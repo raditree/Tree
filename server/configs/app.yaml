@@ -1,0 +1,63 @@
+server:
+  host: "0.0.0.0"
+  port: 8000
+
+# 用户可创建的顶层 agent 数量上限
+agents:
+  max_per_user: 5
+  # 团队最大层级深度（顶部 agent 为 Level 0，最深 Level 3，共 4 层）
+  max_level: 2
+
+docker:
+  image: "agent-workspace:latest"
+  # 每个 agent 可指挥的成员数量上限
+  max_members_per_level: 3
+  resource_limits:
+    cpu: "2.0"
+    memory: "2g"
+    disk: "4g"
+
+# 文件上传限制
+upload:
+  # 单个文件大小上限
+  max_file_size: "100m"
+  # 沙箱内全部文件总大小上限（上传前校验，避免单 agent 工作空间膨胀）
+  sandbox_max_size: "1g"
+
+# 沙箱网络与下载限制（checklist 13/14）
+sandbox:
+  network:
+    # 是否启用白名单式出站网络限制（启用后容器自动获得 NET_ADMIN 以配置 iptables）
+    enabled: true
+    # 白名单：仅允许访问以下主机（域名或 IP；默认放行回环、DNS 与已建立连接）
+    whitelist:
+      - "pypi.org"
+      - "files.pythonhosted.org"
+      - "github.com"
+      - "raw.githubusercontent.com"
+      - "objects.githubusercontent.com"
+    # 单次网络下载数据量上限（如 pip / curl / git 等单次拉取，需 < 1G）
+    max_download_size: "900m"
+
+# 通过 help 工具披露给 LLM 的团队规模与资源限制。
+# path 指向其他配置段的字段（点号分隔），help 返回时动态读取该字段的值，
+# 因此只在此处维护"要披露哪些项"，数值始终来源于 agents/docker 等配置，避免重复。
+help_policy:
+  - name: "每个 agent 最多指挥的成员数"
+    path: "docker.max_members_per_level"
+  - name: "每个沙箱 CPU 限制"
+    path: "docker.resource_limits.cpu"
+  - name: "每个沙箱内存限制"
+    path: "docker.resource_limits.memory"
+  - name: "每个沙箱磁盘限制"
+    path: "docker.resource_limits.disk"
+
+wechat:
+  app_id: ""
+  app_secret: ""
+  redirect_uri: ""
+
+jwt:
+  secret: "change-me-in-production"
+  algorithm: "HS256"
+  expire_hours: 72

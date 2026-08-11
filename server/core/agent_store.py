@@ -1,0 +1,166 @@
+"""Agent 存储 - 基于 SQLite 的持久化实现。
+
+将每个用户创建的 agent 保存到 SQLite 数据库（与对话历史同库），
+重启后数据不丢失。数据库文件位于 ``server/data/conversations.db``。
+"""
+import sqlite3
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+# 数据库目录：server/data
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_DB_PATH = _DATA_DIR / "conversations.db"
+
+# 写操作锁（SQLite 单文件写并发有限，串行化保证安全）
+_write_lock = threading.Lock()
+# 初始化标记
+_initialized = False
+
+
+def _ensure_db() -> None:
+    """确保数据库目录与表结构已创建（线程安全的惰性初始化）。"""
+    global _initialized
+    if _initialized:
+        return
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(_DB_PATH) as conn:
+        # 显式声明 UTF-8 解码，防止 Windows 默认行为导致中文乱码
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agents (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                system_prompt TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agents_user "
+            "ON agents (user_id, created_at)"
+        )
+        # 迁移：为已存在的 agents 表补充 workspace_id 列并回填
+        _migrate_add_workspace_id(conn)
+        conn.commit()
+    _initialized = True
+
+
+def _migrate_add_workspace_id(conn: sqlite3.Connection) -> None:
+    """为 agents 表增加 workspace_id 列（若缺失），并回填已有数据。
+
+    workspace_id 是每个 agent 独立的 Docker 工作空间标识，
+    新列默认回填为 agent 自身的 id，保证旧数据也能映射到独立工作空间。
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(agents)")}
+    if "workspace_id" not in cols:
+        conn.execute(
+            "ALTER TABLE agents ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''"
+        )
+        conn.execute(
+            "UPDATE agents SET workspace_id = id WHERE workspace_id = ''"
+        )
+
+
+def _connect():
+    """创建 UTF-8 编码的 SQLite 连接（全局复用）。"""
+    _ensure_db()
+    conn = sqlite3.connect(_DB_PATH)
+    conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    return conn
+
+
+def create_agent(
+    user_id: str,
+    name: str,
+    model_id: str,
+    system_prompt: str = "",
+) -> Dict[str, Any]:
+    """创建一个 agent 并持久化，返回 agent 字典。
+
+    每个 agent 拥有独立的工作空间（workspace_id 取 agent 自身 id）。
+    """
+    _ensure_db()
+    agent_id = f"agent_{int(time.time() * 1000)}"
+    workspace_id = agent_id
+    created_at = int(time.time() * 1000)
+    with _write_lock:
+        conn = _connect()
+        try:
+            conn.execute(
+                "INSERT INTO agents "
+                "(id, user_id, name, model_id, system_prompt, created_at, workspace_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    agent_id,
+                    user_id,
+                    name,
+                    model_id,
+                    system_prompt,
+                    created_at,
+                    workspace_id,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    result = get_agent(user_id, agent_id)
+    assert result is not None
+    return result
+
+
+def get_agents(user_id: str) -> List[Dict[str, Any]]:
+    """拉取指定用户的全部 agent，按创建时间升序。"""
+    _ensure_db()
+    conn = _connect()
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, name, model_id, system_prompt, created_at, workspace_id "
+            "FROM agents WHERE user_id = ? ORDER BY created_at ASC",
+            (user_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_agent(user_id: str, agent_id: str) -> Optional[Dict[str, Any]]:
+    """按 id 获取指定用户的单个 agent，不存在返回 None。"""
+    _ensure_db()
+    conn = _connect()
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id, name, model_id, system_prompt, created_at, workspace_id "
+            "FROM agents WHERE user_id = ? AND id = ?",
+            (user_id, agent_id),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def delete_agent(user_id: str, agent_id: str) -> bool:
+    """删除指定 agent，并级联删除其对话历史。
+
+    :return: 是否存在被删除的 agent
+    """
+    _ensure_db()
+    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+        cursor = conn.execute(
+            "DELETE FROM agents WHERE user_id = ? AND id = ?",
+            (user_id, agent_id),
+        )
+        # 级联删除该 agent 的对话记录
+        conn.execute(
+            "DELETE FROM messages WHERE user_id = ? AND agent_id = ?",
+            (user_id, agent_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
