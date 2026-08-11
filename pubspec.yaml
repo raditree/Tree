@@ -1,0 +1,42 @@
+name: agent_team_desktop
+description: LLM 驱动的 agent 团队桌面效率工具
+# 防止意外发布到 pub.dev
+publish_to: 'none'
+
+# 应用版本号与构建号
+version: 1.0.0+1
+
+environment:
+  sdk: '>=2.19.6 <3.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # iOS 风格图标
+  cupertino_icons: ^1.0.2
+  # WebSocket 通信（与后端实时消息）
+  web_socket_channel: ^2.3.0
+  # HTTP 请求（REST API 调用）
+  http: ^0.13.5
+  # 文件选择器
+  file_picker: ^5.2.0
+  # 本地键值存储（保存 JWT token 等）
+  shared_preferences: ^2.1.0
+  # 状态管理
+  provider: ^6.0.5
+  # 文件系统路径访问
+  path_provider: ^2.0.14
+  # Markdown 渲染（模型输出默认 markdown 格式）
+  # 注意：0.6.15+1 起要求 Dart 3.0，本项目为 Dart 2.19.6，故精确锁定 0.6.15
+  flutter_markdown: 0.6.15
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  # 代码规范 lint 规则集
+  flutter_lints: ^2.0.0
+
+# Flutter 相关配置
+flutter:
+  # 启用 Material Icons 字体
+  uses-material-design: true
