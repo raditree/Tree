@@ -462,6 +462,39 @@ class ApiService {
     }
   }
 
+  /// 拉取某 agent 的团队成员拓扑（teammates 工作进度窗口）
+  static Future<List<Map<String, dynamic>>> getTeammates(
+      String agentId) async {
+    final Map<String, dynamic> data =
+        await _getJson('/api/agents/$agentId/teammates');
+    final List<dynamic>? members = data['members'] as List<dynamic>?;
+    return members
+            ?.map((dynamic e) => (e as Map<String, dynamic>).cast<String, dynamic>())
+            .toList() ??
+        <Map<String, dynamic>>[];
+  }
+
+  /// 读取成员工作空间的活动日志
+  static Future<String> getTeammateLog(String memberId, {int lines = 60}) async {
+    final Map<String, dynamic> data = await _getJson(
+      '/api/agents/${memberId}/teammate/$memberId/log',
+      query: {'lines': '$lines'},
+    );
+    return (data['log'] as String?) ?? '';
+  }
+
+  /// 用户直接向团队成员发送消息
+  static Future<Map<String, dynamic>> sendTeammateMessage(
+    String leaderId,
+    String memberId,
+    String content,
+  ) async {
+    return _postJson(
+      '/api/agents/$leaderId/teammate/$memberId/message',
+      body: {'content': content},
+    );
+  }
+
   /// 登出：撤销当前 token（后端侧）
   ///
   /// 调用 `POST /api/auth/logout`。本地清理由调用方（AuthService）负责。

@@ -38,10 +38,12 @@ class AgentLLMSession:
     处理 tool_call 循环、并在上下文接近 max_seqlen 时执行压缩。
     """
 
-    # 上下文压缩：保留最近消息数
-    KEEP_RECENT_MESSAGES: int = 10
+    # 上下文压缩：保留最近 N 次用户要求原文（重要，保持不变）
+    KEEP_RECENT_USER_MSGS: int = 3
     # 上下文压缩阈值比例（达到 max_seqlen 的 80% 时触发）
     COMPRESS_THRESHOLD: float = 0.8
+    # 调用 LLM 总结时，截断送入总结器的最长文本长度（控制成本）
+    SUMMARIZE_CHAR_LIMIT: int = 12000
 
     def __init__(
         self,
@@ -309,7 +311,12 @@ class AgentLLMSession:
                     else:
                         result = f"未找到工具: {tc['name']}"
 
-                    yield {"type": "tool_call", "name": tc["name"], "result": str(result)}
+                    yield {
+                        "type": "tool_call",
+                        "name": tc["name"],
+                        "arguments": args,
+                        "result": str(result),
+                    }
 
                     # 将工具结果添加到上下文
                     self.context.append({
@@ -396,6 +403,13 @@ class AgentLLMSession:
         - ``force=True``：手动 compact（compact 按钮），跳过阈值判断，
           只要有可压缩的消息就立即压缩。
 
+        压缩策略（针对"长程任务"重新设计）：
+        - 系统提示词（system 消息）始终保留。
+        - 保留最近 ``KEEP_RECENT_USER_MSGS`` 次用户要求原文，以及它们之后
+          的所有消息（即当前任务上下文原样保留，不丢失用户最新指示）。
+        - 更早的消息调用 LLM 总结工具调用轨迹与任务上下文，生成一条 summary，
+          替换进上下文。
+
         返回是否实际执行了压缩。
         """
         # 估算总 token 数（近似：len(str(msg)) // 4）
@@ -407,54 +421,111 @@ class AgentLLMSession:
             return False
 
         # 分离 system 消息与其他消息
-        system_msgs: List[Dict[str, Any]] = []
-        other_msgs: List[Dict[str, Any]] = []
-        for msg in self.context:
-            if msg.get("role") == "system":
-                system_msgs.append(msg)
-            else:
-                other_msgs.append(msg)
+        system_msgs: List[Dict[str, Any]] = [
+            msg for msg in self.context if msg.get("role") == "system"
+        ]
+        other_msgs: List[Dict[str, Any]] = [
+            msg for msg in self.context if msg.get("role") != "system"
+        ]
 
-        # 强制压缩时：即使消息很少也立即压缩，只保留最近 1 条，其余全部总结。
-        # 这样 compact 按钮无论什么情况都能生效（checklist 5）。
-        keep = (1 if force else self.KEEP_RECENT_MESSAGES)
+        # 定位"需保留的起点"：保留最近 N 次用户要求及其后的所有消息。
+        user_indices = [
+            i for i, m in enumerate(other_msgs) if m.get("role") == "user"
+        ]
+        if len(other_msgs) <= 1:
+            return False
+        if user_indices:
+            keep_from = user_indices[-self.KEEP_RECENT_USER_MSGS]
+        else:
+            # 没有用户消息（异常态），保留最近若干条
+            keep_from = max(0, len(other_msgs) - 5)
 
-        # 消息数不足，无可压缩内容
-        if len(other_msgs) <= keep:
+        to_summarize = other_msgs[:keep_from]
+        to_keep = other_msgs[keep_from:]
+
+        # 无可总结内容（最近 N 次用户要求已覆盖全部消息）
+        if not to_summarize:
             return False
 
-        # 切分：待总结部分 + 保留部分
-        to_summarize = other_msgs[:-keep]
-        to_keep = other_msgs[-keep:]
+        # 调用 LLM 总结工具调用轨迹与任务上下文
+        summary_text = self._summarize_with_llm(to_summarize)
+        summary_msg = {"role": "system", "content": summary_text}
 
-        # 构建总结消息
-        summary_lines: List[str] = [
-            "之前的对话总结（上下文已被压缩，以下为历史要点；"
-            "如需查看完整工作过程请查看工作空间内的文件与日志）:"
-        ]
-        for msg in to_summarize:
-            role = msg.get("role", "unknown")
-            content = str(msg.get("content", ""))[:200]
-            summary_lines.append(f"- [{role}] {content}")
-
-        summary_msg = {"role": "system", "content": "\n".join(summary_lines)}
-
-        # 重组上下文：system 消息 + 总结 + 最近消息
+        # 重组上下文：system 消息 + 总结 + 保留的最近用户要求及其后消息
         self.context = system_msgs + [summary_msg] + to_keep
 
         # 触发记忆更新标志位（后续 Task 13 通过回调或标志位处理）
         self.memory_update_pending = True
 
         logger.info(
-            "上下文已压缩: 总结 %d 条消息, 保留最近 %d 条, "
+            "上下文已压缩: 总结 %d 条消息, 保留最近 %d 条用户要求及其后 %d 条, "
             "workspace=%s, model=%s, force=%s",
             len(to_summarize),
-            keep,
+            self.KEEP_RECENT_USER_MSGS,
+            len(to_keep),
             self.workspace_id,
             self.model_config.model_id,
             force,
         )
         return True
+
+    def _summarize_with_llm(self, messages: List[Dict[str, Any]]) -> str:
+        """调用 LLM 总结一段历史消息（工具调用轨迹 + 任务上下文）。
+
+        单独发起一次非流式补全请求，不携带工具，避免递归调用工具导致死循环。
+        失败时回退到朴素的截断式摘要，保证压缩流程不中断。
+
+        :param messages: 需要被压缩的历史消息列表
+        :return: 中文总结文本
+        """
+        # 构造输入的紧凑表示，控制长度
+        compact_lines: List[str] = []
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            content = str(msg.get("content", ""))
+            if role == "tool":
+                content = "[工具结果] " + content[:300]
+            elif role == "assistant" and msg.get("tool_calls"):
+                content = "[工具调用] " + content[:300]
+            else:
+                content = content[:400]
+            compact_lines.append(f"- [{role}] {content}")
+        raw = "\n".join(compact_lines)
+        if len(raw) > self.SUMMARIZE_CHAR_LIMIT:
+            raw = raw[: self.SUMMARIZE_CHAR_LIMIT] + "\n...[截断]"
+
+        summarize_prompt = (
+            "你是上下文压缩器。以下是 agent 与用户、工具之间的一段历史对话，"
+            "包含任务目标、已执行的工具调用轨迹与结果、以及当前进展。\n"
+            "请用简洁的中文总结：1) 用户的任务目标与最新要求；2) 已完成的工具"
+            "调用轨迹与关键结果；3) 当前进展与尚未完成的待办。保留必要的事实"
+            "细节（文件名、路径、数字、结论），不要逐条复述原文。\n\n"
+            f"历史对话：\n{raw}"
+        )
+
+        try:
+            client = LLMClientFactory.create_client(self.model_config)
+            resp = client.chat.completions.create(
+                model=self.model_config.model_id,
+                messages=[{"role": "user", "content": summarize_prompt}],
+                temperature=0.2,
+            )
+            summary = ""
+            if resp.choices:
+                summary = resp.choices[0].message.content or ""
+            summary = summary.strip()
+            if summary:
+                return (
+                    "以下是此前对话的总结（上下文已被压缩，当前任务目标与最新"
+                    "要求已保留在最近对话中）:\n"
+                    + summary
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("LLM 总结失败，回退到截断摘要: %s", exc)
+
+        # 回退：朴素截断式摘要
+        title = "以下是此前的对话记录（上下文已被压缩，以下为历史要点）:"
+        return title + "\n" + raw[:2000]
 
 
 class LimitlessContextSession(AgentLLMSession):

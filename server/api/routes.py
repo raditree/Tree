@@ -444,11 +444,14 @@ def _escape_shell_path(path: str) -> str:
     return path.replace("'", "'\\''")
 
 
-def _parse_ls_output(output: str) -> List[Dict[str, Any]]:
+def _parse_ls_output(output: str, base_path: str = "") -> List[Dict[str, Any]]:
     """解析 ``ls -la --time-style=long-iso`` 输出为文件信息列表。
 
     输出格式：``perms links owner group size date time name``
+    ：param base_path: 当前列出的目录（相对工作空间根），用于拼接文件完整路径，
+        使前端能直接以 ``path`` 打开子目录中的文件（如 PDF 预览/内容读取）。
     """
+    base = base_path.strip("/")
     files: List[Dict[str, Any]] = []
     for line in output.splitlines():
         line = line.strip()
@@ -465,9 +468,11 @@ def _parse_ls_output(output: str) -> List[Dict[str, Any]]:
         size = int(size_str) if size_str.isdigit() else 0
         modified = f"{parts[5]} {parts[6]}"
         file_type = "dir" if perms.startswith("d") else "file"
+        rel = f"{base}/{name}" if base else name
         files.append(
             {
                 "name": name,
+                "path": rel,
                 "size": size,
                 "type": file_type,
                 "modified": modified,
@@ -500,7 +505,7 @@ async def list_files(
         raise HTTPException(status_code=404, detail=result)
     if result.get("exit_code", 0) != 0:
         raise HTTPException(status_code=404, detail=f"路径不存在: {path}")
-    files = _parse_ls_output(result.get("stdout", ""))
+    files = _parse_ls_output(result.get("stdout", ""), path)
     return {"files": files}
 
 
@@ -526,7 +531,18 @@ async def get_file_content(
     if "error" in result and "exit_code" not in result:
         raise HTTPException(status_code=404, detail=result)
     if result.get("exit_code", 0) != 0:
-        raise HTTPException(status_code=404, detail="文件不存在或无法读取")
+        # 兼容旧工作空间：读取 .self/activity.log 缺失时先初始化再返回
+        if path.rstrip("/").endswith("activity.log"):
+            init = docker_manager.exec_in_workspace(
+                workspace_id,
+                ["sh", "-c", "mkdir -p .self && echo '# Agent 活动日志' > .self/activity.log"],
+            )
+            if init.get("exit_code", 0) == 0:
+                result = docker_manager.exec_in_workspace(
+                    workspace_id, ["sh", "-c", f"cat '{safe_path}' 2>&1"]
+                )
+        if result.get("exit_code", 0) != 0:
+            raise HTTPException(status_code=404, detail="文件不存在或无法读取")
     content = result.get("stdout", "")
     return {
         "content": content,

@@ -1,7 +1,10 @@
 """Docker 工作空间管理 - 容器创建/停止/删除与卷管理。"""
 import base64
+import io
 import logging
 import shlex
+import tarfile
+import time
 from typing import Any, Dict, List, Optional
 from core.config import get_config
 logger = logging.getLogger(__name__)
@@ -18,6 +21,27 @@ except ImportError as _exc:
     _DOCKER_IMPORT_ERROR = str(_exc)
 # 父 agent Git HTTP 服务默认端口（容器内 git http server 监听端口）
 DEFAULT_GIT_PORT = 8000
+
+
+def _make_tar_bytes(name: str, data: bytes) -> bytes:
+    """将单个文件打包为 tar 字节流，供 ``container.put_archive`` 使用。
+
+    采用流式 tar 打包，避免将大文件 base64 编码塞进 exec 命令行——
+    Docker exec 单条命令消息上限 4MB，大文件会触发 ResourceExhausted。
+    :param name: tar 内的文件名（相对解包目录）
+    :param data: 文件字节内容
+    :return: tar 字节流
+    """
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        info.mtime = int(time.time())
+        tar.addfile(info, io.BytesIO(data))
+    buf.seek(0)
+    return buf.read()
+
+
 class DockerManager:
     """管理 agent 工作空间容器与持久化卷的生命周期。"""
     def __init__(self) -> None:
@@ -230,6 +254,8 @@ class DockerManager:
                 f'git config user.name "{name}"',
                 f'git config user.email "{name}@agent.local"',
                 "mkdir -p .self",
+                # 预创建活动日志，避免前端读取 activity.log 时 404
+                "echo '# Agent 活动日志' > .self/activity.log",
             ])
             self._exec(container, git_init_cmd)
             # 3.1 初始化 .self/rule.md 模板（checklist 9：每个 agent 的工作准则文件）
@@ -582,8 +608,8 @@ class DockerManager:
         self, workspace_id: str, container_path: str, data: bytes
     ) -> Dict[str, Any]:
         """将文件内容写入工作空间容器内指定路径（自动创建父目录）。
-        支持任意二进制内容：将内容 base64 编码后，在容器内通过 ``base64 -d``
-        解码写入，避免 shell 转义与编码问题。
+        支持任意二进制内容与任意大小：通过 ``put_archive`` 流式写入，
+        避免把内容 base64 塞进 exec 命令行（超过 4MB 会触发 ResourceExhausted）。
         :param workspace_id: 工作空间标识
         :param container_path: 容器内绝对路径（相对 /workspace 的路径亦可）
         :param data: 待写入的文件字节内容
@@ -617,19 +643,21 @@ class DockerManager:
             rel = f"workspace/{rel}"
         abs_path = f"/{rel}"
         dirname = abs_path.rsplit("/", 1)[0]
-        # base64 字符集（A-Za-z0-9+/=）不含 shell 特殊字符，单引号包裹安全
-        b64 = base64.b64encode(data).decode("ascii")
-        cmd = (
-            f"mkdir -p '{dirname}' && "
-            f"echo '{b64}' | base64 -d > '{abs_path}'"
-        )
+        basename = rel.rsplit("/", 1)[-1]
         try:
-            result = container.exec_run(["sh", "-c", cmd])
-            exit_code = int(result.exit_code)
-            output = result.output
-            if isinstance(output, bytes):
-                output = output.decode("utf-8", errors="replace")
-            return {"exit_code": exit_code, "stdout": output, "stderr": ""}
+            # 先确保父目录存在（put_archive 不会自动创建目标目录）
+            mkdir = container.exec_run(["sh", "-c", f"mkdir -p '{dirname}'"])
+            if int(mkdir.exit_code) != 0:
+                return {
+                    "error": "创建父目录失败",
+                    "exit_code": int(mkdir.exit_code),
+                    "stdout": "",
+                }
+            # 流式写入 tar，避免命令行长度限制
+            ok = container.put_archive(
+                dirname, _make_tar_bytes(basename, data)
+            )
+            return {"exit_code": 0 if ok else 1, "stdout": "", "stderr": ""}
         except (APIError, Exception) as exc:  # noqa: BLE001
             return {
                 "error": "写入文件失败",

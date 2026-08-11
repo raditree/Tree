@@ -5,11 +5,14 @@
 import asyncio
 import datetime
 import json
+import logging
 import os
+import queue
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import jwt
 import uvicorn
@@ -37,6 +40,9 @@ from tools import register_builtin_tools
 
 # WebSocket 连接管理器（全局单例）
 ws_manager = WebSocketManager()
+
+# 模块级日志器
+logger = logging.getLogger(__name__)
 
 # 模型配置全局缓存（ lifespan 中填充）
 _model_configs: Dict[str, ModelConfig] = {}
@@ -88,6 +94,7 @@ async def _register_tools(
         mcp_config=mcp_config,
         broker=_team_broker,
         user_id=user_id,
+        ws_manager=ws_manager,
     )
 
 
@@ -123,7 +130,12 @@ def _upload_attachments(
         result = _docker_manager.write_file(workspace_id, container_path, data)
         if result.get("exit_code") != 0 or "error" in result:
             logger.warning(
-                "附件写入工作空间失败: %s (%s)", name, result.get("error", result.get("detail", ""))
+                "附件写入工作空间失败: %s (exit=%s, error=%s, detail=%s, stderr=%s)",
+                name,
+                result.get("exit_code"),
+                result.get("error", ""),
+                result.get("detail", ""),
+                str(result.get("stderr", ""))[:200],
             )
             continue
         uploaded.append(f"/workspace/{container_path}")
@@ -375,6 +387,32 @@ async def _send_text_as_agent(
 _ACTIVITY_FLUSH_CHARS = 300
 
 
+# 进行中的 agent 任务取消事件表：(user_id, agent_id) -> threading.Event。
+# 前端点击"停止"时，WS 端点 set 对应事件，chat 消费线程在每条产出后检查并退出。
+_active_tasks: Dict[Tuple[str, str], threading.Event] = {}
+
+
+def _register_active_task(user_id: str, agent_id: str) -> threading.Event:
+    """登记一个进行中的任务，返回取消事件。"""
+    event = threading.Event()
+    _active_tasks[(user_id, agent_id)] = event
+    return event
+
+
+def _cancel_active_task(user_id: str, agent_id: str) -> bool:
+    """请求取消指定 agent 的进行中任务。"""
+    event = _active_tasks.get((user_id, agent_id))
+    if event is None:
+        return False
+    event.set()
+    return True
+
+
+def _clear_active_task(user_id: str, agent_id: str) -> None:
+    """任务结束时清除取消事件登记。"""
+    _active_tasks.pop((user_id, agent_id), None)
+
+
 def _clock_now() -> str:
     """返回 HH:MM:SS 时间戳，用于活动日志。"""
     return time.strftime("%H:%M:%S")
@@ -403,6 +441,164 @@ def _append_activity_log(workspace_id: str, message: str) -> None:
         _docker_manager.exec_in_workspace(workspace_id, cmd)
     except Exception as exc:  # noqa: BLE001
         logger.warning("写入活动日志失败: %s", exc)
+
+
+def _new_seg_id(agent_id: str) -> str:
+    """生成一条段（文本消息/工具卡片）的唯一 id。"""
+    return f"{agent_id}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+
+
+async def _stream_agent_reply(
+    user_id: str,
+    agent_id: str,
+    workspace_id: str,
+    session: Any,
+    llm_content: str,
+    on_tool_turn: Optional[Any] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> Tuple[str, str]:
+    """在后台线程中运行 chat 循环，并向前端实时推送进度事件。
+
+    解决"工作期间其他 API 卡住"的问题：LLM 流式调用与工具执行为同步阻塞，
+    若直接在主线程遍历会独占事件循环。这里把生成器消费放到独立线程
+    （``asyncio.to_thread``），通过线程安全的 ``asyncio.Queue`` 把产出
+    传递回事件循环，逐条推送以下 WS 事件：
+
+    - ``agent_status``：由调用方负责发送 working/idle（本函数不发）。
+    - ``text`` 产出：以"段"为单位，先发 ``msg_start`` 再逐块 ``msg_chunk``，
+      段结束时发 ``msg_end``（每一次中间输出独立成一条消息）。
+    - ``tool_call`` 产出：先发 ``tool_start``（含参数），工具执行完成后在
+      同一产出内发 ``tool_end``（含结果），前端据此渲染可折叠卡片。
+    - 取消：检测到 ``cancel_event`` 置位时提前退出，返回 cancelled。
+
+    :return: ``(full_text, status, last_text_id)``，status 为 ``"ok"`` /
+             ``"cancelled"`` / ``"error"``；``last_text_id`` 为结束时仍打开的
+             文本段 id（可能为 None），供调用方在确定 usage 后补发 ``msg_usage``。
+    """
+    loop = asyncio.get_running_loop()
+    out_q: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
+
+    def _consume() -> None:
+        """线程内消费 chat 生成器，产出经线程安全方式回传事件循环。"""
+        try:
+            for item in session.chat(llm_content, on_tool_turn=on_tool_turn):
+                if cancel_event is not None and cancel_event.is_set():
+                    loop.call_soon_threadsafe(out_q.put_nowait, {"type": "cancelled"})
+                    return
+                loop.call_soon_threadsafe(out_q.put_nowait, item)
+        except asyncio.CancelledError:
+            loop.call_soon_threadsafe(out_q.put_nowait, {"type": "cancelled"})
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("chat 消费线程异常")
+            loop.call_soon_threadsafe(
+                out_q.put_nowait, {"type": "error", "content": str(exc)}
+            )
+        finally:
+            loop.call_soon_threadsafe(out_q.put_nowait, {"type": "done"})
+
+    thread_task = asyncio.create_task(asyncio.to_thread(_consume))
+
+    full_parts: List[str] = []
+    text_id: Optional[str] = None
+    flush_buf = ""
+    status = "ok"
+
+    def _close_text() -> None:
+        """结束当前文本段（中间输出独立成一条消息，结束时不带 usage）。"""
+        nonlocal text_id
+        if text_id is not None:
+            asyncio.ensure_future(
+                ws_manager.send_message(
+                    user_id, {"type": "msg_end", "id": text_id, "agent_id": agent_id}
+                )
+            )
+            text_id = None
+
+    try:
+        while True:
+            item = await out_q.get()
+            itype = item.get("type")
+            if itype == "done":
+                break
+            if itype == "cancelled":
+                status = "cancelled"
+                break
+            if itype == "error":
+                status = "error"
+                full_parts.append(item.get("content", ""))
+                break
+            if itype == "text":
+                content = item.get("content", "")
+                full_parts.append(content)
+                if text_id is None:
+                    text_id = _new_seg_id(agent_id)
+                    await ws_manager.send_message(
+                        user_id,
+                        {
+                            "type": "msg_start",
+                            "id": text_id,
+                            "role": "agent",
+                            "agent_id": agent_id,
+                        },
+                    )
+                await ws_manager.send_message(
+                    user_id,
+                    {
+                        "type": "msg_chunk",
+                        "id": text_id,
+                        "agent_id": agent_id,
+                        "chunk": content,
+                    },
+                )
+                flush_buf += content
+                if workspace_id and len(flush_buf) >= _ACTIVITY_FLUSH_CHARS:
+                    _append_activity_log(workspace_id, f"[{_clock_now()}] {flush_buf}")
+                    flush_buf = ""
+            elif itype == "tool_call":
+                # 结束上一段文本（中间输出独立成消息）
+                _close_text()
+                name = item.get("name", "")
+                args = item.get("arguments") or {}
+                result = item.get("result", "")
+                if workspace_id:
+                    _append_activity_log(
+                        workspace_id,
+                        f"[{_clock_now()}] [tool] {name} args="
+                        f"{str(args)[:200]} -> {str(result)[:150]}",
+                    )
+                flush_buf = ""
+                tool_id = _new_seg_id(agent_id)
+                await ws_manager.send_message(
+                    user_id,
+                    {
+                        "type": "tool_start",
+                        "id": tool_id,
+                        "agent_id": agent_id,
+                        "name": name,
+                        "arguments": args,
+                    },
+                )
+                await ws_manager.send_message(
+                    user_id,
+                    {
+                        "type": "tool_end",
+                        "id": tool_id,
+                        "agent_id": agent_id,
+                        "name": name,
+                        "result": str(result),
+                    },
+                )
+            else:
+                # 未知产出类型，忽略
+                continue
+    finally:
+        await thread_task
+        if flush_buf and workspace_id:
+            _append_activity_log(workspace_id, f"[{_clock_now()}] {flush_buf}")
+
+    # 结束时仍打开的文本段即最终回复，交由调用方补发 msg_usage
+    last_text_id = text_id
+    return "".join(full_parts), status, last_text_id
 
 
 async def _process_member_message(
@@ -479,7 +675,7 @@ async def _process_member_message(
             return None
         try:
             incoming = queue.get_nowait()
-        except asyncio.QueueEmpty:
+        except queue.Empty:
             return None
         incoming_content = incoming.get("content", "")
         if not incoming_content:
@@ -491,29 +687,37 @@ async def _process_member_message(
         )
         return incoming_content
 
-    _buf = ""
+    # 登记任务并通知用户该成员进入 working 状态（teammates 窗口可见）
+    cancel_event = _register_active_task(user_id, agent_id)
+    await ws_manager.send_message(
+        user_id,
+        {"type": "agent_status", "data": {"agent_id": agent_id, "status": "working"}},
+    )
     try:
-        for item in session.chat(content, on_tool_turn=_pick_incoming):
-            if item["type"] == "text":
-                _buf += item["content"]
-                if len(_buf) >= _ACTIVITY_FLUSH_CHARS:
-                    _append_activity_log(workspace_id, f"[{_clock_now()}] {_buf}")
-                    _buf = ""
-            elif item["type"] == "tool_call":
-                _append_activity_log(
-                    workspace_id,
-                    f"[{_clock_now()}] [tool] {item['name']} -> "
-                    f"{str(item['result'])[:150]}",
-                )
-                _buf = ""
-        if _buf:
-            _append_activity_log(workspace_id, f"[{_clock_now()}] {_buf}")
+        _, _status, _last = await _stream_agent_reply(
+            user_id,
+            agent_id,
+            workspace_id,
+            session,
+            content,
+            on_tool_turn=_pick_incoming,
+            cancel_event=cancel_event,
+        )
+        # 关闭最终文本段（无 usage）
+        if _last:
+            await ws_manager.send_message(
+                user_id,
+                {"type": "msg_end", "id": _last, "agent_id": agent_id, "usage": None},
+            )
         _append_activity_log(workspace_id, f"[{_clock_now()}] [done(成员)] 回复完成")
     except Exception as exc:  # noqa: BLE001
         logger.exception("成员消息处理失败: %s", exc)
         _append_activity_log(
             workspace_id, f"[{_clock_now()}] [error] 成员处理失败: {exc}"
         )
+    finally:
+        _clear_active_task(user_id, agent_id)
+        await _send_status_idle(user_id, agent_id)
 
     # 持久化上下文（成员回复已实时写入工作空间活动日志，供 leader 查看）
     try:
@@ -583,17 +787,8 @@ async def _handle_user_message(
     attachments = data.get("attachments") or []
     llm_content = content
 
-    # 本轮对话的唯一消息 id（区分同一 agent 的多次回复）
-    msg_id = f"{agent_id}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
-
     # 保存用户消息到历史
     _store_message(user_id, agent_id, "user", content)
-
-    # 通知前端 agent 进入 thinking 状态
-    await ws_manager.send_message(
-        user_id,
-        {"type": "agent_status", "data": {"agent_id": agent_id, "status": "thinking"}},
-    )
 
     # 获取模型配置
     if not _model_configs:
@@ -629,10 +824,13 @@ async def _handle_user_message(
         await _send_status_idle(user_id, agent_id)
         return
 
-    # 发送流式开始标记（前端使用 id 字段匹配消息）
+    # 登记进行中的任务（供"停止"按钮取消）
+    cancel_event = _register_active_task(user_id, agent_id)
+
+    # 通知前端 agent 进入 working 状态
     await ws_manager.send_message(
         user_id,
-        {"type": "stream_start", "id": msg_id},
+        {"type": "agent_status", "data": {"agent_id": agent_id, "status": "working"}},
     )
 
     try:
@@ -668,15 +866,13 @@ async def _handle_user_message(
         # 无限上下文 LLM 每次新建，需注册工具；normal LLM 仅在首次创建时注册
         if model_config.is_limitless_context:
             await _register_tools(session, agent_id, user_id)
-        # 收集 agent 回复内容，流式结束后存入历史
-        full_reply_parts: List[str] = []
-        # 活动日志：记录本次对话开始、流式输出、工具调用与结束，供 leader 判断是否卡死
+
+        # 活动日志：记录本次对话开始，供 leader 判断是否卡死
         if workspace_id:
             _append_activity_log(
                 workspace_id,
                 f"[{_clock_now()}] [start] 收到输入: {llm_content[:120]}",
             )
-        _flush_buf = ""
 
         def _pick_incoming() -> Optional[str]:
             """在 tool_call 间隙从队列切入用户新发的消息（checklist 7）。
@@ -688,7 +884,7 @@ async def _handle_user_message(
                 return None
             try:
                 incoming = queue.get_nowait()
-            except asyncio.QueueEmpty:
+            except queue.Empty:
                 return None
             incoming_content = incoming.get("content", "")
             if not incoming_content:
@@ -701,63 +897,45 @@ async def _handle_user_message(
                 )
             return incoming_content
 
-        for item in session.chat(llm_content, on_tool_turn=_pick_incoming):
-            if item["type"] == "text":
-                full_reply_parts.append(item["content"])
-                # 累积流式文本，达到阈值后 flush 到活动日志（控制 exec 频率）
-                _flush_buf += item["content"]
-                if len(_flush_buf) >= _ACTIVITY_FLUSH_CHARS:
-                    if workspace_id:
-                        _append_activity_log(
-                            workspace_id, f"[{_clock_now()}] {_flush_buf}"
-                        )
-                    _flush_buf = ""
-                await ws_manager.send_message(
-                    user_id,
-                    {
-                        "type": "stream_chunk",
-                        "id": msg_id,
-                        "chunk": item["content"],
-                    },
+        # 在后台线程运行 chat 循环，实时推送中间输出与工具调用
+        full_reply, stream_status, last_text_id = await _stream_agent_reply(
+            user_id,
+            agent_id,
+            workspace_id,
+            session,
+            llm_content,
+            on_tool_turn=_pick_incoming,
+            cancel_event=cancel_event,
+        )
+
+        if stream_status == "cancelled":
+            if workspace_id:
+                _append_activity_log(
+                    workspace_id, f"[{_clock_now()}] [stopped] 已停止"
                 )
-            elif item["type"] == "tool_call":
-                if workspace_id:
-                    _append_activity_log(
-                        workspace_id,
-                        f"[{_clock_now()}] [tool] {item['name']} -> {str(item['result'])[:150]}",
-                    )
-                _flush_buf = ""
-                await ws_manager.send_message(
-                    user_id,
-                    {
-                        "type": "tool_call",
-                        "data": {
-                            "agent_id": agent_id,
-                            "tool": item["name"],
-                            "result": item["result"],
-                        },
-                    },
+        elif stream_status == "error":
+            if workspace_id:
+                _append_activity_log(
+                    workspace_id, f"[{_clock_now()}] [error] LLM 请求失败: {full_reply}"
                 )
-        # 循环结束：flush 剩余文本并记录 done
-        if _flush_buf and workspace_id:
-            _append_activity_log(
-                workspace_id, f"[{_clock_now()}] {_flush_buf}"
-            )
-        if workspace_id:
-            _append_activity_log(
-                workspace_id, f"[{_clock_now()}] [done] 回复完成"
-            )
+        else:
+            if workspace_id:
+                _append_activity_log(
+                    workspace_id, f"[{_clock_now()}] [done] 回复完成"
+                )
         # 对话结束后将上下文持久化到数据库（重启后恢复）
         save_context(user_id, agent_id, session.context)
     except Exception as exc:  # noqa: BLE001
         await _send_text_as_agent(user_id, agent_id, f"LLM 请求失败: {exc}")
-        full_reply_parts.append(f"LLM 请求失败: {exc}")
+        full_reply = f"LLM 请求失败: {exc}"
+        stream_status = "error"
+        last_text_id = None
         if workspace_id:
             _append_activity_log(
                 workspace_id, f"[{_clock_now()}] [error] LLM 请求失败: {exc}"
             )
 
-    # 发送流式结束标记（normal LLM 附带 token 用量统计）
+    # 计算 token 用量（normal LLM 附带）
     usage_payload = None
     if (
         not model_config.is_limitless_context
@@ -766,22 +944,30 @@ async def _handle_user_message(
         max_tokens = int(model_config.extra.get("max_seqlen", 8192))
         usage_payload = {**session.last_usage, "max_tokens": max_tokens}
 
+    # 若最终文本段仍打开，补发 msg_end（附带 usage）
+    if last_text_id:
+        await ws_manager.send_message(
+            user_id,
+            {
+                "type": "msg_end",
+                "id": last_text_id,
+                "agent_id": agent_id,
+                "usage": usage_payload,
+            },
+        )
+
     # 保存 agent 回复到历史（附带 token 用量，便于切换 agent 后恢复显示）
-    if full_reply_parts:
+    if full_reply:
         _store_message(
             user_id,
             agent_id,
             "agent",
-            "".join(full_reply_parts),
+            full_reply,
             usage=usage_payload,
         )
 
-    await ws_manager.send_message(
-        user_id,
-        {"type": "stream_end", "id": msg_id, "usage": usage_payload},
-    )
-
-    # 恢复 idle 状态
+    # 恢复 idle 状态并清除任务登记
+    _clear_active_task(user_id, agent_id)
     await _send_status_idle(user_id, agent_id)
 
 
@@ -863,6 +1049,58 @@ async def websocket_endpoint(ws: WebSocket):
                 # checklist 7：通过 broker 投递，working 时在 tool_call 间隙切入，
                 # idle 时立即处理（不等同于阻塞 WebSocket 循环，便于后续消息切入）。
                 _dispatch_user_message(user_id, data)
+            elif msg_type == "stop":
+                # 停止按钮：请求取消指定 agent 的进行中任务
+                agent_id = data.get("agent_id", "")
+                if agent_id and _cancel_active_task(user_id, agent_id):
+                    await ws_manager.send_message(
+                        user_id,
+                        {
+                            "type": "agent_status",
+                            "data": {"agent_id": agent_id, "status": "stopping"},
+                        },
+                    )
+                else:
+                    await ws_manager.send_message(
+                        user_id,
+                        {
+                            "type": "error",
+                            "data": {"message": "没有进行中的任务可停止"},
+                        },
+                    )
+            elif msg_type == "user_answer":
+                # 用户回答 AskUserQuestion 工具的问题
+                qid = data.get("question_id", "")
+                answer = data.get("answer")
+                from tools.ask_question_tool import get_ask_tool
+
+                ask_tool = get_ask_tool(user_id)
+                if ask_tool is not None and qid:
+                    ask_tool.resolve(qid, answer)
+                else:
+                    await ws_manager.send_message(
+                        user_id,
+                        {
+                            "type": "error",
+                            "data": {"message": "没有等待回答的问题"},
+                        },
+                    )
+            elif msg_type == "cancel_question":
+                # 用户取消 AskUserQuestion 工具的问题
+                qid = data.get("question_id", "")
+                from tools.ask_question_tool import get_ask_tool
+
+                ask_tool = get_ask_tool(user_id)
+                if ask_tool is not None and qid:
+                    ask_tool.cancel(qid)
+                else:
+                    await ws_manager.send_message(
+                        user_id,
+                        {
+                            "type": "error",
+                            "data": {"message": "没有等待回答的问题"},
+                        },
+                    )
             else:
                 await ws_manager.send_message(
                     user_id,
@@ -872,7 +1110,7 @@ async def websocket_endpoint(ws: WebSocket):
         # 客户端主动断开连接
         pass
     finally:
-        ws_manager.disconnect(user_id)
+        ws_manager.disconnect(user_id, ws)
 
 
 @app.get("/api/conversations/{agent_id}")
@@ -926,6 +1164,133 @@ async def compact_agent_context(
         "compressed": compressed,
         "context_size": len(session.context),
     }
+
+
+def _parse_roster_table(content: str) -> List[Dict[str, Any]]:
+    """解析成员管理表 markdown 表格，返回成员字典列表。
+
+    表格列：ID | 名称 | 模型 | 层级 | 创建时间 | 工作状态 | 评价 | ...
+    """
+    members: List[Dict[str, Any]] = []
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("|"):
+            continue
+        if "ID" in line and "名称" in line:
+            continue
+        if "---" in line.replace("|", ""):
+            continue
+        parts = [p.strip() for p in line.strip("|").split("|")]
+        if len(parts) < 7:
+            continue
+        try:
+            level = int(parts[3]) if parts[3].isdigit() else 0
+        except (ValueError, IndexError):
+            level = 0
+        member_id = parts[0]
+        if not member_id:
+            continue
+        members.append(
+            {
+                "id": member_id,
+                "name": parts[1],
+                "model_id": parts[2],
+                "level": level,
+                "created_at": parts[4],
+                "work_status": parts[5],
+                "comment": parts[6],
+                # member_id 同时作为 workspace_id（create_workspace 的约定）
+                "workspace_id": member_id,
+            }
+        )
+    return members
+
+
+@app.get("/api/agents/{agent_id}/teammates")
+async def get_agent_teammates(
+    agent_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """拉取某 agent 的团队成员拓扑（teammates 工作进度窗口）。
+
+    从该 agent 工作空间解析 ``.self/team_roster.md``，并叠加实时工作状态
+    （是否有进行中的任务，来自 ``_active_tasks``）。
+    """
+    user_id = current_user.get("openid", "")
+    agent = get_agent(user_id, agent_id)
+    workspace_id = (agent.get("workspace_id") if agent else None) or agent_id
+    content = _read_workspace_file(workspace_id, ".self/team_roster.md")
+    members = _parse_roster_table(content)
+    for m in members:
+        mid = m["id"]
+        m["live_status"] = (
+            "working" if (user_id, mid) in _active_tasks else m.get("work_status") or "idle"
+        )
+    return {"agent_id": agent_id, "members": members}
+
+
+@app.get("/api/agents/{agent_id}/teammate/{member_id}/log")
+async def get_teammate_log(
+    agent_id: str,
+    member_id: str,
+    lines: int = 60,
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """读取成员工作空间的活动日志（teammates 窗口展示工作进度）。"""
+    user_id = current_user.get("openid", "")
+    if not _docker_manager or not _docker_manager.available:
+        return {"success": True, "log": ""}
+    try:
+        result = _docker_manager.exec_in_workspace(
+            member_id,
+            ["sh", "-c", f"tail -n {int(lines)} .self/activity.log 2>/dev/null"],
+        )
+        return {"success": True, "log": result.get("stdout", "")}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("读取成员日志失败 %s: %s", member_id, exc)
+        return {"success": False, "error": str(exc)}
+
+
+@app.post("/api/agents/{agent_id}/teammate/{member_id}/message")
+async def send_teammate_message(
+    agent_id: str,
+    member_id: str,
+    body: Dict[str, Any],
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """用户直接向团队成员发送消息（teammates 窗口）。
+
+    读取 leader 工作空间的成员管理表找到成员，经 broker 异步投递，
+    成员会像收到 leader 消息一样开始处理。
+    """
+    user_id = current_user.get("openid", "")
+    content = (body or {}).get("content", "")
+    if not content:
+        return {"success": False, "error": "缺少 content"}
+
+    agent = get_agent(user_id, agent_id)
+    leader_ws = (agent.get("workspace_id") if agent else None) or agent_id
+    roster_content = _read_workspace_file(leader_ws, ".self/team_roster.md")
+    members = _parse_roster_table(roster_content)
+    member = next((m for m in members if m["id"] == member_id), None)
+    if member is None:
+        return {"success": False, "error": "成员不存在"}
+
+    if _team_broker is None:
+        return {"success": False, "error": "消息投递器未就绪"}
+
+    _team_broker.dispatch(
+        (user_id, member_id),
+        {
+            "user_id": user_id,
+            "agent_id": member_id,
+            "workspace_id": member_id,
+            "model_id": member.get("model_id", ""),
+            "system_prompt": member.get("system_prompt", ""),
+            "content": content,
+        },
+    )
+    return {"success": True}
 
 
 if __name__ == "__main__":

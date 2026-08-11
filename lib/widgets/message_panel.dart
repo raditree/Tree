@@ -7,6 +7,7 @@ import '../services/auth_service.dart';
 import '../services/websocket_service.dart';
 import 'message_input.dart';
 import 'message_list.dart';
+import 'teammates_window_page.dart';
 
 /// 消息交互面板（中栏）
 ///
@@ -46,6 +47,12 @@ class _MessagePanelState extends State<MessagePanel> {
 
   /// 消息版本号：消息列表每次结构性变化时递增，驱动 MessageList 滚动到底部
   int _scrollRevision = 0;
+
+  /// 处于 working 状态的 agent 集合（用于标题栏显示状态与停止按钮）
+  final Set<String> _workingAgents = <String>{};
+
+  /// 是否正在等待用户回答 agent 的问题（AskUserQuestion）
+  bool _asking = false;
 
   @override
   void initState() {
@@ -107,29 +114,29 @@ class _MessagePanelState extends State<MessagePanel> {
 
   /// 处理后端推送的消息
   ///
-  /// 支持三种流式事件：
-  /// - `stream_start`：创建空的 agent 消息并标记为流式
-  /// - `stream_chunk`：向对应消息追加内容
-  /// - `stream_end`：标记对应消息流式结束
-  ///
-  /// 其他类型消息按完整 JSON 解析后直接加入列表。
+  /// 文本消息按段渲染：`msg_start` 创建、`msg_chunk` 追加、`msg_end` 结束。
+  /// 工具调用按卡片渲染：`tool_start` 创建、`tool_end` 更新结果。
+  /// 另处理 `agent_status`（working/idle）、`ask_user_question`（提问卡片）、
+  /// `msg_usage`（token 用量）。
   void _handleIncomingMessage(Map<String, dynamic> data) {
     if (!mounted) return;
     final String? type = data['type'] as String?;
-    if (type == 'stream_start') {
+
+    if (type == 'msg_start') {
+      if (!_isForCurrentAgent(data)) return;
       final ChatMessage message = ChatMessage(
-        id: (data['id'] as String?) ??
-            'agent_${DateTime.now().millisecondsSinceEpoch}',
+        id: data['id'] as String? ?? '',
         role: 'agent',
         content: '',
         timestamp: DateTime.now(),
         isStreaming: true,
       );
+      if (message.id.isEmpty) return;
       setState(() {
         _messages.add(message);
         _scrollRevision++;
       });
-    } else if (type == 'stream_chunk') {
+    } else if (type == 'msg_chunk') {
       final String id = (data['id'] as String?) ?? '';
       final String chunk = (data['chunk'] as String?) ?? '';
       final int idx = _messages.indexWhere((ChatMessage m) => m.id == id);
@@ -138,7 +145,7 @@ class _MessagePanelState extends State<MessagePanel> {
           _messages[idx].content += chunk;
         });
       }
-    } else if (type == 'stream_end') {
+    } else if (type == 'msg_end') {
       final String id = (data['id'] as String?) ?? '';
       final int idx = _messages.indexWhere((ChatMessage m) => m.id == id);
       if (idx >= 0) {
@@ -150,7 +157,63 @@ class _MessagePanelState extends State<MessagePanel> {
           _scrollRevision++;
         });
       }
+    } else if (type == 'msg_usage') {
+      final String id = (data['id'] as String?) ?? '';
+      final int idx = _messages.indexWhere((ChatMessage m) => m.id == id);
+      if (idx >= 0) {
+        final Map<String, dynamic>? usage =
+            (data['usage'] as Map<String, dynamic>?)?.cast<String, dynamic>();
+        setState(() {
+          _messages[idx].usage = usage;
+        });
+      }
+    } else if (type == 'tool_start') {
+      if (!_isForCurrentAgent(data)) return;
+      final String id = (data['id'] as String?) ?? '';
+      if (id.isEmpty) return;
+      final Map<String, dynamic>? args =
+          (data['arguments'] as Map<String, dynamic>?)?.cast<String, dynamic>();
+      final ChatMessage toolMsg = ChatMessage(
+        id: id,
+        role: 'agent',
+        content: '',
+        timestamp: DateTime.now(),
+        kind: 'tool',
+        toolName: (data['name'] as String?) ?? '',
+        toolArguments: args,
+        toolRunning: true,
+      );
+      setState(() {
+        _messages.add(toolMsg);
+        _scrollRevision++;
+      });
+    } else if (type == 'tool_end') {
+      final String id = (data['id'] as String?) ?? '';
+      final int idx = _messages.indexWhere((ChatMessage m) => m.id == id);
+      if (idx >= 0) {
+        setState(() {
+          _messages[idx].toolRunning = false;
+          _messages[idx].toolResult = (data['result'] as String?) ?? '';
+        });
+      }
+    } else if (type == 'agent_status') {
+      final Map<String, dynamic> d =
+          (data['data'] as Map<String, dynamic>?)?.cast<String, dynamic>() ??
+              {};
+      final String? agentId = d['agent_id'] as String?;
+      final String? status = d['status'] as String?;
+      if (agentId == null) return;
+      setState(() {
+        if (status == 'working') {
+          _workingAgents.add(agentId);
+        } else if (status == 'idle' || status == 'stopping') {
+          _workingAgents.remove(agentId);
+        }
+      });
+    } else if (type == 'ask_user_question') {
+      _handleAskUserQuestion(data);
     } else if (type == 'message') {
+      if (!_isForCurrentAgent(data)) return;
       // 完整 agent 消息（如后端 _send_text_as_agent 发送的错误提示）
       final ChatMessage message = ChatMessage.fromJson(data);
       setState(() {
@@ -158,8 +221,118 @@ class _MessagePanelState extends State<MessagePanel> {
         _scrollRevision++;
       });
     }
-    // 其余控制消息（tool_call / agent_status / file_sync_progress /
-    // heartbeat / error 等）不含 content，忽略，避免产生空回复气泡。
+    // 其余控制消息（file_sync_progress / heartbeat / error 等）忽略
+  }
+
+  /// 判断消息是否属于当前选中的 agent（避免工作中的成员消息污染主面板）
+  bool _isForCurrentAgent(Map<String, dynamic> data) {
+    final String? agentId = data['agent_id'] as String?;
+    if (agentId == null) return true;
+    final Agent? agent = widget.selectedAgent;
+    return agent != null && agent.id == agentId;
+  }
+
+  /// 处理 agent 的提问（AskUserQuestion 工具）：弹出选择/输入对话框
+  void _handleAskUserQuestion(Map<String, dynamic> data) {
+    if (_asking) return;
+    _asking = true;
+    final String qid = (data['id'] as String?) ?? '';
+    final String question = (data['question'] as String?) ?? '提问';
+    final List<String> options =
+        (data['options'] as List?)?.map((e) => e.toString()).toList() ??
+            <String>[];
+    final TextEditingController controller = TextEditingController();
+
+    Future<void> submit(String answer) async {
+      _asking = false;
+      if (Navigator.of(context).canPop()) {
+        Navigator.of(context).pop();
+      }
+      controller.dispose();
+      _webSocket.send(<String, dynamic>{
+        'type': 'user_answer',
+        'data': {'question_id': qid, 'answer': answer},
+      });
+    }
+
+    Future<void> cancel() async {
+      _asking = false;
+      if (Navigator.of(context).canPop()) {
+        Navigator.of(context).pop();
+      }
+      controller.dispose();
+      _webSocket.send(<String, dynamic>{
+        'type': 'cancel_question',
+        'data': {'question_id': qid},
+      });
+    }
+
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext dialogContext) {
+        return AlertDialog(
+          title: const Text('Agent 需要你的输入'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(question, style: const TextStyle(fontSize: 14)),
+                if (options.isNotEmpty) ...<Widget>[
+                  const SizedBox(height: 12),
+                  for (final String option in options)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 2),
+                      child: ListTile(
+                        dense: true,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          side: BorderSide(
+                            color: Theme.of(context).dividerColor,
+                          ),
+                        ),
+                        title: Text(option, style: const TextStyle(fontSize: 13)),
+                        onTap: () => submit(option),
+                      ),
+                    ),
+                ],
+                const SizedBox(height: 12),
+                TextField(
+                  controller: controller,
+                  maxLines: 3,
+                  minLines: 1,
+                  decoration: const InputDecoration(
+                    labelText: '或直接输入回答',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(onPressed: cancel, child: const Text('取消')),
+            TextButton(
+              onPressed: () => submit(controller.text.trim()),
+              child: const Text('发送'),
+            ),
+          ],
+        );
+      },
+    ).then((_) {
+      _asking = false;
+      controller.dispose();
+    });
+  }
+
+  /// 请求停止当前 agent 的进行中任务
+  void _handleStop() {
+    final Agent? agent = widget.selectedAgent;
+    if (agent == null) return;
+    _webSocket.send(<String, dynamic>{
+      'type': 'stop',
+      'data': {'agent_id': agent.id},
+    });
   }
 
   /// 处理发送
@@ -239,12 +412,14 @@ class _MessagePanelState extends State<MessagePanel> {
     );
   }
 
-  /// 构建标题栏（显示 Agent 名称 + normal LLM 的上下文压缩按钮）
+  /// 构建标题栏（显示 Agent 名称 + 状态 + 停止/teammates/压缩按钮）
   Widget _buildTitleBar(Agent? agent) {
     final cs = Theme.of(context).colorScheme;
     final String? title = agent?.name;
     // 仅 normal LLM 需要上下文压缩（无限上下文 LLM 无操作）
     final bool showCompact = agent != null && !agent.isLimitless;
+    // 当前 agent 是否在工作
+    final bool working = agent != null && _workingAgents.contains(agent.id);
     return Container(
       height: 48,
       padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -259,17 +434,51 @@ class _MessagePanelState extends State<MessagePanel> {
           Expanded(
             child: Padding(
               padding: const EdgeInsets.only(left: 8),
-              child: Text(
-                title ?? '未选择',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                ),
+              child: Row(
+                children: <Widget>[
+                  Flexible(
+                    child: Text(
+                      title ?? '未选择',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  if (working) ...<Widget>[
+                    const SizedBox(width: 8),
+                    SizedBox(
+                      width: 12,
+                      height: 12,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: cs.primary,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    const Text(
+                      '工作中',
+                      style: TextStyle(fontSize: 11, color: Colors.orange),
+                    ),
+                  ],
+                ],
               ),
             ),
           ),
+          if (agent != null)
+            IconButton(
+              tooltip: '查看 teammates 工作进度',
+              icon: const Icon(Icons.hub, size: 20),
+              onPressed: () => _openTeammatesWindow(agent),
+            ),
+          if (working)
+            IconButton(
+              tooltip: '停止',
+              icon: Icon(Icons.stop_circle, size: 22, color: cs.error),
+              onPressed: _handleStop,
+            ),
           if (showCompact)
             IconButton(
               tooltip: '压缩上下文',
@@ -277,6 +486,15 @@ class _MessagePanelState extends State<MessagePanel> {
               onPressed: () => _compactContext(agent.id),
             ),
         ],
+      ),
+    );
+  }
+
+  /// 打开 teammates 工作进度窗口
+  void _openTeammatesWindow(Agent agent) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => TeammatesWindowPage(agent: agent),
       ),
     );
   }

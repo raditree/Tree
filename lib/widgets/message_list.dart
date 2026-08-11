@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 
 import '../models/message.dart';
+import 'tool_call_card.dart';
 
 /// 消息列表组件（StatelessWidget）
 ///
@@ -101,6 +102,13 @@ class _MessageListViewState extends State<_MessageListView> {
       itemCount: widget.messages.length,
       itemBuilder: (BuildContext context, int index) {
         final ChatMessage message = widget.messages[index];
+        // 工具调用卡片：默认折叠，独立渲染
+        if (message.kind == 'tool') {
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 4),
+            child: ToolCallCard(message: message),
+          );
+        }
         return Padding(
           padding: const EdgeInsets.only(bottom: 12),
           child: _MessageBubble(message: message),

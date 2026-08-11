@@ -28,6 +28,21 @@ class ChatMessage {
   /// 无限上下文 LLM 或未统计时为 null。
   Map<String, dynamic>? usage;
 
+  /// 消息种类："text"（普通文本）或 "tool"（工具调用卡片）
+  final String kind;
+
+  /// 工具名称（kind == "tool" 时有效）
+  final String? toolName;
+
+  /// 工具调用参数（kind == "tool" 时有效）
+  final Map<String, dynamic>? toolArguments;
+
+  /// 工具执行结果文本（kind == "tool" 时有效）
+  String toolResult;
+
+  /// 工具是否仍在执行中（kind == "tool" 时有效）
+  bool toolRunning;
+
   ChatMessage({
     required this.id,
     required this.role,
@@ -36,6 +51,11 @@ class ChatMessage {
     this.attachments,
     this.isStreaming = false,
     this.usage,
+    this.kind = 'text',
+    this.toolName,
+    this.toolArguments,
+    this.toolResult = '',
+    this.toolRunning = false,
   });
 
   /// 是否为用户消息

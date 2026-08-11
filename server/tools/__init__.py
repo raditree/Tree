@@ -1,5 +1,6 @@
 """内置工具装配：将内置工具注册到 LLM 会话，并把工作空间基础工具注册为 MCP 服务。"""
 
+import asyncio
 import logging
 import os
 import sys
@@ -7,6 +8,8 @@ from typing import Any, Dict, Optional
 
 from core.docker_manager import DockerManager
 from core.llm import AgentLLMSession
+from core.ws_manager import WebSocketManager
+from tools.ask_question_tool import AskUserQuestionTool
 from tools.help_tool import HelpTool
 from tools.mcp_tool import MCPManager, MCPTool
 from tools.refresh_tool import RefreshTool
@@ -28,6 +31,7 @@ def register_builtin_tools(
     mcp_config: Optional[Dict[str, Any]] = None,
     broker: Optional[Any] = None,
     user_id: str = "",
+    ws_manager: Optional[WebSocketManager] = None,
 ) -> None:
     """将内置工具注册到会话，并把工作空间基础工具注册为 MCP 服务。
 
@@ -38,6 +42,8 @@ def register_builtin_tools(
     :param broker: 团队成员消息投递器（TeamMessageBroker），team 工具用于
                    触发成员异步处理
     :param user_id: 当前用户标识，team 工具投递成员消息时使用
+    :param ws_manager: WebSocketManager 实例，AskUserQuestion 工具用于
+                       向用户推送问题卡片
     """
     # MCP 管理器：先注册外部 MCP 服务（来自配置文件）
     mcp_manager = MCPManager()
@@ -65,9 +71,15 @@ def register_builtin_tools(
     team_tool = TeamTool(
         session, docker_manager, model_configs, broker=broker, user_id=user_id
     )
+    ask_tool = AskUserQuestionTool(ws_manager=ws_manager, user_id=user_id)
+    # 绑定主事件循环，供 AskUserQuestion 在消费线程内安全推送 WS 消息
+    try:
+        ask_tool.bind_loop(asyncio.get_running_loop())
+    except RuntimeError:
+        pass
 
     # 统一注册内置工具：handler 收集关键字参数后调用各工具的 execute(dict)
-    for tool in (help_tool, set_tool, refresh_tool, mcp_tool, team_tool):
+    for tool in (help_tool, set_tool, refresh_tool, mcp_tool, team_tool, ask_tool):
         definition = tool.get_tool_definition()
         session.register_tool(
             name=definition["function"]["name"],

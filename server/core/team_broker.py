@@ -13,12 +13,13 @@ leader 通过 ``team send_message`` / ``assign_task`` 给成员投递消息时�
 
 import asyncio
 import logging
+import queue as _queue
 from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# 处理函数签名：async fn(payload: dict) -> None
-ProcessFn = Callable[[dict], Any]
+# 处理函数签名：async fn(payload: dict, queue) -> None
+ProcessFn = Callable[[dict, Any], Any]
 
 
 class TeamMessageBroker:
@@ -26,8 +27,9 @@ class TeamMessageBroker:
 
     def __init__(self, process_fn: ProcessFn) -> None:
         self._process_fn = process_fn
-        # key -> asyncio.Queue，每个成员一个消息队列
-        self._queues: Dict[tuple, asyncio.Queue] = {}
+        # key -> queue.Queue（线程安全）。chat 消费线程会从该队列 peek 新消息，
+        # 因此使用标准库 queue 而非 asyncio.Queue，避免跨线程访问的竞态。
+        self._queues: Dict[tuple, _queue.Queue] = {}
         # key -> asyncio.Task，每个成员一个 worker 串行消费
         self._workers: Dict[tuple, asyncio.Task] = {}
 
@@ -40,7 +42,7 @@ class TeamMessageBroker:
         """
         if not self._process_fn:
             return False
-        queue = self._queues.setdefault(key, asyncio.Queue())
+        queue = self._queues.setdefault(key, _queue.Queue())
         queue.put_nowait(payload)
         worker = self._workers.get(key)
         if worker is None or worker.done():
@@ -51,20 +53,21 @@ class TeamMessageBroker:
             self._workers[key] = loop.create_task(self._run(key, queue))
         return True
 
-    async def _run(self, key: tuple, queue: asyncio.Queue) -> None:
+    async def _run(self, key: tuple, queue: _queue.Queue) -> None:
         """成员 worker：串行消费队列中的消息。
 
         将 ``queue`` 一并传给处理函数，使其能在当前消息的 tool_call
-        间隙通过 ``on_tool_turn`` 回调切入处理新消息。
+        间隙通过 ``on_tool_turn`` 回调切入处理新消息（chat 消费线程内
+        调用 ``get_nowait``，queue.Queue 线程安全）。
         """
         while True:
-            payload = await queue.get()
+            # 在事件循环线程中阻塞等待队列；用 run_in_executor 避免阻塞循环。
+            payload = await asyncio.to_thread(queue.get)
             try:
                 result = self._process_fn(payload, queue)
                 if asyncio.iscoroutine(result):
                     await result
             except asyncio.CancelledError:
-                queue.task_done()
                 raise
             except Exception as exc:  # noqa: BLE001
                 logger.exception("成员消息处理异常, key=%s: %s", key, exc)
