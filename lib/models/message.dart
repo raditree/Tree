@@ -71,6 +71,10 @@ class ChatMessage {
         (json['usage'] as Map<dynamic, dynamic>?)?.map(
       (dynamic k, dynamic v) => MapEntry(k.toString(), v),
     );
+    final Map<String, dynamic>? toolArgs =
+        (json['tool_arguments'] as Map<dynamic, dynamic>?)?.map(
+      (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+    );
     return ChatMessage(
       id: json['id'] as String? ?? '',
       role: json['role'] as String? ?? 'agent',
@@ -82,6 +86,10 @@ class ChatMessage {
       isStreaming:
           json['is_streaming'] as bool? ?? json['isStreaming'] as bool? ?? false,
       usage: usage,
+      kind: json['kind'] as String? ?? 'text',
+      toolName: json['tool_name'] as String?,
+      toolArguments: toolArgs,
+      toolResult: json['tool_result'] as String? ?? '',
     );
   }
 

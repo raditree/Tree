@@ -286,12 +286,13 @@ class ApiService {
     return _getJson('/api/workspaces/$workspaceId/git/branches');
   }
 
-  // ==================== 文件同步相关接口（暂未实现，后端返回 501） ====================
+  // ==================== 文件同步相关接口 ====================
 
   /// 同步工作空间文件到本地目录
   ///
-  /// 调用 `POST /api/files/{workspace_id}/syncToLocal`，后端暂未实现（返回 501）。
-  /// 501 时抛出"功能开发中"异常，UI 层可据此提示用户。
+  /// 调用 `POST /api/files/{workspace_id}/syncToLocal`，请求体为
+  /// `{"local_path": "..."}`。后端在容器内 tar 打包所有文件（排除 .git），
+  /// base64 编码后传回服务端解包到指定本地目录。
   static Future<void> syncToLocal(
     String workspaceId,
     String localPath,

@@ -12,6 +12,71 @@ from core.models import ModelConfig
 logger = logging.getLogger(__name__)
 
 
+def _stringify_tool_result(result: Any) -> str:
+    """将工具执行结果转为前端可读字符串。
+
+    dict 结果会被格式化为人类可读文本，而非原始 JSON / Python dict 字符串。
+    策略：
+    1. 优先提取 content / output / result / message / text 等字段
+    2. 提取 error 字段
+    3. 将剩余 key-value 格式化为 ``标签: 值`` 行（跳过元数据字段）
+    """
+    if isinstance(result, dict):
+        # 1. 已知内容字段
+        for key in ("content", "output", "result", "message", "text", "summary"):
+            val = result.get(key)
+            if val is not None and str(val).strip():
+                return str(val)
+        # 2. error 字段
+        err = result.get("error")
+        if err is not None:
+            return f"错误: {err}"
+        # 3. 格式化所有字段为可读文本（跳过元数据）
+        skip = {"tool_name", "service", "isError"}
+        lines = []
+        for k, v in result.items():
+            if k in skip:
+                continue
+            label = _FIELD_LABELS.get(k, k)
+            if isinstance(v, list):
+                lines.append(f"{label}: {len(v)} 项")
+            elif isinstance(v, bool):
+                lines.append(f"{label}: {'是' if v else '否'}")
+            elif v is not None:
+                lines.append(f"{label}: {v}")
+        if lines:
+            return "\n".join(lines)
+        # 空dict
+        return str(result) if result else "完成"
+    return str(result)
+
+
+# 常见字段名的中文标签
+_FIELD_LABELS: Dict[str, str] = {
+    "success": "成功",
+    "status": "状态",
+    "task_id": "任务ID",
+    "member_id": "成员ID",
+    "member_name": "成员名称",
+    "file_path": "文件路径",
+    "to": "目标",
+    "from": "来源",
+    "count": "数量",
+    "total": "总数",
+    "models": "模型列表",
+    "members": "成员列表",
+    "tasks": "任务列表",
+    "tools": "工具列表",
+    "level": "层级",
+    "model_id": "模型",
+    "name": "名称",
+    "action": "操作",
+    "description": "描述",
+    "comment": "评价",
+    "work_status": "工作状态",
+}
+
+
 class LLMClientFactory:
     """OpenAI SDK client 工厂。
 
@@ -311,18 +376,21 @@ class AgentLLMSession:
                     else:
                         result = f"未找到工具: {tc['name']}"
 
+                    # dict 结果提取可读内容，避免前端显示原始 dict 字符串
+                    result_str = _stringify_tool_result(result)
+
                     yield {
                         "type": "tool_call",
                         "name": tc["name"],
                         "arguments": args,
-                        "result": str(result),
+                        "result": result_str,
                     }
 
                     # 将工具结果添加到上下文
                     self.context.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
-                        "content": str(result),
+                        "content": result_str,
                     })
 
                 # tool_call 间隙：若提供了插入回调，检查是否有新消息需要切入处理

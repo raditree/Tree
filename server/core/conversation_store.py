@@ -60,13 +60,21 @@ def _ensure_db() -> None:
             )
             """
         )
-        # 兼容旧库：缺 usage 列时补充（ALTER TABLE ADD COLUMN）
+        # 兼容旧库：缺列时补充
         cols = {
             row[1]
             for row in conn.execute("PRAGMA table_info(messages)").fetchall()
         }
         if "usage" not in cols:
             conn.execute("ALTER TABLE messages ADD COLUMN usage TEXT")
+        if "kind" not in cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN kind TEXT DEFAULT 'text'")
+        if "tool_name" not in cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN tool_name TEXT")
+        if "tool_arguments" not in cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN tool_arguments TEXT")
+        if "tool_result" not in cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN tool_result TEXT")
         conn.commit()
     _initialized = True
 
@@ -85,23 +93,38 @@ def store_message(
     role: str,
     content: str,
     usage: Optional[Dict[str, Any]] = None,
+    kind: str = "text",
+    tool_name: Optional[str] = None,
+    tool_arguments: Optional[Dict[str, Any]] = None,
+    tool_result: Optional[str] = None,
 ) -> Dict[str, Any]:
     """保存一条消息到 SQLite，返回消息对象（含 id/timestamp）。
 
     :param usage: 可选 token 用量统计（agent 消息），JSON 序列化存储
+    :param kind: 消息种类，``"text"``（普通文本）或 ``"tool"``（工具调用卡片）
+    :param tool_name: 工具名称（kind == "tool" 时有效）
+    :param tool_arguments: 工具调用参数（kind == "tool" 时有效，JSON 序列化存储）
+    :param tool_result: 工具执行结果文本（kind == "tool" 时有效）
     """
     _ensure_db()
     timestamp = int(time.time() * 1000)
     msg_id = f"msg_{timestamp}"
     usage_json = json.dumps(usage, ensure_ascii=False) if usage else None
+    args_json = (
+        json.dumps(tool_arguments, ensure_ascii=False) if tool_arguments else None
+    )
     with _write_lock:
         conn = _connect()
         try:
             conn.execute(
                 "INSERT INTO messages "
-                "(user_id, agent_id, role, content, timestamp, msg_id, usage) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (user_id, agent_id, role, content, timestamp, msg_id, usage_json),
+                "(user_id, agent_id, role, content, timestamp, msg_id, usage, "
+                "kind, tool_name, tool_arguments, tool_result) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    user_id, agent_id, role, content, timestamp, msg_id,
+                    usage_json, kind, tool_name, args_json, tool_result,
+                ),
             )
             conn.commit()
         finally:
@@ -113,6 +136,10 @@ def store_message(
         "timestamp": timestamp,
         "is_streaming": False,
         "usage": usage,
+        "kind": kind,
+        "tool_name": tool_name,
+        "tool_arguments": tool_arguments,
+        "tool_result": tool_result,
     }
 
 
@@ -123,7 +150,9 @@ def get_history(user_id: str, agent_id: str) -> List[Dict[str, Any]]:
     try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT msg_id, role, content, timestamp, usage FROM messages "
+            "SELECT msg_id, role, content, timestamp, usage, "
+            "kind, tool_name, tool_arguments, tool_result "
+            "FROM messages "
             "WHERE user_id = ? AND agent_id = ? ORDER BY id ASC",
             (user_id, agent_id),
         ).fetchall()
@@ -136,6 +165,16 @@ def get_history(user_id: str, agent_id: str) -> List[Dict[str, Any]]:
                     usage = json.loads(raw_usage)
                 except (ValueError, TypeError):
                     usage = None
+            tool_args = None
+            raw_args = row["tool_arguments"] if "tool_arguments" in row.keys() else None
+            if raw_args:
+                try:
+                    tool_args = json.loads(raw_args)
+                except (ValueError, TypeError):
+                    tool_args = None
+            kind = row["kind"] if "kind" in row.keys() else "text"
+            tool_name = row["tool_name"] if "tool_name" in row.keys() else None
+            tool_result = row["tool_result"] if "tool_result" in row.keys() else None
             result.append(
                 {
                     "id": row["msg_id"],
@@ -144,6 +183,10 @@ def get_history(user_id: str, agent_id: str) -> List[Dict[str, Any]]:
                     "timestamp": row["timestamp"],
                     "is_streaming": False,
                     "usage": usage,
+                    "kind": kind or "text",
+                    "tool_name": tool_name,
+                    "tool_arguments": tool_args,
+                    "tool_result": tool_result or "",
                 }
             )
         return result

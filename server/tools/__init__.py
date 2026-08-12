@@ -78,14 +78,27 @@ def register_builtin_tools(
     except RuntimeError:
         pass
 
-    # 统一注册内置工具：handler 收集关键字参数后调用各工具的 execute(dict)
+    # 统一注册内置工具：handler 收集关键字参数后调用各工具的 execute(dict)。
+    # redirect_output 由 _make_handler 统一拦截处理，不传入 execute。
     for tool in (help_tool, set_tool, refresh_tool, mcp_tool, team_tool, ask_tool):
         definition = tool.get_tool_definition()
+        # 给每个内置工具注入 redirect_output 可选参数
+        params = definition["function"]["parameters"]
+        if "properties" not in params:
+            params["properties"] = {}
+        params["properties"]["redirect_output"] = {
+            "type": "string",
+            "description": (
+                "将工具输出重定向保存到工作空间内的指定文件路径"
+                "（如 .output/result.txt）。设置后工具返回保存提示而非原始输出，"
+                "便于通过 tail 查看大输出。"
+            ),
+        }
         session.register_tool(
             name=definition["function"]["name"],
             description=definition["function"]["description"],
-            parameters=definition["function"]["parameters"],
-            handler=_make_handler(tool),
+            parameters=params,
+            handler=_make_handler(tool, session, docker_manager),
         )
     logger.info(
         "已注册内置工具: %s",
@@ -95,10 +108,39 @@ def register_builtin_tools(
     )
 
 
-def _make_handler(tool) -> Any:
-    """构造工具 handler：将 tool_call 的关键字参数打包为 dict 传给 execute。"""
+def _make_handler(tool, session=None, docker_manager=None) -> Any:
+    """构造工具 handler：将 tool_call 的关键字参数打包为 dict 传给 execute。
+
+    若参数中包含 ``redirect_output``，则工具执行后把结果写入工作空间内
+    指定文件，并返回保存提示（而非原始输出），便于 tail 查看大输出。
+    """
 
     def handler(**kwargs: Any) -> Any:
-        return tool.execute(kwargs)
+        redirect_path = kwargs.pop("redirect_output", None)
+        result = tool.execute(kwargs)
+
+        if redirect_path and session and docker_manager:
+            workspace_id = getattr(session, "workspace_id", "") or ""
+            if workspace_id:
+                try:
+                    import base64 as _b64
+                    # 将结果写入工作空间内文件
+                    content = str(result) if result is not None else ""
+                    b64 = _b64.b64encode(content.encode("utf-8")).decode("ascii")
+                    # 确保目录存在
+                    dir_path = "/".join(redirect_path.rsplit("/", 1)[:-1])
+                    mkdir_cmd = ""
+                    if dir_path:
+                        mkdir_cmd = f"mkdir -p '{dir_path}' && "
+                    cmd = [
+                        "sh", "-c",
+                        f"{mkdir_cmd}echo '{b64}' | base64 -d > '{redirect_path}'",
+                    ]
+                    docker_manager.exec_in_workspace(workspace_id, cmd)
+                    return f"工具调用结果已保存到 {redirect_path}"
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("redirect_output 写入失败: %s", exc)
+                    return result
+        return result
 
     return handler

@@ -520,11 +520,30 @@ async def get_file_content(
 
     查询参数 ``path`` 指定文件路径，
     通过 docker_manager.exec_in_workspace 读取文件内容。
+    图片文件（png/jpg/gif 等）返回 base64 编码，``is_base64=true``。
     """
     if not path:
         raise HTTPException(status_code=400, detail="path 参数不能为空")
     docker_manager = _get_docker_manager(request)
     safe_path = _escape_shell_path(path)
+
+    # 图片文件：base64 编码返回，避免二进制被 cat 文本化破坏
+    _image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico"}
+    lower_path = path.lower()
+    if any(lower_path.endswith(ext) for ext in _image_exts):
+        result = docker_manager.exec_in_workspace(
+            workspace_id, ["sh", "-c", f"base64 '{safe_path}' 2>/dev/null"]
+        )
+        if result.get("exit_code", 0) != 0:
+            raise HTTPException(status_code=404, detail="文件不存在或无法读取")
+        b64 = result.get("stdout", "").replace("\n", "").replace("\r", "")
+        return {
+            "content": b64,
+            "path": path,
+            "size": len(b64),
+            "is_base64": True,
+        }
+
     result = docker_manager.exec_in_workspace(
         workspace_id, ["sh", "-c", f"cat '{safe_path}' 2>&1"]
     )
@@ -851,6 +870,78 @@ async def sync_files(
         status_code=501,
         detail="文件同步功能暂未实现，需要前端配合实现",
     )
+
+
+class SyncToLocalRequest(BaseModel):
+    """同步工作空间文件到本地目录请求体。"""
+
+    local_path: str
+
+
+@router.post("/files/{workspace_id}/syncToLocal")
+async def sync_to_local(
+    workspace_id: str,
+    req: SyncToLocalRequest,
+    request: Request,
+    _: dict = Depends(get_current_user),
+):
+    """将工作空间内所有文件同步到本地目录。
+
+    在容器内执行 ``tar`` 打包 /workspace 下所有文件，通过 Docker exec
+    的 stdout 流式传回，服务端直接写入用户指定的本地路径。
+
+    :param workspace_id: 工作空间标识
+    :param req.local_path: 本地目标目录（不存在则自动创建）
+    """
+    import io
+    import tarfile
+    import shutil
+
+    local_path = req.local_path.strip()
+    if not local_path:
+        raise HTTPException(status_code=400, detail="local_path 不能为空")
+
+    docker_manager = _get_docker_manager(request)
+
+    # 容器内 tar 打包后 base64 编码，避免 exec stdout 二进制被 UTF-8 解码损坏
+    result = docker_manager.exec_in_workspace(
+        workspace_id,
+        ["sh", "-c", "tar -cf - --exclude='.git' -C /workspace . | base64"],
+    )
+    if "error" in result and "exit_code" not in result:
+        raise HTTPException(status_code=500, detail=result)
+
+    b64_data = "".join(result.get("stdout", "").split())
+    if not b64_data:
+        raise HTTPException(status_code=500, detail="工作空间为空或打包失败")
+
+    import base64 as _b64
+    tar_bytes = _b64.b64decode(b64_data)
+
+    # 确保本地目录存在
+    os.makedirs(local_path, exist_ok=True)
+
+    # 逐个解包 tar 成员：已存在的文件覆盖，已存在的目录跳过
+    try:
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r") as tar:
+            for member in tar.getmembers():
+                member_path = os.path.join(local_path, member.name)
+                # 防止路径穿越（如 ../../etc/passwd）
+                normalized = os.path.normpath(member_path)
+                if not normalized.startswith(os.path.normpath(local_path)):
+                    continue
+                if member.isdir():
+                    os.makedirs(member_path, exist_ok=True)
+                elif member.isfile():
+                    os.makedirs(os.path.dirname(member_path), exist_ok=True)
+                    tar.extract(member, path=local_path)
+                # 符号链接等跳过
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"解包到本地失败: {exc}"
+        ) from exc
+
+    return {"success": True, "local_path": local_path}
 
 
 # ===== 工作空间生命周期管理 =====

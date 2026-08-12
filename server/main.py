@@ -71,9 +71,18 @@ def _store_message(
     role: str,
     content: str,
     usage: Optional[Dict[str, Any]] = None,
+    kind: str = "text",
+    tool_name: Optional[str] = None,
+    tool_arguments: Optional[Dict[str, Any]] = None,
+    tool_result: Optional[str] = None,
 ) -> Dict[str, Any]:
     """保存一条消息到 SQLite 持久化历史。"""
-    return store_message(user_id, agent_id, role, content, usage=usage)
+    return store_message(
+        user_id, agent_id, role, content,
+        usage=usage, kind=kind,
+        tool_name=tool_name, tool_arguments=tool_arguments,
+        tool_result=tool_result,
+    )
 
 
 async def _register_tools(
@@ -499,20 +508,32 @@ async def _stream_agent_reply(
     thread_task = asyncio.create_task(asyncio.to_thread(_consume))
 
     full_parts: List[str] = []
+    text_parts: List[str] = []  # 当前文本段的累积内容
     text_id: Optional[str] = None
     flush_buf = ""
     status = "ok"
 
     def _close_text() -> None:
-        """结束当前文本段（中间输出独立成一条消息，结束时不带 usage）。"""
-        nonlocal text_id
+        """结束当前文本段（中间输出独立成一条消息，结束时不带 usage）。
+
+        中间文本段持久化到历史表，重启后可通过 get_history 恢复。
+        """
+        nonlocal text_id, text_parts
         if text_id is not None:
             asyncio.ensure_future(
                 ws_manager.send_message(
                     user_id, {"type": "msg_end", "id": text_id, "agent_id": agent_id}
                 )
             )
+            # 持久化中间文本段（非最终回复）
+            intermediate_text = "".join(text_parts)
+            if intermediate_text.strip():
+                try:
+                    _store_message(user_id, agent_id, "agent", intermediate_text)
+                except Exception:  # noqa: BLE001
+                    pass
             text_id = None
+            text_parts = []
 
     try:
         while True:
@@ -530,6 +551,7 @@ async def _stream_agent_reply(
             if itype == "text":
                 content = item.get("content", "")
                 full_parts.append(content)
+                text_parts.append(content)
                 if text_id is None:
                     text_id = _new_seg_id(agent_id)
                     await ws_manager.send_message(
@@ -588,6 +610,17 @@ async def _stream_agent_reply(
                         "result": str(result),
                     },
                 )
+                # 持久化工具调用到历史表
+                try:
+                    _store_message(
+                        user_id, agent_id, "agent", "",
+                        kind="tool",
+                        tool_name=name,
+                        tool_arguments=args if isinstance(args, dict) else {},
+                        tool_result=str(result),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             else:
                 # 未知产出类型，忽略
                 continue
@@ -633,6 +666,9 @@ async def _process_member_message(
         )
         return
 
+    # 保存成员收到的消息到历史（teammates 进度页可加载显示）
+    _store_message(user_id, agent_id, "user", content)
+
     # 构建成员会话（normal 复用缓存累积上下文；limitless 每次新建并从 DB 恢复）
     # 系统提示词：基础指令 + 身份(identity.md) + rule.md + 存储告警 + 成员专属提示词
     member_system_prompt = payload.get("system_prompt", "")
@@ -658,6 +694,7 @@ async def _process_member_message(
                 system_prompt=enhanced_prompt,
             )
             set_session(user_id, agent_id, session)
+            await _register_tools(session, agent_id, user_id)
             restored = load_context(user_id, agent_id)
             if restored:
                 session.context = restored
@@ -694,7 +731,7 @@ async def _process_member_message(
         {"type": "agent_status", "data": {"agent_id": agent_id, "status": "working"}},
     )
     try:
-        _, _status, _last = await _stream_agent_reply(
+        full_reply, _status, _last = await _stream_agent_reply(
             user_id,
             agent_id,
             workspace_id,
@@ -709,6 +746,9 @@ async def _process_member_message(
                 user_id,
                 {"type": "msg_end", "id": _last, "agent_id": agent_id, "usage": None},
             )
+        # 保存成员回复到历史（teammates 进度页可加载显示）
+        if full_reply:
+            _store_message(user_id, agent_id, "agent", full_reply)
         _append_activity_log(workspace_id, f"[{_clock_now()}] [done(成员)] 回复完成")
     except Exception as exc:  # noqa: BLE001
         logger.exception("成员消息处理失败: %s", exc)

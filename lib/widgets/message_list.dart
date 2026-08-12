@@ -52,19 +52,31 @@ class _MessageListView extends StatefulWidget {
 class _MessageListViewState extends State<_MessageListView> {
   final ScrollController _controller = ScrollController();
 
+  /// 用户是否靠近底部（用于判断流式追加时是否自动跟随）
+  bool _nearBottom = true;
+
   @override
   void initState() {
     super.initState();
+    _controller.addListener(_onScroll);
     WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
   }
 
   @override
   void didUpdateWidget(covariant _MessageListView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // 版本号变化（新增消息/切换 agent 重载历史/流式追加）时滚动到底部
-    if (oldWidget.revision != widget.revision) {
+    // 仅在用户已处于底部附近时，才随新消息自动滚动（避免打断用户查看历史）
+    if (oldWidget.revision != widget.revision && _nearBottom) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
     }
+  }
+
+  /// 监听滚动位置，更新 _nearBottom 标志
+  void _onScroll() {
+    if (!_controller.hasClients) return;
+    final double max = _controller.position.maxScrollExtent;
+    final double pos = _controller.position.pixels;
+    _nearBottom = (max - pos) < 120;
   }
 
   /// 滚动到底部
@@ -79,6 +91,7 @@ class _MessageListViewState extends State<_MessageListView> {
 
   @override
   void dispose() {
+    _controller.removeListener(_onScroll);
     _controller.dispose();
     super.dispose();
   }

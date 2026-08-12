@@ -12,6 +12,7 @@ leader 通过 ``team send_message`` / ``assign_task`` 给成员投递消息时�
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import queue as _queue
 from typing import Any, Callable, Dict, Optional
@@ -30,8 +31,14 @@ class TeamMessageBroker:
         # key -> queue.Queue（线程安全）。chat 消费线程会从该队列 peek 新消息，
         # 因此使用标准库 queue 而非 asyncio.Queue，避免跨线程访问的竞态。
         self._queues: Dict[tuple, _queue.Queue] = {}
-        # key -> asyncio.Task，每个成员一个 worker 串行消费
-        self._workers: Dict[tuple, asyncio.Task] = {}
+        # key -> concurrent.futures.Future（worker 已在主事件循环上创建）
+        self._workers: Dict[tuple, Any] = {}
+        # 主事件循环：在构造（lifespan 协程上下文）时捕获，供 dispatch 从
+        # 任意工作线程安全地调度 worker 任务。
+        try:
+            self._loop: Optional[Any] = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
 
     def dispatch(self, key: tuple, payload: dict) -> bool:
         """同步投递一条消息给成员。
@@ -46,12 +53,31 @@ class TeamMessageBroker:
         queue.put_nowait(payload)
         worker = self._workers.get(key)
         if worker is None or worker.done():
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = asyncio.get_event_loop()
-            self._workers[key] = loop.create_task(self._run(key, queue))
+            if self._loop is None or self._loop.is_closed():
+                logger.error("无可用事件循环，无法为成员 %s 启动 worker", key)
+                return False
+            # dispatch 可能在 chat 消费线程（无 running loop）中被调用，
+            # 因此通过 run_coroutine_threadsafe 把 worker 调度到主事件循环。
+            future = asyncio.run_coroutine_threadsafe(
+                self._run(key, queue), self._loop
+            )
+            self._workers[key] = future
+            # 吞掉 worker 异常并记录日志，避免 future 未被消费导致静默丢失。
+            future.add_done_callback(self._on_worker_done)
         return True
+
+    def _on_worker_done(self, future: Any) -> None:
+        """worker 结束回调：记录未捕获的异常（不抛出到调度线程）。"""
+        try:
+            future.result()
+        except (
+            asyncio.CancelledError,
+            concurrent.futures.CancelledError,
+            KeyboardInterrupt,
+        ):
+            pass
+        except Exception:  # noqa: BLE001
+            logger.exception("成员 worker 异常结束")
 
     async def _run(self, key: tuple, queue: _queue.Queue) -> None:
         """成员 worker：串行消费队列中的消息。
