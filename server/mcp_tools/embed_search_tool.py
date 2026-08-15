@@ -9,7 +9,7 @@ import shlex
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.docker_manager import DockerManager
-from core.embed_model import EmbedModelConfig, get_embedding, load_embed_model_config
+from core.embed_model import EmbedModelConfig, get_embedding, get_embeddings_batch, load_embed_model_config
 
 logger = logging.getLogger(__name__)
 
@@ -167,15 +167,18 @@ class EmbedSearchTool:
 
         # 如果嵌入模型可用，计算语义相似度并重排序
         if query_embedding is not None and embed_config is not None:
+            # 批量获取所有候选内容的向量，减少 API 调用次数
+            candidate_texts = [content for _, _, content in candidates]
+            content_embeddings = get_embeddings_batch(candidate_texts, embed_config)
+
             scored_results: List[Dict[str, Any]] = []
-            for file_path, line_num, content in candidates:
-                # 获取候选内容的向量
-                content_embedding = get_embedding(content, embed_config)
-                if content_embedding is None:
-                    # 获取向量失败时使用默认相似度
-                    score = 0.0
+            for i, (file_path, line_num, content) in enumerate(candidates):
+                if content_embeddings is not None and i < len(content_embeddings):
+                    score = _cosine_similarity(
+                        query_embedding, content_embeddings[i]
+                    )
                 else:
-                    score = _cosine_similarity(query_embedding, content_embedding)
+                    score = 0.0
                 scored_results.append({
                     "file": file_path,
                     "line": line_num,

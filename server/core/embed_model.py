@@ -3,7 +3,9 @@
 读取 ``server/configs/embed_model.yaml`` 获取嵌入模型配置，
 提供 OpenAI 协议兼容的 embedding API 调用封装。
 """
+import hashlib
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -19,6 +21,23 @@ _EMBED_CONFIG_FILE = _CONFIG_DIR / "embed_model.yaml"
 
 # EmbedModelConfig 固定字段，其余字段归入 extra
 _KNOWN_FIELDS = {"name", "base_url", "api_key", "model_id"}
+
+# 嵌入结果 LRU 缓存：key = MD5(text) + 可选的 dimensions 后缀
+_embedding_cache: OrderedDict[str, List[float]] = OrderedDict()
+_EMBEDDING_CACHE_MAX_SIZE = 1000
+
+
+def _cache_key(text: str, dimensions: Optional[int] = None) -> str:
+    """根据文本内容生成缓存键（MD5 哈希），dimensions 不同视为不同键。
+
+    :param text: 输入文本
+    :param dimensions: 向量维度（可选）
+    :return: 缓存键字符串
+    """
+    key = hashlib.md5(text.encode("utf-8")).hexdigest()
+    if dimensions is not None:
+        key = f"{key}_d{dimensions}"
+    return key
 
 
 @dataclass
@@ -98,11 +117,19 @@ def get_embedding(
 ) -> Optional[List[float]]:
     """调用嵌入模型 API，返回文本的向量表示。
 
+    内置 MD5 哈希 LRU 缓存，相同的文本内容不会重复调用 API。
+
     :param text: 输入文本
     :param config: 嵌入模型配置
     :param dimensions: 向量维度（模型支持动态维度时可选）
     :return: 浮点数向量列表，调用失败时返回 None
     """
+    # 检查缓存命中
+    key = _cache_key(text, dimensions)
+    if key in _embedding_cache:
+        _embedding_cache.move_to_end(key)
+        return _embedding_cache[key]
+
     client = config.create_client()
 
     kwargs: Dict[str, Any] = {
@@ -125,7 +152,15 @@ def get_embedding(
         logger.warning("嵌入模型 API 返回空数据")
         return None
 
-    return response.data[0].embedding
+    result = response.data[0].embedding
+
+    # 写入缓存
+    _embedding_cache[key] = result
+    _embedding_cache.move_to_end(key)
+    if len(_embedding_cache) > _EMBEDDING_CACHE_MAX_SIZE:
+        _embedding_cache.popitem(last=False)
+
+    return result
 
 
 def get_embeddings_batch(
@@ -135,6 +170,9 @@ def get_embeddings_batch(
 ) -> Optional[List[List[float]]]:
     """批量调用嵌入模型 API，返回多个文本的向量表示。
 
+    内置 MD5 哈希 LRU 缓存，对每个文本单独检查缓存，
+    仅将未命中缓存的文本发送给 API，减少不必要的调用。
+
     :param texts: 输入文本列表
     :param config: 嵌入模型配置
     :param dimensions: 向量维度（模型支持动态维度时可选）
@@ -143,10 +181,29 @@ def get_embeddings_batch(
     if not texts:
         return []
 
+    # 逐条检查缓存，分离已缓存和未缓存
+    keys = [_cache_key(t, dimensions) for t in texts]
+    results: List[Optional[List[float]]] = [None] * len(texts)
+    uncached_indices: List[int] = []
+    uncached_texts: List[str] = []
+
+    for i, (text, key) in enumerate(zip(texts, keys)):
+        if key in _embedding_cache:
+            _embedding_cache.move_to_end(key)
+            results[i] = _embedding_cache[key]
+        else:
+            uncached_indices.append(i)
+            uncached_texts.append(text)
+
+    # 如果全部命中缓存，直接返回
+    if not uncached_texts:
+        return results  # type: ignore[return-value]
+
+    # 调用 API 获取未缓存的向量
     client = config.create_client()
 
     kwargs: Dict[str, Any] = {
-        "input": texts,
+        "input": uncached_texts,
         "model": config.model_id,
     }
     if dimensions is not None:
@@ -158,12 +215,27 @@ def get_embeddings_batch(
         response = client.embeddings.create(**kwargs)
     except Exception as e:
         logger.error("批量调用嵌入模型 API 失败: %s", e)
+        # 有缓存数据时返回部分结果，否则返回 None
+        if any(r is not None for r in results):
+            return [r for r in results if r is not None]
         return None
 
     if not response.data:
         logger.warning("嵌入模型 API 返回空数据")
+        if any(r is not None for r in results):
+            return [r for r in results if r is not None]
         return None
 
-    # 按 index 排序，确保返回顺序与输入一致
+    # 将 API 返回的向量按 index 排序后填入对应位置
     sorted_data = sorted(response.data, key=lambda x: x.index)
-    return [item.embedding for item in sorted_data]
+    for idx, item in zip(uncached_indices, sorted_data):
+        embedding = item.embedding
+        key = keys[idx]
+        _embedding_cache[key] = embedding
+        results[idx] = embedding
+
+    # 裁剪缓存到最大容量
+    while len(_embedding_cache) > _EMBEDDING_CACHE_MAX_SIZE:
+        _embedding_cache.popitem(last=False)
+
+    return results  # type: ignore[return-value]
