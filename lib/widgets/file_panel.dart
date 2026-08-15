@@ -83,11 +83,11 @@ class _FilePanelState extends State<FilePanel>
         fileName: isDirectory
             ? '${path.split('/').last}.tar.gz'
             : path.split('/').last,
-        bytes: bytes,
       );
 
       if (savePath != null) {
-        // saveFile 带 bytes 参数时已自动写入文件，无需额外操作
+        // 手动写入文件（file_picker 5.3.1 不支持 bytes 参数）
+        await File(savePath).writeAsBytes(bytes);
         _showSnackBar('下载完成：${savePath.split(Platform.pathSeparator).last}');
       }
     } on Exception catch (e) {

@@ -215,15 +215,16 @@ def get_embeddings_batch(
         response = client.embeddings.create(**kwargs)
     except Exception as e:
         logger.error("批量调用嵌入模型 API 失败: %s", e)
-        # 有缓存数据时返回部分结果，否则返回 None
+        # 有缓存数据时返回带 None 占位的原始长度列表，否则返回 None
         if any(r is not None for r in results):
-            return [r for r in results if r is not None]
+            return results
         return None
 
     if not response.data:
         logger.warning("嵌入模型 API 返回空数据")
+        # 有缓存数据时返回带 None 占位的原始长度列表，否则返回 None
         if any(r is not None for r in results):
-            return [r for r in results if r is not None]
+            return results
         return None
 
     # 将 API 返回的向量按 index 排序后填入对应位置

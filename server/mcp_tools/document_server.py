@@ -29,13 +29,15 @@ _PROTOCOL_VERSION = "2024-11-05"
 
 def _exec_python(workspace_id: str, docker_manager: DockerManager, script: str) -> dict:
     """在 Docker 工作空间内执行 Python 脚本并返回解析后的 JSON 结果。"""
-    full_script = textwrap.dedent(f"""\
-    import json, sys
-    try:
-        {script}
-    except Exception as e:
-        print(json.dumps({{"success": false, "error": str(e)}}))
-    """)
+    # 将脚本内容缩进 4 格（放入 try 块），避免 f-string 多行替换丢失缩进
+    indented_script = textwrap.indent(script, "    ")
+    full_script = (
+        "import json, sys\n"
+        "try:\n"
+        f"{indented_script}"
+        "except Exception as e:\n"
+        '    print(json.dumps({"success": false, "error": str(e)}))\n'
+    )
     result = docker_manager.exec_in_workspace(
         workspace_id, ["python3", "-c", full_script]
     )

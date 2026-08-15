@@ -603,11 +603,15 @@ async def list_files(
     docker_manager = _get_docker_manager(request)
     if not path:
         # 根目录：使用 "."，避免空字符串被当作不存在的文件名
-        cmd = "ls -la --time-style=long-iso . 2>&1"
+        result = docker_manager.exec_in_workspace(
+            workspace_id, ["sh", "-c", "ls -la --time-style=long-iso . 2>&1"]
+        )
     else:
         safe_path = _escape_shell_path(path)
-        cmd = f"ls -la --time-style=long-iso '{safe_path}' 2>&1"
-    result = docker_manager.exec_in_workspace(workspace_id, ["sh", "-c", cmd])
+        result = docker_manager.exec_in_workspace(
+            workspace_id,
+            ["sh", "-c", 'ls -la --time-style=long-iso "$1" 2>&1', "sh", safe_path],
+        )
     if "error" in result and "exit_code" not in result:
         raise HTTPException(status_code=404, detail=result)
     if result.get("exit_code", 0) != 0:
@@ -639,7 +643,8 @@ async def get_file_content(
     lower_path = path.lower()
     if any(lower_path.endswith(ext) for ext in _image_exts):
         result = docker_manager.exec_in_workspace(
-            workspace_id, ["sh", "-c", f"base64 '{safe_path}' 2>/dev/null"]
+            workspace_id,
+            ["sh", "-c", 'base64 "$1" 2>/dev/null', "sh", safe_path],
         )
         if result.get("exit_code", 0) != 0:
             raise HTTPException(status_code=404, detail="文件不存在或无法读取")
@@ -652,7 +657,8 @@ async def get_file_content(
         }
 
     result = docker_manager.exec_in_workspace(
-        workspace_id, ["sh", "-c", f"cat '{safe_path}' 2>&1"]
+        workspace_id,
+        ["sh", "-c", 'cat "$1" 2>&1', "sh", safe_path],
     )
     if "error" in result and "exit_code" not in result:
         raise HTTPException(status_code=404, detail=result)
@@ -665,10 +671,11 @@ async def get_file_content(
             )
             if init.get("exit_code", 0) == 0:
                 result = docker_manager.exec_in_workspace(
-                    workspace_id, ["sh", "-c", f"cat '{safe_path}' 2>&1"]
+                    workspace_id,
+                    ["sh", "-c", 'cat "$1" 2>&1', "sh", safe_path],
                 )
-        if result.get("exit_code", 0) != 0:
-            raise HTTPException(status_code=404, detail="文件不存在或无法读取")
+    if result.get("exit_code", 0) != 0:
+        raise HTTPException(status_code=404, detail="文件不存在或无法读取")
     content = result.get("stdout", "")
     return {
         "content": content,
@@ -779,11 +786,16 @@ async def upload_file(
         safe_target = _escape_shell_path(target)
         dirname = target.rsplit("/", 1)[0]
         safe_dirname = _escape_shell_path(dirname)
-        cmd = (
-            f"mkdir -p '{safe_dirname}' && "
-            f"echo '{b64_content}' | base64 -d > '{safe_target}'"
+        # 三个参数均通过 shell 位置参数传入，避免字符串插值带来的命令注入风险
+        # b64_content 为 base64 字符（仅 [A-Za-z0-9+/=]），安全无注入风险
+        result = docker_manager.exec_in_workspace(
+            workspace_id,
+            [
+                "sh", "-c",
+                'mkdir -p "$1" && echo "$2" | base64 -d > "$3"',
+                "sh", safe_dirname, b64_content, safe_target,
+            ],
         )
-        result = docker_manager.exec_in_workspace(workspace_id, ["sh", "-c", cmd])
         if "error" in result and "exit_code" not in result:
             raise HTTPException(status_code=404, detail=result)
         if result.get("exit_code", 0) != 0:
@@ -811,7 +823,8 @@ async def download_file(
     docker_manager = _get_docker_manager(request)
     safe_path = _escape_shell_path(req.path)
     result = docker_manager.exec_in_workspace(
-        workspace_id, ["sh", "-c", f"cat '{safe_path}' 2>&1"]
+        workspace_id,
+        ["sh", "-c", 'cat "$1" 2>&1', "sh", safe_path],
     )
     if "error" in result and "exit_code" not in result:
         raise HTTPException(status_code=404, detail=result)
@@ -838,9 +851,10 @@ async def download_folder(
     safe_path = _escape_shell_path(req.path)
 
     # 在容器内 tar 打包指定目录，base64 编码输出（避免二进制被 stdout 损坏）
+    # safe_path 通过 shell 位置参数 $1 传入，避免字符串插值带来的命令注入风险
     result = docker_manager.exec_in_workspace(
         workspace_id,
-        ["sh", "-c", f"tar -czf - -C /workspace '{safe_path}' 2>&1 | base64"],
+        ["sh", "-c", 'tar -czf - -C /workspace "$1" 2>&1 | base64', "sh", safe_path],
     )
     if "error" in result and "exit_code" not in result:
         raise HTTPException(status_code=500, detail=str(result))
@@ -867,8 +881,10 @@ def _read_file_bytes(workspace_id: str, path: str, request: Request) -> bytes:
     """
     docker_manager = _get_docker_manager(request)
     safe_path = _escape_shell_path(path)
-    cmd = f"base64 '{safe_path}' 2>/dev/null"
-    result = docker_manager.exec_in_workspace(workspace_id, ["sh", "-c", cmd])
+    result = docker_manager.exec_in_workspace(
+        workspace_id,
+        ["sh", "-c", 'base64 "$1" 2>/dev/null', "sh", safe_path],
+    )
     if "error" in result and "exit_code" not in result:
         raise HTTPException(status_code=404, detail=result)
     if result.get("exit_code", 0) != 0:

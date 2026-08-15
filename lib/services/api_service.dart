@@ -333,9 +333,10 @@ class ApiService {
         throw Exception(_errorFromBody(response));
       }
       return response.bodyBytes;
-    } on Exception {
-      rethrow;
     } catch (e) {
+      if (e is Exception) {
+        rethrow;
+      }
       throw Exception('网络请求失败，请检查后端服务是否启动');
     }
   }
@@ -366,9 +367,10 @@ class ApiService {
         throw Exception(_errorFromBody(response));
       }
       return response.bodyBytes;
-    } on Exception {
-      rethrow;
     } catch (e) {
+      if (e is Exception) {
+        rethrow;
+      }
       throw Exception('网络请求失败，请检查后端服务是否启动');
     }
   }
@@ -600,9 +602,10 @@ class ApiService {
     try {
       final http.Response response = await http.get(uri, headers: _getHeaders());
       return _handleResponse(response);
-    } on Exception {
-      rethrow;
     } catch (e) {
+      if (e is Exception) {
+        rethrow;
+      }
       throw Exception('网络请求失败，请检查后端服务是否启动');
     }
   }
@@ -623,9 +626,10 @@ class ApiService {
         body: body != null ? jsonEncode(body) : null,
       );
       return _handleResponse(response);
-    } on Exception {
-      rethrow;
     } catch (e) {
+      if (e is Exception) {
+        rethrow;
+      }
       throw Exception('网络请求失败，请检查后端服务是否启动');
     }
   }

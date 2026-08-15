@@ -1155,7 +1155,6 @@ class _DownloadProgressDialogState extends State<_DownloadProgressDialog> {
       final String? savePath = await FilePicker.platform.saveFile(
         dialogTitle: '保存文件',
         fileName: widget.filename,
-        bytes: bytes,
       );
       if (!mounted) return;
 

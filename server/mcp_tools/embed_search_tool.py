@@ -137,6 +137,7 @@ class EmbedSearchTool:
             self.workspace_id, ["sh", "-c", grep_cmd]
         )
 
+        # Docker 不可用或容器不存在
         if result.get("error"):
             return {"error": result["error"], "results": []}
 

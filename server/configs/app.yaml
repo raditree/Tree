@@ -43,6 +43,10 @@ sandbox:
 # path 指向其他配置段的字段（点号分隔），help 返回时动态读取该字段的值，
 # 因此只在此处维护"要披露哪些项"，数值始终来源于 agents/docker 等配置，避免重复。
 help_policy:
+  - name: "每个用户最多可创建的顶层 agent 数"
+    path: "agents.max_per_user"
+  - name: "团队最大层级深度（顶部 agent 为 Level 0）"
+    path: "agents.max_level"
   - name: "每个 agent 最多指挥的成员数"
     path: "docker.max_members_per_level"
   - name: "每个沙箱 CPU 限制"
@@ -51,6 +55,12 @@ help_policy:
     path: "docker.resource_limits.memory"
   - name: "每个沙箱磁盘限制"
     path: "docker.resource_limits.disk"
+  - name: "单个文件上传大小上限"
+    path: "upload.max_file_size"
+  - name: "沙箱内全部文件总大小上限"
+    path: "upload.sandbox_max_size"
+  - name: "单次网络下载数据量上限"
+    path: "sandbox.network.max_download_size"
 
 wechat:
   app_id: ""
