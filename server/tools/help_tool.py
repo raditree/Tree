@@ -19,6 +19,7 @@ class HelpTool:
         mcp_manager: "MCPManager" = None,
         session: "AgentLLMSession" = None,
         team_tool: "TeamTool" = None,
+        workspace_extra_info: dict = None,
     ) -> None:
         """初始化 help 工具。
 
@@ -30,6 +31,8 @@ class HelpTool:
             信息（名称、普通/无限上下文、上下文阈值等）
         :param team_tool: TeamTool 实例，用于读取当前 agent 的层级、是否可创建
             团队以及现有团队成员规模
+        :param workspace_extra_info: 工作空间额外信息字典，包含身份、rule.md、
+            存储告警等，由系统提示词构建时预先计算，help 工具统一透露
         """
         self.registered_tools: list[dict] = (
             registered_tools if registered_tools is not None else []
@@ -37,6 +40,7 @@ class HelpTool:
         self.mcp_manager = mcp_manager
         self.session = session
         self.team_tool = team_tool
+        self.workspace_extra_info = workspace_extra_info or {}
         # 当前可用的 MCP 工具列表快照（无 mcp_manager 时的兜底，由 set_mcp_tools 注入）
         self.mcp_tools: list[dict] = []
 
@@ -128,6 +132,7 @@ class HelpTool:
         """
         sections: list[str] = [
             self._build_identity_section(),
+            self._build_workspace_info_section(),
             self._build_tool_mechanism_section(),
             self._build_system_mechanism_section(),
             self._build_user_expectation_section(),
@@ -204,7 +209,44 @@ class HelpTool:
         return "\n".join(["# 一、身份介绍", "", identity, "", knowledge])
 
     # ------------------------------------------------------------------
-    # 二、工具机制
+    # 二、工作空间信息（身份、rule.md、存储告警等）
+    # ------------------------------------------------------------------
+    def _build_workspace_info_section(self) -> str:
+        """构建"工作空间信息"板块：从 workspace_extra_info 读取身份、rule.md 等。"""
+        info = self.workspace_extra_info
+        if not info:
+            return ""
+
+        lines = ["# 二、工作空间信息", ""]
+
+        # 身份（来自 identity.md 或默认）
+        identity = info.get("identity", "")
+        if identity:
+            lines.append(f"## 你的身份\n{identity}")
+            lines.append("")
+
+        # 成员专属提示词
+        member_prompt = info.get("member_system_prompt", "")
+        if member_prompt:
+            lines.append(f"## 成员职责补充\n{member_prompt}")
+            lines.append("")
+
+        # rule.md
+        rule = info.get("rule", "")
+        if rule:
+            lines.append(f"## 工作准则 (rule.md)\n{rule}")
+            lines.append("")
+
+        # 存储告警
+        warning = info.get("storage_warning", "")
+        if warning:
+            lines.append(f"## 存储告警\n{warning}")
+            lines.append("")
+
+        return "\n".join(lines).rstrip()
+
+    # ------------------------------------------------------------------
+    # 三、工具机制
     # ------------------------------------------------------------------
     def _build_tool_mechanism_section(self) -> str:
         """构建"工具机制"板块：逐一说明内置工具的机制与作用。"""
@@ -214,7 +256,7 @@ class HelpTool:
         )
         is_limitless = model_type == "无限上下文"
 
-        lines = ["# 二、工具机制", ""]
+        lines = ["# 三、工具机制", ""]
         lines.append(
             "以下是你能调用的内置工具及其机制。它们给出的是“机制”而非"
             "“规定动作”，请你结合任务自主决定如何组合。"
@@ -295,7 +337,7 @@ class HelpTool:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
-    # 三、系统机制
+    # 四、系统机制
     # ------------------------------------------------------------------
     def _build_system_mechanism_section(self) -> str:
         """构建"系统机制"板块：上下文、工作区沙箱、消息收发。"""
@@ -311,7 +353,7 @@ class HelpTool:
                 if cfg is not None:
                     max_seqlen = cfg.extra.get("max_seqlen")
 
-        lines = ["# 三、系统机制", ""]
+        lines = ["# 四、系统机制", ""]
 
         # ---- compact 机制 ----
         if is_limitless:
@@ -374,13 +416,13 @@ class HelpTool:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
-    # 四、用户期望
+    # 五、用户期望
     # ------------------------------------------------------------------
     @staticmethod
     def _build_user_expectation_section() -> str:
         """构建"用户期望"板块：用户对 agent 的核心诉求，作为价值取向材料。"""
         lines = [
-            "# 四、用户期望",
+            "# 五、用户期望",
             "用户对你的核心诉求，可据此校准你的工作取向与取舍：",
             "",
             "## 1. 效率",

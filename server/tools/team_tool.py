@@ -59,6 +59,8 @@ class TeamTool:
         model_configs: dict,
         broker: Any = None,
         user_id: str = "",
+        agent_id: str = "",
+        leader_id: str = "",
     ) -> None:
         """初始化 team 工具。
 
@@ -68,6 +70,8 @@ class TeamTool:
         :param broker: 团队成员消息投递器（TeamMessageBroker），用于
                        send_message/assign_task 时触发成员异步处理
         :param user_id: 当前 leader 的用户标识，投递成员消息时使用
+        :param agent_id: 当前 agent 的 ID
+        :param leader_id: 当前 agent 的上级 leader ID（用于队友向 leader 发消息）
         """
         self.session = session
         self.docker_manager = docker_manager
@@ -75,6 +79,8 @@ class TeamTool:
         self.workspace_id: str = getattr(session, "workspace_id", "") or ""
         self.broker = broker
         self.user_id = user_id
+        self.agent_id = agent_id
+        self.leader_id = leader_id
 
         # 成员列表（内存，同时持久化到 team_roster.md）
         self.members: List[Dict[str, Any]] = []
@@ -281,6 +287,7 @@ class TeamTool:
                 "workspace_id": member.get("workspace_id", ""),
                 "model_id": member.get("model_id", ""),
                 "system_prompt": member.get("system_prompt", ""),
+                "leader_id": self.leader_id,
                 "content": content,
             },
         )
@@ -971,7 +978,16 @@ class TeamTool:
 
         target = self._find_member(target_id)
         if target is None:
-            return {"error": f"目标成员不存在: {target_id}"}
+            # 支持向 leader 发送消息（leader 不在队友的 roster 中）
+            if target_id == self.leader_id:
+                target = {
+                    "id": self.leader_id,
+                    "workspace_id": self.leader_id,
+                    "model_id": "",
+                    "system_prompt": "",
+                }
+            else:
+                return {"error": f"目标成员不存在: {target_id}"}
 
         now = self._now()
         msg = {
@@ -1038,7 +1054,16 @@ class TeamTool:
 
         target = self._find_member(target_id)
         if target is None:
-            return {"error": f"目标成员不存在: {target_id}"}
+            # 支持向 leader 发送文件（leader 不在队友的 roster 中）
+            if target_id == self.leader_id:
+                target = {
+                    "id": self.leader_id,
+                    "workspace_id": self.leader_id,
+                    "model_id": "",
+                    "system_prompt": "",
+                }
+            else:
+                return {"error": f"目标成员不存在: {target_id}"}
 
         src_ws = self.workspace_id
         target_ws = target.get("workspace_id")

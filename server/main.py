@@ -55,13 +55,10 @@ _team_broker: Optional[TeamMessageBroker] = None
 # idle 时立即处理（等价于直接发送）。
 _top_chat_broker: Optional[TeamMessageBroker] = None
 
-# Agent 系统提示词：包含简短的 MCP 工具使用工作流引导。
-# 详细流程见 help 工具输出。
+# Agent 系统提示词：仅保留基本介绍，详细说明全部转移到 help 工具。
 _SYSTEM_PROMPT = (
     "你是一个 helpful AI agent，帮助用户完成各种任务。\n"
-    "【工具使用】你具备团队管理与文件操作能力。新任务开始时："
-    "先调用 refresh 查看可用 MCP 工具列表，再通过 mcp (action=call) "
-    "直接调用需要的工具。不确定工具用法时先调用 help 查看说明。"
+    "详细说明、工具机制、身份信息、工作准则等请调用 help 工具查看。"
 )
 
 
@@ -86,7 +83,7 @@ def _store_message(
 
 
 async def _register_tools(
-    session: AgentLLMSession, agent_id: str, user_id: str = ""
+    session: AgentLLMSession, agent_id: str, user_id: str = "", leader_id: str = ""
 ) -> None:
     """给会话注册内置工具（help / team / set / mcp / refresh）。
 
@@ -104,6 +101,8 @@ async def _register_tools(
         broker=_team_broker,
         user_id=user_id,
         ws_manager=ws_manager,
+        agent_id=agent_id,
+        leader_id=leader_id,
     )
 
 
@@ -205,42 +204,52 @@ def _build_agent_system_prompt(
     workspace_id: str,
     member_system_prompt: str = "",
 ) -> str:
-    """构建 agent 的系统提示词：基础指令 + 身份 + rule.md + 存储告警。
+    """构建 agent 的系统提示词：仅保留基础指令，详细说明转移到 help 工具。
 
-    覆盖 checklist 6 / 9 / 10 / 15：
-    - 6(c) 身份：从 ``.self/identity.md`` 读取 team / level / team leader / 是否开团队
-    - 6(d) 工作环境：在系统提示词中说明当前可用工具与工作方式
-    - 9/10  rule.md：注入 ``.self/rule.md`` 内容（初始化或 compact 后仍注入）
-    - 15    存储软上限：工作空间接近 ``upload.sandbox_max_size`` 时提示清理
+    checklist 6 / 9 / 10 / 15 的身份、rule.md、存储告警等全部聚集到 help 工具的
+    ``workspace_extra_info`` 中，由 help 工具统一透露。
 
     :param workspace_id: 工作空间标识
     :param member_system_prompt: 成员专属系统提示词（leader 通过 update_member 设置）
-    :return: 完整系统提示词
+    :return: 精简后的系统提示词
     """
-    parts: List[str] = [_SYSTEM_PROMPT]
+    return _SYSTEM_PROMPT
+
+
+def _build_workspace_extra_info(
+    workspace_id: str,
+    member_system_prompt: str = "",
+) -> dict:
+    """构建工作空间额外信息，供 help 工具使用。
+
+    覆盖 checklist 6 / 9 / 10 / 15：
+    - 6(c) 身份：从 ``.self/identity.md`` 读取 team / level / team leader / 是否开团队
+    - 9/10  rule.md：注入 ``.self/rule.md`` 内容
+    - 15    存储软上限：工作空间接近 ``upload.sandbox_max_size`` 时提示清理
+
+    :param workspace_id: 工作空间标识
+    :param member_system_prompt: 成员专属系统提示词
+    :return: 包含身份、rule.md、存储告警等信息的字典
+    """
+    info: Dict[str, Any] = {}
 
     # 身份信息（checklist 6(c)）
     identity = _read_workspace_file(workspace_id, ".self/identity.md").strip()
     if identity:
-        parts.append(f"## 你的身份\n{identity}")
+        info["identity"] = identity
     else:
-        parts.append(
-            "## 你的身份\n你是顶层 Agent（Level 0），直属用户，可创建并带领子团队。"
-        )
+        info["identity"] = "顶层 Agent（Level 0），直属用户，可创建并带领子团队。"
 
     # 成员专属系统提示词（如有）
     if member_system_prompt:
-        parts.append(f"## 成员职责补充\n{member_system_prompt}")
+        info["member_system_prompt"] = member_system_prompt
 
-    # rule.md 注入（checklist 9/10）：team leader 应提醒 teammates 维护各自 rule.md
+    # rule.md 注入（checklist 9/10）
     rule = _read_workspace_file(workspace_id, ".self/rule.md").strip()
     if rule:
-        parts.append(f"## 工作准则 (rule.md)\n{rule}")
+        info["rule"] = rule
     else:
-        parts.append(
-            "## 工作准则 (rule.md)\n请维护 .self/rule.md 记录你的工作准则。"
-            "如果你是 team leader，请提醒每一位 teammate 维护各自的 rule.md。"
-        )
+        info["rule"] = "请维护 .self/rule.md 记录你的工作准则。如果你是 team leader，请提醒每一位 teammate 维护各自的 rule.md。"
 
     # 存储软上限告警（checklist 15）
     try:
@@ -253,13 +262,13 @@ def _build_agent_system_prompt(
         if used > 0:
             ratio = used / sandbox_max
             if ratio >= 0.85:
-                parts.append(
-                    f"## 存储告警\n工作空间已使用 {used/1024/1024:.0f}MB "
+                info["storage_warning"] = (
+                    f"工作空间已使用 {used/1024/1024:.0f}MB "
                     f"（上限 {sandbox_max/1024/1024:.0f}MB，约 {ratio*100:.0f}%）。"
                     "请清理不再需要的文件，避免达到上限影响后续工作。"
                 )
 
-    return "\n\n".join(parts)
+    return info
 
 
 @asynccontextmanager
@@ -655,6 +664,7 @@ async def _process_member_message(
     workspace_id = payload.get("workspace_id", "")
     model_id = payload.get("model_id", "")
     content = payload.get("content", "")
+    leader_id = payload.get("leader_id", "")
     if not agent_id or not content:
         return
 
@@ -670,9 +680,12 @@ async def _process_member_message(
     _store_message(user_id, agent_id, "user", content)
 
     # 构建成员会话（normal 复用缓存累积上下文；limitless 每次新建并从 DB 恢复）
-    # 系统提示词：基础指令 + 身份(identity.md) + rule.md + 存储告警 + 成员专属提示词
+    # 系统提示词仅保留基础指令，详细说明转移到 help 工具的 workspace_extra_info
     member_system_prompt = payload.get("system_prompt", "")
     enhanced_prompt = _build_agent_system_prompt(
+        workspace_id, member_system_prompt=member_system_prompt
+    )
+    extra_info = _build_workspace_extra_info(
         workspace_id, member_system_prompt=member_system_prompt
     )
     session = get_session(user_id, agent_id)
@@ -684,6 +697,7 @@ async def _process_member_message(
                 system_prompt=enhanced_prompt,
                 docker_manager=_docker_manager,
             )
+            session.workspace_extra_info = extra_info
             restored = load_context(user_id, agent_id)
             if restored:
                 session.restore_context(restored)
@@ -693,13 +707,14 @@ async def _process_member_message(
                 workspace_id=workspace_id,
                 system_prompt=enhanced_prompt,
             )
+            session.workspace_extra_info = extra_info
             set_session(user_id, agent_id, session)
-            await _register_tools(session, agent_id, user_id)
+            await _register_tools(session, agent_id, user_id, leader_id=leader_id)
             restored = load_context(user_id, agent_id)
             if restored:
                 session.context = restored
     if model_config.is_limitless_context:
-        await _register_tools(session, agent_id, user_id)
+        await _register_tools(session, agent_id, user_id, leader_id=leader_id)
 
     _append_activity_log(
         workspace_id,
@@ -873,9 +888,14 @@ async def _handle_user_message(
         {"type": "agent_status", "data": {"agent_id": agent_id, "status": "working"}},
     )
 
+    # 初始化变量，确保 finally 块中可访问
+    session = None
+    full_reply = ""
+    last_text_id = None
     try:
-        # 系统提示词：基础指令 + 身份 + rule.md + 存储告警（checklist 6/9/10/15）
+        # 系统提示词仅保留基础指令，详细说明转移到 help 工具的 workspace_extra_info
         enhanced_prompt = _build_agent_system_prompt(workspace_id)
+        extra_info = _build_workspace_extra_info(workspace_id)
         if model_config.is_limitless_context:
             session = LimitlessContextSession(
                 model_config=model_config,
@@ -883,6 +903,7 @@ async def _handle_user_message(
                 system_prompt=enhanced_prompt,
                 docker_manager=_docker_manager,
             )
+            session.workspace_extra_info = extra_info
             # 无限上下文 LLM 每次新建，从数据库恢复上下文（重启不丢失）
             restored = load_context(user_id, agent_id)
             if restored:
@@ -896,6 +917,7 @@ async def _handle_user_message(
                     workspace_id=workspace_id,
                     system_prompt=enhanced_prompt,
                 )
+                session.workspace_extra_info = extra_info
                 set_session(user_id, agent_id, session)
                 await _register_tools(session, agent_id, user_id)
                 # 首次创建时从数据库恢复上下文（重启后重建会话）
@@ -964,7 +986,8 @@ async def _handle_user_message(
                     workspace_id, f"[{_clock_now()}] [done] 回复完成"
                 )
         # 对话结束后将上下文持久化到数据库（重启后恢复）
-        save_context(user_id, agent_id, session.context)
+        if session is not None:
+            save_context(user_id, agent_id, session.context)
     except Exception as exc:  # noqa: BLE001
         await _send_text_as_agent(user_id, agent_id, f"LLM 请求失败: {exc}")
         full_reply = f"LLM 请求失败: {exc}"
@@ -974,41 +997,42 @@ async def _handle_user_message(
             _append_activity_log(
                 workspace_id, f"[{_clock_now()}] [error] LLM 请求失败: {exc}"
             )
+    finally:
+        # 计算 token 用量（normal LLM 附带）
+        usage_payload = None
+        if (
+            session is not None
+            and not model_config.is_limitless_context
+            and getattr(session, "last_usage", None)
+        ):
+            max_tokens = int(model_config.extra.get("max_seqlen", 8192))
+            usage_payload = {**session.last_usage, "max_tokens": max_tokens}
 
-    # 计算 token 用量（normal LLM 附带）
-    usage_payload = None
-    if (
-        not model_config.is_limitless_context
-        and getattr(session, "last_usage", None)
-    ):
-        max_tokens = int(model_config.extra.get("max_seqlen", 8192))
-        usage_payload = {**session.last_usage, "max_tokens": max_tokens}
+        # 若最终文本段仍打开，补发 msg_end（附带 usage）
+        if last_text_id:
+            await ws_manager.send_message(
+                user_id,
+                {
+                    "type": "msg_end",
+                    "id": last_text_id,
+                    "agent_id": agent_id,
+                    "usage": usage_payload,
+                },
+            )
 
-    # 若最终文本段仍打开，补发 msg_end（附带 usage）
-    if last_text_id:
-        await ws_manager.send_message(
-            user_id,
-            {
-                "type": "msg_end",
-                "id": last_text_id,
-                "agent_id": agent_id,
-                "usage": usage_payload,
-            },
-        )
+        # 保存 agent 回复到历史（附带 token 用量，便于切换 agent 后恢复显示）
+        if full_reply:
+            _store_message(
+                user_id,
+                agent_id,
+                "agent",
+                full_reply,
+                usage=usage_payload,
+            )
 
-    # 保存 agent 回复到历史（附带 token 用量，便于切换 agent 后恢复显示）
-    if full_reply:
-        _store_message(
-            user_id,
-            agent_id,
-            "agent",
-            full_reply,
-            usage=usage_payload,
-        )
-
-    # 恢复 idle 状态并清除任务登记
-    _clear_active_task(user_id, agent_id)
-    await _send_status_idle(user_id, agent_id)
+        # 恢复 idle 状态并清除任务登记
+        _clear_active_task(user_id, agent_id)
+        await _send_status_idle(user_id, agent_id)
 
 
 @app.websocket("/ws")

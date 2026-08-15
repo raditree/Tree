@@ -73,7 +73,8 @@ class _MessageInputState extends State<MessageInput> {
     if (event.logicalKey != LogicalKeyboardKey.enter) {
       return KeyEventResult.ignored;
     }
-    if (RawKeyboard.instance.keysPressed.contains(LogicalKeyboardKey.shift)) {
+    if (RawKeyboard.instance.keysPressed.contains(LogicalKeyboardKey.shiftLeft) ||
+        RawKeyboard.instance.keysPressed.contains(LogicalKeyboardKey.shiftRight)) {
       return KeyEventResult.ignored;
     }
     _handleSend();

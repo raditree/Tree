@@ -37,6 +37,8 @@ def register_builtin_tools(
     broker: Optional[Any] = None,
     user_id: str = "",
     ws_manager: Optional[WebSocketManager] = None,
+    agent_id: str = "",
+    leader_id: str = "",
 ) -> None:
     """将内置工具注册到会话，并把工作空间基础工具注册为 MCP 服务。
 
@@ -49,6 +51,8 @@ def register_builtin_tools(
     :param user_id: 当前用户标识，team 工具投递成员消息时使用
     :param ws_manager: WebSocketManager 实例，AskUserQuestion 工具用于
                        向用户推送问题卡片
+    :param agent_id: 当前 agent 的 ID
+    :param leader_id: 当前 agent 的上级 leader ID
     """
     # MCP 管理器：先注册外部 MCP 服务（来自配置文件）
     mcp_manager = MCPManager()
@@ -84,7 +88,8 @@ def register_builtin_tools(
     refresh_tool = RefreshTool(mcp_manager)
     mcp_tool = MCPTool(mcp_manager)
     team_tool = TeamTool(
-        session, docker_manager, model_configs, broker=broker, user_id=user_id
+        session, docker_manager, model_configs, broker=broker, user_id=user_id,
+        agent_id=agent_id, leader_id=leader_id,
     )
     ask_tool = AskUserQuestionTool(ws_manager=ws_manager, user_id=user_id)
     help_tool = HelpTool(
@@ -92,6 +97,7 @@ def register_builtin_tools(
         mcp_manager=mcp_manager,
         session=session,
         team_tool=team_tool,
+        workspace_extra_info=getattr(session, "workspace_extra_info", None),
     )
     # 绑定主事件循环，供 AskUserQuestion 在消费线程内安全推送 WS 消息
     try:
