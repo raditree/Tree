@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y git iptables && rm -rf /var/lib/apt/lis
 WORKDIR /workspace
 
 # 安装 Python 基础包
-RUN pip install --no-cache-dir openai mcp httpx
+RUN pip install --no-cache-dir openai mcp httpx pymupdf python-pptx python-docx openpyxl
 
 # 默认命令
 CMD ["sleep", "infinity"]

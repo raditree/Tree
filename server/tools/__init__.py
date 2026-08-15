@@ -23,6 +23,11 @@ _WORKSPACE_MCP_SERVER = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "mcp_tools", "server.py"
 )
 
+# 文档处理（PDF/PPTX/DOCX/XLSX）MCP 服务入口
+_DOCUMENT_MCP_SERVER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "mcp_tools", "document_server.py"
+)
+
 
 def register_builtin_tools(
     session: AgentLLMSession,
@@ -59,6 +64,17 @@ def register_builtin_tools(
         {
             "command": sys.executable,
             "args": [os.path.abspath(_WORKSPACE_MCP_SERVER)],
+            "env": {"WORKSPACE_ID": workspace_id},
+        },
+    )
+    # 再注册文档处理服务（PDF/PPTX/DOCX/XLSX）：以 stdio server 方式暴露
+    # read_pdf / read_docx / read_pptx / read_xlsx / create_docx / create_pptx /
+    # create_xlsx，通过 WORKSPACE_ID 环境变量绑定到当前 agent 沙箱。
+    mcp_manager.register_service(
+        "document",
+        {
+            "command": sys.executable,
+            "args": [os.path.abspath(_DOCUMENT_MCP_SERVER)],
             "env": {"WORKSPACE_ID": workspace_id},
         },
     )
