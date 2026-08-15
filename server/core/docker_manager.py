@@ -344,14 +344,21 @@ class DockerManager:
     # Git HTTP 服务与父 agent Git 操作
     # ------------------------------------------------------------------
     def _get_container(self, workspace_id: str):
-        """获取工作空间容器；Docker 不可用或容器不存在时返回 (None, error_dict)。"""
+        """获取工作空间容器；Docker 不可用或容器不存在时返回 (None, error_dict)。
+        容器存在但未运行时自动启动（可能因系统重启等原因已停止）。
+        """
         if not self._available:
             return None, {"error": "Docker 不可用", "detail": self._unavailable_reason}
         try:
             container = self.client.containers.get(self._container_name(workspace_id))
-            return container, None
         except NotFound:
             return None, {"error": f"工作空间容器不存在: {workspace_id}"}
+        if container.status != "running":
+            try:
+                container.start()
+            except APIError as exc:
+                return None, {"error": "启动工作空间容器失败", "detail": str(exc)}
+        return container, None
     @staticmethod
     def _is_valid_ref_name(name: str) -> bool:
         """校验 git 引用名，仅允许字母数字、/_-.，防止命令注入。"""
@@ -585,6 +592,16 @@ class DockerManager:
             except NotFound:
                 return {
                     "error": f"工作空间无法创建: {workspace_id}",
+                    "exit_code": -1,
+                }
+        # 确保容器处于运行状态（可能因系统重启等原因已停止）
+        if container.status != "running":
+            try:
+                container.start()
+            except APIError as exc:
+                return {
+                    "error": "启动工作空间容器失败",
+                    "detail": str(exc),
                     "exit_code": -1,
                 }
         try:

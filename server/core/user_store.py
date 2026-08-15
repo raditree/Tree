@@ -97,6 +97,8 @@ def _row_to_user(row: sqlite3.Row) -> Dict[str, Any]:
     return {
         "id": row["id"],
         "username": row["username"],
+        "password_hash": row["password_hash"],
+        "salt": row["salt"],
         "openid": row["openid"],
         "nickname": row["nickname"],
         "avatar": row["avatar"],

@@ -19,6 +19,9 @@ class FileTree extends StatefulWidget {
   /// 文件选中回调，参数为文件的相对路径
   final ValueChanged<String>? onFileSelected;
 
+  /// 文件/文件夹下载回调，参数为路径和是否为目录
+  final void Function(String path, bool isDirectory)? onDownload;
+
   /// 刷新触发器：递增时重新加载当前目录文件列表
   final int refreshTrigger;
 
@@ -26,6 +29,7 @@ class FileTree extends StatefulWidget {
     super.key,
     required this.workspaceId,
     this.onFileSelected,
+    this.onDownload,
     this.refreshTrigger = 0,
   });
 
@@ -258,67 +262,100 @@ class _FileTreeState extends State<FileTree> {
   Widget _buildFileItem(FileNode node) {
     final bool isDir = node.isDirectory;
     final cs = Theme.of(context).colorScheme;
-    return InkWell(
-      onTap: () {
-        if (isDir) {
-          _enterDirectory(node);
-        } else {
-          _handleFileTap(node);
-        }
+    return GestureDetector(
+      onSecondaryTapDown: (TapDownDetails details) {
+        _showContextMenu(context, details.globalPosition, node);
       },
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        child: Row(
-          children: [
-            // 图标
-            Icon(
-              isDir ? Icons.folder : Icons.insert_drive_file,
-              size: 20,
-              color: isDir ? const Color(0xFFF59E0B) : cs.outline,
-            ),
-            const SizedBox(width: 10),
-            // 名称
-            Expanded(
-              child: Text(
-                node.name,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  fontSize: 13,
-                  color: cs.onSurface,
+      child: InkWell(
+        onTap: () {
+          if (isDir) {
+            _enterDirectory(node);
+          } else {
+            _handleFileTap(node);
+          }
+        },
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(
+            children: [
+              // 图标
+              Icon(
+                isDir ? Icons.folder : Icons.insert_drive_file,
+                size: 20,
+                color: isDir ? const Color(0xFFF59E0B) : cs.outline,
+              ),
+              const SizedBox(width: 10),
+              // 名称
+              Expanded(
+                child: Text(
+                  node.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: cs.onSurface,
+                  ),
                 ),
               ),
-            ),
-            // 大小 + 修改时间
-            const SizedBox(width: 8),
-            Text(
-              node.formattedSize,
-              style: TextStyle(
-                fontSize: 11,
-                color: cs.outline,
+              // 大小 + 修改时间
+              const SizedBox(width: 8),
+              Text(
+                node.formattedSize,
+                style: TextStyle(
+                  fontSize: 11,
+                  color: cs.outline,
+                ),
               ),
-            ),
-            const SizedBox(width: 8),
-            Text(
-              _formatModified(node.modified),
-              style: TextStyle(
-                fontSize: 11,
-                color: cs.outline,
+              const SizedBox(width: 8),
+              Text(
+                _formatModified(node.modified),
+                style: TextStyle(
+                  fontSize: 11,
+                  color: cs.outline,
+                ),
               ),
-            ),
-            // 目录右侧显示进入箭头
-            if (isDir) ...[
-              const SizedBox(width: 4),
-              Icon(
-                Icons.chevron_right,
-                size: 16,
-                color: cs.outline,
-              ),
+              // 目录右侧显示进入箭头
+              if (isDir) ...[
+                const SizedBox(width: 4),
+                Icon(
+                  Icons.chevron_right,
+                  size: 16,
+                  color: cs.outline,
+                ),
+              ],
             ],
-          ],
+          ),
         ),
       ),
     );
+  }
+
+  /// 显示右键上下文菜单
+  void _showContextMenu(BuildContext context, Offset position, FileNode node) {
+    showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx, position.dy, position.dx + 1, position.dy + 1,
+      ),
+      items: [
+        PopupMenuItem<String>(
+          value: 'download',
+          child: Row(
+            children: [
+              Icon(Icons.download, size: 18,
+                  color: Theme.of(context).colorScheme.primary),
+              const SizedBox(width: 8),
+              const Text('下载'),
+            ],
+          ),
+        ),
+      ],
+    ).then((String? value) {
+      if (value == 'download') {
+        final String path = node.path.isNotEmpty ? node.path : node.name;
+        widget.onDownload?.call(path, node.isDirectory);
+      }
+    });
   }
 
   /// 构建居中提示信息

@@ -20,6 +20,8 @@ dependencies:
   http: ^0.13.5
   # 文件选择器
   file_picker: ^5.2.0
+  # 桌面文件拖拽
+  desktop_drop: ^0.4.4
   # 本地键值存储（保存 JWT token 等）
   shared_preferences: ^2.1.0
   # 状态管理

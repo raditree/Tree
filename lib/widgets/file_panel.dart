@@ -1,5 +1,10 @@
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
+import '../services/api_service.dart';
 import 'file_sync_button.dart';
 import 'file_tree.dart';
 import 'file_viewer.dart';
@@ -61,6 +66,47 @@ class _FilePanelState extends State<FilePanel>
     });
   }
 
+  /// 处理文件/文件夹下载
+  ///
+  /// 从后端获取文件/文件夹字节后，弹出系统保存对话框保存到本地。
+  Future<void> _handleDownload(String path, bool isDirectory) async {
+    try {
+      // 显示加载提示
+      _showSnackBar('正在下载...');
+      final Uint8List bytes = isDirectory
+          ? await ApiService.downloadFolder(widget.workspaceId, path)
+          : await ApiService.downloadFile(widget.workspaceId, path);
+
+      // 弹出系统保存对话框
+      final String? savePath = await FilePicker.platform.saveFile(
+        dialogTitle: isDirectory ? '保存文件夹' : '保存文件',
+        fileName: isDirectory
+            ? '${path.split('/').last}.tar.gz'
+            : path.split('/').last,
+        bytes: bytes,
+      );
+
+      if (savePath != null) {
+        // saveFile 带 bytes 参数时已自动写入文件，无需额外操作
+        _showSnackBar('下载完成：${savePath.split(Platform.pathSeparator).last}');
+      }
+    } on Exception catch (e) {
+      String msg = e.toString().replaceFirst('Exception: ', '');
+      _showSnackBar('下载失败：$msg');
+    }
+  }
+
+  /// 显示 SnackBar 提示
+  void _showSnackBar(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -87,6 +133,7 @@ class _FilePanelState extends State<FilePanel>
                     FileTree(
                       workspaceId: widget.workspaceId,
                       refreshTrigger: _fileRefreshTrigger,
+                      onDownload: _handleDownload,
                       onFileSelected: (String path) {
                         setState(() {
                           _selectedFilePath = path;

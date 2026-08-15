@@ -1,9 +1,12 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
 import '../models/agent.dart';
 import '../models/file_node.dart';
+import 'auth_service.dart';
 
 /// API 服务 - 封装后端 REST API 调用
 ///
@@ -16,6 +19,9 @@ class ApiService {
 
   /// 当前 JWT token（登录后设置，用于鉴权请求）
   static String? _token;
+
+  /// 认证失败回调（token 过期/无效时触发，用于跳转登录页）
+  static void Function()? onAuthError;
 
   /// 设置全局 JWT token
   ///
@@ -302,6 +308,71 @@ class ApiService {
     });
   }
 
+  /// 下载单个文件
+  ///
+  /// 调用 `POST /api/files/{workspace_id}/download`，请求体为
+  /// `{"path": "..."}`，返回文件内容的字节数组。
+  /// 文件不存在或网络异常时抛出异常。
+  static Future<Uint8List> downloadFile(
+    String workspaceId,
+    String filePath,
+  ) async {
+    final Uri uri = Uri.parse('$baseUrl/api/files/$workspaceId/download');
+    try {
+      final http.Response response = await http.post(
+        uri,
+        headers: _getHeaders(),
+        body: jsonEncode({'path': filePath}),
+      );
+      if (response.statusCode == 401) {
+        _token = null;
+        onAuthError?.call();
+        throw Exception('登录已过期，请重新登录');
+      }
+      if (response.statusCode != 200) {
+        throw Exception(_errorFromBody(response));
+      }
+      return response.bodyBytes;
+    } on Exception {
+      rethrow;
+    } catch (e) {
+      throw Exception('网络请求失败，请检查后端服务是否启动');
+    }
+  }
+
+  /// 下载文件夹（打包为 tar.gz）
+  ///
+  /// 调用 `POST /api/files/{workspace_id}/download_folder`，请求体为
+  /// `{"path": "..."}`，返回 tar.gz 压缩包的字节数组。
+  /// 目录不存在或网络异常时抛出异常。
+  static Future<Uint8List> downloadFolder(
+    String workspaceId,
+    String folderPath,
+  ) async {
+    final Uri uri =
+        Uri.parse('$baseUrl/api/files/$workspaceId/download_folder');
+    try {
+      final http.Response response = await http.post(
+        uri,
+        headers: _getHeaders(),
+        body: jsonEncode({'path': folderPath}),
+      );
+      if (response.statusCode == 401) {
+        _token = null;
+        onAuthError?.call();
+        throw Exception('登录已过期，请重新登录');
+      }
+      if (response.statusCode != 200) {
+        throw Exception(_errorFromBody(response));
+      }
+      return response.bodyBytes;
+    } on Exception {
+      rethrow;
+    } catch (e) {
+      throw Exception('网络请求失败，请检查后端服务是否启动');
+    }
+  }
+
   /// 上传本地文件到工作空间
   ///
   /// 调用 `POST /api/files/{workspace_id}/upload`，以 multipart/form-data 方式
@@ -478,7 +549,7 @@ class ApiService {
   /// 读取成员工作空间的活动日志
   static Future<String> getTeammateLog(String memberId, {int lines = 60}) async {
     final Map<String, dynamic> data = await _getJson(
-      '/api/agents/${memberId}/teammate/$memberId/log',
+      '/api/agents/$memberId/teammate/$memberId/log',
       query: {'lines': '$lines'},
     );
     return (data['log'] as String?) ?? '';
@@ -561,10 +632,18 @@ class ApiService {
 
   /// 统一处理响应状态码
   ///
+  /// - 401：token 过期或无效，清除 token 并触发跳转登录页
   /// - 501：抛出"功能开发中"异常
   /// - 非 200：抛出 HTTP 状态码异常
   /// - 200：解析 JSON 响应体（强制 UTF-8 解码，避免中文乱码）
   static Map<String, dynamic> _handleResponse(http.Response response) {
+    if (response.statusCode == 401) {
+      // token 过期或无效，清除本地凭证并跳转登录页
+      unawaited(AuthService().clearToken());
+      setToken(null);
+      onAuthError?.call();
+      throw Exception('登录已过期，请重新登录');
+    }
     if (response.statusCode == 501) {
       throw Exception('功能开发中');
     }

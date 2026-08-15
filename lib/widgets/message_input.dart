@@ -1,3 +1,4 @@
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -27,6 +28,9 @@ class _MessageInputState extends State<MessageInput> {
 
   /// 已选择的文件路径列表
   final List<String> _filePaths = [];
+
+  /// 是否正在拖拽文件经过输入框区域
+  bool _isDragging = false;
 
   @override
   void initState() {
@@ -104,83 +108,134 @@ class _MessageInputState extends State<MessageInput> {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: cs.surface,
-        border: Border(
-          top: BorderSide(color: Theme.of(context).dividerColor, width: 1),
+    return DropTarget(
+      onDragDone: _onDragDone,
+      onDragEntered: (_) => setState(() => _isDragging = true),
+      onDragExited: (_) => setState(() => _isDragging = false),
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: cs.surface,
+          border: Border(
+            top: BorderSide(
+              color: _isDragging ? cs.primary : Theme.of(context).dividerColor,
+              width: _isDragging ? 2 : 1,
+            ),
+          ),
         ),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (_filePaths.isNotEmpty) _buildFileList(),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              IconButton(
-                icon: const Icon(Icons.attach_file),
-                onPressed: _pickFile,
-                color: cs.onSurfaceVariant,
-                tooltip: '上传文件',
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (_isDragging)
+              Container(
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                decoration: BoxDecoration(
+                  color: cs.primary.withOpacity(0.08),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: cs.primary.withOpacity(0.3),
+                    width: 1.5,
+                    strokeAlign: BorderSide.strokeAlignInside,
+                  ),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.cloud_upload_outlined,
+                        size: 20, color: cs.primary),
+                    const SizedBox(width: 8),
+                    Text(
+                      '松开以上传文件',
+                      style: TextStyle(
+                        color: cs.primary,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
               ),
-              Expanded(
-                child: Focus(
-                  focusNode: _focusNode,
-                  onKeyEvent: _handleKeyEvent,
-                  child: TextField(
-                    controller: _controller,
-                    maxLines: 5,
-                    minLines: 1,
-                    style: const TextStyle(fontSize: 14),
-                    decoration: InputDecoration(
-                      hintText: '输入消息...',
-                      hintStyle: TextStyle(
-                        color: cs.onSurfaceVariant,
-                        fontSize: 14,
-                      ),
-                      filled: true,
-                      fillColor: cs.surface,
-                      contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 8,
-                      ),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(8),
-                        borderSide: BorderSide(
-                          color: Theme.of(context).dividerColor,
+            if (_filePaths.isNotEmpty) _buildFileList(),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.attach_file),
+                  onPressed: _pickFile,
+                  color: cs.onSurfaceVariant,
+                  tooltip: '上传文件',
+                ),
+                Expanded(
+                  child: Focus(
+                    focusNode: _focusNode,
+                    onKeyEvent: _handleKeyEvent,
+                    child: TextField(
+                      controller: _controller,
+                      maxLines: 5,
+                      minLines: 1,
+                      style: const TextStyle(fontSize: 14),
+                      decoration: InputDecoration(
+                        hintText: '输入消息...',
+                        hintStyle: TextStyle(
+                          color: cs.onSurfaceVariant,
+                          fontSize: 14,
                         ),
-                      ),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(8),
-                        borderSide: BorderSide(
-                          color: Theme.of(context).dividerColor,
+                        filled: true,
+                        fillColor: cs.surface,
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 8,
                         ),
-                      ),
-                      focusedBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(8),
-                        borderSide: BorderSide(
-                          color: cs.primary,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          borderSide: BorderSide(
+                            color: Theme.of(context).dividerColor,
+                          ),
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          borderSide: BorderSide(
+                            color: Theme.of(context).dividerColor,
+                          ),
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          borderSide: BorderSide(
+                            color: cs.primary,
+                          ),
                         ),
                       ),
                     ),
                   ),
                 ),
-              ),
-              const SizedBox(width: 8),
-              IconButton(
-                icon: const Icon(Icons.send),
-                onPressed: _canSend ? _handleSend : null,
-                color: cs.primary,
-                disabledColor: cs.outline,
-                tooltip: '发送',
-              ),
-            ],
-          ),
-        ],
+                const SizedBox(width: 8),
+                IconButton(
+                  icon: const Icon(Icons.send),
+                  onPressed: _canSend ? _handleSend : null,
+                  color: cs.primary,
+                  disabledColor: cs.outline,
+                  tooltip: '发送',
+                ),
+              ],
+            ),
+          ],
+        ),
       ),
     );
+  }
+
+  /// 处理文件拖拽完成
+  void _onDragDone(DropDoneDetails details) {
+    setState(() {
+      _isDragging = false;
+      for (final xfile in details.files) {
+        final String? path = xfile.path;
+        if (path != null && path.isNotEmpty) {
+          _filePaths.add(path);
+        }
+      }
+    });
   }
 
   /// 构建已选文件列表（Chip 形式，可删除）

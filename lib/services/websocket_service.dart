@@ -7,11 +7,18 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 /// WebSocket 服务 - 与后端实时消息通信
 ///
 /// 负责建立 WebSocket 连接、发送消息、接收消息与心跳保活。
-/// 后端地址固定为 `ws://localhost:8000/ws?token=xxx`，
+/// 后端地址通过 [baseUrl] 配置（默认 `ws://localhost:8000`），
 /// 通过 [connect] 传入 JWT token 完成鉴权连接。
 ///
 /// 连接异常断开时会按指数退避策略自动重连（手动 [disconnect] 不重连）。
+/// 若连接失败是因 token 过期导致，会触发 [onAuthError] 回调跳转登录页。
 class WebSocketService {
+  /// WebSocket 基础地址（可运行时切换，用于本地/远程模式切换）
+  static String baseUrl = 'ws://localhost:8000';
+
+  /// 认证失败回调（token 过期/无效时触发，用于跳转登录页）
+  static void Function()? onAuthError;
+
   /// WebSocket 通道
   WebSocketChannel? _channel;
 
@@ -50,11 +57,12 @@ class WebSocketService {
   ///
   /// 使用 [token] 进行鉴权，连接成功后启动心跳定时器。
   /// 若已有连接会先断开再重连。
+  /// 地址使用 [baseUrl]（可在运行时切换本地/远程模式）。
   void connect(String token) {
     _token = token;
     disconnect();
     _shouldReconnect = true;
-    final Uri uri = Uri.parse('ws://localhost:8000/ws?token=$token');
+    final Uri uri = Uri.parse('$baseUrl/ws?token=$token');
     _channel = WebSocketChannel.connect(uri);
     _isConnected = true;
     onConnectionChange?.call(true);
@@ -97,14 +105,42 @@ class WebSocketService {
   ///
   /// 先标记为已断开，再按指数退避策略（最长 30 秒）启动重连定时器。
   /// 手动断开（[_shouldReconnect] 为 false）或超过最大重连次数时不再重连。
+  /// 若 token 已过期，直接触发 [onAuthError] 回调跳转登录页。
   void _scheduleReconnect() {
     _markDisconnected();
+    // 检查 token 是否过期
+    if (_isTokenExpired()) {
+      _shouldReconnect = false;
+      onAuthError?.call();
+      return;
+    }
     if (_shouldReconnect && _reconnectAttempts < _maxReconnectAttempts) {
       // 指数退避：0、2、4、6... 秒，最大 30 秒
       final int delay = min(_reconnectAttempts * 2, 30);
       _reconnectTimer?.cancel();
       _reconnectTimer = Timer(Duration(seconds: delay), _reconnect);
       _reconnectAttempts++;
+    }
+  }
+
+  /// 检查本地存储的 JWT token 是否已过期
+  ///
+  /// 解码 token 的 payload（不验证签名），比对 `exp` 字段与当前时间。
+  /// 无法解码或无 `exp` 字段时返回 false，避免误判。
+  bool _isTokenExpired() {
+    final String? token = _token;
+    if (token == null || token.isEmpty) return false;
+    try {
+      final List<String> parts = token.split('.');
+      if (parts.length < 2) return false;
+      final String normalized = base64Url.normalize(parts[1]);
+      final String decoded = utf8.decode(base64Url.decode(normalized));
+      final Map<String, dynamic> payload =
+          jsonDecode(decoded) as Map<String, dynamic>;
+      final int exp = payload['exp'] as int;
+      return DateTime.now().millisecondsSinceEpoch ~/ 1000 > exp;
+    } catch (_) {
+      return false;
     }
   }
 

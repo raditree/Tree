@@ -200,63 +200,51 @@ class FileSyncButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        _buildButton(
-          context: context,
-          icon: Icons.download_outlined,
-          label: '同步到本地',
-          onPressed: () => _syncToLocal(context),
+    return PopupMenuButton<String>(
+      icon: const Icon(Icons.sync, size: 18),
+      tooltip: '文件同步',
+      onSelected: (String value) {
+        switch (value) {
+          case 'download':
+            _syncToLocal(context);
+            break;
+          case 'upload':
+            _uploadFiles(context);
+            break;
+          case 'upload_folder':
+            _uploadFolder(context);
+            break;
+        }
+      },
+      itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
+        const PopupMenuItem<String>(
+          value: 'download',
+          child: ListTile(
+            dense: true,
+            leading: Icon(Icons.download_outlined, size: 18),
+            title: Text('同步到本地'),
+            contentPadding: EdgeInsets.zero,
+          ),
         ),
-        const SizedBox(width: 6),
-        _buildButton(
-          context: context,
-          icon: Icons.upload_file_outlined,
-          label: '上传文件',
-          onPressed: () => _uploadFiles(context),
+        const PopupMenuItem<String>(
+          value: 'upload',
+          child: ListTile(
+            dense: true,
+            leading: Icon(Icons.upload_file_outlined, size: 18),
+            title: Text('上传文件'),
+            contentPadding: EdgeInsets.zero,
+          ),
         ),
-        const SizedBox(width: 6),
-        _buildButton(
-          context: context,
-          icon: Icons.create_new_folder_outlined,
-          label: '上传文件夹',
-          onPressed: () => _uploadFolder(context),
+        const PopupMenuItem<String>(
+          value: 'upload_folder',
+          child: ListTile(
+            dense: true,
+            leading: Icon(Icons.create_new_folder_outlined, size: 18),
+            title: Text('上传文件夹'),
+            contentPadding: EdgeInsets.zero,
+          ),
         ),
       ],
-    );
-  }
-
-  /// 构建单个同步按钮
-  Widget _buildButton({
-    required BuildContext context,
-    required IconData icon,
-    required String label,
-    required VoidCallback onPressed,
-  }) {
-    final cs = Theme.of(context).colorScheme;
-    return SizedBox(
-      height: 28,
-      child: OutlinedButton.icon(
-        onPressed: onPressed,
-        icon: Icon(icon, size: 14, color: cs.primary),
-        label: Text(
-          label,
-          style: TextStyle(
-            fontSize: 11,
-            color: cs.primary,
-          ),
-        ),
-        style: OutlinedButton.styleFrom(
-          padding: const EdgeInsets.symmetric(horizontal: 8),
-          minimumSize: const Size(0, 28),
-          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-          side: BorderSide(color: cs.primary, width: 1),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(6),
-          ),
-        ),
-      ),
     );
   }
 }

@@ -1,9 +1,11 @@
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../models/agent.dart';
 import '../models/message.dart';
 import '../services/api_service.dart';
 import '../services/auth_service.dart';
+import '../services/local_backend_service.dart';
 import '../services/websocket_service.dart';
 import 'message_input.dart';
 import 'message_list.dart';
@@ -54,14 +56,38 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 是否正在等待用户回答 agent 的问题（AskUserQuestion）
   bool _asking = false;
 
+  /// 本地运行模式是否启用
+  bool _localEnabled = false;
+
+  /// 本地后端工作目录
+  String? _localWorkingDir;
+
+  /// 本地后端是否正在启动中
+  bool _localStarting = false;
+
   @override
   void initState() {
     super.initState();
     _webSocket.onMessage = _handleIncomingMessage;
+    _loadLocalSettings();
     _connectWebSocket();
     // 首次进入时若已选中 agent 则加载历史
     if (widget.selectedAgent != null) {
       _loadHistory();
+    }
+  }
+
+  /// 加载本地运行模式的持久化设置
+  Future<void> _loadLocalSettings() async {
+    await LocalBackendService.loadSettings();
+    if (!mounted) return;
+    setState(() {
+      _localEnabled = LocalBackendService.enabled;
+      _localWorkingDir = LocalBackendService.workingDirectory;
+    });
+    // 如果本地模式已启用但进程未运行，尝试启动
+    if (_localEnabled && !LocalBackendService.isRunning) {
+      _startLocalBackend();
     }
   }
 
@@ -378,6 +404,97 @@ class _MessagePanelState extends State<MessagePanel> {
     return idx >= 0 ? replaced.substring(idx + 1) : replaced;
   }
 
+  /// 切换本地运行模式
+  Future<void> _toggleLocalMode() async {
+    if (_localStarting) return;
+
+    if (_localEnabled) {
+      // 关闭本地模式
+      setState(() => _localStarting = true);
+      await LocalBackendService.setEnabled(false);
+      // 切换 WebSocket 和 API 地址为远程模式
+      WebSocketService.baseUrl = 'ws://localhost:8000';
+      ApiService.baseUrl = 'http://localhost:8000';
+      _reconnectWebSocket();
+      if (!mounted) return;
+      setState(() {
+        _localEnabled = false;
+        _localStarting = false;
+      });
+    } else {
+      // 开启本地模式：先选目录
+      if (_localWorkingDir == null) {
+        await _pickWorkingDirectory();
+        if (_localWorkingDir == null) return;
+      }
+      setState(() => _localStarting = true);
+      final bool success = await LocalBackendService.setEnabled(true);
+      if (!mounted) return;
+      if (success) {
+        // 本地模式使用 localhost（与远程相同，但由本地进程提供服务）
+        WebSocketService.baseUrl = 'ws://localhost:8000';
+        ApiService.baseUrl = 'http://localhost:8000';
+        _reconnectWebSocket();
+        setState(() {
+          _localEnabled = true;
+          _localStarting = false;
+        });
+        _showSnackBar('本地后端已启动');
+      } else {
+        setState(() {
+          _localEnabled = false;
+          _localStarting = false;
+        });
+        _showSnackBar('启动本地后端失败，请检查 Python 环境和目录设置');
+      }
+    }
+  }
+
+  /// 选择工作目录（项目根目录，包含 server/main.py）
+  Future<void> _pickWorkingDirectory() async {
+    final String? path = await FilePicker.platform.getDirectoryPath(
+      dialogTitle: '选择项目根目录（包含 server/main.py）',
+    );
+    if (path == null || path.isEmpty) return;
+    await LocalBackendService.setWorkingDirectory(path);
+    if (!mounted) return;
+    setState(() {
+      _localWorkingDir = path;
+    });
+  }
+
+  /// 启动本地后端
+  Future<void> _startLocalBackend() async {
+    if (_localWorkingDir == null) return;
+    setState(() => _localStarting = true);
+    final bool success = await LocalBackendService.start(_localWorkingDir!);
+    if (!mounted) return;
+    if (success) {
+      WebSocketService.baseUrl = 'ws://localhost:8000';
+      ApiService.baseUrl = 'http://localhost:8000';
+      _reconnectWebSocket();
+    }
+    setState(() => _localStarting = false);
+  }
+
+  /// 重新连接 WebSocket（断开后重连）
+  void _reconnectWebSocket() {
+    _wsConnected = false;
+    _webSocket.disconnect();
+    _connectWebSocket();
+  }
+
+  /// 显示 SnackBar 提示
+  void _showSnackBar(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
   @override
   void dispose() {
     _webSocket.disconnect();
@@ -412,7 +529,7 @@ class _MessagePanelState extends State<MessagePanel> {
     );
   }
 
-  /// 构建标题栏（显示 Agent 名称 + 状态 + 停止/teammates/压缩按钮）
+  /// 构建标题栏（Agent 名称 + 本地运行开关 + 状态 + 停止/teammates/压缩按钮）
   Widget _buildTitleBar(Agent? agent) {
     final cs = Theme.of(context).colorScheme;
     final String? title = agent?.name;
@@ -422,7 +539,7 @@ class _MessagePanelState extends State<MessagePanel> {
     final bool working = agent != null && _workingAgents.contains(agent.id);
     return Container(
       height: 48,
-      padding: const EdgeInsets.symmetric(horizontal: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 4),
       decoration: BoxDecoration(
         color: cs.surface,
         border: Border(
@@ -431,6 +548,11 @@ class _MessagePanelState extends State<MessagePanel> {
       ),
       child: Row(
         children: <Widget>[
+          // 本地运行开关（消息窗口左上）
+          _buildLocalRunToggle(cs),
+          // 工作目录选择（仅本地模式启用时显示）
+          if (_localEnabled) _buildWorkingDirSelector(cs),
+          // Agent 名称
           Expanded(
             child: Padding(
               padding: const EdgeInsets.only(left: 8),
@@ -487,6 +609,75 @@ class _MessagePanelState extends State<MessagePanel> {
             ),
         ],
       ),
+    );
+  }
+
+  /// 构建本地运行开关图标（消息窗口左上）
+  Widget _buildLocalRunToggle(ColorScheme cs) {
+    final Color iconColor = _localEnabled
+        ? Colors.green
+        : (_localStarting ? Colors.orange : cs.onSurfaceVariant);
+    final IconData icon = _localStarting
+        ? Icons.sync
+        : (_localEnabled ? Icons.power : Icons.power_settings_new);
+    return Tooltip(
+      message: _localStarting
+          ? '正在启动本地后端...'
+          : (_localEnabled
+              ? '本地运行中（点击切换为远程）'
+              : '远程模式（点击切换为本地运行）'),
+      child: SizedBox(
+        width: 36,
+        height: 36,
+        child: _localStarting
+            ? Padding(
+                padding: const EdgeInsets.all(8),
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: iconColor,
+                ),
+              )
+            : IconButton(
+                padding: EdgeInsets.zero,
+                icon: Icon(icon, size: 20, color: iconColor),
+                onPressed: _toggleLocalMode,
+              ),
+      ),
+    );
+  }
+
+  /// 构建工作目录选择器（仅本地模式启用时显示）
+  Widget _buildWorkingDirSelector(ColorScheme cs) {
+    final String displayPath = _basename(_localWorkingDir ?? '');
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 100),
+          child: GestureDetector(
+            onTap: _pickWorkingDirectory,
+            child: Text(
+              displayPath.isEmpty ? '选择目录' : displayPath,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 11,
+                color: cs.onSurfaceVariant,
+              ),
+            ),
+          ),
+        ),
+        SizedBox(
+          width: 28,
+          height: 28,
+          child: IconButton(
+            padding: EdgeInsets.zero,
+            icon: Icon(Icons.folder_open, size: 16, color: cs.primary),
+            onPressed: _pickWorkingDirectory,
+            tooltip: '选择工作目录',
+          ),
+        ),
+      ],
     );
   }
 

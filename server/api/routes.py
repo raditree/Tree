@@ -89,15 +89,14 @@ class LoginRequest(BaseModel):
     password: str
 
 
-@router.post("/auth/register")
-async def auth_register(req: RegisterRequest):
-    """注册账号：用户名密码创建账号，成功后返回 JWT token。
+def _strip_sensitive_fields(user: Dict[str, Any]) -> Dict[str, Any]:
+    """移除用户字典中的敏感字段（password_hash、salt），返回副本。"""
+    return {k: v for k, v in user.items() if k not in ("password_hash", "salt")}
 
-    校验：
-    - 用户名非空且长度 2-32
-    - 密码长度不少于 6 位
-    - 用户名唯一（冲突返回 409）
-    """
+
+@router.post("/auth/register")
+async def auth_register(req: LoginRequest):
+    """账号密码注册：创建新用户并返回 JWT token。"""
     username = req.username.strip()
     if not username:
         raise HTTPException(status_code=400, detail="用户名不能为空")
@@ -108,8 +107,9 @@ async def auth_register(req: RegisterRequest):
     if user_store.get_user_by_username(username) is not None:
         raise HTTPException(status_code=409, detail="该用户名已被注册")
     user = user_store.create_account(username, req.password, req.nickname)
-    token = create_token(user)
-    return {"token": token, "user": user}
+    public_user = _strip_sensitive_fields(user)
+    token = create_token(public_user)
+    return {"token": token, "user": public_user}
 
 
 @router.post("/auth/login")
@@ -121,8 +121,9 @@ async def auth_login(req: LoginRequest):
     user = user_store.authenticate(username, req.password)
     if user is None:
         raise HTTPException(status_code=401, detail="用户名或密码错误")
-    token = create_token(user)
-    return {"token": token, "user": user}
+    public_user = _strip_sensitive_fields(user)
+    token = create_token(public_user)
+    return {"token": token, "user": public_user}
 
 
 # ===== 微信登录认证（保留，但前端已不再使用） =====
@@ -821,6 +822,39 @@ async def download_file(
     return StreamingResponse(
         iter([content]),
         media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/files/{workspace_id}/download_folder")
+async def download_folder(
+    workspace_id: str,
+    req: FileDownloadRequest,
+    request: Request,
+    _: dict = Depends(get_current_user),
+):
+    """从工作空间下载文件夹，打包为 tar.gz 返回。"""
+    docker_manager = _get_docker_manager(request)
+    safe_path = _escape_shell_path(req.path)
+
+    # 在容器内 tar 打包指定目录，base64 编码输出（避免二进制被 stdout 损坏）
+    result = docker_manager.exec_in_workspace(
+        workspace_id,
+        ["sh", "-c", f"tar -czf - -C /workspace '{safe_path}' 2>&1 | base64"],
+    )
+    if "error" in result and "exit_code" not in result:
+        raise HTTPException(status_code=500, detail=str(result))
+    if result.get("exit_code", 0) != 0:
+        raise HTTPException(status_code=404, detail="目录不存在或无法读取")
+    b64_data = "".join(result.get("stdout", "").split())
+    if not b64_data:
+        raise HTTPException(status_code=404, detail="目录为空或打包失败")
+    content = base64.b64decode(b64_data)
+    folder_name = req.path.rsplit("/", 1)[-1] or "download"
+    filename = f"{folder_name}.tar.gz"
+    return StreamingResponse(
+        iter([content]),
+        media_type="application/gzip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 

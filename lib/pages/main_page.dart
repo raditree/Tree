@@ -1,11 +1,17 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../models/agent.dart';
 import '../services/api_service.dart';
+import '../services/auth_service.dart';
+import '../services/local_backend_service.dart';
+import '../services/websocket_service.dart';
 import '../widgets/agent_list.dart';
 import '../widgets/create_agent_dialog.dart';
 import '../widgets/file_panel.dart';
 import '../widgets/message_panel.dart';
+import 'login_page.dart';
 import 'settings_page.dart';
 
 /// 主页面 - 三栏布局
@@ -23,7 +29,7 @@ class MainPage extends StatefulWidget {
   State<MainPage> createState() => _MainPageState();
 }
 
-class _MainPageState extends State<MainPage> {
+class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   // 左栏当前宽度，初始 260px
   double _leftWidth = 260;
   // 右栏当前宽度，初始 340px
@@ -126,7 +132,40 @@ class _MainPageState extends State<MainPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    // 注册认证失败回调：token 过期时跳转登录页
+    ApiService.onAuthError = _handleAuthError;
+    WebSocketService.onAuthError = _handleAuthError;
     _loadAgents();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    // 清除回调，避免内存泄漏
+    ApiService.onAuthError = null;
+    WebSocketService.onAuthError = null;
+    LocalBackendService.dispose();
+    super.dispose();
+  }
+
+  /// 处理认证失败：清除 token 并跳转回登录页
+  void _handleAuthError() {
+    // 清除本地 token
+    unawaited(AuthService().clearToken());
+    ApiService.setToken(null);
+    // 跳转登录页
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const LoginPage()),
+      (route) => false,
+    );
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.detached) {
+      LocalBackendService.dispose();
+    }
   }
 
   /// 从后端加载已持久化的 agent 列表

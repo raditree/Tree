@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -290,23 +291,21 @@ class _FileViewerState extends State<FileViewer> {
     );
   }
 
-  /// 下载文件（调用文件同步到本地功能）
+  /// 下载文件（下载单个文件而非同步整个目录）
   ///
-  /// 选择本地目录后调用 [ApiService.syncToLocal] 同步工作空间文件。
-  /// 同步过程通过进度对话框展示，完成后自动关闭。
+  /// 调用 [ApiService.downloadFile] 获取文件字节，然后通过
+  /// [FilePicker.platform.saveFile] 让用户选择保存位置并写入本地。
   Future<void> _downloadFile() async {
-    final String? dirPath = await FilePicker.platform.getDirectoryPath(
-      dialogTitle: '选择本地保存目录',
-    );
-    if (dirPath == null) return; // 用户取消选择
-    if (!mounted) return;
+    // 提取文件名
+    final String filename = widget.filePath.split('/').last;
     showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (BuildContext ctx) {
         return _DownloadProgressDialog(
-          dirPath: dirPath,
           workspaceId: widget.workspaceId,
+          filePath: widget.filePath,
+          filename: filename,
         );
       },
     );
@@ -1102,18 +1101,23 @@ class _MarkdownRenderer extends StatelessWidget {
 
 /// 下载进度对话框
 ///
-/// 调用 [ApiService.syncToLocal] 将工作空间文件同步到本地目录，
-/// 期间显示加载动画与状态文字，完成后显示结果（成功/失败），1.5 秒后自动关闭。
+/// 调用 [ApiService.downloadFile] 获取单个文件字节，
+/// 然后通过 [FilePicker.platform.saveFile] 让用户选择保存位置，
+/// 写入本地文件后显示结果，1.5 秒后自动关闭。
 class _DownloadProgressDialog extends StatefulWidget {
-  /// 本地保存目录
-  final String dirPath;
-
   /// 工作空间 ID
   final String workspaceId;
 
+  /// 工作空间内的文件路径
+  final String filePath;
+
+  /// 建议的文件名
+  final String filename;
+
   const _DownloadProgressDialog({
-    required this.dirPath,
     required this.workspaceId,
+    required this.filePath,
+    required this.filename,
   });
 
   @override
@@ -1137,10 +1141,41 @@ class _DownloadProgressDialogState extends State<_DownloadProgressDialog> {
     _runTask();
   }
 
-  /// 执行同步任务
+  /// 执行下载任务：获取字节 -> 选择保存路径 -> 写入本地
   Future<void> _runTask() async {
     try {
-      await ApiService.syncToLocal(widget.workspaceId, widget.dirPath);
+      // 1. 下载文件字节
+      final Uint8List bytes = await ApiService.downloadFile(
+        widget.workspaceId,
+        widget.filePath,
+      );
+      if (!mounted) return;
+
+      // 2. 让用户选择保存位置
+      final String? savePath = await FilePicker.platform.saveFile(
+        dialogTitle: '保存文件',
+        fileName: widget.filename,
+        bytes: bytes,
+      );
+      if (!mounted) return;
+
+      if (savePath == null) {
+        // 用户取消保存
+        setState(() {
+          _isRunning = false;
+          _result = '已取消';
+          _success = false;
+        });
+        await Future<void>.delayed(const Duration(milliseconds: 1500));
+        if (mounted && Navigator.of(context).canPop()) {
+          Navigator.of(context).pop();
+        }
+        return;
+      }
+
+      // 3. 写入本地文件
+      await File(savePath).writeAsBytes(bytes);
+
       if (!mounted) return;
       setState(() {
         _isRunning = false;
@@ -1185,9 +1220,7 @@ class _DownloadProgressDialogState extends State<_DownloadProgressDialog> {
           const SizedBox(width: 12),
           Expanded(
             child: Text(
-              _isRunning
-                  ? '正在同步到 ${widget.dirPath} ...'
-                  : (_result ?? ''),
+              _isRunning ? '正在下载 ${widget.filename} ...' : (_result ?? ''),
               style: const TextStyle(fontSize: 13),
             ),
           ),
