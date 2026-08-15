@@ -31,6 +31,12 @@ except ImportError:
     fitz = None
 
 from core import agent_store, user_store
+from core.embed_model import (
+    EmbedModelConfig,
+    get_embedding,
+    get_embeddings_batch,
+    load_embed_model_config,
+)
 from core.auth import (
     create_token,
     get_current_user,
@@ -413,15 +419,10 @@ async def delete_agent(
 
 @router.get("/models")
 async def list_models(
-    refresh: bool = Query(False, description="为 true 时强制从各供应商 API 重新拉取模型池"),
     _: dict = Depends(get_current_user),
 ):
-    """获取模型池中的具体模型列表。
-
-    由 yaml 配置 + 各供应商 API（``/models``）拉取的模型合并而成。
-    ``refresh=true`` 时强制重新向供应商 API 查询。
-    """
-    configs = get_model_configs(refresh=refresh)
+    """获取模型池中的具体模型列表（由 YAML 配置文件定义）。"""
+    configs = get_model_configs()
     models = []
     for cfg in configs.values():
         models.append(
@@ -434,6 +435,111 @@ async def list_models(
         )
     return {"models": models}
 
+
+# ===== 嵌入模型 API =====
+
+
+class EmbedRequest(BaseModel):
+    """嵌入请求体。"""
+    input: str
+    dimensions: Optional[int] = None
+
+
+class EmbedBatchRequest(BaseModel):
+    """批量嵌入请求体。"""
+    input: List[str]
+    dimensions: Optional[int] = None
+
+
+@router.get("/embed/models")
+async def get_embed_model_info(
+    _: dict = Depends(get_current_user),
+):
+    """获取嵌入模型配置信息。"""
+    config = load_embed_model_config()
+    if config is None:
+        return {"embed_model": None}
+    return {
+        "embed_model": {
+            "name": config.name,
+            "model_id": config.model_id,
+            "embedding_dimensions": config.extra.get("embedding_dimensions"),
+            "max_input_length": config.extra.get("max_input_length"),
+        }
+    }
+
+
+@router.post("/embed")
+async def embed_text(
+    req: EmbedRequest,
+    _: dict = Depends(get_current_user),
+):
+    """将文本转为向量表示，透传至嵌入模型 API。
+
+    请求体：
+    - input: 输入文本
+    - dimensions: 可选，向量维度（模型支持动态维度时使用）
+
+    返回：
+    - embedding: 浮点数向量列表
+    - model: 使用的嵌入模型标识
+    - dimensions: 实际向量维度
+    """
+    config = load_embed_model_config()
+    if config is None:
+        raise HTTPException(
+            status_code=503,
+            detail="嵌入模型未配置，请配置 server/configs/embed_model.yaml",
+        )
+
+    embedding = get_embedding(req.input, config, dimensions=req.dimensions)
+    if embedding is None:
+        raise HTTPException(
+            status_code=502,
+            detail="调用嵌入模型 API 失败",
+        )
+
+    return {
+        "embedding": embedding,
+        "model": config.model_id,
+        "dimensions": len(embedding),
+    }
+
+
+@router.post("/embed/batch")
+async def embed_texts_batch(
+    req: EmbedBatchRequest,
+    _: dict = Depends(get_current_user),
+):
+    """批量将文本转为向量表示，透传至嵌入模型 API。
+
+    请求体：
+    - input: 输入文本列表
+    - dimensions: 可选，向量维度
+
+    返回：
+    - embeddings: 浮点数向量列表的列表（顺序与输入一致）
+    - model: 使用的嵌入模型标识
+    """
+    config = load_embed_model_config()
+    if config is None:
+        raise HTTPException(
+            status_code=503,
+            detail="嵌入模型未配置，请配置 server/configs/embed_model.yaml",
+        )
+
+    embeddings = get_embeddings_batch(req.input, config, dimensions=req.dimensions)
+    if embeddings is None:
+        raise HTTPException(
+            status_code=502,
+            detail="调用嵌入模型 API 失败",
+        )
+
+    return {
+        "embeddings": embeddings,
+        "model": config.model_id,
+        "dimensions": len(embeddings[0]) if embeddings else 0,
+    }
 
 
 # ===== 工作空间文件管理 =====
