@@ -63,8 +63,7 @@ def register_builtin_tools(
         },
     )
 
-    # 各内置工具实例
-    help_tool = HelpTool(session.registered_tools, mcp_manager=mcp_manager)
+    # 各内置工具实例（help 需在 team_tool 之后构造，以读取身份/层级信息）
     set_tool = SetTool(session)
     refresh_tool = RefreshTool(mcp_manager)
     mcp_tool = MCPTool(mcp_manager)
@@ -72,6 +71,12 @@ def register_builtin_tools(
         session, docker_manager, model_configs, broker=broker, user_id=user_id
     )
     ask_tool = AskUserQuestionTool(ws_manager=ws_manager, user_id=user_id)
+    help_tool = HelpTool(
+        session.registered_tools,
+        mcp_manager=mcp_manager,
+        session=session,
+        team_tool=team_tool,
+    )
     # 绑定主事件循环，供 AskUserQuestion 在消费线程内安全推送 WS 消息
     try:
         ask_tool.bind_loop(asyncio.get_running_loop())

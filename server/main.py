@@ -1050,6 +1050,17 @@ async def websocket_endpoint(ws: WebSocket):
 
     # 2. 接受连接并存储
     await ws_manager.connect(user_id, ws)
+    # 2.1 重连状态同步：将当前仍有进行中任务的 agent 状态补推给前端，
+    #     保证前端重启（WebSocket 重连）后"工作中"标识与"停止"按钮能恢复显示。
+    for (active_uid, active_agent_id) in list(_active_tasks.keys()):
+        if active_uid == user_id:
+            await ws_manager.send_message(
+                user_id,
+                {
+                    "type": "agent_status",
+                    "data": {"agent_id": active_agent_id, "status": "working"},
+                },
+            )
     try:
         # 3. 循环接收消息并处理
         while True:
