@@ -245,7 +245,10 @@ class AgentLLMSession:
         if isinstance(provider_extra, dict):
             extra_body.update(provider_extra)
         # 其余未保留字段作为 OpenAI 顶层参数透传
-        reserved = {"temperature", "top_k", "max_seqlen", "extra_body"}
+        reserved = {
+            "temperature", "top_k", "max_seqlen", "extra_body",
+            "input_price", "output_price", "cached_input_price",
+        }
         for key, value in extra.items():
             if key not in reserved:
                 kwargs[key] = value

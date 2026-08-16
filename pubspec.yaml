@@ -1,5 +1,5 @@
-name: agent_team_desktop
-description: LLM 驱动的 agent 团队桌面效率工具
+name: tree
+description: Tree - LLM 驱动的 agent 团队桌面效率工具
 # 防止意外发布到 pub.dev
 publish_to: 'none'
 
