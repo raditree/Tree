@@ -557,6 +557,25 @@ class ApiService {
     return (data['log'] as String?) ?? '';
   }
 
+  // ==================== 预算控制接口 ====================
+
+  /// 设置顶层 agent 的预算金额（美元）
+  ///
+  /// 调用 `POST /api/budget/{agent_id}`，请求体为 `{"budget": 金额}`。
+  static Future<Map<String, dynamic>> setBudget(
+    String agentId,
+    double budget,
+  ) async {
+    return _postJson('/api/budget/$agentId', body: {'budget': budget});
+  }
+
+  /// 获取顶层 agent 的预算状态
+  ///
+  /// 调用 `GET /api/budget/{agent_id}`，返回预算总额、已使用、剩余、百分比、token 分类用量。
+  static Future<Map<String, dynamic>> getBudget(String agentId) async {
+    return _getJson('/api/budget/$agentId');
+  }
+
   /// 用户直接向团队成员发送消息
   static Future<Map<String, dynamic>> sendTeammateMessage(
     String leaderId,

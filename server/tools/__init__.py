@@ -39,6 +39,7 @@ def register_builtin_tools(
     ws_manager: Optional[WebSocketManager] = None,
     agent_id: str = "",
     leader_id: str = "",
+    top_agent_id: str = "",
 ) -> None:
     """将内置工具注册到会话，并把工作空间基础工具注册为 MCP 服务。
 
@@ -53,6 +54,7 @@ def register_builtin_tools(
                        向用户推送问题卡片
     :param agent_id: 当前 agent 的 ID
     :param leader_id: 当前 agent 的上级 leader ID
+    :param top_agent_id: 顶层 agent 的 ID（用于预算追踪，团队成员共享顶层预算）
     """
     # MCP 管理器：先注册外部 MCP 服务（来自配置文件）
     mcp_manager = MCPManager()
@@ -89,7 +91,7 @@ def register_builtin_tools(
     mcp_tool = MCPTool(mcp_manager)
     team_tool = TeamTool(
         session, docker_manager, model_configs, broker=broker, user_id=user_id,
-        agent_id=agent_id, leader_id=leader_id,
+        agent_id=agent_id, leader_id=leader_id, top_agent_id=top_agent_id,
     )
     ask_tool = AskUserQuestionTool(ws_manager=ws_manager, user_id=user_id)
     help_tool = HelpTool(

@@ -3,7 +3,7 @@
 工具覆盖三个子域：
 - 成员管理：创建成员、成员管理表（.self/team_roster.md）、多维评分、成员/状态查询
 - 消息管理：点对点消息、广播消息、文件发送
-- 任务管理：任务分配、任务完成流程、任务跟踪
+- 任务管理：任务分配、任务完成流程、任务跟踪、等待成员完成
 
 team 工具同时维护团队层级限制：顶部 agent 为 Level 0，最深 Level 3，
 且 can_lead_team 为 False 的成员不可创建子团队。
@@ -61,6 +61,7 @@ class TeamTool:
         user_id: str = "",
         agent_id: str = "",
         leader_id: str = "",
+        top_agent_id: str = "",
     ) -> None:
         """初始化 team 工具。
 
@@ -72,6 +73,7 @@ class TeamTool:
         :param user_id: 当前 leader 的用户标识，投递成员消息时使用
         :param agent_id: 当前 agent 的 ID
         :param leader_id: 当前 agent 的上级 leader ID（用于队友向 leader 发消息）
+        :param top_agent_id: 顶层 agent 的 ID，用于预算追踪（团队成员共享顶层预算）
         """
         self.session = session
         self.docker_manager = docker_manager
@@ -81,6 +83,7 @@ class TeamTool:
         self.user_id = user_id
         self.agent_id = agent_id
         self.leader_id = leader_id
+        self.top_agent_id = top_agent_id or agent_id
 
         # 成员列表（内存，同时持久化到 team_roster.md）
         self.members: List[Dict[str, Any]] = []
@@ -133,6 +136,7 @@ class TeamTool:
                                 "send_file",
                                 "assign_task",
                                 "query_tasks",
+                                "wait_for",
                             ],
                             "description": "操作类型",
                         },
@@ -207,6 +211,14 @@ class TeamTool:
                             "type": "integer",
                             "description": "查看成员活动日志时返回的行数（默认 30）",
                         },
+                        "target_member_ids": {
+                            "type": "string",
+                            "description": "等待完成的成员 ID 列表，多个 ID 用逗号分隔（如 'member_xxx,member_yyy'）",
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "等待超时时间（秒），默认 300（5 分钟）",
+                        },
                     },
                     "required": ["action"],
                 },
@@ -230,6 +242,7 @@ class TeamTool:
             "send_file": self._action_send_file,
             "assign_task": self._action_assign_task,
             "query_tasks": self._action_query_tasks,
+            "wait_for": self._action_wait_for,
         }
         handler = dispatch.get(action)
         if handler is None:
@@ -288,6 +301,7 @@ class TeamTool:
                 "model_id": member.get("model_id", ""),
                 "system_prompt": member.get("system_prompt", ""),
                 "leader_id": self.leader_id,
+                "top_agent_id": self.top_agent_id,
                 "content": content,
             },
         )
@@ -1342,3 +1356,92 @@ class TeamTool:
             result.append(item)
 
         return {"tasks": result, "total": len(result)}
+
+    # ------------------------------------------------------------------
+    # SubTask 9.4: 等待成员完成
+    # ------------------------------------------------------------------
+    def _action_wait_for(self, arguments: dict) -> dict:
+        """等待一个或多个成员完成当前任务后返回。
+
+        轮询成员的工作状态，当所有指定成员的工作状态不再为 "working"
+        时返回结果。支持通过 timeout 参数设置最大等待时间。
+
+        参数：
+            target_member_ids: 逗号分隔的成员 ID 列表（必填）
+            timeout: 等待超时秒数（可选，默认 300，即 5 分钟）
+
+        返回：
+            members: 每个成员最终状态
+            timed_out: 是否超时
+            waited: 实际等待秒数
+        """
+        raw_ids = arguments.get("target_member_ids", "")
+        if not raw_ids:
+            return {"error": "缺少 target_member_ids"}
+
+        member_ids = [mid.strip() for mid in raw_ids.split(",") if mid.strip()]
+        if not member_ids:
+            return {"error": "target_member_ids 为空"}
+
+        # 校验所有成员是否存在
+        members_map: Dict[str, Dict[str, Any]] = {}
+        for mid in member_ids:
+            member = self._find_member(mid)
+            if member is None:
+                return {"error": f"成员不存在: {mid}"}
+            members_map[mid] = member
+
+        try:
+            timeout = max(1, int(arguments.get("timeout", 300)))
+        except (TypeError, ValueError):
+            timeout = 300
+
+        # 终端状态：成员不再处于工作状态
+        terminal_statuses = {"idle", "stopped", "error"}
+
+        deadline = time.time() + timeout
+        poll_interval = 2  # 秒
+        timed_out = False
+
+        while True:
+            # 检查剩余时间
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                timed_out = True
+                break
+
+            # 检查每个成员的状态
+            all_done = True
+            for mid in member_ids:
+                member = members_map[mid]
+                status = member.get("work_status", "")
+                if status not in terminal_statuses:
+                    all_done = False
+                    break
+
+            if all_done:
+                break
+
+            # 等待下次轮询（不超过剩余时间）
+            sleep_time = min(poll_interval, remaining)
+            time.sleep(sleep_time)
+
+        waited = timeout - max(0, deadline - time.time())
+
+        # 收集最终状态
+        results = []
+        for mid in member_ids:
+            member = members_map[mid]
+            results.append({
+                "member_id": mid,
+                "name": member.get("name", ""),
+                "work_status": member.get("work_status", ""),
+                "current_task": member.get("current_task", ""),
+            })
+
+        return {
+            "members": results,
+            "timed_out": timed_out,
+            "waited": round(waited, 1),
+            "total": len(results),
+        }

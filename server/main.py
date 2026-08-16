@@ -16,12 +16,20 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import jwt
 import uvicorn
-from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from api.routes import router as api_router
 from core.agent_store import get_agent
 from core.auth import get_current_user, verify_token
+from core.budget import (
+    PriceCalculator,
+    get_budget_tracker,
+    get_budget_status,
+    reset_budget_tracker,
+    set_budget,
+)
 from core.config import get_config
 from core.conversation_store import (
     clear_history,
@@ -58,7 +66,7 @@ _top_chat_broker: Optional[TeamMessageBroker] = None
 # Agent 系统提示词：仅保留基本介绍，详细说明全部转移到 help 工具。
 _SYSTEM_PROMPT = (
     "你是一个 helpful AI agent，帮助用户完成各种任务。\n"
-    "详细说明、工具机制、身份信息、工作准则等请调用 help 工具查看。"
+    "先调用 help 工具查看使用帮助，磨刀不负砍柴功。"
 )
 
 
@@ -83,7 +91,8 @@ def _store_message(
 
 
 async def _register_tools(
-    session: AgentLLMSession, agent_id: str, user_id: str = "", leader_id: str = ""
+    session: AgentLLMSession, agent_id: str, user_id: str = "",
+    leader_id: str = "", top_agent_id: str = "",
 ) -> None:
     """给会话注册内置工具（help / team / set / mcp / refresh）。
 
@@ -103,6 +112,7 @@ async def _register_tools(
         ws_manager=ws_manager,
         agent_id=agent_id,
         leader_id=leader_id,
+        top_agent_id=top_agent_id,
     )
 
 
@@ -214,6 +224,70 @@ def _build_agent_system_prompt(
     :return: 精简后的系统提示词
     """
     return _SYSTEM_PROMPT
+
+
+def _setup_session_budget(
+    session: Any, model_config: ModelConfig,
+    user_id: str, top_agent_id: str,
+) -> None:
+    """为会话设置预算追踪器与价格计算器。
+
+    如果模型配置包含价格信息，创建 BudgetTracker 并绑定到会话。
+    teammates 共享顶层 agent 的预算（通过 top_agent_id 关联）。
+    """
+    price_calc = PriceCalculator(model_config)
+    if price_calc.has_pricing:
+        tracker = get_budget_tracker(user_id, top_agent_id)
+        session.set_budget_tracker(tracker, price_calc)
+
+
+def _check_budget_threshold(
+    session: Any, user_id: str, agent_id: str,
+) -> Optional[str]:
+    """检查预算阈值，若达到新阈值返回系统提示注入文本。
+
+    返回的文本可注入到 LLM 上下文作为预算告警。
+    """
+    if session.budget_tracker is None or session.price_calculator is None:
+        return None
+    threshold = session.budget_tracker.check_and_mark_threshold(
+        session.price_calculator
+    )
+    if threshold is None:
+        return None
+    pct = session.budget_tracker.get_percentage(session.price_calculator)
+    remaining = session.budget_tracker.get_remaining(session.price_calculator)
+    summary = session.budget_tracker.get_budget_summary(session.price_calculator)
+    if threshold >= 100:
+        msg = (
+            f"[预算告警] 预算已耗尽！{summary}\n"
+            "请立即停止所有非关键 API 调用，仅完成最核心的任务。"
+            "后续 API 调用可能因预算耗尽而受限。"
+        )
+    else:
+        msg = (
+            f"[预算告警] 预算已消耗 {pct}%（{threshold}%），剩余 ${remaining:.4f}。\n"
+            "请合理规划工作流，在预算消耗 50% 前完成核心任务。"
+            f"当前用量：{summary}"
+        )
+    return msg
+
+
+async def _send_budget_update_ws(
+    user_id: str, agent_id: str, session: Any,
+) -> None:
+    """发送预算更新 WebSocket 事件。"""
+    if session.budget_tracker is None or session.price_calculator is None:
+        return
+    data = session.budget_tracker.get_budget_ws_data(session.price_calculator)
+    await ws_manager.send_message(
+        user_id,
+        {
+            "type": "budget_update",
+            "agent_id": agent_id,
+            "data": data,
+        },
+    )
 
 
 def _build_workspace_extra_info(
@@ -619,6 +693,9 @@ async def _stream_agent_reply(
                         "result": str(result),
                     },
                 )
+                # 工具调用完成后发送预算更新
+                if session is not None:
+                    await _send_budget_update_ws(user_id, agent_id, session)
                 # 持久化工具调用到历史表
                 try:
                     _store_message(
@@ -665,6 +742,7 @@ async def _process_member_message(
     model_id = payload.get("model_id", "")
     content = payload.get("content", "")
     leader_id = payload.get("leader_id", "")
+    top_agent_id = payload.get("top_agent_id", "")
     if not agent_id or not content:
         return
 
@@ -709,12 +787,19 @@ async def _process_member_message(
             )
             session.workspace_extra_info = extra_info
             set_session(user_id, agent_id, session)
-            await _register_tools(session, agent_id, user_id, leader_id=leader_id)
+            await _register_tools(session, agent_id, user_id,
+                                  leader_id=leader_id,
+                                  top_agent_id=top_agent_id)
             restored = load_context(user_id, agent_id)
             if restored:
                 session.context = restored
+    # 为成员设置预算追踪器（共享顶层 agent 的预算）
+    if top_agent_id:
+        _setup_session_budget(session, model_config, user_id, top_agent_id)
     if model_config.is_limitless_context:
-        await _register_tools(session, agent_id, user_id, leader_id=leader_id)
+        await _register_tools(session, agent_id, user_id,
+                              leader_id=leader_id,
+                              top_agent_id=top_agent_id)
 
     _append_activity_log(
         workspace_id,
@@ -882,6 +967,9 @@ async def _handle_user_message(
     # 登记进行中的任务（供"停止"按钮取消）
     cancel_event = _register_active_task(user_id, agent_id)
 
+    # 用户发送消息到顶层 agent 时重置预算（teammates 共享顶层预算）
+    reset_budget_tracker(user_id, agent_id)
+
     # 通知前端 agent 进入 working 状态
     await ws_manager.send_message(
         user_id,
@@ -904,6 +992,8 @@ async def _handle_user_message(
                 docker_manager=_docker_manager,
             )
             session.workspace_extra_info = extra_info
+            # 设置预算追踪器
+            _setup_session_budget(session, model_config, user_id, agent_id)
             # 无限上下文 LLM 每次新建，从数据库恢复上下文（重启不丢失）
             restored = load_context(user_id, agent_id)
             if restored:
@@ -918,16 +1008,23 @@ async def _handle_user_message(
                     system_prompt=enhanced_prompt,
                 )
                 session.workspace_extra_info = extra_info
+                # 设置预算追踪器
+                _setup_session_budget(session, model_config, user_id, agent_id)
                 set_session(user_id, agent_id, session)
-                await _register_tools(session, agent_id, user_id)
+                await _register_tools(session, agent_id, user_id,
+                                      top_agent_id=agent_id)
                 # 首次创建时从数据库恢复上下文（重启后重建会话）
                 restored = load_context(user_id, agent_id)
                 if restored:
                     session.context = restored
+            else:
+                # 已有会话，确保预算追踪器已设置
+                _setup_session_budget(session, model_config, user_id, agent_id)
 
         # 无限上下文 LLM 每次新建，需注册工具；normal LLM 仅在首次创建时注册
         if model_config.is_limitless_context:
-            await _register_tools(session, agent_id, user_id)
+            await _register_tools(session, agent_id, user_id,
+                                  top_agent_id=agent_id)
 
         # 活动日志：记录本次对话开始，供 leader 判断是否卡死
         if workspace_id:
@@ -1007,8 +1104,17 @@ async def _handle_user_message(
         ):
             max_tokens = int(model_config.extra.get("max_seqlen", 8192))
             usage_payload = {**session.last_usage, "max_tokens": max_tokens}
+            # 追加预算信息到 usage payload
+            if (
+                getattr(session, "budget_tracker", None) is not None
+                and getattr(session, "price_calculator", None) is not None
+            ):
+                budget_data = session.budget_tracker.get_budget_ws_data(
+                    session.price_calculator
+                )
+                usage_payload["budget"] = budget_data
 
-        # 若最终文本段仍打开，补发 msg_end（附带 usage）
+        # 若最终文本段仍打开，补发 msg_end（附带 usage 与预算信息）
         if last_text_id:
             await ws_manager.send_message(
                 user_id,
@@ -1029,6 +1135,10 @@ async def _handle_user_message(
                 full_reply,
                 usage=usage_payload,
             )
+
+        # 任务结束时发送预算更新
+        if session is not None:
+            await _send_budget_update_ws(user_id, agent_id, session)
 
         # 恢复 idle 状态并清除任务登记
         _clear_active_task(user_id, agent_id)
@@ -1362,10 +1472,57 @@ async def send_teammate_message(
             "workspace_id": member_id,
             "model_id": member.get("model_id", ""),
             "system_prompt": member.get("system_prompt", ""),
+            "leader_id": agent_id,
+            "top_agent_id": agent_id,
             "content": content,
         },
     )
     return {"success": True}
+
+
+# ===== 预算控制 API =====
+
+
+class BudgetSetRequest(BaseModel):
+    """设置预算请求体。"""
+    budget: float
+
+
+@app.post("/api/budget/{agent_id}")
+async def set_agent_budget(
+    agent_id: str,
+    req: BudgetSetRequest,
+    user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """设置顶层 agent 的预算金额（美元）。
+
+    预算金额需大于 0。设置时会重置用量计数器。
+    """
+    user_id = user.get("openid", "")
+    if req.budget <= 0:
+        raise HTTPException(status_code=400, detail="预算金额必须大于 0")
+    set_budget(user_id, agent_id, req.budget)
+    return {"success": True, "agent_id": agent_id, "budget": req.budget}
+
+
+@app.get("/api/budget/{agent_id}")
+async def get_agent_budget(
+    agent_id: str,
+    user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """获取顶层 agent 的预算状态。
+
+    返回预算总额、已使用、剩余、消耗百分比、各 token 分类用量。
+    """
+    user_id = user.get("openid", "")
+    # 获取该 agent 的模型配置以计算价格
+    agent = get_agent(user_id, agent_id)
+    model_id = agent.get("model_id") if agent else None
+    model_config = _model_configs.get(model_id) if model_id else None
+    if model_config is None:
+        model_config = next(iter(_model_configs.values()))
+    status = get_budget_status(user_id, agent_id, model_config)
+    return {"agent_id": agent_id, **status}
 
 
 if __name__ == "__main__":

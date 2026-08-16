@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, Generator, List, Optional
 
 from openai import OpenAI
 
+from core.budget import BudgetTracker, PriceCalculator
 from core.models import ModelConfig
 
 logger = logging.getLogger(__name__)
@@ -152,8 +153,22 @@ class AgentLLMSession:
         # 最近一次 API 调用的 token 用量（流式响应末尾携带）
         self.last_usage: Optional[Dict[str, int]] = None
 
+        # 预算追踪器（由 main.py 注入，None 时不追踪）
+        self.budget_tracker: Optional[BudgetTracker] = None
+        # 价格计算器（由 main.py 注入，None 时不追踪）
+        self.price_calculator: Optional[PriceCalculator] = None
+
         # 记忆更新标志位（后续 Task 13 通过回调或标志位触发记忆更新）
         self.memory_update_pending: bool = False
+
+    def set_budget_tracker(
+        self,
+        tracker: Optional[BudgetTracker],
+        price_calc: Optional[PriceCalculator],
+    ) -> None:
+        """设置预算追踪器与价格计算器（由 main.py 在创建会话后调用）。"""
+        self.budget_tracker = tracker
+        self.price_calculator = price_calc
 
     # ------------------------------------------------------------------
     # 工具注册
@@ -312,11 +327,53 @@ class AgentLLMSession:
                 # 流式末尾的 usage chunk 无 choices，但携带 token 用量
                 usage = getattr(chunk, "usage", None)
                 if usage is not None:
+                    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+                    # 缓存命中 token（OpenAI 协议：prompt_tokens_details.cached_tokens）
+                    cached_tokens = 0
+                    details = getattr(usage, "prompt_tokens_details", None)
+                    if details is not None:
+                        cached_tokens = getattr(details, "cached_tokens", 0) or 0
                     self.last_usage = {
-                        "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-                        "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
                         "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+                        "cached_tokens": cached_tokens,
                     }
+                    # 记录本次 API 调用到预算追踪器
+                    if self.budget_tracker is not None:
+                        self.budget_tracker.record_usage(
+                            prompt_tokens, completion_tokens, cached_tokens
+                        )
+                        # 检查预算阈值，若达到新阈值则注入系统告警提示
+                        if self.price_calculator is not None:
+                            threshold_pct = self.budget_tracker.check_and_mark_threshold(
+                                self.price_calculator
+                            )
+                            if threshold_pct is not None:
+                                pct = self.budget_tracker.get_percentage(
+                                    self.price_calculator
+                                )
+                                remaining = self.budget_tracker.get_remaining(
+                                    self.price_calculator
+                                )
+                                summary = self.budget_tracker.get_budget_summary(
+                                    self.price_calculator
+                                )
+                                if threshold_pct >= 100:
+                                    warning = (
+                                        f"[预算告警] 预算已耗尽！{summary}\n"
+                                        "请立即停止所有非关键 API 调用，仅完成最核心的任务。"
+                                    )
+                                else:
+                                    warning = (
+                                        f"[预算告警] 预算已消耗 {pct}%（{threshold_pct}%），"
+                                        f"剩余 ${remaining:.4f}。\n"
+                                        "请合理规划工作流，在预算消耗 50% 前完成核心任务。"
+                                    )
+                                self.context.append(
+                                    {"role": "system", "content": warning}
+                                )
                 if not chunk.choices:
                     continue
                 choice = chunk.choices[0]
@@ -378,6 +435,13 @@ class AgentLLMSession:
 
                     # dict 结果提取可读内容，避免前端显示原始 dict 字符串
                     result_str = _stringify_tool_result(result)
+
+                    # 追加预算摘要到工具结果（让 agent 感知预算消耗，合理规划工作流）
+                    if self.budget_tracker is not None and self.price_calculator is not None:
+                        budget_summary = self.budget_tracker.get_budget_summary(
+                            self.price_calculator
+                        )
+                        result_str = f"{result_str}\n\n{budget_summary}"
 
                     yield {
                         "type": "tool_call",
@@ -649,6 +713,11 @@ class LimitlessContextSession(AgentLLMSession):
 
         # 最近一次 API 调用的 token 用量（流式响应末尾携带）
         self.last_usage: Optional[Dict[str, int]] = None
+
+        # 预算追踪器（由 main.py 注入，None 时不追踪）
+        self.budget_tracker: Optional[BudgetTracker] = None
+        # 价格计算器（由 main.py 注入，None 时不追踪）
+        self.price_calculator: Optional[PriceCalculator] = None
 
         # 记忆更新标志位（无限上下文不触发）
         self.memory_update_pending: bool = False

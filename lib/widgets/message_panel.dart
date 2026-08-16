@@ -65,15 +65,25 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 本地后端是否正在启动中
   bool _localStarting = false;
 
+  /// 预算数据（来自后端 budget_update 事件）
+  Map<String, dynamic>? _budgetData;
+
+  /// 预算输入控制器
+  final TextEditingController _budgetInputController = TextEditingController();
+
+  /// 是否显示预算设置输入框
+  bool _showBudgetInput = false;
+
   @override
   void initState() {
     super.initState();
     _webSocket.onMessage = _handleIncomingMessage;
     _loadLocalSettings();
     _connectWebSocket();
-    // 首次进入时若已选中 agent 则加载历史
+    // 首次进入时若已选中 agent 则加载历史与预算
     if (widget.selectedAgent != null) {
       _loadHistory();
+      _loadBudget();
     }
   }
 
@@ -98,8 +108,10 @@ class _MessagePanelState extends State<MessagePanel> {
     if (oldWidget.selectedAgent?.id != widget.selectedAgent?.id) {
       setState(() {
         _messages.clear();
+        _budgetData = null;
       });
       _loadHistory();
+      _loadBudget();
     } else if (oldWidget.refreshTrigger != widget.refreshTrigger) {
       setState(() {
         _messages.clear();
@@ -238,6 +250,14 @@ class _MessagePanelState extends State<MessagePanel> {
       });
     } else if (type == 'ask_user_question') {
       _handleAskUserQuestion(data);
+    } else if (type == 'budget_update') {
+      // 预算更新事件
+      final Map<String, dynamic>? d = data['data'] as Map<String, dynamic>?;
+      if (d != null && d['budget'] != null && (d['budget'] as num?)!.toDouble() > 0) {
+        setState(() {
+          _budgetData = Map<String, dynamic>.from(d);
+        });
+      }
     } else if (type == 'message') {
       if (!_isForCurrentAgent(data)) return;
       // 完整 agent 消息（如后端 _send_text_as_agent 发送的错误提示）
@@ -498,6 +518,7 @@ class _MessagePanelState extends State<MessagePanel> {
   @override
   void dispose() {
     _webSocket.disconnect();
+    _budgetInputController.dispose();
     super.dispose();
   }
 
@@ -509,6 +530,7 @@ class _MessagePanelState extends State<MessagePanel> {
       child: Column(
         children: <Widget>[
           _buildTitleBar(agent),
+          if (agent != null) _buildBudgetBar(),
           if (agent == null)
             Expanded(
               child: Center(
@@ -524,6 +546,221 @@ class _MessagePanelState extends State<MessagePanel> {
           else
             Expanded(child: MessageList(messages: _messages, revision: _scrollRevision)),
           if (agent != null) MessageInput(onSend: _handleSend),
+        ],
+      ),
+    );
+  }
+
+  /// 从后端拉取当前 agent 的预算状态
+  Future<void> _loadBudget() async {
+    final Agent? agent = widget.selectedAgent;
+    if (agent == null) return;
+    try {
+      final Map<String, dynamic> data = await ApiService.getBudget(agent.id);
+      if (!mounted) return;
+      if (data['budget'] != null && (data['budget'] as num).toDouble() > 0) {
+        setState(() {
+          _budgetData = data;
+        });
+      }
+    } catch (_) {
+      // 静默失败
+    }
+  }
+
+  /// 设置预算并发送到后端，关闭输入框
+  Future<void> _setBudget() async {
+    final Agent? agent = widget.selectedAgent;
+    if (agent == null) return;
+    final String text = _budgetInputController.text.trim();
+    final double? budget = double.tryParse(text);
+    if (budget == null || budget <= 0) {
+      _showSnackBar('请输入有效的预算金额（美元）');
+      return;
+    }
+    try {
+      await ApiService.setBudget(agent.id, budget);
+      if (!mounted) return;
+      setState(() {
+        _showBudgetInput = false;
+        _budgetInputController.clear();
+      });
+      // 设置后拉取一次最新状态
+      _loadBudget();
+      _showSnackBar('预算已设置为 \$${budget.toStringAsFixed(2)}');
+    } catch (e) {
+      if (!mounted) return;
+      _showSnackBar('设置预算失败: $e');
+    }
+  }
+
+  /// 构建预算栏（显示预算使用进度条 + 设置按钮）
+  Widget _buildBudgetBar() {
+    final cs = Theme.of(context).colorScheme;
+    final bool hasBudget = _budgetData != null &&
+        _budgetData!['budget'] != null &&
+        (_budgetData!['budget'] as num).toDouble() > 0;
+
+    // 无预算时显示 "设置预算" 按钮
+    if (!hasBudget) {
+      return Container(
+        height: 32,
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        decoration: BoxDecoration(
+          color: cs.surfaceVariant.withOpacity(0.3),
+          border: Border(
+            bottom: BorderSide(color: Theme.of(context).dividerColor, width: 0.5),
+          ),
+        ),
+        child: Row(
+          children: <Widget>[
+            Icon(Icons.account_balance_wallet_outlined, size: 14, color: cs.onSurfaceVariant),
+            const SizedBox(width: 4),
+            Text('预算', style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+            const Spacer(),
+            if (_showBudgetInput)
+              Expanded(
+                child: Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: SizedBox(
+                        height: 24,
+                        child: TextField(
+                          controller: _budgetInputController,
+                          style: const TextStyle(fontSize: 12),
+                          decoration: const InputDecoration(
+                            hintText: '输入金额（美元）',
+                            contentPadding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                            border: OutlineInputBorder(),
+                            isDense: true,
+                          ),
+                          keyboardType: TextInputType.number,
+                          onSubmitted: (_) => _setBudget(),
+                        ),
+                      ),
+                    ),
+                    SizedBox(
+                      width: 28,
+                      height: 24,
+                      child: IconButton(
+                        padding: EdgeInsets.zero,
+                        iconSize: 16,
+                        icon: const Icon(Icons.check),
+                        onPressed: _setBudget,
+                      ),
+                    ),
+                    SizedBox(
+                      width: 28,
+                      height: 24,
+                      child: IconButton(
+                        padding: EdgeInsets.zero,
+                        iconSize: 16,
+                        icon: const Icon(Icons.close),
+                        onPressed: () {
+                          setState(() {
+                            _showBudgetInput = false;
+                            _budgetInputController.clear();
+                          });
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              )
+            else
+              SizedBox(
+                height: 24,
+                child: TextButton.icon(
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 6),
+                    minimumSize: Size.zero,
+                    textStyle: const TextStyle(fontSize: 11),
+                  ),
+                  icon: const Icon(Icons.add, size: 14),
+                  label: const Text('设置预算'),
+                  onPressed: () {
+                    setState(() => _showBudgetInput = true);
+                  },
+                ),
+              ),
+          ],
+        ),
+      );
+    }
+
+    // 有预算时显示进度条
+    final double budget = (_budgetData!['budget'] as num).toDouble();
+    final double used = (_budgetData!['used'] as num?)?.toDouble() ?? 0;
+    final double remaining = (_budgetData!['remaining'] as num?)?.toDouble() ?? budget;
+    final double percentage = (_budgetData!['percentage'] as num?)?.toDouble() ?? 0;
+    final int inputTokens = (_budgetData!['input_tokens'] as num?)?.toInt() ?? 0;
+    final int outputTokens = (_budgetData!['output_tokens'] as num?)?.toInt() ?? 0;
+    final int cachedTokens = (_budgetData!['cached_tokens'] as num?)?.toInt() ?? 0;
+
+    final Color barColor = percentage >= 100
+        ? cs.error
+        : percentage >= 80
+            ? Colors.orange
+            : percentage >= 50
+                ? Colors.amber
+                : Colors.green;
+
+    return Container(
+      height: 32,
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      decoration: BoxDecoration(
+        color: cs.surfaceVariant.withOpacity(0.3),
+        border: Border(
+          bottom: BorderSide(color: Theme.of(context).dividerColor, width: 0.5),
+        ),
+      ),
+      child: Row(
+        children: <Widget>[
+          Icon(Icons.account_balance_wallet, size: 14, color: barColor),
+          const SizedBox(width: 4),
+          Expanded(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: <Widget>[
+                // 进度条
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(2),
+                  child: LinearProgressIndicator(
+                    value: percentage / 100.0,
+                    backgroundColor: cs.surfaceVariant.withOpacity(0.5),
+                    valueColor: AlwaysStoppedAnimation<Color>(barColor),
+                    minHeight: 4,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                // 文字信息
+                Row(
+                  children: <Widget>[
+                    Text(
+                      '已用 \$${used.toStringAsFixed(4)}',
+                      style: TextStyle(fontSize: 9, color: cs.onSurfaceVariant),
+                    ),
+                    const Spacer(),
+                    Text(
+                      '剩余 \$${remaining.toStringAsFixed(4)}',
+                      style: TextStyle(fontSize: 9, color: barColor),
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      '${percentage.toStringAsFixed(1)}%',
+                      style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: barColor),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 4),
+          // token 用量小图标
+          Tooltip(
+            message: '输入: $inputTokens | 输出: $outputTokens | 缓存命中: $cachedTokens',
+            child: Icon(Icons.info_outline, size: 12, color: cs.onSurfaceVariant),
+          ),
         ],
       ),
     );
