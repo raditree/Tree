@@ -68,8 +68,8 @@ def set_data_collection(openid: str, enabled: bool) -> None:
             conn.execute(
                 """INSERT INTO data_collection_prefs (openid, enabled, updated_at)
                    VALUES (?, ?, ?)
-                   ON CONFLICT(openid) DO UPDATE SET enabled = ?, updated_at = ?""",
-                (openid, 1 if enabled else 0, now, 1 if enabled else 0, now),
+                   ON CONFLICT(openid) DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = EXCLUDED.updated_at""",
+                (openid, 1 if enabled else 0, now),
             )
             conn.commit()
         finally:

@@ -590,7 +590,7 @@ class ApiService {
 
   /// 修改密码
   ///
-  /// 调用 `POST /api/auth/change-password`，请求体为 `{"old_password", "new_password"}`。
+  /// 调用 `POST /api/auth/change-password`，请求体为 `{"old_password": "...", "new_password": "..."}`。
   static Future<void> changePassword({
     required String oldPassword,
     required String newPassword,

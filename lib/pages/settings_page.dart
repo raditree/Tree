@@ -122,7 +122,7 @@ class _SettingsPageState extends State<SettingsPage> {
     }
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('后端地址已保存，重启后生效')),
+      const SnackBar(content: Text('后端地址已保存，当前请求已使用新地址')),
     );
   }
 
