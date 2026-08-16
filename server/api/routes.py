@@ -7,7 +7,7 @@ import secrets
 import tempfile
 import uuid
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 
 logger = logging.getLogger(__name__)
 
@@ -868,23 +868,20 @@ async def download_file(
     request: Request,
     _: dict = Depends(get_current_user),
 ):
-    """从工作空间下载文件，返回文件内容（StreamingResponse）。"""
-    docker_manager = _get_docker_manager(request)
-    safe_path = _escape_shell_path(req.path)
-    result = docker_manager.exec_in_workspace(
-        workspace_id,
-        ["sh", "-c", 'cat "$1" 2>&1', "sh", safe_path],
-    )
-    if "error" in result and "exit_code" not in result:
-        raise HTTPException(status_code=404, detail=result)
-    if result.get("exit_code", 0) != 0:
-        raise HTTPException(status_code=404, detail="文件不存在或无法读取")
-    content = result.get("stdout", "").encode("utf-8")
+    """从工作空间下载文件，返回文件内容（StreamingResponse）。
+
+    使用 base64 方案读取二进制内容（避免 cat 经 stdout 的 UTF-8 解码损坏二进制）。
+    """
+    content = _read_file_bytes(workspace_id, req.path, request)
     filename = req.path.rsplit("/", 1)[-1] or "download"
+    # 使用 RFC 5987 格式支持非 Latin-1 字符（如中文文件名）
+    encoded_filename = quote(filename, safe="")
     return StreamingResponse(
         iter([content]),
         media_type="application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
+        },
     )
 
 
