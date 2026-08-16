@@ -31,6 +31,10 @@ except ImportError:
     fitz = None
 
 from core import agent_store, user_store
+from core.data_collection_store import (
+    save_snapshot,
+    set_data_collection,
+)
 from core.embed_model import (
     EmbedModelConfig,
     get_embedding,
@@ -269,6 +273,51 @@ async def auth_logout(request: Request, _: dict = Depends(get_current_user)):
     token = auth_header[len("Bearer "):].strip()
     revoke_token(token)
     return {"status": "ok"}
+
+
+class ChangePasswordRequest(BaseModel):
+    """修改密码请求体。"""
+    old_password: str
+    new_password: str
+
+
+@router.post("/auth/change-password")
+async def auth_change_password(
+    req: ChangePasswordRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """修改密码：校验旧密码正确后更新为新密码。"""
+    openid = current_user.get("openid", "")
+    if not req.old_password or not req.new_password:
+        raise HTTPException(status_code=400, detail="旧密码和新密码不能为空")
+    if len(req.new_password) < 6:
+        raise HTTPException(status_code=400, detail="新密码长度不能少于 6 位")
+    success = user_store.change_password(openid, req.old_password, req.new_password)
+    if not success:
+        raise HTTPException(status_code=400, detail="旧密码错误或用户不存在")
+    return {"success": True}
+
+
+class DataCollectionRequest(BaseModel):
+    """数据收集设置请求体。"""
+    enabled: bool
+
+
+@router.post("/settings/data-collection")
+async def set_data_collection_endpoint(
+    req: DataCollectionRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """设置数据收集开关。"""
+    openid = current_user.get("openid", "")
+    set_data_collection(openid, req.enabled)
+    status = "开启" if req.enabled else "关闭"
+    save_snapshot(
+        openid,
+        "settings_change",
+        {"action": "data_collection", "enabled": req.enabled},
+    )
+    return {"success": True, "enabled": req.enabled, "message": f"数据收集已{status}"}
 
 
 # ===== 账号注销（checklist 3：十日倒计时 + 31 天保留后删除） =====

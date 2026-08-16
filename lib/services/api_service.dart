@@ -588,6 +588,28 @@ class ApiService {
     );
   }
 
+  /// 修改密码
+  ///
+  /// 调用 `POST /api/auth/change-password`，请求体为 `{"old_password", "new_password"}`。
+  static Future<void> changePassword({
+    required String oldPassword,
+    required String newPassword,
+  }) async {
+    await _postJson('/api/auth/change-password', body: {
+      'old_password': oldPassword,
+      'new_password': newPassword,
+    });
+  }
+
+  /// 设置数据收集开关
+  ///
+  /// 调用 `POST /api/settings/data-collection`，请求体为 `{"enabled": true/false}`。
+  static Future<void> setDataCollection(bool enabled) async {
+    await _postJson('/api/settings/data-collection', body: {
+      'enabled': enabled,
+    });
+  }
+
   /// 登出：撤销当前 token（后端侧）
   ///
   /// 调用 `POST /api/auth/logout`。本地清理由调用方（AuthService）负责。

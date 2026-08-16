@@ -18,6 +18,7 @@ class LoginPage extends StatefulWidget {
 class _LoginPageState extends State<LoginPage> {
   final TextEditingController _usernameController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
+  final TextEditingController _confirmPasswordController = TextEditingController();
   final TextEditingController _nicknameController = TextEditingController();
 
   /// 当前是否处于注册模式
@@ -33,6 +34,7 @@ class _LoginPageState extends State<LoginPage> {
   void dispose() {
     _usernameController.dispose();
     _passwordController.dispose();
+    _confirmPasswordController.dispose();
     _nicknameController.dispose();
     super.dispose();
   }
@@ -53,6 +55,14 @@ class _LoginPageState extends State<LoginPage> {
     if (username.isEmpty || password.isEmpty) {
       setState(() => _errorMsg = '请输入用户名和密码');
       return;
+    }
+
+    if (_isRegister) {
+      final String confirmPassword = _confirmPasswordController.text;
+      if (password != confirmPassword) {
+        setState(() => _errorMsg = '两次输入的密码不一致');
+        return;
+      }
     }
 
     setState(() {
@@ -150,6 +160,16 @@ class _LoginPageState extends State<LoginPage> {
                       ),
                     ),
                     if (_isRegister) ...[
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: _confirmPasswordController,
+                        obscureText: true,
+                        decoration: const InputDecoration(
+                          labelText: '确认密码',
+                          prefixIcon: Icon(Icons.lock_outline, size: 20),
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
                       const SizedBox(height: 12),
                       TextField(
                         controller: _nicknameController,

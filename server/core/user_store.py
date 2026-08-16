@@ -246,6 +246,34 @@ def cancel_delete(openid: str) -> Optional[Dict[str, Any]]:
     return get_user_by_openid(openid)
 
 
+def change_password(openid: str, old_password: str, new_password: str) -> bool:
+    """修改密码：校验旧密码正确后更新为新密码。
+
+    成功返回 True，旧密码错误或用户不存在返回 False。
+    """
+    user = get_user_by_openid(openid)
+    if user is None:
+        return False
+    password_hash = user.get("password_hash")
+    salt = user.get("salt")
+    if password_hash is None or salt is None:
+        return False
+    if not _verify_password(old_password, password_hash, salt):
+        return False
+    new_hash, new_salt = _hash_password(new_password)
+    with _write_lock:
+        conn = _connect()
+        try:
+            conn.execute(
+                "UPDATE users SET password_hash = ?, salt = ? WHERE openid = ?",
+                (new_hash, new_salt, openid),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return True
+
+
 def get_account_status(openid: str) -> Dict[str, Any]:
     """返回账号注销状态。
 
@@ -307,6 +335,8 @@ def purge_expired_users() -> int:
             conn.execute("DELETE FROM agents WHERE user_id = ?", (openid,))
             conn.execute("DELETE FROM messages WHERE user_id = ?", (openid,))
             conn.execute("DELETE FROM agent_context WHERE user_id = ?", (openid,))
+            conn.execute("DELETE FROM usage_snapshots WHERE openid = ?", (openid,))
+            conn.execute("DELETE FROM data_collection_prefs WHERE openid = ?", (openid,))
             conn.commit()
         deleted += 1
     return deleted

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'pages/login_page.dart';
 import 'pages/main_page.dart';
@@ -16,6 +17,14 @@ void main() async {
 
   // 加载本地保存的主题模式
   await ThemeService.instance.load();
+
+  // 加载自定义后端地址配置
+  final prefs = await SharedPreferences.getInstance();
+  final host = prefs.getString('custom_backend_host') ?? '';
+  final port = prefs.getString('custom_backend_port') ?? '';
+  if (host.isNotEmpty && port.isNotEmpty) {
+    ApiService.baseUrl = 'http://$host:$port';
+  }
 
   // 读取本地登录状态以决定初始路由
   final authService = AuthService();

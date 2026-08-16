@@ -38,6 +38,10 @@ from core.conversation_store import (
     save_context,
     store_message,
 )
+from core.data_collection_store import (
+    is_data_collection_enabled,
+    save_snapshot,
+)
 from core.docker_manager import DockerManager
 from core.llm import AgentLLMSession, LimitlessContextSession
 from core.models import ModelConfig, get_model_configs
@@ -1136,6 +1140,19 @@ async def _handle_user_message(
                 usage=usage_payload,
             )
 
+        # 数据收集：记录使用快照（仅在开启时有效）
+        try:
+            if is_data_collection_enabled(user_id):
+                snapshot_data = {
+                    "agent_id": agent_id,
+                    "model_id": getattr(model_config, "model_id", ""),
+                    "reply_length": len(full_reply) if full_reply else 0,
+                    "usage": usage_payload,
+                }
+                save_snapshot(user_id, "agent_reply", snapshot_data)
+        except Exception:  # noqa: BLE001
+            pass
+
         # 任务结束时发送预算更新
         if session is not None:
             await _send_budget_update_ws(user_id, agent_id, session)
@@ -1496,12 +1513,45 @@ async def set_agent_budget(
 ) -> Dict[str, Any]:
     """设置顶层 agent 的预算金额（美元）。
 
-    预算金额需大于 0。设置时会重置用量计数器。
+    预算金额需大于 0。如果 agent 当前有活跃会话，向上下文中注入预算变更
+    系统提示词，让 agent 感知到预算变化并调整工作策略。
     """
     user_id = user.get("openid", "")
     if req.budget <= 0:
         raise HTTPException(status_code=400, detail="预算金额必须大于 0")
     set_budget(user_id, agent_id, req.budget)
+
+    # 若有活跃会话，注入预算变更提示词
+    session = get_session(user_id, agent_id)
+    if session is not None and hasattr(session, "context"):
+        budget = req.budget
+        # 获取当前预算状态以生成摘要
+        model_config = session.model_config if hasattr(session, "model_config") else None
+        if model_config is not None:
+            try:
+                from core.budget import PriceCalculator, get_budget_tracker
+                pc = PriceCalculator(model_config)
+                tracker = get_budget_tracker(user_id, agent_id)
+                summary = tracker.get_budget_summary(pc)
+                session.context.append({
+                    "role": "system",
+                    "content": (
+                        f"[预算变更] 用户已将预算修改为 ${budget:.2f}。"
+                        f"当前用量：{summary}\n"
+                        "请根据新的预算配额合理规划后续工作流，"
+                        "在预算消耗 50% 前完成核心任务。"
+                    ),
+                })
+            except Exception:
+                # 兜底：简版提示
+                session.context.append({
+                    "role": "system",
+                    "content": (
+                        f"[预算变更] 用户已将预算修改为 ${budget:.2f}。"
+                        "请根据新的预算配额合理规划后续工作流。"
+                    ),
+                })
+
     return {"success": True, "agent_id": agent_id, "budget": req.budget}
 
 

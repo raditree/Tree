@@ -75,6 +75,18 @@ def _ensure_db() -> None:
             conn.execute("ALTER TABLE messages ADD COLUMN tool_arguments TEXT")
         if "tool_result" not in cols:
             conn.execute("ALTER TABLE messages ADD COLUMN tool_result TEXT")
+        # 预算设置表
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS budget_settings (
+                user_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                budget REAL NOT NULL DEFAULT 0.0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, agent_id)
+            )
+            """
+        )
         conn.commit()
     _initialized = True
 
@@ -276,3 +288,51 @@ def clear_context(user_id: str, agent_id: Optional[str] = None) -> None:
                 (user_id, agent_id),
             )
         conn.commit()
+
+
+# ------------------------------------------------------------------
+# 预算设置持久化
+# ------------------------------------------------------------------
+def save_budget_setting(user_id: str, agent_id: str, budget: float) -> None:
+    """保存预算设置到 SQLite。"""
+    _ensure_db()
+    ts = int(time.time() * 1000)
+    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+        conn.execute(
+            "INSERT INTO budget_settings (user_id, agent_id, budget, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id, agent_id) DO UPDATE SET "
+            "budget = excluded.budget, updated_at = excluded.updated_at",
+            (user_id, agent_id, budget, ts),
+        )
+        conn.commit()
+
+
+def load_budget_setting(user_id: str, agent_id: str) -> Optional[float]:
+    """加载指定用户/agent 的预算设置；不存在时返回 None。"""
+    _ensure_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT budget FROM budget_settings "
+            "WHERE user_id = ? AND agent_id = ?",
+            (user_id, agent_id),
+        ).fetchone()
+        return float(row[0]) if row else None
+    finally:
+        conn.close()
+
+
+def load_all_budget_settings() -> List[Dict[str, Any]]:
+    """加载所有预算设置。"""
+    _ensure_db()
+    conn = _connect()
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT user_id, agent_id, budget FROM budget_settings"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()

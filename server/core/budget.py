@@ -6,7 +6,9 @@
 
 import logging
 import threading
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+from core.conversation_store import save_budget_setting
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +88,14 @@ class BudgetTracker:
             self.input_tokens = 0
             self.output_tokens = 0
             self.cached_tokens = 0
+            self._notified_thresholds.clear()
+
+    def clear_thresholds(self) -> None:
+        """仅清除已通知的阈值记录，不清除计数器。
+
+        预算金额变更时调用，使阈值基于新预算重新评估。
+        """
+        with self._lock:
             self._notified_thresholds.clear()
 
     def record_usage(
@@ -209,11 +219,24 @@ _trackers_lock = threading.Lock()
 
 
 def get_budget_tracker(user_id: str, top_agent_id: str) -> BudgetTracker:
-    """获取或创建预算追踪器。"""
+    """获取或创建预算追踪器。
+
+    首次创建时尝试从 SQLite 加载已有预算设置，实现重启后恢复。
+    """
     key = (user_id, top_agent_id)
     with _trackers_lock:
         if key not in _budget_trackers:
-            _budget_trackers[key] = BudgetTracker()
+            tracker = BudgetTracker()
+            # 从 SQLite 加载已有预算
+            try:
+                from core.conversation_store import load_budget_setting
+
+                saved = load_budget_setting(user_id, top_agent_id)
+                if saved is not None and saved > 0:
+                    tracker.budget = saved
+            except Exception:
+                logger.warning("加载预算设置失败", exc_info=True)
+            _budget_trackers[key] = tracker
         return _budget_trackers[key]
 
 
@@ -224,10 +247,19 @@ def reset_budget_tracker(user_id: str, top_agent_id: str) -> None:
 
 
 def set_budget(user_id: str, top_agent_id: str, budget: float) -> None:
-    """设置预算金额。"""
+    """设置预算金额。
+
+    保留已有用量计数器，仅清除阈值记录，使阈值基于新预算重新评估。
+    同时持久化到 SQLite，重启后自动恢复。
+    """
     tracker = get_budget_tracker(user_id, top_agent_id)
     tracker.budget = budget
-    tracker.reset()
+    tracker.clear_thresholds()
+    # 持久化到 SQLite
+    try:
+        save_budget_setting(user_id, top_agent_id, budget)
+    except Exception:
+        logger.warning("保存预算设置失败", exc_info=True)
 
 
 def get_budget_status(

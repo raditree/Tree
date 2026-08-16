@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../services/api_service.dart';
 import '../services/auth_service.dart';
@@ -6,9 +7,12 @@ import '../services/theme_service.dart';
 
 /// 设置页面
 ///
-/// 提供账号管理与主题管理：
+/// 提供账号管理、密码修改、后端配置、数据收集与主题管理：
 /// - 账号管理：展示当前用户信息（昵称、openid），支持退出登录
-/// - 主题管理：浅色 / 深色 / 跟随系统三种模式，切换后持久化并即时生效
+/// - 密码修改：修改当前账号密码
+/// - 后端配置：自定义后端 IP+端口
+/// - 数据收集：允许收集使用数据用于分析
+/// - 主题管理：浅色 / 深色 / 跟随系统三种模式
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key});
 
@@ -32,11 +36,36 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 是否正在执行注销/取消操作
   bool _deleteBusy = false;
 
+  // --- 密码修改 ---
+  final TextEditingController _oldPwdController = TextEditingController();
+  final TextEditingController _newPwdController = TextEditingController();
+  final TextEditingController _confirmNewPwdController = TextEditingController();
+  bool _changingPassword = false;
+
+  // --- 后端配置 ---
+  final TextEditingController _backendHostController = TextEditingController();
+  final TextEditingController _backendPortController = TextEditingController();
+
+  // --- 数据收集 ---
+  bool _dataCollectionEnabled = false;
+
   @override
   void initState() {
     super.initState();
     _loadUser();
     _loadAccountStatus();
+    _loadBackendConfig();
+    _loadDataCollectionSetting();
+  }
+
+  @override
+  void dispose() {
+    _oldPwdController.dispose();
+    _newPwdController.dispose();
+    _confirmNewPwdController.dispose();
+    _backendHostController.dispose();
+    _backendPortController.dispose();
+    super.dispose();
   }
 
   /// 解析本地 token 中的用户信息
@@ -58,6 +87,104 @@ class _SettingsPageState extends State<SettingsPage> {
       setState(() => _accountStatus = status);
     } catch (_) {
       // 查询失败时保持 null，不阻塞其他设置项
+    }
+  }
+
+  /// 加载后端配置（IP+端口）
+  Future<void> _loadBackendConfig() async {
+    final prefs = await SharedPreferences.getInstance();
+    final host = prefs.getString('custom_backend_host') ?? '';
+    final port = prefs.getString('custom_backend_port') ?? '';
+    _backendHostController.text = host;
+    _backendPortController.text = port;
+  }
+
+  /// 加载数据收集设置
+  Future<void> _loadDataCollectionSetting() async {
+    final prefs = await SharedPreferences.getInstance();
+    final enabled = prefs.getBool('data_collection_enabled') ?? false;
+    if (mounted) {
+      setState(() => _dataCollectionEnabled = enabled);
+    }
+  }
+
+  /// 保存后端配置并更新 ApiService.baseUrl
+  Future<void> _saveBackendConfig() async {
+    final host = _backendHostController.text.trim();
+    final port = _backendPortController.text.trim();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('custom_backend_host', host);
+    await prefs.setString('custom_backend_port', port);
+    if (host.isNotEmpty && port.isNotEmpty) {
+      ApiService.baseUrl = 'http://$host:$port';
+    } else {
+      ApiService.baseUrl = 'http://localhost:8000';
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('后端地址已保存，重启后生效')),
+    );
+  }
+
+  /// 切换数据收集开关
+  Future<void> _toggleDataCollection(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('data_collection_enabled', value);
+    try {
+      await ApiService.setDataCollection(value);
+    } catch (_) {
+      // 后端设置失败不阻塞本地持久化
+    }
+    if (mounted) {
+      setState(() => _dataCollectionEnabled = value);
+    }
+  }
+
+  /// 修改密码
+  Future<void> _changePassword() async {
+    final oldPwd = _oldPwdController.text;
+    final newPwd = _newPwdController.text;
+    final confirmPwd = _confirmNewPwdController.text;
+
+    if (oldPwd.isEmpty || newPwd.isEmpty || confirmPwd.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请填写所有密码字段')),
+      );
+      return;
+    }
+    if (newPwd != confirmPwd) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('两次输入的新密码不一致')),
+      );
+      return;
+    }
+    if (newPwd.length < 6) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('新密码长度不能少于 6 位')),
+      );
+      return;
+    }
+
+    setState(() => _changingPassword = true);
+    try {
+      await ApiService.changePassword(
+        oldPassword: oldPwd,
+        newPassword: newPwd,
+      );
+      if (!mounted) return;
+      _oldPwdController.clear();
+      _newPwdController.clear();
+      _confirmNewPwdController.clear();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('密码修改成功')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('密码修改失败：$e')),
+      );
+    } finally {
+      if (mounted) setState(() => _changingPassword = false);
     }
   }
 
@@ -156,6 +283,18 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 8),
           _buildAccountCard(),
           const SizedBox(height: 24),
+          _buildSectionTitle('修改密码'),
+          const SizedBox(height: 8),
+          _buildChangePasswordCard(),
+          const SizedBox(height: 24),
+          _buildSectionTitle('后端配置'),
+          const SizedBox(height: 8),
+          _buildBackendConfigCard(),
+          const SizedBox(height: 24),
+          _buildSectionTitle('数据收集'),
+          const SizedBox(height: 8),
+          _buildDataCollectionCard(),
+          const SizedBox(height: 24),
           _buildSectionTitle('注销账号'),
           const SizedBox(height: 8),
           _buildDeleteAccountCard(),
@@ -164,6 +303,176 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 8),
           _buildThemeCard(),
         ],
+      ),
+    );
+  }
+
+  /// 修改密码卡片
+  Widget _buildChangePasswordCard() {
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: _oldPwdController,
+              obscureText: true,
+              decoration: const InputDecoration(
+                labelText: '当前密码',
+                prefixIcon: Icon(Icons.lock_outline, size: 20),
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _newPwdController,
+              obscureText: true,
+              decoration: const InputDecoration(
+                labelText: '新密码',
+                prefixIcon: Icon(Icons.lock, size: 20),
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _confirmNewPwdController,
+              obscureText: true,
+              decoration: const InputDecoration(
+                labelText: '确认新密码',
+                prefixIcon: Icon(Icons.lock, size: 20),
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: _changingPassword ? null : _changePassword,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF2563EB),
+                  foregroundColor: Colors.white,
+                ),
+                icon: _changingPassword
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      )
+                    : const Icon(Icons.lock_reset, size: 18),
+                label: Text(_changingPassword ? '修改中...' : '修改密码'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 后端配置卡片
+  Widget _buildBackendConfigCard() {
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _backendHostController,
+                    decoration: const InputDecoration(
+                      labelText: 'IP 地址',
+                      hintText: 'localhost',
+                      prefixIcon: Icon(Icons.dns_outlined, size: 20),
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                SizedBox(
+                  width: 100,
+                  child: TextField(
+                    controller: _backendPortController,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(
+                      labelText: '端口',
+                      hintText: '8000',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: _saveBackendConfig,
+                icon: const Icon(Icons.save_outlined, size: 18),
+                label: const Text('保存后端地址'),
+              ),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              '修改后需重启应用生效',
+              style: TextStyle(fontSize: 12, color: Colors.black54),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 数据收集卡片
+  Widget _buildDataCollectionCard() {
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        '允许收集使用数据',
+                        style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        _dataCollectionEnabled
+                            ? '已开启，仅保存开启期间的使用数据快照'
+                            : '关闭状态，不会收集任何使用数据',
+                        style: const TextStyle(fontSize: 12, color: Colors.black54),
+                      ),
+                    ],
+                  ),
+                ),
+                Switch(
+                  value: _dataCollectionEnabled,
+                  onChanged: _toggleDataCollection,
+                  activeColor: const Color(0xFF2563EB),
+                ),
+              ],
+            ),
+          ],
+        ),
       ),
     );
   }

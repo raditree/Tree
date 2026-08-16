@@ -253,7 +253,7 @@ class _MessagePanelState extends State<MessagePanel> {
     } else if (type == 'budget_update') {
       // 预算更新事件
       final Map<String, dynamic>? d = data['data'] as Map<String, dynamic>?;
-      if (d != null && d['budget'] != null && (d['budget'] as num?)!.toDouble() > 0) {
+      if (d != null && d['budget'] != null && (d['budget'] as num).toDouble() > 0) {
         setState(() {
           _budgetData = Map<String, dynamic>.from(d);
         });
@@ -620,51 +620,22 @@ class _MessagePanelState extends State<MessagePanel> {
             const Spacer(),
             if (_showBudgetInput)
               Expanded(
-                child: Row(
-                  children: <Widget>[
-                    Expanded(
-                      child: SizedBox(
-                        height: 24,
-                        child: TextField(
-                          controller: _budgetInputController,
-                          style: const TextStyle(fontSize: 12),
-                          decoration: const InputDecoration(
-                            hintText: '输入金额（美元）',
-                            contentPadding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                            border: OutlineInputBorder(),
-                            isDense: true,
-                          ),
-                          keyboardType: TextInputType.number,
-                          onSubmitted: (_) => _setBudget(),
-                        ),
-                      ),
+                child: SizedBox(
+                  height: 24,
+                  child: TextField(
+                    controller: _budgetInputController,
+                    autofocus: true,
+                    style: const TextStyle(fontSize: 12),
+                    decoration: const InputDecoration(
+                      hintText: '输入金额（美元）',
+                      contentPadding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      border: OutlineInputBorder(),
+                      isDense: true,
                     ),
-                    SizedBox(
-                      width: 28,
-                      height: 24,
-                      child: IconButton(
-                        padding: EdgeInsets.zero,
-                        iconSize: 16,
-                        icon: const Icon(Icons.check),
-                        onPressed: _setBudget,
-                      ),
-                    ),
-                    SizedBox(
-                      width: 28,
-                      height: 24,
-                      child: IconButton(
-                        padding: EdgeInsets.zero,
-                        iconSize: 16,
-                        icon: const Icon(Icons.close),
-                        onPressed: () {
-                          setState(() {
-                            _showBudgetInput = false;
-                            _budgetInputController.clear();
-                          });
-                        },
-                      ),
-                    ),
-                  ],
+                    keyboardType: TextInputType.number,
+                    onSubmitted: (_) => _setBudget(),
+                    onTapOutside: (_) => _setBudget(),
+                  ),
                 ),
               )
             else
@@ -689,6 +660,45 @@ class _MessagePanelState extends State<MessagePanel> {
     }
 
     // 有预算时显示进度条
+    if (_showBudgetInput) {
+      // 修改预算模式：显示输入框，焦点离开自动确认
+      return Container(
+        height: 32,
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        decoration: BoxDecoration(
+          color: cs.surfaceVariant.withOpacity(0.3),
+          border: Border(
+            bottom: BorderSide(color: Theme.of(context).dividerColor, width: 0.5),
+          ),
+        ),
+        child: Row(
+          children: <Widget>[
+            Icon(Icons.account_balance_wallet, size: 14, color: cs.primary),
+            const SizedBox(width: 4),
+            Expanded(
+              child: SizedBox(
+                height: 24,
+                child: TextField(
+                  controller: _budgetInputController,
+                  autofocus: true,
+                  style: const TextStyle(fontSize: 12),
+                  decoration: const InputDecoration(
+                    hintText: '修改预算金额（美元）',
+                    contentPadding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                  keyboardType: TextInputType.number,
+                  onSubmitted: (_) => _setBudget(),
+                  onTapOutside: (_) => _setBudget(),
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
     final double budget = (_budgetData!['budget'] as num).toDouble();
     final double used = (_budgetData!['used'] as num?)?.toDouble() ?? 0;
     final double remaining = (_budgetData!['remaining'] as num?)?.toDouble() ?? budget;
@@ -756,6 +766,21 @@ class _MessagePanelState extends State<MessagePanel> {
             ),
           ),
           const SizedBox(width: 4),
+          // 修改预算按钮
+          SizedBox(
+            width: 20,
+            height: 20,
+            child: IconButton(
+              padding: EdgeInsets.zero,
+              iconSize: 12,
+              icon: Icon(Icons.edit, color: cs.onSurfaceVariant),
+              tooltip: '修改预算',
+              onPressed: () {
+                _budgetInputController.text = budget.toString();
+                setState(() => _showBudgetInput = true);
+              },
+            ),
+          ),
           // token 用量小图标
           Tooltip(
             message: '输入: $inputTokens | 输出: $outputTokens | 缓存命中: $cachedTokens',
