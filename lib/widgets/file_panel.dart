@@ -13,16 +13,20 @@ import 'git_history.dart';
 /// 文件管理面板（右栏）
 ///
 /// 集成文件浏览、Git 历史与文件同步功能，作为右栏的主容器：
-/// - 顶部标题栏："文件管理" + [FileSyncButton]
+/// - 顶部标题栏："文件管理" + [FileSyncButton] + 折叠按钮
 /// - Tab 切换："文件浏览"（[FileTree]） / "Git 历史"（[GitHistory]）
 /// - 点击文件时以覆盖层方式弹出 [FileViewer]，点击返回按钮关闭查看器
 class FilePanel extends StatefulWidget {
   /// 工作空间 ID
   final String workspaceId;
 
+  /// 折叠右侧栏的回调
+  final VoidCallback? onCollapse;
+
   const FilePanel({
     super.key,
     required this.workspaceId,
+    this.onCollapse,
   });
 
   @override
@@ -163,12 +167,12 @@ class _FilePanelState extends State<FilePanel>
   /// 构建标题栏
   ///
   /// 高度 48px，白色背景，底部 1px 分隔线。
-  /// 左侧显示"文件管理"，右侧显示文件同步按钮。
+  /// 左侧显示"文件管理"，右侧显示文件同步按钮和折叠按钮。
   Widget _buildTitleBar() {
     final cs = Theme.of(context).colorScheme;
     return Container(
       height: 48,
-      padding: const EdgeInsets.symmetric(horizontal: 12),
+      padding: const EdgeInsets.only(left: 12, right: 4),
       decoration: BoxDecoration(
         color: cs.surface,
         border: Border(
@@ -188,6 +192,12 @@ class _FilePanelState extends State<FilePanel>
           FileSyncButton(
             workspaceId: widget.workspaceId,
             onUploaded: _refreshFileTree,
+          ),
+          // 折叠右侧栏
+          IconButton(
+            tooltip: '折叠右侧栏',
+            icon: const Icon(Icons.chevron_right),
+            onPressed: widget.onCollapse,
           ),
         ],
       ),

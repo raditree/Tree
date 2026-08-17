@@ -35,6 +35,13 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   // 右栏当前宽度，初始 340px
   double _rightWidth = 340;
 
+  // 折叠状态
+  bool _leftCollapsed = false;
+  bool _rightCollapsed = false;
+
+  // 折叠时宽度
+  static const double _collapsedWidth = 40;
+
   // 当前选中的 Agent（未选择时为 null）
   Agent? _selectedAgent;
 
@@ -239,21 +246,25 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   Widget _buildThreeColumnLayout() {
     return Row(
       children: [
-        // 左栏：Agent 列表
-        SizedBox(
-          width: _leftWidth,
-          child: _buildAgentPanel(),
-        ),
-        // 拖拽分隔条 1（控制左栏宽度）
-        DraggableDivider(
-          onDrag: (delta) {
-            setState(() {
-              _leftWidth = (_leftWidth + delta)
-                  .clamp(_leftMinWidth, _leftMaxWidth)
-                  .toDouble();
-            });
-          },
-        ),
+        // 左栏：Agent 列表（折叠或展开）
+        if (_leftCollapsed)
+          _buildCollapsedLeftBar()
+        else ...[
+          SizedBox(
+            width: _leftWidth,
+            child: _buildAgentPanel(),
+          ),
+          // 拖拽分隔条 1（控制左栏宽度）
+          DraggableDivider(
+            onDrag: (delta) {
+              setState(() {
+                _leftWidth = (_leftWidth + delta)
+                    .clamp(_leftMinWidth, _leftMaxWidth)
+                    .toDouble();
+              });
+            },
+          ),
+        ],
         // 中栏：消息交互（弹性宽度）
         Expanded(
           child: MessagePanel(
@@ -261,22 +272,26 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             refreshTrigger: _refreshTrigger,
           ),
         ),
-        // 拖拽分隔条 2（控制右栏宽度）
-        DraggableDivider(
-          onDrag: (delta) {
-            setState(() {
-              // 右栏分隔条向右拖拽（delta 为正）时，右栏宽度减小
-              _rightWidth = (_rightWidth - delta)
-                  .clamp(_rightMinWidth, _rightMaxWidth)
-                  .toDouble();
-            });
-          },
-        ),
-        // 右栏：文件管理（跟随当前选中的 agent 的工作空间）
-        SizedBox(
-          width: _rightWidth,
-          child: _buildFilePanel(),
-        ),
+        // 右栏：文件管理（折叠或展开）
+        if (_rightCollapsed)
+          _buildCollapsedRightBar()
+        else ...[
+          // 拖拽分隔条 2（控制右栏宽度）
+          DraggableDivider(
+            onDrag: (delta) {
+              setState(() {
+                // 右栏分隔条向右拖拽（delta 为正）时，右栏宽度减小
+                _rightWidth = (_rightWidth - delta)
+                    .clamp(_rightMinWidth, _rightMaxWidth)
+                    .toDouble();
+              });
+            },
+          ),
+          SizedBox(
+            width: _rightWidth,
+            child: _buildFilePanel(),
+          ),
+        ],
       ],
     );
   }
@@ -310,6 +325,11 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     return FilePanel(
       key: ValueKey(workspaceId),
       workspaceId: workspaceId,
+      onCollapse: () {
+        setState(() {
+          _rightCollapsed = true;
+        });
+      },
     );
   }
 
@@ -341,7 +361,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     );
   }
 
-  /// 构建左栏标题栏（标题 + 设置/创建按钮）
+  /// 构建左栏标题栏（标题 + 设置/创建/折叠按钮）
   Widget _buildAgentHeader() {
     final cs = Theme.of(context).colorScheme;
     return Container(
@@ -384,11 +404,114 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             icon: const Icon(Icons.add_circle_outline),
             color: cs.primary,
           ),
+          // 折叠左侧栏
+          IconButton(
+            tooltip: '折叠左侧栏',
+            icon: const Icon(Icons.chevron_left),
+            onPressed: () {
+              setState(() {
+                _leftCollapsed = true;
+              });
+            },
+          ),
         ],
       ),
     );
   }
 
+  /// 构建折叠状态的左侧栏（窄条 + 展开按钮）
+  Widget _buildCollapsedLeftBar() {
+    final cs = Theme.of(context).colorScheme;
+    return Container(
+      width: _collapsedWidth,
+      color: Theme.of(context).scaffoldBackgroundColor,
+      child: Column(
+        children: [
+          Container(
+            height: 48,
+            decoration: BoxDecoration(
+              color: cs.surface,
+              border: Border(
+                bottom: BorderSide(color: Theme.of(context).dividerColor, width: 1),
+              ),
+            ),
+            child: Center(
+              child: IconButton(
+                tooltip: '展开左侧栏',
+                icon: const Icon(Icons.chevron_right),
+                onPressed: () {
+                  setState(() {
+                    _leftCollapsed = false;
+                  });
+                },
+              ),
+            ),
+          ),
+          Expanded(
+            child: RotatedBox(
+              quarterTurns: 1,
+              child: Center(
+                child: Text(
+                  'Agent 列表',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: cs.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 构建折叠状态的右侧栏（窄条 + 展开按钮）
+  Widget _buildCollapsedRightBar() {
+    final cs = Theme.of(context).colorScheme;
+    return Container(
+      width: _collapsedWidth,
+      color: Theme.of(context).scaffoldBackgroundColor,
+      child: Column(
+        children: [
+          Container(
+            height: 48,
+            decoration: BoxDecoration(
+              color: cs.surface,
+              border: Border(
+                bottom: BorderSide(color: Theme.of(context).dividerColor, width: 1),
+              ),
+            ),
+            child: Center(
+              child: IconButton(
+                tooltip: '展开右侧栏',
+                icon: const Icon(Icons.chevron_left),
+                onPressed: () {
+                  setState(() {
+                    _rightCollapsed = false;
+                  });
+                },
+              ),
+            ),
+          ),
+          Expanded(
+            child: RotatedBox(
+              quarterTurns: 1,
+              child: Center(
+                child: Text(
+                  '文件管理',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: cs.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 /// 可拖拽的分隔条组件

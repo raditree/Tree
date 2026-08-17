@@ -5,10 +5,13 @@
 # 实际配置文件（如 my-model.yaml）并填写真实参数。
 #
 # 必填字段：
-#   name                模型显示名称
+#   name                模型显示名称（前端展示用）
 #   base_url            OpenAI 协议兼容的 API 地址
 #   api_key             API 密钥
-#   model_id            模型标识（用于请求）
+#   model_id            模型唯一标识（用于区分不同配置，同时也作为 API 请求的模型名，
+#                        除非同时设置了 api_model_id）
+#   api_model_id        可选。实际发送给 API 的模型名，不设置时默认使用 model_id。
+#                       适用于多个配置使用同一模型名但指向不同 API 地址的场景。
 #   is_limitless_context 是否无限上下文 LLM（true/false）
 #
 # 可选字段（按模型需要）：

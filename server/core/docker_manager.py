@@ -2,6 +2,7 @@
 import base64
 import io
 import logging
+import os
 import shlex
 import tarfile
 import time
@@ -48,7 +49,13 @@ class DockerManager:
         """初始化 docker client，读取配置中的镜像与资源限制。
         若 Docker 未安装或 daemon 未运行，标记为不可用而非抛出异常，
         后续调用各方法时优雅降级。
+
+        本地模式（环境变量 ``LOCAL_MODE=1``，由前端本地后端进程设置）：
+        无论 Docker 是否可用，都直接在用户选择的工作目录下执行命令，
+        工作空间目录为 ``<cwd>/workspaces/{workspace_id}``。
         """
+        # 本地模式：即使 Docker 可用也强制走本地目录执行
+        self.local_mode: bool = os.environ.get("LOCAL_MODE", "").strip() in ("1", "true", "True")
         self._available = False
         self._unavailable_reason = ""
         # docker SDK 未安装
@@ -88,6 +95,47 @@ class DockerManager:
     # ------------------------------------------------------------------
     # 内部工具方法
     # ------------------------------------------------------------------
+    @staticmethod
+    def _local_workspace_path(workspace_id: str) -> "os.PathLike":
+        """返回本地模式下工作空间目录路径。
+
+        - 本地模式（LOCAL_MODE=1，前端本地后端进程设置）：工作空间位于
+          ``<cwd>/workspaces/{workspace_id}``，其中 cwd 即用户选择的目录，
+          确保 agent 的所有操作都落在用户选择的目录下。
+        - 仅 Docker 不可用的降级（未显式设置本地模式）：锚定到 server 目录
+          ``<server>/workspaces/{workspace_id}``，保持云部署行为稳定。
+        """
+        from pathlib import Path
+        if os.environ.get("LOCAL_MODE", "").strip() in ("1", "true", "True"):
+            return Path(os.getcwd()) / "workspaces" / workspace_id
+        return Path(__file__).resolve().parent.parent / "workspaces" / workspace_id
+    def _use_local(self) -> bool:
+        """是否应使用本地目录执行（本地模式或 Docker 不可用）。"""
+        return self.local_mode or not self._available
+    @staticmethod
+    def _resolve_sh() -> Optional[str]:
+        """定位可用的 POSIX shell（本地模式执行 shell 命令用）。
+
+        优先使用 PATH 中的 ``sh``；Windows 上 Git for Windows 自带
+        ``sh.exe``，位于常见安装目录。找不到时返回 None，
+        调用方将使用 Python 原生的命令解析（mkdir/heredoc/base64 等）。
+        """
+        import shutil
+
+        found = shutil.which("sh")
+        if found:
+            return found
+        if os.name == "nt":
+            candidates = [
+                r"C:\Program Files\Git\bin\sh.exe",
+                r"C:\Program Files (x86)\Git\bin\sh.exe",
+                r"C:\Program Files\Git\usr\bin\sh.exe",
+                os.path.expandvars(r"%LOCALAPPDATA%\Programs\Git\bin\sh.exe"),
+            ]
+            for cand in candidates:
+                if cand and os.path.exists(cand):
+                    return cand
+        return None
     @staticmethod
     def _volume_name(workspace_id: str) -> str:
         """工作空间对应的 volume 名称。"""
@@ -214,11 +262,13 @@ class DockerManager:
         :return: 包含 workspace_id / container_id / volume_name 的字典；
                  Docker 不可用时返回 error 字段
         """
-        if not self._available:
-            return {
-                "error": "Docker 不可用",
-                "detail": self._unavailable_reason,
-            }
+        if self._use_local():
+            # 本地模式（或 Docker 不可用）：在用户选择目录下创建本地工作空间
+            if not self.local_mode:
+                logger.info("Docker 不可用，改用本地目录创建工作空间")
+            return self._create_local_workspace(
+                workspace_id, parent_workspace_id, agent_name
+            )
         name = agent_name or f"agent-{workspace_id[:8]}"
         volume_name = self._volume_name(workspace_id)
         container_name = self._container_name(workspace_id)
@@ -286,6 +336,89 @@ class DockerManager:
                 "error": "创建工作空间失败",
                 "detail": str(exc),
             }
+    def _create_local_workspace(
+        self,
+        workspace_id: str,
+        parent_workspace_id: Optional[str] = None,
+        agent_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """本地模式：在用户选择目录下创建本地工作空间并完成 Git 初始化。
+
+        工作空间目录为 ``<cwd>/workspaces/{workspace_id}``，其中 cwd 即前端
+        启动本地后端时选择的工作目录。
+        :return: 包含 workspace_id / is_local 的字典
+        """
+        import subprocess
+
+        name = agent_name or f"agent-{workspace_id[:8]}"
+        local_workspace = self._local_workspace_path(workspace_id)
+        try:
+            existed = local_workspace.exists()
+            if not existed:
+                local_workspace.mkdir(parents=True, exist_ok=True)
+                # Git 初始化
+                subprocess.run(
+                    ["git", "init"],
+                    cwd=str(local_workspace),
+                    capture_output=True,
+                    text=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.name", name],
+                    cwd=str(local_workspace),
+                    capture_output=True,
+                    text=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.email", f"{name}@agent.local"],
+                    cwd=str(local_workspace),
+                    capture_output=True,
+                    text=True,
+                )
+                # .self 目录与活动日志
+                self_dir = local_workspace / ".self"
+                self_dir.mkdir(exist_ok=True)
+                (self_dir / "activity.log").write_text(
+                    "# Agent 活动日志\n", encoding="utf-8"
+                )
+                # .self/rule.md 模板
+                rule_file = self_dir / "rule.md"
+                if not rule_file.exists():
+                    rule_template = (
+                        "# 工作准则 (rule.md)\n\n"
+                        "# 你（agent:{name}）的职责与工作准则\n"
+                        "# 请根据你的角色与偏好维护此文件，供系统在初始化或上下文压缩时注入。\n"
+                        "# 建议记录：\n"
+                        "# - 你的角色定位与擅长领域\n"
+                        "# - 协作方式与沟通偏好\n"
+                        "# - 需要遵守的团队约定与禁忌\n".format(name=name)
+                    )
+                    rule_file.write_text(rule_template, encoding="utf-8")
+                # 父工作空间 remote（本地模式下指向父工作空间目录）
+                if parent_workspace_id:
+                    parent_path = self._local_workspace_path(parent_workspace_id)
+                    if parent_path.exists():
+                        subprocess.run(
+                            ["git", "remote", "add", "parent", str(parent_path)],
+                            cwd=str(local_workspace),
+                            capture_output=True,
+                            text=True,
+                        )
+                logger.info("本地模式：创建本地工作空间: %s", local_workspace)
+            return {
+                "workspace_id": workspace_id,
+                "is_local": True,
+                "local_path": str(local_workspace),
+                "parent_workspace_id": parent_workspace_id,
+                "agent_name": name,
+                "created": not existed,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.error("本地模式创建工作空间失败: %s", exc)
+            return {
+                "error": "本地模式创建工作空间失败",
+                "detail": str(exc),
+            }
     def _init_rule_md(self, container, agent_name: str) -> None:
         """在工作空间中初始化 ``.self/rule.md`` 模板（若不存在）。
         每个 agent 通过维护 rule.md 记录自己的工作准则、偏好与协作方式，
@@ -346,6 +479,7 @@ class DockerManager:
     def _get_container(self, workspace_id: str):
         """获取工作空间容器；Docker 不可用或容器不存在时返回 (None, error_dict)。
         容器存在但未运行时自动启动（可能因系统重启等原因已停止）。
+        在本地模式下始终返回 (None, error)，调用者需要单独处理本地模式。
         """
         if not self._available:
             return None, {"error": "Docker 不可用", "detail": self._unavailable_reason}
@@ -359,6 +493,421 @@ class DockerManager:
             except APIError as exc:
                 return None, {"error": "启动工作空间容器失败", "detail": str(exc)}
         return container, None
+    def _local_git_exec(self, workspace_id: str, command: str) -> Dict[str, Any]:
+        """本地模式：在本地工作空间目录下执行 git 命令。
+        :param workspace_id: 工作空间标识
+        :param command: shell 命令字符串（如 git log --oneline）
+        :return: 同 _exec 的格式
+        """
+        import subprocess
+        import sys as _sys
+
+        local_workspace = self._local_workspace_path(workspace_id)
+        if not local_workspace.exists():
+            return {"error": f"本地工作空间目录不存在: {local_workspace}", "exit_code": -1, "stdout": ""}
+        # 确保在 /workspace 目录下执行（等价于 Docker 中的 cd /workspace）
+        # 将命令中的 cd /workspace && 替换为无操作
+        clean_cmd = command.replace("cd /workspace && ", "")
+        try:
+            sh_path = self._resolve_sh()
+            if _sys.platform == "win32" and sh_path:
+                # Windows 上优先使用 Git for Windows 的 sh 执行复合 git 命令
+                result = subprocess.run(
+                    [sh_path, "-c", clean_cmd],
+                    cwd=str(local_workspace),
+                    capture_output=True,
+                    text=True,
+                )
+            elif _sys.platform == "win32":
+                # Windows 上通过 shell=True 执行
+                result = subprocess.run(
+                    clean_cmd,
+                    cwd=str(local_workspace),
+                    capture_output=True,
+                    text=True,
+                    shell=True,
+                )
+            else:
+                result = subprocess.run(
+                    ["sh", "-c", clean_cmd],
+                    cwd=str(local_workspace),
+                    capture_output=True,
+                    text=True,
+                )
+            return {
+                "exit_code": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+        except Exception as exc:
+            return {"error": f"本地模式 git 命令执行失败: {exc}", "exit_code": -1, "stdout": ""}
+
+    def _local_run_sh(
+        self, cwd: "os.PathLike", shell_cmd: str, args: List[str]
+    ) -> Dict[str, Any]:
+        """本地模式：执行 ``sh -c <shell_cmd> [args]``。
+
+        优先使用 PATH 中的 ``sh``（Windows 上 Git for Windows 的 sh.exe）；
+        找不到时使用 Python 原生实现常见 POSIX shell 命令。
+        """
+        import subprocess
+        import sys as _sys
+
+        # 检查是否有 sh 可用
+        sh_path = self._resolve_sh()
+        if sh_path:
+            return self._local_run_sh_via_sh(sh_path, cwd, shell_cmd, args)
+
+        # 无 sh 可用：Python 原生 fallback 实现常见命令
+        return self._local_run_sh_native(cwd, shell_cmd, args)
+
+    def _local_run_sh_via_sh(
+        self, sh_path: str, cwd: "os.PathLike", shell_cmd: str, args: List[str]
+    ) -> Dict[str, Any]:
+        """通过 sh 执行 shell 命令。"""
+        import subprocess
+        import sys as _sys
+
+        try:
+            # 构建完整的 sh 命令，包含位置参数
+            if args:
+                result = subprocess.run(
+                    [sh_path, "-c", shell_cmd, *args],
+                    cwd=str(cwd),
+                    capture_output=True,
+                    text=True,
+                )
+            else:
+                result = subprocess.run(
+                    [sh_path, "-c", shell_cmd],
+                    cwd=str(cwd),
+                    capture_output=True,
+                    text=True,
+                )
+            return {
+                "exit_code": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+        except Exception as exc:
+            return {"error": f"本地模式 shell 执行失败: {exc}", "exit_code": -1, "stdout": ""}
+
+    def _local_run_sh_native(
+        self, cwd: "os.PathLike", shell_cmd: str, args: List[str]
+    ) -> Dict[str, Any]:
+        """无 sh 可用时的 Python 原生 fallback 实现。
+
+        仅支持常见 POSIX shell 命令模式：
+        - mkdir -p <dir>
+        - cat > file <<'DELIMITER'\ncontent\nDELIMITER  (heredoc 写入)
+        - echo <content> > file
+        - echo <content> >> file
+        - git <subcommand>
+        - timeout <seconds> sh -c <cmd>
+        """
+        import subprocess
+        from pathlib import Path
+
+        # 解析位置参数：$1, $2, ...
+        # args 形如 ["sh", a, b, c]，其中 args[0] 对应 shell 的 $0（脚本名占位），
+        # $1=args[1], $2=args[2], ...
+        def _arg(n: int) -> str:
+            if n >= 1 and n < len(args):
+                return args[n]
+            return ""
+
+        # mkdir -p
+        if shell_cmd == "mkdir -p $1" and _arg(1):
+            (Path(cwd) / _arg(1)).mkdir(parents=True, exist_ok=True)
+            return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+        # touch
+        if shell_cmd == "touch $1" and _arg(1):
+            (Path(cwd) / _arg(1)).touch(exist_ok=True)
+            return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+        # mkdir -p && touch
+        if shell_cmd.startswith("mkdir -p ") and "&&" in shell_cmd and "touch" in shell_cmd:
+            # 解析 mkdir -p DIR && touch FILE
+            parts = shell_cmd.split("&&")
+            dir_part = parts[0].replace("mkdir -p", "").strip()
+            file_part = parts[1].replace("touch", "").strip()
+            if dir_part:
+                (Path(cwd) / dir_part).mkdir(parents=True, exist_ok=True)
+            if file_part:
+                (Path(cwd) / file_part).touch(exist_ok=True)
+            return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+        # heredoc 写入：cat > FILE <<'DELIM'\nCONTENT\nDELIM
+        # 或 echo CONTENT | base64 -d > FILE
+        if "cat >" in shell_cmd and "<<'" in shell_cmd:
+            return self._local_native_heredoc_write(cwd, shell_cmd)
+
+        # echo CONTENT | base64 -d > FILE
+        if "echo " in shell_cmd and "| base64 -d > " in shell_cmd:
+            return self._local_native_base64_write(cwd, shell_cmd, _arg)
+
+        # echo CONTENT > FILE
+        if "echo " in shell_cmd and " > " in shell_cmd and "|" not in shell_cmd:
+            return self._local_native_echo_write(cwd, shell_cmd, ">")
+
+        # echo CONTENT >> FILE
+        if "echo " in shell_cmd and " >> " in shell_cmd and "|" not in shell_cmd:
+            return self._local_native_echo_write(cwd, shell_cmd, ">>")
+
+        # echo CONTENT | base64 -d >> FILE
+        if "echo " in shell_cmd and "| base64 -d >> " in shell_cmd:
+            return self._local_native_base64_append(cwd, shell_cmd, _arg)
+
+        # ls -la --time-style=long-iso（文件面板列表）
+        if shell_cmd.startswith("ls -la"):
+            return self._local_native_ls(cwd, shell_cmd, _arg)
+
+        # git 命令
+        if shell_cmd.startswith("git "):
+            import shlex
+            git_cmd = shlex.split(shell_cmd)
+            try:
+                result = subprocess.run(
+                    git_cmd,
+                    cwd=str(cwd),
+                    capture_output=True,
+                    text=True,
+                )
+                return {
+                    "exit_code": result.returncode,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                }
+            except Exception as exc:
+                return {"error": f"git 命令执行失败: {exc}", "exit_code": -1, "stdout": ""}
+
+        # timeout 命令（去除 timeout 前缀，直接执行）
+        if shell_cmd.startswith("timeout "):
+            import shlex
+            # timeout <seconds> sh -c <cmd> 或 timeout <seconds> <cmd>
+            parts = shell_cmd.split(" ", 2)
+            if len(parts) >= 3:
+                inner_cmd = parts[2]
+                # 去掉 sh -c 包装
+                if inner_cmd.startswith("sh -c "):
+                    inner_cmd = inner_cmd[6:]
+                try:
+                    result = subprocess.run(
+                        inner_cmd,
+                        cwd=str(cwd),
+                        capture_output=True,
+                        text=True,
+                        shell=True,
+                    )
+                    return {
+                        "exit_code": result.returncode,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                    }
+                except Exception as exc:
+                    return {"error": f"timeout 命令执行失败: {exc}", "exit_code": -1, "stdout": ""}
+
+        # 无法原生解析，回退到 cmd.exe / powershell
+        try:
+            result = subprocess.run(
+                shell_cmd,
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                shell=True,
+            )
+            return {
+                "exit_code": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+        except Exception as exc:
+            return {"error": f"本地模式命令执行失败: {exc}", "exit_code": -1, "stdout": ""}
+
+    def _local_native_heredoc_write(
+        self, cwd: "os.PathLike", shell_cmd: str
+    ) -> Dict[str, Any]:
+        """Python 原生实现 heredoc 写入：cat > FILE <<'DELIM'\nCONTENT\nDELIM"""
+        import re
+        from pathlib import Path
+
+        # 解析 cat > FILE <<'DELIM' 或 cat > FILE << 'DELIM'
+        m = re.search(r"cat > (.*?) <<\s*'([^']+)'", shell_cmd)
+        if not m:
+            return {"error": "无法解析 heredoc 命令", "exit_code": 1, "stdout": ""}
+        file_path = m.group(1).strip()
+        delimiter = m.group(2).strip()
+        # 提取内容（在 delimiter 之后、换行后的内容）
+        # 兼容 <<'DELIM' 与 << 'DELIM' 两种写法
+        content = shell_cmd.split(f"<<'{delimiter}'", 1)
+        if len(content) < 2:
+            content = shell_cmd.split(f"<< '{delimiter}'", 1)
+        if len(content) < 2:
+            return {"error": "heredoc 内容格式错误", "exit_code": 1, "stdout": ""}
+        content = content[1]
+        # 去掉末尾的换行 + delimiter
+        if content.endswith(f"\n{delimiter}"):
+            content = content[:-(len(delimiter) + 1)]
+        elif content.endswith(f"\n{delimiter}\n"):
+            content = content[:-(len(delimiter) + 2)]
+        # 去掉前导换行
+        if content.startswith("\n"):
+            content = content[1:]
+
+        full_path = Path(cwd) / file_path
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(content, encoding="utf-8")
+        return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+    def _local_native_base64_write(
+        self, cwd: "os.PathLike", shell_cmd: str, _arg
+    ) -> Dict[str, Any]:
+        """Python 原生实现 echo B64 | base64 -d > FILE"""
+        import base64 as _b64, re
+        from pathlib import Path
+
+        # echo 'B64' | base64 -d > FILE  或 echo "$1" | base64 -d > "$2"
+        m = re.search(r"echo (.+?) \| base64 -d > (.+)", shell_cmd)
+        if not m:
+            return {"error": "无法解析 base64 写入命令", "exit_code": 1, "stdout": ""}
+        b64_src = m.group(1).strip().strip("'\"")
+        file_path = m.group(2).strip().strip("'\"")
+        # 展开 $1, $2 等位置参数
+        if b64_src.startswith("$") and len(b64_src) > 1:
+            idx = int(b64_src[1:])
+            b64_data = _arg(idx)
+        else:
+            b64_data = b64_src
+        if file_path.startswith("$") and len(file_path) > 1:
+            idx = int(file_path[1:])
+            file_path = _arg(idx)
+        try:
+            raw = _b64.b64decode(b64_data)
+            full_path = Path(cwd) / file_path
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            full_path.write_bytes(raw)
+            return {"exit_code": 0, "stdout": "", "stderr": ""}
+        except Exception as exc:
+            return {"error": f"base64 解码写入失败: {exc}", "exit_code": 1, "stdout": ""}
+
+    def _local_native_base64_append(
+        self, cwd: "os.PathLike", shell_cmd: str, _arg
+    ) -> Dict[str, Any]:
+        """Python 原生实现 echo B64 | base64 -d >> FILE"""
+        import base64 as _b64, re
+        from pathlib import Path
+
+        m = re.search(r"echo (.+?) \| base64 -d >> (.+)", shell_cmd)
+        if not m:
+            return {"error": "无法解析 base64 追加命令", "exit_code": 1, "stdout": ""}
+        b64_src = m.group(1).strip().strip("'\"")
+        file_path = m.group(2).strip().strip("'\"")
+        if b64_src.startswith("$") and len(b64_src) > 1:
+            idx = int(b64_src[1:])
+            b64_data = _arg(idx)
+        else:
+            b64_data = b64_src
+        if file_path.startswith("$") and len(file_path) > 1:
+            idx = int(file_path[1:])
+            file_path = _arg(idx)
+        try:
+            raw = _b64.b64decode(b64_data)
+            full_path = Path(cwd) / file_path
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            with full_path.open("ab") as f:
+                f.write(raw)
+            return {"exit_code": 0, "stdout": "", "stderr": ""}
+        except Exception as exc:
+            return {"error": f"base64 解码追加失败: {exc}", "exit_code": 1, "stdout": ""}
+
+    def _local_native_ls(
+        self, cwd: "os.PathLike", shell_cmd: str, _arg
+    ) -> Dict[str, Any]:
+        """Python 原生实现 ``ls -la --time-style=long-iso``。
+
+        输出格式与容器内一致：``perms links owner group size date time name``，
+        以便前端 ``_parse_ls_output`` 解析。
+        """
+        import os as _os
+        import time as _time
+        from pathlib import Path
+
+        # 解析目标目录：ls -la --time-style=long-iso . 或 ls -la --time-style=long-iso "$1"
+        target = "."
+        if '"$1"' in shell_cmd:
+            target = _arg(1) or "."
+        elif shell_cmd.strip().endswith(" ."):
+            target = "."
+        else:
+            # 尝试提取末尾路径（去掉 2>&1 重定向）
+            tail = shell_cmd.split("--time-style=long-iso", 1)[-1].strip()
+            tail = tail.replace("2>&1", "").strip()
+            # 去掉 "$1" 形式的占位（由上方处理）
+            if tail and not tail.startswith("$"):
+                target = tail.strip("'\"")
+        base = Path(cwd) / target
+        if not base.exists():
+            return {"exit_code": 2, "stdout": "", "stderr": f"ls: cannot access '{target}': No such file or directory"}
+        if not base.is_dir():
+            # 列出单个文件
+            entry = base
+            lines = [self._ls_entry(entry)]
+        else:
+            entries = sorted(base.iterdir(), key=lambda p: p.name.lower())
+            # 包含 . 和 .. 两行（与 ls -la 一致）
+            lines = [self._ls_entry(base, ".", is_dir=True, mtime=base.stat().st_mtime),
+                     self._ls_entry(base.parent, "..", is_dir=True)]
+            for entry in entries:
+                lines.append(self._ls_entry(entry))
+        return {"exit_code": 0, "stdout": "\n".join(lines), "stderr": ""}
+
+    @staticmethod
+    def _ls_entry(
+        path: "os.PathLike", name: str = "", is_dir: bool = False, mtime: float = 0.0
+    ) -> str:
+        """构造单行 ls -la --time-style=long-iso 格式输出。"""
+        import os as _os
+        import time as _time
+
+        p = path
+        if not name:
+            name = _os.path.basename(str(p)) or "."
+        try:
+            st = p.stat()
+            is_dir = is_dir or _os.path.isdir(str(p))
+        except OSError:
+            st = None
+            is_dir = False
+        perms = "drwxr-xr-x" if is_dir else "-rw-r--r--"
+        links = "1"
+        owner = "user"
+        group = "group"
+        size = st.st_size if st else 0
+        if mtime == 0.0:
+            mtime = st.st_mtime if st else 0.0
+        tstr = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(mtime))
+        return f"{perms} {links} {owner} {group} {size} {tstr} {name}"
+
+    def _local_native_echo_write(
+        self, cwd: "os.PathLike", shell_cmd: str, op: str
+    ) -> Dict[str, Any]:
+        """Python 原生实现 echo CONTENT > FILE 或 echo CONTENT >> FILE"""
+        import re
+        from pathlib import Path
+
+        pattern = f"echo (.+?) {op} (.+)"
+        m = re.search(pattern, shell_cmd)
+        if not m:
+            return {"error": f"无法解析 echo 命令", "exit_code": 1, "stdout": ""}
+        content = m.group(1).strip().strip("'\"")
+        file_path = m.group(2).strip().strip("'\"")
+        full_path = Path(cwd) / file_path
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        mode = "a" if op == ">>" else "w"
+        full_path.write_text(content, encoding="utf-8")
+        return {"exit_code": 0, "stdout": "", "stderr": ""}
+
     @staticmethod
     def _is_valid_ref_name(name: str) -> bool:
         """校验 git 引用名，仅允许字母数字、/_-.，防止命令注入。"""
@@ -373,7 +922,17 @@ class DockerManager:
         使用 ``git daemon`` 启动 HTTP 服务，监听 ``self.git_port``，
         并通过 ``--enable=receive-pack`` 允许 push 操作。后台运行并重定向输出，
         避免 ``exec_run`` 阻塞。
+        本地模式：不需要 Git HTTP daemon，返回成功（子 agent 直接使用本地 git）。
         """
+        if self._use_local():
+            # 本地模式：不需要 daemon，返回成功
+            return {
+                "workspace_id": workspace_id,
+                "git_port": self.git_port,
+                "exit_code": 0,
+                "started": True,
+                "is_local": True,
+            }
         container, err = self._get_container(workspace_id)
         if err:
             return err
@@ -391,9 +950,25 @@ class DockerManager:
             "git_port": self.git_port,
             "exit_code": exit_code,
             "started": exit_code == 0,
+            "is_local": False,
         }
     def git_fetch(self, workspace_id: str, remote: str = "parent") -> Dict[str, Any]:
         """在指定工作空间执行 ``git fetch {remote}``，拉取远程分支。"""
+        if self._use_local():
+            # 本地模式：直接在本地目录执行
+            if not self._is_valid_ref_name(remote):
+                return {"error": "非法 remote 名称", "remote": remote}
+            result = self._local_git_exec(
+                workspace_id,
+                f"cd /workspace && git fetch {remote}",
+            )
+            if "error" in result:
+                return result
+            return {
+                "exit_code": result["exit_code"],
+                "output": result["stdout"],
+                "remote": remote,
+            }
         container, err = self._get_container(workspace_id)
         if err:
             return err
@@ -410,6 +985,20 @@ class DockerManager:
         }
     def git_diff(self, workspace_id: str, branch: str) -> Dict[str, Any]:
         """查看子 agent 分支与主分支的差异：``git diff main...{branch}``。"""
+        if self._use_local():
+            # 本地模式：直接在本地目录执行
+            if not self._is_valid_ref_name(branch):
+                return {"error": "非法分支名", "branch": branch}
+            result = self._local_git_exec(
+                workspace_id,
+                f"cd /workspace && git diff main...{branch}",
+            )
+            if "error" in result:
+                return result
+            return {
+                "diff": result["stdout"],
+                "exit_code": result["exit_code"],
+            }
         container, err = self._get_container(workspace_id)
         if err:
             return err
@@ -427,6 +1016,26 @@ class DockerManager:
         """合并子 agent 分支到当前分支：``git merge {branch}``。
         返回合并结果（成功/冲突），非零退出码视为冲突。
         """
+        if self._use_local():
+            # 本地模式：直接在本地目录执行
+            if not self._is_valid_ref_name(branch):
+                return {"error": "非法分支名", "branch": branch}
+            result = self._local_git_exec(
+                workspace_id,
+                f"cd /workspace && git merge {branch}",
+            )
+            if "error" in result:
+                return result
+            exit_code = result["exit_code"]
+            output = result["stdout"].strip()
+            success = exit_code == 0
+            message = output or ("合并成功" if success else "合并失败，可能存在冲突")
+            return {
+                "success": success,
+                "message": message,
+                "exit_code": exit_code,
+                "conflict": not success,
+            }
         container, err = self._get_container(workspace_id)
         if err:
             return err
@@ -448,6 +1057,25 @@ class DockerManager:
         }
     def git_log(self, workspace_id: str, limit: int = 50) -> Dict[str, Any]:
         """查看提交历史：``git log --oneline --all -n {limit}``。"""
+        if self._use_local():
+            # 本地模式：直接在本地目录执行
+            # 限制 limit 范围，防止异常输入
+            safe_limit = max(1, min(int(limit), 1000))
+            result = self._local_git_exec(
+                workspace_id,
+                f"cd /workspace && git log --oneline --all -n {safe_limit}",
+            )
+            if "error" in result:
+                return result
+            commits = [
+                line.strip()
+                for line in result["stdout"].splitlines()
+                if line.strip()
+            ]
+            return {
+                "commits": commits,
+                "exit_code": result["exit_code"],
+            }
         container, err = self._get_container(workspace_id)
         if err:
             return err
@@ -468,6 +1096,27 @@ class DockerManager:
         }
     def git_branches(self, workspace_id: str) -> Dict[str, Any]:
         """查看所有分支：``git branch -a``。"""
+        if self._use_local():
+            # 本地模式：直接在本地目录执行
+            result = self._local_git_exec(workspace_id, "cd /workspace && git branch -a")
+            if "error" in result:
+                return result
+            branches: List[str] = []
+            current = ""
+            for line in result["stdout"].splitlines():
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith("* "):
+                    current = stripped[2:].strip()
+                    branches.append(current)
+                else:
+                    branches.append(stripped)
+            return {
+                "branches": branches,
+                "current": current,
+                "exit_code": result["exit_code"],
+            }
         container, err = self._get_container(workspace_id)
         if err:
             return err
@@ -489,21 +1138,36 @@ class DockerManager:
             "exit_code": result["exit_code"],
         }
     def stop_workspace(self, workspace_id: str) -> Dict[str, Any]:
-        """停止工作空间容器但保留卷。"""
-        if not self._available:
-            return {"error": "Docker 不可用", "detail": self._unavailable_reason}
+        """停止工作空间容器但保留卷。
+        本地模式下无需操作，直接返回成功。
+        """
+        if self._use_local():
+            # 本地模式：无需停止
+            return {"workspace_id": workspace_id, "status": "stopped", "is_local": True}
         try:
             container = self.client.containers.get(self._container_name(workspace_id))
             container.stop()
-            return {"workspace_id": workspace_id, "status": "stopped"}
+            return {"workspace_id": workspace_id, "status": "stopped", "is_local": False}
         except NotFound:
-            return {"workspace_id": workspace_id, "status": "removed"}
+            return {"workspace_id": workspace_id, "status": "removed", "is_local": False}
         except (APIError, Exception) as exc:  # noqa: BLE001
             return {"error": "停止工作空间失败", "detail": str(exc)}
     def remove_workspace(self, workspace_id: str) -> Dict[str, Any]:
-        """删除工作空间容器但保留卷（可手动清理）。"""
-        if not self._available:
-            return {"error": "Docker 不可用", "detail": self._unavailable_reason}
+        """删除工作空间容器但保留卷（可手动清理）。
+        本地模式下删除整个本地目录。
+        """
+        if self._use_local():
+            # 本地模式：删除本地目录
+            import shutil
+
+            local_workspace = self._local_workspace_path(workspace_id)
+            if local_workspace.exists():
+                try:
+                    shutil.rmtree(local_workspace)
+                    logger.info("本地模式：删除工作空间目录: %s", local_workspace)
+                except Exception as exc:
+                    return {"error": "本地模式删除工作空间失败", "detail": str(exc)}
+            return {"workspace_id": workspace_id, "status": "removed", "is_local": True}
         try:
             container = self.client.containers.get(self._container_name(workspace_id))
             # 容器可能仍在运行，先停止再删除
@@ -512,15 +1176,30 @@ class DockerManager:
             except Exception:  # noqa: BLE001
                 pass
             container.remove()
-            return {"workspace_id": workspace_id, "status": "removed"}
+            return {"workspace_id": workspace_id, "status": "removed", "is_local": False}
         except NotFound:
-            return {"workspace_id": workspace_id, "status": "removed"}
+            return {"workspace_id": workspace_id, "status": "removed", "is_local": False}
         except (APIError, Exception) as exc:  # noqa: BLE001
             return {"error": "删除工作空间失败", "detail": str(exc)}
     def get_workspace_status(self, workspace_id: str) -> Dict[str, Any]:
-        """返回工作空间容器状态（running / stopped / removed）。"""
-        if not self._available:
-            return {"error": "Docker 不可用", "detail": self._unavailable_reason}
+        """返回工作空间容器状态（running / stopped / removed）。
+        本地模式下返回本地目录的状态。
+        """
+        if self._use_local():
+            # 本地模式：检查本地工作空间目录是否存在
+            local_workspace = self._local_workspace_path(workspace_id)
+            if local_workspace.exists():
+                return {
+                    "workspace_id": workspace_id,
+                    "status": "running",  # 本地模式一直视为运行中
+                    "is_local": True,
+                }
+            else:
+                return {
+                    "workspace_id": workspace_id,
+                    "status": "removed",
+                    "is_local": True,
+                }
         try:
             container = self.client.containers.get(self._container_name(workspace_id))
             container.reload()
@@ -537,11 +1216,13 @@ class DockerManager:
                 "container_id": container.id,
                 "status": status,
                 "volume_name": self._volume_name(workspace_id),
+                "is_local": False,
             }
         except NotFound:
             return {
                 "workspace_id": workspace_id,
                 "status": "removed",
+                "is_local": False,
             }
         except (APIError, Exception) as exc:  # noqa: BLE001
             return {"error": "查询工作空间状态失败", "detail": str(exc)}
@@ -549,31 +1230,180 @@ class DockerManager:
         """确保工作空间容器存在，不存在时自动创建。
         用于兼容历史 agent 数据（数据库中记录了 workspace_id 但容器从未创建），
         首次访问时补建容器。
+        本地模式下确保本地目录存在。
         :param workspace_id: 工作空间唯一标识
         :return: 容器已存在返回 {"created": False}；创建成功返回
                  {"created": True, ...}；失败返回含 "error" 字段的字典
         """
-        if not self._available:
-            return {
-                "created": False,
-                "error": "Docker 不可用",
-                "detail": self._unavailable_reason,
-            }
+        if self._use_local():
+            # 本地模式：确保本地目录存在
+            import subprocess
+
+            local_workspace = self._local_workspace_path(workspace_id)
+            if local_workspace.exists():
+                return {"created": False, "is_local": True}
+            # 不存在则创建目录并初始化 git
+            local_workspace.mkdir(parents=True, exist_ok=True)
+            init_cmd = ["git", "init"]
+            result = subprocess.run(
+                init_cmd,
+                cwd=str(local_workspace),
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "local-agent"],
+                cwd=str(local_workspace),
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "local-agent@agent.local"],
+                cwd=str(local_workspace),
+                capture_output=True,
+                text=True,
+            )
+            (local_workspace / ".self").mkdir(exist_ok=True)
+            (local_workspace / ".self" / "activity.log").write_text(
+                "# Agent 活动日志\n", encoding="utf-8"
+            )
+            logger.info("本地模式：自动确保工作空间目录存在: %s", local_workspace)
+            return {"created": True, "is_local": True, "workspace_id": workspace_id}
         try:
             self.client.containers.get(self._container_name(workspace_id))
-            return {"created": False}
+            return {"created": False, "is_local": False}
         except NotFound:
             result = self.create_workspace(workspace_id)
             result["created"] = "error" not in result
+            result["is_local"] = False
             return result
     def exec_in_workspace(
         self, workspace_id: str, command: List[str]
     ) -> Dict[str, Any]:
         """在工作空间容器内执行命令，返回 stdout / exit_code。
         :param command: 命令及其参数列表，如 ``["git", "status"]``
+        Docker 不可用时，降级为直接在本地工作空间目录执行。
         """
-        if not self._available:
-            return {"error": "Docker 不可用", "detail": self._unavailable_reason}
+        if self._use_local():
+            # 本地模式（或 Docker 不可用）：直接在用户选择目录下执行命令
+            import subprocess
+            import os
+
+            # 本地工作空间目录位于用户选择的工作目录下
+            local_workspace = self._local_workspace_path(workspace_id)
+            if not local_workspace.exists():
+                # 自动创建工作空间目录
+                local_workspace.mkdir(parents=True, exist_ok=True)
+                # 初始化 git
+                subprocess.run(
+                    ["git", "init"],
+                    cwd=str(local_workspace),
+                    capture_output=True,
+                    text=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.name", "local-agent"],
+                    cwd=str(local_workspace),
+                    capture_output=True,
+                    text=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.email", "local-agent@agent.local"],
+                    cwd=str(local_workspace),
+                    capture_output=True,
+                    text=True,
+                )
+                (local_workspace / ".self").mkdir(exist_ok=True)
+                (local_workspace / ".self" / "activity.log").write_text(
+                    "# Agent 活动日志\n", encoding="utf-8"
+                )
+                logger.info("本地模式：自动创建工作空间目录: %s", local_workspace)
+
+            # 执行命令 — 处理 "cat" 读取文件的场景
+            try:
+                if len(command) == 1 and command[0] == "cat":
+                    # 纯 "cat" 无参数，返回空
+                    return {"exit_code": 0, "stdout": "", "stderr": ""}
+                if len(command) >= 2 and command[0] == "cat":
+                    # cat 文件：直接从本地文件读取
+                    file_path = command[1]
+                    # 确保路径在工作空间内，防止路径穿越
+                    safe_path = file_path.lstrip("/")
+                    if safe_path.startswith("workspace/"):
+                        safe_path = safe_path[len("workspace/"):]
+                    abs_path = local_workspace / safe_path
+                    try:
+                        content = abs_path.read_text(encoding="utf-8", errors="replace")
+                        return {"exit_code": 0, "stdout": content, "stderr": ""}
+                    except FileNotFoundError:
+                        return {"exit_code": 1, "stdout": "", "stderr": f"文件不存在: {file_path}"}
+                    except Exception as exc:
+                        return {"exit_code": 1, "stdout": "", "stderr": str(exc)}
+
+                if len(command) >= 3 and command[0] == "sh" and command[1] == "-c":
+                    shell_cmd = command[2]
+                    # 位置参数（如 "sh" 脚本名 + 各参数）
+                    args = list(command[3:])
+                    # base64 编码命令模式：base64 "$1" 2>/dev/null
+                    if shell_cmd.startswith("base64 ") or (
+                        "base64" in shell_cmd and "tar" not in shell_cmd
+                        and ">" not in shell_cmd and ">>" not in shell_cmd
+                    ):
+                        # 提取文件路径参数（command[3] 是 "sh"，command[4] 是路径）
+                        file_arg = command[4] if len(command) >= 5 else ""
+                        if file_arg:
+                            safe_path = file_arg.lstrip("/")
+                            if safe_path.startswith("workspace/"):
+                                safe_path = safe_path[len("workspace/"):]
+                            abs_path = local_workspace / safe_path
+                            if abs_path.exists():
+                                import base64 as _b64
+                                data = abs_path.read_bytes()
+                                b64_str = _b64.b64encode(data).decode("ascii")
+                                return {"exit_code": 0, "stdout": b64_str, "stderr": ""}
+                            else:
+                                return {"exit_code": 1, "stdout": "", "stderr": f"文件不存在: {file_arg}"}
+                        return {"exit_code": 1, "stdout": "", "stderr": "base64 命令缺少文件路径"}
+                    if "tar" in shell_cmd and "echo" not in shell_cmd and ">" not in shell_cmd:
+                        # tar 打包命令：使用 Python 的 tarfile 实现
+                        import tarfile, io, base64 as _b642
+                        # 排除 .git 目录
+                        buf = io.BytesIO()
+                        with tarfile.open(fileobj=buf, mode="w") as tar:
+                            for item in local_workspace.rglob("*"):
+                                if ".git" in item.parts:
+                                    continue
+                                rel = item.relative_to(local_workspace)
+                                try:
+                                    tar.add(str(item), arcname=str(rel))
+                                except Exception:
+                                    pass
+                        buf.seek(0)
+                        b64_str = _b642.b64encode(buf.read()).decode("ascii")
+                        return {"exit_code": 0, "stdout": b64_str, "stderr": ""}
+                    # 其他 sh -c 命令：交由本地 shell 解析器处理
+                    return self._local_run_sh(
+                        local_workspace, shell_cmd, args
+                    )
+
+                # 其他命令列表
+                result = subprocess.run(
+                    command,
+                    cwd=str(local_workspace),
+                    capture_output=True,
+                    text=True,
+                )
+                return {
+                    "exit_code": result.returncode,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                }
+            except Exception as exc:
+                return {
+                    "error": "本地模式执行命令失败",
+                    "detail": str(exc),
+                    "exit_code": -1,
+                }
         try:
             container = self.client.containers.get(self._container_name(workspace_id))
         except NotFound:
@@ -632,8 +1462,26 @@ class DockerManager:
         :param data: 待写入的文件字节内容
         :return: ``{"exit_code": 0, "stdout": ...}`` 或在失败时带 ``error``
         """
-        if not self._available:
-            return {"error": "Docker 不可用", "detail": self._unavailable_reason}
+        if self._use_local():
+            # 本地模式（或 Docker 不可用）：直接在用户选择目录下写入文件
+            local_workspace = self._local_workspace_path(workspace_id)
+            local_workspace.mkdir(parents=True, exist_ok=True)
+            # 统一为相对路径
+            rel = container_path.lstrip("/")
+            if rel.startswith("workspace/"):
+                rel = rel[len("workspace/"):]
+            local_path = local_workspace / rel
+            # 自动创建父目录
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                local_path.write_bytes(data)
+                return {"exit_code": 0, "stdout": "", "stderr": ""}
+            except Exception as exc:
+                return {
+                    "error": "本地模式写入文件失败",
+                    "detail": str(exc),
+                    "exit_code": -1,
+                }
         try:
             container = self.client.containers.get(self._container_name(workspace_id))
         except NotFound:

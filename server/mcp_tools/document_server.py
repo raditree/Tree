@@ -36,7 +36,7 @@ def _exec_python(workspace_id: str, docker_manager: DockerManager, script: str) 
         "try:\n"
         f"{indented_script}"
         "except Exception as e:\n"
-        '    print(json.dumps({"success": false, "error": str(e)}))\n'
+        '    print(json.dumps({"success": False, "error": str(e)}))\n'
     )
     result = docker_manager.exec_in_workspace(
         workspace_id, ["python3", "-c", full_script]
@@ -202,7 +202,7 @@ def _execute_tool(name: str, arguments: dict, workspace_id: str, docker_manager:
             import pymupdf
             doc = pymupdf.open("{file_path}")
             pages = [{{"page": i+1, "text": page.get_text()}} for i, page in enumerate(doc)]
-            print(json.dumps({{"success": true, "pages": len(doc), "content": pages}}))
+            print(json.dumps({{"success": True, "pages": len(doc), "content": pages}}))
         """)
         return _dump(_exec_python(workspace_id, docker_manager, script))
 
@@ -217,7 +217,7 @@ def _execute_tool(name: str, arguments: dict, workspace_id: str, docker_manager:
                 for row in table.rows:
                     rows.append([cell.text for cell in row.cells])
                 tables.append(rows)
-            print(json.dumps({{"success": true, "paragraphs": paragraphs, "tables": tables}}))
+            print(json.dumps({{"success": True, "paragraphs": paragraphs, "tables": tables}}))
         """)
         return _dump(_exec_python(workspace_id, docker_manager, script))
 
@@ -232,7 +232,7 @@ def _execute_tool(name: str, arguments: dict, workspace_id: str, docker_manager:
                     if shape.has_text_frame:
                         texts.append(shape.text)
                 slides.append({{"slide": i+1, "texts": texts}})
-            print(json.dumps({{"success": true, "slides": slides}}))
+            print(json.dumps({{"success": True, "slides": slides}}))
         """)
         return _dump(_exec_python(workspace_id, docker_manager, script))
 
@@ -247,7 +247,7 @@ def _execute_tool(name: str, arguments: dict, workspace_id: str, docker_manager:
                 for row in ws.iter_rows(values_only=True):
                     rows.append([str(c) if c is not None else "" for c in row])
                 sheets.append({{"name": name, "rows": rows}})
-            print(json.dumps({{"success": true, "sheets": sheets}}))
+            print(json.dumps({{"success": True, "sheets": sheets}}))
         """)
         return _dump(_exec_python(workspace_id, docker_manager, script))
 
@@ -261,7 +261,7 @@ def _execute_tool(name: str, arguments: dict, workspace_id: str, docker_manager:
             for line in text.split("\\n"):
                 doc.add_paragraph(line)
             doc.save("{file_path}")
-            print(json.dumps({{"success": true, "file_path": "{file_path}"}}))
+            print(json.dumps({{"success": True, "file_path": "{file_path}"}}))
         """)
         return _dump(_exec_python(workspace_id, docker_manager, script))
 
@@ -282,7 +282,7 @@ def _execute_tool(name: str, arguments: dict, workspace_id: str, docker_manager:
                 if content and s.get("content"):
                     content.text = s["content"]
             prs.save("{file_path}")
-            print(json.dumps({{"success": true, "file_path": "{file_path}"}}))
+            print(json.dumps({{"success": True, "file_path": "{file_path}"}}))
         """)
         return _dump(_exec_python(workspace_id, docker_manager, script))
 
@@ -304,7 +304,7 @@ def _execute_tool(name: str, arguments: dict, workspace_id: str, docker_manager:
                         if row_idx == 1:
                             cell.font = Font(bold=True)
             wb.save("{file_path}")
-            print(json.dumps({{"success": true, "file_path": "{file_path}"}}))
+            print(json.dumps({{"success": True, "file_path": "{file_path}"}}))
         """)
         return _dump(_exec_python(workspace_id, docker_manager, script))
 

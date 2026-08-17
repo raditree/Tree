@@ -153,6 +153,11 @@ class AgentLLMSession:
         # 最近一次 API 调用的 token 用量（流式响应末尾携带）
         self.last_usage: Optional[Dict[str, int]] = None
 
+        # 上一次 API 调用返回的 prompt_tokens 与当时的上下文消息条数，
+        # 用于准确估算当前上下文 token 数（避免 len(str)//4 对中文低估）
+        self._last_prompt_tokens: Optional[int] = None
+        self._context_len_at_last_call: int = 0
+
         # 预算追踪器（由 main.py 注入，None 时不追踪）
         self.budget_tracker: Optional[BudgetTracker] = None
         # 价格计算器（由 main.py 注入，None 时不追踪）
@@ -223,7 +228,7 @@ class AgentLLMSession:
           ``max_tokens``、``top_p``）
         """
         kwargs: Dict[str, Any] = {
-            "model": self.model_config.model_id,
+            "model": self.model_config.api_model_id or self.model_config.model_id,
             "messages": self.context,
             "stream": True,
             # 流式响应末尾返回 token 用量（OpenAI 规范：stream_options.include_usage）
@@ -318,6 +323,10 @@ class AgentLLMSession:
                              在成员工作的间隙切入 leader 发来的新消息）。
         """
         while True:
+            # 长任务 tool 循环中上下文会持续增长，每轮调用前检查是否需要及时压缩，
+            # 避免任务结束前上下文就已超过 max_seqlen（约定阈值）
+            self._compress_context()
+
             api_kwargs = self._build_api_kwargs()
             stream = client.chat.completions.create(**api_kwargs)
 
@@ -343,6 +352,9 @@ class AgentLLMSession:
                         "total_tokens": getattr(usage, "total_tokens", 0) or 0,
                         "cached_tokens": cached_tokens,
                     }
+                    # 记录真实 prompt_tokens，供后续压缩判断使用精确值
+                    self._last_prompt_tokens = prompt_tokens
+                    self._context_len_at_last_call = len(self.context)
                     # 记录本次 API 调用到预算追踪器
                     if self.budget_tracker is not None:
                         self.budget_tracker.record_usage(
@@ -520,6 +532,24 @@ class AgentLLMSession:
         普通 LLM 无需验证，空操作。无限上下文 LLM 覆盖此方法。
         """
 
+    def _estimate_context_tokens(self) -> int:
+        """估算当前上下文 token 数。
+
+        优先基于上一次 API 调用返回的真实 ``prompt_tokens``（它反映了完整
+        上下文的实际 token 数，对中文内容尤为准确），再叠加自上轮调用后新增
+        消息的粗略估算（``len(str)//4``）。无历史调用时回退到字符数估算。
+
+        :return: 估算的上下文 token 总数
+        """
+        base = getattr(self, "_last_prompt_tokens", None)
+        if base is not None:
+            anchor = getattr(self, "_context_len_at_last_call", 0)
+            added = sum(
+                len(str(m)) // 4 for m in self.context[anchor:]
+            )
+            return base + added
+        return sum(len(str(m)) // 4 for m in self.context)
+
     def _compress_context(self) -> None:
         """检查并压缩上下文（自动触发，带阈值判断）。
 
@@ -547,8 +577,10 @@ class AgentLLMSession:
 
         返回是否实际执行了压缩。
         """
-        # 估算总 token 数（近似：len(str(msg)) // 4）
-        total_tokens = sum(len(str(msg)) // 4 for msg in self.context)
+        # 估算总 token 数：优先使用上一次 API 返回的真实 prompt_tokens
+        # （反映完整上下文实际 token 数），再叠加自上轮调用后新增消息的
+        # 粗略估算；无历史调用时回退到字符数估算。
+        total_tokens = self._estimate_context_tokens()
 
         # 未超过阈值，且非强制压缩时跳过
         threshold = int(self.max_seqlen * self.COMPRESS_THRESHOLD)
@@ -641,7 +673,7 @@ class AgentLLMSession:
         try:
             client = LLMClientFactory.create_client(self.model_config)
             resp = client.chat.completions.create(
-                model=self.model_config.model_id,
+                model=self.model_config.api_model_id or self.model_config.model_id,
                 messages=[{"role": "user", "content": summarize_prompt}],
                 temperature=0.2,
             )

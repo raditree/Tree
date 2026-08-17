@@ -184,7 +184,7 @@ def _build_attachments_prompt(paths: Any) -> str:
 
 def _read_workspace_file(workspace_id: str, rel_path: str) -> str:
     """从工作空间读取文件内容（不存在或失败时返回空字符串）。"""
-    if not workspace_id or _docker_manager is None or not _docker_manager.available:
+    if not workspace_id or _docker_manager is None:
         return ""
     try:
         result = _docker_manager.exec_in_workspace(
@@ -200,8 +200,23 @@ def _read_workspace_file(workspace_id: str, rel_path: str) -> str:
 
 def _get_workspace_size(workspace_id: str) -> int:
     """获取工作空间已用字节数（查询失败返回 0）。"""
-    if not workspace_id or _docker_manager is None or not _docker_manager.available:
+    if not workspace_id or _docker_manager is None:
         return 0
+    if _docker_manager._use_local():
+        # 本地模式：直接统计本地工作空间目录大小
+        import os as _os
+
+        local_workspace = _docker_manager._local_workspace_path(workspace_id)
+        if not local_workspace.exists():
+            return 0
+        total = 0
+        for dirpath, _dirnames, filenames in _os.walk(str(local_workspace)):
+            for fname in filenames:
+                try:
+                    total += _os.path.getsize(_os.path.join(dirpath, fname))
+                except OSError:
+                    continue
+        return total
     try:
         result = _docker_manager.exec_in_workspace(
             workspace_id, ["sh", "-c", "du -sb /workspace 2>/dev/null"]
@@ -371,8 +386,11 @@ async def lifespan(app: FastAPI):
     app.state.ws_manager = ws_manager
     print(f"[启动] 服务配置: {config.get('server', {})}")
     print(f"[启动] 已加载模型: {list(_model_configs.keys())}")
-    if docker_manager.available:
-        print(f"[启动] Docker 工作空间管理器就绪，镜像: {docker_manager.image}")
+    if docker_manager.local_mode:
+        print("[启动] 本地运行模式：直接使用本地终端执行命令")
+    if docker_manager.available or docker_manager.local_mode:
+        if docker_manager.available:
+            print(f"[启动] Docker 工作空间管理器就绪，镜像: {docker_manager.image}")
         # 自动创建顶部 agent 工作空间（若不存在），供前端文件管理使用
         top_status = docker_manager.get_workspace_status("top")
         if top_status.get("status") == "removed":

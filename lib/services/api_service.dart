@@ -693,7 +693,7 @@ class ApiService {
       throw Exception('功能开发中');
     }
     if (response.statusCode != 200) {
-      throw Exception('请求失败（HTTP ${response.statusCode}）');
+      throw Exception(_errorFromBody(response));
     }
     // 后端 Content-Type 为 application/json（无 charset），
     // http 包默认按 latin-1 解码导致中文乱码，这里强制 UTF-8。

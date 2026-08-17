@@ -91,6 +91,9 @@ class LocalBackendService {
         workingDirectory: workingDirectory,
         environment: {
           'PYTHONUNBUFFERED': '1',
+          // 标记本地运行模式：即使本机装有 Docker，后端也直接使用本地终端
+          // 在用户选择的工作目录下执行命令，而非进入 Docker 沙箱。
+          'LOCAL_MODE': '1',
         },
       );
 

@@ -761,8 +761,21 @@ def _parse_size(value: Any, default: int = 0) -> int:
 def _get_workspace_size(docker_manager, workspace_id: str) -> int:
     """获取工作空间当前已用字节数（``du -sb /workspace``）。
 
-    查询失败时返回 0（不阻塞上传）。
+    本地模式下直接统计本地目录大小；查询失败时返回 0（不阻塞上传）。
     """
+    if getattr(docker_manager, "_use_local", lambda: False)():
+        import os as _os
+        total = 0
+        local_workspace = docker_manager._local_workspace_path(workspace_id)
+        if not local_workspace.exists():
+            return 0
+        for dirpath, dirnames, filenames in _os.walk(str(local_workspace)):
+            for fname in filenames:
+                try:
+                    total += _os.path.getsize(_os.path.join(dirpath, fname))
+                except OSError:
+                    continue
+        return total
     result = docker_manager.exec_in_workspace(
         workspace_id, ["sh", "-c", "du -sb /workspace 2>/dev/null"]
     )

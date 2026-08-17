@@ -12,7 +12,7 @@ import yaml
 _MODELS_DIR = Path(__file__).resolve().parent.parent / "configs" / "models"
 
 # ModelConfig 固定字段，其余字段归入 extra
-_KNOWN_FIELDS = {"name", "base_url", "api_key", "model_id", "is_limitless_context"}
+_KNOWN_FIELDS = {"name", "base_url", "api_key", "model_id", "api_model_id", "is_limitless_context"}
 
 
 @dataclass
@@ -26,6 +26,7 @@ class ModelConfig:
     base_url: str
     api_key: str
     model_id: str
+    api_model_id: str = ""
     is_limitless_context: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -38,6 +39,7 @@ class ModelConfig:
             base_url=data.get("base_url", ""),
             api_key=data.get("api_key", ""),
             model_id=data.get("model_id", ""),
+            api_model_id=data.get("api_model_id", ""),
             is_limitless_context=bool(data.get("is_limitless_context", False)),
             extra=extra,
         )
