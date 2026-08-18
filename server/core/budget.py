@@ -169,8 +169,16 @@ class BudgetTracker:
                     return t
         return None
 
-    def get_budget_summary(self, price_calc: PriceCalculator) -> str:
-        """生成预算摘要文本（供注入 tool result 或系统提示词）。"""
+    def get_budget_summary(
+        self, price_calc: PriceCalculator, compact: bool = False
+    ) -> str:
+        """生成预算摘要文本（供注入 tool result 或系统提示词）。
+
+        compact=True 时返回精简版（仅剩余金额与消耗比例），避免完整 token
+        明细在每个工具结果后反复注入上下文导致"输入滚雪球"（累计 input
+        tokens 异常偏大、成本虚高）。完整明细用于预算告警 / WebSocket 推送等
+        面向用户的场景。
+        """
         with self._lock:
             cost = price_calc.calculate_cost(
                 self.input_tokens, self.output_tokens, self.cached_tokens
@@ -181,6 +189,8 @@ class BudgetTracker:
                 if self.budget > 0
                 else 0
             )
+            if compact:
+                return f"[预算] 剩余 ${remaining:.2f}（已消耗 {pct}%）"
             return (
                 f"[预算] 已消耗 ${cost:.4f}（输入 {self.input_tokens} tokens, "
                 f"输出 {self.output_tokens} tokens, "

@@ -81,6 +81,52 @@ _FIELD_LABELS: Dict[str, str] = {
 }
 
 
+def extract_usage_counts(usage: Any) -> Dict[str, int]:
+    """从流式 usage chunk 中稳健解析 token 用量。
+
+    兼容三种缓存字段口径：
+    1. OpenAI 协议: ``usage.prompt_tokens_details.cached_tokens``
+    2. DeepSeek 官方: 顶层 ``usage.prompt_cache_hit_tokens``（或
+       ``prompt_cache_miss_tokens``，二者同时存在）
+    3. 兼容网关: 顶层 ``usage.cached_tokens``
+
+    同时做防御性钳制：缓存命中数不超过输入 token 总数，避免网关异常值
+    导致成本计算为负或缓存占比超过 100%。
+
+    :param usage: OpenAI SDK 的 completion usage 对象（或任意相似属性命名）
+    :return: ``{"prompt_tokens", "completion_tokens", "cached_tokens"}``
+    """
+    prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+    completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+    cached_tokens = 0
+
+    # 1. OpenAI 协议：prompt_tokens_details.cached_tokens
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is not None:
+        cached_tokens = int(getattr(details, "cached_tokens", 0) or 0)
+
+    # 2. DeepSeek 官方：顶层 prompt_cache_hit_tokens（优先），
+    #    prompt_cache_miss_tokens 可交叉验证
+    if not cached_tokens:
+        cached_tokens = int(getattr(usage, "prompt_cache_hit_tokens", 0) or 0)
+        if not cached_tokens:
+            miss = int(getattr(usage, "prompt_cache_miss_tokens", 0) or 0)
+            if prompt_tokens and miss:
+                cached_tokens = max(0, prompt_tokens - miss)
+
+    # 3. 兼容网关：顶层 cached_tokens
+    if not cached_tokens:
+        cached_tokens = int(getattr(usage, "cached_tokens", 0) or 0)
+
+    # 防御性钳制：缓存命中不超过输入 token，且不小于 0
+    cached_tokens = max(0, min(cached_tokens, prompt_tokens))
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "cached_tokens": cached_tokens,
+    }
+
+
 class LLMClientFactory:
     """OpenAI SDK client 工厂。
 
@@ -370,19 +416,23 @@ class AgentLLMSession:
             content_parts: List[str] = []
             tool_calls: List[Dict[str, str]] = []
             finish_reason: Optional[str] = None
+            # usage 记账守卫：include_usage 下规范只应出现一个 usage chunk，
+            # 但网关异常时可能重复，仅记录一次避免重复计费翻倍
+            usage_recorded = False
 
             # 流式接收响应
             for chunk in stream:
-                # 流式末尾的 usage chunk 无 choices，但携带 token 用量
+                # 流式末尾的 usage chunk 无 token，但携带 token 用量
                 usage = getattr(chunk, "usage", None)
                 if usage is not None:
-                    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
-                    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
-                    # 缓存命中 token（OpenAI 协议：prompt_tokens_details.cached_tokens）
-                    cached_tokens = 0
-                    details = getattr(usage, "prompt_tokens_details", None)
-                    if details is not None:
-                        cached_tokens = getattr(details, "cached_tokens", 0) or 0
+                    if usage_recorded:
+                        # 防御：同一响应中重复的 usage chunk 只记一次，避免预算重复统计
+                        continue
+                    usage_recorded = True
+                    counts = extract_usage_counts(usage)
+                    prompt_tokens = counts["prompt_tokens"]
+                    completion_tokens = counts["completion_tokens"]
+                    cached_tokens = counts["cached_tokens"]
                     self.last_usage = {
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
@@ -488,10 +538,13 @@ class AgentLLMSession:
                     # dict 结果提取可读内容，避免前端显示原始 dict 字符串
                     result_str = _stringify_tool_result(result)
 
-                    # 追加预算摘要到工具结果（让 agent 感知预算消耗，合理规划工作流）
+                    # 追加预算摘要到工具结果（让 agent 感知预算消耗，合理规划工作流）。
+                    # compact=True 只给剩余预算比例/金额，不给完整 token 明细：
+                    # 完整明细会在每个工具结果后反复注入并留在上下文中，导致
+                    # 上下文膨胀、后续每次 API 输入更大，形成"输入滚雪球"。
                     if self.budget_tracker is not None and self.price_calculator is not None:
                         budget_summary = self.budget_tracker.get_budget_summary(
-                            self.price_calculator
+                            self.price_calculator, compact=True
                         )
                         result_str = f"{result_str}\n\n{budget_summary}"
 
