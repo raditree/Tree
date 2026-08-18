@@ -7,6 +7,38 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'websocket_service.dart';
 
+/// 判断路径是否属于 Unix/WSL 风格目录（而非 Windows 盘符目录）。
+///
+/// 供本地执行器选择 shell 使用：Windows 上的 WSL 挂载目录（如
+/// /mnt/e/...、\\wsl$\...）需要通过 bash / wsl.exe 才能访问，而
+/// 纯 Windows 目录（如 C:\...）应继续使用 cmd /c。
+///
+/// 判定规则：
+/// - 含 Windows 盘符（^[A-Za-z]:）→ 纯 Windows 目录（false）；
+/// - 以 `/` 开头且无盘符 → Unix 风格（/mnt/...、/home/...、/usr/...）；
+/// - 包含 /mnt/、/wsl、/usr/ 等特征 → Unix/WSL（覆盖 \\wsl$\UNC 形式）。
+bool isUnixLikePath(String path) {
+  final String p = path.trim();
+  if (p.isEmpty) return false;
+  final String normalized = p.replaceAll('\\', '/');
+  if (RegExp(r'^[A-Za-z]:').hasMatch(normalized)) return false;
+  if (normalized.startsWith('/')) return true;
+  return normalized.contains('/mnt/') ||
+      normalized.contains('/wsl') ||
+      normalized.contains('/usr/') ||
+      normalized.contains('/home/') ||
+      normalized.contains('/tmp/');
+}
+
+/// 为工作目录解析应使用的 shell 名（纯函数，便于单元测试）。
+///
+/// - Unix/WSL 目录 → 'bash'（Windows 平台执行时自动回退 wsl.exe）
+/// - 纯 Windows 目录 → 'cmd'
+String? resolveShellForDir(String path) {
+  if (path.isEmpty) return null;
+  return isUnixLikePath(path) ? 'bash' : 'cmd';
+}
+
 /// 本地执行器服务 - 在本地运行模式下执行后端推送的工具请求
 ///
 /// 本地运行模式：后端完整运行在云端，但工具调用环境转移到用户本机。
@@ -153,6 +185,20 @@ class LocalExecutorService extends ChangeNotifier {
       'type': 'unregister_local_executor',
       'data': <String, dynamic>{'top_agent_id': _currentTopAgentId},
     });
+  }
+
+  /// 应用退出 / 页面销毁时清理资源。
+  ///
+  /// 替代已废弃的 LocalBackendService.dispose()：本服务不持有本地进程，
+  /// 只需通知后端注销本地执行器（避免后端残留注册导致工具请求被错误路由），
+  /// 并释放 WebSocket 引用、复位注册状态。清理后下次连接会通过
+  /// [attach] + [syncRegistration] 按持久化设置重新注册。
+  void cleanup() {
+    if (_registered) {
+      unregister();
+    }
+    _ws = null;
+    _registered = false;
   }
 
   /// 解析工具请求的工作目录（与后端本地路径映射保持一致）。
@@ -504,6 +550,13 @@ class LocalExecutorService extends ChangeNotifier {
       return <String, dynamic>{'error': 'exec_shell 缺少 command'};
     }
     final int timeout = ((data['timeout'] as num?) ?? 30).toInt();
+    final String workDir = wsDir.path;
+    // Unix/WSL 工作目录：Windows API 无法把该路径作为 workingDirectory，
+    // 改用 bash -lc "cd <dir> && <command>"（或 wsl.exe --cd 兜底）。
+    if (isUnixLikePath(workDir)) {
+      return _runUnixShellInDir(workDir, command, timeout: timeout);
+    }
+    // 纯 Windows 目录：保持 cmd /c 行为，向后兼容。
     final bool isWindows = Platform.isWindows;
     return _runProcess(
       wsDir,
@@ -512,6 +565,54 @@ class LocalExecutorService extends ChangeNotifier {
           : <String>['sh', '-c', command],
       timeout: timeout,
     );
+  }
+
+  /// 在 Unix 风格工作目录（WSL 挂载路径等）中执行 shell 命令。
+  ///
+  /// Windows API 无法把 Unix 路径作为 Process.run 的 workingDirectory，
+  /// 因此优先执行 `bash -lc "cd <dir> && <command>"`；bash 不可用（进程
+  /// 无法启动）时回退 `wsl.exe --cd <dir> bash -lc <command>`；两者均不可
+  /// 用则返回明确错误（不静默返回空）。
+  Future<Map<String, dynamic>> _runUnixShellInDir(
+    String workDir,
+    String command, {
+    int timeout = 30,
+  }) async {
+    // 真正的工作目录访问交给 bash 的 cd 完成（当前目录进程可启动即可）。
+    final String bashBody = "cd '$workDir' && $command";
+    final Map<String, dynamic> bashResult = await _runProcess(
+      Directory('.'),
+      <String>['bash', '-lc', bashBody],
+      timeout: timeout,
+    );
+    if (!_isShellMissing(bashResult)) return bashResult;
+
+    // bash 不可用 => wsl.exe 兜底（--cd 由 wsl 解析 Unix 路径）。
+    final Map<String, dynamic> wslResult = await _runProcess(
+      Directory('.'),
+      <String>['wsl.exe', '--cd', workDir, 'bash', '-lc', command],
+      timeout: timeout,
+    );
+    if (!_isShellMissing(wslResult)) return wslResult;
+
+    return <String, dynamic>{
+      'error': 'bash 不可用，请检查 WSL（wsl.exe 与 bash 均无法调用）',
+      'exit_code': -1,
+      'stdout': '',
+      'stderr': '',
+    };
+  }
+
+  /// 判断 [result] 是否表示 shell 本身不可用（而非命令本身失败）。
+  bool _isShellMissing(Map<String, dynamic> result) {
+    final Object? err = result['error'];
+    if (err == null) return false;
+    final String msg = err.toString().toLowerCase();
+    return msg.contains('not found') ||
+        msg.contains('cannot run program') ||
+        msg.contains('system cannot find') ||
+        msg.contains('not recognized') ||
+        msg.contains('不是内部或外部命令');
   }
 
   /// 执行 argv 形式的命令（不经 shell 包装）。
@@ -530,20 +631,29 @@ class LocalExecutorService extends ChangeNotifier {
   }
 
   /// 执行本地进程并返回 ``{exit_code, stdout, stderr}`` 或 ``{error}``。
+  ///
+  /// [workingDirectory] 可覆盖工作目录；缺省时若 [wsDir] 为 Unix/WSL
+  /// 风格路径（Windows API 无法识别）则不传 workingDirectory（用当前目录），
+  /// 由调用方以 `bash -lc "cd .. && ..."` 等内嵌方式进入；否则用 [wsDir]。
   Future<Map<String, dynamic>> _runProcess(
     Directory wsDir,
     List<String> argv, {
     int timeout = 0,
+    String? workingDirectory,
   }) async {
     if (argv.isEmpty) {
       return <String, dynamic>{'error': '缺少可执行命令'};
     }
+    final String? cwd = workingDirectory ??
+        (isUnixLikePath(wsDir.path) ? null : wsDir.path);
     try {
-      final Future<ProcessResult> future = Process.run(
-        argv.first,
-        argv.sublist(1),
-        workingDirectory: wsDir.path,
-      );
+      final Future<ProcessResult> future = cwd == null
+          ? Process.run(argv.first, argv.sublist(1))
+          : Process.run(
+              argv.first,
+              argv.sublist(1),
+              workingDirectory: cwd,
+            );
       final ProcessResult result = timeout > 0
           ? await future.timeout(Duration(seconds: timeout))
           : await future;
