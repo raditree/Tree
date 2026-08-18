@@ -344,6 +344,63 @@
 
 **待办**：修复代码需**再次重启后端**生效；重启后 help 应显示 `## 执行模式：本地…` + `## 记忆档案 (memory.md)` 压缩版 + `## 工作准则 (rule.md)` 压缩版。
 
+### 2026-08-18 · 第十三轮：IO 阻塞修复（asyncio.to_thread）+ help 注入全链路验证通过
+
+**任务目标**：用户重启后端后验证第十二轮修复；用户指出"IO 处理阻塞了，现在应该已经修好了，继续工作"——第十二轮的 `_get_workspace_io` 引入了一个隐藏死锁风险，用户已修复。
+
+**用户修复的 IO 阻塞（关键，吸取教训）**：
+- 本地模式下 `_build_workspace_extra_info` 经 `LocalWorkspaceIO` 走**反向 WS** 读 .self 文件（**同步阻塞**）。
+- 若在**事件循环线程内**直接同步调用（消息处理路径 `_process_member_message` / `_handle_user_message` 原本如此），`local_executor.request` 会用 `run_coroutine_threadsafe` 往事件循环发 WS 消息，但**事件循环被自身阻塞，send_message 永远不会被调度执行 → 死锁 ~120s/文件**。
+- **用户修复**：两处调用包 `await asyncio.to_thread(_build_workspace_extra_info, ...)`，把同步 IO 移到线程池，避免阻塞事件循环。
+- **教训**：涉及反向 WS 的同步 IO（LocalWorkspaceIO 全家桶）绝不能在事件循环线程直接调用，必须 asyncio.to_thread；工具执行路径（chat 线程）天然无此问题（chat 循环在独立线程）。
+
+**execute 刷新设计确认（用户恢复并细化）**：
+- 用户修 IO 时把 execute() 的每次刷新**加回来了**，但设计更精细（help_tool.py:139-151 注释）：
+  - **主动调 help**（execute）：每次刷新拿最新 memory/rule/identity——产出文本作为**本轮新 tool 结果**追加进上下文（新消息），**不影响已有前缀消息的 KV 缓存** ✅
+  - **compact 常驻块**（render_fresh_content）：只在 compact 重构时刷新，避免常驻块内容漂移破坏前缀稳定性 ✅
+- 即最终语义：**主动 help = 现读最新；常驻 help 块 = 仅在 compact 重构时刷新**。两者不冲突，各自正确。
+
+**重启后实测（help 输出完整验证通过）**：
+- `## 执行模式`：`本地（工作目录 E:\...\flutter_application_tree；私人空间 .self 位于 .../workspaces/agent_1787022784638/.self；团队共享工作目录 ...）` ✅
+- `## 你的身份`：读到**本地最新 identity.md**（含到第十二轮的近期职责）✅
+- `## 工作准则 (rule.md)`：5613 字符 > 4096 → **自动压缩摘要**（含任务目标/角色定位/核心准则）✅
+- `## 记忆档案 (memory.md)`：23630 字 → **压缩摘要 ~4500 字**（第一轮至今全部记忆）✅
+- **双轨制闭环达成**：记忆维护写本地 baseDir（LocalWorkspaceIO）→ help 注入经 `_get_workspace_io` 读同一位置 → **读写同源**。
+
+**回归验证（verify_refresh_chain.py 全过）**：
+1. 主动 help execute：每次刷新拿最新（ID_NEW/RULE_NEW/MEMORY_NEW），refresh=1 ✅
+2. compact：常驻 help 块被刷新替换（新内容、旧块无残留、tool_call 配对约束满足）✅
+3. 无回调（无限上下文 session）：保留旧块 ✅
+- 注：compress 测试需 ≥4 条 user 消息（help 块豁免后 to_summarize 非空才真正压缩；只有 3 条 user 全在保留区时 compress 返回 False 是正确行为）。
+
+**本轮最终状态**：memory/rule 注入 help（<4k 全量、超限压缩、md5 指纹缓存）+ 主动 help 现刷 + compact 常驻块刷新 + 统一 IO 通道（`_get_workspace_io`）+ IO 阻塞修复（asyncio.to_thread）——**全链路实测通过，无需再重启**。
+
+**遗留待办（延续第六轮）**：已建 3 名成员空间仍在容器（03efdf...），本地模式下建议重建使路径一致；roster 表缺 system_prompt/can_lead_team 列；help 对成员仍注入"顶层 Agent"身份（未按 level 渲染）。
+
+### 2026-08-18 · 第十四轮：记忆维护文档质量修复（发现并修复上次维护的重复插入失误）
+
+**任务目标**：系统触发记忆维护后，全面检查 .self 三文档健康度，发现并修复上次（第十三轮）记忆维护的失误。
+
+**发现的问题（上次记忆维护失误实证）**：
+1. **identity.md 第九~十二轮重复**（行 27-31 vs 32-35）：上次 append 时 old_text 误用了"第八轮"那行（而非真正的文末"第十二轮"），把"第九~十三轮"整块插到第八轮后，而原有的第九~十二轮还在 → 第九~十二轮各出现 2 次。
+2. **rule.md 编号 24、25 重复 + 顺序错乱**：上次 append 时 old_text 用了"第 23 条"（误以为文末），实际文件在第 23 条后**已有** 24'-31（更早轮次追加的条目），插入后变成 23, 24(反向WS), 25(help刷新), 24'(记忆读侧), 25'(注入限长), 26-31。
+3. **根因**：上次记忆维护**没有先 read 全文档**，凭记忆中的"文末"做 edit，而实际文档比我记忆的更完整（更早轮次已追加过条目，但 memory.md 未记录这些追加动作——盲点）。
+
+**修复（已备份到 .output/*_backup_before_fix.md）**：
+- identity.md：脚本删除重复的第九~十二轮（9 行含多余空行），保留唯一完整版；验证各轮次出现 1 次。
+- rule.md：重编号使 1-33 连续——91 行 24→26（**中文引号"读""写"导致初次匹配失败**，用 edit 带引号替换成功）、96 行 25→27、99 行 26→28、103 行 27→29、107 行 28→30、114 行 29→31、118 行 30→32、124 行 31→33；验证无重复无缺失。
+- memory.md：13 个轮次标题唯一，无需修复。
+
+**教训沉淀（新增 rule.md 第 34 条）**：
+- 记忆维护 edit 前**必须 read 全文**，确认真正的文末（old_text 取文末唯一片段），不能凭记忆；
+- 追加后**验证编号/标题唯一性**（脚本扫描），防止插入到文件中部造成重复；
+- **中文引号（" "）会导致 edit/正则匹配失败**——先 inspect 码点确认原文，再精确替换；
+- 更早轮次的 rule.md 追加动作应在 memory.md 留痕（记忆盲点：memory 只记任务，不记 .self 文档自身的增量）。
+
+**本轮最终状态**：.self 三文档结构健康（memory 13 标题、rule 33 条连续、identity 13 轮次唯一）；备份保留在 .output/。
+
+
+
 
 
 

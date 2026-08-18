@@ -88,47 +88,39 @@
     （与内置工具同路径语义，本地=baseDir/workspaces/{id}/.self，云端=容器），杜绝写读双轨；memory/rule
     注入设 4k 上限（超限 LLM 压缩 + md5 指纹缓存）；**主动调用 help = 现读最新（新 tool 结果追加，不影响
     旧前缀缓存），compact 常驻 help 块 = 仅在 compact 重构时刷新（此时前缀必重排，零额外成本）**。
-26. **记忆维护闭环要验证"读"侧，不能只验证"写"侧**：update memory 把结论写进 .self/memory.md ≠ agent
+24. **记忆维护闭环要验证"读"侧，不能只验证"写"侧**：update memory 把结论写进 .self/memory.md ≠ agent
     能读到。本项目实证：注入链只有两条（system prompt / help 的 workspace_extra_info），且都只含
     identity.md + rule.md，**memory.md 从未自动注入**——维护是"只写不读"半闭环。设计记忆机制时，
     先回答"写入的东西通过哪条链路回到上下文"，并验证注入点确实读取了该文件；轻量做法是注入
     memory 索引（各轮标题+日期），细节按需 read。
-27. **记忆注入必须限长 + 带指纹缓存**：memory.md 随轮次无限增长（本 agent 已 17.5k 字符 ≈ 8.8k tokens），
+25. **记忆注入必须限长 + 带指纹缓存**：memory.md 随轮次无限增长（本 agent 已 17.5k 字符 ≈ 8.8k tokens），
     全量注入 help 会膨胀上下文。做法：常量上限（如 4k 字符）超限时 LLM 压缩（失败回退保头保尾截断），
     压缩结果按 md5 指纹缓存（内容未变直接复用，避免每次 help 重复触发 LLM 压缩）；rule.md 等同样应限长。
-28. **help 快照要能刷新，不能只靠会话重建**：workspace_extra_info 是会话构造时的一次性快照，而
+26. **help 快照要能刷新，不能只靠会话重建**：workspace_extra_info 是会话构造时的一次性快照，而
     memory.md 每次记忆维护都更新——若 help 永远读旧快照，"记忆注入"就失效了。做法：给 HelpTool 注入
     `refresh_extra_info` 回调（main 层闭包现读现算），`execute()` 每次执行前刷新 workspace_extra_info，
     保证 help 输出始终最新（identity/rule/memory 均可现读）。
-29. **compact 时刷新 help 块的前缀代价 ≈ 0**：保留的 help 块若在 compact 时用最新渲染替换，看似破坏
+27. **compact 时刷新 help 块的前缀代价 ≈ 0**：保留的 help 块若在 compact 时用最新渲染替换，看似破坏
     前缀缓存，但 compact 本身就用新 summary 替换全部历史（上下文全新排布、前缀必然全失效）——刷新与
     compact 固有失效完全重叠，不增加额外成本。评估"更新是否会破坏前缀缓存"时，先算清该更新是否与
     其他全量变化（compact/会话重建）重叠。
-30. **help 快照刷新只放在 compact，不在 execute（修正第 26 条中间方案）**：help 块作为历史消息留在
+28. **help 快照刷新只放在 compact，不在 execute（修正第 26 条中间方案）**：help 块作为历史消息留在
     上下文中，若每次 execute 都现刷内容，会破坏前缀稳定性、频繁失效 KV 缓存。最终设计：**平时 execute
     用快照（内容不变、前缀稳定利于缓存命中）；只有 compact 触发上下文重构时才刷新**——HelpTool 提供
     `render_fresh_content()` 专供 compact 调用，main 层通过 `session.help_refresh_callback` 绑定
     （返回新 assistant(tool_call=help)+tool(result) 消息对，保证 OpenAI tool_call 配对约束），
     llm.compress 保留 kept_help 后若有回调则用最新渲染替换。凡"常驻块"（help/工具说明等）的刷新时机，
     统一锚定到全量重排事件（compact/会话重建），避免为单个块刷新破坏整体前缀。
-31. **memory 注入限长要覆盖 rule/identity 等全部 .self 文档，且压缩函数泛化**：不只 memory.md，
+29. **memory 注入限长要覆盖 rule/identity 等全部 .self 文档，且压缩函数泛化**：不只 memory.md，
     rule.md（本 agent 已 4863 字符）也会超限。做法：统一 `_SELF_DOC_INJECT_LIMIT = 4096` +
     `_compress_self_doc(workspace_id, doc_key, text, kind)`（LLM 压缩 + md5 指纹缓存 +
     保头保尾截断回退），缓存键带 doc_key 区分文档，避免不同文档互相串缓存。
-32. **.self 文档读写必须走统一 WorkspaceIO，禁止一边容器一边本地（双轨制深坑实证）**：本项目记忆维护
+30. **.self 文档读写必须走统一 WorkspaceIO，禁止一边容器一边本地（双轨制深坑实证）**：本项目记忆维护
     写 memory/rule/identity 走内置工具→LocalWorkspaceIO→本地 baseDir；但 help 注入读 .self 曾硬编码
     docker_manager→Docker 容器——两者分叉导致 help 永远读到容器空壳、读不到 agent 实际写的记忆，
     即使实现注入也白搭。修复：新增 `_get_workspace_io(user_id, agent_id)`（本地→LocalWorkspaceIO
     经 WS 前端解析路径，云端→CloudWorkspaceIO），_build_workspace_extra_info 读 identity/rule/memory
     全部走统一 IO（io 失败回退 docker）。凡跨组件读写同一文件，先确认写读两端是否同一通道。
-33. **注入进 help 的字段必须确认渲染逻辑存在**：_build_workspace_extra_info 早注入 exec_mode，但
+31. **注入进 help 的字段必须确认渲染逻辑存在**：_build_workspace_extra_info 早注入 exec_mode，但
     help_tool._build_workspace_info_section 一直没渲染它 → 用户侧看不到。注入端与渲染端要成对检查，
     新增字段后验证 help 输出确实包含。
-34. **记忆维护 edit 前必须 read 全文确认真正的文末**：不能凭记忆中的"文末"做 old_text。实证教训：
-    append 时误用"第八轮"作 old_text，把第九~十三轮整块插到第八轮后，而原有第九~十二轮还在 →
-    重复插入。正确做法：read 全文 → 确认最后一条记录 → old_text 取文末唯一片段 → edit 追加 →
-    追加后验证编号/标题唯一性（脚本扫描）。**中文引号（""）会导致 edit/正则匹配失败**，先 inspect
-    码点确认原文再精确替换。
-35. **记忆维护是元工作也要留痕**：.self 文档自身的增量（rule.md 新增条目、identity.md 职责追加）
-    应同步记入 memory.md 轮次记录，否则后续轮次读文档时发现比记忆更完整的内容（如 rule 24'-31 早已
-    存在）会误判为文末而重复插入。
