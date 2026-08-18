@@ -1462,7 +1462,7 @@ def _dispatch_agent_message(
     }
 
 
-def _dispatch_user_message(user_id: str, data: Dict[str, Any]) -> None:
+async def _dispatch_user_message(user_id: str, data: Dict[str, Any]) -> None:
     """投递顶部 agent 用户消息（收敛到统一消息 API）。
 
     - agent idle：broker 立即新建 worker 消费消息，等价于直接发送。
@@ -1482,11 +1482,16 @@ def _dispatch_user_message(user_id: str, data: Dict[str, Any]) -> None:
     content = data.get("content", "") or ""
     if not content and data.get("attachments"):
         content = "[附件消息]"
-    result = _dispatch_agent_message(
+
+    # 本地模式下 _dispatch_agent_message 内部可能经反向 WS 读 roster（阻塞），
+    # 放入线程池执行，避免在事件循环线程内空等（阻塞期间其他请求全部卡住）。
+    result = await asyncio.to_thread(
+        _dispatch_agent_message,
         user_id, [agent_id], content,
-        source_agent_id="",
-        top_agent_id=agent_id,
-        extra=dict(data),
+        "",
+        agent_id,
+        "",
+        dict(data),
     )
     if result.get("status") == "error":
         asyncio.create_task(_handle_user_message(user_id, data))
@@ -1868,7 +1873,8 @@ async def websocket_endpoint(ws: WebSocket):
             elif msg_type == "user_message":
                 # checklist 7：通过 broker 投递，working 时在 tool_call 间隙切入，
                 # idle 时立即处理（不等同于阻塞 WebSocket 循环，便于后续消息切入）。
-                _dispatch_user_message(user_id, data)
+                # dispatch 内部可能经反向 WS 读 roster（阻塞），await 保证其在线程池执行
+                await _dispatch_user_message(user_id, data)
             elif msg_type == "stop":
                 # 停止按钮：请求取消指定 agent 的进行中任务
                 agent_id = data.get("agent_id", "")

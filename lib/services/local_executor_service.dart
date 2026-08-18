@@ -83,6 +83,14 @@ class LocalExecutorService extends ChangeNotifier {
   bool _enabled = false;
   bool get enabled => _enabled;
 
+  /// 已向后端注册过本地执行器的顶部 agent 集合。
+  ///
+  /// [_currentTopAgentId] 只反映当前选中的顶部 agent，而切换顶部 agent 时
+  /// 后端不会自动注销旧注册；若清理时只注销当前 agent，残留注册会让后端
+  /// 继续向本端转发工具请求而无人响应（每次请求空等 120s，表现为发消息卡死）。
+  /// 因此单独记录所有注册过的顶部 agent，[cleanup] 时逐一注销。
+  final Set<String> _registeredTopAgents = <String>{};
+
   /// 当前顶部 agent 的工作目录（持久化）
   String get workingDirectory => _baseDir;
 
@@ -168,6 +176,7 @@ class LocalExecutorService extends ChangeNotifier {
     if (_currentTopAgentId.isEmpty) return;
     _baseDir = baseDir;
     _registered = true;
+    _registeredTopAgents.add(_currentTopAgentId);
     _send(<String, dynamic>{
       'type': 'register_local_executor',
       'data': <String, dynamic>{
@@ -181,9 +190,15 @@ class LocalExecutorService extends ChangeNotifier {
   void unregister() {
     if (_currentTopAgentId.isEmpty) return;
     _registered = false;
+    _registeredTopAgents.remove(_currentTopAgentId);
+    _sendUnregister(_currentTopAgentId);
+  }
+
+  /// 向后端发送注销指定顶部 agent 的本地执行器消息。
+  void _sendUnregister(String topAgentId) {
     _send(<String, dynamic>{
       'type': 'unregister_local_executor',
-      'data': <String, dynamic>{'top_agent_id': _currentTopAgentId},
+      'data': <String, dynamic>{'top_agent_id': topAgentId},
     });
   }
 
@@ -194,9 +209,15 @@ class LocalExecutorService extends ChangeNotifier {
   /// 并释放 WebSocket 引用、复位注册状态。清理后下次连接会通过
   /// [attach] + [syncRegistration] 按持久化设置重新注册。
   void cleanup() {
-    if (_registered) {
-      unregister();
+    // 无论 [_registered] 是否置位都要通知后端注销：切换顶部 agent 后
+    // [_registered] 只反映当前 agent，后端可能仍残留其他顶部 agent 的注册，
+    // 若只注销当前 agent，残留注册会让后端继续向本端转发工具请求而无人响应
+    // （每次请求空等 120s，表现为发消息卡死）。逐一注销所有注册过的顶部 agent。
+    final List<String> agents = _registeredTopAgents.toList();
+    for (final String topAgentId in agents) {
+      _sendUnregister(topAgentId);
     }
+    _registeredTopAgents.clear();
     _ws = null;
     _registered = false;
   }

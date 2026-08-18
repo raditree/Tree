@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import time
 import uuid
 from typing import Any, Dict, Optional
 
@@ -27,6 +28,16 @@ logger = logging.getLogger(__name__)
 
 # 本地执行请求默认超时（秒）
 _LOCAL_EXEC_TIMEOUT = 120
+
+# 执行器"冷启动"判定：距上次成功往返超过该时长视为冷（首次响应需先探测）。
+# 冷执行器用短超时等待首个响应，避免前端执行器已失联时每个请求都空等满
+# _LOCAL_EXEC_TIMEOUT，导致一条消息要卡几分钟（表现为"发消息卡大半天"）。
+_PROBE_GAP_SECONDS = 60.0
+# 冷启动探测超时（秒）：远小于响应超时，失联执行器快速失败并触发自动停用
+_PROBE_TIMEOUT_SECONDS = 15.0
+# 连续响应超时达到该次数后自动停用该用户的本地执行器（回退云端执行），
+# 防止后续请求继续逐个空等超时并占用线程池线程导致其他请求被阻塞。
+_MAX_CONSECUTIVE_TIMEOUTS = 2
 
 
 def _run_async(coro: "Any") -> Any:
@@ -65,6 +76,10 @@ class LocalExecutorClient:
         self._pending: Dict[str, "concurrent.futures.Future[Dict[str, Any]]"] = {}
         # 主事件循环（lifespan 中绑定，用于从后台线程安全推送 WS 消息）
         self._loop: "Optional[asyncio.AbstractEventLoop]" = None
+        # user_id -> 最近一次成功往返时间戳（冷启动探测依据）
+        self._last_ok: Dict[str, float] = {}
+        # user_id -> 连续响应超时次数（达到阈值自动停用执行器）
+        self._consecutive_timeouts: Dict[str, int] = {}
 
     def bind_loop(self, loop: "asyncio.AbstractEventLoop") -> None:
         """绑定后端主事件循环。
@@ -104,6 +119,8 @@ class LocalExecutorClient:
         if not top_agent_id:
             top_agent_id = user_id
         self._users.setdefault(user_id, {})[top_agent_id] = base_dir or ""
+        # 重新注册视为执行器恢复：清零连续超时计数，避免旧失败记录继续触发停用
+        self._consecutive_timeouts.pop(user_id, None)
         logger.info(
             "用户 %s 顶部 agent %s 已启用本地执行器（base_dir=%s）",
             user_id,
@@ -130,6 +147,36 @@ class LocalExecutorClient:
                     fut.set_exception(RuntimeError("本地执行器已注销"))
                 self._pending.pop(key, None)
         logger.info("用户 %s 顶部 agent %s 已注销本地执行器", user_id, top_agent_id)
+
+    def _is_cold(self, user_id: str) -> bool:
+        """执行器是否处于"冷"状态：距上次成功往返超过探测间隔。
+
+        冷状态下首个响应改用短超时探测，失联执行器快速失败；热状态下
+        （对话进行中频繁往返）保持完整响应超时，不误伤慢速但正常的工具。
+        """
+        return time.time() - self._last_ok.get(user_id, 0.0) > _PROBE_GAP_SECONDS
+
+    def _register_timeout(self, user_id: str) -> None:
+        """记录一次响应超时；连续超时达到阈值时自动停用该用户的本地执行器。
+
+        停用后 is_local 返回 False，后续请求立即返回错误，调用方回退到
+        云端（Docker）通道，不再逐个请求空等 120s，也不占用线程池线程阻塞
+        其他请求。前端重新注册（register）时自动恢复。
+        """
+        self._consecutive_timeouts[user_id] = (
+            self._consecutive_timeouts.get(user_id, 0) + 1
+        )
+        if self._consecutive_timeouts[user_id] >= _MAX_CONSECUTIVE_TIMEOUTS:
+            logger.warning(
+                "本地执行器连续 %d 次响应超时，自动停用（回退云端执行）: user_id=%s",
+                _MAX_CONSECUTIVE_TIMEOUTS,
+                user_id,
+            )
+            for top_agent_id in list(self._users.get(user_id, {}).keys()):
+                try:
+                    self.unregister(user_id, top_agent_id)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def request(
         self,
@@ -189,25 +236,43 @@ class LocalExecutorClient:
                 exc, exec_id, payload.get("op"),
             )
             return {"error": f"推送本地执行请求失败: {exc}"}
+        # 冷启动探测：执行器长时间无成功往返时，先用短超时等待首个响应，
+        # 避免前端执行器已失联（未注销、WS 断开等）后每个请求都空等满
+        # timeout（默认 120s），一条消息叠加多次请求就是"卡大半天"。
+        wait_timeout = timeout
+        if self._is_cold(user_id):
+            wait_timeout = min(timeout, _PROBE_TIMEOUT_SECONDS)
         try:
-            result = fut.result(timeout=timeout)
+            result = fut.result(timeout=wait_timeout)
             if isinstance(result, BaseException):
                 raise result
+            # 成功往返：记录存活时间并清零连续超时计数（探测不再触发）
+            self._last_ok[user_id] = time.time()
+            self._consecutive_timeouts[user_id] = 0
             return result if isinstance(result, dict) else {"error": str(result)}
         except concurrent.futures.TimeoutError:
             self._pending.pop(key, None)
             # 取消可能仍在排队的发送协程，避免极晚投递导致响应无人匹配
             if send_fut is not None and not send_fut.done():
                 send_fut.cancel()
-            logger.warning("本地执行请求超时: exec_id=%s op=%s", exec_id, payload.get("op"))
+            logger.warning(
+                "本地执行请求超时(等待 %.0fs): exec_id=%s op=%s",
+                wait_timeout, exec_id, payload.get("op"),
+            )
+            self._register_timeout(user_id)
             return {"error": "本地执行器响应超时"}
         except Exception as exc:  # noqa: BLE001
             self._pending.pop(key, None)
             logger.warning("本地执行请求异常: %r (exec_id=%s)", exc, exec_id)
             return {"error": f"本地执行器错误: {exc}"}
         finally:
-            # 超时/异常后确保清理
-            self._pending.pop(key, None)
+            # 仅当请求被放弃（future 仍未完成，即超时/异常路径）时才兜底清理，
+            # 避免在正常返回路径上把已交付的结果从 pending 中提前移除；
+            # 正常路径的清理由 resolve() 在匹配时完成（set_result + pop）。
+            # 注意：不使用 fut.set_running_or_notify_cancel() 判断，因为它会把
+            # 尚未完成的 future 置为 RUNNING，导致后续 set_result 抛 InvalidStateError。
+            if not fut.done():
+                self._pending.pop(key, None)
 
     def resolve(self, user_id: str, exec_id: str, result: Dict[str, Any]) -> bool:
         """由 WS 接收处理调用：用前端返回结果唤醒等待方。

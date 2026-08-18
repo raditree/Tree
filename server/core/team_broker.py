@@ -79,6 +79,23 @@ class TeamMessageBroker:
         except Exception:  # noqa: BLE001
             logger.exception("成员 worker 异常结束")
 
+    @staticmethod
+    async def _wait_payload(queue: _queue.Queue) -> dict:
+        """轻量轮询取队列，不长期占用默认线程池线程。
+
+        此前使用 ``asyncio.to_thread(queue.get)``：每个空闲 worker 会永久
+        占用默认 ThreadPoolExecutor 的一个线程（get 阻塞直到有消息），
+        agent 数量一多就把线程池占满，导致其他 to_thread 请求（REST 读、
+        本地 WS 读写等）全部排队阻塞，表现为"一个请求卡住，其他请求全卡"。
+        改为轮询 get_nowait + asyncio.sleep：空闲 worker 不占线程，
+        消息投递延迟仅为一个轮询周期（50ms）。
+        """
+        while True:
+            try:
+                return queue.get_nowait()
+            except _queue.Empty:
+                await asyncio.sleep(0.05)
+
     async def _run(self, key: tuple, queue: _queue.Queue) -> None:
         """成员 worker：串行消费队列中的消息。
 
@@ -87,8 +104,7 @@ class TeamMessageBroker:
         调用 ``get_nowait``，queue.Queue 线程安全）。
         """
         while True:
-            # 在事件循环线程中阻塞等待队列；用 run_in_executor 避免阻塞循环。
-            payload = await asyncio.to_thread(queue.get)
+            payload = await self._wait_payload(queue)
             try:
                 result = self._process_fn(payload, queue)
                 if asyncio.iscoroutine(result):
