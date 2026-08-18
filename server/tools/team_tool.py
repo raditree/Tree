@@ -62,6 +62,7 @@ class TeamTool:
         agent_id: str = "",
         leader_id: str = "",
         top_agent_id: str = "",
+        message_dispatcher: Any = None,
     ) -> None:
         """初始化 team 工具。
 
@@ -84,6 +85,8 @@ class TeamTool:
         self.agent_id = agent_id
         self.leader_id = leader_id
         self.top_agent_id = top_agent_id or agent_id
+        # 统一消息发送回调（main 提供）：User-Agent / Agent-Agent 收敛出口
+        self.message_dispatcher = message_dispatcher
 
         # 成员列表（内存，同时持久化到 team_roster.md）
         self.members: List[Dict[str, Any]] = []
@@ -133,7 +136,6 @@ class TeamTool:
                                 "view_member_log",
                                 "send_message",
                                 "broadcast",
-                                "send_file",
                                 "assign_task",
                                 "query_tasks",
                                 "wait_for",
@@ -239,7 +241,6 @@ class TeamTool:
             "view_member_log": self._action_view_member_log,
             "send_message": self._action_send_message,
             "broadcast": self._action_broadcast,
-            "send_file": self._action_send_file,
             "assign_task": self._action_assign_task,
             "query_tasks": self._action_query_tasks,
             "wait_for": self._action_wait_for,
@@ -279,6 +280,28 @@ class TeamTool:
             if m.get("id") == member_id:
                 return m
         return None
+
+    def _lookup_agent_by_id(self, agent_id: str) -> Optional[Dict[str, Any]]:
+        """通过 agent_store 查询 agent 信息（向 leader 发送时补齐模型配置）。"""
+        try:
+            from core.agent_store import get_agent
+            return get_agent(self.user_id, agent_id)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _load_roster_of(self, agent_id: str) -> List[Dict[str, Any]]:
+        """读取指定 agent 工作空间的 roster 成员表（用于查找平级成员）。"""
+        if not agent_id or self.docker_manager is None:
+            return []
+        try:
+            result = self.docker_manager.exec_in_workspace(
+                agent_id, ["cat", ROSTER_FILE_PATH]
+            )
+            if result.get("exit_code", -1) != 0:
+                return []
+            return self._parse_roster_md(result.get("stdout", "") or "")
+        except Exception:  # noqa: BLE001
+            return []
 
     def _dispatch_to_member(
         self, member: Dict[str, Any], content: str
@@ -649,15 +672,22 @@ class TeamTool:
     # SubTask 7.4: 成员查询
     # ------------------------------------------------------------------
     def _action_list_members(self, arguments: dict) -> dict:
-        """列出所有成员（完整成员管理表），支持按模型/层级/工作状态筛选。"""
+        """列出与本 agent 有关系的所有 agent，按分组返回。
+
+        分组：
+        - ``team_leader``：当前 agent 的上级 leader（成员视角；顶部 agent 无 leader）
+        - ``teammates``：当前 agent 创建的直属成员（下属）
+        - ``team_member``：当前 agent 所属团队中的其他成员（同顶部 agent 旗下、
+          经上级 roster 可查的平级成员；teammates 无法看到无关系的 agent）
+
+        筛选参数（model_id / level / work_status）仅作用于 ``teammates`` 分组。
+        """
         result = list(self.members)
 
-        # 按模型筛选
         model_id = arguments.get("model_id")
         if model_id:
             result = [m for m in result if m.get("model_id") == model_id]
 
-        # 按层级筛选
         level = arguments.get("level")
         if level is not None:
             try:
@@ -666,12 +696,58 @@ class TeamTool:
             except (TypeError, ValueError):
                 pass
 
-        # 按工作状态筛选
         work_status = arguments.get("work_status")
         if work_status:
             result = [m for m in result if m.get("work_status") == work_status]
 
-        return {"members": result, "total": len(result)}
+        # team_leader：自己的上级 leader
+        team_leader: List[Dict[str, Any]] = []
+        if self.leader_id:
+            leader_agent = self._lookup_agent_by_id(self.leader_id)
+            if leader_agent is not None:
+                team_leader.append({
+                    "id": leader_agent.get("id") or self.leader_id,
+                    "name": leader_agent.get("name", ""),
+                    "model_id": leader_agent.get("model_id", ""),
+                    "level": 0,
+                    "workspace_id": leader_agent.get("workspace_id") or self.leader_id,
+                    "relation": "team_leader",
+                })
+            else:
+                team_leader.append({
+                    "id": self.leader_id,
+                    "name": self.leader_id,
+                    "model_id": "",
+                    "level": 0,
+                    "workspace_id": self.leader_id,
+                    "relation": "team_leader",
+                })
+
+        # team_member：本顶部 agent 旗下其他成员（上级 roster 中的平级成员）
+        team_member: List[Dict[str, Any]] = []
+        if self.leader_id:
+            own_ids = {m.get("id") for m in result if m.get("id")}
+            for m in self._load_roster_of(self.leader_id):
+                sid = m.get("id", "")
+                if sid and sid != self.agent_id and sid not in own_ids:
+                    team_member.append({
+                        "id": sid,
+                        "name": m.get("name") or sid,
+                        "model_id": m.get("model_id", ""),
+                        "level": int(m.get("level") or 1),
+                        "workspace_id": sid,
+                        "relation": "team_member",
+                    })
+
+        return {
+            "groups": {
+                "team_leader": team_leader,
+                "teammates": result,
+                "team_member": team_member,
+            },
+            "members": result,
+            "total": len(team_leader) + len(result) + len(team_member),
+        }
 
     def _action_query_member(self, arguments: dict) -> dict:
         """按 member_id 查询单个成员详情。"""
@@ -985,54 +1061,90 @@ class TeamTool:
     # SubTask 8.1: 点对点消息发送
     # ------------------------------------------------------------------
     def _action_send_message(self, arguments: dict) -> dict:
-        """点对点发送消息：路由到目标成员并记录在双方消息历史中。"""
-        target_id = arguments.get("target_member_id")
+        """发送消息：目标支持单个 ID 或列表（一对多），收敛到统一消息 API。
+
+        可发送给：直属成员（teammates）、上级 leader（team_leader）、以及本顶部
+        agent 旗下其他有关系的 agent（team_member）；无关系/跨顶部 agent 会被拒绝。
+        """
+        target_raw = arguments.get("target_member_id") or arguments.get("target_ids")
         message = arguments.get("message", "")
-        if not target_id:
+        if not target_raw:
             return {"error": "缺少 target_member_id"}
         if not message:
             return {"error": "缺少 message"}
 
-        target = self._find_member(target_id)
-        if target is None:
-            # 支持向 leader 发送消息（leader 不在队友的 roster 中）
-            if target_id == self.leader_id:
-                target = {
-                    "id": self.leader_id,
-                    "workspace_id": self.leader_id,
-                    "model_id": "",
-                    "system_prompt": "",
-                }
-            else:
-                return {"error": f"目标成员不存在: {target_id}"}
+        # 支持字符串或列表（一对多）
+        if isinstance(target_raw, str):
+            target_ids = [target_raw]
+        elif isinstance(target_raw, list):
+            target_ids = [t for t in target_raw if isinstance(t, str) and t]
+        else:
+            return {"error": "target_member_id 必须是字符串或字符串列表"}
+        if not target_ids:
+            return {"error": "目标 ID 列表为空"}
 
         now = self._now()
         msg = {
             "id": self._generate_message_id(),
             "from": "self",
-            "to": target_id,
+            "to": ",".join(target_ids),
             "type": "direct",
             "content": message,
             "timestamp": now,
         }
         self.messages.append(msg)
-        # 在目标成员的消息历史中记录
-        target.setdefault("message_history", []).append(msg)
-        # 投递给目标成员，触发其异步串行处理
-        dispatched = self._dispatch_to_member(target, message)
+        # 在已知直属成员的消息历史中记录
+        for tid in target_ids:
+            member = self._find_member(tid)
+            if member is not None:
+                member.setdefault("message_history", []).append(msg)
+
+        rejected: List[str] = []
+        # 收敛出口：统一消息 API（无 dispatcher 时退回 broker 直投）
+        if self.message_dispatcher is not None:
+            result = self.message_dispatcher(
+                self.user_id,
+                target_ids,
+                message,
+                source_agent_id=self.agent_id,
+                top_agent_id=self.top_agent_id,
+                system_prompt="",
+            )
+            dispatched = result.get("status") in ("sent", "partial")
+            rejected = result.get("rejected", []) or []
+        else:
+            dispatched = False
+            for tid in target_ids:
+                member = self._find_member(tid)
+                if member is not None:
+                    if self._dispatch_to_member(member, message):
+                        dispatched = True
+                elif tid == self.leader_id:
+                    leader_agent = self._lookup_agent_by_id(tid)
+                    target = {
+                        "id": tid,
+                        "workspace_id": (leader_agent or {}).get("workspace_id") or tid,
+                        "model_id": (leader_agent or {}).get("model_id") or "",
+                        "system_prompt": "",
+                    }
+                    if self._dispatch_to_member(target, message):
+                        dispatched = True
+                else:
+                    rejected.append(tid)
 
         return {
-            "status": "sent",
+            "status": "sent" if dispatched else "error",
             "message_id": msg["id"],
-            "to": target_id,
+            "to": target_ids,
             "dispatched": dispatched,
+            "rejected": rejected,
         }
 
     # ------------------------------------------------------------------
     # SubTask 8.2: 广播消息
     # ------------------------------------------------------------------
     def _action_broadcast(self, arguments: dict) -> dict:
-        """向所有团队成员发送广播消息。"""
+        """向所有直属成员发送广播消息（经统一消息 API 逐成员投递）。"""
         message = arguments.get("message", "")
         if not message:
             return {"error": "缺少 message"}
@@ -1047,21 +1159,43 @@ class TeamTool:
             "timestamp": now,
         }
         self.messages.append(msg)
-        # 每个成员的消息历史中记录该消息
+        member_ids = [m.get("id", "") for m in self.members if m.get("id")]
         for m in self.members:
             m.setdefault("message_history", []).append(msg)
+
+        rejected: List[str] = []
+        if self.message_dispatcher is not None:
+            result = self.message_dispatcher(
+                self.user_id,
+                member_ids,
+                message,
+                source_agent_id=self.agent_id,
+                top_agent_id=self.top_agent_id,
+            )
+            rejected = result.get("rejected", []) or []
+        else:
+            for m in self.members:
+                if not self._dispatch_to_member(m, message):
+                    rejected.append(m.get("id", ""))
 
         return {
             "status": "broadcast",
             "message_id": msg["id"],
             "recipients": len(self.members),
+            "rejected": rejected,
         }
 
     # ------------------------------------------------------------------
     # SubTask 8.3: 文件发送
     # ------------------------------------------------------------------
     def _action_send_file(self, arguments: dict) -> dict:
-        """从发送者工作空间复制文件到接收者工作空间（即时通信，与 Git 提交独立）。"""
+        """文件发送已取消：team leader 与 teammates 共享工作目录 base。"""
+        return {
+            "status": "cancelled",
+            "error": "文件发送功能已取消：team leader 与 teammates 共享工作目录，"
+                     "文件直接写入双方可见的工作空间即可。",
+        }
+        # ---- 以下旧实现已废弃（保留引用，避免误删其它逻辑） ----
         target_id = arguments.get("target_member_id")
         file_path = arguments.get("file_path", "")
         if not target_id:

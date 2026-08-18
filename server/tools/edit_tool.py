@@ -1,15 +1,16 @@
-"""MCP 工具 - edit：对工作空间内文件执行精确字符串替换。
+"""内置 edit 工具 - 对工作空间内文件执行精确字符串替换。
 
 通过 :class:`core.workspace_io.WorkspaceIO` 读取文件、在 Python 中执行
 精确字符串替换后写回文件。要求 ``old_text`` 在文件中唯一匹配。
+与 read / write / terminal 同为内置工具，直接走 LLM 工具循环，不经 MCP。
 """
 
 import logging
 from typing import Any, Dict
 
 from core.workspace_io import WorkspaceIO
-from mcp_tools.read_tool import ReadTool
-from mcp_tools.write_tool import WriteTool
+from tools.read_tool import ReadTool
+from tools.write_tool import WriteTool
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ class EditTool:
         """
         self.io = io
         self.workspace_id = workspace_id
-        # 复用 read/write 工具的实现，保持文件读写逻辑一致
+        # 复用内置 read/write 工具的实现，保持文件读写逻辑一致
         self._read_tool = ReadTool(io, workspace_id)
         self._write_tool = WriteTool(io, workspace_id)
 

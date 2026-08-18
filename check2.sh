@@ -1,0 +1,1 @@
+git status --short -- server/core/llm.py server/core/budget.py 2>&1; echo ---LOG---; git log --oneline -5 2>&1

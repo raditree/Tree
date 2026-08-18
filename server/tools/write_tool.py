@@ -1,7 +1,7 @@
-"""MCP 工具 - write：向工作空间内写入文件。
+"""内置 write 工具 - 向工作空间内写入文件。
 
 通过 :class:`core.workspace_io.WorkspaceIO` 写入文件，云端/本地实现均可。
-写入前会自动创建父目录。文件路径需通过防注入校验。
+与 read / edit / terminal 同为内置工具，直接走 LLM 工具循环，不经 MCP。
 """
 
 import logging

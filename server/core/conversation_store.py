@@ -336,3 +336,78 @@ def load_all_budget_settings() -> List[Dict[str, Any]]:
         return [dict(r) for r in rows]
     finally:
         conn.close()
+
+
+# ------------------------------------------------------------------
+# agent 工具调用计数持久化（update memory 门控，按 agent 隔离）
+# ------------------------------------------------------------------
+def _ensure_tool_count_table() -> None:
+    """确保工具计数表存在（惰性初始化）。"""
+    _ensure_db()
+    with sqlite3.connect(_DB_PATH) as conn:
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_tool_count (
+                user_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                tool_count INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, agent_id)
+            )
+            """
+        )
+        conn.commit()
+
+
+def get_tool_count(user_id: str, agent_id: str) -> int:
+    """读取指定 agent 的工具调用计数（不存在时返回 0）。"""
+    _ensure_tool_count_table()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT tool_count FROM agent_tool_count "
+            "WHERE user_id = ? AND agent_id = ?",
+            (user_id, agent_id),
+        ).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
+def increment_tool_count(user_id: str, agent_id: str) -> int:
+    """工具调用计数 +1（各 agent 独立，跨消息累积），返回累加后的值。"""
+    _ensure_tool_count_table()
+    ts = int(time.time() * 1000)
+    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+        conn.execute(
+            "INSERT INTO agent_tool_count (user_id, agent_id, tool_count, updated_at) "
+            "VALUES (?, ?, 1, ?) "
+            "ON CONFLICT(user_id, agent_id) DO UPDATE SET "
+            "tool_count = tool_count + 1, updated_at = excluded.updated_at",
+            (user_id, agent_id, ts),
+        )
+        row = conn.execute(
+            "SELECT tool_count FROM agent_tool_count "
+            "WHERE user_id = ? AND agent_id = ?",
+            (user_id, agent_id),
+        ).fetchone()
+        conn.commit()
+        return int(row[0]) if row else 0
+
+
+def reset_tool_count(user_id: str, agent_id: str) -> None:
+    """清零指定 agent 的工具调用计数（update memory 完成后调用）。"""
+    _ensure_tool_count_table()
+    ts = int(time.time() * 1000)
+    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+        conn.execute(
+            "INSERT INTO agent_tool_count (user_id, agent_id, tool_count, updated_at) "
+            "VALUES (?, ?, 0, ?) "
+            "ON CONFLICT(user_id, agent_id) DO UPDATE SET "
+            "tool_count = 0, updated_at = excluded.updated_at",
+            (user_id, agent_id, ts),
+        )
+        conn.commit()

@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import jwt
 import uvicorn
@@ -38,6 +38,9 @@ from core.conversation_store import (
     load_context,
     save_context,
     store_message,
+    get_tool_count,
+    increment_tool_count,
+    reset_tool_count,
 )
 from core.data_collection_store import (
     is_data_collection_enabled,
@@ -122,6 +125,7 @@ async def _register_tools(
         leader_id=leader_id,
         top_agent_id=top_agent_id,
         local_executor=_local_executor,
+        message_dispatcher=_dispatch_agent_message,
     )
 
 
@@ -551,7 +555,7 @@ async def _run_memory_update(
 ) -> None:
     """任务主循环完成后运行记忆更新阶段。
 
-    状态机：working -> updating_memory -> working -> idle。
+    状态机：working -> updating_memory -> idle（记忆维护结束后由调用方直接发送 idle）。
 
     流程：
     1. 发送 ``agent_status: updating_memory``。
@@ -567,11 +571,29 @@ async def _run_memory_update(
     if cancel_event is not None and cancel_event.is_set():
         return
 
+    # update memory 门控：工具调用计数达到阈值才触发（各 agent 独立，落盘）。
+    # 只有调用了 7 次以上工具时才进入记忆维护，完成后计数清零重新累积。
+    tool_count = get_tool_count(user_id, agent_id)
+    if tool_count < 7:
+        _append_activity_log(
+            workspace_id,
+            f"[{_clock_now()}] [memory] 工具调用数 {tool_count} < 7，跳过记忆维护",
+        )
+        return
+
+    # update memory 加锁：期间 User/Teammates/Team Leader 均无法向其发送消息
+    if not _lock_memory_update(user_id, agent_id):
+        _append_activity_log(
+            workspace_id,
+            f"[{_clock_now()}] [memory] 已有记忆更新进行中，跳过本次触发",
+        )
+        return
+
     await _send_status_updating_memory(user_id, agent_id)
 
     # 上下文接近模型上限时跳过记忆维护：记忆阶段会继续执行多轮工具调用、
     # 每轮把完整上下文重发给 LLM，容易使输入超长导致响应极慢（表现为前端
-    # 长时间"卡死"）。此时跳过记忆更新，直接回到 working 状态。
+    # 长时间"卡死"）。此时跳过记忆更新，保持 updating_memory，随后由调用方直接发送 idle。
     # 跳过阈值比例来自 app.yaml 的 llm.memory_update_skip_ratio，默认 0.9。
     limit = getattr(session, "max_seqlen", 0) or 0
     if limit and getattr(session, "context", None):
@@ -590,7 +612,7 @@ async def _run_memory_update(
                 f"[{_clock_now()}] [memory] 上下文接近上限（{est} ≥ {limit} tokens），"
                 "跳过记忆维护以避免超长输入",
             )
-            await _send_status_working(user_id, agent_id)
+            # 不发送 working：保持 updating_memory，由调用方随后发送 idle
             return
 
     # 记忆更新阶段在上下文中的起始标记，结束后回滚
@@ -638,13 +660,38 @@ async def _run_memory_update(
         session.last_usage = saved_usage
         session._last_prompt_tokens = saved_last_prompt
         session._context_len_at_last_call = saved_anchor
-        # 恢复工作状态（调用方随后发送 idle）
-        await _send_status_working(user_id, agent_id)
+        # 释放 update memory 锁，并清零工具调用计数（门控重新累积）
+        _unlock_memory_update(user_id, agent_id)
+        reset_tool_count(user_id, agent_id)
+        # 不发送 working：保持 updating_memory，由调用方随后发送 idle
 
 
 # 进行中的 agent 任务取消事件表：(user_id, agent_id) -> threading.Event。
 # 前端点击"停止"时，WS 端点 set 对应事件，chat 消费线程在每条产出后检查并退出。
 _active_tasks: Dict[Tuple[str, str], threading.Event] = {}
+
+# update memory 进行中的 agent 集合：期间 User/Teammates/Team Leader 均无法
+# 向其发送消息（入口统一拦截）。键为 (user_id, agent_id)。
+_memory_updating: Set[Tuple[str, str]] = set()
+
+
+def _is_memory_updating(user_id: str, agent_id: str) -> bool:
+    """判断指定 agent 是否正处于 update memory 阶段。"""
+    return (user_id, agent_id) in _memory_updating
+
+
+def _lock_memory_update(user_id: str, agent_id: str) -> bool:
+    """为指定 agent 加 update memory 锁；已加锁时返回 False。"""
+    key = (user_id, agent_id)
+    if key in _memory_updating:
+        return False
+    _memory_updating.add(key)
+    return True
+
+
+def _unlock_memory_update(user_id: str, agent_id: str) -> None:
+    """释放 update memory 锁。"""
+    _memory_updating.discard((user_id, agent_id))
 
 
 def _register_active_task(user_id: str, agent_id: str) -> threading.Event:
@@ -840,6 +887,13 @@ async def _stream_agent_reply(
                 name = item.get("name", "")
                 args = item.get("arguments") or {}
                 result = item.get("result", "")
+                # 工具调用计数 +1（update memory 门控累加器，落盘、按 agent 隔离）；
+                # 静默模式（update memory 内部工具调用）不计入。
+                if not silent:
+                    try:
+                        increment_tool_count(user_id, agent_id)
+                    except Exception:  # noqa: BLE001
+                        pass
                 if workspace_id:
                     _append_activity_log(
                         workspace_id,
@@ -920,6 +974,14 @@ async def _process_member_message(
     leader_id = payload.get("leader_id", "")
     top_agent_id = payload.get("top_agent_id", "")
     if not agent_id or not content:
+        return
+
+    # update memory 锁：成员正在记忆更新时拒绝新消息（用户/leader 消息均被拦截）
+    if _is_memory_updating(user_id, agent_id):
+        _append_activity_log(
+            workspace_id,
+            f"[{_clock_now()}] [error] 成员 {agent_id} 正在记忆更新，消息被拒绝",
+        )
         return
 
     model_config = _model_configs.get(model_id)
@@ -1026,6 +1088,19 @@ async def _process_member_message(
         if full_reply:
             _store_message(user_id, agent_id, "agent", full_reply)
         _append_activity_log(workspace_id, f"[{_clock_now()}] [done(成员)] 回复完成")
+        # 成员工具循环最后一次回复的 content 自动回发对应 leader
+        if full_reply and leader_id:
+            try:
+                _dispatch_agent_message(
+                    user_id,
+                    [leader_id],
+                    f"[成员 {agent_id} 完成回复] {full_reply}",
+                    source_agent_id=agent_id,
+                    top_agent_id=top_agent_id or leader_id,
+                    extra={"auto_reply": True},
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("成员回复回传 leader 失败: %s", exc)
         # 成员主回复成功后触发记忆更新阶段（普通 LLM，且未被取消时）
         if _status == "ok" and not model_config.is_limitless_context:
             await _run_memory_update(
@@ -1063,21 +1138,152 @@ async def _broker_process_user_message(
     await _handle_user_message(user_id, payload, queue)
 
 
+def _find_roster_member(
+    user_id: str, roster_owner_id: str, member_id: str
+) -> Optional[Dict[str, Any]]:
+    """从指定 agent 的 roster（成员管理表）中查找成员。"""
+    if not roster_owner_id or not member_id:
+        return None
+    owner = get_agent(user_id, roster_owner_id) or {}
+    owner_ws = owner.get("workspace_id") or roster_owner_id
+    roster_content = _read_workspace_file(owner_ws, ".self/team_roster.md")
+    members = _parse_roster_table(roster_content)
+    for m in members:
+        if m.get("id") == member_id:
+            return m
+    return None
+
+
+def _dispatch_agent_message(
+    user_id: str,
+    target_ids: Any,
+    content: str,
+    source_agent_id: str = "",
+    top_agent_id: str = "",
+    system_prompt: str = "",
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """统一消息发送 API：对本顶部 agent 旗下任意 agent_id 发送消息（一对多）。
+
+    User-Agent 与 Agent-Agent 消息都收敛到本入口（顶部 agent 走
+    ``_top_chat_broker``，团队成员走 ``_team_broker``），统一做：
+    - 团队隔离：仅允许发送给与本 agent 有关系的对象（上级 leader / 直属成员），
+      不同顶部 agent 旗下互不可见、不可达；
+    - update memory 锁：目标正处于记忆维护时拒绝投递；
+    - 目标解析：顶部 agent 经 agent_store 查询；成员经发送方 roster 解析。
+    """
+    if isinstance(target_ids, str):
+        target_ids = [target_ids]
+    if not target_ids or not content:
+        return {"error": "目标 ID 或消息内容不能为空"}
+
+    owner_top = top_agent_id or source_agent_id or ""
+    sent: List[str] = []
+    rejected: List[str] = []
+    for target_id in target_ids:
+        if not target_id or target_id == source_agent_id:
+            rejected.append(target_id)
+            continue
+        # update memory 锁：目标正在记忆更新时拒绝投递
+        if _is_memory_updating(user_id, target_id):
+            logger.warning("目标 %s 正在记忆更新，拒绝消息投递", target_id)
+            rejected.append(target_id)
+            continue
+
+        # 1) 目标为顶部 agent（agent_store 中可查）
+        target_agent = get_agent(user_id, target_id)
+        if target_agent is not None:
+            # 团队隔离：成员只能向自己的顶部 leader 发送（不允许跨顶部互发）
+            if source_agent_id and owner_top and target_id != owner_top:
+                rejected.append(target_id)
+                continue
+            payload = {
+                "user_id": user_id,
+                "agent_id": target_id,
+                "workspace_id": target_agent.get("workspace_id") or target_id,
+                "model_id": target_agent.get("model_id") or "",
+                "system_prompt": system_prompt,
+                "leader_id": "",
+                "top_agent_id": target_id,
+                "content": content,
+            }
+            if extra:
+                payload.update(extra)
+            dispatched = False
+            if _top_chat_broker is not None:
+                dispatched = _top_chat_broker.dispatch(
+                    (user_id, target_id), payload
+                )
+            if dispatched:
+                sent.append(target_id)
+            else:
+                rejected.append(target_id)
+            continue
+
+        # 2) 目标为成员：从发送方（或所属顶部 agent）roster 查找直属成员
+        member = _find_roster_member(
+            user_id, top_agent_id or source_agent_id, target_id
+        )
+        if member is None:
+            rejected.append(target_id)
+            continue
+        payload = {
+            "user_id": user_id,
+            "agent_id": target_id,
+            "workspace_id": member.get("workspace_id") or target_id,
+            "model_id": member.get("model_id") or "",
+            "system_prompt": member.get("system_prompt", "") or system_prompt,
+            "leader_id": source_agent_id or top_agent_id,
+            "top_agent_id": owner_top,
+            "content": content,
+        }
+        if extra:
+            payload.update(extra)
+        dispatched = False
+        if _team_broker is not None:
+            dispatched = _team_broker.dispatch((user_id, target_id), payload)
+        if dispatched:
+            sent.append(target_id)
+        else:
+            rejected.append(target_id)
+
+    if not sent:
+        return {"status": "error", "sent": sent, "rejected": rejected}
+    return {
+        "status": "sent" if not rejected else "partial",
+        "sent": sent,
+        "rejected": rejected,
+    }
+
+
 def _dispatch_user_message(user_id: str, data: Dict[str, Any]) -> None:
-    """投递顶部 agent 用户消息（checklist 7）。
+    """投递顶部 agent 用户消息（收敛到统一消息 API）。
 
     - agent idle：broker 立即新建 worker 消费消息，等价于直接发送。
-    - agent working：消息进入该 agent 的队列，在当前 tool_call 间隙切入，
-      插在工具结果之后供下一轮 LLM 处理。
+    - agent working：消息进入该 agent 的队列，在当前 tool_call 间隙切入。
+    - update memory 期间拒绝投递（记忆维护锁）。
     """
     agent_id = data.get("agent_id", "")
-    if not agent_id or _top_chat_broker is None:
-        # 兜底：无法路由时直接异步处理
+    if not agent_id:
         asyncio.create_task(_handle_user_message(user_id, data))
         return
-    payload = dict(data)
-    payload["user_id"] = user_id
-    _top_chat_broker.dispatch((user_id, agent_id), payload)
+    if _is_memory_updating(user_id, agent_id):
+        logger.warning("agent %s 正在记忆更新，拒绝用户消息投递", agent_id)
+        asyncio.create_task(_send_text_as_agent(
+            user_id, agent_id, "该 agent 正在执行记忆维护，请稍后再发送消息。"
+        ))
+        return
+    content = data.get("content", "") or ""
+    if not content and data.get("attachments"):
+        content = "[附件消息]"
+    result = _dispatch_agent_message(
+        user_id, [agent_id], content,
+        source_agent_id="",
+        top_agent_id=agent_id,
+        extra=dict(data),
+    )
+    if result.get("status") == "error":
+        asyncio.create_task(_handle_user_message(user_id, data))
 
 
 async def _handle_user_message(
@@ -1103,6 +1309,14 @@ async def _handle_user_message(
     """
     agent_id = data.get("agent_id", "")
     content = data.get("content", "")
+
+    # update memory 锁兜底：直连调用时同样拒绝（正常由 _dispatch_user_message 拦截）
+    if agent_id and _is_memory_updating(user_id, agent_id):
+        await _send_text_as_agent(
+            user_id, agent_id, "该 agent 正在执行记忆维护，请稍后再发送消息。"
+        )
+        await _send_status_idle(user_id, agent_id)
+        return
 
     if not agent_id or (not content and not data.get("attachments")):
         await _send_text_as_agent(user_id, agent_id or "unknown", "消息内容或 agent_id 不能为空")
@@ -1710,30 +1924,16 @@ async def send_teammate_message(
     if not content:
         return {"success": False, "error": "缺少 content"}
 
-    agent = get_agent(user_id, agent_id)
-    leader_ws = (agent.get("workspace_id") if agent else None) or agent_id
-    roster_content = _read_workspace_file(leader_ws, ".self/team_roster.md")
-    members = _parse_roster_table(roster_content)
-    member = next((m for m in members if m["id"] == member_id), None)
-    if member is None:
-        return {"success": False, "error": "成员不存在"}
-
-    if _team_broker is None:
-        return {"success": False, "error": "消息投递器未就绪"}
-
-    _team_broker.dispatch(
-        (user_id, member_id),
-        {
-            "user_id": user_id,
-            "agent_id": member_id,
-            "workspace_id": member_id,
-            "model_id": member.get("model_id", ""),
-            "system_prompt": member.get("system_prompt", ""),
-            "leader_id": agent_id,
-            "top_agent_id": agent_id,
-            "content": content,
-        },
+    # 收敛出口：统一消息 API（用户 -> 成员，走顶部 agent 的 roster 校验与投递）
+    result = _dispatch_agent_message(
+        user_id,
+        [member_id],
+        content,
+        source_agent_id="",
+        top_agent_id=agent_id,
     )
+    if result.get("status") == "error":
+        return {"success": False, "error": "消息投递失败", "detail": result}
     return {"success": True}
 
 
@@ -1815,8 +2015,38 @@ async def get_agent_budget(
     return {"agent_id": agent_id, **status}
 
 
+class _LifespanCancelFilter(logging.Filter):
+    """屏蔽 uvicorn 强制退出时 lifespan 任务被取消产生的噪音堆栈。
+
+    uvicorn 0.29+ 在 Windows 上 Ctrl+C 退出时会重抛捕获到的信号，导致
+    asyncio 清理阶段取消仍存活的 lifespan 任务；starlette 随后将这段
+    CancelledError 堆栈作为 lifespan.shutdown.failed 消息以 ERROR 级别打印。
+    这里仅抑制这类“任务被取消”的堆栈，其它真实异常不受影响。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno < logging.ERROR:
+            return True
+        msg = record.getMessage()
+        # 形式 1：starlette 把格式化后的取消堆栈作为消息（on.py send 分支）
+        if msg.startswith("Traceback (most recent call last):") and msg.strip().endswith("CancelledError"):
+            return False
+        # 形式 2：uvicorn 直接以 exc_info 记录 lifespan 协议异常（on.py main 分支）
+        if msg.startswith("Exception in 'lifespan' protocol") and record.exc_info:
+            if record.exc_info[0] is asyncio.CancelledError:
+                return False
+        return True
+
+
 if __name__ == "__main__":
     server_cfg = get_config().get("server", {})
     host = server_cfg.get("host", "0.0.0.0")
     port = int(server_cfg.get("port", 8000))
-    uvicorn.run(app, host=host, port=port)
+    # Windows 上 uvicorn 退出路径会触发上述 lifespan 取消噪音，预先挂上过滤器
+    logging.getLogger("uvicorn.error").addFilter(_LifespanCancelFilter())
+    try:
+        uvicorn.run(app, host=host, port=port)
+    except KeyboardInterrupt:
+        pass
+    except asyncio.CancelledError:
+        pass

@@ -1,7 +1,8 @@
-"""MCP 工具 - terminal：在工作空间内执行 shell 命令。
+"""内置 terminal 工具 - 在工作空间内执行 shell 命令。
 
-通过 :class:`core.workspace_io.WorkspaceIO` 在工作空间内执行任意 shell 命令
-（包括 git 命令），支持超时限制。
+通过 :class:`core.workspace_io.WorkspaceIO` 执行命令（云端容器 / 本地目录），
+避免经 MCP stdio 嵌套调用导致的解析错误。与 read/write/edit 工具同级，
+统一走 LLM 工具循环的 tool_call 执行通道。
 """
 
 import logging

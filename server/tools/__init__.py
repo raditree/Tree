@@ -12,11 +12,11 @@ from core.llm import AgentLLMSession
 from core.workspace_io import LocalWorkspaceIO
 from core.ws_manager import WebSocketManager
 from mcp_tools import document_server
-from mcp_tools.edit_tool import EditTool
 from mcp_tools.embed_search_tool import EmbedSearchTool
-from mcp_tools.read_tool import ReadTool
-from mcp_tools.terminal_tool import TerminalTool
-from mcp_tools.write_tool import WriteTool
+from tools.edit_tool import EditTool
+from tools.read_tool import ReadTool
+from tools.terminal_tool import TerminalTool
+from tools.write_tool import WriteTool
 from tools.ask_question_tool import AskUserQuestionTool
 from tools.help_tool import HelpTool
 from tools.mcp_tool import MCPManager, MCPTool
@@ -47,10 +47,7 @@ def _build_in_process_handler(
     不启动 stdio 子进程，所有 IO 通过反向 WS 到本地执行器。
     """
     tools: Dict[str, Any] = {
-        "read": ReadTool(io, workspace_id),
-        "write": WriteTool(io, workspace_id),
-        "edit": EditTool(io, workspace_id),
-        "terminal": TerminalTool(io, workspace_id),
+        # read/write/edit/terminal 已改为内置工具，不经过 MCP
         "embed_search": EmbedSearchTool(io, workspace_id),
     }
 
@@ -68,16 +65,8 @@ def _get_workspace_tool_defs() -> List[Dict[str, Any]]:
 
     用于本地模式进程内处理器的静态工具定义列表。
     """
-    from mcp_tools.read_tool import ReadTool
-    from mcp_tools.write_tool import WriteTool
-    from mcp_tools.edit_tool import EditTool
-    from mcp_tools.terminal_tool import TerminalTool
     from mcp_tools.embed_search_tool import EmbedSearchTool
     return [
-        ReadTool(None, "").get_tool_definition(),
-        WriteTool(None, "").get_tool_definition(),
-        EditTool(None, "").get_tool_definition(),
-        TerminalTool(None, "").get_tool_definition(),
         EmbedSearchTool(None, "").get_tool_definition(),
     ]
 
@@ -112,6 +101,7 @@ def register_builtin_tools(
     leader_id: str = "",
     top_agent_id: str = "",
     local_executor: Optional[Any] = None,
+    message_dispatcher: Optional[Callable] = None,
 ) -> None:
     """将内置工具注册到会话，并把工作空间基础工具注册为 MCP 服务。
 
@@ -142,6 +132,7 @@ def register_builtin_tools(
     # 本地模式按顶部 agent 单独控制：以 top_agent_id 为判定键（顶部 agent 自身
     # 会话 top_agent_id == agent_id；成员会话 top_agent_id 为其所属顶部 agent）。
     mode_key = top_agent_id or agent_id or user_id
+    io: Optional[Any] = None
     if local_executor is not None and local_executor.is_local(user_id, mode_key):
         # 本地模式：工作空间 IO 通过反向 WS 到前端本地执行器，本进程内调用
         from core.workspace_io import LocalWorkspaceIO
@@ -162,7 +153,9 @@ def register_builtin_tools(
             },
         )
     else:
-        # 云端模式：原有 stdio 子进程方式
+        # 云端模式：原有 stdio 子进程方式（terminal 改为内置工具，直接用 IO）
+        from core.workspace_io import CloudWorkspaceIO
+        io = CloudWorkspaceIO(docker_manager)
         mcp_manager.register_service(
             "workspace",
             {
@@ -185,9 +178,14 @@ def register_builtin_tools(
     set_tool = SetTool(session)
     refresh_tool = RefreshTool(mcp_manager)
     mcp_tool = MCPTool(mcp_manager)
+    read_tool = ReadTool(io, workspace_id)
+    write_tool = WriteTool(io, workspace_id)
+    edit_tool = EditTool(io, workspace_id)
+    terminal_tool = TerminalTool(io, workspace_id)
     team_tool = TeamTool(
         session, docker_manager, model_configs, broker=broker, user_id=user_id,
         agent_id=agent_id, leader_id=leader_id, top_agent_id=top_agent_id,
+        message_dispatcher=message_dispatcher,
     )
     ask_tool = AskUserQuestionTool(ws_manager=ws_manager, user_id=user_id)
     help_tool = HelpTool(
@@ -205,7 +203,9 @@ def register_builtin_tools(
 
     # 统一注册内置工具：handler 收集关键字参数后调用各工具的 execute(dict)。
     # redirect_output 由 _make_handler 统一拦截处理，不传入 execute。
-    for tool in (help_tool, set_tool, refresh_tool, mcp_tool, team_tool, ask_tool):
+    for tool in (help_tool, set_tool, refresh_tool, mcp_tool,
+                read_tool, write_tool, edit_tool, terminal_tool,
+                team_tool, ask_tool):
         definition = tool.get_tool_definition()
         # 给每个内置工具注入 redirect_output 可选参数
         params = definition["function"]["parameters"]

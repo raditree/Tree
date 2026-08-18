@@ -1,7 +1,7 @@
-"""MCP 工具 - read：读取工作空间内的文件内容。
+"""内置 read 工具 - 读取工作空间内的文件内容。
 
 通过 :class:`core.workspace_io.WorkspaceIO` 读取文件，云端/本地实现均可。
-文件路径需通过防注入校验。
+与 write / edit / terminal 同为内置工具，直接走 LLM 工具循环，不经 MCP。
 """
 
 import logging

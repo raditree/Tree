@@ -88,6 +88,30 @@ class WorkspaceIO(ABC):
                  exit_code 为 1；失败 ``{"error": ...}``
         """
 
+    @abstractmethod
+    def git_log(
+        self, workspace_id: str, limit: int = 50
+    ) -> Dict[str, Any]:
+        """查看工作空间 Git 提交历史（供 team 工具使用，统一双轨制）。
+
+        :param workspace_id: 工作空间标识
+        :param limit: 返回提交条数上限
+        :return: ``{"commits": [{"hash", "author", "date", "message"}, ...]}``
+                 或含 ``error`` 的字典
+        """
+
+    @abstractmethod
+    def list_files(
+        self, workspace_id: str, path: str = ""
+    ) -> Dict[str, Any]:
+        """列出工作空间内指定目录的文件（供 team 工具 view_member_output 使用）。
+
+        :param workspace_id: 工作空间标识
+        :param path: 相对工作空间根的目录路径，空串表示根目录
+        :return: ``{"files": [{"name", "size", "type", "modified"}, ...]}``
+                 或含 ``error`` 的字典
+        """
+
 
 class CloudWorkspaceIO(WorkspaceIO):
     """云端模式实现：基于 DockerManager 在容器内执行。"""
@@ -163,6 +187,64 @@ class CloudWorkspaceIO(WorkspaceIO):
         return self.docker_manager.exec_in_workspace(workspace_id, ["sh", "-c", grep_cmd])
 
 
+    def git_log(
+        self, workspace_id: str, limit: int = 50
+    ) -> Dict[str, Any]:
+        import shlex
+
+        cmd = (
+            "git log --pretty=format:%H%x09%an%x09%ad%x09%s --date=iso "
+            f"-n {int(limit)}"
+        )
+        result = self.docker_manager.exec_in_workspace(
+            workspace_id, ["sh", "-c", cmd]
+        )
+        commits = []
+        if not result.get("error") and result.get("exit_code") == 0:
+            for line in (result.get("stdout", "") or "").splitlines():
+                parts = line.split("\t", 3)
+                if len(parts) == 4:
+                    commits.append({
+                        "hash": parts[0],
+                        "author": parts[1],
+                        "date": parts[2],
+                        "message": parts[3],
+                    })
+        return {"commits": commits, "exit_code": result.get("exit_code", 0)}
+
+    def list_files(
+        self, workspace_id: str, path: str = ""
+    ) -> Dict[str, Any]:
+        import shlex
+
+        target = path.strip("/") if path else "."
+        cmd = f"ls -la {shlex.quote(target)}"
+        result = self.docker_manager.exec_in_workspace(
+            workspace_id, ["sh", "-c", cmd]
+        )
+        files = []
+        if not result.get("error") and result.get("exit_code") == 0:
+            for line in (result.get("stdout", "") or "").splitlines():
+                line = line.strip()
+                if not line or line.startswith("total"):
+                    continue
+                parts = line.split(None, 8)
+                if len(parts) >= 9:
+                    name = parts[8]
+                    is_dir = parts[0].startswith("d")
+                    try:
+                        size = int(parts[4])
+                    except ValueError:
+                        size = 0
+                    files.append({
+                        "name": name,
+                        "size": size,
+                        "type": "dir" if is_dir else "file",
+                        "modified": " ".join(parts[5:8]),
+                    })
+        return {"files": files, "exit_code": result.get("exit_code", 0)}
+
+
 class LocalWorkspaceIO(WorkspaceIO):
     """本地模式实现：通过反向 WebSocket 把请求转发给前端本地执行器。
 
@@ -231,3 +313,22 @@ class LocalWorkspaceIO(WorkspaceIO):
 
     def grep_search(self, workspace_id: str, pattern: str) -> Dict[str, Any]:
         return self._request(workspace_id, "grep_search", pattern=pattern)
+
+
+    def git_log(
+        self, workspace_id: str, limit: int = 50
+    ) -> Dict[str, Any]:
+        result = self._request(workspace_id, "git_log", limit=int(limit or 50))
+        return {
+            "commits": result.get("commits", []),
+            "exit_code": result.get("exit_code", 0),
+        }
+
+    def list_files(
+        self, workspace_id: str, path: str = ""
+    ) -> Dict[str, Any]:
+        result = self._request(workspace_id, "list_files", path=path or "")
+        return {
+            "files": result.get("files", []),
+            "exit_code": result.get("exit_code", 0),
+        }

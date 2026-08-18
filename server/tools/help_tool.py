@@ -331,7 +331,7 @@ class HelpTool:
             "- 成员管理：list_models / create_member / list_members / query_member "
             "/ update_member / query_status / view_member_output / view_member_log，"
             "以及多维评分（质量/效率/协作/准确性）。",
-            "- 消息管理：send_message（点对点）/ broadcast（广播）/ send_file（文件）。",
+            "- 消息管理：send_message（点对点/一对多）/ broadcast（广播）。",
             "- 任务管理：assign_task / query_tasks / wait_for，成员完成后经 Git 提交并汇报。"
             " wait_for 可等待一个或多个成员完成当前任务，支持 timeout 超时参数。",
         ]
@@ -428,7 +428,7 @@ class HelpTool:
         message = (
             "用户消息与团队成员消息通过消息投递器串行消费：你在工作中时，新消息会在"
             "工具调用间隙切入；空闲时立即处理。你（作为 leader）可通过 team 工具的 "
-            "send_message/broadcast/send_file/assign_task 向成员投递消息与任务，成员"
+            "send_message/broadcast/assign_task 向成员投递消息与任务，成员"
             "异步串行处理并在完成后通过 Git 提交与汇报回传结果（结果以摘要形式注入"
             "你的上下文，而非完整日志）。你也可以通过 ask_user_question 主动向用户"
             "提问并等待回答。跨 agent 的消息/文件经各自的沙箱边界与团队机制流转。"

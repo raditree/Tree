@@ -156,6 +156,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     // 清除回调，避免内存泄漏
     ApiService.onAuthError = null;
     WebSocketService.onAuthError = null;
+    // 清理本地执行器：注销后端注册并释放 WebSocket 引用
+    LocalExecutorService.instance.cleanup();
     super.dispose();
   }
 
@@ -174,7 +176,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.detached) {
-      // 应用退出时清理资源
+      // 应用退出时清理本地执行器（注销后端注册并释放 WebSocket 引用）
+      LocalExecutorService.instance.cleanup();
     }
   }
 
