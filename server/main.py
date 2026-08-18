@@ -766,6 +766,8 @@ async def _run_memory_update(
                 f"[{_clock_now()}] [memory] 上下文接近上限（{est} ≥ {limit} tokens），"
                 "跳过记忆维护以避免超长输入",
             )
+            # 释放本次加的 update memory 锁，否则该 agent 将永远无法再次进行记忆更新
+            _unlock_memory_update(user_id, agent_id)
             # 不发送 working：保持 updating_memory，由调用方随后发送 idle
             return
 
