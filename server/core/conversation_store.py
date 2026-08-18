@@ -75,6 +75,17 @@ def _ensure_db() -> None:
             conn.execute("ALTER TABLE messages ADD COLUMN tool_arguments TEXT")
         if "tool_result" not in cols:
             conn.execute("ALTER TABLE messages ADD COLUMN tool_result TEXT")
+        # 软删除标记列：NULL 表示未删除，非 NULL 表示已从前端清空的时间戳。
+        # 底层消息行始终保留（含 LLM CoT），方便后期审计。
+        if "deleted_at" not in cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN deleted_at INTEGER")
+        # agent_context 同样加软删除标记列
+        ctx_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(agent_context)").fetchall()
+        }
+        if "deleted_at" not in ctx_cols:
+            conn.execute("ALTER TABLE agent_context ADD COLUMN deleted_at INTEGER")
         # 预算设置表
         conn.execute(
             """
@@ -86,6 +97,27 @@ def _ensure_db() -> None:
                 PRIMARY KEY (user_id, agent_id)
             )
             """
+        )
+        # agent_context 归档表：compact / clear 等覆盖性操作发生前，
+        # 把当时的完整 LLM 上下文快照写入此表，用于后期审计（含 CoT）。
+        # 与 agent_context 的软删除不同：compact 不软删当前行，而是用
+        # summary 覆盖 self.context 后由 save_context UPSERT 写回，旧值
+        # 会丢失——故专门在此表留一份只增不改的历史快照。
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_context_archive (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                context TEXT NOT NULL,
+                archived_at INTEGER NOT NULL,
+                reason TEXT NOT NULL DEFAULT 'compact'
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ctx_archive_user_agent "
+            "ON agent_context_archive (user_id, agent_id, id)"
         )
         conn.commit()
     _initialized = True
@@ -156,7 +188,7 @@ def store_message(
 
 
 def get_history(user_id: str, agent_id: str) -> List[Dict[str, Any]]:
-    """拉取指定用户/agent 的对话历史，按 id 升序。"""
+    """拉取指定用户/agent 的对话历史（不含已软删除），按 id 升序。"""
     _ensure_db()
     conn = _connect()
     try:
@@ -165,7 +197,8 @@ def get_history(user_id: str, agent_id: str) -> List[Dict[str, Any]]:
             "SELECT msg_id, role, content, timestamp, usage, "
             "kind, tool_name, tool_arguments, tool_result "
             "FROM messages "
-            "WHERE user_id = ? AND agent_id = ? ORDER BY id ASC",
+            "WHERE user_id = ? AND agent_id = ? AND deleted_at IS NULL "
+            "ORDER BY id ASC",
             (user_id, agent_id),
         ).fetchall()
         result: List[Dict[str, Any]] = []
@@ -207,22 +240,30 @@ def get_history(user_id: str, agent_id: str) -> List[Dict[str, Any]]:
 
 
 def clear_history(user_id: str, agent_id: Optional[str] = None) -> int:
-    """清空指定用户/agent 的对话历史。
+    """软删除（标记 deleted_at）指定用户/agent 的对话历史。
+
+    底层消息行一律保留（含 LLM CoT），方便后期审计；前端
+    ``get_history`` 自动过滤已软删除的行。
 
     :param user_id: 用户标识
     :param agent_id: agent 标识，None 表示清空该用户所有 agent 的历史
-    :return: 被删除的消息条数
+    :return: 被软删除的消息条数
     """
     _ensure_db()
+    now = int(time.time() * 1000)
     with _write_lock, sqlite3.connect(_DB_PATH) as conn:
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
         if agent_id is None:
             cursor = conn.execute(
-                "DELETE FROM messages WHERE user_id = ?", (user_id,)
+                "UPDATE messages SET deleted_at = ? "
+                "WHERE user_id = ? AND deleted_at IS NULL",
+                (now, user_id),
             )
         else:
             cursor = conn.execute(
-                "DELETE FROM messages WHERE user_id = ? AND agent_id = ?",
-                (user_id, agent_id),
+                "UPDATE messages SET deleted_at = ? "
+                "WHERE user_id = ? AND agent_id = ? AND deleted_at IS NULL",
+                (now, user_id, agent_id),
             )
         deleted = cursor.rowcount
         conn.commit()
@@ -234,6 +275,9 @@ def save_context(
 ) -> None:
     """保存 LLM 会话上下文到 SQLite（upsert）。
 
+    新对话开始时调用：UPSERT 同时把 ``deleted_at`` 重置为 NULL，
+    使之前被 ``clear_context`` 软删除的行重新可见（live 状态）。
+
     :param context: LLM 上下文列表（OpenAI messages 格式），JSON 序列化存储
     """
     _ensure_db()
@@ -242,10 +286,11 @@ def save_context(
     with _write_lock, sqlite3.connect(_DB_PATH) as conn:
         conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
         conn.execute(
-            "INSERT INTO agent_context (user_id, agent_id, context, updated_at) "
-            "VALUES (?, ?, ?, ?) "
+            "INSERT INTO agent_context (user_id, agent_id, context, updated_at, deleted_at) "
+            "VALUES (?, ?, ?, ?, NULL) "
             "ON CONFLICT(user_id, agent_id) DO UPDATE SET "
-            "context = excluded.context, updated_at = excluded.updated_at",
+            "context = excluded.context, updated_at = excluded.updated_at, "
+            "deleted_at = NULL",
             (user_id, agent_id, context_json, ts),
         )
         conn.commit()
@@ -254,13 +299,13 @@ def save_context(
 def load_context(
     user_id: str, agent_id: str
 ) -> Optional[List[Dict[str, Any]]]:
-    """从 SQLite 加载 LLM 会话上下文；不存在或解析失败时返回 None。"""
+    """从 SQLite 加载 LLM 会话上下文；不存在/已软删除/解析失败时返回 None。"""
     _ensure_db()
     conn = _connect()
     try:
         row = conn.execute(
             "SELECT context FROM agent_context "
-            "WHERE user_id = ? AND agent_id = ?",
+            "WHERE user_id = ? AND agent_id = ? AND deleted_at IS NULL",
             (user_id, agent_id),
         ).fetchone()
         if not row or not row[0]:
@@ -275,19 +320,91 @@ def load_context(
 
 
 def clear_context(user_id: str, agent_id: Optional[str] = None) -> None:
-    """清空指定用户/agent 的会话上下文；agent_id 为 None 时清空该用户全部。"""
+    """软删除（标记 deleted_at）指定用户/agent 的会话上下文。
+
+    底层 ``agent_context`` 行一律保留（含完整 LLM 上下文 / CoT），
+    方便后期审计；``load_context`` 自动过滤已软删除的行。
+    """
     _ensure_db()
+    now = int(time.time() * 1000)
     with _write_lock, sqlite3.connect(_DB_PATH) as conn:
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
         if agent_id is None:
             conn.execute(
-                "DELETE FROM agent_context WHERE user_id = ?", (user_id,)
+                "UPDATE agent_context SET deleted_at = ? "
+                "WHERE user_id = ? AND deleted_at IS NULL",
+                (now, user_id),
             )
         else:
             conn.execute(
-                "DELETE FROM agent_context WHERE user_id = ? AND agent_id = ?",
-                (user_id, agent_id),
+                "UPDATE agent_context SET deleted_at = ? "
+                "WHERE user_id = ? AND agent_id = ? AND deleted_at IS NULL",
+                (now, user_id, agent_id),
             )
         conn.commit()
+
+
+def archive_context(
+    user_id: str,
+    agent_id: str,
+    context: List[Dict[str, Any]],
+    reason: str = "compact",
+) -> None:
+    """归档一份完整的 LLM 上下文快照（只增不改），用于后期审计。
+
+    在 compact 等覆盖性操作替换 ``session.context`` 前调用：把当时的
+    完整上下文（含 system / user / assistant / tool 消息与 CoT）写入
+    ``agent_context_archive`` 表。该表与 ``agent_context`` 不同——后者
+    是 live 状态（被 UPSERT 覆盖、被软删除标记），前者是只增的历史快照。
+
+    :param context: LLM 上下文列表（OpenAI messages 格式）
+    :param reason: 归档原因，如 ``"compact"`` / ``"auto_compress"``
+    """
+    _ensure_db()
+    context_json = json.dumps(context, ensure_ascii=False)
+    ts = int(time.time() * 1000)
+    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+        conn.execute(
+            "INSERT INTO agent_context_archive "
+            "(user_id, agent_id, context, archived_at, reason) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, agent_id, context_json, ts, reason),
+        )
+        conn.commit()
+
+
+def list_archived_contexts(
+    user_id: str, agent_id: str
+) -> List[Dict[str, Any]]:
+    """拉取指定 agent 的全部归档上下文快照，按时间升序（审计查询用）。"""
+    _ensure_db()
+    conn = _connect()
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, context, archived_at, reason "
+            "FROM agent_context_archive "
+            "WHERE user_id = ? AND agent_id = ? ORDER BY id ASC",
+            (user_id, agent_id),
+        ).fetchall()
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                data = json.loads(row["context"])
+            except (ValueError, TypeError):
+                data = None
+            result.append(
+                {
+                    "id": row["id"],
+                    "context": data,
+                    "archived_at": row["archived_at"],
+                    "reason": row["reason"],
+                }
+            )
+        return result
+    finally:
+        conn.close()
 
 
 # ------------------------------------------------------------------

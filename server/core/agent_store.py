@@ -46,6 +46,8 @@ def _ensure_db() -> None:
         )
         # 迁移：为已存在的 agents 表补充 workspace_id 列并回填
         _migrate_add_workspace_id(conn)
+        # 迁移：补充 deleted_at 列（软删除标记，NULL 表示未删除）
+        _migrate_add_deleted_at(conn)
         conn.commit()
     _initialized = True
 
@@ -64,6 +66,17 @@ def _migrate_add_workspace_id(conn: sqlite3.Connection) -> None:
         conn.execute(
             "UPDATE agents SET workspace_id = id WHERE workspace_id = ''"
         )
+
+
+def _migrate_add_deleted_at(conn: sqlite3.Connection) -> None:
+    """为 agents 表增加 deleted_at 列（若缺失）。
+
+    软删除标记：NULL 表示未删除，非 NULL 表示已从前端删除的时间戳。
+    底层数据（messages / agent_context）始终保留，方便后期审计。
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(agents)")}
+    if "deleted_at" not in cols:
+        conn.execute("ALTER TABLE agents ADD COLUMN deleted_at INTEGER")
 
 
 def _connect():
@@ -114,14 +127,15 @@ def create_agent(
 
 
 def get_agents(user_id: str) -> List[Dict[str, Any]]:
-    """拉取指定用户的全部 agent，按创建时间升序。"""
+    """拉取指定用户的全部 agent（不含已软删除），按创建时间升序。"""
     _ensure_db()
     conn = _connect()
     try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT id, name, model_id, system_prompt, created_at, workspace_id "
-            "FROM agents WHERE user_id = ? ORDER BY created_at ASC",
+            "FROM agents WHERE user_id = ? AND deleted_at IS NULL "
+            "ORDER BY created_at ASC",
             (user_id,),
         ).fetchall()
         return [dict(row) for row in rows]
@@ -130,14 +144,14 @@ def get_agents(user_id: str) -> List[Dict[str, Any]]:
 
 
 def get_agent(user_id: str, agent_id: str) -> Optional[Dict[str, Any]]:
-    """按 id 获取指定用户的单个 agent，不存在返回 None。"""
+    """按 id 获取指定用户的单个 agent（已软删除返回 None）。"""
     _ensure_db()
     conn = _connect()
     try:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT id, name, model_id, system_prompt, created_at, workspace_id "
-            "FROM agents WHERE user_id = ? AND id = ?",
+            "FROM agents WHERE user_id = ? AND id = ? AND deleted_at IS NULL",
             (user_id, agent_id),
         ).fetchone()
         return dict(row) if row else None
@@ -146,21 +160,22 @@ def get_agent(user_id: str, agent_id: str) -> Optional[Dict[str, Any]]:
 
 
 def delete_agent(user_id: str, agent_id: str) -> bool:
-    """删除指定 agent，并级联删除其对话历史。
+    """软删除指定 agent（标记 deleted_at），保留其对话历史与 LLM 上下文。
 
-    :return: 是否存在被删除的 agent
+    前端列表/查询自动过滤已删除 agent，但底层 messages / agent_context
+    行一律保留（含 LLM CoT），方便后期审计。彻底清理只能由
+    ``user_store.purge_expired_users`` 在用户注销保留期满后触发。
+
+    :return: 是否存在被软删除的 agent
     """
     _ensure_db()
+    now = int(time.time() * 1000)
     with _write_lock, sqlite3.connect(_DB_PATH) as conn:
         conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
         cursor = conn.execute(
-            "DELETE FROM agents WHERE user_id = ? AND id = ?",
-            (user_id, agent_id),
-        )
-        # 级联删除该 agent 的对话记录
-        conn.execute(
-            "DELETE FROM messages WHERE user_id = ? AND agent_id = ?",
-            (user_id, agent_id),
+            "UPDATE agents SET deleted_at = ? "
+            "WHERE user_id = ? AND id = ? AND deleted_at IS NULL",
+            (now, user_id, agent_id),
         )
         conn.commit()
         return cursor.rowcount > 0

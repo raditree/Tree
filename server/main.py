@@ -35,6 +35,7 @@ from core.budget import (
 from core.config import get_config
 from core.conversation_store import (
     clear_history,
+    clear_context,
     get_history,
     load_context,
     save_context,
@@ -1947,13 +1948,33 @@ async def delete_conversation(
     agent_id: str,
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """清空指定 agent 的对话历史。
+    """软删除指定 agent 的对话历史（``agent_id == "all"`` 时清空该用户全部）。
 
-    ``agent_id`` 为 ``all`` 时清空该用户所有 agent 的历史。
+    软删除（标记 ``deleted_at``）三处数据，底层一律保留用于后期审计
+    （含 LLM CoT / 完整上下文）：
+
+    - ``messages``：对话消息（用户提问 + agent 回复 + 工具卡片）
+    - ``agent_context``：LLM 持久化上下文（OpenAI messages 格式）
+    - 内存会话缓存：使下次发消息重建会话（live 状态重置）
+
+    彻底清理只能由 ``user_store.purge_expired_users`` 在用户注销保留期满后触发。
     """
     user_id = current_user.get("openid", "")
     target = None if agent_id == "all" else agent_id
     deleted = clear_history(user_id, target)
+    # 同步软删除 LLM 上下文：否则清空后 agent 仍持有旧上下文，
+    # 下次发消息会引用已软删除的历史消息，破坏"会话已重置"语义
+    if target is None:
+        clear_context(user_id, None)
+        # 清空该用户全部内存会话缓存
+        # （clear_user_agent 按 (user_id, agent_id) 清理，此处逐 agent 处理）
+        from core.agent_store import get_agents
+
+        for agent in get_agents(user_id):
+            clear_user_agent(user_id, agent["id"])
+    else:
+        clear_context(user_id, target)
+        clear_user_agent(user_id, target)
     return {"success": True, "deleted": deleted}
 
 

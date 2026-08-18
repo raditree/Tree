@@ -767,6 +767,19 @@ class AgentLLMSession:
         summary_text = self._summarize_with_llm(to_summarize)
         summary_msg = {"role": "system", "content": summary_text}
 
+        # 在覆盖 self.context 前，归档一份完整的 pre-compact 上下文快照，
+        # 供后期审计（含 LLM CoT / 工具调用轨迹原文）。回调由 main.py 注入，
+        # 未注入时（如单测）静默跳过。reason 区分手动 compact 与自动压缩。
+        archiver = getattr(self, "archive_context_callback", None)
+        if archiver is not None:
+            try:
+                archiver(
+                    list(self.context),
+                    "compact" if force else "auto_compress",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("归档 pre-compact 上下文失败(已忽略): %s", exc)
+
         # 重组上下文：system 消息 + 总结 + 常驻 help 块 + 保留的最近用户要求及其后消息
         self.context = system_msgs + [summary_msg] + kept_help + to_keep
 

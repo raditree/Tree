@@ -8,6 +8,7 @@ import sys
 from typing import Any, Callable, Dict, List, Optional
 
 from core.docker_manager import DockerManager
+from core.conversation_store import archive_context
 from core.llm import AgentLLMSession
 from core.workspace_io import LocalWorkspaceIO
 from core.ws_manager import WebSocketManager
@@ -226,6 +227,20 @@ def register_builtin_tools(
             ]
         # 挂到 session 上，llm.compress 通过 getattr 读取
         session.help_refresh_callback = _refresh_help_block
+
+    # 绑定 compact 时的上下文归档回调：llm.compress 替换 self.context 前，
+    # 把完整 pre-compact 上下文快照写入 agent_context_archive 表，用于后期
+    # 审计（含 LLM CoT / 工具调用轨迹原文）。未注入时压缩静默跳过归档。
+    # 用默认参数按值捕获 user_id/agent_id，避免闭包延迟绑定的潜在歧义。
+    if user_id and agent_id:
+        def _archive_ctx(
+            ctx: list,
+            reason: str = "compact",
+            _u: str = user_id,
+            _a: str = agent_id,
+        ) -> None:
+            archive_context(_u, _a, ctx, reason)
+        session.archive_context_callback = _archive_ctx
 
     # 统一注册内置工具：handler 收集关键字参数后调用各工具的 execute(dict)。
     # redirect_output 由 _make_handler 统一拦截处理，不传入 execute。
