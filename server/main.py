@@ -4,6 +4,7 @@
 """
 import asyncio
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -103,7 +104,7 @@ def _store_message(
 
 async def _register_tools(
     session: AgentLLMSession, agent_id: str, user_id: str = "",
-    leader_id: str = "", top_agent_id: str = "",
+    leader_id: str = "", top_agent_id: str = "", member_system_prompt: str = "",
 ) -> None:
     """给会话注册内置工具（help / team / set / mcp / refresh）。
 
@@ -113,6 +114,20 @@ async def _register_tools(
     mcp_config = (
         app.state.config.get("mcp") if hasattr(app.state, "config") else None
     )
+    workspace_id = getattr(session, "workspace_id", "") or ""
+
+    # help 的 workspace_extra_info 刷新回调：每次 help 执行 / compact 刷新时
+    # 现读现算（identity/rule/memory.md 均为最新），避免会话构造时的一次性
+    # 快照长期过期（memory.md 每次记忆维护都会更新）。
+    def _extra_info_refresher() -> dict:
+        return _build_workspace_extra_info(
+            workspace_id,
+            member_system_prompt=member_system_prompt,
+            user_id=user_id,
+            agent_id=top_agent_id or agent_id,
+            local_executor=_local_executor,
+        )
+
     register_builtin_tools(
         session,
         docker_manager=_docker_manager,
@@ -126,6 +141,7 @@ async def _register_tools(
         top_agent_id=top_agent_id,
         local_executor=_local_executor,
         message_dispatcher=_dispatch_agent_message,
+        extra_info_refresher=_extra_info_refresher,
     )
 
 
@@ -318,9 +334,120 @@ async def _send_budget_update_ws(
     )
 
 
+def _build_exec_mode_text(
+    workspace_id: str,
+    user_id: str = "",
+    agent_id: str = "",
+    local_executor: Any = None,
+) -> str:
+    """构建执行模式说明文本（本地 vs 云端沙箱），供 help 工具透出。
+
+    本地模式：工作目录 = base_dir，私人空间 .self 在 base_dir/workspaces/{id}/.self，
+    团队共享 base_dir（成员与 leader 直接读写文件协作）。
+    云端模式：工作空间在 Docker 容器，工具读写经容器路径。
+    """
+    mode_key = agent_id or user_id or ""
+    is_local = False
+    base_dir = ""
+    if local_executor is not None and mode_key:
+        try:
+            is_local = bool(local_executor.is_local(user_id, mode_key))
+        except Exception:  # noqa: BLE001
+            is_local = False
+        if is_local:
+            try:
+                reg = getattr(local_executor, "_users", {}) or {}
+                base_dir = ((reg.get(user_id) or {}).get(mode_key) or "") or ""
+            except Exception:  # noqa: BLE001
+                base_dir = ""
+    if is_local:
+        ws_self = f"{base_dir}/workspaces/{workspace_id}/.self"
+        return (
+            f"执行模式：本地（工作目录 {base_dir or '<用户选择目录>'}"
+            f"；你的私人空间 .self 位于 {ws_self}；"
+            f"团队共享工作目录 {base_dir or '<用户选择目录>'}"
+            "，成员与 leader 直接在此读写文件协作，无需跨沙箱）"
+        )
+    return (
+        f"执行模式：云端沙箱（工作空间 {workspace_id} 位于 Docker 容器，"
+        "工具读写经容器路径，工作文件与私人空间 .self 都在容器内）"
+    )
+
+
+# .self 文档（memory.md / rule.md）注入大小上限（字符数）：未超限时全量注入
+# help 的 workspace_extra_info，超限时经 LLM 压缩为摘要再注入，控制 help 输出
+# 体积与 token 成本。
+_SELF_DOC_INJECT_LIMIT = 4096
+# .self 文档压缩结果缓存：doc_key -> (内容指纹, 压缩文本)。
+# 文档未变化时直接复用缓存，避免重复触发 LLM 压缩。
+_self_doc_compress_cache: Dict[str, Tuple[str, str]] = {}
+
+
+def _compress_self_doc(workspace_id: str, doc_key: str, text: str,
+                       kind: str = "记忆档案") -> str:
+    """.self 文档（memory.md / rule.md）超过注入上限时压缩为中文摘要。
+
+    优先调用 LLM 压缩（复用默认模型配置，失败回退）；回退方案为保头保尾截断。
+    带指纹缓存：文档内容未变化时直接返回缓存结果。
+
+    :param workspace_id: 工作空间标识
+    :param doc_key: 文档标识（如 "memory.md" / "rule.md"），用于缓存区分
+    :param text: 文档全文
+    :param kind: 文档种类名（用于压缩提示词，如 记忆档案 / 工作准则）
+    """
+    cache_key = f"{workspace_id}:{doc_key}"
+    digest = hashlib.md5(text.encode("utf-8")).hexdigest()
+    cached = _self_doc_compress_cache.get(cache_key)
+    if cached and cached[0] == digest:
+        return cached[1]
+
+    compressed = ""
+    try:
+        from core.llm import LLMClientFactory
+
+        model_id = next(iter(_model_configs), "")
+        cfg = _model_configs.get(model_id) if model_id else None
+        if cfg is not None:
+            client = LLMClientFactory.create_client(cfg)
+            resp = client.chat.completions.create(
+                model=cfg.api_model_id or cfg.model_id,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"你是文档压缩器。以下是一份 agent 的{kind}文档（{doc_key}），"
+                        f"共 {len(text)} 字，超过单次注入上限。"
+                        "请压缩成 4000 字以内的中文摘要，保留：任务目标与最新要求、"
+                        "关键决策、遇到的问题及解决方案、重要结论、待办事项。"
+                        "不要逐条复述原文，保留必要事实（文件名、路径、数字、结论）。\n\n"
+                        f"文档内容：\n{text[:12000]}"
+                    ),
+                }],
+                temperature=0.2,
+                max_tokens=1024,
+            )
+            if resp.choices:
+                compressed = (resp.choices[0].message.content or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("%s 压缩失败(%s)，回退截断: %s", doc_key, workspace_id, exc)
+        compressed = ""
+
+    if not compressed:
+        # 回退方案：保留头部与尾部，中间省略（保留最新轮次与最早基线）
+        compressed = (
+            text[:1800].rstrip()
+            + "\n\n...[文档超长已截断，省略中间内容]...\n\n"
+            + text[-1600:].lstrip()
+        )
+    _self_doc_compress_cache[cache_key] = (digest, compressed)
+    return compressed
+
+
 def _build_workspace_extra_info(
     workspace_id: str,
     member_system_prompt: str = "",
+    user_id: str = "",
+    agent_id: str = "",
+    local_executor: Any = None,
 ) -> dict:
     """构建工作空间额外信息，供 help 工具使用。
 
@@ -335,6 +462,15 @@ def _build_workspace_extra_info(
     """
     info: Dict[str, Any] = {}
 
+    # 执行模式（本地 vs 云端沙箱）：让 agent 无需猜测自己的工作环境。
+    # 本地执行器按顶部 agent 注册（mode_key=top_agent_id；顶部 agent 自身即 agent_id）。
+    exec_mode = _build_exec_mode_text(
+        workspace_id, user_id=user_id, agent_id=agent_id,
+        local_executor=local_executor,
+    )
+    if exec_mode:
+        info["exec_mode"] = exec_mode
+
     # 身份信息（checklist 6(c)）
     identity = _read_workspace_file(workspace_id, ".self/identity.md").strip()
     if identity:
@@ -346,12 +482,30 @@ def _build_workspace_extra_info(
     if member_system_prompt:
         info["member_system_prompt"] = member_system_prompt
 
-    # rule.md 注入（checklist 9/10）
+    # rule.md 注入（checklist 9/10）：同样设 4k 大小上限，超限压缩
     rule = _read_workspace_file(workspace_id, ".self/rule.md").strip()
     if rule:
-        info["rule"] = rule
+        if len(rule) <= _SELF_DOC_INJECT_LIMIT:
+            info["rule"] = rule
+        else:
+            info["rule"] = _compress_self_doc(
+                workspace_id, "rule.md", rule, "工作准则"
+            )
     else:
         info["rule"] = "请维护 .self/rule.md 记录你的工作准则。如果你是 team leader，请提醒每一位 teammate 维护各自的 rule.md。"
+
+    # memory.md 注入：全量优先，超过大小上限时压缩为摘要后再注入。
+    # memory.md 每次记忆维护都会更新（_run_memory_update），所以不能依赖
+    # 会话构造时的一次性快照——compact 触发上下文重构时通过 help 刷新回调
+    # 现读现算（见 tools/__init__.py 的 help_refresh_callback）。
+    memory = _read_workspace_file(workspace_id, ".self/memory.md").strip()
+    if memory:
+        if len(memory) <= _SELF_DOC_INJECT_LIMIT:
+            info["memory"] = memory
+        else:
+            info["memory"] = _compress_self_doc(
+                workspace_id, "memory.md", memory, "记忆档案"
+            )
 
     # 存储软上限告警（checklist 15）
     try:
@@ -1002,7 +1156,9 @@ async def _process_member_message(
         workspace_id, member_system_prompt=member_system_prompt
     )
     extra_info = _build_workspace_extra_info(
-        workspace_id, member_system_prompt=member_system_prompt
+        workspace_id, member_system_prompt=member_system_prompt,
+        user_id=user_id, agent_id=top_agent_id or agent_id,
+        local_executor=_local_executor,
     )
     session = get_session(user_id, agent_id)
     if session is None:
@@ -1027,7 +1183,8 @@ async def _process_member_message(
             set_session(user_id, agent_id, session)
             await _register_tools(session, agent_id, user_id,
                                   leader_id=leader_id,
-                                  top_agent_id=top_agent_id)
+                                  top_agent_id=top_agent_id,
+                                  member_system_prompt=member_system_prompt)
             restored = load_context(user_id, agent_id)
             if restored:
                 session.context = restored
@@ -1037,7 +1194,8 @@ async def _process_member_message(
     if model_config.is_limitless_context:
         await _register_tools(session, agent_id, user_id,
                               leader_id=leader_id,
-                              top_agent_id=top_agent_id)
+                              top_agent_id=top_agent_id,
+                              member_system_prompt=member_system_prompt)
 
     _append_activity_log(
         workspace_id,
@@ -1382,7 +1540,10 @@ async def _handle_user_message(
     try:
         # 系统提示词仅保留基础指令，详细说明转移到 help 工具的 workspace_extra_info
         enhanced_prompt = _build_agent_system_prompt(workspace_id)
-        extra_info = _build_workspace_extra_info(workspace_id)
+        extra_info = _build_workspace_extra_info(
+            workspace_id, user_id=user_id, agent_id=agent_id,
+            local_executor=_local_executor,
+        )
         if model_config.is_limitless_context:
             session = LimitlessContextSession(
                 model_config=model_config,

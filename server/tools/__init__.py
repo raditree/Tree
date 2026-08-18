@@ -102,6 +102,7 @@ def register_builtin_tools(
     top_agent_id: str = "",
     local_executor: Optional[Any] = None,
     message_dispatcher: Optional[Callable] = None,
+    extra_info_refresher: Optional[Callable[[], dict]] = None,
 ) -> None:
     """将内置工具注册到会话，并把工作空间基础工具注册为 MCP 服务。
 
@@ -185,7 +186,7 @@ def register_builtin_tools(
     team_tool = TeamTool(
         session, docker_manager, model_configs, broker=broker, user_id=user_id,
         agent_id=agent_id, leader_id=leader_id, top_agent_id=top_agent_id,
-        message_dispatcher=message_dispatcher,
+        message_dispatcher=message_dispatcher, io=io,
     )
     ask_tool = AskUserQuestionTool(ws_manager=ws_manager, user_id=user_id)
     help_tool = HelpTool(
@@ -194,12 +195,37 @@ def register_builtin_tools(
         session=session,
         team_tool=team_tool,
         workspace_extra_info=getattr(session, "workspace_extra_info", None),
+        refresh_extra_info=extra_info_refresher,
     )
     # 绑定主事件循环，供 AskUserQuestion 在消费线程内安全推送 WS 消息
     try:
         ask_tool.bind_loop(asyncio.get_running_loop())
     except RuntimeError:
         pass
+
+    # 绑定 compact 时的 help 刷新回调：compact 触发上下文重构时（llm.compress），
+    # 用最新 workspace_extra_info（memory/rule 更新后）重新渲染 help 块，替换
+    # 常驻的 kept_help。返回新的 assistant(tool_call=help) + tool(result) 消息对，
+    # 保证 OpenAI tool_call 配对约束。无回调时压缩保留旧块。
+    if extra_info_refresher is not None:
+        def _refresh_help_block() -> list[dict]:
+            content = help_tool.render_fresh_content()
+            import uuid
+            tid = f"help_{uuid.uuid4().hex[:10]}"
+            return [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": tid,
+                        "type": "function",
+                        "function": {"name": "help", "arguments": "{}"},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": tid, "content": content},
+            ]
+        # 挂到 session 上，llm.compress 通过 getattr 读取
+        session.help_refresh_callback = _refresh_help_block
 
     # 统一注册内置工具：handler 收集关键字参数后调用各工具的 execute(dict)。
     # redirect_output 由 _make_handler 统一拦截处理，不传入 execute。

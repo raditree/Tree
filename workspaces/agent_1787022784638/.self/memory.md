@@ -63,7 +63,6 @@
 - 诊断脚本已清理（tmp/ 下临时脚本已删）。
 - 注意：本 agent 私人空间为 `workspaces/agent_1787022784638/.self`（本地模式），与 `workspaces/agent_1787008529546`（团队 Leader 的私人空间）不同。
 
-
 ### 2026-08-18 · 第三轮：team 工具改造实施（8 项需求落地 + 状态机修正）
 
 **任务目标**：将前两轮诊断结论落地为实际改造，按用户 8 项需求实施：
@@ -80,7 +79,6 @@
 - **统一消息 API**：新增 main._dispatch_agent_message(user_id, target_ids, content, source_agent_id, top_agent_id, system_prompt, extra)。用户消息（_dispatch_user_message）、teammates 路由（send_teammate_message）、team 工具 send_message/broadcast 全部收敛到此出口；target_ids 支持字符串或列表（原生一对多）；顶部 agent 走 _top_chat_broker、成员走 _team_broker；跨顶部 agent 隔离（仅上级 leader/直属成员/同旗下成员可达）；入口统一做 _is_memory_updating 锁检查。
 - **memory 门控与锁**：conversation_store 新增 agent_tool_count 表（(user_id, agent_id) 主键，各 agent 隔离），get/increment/reset_tool_count；_run_memory_update 入口检查计数达到 7 才触发；_memory_updating 集合 + _lock/_unlock/_is_memory_updating；_stream_agent_reply 每次 tool_call 递增（silent 模式不计）。
 - **terminal 内置化**：新建 server/tools/terminal_tool.py（基于 WorkspaceIO，云端容器/本地目录统一），从 mcp_tools/server.py、本地 handler、tool_defs 移除 terminal 暴露。
-
 - **list_members 分组**：_action_list_members 返回 groups: {team_leader, teammates, team_member}，新增 _lookup_agent_by_id（agent_store）与 _load_roster_of（读上级 roster）。
 - **send_file 取消**：从工具 enum 与 dispatch 移除；方法保留但直接返回已取消（共享工作目录）。
 - **成员回复回传 leader**：_process_member_message 完成后把 full_reply 经统一消息 API 回传 leader_id（前缀 [成员 xxx 完成回复]）。
@@ -103,3 +101,226 @@
 - 修改文件：server/main.py、server/tools/{team_tool,terminal_tool,__init__,help_tool}.py、server/core/{workspace_io,conversation_store}.py、server/mcp_tools/server.py。
 - 改造记录：docs/team_tool_refactor.md。
 - 临时脚本已清理（tmp/*.py）。
+
+### 2026-08-18 · 第四轮：工作空间基础工具全部内置化（read/write/edit/terminal）
+
+**任务目标**：用户要求把 write/edit/read 也改为内置 tool（第三轮已完成 terminal 内置化），彻底消除 MCP stdio 嵌套解析错误。
+
+**关键决策与实现**：
+- 新建 server/tools/read_tool.py / write_tool.py / edit_tool.py（内容与旧 mcp_tools 版一致，均基于 WorkspaceIO；edit 复用内置 read/write）。
+- tools/__init__.py：import 改内置版本；本地 in-process handler 与 tool_defs 仅保留 embed_search；注册循环加入 read/write/edit/terminal 四个内置工具（顺序：help, set, refresh, mcp, read, write, edit, terminal, team, ask_user_question）。
+- mcp_tools/server.py：workspace stdio server 仅保留 embed_search（docstring 已更新）。
+- 删除旧文件：mcp_tools/read_tool.py / write_tool.py / edit_tool.py / terminal_tool.py（全量扫描确认无残留引用）。
+
+**遇到的问题及解决方案**：
+- 旧 mcp_tools/edit_tool.py 内部自引用 read/write（仅自身引用，无外部依赖）→ 确认可安全删除。
+- 写入大文件偶发 file_path 不能为空 → 拆小步骤 + 重试（沿用第三轮经验）。
+
+**重要结论**：
+- 四个工作空间基础工具与 LLM 工具循环同进程直连，彻底消除 MCP stdio 子进程嵌套解析错误。
+- WorkspaceIO 抽象保证云端容器 / 本地目录双轨行为一致；mcp/refresh 工具保留用于接入第三方 MCP 服务。
+- 双轨制遗留：team_tool 内部 roster/日志仍直调 docker_manager（尚未迁移到 WorkspaceIO），留待后续迭代。
+
+**验证**：
+- import main OK；8 文件 ast.parse 通过；工具注册列表实测含 read/write/edit/terminal；
+- 功能实测（stub WorkspaceIO）：read 读取、write 写入、edit 精确替换+唯一性校验、terminal 执行全部通过。
+- 修改文件：server/tools/{read_tool,write_tool,edit_tool}.py（新增）、server/tools/__init__.py、server/mcp_tools/server.py；删除 mcp_tools 下 4 个旧工具文件。
+- 文档已更新：docs/team_tool_refactor.md（第 3 节改为“工作空间工具全部内置化”）。
+
+### 2026-08-18 · 第五轮：系统重启后自由体验新架构（实测验证）
+
+**任务目标**：系统重启后，用户要求自由体验新架构（前四轮改造已全部落地）。
+
+**实测验证结果（全部通过）**：
+1. **工具内置化生效**：`refresh` 后 MCP 工具列表从 12 项收敛为 **8 项**（仅 embed_search + 7 个文档工具）；read/write/edit/terminal 已在 LLM 工具循环内直接可用，全程无 MCP 嵌套解析错误。
+2. **memory 门控落盘运转**：`agent_tool_count` 表存在；本轮计数从 8 → 25 → **29**（每次工具调用实时递增，silent 模式不计）；**记忆维护闭环已实际运转过一次**——memory.md 上次更新于 12:48:44（第四轮总结），说明第三轮“触发→更新→清零→重新累积”链路在真实运行中验证通过。
+3. **list_members 分组生效**：返回 `groups: {team_leader, teammates, team_member}` 结构；独立顶部 agent 三组皆空，符合隔离预期。
+4. **send_file 取消生效**：team 工具 action 列表已无 send_file。
+5. **跨团队隔离生效**：向 leader（agent_1787008529546）的成员 member_1787016828_x3clpa 发消息 → `rejected`（无关系 agent 不可达）。
+6. **工作空间双轨一致**：本地 `workspaces/` 下 agent_1787022784638（我）与 3 名成员 .self 独立；各成员 memory.md 记录各自任务，健康。
+7. **后端重启正常**：端口 8000 监听；6 个 agents 记录完好。
+
+**附带发现（非本次改造问题，双轨制遗留）**：
+- 团队 Leader `agent_1787008529546` 的 `.self` 下**缺少 team_roster.md**（只有 identity/memory/rule），但其 identity.md 声称已组建 3 名成员（member_1787016828_x3clpa / 7xql6q / ij3yml）。疑似双轨制遗留：roster 曾写入 Docker 容器路径而非本地 workspaces；或 leader 会话重建 TeamTool 后 roster 尚未重建。成员 workspace 与 memory 均存在。**后续迭代候选：team_tool 内部 roster/日志访问从 docker_manager 直调迁移到 WorkspaceIO（统一双轨制）**。
+
+**验证方法沉淀**：
+- `refresh` + `mcp(help)` 看工具列表数量：12→8 即可快速确认内置化改造是否生效（低成本回归验证手段）。
+- `sqlite3 server/data/conversations.db "SELECT * FROM agent_tool_count"` 直接看各 agent 工具计数，验证门控累积/清零。
+- 检查 `.self/memory.md` 的 mtime 与 md5 判断记忆维护是否触发（基线/后验对比）。
+
+**本轮触发的记忆维护**：工具计数 29 ≥ 7，本次回复进入 update memory 阶段（working → updating_memory → idle），完成后计数清零。
+
+### 2026-08-18 · 第六轮：实测 team 工具组队 + 双轨制统一 + 执行模式注入
+
+**任务目标**：用户要求先看 memory update 实现，然后实测 team 工具是否可用，并组一支维护团队（"以后就一起维护项目了"）。
+
+**memory update 审查（_run_memory_update, main.py:549）**：
+- 门控：get_tool_count < 7 跳过；≥7 触发，完成后 reset_tool_count 清零（各 agent 隔离、落盘 agent_tool_count 表）。
+- 锁：_lock_memory_update 防重入；5 处入口拦截（顶部 agent 消息 980、teammates 路由 1188、team 工具 1270、broker 1314、用户投递）。
+- 状态机：working → updating_memory → idle（不回跳 working；idle 由调用方 finally 发送）。
+- 上下文接近上限（≥0.9*max_seqlen）时跳过记忆维护，避免超长输入卡死。
+
+**组队实测（全部通过）**：
+- list_models 4 项；create_member 创建 3 名成员成功（member_1787028983_gj0jap 后端 / member_1787028988_kcihfd 前端 / member_1787028988_nswajn 测试，均 deepseek-v4-flash-official）。
+- list_members 分组生效：3 名全部归入 teammates 组。
+- send_message 投递成功，成员真实执行工具循环（help/terminal/read/mcp 多轮），最终回复经回传链路送达 leader（[成员 xxx 完成回复] 前缀）——**成员→leader 闭环实测可用**。
+- 发现字段缺陷：roster 表只有 7 列（缺 system_prompt/can_lead_team）→ 成员 can_lead_team 显示 True（默认值）、system_prompt 为空（第一轮诊断的 _parse_roster_table 缺列问题，双轨制遗留）。
+
+**组队暴露的双轨制问题（关键）**：
+- Docker 容器真实存在（03efdf117367...），成员工作空间建在容器 /workspace/workspaces/{id}/.self（identity/rule/activity 都有，缺 memory.md）。
+- 但成员工具走本地执行器（baseDir=项目根）→ 成员 read .self/identity.md 报"文件不存在"，误读到 leader（我）的 identity，一路猜路径。
+- 前端 LocalExecutorService._resolveWorkspaceDir：私人 .self → baseDir/workspaces/{id}，工作文件 → baseDir（本地模式）；但后端 TeamTool 的 roster/身份读写仍直调 docker_manager → **双轨制在组队场景的实证**。
+
+**terminal 长命令稳定性实测（cmd 固有行为，非内置化 bug）**：
+- `&&` 多命令、引号/中文、括号分支、dir|findstr 管道：正常。
+- `python -c "print(123)"` → exit 0 但**无输出**：cmd /c 不剥离引号，python 收到 `"print(123)"`（带引号代码=表达式求值无副作用）。
+- `cmd /c "python -c \"print(123)\""`（Dart 转义）→ 系统找不到路径。
+- **exec_argv 直接 argv 传递稳定**（`python -c 'print(123)'` → 123）：引号问题可用 argv 绕开。
+
+**用户灵魂拷问："为什么你作为 leader，工作环境在本地还是沙箱都分不清？" → 根因：执行模式信息从未注入**：
+- _SYSTEM_PROMPT（main.py:78）固定两句话，无执行环境；_build_workspace_extra_info（321）只注入 identity/rule/storage_warning；前端 base_dir 注释明写"仅供后端记录/展示，不参与路径映射"。
+- 我和成员全靠调用 terminal 猜自己在哪（成员更惨：空间在容器、工具走本地，猜都猜不到）。
+
+**修复 1：执行模式注入（main.py）**：
+- 新增 _build_exec_mode_text()：按 local_executor.is_local(mode_key=top_agent_id) 判定，注入"本地（工作目录 base；私人空间 .self 在 base/workspaces/{id}/.self；团队共享 base）"或"云端沙箱（容器路径）"。
+- _build_workspace_extra_info 增加 exec_mode 字段，成员/顶部 agent 两个调用点传参；本地/云端/None 三种场景 stub 验证通过；import main OK。
+
+**修复 2：双轨制统一（TeamTool 注入 WorkspaceIO）**：
+- team_tool.py __init__ 增加 io 参数；新增 _io_write/_io_read 辅助（优先 io，回退 docker exec）。
+- 新增 _init_member_private_space()：create_member 时初始化成员 .self（rule/memory/activity），本地模式落到 baseDir/workspaces/{id}/.self。
+- _write_member_identity/_save_roster/_load_roster/_load_roster_of 全部优先走 io。
+- tools/__init__.py register_builtin_tools 传 io=io。
+- 10 条规则全部成功，ast.parse 通过；stub 测试通过（成员能读到自己 identity、roster 落 leader 本地、重建 TeamTool 能加载 roster）。
+
+**遗留/待办**：
+- 已建 3 名成员空间仍在容器（03efdf...），本地模式下与工具路径分离 → **建议重启后端后重建成员**（本地模式 create_workspace 走本地路径，配合新注入完全一致）。
+- 成员 identity 中 can_lead_team 显示"是"（roster 缺列默认 True）——若需准确，roster 表需扩展列或成员信息存 agent_store。
+- help 对成员仍注入"顶层 Agent"身份（help_tool 未按成员渲染身份区），成员误以为自己是顶层；待后续迭代修正 help 身份区按 level 渲染。
+
+### 2026-08-18 · 第七轮：compact 后 help 信息是否保留的审查
+
+**用户问题**：compact 后 help 的信息（含刚注入的 exec_mode）还留得住吗？是否上下文丢失？
+
+**审查结论：留得住，且不是上下文丢失**：
+- **workspace_extra_info（身份/rule/exec_mode）存放在 HelpTool 实例属性上**（help_tool.py 构造时传入，`self.workspace_extra_info`），不在 LLM context 里。
+- **compact（llm.py:657-720 compress）只重组 self.context 消息列表**：`self.context = system_msgs + [summary_msg] + to_keep`，并重置 `_last_prompt_tokens` 锚点。完全不碰 `registered_tools`、HelpTool 实例、workspace_extra_info。
+- 因此 compact 后：help 工具定义还在（每轮 chat 的 tools 参数照常暴露）；重新调用 help 时 `execute()` 从 workspace_extra_info **现读**身份/rule/exec_mode 原样返回。
+- "信息丢了"的感觉来自：compact 把**之前 help 输出的文本**（作为历史 tool result）总结进 summary——若 agent 不重新调 help，工作记忆里不再有 exec_mode 细节。但这正是 help 设计：机制性信息靠"随时可重新获取"而非"上下文残留"（这也是系统提示词"先调用 help"的原因）。
+
+**边界**：
+1. **快照语义**：workspace_extra_info 是会话构造时计算的一次性快照；运行中 identity.md/rule.md 被改，compact 后 help 读的是旧快照（需会话重建刷新）——不是丢失，是快照设计。
+2. **会话重建更保险**：clear_user_agent / update_member 重建会话会重新计算 workspace_extra_info（重新读文件 + 重新注入 exec_mode），反而更新鲜。
+
+**关键洞察**：把身份/rule/exec_mode 放 help 而非系统提示词，是"即取即用"设计——系统提示词会被 compact 保留但会无限膨胀；help 是动态获取。exec_mode 属于 workspace_extra_info，compact 与会话重建两种场景都能被 help 重新调出，不会消失。
+
+**本轮待办提醒**：此前 main.py / team_tool.py 的修改（exec_mode 注入 + TeamTool 注入 io + _init_member_private_space）需**重启后端才生效**；已建 3 名成员空间在容器，本地模式建议重启后重建。
+
+### 2026-08-18 · 第八轮：help 永久保留特权（最贴近系统提示词的那次）
+
+**用户需求**："你这么久我就没看你调用过 help，要不给 help 一个额外特权，最接近系统提示词的那次 help 调用永久保留。"（先问"compact 后 help 的信息还留得住吗"，第七轮确认留得住但依赖重新调用；用户进一步要求把最近系统提示词的 help 调用做成 compact 豁免，作为常驻环境基线。）
+
+**关键约束（OpenAI API）**：tool 消息必须紧跟对应 assistant 消息，所以 help 调用必须**成对保留**（assistant tool_call + 对应 tool 结果），不能只留 tool 结果。
+
+**实现（llm.py compress，2 处修改）**：
+1. **剥离 help 块**：在压缩前扫描 other_msgs，识别 role=assistant 且 tool_calls 含 name=="help" 的消息，连同其后紧随的 role=tool（tool_call_id 属于该 assistant）组成 help 块；从 to_summarize/to_keep 中剔除。
+2. **只保留一次**（用户二次收紧"要那么多 help 干啥"）：`kept_help = help_blocks[0]` —— 只取**最靠前（最贴近系统提示词）**的块；其余 help 块按普通消息处理（可总结区总结、保留区留存）。避免多个 help 输出在上下文反复堆积膨胀。
+3. 重组：`self.context = system_msgs + [summary_msg] + kept_help + to_keep`（help 块紧跟总结、位于最近任务之前，顺序合理）。
+
+**测试验证（构造真实形态上下文，monkeypatch _summarize_with_llm）**：
+- 场景：系统提示词 + 最早 help（特权）+ 任务0（内含第二次 help，应总结）+ 任务1/2/3（保留）。
+- 压缩后：SUMMARY 总结了第二次 help + 任务0；最早 help 调用对完整保留（tool 内容含 exec_mode）；任务1/2/3 保留。
+- 断言全过：仅最早 help 保留、第二次 help 被总结、任务0 被总结、最近任务保留、总结位置正确。
+- ast.parse OK、import main OK、LimitlessContextSession.compress 不受影响（no-op 不变）。
+
+**效果**：compact 后上下文永远只有最早那次 help（环境基线：执行模式/身份/工具机制），不会堆积多个 help 膨胀上下文；agent 即使从不重调 help，核心环境认知也常驻。
+
+**待办提醒（延续）**：main.py（exec_mode 注入）/ team_tool.py（io 注入）/ llm.py（help 保留）三处修改均需**重启后端生效**；已建 3 名成员空间在容器（03efdf...），本地模式建议重启后重建（配合新注入路径一致）。
+
+### 2026-08-18 · 第九轮：memory.md 是否自动注入的审查（发现"只写不读"半闭环）
+
+**用户灵魂拷问**："memory 每次更新，也没看你看过啊，会自动注入上下文吗？"——质疑记忆维护闭环是否真的把写下的记忆带回 agent 认知。
+
+**审查结论：不会自动注入，用户观察正确**。记忆维护是**只写不读的半闭环**：
+- ✅ **写**：工具计数 ≥7 → update memory → 写入 .self/memory.md → 清零（链路完整）。
+- ❌ **读**：**没有任何机制把 memory.md 带回上下文**。compact 后长期记忆等于不存在，这也是"每轮维护后还在重复踩坑"的原因。
+
+**证据链（代码确认）**：
+1. **注入链只有两条，均不含 memory**：
+   - system prompt（main.py:78 _SYSTEM_PROMPT）：固定两句话，不含任何文件。
+   - help 的 workspace_extra_info（main.py:361 _build_workspace_extra_info）：只注入 exec_mode / **identity.md**(391) / **rule.md**(402) / storage_warning(409)，**没有任何一行读 memory.md**。
+2. **llm.py 不读 .self 文件**：全文件仅 context_snapshot.json（会话恢复快照），无 memory 注入；compress 只重组 LLM context 消息列表，不注入任何 .self 文件。
+3. 因此唯一看到 memory.md 的方式是 agent 主动 `read .self/memory.md`——而我（和其他 agent）从未读过。
+
+**附带认知**：rule.md / identity.md 能"常驻"是因为它们进了 help 的 workspace_extra_info；memory.md 被漏掉，导致三份记忆文档注入待遇不一致。
+
+**修复选项（已向用户提出，待决策）**：
+1. **全量注入**：memory 加进 _build_workspace_extra_info，help 全量返回——改动最小，但 memory.md 渐长，help 输出膨胀吃 token。
+2. **索引注入**（推荐）：只注入各轮记忆的**标题+日期清单**（轻量恒定），agent 需要细节时主动 read .self/memory.md——成本低、保证 agent 知道"有哪些记忆、去哪读"。
+3. **最近 N 条 + 更早索引**：折中，最近 2 轮完整、更早只留标题。
+
+**待办**：等用户选择修复方案后实施；若选方案 2，改 _build_workspace_extra_info 增加 memory_index 字段（解析 memory.md 的 `### 日期 · 标题` 行）。
+
+### 2026-08-18 · 第十轮：memory 全量注入 help（<4k 压缩）+ help 刷新机制 + compact 长度实测
+
+**用户拍板**："全量注入+memory总大小限制（memory.md<4k），超出发系统提示词压缩。那另一个问题：compact 后保留最早 help，那 memory 更新也加不进去啊，要不 compact 保留的同时刷新一下 help 内容。"
+
+**实现（3 文件，已接线验证）**：
+1. **main.py**：
+   - 常量 `_MEMORY_INJECT_LIMIT = 4096`（字符）；`_memory_compress_cache: {workspace_id: (md5指纹, 压缩文本)}`。
+   - `_compress_memory_text()`：优先 LLM 压缩（默认模型，temperature 0.2，max_tokens 1024，prompt 要求 4000 字内中文摘要），失败回退"保头保尾截断"（头 1800 + 尾 1600）；带 md5 指纹缓存，memory 未变化时直接复用，避免每次 help 重复触发 LLM 压缩。
+   - `_build_workspace_extra_info` 增加 memory 注入：≤4k 全量，>4k 压缩后注入 `info["memory"]`。
+   - `_register_tools` 新增 `member_system_prompt` 参数 + `_extra_info_refresher` 闭包（现读现算 extra_info），传给 register_builtin_tools；成员 2 处调用透传 member_system_prompt。
+2. **help_tool.py**：`__init__` 新增 `refresh_extra_info` 回调；`execute()` 每次执行前调用刷新 `self.workspace_extra_info`（memory.md 每次记忆维护都更新，快照必过期）；`_build_workspace_info_section` 增加 `## 记忆档案 (memory.md)` 板块（rule 之后、存储告警之前）。
+3. **tools/__init__.py**：`register_builtin_tools` 新增 `extra_info_refresher` 参数并透传给 `HelpTool(refresh_extra_info=...)`（已补接线）。
+
+**验证**：3 文件 AST parse OK、import main OK、HelpTool 参数含 refresh_extra_info。
+
+**用户追问："但 help 在最前面，更新意味着前缀缓存失效，compact 后上下文长度能压到多少？" → 实测分析**：
+- **.self 现状**：memory.md **17553 字符（~8.8k tokens）**、rule.md 4.2k、identity.md 1.7k；memory 远超 4k 上限走压缩（注入 3418 字符 ≈ 1.7k tokens）。
+- **完整 help 输出 14166 字符（~7.1k tokens）**，其中工作空间信息板块 9366 字符（~4.7k，含 identity+rule+memory）是大头；其余板块：身份 0.2k / 工具机制 0.8k / 系统机制 1.1k / 用户期望 0.2k / 工具清单 0.06k。
+- **compact 后上下文估算（当前 agent 真实历史）**：system 0.2k + summary ~1k（719 条旧历史 22k tokens 被总结）+ kept_help 7.1k + to_keep 3.8k（最近 3 轮 126 条）≈ **12.1k tokens**；对比全量 26k，压缩比干净。
+- **max_seqlen=204800、压缩阈值 163840**：compact 后 12.1k 仅占阈值 7%，**无"压缩后立刻又压"死循环风险**。
+- **前缀缓存结论（用户顾虑核心）**：compact 本身用新 summary 替换全部历史，无论 help 刷不刷新，compact 后整个上下文都是全新排布、前缀必然全失效 → **"compact 时刷新 help"与 compact 固有失效完全重叠，额外成本 = 0**。compact 后到下次 compact 之间 help 块固定，前缀稳定，DeepSeek 硬盘缓存正常命中（命中部分 10% 价格）。
+- **稳态成本**：help 块 7.1k tokens 每轮携带（命中时约 0.7k 等价；compact 后首轮全量）。
+
+**优化建议（已提出，待用户确认）**：
+1. memory 注入上限 4k → 2k（当前压缩后 3.4k 仍偏大，help 块 7.1k 中 memory 1.7k + rule 2.1k 占过半）；
+2. rule.md 也加限长压缩（现 4.2k 字符全量注入无限制）；
+3. （可选）compact 保留 help 时只保留精华板块（exec_mode/identity/rule/memory），丢弃静态工具机制/系统机制说明（需要时可重调 help 获取）。
+
+**重要待办（用户需求未完成部分）**：
+- **compact 时重渲染 kept_help 块内容未实现**：用户要求"compact 保留 help 的同时刷新 help 内容"。当前实现只覆盖 **help execute 时现刷**（agent 重调 help 拿到最新 memory）；但 compact 保留的"最早 help 块"是历史消息文本，compress 不会自动重渲染。要让 compact 后常驻 help 反映最新 memory，需给 session 绑定 help 渲染回调（main 层提供），compress 时若有 kept_help 用最新渲染替换 tool 内容——**待实施**。
+- 优化建议 1/2/3 待用户拍板。
+
+**本轮代码状态**：memory 注入 + execute 刷新已可运行（AST/import 验证过）；compact 重渲染与优化未做，后端重启后生效（memory 注入随 extra_info 每次 help 现算）。
+
+### 2026-08-18 · 第十一轮：最终落地——rule.md 限长 + help 刷新收敛到 compact + compact 重渲染 kept_help
+
+**用户最终拍板（修正第十轮中间方案）**："给 rule.md 也设限（<4k），只要 compact 后上下文长度本身就不长，那注入影响不大。**注意所有的 help 信息刷新都是在 compact 触发上下文重构时发生**。"
+
+**关键转变**：第十轮的"execute 每次现刷"方案被推翻——help 块作为历史消息留在上下文中，若每次执行都变内容，会**破坏前缀稳定性、频繁失效 KV 缓存**。最终改为：**平时 execute 用快照（内容不变、前缀稳定利于缓存命中）；只在 compact 触发上下文重构时刷新 help 块（此时前缀必然重排，刷新零额外成本）**。
+
+**实现（4 文件，全部落地 + 测试通过）**：
+1. **main.py**：
+   - `_MEMORY_INJECT_LIMIT` → `_SELF_DOC_INJECT_LIMIT = 4096`（memory/rule 统一上限）。
+   - `_compress_memory_text` 泛化为 `_compress_self_doc(workspace_id, doc_key, text, kind)`，缓存键 `{workspace_id}:{doc_key}`（md5 指纹）。
+   - **rule.md 注入同样设限**：≤4k 全量，>4k 压缩（`_compress_self_doc(..., "rule.md", "工作准则")`）。
+   - memory 注入改用新函数（当前 memory.md 20281 字符 → 压缩 3425；rule.md 4863 → 3426）。
+2. **help_tool.py**：`execute()` **移除每次自动刷新**（保留快照）；新增 `render_fresh_content()`（刷新 extra_info + 重渲染），**专供 compact 调用**。
+3. **tools/__init__.py**：构造 HelpTool 传 `refresh_extra_info`；绑定 `session.help_refresh_callback`（调 `render_fresh_content()`，返回新 assistant(tool_call=help)+tool(result) 消息对，保证 OpenAI tool_call 配对约束）；无回调时压缩保留旧块。
+4. **llm.py compress**：保留最早 help 块后，若 session 有 `help_refresh_callback` → 用最新渲染替换 kept_help（try/except 失败沿用旧块）。
+
+**测试验证（test_help_refresh.py 全过）**：
+- 平时 help execute：用快照（rule v1、无 memory），**refresh 回调调用 0 次**——前缀稳定 ✅
+- compact 触发重构：刷新回调被调 1 次，help 块替换为 rule v2 + 最新 memory ✅
+- 旧 help 块被替换无残留、tool_call 配对约束满足 ✅
+- `_compress_self_doc` 指纹缓存验证：同内容二次压缩实际调用 1 次（不重复触发 LLM）✅
+- 4 文件 AST parse OK、import main OK ✅
+
+**长度实测（最终态）**：memory 20281→3425 字符、rule 4863→3426 字符；compact 后上下文 ~12k tokens（max_seqlen=204800，阈值 163840，占 7%，无死循环风险）；help 块 7.1k 为每轮固定负担，命中缓存时约 0.7k 等价。
+
+**待办（延续）**：main.py / help_tool.py / tools/__init__.py / llm.py 四处修改需**重启后端生效**；已建 3 名成员空间仍在容器（03efdf...），本地模式建议重启后重建（配合 exec_mode 注入 + TeamTool io 注入路径一致）。
+
+
+
+

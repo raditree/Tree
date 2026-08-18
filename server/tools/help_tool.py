@@ -20,6 +20,7 @@ class HelpTool:
         session: "AgentLLMSession" = None,
         team_tool: "TeamTool" = None,
         workspace_extra_info: dict = None,
+        refresh_extra_info: "Callable[[], dict]" = None,
     ) -> None:
         """初始化 help 工具。
 
@@ -33,6 +34,10 @@ class HelpTool:
             团队以及现有团队成员规模
         :param workspace_extra_info: 工作空间额外信息字典，包含身份、rule.md、
             存储告警等，由系统提示词构建时预先计算，help 工具统一透露
+        :param refresh_extra_info: 可选回调，每次执行 help 时重新计算
+            workspace_extra_info（现读 .self 文件）。memory.md 每次记忆维护
+            都会更新，快照会过期，提供该回调可保证 help 输出始终最新；
+            无回调时使用构造时快照。
         """
         self.registered_tools: list[dict] = (
             registered_tools if registered_tools is not None else []
@@ -41,6 +46,7 @@ class HelpTool:
         self.session = session
         self.team_tool = team_tool
         self.workspace_extra_info = workspace_extra_info or {}
+        self.refresh_extra_info = refresh_extra_info
         # 当前可用的 MCP 工具列表快照（无 mcp_manager 时的兜底，由 set_mcp_tools 注入）
         self.mcp_tools: list[dict] = []
 
@@ -130,6 +136,10 @@ class HelpTool:
         :param arguments: 工具参数（help 工具无参数）
         :return: 包含格式化说明文档字符串的字典
         """
+        # 注意：此处不自动刷新 workspace_extra_info。help 块作为历史消息留在
+        # 上下文中，若每次执行都改变内容，会破坏前缀稳定性、频繁失效 KV 缓存。
+        # 刷新统一在 compact 触发上下文重构时进行（render_fresh_content），
+        # 此时整个前缀必然重排，刷新零额外成本。
         sections: list[str] = [
             self._build_identity_section(),
             self._build_workspace_info_section(),
@@ -145,6 +155,24 @@ class HelpTool:
             len(self._get_mcp_tools()),
         )
         return {"content": content}
+
+    def render_fresh_content(self) -> str:
+        """刷新工作空间额外信息并重新渲染 help 内容。
+
+        专供 compact 触发上下文重构时调用（此时整个前缀必然重排，刷新 help
+        块不产生额外缓存失效）。平时 help 执行走 execute()，使用当前快照，
+        保持前缀稳定、利于 KV 缓存命中。
+
+        :return: 最新 help 渲染文本
+        """
+        if self.refresh_extra_info is not None:
+            try:
+                fresh = self.refresh_extra_info()
+                if fresh:
+                    self.workspace_extra_info = fresh
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("刷新 workspace_extra_info 失败，沿用快照: %s", exc)
+        return self.execute({}).get("content", "")
 
     # ------------------------------------------------------------------
     # 一、身份介绍
@@ -235,6 +263,12 @@ class HelpTool:
         rule = info.get("rule", "")
         if rule:
             lines.append(f"## 工作准则 (rule.md)\n{rule}")
+            lines.append("")
+
+        # memory.md（记忆档案：任务目标/关键决策/结论/待办；超限时已压缩）
+        memory = info.get("memory", "")
+        if memory:
+            lines.append(f"## 记忆档案 (memory.md)\n{memory}")
             lines.append("")
 
         # 存储告警

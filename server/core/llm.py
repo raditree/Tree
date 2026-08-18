@@ -703,7 +703,63 @@ class AgentLLMSession:
         to_summarize = other_msgs[:keep_from]
         to_keep = other_msgs[keep_from:]
 
-        # 无可总结内容（最近 N 次用户要求已覆盖全部消息）
+        # help 永久保留特权：help 调用（assistant tool_call + 对应 tool 结果）
+        # 整体从可压缩区域剥离，重组后紧跟总结，像系统提示词一样常驻。
+        # 原因：help 输出承载执行模式/身份/工具机制/用户期望等关键认知，agent
+        # 很少主动重调 help，若被 compact 总结掉会丢失环境基线。
+        # 注意必须成对保留（OpenAI API 要求 tool 消息紧随对应 assistant 消息）。
+        kept_help: List[Dict[str, Any]] = []
+        if other_msgs:
+            help_blocks: List[List[Dict[str, Any]]] = []
+            idx = 0
+            while idx < len(other_msgs):
+                msg = other_msgs[idx]
+                tool_calls = msg.get("tool_calls") or []
+                if (
+                    msg.get("role") == "assistant"
+                    and tool_calls
+                    and any(
+                        (tc.get("function") or {}).get("name") == "help"
+                        for tc in tool_calls
+                    )
+                ):
+                    help_ids = {(tc.get("id") or "") for tc in tool_calls}
+                    block: List[Dict[str, Any]] = [msg]
+                    j = idx + 1
+                    while (
+                        j < len(other_msgs)
+                        and other_msgs[j].get("role") == "tool"
+                        and (other_msgs[j].get("tool_call_id") or "") in help_ids
+                    ):
+                        block.append(other_msgs[j])
+                        j += 1
+                    help_blocks.append(block)
+                    idx = j
+                else:
+                    idx += 1
+            if help_blocks:
+                # 只永久保留最接近系统提示词的一次 help 调用（第一个块）。
+                # 原因：help 输出体积大，若所有 help 调用都常驻会在上下文中反复
+                # 堆积膨胀；特权仅给最早那次（环境基线），其余按普通消息处理。
+                kept_help = help_blocks[0]
+                kept_ids = {id(m) for m in kept_help}
+                to_summarize = [m for m in to_summarize if id(m) not in kept_ids]
+                to_keep = [m for m in to_keep if id(m) not in kept_ids]
+
+        # help 信息刷新：只在 compact 触发上下文重构时进行（此时整个前缀必然
+        # 重排，刷新零额外缓存成本）。用最新 workspace_extra_info（memory/rule
+        # 更新后）重新渲染 help 块，替换常驻 kept_help；无回调时保留旧块。
+        if kept_help:
+            refresher = getattr(self, "help_refresh_callback", None)
+            if refresher is not None:
+                try:
+                    fresh_block = refresher()
+                    if fresh_block:
+                        kept_help = fresh_block
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("compact 刷新 help 块失败，沿用旧块: %s", exc)
+
+        # 无可总结内容（最近 N 次用户要求已覆盖全部消息，或仅剩 help 保留块）
         if not to_summarize:
             return False
 
@@ -711,8 +767,8 @@ class AgentLLMSession:
         summary_text = self._summarize_with_llm(to_summarize)
         summary_msg = {"role": "system", "content": summary_text}
 
-        # 重组上下文：system 消息 + 总结 + 保留的最近用户要求及其后消息
-        self.context = system_msgs + [summary_msg] + to_keep
+        # 重组上下文：system 消息 + 总结 + 常驻 help 块 + 保留的最近用户要求及其后消息
+        self.context = system_msgs + [summary_msg] + kept_help + to_keep
 
         # 压缩后 context 长度变化，旧的真实 prompt_tokens 锚点已失效；
         # 重置锚点让下次估算以字符估算重新校准，避免高估触发重复压缩

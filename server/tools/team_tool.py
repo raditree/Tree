@@ -63,6 +63,7 @@ class TeamTool:
         leader_id: str = "",
         top_agent_id: str = "",
         message_dispatcher: Any = None,
+        io: Any = None,
     ) -> None:
         """初始化 team 工具。
 
@@ -87,6 +88,10 @@ class TeamTool:
         self.top_agent_id = top_agent_id or agent_id
         # 统一消息发送回调（main 提供）：User-Agent / Agent-Agent 收敛出口
         self.message_dispatcher = message_dispatcher
+        # 统一工作空间 IO（WorkspaceIO）：成员空间/roster/身份文件读写走统一通道，
+        # 解决双轨制（team 工具走容器、成员工具走本地）导致的私人空间不可见问题。
+        # 本地模式 -> baseDir/workspaces/{id}/.self；云端模式 -> 容器路径。
+        self.io: Any = io
 
         # 成员列表（内存，同时持久化到 team_roster.md）
         self.members: List[Dict[str, Any]] = []
@@ -293,6 +298,10 @@ class TeamTool:
         """读取指定 agent 工作空间的 roster 成员表（用于查找平级成员）。"""
         if not agent_id or self.docker_manager is None:
             return []
+        # 优先走统一 WorkspaceIO（本地模式读本地 .self）
+        stdout = self._io_read(agent_id, ROSTER_FILE_PATH)
+        if stdout is not None:
+            return self._parse_roster_md(stdout)
         try:
             result = self.docker_manager.exec_in_workspace(
                 agent_id, ["cat", ROSTER_FILE_PATH]
@@ -329,6 +338,29 @@ class TeamTool:
             },
         )
 
+    def _io_write(self, workspace_id: str, path: str, content: str) -> bool:
+        """通过 WorkspaceIO 写入文件（统一双轨制），成功返回 True。"""
+        if self.io is None:
+            return False
+        try:
+            result = self.io.write_file(workspace_id, path, content)
+            return not bool(result.get("error"))
+        except Exception:  # noqa: BLE001
+            logger.warning("WorkspaceIO 写入失败: %s@%s", workspace_id, path)
+            return False
+
+    def _io_read(self, workspace_id: str, path: str) -> Optional[str]:
+        """通过 WorkspaceIO 读取文件，不存在或失败返回 None。"""
+        if self.io is None:
+            return None
+        try:
+            result = self.io.read_file(workspace_id, path)
+            if result.get("error"):
+                return None
+            return result.get("content", "")
+        except Exception:  # noqa: BLE001
+            return None
+
     @staticmethod
     def _now() -> str:
         """返回当前时间字符串。"""
@@ -357,6 +389,10 @@ class TeamTool:
             f"({member.get('parent_workspace_id', '')})\n"
             f"- can_lead_team: {leading}\n"
         )
+        # 优先走统一 WorkspaceIO（本地模式 -> baseDir/workspaces/{id}/.self，
+        # 成员工具立即可见）；io 不可用时回退 docker exec（云端容器）
+        if self._io_write(ws_id, ".self/identity.md", content):
+            return
         b64 = __import__("base64").b64encode(content.encode("utf-8")).decode("ascii")
         cmd = [
             "sh", "-c",
@@ -504,6 +540,11 @@ class TeamTool:
         # 记录身份信息到工作空间 .self/identity.md（checklist 6(c)：身份透明）
         self._write_member_identity(member)
 
+        # 初始化成员私人空间 .self（identity/rule/memory/activity），确保成员
+        # 工具循环立即可读自己的身份与记忆，无需自行猜测路径（双轨制统一：
+        # 本地模式经 WorkspaceIO 落到 baseDir/workspaces/{member_id}/.self）
+        self._init_member_private_space(member)
+
         # 记录到成员管理表
         self._save_roster()
 
@@ -515,6 +556,38 @@ class TeamTool:
             "workspace_id": member["workspace_id"],
             "created_at": now,
         }
+
+    def _init_member_private_space(self, member: Dict[str, Any]) -> None:
+        """初始化成员私人空间 .self（rule.md / memory.md / activity.log）。
+
+        identity.md 由 _write_member_identity 负责；此处补齐其余文件，
+        全部走统一 WorkspaceIO（本地模式成员工具立即可见，云端容器同路径）。
+        """
+        ws_id = member.get("workspace_id") or member.get("id")
+        if not ws_id:
+            return
+        name = member.get("name", "")
+        leader = member.get("leader_name", "") or "self"
+        mid = member.get("id", "")
+        level = member.get("level", 1)
+        now = self._now()
+        files = {
+            ".self/rule.md": (
+                f"# 工作准则 (rule.md)\n\n"
+                f"你是 {name}（Level {level} 团队成员，直属 leader: {leader}）。\n"
+                f"工作准则：先读 .self/identity.md 与 .self/memory.md 确认身份与历史；"
+                f"动手前先定位根因再做最小修改；完成后更新 .self/memory.md 并向 leader 汇报。\n"
+            ),
+            ".self/memory.md": (
+                "# 记忆文档 (memory.md)\n\n"
+                "## 任务记录\n\n"
+                f"### {now} · 初始化\n\n"
+                f"- 作为 {name}（member_id: {mid}）加入团队，直属 leader: {leader}。\n"
+            ),
+            ".self/activity.log": "",
+        }
+        for path, content in files.items():
+            self._io_write(ws_id, path, content)
 
     # ------------------------------------------------------------------
     # SubTask 7.2: 成员管理表
@@ -548,7 +621,10 @@ class TeamTool:
             )
         content = "\n".join(lines) + "\n"
 
-        # 使用 quoted here-doc 写入，避免变量展开与特殊字符问题
+        # 优先走统一 WorkspaceIO（本地模式 .self 本地可见，解决 roster 双轨问题）
+        if self._io_write(self.workspace_id, ROSTER_FILE_PATH, content):
+            return
+        # 回退 docker exec（云端容器）
         cmd = [
             "sh",
             "-c",
@@ -568,17 +644,18 @@ class TeamTool:
         if not self.workspace_id:
             return
 
-        cmd = ["sh", "-c", f"cat {ROSTER_FILE_PATH} 2>/dev/null"]
-        try:
-            result = self.docker_manager.exec_in_workspace(self.workspace_id, cmd)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("读取成员管理表失败: %s", exc)
-            return
-
-        if result.get("exit_code") != 0:
-            return
-
-        stdout = result.get("stdout", "")
+        # 优先走统一 WorkspaceIO（本地模式从本地 .self 读取）
+        stdout = self._io_read(self.workspace_id, ROSTER_FILE_PATH)
+        if stdout is None:
+            cmd = ["sh", "-c", f"cat {ROSTER_FILE_PATH} 2>/dev/null"]
+            try:
+                result = self.docker_manager.exec_in_workspace(self.workspace_id, cmd)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("读取成员管理表失败: %s", exc)
+                return
+            if result.get("exit_code") != 0:
+                return
+            stdout = result.get("stdout", "") or ""
         loaded = self._parse_roster_md(stdout)
         if loaded:
             self.members = loaded
