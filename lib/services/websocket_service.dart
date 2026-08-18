@@ -31,6 +31,12 @@ class WebSocketService {
   /// 收到消息时的回调（已解析为 Map）
   void Function(Map<String, dynamic> message)? onMessage;
 
+  /// 工具执行请求回调（本地执行器注册）
+  ///
+  /// 收到 ``tool_exec_request`` 时优先交给本地执行器处理，处理完毕后
+  /// 不会继续派发给 [onMessage]，避免页面重复解析。
+  void Function(Map<String, dynamic> message)? onToolExecRequest;
+
   /// 连接状态变化回调
   void Function(bool connected)? onConnectionChange;
 
@@ -93,6 +99,11 @@ class WebSocketService {
       // 过滤心跳响应
       final String? type = json['type'] as String?;
       if (type == 'heartbeat' || type == 'pong') {
+        return;
+      }
+      // 工具执行请求交给本地执行器（不向上派发）
+      if (type == 'tool_exec_request') {
+        onToolExecRequest?.call(json);
         return;
       }
       onMessage?.call(json);

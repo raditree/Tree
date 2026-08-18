@@ -1,13 +1,13 @@
 """MCP 工具 - write：向工作空间内写入文件。
 
-通过 ``docker_manager.exec_in_workspace`` 在 agent 的 Docker 工作空间内
-执行命令写入文件，写入前会自动创建父目录。文件路径需通过防注入校验。
+通过 :class:`core.workspace_io.WorkspaceIO` 写入文件，云端/本地实现均可。
+写入前会自动创建父目录。文件路径需通过防注入校验。
 """
 
 import logging
 from typing import Any, Dict
 
-from core.docker_manager import DockerManager
+from core.workspace_io import WorkspaceIO
 
 logger = logging.getLogger(__name__)
 
@@ -15,13 +15,13 @@ logger = logging.getLogger(__name__)
 class WriteTool:
     """write 工具 - 向工作空间内写入文件。"""
 
-    def __init__(self, docker_manager: DockerManager, workspace_id: str) -> None:
+    def __init__(self, io: WorkspaceIO, workspace_id: str) -> None:
         """初始化 write 工具。
 
-        :param docker_manager: Docker 工作空间管理器实例
+        :param io: 工作空间 IO 实现（云端/本地）
         :param workspace_id: 工作空间标识
         """
-        self.docker_manager = docker_manager
+        self.io = io
         self.workspace_id = workspace_id
 
     @staticmethod
@@ -80,38 +80,9 @@ class WriteTool:
         if not isinstance(content, str):
             return {"error": "content 必须是字符串"}
 
-        # 1. 创建父目录：file_path 已通过校验，dirname 直接切片即可
-        if "/" in file_path:
-            parent_dir = file_path.rsplit("/", 1)[0]
-        else:
-            parent_dir = "."
-        mkdir_result = self.docker_manager.exec_in_workspace(
-            self.workspace_id, ["sh", "-c", f"mkdir -p {parent_dir}"]
-        )
-        if mkdir_result.get("error"):
-            return {"error": mkdir_result["error"], "file_path": file_path}
-        if mkdir_result.get("exit_code", -1) != 0:
-            return {
-                "error": f"创建父目录失败: {mkdir_result.get('stdout', '')}",
-                "file_path": file_path,
-            }
-
-        # 2. 写入文件：使用 heredoc + 唯一定界符，避免内容中的 shell 元字符干扰
-        #    定界符加单引号前缀，禁用变量替换，保证内容原样写入
-        delimiter = "WRITE_TOOL_EOF_9f8a7b6c"
-        heredoc_script = (
-            f"cat > {file_path} <<'{delimiter}'\n{content}\n{delimiter}"
-        )
-        write_result = self.docker_manager.exec_in_workspace(
-            self.workspace_id, ["sh", "-c", heredoc_script]
-        )
-        if write_result.get("error"):
-            return {"error": write_result["error"], "file_path": file_path}
-        if write_result.get("exit_code", -1) != 0:
-            return {
-                "error": f"写入文件失败: {write_result.get('stdout', '')}",
-                "file_path": file_path,
-            }
+        result = self.io.write_file(self.workspace_id, file_path, content)
+        if result.get("error"):
+            return {"error": result["error"], "file_path": file_path}
 
         logger.info("write 工具写入文件成功: %s", file_path)
         return {"success": True, "file_path": file_path}

@@ -5,24 +5,35 @@ server:
 # 用户可创建的顶层 agent 数量上限
 agents:
   max_per_user: 5
-  # 团队最大层级深度（顶部 agent 为 Level 0，最深 Level 3，共 4 层）
+  # 团队最大层级深度（顶部 agent 为 Level 0）
   max_level: 2
 
 docker:
   image: "agent-workspace:latest"
   # 每个 agent 可指挥的成员数量上限
-  max_members_per_level: 3
+  max_members_per_level: 7
   resource_limits:
-    cpu: "2.0"
-    memory: "2g"
-    disk: "4g"
+    cpu: "4.0"
+    memory: "4g"
+    disk: "10g"
 
 # 文件上传限制
 upload:
   # 单个文件大小上限
-  max_file_size: "100m"
+  max_file_size: "300m"
   # 沙箱内全部文件总大小上限（上传前校验，避免单 agent 工作空间膨胀）
-  sandbox_max_size: "1g"
+  sandbox_max_size: "8g"
+
+# LLM 调用行为（应用级默认值）
+llm:
+  # 单次调用超时（秒）。长上下文 + thinking 模型响应可能很慢，
+  # 但必须设上限，否则 API 挂起会导致前端永远显示 working（表现为卡死）
+  timeout_seconds: 300
+  # 调用失败重试次数
+  max_retries: 1
+  # 记忆维护跳过阈值：上下文达到模型 max_seqlen 的该比例时跳过记忆维护，
+  # 避免记忆阶段的工具循环继续膨胀上下文导致超长输入
+  memory_update_skip_ratio: 0.9
 
 # 沙箱网络与下载限制（checklist 13/14）
 sandbox:

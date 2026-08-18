@@ -5,7 +5,7 @@ import '../models/agent.dart';
 import '../models/message.dart';
 import '../services/api_service.dart';
 import '../services/auth_service.dart';
-import '../services/local_backend_service.dart';
+import '../services/local_executor_service.dart';
 import '../services/websocket_service.dart';
 import 'message_input.dart';
 import 'message_list.dart';
@@ -53,6 +53,9 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 处于 working 状态的 agent 集合（用于标题栏显示状态与停止按钮）
   final Set<String> _workingAgents = <String>{};
 
+  /// 各 agent 最近的非 idle 状态（working / updating_memory 等），用于区分状态文案
+  final Map<String, String> _agentStatus = <String, String>{};
+
   /// 是否正在等待用户回答 agent 的问题（AskUserQuestion）
   bool _asking = false;
 
@@ -62,8 +65,12 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 本地后端工作目录
   String? _localWorkingDir;
 
-  /// 本地后端是否正在启动中
-  bool _localStarting = false;
+  /// 切换运行模式时的防重入守卫（不再启动任何本地后端，仅防双击）
+  bool _togglingMode = false;
+
+  /// 当前顶部 agent 的对话是否已开始（发送首条消息后运行模式锁定，
+  /// 防止因后端会话已绑定本地/云端工具而出现模式切换"不生效"的困惑）
+  bool _modeLocked = false;
 
   /// 预算数据（来自后端 budget_update 事件）
   Map<String, dynamic>? _budgetData;
@@ -78,8 +85,9 @@ class _MessagePanelState extends State<MessagePanel> {
   void initState() {
     super.initState();
     _webSocket.onMessage = _handleIncomingMessage;
-    _loadLocalSettings();
-    _connectWebSocket();
+    // 先恢复本地模式设置（按顶部 agent），再建立 WebSocket 连接，
+    // 确保连接建立后能按正确的本地模式注册执行器
+    _initAsync();
     // 首次进入时若已选中 agent 则加载历史与预算
     if (widget.selectedAgent != null) {
       _loadHistory();
@@ -87,17 +95,28 @@ class _MessagePanelState extends State<MessagePanel> {
     }
   }
 
-  /// 加载本地运行模式的持久化设置
+  /// 初始化：先加载当前顶部 agent 的本地模式设置，再连接 WebSocket
+  Future<void> _initAsync() async {
+    await _loadLocalSettings();
+    if (!mounted) return;
+    await _connectWebSocket();
+  }
+
+  /// 加载当前顶部 agent 的本地执行模式持久化设置，并同步注册/注销
   Future<void> _loadLocalSettings() async {
-    await LocalBackendService.loadSettings();
+    if (widget.selectedAgent != null) {
+      LocalExecutorService.instance
+          .setCurrentTopAgent(widget.selectedAgent!.id);
+    }
+    await LocalExecutorService.instance.loadSettings();
     if (!mounted) return;
     setState(() {
-      _localEnabled = LocalBackendService.enabled;
-      _localWorkingDir = LocalBackendService.workingDirectory;
+      _localEnabled = LocalExecutorService.instance.enabled;
+      _localWorkingDir = LocalExecutorService.instance.workingDirectory;
     });
-    // 如果本地模式已启用但进程未运行，尝试启动
-    if (_localEnabled && !LocalBackendService.isRunning) {
-      _startLocalBackend();
+    // 连接已建立时，按当前顶部 agent 的本地模式同步注册/注销
+    if (_wsConnected && _webSocket.isConnected) {
+      LocalExecutorService.instance.syncRegistration();
     }
   }
 
@@ -109,9 +128,13 @@ class _MessagePanelState extends State<MessagePanel> {
       setState(() {
         _messages.clear();
         _budgetData = null;
+        // 切换顶部 agent 后解除锁定，由新 agent 的历史/首条消息重新决定
+        _modeLocked = false;
       });
       _loadHistory();
       _loadBudget();
+      // 切换顶部 agent：加载其独立的本地模式设置并同步注册/注销
+      _loadLocalSettings();
     } else if (oldWidget.refreshTrigger != widget.refreshTrigger) {
       setState(() {
         _messages.clear();
@@ -133,6 +156,8 @@ class _MessagePanelState extends State<MessagePanel> {
         for (final Map<String, dynamic> item in raw) {
           _messages.add(ChatMessage.fromJson(item));
         }
+        // 历史已存在说明该顶部 agent 的对话已开始，运行模式一并锁定
+        _modeLocked = _messages.isNotEmpty;
         _scrollRevision++;
       });
     } catch (e) {
@@ -146,8 +171,12 @@ class _MessagePanelState extends State<MessagePanel> {
     final AuthService auth = AuthService();
     final String? token = await auth.getToken();
     if (token == null || token.isEmpty) return;
+    // 本地执行器接管工具执行请求（始终接管，按是否本地模式决定是否注册）
+    LocalExecutorService.instance.attach(_webSocket);
     _webSocket.connect(token);
     _wsConnected = true;
+    // 按当前顶部 agent 的本地模式注册/注销（须在连接建立后发送）
+    LocalExecutorService.instance.syncRegistration();
   }
 
   /// 处理后端推送的消息
@@ -244,8 +273,14 @@ class _MessagePanelState extends State<MessagePanel> {
       setState(() {
         if (status == 'working') {
           _workingAgents.add(agentId);
+          _agentStatus[agentId] = 'working';
+        } else if (status == 'updating_memory') {
+          // 记忆更新阶段：仍视为忙碌（停止按钮可用），但展示独立文案
+          _workingAgents.add(agentId);
+          _agentStatus[agentId] = 'updating_memory';
         } else if (status == 'idle' || status == 'stopping') {
           _workingAgents.remove(agentId);
+          _agentStatus.remove(agentId);
         }
       });
     } else if (type == 'ask_user_question') {
@@ -407,6 +442,8 @@ class _MessagePanelState extends State<MessagePanel> {
     setState(() {
       _messages.add(userMessage);
       _scrollRevision++;
+      // 发送首条消息后锁定运行模式（后端会话自此绑定本地/云端工具）
+      _modeLocked = true;
     });
 
     _webSocket.sendMessage(<String, dynamic>{
@@ -424,84 +461,54 @@ class _MessagePanelState extends State<MessagePanel> {
     return idx >= 0 ? replaced.substring(idx + 1) : replaced;
   }
 
-  /// 切换本地运行模式
+  /// 切换当前顶部 agent 的本地执行模式。
+  ///
+  /// 仅需持久化开关并经反向 WS 注册/注销本地执行器，无需启动任何本地进程。
   Future<void> _toggleLocalMode() async {
-    if (_localStarting) return;
+    if (_togglingMode) return;
+    // 发送首条消息后会话已绑定本地/云端工具，禁止再切换运行模式
+    if (_modeLocked) {
+      _showSnackBar('对话已开始，该顶部 agent 的运行模式已锁定，无法切换');
+      return;
+    }
 
-    if (_localEnabled) {
-      // 关闭本地模式
-      setState(() => _localStarting = true);
-      await LocalBackendService.setEnabled(false);
-      // 切换 WebSocket 和 API 地址为远程模式
-      WebSocketService.baseUrl = 'ws://localhost:8000';
-      ApiService.baseUrl = 'http://localhost:8000';
-      _reconnectWebSocket();
-      if (!mounted) return;
-      setState(() {
-        _localEnabled = false;
-        _localStarting = false;
-      });
-    } else {
-      // 开启本地模式：先选目录
-      if (_localWorkingDir == null) {
-        await _pickWorkingDirectory();
-        if (_localWorkingDir == null) return;
-      }
-      setState(() => _localStarting = true);
-      final bool success = await LocalBackendService.setEnabled(true);
-      if (!mounted) return;
-      if (success) {
-        // 本地模式使用 localhost（与远程相同，但由本地进程提供服务）
-        WebSocketService.baseUrl = 'ws://localhost:8000';
-        ApiService.baseUrl = 'http://localhost:8000';
-        _reconnectWebSocket();
-        setState(() {
-          _localEnabled = true;
-          _localStarting = false;
-        });
-        _showSnackBar('本地后端已启动');
+    _togglingMode = true;
+    try {
+      if (_localEnabled) {
+        // 关闭当前顶部 agent 的本地执行模式（后端注销该 agent 的本地执行器）
+        await LocalExecutorService.instance.setEnabled(false);
+        if (mounted) setState(() => _localEnabled = false);
       } else {
-        setState(() {
-          _localEnabled = false;
-          _localStarting = false;
-        });
-        _showSnackBar('启动本地后端失败，请检查 Python 环境和目录设置');
+        // 开启前先选目录（工具执行结果写入此目录）
+        // 注意：新 agent 的 _localWorkingDir 可能是空字符串而非 null，
+        // 因此同时检查 null 和空字符串，确保目录必选
+        if (_localWorkingDir == null || _localWorkingDir!.isEmpty) {
+          await _pickWorkingDirectory();
+          // 用户取消选择或路径仍为空，不启用本地模式
+          if (_localWorkingDir == null || _localWorkingDir!.isEmpty) return;
+        }
+        await LocalExecutorService.instance.setEnabled(true);
+        if (mounted) {
+          setState(() => _localEnabled = true);
+          _showSnackBar('本地执行模式已启用（工具直接在本机目录运行）');
+        }
       }
+    } finally {
+      _togglingMode = false;
     }
   }
 
-  /// 选择工作目录（项目根目录，包含 server/main.py）
+  /// 选择工作目录（用户项目根目录，工具读写/命令执行都在此目录下）
   Future<void> _pickWorkingDirectory() async {
     final String? path = await FilePicker.platform.getDirectoryPath(
-      dialogTitle: '选择项目根目录（包含 server/main.py）',
+      dialogTitle: '选择项目根目录（工具执行结果写入此目录）',
     );
     if (path == null || path.isEmpty) return;
-    await LocalBackendService.setWorkingDirectory(path);
+    await LocalExecutorService.instance.setWorkingDirectory(path);
     if (!mounted) return;
     setState(() {
       _localWorkingDir = path;
     });
-  }
-
-  /// 启动本地后端
-  Future<void> _startLocalBackend() async {
-    if (_localWorkingDir == null) return;
-    setState(() => _localStarting = true);
-    final bool success = await LocalBackendService.start(_localWorkingDir!);
-    if (!mounted) return;
-    if (success) {
-      WebSocketService.baseUrl = 'ws://localhost:8000';
-      ApiService.baseUrl = 'http://localhost:8000';
-      _reconnectWebSocket();
-    }
-    setState(() => _localStarting = false);
-  }
-
-  /// 重新连接 WebSocket（断开后重连）
-  void _reconnectWebSocket() {
-    _wsConnected = false;
-    _webSocket.disconnect();
-    _connectWebSocket();
   }
 
   /// 显示 SnackBar 提示
@@ -799,6 +806,9 @@ class _MessagePanelState extends State<MessagePanel> {
     final bool showCompact = agent != null && !agent.isLimitless;
     // 当前 agent 是否在工作
     final bool working = agent != null && _workingAgents.contains(agent.id);
+    // 工作状态文案（区分更新记忆阶段）
+    final String? agentStatus = agent != null ? _agentStatus[agent.id] : null;
+    final bool updatingMemory = agentStatus == 'updating_memory';
     return Container(
       height: 48,
       padding: const EdgeInsets.symmetric(horizontal: 4),
@@ -838,13 +848,18 @@ class _MessagePanelState extends State<MessagePanel> {
                       height: 12,
                       child: CircularProgressIndicator(
                         strokeWidth: 2,
-                        color: cs.primary,
+                        color: updatingMemory
+                            ? Colors.blue
+                            : cs.primary,
                       ),
                     ),
                     const SizedBox(width: 4),
-                    const Text(
-                      '工作中',
-                      style: TextStyle(fontSize: 11, color: Colors.orange),
+                    Text(
+                      updatingMemory ? '更新记忆中' : '工作中',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: updatingMemory ? Colors.blue : Colors.orange,
+                      ),
                     ),
                   ],
                 ],
@@ -876,34 +891,24 @@ class _MessagePanelState extends State<MessagePanel> {
 
   /// 构建本地运行开关图标（消息窗口左上）
   Widget _buildLocalRunToggle(ColorScheme cs) {
-    final Color iconColor = _localEnabled
-        ? Colors.green
-        : (_localStarting ? Colors.orange : cs.onSurfaceVariant);
-    final IconData icon = _localStarting
-        ? Icons.sync
-        : (_localEnabled ? Icons.power : Icons.power_settings_new);
+    final Color iconColor = _localEnabled ? Colors.green : cs.onSurfaceVariant;
+    final IconData icon = _localEnabled ? Icons.power : Icons.power_settings_new;
+    final String tooltip = _modeLocked
+        ? '对话已开始，该顶部 agent 的运行模式已锁定'
+        : (_localEnabled
+            ? '本地运行中（点击切换为远程）'
+            : '远程模式（点击切换为本地运行）');
     return Tooltip(
-      message: _localStarting
-          ? '正在启动本地后端...'
-          : (_localEnabled
-              ? '本地运行中（点击切换为远程）'
-              : '远程模式（点击切换为本地运行）'),
+      message: tooltip,
       child: SizedBox(
         width: 36,
         height: 36,
-        child: _localStarting
-            ? Padding(
-                padding: const EdgeInsets.all(8),
-                child: CircularProgressIndicator(
-                  strokeWidth: 2,
-                  color: iconColor,
-                ),
-              )
-            : IconButton(
-                padding: EdgeInsets.zero,
-                icon: Icon(icon, size: 20, color: iconColor),
-                onPressed: _toggleLocalMode,
-              ),
+        child: IconButton(
+          padding: EdgeInsets.zero,
+          icon: Icon(icon, size: 20, color: iconColor),
+          // 对话开始后锁定运行模式，禁止切换
+          onPressed: _modeLocked ? null : _toggleLocalMode,
+        ),
       ),
     );
   }

@@ -201,10 +201,12 @@ class ApiService {
   static Future<List<FileNode>> getFiles(
     String workspaceId, {
     String path = '',
+    String topAgentId = '',
   }) async {
     final Map<String, dynamic> data =
         await _getJson('/api/files/$workspaceId', query: {
       if (path.isNotEmpty) 'path': path,
+      if (topAgentId.isNotEmpty) 'top_agent_id': topAgentId,
     });
     final List<dynamic> files = data['files'] as List<dynamic>? ?? [];
     return files
@@ -218,11 +220,13 @@ class ApiService {
   /// `{"content", "path", "size"}`。网络异常或后端返回错误时抛出中文异常。
   static Future<String> getFileContent(
     String workspaceId,
-    String path,
-  ) async {
+    String path, {
+    String topAgentId = '',
+  }) async {
     final Map<String, dynamic> data =
         await _getJson('/api/files/$workspaceId/content', query: {
       'path': path,
+      if (topAgentId.isNotEmpty) 'top_agent_id': topAgentId,
     });
     return data['content'] as String? ?? '';
   }
@@ -234,10 +238,12 @@ class ApiService {
   /// 网络异常或后端返回错误时抛出中文异常。
   static Future<Map<String, dynamic>> getPdfInfo(
     String workspaceId,
-    String path,
-  ) async {
+    String path, {
+    String topAgentId = '',
+  }) async {
     return _getJson('/api/files/$workspaceId/pdf_info', query: {
       'path': path,
+      if (topAgentId.isNotEmpty) 'top_agent_id': topAgentId,
     });
   }
 
@@ -252,11 +258,13 @@ class ApiService {
     String path, {
     int page = 1,
     double scale = 2.0,
+    String topAgentId = '',
   }) async {
     return _getJson('/api/files/$workspaceId/pdf_preview', query: {
       'path': path,
       'page': page.toString(),
       'scale': scale.toString(),
+      if (topAgentId.isNotEmpty) 'top_agent_id': topAgentId,
     });
   }
 
@@ -270,10 +278,12 @@ class ApiService {
   static Future<List<Map<String, dynamic>>> getGitLog(
     String workspaceId, {
     int limit = 50,
+    String topAgentId = '',
   }) async {
     final Map<String, dynamic> data =
         await _getJson('/api/workspaces/$workspaceId/git/log', query: {
       'limit': limit.toString(),
+      if (topAgentId.isNotEmpty) 'top_agent_id': topAgentId,
     });
     final List<dynamic> commits = data['commits'] as List<dynamic>? ?? [];
     return commits
@@ -287,9 +297,12 @@ class ApiService {
   /// `{"branches": [...], "current": "..."}`。
   /// 网络异常或后端返回错误时抛出中文异常。
   static Future<Map<String, dynamic>> getGitBranches(
-    String workspaceId,
-  ) async {
-    return _getJson('/api/workspaces/$workspaceId/git/branches');
+    String workspaceId, {
+    String topAgentId = '',
+  }) async {
+    return _getJson('/api/workspaces/$workspaceId/git/branches', query: {
+      if (topAgentId.isNotEmpty) 'top_agent_id': topAgentId,
+    });
   }
 
   // ==================== 文件同步相关接口 ====================
@@ -315,9 +328,13 @@ class ApiService {
   /// 文件不存在或网络异常时抛出异常。
   static Future<Uint8List> downloadFile(
     String workspaceId,
-    String filePath,
-  ) async {
-    final Uri uri = Uri.parse('$baseUrl/api/files/$workspaceId/download');
+    String filePath, {
+    String topAgentId = '',
+  }) async {
+    final String query =
+        topAgentId.isNotEmpty ? '?top_agent_id=${Uri.encodeQueryComponent(topAgentId)}' : '';
+    final Uri uri = Uri.parse(
+        '$baseUrl/api/files/$workspaceId/download$query');
     try {
       final http.Response response = await http.post(
         uri,
@@ -348,10 +365,13 @@ class ApiService {
   /// 目录不存在或网络异常时抛出异常。
   static Future<Uint8List> downloadFolder(
     String workspaceId,
-    String folderPath,
-  ) async {
+    String folderPath, {
+    String topAgentId = '',
+  }) async {
+    final String query =
+        topAgentId.isNotEmpty ? '?top_agent_id=${Uri.encodeQueryComponent(topAgentId)}' : '';
     final Uri uri =
-        Uri.parse('$baseUrl/api/files/$workspaceId/download_folder');
+        Uri.parse('$baseUrl/api/files/$workspaceId/download_folder$query');
     try {
       final http.Response response = await http.post(
         uri,

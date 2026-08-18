@@ -1,8 +1,10 @@
 """Docker 工作空间管理 - 容器创建/停止/删除与卷管理。"""
 import base64
 import io
+import json
 import logging
 import os
+import re
 import shlex
 import tarfile
 import time
@@ -50,12 +52,11 @@ class DockerManager:
         若 Docker 未安装或 daemon 未运行，标记为不可用而非抛出异常，
         后续调用各方法时优雅降级。
 
-        本地模式（环境变量 ``LOCAL_MODE=1``，由前端本地后端进程设置）：
-        无论 Docker 是否可用，都直接在用户选择的工作目录下执行命令，
-        工作空间目录为 ``<cwd>/workspaces/{workspace_id}``。
+        说明：本地运行模式不再由本后端进程决定（前端不再启动本地后端），
+        而是由用户在 WebSocket 连接中发送 ``register_local_executor`` 注册，
+        后端通过 :class:`core.local_executor.LocalExecutorClient` 把工具调用
+        经反向 WS 转发到用户本机执行。因此此处不再读取 ``LOCAL_MODE`` 环境变量。
         """
-        # 本地模式：即使 Docker 可用也强制走本地目录执行
-        self.local_mode: bool = os.environ.get("LOCAL_MODE", "").strip() in ("1", "true", "True")
         self._available = False
         self._unavailable_reason = ""
         # docker SDK 未安装
@@ -88,6 +89,11 @@ class DockerManager:
         self.max_download_size: str = str(
             net_cfg.get("max_download_size", "900m")
         )
+        # 云端共享主工作区：member_workspace_id -> 顶层 agent workspace_id。
+        # 团队成员共享顶层 agent 的容器/卷（/workspace 主工作区），
+        # 各 agent 的 .self 私人路径路由到共享容器内 workspaces/{agent_id}/.self。
+        self._shared_owner: Dict[str, str] = {}
+        self._load_shared_map()
     @property
     def available(self) -> bool:
         """Docker daemon 是否可用。"""
@@ -97,21 +103,22 @@ class DockerManager:
     # ------------------------------------------------------------------
     @staticmethod
     def _local_workspace_path(workspace_id: str) -> "os.PathLike":
-        """返回本地模式下工作空间目录路径。
+        """返回 Docker 不可用时的工作空间目录路径。
 
-        - 本地模式（LOCAL_MODE=1，前端本地后端进程设置）：工作空间位于
-          ``<cwd>/workspaces/{workspace_id}``，其中 cwd 即用户选择的目录，
-          确保 agent 的所有操作都落在用户选择的目录下。
-        - 仅 Docker 不可用的降级（未显式设置本地模式）：锚定到 server 目录
-          ``<server>/workspaces/{workspace_id}``，保持云部署行为稳定。
+        - 顶级 agent（workspace_id == "top"）：直接映射到后端当前工作目录
+          ``<cwd>`` 本身。
+        - 其他 agent：位于 ``<cwd>/workspaces/{workspace_id}`` 子目录，
+          彼此隔离且不污染用户项目目录。
+
+        注意：新架构下本地运行模式（工具执行经反向 WS 到用户本机）不由
+        本方法决定——Frontend 端的 :class:`LocalExecutorService` 拥有独立的
+        路径映射逻辑（与后端一致保持同步即可）。
         """
         from pathlib import Path
-        if os.environ.get("LOCAL_MODE", "").strip() in ("1", "true", "True"):
-            return Path(os.getcwd()) / "workspaces" / workspace_id
         return Path(__file__).resolve().parent.parent / "workspaces" / workspace_id
     def _use_local(self) -> bool:
-        """是否应使用本地目录执行（本地模式或 Docker 不可用）。"""
-        return self.local_mode or not self._available
+        """是否应使用本地目录执行（Docker 不可用时降级）。"""
+        return not self._available
     @staticmethod
     def _resolve_sh() -> Optional[str]:
         """定位可用的 POSIX shell（本地模式执行 shell 命令用）。
@@ -144,6 +151,117 @@ class DockerManager:
     def _container_name(workspace_id: str) -> str:
         """工作空间对应的容器名称。"""
         return f"workspace_{workspace_id}"
+    # ------------------------------------------------------------------
+    # 云端共享主工作区：团队成员共享顶层 agent 的容器/卷
+    # ------------------------------------------------------------------
+    def _shared_map_path(self) -> "os.PathLike":
+        """共享映射持久化文件路径（server/data/shared_workspaces.json）。"""
+        from pathlib import Path
+        return Path(__file__).resolve().parent.parent / "data" / "shared_workspaces.json"
+
+    def _load_shared_map(self) -> None:
+        """从磁盘加载共享映射：{member_workspace_id: top_agent_workspace_id}。"""
+        try:
+            path = self._shared_map_path()
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    self._shared_owner = {
+                        str(k): str(v) for k, v in data.items() if k and v
+                    }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("加载共享工作空间映射失败: %s", exc)
+
+    def _save_shared_map(self) -> None:
+        """持久化共享映射，保证服务重启后成员仍共享顶层容器。"""
+        try:
+            path = self._shared_map_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._shared_owner, f, ensure_ascii=False, indent=2)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("保存共享工作空间映射失败: %s", exc)
+
+    def register_shared_workspace(
+        self, workspace_id: str, owner_id: str
+    ) -> None:
+        """将成员工作空间注册为共享顶层 agent 的主工作区。
+
+        :param workspace_id: 成员工作空间标识
+        :param owner_id: 所属顶层 agent 的工作空间标识（容器所有者）
+        """
+        if not workspace_id or not owner_id or workspace_id == owner_id:
+            return
+        self._shared_owner[workspace_id] = owner_id
+        self._save_shared_map()
+
+    def unregister_shared_workspace(self, workspace_id: str) -> None:
+        """取消成员工作空间的共享注册（不删除共享容器）。"""
+        if self._shared_owner.pop(workspace_id, None) is not None:
+            self._save_shared_map()
+
+    def is_shared(self, workspace_id: str) -> bool:
+        """是否为共享成员：云端模式下共享顶层 agent 的容器。"""
+        return workspace_id in self._shared_owner
+
+    def get_container_owner(self, workspace_id: str) -> str:
+        """返回实际持有容器的工作空间标识（共享成员→顶层 agent，否则为自身）。"""
+        return self._shared_owner.get(workspace_id, workspace_id)
+
+    def _container_name_for(self, workspace_id: str) -> str:
+        """返回应使用的容器名称（共享成员解析到顶层 agent 容器）。"""
+        return self._container_name(self.get_container_owner(workspace_id))
+
+    @staticmethod
+    def _is_private_path(path: str) -> bool:
+        """判断路径是否属于 agent 的私人记忆空间（``.self`` 开头的路径）。
+
+        与前端 LocalExecutorService 保持一致：仅 ``.self`` 视为私人路径，
+        ``.input``（用户上传附件）等其余路径共享主工作区。
+        兼容 ``/workspace/.self/...`` 绝对路径形式。
+        """
+        p = (path or "").replace("\\", "/").strip()
+        if p == "/workspace":
+            return False
+        if p.startswith("/workspace/"):
+            p = p[len("/workspace/"):]
+        while p.startswith("./"):
+            p = p[2:]
+        return p == ".self" or p.startswith(".self/")
+
+    def resolve_private_path(self, workspace_id: str, path: str) -> str:
+        """解析工作空间内相对路径（相对于 /workspace）。
+
+        共享成员（云端模式下共享顶层 agent 容器）的 ``.self`` 私人路径
+        路由到共享容器内 ``workspaces/{workspace_id}`` 子目录；其余路径
+        保持不变（即顶层 agent 的主工作区，团队共享）。
+        """
+        if not self.is_shared(workspace_id):
+            return path
+        p = (path or "").replace("\\", "/").strip()
+        if p.startswith("/workspace/"):
+            p = p[len("/workspace/"):]
+        elif p == "/workspace":
+            p = ""
+        while p.startswith("./"):
+            p = p[2:]
+        if not (p == ".self" or p.startswith(".self/")):
+            return path
+        rest = p[len(".self"):].lstrip("/")
+        prefix = f"workspaces/{workspace_id}/.self"
+        return prefix if not rest else f"{prefix}/{rest}"
+
+    def _rewrite_private_tokens(self, workspace_id: str, text: str) -> str:
+        """重写命令中的 ``.self`` 路径令牌（共享成员→私人子目录）。
+
+        仅当目标工作空间为共享成员时生效；顶层 agent 的命令原样返回。
+        使用词边界正则，避免误伤 ``myself`` / ``.selfish`` 等含 .self 的串。
+        """
+        if not self.is_shared(workspace_id) or not text:
+            return text
+        pattern = re.compile(r"(?<![A-Za-z0-9_.-])\.self(?![A-Za-z0-9_.-])")
+        return pattern.sub(f"workspaces/{workspace_id}/.self", text)
     def _exec(self, container, command: str) -> Dict[str, Any]:
         """在容器内通过 sh -c 执行复合命令，返回执行结果。"""
         result = container.exec_run(["sh", "-c", command])
@@ -254,18 +372,63 @@ class DockerManager:
         workspace_id: str,
         parent_workspace_id: Optional[str] = None,
         agent_name: Optional[str] = None,
+        shared_with: Optional[str] = None,
     ) -> Dict[str, Any]:
         """创建工作空间容器并完成 Git 初始化。
         :param workspace_id: 工作空间唯一标识
         :param parent_workspace_id: 父工作空间标识，存在时配置父 agent git remote
         :param agent_name: agent 名称，用于 git user 配置；缺省时从 workspace_id 派生
+        :param shared_with: 所属顶层 agent 的工作空间标识。提供时表示该工作空间为
+            团队成员，云端模式下不创建独立容器/卷，而是共享顶层 agent 的容器与
+            /workspace 主工作区，仅在其内初始化私人空间 workspaces/{id}/.self。
         :return: 包含 workspace_id / container_id / volume_name 的字典；
                  Docker 不可用时返回 error 字段
         """
+        if shared_with:
+            # 云端共享主工作区：成员不创建独立容器/卷，共享顶层 agent 容器
+            self.register_shared_workspace(workspace_id, shared_with)
+            if self._use_local():
+                # Docker 不可用：降级为本地目录创建工作空间（保留原行为）
+                return self._create_local_workspace(
+                    workspace_id, parent_workspace_id, agent_name
+                )
+            name = agent_name or f"agent-{workspace_id[:8]}"
+            try:
+                # 确保顶层 agent 容器存在（首次创建成员时可能尚未就绪）
+                owner = self.ensure_workspace(shared_with)
+                if "error" in owner:
+                    return {
+                        "error": owner["error"],
+                        "detail": owner.get("detail", ""),
+                    }
+                container = self.client.containers.get(
+                    self._container_name_for(workspace_id)
+                )
+                # 在共享容器内初始化成员私人空间 workspaces/{member_id}/.self
+                private_dir = f"workspaces/{workspace_id}/.self"
+                init_cmd = " && ".join([
+                    f"mkdir -p {private_dir}",
+                    f"echo '# Agent 活动日志' > {private_dir}/activity.log",
+                    f"echo '# 工作准则 (rule.md)' > {private_dir}/rule.md",
+                ])
+                self._exec(container, init_cmd)
+                return {
+                    "workspace_id": workspace_id,
+                    "container_id": container.id,
+                    "volume_name": self._volume_name(shared_with),
+                    "parent_workspace_id": parent_workspace_id,
+                    "agent_name": name,
+                    "shared_with": shared_with,
+                    "is_shared": True,
+                }
+            except (APIError, Exception) as exc:  # noqa: BLE001
+                return {
+                    "error": "创建共享成员工作空间失败",
+                    "detail": str(exc),
+                }
         if self._use_local():
-            # 本地模式（或 Docker 不可用）：在用户选择目录下创建本地工作空间
-            if not self.local_mode:
-                logger.info("Docker 不可用，改用本地目录创建工作空间")
+            # Docker 不可用：降级为本地目录创建工作空间
+            logger.info("Docker 不可用，改用本地目录创建工作空间")
             return self._create_local_workspace(
                 workspace_id, parent_workspace_id, agent_name
             )
@@ -484,7 +647,7 @@ class DockerManager:
         if not self._available:
             return None, {"error": "Docker 不可用", "detail": self._unavailable_reason}
         try:
-            container = self.client.containers.get(self._container_name(workspace_id))
+            container = self.client.containers.get(self._container_name_for(workspace_id))
         except NotFound:
             return None, {"error": f"工作空间容器不存在: {workspace_id}"}
         if container.status != "running":
@@ -1056,44 +1219,56 @@ class DockerManager:
             "conflict": not success,
         }
     def git_log(self, workspace_id: str, limit: int = 50) -> Dict[str, Any]:
-        """查看提交历史：``git log --oneline --all -n {limit}``。"""
+        """查看提交历史：``git log --all -n {limit}``，返回结构化提交列表。
+
+        每条提交 ``{"hash", "author", "date", "message"}``，与前端 Git 历史面板
+        的解析字段保持一致（前端按 hash/author/date/message 候选键取值）。
+        """
+        # 限制 limit 范围，防止异常输入
+        safe_limit = max(1, min(int(limit), 1000))
+        pretty = "--pretty=format:%H%x1f%an%x1f%aI%x1f%s"
         if self._use_local():
             # 本地模式：直接在本地目录执行
-            # 限制 limit 范围，防止异常输入
-            safe_limit = max(1, min(int(limit), 1000))
             result = self._local_git_exec(
                 workspace_id,
-                f"cd /workspace && git log --oneline --all -n {safe_limit}",
+                f"cd /workspace && git log --all -n {safe_limit} {pretty}",
             )
             if "error" in result:
                 return result
-            commits = [
-                line.strip()
-                for line in result["stdout"].splitlines()
-                if line.strip()
-            ]
             return {
-                "commits": commits,
+                "commits": self._parse_git_log_commits(result["stdout"]),
                 "exit_code": result["exit_code"],
             }
         container, err = self._get_container(workspace_id)
         if err:
             return err
-        # 限制 limit 范围，防止异常输入
-        safe_limit = max(1, min(int(limit), 1000))
         result = self._exec(
             container,
-            f"cd /workspace && git log --oneline --all -n {safe_limit}",
+            f"cd /workspace && git log --all -n {safe_limit} {pretty}",
         )
-        commits = [
-            line.strip()
-            for line in result["stdout"].splitlines()
-            if line.strip()
-        ]
         return {
-            "commits": commits,
+            "commits": self._parse_git_log_commits(result["stdout"]),
             "exit_code": result["exit_code"],
         }
+
+    @staticmethod
+    def _parse_git_log_commits(stdout: str) -> List[Dict[str, str]]:
+        """解析 ``git log --pretty=format:%H%x1f%an%x1f%aI%x1f%s`` 输出。
+
+        字段以单位分隔符（``0x1f``）分隔，避免提交信息中出现空格/管道符干扰解析。
+        """
+        commits: List[Dict[str, str]] = []
+        for line in (stdout or "").splitlines():
+            parts = line.split("\x1f")
+            commits.append(
+                {
+                    "hash": parts[0].strip() if len(parts) > 0 else "",
+                    "author": parts[1].strip() if len(parts) > 1 else "",
+                    "date": parts[2].strip() if len(parts) > 2 else "",
+                    "message": parts[3].strip() if len(parts) > 3 else "",
+                }
+            )
+        return commits
     def git_branches(self, workspace_id: str) -> Dict[str, Any]:
         """查看所有分支：``git branch -a``。"""
         if self._use_local():
@@ -1139,11 +1314,18 @@ class DockerManager:
         }
     def stop_workspace(self, workspace_id: str) -> Dict[str, Any]:
         """停止工作空间容器但保留卷。
-        本地模式下无需操作，直接返回成功。
+        本地模式下无需操作，直接返回成功；共享成员不得停止顶层 agent 容器。
         """
         if self._use_local():
             # 本地模式：无需停止
             return {"workspace_id": workspace_id, "status": "stopped", "is_local": True}
+        if self.is_shared(workspace_id):
+            # 共享成员：容器归顶层 agent 所有，不可单独停止
+            return {
+                "workspace_id": workspace_id,
+                "status": "running",
+                "is_shared": True,
+            }
         try:
             container = self.client.containers.get(self._container_name(workspace_id))
             container.stop()
@@ -1154,7 +1336,7 @@ class DockerManager:
             return {"error": "停止工作空间失败", "detail": str(exc)}
     def remove_workspace(self, workspace_id: str) -> Dict[str, Any]:
         """删除工作空间容器但保留卷（可手动清理）。
-        本地模式下删除整个本地目录。
+        本地模式下删除整个本地目录；共享成员仅取消共享注册，不删除顶层容器。
         """
         if self._use_local():
             # 本地模式：删除本地目录
@@ -1168,6 +1350,14 @@ class DockerManager:
                 except Exception as exc:
                     return {"error": "本地模式删除工作空间失败", "detail": str(exc)}
             return {"workspace_id": workspace_id, "status": "removed", "is_local": True}
+        if self.is_shared(workspace_id):
+            # 共享成员：仅取消共享注册，共享容器与主工作区保留
+            self.unregister_shared_workspace(workspace_id)
+            return {
+                "workspace_id": workspace_id,
+                "status": "removed",
+                "is_shared": True,
+            }
         try:
             container = self.client.containers.get(self._container_name(workspace_id))
             # 容器可能仍在运行，先停止再删除
@@ -1201,7 +1391,7 @@ class DockerManager:
                     "is_local": True,
                 }
         try:
-            container = self.client.containers.get(self._container_name(workspace_id))
+            container = self.client.containers.get(self._container_name_for(workspace_id))
             container.reload()
             # container.status: "created" / "running" / "exited" / "paused" 等
             raw_status = container.status or "unknown"
@@ -1215,8 +1405,10 @@ class DockerManager:
                 "workspace_id": workspace_id,
                 "container_id": container.id,
                 "status": status,
-                "volume_name": self._volume_name(workspace_id),
+                "volume_name": self._volume_name(self.get_container_owner(workspace_id)),
                 "is_local": False,
+                "is_shared": self.is_shared(workspace_id),
+                "shared_with": self._shared_owner.get(workspace_id, ""),
             }
         except NotFound:
             return {
@@ -1270,10 +1462,12 @@ class DockerManager:
             logger.info("本地模式：自动确保工作空间目录存在: %s", local_workspace)
             return {"created": True, "is_local": True, "workspace_id": workspace_id}
         try:
-            self.client.containers.get(self._container_name(workspace_id))
-            return {"created": False, "is_local": False}
+            self.client.containers.get(self._container_name_for(workspace_id))
+            return {"created": False, "is_local": False, "is_shared": self.is_shared(workspace_id)}
         except NotFound:
-            result = self.create_workspace(workspace_id)
+            # 共享成员：补建其所属顶层 agent 的容器（成员自身不持有容器）
+            create_target = self.get_container_owner(workspace_id)
+            result = self.create_workspace(create_target)
             result["created"] = "error" not in result
             result["is_local"] = False
             return result
@@ -1404,10 +1598,16 @@ class DockerManager:
                     "detail": str(exc),
                     "exit_code": -1,
                 }
+        # 共享成员：将命令中的 .self 路径令牌重写为私人子目录 workspaces/{id}/.self，
+        # 并把容器解析到所属顶层 agent 的共享容器（主工作区 /workspace）
+        if self.is_shared(workspace_id):
+            command = [
+                self._rewrite_private_tokens(workspace_id, c) for c in command
+            ]
         try:
-            container = self.client.containers.get(self._container_name(workspace_id))
+            container = self.client.containers.get(self._container_name_for(workspace_id))
         except NotFound:
-            # 容器不存在：自动补建（兼容历史 agent 数据，首次访问时创建）
+            # 容器不存在：自动补建（共享成员补建其所属顶层 agent 容器）
             created = self.ensure_workspace(workspace_id)
             if "error" in created:
                 return {
@@ -1417,7 +1617,7 @@ class DockerManager:
                 }
             try:
                 container = self.client.containers.get(
-                    self._container_name(workspace_id)
+                    self._container_name_for(workspace_id)
                 )
             except NotFound:
                 return {
@@ -1482,10 +1682,13 @@ class DockerManager:
                     "detail": str(exc),
                     "exit_code": -1,
                 }
+        # 共享成员：将 .self 私人路径路由到共享容器内 workspaces/{id}/.self
+        if self.is_shared(workspace_id):
+            container_path = self.resolve_private_path(workspace_id, container_path)
         try:
-            container = self.client.containers.get(self._container_name(workspace_id))
+            container = self.client.containers.get(self._container_name_for(workspace_id))
         except NotFound:
-            # 容器不存在：自动补建（兼容历史 agent 数据）
+            # 容器不存在：自动补建（共享成员补建其所属顶层 agent 容器）
             created = self.ensure_workspace(workspace_id)
             if "error" in created:
                 return {
@@ -1495,7 +1698,7 @@ class DockerManager:
                 }
             try:
                 container = self.client.containers.get(
-                    self._container_name(workspace_id)
+                    self._container_name_for(workspace_id)
                 )
             except NotFound:
                 return {

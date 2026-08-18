@@ -5,6 +5,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../services/api_service.dart';
+import '../services/local_executor_service.dart';
 import 'file_sync_button.dart';
 import 'file_tree.dart';
 import 'file_viewer.dart';
@@ -55,12 +56,24 @@ class _FilePanelState extends State<FilePanel>
   void initState() {
     super.initState();
     _tabController = TabController(length: 2, vsync: this);
+    // 本地模式开关/工作目录变化时重新加载文件列表
+    LocalExecutorService.instance.addListener(_onLocalModeChanged);
   }
 
   @override
   void dispose() {
+    LocalExecutorService.instance.removeListener(_onLocalModeChanged);
     _tabController.dispose();
     super.dispose();
+  }
+
+  /// 本地执行模式状态变化（切换开关/选择工作目录）时刷新文件树。
+  ///
+  /// 本地模式下文件面板数据源从云端容器切换到用户本机目录，
+  /// 若不刷新则仍显示旧的（容器内）文件列表。
+  void _onLocalModeChanged() {
+    if (!mounted) return;
+    _refreshFileTree();
   }
 
   /// 关闭文件查看器

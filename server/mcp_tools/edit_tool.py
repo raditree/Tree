@@ -1,13 +1,13 @@
 """MCP 工具 - edit：对工作空间内文件执行精确字符串替换。
 
-通过 ``docker_manager.exec_in_workspace`` 读取文件、在 Python 中执行
+通过 :class:`core.workspace_io.WorkspaceIO` 读取文件、在 Python 中执行
 精确字符串替换后写回文件。要求 ``old_text`` 在文件中唯一匹配。
 """
 
 import logging
 from typing import Any, Dict
 
-from core.docker_manager import DockerManager
+from core.workspace_io import WorkspaceIO
 from mcp_tools.read_tool import ReadTool
 from mcp_tools.write_tool import WriteTool
 
@@ -17,17 +17,17 @@ logger = logging.getLogger(__name__)
 class EditTool:
     """edit 工具 - 对工作空间内文件执行精确字符串替换。"""
 
-    def __init__(self, docker_manager: DockerManager, workspace_id: str) -> None:
+    def __init__(self, io: WorkspaceIO, workspace_id: str) -> None:
         """初始化 edit 工具。
 
-        :param docker_manager: Docker 工作空间管理器实例
+        :param io: 工作空间 IO 实现（云端/本地）
         :param workspace_id: 工作空间标识
         """
-        self.docker_manager = docker_manager
+        self.io = io
         self.workspace_id = workspace_id
         # 复用 read/write 工具的实现，保持文件读写逻辑一致
-        self._read_tool = ReadTool(docker_manager, workspace_id)
-        self._write_tool = WriteTool(docker_manager, workspace_id)
+        self._read_tool = ReadTool(io, workspace_id)
+        self._write_tool = WriteTool(io, workspace_id)
 
     @staticmethod
     def _is_valid_path(path: str) -> bool:

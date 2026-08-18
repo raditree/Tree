@@ -3,12 +3,12 @@
 使用嵌入模型将查询转为向量，结合语义相似度对 grep 候选结果进行重排序，
 实现更准确的语义搜索。嵌入模型未配置时自动降级为纯文本搜索。
 """
+
 import logging
 import math
-import shlex
 from typing import Any, Dict, List, Optional, Tuple
 
-from core.docker_manager import DockerManager
+from core.workspace_io import WorkspaceIO
 from core.embed_model import EmbedModelConfig, get_embedding, get_embeddings_batch, load_embed_model_config
 
 logger = logging.getLogger(__name__)
@@ -38,19 +38,19 @@ class EmbedSearchTool:
     """embed_search 工具 - 在工作空间内进行向量嵌入搜索。
 
     搜索流程：
-    1. 使用 grep 快速定位候选匹配行
+    1. 使用 grep 快速定位候选匹配行（通过 WorkspaceIO.grep_search）
     2. 若嵌入模型已配置，获取查询向量与各候选内容的向量
     3. 计算余弦相似度，按语义相关性重排序
     4. 返回 top-k 结果
     """
 
-    def __init__(self, docker_manager: DockerManager, workspace_id: str) -> None:
+    def __init__(self, io: WorkspaceIO, workspace_id: str) -> None:
         """初始化 embed_search 工具。
 
-        :param docker_manager: Docker 工作空间管理器实例
+        :param io: 工作空间 IO 实现（云端/本地）
         :param workspace_id: 工作空间标识
         """
-        self.docker_manager = docker_manager
+        self.io = io
         self.workspace_id = workspace_id
         self._embed_config: Optional[EmbedModelConfig] = None
 
@@ -129,15 +129,9 @@ class EmbedSearchTool:
                     "获取查询向量失败，降级为纯文本搜索"
                 )
 
-        # 使用 grep 搜索候选匹配行
-        grep_cmd = (
-            f"grep -rnI --exclude-dir=.git -- {shlex.quote(query)} ."
-        )
-        result = self.docker_manager.exec_in_workspace(
-            self.workspace_id, ["sh", "-c", grep_cmd]
-        )
+        # 使用 grep 搜索候选匹配行（通过 WorkspaceIO 接口，云端/本地均可）
+        result = self.io.grep_search(self.workspace_id, query)
 
-        # Docker 不可用或容器不存在
         if result.get("error"):
             return {"error": result["error"], "results": []}
 

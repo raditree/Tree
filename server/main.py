@@ -18,6 +18,7 @@ import jwt
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from openai import RateLimitError
 from pydantic import BaseModel
 
 from api.routes import router as api_router
@@ -45,13 +46,16 @@ from core.data_collection_store import (
 from core.docker_manager import DockerManager
 from core.llm import AgentLLMSession, LimitlessContextSession
 from core.models import ModelConfig, get_model_configs
-from core.session_cache import get_session, set_session
+from core.session_cache import get_session, set_session, clear_user_agent
 from core.team_broker import TeamMessageBroker
 from core.ws_manager import WebSocketManager
 from tools import register_builtin_tools
 
 # WebSocket 连接管理器（全局单例）
 ws_manager = WebSocketManager()
+
+# 本地执行器客户端（全局单例）：本地模式下把工具调用转发给前端本地执行
+_local_executor: "Optional[Any]" = None
 
 # 模块级日志器
 logger = logging.getLogger(__name__)
@@ -117,6 +121,7 @@ async def _register_tools(
         agent_id=agent_id,
         leader_id=leader_id,
         top_agent_id=top_agent_id,
+        local_executor=_local_executor,
     )
 
 
@@ -368,10 +373,17 @@ def _build_workspace_extra_info(
 async def lifespan(app: FastAPI):
     """应用生命周期：启动时加载配置与模型配置，关闭时清理资源。"""
     global _model_configs, _docker_manager, _team_broker, _top_chat_broker
+    global _local_executor
     config = get_config()
     app.state.config = config
     _model_configs = get_model_configs()
     app.state.model_configs = _model_configs
+    # 本地执行器客户端：本地模式下工具调用经反向 WS 转发给前端本地执行
+    from core.local_executor import LocalExecutorClient
+    _local_executor = LocalExecutorClient()
+    # 绑定主事件循环，供后台线程通过 run_coroutine_threadsafe 安全推送 WS 消息
+    _local_executor.bind_loop(asyncio.get_running_loop())
+    app.state.local_executor = _local_executor
     # 团队成员消息投递器：leader 发消息给成员时异步触发成员串行处理
     _team_broker = TeamMessageBroker(process_fn=_process_member_message)
     app.state.team_broker = _team_broker
@@ -386,11 +398,8 @@ async def lifespan(app: FastAPI):
     app.state.ws_manager = ws_manager
     print(f"[启动] 服务配置: {config.get('server', {})}")
     print(f"[启动] 已加载模型: {list(_model_configs.keys())}")
-    if docker_manager.local_mode:
-        print("[启动] 本地运行模式：直接使用本地终端执行命令")
-    if docker_manager.available or docker_manager.local_mode:
-        if docker_manager.available:
-            print(f"[启动] Docker 工作空间管理器就绪，镜像: {docker_manager.image}")
+    if docker_manager.available:
+        print(f"[启动] Docker 工作空间管理器就绪，镜像: {docker_manager.image}")
         # 自动创建顶部 agent 工作空间（若不存在），供前端文件管理使用
         top_status = docker_manager.get_workspace_status("top")
         if top_status.get("status") == "removed":
@@ -477,6 +486,25 @@ async def _send_status_idle(user_id: str, agent_id: str) -> None:
     )
 
 
+async def _send_status_working(user_id: str, agent_id: str) -> None:
+    """发送 agent 进入 working 状态。"""
+    await ws_manager.send_message(
+        user_id,
+        {"type": "agent_status", "data": {"agent_id": agent_id, "status": "working"}},
+    )
+
+
+async def _send_status_updating_memory(user_id: str, agent_id: str) -> None:
+    """发送 agent 进入记忆更新状态。"""
+    await ws_manager.send_message(
+        user_id,
+        {
+            "type": "agent_status",
+            "data": {"agent_id": agent_id, "status": "updating_memory"},
+        },
+    )
+
+
 async def _send_text_as_agent(
     user_id: str, agent_id: str, text: str
 ) -> None:
@@ -499,6 +527,119 @@ async def _send_text_as_agent(
 
 # 活动日志写入阈值：流式文本累积达到该长度后 flush 一次到工作空间日志
 _ACTIVITY_FLUSH_CHARS = 300
+
+# 记忆更新阶段注入的系统提示词：让 agent 用 write/edit 工具更新 .self/ 文档
+_MEMORY_UPDATE_PROMPT = (
+    "【记忆维护】本次任务已完成。请更新 .self/ 目录下的记忆文档，"
+    "记录本次任务的关键信息：\n"
+    "- .self/memory.md：任务目标、关键决策、遇到的问题及解决方案、重要结论\n"
+    "- .self/rule.md：从本次任务中总结出的工作准则或经验（如有）\n"
+    "- .self/identity.md：如角色或团队结构发生变化（可选）\n"
+    "请优先使用 read 工具读取现有内容，再用 write/edit 工具增量更新，"
+    "保留已有记忆，不要删除历史记录。\n"
+    "更新完成后，仅输出一句话确认：'记忆已更新。'\n"
+    "如果本次任务没有值得记录的信息，输出：'无需更新记忆。'"
+)
+
+
+async def _run_memory_update(
+    user_id: str,
+    agent_id: str,
+    workspace_id: str,
+    session: Any,
+    cancel_event: Optional[threading.Event] = None,
+) -> None:
+    """任务主循环完成后运行记忆更新阶段。
+
+    状态机：working -> updating_memory -> working -> idle。
+
+    流程：
+    1. 发送 ``agent_status: updating_memory``。
+    2. 向会话上下文注入记忆更新系统提示，静默运行一次完整 LLM 循环
+       （工具调用正常执行并写入 .self/ 文档，但不向前端推送文本/工具卡片）。
+    3. 结束后回滚记忆更新阶段的上下文注入与产出，保持主对话上下文干净；
+       恢复 ``last_usage`` 等字段，保证最终 token 用量仍为主回复的。
+
+    仅在普通 LLM（非无限上下文）且主回复成功时由调用方触发。
+    """
+    if session is None:
+        return
+    if cancel_event is not None and cancel_event.is_set():
+        return
+
+    await _send_status_updating_memory(user_id, agent_id)
+
+    # 上下文接近模型上限时跳过记忆维护：记忆阶段会继续执行多轮工具调用、
+    # 每轮把完整上下文重发给 LLM，容易使输入超长导致响应极慢（表现为前端
+    # 长时间"卡死"）。此时跳过记忆更新，直接回到 working 状态。
+    # 跳过阈值比例来自 app.yaml 的 llm.memory_update_skip_ratio，默认 0.9。
+    limit = getattr(session, "max_seqlen", 0) or 0
+    if limit and getattr(session, "context", None):
+        llm_cfg = get_config().get("llm", {}) or {}
+        try:
+            skip_ratio = float(llm_cfg.get("memory_update_skip_ratio", 0.9))
+        except Exception:  # noqa: BLE001
+            skip_ratio = 0.9
+        try:
+            est = session._estimate_context_tokens()
+        except Exception:  # noqa: BLE001
+            est = 0
+        if est >= int(limit * skip_ratio):
+            _append_activity_log(
+                workspace_id,
+                f"[{_clock_now()}] [memory] 上下文接近上限（{est} ≥ {limit} tokens），"
+                "跳过记忆维护以避免超长输入",
+            )
+            await _send_status_working(user_id, agent_id)
+            return
+
+    # 记忆更新阶段在上下文中的起始标记，结束后回滚
+    marker_index = len(session.context)
+    # 保存主回复的用量字段，记忆阶段结束后恢复
+    saved_usage = getattr(session, "last_usage", None)
+    saved_last_prompt = getattr(session, "_last_prompt_tokens", None)
+    saved_anchor = getattr(session, "_context_len_at_last_call", 0)
+
+    # 注入记忆更新提示
+    session.context.append({"role": "system", "content": _MEMORY_UPDATE_PROMPT})
+
+    try:
+        _, mem_status, _ = await _stream_agent_reply(
+            user_id,
+            agent_id,
+            workspace_id,
+            session,
+            "[系统] 请进入记忆维护阶段，按上述要求更新 .self/ 文档。",
+            on_tool_turn=None,
+            cancel_event=cancel_event,
+            silent=True,
+        )
+        if mem_status == "cancelled":
+            _append_activity_log(
+                workspace_id, f"[{_clock_now()}] [memory] 记忆更新被取消"
+            )
+        elif mem_status == "error":
+            _append_activity_log(
+                workspace_id, f"[{_clock_now()}] [memory] 记忆更新失败"
+            )
+        else:
+            _append_activity_log(
+                workspace_id, f"[{_clock_now()}] [memory] 记忆更新完成"
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("记忆更新阶段异常: %s", exc)
+        _append_activity_log(
+            workspace_id, f"[{_clock_now()}] [error] 记忆更新异常: {exc}"
+        )
+    finally:
+        # 回滚记忆更新阶段的上下文注入与产出，保持主对话上下文干净
+        del session.context[marker_index:]
+        # 恢复主回复的用量字段，避免最终显示的 token 用量被记忆阶段覆盖
+        session.last_usage = saved_usage
+        session._last_prompt_tokens = saved_last_prompt
+        session._context_len_at_last_call = saved_anchor
+        # 恢复工作状态（调用方随后发送 idle）
+        await _send_status_working(user_id, agent_id)
 
 
 # 进行中的 agent 任务取消事件表：(user_id, agent_id) -> threading.Event。
@@ -570,6 +711,7 @@ async def _stream_agent_reply(
     llm_content: str,
     on_tool_turn: Optional[Any] = None,
     cancel_event: Optional[threading.Event] = None,
+    silent: bool = False,
 ) -> Tuple[str, str]:
     """在后台线程中运行 chat 循环，并向前端实时推送进度事件。
 
@@ -585,6 +727,9 @@ async def _stream_agent_reply(
       同一产出内发 ``tool_end``（含结果），前端据此渲染可折叠卡片。
     - 取消：检测到 ``cancel_event`` 置位时提前退出，返回 cancelled。
 
+    :param silent: 静默模式。为 True 时不向前端推送任何 WS 事件（文本段、
+                   工具卡片、历史持久化均跳过），仅执行工具与写活动日志，
+                   用于后台记忆更新阶段。
     :return: ``(full_text, status, last_text_id)``，status 为 ``"ok"`` /
              ``"cancelled"`` / ``"error"``；``last_text_id`` 为结束时仍打开的
              文本段 id（可能为 None），供调用方在确定 usage 后补发 ``msg_usage``。
@@ -604,8 +749,13 @@ async def _stream_agent_reply(
             loop.call_soon_threadsafe(out_q.put_nowait, {"type": "cancelled"})
         except Exception as exc:  # noqa: BLE001
             logger.exception("chat 消费线程异常")
+            # 将 OpenAI 限流错误格式化为可读提示，避免前端展示原始异常串
+            if isinstance(exc, RateLimitError):
+                content = "请求被限流（429），请稍后重试。"
+            else:
+                content = str(exc)
             loop.call_soon_threadsafe(
-                out_q.put_nowait, {"type": "error", "content": str(exc)}
+                out_q.put_nowait, {"type": "error", "content": content}
             )
         finally:
             loop.call_soon_threadsafe(out_q.put_nowait, {"type": "done"})
@@ -625,14 +775,15 @@ async def _stream_agent_reply(
         """
         nonlocal text_id, text_parts
         if text_id is not None:
-            asyncio.ensure_future(
-                ws_manager.send_message(
-                    user_id, {"type": "msg_end", "id": text_id, "agent_id": agent_id}
+            if not silent:
+                asyncio.ensure_future(
+                    ws_manager.send_message(
+                        user_id, {"type": "msg_end", "id": text_id, "agent_id": agent_id}
+                    )
                 )
-            )
-            # 持久化中间文本段（非最终回复）
+            # 持久化中间文本段（非最终回复）；静默阶段不写入历史
             intermediate_text = "".join(text_parts)
-            if intermediate_text.strip():
+            if (not silent) and intermediate_text.strip():
                 try:
                     _store_message(user_id, agent_id, "agent", intermediate_text)
                 except Exception:  # noqa: BLE001
@@ -657,30 +808,32 @@ async def _stream_agent_reply(
                 content = item.get("content", "")
                 full_parts.append(content)
                 text_parts.append(content)
-                if text_id is None:
-                    text_id = _new_seg_id(agent_id)
+                if not silent:
+                    if text_id is None:
+                        text_id = _new_seg_id(agent_id)
+                        await ws_manager.send_message(
+                            user_id,
+                            {
+                                "type": "msg_start",
+                                "id": text_id,
+                                "role": "agent",
+                                "agent_id": agent_id,
+                            },
+                        )
                     await ws_manager.send_message(
                         user_id,
                         {
-                            "type": "msg_start",
+                            "type": "msg_chunk",
                             "id": text_id,
-                            "role": "agent",
                             "agent_id": agent_id,
+                            "chunk": content,
                         },
                     )
-                await ws_manager.send_message(
-                    user_id,
-                    {
-                        "type": "msg_chunk",
-                        "id": text_id,
-                        "agent_id": agent_id,
-                        "chunk": content,
-                    },
-                )
-                flush_buf += content
-                if workspace_id and len(flush_buf) >= _ACTIVITY_FLUSH_CHARS:
-                    _append_activity_log(workspace_id, f"[{_clock_now()}] {flush_buf}")
-                    flush_buf = ""
+                if workspace_id:
+                    flush_buf += content
+                    if len(flush_buf) >= _ACTIVITY_FLUSH_CHARS:
+                        _append_activity_log(workspace_id, f"[{_clock_now()}] {flush_buf}")
+                        flush_buf = ""
             elif itype == "tool_call":
                 # 结束上一段文本（中间输出独立成消息）
                 _close_text()
@@ -694,41 +847,42 @@ async def _stream_agent_reply(
                         f"{str(args)[:200]} -> {str(result)[:150]}",
                     )
                 flush_buf = ""
-                tool_id = _new_seg_id(agent_id)
-                await ws_manager.send_message(
-                    user_id,
-                    {
-                        "type": "tool_start",
-                        "id": tool_id,
-                        "agent_id": agent_id,
-                        "name": name,
-                        "arguments": args,
-                    },
-                )
-                await ws_manager.send_message(
-                    user_id,
-                    {
-                        "type": "tool_end",
-                        "id": tool_id,
-                        "agent_id": agent_id,
-                        "name": name,
-                        "result": str(result),
-                    },
-                )
-                # 工具调用完成后发送预算更新
-                if session is not None:
-                    await _send_budget_update_ws(user_id, agent_id, session)
-                # 持久化工具调用到历史表
-                try:
-                    _store_message(
-                        user_id, agent_id, "agent", "",
-                        kind="tool",
-                        tool_name=name,
-                        tool_arguments=args if isinstance(args, dict) else {},
-                        tool_result=str(result),
+                if not silent:
+                    tool_id = _new_seg_id(agent_id)
+                    await ws_manager.send_message(
+                        user_id,
+                        {
+                            "type": "tool_start",
+                            "id": tool_id,
+                            "agent_id": agent_id,
+                            "name": name,
+                            "arguments": args,
+                        },
                     )
-                except Exception:  # noqa: BLE001
-                    pass
+                    await ws_manager.send_message(
+                        user_id,
+                        {
+                            "type": "tool_end",
+                            "id": tool_id,
+                            "agent_id": agent_id,
+                            "name": name,
+                            "result": str(result),
+                        },
+                    )
+                    # 工具调用完成后发送预算更新
+                    if session is not None:
+                        await _send_budget_update_ws(user_id, agent_id, session)
+                    # 持久化工具调用到历史表；静默阶段不写入历史
+                    try:
+                        _store_message(
+                            user_id, agent_id, "agent", "",
+                            kind="tool",
+                            tool_name=name,
+                            tool_arguments=args if isinstance(args, dict) else {},
+                            tool_result=str(result),
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
             else:
                 # 未知产出类型，忽略
                 continue
@@ -872,6 +1026,15 @@ async def _process_member_message(
         if full_reply:
             _store_message(user_id, agent_id, "agent", full_reply)
         _append_activity_log(workspace_id, f"[{_clock_now()}] [done(成员)] 回复完成")
+        # 成员主回复成功后触发记忆更新阶段（普通 LLM，且未被取消时）
+        if _status == "ok" and not model_config.is_limitless_context:
+            await _run_memory_update(
+                user_id,
+                agent_id,
+                workspace_id,
+                session,
+                cancel_event=cancel_event,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.exception("成员消息处理失败: %s", exc)
         _append_activity_log(
@@ -1104,6 +1267,15 @@ async def _handle_user_message(
                 _append_activity_log(
                     workspace_id, f"[{_clock_now()}] [done] 回复完成"
                 )
+            # 主回复成功后触发记忆更新阶段（普通 LLM，且未被取消时）
+            if not model_config.is_limitless_context:
+                await _run_memory_update(
+                    user_id,
+                    agent_id,
+                    workspace_id,
+                    session,
+                    cancel_event=cancel_event,
+                )
         # 对话结束后将上下文持久化到数据库（重启后恢复）
         if session is not None:
             save_context(user_id, agent_id, session.context)
@@ -1320,6 +1492,56 @@ async def websocket_endpoint(ws: WebSocket):
                             "type": "error",
                             "data": {"message": "没有等待回答的问题"},
                         },
+                    )
+            elif msg_type == "register_local_executor":
+                # 前端注册本地执行器：该顶部 agent 的工具调用转发到前端本地执行
+                from core.local_executor import LocalExecutorClient
+                base_dir = data.get("base_dir")
+                top_agent_id = data.get("top_agent_id") or data.get("agent_id") or user_id
+                _local_executor.register(user_id, top_agent_id, base_dir)
+                # 清除该 agent 的会话缓存：即使此前会话已绑定云端工具，
+                # 下次发消息会重建会话并按本地模式重新绑定工具
+                clear_user_agent(user_id, top_agent_id)
+                # 注册成功回应
+                await ws_manager.send_message(
+                    user_id,
+                    {
+                        "type": "register_local_executor_ack",
+                        "data": {"success": True},
+                    },
+                )
+            elif msg_type == "unregister_local_executor":
+                # 前端注销某个顶部 agent 的本地执行器：该 agent 恢复云端执行
+                from core.local_executor import LocalExecutorClient
+                top_agent_id = data.get("top_agent_id") or data.get("agent_id") or user_id
+                _local_executor.unregister(user_id, top_agent_id)
+                await ws_manager.send_message(
+                    user_id,
+                    {
+                        "type": "unregister_local_executor_ack",
+                        "data": {"success": True},
+                    },
+                )
+            elif msg_type == "tool_exec_response":
+                # 前端返回工具执行结果：唤醒等待的后端请求
+                from core.local_executor import LocalExecutorClient
+                exec_id = data.get("exec_id", "")
+                result = data.get("result", {})
+                if not exec_id:
+                    await ws_manager.send_message(
+                        user_id,
+                        {
+                            "type": "error",
+                            "data": {"message": "tool_exec_response 缺少 exec_id"},
+                        },
+                    )
+                    continue
+                resolved = _local_executor.resolve(user_id, exec_id, result)
+                if not resolved:
+                    logger.warning(
+                        "tool_exec_response 未匹配到待处理请求: user_id=%s exec_id=%s",
+                        user_id,
+                        exec_id,
                     )
             else:
                 await ws_manager.send_message(

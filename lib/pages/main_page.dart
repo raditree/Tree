@@ -5,7 +5,7 @@ import 'package:flutter/material.dart';
 import '../models/agent.dart';
 import '../services/api_service.dart';
 import '../services/auth_service.dart';
-import '../services/local_backend_service.dart';
+import '../services/local_executor_service.dart';
 import '../services/websocket_service.dart';
 import '../widgets/agent_list.dart';
 import '../widgets/create_agent_dialog.dart';
@@ -116,7 +116,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
 
   /// 删除指定 agent（连同其对话历史），并同步后端
   ///
-  /// 若删除的是当前选中的 agent，则清除选中态。
+  /// 若删除的是当前选中的 agent，则清除选中态，并注销其本地执行器，
+  /// 避免删除/重建后旧注册残留导致新 agent 走错执行通道。
   Future<void> _handleDeleteAgent(Agent agent) async {
     try {
       await ApiService.deleteAgent(agent.id);
@@ -125,6 +126,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         _agents.removeWhere((a) => a.id == agent.id);
         if (_selectedAgent?.id == agent.id) {
           _selectedAgent = null;
+          // 注销当前顶部 agent 的本地执行器（后端清注册，前端复位状态）
+          LocalExecutorService.instance.unregister();
+          LocalExecutorService.instance.setCurrentTopAgent('');
         }
       });
     } catch (e) {
@@ -152,7 +156,6 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     // 清除回调，避免内存泄漏
     ApiService.onAuthError = null;
     WebSocketService.onAuthError = null;
-    LocalBackendService.dispose();
     super.dispose();
   }
 
@@ -171,7 +174,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.detached) {
-      LocalBackendService.dispose();
+      // 应用退出时清理资源
     }
   }
 

@@ -168,11 +168,8 @@ class TestLimitlessContextSession(unittest.TestCase):
         self.assertEqual(len(text_results), 1)
         self.assertEqual(text_results[0]["content"], "task 2 done")
 
-        # 验证持久化被调用（回复完成后）
-        # __init__ 调用 1 次 cat + chat 中 1 次 persist = 至少 2 次
-        self.assertGreaterEqual(
-            self.docker_manager.exec_in_workspace.call_count, 2
-        )
+        # 验证持久化被调用（回复完成后，write_file 写入上下文快照）
+        self.assertGreaterEqual(self.docker_manager.write_file.call_count, 1)
 
     # ------------------------------------------------------------------
     # 持久化测试
@@ -188,34 +185,29 @@ class TestLimitlessContextSession(unittest.TestCase):
         ]
 
         # 重置 mock 以仅捕获持久化调用
-        self.docker_manager.exec_in_workspace.reset_mock()
+        self.docker_manager.write_file.reset_mock()
 
         # 执行持久化
         session._persist_context()
 
-        # 验证 exec_in_workspace 被调用
-        self.docker_manager.exec_in_workspace.assert_called_once()
+        # 验证 write_file 被调用
+        self.docker_manager.write_file.assert_called_once()
 
-        call_args = self.docker_manager.exec_in_workspace.call_args
+        call_args = self.docker_manager.write_file.call_args
         # 第一个位置参数是 workspace_id
         workspace_id_arg = call_args[0][0]
         self.assertEqual(workspace_id_arg, self.workspace_id)
 
-        # 第二个位置参数是 command 列表
-        command = call_args[0][1]
-        self.assertIsInstance(command, list)
-        self.assertEqual(command[0], "sh")
-        self.assertEqual(command[1], "-c")
+        # 第二个位置参数是写入路径
+        path_arg = call_args[0][1]
+        self.assertEqual(path_arg, "/workspace/.self/context_snapshot.json")
 
-        # 验证 heredoc 命令包含正确的文件路径和内容
-        heredoc_script = command[2]
-        self.assertIn("/workspace/.self/context_snapshot.json", heredoc_script)
-        self.assertIn("CONTEXT_EOF", heredoc_script)
-        self.assertIn("test message", heredoc_script)
-        self.assertIn("test reply", heredoc_script)
-
-        # 验证 heredoc 使用引号分隔符（防止变量展开）
-        self.assertIn("<< 'CONTEXT_EOF'", heredoc_script)
+        # 第三个位置参数是内容 bytes，验证包含上下文消息
+        content_arg = call_args[0][2]
+        self.assertIsInstance(content_arg, bytes)
+        content = content_arg.decode("utf-8")
+        self.assertIn("test message", content)
+        self.assertIn("test reply", content)
 
     # ------------------------------------------------------------------
     # 崩溃恢复测试
@@ -325,25 +317,19 @@ class TestLimitlessContextSession(unittest.TestCase):
             {"role": "assistant", "content": "round trip reply"},
         ]
 
-        # 捕获持久化写入的内容
+        # 捕获持久化写入的内容（write_file 的第三个位置参数）
         persisted_json = None
+
+        def mock_write_file(workspace_id, path, content):
+            nonlocal persisted_json
+            persisted_json = content.decode("utf-8")
+            return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+        docker_manager.write_file.side_effect = mock_write_file
 
         def mock_exec_capture(workspace_id, command):
             nonlocal persisted_json
-            if isinstance(command, list) and len(command) > 1 and command[0] == "sh":
-                # 持久化命令：从 heredoc 中提取 JSON 内容
-                script = command[2]
-                # 提取 CONTEXT_EOF 之间的内容
-                start_marker = "<< 'CONTEXT_EOF'\n"
-                end_marker = "\nCONTEXT_EOF"
-                start_idx = script.find(start_marker)
-                end_idx = script.find(end_marker, start_idx + len(start_marker))
-                if start_idx != -1 and end_idx != -1:
-                    persisted_json = script[
-                        start_idx + len(start_marker) : end_idx
-                    ]
-                return {"exit_code": 0, "stdout": "", "stderr": ""}
-            elif isinstance(command, list) and len(command) > 0 and command[0] == "cat":
+            if isinstance(command, list) and len(command) > 0 and command[0] == "cat":
                 if persisted_json is not None:
                     return {
                         "exit_code": 0,

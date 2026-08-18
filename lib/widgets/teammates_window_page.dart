@@ -69,7 +69,7 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
       final String? status = d['status'] as String?;
       if (agentId == null) return;
       setState(() {
-        if (status == 'working') {
+        if (status == 'working' || status == 'updating_memory') {
           _workingMembers.add(agentId);
         } else if (status == 'idle' || status == 'stopping') {
           _workingMembers.remove(agentId);
@@ -487,7 +487,10 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
           ),
         );
       case 'files':
-        return _MemberFileBrowser(workspaceId: widget.memberId);
+        return _MemberFileBrowser(
+          workspaceId: widget.memberId,
+          topAgentId: widget.leader.id,
+        );
       case 'progress':
       default:
         return MessageList(
@@ -558,7 +561,13 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
 class _MemberFileBrowser extends StatefulWidget {
   final String workspaceId;
 
-  const _MemberFileBrowser({required this.workspaceId});
+  /// 所属顶层 agent ID（本地模式下用于后端判定，使成员面板也浏览共享 base）
+  final String topAgentId;
+
+  const _MemberFileBrowser({
+    required this.workspaceId,
+    required this.topAgentId,
+  });
 
   @override
   State<_MemberFileBrowser> createState() => _MemberFileBrowserState();
@@ -583,8 +592,11 @@ class _MemberFileBrowserState extends State<_MemberFileBrowser> {
       _error = null;
     });
     try {
-      final List<FileNode> files =
-          await ApiService.getFiles(widget.workspaceId, path: _currentPath);
+      final List<FileNode> files = await ApiService.getFiles(
+        widget.workspaceId,
+        path: _currentPath,
+        topAgentId: widget.topAgentId,
+      );
       if (!mounted) return;
       setState(() {
         _files = files;

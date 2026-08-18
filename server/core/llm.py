@@ -2,12 +2,15 @@
 
 import json
 import logging
+import random
 import re
+import time
 from typing import Any, Callable, Dict, Generator, List, Optional
 
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 from core.budget import BudgetTracker, PriceCalculator
+from core.config import get_config
 from core.models import ModelConfig
 
 logger = logging.getLogger(__name__)
@@ -90,10 +93,19 @@ class LLMClientFactory:
 
         :param model_config: 模型配置，提供 base_url 与 api_key
         :return: openai.OpenAI 实例
+
+        超时与重试次数为应用级配置（app.yaml 的 ``llm`` 段），未配置时
+        使用默认值。长上下文 + thinking 模型响应可能很慢，但超时必须设
+        上限，否则 API 挂起会导致前端永远显示 working（表现为卡死）。
         """
+        llm_cfg = get_config().get("llm", {}) or {}
+        timeout = float(llm_cfg.get("timeout_seconds", 300.0))
+        max_retries = int(llm_cfg.get("max_retries", 1))
         return OpenAI(
             base_url=model_config.base_url,
             api_key=model_config.api_key,
+            timeout=timeout,
+            max_retries=max_retries,
         )
 
 
@@ -253,6 +265,7 @@ class AgentLLMSession:
         reserved = {
             "temperature", "top_k", "max_seqlen", "extra_body",
             "input_price", "output_price", "cached_input_price",
+            "timeout_seconds", "max_retries", "memory_update_skip_ratio",
         }
         for key, value in extra.items():
             if key not in reserved:
@@ -308,6 +321,30 @@ class AgentLLMSession:
         logger.warning("无法解析 tool_call 参数，返回空参数: %.200r", raw)
         return {}
 
+    def _create_completion(self, client: OpenAI, api_kwargs: Dict[str, Any]) -> Any:
+        """调用 ``chat.completions.create``，触发 429 限流时指数退避重试。
+
+        上游限流（如每分钟请求数上限）通常是短暂峰值，等待片刻后即可恢复；
+        在最终抛错前给最多 5 次重试（间隔 5s → 60s，带随机抖动）。
+        """
+        max_attempts = 6  # 初始 1 次 + 重试 5 次
+        for attempt in range(max_attempts):
+            try:
+                return client.chat.completions.create(**api_kwargs)
+            except RateLimitError as exc:
+                if attempt >= max_attempts - 1:
+                    logger.warning("LLM 请求持续触发限流(429)，重试耗尽: %s", exc)
+                    raise
+                delay = min(60, 5 * (2 ** attempt)) * random.uniform(0.8, 1.2)
+                logger.warning(
+                    "LLM 请求触发限流(429)，%.1fs 后重试 %d/%d: %s",
+                    delay,
+                    attempt + 1,
+                    max_attempts - 1,
+                    exc,
+                )
+                time.sleep(delay)
+
     def _run_completion_loop(
         self, client: OpenAI, on_tool_turn: Optional[Callable[[], str]] = None
     ) -> Generator[Dict[str, Any], None, None]:
@@ -328,7 +365,7 @@ class AgentLLMSession:
             self._compress_context()
 
             api_kwargs = self._build_api_kwargs()
-            stream = client.chat.completions.create(**api_kwargs)
+            stream = self._create_completion(client, api_kwargs)
 
             content_parts: List[str] = []
             tool_calls: List[Dict[str, str]] = []
@@ -539,16 +576,19 @@ class AgentLLMSession:
         上下文的实际 token 数，对中文内容尤为准确），再叠加自上轮调用后新增
         消息的粗略估算（``len(str)//4``）。无历史调用时回退到字符数估算。
 
+        返回时与字符估算取较大值：字符估算对中文可能低估，而真实
+        ``prompt_tokens`` 在上下文被压缩/回滚后可能失真（锚点失效），
+        取大值能确保压缩阈值判断不因估算偏低而漏触发。
+
         :return: 估算的上下文 token 总数
         """
+        char_est = sum(len(str(m)) // 4 for m in self.context)
         base = getattr(self, "_last_prompt_tokens", None)
         if base is not None:
             anchor = getattr(self, "_context_len_at_last_call", 0)
-            added = sum(
-                len(str(m)) // 4 for m in self.context[anchor:]
-            )
-            return base + added
-        return sum(len(str(m)) // 4 for m in self.context)
+            added = sum(len(str(m)) // 4 for m in self.context[anchor:])
+            return max(base + added, char_est)
+        return char_est
 
     def _compress_context(self) -> None:
         """检查并压缩上下文（自动触发，带阈值判断）。
@@ -620,6 +660,11 @@ class AgentLLMSession:
 
         # 重组上下文：system 消息 + 总结 + 保留的最近用户要求及其后消息
         self.context = system_msgs + [summary_msg] + to_keep
+
+        # 压缩后 context 长度变化，旧的真实 prompt_tokens 锚点已失效；
+        # 重置锚点让下次估算以字符估算重新校准，避免高估触发重复压缩
+        self._last_prompt_tokens = None
+        self._context_len_at_last_call = len(self.context)
 
         # 触发记忆更新标志位（后续 Task 13 通过回调或标志位处理）
         self.memory_update_pending = True
@@ -867,9 +912,11 @@ class LimitlessContextSession(AgentLLMSession):
     def _persist_context(self) -> None:
         """将当前上下文持久化到工作空间的 JSON 文件。
 
-        将 self.context 序列化为 JSON，通过 docker_manager 写入
-        ``/workspace/.self/context_snapshot.json``。使用 heredoc 方式写入，
-        避免特殊字符转义问题。docker_manager 为 None 时跳过（测试环境）。
+        将 self.context 序列化为 JSON，通过 docker_manager.write_file 写入
+        ``/workspace/.self/context_snapshot.json``（共享成员自动路由到私人空间
+        ``workspaces/{id}/.self``）。使用 put_archive 流式写入，避免 shell
+        heredoc 转义问题与内容中含 ``.self`` 导致的误重写。
+        docker_manager 为 None 时跳过（测试环境）。
         """
         if self.docker_manager is None:
             logger.debug(
@@ -880,15 +927,10 @@ class LimitlessContextSession(AgentLLMSession):
 
         try:
             context_json = json.dumps(self.context, ensure_ascii=False)
-            # 使用 heredoc 写入文件，避免 JSON 中的特殊字符导致命令注入或转义问题
-            command = [
-                "sh", "-c",
-                f"cat > /workspace/.self/context_snapshot.json << 'CONTEXT_EOF'\n"
-                f"{context_json}\n"
-                f"CONTEXT_EOF",
-            ]
-            result = self.docker_manager.exec_in_workspace(
-                self.workspace_id, command
+            result = self.docker_manager.write_file(
+                self.workspace_id,
+                "/workspace/.self/context_snapshot.json",
+                context_json.encode("utf-8"),
             )
             if result.get("exit_code", -1) != 0:
                 logger.warning(

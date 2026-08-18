@@ -434,11 +434,13 @@ class TeamTool:
         member_id = self._generate_member_id()
         member_name = arguments.get("member_name") or f"member-{member_id[-6:]}"
 
-        # 创建工作空间（含 Git，parent_workspace_id 设为当前 agent 的 workspace_id）
+        # 创建工作空间（含 Git，parent_workspace_id 设为当前 agent 的 workspace_id；
+        # 云端模式下共享所属顶层 agent 的主工作区，仅初始化私人空间 .self）
         ws_result = self.docker_manager.create_workspace(
             workspace_id=member_id,
             parent_workspace_id=self.workspace_id or None,
             agent_name=member_name,
+            shared_with=self.top_agent_id,
         )
         if "error" in ws_result:
             return {"error": "创建成员工作空间失败", "detail": ws_result}
@@ -803,6 +805,7 @@ class TeamTool:
                     workspace_id=ws_id,
                     parent_workspace_id=member.get("parent_workspace_id") or None,
                     agent_name=member.get("name") or "",
+                    shared_with=self.top_agent_id,
                 )
                 if "error" not in create_result:
                     workspace_rebuilt = True

@@ -20,6 +20,7 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.docker_manager import DockerManager  # noqa: E402
+from core.workspace_io import CloudWorkspaceIO, WorkspaceIO  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +28,8 @@ logger = logging.getLogger(__name__)
 _PROTOCOL_VERSION = "2024-11-05"
 
 
-def _exec_python(workspace_id: str, docker_manager: DockerManager, script: str) -> dict:
-    """在 Docker 工作空间内执行 Python 脚本并返回解析后的 JSON 结果。"""
+def _exec_python(workspace_id: str, io: WorkspaceIO, script: str) -> dict:
+    """在工作空间内执行 Python 脚本并返回解析后的 JSON 结果。"""
     # 将脚本内容缩进 4 格（放入 try 块），避免 f-string 多行替换丢失缩进
     indented_script = textwrap.indent(script, "    ")
     full_script = (
@@ -38,9 +39,7 @@ def _exec_python(workspace_id: str, docker_manager: DockerManager, script: str) 
         "except Exception as e:\n"
         '    print(json.dumps({"success": False, "error": str(e)}))\n'
     )
-    result = docker_manager.exec_in_workspace(
-        workspace_id, ["python3", "-c", full_script]
-    )
+    result = io.exec_argv(workspace_id, ["python3", "-c", full_script])
     exit_code = result.get("exit_code", -1)
     stdout = result.get("stdout", "") or ""
     stderr = result.get("stderr", "") or ""
@@ -178,10 +177,10 @@ TOOLS = [
 ]
 
 
-def _handle_tool_call(name: str, arguments: dict, workspace_id: str, docker_manager: DockerManager) -> str:
+def _handle_tool_call(name: str, arguments: dict, workspace_id: str, io: WorkspaceIO) -> str:
     """执行工具调用并返回 MCP CallToolResult 的 JSON 字符串。"""
     try:
-        result_text = _execute_tool(name, arguments, workspace_id, docker_manager)
+        result_text = _execute_tool(name, arguments, workspace_id, io)
         return json.dumps({
             "content": [{"type": "text", "text": result_text}],
             "isError": False,
@@ -193,7 +192,7 @@ def _handle_tool_call(name: str, arguments: dict, workspace_id: str, docker_mana
         })
 
 
-def _execute_tool(name: str, arguments: dict, workspace_id: str, docker_manager: DockerManager) -> str:
+def _execute_tool(name: str, arguments: dict, workspace_id: str, io: WorkspaceIO) -> str:
     """执行具体工具逻辑。"""
     file_path = arguments.get("file_path", "")
 
@@ -204,7 +203,7 @@ def _execute_tool(name: str, arguments: dict, workspace_id: str, docker_manager:
             pages = [{{"page": i+1, "text": page.get_text()}} for i, page in enumerate(doc)]
             print(json.dumps({{"success": True, "pages": len(doc), "content": pages}}))
         """)
-        return _dump(_exec_python(workspace_id, docker_manager, script))
+        return _dump(_exec_python(workspace_id, io, script))
 
     elif name == "read_docx":
         script = textwrap.dedent(f"""\
@@ -219,7 +218,7 @@ def _execute_tool(name: str, arguments: dict, workspace_id: str, docker_manager:
                 tables.append(rows)
             print(json.dumps({{"success": True, "paragraphs": paragraphs, "tables": tables}}))
         """)
-        return _dump(_exec_python(workspace_id, docker_manager, script))
+        return _dump(_exec_python(workspace_id, io, script))
 
     elif name == "read_pptx":
         script = textwrap.dedent(f"""\
@@ -234,7 +233,7 @@ def _execute_tool(name: str, arguments: dict, workspace_id: str, docker_manager:
                 slides.append({{"slide": i+1, "texts": texts}})
             print(json.dumps({{"success": True, "slides": slides}}))
         """)
-        return _dump(_exec_python(workspace_id, docker_manager, script))
+        return _dump(_exec_python(workspace_id, io, script))
 
     elif name == "read_xlsx":
         script = textwrap.dedent(f"""\
@@ -249,7 +248,7 @@ def _execute_tool(name: str, arguments: dict, workspace_id: str, docker_manager:
                 sheets.append({{"name": name, "rows": rows}})
             print(json.dumps({{"success": True, "sheets": sheets}}))
         """)
-        return _dump(_exec_python(workspace_id, docker_manager, script))
+        return _dump(_exec_python(workspace_id, io, script))
 
     elif name == "create_docx":
         content = arguments.get("content", "")
@@ -263,7 +262,7 @@ def _execute_tool(name: str, arguments: dict, workspace_id: str, docker_manager:
             doc.save("{file_path}")
             print(json.dumps({{"success": True, "file_path": "{file_path}"}}))
         """)
-        return _dump(_exec_python(workspace_id, docker_manager, script))
+        return _dump(_exec_python(workspace_id, io, script))
 
     elif name == "create_pptx":
         slides = arguments.get("slides", "[]")
@@ -284,7 +283,7 @@ def _execute_tool(name: str, arguments: dict, workspace_id: str, docker_manager:
             prs.save("{file_path}")
             print(json.dumps({{"success": True, "file_path": "{file_path}"}}))
         """)
-        return _dump(_exec_python(workspace_id, docker_manager, script))
+        return _dump(_exec_python(workspace_id, io, script))
 
     elif name == "create_xlsx":
         data = arguments.get("data", "{}")
@@ -306,13 +305,13 @@ def _execute_tool(name: str, arguments: dict, workspace_id: str, docker_manager:
             wb.save("{file_path}")
             print(json.dumps({{"success": True, "file_path": "{file_path}"}}))
         """)
-        return _dump(_exec_python(workspace_id, docker_manager, script))
+        return _dump(_exec_python(workspace_id, io, script))
 
     else:
         return json.dumps({"success": False, "error": f"未知工具: {name}"})
 
 
-def _handle_request(request: dict, workspace_id: str, docker_manager: DockerManager) -> str:
+def _handle_request(request: dict, workspace_id: str, io: WorkspaceIO) -> str:
     """处理单个 JSON-RPC 请求，返回 JSON-RPC 响应字符串。"""
     req_id = request.get("id")
     method = request.get("method", "")
@@ -350,7 +349,7 @@ def _handle_request(request: dict, workspace_id: str, docker_manager: DockerMana
     elif method == "tools/call":
         name = params.get("name", "")
         arguments = params.get("arguments", {}) or {}
-        result_text = _handle_tool_call(name, arguments, workspace_id, docker_manager)
+        result_text = _handle_tool_call(name, arguments, workspace_id, io)
         # 返回结果已经包含 content
         resp = json.loads(result_text)
         return json.dumps({
@@ -379,6 +378,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
     workspace_id = os.environ.get("WORKSPACE_ID", "")
     docker_manager = DockerManager()
+    io: WorkspaceIO = CloudWorkspaceIO(docker_manager)
 
     if not docker_manager.available:
         logger.warning("Docker 不可用，文档处理服务将无法工作")
@@ -397,7 +397,7 @@ def main() -> None:
             continue
 
         try:
-            response = _handle_request(request, workspace_id, docker_manager)
+            response = _handle_request(request, workspace_id, io)
             if response:
                 sys.stdout.write(response + "\n")
                 sys.stdout.flush()

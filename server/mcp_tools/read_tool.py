@@ -1,13 +1,13 @@
 """MCP 工具 - read：读取工作空间内的文件内容。
 
-通过 ``docker_manager.exec_in_workspace`` 在 agent 的 Docker 工作空间内
-执行 ``cat`` 命令读取文件，文件路径需通过防注入校验。
+通过 :class:`core.workspace_io.WorkspaceIO` 读取文件，云端/本地实现均可。
+文件路径需通过防注入校验。
 """
 
 import logging
 from typing import Any, Dict
 
-from core.docker_manager import DockerManager
+from core.workspace_io import WorkspaceIO
 
 logger = logging.getLogger(__name__)
 
@@ -15,13 +15,13 @@ logger = logging.getLogger(__name__)
 class ReadTool:
     """read 工具 - 读取工作空间内的文件内容。"""
 
-    def __init__(self, docker_manager: DockerManager, workspace_id: str) -> None:
+    def __init__(self, io: WorkspaceIO, workspace_id: str) -> None:
         """初始化 read 工具。
 
-        :param docker_manager: Docker 工作空间管理器实例
+        :param io: 工作空间 IO 实现（云端/本地）
         :param workspace_id: 工作空间标识
         """
-        self.docker_manager = docker_manager
+        self.io = io
         self.workspace_id = workspace_id
 
     @staticmethod
@@ -76,25 +76,13 @@ class ReadTool:
         if not self._is_valid_path(file_path):
             return {"error": "非法文件路径，仅允许字母数字、/_-. 字符"}
 
-        # encoding 参数目前仅作记录，cat 输出由 docker_manager 按 utf-8 解码
         encoding = arguments.get("encoding", "utf-8") or "utf-8"
 
-        result = self.docker_manager.exec_in_workspace(
-            self.workspace_id, ["cat", file_path]
-        )
+        result = self.io.read_file(self.workspace_id, file_path, encoding)
 
-        # Docker 不可用或容器不存在
         if result.get("error"):
             return {"error": result["error"], "file_path": file_path}
 
-        exit_code = result.get("exit_code", -1)
-        if exit_code != 0:
-            logger.info("read 工具读取文件失败: %s, exit_code=%s", file_path, exit_code)
-            return {
-                "error": f"文件不存在或无法读取: {file_path}",
-                "file_path": file_path,
-            }
-
-        content = result.get("stdout", "")
+        content = result.get("content", "")
         logger.info("read 工具读取文件成功: %s (encoding=%s)", file_path, encoding)
         return {"content": content, "file_path": file_path}

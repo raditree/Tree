@@ -17,6 +17,7 @@ from mcp.server.mcpserver import MCPServer
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.docker_manager import DockerManager  # noqa: E402
+from core.workspace_io import CloudWorkspaceIO  # noqa: E402
 from mcp_tools.edit_tool import EditTool  # noqa: E402
 from mcp_tools.embed_search_tool import EmbedSearchTool  # noqa: E402
 from mcp_tools.read_tool import ReadTool  # noqa: E402
@@ -30,12 +31,13 @@ def _build_server() -> MCPServer:
     """构建暴露工作空间基础工具的 MCP server。"""
     workspace_id = os.environ.get("WORKSPACE_ID", "")
     docker_manager = DockerManager()
+    io = CloudWorkspaceIO(docker_manager)
 
-    read_tool = ReadTool(docker_manager, workspace_id)
-    write_tool = WriteTool(docker_manager, workspace_id)
-    edit_tool = EditTool(docker_manager, workspace_id)
-    terminal_tool = TerminalTool(docker_manager, workspace_id)
-    embed_tool = EmbedSearchTool(docker_manager, workspace_id)
+    read_tool = ReadTool(io, workspace_id)
+    write_tool = WriteTool(io, workspace_id)
+    edit_tool = EditTool(io, workspace_id)
+    terminal_tool = TerminalTool(io, workspace_id)
+    embed_tool = EmbedSearchTool(io, workspace_id)
 
     server = MCPServer(
         name=f"workspace-{workspace_id or 'default'}",

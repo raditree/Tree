@@ -1,4 +1,5 @@
 """REST API 路由定义。"""
+import asyncio
 import base64
 import datetime
 import logging
@@ -600,12 +601,14 @@ def _escape_shell_path(path: str) -> str:
     return path.replace("'", "'\\''")
 
 
-def _parse_ls_output(output: str, base_path: str = "") -> List[Dict[str, Any]]:
+def _parse_ls_output(
+    output: str, base_path: str = "", skip_names: Optional[set] = None
+) -> List[Dict[str, Any]]:
     """解析 ``ls -la --time-style=long-iso`` 输出为文件信息列表。
 
-    输出格式：``perms links owner group size date time name``
     ：param base_path: 当前列出的目录（相对工作空间根），用于拼接文件完整路径，
         使前端能直接以 ``path`` 打开子目录中的文件（如 PDF 预览/内容读取）。
+    ：param skip_names: 需要从列表中剔除的条目名集合（如共享成员隐藏 .git / workspaces）。
     """
     base = base_path.strip("/")
     files: List[Dict[str, Any]] = []
@@ -618,6 +621,8 @@ def _parse_ls_output(output: str, base_path: str = "") -> List[Dict[str, Any]]:
             continue
         name = " ".join(parts[7:])
         if name in (".", ".."):
+            continue
+        if skip_names and name in skip_names:
             continue
         perms = parts[0]
         size_str = parts[4]
@@ -642,13 +647,39 @@ async def list_files(
     workspace_id: str,
     request: Request,
     path: str = Query("", description="子路径，默认根目录"),
-    _: dict = Depends(get_current_user),
+    top_agent_id: str = Query("", description="所属顶层 agent ID（成员浏览时传入，用于本地模式判定）"),
+    current_user: dict = Depends(get_current_user),
 ):
     """获取工作空间文件列表。
 
-    查询参数 ``path`` 指定子路径（默认根目录），
-    通过 docker_manager.exec_in_workspace 执行 ``ls -la`` 获取文件列表。
+    查询参数 ``path`` 指定子路径（默认根目录）。
+    本地模式下通过反向 WS 转发给前端本地执行器，列出用户本机工作目录；
+    云端模式通过 docker_manager.exec_in_workspace 执行 ``ls -la`` 获取文件列表。
     """
+    # 本地模式：转发给前端本地执行器，列出本机工作空间目录
+    local_executor = getattr(request.app.state, "local_executor", None)
+    ws_manager = getattr(request.app.state, "ws_manager", None)
+    if local_executor is not None and ws_manager is not None:
+        user_id = current_user.get("openid", "")
+        # 成员会话以其所属顶层 agent 为本地判定键（top_agent_id or workspace_id）
+        local_key = top_agent_id or workspace_id
+        if local_executor.is_local(user_id, local_key):
+            # 异步端点内不可阻塞事件循环（否则 WS 接收无法处理响应导致死锁），
+            # 因此放入线程池中执行阻塞式请求
+            result = await asyncio.to_thread(
+                local_executor.request,
+                ws_manager,
+                user_id,
+                {
+                    "op": "list_files",
+                    "workspace_id": workspace_id,
+                    "path": path,
+                },
+            )
+            if "error" in result:
+                raise HTTPException(status_code=404, detail=result)
+            return {"files": result.get("files", [])}
+
     docker_manager = _get_docker_manager(request)
     if not path:
         # 根目录：使用 "."，避免空字符串被当作不存在的文件名
@@ -665,7 +696,11 @@ async def list_files(
         raise HTTPException(status_code=404, detail=result)
     if result.get("exit_code", 0) != 0:
         raise HTTPException(status_code=404, detail=f"路径不存在: {path}")
-    files = _parse_ls_output(result.get("stdout", ""), path)
+    # 云端列表隐藏 .git（git 元数据）与 workspaces（各 agent 私人空间），
+    # 与本地模式的文件浏览语义保持一致，避免私人记忆互相泄露
+    files = _parse_ls_output(
+        result.get("stdout", ""), path, {".git", "workspaces"}
+    )
     return {"files": files}
 
 
@@ -674,16 +709,46 @@ async def get_file_content(
     workspace_id: str,
     request: Request,
     path: str = Query(..., description="文件路径"),
-    _: dict = Depends(get_current_user),
+    top_agent_id: str = Query("", description="所属顶层 agent ID（成员浏览时传入，用于本地模式判定）"),
+    current_user: dict = Depends(get_current_user),
 ):
     """获取文件内容。
 
-    查询参数 ``path`` 指定文件路径，
-    通过 docker_manager.exec_in_workspace 读取文件内容。
+    查询参数 ``path`` 指定文件路径。
+    本地模式下通过反向 WS 转发给前端本地执行器读取本机文件；
+    云端模式通过 docker_manager.exec_in_workspace 读取文件内容。
     图片文件（png/jpg/gif 等）返回 base64 编码，``is_base64=true``。
     """
     if not path:
         raise HTTPException(status_code=400, detail="path 参数不能为空")
+
+    # 本地模式：转发给前端本地执行器，读取本机工作空间文件
+    local_executor = getattr(request.app.state, "local_executor", None)
+    ws_manager = getattr(request.app.state, "ws_manager", None)
+    if local_executor is not None and ws_manager is not None:
+        user_id = current_user.get("openid", "")
+        local_key = top_agent_id or workspace_id
+        if local_executor.is_local(user_id, local_key):
+            result = await asyncio.to_thread(
+                local_executor.request,
+                ws_manager,
+                user_id,
+                {
+                    "op": "read_file",
+                    "workspace_id": workspace_id,
+                    "path": path,
+                    "encoding": "utf-8",
+                },
+            )
+            if "error" in result or result.get("exit_code", 0) != 0:
+                raise HTTPException(status_code=404, detail="文件不存在或无法读取")
+            content = result.get("content", "")
+            return {
+                "content": content,
+                "path": path,
+                "size": len(content.encode("utf-8")),
+            }
+
     docker_manager = _get_docker_manager(request)
     safe_path = _escape_shell_path(path)
 
@@ -879,13 +944,17 @@ async def download_file(
     workspace_id: str,
     req: FileDownloadRequest,
     request: Request,
-    _: dict = Depends(get_current_user),
+    top_agent_id: str = Query("", description="所属顶层 agent ID（成员浏览时传入，用于本地模式判定）"),
+    current_user: dict = Depends(get_current_user),
 ):
     """从工作空间下载文件，返回文件内容（StreamingResponse）。
 
     使用 base64 方案读取二进制内容（避免 cat 经 stdout 的 UTF-8 解码损坏二进制）。
+    本地模式下读取用户本机文件。
     """
-    content = _read_file_bytes(workspace_id, req.path, request)
+    content = await _read_file_bytes(
+        workspace_id, req.path, request, current_user, top_agent_id
+    )
     filename = req.path.rsplit("/", 1)[-1] or "download"
     # 使用 RFC 5987 格式支持非 Latin-1 字符（如中文文件名）
     encoded_filename = quote(filename, safe="")
@@ -903,9 +972,21 @@ async def download_folder(
     workspace_id: str,
     req: FileDownloadRequest,
     request: Request,
-    _: dict = Depends(get_current_user),
+    top_agent_id: str = Query("", description="所属顶层 agent ID（成员浏览时传入，用于本地模式判定）"),
+    current_user: dict = Depends(get_current_user),
 ):
     """从工作空间下载文件夹，打包为 tar.gz 返回。"""
+    # 本地模式暂不支持文件夹打包下载（tar 命令与路径跨平台差异较大）
+    local_executor = getattr(request.app.state, "local_executor", None)
+    ws_manager = getattr(request.app.state, "ws_manager", None)
+    if local_executor is not None and ws_manager is not None:
+        user_id = current_user.get("openid", "")
+        local_key = top_agent_id or workspace_id
+        if local_executor.is_local(user_id, local_key):
+            raise HTTPException(
+                status_code=400,
+                detail="本地模式暂不支持文件夹打包下载，请逐个下载文件",
+            )
     docker_manager = _get_docker_manager(request)
     safe_path = _escape_shell_path(req.path)
 
@@ -932,12 +1013,47 @@ async def download_folder(
     )
 
 
-def _read_file_bytes(workspace_id: str, path: str, request: Request) -> bytes:
+async def _read_file_bytes(
+    workspace_id: str,
+    path: str,
+    request: Request,
+    current_user: Optional[dict] = None,
+    top_agent_id: str = "",
+) -> bytes:
     """从工作空间读取文件原始字节。
 
-    在容器内用 base64 编码文件内容，服务器端解码后返回字节，
-    适用于 PDF 等二进制文件。
+    本地模式下通过反向 WS 让前端本地执行器读取本机文件（base64 回传），
+    服务器端解码后返回字节；云端模式在容器内用 base64 编码文件内容，
+    服务器端解码后返回字节。适用于 PDF 等二进制文件。
     """
+    # 本地模式：转发给前端本地执行器，读取本机文件字节（base64 回传）
+    local_executor = getattr(request.app.state, "local_executor", None)
+    ws_manager = getattr(request.app.state, "ws_manager", None)
+    if (
+        local_executor is not None
+        and ws_manager is not None
+        and current_user
+    ):
+        user_id = current_user.get("openid", "")
+        local_key = top_agent_id or workspace_id
+        if local_executor.is_local(user_id, local_key):
+            result = await asyncio.to_thread(
+                local_executor.request,
+                ws_manager,
+                user_id,
+                {
+                    "op": "read_file_bytes",
+                    "workspace_id": workspace_id,
+                    "path": path,
+                },
+            )
+            if "error" in result or result.get("exit_code", 0) != 0:
+                raise HTTPException(status_code=404, detail="文件不存在或无法读取")
+            b64_data = "".join(str(result.get("content_base64", "")).split())
+            if not b64_data:
+                raise HTTPException(status_code=500, detail="文件内容为空")
+            return base64.b64decode(b64_data)
+
     docker_manager = _get_docker_manager(request)
     safe_path = _escape_shell_path(path)
     result = docker_manager.exec_in_workspace(
@@ -979,7 +1095,8 @@ async def get_pdf_info(
     workspace_id: str,
     request: Request,
     path: str = Query(..., description="PDF 文件路径"),
-    _: dict = Depends(get_current_user),
+    top_agent_id: str = Query("", description="所属顶层 agent ID（成员浏览时传入，用于本地模式判定）"),
+    current_user: dict = Depends(get_current_user),
 ):
     """获取 PDF 文件信息（总页数、标题、作者）。
 
@@ -991,7 +1108,9 @@ async def get_pdf_info(
     if not path:
         raise HTTPException(status_code=400, detail="path 参数不能为空")
 
-    pdf_bytes = _read_file_bytes(workspace_id, path, request)
+    pdf_bytes = await _read_file_bytes(
+        workspace_id, path, request, current_user, top_agent_id
+    )
     tmp_path = _save_temp_pdf(pdf_bytes)
     try:
         doc = fitz.open(tmp_path)
@@ -1018,7 +1137,8 @@ async def get_pdf_preview(
     path: str = Query(..., description="PDF 文件路径"),
     page: int = Query(1, ge=1, description="页码，从 1 开始"),
     scale: float = Query(2.0, gt=0, description="缩放比例"),
-    _: dict = Depends(get_current_user),
+    top_agent_id: str = Query("", description="所属顶层 agent ID（成员浏览时传入，用于本地模式判定）"),
+    current_user: dict = Depends(get_current_user),
 ):
     """获取 PDF 指定页的预览图片（PNG，base64 编码）。
 
@@ -1030,7 +1150,9 @@ async def get_pdf_preview(
     if not path:
         raise HTTPException(status_code=400, detail="path 参数不能为空")
 
-    pdf_bytes = _read_file_bytes(workspace_id, path, request)
+    pdf_bytes = await _read_file_bytes(
+        workspace_id, path, request, current_user, top_agent_id
+    )
     tmp_path = _save_temp_pdf(pdf_bytes)
     try:
         doc = fitz.open(tmp_path)
@@ -1272,12 +1394,35 @@ async def git_log(
     workspace_id: str,
     request: Request,
     limit: int = 50,
-    _: dict = Depends(get_current_user),
+    top_agent_id: str = Query("", description="所属顶层 agent ID（成员浏览时传入，用于本地模式判定）"),
+    current_user: dict = Depends(get_current_user),
 ):
     """查看提交历史。
 
     查询参数 ``limit``（默认 50），返回 ``{"commits": [...]}``。
+    本地模式下通过反向 WS 让前端本地执行器在本机工作空间执行 ``git log``。
     """
+    # 本地模式：转发给前端本地执行器，在本机工作空间执行 git log
+    local_executor = getattr(request.app.state, "local_executor", None)
+    ws_manager = getattr(request.app.state, "ws_manager", None)
+    if local_executor is not None and ws_manager is not None:
+        user_id = current_user.get("openid", "")
+        local_key = top_agent_id or workspace_id
+        if local_executor.is_local(user_id, local_key):
+            result = await asyncio.to_thread(
+                local_executor.request,
+                ws_manager,
+                user_id,
+                {
+                    "op": "git_log",
+                    "workspace_id": workspace_id,
+                    "limit": int(limit),
+                },
+            )
+            if "error" in result:
+                raise HTTPException(status_code=500, detail=result)
+            return {"commits": result.get("commits", [])}
+
     docker_manager = _get_docker_manager(request)
     result = docker_manager.git_log(workspace_id, limit=limit)
     if "error" in result:
@@ -1289,9 +1434,30 @@ async def git_log(
 async def git_branches(
     workspace_id: str,
     request: Request,
-    _: dict = Depends(get_current_user),
+    top_agent_id: str = Query("", description="所属顶层 agent ID（成员浏览时传入，用于本地模式判定）"),
+    current_user: dict = Depends(get_current_user),
 ):
     """查看分支列表，返回 ``{"branches": [...], "current": "..."}``。"""
+    # 本地模式：转发给前端本地执行器，在本机工作空间执行 git branch
+    local_executor = getattr(request.app.state, "local_executor", None)
+    ws_manager = getattr(request.app.state, "ws_manager", None)
+    if local_executor is not None and ws_manager is not None:
+        user_id = current_user.get("openid", "")
+        local_key = top_agent_id or workspace_id
+        if local_executor.is_local(user_id, local_key):
+            result = await asyncio.to_thread(
+                local_executor.request,
+                ws_manager,
+                user_id,
+                {"op": "git_branches", "workspace_id": workspace_id},
+            )
+            if "error" in result:
+                raise HTTPException(status_code=500, detail=result)
+            return {
+                "branches": result.get("branches", []),
+                "current": result.get("current", ""),
+            }
+
     docker_manager = _get_docker_manager(request)
     result = docker_manager.git_branches(workspace_id)
     if "error" in result:

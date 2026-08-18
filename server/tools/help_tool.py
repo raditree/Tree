@@ -383,26 +383,46 @@ class HelpTool:
         if policy_lines:
             resource_block = "\n".join(["（当前资源限制）"] + list(policy_lines))
         workspace = (
-            "每个 agent 拥有独立的沙箱工作空间，彼此隔离。你通过 MCP 的 workspace "
-            "服务读写文件、执行命令、语义搜索，所有操作都落在自己的沙箱内。工作过程"
-            "由内置 Git 仓库跟踪，每次阶段性成果建议提交，便于回溯与汇报；父 agent "
-            "可通过 view_member_output/query_status 查看你的产出与提交。沙箱受到资源"
-            "与网络限制（白名单出站、下载上限、存储软上限），请据此控制产出规模与"
-            "下载行为。\n"
+            "团队协作采用共享主工作区：同一顶层 agent 及其团队成员共享同一个"
+            "工作空间（云端模式下共享顶层 agent 的 Docker 容器 /workspace，本地"
+            "模式下共享用户选择的工作目录 <baseDir>），全队在同一份项目文件中读写"
+            "执行、协同工作；而每个 agent 的私人记忆文件（.self/memory.md、"
+            ".self/rule.md、.self/team_roster.md、.self/activity.log 等）分别"
+            "存放在各自的私人空间（云端 workspaces/agent_<id>/.self，本地 "
+            "<baseDir>/workspaces/agent_<id>/.self），与共享主工作区隔离、互不"
+            "泄露。你通过 MCP 的 workspace 服务读写文件、执行命令、语义搜索。工作"
+            "过程由内置 Git 仓库跟踪，每次阶段性成果建议提交，便于回溯与汇报；父"
+            " agent 可通过 view_member_output/query_status 查看你的产出与提交。"
+            "沙箱受到资源与网络限制（白名单出站、下载上限、存储软上限），请据此"
+            "控制产出规模与下载行为。\n"
             + resource_block
         )
         lines += ["## 2. 工作区与沙箱机制", workspace, ""]
 
         # ---- 本地运行机制 ----
         local_mode = (
-            "后端默认运行在 Docker 容器中。对于拥有较好设备的开发者，"
-            "可通过前端消息窗口左上角的电源开关切换为本地运行模式："
-            "后端（Python FastAPI 服务）直接运行在用户的开发机上，"
-            "前端通过 localhost:8000 直连。工作目录在开启时选择。"
-            "此模式下无需 Docker，启动更快，适合本地开发调试。"
-            "切换回远程模式时，后端自动停止，前端重新连接远程服务。"
+            "后端默认运行在云端服务器（Docker 沙箱）中。对于拥有较好设备的开发者，"
+            "可通过前端消息窗口左上角的电源开关将运行模式切换为本地执行：后端仍在"
+            "云端运行，但工具调用环境转移到用户本机——read/write/terminal/"
+            "embed_search 等工具直接在用户选择的工作目录中执行，经反向 WebSocket "
+            "把结果回传后端。\n"
+            "本地执行模式按顶部 agent 单独控制：每个顶部 agent 可分别处于本地或"
+            "云端模式，互不影响；开启时需选择该顶部 agent 的本机工作目录，开关与"
+            "工作目录均按 agent 持久化，重启后依然生效。你（以及同属该顶部 agent "
+            "的团队成员）的工具调用都跟随所属顶部 agent 的模式。\n"
+            "协同语义：本地模式下，你与同属该顶部 agent 的所有成员的工具调用都在"
+            "同一工作目录 <baseDir>（用户选择的目录）中读写执行，全队共享同一份"
+            "项目文件以协同工作；而每个 agent 的私人记忆文件（如 .self/memory.md、"
+            ".self/rule.md、.self/team_roster.md）分别存放在各自的私人空间 "
+            "<baseDir>/workspaces/agent_<id>/.self 中，与共享工作目录隔离、互不"
+            "泄露。\n"
+            "重要约束：运行模式在对话开始（用户向该顶部 agent 发送首条消息）后即"
+            "锁定，无法再切换——后端会话自此绑定本地/云端工具。因此在对话开始前"
+            "就应确定模式；如需变更，只能在尚未对话的新对话上先切换再开始。"
+            "此模式适合在用户自己的项目上直接开发调试；切换回云端模式后，工具调用"
+            "恢复到云端共享主工作区（顶层 agent 的 Docker 沙箱）执行。"
         )
-        lines += ["## 3. 本地运行模式", local_mode, ""]
+        lines += ["## 3. 本地执行模式", local_mode, ""]
 
         # ---- 消息收发机制 ----
         message = (

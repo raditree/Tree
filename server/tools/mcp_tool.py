@@ -63,19 +63,27 @@ class MCPManager:
             - command: 启动命令（如 ``npx``、``python``）
             - args: 参数列表
             - env: 环境变量
+            - handler: 可选，进程内处理器 ``callable(tool_name, arguments) -> dict``。
+                      提供时不再启动 stdio 子进程，直接在本进程内调用（本地模式用）。
+            - tool_defs: 可选，配合 handler 使用的静态工具定义列表
+                         （OpenAI function calling 格式）。
         """
         self.services[name] = {
             "command": config.get("command", ""),
             "args": list(config.get("args", [])),
             "env": dict(config.get("env", {})),
+            "handler": config.get("handler"),
+            # 静态工具定义（进程内处理器模式使用）
+            "tool_defs": list(config.get("tool_defs", [])),
             # 已发现的工具列表缓存（由 MCP SDK 连接后填充）
             "tools": [],
         }
         logger.info(
-            "已注册 MCP 服务: %s (command=%s, args=%s)",
+            "已注册 MCP 服务: %s (command=%s, args=%s, in_process=%s)",
             name,
             self.services[name]["command"],
             self.services[name]["args"],
+            self.services[name]["handler"] is not None,
         )
 
     def list_services(self) -> list[str]:
@@ -131,6 +139,26 @@ class MCPManager:
         if cached and not force:
             logger.debug("MCP 服务 %s 命中工具缓存: %d 个", service_name, len(cached))
             return list(cached)
+
+        # 进程内处理器模式：直接使用静态工具定义，不启动子进程
+        if service.get("handler") is not None:
+            tools = list(service.get("tool_defs", []))
+            # tool_defs 支持两种格式：OpenAI function calling（name 在 function 内）
+            # 与扁平格式（name/description + parameters 或 inputSchema）。
+            # 统一转换为 {name, description, parameters}，与 stdio 拉取结果一致，
+            # 否则 call_tool 按 tool.get("name") 查找永远匹配不上。
+            normalized: "list[dict]" = []
+            for tool in tools:
+                fn = tool.get("function", tool) or tool
+                normalized.append({
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters")
+                    or fn.get("inputSchema")
+                    or {},
+                })
+            service["tools"] = normalized
+            return normalized
 
         command = service.get("command", "")
         if not command:
@@ -205,6 +233,17 @@ class MCPManager:
             return {"error": f"未找到 MCP 工具: {tool_name}"}
 
         service = self.services[target_service_name]
+        # 进程内处理器模式：直接调用 handler，不启动子进程
+        handler = service.get("handler")
+        if handler is not None:
+            logger.info(
+                "调用本地 MCP 工具: %s (service=%s, arguments=%s)",
+                tool_name,
+                target_service_name,
+                arguments,
+            )
+            return handler(tool_name, arguments)
+
         command = service.get("command", "")
         if not command:
             logger.error(
