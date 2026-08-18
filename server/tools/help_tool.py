@@ -136,10 +136,20 @@ class HelpTool:
         :param arguments: 工具参数（help 工具无参数）
         :return: 包含格式化说明文档字符串的字典
         """
-        # 注意：此处不自动刷新 workspace_extra_info。help 块作为历史消息留在
-        # 上下文中，若每次执行都改变内容，会破坏前缀稳定性、频繁失效 KV 缓存。
-        # 刷新统一在 compact 触发上下文重构时进行（render_fresh_content），
-        # 此时整个前缀必然重排，刷新零额外成本。
+        # 每次执行前刷新工作空间额外信息：agent 主动调用 help 期望拿到最新
+        # 的 memory/rule/identity（记忆维护后立即反映）。此刷新产出的文本作为
+        # 本轮 tool 结果进入上下文，是正常对话流，不影响已有前缀消息的 KV 缓存。
+        # compact 保留的常驻 help 块则只在 compact 重构时刷新（render_fresh_content
+        # 由 session.help_refresh_callback 在 llm.compress 内调用），避免常驻块
+        # 内容漂移破坏前缀稳定性。
+        if self.refresh_extra_info is not None:
+            try:
+                fresh = self.refresh_extra_info()
+                if fresh:
+                    self.workspace_extra_info = fresh
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("刷新 workspace_extra_info 失败，沿用快照: %s", exc)
+
         sections: list[str] = [
             self._build_identity_section(),
             self._build_workspace_info_section(),
@@ -246,6 +256,12 @@ class HelpTool:
             return ""
 
         lines = ["# 二、工作空间信息", ""]
+
+        # 执行模式（本地 vs 云端沙箱）：agent 无需猜测自己的工作环境
+        exec_mode = info.get("exec_mode", "")
+        if exec_mode:
+            lines.append(f"## 执行模式\n{exec_mode}")
+            lines.append("")
 
         # 身份（来自 identity.md 或默认）
         identity = info.get("identity", "")

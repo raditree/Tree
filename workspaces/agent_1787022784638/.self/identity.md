@@ -26,7 +26,9 @@
 - 第八轮（2026-08-18）：实现 help 永久保留特权——compress 时把最贴近系统提示词的那次 help 调用对（assistant tool_call + tool 结果成对）从可总结区剥离、常驻 summary 之后；只保留一次，其余 help 按普通消息处理；llm.py 测试断言全过（仅最早 help 保留、第二次 help 被总结、最近任务保留）。
 - 第九轮（2026-08-18）：审查确认 memory.md 不会自动注入——注入链（system prompt / help workspace_extra_info）只含 identity.md 与 rule.md，memory.md 从未被读取，记忆维护是"只写不读"半闭环；已向用户提出 3 个修复选项（全量注入 / 索引注入推荐 / 最近N条+索引），待决策后实施。
 - 第十轮（2026-08-18）：实施 memory 全量注入 help（<4k 全量、超限 LLM 压缩 + md5 指纹缓存）、HelpTool 注入 refresh_extra_info 回调（execute 每次现刷最新 memory/rule/identity）、_register_tools 透传 member_system_prompt；实测 compact 后上下文 ~12.1k tokens（kept_help 7.1k 为大头）、前缀刷新与 compact 固有失效重叠（额外成本≈0）；待办：compact 重渲染 kept_help 块未实现、memory 上限 4k→2k 与 rule 限长等优化待用户确认。
-- 第十一轮（2026-08-18）：最终落地——rule.md 也设 <4k 限（`_SELF_DOC_INJECT_LIMIT=4096`，`_compress_self_doc` 泛化 memory/rule 统一压缩 + 指纹缓存）；help 刷新收敛到 compact（execute 改用快照保前缀稳定，新增 `HelpTool.render_fresh_content()` 专供 compact，`session.help_refresh_callback` 绑定 + llm.compress 替换 kept_help）；测试全过（平时 execute 刷新 0 次、compact 刷新 1 次、tool_call 配对、压缩缓存命中）；memory 20281→3425 字符、rule 4863→3426 字符，compact 后 ~12k tokens 占阈值 7%。
+- 第十一轮（2026-08-18）：最终落地——rule.md 也设 <4k 限（`_SELF_DOC_INJECT_LIMIT=4096`，`_compress_self_doc` 泛化统一压缩）；help 刷新收敛到 compact（execute 快照保前缀稳定、`render_fresh_content()` 专供 compact、`session.help_refresh_callback` + llm.compress 替换 kept_help）；测试全过。
+- 第十二轮（2026-08-18）：重启验证暴露双轨制致命 bug——help 注入读 .self 走 Docker 容器（空壳：无 memory/identity），记忆维护写 .self 走本地 baseDir（最新版）；修复：`_get_workspace_io()` 统一 IO 通道 + help_tool 补 exec_mode 渲染；待再次重启验证。
+
 
 
 

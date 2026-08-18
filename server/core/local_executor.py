@@ -160,6 +160,11 @@ class LocalExecutorClient:
             "type": "tool_exec_request",
             "data": {"exec_id": exec_id, **payload},
         }
+        # 发送超时远小于响应超时：send 仅推送 WS 消息，正常毫秒级完成。
+        # 主事件循环短暂繁忙时 send_message 可能延迟入队，此时不立即放弃——
+        # 消息仍可能被延迟投递到前端，继续等待响应可避免工具调用误判失败。
+        send_timeout = min(10.0, timeout)
+        send_fut: "Optional[concurrent.futures.Future[Any]]" = None
         try:
             # 优先在主事件循环中发送（绑定于 uvicorn 主循环的 WS 连接跨循环会失败）
             loop = self._loop
@@ -167,12 +172,22 @@ class LocalExecutorClient:
                 send_fut = asyncio.run_coroutine_threadsafe(
                     ws_manager.send_message(user_id, message), loop
                 )
-                send_fut.result(timeout=max(5, timeout))
+                send_fut.result(timeout=send_timeout)
             else:
                 _run_async(ws_manager.send_message(user_id, message))
+        except concurrent.futures.TimeoutError:
+            # 发送超时：消息可能仍在主事件循环队列中等待投递。
+            # 不移除 pending、不返回错误，继续等待响应（前端执行后回传结果时仍能匹配）。
+            logger.debug(
+                "本地执行请求发送超时，继续等待响应: exec_id=%s op=%s",
+                exec_id, payload.get("op"),
+            )
         except Exception as exc:  # noqa: BLE001
             self._pending.pop(key, None)
-            logger.warning("推送本地执行请求失败: %s", exc)
+            logger.warning(
+                "推送本地执行请求失败: %r (exec_id=%s, op=%s)",
+                exc, exec_id, payload.get("op"),
+            )
             return {"error": f"推送本地执行请求失败: {exc}"}
         try:
             result = fut.result(timeout=timeout)
@@ -181,11 +196,14 @@ class LocalExecutorClient:
             return result if isinstance(result, dict) else {"error": str(result)}
         except concurrent.futures.TimeoutError:
             self._pending.pop(key, None)
+            # 取消可能仍在排队的发送协程，避免极晚投递导致响应无人匹配
+            if send_fut is not None and not send_fut.done():
+                send_fut.cancel()
             logger.warning("本地执行请求超时: exec_id=%s op=%s", exec_id, payload.get("op"))
             return {"error": "本地执行器响应超时"}
         except Exception as exc:  # noqa: BLE001
             self._pending.pop(key, None)
-            logger.warning("本地执行请求异常: %s", exc)
+            logger.warning("本地执行请求异常: %r (exec_id=%s)", exc, exec_id)
             return {"error": f"本地执行器错误: {exc}"}
         finally:
             # 超时/异常后确保清理

@@ -74,3 +74,47 @@
 | server/core/workspace_io.py | 新增 git_log / list_files 抽象与实现（统一双轨制基础） |
 | server/core/conversation_store.py | 新增 agent_tool_count 持久化 |
 | server/mcp_tools/server.py | 移除 terminal 工具暴露 |
+
+---
+
+## 9. help 永久保留 + memory/rule 注入 + compact 刷新（第九轮）
+
+> 时间：2026-08-18（同一会话续作）
+> 背景：agent 很少主动重调 help，compact 后执行模式/身份等环境认知丢失；且 memory.md 只写不读（无注入机制）。
+
+### 9.1 help 永久保留特权（llm.compress）
+
+- compact 时扫描历史中的 help 调用对（``assistant`` 的 ``tool_calls`` 含 ``name=="help"`` + 紧随其后的 ``tool`` 结果），**成对剥离**（OpenAI API 要求 tool 消息紧跟 assistant）；
+- **只保留最靠前（最贴近系统提示词）的一次**，其余按普通消息处理（可总结区总结、保留区留存），避免 help 输出堆积膨胀；
+- 重组：``system + [summary] + kept_help + to_keep``。
+
+### 9.2 memory.md / rule.md 注入 help（workspace_extra_info）
+
+- ``_build_workspace_extra_info`` 新增注入 ``.self/memory.md`` 与 ``.self/rule.md``；
+- **大小上限 4096 字符**（``_SELF_DOC_INJECT_LIMIT``）：未超限全量注入，超限经 ``_compress_self_doc``（LLM 压缩 + 保头保尾回退 + 指纹缓存）压缩；
+- help 工具新增 ``## 记忆档案 (memory.md)`` 板块（在 rule 之后）。
+
+### 9.3 help 刷新只在 compact 触发上下文重构时发生
+
+- 平时 ``help.execute()`` **不刷新**（用会话快照，保持前缀稳定、KV 缓存命中）；
+- 新增 ``HelpTool.render_fresh_content()``：刷新 extra_info + 重新渲染；
+- ``register_builtin_tools`` 绑定 ``session.help_refresh_callback``：compact 时调用刷新回调，生成新的 help 调用对（新 assistant tool_call + tool 结果），替换常驻 kept_help；
+- ``llm.compress`` 在重组前调用该回调替换 kept_help——此时整个前缀必然重排，**刷新零额外缓存成本**；
+- 无回调（无限上下文会话等）时保留旧块，行为不变。
+
+### 9.4 验证
+
+- 单元测试（stub）：平时 execute 用快照（refresh 0 次）；compact 时刷新 1 次、help 块含最新 memory/rule；tool_call 配对约束满足；
+- 实测：memory.md 20281 字符 → 注入 3425；rule.md 4863 → 3426；compact 后上下文约 12k tokens（max_seqlen=204800，阈值 163840，占 7%）；
+- 压缩缓存：同内容二次调用不重复触发 LLM。
+
+### 9.5 修改文件
+
+| 文件 | 改动 |
+|---|---|
+| server/core/llm.py | compact 剥离最早 help 块 + 刷新回调替换 |
+| server/main.py | `_SELF_DOC_INJECT_LIMIT` / `_compress_self_doc` / memory+rule 注入 / `_register_tools` refresher |
+| server/tools/help_tool.py | `render_fresh_content()` / `refresh_extra_info` 参数 / memory 板块 |
+| server/tools/__init__.py | refresher 透传 / `session.help_refresh_callback` 绑定 |
+
+**待办**：改动需重启后端（PID 40536 无 reload）生效；重启后可用 ``refresh`` 验证 help 输出含记忆档案板块。

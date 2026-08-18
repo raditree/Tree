@@ -106,3 +106,12 @@
     rule.md（本 agent 已 4863 字符）也会超限。做法：统一 `_SELF_DOC_INJECT_LIMIT = 4096` +
     `_compress_self_doc(workspace_id, doc_key, text, kind)`（LLM 压缩 + md5 指纹缓存 +
     保头保尾截断回退），缓存键带 doc_key 区分文档，避免不同文档互相串缓存。
+30. **.self 文档读写必须走统一 WorkspaceIO，禁止一边容器一边本地（双轨制深坑实证）**：本项目记忆维护
+    写 memory/rule/identity 走内置工具→LocalWorkspaceIO→本地 baseDir；但 help 注入读 .self 曾硬编码
+    docker_manager→Docker 容器——两者分叉导致 help 永远读到容器空壳、读不到 agent 实际写的记忆，
+    即使实现注入也白搭。修复：新增 `_get_workspace_io(user_id, agent_id)`（本地→LocalWorkspaceIO
+    经 WS 前端解析路径，云端→CloudWorkspaceIO），_build_workspace_extra_info 读 identity/rule/memory
+    全部走统一 IO（io 失败回退 docker）。凡跨组件读写同一文件，先确认写读两端是否同一通道。
+31. **注入进 help 的字段必须确认渲染逻辑存在**：_build_workspace_extra_info 早注入 exec_mode，但
+    help_tool._build_workspace_info_section 一直没渲染它 → 用户侧看不到。注入端与渲染端要成对检查，
+    新增字段后验证 help 输出确实包含。

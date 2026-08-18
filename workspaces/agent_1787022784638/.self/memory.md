@@ -321,6 +321,30 @@
 
 **待办（延续）**：main.py / help_tool.py / tools/__init__.py / llm.py 四处修改需**重启后端生效**；已建 3 名成员空间仍在容器（03efdf...），本地模式建议重启后重建（配合 exec_mode 注入 + TeamTool io 注入路径一致）。
 
+### 2026-08-18 · 第十二轮：重启验证暴露双轨制致命 bug（help 注入读容器、记忆写本地）+ 修复
+
+**任务目标**：用户重启后端后验证 memory/rule 注入 + compact 刷新新架构是否生效。
+
+**验证结果（暴露严重 bug）**：
+- 进程启动时间 16:50 < 代码修改时间 16:44 → 代码已加载，但 help 输出仍是旧内容：
+  - 无"记忆档案"板块（memory 注入完全没生效）、无"执行模式"板块
+  - identity 显示默认文案、rule 显示 323 字节旧版
+- **根因（双轨制铁证）**：
+  - 记忆维护写路径：`_run_memory_update` → `_stream_agent_reply(silent=True)` → 内置 read/write/edit → `LocalWorkspaceIO` → **本地 baseDir**（`workspaces/agent_1787022784638/.self`：memory 22KB、rule 5.6KB、identity 2.4KB 全部最新版）
+  - help 注入读路径：`_read_workspace_file` **硬编码 docker_manager** → Docker 容器 `workspace_agent_1787022784638`(03efdf117367)：只有旧 rule.md(323B)+activity.log+roster，**无 identity.md、无 memory.md**
+  - 即：help 永远读到容器里的空壳工作空间，读不到 agent 实际写的记忆 → 即使实现注入也白搭
+
+**修复（2 处）**：
+1. **main.py 新增 `_get_workspace_io(user_id, agent_id)`**：本地模式（`local_executor.is_local`）返回 `LocalWorkspaceIO`（经 WS 到前端解析 `baseDir/workspaces/{id}/.self`），云端返回 `CloudWorkspaceIO`；`_build_workspace_extra_info` 读 identity/rule/memory 改用统一 IO（`_read_self_doc` 闭包，io 失败回退 `_read_workspace_file`），与内置工具同路径语义。
+2. **help_tool.py 补 exec_mode 渲染**：板块二新增 `## 执行模式`（第六轮注入的 exec_mode 一直没渲染，是隐藏缺陷）。
+
+**验证**：AST OK；exec_mode/memory/rule 渲染断言全过；`_get_workspace_io` 在 `_local_executor=None` 时回退 CloudWorkspaceIO 不抛异常。
+
+**关键认知沉淀**：项目"双轨制"比预想更深——不仅 team 工具 roster 与 LLM 工具分离，**连 help 注入读 .self 都走容器、而记忆维护写 .self 走本地 baseDir**。凡涉及 .self 文档读写，必须统一走 WorkspaceIO 通道，否则写读必然分叉。
+
+**待办**：修复代码需**再次重启后端**生效；重启后 help 应显示 `## 执行模式：本地…` + `## 记忆档案 (memory.md)` 压缩版 + `## 工作准则 (rule.md)` 压缩版。
+
+
 
 
 

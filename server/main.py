@@ -443,6 +443,28 @@ def _compress_self_doc(workspace_id: str, doc_key: str, text: str,
     return compressed
 
 
+def _get_workspace_io(user_id: str, agent_id: str) -> Any:
+    """构建与内置工具一致的 WorkspaceIO 通道。
+
+    本地模式（local_executor.is_local）经反向 WS 到前端本地执行器，由前端把
+    workspace 相对路径映射到用户选择的工作目录（.self 私人空间 →
+    baseDir/workspaces/{workspace_id}/.self）；云端模式走 Docker 容器。
+    用于读 .self 文档时与内置工具（read/write/edit/terminal）保持同一路径语义，
+    避免双轨制（记忆维护写本地 baseDir，help 注入却读 Docker 容器）导致
+    memory/rule 注入读到旧内容或缺失。
+    """
+    try:
+        if _local_executor is not None and _local_executor.is_local(user_id, agent_id):
+            from core.workspace_io import LocalWorkspaceIO
+
+            return LocalWorkspaceIO(_local_executor, ws_manager, user_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("构建本地 WorkspaceIO 失败，回退云端: %s", exc)
+    from core.workspace_io import CloudWorkspaceIO
+
+    return CloudWorkspaceIO(_docker_manager)
+
+
 def _build_workspace_extra_info(
     workspace_id: str,
     member_system_prompt: str = "",
@@ -463,6 +485,21 @@ def _build_workspace_extra_info(
     """
     info: Dict[str, Any] = {}
 
+    # 统一 IO 通道读 .self 文档：与内置工具同路径语义（本地 baseDir/云端容器），
+    # 保证 memory/rule/identity 注入读到的是 agent 实际写入的私人空间文件。
+    _io = _get_workspace_io(user_id, agent_id)
+
+    def _read_self_doc(rel_path: str) -> str:
+        if _io is not None:
+            try:
+                r = _io.read_file(workspace_id, rel_path)
+                content = r.get("content")
+                if content is not None and not r.get("error"):
+                    return str(content) or ""
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("io 读取 %s 失败，回退 docker: %s", rel_path, exc)
+        return _read_workspace_file(workspace_id, rel_path)
+
     # 执行模式（本地 vs 云端沙箱）：让 agent 无需猜测自己的工作环境。
     # 本地执行器按顶部 agent 注册（mode_key=top_agent_id；顶部 agent 自身即 agent_id）。
     exec_mode = _build_exec_mode_text(
@@ -473,7 +510,7 @@ def _build_workspace_extra_info(
         info["exec_mode"] = exec_mode
 
     # 身份信息（checklist 6(c)）
-    identity = _read_workspace_file(workspace_id, ".self/identity.md").strip()
+    identity = _read_self_doc(".self/identity.md").strip()
     if identity:
         info["identity"] = identity
     else:
@@ -484,7 +521,7 @@ def _build_workspace_extra_info(
         info["member_system_prompt"] = member_system_prompt
 
     # rule.md 注入（checklist 9/10）：同样设 4k 大小上限，超限压缩
-    rule = _read_workspace_file(workspace_id, ".self/rule.md").strip()
+    rule = _read_self_doc(".self/rule.md").strip()
     if rule:
         if len(rule) <= _SELF_DOC_INJECT_LIMIT:
             info["rule"] = rule
@@ -499,7 +536,7 @@ def _build_workspace_extra_info(
     # memory.md 每次记忆维护都会更新（_run_memory_update），所以不能依赖
     # 会话构造时的一次性快照——compact 触发上下文重构时通过 help 刷新回调
     # 现读现算（见 tools/__init__.py 的 help_refresh_callback）。
-    memory = _read_workspace_file(workspace_id, ".self/memory.md").strip()
+    memory = _read_self_doc(".self/memory.md").strip()
     if memory:
         if len(memory) <= _SELF_DOC_INJECT_LIMIT:
             info["memory"] = memory
@@ -1158,7 +1195,9 @@ async def _process_member_message(
     enhanced_prompt = _build_agent_system_prompt(
         workspace_id, member_system_prompt=member_system_prompt
     )
-    extra_info = _build_workspace_extra_info(
+    # 本地模式下读 .self 文件经反向 WS（阻塞），必须放入线程池避免死锁事件循环
+    extra_info = await asyncio.to_thread(
+        _build_workspace_extra_info,
         workspace_id, member_system_prompt=member_system_prompt,
         user_id=user_id, agent_id=top_agent_id or agent_id,
         local_executor=_local_executor,
@@ -1307,7 +1346,13 @@ def _find_roster_member(
         return None
     owner = get_agent(user_id, roster_owner_id) or {}
     owner_ws = owner.get("workspace_id") or roster_owner_id
-    roster_content = _read_workspace_file(owner_ws, ".self/team_roster.md")
+    # 本地模式下经反向 WS 读用户本机的 .self/team_roster.md（与 help 注入同路径）
+    _io = _get_workspace_io(user_id, roster_owner_id)
+    try:
+        r = _io.read_file(owner_ws, ".self/team_roster.md")
+        roster_content = "" if r.get("error") else (r.get("content", "") or "")
+    except Exception:  # noqa: BLE001
+        roster_content = _read_workspace_file(owner_ws, ".self/team_roster.md")
     members = _parse_roster_table(roster_content)
     for m in members:
         if m.get("id") == member_id:
@@ -1543,7 +1588,12 @@ async def _handle_user_message(
     try:
         # 系统提示词仅保留基础指令，详细说明转移到 help 工具的 workspace_extra_info
         enhanced_prompt = _build_agent_system_prompt(workspace_id)
-        extra_info = _build_workspace_extra_info(
+        # 本地模式下 _build_workspace_extra_info 经反向 WS 读 .self 文件（阻塞），
+        # 必须放入线程池执行：否则 local_executor.request 会在事件循环线程内
+        # 调用 run_coroutine_threadsafe 发送 WS 消息，但事件循环被自身阻塞，
+        # send_message 永远不会被调度执行 → 死锁 ~120s/文件。
+        extra_info = await asyncio.to_thread(
+            _build_workspace_extra_info,
             workspace_id, user_id=user_id, agent_id=agent_id,
             local_executor=_local_executor,
         )
@@ -2059,7 +2109,19 @@ async def get_agent_teammates(
     user_id = current_user.get("openid", "")
     agent = get_agent(user_id, agent_id)
     workspace_id = (agent.get("workspace_id") if agent else None) or agent_id
-    content = _read_workspace_file(workspace_id, ".self/team_roster.md")
+
+    # 本地模式下读 .self 文件经反向 WS（阻塞），放入线程池避免死锁事件循环
+    def _read_roster() -> str:
+        _io = _get_workspace_io(user_id, agent_id)
+        try:
+            r = _io.read_file(workspace_id, ".self/team_roster.md")
+            if r.get("error"):
+                return ""
+            return r.get("content", "") or ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    content = await asyncio.to_thread(_read_roster)
     members = _parse_roster_table(content)
     for m in members:
         mid = m["id"]
@@ -2078,17 +2140,26 @@ async def get_teammate_log(
 ) -> Dict[str, Any]:
     """读取成员工作空间的活动日志（teammates 窗口展示工作进度）。"""
     user_id = current_user.get("openid", "")
-    if not _docker_manager or not _docker_manager.available:
+
+    # 本地模式下读 .self 文件经反向 WS（阻塞），放入线程池避免死锁事件循环。
+    # 云端模式经 docker exec（subprocess 阻塞），同样需要线程池。
+    def _read_log() -> str:
+        _io = _get_workspace_io(user_id, agent_id)
+        try:
+            r = _io.read_file(member_id, ".self/activity.log")
+            if r.get("error"):
+                return ""
+            return r.get("content", "") or ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    full_log = await asyncio.to_thread(_read_log)
+    if not full_log:
         return {"success": True, "log": ""}
-    try:
-        result = _docker_manager.exec_in_workspace(
-            member_id,
-            ["sh", "-c", f"tail -n {int(lines)} .self/activity.log 2>/dev/null"],
-        )
-        return {"success": True, "log": result.get("stdout", "")}
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("读取成员日志失败 %s: %s", member_id, exc)
-        return {"success": False, "error": str(exc)}
+    # 取最后 N 行（等价于原 tail -n 语义）
+    log_lines = full_log.rstrip().split("\n")
+    tail = "\n".join(log_lines[-int(lines):]) if lines > 0 else full_log
+    return {"success": True, "log": tail}
 
 
 @app.post("/api/agents/{agent_id}/teammate/{member_id}/message")
@@ -2109,7 +2180,9 @@ async def send_teammate_message(
         return {"success": False, "error": "缺少 content"}
 
     # 收敛出口：统一消息 API（用户 -> 成员，走顶部 agent 的 roster 校验与投递）
-    result = _dispatch_agent_message(
+    # 本地模式下 _find_roster_member 经反向 WS 读 roster（阻塞），放入线程池
+    result = await asyncio.to_thread(
+        _dispatch_agent_message,
         user_id,
         [member_id],
         content,
