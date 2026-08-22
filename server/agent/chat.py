@@ -357,6 +357,9 @@ def _build_agent_system_prompt(
     # ⑨ Spec 维护指引
     chapters.append(_build_spec_maintenance_text())
 
+    # ⑩ 任务进度管理纪律（todo 及时更新）
+    chapters.append(_build_todo_discipline_text())
+
     return "\n\n".join(chapters)
 
 
@@ -532,6 +535,31 @@ def _build_spec_maintenance_text() -> str:
         "（hard 强制，缺则任务未闭环）。\n"
         "- 中途新增选择：spec select 挂 hook，下次重构 context（compact/新建会话）"
         "自动注入全文；立即使用请用 spec read 取全文进对话上下文。"
+    )
+
+
+def _build_todo_discipline_text() -> str:
+    """⑩ 任务进度管理纪律：todo 必须增量、及时、诚实更新。
+
+    提示词工程师要点：
+    - 反模式：任务开始时一次 set 全量 todos，然后全程不动，直到全部完成才一次性
+      update 标注 completed。评估与进度失真，用户无法感知中途进展。
+    - 正模式：todos 是"活"清单。建好在里程碑（每完成/推进一项、遇到阻塞）处
+      及时增量 update，让用户随时看到真实进度。
+    """
+    return (
+        "## ⑩ 任务进度管理纪律（todo 须增量更新）\n"
+        "- **及时性**：不要「建好 todos 后扔一边、最后统一标完成」。每完成一个子任务、"
+        "每取得阶段性进展、每遇到阻塞，都要**立即**用 set_todo_list update 更新对应 "
+        "todo（status/progress），让前端 Todo 面板始终反映真实进度。\n"
+        "- **诚实性**：progress 按实际完成度填（如 0/50/100），status 只在真正完成时置 "
+        "completed、受阻时置 blocked；不得为了好看虚报全绿。\n"
+        "- **小步更新**：宁可多次小更新，不要攒到最后一次大改。100 条消息的复杂任务，"
+        "每条 todo 应在它完成的那轮附近被标注，而非任务结束时才统一写完成。\n"
+        "- **中途变化**：执行中发现原计划不适用需调整范围时，用 set_todo_list set "
+        "整体替换清单并如实标注（含新增/删除/合并），不要保留已过时的 todo。\n"
+        "- **长任务/团队任务必用**：hard / 多人协作务必全程维护 todos，作为进度契约"
+        "与回滚依据；easy 小任务可不建。"
     )
 
 

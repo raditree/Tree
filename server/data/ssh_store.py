@@ -10,8 +10,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# 数据库目录与文件（与 user_store 保持一致）
-_DATA_DIR = Path(__file__).resolve().parent
+# 数据库目录与文件（与 user_store 保持一致，定位到 server/data）
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 _DB_PATH = _DATA_DIR / "conversations.db"
 
 # 写操作锁

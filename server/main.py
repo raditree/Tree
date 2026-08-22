@@ -128,7 +128,7 @@ async def lifespan(app: FastAPI):
             try:
                 export_daily_sft()
             except Exception as exc:  # noqa: BLE001
-                print(f"[SFT] 每日导出异常: {exc}")
+                logger.warning("每日 SFT 导出异常: %s", exc)
 
     sft_task = asyncio.create_task(_sft_export_loop())
 
