@@ -219,6 +219,15 @@ class _MessagePanelState extends State<MessagePanel> {
         // 历史已存在说明该顶部 agent 的对话已开始，运行模式一并锁定
         _modeLocked = _messages.isNotEmpty;
         _scrollRevision++;
+        // 从历史中恢复 token 用量：取最后一条带 usage 的 agent 消息，
+        // 使重启后「上下文长度」统计不丢失（usage 随消息已持久化）
+        for (final ChatMessage m in _messages.reversed) {
+          final Map<String, dynamic>? usage = m.usage;
+          if (usage != null && usage.isNotEmpty) {
+            _usageByAgent['${agent.id}::$sessionId'] = usage;
+            break;
+          }
+        }
       });
     } catch (e) {
       // 拉取失败时静默处理（保持空列表）
@@ -305,16 +314,21 @@ class _MessagePanelState extends State<MessagePanel> {
     } else if (type == 'msg_usage') {
       if (!_isForCurrentSession(data)) return;
       final String id = (data['id'] as String?) ?? '';
+      final Map<String, dynamic>? usage =
+          (data['usage'] as Map<String, dynamic>?)?.cast<String, dynamic>();
       final int idx = _messages.indexWhere((ChatMessage m) => m.id == id);
       if (idx >= 0) {
-        final Map<String, dynamic>? usage =
-            (data['usage'] as Map<String, dynamic>?)?.cast<String, dynamic>();
         setState(() {
           _messages[idx].usage = usage;
           if (usage != null) {
             _recordUsage(data, usage);
           }
         });
+      } else if (usage != null) {
+        // 会话粒度推进：工具循环中推送的 usage 没有对应文本消息（id 是工具卡片），
+        // 仍要记录，使上下文统计持续更新
+        _recordUsage(data, usage);
+        if (mounted) setState(() {});
       }
     } else if (type == 'tool_start') {
       if (!_isForCurrentAgent(data) || !_isForCurrentSession(data)) return;

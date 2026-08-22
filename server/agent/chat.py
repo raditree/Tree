@@ -1193,6 +1193,22 @@ async def _stream_agent_reply(
                         )
                     except Exception:  # noqa: BLE001
                         pass
+
+                    # 工具循环中持续推送 token 用量：本轮 LLM 调用已产生新的
+                    # last_usage，立即同步给前端，让「上下文长度」统计在 tool 循环
+                    # 中持续跟进，而非等最终回复结束才一次性更新。
+                    if getattr(session, "last_usage", None):
+                        mid_max = int(model_config.extra.get("max_seqlen", 8192))
+                        await state.ws_manager.send_message(
+                            user_id,
+                            {
+                                "type": "msg_usage",
+                                "id": tool_id,
+                                "agent_id": agent_id,
+                                "session_id": session_id,
+                                "usage": {**session.last_usage, "max_tokens": mid_max},
+                            },
+                        )
             else:
                 # 未知产出类型，忽略
                 continue

@@ -5,9 +5,9 @@ import '../models/session.dart';
 /// 会话选择器（中栏标题栏）
 ///
 /// 展示当前 agent 的会话列表，支持：
-/// - 点击下拉切换会话
+/// - 单击/下拉切换会话
 /// - 新建会话
-/// - 重命名 / 删除当前会话
+/// - 右键（secondary tap）当前会话标题栏弹出「重命名 / 删除」菜单
 ///
 /// 通过回调与外部（MessagePanel）交互，自身不持有会话数据。
 class SessionPicker extends StatelessWidget {
@@ -46,12 +46,62 @@ class SessionPicker extends StatelessWidget {
     return sessions.isNotEmpty ? sessions.first : null;
   }
 
+  /// 右键（Windows 桌面 secondary tap）/长按当前会话标题栏，弹出重命名/删除菜单。
+  /// 列表项内不再放内嵌按钮，避免会话名过长时按钮被挤出。
+  void _handleSecondary(BuildContext context, Offset globalPosition) {
+    final ChatSession? current = _current;
+    final cs = Theme.of(context).colorScheme;
+    if (current == null || current.isDefault) return; // 默认会话不可重命名/删除
+
+    final box = context.findRenderObject() as RenderBox?;
+    final size = box?.size ?? Size.zero;
+
+    showMenu<_SecondaryAction>(
+      context: context,
+      // 将菜单定位到触发点（光标/长按点）附近
+      position: RelativeRect.fromRect(
+        globalPosition & size,
+        Offset.zero & (box?.size ?? Size.zero),
+      ),
+      items: <PopupMenuEntry<_SecondaryAction>>[
+        PopupMenuItem<_SecondaryAction>(
+          value: const _SecondaryAction(type: 'rename'),
+          child: Row(
+            children: <Widget>[
+              Icon(Icons.edit_outlined, size: 18, color: cs.onSurfaceVariant),
+              const SizedBox(width: 8),
+              const Text('重命名会话'),
+            ],
+          ),
+        ),
+        PopupMenuItem<_SecondaryAction>(
+          value: const _SecondaryAction(type: 'delete'),
+          child: Row(
+            children: <Widget>[
+              Icon(Icons.delete_outline, size: 18, color: cs.error),
+              const SizedBox(width: 8),
+              Text('删除会话', style: TextStyle(color: cs.error)),
+            ],
+          ),
+        ),
+      ],
+    ).then((action) {
+      if (action == null) return;
+      if (action.type == 'rename') {
+        onRename(current);
+      } else if (action.type == 'delete') {
+        onDelete(current);
+      }
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final ChatSession? current = _current;
 
-    return PopupMenuButton<_SessionAction>(
+    final PopupMenuButton<_SessionAction> menu =
+        PopupMenuButton<_SessionAction>(
       tooltip: '会话管理',
       onSelected: (action) {
         switch (action.type) {
@@ -110,24 +160,6 @@ class SessionPicker extends StatelessWidget {
                     ),
                   ),
                 ),
-                if (!s.isDefault) ...<Widget>[
-                  _MiniIcon(
-                    icon: Icons.edit_outlined,
-                    color: cs.onSurfaceVariant,
-                    onTap: () {
-                      Navigator.of(context).pop();
-                      onRename(s);
-                    },
-                  ),
-                  _MiniIcon(
-                    icon: Icons.delete_outline,
-                    color: cs.error,
-                    onTap: () {
-                      Navigator.of(context).pop();
-                      onDelete(s);
-                    },
-                  ),
-                ],
               ],
             ),
           ),
@@ -160,6 +192,15 @@ class SessionPicker extends StatelessWidget {
         ),
       ),
     );
+
+    // 右键/长按标题栏弹当前会话的重命名/删除菜单（默认会话除外）
+    return GestureDetector(
+      onSecondaryTapDown: (details) =>
+          _handleSecondary(context, details.globalPosition),
+      onLongPressStart: (details) =>
+          _handleSecondary(context, details.globalPosition),
+      child: menu,
+    );
   }
 }
 
@@ -171,27 +212,9 @@ class _SessionAction {
   const _SessionAction({required this.type, this.session});
 }
 
-/// 菜单内的小图标按钮（重命名/删除）
-class _MiniIcon extends StatelessWidget {
-  final IconData icon;
-  final Color color;
-  final VoidCallback onTap;
+/// 右键菜单动作：type ∈ {rename, delete}
+class _SecondaryAction {
+  final String type;
 
-  const _MiniIcon({
-    required this.icon,
-    required this.color,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(4),
-      child: Padding(
-        padding: const EdgeInsets.all(4),
-        child: Icon(icon, size: 16, color: color),
-      ),
-    );
-  }
+  const _SecondaryAction({required this.type});
 }
