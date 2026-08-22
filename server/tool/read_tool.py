@@ -46,7 +46,9 @@ class ReadTool:
                     "何时使用: 修改任何文件前必须先 read 看清楚当前内容；"
                     "查找代码/配置/文档内容；排查问题时读取相关文件\n"
                     "何时不用: 已确定文件内容无需重读；大目录浏览用 Terminal ls\n"
-                    "前置依赖: 文件必须存在于工作空间"
+                    "前置依赖: 文件必须存在于工作空间\n"
+                    "省钱技巧: 大文件用 start_line/line_count 只读需要的行为表/函数，"
+                    "避免整文件全读占用大量上下文"
                 ),
                 "parameters": {
                     "type": "object",
@@ -58,6 +60,16 @@ class ReadTool:
                         "encoding": {
                             "type": "string",
                             "description": "文件编码，默认 utf-8",
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "description": "起始行号（从 1 开始），只读取该行起的片段；"
+                            "缺省为 1 表示从文件开头。配合 line_count 分段读取大文件",
+                        },
+                        "line_count": {
+                            "type": "integer",
+                            "description": "读取的行数，只返回从 start_line 起的连续 line_count 行；"
+                            "缺省表示读到文件末尾",
                         },
                     },
                     "required": ["file_path"],
@@ -91,5 +103,44 @@ class ReadTool:
             return {"error": result["error"], "file_path": file_path}
 
         content = result.get("content", "")
-        logger.info("read 工具读取文件成功: %s (encoding=%s)", file_path, encoding)
+        content = self._apply_line_range(content, arguments)
+        logger.info(
+            "read 工具读取文件成功: %s (encoding=%s)", file_path, encoding
+        )
         return {"content": content, "file_path": file_path}
+
+    @staticmethod
+    def _apply_line_range(content: str, arguments: Dict[str, Any]) -> str:
+        """按 start_line / line_count 裁剪内容，节省 LLM 上下文。
+
+        - 未提供任何行控制参数时返回全文（保持向后兼容）。
+        - 行号从 1 开始计数。
+        """
+        has_range = (
+            arguments.get("start_line") is not None
+            or arguments.get("line_count") is not None
+        )
+        if not has_range:
+            return content
+
+        try:
+            start = int(float(arguments.get("start_line") or 1))
+        except (TypeError, ValueError):
+            start = 1
+        if start < 1:
+            start = 1
+
+        try:
+            count = int(float(arguments.get("line_count") or 0))
+        except (TypeError, ValueError):
+            count = 0
+        # count <= 0 视为不限制（读到末尾）
+        if count <= 0:
+            count = None
+
+        lines = content.split("\n")
+        start_idx = start - 1
+        end_idx = len(lines) if count is None else start_idx + count
+        end_idx = max(start_idx, min(end_idx, len(lines)))
+
+        return "\n".join(lines[start_idx:end_idx])
