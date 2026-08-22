@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import uvicorn
 import websockets
-from core.auth import create_token
+from ws.auth import create_token
 
 import main as m
 

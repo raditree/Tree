@@ -8,8 +8,8 @@ import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
-from core.workspace_io import WorkspaceIO
-from core.embed_model import EmbedModelConfig, get_embedding, get_embeddings_batch, load_embed_model_config
+from io_.workspace_io import WorkspaceIO, run_io
+from data.embed_model import EmbedModelConfig, get_embedding, get_embeddings_batch, load_embed_model_config
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +130,7 @@ class EmbedSearchTool:
                 )
 
         # 使用 grep 搜索候选匹配行（通过 WorkspaceIO 接口，云端/本地均可）
-        result = self.io.grep_search(self.workspace_id, query)
+        result = run_io(self.io.grep_search(self.workspace_id, query))
 
         if result.get("error"):
             return {"error": result["error"], "results": []}

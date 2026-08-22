@@ -1,8 +1,0 @@
-ack: register_local_executor_ack
-msg sent
-[  0.13s] agent_status {"agent_id": "agent_1787022784638", "status": "working"}
-[  0.14s] tool_exec_request #1 op=read_file path=.self/identity.md -> responded in 0ms
-[  0.14s] tool_exec_request #2 op=read_file path=.self/rule.md -> responded in 0ms
-[  0.14s] tool_exec_request #3 op=read_file path=.self/memory.md -> responded in 0ms
-recv err: sent 1011 (internal error) keepalive ping timeout; no close frame received
-=== done: tool_exec_request=3, total=50.02s

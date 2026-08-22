@@ -4,7 +4,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from tools.mcp_tool import MCPManager
+from tool.mcp_tool import MCPManager
 
 
 class FakeLocalExecutor:
@@ -28,8 +28,8 @@ def build_io(executor):
 
 
 def main() -> None:
-    from tools import _build_in_process_handler, _get_workspace_tool_defs
-    from tools import _build_document_in_process_handler, _get_document_tool_defs
+    from tool import _build_in_process_handler, _get_workspace_tool_defs
+    from tool import _build_document_in_process_handler, _get_document_tool_defs
 
     executor = FakeLocalExecutor()
     io = build_io(executor)

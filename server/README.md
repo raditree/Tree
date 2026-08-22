@@ -35,34 +35,44 @@ xcopy configs\models\model.example.yaml configs\models\my-model.yaml
 
 ```
 server/
-├── main.py                 # 应用入口：lifespan 初始化、WebSocket、会话/消息处理
-├── api/routes.py           # REST 路由
-├── core/                   # 核心逻辑
+├── main.py                 # 应用入口：lifespan 初始化、REST/WS 装配、全局状态注入
+├── state.py                # 全局状态容器（lifespan 填充：ws_manager/docker_manager/...）
+├── ws/                     # WebSocket 组件（全局核心组件）
 │   ├── auth.py             # JWT 签发/校验
-│   ├── user_store.py       # 用户存储 + 注销（十日倒计时 + 31 天保留后彻底删除）
-│   ├── agent_store.py      # agent 持久化（SQLite）
-│   ├── conversation_store.py # 消息与上下文持久化
-│   ├── session_cache.py    # 会话缓存
-│   ├── llm.py              # LLM 会话：普通（上下文压缩）/ 无限上下文
-│   ├── models.py           # 模型配置加载与合并（YAML + 运行期拉取）
-│   ├── docker_manager.py   # Docker 工作空间生命周期 + Git + 沙箱网络/下载策略
-│   ├── team_broker.py      # 团队成员消息串行投递（checklist 7 切入机制）
-│   ├── memory.py           # 记忆管理
+│   ├── ws_manager.py       # WS 连接管理/推送
+│   └── endpoints.py        # WS 消息处理（会话、工具事件、模式注册）
+├── agent/                  # Agent 组件
+│   ├── chat.py             # Agent 会话主逻辑（LLM 循环、工具注册、消息分发）
+│   ├── routes.py           # agent CRUD / 模型列表 / compact / teammates
+│   ├── team_broker.py      # 团队成员消息串行投递（切入机制）
 │   └── context_isolation.py
-├── tools/                  # LLM 内置工具
-│   ├── help_tool.py        # help：披露团队规模与资源限制
-│   ├── team_tool.py        # team：成员/消息/任务管理（含文件发送、update 重生）
-│   ├── set_tool.py         # set：模型/上下文参数
-│   ├── mcp_tool.py         # mcp：MCP 工具调用
-│   └── refresh_tool.py     # refresh：刷新 MCP 工具列表
-├── mcp_tools/              # MCP 工具实现
-│   ├── read_tool.py / write_tool.py / edit_tool.py
+├── tool/                   # LLM 内置工具组件（9 工具集）
+│   ├── read_tool.py / write_tool.py / edit_tool.py   # 文件读写
 │   ├── terminal_tool.py    # terminal：沙箱命令执行
-│   └── embed_search_tool.py# embed_search：工作空间文本搜索
+│   ├── mcp_tool.py         # mcp：MCP 工具调用
+│   ├── team_tool.py        # team：成员/消息/任务管理
+│   └── ask_question_tool.py# ask_user_question：向用户提问
+├── io_/                    # IO 组件（WorkspaceIO 抽象 + 三模式）
+│   ├── workspace_io.py     # WorkspaceIO 抽象 + Cloud/Local 实现
+│   ├── mode_resolver.py    # cloud/local/ssh 三模式判定与互斥校验
+│   ├── ssh_connection_manager.py / ssh_workspace_io.py / ssh_store.py
+│   ├── docker_manager.py   # Docker 工作空间生命周期 + Git + 沙箱策略
+│   ├── local_executor.py   # 本地反向 WS 执行器
+│   └── routes.py           # IO 相关 REST（模式/SSH 配置）
+├── llm/                    # LLM 组件（OpenAI 协议）
+│   └── llm.py              # LLM 会话：上下文压缩 / thinking 解析 / usage 统计
+├── data/                   # Data 组件（SQLite 持久化）
+│   ├── agent_store.py / conversation_store.py / session_cache.py
+│   ├── user_store.py / memory.py / embed_model.py / ssh_store.py
+│   └── routes.py           # 对话历史等数据 REST
+├── config/                 # Config 组件
+│   ├── config.py           # 应用配置加载
+│   └── models.py           # 模型配置加载（YAML）
 ├── configs/app.yaml        # 应用配置
 ├── configs/models/*.yaml   # 模型配置（含密钥，已被 gitignore）
 ├── docker/Dockerfile       # 工作空间基础镜像
-└── data/                   # SQLite 运行时数据（已被 gitignore）
+├── mcp_tools/              # MCP 工具实现（document_server / embed_search / server）
+└── workspaces/             # agent 工作空间（已被 gitignore）
 ```
 
 ---
@@ -83,7 +93,7 @@ server/
 
 ### 模型配置 `configs/models/*.yaml`
 
-每个 `.yaml` 一个模型，见 `model.example.yaml`。`is_limitless_context: true` 表示无限上下文 LLM（不支持上下文压缩，上下文原子追加）。普通 LLM 支持手动/自动上下文压缩。
+每个 `.yaml` 一个模型，见 `model.example.yaml`。所有模型均支持手动/自动上下文压缩（超过 `max_seqlen` 参考值时触发）。
 
 模型池由 YAML 配置与提供商的运行期 API 拉取模型合并而成；`GET /api/models?refresh=true` 可强制刷新。
 

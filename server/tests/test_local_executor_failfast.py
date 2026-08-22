@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.local_executor import LocalExecutorClient  # noqa: E402
+from io_.local_executor import LocalExecutorClient  # noqa: E402
 
 
 class _FakeWS:

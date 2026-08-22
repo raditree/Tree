@@ -20,8 +20,8 @@ from unittest.mock import MagicMock, patch
 # 将 server 目录添加到 Python 路径，使 core 模块可导入
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.llm import AgentLLMSession, extract_usage_counts  # noqa: E402
-from core.models import ModelConfig  # noqa: E402
+from llm.llm import AgentLLMSession, extract_usage_counts  # noqa: E402
+from config.models import ModelConfig  # noqa: E402
 
 
 class _Usage:
@@ -117,7 +117,7 @@ class TestExtractUsageCounts(unittest.TestCase):
 
 
 class TestUsageRecordOnce(unittest.TestCase):
-    """验证流式响应中重复 usage chunk 只记账一次。"""
+    """验证流式响应中重复 usage chunk 只记账一次（写入 last_usage）。"""
 
     def setUp(self):
         self.model_config = ModelConfig(
@@ -132,18 +132,6 @@ class TestUsageRecordOnce(unittest.TestCase):
             workspace_id="test-ws",
             system_prompt="",
         )
-        # 构造轻量 budget tracker stub（避免依赖真实价格配置）
-        from core.budget import BudgetTracker, PriceCalculator
-
-        class _Cfg:
-            extra = {
-                "input_price": 0.1,
-                "output_price": 0.2,
-                "cached_input_price": 0.02,
-            }
-
-        self.tracker = BudgetTracker(budget=1.0)
-        self.session.set_budget_tracker(self.tracker, PriceCalculator(_Cfg()))
 
     def test_duplicate_usage_chunks_recorded_once(self):
         """同一响应中重复的 usage chunk 只记录一次。"""
@@ -179,15 +167,16 @@ class TestUsageRecordOnce(unittest.TestCase):
         ]
 
         with patch(
-            "core.llm.LLMClientFactory.create_client",
+            "llm.llm.LLMClientFactory.create_client",
             return_value=mock_client,
         ):
             list(self.session.chat("hi"))
 
-        # 预算 tracker 只记录一次：输入 100，输出 20，缓存 80
-        snap = self.tracker.get_usage_snapshot()
-        self.assertEqual(snap["input_tokens"], 100)
-        self.assertEqual(snap["output_tokens"], 20)
+        # last_usage 只记录一次：输入 100，输出 20，缓存 80
+        snap = self.session.last_usage
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap["prompt_tokens"], 100)
+        self.assertEqual(snap["completion_tokens"], 20)
         self.assertEqual(snap["cached_tokens"], 80)
 
 

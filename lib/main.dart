@@ -1,11 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'pages/login_page.dart';
-import 'pages/main_page.dart';
-import 'services/api_service.dart';
-import 'services/auth_service.dart';
-import 'services/theme_service.dart';
+import 'ui/pages/login_page.dart';
+import 'ui/pages/main_page.dart';
+import 'io/api_service.dart';
+import 'io/auth_service.dart';
+import 'ui/theme_service.dart';
 
 /// 应用入口
 ///

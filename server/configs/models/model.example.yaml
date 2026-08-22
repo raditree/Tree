@@ -12,12 +12,12 @@
 #                        除非同时设置了 api_model_id）
 #   api_model_id        可选。实际发送给 API 的模型名，不设置时默认使用 model_id。
 #                       适用于多个配置使用同一模型名但指向不同 API 地址的场景。
-#   is_limitless_context 是否无限上下文 LLM（true/false）
 #
 # 可选字段（按模型需要）：
 #   max_seqlen          最大上下文长度（普通 LLM 触发压缩的参考值）
 #   temperature         采样温度
 #   top_k               采样 top_k
+#   thinking            是否启用思考模式（true/false，默认 false）
 #   reasoning_effort    推理强度
 #   extra_body          额外请求体（如 thinking 配置）
 
@@ -25,7 +25,6 @@ name: "示例模型"
 base_url: "https://api.example.com/v1"
 api_key: "sk-xxxx"
 model_id: "example-model"
-is_limitless_context: false
 max_seqlen: 65536
 temperature: 0.7
 top_k: 40

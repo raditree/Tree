@@ -16,7 +16,7 @@ from pathlib import Path
 # 将 server 目录添加到 Python 路径，使 core 模块可导入
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.local_executor import LocalExecutorClient  # noqa: E402
+from io_.local_executor import LocalExecutorClient  # noqa: E402
 
 
 class _SpyPending(dict):

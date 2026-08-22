@@ -31,9 +31,6 @@ llm:
   timeout_seconds: 300
   # 调用失败重试次数
   max_retries: 1
-  # 记忆维护跳过阈值：上下文达到模型 max_seqlen 的该比例时跳过记忆维护，
-  # 避免记忆阶段的工具循环继续膨胀上下文导致超长输入
-  memory_update_skip_ratio: 0.9
 
 # 沙箱网络与下载限制（checklist 13/14）
 sandbox:

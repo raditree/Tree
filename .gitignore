@@ -54,6 +54,18 @@ server/**/__pycache__/
 # 后端运行时数据（SQLite 数据库，含用户/上下文等业务数据）
 server/data/
 
+# 本地模式工作空间（成员 top 工作目录 / .self 记忆）与运行时输出目录
+workspaces/
+server/workspaces/
+**/.output/
+
+# 一次性调试/探针脚本与临时产物（P6 仓库卫生）
+/tmp/
+server/tmp*.py
+/tmp_*.py
+/tmp/repro*
+server/**/*.probe.txt
+
 # 模型配置文件含 API Key 密钥，不提交；请参照 *.example.yaml 创建
 server/configs/models/*.yaml
 !server/configs/models/*.example.yaml

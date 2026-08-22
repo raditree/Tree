@@ -19,8 +19,8 @@ import traceback
 # 确保 server 目录在 sys.path 中，便于导入 core
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.docker_manager import DockerManager  # noqa: E402
-from core.workspace_io import CloudWorkspaceIO, WorkspaceIO  # noqa: E402
+from io_.docker_manager import DockerManager  # noqa: E402
+from io_.workspace_io import CloudWorkspaceIO, WorkspaceIO, run_io  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ def _exec_python(workspace_id: str, io: WorkspaceIO, script: str) -> dict:
         "except Exception as e:\n"
         '    print(json.dumps({"success": False, "error": str(e)}))\n'
     )
-    result = io.exec_argv(workspace_id, ["python3", "-c", full_script])
+    result = run_io(io.exec_argv(workspace_id, ["python3", "-c", full_script]))
     exit_code = result.get("exit_code", -1)
     stdout = result.get("stdout", "") or ""
     stderr = result.get("stderr", "") or ""

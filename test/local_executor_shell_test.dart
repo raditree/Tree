@@ -2,7 +2,7 @@
 // 运行方式（项目根目录）：
 //   flutter test test/local_executor_shell_test.dart
 import 'package:flutter_test/flutter_test.dart';
-import 'package:tree/services/local_executor_service.dart';
+import 'package:tree/io/local_executor_service.dart';
 
 void main() {
   group('isUnixLikePath', () {

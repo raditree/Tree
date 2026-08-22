@@ -17,8 +17,8 @@ from mcp.server.mcpserver import MCPServer
 # 确保 server 目录在 sys.path 中，便于导入 core / mcp_tools
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.docker_manager import DockerManager  # noqa: E402
-from core.workspace_io import CloudWorkspaceIO  # noqa: E402
+from io_.docker_manager import DockerManager  # noqa: E402
+from io_.workspace_io import CloudWorkspaceIO  # noqa: E402
 from mcp_tools.embed_search_tool import EmbedSearchTool  # noqa: E402
 
 logger = logging.getLogger(__name__)
