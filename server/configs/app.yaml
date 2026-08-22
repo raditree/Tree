@@ -32,6 +32,14 @@ llm:
   # 调用失败重试次数
   max_retries: 1
 
+# SFT 数据收集与导出
+data_export:
+  # 每日自动导出时刻（HH:MM，本地时区；默认 1:43）
+  daily_time: "01:43"
+  # 允许下载/查看 SFT 导出文件的管理员 openid 列表
+  # （导出文件含全量对话，仅管理员可访问，防止普通用户越权拉取）
+  admin_openids: []
+
 # 沙箱网络与下载限制（checklist 13/14）
 sandbox:
   network:

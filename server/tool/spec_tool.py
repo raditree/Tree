@@ -85,8 +85,8 @@ class SpecTool:
                     " + 上下文获取（检索/读取历史任务规范）\n"
                     "何时使用: 任务开始前检索是否已有对应 Spec；任务完成前沉淀新 Spec；"
                     "用户/本会话已选 Spec 需读全文时\n"
-                    "何时不用: 简单单文件改动无需 Spec；仅查资料不涉及任务规范时\n"
-                    "前置依赖: 无\n"
+                    "何时不用: 无。**必须调用**，即使单文件修改也必须先 **read 并 select** easy spec 再开始任务\n"
+                    "前置依赖: 在搜索更多 spec 前必须先从三个内置基础 spec 中选择一个或多个\n"
                     "动作: search(语义检索) / list(索引) / read(全文) / "
                     "select(多选挂 hook) / create(创建) / update(更新)"
                 ),
@@ -96,7 +96,7 @@ class SpecTool:
                         "action": {
                             "type": "string",
                             "enum": ["search", "list", "read", "select", "create", "update"],
-                            "description": "要执行的动作",
+                            "description": "要执行的动作。**在使用 select 前必须先 read 对应 spec**，select 之后，旧的 spec_id 会被新的 spec_id 覆盖",
                         },
                         "query": {
                             "type": "string",
@@ -105,7 +105,10 @@ class SpecTool:
                         "spec_ids": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "select 用：要挂 hook 的 Spec id 列表（多选）",
+                            "description": "select 用：要挂 hook 的 Spec id 列表（多选）。"
+                                            "**传空数组 [] 表示取消全部选择**；"
+                                            "传非空列表会整体替换当前已选集合。"
+                                            "列表内的 Spec id 会自动去重",
                         },
                         "spec_id": {
                             "type": "string",
@@ -228,20 +231,27 @@ class SpecTool:
         if not isinstance(raw, list):
             return {"error": "select 需要 spec_ids 列表"}
         spec_ids = [str(x).strip() for x in raw if str(x).strip()]
-        if not spec_ids:
-            return {"error": "select 需要至少一个 spec_id"}
+        # 去重，保持插入顺序
+        spec_ids = list(dict.fromkeys(spec_ids))
         if not (self.user_id and self.session_id):
             return {"error": "当前会话未绑定，无法挂 hook（select 仅会话内生效）"}
-        # 校验全部 Spec 存在（内置或自定义）
-        missing = [sid for sid in spec_ids if self._read_spec_content(sid) is None]
-        if missing:
-            return {"error": f"Spec 不存在: {missing}（可先 list/search 查看可用 id）"}
+        if spec_ids:
+            # 校验全部 Spec 存在（内置或自定义）
+            missing = [sid for sid in spec_ids if self._read_spec_content(sid) is None]
+            if missing:
+                return {"error": f"Spec 不存在: {missing}（可先 list/search 查看可用 id）"}
         set_selected_spec_ids(self.user_id, self.session_id, spec_ids)
+        if not spec_ids:
+            return {
+                "action": "select",
+                "spec_ids": [],
+                "note": "已取消全部 Spec 选择（selected_spec_ids 已清空），"
+                        "后续重构 context 将不再注入任何 Spec。",
+            }
         return {
             "action": "select",
             "spec_ids": spec_ids,
-            "note": "已挂 hook；实际注入发生在下次重构 context（compact/新建会话）。"
-                    "如需立即使用请用 read 取全文。",
+            "note": "已挂 hook；实际注入发生在下次重构 context（compact/新建会话）。",
         }
 
     def _action_create(self, arguments: Dict[str, Any]) -> Dict[str, Any]:

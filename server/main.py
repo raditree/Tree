@@ -8,6 +8,7 @@ model_configs）在 lifespan 中统一填充到 state 模块，各组件经 stat
 避免跨组件循环 import。
 """
 import asyncio
+import datetime
 import logging
 from contextlib import asynccontextmanager
 
@@ -23,6 +24,7 @@ from agent.chat import (
 from agent.routes import router as agent_router
 from agent.team_broker import TeamMessageBroker
 from config.config import get_config
+from config.logging_config import setup_logging
 from config.models import get_model_configs
 from data.routes import router as data_router
 from data.user_store import purge_expired_users
@@ -42,6 +44,8 @@ async def lifespan(app: FastAPI):
 
     所有全局单例填充到 state 模块（组件内不持有模块级单例）。
     """
+    # 初始化日志：控制台 + 滚动文件（server/logs/app.log），幂等可重复调用
+    setup_logging()
     config = get_config()
     state.model_configs = get_model_configs()
 
@@ -104,11 +108,40 @@ async def lifespan(app: FastAPI):
 
     purge_task = asyncio.create_task(_purge_loop())
 
+    # 启动后台任务：每日固定时刻自动导出 SFT 数据集（默认 01:43）
+    async def _sft_export_loop() -> None:
+        from data.data_collection_store import export_daily_sft
+
+        daily_cfg = get_config().get("data_export", {})
+        daily_time = str(daily_cfg.get("daily_time", "01:43"))
+        try:
+            hh, mm = (int(x) for x in daily_time.split(":"))
+        except (ValueError, TypeError):
+            hh, mm = 1, 43
+        while True:
+            now = datetime.datetime.now()
+            # 距下一个导出时刻的秒数（当日已过则顺延到次日）
+            next_dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if next_dt <= now:
+                next_dt += datetime.timedelta(days=1)
+            await asyncio.sleep((next_dt - now).total_seconds())
+            try:
+                export_daily_sft()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[SFT] 每日导出异常: {exc}")
+
+    sft_task = asyncio.create_task(_sft_export_loop())
+
     yield
     print("[关闭] 服务退出")
     purge_task.cancel()
+    sft_task.cancel()
     try:
         await purge_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await sft_task
     except asyncio.CancelledError:
         pass
     # 关闭全部 SSH 缓存连接
@@ -174,7 +207,8 @@ if __name__ == "__main__":
     # Windows 上 uvicorn 退出路径会触发上述 lifespan 取消噪音，预先挂上过滤器
     logging.getLogger("uvicorn.error").addFilter(_LifespanCancelFilter())
     try:
-        uvicorn.run(app, host=host, port=port)
+        # log_config=None：不覆盖我们初始化好的日志配置（控制台 + 文件）
+        uvicorn.run(app, host=host, port=port, log_config=None)
     except KeyboardInterrupt:
         pass
     except asyncio.CancelledError:

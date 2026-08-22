@@ -29,6 +29,7 @@ from data.conversation_store import (
     save_context,
     store_message,
 )
+from data.data_collection_store import collect_sft_turn
 from data.session_cache import get_session, set_session
 from data.session_store import (
     DEFAULT_SESSION,
@@ -1657,6 +1658,10 @@ async def _handle_user_message(
                 )
             return incoming_content
 
+        # SFT 数据收集：记录该轮处理前的上下文基线（仅开启数据收集期间有效，
+        # 内部按开关过滤；含 CoT 的完整 context 在对话结束后与基线求 diff）
+        context_before = list(session.context) if session is not None else []
+
         # 在后台线程运行 chat 循环，实时推送中间输出与工具调用
         full_reply, stream_status, last_text_id = await _stream_agent_reply(
             user_id,
@@ -1687,6 +1692,15 @@ async def _handle_user_message(
         # 对话结束后将上下文持久化到数据库（重启后恢复）
         if session is not None:
             save_context(user_id, agent_id, session.context, session_id=session_id)
+            # SFT 数据收集：仅开启期间生效；把本轮新增消息（含 CoT）作为
+            # diff 累加到该会话快照。带 try 避免收集异常影响主流程。
+            try:
+                collect_sft_turn(
+                    user_id, agent_id, session_id,
+                    context_before, session.context,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("SFT 收集失败: %s", exc)
     except Exception as exc:  # noqa: BLE001
         await _send_text_as_agent(user_id, agent_id, f"LLM 请求失败: {exc}", session_id=session_id)
         full_reply = f"LLM 请求失败: {exc}"

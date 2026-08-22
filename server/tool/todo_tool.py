@@ -79,6 +79,14 @@ class SetTodoListTool:
                             "items": {
                                 "type": "object",
                                 "properties": {
+                                    "id": {
+                                        "type": "string",
+                                        "description": (
+                                            "任务项 id（可选）。建议由你自定义一个简短、可读且唯一的 "
+                                            "标识（如 task_export_data），后续 update 用它来定位更新；"
+                                            "不提供则由工具自动生成"
+                                        ),
+                                    },
                                     "content": {
                                         "type": "string",
                                         "description": "任务描述",
@@ -95,7 +103,10 @@ class SetTodoListTool:
                                 },
                                 "required": ["content"],
                             },
-                            "description": "set 用：完整 todos 列表（不含 id，由工具生成）",
+                            "description": (
+                                "set 用：完整 todos 列表。每项建议提供自定义 id 便于后续按 id "
+                                "update，不提供时工具自动生成"
+                            ),
                         },
                         "todo_id": {
                             "type": "string",
@@ -148,6 +159,7 @@ class SetTodoListTool:
             return {"error": f"todos 过多（{len(raw)} > {MAX_TODOS}），请拆分精简"}
         now = int(time.time() * 1000)
         todos: List[Dict[str, Any]] = []
+        seen_ids: set = set()
         for item in raw:
             if not isinstance(item, dict):
                 continue
@@ -158,8 +170,18 @@ class SetTodoListTool:
             if status not in STATUS_VALUES:
                 status = "pending"
             progress = _clamp_progress(item.get("progress"), status)
+            # 支持 agent 自定义 id；未提供或非法时回退系统生成
+            custom_id = item.get("id")
+            if isinstance(custom_id, str) and custom_id.strip():
+                todo_id = custom_id.strip()
+            else:
+                todo_id = _gen_todo_id()
+            # 同批次内 id 必须唯一，重复时回退系统生成避免覆盖
+            if todo_id in seen_ids:
+                todo_id = _gen_todo_id()
+            seen_ids.add(todo_id)
             todos.append({
-                "id": _gen_todo_id(),
+                "id": todo_id,
                 "content": content,
                 "status": status,
                 "progress": progress,

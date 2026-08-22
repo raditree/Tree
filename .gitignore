@@ -51,8 +51,11 @@ server/**/__pycache__/
 *.py[cod]
 *.egg-info/
 
-# 后端运行时数据（SQLite 数据库，含用户/上下文等业务数据）
-server/data/
+# 后端运行时数据（SQLite 数据库、本地工作空间映射等业务数据）。
+# 注意：仅忽略运行时生成的 db/json 产物，保留 data/ 下的源码（*.py、names.json）。
+server/data/*.db
+server/data/*.db-*
+server/data/shared_workspaces.json
 
 # 本地模式工作空间（成员 top 工作目录 / .self 记忆）与运行时输出目录
 workspaces/
@@ -79,3 +82,6 @@ server/configs/embed_model.yaml
 # 本地运行日志
 *.log
 server/*.log
+
+# 后端统一运行日志目录（server/logs/app.log 及滚动副本）
+server/logs/

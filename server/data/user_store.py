@@ -337,6 +337,7 @@ def purge_expired_users() -> int:
             conn.execute("DELETE FROM agent_context WHERE user_id = ?", (openid,))
             conn.execute("DELETE FROM usage_snapshots WHERE openid = ?", (openid,))
             conn.execute("DELETE FROM data_collection_prefs WHERE openid = ?", (openid,))
+            conn.execute("DELETE FROM sft_sessions WHERE user_id = ?", (openid,))
             conn.commit()
         deleted += 1
     return deleted

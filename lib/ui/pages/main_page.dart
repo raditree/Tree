@@ -339,6 +339,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     return FilePanel(
       key: ValueKey(workspaceId),
       workspaceId: workspaceId,
+      topAgentId: _selectedAgent?.id,
       onCollapse: () {
         setState(() {
           _rightCollapsed = true;

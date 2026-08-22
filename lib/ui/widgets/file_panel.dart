@@ -10,16 +10,21 @@ import 'file_sync_button.dart';
 import 'file_tree.dart';
 import 'file_viewer.dart';
 import 'git_history.dart';
+import 'todo_panel.dart';
 
 /// 文件管理面板（右栏）
 ///
-/// 集成文件浏览、Git 历史与文件同步功能，作为右栏的主容器：
-/// - 顶部标题栏："文件管理" + [FileSyncButton] + 折叠按钮
-/// - Tab 切换："文件浏览"（[FileTree]） / "Git 历史"（[GitHistory]）
+/// 集成文件浏览、Git 历史、文件同步与 Todo 面板，作为右栏的主容器：
+/// - 顶部导航栏："文件" / "Todo" 切换
+/// - 文件页：Tab 切换"文件浏览"（[FileTree]） / "Git 历史"（[GitHistory]）
+/// - Todo 页：展示 [TodoPanel]（agent 的 .self/todos.md 任务清单）
 /// - 点击文件时以覆盖层方式弹出 [FileViewer]，点击返回按钮关闭查看器
 class FilePanel extends StatefulWidget {
   /// 工作空间 ID
   final String workspaceId;
+
+  /// 所属顶层 agent ID（Todo 面板本地模式读取需要）
+  final String? topAgentId;
 
   /// 折叠右侧栏的回调
   final VoidCallback? onCollapse;
@@ -27,6 +32,7 @@ class FilePanel extends StatefulWidget {
   const FilePanel({
     super.key,
     required this.workspaceId,
+    this.topAgentId,
     this.onCollapse,
   });
 
@@ -36,6 +42,9 @@ class FilePanel extends StatefulWidget {
 
 class _FilePanelState extends State<FilePanel>
     with SingleTickerProviderStateMixin {
+  /// 当前右侧栏导航分区（'files'=文件 / 'todo'=Todo）
+  String _navSection = 'files';
+
   /// Tab 控制器（0=文件浏览，1=Git 历史）
   late final TabController _tabController;
 
@@ -130,62 +139,84 @@ class _FilePanelState extends State<FilePanel>
       color: Theme.of(context).scaffoldBackgroundColor,
       child: Column(
         children: [
-          // 标题栏：文件管理 + 同步按钮
+          // 顶部导航栏：文件 / Todo 切换 + 同步按钮
           _buildTitleBar(),
-          // Tab 栏
-          _buildTabBar(),
           Divider(
             height: 1,
             thickness: 1,
             color: Theme.of(context).dividerColor,
           ),
-          // 内容区域（使用 Stack 叠加 FileViewer 覆盖层）
+          // 内容区域：按导航分区切换
           Expanded(
-            child: Stack(
-              children: [
-                // Tab 内容
-                TabBarView(
-                  controller: _tabController,
-                  children: [
-                    FileTree(
-                      workspaceId: widget.workspaceId,
-                      refreshTrigger: _fileRefreshTrigger,
-                      onDownload: _handleDownload,
-                      onFileSelected: (String path) {
-                        setState(() {
-                          _selectedFilePath = path;
-                        });
-                      },
-                    ),
-                    GitHistory(workspaceId: widget.workspaceId),
-                  ],
-                ),
-                // FileViewer 覆盖层（选中文件时显示）
-                if (_selectedFilePath != null)
-                  Positioned.fill(
-                    child: FileViewer(
-                      workspaceId: widget.workspaceId,
-                      filePath: _selectedFilePath!,
-                      onClose: _closeViewer,
-                    ),
-                  ),
-              ],
-            ),
+            child: _navSection == 'todo'
+                ? TodoPanel(
+                    workspaceId: widget.workspaceId,
+                    topAgentId: widget.topAgentId,
+                    refreshTrigger: _fileRefreshTrigger,
+                  )
+                : _buildFileSection(),
           ),
         ],
       ),
     );
   }
 
-  /// 构建标题栏
+  /// 文件分区：Tab 栏 + 内容（文件浏览 / Git 历史） + FileViewer 覆盖层
+  Widget _buildFileSection() {
+    return Column(
+      children: [
+        // Tab 栏
+        _buildTabBar(),
+        Divider(
+          height: 1,
+          thickness: 1,
+          color: Theme.of(context).dividerColor,
+        ),
+        // 内容区域（使用 Stack 叠加 FileViewer 覆盖层）
+        Expanded(
+          child: Stack(
+            children: [
+              // Tab 内容
+              TabBarView(
+                controller: _tabController,
+                children: [
+                  FileTree(
+                    workspaceId: widget.workspaceId,
+                    refreshTrigger: _fileRefreshTrigger,
+                    onDownload: _handleDownload,
+                    onFileSelected: (String path) {
+                      setState(() {
+                        _selectedFilePath = path;
+                      });
+                    },
+                  ),
+                  GitHistory(workspaceId: widget.workspaceId),
+                ],
+              ),
+              // FileViewer 覆盖层（选中文件时显示）
+              if (_selectedFilePath != null)
+                Positioned.fill(
+                  child: FileViewer(
+                    workspaceId: widget.workspaceId,
+                    filePath: _selectedFilePath!,
+                    onClose: _closeViewer,
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// 构建顶部导航栏
   ///
-  /// 高度 48px，白色背景，底部 1px 分隔线。
-  /// 左侧显示"文件管理"，右侧显示文件同步按钮和折叠按钮。
+  /// 左侧"文件 / Todo"切换，右侧文件同步按钮与折叠按钮。
   Widget _buildTitleBar() {
     final cs = Theme.of(context).colorScheme;
     return Container(
       height: 48,
-      padding: const EdgeInsets.only(left: 12, right: 4),
+      padding: const EdgeInsets.only(left: 8, right: 4),
       decoration: BoxDecoration(
         color: cs.surface,
         border: Border(
@@ -194,18 +225,40 @@ class _FilePanelState extends State<FilePanel>
       ),
       child: Row(
         children: [
-          const Text(
-            '文件管理',
-            style: TextStyle(
-              fontSize: 16,
-              fontWeight: FontWeight.w600,
+          // 导航切换：文件 / Todo
+          SegmentedButton<String>(
+            segments: const <ButtonSegment<String>>[
+              ButtonSegment<String>(
+                value: 'files',
+                label: Text('文件'),
+                icon: Icon(Icons.folder_outlined, size: 16),
+              ),
+              ButtonSegment<String>(
+                value: 'todo',
+                label: Text('Todo'),
+                icon: Icon(Icons.checklist_outlined, size: 16),
+              ),
+            ],
+            selected: <String>{_navSection},
+            onSelectionChanged: (Set<String> selection) {
+              setState(() {
+                _navSection = selection.first;
+              });
+            },
+            showSelectedIcon: false,
+            style: const ButtonStyle(
+              visualDensity: VisualDensity.compact,
+              padding: MaterialStatePropertyAll(
+                EdgeInsets.symmetric(horizontal: 10),
+              ),
             ),
           ),
           const Spacer(),
-          FileSyncButton(
-            workspaceId: widget.workspaceId,
-            onUploaded: _refreshFileTree,
-          ),
+          if (_navSection == 'files')
+            FileSyncButton(
+              workspaceId: widget.workspaceId,
+              onUploaded: _refreshFileTree,
+            ),
           // 折叠右侧栏
           IconButton(
             tooltip: '折叠右侧栏',

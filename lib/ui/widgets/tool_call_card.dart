@@ -250,6 +250,18 @@ class _ToolCallCardState extends State<ToolCallCard> {
           _paramRow('参数', key),
           _paramRow('值', value),
         ];
+      case 'set_todo_list':
+        final String action = args['action']?.toString() ?? '';
+        final List<Widget> widgets = <Widget>[_paramRow('操作', action)];
+        if (action == 'set') {
+          final List<dynamic>? todos = args['todos'] as List<dynamic>?;
+          if (todos != null && todos.isNotEmpty) {
+            widgets.add(_paramRow('任务项数', '${todos.length}'));
+          }
+        } else if (action == 'update') {
+          widgets.add(_paramRow('目标 id', args['todo_id']?.toString() ?? ''));
+        }
+        return widgets;
       case 'team':
         final String action = args['action']?.toString() ?? '';
         final String? memberId = args['member_id']?.toString();
@@ -298,6 +310,60 @@ class _ToolCallCardState extends State<ToolCallCard> {
     if (result.isEmpty) {
       return const Text('（无输出）',
           style: TextStyle(fontSize: 12, color: Colors.grey));
+    }
+
+    // set_todo_list 特殊展示：把 todos 数组渲染成 id+内容+状态列表
+    if (name == 'set_todo_list') {
+      final Map<String, dynamic>? parsed = _tryDecodeMap(result);
+      final List<dynamic>? todos = parsed?['todos'] as List<dynamic>?;
+      if (todos != null && todos.isNotEmpty) {
+        final List<Widget> rows = <Widget>[];
+        for (final dynamic t in todos) {
+          if (t is! Map<String, dynamic>) continue;
+          final String id = (t['id'] ?? '').toString();
+          final String content = (t['content'] ?? '').toString();
+          final String status = (t['status'] ?? '').toString();
+          final String progress = (t['progress'] ?? '').toString();
+          rows.add(Padding(
+            padding: const EdgeInsets.only(bottom: 3),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                SizedBox(
+                  width: 120,
+                  child: Text(
+                    id,
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontFamily: 'monospace',
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                Expanded(
+                  child: Text(
+                    content,
+                    style: const TextStyle(fontSize: 12, height: 1.4),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  '$status $progress',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ));
+        }
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: rows,
+        );
+      }
     }
     // 如果结果是重定向提示
     if (result.startsWith('工具调用结果已保存到')) {
@@ -359,24 +425,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
   /// 提取 `content` / `output` / `result` / `message` 等关键字段；
   /// 若解析失败则返回原始字符串。
   String _extractReadableResult(String raw) {
-    // 尝试 JSON 解析
-    Map<String, dynamic>? parsed;
-    try {
-      parsed = jsonDecode(raw) as Map<String, dynamic>?;
-    } catch (_) {
-      // 尝试修复 Python dict 字符串（单引号 -> 双引号）
-      try {
-        final String fixed = raw
-            .replaceAll(RegExp(r"(?<!\\)'"), '"')
-            .replaceAll(RegExp(r'\bTrue\b'), 'true')
-            .replaceAll(RegExp(r'\bFalse\b'), 'false')
-            .replaceAll(RegExp(r'\bNone\b'), 'null');
-        parsed = jsonDecode(fixed) as Map<String, dynamic>?;
-      } catch (_) {
-        parsed = null;
-      }
-    }
-
+    final Map<String, dynamic>? parsed = _tryDecodeMap(raw);
     if (parsed == null) return raw;
 
     // 提取可读字段
@@ -395,6 +444,32 @@ class _ToolCallCardState extends State<ToolCallCard> {
 
     // 回退：返回原始 JSON
     return raw;
+  }
+
+  /// 尝试把工具结果字符串解析为 map。
+  ///
+  /// 兼容 JSON 与 Python dict 字符串（单引号、True/False/None）。
+  /// 解析失败时返回 null。
+  Map<String, dynamic>? _tryDecodeMap(String raw) {
+    // 尝试 JSON 解析
+    try {
+      final Object? decoded = jsonDecode(raw);
+      if (decoded is Map<String, dynamic>) return decoded;
+    } catch (_) {
+      // 尝试修复 Python dict 字符串（单引号 -> 双引号）
+      try {
+        final String fixed = raw
+            .replaceAll(RegExp(r"(?<!\\)'"), '"')
+            .replaceAll(RegExp(r'\bTrue\b'), 'true')
+            .replaceAll(RegExp(r'\bFalse\b'), 'false')
+            .replaceAll(RegExp(r'\bNone\b'), 'null');
+        final Object? decoded = jsonDecode(fixed);
+        if (decoded is Map<String, dynamic>) return decoded;
+      } catch (_) {
+        return null;
+      }
+    }
+    return null;
   }
 
   /// 参数行：标签 + 值
