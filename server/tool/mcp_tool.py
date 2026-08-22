@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import threading
-from typing import Any
+from typing import Any, Optional
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -89,6 +89,37 @@ class MCPManager:
     def list_services(self) -> list[str]:
         """返回所有已注册的 MCP 服务名称。"""
         return list(self.services.keys())
+
+    def unregister_service(self, name: str) -> bool:
+        """注销一个 MCP 服务。
+
+        :param name: 服务名称
+        :return: 是否存在并被删除
+        """
+        if name in self.services:
+            self.services.pop(name, None)
+            self._sessions.pop(name, None)
+            logger.info("已注销 MCP 服务: %s", name)
+            return True
+        return False
+
+    def get_service_info(self, name: str) -> Optional[dict]:
+        """返回服务详情（脱敏：env 仅列键名，不含值）。
+
+        :param name: 服务名称
+        :return: 服务信息字典；服务不存在时返回 None
+        """
+        service = self.services.get(name)
+        if service is None:
+            return None
+        return {
+            "name": name,
+            "command": service.get("command", ""),
+            "args": list(service.get("args", [])),
+            "env_keys": list(service.get("env", {}).keys()),
+            "in_process": service.get("handler") is not None,
+            "tool_count": len(service.get("tools", []) or []),
+        }
 
     def get_tools(self, service_name: str = None, force: bool = False) -> list[dict]:
         """获取 MCP 工具列表。

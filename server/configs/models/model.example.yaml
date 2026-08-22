@@ -18,6 +18,8 @@
 #   temperature         采样温度
 #   top_k               采样 top_k
 #   thinking            是否启用思考模式（true/false，默认 false）
+#   if_vision           是否支持图像输入（true/false，默认 false）。
+#                       为 true 时 read 工具读图会构造 OpenAI vision 消息格式。
 #   reasoning_effort    推理强度
 #   extra_body          额外请求体（如 thinking 配置）
 
@@ -25,6 +27,7 @@ name: "示例模型"
 base_url: "https://api.example.com/v1"
 api_key: "sk-xxxx"
 model_id: "example-model"
+if_vision: false
 max_seqlen: 65536
 temperature: 0.7
 top_k: 40

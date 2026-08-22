@@ -12,6 +12,11 @@ from io_.workspace_io import WorkspaceIO, run_io
 
 logger = logging.getLogger(__name__)
 
+# terminal 工具默认执行超时（秒）：长命令（构建/测试/安装）默认给 120s，
+# 避免无限阻塞 tool loop；显式传入 timeout 时仍可覆盖（1-3600s）。
+_DEFAULT_TIMEOUT = 120
+_MAX_TIMEOUT = 3600
+
 
 class TerminalTool:
     """terminal 工具 - 在工作空间内执行 shell 命令。"""
@@ -50,7 +55,7 @@ class TerminalTool:
                         },
                         "timeout": {
                             "type": "integer",
-                            "description": "超时时间（秒），默认 30",
+                            "description": "超时时间（秒），默认 120；超时返回错误并继续，避免无限阻塞",
                         },
                     },
                     "required": ["command"],
@@ -63,7 +68,7 @@ class TerminalTool:
 
         :param arguments: 工具参数，包含：
             - command: shell 命令（必填）
-            - timeout: 超时秒数（可选，默认 30）
+            - timeout: 超时秒数（可选，默认 120）
         :return: ``{"stdout": "...", "exit_code": N}``；命令为空时返回
                  ``{"error": "..."}``
         """

@@ -12,7 +12,10 @@ import yaml
 _MODELS_DIR = Path(__file__).resolve().parent.parent / "configs" / "models"
 
 # ModelConfig 固定字段，其余字段归入 extra
-_KNOWN_FIELDS = {"name", "base_url", "api_key", "model_id", "api_model_id"}
+_KNOWN_FIELDS = {
+    "name", "base_url", "api_key", "model_id", "api_model_id",
+    "thinking", "if_vision",
+}
 
 
 @dataclass
@@ -28,17 +31,19 @@ class ModelConfig:
     model_id: str
     api_model_id: str = ""
     thinking: bool = False
+    if_vision: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ModelConfig":
         """从配置字典构造 ModelConfig，未识别字段放入 extra。
 
-        ``thinking`` 为顶层布尔字段（默认 false），spec「thinking 支持：
-        ModelConfig ``thinking`` 字段」。其余未识别字段归入 extra。
+        ``thinking`` / ``if_vision`` 为顶层布尔字段（默认 false），
+        spec「thinking 支持：ModelConfig ``thinking`` 字段」「read_tool 图像：
+        ModelConfig ``if_vision`` 字段」。其余未识别字段归入 extra。
         """
         extra = {k: v for k, v in data.items()
-                 if k not in _KNOWN_FIELDS and k != "thinking"}
+                 if k not in _KNOWN_FIELDS and k not in ("thinking", "if_vision")}
         return cls(
             name=data.get("name", ""),
             base_url=data.get("base_url", ""),
@@ -46,6 +51,7 @@ class ModelConfig:
             model_id=data.get("model_id", ""),
             api_model_id=data.get("api_model_id", ""),
             thinking=bool(data.get("thinking", False)),
+            if_vision=bool(data.get("if_vision", False)),
             extra=extra,
         )
 
@@ -58,6 +64,7 @@ class ModelConfig:
             "model_id": self.model_id,
             "api_model_id": self.api_model_id,
             "thinking": self.thinking,
+            "if_vision": self.if_vision,
         }
         result.update(self.extra)
         return result

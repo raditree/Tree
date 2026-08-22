@@ -103,16 +103,19 @@ class TestSpecStore(DataStoreBase):
     def test_builtin_specs_pinned_first(self):
         specs = spec_store.list_specs(agent_id=None)
         pinned = [s for s in specs if s["pinned"]]
-        # 内置 3 个存在且置顶并被标记为 builtin
-        self.assertGreaterEqual(len(pinned), 3)
+        # 内置 4 个存在且置顶并被标记为 builtin
+        self.assertGreaterEqual(len(pinned), 4)
         builtin_ids = [s["id"] for s in pinned if s["builtin"]]
         self.assertEqual(
             [s for s in spec_store.BUILTIN_SPEC_IDS if s in builtin_ids],
             list(spec_store.BUILTIN_SPEC_IDS),
         )
-        # 固定顺序置顶：easy/complex/hard
+        # 固定顺序置顶：easy/complex/hard/team-meeting
         order = [s["id"] for s in specs if s["builtin"]]
-        self.assertEqual(order[:3], ["easy-task", "complex-task", "hard-task"])
+        self.assertEqual(
+            order[:4],
+            ["easy-task", "complex-task", "hard-task", "team-meeting"],
+        )
 
     @unittest.skipIf(
         not (Path(__file__).resolve().parent.parent / "tool/spec/builtin").exists(),

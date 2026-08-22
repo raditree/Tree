@@ -22,3 +22,5 @@ top_chat_broker: Optional[Any] = None
 ssh_manager: Optional[Any] = None
 # 模型配置全局缓存（lifespan 中填充）
 model_configs: Dict[str, ModelConfig] = {}
+# MCP 服务管理器（lifespan 中填充）：管理全局外部 stdio MCP 服务
+# （经 REST /api/mcp/services 注册，跨会话共享；各会话工具注册时复制外部服务）

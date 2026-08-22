@@ -3,6 +3,8 @@
 读取 ``server/configs/embed_model.yaml`` 获取嵌入模型配置，
 提供 OpenAI 协议兼容的 embedding API 调用封装。
 """
+from __future__ import annotations
+
 import hashlib
 import logging
 from collections import OrderedDict
@@ -38,6 +40,38 @@ def _cache_key(text: str, dimensions: Optional[int] = None) -> str:
     if dimensions is not None:
         key = f"{key}_d{dimensions}"
     return key
+
+
+def get_max_input_length(config: EmbedModelConfig) -> Optional[int]:
+    """读取嵌入模型配置中的单次最大输入字符数（``max_input_length``）。
+
+    配置缺失或非法时返回 None（不截断，保持旧行为）。
+
+    :param config: 嵌入模型配置
+    :return: 最大输入字符数，或 None
+    """
+    raw = config.extra.get("max_input_length")
+    if raw is None:
+        return None
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return limit if limit > 0 else None
+
+
+def truncate_text(text: str, max_length: Optional[int]) -> str:
+    """按 ``max_input_length`` 截断输入文本（字符级），避免超长文本嵌入异常。
+
+    :param text: 输入文本
+    :param max_length: 最大字符数；None 或不大于 0 时不截断
+    :return: 截断后的文本
+    """
+    if not max_length or max_length <= 0 or not text:
+        return text
+    if len(text) > max_length:
+        return text[:max_length]
+    return text
 
 
 @dataclass
@@ -124,6 +158,10 @@ def get_embedding(
     :param dimensions: 向量维度（模型支持动态维度时可选）
     :return: 浮点数向量列表，调用失败时返回 None
     """
+    # 截断保护：超过 max_input_length 时按配置截断（超长文本嵌入前先截断）
+    max_len = get_max_input_length(config)
+    if max_len:
+        text = truncate_text(text, max_len)
     # 检查缓存命中
     key = _cache_key(text, dimensions)
     if key in _embedding_cache:
@@ -180,6 +218,11 @@ def get_embeddings_batch(
     """
     if not texts:
         return []
+
+    # 截断保护：批量文本逐条按 max_input_length 截断（超长文本嵌入前先截断）
+    max_len = get_max_input_length(config)
+    if max_len:
+        texts = [truncate_text(t, max_len) for t in texts]
 
     # 逐条检查缓存，分离已缓存和未缓存
     keys = [_cache_key(t, dimensions) for t in texts]

@@ -136,6 +136,30 @@ class WorkspaceIO(ABC):
                  或含 ``error`` 的字典
         """
 
+    async def read_file_base64(
+        self, workspace_id: str, path: str
+    ) -> Dict[str, Any]:
+        """读取工作空间内文件并以 base64 返回（供 read 工具图像输入）。
+
+        默认实现基于 :meth:`exec_argv` 执行 ``base64 -w0``（容器/远端主机
+        通常自带 coreutils）；子类可按需覆盖（如前端本地执行器自定义 op）。
+
+        :param workspace_id: 工作空间标识
+        :param path: 工作空间内相对路径
+        :return: 成功 ``{"base64": "<...>", "file_path": path}``；
+                 失败 ``{"error": "...", "file_path": path}``
+        """
+        result = await self.exec_argv(
+            workspace_id, ["base64", "-w0", path], timeout=30
+        )
+        if result.get("error") or result.get("exit_code", -1) != 0:
+            return {
+                "error": result.get("error")
+                or f"读取二进制文件失败: {path}",
+                "file_path": path,
+            }
+        return {"base64": result.get("stdout", ""), "file_path": path}
+
 
 class CloudWorkspaceIO(WorkspaceIO):
     """云端模式实现：基于 DockerManager 在容器内执行。

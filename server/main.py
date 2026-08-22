@@ -168,7 +168,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 注册 REST API 路由（data：健康/认证/数据收集/embed；agent：agent CRUD/对话；io_：工作空间/Git）
+# 注册 REST API 路由（data：健康/认证/数据收集/embed；agent：agent CRUD/对话/
+# MCP 服务管理/模型信息；io_：工作空间/Git）
 app.include_router(data_router)
 app.include_router(agent_router)
 app.include_router(io_router)
@@ -183,7 +184,7 @@ class _LifespanCancelFilter(logging.Filter):
     uvicorn 0.29+ 在 Windows 上 Ctrl+C 退出时会重抛捕获到的信号，导致
     asyncio 清理阶段取消仍存活的 lifespan 任务；starlette 随后将这段
     CancelledError 堆栈作为 lifespan.shutdown.failed 消息以 ERROR 级别打印。
-    这里仅抑制这类“任务被取消”的堆栈，其它真实异常不受影响。
+    这里仅抑制这类"任务被取消"的堆栈，其它真实异常不受影响。
     """
 
     def filter(self, record: logging.LogRecord) -> bool:

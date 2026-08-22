@@ -9,7 +9,14 @@ import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from io_.workspace_io import WorkspaceIO, run_io
-from data.embed_model import EmbedModelConfig, get_embedding, get_embeddings_batch, load_embed_model_config
+from data.embed_model import (
+    EmbedModelConfig,
+    get_embedding,
+    get_embeddings_batch,
+    get_max_input_length,
+    load_embed_model_config,
+    truncate_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -120,10 +127,14 @@ class EmbedSearchTool:
         # 获取嵌入模型配置
         embed_config = self._get_embed_config()
 
+        # 截断保护：查询与候选内容均按配置的 max_input_length 截断后再嵌入，
+        # 避免超长文本超出嵌入模型输入上限导致 API 报错（512 字符等）。
+        max_len = get_max_input_length(embed_config) if embed_config else None
+
         # 获取查询向量（如果嵌入模型已配置）
         query_embedding: Optional[List[float]] = None
         if embed_config is not None:
-            query_embedding = get_embedding(query, embed_config)
+            query_embedding = get_embedding(truncate_text(query, max_len), embed_config)
             if query_embedding is None:
                 logger.warning(
                     "获取查询向量失败，降级为纯文本搜索"
@@ -162,8 +173,8 @@ class EmbedSearchTool:
 
         # 如果嵌入模型可用，计算语义相似度并重排序
         if query_embedding is not None and embed_config is not None:
-            # 批量获取所有候选内容的向量，减少 API 调用次数
-            candidate_texts = [content for _, _, content in candidates]
+            # 批量获取所有候选内容的向量，减少 API 调用次数（逐条截断保护）
+            candidate_texts = [truncate_text(content, max_len) for _, _, content in candidates]
             content_embeddings = get_embeddings_batch(candidate_texts, embed_config)
 
             scored_results: List[Dict[str, Any]] = []

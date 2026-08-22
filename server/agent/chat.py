@@ -79,6 +79,18 @@ async def _register_tools(
     重构 context 时重建 system prompt，注入最新 Spec 索引/已选 Spec/memory/成员拓扑）。
     """
     mcp_config = get_config().get("mcp")
+    # 合并 DB 持久化的外部 MCP 服务（REST /api/mcp/services 注册），
+    # 与 config yaml 内置服务一起注册到 MCPManager（spec「MCP services CRUD」）
+    try:
+        from data.mcp_service_store import load_services_as_config
+
+        db_services = load_services_as_config()
+        if db_services:
+            merged = dict(mcp_config or {})
+            merged.update(db_services)
+            mcp_config = merged
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("加载 DB 外部 MCP 服务失败(忽略): %s", exc)
     workspace_id = getattr(session, "workspace_id", "") or ""
     session.system_prompt_rebuilder = _make_system_prompt_rebuilder(
         workspace_id,
@@ -364,7 +376,7 @@ def _build_agent_system_prompt(
 
 
 def _build_task_paradigm_text() -> str:
-    """② 任务执行范式：任务分型路由（easy/complex/hard → 内置 Spec workflow）。"""
+    """② 任务执行范式：任务分型路由（easy/complex/hard/team-meeting → 内置 Spec workflow）。"""
     return (
         "## ② 任务执行范式（任务分型路由）\n"
         "接到任务先判型，再选对应内置 Spec 按其 workflow 执行：\n"
@@ -376,8 +388,12 @@ def _build_task_paradigm_text() -> str:
         "按需 team 指派成员 → 按 todo 执行并更新 → 全量验证 → 汇报 → "
         "无适用 Spec 时 spec create 沉淀。\n"
         "- **hard-task**：架构级框架级变更 / 新领域无经验 / 高不确定需多方案 / 高危。"
-        "先界定边界 → 召开团队会议讨论选型 → 标准团队流水线（需求→方案→评审→实现→"
-        "测试→交付）→ 高危操作 ask_user_question 确认 → 末尾强制 spec create 补 Spec。\n"
+        "先界定边界 → 召开团队会议讨论选型（遵循 team-meeting，**会议期间只讨论不落地**）→ "
+        "标准团队流水线（需求→方案→评审→实现→测试→交付）→ 高危操作 ask_user_question 确认 → "
+        "末尾强制 spec create 补 Spec。\n"
+        "- **team-meeting**：团队方案讨论/评审/定案。leader 召集会议只讨论、只产出方案；"
+        "成员收到会议消息后**只发言不落地**（禁 write/edit/terminal/assign_task），"
+        "收到明确执行指令后方可开工。\n"
         "easy 是初判非承诺：执行中复杂度增长（tool call >8 未收敛 / 发现跨文件影响）"
         "必须切换更高级别，不得硬撑。"
     )
@@ -398,7 +414,7 @@ def _build_tool_routing_text() -> str:
 
 
 def _build_spec_index_text(agent_id: str) -> str:
-    """⑤ Spec 索引：内置 3 置顶 + 自定义 Spec（id/task_type/title/when 摘要），超限截断。"""
+    """⑤ Spec 索引：内置 4 置顶 + 自定义 Spec（id/task_type/title/when 摘要），超限截断。"""
     try:
         from data.spec_store import list_specs
 
@@ -529,7 +545,7 @@ def _build_spec_maintenance_text() -> str:
     return (
         "## ⑨ Spec 维护指引\n"
         "- 任务开始前：先用 spec search 检索是否已有对应 Spec（内置 "
-        "easy/complex/hard 或历史自定义）；命中则遵循其 workflow。\n"
+        "easy/complex/hard/team-meeting 或历史自定义）；命中则遵循其 workflow。\n"
         "- 任务过程中：用户/团队约定、可复用的工作流与规范值得沉淀时 spec create 记录。\n"
         "- 任务完成后（complex/hard 且无适用 Spec）：spec create 补充对应 Spec"
         "（hard 强制，缺则任务未闭环）。\n"
@@ -975,7 +991,7 @@ async def _stream_agent_reply(
     def _consume() -> None:
         """线程内消费 chat 生成器，产出经线程安全方式回传事件循环。"""
         try:
-            for item in session.chat(llm_content, on_tool_turn=on_tool_turn):
+            for item in session.chat(llm_content, on_tool_turn=on_tool_turn, cancel_event=cancel_event):
                 if cancel_event is not None and cancel_event.is_set():
                     loop.call_soon_threadsafe(out_q.put_nowait, {"type": "cancelled"})
                     return
@@ -1198,7 +1214,11 @@ async def _stream_agent_reply(
                     # last_usage，立即同步给前端，让「上下文长度」统计在 tool 循环
                     # 中持续跟进，而非等最终回复结束才一次性更新。
                     if getattr(session, "last_usage", None):
-                        mid_max = int(model_config.extra.get("max_seqlen", 8192))
+                        _mc = getattr(session, "model_config", None)
+                        mid_max = (
+                            int(_mc.extra.get("max_seqlen", 8192))
+                            if _mc is not None else 8192
+                        )
                         await state.ws_manager.send_message(
                             user_id,
                             {
@@ -1327,7 +1347,8 @@ async def _process_member_message(
     cancel_event = _register_active_task(user_id, agent_id, session_id)
     await state.ws_manager.send_message(
         user_id,
-        {"type": "agent_status", "data": {"agent_id": agent_id, "status": "working"}},
+        {"type": "agent_status", "data": {"agent_id": agent_id, "status": "working",
+                                           "session_id": session_id}},
     )
     try:
         full_reply, _status, _last = await _stream_agent_reply(
@@ -1361,7 +1382,7 @@ async def _process_member_message(
                     f"[成员 {agent_id} 完成回复] {full_reply}",
                     source_agent_id=agent_id,
                     top_agent_id=top_agent_id or leader_id,
-                    extra={"auto_reply": True},
+                    extra={"auto_reply": True, "session_id": session_id},
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("成员回复回传 leader 失败: %s", exc)
@@ -1396,9 +1417,38 @@ async def _broker_process_user_message(
 def _find_roster_member(
     user_id: str, roster_owner_id: str, member_id: str
 ) -> Optional[Dict[str, Any]]:
-    """从指定 agent 的 roster（成员管理表）中查找成员。"""
+    """从指定 agent 的成员名单中查找成员（team 跨模式）。
+
+    优先读 ``team_members`` 表（P4 建队后的权威名单，cloud/local/ssh 一致），
+    表为空（未建队/旧数据）时回退解析工作空间 ``.self/team_roster.md``。
+    成员记录补充 system_prompt 字段（表中有、文件视图无），供投递时使用。
+    """
     if not roster_owner_id or not member_id:
         return None
+
+    # 权威来源：team_store（teams/team_members 表）
+    from data.team_store import get_member as get_team_member
+
+    try:
+        db_member = get_team_member(roster_owner_id, member_id)
+    except Exception:  # noqa: BLE001
+        db_member = None
+    if db_member is not None:
+        return {
+            "id": db_member["id"],
+            "name": db_member["name"],
+            "model_id": db_member.get("model_id", ""),
+            "level": db_member.get("level", 1),
+            "created_at": db_member.get("created_at", ""),
+            "work_status": db_member.get("work_status", "idle"),
+            "comment": db_member.get("comment", ""),
+            "role": db_member.get("role", ""),
+            "duty": db_member.get("duty", ""),
+            "system_prompt": db_member.get("system_prompt", ""),
+            "workspace_id": db_member["id"],
+        }
+
+    # 回退：工作空间 roster 文件（未走 P4 建队的历史数据）
     owner = get_agent(user_id, roster_owner_id) or {}
     owner_ws = owner.get("workspace_id") or roster_owner_id
     # 本地模式下经反向 WS 读用户本机的 .self/team_roster.md（与 help 注入同路径）

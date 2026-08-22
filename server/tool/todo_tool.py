@@ -48,6 +48,11 @@ class SetTodoListTool:
         self.workspace_id = workspace_id
         self.user_id = user_id
         self.ws_manager = ws_manager
+        self._loop: Optional[Any] = None
+
+    def bind_loop(self, loop: Any) -> None:
+        """绑定主事件循环，供消费线程内安全地 run_coroutine_threadsafe 推送。"""
+        self._loop = loop
 
     # ------------------------------------------------------------------
     # 工具定义
@@ -292,18 +297,14 @@ class SetTodoListTool:
             "data": {"todos": todos, "updated_at": int(time.time() * 1000)},
         }
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        try:
-            if loop is not None and loop.is_running():
+            if self._loop is not None and self._loop.is_running():
+                # 在后台线程内执行：线程安全地调度回主事件循环
                 asyncio.run_coroutine_threadsafe(
-                    self.ws_manager.send_message(self.user_id, payload), loop
+                    self.ws_manager.send_message(self.user_id, payload), self._loop
                 )
             else:
-                import asyncio as _a
-
-                _a.run_until_complete(
+                # 回退：同步执行协程（仅当未绑定主循环时使用）
+                asyncio.get_event_loop().run_until_complete(
                     self.ws_manager.send_message(self.user_id, payload)
                 )
         except Exception as exc:  # noqa: BLE001

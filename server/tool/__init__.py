@@ -124,7 +124,9 @@ def register_builtin_tools(
     :param extra_info_refresher: 额外信息刷新回调
     :param session_id: 当前会话 ID（spec 工具挂 hook 使用）
     """
-    # MCP 管理器：先注册外部 MCP 服务（来自配置文件）
+    # MCP 管理器：注册外部 MCP 服务（mcp_config 已由调用方合并 config yaml +
+    # DB 持久化服务，见 agent/chat.py _register_session_tools），随后挂载
+    # 本会话 workspace/document 服务。
     mcp_manager = MCPManager()
     for name, cfg in (mcp_config or {}).items():
         if isinstance(cfg, dict):
@@ -225,6 +227,11 @@ def register_builtin_tools(
     todo_tool = SetTodoListTool(
         io, workspace_id, user_id=user_id, ws_manager=ws_manager,
     )
+    # 绑定主事件循环，供 SetTodoList 在消费线程内安全推送 todo_update WS
+    try:
+        todo_tool.bind_loop(asyncio.get_running_loop())
+    except RuntimeError:
+        pass
 
     # 绑定 compact 时的上下文归档回调：llm.compress 替换 self.context 前，
     # 把完整 pre-compact 上下文快照写入 agent_context_archive 表，用于后期

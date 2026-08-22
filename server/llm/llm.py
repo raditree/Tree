@@ -4,6 +4,7 @@ import json
 import logging
 import random
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, Generator, List, Optional
 
@@ -25,6 +26,12 @@ def _stringify_tool_result(result: Any) -> str:
     3. 将剩余 key-value 格式化为 ``标签: 值`` 行（跳过元数据字段）
     """
     if isinstance(result, dict):
+        # 图像工具结果：不展开 base64 本体，输出摘要（前端展示友好）
+        if result.get("image_base64"):
+            mime = result.get("mime") or "image"
+            fp = result.get("file_path") or ""
+            size = len(str(result["image_base64"]))
+            return f"已读取图像: {fp} ({mime}, base64 {size} 字符)"
         # 1. 已知内容字段
         for key in ("content", "output", "result", "message", "text", "summary"):
             val = result.get(key)
@@ -173,16 +180,22 @@ class AgentLLMSession:
         model_config: ModelConfig,
         workspace_id: str,
         system_prompt: str = "",
+        cancel_event: Optional[threading.Event] = None,
     ) -> None:
         """初始化 LLM 会话。
 
         :param model_config: 模型配置
         :param workspace_id: 工作空间标识
         :param system_prompt: 系统提示词，普通 LLM 初始化时注入上下文
+        :param cancel_event: 可选取消事件（前端"停止"按钮置位）。
+                             置位后 ``_run_completion_loop`` 在每轮循环开始、
+                             流式接收间隙与每次 tool_call 执行前退出，
+                             使停止能快速中止 tool loop（不再启动新的工具调用）。
         """
         self.model_config = model_config
         self.workspace_id = workspace_id
         self.system_prompt = system_prompt
+        self.cancel_event = cancel_event
 
         # 上下文列表：普通 LLM 初始化时注入系统提示词
         self.context: List[Dict[str, Any]] = []
@@ -270,10 +283,20 @@ class AgentLLMSession:
         - ``extra_body`` 中的嵌套字典合并进 ``extra_body``（非标准参数）
         - 其余字段作为 OpenAI 顶层参数原样透传（如 ``reasoning_effort``、
           ``max_tokens``、``top_p``）
+
+        视觉模型（``if_vision=True``）会先把上下文中的"含图像用户消息"
+        转为 OpenAI vision content 数组格式（``content: [{type:text},
+        {type:image_url}]``）；非视觉模型不转换（天然降级，图像字段被忽略）。
         """
+        # 视觉消息格式转换（仅当模型 if_vision=true 时执行）
+        messages = (
+            self._convert_vision_messages(self.context)
+            if self.model_config.if_vision
+            else self.context
+        )
         kwargs: Dict[str, Any] = {
             "model": self.model_config.api_model_id or self.model_config.model_id,
-            "messages": self.context,
+            "messages": messages,
             "stream": True,
             # 流式响应末尾返回 token 用量（OpenAI 规范：stream_options.include_usage）
             "stream_options": {"include_usage": True},
@@ -303,12 +326,53 @@ class AgentLLMSession:
             # 配置元数据字段（无 API 消费方，仅供展示/预算记录），不透传给 API
             "is_limitless_context",
             "input_price", "output_price", "cached_input_price",
+            # 视觉能力开关是配置元数据，不透传给 API（防 OpenAI SDK 未知参数校验）
+            "if_vision",
         }
         for key, value in extra.items():
             if key not in reserved:
                 kwargs[key] = value
         kwargs["extra_body"] = extra_body
         return kwargs
+
+    @staticmethod
+    def _convert_vision_messages(
+        context: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """将上下文中的"含图像用户消息"转为 OpenAI vision content 数组格式。
+
+        约定：``role == "user"`` 且 ``content`` 为 dict（含 ``text`` 与
+        ``image_base64``/``image_url`` 字段）的消息为含图消息；转换为
+        ``content: [{type:"text", text}, {type:"image_url", image_url:{url}}]``。
+        dict content 之外的普通字符串消息原样保留。
+
+        由调用方（``_build_api_kwargs``）仅在视觉模型（``if_vision=True``）
+        时调用；非视觉模型不调用本方法（图像已在工具结果写入处降级）。
+        """
+        converted: List[Dict[str, Any]] = []
+        for msg in context:
+            content = msg.get("content")
+            if (
+                msg.get("role") == "user"
+                and isinstance(content, dict)
+                and content.get("image_base64")
+            ):
+                mime = content.get("mime", "image/png")
+                data_url = (
+                    content.get("image_url")
+                    or f"data:{mime};base64,{content['image_base64']}"
+                )
+                parts: List[Dict[str, Any]] = []
+                text = content.get("text", "")
+                if text:
+                    parts.append({"type": "text", "text": text})
+                parts.append(
+                    {"type": "image_url", "image_url": {"url": data_url}}
+                )
+                converted.append({"role": "user", "content": parts})
+            else:
+                converted.append(msg)
+        return converted
 
     @staticmethod
     def _safe_parse_arguments(raw: str) -> Dict[str, Any]:
@@ -382,8 +446,63 @@ class AgentLLMSession:
                 )
                 time.sleep(delay)
 
+    def _tool_context_content(self, result: Any, result_str: str) -> Any:
+        """构造写入上下文的工具结果 content。
+
+        图像工具结果（dict 含 ``image_base64``）：
+        - 工具消息本身只保留文本摘要（``result_str`` 已含"已读取图像"提示），
+          图像本体经调用点追加为独立 ``user`` 消息（``_append_image_user_msg``），
+          兼容仅支持 user 消息携带图像的各网关；
+        - 非视觉模型 → 文本降级提示（``if_vision`` 缺失/ false），避免网关 400。
+        其余结果原样返回字符串（与旧行为一致）。
+        """
+        if isinstance(result, dict) and result.get("image_base64"):
+            if not self.model_config.if_vision:
+                fp = result.get("file_path", "")
+                return (
+                    f"图像 {fp} 已读取，但当前模型不支持图像输入"
+                    "（if_vision=false），无法解析图像内容。"
+                )
+            return result_str
+        return result_str
+
+    def _append_image_user_msg(self, result: Any) -> None:
+        """图像工具结果：追加一条携带图像的 user 消息（供视觉模型下一轮消费）。
+
+        content 为 dict（``text`` + ``image_base64`` + ``mime``），
+        ``_build_api_kwargs`` 中的 ``_convert_vision_messages`` 会在请求
+        构建时转成 OpenAI vision content 数组格式。
+        """
+        if not (isinstance(result, dict) and result.get("image_base64")):
+            return
+        if not self.model_config.if_vision:
+            return
+        self.context.append({
+            "role": "user",
+            "content": {
+                "text": f"[图像读取结果] {result.get('file_path', '')}",
+                "image_base64": str(result["image_base64"]),
+                "mime": result.get("mime") or "image/png",
+            },
+        })
+
+    def _is_cancelled(
+        self, cancel_event: Optional[threading.Event] = None
+    ) -> bool:
+        """检查取消事件是否已置位（前端"停止"按钮中止 tool loop）。
+
+        :param cancel_event: 本次调用显式传入的取消事件；为 None 时回退到
+                             会话级 ``self.cancel_event``（构造时注入）。
+        :return: True 表示应中止当前回复生成
+        """
+        evt = cancel_event if cancel_event is not None else self.cancel_event
+        return evt is not None and evt.is_set()
+
     def _run_completion_loop(
-        self, client: OpenAI, on_tool_turn: Optional[Callable[[], str]] = None
+        self,
+        client: OpenAI,
+        on_tool_turn: Optional[Callable[[], str]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """运行 LLM 流式调用 + tool_call 循环。
 
@@ -395,8 +514,13 @@ class AgentLLMSession:
                              调用前被调用。若返回非空字符串，则将其作为一条
                              user 消息插入上下文，供下一轮 LLM 处理（用于
                              在成员工作的间隙切入 leader 发来的新消息）。
+        :param cancel_event: 可选取消事件；未传入时回退到会话级
+                             ``self.cancel_event``（构造时注入）。
         """
         while True:
+            # 停止中止：每轮循环开始检查取消事件（阻塞环节之间的间隙可响应停止）
+            if self._is_cancelled(cancel_event):
+                return
             # 长任务 tool 循环中上下文会持续增长，每轮调用前检查是否需要及时压缩，
             # 避免任务结束前上下文就已超过 max_seqlen（约定阈值）
             self._compress_context()
@@ -415,6 +539,9 @@ class AgentLLMSession:
 
             # 流式接收响应
             for chunk in stream:
+                # 停止中止：流式接收间隙检查取消（响应较快时也能及时停止）
+                if self._is_cancelled(cancel_event):
+                    return
                 # 流式末尾的 usage chunk 无 token，但携带 token 用量
                 usage = getattr(chunk, "usage", None)
                 if usage is not None:
@@ -500,6 +627,10 @@ class AgentLLMSession:
 
                 # 执行每个 tool_call
                 for tc in tool_calls:
+                    # 停止中止：每次 tool_call 执行前检查取消，
+                    # 已停止时不再启动新的工具调用（阻塞工具可被跳过）
+                    if self._is_cancelled(cancel_event):
+                        return
                     handler = self._find_handler(tc["name"])
                     # 参数与结果：默认空参数，解析失败/未找到 handler 时
                     # 仍能安全 yield（避免 yield 引用未定义变量）
@@ -524,12 +655,14 @@ class AgentLLMSession:
                         "result": result_str,
                     }
 
-                    # 将工具结果添加到上下文
+                    # 将工具结果添加到上下文（含图像时按模型视觉能力构造 content）
                     self.context.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
-                        "content": result_str,
+                        "content": self._tool_context_content(result, result_str),
                     })
+                    # 视觉模型：图像本体追加为独立 user 消息（网关兼容）
+                    self._append_image_user_msg(result)
 
                 # tool_call 间隙：若提供了插入回调，检查是否有新消息需要切入处理
                 if on_tool_turn is not None:
@@ -563,6 +696,7 @@ class AgentLLMSession:
         self,
         user_message: str,
         on_tool_turn: Optional[Callable[[], Optional[str]]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """与 LLM 对话，流式输出。
 
@@ -572,11 +706,19 @@ class AgentLLMSession:
         :param user_message: 用户消息
         :param on_tool_turn: 可选回调，在每次 tool_call 间隙被调用，若返回
                              新消息文本则切入处理（见 _run_completion_loop）
+        :param cancel_event: 可选取消事件（"停止"按钮置位）。置位后在每轮
+                             循环开始、流式接收间隙与每次 tool_call 执行前
+                             退出生成器，使停止能快速中止 tool loop。
         :return: 生成器，yield ``{"type": "text", "content": "..."}`` 或
                  ``{"type": "tool_call", "name": "...", "result": "..."}``
         """
         # 前缀一致性验证（普通 LLM 无需验证，由子类覆盖）
         self._validate_prefix(user_message)
+
+        # 自愈：中途「停止」/异常可能在 cancellation 点把上下文停在「assistant 带
+        # tool_calls 但缺对应 tool 响应」的不一致状态，网关下轮必返 400。每次对话
+        # 前修复，保证上下文对网关始终合法（保留历史，仅补充占位 tool 响应）。
+        self._repair_context()
 
         # 将用户消息添加到上下文
         self.context.append({"role": "user", "content": user_message})
@@ -586,7 +728,9 @@ class AgentLLMSession:
 
         client = LLMClientFactory.create_client(self.model_config)
 
-        yield from self._run_completion_loop(client, on_tool_turn=on_tool_turn)
+        yield from self._run_completion_loop(
+            client, on_tool_turn=on_tool_turn, cancel_event=cancel_event
+        )
 
     # ------------------------------------------------------------------
     # 钩子方法（可由子类覆盖）
@@ -617,6 +761,46 @@ class AgentLLMSession:
             added = sum(len(str(m)) // 4 for m in self.context[anchor:])
             return max(base + added, char_est)
         return char_est
+
+    def _repair_context(self) -> None:
+        """修复被中途「停止」/异常打断的上下文不一致。
+
+        当消费线程在 ``yield`` 处被取消（GeneratorExit）时，若当时刚把带
+        ``tool_calls`` 的 assistant 消息写进 context、但对应 ``role='tool'``
+        响应尚未追加，就会留下「assistant tool_calls 缺少匹配 tool 响应」的
+        非法序列，网关下轮必返 400（此问题会一直卡死后续回复）。
+
+        这里为每个缺失响应的 ``tool_call_id`` 补一条占位 tool 消息，使上下文
+        对网关始终合法：既保留历史，又让模型知道该工具调用被中止。
+        """
+        if not self.context:
+            return
+        have = {
+            m.get("tool_call_id")
+            for m in self.context
+            if m.get("role") == "tool" and m.get("tool_call_id")
+        }
+        out: List[Dict[str, Any]] = []
+        changed = False
+        for msg in self.context:
+            out.append(msg)
+            if not (msg.get("role") == "assistant" and msg.get("tool_calls")):
+                continue
+            for tc in msg["tool_calls"]:
+                tid = tc.get("id")
+                if tid and tid not in have:
+                    out.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tid,
+                            "content": "[已中止：任务被用户停止，该工具调用未返回结果]",
+                        }
+                    )
+                    have.add(tid)
+                    changed = True
+        if changed:
+            self.context = out
+            logger.warning("已修复上下文：为 %d 个缺失响应的 tool_call 补充占位消息", changed)
 
     def _compress_context(self) -> None:
         """检查并压缩上下文（自动触发，带阈值判断）。
