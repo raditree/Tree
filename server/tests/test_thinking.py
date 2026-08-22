@@ -198,19 +198,27 @@ class TestThinkingStreaming(unittest.TestCase):
 
 
 class TestThinkingApiKwargs(unittest.TestCase):
-    """thinking 模式下 API 顶层透传 thinking=True。"""
+    """thinking 模式不通过 OpenAI 顶层参数透传，而经 extra_body 下发。"""
 
-    def test_thinking_in_api_kwargs(self):
+    def test_thinking_not_passed_as_top_level(self):
+        """回归：thinking 作为顶层参数会被 OpenAI SDK 抛 TypeError，
+        推理由 extra_body.thinking 开启，顶层不得出现 thinking。"""
         mc = ModelConfig(
             name="t", base_url="http://localhost:8000", api_key="k",
             model_id="m", thinking=True,
-            extra={"max_seqlen": 65536},
+            extra={
+                "max_seqlen": 65536,
+                "extra_body": {"thinking": {"type": "enabled"}},
+            },
         )
         session = AgentLLMSession(
             model_config=mc, workspace_id="ws", system_prompt=""
         )
         kwargs = session._build_api_kwargs()
-        self.assertTrue(kwargs.get("thinking"))
+        self.assertNotIn("thinking", kwargs)
+        self.assertEqual(
+            {"type": "enabled"}, kwargs.get("extra_body", {}).get("thinking")
+        )
 
     def test_no_thinking_when_disabled(self):
         mc = ModelConfig(

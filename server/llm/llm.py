@@ -281,9 +281,9 @@ class AgentLLMSession:
         # temperature 仅在 yaml 显式配置或通过 set 工具设置时下发
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
-        # thinking 模式：启用时作为顶层参数下发（OpenAI 兼容端点/网关据此开启推理）
-        if self.thinking:
-            kwargs["thinking"] = True
+        # thinking 模式仅用于解析流式 reasoning_content（见 _run_completion_loop），
+        # 不作为 OpenAI 顶层参数透传——推理由模型配置的 extra_body.thinking 开启，
+        # 顶层传 thinking 会被 OpenAI SDK 校验为未知参数而抛 TypeError。
         # 注入 tools（如有注册）
         if self.registered_tools:
             kwargs["tools"] = [t["definition"] for t in self.registered_tools]
