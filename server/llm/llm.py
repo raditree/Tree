@@ -670,7 +670,10 @@ class AgentLLMSession:
         if len(other_msgs) <= 1:
             return False
         if user_indices:
-            keep_from = user_indices[-self.KEEP_RECENT_USER_MSGS]
+            # 保留最近 KEEP_RECENT_USER_MSGS 次用户要求；不足时从第一条用户消息起保留
+            keep_from = user_indices[
+                max(0, len(user_indices) - self.KEEP_RECENT_USER_MSGS)
+            ]
         else:
             # 没有用户消息（异常态），保留最近若干条
             keep_from = max(0, len(other_msgs) - 5)

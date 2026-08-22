@@ -265,5 +265,36 @@ class TestThinkingApiKwargs(unittest.TestCase):
         self.assertEqual(kwargs["model"], "m")
 
 
+class TestContextCompress(unittest.TestCase):
+    """上下文压缩：用户消息不足时不得越界。
+
+    回归：历史上当用户消息条数 < KEEP_RECENT_USER_MSGS(3) 时，
+    ``user_indices[-3]`` 触发 ``IndexError: list index out of range``，
+    导致 chat 消费线程异常。
+    """
+
+    def test_compress_few_user_msgs_no_index_error(self):
+        session = AgentLLMSession(
+            model_config=ModelConfig(
+                name="t", base_url="http://localhost:8000",
+                api_key="k", model_id="m",
+                extra={"max_seqlen": 4096},
+            ),
+            workspace_id="ws", system_prompt="sys",
+        )
+        # 仅 2 条用户消息（< 3），多条助手/工具消息
+        session.context = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "任务一"},
+            {"role": "assistant", "content": "回复一"},
+            {"role": "user", "content": "任务二"},
+            {"role": "assistant", "content": "回复二"},
+        ]
+        # force=True 跳过阈值，直接进入压缩逻辑；不得抛 IndexError
+        result = session.compress(force=True)
+        # 第一条用户消息即保留起点 → 无需总结，返回 False（不崩溃即为通过）
+        self.assertFalse(result)
+
+
 if __name__ == "__main__":
     unittest.main()
