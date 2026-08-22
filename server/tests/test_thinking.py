@@ -224,6 +224,38 @@ class TestThinkingApiKwargs(unittest.TestCase):
         kwargs = session._build_api_kwargs()
         self.assertNotIn("thinking", kwargs)
 
+    def test_metadata_fields_not_passed_to_api(self):
+        """配置元数据字段（is_limitless_context / 价格）不透传给 OpenAI API。
+
+        回归：历史上 ``is_limitless_context`` 被当作 OpenAI 顶层参数透传，
+        导致 ``Completions.create() got an unexpected keyword argument``，
+        agent 发消息无回应。
+        """
+        mc = ModelConfig(
+            name="t", base_url="http://localhost:8000", api_key="k",
+            model_id="m", thinking=False,
+            extra={
+                "max_seqlen": 204800,
+                "is_limitless_context": False,
+                "input_price": 0.14,
+                "output_price": 0.28,
+                "cached_input_price": 0.028,
+            },
+        )
+        session = AgentLLMSession(
+            model_config=mc, workspace_id="ws", system_prompt=""
+        )
+        kwargs = session._build_api_kwargs()
+        for field in (
+            "is_limitless_context",
+            "input_price",
+            "output_price",
+            "cached_input_price",
+        ):
+            self.assertNotIn(field, kwargs, f"{field} 不应透传给 API")
+        # 保留字段仍正常透传
+        self.assertEqual(kwargs["model"], "m")
+
 
 if __name__ == "__main__":
     unittest.main()

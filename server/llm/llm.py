@@ -300,6 +300,9 @@ class AgentLLMSession:
         reserved = {
             "temperature", "top_k", "max_seqlen", "extra_body",
             "timeout_seconds", "max_retries",
+            # 配置元数据字段（无 API 消费方，仅供展示/预算记录），不透传给 API
+            "is_limitless_context",
+            "input_price", "output_price", "cached_input_price",
         }
         for key, value in extra.items():
             if key not in reserved:
