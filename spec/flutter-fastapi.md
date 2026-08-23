@@ -7,42 +7,34 @@ when:
   - 前端设置页新增开关（主动延迟/数据收集等），需前后端同步
   - 后端需限制 agent API 调用频率或做停止级联
   - Flutter 应用多端适配（Windows/Android/Linux）
-  - 并行成员工作流共存时需安全提交
+  - 移动端（Android/iOS）响应式布局或平台能力守卫（目录选择/保存对话框/本地执行）
 tags: [complex]
 pinned: false
 builtin: false
-created_at: 1787464084
-updated_at: 1787464084
+created_at: 1787467805
+updated_at: 1787467805
 ---
 
 ## 工作流（workflow）
 
-## 工作流
-1. **判型**：跨前后端/多模块 → complex/hard；先 spec search。
-2. **摸底**：read 关键文件（settings_page/api_service/ws endpoints/chat/llm/tool 定义），git status 确认基线与其他并行改动。
-3. **拆解**：set_todo_list 分解（后端限流 / 停止级联 / team 工具描述 / 前端开关 / 多端适配 / 测试 / 提交），每里程碑提交一次。
-4. **后端实现**：
-   - 限流：令牌桶（固定时间步 pacing，平均 6 次/min/agent），等待可被 cancel_event 取消；REST 设置接口写 SQLite + 更新内存缓存；启动预载。
-   - 停止级联：`_stop_agent_tree`（TOP+成员取消全部会话任务 + broker.cancel_agent 清队列 + `_reset_member_status_to_idle` 复位 + 推送 idle）。
-   - team 工具 description 提醒先查成员 role/duty/model_id，为空用 update_member 补充；list_members 返回 hint。
-5. **前端实现**：ApiService 封装设置接口 + defaultBackendHost()；设置页 Switch 卡片（本地+后端双写）；main.dart 同步设置 HTTP/WS baseUrl；DropTarget 平台守卫；AndroidManifest 权限。
-6. **测试**：限流器单测（加速间隔、取消、按 agent 独立、存储往返隔离临时 DB）；停止级联单测（_active_tasks 操作、broker 队列）；全量 pytest + flutter analyze。
-7. **构建验证**：flutter build windows（注意运行中进程锁）；Android/Linux 依赖 SDK/GTK，环境不具备时验证配置正确性 + 文档说明。
-8. **汇报**：提交历史（每里程碑一个）、验证结果、并行工作流说明、遗留事项。
+
 
 ## 该类任务规范
 
-## 规范
 - 开关类设置：前端 Switch + SharedPreferences(本地) + REST 设置接口(权威) + SQLite 偏好表 + 内存缓存，避免每次查库。
 - 停止级联：TOP agent 停止时取消 TOP+全部成员**所有会话**任务（不只当前会话），清空 top_chat_broker/team_broker 排队消息防复活，复位 team_members work_status=idle，推送 agent_status=idle 让 UI 立即停。
 - 平台通道守卫：仅桌面支持的插件（desktop_drop）必须用 Platform/kIsWeb 判断后再包裹，避免移动端 MissingPluginException。
 - Android 联网：INTERNET 权限 + usesCleartextTraffic（本地开发 http 场景）。
 - 平台默认后端：Android 模拟器 10.0.2.2，其余 localhost；HTTP 与 WS 必须同源（改 ApiService.baseUrl 同时改 WebSocketService.baseUrl）。
 - 提交纪律：每完成一个里程碑立即 git commit（指定文件），便于回滚。
+- **移动端响应式**：统一用 lib/io/platform_support.dart（isAndroid/isDesktop/isMobile，先判 kIsWeb）；移动端单栏+底部导航（复用 AgentList/MessagePanel/FilePanel），桌面三栏；最小窗口限制（1024×600）仅桌面生效。
+- **file_picker 平台差异**：getDirectoryPath / saveFile 仅桌面支持，移动端隐藏入口或降级（下载保存到 getApplicationDocumentsDirectory）；pickFiles 全平台可用。
+- **本地执行模式（LocalExecutorService）移动端禁用**：setEnabled/syncRegistration/register 守卫 isMobile；ModeSwitchButton 加 showLocal 参数隐藏菜单项。
+- **Android minSdk 21**：file_picker 5.x 要求（Flutter 3.7 默认 16 会构建失败），显式写 android/app/build.gradle。
+- **Linux 窗口标题**：改 linux/my_application.cc 的 gtk_header_bar_set_title / gtk_window_set_title（默认是项目名，产品名在 Windows 由 runner 资源、Android 由 android:label 定义）。
 
 ## 注意事项
 
-## 注意事项
 - **成员任务核实**：成员显示 working 不等于有产出——以 git status / 文件 mtime / 提交为准；成员任务可被 TOP 接管（先 send_message 取消再自查）。
 - **并行工作流冲突**：仓库可能存在其他成员并行改动（如 compact 优化），提交时用 `git add <指定文件>` 而非 `git add -A`，避免把他人 WIP 混入。
 - **CRLF 陷阱**：Windows 下部分 py/dart 文件是 CRLF，edit 工具精确匹配失败时先转 LF（git core.autocrlf=true 下仓库仍存 LF，diff 干净）。
