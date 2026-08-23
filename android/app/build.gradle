@@ -47,7 +47,8 @@ android {
         applicationId "com.example.flutter_application_tree"
         // You can update the following values to match your application needs.
         // For more information, see: https://docs.flutter.dev/deployment/android#reviewing-the-gradle-build-configuration.
-        minSdkVersion flutter.minSdkVersion
+        // minSdkVersion 21：file_picker 5.x 要求 Android 5.0+（Flutter 3.7 默认 16 会构建失败）
+        minSdkVersion 21
         targetSdkVersion flutter.targetSdkVersion
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName

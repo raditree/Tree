@@ -4,6 +4,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
+import '../../io/platform_support.dart';
 
 /// 文件同步按钮组件
 ///
@@ -29,7 +30,12 @@ class FileSyncButton extends StatelessWidget {
   ///
   /// 调用 file_picker 选择本地目录，然后调用 [ApiService.syncToLocal]
   /// 下载工作空间文件。同步期间展示进度对话框。
+  /// 移动端不支持目录选择（file_picker.getDirectoryPath 仅桌面），直接提示。
   Future<void> _syncToLocal(BuildContext context) async {
+    if (isMobile) {
+      _showUnsupported(context);
+      return;
+    }
     // 选择本地目录
     final String? dirPath = await FilePicker.platform.getDirectoryPath(
       dialogTitle: '选择本地保存目录',
@@ -100,7 +106,12 @@ class FileSyncButton extends StatelessWidget {
   ///
   /// 调用 file_picker 选择本地文件夹，递归收集其中所有文件，
   /// 以相对路径上传到工作空间 `.input/yyyymmdd/`，保留文件夹层级。
+  /// 移动端不支持目录选择（file_picker.getDirectoryPath 仅桌面），直接提示。
   Future<void> _uploadFolder(BuildContext context) async {
+    if (isMobile) {
+      _showUnsupported(context);
+      return;
+    }
     // 选择本地文件夹
     final String? dirPath = await FilePicker.platform.getDirectoryPath(
       dialogTitle: '选择要上传的文件夹',
@@ -198,6 +209,13 @@ class FileSyncButton extends StatelessWidget {
     );
   }
 
+  /// 移动端提示功能不支持
+  void _showUnsupported(BuildContext context) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('移动端暂不支持该操作，请使用「上传文件」或到桌面端操作')),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return PopupMenuButton<String>(
@@ -217,15 +235,17 @@ class FileSyncButton extends StatelessWidget {
         }
       },
       itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
-        const PopupMenuItem<String>(
-          value: 'download',
-          child: ListTile(
-            dense: true,
-            leading: Icon(Icons.download_outlined, size: 18),
-            title: Text('同步到本地'),
-            contentPadding: EdgeInsets.zero,
+        // 目录选择（getDirectoryPath）仅桌面支持，移动端隐藏
+        if (!isMobile)
+          const PopupMenuItem<String>(
+            value: 'download',
+            child: ListTile(
+              dense: true,
+              leading: Icon(Icons.download_outlined, size: 18),
+              title: Text('同步到本地'),
+              contentPadding: EdgeInsets.zero,
+            ),
           ),
-        ),
         const PopupMenuItem<String>(
           value: 'upload',
           child: ListTile(
@@ -235,15 +255,16 @@ class FileSyncButton extends StatelessWidget {
             contentPadding: EdgeInsets.zero,
           ),
         ),
-        const PopupMenuItem<String>(
-          value: 'upload_folder',
-          child: ListTile(
-            dense: true,
-            leading: Icon(Icons.create_new_folder_outlined, size: 18),
-            title: Text('上传文件夹'),
-            contentPadding: EdgeInsets.zero,
+        if (!isMobile)
+          const PopupMenuItem<String>(
+            value: 'upload_folder',
+            child: ListTile(
+              dense: true,
+              leading: Icon(Icons.create_new_folder_outlined, size: 18),
+              title: Text('上传文件夹'),
+              contentPadding: EdgeInsets.zero,
+            ),
           ),
-        ),
       ],
     );
   }

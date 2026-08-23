@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
 import '../../io/local_executor_service.dart';
+import '../../io/platform_support.dart';
 import 'file_sync_button.dart';
 import 'file_tree.dart';
 import 'file_viewer.dart';
@@ -100,7 +101,12 @@ class _FilePanelState extends State<FilePanel>
   /// 处理文件/文件夹下载
   ///
   /// 从后端获取文件/文件夹字节后，弹出系统保存对话框保存到本地。
+  /// 移动端不支持系统保存对话框（file_picker.saveFile 仅桌面），直接提示。
   Future<void> _handleDownload(String path, bool isDirectory) async {
+    if (isMobile) {
+      _showSnackBar('移动端暂不支持保存到本地文件系统，请到桌面端下载');
+      return;
+    }
     try {
       // 显示加载提示
       _showSnackBar('正在下载...');

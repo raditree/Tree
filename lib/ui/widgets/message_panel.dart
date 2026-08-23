@@ -7,6 +7,7 @@ import '../models/session.dart';
 import '../../io/api_service.dart';
 import '../../io/auth_service.dart';
 import '../../io/local_executor_service.dart';
+import '../../io/platform_support.dart';
 import '../../io/ssh_executor_service.dart';
 import '../../io/websocket_service.dart';
 import 'message_input.dart';
@@ -608,6 +609,11 @@ class _MessagePanelState extends State<MessagePanel> {
         });
         _showSnackBar('已切换为云端执行模式（Docker 容器）');
       } else if (targetMode == 'local') {
+        // 移动端（Android/iOS）无桌面文件系统与目录选择能力，本地执行不可用
+        if (isMobile) {
+          _showSnackBar('移动端不支持本地执行模式，请使用云端或 SSH 模式');
+          return;
+        }
         // 与 SSH 互斥：先注销 ssh
         if (current == 'ssh') {
           await SshExecutorService.instance.disable();
@@ -901,6 +907,8 @@ class _MessagePanelState extends State<MessagePanel> {
         mode: _currentMode,
         locked: _modeLocked,
         onSelect: _switchMode,
+        // 移动端不支持本机目录执行，隐藏「本地执行」菜单项
+        showLocal: !isMobile,
       ),
     );
   }
@@ -968,7 +976,12 @@ class _MessagePanelState extends State<MessagePanel> {
   void _openTeammatesWindow(Agent agent) {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) => TeammatesWindowPage(agent: agent),
+        builder: (_) => TeammatesWindowPage(
+          agent: agent,
+          // 透传当前会话：进度页历史/实时 WS 按该成员+该会话过滤，
+          // 避免把该成员其他会话的工作进度混进当前窗口（跨会话）。
+          sessionId: _currentSessionId,
+        ),
       ),
     );
   }

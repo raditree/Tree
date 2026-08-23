@@ -6,6 +6,7 @@ import '../models/agent.dart';
 import '../../io/api_service.dart';
 import '../../io/auth_service.dart';
 import '../../io/local_executor_service.dart';
+import '../../io/platform_support.dart';
 import '../../io/ssh_executor_service.dart';
 import '../../io/websocket_service.dart';
 import '../widgets/agent_list.dart';
@@ -42,6 +43,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
 
   // 折叠时宽度
   static const double _collapsedWidth = 40;
+
+  /// 移动端底部导航当前页（0=Agent 列表，1=消息，2=文件）
+  int _mobileTab = 0;
 
   // 当前选中的 Agent（未选择时为 null）
   Agent? _selectedAgent;
@@ -212,6 +216,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     return Scaffold(
       body: LayoutBuilder(
         builder: (context, constraints) {
+          // 移动端（Android/iOS）：任意屏幕尺寸使用单栏底部导航布局。
+          // 桌面三栏 + 最小 1024×600 限制在手机上会导致整页不可用
+          // （手机竖屏宽度通常仅 360~430dp）。
+          if (isMobile) return _buildMobileLayout();
           // 检查窗口尺寸是否满足最小要求
           if (constraints.maxWidth < _minWindowWidth ||
               constraints.maxHeight < _minWindowHeight) {
@@ -219,6 +227,122 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
           }
           return _buildThreeColumnLayout();
         },
+      ),
+    );
+  }
+
+  /// 构建移动端单栏布局（底部导航切换：Agent 列表 / 消息 / 文件）
+  ///
+  /// 移动端屏幕窄，桌面三栏无法容纳，改为顶部 AppBar + 单页内容 +
+  /// 底部导航；选中 Agent 后自动切到消息页。文件页未选中 Agent 时显示占位。
+  Widget _buildMobileLayout() {
+    final String workspaceId = _selectedAgent?.workspaceId ?? '';
+    final String title;
+    switch (_mobileTab) {
+      case 0:
+        title = 'Agent 列表';
+        break;
+      case 1:
+        title = _selectedAgent?.name ?? 'Agent 团队效率工具';
+        break;
+      default:
+        title = '文件管理';
+        break;
+    }
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(title, style: const TextStyle(fontSize: 17)),
+        actions: [
+          IconButton(
+            tooltip: '设置',
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (BuildContext context) => const SettingsPage(),
+                ),
+              );
+            },
+            icon: const Icon(Icons.settings_outlined),
+          ),
+          if (_mobileTab == 0)
+            IconButton(
+              tooltip: '创建 Agent',
+              onPressed: _handleCreateAgent,
+              icon: const Icon(Icons.add_circle_outline),
+            ),
+        ],
+      ),
+      body: IndexedStack(
+        index: _mobileTab,
+        children: [
+          AgentList(
+            agents: _agents,
+            onAgentSelected: (Agent agent) {
+              setState(() {
+                _selectedAgent = agent;
+                _mobileTab = 1;
+              });
+            },
+            onClearHistory: _handleClearHistory,
+            onDelete: _handleDeleteAgent,
+          ),
+          MessagePanel(
+            selectedAgent: _selectedAgent,
+            refreshTrigger: _refreshTrigger,
+          ),
+          workspaceId.isEmpty
+              ? _buildMobileFilePlaceholder()
+              : FilePanel(
+                  key: ValueKey(workspaceId),
+                  workspaceId: workspaceId,
+                  topAgentId: _selectedAgent?.id,
+                ),
+        ],
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _mobileTab,
+        onDestinationSelected: (int index) {
+          setState(() => _mobileTab = index);
+        },
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.groups_outlined),
+            selectedIcon: Icon(Icons.groups),
+            label: 'Agent',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.chat_bubble_outline),
+            selectedIcon: Icon(Icons.chat_bubble),
+            label: '消息',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.folder_outlined),
+            selectedIcon: Icon(Icons.folder),
+            label: '文件',
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 移动端未选中 Agent 时文件页占位
+  Widget _buildMobileFilePlaceholder() {
+    final cs = Theme.of(context).colorScheme;
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            Icons.folder_open_outlined,
+            size: 56,
+            color: cs.onSurfaceVariant,
+          ),
+          const SizedBox(height: 12),
+          Text(
+            '请先在 Agent 页选择或创建一个 Agent',
+            style: TextStyle(fontSize: 14, color: cs.onSurfaceVariant),
+          ),
+        ],
       ),
     );
   }

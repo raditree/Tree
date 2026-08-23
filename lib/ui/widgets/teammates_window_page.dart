@@ -17,7 +17,14 @@ import 'message_list.dart';
 class TeammatesWindowPage extends StatefulWidget {
   final Agent agent;
 
-  const TeammatesWindowPage({super.key, required this.agent});
+  /// 打开窗口时的当前会话 id；透传给成员进度页，使历史/实时按会话过滤
+  final String sessionId;
+
+  const TeammatesWindowPage({
+    super.key,
+    required this.agent,
+    required this.sessionId,
+  });
 
   @override
   State<TeammatesWindowPage> createState() => _TeammatesWindowPageState();
@@ -233,6 +240,7 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
                 leader: widget.agent,
                 memberId: id,
                 memberName: name.isNotEmpty ? name : id,
+                sessionId: widget.sessionId,
               ),
             ),
           );
@@ -302,11 +310,15 @@ class TeammateDetailPage extends StatefulWidget {
   final String memberId;
   final String memberName;
 
+  /// 当前会话 id：历史加载与实时 WS 均按该会话过滤，避免跨会话混杂
+  final String sessionId;
+
   const TeammateDetailPage({
     super.key,
     required this.leader,
     required this.memberId,
     required this.memberName,
+    required this.sessionId,
   });
 
   @override
@@ -330,11 +342,14 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
     _loadLog();
   }
 
-  /// 加载该成员的历史进度（对话历史 + 实时 WS 增量合并）
+  /// 加载该成员当前会话的历史进度（对话历史 + 实时 WS 增量合并）
   Future<void> _loadHistory() async {
     try {
       final List<Map<String, dynamic>> history =
-          await ApiService.getConversationHistory(widget.memberId);
+          await ApiService.getConversationHistory(
+        widget.memberId,
+        sessionId: widget.sessionId,
+      );
       if (!mounted) return;
       setState(() {
         _liveMessages.clear();
@@ -357,12 +372,17 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
     _wsConnected = true;
   }
 
-  /// 处理成员实时进度：仅保留属于该成员的消息/工具卡片
+  /// 处理成员实时进度：仅保留属于该成员、且属于当前会话的消息/工具卡片
   void _handleIncoming(Map<String, dynamic> data) {
     if (!mounted) return;
     final String? type = data['type'] as String?;
     final String? agentId = data['agent_id'] as String?;
     if (agentId != null && agentId != widget.memberId) return;
+
+    // 跨会话隔离：事件带 session_id 时，仅接收当前会话的增量，丢弃其他会话
+    // 的进度，避免把该成员在别的会话的工作混进本窗口。
+    final String? incomingSession = data['session_id'] as String?;
+    if (incomingSession != null && incomingSession != widget.sessionId) return;
 
     if (type == 'msg_start') {
       final ChatMessage message = ChatMessage(

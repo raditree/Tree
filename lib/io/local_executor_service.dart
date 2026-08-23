@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'platform_support.dart';
 import 'websocket_service.dart';
 
 /// 判断路径是否属于 Unix/WSL 风格目录（而非 Windows 盘符目录）。
@@ -123,7 +124,9 @@ class LocalExecutorService extends ChangeNotifier {
   ///
   /// 开启时若已有工作目录立即注册本地执行器；关闭时注销并恢复云端执行。
   /// 不启动任何本地进程——工具执行位置由后端通过反向 WS 转发决定。
+  /// 移动端（Android/iOS）无桌面文件系统访问能力，禁止开启。
   Future<void> setEnabled(bool value) async {
+    if (isMobile && value) return; // 移动端不支持本地执行模式
     if (value == _enabled) {
       // 状态一致但连接可能已重建，重新确保注册/注销
       if (value && _baseDir.isNotEmpty) {
@@ -155,6 +158,7 @@ class LocalExecutorService extends ChangeNotifier {
   /// 按当前顶部 agent 的本地模式同步注册/注销（切换顶部 agent / 重连后调用）。
   void syncRegistration() {
     if (_currentTopAgentId.isEmpty) return;
+    if (isMobile) return; // 移动端不支持本地执行模式，不注册
     if (_enabled && _baseDir.isNotEmpty) {
       register(_baseDir);
     } else if (_registered) {
@@ -174,6 +178,7 @@ class LocalExecutorService extends ChangeNotifier {
   /// 注册当前顶部 agent 的本地执行器：设置工作目录并通知后端转发工具请求。
   void register(String baseDir) {
     if (_currentTopAgentId.isEmpty) return;
+    if (isMobile) return; // 移动端不支持本地执行模式，不注册
     _baseDir = baseDir;
     _registered = true;
     _registeredTopAgents.add(_currentTopAgentId);

@@ -2,9 +2,9 @@
 
 LLM 驱动的 **agent 团队桌面效率工具**：根据任务难度动态组建 agent 团队、适配无限上下文 LLM，提供云端运行 + 本地控制的混合工作流，让 LLM agent 通过 Git 仓库层级协作。
 
-- **前端**：Flutter 桌面应用（三栏式工作界面：agent 列表 | 消息交互 | 文件管理）
+- **前端**：Flutter 桌面应用（三栏式工作界面：agent 列表 | 消息交互 | 文件管理），移动端自动切换为单栏 + 底部导航
 - **后端**：Python / FastAPI 服务（REST + WebSocket），Docker 多 agent 工作空间隔离
-- **目标平台**：Windows 7+ 桌面（受 Flutter 版本约束，请勿升级 Flutter ≥ 3.19）
+- **目标平台**：Windows 7+ / Linux 桌面 + Android 移动端（受 Flutter 版本约束，请勿升级 Flutter ≥ 3.19）
 
 ---
 
@@ -29,10 +29,8 @@ LLM 驱动的 **agent 团队桌面效率工具**：根据任务难度动态组�
 flutter_application_tree/
 ├── lib/                    # Flutter 前端
 │   ├── main.dart           # 应用入口（登录态路由）
-│   ├── models/             # 数据模型（agent/message/file_node）
-│   ├── pages/              # 登录、主界面、设置
-│   ├── services/           # API / WebSocket / 认证 / 主题
-│   └── widgets/            # agent 列表、消息面板、文件面板、Git 历史等
+│   ├── io/                 # API / WebSocket / 认证 / 本地与 SSH 执行器 / 平台判断
+│   └── ui/                 # 页面（登录/主界面/设置）+ 组件 + 数据模型 + 主题
 ├── server/                 # Python 后端
 │   ├── main.py             # FastAPI 入口
 │   ├── api/routes.py       # REST 路由（认证、agent、文件、Git…）
@@ -82,8 +80,29 @@ cd server
 
 ```bash
 flutter pub get
-flutter run -d windows
 ```
+
+- **Windows 桌面**（主平台）：
+
+  ```bash
+  flutter run -d windows
+  ```
+
+- **Linux 桌面**：需先安装构建依赖（Debian/Ubuntu）：
+
+  ```bash
+  sudo apt install clang cmake ninja-build pkg-config libgtk-3-dev
+  flutter run -d linux
+  ```
+
+- **Android**（模拟器/真机，需 Android SDK + JDK，minSdk 21+）：
+
+  ```bash
+  flutter run -d android
+  ```
+
+  后端地址：模拟器默认自动使用 `10.0.2.2:8000`（映射宿主机，应用内置）；
+  真机请在「设置 → 后端配置」填写电脑的局域网 IP + 端口。
 
 首次登录需注册账号（用户名 + 密码）。
 
@@ -113,6 +132,10 @@ flutter run -d windows
 - **Docker 不可用**：后端会优雅降级，但工作空间隔离、Git 层级协作、沙箱限制不可用。
 - **模型 API 拉取失败**：不影响已配置的 YAML 模型；提供服务商不可达时仅跳过该提供商的运行期拉取。
 - **Windows 7 支持**：请保持 Flutter 版本 ≤ 3.19，使用 Visual Studio 2019 Build Tools + Windows 10 SDK 10.0.19041.0 构建。
+- **Android 模拟器连不上后端**：模拟器默认后端为 `10.0.2.2:8000`（已内置）；若后端监听 `0.0.0.0` 仍不通，检查防火墙。真机需在设置页填电脑局域网 IP。
+- **Android 明文 HTTP 告警**：本地开发已开启 `usesCleartextTraffic="true"`（AndroidManifest.xml），可直接访问 `http://` 后端。
+- **移动端功能限制**：本地执行模式、目录选择与系统保存对话框（file_picker 的 `getDirectoryPath`/`saveFile` 仅桌面支持）在 Android/iOS 不可用，界面已自动隐藏对应入口；文件下载在移动端保存到应用文档目录。
+- **Linux 构建失败（缺 GTK）**：按「快速开始」安装 `clang cmake ninja-build pkg-config libgtk-3-dev`。
 
 ---
 

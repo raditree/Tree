@@ -4,8 +4,10 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../../io/api_service.dart';
+import '../../io/platform_support.dart';
 
 /// 文本文件扩展名
 const List<String> textExtensions = [
@@ -1151,11 +1153,19 @@ class _DownloadProgressDialogState extends State<_DownloadProgressDialog> {
       );
       if (!mounted) return;
 
-      // 2. 让用户选择保存位置
-      final String? savePath = await FilePicker.platform.saveFile(
-        dialogTitle: '保存文件',
-        fileName: widget.filename,
-      );
+      // 2. 选择保存位置
+      // 桌面端：系统保存对话框（file_picker.saveFile 仅桌面支持）
+      // 移动端：无系统文件选择器，保存到应用文档目录并提示完整路径
+      String? savePath;
+      if (isMobile) {
+        final Directory docDir = await getApplicationDocumentsDirectory();
+        savePath = '${docDir.path}${Platform.pathSeparator}${widget.filename}';
+      } else {
+        savePath = await FilePicker.platform.saveFile(
+          dialogTitle: '保存文件',
+          fileName: widget.filename,
+        );
+      }
       if (!mounted) return;
 
       if (savePath == null) {
@@ -1178,7 +1188,7 @@ class _DownloadProgressDialogState extends State<_DownloadProgressDialog> {
       if (!mounted) return;
       setState(() {
         _isRunning = false;
-        _result = '下载完成';
+        _result = isMobile ? '已保存到：$savePath' : '下载完成';
         _success = true;
       });
     } on Exception catch (e) {

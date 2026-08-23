@@ -8,12 +8,15 @@ import 'package:flutter/material.dart';
 /// - ssh：DNS 图标（橙）
 ///
 /// 对话开始后 [locked] 为 true，禁止切换。
+/// 移动端（Android/iOS）无桌面文件系统与目录选择能力，本地执行模式不可用，
+/// 通过 [showLocal] 隐藏「本地执行」菜单项（仅保留云端与 SSH）。
 class ModeSwitchButton extends StatelessWidget {
   const ModeSwitchButton({
     super.key,
     required this.mode,
     required this.locked,
     required this.onSelect,
+    this.showLocal = true,
   });
 
   /// 当前模式：'cloud' | 'local' | 'ssh'
@@ -24,6 +27,9 @@ class ModeSwitchButton extends StatelessWidget {
 
   /// 选择新模式回调（异步切换由调用方处理）
   final void Function(String mode) onSelect;
+
+  /// 是否显示「本地执行」选项（移动端不支持本机目录执行，传 false 隐藏）
+  final bool showLocal;
 
   IconData _iconFor() {
     if (mode == 'local') return Icons.power;
@@ -67,16 +73,17 @@ class ModeSwitchButton extends StatelessWidget {
               ],
             ),
           ),
-          PopupMenuItem<String>(
-            value: 'local',
-            child: Row(
-              children: const <Widget>[
-                Icon(Icons.desktop_windows, size: 18, color: Colors.green),
-                SizedBox(width: 8),
-                Text('本地执行（本机目录）'),
-              ],
+          if (showLocal)
+            PopupMenuItem<String>(
+              value: 'local',
+              child: Row(
+                children: const <Widget>[
+                  Icon(Icons.desktop_windows, size: 18, color: Colors.green),
+                  SizedBox(width: 8),
+                  Text('本地执行（本机目录）'),
+                ],
+              ),
             ),
-          ),
           PopupMenuItem<String>(
             value: 'ssh',
             child: Row(
