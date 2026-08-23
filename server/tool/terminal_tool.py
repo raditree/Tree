@@ -9,6 +9,7 @@ import logging
 from typing import Any, Dict
 
 from io_.workspace_io import WorkspaceIO, run_io
+from prompt import versions
 
 logger = logging.getLogger(__name__)
 
@@ -36,16 +37,7 @@ class TerminalTool:
             "type": "function",
             "function": {
                 "name": "terminal",
-                "description": (
-                    "[在工作空间执行 shell 命令（含 git）] | "
-                    "贡献维度: 环境执行（运行构建/测试/安装/文件操作，验证与运维的唯一途径）\n"
-                    "何时使用: 运行构建与测试（验证改动）；安装依赖；"
-                    "git 操作；文件/目录管理（ls/mkdir/rm）；运行脚本；查看环境\n"
-                    "何时不用: 读/写/改文件内容用 read/write/edit（更精确、可追溯）；"
-                    "仅需内容查看时避免用 cat 取代 read\n"
-                    "前置依赖: 命令须符合当前执行环境的 shell 语法"
-                    "（cloud=sh；local Windows=cmd.exe；ssh=远端 shell，见 system prompt）"
-                ),
+                "description": versions.active_tool_description("terminal"),
                 "parameters": {
                     "type": "object",
                     "properties": {

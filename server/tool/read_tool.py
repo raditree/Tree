@@ -13,6 +13,7 @@ import re
 from typing import Any, Dict, List
 
 from io_.workspace_io import WorkspaceIO, run_io
+from prompt import versions
 
 logger = logging.getLogger(__name__)
 
@@ -81,17 +82,7 @@ class ReadTool:
             "type": "function",
             "function": {
                 "name": "read",
-                "description": (
-                    "[读取工作空间文件内容] | "
-                    "贡献维度: 上下文获取（获取文件/代码/配置现状，是所有修改与判断的前提）\n"
-                    "何时使用: 修改任何文件前必须先 read 看清楚当前内容；"
-                    "查找代码/配置/文档内容；排查问题时读取相关文件；"
-                    "读取图像文件（png/jpg/jpeg/webp/gif，自动识别并返回 base64）\n"
-                    "何时不用: 已确定文件内容无需重读；大目录浏览用 Terminal ls\n"
-                    "前置依赖: 文件必须存在于工作空间\n"
-                    "省钱技巧: 大文件用 start_line/line_count 只读需要的行为表/函数，"
-                    "避免整文件全读占用大量上下文"
-                ),
+                "description": versions.active_tool_description("read"),
                 "parameters": {
                     "type": "object",
                     "properties": {

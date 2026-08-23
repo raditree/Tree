@@ -12,7 +12,7 @@ from openai import OpenAI, RateLimitError
 
 from config.config import get_config
 from config.models import ModelConfig
-from prompt.llm_prompts import context_compressor_prompt
+from prompt import versions
 
 logger = logging.getLogger(__name__)
 
@@ -1186,7 +1186,7 @@ class AgentLLMSession:
         if len(raw) > self.SUMMARIZE_CHAR_LIMIT:
             raw = raw[: self.SUMMARIZE_CHAR_LIMIT] + "\n...[截断]"
 
-        summarize_prompt = context_compressor_prompt(raw)
+        summarize_prompt = versions.active_compressor(raw)
 
         try:
             # 主动延迟：压缩总结也属于该 agent 的 API 调用，同样限速

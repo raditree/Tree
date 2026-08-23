@@ -572,7 +572,8 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
               controller.clear();
               try {
                 await ApiService.sendTeammateMessage(
-                    widget.leader.id, widget.memberId, text);
+                    widget.leader.id, widget.memberId, text,
+                    sessionId: widget.sessionId);
               } catch (e) {
                 if (!mounted) return;
                 ScaffoldMessenger.of(context).showSnackBar(

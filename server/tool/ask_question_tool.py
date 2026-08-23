@@ -17,6 +17,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from data.conversation_store import save_pending_question, store_message
+from prompt import versions
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ class AskUserQuestionTool:
         top_agent_id: str = "",
         session_id: str = "",
         is_member: bool = False,
+        session: Any = None,
     ) -> None:
         """初始化。
 
@@ -59,6 +61,8 @@ class AskUserQuestionTool:
             提问时即自身），唤醒路由成员 roster 时使用
         :param session_id: 所属会话 id（多会话隔离）
         :param is_member: 是否团队成员提问（决定唤醒时的分发路径）
+        :param session: 对应的 LLM 会话，提问时读取 ``session.sender_id`` 作为
+            原发送方持久化（供续跑后成员总结精确回发）
         """
         self.ws_manager = ws_manager
         self.user_id = user_id
@@ -66,6 +70,7 @@ class AskUserQuestionTool:
         self.top_agent_id = top_agent_id or agent_id
         self.session_id = session_id
         self.is_member = is_member
+        self._session = session
         # 主事件循环引用（在 register_builtin_tools 的协程上下文中填充）
         self._loop: Optional[Any] = None
         if user_id:
@@ -81,17 +86,7 @@ class AskUserQuestionTool:
             "type": "function",
             "function": {
                 "name": "ask_user_question",
-                "description": (
-                    "[向用户提问] | "
-                    "贡献维度: 人机协作（获取用户决策/澄清/补充信息，消除歧义与风险）\n"
-                    "何时使用: 任务信息不完整需要澄清；需要用户决策/选择；"
-                    "高风险操作（删除/覆盖/破坏性/花钱）需确认；多方案让用户选型\n"
-                    "何时不用: 可从现有上下文/文件推断时不提问；"
-                    "琐碎问题自己能决策时不要打断用户；hard 任务之外避免频繁提问\n"
-                    "前置依赖: 用户在线（WebSocket 连接）可收到问题卡片；"
-                    "options 提供后用户可快速选择，否则自由输入。"
-                    "提问后 agent 会暂停等待，用户作答后自动继续"
-                ),
+                "description": versions.active_tool_description("ask_user_question"),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -127,8 +122,11 @@ class AskUserQuestionTool:
 
         qid = f"q_{uuid.uuid4().hex[:8]}"
 
-        # 1) 持久化待答提问（重启后仍可路由/唤醒）
+        # 1) 持久化待答提问（重启后仍可路由/唤醒）。记录当前发送方
+        #    （session.sender_id，由 _process_member_message / 插入消息实时维护），
+        #    供续跑后成员总结精确回发到原发送方。
         try:
+            sender_id = getattr(self._session, "sender_id", "") if self._session else ""
             save_pending_question(
                 self.user_id,
                 self.agent_id,
@@ -138,6 +136,7 @@ class AskUserQuestionTool:
                 question,
                 options,
                 is_member=1 if self.is_member else 0,
+                sender_id=sender_id,
             )
             # 2) 作为会话历史消息展示（断线/刷新后恢复卡片），qid 即 msg_id
             store_message(

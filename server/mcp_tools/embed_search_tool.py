@@ -17,6 +17,7 @@ from data.embed_model import (
     load_embed_model_config,
     truncate_text,
 )
+from prompt import versions
 
 logger = logging.getLogger(__name__)
 
@@ -73,21 +74,9 @@ class EmbedSearchTool:
     def get_tool_definition(self) -> Dict[str, Any]:
         """返回 OpenAI function calling 格式的工具定义。"""
         has_embed = self._get_embed_config() is not None
-        if has_embed:
-            desc = (
-                "[工作空间全文语义搜索] | 贡献维度: 上下文获取\n"
-                "何时使用: 需要按语义（而非仅关键词）在工作空间内检索最相关内容；"
-                "关键词不确定、想要『意思相近』的结果时\n"
-                "何时不用: 已明确文件路径时用 read；仅需精确关键词定位可先用 grep\n"
-                "前置依赖: 已配置嵌入模型；query 不能为空"
-            )
-        else:
-            desc = (
-                "[工作空间文本搜索（grep 降级）] | 贡献维度: 上下文获取\n"
-                "何时使用: 需要按关键词在工作空间内定位内容\n"
-                "何时不用: 已明确文件路径时用 read\n"
-                "前置依赖: 配置嵌入模型后升级为向量语义搜索"
-            )
+        desc = versions.active_tool_description(
+            "embed_search.embed" if has_embed else "embed_search.grep"
+        )
         return {
             "type": "function",
             "function": {

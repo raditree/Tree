@@ -222,6 +222,9 @@ def register_builtin_tools(
         ws_manager=ws_manager, user_id=user_id,
         agent_id=agent_id, top_agent_id=top_agent_id or agent_id,
         session_id=session_id, is_member=is_member,
+        # 透传会话：提问时读取 session.sender_id 持久化原发送方，
+        # 供成员续跑后总结精确回发（"谁发给它的就回发给谁"）
+        session=session,
     )
     # 绑定主事件循环，供 AskUserQuestion 在消费线程内安全推送 WS 消息
     try:

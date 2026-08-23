@@ -23,11 +23,8 @@ from openai import RateLimitError
 import state
 from config.config import get_config
 from config.models import ModelConfig
+from prompt import versions
 from prompt.registry import audit_header
-from prompt.system_chapters import (
-    SYSTEM_STATIC_CHAPTERS,
-    SYSTEM_STATIC_TAIL_CHAPTERS,
-)
 from data.agent_store import get_agent
 from data.conversation_store import (
     load_context,
@@ -295,10 +292,11 @@ def _build_agent_system_prompt(
 ) -> str:
     """构建 agent 系统提示词：13 章节全量注入（spec「system prompt 内容」）。
 
-    章节数据来自集中式版本化注册表（``prompt.system_chapters``）：静态章节
-    （角色权威/任务范式/安全护栏/工具路由/Spec 维护/todo 纪律/[Warning] 负责）
-    由注册表提供并随之版本化；动态章节（身份/memory/Spec 索引/已选 Spec/执行
-    模式/成员拓扑）由本函数按会话现算注入。提示词顶部带审计头（版本+章节清单）。
+    章节数据来自集中式版本化数据目录（``prompt/versions/<激活版本>/``，经
+    ``prompt.versions`` 解析）：静态章节（角色权威/任务范式/安全护栏/工具路由/
+    Spec 维护/todo 纪律/[Warning] 负责）随激活版本切换；动态章节（身份/memory/Spec
+    索引/已选 Spec/执行模式/成员拓扑）由本函数按会话现算注入。提示词顶部带审计头
+    （版本+章节清单）。
 
     ① 身份与角色（.self/identity.md，默认顶层 Agent 说明；成员含 leader 设定）
     ② 角色权威与行为准则（core，注册表）
@@ -342,7 +340,7 @@ def _build_agent_system_prompt(
     chapters.append("\n".join(identity_chapter))
 
     # ②-⑤ 静态核心与护栏章节（角色权威/任务范式/安全护栏/工具路由）：来自注册表
-    for chap in SYSTEM_STATIC_CHAPTERS:
+    for chap in versions.active_system_head():
         chapters.append(f"## {chap.title}\n{chap.content}")
 
     # ⑥ .self 私人文档（memory.md；rule.md 已移除）
@@ -382,7 +380,7 @@ def _build_agent_system_prompt(
     )
 
     # ⑪-⑬ 静态尾部章节（Spec 维护/todo 纪律/[Warning] 负责）：来自注册表
-    for chap in SYSTEM_STATIC_TAIL_CHAPTERS:
+    for chap in versions.active_system_tail():
         chapters.append(f"## {chap.title}\n{chap.content}")
 
     return "\n\n".join(chapters)
@@ -1396,6 +1394,12 @@ async def _process_member_message(
     leader_id = payload.get("leader_id", "")
     top_agent_id = payload.get("top_agent_id", "")
     session_id = payload.get("session_id", DEFAULT_SESSION)
+    # 真正触发本条处理的发送方：agent 发送 = 该 agent（上级/平级/下级均可）；
+    # 用户直发 = 空串（成员总结不转发给任何 agent）。key 存在（含空串）即用之，
+    # key 缺失才回退 leader_id（兼容无 sender_id 的老负载）。
+    sender_id = payload.get("sender_id")
+    if sender_id is None:
+        sender_id = payload.get("leader_id", "")
     if not agent_id or not content:
         return
 
@@ -1418,17 +1422,18 @@ async def _process_member_message(
             f"[{_clock_now()}] [error] 成员模型不存在: {model_id!r}，"
             "消息未处理（leader 需先用 team update_member 为该成员设置 model_id）",
         )
-        # 明确回传错误给 leader，避免消息被静默丢弃（表现为"成员没收到"）
-        if leader_id:
+        # 明确回传错误给发送方（仅当发送方是 agent；用户直发不转发任何 agent），
+        # 避免消息被静默丢弃（表现为"成员没收到"）
+        if sender_id:
             try:
                 _dispatch_agent_message(
                     user_id,
-                    [leader_id],
+                    [sender_id],
                     f"[成员 {agent_id} 无法处理消息] 未配置 LLM 模型"
                     f"（model_id={model_id!r}），消息已丢弃：{content[:120]}。"
                     "请用 team update_member 为该成员设置 model_id 后重试。",
                     source_agent_id=agent_id,
-                    top_agent_id=top_agent_id or leader_id,
+                    top_agent_id=top_agent_id or sender_id,
                     extra={"auto_reply": True, "session_id": session_id},
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1479,13 +1484,22 @@ async def _process_member_message(
         if restored:
             session.context = restored
 
+    # 记录本条消息的发送方：供 AskUserQuestion 在提问时持久化溯源，
+    # 并由中途插入的消息实时更新为"最后发送方"（见 _pick_incoming）。
+    session.sender_id = sender_id
+
     _append_activity_log(
         workspace_id,
         f"[{_clock_now()}] [start(成员)] 收到 leader 消息: {content[:120]}",
     )
 
+    # 成员最终总结的回发目标：默认 = 本条消息的发送方；中途切入新消息时
+    # 更新为最后一位发送方（feature：自动回复仅回给最后发给它的那位）。
+    reply_sender = sender_id
+
     def _pick_incoming() -> Optional[str]:
         """在 tool_call 间隙从队列切入 leader 发来的新消息。"""
+        nonlocal reply_sender
         if queue is None:
             return None
         try:
@@ -1501,6 +1515,13 @@ async def _process_member_message(
         incoming_content = incoming.get("content", "")
         if not incoming_content:
             return None
+        # 更新"最后发送方"：插入的新消息到来时，把最终总结的回发目标切换为
+        # 这条新消息的发送方（feature：自动回复仅回给最后发给它的那位）。
+        inc_sender = incoming.get("sender_id")
+        if inc_sender is None:
+            inc_sender = incoming.get("leader_id", "")
+        reply_sender = inc_sender
+        session.sender_id = inc_sender
         _append_activity_log(
             workspace_id,
             f"[{_clock_now()}] [切入] 收到 leader 新消息: "
@@ -1538,15 +1559,16 @@ async def _process_member_message(
             _store_message(user_id, agent_id, "agent", full_reply,
                            session_id=session_id)
         _append_activity_log(workspace_id, f"[{_clock_now()}] [done(成员)] 回复完成")
-        # 成员工具循环最后一次回复的 content 自动回发对应 leader
-        if full_reply and leader_id:
+        # 成员工具循环最后一次回复的 content 自动回发"最后将消息发给它的那位"
+        # （用户直发时为空串 → 不转发任何 agent，仅留在成员会话/teammates 窗口）
+        if full_reply and reply_sender:
             try:
                 _dispatch_agent_message(
                     user_id,
-                    [leader_id],
+                    [reply_sender],
                     f"[成员 {agent_id} 完成回复] {full_reply}",
                     source_agent_id=agent_id,
-                    top_agent_id=top_agent_id or leader_id,
+                    top_agent_id=top_agent_id or reply_sender,
                     extra={"auto_reply": True, "session_id": session_id},
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1726,6 +1748,9 @@ def _dispatch_agent_message(
             "system_prompt": member.get("system_prompt", "") or system_prompt,
             "leader_id": source_agent_id or top_agent_id,
             "top_agent_id": owner_top,
+            # 真正触发本条处理的发送方（可被调用方经 extra 显式覆盖：用户直发==""、
+            # 续跑=原发送方、团队工具缺省=source_agent_id=发送的 agent）。
+            "sender_id": source_agent_id or top_agent_id,
             "content": content,
         }
         if extra:
@@ -1782,6 +1807,7 @@ async def resume_after_answer(
     session_id: str,
     answer: str,
     is_member: bool,
+    sender_id: str = "",
 ) -> None:
     """AskUserQuestion 作答后的唤醒：注入答案并重新触发该 agent 执行。
 
@@ -1792,6 +1818,9 @@ async def resume_after_answer(
     - 成员：经 ``_dispatch_agent_message``（team_broker）分发，需
       ``top_agent_id`` 解析 roster。
     - 主 agent：经 ``_dispatch_user_message``（top_chat_broker）分发。
+
+    ``sender_id`` 为提问时持久化的原发送方；成员续跑后最终总结仍回发给它，
+    保证"谁发给它的总结就回发给谁"在提问-回答边缘路径同样成立。
     """
     content = f"[AskUserQuestion 用户回答] {answer}"
     try:
@@ -1800,7 +1829,7 @@ async def resume_after_answer(
                 _dispatch_agent_message,
                 user_id, [agent_id], content,
                 top_agent_id, top_agent_id, "",
-                {"session_id": session_id},
+                {"session_id": session_id, "sender_id": sender_id},
             )
         else:
             await _dispatch_user_message(user_id, {

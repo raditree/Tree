@@ -822,11 +822,17 @@ class ApiService {
   static Future<Map<String, dynamic>> sendTeammateMessage(
     String leaderId,
     String memberId,
-    String content,
-  ) async {
+    String content, {
+    String? sessionId,
+  }) async {
     return _postJson(
       '/api/agents/$leaderId/teammate/$memberId/message',
-      body: {'content': content},
+      body: {
+        'content': content,
+        // 会话隔离：携带当前会话 id，避免成员消息串入默认会话
+        if (sessionId != null && sessionId.isNotEmpty)
+          'session_id': sessionId,
+      },
     );
   }
 

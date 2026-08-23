@@ -5,7 +5,8 @@
 （``system_chapters``）复用。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Dict
 
 
 # 章节层级枚举（用于审计/权限分级）
@@ -32,3 +33,27 @@ class Chapter:
     level: str
     description: str
     content: str = ""  # 动态章节留空，由运行时注入
+
+
+@dataclass(frozen=True)
+class PromptVersion:
+    """一个版本打包（rule set）的提示词产物集合。
+
+    由 :mod:`prompt.loader` 从 ``versions/<version>/`` 数据目录加载，作为
+    「激活版本解析器」返回的完整版本包。
+
+    :param version: 语义化版本号（与配置 ``prompt.version`` 对齐）
+    :param system_head: 静态头章节（角色权威/任务范式/安全护栏/工具路由）
+    :param system_tail: 静态尾章节（Spec 维护/todo 纪律/[Warning] 负责）
+    :param compressor: 上下文压缩器模板函数（输入待压缩历史，输出压缩指令）
+    :param tool_descriptions: 该版本的工具描述（``name -> description``）
+    :param meta: 版本元数据（version/date/scope 等，来自 ``meta.yaml``）
+    :param changelog: 版本变更记录列表
+    """
+    version: str
+    system_head: tuple
+    system_tail: tuple
+    compressor: object
+    tool_descriptions: Dict
+    meta: Dict = field(default_factory=dict)
+    changelog: tuple = ()

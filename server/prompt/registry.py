@@ -1,14 +1,15 @@
-"""提示词注册表：全局版本号 + 章节审计清单 + 版本变更记录。
+"""提示词注册表：版本审计工具 + 版本常量基线。
 
-统一管理整套提示词体系的版本与可审计性：
-- ``PROMPT_VERSION``：系统提示词体系当前版本（语义化版本，字符串）。
-- ``TOOL_TEMPLATE_VERSION``：内置 / MCP 工具描述统一模板版本（整数）。
-- ``COMPRESSOR_VERSION``：上下文压缩器提示词版本（整数，llm.py 使用）。
-- ``SYSTEM_PROMPT_CHANGELOG``：系统提示词版本变更记录（audit），用于追溯
-  各版本改了什么、为何改。
+提供：
+- ``chapter_manifest``：章节审计清单（id/层级/版本号）。
+- ``audit_header``：按**当前激活版本**（``versions.active_*``，由 app.yaml
+  的 ``prompt.version`` 决定）生成系统提示词审计头。
+- ``PROMPT_VERSION`` / ``TOOL_TEMPLATE_VERSION`` / ``COMPRESSOR_VERSION``：
+  **v1.0.0 基线**常量。运行期实际使用哪个版本，以 ``prompt.version`` 配置与
+  ``prompt/versions/`` 数据目录为准（见 :mod:`prompt.versions`）。
 
-章节数据本身见 :mod:`prompt.system_chapters`，避免本模块与章节数据互相
-依赖（仅在需要生成审计清单时惰性 import，切断循环依赖）。
+章节数据本体已迁至数据目录 ``versions/<version>/``（由 :mod:`prompt.loader`
+读取），不再内嵌于代码。
 """
 
 from __future__ import annotations
@@ -91,22 +92,25 @@ def chapter_manifest(chapters) -> List[Dict[str, str]]:
 
 
 def audit_header() -> str:
-    """生成系统提示词顶部的审计头（版本 + 章节清单，纯文本、不占正文语义）。
+    """生成**当前激活版本**系统提示词顶部的审计头（版本 + 章节清单）。
 
-    保持简洁以控制上下文开销：仅列出本章节 id、层级与版本号。
+    章节取自激活版本数据目录（``versions.active_chapters()``），版本号取
+    ``versions.active_version()``。保持简洁以控制上下文开销：仅列出章节
+    id、层级与版本号。
     """
-    # 惰性 import，避免与 system_chapters 形成循环依赖
-    from .system_chapters import (
-        SYSTEM_STATIC_CHAPTERS,
-        SYSTEM_STATIC_TAIL_CHAPTERS,
-    )
+    # 惰性 import，避免与 versions/loader 形成循环依赖
+    from .versions import active_chapters, active_version
 
-    all_static = [*SYSTEM_STATIC_CHAPTERS, *SYSTEM_STATIC_TAIL_CHAPTERS]
+    all_static = active_chapters()
     manifest_lines = []
     for c in chapter_manifest(all_static):
         manifest_lines.append(
             f"- [{c['level_label']}] {c['id']} v{c['version']}"
         )
-    title_line = f"系统提示词体系：版本 v{PROMPT_VERSION}（工程来源 server/prompt）"
+    version = active_version()
+    title_line = (
+        f"系统提示词体系：版本 v{version}"
+        "（工程来源 server/prompt/versions，激活版本以配置 prompt.version 为准）"
+    )
     body = "\n".join(manifest_lines)
     return f"{title_line}\n已装载章节:\n{body}"

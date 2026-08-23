@@ -8,6 +8,7 @@ import logging
 from typing import Any, Dict
 
 from io_.workspace_io import WorkspaceIO, run_io
+from prompt import versions
 
 logger = logging.getLogger(__name__)
 
@@ -40,15 +41,7 @@ class WriteTool:
             "type": "function",
             "function": {
                 "name": "write",
-                "description": (
-                    "[向工作空间写入文件，自动创建父目录] | "
-                    "贡献维度: 文件产出（创建新文件/脚本/文档/配置文件）\n"
-                    "何时使用: 新建文件（如新模块、新脚本、新文档、配置文件）；"
-                    "整文件重写（WriteFile 覆盖）；生成批量内容\n"
-                    "何时不用: 已有文件的小改动（用 edit 保留上下文）；"
-                    "创建目录/删除文件用 Terminal\n"
-                    "前置依赖: 工作空间可写；写入前建议先 read 确认是否已有同名文件"
-                ),
+                "description": versions.active_tool_description("write"),
                 "parameters": {
                     "type": "object",
                     "properties": {

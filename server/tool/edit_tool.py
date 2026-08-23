@@ -9,6 +9,7 @@ import logging
 from typing import Any, Dict
 
 from io_.workspace_io import WorkspaceIO
+from prompt import versions
 from tool.read_tool import ReadTool
 from tool.write_tool import WriteTool
 
@@ -46,15 +47,7 @@ class EditTool:
             "type": "function",
             "function": {
                 "name": "edit",
-                "description": (
-                    "[对工作空间文件执行精确字符串替换] | "
-                    "贡献维度: 文件产出（对已有文件做局部精准修改，保留其余内容）\n"
-                    "何时使用: 修改已有文件的某段内容（改逻辑/文案/参数）；"
-                    "old_text 必须在文件中唯一匹配，否则返回错误\n"
-                    "何时不用: 新建文件用 write；大段重写用 write 覆盖；"
-                    "不确定匹配内容时先 read 确认\n"
-                    "前置依赖: 文件已存在；编辑前应先 read 拿到准确的 old_text"
-                ),
+                "description": versions.active_tool_description("edit"),
                 "parameters": {
                     "type": "object",
                     "properties": {

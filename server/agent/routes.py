@@ -492,6 +492,10 @@ async def send_teammate_message(
     if not content:
         return {"success": False, "error": "缺少 content"}
 
+    # 会话隔离：成员处理按 session_id 归集，缺省回退默认会话。
+    # 若丢失 session_id，会串入默认会话（与其他会话交叉）。
+    session_id = (body or {}).get("session_id") or DEFAULT_SESSION
+
     # 收敛出口：统一消息 API（用户 -> 成员，走顶部 agent 的 roster 校验与投递）
     # 本地模式下 _find_roster_member 经反向 WS 读 roster（阻塞），放入线程池
     result = await asyncio.to_thread(
@@ -501,6 +505,9 @@ async def send_teammate_message(
         content,
         source_agent_id="",
         top_agent_id=agent_id,
+        # 用户直发：sender_id 置空，成员总结只留在成员会话/teammates 窗口，
+        # 不转发给任何 agent（更不回发给 top），避免把顶部 agent 卷进来。
+        extra={"session_id": session_id, "sender_id": ""},
     )
     if result.get("status") == "error":
         return {"success": False, "error": "消息投递失败", "detail": result}

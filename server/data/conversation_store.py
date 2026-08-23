@@ -128,6 +128,17 @@ def _ensure_db() -> None:
             )
             """
         )
+        # 待答提问补充 sender_id 列：持久化成员提问时的原发送方，供续跑后
+        # 成员总结精确回发（"谁发给它的就回发给谁"，兼容 ask/resume 边缘路径）。
+        pq_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(pending_questions)").fetchall()
+        }
+        if "sender_id" not in pq_cols:
+            conn.execute(
+                "ALTER TABLE pending_questions "
+                "ADD COLUMN sender_id TEXT NOT NULL DEFAULT ''"
+            )
         # agent_context 主键扩为 (user_id, agent_id, session_id)：重建表迁移。
         # 旧结构无 session_id 列时，把既有行归入默认会话后替换表结构。
         ctx_cols = {
@@ -609,8 +620,12 @@ def save_pending_question(
     question: str,
     options: Optional[List[str]] = None,
     is_member: int = 0,
+    sender_id: str = "",
 ) -> None:
-    """保存一条待答提问（status=pending），qid 主键，可重复 UPSERT。"""
+    """保存一条待答提问（status=pending），qid 主键，可重复 UPSERT。
+
+    sender_id 记录提问时的原发送方，供续跑后成员总结精确回发。
+    """
     _ensure_db()
     options_json = json.dumps(options or [], ensure_ascii=False)
     ts = int(time.time() * 1000)
@@ -619,12 +634,14 @@ def save_pending_question(
         conn.execute(
             "INSERT INTO pending_questions "
             "(qid, user_id, agent_id, top_agent_id, session_id, is_member, "
-            "question, options, answer, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending', ?) "
+            "question, options, answer, status, sender_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending', ?, ?) "
             "ON CONFLICT(qid) DO UPDATE SET "
-            "answer = NULL, status = 'pending', created_at = excluded.created_at",
+            "answer = NULL, status = 'pending', "
+            "sender_id = excluded.sender_id, "
+            "created_at = excluded.created_at",
             (qid, user_id, agent_id, top_agent_id, session_id, is_member,
-             question, options_json, ts),
+             question, options_json, sender_id, ts),
         )
         conn.commit()
 
@@ -637,7 +654,7 @@ def get_pending_question(qid: str) -> Optional[Dict[str, Any]]:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT qid, user_id, agent_id, top_agent_id, session_id, is_member, "
-            "question, options, answer, status, created_at "
+            "question, options, answer, status, sender_id, created_at "
             "FROM pending_questions WHERE qid = ?",
             (qid,),
         ).fetchone()
@@ -658,6 +675,7 @@ def get_pending_question(qid: str) -> Optional[Dict[str, Any]]:
             "options": options,
             "answer": row["answer"],
             "status": row["status"],
+            "sender_id": row["sender_id"] or "",
             "created_at": row["created_at"],
         }
     finally:

@@ -35,6 +35,7 @@ from data.spec_store import (
 )
 from data.session_store import get_selected_spec_ids, set_selected_spec_ids
 from io_.workspace_io import WorkspaceIO, run_io
+from prompt import versions
 
 logger = logging.getLogger(__name__)
 
@@ -82,17 +83,7 @@ class SpecTool:
             "type": "function",
             "function": {
                 "name": "spec",
-                "description": (
-                    "[任务型规范（Spec）检索/选择/沉淀] | "
-                    "贡献维度: 任务管理（把任务经验沉淀为可复用规范，指导后续任务）"
-                    " + 上下文获取（检索/读取历史任务规范）\n"
-                    "何时使用: 任务开始前检索是否已有对应 Spec；任务完成前沉淀新 Spec；"
-                    "用户/本会话已选 Spec 需读全文时\n"
-                    "何时不用: 无。**必须调用**，即使单文件修改也必须先 **read 并 select** easy spec 再开始任务\n"
-                    "前置依赖: 在搜索更多 spec 前必须先从四个内置基础 spec 中选择一个或多个\n"
-                    "动作: search(语义检索) / list(索引) / read(全文) / "
-                    "select(多选挂 hook) / create(创建) / update(更新)"
-                ),
+                "description": versions.active_tool_description("spec"),
                 "parameters": {
                     "type": "object",
                     "properties": {

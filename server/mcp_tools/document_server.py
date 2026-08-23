@@ -21,11 +21,25 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from io_.docker_manager import DockerManager  # noqa: E402
 from io_.workspace_io import CloudWorkspaceIO, WorkspaceIO, run_io  # noqa: E402
+from prompt import versions  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 # MCP 协议版本
 _PROTOCOL_VERSION = "2024-11-05"
+
+
+def _tool_description(name: str, baseline: str) -> str:
+    """取**激活版本**的工具描述；无法解析时回退到内联基线（v1.0.0 文本）。
+
+    document_server 可作为后端进程（local/ssh 进程内）或云端 stdio 子进程运行，
+    二者均有配置文件读取路径；此处兜底保证在缺少配置的裸沙箱中不至于使整个
+    文档服务崩溃。
+    """
+    try:
+        return versions.active_tool_description(name)
+    except Exception:  # noqa: BLE001
+        return baseline
 
 
 def _exec_python(workspace_id: str, io: WorkspaceIO, script: str) -> dict:
@@ -66,11 +80,12 @@ def _dump(result: dict) -> str:
 TOOLS = [
     {
         "name": "read_pdf",
-        "description": (
+        "description": _tool_description(
+            "read_pdf",
             "[解析 PDF 提取文本] | 贡献维度: 外部能力/文档处理\n"
             "何时使用: 需要读取 .pdf 文件内容（按页返回文本）\n"
             "何时不用: 非 PDF 文档用 read_docx/read_pptx/read_xlsx\n"
-            "前置依赖: 文件须存在于工作空间且为 PDF"
+            "前置依赖: 文件须存在于工作空间且为 PDF",
         ),
         "inputSchema": {
             "type": "object",
@@ -85,11 +100,12 @@ TOOLS = [
     },
     {
         "name": "read_docx",
-        "description": (
+        "description": _tool_description(
+            "read_docx",
             "[解析 DOCX 提取文本与表格] | 贡献维度: 外部能力/文档处理\n"
             "何时使用: 需要读取 .docx 文件内容（段落文本与表格数据）\n"
             "何时不用: 非 DOCX 文档用对应的 read_* 工具\n"
-            "前置依赖: 文件须存在于工作空间且为 DOCX"
+            "前置依赖: 文件须存在于工作空间且为 DOCX",
         ),
         "inputSchema": {
             "type": "object",
@@ -104,11 +120,12 @@ TOOLS = [
     },
     {
         "name": "read_pptx",
-        "description": (
+        "description": _tool_description(
+            "read_pptx",
             "[解析 PPTX 提取幻灯片文本] | 贡献维度: 外部能力/文档处理\n"
             "何时使用: 需要读取 .pptx 文件内容（所有幻灯片的文本）\n"
             "何时不用: 非 PPTX 文档用对应的 read_* 工具\n"
-            "前置依赖: 文件须存在于工作空间且为 PPTX"
+            "前置依赖: 文件须存在于工作空间且为 PPTX",
         ),
         "inputSchema": {
             "type": "object",
@@ -123,11 +140,12 @@ TOOLS = [
     },
     {
         "name": "read_xlsx",
-        "description": (
+        "description": _tool_description(
+            "read_xlsx",
             "[解析 XLSX 提取工作表数据] | 贡献维度: 外部能力/文档处理\n"
             "何时使用: 需要读取 .xlsx 文件内容（各工作表数据）\n"
             "何时不用: 非 XLSX 文档用对应的 read_* 工具\n"
-            "前置依赖: 文件须存在于工作空间且为 XLSX"
+            "前置依赖: 文件须存在于工作空间且为 XLSX",
         ),
         "inputSchema": {
             "type": "object",
@@ -142,11 +160,12 @@ TOOLS = [
     },
     {
         "name": "create_docx",
-        "description": (
+        "description": _tool_description(
+            "create_docx",
             "[由文本生成 DOCX 文档] | 贡献维度: 外部能力/文档产出\n"
             "何时使用: 需要产出 .docx 文件（按文本内容，多行用 \\n 分隔）\n"
             "何时不用: 产出非 DOCX 用对应的 create_* 工具\n"
-            "前置依赖: 保存路径可写；内容按工具约定的文本格式传入"
+            "前置依赖: 保存路径可写；内容按工具约定的文本格式传入",
         ),
         "inputSchema": {
             "type": "object",
@@ -165,11 +184,12 @@ TOOLS = [
     },
     {
         "name": "create_pptx",
-        "description": (
+        "description": _tool_description(
+            "create_pptx",
             "[由 JSON 生成 PPTX 幻灯片] | 贡献维度: 外部能力/文档产出\n"
             "何时使用: 需要产出 .pptx 文件（按 JSON 描述的标题/内容生成）\n"
             "何时不用: 产出非 PPTX 用对应的 create_* 工具\n"
-            "前置依赖: 保存路径可写；slides 为合法 JSON 数组字符串"
+            "前置依赖: 保存路径可写；slides 为合法 JSON 数组字符串",
         ),
         "inputSchema": {
             "type": "object",
@@ -188,11 +208,12 @@ TOOLS = [
     },
     {
         "name": "create_xlsx",
-        "description": (
+        "description": _tool_description(
+            "create_xlsx",
             "[由 JSON 数据生成 XLSX] | 贡献维度: 外部能力/文档产出\n"
             "何时使用: 需要产出 .xlsx 文件（按 JSON 工作表数据生成）\n"
             "何时不用: 产出非 XLSX 用对应的 create_* 工具\n"
-            "前置依赖: 保存路径可写；data 为合法 JSON 对象字符串"
+            "前置依赖: 保存路径可写；data 为合法 JSON 对象字符串",
         ),
         "inputSchema": {
             "type": "object",

@@ -332,9 +332,10 @@ class TestWarningAccountabilityPrompt(unittest.TestCase):
     """system prompt 必须包含 ⑬ 工具反馈 [Warning] 负责规则（来自 versioned 注册表）。"""
 
     def test_warning_accountability_text_has_rules(self):
-        from prompt.system_chapters import WARNING_ACCOUNTABILITY
-        self.assertIn("⑬ 工具反馈 [Warning] 负责规则", WARNING_ACCOUNTABILITY.title)
-        text = WARNING_ACCOUNTABILITY.content
+        from prompt.versions import active_system_tail
+        wc = [c for c in active_system_tail() if c.id == "warning-accountability"][0]
+        self.assertIn("⑬ 工具反馈 [Warning] 负责规则", wc.title)
+        text = wc.content
         self.assertIn("严格关注", text)
         self.assertIn("背景噪音", text)
         self.assertIn("ask_user_question", text)

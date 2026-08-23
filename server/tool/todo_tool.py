@@ -24,6 +24,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from io_.workspace_io import WorkspaceIO, run_io
+from prompt import versions
 
 logger = logging.getLogger(__name__)
 
@@ -135,15 +136,7 @@ class SetTodoListTool:
             "type": "function",
             "function": {
                 "name": "set_todo_list",
-                "description": (
-                    "[任务分解与进度跟踪] | "
-                    "贡献维度: 任务管理（把任务拆成可跟踪的 todo 列表，持续汇报进度）\n"
-                    "何时使用: 开始复杂任务前先 set 分解；执行中每完成/推进一项、遇到阻塞"
-                    "都要立即用 update 增量更新（status/progress），不得攒到全部完成才统一标注\n"
-                    "何时不用: 简单单文件改动（easy 任务）无需 todo\n"
-                    "前置依赖: 工作空间可写（.self/todos.md）\n"
-                    "动作: set(整体替换) / update(按 id 更新) / clear(清空) / get(读取快照)"
-                ),
+                "description": versions.active_tool_description("set_todo_list"),
                 "parameters": {
                     "type": "object",
                     "properties": {

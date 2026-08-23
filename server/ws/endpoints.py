@@ -213,6 +213,8 @@ def register_ws(app: FastAPI) -> None:
                             pending["session_id"],
                             str(answer or "") if answer is not None else "",
                             pending["is_member"],
+                            # 原发送方：成员续跑后总结精确回发到"谁发给它的那位"
+                            pending.get("sender_id", ""),
                         )
                     )
                 elif msg_type == "cancel_question":

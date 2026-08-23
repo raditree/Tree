@@ -1,0 +1,25 @@
+version: "1.0.0"
+date: "2026-08-23"
+scope: "system|tool|compressor"
+# 静态头/尾章节的 id 清单（顺序即渲染顺序；须与 chapters/ 下的文件一一对应）
+head_ids:
+  - authority
+  - task-paradigm
+  - security-boundary
+  - tool-routing
+tail_ids:
+  - spec-maintenance
+  - todo-discipline
+  - warning-accountability
+changelog:
+  - version: "1.0.0"
+    date: "2026-08-23"
+    scope: "system / tool / spec / compressor"
+    changes:
+      - "引入集中式版本化提示词注册表（server/prompt 包），章节数据与拼装逻辑解耦，支持版本号与章节审计清单。"
+      - "新增『角色权威与行为准则』章节（core）：权威边界、诚实性、先证后断、范围克制、不明即澄清。"
+      - "新增『安全与边界护栏』章节（guardrail）：数据安全、命令护栏、权限边界、合规与敏感信息处理。"
+      - "为既有全部系统提示词章节补充 version/level/description 元数据，并注入审计头（版本 + 章节清单）。"
+      - "内置 / MCP 工具描述统一到结构化模板（贡献维度/何时使用/何时不用/前置依赖/动作），登记工具提示词版本清单。"
+      - "内置 Spec 补充 version / changelog / classification 前端字段，规范可追溯、可回滚。"
+      - "上下文压缩器 prompt 改为集中式版本化常量（llm.py 引用）。"

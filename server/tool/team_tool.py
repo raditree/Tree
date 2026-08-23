@@ -24,6 +24,7 @@ from io_.workspace_io import run_io
 from llm.llm import AgentLLMSession
 from config.models import ModelConfig
 from data.session_cache import clear_user_agent
+from prompt import versions
 
 logger = logging.getLogger(__name__)
 
@@ -140,25 +141,7 @@ class TeamTool:
             "type": "function",
             "function": {
                 "name": "team",
-                "description": (
-                    "[团队协作：成员管理/消息/任务调度] | "
-                    "贡献维度: 协同（与团队成员协作：分工、通信、任务指派、进度跟踪）\n"
-                    "何时使用: 复杂任务需分工协作时（update_member 设分工 + assign_task 指派）；"
-                    "与同级/下级成员通信；跨 Top agent 顶层协作（需用户透露对方 TOP name，"
-                    "先 list_teams 熟悉本用户名下 TOP）；查看成员产出/日志/状态\n"
-                    "何时不用: 简单任务（easy）无需团队；"
-                    "仅需给自己排进度用 set_todo_list 而非 team\n"
-                    "前置依赖: 成员已预建（TOP 创建时全量建队），按 name 或 member id 寻址；"
-                    "分工前先 list_members 确认拓扑；成员职责未设时先 update_member 设置\n"
-                    "注意: 成员不可动态创建/删除（P4 预建）；仅可 update_member 调整。"
-                    "修改成员信息会触发名单推送\n"
-                    "**使用前可查成员基本信息**：先 list_members / query_member 查看"
-                    "成员的 role（角色）、duty（职责）、model_id（模型）；role/duty 为空"
-                    "时用 update_member 补充完善再派发任务；model_id 为空会自动回退所属"
-                    " TOP 模型，无需强制设置。\n"
-                    "update_member 必须携带 target_member_id（或 member_name）指定目标成员，"
-                    "先从 list_members 获取成员 id/name，禁止省略"
-                ),
+                "description": versions.active_tool_description("team"),
                 "parameters": {
                     "type": "object",
                     "properties": {

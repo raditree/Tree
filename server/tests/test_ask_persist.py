@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -73,6 +74,18 @@ class PendingQuestionStoreTest(unittest.TestCase):
         store.mark_pending_cancelled("q_test3")
         self.assertEqual(store.get_pending_question("q_test3")["status"], "cancelled")
 
+    def test_sender_id_roundtrip(self) -> None:
+        """sender_id 应随待答提问落库并回读（续跑后总结精确回发用）。"""
+        store.save_pending_question(
+            "u4", "a4", "top-4", "s4", "q_test4", "问题",
+            is_member=1, sender_id="peerA",
+        )
+        row = store.get_pending_question("q_test4")
+        self.assertEqual(row["sender_id"], "peerA")
+        # 缺省 sender_id 落库为空串（兼容旧调用/主 agent）
+        store.save_pending_question("u5", "a5", "a5", "s5", "q_test5", "问题")
+        self.assertEqual(store.get_pending_question("q_test5")["sender_id"], "")
+
 
 class AskToolSentinelTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -103,6 +116,19 @@ class AskToolSentinelTest(unittest.TestCase):
         # 历史里也应有对应的提问消息
         hist = store.get_history("u1", "a1", "s1")
         self.assertTrue(any(m["kind"] == "ask_user_question" for m in hist))
+
+    def test_execute_persists_sender_from_session(self) -> None:
+        """提问时从 session.sender_id 读取发送方并持久化（成员边缘路径）。"""
+        session = MagicMock()
+        session.sender_id = "peerA"
+        tool = AskUserQuestionTool(
+            ws_manager=None, user_id="u6", agent_id="a6",
+            top_agent_id="top-6", session_id="s6", is_member=True,
+            session=session,
+        )
+        result = tool.execute({"question": "确认？"})
+        qid = result.get("qid")
+        self.assertEqual(store.get_pending_question(qid)["sender_id"], "peerA")
 
 
 if __name__ == "__main__":

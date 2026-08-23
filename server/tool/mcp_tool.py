@@ -8,6 +8,8 @@ from typing import Any, Optional
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from prompt import versions
+
 logger = logging.getLogger(__name__)
 
 
@@ -355,16 +357,7 @@ class MCPTool:
             "type": "function",
             "function": {
                 "name": "mcp",
-                "description": (
-                    "[调用外部 MCP 能力（文档解析/搜索/第三方服务）] | "
-                    "贡献维度: 外部能力（接入工作空间以外的第三方能力：文档解析、"
-                    "网页检索、数据库、外部 API 等）\n"
-                    "何时使用: 需要解析 PDF/PPTX/DOCX/XLSX 等文档；"
-                    "需要外部搜索/第三方服务；任务需要工作空间外的数据与能力\n"
-                    "何时不用: 工作空间内的文件读写/执行用 read/write/edit/terminal；"
-                    "不需外部能力时不要调用\n"
-                    "前置依赖: 先 help 查看可用 MCP 工具；注意区分 mcp 与内置工具职责"
-                ),
+                "description": versions.active_tool_description("mcp"),
                 "parameters": {
                     "type": "object",
                     "properties": {
