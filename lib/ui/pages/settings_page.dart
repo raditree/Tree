@@ -3,6 +3,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../io/api_service.dart';
 import '../../io/auth_service.dart';
+import '../../io/websocket_service.dart';
 import '../theme_service.dart';
 
 /// 设置页面
@@ -49,6 +50,9 @@ class _SettingsPageState extends State<SettingsPage> {
   // --- 数据收集 ---
   bool _dataCollectionEnabled = false;
 
+  // --- 主动延迟（限制单个 agent 的 API 调用频率，平均 6 次/分钟） ---
+  bool _rateLimitEnabled = false;
+
   @override
   void initState() {
     super.initState();
@@ -56,6 +60,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _loadAccountStatus();
     _loadBackendConfig();
     _loadDataCollectionSetting();
+    _loadRateLimitSetting();
   }
 
   @override
@@ -108,18 +113,49 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
-  /// 保存后端配置并更新 ApiService.baseUrl
+  /// 加载主动延迟设置
+  Future<void> _loadRateLimitSetting() async {
+    final prefs = await SharedPreferences.getInstance();
+    final local = prefs.getBool('rate_limit_enabled') ?? false;
+    if (mounted) {
+      setState(() => _rateLimitEnabled = local);
+    }
+    // 尝试从后端拉取权威状态（后端未启动/未登录时忽略，保留本地值）
+    try {
+      final bool remote = await ApiService.getRateLimit();
+      if (mounted) setState(() => _rateLimitEnabled = remote);
+    } catch (_) {
+      // 后端不可达时保留本地持久化值
+    }
+  }
+
+  /// 切换主动延迟开关
+  Future<void> _toggleRateLimit(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('rate_limit_enabled', value);
+    try {
+      await ApiService.setRateLimit(value);
+    } catch (_) {
+      // 后端设置失败不阻塞本地持久化
+    }
+    if (mounted) {
+      setState(() => _rateLimitEnabled = value);
+    }
+  }
+
+  /// 保存后端配置并更新 ApiService.baseUrl / WebSocketService.baseUrl
   Future<void> _saveBackendConfig() async {
     final host = _backendHostController.text.trim();
     final port = _backendPortController.text.trim();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('custom_backend_host', host);
     await prefs.setString('custom_backend_port', port);
-    if (host.isNotEmpty && port.isNotEmpty) {
-      ApiService.baseUrl = 'http://$host:$port';
-    } else {
-      ApiService.baseUrl = 'http://localhost:8000';
-    }
+    final String backendHost =
+        host.isNotEmpty && port.isNotEmpty ? host : ApiService.defaultBackendHost();
+    final String backendPort = host.isNotEmpty && port.isNotEmpty ? port : '8000';
+    // HTTP 与 WebSocket 同步指向同一后端，避免自定义地址后 WS 仍连 localhost
+    ApiService.baseUrl = 'http://$backendHost:$backendPort';
+    WebSocketService.baseUrl = 'ws://$backendHost:$backendPort';
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('后端地址已保存，当前请求已使用新地址')),
@@ -294,6 +330,10 @@ class _SettingsPageState extends State<SettingsPage> {
           _buildSectionTitle('数据收集'),
           const SizedBox(height: 8),
           _buildDataCollectionCard(),
+          const SizedBox(height: 24),
+          _buildSectionTitle('主动延迟'),
+          const SizedBox(height: 8),
+          _buildRateLimitCard(),
           const SizedBox(height: 24),
           _buildSectionTitle('注销账号'),
           const SizedBox(height: 8),
@@ -470,6 +510,46 @@ class _SettingsPageState extends State<SettingsPage> {
                   activeColor: const Color(0xFF2563EB),
                 ),
               ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 主动延迟卡片
+  ///
+  /// 开启后限制单个 agent 的 API 调用频率（平均 6 次/分钟），
+  /// 适合交互式开发——放慢 agent 节奏，让用户跟得上每个步骤。
+  Widget _buildRateLimitCard() {
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    '主动延迟（API 限速）',
+                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    _rateLimitEnabled
+                        ? '已开启：限制单个 agent 的 API 调用频率（平均 6 次/分钟），适合交互式开发'
+                        : '关闭：API 调用不限速',
+                    style: const TextStyle(fontSize: 12, color: Colors.black54),
+                  ),
+                ],
+              ),
+            ),
+            Switch(
+              value: _rateLimitEnabled,
+              onChanged: _toggleRateLimit,
+              activeColor: const Color(0xFF2563EB),
             ),
           ],
         ),

@@ -1,9 +1,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.example.flutter_application_tree">
+    <!-- 网络访问权限：连接后端 REST / WebSocket 服务必需 -->
+    <uses-permission android:name="android.permission.INTERNET"/>
    <application
-        android:label="flutter_application_tree"
+        android:label="Tree"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:usesCleartextTraffic="true">
         <activity
             android:name=".MainActivity"
             android:exported="true"

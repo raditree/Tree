@@ -5,6 +5,7 @@ import 'ui/pages/login_page.dart';
 import 'ui/pages/main_page.dart';
 import 'io/api_service.dart';
 import 'io/auth_service.dart';
+import 'io/websocket_service.dart';
 import 'ui/theme_service.dart';
 
 /// 应用入口
@@ -18,13 +19,17 @@ void main() async {
   // 加载本地保存的主题模式
   await ThemeService.instance.load();
 
-  // 加载自定义后端地址配置
+  // 加载自定义后端地址配置；未自定义时使用平台默认地址
+  // （Android 模拟器为 10.0.2.2，其余平台 localhost）
   final prefs = await SharedPreferences.getInstance();
   final host = prefs.getString('custom_backend_host') ?? '';
   final port = prefs.getString('custom_backend_port') ?? '';
-  if (host.isNotEmpty && port.isNotEmpty) {
-    ApiService.baseUrl = 'http://$host:$port';
-  }
+  final bool hasCustom = host.isNotEmpty && port.isNotEmpty;
+  final String backendHost = hasCustom ? host : ApiService.defaultBackendHost();
+  final String backendPort = hasCustom ? port : '8000';
+  // HTTP 与 WebSocket 使用同一后端地址，避免自定义后 WS 仍连 localhost
+  ApiService.baseUrl = 'http://$backendHost:$backendPort';
+  WebSocketService.baseUrl = 'ws://$backendHost:$backendPort';
 
   // 读取本地登录状态以决定初始路由
   final authService = AuthService();

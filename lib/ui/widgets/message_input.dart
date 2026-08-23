@@ -1,5 +1,8 @@
+import 'dart:io' show Platform;
+
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -106,14 +109,30 @@ class _MessageInputState extends State<MessageInput> {
     return idx >= 0 ? replaced.substring(idx + 1) : replaced;
   }
 
+  /// 是否桌面端（拖拽上传仅桌面支持，移动端跳过 DropTarget 避免崩溃）
+  bool get _isDesktop =>
+      !kIsWeb &&
+      (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
+
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final Widget body = _buildInputBody(cs);
+    // desktop_drop 的 DropTarget 仅支持桌面端（Windows/Linux/macOS）；
+    // 移动端（Android/iOS）无拖拽能力，直接渲染输入区，
+    // 避免注册不存在的平台通道导致 MissingPluginException 崩溃。
+    if (!_isDesktop) return body;
     return DropTarget(
       onDragDone: _onDragDone,
       onDragEntered: (_) => setState(() => _isDragging = true),
       onDragExited: (_) => setState(() => _isDragging = false),
-      child: Container(
+      child: body,
+    );
+  }
+
+  /// 输入区主体（桌面端由 DropTarget 包裹支持文件拖拽）
+  Widget _buildInputBody(ColorScheme cs) {
+    return Container(
         padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
           color: cs.surface,
@@ -222,7 +241,6 @@ class _MessageInputState extends State<MessageInput> {
             ),
           ],
         ),
-      ),
     );
   }
 

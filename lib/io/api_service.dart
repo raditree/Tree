@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show Platform;
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
 
 import '../ui/models/agent.dart';
@@ -17,6 +19,16 @@ import 'auth_service.dart';
 class ApiService {
   /// 后端服务地址
   static String baseUrl = 'http://localhost:8000';
+
+  /// 平台默认后端主机名
+  ///
+  /// - Android 模拟器通过 ``10.0.2.2`` 访问宿主机（localhost 指模拟器自身）
+  /// - 其余平台（Windows / Linux / macOS / Web）默认 ``localhost``
+  /// 用户在后端配置页自定义 IP+端口后不再使用此默认值。
+  static String defaultBackendHost() {
+    if (!kIsWeb && Platform.isAndroid) return '10.0.2.2';
+    return 'localhost';
+  }
 
   /// 当前 JWT token（登录后设置，用于鉴权请求）
   static String? _token;
@@ -822,6 +834,26 @@ class ApiService {
     await _postJson('/api/settings/data-collection', body: {
       'enabled': enabled,
     });
+  }
+
+  /// 设置主动延迟开关
+  ///
+  /// 开启后限制单个 agent 的 LLM API 调用频率（平均 6 次/分钟），
+  /// 适合交互式开发。调用 `POST /api/settings/rate-limit`，请求体
+  /// 为 `{"enabled": true/false}`。
+  static Future<void> setRateLimit(bool enabled) async {
+    await _postJson('/api/settings/rate-limit', body: {
+      'enabled': enabled,
+    });
+  }
+
+  /// 查询主动延迟开关状态
+  ///
+  /// 调用 `GET /api/settings/rate-limit`，返回 `{"enabled": bool, ...}`。
+  /// 查询失败时抛出中文异常（由调用方决定是否忽略）。
+  static Future<bool> getRateLimit() async {
+    final Map<String, dynamic> data = await _getJson('/api/settings/rate-limit');
+    return (data['enabled'] as bool?) ?? false;
   }
 
   /// 登出：撤销当前 token（后端侧）
