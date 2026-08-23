@@ -20,6 +20,7 @@ from agent.chat import (
     _active_tasks,
     _cancel_active_task,
     _dispatch_user_message,
+    _stop_agent_tree,
 )
 from data.session_cache import clear_user_agent
 from tool.ask_question_tool import get_ask_tool
@@ -135,27 +136,43 @@ def register_ws(app: FastAPI) -> None:
                     # dispatch 内部可能经反向 WS 读 roster（阻塞），await 保证其在线程池执行
                     await _dispatch_user_message(user_id, data)
                 elif msg_type == "stop":
-                    # 停止按钮：请求取消指定 agent/会话的进行中任务
+                    # 停止按钮：级联停止 TOP agent + 其下全部成员（或单成员）。
+                    # 取消事件置位 + 清空 broker 排队消息 + 复位持久化
+                    # work_status + 推送 idle，使 UI 立即停止、不复活。
                     agent_id = data.get("agent_id", "")
                     session_id = data.get("session_id")
-                    if agent_id and _cancel_active_task(user_id, agent_id, session_id):
-                        await state.ws_manager.send_message(
-                            user_id,
-                            {
-                                "type": "agent_status",
-                                "data": {
-                                    "agent_id": agent_id,
-                                    "status": "stopping",
-                                    "session_id": session_id,
-                                },
-                            },
+                    if agent_id:
+                        result = await _stop_agent_tree(
+                            user_id, agent_id, session_id
                         )
+                        if result.get("stopped"):
+                            await state.ws_manager.send_message(
+                                user_id,
+                                {
+                                    "type": "agent_status",
+                                    "data": {
+                                        "agent_id": agent_id,
+                                        "status": "stopping",
+                                        "session_id": session_id,
+                                    },
+                                },
+                            )
+                        else:
+                            await state.ws_manager.send_message(
+                                user_id,
+                                {
+                                    "type": "error",
+                                    "data": {
+                                        "message": "没有进行中的任务可停止",
+                                    },
+                                },
+                            )
                     else:
                         await state.ws_manager.send_message(
                             user_id,
                             {
                                 "type": "error",
-                                "data": {"message": "没有进行中的任务可停止"},
+                                "data": {"message": "缺少 agent_id"},
                             },
                         )
                 elif msg_type == "user_answer":

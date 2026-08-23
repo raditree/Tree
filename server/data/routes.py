@@ -18,6 +18,10 @@ from data.data_collection_store import (
     read_sft_file,
     set_collection_enabled,
 )
+from data.rate_limit_store import (
+    is_rate_limit_enabled,
+    set_rate_limit_enabled,
+)
 from data.embed_model import (
     get_embedding,
     get_embeddings_batch,
@@ -449,6 +453,47 @@ async def set_data_collection(
     """
     openid = current_user.get("openid", "")
     set_collection_enabled(openid, req.enabled)
+    return {"enabled": req.enabled, "openid": openid}
+
+
+# ===== 主动延迟（API 调用频率限制） =====
+
+
+class RateLimitRequest(BaseModel):
+    """主动延迟开关请求体。"""
+
+    enabled: bool
+
+
+@router.get("/settings/rate-limit")
+async def get_rate_limit(
+    current_user: dict = Depends(get_current_user),
+):
+    """查询当前用户是否开启主动延迟（限制单个 agent 的 API 调用频率）。"""
+    openid = current_user.get("openid", "")
+    return {
+        "enabled": is_rate_limit_enabled(openid),
+        "openid": openid,
+    }
+
+
+@router.post("/settings/rate-limit")
+async def set_rate_limit(
+    req: RateLimitRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """设置当前用户的主动延迟开关。
+
+    开启后限制单个 agent 的 LLM API 调用频率（平均 6 次/分钟），
+    适合交互式开发。持久化到 ``rate_limit_prefs`` 表，并同步更新
+    ``llm.rate_limit`` 内存缓存（立即对后续 API 调用生效）。
+    """
+    openid = current_user.get("openid", "")
+    set_rate_limit_enabled(openid, req.enabled)
+    # 同步内存缓存：限流器按 (user_id, agent_id) 从缓存判定开关
+    from llm.rate_limit import set_user_enabled
+
+    set_user_enabled(openid, req.enabled)
     return {"enabled": req.enabled, "openid": openid}
 
 

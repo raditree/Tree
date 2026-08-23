@@ -181,6 +181,8 @@ class AgentLLMSession:
         workspace_id: str,
         system_prompt: str = "",
         cancel_event: Optional[threading.Event] = None,
+        user_id: str = "",
+        agent_id: str = "",
     ) -> None:
         """初始化 LLM 会话。
 
@@ -191,11 +193,16 @@ class AgentLLMSession:
                              置位后 ``_run_completion_loop`` 在每轮循环开始、
                              流式接收间隙与每次 tool_call 执行前退出，
                              使停止能快速中止 tool loop（不再启动新的工具调用）。
+        :param user_id: 用户标识（主动延迟限流按用户开关判定）
+        :param agent_id: agent 标识（主动延迟限流按 (user_id, agent_id) 粒度）
         """
         self.model_config = model_config
         self.workspace_id = workspace_id
         self.system_prompt = system_prompt
         self.cancel_event = cancel_event
+        # 主动延迟限流归属：REST 设置接口按 openid 开关，限流器按 (user, agent)
+        self.user_id = user_id or ""
+        self.agent_id = agent_id or ""
 
         # 上下文列表：普通 LLM 初始化时注入系统提示词
         self.context: List[Dict[str, Any]] = []
@@ -422,14 +429,27 @@ class AgentLLMSession:
         logger.warning("无法解析 tool_call 参数，返回空参数: %.200r", raw)
         return {}
 
-    def _create_completion(self, client: OpenAI, api_kwargs: Dict[str, Any]) -> Any:
+    def _create_completion(
+        self,
+        client: OpenAI,
+        api_kwargs: Dict[str, Any],
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Any:
         """调用 ``chat.completions.create``，触发 429 限流时指数退避重试。
 
         上游限流（如每分钟请求数上限）通常是短暂峰值，等待片刻后即可恢复；
         在最终抛错前给最多 5 次重试（间隔 5s → 60s，带随机抖动）。
+
+        :param cancel_event: 取消事件（「停止」按钮置位）。重试等待期间
+                             检查取消：已停止时不等待直接返回 None，避免
+                             限流重试拖慢停止响应。
+        :return: 流式响应；被取消时返回 None
         """
         max_attempts = 6  # 初始 1 次 + 重试 5 次
         for attempt in range(max_attempts):
+            # 重试间隙/等待前检查取消：已停止不再发起新的 API 调用
+            if self._is_cancelled(cancel_event):
+                return None
             try:
                 return client.chat.completions.create(**api_kwargs)
             except RateLimitError as exc:
@@ -444,7 +464,12 @@ class AgentLLMSession:
                     max_attempts - 1,
                     exc,
                 )
-                time.sleep(delay)
+                # 等待期间分片检查取消：已停止则放弃重试（停止优先于限流等待）
+                deadline = time.time() + delay
+                while time.time() < deadline:
+                    if self._is_cancelled(cancel_event):
+                        return None
+                    time.sleep(min(0.2, deadline - time.time()))
 
     def _tool_context_content(self, result: Any, result_str: str) -> Any:
         """构造写入上下文的工具结果 content。
@@ -498,6 +523,22 @@ class AgentLLMSession:
         evt = cancel_event if cancel_event is not None else self.cancel_event
         return evt is not None and evt.is_set()
 
+    def _acquire_rate_limit(
+        self, cancel_event: Optional[threading.Event] = None
+    ) -> bool:
+        """主动延迟：开启时限制单个 agent 的 API 调用频率（平均 6 次/分钟）。
+
+        - 用户未开启 / 会话未绑定 user_id/agent_id 时直接放行。
+        - 等待令牌期间可响应 ``cancel_event``（「停止」按钮），收到取消
+          立即返回 False，调用方中止本轮 API 调用（不拖慢停止）。
+        :return: False 表示应中止本轮 API 调用
+        """
+        if not self.user_id or not self.agent_id:
+            return True
+        from llm.rate_limit import acquire
+
+        return acquire(self.user_id, self.agent_id, cancel_event)
+
     def _run_completion_loop(
         self,
         client: OpenAI,
@@ -525,8 +566,16 @@ class AgentLLMSession:
             # 避免任务结束前上下文就已超过 max_seqlen（约定阈值）
             self._compress_context()
 
+            # 主动延迟：开启时限制该 agent 的 API 调用频率（平均 6 次/分钟）。
+            # 等待令牌期间若收到「停止」事件则中止本轮（与停止级联配合）。
+            if not self._acquire_rate_limit(cancel_event):
+                return
+
             api_kwargs = self._build_api_kwargs()
-            stream = self._create_completion(client, api_kwargs)
+            stream = self._create_completion(client, api_kwargs, cancel_event)
+            if stream is None:
+                # 已停止：_create_completion 在发起前或重试等待期间检测到取消
+                return
 
             content_parts: List[str] = []
             tool_calls: List[Dict[str, str]] = []
@@ -965,6 +1014,9 @@ class AgentLLMSession:
         )
 
         try:
+            # 主动延迟：压缩总结也属于该 agent 的 API 调用，同样限速
+            # （无取消事件：压缩时机不阻塞停止，停止检查点在主循环/流式间隙）
+            self._acquire_rate_limit()
             client = LLMClientFactory.create_client(self.model_config)
             resp = client.chat.completions.create(
                 model=self.model_config.api_model_id or self.model_config.model_id,

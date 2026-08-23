@@ -159,6 +159,8 @@ async def compact_agent_context(
             model_config=model_config,
             workspace_id=(agent or {}).get("workspace_id", "") or agent_id,
             system_prompt="",
+            user_id=user_id,
+            agent_id=agent_id,
         )
         session.context = restored
         restored_from_db = True

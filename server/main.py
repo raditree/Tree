@@ -49,6 +49,13 @@ async def lifespan(app: FastAPI):
     config = get_config()
     state.model_configs = get_model_configs()
 
+    # 预载「主动延迟」开关到内存：限流器按 (user_id, agent_id) 从内存缓存判定，
+    # 避免每次 API 调用查 SQLite（REST 设置接口写库后同步更新缓存）
+    from data.rate_limit_store import load_all_rate_limit_prefs
+    from llm.rate_limit import load_enabled_users
+
+    load_enabled_users(load_all_rate_limit_prefs())
+
     # 本地执行器客户端：本地模式下工具调用经反向 WS 转发给前端本地执行
     local_executor = LocalExecutorClient()
     # 绑定主事件循环，供后台线程通过 run_coroutine_threadsafe 安全推送 WS 消息

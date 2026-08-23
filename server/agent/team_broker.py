@@ -66,6 +66,35 @@ class TeamMessageBroker:
             future.add_done_callback(self._on_worker_done)
         return True
 
+    def cancel_agent(self, user_id: str, agent_id: str) -> int:
+        """停止指定 agent 的 worker：取消在途任务并清空其消息队列。
+
+        用于「停止」按钮级联（TOP agent + 其下全部成员）。仅置位取消事件
+        不足以让成员停下来：worker 处理完当前消息后会继续消费队列里残留的
+        消息，把已停止的成员又拉起来工作。此处：
+
+        1. 清空该 agent 的消息队列（排队的消息全部丢弃，不再被处理）；
+        2. 取消其 worker future（若在途），使 ``_run`` 收到 CancelledError
+           退出；正在执行的消息处理协程的 ``finally`` 会照常复位状态、
+           推送 idle（取消事件驱动其 chat 线程在下一个检查点退出，不会硬杀）。
+
+        注意：若该 agent 当前正阻塞在同步工具调用（如长 terminal 命令）中，
+        取消无法强行中断该工具线程，工具返回后 chat 线程在检查点退出。
+
+        :return: 被清空的排队消息数
+        """
+        key = (user_id, agent_id)
+        cleared = 0
+        queue = self._queues.get(key)
+        if queue is not None:
+            with queue.mutex:
+                cleared = len(queue.queue)
+                queue.queue.clear()
+        worker = self._workers.get(key)
+        if worker is not None and not worker.done():
+            worker.cancel()
+        return cleared
+
     def _on_worker_done(self, future: Any) -> None:
         """worker 结束回调：记录未捕获的异常（不抛出到调度线程）。"""
         try:

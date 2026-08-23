@@ -522,6 +522,8 @@ def _build_member_topology_text(
     lines.append("- 跨团队顶层沟通：先 list_teams 熟悉本用户名下 TOP，向其他 TOP agent "
                 "按 TOP 名称寻址，经 team 投递。")
     lines.append("- 回复路径：成员→上级（TOP）；TOP→用户。成员不直接面向用户。")
+    lines.append("- 使用 team 工具前先检查成员基本信息（role/duty/model_id），"
+                "若为空先用 update_member 补充完善再派发任务。")
     return "\n".join(lines)
 
 
@@ -940,6 +942,161 @@ def _is_agent_working(user_id: str, agent_id: str) -> bool:
     )
 
 
+def _cancel_all_agent_tasks(
+    user_id: str, agent_id: str
+) -> List[Tuple[str, str, str]]:
+    """取消指定 agent 的全部进行中任务（所有会话），返回已取消的键列表。
+
+    与 ``_cancel_active_task``（单会话）不同，停止级联需要把 TOP agent 与
+    其下全部成员**所有会话**的进行中任务一次性取消，避免只停当前窗口会话
+    而其他会话的任务仍在跑。
+    """
+    cancelled: List[Tuple[str, str, str]] = []
+    for (uid, aid, sid), event in list(_active_tasks.items()):
+        if uid == user_id and aid == agent_id:
+            event.set()
+            cancelled.append((uid, aid, sid))
+    return cancelled
+
+
+def _reset_member_status_to_idle(
+    user_id: str, top_id: str, member_id: str
+) -> None:
+    """将成员持久化工作状态复位为 idle（team_members 表 + leader 会话内存态）。
+
+    停止级联中，成员可能正处于 working 且其 tool loop 的 finally 尚未运行
+    （或永远不会再运行——队列被清空、worker 被取消），此处直接三方复位：
+    - ``team_members`` 表（权威名单）：teammates API/UI 立即显示 idle
+    - leader 会话上挂载的 team_tool 内存态 + roster 文件（mark_member_idle）
+    """
+    if not user_id or not top_id or not member_id:
+        return
+    # 1) team_members 表
+    try:
+        from data.team_store import update_member
+
+        update_member(top_id, member_id, work_status="idle", current_task="")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("停止级联复位成员状态失败(表): %s %s", member_id, exc)
+    # 2) leader 会话 team_tool 内存态 + roster 文件
+    try:
+        leader_session = get_session(user_id, top_id, DEFAULT_SESSION)
+        team_tool = getattr(leader_session, "team_tool", None)
+        if team_tool is not None:
+            team_tool.mark_member_idle(member_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("停止级联复位成员状态失败(内存): %s %s", member_id, exc)
+
+
+async def _stop_agent_tree(
+    user_id: str,
+    agent_id: str,
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """停止按钮级联：停止指定 agent（TOP 或成员）及其全部相关任务。
+
+    若 ``agent_id`` 为 TOP agent（agent_store 可查）：
+    - 取消 TOP 自身全部进行中任务（所有会话，不止当前会话）
+    - 查出其全部成员（``team_members`` 表），逐一取消成员全部进行中任务
+    - 清空 ``top_chat_broker`` 中该 TOP 的排队用户消息、``team_broker`` 中
+      各成员的排队消息（防止队列里残留的消息在停止后把成员又拉起来工作）
+    - 复位成员持久化 ``work_status`` 为 idle（team_members 表 + leader 会话）
+    - 向前端推送 TOP 与全部成员的 ``agent_status=idle``，UI 立即停止标识
+
+    若 ``agent_id`` 为成员（不在 agent_store）：
+    - 仅取消该成员任务、清空其 broker 队列、复位 idle
+
+    关于「立即中止」的边界（如实说明）：
+    - API 调用：取消事件在流式分块间隙、下一轮调用发起前、429 重试等待期、
+      限流等待期均被检查，因此**不会再发起新的 API 调用**；正在进行的流式
+      响应在下一个 chunk 到达即中止。
+    - 工具调用：每次 tool_call 执行前检查取消，**不再启动新工具**；但正在
+      阻塞执行的同步工具（如长 terminal 命令）无法从外部强杀 Python 线程，
+      需等其返回后循环在检查点退出（属正常边界，已写入活动日志提示）。
+
+    :return: ``{"stopped": bool, "cancelled": [...], "members": [...]}``
+    """
+    cancelled: List[Tuple[str, str, str]] = []
+    member_ids: List[str] = []
+
+    # 判断是否为 TOP agent（agent_store 可查即 TOP）
+    from data.agent_store import get_agent
+
+    is_top = get_agent(user_id, agent_id) is not None
+
+    # 1) 取消 agent 自身全部任务
+    cancelled += _cancel_all_agent_tasks(user_id, agent_id)
+
+    if is_top:
+        # 2) 查出成员并取消其全部任务
+        try:
+            from data.team_store import get_members
+
+            members = get_members(agent_id) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("停止级联读取成员失败: %s", exc)
+            members = []
+        member_ids = [m.get("id", "") for m in members if m.get("id")]
+        for mid in member_ids:
+            cancelled += _cancel_all_agent_tasks(user_id, mid)
+
+        # 3) 清空排队消息：TOP 的用户消息 + 各成员的 leader 消息
+        try:
+            if state.top_chat_broker is not None:
+                state.top_chat_broker.cancel_agent(user_id, agent_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("停止级联清空 TOP 队列失败: %s", exc)
+        if state.team_broker is not None:
+            for mid in member_ids:
+                try:
+                    state.team_broker.cancel_agent(user_id, mid)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("停止级联清空成员队列失败 %s: %s", mid, exc)
+
+        # 4) 复位成员持久化状态为 idle
+        for mid in member_ids:
+            _reset_member_status_to_idle(user_id, agent_id, mid)
+
+        # 5) 推送 idle：TOP + 全部成员
+        for mid in [agent_id] + member_ids:
+            await state.ws_manager.send_message(
+                user_id,
+                {
+                    "type": "agent_status",
+                    "data": {
+                        "agent_id": mid,
+                        "status": "idle",
+                        "session_id": session_id,
+                    },
+                },
+            )
+    else:
+        # 成员：清空其 broker 队列 + 复位 idle
+        if state.team_broker is not None:
+            try:
+                state.team_broker.cancel_agent(user_id, agent_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("停止级联清空成员队列失败 %s: %s", agent_id, exc)
+        _reset_member_status_to_idle(user_id, agent_id, agent_id)
+        await state.ws_manager.send_message(
+            user_id,
+            {
+                "type": "agent_status",
+                "data": {
+                    "agent_id": agent_id,
+                    "status": "idle",
+                    "session_id": session_id,
+                },
+            },
+        )
+
+    return {
+        "stopped": bool(cancelled) or bool(member_ids),
+        "cancelled": cancelled,
+        "members": member_ids,
+    }
+
+
 def _clock_now() -> str:
     """返回 HH:MM:SS 时间戳，用于活动日志。"""
     return time.strftime("%H:%M:%S")
@@ -1330,6 +1487,8 @@ async def _process_member_message(
             model_config=model_config,
             workspace_id=workspace_id,
             system_prompt=enhanced_prompt,
+            user_id=user_id,
+            agent_id=agent_id,
         )
         session.workspace_extra_info = extra_info
         set_session(user_id, agent_id, session, session_id)
@@ -1744,6 +1903,8 @@ async def _handle_user_message(
                 model_config=model_config,
                 workspace_id=workspace_id,
                 system_prompt=enhanced_prompt,
+                user_id=user_id,
+                agent_id=agent_id,
             )
             session.workspace_extra_info = extra_info
             set_session(user_id, agent_id, session, session_id)

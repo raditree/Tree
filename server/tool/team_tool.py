@@ -151,7 +151,13 @@ class TeamTool:
                     "前置依赖: 成员已预建（TOP 创建时全量建队），按 name 或 member id 寻址；"
                     "分工前先 list_members 确认拓扑；成员职责未设时先 update_member 设置\n"
                     "注意: 成员不可动态创建/删除（P4 预建）；仅可 update_member 调整。"
-                    "修改成员信息会触发名单推送"
+                    "修改成员信息会触发名单推送\n"
+                    "**使用前必查成员基本信息**：先 list_members / query_member 检查"
+                    "成员的 role（角色）、duty（职责）、model_id（模型）等字段是否为空；"
+                    "若为空或缺失，请先用 update_member 补充完善（role/duty/model_id）"
+                    "再派发任务，避免成员职责不明、模型缺失导致任务执行偏差。\n"
+                    "update_member 必须携带 target_member_id（或 member_name）指定目标成员，"
+                    "先从 list_members 获取成员 id/name，禁止省略"
                 ),
                 "parameters": {
                     "type": "object",
@@ -173,7 +179,12 @@ class TeamTool:
                                 "query_tasks",
                                 "wait_for",
                             ],
-                            "description": "操作类型",
+                            "description": "操作类型。按成员寻址的操作必须同时提供 "
+                                         "target_member_id（或其等价别名 member_name），"
+                                         "否则会因缺少 target_member_id 而失败："
+                                         "update_member / query_member / query_status / "
+                                         "view_member_output / view_member_log / "
+                                         "send_message / assign_task",
                         },
                         "model_id": {
                             "type": "string",
@@ -181,11 +192,14 @@ class TeamTool:
                         },
                         "member_name": {
                             "type": "string",
-                            "description": "成员名称（按 name 寻址时使用，等同于 target_member_id 的别名）",
+                            "description": "成员名称（按 name 寻址时使用，是 target_member_id 的别名；"
+                                           "update_member 等按成员寻址的操作二者必填其一）",
                         },
                         "target_member_id": {
                             "type": "string",
-                            "description": "目标成员 ID 或名称（按 name 基于拓扑寻址）",
+                            "description": "目标成员 ID 或名称（按 name 基于拓扑寻址）。"
+                                           "update_member 等按成员寻址的操作必填："
+                                           "调用前先从 list_members 获取确切 id/name，切勿省略",
                         },
                         "name": {
                             "type": "string",
@@ -980,6 +994,23 @@ class TeamTool:
                         "relation": "team_member",
                     })
 
+        # 基本信息完整性提示：role/duty/model_id 为空时提醒先 update_member 补充，
+        # 避免成员职责不明/模型缺失导致后续派发任务执行偏差（spec「基本信息先查」）
+        missing = [
+            (m.get("name") or m.get("id"))
+            for m in result
+            if not (m.get("role") and m.get("duty") and m.get("model_id"))
+        ]
+        hint = ""
+        if missing:
+            hint = (
+                "以下成员基本信息不完整（role/duty/model_id 为空），"
+                "请先用 update_member 补充完善后再派发任务: "
+                + "、".join(missing[:5])
+            )
+            if len(missing) > 5:
+                hint += f" 等 {len(missing)} 名"
+
         return {
             "groups": {
                 "team_leader": team_leader,
@@ -988,6 +1019,7 @@ class TeamTool:
             },
             "members": result,
             "total": len(team_leader) + len(result) + len(team_member),
+            "hint": hint,
         }
 
     def _action_query_member(self, arguments: dict) -> dict:
