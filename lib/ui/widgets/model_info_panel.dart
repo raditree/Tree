@@ -69,8 +69,11 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
           await ApiService.getAgentModelsInfo(widget.agentId);
       final List<dynamic> rawModels =
           data['models'] as List<dynamic>? ?? <dynamic>[];
+      // 后端返回结构为 {"agent": {id, model_id, system_prompt}, "models": [...]}
+      // （注意：后端字段名为 agent，前端此前误读 current 导致永远取不到当前模型，
+      //  模型下拉始终回退到模型池第一个 —— 已修正为 agent）
       final Map<String, dynamic>? current =
-          (data['current'] as Map<String, dynamic>?)?.cast<String, dynamic>();
+          (data['agent'] as Map<String, dynamic>?)?.cast<String, dynamic>();
       if (!mounted) return;
       setState(() {
         _models = rawModels
@@ -78,8 +81,13 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
                 Map<String, dynamic>.from(e as Map<dynamic, dynamic>))
             .toList();
         _current = current;
-        _selectedModelId = (current?['model_id'] as String?) ??
-            (_models.isNotEmpty
+        // 当前 agent 绑定的模型优先；无则回退模型池第一个
+        final String? boundModelId = current?['model_id'] as String?;
+        final bool boundInPool = boundModelId != null &&
+            _models.any((m) => (m['model_id'] as String? ?? '') == boundModelId);
+        _selectedModelId = boundInPool
+            ? boundModelId
+            : (_models.isNotEmpty
                 ? (_models.first['model_id'] as String?)
                 : null);
         // models-info 返回的 system_prompt 优先于初始值

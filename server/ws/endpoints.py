@@ -117,10 +117,12 @@ def register_ws(app: FastAPI) -> None:
                 if not isinstance(data, dict):
                     data = {}
                 # 兼容两种字段位置：优先 data 子对象，回退到顶层字段
+                # 注意必须保留 session_id：前端 user_message 将字段放在顶层，
+                # 若丢弃 session_id 会回退到默认会话，造成跨会话串扰。
                 if not data:
                     data = {
                         k: message.get(k)
-                        for k in ("agent_id", "content", "attachments")
+                        for k in ("agent_id", "content", "attachments", "session_id")
                         if message.get(k) is not None
                     }
 

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../io/api_service.dart';
 
@@ -12,6 +13,9 @@ import '../../io/api_service.dart';
 /// - `model_id`: 所选具体模型的 model_id
 /// - `model_name`: 所选模型显示名（用于回显）
 /// - `system_prompt`: 系统提示词
+///
+/// 模型选择会记忆到本地（SharedPreferences 键 `last_selected_model_id`），
+/// 下次打开对话框默认选中上次使用的模型，不再每次都回退到模型池第一个。
 class CreateAgentDialog extends StatefulWidget {
   const CreateAgentDialog({super.key});
 
@@ -35,6 +39,12 @@ class _CreateAgentDialogState extends State<CreateAgentDialog> {
   /// 当前选中的模型 id（默认第一个）
   String? _selectedModelId;
 
+  /// 本地记忆的上次选择模型 id（加载模型池后用于恢复选中）
+  String? _lastSelectedModelId;
+
+  /// SharedPreferences 记忆键
+  static const String _lastModelKey = 'last_selected_model_id';
+
   @override
   void initState() {
     super.initState();
@@ -48,15 +58,28 @@ class _CreateAgentDialogState extends State<CreateAgentDialog> {
     super.dispose();
   }
 
-  /// 从后端加载模型池
+  /// 从后端加载模型池，并尝试恢复上次选择的模型
   Future<void> _loadModels() async {
     try {
+      // 先读本地记忆（不阻塞模型池加载）
+      try {
+        final SharedPreferences prefs = await SharedPreferences.getInstance();
+        _lastSelectedModelId = prefs.getString(_lastModelKey);
+      } catch (_) {
+        _lastSelectedModelId = null;
+      }
       final List<Map<String, dynamic>> models = await ApiService.getModels();
       if (!mounted) return;
       setState(() {
         _models = models;
         _loading = false;
-        _selectedModelId = models.isNotEmpty ? models.first['model_id'] as String : null;
+        // 恢复上次选择：记忆模型仍在池中则选中它，否则回退第一个
+        final bool remembered = _lastSelectedModelId != null &&
+            models.any((m) =>
+                (m['model_id'] as String? ?? '') == _lastSelectedModelId);
+        _selectedModelId = remembered
+            ? _lastSelectedModelId
+            : (models.isNotEmpty ? models.first['model_id'] as String : null);
       });
     } catch (e) {
       if (!mounted) return;
@@ -64,6 +87,16 @@ class _CreateAgentDialogState extends State<CreateAgentDialog> {
         _loading = false;
         _loadError = '$e';
       });
+    }
+  }
+
+  /// 记忆本次选择的模型（下次打开对话框默认选中）
+  Future<void> _rememberModel(String modelId) async {
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_lastModelKey, modelId);
+    } catch (_) {
+      // 记忆失败不影响创建流程
     }
   }
 
@@ -89,6 +122,8 @@ class _CreateAgentDialogState extends State<CreateAgentDialog> {
         break;
       }
     }
+    // 记忆本次选择，下次打开默认选中
+    _rememberModel(_selectedModelId!);
     Navigator.of(context).pop({
       'name': name,
       'model_id': _selectedModelId,

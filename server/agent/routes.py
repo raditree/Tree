@@ -30,11 +30,14 @@ from data.conversation_store import (
     clear_history,
     count_messages_by_session,
     get_history,
+    load_context,
+    save_context,
 )
 from data.session_cache import clear_user_agent, get_session
 from data.team_init import init_team_for_top
 from data.team_store import delete_team
 from io_.workspace_io import run_io
+from llm.llm import AgentLLMSession
 from data.session_store import (
     DEFAULT_SESSION,
     create_session,
@@ -126,20 +129,45 @@ async def compact_agent_context(
     从会话缓存中取出该 agent 指定会话并强制压缩：
     - 中间消息总结为一条 summary，保留最近 N 条。
     - 无限上下文 LLM 无操作（返回 compressed=False）。
+
+    缓存未命中（如后端重启后内存会话已清空）时，尝试从数据库
+    ``agent_context`` 表恢复持久化上下文再压缩，避免误报
+    "该 agent 当前没有活跃的会话上下文"。
     """
     user_id = current_user.get("openid", "")
     session_id = (body or {}).get("session_id") or DEFAULT_SESSION
     session = get_session(user_id, agent_id, session_id)
+    restored_from_db = False
     if session is None:
-        return {
-            "success": True,
-            "compressed": False,
-            "reason": "no_active_session",
-            "message": "该 agent 当前没有活跃的会话上下文",
-        }
+        # 内存缓存未命中：尝试从 DB 恢复持久化上下文
+        restored = load_context(user_id, agent_id, session_id)
+        if not restored:
+            return {
+                "success": True,
+                "compressed": False,
+                "reason": "no_active_session",
+                "message": "该 agent 当前没有活跃的会话上下文",
+            }
+        # 用 agent 绑定的模型构建会话（与发消息路径一致），
+        # 仅加载持久化上下文用于压缩，不重复注入 system prompt。
+        agent = get_agent(user_id, agent_id)
+        model_id = agent.get("model_id") if agent else None
+        model_config = state.model_configs.get(model_id)
+        if model_config is None:
+            model_config = next(iter(state.model_configs.values()))
+        session = AgentLLMSession(
+            model_config=model_config,
+            workspace_id=(agent or {}).get("workspace_id", "") or agent_id,
+            system_prompt="",
+        )
+        session.context = restored
+        restored_from_db = True
     # compress 内会在重构 context 后重建 system prompt（读 .self 文件）；
     # 本地模式反向 WS 阻塞读，须放入线程池避免死锁事件循环
     compressed = await asyncio.to_thread(session.compress, force=True)
+    if restored_from_db:
+        # 压缩结果写回 DB，保证重启后上下文仍是压缩后的最新状态
+        save_context(user_id, agent_id, session.context, session_id)
     return {
         "success": True,
         "compressed": compressed,
