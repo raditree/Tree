@@ -21,12 +21,19 @@ from typing import Dict, Optional, Tuple
 # 日志器
 import logging
 
+from config.config import get_config
+
 logger = logging.getLogger(__name__)
 
-# 限流目标：平均 6 次 API 调用 / 分钟
-RATE_PER_MINUTE = 6.0
-# 最小调用间隔（秒）：60s / 6 = 10s
-MIN_INTERVAL = 60.0 / RATE_PER_MINUTE
+# 主动延迟限流节奏：由 app.yaml (llm.rate_per_minute / llm.min_interval_seconds)
+# 驱动。min_interval_seconds 为 0 时按 60/rate_per_minute 自动推导。
+_RATE_CFG = (get_config() or {}).get("llm", {}) or {}
+RATE_PER_MINUTE = float(
+    _RATE_CFG.get("rate_per_minute", 6.0) or 6.0
+)
+_cfg_interval = float(_RATE_CFG.get("min_interval_seconds", 0) or 0)
+# 最小调用间隔（秒）：优先取配置，否则按 60 / rate_per_minute 推导
+MIN_INTERVAL = _cfg_interval if _cfg_interval > 0 else 60.0 / RATE_PER_MINUTE
 
 # 用户开关内存缓存：user_id -> enabled
 _user_enabled: Dict[str, bool] = {}
@@ -36,7 +43,7 @@ _registry_lock = threading.Lock()
 
 
 class AgentRateLimiter:
-    """单个 agent 的令牌桶限流器（平均 6 次/分钟，最小间隔 10s）。
+    """单个 agent 的令牌桶限流器（节奏由 app.yaml 的 llm.rate_per_minute 决定）。
 
     线程安全：``acquire`` 全程持有锁，串行化同一 agent 的令牌消费。
     实际运行中同一 (user_id, agent_id) 的 LLM 调用由其 broker worker 串行
