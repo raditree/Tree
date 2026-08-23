@@ -21,6 +21,9 @@ class ChatSession {
   /// 选中的 Spec id 列表（P4-spec 使用）
   final List<String> selectedSpecIds;
 
+  /// 该会话的有效消息数（运行模式 agent 级锁定判定依据）
+  final int messageCount;
+
   ChatSession({
     required this.sessionId,
     required this.title,
@@ -28,6 +31,7 @@ class ChatSession {
     this.createdAt = 0,
     this.updatedAt = 0,
     this.selectedSpecIds = const [],
+    this.messageCount = 0,
   });
 
   /// 是否为默认会话
@@ -44,6 +48,7 @@ class ChatSession {
       updatedAt: json['updated_at'] as int? ?? 0,
       selectedSpecIds: rawSpecs?.map((dynamic e) => e.toString()).toList() ??
           const <String>[],
+      messageCount: json['message_count'] as int? ?? 0,
     );
   }
 }

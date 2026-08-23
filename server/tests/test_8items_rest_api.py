@@ -27,7 +27,9 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 import data.agent_store as agent_store  # noqa: E402
+import data.conversation_store as conv_store  # noqa: E402
 import data.mcp_service_store as mcp_store  # noqa: E402
+import data.session_store as session_store  # noqa: E402
 import data.team_store as team_store  # noqa: E402
 from agent.routes import router as agent_router  # noqa: E402
 from config.models import ModelConfig  # noqa: E402
@@ -37,7 +39,13 @@ USER = {"openid": "u-rest-test"}
 
 def _redirect_db(tmpdir: Path) -> None:
     """将各 data 模块 DB 路径指向临时目录并重置初始化标记。"""
-    for mod in (agent_store, mcp_store, team_store):
+    for mod in (
+        agent_store,
+        mcp_store,
+        team_store,
+        conv_store,
+        session_store,
+    ):
         mod._DB_PATH = tmpdir / "conversations.db"  # type: ignore[attr-defined]
         mod._initialized = False  # type: ignore[attr-defined]
 
@@ -45,7 +53,7 @@ def _redirect_db(tmpdir: Path) -> None:
 class RestApiBase(unittest.TestCase):
     """为每个测试创建独立临时 DB + 独立 TestClient（override 认证）。"""
 
-    _REDIRECT_MODS = (agent_store, mcp_store, team_store)
+    _REDIRECT_MODS = (agent_store, mcp_store, team_store, conv_store, session_store)
 
     def setUp(self):
         self._tmp = Path(tempfile.mkdtemp(prefix="trae_rest_"))
@@ -263,6 +271,60 @@ class TestUserMessageSessionChain(unittest.TestCase):
                 "u1", {"agent_id": "", "content": "x", "session_id": "sess-abc"}
             ))
         self.assertEqual(captured.get("session_id"), "sess-abc")
+
+
+class TestSessionMessageCount(RestApiBase):
+    """会话列表附带 message_count：运行模式 agent 级锁定的数据基础。
+
+    验证 GET /api/agents/{id}/sessions 返回每个会话的 message_count，
+    供前端判断「该 agent 是否已有任一历史会话」来锁定运行模式
+    （切换会话/新建空会话不解除锁定）。
+    """
+
+    def test_message_count_attached(self):
+        agent = agent_store.create_agent(USER["openid"], "测试", "flash")
+        session_store.create_session(
+            USER["openid"], agent["id"], title="会话A", session_id="sa"
+        )
+        session_store.create_session(
+            USER["openid"], agent["id"], title="会话B", session_id="sb"
+        )
+        # 会话 A 有 2 条消息，会话 B 为空
+        conv_store.store_message(
+            USER["openid"], agent["id"], "user", "hi", session_id="sa"
+        )
+        conv_store.store_message(
+            USER["openid"], agent["id"], "agent", "hello", session_id="sa"
+        )
+        r = self.client.get(f"/api/agents/{agent['id']}/sessions")
+        self.assertEqual(r.status_code, 200)
+        sessions = r.json()["sessions"]
+        by_id = {s["session_id"]: s["message_count"] for s in sessions}
+        self.assertEqual(by_id["sa"], 2)
+        self.assertEqual(by_id["sb"], 0)
+
+    def test_any_session_with_history_means_agent_started(self):
+        """仅会话 A 有历史即可认定该 agent 已开始过对话（供前端锁定模式）。"""
+        agent = agent_store.create_agent(USER["openid"], "测试", "flash")
+        session_store.create_session(
+            USER["openid"], agent["id"], title="会话A", session_id="sa"
+        )
+        session_store.create_session(
+            USER["openid"], agent["id"], title="会话B", session_id="sb"
+        )
+        conv_store.store_message(
+            USER["openid"], agent["id"], "user", "hi", session_id="sa"
+        )
+        r = self.client.get(f"/api/agents/{agent['id']}/sessions")
+        sessions = r.json()["sessions"]
+        self.assertTrue(any(s["message_count"] > 0 for s in sessions))
+        # 前端据此：agent 级锁定 = 任一会话 message_count > 0
+        self.assertTrue(
+            all(
+                (s["message_count"] > 0) == (s["session_id"] == "sa")
+                for s in sessions
+            )
+        )
 
 
 class TestTeamMemberSessionIsolation(unittest.TestCase):

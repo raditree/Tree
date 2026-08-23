@@ -314,6 +314,29 @@ def get_history(
         conn.close()
 
 
+def count_messages_by_session(
+    user_id: str, agent_id: str
+) -> Dict[str, int]:
+    """统计指定 agent 各会话的有效消息数（不含已软删除）。
+
+    返回 ``{session_id: count}``，供前端判断该 agent 是否已有任何
+    会话开始过对话（运行模式锁定依据）。
+    """
+    _ensure_db()
+    conn = _connect()
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT session_id, COUNT(*) AS cnt FROM messages "
+            "WHERE user_id = ? AND agent_id = ? AND deleted_at IS NULL "
+            "GROUP BY session_id",
+            (user_id, agent_id),
+        ).fetchall()
+        return {r["session_id"]: r["cnt"] for r in rows}
+    finally:
+        conn.close()
+
+
 def clear_history(
     user_id: str,
     agent_id: Optional[str] = None,

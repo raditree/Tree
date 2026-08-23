@@ -25,7 +25,12 @@ from data.agent_store import (
     get_agents,
     update_agent,
 )
-from data.conversation_store import clear_context, clear_history, get_history
+from data.conversation_store import (
+    clear_context,
+    clear_history,
+    count_messages_by_session,
+    get_history,
+)
 from data.session_cache import clear_user_agent, get_session
 from data.team_init import init_team_for_top
 from data.team_store import delete_team
@@ -154,9 +159,13 @@ async def list_agent_sessions(
     """列出指定 agent 的全部会话元数据（按最近更新倒序）。"""
     user_id = current_user.get("openid", "")
     sessions = list_sessions(user_id, agent_id)
+    # 各会话消息数：前端据其判断该 agent 是否已有任何会话开始过对话
+    # （运行模式按 agent 级锁定，不受切换会话影响）
+    counts = count_messages_by_session(user_id, agent_id)
     # 附带各会话的选中 Spec 与消息数/上下文占用，供前端会话列表展示
     for s in sessions:
         s["selected_spec_ids"] = get_selected_spec_ids(user_id, s["session_id"])
+        s["message_count"] = counts.get(s["session_id"], 0)
     return {"agent_id": agent_id, "sessions": sessions}
 
 

@@ -189,6 +189,9 @@ class _MessagePanelState extends State<MessagePanel> {
       if (!mounted) return;
       setState(() {
         _sessions = sessions;
+        // 运行模式按顶部 agent 级锁定：该 agent 任一历史会话有消息
+        // 即视为「已开始过对话」，切换会话不解除锁定
+        _modeLocked = sessions.any((s) => s.messageCount > 0);
         // 保持当前会话选择（若仍存在），否则回退到列表首个/默认会话
         final String prev = _currentSessionId;
         final bool keep = sessions.any((s) => s.sessionId == prev);
@@ -226,8 +229,10 @@ class _MessagePanelState extends State<MessagePanel> {
         for (final Map<String, dynamic> item in raw) {
           _messages.add(ChatMessage.fromJson(item));
         }
-        // 历史已存在说明该顶部 agent 的对话已开始，运行模式一并锁定
-        _modeLocked = _messages.isNotEmpty;
+        // 注意：不再按「当前会话历史是否为空」重置 _modeLocked——
+        // 运行模式是顶部 agent 级共享的，锁定状态由 _loadSessions
+        // 依据「该 agent 是否已有任一历史会话」统一决定，切换会话
+        // （含新建空会话）不得解除锁定。
         _scrollRevision++;
         // 从历史中恢复 token 用量：取最后一条带 usage 的 agent 消息，
         // 使重启后「上下文长度」统计不丢失（usage 随消息已持久化）
