@@ -1,10 +1,12 @@
-import 'dart:io' show Platform;
+import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 
 /// 消息输入框组件
 ///
@@ -26,6 +28,10 @@ class MessageInput extends StatefulWidget {
 }
 
 class _MessageInputState extends State<MessageInput> {
+  /// 剪贴板图片读取通道（Windows 原生实现于 flutter_window.cpp）
+  static const MethodChannel _clipboardChannel =
+      MethodChannel('tree/clipboard');
+
   final TextEditingController _controller = TextEditingController();
   final FocusNode _focusNode = FocusNode();
 
@@ -73,6 +79,16 @@ class _MessageInputState extends State<MessageInput> {
   /// Shift+Enter 时返回 [KeyEventResult.ignored]，交由 TextField 处理换行。
   KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    // Ctrl+V：拦截默认粘贴，优先处理"粘贴上传"（剪贴板图片 / 复制的文件路径），
+    // 普通文本则在手动插入（见 _handlePaste），避免被默认粘贴重复插入。
+    if (event.logicalKey == LogicalKeyboardKey.keyV &&
+        (RawKeyboard.instance.keysPressed
+                .contains(LogicalKeyboardKey.controlLeft) ||
+            RawKeyboard.instance.keysPressed
+                .contains(LogicalKeyboardKey.controlRight))) {
+      _handlePaste();
+      return KeyEventResult.handled;
+    }
     if (event.logicalKey != LogicalKeyboardKey.enter) {
       return KeyEventResult.ignored;
     }
@@ -100,6 +116,103 @@ class _MessageInputState extends State<MessageInput> {
     } catch (e) {
       // 忽略文件选择异常
     }
+  }
+
+  /// 处理粘贴上传（Ctrl+V）：
+  /// 1) 剪贴板图片 → 保存为临时文件并加入附件；
+  /// 2) 复制的文件路径文本（一个或多个）→ 加入附件；
+  /// 3) 普通文本 → 手动插入输入框当前光标处。
+  Future<void> _handlePaste() async {
+    // 1) 剪贴板图片
+    final String? imagePath = await _readClipboardImage();
+    if (imagePath != null) {
+      if (!mounted) return;
+      setState(() => _filePaths.add(imagePath));
+      return;
+    }
+    // 2) 剪贴板文本
+    ClipboardData? data;
+    String text;
+    try {
+      data = await Clipboard.getData(Clipboard.kTextPlain);
+      text = data?.text ?? '';
+    } catch (_) {
+      text = '';
+    }
+    if (text.trim().isEmpty) return;
+    final List<String> paths = _extractFilePaths(text);
+    if (paths.isNotEmpty) {
+      if (!mounted) return;
+      setState(() => _filePaths.addAll(paths));
+      return;
+    }
+    // 3) 普通文本：手动插入（已拦截默认粘贴，需自行插入）
+    if (!mounted) return;
+    _insertText(text);
+  }
+
+  /// 读取剪贴板图片并保存为临时文件，无图片时返回 null
+  Future<String?> _readClipboardImage() async {
+    try {
+      final Map<dynamic, dynamic>? result =
+          await _clipboardChannel.invokeMethod<Map<dynamic, dynamic>>(
+        'readImage',
+      );
+      if (result == null) return null;
+      final String format = (result['format'] as String? ?? 'png').toString();
+      final Uint8List? bytes = result['bytes'] as Uint8List?;
+      if (bytes == null || bytes.isEmpty) return null;
+      final Directory dir = await getTemporaryDirectory();
+      final String ext = format == 'bmp' ? 'bmp' : 'png';
+      final File file = File(
+        '${dir.path}${Platform.pathSeparator}'
+        'clipboard_paste_${DateTime.now().millisecondsSinceEpoch}.$ext',
+      );
+      await file.writeAsBytes(bytes, flush: true);
+      return file.path;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 从剪贴板文本识别文件路径。仅当所有非空行都是已存在的文件时才返回
+  /// 文件列表（视为复制文件场景）；否则返回空（按普通文本处理）。
+  List<String> _extractFilePaths(String text) {
+    final List<String> lines = text
+        .split(RegExp(r'[\r\n]+'))
+        .map((String line) {
+          String t = line.trim();
+          // 兼容 file:// 前缀（如浏览器复制的本地文件地址）
+          if (t.startsWith('file:///')) {
+            t = t.substring('file:///'.length);
+          } else if (t.startsWith('file://')) {
+            t = t.substring('file://'.length);
+          }
+          if (t.startsWith('"') && t.endsWith('"') && t.length >= 2) {
+            t = t.substring(1, t.length - 1);
+          }
+          return t;
+        })
+        .where((String l) => l.isNotEmpty)
+        .toList();
+    if (lines.isEmpty) return const [];
+    for (final String l in lines) {
+      if (!File(l).existsSync()) return const [];
+    }
+    return lines;
+  }
+
+  /// 在输入框当前选区处插入文本（替换选区）
+  void _insertText(String text) {
+    final TextEditingValue value = _controller.value;
+    final TextSelection sel = value.selection;
+    final int start = sel.isValid ? sel.start : value.text.length;
+    final int end = sel.isValid ? sel.end : value.text.length;
+    final String newText = value.text.replaceRange(start, end, text);
+    _controller.value = TextEditingValue(
+      text: newText,
+      selection: TextSelection.collapsed(offset: start + text.length),
+    );
   }
 
   /// 从路径中提取文件名（兼容 / 与 \）
@@ -184,7 +297,7 @@ class _MessageInputState extends State<MessageInput> {
                   icon: const Icon(Icons.attach_file),
                   onPressed: _pickFile,
                   color: cs.onSurfaceVariant,
-                  tooltip: '上传文件',
+                  tooltip: '上传文件（或直接 Ctrl+V 粘贴图片/文件）',
                 ),
                 Expanded(
                   child: Focus(
