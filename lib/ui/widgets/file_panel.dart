@@ -195,13 +195,22 @@ class _FilePanelState extends State<FilePanel>
           ),
           // 内容区域：按顶层 Tab 切换
           Expanded(
-            child: TabBarView(
-              controller: _tabController,
-              children: [
-                _buildFileSection(),
-                const McpConfigPanel(),
-                ModelInfoPanel(agentId: widget.topAgentId ?? ''),
-              ],
+            child: GestureDetector(
+              // 点击任意页签内容区的空白处折叠右侧栏（文件较少、Todo 为空、
+              // MCP 配置、模型信息等的大片空白均生效）。子项自带点击手势
+              // （列表项、Tab、按钮等）会优先消费，只有点到真正空白处才命中，
+              // 不会误伤内容交互。打开 FileViewer 时禁止折叠。
+              behavior: HitTestBehavior.translucent,
+              onTap:
+                  _selectedFilePath == null ? widget.onCollapse : null,
+              child: TabBarView(
+                controller: _tabController,
+                children: [
+                  _buildFileSection(),
+                  const McpConfigPanel(),
+                  ModelInfoPanel(agentId: widget.topAgentId ?? ''),
+                ],
+              ),
             ),
           ),
         ],

@@ -163,51 +163,56 @@ class _AgentListState extends State<AgentList> {
 
   @override
   Widget build(BuildContext context) {
-    // 列表末尾追加一项"空位折叠区"：Agent 较少时列表下方空白可点击折叠左栏
-    return ListView.separated(
-      padding: EdgeInsets.zero,
-      itemCount: widget.agents.length + 1,
-      // 列表项之间 1px 分隔线
-      separatorBuilder: (BuildContext context, int index) {
-        if (index >= widget.agents.length) {
-          return const SizedBox.shrink();
-        }
-        return Divider(
-          height: 1,
-          thickness: 1,
-          color: Theme.of(context).dividerColor,
-          indent: 12,
-          endIndent: 12,
-        );
-      },
-      itemBuilder: (BuildContext context, int index) {
-        // 最后一项：空位折叠区
-        if (index == widget.agents.length) {
-          return _buildCollapsePlaceholder();
-        }
-        final Agent agent = widget.agents[index];
-        return GestureDetector(
-          // 桌面端右键
-          onSecondaryTapDown: (TapDownDetails details) {
-            _lastTapPos = details.globalPosition;
-          },
-          onSecondaryTap: () => _handleSecondaryAction(context, agent),
-          // 移动端长按
-          onLongPressStart: (LongPressStartDetails details) {
-            _lastTapPos = details.globalPosition;
-          },
-          onLongPress: () => _handleSecondaryAction(context, agent),
-          child: AgentListItem(
-            agent: agent,
-            selected: agent.id == _selectedAgentId,
-            onTap: () => _handleTap(agent),
+    return CustomScrollView(
+      slivers: <Widget>[
+        // Agent 列表项（此 Flutter 版本无 SliverList.separated，手动插入分隔线）
+        SliverList(
+          delegate: SliverChildBuilderDelegate(
+            (BuildContext context, int index) {
+              // 奇数索引为分隔线，偶数索引为 agent 项
+              final int itemIndex = index ~/ 2;
+              if (index.isOdd) {
+                return Divider(
+                  height: 1,
+                  thickness: 1,
+                  color: Theme.of(context).dividerColor,
+                  indent: 12,
+                  endIndent: 12,
+                );
+              }
+              final Agent agent = widget.agents[itemIndex];
+              return GestureDetector(
+                // 桌面端右键
+                onSecondaryTapDown: (TapDownDetails details) {
+                  _lastTapPos = details.globalPosition;
+                },
+                onSecondaryTap: () => _handleSecondaryAction(context, agent),
+                // 移动端长按
+                onLongPressStart: (LongPressStartDetails details) {
+                  _lastTapPos = details.globalPosition;
+                },
+                onLongPress: () => _handleSecondaryAction(context, agent),
+                child: AgentListItem(
+                  agent: agent,
+                  selected: agent.id == _selectedAgentId,
+                  onTap: () => _handleTap(agent),
+                ),
+              );
+            },
+            childCount: widget.agents.length * 2 - 1,
           ),
-        );
-      },
+        ),
+        // 空位折叠区：占满列表下方剩余的完整空白区域，点击任意空白处均可折叠
+        SliverFillRemaining(
+          hasScrollBody: false,
+          child: _buildCollapsePlaceholder(),
+        ),
+      ],
     );
   }
 
-  /// 列表底部空位折叠区：Agent 较少时显示"点击空白处折叠左栏"
+  /// 列表底部空位折叠区：占满剩余空白，显示"点击空白处折叠左栏"。
+  /// 无 Agent 时叠加"暂无 Agent"提示。
   Widget _buildCollapsePlaceholder() {
     final cs = Theme.of(context).colorScheme;
     // 仅注册 onTap：若同时注册 onDoubleTap，GestureDetector 会等待双击超时
@@ -215,30 +220,30 @@ class _AgentListState extends State<AgentList> {
     return GestureDetector(
       behavior: HitTestBehavior.translucent,
       onTap: widget.onCollapse,
-      child: SizedBox(
-        height: 220,
-        child: Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: <Widget>[
-              if (widget.agents.isEmpty) ...<Widget>[
-                Text(
-                  '暂无 Agent',
-                  style: TextStyle(
-                    color: cs.onSurfaceVariant,
-                    fontSize: 14,
-                  ),
-                ),
-                const SizedBox(height: 10),
-              ],
-              Icon(Icons.chevron_left, size: 20, color: cs.outline),
-              const SizedBox(height: 4),
+      child: Container(
+        width: double.infinity,
+        alignment: Alignment.center,
+        padding: const EdgeInsets.only(top: 24, bottom: 40),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            if (widget.agents.isEmpty) ...<Widget>[
               Text(
-                '点击空白处折叠左栏',
-                style: TextStyle(fontSize: 11, color: cs.outline),
+                '暂无 Agent',
+                style: TextStyle(
+                  color: cs.onSurfaceVariant,
+                  fontSize: 14,
+                ),
               ),
+              const SizedBox(height: 10),
             ],
-          ),
+            Icon(Icons.chevron_left, size: 20, color: cs.outline),
+            const SizedBox(height: 4),
+            Text(
+              '点击空白处折叠左栏',
+              style: TextStyle(fontSize: 11, color: cs.outline),
+            ),
+          ],
         ),
       ),
     );

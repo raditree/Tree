@@ -45,8 +45,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   static const double _collapsedWidth = 40;
 
   // 侧栏折叠/展开的动画时长与曲线（宽度平滑过渡 + 内容淡入淡出）
-  static const Duration _sidebarAnimDuration = Duration(milliseconds: 240);
-  static const Curve _sidebarAnimCurve = Curves.easeInOutCubic;
+  static const Duration _sidebarAnimDuration = Duration(milliseconds: 60);
+  static const Curve _sidebarAnimCurve = Curves.linear;
 
   /// 移动端底部导航当前页（0=Agent 列表，1=消息，2=文件）
   int _mobileTab = 0;
@@ -456,7 +456,11 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     );
   }
 
-  /// 折叠自适应的侧栏：宽度随折叠状态平滑过渡，内容在展开/折叠两态间淡入淡出
+  /// 折叠自适应的侧栏：宽度随折叠状态平滑过渡。
+  ///
+  /// 展开内容始终以完整宽度挂载（折叠时超出容器部分被裁剪，并被折叠窄条
+  /// 覆盖、禁用点击），从而保留其 State（滚动位置、当前 Tab、文件查看器等），
+  /// 避免折叠再展开后访问位置丢失。
   Widget _buildAnimatedSidebar({
     required bool collapsed,
     required double expandedWidth,
@@ -467,19 +471,33 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       duration: _sidebarAnimDuration,
       curve: _sidebarAnimCurve,
       width: collapsed ? _collapsedWidth : expandedWidth,
-      child: AnimatedSwitcher(
-        duration: _sidebarAnimDuration,
-        switchInCurve: _sidebarAnimCurve,
-        switchOutCurve: _sidebarAnimCurve,
-        transitionBuilder: (Widget child, Animation<double> animation) {
-          return FadeTransition(
-            opacity: animation,
-            child: KeyedSubtree(key: const ValueKey('sidebar'), child: child),
-          );
-        },
-        child: collapsed
-            ? KeyedSubtree(key: const ValueKey('collapsed'), child: collapsedBar)
-            : KeyedSubtree(key: const ValueKey('expanded'), child: expandedBar),
+      child: ClipRect(
+        clipBehavior: Clip.hardEdge,
+        child: Stack(
+          children: [
+            // 展开面板：以 Positioned 指定完整宽度布局（不受折叠时父级 40px
+            // 紧约束影响），折叠时超出部分被 ClipRect 裁剪；仍挂载以保留
+            // State，同时禁用点击与动画（折叠窄条会覆盖它）。
+            Positioned(
+              top: 0,
+              bottom: 0,
+              left: 0,
+              width: expandedWidth,
+              child: IgnorePointer(
+                ignoring: collapsed,
+                child: TickerMode(
+                  enabled: !collapsed,
+                  child: expandedBar,
+                ),
+              ),
+            ),
+            // 折叠窄条：仅折叠时覆盖在展开面板之上
+            if (collapsed)
+              Positioned.fill(
+                child: collapsedBar,
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -505,21 +523,31 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     final cs = Theme.of(context).colorScheme;
     final workspaceId = _selectedAgent?.workspaceId ?? '';
     if (workspaceId.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              Icons.folder_open_outlined,
-              size: 56,
-              color: cs.onSurfaceVariant,
-            ),
-            const SizedBox(height: 12),
-            Text(
-              '请先在左侧选择或创建一个 Agent',
-              style: TextStyle(fontSize: 14, color: cs.onSurfaceVariant),
-            ),
-          ],
+      // 未选中 agent：右侧为空白占位，点击任意空白处折叠右侧栏。
+      // 这里保留现有文字（不新增"点击空白处折叠"提醒，用户可自然外推）。
+      return GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTap: () {
+          setState(() {
+            _rightCollapsed = true;
+          });
+        },
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.folder_open_outlined,
+                size: 56,
+                color: cs.onSurfaceVariant,
+              ),
+              const SizedBox(height: 12),
+              Text(
+                '请先在左侧选择或创建一个 Agent',
+                style: TextStyle(fontSize: 14, color: cs.onSurfaceVariant),
+              ),
+            ],
+          ),
         ),
       );
     }
