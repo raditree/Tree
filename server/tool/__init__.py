@@ -106,6 +106,7 @@ def register_builtin_tools(
     message_dispatcher: Optional[Callable] = None,
     extra_info_refresher: Optional[Callable[[], dict]] = None,
     session_id: str = "",
+    is_member: bool = False,
 ) -> None:
     """将内置工具注册到会话，并把工作空间基础工具注册为 MCP 服务。
 
@@ -217,7 +218,11 @@ def register_builtin_tools(
         # 透传当前会话：成员上下文按 session 隔离
         session_id=session_id,
     )
-    ask_tool = AskUserQuestionTool(ws_manager=ws_manager, user_id=user_id)
+    ask_tool = AskUserQuestionTool(
+        ws_manager=ws_manager, user_id=user_id,
+        agent_id=agent_id, top_agent_id=top_agent_id or agent_id,
+        session_id=session_id, is_member=is_member,
+    )
     # 绑定主事件循环，供 AskUserQuestion 在消费线程内安全推送 WS 消息
     try:
         ask_tool.bind_loop(asyncio.get_running_loop())
@@ -240,6 +245,13 @@ def register_builtin_tools(
     # 状态文案，供模型及时更新 todo（见 llm.py 工具结果装配）。
     try:
         session.current_todo_status = todo_tool.current_status_text
+    except Exception:  # noqa: BLE001
+        pass
+    # 挂载会话级 selected spec 状态提供者：每个工具调用返回时注入
+    # "selected spec" 状态文案，督促模型始终挂接至少一个内置 Spec
+    # （见 llm.py 工具结果装配）。
+    try:
+        session.current_spec_status = spec_tool.current_status_text
     except Exception:  # noqa: BLE001
         pass
     # 绑定主事件循环，供 SetTodoList 在消费线程内安全推送 todo_update WS

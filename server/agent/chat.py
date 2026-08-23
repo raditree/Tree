@@ -430,6 +430,9 @@ def _build_spec_index_text(agent_id: str) -> str:
         if len(when) > 80:
             when = when[:80] + "…"
         line = f"- `{s['id']}` [{s.get('task_type', '')}] {s.get('title', '')}"
+        # 标注内置模板（easy/complex/hard/team-meeting），与自定义 Spec 区分
+        if s.get("builtin"):
+            line += "（内置）"
         if when:
             line += f"（适用: {when}）"
         lines.append(line)
@@ -530,8 +533,9 @@ def _build_member_topology_text(
     lines.append("- 跨团队顶层沟通：先 list_teams 熟悉本用户名下 TOP，向其他 TOP agent "
                 "按 TOP 名称寻址，经 team 投递。")
     lines.append("- 回复路径：成员→上级（TOP）；TOP→用户。成员不直接面向用户。")
-    lines.append("- 使用 team 工具前先检查成员基本信息（role/duty/model_id），"
-                "若为空先用 update_member 补充完善再派发任务。")
+    lines.append("- 使用 team 工具前先检查成员基本信息：role/duty 为空时用 "
+                "update_member 补充完善再派发任务；model_id 为空会自动回退所属 "
+                "TOP 模型（无需强制 update_member）。")
     return "\n".join(lines)
 
 
@@ -1177,6 +1181,9 @@ async def _stream_agent_reply(
     full_parts: List[str] = []
     text_parts: List[str] = []  # 当前文本段的累积内容
     text_id: Optional[str] = None
+    # 最后一次工具调用摘要（纯 tool loop 无文字输出时，兜底为回复内容推送
+    # 给上一级 leader，避免成员完成工作后 leader 收不到任何结果）
+    last_tool_text = ""
     # thinking（推理）段累积：每段独立 id，收到非 thinking 产出时关闭并持久化
     thinking_parts: List[str] = []
     thinking_id: Optional[str] = None
@@ -1327,6 +1334,8 @@ async def _stream_agent_reply(
                 name = item.get("name", "")
                 args = item.get("arguments") or {}
                 result = item.get("result", "")
+                # 记录最后一次工具调用摘要（结果截断，避免超长）
+                last_tool_text = f"[工具 {name}] {str(result)[:500]}"
                 if workspace_id:
                     _append_activity_log(
                         workspace_id,
@@ -1402,6 +1411,14 @@ async def _stream_agent_reply(
 
     # 结束时仍打开的文本段即最终回复，交由调用方补发 msg_usage
     last_text_id = text_id
+    # 纯 tool loop 无文字输出兜底：status=ok 且无任何文本时，用最后一次
+    # 工具调用摘要作为回复内容（_process_member_message 据此推送给 leader）。
+    if (
+        status == "ok"
+        and not full_parts
+        and last_tool_text
+    ):
+        full_parts.append(f"（本轮无文字输出，最后执行：{last_tool_text}）")
     return "".join(full_parts), status, last_text_id
 
 
@@ -1433,6 +1450,18 @@ async def _process_member_message(
         return
 
     model_config = state.model_configs.get(model_id)
+    if model_config is None and not model_id and top_agent_id:
+        # 空 model_id 自动回退所属 TOP 的模型：建队默认继承 TOP 模型，
+        # 此处兼容历史空 model_id 成员（无论从哪条投递路径进入，都不因
+        # 模型缺失丢消息）。
+        try:
+            top_rec = get_agent(user_id, top_agent_id) or {}
+            top_model = top_rec.get("model_id") or ""
+            if top_model and top_model in state.model_configs:
+                model_config = state.model_configs[top_model]
+                model_id = top_model
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("成员空 model_id 回退 TOP 模型失败: %s", exc)
     if model_config is None:
         _append_activity_log(
             workspace_id,
@@ -1793,6 +1822,7 @@ async def _dispatch_user_message(user_id: str, data: Dict[str, Any]) -> None:
     )
     if result.get("status") == "error":
         asyncio.create_task(_handle_user_message(user_id, data))
+
 
 
 async def _handle_user_message(

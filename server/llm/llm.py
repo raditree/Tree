@@ -15,6 +15,60 @@ from config.models import ModelConfig
 
 logger = logging.getLogger(__name__)
 
+# 列表字段展开上限（防止超大列表撑爆上下文）与项内字段上限
+_MAX_LIST_ITEMS = 30
+_MAX_ITEM_FIELDS = 8
+_MAX_VALUE_CHARS = 120
+
+
+def _fmt_value(v: Any, max_chars: int = _MAX_VALUE_CHARS) -> str:
+    """把单个值格式化为可读文本（截断超长字符串）。"""
+    if isinstance(v, bool):
+        return "是" if v else "否"
+    if isinstance(v, list):
+        return f"{len(v)} 项"
+    if isinstance(v, dict):
+        return "{...}"
+    s = str(v)
+    if len(s) > max_chars:
+        s = s[:max_chars] + "..."
+    return s
+
+
+def _fmt_list_item(item: Any) -> str:
+    """把列表中的一项格式化为一行（dict 紧凑 key=value）。
+
+    保留空值字段（如 ``model_id=``），让模型能感知字段存在但为空
+    （配合自动回退机制，避免"看不到 model_id"而误判）。
+    """
+    if isinstance(item, dict):
+        parts = []
+        for k2, v2 in item.items():
+            parts.append(f"{k2}={_fmt_value(v2)}")
+            if len(parts) >= _MAX_ITEM_FIELDS:
+                break
+        return "  - " + ", ".join(parts)
+    return "  - " + _fmt_value(item)
+
+
+def _format_list_block(label: str, items: list) -> str:
+    """把工具结果中的列表字段展开为逐项可读文本（而非只显示数量）。
+
+    修复"list_models / spec list 等仅返回数量、模型拿不到具体内容"的
+    类 no-op 问题：models/specs/teams/members/tasks/tools 等列表字段
+    全部展开具体项，控制规模（最多 _MAX_LIST_ITEMS 项、每项最多
+    _MAX_ITEM_FIELDS 字段）。
+    """
+    total = len(items)
+    head = f"{label}: {total} 项"
+    if total == 0:
+        return head
+    shown = items[:_MAX_LIST_ITEMS]
+    body = [_fmt_list_item(it) for it in shown]
+    if total > len(shown):
+        body.append(f"  ... 还有 {total - len(shown)} 项")
+    return head + "\n" + "\n".join(body)
+
 
 def _stringify_tool_result(result: Any) -> str:
     """将工具执行结果转为前端可读字符串。
@@ -23,7 +77,8 @@ def _stringify_tool_result(result: Any) -> str:
     策略：
     1. 优先提取 content / output / result / message / text 等字段
     2. 提取 error 字段
-    3. 将剩余 key-value 格式化为 ``标签: 值`` 行（跳过元数据字段）
+    3. 将剩余 key-value 格式化为 ``标签: 值`` 行（跳过元数据字段）；
+       列表字段**展开具体项**（避免只给数量导致模型无法决策）。
     """
     if isinstance(result, dict):
         # 图像工具结果：不展开 base64 本体，输出摘要（前端展示友好）
@@ -49,7 +104,11 @@ def _stringify_tool_result(result: Any) -> str:
                 continue
             label = _FIELD_LABELS.get(k, k)
             if isinstance(v, list):
-                lines.append(f"{label}: {len(v)} 项")
+                lines.append(_format_list_block(label, v))
+            elif isinstance(v, dict):
+                # dict 值（如 query_member 的 member）紧凑格式化，避免 Python repr
+                lines.append(f"{label}:")
+                lines.append(_fmt_list_item(v))
             elif isinstance(v, bool):
                 lines.append(f"{label}: {'是' if v else '否'}")
             elif v is not None:
@@ -77,6 +136,16 @@ _FIELD_LABELS: Dict[str, str] = {
     "members": "成员列表",
     "tasks": "任务列表",
     "tools": "工具列表",
+    "specs": "Spec列表",
+    "teams": "团队列表",
+    "commits": "提交历史",
+    "files": "产出文件",
+    "log_lines": "活动日志",
+    "groups": "分组",
+    "spec_ids": "已选Spec",
+    "selected_spec_ids": "已选Spec",
+    "member": "成员",
+    "spec": "Spec",
     "level": "层级",
     "model_id": "模型",
     "name": "名称",
@@ -721,6 +790,22 @@ class AgentLLMSession:
                         base_content = (
                             f"当前 in_progress todo（current_todo_id）：\n"
                             f"{current_todo_text}\n\n"
+                            f"{base_content}"
+                        )
+                    # 注入会话级 selected spec 状态：与 todo 一样随每次工具
+                    # 返回带给模型，督促其始终挂接至少一个内置 Spec
+                    # （easy/complex/hard/team-meeting）。
+                    spec_provider = getattr(self, "current_spec_status", None)
+                    current_spec_text = ""
+                    if spec_provider is not None:
+                        try:
+                            current_spec_text = str(spec_provider() or "")
+                        except Exception:  # noqa: BLE001
+                            current_spec_text = ""
+                    if current_spec_text:
+                        base_content = (
+                            f"当前 selected spec（selected spec）：\n"
+                            f"{current_spec_text}\n\n"
                             f"{base_content}"
                         )
                     self.context.append({

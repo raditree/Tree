@@ -173,6 +173,46 @@ class SpecTool:
         return {"error": f"未知 spec 动作: {action}（应为 search/list/read/select/create/update）"}
 
     # ------------------------------------------------------------------
+    # 会话级 selected spec 状态（供工具返回注入约束模型）
+    # ------------------------------------------------------------------
+    def current_status_text(self) -> str:
+        """生成本会话 ``selected spec`` 状态文案（供工具返回注入，督促挂 Spec）。
+
+        三态：
+        - 未选择任何 Spec：``- "[Warning]spec 未选择"``
+        - 已选但**无**内置基础 Spec（easy/complex/hard/team-meeting）：
+          ``- "[Info]已选择：[<id0>, ][Warning]至少选择一个内置 spec"``
+        - 正常（含至少一个内置 Spec）：
+          ``- "[Info]已选择：[<id0>, ]"``
+
+        每个 Spec 标注是否为内置（``(内置)`` / ``(自定义)``），
+        让模型明确"内置基础 Spec"与"自定义 Spec"的区别。
+        """
+        selected: List[str] = []
+        if self.user_id and self.session_id:
+            try:
+                selected = get_selected_spec_ids(self.user_id, self.session_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("读取已选 Spec 失败: %s", exc)
+                selected = []
+        if not selected:
+            return '- "[Warning]spec 未选择"'
+        labeled: List[str] = []
+        has_builtin = False
+        for sid in selected:
+            is_builtin = sid in BUILTIN_SPEC_IDS
+            if is_builtin:
+                has_builtin = True
+            labeled.append(f"{sid}({'内置' if is_builtin else '自定义'})")
+        joined = ", ".join(labeled)
+        if not has_builtin:
+            return (
+                f'- "[Info]已选择：[{joined}，]'
+                '[Warning]至少选择一个内置 spec"'
+            )
+        return f'- "[Info]已选择：[{joined}，]'
+
+    # ------------------------------------------------------------------
     # 具体动作
     # ------------------------------------------------------------------
     def _action_search(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -194,6 +234,9 @@ class SpecTool:
                 "description": s["description"],
                 "when": s["when"],
                 "pinned": s["pinned"],
+                # 标注是否为内置模板（easy/complex/hard/team-meeting），
+                # 供模型区分内置（可 select 挂 hook）与自定义 Spec
+                "builtin": bool(s.get("builtin", s["id"] in BUILTIN_SPEC_IDS)),
             })
         return {"action": "search", "query": query, "count": len(items), "specs": items}
 
@@ -207,6 +250,8 @@ class SpecTool:
                 "description": s["description"],
                 "when": s["when"],
                 "pinned": s["pinned"],
+                # 内置模板标注（BUILTIN_SPEC_IDS），自定义 Spec 为 False
+                "builtin": bool(s.get("builtin", s["id"] in BUILTIN_SPEC_IDS)),
             }
             for s in results
         ]

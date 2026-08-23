@@ -152,10 +152,10 @@ class TeamTool:
                     "分工前先 list_members 确认拓扑；成员职责未设时先 update_member 设置\n"
                     "注意: 成员不可动态创建/删除（P4 预建）；仅可 update_member 调整。"
                     "修改成员信息会触发名单推送\n"
-                    "**使用前必查成员基本信息**：先 list_members / query_member 检查"
-                    "成员的 role（角色）、duty（职责）、model_id（模型）等字段是否为空；"
-                    "若为空或缺失，请先用 update_member 补充完善（role/duty/model_id）"
-                    "再派发任务，避免成员职责不明、模型缺失导致任务执行偏差。\n"
+                    "**使用前可查成员基本信息**：先 list_members / query_member 查看"
+                    "成员的 role（角色）、duty（职责）、model_id（模型）；role/duty 为空"
+                    "时用 update_member 补充完善再派发任务；model_id 为空会自动回退所属"
+                    " TOP 模型，无需强制设置。\n"
                     "update_member 必须携带 target_member_id（或 member_name）指定目标成员，"
                     "先从 list_members 获取成员 id/name，禁止省略"
                 ),
@@ -414,13 +414,26 @@ class TeamTool:
         member_id = member.get("id", "")
         if not member_id:
             return False
+        # 空 model_id 自动回退所属 TOP 的模型（与 _dispatch_agent_message
+        # 一致）：建队默认继承 TOP 模型，兼容历史空 model_id 成员，避免
+        # 消息被 _process_member_message 因"模型不存在"静默丢弃。
+        member_model = member.get("model_id", "") or ""
+        if not member_model and self.top_agent_id:
+            try:
+                from data.agent_store import get_agent
+
+                top_rec = get_agent(self.user_id, self.top_agent_id) or {}
+                member_model = top_rec.get("model_id") or ""
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("成员空 model_id 回退 TOP 模型失败: %s", exc)
+                member_model = ""
         return self.broker.dispatch(
             (self.user_id, member_id),
             {
                 "user_id": self.user_id,
                 "agent_id": member_id,
                 "workspace_id": member.get("workspace_id", ""),
-                "model_id": member.get("model_id", ""),
+                "model_id": member_model,
                 "system_prompt": member.get("system_prompt", ""),
                 "leader_id": self.leader_id,
                 "top_agent_id": self.top_agent_id,
@@ -989,18 +1002,20 @@ class TeamTool:
                         "relation": "team_member",
                     })
 
-        # 基本信息完整性提示：role/duty/model_id 为空时提醒先 update_member 补充，
-        # 避免成员职责不明/模型缺失导致后续派发任务执行偏差（spec「基本信息先查」）
+        # 基本信息完整性提示：role/duty 为空时提醒先 update_member 补充
+        # （避免成员职责不明导致任务执行偏差，spec「基本信息先查」）。
+        # model_id 为空**不**警告——存在自动回退机制（投递时回退所属 TOP
+        # 模型），无需强制设置，避免对 agent 的持续骚扰。
         missing = [
             (m.get("name") or m.get("id"))
             for m in result
-            if not (m.get("role") and m.get("duty") and m.get("model_id"))
+            if not (m.get("role") and m.get("duty"))
         ]
         hint = ""
         if missing:
             hint = (
-                "以下成员基本信息不完整（role/duty/model_id 为空），"
-                "请先用 update_member 补充完善后再派发任务: "
+                "以下成员 role/duty 为空，建议用 update_member 补充完善后"
+                "再派发任务（model_id 为空会自动回退所属 TOP 模型，无需设置）: "
                 + "、".join(missing[:5])
             )
             if len(missing) > 5:
