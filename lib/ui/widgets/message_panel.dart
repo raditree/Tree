@@ -104,6 +104,16 @@ class _MessagePanelState extends State<MessagePanel> {
   void initState() {
     super.initState();
     _webSocket.onMessage = _handleIncomingMessage;
+    // 连接建立/重连时清空 working 集合：后端重启会清空其内存态 _active_tasks，
+    // 若不清空，前端会残留旧的 working（无 API 调用却显示工作中）。
+    // 清空后由后端在 WS 建立时补推真实的 agent_status（仍在工作的才重新标记）。
+    _webSocket.onConnectionChange = (bool connected) {
+      if (connected && mounted) {
+        setState(() {
+          _workingAgents.clear();
+        });
+      }
+    };
     // 先恢复本地模式设置（按顶部 agent），再建立 WebSocket 连接，
     // 确保连接建立后能按正确的本地模式注册执行器
     _initAsync();

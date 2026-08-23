@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 
 import '../models/message.dart';
@@ -100,13 +101,21 @@ class _MessageListViewState extends State<_MessageListView> {
   @override
   Widget build(BuildContext context) {
     if (widget.messages.isEmpty) {
+      // 空态：居中排版，emoji 与文字分行
       return Center(
-        child: Text(
-          '暂无消息',
-          style: TextStyle(
-            color: Theme.of(context).colorScheme.onSurfaceVariant,
-            fontSize: 14,
-          ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('👋', style: TextStyle(fontSize: 44)),
+            const SizedBox(height: 8),
+            Text(
+              '你好，欢迎使用 Tree',
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+                fontSize: 14,
+              ),
+            ),
+          ],
         ),
       );
     }
@@ -160,6 +169,9 @@ class _MessageBubbleState extends State<_MessageBubble> {
 
   /// 当前是否显示光标（"|" 与空格交替）
   bool _showCursor = true;
+
+  /// 鼠标是否悬停在气泡上（用于显示「复制全文」按钮）
+  bool _hoverCopy = false;
 
   /// 气泡圆角
   static const double _radius = 12;
@@ -300,10 +312,85 @@ class _MessageBubbleState extends State<_MessageBubble> {
       );
     }
     // agent 消息渲染 markdown（模型输出默认 markdown 格式）
-    return MarkdownBody(
-      data: text,
-      selectable: true,
-      styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)),
+    // - hover 显示「复制全文」按钮（一次性复制完整内容，不因选段拆断）
+    // - 外层 SelectionArea 兜底跨段落选择复制（markdown 内部 selectable 关闭避免嵌套冲突）
+    return _buildMarkdownContent(message, textColor);
+  }
+
+  /// 构建 agent 消息的 markdown 内容：SelectionArea 兜底 + hover「复制全文」按钮
+  Widget _buildMarkdownContent(ChatMessage message, Color textColor) {
+    final bool streaming = message.isStreaming;
+    return MouseRegion(
+      onEnter: (_) {
+        setState(() {
+          _hoverCopy = true;
+        });
+      },
+      onExit: (_) {
+        setState(() {
+          _hoverCopy = false;
+        });
+      },
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          // SelectionArea 提供跨段落选择复制
+          SelectionArea(
+            child: MarkdownBody(
+              data: message.content,
+              selectable: false,
+              styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)),
+            ),
+          ),
+          // 流式输出中不显示复制按钮（内容仍在变化）
+          if (_hoverCopy && !streaming)
+            Positioned(
+              top: -8,
+              right: -8,
+              child: _buildCopyButton(),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// 「复制全文」按钮：复制原始 markdown 文本到剪贴板
+  Widget _buildCopyButton() {
+    final cs = Theme.of(context).colorScheme;
+    return Material(
+      color: cs.surface,
+      elevation: 2,
+      borderRadius: BorderRadius.circular(6),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(6),
+        onTap: _copyFullText,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.copy, size: 12, color: cs.onSurfaceVariant),
+              const SizedBox(width: 4),
+              Text(
+                '复制',
+                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 复制消息全文（原始 markdown 内容）
+  Future<void> _copyFullText() async {
+    await Clipboard.setData(ClipboardData(text: widget.message.content));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('已复制全文'),
+        duration: Duration(seconds: 1),
+      ),
     );
   }
 

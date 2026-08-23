@@ -369,6 +369,11 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
               },
               onClearHistory: _handleClearHistory,
               onDelete: _handleDeleteAgent,
+              onCollapse: () {
+                setState(() {
+                  _leftCollapsed = true;
+                });
+              },
             ),
           ),
         ],
@@ -463,14 +468,23 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             ),
           ),
           Expanded(
-            child: RotatedBox(
-              quarterTurns: 1,
-              child: Center(
-                child: Text(
-                  'Agent 列表',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: cs.onSurfaceVariant,
+            // 整条窄条可点击展开（不只顶部按钮）
+            child: GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onTap: () {
+                setState(() {
+                  _leftCollapsed = false;
+                });
+              },
+              child: RotatedBox(
+                quarterTurns: 1,
+                child: Center(
+                  child: Text(
+                    'Agent 列表',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: cs.onSurfaceVariant,
+                    ),
                   ),
                 ),
               ),
@@ -510,14 +524,23 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             ),
           ),
           Expanded(
-            child: RotatedBox(
-              quarterTurns: 1,
-              child: Center(
-                child: Text(
-                  '文件管理',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: cs.onSurfaceVariant,
+            // 整条窄条可点击展开（不只顶部按钮）
+            child: GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onTap: () {
+                setState(() {
+                  _rightCollapsed = false;
+                });
+              },
+              child: RotatedBox(
+                quarterTurns: 1,
+                child: Center(
+                  child: Text(
+                    '文件管理',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: cs.onSurfaceVariant,
+                    ),
                   ),
                 ),
               ),

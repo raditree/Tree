@@ -545,6 +545,81 @@ class ApiService {
     }
   }
 
+  /// 修改 agent 的模型或系统提示词（右栏「模型信息」页使用）
+  ///
+  /// 调用 `PATCH /api/agents/{id}`，请求体为 `{"model_id"?, "system_prompt"?}`，
+  /// 只传需要修改的字段。网络异常或后端返回错误时抛出中文异常。
+  static Future<Map<String, dynamic>> updateAgent(
+    String agentId, {
+    String? modelId,
+    String? systemPrompt,
+  }) async {
+    return _patchJson('/api/agents/$agentId', body: {
+      if (modelId != null && modelId.isNotEmpty) 'model_id': modelId,
+      if (systemPrompt != null) 'system_prompt': systemPrompt,
+    });
+  }
+
+  /// 获取 agent 的可用模型池与当前模型信息（右栏「模型信息」页使用）
+  ///
+  /// 调用 `GET /api/agents/{id}/models-info`，返回
+  /// `{"models": [{"model_id","name","max_seqlen","thinking","if_vision","base_url"}], "current": {...}}`。
+  /// 网络异常或后端返回错误时抛出中文异常。
+  static Future<Map<String, dynamic>> getAgentModelsInfo(String agentId) async {
+    return _getJson('/api/agents/$agentId/models-info');
+  }
+
+  // ==================== MCP 服务管理接口（右栏 MCP 配置页） ====================
+
+  /// 列出已注册的 MCP 服务
+  ///
+  /// 调用 `GET /api/mcp/services`，返回 `{"services": [{"name","command","args","builtin","enabled"}]}`。
+  /// 网络异常或后端返回错误时抛出中文异常。
+  static Future<List<Map<String, dynamic>>> getMcpServices() async {
+    final Map<String, dynamic> data = await _getJson('/api/mcp/services');
+    final List<dynamic> services = data['services'] as List<dynamic>? ?? [];
+    return services
+        .map((dynamic e) => Map<String, dynamic>.from(e as Map<dynamic, dynamic>))
+        .toList();
+  }
+
+  /// 注册一个 MCP 服务（stdio 外接）
+  ///
+  /// 调用 `POST /api/mcp/services`，请求体为 `{"name","command","args"}`。
+  /// 网络异常或后端返回错误时抛出中文异常。
+  static Future<Map<String, dynamic>> registerMcpService({
+    required String name,
+    required String command,
+    List<String> args = const [],
+  }) async {
+    return _postJson('/api/mcp/services', body: {
+      'name': name,
+      'command': command,
+      'args': args,
+    });
+  }
+
+  /// 删除一个 MCP 服务
+  ///
+  /// 调用 `DELETE /api/mcp/services/{name}`。
+  /// 网络异常或后端返回错误时抛出中文异常。
+  static Future<void> deleteMcpService(String name) async {
+    final Uri uri = Uri.parse(
+      '$baseUrl/api/mcp/services/${Uri.encodeComponent(name)}',
+    );
+    try {
+      final http.Response response =
+          await http.delete(uri, headers: _getHeaders());
+      if (response.statusCode != 200) {
+        throw Exception(_errorFromBody(response));
+      }
+    } on Exception {
+      rethrow;
+    } catch (e) {
+      throw Exception('网络请求失败，请检查后端服务是否启动');
+    }
+  }
+
   /// 手动压缩 normal LLM 的上下文（compact 按钮触发）
   ///
   /// 调用 `POST /api/agents/{agentId}/compact`（请求体带 session_id）。

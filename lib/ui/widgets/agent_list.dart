@@ -23,12 +23,16 @@ class AgentList extends StatefulWidget {
   /// 删除 agent 后的回调（父组件同步后端并刷新列表）
   final ValueChanged<Agent>? onDelete;
 
+  /// 左栏折叠回调（列表底部空位区域点击触发，Agent 较少时便于快速折叠）
+  final VoidCallback? onCollapse;
+
   const AgentList({
     super.key,
     required this.agents,
     this.onAgentSelected,
     this.onClearHistory,
     this.onDelete,
+    this.onCollapse,
   });
 
   @override
@@ -159,24 +163,15 @@ class _AgentListState extends State<AgentList> {
 
   @override
   Widget build(BuildContext context) {
-    // 列表为空时居中展示提示
-    if (widget.agents.isEmpty) {
-      return Center(
-        child: Text(
-          '暂无 Agent',
-          style: TextStyle(
-            color: Theme.of(context).colorScheme.onSurfaceVariant,
-            fontSize: 14,
-          ),
-        ),
-      );
-    }
-
+    // 列表末尾追加一项"空位折叠区"：Agent 较少时列表下方空白可点击折叠左栏
     return ListView.separated(
       padding: EdgeInsets.zero,
-      itemCount: widget.agents.length,
+      itemCount: widget.agents.length + 1,
       // 列表项之间 1px 分隔线
       separatorBuilder: (BuildContext context, int index) {
+        if (index >= widget.agents.length) {
+          return const SizedBox.shrink();
+        }
         return Divider(
           height: 1,
           thickness: 1,
@@ -186,6 +181,10 @@ class _AgentListState extends State<AgentList> {
         );
       },
       itemBuilder: (BuildContext context, int index) {
+        // 最后一项：空位折叠区
+        if (index == widget.agents.length) {
+          return _buildCollapsePlaceholder();
+        }
         final Agent agent = widget.agents[index];
         return GestureDetector(
           // 桌面端右键
@@ -205,6 +204,42 @@ class _AgentListState extends State<AgentList> {
           ),
         );
       },
+    );
+  }
+
+  /// 列表底部空位折叠区：Agent 较少时显示"点击空白处折叠左栏"
+  Widget _buildCollapsePlaceholder() {
+    final cs = Theme.of(context).colorScheme;
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onTap: widget.onCollapse,
+      onDoubleTap: widget.onCollapse,
+      child: SizedBox(
+        height: 220,
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              if (widget.agents.isEmpty) ...<Widget>[
+                Text(
+                  '暂无 Agent',
+                  style: TextStyle(
+                    color: cs.onSurfaceVariant,
+                    fontSize: 14,
+                  ),
+                ),
+                const SizedBox(height: 10),
+              ],
+              Icon(Icons.chevron_left, size: 20, color: cs.outline),
+              const SizedBox(height: 4),
+              Text(
+                '点击空白处折叠左栏',
+                style: TextStyle(fontSize: 11, color: cs.outline),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
