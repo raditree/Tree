@@ -18,7 +18,13 @@ from agent.chat import (
 )
 from config.config import get_config
 from config.models import get_model_configs
-from data.agent_store import create_agent, delete_agent, get_agent, get_agents
+from data.agent_store import (
+    create_agent,
+    delete_agent,
+    get_agent,
+    get_agents,
+    update_agent,
+)
 from data.conversation_store import clear_context, clear_history, get_history
 from data.session_cache import clear_user_agent, get_session
 from data.team_init import init_team_for_top
@@ -299,6 +305,31 @@ async def get_agent_spec_detail(
     return {"meta": meta, "content": content}
 
 
+def _roster_from_db(db_members: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """将 team_members 表记录转换为前端 teammates 结构（与 roster 文件解析兼容）。
+
+    team_members 表为成员名单结构化存储（权威源），转换后叠加
+    role/duty/scores 额外字段（文件视图未包含），供前端工作进度窗口展示。
+    member_id 同时作为 workspace_id（create_workspace 约定）。
+    """
+    members: List[Dict[str, Any]] = []
+    for m in db_members:
+        members.append({
+            "id": m["id"],
+            "name": m["name"],
+            "model_id": m.get("model_id", ""),
+            "level": m.get("level", 1),
+            "created_at": m.get("created_at", ""),
+            "work_status": m.get("work_status", "idle"),
+            "comment": m.get("comment", ""),
+            "role": m.get("role", ""),
+            "duty": m.get("duty", ""),
+            "scores": m.get("scores") or {},
+            "workspace_id": m["id"],
+        })
+    return members
+
+
 @router.get("/agents/{agent_id}/teammates")
 async def get_agent_teammates(
     agent_id: str,
@@ -306,22 +337,31 @@ async def get_agent_teammates(
 ) -> Dict[str, Any]:
     """拉取某 agent 的团队成员拓扑（teammates 工作进度窗口）。
 
-    从该 agent 工作空间解析 ``.self/team_roster.md``，并叠加实时工作状态
-    （是否有进行中的任务，来自 ``_active_tasks``）。
+    优先读取 ``team_members`` 表（P4 建队后的权威名单，跨模式不丢：
+    cloud/local/ssh 一致），表为空（未建队/旧数据）时回退解析工作空间
+    ``.self/team_roster.md``。均叠加实时工作状态（来自 ``_active_tasks``）。
     """
     user_id = current_user.get("openid", "")
     agent = get_agent(user_id, agent_id)
     workspace_id = (agent.get("workspace_id") if agent else None) or agent_id
 
-    # WorkspaceIO 为 async 接口，直接 await（本地模式反向 WS 在线程内执行，
-    # 云端模式 docker exec 经 to_thread，均不阻塞事件循环）
-    _io = _get_workspace_io(user_id, agent_id)
+    from data.team_store import get_members as get_team_members
+
     try:
-        r = await _io.read_file(workspace_id, ".self/team_roster.md")
-        content = "" if r.get("error") else (r.get("content", "") or "")
+        db_members = get_team_members(agent_id)
     except Exception:  # noqa: BLE001
-        content = ""
-    members = _parse_roster_table(content)
+        db_members = []
+    if db_members:
+        members = _roster_from_db(db_members)
+    else:
+        # 回退：roster 文件（未走 P4 建队的历史数据，解析 13 列表格）
+        _io = _get_workspace_io(user_id, agent_id)
+        try:
+            r = await _io.read_file(workspace_id, ".self/team_roster.md")
+            content = "" if r.get("error") else (r.get("content", "") or "")
+        except Exception:  # noqa: BLE001
+            content = ""
+        members = _parse_roster_table(content)
     for m in members:
         mid = m["id"]
         m["live_status"] = (
@@ -423,6 +463,16 @@ class CreateAgentRequest(BaseModel):
     team_member_count: Optional[int] = None
 
 
+class UpdateAgentRequest(BaseModel):
+    """修改 agent 请求体（右侧"模型信息"页）。
+
+    model_id / system_prompt 至少提供一个；均可不传（不修改）。
+    """
+
+    model_id: Optional[str] = None
+    system_prompt: Optional[str] = None
+
+
 @router.post("/agents")
 async def create_agent_endpoint(
     req: CreateAgentRequest,
@@ -473,6 +523,86 @@ async def create_agent_endpoint(
     }
 
 
+@router.patch("/agents/{agent_id}")
+async def update_agent_endpoint(
+    agent_id: str,
+    req: UpdateAgentRequest,
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """修改 agent 的模型 / 系统提示词（右侧"模型信息"页提交 PATCH）。
+
+    修改后清空该 agent 的会话缓存与上下文：下次发消息按新模型重建会话，
+    避免旧模型上下文（工具注册/模型参数）残留；历史消息保留。
+    """
+    user_id = current_user.get("openid", "")
+    if req.model_id is None and req.system_prompt is None:
+        raise HTTPException(status_code=400, detail="至少提供 model_id 或 system_prompt 之一")
+    if req.model_id is not None and req.model_id not in state.model_configs:
+        raise HTTPException(status_code=400, detail=f"模型不存在: {req.model_id}")
+    record = update_agent(
+        user_id,
+        agent_id,
+        model_id=req.model_id,
+        system_prompt=(
+            req.system_prompt.strip()
+            if req.system_prompt is not None else None
+        ),
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="Agent 不存在")
+    # 清会话缓存（含上下文），下次发消息按新配置重建
+    clear_user_agent(user_id, agent_id)
+    return {"success": True, "agent": _agent_to_response(record)}
+
+
+def _mask_base_url(url: str) -> str:
+    """脱敏 base_url：仅保留协议与主机名（去除路径与敏感信息）。"""
+    from urllib.parse import urlparse
+
+    try:
+        p = urlparse(url)
+        host = p.hostname or ""
+        port = f":{p.port}" if p.port else ""
+        return f"{p.scheme}://{host}{port}"
+    except Exception:  # noqa: BLE001
+        return url
+
+
+@router.get("/agents/{agent_id}/models-info")
+async def get_agent_models_info(
+    agent_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """获取 agent 的模型信息与可用模型池（右侧"模型信息"页展示）。
+
+    返回：
+    - ``agent``：当前 agent 的 id / model_id / system_prompt
+    - ``models``：可用模型池（max_seqlen / thinking / if_vision / base_url 脱敏）
+    """
+    user_id = current_user.get("openid", "")
+    agent = get_agent(user_id, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent 不存在")
+    models = []
+    for cfg in get_model_configs().values():
+        models.append({
+            "model_id": cfg.model_id,
+            "name": cfg.name,
+            "max_seqlen": cfg.extra.get("max_seqlen"),
+            "thinking": cfg.thinking,
+            "if_vision": cfg.if_vision,
+            "base_url": _mask_base_url(cfg.base_url),
+        })
+    return {
+        "agent": {
+            "id": agent["id"],
+            "model_id": agent["model_id"],
+            "system_prompt": agent.get("system_prompt", ""),
+        },
+        "models": models,
+    }
+
+
 @router.delete("/agents/{agent_id}")
 async def delete_agent_endpoint(
     agent_id: str,
@@ -507,7 +637,11 @@ async def delete_agent_endpoint(
 async def list_models(
     _: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """获取模型池中的具体模型列表（由 YAML 配置文件定义）。"""
+    """获取模型池中的具体模型列表（由 YAML 配置文件定义）。
+
+    与 ``/agents/{id}/models-info`` 复用同一数据源（ModelConfig），
+    避免两处模型信息不一致（spec「models-info 收敛复用」）。
+    """
     configs = get_model_configs()
     models = []
     for cfg in configs.values():
@@ -516,6 +650,94 @@ async def list_models(
                 "model_id": cfg.model_id,
                 "name": cfg.name,
                 "max_seqlen": cfg.extra.get("max_seqlen"),
+                "thinking": cfg.thinking,
+                "if_vision": cfg.if_vision,
+                "base_url": _mask_base_url(cfg.base_url),
             }
         )
     return {"models": models}
+
+
+# ===== MCP 服务管理（右侧" MCP 配置"页） =====
+
+
+class RegisterMcpServiceRequest(BaseModel):
+    """注册外部 MCP 服务请求体（stdio 外接）。"""
+
+    name: str
+    command: str
+    args: List[str] = []
+
+
+@router.get("/mcp/services")
+async def list_mcp_services(
+    _: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """列出已注册的外部 MCP 服务（含内置服务标记）。
+
+    外部服务来自 SQLite ``mcp_services`` 表（REST 注册，权威持久化）；
+    内置服务（workspace / document / embed_search）在会话构建时由
+    ``register_builtin_tools`` 注册，此处仅列出外部配置。
+    """
+    from data.mcp_service_store import list_services
+
+    try:
+        services = list_services()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("读取 MCP 服务配置失败: %s", exc)
+        services = []
+    # 内置服务标记（不可删除），供前端区分展示
+    builtin = {
+        "workspace": "工作空间基础工具（read/write/edit/terminal/embed_search）",
+        "document": "文档处理服务（PDF/PPTX/DOCX/XLSX）",
+        "embed_search": "embed 向量搜索服务",
+    }
+    for svc in services:
+        svc["builtin"] = False
+    for name, desc in builtin.items():
+        services.append({
+            "name": name,
+            "command": "",
+            "args": [],
+            "enabled": True,
+            "builtin": True,
+            "description": desc,
+        })
+    return {"services": services}
+
+
+@router.post("/mcp/services")
+async def register_mcp_service(
+    req: RegisterMcpServiceRequest,
+    _: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """注册一个外部 MCP 服务（stdio 外接），持久化到 SQLite。
+
+    安全校验（spec「MCP services CRUD 安全红线」）：命令白名单/绝对路径、
+    禁 shell 元字符、禁危险参数，防止注册任意命令导致 RCE。
+    """
+    from data.mcp_service_store import register_service
+
+    try:
+        record = register_service(req.name, req.command, req.args)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"success": True, "service": record}
+
+
+@router.delete("/mcp/services/{name}")
+async def delete_mcp_service(
+    name: str,
+    _: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """删除一个外部 MCP 服务配置。内置服务不可删除。
+
+    仅删除配置（下次会话构建不再注册）；正在运行的会话不受影响
+    （MCPManager 按会话构建，进程生命周期随会话）。
+    """
+    from data.mcp_service_store import delete_service
+
+    ok = delete_service(name)
+    if not ok:
+        raise HTTPException(status_code=404, detail="服务不存在或为内置服务，无法删除")
+    return {"success": True}

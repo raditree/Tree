@@ -159,6 +159,48 @@ def get_agent(user_id: str, agent_id: str) -> Optional[Dict[str, Any]]:
         conn.close()
 
 
+def update_agent(
+    user_id: str,
+    agent_id: str,
+    model_id: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """更新 agent 字段（model_id / system_prompt），仅更新非 None 字段。
+
+    用于 ``PATCH /api/agents/{id}``（右侧面板"模型信息"页修改模型与提示词）。
+
+    :param user_id: 用户标识
+    :param agent_id: agent 标识
+    :param model_id: 新模型 ID（可选）
+    :param system_prompt: 新系统提示词（可选）
+    :return: 更新后的 agent 字典；agent 不存在返回 None
+    """
+    _ensure_db()
+    updates: Dict[str, Any] = {}
+    if model_id is not None:
+        updates["model_id"] = model_id
+    if system_prompt is not None:
+        updates["system_prompt"] = system_prompt
+    if not updates:
+        return get_agent(user_id, agent_id)
+
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    values = list(updates.values()) + [user_id, agent_id]
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.execute(
+                f"UPDATE agents SET {set_clause} "
+                "WHERE user_id = ? AND id = ? AND deleted_at IS NULL",
+                values,
+            )
+            conn.commit()
+            updated = cursor.rowcount > 0
+        finally:
+            conn.close()
+    return get_agent(user_id, agent_id) if updated else None
+
+
 def delete_agent(user_id: str, agent_id: str) -> bool:
     """软删除指定 agent（标记 deleted_at），保留其对话历史与 LLM 上下文。
 
