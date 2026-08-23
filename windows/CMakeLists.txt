@@ -39,7 +39,8 @@ add_definitions(-DUNICODE -D_UNICODE)
 # of modifying this function.
 function(APPLY_STANDARD_SETTINGS TARGET)
   target_compile_features(${TARGET} PUBLIC cxx_std_17)
-  target_compile_options(${TARGET} PRIVATE /W4 /WX /wd"4100")
+  # /utf-8: 让 MSVC 按 UTF-8 解析源码，避免中文注释在 GBK 代码页下触发 C4819
+  target_compile_options(${TARGET} PRIVATE /W4 /WX /utf-8 /wd"4100")
   target_compile_options(${TARGET} PRIVATE /EHsc)
   # 静态链接 VC++ CRT，消除对 vc_redist 的依赖
   target_compile_options(${TARGET} PRIVATE "$<$<CONFIG:Release>:/MT>$<$<CONFIG:Profile>:/MT>$<$<CONFIG:Debug>:/MTd>")
