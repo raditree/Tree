@@ -170,6 +170,8 @@ class AgentLLMSession:
 
     # 上下文压缩：保留最近 N 次用户要求原文（重要，保持不变）
     KEEP_RECENT_USER_MSGS: int = 3
+    # 压缩时额外保留的最近消息条数（当前活动轮次尾部，保证工具序列连续）
+    KEEP_TAIL_LENGTH: int = 8
     # 上下文压缩阈值比例（达到 max_seqlen 的 80% 时触发）
     COMPRESS_THRESHOLD: float = 0.8
     # 调用 LLM 总结时，截断送入总结器的最长文本长度（控制成本）
@@ -811,6 +813,24 @@ class AgentLLMSession:
             return max(base + added, char_est)
         return char_est
 
+    @staticmethod
+    def _legal_tail_start(other_msgs: List[Dict[str, Any]], start: int) -> int:
+        """把截断起点回退到合法的消息角色（user/assistant）。
+
+        后缀若以 ``role == "tool"`` 的消息开头，会引用已不在保留范围内的
+        assistant tool_calls，导致对网关非法；这里回退到其所属的 assistant
+        （或 user），保证截断后的上下文自洽。
+
+        :param other_msgs: 非 system 消息列表
+        :param start: 期望的截断起点
+        :return: 回退后的合法起点（不小于 0）
+        """
+        if start >= len(other_msgs):
+            return start  # 空尾部（最后一条用户消息之后无内容）
+        while start > 0 and other_msgs[start].get("role") == "tool":
+            start -= 1
+        return max(start, 0)
+
     def _repair_context(self) -> None:
         """修复被中途「停止」/异常打断的上下文不一致。
 
@@ -871,10 +891,12 @@ class AgentLLMSession:
 
         压缩策略（针对"长程任务"重新设计）：
         - 系统提示词（system 消息）始终保留。
-        - 保留最近 ``KEEP_RECENT_USER_MSGS`` 次用户要求原文，以及它们之后
-          的所有消息（即当前任务上下文原样保留，不丢失用户最新指示）。
-        - 更早的消息调用 LLM 总结工具调用轨迹与任务上下文，生成一条 summary，
-          替换进上下文。
+        - 优先保留用户输入：保留最近 ``KEEP_RECENT_USER_MSGS`` 次用户要求
+          原文，而不是完整的 tool 调用轨迹。
+        - 额外保留当前活动轮次尾部 ``KEEP_TAIL_LENGTH`` 条消息（保持工具
+          序列连续、保留即时执行状态）。
+        - 其余消息（更早的用户输入 + 中间/更早的 tool 调用轨迹）调用 LLM
+          总结成一条 summary，替换进上下文。
 
         返回是否实际执行了压缩。
         """
@@ -896,25 +918,51 @@ class AgentLLMSession:
             msg for msg in self.context if msg.get("role") != "system"
         ]
 
-        # 定位"需保留的起点"：保留最近 N 次用户要求及其后的所有消息。
+        # 定位用户消息与当前活动轮次。
         user_indices = [
             i for i, m in enumerate(other_msgs) if m.get("role") == "user"
         ]
         if len(other_msgs) <= 1:
             return False
+
+        # 保留策略（优先保留用户输入，而非完整 tool 调用轨迹）：
+        # - 保留最近 KEEP_RECENT_USER_MSGS 条用户输入原文；
+        # - 额外保留当前活动轮次尾部 KEEP_TAIL_LENGTH 条消息（保持工具序列
+        #   连续、保留即时执行状态，但限制条数，避免单轮超长 tool 轨迹导致
+        #   永不压缩）；
+        # - 其余全部消息（更早的用户输入 + 中间/更早的 tool 轨迹）进总结。
+        kept_user_msgs: List[Dict[str, Any]] = []
+        tail_msgs: List[Dict[str, Any]] = []
         if user_indices:
-            # 保留最近 KEEP_RECENT_USER_MSGS 次用户要求；不足时从第一条用户消息起保留
-            keep_from = user_indices[
+            keep_user_from = user_indices[
                 max(0, len(user_indices) - self.KEEP_RECENT_USER_MSGS)
             ]
+            kept_user_msgs = [
+                m for m in other_msgs[keep_user_from:] if m.get("role") == "user"
+            ]
+            last_user_idx = user_indices[-1]
+            tail_start = max(
+                last_user_idx + 1,
+                len(other_msgs) - self.KEEP_TAIL_LENGTH,
+            )
+            tail_start = self._legal_tail_start(other_msgs, tail_start)
+            tail_msgs = other_msgs[tail_start:]
         else:
-            # 没有用户消息（异常态），保留最近若干条
-            keep_from = max(0, len(other_msgs) - 5)
+            # 没有用户消息（异常态），仅保留最近若干条
+            tail_start = max(
+                0,
+                len(other_msgs) - self.KEEP_TAIL_LENGTH,
+            )
+            tail_start = self._legal_tail_start(other_msgs, tail_start)
+            tail_msgs = other_msgs[tail_start:]
 
-        to_summarize = other_msgs[:keep_from]
-        to_keep = other_msgs[keep_from:]
+        to_keep = kept_user_msgs + tail_msgs
 
-        # 无可总结内容（最近 N 次用户要求已覆盖全部消息）
+        # 待总结：其余全部消息（按原始顺序，保留更早的用户输入与 tool 轨迹）
+        kept_ids = {id(m) for m in to_keep}
+        to_summarize = [m for m in other_msgs if id(m) not in kept_ids]
+
+        # 无可总结内容（上下文本身较短，仍在保留窗口内）
         if not to_summarize:
             return False
 
@@ -935,8 +983,11 @@ class AgentLLMSession:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("归档 pre-compact 上下文失败(已忽略): %s", exc)
 
-        # 重组上下文：system 消息 + 总结 + 保留的最近用户要求及其后消息
+        # 重组上下文：system 消息 + 总结 + 保留的最近用户输入 + 活动轮次尾部。
+        # 尾部截断可能留下「assistant 带 tool_calls 但缺 tool 响应」的非法序列，
+        # 重组后复用 _repair_context 补占位响应，保证对网关合法。
         self.context = system_msgs + [summary_msg] + to_keep
+        self._repair_context()
 
         # 重构 context 完成后重建 system prompt（spec「注入时机」）：注入最新
         # Spec 索引 / 已选 Spec 全文 / memory / 成员拓扑。回调由 chat.py 注入

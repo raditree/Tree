@@ -1132,11 +1132,19 @@ class _MessagePanelState extends State<MessagePanel> {
       );
       if (!mounted) return;
       final bool compressed = result['compressed'] == true;
-      final String message = compressed
-          ? '已压缩上下文（当前 ${result['context_size']} 条）'
-          : (result['reason'] == 'no_active_session'
-              ? '该 agent 当前没有活跃的会话上下文'
-              : '上下文无需压缩或该 agent 不支持');
+      final String reason = (result['reason'] ?? '') as String;
+      final String message;
+      if (compressed) {
+        message = '已压缩上下文（当前 ${result['context_size']} 条）';
+      } else if (reason == 'no_active_session') {
+        message = '该 agent 当前没有活跃的会话上下文';
+      } else if (reason == 'too_few_messages') {
+        message = '对话消息太少，暂无需压缩';
+      } else if (reason == 'nothing_to_summarize') {
+        message = '最近对话较短，暂无需压缩';
+      } else {
+        message = '上下文无需压缩';
+      }
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(message),

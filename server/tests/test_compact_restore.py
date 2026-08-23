@@ -101,6 +101,48 @@ class TestCompactRestore(unittest.TestCase):
         load_mock.assert_not_called()
         save_mock.assert_not_called()
 
+    def test_compact_not_compressed_reports_reason(self):
+        """有活跃会话但 compress 返回 False：应给出具体 reason，避免前端误报。"""
+        fake_session = MagicMock()
+        fake_session.compress.return_value = False
+        fake_session.context = list(self.ctx)
+
+        with patch.object(routes, "get_session", return_value=fake_session), \
+             patch.object(routes, "load_context") as load_mock, \
+             patch.object(routes, "save_context") as save_mock:
+            result = _run(routes.compact_agent_context(
+                self.agent_id,
+                body={"session_id": self.session_id},
+                current_user={"openid": self.user_id},
+            ))
+
+        self.assertFalse(result["compressed"])
+        # 会话含 system + 4 条非 system 消息：应归类为无可总结历史
+        self.assertEqual(result["reason"], "nothing_to_summarize")
+        load_mock.assert_not_called()
+        save_mock.assert_not_called()
+
+    def test_compact_too_few_messages_reason(self):
+        """有活跃会话但消息太少：reason 应为 too_few_messages。"""
+        fake_session = MagicMock()
+        fake_session.compress.return_value = False
+        fake_session.context = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hello"},
+        ]
+
+        with patch.object(routes, "get_session", return_value=fake_session), \
+             patch.object(routes, "load_context") as load_mock:
+            result = _run(routes.compact_agent_context(
+                self.agent_id,
+                body={"session_id": self.session_id},
+                current_user={"openid": self.user_id},
+            ))
+
+        self.assertFalse(result["compressed"])
+        self.assertEqual(result["reason"], "too_few_messages")
+        load_mock.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

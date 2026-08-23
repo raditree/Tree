@@ -170,12 +170,20 @@ async def compact_agent_context(
     if restored_from_db:
         # 压缩结果写回 DB，保证重启后上下文仍是压缩后的最新状态
         save_context(user_id, agent_id, session.context, session_id)
-    return {
+    result: Dict[str, Any] = {
         "success": True,
         "compressed": compressed,
         "context_size": len(session.context),
         "session_id": session_id,
     }
+    # 有活跃会话但未实际压缩时，区分原因（对话消息太少 / 最近对话均在保留窗口内），
+    # 避免前端误报"无需压缩或该 agent 不支持"
+    if not compressed:
+        non_system = [m for m in session.context if m.get("role") != "system"]
+        result["reason"] = (
+            "too_few_messages" if len(non_system) <= 1 else "nothing_to_summarize"
+        )
+    return result
 
 
 # ===== 多会话管理（P2 多会话并行） =====

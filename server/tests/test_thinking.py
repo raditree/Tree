@@ -266,7 +266,7 @@ class TestThinkingApiKwargs(unittest.TestCase):
 
 
 class TestContextCompress(unittest.TestCase):
-    """上下文压缩：用户消息不足时不得越界。
+    """上下文压缩：保留用户输入、压缩 tool 轨迹，用户消息不足时不得越界。
 
     回归：历史上当用户消息条数 < KEEP_RECENT_USER_MSGS(3) 时，
     ``user_indices[-3]`` 触发 ``IndexError: list index out of range``，
@@ -291,9 +291,58 @@ class TestContextCompress(unittest.TestCase):
             {"role": "assistant", "content": "回复二"},
         ]
         # force=True 跳过阈值，直接进入压缩逻辑；不得抛 IndexError
-        result = session.compress(force=True)
-        # 第一条用户消息即保留起点 → 无需总结，返回 False（不崩溃即为通过）
-        self.assertFalse(result)
+        with patch.object(session, "_summarize_with_llm", return_value="摘要"):
+            result = session.compress(force=True)
+        # 新策略：保留两条用户输入 + 尾部（回复二），中间的回复一进总结 → True
+        self.assertTrue(result)
+        # 重组后：system + summary + 用户输入 + 尾部
+        roles = [m["role"] for m in session.context]
+        self.assertEqual(roles, ["system", "system", "user", "user", "assistant"])
+        # 用户输入原文完整保留
+        contents = [m["content"] for m in session.context if m["role"] == "user"]
+        self.assertEqual(contents, ["任务一", "任务二"])
+
+    def test_compress_single_turn_many_tool_calls(self):
+        """单轮任务大量 tool 调用：应压缩中间 tool 轨迹，仅保留用户输入与尾部。"""
+        session = AgentLLMSession(
+            model_config=ModelConfig(
+                name="t", base_url="http://localhost:8000",
+                api_key="k", model_id="m",
+                extra={"max_seqlen": 4096},
+            ),
+            workspace_id="ws", system_prompt="sys",
+        )
+        ctx = [{"role": "system", "content": "sys"},
+               {"role": "user", "content": "任务指令"}]
+        for i in range(20):
+            ctx.append({"role": "assistant",
+                        "tool_calls": [{"id": f"t{i}", "type": "function",
+                                        "function": {"name": "f", "arguments": "{}"}}],
+                        "content": ""})
+            ctx.append({"role": "tool", "tool_call_id": f"t{i}",
+                        "content": f"结果{i}"})
+        ctx.append({"role": "assistant", "content": "完成"})
+        session.context = ctx
+        with patch.object(session, "_summarize_with_llm", return_value="摘要"):
+            result = session.compress(force=True)
+        self.assertTrue(result)
+        # 用户输入原文保留
+        contents = [m["content"] for m in session.context if m["role"] == "user"]
+        self.assertEqual(contents, ["任务指令"])
+        # 大部分 tool 轨迹被总结压缩，只保留尾部少量
+        tool_cnt = len([m for m in session.context if m["role"] == "tool"])
+        self.assertLess(tool_cnt, 20)
+        self.assertGreater(tool_cnt, 0)
+        # 重组后上下文必须以 system(system+summary) 开头，且工具序列合法
+        self.assertEqual(session.context[0]["role"], "system")
+        self.assertEqual(session.context[1]["role"], "system")
+        # 尾部 assistant(tool_calls) 均有对应 tool 响应（无孤立的 tool 消息）
+        have = {m.get("tool_call_id") for m in session.context
+                if m.get("role") == "tool"}
+        for msg in session.context:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    self.assertIn(tc.get("id"), have)
 
 
 if __name__ == "__main__":

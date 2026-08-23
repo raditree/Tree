@@ -554,7 +554,17 @@ class LocalExecutorService extends ChangeNotifier {
       final String full = _resolveInWorkspace(wsDir, path);
       final File file = File(full);
       await file.parent.create(recursive: true);
-      await file.writeAsString(content);
+      final String lower = path.toLowerCase();
+      if (lower.endsWith('.ps1') ||
+          lower.endsWith('.bat') ||
+          lower.endsWith('.cmd')) {
+        // Windows PowerShell 5.1 / cmd.exe 读取无 BOM 的脚本文件时按
+        // ANSI（中文系统为 GBK）解码，会破坏 UTF-8 中文（如 git commit 消息
+        // 双重乱码）；加 UTF-8 BOM 强制按 UTF-8 解析。
+        await file.writeAsBytes(utf8.encode('\uFEFF$content'), flush: true);
+      } else {
+        await file.writeAsString(content, flush: true);
+      }
       return <String, dynamic>{'success': true, 'file_path': path};
     } catch (e) {
       return <String, dynamic>{'error': '写入文件失败: $e', 'file_path': path};
