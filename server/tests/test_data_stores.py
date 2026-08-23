@@ -216,7 +216,7 @@ class TestTeamStore(DataStoreBase):
 
 class TestTeamInit(DataStoreBase):
     def test_pick_names_global_unique(self):
-        pool = ["晏清", "知遥", "砚秋", "景行", "予安", "昭野", "婉宁", "叙白", "乐仪"]
+        pool = team_init._load_names()
         # 无已用名字时，返回 count 个互不重复的名字
         names = team_init._pick_names("u", "top_a", 4)
         self.assertEqual(len(names), 4)
@@ -225,10 +225,14 @@ class TestTeamInit(DataStoreBase):
             self.assertIn(n, pool)
 
     def test_pick_names_reject_all_used(self):
-        """名字池不足（需求超出可用个数）应抛错并提示扩充名字池。"""
-        self.assertEqual(len(team_init._load_names()), 9)
+        """名字池不足（需求超出可用个数）应抛错并提示扩充名字池。
+
+        不依赖 names.json 的固定数量：以当前池大小 +1 作为需求，确保必然超出。
+        """
+        pool = team_init._load_names()
+        self.assertGreaterEqual(len(pool), 1)  # 名字池非空
         with self.assertRaises(ValueError):
-            team_init._pick_names("u", "top_b", 100)
+            team_init._pick_names("u", "top_b", len(pool) + 1)
 
 
 if __name__ == "__main__":
