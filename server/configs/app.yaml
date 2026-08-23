@@ -33,7 +33,7 @@ llm:
   max_retries: 1
   # 主动延迟限流（帧率控制式固定时间步节奏）：见 llm/rate_limit.py
   # 平均每 API 调用次数 / 分钟（限制上游调用频率，默认 6）
-  rate_per_minute: 6
+  rate_per_minute: 4
   # 最小调用间隔（秒），0 时自动按 60/rate_per_minute 推导（默认 10s）
   min_interval_seconds: 0
 

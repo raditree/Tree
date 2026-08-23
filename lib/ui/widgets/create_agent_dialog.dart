@@ -149,7 +149,7 @@ class _CreateAgentDialogState extends State<CreateAgentDialog> {
               TextField(
                 controller: _nameController,
                 decoration: const InputDecoration(
-                  hintText: '例如：代码审查员',
+                  hintText: '例如：樾深',
                   isDense: true,
                   border: OutlineInputBorder(),
                 ),
