@@ -85,3 +85,6 @@ server/*.log
 
 # 后端统一运行日志目录（server/logs/app.log 及滚动副本）
 server/logs/
+
+# SFT 数据收集运行时产物（server/data/sft/sft_YYYYMMDD.jsonl）
+server/data/sft/

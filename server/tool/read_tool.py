@@ -9,6 +9,7 @@
 import base64
 import logging
 import os
+import re
 from typing import Any, Dict, List
 
 from io_.workspace_io import WorkspaceIO, run_io
@@ -60,8 +61,12 @@ class ReadTool:
         """
         if not path or len(path) > 4096:
             return False
-        # 拒绝绝对路径与 shell 元字符
-        if path.startswith("/") or path.startswith("\\"):
+        # 拒绝绝对路径与 shell 元字符（含 Windows 盘符路径如 C:\file.png）
+        if (
+            path.startswith("/")
+            or path.startswith("\\")
+            or re.match(r"^[A-Za-z]:", path)
+        ):
             return False
         if ".." in path.replace("\\", "/").split("/"):
             return False

@@ -108,6 +108,10 @@ class TestImagePathValidation(unittest.TestCase):
     def test_reject_absolute_path(self):
         self.assertFalse(ReadTool._is_valid_image_path("/etc/passwd.png"))
         self.assertFalse(ReadTool._is_valid_image_path("\\server\\share.png"))
+        # Windows 盘符绝对路径
+        self.assertFalse(ReadTool._is_valid_image_path("C:\\file.png"))
+        self.assertFalse(ReadTool._is_valid_image_path("C:/file.png"))
+        self.assertFalse(ReadTool._is_valid_image_path("d:\\tmp\\a.png"))
 
     def test_reject_parent_traversal(self):
         self.assertFalse(ReadTool._is_valid_image_path("../secret.png"))
