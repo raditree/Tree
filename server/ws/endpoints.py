@@ -312,8 +312,15 @@ def register_ws(app: FastAPI) -> None:
                             },
                         )
                         continue
+                    # 数据最小化：后端不存储/消费 SSH 密码（连接由前端发起），
+                    # 在边界处即剔除，避免密码经 WS 传送到后端。
+                    ssh_cfg = {
+                        k: v
+                        for k, v in data.get("config", {}).items()
+                        if k != "password"
+                    }
                     ok, reason = state.ssh_manager.register(
-                        user_id, top_agent_id, data.get("config", {})
+                        user_id, top_agent_id, ssh_cfg
                     )
                     if not ok:
                         await state.ws_manager.send_message(

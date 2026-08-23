@@ -53,7 +53,6 @@ class SSHConnectionManager:
             port=int(cfg.get("port", 22) or 22),
             username=cfg.get("username", ""),
             auth_type=cfg.get("auth_type", "password"),
-            password=cfg.get("password", ""),
             private_key_path=cfg.get("private_key_path", ""),
             remote_base_dir=cfg.get("remote_base_dir", ""),
         )

@@ -1120,7 +1120,6 @@ class SSHRegisterRequest(BaseModel):
     port: int = 22
     username: str = ""
     auth_type: str = "password"
-    password: str = ""
     private_key_path: str = ""
     remote_base_dir: str = ""
 
@@ -1163,7 +1162,6 @@ async def register_ssh(
             "port": req.port,
             "username": req.username,
             "auth_type": req.auth_type,
-            "password": req.password,
             "private_key_path": req.private_key_path,
             "remote_base_dir": req.remote_base_dir,
         },
