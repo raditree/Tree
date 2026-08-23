@@ -212,6 +212,8 @@ def register_builtin_tools(
         session, docker_manager, model_configs, broker=broker, user_id=user_id,
         agent_id=agent_id, leader_id=leader_id, top_agent_id=top_agent_id,
         message_dispatcher=message_dispatcher, io=io,
+        # 透传当前会话：成员上下文按 session 隔离
+        session_id=session_id,
     )
     ask_tool = AskUserQuestionTool(ws_manager=ws_manager, user_id=user_id)
     # 绑定主事件循环，供 AskUserQuestion 在消费线程内安全推送 WS 消息

@@ -75,6 +75,7 @@ class TeamTool:
         top_agent_id: str = "",
         message_dispatcher: Any = None,
         io: Any = None,
+        session_id: str = "",
     ) -> None:
         """初始化 team 工具。
 
@@ -87,6 +88,8 @@ class TeamTool:
         :param agent_id: 当前 agent 的 ID
         :param leader_id: 当前 agent 的上级 leader ID（用于队友向 leader 发消息）
         :param top_agent_id: 顶层 agent 的 ID，用于预算追踪（团队成员共享顶层预算）
+        :param session_id: 当前会话 ID（透传到成员投递，保证成员上下文
+                           按 session 隔离；为空时投递回退默认会话）
         """
         self.session = session
         self.docker_manager = docker_manager
@@ -97,6 +100,8 @@ class TeamTool:
         self.agent_id = agent_id
         self.leader_id = leader_id
         self.top_agent_id = top_agent_id or agent_id
+        # 当前会话 ID：leader 投递成员消息时透传，成员上下文按 session 隔离
+        self.session_id = session_id or ""
         # 统一消息发送回调（main 提供）：User-Agent / Agent-Agent 收敛出口
         self.message_dispatcher = message_dispatcher
         # 统一工作空间 IO（WorkspaceIO）：成员空间/roster/身份文件读写走统一通道，
@@ -404,6 +409,8 @@ class TeamTool:
                 "leader_id": self.leader_id,
                 "top_agent_id": self.top_agent_id,
                 "content": content,
+                # 透传当前会话：成员上下文/历史按 session 隔离，避免多会话串扰
+                "session_id": self.session_id,
             },
         )
 
@@ -1196,6 +1203,8 @@ class TeamTool:
                             "请刷新你的成员拓扑认知，以最新名单为准：\n"
                             + roster_md),
                 "event": "roster_update",
+                # 透传当前会话：成员上下文按 session 隔离
+                "session_id": self.session_id,
             }
             try:
                 if self.broker is not None:
@@ -1469,6 +1478,8 @@ class TeamTool:
                 source_agent_id=self.agent_id,
                 top_agent_id=self.top_agent_id,
                 system_prompt="",
+                # 透传当前会话：成员上下文/历史按 session 隔离
+                extra={"session_id": self.session_id},
             )
             dispatched = result.get("status") in ("sent", "partial")
             rejected += result.get("rejected", []) or []
@@ -1531,6 +1542,8 @@ class TeamTool:
                 message,
                 source_agent_id=self.agent_id,
                 top_agent_id=self.top_agent_id,
+                # 透传当前会话：成员上下文/历史按 session 隔离
+                extra={"session_id": self.session_id},
             )
             rejected = result.get("rejected", []) or []
         else:

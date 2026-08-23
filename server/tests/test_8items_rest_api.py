@@ -265,5 +265,92 @@ class TestUserMessageSessionChain(unittest.TestCase):
         self.assertEqual(captured.get("session_id"), "sess-abc")
 
 
+class TestTeamMemberSessionIsolation(unittest.TestCase):
+    """R2 成员链路层：leader 投递消息给成员时 session_id 必须透传。
+
+    此前 TeamTool._dispatch_to_member / message_dispatcher 构造的 payload
+    不带 session_id，成员在 _process_member_message 中恒回退默认会话，
+    导致成员上下文跨会话串扰。修复后要求：
+    1. _dispatch_to_member payload 含当前会话 session_id；
+    2. message_dispatcher 调用（send_message/broadcast）经 extra 透传 session_id；
+    3. _dispatch_roster_event 广播 payload 同样带 session_id。
+    """
+
+    def _make_tool(self, session_id: str = "sess-m"):
+        """构造带指定 session_id 的 TeamTool（依赖为占位，仅测投递 payload）。"""
+        from tool.team_tool import TeamTool
+
+        session = MagicMock()
+        session.workspace_id = "ws-m"
+        tool = TeamTool(
+            session=session,
+            docker_manager=None,
+            model_configs={},
+            broker=MagicMock(),
+            user_id="u1",
+            agent_id="leader-1",
+            leader_id="top-1",
+            top_agent_id="top-1",
+            session_id=session_id,
+        )
+        tool.members = [{
+            "id": "mem-1", "workspace_id": "ws-m", "model_id": "m1",
+            "system_prompt": "", "name": "成员一", "role": "执行",
+        }]
+        return tool
+
+    def test_dispatch_to_member_carries_session_id(self):
+        """_dispatch_to_member 的 broker payload 必须含当前 session_id。"""
+        tool = self._make_tool(session_id="sess-xyz")
+        broker = tool.broker
+        broker.dispatch.return_value = True
+        tool._dispatch_to_member(tool.members[0], "请完成任务")
+        _, payload = broker.dispatch.call_args[0]
+        self.assertEqual(payload["session_id"], "sess-xyz")
+        self.assertEqual(payload["agent_id"], "mem-1")
+
+    def test_default_session_when_empty(self):
+        """session_id 未设置时 payload 为空串，由成员处理侧回退默认会话。"""
+        tool = self._make_tool(session_id="")
+        broker = tool.broker
+        broker.dispatch.return_value = True
+        tool._dispatch_to_member(tool.members[0], "hi")
+        _, payload = broker.dispatch.call_args[0]
+        self.assertEqual(payload["session_id"], "")
+
+    def test_send_message_passes_session_via_extra(self):
+        """send_message 走 message_dispatcher 时经 extra 透传 session_id。"""
+        tool = self._make_tool(session_id="sess-abc")
+
+        def _fake_dispatcher(user_id, target_ids, content, source_agent_id="",
+                             top_agent_id="", system_prompt="", extra=None):
+            self.assertEqual(extra, {"session_id": "sess-abc"})
+            return {"status": "sent", "sent": target_ids, "rejected": []}
+
+        tool.message_dispatcher = _fake_dispatcher
+        result = tool.execute({
+            "action": "send_message",
+            "target_member_id": "mem-1",
+            "message": "开工",
+        })
+        self.assertEqual(result["status"], "sent")
+
+    def test_broadcast_passes_session_via_extra(self):
+        """broadcast 走 message_dispatcher 时经 extra 透传 session_id。"""
+        tool = self._make_tool(session_id="sess-bc")
+
+        def _fake_dispatcher(user_id, target_ids, content, source_agent_id="",
+                             top_agent_id="", system_prompt="", extra=None):
+            self.assertEqual(extra, {"session_id": "sess-bc"})
+            return {"status": "sent", "sent": target_ids, "rejected": []}
+
+        tool.message_dispatcher = _fake_dispatcher
+        result = tool.execute({
+            "action": "broadcast",
+            "message": "全体注意",
+        })
+        self.assertEqual(result["status"], "broadcast")
+
+
 if __name__ == "__main__":
     unittest.main()
