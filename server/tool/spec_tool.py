@@ -1,7 +1,7 @@
 """内置 spec 工具 - Spec 检索/选择/读取/创建/列索引/更新。
 
 Spec = 任务型规范文件（Markdown，含 front matter + 工作流/规范/注意事项三段）。
-- 内置 3 个（easy-task/complex-task/hard-task）为服务端模板，置顶不可删；
+- 内置 4 个（easy-task/complex-task/hard-task/team-meeting）为服务端模板，置顶不可删；
 - 自定义 Spec 落盘到 ``workspace/<agent id>/spec/<id>.md``，元数据索引在
   ``specs`` 表（经 data.spec_store）。
 
@@ -86,7 +86,7 @@ class SpecTool:
                     "何时使用: 任务开始前检索是否已有对应 Spec；任务完成前沉淀新 Spec；"
                     "用户/本会话已选 Spec 需读全文时\n"
                     "何时不用: 无。**必须调用**，即使单文件修改也必须先 **read 并 select** easy spec 再开始任务\n"
-                    "前置依赖: 在搜索更多 spec 前必须先从三个内置基础 spec 中选择一个或多个\n"
+                    "前置依赖: 在搜索更多 spec 前必须先从四个内置基础 spec 中选择一个或多个\n"
                     "动作: search(语义检索) / list(索引) / read(全文) / "
                     "select(多选挂 hook) / create(创建) / update(更新)"
                 ),

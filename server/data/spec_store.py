@@ -30,8 +30,8 @@ _BUILTIN_DIR = (
     Path(__file__).resolve().parent.parent / "tool" / "spec" / "builtin"
 )
 
-# 内置 3 个 Spec 的固定 id（置顶顺序）
-BUILTIN_SPEC_IDS = ("easy-task", "complex-task", "hard-task")
+# 内置 4 个 Spec 的固定 id（置顶顺序）
+BUILTIN_SPEC_IDS = ("easy-task", "complex-task", "hard-task", "team-meeting")
 
 # 写操作锁
 _write_lock = threading.Lock()
