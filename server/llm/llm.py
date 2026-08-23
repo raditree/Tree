@@ -12,6 +12,7 @@ from openai import OpenAI, RateLimitError
 
 from config.config import get_config
 from config.models import ModelConfig
+from prompt.llm_prompts import context_compressor_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -1185,14 +1186,7 @@ class AgentLLMSession:
         if len(raw) > self.SUMMARIZE_CHAR_LIMIT:
             raw = raw[: self.SUMMARIZE_CHAR_LIMIT] + "\n...[截断]"
 
-        summarize_prompt = (
-            "你是上下文压缩器。以下是 agent 与用户、工具之间的一段历史对话，"
-            "包含任务目标、已执行的工具调用轨迹与结果、以及当前进展。\n"
-            "请用简洁的中文总结：1) 用户的任务目标与最新要求；2) 已完成的工具"
-            "调用轨迹与关键结果；3) 当前进展与尚未完成的待办。保留必要的事实"
-            "细节（文件名、路径、数字、结论），不要逐条复述原文。\n\n"
-            f"历史对话：\n{raw}"
-        )
+        summarize_prompt = context_compressor_prompt(raw)
 
         try:
             # 主动延迟：压缩总结也属于该 agent 的 API 调用，同样限速

@@ -23,6 +23,11 @@ from openai import RateLimitError
 import state
 from config.config import get_config
 from config.models import ModelConfig
+from prompt.registry import audit_header
+from prompt.system_chapters import (
+    SYSTEM_STATIC_CHAPTERS,
+    SYSTEM_STATIC_TAIL_CHAPTERS,
+)
 from data.agent_store import get_agent
 from data.conversation_store import (
     load_context,
@@ -288,21 +293,27 @@ def _build_agent_system_prompt(
     session_id: str = "",
     extra_info: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """构建 agent 系统提示词：11 章节全量注入（spec「system prompt 内容」）。
+    """构建 agent 系统提示词：13 章节全量注入（spec「system prompt 内容」）。
 
-    ① 身份与角色（.self/identity.md，默认顶层 Agent 说明）
-    ② 任务执行范式（任务分型路由：判型 easy/complex/hard → 选对应内置 Spec →
-       按其 workflow 执行）
-    ③ 需求→工具路由表（7 需求维度 → 内置工具）
-    ④ .self 文档注入（memory.md，超 4k 已由 _build_workspace_extra_info 压缩）
-    ⑤ Spec 索引（内置 3 置顶 + 自定义，id/task_type/title/when 摘要）
-    ⑥ 已选 Spec 全文（本会话挂 hook 的 Spec，注入 workflow/规范/注意事项全文）
-    ⑦ 工作空间与执行模式（三模式 + shell 类型 + 存储软上限告警）
-    ⑧ 成员拓扑与寻址规则（TOP + 全体成员；top 内按 name 寻址、跨 Top 顶层寻址、
+    章节数据来自集中式版本化注册表（``prompt.system_chapters``）：静态章节
+    （角色权威/任务范式/安全护栏/工具路由/Spec 维护/todo 纪律/[Warning] 负责）
+    由注册表提供并随之版本化；动态章节（身份/memory/Spec 索引/已选 Spec/执行
+    模式/成员拓扑）由本函数按会话现算注入。提示词顶部带审计头（版本+章节清单）。
+
+    ① 身份与角色（.self/identity.md，默认顶层 Agent 说明；成员含 leader 设定）
+    ② 角色权威与行为准则（core，注册表）
+    ③ 任务执行范式（任务分型路由，注册表）
+    ④ 安全与边界护栏（guardrail，注册表）
+    ⑤ 需求→工具路由表（7 需求维度，注册表）
+    ⑥ .self 文档注入（memory.md，超 4k 已由 _build_workspace_extra_info 压缩）
+    ⑦ Spec 索引（内置 4 置顶 + 自定义，id/task_type/title/when 摘要）
+    ⑧ 已选 Spec 全文（本会话挂 hook 的 Spec，注入 workflow/规范/注意事项全文）
+    ⑨ 工作空间与执行模式（三模式 + shell 类型 + 存储软上限告警）
+    ⑩ 成员拓扑与寻址规则（TOP + 全体成员；top 内按 name 寻址、跨 Top 顶层寻址、
        回复路径）
-    ⑨ Spec 维护指引（何时应 search/select/create spec）
-    ⑩ 任务进度管理纪律（todo 须增量更新）
-    ⑪ 工具反馈 [Warning] 负责规则（[Warning] 必须严格关注并回应）
+    ⑪ Spec 维护指引（何时应 search/select/create spec，注册表）
+    ⑫ 任务进度管理纪律（todo 须增量更新，注册表）
+    ⑬ 工具反馈 [Warning] 负责规则（[Warning] 必须严格关注并回应，注册表）
 
     :param workspace_id: 工作空间标识
     :param member_system_prompt: 成员专属系统提示词（leader 通过 update_member 设置）
@@ -312,13 +323,16 @@ def _build_agent_system_prompt(
     :param session_id: 当前会话 ID（读取已选 Spec）
     :param extra_info: ``_build_workspace_extra_info`` 的输出（identity/memory/
                        exec_mode/storage_warning 等现算信息）
-    :return: 9 章节系统提示词
+    :return: 13 章节系统提示词
     """
     extra_info = extra_info or {}
     mode_key = top_agent_id or agent_id
     chapters: List[str] = []
 
-    # ① 身份与角色
+    # 审计头：版本 + 章节清单（可审计、可追溯）
+    chapters.append(audit_header())
+
+    # ① 身份与角色（动态）
     identity = str(extra_info.get("identity") or "").strip()
     if not identity:
         identity = "顶层 Agent（Level 0），直属用户，可创建并带领子团队。"
@@ -327,100 +341,55 @@ def _build_agent_system_prompt(
         identity_chapter.append(f"\n角色分工（leader 设定）:\n{member_system_prompt}")
     chapters.append("\n".join(identity_chapter))
 
-    # ② 任务执行范式：任务分型路由
-    chapters.append(_build_task_paradigm_text())
+    # ②-⑤ 静态核心与护栏章节（角色权威/任务范式/安全护栏/工具路由）：来自注册表
+    for chap in SYSTEM_STATIC_CHAPTERS:
+        chapters.append(f"## {chap.title}\n{chap.content}")
 
-    # ③ 需求→工具路由表（7 维度）
-    chapters.append(_build_tool_routing_text())
-
-    # ④ .self 私人文档（memory.md；rule.md 已移除）
+    # ⑥ .self 私人文档（memory.md；rule.md 已移除）
     memory = str(extra_info.get("memory") or "").strip()
     if memory:
-        chapters.append("## ④ .self 私人文档（memory.md）\n" + memory)
+        chapters.append("## ⑥ .self 私人文档（memory.md）\n" + memory)
     else:
         chapters.append(
-            "## ④ .self 私人文档\n暂无 memory.md；任务完成/关键结论请维护到 "
+            "## ⑥ .self 私人文档\n暂无 memory.md；任务完成/关键结论请维护到 "
             ".self/memory.md 供跨会话记忆。"
         )
 
-    # ⑤ Spec 索引（内置 3 置顶 + 自定义）
+    # ⑦ Spec 索引（内置 4 置顶 + 自定义）
     chapters.append(
-        "## ⑤ Spec 索引（内置 3 置顶 + 自定义）\n" + _build_spec_index_text(agent_id)
+        "## ⑦ Spec 索引（内置 4 置顶 + 自定义）\n" + _build_spec_index_text(agent_id)
     )
 
-    # ⑥ 已选 Spec 全文（本会话挂 hook）
+    # ⑧ 已选 Spec 全文（本会话挂 hook）
     selected_text = _build_selected_specs_text(
         workspace_id, user_id, mode_key, session_id
     )
     if selected_text:
-        chapters.append("## ⑥ 已选 Spec 全文（本会话挂 hook）\n" + selected_text)
+        chapters.append("## ⑧ 已选 Spec 全文（本会话挂 hook）\n" + selected_text)
 
-    # ⑦ 工作空间与执行模式
+    # ⑨ 工作空间与执行模式
     exec_mode = str(extra_info.get("exec_mode") or "").strip()
     if exec_mode:
-        chapter7 = "## ⑦ 工作空间与执行模式\n" + exec_mode
+        chapter9 = "## ⑨ 工作空间与执行模式\n" + exec_mode
         storage_warning = str(extra_info.get("storage_warning") or "").strip()
         if storage_warning:
-            chapter7 += "\n" + storage_warning
-        chapters.append(chapter7)
+            chapter9 += "\n" + storage_warning
+        chapters.append(chapter9)
 
-    # ⑧ 成员拓扑与寻址规则
+    # ⑩ 成员拓扑与寻址规则（动态）
     chapters.append(
         _build_member_topology_text(workspace_id, user_id, mode_key)
     )
 
-    # ⑨ Spec 维护指引
-    chapters.append(_build_spec_maintenance_text())
-
-    # ⑩ 任务进度管理纪律（todo 及时更新）
-    chapters.append(_build_todo_discipline_text())
-
-    # ⑪ 工具反馈 [Warning] 负责规则
-    chapters.append(_build_warning_accountability_text())
+    # ⑪-⑬ 静态尾部章节（Spec 维护/todo 纪律/[Warning] 负责）：来自注册表
+    for chap in SYSTEM_STATIC_TAIL_CHAPTERS:
+        chapters.append(f"## {chap.title}\n{chap.content}")
 
     return "\n\n".join(chapters)
 
 
-def _build_task_paradigm_text() -> str:
-    """② 任务执行范式：任务分型路由（easy/complex/hard/team-meeting → 内置 Spec workflow）。"""
-    return (
-        "## ② 任务执行范式（任务分型路由）\n"
-        "接到任务先判型，再选对应内置 Spec 按其 workflow 执行：\n"
-        "- **easy-task**：单文件(≤3)局部改动 / 明确问答查资料 / tool call 预计 ≤5 / "
-        "无新增依赖与接口变更。直接 read 读上下文 → edit/write/terminal 执行 → "
-        "terminal 验证 → 汇报。\n"
-        "- **complex-task**：跨文件跨模块 / 需分工 / 新功能多组件 / 环境依赖变更。"
-        "先 spec search 找适用 Spec（命中→select 并遵循）→ set_todo_list 分解 → "
-        "按需 team 指派成员 → 按 todo 执行并更新 → 全量验证 → 汇报 → "
-        "无适用 Spec 时 spec create 沉淀。\n"
-        "- **hard-task**：架构级框架级变更 / 新领域无经验 / 高不确定需多方案 / 高危。"
-        "先界定边界 → 召开团队会议讨论选型（遵循 team-meeting，**会议期间只讨论不落地**）→ "
-        "标准团队流水线（需求→方案→评审→实现→测试→交付）→ 高危操作 ask_user_question 确认 → "
-        "末尾强制 spec create 补 Spec。\n"
-        "- **team-meeting**：团队方案讨论/评审/定案。leader 召集会议只讨论、只产出方案；"
-        "成员收到会议消息后**只发言不落地**（禁 write/edit/terminal/assign_task），"
-        "收到明确执行指令后方可开工。\n"
-        "easy 是初判非承诺：执行中复杂度增长（tool call >8 未收敛 / 发现跨文件影响）"
-        "必须切换更高级别，不得硬撑。"
-    )
-
-
-def _build_tool_routing_text() -> str:
-    """③ 需求→工具路由表：7 需求维度 → 内置工具映射。"""
-    return (
-        "## ③ 需求→工具路由表（按需求选工具）\n"
-        "- **上下文获取**：read（读文件）/ spec（检索/读取任务规范）/ mcp call（MCP 工具）\n"
-        "- **文件产出**：write（新建）/ edit（修改）/ read（先看再改）\n"
-        "- **环境执行**：terminal（命令/git/构建/验证，注意 shell 类型语法）\n"
-        "- **外部能力**：mcp call（workspace/document/外部 MCP 服务工具）\n"
-        "- **协同**：team（向成员派发任务/收成果/看进度/跨 Top 顶层通信）\n"
-        "- **任务管理**：set_todo_list（拆解/跟踪进度）/ spec（沉淀规范）\n"
-        "- **人机协作**：ask_user_question（关键决策/高危操作需用户确认时）"
-    )
-
-
 def _build_spec_index_text(agent_id: str) -> str:
-    """⑤ Spec 索引：内置 4 置顶 + 自定义 Spec（id/task_type/title/when 摘要），超限截断。"""
+    """⑦ Spec 索引：内置 4 置顶 + 自定义 Spec（id/task_type/title/when 摘要），超限截断。"""
     try:
         from data.spec_store import list_specs
 
@@ -514,7 +483,7 @@ def _build_member_topology_text(
             roster = _read_workspace_file(workspace_id, ".self/team_roster.md")
         members = _parse_roster_table(roster) if roster.strip() else []
 
-    lines = ["## ⑧ 成员拓扑与寻址规则"]
+    lines = ["## ⑩ 成员拓扑与寻址规则"]
     if members:
         lines.append("当前团队成员（ID | 名称 | 角色 | 职责 | 模型 | 状态 | 层级）:")
         for m in members:
@@ -558,69 +527,6 @@ def _load_members_from_team_store(mode_key: str) -> List[Dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("从 team_store 读取成员拓扑失败: %s", exc)
         return []
-
-
-def _build_spec_maintenance_text() -> str:
-    """⑨ Spec 维护指引：何时应 search/select/create spec。"""
-    return (
-        "## ⑨ Spec 维护指引\n"
-        "- 任务开始前：先用 spec search 检索是否已有对应 Spec（内置 "
-        "easy/complex/hard/team-meeting 或历史自定义）；命中则遵循其 workflow。\n"
-        "- 任务过程中：用户/团队约定、可复用的工作流与规范值得沉淀时 spec create 记录。\n"
-        "- 任务完成后（complex/hard 且无适用 Spec）：spec create 补充对应 Spec"
-        "（hard 强制，缺则任务未闭环）。\n"
-        "- 中途新增选择：spec select 挂 hook，下次重构 context（compact/新建会话）"
-        "自动注入全文；立即使用请用 spec read 取全文进对话上下文。"
-    )
-
-
-def _build_todo_discipline_text() -> str:
-    """⑩ 任务进度管理纪律：todo 必须增量、及时、诚实更新。
-
-    提示词工程师要点：
-    - 反模式：任务开始时一次 set 全量 todos，然后全程不动，直到全部完成才一次性
-      update 标注 completed。评估与进度失真，用户无法感知中途进展。
-    - 正模式：todos 是"活"清单。建好在里程碑（每完成/推进一项、遇到阻塞）处
-      及时增量 update，让用户随时看到真实进度。
-    """
-    return (
-        "## ⑩ 任务进度管理纪律（todo 须增量更新）\n"
-        "- **及时性**：不要「建好 todos 后扔一边、最后统一标完成」。每完成一个子任务、"
-        "每取得阶段性进展、每遇到阻塞，都要**立即**用 set_todo_list update 更新对应 "
-        "todo（status/progress），让前端 Todo 面板始终反映真实进度。\n"
-        "- **诚实性**：progress 按实际完成度填（如 0/50/100），status 只在真正完成时置 "
-        "completed、受阻时置 blocked；不得为了好看虚报全绿。\n"
-        "- **小步更新**：宁可多次小更新，不要攒到最后一次大改。100 条消息的复杂任务，"
-        "每条 todo 应在它完成的那轮附近被标注，而非任务结束时才统一写完成。\n"
-        "- **中途变化**：执行中发现原计划不适用需调整范围时，用 set_todo_list set "
-        "整体替换清单并如实标注（含新增/删除/合并），不要保留已过时的 todo。\n"
-        "- **长任务/团队任务必用**：hard / 多人协作务必全程维护 todos，作为进度契约"
-        "与回滚依据；easy 小任务可不建。"
-    )
-
-
-def _build_warning_accountability_text() -> str:
-    """⑪ 工具反馈 [Warning] 负责规则：所有 [Warning] 必须严格关注并回应。
-
-    提示词工程师要点：
-    - 反模式：把重复出现的 [Warning]（如 todo 未设置、spec 未选择）当作"背景噪音"
-      忽略，导致 todo/spec 机制空转、任务管理失真。
-    - 正模式：[Warning] 是服务端主动注入的"必须行动"信号，即使重复出现也要逐条
-      回应；确需忽略时必须 ask_user_question 向用户申请，申请须准确具体。
-    """
-    return (
-        "## ⑪ 工具反馈 [Warning] 负责规则\n"
-        "工具返回（含注入到工具结果中的状态字段）里所有带 `[Warning]` 标记的内容"
-        "（如 todo 未设置/无 in_progress、spec 未选择等）都是你必须负责的信号：\n"
-        "- **严格关注**：逐条阅读并回应，即使重复出现、即使看似背景噪音，也不得"
-        "跳过或无视。\n"
-        "- **立即行动**：针对 Warning 内容采取对应动作（建/更新 todo、select 内置 "
-        "spec、修正参数、补充缺失信息等），不拖延、不搁置。\n"
-        "- **申请忽略**：若确实无法/无需处理某个 Warning（如与当前任务无关、忽略不"
-        "影响质量），必须用 ask_user_question 向用户申请忽略；申请必须**准确、具体**"
-        "（指明是哪个 Warning、为什么忽略、对任务的影响），不得泛化（如\"忽略所有"
-        "警告\"）。"
-    )
 
 
 def _build_exec_mode_text(

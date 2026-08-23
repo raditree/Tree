@@ -14,6 +14,13 @@ pinned: true
 builtin: true
 created_at: 0
 updated_at: 0
+version: 1
+classification: 内部规范
+risk: medium
+changelog:
+  - version: 1
+    date: 2026-08-23
+    changes: ["初版：纳入版本化提示词体系，补充版本与审计元数据"]
 ---
 
 ## 工作流（workflow）

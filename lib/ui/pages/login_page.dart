@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../io/api_service.dart';
 import '../../io/auth_service.dart';
+import '../../io/websocket_service.dart';
 
 /// 登录页面
 ///
@@ -21,6 +23,13 @@ class _LoginPageState extends State<LoginPage> {
   final TextEditingController _confirmPasswordController = TextEditingController();
   final TextEditingController _nicknameController = TextEditingController();
 
+  /// 后端 IP 与端口输入控制器（左下角切换后端地址用）
+  final TextEditingController _backendHostController = TextEditingController();
+  final TextEditingController _backendPortController = TextEditingController();
+
+  /// 当前显示的后端地址（host:port）
+  String _backendLabel = '';
+
   /// 当前是否处于注册模式
   bool _isRegister = false;
 
@@ -31,12 +40,116 @@ class _LoginPageState extends State<LoginPage> {
   String _errorMsg = '';
 
   @override
+  void initState() {
+    super.initState();
+    _loadBackendConfig();
+  }
+
+  @override
   void dispose() {
     _usernameController.dispose();
     _passwordController.dispose();
     _confirmPasswordController.dispose();
     _nicknameController.dispose();
+    _backendHostController.dispose();
+    _backendPortController.dispose();
     super.dispose();
+  }
+
+  /// 加载本地保存的后端地址配置（未自定义时使用平台默认值）
+  Future<void> _loadBackendConfig() async {
+    final prefs = await SharedPreferences.getInstance();
+    final String host = prefs.getString('custom_backend_host') ?? '';
+    final String port = prefs.getString('custom_backend_port') ?? '';
+    final String backendHost =
+        host.isNotEmpty && port.isNotEmpty ? host : ApiService.defaultBackendHost();
+    final String backendPort =
+        host.isNotEmpty && port.isNotEmpty ? port : '8000';
+    _backendHostController.text = host;
+    _backendPortController.text = port;
+    if (mounted) {
+      setState(() => _backendLabel = '$backendHost:$backendPort');
+    }
+  }
+
+  /// 弹窗编辑后端 IP + 端口，保存后立即生效（允许先切换再登录）
+  Future<void> _openBackendSwitchDialog() async {
+    final String currentHost = ApiService.baseUrl
+        .replaceFirst('http://', '')
+        .replaceFirst('https://', '')
+        .split(':')
+        .first;
+    _backendHostController.text =
+        _backendHostController.text.isNotEmpty ? _backendHostController.text : currentHost;
+    _backendPortController.text =
+        _backendPortController.text.isNotEmpty ? _backendPortController.text : '8000';
+
+    final bool? saved = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext ctx) => AlertDialog(
+        title: const Text('切换后端地址'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: _backendHostController,
+                keyboardType: TextInputType.url,
+                decoration: const InputDecoration(
+                  labelText: 'IP / 域名',
+                  hintText: 'localhost',
+                  prefixIcon: Icon(Icons.dns_outlined, size: 20),
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _backendPortController,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  labelText: '端口',
+                  hintText: '8000',
+                  prefixIcon: Icon(Icons.numbers_outlined, size: 20),
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+
+    if (saved != true || !mounted) return;
+
+    final String hostText = _backendHostController.text.trim();
+    final String portText = _backendPortController.text.trim();
+    final String backendHost = hostText.isNotEmpty ? hostText : ApiService.defaultBackendHost();
+    final String backendPort = hostText.isNotEmpty && portText.isNotEmpty ? portText : '8000';
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('custom_backend_host', hostText);
+    await prefs.setString('custom_backend_port', portText);
+
+    // HTTP 与 WebSocket 同步指向同一后端，避免切换后 WS 仍连旧地址
+    ApiService.baseUrl = 'http://$backendHost:$backendPort';
+    WebSocketService.baseUrl = 'ws://$backendHost:$backendPort';
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('已切换后端地址：$backendHost:$backendPort')),
+    );
+    setState(() => _backendLabel = '$backendHost:$backendPort');
   }
 
   /// 切换登录/注册模式并清空错误提示
@@ -115,110 +228,130 @@ class _LoginPageState extends State<LoginPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFFF3F4F6),
-      body: Center(
-        child: SingleChildScrollView(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 380),
-            child: Card(
-              margin: const EdgeInsets.all(24),
-              elevation: 2,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Padding(
-                padding: const EdgeInsets.all(32),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Text(
-                      'Agent 团队效率工具',
-                      style: TextStyle(
-                        fontSize: 22,
-                        fontWeight: FontWeight.bold,
-                        color: Color(0xFF2563EB),
-                      ),
-                    ),
-                    const SizedBox(height: 24),
-                    _buildModeSwitcher(),
-                    const SizedBox(height: 20),
-                    TextField(
-                      controller: _usernameController,
-                      decoration: const InputDecoration(
-                        labelText: '用户名',
-                        prefixIcon: Icon(Icons.person_outline, size: 20),
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: _passwordController,
-                      obscureText: true,
-                      decoration: const InputDecoration(
-                        labelText: '密码',
-                        prefixIcon: Icon(Icons.lock_outline, size: 20),
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                    if (_isRegister) ...[
-                      const SizedBox(height: 12),
-                      TextField(
-                        controller: _confirmPasswordController,
-                        obscureText: true,
-                        decoration: const InputDecoration(
-                          labelText: '确认密码',
-                          prefixIcon: Icon(Icons.lock_outline, size: 20),
-                          border: OutlineInputBorder(),
+      body: Stack(
+        children: [
+          Center(
+            child: SingleChildScrollView(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 380),
+                child: Card(
+                  margin: const EdgeInsets.fromLTRB(24, 24, 24, 64),
+                  elevation: 2,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.all(32),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Text(
+                          'Agent 团队效率工具',
+                          style: TextStyle(
+                            fontSize: 22,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFF2563EB),
+                          ),
                         ),
-                      ),
-                      const SizedBox(height: 12),
-                      TextField(
-                        controller: _nicknameController,
-                        decoration: const InputDecoration(
-                          labelText: '昵称（可选）',
-                          prefixIcon: Icon(Icons.badge_outlined, size: 20),
-                          border: OutlineInputBorder(),
+                        const SizedBox(height: 24),
+                        _buildModeSwitcher(),
+                        const SizedBox(height: 20),
+                        TextField(
+                          controller: _usernameController,
+                          decoration: const InputDecoration(
+                            labelText: '用户名',
+                            prefixIcon: Icon(Icons.person_outline, size: 20),
+                            border: OutlineInputBorder(),
+                          ),
                         ),
-                      ),
-                    ],
-                    if (_errorMsg.isNotEmpty) ...[
-                      const SizedBox(height: 12),
-                      Text(
-                        _errorMsg,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          color: Colors.red,
-                          fontSize: 13,
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: _passwordController,
+                          obscureText: true,
+                          decoration: const InputDecoration(
+                            labelText: '密码',
+                            prefixIcon: Icon(Icons.lock_outline, size: 20),
+                            border: OutlineInputBorder(),
+                          ),
                         ),
-                      ),
-                    ],
-                    const SizedBox(height: 20),
-                    SizedBox(
-                      width: double.infinity,
-                      child: ElevatedButton(
-                        onPressed: _submitting ? null : _submit,
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF2563EB),
-                          foregroundColor: Colors.white,
-                          padding: const EdgeInsets.symmetric(vertical: 14),
+                        if (_isRegister) ...[
+                          const SizedBox(height: 12),
+                          TextField(
+                            controller: _confirmPasswordController,
+                            obscureText: true,
+                            decoration: const InputDecoration(
+                              labelText: '确认密码',
+                              prefixIcon: Icon(Icons.lock_outline, size: 20),
+                              border: OutlineInputBorder(),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          TextField(
+                            controller: _nicknameController,
+                            decoration: const InputDecoration(
+                              labelText: '昵称（可选）',
+                              prefixIcon: Icon(Icons.badge_outlined, size: 20),
+                              border: OutlineInputBorder(),
+                            ),
+                          ),
+                        ],
+                        if (_errorMsg.isNotEmpty) ...[
+                          const SizedBox(height: 12),
+                          Text(
+                            _errorMsg,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Colors.red,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ],
+                        const SizedBox(height: 20),
+                        SizedBox(
+                          width: double.infinity,
+                          child: ElevatedButton(
+                            onPressed: _submitting ? null : _submit,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF2563EB),
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(vertical: 14),
+                            ),
+                            child: _submitting
+                                ? const SizedBox(
+                                    width: 20,
+                                    height: 20,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white,
+                                    ),
+                                  )
+                                : Text(_isRegister ? '注册' : '登录'),
+                          ),
                         ),
-                        child: _submitting
-                            ? const SizedBox(
-                                width: 20,
-                                height: 20,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                  color: Colors.white,
-                                ),
-                              )
-                            : Text(_isRegister ? '注册' : '登录'),
-                      ),
+                      ],
                     ),
-                  ],
+                  ),
                 ),
               ),
             ),
           ),
-        ),
+          // 左下角：后端 IP 切换入口
+          Positioned(
+            left: 12,
+            bottom: 12,
+            child: TextButton.icon(
+              onPressed: _openBackendSwitchDialog,
+              icon: const Icon(Icons.dns_outlined, size: 18),
+              label: Text(
+                '后端 ${_backendLabel.isEmpty ? '...' : _backendLabel}',
+                style: const TextStyle(fontSize: 13),
+              ),
+              style: TextButton.styleFrom(
+                foregroundColor: Colors.black54,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

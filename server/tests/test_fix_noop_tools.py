@@ -329,12 +329,12 @@ class TestMemberReplyFallbackPushback(unittest.TestCase):
 
 
 class TestWarningAccountabilityPrompt(unittest.TestCase):
-    """system prompt 必须包含 ⑪ 工具反馈 [Warning] 负责规则。"""
+    """system prompt 必须包含 ⑬ 工具反馈 [Warning] 负责规则（来自 versioned 注册表）。"""
 
     def test_warning_accountability_text_has_rules(self):
-        from agent.chat import _build_warning_accountability_text
-        text = _build_warning_accountability_text()
-        self.assertIn("⑪ 工具反馈 [Warning] 负责规则", text)
+        from prompt.system_chapters import WARNING_ACCOUNTABILITY
+        self.assertIn("⑬ 工具反馈 [Warning] 负责规则", WARNING_ACCOUNTABILITY.title)
+        text = WARNING_ACCOUNTABILITY.content
         self.assertIn("严格关注", text)
         self.assertIn("背景噪音", text)
         self.assertIn("ask_user_question", text)
@@ -345,8 +345,12 @@ class TestWarningAccountabilityPrompt(unittest.TestCase):
     def test_agent_system_prompt_includes_warning_chapter(self):
         from agent.chat import _build_agent_system_prompt
         prompt = _build_agent_system_prompt(workspace_id="w1")
-        self.assertIn("⑪ 工具反馈 [Warning] 负责规则", prompt)
-        self.assertIn("⑩ 任务进度管理纪律", prompt)
+        self.assertIn("⑬ 工具反馈 [Warning] 负责规则", prompt)
+        self.assertIn("⑫ 任务进度管理纪律", prompt)
+        # 审计头：企业级可审计性
+        self.assertIn("系统提示词体系：版本 v", prompt)
+        self.assertIn("安全与边界护栏", prompt)
+        self.assertIn("角色权威与行为准则", prompt)
 
 
 if __name__ == "__main__":

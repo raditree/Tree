@@ -66,7 +66,12 @@ def _dump(result: dict) -> str:
 TOOLS = [
     {
         "name": "read_pdf",
-        "description": "读取 PDF 文件并提取文本内容，返回每页的文本",
+        "description": (
+            "[解析 PDF 提取文本] | 贡献维度: 外部能力/文档处理\n"
+            "何时使用: 需要读取 .pdf 文件内容（按页返回文本）\n"
+            "何时不用: 非 PDF 文档用 read_docx/read_pptx/read_xlsx\n"
+            "前置依赖: 文件须存在于工作空间且为 PDF"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -80,7 +85,12 @@ TOOLS = [
     },
     {
         "name": "read_docx",
-        "description": "读取 DOCX 文件并提取段落文本和表格数据",
+        "description": (
+            "[解析 DOCX 提取文本与表格] | 贡献维度: 外部能力/文档处理\n"
+            "何时使用: 需要读取 .docx 文件内容（段落文本与表格数据）\n"
+            "何时不用: 非 DOCX 文档用对应的 read_* 工具\n"
+            "前置依赖: 文件须存在于工作空间且为 DOCX"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -94,7 +104,12 @@ TOOLS = [
     },
     {
         "name": "read_pptx",
-        "description": "读取 PPTX 文件并提取所有幻灯片的文本内容",
+        "description": (
+            "[解析 PPTX 提取幻灯片文本] | 贡献维度: 外部能力/文档处理\n"
+            "何时使用: 需要读取 .pptx 文件内容（所有幻灯片的文本）\n"
+            "何时不用: 非 PPTX 文档用对应的 read_* 工具\n"
+            "前置依赖: 文件须存在于工作空间且为 PPTX"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -108,7 +123,12 @@ TOOLS = [
     },
     {
         "name": "read_xlsx",
-        "description": "读取 XLSX 文件并提取所有工作表的数据",
+        "description": (
+            "[解析 XLSX 提取工作表数据] | 贡献维度: 外部能力/文档处理\n"
+            "何时使用: 需要读取 .xlsx 文件内容（各工作表数据）\n"
+            "何时不用: 非 XLSX 文档用对应的 read_* 工具\n"
+            "前置依赖: 文件须存在于工作空间且为 XLSX"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -122,7 +142,12 @@ TOOLS = [
     },
     {
         "name": "create_docx",
-        "description": "根据文本内容生成 DOCX 文件，保存到指定路径",
+        "description": (
+            "[由文本生成 DOCX 文档] | 贡献维度: 外部能力/文档产出\n"
+            "何时使用: 需要产出 .docx 文件（按文本内容，多行用 \\n 分隔）\n"
+            "何时不用: 产出非 DOCX 用对应的 create_* 工具\n"
+            "前置依赖: 保存路径可写；内容按工具约定的文本格式传入"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -140,7 +165,12 @@ TOOLS = [
     },
     {
         "name": "create_pptx",
-        "description": "根据 JSON 描述的幻灯片内容生成 PPTX 文件",
+        "description": (
+            "[由 JSON 生成 PPTX 幻灯片] | 贡献维度: 外部能力/文档产出\n"
+            "何时使用: 需要产出 .pptx 文件（按 JSON 描述的标题/内容生成）\n"
+            "何时不用: 产出非 PPTX 用对应的 create_* 工具\n"
+            "前置依赖: 保存路径可写；slides 为合法 JSON 数组字符串"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -158,7 +188,12 @@ TOOLS = [
     },
     {
         "name": "create_xlsx",
-        "description": "根据 JSON 数据生成 XLSX 文件",
+        "description": (
+            "[由 JSON 数据生成 XLSX] | 贡献维度: 外部能力/文档产出\n"
+            "何时使用: 需要产出 .xlsx 文件（按 JSON 工作表数据生成）\n"
+            "何时不用: 产出非 XLSX 用对应的 create_* 工具\n"
+            "前置依赖: 保存路径可写；data 为合法 JSON 对象字符串"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
