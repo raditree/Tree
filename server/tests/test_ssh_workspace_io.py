@@ -1,168 +1,74 @@
-"""P0 Task3 单测：SSHWorkspaceIO 七方法 / 连接探活重连 / ModeResolver 三模式。
+# -*- coding: utf-8 -*-
+"""SSH 模式相关单测：SSHWorkspaceIO 前端委托 / SSHConnectionManager 配置管理 / ModeResolver 三模式。
 
-使用 mock 替换 paramiko client / sftp，无需真实 SSH 主机即可验证
-路径映射、exec 结果解析与连接管理逻辑。
+SSH 运行模式改造后（SSH 连接由**前端 dartssh2** 发起，IP 相对前端），后端
+不再建立任何 SSH 连接：
+
+- ``SSHWorkspaceIO`` 是 ``LocalWorkspaceIO`` 的委托子类：七个方法（含 hook）
+  把请求转发给 ``local_executor.request()`` / ``send_request()`` 并透传结果。
+- ``SSHConnectionManager`` 仅做配置持久化与模式判定（register 不再测试连接）。
+- ``ModeResolver`` 三模式优先级 local > ssh > cloud 与互斥校验保持不变。
+
+使用 mock 替换 local_executor / ssh_store，无需真实 SSH 主机或前端。
 """
 import asyncio
+import sys
+from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 
 # ----------------------------------------------------------------------
-# Fake paramiko 组件
+# 前端委托假件
 # ----------------------------------------------------------------------
-class FakeSFTPFile:
-    def __init__(self, data: bytes = b""):
-        self._data = data
-        self._pos = 0
+class _FakeWS:
+    """极简 ws_manager 替身（request 不实际推送，仅记录）。"""
 
-    def read(self, size=-1):
-        if size < 0:
-            data = self._data[self._pos:]
-            self._pos = len(self._data)
-            return data
-        data = self._data[self._pos:self._pos + size]
-        self._pos += len(data)
-        return data
-
-    def write(self, data):
-        self._data += data
-        return len(data)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-
-class FakeSFTP:
     def __init__(self):
-        self.files = {}  # path -> FakeSFTPFile
-        self.dirs = set()
+        self.sent = []
 
-    def open(self, path, mode="rb"):
-        if "w" in mode:
-            f = FakeSFTPFile()
-            self.files[path] = f
-            return f
-        f = self.files.get(path)
-        if f is None:
-            raise FileNotFoundError(path)
-        return f
-
-    def stat(self, path):
-        if path in self.dirs or path in self.files:
-            return object()
-        raise OSError(f"no such: {path}")
-
-    def mkdir(self, path):
-        self.dirs.add(path)
-
-    def close(self):
-        pass
+    async def send_message(self, user_id, message):
+        self.sent.append(message)
 
 
-class FakeTransport:
-    def __init__(self, active=True):
-        self._active = active
+class _FakeExecutor:
+    """假前端执行器客户端：记录请求负载，按预设响应返回。"""
 
-    def is_active(self):
-        return self._active
+    def __init__(self, response=None):
+        self.response = response if response is not None else {}
+        self.request_calls = []
+        self.send_calls = []
+        self.cancel_calls = []
+        self.hook_on_done = None
 
+    def request(self, ws_manager, user_id, payload):
+        self.request_calls.append(payload)
+        return dict(self.response)
 
-class FakeChannel:
-    def __init__(self, code=0):
-        self._code = code
+    def send_request(self, ws_manager, user_id, payload):
+        self.send_calls.append(payload)
+        return {"success": True}
 
-    def recv_exit_status(self):
-        return self._code
+    def register_hook(self, user_id, exec_id, on_done):
+        self.hook_on_done = on_done
 
+    def resolve(self, user_id, exec_id, result):
+        # 模拟真实 LocalExecutorClient.resolve：唤醒已登记的 hook 完成回调
+        if self.hook_on_done is not None:
+            self.hook_on_done(result)
+        return True
 
-class FakeStdout:
-    def __init__(self, data: str, code=0):
-        self._data = data.encode("utf-8")
-        self._pos = 0
-        self.channel = FakeChannel(code)
-
-    def read(self, size=-1):
-        if size < 0:
-            data = self._data[self._pos:]
-            self._pos = len(self._data)
-            return data
-        data = self._data[self._pos:self._pos + size]
-        self._pos += len(data)
-        return data
-
-
-class FakeStderr:
-    def __init__(self, data: str = ""):
-        self._data = data.encode("utf-8")
-        self._pos = 0
-
-    def read(self, size=-1):
-        if size < 0:
-            data = self._data[self._pos:]
-            self._pos = len(self._data)
-            return data
-        data = self._data[self._pos:self._pos + size]
-        self._pos += len(data)
-        return data
+    def cancel_hook(self, ws_manager, user_id, exec_id):
+        self.cancel_calls.append(exec_id)
+        return {"success": True}
 
 
-class FakeClient:
-    def __init__(self, transport_active=True, exec_code=0, exec_stdout=""):
-        self._transport = FakeTransport(transport_active)
-        self.exec_code = exec_code
-        self.exec_stdout = exec_stdout
-        self.sftp = FakeSFTP()
-        self.connect_calls = 0
-        self.close_calls = 0
-
-    def open_sftp(self):
-        return self.sftp
-
-    def exec_command(self, command, timeout=None):
-        return None, FakeStdout(self.exec_stdout, self.exec_code), FakeStderr()
-
-    def get_transport(self):
-        return self._transport
-
-    def connect(self, **kwargs):
-        self.connect_calls += 1
-
-    def close(self):
-        self.close_calls += 1
-
-
-class FakeSSHManager:
-    """提供 get_config / get_connection 的假管理器（持有单一 client）。"""
-
-    def __init__(self, cfg, client):
-        self.cfg = cfg
-        self.client = client
-
-    def get_config(self, user_id, agent_id):
-        return self.cfg
-
-    def get_connection(self, user_id, agent_id):
-        return self.client
-
-
-@pytest.fixture
-def ssh_cfg():
-    return {
-        "host": "example.com",
-        "port": 22,
-        "username": "user",
-        "remote_base_dir": "/home/user/agent",
-    }
-
-
-def make_io(manager, top_agent_id="top1"):
+def make_io(executor, top_agent_id="top1"):
     from io_.ssh_workspace_io import SSHWorkspaceIO
 
-    return SSHWorkspaceIO(manager, "u1", top_agent_id)
+    return SSHWorkspaceIO(executor, _FakeWS(), "u1")
 
 
 def run(coro):
@@ -170,184 +76,207 @@ def run(coro):
 
 
 # ----------------------------------------------------------------------
-# 路径映射
+# SSHWorkspaceIO：委托前端执行器 + 结果透传
 # ----------------------------------------------------------------------
-def test_remote_path_top_maps_to_base(ssh_cfg):
-    client = FakeClient()
-    manager = FakeSSHManager(ssh_cfg, client)
-    io = make_io(manager, top_agent_id="top1")
-    assert io._remote_path("top1", "a.txt") == "/home/user/agent/a.txt"
-    assert io._remote_path("top1", "") == "/home/user/agent"
-
-
-def test_remote_path_member_maps_to_workspaces(ssh_cfg):
-    client = FakeClient()
-    manager = FakeSSHManager(ssh_cfg, client)
-    io = make_io(manager, top_agent_id="top1")
-    assert (
-        io._remote_path("memberA", ".self/memory.md")
-        == "/home/user/agent/workspaces/memberA/.self/memory.md"
-    )
-
-
-# ----------------------------------------------------------------------
-# 七个 async 方法
-# ----------------------------------------------------------------------
-def test_read_file(ssh_cfg):
-    client = FakeClient()
-    client.sftp.files["/home/user/agent/a.txt"] = FakeSFTPFile("hello".encode())
-    io = make_io(FakeSSHManager(ssh_cfg, client))
-    result = run(io.read_file("top1", "a.txt"))
-    assert result["exit_code"] == 0
+def test_read_file_delegates_and_passthrough():
+    io = make_io(_FakeExecutor({
+        "exit_code": 0, "content": "hello", "stdout": "hello", "stderr": "",
+    }))
+    result = run(io.read_file("top1", "a.txt", "utf-8"))
     assert result["content"] == "hello"
-
-
-def test_read_file_missing(ssh_cfg):
-    client = FakeClient()
-    io = make_io(FakeSSHManager(ssh_cfg, client))
-    result = run(io.read_file("top1", "nope.txt"))
-    assert "error" in result
-
-
-def test_write_file_creates_dirs(ssh_cfg):
-    client = FakeClient()
-    io = make_io(FakeSSHManager(ssh_cfg, client))
-    result = run(io.write_file("top1", "sub/dir/f.txt", "content"))
-    assert result["success"] is True
-    sftp = client.sftp
-    assert "/home/user/agent/sub" in sftp.dirs
-    assert "/home/user/agent/sub/dir" in sftp.dirs
-    assert sftp.files["/home/user/agent/sub/dir/f.txt"]._data == b"content"
-
-
-def test_exec_shell(ssh_cfg):
-    client = FakeClient(exec_stdout="cmd-out\n", exec_code=0)
-    io = make_io(FakeSSHManager(ssh_cfg, client))
-    result = run(io.exec_shell("top1", "echo hi", timeout=5))
     assert result["exit_code"] == 0
-    assert "cmd-out" in result["stdout"]
+    call = io._executor.request_calls[0]
+    assert call["op"] == "read_file"
+    assert call["workspace_id"] == "top1"
+    assert call["path"] == "a.txt"
+    assert call["encoding"] == "utf-8"
 
 
-def test_exec_argv(ssh_cfg):
-    client = FakeClient(exec_stdout="py\n", exec_code=0)
-    io = make_io(FakeSSHManager(ssh_cfg, client))
+def test_read_file_error_passthrough():
+    io = make_io(_FakeExecutor({"error": "文件不存在"}))
+    result = run(io.read_file("top1", "nope.txt"))
+    assert result["error"] == "文件不存在"
+
+
+def test_write_file_delegates():
+    io = make_io(_FakeExecutor({"success": True, "file_path": "f.txt"}))
+    result = run(io.write_file("top1", "f.txt", "content"))
+    assert result["success"] is True
+    call = io._executor.request_calls[0]
+    assert call["op"] == "write_file"
+    assert call["content"] == "content"
+
+
+def test_write_file_error_passthrough():
+    io = make_io(_FakeExecutor({"error": "写入失败"}))
+    result = run(io.write_file("top1", "f.txt", "content"))
+    assert result["error"] == "写入失败"
+    assert result["file_path"] == "f.txt"
+
+
+def test_exec_shell_delegates():
+    io = make_io(_FakeExecutor({"exit_code": 0, "stdout": "out", "stderr": ""}))
+    result = run(io.exec_shell("top1", "echo hi", timeout=15))
+    assert result["stdout"] == "out"
+    call = io._executor.request_calls[0]
+    assert call["op"] == "exec_shell"
+    assert call["command"] == "echo hi"
+    assert call["timeout"] == 15
+
+
+def test_exec_argv_delegates():
+    io = make_io(_FakeExecutor({"exit_code": 0, "stdout": "py", "stderr": ""}))
     result = run(io.exec_argv("top1", ["python3", "-c", "print(1)"]))
     assert result["exit_code"] == 0
-    assert "py" in result["stdout"]
+    call = io._executor.request_calls[0]
+    assert call["op"] == "exec_argv"
+    assert call["argv"] == ["python3", "-c", "print(1)"]
 
 
-def test_grep_search(ssh_cfg):
-    client = FakeClient(exec_stdout="f.py:1:match", exec_code=0)
-    io = make_io(FakeSSHManager(ssh_cfg, client))
+def test_grep_search_delegates():
+    io = make_io(_FakeExecutor({"exit_code": 0, "stdout": "f.py:1:match"}))
     result = run(io.grep_search("top1", "pattern"))
-    assert result["exit_code"] == 0
     assert "f.py:1:match" in result["stdout"]
+    call = io._executor.request_calls[0]
+    assert call["op"] == "grep_search"
+    assert call["pattern"] == "pattern"
 
 
-def test_git_log(ssh_cfg):
-    out = "abc123\tAlice\t2026-01-01 10:00:00 +0800\tfix bug"
-    client = FakeClient(exec_stdout=out, exec_code=0)
-    io = make_io(FakeSSHManager(ssh_cfg, client))
+def test_git_log_delegates():
+    io = make_io(_FakeExecutor({
+        "commits": [{"hash": "abc123", "author": "Alice",
+                     "date": "2026-01-01", "message": "fix"}],
+        "exit_code": 0,
+    }))
     result = run(io.git_log("top1", limit=10))
     assert len(result["commits"]) == 1
     assert result["commits"][0]["hash"] == "abc123"
-    assert result["commits"][0]["message"] == "fix bug"
+    call = io._executor.request_calls[0]
+    assert call["op"] == "git_log"
+    assert call["limit"] == 10
 
 
-def test_git_branches(ssh_cfg):
-    out = "* main\n  feature/x\n  remotes/origin/main\n"
-    client = FakeClient(exec_stdout=out, exec_code=0)
-    io = make_io(FakeSSHManager(ssh_cfg, client))
-    result = run(io.git_branches("top1"))
-    assert result["current"] == "main"
-    assert "main" in result["branches"]
-    assert "feature/x" in result["branches"]
-    assert result["branches"].count("main") == 1
-
-
-def test_git_branches_empty(ssh_cfg):
-    client = FakeClient(exec_stdout="", exec_code=0)
-    io = make_io(FakeSSHManager(ssh_cfg, client))
-    result = run(io.git_branches("top1"))
-    assert result["branches"] == []
-    assert result["current"] == ""
-
-
-def test_list_files(ssh_cfg):
-    out = (
-        "total 8\n"
-        "drwxr-xr-x 2 user user 4096 Jan 1 10:00 .\n"
-        "drwxr-xr-x 3 user user 4096 Jan 1 10:00 ..\n"
-        "-rw-r--r-- 1 user user  123 Jan 1 10:00 a.txt\n"
-        "drwxr-xr-x 2 user user 4096 Jan 1 10:00 dir\n"
-    )
-    client = FakeClient(exec_stdout=out, exec_code=0)
-    io = make_io(FakeSSHManager(ssh_cfg, client))
+def test_list_files_delegates():
+    io = make_io(_FakeExecutor({"files": [{"name": "a.txt", "type": "file"}],
+                                "exit_code": 0}))
     result = run(io.list_files("top1", ""))
-    names = {(f["name"], f["type"]) for f in result["files"]}
-    assert ("a.txt", "file") in names
-    assert ("dir", "dir") in names
-    assert len(result["files"]) == 2
+    assert len(result["files"]) == 1
+    assert result["files"][0]["name"] == "a.txt"
+    call = io._executor.request_calls[0]
+    assert call["op"] == "list_files"
+
+
+def test_exec_shell_hook_delegates():
+    """hook 模式：先登记完成回调，再非阻塞发送 exec_shell_hook。"""
+    io = make_io(_FakeExecutor())
+    done = []
+
+    def on_done(r):
+        done.append(r)
+
+    result = run(io.exec_shell_hook(
+        "top1", "exec1", "sleep 1 > .o 2>&1", ".o", 120, on_done,
+    ))
+    assert result["success"] is True
+    assert io._executor.hook_on_done is on_done
+    call = io._executor.send_calls[0]
+    assert call["op"] == "exec_shell_hook"
+    assert call["exec_id"] == "exec1"
+    assert call["output_file"] == ".o"
+
+
+def test_exec_shell_hook_send_failure_resolves_error():
+    """发送失败时立即触发 on_done 以错误收尾，避免 hook 悬挂。"""
+    class _FailExecutor(_FakeExecutor):
+        def send_request(self, ws_manager, user_id, payload):
+            self.send_calls.append(payload)
+            return {"error": "推送失败"}
+
+    io = make_io(_FailExecutor())
+    done = []
+
+    def on_done(r):
+        done.append(r)
+
+    result = run(io.exec_shell_hook(
+        "top1", "exec2", "cmd", ".o", None, on_done,
+    ))
+    assert result["error"] == "推送失败"
+    assert len(done) == 1
+    assert "error" in done[0]
+
+
+def test_cancel_exec_hook_delegates():
+    io = make_io(_FakeExecutor())
+    result = run(io.cancel_exec_hook("exec3"))
+    assert result["success"] is True
+    assert io._executor.cancel_calls == ["exec3"]
 
 
 # ----------------------------------------------------------------------
-# 连接管理：懒连接 + 探活重连
+# SSHConnectionManager：配置持久化 + 模式判定（不再建连）
 # ----------------------------------------------------------------------
-def test_connection_lazy_and_reconnect(monkeypatch, ssh_cfg):
+def _make_manager():
     import io_.ssh_connection_manager as mod
-    from io_.ssh_connection_manager import SSHConnectionManager
 
-    client1 = FakeClient(transport_active=True)
-    client2 = FakeClient(transport_active=True)
-
-    monkeypatch.setattr(
-        mod.ssh_store, "get_connection", lambda u, a: dict(ssh_cfg)
-    )
-    manager = SSHConnectionManager()
-    manager._clients["u1:top1"] = client1
-
-    # 活动连接直接复用
-    got = manager.get_connection("u1", "top1")
-    assert got is client1
-
-    # transport 失活 -> 关闭并重建（新 connect）
-    client1._transport._active = False
-
-    def _connect(**kwargs):
-        pass
-
-    monkeypatch.setattr(
-        "paramiko.SSHClient.connect", lambda self, **kw: setattr(self, "connected", True)
-    )
-    client2.close_calls = 0
-    got = manager.get_connection("u1", "top1")
-    assert client1.close_calls == 1  # 旧连接被关闭
-    assert got is not client1
-    assert got is not None
+    return mod.SSHConnectionManager(), mod
 
 
-def test_connection_not_configured(monkeypatch, ssh_cfg):
-    import io_.ssh_connection_manager as mod
-    from io_.ssh_connection_manager import SSHConnectionManager
+def test_register_persists_config(monkeypatch):
+    mgr, mod = _make_manager()
+    saved = {}
 
-    monkeypatch.setattr(mod.ssh_store, "get_connection", lambda u, a: None)
-    manager = SSHConnectionManager()
-    with pytest.raises(RuntimeError):
-        manager.get_connection("u1", "top1")
+    def _save(**kw):
+        saved.update(kw)
+
+    monkeypatch.setattr(mod.ssh_store, "save_connection", _save)
+    ok, msg = mgr.register("u1", "top1", {
+        "host": "remote.example.com",
+        "port": 2222,
+        "username": "deploy",
+        "auth_type": "password",
+        "password": "secret",
+        "private_key_path": "",
+        "remote_base_dir": "/srv/agent",
+    })
+    assert ok is True
+    assert msg == ""
+    assert saved["user_id"] == "u1"
+    assert saved["agent_id"] == "top1"
+    assert saved["host"] == "remote.example.com"
+    assert saved["port"] == 2222
+    assert saved["username"] == "deploy"
+    assert saved["remote_base_dir"] == "/srv/agent"
 
 
-def test_is_ssh(monkeypatch, ssh_cfg):
-    import io_.ssh_connection_manager as mod
-    from io_.ssh_connection_manager import SSHConnectionManager
+def test_register_does_not_test_connection(monkeypatch):
+    """后端不再测试连接（连接测试由前端完成），仅持久化配置。"""
+    mgr, mod = _make_manager()
+    monkeypatch.setattr(mod.ssh_store, "save_connection", lambda **kw: {})
+    assert mgr.register("u1", "top1", {"host": "h", "username": "u"}) == (True, "")
 
-    monkeypatch.setattr(mod.ssh_store, "get_connection", lambda u, a: dict(ssh_cfg))
-    assert SSHConnectionManager().is_ssh("u1", "top1") is True
-    monkeypatch.setattr(mod.ssh_store, "get_connection", lambda u, a: None)
-    assert SSHConnectionManager().is_ssh("u1", "top1") is False
+
+def test_is_ssh_and_get_config(monkeypatch):
+    mgr, mod = _make_manager()
+    cfg = {"host": "remote.example.com", "username": "deploy"}
+    monkeypatch.setattr(mod.ssh_store, "get_connection",
+                        lambda u, a: dict(cfg) if a == "top1" else None)
+    assert mgr.is_ssh("u1", "top1") is True
+    assert mgr.is_ssh("u1", "other") is False
+    assert mgr.get_config("u1", "top1") == cfg
+    assert mgr.get_config("u1", "other") is None
+
+
+def test_unregister_deletes_config(monkeypatch):
+    mgr, mod = _make_manager()
+    monkeypatch.setattr(mod.ssh_store, "delete_connection",
+                        lambda u, a: a == "top1")
+    assert mgr.unregister("u1", "top1") is True
+    assert mgr.unregister("u1", "other") is False
 
 
 # ----------------------------------------------------------------------
-# ModeResolver：优先级 + 互斥
+# ModeResolver：优先级 + 互斥（沿用三模式判定）
 # ----------------------------------------------------------------------
 class FakeLocalExecutor:
     def __init__(self, local=False):

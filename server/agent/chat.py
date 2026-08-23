@@ -115,6 +115,45 @@ async def _register_tools(
             local_executor=state.local_executor,
         )
 
+    # terminal hook 模式完成回调：后台命令结束后向发起该命令的 agent 投递
+    # 一条 user 角色消息（带 [terminal hook] 前缀），经既有 broker 通道续跑
+    # 同一会话，agent 据此读取输出文件继续推进任务。与 AskUserQuestion 的
+    # resume_after_answer 唤醒通道一致（顶部 agent 走 top_chat_broker、
+    # 成员走 team_broker）；source_agent_id 为空可避免 _dispatch_agent_message
+    # 的"自发拒绝"（目标=自己）。
+    def _terminal_hook_done(
+        task_id: str,
+        exit_code: int,
+        output_file: str,
+        cancelled: bool = False,
+        error: str = "",
+    ) -> None:
+        tag = "取消" if cancelled else "结束"
+        content = (
+            f"[terminal hook] 你启动的后台命令已{tag}（exit_code={exit_code}），"
+            f"输出已重定向到工作空间文件 {output_file}。"
+            f"{('' if not error else ' ' + str(error))}"
+            " 请读取该文件，根据结果继续推进你的任务。"
+        )
+        sender = getattr(session, "sender_id", "") or ""
+        try:
+            if is_member:
+                _dispatch_agent_message(
+                    user_id, [agent_id], content,
+                    source_agent_id=top_agent_id or agent_id,
+                    top_agent_id=top_agent_id,
+                    extra={"session_id": session_id, "sender_id": sender},
+                )
+            else:
+                _dispatch_agent_message(
+                    user_id, [agent_id], content, "",
+                    top_agent_id or agent_id, "", {"session_id": session_id},
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "terminal hook 唤醒 agent 失败: %s agent=%s", exc, agent_id
+            )
+
     register_builtin_tools(
         session,
         docker_manager=state.docker_manager,
@@ -131,6 +170,7 @@ async def _register_tools(
         extra_info_refresher=_extra_info_refresher,
         session_id=session_id,
         is_member=is_member,
+        terminal_hook_callback=_terminal_hook_done,
     )
 
 
@@ -650,7 +690,7 @@ def _get_workspace_io(user_id: str, agent_id: str) -> Any:
 
     本地模式经反向 WS 到前端本地执行器，由前端把 workspace 相对路径映射到
     用户选择的工作目录（.self 私人空间 → baseDir/workspaces/{workspace_id}/.self）；
-    SSH 模式经 paramiko 转发到远端主机；云端模式走 Docker 容器。
+    SSH 模式由前端发起 SSH 连接、经反向 WS 委托前端执行；云端模式走 Docker 容器。
     用于读 .self 文档时与内置工具（read/write/edit/terminal）保持同一路径语义，
     避免双轨制（记忆维护写本地 baseDir，help 注入却读 Docker 容器）导致
     memory/rule 注入读到旧内容或缺失。

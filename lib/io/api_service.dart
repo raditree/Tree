@@ -836,6 +836,32 @@ class ApiService {
     );
   }
 
+  /// 列出当前用户的提问（可选按会话过滤），供右侧「问题回复」页使用。
+  ///
+  /// ``sessionId`` 为空时返回全部提问（含各 agent 与成员提问）。
+  static Future<List<Map<String, dynamic>>> getQuestions(
+      {String? sessionId}) async {
+    final Map<String, dynamic> data = await _getJson(
+      '/api/questions',
+      query: (sessionId != null && sessionId.isNotEmpty)
+          ? {'session_id': sessionId}
+          : null,
+    );
+    final List<dynamic>? questions = data['questions'] as List<dynamic>?;
+    return questions
+            ?.map((dynamic e) => (e as Map<String, dynamic>).cast<String, dynamic>())
+            .toList() ??
+        <Map<String, dynamic>>[];
+  }
+
+  /// 回答某条待答提问（REST 入口，与 WS user_answer 等价）。
+  static Future<void> answerQuestion(String qid, String answer) async {
+    await _postJson(
+      '/api/questions/$qid/answer',
+      body: {'answer': answer},
+    );
+  }
+
   /// 修改密码
   ///
   /// 调用 `POST /api/auth/change-password`，请求体为 `{"old_password": "...", "new_password": "..."}`。

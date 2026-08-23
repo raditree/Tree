@@ -14,14 +14,16 @@ import 'file_viewer.dart';
 import 'git_history.dart';
 import 'mcp_config_panel.dart';
 import 'model_info_panel.dart';
+import 'question_panel.dart';
 import 'todo_panel.dart';
 
 /// 文件管理面板（右栏）
 ///
-/// 作为右栏的主容器，以 Tab 组织三个分区：
+/// 作为右栏的主容器，以 Tab 组织四个分区：
 /// - 「文件」：文件浏览（[FileTree]）/ Git 历史（[GitHistory]）/ Todo（[TodoPanel]）
 /// - 「MCP 配置」：MCP 服务列表与注册（[McpConfigPanel]）
 /// - 「模型信息」：模型下拉与系统提示词编辑（[ModelInfoPanel]）
+/// - 「问题回复」：统一汇总并答复所有提问（[QuestionPanel]）
 ///
 /// 点击文件时以覆盖层方式弹出 [FileViewer]，点击返回按钮关闭查看器。
 class FilePanel extends StatefulWidget {
@@ -37,12 +39,16 @@ class FilePanel extends StatefulWidget {
   /// 折叠右侧栏的回调
   final VoidCallback? onCollapse;
 
+  /// 提问定位回调（透传给 [QuestionPanel]）
+  final QuestionNavigateCallback? onNavigateToQuestion;
+
   const FilePanel({
     super.key,
     required this.workspaceId,
     this.topAgentId,
     this.sessionId = 'session_default',
     this.onCollapse,
+    this.onNavigateToQuestion,
   });
 
   @override
@@ -79,7 +85,7 @@ class _FilePanelState extends State<FilePanel>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 3, vsync: this);
+    _tabController = TabController(length: 4, vsync: this);
     _fileTabController = TabController(length: 3, vsync: this);
     // 本地模式开关/工作目录变化时重新加载文件列表
     LocalExecutorService.instance.addListener(_onLocalModeChanged);
@@ -209,6 +215,10 @@ class _FilePanelState extends State<FilePanel>
                   _buildFileSection(),
                   const McpConfigPanel(),
                   ModelInfoPanel(agentId: widget.topAgentId ?? ''),
+                  QuestionPanel(
+                    sessionId: widget.sessionId,
+                    onNavigateToQuestion: widget.onNavigateToQuestion,
+                  ),
                 ],
               ),
             ),
@@ -233,6 +243,7 @@ class _FilePanelState extends State<FilePanel>
               unselectedLabelColor: cs.onSurfaceVariant,
               indicatorColor: cs.primary,
               indicatorSize: TabBarIndicatorSize.label,
+              isScrollable: true,
               labelStyle: const TextStyle(
                 fontSize: 13,
                 fontWeight: FontWeight.w600,
@@ -242,6 +253,7 @@ class _FilePanelState extends State<FilePanel>
                 Tab(text: '文件'),
                 Tab(text: 'MCP 配置'),
                 Tab(text: '模型信息'),
+                Tab(text: '问题回复'),
               ],
             ),
           ),

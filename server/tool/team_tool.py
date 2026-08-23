@@ -1939,6 +1939,7 @@ class TeamTool:
             members: 每个成员最终状态
             timed_out: 是否超时
             waited: 实际等待秒数
+            hint: 超时时提示（可暂时结束本轮，成员完成后会自动推送消息）
         """
         raw_ids = arguments.get("target_member_ids", "")
         if not raw_ids:
@@ -2003,9 +2004,25 @@ class TeamTool:
                 "current_task": member.get("current_task", ""),
             })
 
-        return {
+        result = {
             "members": results,
             "timed_out": timed_out,
             "waited": round(waited, 1),
             "total": len(results),
         }
+        if timed_out:
+            # 超时提示：告知模型可暂时结束本轮，成员完成回复后会自动推送
+            # 消息给 leader（chat 层成员回复回发机制），避免模型陷入反复
+            # 轮询 wait_for 的循环。
+            working = [
+                r["name"] for r in results
+                if r["work_status"] not in terminal_statuses
+            ]
+            result["hint"] = (
+                "等待超时，以下成员仍在工作中："
+                + ("、".join(working) if working else "（全部）")
+                + "。你可以暂时结束本轮回复（无需继续轮询 wait_for）："
+                "成员完成回复后会自动推送消息给你，"
+                "届时你会收到新消息，再继续查看结果。"
+            )
+        return result

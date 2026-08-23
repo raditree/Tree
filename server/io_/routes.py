@@ -980,12 +980,12 @@ async def git_log(
             raise HTTPException(status_code=500, detail=result)
         return {"commits": result.get("commits", [])}
 
-    # SSH 模式：转发到远端主机工作空间执行 git log
+    # SSH 模式：SSH 连接由前端发起，后端经反向 WS 委托前端执行 git log
     mode = mode_resolver.resolve_mode(user_id, top_agent_id or workspace_id)
     if mode == "ssh":
         from io_.ssh_workspace_io import SSHWorkspaceIO
 
-        ssh = SSHWorkspaceIO(state.ssh_manager, user_id, top_agent_id or workspace_id)
+        ssh = SSHWorkspaceIO(state.local_executor, state.ws_manager, user_id)
         result = await ssh.git_log(workspace_id, limit=int(limit))
         if result.get("error"):
             raise HTTPException(status_code=500, detail=result)
@@ -1025,12 +1025,12 @@ async def git_branches(
             "current": result.get("current", ""),
         }
 
-    # SSH 模式：转发到远端主机工作空间执行 git branch
+    # SSH 模式：SSH 连接由前端发起，后端经反向 WS 委托前端执行 git branch
     mode = mode_resolver.resolve_mode(user_id, top_agent_id or workspace_id)
     if mode == "ssh":
         from io_.ssh_workspace_io import SSHWorkspaceIO
 
-        ssh = SSHWorkspaceIO(state.ssh_manager, user_id, top_agent_id or workspace_id)
+        ssh = SSHWorkspaceIO(state.local_executor, state.ws_manager, user_id)
         result = await ssh.git_branches(workspace_id)
         if result.get("error"):
             raise HTTPException(status_code=500, detail=result)

@@ -68,7 +68,8 @@ def build_workspace_io(user_id: str, agent_id: str) -> Any:
     if mode == "ssh":
         from io_.ssh_workspace_io import SSHWorkspaceIO
 
-        return SSHWorkspaceIO(state.ssh_manager, user_id, agent_id)
+        # SSH 连接由前端发起；后端经反向 WS 委托前端执行，构造与 local 一致
+        return SSHWorkspaceIO(state.local_executor, state.ws_manager, user_id)
     from io_.workspace_io import CloudWorkspaceIO
 
     return CloudWorkspaceIO(state.docker_manager)

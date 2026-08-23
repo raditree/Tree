@@ -313,12 +313,16 @@ class TeammateDetailPage extends StatefulWidget {
   /// 当前会话 id：历史加载与实时 WS 均按该会话过滤，避免跨会话混杂
   final String sessionId;
 
+  /// 定位目标消息 id（右侧「问题回复」成员提问导航触发；历史加载后滚动定位）
+  final String? scrollToMessageId;
+
   const TeammateDetailPage({
     super.key,
     required this.leader,
     required this.memberId,
     required this.memberName,
     required this.sessionId,
+    this.scrollToMessageId,
   });
 
   @override
@@ -332,6 +336,12 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
   bool _wsConnected = false;
   String _log = '';
   String? _selectedTab = 'progress';
+
+  /// MessageList 定位触发号（右侧「问题回复」成员提问导航用）
+  int _scrollToRevision = 0;
+
+  /// MessageList 定位目标消息 id
+  String? _scrollToMessageId;
 
   @override
   void initState() {
@@ -356,7 +366,15 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
         for (final Map<String, dynamic> item in history) {
           _liveMessages.add(ChatMessage.fromJson(item));
         }
-        _scrollRevision++;
+        // 定位导航：历史加载后直接触发 MessageList 定位滚动（而非滚底，
+        // 避免「先滚底再跳位」的闪烁）；否则按原逻辑滚动到底部
+        final String? target = widget.scrollToMessageId;
+        if (target != null && target.isNotEmpty) {
+          _scrollToMessageId = target;
+          _scrollToRevision++;
+        } else {
+          _scrollRevision++;
+        }
       });
     } catch (_) {
       // 拉取失败时保持空列表，仅依赖实时 WS
@@ -526,6 +544,8 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
         return MessageList(
           messages: _liveMessages,
           revision: _scrollRevision,
+          scrollToMessageId: _scrollToMessageId,
+          scrollToRevision: _scrollToRevision,
         );
     }
   }

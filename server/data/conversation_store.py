@@ -718,3 +718,60 @@ def mark_pending_cancelled(qid: str) -> None:
         )
         conn.commit()
 
+
+def list_questions(
+    user_id: str, session_id: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """按用户（可选按会话过滤）列出全部提问，按创建时间倒序。
+
+    返回字段与 get_pending_question 一致（options 解 JSON、is_member 转 bool）。
+    session_id 为空时返回该用户全部提问；否则仅返回该会话的。
+    """
+    _ensure_db()
+    conn = _connect()
+    try:
+        conn.row_factory = sqlite3.Row
+        if session_id:
+            rows = conn.execute(
+                "SELECT qid, user_id, agent_id, top_agent_id, session_id, "
+                "is_member, question, options, answer, status, sender_id, "
+                "created_at "
+                "FROM pending_questions WHERE user_id = ? AND session_id = ? "
+                "ORDER BY created_at DESC, qid DESC",
+                (user_id, session_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT qid, user_id, agent_id, top_agent_id, session_id, "
+                "is_member, question, options, answer, status, sender_id, "
+                "created_at "
+                "FROM pending_questions WHERE user_id = ? "
+                "ORDER BY created_at DESC, qid DESC",
+                (user_id,),
+            ).fetchall()
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                options = json.loads(row["options"] or "[]")
+            except (ValueError, TypeError):
+                options = []
+            result.append(
+                {
+                    "qid": row["qid"],
+                    "user_id": row["user_id"],
+                    "agent_id": row["agent_id"],
+                    "top_agent_id": row["top_agent_id"] or "",
+                    "session_id": row["session_id"],
+                    "is_member": bool(row["is_member"]),
+                    "question": row["question"],
+                    "options": options,
+                    "answer": row["answer"],
+                    "status": row["status"],
+                    "sender_id": row["sender_id"] or "",
+                    "created_at": row["created_at"],
+                }
+            )
+        return result
+    finally:
+        conn.close()
+

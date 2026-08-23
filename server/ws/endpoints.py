@@ -324,6 +324,8 @@ def register_ws(app: FastAPI) -> None:
                             },
                         )
                         continue
+                    # 登记到前端执行器客户端：SSH 模式工具调用经反向 WS 委托前端执行
+                    state.local_executor.register_ssh(user_id, top_agent_id)
                     # 清除会话缓存：下次发消息重建会话并按 SSH 模式绑定工具
                     clear_user_agent(user_id, top_agent_id)
                     await state.ws_manager.send_message(
@@ -339,6 +341,7 @@ def register_ws(app: FastAPI) -> None:
                         data.get("top_agent_id") or data.get("agent_id") or user_id
                     )
                     state.ssh_manager.unregister(user_id, top_agent_id)
+                    state.local_executor.unregister_ssh(user_id, top_agent_id)
                     await state.ws_manager.send_message(
                         user_id,
                         {

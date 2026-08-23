@@ -107,6 +107,7 @@ def register_builtin_tools(
     extra_info_refresher: Optional[Callable[[], dict]] = None,
     session_id: str = "",
     is_member: bool = False,
+    terminal_hook_callback: Optional[Callable] = None,
 ) -> None:
     """将内置工具注册到会话，并把工作空间基础工具注册为 MCP 服务。
 
@@ -126,6 +127,8 @@ def register_builtin_tools(
     :param message_dispatcher: 消息投递回调
     :param extra_info_refresher: 额外信息刷新回调
     :param session_id: 当前会话 ID（spec 工具挂 hook 使用）
+    :param terminal_hook_callback: terminal hook 模式完成回调（由 chat.py 注入，
+                                   后台命令结束后唤醒发起该命令的 agent 续跑）
     """
     # MCP 管理器：注册外部 MCP 服务（mcp_config 已由调用方合并 config yaml +
     # DB 持久化服务，见 agent/chat.py _register_session_tools），随后挂载
@@ -166,9 +169,9 @@ def register_builtin_tools(
             },
         )
     elif mode == "ssh":
-        # SSH 模式：工作空间 IO 经 paramiko 转发到远端主机，本进程内调用
+        # SSH 模式：SSH 连接由前端发起，后端经反向 WS 委托前端执行，本进程内调用
         from io_.ssh_workspace_io import SSHWorkspaceIO
-        io = SSHWorkspaceIO(state.ssh_manager, user_id, mode_key)
+        io = SSHWorkspaceIO(state.local_executor, state.ws_manager, user_id)
         mcp_manager.register_service(
             "workspace",
             {
@@ -210,7 +213,9 @@ def register_builtin_tools(
     read_tool = ReadTool(io, workspace_id)
     write_tool = WriteTool(io, workspace_id)
     edit_tool = EditTool(io, workspace_id)
-    terminal_tool = TerminalTool(io, workspace_id)
+    terminal_tool = TerminalTool(
+        io, workspace_id, hook_callback=terminal_hook_callback
+    )
     team_tool = TeamTool(
         session, docker_manager, model_configs, broker=broker, user_id=user_id,
         agent_id=agent_id, leader_id=leader_id, top_agent_id=top_agent_id,

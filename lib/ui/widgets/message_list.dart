@@ -28,11 +28,19 @@ class MessageList extends StatelessWidget {
   /// 内联提问卡片的选择回调（参数为消息 id 与答案）
   final void Function(String messageId, String answer)? onAskAnswer;
 
+  /// 定位目标消息 id：非空且 [scrollToRevision] 变化时滚动定位到该消息
+  final String? scrollToMessageId;
+
+  /// 定位触发号：外部递增触发滚动定位（与 [scrollToMessageId] 配合）
+  final int scrollToRevision;
+
   const MessageList({
     super.key,
     required this.messages,
     this.revision = 0,
     this.onAskAnswer,
+    this.scrollToMessageId,
+    this.scrollToRevision = 0,
   });
 
   @override
@@ -41,6 +49,8 @@ class MessageList extends StatelessWidget {
       messages: messages,
       revision: revision,
       onAskAnswer: onAskAnswer,
+      scrollToMessageId: scrollToMessageId,
+      scrollToRevision: scrollToRevision,
     );
   }
 }
@@ -53,11 +63,15 @@ class _MessageListView extends StatefulWidget {
   final List<ChatMessage> messages;
   final int revision;
   final void Function(String messageId, String answer)? onAskAnswer;
+  final String? scrollToMessageId;
+  final int scrollToRevision;
 
   const _MessageListView({
     required this.messages,
     this.revision = 0,
     this.onAskAnswer,
+    this.scrollToMessageId,
+    this.scrollToRevision = 0,
   });
 
   @override
@@ -69,6 +83,18 @@ class _MessageListViewState extends State<_MessageListView> {
 
   /// 用户是否靠近底部（用于判断流式追加时是否自动跟随）
   bool _nearBottom = true;
+
+  /// 消息 id → GlobalKey（定位目标可寻址）
+  final Map<String, GlobalKey> _itemKeys = <String, GlobalKey>{};
+
+  /// 当前高亮定位的消息 id
+  String? _highlightedId;
+
+  /// 高亮清除定时器
+  Timer? _highlightTimer;
+
+  /// 定位重试次数（防止目标未构建时无限重试）
+  int _scrollRetries = 0;
 
   @override
   void initState() {
@@ -83,6 +109,56 @@ class _MessageListViewState extends State<_MessageListView> {
     // 仅在用户已处于底部附近时，才随新消息自动滚动（避免打断用户查看历史）
     if (oldWidget.revision != widget.revision && _nearBottom) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+    }
+    // 定位触发：scrollToRevision 变化且存在目标消息 id
+    if (oldWidget.scrollToRevision != widget.scrollToRevision &&
+        widget.scrollToMessageId != null &&
+        widget.scrollToMessageId!.isNotEmpty) {
+      _scrollRetries = 0;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _scrollToMessage(widget.scrollToMessageId!);
+      });
+    }
+  }
+
+  /// 滚动定位到指定消息并短暂高亮。
+  ///
+  /// 兼容目标未构建（ListView.builder 懒加载、目标在视口外）的情况：
+  /// 先按索引比例粗跳使目标进入构建范围，下一帧重试精确定位；最终
+  /// [Scrollable.ensureVisible] 保证目标必达。
+  void _scrollToMessage(String id) {
+    if (!_controller.hasClients) return;
+    final int idx = widget.messages.indexWhere((ChatMessage m) => m.id == id);
+    if (idx < 0) return;
+    final GlobalKey? key = _itemKeys[id];
+    final BuildContext? ctx = key?.currentContext;
+    if (ctx != null) {
+      Scrollable.ensureVisible(
+        ctx,
+        alignment: 0.2,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOut,
+      );
+      setState(() {
+        _highlightedId = id;
+      });
+      _highlightTimer?.cancel();
+      _highlightTimer = Timer(const Duration(seconds: 2), () {
+        if (mounted) {
+          setState(() {
+            _highlightedId = null;
+          });
+        }
+      });
+    } else {
+      // 目标尚未构建：按索引比例粗跳，下一帧重试精确定位
+      if (_scrollRetries >= 2 || widget.messages.isEmpty) return;
+      _scrollRetries++;
+      final double ratio = idx / widget.messages.length;
+      _controller.jumpTo(_controller.position.maxScrollExtent * ratio);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _scrollToMessage(id);
+      });
     }
   }
 
@@ -106,6 +182,7 @@ class _MessageListViewState extends State<_MessageListView> {
 
   @override
   void dispose() {
+    _highlightTimer?.cancel();
     _controller.removeListener(_onScroll);
     _controller.dispose();
     super.dispose();
@@ -139,32 +216,49 @@ class _MessageListViewState extends State<_MessageListView> {
       itemBuilder: (BuildContext context, int index) {
         final ChatMessage message = widget.messages[index];
         // 工具调用卡片：默认折叠，独立渲染
+        Widget child;
         if (message.kind == 'tool') {
-          return Padding(
+          child = Padding(
             padding: const EdgeInsets.only(bottom: 4),
             child: ToolCallCard(message: message),
           );
-        }
-        // 思考（推理）卡片：默认折叠，可展开查看完整推理内容
-        if (message.kind == 'thinking') {
-          return Padding(
+        } else if (message.kind == 'thinking') {
+          // 思考（推理）卡片：默认折叠，可展开查看完整推理内容
+          child = Padding(
             padding: const EdgeInsets.only(bottom: 4),
             child: ThinkingCard(message: message),
           );
-        }
-        // 内联提问卡片：非阻塞，允许查看上下文与右侧信息后再作答
-        if (message.kind == 'ask_user_question') {
-          return Padding(
+        } else if (message.kind == 'ask_user_question') {
+          // 内联提问卡片：非阻塞，允许查看上下文与右侧信息后再作答
+          child = Padding(
             padding: const EdgeInsets.only(bottom: 12),
             child: _AskQuestionCard(
               message: message,
               onAnswer: widget.onAskAnswer,
             ),
           );
+        } else {
+          child = Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: _MessageBubble(message: message),
+          );
         }
-        return Padding(
-          padding: const EdgeInsets.only(bottom: 12),
-          child: _MessageBubble(message: message),
+        // 定位目标：为每条消息挂 GlobalKey，命中定位时短暂高亮
+        final GlobalKey key =
+            _itemKeys.putIfAbsent(message.id, GlobalKey.new);
+        final bool highlighted = _highlightedId == message.id;
+        if (!highlighted) {
+          return KeyedSubtree(key: key, child: child);
+        }
+        final ColorScheme cs = Theme.of(context).colorScheme;
+        return Container(
+          key: key,
+          decoration: BoxDecoration(
+            color: cs.primary.withOpacity(0.10),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: cs.primary, width: 2),
+          ),
+          child: child,
         );
       },
     );

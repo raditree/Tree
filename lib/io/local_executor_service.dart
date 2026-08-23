@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'platform_support.dart';
+import 'ssh_executor_service.dart';
 import 'websocket_service.dart';
 
 /// 判断路径是否属于 Unix/WSL 风格目录（而非 Windows 盘符目录）。
@@ -76,6 +77,12 @@ class LocalExecutorService extends ChangeNotifier {
 
   /// 承载当前 WebSocket 通道的服务（用于接收请求与回传结果）
   WebSocketService? _ws;
+
+  /// hook 模式分离进程集合：exec_id -> Process（可被 kill 终止）。
+  ///
+  /// 本地模式长任务（terminal hook）由 [Process.start] 托管句柄，进程退出时
+  /// 回传 ``tool_exec_response``；取消时经 ``tool_exec_cancel`` 触发 [killProcess]。
+  final Map<String, Process> _hookProcesses = <String, Process>{};
 
   /// 当前顶部 agent 的本地工作目录
   String _baseDir = '';
@@ -172,7 +179,25 @@ class LocalExecutorService extends ChangeNotifier {
   /// 工具执行请求，其余消息仍正常派发给页面。
   void attach(WebSocketService ws) {
     _ws = ws;
-    ws.onToolExecRequest = _handleToolExecRequest;
+    ws.addToolExecRequestHandler(_handleToolExecRequest);
+    ws.onToolExecCancel = _handleToolExecCancel;
+  }
+
+  /// 处理 ``tool_exec_cancel``：终止对应 hook 分离进程。
+  void _handleToolExecCancel(Map<String, dynamic> message) {
+    final Map<String, dynamic> data =
+        (message['data'] as Map<String, dynamic>?) ?? <String, dynamic>{};
+    final String execId = (data['exec_id'] as String?) ?? '';
+    if (execId.isEmpty) return;
+    killProcess(execId);
+  }
+
+  /// 终止指定 hook 分离进程（尽力终止）。
+  ///
+  /// 取消后进程退出仍会经 ``tool_exec_response`` 回传，后端据此将任务标记
+  /// 为 cancelled。进程未运行/已退出时静默忽略。
+  void killProcess(String execId) {
+    _hookProcesses.remove(execId)?.kill();
   }
 
   /// 注册当前顶部 agent 的本地执行器：设置工作目录并通知后端转发工具请求。
@@ -223,6 +248,7 @@ class LocalExecutorService extends ChangeNotifier {
       _sendUnregister(topAgentId);
     }
     _registeredTopAgents.clear();
+    _ws?.removeToolExecRequestHandler(_handleToolExecRequest);
     _ws = null;
     _registered = false;
   }
@@ -256,31 +282,117 @@ class LocalExecutorService extends ChangeNotifier {
   }
 
   /// 处理 ``tool_exec_request``，异步执行后回传 ``tool_exec_response``。
-  void _handleToolExecRequest(Map<String, dynamic> message) {
+  ///
+  /// 返回 `true` 表示已接管该请求（工具执行请求在本地模式下发到本端时
+  /// 总是由本处理者执行）；当前顶部 agent 处于 SSH 模式时返回 `false`，
+  /// 把请求放行给 SSH 执行器处理，避免本地与 SSH 双处理。
+  bool _handleToolExecRequest(Map<String, dynamic> message) {
+    // SSH 模式守卫：当前顶部 agent 处于 SSH 模式时，工具请求交给 SSH 执行器
+    if (SshExecutorService.instance.enabled) return false;
     final Map<String, dynamic> data =
         (message['data'] as Map<String, dynamic>?) ?? <String, dynamic>{};
     final String execId = (data['exec_id'] as String?) ?? '';
-    if (execId.isEmpty) return;
+    if (execId.isEmpty) return false;
     final String workspaceId = (data['workspace_id'] as String?) ?? '';
     final String op = (data['op'] as String?) ?? '';
 
+    // hook 模式：分离进程后台执行，进程退出时再回传（不在此处立即响应）
+    if (op == 'exec_shell_hook') {
+      final String path = (data['output_file'] as String?) ?? '';
+      final Directory wsDir = _resolveWorkspaceDir(workspaceId, path);
+      _execShellHookDeferred(wsDir, execId, data);
+      return true;
+    }
+
     _execute(workspaceId, op, data).then((Map<String, dynamic> result) {
-      _send(<String, dynamic>{
-        'type': 'tool_exec_response',
-        'data': <String, dynamic>{
-          'exec_id': execId,
-          'result': result,
-        },
-      });
+      _sendToolExecResponse(execId, result);
     }).catchError((Object error) {
-      _send(<String, dynamic>{
-        'type': 'tool_exec_response',
-        'data': <String, dynamic>{
-          'exec_id': execId,
-          'result': <String, dynamic>{'error': error.toString()},
-        },
+      _sendToolExecResponse(execId, <String, dynamic>{
+        'error': error.toString(),
       });
     });
+    return true;
+  }
+
+  /// 回传一次工具执行结果（``tool_exec_response``）。
+  void _sendToolExecResponse(String execId, Map<String, dynamic> result) {
+    _send(<String, dynamic>{
+      'type': 'tool_exec_response',
+      'data': <String, dynamic>{
+        'exec_id': execId,
+        'result': result,
+      },
+    });
+  }
+
+  /// hook 模式：分离进程后台执行长命令，输出实时重定向到 output_file。
+  ///
+  /// 与 [_execShell] 相同的 shell 解析（Unix/WSL= bash，Windows=cmd），但用
+  /// [Process.start] 托管句柄（可被 [killProcess] 终止）且**不设超时**；进程
+  /// 退出后回传真实退出码（不受后端 120s 等待上限约束）。启动失败立即回传
+  /// 错误，避免后端挂起。
+  Future<void> _execShellHookDeferred(
+    Directory wsDir,
+    String execId,
+    Map<String, dynamic> data,
+  ) async {
+    final String command = (data['command'] as String?) ?? '';
+    if (command.isEmpty) {
+      _sendToolExecResponse(execId, <String, dynamic>{
+        'error': 'exec_shell_hook 缺少 command',
+        'exit_code': -1,
+      });
+      return;
+    }
+    // 解析输出重定向文件绝对路径并确保父目录存在（命令内为相对路径重定向）
+    final String outputFile = (data['output_file'] as String?) ?? '';
+    try {
+      if (outputFile.isNotEmpty) {
+        final String fullOut = _resolveInWorkspace(wsDir, outputFile);
+        await File(fullOut).parent.create(recursive: true);
+      }
+    } catch (e) {
+      _sendToolExecResponse(execId, <String, dynamic>{
+        'error': '输出文件路径非法: $e',
+        'exit_code': -1,
+      });
+      return;
+    }
+    final String workDir = wsDir.path;
+    try {
+      Process process;
+      if (isUnixLikePath(workDir)) {
+        // Unix/WSL 工作目录：Windows API 无法识别，改用 bash -lc "cd .. && .."
+        final String bashBody = "cd '$workDir' && $command";
+        process = await Process.start('bash', <String>['-lc', bashBody]);
+      } else {
+        final bool isWindows = Platform.isWindows;
+        process = await Process.start(
+          isWindows ? 'cmd' : 'sh',
+          isWindows ? <String>['/c', command] : <String>['-c', command],
+          workingDirectory: workDir,
+        );
+      }
+      _hookProcesses[execId] = process;
+      process.exitCode.then((int code) {
+        _hookProcesses.remove(execId);
+        _sendToolExecResponse(execId, <String, dynamic>{
+          'exit_code': code,
+          'stdout': '',
+          'stderr': '',
+        });
+      });
+    } on ProcessException catch (e) {
+      _sendToolExecResponse(execId, <String, dynamic>{
+        'error': '启动命令失败: ${e.message}',
+        'exit_code': -1,
+      });
+    } catch (e) {
+      _sendToolExecResponse(execId, <String, dynamic>{
+        'error': '启动命令失败: $e',
+        'exit_code': -1,
+      });
+    }
   }
 
   /// 按操作类型分发执行

@@ -32,6 +32,10 @@ terminal:
     何时使用: 运行构建与测试（验证改动）；安装依赖；git 操作；文件/目录管理（ls/mkdir/rm）；运行脚本；查看环境
     何时不用: 读/写/改文件内容用 read/write/edit（更精确、可追溯）；仅需内容查看时避免用 cat 取代 read
     前置依赖: 命令须符合当前执行环境的 shell 语法（cloud=sh；local Windows=cmd.exe；ssh=远端 shell，见 system prompt）
+    长任务（hook 模式）: 对构建/测试/长脚本等预计很长的命令，传 hook=true 以后台模式执行——输出实时重定向到
+      output_file（工作空间相对路径，缺省自动派生 .output/hook_<id>.log），工具立即返回 task_id 不阻塞本
+      轮；命令结束后会自动收到 [terminal hook] 提示（含退出码与输出文件），届时用 read 工具读取该文件继续
+      任务。运行期间可用 read 工具 tail 查看实时进度；用 hook_action=status/cancel + task_id 查询/取消后台任务。
 
 mcp:
   version: 1

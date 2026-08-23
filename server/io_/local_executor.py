@@ -1,15 +1,19 @@
-"""本地执行器客户端 - 通过反向 WebSocket 把工具执行请求转发给前端本地执行器。
+"""前端执行器客户端 - 通过反向 WebSocket 把工具执行请求转发给前端执行器。
 
-本地运行模式下，后端完整运行在云端，但工具调用环境转移到用户本机：
-- 前端（Flutter）在 WebSocket 连接建立后发送 ``register_local_executor``，
-  通知后端"本顶部 agent 的工具调用应转发到本地执行"。
-- 后端 :class:`LocalExecutorClient.request` 把每个工具执行请求包装成
-  ``tool_exec_request`` 消息推送给前端，并阻塞等待 ``tool_exec_response``。
-- 前端执行完成后回传结果，:meth:`resolve` 唤醒等待方。
+本地（local）与 SSH（ssh）两种"前端执行"模式共用本客户端：
+- 本地模式：前端（Flutter）发送 ``register_local_executor``，通知后端"本顶部
+  agent 的工具调用应转发到用户本机执行"；前端在用户选择的目录中执行。
+- SSH 模式：前端发送 ``register_ssh_executor``，通知后端"本顶部 agent 的工具
+  调用应转发到前端发起的 SSH 会话执行"；SSH 连接由前端（dartssh2）建立，
+  IP 相对前端机器，后端仅转发。
+- 后端 :meth:`request` 把每个工具执行请求包装成 ``tool_exec_request`` 消息推送给
+  前端，并阻塞等待 ``tool_exec_response``；前端执行完成后回传结果，:meth:`resolve`
+  唤醒等待方。
 
-本地模式按顶部 agent 单独控制：``register_local_executor`` 携带
-``top_agent_id``，后端以 ``(user_id, top_agent_id)`` 记录，同一用户的不同
-顶部 agent 可分别处于本地/云端模式。
+两种模式都按顶部 agent 单独控制：注册消息携带 ``top_agent_id``，后端以
+``(user_id, top_agent_id)`` 记录（local 记入 ``_users``、ssh 记入 ``_ssh_users``），
+同一用户的不同顶部 agent 可分别处于 local / ssh / cloud 模式（local 与 ssh 互斥，
+由 mode_resolver 保证）。
 
 由于工具 handler 运行在聊天消费线程（非事件循环线程），此处使用
 ``concurrent.futures.Future``（线程安全）实现跨线程的请求/响应配对。
@@ -66,12 +70,15 @@ def _run_async(coro: "Any") -> Any:
 
 
 class LocalExecutorClient:
-    """管理某用户到前端本地执行器的反向 WS 请求/响应。"""
+    """管理某用户到前端执行器（本地 / SSH）的反向 WS 请求/响应。"""
 
     def __init__(self) -> None:
         # user_id -> {top_agent_id: base_dir}（base_dir 仅供后端记录/展示；
         # 本地模式按顶部 agent 单独控制，因此以 (user_id, top_agent_id) 区分）
         self._users: Dict[str, Dict[str, str]] = {}
+        # user_id -> {top_agent_id}（SSH 模式按顶部 agent 单独控制；
+        # 仅记录"该顶部 agent 的工具调用应转发到前端 SSH 会话执行"）
+        self._ssh_users: Dict[str, set] = {}
         # (user_id, exec_id) -> concurrent.futures.Future 待响应
         self._pending: Dict[str, "concurrent.futures.Future[Dict[str, Any]]"] = {}
         # 主事件循环（lifespan 中绑定，用于从后台线程安全推送 WS 消息）
@@ -148,6 +155,61 @@ class LocalExecutorClient:
                 self._pending.pop(key, None)
         logger.info("用户 %s 顶部 agent %s 已注销本地执行器", user_id, top_agent_id)
 
+    def is_ssh(self, user_id: str, top_agent_id: Optional[str] = None) -> bool:
+        """当前用户/顶部 agent 是否已注册 SSH 前端执行器。
+
+        :param user_id: 用户标识
+        :param top_agent_id: 顶部 agent ID；None 时表示"该用户是否注册了任一
+                             SSH 顶部 agent"
+        """
+        regs = self._ssh_users.get(user_id)
+        if not regs:
+            return False
+        if top_agent_id is None:
+            return True
+        return top_agent_id in regs
+
+    def register_ssh(self, user_id: str, top_agent_id: str) -> None:
+        """注册某个顶部 agent 的 SSH 前端执行器。
+
+        :param user_id: 用户标识
+        :param top_agent_id: 顶部 agent ID（SSH 模式按顶部 agent 单独控制）
+        """
+        if not top_agent_id:
+            top_agent_id = user_id
+        self._ssh_users.setdefault(user_id, set()).add(top_agent_id)
+        # 重新注册视为执行器恢复：清零连续超时计数（复用同一用户级计数）
+        self._consecutive_timeouts.pop(user_id, None)
+        logger.info("用户 %s 顶部 agent %s 已启用 SSH 前端执行器", user_id, top_agent_id)
+
+    def unregister_ssh(self, user_id: str, top_agent_id: str) -> None:
+        """注销某个顶部 agent 的 SSH 前端执行器，并使该用户所有待响应请求失败。
+
+        :param user_id: 用户标识
+        :param top_agent_id: 顶部 agent ID
+        """
+        if not top_agent_id:
+            top_agent_id = user_id
+        regs = self._ssh_users.get(user_id)
+        if regs is not None:
+            regs.discard(top_agent_id)
+            if not regs:
+                self._ssh_users.pop(user_id, None)
+        for key, fut in list(self._pending.items()):
+            if key.startswith(f"{user_id}:"):
+                if not fut.done():
+                    fut.set_exception(RuntimeError("SSH 前端执行器已注销"))
+                self._pending.pop(key, None)
+        logger.info("用户 %s 顶部 agent %s 已注销 SSH 前端执行器", user_id, top_agent_id)
+
+    def _has_frontend_executor(self, user_id: str) -> bool:
+        """该用户是否注册了任一前端执行器（本地或 SSH）。
+
+        ``request`` / ``send_request`` 的粗粒度守卫：只要存在任一前端执行
+        模式，就把工具请求转发到前端；具体由前端按自身模式状态路由执行。
+        """
+        return bool(self._users.get(user_id)) or bool(self._ssh_users.get(user_id))
+
     def _is_cold(self, user_id: str) -> bool:
         """执行器是否处于"冷"状态：距上次成功往返超过探测间隔。
 
@@ -197,8 +259,8 @@ class LocalExecutorClient:
         :param timeout: 等待响应超时秒数
         :return: 前端返回的结果字典；失败时 ``{"error": ...}``
         """
-        if not self.is_local(user_id):
-            return {"error": "本地执行器未启用"}
+        if not self._has_frontend_executor(user_id):
+            return {"error": "前端执行器未启用（本地或 SSH）"}
         exec_id = uuid.uuid4().hex
         key = f"{user_id}:{exec_id}"
         fut: "concurrent.futures.Future[Dict[str, Any]]" = concurrent.futures.Future()
@@ -273,6 +335,95 @@ class LocalExecutorClient:
             # 尚未完成的 future 置为 RUNNING，导致后续 set_result 抛 InvalidStateError。
             if not fut.done():
                 self._pending.pop(key, None)
+
+    def send_request(
+        self, ws_manager: Any, user_id: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """非阻塞发送一个工具执行请求（不等待响应）。
+
+        hook 模式专用：本地前端托管分离进程执行长任务，进程退出后经
+        ``tool_exec_response`` 回传，由 :meth:`register_hook` 挂的 done
+        回调触发。发送失败返回 ``{"error": ...}``，不抛异常。
+
+        :param ws_manager: WebSocketManager 实例
+        :param user_id: 用户标识
+        :param payload: 执行请求负载（必须含 exec_id / op 等）
+        :return: ``{"success": True}`` 或 ``{"error": ...}``
+        """
+        if not self._has_frontend_executor(user_id):
+            return {"error": "前端执行器未启用（本地或 SSH）"}
+        exec_id = payload.get("exec_id", "")
+        message = {
+            "type": "tool_exec_request",
+            "data": {"exec_id": exec_id, **payload},
+        }
+        try:
+            loop = self._loop
+            if loop is not None and loop.is_running():
+                send_fut = asyncio.run_coroutine_threadsafe(
+                    ws_manager.send_message(user_id, message), loop
+                )
+                send_fut.result(timeout=10.0)
+            else:
+                _run_async(ws_manager.send_message(user_id, message))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "推送本地 hook 执行请求失败: %r (exec_id=%s, op=%s)",
+                exc, exec_id, payload.get("op"),
+            )
+            return {"error": f"推送本地 hook 执行请求失败: {exc}"}
+        return {"success": True}
+
+    def register_hook(
+        self,
+        user_id: str,
+        exec_id: str,
+        on_done: Any,
+    ) -> None:
+        """登记一个 hook 任务的完成回调。
+
+        把 ``(user_id, exec_id)`` 存入 ``_pending`` 并挂 done 回调：收到
+        ``tool_exec_response`` 时由既有 :meth:`resolve` 触发；执行器注销
+        （unregister）时以异常触发，保证 hook 不会悬挂。
+        """
+        key = f"{user_id}:{exec_id}"
+        fut: "concurrent.futures.Future[Dict[str, Any]]" = concurrent.futures.Future()
+        self._pending[key] = fut
+
+        def _done(f: "concurrent.futures.Future[Dict[str, Any]]") -> None:
+            try:
+                result = f.result()
+            except Exception as exc:  # noqa: BLE001
+                result = {"error": f"本地执行器 hook 异常: {exc}"}
+            try:
+                on_done(result)
+            except Exception:  # noqa: BLE001
+                logger.exception("hook on_done 回调失败: exec_id=%s", exec_id)
+
+        fut.add_done_callback(_done)
+
+    def cancel_hook(
+        self, ws_manager: Any, user_id: str, exec_id: str
+    ) -> Dict[str, Any]:
+        """通知前端终止一个 hook 分离进程（尽力终止）。
+
+        发送 ``tool_exec_cancel`` 消息；进程退出后前端仍会回传
+        ``tool_exec_response``，后端据此将任务标记为 cancelled。
+        """
+        message = {"type": "tool_exec_cancel", "data": {"exec_id": exec_id}}
+        try:
+            loop = self._loop
+            if loop is not None and loop.is_running():
+                send_fut = asyncio.run_coroutine_threadsafe(
+                    ws_manager.send_message(user_id, message), loop
+                )
+                send_fut.result(timeout=10.0)
+            else:
+                _run_async(ws_manager.send_message(user_id, message))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("推送取消 hook 请求失败: %r (exec_id=%s)", exc, exec_id)
+            return {"error": f"推送取消 hook 请求失败: {exc}"}
+        return {"success": True}
 
     def resolve(self, user_id: str, exec_id: str, result: Dict[str, Any]) -> bool:
         """由 WS 接收处理调用：用前端返回结果唤醒等待方。

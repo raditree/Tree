@@ -31,6 +31,11 @@ dependencies:
   # Markdown 渲染（模型输出默认 markdown 格式）
   # 注意：0.6.15+1 起要求 Dart 3.0，本项目为 Dart 2.19.6，故精确锁定 0.6.15
   flutter_markdown: 0.6.15
+  # SSH/SFTP 客户端（纯 Dart，Windows 桌面可用）
+  # 注意：dartssh2 >=2.10.0 依赖 meta ^1.15.0，与本项目 Flutter SDK 锁定的
+  # meta 1.8.0（Dart 2.19.6）冲突，故锁定 2.8.2（依赖 meta ^1.1.6，min Dart 2.14）
+  # SSH 模式连接由前端发起，IP 相对前端机器
+  dartssh2: 2.8.2
 
 dev_dependencies:
   flutter_test:

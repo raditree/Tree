@@ -151,12 +151,6 @@ async def lifespan(app: FastAPI):
         await sft_task
     except asyncio.CancelledError:
         pass
-    # 关闭全部 SSH 缓存连接
-    if state.ssh_manager is not None:
-        try:
-            state.ssh_manager.close_all()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("关闭 SSH 连接失败: %s", exc)
 
 
 app = FastAPI(

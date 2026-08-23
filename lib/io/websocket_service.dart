@@ -4,6 +4,12 @@ import 'dart:math' show min;
 
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+/// 工具执行请求处理者签名。
+///
+/// 返回 `true` 表示已接管该 ``tool_exec_request``（WebSocket 服务不再派发
+/// 给后续处理者）；返回 `false` 表示未接管（交由其他处理者按需处理）。
+typedef ToolExecRequestHandler = bool Function(Map<String, dynamic> message);
+
 /// WebSocket 服务 - 与后端实时消息通信
 ///
 /// 负责建立 WebSocket 连接、发送消息、接收消息与心跳保活。
@@ -31,11 +37,31 @@ class WebSocketService {
   /// 收到消息时的回调（已解析为 Map）
   void Function(Map<String, dynamic> message)? onMessage;
 
-  /// 工具执行请求回调（本地执行器注册）
+  /// 工具执行取消回调（本地执行器 hook 模式）
   ///
-  /// 收到 ``tool_exec_request`` 时优先交给本地执行器处理，处理完毕后
-  /// 不会继续派发给 [onMessage]，避免页面重复解析。
-  void Function(Map<String, dynamic> message)? onToolExecRequest;
+  /// 收到 ``tool_exec_cancel`` 时通知本地执行器终止对应分离进程。
+  void Function(Map<String, dynamic> message)? onToolExecCancel;
+
+  /// 工具执行请求处理者列表（本地执行器 / SSH 执行器共同注册）。
+  ///
+  /// 收到 ``tool_exec_request`` 时按注册顺序依次调用各处理者；返回 `true`
+  /// 表示该处理者已接管消息（不再派发给后续处理者，也不会派发给
+  /// [onMessage]，避免页面重复解析）。本地与 SSH 模式互斥，由各处理者
+  /// 按自身模式状态决定是否接管（本地处理者在 SSH 模式时返回 false 放行）。
+  final List<ToolExecRequestHandler> _toolExecRequestHandlers =
+      <ToolExecRequestHandler>[];
+
+  /// 注册一个工具执行请求处理者（重复注册会被忽略）。
+  void addToolExecRequestHandler(ToolExecRequestHandler handler) {
+    if (!_toolExecRequestHandlers.contains(handler)) {
+      _toolExecRequestHandlers.add(handler);
+    }
+  }
+
+  /// 注销一个工具执行请求处理者。
+  void removeToolExecRequestHandler(ToolExecRequestHandler handler) {
+    _toolExecRequestHandlers.remove(handler);
+  }
 
   /// 连接状态变化回调
   void Function(bool connected)? onConnectionChange;
@@ -101,9 +127,19 @@ class WebSocketService {
       if (type == 'heartbeat' || type == 'pong') {
         return;
       }
-      // 工具执行请求交给本地执行器（不向上派发）
+      // 工具执行请求交给已注册的执行器处理者（本地/SSH 按模式互斥接管，
+      // 不向上派发）。某处理者返回 true 表示已接管，停止后续派发。
       if (type == 'tool_exec_request') {
-        onToolExecRequest?.call(json);
+        final List<ToolExecRequestHandler> handlers =
+            List<ToolExecRequestHandler>.of(_toolExecRequestHandlers);
+        for (final ToolExecRequestHandler handler in handlers) {
+          if (handler(json)) return;
+        }
+        return;
+      }
+      // 工具执行取消交给本地执行器（hook 模式终止分离进程，不向上派发）
+      if (type == 'tool_exec_cancel') {
+        onToolExecCancel?.call(json);
         return;
       }
       onMessage?.call(json);

@@ -86,6 +86,31 @@ class PendingQuestionStoreTest(unittest.TestCase):
         store.save_pending_question("u5", "a5", "a5", "s5", "q_test5", "问题")
         self.assertEqual(store.get_pending_question("q_test5")["sender_id"], "")
 
+    def test_list_questions_filter_and_order(self) -> None:
+        """list_questions 支持按会话过滤、is_member 转 bool、按时间倒序。"""
+        store.save_pending_question(
+            "u9", "a9", "top-9", "s9", "q_list1", "问题1", ["A", "B"], is_member=0
+        )
+        store.save_pending_question(
+            "u9", "a9m", "top-9", "s9", "q_list2", "问题2",
+            is_member=1, sender_id="peerB",
+        )
+        # 另一会话的提问不应混入 s9 的结果
+        store.save_pending_question("u9", "a9", "top-9", "s10", "q_list3", "问题3")
+
+        # 按会话过滤：仅 s9 两条，且最新的在前（q_list2 后插入）
+        rows = store.list_questions("u9", "s9")
+        self.assertEqual([r["qid"] for r in rows], ["q_list2", "q_list1"])
+        self.assertTrue(rows[0]["is_member"])
+        self.assertFalse(rows[1]["is_member"])
+        self.assertEqual(rows[1]["options"], ["A", "B"])
+        self.assertEqual(rows[0]["sender_id"], "peerB")
+
+        # 不过滤会话：三条全返回
+        self.assertEqual(len(store.list_questions("u9")), 3)
+        # 其他用户不可见
+        self.assertEqual(store.list_questions("u-other"), [])
+
 
 class AskToolSentinelTest(unittest.TestCase):
     def setUp(self) -> None:

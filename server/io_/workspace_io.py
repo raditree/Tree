@@ -136,6 +136,18 @@ class WorkspaceIO(ABC):
                  或含 ``error`` 的字典
         """
 
+    async def exec_shell_no_timeout(
+        self, workspace_id: str, command: str
+    ) -> Dict[str, Any]:
+        """在工作空间内执行 shell 命令（hook 后台任务专用，**无时长上限**）。
+
+        与 :meth:`exec_shell` 的区别：**不做 ``timeout N`` 包装、无超时封顶**，
+        由调用方（hook_manager）以后台线程/进程执行并自行负责终止。仅
+        cloud / ssh 需要实现；local 模式走 :meth:`LocalWorkspaceIO.exec_shell_hook`，
+        因此基类默认返回错误（不应被调用）。
+        """
+        return {"error": "exec_shell_no_timeout 未实现（仅 cloud/ssh 支持）"}
+
     async def read_file_base64(
         self, workspace_id: str, path: str
     ) -> Dict[str, Any]:
@@ -229,6 +241,15 @@ class CloudWorkspaceIO(WorkspaceIO):
         return await asyncio.to_thread(
             self.docker_manager.exec_in_workspace,
             workspace_id, ["sh", "-c", wrapped_command],
+        )
+
+    async def exec_shell_no_timeout(
+        self, workspace_id: str, command: str
+    ) -> Dict[str, Any]:
+        """hook 后台任务专用：不做 ``timeout N`` 包装，无时长上限。"""
+        return await asyncio.to_thread(
+            self.docker_manager.exec_in_workspace,
+            workspace_id, ["sh", "-c", command],
         )
 
     async def exec_argv(
@@ -366,6 +387,46 @@ class LocalWorkspaceIO(WorkspaceIO):
     ) -> Dict[str, Any]:
         return await self._request(
             workspace_id, "exec_shell", command=command, timeout=int(timeout or 30)
+        )
+
+    async def exec_shell_hook(
+        self,
+        workspace_id: str,
+        exec_id: str,
+        command: str,
+        output_file: str,
+        timeout: Optional[int],
+        on_done: Any,
+    ) -> Dict[str, Any]:
+        """本地 hook 模式：前端托管分离进程执行长命令（无时长上限）。
+
+        先登记完成回调（进程退出时经 ``tool_exec_response`` 触发），再非阻塞
+        发送 ``exec_shell_hook`` 请求；发送失败时以错误结果收尾回调并返回错误，
+        避免 hook 挂起。
+        """
+        self._executor.register_hook(self._user_id, exec_id, on_done)
+        result = await asyncio.to_thread(
+            self._executor.send_request, self._ws_manager, self._user_id,
+            {
+                "op": "exec_shell_hook",
+                "workspace_id": workspace_id,
+                "exec_id": exec_id,
+                "command": command,
+                "output_file": output_file,
+                "timeout": timeout,
+            },
+        )
+        if result.get("error"):
+            # 发送失败：触发 on_done 以错误收尾，避免 hook 永久悬挂
+            self._executor.resolve(
+                self._user_id, exec_id, {"error": result["error"]}
+            )
+        return result
+
+    async def cancel_exec_hook(self, exec_id: str) -> Dict[str, Any]:
+        """取消本地 hook 分离进程：向后端 WS 发 ``tool_exec_cancel``。"""
+        return await asyncio.to_thread(
+            self._executor.cancel_hook, self._ws_manager, self._user_id, exec_id
         )
 
     async def exec_argv(

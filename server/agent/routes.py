@@ -15,6 +15,7 @@ from agent.chat import (
     _dispatch_agent_message,
     _get_workspace_io,
     _parse_roster_table,
+    resume_after_answer,
 )
 from config.config import get_config
 from config.models import get_model_configs
@@ -30,7 +31,10 @@ from data.conversation_store import (
     clear_history,
     count_messages_by_session,
     get_history,
+    get_pending_question,
+    list_questions,
     load_context,
+    mark_pending_answered,
     save_context,
 )
 from data.session_cache import clear_user_agent, get_session
@@ -826,3 +830,64 @@ async def delete_mcp_service(
     if not ok:
         raise HTTPException(status_code=404, detail="服务不存在或为内置服务，无法删除")
     return {"success": True}
+
+
+class AnswerQuestionRequest(BaseModel):
+    """回答 AskUserQuestion 问题的请求体。"""
+
+    answer: str
+
+
+@router.get("/questions")
+async def list_question_api(
+    session_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """列出当前用户的提问（可选按会话过滤），供右侧「问题回复」页使用。
+
+    ``session_id`` 缺省不过滤，返回该用户全部提问（含各 agent 与成员提问）。
+    """
+    user_id = current_user.get("openid", "")
+    questions = list_questions(user_id, session_id)
+    return {"questions": questions}
+
+
+@router.post("/questions/{qid}/answer")
+async def answer_question_api(
+    qid: str,
+    req: AnswerQuestionRequest,
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """回答某条待答提问（REST 入口，与 WS user_answer 逻辑等价）。
+
+    校验归属后标记 answered、推送 ask_user_question_resolved 供中栏同步，
+    并异步唤醒对应 agent 续跑。
+    """
+    user_id = current_user.get("openid", "")
+    pending = get_pending_question(qid)
+    if pending is None or pending["status"] != "pending":
+        raise HTTPException(status_code=400, detail="没有等待回答的问题")
+    if pending.get("user_id") != user_id:
+        raise HTTPException(status_code=403, detail="无权操作该提问")
+    answer = str(req.answer or "")
+    mark_pending_answered(qid, answer)
+    await state.ws_manager.send_message(
+        user_id,
+        {
+            "type": "ask_user_question_resolved",
+            "data": {"id": qid, "session_id": pending["session_id"]},
+        },
+    )
+    # 唤醒：注入答案并重新触发该 agent 执行（异步，不阻塞请求）
+    asyncio.create_task(
+        resume_after_answer(
+            pending["user_id"],
+            pending["agent_id"],
+            pending["top_agent_id"],
+            pending["session_id"],
+            answer,
+            pending["is_member"],
+            pending.get("sender_id", ""),
+        )
+    )
+    return {"success": True, "qid": qid, "status": "answered"}

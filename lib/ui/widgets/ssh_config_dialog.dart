@@ -106,6 +106,7 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
                 decoration: const InputDecoration(
                   labelText: '主机地址',
                   hintText: '例如 192.168.1.10 或 host.example.com',
+                  helperText: '需从前端所在机器可达（IP 相对前端）',
                   prefixIcon: Icon(Icons.dns_outlined, size: 20),
                   border: OutlineInputBorder(),
                   isDense: true,

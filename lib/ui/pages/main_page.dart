@@ -13,6 +13,7 @@ import '../widgets/agent_list.dart';
 import '../widgets/create_agent_dialog.dart';
 import '../widgets/file_panel.dart';
 import '../widgets/message_panel.dart';
+import '../widgets/teammates_window_page.dart';
 import 'login_page.dart';
 import 'settings_page.dart';
 
@@ -60,6 +61,12 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   // 消息面板刷新触发器（递增触发 MessagePanel 重新加载历史）
   int _refreshTrigger = 0;
 
+  // 提问定位目标消息 id（右侧「问题回复」导航触发）
+  String? _navigateMessageId;
+
+  // 提问定位触发号（递增触发 MessagePanel 定位滚动）
+  int _navigateTrigger = 0;
+
   // 当前选中 Agent 的列表（默认空，通过"创建 Agent"新增）
   List<Agent> _agents = <Agent>[];
 
@@ -94,6 +101,86 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         );
       }
     }
+  }
+
+  /// 处理右侧「问题回复」页的定位导航。
+  ///
+  /// - 主 agent 提问：切换中栏到该提问所属 agent/会话，并滚动定位到该提问卡片。
+  /// - 成员提问：打开该成员的工作进度详情窗口并滚动定位（不动中栏/左栏上下文）。
+  Future<void> _handleNavigateToQuestion({
+    required bool isMember,
+    required String agentId,
+    required String topAgentId,
+    required String sessionId,
+    required String messageId,
+  }) async {
+    if (isMember) {
+      // 成员提问：打开成员进度详情窗口并滚动定位
+      Agent? leader;
+      for (final Agent a in _agents) {
+        if (a.id == topAgentId) {
+          leader = a;
+          break;
+        }
+      }
+      if (leader == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('该提问所属 Agent 不存在或已删除')),
+          );
+        }
+        return;
+      }
+      String memberName = '';
+      try {
+        final List<Map<String, dynamic>> members =
+            await ApiService.getTeammates(leader.id);
+        for (final Map<String, dynamic> m in members) {
+          if ((m['id'] as String?) == agentId) {
+            memberName = (m['name'] as String?) ?? '';
+            break;
+          }
+        }
+      } catch (_) {
+        // 拉取成员名失败时回退用成员 id 显示
+      }
+      if (!mounted) return;
+      final Agent leaderAgent = leader;
+      Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => TeammateDetailPage(
+            leader: leaderAgent,
+            memberId: agentId,
+            memberName: memberName.isNotEmpty ? memberName : agentId,
+            sessionId: sessionId,
+            scrollToMessageId: messageId,
+          ),
+        ),
+      );
+      return;
+    }
+    // 主 agent 提问：切换中栏上下文并滚动定位
+    Agent? target;
+    for (final Agent a in _agents) {
+      if (a.id == agentId) {
+        target = a;
+        break;
+      }
+    }
+    if (target == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('该提问所属 Agent 不存在或已删除')),
+        );
+      }
+      return;
+    }
+    setState(() {
+      _selectedAgent = target;
+      _currentSessionId = sessionId;
+      _navigateMessageId = messageId;
+      _navigateTrigger++;
+    });
   }
 
   /// 弹出创建 Agent 配置对话框，并在确认后加入列表
@@ -303,6 +390,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 _currentSessionId = id;
               });
             },
+            navigateMessageId: _navigateMessageId,
+            navigateSessionId: _currentSessionId,
+            navigateTrigger: _navigateTrigger,
           ),
           workspaceId.isEmpty
               ? _buildMobileFilePlaceholder()
@@ -311,6 +401,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                   workspaceId: workspaceId,
                   topAgentId: _selectedAgent?.id,
                   sessionId: _currentSessionId,
+                  onNavigateToQuestion: _handleNavigateToQuestion,
                 ),
         ],
       ),
@@ -429,6 +520,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 _currentSessionId = id;
               });
             },
+            navigateMessageId: _navigateMessageId,
+            navigateSessionId: _currentSessionId,
+            navigateTrigger: _navigateTrigger,
           ),
         ),
         // 拖拽分隔条 2（控制右栏宽度；折叠时平滑收为 0）
@@ -561,6 +655,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
           _rightCollapsed = true;
         });
       },
+      onNavigateToQuestion: _handleNavigateToQuestion,
     );
   }
 

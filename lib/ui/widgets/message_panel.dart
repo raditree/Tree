@@ -8,6 +8,7 @@ import '../../io/api_service.dart';
 import '../../io/auth_service.dart';
 import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
+import '../../io/question_update_service.dart';
 import '../../io/ssh_executor_service.dart';
 import '../../io/websocket_service.dart';
 import '../../io/workspace_refresh_service.dart';
@@ -38,11 +39,23 @@ class MessagePanel extends StatefulWidget {
   /// 会话切换回调（选中/新建会话时触发，携带新的 session_id）
   final ValueChanged<String>? onSessionChanged;
 
+  /// 定位目标消息 id（右侧「问题回复」导航触发）
+  final String? navigateMessageId;
+
+  /// 定位目标会话 id（与 [navigateMessageId] 配合）
+  final String? navigateSessionId;
+
+  /// 定位触发号：外部递增触发导航定位
+  final int navigateTrigger;
+
   const MessagePanel({
     super.key,
     this.selectedAgent,
     this.refreshTrigger = 0,
     this.onSessionChanged,
+    this.navigateMessageId,
+    this.navigateSessionId,
+    this.navigateTrigger = 0,
   });
 
   @override
@@ -61,6 +74,18 @@ class _MessagePanelState extends State<MessagePanel> {
 
   /// 消息版本号：消息列表每次结构性变化时递增，驱动 MessageList 滚动到底部
   int _scrollRevision = 0;
+
+  /// 定位目标消息 id（历史加载完成后消费，驱动 MessageList 定位滚动）
+  String? _pendingScrollId;
+
+  /// 定位目标会话 id（供 _loadSessions 优先选中目标会话）
+  String? _pendingSessionId;
+
+  /// MessageList 定位触发号
+  int _scrollToRevision = 0;
+
+  /// 定位目标消息 id（透传给 MessageList）
+  String? _scrollToMessageId;
 
   /// 处于 working 状态的 agent 集合（用于标题栏显示状态与停止按钮）
   final Set<String> _workingAgents = <String>{};
@@ -164,6 +189,15 @@ class _MessagePanelState extends State<MessagePanel> {
   @override
   void didUpdateWidget(covariant MessagePanel oldWidget) {
     super.didUpdateWidget(oldWidget);
+    // 右侧「问题回复」导航定位触发：记录待消费的定位目标
+    final bool navTriggered = oldWidget.navigateTrigger != widget.navigateTrigger &&
+        widget.navigateMessageId != null &&
+        widget.navigateMessageId!.isNotEmpty;
+    if (navTriggered) {
+      _pendingScrollId = widget.navigateMessageId;
+      _pendingSessionId = widget.navigateSessionId;
+    }
+
     // 切换 Agent 或外部触发刷新时清空消息列表并加载历史
     if (oldWidget.selectedAgent?.id != widget.selectedAgent?.id) {
       setState(() {
@@ -182,7 +216,39 @@ class _MessagePanelState extends State<MessagePanel> {
         _messages.clear();
       });
       _loadHistory();
+    } else if (navTriggered) {
+      // 同 agent 定位：按目标会话切换（若不同）后加载历史并定位
+      final String? targetSession = widget.navigateSessionId;
+      if (targetSession != null &&
+          targetSession.isNotEmpty &&
+          targetSession != _currentSessionId) {
+        final ChatSession? ts = _sessions
+            .where((ChatSession s) => s.sessionId == targetSession)
+            .cast<ChatSession?>()
+            .firstWhere((ChatSession? s) => s != null, orElse: () => null);
+        setState(() {
+          _currentSession = ts;
+          _messages.clear();
+        });
+        widget.onSessionChanged?.call(targetSession);
+        _loadHistory();
+      } else if (_messages.isEmpty) {
+        _loadHistory();
+      } else {
+        _consumePendingScroll();
+      }
     }
+  }
+
+  /// 消费定位目标：递增 MessageList 定位触发号，驱动滚动到目标消息。
+  void _consumePendingScroll() {
+    final String? id = _pendingScrollId;
+    if (id == null || id.isEmpty) return;
+    _pendingScrollId = null;
+    setState(() {
+      _scrollToMessageId = id;
+      _scrollToRevision++;
+    });
   }
 
   /// 拉取当前 agent 的会话列表；切换会话时清空消息并重新加载历史
@@ -198,10 +264,12 @@ class _MessagePanelState extends State<MessagePanel> {
         // 运行模式按顶部 agent 级锁定：该 agent 任一历史会话有消息
         // 即视为「已开始过对话」，切换会话不解除锁定
         _modeLocked = sessions.any((s) => s.messageCount > 0);
-        // 保持当前会话选择（若仍存在），否则回退到列表首个/默认会话
-        final String prev = _currentSessionId;
+        // 保持当前会话选择（若仍存在），否则回退到列表首个/默认会话。
+        // 定位导航时优先选中目标会话（_pendingSessionId，一次性消费）。
+        final String prev = _pendingSessionId ?? _currentSessionId;
+        _pendingSessionId = null;
         final bool keep = sessions.any((s) => s.sessionId == prev);
-        if (keep && _currentSession != null) {
+        if (keep) {
           _currentSession = sessions.firstWhere((s) => s.sessionId == prev);
         } else if (sessions.isNotEmpty) {
           _currentSession = sessions.first;
@@ -236,6 +304,9 @@ class _MessagePanelState extends State<MessagePanel> {
       if (!mounted) return;
       // 会话可能在等待期间被切换，丢弃过期的历史
       if (sessionId != _currentSessionId) return;
+      // 定位目标：历史加载完成后直接消费，驱动 MessageList 定位滚动
+      // （而非滚到底部，避免「先滚底再跳位」的闪烁）
+      final String? pendingScroll = _pendingScrollId;
       setState(() {
         _messages.clear();
         for (final Map<String, dynamic> item in raw) {
@@ -245,7 +316,13 @@ class _MessagePanelState extends State<MessagePanel> {
         // 运行模式是顶部 agent 级共享的，锁定状态由 _loadSessions
         // 依据「该 agent 是否已有任一历史会话」统一决定，切换会话
         // （含新建空会话）不得解除锁定。
-        _scrollRevision++;
+        if (pendingScroll != null && pendingScroll.isNotEmpty) {
+          _scrollToMessageId = pendingScroll;
+          _scrollToRevision++;
+          _pendingScrollId = null;
+        } else {
+          _scrollRevision++;
+        }
         // 从历史中恢复 token 用量：取最后一条带 usage 的 agent 消息，
         // 使重启后「上下文长度」统计不丢失（usage 随消息已持久化）
         for (final ChatMessage m in _messages.reversed) {
@@ -448,6 +525,19 @@ class _MessagePanelState extends State<MessagePanel> {
       });
     } else if (type == 'ask_user_question') {
       _handleAskUserQuestion(data);
+    } else if (type == 'ask_user_question_resolved') {
+      // 右栏作答后，中栏对应内联卡片即时置灰
+      final String qid =
+          (((data['data'] as Map?)?['id']) as String?) ?? '';
+      if (qid.isNotEmpty) {
+        final int idx =
+            _messages.indexWhere((ChatMessage m) => m.id == qid);
+        if (idx >= 0) {
+          setState(() {
+            _messages[idx].answered = true;
+          });
+        }
+      }
     } else if (type == 'message') {
       if (!_isForCurrentAgent(data) || !_isForCurrentSession(data)) return;
       // 完整 agent 消息（如后端 _send_text_as_agent 发送的错误提示）
@@ -509,6 +599,8 @@ class _MessagePanelState extends State<MessagePanel> {
       ));
       _scrollRevision++;
     });
+    // 通知右栏「问题回复」页即时出现新问题
+    QuestionUpdateService.instance.notifyChanged();
   }
 
   /// 处理内联提问卡片的选项点选：发送 user_answer 并标记该问题已作答。
@@ -524,6 +616,8 @@ class _MessagePanelState extends State<MessagePanel> {
       'type': 'user_answer',
       'data': {'question_id': messageId, 'answer': answer},
     });
+    // 通知右栏「问题回复」页标记该问题已回复
+    QuestionUpdateService.instance.notifyChanged();
   }
 
   /// 请求停止当前 agent/会话的进行中任务
@@ -727,6 +821,8 @@ class _MessagePanelState extends State<MessagePanel> {
                         messages: _messages,
                         revision: _scrollRevision,
                         onAskAnswer: _handleAskAnswer,
+                        scrollToMessageId: _scrollToMessageId,
+                        scrollToRevision: _scrollToRevision,
                       ),
                     ),
           if (agent != null) MessageInput(onSend: _handleSend),
