@@ -414,5 +414,138 @@ class TestTeamMemberSessionIsolation(unittest.TestCase):
         self.assertEqual(result["status"], "broadcast")
 
 
+class TestQueueInjectionSessionIsolation(unittest.TestCase):
+    """R2 队列切入链路：tool_call 间隙切入时只接收当前会话的消息。
+
+    背景：broker 队列按 (user_id, agent_id) 维度共享，跨会话的消息
+    会进入同一队列。若 _pick_incoming 不校验 session_id，用户在会话 B
+    发消息而 agent 正在处理会话 A 时，B 的消息会被切入 A 的上下文，
+    造成"其他会话消息串入当前会话/默认会话"。
+
+    修复：_pick_incoming 校验 incoming.session_id == 当前会话，不匹配
+    则放回队列（由 worker 后续作为独立消息处理），不串入本会话上下文。
+    """
+
+    def _run(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def test_pick_incoming_skips_other_session(self):
+        """切入时跳过其他会话消息并放回队列，仅切入当前会话消息。"""
+        from agent import chat
+
+        injected: list = []
+
+        async def _fake_stream(user_id, agent_id, workspace_id, session,
+                               content, on_tool_turn=None, cancel_event=None,
+                               session_id=None):
+            # 模拟 tool_call 间隙：先尝试切入（此刻队列头是其他会话消息，
+            # 应被跳过放回），再尝试切入（当前会话消息可被取出）
+            first = on_tool_turn()
+            second = on_tool_turn()
+            injected.append((first, second))
+            return ("ok", "ok", None)
+
+        # 队列先放其他会话消息，再放当前会话消息
+        import queue as _queue
+
+        q = _queue.Queue()
+        q.put({"user_id": "u1", "agent_id": "mem-1", "workspace_id": "w1",
+               "model_id": "m1", "leader_id": "leader-1",
+               "top_agent_id": "top-1", "content": "other-session-msg",
+               "session_id": "sess-other"})
+        q.put({"user_id": "u1", "agent_id": "mem-1", "workspace_id": "w1",
+               "model_id": "m1", "leader_id": "leader-1",
+               "top_agent_id": "top-1", "content": "current-session-msg",
+               "session_id": "sess-current"})
+
+        with patch.object(chat, "_stream_agent_reply", new=_fake_stream), \
+                patch.object(chat, "_store_message", return_value=None), \
+                patch.object(chat, "_register_active_task",
+                             return_value=MagicMock()), \
+                patch.object(chat, "_clear_active_task", return_value=None), \
+                patch.object(chat, "_send_status_idle", new=AsyncMock()), \
+                patch.object(chat, "save_context", return_value=None), \
+                patch.object(chat, "_reset_member_work_status", return_value=None), \
+                patch.object(chat, "_append_activity_log", return_value=None), \
+                patch.object(chat, "_register_tools", new=AsyncMock()), \
+                patch.object(chat, "get_session", return_value=None), \
+                patch.object(chat, "load_context", return_value=None), \
+                patch.object(chat, "set_session", return_value=None), \
+                patch("agent.chat.state.model_configs", {
+                    "m1": MagicMock(api_key="k", name="M1", if_vision=False),
+                }), \
+                patch("agent.chat.state.ws_manager",
+                      MagicMock(send_message=AsyncMock())):
+            payload = {
+                "user_id": "u1", "agent_id": "mem-1", "workspace_id": "w1",
+                "model_id": "m1", "leader_id": "leader-1",
+                "top_agent_id": "top-1",
+                "system_prompt": "", "content": "start",
+                "session_id": "sess-current",
+            }
+            self._run(chat._process_member_message(payload, q))
+
+        # 第一次切入应跳过其他会话（None），第二次切入到当前会话消息
+        self.assertEqual(injected[0][0], None)
+        self.assertEqual(injected[0][1], "current-session-msg")
+        # 其他会话消息被放回队列，未被消费
+        self.assertFalse(q.empty())
+
+    def test_pick_incoming_same_session_passthrough(self):
+        """队列头即当前会话消息时正常切入（不误伤）。"""
+        from agent import chat
+
+        injected: list = []
+
+        async def _fake_stream(user_id, agent_id, workspace_id, session,
+                               content, on_tool_turn=None, cancel_event=None,
+                               session_id=None):
+            injected.append(on_tool_turn())
+            return ("ok", "ok", None)
+
+        import queue as _queue
+
+        q = _queue.Queue()
+        q.put({"user_id": "u1", "agent_id": "mem-1", "workspace_id": "w1",
+               "model_id": "m1", "leader_id": "leader-1",
+               "top_agent_id": "top-1", "content": "same-session-msg",
+               "session_id": "sess-current"})
+
+        with patch.object(chat, "_stream_agent_reply", new=_fake_stream), \
+                patch.object(chat, "_store_message", return_value=None), \
+                patch.object(chat, "_register_active_task",
+                             return_value=MagicMock()), \
+                patch.object(chat, "_clear_active_task", return_value=None), \
+                patch.object(chat, "_send_status_idle", new=AsyncMock()), \
+                patch.object(chat, "save_context", return_value=None), \
+                patch.object(chat, "_reset_member_work_status", return_value=None), \
+                patch.object(chat, "_append_activity_log", return_value=None), \
+                patch.object(chat, "_register_tools", new=AsyncMock()), \
+                patch.object(chat, "get_session", return_value=None), \
+                patch.object(chat, "load_context", return_value=None), \
+                patch.object(chat, "set_session", return_value=None), \
+                patch("agent.chat.state.model_configs", {
+                    "m1": MagicMock(api_key="k", name="M1", if_vision=False),
+                }), \
+                patch("agent.chat.state.ws_manager",
+                      MagicMock(send_message=AsyncMock())):
+            payload = {
+                "user_id": "u1", "agent_id": "mem-1", "workspace_id": "w1",
+                "model_id": "m1", "leader_id": "leader-1",
+                "top_agent_id": "top-1",
+                "system_prompt": "", "content": "start",
+                "session_id": "sess-current",
+            }
+            self._run(chat._process_member_message(payload, q))
+
+        self.assertEqual(injected[0], "same-session-msg")
+        # 当前会话消息已被消费
+        self.assertTrue(q.empty())
+
+
 if __name__ == "__main__":
     unittest.main()

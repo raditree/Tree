@@ -1355,6 +1355,12 @@ async def _process_member_message(
             incoming = queue.get_nowait()
         except queue.Empty:
             return None
+        # 跨会话隔离：只切入当前会话的消息；其他会话的消息放回队列，
+        # 待当前消息处理完后由 worker 作为独立消息继续处理（不串入本会话上下文）
+        incoming_session = incoming.get("session_id", DEFAULT_SESSION)
+        if incoming_session != session_id:
+            queue.put_nowait(incoming)
+            return None
         incoming_content = incoming.get("content", "")
         if not incoming_content:
             return None
@@ -1761,12 +1767,19 @@ async def _handle_user_message(
 
             仅在 agent 处于 working 状态时调用：当前消息处理到 tool_call 间隙，
             从队列取出用户新消息，插到工具结果之后供下一轮 LLM 处理。
+
+            跨会话隔离：只切入当前会话的消息；其他会话的消息放回队列，
+            待当前消息处理完后由 worker 作为独立消息继续处理（不串入本会话上下文）。
             """
             if queue is None:
                 return None
             try:
                 incoming = queue.get_nowait()
             except queue.Empty:
+                return None
+            incoming_session = incoming.get("session_id", DEFAULT_SESSION)
+            if incoming_session != session_id:
+                queue.put_nowait(incoming)
                 return None
             incoming_content = incoming.get("content", "")
             if not incoming_content:
