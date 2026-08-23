@@ -71,8 +71,9 @@ class _FileTreeState extends State<FileTree> {
   /// 调用 [ApiService.getFiles] 获取数据，加载完成后按"目录优先 + 名称排序"
   /// 的顺序排列。异常时设置 [_error] 以便 UI 展示。
   Future<void> _loadFiles() async {
+    // 软更新：已有旧数据时保持旧列表可见，不闪加载态；仅首次加载显示 spinner
     setState(() {
-      _isLoading = true;
+      _isLoading = _files.isEmpty;
       _error = null;
     });
     try {

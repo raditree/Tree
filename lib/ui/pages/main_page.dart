@@ -44,6 +44,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   // 折叠时宽度
   static const double _collapsedWidth = 40;
 
+  // 侧栏折叠/展开的动画时长与曲线（宽度平滑过渡 + 内容淡入淡出）
+  static const Duration _sidebarAnimDuration = Duration(milliseconds: 240);
+  static const Curve _sidebarAnimCurve = Curves.easeInOutCubic;
+
   /// 移动端底部导航当前页（0=Agent 列表，1=消息，2=文件）
   int _mobileTab = 0;
 
@@ -395,16 +399,17 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   Widget _buildThreeColumnLayout() {
     return Row(
       children: [
-        // 左栏：Agent 列表（折叠或展开）
-        if (_leftCollapsed)
-          _buildCollapsedLeftBar()
-        else ...[
-          SizedBox(
-            width: _leftWidth,
-            child: _buildAgentPanel(),
-          ),
-          // 拖拽分隔条 1（控制左栏宽度）
-          DraggableDivider(
+        // 左栏：Agent 列表（折叠时宽度平滑过渡，内容淡入淡出）
+        _buildAnimatedSidebar(
+          collapsed: _leftCollapsed,
+          expandedWidth: _leftWidth,
+          collapsedBar: _buildCollapsedLeftBar(),
+          expandedBar: _buildAgentPanel(),
+        ),
+        // 拖拽分隔条 1（控制左栏宽度；折叠时平滑收为 0）
+        _buildAnimatedDivider(
+          collapsed: _leftCollapsed,
+          divider: DraggableDivider(
             onDrag: (delta) {
               setState(() {
                 _leftWidth = (_leftWidth + delta)
@@ -413,7 +418,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
               });
             },
           ),
-        ],
+        ),
         // 中栏：消息交互（弹性宽度）
         Expanded(
           child: MessagePanel(
@@ -426,12 +431,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             },
           ),
         ),
-        // 右栏：文件管理（折叠或展开）
-        if (_rightCollapsed)
-          _buildCollapsedRightBar()
-        else ...[
-          // 拖拽分隔条 2（控制右栏宽度）
-          DraggableDivider(
+        // 拖拽分隔条 2（控制右栏宽度；折叠时平滑收为 0）
+        _buildAnimatedDivider(
+          collapsed: _rightCollapsed,
+          divider: DraggableDivider(
             onDrag: (delta) {
               setState(() {
                 // 右栏分隔条向右拖拽（delta 为正）时，右栏宽度减小
@@ -441,12 +444,56 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
               });
             },
           ),
-          SizedBox(
-            width: _rightWidth,
-            child: _buildFilePanel(),
-          ),
-        ],
+        ),
+        // 右栏：文件管理（折叠时宽度平滑过渡，内容淡入淡出）
+        _buildAnimatedSidebar(
+          collapsed: _rightCollapsed,
+          expandedWidth: _rightWidth,
+          collapsedBar: _buildCollapsedRightBar(),
+          expandedBar: _buildFilePanel(),
+        ),
       ],
+    );
+  }
+
+  /// 折叠自适应的侧栏：宽度随折叠状态平滑过渡，内容在展开/折叠两态间淡入淡出
+  Widget _buildAnimatedSidebar({
+    required bool collapsed,
+    required double expandedWidth,
+    required Widget collapsedBar,
+    required Widget expandedBar,
+  }) {
+    return AnimatedContainer(
+      duration: _sidebarAnimDuration,
+      curve: _sidebarAnimCurve,
+      width: collapsed ? _collapsedWidth : expandedWidth,
+      child: AnimatedSwitcher(
+        duration: _sidebarAnimDuration,
+        switchInCurve: _sidebarAnimCurve,
+        switchOutCurve: _sidebarAnimCurve,
+        transitionBuilder: (Widget child, Animation<double> animation) {
+          return FadeTransition(
+            opacity: animation,
+            child: KeyedSubtree(key: const ValueKey('sidebar'), child: child),
+          );
+        },
+        child: collapsed
+            ? KeyedSubtree(key: const ValueKey('collapsed'), child: collapsedBar)
+            : KeyedSubtree(key: const ValueKey('expanded'), child: expandedBar),
+      ),
+    );
+  }
+
+  /// 折叠自适应的分隔条：折叠时宽度平滑收为 0（不占空间）
+  Widget _buildAnimatedDivider({
+    required bool collapsed,
+    required Widget divider,
+  }) {
+    return AnimatedContainer(
+      duration: _sidebarAnimDuration,
+      curve: _sidebarAnimCurve,
+      width: collapsed ? 0 : 6,
+      child: collapsed ? const SizedBox.shrink() : divider,
     );
   }
 

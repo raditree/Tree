@@ -63,7 +63,13 @@ class _FilePanelState extends State<FilePanel>
   /// 文件树刷新触发器（上传等操作后递增，触发 FileTree 重新加载）
   int _fileRefreshTrigger = 0;
 
-  /// 刷新文件树
+  /// Git 历史刷新触发器
+  int _gitRefreshTrigger = 0;
+
+  /// Todo 列表刷新触发器
+  int _todoRefreshTrigger = 0;
+
+  /// 刷新文件树（兼容旧调用：视为文件区域）
   void _refreshFileTree() {
     setState(() {
       _fileRefreshTrigger++;
@@ -90,13 +96,26 @@ class _FilePanelState extends State<FilePanel>
     super.dispose();
   }
 
-  /// 工作空间数据变更（工具写文件 / git 提交 / 更新 todo）时刷新右栏面板。
+  /// 工作空间数据变更（工具写文件 / git 提交 / 更新 todo）时增量刷新右栏。
   ///
-  /// 递增 [_fileRefreshTrigger] 会同时触发 FileTree / GitHistory / TodoPanel 重载，
-  /// 无需"切 Tab 再切回"。
+  /// 依据变更影响的区域，只递增对应 tab 的触发器；只读工具不触发，
+  /// 不再"切 Tab 再切回"也无需整表重拉。
   void _onWorkspaceChanged() {
     if (!mounted) return;
-    _refreshFileTree();
+    final Set<WorkspaceArea>? areas =
+        WorkspaceRefreshService.instance.takeAreas();
+    if (areas == null || areas.isEmpty) return;
+    setState(() {
+      if (areas.contains(WorkspaceArea.files)) {
+        _fileRefreshTrigger++;
+      }
+      if (areas.contains(WorkspaceArea.git)) {
+        _gitRefreshTrigger++;
+      }
+      if (areas.contains(WorkspaceArea.todo)) {
+        _todoRefreshTrigger++;
+      }
+    });
   }
 
   /// 本地执行模式状态变化（切换开关/选择工作目录）时刷新文件树。
@@ -291,13 +310,13 @@ class _FilePanelState extends State<FilePanel>
                   GitHistory(
                       workspaceId: widget.workspaceId,
                       topAgentId: widget.topAgentId,
-                      refreshTrigger: _fileRefreshTrigger,
+                      refreshTrigger: _gitRefreshTrigger,
                     ),
                   TodoPanel(
                     workspaceId: widget.workspaceId,
                     topAgentId: widget.topAgentId,
                     sessionId: widget.sessionId,
-                    refreshTrigger: _fileRefreshTrigger,
+                    refreshTrigger: _todoRefreshTrigger,
                   ),
                 ],
               ),

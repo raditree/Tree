@@ -83,7 +83,8 @@ class _TodoPanelState extends State<TodoPanel> {
   /// 拉取并解析当前会话 todos
   Future<void> _load() async {
     setState(() {
-      _loading = true;
+      // 软更新：有旧数据时不闪加载态
+      _loading = _todos.isEmpty;
       _error = null;
     });
     try {

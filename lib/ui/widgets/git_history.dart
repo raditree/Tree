@@ -89,7 +89,8 @@ class _GitHistoryState extends State<GitHistory>
   /// 加载 Git 提交历史
   Future<void> _loadCommits() async {
     setState(() {
-      _isLoadingCommits = true;
+      // 软更新：有旧数据时不闪加载态
+      _isLoadingCommits = _commits.isEmpty;
       _commitsError = null;
     });
     try {
@@ -116,7 +117,8 @@ class _GitHistoryState extends State<GitHistory>
   /// 加载 Git 分支列表
   Future<void> _loadBranches() async {
     setState(() {
-      _isLoadingBranches = true;
+      // 软更新：有旧数据时不闪加载态
+      _isLoadingBranches = _branches.isEmpty;
       _branchesError = null;
     });
     try {

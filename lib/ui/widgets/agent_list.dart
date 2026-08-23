@@ -210,10 +210,11 @@ class _AgentListState extends State<AgentList> {
   /// 列表底部空位折叠区：Agent 较少时显示"点击空白处折叠左栏"
   Widget _buildCollapsePlaceholder() {
     final cs = Theme.of(context).colorScheme;
+    // 仅注册 onTap：若同时注册 onDoubleTap，GestureDetector 会等待双击超时
+    // （约 300ms）以消除歧义，导致点击折叠出现明显延迟，故这里只保留单击。
     return GestureDetector(
       behavior: HitTestBehavior.translucent,
       onTap: widget.onCollapse,
-      onDoubleTap: widget.onCollapse,
       child: SizedBox(
         height: 220,
         child: Center(

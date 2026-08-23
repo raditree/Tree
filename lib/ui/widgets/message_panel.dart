@@ -211,6 +211,12 @@ class _MessagePanelState extends State<MessagePanel> {
         _messages.clear();
       });
       _loadHistory();
+      // 无论显式选会话还是自动选中，都把实际生效的会话 id 广播给
+      // main_page -> FilePanel -> TodoPanel，保证"进入会话无 tool 调用"时
+      // todo 也按当前会话隔离（否则 TodoPanel 会停留在旧的 session_default）
+      if (mounted) {
+        widget.onSessionChanged?.call(_currentSessionId);
+      }
     } catch (e) {
       // 拉取失败时保持默认会话
     }
@@ -252,6 +258,44 @@ class _MessagePanelState extends State<MessagePanel> {
       });
     } catch (e) {
       // 拉取失败时静默处理（保持空列表）
+    }
+  }
+
+  /// 按工具名判定其影响的工作空间区域，决定右栏哪些 tab 需要增量刷新。
+  ///
+  /// 只读/会话管理/子代理分发等不变更文件与规范状态的工具返回空集，
+  /// 避免每次工具结束右栏都会闪一下；其余未知工具保守归为文件区。
+  Set<WorkspaceArea> _areasForToolName(String name) {
+    switch (name) {
+      case 'write':
+      case 'edit':
+        return {WorkspaceArea.files};
+      case 'set_todo_list':
+        return {WorkspaceArea.todo};
+      case 'terminal':
+        // 终端可能写文件，也可能执行 git 命令
+        return {WorkspaceArea.files, WorkspaceArea.git};
+      case 'read':
+      case 'view':
+      case 'cat':
+      case 'show':
+      case 'list':
+      case 'search':
+      case 'grep':
+      case 'ask_user_question':
+      case 'team':
+        return {};
+      default:
+        if (name.startsWith('session_') ||
+            name.startsWith('tool_') ||
+            name.startsWith('member_') ||
+            name.startsWith('help_') ||
+            name.startsWith('web_') ||
+            name.startsWith('mcp_')) {
+          return {};
+        }
+        // 未知工具保守视为可能改文件
+        return {WorkspaceArea.files};
     }
   }
 
@@ -381,8 +425,13 @@ class _MessagePanelState extends State<MessagePanel> {
           _messages[idx].toolResult = (data['result'] as String?) ?? '';
         });
       }
-      // 工具执行结束：工作空间（文件/Git/Todo）可能已变更，通知右栏即时刷新。
-      WorkspaceRefreshService.instance.notifyWorkspaceChanged();
+      // 工具执行结束：按工具类型增量通知右栏刷新对应区域（文件/Git/Todo）。
+      // 只读类工具不触发，避免每次工具结束右栏都闪一下。
+      final Set<WorkspaceArea> areas =
+          _areasForToolName((data['name'] as String?) ?? '');
+      if (areas.isNotEmpty) {
+        WorkspaceRefreshService.instance.notifyWorkspaceChanged(areas);
+      }
     } else if (type == 'agent_status') {
       final Map<String, dynamic> d =
           (data['data'] as Map<String, dynamic>?)?.cast<String, dynamic>() ??
@@ -1088,6 +1137,9 @@ class _MessagePanelState extends State<MessagePanel> {
           _currentSession = _sessions.isNotEmpty ? _sessions.first : null;
           _messages.clear();
           _scrollRevision++;
+          if (mounted) {
+            widget.onSessionChanged?.call(_currentSessionId);
+          }
         }
       });
       _loadHistory();
