@@ -79,21 +79,28 @@ def parse_todos(content: str) -> List[Dict[str, Any]]:
 
 
 def format_current_todo_status(todos: List[Dict[str, Any]]) -> str:
-    """按会话当前 todos 生成 ``current_todo_id`` 字段文案。
+    """按会话当前 todos 生成 ``current_todo_id`` 字段文案（含 [Warning]/[Info] 标注）。
 
-    - 无任何 todo：``目前尚未设置 todo list``
+    与 selected spec 字段同构，让模型一眼区分"必须行动"（[Warning]）与
+    "正常督促"（[Info]）：
+    - 无任何 todo：``- "[Warning]todo 未设置"``
     - 有 todo 但无 in_progress（全部 pending/completed/blocked）：
-      ``目前无 in_progress 的 todo，请根据目前进度更新 todo list``
-    - 有 in_progress：逐行列出 ``<todo id> <progress>%``
+      ``- "[Info]todo 已设置：[N 项，][Warning]无 in_progress 项，请更新进度或开始 pending 项"``
+    - 有 in_progress：``- "[Info]当前 in_progress：<todo id> <progress>%"``
+      （多个 in_progress 以逗号分隔）
     """
     if not todos:
-        return "目前尚未设置 todo list"
+        return '- "[Warning]todo 未设置"'
     in_progress = [t for t in todos if t.get("status") == "in_progress"]
     if not in_progress:
-        return "目前无 in_progress 的 todo，请根据目前进度更新 todo list"
-    return "\n".join(
+        return (
+            f'- "[Info]todo 已设置：[{len(todos)} 项，]'
+            '[Warning]无 in_progress 项，请更新进度或开始 pending 项"'
+        )
+    items = ", ".join(
         f"{t.get('id', '')} {t.get('progress', 0)}%" for t in in_progress
     )
+    return f'- "[Info]当前 in_progress：{items}'
 
 
 class SetTodoListTool:

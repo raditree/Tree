@@ -196,5 +196,36 @@ class TestActionUpdateClearGet(unittest.TestCase):
         self.assertIn("error", r)
 
 
+class TestFormatCurrentTodoStatus(unittest.TestCase):
+    """format_current_todo_status 三态文案必须带 [Warning]/[Info] 标注。"""
+
+    def test_no_todos_warning(self):
+        out = todo_tool.format_current_todo_status([])
+        self.assertIn('[Warning]todo 未设置', out)
+        self.assertNotIn("[Info]", out)
+
+    def test_no_in_progress_warning(self):
+        out = todo_tool.format_current_todo_status([
+            {"id": "t1", "status": "pending", "progress": 0},
+            {"id": "t2", "status": "completed", "progress": 100},
+        ])
+        self.assertIn("[Info]todo 已设置：[2 项，]", out)
+        self.assertIn("[Warning]无 in_progress 项", out)
+
+    def test_in_progress_info(self):
+        out = todo_tool.format_current_todo_status([
+            {"id": "t1", "status": "in_progress", "progress": 30},
+        ])
+        self.assertIn("[Info]当前 in_progress：t1 30%", out)
+        self.assertNotIn("[Warning]", out)
+
+    def test_multiple_in_progress_joined(self):
+        out = todo_tool.format_current_todo_status([
+            {"id": "t1", "status": "in_progress", "progress": 0},
+            {"id": "t2", "status": "in_progress", "progress": 50},
+        ])
+        self.assertIn("[Info]当前 in_progress：t1 0%, t2 50%", out)
+
+
 if __name__ == "__main__":
     unittest.main()

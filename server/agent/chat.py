@@ -288,7 +288,7 @@ def _build_agent_system_prompt(
     session_id: str = "",
     extra_info: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """构建 agent 系统提示词：9 章节全量注入（spec「system prompt 内容」）。
+    """构建 agent 系统提示词：11 章节全量注入（spec「system prompt 内容」）。
 
     ① 身份与角色（.self/identity.md，默认顶层 Agent 说明）
     ② 任务执行范式（任务分型路由：判型 easy/complex/hard → 选对应内置 Spec →
@@ -301,6 +301,8 @@ def _build_agent_system_prompt(
     ⑧ 成员拓扑与寻址规则（TOP + 全体成员；top 内按 name 寻址、跨 Top 顶层寻址、
        回复路径）
     ⑨ Spec 维护指引（何时应 search/select/create spec）
+    ⑩ 任务进度管理纪律（todo 须增量更新）
+    ⑪ 工具反馈 [Warning] 负责规则（[Warning] 必须严格关注并回应）
 
     :param workspace_id: 工作空间标识
     :param member_system_prompt: 成员专属系统提示词（leader 通过 update_member 设置）
@@ -372,6 +374,9 @@ def _build_agent_system_prompt(
 
     # ⑩ 任务进度管理纪律（todo 及时更新）
     chapters.append(_build_todo_discipline_text())
+
+    # ⑪ 工具反馈 [Warning] 负责规则
+    chapters.append(_build_warning_accountability_text())
 
     return "\n\n".join(chapters)
 
@@ -591,6 +596,30 @@ def _build_todo_discipline_text() -> str:
         "整体替换清单并如实标注（含新增/删除/合并），不要保留已过时的 todo。\n"
         "- **长任务/团队任务必用**：hard / 多人协作务必全程维护 todos，作为进度契约"
         "与回滚依据；easy 小任务可不建。"
+    )
+
+
+def _build_warning_accountability_text() -> str:
+    """⑪ 工具反馈 [Warning] 负责规则：所有 [Warning] 必须严格关注并回应。
+
+    提示词工程师要点：
+    - 反模式：把重复出现的 [Warning]（如 todo 未设置、spec 未选择）当作"背景噪音"
+      忽略，导致 todo/spec 机制空转、任务管理失真。
+    - 正模式：[Warning] 是服务端主动注入的"必须行动"信号，即使重复出现也要逐条
+      回应；确需忽略时必须 ask_user_question 向用户申请，申请须准确具体。
+    """
+    return (
+        "## ⑪ 工具反馈 [Warning] 负责规则\n"
+        "工具返回（含注入到工具结果中的状态字段）里所有带 `[Warning]` 标记的内容"
+        "（如 todo 未设置/无 in_progress、spec 未选择等）都是你必须负责的信号：\n"
+        "- **严格关注**：逐条阅读并回应，即使重复出现、即使看似背景噪音，也不得"
+        "跳过或无视。\n"
+        "- **立即行动**：针对 Warning 内容采取对应动作（建/更新 todo、select 内置 "
+        "spec、修正参数、补充缺失信息等），不拖延、不搁置。\n"
+        "- **申请忽略**：若确实无法/无需处理某个 Warning（如与当前任务无关、忽略不"
+        "影响质量），必须用 ask_user_question 向用户申请忽略；申请必须**准确、具体**"
+        "（指明是哪个 Warning、为什么忽略、对任务的影响），不得泛化（如\"忽略所有"
+        "警告\"）。"
     )
 
 

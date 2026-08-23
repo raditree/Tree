@@ -328,6 +328,27 @@ class TestMemberReplyFallbackPushback(unittest.TestCase):
         self.assertIn("提交成功: abc123", content)
 
 
+class TestWarningAccountabilityPrompt(unittest.TestCase):
+    """system prompt 必须包含 ⑪ 工具反馈 [Warning] 负责规则。"""
+
+    def test_warning_accountability_text_has_rules(self):
+        from agent.chat import _build_warning_accountability_text
+        text = _build_warning_accountability_text()
+        self.assertIn("⑪ 工具反馈 [Warning] 负责规则", text)
+        self.assertIn("严格关注", text)
+        self.assertIn("背景噪音", text)
+        self.assertIn("ask_user_question", text)
+        self.assertIn("准确、具体", text)
+        # 反模式必须被禁止：不得泛化忽略
+        self.assertIn("忽略所有", text)
+
+    def test_agent_system_prompt_includes_warning_chapter(self):
+        from agent.chat import _build_agent_system_prompt
+        prompt = _build_agent_system_prompt(workspace_id="w1")
+        self.assertIn("⑪ 工具反馈 [Warning] 负责规则", prompt)
+        self.assertIn("⑩ 任务进度管理纪律", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()
 
