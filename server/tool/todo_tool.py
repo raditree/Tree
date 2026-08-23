@@ -1,7 +1,7 @@
 """内置工具 SetTodoList - 任务分解与进度跟踪。
 
-将任务列表写入 agent 工作空间 ``.self/todos.md``（持久化），并通过 WebSocket
-推送 ``todo_update`` 事件，供前端 Todo 面板实时展示。
+将任务列表按会话写入 agent 工作空间 ``.self/todos.md``（持久化），并通过
+WebSocket 推送 ``todo_update`` 事件，供前端 Todo 面板实时展示。
 
 动作：
 - ``set``：整体替换 todos（提供完整的 todos 列表）
@@ -12,6 +12,9 @@
 todos 每项结构：``{id, content, status, progress}``
 - status ∈ pending / in_progress / completed / blocked
 - progress：0-100 整数（可选，默认按 status 推断）
+
+多会话隔离：todos 存储路径按会话区分。默认会话沿用 ``.self/todos.md``
+（兼容旧数据），其余会话写入 ``.self/todos/todos_{session_id}.md``。
 """
 import json
 import logging
@@ -24,7 +27,7 @@ from io_.workspace_io import WorkspaceIO, run_io
 
 logger = logging.getLogger(__name__)
 
-# todos 持久化路径（agent 私人空间）
+# todos 持久化路径（agent 私人空间，默认会话 / 兼容旧数据）
 TODOS_PATH = ".self/todos.md"
 
 # todo 状态全集
@@ -32,6 +35,65 @@ STATUS_VALUES = {"pending", "in_progress", "completed", "blocked"}
 
 # 单次最大 todo 项数（防止模型一次性塞入超大列表）
 MAX_TODOS = 200
+
+
+def _todos_path(session_id: str) -> str:
+    """按会话返回 todos 持久化路径。
+
+    默认会话沿用旧路径 ``.self/todos.md``（兼容既有数据），其余会话写入
+    会话独立文件 ``.self/todos/todos_{session_id}.md``，实现按用户 + agent +
+    会话的隔离。
+    """
+    if session_id in ("", "session_default"):
+        return TODOS_PATH
+    return f".self/todos/todos_{session_id}.md"
+
+
+def read_todos_file(io: Any, workspace_id: str, session_id: str) -> str:
+    """按用户/agent/会话读取 todos 文件内容（供 REST API 与 LLM 注入用）。"""
+    if not io:
+        return ""
+    try:
+        r = run_io(io.read_file(workspace_id, _todos_path(session_id)))
+        if r.get("error"):
+            return ""
+        return str(r.get("content") or "")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("读取 todos(%s) 失败: %s", session_id, exc)
+        return ""
+
+
+def parse_todos(content: str) -> List[Dict[str, Any]]:
+    """从 todos.md 文件中解析 todos 列表（markdown 包裹的 JSON 块）。"""
+    if not content:
+        return []
+    match = re.search(r"```json\s*(.*?)\s*```", content, re.DOTALL)
+    if not match:
+        return []
+    try:
+        data = json.loads(match.group(1))
+        return data if isinstance(data, list) else []
+    except Exception:  # noqa: BLE001
+        logger.warning("解析 todos JSON 失败，返回空列表")
+        return []
+
+
+def format_current_todo_status(todos: List[Dict[str, Any]]) -> str:
+    """按会话当前 todos 生成 ``current_todo_id`` 字段文案。
+
+    - 无任何 todo：``目前尚未设置 todo list``
+    - 有 todo 但无 in_progress（全部 pending/completed/blocked）：
+      ``目前无 in_progress 的 todo，请根据目前进度更新 todo list``
+    - 有 in_progress：逐行列出 ``<todo id> <progress>%``
+    """
+    if not todos:
+        return "目前尚未设置 todo list"
+    in_progress = [t for t in todos if t.get("status") == "in_progress"]
+    if not in_progress:
+        return "目前无 in_progress 的 todo，请根据目前进度更新 todo list"
+    return "\n".join(
+        f"{t.get('id', '')} {t.get('progress', 0)}%" for t in in_progress
+    )
 
 
 class SetTodoListTool:
@@ -43,12 +105,16 @@ class SetTodoListTool:
         workspace_id: str,
         user_id: str = "",
         ws_manager: Any = None,
+        session_id: str = "",
     ) -> None:
         self.io = io
         self.workspace_id = workspace_id
         self.user_id = user_id
         self.ws_manager = ws_manager
+        self.session_id = session_id
         self._loop: Optional[Any] = None
+        # 会话内 todos 缓存（None 表示尚未加载，首次访问时从文件读取）
+        self._todos_cache: Optional[List[Dict[str, Any]]] = None
 
     def bind_loop(self, loop: Any) -> None:
         """绑定主事件循环，供消费线程内安全地 run_coroutine_threadsafe 推送。"""
@@ -197,6 +263,7 @@ class SetTodoListTool:
         ok = self._save_todos(todos)
         if not ok:
             return {"error": "todos 写入失败（工作空间不可写）"}
+        self._todos_cache = todos
         self._notify(todos)
         return {
             "action": "set",
@@ -227,6 +294,7 @@ class SetTodoListTool:
         ok = self._save_todos(todos)
         if not ok:
             return {"error": "todos 写入失败（工作空间不可写）"}
+        self._todos_cache = todos
         self._notify(todos)
         return {"action": "update", "todo": target, "todos": todos}
 
@@ -234,19 +302,31 @@ class SetTodoListTool:
         ok = self._save_todos([])
         if not ok:
             return {"error": "todos 写入失败（工作空间不可写）"}
+        self._todos_cache = []
         self._notify([])
         return {"action": "clear", "note": "todos 已清空。"}
 
     def _action_get(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         todos = self._load_todos()
+        self._todos_cache = todos
         return {"action": "get", "count": len(todos), "todos": todos}
+
+    def todos(self) -> List[Dict[str, Any]]:
+        """返回本会话当前 todos（优先缓存，未加载时从文件读取）。"""
+        if self._todos_cache is None:
+            self._todos_cache = self._load_todos()
+        return self._todos_cache
+
+    def current_status_text(self) -> str:
+        """生成本会话的 ``current_todo_id`` 状态文案（供工具返回注入约束模型）。"""
+        return format_current_todo_status(self.todos())
 
     # ------------------------------------------------------------------
     # 持久化与推送
     # ------------------------------------------------------------------
     def _load_todos(self) -> List[Dict[str, Any]]:
-        """从 .self/todos.md 读取 todos（解析 JSON 数据块）。"""
-        content = self._read_file(TODOS_PATH)
+        """从本会话 todos 文件读取 todos（解析 JSON 数据块）。"""
+        content = self._read_file(_todos_path(self.session_id))
         if not content:
             return []
         match = re.search(r"```json\s*(.*?)\s*```", content, re.DOTALL)
@@ -260,15 +340,22 @@ class SetTodoListTool:
             return []
 
     def _save_todos(self, todos: List[Dict[str, Any]]) -> bool:
-        """把 todos 序列化写入 .self/todos.md。"""
+        """把 todos 序列化写入本会话的 todos 文件。"""
         header = "# 任务清单（Todo List）\n\n"
         note = "> 由 SetTodoList 工具维护，前端 Todo 面板同步展示。\n\n"
         body = "```json\n" + json.dumps(todos, ensure_ascii=False, indent=2) + "\n```\n"
         content = header + note + body
         if not self.io:
             return False
+        path = _todos_path(self.session_id)
         try:
-            r = run_io(self.io.write_file(self.workspace_id, TODOS_PATH, content))
+            # 子目录路径（非默认会话）先确保目录存在，再写文件
+            if "/" in path and not path.endswith(TODOS_PATH):
+                dir_part = path.rsplit("/", 1)[0]
+                exec_shell = getattr(self.io, "exec_shell", None)
+                if exec_shell is not None:
+                    run_io(exec_shell(self.workspace_id, f"mkdir -p {dir_part}"))
+            r = run_io(self.io.write_file(self.workspace_id, path, content))
             return not r.get("error")
         except Exception as exc:  # noqa: BLE001
             logger.warning("todos 写入失败: %s", exc)
@@ -294,7 +381,12 @@ class SetTodoListTool:
 
         payload = {
             "type": "todo_update",
-            "data": {"todos": todos, "updated_at": int(time.time() * 1000)},
+            "data": {
+                "todos": todos,
+                "updated_at": int(time.time() * 1000),
+                # 让前端可按会话过滤 todo_update，避免跨会话刷新串扰
+                "session_id": self.session_id,
+            },
         }
         try:
             if self._loop is not None and self._loop.is_running():

@@ -1,5 +1,3 @@
-import 'dart:convert';
-
 import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
@@ -33,14 +31,18 @@ class TodoItem {
 
 /// Todo 面板（右栏导航页）
 ///
-/// 通过读取 agent 工作空间 `.self/todos.md`（由 SetTodoList 工具维护）拉取
-/// 任务清单，并渲染成 id + 内容 + 状态/进度的列表。进入面板时拉取一次。
+/// 通过后端 API 按 user_id + agent_id + session_id 拉取该 agent 当前会话的
+/// 任务清单（会话隔离，由 SetTodoList 工具维护），渲染成 id + 内容 + 状态/
+/// 进度的列表。进入面板时拉取一次，会话变化时自动重新拉取。
 class TodoPanel extends StatefulWidget {
   /// 工作空间 ID
   final String workspaceId;
 
-  /// 所属顶层 agent ID（本地模式下读取本机文件需要）
+  /// 所属顶层 agent ID（查询 todos 用）
   final String? topAgentId;
+
+  /// 当前会话 ID（todos 按会话隔离）
+  final String sessionId;
 
   /// 刷新触发器（外部可递增触发重新拉取）
   final int refreshTrigger;
@@ -49,6 +51,7 @@ class TodoPanel extends StatefulWidget {
     super.key,
     required this.workspaceId,
     this.topAgentId,
+    this.sessionId = 'session_default',
     this.refreshTrigger = 0,
   });
 
@@ -71,24 +74,24 @@ class _TodoPanelState extends State<TodoPanel> {
   void didUpdateWidget(covariant TodoPanel oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.workspaceId != widget.workspaceId ||
+        oldWidget.sessionId != widget.sessionId ||
         oldWidget.refreshTrigger != widget.refreshTrigger) {
       _load();
     }
   }
 
-  /// 拉取并解析 .self/todos.md
+  /// 拉取并解析当前会话 todos
   Future<void> _load() async {
     setState(() {
       _loading = true;
       _error = null;
     });
     try {
-      final String content = await ApiService.getFileContent(
-        widget.workspaceId,
-        '.self/todos.md',
-        topAgentId: widget.topAgentId ?? '',
-      );
-      final List<TodoItem> items = _parseTodosContent(content);
+      final agentId = widget.topAgentId ?? '';
+      final List<Map<String, dynamic>> todoMaps =
+          await ApiService.getAgentTodos(agentId, sessionId: widget.sessionId);
+      final List<TodoItem> items =
+          todoMaps.map(TodoItem.fromJson).toList(growable: false);
       if (!mounted) return;
       setState(() {
         _todos = items;
@@ -100,27 +103,6 @@ class _TodoPanelState extends State<TodoPanel> {
         _loading = false;
         _error = '读取任务清单失败';
       });
-    }
-  }
-
-  /// 从 .self/todos.md 内容中解析 todos 数组。
-  ///
-  /// 后端写入格式为 markdown 包裹的 ```json {...}``` 代码块。
-  List<TodoItem> _parseTodosContent(String content) {
-    if (content.isEmpty) return <TodoItem>[];
-    final RegExp jsonBlock =
-        RegExp(r'```json\s*(.*?)\s*```', dotAll: true);
-    final Match? match = jsonBlock.firstMatch(content);
-    if (match == null) return <TodoItem>[];
-    try {
-      final dynamic data = jsonDecode(match.group(1)!);
-      if (data is! List) return <TodoItem>[];
-      return data
-          .whereType<Map<String, dynamic>>()
-          .map(TodoItem.fromJson)
-          .toList();
-    } catch (_) {
-      return <TodoItem>[];
     }
   }
 

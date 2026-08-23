@@ -34,10 +34,14 @@ class MessagePanel extends StatefulWidget {
   /// 外部触发刷新（如清空对话后递增），值变化时重新拉取历史
   final int refreshTrigger;
 
+  /// 会话切换回调（选中/新建会话时触发，携带新的 session_id）
+  final ValueChanged<String>? onSessionChanged;
+
   const MessagePanel({
     super.key,
     this.selectedAgent,
     this.refreshTrigger = 0,
+    this.onSessionChanged,
   });
 
   @override
@@ -1010,6 +1014,7 @@ class _MessagePanelState extends State<MessagePanel> {
       _messages.clear();
       _scrollRevision++;
     });
+    widget.onSessionChanged?.call(_currentSessionId);
     _loadHistory();
   }
 
@@ -1026,6 +1031,7 @@ class _MessagePanelState extends State<MessagePanel> {
         _messages.clear();
         _scrollRevision++;
       });
+      widget.onSessionChanged?.call(_currentSessionId);
       _loadHistory();
     } catch (e) {
       if (!mounted) return;

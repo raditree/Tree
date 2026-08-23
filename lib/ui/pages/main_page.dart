@@ -50,6 +50,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   // 当前选中的 Agent（未选择时为 null）
   Agent? _selectedAgent;
 
+  // 当前会话 ID（中栏切换会话时更新；Todo 面板按会话隔离查询 todos）
+  String _currentSessionId = 'session_default';
+
   // 消息面板刷新触发器（递增触发 MessagePanel 重新加载历史）
   int _refreshTrigger = 0;
 
@@ -109,6 +112,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       setState(() {
         _agents.add(agent);
         _selectedAgent = agent;
+        _currentSessionId = 'session_default';
       });
     } catch (e) {
       if (mounted) {
@@ -280,6 +284,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             onAgentSelected: (Agent agent) {
               setState(() {
                 _selectedAgent = agent;
+                _currentSessionId = 'session_default';
                 _mobileTab = 1;
               });
             },
@@ -289,6 +294,11 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
           MessagePanel(
             selectedAgent: _selectedAgent,
             refreshTrigger: _refreshTrigger,
+            onSessionChanged: (String id) {
+              setState(() {
+                _currentSessionId = id;
+              });
+            },
           ),
           workspaceId.isEmpty
               ? _buildMobileFilePlaceholder()
@@ -296,6 +306,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                   key: ValueKey(workspaceId),
                   workspaceId: workspaceId,
                   topAgentId: _selectedAgent?.id,
+                  sessionId: _currentSessionId,
                 ),
         ],
       ),
@@ -408,6 +419,11 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
           child: MessagePanel(
             selectedAgent: _selectedAgent,
             refreshTrigger: _refreshTrigger,
+            onSessionChanged: (String id) {
+              setState(() {
+                _currentSessionId = id;
+              });
+            },
           ),
         ),
         // 右栏：文件管理（折叠或展开）
@@ -464,6 +480,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       key: ValueKey(workspaceId),
       workspaceId: workspaceId,
       topAgentId: _selectedAgent?.id,
+      sessionId: _currentSessionId,
       onCollapse: () {
         setState(() {
           _rightCollapsed = true;
@@ -489,6 +506,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
               onAgentSelected: (Agent agent) {
                 setState(() {
                   _selectedAgent = agent;
+                  _currentSessionId = 'session_default';
                 });
               },
               onClearHistory: _handleClearHistory,

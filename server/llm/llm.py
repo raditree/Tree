@@ -707,10 +707,26 @@ class AgentLLMSession:
                     }
 
                     # 将工具结果添加到上下文（含图像时按模型视觉能力构造 content）
+                    # 注入会话级 current_todo_id：让每次工具返回都带给模型当前
+                    # in_progress 的 todo，约束其及时增量更新 todo 进度。
+                    base_content = self._tool_context_content(result, result_str)
+                    status_provider = getattr(self, "current_todo_status", None)
+                    current_todo_text = ""
+                    if status_provider is not None:
+                        try:
+                            current_todo_text = str(status_provider() or "")
+                        except Exception:  # noqa: BLE001
+                            current_todo_text = ""
+                    if current_todo_text:
+                        base_content = (
+                            f"当前 in_progress todo（current_todo_id）：\n"
+                            f"{current_todo_text}\n\n"
+                            f"{base_content}"
+                        )
                     self.context.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
-                        "content": self._tool_context_content(result, result_str),
+                        "content": base_content,
                     })
                     # 视觉模型：图像本体追加为独立 user 消息（网关兼容）
                     self._append_image_user_msg(result)

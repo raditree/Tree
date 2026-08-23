@@ -352,6 +352,35 @@ async def get_agent_spec_detail(
     return {"meta": meta, "content": content}
 
 
+@router.get("/agents/{agent_id}/todos")
+async def get_agent_todos(
+    agent_id: str,
+    session_id: str = "",
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """按 user_id + agent_id + session_id 查询该 agent 当前会话的兜底 todos。
+
+    读取的路径与会话隔离存储一致（默认会话 .self/todos.md，其余会话
+    .self/todos/todos_{session_id}.md），返回解析后的 todos 列表。
+    """
+    from tool.todo_tool import parse_todos, read_todos_file
+
+    user_id = current_user.get("openid", "")
+    try:
+        io = _get_workspace_io(user_id, agent_id)
+        ws_id = (get_agent(user_id, agent_id) or {}).get("workspace_id", "") or agent_id
+        content = ""
+        if io is not None:
+            content = await asyncio.to_thread(
+                read_todos_file, io, ws_id, session_id,
+            )
+        todos = parse_todos(content)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("查询 todos 失败(%s/%s/%s): %s", user_id, agent_id, session_id, exc)
+        todos = []
+    return {"agent_id": agent_id, "session_id": session_id, "todos": todos}
+
+
 def _roster_from_db(db_members: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """将 team_members 表记录转换为前端 teammates 结构（与 roster 文件解析兼容）。
 

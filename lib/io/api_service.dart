@@ -793,6 +793,22 @@ class ApiService {
         <Map<String, dynamic>>[];
   }
 
+  /// 按 user_id + agent_id + session_id 查询该 agent 当前会话的追加 todos
+  static Future<List<Map<String, dynamic>>> getAgentTodos(
+    String agentId, {
+    String sessionId = 'session_default',
+  }) async {
+    final Map<String, dynamic> data = await _getJson(
+      '/api/agents/$agentId/todos',
+      query: {'session_id': sessionId},
+    );
+    final List<dynamic>? todos = data['todos'] as List<dynamic>?;
+    return todos
+            ?.map((dynamic e) => (e as Map<String, dynamic>).cast<String, dynamic>())
+            .toList() ??
+        <Map<String, dynamic>>[];
+  }
+
   /// 读取成员工作空间的活动日志
   static Future<String> getTeammateLog(String memberId, {int lines = 60}) async {
     final Map<String, dynamic> data = await _getJson(

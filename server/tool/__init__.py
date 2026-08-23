@@ -7,6 +7,8 @@ import os
 import sys
 from typing import Any, Callable, Dict, List, Optional
 
+import state
+
 from io_.docker_manager import DockerManager
 from data.conversation_store import archive_context
 from llm.llm import AgentLLMSession
@@ -229,9 +231,17 @@ def register_builtin_tools(
         io, workspace_id, user_id=user_id, agent_id=agent_id, session_id=session_id,
     )
     # SetTodoList 工具：任务分解与进度跟踪（.self/todos.md + todo_update WS 推送）
+    # 按会话隔离存储：默认会话用 .self/todos.md，其余会话用会话独立文件。
     todo_tool = SetTodoListTool(
         io, workspace_id, user_id=user_id, ws_manager=ws_manager,
+        session_id=session_id,
     )
+    # 挂载会话级 todos 状态提供者：每个工具调用返回时注入 "current_todo_id"
+    # 状态文案，供模型及时更新 todo（见 llm.py 工具结果装配）。
+    try:
+        session.current_todo_status = todo_tool.current_status_text
+    except Exception:  # noqa: BLE001
+        pass
     # 绑定主事件循环，供 SetTodoList 在消费线程内安全推送 todo_update WS
     try:
         todo_tool.bind_loop(asyncio.get_running_loop())

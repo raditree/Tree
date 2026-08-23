@@ -30,6 +30,9 @@ class FilePanel extends StatefulWidget {
   /// 所属顶层 agent ID（Todo 面板本地模式读取、模型信息页需要）
   final String? topAgentId;
 
+  /// 当前会话 ID（Todo 面板按会话隔离查询 todos）
+  final String sessionId;
+
   /// 折叠右侧栏的回调
   final VoidCallback? onCollapse;
 
@@ -37,6 +40,7 @@ class FilePanel extends StatefulWidget {
     super.key,
     required this.workspaceId,
     this.topAgentId,
+    this.sessionId = 'session_default',
     this.onCollapse,
   });
 
@@ -275,6 +279,7 @@ class _FilePanelState extends State<FilePanel>
                   TodoPanel(
                     workspaceId: widget.workspaceId,
                     topAgentId: widget.topAgentId,
+                    sessionId: widget.sessionId,
                     refreshTrigger: _fileRefreshTrigger,
                   ),
                 ],
