@@ -6,10 +6,13 @@
 import asyncio
 import base64
 import datetime
+import json
 import logging
 import os
+import sqlite3
 import tempfile
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -39,6 +42,99 @@ from ws.auth import get_current_user
 from io_ import mode_resolver
 
 router = APIRouter(prefix="/api")
+
+
+# ===== 工作空间归属校验 =====
+
+
+def _workspace_owners_path() -> Path:
+    """REST 创建的工作空间 owner 映射文件路径（server/data/workspace_owners.json）。
+
+    与 docker_manager 里 shared_workspaces.json 的读写方式保持一致。
+    """
+    return Path(__file__).resolve().parent.parent / "data" / "workspace_owners.json"
+
+
+def _load_workspace_owners() -> Dict[str, List[str]]:
+    """从磁盘加载 ``workspace_id -> 所有者 user_id 列表`` 映射。"""
+    try:
+        path = _workspace_owners_path()
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {
+                    str(k): [str(u) for u in v] for k, v in data.items() if k
+                }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("加载工作空间 owner 映射失败: %s", exc)
+    return {}
+
+
+def _save_workspace_owners(mapping: Dict[str, List[str]]) -> None:
+    """持久化 ``workspace_id -> 所有者 user_id 列表`` 映射。"""
+    try:
+        path = _workspace_owners_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(mapping, f, ensure_ascii=False, indent=2)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("保存工作空间 owner 映射失败: %s", exc)
+
+
+def register_workspace_owner(workspace_id: str, owner_user_id: str) -> None:
+    """记录 REST 创建工作空间的所属用户（持久化到磁盘 JSON）。"""
+    if not workspace_id or not owner_user_id:
+        return
+    mapping = _load_workspace_owners()
+    if owner_user_id not in mapping.setdefault(workspace_id, []):
+        mapping[workspace_id].append(owner_user_id)
+        _save_workspace_owners(mapping)
+
+
+def _agents_db_path() -> Path:
+    """agents 表所在 sqlite 文件路径（server/data/conversations.db）。"""
+    return Path(__file__).resolve().parent.parent / "data" / "conversations.db"
+
+
+def _resolve_workspace_owners(workspace_id: str) -> set:
+    """解析工作空间的所有者 user_id 集合。
+
+    数据来自两处：
+    - REST 创建记录（workspace_owners.json）；
+    - agents 表：``SELECT DISTINCT user_id FROM agents
+      WHERE workspace_id = ? AND deleted_at IS NULL``。
+    """
+    owners = set()
+    owners.update(_load_workspace_owners().get(workspace_id, []))
+    try:
+        conn = sqlite3.connect(str(_agents_db_path()))
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT user_id FROM agents "
+                "WHERE workspace_id = ? AND deleted_at IS NULL",
+                (workspace_id,),
+            ).fetchall()
+            owners.update(row[0] for row in rows)
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("查询工作空间 owner 失败: %s", exc)
+    return owners
+
+
+def assert_workspace_owned(workspace_id: str, current_user: dict) -> None:
+    """校验当前用户是否为该 workspace 的所有者（否则抛 403、不执行后续操作）。
+
+    特殊共享演示工作空间 ``"top"`` 视为任何已登录用户可访问。
+    """
+    if not workspace_id or workspace_id == "top":
+        return
+    openid = (current_user or {}).get("openid", "")
+    if openid in _resolve_workspace_owners(workspace_id):
+        return
+    raise HTTPException(status_code=403, detail="无权访问该工作空间")
 
 
 # ===== 工作空间文件管理 =====
@@ -126,6 +222,7 @@ async def list_files(
     本地模式下通过反向 WS 转发给前端本地执行器，列出用户本机工作目录；
     云端模式通过 docker_manager.exec_in_workspace 执行 ``ls -la`` 获取文件列表。
     """
+    assert_workspace_owned(workspace_id, current_user)
     # 本地模式：转发给前端本地执行器，列出本机工作空间目录
     user_id = current_user.get("openid", "")
     local_key = top_agent_id or workspace_id
@@ -189,6 +286,7 @@ async def get_file_content(
     if not path:
         raise HTTPException(status_code=400, detail="path 参数不能为空")
 
+    assert_workspace_owned(workspace_id, current_user)
     # 本地模式：转发给前端本地执行器，读取本机工作空间文件
     user_id = current_user.get("openid", "")
     local_key = top_agent_id or workspace_id
@@ -324,7 +422,7 @@ async def upload_file(
     request: Request,
     files: List[UploadFile] = File(...),
     rel_paths: List[str] = Form(default=[]),
-    _: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ):
     """上传多个文件到工作空间 ``.input/yyyymmdd/`` 目录。
 
@@ -346,6 +444,8 @@ async def upload_file(
     )
 
     date_dir = datetime.datetime.now().strftime("%Y%m%d")
+
+    assert_workspace_owned(workspace_id, current_user)
 
     # 读取全部文件并统一校验
     payloads: List[tuple] = []  # (相对路径, 字节内容)
@@ -417,6 +517,7 @@ async def download_file(
     使用 base64 方案读取二进制内容（避免 cat 经 stdout 的 UTF-8 解码损坏二进制）。
     本地模式下读取用户本机文件。
     """
+    assert_workspace_owned(workspace_id, current_user)
     content = await _read_file_bytes(
         workspace_id, req.path, current_user, top_agent_id
     )
@@ -441,6 +542,7 @@ async def download_folder(
     current_user: dict = Depends(get_current_user),
 ):
     """从工作空间下载文件夹，打包为 tar.gz 返回。"""
+    assert_workspace_owned(workspace_id, current_user)
     # 本地模式暂不支持文件夹打包下载（tar 命令与路径跨平台差异较大）
     user_id = current_user.get("openid", "")
     local_key = top_agent_id or workspace_id
@@ -564,6 +666,7 @@ async def get_pdf_info(
     if not path:
         raise HTTPException(status_code=400, detail="path 参数不能为空")
 
+    assert_workspace_owned(workspace_id, current_user)
     pdf_bytes = await _read_file_bytes(
         workspace_id, path, current_user, top_agent_id
     )
@@ -606,6 +709,7 @@ async def get_pdf_preview(
     if not path:
         raise HTTPException(status_code=400, detail="path 参数不能为空")
 
+    assert_workspace_owned(workspace_id, current_user)
     pdf_bytes = await _read_file_bytes(
         workspace_id, path, current_user, top_agent_id
     )
@@ -652,13 +756,14 @@ async def sync_files(
     workspace_id: str,
     req: FileSyncRequest,
     request: Request,
-    _: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ):
     """文件双向同步（本地 <-> 云端工作目录）。
 
     请求体 ``{"direction": "local_to_cloud"/"cloud_to_local", "path": "..."}``，
     暂未实现，返回 501（需要前端配合实现）。
     """
+    assert_workspace_owned(workspace_id, current_user)
     raise HTTPException(
         status_code=501,
         detail="文件同步功能暂未实现，需要前端配合实现",
@@ -676,7 +781,7 @@ async def sync_to_local(
     workspace_id: str,
     req: SyncToLocalRequest,
     request: Request,
-    _: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ):
     """将工作空间内所有文件同步到本地目录。
 
@@ -693,6 +798,7 @@ async def sync_to_local(
     if not local_path:
         raise HTTPException(status_code=400, detail="local_path 不能为空")
 
+    assert_workspace_owned(workspace_id, current_user)
     docker_manager = _get_docker_manager()
 
     # 容器内 tar 打包后 base64 编码，避免 exec stdout 二进制被 UTF-8 解码损坏
@@ -756,7 +862,7 @@ class ExecCommandRequest(BaseModel):
 async def create_workspace(
     req: CreateWorkspaceRequest,
     request: Request,
-    _: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ):
     """创建工作空间。
 
@@ -771,6 +877,8 @@ async def create_workspace(
     )
     if "error" in result:
         raise HTTPException(status_code=500, detail=result)
+    # 记录该 REST 创建工作空间的属主（持久化，供后续归属校验）
+    register_workspace_owner(workspace_id, current_user.get("openid", ""))
     return result
 
 
@@ -778,9 +886,10 @@ async def create_workspace(
 async def get_workspace(
     workspace_id: str,
     request: Request,
-    _: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ):
     """查询工作空间状态。"""
+    assert_workspace_owned(workspace_id, current_user)
     docker_manager = _get_docker_manager()
     result = docker_manager.get_workspace_status(workspace_id)
     if "error" in result:
@@ -792,9 +901,10 @@ async def get_workspace(
 async def delete_workspace(
     workspace_id: str,
     request: Request,
-    _: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ):
     """删除工作空间（停止并删除容器，保留卷）。"""
+    assert_workspace_owned(workspace_id, current_user)
     docker_manager = _get_docker_manager()
     result = docker_manager.remove_workspace(workspace_id)
     if "error" in result:
@@ -807,12 +917,13 @@ async def exec_in_workspace(
     workspace_id: str,
     req: ExecCommandRequest,
     request: Request,
-    _: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ):
     """在工作空间内执行命令。
 
     请求体：``{"command": ["git", "status"]}``
     """
+    assert_workspace_owned(workspace_id, current_user)
     docker_manager = _get_docker_manager()
     result = docker_manager.exec_in_workspace(workspace_id, req.command)
     # 容器不存在等场景返回 error 字段且无 exit_code
@@ -849,6 +960,7 @@ async def git_log(
     查询参数 ``limit``（默认 50），返回 ``{"commits": [...]}``。
     本地模式下通过反向 WS 让前端本地执行器在本机工作空间执行 ``git log``。
     """
+    assert_workspace_owned(workspace_id, current_user)
     # 本地模式：转发给前端本地执行器，在本机工作空间执行 git log
     user_id = current_user.get("openid", "")
     local_key = top_agent_id or workspace_id
@@ -894,6 +1006,7 @@ async def git_branches(
     current_user: dict = Depends(get_current_user),
 ):
     """查看分支列表，返回 ``{"branches": [...], "current": "..."}``。"""
+    assert_workspace_owned(workspace_id, current_user)
     # 本地模式：转发给前端本地执行器，在本机工作空间执行 git branch
     user_id = current_user.get("openid", "")
     local_key = top_agent_id or workspace_id
@@ -941,12 +1054,13 @@ async def git_diff(
     workspace_id: str,
     request: Request,
     branch: str,
-    _: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ):
     """查看分支差异。
 
     查询参数 ``branch`` 指定要对比的分支名，返回 ``{"diff": "..."}``。
     """
+    assert_workspace_owned(workspace_id, current_user)
     docker_manager = _get_docker_manager()
     result = docker_manager.git_diff(workspace_id, branch=branch)
     if "error" in result:
@@ -959,12 +1073,13 @@ async def git_merge(
     workspace_id: str,
     req: GitMergeRequest,
     request: Request,
-    _: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ):
     """合并分支。
 
     请求体 ``{"branch": "member_xxx"}``，返回 ``{"success": true/false, "message": "..."}``。
     """
+    assert_workspace_owned(workspace_id, current_user)
     docker_manager = _get_docker_manager()
     result = docker_manager.git_merge(workspace_id, branch=req.branch)
     if "error" in result:
@@ -980,12 +1095,13 @@ async def git_fetch(
     workspace_id: str,
     req: GitFetchRequest,
     request: Request,
-    _: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ):
     """fetch 远程。
 
     请求体 ``{"remote": "parent"}``（remote 可选，默认 parent），返回 fetch 结果。
     """
+    assert_workspace_owned(workspace_id, current_user)
     docker_manager = _get_docker_manager()
     result = docker_manager.git_fetch(workspace_id, remote=req.remote)
     if "error" in result:

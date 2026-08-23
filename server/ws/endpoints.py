@@ -196,6 +196,16 @@ def register_ws(app: FastAPI) -> None:
                             },
                         )
                         continue
+                    # 归属校验：仅提问所属用户可回答
+                    if pending.get("user_id") != user_id:
+                        await state.ws_manager.send_message(
+                            user_id,
+                            {
+                                "type": "error",
+                                "data": {"message": "无权操作该提问"},
+                            },
+                        )
+                        continue
                     mark_pending_answered(qid, str(answer or "") if answer is not None else "")
                     await state.ws_manager.send_message(
                         user_id,
@@ -227,6 +237,15 @@ def register_ws(app: FastAPI) -> None:
                             {
                                 "type": "error",
                                 "data": {"message": "没有等待回答的问题"},
+                            },
+                        )
+                    elif pending.get("user_id") != user_id:
+                        # 归属校验：仅提问所属用户可取消
+                        await state.ws_manager.send_message(
+                            user_id,
+                            {
+                                "type": "error",
+                                "data": {"message": "无权操作该提问"},
                             },
                         )
                     else:

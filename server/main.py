@@ -167,10 +167,21 @@ app = FastAPI(
 )
 
 # CORS 中间件配置
+# 允许源与是否允许凭据由配置（configs/app.yaml 的 cors 段）提供。
+# 安全约束：永不出现「allow_origins 含 "*" 且 allow_credentials=True」的任意源带凭据组合。
+cors_cfg = get_config().get("cors", {})
+cors_origins = cors_cfg.get("allow_origins", []) or []
+cors_credentials = bool(cors_cfg.get("allow_credentials", False))
+if "*" in cors_origins:
+    # "*" 与 credentials 不能共存（浏览器规范 + 安全要求），取更严格的：非 "*" 才允许凭据
+    if cors_credentials:
+        cors_origins = [origin for origin in cors_origins if origin != "*"]
+    else:
+        cors_origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=cors_origins if cors_origins else [],
+    allow_credentials=cors_credentials and "*" not in cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )

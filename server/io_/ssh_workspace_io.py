@@ -63,6 +63,36 @@ class SSHWorkspaceIO(WorkspaceIO):
             root = f"{base}/workspaces/{workspace_id}"
         return posixpath.join(root, rel) if rel else root
 
+    def _sanitize_remote_path(self, workspace_id: str, path: str) -> Optional[str]:
+        """将工作空间内相对路径映射为远端绝对路径，并做路径穿越防护。
+
+        拒绝绝对路径（以 ``/`` 或 ``\\`` 开头）与含 ``..`` 段的输入；
+        对 ``posixpath.join(remote_base_dir, path)`` 归一化后，校验展开的
+        绝对路径仍位于远端 base（或其子路径）之下，越界返回 ``None``
+        （调用方据此返回错误而不执行）。
+        """
+        if path.startswith("/") or path.startswith("\\"):
+            return None
+        if ".." in path.replace("\\", "/").split("/"):
+            return None
+        base = self._resolve_base()
+        rel = path.lstrip("/")
+        if workspace_id == self._top_agent_id:
+            root = base
+        else:
+            root = f"{base}/workspaces/{workspace_id}"
+        if not rel:
+            return root
+        norm = posixpath.normpath(posixpath.join(root, rel))
+        base_norm = posixpath.normpath(base)
+        if not base_norm or base_norm == "/":
+            # base 未配置或为根目录：保持原有行为，视为允许
+            return norm
+        prefix = base_norm.rstrip("/") + "/"
+        if norm == base_norm or norm.startswith(prefix):
+            return norm
+        return None
+
     # ------------------------------------------------------------------
     # 同步底层（阻塞，经 to_thread 调用）
     # ------------------------------------------------------------------
@@ -106,10 +136,12 @@ class SSHWorkspaceIO(WorkspaceIO):
         self, workspace_id: str, path: str, encoding: str = "utf-8"
     ) -> Dict[str, Any]:
         def _do() -> Dict[str, Any]:
+            remote = self._sanitize_remote_path(workspace_id, path)
+            if remote is None:
+                return {"error": "非法文件路径", "exit_code": 1}
             try:
                 sftp = self._client().open_sftp()
                 try:
-                    remote = self._remote_path(workspace_id, path)
                     with sftp.open(remote, "rb") as f:
                         data = f.read()
                 finally:
@@ -132,11 +164,13 @@ class SSHWorkspaceIO(WorkspaceIO):
         self, workspace_id: str, path: str, content: str
     ) -> Dict[str, Any]:
         def _do() -> Dict[str, Any]:
+            remote = self._sanitize_remote_path(workspace_id, path)
+            if remote is None:
+                return {"error": "非法文件路径", "file_path": path}
             try:
                 client = self._client()
                 sftp = client.open_sftp()
                 try:
-                    remote = self._remote_path(workspace_id, path)
                     self._sftp_mkdir_p(sftp, posixpath.dirname(remote))
                     with sftp.open(remote, "wb") as f:
                         f.write(content.encode("utf-8"))
@@ -227,7 +261,9 @@ class SSHWorkspaceIO(WorkspaceIO):
     async def list_files(
         self, workspace_id: str, path: str = ""
     ) -> Dict[str, Any]:
-        target = self._remote_path(workspace_id, path.strip("/"))
+        target = self._sanitize_remote_path(workspace_id, path)
+        if target is None:
+            return {"files": [], "error": "非法文件路径", "exit_code": 1}
         result = await asyncio.to_thread(
             self._exec, ["ls", "-la", target]
         )

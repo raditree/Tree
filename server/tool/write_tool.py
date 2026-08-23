@@ -27,13 +27,25 @@ class WriteTool:
 
     @staticmethod
     def _is_valid_path(path: str) -> bool:
-        """校验文件路径，仅允许字母数字、/_-.，防止命令注入。"""
+        """校验文件路径，仅允许字母数字、/_-.，防止命令注入。
+
+        在字符白名单基础上，额外拒绝绝对路径（以 ``/`` 或 ``\\`` 开头）
+        与含 ``..`` 段的相对路径（任一路径段为 ``..``），防止路径穿越。
+        """
         if not path or len(path) > 4096:
+            return False
+        # 拒绝绝对路径
+        if path.startswith("/") or path.startswith("\\"):
             return False
         allowed = set(
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/_.-"
         )
-        return all(ch in allowed for ch in path)
+        if not all(ch in allowed for ch in path):
+            return False
+        # 拒绝任一路径段为 ``..``
+        if ".." in path.replace("\\", "/").split("/"):
+            return False
+        return True
 
     def get_tool_definition(self) -> Dict[str, Any]:
         """返回 OpenAI function calling 格式的工具定义。"""

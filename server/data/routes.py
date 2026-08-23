@@ -4,6 +4,8 @@
 """
 import logging
 import secrets
+import threading
+import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
@@ -41,6 +43,29 @@ router = APIRouter(prefix="/api")
 
 # 微信登录 state 暂存：state -> {"status": "pending"|"success", "token": ..., "user": ...}
 _WECHAT_STATES: Dict[str, Dict[str, Any]] = {}
+
+# 登录/注册内存滑动窗口限流：Key = 客户端IP + "|" + 用户名
+_AUTH_RATE_LIMIT_MAX = 10          # 每个 key 在窗口内允许的最大尝试次数
+_AUTH_RATE_LIMIT_WINDOW = 15 * 60  # 窗口时长（秒），默认 15 分钟
+_AUTH_RATE_ATTEMPTS: Dict[str, List[float]] = {}
+_AUTH_RATE_LOCK = threading.Lock()
+
+
+def _check_auth_rate_limit(key: str) -> None:
+    """滑动窗口限流：超限抛 429，否则记录当前尝试时间戳。"""
+    now = time.time()
+    with _AUTH_RATE_LOCK:
+        # 清理该 key 的过期时间戳
+        timestamps = [
+            ts
+            for ts in _AUTH_RATE_ATTEMPTS.get(key, [])
+            if now - ts < _AUTH_RATE_LIMIT_WINDOW
+        ]
+        if len(timestamps) >= _AUTH_RATE_LIMIT_MAX:
+            _AUTH_RATE_ATTEMPTS[key] = timestamps
+            raise HTTPException(status_code=429, detail="尝试过于频繁，请稍后再试")
+        timestamps.append(now)
+        _AUTH_RATE_ATTEMPTS[key] = timestamps
 
 
 def _wechat_config() -> Dict[str, Any]:
@@ -84,8 +109,9 @@ def _strip_sensitive_fields(user: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @router.post("/auth/register")
-async def auth_register(req: RegisterRequest):
+async def auth_register(request: Request, req: RegisterRequest):
     """账号密码注册：创建新用户并返回 JWT token。"""
+    _check_auth_rate_limit(f"{request.client.host}|{req.username.strip()}")
     username = req.username.strip()
     if not username:
         raise HTTPException(status_code=400, detail="用户名不能为空")
@@ -102,8 +128,9 @@ async def auth_register(req: RegisterRequest):
 
 
 @router.post("/auth/login")
-async def auth_login(req: LoginRequest):
+async def auth_login(request: Request, req: LoginRequest):
     """账号密码登录：校验通过后返回 JWT token。"""
+    _check_auth_rate_limit(f"{request.client.host}|{req.username.strip()}")
     username = req.username.strip()
     if not username or not req.password:
         raise HTTPException(status_code=400, detail="用户名和密码不能为空")
@@ -296,7 +323,10 @@ async def account_status(current_user: dict = Depends(get_current_user)):
     - ``deleting``：倒计时结束，数据保留 31 天后彻底删除（含剩余天数）
     """
     openid = current_user.get("openid", "")
-    return user_store.get_account_status(openid)
+    status = user_store.get_account_status(openid)
+    if status.get("user"):
+        status["user"] = _strip_sensitive_fields(status["user"])
+    return status
 
 
 @router.post("/auth/account/delete-request")

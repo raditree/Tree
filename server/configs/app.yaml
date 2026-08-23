@@ -2,6 +2,14 @@ server:
   host: "0.0.0.0"
   port: 8000
 
+# CORS 跨域配置。
+# allow_origins 为空列表表示不放开任意源（默认，安全推荐）；
+# 需要 Web 端跨域访问时，把允许的源列出来（如 ["http://localhost:3000"]）并置 allow_credentials: true。
+# 注意：allow_credentials 为 true 时不允许出现 "*"，任意源带凭据是不安全组合。
+cors:
+  allow_origins: []
+  allow_credentials: false
+
 # 提示词体系多版本选择（见 server/prompt/versions.py；版本内容在 server/prompt/versions/ 下）
 prompt:
   version: "1.0.0"
