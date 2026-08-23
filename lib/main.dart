@@ -69,6 +69,12 @@ class AgentTeamApp extends StatelessWidget {
         primary: Color(0xFF2563EB),
         secondary: Color(0xFF2563EB),
       ),
+      // 文字选区高亮用 cyan，与用户消息气泡底色(primary 蓝)区分开，
+      // 否则选中重叠在蓝色气泡上看不出框选效果。
+      textSelectionTheme: const TextSelectionThemeData(
+        selectionColor: Color(0xFF80DEEA),
+        selectionHandleColor: Color(0xFF00ACC1),
+      ),
       useMaterial3: false,
     );
   }
@@ -88,6 +94,11 @@ class AgentTeamApp extends StatelessWidget {
       colorScheme: const ColorScheme.dark(
         primary: Color(0xFF3B82F6),
         secondary: Color(0xFF3B82F6),
+      ),
+      // 深色模式下同样用 cyan 选区，避免与蓝色气泡/深色背景隐形。
+      textSelectionTheme: const TextSelectionThemeData(
+        selectionColor: Color(0xFF4DD0E1),
+        selectionHandleColor: Color(0xFF00ACC1),
       ),
       useMaterial3: false,
     );
