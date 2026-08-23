@@ -14,9 +14,17 @@ class GitHistory extends StatefulWidget {
   /// 工作空间 ID
   final String workspaceId;
 
+  /// 所属顶层 agent ID（SSH/本地模式下区分布局用，决定查询哪种执行源的 git）
+  final String? topAgentId;
+
+  /// 刷新触发器：递增时重新加载提交历史与分支列表
+  final int refreshTrigger;
+
   const GitHistory({
     super.key,
     required this.workspaceId,
+    this.topAgentId,
+    this.refreshTrigger = 0,
   });
 
   @override
@@ -61,6 +69,18 @@ class _GitHistoryState extends State<GitHistory>
   }
 
   @override
+  void didUpdateWidget(GitHistory oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 工作空间 / 顶层 agent / 刷新触发器变化时重新加载
+    if (oldWidget.workspaceId != widget.workspaceId ||
+        oldWidget.topAgentId != widget.topAgentId ||
+        oldWidget.refreshTrigger != widget.refreshTrigger) {
+      _loadCommits();
+      _loadBranches();
+    }
+  }
+
+  @override
   void dispose() {
     _tabController.dispose();
     super.dispose();
@@ -73,8 +93,10 @@ class _GitHistoryState extends State<GitHistory>
       _commitsError = null;
     });
     try {
-      final List<Map<String, dynamic>> commits =
-          await ApiService.getGitLog(widget.workspaceId);
+      final List<Map<String, dynamic>> commits = await ApiService.getGitLog(
+        widget.workspaceId,
+        topAgentId: widget.topAgentId ?? '',
+      );
       if (mounted) {
         setState(() {
           _commits = commits;
@@ -98,8 +120,10 @@ class _GitHistoryState extends State<GitHistory>
       _branchesError = null;
     });
     try {
-      final Map<String, dynamic> data =
-          await ApiService.getGitBranches(widget.workspaceId);
+      final Map<String, dynamic> data = await ApiService.getGitBranches(
+        widget.workspaceId,
+        topAgentId: widget.topAgentId ?? '',
+      );
       final List<dynamic> rawBranches =
           data['branches'] as List<dynamic>? ?? [];
       final List<String> branches = rawBranches.map((dynamic b) {

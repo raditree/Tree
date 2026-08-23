@@ -198,6 +198,32 @@ class SSHWorkspaceIO(WorkspaceIO):
                     })
         return {"commits": commits, "exit_code": result.get("exit_code", 0)}
 
+    async def git_branches(self, workspace_id: str) -> Dict[str, Any]:
+        """查看远端所有分支：``git branch -a``，返回 ``{"branches", "current"}``。
+
+        与 :meth:`git_log` 一致，在远端工作空间目录执行；解析 ``*`` 标记当前分支。
+        """
+        cwd = self._remote_path(workspace_id, "")
+        full = f"cd {shlex.quote(cwd)} && git branch -a"
+        result = await asyncio.to_thread(self._exec, ["sh", "-c", full])
+        branches: List[str] = []
+        current = ""
+        if not result.get("error") and result.get("exit_code") == 0:
+            for line in (result.get("stdout", "") or "").splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                if s.startswith("* "):
+                    current = s[2:].strip()
+                    branches.append(current)
+                else:
+                    branches.append(s)
+        return {
+            "branches": branches,
+            "current": current,
+            "exit_code": result.get("exit_code", 0),
+        }
+
     async def list_files(
         self, workspace_id: str, path: str = ""
     ) -> Dict[str, Any]:

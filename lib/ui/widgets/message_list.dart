@@ -25,15 +25,23 @@ class MessageList extends StatelessWidget {
   /// 无法通过长度/引用比较检测变化，故使用版本号信号。
   final int revision;
 
+  /// 内联提问卡片的选择回调（参数为消息 id 与答案）
+  final void Function(String messageId, String answer)? onAskAnswer;
+
   const MessageList({
     super.key,
     required this.messages,
     this.revision = 0,
+    this.onAskAnswer,
   });
 
   @override
   Widget build(BuildContext context) {
-    return _MessageListView(messages: messages, revision: revision);
+    return _MessageListView(
+      messages: messages,
+      revision: revision,
+      onAskAnswer: onAskAnswer,
+    );
   }
 }
 
@@ -44,8 +52,13 @@ class MessageList extends StatelessWidget {
 class _MessageListView extends StatefulWidget {
   final List<ChatMessage> messages;
   final int revision;
+  final void Function(String messageId, String answer)? onAskAnswer;
 
-  const _MessageListView({required this.messages, this.revision = 0});
+  const _MessageListView({
+    required this.messages,
+    this.revision = 0,
+    this.onAskAnswer,
+  });
 
   @override
   State<_MessageListView> createState() => _MessageListViewState();
@@ -137,6 +150,16 @@ class _MessageListViewState extends State<_MessageListView> {
           return Padding(
             padding: const EdgeInsets.only(bottom: 4),
             child: ThinkingCard(message: message),
+          );
+        }
+        // 内联提问卡片：非阻塞，允许查看上下文与右侧信息后再作答
+        if (message.kind == 'ask_user_question') {
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: _AskQuestionCard(
+              message: message,
+              onAnswer: widget.onAskAnswer,
+            ),
           );
         }
         return Padding(
@@ -473,5 +496,145 @@ class _MessageBubbleState extends State<_MessageBubble> {
       unitIdx++;
     }
     return '${size.toStringAsFixed(size >= 10 ? 0 : 1)} ${units[unitIdx]}';
+  }
+}
+
+/// 内联提问卡片（AskUserQuestion 的非阻塞展示）
+///
+/// 替代全屏遮罩对话框：提问以卡片形式插入消息流，答题者仍可滚动查看
+/// 模型最近输出与右侧信息后再做决策。点击选项或输入自由文本后回调
+/// [onAnswer]，由父级发送 user_answer 并置位 answered 禁用输入。
+class _AskQuestionCard extends StatefulWidget {
+  final ChatMessage message;
+  final void Function(String messageId, String answer)? onAnswer;
+
+  const _AskQuestionCard({required this.message, this.onAnswer});
+
+  @override
+  State<_AskQuestionCard> createState() => _AskQuestionCardState();
+}
+
+class _AskQuestionCardState extends State<_AskQuestionCard> {
+  final TextEditingController _controller = TextEditingController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final String text = _controller.text.trim();
+    if (widget.message.answered || text.isEmpty) return;
+    final void Function(String, String)? onAnswer = widget.onAnswer;
+    if (onAnswer == null) return;
+    _controller.clear();
+    onAnswer(widget.message.id, text);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final ChatMessage message = widget.message;
+    final bool enabled = !message.answered && widget.onAnswer != null;
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: cs.surface,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: cs.primary, width: 1),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Row(
+              children: <Widget>[
+                Icon(Icons.help_outline, size: 16, color: cs.primary),
+                const SizedBox(width: 6),
+                Text(
+                  message.answered ? '已提交你的选择' : 'Agent 需要你的输入',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: cs.primary,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              message.content.isEmpty ? '提问' : message.content,
+              style: TextStyle(fontSize: 14, color: cs.onSurface, height: 1.4),
+            ),
+            if (message.options.isNotEmpty) ...<Widget>[
+              const SizedBox(height: 10),
+              for (final String option in message.options)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 3),
+                  child: SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton(
+                      onPressed: enabled
+                          ? () => widget.onAnswer!(message.id, option)
+                          : null,
+                      style: OutlinedButton.styleFrom(
+                        alignment: Alignment.centerLeft,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
+                      ),
+                      child: Row(
+                        children: <Widget>[
+                          Icon(
+                            message.answered
+                                ? Icons.check_circle_outline
+                                : Icons.radio_button_unchecked,
+                            size: 16,
+                            color: cs.onSurfaceVariant,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              option,
+                              style: TextStyle(
+                                fontSize: 13,
+                                color: cs.onSurface,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+            const SizedBox(height: 10),
+            // 或直接输入回答
+            TextField(
+              controller: _controller,
+              enabled: enabled,
+              maxLines: 2,
+              minLines: 1,
+              onSubmitted: (_) => _submit(),
+              decoration: InputDecoration(
+                hintText: '或直接输入回答…',
+                isDense: true,
+                border: const OutlineInputBorder(),
+                suffixIcon: IconButton(
+                  onPressed: enabled ? _submit : null,
+                  icon: const Icon(Icons.send, size: 18),
+                  tooltip: '发送',
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }

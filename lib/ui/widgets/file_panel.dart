@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import '../../io/api_service.dart';
 import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
+import '../../io/workspace_refresh_service.dart';
 import 'file_sync_button.dart';
 import 'file_tree.dart';
 import 'file_viewer.dart';
@@ -76,14 +77,26 @@ class _FilePanelState extends State<FilePanel>
     _fileTabController = TabController(length: 3, vsync: this);
     // 本地模式开关/工作目录变化时重新加载文件列表
     LocalExecutorService.instance.addListener(_onLocalModeChanged);
+    // 工作空间数据变更（文件/Git/Todo 工具执行）时即时刷新右栏
+    WorkspaceRefreshService.instance.addListener(_onWorkspaceChanged);
   }
 
   @override
   void dispose() {
     LocalExecutorService.instance.removeListener(_onLocalModeChanged);
+    WorkspaceRefreshService.instance.removeListener(_onWorkspaceChanged);
     _tabController.dispose();
     _fileTabController.dispose();
     super.dispose();
+  }
+
+  /// 工作空间数据变更（工具写文件 / git 提交 / 更新 todo）时刷新右栏面板。
+  ///
+  /// 递增 [_fileRefreshTrigger] 会同时触发 FileTree / GitHistory / TodoPanel 重载，
+  /// 无需"切 Tab 再切回"。
+  void _onWorkspaceChanged() {
+    if (!mounted) return;
+    _refreshFileTree();
   }
 
   /// 本地执行模式状态变化（切换开关/选择工作目录）时刷新文件树。
@@ -275,7 +288,11 @@ class _FilePanelState extends State<FilePanel>
                       });
                     },
                   ),
-                  GitHistory(workspaceId: widget.workspaceId),
+                  GitHistory(
+                      workspaceId: widget.workspaceId,
+                      topAgentId: widget.topAgentId,
+                      refreshTrigger: _fileRefreshTrigger,
+                    ),
                   TodoPanel(
                     workspaceId: widget.workspaceId,
                     topAgentId: widget.topAgentId,

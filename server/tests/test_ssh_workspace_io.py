@@ -254,6 +254,25 @@ def test_git_log(ssh_cfg):
     assert result["commits"][0]["message"] == "fix bug"
 
 
+def test_git_branches(ssh_cfg):
+    out = "* main\n  feature/x\n  remotes/origin/main\n"
+    client = FakeClient(exec_stdout=out, exec_code=0)
+    io = make_io(FakeSSHManager(ssh_cfg, client))
+    result = run(io.git_branches("top1"))
+    assert result["current"] == "main"
+    assert "main" in result["branches"]
+    assert "feature/x" in result["branches"]
+    assert result["branches"].count("main") == 1
+
+
+def test_git_branches_empty(ssh_cfg):
+    client = FakeClient(exec_stdout="", exec_code=0)
+    io = make_io(FakeSSHManager(ssh_cfg, client))
+    result = run(io.git_branches("top1"))
+    assert result["branches"] == []
+    assert result["current"] == ""
+
+
 def test_list_files(ssh_cfg):
     out = (
         "total 8\n"

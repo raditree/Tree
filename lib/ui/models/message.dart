@@ -43,6 +43,12 @@ class ChatMessage {
   /// 工具是否仍在执行中（kind == "tool" 时有效）
   bool toolRunning;
 
+  /// 提问选项（kind == "ask_user_question" 时有效）
+  final List<String> options;
+
+  /// 是否已作答（内联提问卡片被选择后置位，用于禁用其余选项）
+  bool answered;
+
   ChatMessage({
     required this.id,
     required this.role,
@@ -56,6 +62,8 @@ class ChatMessage {
     this.toolArguments,
     this.toolResult = '',
     this.toolRunning = false,
+    this.options = const <String>[],
+    this.answered = false,
   });
 
   /// 是否为用户消息
@@ -90,6 +98,10 @@ class ChatMessage {
       toolName: json['tool_name'] as String?,
       toolArguments: toolArgs,
       toolResult: json['tool_result'] as String? ?? '',
+      options:
+          (json['options'] as List<dynamic>?)?.map((e) => e.toString()).toList() ??
+              <String>[],
+      answered: json['answered'] as bool? ?? false,
     );
   }
 

@@ -10,6 +10,7 @@ import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
 import '../../io/ssh_executor_service.dart';
 import '../../io/websocket_service.dart';
+import '../../io/workspace_refresh_service.dart';
 import 'message_input.dart';
 import 'message_list.dart';
 import 'mode_switch.dart';
@@ -380,6 +381,8 @@ class _MessagePanelState extends State<MessagePanel> {
           _messages[idx].toolResult = (data['result'] as String?) ?? '';
         });
       }
+      // 工具执行结束：工作空间（文件/Git/Todo）可能已变更，通知右栏即时刷新。
+      WorkspaceRefreshService.instance.notifyWorkspaceChanged();
     } else if (type == 'agent_status') {
       final Map<String, dynamic> d =
           (data['data'] as Map<String, dynamic>?)?.cast<String, dynamic>() ??
@@ -433,96 +436,44 @@ class _MessagePanelState extends State<MessagePanel> {
     _usageByAgent['$agentId::$sessionId'] = usage;
   }
 
-  /// 处理 agent 的提问（AskUserQuestion 工具）：弹出选择/输入对话框
+  /// 处理 agent 的提问（AskUserQuestion 工具）：以非阻塞内联卡片插入消息流。
+  ///
+  /// 不再弹全屏遮罩对话框，避免挡住模型最近输出与右侧信息；用户可先浏览
+  /// 上下文再点选选项作答，由 [_handleAskAnswer] 发送 answer 并置位已作答状态。
   void _handleAskUserQuestion(Map<String, dynamic> data) {
     if (_asking) return;
-    _asking = true;
     final String qid = (data['id'] as String?) ?? '';
+    if (qid.isEmpty) return;
+    _asking = true;
     final String question = (data['question'] as String?) ?? '提问';
     final List<String> options =
         (data['options'] as List?)?.map((e) => e.toString()).toList() ??
             <String>[];
-    final TextEditingController controller = TextEditingController();
+    setState(() {
+      _messages.add(ChatMessage(
+        id: qid,
+        role: 'agent',
+        content: question,
+        timestamp: DateTime.now(),
+        kind: 'ask_user_question',
+        options: options,
+      ));
+      _scrollRevision++;
+    });
+  }
 
-    Future<void> submit(String answer) async {
-      _asking = false;
-      if (Navigator.of(context).canPop()) {
-        Navigator.of(context).pop();
-      }
-      controller.dispose();
-      _webSocket.send(<String, dynamic>{
-        'type': 'user_answer',
-        'data': {'question_id': qid, 'answer': answer},
+  /// 处理内联提问卡片的选项点选：发送 user_answer 并标记该问题已作答。
+  void _handleAskAnswer(String messageId, String answer) {
+    _asking = false;
+    final int idx = _messages.indexWhere((ChatMessage m) => m.id == messageId);
+    if (idx >= 0) {
+      setState(() {
+        _messages[idx].answered = true;
       });
     }
-
-    Future<void> cancel() async {
-      _asking = false;
-      if (Navigator.of(context).canPop()) {
-        Navigator.of(context).pop();
-      }
-      controller.dispose();
-      _webSocket.send(<String, dynamic>{
-        'type': 'cancel_question',
-        'data': {'question_id': qid},
-      });
-    }
-
-    showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (BuildContext dialogContext) {
-        return AlertDialog(
-          title: const Text('Agent 需要你的输入'),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Text(question, style: const TextStyle(fontSize: 14)),
-                if (options.isNotEmpty) ...<Widget>[
-                  const SizedBox(height: 12),
-                  for (final String option in options)
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 2),
-                      child: ListTile(
-                        dense: true,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(8),
-                          side: BorderSide(
-                            color: Theme.of(context).dividerColor,
-                          ),
-                        ),
-                        title: Text(option, style: const TextStyle(fontSize: 13)),
-                        onTap: () => submit(option),
-                      ),
-                    ),
-                ],
-                const SizedBox(height: 12),
-                TextField(
-                  controller: controller,
-                  maxLines: 3,
-                  minLines: 1,
-                  decoration: const InputDecoration(
-                    labelText: '或直接输入回答',
-                    border: OutlineInputBorder(),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          actions: <Widget>[
-            TextButton(onPressed: cancel, child: const Text('取消')),
-            TextButton(
-              onPressed: () => submit(controller.text.trim()),
-              child: const Text('发送'),
-            ),
-          ],
-        );
-      },
-    ).then((_) {
-      _asking = false;
-      controller.dispose();
+    _webSocket.send(<String, dynamic>{
+      'type': 'user_answer',
+      'data': {'question_id': messageId, 'answer': answer},
     });
   }
 
@@ -722,7 +673,13 @@ class _MessagePanelState extends State<MessagePanel> {
               ),
             )
           else
-            Expanded(child: MessageList(messages: _messages, revision: _scrollRevision)),
+            Expanded(
+                      child: MessageList(
+                        messages: _messages,
+                        revision: _scrollRevision,
+                        onAskAnswer: _handleAskAnswer,
+                      ),
+                    ),
           if (agent != null) MessageInput(onSend: _handleSend),
         ],
       ),

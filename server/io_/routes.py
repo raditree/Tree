@@ -36,6 +36,7 @@ except ImportError:
 import state
 from config.config import get_config
 from ws.auth import get_current_user
+from io_ import mode_resolver
 
 router = APIRouter(prefix="/api")
 
@@ -867,6 +868,17 @@ async def git_log(
             raise HTTPException(status_code=500, detail=result)
         return {"commits": result.get("commits", [])}
 
+    # SSH 模式：转发到远端主机工作空间执行 git log
+    mode = mode_resolver.resolve_mode(user_id, top_agent_id or workspace_id)
+    if mode == "ssh":
+        from io_.ssh_workspace_io import SSHWorkspaceIO
+
+        ssh = SSHWorkspaceIO(state.ssh_manager, user_id, top_agent_id or workspace_id)
+        result = await ssh.git_log(workspace_id, limit=int(limit))
+        if result.get("error"):
+            raise HTTPException(status_code=500, detail=result)
+        return {"commits": result.get("commits", [])}
+
     docker_manager = _get_docker_manager()
     result = docker_manager.git_log(workspace_id, limit=limit)
     if "error" in result:
@@ -894,6 +906,20 @@ async def git_branches(
             {"op": "git_branches", "workspace_id": workspace_id},
         )
         if "error" in result:
+            raise HTTPException(status_code=500, detail=result)
+        return {
+            "branches": result.get("branches", []),
+            "current": result.get("current", ""),
+        }
+
+    # SSH 模式：转发到远端主机工作空间执行 git branch
+    mode = mode_resolver.resolve_mode(user_id, top_agent_id or workspace_id)
+    if mode == "ssh":
+        from io_.ssh_workspace_io import SSHWorkspaceIO
+
+        ssh = SSHWorkspaceIO(state.ssh_manager, user_id, top_agent_id or workspace_id)
+        result = await ssh.git_branches(workspace_id)
+        if result.get("error"):
             raise HTTPException(status_code=500, detail=result)
         return {
             "branches": result.get("branches", []),
