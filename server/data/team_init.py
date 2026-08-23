@@ -265,7 +265,11 @@ def init_team_for_top(
             name=names[i],
             role=role,
             duty="",
-            model_id="",
+            # 成员默认继承 TOP 的模型：保证建队即可接收消息并真正执行
+            # （此前 model_id 为空导致 _process_member_message 因模型缺失
+            #   静默丢弃消息，成员"收不到"leader 的任务；leader 仍可经
+            #   team update_member 为成员改配独立模型）
+            model_id=top_agent.get("model_id", ""),
             level=1,
             system_prompt="",
         )

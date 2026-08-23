@@ -403,10 +403,12 @@ async def get_agent_teammates(
         members = _parse_roster_table(content)
     for m in members:
         mid = m["id"]
+        # 状态治理：live_status 唯一基于 _active_tasks（实际 tool loop 登记），
+        # 不 fallback 表/roster 中的 work_status（可能是假状态/过时快照）。
         m["live_status"] = (
             "working"
             if any(k[0] == user_id and k[1] == mid for k in _active_tasks)
-            else m.get("work_status") or "idle"
+            else "idle"
         )
     return {"agent_id": agent_id, "members": members}
 

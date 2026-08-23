@@ -106,6 +106,11 @@ def render_roster_md(members: List[Dict[str, Any]]) -> str:
     角色/职责列追加在评价之后、评分之前，避免破坏已有解析索引。
     完整列：ID | 名称 | 模型 | 层级 | 创建时间 | 工作状态 | 评价 |
     角色 | 职责 | 质量 | 效率 | 协作性 | 准确性
+
+    【状态治理】工作状态列输出占位 ``-``（不写任何状态值）：成员是否在
+    工作的唯一权威是 ``chat._active_tasks``（实际 tool loop 登记），由
+    ``team query_status`` / teammates API 实时计算；roster 不再承载状态，
+    避免名册中的状态与实际情况脱节（曾被 leader/assign_task 写入假状态）。
     """
     header = (
         "| ID | 名称 | 模型 | 层级 | 创建时间 | 工作状态 | 评价 | "
@@ -121,7 +126,7 @@ def render_roster_md(members: List[Dict[str, Any]]) -> str:
         lines.append(
             f"| {m.get('id', '')} | {m.get('name', '')} | "
             f"{m.get('model_id', '')} | {m.get('level', 1)} | "
-            f"{m.get('created_at', '')} | {m.get('work_status', '')} | "
+            f"{m.get('created_at', '')} | - | "
             f"{m.get('comment', '')} | "
             f"{m.get('role', '')} | {m.get('duty', '')} | "
             f"{_to_score(s.get('quality', 0))} | "

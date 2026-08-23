@@ -509,10 +509,18 @@ def _build_member_topology_text(
     if members:
         lines.append("当前团队成员（ID | 名称 | 角色 | 职责 | 模型 | 状态 | 层级）:")
         for m in members:
+            # 状态列注入**实际执行态**（基于 _active_tasks），
+            # 不读表/roster 快照（避免假 working）
+            mid = m.get("id", "")
+            live_status = (
+                "working"
+                if (user_id and mid and _is_agent_working(user_id, mid))
+                else "idle"
+            )
             lines.append(
-                f"- {m.get('id', '')} | {m.get('name', '')} | "
+                f"- {mid} | {m.get('name', '')} | "
                 f"{m.get('role', '')} | {m.get('duty', '')} | "
-                f"{m.get('model_id', '')} | {m.get('work_status', '')} | "
+                f"{m.get('model_id', '')} | {live_status} | "
                 f"L{m.get('level', 1)}"
             )
     else:
@@ -829,21 +837,13 @@ def _reset_member_work_status(
 ) -> None:
     """成员 tool loop 结束后复位其持久化 work_status 为 idle。
 
-    ``work_status`` 有三处状态：leader 的 team_tool 内存态（self.members）、
-    roster 文件（``.self/team_roster.md``）、team_members 表（权威源）。
-    ``complete_task`` 依赖成员显式调用才能切回 idle，但成员 tool loop 自然结束
-    （回复完成）时往往无人调用，导致 UI 一直显示"工作中"。此处通过 leader
-    会话上挂载的 team_tool.mark_member_idle 三方统一复位。
+    【状态治理】工作状态不再由 leader/roster/表写入——成员是否在工作的
+    唯一权威是 ``_active_tasks``（实际 tool loop 登记）：``_process_member_
+    message`` 真正开始 chat 前登记、结束时清除，前端经 WS ``agent_status``
+    事件感知，teammates API 的 ``live_status`` 亦基于 ``_active_tasks`` 实时
+    计算。故本函数保留为兼容占位（不再写任何持久化状态）。
     """
-    if not leader_id or not member_id:
-        return
-    try:
-        leader_session = get_session(user_id, leader_id, session_id)
-        team_tool = getattr(leader_session, "team_tool", None)
-        if team_tool is not None:
-            team_tool.mark_member_idle(member_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("复位成员 %s 工作状态失败: %s", member_id, exc)
+    return
 
 
 async def _send_status_working(
@@ -962,30 +962,15 @@ def _cancel_all_agent_tasks(
 def _reset_member_status_to_idle(
     user_id: str, top_id: str, member_id: str
 ) -> None:
-    """将成员持久化工作状态复位为 idle（team_members 表 + leader 会话内存态）。
+    """（已废弃）成员工作状态复位占位。
 
-    停止级联中，成员可能正处于 working 且其 tool loop 的 finally 尚未运行
-    （或永远不会再运行——队列被清空、worker 被取消），此处直接三方复位：
-    - ``team_members`` 表（权威名单）：teammates API/UI 立即显示 idle
-    - leader 会话上挂载的 team_tool 内存态 + roster 文件（mark_member_idle）
+    【状态治理】工作状态唯一权威是 ``_active_tasks``（实际 tool loop 登记），
+    不再写入 team_members 表 / roster / team_tool 内存态。停止 = 取消
+    ``_active_tasks`` 中的任务 + 清空 broker 队列；成员 tool loop 的 finally
+    会 ``_clear_active_task`` 并推送 ``agent_status=idle``，前端/API 状态
+    自然回到 idle。保留本函数仅为兼容调用方，不再写任何持久化状态。
     """
-    if not user_id or not top_id or not member_id:
-        return
-    # 1) team_members 表
-    try:
-        from data.team_store import update_member
-
-        update_member(top_id, member_id, work_status="idle", current_task="")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("停止级联复位成员状态失败(表): %s %s", member_id, exc)
-    # 2) leader 会话 team_tool 内存态 + roster 文件
-    try:
-        leader_session = get_session(user_id, top_id, DEFAULT_SESSION)
-        team_tool = getattr(leader_session, "team_tool", None)
-        if team_tool is not None:
-            team_tool.mark_member_idle(member_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("停止级联复位成员状态失败(内存): %s %s", member_id, exc)
+    return
 
 
 async def _stop_agent_tree(
@@ -1000,8 +985,8 @@ async def _stop_agent_tree(
     - 查出其全部成员（``team_members`` 表），逐一取消成员全部进行中任务
     - 清空 ``top_chat_broker`` 中该 TOP 的排队用户消息、``team_broker`` 中
       各成员的排队消息（防止队列里残留的消息在停止后把成员又拉起来工作）
-    - 复位成员持久化 ``work_status`` 为 idle（team_members 表 + leader 会话）
     - 向前端推送 TOP 与全部成员的 ``agent_status=idle``，UI 立即停止标识
+      （工作状态唯一权威是 ``_active_tasks``，不写入表/roster）
 
     若 ``agent_id`` 为成员（不在 agent_store）：
     - 仅取消该成员任务、清空其 broker 队列、复位 idle
@@ -1053,11 +1038,9 @@ async def _stop_agent_tree(
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("停止级联清空成员队列失败 %s: %s", mid, exc)
 
-        # 4) 复位成员持久化状态为 idle
-        for mid in member_ids:
-            _reset_member_status_to_idle(user_id, agent_id, mid)
-
-        # 5) 推送 idle：TOP + 全部成员
+        # 4) 推送 idle：TOP + 全部成员。成员工作状态无需写表——tool loop 的
+        #    finally 会 _clear_active_task（_active_tasks 为唯一权威），
+        #    此处推送 idle 让前端 UI 立即停止标识。
         for mid in [agent_id] + member_ids:
             await state.ws_manager.send_message(
                 user_id,
@@ -1071,13 +1054,12 @@ async def _stop_agent_tree(
                 },
             )
     else:
-        # 成员：清空其 broker 队列 + 复位 idle
+        # 成员：清空其 broker 队列 + 推送 idle
         if state.team_broker is not None:
             try:
                 state.team_broker.cancel_agent(user_id, agent_id)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("停止级联清空成员队列失败 %s: %s", agent_id, exc)
-        _reset_member_status_to_idle(user_id, agent_id, agent_id)
         await state.ws_manager.send_message(
             user_id,
             {
@@ -1454,8 +1436,24 @@ async def _process_member_message(
     if model_config is None:
         _append_activity_log(
             workspace_id,
-            f"[{_clock_now()}] [error] 成员模型不存在: {model_id}",
+            f"[{_clock_now()}] [error] 成员模型不存在: {model_id!r}，"
+            "消息未处理（leader 需先用 team update_member 为该成员设置 model_id）",
         )
+        # 明确回传错误给 leader，避免消息被静默丢弃（表现为"成员没收到"）
+        if leader_id:
+            try:
+                _dispatch_agent_message(
+                    user_id,
+                    [leader_id],
+                    f"[成员 {agent_id} 无法处理消息] 未配置 LLM 模型"
+                    f"（model_id={model_id!r}），消息已丢弃：{content[:120]}。"
+                    "请用 team update_member 为该成员设置 model_id 后重试。",
+                    source_agent_id=agent_id,
+                    top_agent_id=top_agent_id or leader_id,
+                    extra={"auto_reply": True, "session_id": session_id},
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("回传成员模型缺失错误失败: %s", exc)
         return
 
     # 保存成员收到的消息到历史（teammates 进度页可加载显示）
@@ -1579,13 +1577,10 @@ async def _process_member_message(
             workspace_id, f"[{_clock_now()}] [error] 成员处理失败: {exc}"
         )
     finally:
+        # 状态治理：工作状态唯一权威是 _active_tasks——此处清除任务登记并
+        # 推送 idle，前端/API 状态立即回到空闲；不再写 roster/表/内存态。
         _clear_active_task(user_id, agent_id, session_id)
         await _send_status_idle(user_id, agent_id, session_id)
-        # 复位持久化 work_status 为 idle：成员完成本轮 tool loop 后，若其
-        # 状态仍停留在 working（leader 未调用 complete_task 时），teammates
-        # API/UI 会一直显示"工作中"。这里通过 leader 会话的 team_tool 把
-        # 内存态 + roster 文件 + team_members 表三方统一复位为 idle。
-        _reset_member_work_status(user_id, leader_id, agent_id, session_id)
 
     # 持久化上下文（成员回复已实时写入工作空间活动日志，供 leader 查看）
     try:
@@ -1733,11 +1728,21 @@ def _dispatch_agent_message(
         if member is None:
             rejected.append(target_id)
             continue
+        # 成员 model_id 为空时回退所属 TOP 的模型：建队默认继承 TOP 模型，
+        # 此处兼容历史空 model_id 成员，避免消息被 _process_member_message
+        # 因"模型不存在"静默丢弃（成员"收不到"消息）。
+        member_model = member.get("model_id") or ""
+        if not member_model and owner_top:
+            try:
+                top_rec = get_agent(user_id, owner_top) or {}
+                member_model = top_rec.get("model_id") or ""
+            except Exception:  # noqa: BLE001
+                member_model = ""
         payload = {
             "user_id": user_id,
             "agent_id": target_id,
             "workspace_id": member.get("workspace_id") or target_id,
-            "model_id": member.get("model_id") or "",
+            "model_id": member_model,
             "system_prompt": member.get("system_prompt", "") or system_prompt,
             "leader_id": source_agent_id or top_agent_id,
             "top_agent_id": owner_top,

@@ -216,7 +216,9 @@ class TeamTool:
                         "work_status": {
                             "type": "string",
                             "enum": ["idle", "working", "waiting_input", "stopped", "error"],
-                            "description": "成员工作状态",
+                            "description": "成员工作状态（**只读**：由实际执行态决定，"
+                                           "请用 list_members/query_member 查询，"
+                                           "不可通过 update_member 设置）",
                         },
                         "can_lead_team": {
                             "type": "boolean",
@@ -863,29 +865,19 @@ class TeamTool:
         return members
 
     # ------------------------------------------------------------------
-    # SubTask 7.2: 成员工作状态复位（成员 tool loop 结束时由 chat 调用）
+    # SubTask 7.2: 成员工作状态（状态治理：以 _active_tasks 为准，不写持久化）
     # ------------------------------------------------------------------
     def mark_member_idle(self, member_id: str) -> None:
-        """将成员工作状态复位为空闲（内存态 + roster 文件 + team_members 表）。
+        """（已废弃）成员工作状态复位占位。
 
-        成员完成一轮 tool loop（回复/工具循环自然结束）后，若其持久化
-        ``work_status`` 仍停留在 ``working``，会导致 teammates API / UI 一直
-        显示"工作中"。此方法在 ``chat._process_member_message`` 结束时被调用，
-        把三方状态统一复位为 idle，保证工作状态与实际执行一致。
+        【状态治理】成员是否在工作由 ``chat._active_tasks``（实际 tool loop
+        登记）唯一决定：``_process_member_message`` 开始前登记、结束时清除
+        并推送 ``agent_status=idle``，前端/API 据此展示。此处不再写内存态 /
+        roster / team_members 表，保留函数仅为兼容历史调用方。
 
         :param member_id: 成员 ID
         """
-        member = self._find_member(member_id)
-        if member is None:
-            return
-        if member.get("work_status") != "working":
-            return
-        member["work_status"] = "idle"
-        member["current_task"] = ""
-        self._save_roster()
-        self._sync_member_to_team_store(
-            member["id"], work_status="idle", current_task=""
-        )
+        return
 
     # ------------------------------------------------------------------
     # SubTask 7.3: 多维评分机制
@@ -953,7 +945,10 @@ class TeamTool:
 
         work_status = arguments.get("work_status")
         if work_status:
-            result = [m for m in result if m.get("work_status") == work_status]
+            result = [
+                m for m in result
+                if self._live_work_status(m.get("id", "")) == work_status
+            ]
 
         # team_leader：自己的上级 leader
         team_leader: List[Dict[str, Any]] = []
@@ -1011,14 +1006,20 @@ class TeamTool:
             if len(missing) > 5:
                 hint += f" 等 {len(missing)} 名"
 
+        # 【状态治理】返回前把 members 的 work_status 覆盖为**实际执行态**
+        # （基于 _active_tasks），而非表/roster 中的快照（可能过时或假状态）。
+        live_result = [dict(m) for m in result]
+        for m in live_result:
+            m["work_status"] = self._live_work_status(m.get("id", ""))
+
         return {
             "groups": {
                 "team_leader": team_leader,
-                "teammates": result,
+                "teammates": live_result,
                 "team_member": team_member,
             },
-            "members": result,
-            "total": len(team_leader) + len(result) + len(team_member),
+            "members": live_result,
+            "total": len(team_leader) + len(live_result) + len(team_member),
             "hint": hint,
         }
 
@@ -1036,9 +1037,14 @@ class TeamTool:
     VALID_WORK_STATUS = ("idle", "working", "waiting_input", "stopped", "error")
 
     def _action_update_member(self, arguments: dict) -> dict:
-        """编辑成员信息（name/model_id/work_status/can_lead_team/comment/scores/system_prompt）。
+        """编辑成员信息（name/model_id/can_lead_team/comment/scores/system_prompt）。
 
         仅更新显式提供的字段，其余保持不变；更新后持久化到成员管理表。
+
+        【状态治理】工作状态（work_status）不可由 update_member 设置——成员
+        是否在工作的唯一权威是 ``chat._active_tasks``（实际 tool loop 登记），
+        由执行层登记/清除并经 WS ``agent_status`` 事件推送。需要停止成员请
+        使用前端「停止」按钮（取消任务 + 清空队列），而非修改状态字段。
 
         checklist 12 语义：
         - 变 model_id / comment → 只更新成员管理表，无其他操作（不重建工作区）。
@@ -1051,6 +1057,13 @@ class TeamTool:
         member = self._find_member(member_id)
         if member is None:
             return {"error": f"成员不存在: {member_id}"}
+
+        # 状态字段只读：work_status 由 _active_tasks 实际执行态决定，拒绝写入
+        if arguments.get("work_status") is not None:
+            return {
+                "error": "work_status 为只读字段（由实际执行状态决定），"
+                "请勿通过 update_member 设置；如需停止成员请使用前端「停止」按钮",
+            }
 
         updated: List[str] = []
         # 触发重生的字段：角色（name）/ 提示词（system_prompt）变化 → 重建工作区清空上下文
@@ -1085,14 +1098,6 @@ class TeamTool:
             member["model_name"] = self.model_configs[model_id].name
             updated.append("model")
 
-        # 更新工作状态（校验合法值）
-        work_status = arguments.get("work_status")
-        if work_status is not None:
-            if work_status not in self.VALID_WORK_STATUS:
-                return {"error": f"非法工作状态: {work_status}"}
-            member["work_status"] = work_status
-            updated.append("work_status")
-
         # 更新是否可创建子团队
         can_lead_team = arguments.get("can_lead_team")
         if can_lead_team is not None:
@@ -1116,7 +1121,8 @@ class TeamTool:
         if not updated:
             return {"error": "未提供任何可更新的字段"}
 
-        # 持久化到成员管理表（视图）+ 同步 team_members 表（权威名单）
+        # 持久化到成员管理表（视图）+ 同步 team_members 表（权威名单）。
+        # work_status 为只读（实际执行态），不同步写表。
         self._save_roster()
         self._sync_member_to_team_store(member_id,
                                         name=member.get("name"),
@@ -1124,7 +1130,6 @@ class TeamTool:
                                         duty=member.get("duty"),
                                         model_id=member.get("model_id"),
                                         level=member.get("level"),
-                                        work_status=member.get("work_status"),
                                         comment=member.get("comment"),
                                         system_prompt=member.get("system_prompt"),
                                         scores=member.get("scores"))
@@ -1289,8 +1294,26 @@ class TeamTool:
     # ------------------------------------------------------------------
     # SubTask 7.5: 工作状态查询
     # ------------------------------------------------------------------
+    def _live_work_status(self, member_id: str) -> str:
+        """返回成员**实际**工作状态（是否处于 tool loop）。
+
+        【状态治理】唯一权威是 ``chat._active_tasks``（真实运行中的任务登记），
+        不读表/roster/内存态的 work_status（那可能是过时或被错误设置的快照）。
+        """
+        if not self.user_id or not member_id:
+            return "idle"
+        try:
+            from agent.chat import _is_agent_working
+
+            return "working" if _is_agent_working(self.user_id, member_id) else "idle"
+        except Exception:  # noqa: BLE001
+            return "idle"
+
     def _action_query_status(self, arguments: dict) -> dict:
-        """查询成员工作状态、当前任务与最后一次 Git 提交。"""
+        """查询成员工作状态、当前任务与最后一次 Git 提交。
+
+        工作状态返回**实际执行态**（基于 ``_active_tasks``），非表/roster 快照。
+        """
         member_id = arguments.get("target_member_id")
         if not member_id:
             return {"error": "缺少 target_member_id"}
@@ -1312,7 +1335,7 @@ class TeamTool:
 
         return {
             "member_id": member_id,
-            "work_status": member.get("work_status", "unknown"),
+            "work_status": self._live_work_status(member_id),
             "current_task": member.get("current_task", ""),
             "last_commit": last_commit,
         }
@@ -1391,7 +1414,7 @@ class TeamTool:
         return {
             "member_id": member_id,
             "name": member.get("name", ""),
-            "work_status": member.get("work_status", "unknown"),
+            "work_status": self._live_work_status(member_id),
             "current_task": member.get("current_task", ""),
             "commits": commits,
             "files": files,
@@ -1435,7 +1458,7 @@ class TeamTool:
         return {
             "member_id": member_id,
             "name": member.get("name", ""),
-            "work_status": member.get("work_status", "unknown"),
+            "work_status": self._live_work_status(member_id),
             "log_lines": log_lines,
             "total": len(log_lines),
         }
@@ -1718,14 +1741,9 @@ class TeamTool:
         }
         self.tasks.append(task)
         member.setdefault("task_ids", []).append(task_id)
-        # 更新成员工作状态为工作中
-        member["work_status"] = "working"
-        member["current_task"] = description
-        self._save_roster()
-        # 同步到 team_store 权威名单，保证 roster 文件与 DB 一致
-        self._sync_member_to_team_store(
-            member["id"], work_status="working", current_task=description
-        )
+        # 【状态治理】不写成员 work_status（工作状态由 _active_tasks 实际
+        # tool loop 决定，投递后成员 worker 处理消息时自动登记 working、
+        # 结束后自动清除并推送 idle）。任务对象继续跟踪任务状态。
         # 投递给成员，触发其异步串行处理任务
         dispatched = self._dispatch_to_member(member, description)
 
@@ -1746,8 +1764,11 @@ class TeamTool:
 
         - 记录 Git 提交哈希与总结
         - 更新任务状态为已完成
-        - 更新成员工作状态为空闲
         - 通知父 agent（父 agent 可随后调用 update_member_score 评分）
+
+        【状态治理】不再修改成员 work_status——成员工作状态由
+        ``chat._active_tasks`` 实际 tool loop 决定（消息处理结束自动清除并
+        推送 idle），不依赖成员显式调用 complete_task。
 
         :param task_id: 任务 ID
         :param git_commit_hash: 工作成果的 Git 提交哈希
@@ -1765,15 +1786,6 @@ class TeamTool:
         task["summary"] = summary
         task["status"] = "completed"
         task["completed_at"] = self._now()
-
-        # 更新成员工作状态
-        member = self._find_member(task.get("assignee", ""))
-        if member is not None:
-            member["work_status"] = "idle"
-            member["current_task"] = ""
-            self._sync_member_to_team_store(
-                member["id"], work_status="idle", current_task=""
-            )
 
         # 更新成员管理表（父 agent 评分通过 update_member_score 单独触发）
         self._save_roster()
@@ -1951,7 +1963,7 @@ class TeamTool:
         except (TypeError, ValueError):
             timeout = 300
 
-        # 终端状态：成员不再处于工作状态
+        # 终端状态：成员不再处于工作状态（以 _active_tasks 实际执行态为准）
         terminal_statuses = {"idle", "stopped", "error"}
 
         deadline = time.time() + timeout
@@ -1965,11 +1977,10 @@ class TeamTool:
                 timed_out = True
                 break
 
-            # 检查每个成员的状态
+            # 检查每个成员的状态（实时查询实际执行态）
             all_done = True
             for mid in member_ids:
-                member = members_map[mid]
-                status = member.get("work_status", "")
+                status = self._live_work_status(mid)
                 if status not in terminal_statuses:
                     all_done = False
                     break
@@ -1983,14 +1994,14 @@ class TeamTool:
 
         waited = timeout - max(0, deadline - time.time())
 
-        # 收集最终状态
+        # 收集最终状态（实时执行态）
         results = []
         for mid in member_ids:
             member = members_map[mid]
             results.append({
                 "member_id": mid,
                 "name": member.get("name", ""),
-                "work_status": member.get("work_status", ""),
+                "work_status": self._live_work_status(mid),
                 "current_task": member.get("current_task", ""),
             })
 
