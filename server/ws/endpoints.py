@@ -8,6 +8,7 @@
 - ``register_local_executor`` / ``unregister_local_executor``：本地执行器注册
 - ``tool_exec_response``：前端工具执行结果回传
 """
+import asyncio
 import json
 import logging
 from typing import Any, Dict
@@ -21,9 +22,14 @@ from agent.chat import (
     _cancel_active_task,
     _dispatch_user_message,
     _stop_agent_tree,
+    resume_after_answer,
+)
+from data.conversation_store import (
+    get_pending_question,
+    mark_pending_answered,
+    mark_pending_cancelled,
 )
 from data.session_cache import clear_user_agent
-from tool.ask_question_tool import get_ask_tool
 from ws.auth import verify_token
 
 logger = logging.getLogger(__name__)
@@ -176,13 +182,12 @@ def register_ws(app: FastAPI) -> None:
                             },
                         )
                 elif msg_type == "user_answer":
-                    # 用户回答 AskUserQuestion 工具的问题
+                    # 用户回答 AskUserQuestion 工具的问题：按 qid 查存活态
+                    # 提问，回写 answered 状态并触发该 agent 唤醒续跑。
                     qid = data.get("question_id", "")
                     answer = data.get("answer")
-                    ask_tool = get_ask_tool(user_id)
-                    if ask_tool is not None and qid:
-                        ask_tool.resolve(qid, answer)
-                    else:
+                    pending = get_pending_question(qid)
+                    if pending is None or pending["status"] != "pending":
                         await state.ws_manager.send_message(
                             user_id,
                             {
@@ -190,13 +195,31 @@ def register_ws(app: FastAPI) -> None:
                                 "data": {"message": "没有等待回答的问题"},
                             },
                         )
+                        continue
+                    mark_pending_answered(qid, str(answer or "") if answer is not None else "")
+                    await state.ws_manager.send_message(
+                        user_id,
+                        {
+                            "type": "ask_user_question_resolved",
+                            "data": {"id": qid, "session_id": pending["session_id"]},
+                        },
+                    )
+                    # 唤醒：注入答案并重新触发该 agent 执行（异步，不阻塞 WS）
+                    asyncio.create_task(
+                        resume_after_answer(
+                            pending["user_id"],
+                            pending["agent_id"],
+                            pending["top_agent_id"],
+                            pending["session_id"],
+                            str(answer or "") if answer is not None else "",
+                            pending["is_member"],
+                        )
+                    )
                 elif msg_type == "cancel_question":
                     # 用户取消 AskUserQuestion 工具的问题
                     qid = data.get("question_id", "")
-                    ask_tool = get_ask_tool(user_id)
-                    if ask_tool is not None and qid:
-                        ask_tool.cancel(qid)
-                    else:
+                    pending = get_pending_question(qid)
+                    if pending is None or pending["status"] != "pending":
                         await state.ws_manager.send_message(
                             user_id,
                             {
@@ -204,6 +227,8 @@ def register_ws(app: FastAPI) -> None:
                                 "data": {"message": "没有等待回答的问题"},
                             },
                         )
+                    else:
+                        mark_pending_cancelled(qid)
                 elif msg_type == "register_local_executor":
                     # 前端注册本地执行器：该顶部 agent 的工具调用转发到前端本地执行
                     base_dir = data.get("base_dir")

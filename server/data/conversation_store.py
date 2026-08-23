@@ -104,6 +104,30 @@ def _ensure_db() -> None:
                 "UPDATE messages SET session_id = 'session_default' "
                 "WHERE session_id IS NULL"
             )
+        # AskUserQuestion：历史消息补充 answered/answer 列（选项存于 tool_arguments）
+        if "answered" not in cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN answered INTEGER DEFAULT 0")
+            conn.execute("UPDATE messages SET answered = 0 WHERE answered IS NULL")
+        if "answer" not in cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN answer TEXT")
+        # 存活态提问：供用户作答路由（qid 主键），重启后仍可答/唤醒
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_questions (
+                qid TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                top_agent_id TEXT NOT NULL DEFAULT '',
+                session_id TEXT NOT NULL,
+                is_member INTEGER NOT NULL DEFAULT 0,
+                question TEXT NOT NULL,
+                options TEXT NOT NULL DEFAULT '[]',
+                answer TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
         # agent_context 主键扩为 (user_id, agent_id, session_id)：重建表迁移。
         # 旧结构无 session_id 列时，把既有行归入默认会话后替换表结构。
         ctx_cols = {
@@ -196,19 +220,27 @@ def store_message(
     tool_arguments: Optional[Dict[str, Any]] = None,
     tool_result: Optional[str] = None,
     session_id: str = DEFAULT_SESSION,
+    answer: Optional[str] = None,
+    answered: int = 0,
+    msg_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """保存一条消息到 SQLite，返回消息对象（含 id/timestamp）。
 
     :param usage: 可选 token 用量统计（agent 消息），JSON 序列化存储
-    :param kind: 消息种类，``"text"``（普通文本）或 ``"tool"``（工具调用卡片）
+    :param kind: 消息种类，``"text"``（普通文本）、``"tool"``（工具调用卡片）或
+        ``"ask_user_question"``（AskUserQuestion 提问卡片）
     :param tool_name: 工具名称（kind == "tool" 时有效）
-    :param tool_arguments: 工具调用参数（kind == "tool" 时有效，JSON 序列化存储）
+    :param tool_arguments: 工具调用/选项参数（kind == "tool" 或
+        ``"ask_user_question"`` 时有效，JSON 序列化存储
     :param tool_result: 工具执行结果文本（kind == "tool" 时有效）
     :param session_id: 所属会话 id（多会话隔离，缺省为默认会话）
+    :param answer: AskUserQuestion 的回答文本（kind == "ask_user_question" 时有效）
+    :param answered: AskUserQuestion 是否已作答（0/1）
+    :param msg_id: 显式消息 id；缺省按时间戳生成
     """
     _ensure_db()
     timestamp = int(time.time() * 1000)
-    msg_id = f"msg_{timestamp}"
+    msg_id = msg_id or f"msg_{timestamp}"
     usage_json = json.dumps(usage, ensure_ascii=False) if usage else None
     args_json = (
         json.dumps(tool_arguments, ensure_ascii=False) if tool_arguments else None
@@ -219,12 +251,13 @@ def store_message(
             conn.execute(
                 "INSERT INTO messages "
                 "(user_id, agent_id, role, content, timestamp, msg_id, usage, "
-                "kind, tool_name, tool_arguments, tool_result, session_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "kind, tool_name, tool_arguments, tool_result, session_id, "
+                "answered, answer) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     user_id, agent_id, role, content, timestamp, msg_id,
                     usage_json, kind, tool_name, args_json, tool_result,
-                    session_id,
+                    session_id, answered, answer,
                 ),
             )
             conn.commit()
@@ -241,6 +274,8 @@ def store_message(
         "tool_name": tool_name,
         "tool_arguments": tool_arguments,
         "tool_result": tool_result,
+        "answered": answered,
+        "answer": answer,
     }
 
 
@@ -259,7 +294,8 @@ def get_history(
         if session_id is None:
             rows = conn.execute(
                 "SELECT session_id, msg_id, role, content, timestamp, usage, "
-                "kind, tool_name, tool_arguments, tool_result "
+                "kind, tool_name, tool_arguments, tool_result, "
+                "answered, answer "
                 "FROM messages "
                 "WHERE user_id = ? AND agent_id = ? AND deleted_at IS NULL "
                 "ORDER BY id ASC",
@@ -268,7 +304,8 @@ def get_history(
         else:
             rows = conn.execute(
                 "SELECT session_id, msg_id, role, content, timestamp, usage, "
-                "kind, tool_name, tool_arguments, tool_result "
+                "kind, tool_name, tool_arguments, tool_result, "
+                "answered, answer "
                 "FROM messages "
                 "WHERE user_id = ? AND agent_id = ? AND session_id = ? "
                 "AND deleted_at IS NULL "
@@ -294,6 +331,11 @@ def get_history(
             kind = row["kind"] if "kind" in row.keys() else "text"
             tool_name = row["tool_name"] if "tool_name" in row.keys() else None
             tool_result = row["tool_result"] if "tool_result" in row.keys() else None
+            options: List[str] = []
+            if isinstance(tool_args, dict) and isinstance(tool_args.get("options"), list):
+                options = [str(o) for o in tool_args["options"]]
+            answered = row["answered"] if "answered" in row.keys() else 0
+            answer = row["answer"] if "answer" in row.keys() else None
             result.append(
                 {
                     "id": row["msg_id"],
@@ -307,6 +349,9 @@ def get_history(
                     "tool_arguments": tool_args,
                     "tool_result": tool_result or "",
                     "session_id": row["session_id"],
+                    "options": options,
+                    "answered": bool(answered),
+                    "answer": answer,
                 }
             )
         return result
@@ -548,4 +593,110 @@ def list_archived_contexts(
         return result
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 存活态提问（AskUserQuestion）：持久化待答问题，供用户延迟作答与唤醒
+# ---------------------------------------------------------------------------
+
+
+def save_pending_question(
+    user_id: str,
+    agent_id: str,
+    top_agent_id: str,
+    session_id: str,
+    qid: str,
+    question: str,
+    options: Optional[List[str]] = None,
+    is_member: int = 0,
+) -> None:
+    """保存一条待答提问（status=pending），qid 主键，可重复 UPSERT。"""
+    _ensure_db()
+    options_json = json.dumps(options or [], ensure_ascii=False)
+    ts = int(time.time() * 1000)
+    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+        conn.execute(
+            "INSERT INTO pending_questions "
+            "(qid, user_id, agent_id, top_agent_id, session_id, is_member, "
+            "question, options, answer, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending', ?) "
+            "ON CONFLICT(qid) DO UPDATE SET "
+            "answer = NULL, status = 'pending', created_at = excluded.created_at",
+            (qid, user_id, agent_id, top_agent_id, session_id, is_member,
+             question, options_json, ts),
+        )
+        conn.commit()
+
+
+def get_pending_question(qid: str) -> Optional[Dict[str, Any]]:
+    """按 qid 查询待答问题，不存在返回 None。"""
+    _ensure_db()
+    conn = _connect()
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT qid, user_id, agent_id, top_agent_id, session_id, is_member, "
+            "question, options, answer, status, created_at "
+            "FROM pending_questions WHERE qid = ?",
+            (qid,),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            options = json.loads(row["options"] or "[]")
+        except (ValueError, TypeError):
+            options = []
+        return {
+            "qid": row["qid"],
+            "user_id": row["user_id"],
+            "agent_id": row["agent_id"],
+            "top_agent_id": row["top_agent_id"] or "",
+            "session_id": row["session_id"],
+            "is_member": bool(row["is_member"]),
+            "question": row["question"],
+            "options": options,
+            "answer": row["answer"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+        }
+    finally:
+        conn.close()
+
+
+def mark_pending_answered(qid: str, answer: str) -> Optional[Dict[str, Any]]:
+    """标记提问已作答，并回写对应的历史提问消息。返回待答问题信息。"""
+    pending = get_pending_question(qid)
+    if pending is None or pending["status"] != "pending":
+        return None
+    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+        conn.execute(
+            "UPDATE pending_questions SET answer = ?, status = 'answered' "
+            "WHERE qid = ?",
+            (answer, qid),
+        )
+        # 同步回写历史消息：突出 qid == msg_id 的提问卡片
+        conn.execute(
+            "UPDATE messages SET answered = 1, answer = ? WHERE msg_id = ?",
+            (answer, qid),
+        )
+        conn.commit()
+    return pending
+
+
+def mark_pending_cancelled(qid: str) -> None:
+    """标记提问已取消（不触发唤醒）。"""
+    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+        conn.execute(
+            "UPDATE pending_questions SET status = 'cancelled' WHERE qid = ?",
+            (qid,),
+        )
+        conn.execute(
+            "UPDATE messages SET answered = 1, answer = ? "
+            "WHERE msg_id = ? AND kind = 'ask_user_question'",
+            ("[已取消]", qid),
+        )
+        conn.commit()
 

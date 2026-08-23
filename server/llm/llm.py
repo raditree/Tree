@@ -15,6 +15,23 @@ from config.models import ModelConfig
 
 logger = logging.getLogger(__name__)
 
+# AskUserQuestion 暂停哨兵：工具检测到提问后停止本轮，等用户作答再由后端唤醒
+# （与 tool/ask_question_tool.py 的 ASK_PAUSED_KEY 一致，避免反向依赖）
+_ASK_PAUSED_KEY = "__ask_paused__"
+
+
+class _AskPaused(Exception):
+    """发出"已向用户提问、本轮应暂停等待作答"的信号。
+
+    由工具循环在 AskUserQuestion 返回哨兵时抛出，向上终止当前 chat() 循环，
+    外层调用链据此持久化上下文并使 agent 归闲。
+    """
+
+    def __init__(self, qid: str = "") -> None:
+        self.qid = qid
+        super().__init__(qid)
+
+
 # 列表字段展开上限（防止超大列表撑爆上下文）与项内字段上限
 _MAX_LIST_ITEMS = 30
 _MAX_ITEM_FIELDS = 8
@@ -764,6 +781,18 @@ class AgentLLMSession:
                             result = f"工具执行出错: {exc}"
                     else:
                         result = f"未找到工具: {tc['name']}"
+
+                    # AskUserQuestion 暂停：写入占位 tool 结果以保持上下文一致，
+                    # 然后抛出哨兵终止本轮（agent 归闲，等用户作答后由后端唤醒）。
+                    if isinstance(result, dict) and result.get(_ASK_PAUSED_KEY):
+                        self.context.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": (
+                                f"等待用户回答..."
+                            ),
+                        })
+                        raise _AskPaused(str(result.get("qid", "")))
 
                     # dict 结果提取可读内容，避免前端显示原始 dict 字符串
                     result_str = _stringify_tool_result(result)

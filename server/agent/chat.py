@@ -38,7 +38,7 @@ from data.session_store import (
     update_session_title_from_first_message,
 )
 from io_.workspace_io import run_io
-from llm.llm import AgentLLMSession
+from llm.llm import AgentLLMSession, _AskPaused
 from tool import register_builtin_tools
 
 # 模块级日志器
@@ -69,7 +69,7 @@ def _store_message(
 async def _register_tools(
     session: AgentLLMSession, agent_id: str, user_id: str = "",
     leader_id: str = "", top_agent_id: str = "", member_system_prompt: str = "",
-    session_id: str = DEFAULT_SESSION,
+    session_id: str = DEFAULT_SESSION, is_member: bool = False,
 ) -> None:
     """给会话注册内置工具（team / mcp / spec 等）。
 
@@ -128,6 +128,7 @@ async def _register_tools(
         message_dispatcher=_dispatch_agent_message,
         extra_info_refresher=_extra_info_refresher,
         session_id=session_id,
+        is_member=is_member,
     )
 
 
@@ -1163,6 +1164,11 @@ async def _stream_agent_reply(
                 loop.call_soon_threadsafe(out_q.put_nowait, item)
         except asyncio.CancelledError:
             loop.call_soon_threadsafe(out_q.put_nowait, {"type": "cancelled"})
+        except _AskPaused:
+            # AskUserQuestion 暂停：不视为错误，通知主循环置"已提问待答"
+            loop.call_soon_threadsafe(
+                out_q.put_nowait, {"type": "ask_paused"}
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("chat 消费线程异常")
             # 将 OpenAI 限流错误格式化为可读提示，避免前端展示原始异常串
@@ -1264,6 +1270,15 @@ async def _stream_agent_reply(
             if itype == "error":
                 status = "error"
                 full_parts.append(item.get("content", ""))
+                break
+            if itype == "ask_paused":
+                # AskUserQuestion 已提问，本轮暂停（agent 归闲，等用户作答后唤醒）
+                _close_thinking()
+                _close_text()
+                status = "paused"
+                if flush_buf and workspace_id:
+                    _append_activity_log(workspace_id, f"[{_clock_now()}] {flush_buf}")
+                    flush_buf = ""
                 break
             if itype == "thinking":
                 content = item.get("content", "")
@@ -1523,7 +1538,8 @@ async def _process_member_message(
                               leader_id=leader_id,
                               top_agent_id=top_agent_id,
                               member_system_prompt=member_system_prompt,
-                              session_id=session_id)
+                              session_id=session_id,
+                              is_member=True)
         restored = load_context(user_id, agent_id, session_id)
         if restored:
             session.context = restored
@@ -1824,6 +1840,42 @@ async def _dispatch_user_message(user_id: str, data: Dict[str, Any]) -> None:
         asyncio.create_task(_handle_user_message(user_id, data))
 
 
+async def resume_after_answer(
+    user_id: str,
+    agent_id: str,
+    top_agent_id: str,
+    session_id: str,
+    answer: str,
+    is_member: bool,
+) -> None:
+    """AskUserQuestion 作答后的唤醒：注入答案并重新触发该 agent 执行。
+
+    agent 提问后暂停归闲、上下文已持久化（含 assistant tool_calls + 占位
+    tool 结果）。这里把答案作为一条"用户回答"消息经既有 broker/消息派发
+    通道重新投递给该 agent，使其续跑原任务。
+
+    - 成员：经 ``_dispatch_agent_message``（team_broker）分发，需
+      ``top_agent_id`` 解析 roster。
+    - 主 agent：经 ``_dispatch_user_message``（top_chat_broker）分发。
+    """
+    content = f"[AskUserQuestion 用户回答] {answer}"
+    try:
+        if is_member:
+            await asyncio.to_thread(
+                _dispatch_agent_message,
+                user_id, [agent_id], content,
+                top_agent_id, top_agent_id, "",
+                {"session_id": session_id},
+            )
+        else:
+            await _dispatch_user_message(user_id, {
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "content": content,
+            })
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("唤醒 agent 失败: %s agent=%s", exc, agent_id)
+
 
 async def _handle_user_message(
     user_id: str, data: Dict[str, Any], queue: Optional[asyncio.Queue] = None
@@ -2008,6 +2060,11 @@ async def _handle_user_message(
             if workspace_id:
                 _append_activity_log(
                     workspace_id, f"[{_clock_now()}] [stopped] 已停止"
+                )
+        elif stream_status == "paused":
+            if workspace_id:
+                _append_activity_log(
+                    workspace_id, f"[{_clock_now()}] [wait] 已提问，等待用户回答"
                 )
         elif stream_status == "error":
             if workspace_id:
