@@ -219,6 +219,9 @@ def register_builtin_tools(
         ask_tool.bind_loop(asyncio.get_running_loop())
     except RuntimeError:
         pass
+    # 挂载 team_tool 到会话：成员 tool loop 结束时 chat 侧通过 leader 会话
+    # 调 mark_member_idle 复位持久化 work_status（roster 文件 + team_members 表）
+    session.team_tool = team_tool
     # Spec 工具：检索/选择/读取/创建/更新任务型规范（挂 hook 到当前会话）
     spec_tool = SpecTool(
         io, workspace_id, user_id=user_id, agent_id=agent_id, session_id=session_id,

@@ -822,6 +822,28 @@ async def _send_status_idle(
     )
 
 
+def _reset_member_work_status(
+    user_id: str, leader_id: str, member_id: str, session_id: str = DEFAULT_SESSION
+) -> None:
+    """成员 tool loop 结束后复位其持久化 work_status 为 idle。
+
+    ``work_status`` 有三处状态：leader 的 team_tool 内存态（self.members）、
+    roster 文件（``.self/team_roster.md``）、team_members 表（权威源）。
+    ``complete_task`` 依赖成员显式调用才能切回 idle，但成员 tool loop 自然结束
+    （回复完成）时往往无人调用，导致 UI 一直显示"工作中"。此处通过 leader
+    会话上挂载的 team_tool.mark_member_idle 三方统一复位。
+    """
+    if not leader_id or not member_id:
+        return
+    try:
+        leader_session = get_session(user_id, leader_id, session_id)
+        team_tool = getattr(leader_session, "team_tool", None)
+        if team_tool is not None:
+            team_tool.mark_member_idle(member_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("复位成员 %s 工作状态失败: %s", member_id, exc)
+
+
 async def _send_status_working(
     user_id: str, agent_id: str, session_id: str = DEFAULT_SESSION
 ) -> None:
@@ -1394,6 +1416,11 @@ async def _process_member_message(
     finally:
         _clear_active_task(user_id, agent_id, session_id)
         await _send_status_idle(user_id, agent_id, session_id)
+        # 复位持久化 work_status 为 idle：成员完成本轮 tool loop 后，若其
+        # 状态仍停留在 working（leader 未调用 complete_task 时），teammates
+        # API/UI 会一直显示"工作中"。这里通过 leader 会话的 team_tool 把
+        # 内存态 + roster 文件 + team_members 表三方统一复位为 idle。
+        _reset_member_work_status(user_id, leader_id, agent_id, session_id)
 
     # 持久化上下文（成员回复已实时写入工作空间活动日志，供 leader 查看）
     try:

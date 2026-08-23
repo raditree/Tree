@@ -842,6 +842,31 @@ class TeamTool:
         return members
 
     # ------------------------------------------------------------------
+    # SubTask 7.2: 成员工作状态复位（成员 tool loop 结束时由 chat 调用）
+    # ------------------------------------------------------------------
+    def mark_member_idle(self, member_id: str) -> None:
+        """将成员工作状态复位为空闲（内存态 + roster 文件 + team_members 表）。
+
+        成员完成一轮 tool loop（回复/工具循环自然结束）后，若其持久化
+        ``work_status`` 仍停留在 ``working``，会导致 teammates API / UI 一直
+        显示"工作中"。此方法在 ``chat._process_member_message`` 结束时被调用，
+        把三方状态统一复位为 idle，保证工作状态与实际执行一致。
+
+        :param member_id: 成员 ID
+        """
+        member = self._find_member(member_id)
+        if member is None:
+            return
+        if member.get("work_status") != "working":
+            return
+        member["work_status"] = "idle"
+        member["current_task"] = ""
+        self._save_roster()
+        self._sync_member_to_team_store(
+            member["id"], work_status="idle", current_task=""
+        )
+
+    # ------------------------------------------------------------------
     # SubTask 7.3: 多维评分机制
     # ------------------------------------------------------------------
     def update_member_score(
@@ -1652,6 +1677,10 @@ class TeamTool:
         member["work_status"] = "working"
         member["current_task"] = description
         self._save_roster()
+        # 同步到 team_store 权威名单，保证 roster 文件与 DB 一致
+        self._sync_member_to_team_store(
+            member["id"], work_status="working", current_task=description
+        )
         # 投递给成员，触发其异步串行处理任务
         dispatched = self._dispatch_to_member(member, description)
 
@@ -1697,6 +1726,9 @@ class TeamTool:
         if member is not None:
             member["work_status"] = "idle"
             member["current_task"] = ""
+            self._sync_member_to_team_store(
+                member["id"], work_status="idle", current_task=""
+            )
 
         # 更新成员管理表（父 agent 评分通过 update_member_score 单独触发）
         self._save_roster()
