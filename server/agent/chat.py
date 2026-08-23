@@ -570,7 +570,10 @@ def _build_spec_maintenance_text() -> str:
         "- 任务完成后（complex/hard 且无适用 Spec）：spec create 补充对应 Spec"
         "（hard 强制，缺则任务未闭环）。\n"
         "- 中途新增选择：spec select 挂 hook，下次重构 context（compact/新建会话）"
-        "自动注入全文；立即使用请用 spec read 取全文进对话上下文。"
+        "自动注入全文；立即使用请用 spec read 取全文进对话上下文。\n"
+        "- **select 前置**：select 任何 Spec 前必须先 read 对应 Spec（本会话内），"
+        "未 read 直接 select 会被工具拒绝（返回 error 提示先 read）；"
+        "read 后即可 select 挂 hook。"
     )
 
 

@@ -69,6 +69,9 @@ class SpecTool:
         self.user_id = user_id
         self.agent_id = agent_id
         self.session_id = session_id
+        # 本会话已 read 过的 Spec id（select 前置校验：select 前必须先 read）。
+        # 实例按会话创建，随会话生命周期存活；compact/重建会话后需重新 read。
+        self._read_spec_ids: set = set()
 
     # ------------------------------------------------------------------
     # 工具定义
@@ -269,6 +272,8 @@ class SpecTool:
         content = self._read_spec_content(spec_id)
         if content is None:
             return {"error": f"Spec 不存在: {spec_id}（可先 list/search 查看可用 id）"}
+        # 记录本会话已 read 的 spec：select 前置校验依赖（select 前必须先 read）
+        self._read_spec_ids.add(spec_id)
         return {"action": "read", "spec_id": spec_id, "content": content}
 
     def _action_select(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -285,6 +290,16 @@ class SpecTool:
             missing = [sid for sid in spec_ids if self._read_spec_content(sid) is None]
             if missing:
                 return {"error": f"Spec 不存在: {missing}（可先 list/search 查看可用 id）"}
+            # 校验全部已在本会话 read 过：select 前必须先 read 对应 Spec，
+            # 未 read 直接 select 会被拒绝（防止未读全文就挂 hook）。
+            not_read = [sid for sid in spec_ids if sid not in self._read_spec_ids]
+            if not_read:
+                return {
+                    "error": (
+                        f"select 前必须先 read 对应 Spec: {not_read}"
+                        "（请先 spec read 取全文，再 select 挂 hook）"
+                    )
+                }
         set_selected_spec_ids(self.user_id, self.session_id, spec_ids)
         if not spec_ids:
             return {
