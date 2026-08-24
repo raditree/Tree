@@ -5,7 +5,7 @@ import '../models/agent.dart';
 /// Agent 列表项组件
 ///
 /// 渲染单个 Agent 信息行，包含头像、名称、最后消息预览、时间与未读数。
-/// 头像为蓝色背景。选中时整行高亮浅蓝背景。
+/// 头像为主色（随主题）背景。选中时整行高亮 primaryContainer 背景。
 class AgentListItem extends StatelessWidget {
   /// 对应的 Agent 数据
   final Agent agent;
@@ -15,9 +15,6 @@ class AgentListItem extends StatelessWidget {
 
   /// 点击回调
   final VoidCallback? onTap;
-
-  /// 头像背景色（深蓝 #2563EB）
-  static const Color _normalAvatarColor = Color(0xFF2563EB);
 
   /// 未读数红色徽章背景色
   static const Color _unreadBadgeColor = Color(0xFFEF4444);
@@ -41,7 +38,7 @@ class AgentListItem extends StatelessWidget {
           child: Row(
             children: [
               // 左侧头像
-              _buildAvatar(),
+              _buildAvatar(context),
               const SizedBox(width: 10),
               // 中间名称与消息预览
               Expanded(
@@ -102,8 +99,10 @@ class AgentListItem extends StatelessWidget {
   }
 
   /// 构建头像（圆形 40x40）
-  Widget _buildAvatar() {
+  Widget _buildAvatar(BuildContext context) {
     final String initial = _getInitial(agent.name);
+    // 头像背景跟随主题主色（浅色 #00904A / 深色 #00FF8C），文字用 onPrimary
+    final cs = Theme.of(context).colorScheme;
 
     return SizedBox(
       width: 40,
@@ -115,15 +114,15 @@ class AgentListItem extends StatelessWidget {
           Container(
             width: 40,
             height: 40,
-            decoration: const BoxDecoration(
-              color: _normalAvatarColor,
+            decoration: BoxDecoration(
+              color: cs.primary,
               shape: BoxShape.circle,
             ),
             alignment: Alignment.center,
             child: Text(
               initial,
-              style: const TextStyle(
-                color: Colors.white,
+              style: TextStyle(
+                color: cs.onPrimary,
                 fontSize: 16,
                 fontWeight: FontWeight.w600,
               ),

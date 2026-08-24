@@ -3,6 +3,9 @@
 通过 :class:`core.workspace_io.WorkspaceIO` 读取文件、在 Python 中执行
 精确字符串替换后写回文件。要求 ``old_text`` 在文件中唯一匹配。
 与 read / write / terminal 同为内置工具，直接走 LLM 工具循环，不经 MCP。
+
+自动兼容 LF / CRLF 换行：文件为 CRLF 时，old_text / new_text 会按 CRLF
+归一后再匹配与写回（LLM 传参通常为 LF），无需预先转换文件换行符。
 """
 
 import logging
@@ -53,7 +56,8 @@ class EditTool:
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "要编辑的文件路径（工作空间内相对路径）",
+                            "description": "工作空间内相对路径（如 lib/foo.dart）；"
+                            "禁止绝对路径或盘符（如 E:\\foo.dart、E:/foo.dart 会被拒绝）",
                         },
                         "old_text": {
                             "type": "string",
@@ -86,7 +90,11 @@ class EditTool:
         if not isinstance(file_path, str) or not file_path:
             return {"error": "file_path 不能为空"}
         if not self._is_valid_path(file_path):
-            return {"error": "非法文件路径，仅允许字母数字、/_-. 字符"}
+            return {
+                "error": "非法文件路径：必须为工作空间内相对路径（如 lib/foo.dart），"
+                "禁止绝对路径/盘符（如 E:\\foo.dart、E:/foo.dart）或 .. 回溯；"
+                "仅允许字母数字、/_-. 字符",
+            }
 
         old_text = arguments.get("old_text")
         if not isinstance(old_text, str):
@@ -101,8 +109,15 @@ class EditTool:
             return {"error": read_result["error"], "file_path": file_path}
         content = read_result.get("content", "")
 
+        # 1.5 换行容错：文件为 CRLF 时，把 old/new 统一转为 CRLF 再匹配，
+        #     使 edit 对 LF/CRLF 文件一视同仁（LLM 传参通常为 LF），
+        #     避免 CRLF 文件「未找到匹配」需手动转 LF 或脚本替换。
+        eol = "\r\n" if "\r\n" in content else "\n"
+        needle = old_text.replace("\r\n", "\n").replace("\n", eol)
+        replacement = new_text.replace("\r\n", "\n").replace("\n", eol)
+
         # 2. 统计匹配次数
-        match_count = content.count(old_text)
+        match_count = content.count(needle)
         if match_count == 0:
             logger.info("edit 工具未找到匹配文本: %s", file_path)
             return {"error": "未找到匹配的文本", "file_path": file_path}
@@ -116,8 +131,8 @@ class EditTool:
                 "match_count": match_count,
             }
 
-        # 3. 执行替换并写回
-        new_content = content.replace(old_text, new_text, 1)
+        # 3. 执行替换并写回（needle/replacement 已按文件换行风格归一）
+        new_content = content.replace(needle, replacement, 1)
         write_result = self._write_tool.execute({
             "file_path": file_path,
             "content": new_content,

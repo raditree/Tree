@@ -349,6 +349,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
   /// 修改密码卡片
   Widget _buildChangePasswordCard() {
+    final cs = Theme.of(context).colorScheme;
     return Card(
       margin: EdgeInsets.zero,
       child: Padding(
@@ -362,7 +363,6 @@ class _SettingsPageState extends State<SettingsPage> {
               decoration: const InputDecoration(
                 labelText: '当前密码',
                 prefixIcon: Icon(Icons.lock_outline, size: 20),
-                border: OutlineInputBorder(),
                 isDense: true,
               ),
             ),
@@ -373,7 +373,6 @@ class _SettingsPageState extends State<SettingsPage> {
               decoration: const InputDecoration(
                 labelText: '新密码',
                 prefixIcon: Icon(Icons.lock, size: 20),
-                border: OutlineInputBorder(),
                 isDense: true,
               ),
             ),
@@ -384,7 +383,6 @@ class _SettingsPageState extends State<SettingsPage> {
               decoration: const InputDecoration(
                 labelText: '确认新密码',
                 prefixIcon: Icon(Icons.lock, size: 20),
-                border: OutlineInputBorder(),
                 isDense: true,
               ),
             ),
@@ -394,16 +392,16 @@ class _SettingsPageState extends State<SettingsPage> {
               child: ElevatedButton.icon(
                 onPressed: _changingPassword ? null : _changePassword,
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF2563EB),
-                  foregroundColor: Colors.white,
+                  backgroundColor: cs.primary,
+                  foregroundColor: cs.onPrimary,
                 ),
                 icon: _changingPassword
-                    ? const SizedBox(
+                    ? SizedBox(
                         width: 16,
                         height: 16,
                         child: CircularProgressIndicator(
                           strokeWidth: 2,
-                          color: Colors.white,
+                          color: cs.onPrimary,
                         ),
                       )
                     : const Icon(Icons.lock_reset, size: 18),
@@ -434,7 +432,6 @@ class _SettingsPageState extends State<SettingsPage> {
                       labelText: 'IP 地址',
                       hintText: 'localhost',
                       prefixIcon: Icon(Icons.dns_outlined, size: 20),
-                      border: OutlineInputBorder(),
                       isDense: true,
                     ),
                   ),
@@ -448,7 +445,6 @@ class _SettingsPageState extends State<SettingsPage> {
                     decoration: const InputDecoration(
                       labelText: '端口',
                       hintText: '8000',
-                      border: OutlineInputBorder(),
                       isDense: true,
                     ),
                   ),
@@ -467,7 +463,7 @@ class _SettingsPageState extends State<SettingsPage> {
             const SizedBox(height: 4),
             const Text(
               '修改后需重启应用生效',
-              style: TextStyle(fontSize: 12, color: Colors.black54),
+              style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
             ),
           ],
         ),
@@ -477,6 +473,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
   /// 数据收集卡片
   Widget _buildDataCollectionCard() {
+    final cs = Theme.of(context).colorScheme;
     return Card(
       margin: EdgeInsets.zero,
       child: Padding(
@@ -499,7 +496,7 @@ class _SettingsPageState extends State<SettingsPage> {
                         _dataCollectionEnabled
                             ? '已开启，仅保存开启期间的使用数据快照'
                             : '关闭状态，不会收集任何使用数据',
-                        style: const TextStyle(fontSize: 12, color: Colors.black54),
+                        style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
                       ),
                     ],
                   ),
@@ -507,7 +504,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 Switch(
                   value: _dataCollectionEnabled,
                   onChanged: _toggleDataCollection,
-                  activeColor: const Color(0xFF2563EB),
+                  activeColor: cs.primary,
                 ),
               ],
             ),
@@ -522,6 +519,7 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 开启后限制单个 agent 的 API 调用频率（平均 6 次/分钟），
   /// 适合交互式开发——放慢 agent 节奏，让用户跟得上每个步骤。
   Widget _buildRateLimitCard() {
+    final cs = Theme.of(context).colorScheme;
     return Card(
       margin: EdgeInsets.zero,
       child: Padding(
@@ -541,7 +539,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     _rateLimitEnabled
                         ? '已开启：限制单个 agent 的 API 调用频率（平均 6 次/分钟），适合交互式开发'
                         : '关闭：API 调用不限速',
-                    style: const TextStyle(fontSize: 12, color: Colors.black54),
+                    style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
                   ),
                 ],
               ),
@@ -549,7 +547,7 @@ class _SettingsPageState extends State<SettingsPage> {
             Switch(
               value: _rateLimitEnabled,
               onChanged: _toggleRateLimit,
-              activeColor: const Color(0xFF2563EB),
+              activeColor: cs.primary,
             ),
           ],
         ),
@@ -567,7 +565,7 @@ class _SettingsPageState extends State<SettingsPage> {
           padding: EdgeInsets.all(16),
           child: Text(
             '无法获取账号状态，请稍后重试',
-            style: TextStyle(fontSize: 13, color: Colors.black54),
+            style: TextStyle(fontSize: 13, color: Color(0xFF94A3B8)),
           ),
         ),
       );
@@ -589,7 +587,7 @@ class _SettingsPageState extends State<SettingsPage> {
               const SizedBox(height: 4),
               const Text(
                 '倒计时期间功能照常，倒计时结束后数据保留 31 天再彻底删除。',
-                style: TextStyle(fontSize: 12, color: Colors.black54),
+                style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
               ),
               const SizedBox(height: 12),
               SizedBox(
@@ -620,7 +618,7 @@ class _SettingsPageState extends State<SettingsPage> {
           padding: const EdgeInsets.all(16),
           child: Text(
             '账号已注销，数据将在 $daysLeft 天后彻底删除，无法恢复。',
-            style: const TextStyle(fontSize: 13, color: Colors.black54),
+            style: const TextStyle(fontSize: 13, color: Color(0xFF94A3B8)),
           ),
         ),
       );
@@ -636,7 +634,7 @@ class _SettingsPageState extends State<SettingsPage> {
           children: [
             const Text(
               '注销后账号数据将按「十日倒计时 → 保留 31 天 → 彻底删除」流程处理。',
-              style: TextStyle(fontSize: 12, color: Colors.black54),
+              style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
             ),
             const SizedBox(height: 12),
             SizedBox(
@@ -670,13 +668,14 @@ class _SettingsPageState extends State<SettingsPage> {
       style: const TextStyle(
         fontSize: 14,
         fontWeight: FontWeight.w600,
-        color: Colors.black54,
+        color: Color(0xFF94A3B8),
       ),
     );
   }
 
   /// 账号管理卡片
   Widget _buildAccountCard() {
+    final cs = Theme.of(context).colorScheme;
     if (_loadingUser) {
       return const Card(
         margin: EdgeInsets.zero,
@@ -704,15 +703,15 @@ class _SettingsPageState extends State<SettingsPage> {
               children: [
                 CircleAvatar(
                   radius: 24,
-                  backgroundColor: const Color(0xFF2563EB),
+                  backgroundColor: cs.primary,
                   backgroundImage: avatar.isNotEmpty
                       ? NetworkImage(avatar)
                       : null,
                   child: avatar.isEmpty
                       ? Text(
                           nickname.isNotEmpty ? nickname.substring(0, 1) : '?',
-                          style: const TextStyle(
-                            color: Colors.white,
+                          style: TextStyle(
+                            color: cs.onPrimary,
                             fontSize: 18,
                           ),
                         )
@@ -735,7 +734,7 @@ class _SettingsPageState extends State<SettingsPage> {
                         'openid: $openid',
                         style: const TextStyle(
                           fontSize: 12,
-                          color: Colors.black54,
+                          color: Color(0xFF94A3B8),
                         ),
                         overflow: TextOverflow.ellipsis,
                       ),
@@ -814,6 +813,7 @@ class _SettingsPageState extends State<SettingsPage> {
     return AnimatedBuilder(
       animation: themeService,
       builder: (BuildContext context, _) {
+        final cs = Theme.of(context).colorScheme;
         return RadioListTile<ThemeMode>(
           value: mode,
           groupValue: themeService.mode,
@@ -822,8 +822,8 @@ class _SettingsPageState extends State<SettingsPage> {
               themeService.setMode(value);
             }
           },
-          activeColor: const Color(0xFF2563EB),
-          secondary: Icon(icon, color: const Color(0xFF2563EB)),
+          activeColor: cs.primary,
+          secondary: Icon(icon, color: cs.primary),
           title: Text(title),
           subtitle: Text(subtitle),
         );

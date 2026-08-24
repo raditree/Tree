@@ -100,7 +100,8 @@ class ReadTool:
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "要读取的文件路径（工作空间内相对路径）",
+                            "description": "工作空间内相对路径（如 lib/foo.dart）；"
+                            "禁止绝对路径或盘符（如 E:\\foo.dart、E:/foo.dart 会被拒绝）",
                         },
                         "encoding": {
                             "type": "string",
@@ -150,11 +151,15 @@ class ReadTool:
         is_image = bool(arguments.get("image")) or ext in _IMAGE_EXTS
         if is_image:
             if not self._is_valid_image_path(file_path):
-                return {"error": "非法图像路径"}
+                return {"error": "非法图像路径：必须为工作空间内相对路径，禁止绝对路径/盘符（如 C:\\file.png）、.. 回溯与 shell 元字符"}
             return self._read_image(file_path)
 
         if not self._is_valid_path(file_path):
-            return {"error": "非法文件路径，仅允许字母数字、/_-. 字符"}
+            return {
+                "error": "非法文件路径：必须为工作空间内相对路径（如 lib/foo.dart），"
+                "禁止绝对路径/盘符（如 E:\\foo.dart、E:/foo.dart）或 .. 回溯；"
+                "仅允许字母数字、/_-. 字符",
+            }
 
         encoding = arguments.get("encoding", "utf-8") or "utf-8"
 

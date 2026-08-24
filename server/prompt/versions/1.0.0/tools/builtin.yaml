@@ -1,37 +1,38 @@
 # 系统内置工具描述（v1.0.0，单一事实来源；tool/*.py 的 get_tool_definition 引用之）
 # 结构化模板：title | 贡献维度 + 何时使用/何时不用/前置依赖/动作
 read:
-  version: 1
+  version: 2
   description: |
     [读取工作空间文件内容] | 贡献维度: 上下文获取（获取文件/代码/配置现状，是所有修改与判断的前提）
     何时使用: 修改任何文件前必须先 read 看清楚当前内容；查找代码/配置/文档内容；排查问题时读取相关文件；读取图像文件（png/jpg/jpeg/webp/gif，自动识别并返回 base64）
     何时不用: 已确定文件内容无需重读；大目录浏览用 Terminal ls
-    前置依赖: 文件必须存在于工作空间
+    前置依赖: 文件必须存在于工作空间；file_path 必须为工作空间内相对路径（如 lib/foo.dart），禁止绝对路径或盘符（如 E:\foo.dart、E:/foo.dart 会被拒绝）
     省钱技巧: 大文件用 start_line/line_count 只读需要的行为表/函数，避免整文件全读占用大量上下文
 
 write:
-  version: 1
+  version: 2
   description: |
     [向工作空间写入文件，自动创建父目录] | 贡献维度: 文件产出（创建新文件/脚本/文档/配置文件）
     何时使用: 新建文件（如新模块、新脚本、新文档、配置文件）；整文件重写（WriteFile 覆盖）；生成批量内容
     何时不用: 已有文件的小改动（用 edit 保留上下文）；创建目录/删除文件用 Terminal
-    前置依赖: 工作空间可写；写入前建议先 read 确认是否已有同名文件
+    前置依赖: 工作空间可写；file_path 必须为工作空间内相对路径（如 lib/foo.dart），禁止绝对路径或盘符（如 E:\foo.dart、E:/foo.dart 会被拒绝）；写入前建议先 read 确认是否已有同名文件
 
 edit:
-  version: 1
+  version: 3
   description: |
     [对工作空间文件执行精确字符串替换] | 贡献维度: 文件产出（对已有文件做局部精准修改，保留其余内容）
-    何时使用: 修改已有文件的某段内容（改逻辑/文案/参数）；old_text 必须在文件中唯一匹配，否则返回错误
+    何时使用: 修改已有文件的某段内容（改逻辑/文案/参数）；old_text 必须在文件中唯一匹配，否则返回错误；自动兼容 LF/CRLF 换行文件（无需手动转换）
     何时不用: 新建文件用 write；大段重写用 write 覆盖；不确定匹配内容时先 read 确认
-    前置依赖: 文件已存在；编辑前应先 read 拿到准确的 old_text
+    前置依赖: 文件已存在；file_path 必须为工作空间内相对路径（如 lib/foo.dart），禁止绝对路径或盘符（如 E:\foo.dart、E:/foo.dart 会被拒绝）；编辑前应先 read 拿到准确的 old_text
 
 terminal:
-  version: 1
+  version: 2
   description: |
     [在工作空间执行 shell 命令（含 git）] | 贡献维度: 环境执行（运行构建/测试/安装/文件操作，验证与运维的唯一途径）
     何时使用: 运行构建与测试（验证改动）；安装依赖；git 操作；文件/目录管理（ls/mkdir/rm）；运行脚本；查看环境
     何时不用: 读/写/改文件内容用 read/write/edit（更精确、可追溯）；仅需内容查看时避免用 cat 取代 read
     前置依赖: 命令须符合当前执行环境的 shell 语法（cloud=sh；local Windows=cmd.exe；ssh=远端 shell，见 system prompt）
+    输出捕获: hook 模式与普通模式下 stdout/stderr 都会被工具自动捕获并返回，命令中无需追加 2>&1（hook 模式还会把错误输出重定向到 output_file 日志，追加 2>&1 属冗余，且可能干扰 Windows 管道行为）
     长任务（hook 模式）: 对构建/测试/长脚本等预计很长的命令，传 hook=true 以后台模式执行——输出实时重定向到
       output_file（工作空间相对路径，缺省自动派生 .output/hook_<id>.log），工具立即返回 task_id 不阻塞本
       轮；命令结束后会自动收到 [terminal hook] 提示（含退出码与输出文件），届时用 read 工具读取该文件继续

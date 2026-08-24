@@ -23,3 +23,9 @@ changelog:
       - "内置 / MCP 工具描述统一到结构化模板（贡献维度/何时使用/何时不用/前置依赖/动作），登记工具提示词版本清单。"
       - "内置 Spec 补充 version / changelog / classification 前端字段，规范可追溯、可回滚。"
       - "上下文压缩器 prompt 改为集中式版本化常量（llm.py 引用）。"
+  - version: "1.0.0"
+    date: "2026-08-24"
+    scope: "tool"
+    changes:
+      - "内置 read/write/edit 工具描述与参数说明明确 file_path 必须为工作空间内相对路径、禁止绝对路径或盘符（如 E:\\foo.dart / E:/foo.dart）；非法路径错误提示补充修复引导，便于模型自纠。"
+      - "edit 工具新增 CRLF 自动容错：文件为 CRLF 时 old_text/new_text 自动按 CRLF 归一后匹配与写回（LLM 传参通常为 LF），无需手动转换文件换行；描述同步标注。"

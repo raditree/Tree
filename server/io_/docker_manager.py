@@ -443,6 +443,13 @@ class DockerManager:
                 volume = self.client.volumes.create(name=volume_name)
             # 2. 启动容器，挂载卷并设置资源配额
             cpu_quota = int(float(self.cpu_limit) * 100000)
+            # 沙箱网络与容器加固：
+            # - 白名单模式（network_enabled 且 whitelist 非空）：需 root + NET_ADMIN
+            #   配置 iptables 白名单，维持现状；
+            # - 放开+限流 / 完全放开模式（whitelist 为空）：改为非 root + 最小能力集
+            #   + no-new-privileges 运行，提升容器逃逸难度；出站代理仍做单次下载量
+            #   上限与访问日志（checklist 13/14）。
+            whitelist_mode = bool(self.network_enabled and self.network_whitelist)
             container = self.client.containers.run(
                 image=self.image,
                 name=container_name,
@@ -452,8 +459,14 @@ class DockerManager:
                 mem_limit=self.memory_limit,
                 detach=True,
                 tty=True,
-                # 白名单网络限制需 NET_ADMIN 能力配置 iptables（checklist 13）
-                cap_add=["NET_ADMIN"] if self.network_enabled else None,
+                # 非 root 运行（对应 Dockerfile 的 USER agent，uid 1000）；
+                # 白名单模式需 root 才能执行 iptables，故保留默认用户
+                user=("1000:1000" if not whitelist_mode else None),
+                # 最小能力集：默认丢弃全部；仅白名单模式需 NET_ADMIN 配置 iptables
+                cap_drop=["ALL"],
+                cap_add=["NET_ADMIN"] if whitelist_mode else None,
+                # 禁止 setuid/setgid 提权（防御已知提权漏洞）
+                security_opt=["no-new-privileges:true"],
                 # 经本地出站代理路由 HTTP/HTTPS，以限制单次下载数据量（checklist 14）
                 environment=(
                     _egress_proxy_env() if self.network_enabled else None
@@ -1769,6 +1782,9 @@ def _build_egress_proxy_src(max_bytes: int, whitelist: List[str]) -> str:
         "    if host.startswith('['):\n"
         "        host = host.split(']')[-1]\n"
         "    host = host.split(':')[0]\n"
+        "    if not WHITELIST:\n"
+        "        # 放开模式：白名单为空时不封域名，仅保留单次下载量上限与访问日志\n"
+        "        return True\n"
         "    for w in WHITELIST:\n"
         "        w = w.strip().lower()\n"
         "        if w == host:\n"
@@ -1830,6 +1846,7 @@ def _build_egress_proxy_src(max_bytes: int, whitelist: List[str]) -> str:
         "            if not _allowed(hp):\n"
         "                client.sendall(b'HTTP/1.1 403 Forbidden\\r\\n\\r\\n')\n"
         "                client.close(); return\n"
+        "            print('egress CONNECT', hp + ':' + str(port))\n"
         "            try:\n"
         "                up = socket.create_connection((hp, port), timeout=30)\n"
         "            except Exception:\n"
@@ -1850,6 +1867,7 @@ def _build_egress_proxy_src(max_bytes: int, whitelist: List[str]) -> str:
         "            if not _allowed(headers.get('host', host).split(':')[0]):\n"
         "                client.sendall(b'HTTP/1.1 403 Forbidden\\r\\n\\r\\n')\n"
         "                client.close(); return\n"
+        "            print('egress', method, host + ':' + str(port) + path)\n"
         "            try:\n"
         "                up = socket.create_connection((host, port), timeout=30)\n"
         "            except Exception:\n"
@@ -1869,6 +1887,7 @@ def _build_egress_proxy_src(max_bytes: int, whitelist: List[str]) -> str:
         "        t1 = threading.Thread(target=_copy, args=(client, up, up_ct, 10**18), daemon=True)\n"
         "        t2 = threading.Thread(target=_copy, args=(up, client, down_ct, LIMIT), daemon=True)\n"
         "        t1.start(); t2.start(); t1.join(); t2.join()\n"
+        "        print('egress download', method, host, 'down_bytes=' + str(down_ct[0]))\n"
         "    except Exception:\n"
         "        pass\n"
         "    finally:\n"

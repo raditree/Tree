@@ -335,21 +335,27 @@ class LocalWorkspaceIO(WorkspaceIO):
     ``asyncio.to_thread`` 切线程执行。
     """
 
-    def __init__(self, local_executor: Any, ws_manager: Any, user_id: str) -> None:
+    def __init__(self, local_executor: Any, ws_manager: Any, user_id: str,
+                 agent_id: str = "") -> None:
         """初始化本地 IO。
 
         :param local_executor: LocalExecutorClient 实例
         :param ws_manager: WebSocketManager 实例
         :param user_id: 用户标识（用于反向 WS 通道）
+        :param agent_id: 顶部 agent ID（mode key），随 ``tool_exec_request``
+            透传，供前端执行器校验请求归属（避免其他 agent 的 SSH 执行器
+            误接管本 agent 的请求）
         """
         self._executor = local_executor
         self._ws_manager = ws_manager
         self._user_id = user_id
+        self._agent_id = agent_id
 
     async def _request(self, workspace_id: str, op: str, **kwargs: Any) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "op": op,
             "workspace_id": workspace_id,
+            "top_agent_id": self._agent_id,
             **kwargs,
         }
         return await asyncio.to_thread(
@@ -411,6 +417,7 @@ class LocalWorkspaceIO(WorkspaceIO):
                 "op": "exec_shell_hook",
                 "workspace_id": workspace_id,
                 "exec_id": exec_id,
+                "top_agent_id": self._agent_id,
                 "command": command,
                 "output_file": output_file,
                 "timeout": timeout,

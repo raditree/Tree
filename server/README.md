@@ -131,11 +131,13 @@ server/
 
 ## 沙箱网络与下载限制
 
-- **白名单式出站网络**：容器获得 `NET_ADMIN`，通过 iptables 仅放行白名单主机（`sandbox.network.whitelist`）的 80/443，其余出站 DROP。
-- **单次下载上限**：容器内置出站代理（`127.0.0.1:3128`），`http_proxy/https_proxy` 环境变量路由所有 HTTP/HTTPS 流量，每次下载（下行方向）超过 `sandbox.network.max_download_size`（默认 `900m`，<1G）即截断。
+- **放开 + 限流代理（默认，`whitelist: []`）**：沙箱可自由访问公网，不再封域名；容器内置出站代理（`127.0.0.1:3128`），`http_proxy`/`https_proxy` 环境变量路由所有 HTTP/HTTPS 流量，每次下载（下行方向）超过 `sandbox.network.max_download_size`（默认 `900m`，<1G）即截断；访问日志写入容器内 `/tmp/egress_proxy.log`。
+- **白名单式出站（可选，`whitelist` 非空）**：容器获得 `NET_ADMIN`，通过 iptables 仅放行白名单主机（`sandbox.network.whitelist`）的 80/443，其余出站 DROP。
 - **磁盘软上限告警**：工作空间占用接近 `upload.sandbox_max_size` 时，系统提示词提示清理。
+- **容器加固**：放开模式下容器以非 root（uid 1000）运行、`cap_drop ALL`（仅白名单模式加 `NET_ADMIN`）、`no-new-privileges`，提升容器逃逸难度。
 
-> `agent-workspace:latest` 镜像需包含 `git` 与 `iptables`；旧镜像重建后白名单 iptables 层才生效。
+> 修改 `sandbox.network` 或容器加固后需重建镜像：`docker build -t agent-workspace:latest docker/`。
+> 注意：旧镜像/旧工作空间卷为 root 属主，升级后非 root 容器无法写入旧卷，需重建工作空间（或对旧卷执行 `docker run --rm -v <vol>:/data alpine chown -R 1000:1000 /data`）。
 
 ---
 

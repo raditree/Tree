@@ -413,11 +413,11 @@ class _GitHistoryState extends State<GitHistory>
                   color: cs.primary,
                   borderRadius: BorderRadius.circular(4),
                 ),
-                child: const Text(
+                child: Text(
                   '当前',
                   style: TextStyle(
                     fontSize: 10,
-                    color: Colors.white,
+                    color: cs.onPrimary,
                     fontWeight: FontWeight.w600,
                   ),
                 ),

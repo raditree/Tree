@@ -106,6 +106,9 @@ class LocalExecutorService extends ChangeNotifier {
   bool _registered = false;
   bool get registered => _registered;
 
+  /// 当前服务的顶部 agent ID（供请求归属校验）
+  String get currentTopAgentId => _currentTopAgentId;
+
   /// 切换当前操作的顶部 agent，并重置其本地状态（下次 [loadSettings] 后生效）。
   ///
   /// 不会自动注销上一个顶部 agent——各顶部 agent 的本地模式相互独立，
@@ -123,6 +126,9 @@ class LocalExecutorService extends ChangeNotifier {
   Future<void> loadSettings() async {
     final String id = _currentTopAgentId;
     final prefs = await SharedPreferences.getInstance();
+    // 竞态防护：等待期间可能已切换顶部 agent，丢弃过期恢复结果
+    // （否则旧 agent 的持久化设置会被写回当前 agent 的内存态）
+    if (id != _currentTopAgentId) return;
     _enabled = prefs.getBool(_kEnabledKey(id)) ?? false;
     _baseDir = prefs.getString(_kWorkDirKey(id)) ?? '';
   }
@@ -284,15 +290,38 @@ class LocalExecutorService extends ChangeNotifier {
   /// 处理 ``tool_exec_request``，异步执行后回传 ``tool_exec_response``。
   ///
   /// 返回 `true` 表示已接管该请求（工具执行请求在本地模式下发到本端时
-  /// 总是由本处理者执行）；当前顶部 agent 处于 SSH 模式时返回 `false`，
-  /// 把请求放行给 SSH 执行器处理，避免本地与 SSH 双处理。
+  /// 总是由本处理者执行）；当前顶部 agent 处于 SSH 模式或本实例未启用
+  /// 本地模式时返回 `false`，把请求放行给 SSH 执行器 / 其他实例处理。
   bool _handleToolExecRequest(Map<String, dynamic> message) {
-    // SSH 模式守卫：当前顶部 agent 处于 SSH 模式时，工具请求交给 SSH 执行器
-    if (SshExecutorService.instance.enabled) return false;
     final Map<String, dynamic> data =
         (message['data'] as Map<String, dynamic>?) ?? <String, dynamic>{};
     final String execId = (data['exec_id'] as String?) ?? '';
     if (execId.isEmpty) return false;
+    // 归属校验：请求明确属于其他顶部 agent 时不接管（放行给对应执行器/实例）
+    final String reqAgent = (data['top_agent_id'] as String?) ?? '';
+    if (reqAgent.isNotEmpty && reqAgent != _currentTopAgentId) return false;
+    // SSH 模式守卫：当前顶部 agent 处于 SSH 模式时，工具请求交给 SSH 执行器
+    // （仅当 SSH 执行器服务的就是同一个 agent 时让位——防止残留其他 agent 的
+    // SSH 启用态把本地 agent 的请求误让给 SSH 通道）
+    if (SshExecutorService.instance.enabled &&
+        SshExecutorService.instance.currentTopAgentId == _currentTopAgentId) {
+      return false;
+    }
+    // 本地模式守卫：本实例未启用本地执行时不接管工具请求。同一用户可能
+    // 并行开多个前端实例（后端按 user_id 向该用户所有 WS 连接广播请求），
+    // 只有真正启用了本地模式的实例才执行——否则未配置的实例会以
+    // Directory.current（Windows 桌面打包运行时为 build\windows\runner\Release）
+    // 兜底执行并回传"文件不存在"错误，先于正确实例的成功结果到达后端。
+    if (!_enabled) return false;
+    // 已启用但未选择工作目录：明确报错，禁止用 Directory.current 兜底
+    // （打包运行时的当前目录是 exe 所在目录，工具会在错误位置执行）
+    if (_baseDir.isEmpty) {
+      _sendToolExecResponse(execId, <String, dynamic>{
+        'error': '本地模式未选择工作目录，请在标题栏选择目录后重试',
+        'exit_code': -1,
+      });
+      return true;
+    }
     final String workspaceId = (data['workspace_id'] as String?) ?? '';
     final String op = (data['op'] as String?) ?? '';
 
@@ -325,12 +354,16 @@ class LocalExecutorService extends ChangeNotifier {
     });
   }
 
-  /// hook 模式：分离进程后台执行长命令，输出实时重定向到 output_file。
+  /// hook 模式：分离进程后台执行长命令，输出实时写入 output_file。
   ///
   /// 与 [_execShell] 相同的 shell 解析（Unix/WSL= bash，Windows=cmd），但用
   /// [Process.start] 托管句柄（可被 [killProcess] 终止）且**不设超时**；进程
   /// 退出后回传真实退出码（不受后端 120s 等待上限约束）。启动失败立即回传
   /// 错误，避免后端挂起。
+  ///
+  /// 输出落盘：**不依赖 shell 重定向**——命令内 `cd` 会改变 cmd/bash 工作
+  /// 目录，后端拼的相对路径（.output/hook_x.log）会解析到错误位置导致空
+  /// 日志；本端改用绝对路径流式写入（stdout/stderr 管道 → 文件）。
   Future<void> _execShellHookDeferred(
     Directory wsDir,
     String execId,
@@ -344,11 +377,12 @@ class LocalExecutorService extends ChangeNotifier {
       });
       return;
     }
-    // 解析输出重定向文件绝对路径并确保父目录存在（命令内为相对路径重定向）
+    // 解析输出重定向文件绝对路径并确保父目录存在（后端已创建占位文件）
     final String outputFile = (data['output_file'] as String?) ?? '';
+    String fullOut = '';
     try {
       if (outputFile.isNotEmpty) {
-        final String fullOut = _resolveInWorkspace(wsDir, outputFile);
+        fullOut = _resolveInWorkspace(wsDir, outputFile);
         await File(fullOut).parent.create(recursive: true);
       }
     } catch (e) {
@@ -360,25 +394,86 @@ class LocalExecutorService extends ChangeNotifier {
     }
     final String workDir = wsDir.path;
     try {
+      // 以绝对路径打开输出 sink（覆盖写：丢弃后端占位文件的空内容）
+      final IOSink? sink = fullOut.isEmpty
+          ? null
+          : File(fullOut).openWrite();
       Process process;
       if (isUnixLikePath(workDir)) {
         // Unix/WSL 工作目录：Windows API 无法识别，改用 bash -lc "cd .. && .."
         final String bashBody = "cd '$workDir' && $command";
         process = await Process.start('bash', <String>['-lc', bashBody]);
-      } else {
-        final bool isWindows = Platform.isWindows;
+      } else if (Platform.isWindows) {
+        // Windows：命令写入临时 .bat 再执行——绕开 cmd /c 命令行对引号/
+        // 重定向/&& 的解析坑（Dart 进程参数引号处理会导致带引号命令的
+        // stdout 丢失，表现为 hook 日志为空），确保输出可靠进入管道
+        final String batPath =
+            '${Directory.systemTemp.path}${Platform.pathSeparator}'
+            'hook_${execId}_exec.bat';
+        await File(batPath).writeAsString('@echo off\r\n$command\r\n');
         process = await Process.start(
-          isWindows ? 'cmd' : 'sh',
-          isWindows ? <String>['/c', command] : <String>['-c', command],
+          'cmd',
+          <String>['/d', '/s', '/c', batPath],
+          workingDirectory: workDir,
+        );
+        // 进程退出后清理临时 bat（尽力而为，失败不影响任务）
+        process.exitCode.whenComplete(() {
+          try {
+            File(batPath).deleteSync();
+          } catch (_) {
+            // 忽略：临时文件残留无碍
+          }
+        });
+      } else {
+        process = await Process.start(
+          'sh',
+          <String>['-c', command],
           workingDirectory: workDir,
         );
       }
       _hookProcesses[execId] = process;
-      process.exitCode.then((int code) {
+      // 实时把 stdout/stderr 写入输出文件（不依赖 shell 重定向）。
+      // outputFile 为空时也无碍（hook_manager 总会生成），此处仍兜底。
+      final StringBuffer memOut = StringBuffer();
+      final Completer<void> outDone = Completer<void>();
+      final Completer<void> errDone = Completer<void>();
+      // 实时把 stdout/stderr 写入输出文件（不依赖 shell 重定向）。
+      // onDone 记录流结束，用于等待管道 EOF（进程退出时剩余数据仍在
+      // 事件循环队列中，过早关闭 sink 会丢失尾部输出）。
+      process.stdout.listen((List<int> chunk) {
+        if (sink != null) {
+          sink.add(chunk);
+        } else {
+          memOut.write(String.fromCharCodes(chunk));
+        }
+      }, onDone: () {
+        if (!outDone.isCompleted) outDone.complete();
+      }, cancelOnError: true);
+      process.stderr.listen((List<int> chunk) {
+        if (sink != null) {
+          sink.add(chunk);
+        } else {
+          memOut.write(String.fromCharCodes(chunk));
+        }
+      }, onDone: () {
+        if (!errDone.isCompleted) errDone.complete();
+      }, cancelOnError: true);
+      process.exitCode.then((int code) async {
         _hookProcesses.remove(execId);
+        // 等待 stdout/stderr 流 EOF 后再落盘回传：避免后端立刻读取
+        // 输出文件读到未刷新/缺失尾部的内容
+        try {
+          await Future.wait(<Future<void>>[outDone.future, errDone.future]);
+          if (sink != null) {
+            await sink.flush();
+            await sink.close();
+          }
+        } catch (_) {
+          if (sink != null) sink.close();
+        }
         _sendToolExecResponse(execId, <String, dynamic>{
           'exit_code': code,
-          'stdout': '',
+          'stdout': sink != null ? '' : memOut.toString(),
           'stderr': '',
         });
       });

@@ -45,6 +45,9 @@ class SshExecutorService extends ChangeNotifier {
   /// 当前选中的顶部 agent ID（SSH 模式按此单独控制）
   String _currentTopAgentId = '';
 
+  /// 当前服务的顶部 agent ID（供本地执行器等校验被服务方归属）
+  String get currentTopAgentId => _currentTopAgentId;
+
   /// SharedPreferences 键前缀（后接顶部 agent ID，实现按顶部 agent 持久化）
   static const String _kEnabledPrefix = 'ssh_exec_enabled_';
   static const String _kConfigPrefix = 'ssh_exec_config_';
@@ -81,7 +84,11 @@ class SshExecutorService extends ChangeNotifier {
   /// 从 SharedPreferences 恢复当前顶部 agent 的 SSH 模式设置
   Future<void> loadSettings() async {
     final String id = _currentTopAgentId;
+    // 竞态防护：等待期间可能已切换顶部 agent，丢弃过期恢复结果
+    // （否则旧 agent 的 SSH 启用态会被写回当前 agent 内存态，
+    // 造成本地 agent 的工具请求被残留 SSH 启用态误接管）
     final prefs = await SharedPreferences.getInstance();
+    if (id != _currentTopAgentId) return;
     _enabled = prefs.getBool(_kEnabledKey(id)) ?? false;
     final String? raw = prefs.getString(_kConfigKey(id));
     if (raw != null && raw.isNotEmpty) {
@@ -201,12 +208,20 @@ class SshExecutorService extends ChangeNotifier {
   /// 执行并回传 ``tool_exec_response``。
   ///
   /// 返回 `true` 表示已接管（SSH 模式启用时）；否则返回 `false` 放行。
+  ///
+  /// 归属校验：请求由后端按 (user_id, top_agent_id) 广播到用户全部 WS 连接，
+  /// 消息携带 ``top_agent_id`` 时，只接管属于本执行器当前服务 agent 的请求。
+  /// 修复"同窗口先与 SSH 模式 agent 对话后切回本地 agent，工具请求被残留
+  /// SSH 启用态误截获发往错误远端主机"的问题（findstr 等命令随机连不通）。
   bool _handleToolExecRequest(Map<String, dynamic> message) {
     if (!_enabled) return false;
     final Map<String, dynamic> data =
         (message['data'] as Map<String, dynamic>?) ?? <String, dynamic>{};
     final String execId = (data['exec_id'] as String?) ?? '';
     if (execId.isEmpty) return false;
+    // 归属校验：请求明确属于其他顶部 agent 时不接管（放行给正确执行器/实例）
+    final String reqAgent = (data['top_agent_id'] as String?) ?? '';
+    if (reqAgent.isNotEmpty && reqAgent != _currentTopAgentId) return false;
     final String workspaceId = (data['workspace_id'] as String?) ?? '';
     final String op = (data['op'] as String?) ?? '';
 

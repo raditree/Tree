@@ -75,6 +75,11 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 消息版本号：消息列表每次结构性变化时递增，驱动 MessageList 滚动到底部
   int _scrollRevision = 0;
 
+  /// 消息列表滚动模式标志：历史整批重载时置 true（MessageList 无动画直达
+  /// 底部、迭代校正确保超长会话真正落底）；流式追加/增量更新时置 false
+  /// （平滑滚动跟随）。
+  bool _bottomJump = false;
+
   /// 定位目标消息 id（历史加载完成后消费，驱动 MessageList 定位滚动）
   String? _pendingScrollId;
 
@@ -127,6 +132,10 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 当前选中的会话（未加载时为 null，回退默认会话）
   ChatSession? _currentSession;
 
+  /// 各 agent 上次浏览的会话 id（agent_id -> session_id）。
+  /// 切换 agent 回来时恢复上次浏览的会话，而非回退默认会话。
+  final Map<String, String> _lastSessionByAgent = <String, String>{};
+
   /// 当前会话 id（缺省为默认会话）
   String get _currentSessionId =>
       _currentSession?.sessionId ?? 'session_default';
@@ -163,16 +172,23 @@ class _MessagePanelState extends State<MessagePanel> {
 
   /// 加载当前顶部 agent 的本地/SSH 执行模式持久化设置，并同步注册/注销
   Future<void> _loadModeSettings() async {
-    if (widget.selectedAgent != null) {
-      LocalExecutorService.instance
-          .setCurrentTopAgent(widget.selectedAgent!.id);
-      SshExecutorService.instance.setCurrentTopAgent(widget.selectedAgent!.id);
-    }
+    // 始终重置执行器状态：selectedAgent 为 null 时清空（传 ''），
+    // 避免旧 agent 的 SSH/local 启用态残留导致新 agent 请求被误路由
+    LocalExecutorService.instance
+        .setCurrentTopAgent(widget.selectedAgent?.id ?? '');
+    SshExecutorService.instance.setCurrentTopAgent(widget.selectedAgent?.id ?? '');
     await Future.wait(<Future<void>>[
       LocalExecutorService.instance.loadSettings(),
       SshExecutorService.instance.loadSettings(),
     ]);
     if (!mounted) return;
+    // 竞态防护：等待期间已切换顶部 agent 时放弃本次恢复
+    // （新切换会重新进入本函数，避免旧 agent 的恢复结果误同步）
+    final String nowAgent = widget.selectedAgent?.id ?? '';
+    if (LocalExecutorService.instance.currentTopAgentId != nowAgent ||
+        SshExecutorService.instance.currentTopAgentId != nowAgent) {
+      return;
+    }
     setState(() {
       _localEnabled = LocalExecutorService.instance.enabled;
       _localWorkingDir = LocalExecutorService.instance.workingDirectory;
@@ -207,6 +223,9 @@ class _MessagePanelState extends State<MessagePanel> {
         _usageByAgent.clear();
         // 切换顶部 agent 后解除锁定，由新 agent 的历史/首条消息重新决定
         _modeLocked = false;
+        // 导航定位目标属于旧 agent，切换后作废，避免残留误用
+        _pendingScrollId = null;
+        _pendingSessionId = null;
       });
       _loadSessions();
       // 切换顶部 agent：加载其独立的运行模式设置并同步注册/注销
@@ -255,29 +274,47 @@ class _MessagePanelState extends State<MessagePanel> {
   Future<void> _loadSessions() async {
     final Agent? agent = widget.selectedAgent;
     if (agent == null) return;
+    final String agentId = agent.id;
     try {
       final List<ChatSession> sessions =
           await ApiService.getSessions(agent.id);
       if (!mounted) return;
+      // 竞态防护：等待期间可能已切换 agent，丢弃过期响应
+      // （否则旧 agent 的会话列表会覆盖新 agent，表现为"不稳定"）
+      if (widget.selectedAgent?.id != agentId) return;
       setState(() {
         _sessions = sessions;
         // 运行模式按顶部 agent 级锁定：该 agent 任一历史会话有消息
         // 即视为「已开始过对话」，切换会话不解除锁定
         _modeLocked = sessions.any((s) => s.messageCount > 0);
-        // 保持当前会话选择（若仍存在），否则回退到列表首个/默认会话。
-        // 定位导航时优先选中目标会话（_pendingSessionId，一次性消费）。
-        final String prev = _pendingSessionId ?? _currentSessionId;
+        // 会话选择优先级：导航定位目标（一次性消费）> 该 agent 上次浏览
+        // 的会话（_lastSessionByAgent）> 最近有消息的会话 > 列表首个。
+        // 切换 agent 后 _currentSession 已清空，靠 _lastSessionByAgent
+        // 恢复上次浏览的会话，而非回退默认会话。
+        // 前端重启后 _lastSessionByAgent 丢失导致 prev 为空：此时若按原
+        // 逻辑回退到 _currentSessionId（session_default），而默认会话
+        // 无消息时（list_sessions 的兜底条目必然匹配），用户实际对话所在
+        // 的非默认会话会被丢弃，compact/历史加载错位，误报
+        // "该 agent 无活跃的会话上下文"。
+        final String prev = _pendingSessionId ??
+            _lastSessionByAgent[agentId] ??
+            '';
         _pendingSessionId = null;
-        final bool keep = sessions.any((s) => s.sessionId == prev);
-        if (keep) {
-          _currentSession = sessions.firstWhere((s) => s.sessionId == prev);
-        } else if (sessions.isNotEmpty) {
-          _currentSession = sessions.first;
-        } else {
-          _currentSession = null;
+        ChatSession? target;
+        if (prev.isNotEmpty) {
+          final List<ChatSession> matched = sessions
+              .where((ChatSession s) => s.sessionId == prev)
+              .toList();
+          if (matched.isNotEmpty) target = matched.first;
         }
+        // 无明确目标（重启/首次进入/目标会话已删除）时：优先恢复最近
+        // 有消息的会话，避免回退到空的默认会话导致会话错位
+        target ??= _firstActiveSession(sessions);
+        _currentSession = target ?? (sessions.isNotEmpty ? sessions.first : null);
         _messages.clear();
       });
+      // 记录该 agent 本次实际生效的会话，供下次切换回来恢复
+      _lastSessionByAgent[agentId] = _currentSessionId;
       _loadHistory();
       // 无论显式选会话还是自动选中，都把实际生效的会话 id 广播给
       // main_page -> FilePanel -> TodoPanel，保证"进入会话无 tool 调用"时
@@ -288,6 +325,18 @@ class _MessagePanelState extends State<MessagePanel> {
     } catch (e) {
       // 拉取失败时保持默认会话
     }
+  }
+
+  /// 会话列表（按最近更新倒序）中第一个有消息的会话。
+  ///
+  /// 用于前端重启/首次进入时恢复"上次实际对话所在会话"：list_sessions
+  /// 始终兜底提供一个空的 session_default，若优先选中它会丢失用户真实
+  /// 对话所在的非默认会话（compact/历史错位）。
+  ChatSession? _firstActiveSession(List<ChatSession> sessions) {
+    for (final ChatSession s in sessions) {
+      if (s.messageCount > 0) return s;
+    }
+    return null;
   }
 
   /// 从后端拉取当前 agent/会话的对话历史
@@ -312,6 +361,8 @@ class _MessagePanelState extends State<MessagePanel> {
         for (final Map<String, dynamic> item in raw) {
           _messages.add(ChatMessage.fromJson(item));
         }
+        // 历史整批重载：驱动 MessageList 无动画直达底部（避免下滑动画）
+        _bottomJump = true;
         // 注意：不再按「当前会话历史是否为空」重置 _modeLocked——
         // 运行模式是顶部 agent 级共享的，锁定状态由 _loadSessions
         // 依据「该 agent 是否已有任一历史会话」统一决定，切换会话
@@ -426,6 +477,8 @@ class _MessagePanelState extends State<MessagePanel> {
       setState(() {
         _messages.add(message);
         _scrollRevision++;
+        // 流式新增：平滑滚动跟随（历史整批重载才走直达底部）
+        _bottomJump = false;
       });
     } else if (type == 'msg_chunk') {
       if (!_isForCurrentSession(data)) return;
@@ -448,6 +501,7 @@ class _MessagePanelState extends State<MessagePanel> {
           _messages[idx].isStreaming = false;
           _messages[idx].usage = usage;
           _scrollRevision++;
+          _bottomJump = false;
           if (usage != null) {
             _recordUsage(data, usage);
           }
@@ -491,6 +545,7 @@ class _MessagePanelState extends State<MessagePanel> {
       setState(() {
         _messages.add(toolMsg);
         _scrollRevision++;
+        _bottomJump = false;
       });
     } else if (type == 'tool_end') {
       if (!_isForCurrentSession(data)) return;
@@ -545,6 +600,7 @@ class _MessagePanelState extends State<MessagePanel> {
       setState(() {
         _messages.add(message);
         _scrollRevision++;
+        _bottomJump = false;
       });
     }
     // 其余控制消息（file_sync_progress / heartbeat / error 等）忽略
@@ -598,6 +654,7 @@ class _MessagePanelState extends State<MessagePanel> {
         options: options,
       ));
       _scrollRevision++;
+      _bottomJump = false;
     });
     // 通知右栏「问题回复」页即时出现新问题
     QuestionUpdateService.instance.notifyChanged();
@@ -656,6 +713,7 @@ class _MessagePanelState extends State<MessagePanel> {
     setState(() {
       _messages.add(userMessage);
       _scrollRevision++;
+      _bottomJump = false;
       // 发送首条消息后锁定运行模式（后端会话自此绑定本地/云端工具）
       _modeLocked = true;
     });
@@ -823,6 +881,7 @@ class _MessagePanelState extends State<MessagePanel> {
                         onAskAnswer: _handleAskAnswer,
                         scrollToMessageId: _scrollToMessageId,
                         scrollToRevision: _scrollToRevision,
+                        bottomJump: _bottomJump,
                       ),
                     ),
           if (agent != null) MessageInput(onSend: _handleSend),
@@ -1116,6 +1175,7 @@ class _MessagePanelState extends State<MessagePanel> {
       _messages.clear();
       _scrollRevision++;
     });
+    _lastSessionByAgent[agent.id] = session.sessionId;
     widget.onSessionChanged?.call(_currentSessionId);
     _loadHistory();
   }
@@ -1133,6 +1193,7 @@ class _MessagePanelState extends State<MessagePanel> {
         _messages.clear();
         _scrollRevision++;
       });
+      _lastSessionByAgent[agent.id] = session.sessionId;
       widget.onSessionChanged?.call(_currentSessionId);
       _loadHistory();
     } catch (e) {
@@ -1238,6 +1299,9 @@ class _MessagePanelState extends State<MessagePanel> {
           }
         }
       });
+      // 同步更新该 agent 的上次浏览会话（删除当前会话时已切到剩余首个；
+      // 删除非当前会话时值不变，赋值无副作用）
+      _lastSessionByAgent[agent.id] = _currentSessionId;
       _loadHistory();
     } catch (e) {
       if (!mounted) return;
@@ -1250,6 +1314,12 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 触发后端上下文压缩（compact 按钮）
   Future<void> _compactContext(String agentId) async {
     try {
+      // 前端重启后会话列表可能仍在异步加载中（_currentSession 为 null）：
+      // 此时立即压缩会回退到空的默认会话，误报"无活跃的会话上下文"。
+      // 先确保取到实际生效的会话（内部会恢复最近活跃会话）再压缩。
+      if (_currentSession == null && _sessions.isEmpty) {
+        await _loadSessions();
+      }
       final Map<String, dynamic> result = await ApiService.compactAgent(
         agentId,
         sessionId: _currentSessionId,

@@ -60,15 +60,15 @@ data_export:
 # 沙箱网络与下载限制（checklist 13/14）
 sandbox:
   network:
-    # 是否启用白名单式出站网络限制（启用后容器自动获得 NET_ADMIN 以配置 iptables）
+    # 是否启用沙箱网络策略（出站代理：单次下载量上限 + 访问日志）。
+    # - whitelist 为空（默认）：放开出站域名，沙箱可自由访问公网，仅保留
+    #   单次下载量上限与访问日志（3128 出站代理）；容器以非 root + 最小能力集运行。
+    # - whitelist 非空：恢复白名单式出站（仅放行列出的主机 80/443），
+    #   此时容器以 root + NET_ADMIN 运行以配置 iptables。
     enabled: true
-    # 白名单：仅允许访问以下主机（域名或 IP；默认放行回环、DNS 与已建立连接）
-    whitelist:
-      - "pypi.org"
-      - "files.pythonhosted.org"
-      - "github.com"
-      - "raw.githubusercontent.com"
-      - "objects.githubusercontent.com"
+    # 白名单：放开模式留空 []；如需恢复白名单式出站，在此列出允许的
+    # 域名/通配符（如 "*.pypi.org"）。默认放行回环、DNS 与已建立连接。
+    whitelist: []
     # 单次网络下载数据量上限（如 pip / curl / git 等单次拉取，需 < 1G）
     max_download_size: "900m"
 
@@ -101,6 +101,9 @@ wechat:
   redirect_uri: ""
 
 jwt:
-  secret: "change-me-in-production"
+  # secret 留空时，后端启动后随机生成并仅存内存（进程内），不落盘——
+  # 数据无硬编码泄露风险；副作用：进程重启后所有已签发 token 失效，需重新登录。
+  # 如需跨重启保持登录态（多实例 / 容器重建），可在此配置固定值。
+  secret: ""
   algorithm: "HS256"
   expire_hours: 72

@@ -345,5 +345,290 @@ class TestContextCompress(unittest.TestCase):
                     self.assertIn(tc.get("id"), have)
 
 
+class TestContextToolSequenceRepair(unittest.TestCase):
+    """工具序列一致性修复（压缩截断 / 上下文自愈）。
+
+    回归：``read`` 读取图像时 ``_append_image_user_msg`` 会在并行工具的结果
+    之间插入 user（图像）消息，使 tool 响应与归属 assistant 不再连续。
+    旧 ``_legal_tail_start`` 只回退连续 tool 消息，压缩截断会在图像 user 处
+    留下孤立 tool 消息 → 网关 400「tool 消息必须紧跟 assistant tool_calls」，
+    agent 永久卡死。这里覆盖修复后的两个自愈点。
+    """
+
+    def _session(self):
+        return AgentLLMSession(
+            model_config=ModelConfig(
+                name="t", base_url="http://localhost:8000",
+                api_key="k", model_id="m", if_vision=True,
+                extra={"max_seqlen": 4096},
+            ),
+            workspace_id="ws", system_prompt="sys",
+        )
+
+    @staticmethod
+    def _assert_no_orphan_tool(ctx):
+        """断言 ctx 内每个 tool 消息都有前置匹配的 assistant tool_calls。"""
+        declared = set()
+        for m in ctx:
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                for tc in m["tool_calls"]:
+                    if tc.get("id"):
+                        declared.add(tc["id"])
+            elif m.get("role") == "tool":
+                assert m.get("tool_call_id") in declared, (
+                    f"孤立 tool 消息: {m.get('tool_call_id')}"
+                )
+
+    def test_legal_tail_start_backs_to_owner_across_image_user(self):
+        """截断起点落在图像 user 后的 tool 上时，应回退到归属 assistant。"""
+        other_msgs = [
+            {"role": "user", "content": "任务"},
+            {"role": "assistant", "tool_calls": [{"id": "c1"}, {"id": "c2"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "read结果"},
+            {"role": "user", "content": {"text": "img", "image_base64": "x"}},
+            {"role": "tool", "tool_call_id": "c2", "content": "mcp结果"},
+            {"role": "user", "content": "继续"},
+        ]
+        start = AgentLLMSession._legal_tail_start(other_msgs, 4)
+        # 旧实现回退到 3（图像 user），留下孤立 tool c2；现应回退到 1（归属 assistant）
+        self.assertEqual(1, start)
+        self._assert_no_orphan_tool(other_msgs[start:])
+
+    def test_compress_image_round_no_orphan(self):
+        """read 图像 + 并行工具轮次压缩后不得产生孤立 tool 消息。"""
+        session = self._session()
+        session.context = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "早期一"},
+            {"role": "assistant", "content": "回复一"},
+            {"role": "user", "content": "早期二"},
+            {"role": "assistant", "content": "回复二"},
+            {"role": "user", "content": "任务"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "read", "arguments": "{}"}},
+                {"id": "c2", "type": "function",
+                 "function": {"name": "mcp", "arguments": "{}"}}],
+             "content": ""},
+            {"role": "tool", "tool_call_id": "c1", "content": "read结果"},
+            {"role": "user", "content": {"text": "[图像读取结果]", "image_base64": "x"}},
+            {"role": "tool", "tool_call_id": "c2", "content": "mcp结果"},
+        ]
+        with patch.object(session, "_summarize_with_llm", return_value="摘要"):
+            result = session.compress(force=True)
+        self.assertTrue(result)
+        self._assert_no_orphan_tool(session.context)
+
+    def test_repair_context_removes_orphan_tool(self):
+        """自愈：移除无前置 assistant tool_calls 的孤立 tool 消息。"""
+        session = self._session()
+        session.context = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "任务"},
+            {"role": "tool", "tool_call_id": "c1", "content": "孤立 tool 结果"},
+            {"role": "user", "content": "继续"},
+        ]
+        session._repair_context()
+        roles = [m["role"] for m in session.context]
+        self.assertNotIn("tool", roles)
+        self.assertEqual(roles, ["system", "user", "user"])
+
+    def test_repair_context_still_adds_placeholder_for_missing_response(self):
+        """自愈（原行为保留）：assistant tool_calls 缺响应时补占位 tool 消息。"""
+        session = self._session()
+        session.context = [
+            {"role": "system", "content": "sys"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "read", "arguments": "{}"}}],
+             "content": ""},
+            {"role": "user", "content": "继续"},
+        ]
+        session._repair_context()
+        tool_msgs = [m for m in session.context if m["role"] == "tool"]
+        self.assertEqual(1, len(tool_msgs))
+        self.assertEqual("c1", tool_msgs[0]["tool_call_id"])
+
+    def test_sanitize_messages_drops_orphan_tool(self):
+        """防御修复：丢弃孤立 tool 消息，其余原样保留。"""
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "任务"},
+            {"role": "tool", "tool_call_id": "c1", "content": "孤立 tool 结果"},
+            {"role": "user", "content": "继续"},
+        ]
+        fixed = AgentLLMSession._sanitize_messages(messages)
+        self.assertNotIn("tool", [m["role"] for m in fixed])
+        self.assertEqual(3, len(fixed))
+        self._assert_no_orphan_tool(fixed)
+
+    def test_sanitize_messages_adds_placeholder_for_missing_response(self):
+        """防御修复：assistant tool_calls 缺响应时补占位，且紧跟其后。"""
+        messages = [
+            {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "read", "arguments": "{}"}}],
+             "content": ""},
+            {"role": "user", "content": "继续"},
+        ]
+        fixed = AgentLLMSession._sanitize_messages(messages)
+        self.assertEqual(3, len(fixed))
+        self.assertEqual("tool", fixed[1]["role"])
+        self.assertEqual("c1", fixed[1]["tool_call_id"])
+        self._assert_no_orphan_tool(fixed)
+
+    def test_sanitize_messages_keeps_valid_sequence_unchanged(self):
+        """防御修复：合法序列（tool 响应连续、图像在轮末）原样返回同一引用。"""
+        messages = [
+            {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "read", "arguments": "{}"}},
+                {"id": "c2", "type": "function",
+                 "function": {"name": "mcp", "arguments": "{}"}}],
+             "content": ""},
+            {"role": "tool", "tool_call_id": "c1", "content": "read结果"},
+            {"role": "tool", "tool_call_id": "c2", "content": "mcp结果"},
+            {"role": "user", "content": {"text": "img", "image_base64": "x"}},
+        ]
+        fixed = AgentLLMSession._sanitize_messages(messages)
+        self.assertIs(fixed, messages)  # 无变化时返回原引用
+        self._assert_no_orphan_tool(fixed)
+
+    def test_build_api_kwargs_sanitizes_orphan_tool(self):
+        """集成：上下文中残留孤立 tool 时，发出的请求消息也被自动修复。"""
+        session = self._session()
+        session.context = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "任务"},
+            {"role": "tool", "tool_call_id": "c1", "content": "孤立 tool 结果"},
+            {"role": "user", "content": "继续"},
+        ]
+        kwargs = session._build_api_kwargs()
+        msgs = kwargs["messages"]
+        self.assertNotIn("tool", [m["role"] for m in msgs])
+        self._assert_no_orphan_tool(msgs)
+
+    def test_reflow_tool_responses_moves_interleaved_image_after_round(self):
+        """重排：图像 user 消息夹在并行 tool 响应之间时，移到轮末恢复连续。"""
+        messages = [
+            {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "read", "arguments": "{}"}},
+                {"id": "c2", "type": "function",
+                 "function": {"name": "mcp", "arguments": "{}"}}],
+             "content": ""},
+            {"role": "tool", "tool_call_id": "c1", "content": "read结果"},
+            {"role": "user", "content": {"text": "[图像读取结果]", "image_base64": "x"}},
+            {"role": "tool", "tool_call_id": "c2", "content": "mcp结果"},
+            {"role": "user", "content": "继续"},
+        ]
+        fixed = AgentLLMSession._reflow_tool_responses(messages)
+        roles = [m["role"] for m in fixed]
+        # tool 响应紧跟归属 assistant，且两 tool 响应连续
+        self.assertEqual(roles, ["assistant", "tool", "tool", "user", "user"])
+        self.assertEqual(fixed[1]["tool_call_id"], "c1")
+        self.assertEqual(fixed[2]["tool_call_id"], "c2")
+        self.assertIs(fixed[4], messages[4])  # "继续" 顺序不变
+        self._assert_no_orphan_tool(fixed)
+
+    def test_reflow_tool_responses_valid_sequence_unchanged(self):
+        """重排：合法序列（tool 响应连续）原样返回（同一引用）。"""
+        messages = [
+            {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "read", "arguments": "{}"}}],
+             "content": ""},
+            {"role": "tool", "tool_call_id": "c1", "content": "read结果"},
+            {"role": "user", "content": {"text": "img", "image_base64": "x"}},
+        ]
+        fixed = AgentLLMSession._reflow_tool_responses(messages)
+        self.assertIs(fixed, messages)
+
+    def test_sanitize_messages_reflows_interleaved_image(self):
+        """防御修复：历史遗留「图像 user 夹在并行 tool 响应之间」也被修复。"""
+        session = self._session()
+        session.context = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "任务"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "read", "arguments": "{}"}},
+                {"id": "c2", "type": "function",
+                 "function": {"name": "spec", "arguments": "{}"}}],
+             "content": ""},
+            {"role": "tool", "tool_call_id": "c1", "content": "read结果"},
+            {"role": "user", "content": {"text": "[图像读取结果]", "image_base64": "x"}},
+            {"role": "tool", "tool_call_id": "c2", "content": "spec结果"},
+            {"role": "user", "content": "继续"},
+        ]
+        session._repair_context()
+        roles = [m["role"] for m in session.context]
+        self.assertEqual(
+            roles,
+            ["system", "user", "assistant", "tool", "tool", "user", "user"],
+        )
+        self.assertEqual(session.context[3]["tool_call_id"], "c1")
+        self.assertEqual(session.context[4]["tool_call_id"], "c2")
+        self._assert_no_orphan_tool(session.context)
+
+    def test_loop_parallel_tools_image_deferred(self):
+        """主循环：并行 tool（read 图像 + spec）时，图像 user 消息在全部
+        tool 响应之后统一追加，tool 响应保持紧随归属 assistant。"""
+        session = self._session()
+        session.context = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "任务"},
+        ]
+        session.register_tool(
+            "read", "读图", {},
+            lambda file_path="x.png": {
+                "image_base64": "QUJD", "mime": "image/png",
+                "file_path": file_path,
+            },
+        )
+        session.register_tool("spec", "spec", {}, lambda: {"spec": "ok"})
+        # 第一轮：两个并行 tool_call；第二轮：最终文本
+        round1 = [
+            make_chunk(
+                make_delta(tool_calls=[
+                    _mk_tc(0, "c1", "read", "{}"),
+                    _mk_tc(1, "c2", "spec", "{}"),
+                ]),
+                finish_reason="tool_calls",
+            )
+        ]
+        round2 = [make_chunk(make_delta(content="完成"))]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = [round1, round2]
+        with patch("llm.llm.LLMClientFactory.create_client",
+                   return_value=mock_client):
+            list(session.chat("任务"))
+        roles = [m["role"] for m in session.context]
+        self.assertEqual(
+            roles,
+            ["system", "user", "user", "assistant", "tool", "tool",
+             "user", "assistant"],
+        )
+        # tool 响应紧随归属 assistant 且连续
+        self.assertEqual(session.context[4]["tool_call_id"], "c1")
+        self.assertEqual(session.context[5]["tool_call_id"], "c2")
+        # 图像 user 消息在 tool 响应之后
+        self.assertIsInstance(session.context[6]["content"], dict)
+        self.assertIn("image_base64", session.context[6]["content"])
+        self._assert_no_orphan_tool(session.context)
+
+
+def _mk_tc(index, tid, name, args):
+    """构造流式 tool_call 分片（含 index/id/function）。"""
+    tc = MagicMock()
+    tc.index = index
+    tc.id = tid
+    fn = MagicMock()
+    fn.name = name
+    fn.arguments = args
+    tc.function = fn
+    return tc
+
+
 if __name__ == "__main__":
     unittest.main()

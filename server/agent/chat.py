@@ -208,19 +208,84 @@ def _make_system_prompt_rebuilder(
     return _rebuild
 
 
+def _upload_attachments_local(base_dir: str, paths: Any) -> List[str]:
+    """本地模式：把上传的本地文件写入 ``base_dir/.input/yyyymmdd/``。
+
+    base_dir 是用户在本地执行模式下选择的工作目录（register_local_executor
+    上报），与 agent 本地 read/write 工具的根一致——附件落地后 agent 即可
+    通过相对路径 ``.input/yyyymmdd/name`` 读取。
+
+    :param base_dir: 用户选择的本地工作目录
+    :param paths: 用户上传的本地文件路径列表
+    :return: 工作空间语义路径列表（如 ``/workspace/.input/20260808/xxx``）
+    """
+    date_dir = datetime.datetime.now().strftime("%Y%m%d")
+    uploaded: List[str] = []
+    for p in paths:
+        path = str(p)
+        if not os.path.isfile(path):
+            logger.debug("附件不存在，跳过上传: %s", path)
+            continue
+        name = os.path.basename(path.replace("\\", "/"))
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as exc:  # noqa: BLE001
+            logger.warning("读取附件失败: %s (%s)", path, exc)
+            continue
+        rel_path = os.path.join(".input", date_dir, name)
+        target = os.path.join(base_dir, rel_path)
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb") as f:
+                f.write(data)
+        except OSError as exc:  # noqa: BLE001
+            logger.warning("附件写入本地工作空间失败: %s (%s)", name, exc)
+            continue
+        uploaded.append(f"/workspace/.input/{date_dir}/{name}")
+    return uploaded
+
+
 def _upload_attachments(
-    workspace_id: str, paths: Any
+    workspace_id: str,
+    paths: Any,
+    user_id: str = "",
+    top_agent_id: str = "",
 ) -> List[str]:
     """将对话框上传的本地文件写入工作空间 ``.input/yyyymmdd/`` 目录。
 
-    返回工作空间内的路径列表（如 ``/workspace/.input/20260808/xxx``）。
-    Docker 不可用或文件不存在时跳过该文件。写入失败仅记录日志，不中断。
+    返回工作空间内的路径列表（如 ``/workspace/.input/20260808/xxx``）：
+    - 本地模式（用户已注册本地执行器）：写入用户选择的本地工作目录
+      ``base_dir/.input/yyyymmdd/``，与 agent 本地工具同一根目录；
+    - 云端模式：写入 Docker 容器。Docker 不可用或文件不存在时跳过该文件。
+
+    写入失败仅记录日志，不中断。
 
     :param workspace_id: agent 工作空间标识
     :param paths: 用户上传的本地文件路径列表
+    :param user_id: 用户标识（本地模式判定用）
+    :param top_agent_id: 顶部 agent 标识（本地模式判定用）
     :return: 成功写入工作空间的路径列表
     """
-    if not paths or state.docker_manager is None or not state.docker_manager.available:
+    if not paths:
+        return []
+    # 本地模式优先：附件落到用户选择的本地目录，否则云端容器里 agent
+    # 本地工具根本读不到（表现为「提示已存入工作空间，实际无法访问」）。
+    if user_id and top_agent_id and state.local_executor is not None:
+        try:
+            if state.local_executor.is_local(user_id, top_agent_id):
+                base_dir = state.local_executor.base_dir_of(
+                    user_id, top_agent_id
+                ) or ""
+                if not base_dir:
+                    logger.warning(
+                        "本地执行器已注册但 base_dir 为空，附件跳过上传"
+                    )
+                    return []
+                return _upload_attachments_local(base_dir, paths)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("附件本地上传判定失败，回退云端路径: %s", exc)
+    if state.docker_manager is None or not state.docker_manager.available:
         return []
     date_dir = datetime.datetime.now().strftime("%Y%m%d")
     uploaded: List[str] = []
@@ -1938,7 +2003,13 @@ async def _handle_user_message(
         workspace_id = agent_id if agent else "top"
 
     # 上传附件到工作空间 .input/yyyymmdd/，仅将路径告知 LLM
-    uploaded_paths = _upload_attachments(workspace_id, attachments)
+    # （user_id/agent_id 用于本地模式判定：附件需落到用户选择的本地目录）
+    uploaded_paths = _upload_attachments(
+        workspace_id,
+        attachments,
+        user_id=user_id,
+        top_agent_id=agent_id,
+    )
     attachments_prompt = _build_attachments_prompt(uploaded_paths)
     if attachments_prompt:
         llm_content = f"{llm_content}\n\n{attachments_prompt}" if llm_content else attachments_prompt

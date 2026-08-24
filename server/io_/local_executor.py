@@ -111,6 +111,28 @@ class LocalExecutorClient:
             return True
         return top_agent_id in regs
 
+    def base_dir_of(
+        self, user_id: str, top_agent_id: Optional[str] = None
+    ) -> str:
+        """返回用户/顶部 agent 注册的本地工作目录（base_dir）。
+
+        base_dir 由前端 ``register_local_executor`` 上报，即用户在本地执行
+        模式下选择的目录。附件上传、工作文件落盘等需要本地真实根目录的
+        场景应通过本方法获取，而非直接访问 ``_users`` 私有字段。
+
+        :param user_id: 用户标识
+        :param top_agent_id: 顶部 agent ID；None 时返回该用户任一已注册
+                             本地执行器的 base_dir（取第一个非空）
+        :return: 本地工作目录；未注册或为空时返回 ""
+        """
+        regs = self._users.get(user_id) or {}
+        if top_agent_id is None:
+            for value in regs.values():
+                if value:
+                    return value
+            return ""
+        return regs.get(top_agent_id) or ""
+
     def register(
         self,
         user_id: str,

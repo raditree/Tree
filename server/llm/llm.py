@@ -8,7 +8,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, Generator, List, Optional
 
-from openai import OpenAI, RateLimitError
+from openai import BadRequestError, OpenAI, RateLimitError
 
 from config.config import get_config
 from config.models import ModelConfig
@@ -385,11 +385,13 @@ class AgentLLMSession:
         {type:image_url}]``）；非视觉模型不转换（天然降级，图像字段被忽略）。
         """
         # 视觉消息格式转换（仅当模型 if_vision=true 时执行）
-        messages = (
-            self._convert_vision_messages(self.context)
-            if self.model_config.if_vision
-            else self.context
-        )
+        if self.model_config.if_vision:
+            messages = self._convert_vision_messages(self.context)
+        else:
+            messages = self.context
+        # 防御式修复：保证 tool 序列对网关合法（孤立 tool 丢弃 / 缺失响应补占位），
+        # 避免压缩截断或恢复造成的 400 直接击倒 agent
+        messages = self._sanitize_messages(messages)
         kwargs: Dict[str, Any] = {
             "model": self.model_config.api_model_id or self.model_config.model_id,
             "messages": messages,
@@ -518,6 +520,125 @@ class AgentLLMSession:
         logger.warning("无法解析 tool_call 参数，返回空参数: %.200r", raw)
         return {}
 
+    @staticmethod
+    def _sanitize_messages(
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """容错修复消息列表，保证工具序列对网关合法（类似 _safe_parse_arguments）。
+
+        OpenAI 兼容网关对 tool 序列有严格要求，不合法会直接 400（如
+        ``Messages with role 'tool' must be a response to a preceding message
+        with 'tool_calls'``）。压缩截断、会话恢复、或图像 user 消息插入
+        （``_append_image_user_msg``）都可能把序列弄坏。这里是纯函数式防御
+        修复，双向处理：
+        1. ``tool`` 消息缺少前置匹配的 assistant ``tool_calls``（孤立 tool，
+           多为压缩截断残留）→ 丢弃；
+        2. assistant ``tool_calls`` 缺少对应 ``tool`` 响应（多为中途被取消
+           遗留）→ 补占位消息，让模型知道该工具调用被中止。
+
+        不修改入参；无变化时返回原列表引用（避免无谓拷贝）。
+        """
+        if not messages:
+            return messages
+        have = {
+            m.get("tool_call_id")
+            for m in messages
+            if m.get("role") == "tool" and m.get("tool_call_id")
+        }
+        out: Optional[List[Dict[str, Any]]] = None  # 惰性创建：仅在需要修复时
+        declared: set = set()  # 已由前置 assistant tool_calls 声明的 id
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                if out is not None:
+                    out.append(msg)
+                for tc in msg["tool_calls"]:
+                    tid = tc.get("id")
+                    if tid:
+                        declared.add(tid)
+                    if tid and tid not in have:
+                        if out is None:
+                            out = messages[:i + 1]
+                        out.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tid,
+                                "content": "[已中止：任务被用户停止，该工具调用未返回结果]",
+                            }
+                        )
+                        have.add(tid)
+            elif msg.get("role") == "tool":
+                tid = msg.get("tool_call_id")
+                if tid and tid not in declared:
+                    # 孤立 tool：丢弃（其原始轮次已提供给模型，属残留）
+                    if out is None:
+                        out = messages[:i]
+                    continue
+                if tid in declared:
+                    declared.discard(tid)
+                if out is not None:
+                    out.append(msg)
+            elif out is not None:
+                out.append(msg)
+        fixed = out if out is not None else messages
+        # 步骤 2：重排 tool 响应紧随归属 assistant（修复历史版本把图像 user
+        # 消息插入并行 tool 响应之间造成的「tool 响应不足」400）
+        return AgentLLMSession._reflow_tool_responses(fixed)
+
+    @staticmethod
+    def _reflow_tool_responses(
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """把每个 assistant tool_calls 的 tool 响应重排为紧随其后、连续排列。
+
+        OpenAI 兼容网关（含 DeepSeek）要求 ``tool`` 响应必须紧跟声明它们的
+        assistant 消息，中间出现任何其他消息（如历史版本 ``_append_image_user_msg``
+        在并行工具结果之间插入的 user(图像)）都会被判定为「tool 响应不足」而
+        400。此方法把夹在 tool 响应之间的非 tool 消息移到该轮最后一个 tool
+        响应之后，恢复合法序列。
+
+        纯函数，不修改入参；未发生重排时返回原列表引用。
+        """
+        if not messages:
+            return messages
+        out: List[Dict[str, Any]] = []
+        changed = False
+        i = 0
+        n = len(messages)
+        while i < n:
+            msg = messages[i]
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                declared = {tc.get("id") for tc in msg["tool_calls"] if tc.get("id")}
+                out.append(msg)
+                i += 1
+                if not declared:
+                    continue  # 无 id 可校验，无法界定该轮范围，原样保留
+                seen: set = set()
+                pending: List[Dict[str, Any]] = []
+                # 收集本轮全部 tool 响应；夹杂的非 tool 消息先缓存，轮末回填
+                while i < n:
+                    cur = messages[i]
+                    tid = cur.get("tool_call_id")
+                    if (
+                        cur.get("role") == "tool"
+                        and tid in declared
+                        and tid not in seen
+                    ):
+                        out.append(cur)
+                        seen.add(tid)
+                        i += 1
+                        if seen == declared:
+                            break
+                    else:
+                        pending.append(cur)
+                        i += 1
+                if pending:
+                    changed = True
+                out.extend(pending)
+                continue
+            out.append(msg)
+            i += 1
+        return out if changed else messages
+
     def _create_completion(
         self,
         client: OpenAI,
@@ -560,6 +681,30 @@ class AgentLLMSession:
                         return None
                     time.sleep(min(0.2, deadline - time.time()))
 
+    def _create_completion_guarded(
+        self,
+        client: OpenAI,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Any:
+        """构建请求并调用 LLM；上下文非法导致 400 时修复上下文后重试一次。
+
+        压缩/恢复可能把上下文截成非法 tool 序列（网关 400「tool 消息必须紧跟
+        assistant tool_calls」）。若直接抛出，消费线程会把它当致命错误终止，
+        使单个工具/上下文错误击倒整个 agent。这里捕获 ``BadRequestError``，
+        调用 ``_repair_context`` 自愈后重建请求重试一次；二次失败仍抛出，
+        由上层照常处理（避免掩盖真正的请求错误）。
+        """
+        api_kwargs = self._build_api_kwargs()
+        try:
+            return self._create_completion(client, api_kwargs, cancel_event)
+        except BadRequestError:
+            logger.warning(
+                "LLM 请求 400（可能上下文含非法 tool 序列），修复上下文后重试一次"
+            )
+            self._repair_context()
+            api_kwargs = self._build_api_kwargs()
+            return self._create_completion(client, api_kwargs, cancel_event)
+
     def _tool_context_content(self, result: Any, result_str: str) -> Any:
         """构造写入上下文的工具结果 content。
 
@@ -580,25 +725,40 @@ class AgentLLMSession:
             return result_str
         return result_str
 
-    def _append_image_user_msg(self, result: Any) -> None:
-        """图像工具结果：追加一条携带图像的 user 消息（供视觉模型下一轮消费）。
+    def _build_image_user_msg(self, result: Any) -> Optional[Dict[str, Any]]:
+        """构造携带图像的 user 消息（供视觉模型下一轮消费），不追加。
+
+        仅当结果含 ``image_base64`` 且模型开启视觉时返回消息，否则返回
+        ``None``。调用方决定何时写入上下文：主工具循环会在本轮全部 tool
+        响应追加完毕后统一写入，避免图像 user 消息夹在并行 tool 响应之间
+        导致网关 400。
 
         content 为 dict（``text`` + ``image_base64`` + ``mime``），
         ``_build_api_kwargs`` 中的 ``_convert_vision_messages`` 会在请求
         构建时转成 OpenAI vision content 数组格式。
         """
         if not (isinstance(result, dict) and result.get("image_base64")):
-            return
+            return None
         if not self.model_config.if_vision:
-            return
-        self.context.append({
+            return None
+        return {
             "role": "user",
             "content": {
                 "text": f"[图像读取结果] {result.get('file_path', '')}",
                 "image_base64": str(result["image_base64"]),
                 "mime": result.get("mime") or "image/png",
             },
-        })
+        }
+
+    def _append_image_user_msg(self, result: Any) -> None:
+        """图像工具结果：立即把图像 user 消息追加进上下文。
+
+        立即追加仅在单工具轮次下安全；并行工具轮次请改用
+        ``_build_image_user_msg`` 收集后统一写入（见主工具循环）。
+        """
+        msg = self._build_image_user_msg(result)
+        if msg is not None:
+            self.context.append(msg)
 
     def _is_cancelled(
         self, cancel_event: Optional[threading.Event] = None
@@ -660,8 +820,7 @@ class AgentLLMSession:
             if not self._acquire_rate_limit(cancel_event):
                 return
 
-            api_kwargs = self._build_api_kwargs()
-            stream = self._create_completion(client, api_kwargs, cancel_event)
+            stream = self._create_completion_guarded(client, cancel_event)
             if stream is None:
                 # 已停止：_create_completion 在发起前或重试等待期间检测到取消
                 return
@@ -764,6 +923,7 @@ class AgentLLMSession:
                 self.context.append(assistant_msg)
 
                 # 执行每个 tool_call
+                pending_image_msgs: List[Dict[str, Any]] = []
                 for tc in tool_calls:
                     # 停止中止：每次 tool_call 执行前检查取消，
                     # 已停止时不再启动新的工具调用（阻塞工具可被跳过）
@@ -843,8 +1003,19 @@ class AgentLLMSession:
                         "tool_call_id": tc["id"],
                         "content": base_content,
                     })
-                    # 视觉模型：图像本体追加为独立 user 消息（网关兼容）
-                    self._append_image_user_msg(result)
+                    # 视觉模型：图像本体追加为独立 user 消息（网关兼容）。
+                    # 注意不能在此处立即插入——若本轮有多个并行 tool_call，
+                    # 图像 user 消息会夹在 tool 响应之间，网关判定「tool 响应
+                    # 不足」直接 400（assistant tool_calls 后必须紧跟连续 tool
+                    # 响应）。先收集，待本轮 tool 响应全部追加后再统一入上下文。
+                    img_msg = self._build_image_user_msg(result)
+                    if img_msg is not None:
+                        pending_image_msgs.append(img_msg)
+
+                # 本轮全部 tool 响应追加完毕后再追加图像 user 消息，保持
+                # tool 响应紧随归属 assistant，避免网关 400
+                for img_msg in pending_image_msgs:
+                    self.context.append(img_msg)
 
                 # tool_call 间隙：若提供了插入回调，检查是否有新消息需要切入处理
                 if on_tool_turn is not None:
@@ -946,11 +1117,15 @@ class AgentLLMSession:
 
     @staticmethod
     def _legal_tail_start(other_msgs: List[Dict[str, Any]], start: int) -> int:
-        """把截断起点回退到合法的消息角色（user/assistant）。
+        """把截断起点回退到合法边界，保证 tail 内无孤立 tool 消息。
 
         后缀若以 ``role == "tool"`` 的消息开头，会引用已不在保留范围内的
-        assistant tool_calls，导致对网关非法；这里回退到其所属的 assistant
-        （或 user），保证截断后的上下文自洽。
+        assistant tool_calls，导致对网关非法（400）。早期版本
+        ``_append_image_user_msg`` 会在并行工具的结果之间插入 user（图像）
+        消息，使 tool 响应与归属 assistant 不再连续（现已改为轮末统一追加，
+        历史遗留数据仍可能存在）；因此不能只回退连续 tool 消息，需逐条校验
+        tail 内每个 tool 消息都有前置匹配的 assistant tool_calls，否则把起点
+        回退到其归属 assistant 重新扫描。
 
         :param other_msgs: 非 system 消息列表
         :param start: 期望的截断起点
@@ -958,49 +1133,56 @@ class AgentLLMSession:
         """
         if start >= len(other_msgs):
             return start  # 空尾部（最后一条用户消息之后无内容）
-        while start > 0 and other_msgs[start].get("role") == "tool":
-            start -= 1
+        n = len(other_msgs)
+        while 0 < start < n:
+            declared = set()  # 当前已由前置 assistant tool_calls 声明的 id
+            need_back = False
+            for i in range(start, n):
+                msg = other_msgs[i]
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    for tc in msg["tool_calls"]:
+                        tid = tc.get("id")
+                        if tid:
+                            declared.add(tid)
+                elif msg.get("role") == "tool":
+                    tid = msg.get("tool_call_id")
+                    if tid and tid not in declared:
+                        # 孤立 tool：归属 assistant 在 tail 之外，回退包含它
+                        owner = None
+                        for j in range(i - 1, -1, -1):
+                            pm = other_msgs[j]
+                            if pm.get("role") == "assistant" and pm.get("tool_calls"):
+                                if tid in {tc.get("id") for tc in pm["tool_calls"]}:
+                                    owner = j
+                                    break
+                        need_back = True
+                        # 找不到归属（历史数据已损坏）时回退到 0，
+                        # 交由 _repair_context 移除孤立 tool
+                        start = owner if owner is not None else 0
+                        break
+            if not need_back:
+                break
         return max(start, 0)
 
     def _repair_context(self) -> None:
-        """修复被中途「停止」/异常打断的上下文不一致。
+        """修复上下文不一致并写回，保证后续请求对网关始终合法。
 
-        当消费线程在 ``yield`` 处被取消（GeneratorExit）时，若当时刚把带
-        ``tool_calls`` 的 assistant 消息写进 context、但对应 ``role='tool'``
-        响应尚未追加，就会留下「assistant tool_calls 缺少匹配 tool 响应」的
-        非法序列，网关下轮必返 400（此问题会一直卡死后续回复）。
-
-        这里为每个缺失响应的 ``tool_call_id`` 补一条占位 tool 消息，使上下文
-        对网关始终合法：既保留历史，又让模型知道该工具调用被中止。
+        消费线程在 ``yield`` 处被取消（GeneratorExit）、压缩截断或历史数据
+        损坏都可能留下非法序列（孤立 tool / 缺失响应），网关下轮必返 400
+        （问题会一直卡死后续回复）。这里调用 ``_sanitize_messages`` 做双向
+        修复（丢弃孤立 tool、为缺失响应的 tool_call 补占位），并把结果写回
+        ``self.context`` 使其持久生效，避免每个请求反复带病。
         """
         if not self.context:
             return
-        have = {
-            m.get("tool_call_id")
-            for m in self.context
-            if m.get("role") == "tool" and m.get("tool_call_id")
-        }
-        out: List[Dict[str, Any]] = []
-        changed = False
-        for msg in self.context:
-            out.append(msg)
-            if not (msg.get("role") == "assistant" and msg.get("tool_calls")):
-                continue
-            for tc in msg["tool_calls"]:
-                tid = tc.get("id")
-                if tid and tid not in have:
-                    out.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tid,
-                            "content": "[已中止：任务被用户停止，该工具调用未返回结果]",
-                        }
-                    )
-                    have.add(tid)
-                    changed = True
-        if changed:
-            self.context = out
-            logger.warning("已修复上下文：为 %d 个缺失响应的 tool_call 补充占位消息", changed)
+        fixed = self._sanitize_messages(self.context)
+        if fixed is not self.context:
+            logger.warning(
+                "修复上下文消息序列（丢弃孤立 tool / 补占位 / 重排 tool 响应，%d 条 → %d 条）",
+                len(self.context),
+                len(fixed),
+            )
+            self.context = fixed
 
     def _compress_context(self) -> None:
         """检查并压缩上下文（自动触发，带阈值判断）。

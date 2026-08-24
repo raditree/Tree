@@ -54,48 +54,156 @@ class AgentTeamApp extends StatelessWidget {
 
   const AgentTeamApp({super.key, required this.initialRoute});
 
-  /// 浅色主题（深蓝专业风格）
+  // ==================== 品牌色板（对齐 web/icons/Icon-512.png） ====================
+  /// 图标主亮绿（HUD 弧线）
+  static const Color brandBright = Color(0xFF00FF8C);
+  /// 图标渐变深绿（弧线暗部/高亮刻度）
+  static const Color brandDeep = Color(0xFF00904A);
+  /// 图标辅助深绿（细刻度线）
+  static const Color brandLine = Color(0xFF00522C);
+  /// 图标背景近黑（#030705，带极微弱绿）
+  static const Color brandBlack = Color(0xFF030705);
+  /// 深色卡片底色（比背景略亮）
+  static const Color brandCard = Color(0xFF0A1A10);
+  /// 绿色分割线（半透明亮绿，用于各类边线框/分隔线）
+  static const Color brandDivider = Color(0xFF2B7A4B);
+  /// 亮绿上的前景深墨绿（onPrimary，保证对比度）
+  static const Color onBrandBright = Color(0xFF00280F);
+  /// PrimaryContainer 深绿
+  static const Color brandContainer = Color(0xFF0E2B1A);
+  static const Color onBrandContainer = Color(0xFFB8FFD9);
+
+  /// 浅色主题（白绿配色：白底 + 图标渐变深绿主色，清爽可读）
+  ///
+  /// 主色用 brandDeep（#00904A 图标渐变深绿），白底上保持足够对比度；
+  /// 文字走 Material 浅色派生（近黑墨绿），避免黑字黑底的不可读问题。
   ThemeData _buildLightTheme() {
     return ThemeData(
-      primaryColor: const Color(0xFF2563EB),
-      scaffoldBackgroundColor: const Color(0xFFF3F4F6),
+      fontFamily: 'Microsoft YaHei',
+      fontFamilyFallback: const ['PingFang SC', 'Noto Sans CJK SC', 'sans-serif'],
+      primaryColor: brandDeep,
+      scaffoldBackgroundColor: const Color(0xFFF4FAF6),
       cardColor: Colors.white,
+      dividerColor: const Color(0xFFC9E5D3),
+      dividerTheme: const DividerThemeData(color: Color(0xFFC9E5D3), thickness: 1),
       appBarTheme: const AppBarTheme(
-        backgroundColor: Color(0xFF2563EB),
-        foregroundColor: Colors.white,
+        backgroundColor: Colors.white,
+        foregroundColor: brandDeep,
         elevation: 0,
+        // 底部浅绿分割线：白底上的绿色分界，呼应图标风格
+        shape: Border(
+          bottom: BorderSide(color: Color(0xFFC9E5D3), width: 1),
+        ),
       ),
       colorScheme: const ColorScheme.light(
-        primary: Color(0xFF2563EB),
-        secondary: Color(0xFF2563EB),
+        primary: brandDeep,
+        onPrimary: Colors.white,
+        secondary: brandDeep,
+        onSecondary: Colors.white,
+        primaryContainer: Color(0xFFD9F2E3),
+        onPrimaryContainer: Color(0xFF00491F),
+        secondaryContainer: Color(0xFFD9F2E3),
+        onSecondaryContainer: Color(0xFF00491F),
+        surface: Colors.white,
+        onSurface: Color(0xFF1A2E21),
+        // 显式补充（ColorScheme.light 未传时默认黑色/极端值，会在浅色底上
+        // 造成同色不可读或过重描边）：灰绿系，与品牌绿协调且白底清晰
+        surfaceVariant: Color(0xFFDCEAE1),
+        onSurfaceVariant: Color(0xFF44584C),
+        outline: Color(0xFF6FA98A),
       ),
-      // 文字选区高亮用 cyan，与用户消息气泡底色(primary 蓝)区分开，
-      // 否则选中重叠在蓝色气泡上看不出框选效果。
+      // 输入框浅绿边框（聚焦时转品牌深绿）
+      inputDecorationTheme: const InputDecorationTheme(
+        enabledBorder: OutlineInputBorder(
+          borderSide: BorderSide(color: Color(0xFFB9DCC7)),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderSide: BorderSide(color: brandDeep, width: 1.5),
+        ),
+      ),
+      // 卡片：白底 + 浅绿描边
+      cardTheme: CardTheme(
+        color: Colors.white,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
+          side: const BorderSide(color: Color(0xFFC9E5D3)),
+        ),
+      ),
+      dialogTheme: const DialogTheme(
+        backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.all(Radius.circular(8)),
+          side: BorderSide(color: Color(0xFFC9E5D3)),
+        ),
+      ),
+      // 文字选区浅绿，与用户消息气泡底色(deep 绿)区分开；白底上清晰可见。
       textSelectionTheme: const TextSelectionThemeData(
-        selectionColor: Color(0xFF80DEEA),
-        selectionHandleColor: Color(0xFF00ACC1),
+        selectionColor: Color(0xFFA5E8C3),
+        selectionHandleColor: Color(0xFF00904A),
       ),
       useMaterial3: false,
     );
   }
 
-  /// 深色主题
+  /// 深色主题（黑背景 + 亮绿 HUD 弧线，主色 #00FF8C 与图标一致）
   ThemeData _buildDarkTheme() {
     return ThemeData(
+      fontFamily: 'Microsoft YaHei',
+      fontFamilyFallback: const ['PingFang SC', 'Noto Sans CJK SC', 'sans-serif'],
       brightness: Brightness.dark,
-      primaryColor: const Color(0xFF3B82F6),
-      scaffoldBackgroundColor: const Color(0xFF1F2937),
-      cardColor: const Color(0xFF374151),
+      primaryColor: brandBright,
+      scaffoldBackgroundColor: brandBlack,
+      cardColor: brandCard,
+      dividerColor: brandDivider,
+      dividerTheme: const DividerThemeData(color: brandDivider, thickness: 1),
       appBarTheme: const AppBarTheme(
-        backgroundColor: Color(0xFF111827),
-        foregroundColor: Colors.white,
+        backgroundColor: brandBlack,
+        foregroundColor: Color(0xFFD9FFEC),
         elevation: 0,
+        shape: Border(
+          bottom: BorderSide(color: brandDivider, width: 1),
+        ),
       ),
       colorScheme: const ColorScheme.dark(
-        primary: Color(0xFF3B82F6),
-        secondary: Color(0xFF3B82F6),
+        primary: brandBright,
+        onPrimary: onBrandBright,
+        secondary: brandBright,
+        onSecondary: onBrandBright,
+        primaryContainer: brandContainer,
+        onPrimaryContainer: onBrandContainer,
+        secondaryContainer: brandContainer,
+        onSecondaryContainer: onBrandContainer,
+        surface: brandBlack,
+        onSurface: Color(0xFFE6F3EC),
+        // 显式补充（ColorScheme.dark 未传时默认白色，半透明表层/状态文字
+        // 会亮到与深底失去层次，甚至同色不可见）：深绿灰系与品牌绿协调
+        surfaceVariant: Color(0xFF14251B),
+        onSurfaceVariant: Color(0xFFA9C9B6),
+        outline: Color(0xFF5E8E71),
       ),
-      // 深色模式下同样用 cyan 选区，避免与蓝色气泡/深色背景隐形。
+      inputDecorationTheme: const InputDecorationTheme(
+        enabledBorder: OutlineInputBorder(
+          borderSide: BorderSide(color: brandLine),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderSide: BorderSide(color: brandBright, width: 1.5),
+        ),
+      ),
+      cardTheme: CardTheme(
+        color: brandCard,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
+          side: const BorderSide(color: brandDivider),
+        ),
+      ),
+      dialogTheme: const DialogTheme(
+        backgroundColor: brandCard,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.all(Radius.circular(8)),
+          side: BorderSide(color: brandDivider),
+        ),
+      ),
+      // 深色模式下同样用 cyan 选区，避免与绿色气泡/深色背景隐形。
       textSelectionTheme: const TextSelectionThemeData(
         selectionColor: Color(0xFF4DD0E1),
         selectionHandleColor: Color(0xFF00ACC1),

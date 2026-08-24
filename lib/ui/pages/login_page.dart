@@ -226,8 +226,27 @@ class _LoginPageState extends State<LoginPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFFF3F4F6),
+    // 主题色（黑色背景 + 绿色边线框，见 main.dart 品牌色板）
+    final cs = Theme.of(context).colorScheme;
+    // 登录页保持品牌 HUD 暗色风：局部覆盖输入框样式为亮色，
+    // 避免浅色主题（白绿）派生出的黑字在黑卡片上不可读。
+    return Theme(
+      data: Theme.of(context).copyWith(
+        inputDecorationTheme: const InputDecorationTheme(
+          labelStyle: TextStyle(color: Color(0xFFB8FFD9)),
+          hintStyle: TextStyle(color: Color(0xFF94A3B8)),
+          enabledBorder: OutlineInputBorder(
+            borderSide: BorderSide(color: Color(0xFF2B7A4B)),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderSide: BorderSide(color: Color(0xFF00FF8C), width: 1.5),
+          ),
+        ),
+      ),
+      child: Scaffold(
+      // 登录页强制品牌黑底（HUD 风），不随浅色/深色主题变化，
+      // 与黑卡片、亮绿标题、白字按钮保持一致
+      backgroundColor: const Color(0xFF030705),
       body: Stack(
         children: [
           Center(
@@ -237,9 +256,7 @@ class _LoginPageState extends State<LoginPage> {
                 child: Card(
                   margin: const EdgeInsets.fromLTRB(24, 24, 24, 64),
                   elevation: 2,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
+                  // 卡片形状跟随主题 cardTheme（黑底 + 绿色描边）
                   child: Padding(
                     padding: const EdgeInsets.all(32),
                     child: Column(
@@ -250,7 +267,8 @@ class _LoginPageState extends State<LoginPage> {
                           style: TextStyle(
                             fontSize: 22,
                             fontWeight: FontWeight.bold,
-                            color: Color(0xFF2563EB),
+                            // 与 main.dart 品牌亮绿保持一致（黑底上高对比）
+                            color: Color(0xFF00FF8C),
                           ),
                         ),
                         const SizedBox(height: 24),
@@ -258,20 +276,22 @@ class _LoginPageState extends State<LoginPage> {
                         const SizedBox(height: 20),
                         TextField(
                           controller: _usernameController,
+                          style: const TextStyle(color: Color(0xFFE6F3EC)),
+                          cursorColor: const Color(0xFF00FF8C),
                           decoration: const InputDecoration(
                             labelText: '用户名',
                             prefixIcon: Icon(Icons.person_outline, size: 20),
-                            border: OutlineInputBorder(),
                           ),
                         ),
                         const SizedBox(height: 12),
                         TextField(
                           controller: _passwordController,
                           obscureText: true,
+                          style: const TextStyle(color: Color(0xFFE6F3EC)),
+                          cursorColor: const Color(0xFF00FF8C),
                           decoration: const InputDecoration(
                             labelText: '密码',
                             prefixIcon: Icon(Icons.lock_outline, size: 20),
-                            border: OutlineInputBorder(),
                           ),
                         ),
                         if (_isRegister) ...[
@@ -279,19 +299,21 @@ class _LoginPageState extends State<LoginPage> {
                           TextField(
                             controller: _confirmPasswordController,
                             obscureText: true,
+                            style: const TextStyle(color: Color(0xFFE6F3EC)),
+                            cursorColor: const Color(0xFF00FF8C),
                             decoration: const InputDecoration(
                               labelText: '确认密码',
                               prefixIcon: Icon(Icons.lock_outline, size: 20),
-                              border: OutlineInputBorder(),
                             ),
                           ),
                           const SizedBox(height: 12),
                           TextField(
                             controller: _nicknameController,
+                            style: const TextStyle(color: Color(0xFFE6F3EC)),
+                            cursorColor: const Color(0xFF00FF8C),
                             decoration: const InputDecoration(
                               labelText: '昵称（可选）',
                               prefixIcon: Icon(Icons.badge_outlined, size: 20),
-                              border: OutlineInputBorder(),
                             ),
                           ),
                         ],
@@ -312,17 +334,17 @@ class _LoginPageState extends State<LoginPage> {
                           child: ElevatedButton(
                             onPressed: _submitting ? null : _submit,
                             style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFF2563EB),
-                              foregroundColor: Colors.white,
+                              backgroundColor: cs.primary,
+                              foregroundColor: cs.onPrimary,
                               padding: const EdgeInsets.symmetric(vertical: 14),
                             ),
                             child: _submitting
-                                ? const SizedBox(
+                                ? SizedBox(
                                     width: 20,
                                     height: 20,
                                     child: CircularProgressIndicator(
                                       strokeWidth: 2,
-                                      color: Colors.white,
+                                      color: cs.onPrimary,
                                     ),
                                   )
                                 : Text(_isRegister ? '注册' : '登录'),
@@ -347,11 +369,12 @@ class _LoginPageState extends State<LoginPage> {
                 style: const TextStyle(fontSize: 13),
               ),
               style: TextButton.styleFrom(
-                foregroundColor: Colors.black54,
+                foregroundColor: Colors.white70,
               ),
             ),
           ),
         ],
+      ),
       ),
     );
   }
@@ -360,7 +383,8 @@ class _LoginPageState extends State<LoginPage> {
   Widget _buildModeSwitcher() {
     return Container(
       decoration: BoxDecoration(
-        color: const Color(0xFFF3F4F6),
+        // 品牌卡片底色（黑底绿边风格，与 main.dart brandCard 一致）
+        color: const Color(0xFF0A1A10),
         borderRadius: BorderRadius.circular(8),
       ),
       padding: const EdgeInsets.all(4),
@@ -381,16 +405,12 @@ class _LoginPageState extends State<LoginPage> {
         child: Container(
           padding: const EdgeInsets.symmetric(vertical: 8),
           decoration: BoxDecoration(
-            color: selected ? Colors.white : Colors.transparent,
+            // 选中项：品牌容器深绿底；未选中：透明
+            color: selected ? const Color(0xFF0E2B1A) : Colors.transparent,
             borderRadius: BorderRadius.circular(6),
-            boxShadow: selected
-                ? [
-                    BoxShadow(
-                      color: Colors.black.withOpacity(0.06),
-                      blurRadius: 4,
-                    ),
-                  ]
-                : null,
+            border: Border.all(
+              color: selected ? const Color(0xFF2B7A4B) : Colors.transparent,
+            ),
           ),
           child: Text(
             text,
@@ -399,8 +419,8 @@ class _LoginPageState extends State<LoginPage> {
               fontSize: 14,
               fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
               color: selected
-                  ? const Color(0xFF2563EB)
-                  : Colors.black.withOpacity(0.6),
+                  ? const Color(0xFF00FF8C)
+                  : const Color(0xFF94A3B8),
             ),
           ),
         ),

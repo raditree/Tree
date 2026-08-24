@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 
@@ -34,6 +35,13 @@ class MessageList extends StatelessWidget {
   /// 定位触发号：外部递增触发滚动定位（与 [scrollToMessageId] 配合）
   final int scrollToRevision;
 
+  /// 本次 revision 变化是否以「无动画直达底部」方式响应。
+  ///
+  /// 列表反转（reverse: true）后 offset 0 即视觉底部：历史整批重载
+  /// （切会话/切 agent/清空重拉）传 true 直接落在底部；流式追加/
+  /// 增量更新传 false 平滑滚动跟随（动画完成后校正一次）。
+  final bool bottomJump;
+
   const MessageList({
     super.key,
     required this.messages,
@@ -41,6 +49,7 @@ class MessageList extends StatelessWidget {
     this.onAskAnswer,
     this.scrollToMessageId,
     this.scrollToRevision = 0,
+    this.bottomJump = false,
   });
 
   @override
@@ -51,6 +60,7 @@ class MessageList extends StatelessWidget {
       onAskAnswer: onAskAnswer,
       scrollToMessageId: scrollToMessageId,
       scrollToRevision: scrollToRevision,
+      bottomJump: bottomJump,
     );
   }
 }
@@ -65,6 +75,7 @@ class _MessageListView extends StatefulWidget {
   final void Function(String messageId, String answer)? onAskAnswer;
   final String? scrollToMessageId;
   final int scrollToRevision;
+  final bool bottomJump;
 
   const _MessageListView({
     required this.messages,
@@ -72,6 +83,7 @@ class _MessageListView extends StatefulWidget {
     this.onAskAnswer,
     this.scrollToMessageId,
     this.scrollToRevision = 0,
+    this.bottomJump = false,
   });
 
   @override
@@ -96,11 +108,20 @@ class _MessageListViewState extends State<_MessageListView> {
   /// 定位重试次数（防止目标未构建时无限重试）
   int _scrollRetries = 0;
 
+  /// 视口锚定：用户查看历史时，记录视口顶部第一条可见消息，
+  /// 内容更新后按其实位置还原视口（消除被动下滚）
+  String? _anchorId;
+  double _anchorDy = 0;
+
+  /// 锚定还原迭代次数（最多 3 帧迭代校正）
+  int _restoreAttempts = 0;
+
   @override
   void initState() {
     super.initState();
     _controller.addListener(_onScroll);
-    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+    // 列表为反转模式（reverse: true），初始 offset 0 即视觉底部：
+    // 打开会话时首帧直接渲染在底部（最新消息），无需任何滚动。
   }
 
   @override
@@ -108,7 +129,23 @@ class _MessageListViewState extends State<_MessageListView> {
     super.didUpdateWidget(oldWidget);
     // 仅在用户已处于底部附近时，才随新消息自动滚动（避免打断用户查看历史）
     if (oldWidget.revision != widget.revision && _nearBottom) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        // 历史整批重载（切会话/切 agent/清空重拉）：无动画直达底部，
+        // 避免「从顶部下滑」的粗糙观感；流式追加/增量更新：平滑跟随。
+        if (widget.bottomJump) {
+          _jumpToBottom();
+        } else {
+          _scrollToBottomSmooth();
+        }
+      });
+    } else if (!_nearBottom) {
+      // 用户在查看历史：底部新增内容（工具卡片推送/流式追加等）会抬高
+      // 反转列表的 maxScrollExtent，固定 offset 时视口内容整体向新消息
+      // 方向偏移，表现为「推送一个卡片就下滚一个卡片高度」。
+      // 锚定视口顶部第一条可见消息，布局完成后按消息实际位置精确还原，
+      // 彻底消除被动下滚（不依赖未构建卡片高度的估算值）。
+      _captureAnchorAndRestore();
     }
     // 定位触发：scrollToRevision 变化且存在目标消息 id
     if (oldWidget.scrollToRevision != widget.scrollToRevision &&
@@ -119,6 +156,76 @@ class _MessageListViewState extends State<_MessageListView> {
         if (mounted) _scrollToMessage(widget.scrollToMessageId!);
       });
     }
+  }
+
+  /// 捕获当前视口顶部第一条可见消息，并在下一帧按其实位置还原视口。
+  ///
+  /// 反转列表在底部新增内容（工具卡片/流式文本）时，固定 offset 的视口
+  /// 内容会向新消息方向偏移（用户感知为「推一个卡片就下滚一点」）。
+  /// 这里在内容变化前记录视口顶部第一条可见消息的全局 y 坐标，布局完成后
+  /// 沿该坐标逐帧校正 offset（迭代至残差 <0.5px），使视口内容保持不动。
+  void _captureAnchorAndRestore() {
+    if (!_controller.hasClients) return;
+    final String? id = _firstVisibleMessageId();
+    if (id == null) return;
+    final BuildContext? ctx = _itemKeys[id]?.currentContext;
+    if (ctx == null) return;
+    final RenderBox? ro = ctx.findRenderObject() as RenderBox?;
+    if (ro == null || !ro.hasSize || ro.size.height <= 0) return;
+    _anchorId = id;
+    _anchorDy = ro.localToGlobal(Offset.zero).dy;
+    _restoreAttempts = 0;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _restoreAnchorStep();
+    });
+  }
+
+  /// 视口顶部（视觉最上）第一条可见消息 id。
+  ///
+  /// 遍历已构建消息项（ListView.builder 懒加载只构建视口附近项），
+  /// 以全局 y 坐标落在视口范围内、且 dy 最小者为「顶部第一条可见」。
+  String? _firstVisibleMessageId() {
+    String? best;
+    double bestDy = double.infinity;
+    RenderBox? viewportBox;
+    for (final String id in _itemKeys.keys) {
+      final BuildContext? ctx = _itemKeys[id]?.currentContext;
+      if (ctx == null) continue;
+      final RenderBox? ro = ctx.findRenderObject() as RenderBox?;
+      if (ro == null || !ro.hasSize || ro.size.height <= 0) continue;
+      viewportBox ??=
+          (RenderAbstractViewport.maybeOf(ro) as RenderBox?) ?? ro;
+      final double vpTop = viewportBox.localToGlobal(Offset.zero).dy;
+      final double vpBottom = vpTop + viewportBox.size.height;
+      final double dy = ro.localToGlobal(Offset.zero).dy;
+      final double bottom = dy + ro.size.height;
+      if (bottom <= vpTop || dy >= vpBottom) continue; // 完全不在视口内
+      if (dy < bestDy) {
+        bestDy = dy;
+        best = id;
+      }
+    }
+    return best;
+  }
+
+  /// 校正一帧：把锚定消息移回其原全局 y 坐标；残差大时下一帧继续。
+  void _restoreAnchorStep() {
+    if (!mounted || !_controller.hasClients || _anchorId == null) return;
+    final BuildContext? ctx = _itemKeys[_anchorId]?.currentContext;
+    if (ctx == null) return;
+    final RenderBox? ro = ctx.findRenderObject() as RenderBox?;
+    if (ro == null || !ro.hasSize) return;
+    final double nowDy = ro.localToGlobal(Offset.zero).dy;
+    final double diff = _anchorDy - nowDy;
+    if (diff.abs() < 0.5 || _restoreAttempts >= 3) return;
+    _restoreAttempts++;
+    // 反转列表：offset 增大 = 视口内容整体向下移动（消息 dy 增大），
+    // 故 offset 修正量 = diff（目标 y - 当前 y）。
+    final ScrollPosition pos = _controller.position;
+    pos.jumpTo((pos.pixels + diff).clamp(0.0, pos.maxScrollExtent));
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _restoreAnchorStep();
+    });
   }
 
   /// 滚动定位到指定消息并短暂高亮。
@@ -155,7 +262,10 @@ class _MessageListViewState extends State<_MessageListView> {
       if (_scrollRetries >= 2 || widget.messages.isEmpty) return;
       _scrollRetries++;
       final double ratio = idx / widget.messages.length;
-      _controller.jumpTo(_controller.position.maxScrollExtent * ratio);
+      // 反转列表：idx 越靠前（越旧）越靠近顶部（offset 大）；
+      // 按 (1 - ratio) 比例粗跳，使目标进入构建范围。
+      _controller
+          .jumpTo(_controller.position.maxScrollExtent * (1 - ratio));
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _scrollToMessage(id);
       });
@@ -165,19 +275,37 @@ class _MessageListViewState extends State<_MessageListView> {
   /// 监听滚动位置，更新 _nearBottom 标志
   void _onScroll() {
     if (!_controller.hasClients) return;
-    final double max = _controller.position.maxScrollExtent;
     final double pos = _controller.position.pixels;
-    _nearBottom = (max - pos) < 120;
+    // 反转列表：offset 0 即视觉底部，靠近底部 = pixels 接近 0
+    _nearBottom = pos < 120;
   }
 
-  /// 滚动到底部
-  void _scrollToBottom() {
+  /// 无动画直达底部。
+  ///
+  /// 列表为反转模式（reverse: true），offset 0 即视觉底部，与懒加载的
+  /// maxScrollExtent 估算无关：jumpTo(0) 必达真实底部，不存在
+  /// 「到不了底」问题，也无需逐帧迭代校正。
+  void _jumpToBottom() {
     if (!_controller.hasClients) return;
-    _controller.animateTo(
-      _controller.position.maxScrollExtent,
-      duration: const Duration(milliseconds: 200),
-      curve: Curves.easeOut,
-    );
+    _controller.jumpTo(0);
+  }
+
+  /// 平滑滚动到底部（流式追加/增量更新时跟随）。
+  ///
+  /// 反转列表底部即 offset 0；动画完成后校正一次，
+  /// 兼容动画被用户触摸打断未到底的情况。
+  void _scrollToBottomSmooth() {
+    if (!_controller.hasClients) return;
+    _controller
+        .animateTo(
+          0,
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOut,
+        )
+        .then((_) {
+      if (!mounted) return;
+      _jumpToBottom();
+    });
   }
 
   @override
@@ -211,10 +339,18 @@ class _MessageListViewState extends State<_MessageListView> {
     }
     return ListView.builder(
       controller: _controller,
+      // 反转列表：offset 0 即视觉底部。配合 itemBuilder 的反向索引，
+      // 视觉上「顶→底 = 旧→新」，最新消息固定显示在底部：
+      // 打开会话时首帧直接渲染在底部（最新消息），无「顶部闪一下再滑到底」；
+      // 追加新消息不顶动视图；查看历史向上滚。
+      reverse: true,
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       itemCount: widget.messages.length,
       itemBuilder: (BuildContext context, int index) {
-        final ChatMessage message = widget.messages[index];
+        // 反转列表中 index 0 渲染在视觉底部，故反向取数据：
+        // messages[len-1]（最新）在底部，messages[0]（最旧）在顶部
+        final ChatMessage message =
+            widget.messages[widget.messages.length - 1 - index];
         // 工具调用卡片：默认折叠，独立渲染
         Widget child;
         if (message.kind == 'tool') {
@@ -267,8 +403,10 @@ class _MessageListViewState extends State<_MessageListView> {
 
 /// 单条消息气泡
 ///
-/// 用户消息：右对齐，蓝色背景（#2563EB），白色文字。
-/// agent 消息：左对齐，白色背景，黑色文字，灰色边框。
+/// 用户消息：右对齐，主色背景（浅色 #00904A + 白字 / 深色 #00FF8C + 墨绿字），
+/// 文字用 onPrimary，保证对比度。
+/// agent 消息：左对齐，背景 cs.surface（浅色白底 / 深色黑底），文字 onSurface
+/// （浅色墨绿 / 深色浅绿白），边框 dividerColor。
 /// 流式消息在内容末尾追加闪烁光标（"|" 与空格每 500ms 交替）。
 /// 附件以小卡片形式展示在内容上方，含文件图标、文件名与大小。
 class _MessageBubble extends StatefulWidget {
@@ -387,8 +525,11 @@ class _MessageBubbleState extends State<_MessageBubble> {
 
   /// 构建消息内容（流式时追加闪烁光标）
   Widget _buildContent(ChatMessage message, bool isUser) {
-    final Color textColor =
-        isUser ? Colors.white : Theme.of(context).colorScheme.onSurface;
+    // 用户气泡底色为 cs.primary（深色主题下为亮绿 #00FF8C），
+    // 文字用 onPrimary（深色墨绿）保证对比度，避免白字在亮绿上看不清。
+    final Color textColor = isUser
+        ? Theme.of(context).colorScheme.onPrimary
+        : Theme.of(context).colorScheme.onSurface;
     final String text = message.content;
     // 流式但尚无内容：仅显示闪烁光标
     if (message.isStreaming && text.isEmpty) {
@@ -518,7 +659,7 @@ class _MessageBubbleState extends State<_MessageBubble> {
     final String minute =
         message.timestamp.minute.toString().padLeft(2, '0');
     final Color color = isUser
-        ? Colors.white70
+        ? Theme.of(context).colorScheme.onPrimary.withOpacity(0.7)
         : Theme.of(context).colorScheme.outline;
     return Text(
       '$hour:$minute',
@@ -530,10 +671,11 @@ class _MessageBubbleState extends State<_MessageBubble> {
   Widget _buildAttachments(bool isUser) {
     final List<Attachment> attachments = widget.message.attachments!;
     final cs = Theme.of(context).colorScheme;
-    final Color textColor = isUser ? Colors.white : cs.onSurface;
-    final Color subColor = isUser ? Colors.white70 : cs.onSurfaceVariant;
+    final Color textColor = isUser ? cs.onPrimary : cs.onSurface;
+    final Color subColor =
+        isUser ? cs.onPrimary.withOpacity(0.7) : cs.onSurfaceVariant;
     final Color borderColor =
-        isUser ? Colors.white24 : Theme.of(context).dividerColor;
+        isUser ? cs.onPrimary.withOpacity(0.3) : Theme.of(context).dividerColor;
     return Wrap(
       spacing: 6,
       runSpacing: 6,
@@ -541,7 +683,7 @@ class _MessageBubbleState extends State<_MessageBubble> {
         return Container(
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
           decoration: BoxDecoration(
-            color: isUser ? Colors.white10 : cs.surface,
+            color: isUser ? cs.onPrimary.withOpacity(0.08) : cs.surface,
             borderRadius: BorderRadius.circular(6),
             border: Border.all(color: borderColor),
           ),

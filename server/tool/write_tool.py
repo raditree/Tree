@@ -59,7 +59,8 @@ class WriteTool:
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "要写入的文件路径（工作空间内相对路径）",
+                            "description": "工作空间内相对路径（如 lib/foo.dart）；"
+                            "禁止绝对路径或盘符（如 E:\\foo.dart、E:/foo.dart 会被拒绝）",
                         },
                         "content": {
                             "type": "string",
@@ -87,7 +88,11 @@ class WriteTool:
         if not isinstance(file_path, str) or not file_path:
             return {"error": "file_path 不能为空"}
         if not self._is_valid_path(file_path):
-            return {"error": "非法文件路径，仅允许字母数字、/_-. 字符"}
+            return {
+                "error": "非法文件路径：必须为工作空间内相对路径（如 lib/foo.dart），"
+                "禁止绝对路径/盘符（如 E:\\foo.dart、E:/foo.dart）或 .. 回溯；"
+                "仅允许字母数字、/_-. 字符",
+            }
 
         content = arguments.get("content", "")
         if not isinstance(content, str):

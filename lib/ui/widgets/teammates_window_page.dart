@@ -190,7 +190,7 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
             backgroundColor: cs.primary,
             child: Text(
               widget.agent.name.isNotEmpty ? widget.agent.name[0] : 'L',
-              style: const TextStyle(color: Colors.white, fontSize: 14),
+              style: TextStyle(color: cs.onPrimary, fontSize: 14),
             ),
           ),
           const SizedBox(width: 12),

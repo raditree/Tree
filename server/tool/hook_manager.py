@@ -95,8 +95,11 @@ class HookTaskManager:
             return {"error": task.error, "task_id": task_id}
 
         if isinstance(io, LocalWorkspaceIO):
-            # 本地模式：前端托管分离进程，输出重定向在前端 cmd/bash 中完成
-            wrapped = f"{command} > {output_file} 2>&1"
+            # 本地模式：前端托管分离进程。输出文件由前端以**绝对路径流式写入**
+            # （Process 管道 → 文件），命令中不附加 shell 重定向——命令内
+            # `cd` 会改变 cmd 工作目录，相对路径（.output/hook_xxx.log）会
+            # 解析到错误位置导致重定向失败（表现为 hook 日志为空、exit=1）。
+            wrapped = command
             try:
                 result = run_io(io.exec_shell_hook(
                     workspace_id, task_id, wrapped, output_file,

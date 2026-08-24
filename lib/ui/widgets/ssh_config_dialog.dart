@@ -92,6 +92,7 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
     return AlertDialog(
       title: const Text('SSH 执行模式配置'),
       content: SingleChildScrollView(
@@ -108,8 +109,7 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
                   hintText: '例如 192.168.1.10 或 host.example.com',
                   helperText: '需从前端所在机器可达（IP 相对前端）',
                   prefixIcon: Icon(Icons.dns_outlined, size: 20),
-                  border: OutlineInputBorder(),
-                  isDense: true,
+                                    isDense: true,
                 ),
               ),
               const SizedBox(height: 12),
@@ -123,8 +123,7 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
                       decoration: const InputDecoration(
                         labelText: '端口',
                         hintText: '22',
-                        border: OutlineInputBorder(),
-                        isDense: true,
+                                                isDense: true,
                       ),
                     ),
                   ),
@@ -136,8 +135,7 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
                         labelText: '用户名',
                         hintText: 'root',
                         prefixIcon: Icon(Icons.person_outline, size: 20),
-                        border: OutlineInputBorder(),
-                        isDense: true,
+                                                isDense: true,
                       ),
                     ),
                   ),
@@ -149,8 +147,7 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
                 decoration: const InputDecoration(
                   labelText: '认证方式',
                   prefixIcon: Icon(Icons.vpn_key_outlined, size: 20),
-                  border: OutlineInputBorder(),
-                  isDense: true,
+                                    isDense: true,
                 ),
                 items: const <DropdownMenuItem<String>>[
                   DropdownMenuItem<String>(
@@ -176,8 +173,7 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
                   decoration: const InputDecoration(
                     labelText: '密码',
                     prefixIcon: Icon(Icons.lock_outline, size: 20),
-                    border: OutlineInputBorder(),
-                    isDense: true,
+                                        isDense: true,
                   ),
                 )
               else
@@ -189,8 +185,7 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
                         decoration: const InputDecoration(
                           labelText: '私钥路径',
                           hintText: '例如 C:\\Users\\xxx\\.ssh\\id_rsa',
-                          border: OutlineInputBorder(),
-                          isDense: true,
+                                                    isDense: true,
                         ),
                       ),
                     ),
@@ -210,8 +205,7 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
                   hintText: '/',
                   helperText: '顶部 agent 文件落在此目录下；成员落在其 workspaces/ 子目录',
                   prefixIcon: Icon(Icons.folder_outlined, size: 20),
-                  border: OutlineInputBorder(),
-                  isDense: true,
+                                    isDense: true,
                 ),
               ),
             ],
@@ -226,8 +220,8 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
         ElevatedButton(
           onPressed: _submit,
           style: ElevatedButton.styleFrom(
-            backgroundColor: const Color(0xFF2563EB),
-            foregroundColor: Colors.white,
+            backgroundColor: cs.primary,
+            foregroundColor: cs.onPrimary,
           ),
           child: const Text('测试并启用'),
         ),
