@@ -76,6 +76,9 @@ sandbox:
 # path 指向其他配置段的字段（点号分隔），help 返回时动态读取该字段的值，
 # 因此只在此处维护"要披露哪些项"，数值始终来源于 agents/docker 等配置，避免重复。
 help_policy:
+  # 每个用户最多可创建的顶层 agent 数。
+  # 注：max_per_user=-1/0/缺省时不限，实际运营上限为按用户等级控制的并发 agent 数
+  # （见 registration.levels.*.max_concurrent_agents，动态披露后续实现）；此处保留静态路径兜底即可。
   - name: "每个用户最多可创建的顶层 agent 数"
     path: "agents.max_per_user"
   - name: "团队最大层级深度（顶部 agent 为 Level 0）"
@@ -107,3 +110,59 @@ jwt:
   secret: ""
   algorithm: "HS256"
   expire_hours: 72
+
+# 用户注册与等级（registration）配置。
+# 各字段含义：
+#   - enabled                 ：是否开放注册
+#   - restore_level           ：是否允许等级恢复（默认关闭）
+#   - key_dir                 ：邀请码 .key 文件目录（留空 = server/ 目录）
+#   - levels.<level>          ：各等级配额（common/pro/ultra/beta），字段含义如下：
+#       - max_users              ：该等级最大可注册用户数（注册 + 升级均计入）
+#       - validity_minutes       ：邀请码有效期（分钟）
+#       - cooldown_minutes       ：邀请码到期后的冷却时间（分钟，>0 时冷却结束才重新生成）
+#       - max_concurrent_agents  ：该等级用户可同时运行的并发 agent 数（动态披露后续实现）
+#       - max_level              ：该等级允许的团队最大层级深度
+#       - max_members_per_level  ：该等级每层级最多指挥的成员数
+#       - rate_per_minute        ：常规速率限制（次/分钟）
+#       - active_rate_per_minute ：活跃态速率限制（次/分钟）
+registration:
+  enabled: true
+  restore_level: false
+  key_dir: ""
+  levels:
+    common:
+      max_users: 200
+      validity_minutes: 1440
+      cooldown_minutes: 0
+      max_concurrent_agents: 4
+      max_level: 2
+      max_members_per_level: 3
+      rate_per_minute: 12
+      active_rate_per_minute: 6
+    pro:
+      max_users: 50
+      validity_minutes: 360
+      cooldown_minutes: 0
+      max_concurrent_agents: 12
+      max_level: 2
+      max_members_per_level: 5
+      rate_per_minute: 24
+      active_rate_per_minute: 6
+    ultra:
+      max_users: 10
+      validity_minutes: 30
+      cooldown_minutes: 0
+      max_concurrent_agents: 72
+      max_level: 2
+      max_members_per_level: 7
+      rate_per_minute: 60
+      active_rate_per_minute: 6
+    beta:
+      max_users: 1
+      validity_minutes: 2
+      cooldown_minutes: 18
+      max_concurrent_agents: 500
+      max_level: 3
+      max_members_per_level: 5
+      rate_per_minute: 300
+      active_rate_per_minute: 6

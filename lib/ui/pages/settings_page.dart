@@ -43,6 +43,10 @@ class _SettingsPageState extends State<SettingsPage> {
   final TextEditingController _confirmNewPwdController = TextEditingController();
   bool _changingPassword = false;
 
+  // --- 等级升级 ---
+  final TextEditingController _upgradeController = TextEditingController();
+  bool _upgrading = false;
+
   // --- 后端配置 ---
   final TextEditingController _backendHostController = TextEditingController();
   final TextEditingController _backendPortController = TextEditingController();
@@ -68,6 +72,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _oldPwdController.dispose();
     _newPwdController.dispose();
     _confirmNewPwdController.dispose();
+    _upgradeController.dispose();
     _backendHostController.dispose();
     _backendPortController.dispose();
     super.dispose();
@@ -224,6 +229,47 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
+  /// 使用邀请码升级等级
+  Future<void> _upgrade() async {
+    final String code = _upgradeController.text.trim();
+    if (code.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请输入邀请码')),
+      );
+      return;
+    }
+    setState(() => _upgrading = true);
+    try {
+      final Map<String, dynamic> data = await ApiService.upgradeLevel(code);
+      if (!mounted) return;
+      final String level = data['level'] as String? ?? '';
+      final Map<String, dynamic>? user = data['user'] as Map<String, dynamic>?;
+      setState(() {
+        _upgrading = false;
+        // 把后端返回的最新 user 合并进本地用户信息
+        if (user != null) {
+          _user = {...?_user, ...user};
+        }
+      });
+      _upgradeController.clear();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已升级至 $level')),
+      );
+      // 刷新账号状态以获取最新等级
+      _loadAccountStatus();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _upgrading = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '升级失败：${e.toString().replaceFirst('Exception: ', '')}',
+          ),
+        ),
+      );
+    }
+  }
+
   /// 请求注销账号（进入十日倒计时）
   Future<void> _requestDeleteAccount() async {
     final bool? confirmed = await showDialog<bool>(
@@ -319,6 +365,10 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 8),
           _buildAccountCard(),
           const SizedBox(height: 24),
+          _buildSectionTitle('等级升级'),
+          const SizedBox(height: 8),
+          _buildUpgradeCard(),
+          const SizedBox(height: 24),
           _buildSectionTitle('修改密码'),
           const SizedBox(height: 8),
           _buildChangePasswordCard(),
@@ -406,6 +456,62 @@ class _SettingsPageState extends State<SettingsPage> {
                       )
                     : const Icon(Icons.lock_reset, size: 18),
                 label: Text(_changingPassword ? '修改中...' : '修改密码'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 等级升级卡片
+  Widget _buildUpgradeCard() {
+    final cs = Theme.of(context).colorScheme;
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              '等级升级',
+              style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              '输入邀请码升级等级，升级后保持到后端重启',
+              style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _upgradeController,
+              decoration: const InputDecoration(
+                labelText: '邀请码',
+                prefixIcon: Icon(Icons.vpn_key_outlined, size: 20),
+                isDense: true,
+              ),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: _upgrading ? null : _upgrade,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: cs.primary,
+                  foregroundColor: cs.onPrimary,
+                ),
+                icon: _upgrading
+                    ? SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: cs.onPrimary,
+                        ),
+                      )
+                    : const Icon(Icons.workspace_premium, size: 18),
+                label: Text(_upgrading ? '升级中...' : '升级'),
               ),
             ),
           ],
@@ -673,6 +779,17 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
+  /// 等级中文映射（未知名显示原字符串）
+  String _levelLabel(String level) {
+    const Map<String, String> levelNames = {
+      'common': '普通',
+      'pro': '专业',
+      'ultra': '旗舰',
+      'beta': '测试',
+    };
+    return levelNames[level] ?? level;
+  }
+
   /// 账号管理卡片
   Widget _buildAccountCard() {
     final cs = Theme.of(context).colorScheme;
@@ -691,6 +808,10 @@ class _SettingsPageState extends State<SettingsPage> {
     final String nickname = user['nickname'] as String? ?? '未知用户';
     final String openid = user['openid'] as String? ?? '未登录';
     final String avatar = user['avatar'] as String? ?? '';
+    // 当前等级：优先取本地 user，回退到账号状态中的 user，缺省 common
+    final String level = (user['level'] as String?) ??
+        ((_accountStatus?['user'] as Map<String, dynamic>?)?['level'] as String?) ??
+        'common';
 
     return Card(
       margin: EdgeInsets.zero,
@@ -737,6 +858,14 @@ class _SettingsPageState extends State<SettingsPage> {
                           color: Color(0xFF94A3B8),
                         ),
                         overflow: TextOverflow.ellipsis,
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        '等级：${_levelLabel(level)} ($level)',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Color(0xFF94A3B8),
+                        ),
                       ),
                     ],
                   ),

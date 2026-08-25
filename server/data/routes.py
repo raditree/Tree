@@ -13,7 +13,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from data import user_store
+from data import invitation_code, user_store
 from data.data_collection_store import (
     is_collection_enabled,
     list_sft_files,
@@ -36,6 +36,7 @@ from ws.auth import (
     revoke_token,
 )
 from config.config import get_config
+from config.levels import get_levels, get_registration_config
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,13 @@ class RegisterRequest(BaseModel):
     username: str
     password: str
     nickname: str = ""
+    invitation_code: str = ""
+
+
+class UpgradeRequest(BaseModel):
+    """等级升级请求体。"""
+
+    invitation_code: str
 
 
 class LoginRequest(BaseModel):
@@ -110,7 +118,11 @@ def _strip_sensitive_fields(user: Dict[str, Any]) -> Dict[str, Any]:
 
 @router.post("/auth/register")
 async def auth_register(request: Request, req: RegisterRequest):
-    """账号密码注册：创建新用户并返回 JWT token。"""
+    """账号密码注册：创建新用户并返回 JWT token。
+
+    registration.enabled=true 时要求有效邀请码，注册成功后把用户等级设置为
+    邀请码对应等级；enabled=false 时邀请码可选忽略，注册用户按默认 common。
+    """
     _check_auth_rate_limit(f"{request.client.host}|{req.username.strip()}")
     username = req.username.strip()
     if not username:
@@ -121,7 +133,24 @@ async def auth_register(request: Request, req: RegisterRequest):
         raise HTTPException(status_code=400, detail="密码长度不能少于 6 位")
     if user_store.get_user_by_username(username) is not None:
         raise HTTPException(status_code=409, detail="该用户名已被注册")
+
+    # 邀请码注册：enabled=true 时必填并校验/扣减名额
+    level: Optional[str] = None
+    if get_registration_config().get("enabled"):
+        code = req.invitation_code.strip()
+        if not code:
+            raise HTTPException(status_code=400, detail="请输入邀请码")
+        validate_level, reason = invitation_code.validate_code(code)
+        if validate_level is None:
+            raise HTTPException(status_code=400, detail=reason)
+        if not invitation_code.consume_code(validate_level):
+            raise HTTPException(status_code=400, detail="该邀请码使用人数已达上限")
+        level = validate_level
+
     user = user_store.create_account(username, req.password, req.nickname)
+    if level is not None:
+        user_store.set_user_level(user["openid"], level)
+        user["level"] = level  # create_account 返回 dict 默认 common，此处覆盖为邀请码等级
     public_user = _strip_sensitive_fields(user)
     token = create_token(public_user)
     return {"token": token, "user": public_user}
@@ -140,6 +169,66 @@ async def auth_login(request: Request, req: LoginRequest):
     public_user = _strip_sensitive_fields(user)
     token = create_token(public_user)
     return {"token": token, "user": public_user}
+
+
+# 等级元数据白名单：registration-config 仅返回这些字段，绝不包含邀请码本身
+_LEVEL_META_KEYS = (
+    "max_users",
+    "validity_minutes",
+    "cooldown_minutes",
+    "max_concurrent_agents",
+    "max_level",
+    "max_members_per_level",
+    "rate_per_minute",
+    "active_rate_per_minute",
+)
+
+
+@router.get("/auth/registration-config")
+async def auth_registration_config():
+    """查询注册配置：是否开放注册及各等级元数据（不含邀请码本身）。
+
+    返回 ``{"enabled": bool, "levels": {...}}``；registration 未配置时 levels 为空 dict。
+    """
+    enabled = bool(get_registration_config().get("enabled"))
+    level_meta = {}
+    for level, cfg in get_levels().items():
+        if not isinstance(cfg, dict):
+            continue
+        level_meta[level] = {k: cfg.get(k) for k in _LEVEL_META_KEYS}
+    return {"enabled": enabled, "levels": level_meta}
+
+
+@router.post("/auth/upgrade")
+async def auth_upgrade(
+    req: UpgradeRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """使用邀请码升级等级：将当前用户等级直接设置为邀请码对应等级。
+
+    enabled=false 时返回 400。升级对已注册用户不做降级限制，
+    等级可为相同或更高等级，直接设置为邀请码对应等级。
+    """
+    if not get_registration_config().get("enabled"):
+        raise HTTPException(status_code=400, detail="注册功能未开启，无法升级")
+    code = (req.invitation_code or "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="请输入邀请码")
+    level, reason = invitation_code.validate_code(code)
+    if level is None:
+        raise HTTPException(status_code=400, detail=reason)
+    if not invitation_code.consume_code(level):
+        raise HTTPException(status_code=400, detail="该邀请码使用人数已达上限")
+
+    openid = current_user.get("openid", "")
+    user_store.set_user_level(openid, level)
+    # 重新读取用户公开字典（含最新 level）；DB 查不到时回退 token 内用户并补 level
+    user = user_store.get_user_by_openid(openid)
+    if user is None:
+        user = dict(current_user)
+        user["level"] = level
+    public_user = _strip_sensitive_fields(user)
+    return {"level": level, "user": public_user}
 
 
 # ===== 微信登录认证（保留，但前端已不再使用） =====
@@ -235,6 +324,9 @@ async def wechat_callback(code: str, state: str):
                 "nickname": user_data.get("nickname", ""),
                 "avatar": user_data.get("headimgurl", ""),
             }
+
+    # 微信登录用户字典补齐 level（mock 模式 openid 不在 DB，get_user_level 返回 common，可接受）
+    user["level"] = user_store.get_user_level(user.get("openid", ""))
 
     # 生成 JWT token
     token = create_token(user)

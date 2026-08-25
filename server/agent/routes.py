@@ -574,10 +574,14 @@ async def create_agent_endpoint(
     if not req.model_id:
         raise HTTPException(status_code=400, detail="请选择模型")
     user_id = current_user.get("openid", "")
-    # 顶层 agent 数量限制（配置 agents.max_per_user）
-    max_per_user = int(get_config().get("agents", {}).get("max_per_user", 5))
+    # 顶层 agent 数量限制（配置 agents.max_per_user）。
+    # max_per_user 为 -1、0 或缺失时表示不限制（跳过该检查）；
+    # 实际运营上限由按用户等级控制的并发 agent 数决定
+    # （见 registration.levels.*.max_concurrent_agents，动态披露后续实现）。
+    raw_max = (get_config().get("agents") or {}).get("max_per_user")
+    max_per_user = int(raw_max) if raw_max is not None else 0
     existing = get_agents(user_id)
-    if len(existing) >= max_per_user:
+    if max_per_user > 0 and len(existing) >= max_per_user:
         raise HTTPException(
             status_code=400,
             detail=f"每个用户最多创建 {max_per_user} 个 Agent，已达上限",

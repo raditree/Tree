@@ -22,6 +22,7 @@ class _LoginPageState extends State<LoginPage> {
   final TextEditingController _passwordController = TextEditingController();
   final TextEditingController _confirmPasswordController = TextEditingController();
   final TextEditingController _nicknameController = TextEditingController();
+  final TextEditingController _invitationController = TextEditingController();
 
   /// 后端 IP 与端口输入控制器（左下角切换后端地址用）
   final TextEditingController _backendHostController = TextEditingController();
@@ -33,6 +34,9 @@ class _LoginPageState extends State<LoginPage> {
   /// 当前是否处于注册模式
   bool _isRegister = false;
 
+  /// 后端是否开启邀请码注册
+  bool _registrationEnabled = false;
+
   /// 是否正在提交
   bool _submitting = false;
 
@@ -43,6 +47,7 @@ class _LoginPageState extends State<LoginPage> {
   void initState() {
     super.initState();
     _loadBackendConfig();
+    _loadRegistrationConfig();
   }
 
   @override
@@ -51,9 +56,21 @@ class _LoginPageState extends State<LoginPage> {
     _passwordController.dispose();
     _confirmPasswordController.dispose();
     _nicknameController.dispose();
+    _invitationController.dispose();
     _backendHostController.dispose();
     _backendPortController.dispose();
     super.dispose();
+  }
+
+  /// 加载后端注册配置（决定注册页是否展示邀请码输入框）
+  Future<void> _loadRegistrationConfig() async {
+    try {
+      final Map<String, dynamic> data = await ApiService.getRegistrationConfig();
+      if (!mounted) return;
+      setState(() => _registrationEnabled = data['enabled'] == true);
+    } catch (_) {
+      // 获取失败时保持关闭，不阻塞登录页
+    }
   }
 
   /// 加载本地保存的后端地址配置（未自定义时使用平台默认值）
@@ -158,6 +175,9 @@ class _LoginPageState extends State<LoginPage> {
       _isRegister = isRegister;
       _errorMsg = '';
     });
+    if (isRegister) {
+      _invitationController.clear();
+    }
   }
 
   /// 提交登录或注册
@@ -176,6 +196,10 @@ class _LoginPageState extends State<LoginPage> {
         setState(() => _errorMsg = '两次输入的密码不一致');
         return;
       }
+      if (_registrationEnabled && _invitationController.text.trim().isEmpty) {
+        setState(() => _errorMsg = '请输入邀请码');
+        return;
+      }
     }
 
     setState(() {
@@ -190,6 +214,7 @@ class _LoginPageState extends State<LoginPage> {
           username: username,
           password: password,
           nickname: _nicknameController.text.trim(),
+          invitationCode: _invitationController.text.trim(),
         );
       } else {
         data = await ApiService.login(username: username, password: password);
@@ -316,6 +341,18 @@ class _LoginPageState extends State<LoginPage> {
                               prefixIcon: Icon(Icons.badge_outlined, size: 20),
                             ),
                           ),
+                          if (_registrationEnabled) ...[
+                            const SizedBox(height: 12),
+                            TextField(
+                              controller: _invitationController,
+                              style: const TextStyle(color: Color(0xFFE6F3EC)),
+                              cursorColor: const Color(0xFF00FF8C),
+                              decoration: const InputDecoration(
+                                labelText: '邀请码（必填）',
+                                prefixIcon: Icon(Icons.vpn_key_outlined, size: 20),
+                              ),
+                            ),
+                          ],
                         ],
                         if (_errorMsg.isNotEmpty) ...[
                           const SizedBox(height: 12),

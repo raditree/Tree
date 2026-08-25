@@ -1,16 +1,20 @@
-"""主动延迟限流：按 (user_id, agent_id) 粒度的令牌桶限流器。
+"""分级 API 限流：按 (user_id, agent_id) 粒度的令牌桶限流器。
 
-「主动延迟」开关（前端设置页）开启后，限制单个 agent 的 LLM API 调用频率
-为平均 6 次/分钟（即每次调用最小间隔 10s）。适合交互式开发——放慢 agent
-节奏，避免一口气烧完大量 API 调用，让用户跟得上每个步骤。
+按用户等级 + 「主动延迟」开关动态解析限流间隔（秒）：
+- 主动延迟关闭（is_user_enabled=False）：interval = 60 / 等级 rate_per_minute
+  （common 12 / pro 24 / ultra 60 / beta 300 次/分钟）；
+- 主动延迟开启（is_user_enabled=True）：interval = 60 / 等级
+  active_rate_per_minute（各等级均 6 次/分钟），适合交互式开发——放慢 agent
+  节奏，避免一口气烧完大量 API 调用，让用户跟得上每个步骤；
+- 等级配置缺失或 rate<=0 时回退 MIN_INTERVAL（60 / llm.rate_per_minute，默认 6/min）。
+- 无论是否开启主动延迟都限流；缺少 user_id / agent_id 时直接放行。
 
 实现采用游戏帧率控制式**固定时间步（fixed time-step pacing）**思想：
 - 令牌桶容量 1：距上次调用已超过间隔时立即放行（等效帧率下界）；
-- 补充速率 6 令牌/分钟（1 令牌/10s）：无令牌时阻塞等待直至补满，
-  保证任意滑动窗口内的平均频率不超过 6 次/分钟（比简单 sleep 更平滑，
-  也不会在长时间空闲后允许突发爆发，与「平均限速」语义一致）。
+- 无令牌时阻塞等待直至补满，保证任意滑动窗口内的平均频率不超过对应等级
+  的限速（比简单 sleep 更平滑，也不会在长时间空闲后允许突发爆发）。
 
-开启状态按用户（openid）持久化（``server/data/rate_limit_store.py``），
+主动延迟开关按用户（openid）持久化（``server/data/rate_limit_store.py``），
 本模块维护内存缓存（``_user_enabled``）与按 (user_id, agent_id) 的限流器
 实例（``_limiters``），避免每次 API 调用都查 SQLite。
 """
@@ -21,7 +25,9 @@ from typing import Dict, Optional, Tuple
 # 日志器
 import logging
 
+from config import levels
 from config.config import get_config
+from data import user_store
 
 logger = logging.getLogger(__name__)
 
@@ -58,17 +64,26 @@ class AgentRateLimiter:
         # 下一次允许发起 API 调用的时间（time.monotonic 时间戳）
         self._next_allowed = 0.0
 
-    def acquire(self, cancel_event: Optional[threading.Event] = None) -> bool:
+    def acquire(
+        self,
+        cancel_event: Optional[threading.Event] = None,
+        interval: Optional[float] = None,
+    ) -> bool:
         """获取令牌：通过则返回 True；等待期间被取消返回 False。
+
+        ``interval`` 为本调用应遵循的最小间隔（秒），缺省或非正数时用
+        ``MIN_INTERVAL`` 兜底；``_next_allowed`` 推进使用该 interval。
 
         返回 False 时**不消费令牌**（下次调用仍按原节奏），调用方应中止
         本轮 API 调用（如已收到停止信号）。
         """
+        if not interval or interval <= 0:
+            interval = MIN_INTERVAL
         with self._lock:
             now = time.monotonic()
             if now >= self._next_allowed:
                 # 有令牌：立即放行，并把下次允许时间推到间隔之后
-                self._next_allowed = now + MIN_INTERVAL
+                self._next_allowed = now + interval
                 return True
             wait = self._next_allowed - now
 
@@ -77,7 +92,7 @@ class AgentRateLimiter:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    self._next_allowed = time.monotonic() + MIN_INTERVAL
+                    self._next_allowed = time.monotonic() + interval
                     return True
                 if cancel_event is not None:
                     # 等待期间可响应「停止」：最多等 0.2s 检查一次
@@ -101,6 +116,30 @@ def is_user_enabled(user_id: str) -> bool:
     return bool(_user_enabled.get(user_id))
 
 
+def _resolve_interval(user_id: str) -> float:
+    """按用户等级 + 主动延迟开关解析最小调用间隔（秒）。
+
+    - 主动延迟关闭（is_user_enabled=False）：用该等级配置的 ``rate_per_minute``；
+    - 主动延迟开启（is_user_enabled=True）：用该等级配置的 ``active_rate_per_minute``；
+    - 间隔 = 60 / rate（次/分钟）；等级配置缺失或 rate<=0 时回退 ``MIN_INTERVAL``。
+
+    ``user_store.get_user_level`` / ``levels.get_level_config`` 均已对非法值
+    兜底；此处再包一层异常保护，避免个别用户数据异常拖垮限流入口。
+    """
+    try:
+        level = user_store.get_user_level(user_id)
+        cfg = levels.get_level_config(level)
+        if is_user_enabled(user_id):
+            rate = float(cfg.get("active_rate_per_minute", 0) or 0)
+        else:
+            rate = float(cfg.get("rate_per_minute", 0) or 0)
+    except Exception:  # noqa: BLE001 - 兜底：解析失败也按最小间隔限流
+        rate = 0.0
+    if rate <= 0:
+        return MIN_INTERVAL
+    return 60.0 / rate
+
+
 def load_enabled_users(prefs: Dict[str, bool]) -> None:
     """启动时预载全部用户的主动延迟开关（来自 SQLite 持久化）。"""
     with _registry_lock:
@@ -117,27 +156,40 @@ def reset_user(user_id: str) -> None:
             _limiters.pop(key, None)
 
 
+def set_user_level(user_id: str, level: str) -> None:
+    """等级变更后清除该用户所有限流器实例，使新等级节奏立即生效。
+
+    用户等级的内存缓存/落盘由 ``data.user_store`` 维护，这里只做限流器
+    复位：下次 ``acquire`` 会按新等级重新解析间隔并重新获得一枚令牌，
+    避免旧等级残留的 ``_next_allowed`` 拖延新等级的首个调用。
+    """
+    with _registry_lock:
+        for key in [k for k in _limiters if k[0] == user_id]:
+            _limiters.pop(key, None)
+
+
 def acquire(
     user_id: str,
     agent_id: str,
     cancel_event: Optional[threading.Event] = None,
 ) -> bool:
-    """主动延迟限流入口：按 (user_id, agent_id) 获取令牌。
+    """分级 API 限流入口：按 (user_id, agent_id) 获取令牌。
 
-    - 用户未开启 / 缺少 user_id / agent_id 时直接放行（不产生任何等待）。
-    - 开启时等待令牌（平均 6 次/分钟），等待期间可被 ``cancel_event`` 取消。
+    - 缺少 user_id / agent_id 时直接放行（不产生任何等待）。
+    - 无论是否开启主动延迟都限流：间隔按用户等级 + 开关动态解析
+      （关闭用等级 ``rate_per_minute``，开启用等级 ``active_rate_per_minute``）。
+    - 等待期间可被 ``cancel_event`` 取消。
     - 返回 False 表示应中止本轮 API 调用（收到停止信号）。
     """
     if not user_id or not agent_id:
         return True
-    if not is_user_enabled(user_id):
-        return True
+    interval = _resolve_interval(user_id)
     with _registry_lock:
         limiter = _limiters.get((user_id, agent_id))
         if limiter is None:
             limiter = AgentRateLimiter()
             _limiters[(user_id, agent_id)] = limiter
-    return limiter.acquire(cancel_event)
+    return limiter.acquire(cancel_event, interval)
 
 
 __all__ = [
@@ -147,6 +199,7 @@ __all__ = [
     "load_enabled_users",
     "reset_user",
     "set_user_enabled",
+    "set_user_level",
     "MIN_INTERVAL",
     "RATE_PER_MINUTE",
 ]

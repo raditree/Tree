@@ -129,11 +129,13 @@ class ApiService {
   ///
   /// 调用 `POST /api/auth/register`，请求体为
   /// `{"username", "password", "nickname"}`，返回 `{"token", "user"}`。
+  /// 注册开启邀请码时，[invitationCode] 非空会附带 `invitation_code` 字段。
   /// 用户名冲突或校验失败时抛出中文异常。
   static Future<Map<String, dynamic>> register({
     required String username,
     required String password,
     String nickname = '',
+    String invitationCode = '',
   }) async {
     final http.Response response = await http.post(
       Uri.parse('$baseUrl/api/auth/register'),
@@ -142,6 +144,7 @@ class ApiService {
         'username': username,
         'password': password,
         'nickname': nickname,
+        if (invitationCode.isNotEmpty) 'invitation_code': invitationCode,
       }),
     );
     if (response.statusCode != 200) {
@@ -167,6 +170,26 @@ class ApiService {
       throw Exception(_errorFromBody(response));
     }
     return _parseJson(utf8.decode(response.bodyBytes));
+  }
+
+  /// 查询注册配置（邀请码注册开关与等级配置）
+  ///
+  /// 调用 `GET /api/auth/registration-config`，返回
+  /// `{"enabled": bool, "levels": {level: {...}}}`。
+  /// 网络异常或后端返回错误时抛出中文异常。
+  static Future<Map<String, dynamic>> getRegistrationConfig() async {
+    return _getJson('/api/auth/registration-config');
+  }
+
+  /// 使用邀请码升级等级
+  ///
+  /// 调用 `POST /api/auth/upgrade`，请求体为 `{"invitation_code": "..."}`，
+  /// 需登录。返回 `{"level": "...", "user": {...}}`。
+  /// 网络异常或后端返回错误时抛出中文异常。
+  static Future<Map<String, dynamic>> upgradeLevel(String invitationCode) async {
+    return _postJson('/api/auth/upgrade', body: {
+      'invitation_code': invitationCode,
+    });
   }
 
   /// 查询账号注销状态

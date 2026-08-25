@@ -214,8 +214,9 @@ def init_team_for_top(
     :param user_id: 用户标识
     :param top_agent: 刚创建的 TOP agent 记录（需含 id/name/workspace_id）
     :param docker_manager: DockerManager 或 None
-    :param member_count: 要创建的成员数，缺省用配置
-        ``(agents.max_members_per_level 的默认 16)``
+    :param member_count: 要创建的成员数，缺省按用户等级解析
+        ``registration.levels.<level>.max_members_per_level``（未配置 / 等级缺失时
+        回退 ``docker_manager.max_members_per_level``）
     :return: ``{"team":..., "members": [...], "created_count": n}``；
              名字池不足抛 ValueError
     """
@@ -239,10 +240,15 @@ def init_team_for_top(
             "created_count": 0,
         }
 
-    # 确定成员数量：默认 16（标准角色模板长度）
-    cfg_max = 16
-    if docker_manager is not None:
-        cfg_max = int(getattr(docker_manager, "max_members_per_level", 16) or 16)
+    # 确定成员数量：按用户等级解析 max_members_per_level（优先）；
+    # 未配置 registration / 等级缺失时回退 docker_manager.max_members_per_level
+    from tool.team_tool import _resolve_team_limits
+
+    _, cfg_max = _resolve_team_limits(
+        user_id,
+        fallback_members=getattr(docker_manager, "max_members_per_level", None)
+        if docker_manager is not None else None,
+    )
     count = int(member_count or cfg_max)
     if count < 1:
         count = 1

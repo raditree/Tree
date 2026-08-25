@@ -985,6 +985,42 @@ def _is_agent_working(user_id: str, agent_id: str) -> bool:
     )
 
 
+def _count_active_agents(user_id: str) -> int:
+    """统计该用户当前"正在工作"的不同 agent 数量（并发执行数）。
+
+    _active_tasks 以 (user_id, agent_id, session_id) 为键，同一 agent 的
+    多个会话只算一个并发名额，故按 agent_id 去重计数。
+    """
+    return len({aid for (uid, aid, _sid) in _active_tasks if uid == user_id})
+
+
+def _concurrency_limit_reached(user_id: str) -> Tuple[bool, int]:
+    """判断该用户是否已达并发执行 agent 数上限。
+
+    按等级配置 ``max_concurrent_agents`` 限制：common 4 / pro 12 /
+    ultra 72 / beta 500；<=0 或缺失 = 不限。
+
+    :return: (是否已达上限, 当前并发数)；不限时返回 (False, 0)。
+    """
+    active = _count_active_agents(user_id)
+    # 惰性 import：chat.py 较大，避免顶层新增依赖引起循环导入
+    #（user_store / config.levels 均不反向 import chat，可安全在函数内 import）
+    from data.user_store import get_user_level
+    from config.levels import get_level_config
+
+    try:
+        level = get_user_level(user_id)
+        cfg = get_level_config(level)
+        limit = int(cfg.get("max_concurrent_agents", 0) or 0)
+    except Exception as exc:  # noqa: BLE001
+        # 等级读取失败（如 DB 异常）时按"不限"放行，避免并发门禁阻断正常投递
+        logger.warning("读取用户并发上限失败，按不限处理 user=%s: %s", user_id, exc)
+        return False, 0
+    if limit <= 0:
+        return False, 0
+    return active >= limit, active
+
+
 def _cancel_all_agent_tasks(
     user_id: str, agent_id: str
 ) -> List[Tuple[str, str, str]]:
@@ -1785,10 +1821,45 @@ def _dispatch_agent_message(
     owner_top = top_agent_id or source_agent_id or ""
     sent: List[str] = []
     rejected: List[str] = []
+    # 因用户并发执行上限被拒绝的 target（Task 7：按用户等级限制并发 agent 数）
+    concurrency_limited: List[str] = []
+    # auto_reply（agent 侧自动回复）消息跳过并发检查，防止递归拒绝/误伤
+    # 既有 auto_reply 通道（成员模型缺失回传、成员完成回传等）。
+    is_auto_reply = bool((extra or {}).get("auto_reply"))
     for target_id in target_ids:
         if not target_id or target_id == source_agent_id:
             rejected.append(target_id)
             continue
+
+        # 并发执行上限检查（Task 7）：
+        # - 仅当目标当前未在 working（这条消息会使其新进入 working、新增并发名额）才检查；
+        #   已 working 的目标消息只是入队，不新增并发，直接放行。
+        # - 用户直发（source_agent_id==""）命中上限时拒绝投递（由 _dispatch_user_message
+        #   提示用户）；agent→agent 命中上限时以 auto_reply 方式回发 429 给发送方。
+        if not is_auto_reply and not _is_agent_working(user_id, target_id):
+            limit_reached, active = _concurrency_limit_reached(user_id)
+            if limit_reached:
+                concurrency_limited.append(target_id)
+                if source_agent_id:
+                    _reply_session = (extra or {}).get(
+                        "session_id", DEFAULT_SESSION
+                    )
+                    try:
+                        _dispatch_agent_message(
+                            user_id,
+                            [source_agent_id],
+                            f"[成员 {target_id} 无法处理] 当前并发任务已达上限"
+                            f"（{active} 个），请稍等片刻再试。",
+                            source_agent_id=target_id,
+                            top_agent_id=top_agent_id or source_agent_id,
+                            extra={
+                                "auto_reply": True,
+                                "session_id": _reply_session,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("回传并发限制 429 错误失败: %s", exc)
+                continue
 
         # 1) 目标为顶部 agent（agent_store 中可查）
         target_agent = get_agent(user_id, target_id)
@@ -1868,6 +1939,22 @@ def _dispatch_agent_message(
         else:
             rejected.append(target_id)
 
+    if concurrency_limited:
+        result = {
+            "sent": sent,
+            "rejected": rejected,
+            "concurrency_limited": concurrency_limited,
+        }
+        # 仅当全部 target 都被并发拒绝（无成功、无其他原因拒绝）时整体标记，
+        # 供 _dispatch_user_message 据此提示用户，而不回落到 _handle_user_message。
+        if not sent and not rejected:
+            result["status"] = "concurrency_limited"
+        elif not sent:
+            result["status"] = "error"
+        else:
+            result["status"] = "sent" if not rejected else "partial"
+        return result
+
     if not sent:
         return {"status": "error", "sent": sent, "rejected": rejected}
     return {
@@ -1901,6 +1988,17 @@ async def _dispatch_user_message(user_id: str, data: Dict[str, Any]) -> None:
         "",
         dict(data),
     )
+    if result.get("status") == "concurrency_limited":
+        # 并发执行上限命中（Task 7）：提示用户稍后再试，不回落到
+        # _handle_user_message（否则会再次触发超限）。
+        active = _count_active_agents(user_id)
+        await _send_text_as_agent(
+            user_id,
+            agent_id,
+            f"并发任务已达上限（当前并发 {active} 个），请稍等片刻再试",
+            session_id=data.get("session_id", DEFAULT_SESSION),
+        )
+        return
     if result.get("status") == "error":
         asyncio.create_task(_handle_user_message(user_id, data))
 

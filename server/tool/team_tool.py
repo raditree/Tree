@@ -54,6 +54,44 @@ def _fmt_ts(value: Any) -> str:
         return str(value)
 
 
+def _resolve_team_limits(user_id: str, fallback_members: Optional[int] = None):
+    """按用户等级解析团队规模限制，返回 ``(max_level, max_members_per_level)``。
+
+    优先取 ``registration.levels.<level>.max_level`` 与 ``max_members_per_level``；
+    未配置 registration 或等级缺失时：
+    - ``max_level`` 回退 ``agents.max_level``
+    - ``max_members_per_level`` 优先回退 ``fallback_members``（实例级兜底，
+      如 ``docker_manager.max_members_per_level``），再回退
+      ``docker.max_members_per_level``
+
+    返回值均为 >=1 的整数。
+    """
+    from config.levels import get_level_config
+    from data.user_store import get_user_level
+
+    cfg = get_level_config(get_user_level(user_id))
+    max_level = cfg.get("max_level")
+    max_members = cfg.get("max_members_per_level")
+    if max_level is None:
+        max_level = get_config().get("agents", {}).get("max_level", 3)
+    if max_members is None:
+        if fallback_members:
+            max_members = fallback_members
+        else:
+            max_members = get_config().get("docker", {}).get(
+                "max_members_per_level", 7
+            )
+    try:
+        max_level = max(1, int(max_level))
+    except (TypeError, ValueError):
+        max_level = 3
+    try:
+        max_members = max(1, int(max_members))
+    except (TypeError, ValueError):
+        max_members = 7
+    return max_level, max_members
+
+
 class TeamTool:
     """team 工具：团队成员管理、消息管理、任务管理。
 
@@ -119,10 +157,9 @@ class TeamTool:
 
         # 当前 agent 层级：顶部 agent 为 Level 0
         self.level: int = 0
-        # 团队最大层级深度（配置 agents.max_level，顶部为 Level 0）
-        self.max_team_level: int = int(
-            get_config().get("agents", {}).get("max_level", 3)
-        )
+        # 团队最大层级深度（按用户等级解析，顶部为 Level 0；
+        # 未配置 registration / 等级缺失时回退 agents.max_level）
+        self.max_team_level, _ = _resolve_team_limits(self.user_id)
         # 当前 agent 是否可带领团队（由 set 工具设置；False 时不可创建子团队）
         self.can_lead_team: bool = True
 
@@ -566,8 +603,14 @@ class TeamTool:
         if self.level >= self.max_team_level:
             return {"error": "已达最大层级（Level 3），不可继续创建子团队"}
 
-        # 每级成员数量上限（配置 docker.max_members_per_level）
-        max_members = getattr(self.docker_manager, "max_members_per_level", 8)
+        # 每级成员数量上限（按用户等级解析；
+        # 未配置 registration / 等级缺失时回退 docker_manager.max_members_per_level）
+        _, max_members = _resolve_team_limits(
+            self.user_id,
+            fallback_members=getattr(
+                self.docker_manager, "max_members_per_level", None
+            ),
+        )
         if len(self.members) >= max_members:
             return {
                 "error": f"当前 agent 的成员数量已达上限（{max_members}），"

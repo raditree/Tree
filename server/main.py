@@ -24,8 +24,10 @@ from agent.chat import (
 from agent.routes import router as agent_router
 from agent.team_broker import TeamMessageBroker
 from config.config import get_config
+from config.levels import get_levels
 from config.logging_config import setup_logging
 from config.models import get_model_configs
+from data.invitation_code import init_invitation_codes, invitation_code_loop
 from data.routes import router as data_router
 from data.user_store import purge_expired_users
 from io_.docker_manager import DockerManager
@@ -55,6 +57,11 @@ async def lifespan(app: FastAPI):
     from llm.rate_limit import load_enabled_users
 
     load_enabled_users(load_all_rate_limit_prefs())
+
+    # 预载用户等级到内存缓存（按配置 registration.restore_level 决定是否从 DB 恢复）
+    from data.user_store import load_user_levels
+
+    load_user_levels()
 
     # 本地执行器客户端：本地模式下工具调用经反向 WS 转发给前端本地执行
     local_executor = LocalExecutorClient()
@@ -139,6 +146,14 @@ async def lifespan(app: FastAPI):
 
     sft_task = asyncio.create_task(_sft_export_loop())
 
+    # 启动后台任务：每个等级一个邀请码生命周期循环（到期自动更新 key 文件）。
+    # levels 为空（registration 未配置）时列表为空，不启动任何邀请码任务。
+    init_invitation_codes()
+    invitation_tasks = [
+        asyncio.create_task(invitation_code_loop(level))
+        for level in get_levels()
+    ]
+
     yield
     print("[关闭] 服务退出")
     purge_task.cancel()
@@ -151,6 +166,13 @@ async def lifespan(app: FastAPI):
         await sft_task
     except asyncio.CancelledError:
         pass
+    for task in invitation_tasks:
+        task.cancel()
+    for task in invitation_tasks:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(

@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from config.levels import DEFAULT_LEVEL, is_valid_level
+
 # 数据库目录与文件（与 agent_store/conversation_store 保持一致）
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 _DB_PATH = _DATA_DIR / "conversations.db"
@@ -28,9 +30,31 @@ _DB_PATH = _DATA_DIR / "conversations.db"
 _write_lock = threading.Lock()
 _initialized = False
 
+# 用户等级内存缓存（user_id(openid) -> level），用独立锁保护，与 DB 写锁分开
+_level_cache: Dict[str, str] = {}
+_level_cache_lock = threading.Lock()
+# 是否允许从 DB 恢复用户等级：restore_level=false（默认）时重启不恢复上次会话
+# 落盘的等级，全部按 DEFAULT_LEVEL=common；由 load_levels_from_db() 设置。
+# 关闭后 get_user_level 缓存未命中时直接返回 common，不再回读 DB 里旧等级
+# （但 DB 落盘值本身不改，供 restore_level=true 或未来重新启用时保留）。
+_level_restore_enabled: bool = True
+
 # 注销流程天数配置
 CANCEL_GRACE_DAYS = 10      # 申请注销后的十日倒计时（期间可取消）
 RETENTION_AFTER_CANCEL = 31  # 倒计时结束后数据保留 31 天
+
+
+def _ensure_level_column(conn: sqlite3.Connection) -> None:
+    """幂等迁移：老库 users 表缺少 level 列时补加（新库 CREATE TABLE 已含）。
+
+    通过 PRAGMA table_info(users) 检查列是否存在，不存在才 ALTER，
+    因此重复调用不报错、不重复修改。
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "level" not in cols:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN level TEXT NOT NULL DEFAULT 'common'"
+        )
 
 
 def _ensure_db() -> None:
@@ -52,6 +76,7 @@ def _ensure_db() -> None:
                 nickname TEXT NOT NULL DEFAULT '',
                 avatar TEXT NOT NULL DEFAULT '',
                 source TEXT NOT NULL DEFAULT 'account',
+                level TEXT NOT NULL DEFAULT 'common',
                 delete_requested_at INTEGER,
                 cancel_deadline INTEGER,
                 delete_at INTEGER,
@@ -59,6 +84,8 @@ def _ensure_db() -> None:
             )
             """
         )
+        # 老库迁移：确保 level 列存在（幂等）
+        _ensure_level_column(conn)
         conn.commit()
     _initialized = True
 
@@ -103,6 +130,7 @@ def _row_to_user(row: sqlite3.Row) -> Dict[str, Any]:
         "nickname": row["nickname"],
         "avatar": row["avatar"],
         "source": row["source"],
+        "level": row["level"],
         "delete_requested_at": row["delete_requested_at"],
         "cancel_deadline": row["cancel_deadline"],
         "delete_at": row["delete_at"],
@@ -341,3 +369,103 @@ def purge_expired_users() -> int:
             conn.commit()
         deleted += 1
     return deleted
+
+
+# ----------------------------------------------------------------------
+# 用户等级（level）读写：内存缓存 + 落盘
+# ----------------------------------------------------------------------
+def get_user_level(user_id: str) -> str:
+    """返回用户等级。
+
+    优先读内存缓存；缓存未命中则读 DB（users.level，用户不存在时按
+    DEFAULT_LEVEL）并回填缓存。永远返回合法等级（非法值回 common）。
+    """
+    _ensure_db()
+    with _level_cache_lock:
+        level = _level_cache.get(user_id)
+    if level is not None:
+        return level if is_valid_level(level) else DEFAULT_LEVEL
+    if not _level_restore_enabled:
+        # restore_level=false：不恢复上次会话落盘的等级，缓存未命中统一按 common，
+        # 不回读 DB（DB 值保留但本会话不生效）。
+        with _level_cache_lock:
+            _level_cache[user_id] = DEFAULT_LEVEL
+        return DEFAULT_LEVEL
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT level FROM users WHERE openid = ?", (user_id,)
+        ).fetchone()
+        level = str(row[0]) if row else DEFAULT_LEVEL
+    finally:
+        conn.close()
+    if not is_valid_level(level):
+        level = DEFAULT_LEVEL
+    with _level_cache_lock:
+        _level_cache[user_id] = level
+    return level
+
+
+def set_user_level(user_id: str, level: str) -> str:
+    """设置用户等级：校验（非法回 DEFAULT_LEVEL），更新内存缓存并 UPDATE 落盘。
+
+    返回实际设置的等级。用户不存在时仅更新缓存不报错（由上层接口处理）。
+    """
+    _ensure_db()
+    if not is_valid_level(level):
+        level = DEFAULT_LEVEL
+    with _level_cache_lock:
+        _level_cache[user_id] = level
+    with _write_lock:
+        conn = _connect()
+        try:
+            conn.execute(
+                "UPDATE users SET level = ? WHERE openid = ?", (level, user_id)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return level
+
+
+def get_all_users_levels() -> Dict[str, str]:
+    """遍历 users 表返回 {openid: level}（供启动恢复加载用）。"""
+    _ensure_db()
+    conn = _connect()
+    try:
+        rows = conn.execute("SELECT openid, level FROM users").fetchall()
+        return {
+            str(openid): level if is_valid_level(level) else DEFAULT_LEVEL
+            for openid, level in rows
+        }
+    finally:
+        conn.close()
+
+
+def load_levels_from_db(restore: bool) -> None:
+    """启动加载等级缓存。
+
+    restore=True 时用 DB 落盘值把各用户等级载入内存缓存；
+    restore=False 时清空缓存并关闭 DB 恢复（所有用户按 DEFAULT_LEVEL=common，
+    get_user_level 不再回读 DB，但 DB 落盘值本身不改）。
+    """
+    global _level_restore_enabled
+    _ensure_db()
+    if restore:
+        data = get_all_users_levels()
+        with _level_cache_lock:
+            _level_cache.clear()
+            _level_cache.update(data)
+        _level_restore_enabled = True
+    else:
+        with _level_cache_lock:
+            _level_cache.clear()
+        _level_restore_enabled = False
+
+
+def load_user_levels() -> None:
+    """按配置 registration.restore_level 决定是否从 DB 恢复等级缓存（无参，供启动调用）。"""
+    from config.levels import get_registration_config
+
+    restore = bool(get_registration_config().get("restore_level", False))
+    load_levels_from_db(restore)
