@@ -992,11 +992,13 @@ class LocalExecutorService extends ChangeNotifier {
         try {
           final String content = await entity.readAsString(encoding: utf8);
           final List<String> fileLines = content.split('\n');
+          // 提前转换一次，避免每行重复调用 pattern.toLowerCase()
+          final String lowerPattern = ignoreCase ? pattern.toLowerCase() : pattern;
           for (final String line in fileLines) {
             final bool hit = re != null
                 ? re.hasMatch(line)
                 : ignoreCase
-                    ? line.toLowerCase().contains(pattern.toLowerCase())
+                    ? line.toLowerCase().contains(lowerPattern)
                     : line.contains(pattern);
             if (hit) {
               out.add('${entity.path}:$line');
