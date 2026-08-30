@@ -1,13 +1,13 @@
 """Spec 元数据索引存储 - SQLite 持久化。
 
 Spec = 任务型规范文件（Markdown），本体存于 ``workspace/<agent id>/spec/``
-（内置 3 个为服务端模板 ``server/tool/spec/builtin/``）；本模块维护其
+（内置 4 个为服务端模板 ``server/tool/spec/builtin/``）；本模块维护其
 **元数据索引**（``specs`` 表：title/task_type/description/when/tags/
 pinned/builtin/embedding），支撑索引列表、语义检索与"已选 Spec"挂 hook。
 
 字段说明：
 - ``agent_id``：NULL 表示内置 Spec（全用户共享）；自定义 Spec 归属某 agent。
-- ``pinned``：内置 3 个置顶展示（``True``）。
+- ``pinned``：内置 4 个置顶展示（``True``）。
 - ``builtin``：是否为服务端内置模板（不随 agent 工作空间删除）。
 - ``embedding``：description + when 的向量（JSON），供语义检索复用 Embed 组件。
 """
@@ -43,7 +43,7 @@ _initialized = False
 # 初始化与内置注册
 # ----------------------------------------------------------------------
 def _ensure_db() -> None:
-    """确保 ``specs`` 表已创建，并注册内置 3 个 Spec 的元数据。"""
+    """确保 ``specs`` 表已创建，并注册内置 4 个 Spec 的元数据。"""
     global _initialized
     if _initialized:
         return
@@ -79,7 +79,7 @@ def _ensure_db() -> None:
 
 
 def _register_builtin_specs() -> None:
-    """把内置 3 个 Spec（server/tool/spec/builtin/*.md）的元数据写入 specs 表。
+    """把内置 4 个 Spec（server/tool/spec/builtin/*.md）的元数据写入 specs 表。
 
     内置 Spec 为服务端模板，agent_id = NULL（全局共享），置顶展示。
     模板文件不存在或已注册时跳过（幂等）。首次注册时同步 front matter 与
@@ -229,10 +229,10 @@ def list_specs(
     agent_id: Optional[str] = None,
     include_builtin: bool = True,
 ) -> List[Dict[str, Any]]:
-    """列出 Spec 索引：内置 3 个置顶 + 该 agent 的自定义 Spec。
+    """列出 Spec 索引：内置 4 个置顶 + 该 agent 的自定义 Spec。
 
     :param agent_id: 指定 agent 时同时返回其自定义 Spec；None 仅返回内置。
-    :param include_builtin: 是否包含内置 3 个（默认包含并置顶）。
+    :param include_builtin: 是否包含内置 4 个（默认包含并置顶）。
     :return: Spec 元数据列表（不含正文）
     """
     _ensure_db()
@@ -242,7 +242,7 @@ def list_specs(
             "SELECT * FROM specs WHERE agent_id IS NULL"
         ).fetchall()
         by_id = {r["id"]: _row_to_dict(r) for r in rows}
-        # 内置 3 个按固定顺序置顶（easy/complex/hard），其余按 id
+        # 内置 4 个按固定顺序置顶（easy/complex/hard/team-meeting），其余按 id
         result: List[Dict[str, Any]] = []
         for bid in BUILTIN_SPEC_IDS:
             if bid in by_id:

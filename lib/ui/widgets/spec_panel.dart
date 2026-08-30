@@ -5,8 +5,8 @@ import '../../io/api_service.dart';
 
 /// 任务规范（Spec）面板（P4 前端）
 ///
-/// 展示某 agent 可用的 Spec 索引（内置 3 置顶 + 自定义），支持：
-/// - 查看 Spec 元数据（task_type / when / tags / description）
+/// 展示某 agent 可用的 Spec 索引（内置 4 置顶 + 自定义），支持：
+/// - 查看 Spec 元数据（task_type / description / when / tags）
 /// - 展开查看 Spec 全文
 /// - 为当前会话多选 Spec（挂 hook，重构 context 时注入全文）
 ///
@@ -185,7 +185,15 @@ class _SpecPanelState extends State<SpecPanel> {
       );
     }
     if (_specs.isEmpty) {
-      return const Center(child: Text('暂无可用 Spec'));
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Text(
+            '暂无可用 Spec\n内置 Spec 由服务端提供；任务完成前可用 spec 工具沉淀自定义 Spec',
+            textAlign: TextAlign.center,
+          ),
+        ),
+      );
     }
     return ListView.builder(
       padding: const EdgeInsets.all(12),
@@ -200,6 +208,7 @@ class _SpecPanelState extends State<SpecPanel> {
     final String specId = (spec['id'] as String?) ?? '';
     final String title = (spec['title'] as String?) ?? specId;
     final String taskType = (spec['task_type'] as String?) ?? '';
+    final String description = (spec['description'] as String?) ?? '';
     final bool builtin = (spec['builtin'] as bool?) ?? false;
     final bool pinned = (spec['pinned'] as bool?) ?? false;
     final bool selected = _selected.contains(specId);
@@ -211,6 +220,13 @@ class _SpecPanelState extends State<SpecPanel> {
       elevation: 0,
       color: _cs.surfaceVariant.withOpacity(0.35),
       margin: const EdgeInsets.only(bottom: 10),
+      // 选中态（挂 hook）高亮描边，便于识别当前生效的 Spec
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12),
+        side: selected
+            ? BorderSide(color: _cs.primary, width: 1.5)
+            : BorderSide.none,
+      ),
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(
@@ -258,16 +274,22 @@ class _SpecPanelState extends State<SpecPanel> {
                               ),
                             ),
                           ),
-                          if (taskType.isNotEmpty)
-                            Text(
-                              taskType,
-                              style: TextStyle(
-                                fontSize: 11,
-                                color: _cs.onSurfaceVariant,
-                              ),
-                            ),
+                          if (taskType.isNotEmpty) _TaskTypeBadge(taskType),
                         ],
                       ),
+                      if (description.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Text(
+                            description,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: _cs.onSurfaceVariant,
+                            ),
+                          ),
+                        ),
                       const SizedBox(height: 4),
                       if (when.isNotEmpty)
                         Text(
@@ -328,9 +350,61 @@ class _SpecPanelState extends State<SpecPanel> {
   }
 }
 
+/// 任务类型中文徽章：easy→简单 / complex→复杂 / hard→困难 / custom→自定义，
+/// 未知值原样显示；配色按类型区分，便于快速识别风险与协作强度。
+class _TaskTypeBadge extends StatelessWidget {
+  const _TaskTypeBadge(this.taskType);
+
+  final String taskType;
+
+  static const Map<String, String> _labels = <String, String>{
+    'easy': '简单',
+    'complex': '复杂',
+    'hard': '困难',
+    'custom': '自定义',
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final String label = _labels[taskType] ?? taskType;
+    final Color bg;
+    final Color fg;
+    switch (taskType) {
+      case 'easy':
+        bg = cs.primaryContainer;
+        fg = cs.onPrimaryContainer;
+        break;
+      case 'complex':
+        bg = cs.tertiaryContainer;
+        fg = cs.onTertiaryContainer;
+        break;
+      case 'hard':
+        bg = cs.errorContainer;
+        fg = cs.onErrorContainer;
+        break;
+      default:
+        bg = cs.surfaceVariant;
+        fg = cs.onSurfaceVariant;
+    }
+    return Container(
+      margin: const EdgeInsets.only(left: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(fontSize: 10, color: fg),
+      ),
+    );
+  }
+}
+
 /// 简洁的 Markdown 渲染容器（Spec 正文多为标题/列表/代码块）
 ///
-/// 内置包不含完整 markdown 渲染器，这里对标题、代码行做轻量着色，
+/// 内置包不含完整 markdown 渲染器，这里对标题、列表、加粗做轻量着色与排版，
 /// 通用文本原样展示。
 class _ExpandedMarkdown extends StatelessWidget {
   const _ExpandedMarkdown({required this.content});
@@ -340,6 +414,22 @@ class _ExpandedMarkdown extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final ColorScheme cs = Theme.of(context).colorScheme;
+    final List<Widget> lines = content.split('\n').map((String line) {
+      final String trimmed = line.trim();
+      final TextSpan lineSpan = _buildLineSpan(trimmed, cs);
+      return Padding(
+        padding: EdgeInsets.only(
+          left: trimmed.startsWith('- ') ? 8 : 0,
+          top: 1,
+          bottom: 1,
+        ),
+        child: Text.rich(
+          lineSpan,
+          style: TextStyle(fontSize: 12, height: 1.5, color: cs.onSurface),
+        ),
+      );
+    }).toList();
+
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(10),
@@ -348,10 +438,64 @@ class _ExpandedMarkdown extends StatelessWidget {
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: cs.outlineVariant),
       ),
-      child: Text(
-        content,
-        style: const TextStyle(fontSize: 12, height: 1.5),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: lines,
       ),
     );
+  }
+
+  /// 按行做轻量 Markdown 着色：标题加粗变色、`- ` 列表、`**加粗**`、`` `代码` ``。
+  TextSpan _buildLineSpan(String line, ColorScheme cs) {
+    final TextStyle? style;
+    String text = line;
+    if (text.startsWith('### ')) {
+      style = TextStyle(fontWeight: FontWeight.w700, color: cs.primary);
+      text = text.substring(4);
+    } else if (text.startsWith('## ')) {
+      style = TextStyle(fontWeight: FontWeight.w700, color: cs.primary);
+      text = text.substring(3);
+    } else if (text.startsWith('- ')) {
+      style = const TextStyle(fontWeight: FontWeight.w600);
+      text = '• ${text.substring(2)}';
+    } else {
+      style = null;
+    }
+
+    // `**粗体**` / `` `代码` `` 段内富文本
+    final List<InlineSpan> spans = <InlineSpan>[];
+    final RegExp pattern = RegExp(r'(\*\*[^*]+\*\*|`[^`]+`)');
+    int cursor = 0;
+    for (final RegExpMatch m in pattern.allMatches(text)) {
+      if (m.start > cursor) {
+        spans.add(TextSpan(text: text.substring(cursor, m.start)));
+      }
+      final String token = m.group(0)!;
+      if (token.startsWith('**')) {
+        spans.add(TextSpan(
+          text: token.substring(2, token.length - 2),
+          style: TextStyle(
+            fontWeight: FontWeight.w700,
+            color: cs.primary,
+            fontSize: 12,
+          ),
+        ));
+      } else {
+        spans.add(TextSpan(
+          text: token.substring(1, token.length - 1),
+          style: TextStyle(
+            fontFamily: 'monospace',
+            backgroundColor: cs.surfaceVariant,
+            fontSize: 11,
+          ),
+        ));
+      }
+      cursor = m.end;
+    }
+    if (cursor < text.length) {
+      spans.add(TextSpan(text: text.substring(cursor)));
+    }
+
+    return TextSpan(children: spans, style: style);
   }
 }

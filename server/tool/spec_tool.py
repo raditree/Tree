@@ -32,6 +32,7 @@ from data.spec_store import (
     list_specs as store_list_specs,
     search_specs as store_search_specs,
     update_spec as store_update_spec,
+    _parse_front_matter,
 )
 from data.session_store import get_selected_spec_ids, set_selected_spec_ids
 from io_.workspace_io import WorkspaceIO, run_io
@@ -120,6 +121,18 @@ class SpecTool:
                         "description": {
                             "type": "string",
                             "description": "create/update 用：一句话描述（供索引与检索）",
+                        },
+                        "risk": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high", "review"],
+                            "description": "create/update 用：风险等级"
+                                            "（easy→low / complex→medium / hard→high / 评审类→review；"
+                                            "非法值自动回退 low）",
+                        },
+                        "classification": {
+                            "type": "string",
+                            "description": "create/update 用：规范分类"
+                                            "（如 内部规范/团队约定/领域规范；默认 内部规范）",
                         },
                         "when": {
                             "type": "array",
@@ -324,11 +337,14 @@ class SpecTool:
         if not (workflow or rules or notes):
             return {"error": "create 需要至少提供 workflow/rules/notes 之一"}
         tags = [task_type]
+        risk = _normalize_risk(arguments.get("risk"))
+        classification = str(arguments.get("classification", "")).strip() or "内部规范"
 
         md = _render_spec_markdown(
             spec_id=spec_id, title=title, task_type=task_type,
             description=description, when=when, tags=tags,
             workflow=workflow, rules=rules, notes=notes,
+            risk=risk, classification=classification,
         )
         ok = self._write_spec_file(spec_id, md)
         if not ok:
@@ -373,10 +389,31 @@ class SpecTool:
         notes = str(arguments.get("notes", "")).strip()
         workflow, rules, notes = _merge_spec_body(content, workflow, rules, notes)
 
+        # 解析原 front matter：版本号 +1、changelog 头部插入本次更新条目并保留原条目；
+        # risk/classification 传参覆盖、未传保留原值
+        meta_fm = _parse_front_matter(content) or {}
+        try:
+            version = int(meta_fm.get("version") or 1)
+        except (TypeError, ValueError):
+            version = 1
+        version += 1
+        risk = _normalize_risk(arguments.get("risk") if arguments.get("risk") is not None
+                               else meta_fm.get("risk"))
+        classification = str(
+            arguments.get("classification")
+            if arguments.get("classification") is not None
+            else (meta_fm.get("classification") or "内部规范")
+        ).strip() or "内部规范"
+        changelog = _parse_changelog(content)
+        now = time.strftime("%Y-%m-%d", time.localtime())
+        changelog = [f"v{version}({now}): 经 spec update 更新"] + changelog
+
         md = _render_spec_markdown(
             spec_id=spec_id, title=title, task_type=task_type,
             description=description, when=when, tags=list(meta.get("tags") or []),
             workflow=workflow, rules=rules, notes=notes,
+            risk=risk, classification=classification,
+            version=version, changelog=changelog,
         )
         if not self._write_spec_file(spec_id, md):
             return {"error": f"Spec 文件写入失败: spec/{spec_id}.md"}
@@ -439,8 +476,17 @@ def _render_spec_markdown(
     workflow: str,
     rules: str,
     notes: str,
+    risk: str = "low",
+    classification: str = "内部规范",
+    version: int = 1,
+    changelog: Optional[List[str]] = None,
 ) -> str:
-    """渲染 Spec Markdown（front matter + 固定三段正文）。"""
+    """渲染 Spec Markdown（front matter + 固定三段正文）。
+
+    front matter 与内置模板（server/tool/spec/builtin/*.md）结构对齐：
+    含 version/classification/risk/changelog 版本化与审计元数据；
+    其余字段（created_at/updated_at/pinned/builtin）随自定义 Spec 语义固定。
+    """
     def _fmt_list(items: List[str]) -> str:
         if not items:
             return ""
@@ -455,6 +501,9 @@ def _render_spec_markdown(
     now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
     when_block = _fmt_list(when)
     tags_block = _fmt_tags(tags)
+    # changelog 条目带引号渲染，与内置模板风格一致（条目内含冒号）
+    changelog_entries = changelog or [f"v{version}({now}): 初始创建"]
+    changelog_items = _fmt_list([f'"{item}"' for item in changelog_entries])
     return (
         "---\n"
         f"id: {spec_id}\n"
@@ -467,11 +516,53 @@ def _render_spec_markdown(
         "builtin: false\n"
         f"created_at: {ts}\n"
         f"updated_at: {ts}\n"
+        f"version: {version}\n"
+        f"classification: {classification}\n"
+        f"risk: {risk}\n"
+        f"changelog:\n{changelog_items}\n"
         "---\n\n"
         f"## 工作流（workflow）\n\n{workflow.strip()}\n\n"
         f"## 该类任务规范\n\n{rules.strip()}\n\n"
         f"## 注意事项\n\n{notes.strip()}\n"
     )
+
+
+def _normalize_risk(value: Any) -> str:
+    """把 risk 参数规范化为合法值；非法/缺失回退 low。"""
+    v = str(value or "").strip().lower()
+    return v if v in ("low", "medium", "high", "review") else "low"
+
+
+def _parse_changelog(content: str) -> List[str]:
+    """从 Spec 文件 front matter 解析 changelog 条目（扁平字符串列表）。
+
+    ``_parse_front_matter`` 对嵌套结构解析不可靠，此处直接按 front matter
+    的 ``changelog:`` 块逐行提取 ``- "..."`` 条目；解析失败返回空列表。
+    """
+    if not content.startswith("---"):
+        return []
+    end = content.find("\n---", 3)
+    if end == -1:
+        return []
+    fm_text = content[3:end]
+    items: List[str] = []
+    in_changelog = False
+    for line in fm_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("changelog:"):
+            in_changelog = True
+            continue
+        if in_changelog:
+            if stripped.startswith("- "):
+                item = stripped[2:].strip().strip('"').strip("'")
+                if item:
+                    items.append(item)
+            elif not stripped.startswith("-") and stripped and ":" in stripped and not stripped.startswith("  "):
+                # 遇下一个顶层键即结束
+                break
+    return items
 
 
 def _merge_spec_body(
