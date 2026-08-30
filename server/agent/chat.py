@@ -877,6 +877,23 @@ def _get_workspace_io(user_id: str, agent_id: str) -> Any:
     return CloudWorkspaceIO(state.docker_manager)
 
 
+def _make_result_redirect_writer(
+    workspace_id: str, user_id: str, agent_id: str,
+) -> Callable[[str, str], None]:
+    """构造工具结果重定向写入器：把超长工具结果写入 .self 私有目录。
+
+    与内置工具共用同一 WorkspaceIO 通道（三模式统一），保证 .self
+    路径语义一致（本地 baseDir / 云端容器 / SSH）。由 LLM 会话在
+    工具结果超过门控阈值时调用，写入失败由 llm.py 侧退化截断兜底。
+    """
+    io = _get_workspace_io(user_id, agent_id)
+
+    def _writer(rel_path: str, content: str) -> None:
+        run_io(io.write_file(workspace_id, rel_path, content))
+
+    return _writer
+
+
 def _build_workspace_extra_info(
     workspace_id: str,
     member_system_prompt: str = "",
@@ -1758,6 +1775,9 @@ async def _process_member_message(
             workspace_id=workspace_id,
             user_id=user_id,
             agent_id=agent_id,
+            result_redirect_writer=_make_result_redirect_writer(
+                workspace_id, user_id, top_agent_id or agent_id
+            ),
         )
         set_session(user_id, agent_id, session, session_id)
         try:
@@ -2352,6 +2372,9 @@ async def _handle_user_message(
                 workspace_id=workspace_id,
                 user_id=user_id,
                 agent_id=agent_id,
+                result_redirect_writer=_make_result_redirect_writer(
+                    workspace_id, user_id, agent_id
+                ),
             )
             set_session(user_id, agent_id, session, session_id)
             try:

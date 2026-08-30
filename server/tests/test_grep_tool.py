@@ -10,7 +10,12 @@
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-from tool.grep_tool import DEFAULT_MAX_RESULTS, GrepTool
+from tool.grep_tool import (
+    DEFAULT_MAX_LINE_CHARS,
+    DEFAULT_MAX_RESULTS,
+    DEFAULT_MAX_TOTAL_CHARS,
+    GrepTool,
+)
 
 
 class TestToolDefinition(unittest.TestCase):
@@ -135,6 +140,53 @@ class TestExecute(unittest.TestCase):
         )
         ret = self.tool.execute({"pattern": "line"})
         self.assertEqual(ret["matches"], ["line"])
+
+    def test_short_lines_untouched(self):
+        ret = self.tool.execute({"pattern": "hello"})
+        self.assertFalse(ret["line_truncated"])
+        self.assertEqual(ret["matches"][0], "lib/a.dart:hello")
+
+    def test_long_line_truncated_to_match_window(self):
+        # 模拟 jsonl 超长记录行：命中点在行中部，整行返回会撑爆上下文
+        pad = "x" * 5000
+        line = f"{pad}list_members{pad}"
+        self.io.grep_search = AsyncMock(
+            return_value={
+                "exit_code": 0,
+                "stdout": f"sft_20260825.jsonl:1:{line}",
+            }
+        )
+        ret = self.tool.execute({"pattern": "list_members"})
+        self.assertTrue(ret["line_truncated"])
+        self.assertEqual(ret["count"], 1)
+        out = ret["matches"][0]
+        self.assertIn("list_members", out)
+        # 截断为「命中点 ± 上下文」窗口：行本身 10000+ 字符，返回仅 2000 上下
+        self.assertLessEqual(len(out), DEFAULT_MAX_LINE_CHARS + 2)
+        self.assertTrue(out.startswith("…") and out.endswith("…"))
+        self.assertGreater(out.index("list_members"), 0)
+
+    def test_long_line_regex_match_position(self):
+        pad = "y" * 5000
+        line = f"{pad}ERROR: disk full{pad}"
+        self.io.grep_search = AsyncMock(
+            return_value={"exit_code": 0, "stdout": f"log.txt:3:{line}"}
+        )
+        ret = self.tool.execute({"pattern": r"ERROR:\s+\w+", "regex": True})
+        self.assertTrue(ret["line_truncated"])
+        self.assertIn("disk full", ret["matches"][0])
+
+    def test_total_chars_cap(self):
+        # 多行超长行叠加，触发总字符上限并停止收集
+        pad = "z" * 3000
+        lines = "\n".join(f"f{i}.jsonl:{pad}needle{pad}" for i in range(50))
+        self.io.grep_search = AsyncMock(return_value={"exit_code": 0, "stdout": lines})
+        ret = self.tool.execute({"pattern": "needle"})
+        self.assertTrue(ret["truncated"])
+        self.assertLess(ret["count"], 50)
+        self.assertLessEqual(
+            sum(len(m) + 1 for m in ret["matches"]), DEFAULT_MAX_TOTAL_CHARS
+        )
 
 
 if __name__ == "__main__":

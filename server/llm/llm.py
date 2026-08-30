@@ -38,6 +38,12 @@ _MAX_LIST_ITEMS = 30
 _MAX_ITEM_FIELDS = 8
 _MAX_VALUE_CHARS = 120
 
+# 工具结果大小门控：单个工具结果字符串超过该字符数时，不再直进上下文，
+# 重定向到工作空间 .self 私有目录文件，只把「文件位置+查看建议+原因」给 agent
+RESULT_REDIRECT_THRESHOLD = 10_000
+# 重定向提示中附带的结果预览长度（让 agent 快速判断是否值得查看）
+_REDIRECT_PREVIEW_CHARS = 300
+
 
 def _fmt_value(v: Any, max_chars: int = _MAX_VALUE_CHARS) -> str:
     """把单个值格式化为可读文本（截断超长字符串）。"""
@@ -279,6 +285,7 @@ class AgentLLMSession:
         cancel_event: Optional[threading.Event] = None,
         user_id: str = "",
         agent_id: str = "",
+        result_redirect_writer: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         """初始化 LLM 会话。
 
@@ -291,6 +298,10 @@ class AgentLLMSession:
                              使停止能快速中止 tool loop（不再启动新的工具调用）。
         :param user_id: 用户标识（主动延迟限流按用户开关判定）
         :param agent_id: agent 标识（主动延迟限流按 (user_id, agent_id) 粒度）
+        :param result_redirect_writer: 可选同步回调 ``(rel_path, content) -> None``，
+            用于把超长工具结果写入工作空间（如 ``.self/results/...``）；为 None
+            时超长结果退化为本地截断。回调由 chat.py 注入，与内置工具共用
+            同一 WorkspaceIO 通道，保证 .self 路径语义一致。
         """
         self.model_config = model_config
         self.workspace_id = workspace_id
@@ -299,6 +310,9 @@ class AgentLLMSession:
         # 主动延迟限流归属：REST 设置接口按 openid 开关，限流器按 (user, agent)
         self.user_id = user_id or ""
         self.agent_id = agent_id or ""
+        # 工具结果重定向写入器与重定向文件序号（会话级，工具循环单线程执行）
+        self.result_redirect_writer = result_redirect_writer
+        self._redirect_seq = 0
 
         # 上下文列表：普通 LLM 初始化时注入系统提示词
         self.context: List[Dict[str, Any]] = []
@@ -374,6 +388,59 @@ class AgentLLMSession:
             if tool["definition"]["function"]["name"] == name:
                 return tool["handler"]
         return None
+
+    # ------------------------------------------------------------------
+    # 工具结果大小门控
+    # ------------------------------------------------------------------
+    def _maybe_redirect_result(self, tool_name: str, result_str: str) -> str:
+        """工具结果大小门控：超长结果重定向到 .self 私有文件，只返回提示。
+
+        ``result_str`` 超过 :data:`RESULT_REDIRECT_THRESHOLD` 字符时：
+        - 有写入器（``self.result_redirect_writer``）：把完整结果写入
+          ``.self/results/<时间戳>_<序号>.<工具名>.result``，返回重定向提示
+          （文件位置 + 推荐查看方式 + 原因 + 预览片段）；
+        - 无写入器或写入失败：退化为本地截断，保证上下文始终有界。
+
+        :param tool_name: 工具名（用于重定向文件名）
+        :param result_str: 工具结果的字符串化文本
+        :return: 写回上下文 / 展示的文本（原文本、重定向提示或截断文本）
+        """
+        if len(result_str) <= RESULT_REDIRECT_THRESHOLD:
+            return result_str
+
+        if self.result_redirect_writer is not None:
+            try:
+                self._redirect_seq += 1
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                rel = (
+                    f".self/results/{ts}_{self._redirect_seq:03d}."
+                    f"{tool_name}.result"
+                )
+                self.result_redirect_writer(rel, result_str)
+                return (
+                    f"[工具结果已重定向] {tool_name} 返回结果过长"
+                    f"（{len(result_str)} 字符 > {RESULT_REDIRECT_THRESHOLD} "
+                    f"阈值），完整结果已写入私有文件 {rel}，未直接展示。\n"
+                    f"如需查看：\n"
+                    f"1) 用 read 工具对该文件分多次读取"
+                    f"（start_line / line_count 控制范围）；\n"
+                    f"2) 或用 terminal 工具（grep / sed / python 等）对文件"
+                    f"进一步正则化解析，提取需要的有效信息。\n"
+                    f"文件预览（前 {_REDIRECT_PREVIEW_CHARS} 字符）：\n"
+                    f"{result_str[:_REDIRECT_PREVIEW_CHARS]}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "工具结果重定向写入失败（%s），退化为截断: %s",
+                    tool_name, exc,
+                )
+
+        # 无写入能力或写入失败：退化为本地截断
+        return (
+            result_str[:RESULT_REDIRECT_THRESHOLD]
+            + f"\n...[结果过长，共 {len(result_str)} 字符，已截断至 "
+            f"{RESULT_REDIRECT_THRESHOLD} 字符]"
+        )
 
     # ------------------------------------------------------------------
     # API 调用辅助
@@ -964,6 +1031,11 @@ class AgentLLMSession:
 
                     # dict 结果提取可读内容，避免前端显示原始 dict 字符串
                     result_str = _stringify_tool_result(result)
+                    # 工具结果大小门控：超长结果重定向到 .self 文件，
+                    # 上下文/前端/历史表三处均只携带重定向提示
+                    result_str = self._maybe_redirect_result(
+                        tc["name"], result_str
+                    )
 
                     yield {
                         "type": "tool_call",
