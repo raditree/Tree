@@ -20,7 +20,9 @@ from pathlib import Path
 # 将 server 目录加入 Python 路径
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import data.agent_store as agent_store  # noqa: E402
 import data.conversation_store as conv  # noqa: E402
+import data.db as db_mod  # noqa: E402
 import data.session_store as session_store  # noqa: E402
 import data.spec_store as spec_store  # noqa: E402
 import data.team_store as team_store  # noqa: E402
@@ -28,10 +30,16 @@ import data.team_init as team_init  # noqa: E402
 
 
 def _redirect_db_mods(tmpdir: Path) -> None:
-    """把各 data 模块的 DB 路径指向临时目录并重置初始化标记。"""
-    for mod in (conv, session_store, spec_store, team_store):
+    """把各 data 模块的 DB 路径指向临时目录并重置初始化标记。
+
+    ``data.db`` 是共享 connect() 的路径来源（WAL/busy_timeout），
+    必须一并重定向，否则各存储模块会打开真实数据库。
+    """
+    for mod in (conv, session_store, spec_store, team_store, agent_store):
         mod._DB_PATH = tmpdir / "conversations.db"  # type: ignore[attr-defined]
         mod._initialized = False  # type: ignore[attr-defined]
+    db_mod._DB_PATH = tmpdir / "conversations.db"  # type: ignore[attr-defined]
+    db_mod._wal_configured = False  # type: ignore[attr-defined]
 
 
 class DataStoreBase(unittest.TestCase):
@@ -39,9 +47,13 @@ class DataStoreBase(unittest.TestCase):
 
     def setUp(self):
         self._tmp = Path(tempfile.mkdtemp(prefix="trae_test_"))
+        self._orig_db = db_mod._DB_PATH  # type: ignore[attr-defined]
         _redirect_db_mods(self._tmp)
 
     def tearDown(self):
+        # 恢复共享 db 路径，避免污染其他测试文件
+        db_mod._DB_PATH = self._orig_db  # type: ignore[attr-defined]
+        db_mod._wal_configured = False  # type: ignore[attr-defined]
         shutil.rmtree(self._tmp, ignore_errors=True)
 
 

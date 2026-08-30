@@ -547,17 +547,31 @@ class ApiService {
 
   /// 创建一个 agent 并持久化到后端
   ///
-  /// 调用 `POST /api/agents`，请求体为 `{"name", "model_id", "system_prompt"}`。
+  /// 调用 `POST /api/agents`，请求体为
+  /// `{"name", "model_id", "system_prompt", "team_member_count"?,
+  ///  "max_level"?, "max_members_per_level"?}`。
   /// 成功后返回后端生成的完整 Agent 对象（含真实 id）。
+  ///
+  /// 团队配置（maxLevel / maxMembersPerLevel）在创建 TOP 时一次性设定，
+  /// 创建后不可修改（成员只增不减）；teamMemberCount 为初始预建成员数
+  /// （不填则按每层成员上限全量预建，P4 建队）。
   static Future<Agent> createAgent({
     required String name,
     required String modelId,
     String systemPrompt = '',
+    int? teamMemberCount,
+    int? maxLevel,
+    int? maxMembersPerLevel,
   }) async {
     final Map<String, dynamic> data = await _postJson('/api/agents', body: {
       'name': name,
       'model_id': modelId,
       'system_prompt': systemPrompt,
+      if (teamMemberCount != null && teamMemberCount > 0)
+        'team_member_count': teamMemberCount,
+      if (maxLevel != null && maxLevel > 0) 'max_level': maxLevel,
+      if (maxMembersPerLevel != null && maxMembersPerLevel > 0)
+        'max_members_per_level': maxMembersPerLevel,
     });
     return Agent.fromJson(data['agent'] as Map<String, dynamic>);
   }

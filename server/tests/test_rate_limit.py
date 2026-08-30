@@ -26,6 +26,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import llm.rate_limit as rate_limit  # noqa: E402
+import data.db as data_db  # noqa: E402
 import data.rate_limit_store as rate_limit_store  # noqa: E402
 from config import levels as level_config  # noqa: E402
 from data import user_store  # noqa: E402
@@ -210,7 +211,8 @@ class TestRateLimitStore(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp())
         with patch.object(rate_limit_store, "_DATA_DIR", tmp), \
              patch.object(rate_limit_store, "_DB_PATH", tmp / "test.db"), \
-             patch.object(rate_limit_store, "_initialized", False):
+             patch.object(rate_limit_store, "_initialized", False), \
+             patch.object(data_db, "_DB_PATH", tmp / "test.db"):
             rate_limit_store.set_rate_limit_enabled("u9", True)
             self.assertTrue(rate_limit_store.is_rate_limit_enabled("u9"))
 

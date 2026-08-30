@@ -86,7 +86,9 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
       final String? status = d['status'] as String?;
       if (agentId == null) return;
       setState(() {
-        if (status == 'working' || status == 'updating_memory') {
+        if (status == 'working' ||
+            status == 'updating_memory' ||
+            status == 'compacting') {
           _workingMembers.add(agentId);
         } else if (status == 'idle' || status == 'stopping') {
           _workingMembers.remove(agentId);

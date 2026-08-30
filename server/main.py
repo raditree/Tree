@@ -27,6 +27,7 @@ from config.config import get_config
 from config.levels import get_levels
 from config.logging_config import setup_logging
 from config.models import get_model_configs
+from data.conversation_store import prune_archived_context
 from data.invitation_code import init_invitation_codes, invitation_code_loop
 from data.routes import router as data_router
 from data.user_store import purge_expired_users
@@ -109,7 +110,9 @@ async def lifespan(app: FastAPI):
     else:
         print(f"[启动] Docker 不可用，工作空间功能将降级: {docker_manager._unavailable_reason}")
 
-    # 启动后台任务：定期彻底删除超过保留期的注销账号（checklist 3(b)）
+    # 启动后台任务：定期彻底删除超过保留期的注销账号（checklist 3(b)），
+    # 并清理超过保留期的上下文归档（agent_context_archive，300+ agent 长跑
+    # 下防止数据库无限膨胀；data_export.archive_retention_days，0=不清理）
     async def _purge_loop() -> None:
         while True:
             try:
@@ -118,6 +121,20 @@ async def lifespan(app: FastAPI):
                     print(f"[注销] 已彻底删除 {deleted} 个过期账号")
             except Exception as exc:  # noqa: BLE001
                 print(f"[注销] 清理任务异常: {exc}")
+            try:
+                retention_days = int(
+                    (get_config().get("data_export", {}) or {})
+                    .get("archive_retention_days", 30) or 0
+                )
+                if retention_days > 0:
+                    removed = prune_archived_context(retention_days)
+                    if removed:
+                        print(
+                            f"[归档] 已清理 {removed} 条超期上下文归档"
+                            f"（保留 {retention_days} 天）"
+                        )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[归档] 清理任务异常: {exc}")
             await asyncio.sleep(3600)  # 每小时检查一次
 
     purge_task = asyncio.create_task(_purge_loop())

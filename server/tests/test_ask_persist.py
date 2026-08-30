@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tool.ask_question_tool import ASK_PAUSED_KEY, AskUserQuestionTool
 import data.conversation_store as store
+import data.db as db_mod
 
 
 class PendingQuestionStoreTest(unittest.TestCase):
@@ -24,9 +25,15 @@ class PendingQuestionStoreTest(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         store._DB_PATH = Path(self.tmpdir.name) / "conv_test_ask.db"
         store._initialized = False
+        # 共享 connect()（data.db）一并重定向，避免打开真实库
+        self._old_shared_db = db_mod._DB_PATH
+        db_mod._DB_PATH = Path(self.tmpdir.name) / "conv_test_ask.db"
+        db_mod._wal_configured = False
 
     def tearDown(self) -> None:
         store._initialized = False
+        db_mod._DB_PATH = self._old_shared_db
+        db_mod._wal_configured = False
         self.tmpdir.cleanup()
 
     def test_pending_crud_and_history_roundtrip(self) -> None:

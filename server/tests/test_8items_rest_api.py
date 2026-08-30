@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 import data.agent_store as agent_store  # noqa: E402
 import data.conversation_store as conv_store  # noqa: E402
+import data.db as db_mod  # noqa: E402
 import data.mcp_service_store as mcp_store  # noqa: E402
 import data.session_store as session_store  # noqa: E402
 import data.team_store as team_store  # noqa: E402
@@ -45,6 +46,7 @@ def _redirect_db(tmpdir: Path) -> None:
         team_store,
         conv_store,
         session_store,
+        db_mod,
     ):
         mod._DB_PATH = tmpdir / "conversations.db"  # type: ignore[attr-defined]
         mod._initialized = False  # type: ignore[attr-defined]
@@ -53,7 +55,8 @@ def _redirect_db(tmpdir: Path) -> None:
 class RestApiBase(unittest.TestCase):
     """为每个测试创建独立临时 DB + 独立 TestClient（override 认证）。"""
 
-    _REDIRECT_MODS = (agent_store, mcp_store, team_store, conv_store, session_store)
+    _REDIRECT_MODS = (agent_store, mcp_store, team_store, conv_store,
+                      session_store, db_mod)
 
     def setUp(self):
         self._tmp = Path(tempfile.mkdtemp(prefix="trae_rest_"))
@@ -469,6 +472,7 @@ class TestQueueInjectionSessionIsolation(unittest.TestCase):
                 patch.object(chat, "_clear_active_task", return_value=None), \
                 patch.object(chat, "_send_status_idle", new=AsyncMock()), \
                 patch.object(chat, "save_context", return_value=None), \
+                patch.object(chat, "collect_sft_turn", return_value=None), \
                 patch.object(chat, "_reset_member_work_status", return_value=None), \
                 patch.object(chat, "_append_activity_log", return_value=None), \
                 patch.object(chat, "_register_tools", new=AsyncMock()), \
@@ -522,6 +526,7 @@ class TestQueueInjectionSessionIsolation(unittest.TestCase):
                 patch.object(chat, "_clear_active_task", return_value=None), \
                 patch.object(chat, "_send_status_idle", new=AsyncMock()), \
                 patch.object(chat, "save_context", return_value=None), \
+                patch.object(chat, "collect_sft_turn", return_value=None), \
                 patch.object(chat, "_reset_member_work_status", return_value=None), \
                 patch.object(chat, "_append_activity_log", return_value=None), \
                 patch.object(chat, "_register_tools", new=AsyncMock()), \

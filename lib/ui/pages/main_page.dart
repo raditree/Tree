@@ -198,6 +198,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         name: result['name'] as String,
         modelId: result['model_id'] as String,
         systemPrompt: result['system_prompt'] as String? ?? '',
+        teamMemberCount: result['team_member_count'] as int?,
+        maxLevel: result['max_level'] as int?,
+        maxMembersPerLevel: result['max_members_per_level'] as int?,
       );
       if (!mounted) return;
       setState(() {

@@ -95,6 +95,9 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 处于 working 状态的 agent 集合（用于标题栏显示状态与停止按钮）
   final Set<String> _workingAgents = <String>{};
 
+  /// 处于 compacting（上下文压缩中）状态的 agent 集合（标题栏显示「压缩中」）
+  final Set<String> _compactingAgents = <String>{};
+
   /// 是否正在等待用户回答 agent 的问题（AskUserQuestion）
   bool _asking = false;
 
@@ -151,6 +154,7 @@ class _MessagePanelState extends State<MessagePanel> {
       if (connected && mounted) {
         setState(() {
           _workingAgents.clear();
+          _compactingAgents.clear();
         });
       }
     };
@@ -574,8 +578,12 @@ class _MessagePanelState extends State<MessagePanel> {
       setState(() {
         if (status == 'working') {
           _workingAgents.add(agentId);
+          _compactingAgents.remove(agentId);
+        } else if (status == 'compacting') {
+          _compactingAgents.add(agentId);
         } else if (status == 'idle' || status == 'stopping') {
           _workingAgents.remove(agentId);
+          _compactingAgents.remove(agentId);
         }
       });
     } else if (type == 'ask_user_question') {
@@ -965,6 +973,10 @@ class _MessagePanelState extends State<MessagePanel> {
     final String? title = agent?.name;
     // 当前 agent 是否在工作
     final bool working = agent != null && _workingAgents.contains(agent.id);
+    // 当前 agent 是否在压缩上下文（compacting 状态，与 working 可并存：
+    // working 是 agent 级、compacting 是会话级，跨会话可同时发生）
+    final bool compacting =
+        agent != null && _compactingAgents.contains(agent.id);
     return Container(
       height: 48,
       padding: const EdgeInsets.symmetric(horizontal: 4),
@@ -1018,6 +1030,25 @@ class _MessagePanelState extends State<MessagePanel> {
                       ),
                     ),
                   ],
+                  if (compacting) ...<Widget>[
+                    const SizedBox(width: 8),
+                    SizedBox(
+                      width: 12,
+                      height: 12,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: cs.tertiary,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      '压缩中',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: cs.tertiary,
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -1054,9 +1085,15 @@ class _MessagePanelState extends State<MessagePanel> {
             ),
           if (agent != null)
             IconButton(
-              tooltip: '压缩上下文',
-              icon: const Icon(Icons.compress, size: 20),
-              onPressed: () => _compactContext(agent.id),
+              tooltip: compacting ? '正在压缩中' : '压缩上下文',
+              icon: Icon(
+                Icons.compress,
+                size: 20,
+                color: compacting ? cs.outline : null,
+              ),
+              // 压缩期间禁用：后端按会话粒度互斥（防双击并发压缩），
+              // 工作中由后端返回 agent_working 提示，不在此拦截
+              onPressed: compacting ? null : () => _compactContext(agent.id),
             ),
         ],
       ),
@@ -1336,6 +1373,10 @@ class _MessagePanelState extends State<MessagePanel> {
         message = '对话消息太少，暂无需压缩';
       } else if (reason == 'nothing_to_summarize') {
         message = '最近对话较短，暂无需压缩';
+      } else if (reason == 'agent_working') {
+        message = '该会话正在处理消息，请稍后再压缩';
+      } else if (reason == 'already_compacting') {
+        message = '该会话正在压缩中';
       } else {
         message = '上下文无需压缩';
       }

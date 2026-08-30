@@ -156,6 +156,16 @@ def reset_user(user_id: str) -> None:
             _limiters.pop(key, None)
 
 
+def remove_agent(user_id: str, agent_id: str) -> None:
+    """删除 agent 时清理其限流器实例（300+ agent 长跑防注册表膨胀）。
+
+    agent 删除后不会再发起 API 调用，残留的 ``AgentRateLimiter`` 只会占
+    内存；此处主动摘除，配合 broker ``remove_agent`` / 会话缓存 LRU 治理。
+    """
+    with _registry_lock:
+        _limiters.pop((user_id, agent_id), None)
+
+
 def set_user_level(user_id: str, level: str) -> None:
     """等级变更后清除该用户所有限流器实例，使新等级节奏立即生效。
 
@@ -197,6 +207,7 @@ __all__ = [
     "acquire",
     "is_user_enabled",
     "load_enabled_users",
+    "remove_agent",
     "reset_user",
     "set_user_enabled",
     "set_user_level",

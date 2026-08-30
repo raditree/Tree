@@ -17,6 +17,15 @@ write:
     何时不用: 已有文件的小改动（用 edit 保留上下文）；创建目录/删除文件用 Terminal
     前置依赖: 工作空间可写；file_path 必须为工作空间内相对路径（如 lib/foo.dart），禁止绝对路径或盘符（如 E:\foo.dart、E:/foo.dart 会被拒绝）；写入前建议先 read 确认是否已有同名文件
 
+grep:
+  version: 1
+  description: |
+    [在工作空间内按模式搜索文件内容] | 贡献维度: 上下文获取（快速定位关键字/正则出现的位置，先定位再精读）
+    何时使用: 需要在工作空间内查找某关键字/标识符/配置项出现的位置；用正则批量定位模式（如 TODO|FIXME、函数调用点）；不确定目标文件时先 grep 缩小范围再 read 精读
+    何时不用: 已确定目标文件时直接 read；需要语义/向量检索用 embed_search（mcp call）；浏览目录结构用 Terminal ls
+    前置依赖: pattern 必填；regex=false 时 pattern 为字面量、regex=true 时为正则；path 可限定搜索范围（工作空间内相对路径）；ignore_case 控制大小写
+    省钱技巧: 用 path 缩小搜索范围、用 max_results 限制返回行数（缺省 200），避免大海捞针占用上下文
+
 edit:
   version: 3
   description: |
@@ -52,8 +61,8 @@ team:
     [团队协作：成员管理/消息/任务调度] | 贡献维度: 协同（与团队成员协作：分工、通信、任务指派、进度跟踪）
     何时使用: 复杂任务需分工协作时（update_member 设分工 + assign_task 指派）；与同级/下级成员通信；跨 Top agent 顶层协作（需用户透露对方 TOP name，先 list_teams 熟悉本用户名下 TOP）；查看成员产出/日志/状态
     何时不用: 简单任务（easy）无需团队；仅需给自己排进度用 set_todo_list 而非 team
-    前置依赖: 成员已预建（TOP 创建时全量建队），按 name 或 member id 寻址；分工前先 list_members 确认拓扑；成员职责未设时先 update_member 设置
-    注意: 成员不可动态创建/删除（P4 预建）；仅可 update_member 调整。修改成员信息会触发名单推送
+    前置依赖: 成员已预建（TOP 创建时全量建队）或由 leader 经 create_member 扩充；按 name 或 member id 寻址；分工前先 list_members 确认拓扑；成员职责未设时先 update_member 设置
+    注意: 成员创建仅限 team leader 经 create_member 完成（应用户自然语言要求，创建后系统自动向新成员下发其 system prompt 初始化消息）；成员不可删除；仅可 update_member 调整。修改成员信息会触发名单推送
     **使用前可查成员基本信息**：先 list_members / query_member 查看成员的 role（角色）、duty（职责）、model_id（模型）；role/duty 为空时用 update_member 补充完善再派发任务；model_id 为空会自动回退所属 TOP 模型，无需强制设置。
     update_member 必须携带 target_member_id（或 member_name）指定目标成员，先从 list_members 获取成员 id/name，禁止省略
 

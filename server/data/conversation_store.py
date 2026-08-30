@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from data.db import connect  # noqa: E402
 from data.session_store import DEFAULT_SESSION
 
 
@@ -39,9 +40,7 @@ def _ensure_db() -> None:
     if _initialized:
         return
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(_DB_PATH) as conn:
-        # 显式声明 UTF-8 解码，防止 Windows 默认行为导致中文乱码
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with connect() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -215,8 +214,7 @@ def _ensure_db() -> None:
 def _connect():
     """创建 UTF-8 编码的 SQLite 连接（全局复用）。"""
     _ensure_db()
-    conn = sqlite3.connect(_DB_PATH)
-    conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    conn = connect()
     return conn
 
 
@@ -410,8 +408,7 @@ def clear_history(
     """
     _ensure_db()
     now = int(time.time() * 1000)
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         if agent_id is None and session_id is None:
             cursor = conn.execute(
                 "UPDATE messages SET deleted_at = ? "
@@ -459,8 +456,7 @@ def save_context(
     _ensure_db()
     context_json = json.dumps(context, ensure_ascii=False)
     ts = int(time.time() * 1000)
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         conn.execute(
             "INSERT INTO agent_context "
             "(user_id, agent_id, session_id, context, updated_at, deleted_at) "
@@ -511,8 +507,7 @@ def clear_context(
     """
     _ensure_db()
     now = int(time.time() * 1000)
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         if agent_id is None and session_id is None:
             conn.execute(
                 "UPDATE agent_context SET deleted_at = ? "
@@ -562,8 +557,7 @@ def archive_context(
     _ensure_db()
     context_json = json.dumps(context, ensure_ascii=False)
     ts = int(time.time() * 1000)
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         conn.execute(
             "INSERT INTO agent_context_archive "
             "(user_id, agent_id, session_id, context, archived_at, reason) "
@@ -606,6 +600,26 @@ def list_archived_contexts(
         conn.close()
 
 
+def prune_archived_context(retention_days: int) -> int:
+    """删除超过保留期的上下文归档（7×24 长跑数据库膨胀治理）。
+
+    由 main 的后台维护任务每小时调用；``retention_days <= 0`` 表示不清理。
+    删除粒度按行，SQLite 删除后文件不自动收缩，但可显著抑制膨胀。
+    返回删除的行数。
+    """
+    if not retention_days or retention_days <= 0:
+        return 0
+    _ensure_db()
+    cutoff_ms = int(time.time() * 1000) - int(retention_days) * 86400 * 1000
+    with _write_lock, connect() as conn:
+        cursor = conn.execute(
+            "DELETE FROM agent_context_archive WHERE archived_at < ?",
+            (cutoff_ms,),
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
 # ---------------------------------------------------------------------------
 # 存活态提问（AskUserQuestion）：持久化待答问题，供用户延迟作答与唤醒
 # ---------------------------------------------------------------------------
@@ -629,8 +643,7 @@ def save_pending_question(
     _ensure_db()
     options_json = json.dumps(options or [], ensure_ascii=False)
     ts = int(time.time() * 1000)
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         conn.execute(
             "INSERT INTO pending_questions "
             "(qid, user_id, agent_id, top_agent_id, session_id, is_member, "
@@ -687,8 +700,7 @@ def mark_pending_answered(qid: str, answer: str) -> Optional[Dict[str, Any]]:
     pending = get_pending_question(qid)
     if pending is None or pending["status"] != "pending":
         return None
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         conn.execute(
             "UPDATE pending_questions SET answer = ?, status = 'answered' "
             "WHERE qid = ?",
@@ -705,8 +717,7 @@ def mark_pending_answered(qid: str, answer: str) -> Optional[Dict[str, Any]]:
 
 def mark_pending_cancelled(qid: str) -> None:
     """标记提问已取消（不触发唤醒）。"""
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         conn.execute(
             "UPDATE pending_questions SET status = 'cancelled' WHERE qid = ?",
             (qid,),

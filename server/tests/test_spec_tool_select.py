@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 # 将 server 目录加入 Python 路径
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import data.db as db_mod  # noqa: E402
 import data.session_store as session_store  # noqa: E402
 from tool.spec_tool import SpecTool  # noqa: E402
 
@@ -19,8 +20,12 @@ class SpecSelectBase(unittest.TestCase):
     def setUp(self):
         self._tmp = Path(tempfile.mkdtemp(prefix="trae_spec_"))
         self._old_db = session_store._DB_PATH
+        self._old_shared_db = db_mod._DB_PATH
         session_store._DB_PATH = self._tmp / "conversations.db"  # type: ignore[attr-defined]
         session_store._initialized = False  # type: ignore[attr-defined]
+        # 共享 connect() 的路径来源（data.db）一并重定向，避免打开真实库
+        db_mod._DB_PATH = self._tmp / "conversations.db"  # type: ignore[attr-defined]
+        db_mod._wal_configured = False  # type: ignore[attr-defined]
         # 构造会话，模拟 云舟 已建会话（route 里先 create_session 再由 tool 写）
         self.user_id = "u1"
         self.agent_id = "a1"
@@ -30,6 +35,8 @@ class SpecSelectBase(unittest.TestCase):
 
     def tearDown(self):
         session_store._DB_PATH = self._old_db  # type: ignore[attr-defined]
+        db_mod._DB_PATH = self._old_shared_db  # type: ignore[attr-defined]
+        db_mod._wal_configured = False  # type: ignore[attr-defined]
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def _make_tool(self):

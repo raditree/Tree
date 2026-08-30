@@ -922,8 +922,12 @@ class LocalExecutorService extends ChangeNotifier {
     }
   }
 
-  /// 在工作空间内按字面量模式递归搜索（排除 .git 与二进制文件），
+  /// 在工作空间内按模式递归搜索（排除 .git 与二进制文件），
   /// 返回 ``{exit_code, stdout}``，无命中时 exit_code 为 1（与 grep 一致）。
+  ///
+  /// 支持参数：``pattern``（必填）、``path``（搜索范围，工作空间内相对路径，
+  /// 缺省整个工作空间）、``regex``（是否正则，缺省 false 字面量）、
+  /// ``ignore_case``（是否忽略大小写，缺省 false）。
   Future<Map<String, dynamic>> _grepSearch(
     Directory wsDir,
     Map<String, dynamic> data,
@@ -932,9 +936,27 @@ class LocalExecutorService extends ChangeNotifier {
     if (pattern.isEmpty) {
       return <String, dynamic>{'error': 'grep_search 缺少 pattern'};
     }
+    final String path = (data['path'] as String?) ?? '';
+    final bool regex = (data['regex'] as bool?) ?? false;
+    final bool ignoreCase = (data['ignore_case'] as bool?) ?? false;
     final List<String> lines = <String>[];
     try {
-      await _walkSearch(wsDir, pattern, lines);
+      Directory dir = wsDir;
+      if (path.isNotEmpty) {
+        dir = Directory(_resolveInWorkspace(wsDir, path));
+      }
+      final RegExp? re = regex
+          ? RegExp(pattern, caseSensitive: !ignoreCase)
+          : null;
+      await _walkSearch(
+        dir,
+        pattern,
+        lines,
+        re: re,
+        ignoreCase: ignoreCase,
+      );
+    } on FormatException {
+      return <String, dynamic>{'error': '非法正则表达式: $pattern'};
     } catch (e) {
       return <String, dynamic>{'error': '搜索失败: $e'};
     }
@@ -947,23 +969,36 @@ class LocalExecutorService extends ChangeNotifier {
     };
   }
 
-  /// 递归遍历目录，收集包含 [pattern]（字面量）的行。
+  /// 递归遍历目录，收集包含 [pattern] 的行（[re] 非空时按正则匹配）。
   Future<void> _walkSearch(
     Directory dir,
     String pattern,
-    List<String> out,
-  ) async {
+    List<String> out, {
+    RegExp? re,
+    bool ignoreCase = false,
+  }) async {
     await for (final FileSystemEntity entity in dir.list(followLinks: false)) {
       if (entity is Directory) {
         final String name = _basename(entity.path);
         if (name == '.git' || name == 'workspaces') continue;
-        await _walkSearch(entity, pattern, out);
+        await _walkSearch(
+          entity,
+          pattern,
+          out,
+          re: re,
+          ignoreCase: ignoreCase,
+        );
       } else if (entity is File) {
         try {
           final String content = await entity.readAsString(encoding: utf8);
           final List<String> fileLines = content.split('\n');
           for (final String line in fileLines) {
-            if (line.contains(pattern)) {
+            final bool hit = re != null
+                ? re.hasMatch(line)
+                : ignoreCase
+                    ? line.toLowerCase().contains(pattern.toLowerCase())
+                    : line.contains(pattern);
+            if (hit) {
               out.add('${entity.path}:$line');
             }
           }

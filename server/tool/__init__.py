@@ -18,6 +18,7 @@ from mcp_tools import document_server
 from mcp_tools.embed_search_tool import EmbedSearchTool
 from tool.edit_tool import EditTool
 from tool.read_tool import ReadTool
+from tool.grep_tool import GrepTool
 from tool.terminal_tool import TerminalTool
 from tool.write_tool import WriteTool
 from tool.ask_question_tool import AskUserQuestionTool
@@ -136,8 +137,7 @@ def register_builtin_tools(
     mcp_manager = MCPManager()
     for name, cfg in (mcp_config or {}).items():
         if isinstance(cfg, dict):
-            mcp_manager.register_service(name, cfg)
-    # 再注册工作空间基础工具服务：以 stdio server 方式暴露 read/write/edit/
+            mcp_manager.register_service(name, cfg)    # 再注册工作空间基础工具服务：以 stdio server 方式暴露 read/write/edit/
     # terminal/embed_search，通过 WORKSPACE_ID 环境变量绑定到当前 agent 沙箱。
     # 工具经 refresh 列出、set 选择、mcp call 调用，而非直接作为 tool 注入。
     workspace_id = getattr(session, "workspace_id", "") or ""
@@ -211,6 +211,7 @@ def register_builtin_tools(
     # 各内置工具实例
     mcp_tool = MCPTool(mcp_manager)
     read_tool = ReadTool(io, workspace_id)
+    grep_tool = GrepTool(io, workspace_id)
     write_tool = WriteTool(io, workspace_id)
     edit_tool = EditTool(io, workspace_id)
     terminal_tool = TerminalTool(
@@ -282,10 +283,10 @@ def register_builtin_tools(
             archive_context(_u, _a, ctx, reason)
         session.archive_context_callback = _archive_ctx
 
-    # 统一注册内置工具（9 个）：handler 收集关键字参数后调用各工具的 execute(dict)。
+    # 统一注册内置工具（10 个）：handler 收集关键字参数后调用各工具的 execute(dict)。
     # redirect_output 由 _make_handler 统一拦截处理，不传入 execute。
-    for tool in (mcp_tool, read_tool, write_tool, edit_tool, terminal_tool,
-                team_tool, todo_tool, ask_tool, spec_tool):
+    for tool in (mcp_tool, read_tool, grep_tool, write_tool, edit_tool,
+                terminal_tool, team_tool, todo_tool, ask_tool, spec_tool):
         definition = tool.get_tool_definition()
         # 给每个内置工具注入 redirect_output 可选参数
         params = definition["function"]["parameters"]
@@ -305,6 +306,10 @@ def register_builtin_tools(
             parameters=params,
             handler=_make_handler(tool, session, docker_manager),
         )
+    # 挂载 MCP 管理器到会话：供 system prompt 重建（compact）与初始快照
+    # 注入 MCP 工具清单章节（chat.py _build_mcp_tools_text）
+    session.mcp_manager = mcp_manager
+
     logger.info(
         "已注册内置工具: %s",
         ", ".join(

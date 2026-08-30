@@ -1,12 +1,16 @@
 """内置 team 工具 - 团队成员管理、消息管理、任务管理。
 
 工具覆盖三个子域：
-- 成员管理：创建成员、成员管理表（.self/team_roster.md）、多维评分、成员/状态查询
+- 成员管理：创建成员（team leader 权限，应用户自然语言要求）、成员管理表
+  （.self/team_roster.md）、多维评分、成员/状态查询
 - 消息管理：点对点消息、广播消息、文件发送
 - 任务管理：任务分配、任务完成流程、任务跟踪、等待成员完成
 
-team 工具同时维护团队层级限制：顶部 agent 为 Level 0，最深 Level 3，
-且 can_lead_team 为 False 的成员不可创建子团队。
+team 工具同时维护团队层级限制：顶部 agent 为 Level 0，最大层级深度与每层
+成员上限在**创建 TOP agent 时设定**（teams 表，创建后不可修改，成员只增不
+减）；can_lead_team 为 False 的成员不可创建子团队。成员创建只允许 team
+leader（经 create_member，用户自然语言驱动），普通成员只能 update_member
+编辑信息，不可创建/删除成员。
 """
 
 import logging
@@ -14,16 +18,13 @@ import os
 import random
 import string
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.context_isolation import ContextIsolator
-from config.config import get_config
-from data.conversation_store import clear_context
 from io_.docker_manager import DockerManager
 from io_.workspace_io import run_io
 from llm.llm import AgentLLMSession
 from config.models import ModelConfig
-from data.session_cache import clear_user_agent
 from prompt import versions
 
 logger = logging.getLogger(__name__)
@@ -54,41 +55,38 @@ def _fmt_ts(value: Any) -> str:
         return str(value)
 
 
-def _resolve_team_limits(user_id: str, fallback_members: Optional[int] = None):
-    """按用户等级解析团队规模限制，返回 ``(max_level, max_members_per_level)``。
+def _resolve_team_limits(top_agent_id: str) -> Tuple[int, int]:
+    """按 TOP 的团队记录解析规模限制，返回 ``(max_level, max_members_per_level)``。
 
-    优先取 ``registration.levels.<level>.max_level`` 与 ``max_members_per_level``；
-    未配置 registration 或等级缺失时：
-    - ``max_level`` 回退 ``agents.max_level``
-    - ``max_members_per_level`` 优先回退 ``fallback_members``（实例级兜底，
-      如 ``docker_manager.max_members_per_level``），再回退
-      ``docker.max_members_per_level``
+    团队配置在创建 TOP agent 时由用户设定并持久化到 ``teams`` 表
+    （创建后不可修改，成员只增不减）；旧数据无团队记录/配置列缺失时回退
+    ``config.team`` 的代码默认值。不再读取用户等级 / app.yaml / docker 配置。
 
-    返回值均为 >=1 的整数。
+    :param top_agent_id: 所属顶层 agent ID（顶部 agent 自身即 agent_id）
+    :return: ``(max_level, max_members_per_level)``，均 >=1
     """
-    from config.levels import get_level_config
-    from data.user_store import get_user_level
+    from config.team import DEFAULT_TEAM_MAX_LEVEL, DEFAULT_TEAM_MAX_MEMBERS
+    from data.team_store import get_team
 
-    cfg = get_level_config(get_user_level(user_id))
-    max_level = cfg.get("max_level")
-    max_members = cfg.get("max_members_per_level")
-    if max_level is None:
-        max_level = get_config().get("agents", {}).get("max_level", 3)
-    if max_members is None:
-        if fallback_members:
-            max_members = fallback_members
-        else:
-            max_members = get_config().get("docker", {}).get(
-                "max_members_per_level", 7
+    team = None
+    if top_agent_id:
+        try:
+            team = get_team(top_agent_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取团队配置失败(按默认值): %s: %s", top_agent_id, exc)
+    max_level = DEFAULT_TEAM_MAX_LEVEL
+    max_members = DEFAULT_TEAM_MAX_MEMBERS
+    if isinstance(team, dict):
+        try:
+            max_level = max(1, int(team.get("max_level") or DEFAULT_TEAM_MAX_LEVEL))
+        except (TypeError, ValueError):
+            max_level = DEFAULT_TEAM_MAX_LEVEL
+        try:
+            max_members = max(
+                1, int(team.get("max_members_per_level") or DEFAULT_TEAM_MAX_MEMBERS)
             )
-    try:
-        max_level = max(1, int(max_level))
-    except (TypeError, ValueError):
-        max_level = 3
-    try:
-        max_members = max(1, int(max_members))
-    except (TypeError, ValueError):
-        max_members = 7
+        except (TypeError, ValueError):
+            max_members = DEFAULT_TEAM_MAX_MEMBERS
     return max_level, max_members
 
 
@@ -157,9 +155,11 @@ class TeamTool:
 
         # 当前 agent 层级：顶部 agent 为 Level 0
         self.level: int = 0
-        # 团队最大层级深度（按用户等级解析，顶部为 Level 0；
-        # 未配置 registration / 等级缺失时回退 agents.max_level）
-        self.max_team_level, _ = _resolve_team_limits(self.user_id)
+        # 团队最大层级深度 + 每层成员上限：按所属 TOP 的团队记录解析
+        # （创建 TOP 时设定，之后不可修改；未建队/旧数据回退代码默认值）
+        self.max_team_level, self.max_members_per_level = _resolve_team_limits(
+            self.top_agent_id or self.agent_id
+        )
         # 当前 agent 是否可带领团队（由 set 工具设置；False 时不可创建子团队）
         self.can_lead_team: bool = True
 
@@ -188,6 +188,7 @@ class TeamTool:
                                 "list_models",
                                 "list_teams",
                                 "list_members",
+                                "create_member",
                                 "query_member",
                                 "update_member",
                                 "query_status",
@@ -204,7 +205,10 @@ class TeamTool:
                                          "否则会因缺少 target_member_id 而失败："
                                          "update_member / query_member / query_status / "
                                          "view_member_output / view_member_log / "
-                                         "send_message / assign_task",
+                                         "send_message / assign_task。"
+                                         "create_member 为团队 leader 权限：仅在用户"
+                                         "明确要求组建/扩充团队时调用，创建后系统会"
+                                         "自动向新成员发送其 system prompt 初始化消息",
                         },
                         "model_id": {
                             "type": "string",
@@ -250,7 +254,10 @@ class TeamTool:
                         },
                         "system_prompt": {
                             "type": "string",
-                            "description": "成员的独立系统提示词/职责说明（更新后重建工作区并清空上下文，等价于重生）",
+                            "description": "成员的独立系统提示词/职责说明（create_member "
+                                         "创建时设置，或 update_member 修改；仅更新提示词，"
+                                         "**不清空成员上下文/工作区**，新提示词在成员下次"
+                                         "上下文重建（compact）时生效）",
                         },
                         "scores": {
                             "type": "object",
@@ -311,6 +318,7 @@ class TeamTool:
             "list_models": self._action_list_models,
             "list_teams": self._action_list_teams,
             "list_members": self._action_list_members,
+            "create_member": self._action_create_member,
             "query_member": self._action_query_member,
             "update_member": self._action_update_member,
             "query_status": self._action_query_status,
@@ -403,24 +411,6 @@ class TeamTool:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("解析跨 Top 目标失败: %s", exc)
         return {"type": "unknown", "id": target, "name": ""}
-
-    def _load_roster_of(self, agent_id: str) -> List[Dict[str, Any]]:
-        """读取指定 agent 工作空间的 roster 成员表（用于查找平级成员）。"""
-        if not agent_id or self.docker_manager is None:
-            return []
-        # 优先走统一 WorkspaceIO（本地模式读本地 .self）
-        stdout = self._io_read(agent_id, ROSTER_FILE_PATH)
-        if stdout is not None:
-            return self._parse_roster_md(stdout)
-        try:
-            result = self.docker_manager.exec_in_workspace(
-                agent_id, ["cat", ROSTER_FILE_PATH]
-            )
-            if result.get("exit_code", -1) != 0:
-                return []
-            return self._parse_roster_md(result.get("stdout", "") or "")
-        except Exception:  # noqa: BLE001
-            return []
 
     def _dispatch_to_member(
         self, member: Dict[str, Any], content: str
@@ -590,31 +580,36 @@ class TeamTool:
         return {"teams": teams, "total": len(teams)}
 
     def _action_create_member(self, arguments: dict) -> dict:
-        """创建新成员流程。
+        """创建新成员流程（团队 leader 权限，应用户自然语言要求调用）。
 
-        1. 层级校验：当前层级 >= 3 时拒绝
+        1. 层级校验：当前层级 >= 本 TOP 配置的最大层级深度时拒绝（动态错误信息）
         2. can_lead_team 校验：当前 agent 不可带队时拒绝
-        3. 未指定 model_id 时返回可用模型池
-        4. 创建工作空间（parent_workspace_id = 当前 agent 的 workspace_id）
-        5. 配置成员信息并加入 self.members
-        6. 持久化到成员管理表
+        3. 直属成员数量校验：已达本 TOP 配置的每层成员上限时拒绝
+           （按 parent_agent_id == 当前 agent 计数，成员只增不减）
+        4. 未指定 model_id 时返回可用模型池
+        5. 创建工作空间（parent_workspace_id = 当前 agent 的 workspace_id）
+        6. 配置成员信息并加入 self.members（含 system_prompt）
+        7. 持久化到成员管理表 + team_members 表
+        8. **向新成员投递初始化消息**（携带其 system_prompt），触发成员
+           首次会话构建与确认回复
         """
-        # 层级深度校验（配置 agents.max_level）
+        # 层级深度校验（本 TOP 创建时设定的 max_level；顶部 agent 为 Level 0）
         if self.level >= self.max_team_level:
-            return {"error": "已达最大层级（Level 3），不可继续创建子团队"}
-
-        # 每级成员数量上限（按用户等级解析；
-        # 未配置 registration / 等级缺失时回退 docker_manager.max_members_per_level）
-        _, max_members = _resolve_team_limits(
-            self.user_id,
-            fallback_members=getattr(
-                self.docker_manager, "max_members_per_level", None
-            ),
-        )
-        if len(self.members) >= max_members:
             return {
-                "error": f"当前 agent 的成员数量已达上限（{max_members}），"
+                "error": f"已达最大层级（Level {self.max_team_level}），"
                 "不可继续创建子团队"
+            }
+
+        # 直属成员数量上限（按 parent_agent_id 计数，而非 TOP 总人数——
+        # team_members 表含全层级成员，混计会让子 agent 误判上限已满）
+        direct_count = sum(
+            1 for m in self.members
+            if (m.get("parent_agent_id") or "") == self.agent_id
+        )
+        if direct_count >= self.max_members_per_level:
+            return {
+                "error": f"当前 agent 的直属成员数量已达上限"
+                f"（{self.max_members_per_level}），不可继续创建成员"
             }
 
         # can_lead_team 校验（SubTask 9.5.3）
@@ -633,6 +628,9 @@ class TeamTool:
         # 生成成员 ID
         member_id = self._generate_member_id()
         member_name = arguments.get("member_name") or f"member-{member_id[-6:]}"
+        # 成员独立系统提示词（leader 创建时设定；创建后系统自动向成员发送
+        # 该提示词作为初始化消息，见本函数末尾）
+        system_prompt = str(arguments.get("system_prompt") or "").strip()
 
         # 创建工作空间（含 Git，parent_workspace_id 设为当前 agent 的 workspace_id；
         # 云端模式下共享所属顶层 agent 的主工作区，仅初始化私人空间 .self）
@@ -656,14 +654,15 @@ class TeamTool:
             "workspace_id": ws_result.get("workspace_id", member_id),
             "container_id": ws_result.get("container_id", ""),
             "parent_workspace_id": self.workspace_id,
+            "parent_agent_id": self.agent_id,
             "leader_name": self._leader_name(),
             "created_at": now,
             "work_status": "idle",  # idle / working / waiting_input / stopped / error
             "current_task": "",
             "can_lead_team": True,
             # 成员独立系统提示词（leader 可后续通过 update_member 修改；
-            # 修改后触发工作区重建与上下文清空，checklist 12）
-            "system_prompt": "",
+            # 修改只更新提示词，不清空上下文/工作区）
+            "system_prompt": system_prompt,
             # 多维评分（SubTask 7.3）
             "scores": {
                 "quality": 0.0,
@@ -686,8 +685,33 @@ class TeamTool:
         # 本地模式经 WorkspaceIO 落到 baseDir/workspaces/{member_id}/.self）
         self._init_member_private_space(member)
 
-        # 记录到成员管理表
+        # 记录到成员管理表（视图）+ team_members 表（权威名单，含直属 leader）。
+        # 注：此前 create_member 只写内存 + roster 视图，不落 team_members 表，
+        # 重启后成员即消失（_load_from_team_store 读不到）——此处必须经
+        # team_store.add_member 持久化（parent_agent_id 记录直属 leader）。
         self._save_roster()
+        try:
+            from data.team_store import add_member
+
+            add_member(
+                user_id=self.user_id,
+                top_agent_id=self.top_agent_id or self.agent_id,
+                member_id=member_id,
+                name=member.get("name", ""),
+                role=member.get("role", ""),
+                duty=member.get("duty", ""),
+                model_id=member.get("model_id", ""),
+                level=member.get("level", 1),
+                system_prompt=member.get("system_prompt", ""),
+                parent_agent_id=member.get("parent_agent_id", ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("持久化新成员到 team_store 失败 %s: %s", member_id, exc)
+
+        # 创建后向新成员投递初始化消息（携带其 system_prompt）：
+        # 成员首次会话据此构建系统提示词快照并回复确认，用户/leader 即可
+        # 立即指派任务。投递失败不阻塞创建（成员已落库，可稍后 send_message）。
+        initialized = self._dispatch_member_init(member)
 
         return {
             "member_id": member_id,
@@ -696,7 +720,33 @@ class TeamTool:
             "level": member["level"],
             "workspace_id": member["workspace_id"],
             "created_at": now,
+            "initialized": initialized,
+            "hint": "" if initialized else (
+                "成员已创建但初始化消息投递失败（broker 未就绪），"
+                "可稍后用 send_message 通知该成员"
+            ),
         }
+
+    def _dispatch_member_init(self, member: Dict[str, Any]) -> bool:
+        """向新创建/加入的成员投递初始化消息（含其 system prompt）。
+
+        内容明确告知成员身份、直属 leader 与职责（system prompt），触发其
+        首次会话构建（``_process_member_message`` 以 payload.system_prompt
+        注入系统提示词快照）并回复确认。
+
+        :return: 是否已入队
+        """
+        sp = (member.get("system_prompt") or "").strip()
+        content = (
+            "【团队初始化】你已加入团队（直属 leader: "
+            f"{member.get('leader_name') or self._leader_name()}）。\n"
+        )
+        if sp:
+            content += f"你的角色与职责（system prompt）如下，请阅读并确认理解：\n{sp}\n"
+        else:
+            content += "目前未设置独立分工，请先向 leader 确认你的角色与职责。\n"
+        content += "确认后等待 leader 派发任务。"
+        return self._dispatch_to_member(member, content)
 
     def _init_member_private_space(self, member: Dict[str, Any]) -> None:
         """初始化成员私人空间 .self（rule.md / memory.md / activity.log）。
@@ -811,6 +861,12 @@ class TeamTool:
             return []
         result: List[Dict[str, Any]] = []
         for r in rows:
+            parent_id = r.get("parent_agent_id", "") or top_id
+            leader_name = "self"
+            if parent_id and parent_id != self.agent_id:
+                parent_rec = self._lookup_agent_by_id(parent_id)
+                if parent_rec is not None:
+                    leader_name = parent_rec.get("name") or parent_id
             result.append({
                 "id": r.get("id", ""),
                 "name": r.get("name", ""),
@@ -822,7 +878,9 @@ class TeamTool:
                 "workspace_id": r.get("id", ""),
                 "container_id": "",
                 "parent_workspace_id": self.workspace_id,
+                "parent_agent_id": parent_id,
                 "top_agent_id": top_id,
+                "leader_name": leader_name,
                 "created_at": _fmt_ts(r.get("created_at")),
                 "work_status": r.get("work_status", "idle"),
                 "current_task": "",
@@ -886,6 +944,10 @@ class TeamTool:
                     "workspace_id": member_id,
                     "container_id": "",
                     "parent_workspace_id": self.workspace_id,
+                    # 旧 roster 文件无直属 leader 列：历史语义为「本 agent 的
+                    # 成员视图」，视为直属（与 team_store 回退约定一致）
+                    "parent_agent_id": self.agent_id,
+                    "leader_name": self._leader_name(),
                     "created_at": parts[4],
                     "work_status": parts[5] or "idle",
                     "current_task": "",
@@ -962,9 +1024,10 @@ class TeamTool:
 
         分组：
         - ``team_leader``：当前 agent 的上级 leader（成员视角；顶部 agent 无 leader）
-        - ``teammates``：当前 agent 创建的直属成员（下属）
+        - ``teammates``：当前 agent 创建的**直属成员**（下属，parent_agent_id
+          等于当前 agent；P4 全量建队的成员直属 TOP）
         - ``team_member``：当前 agent 所属团队中的其他成员（同顶部 agent 旗下、
-          经上级 roster 可查的平级成员；teammates 无法看到无关系的 agent）
+          非直属的其他层级成员）
 
         筛选参数（model_id / level / work_status）仅作用于 ``teammates`` 分组。
         """
@@ -989,6 +1052,17 @@ class TeamTool:
                 if self._live_work_status(m.get("id", "")) == work_status
             ]
 
+        # 分组：直属（parent == 当前 agent）与同 TOP 非直属（平级/其他层级）
+        own_id = self.agent_id or ""
+        direct = [
+            m for m in result
+            if (m.get("parent_agent_id") or "") == own_id
+        ]
+        team_member = [
+            m for m in result
+            if (m.get("parent_agent_id") or "") != own_id
+        ]
+
         # team_leader：自己的上级 leader
         team_leader: List[Dict[str, Any]] = []
         if self.leader_id:
@@ -1012,29 +1086,13 @@ class TeamTool:
                     "relation": "team_leader",
                 })
 
-        # team_member：本顶部 agent 旗下其他成员（上级 roster 中的平级成员）
-        team_member: List[Dict[str, Any]] = []
-        if self.leader_id:
-            own_ids = {m.get("id") for m in result if m.get("id")}
-            for m in self._load_roster_of(self.leader_id):
-                sid = m.get("id", "")
-                if sid and sid != self.agent_id and sid not in own_ids:
-                    team_member.append({
-                        "id": sid,
-                        "name": m.get("name") or sid,
-                        "model_id": m.get("model_id", ""),
-                        "level": int(m.get("level") or 1),
-                        "workspace_id": sid,
-                        "relation": "team_member",
-                    })
-
         # 基本信息完整性提示：role/duty 为空时提醒先 update_member 补充
         # （避免成员职责不明导致任务执行偏差，spec「基本信息先查」）。
         # model_id 为空**不**警告——存在自动回退机制（投递时回退所属 TOP
         # 模型），无需强制设置，避免对 agent 的持续骚扰。
         missing = [
             (m.get("name") or m.get("id"))
-            for m in result
+            for m in direct
             if not (m.get("role") and m.get("duty"))
         ]
         hint = ""
@@ -1049,7 +1107,7 @@ class TeamTool:
 
         # 【状态治理】返回前把 members 的 work_status 覆盖为**实际执行态**
         # （基于 _active_tasks），而非表/roster 中的快照（可能过时或假状态）。
-        live_result = [dict(m) for m in result]
+        live_result = [dict(m) for m in direct]
         for m in live_result:
             m["work_status"] = self._live_work_status(m.get("id", ""))
 
@@ -1081,16 +1139,14 @@ class TeamTool:
         """编辑成员信息（name/model_id/can_lead_team/comment/scores/system_prompt）。
 
         仅更新显式提供的字段，其余保持不变；更新后持久化到成员管理表。
+        **信息保留**：任何字段（含 name / system_prompt）的修改都只更新成员
+        信息，**不重建工作区、不清空上下文**——成员的记忆与进行中任务不受
+        影响；新的 system_prompt 在成员下次上下文重建（compact）时生效。
 
         【状态治理】工作状态（work_status）不可由 update_member 设置——成员
         是否在工作的唯一权威是 ``chat._active_tasks``（实际 tool loop 登记），
         由执行层登记/清除并经 WS ``agent_status`` 事件推送。需要停止成员请
         使用前端「停止」按钮（取消任务 + 清空队列），而非修改状态字段。
-
-        checklist 12 语义：
-        - 变 model_id / comment → 只更新成员管理表，无其他操作（不重建工作区）。
-        - 变角色（name）/ 提示词（system_prompt）→ 重建工作区、清空上下文
-          （相当于成员重生，用新角色/新提示词重新初始化）。
         """
         member_id = arguments.get("target_member_id") or arguments.get("member_id")
         if not member_id:
@@ -1107,8 +1163,6 @@ class TeamTool:
             }
 
         updated: List[str] = []
-        # 触发重生的字段：角色（name）/ 提示词（system_prompt）变化 → 重建工作区清空上下文
-        rebirth_triggered = False
 
         # 更新名称（角色）
         name = arguments.get("name")
@@ -1116,18 +1170,15 @@ class TeamTool:
             stripped = str(name).strip()
             if not stripped:
                 return {"error": "成员名称不能为空"}
-            if member.get("name") != stripped:
-                rebirth_triggered = True
             member["name"] = stripped
             updated.append("name")
 
-        # 更新成员独立提示词（角色/职责说明）
+        # 更新成员独立提示词（角色/职责说明）。
+        # 信息保留：只更新字段，不重建工作区、不清空上下文（新提示词在
+        # 成员下次 compact 时经 system_prompt_rebuilder 现读生效）
         system_prompt = arguments.get("system_prompt")
         if system_prompt is not None:
-            new_prompt = str(system_prompt)
-            if member.get("system_prompt") != new_prompt:
-                rebirth_triggered = True
-            member["system_prompt"] = new_prompt
+            member["system_prompt"] = str(system_prompt)
             updated.append("system_prompt")
 
         # 更新模型（校验模型必须存在于模型池；按 checklist 12(a) 不重建工作区）
@@ -1175,12 +1226,6 @@ class TeamTool:
                                         system_prompt=member.get("system_prompt"),
                                         scores=member.get("scores"))
 
-        # checklist 12(b)：角色/提示词变化 → 重建工作区并清空上下文（重生）
-        rebuilt = False
-        cleared = False
-        if rebirth_triggered:
-            rebuilt, cleared = self._rebuild_member(member)
-
         # 名单变更推送：TOP 修改成员信息后，向本 TOP 下所有 agent 推送更新后的
         # 名单（触发其 context 重构、注入最新成员拓扑）（spec「名单变更推送」）
         pushed = self._push_roster_update()
@@ -1189,11 +1234,6 @@ class TeamTool:
             "member_id": member_id,
             "updated": updated,
             "member": member,
-            "rebirth": {
-                "triggered": rebirth_triggered,
-                "workspace_rebuilt": rebuilt,
-                "context_cleared": cleared,
-            },
             "roster_pushed": pushed,
         }
 
@@ -1260,12 +1300,27 @@ class TeamTool:
             logger.warning("名单推送渲染 roster 失败: %s", exc)
             return 0
         # 通知各成员：下发 roster 更新事件（内容为最新名单视图），触发重构
-        return self._dispatch_roster_event(top_id, roster_md)
+        return self._dispatch_roster_event(top_id, roster_md, members)
 
-    def _dispatch_roster_event(self, top_id: str, roster_md: str) -> int:
-        """向 TOP 下全部成员广播 roster 更新事件（经 broker 投递弱事件消息）。"""
+    def _dispatch_roster_event(
+        self, top_id: str, roster_md: str,
+        members: Optional[List[Dict[str, Any]]] = None,
+    ) -> int:
+        """向 TOP 下全部成员广播 roster 更新事件（经 broker 投递弱事件消息）。
+
+        成员列表按 team_store 权威名单全量投递（跨层级），而非仅当前 agent
+        的直属成员——名单变更影响整个 TOP 的拓扑认知。
+        """
+        if members is None:
+            try:
+                from data.team_store import get_members
+
+                members = get_members(top_id) or []
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("名单推送读取全量成员失败: %s", exc)
+                return 0
         pushed = 0
-        for m in (self.members or []):
+        for m in (members or []):
             _id = m.get("id", "")
             if not _id:
                 continue
@@ -1291,46 +1346,6 @@ class TeamTool:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("名单推送投掷失败 %s: %s", _id, exc)
         return pushed
-
-    def _rebuild_member(self, member: Dict[str, Any]) -> tuple:
-        """重建成员工作空间并清空其上下文（checklist 12(b) 重生）。
-
-        - 删除旧容器并重建（新角色/新提示词的干净工作空间，重新初始化 rule.md）
-        - 重写 ``.self/identity.md`` 身份信息
-        - 清空该成员在会话缓存与数据库中的上下文，使其下次处理消息时全新开始
-
-        :return: ``(workspace_rebuilt, context_cleared)``
-        """
-        ws_id = member.get("workspace_id")
-        workspace_rebuilt = False
-        if ws_id:
-            try:
-                self.docker_manager.remove_workspace(ws_id)
-                create_result = self.docker_manager.create_workspace(
-                    workspace_id=ws_id,
-                    parent_workspace_id=member.get("parent_workspace_id") or None,
-                    agent_name=member.get("name") or "",
-                    shared_with=self.top_agent_id,
-                )
-                if "error" not in create_result:
-                    workspace_rebuilt = True
-                    # 用最新角色/信息重写身份文件
-                    self._write_member_identity(member)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("重建成员工作空间失败: %s", exc)
-
-        # 清空上下文：会话缓存 + 数据库持久化上下文
-        context_cleared = False
-        member_id = member.get("id", "")
-        if self.user_id and member_id:
-            try:
-                clear_user_agent(self.user_id, member_id)
-                clear_context(self.user_id, member_id)
-                context_cleared = True
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("清空成员上下文失败: %s", exc)
-
-        return workspace_rebuilt, context_cleared
 
     # ------------------------------------------------------------------
     # SubTask 7.5: 工作状态查询
@@ -1626,8 +1641,13 @@ class TeamTool:
             "timestamp": now,
         }
         self.messages.append(msg)
-        member_ids = [m.get("id", "") for m in self.members if m.get("id")]
-        for m in self.members:
+        # 仅投递给直属成员（parent_agent_id == 当前 agent；广播不跨层级）
+        direct = [
+            m for m in self.members
+            if (m.get("parent_agent_id") or "") == self.agent_id
+        ]
+        member_ids = [m.get("id", "") for m in direct if m.get("id")]
+        for m in direct:
             m.setdefault("message_history", []).append(msg)
 
         rejected: List[str] = []
@@ -1643,14 +1663,14 @@ class TeamTool:
             )
             rejected = result.get("rejected", []) or []
         else:
-            for m in self.members:
+            for m in direct:
                 if not self._dispatch_to_member(m, message):
                     rejected.append(m.get("id", ""))
 
         return {
             "status": "broadcast",
             "message_id": msg["id"],
-            "recipients": len(self.members),
+            "recipients": len(direct),
             "rejected": rejected,
         }
 

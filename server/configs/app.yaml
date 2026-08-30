@@ -15,15 +15,14 @@ prompt:
   version: "1.0.0"
 
 # 用户可创建的顶层 agent 数量上限
+# 注：团队规模（最大层级深度 / 每层成员上限）不再在此配置——由用户创建
+# TOP agent 时指定（见 data/team_store 的 teams 表 max_level /
+# max_members_per_level），创建后不可修改，成员只增不减。
 agents:
   max_per_user: 5
-  # 团队最大层级深度（顶部 agent 为 Level 0）
-  max_level: 2
 
 docker:
   image: "agent-workspace:latest"
-  # 每个 agent 可指挥的成员数量上限
-  max_members_per_level: 7
   resource_limits:
     cpu: "4.0"
     memory: "4g"
@@ -53,6 +52,9 @@ llm:
 data_export:
   # 每日自动导出时刻（HH:MM，本地时区；默认 1:43）
   daily_time: "01:43"
+  # 上下文归档（agent_context_archive）保留天数：超过保留期的归档行由后台
+  # 维护任务定期清理，防止 300+ agent 长跑下数据库无限膨胀；0 表示不清理
+  archive_retention_days: 30
   # 允许下载/查看 SFT 导出文件的管理员 openid 列表
   # （导出文件含全量对话，仅管理员可访问，防止普通用户越权拉取）
   admin_openids: []
@@ -81,10 +83,6 @@ help_policy:
   # （见 registration.levels.*.max_concurrent_agents，动态披露后续实现）；此处保留静态路径兜底即可。
   - name: "每个用户最多可创建的顶层 agent 数"
     path: "agents.max_per_user"
-  - name: "团队最大层级深度（顶部 agent 为 Level 0）"
-    path: "agents.max_level"
-  - name: "每个 agent 最多指挥的成员数"
-    path: "docker.max_members_per_level"
   - name: "每个沙箱 CPU 限制"
     path: "docker.resource_limits.cpu"
   - name: "每个沙箱内存限制"
@@ -120,9 +118,8 @@ jwt:
 #       - max_users              ：该等级最大可注册用户数（注册 + 升级均计入）
 #       - validity_minutes       ：邀请码有效期（分钟）
 #       - cooldown_minutes       ：邀请码到期后的冷却时间（分钟，>0 时冷却结束才重新生成）
-#       - max_concurrent_agents  ：该等级用户可同时运行的并发 agent 数（动态披露后续实现）
-#       - max_level              ：该等级允许的团队最大层级深度
-#       - max_members_per_level  ：该等级每层级最多指挥的成员数
+#       - max_concurrent_agents  ：该等级用户可同时运行的并发 agent 数（等级只管并发；
+#                                  团队规模在创建 TOP agent 时设定，见 config/team.py）
 #       - rate_per_minute        ：常规速率限制（次/分钟）
 #       - active_rate_per_minute ：活跃态速率限制（次/分钟）
 registration:
@@ -135,8 +132,6 @@ registration:
       validity_minutes: 1440
       cooldown_minutes: 0
       max_concurrent_agents: 4
-      max_level: 2
-      max_members_per_level: 3
       rate_per_minute: 12
       active_rate_per_minute: 6
     pro:
@@ -144,8 +139,6 @@ registration:
       validity_minutes: 360
       cooldown_minutes: 0
       max_concurrent_agents: 12
-      max_level: 2
-      max_members_per_level: 5
       rate_per_minute: 24
       active_rate_per_minute: 6
     ultra:
@@ -153,8 +146,6 @@ registration:
       validity_minutes: 30
       cooldown_minutes: 0
       max_concurrent_agents: 72
-      max_level: 2
-      max_members_per_level: 7
       rate_per_minute: 60
       active_rate_per_minute: 6
     beta:
@@ -162,7 +153,5 @@ registration:
       validity_minutes: 2
       cooldown_minutes: 18
       max_concurrent_agents: 500
-      max_level: 3
-      max_members_per_level: 5
       rate_per_minute: 300
       active_rate_per_minute: 6

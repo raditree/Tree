@@ -74,7 +74,8 @@ class DockerManager:
                 self.client = None  # type: ignore[assignment]
         docker_cfg = get_config().get("docker", {})
         self.image: str = docker_cfg.get("image", "agent-workspace:latest")
-        self.max_members_per_level: int = int(docker_cfg.get("max_members_per_level", 10))
+        # 注：团队规模（每层成员上限）不再由 docker 配置承载，改由创建 TOP
+        # agent 时设定（teams 表 max_members_per_level，见 config/team.py）。
         resource_limits = docker_cfg.get("resource_limits", {})
         self.cpu_limit: str = str(resource_limits.get("cpu", "2.0"))
         self.memory_limit: str = str(resource_limits.get("memory", "2g"))

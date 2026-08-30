@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from data.db import connect  # noqa: E402
+
 # 数据库目录：server/data
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 _DB_PATH = _DATA_DIR / "conversations.db"
@@ -32,13 +34,16 @@ _initialized = False
 
 
 def _ensure_db() -> None:
-    """确保数据库目录与表结构已创建（线程安全的惰性初始化）。"""
+    """确保数据库目录与表结构已创建（线程安全的惰性初始化）。
+
+    含旧库迁移：``teams.max_level / max_members_per_level`` 与
+    ``team_members.parent_agent_id`` 为后加列，对已存在的表做幂等 ALTER。
+    """
     global _initialized
     if _initialized:
         return
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS teams (
@@ -46,6 +51,8 @@ def _ensure_db() -> None:
                 user_id TEXT NOT NULL,
                 name TEXT NOT NULL,
                 member_count INTEGER NOT NULL DEFAULT 0,
+                max_level INTEGER NOT NULL DEFAULT 3,
+                max_members_per_level INTEGER NOT NULL DEFAULT 7,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )
@@ -66,6 +73,7 @@ def _ensure_db() -> None:
                 comment TEXT NOT NULL DEFAULT '',
                 scores_json TEXT NOT NULL DEFAULT '{}',
                 system_prompt TEXT NOT NULL DEFAULT '',
+                parent_agent_id TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )
@@ -75,15 +83,35 @@ def _ensure_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_team_members_top "
             "ON team_members (top_agent_id, created_at)"
         )
+        # 旧库迁移（幂等）：检查列是否存在，缺失则 ALTER 补充
+        _migrate_column(conn, "teams", "max_level",
+                        "ALTER TABLE teams ADD COLUMN max_level "
+                        "INTEGER NOT NULL DEFAULT 3")
+        _migrate_column(conn, "teams", "max_members_per_level",
+                        "ALTER TABLE teams ADD COLUMN max_members_per_level "
+                        "INTEGER NOT NULL DEFAULT 7")
+        _migrate_column(conn, "team_members", "parent_agent_id",
+                        "ALTER TABLE team_members ADD COLUMN parent_agent_id "
+                        "TEXT NOT NULL DEFAULT ''")
         conn.commit()
     _initialized = True
+
+
+def _migrate_column(conn: sqlite3.Connection, table: str, column: str,
+                    ddl: str) -> None:
+    """列不存在时执行 ALTER TABLE（幂等迁移）。"""
+    try:
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    except sqlite3.Error:
+        return
+    if column not in cols:
+        conn.execute(ddl)
 
 
 def _connect():
     """创建 UTF-8 编码的 SQLite 连接（确保表已建）。"""
     _ensure_db()
-    conn = sqlite3.connect(_DB_PATH)
-    conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    conn = connect()
     return conn
 
 
@@ -140,22 +168,34 @@ def render_roster_md(members: List[Dict[str, Any]]) -> str:
 # ----------------------------------------------------------------------
 # teams 表
 # ----------------------------------------------------------------------
-def init_team(user_id: str, top_agent_id: str, name: str) -> Dict[str, Any]:
-    """初始化一个 TOP agent 的团队（幂等：已存在则更新名称）。
+def init_team(
+    user_id: str,
+    top_agent_id: str,
+    name: str,
+    max_level: int = 3,
+    max_members_per_level: int = 7,
+) -> Dict[str, Any]:
+    """初始化一个 TOP agent 的团队（幂等：已存在则更新名称与团队配置）。
+
+    团队配置（max_level / max_members_per_level）在创建 TOP 时设定并持久化，
+    之后不可修改（成员只增不减）。已存在团队时同步更新配置列（兼容旧数据）。
 
     :return: 团队信息字典
     """
     _ensure_db()
     now = int(time.time() * 1000)
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         conn.execute(
             "INSERT INTO teams (top_agent_id, user_id, name, member_count, "
-            "created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?) "
+            "max_level, max_members_per_level, created_at, updated_at) "
+            "VALUES (?, ?, ?, 0, ?, ?, ?, ?) "
             "ON CONFLICT(top_agent_id) DO UPDATE SET "
             "name = excluded.name, user_id = excluded.user_id, "
+            "max_level = excluded.max_level, "
+            "max_members_per_level = excluded.max_members_per_level, "
             "updated_at = excluded.updated_at",
-            (top_agent_id, user_id, name, now, now),
+            (top_agent_id, user_id, name, max_level, max_members_per_level,
+             now, now),
         )
         conn.commit()
     team = get_team(top_agent_id)
@@ -180,8 +220,7 @@ def get_team(top_agent_id: str) -> Optional[Dict[str, Any]]:
 def delete_team(top_agent_id: str) -> bool:
     """删除团队及全部成员（TOP agent 被删除时调用）。"""
     _ensure_db()
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         conn.execute("DELETE FROM team_members WHERE top_agent_id = ?", (top_agent_id,))
         cursor = conn.execute(
             "DELETE FROM teams WHERE top_agent_id = ?", (top_agent_id,)
@@ -203,20 +242,27 @@ def add_member(
     model_id: str = "",
     level: int = 1,
     system_prompt: str = "",
+    parent_agent_id: str = "",
 ) -> Dict[str, Any]:
-    """新增一名团队成员并更新团队 member_count。"""
+    """新增一名团队成员并更新团队 member_count。
+
+    :param parent_agent_id: 直属 leader（创建者的 agent_id）；P4 全量建队时
+                            为 top_agent_id，leader 经 create_member 创建时为
+                            创建者的 agent_id（用于「每层成员上限」与
+                            teammates/team_member 分组）。
+    """
     _ensure_db()
     now = int(time.time() * 1000)
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO team_members "
             "(id, top_agent_id, user_id, name, role, duty, model_id, level, "
-            "work_status, comment, scores_json, system_prompt, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'idle', '', '{}', ?, ?, ?)",
+            "work_status, comment, scores_json, system_prompt, parent_agent_id, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'idle', '', '{}', ?, ?, ?, ?)",
             (
                 member_id, top_agent_id, user_id, name, role, duty,
-                model_id, level, system_prompt, now, now,
+                model_id, level, system_prompt, parent_agent_id, now, now,
             ),
         )
         conn.execute(
@@ -304,8 +350,7 @@ def update_member(
     set_clause = ", ".join(f"{k} = ?" for k in updates)
     values = list(updates.values()) + [now, top_agent_id, member_id]
     _ensure_db()
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         cursor = conn.execute(
             f"UPDATE team_members SET {set_clause}, updated_at = ? "
             "WHERE top_agent_id = ? AND id = ?",

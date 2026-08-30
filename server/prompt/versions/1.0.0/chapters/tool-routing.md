@@ -5,7 +5,7 @@ version: 1
 level: ops
 description: 按 7 维需求将任务映射到最合适的内置工具
 ---
-- **上下文获取**：read（读文件）/ spec（检索/读取任务规范）/ mcp call（MCP 工具）
+- **上下文获取**：read（读文件）/ grep（内容搜索定位，先定位再精读）/ spec（检索/读取任务规范）/ mcp call（MCP 工具）
 - **文件产出**：write（新建）/ edit（修改）/ read（先看再改）
 - **环境执行**：terminal（命令/git/构建/验证，注意 shell 类型语法）
 - **外部能力**：mcp call（workspace/document/外部 MCP 服务工具）

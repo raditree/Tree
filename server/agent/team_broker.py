@@ -95,6 +95,27 @@ class TeamMessageBroker:
             worker.cancel()
         return cleared
 
+    def remove_agent(self, user_id: str, agent_id: str) -> int:
+        """彻底移除 agent 的队列与 worker 注册（agent 删除时调用）。
+
+        与 ``cancel_agent``（停止但保留注册，可继续接收消息）不同：
+        ``remove_agent`` 在取消在途 worker 后删除 ``_queues`` / ``_workers``
+        条目，避免 300+ agent 7×24 长跑下注册表无限增长（内存泄漏）。
+
+        :return: 被清空的排队消息数
+        """
+        key = (user_id, agent_id)
+        cleared = 0
+        queue = self._queues.pop(key, None)
+        if queue is not None:
+            with queue.mutex:
+                cleared = len(queue.queue)
+                queue.queue.clear()
+        worker = self._workers.pop(key, None)
+        if worker is not None and not worker.done():
+            worker.cancel()
+        return cleared
+
     def _on_worker_done(self, future: Any) -> None:
         """worker 结束回调：记录未捕获的异常（不抛出到调度线程）。"""
         try:

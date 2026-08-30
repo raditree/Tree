@@ -652,17 +652,21 @@ class _MessageBubbleState extends State<_MessageBubble> {
     );
   }
 
-  /// 构建时间戳（小号灰色文字）
+  /// 构建时间戳（小号灰色文字，含日期：MM-dd HH:mm，跨年补年份）
   Widget _buildTime(ChatMessage message, bool isUser) {
-    final String hour =
-        message.timestamp.hour.toString().padLeft(2, '0');
-    final String minute =
-        message.timestamp.minute.toString().padLeft(2, '0');
+    final DateTime t = message.timestamp;
+    final String mm = t.month.toString().padLeft(2, '0');
+    final String dd = t.day.toString().padLeft(2, '0');
+    final String hour = t.hour.toString().padLeft(2, '0');
+    final String minute = t.minute.toString().padLeft(2, '0');
+    final String date = t.year == DateTime.now().year
+        ? '$mm-$dd'
+        : '${t.year}-$mm-$dd';
     final Color color = isUser
         ? Theme.of(context).colorScheme.onPrimary.withOpacity(0.7)
         : Theme.of(context).colorScheme.outline;
     return Text(
-      '$hour:$minute',
+      '$date $hour:$minute',
       style: TextStyle(fontSize: 11, color: color),
     );
   }

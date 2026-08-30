@@ -208,15 +208,18 @@ def _write_roster_view(
 def init_team_for_top(
     user_id: str, top_agent: Dict[str, Any], docker_manager: Any,
     member_count: Optional[int] = None,
+    max_level: Optional[int] = None,
+    max_members_per_level: Optional[int] = None,
 ) -> Dict[str, Any]:
     """TOP agent 创建时全量建队（幂等：已有团队则直接返回现状）。
 
     :param user_id: 用户标识
     :param top_agent: 刚创建的 TOP agent 记录（需含 id/name/workspace_id）
     :param docker_manager: DockerManager 或 None
-    :param member_count: 要创建的成员数，缺省按用户等级解析
-        ``registration.levels.<level>.max_members_per_level``（未配置 / 等级缺失时
-        回退 ``docker_manager.max_members_per_level``）
+    :param member_count: 要创建的成员数，缺省按 ``max_members_per_level``
+    :param max_level: 团队最大层级深度（创建 TOP 时设定，缺省用代码默认值）
+    :param max_members_per_level: 每层成员上限（创建 TOP 时设定，缺省用代码
+        默认值；成员数 = clamp(member_count or 上限, 1, 上限)，只增不减）
     :return: ``{"team":..., "members": [...], "created_count": n}``；
              名字池不足抛 ValueError
     """
@@ -231,6 +234,13 @@ def init_team_for_top(
     if not top_agent_id:
         return {"error": "缺少 top_agent_id"}
 
+    # 团队配置在创建 TOP 时设定：归一化后持久化到 teams 表（此后不可修改）
+    from config.team import resolve_team_config
+
+    cfg = resolve_team_config(max_level, max_members_per_level)
+    team_max_level = cfg["max_level"]
+    team_max_members = cfg["max_members_per_level"]
+
     # 幂等：已建团队直接返回现状（重复 TOP 记录/重试）
     existing = get_team(top_agent_id)
     if existing is not None:
@@ -240,20 +250,14 @@ def init_team_for_top(
             "created_count": 0,
         }
 
-    # 确定成员数量：按用户等级解析 max_members_per_level（优先）；
-    # 未配置 registration / 等级缺失时回退 docker_manager.max_members_per_level
-    from tool.team_tool import _resolve_team_limits
+    # 初始成员数：显式 member_count 缺省按每层成员上限，钳制在 1..上限
+    count = int(member_count or team_max_members)
+    count = max(1, min(count, team_max_members))
 
-    _, cfg_max = _resolve_team_limits(
-        user_id,
-        fallback_members=getattr(docker_manager, "max_members_per_level", None)
-        if docker_manager is not None else None,
+    team = init_team(
+        user_id, top_agent_id, top_agent.get("name", ""),
+        max_level=team_max_level, max_members_per_level=team_max_members,
     )
-    count = int(member_count or cfg_max)
-    if count < 1:
-        count = 1
-
-    team = init_team(user_id, top_agent_id, top_agent.get("name", ""))
     top_ws = top_agent.get("workspace_id") or top_agent_id
 
     # 取名字（同名用户全局唯一）与生成成员 ID
@@ -278,6 +282,8 @@ def init_team_for_top(
             model_id=top_agent.get("model_id", ""),
             level=1,
             system_prompt="",
+            # P4 全量建队：直属 leader 即 TOP 自身
+            parent_agent_id=top_agent_id,
         )
         member["workspace_id"] = member["id"]
         member["top_workspace_id"] = top_ws

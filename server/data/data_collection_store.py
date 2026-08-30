@@ -4,6 +4,12 @@
 后台才允许收集该用户后续产生的对话数据；关闭开关即停止写入（**仅在开启
 数据收集期间收集对话数据**）。
 
+收集范围：顶部 agent（TOP）与团队成员（``_process_member_message``）的
+每一轮 LLM 对话都收集，按 ``(user_id, agent_id, session_id)`` 分键——
+成员使用自己的 agent_id 与 TOP 会话同 id 的 session_id，与 TOP 数据互不
+覆盖。``agent_type`` 标注样本来源（``"top"`` / ``"member"``），导出时随
+样本写出，供训练管线区分/过滤。
+
 收集粒度：按 `(user_id, agent_id, session_id)` 存一个会话行，记录
 **含 CoT（thinking）的完整 OpenAI messages 上下文**：
 - ``base_messages``：会话首次进入收集时（用户开启开关后的第一次对话）的完整
@@ -66,6 +72,7 @@ def _ensure_db() -> None:
                 base_messages TEXT NOT NULL,
                 diffs TEXT NOT NULL DEFAULT '[]',
                 sealed TEXT NOT NULL DEFAULT '[]',
+                agent_type TEXT NOT NULL DEFAULT 'top',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 UNIQUE (user_id, agent_id, session_id)
@@ -90,6 +97,16 @@ def _ensure_db() -> None:
             )
         except sqlite3.OperationalError:
             # 列已存在（表已含 sealed）
+            pass
+        # 兼容旧库：早期表无 agent_type 列（成员 SFT 收集上线前），补充迁移。
+        # 历史行（全部为 TOP 数据）置默认 'top'，语义正确。
+        try:
+            conn.execute(
+                "ALTER TABLE sft_sessions "
+                "ADD COLUMN agent_type TEXT NOT NULL DEFAULT 'top'"
+            )
+        except sqlite3.OperationalError:
+            # 列已存在（表已含 agent_type）
             pass
         conn.commit()
     _initialized = True
@@ -186,10 +203,15 @@ def collect_sft_turn(
     session_id: str,
     context_before: List[Dict[str, Any]],
     context_after: List[Dict[str, Any]],
+    agent_type: str = "top",
 ) -> None:
     """收集一个用户轮次新增的对话消息 diff。
 
     若开关未开启则静默忽略（不收集）。
+
+    :param agent_type: 样本来源标注，``"top"``（顶部 agent，默认）或
+        ``"member"``（团队成员，由 ``_process_member_message`` 传入）。
+        随行持久化并在导出时随样本写出，供训练管线区分/过滤。
 
     数据组织为「已封存段 + 活动段」：
     - 活动段由 ``base_messages`` + ``diffs`` 构成，随每个轮次追加 diff。
@@ -219,11 +241,13 @@ def collect_sft_turn(
                 conn.execute(
                     "INSERT INTO sft_sessions "
                     "(user_id, agent_id, session_id, base_messages, diffs, "
-                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "agent_type, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         user_id, agent_id, session_id,
                         json.dumps(context_before, ensure_ascii=False),
                         json.dumps([diff], ensure_ascii=False),
+                        agent_type,
                         now, now,
                     ),
                 )
@@ -316,7 +340,8 @@ def export_daily_sft() -> Path:
     """把所有已收集会话还原为完整消息，写 SFT jsonl 文件并返回路径。
 
     文件名 ``sft_YYYYMMDD.jsonl``，每行一条完整对话样本：
-    ``{"messages": [...完整含CoT的OpenAI消息...]}``，附带会话元数据。
+    ``{"messages": [...完整含CoT的OpenAI消息...]}``，附带会话元数据
+    （``agent_id`` / ``session_id`` / ``agent_type``，后者区分 TOP 与成员）。
 
     一个会话若经历 compact，其旧历史被封存为 sealed 段，仍会被完整导出；
     该会话输出多行（每 sealed 段一行 + 活动段一行），不丢任何历史。
@@ -331,7 +356,7 @@ def export_daily_sft() -> Path:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT agent_id, session_id, base_messages, diffs, sealed, "
-            "updated_at FROM sft_sessions ORDER BY updated_at ASC"
+            "agent_type, updated_at FROM sft_sessions ORDER BY updated_at ASC"
         ).fetchall()
     finally:
         conn.close()
@@ -344,6 +369,7 @@ def export_daily_sft() -> Path:
                     "messages": messages,
                     "agent_id": row["agent_id"],
                     "session_id": row["session_id"],
+                    "agent_type": row["agent_type"],
                     "collected_until": row["updated_at"],
                 }
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")

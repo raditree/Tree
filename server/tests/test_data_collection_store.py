@@ -108,6 +108,62 @@ class TestCollectSftTurn(SftStoreBase):
         self.assertEqual(len(lines), 2)
 
 
+class TestMemberCollection(SftStoreBase):
+    """团队成员轮次同样收集（agent_type 标注，按成员 agent_id 分键）。"""
+
+    def _base_ctx(self):
+        return [{"role": "system", "content": "member sys"}]
+
+    def test_member_turn_collected_with_member_type(self):
+        dcs.set_collection_enabled("u1", True)
+        ctx0 = self._base_ctx()
+        ctx1 = ctx0 + [{"role": "user", "content": "任务"},
+                       {"role": "assistant", "content": "成员回复"}]
+        dcs.collect_sft_turn("u1", "member_1", "sess1", ctx0, ctx1,
+                             agent_type="member")
+
+        out = dcs.export_daily_sft()
+        rec = json.loads(
+            out.read_text(encoding="utf-8").strip().splitlines()[0]
+        )
+        self.assertEqual(rec["agent_id"], "member_1")
+        self.assertEqual(rec["agent_type"], "member")
+        self.assertEqual(rec["session_id"], "sess1")
+        self.assertEqual(len(rec["messages"]), 3)
+
+    def test_top_defaults_to_top_type(self):
+        """不带 agent_type 的历史/TOP 路径默认 'top'。"""
+        dcs.set_collection_enabled("u1", True)
+        ctx0 = self._base_ctx()
+        ctx1 = ctx0 + [{"role": "user", "content": "q"},
+                       {"role": "assistant", "content": "a"}]
+        dcs.collect_sft_turn("u1", "a1", "s", ctx0, ctx1)
+
+        out = dcs.export_daily_sft()
+        rec = json.loads(
+            out.read_text(encoding="utf-8").strip().splitlines()[0]
+        )
+        self.assertEqual(rec["agent_id"], "a1")
+        self.assertEqual(rec["agent_type"], "top")
+
+    def test_top_and_member_same_session_separate_rows(self):
+        """TOP 与成员在同一 session_id 下互不覆盖，导出两行各带类型。"""
+        dcs.set_collection_enabled("u1", True)
+        ctx0 = self._base_ctx()
+        ctx1 = ctx0 + [{"role": "user", "content": "x"},
+                       {"role": "assistant", "content": "y"}]
+        # 同一会话：TOP 收集 + 成员收集（成员用自己 agent_id）
+        dcs.collect_sft_turn("u1", "top-1", "sess-x", ctx0, ctx1)
+        dcs.collect_sft_turn("u1", "member_1", "sess-x", ctx0, ctx1,
+                             agent_type="member")
+
+        out = dcs.export_daily_sft()
+        lines = out.read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(lines), 2)
+        types = sorted(json.loads(l)["agent_type"] for l in lines)
+        self.assertEqual(types, ["member", "top"])
+
+
 class TestCompactHandling(SftStoreBase):
     """compact（上下文压缩）下 diff 需做"减法"：前缀被替换/缩短时重置 base。"""
 

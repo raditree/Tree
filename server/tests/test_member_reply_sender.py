@@ -68,6 +68,7 @@ def _make_context(dispatched, fake_stream, q=None):
         patch.object(chat_mod, "_clear_active_task", return_value=None),
         patch.object(chat_mod, "_send_status_idle", new=AsyncMock()),
         patch.object(chat_mod, "save_context", return_value=None),
+        patch.object(chat_mod, "collect_sft_turn", return_value=None),
         patch.object(chat_mod, "_append_activity_log", return_value=None),
         patch.object(chat_mod, "_register_tools", new=AsyncMock()),
         patch.object(chat_mod, "get_session", return_value=MagicMock()),

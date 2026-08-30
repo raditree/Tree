@@ -12,9 +12,13 @@ from pydantic import BaseModel
 import state
 from agent.chat import (
     _active_tasks,
+    _clear_compacting_task,
     _dispatch_agent_message,
     _get_workspace_io,
+    _is_agent_compacting,
+    _is_agent_working,
     _parse_roster_table,
+    _register_compacting_task,
     resume_after_answer,
 )
 from config.config import get_config
@@ -137,6 +141,12 @@ async def compact_agent_context(
     缓存未命中（如后端重启后内存会话已清空）时，尝试从数据库
     ``agent_context`` 表恢复持久化上下文再压缩，避免误报
     "该 agent 当前没有活跃的会话上下文"。
+
+    状态行为：压缩期间登记 ``_compacting_tasks`` 并向 WS 推送
+    ``agent_status=compacting``（前端显示「压缩中」），结束（含异常）后按
+    实际工作状态推送 working/idle。互斥按同会话粒度：该会话正在 chat 或
+    正在压缩时拒绝（reason=agent_working / already_compacting），
+    其他会话的 working/compacting 不拦截（各自独立 AgentLLMSession）。
     """
     user_id = current_user.get("openid", "")
     session_id = (body or {}).get("session_id") or DEFAULT_SESSION
@@ -168,26 +178,90 @@ async def compact_agent_context(
         )
         session.context = restored
         restored_from_db = True
-    # compress 内会在重构 context 后重建 system prompt（读 .self 文件）；
-    # 本地模式反向 WS 阻塞读，须放入线程池避免死锁事件循环
-    compressed = await asyncio.to_thread(session.compress, force=True)
-    if restored_from_db:
-        # 压缩结果写回 DB，保证重启后上下文仍是压缩后的最新状态
-        save_context(user_id, agent_id, session.context, session_id)
-    result: Dict[str, Any] = {
-        "success": True,
-        "compressed": compressed,
-        "context_size": len(session.context),
-        "session_id": session_id,
-    }
-    # 有活跃会话但未实际压缩时，区分原因（对话消息太少 / 最近对话均在保留窗口内），
-    # 避免前端误报"无需压缩或该 agent 不支持"
-    if not compressed:
-        non_system = [m for m in session.context if m.get("role") != "system"]
-        result["reason"] = (
-            "too_few_messages" if len(non_system) <= 1 else "nothing_to_summarize"
+
+    # 压缩互斥（同会话粒度）：
+    # - 该会话正在 chat（_active_tasks 已登记）→ 拒绝压缩：compress 会改写
+    #   session.context，与 chat 线程并发读写上下文存在数据竞争；
+    # - 该会话正在压缩（_compacting_tasks 已登记，如双击）→ 拒绝重复压缩。
+    # 其他会话的 working/compacting 不拦截（各自独立 AgentLLMSession）。
+    if (user_id, agent_id, session_id) in _active_tasks:
+        return {
+            "success": True,
+            "compressed": False,
+            "reason": "agent_working",
+            "message": "该会话正在处理消息，请稍后再压缩",
+        }
+    if _is_agent_compacting(user_id, agent_id, session_id):
+        return {
+            "success": True,
+            "compressed": False,
+            "reason": "already_compacting",
+            "message": "该会话正在压缩中",
+        }
+
+    # 进入 compacting 状态：登记 + 推送 WS 事件（前端据此显示「压缩中」）。
+    # compress 是长时间操作（LLM 总结，本地模型可能数分钟），期间 UI 不能静默。
+    _register_compacting_task(user_id, agent_id, session_id)
+    await _send_agent_status(
+        user_id, agent_id, session_id, "compacting"
+    )
+    try:
+        # compress 内会在重构 context 后重建 system prompt（读 .self 文件）；
+        # 本地模式反向 WS 阻塞读，须放入线程池避免死锁事件循环
+        compressed = await asyncio.to_thread(session.compress, force=True)
+        if restored_from_db:
+            # 压缩结果写回 DB，保证重启后上下文仍是压缩后的最新状态
+            save_context(user_id, agent_id, session.context, session_id)
+        result: Dict[str, Any] = {
+            "success": True,
+            "compressed": compressed,
+            "context_size": len(session.context),
+            "session_id": session_id,
+        }
+        # 有活跃会话但未实际压缩时，区分原因（对话消息太少 / 最近对话均在保留窗口内），
+        # 避免前端误报"无需压缩或该 agent 不支持"
+        if not compressed:
+            non_system = [m for m in session.context if m.get("role") != "system"]
+            result["reason"] = (
+                "too_few_messages"
+                if len(non_system) <= 1
+                else "nothing_to_summarize"
+            )
+        return result
+    finally:
+        # 复位状态：注销登记 + 推送结束状态。若该 agent 其他会话仍在工作
+        # （或压缩期间新消息被受理），按实际状态推送 working，避免误清。
+        _clear_compacting_task(user_id, agent_id, session_id)
+        end_status = (
+            "working" if _is_agent_working(user_id, agent_id) else "idle"
         )
-    return result
+        await _send_agent_status(user_id, agent_id, session_id, end_status)
+
+
+async def _send_agent_status(
+    user_id: str, agent_id: str, session_id: str, status: str
+) -> None:
+    """推送 agent_status WS 事件（ws_manager 缺失/未连接时静默跳过）。
+
+    compact 端点内使用：状态推送失败不应导致压缩请求失败，故全部吞掉。
+    """
+    try:
+        wsm = getattr(state, "ws_manager", None)
+        if wsm is None:
+            return
+        await wsm.send_message(
+            user_id,
+            {
+                "type": "agent_status",
+                "data": {
+                    "agent_id": agent_id,
+                    "status": status,
+                    "session_id": session_id,
+                },
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ===== 多会话管理（P2 多会话并行） =====
@@ -544,12 +618,18 @@ async def list_agents(current_user: dict = Depends(get_current_user)) -> Dict[st
 
 
 class CreateAgentRequest(BaseModel):
-    """创建 agent 请求体。"""
+    """创建 agent 请求体。
+
+    团队配置（max_level / max_members_per_level）在创建 TOP 时设定并持久化
+    到 teams 表，创建后不可修改（成员只增不减）。
+    """
 
     name: str
     model_id: str
     system_prompt: str = ""
     team_member_count: Optional[int] = None
+    max_level: Optional[int] = None
+    max_members_per_level: Optional[int] = None
 
 
 class UpdateAgentRequest(BaseModel):
@@ -586,6 +666,22 @@ async def create_agent_endpoint(
             status_code=400,
             detail=f"每个用户最多创建 {max_per_user} 个 Agent，已达上限",
         )
+    # 团队配置硬上限校验（防超量建队）：层级 / 每层成员上限超出硬上限直接拒绝
+    # （在 create_agent 落库之前校验，避免留下孤儿 agent 记录）
+    from config.team import HARD_MAX_LEVEL, HARD_MAX_MEMBERS, clamp_level, clamp_members
+
+    max_level = clamp_level(req.max_level)
+    max_members = clamp_members(req.max_members_per_level)
+    if req.max_level is not None and max_level > HARD_MAX_LEVEL:
+        raise HTTPException(
+            status_code=400,
+            detail=f"团队最大层级超出硬上限（{HARD_MAX_LEVEL}）",
+        )
+    if req.max_members_per_level is not None and max_members > HARD_MAX_MEMBERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"每层成员上限超出硬上限（{HARD_MAX_MEMBERS}）",
+        )
     record = create_agent(user_id, name, req.model_id, req.system_prompt.strip())
     # 为该 agent 创建独立工作空间（Docker 不可用时不阻塞创建，仅记录降级）
     docker_manager = state.docker_manager
@@ -597,12 +693,16 @@ async def create_agent_endpoint(
         if ws_error:
             logger.warning("创建 agent 工作空间失败: %s (%s)", workspace_id, ws_error)
     # P4：TOP 创建即全量建队（名字池 + 标准角色模板 + teams/team_members 登记 + roster 视图）。
+    # 团队配置（max_level / max_members_per_level）在此一次性设定，此后不可修改。
     # 名字池耗尽属异常（同用户内全局唯一冲突/名字不足），返回明确错误提示扩充名字池。
     team_error = None
+    team_result = None
     try:
         team_result = init_team_for_top(
             user_id, record, docker_manager,
             member_count=req.team_member_count,
+            max_level=max_level,
+            max_members_per_level=max_members,
         )
         if team_result.get("error"):
             team_error = team_result["error"]
@@ -613,6 +713,15 @@ async def create_agent_endpoint(
         "agent": _agent_to_response(record),
         "workspace_error": ws_error,
         "team_error": team_error,
+        "team": {
+            "max_level": max_level,
+            "max_members_per_level": max_members,
+            "member_count": int((team_result or {}).get("created_count") or 0),
+        } if team_result and not team_result.get("error") else {
+            "max_level": max_level,
+            "max_members_per_level": max_members,
+            "member_count": 0,
+        },
     }
 
 
@@ -718,6 +827,27 @@ async def delete_agent_endpoint(
     clear_user_agent(user_id, agent_id)
     # 清理该 agent 持久化的会话上下文（数据库）
     clear_context(user_id, agent_id)
+    # 清理 broker 队列/worker 与限流器注册（TOP 自身 + 其下全部成员），
+    # 防止 300+ agent 长跑下 _queues/_workers/_limiters 无限增长
+    try:
+        from data.team_store import get_members
+        from agent.team_broker import TeamMessageBroker
+        from llm.rate_limit import remove_agent
+
+        broker: TeamMessageBroker = state.team_broker
+        for m in (get_members(agent_id) or []):
+            mid = m.get("id", "")
+            if not mid:
+                continue
+            if broker is not None:
+                broker.remove_agent(user_id, mid)
+            remove_agent(user_id, mid)
+        if broker is not None:
+            broker.remove_agent(user_id, agent_id)
+        remove_agent(user_id, agent_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("清理删除 agent 的 broker/限流注册失败(已忽略): %s (%s)",
+                       agent_id, exc)
     # P4：同步清理该 TOP 的团队（teams/team_members 表），避免孤儿成员
     try:
         delete_team(agent_id)

@@ -20,6 +20,7 @@ import state
 from agent.chat import (
     _active_tasks,
     _cancel_active_task,
+    _compacting_tasks,
     _dispatch_user_message,
     _stop_agent_tree,
     resume_after_answer,
@@ -96,6 +97,23 @@ def register_ws(app: FastAPI) -> None:
                             "agent_id": active_agent_id,
                             "status": "working",
                             "session_id": active_session_id,
+                        },
+                    },
+                )
+        # 2.2 补推进行中的上下文压缩状态（compacting）：compress 是长时间
+        #     操作（LLM 总结），重连后前端据此恢复「压缩中」标识。
+        for (compact_uid, compact_agent_id, compact_session_id) in list(
+            _compacting_tasks
+        ):
+            if compact_uid == user_id:
+                await state.ws_manager.send_message(
+                    user_id,
+                    {
+                        "type": "agent_status",
+                        "data": {
+                            "agent_id": compact_agent_id,
+                            "status": "compacting",
+                            "session_id": compact_session_id,
                         },
                     },
                 )

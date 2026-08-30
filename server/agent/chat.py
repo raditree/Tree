@@ -16,7 +16,7 @@ import queue
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from openai import RateLimitError
 
@@ -32,7 +32,7 @@ from data.conversation_store import (
     store_message,
 )
 from data.data_collection_store import collect_sft_turn
-from data.session_cache import get_session, set_session
+from data.session_cache import get_session, pop_session, set_session
 from data.session_store import (
     DEFAULT_SESSION,
     create_session,
@@ -72,13 +72,19 @@ async def _register_tools(
     session: AgentLLMSession, agent_id: str, user_id: str = "",
     leader_id: str = "", top_agent_id: str = "", member_system_prompt: str = "",
     session_id: str = DEFAULT_SESSION, is_member: bool = False,
+    member_system_prompt_provider: Optional[Callable[[], str]] = None,
 ) -> None:
     """给会话注册内置工具（team / mcp / spec 等）。
 
     封装对 register_builtin_tools 的调用，避免重复展开 mcp_config 取值逻辑。
     同时把消息投递器与用户标识传给 team 工具，用于异步触发成员处理。
     并给会话挂上 compact 时的 system prompt 重建回调（spec「注入时机」：
-    重构 context 时重建 system prompt，注入最新 Spec 索引/已选 Spec/memory/成员拓扑）。
+    重构 context 时重建 system prompt，注入最新 Spec 索引/已选 Spec/memory/
+    成员拓扑/MCP 工具清单）。
+
+    :param member_system_prompt_provider: 可选，重建/刷新时现读成员
+        system_prompt（经 team_store；update_member 修改后无需清会话，
+        下次 compact 即生效）。缺省回退 ``member_system_prompt``。
     """
     mcp_config = get_config().get("mcp")
     # 合并 DB 持久化的外部 MCP 服务（REST /api/mcp/services 注册），
@@ -94,6 +100,13 @@ async def _register_tools(
     except Exception as exc:  # noqa: BLE001
         logger.warning("加载 DB 外部 MCP 服务失败(忽略): %s", exc)
     workspace_id = getattr(session, "workspace_id", "") or ""
+
+    # MCP 章节正文提供者：从会话级 mcp_manager 现算（不启动 stdio 子进程）。
+    # 注意：register_builtin_tools 在本函数末尾才挂载 session.mcp_manager，
+    # 此闭包是惰性的（compact 重建时才读取），顺序无碍。
+    def _mcp_text_provider() -> str:
+        return _build_mcp_tools_text(getattr(session, "mcp_manager", None))
+
     session.system_prompt_rebuilder = _make_system_prompt_rebuilder(
         workspace_id,
         member_system_prompt=member_system_prompt,
@@ -101,15 +114,25 @@ async def _register_tools(
         agent_id=agent_id,
         top_agent_id=top_agent_id,
         session_id=session_id,
+        member_system_prompt_provider=member_system_prompt_provider,
+        mcp_text_provider=_mcp_text_provider,
     )
 
     # workspace_extra_info 刷新回调：每次 compact 刷新时现读现算
-    # （identity/memory.md 均为最新），避免会话构造时的一次性
-    # 快照长期过期（memory.md 每次记忆维护都会更新）。
+    # （identity/memory.md 均为最新；成员 system_prompt 经 provider 现读，
+    # 避免会话构造时的一次性快照长期过期——memory.md 每次记忆维护都会更新）。
     def _extra_info_refresher() -> dict:
+        member_prompt = member_system_prompt
+        if member_system_prompt_provider is not None:
+            try:
+                member_prompt = (
+                    member_system_prompt_provider() or member_system_prompt
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("刷新成员 system_prompt 失败(回退捕获值): %s", exc)
         return _build_workspace_extra_info(
             workspace_id,
-            member_system_prompt=member_system_prompt,
+            member_system_prompt=member_prompt,
             user_id=user_id,
             agent_id=top_agent_id or agent_id,
             local_executor=state.local_executor,
@@ -181,29 +204,53 @@ def _make_system_prompt_rebuilder(
     agent_id: str = "",
     top_agent_id: str = "",
     session_id: str = "",
+    member_system_prompt_provider: Optional[Callable[[], str]] = None,
+    mcp_text_provider: Optional[Callable[[], str]] = None,
 ) -> Any:
     """构造 compact（重构 context）时重建 system prompt 的同步回调。
 
     现读现算：.self 文档（identity/memory）、Spec 索引、已选 Spec 全文、
     成员拓扑均为最新。回调在后台线程（自动压缩）或 to_thread（手动 compact）
     中执行，其中读取 .self 经反向 WS（阻塞）不会卡死事件循环。
+
+    :param member_system_prompt_provider: 可选，重建时现读成员 system_prompt
+        （经 team_store，update_member 修改后无需清会话即可在下次 compact 生效）；
+        缺省回退 ``member_system_prompt``（会话创建时捕获值）
+    :param mcp_text_provider: 可选，重建时现算 MCP 工具清单章节正文
+        （经 ``session.mcp_manager``，不启动 stdio 子进程）
     """
+    def _resolve_member_prompt() -> str:
+        if member_system_prompt_provider is not None:
+            try:
+                return member_system_prompt_provider() or member_system_prompt
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("现读成员 system_prompt 失败(回退捕获值): %s", exc)
+        return member_system_prompt
+
     def _rebuild() -> str:
+        member_prompt = _resolve_member_prompt()
         extra_info = _build_workspace_extra_info(
             workspace_id,
-            member_system_prompt=member_system_prompt,
+            member_system_prompt=member_prompt,
             user_id=user_id,
             agent_id=top_agent_id or agent_id,
             local_executor=state.local_executor,
         )
+        mcp_text = ""
+        if mcp_text_provider is not None:
+            try:
+                mcp_text = mcp_text_provider() or ""
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("现算 MCP 工具清单失败(跳过章节): %s", exc)
         return _build_agent_system_prompt(
             workspace_id,
-            member_system_prompt=member_system_prompt,
+            member_system_prompt=member_prompt,
             user_id=user_id,
             agent_id=agent_id,
             top_agent_id=top_agent_id,
             session_id=session_id,
             extra_info=extra_info,
+            mcp_tools_text=mcp_text,
         )
     return _rebuild
 
@@ -386,6 +433,56 @@ def _get_workspace_size(workspace_id: str) -> int:
 _SPEC_INDEX_LIMIT = 12
 
 
+def _build_mcp_tools_text(mcp_manager: Any) -> str:
+    """生成「⑩b MCP 工具与外部服务」章节文本（不启动 stdio 子进程）。
+
+    进程内服务（本地/SSH 模式的 workspace/document，handler + tool_defs）
+    直接列工具名；stdio 外部服务只列服务名与工具数，完整列表由模型按需
+    ``mcp help`` 查询——prompt 构建/重建发生在会话创建与 compact 时机，
+    逐服务拉起子进程在 300+ agent 规模下不可接受。
+
+    :param mcp_manager: 会话级 MCPManager（``session.mcp_manager``）
+    :return: 章节正文；无可用服务/异常时返回空串（调用方跳过章节）
+    """
+    try:
+        if mcp_manager is None:
+            return ""
+        services = mcp_manager.list_services()
+        if not services:
+            return ""
+        lines: List[str] = []
+        for name in services:
+            service = getattr(mcp_manager, "services", {}).get(name) or {}
+            in_process = service.get("handler") is not None
+            if in_process:
+                tools = service.get("tool_defs", []) or []
+                names: List[str] = []
+                for t in tools:
+                    fn = t.get("function", t) or t
+                    if fn.get("name"):
+                        names.append(str(fn["name"]))
+                if names:
+                    lines.append(f"- 服务 `{name}`（进程内）: {', '.join(names)}")
+                else:
+                    lines.append(f"- 服务 `{name}`（进程内）")
+            else:
+                tool_count = len(service.get("tools", []) or [])
+                hint = f"（{tool_count} 个工具）" if tool_count else ""
+                lines.append(
+                    f"- 服务 `{name}`{hint}：工具列表用 `mcp` 工具的 help 动作查看"
+                )
+        if not lines:
+            return ""
+        return (
+            "可用 MCP 服务与工具：\n" + "\n".join(lines) + "\n"
+            "（调用方式：mcp 工具 call，action=call，tool_name 为上述工具名；"
+            "stdio 服务的完整工具清单可用 action=help 查询）"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("构建 MCP 工具清单章节失败(跳过): %s", exc)
+        return ""
+
+
 def _build_agent_system_prompt(
     workspace_id: str,
     member_system_prompt: str = "",
@@ -394,14 +491,15 @@ def _build_agent_system_prompt(
     top_agent_id: str = "",
     session_id: str = "",
     extra_info: Optional[Dict[str, Any]] = None,
+    mcp_tools_text: str = "",
 ) -> str:
     """构建 agent 系统提示词：13 章节全量注入（spec「system prompt 内容」）。
 
     章节数据来自集中式版本化数据目录（``prompt/versions/<激活版本>/``，经
     ``prompt.versions`` 解析）：静态章节（角色权威/任务范式/安全护栏/工具路由/
     Spec 维护/todo 纪律/[Warning] 负责）随激活版本切换；动态章节（身份/memory/Spec
-    索引/已选 Spec/执行模式/成员拓扑）由本函数按会话现算注入。提示词顶部带审计头
-    （版本+章节清单）。
+    索引/已选 Spec/执行模式/成员拓扑/MCP 工具清单）由本函数按会话现算注入。
+    提示词顶部带审计头（版本+章节清单）。
 
     ① 身份与角色（.self/identity.md，默认顶层 Agent 说明；成员含 leader 设定）
     ② 角色权威与行为准则（core，注册表）
@@ -414,6 +512,7 @@ def _build_agent_system_prompt(
     ⑨ 工作空间与执行模式（三模式 + shell 类型 + 存储软上限告警）
     ⑩ 成员拓扑与寻址规则（TOP + 全体成员；top 内按 name 寻址、跨 Top 顶层寻址、
        回复路径）
+    ⑩b MCP 工具与外部服务（已注册服务/进程内工具名；stdio 服务提示 mcp help）
     ⑪ Spec 维护指引（何时应 search/select/create spec，注册表）
     ⑫ 任务进度管理纪律（todo 须增量更新，注册表）
     ⑬ 工具反馈 [Warning] 负责规则（[Warning] 必须严格关注并回应，注册表）
@@ -426,6 +525,8 @@ def _build_agent_system_prompt(
     :param session_id: 当前会话 ID（读取已选 Spec）
     :param extra_info: ``_build_workspace_extra_info`` 的输出（identity/memory/
                        exec_mode/storage_warning 等现算信息）
+    :param mcp_tools_text: ``_build_mcp_tools_text`` 的输出（MCP 章节正文；
+                           空串时不注入该章节）
     :return: 13 章节系统提示词
     """
     extra_info = extra_info or {}
@@ -483,6 +584,11 @@ def _build_agent_system_prompt(
     chapters.append(
         _build_member_topology_text(workspace_id, user_id, mode_key)
     )
+
+    # ⑩b MCP 工具与外部服务（动态，仅当有可用服务时注入；
+    # 文本由调用方经 session.mcp_manager 现算，避免在此启动 stdio 子进程）
+    if mcp_tools_text:
+        chapters.append("## ⑩b MCP 工具与外部服务\n" + mcp_tools_text)
 
     # ⑪-⑬ 静态尾部章节（Spec 维护/todo 纪律/[Warning] 负责）：来自注册表
     for chap in versions.active_system_tail():
@@ -975,6 +1081,43 @@ def _clear_active_task(
 ) -> None:
     """任务结束时清除取消事件登记。"""
     _active_tasks.pop((user_id, agent_id, session_id), None)
+
+
+# 进行中的上下文压缩登记表：(user_id, agent_id, session_id)。
+# compact 是长时间操作（LLM 总结，本地模型可能数分钟），期间：
+# - 前端经 WS agent_status=compacting 显示「压缩中」状态；
+# - 同会话禁止并发 compact（防双击）与消息处理（防与 compress 并发改写
+#   session.context）。镜像 _active_tasks 的登记/清理/查询模式。
+_compacting_tasks: "Set[Tuple[str, str, str]]" = set()
+
+
+def _register_compacting_task(
+    user_id: str, agent_id: str, session_id: str = DEFAULT_SESSION
+) -> None:
+    """登记一个进行中的上下文压缩。"""
+    _compacting_tasks.add((user_id, agent_id, session_id))
+
+
+def _clear_compacting_task(
+    user_id: str, agent_id: str, session_id: str = DEFAULT_SESSION
+) -> None:
+    """压缩结束（含失败）时注销登记。"""
+    _compacting_tasks.discard((user_id, agent_id, session_id))
+
+
+def _is_agent_compacting(
+    user_id: str, agent_id: str, session_id: Optional[str] = None
+) -> bool:
+    """该 agent 是否正在压缩上下文。
+
+    :param session_id: 指定会话；None 时检查该 agent 是否有任意会话在压缩
+    """
+    if session_id is not None:
+        return (user_id, agent_id, session_id) in _compacting_tasks
+    return any(
+        uid == user_id and aid == agent_id
+        for (uid, aid, _sid) in _compacting_tasks
+    )
 
 
 def _is_agent_working(user_id: str, agent_id: str) -> bool:
@@ -1586,15 +1729,60 @@ async def _process_member_message(
 
     # 构建成员会话（normal 复用缓存累积上下文）
     # 系统提示词 9 章节全量注入（Spec 索引/已选 Spec/.self 文档/成员拓扑）
+    # + MCP 工具清单章节（⑩b）
     member_system_prompt = payload.get("system_prompt", "")
     session = get_session(user_id, agent_id, session_id)
+
+    def _member_prompt_provider() -> str:
+        """现读成员 system_prompt（经 team_store）。
+
+        update_member 修改提示词后**不清空成员上下文**，本 provider 使成员
+        下次 compact 重建（system_prompt_rebuilder）即用新提示词；读取失败
+        回退本条消息投递时捕获的 member_system_prompt。
+        """
+        try:
+            from data.team_store import get_member
+
+            rec = get_member(top_agent_id or agent_id, agent_id)
+            if rec:
+                return str(rec.get("system_prompt") or "")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("现读成员 system_prompt 失败(回退捕获值): %s", exc)
+        return member_system_prompt
+
     if session is None:
+        # 先建空会话并注册工具（register_builtin_tools 挂载 session.mcp_manager），
+        # 再构建含 MCP 工具清单章节的系统提示词快照
+        session = AgentLLMSession(
+            model_config=model_config,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            agent_id=agent_id,
+        )
+        set_session(user_id, agent_id, session, session_id)
+        try:
+            await _register_tools(
+                session, agent_id, user_id,
+                leader_id=leader_id,
+                top_agent_id=top_agent_id,
+                member_system_prompt=member_system_prompt,
+                session_id=session_id,
+                is_member=True,
+                member_system_prompt_provider=_member_prompt_provider,
+            )
+        except Exception:
+            # 工具注册失败：清掉半成品会话，避免下次消息拿到无工具会话
+            pop_session(user_id, agent_id, session_id)
+            raise
         # 本地模式下读 .self 文件经反向 WS（阻塞），必须放入线程池避免死锁事件循环
         extra_info = await asyncio.to_thread(
             _build_workspace_extra_info,
             workspace_id, member_system_prompt=member_system_prompt,
             user_id=user_id, agent_id=top_agent_id or agent_id,
             local_executor=state.local_executor,
+        )
+        mcp_text = _build_mcp_tools_text(
+            getattr(session, "mcp_manager", None)
         )
         enhanced_prompt = await asyncio.to_thread(
             _build_agent_system_prompt,
@@ -1605,22 +1793,11 @@ async def _process_member_message(
             top_agent_id=top_agent_id,
             session_id=session_id,
             extra_info=extra_info,
+            mcp_tools_text=mcp_text,
         )
-        session = AgentLLMSession(
-            model_config=model_config,
-            workspace_id=workspace_id,
-            system_prompt=enhanced_prompt,
-            user_id=user_id,
-            agent_id=agent_id,
-        )
+        session.system_prompt = enhanced_prompt
+        session.context = [{"role": "system", "content": enhanced_prompt}]
         session.workspace_extra_info = extra_info
-        set_session(user_id, agent_id, session, session_id)
-        await _register_tools(session, agent_id, user_id,
-                              leader_id=leader_id,
-                              top_agent_id=top_agent_id,
-                              member_system_prompt=member_system_prompt,
-                              session_id=session_id,
-                              is_member=True)
         restored = load_context(user_id, agent_id, session_id)
         if restored:
             session.context = restored
@@ -1669,6 +1846,11 @@ async def _process_member_message(
             f"{incoming_content[:120]}",
         )
         return incoming_content
+
+    # SFT 数据收集：记录该轮处理前的上下文基线（与 TOP 路径一致，含 CoT 的
+    # 完整 context 在成员处理结束后与基线求 diff）。收集开关按用户生效，
+    # 成员数据以 (user_id, member_id, session_id) 分键存储，与 TOP 互不覆盖。
+    context_before = list(session.context)
 
     # 登记任务并通知用户该成员进入 working 状态（teammates 窗口可见）
     cancel_event = _register_active_task(user_id, agent_id, session_id)
@@ -1730,6 +1912,17 @@ async def _process_member_message(
         save_context(user_id, agent_id, session.context, session_id=session_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("成员上下文持久化失败: %s", exc)
+    # SFT 数据收集：仅开启期间生效；把本轮新增消息（含 CoT）作为 diff 累加
+    # 到该成员会话快照（agent_type=member 标注样本来源）。带 try 避免收集
+    # 异常影响主流程。
+    try:
+        collect_sft_turn(
+            user_id, agent_id, session_id,
+            context_before, session.context,
+            agent_type="member",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("成员 SFT 收集失败: %s", exc)
 
 
 async def _broker_process_user_message(
@@ -2073,6 +2266,17 @@ async def _handle_user_message(
         await _send_text_as_agent(user_id, agent_id or "unknown", "消息内容或 agent_id 不能为空")
         return
 
+    # 压缩互斥：同会话正在 compact（compress 在后台线程改写 session.context）
+    # 时拒绝受理新消息，避免与 compress 并发读写上下文造成数据竞争；
+    # 其他会话的压缩不受影响（各自独立 AgentLLMSession）。
+    if _is_agent_compacting(user_id, agent_id, session_id):
+        await _send_text_as_agent(
+            user_id, agent_id,
+            "该 agent 正在压缩上下文，请稍候再试",
+            session_id=session_id,
+        )
+        return
+
     # 确保会话元数据存在（多会话并行），更新访问时间并用首条消息生成标题
     create_session(user_id, agent_id, session_id=session_id)
     touch_session(user_id, session_id)
@@ -2140,6 +2344,24 @@ async def _handle_user_message(
         # normal LLM：按 (user_id, agent_id, session_id) 复用会话，使上下文跨消息累积
         session = get_session(user_id, agent_id, session_id)
         if session is None:
+            # 先建空会话并注册工具（register_builtin_tools 挂载 session.mcp_manager），
+            # 再构建含 MCP 工具清单章节的系统提示词快照——MCP 章节正文需经
+            # session.mcp_manager 现算（不启动 stdio 子进程）。
+            session = AgentLLMSession(
+                model_config=model_config,
+                workspace_id=workspace_id,
+                user_id=user_id,
+                agent_id=agent_id,
+            )
+            set_session(user_id, agent_id, session, session_id)
+            try:
+                await _register_tools(session, agent_id, user_id,
+                                      top_agent_id=agent_id,
+                                      session_id=session_id)
+            except Exception:
+                # 工具注册失败：清掉半成品会话，避免下次消息拿到无工具会话
+                pop_session(user_id, agent_id, session_id)
+                raise
             # 本地模式下 _build_workspace_extra_info 经反向 WS 读 .self 文件（阻塞），
             # 必须放入线程池执行：否则 local_executor.request 会在事件循环线程内
             # 调用 run_coroutine_threadsafe 发送 WS 消息，但事件循环被自身阻塞，
@@ -2150,6 +2372,10 @@ async def _handle_user_message(
                 local_executor=state.local_executor,
             )
             # 系统提示词 9 章节全量注入（Spec 索引/已选 Spec/.self 文档/成员拓扑）
+            # + MCP 工具清单章节（⑩b）
+            mcp_text = _build_mcp_tools_text(
+                getattr(session, "mcp_manager", None)
+            )
             enhanced_prompt = await asyncio.to_thread(
                 _build_agent_system_prompt,
                 workspace_id,
@@ -2158,19 +2384,11 @@ async def _handle_user_message(
                 top_agent_id=agent_id,
                 session_id=session_id,
                 extra_info=extra_info,
+                mcp_tools_text=mcp_text,
             )
-            session = AgentLLMSession(
-                model_config=model_config,
-                workspace_id=workspace_id,
-                system_prompt=enhanced_prompt,
-                user_id=user_id,
-                agent_id=agent_id,
-            )
+            session.system_prompt = enhanced_prompt
+            session.context = [{"role": "system", "content": enhanced_prompt}]
             session.workspace_extra_info = extra_info
-            set_session(user_id, agent_id, session, session_id)
-            await _register_tools(session, agent_id, user_id,
-                                  top_agent_id=agent_id,
-                                  session_id=session_id)
             # 首次创建时从数据库恢复上下文（重启后重建会话）
             restored = load_context(user_id, agent_id, session_id)
             if restored:

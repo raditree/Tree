@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from data.db import connect  # noqa: E402
+
 # 数据库目录：server/data
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 _DB_PATH = _DATA_DIR / "conversations.db"
@@ -25,9 +27,7 @@ def _ensure_db() -> None:
     if _initialized:
         return
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(_DB_PATH) as conn:
-        # 显式声明 UTF-8 解码，防止 Windows 默认行为导致中文乱码
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with connect() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS agents (
@@ -82,8 +82,7 @@ def _migrate_add_deleted_at(conn: sqlite3.Connection) -> None:
 def _connect():
     """创建 UTF-8 编码的 SQLite 连接（全局复用）。"""
     _ensure_db()
-    conn = sqlite3.connect(_DB_PATH)
-    conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    conn = connect()
     return conn
 
 
@@ -212,8 +211,7 @@ def delete_agent(user_id: str, agent_id: str) -> bool:
     """
     _ensure_db()
     now = int(time.time() * 1000)
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         cursor = conn.execute(
             "UPDATE agents SET deleted_at = ? "
             "WHERE user_id = ? AND id = ? AND deleted_at IS NULL",

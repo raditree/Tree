@@ -18,6 +18,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from data.db import connect  # noqa: E402
+
 # 默认会话 id：旧数据迁移目标，前端未选择会话时的兜底
 DEFAULT_SESSION = "session_default"
 
@@ -37,8 +39,7 @@ def _ensure_db() -> None:
     if _initialized:
         return
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with connect() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sessions (
@@ -66,8 +67,7 @@ def _ensure_db() -> None:
 def _connect():
     """创建 UTF-8 编码的 SQLite 连接（全局复用）。"""
     _ensure_db()
-    conn = sqlite3.connect(_DB_PATH)
-    conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    conn = connect()
     return conn
 
 
@@ -88,8 +88,7 @@ def create_session(
     sid = session_id or _gen_session_id()
     final_title = (title or "").strip() or "新会话"
     ts = int(time.time() * 1000)
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         conn.execute(
             "INSERT OR IGNORE INTO sessions "
             "(session_id, user_id, agent_id, title, created_at, updated_at, status) "
@@ -167,8 +166,7 @@ def rename_session(user_id: str, session_id: str, title: str) -> bool:
     if not final_title:
         return False
     ts = int(time.time() * 1000)
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         cursor = conn.execute(
             "UPDATE sessions SET title = ?, updated_at = ? "
             "WHERE session_id = ? AND user_id = ? AND deleted_at IS NULL",
@@ -182,8 +180,7 @@ def touch_session(user_id: str, session_id: str) -> None:
     """更新会话的最后活跃时间（消息收发 / compact 时调用）。"""
     _ensure_db()
     ts = int(time.time() * 1000)
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         conn.execute(
             "UPDATE sessions SET updated_at = ? "
             "WHERE session_id = ? AND user_id = ? AND deleted_at IS NULL",
@@ -204,8 +201,7 @@ def update_session_title_from_first_message(
     if not text:
         return
     brief = text[:30] + ("…" if len(text) > 30 else "")
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         conn.execute(
             "UPDATE sessions SET title = ?, updated_at = ? "
             "WHERE session_id = ? AND user_id = ? AND deleted_at IS NULL "
@@ -222,8 +218,7 @@ def delete_session(user_id: str, session_id: str) -> bool:
     """
     _ensure_db()
     now = int(time.time() * 1000)
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         cursor = conn.execute(
             "UPDATE sessions SET deleted_at = ? "
             "WHERE session_id = ? AND user_id = ? AND deleted_at IS NULL",
@@ -246,8 +241,7 @@ def set_selected_spec_ids(
     _ensure_db()
     raw = json.dumps(list(spec_ids or []), ensure_ascii=False)
     ts = int(time.time() * 1000)
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         cursor = conn.execute(
             "UPDATE sessions SET selected_spec_ids = ?, updated_at = ? "
             "WHERE session_id = ? AND user_id = ? AND deleted_at IS NULL",

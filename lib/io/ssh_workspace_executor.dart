@@ -438,7 +438,10 @@ class SshWorkspaceExecutor {
     return _exec(client, full);
   }
 
-  /// 在远端工作空间按字面量模式递归搜索，返回 ``{exit_code, stdout}``。
+  /// 在远端工作空间按模式递归搜索，返回 ``{exit_code, stdout}``。
+  ///
+  /// 支持参数：``pattern``（必填）、``path``（搜索范围，缺省整个工作空间）、
+  /// ``regex``（是否正则，缺省 false 字面量）、``ignore_case``（缺省 false）。
   Future<Map<String, dynamic>> _grepSearch(
     SSHClient client,
     String workspaceId,
@@ -448,9 +451,17 @@ class SshWorkspaceExecutor {
     if (pattern.isEmpty) {
       return <String, dynamic>{'error': 'grep_search 缺少 pattern'};
     }
+    final bool regex = (data['regex'] as bool?) ?? false;
+    final bool ignoreCase = (data['ignore_case'] as bool?) ?? false;
+    final String path = (data['path'] as String?) ?? '';
     final String cwd = _remotePath(workspaceId, '');
+    // -F 固定字符串 / -E 扩展正则；-- 后为位置参数，pattern 以 - 开头也不会被当选项
+    final String mode = regex ? '-E' : '-F';
+    final String ic = ignoreCase ? 'i' : '';
+    final String target = path.isEmpty ? '.' : _shQuote(path);
     final String full =
-        'cd ${_shQuote(cwd)} && grep -rnI --exclude-dir=.git -- ${_shQuote(pattern)} .';
+        'cd ${_shQuote(cwd)} && grep -rn${ic}I $mode --exclude-dir=.git '
+        '-- ${_shQuote(pattern)} $target';
     return _exec(client, full);
   }
 

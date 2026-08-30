@@ -171,14 +171,14 @@ async def auth_login(request: Request, req: LoginRequest):
     return {"token": token, "user": public_user}
 
 
-# 等级元数据白名单：registration-config 仅返回这些字段，绝不包含邀请码本身
+# 等级元数据白名单：registration-config 仅返回这些字段，绝不包含邀请码本身。
+# 团队规模（max_level / max_members_per_level）已移出等级配置——等级只管并发
+# （max_concurrent_agents），团队配置在创建 TOP agent 时设定（见 config/team.py）。
 _LEVEL_META_KEYS = (
     "max_users",
     "validity_minutes",
     "cooldown_minutes",
     "max_concurrent_agents",
-    "max_level",
-    "max_members_per_level",
     "rate_per_minute",
     "active_rate_per_minute",
 )

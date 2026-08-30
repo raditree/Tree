@@ -18,6 +18,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+from data.db import connect  # noqa: E402
+
 # 数据库目录（与 conversation_store 保持一致）
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 _DB_PATH = _DATA_DIR / "conversations.db"
@@ -33,8 +35,7 @@ def _ensure_db() -> None:
     if _initialized:
         return
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with connect() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS rate_limit_prefs (
@@ -50,8 +51,7 @@ def _ensure_db() -> None:
 
 def _connect():
     _ensure_db()
-    conn = sqlite3.connect(_DB_PATH)
-    conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    conn = connect()
     return conn
 
 
@@ -107,7 +107,6 @@ def load_all_rate_limit_prefs() -> Dict[str, bool]:
 def delete_user_rate_limit_pref(user_id: str) -> None:
     """删除某用户的主动延迟偏好（注销彻底删除时级联调用）。"""
     _ensure_db()
-    with _write_lock, sqlite3.connect(_DB_PATH) as conn:
-        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+    with _write_lock, connect() as conn:
         conn.execute("DELETE FROM rate_limit_prefs WHERE openid = ?", (user_id,))
         conn.commit()

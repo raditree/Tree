@@ -103,11 +103,21 @@ class WorkspaceIO(ABC):
         """
 
     @abstractmethod
-    async def grep_search(self, workspace_id: str, pattern: str) -> Dict[str, Any]:
-        """在工作空间内按文本模式搜索候选行（供 embed_search 使用）。
+    async def grep_search(
+        self,
+        workspace_id: str,
+        pattern: str,
+        path: str = "",
+        regex: bool = False,
+        ignore_case: bool = False,
+    ) -> Dict[str, Any]:
+        """在工作空间内按文本模式/正则搜索候选行（供 embed_search / grep 工具使用）。
 
         :param workspace_id: 工作空间标识
-        :param pattern: 搜索模式（作为字面量传给 grep）
+        :param pattern: 搜索模式；regex=False 时作为字面量，regex=True 时为正则
+        :param path: 搜索范围（工作空间内相对目录/文件），空串表示整个工作空间
+        :param regex: 是否将 pattern 视为正则表达式（缺省 False 字面量）
+        :param ignore_case: 是否忽略大小写（缺省 False）
         :return: ``{"exit_code": 0|1, "stdout": "<grep 输出>"}``；grep 无命中时
                  exit_code 为 1；失败 ``{"error": ...}``
         """
@@ -259,10 +269,27 @@ class CloudWorkspaceIO(WorkspaceIO):
             self.docker_manager.exec_in_workspace, workspace_id, list(argv)
         )
 
-    async def grep_search(self, workspace_id: str, pattern: str) -> Dict[str, Any]:
+    async def grep_search(
+        self,
+        workspace_id: str,
+        pattern: str,
+        path: str = "",
+        regex: bool = False,
+        ignore_case: bool = False,
+    ) -> Dict[str, Any]:
         import shlex
 
-        grep_cmd = f"grep -rnI --exclude-dir=.git -- {shlex.quote(pattern)} ."
+        # -F 固定字符串（字面量）/ -E 扩展正则；-- 之后均为位置参数，pattern
+        # 以 - 开头也不会被解析为选项；pattern 统一 shlex.quote 防注入。
+        flags = "-rnI"
+        if ignore_case:
+            flags += "i"
+        mode = "-E" if regex else "-F"
+        target = shlex.quote(path.strip("/")) if path else "."
+        grep_cmd = (
+            f"grep {flags} {mode} --exclude-dir=.git -- "
+            f"{shlex.quote(pattern)} {target}"
+        )
         return await asyncio.to_thread(
             self.docker_manager.exec_in_workspace,
             workspace_id, ["sh", "-c", grep_cmd],
@@ -443,8 +470,22 @@ class LocalWorkspaceIO(WorkspaceIO):
             workspace_id, "exec_argv", argv=list(argv), timeout=timeout
         )
 
-    async def grep_search(self, workspace_id: str, pattern: str) -> Dict[str, Any]:
-        return await self._request(workspace_id, "grep_search", pattern=pattern)
+    async def grep_search(
+        self,
+        workspace_id: str,
+        pattern: str,
+        path: str = "",
+        regex: bool = False,
+        ignore_case: bool = False,
+    ) -> Dict[str, Any]:
+        return await self._request(
+            workspace_id,
+            "grep_search",
+            pattern=pattern,
+            path=path or "",
+            regex=regex,
+            ignore_case=ignore_case,
+        )
 
     async def git_log(
         self, workspace_id: str, limit: int = 50

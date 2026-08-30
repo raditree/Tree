@@ -1,0 +1,141 @@
+"""grep 内置工具单元测试。
+
+覆盖：
+- 工具定义（name=grep、必填 pattern、参数齐全）
+- 参数校验（空 pattern / 非法路径：绝对路径、盘符、.. 回溯、非法字符）
+- 执行分发（pattern/path/regex/ignore_case 正确透传 WorkspaceIO.grep_search）
+- 结果组装（命中 / 无命中 exit_code=1 / max_results 截断标注）
+"""
+
+import unittest
+from unittest.mock import AsyncMock, Mock
+
+from tool.grep_tool import DEFAULT_MAX_RESULTS, GrepTool
+
+
+class TestToolDefinition(unittest.TestCase):
+    def setUp(self):
+        self.tool = GrepTool(Mock(), "ws")
+
+    def test_name_and_required(self):
+        fn = self.tool.get_tool_definition()["function"]
+        self.assertEqual(fn["name"], "grep")
+        self.assertEqual(fn["parameters"]["required"], ["pattern"])
+
+    def test_has_all_params(self):
+        props = self.tool.get_tool_definition()["function"]["parameters"]["properties"]
+        for key in ("pattern", "path", "regex", "ignore_case", "max_results"):
+            self.assertIn(key, props)
+
+
+class TestPathValidation(unittest.TestCase):
+    def test_valid_relative_paths(self):
+        for p in ("lib/src", "a/b/c.dart", "lib", "dir_1.2-3"):
+            self.assertTrue(GrepTool._is_valid_path(p), p)
+
+    def test_reject_absolute_and_drive(self):
+        self.assertFalse(GrepTool._is_valid_path("/etc"))
+        self.assertFalse(GrepTool._is_valid_path("\\etc"))
+        self.assertFalse(GrepTool._is_valid_path("C:/Users"))
+        self.assertFalse(GrepTool._is_valid_path("d:\\tmp"))
+
+    def test_reject_parent_traversal(self):
+        self.assertFalse(GrepTool._is_valid_path("../secret"))
+        self.assertFalse(GrepTool._is_valid_path("a/../../b"))
+
+    def test_reject_illegal_chars(self):
+        for ch in "|;&$`<>'\"*?~ ":
+            self.assertFalse(GrepTool._is_valid_path(f"a{ch}b"), ch)
+
+    def test_reject_empty(self):
+        self.assertFalse(GrepTool._is_valid_path(""))
+
+
+class TestExecute(unittest.TestCase):
+    def setUp(self):
+        self.io = Mock()
+        self.io.grep_search = AsyncMock(
+            return_value={"exit_code": 0, "stdout": "lib/a.dart:hello\nlib/b.dart:hello2"}
+        )
+        self.tool = GrepTool(self.io, "ws")
+
+    def test_empty_pattern_rejected(self):
+        ret = self.tool.execute({})
+        self.assertIn("error", ret)
+        ret2 = self.tool.execute({"pattern": "  "})
+        self.assertIn("error", ret2)
+
+    def test_invalid_path_rejected(self):
+        ret = self.tool.execute({"pattern": "x", "path": "../secret"})
+        self.assertIn("error", ret)
+        ret2 = self.tool.execute({"pattern": "x", "path": "E:/foo"})
+        self.assertIn("error", ret2)
+        self.io.grep_search.assert_not_awaited()
+
+    def test_non_string_path_rejected(self):
+        ret = self.tool.execute({"pattern": "x", "path": 123})
+        self.assertIn("error", ret)
+
+    def test_hits_returned(self):
+        ret = self.tool.execute({"pattern": "hello"})
+        self.assertEqual(ret["exit_code"], 0)
+        self.assertEqual(ret["count"], 2)
+        self.assertEqual(ret["total"], 2)
+        self.assertFalse(ret["truncated"])
+        self.assertEqual(ret["matches"][0], "lib/a.dart:hello")
+        self.io.grep_search.assert_awaited_once_with(
+            "ws", "hello", path="", regex=False, ignore_case=False
+        )
+
+    def test_params_forwarded(self):
+        self.tool.execute(
+            {"pattern": r"\d+", "path": "lib/src", "regex": True, "ignore_case": True}
+        )
+        self.io.grep_search.assert_awaited_once_with(
+            "ws", r"\d+", path="lib/src", regex=True, ignore_case=True
+        )
+
+    def test_no_hits(self):
+        self.io.grep_search = AsyncMock(return_value={"exit_code": 1, "stdout": ""})
+        ret = self.tool.execute({"pattern": "nope"})
+        self.assertEqual(ret["exit_code"], 1)
+        self.assertEqual(ret["matches"], [])
+        self.assertEqual(ret["count"], 0)
+
+    def test_error_propagated(self):
+        self.io.grep_search = AsyncMock(return_value={"error": "搜索失败"})
+        ret = self.tool.execute({"pattern": "x"})
+        self.assertIn("error", ret)
+
+    def test_max_results_truncates(self):
+        self.io.grep_search = AsyncMock(
+            return_value={
+                "exit_code": 0,
+                "stdout": "\n".join(f"f{i}.txt:line{i}" for i in range(1, 11)),
+            }
+        )
+        ret = self.tool.execute({"pattern": "line", "max_results": 3})
+        self.assertEqual(ret["count"], 3)
+        self.assertEqual(ret["total"], 10)
+        self.assertTrue(ret["truncated"])
+        self.assertEqual(len(ret["matches"]), 3)
+
+    def test_max_results_clamped_and_defaulted(self):
+        self.io.grep_search = AsyncMock(return_value={"exit_code": 0, "stdout": ""})
+        ret = self.tool.execute({"pattern": "x", "max_results": 999999})
+        self.assertLessEqual(ret["total"], 2000)
+        self.io.grep_search = AsyncMock(return_value={"exit_code": 0, "stdout": ""})
+        ret2 = self.tool.execute({"pattern": "x", "max_results": "abc"})
+        self.assertEqual(ret2["count"], 0)
+        self.assertEqual(DEFAULT_MAX_RESULTS, 200)
+
+    def test_blank_stdout_is_clean(self):
+        self.io.grep_search = AsyncMock(
+            return_value={"exit_code": 0, "stdout": "\n  \nline\n"}
+        )
+        ret = self.tool.execute({"pattern": "line"})
+        self.assertEqual(ret["matches"], ["line"])
+
+
+if __name__ == "__main__":
+    unittest.main()

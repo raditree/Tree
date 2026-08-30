@@ -231,15 +231,22 @@ class LLMClientFactory:
         """根据模型配置创建 OpenAI client。
 
         :param model_config: 模型配置，提供 base_url 与 api_key
-        :return: openai.OpenAI 实例
 
-        超时与重试次数为应用级配置（app.yaml 的 ``llm`` 段），未配置时
-        使用默认值。长上下文 + thinking 模型响应可能很慢，但超时必须设
-        上限，否则 API 挂起会导致前端永远显示 working（表现为卡死）。
+        超时与重试次数优先取**模型级**配置（``model_config.extra`` 的
+        ``timeout_seconds`` / ``max_retries``，支持本地大上下文模型长 prefill
+        20min+），未配置时回退应用级默认（app.yaml ``llm`` 段，默认 300s / 1）。
+        注意 OpenAI SDK 的 float timeout 同时覆盖 connect/read/总时长，流式
+        接收按 chunk 重置——本地模型应显式调大 ``timeout_seconds``
+        （如 1800~2400），否则首 token 前的 prefill 阶段即被 read 超时打断。
         """
         llm_cfg = get_config().get("llm", {}) or {}
-        timeout = float(llm_cfg.get("timeout_seconds", 300.0))
-        max_retries = int(llm_cfg.get("max_retries", 1))
+        extra = getattr(model_config, "extra", {}) or {}
+        timeout = float(
+            extra.get("timeout_seconds", llm_cfg.get("timeout_seconds", 300.0))
+        )
+        max_retries = int(
+            extra.get("max_retries", llm_cfg.get("max_retries", 1))
+        )
         return OpenAI(
             base_url=model_config.base_url,
             api_key=model_config.api_key,

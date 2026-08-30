@@ -11,7 +11,7 @@ import '../models/message.dart';
 /// - 工具执行结果（如果尚未完成，显示执行中的动画）
 ///
 /// 为内置工具（help / set / refresh / mcp / team / ask_user_question）与
-/// 工作空间工具（read / write / edit / terminal / embed_search）定制了
+/// 工作空间工具（read / grep / write / edit / terminal / embed_search）定制了
 /// 图标、配色与标题，其余工具使用通用样式。
 class ToolCallCard extends StatefulWidget {
   final ChatMessage message;
@@ -129,6 +129,12 @@ class _ToolCallCardState extends State<ToolCallCard> {
     switch (name) {
       case 'read':
         return '读取 ${args['path'] ?? ''}';
+      case 'grep': {
+        final String pattern = (args['pattern'] ?? '').toString();
+        final String path = (args['path'] ?? '').toString();
+        if (pattern.isEmpty) return '内容搜索';
+        return path.isEmpty ? '搜索: $pattern' : '搜索 $path: $pattern';
+      }
       case 'write':
         return '写入 ${args['path'] ?? ''}';
       case 'edit':
@@ -563,6 +569,8 @@ ToolStyle _toolStyle(String name) {
           Icons.question_answer, _pink, 'ask_user_question · 向用户提问');
     case 'read':
       return const ToolStyle(Icons.description, _blue, 'read · 读取文件');
+    case 'grep':
+      return const ToolStyle(Icons.manage_search, _teal, 'grep · 内容搜索');
     case 'write':
       return const ToolStyle(Icons.note_add, _green, 'write · 写入文件');
     case 'edit':

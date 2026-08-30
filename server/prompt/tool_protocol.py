@@ -73,6 +73,7 @@ def mcp_tool_description(
 TOOL_MANIFEST: Dict[str, Dict[str, object]] = {
     # 内置工具
     "read": {"version": 1, "purpose": "读取工作空间文件/图像，先证后断的前提"},
+    "grep": {"version": 1, "purpose": "工作空间内按字面量/正则搜索文件内容，先定位再精读"},
     "write": {"version": 1, "purpose": "新建/整写文件，自动创建父目录"},
     "edit": {"version": 1, "purpose": "对已有文件做唯一匹配的精确字符串替换"},
     "terminal": {"version": 1, "purpose": "执行 shell 命令（构建/测试/git/文件操作）"},
