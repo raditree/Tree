@@ -222,6 +222,76 @@ class TestLocalExecutorFailFast(unittest.TestCase):
         finally:
             le_mod._STALL_WITHOUT_PROGRESS_SECONDS = orig
 
+    def test_note_progress_ownership_enforced(self):
+        """tool_exec_progress 归属校验：他人不能为本用户的 pending 续期。
+
+        只有请求归属的 user_id 本人上报进度才能刷新 _progress_at（卡死窗口
+        续期）；其他用户即使猜到/拿到 tool_id 也会被拒绝（fail-closed，owner
+        记录缺失同样拒绝），避免跨用户续期放大等待窗口。
+        """
+        client = self._make_client("own")
+        ws = _FakeWS()
+        box = {}
+
+        def do_request():
+            box["res"] = client.request(
+                ws, "own",
+                {"op": "exec_shell", "workspace_id": "top", "command": "sleep"},
+                timeout=30,
+            )
+
+        t = threading.Thread(target=do_request)
+        t.start()
+        msg = ws.wait_message()
+        tool_id = msg["data"]["tool_id"]
+        self.assertIsNotNone(client._pending.get(tool_id))
+
+        # 他人（未注册该 team 的另一用户）上报进度 → 拒绝，不刷新活动时间
+        self.assertFalse(client.note_progress("evil", tool_id))
+        self.assertNotIn(tool_id, client._progress_at)
+
+        # 本人上报进度 → 允许续期
+        self.assertTrue(client.note_progress("own", tool_id))
+        self.assertIn(tool_id, client._progress_at)
+
+        # 正常回传收尾，等待线程安全退出
+        self.assertTrue(
+            client.resolve("own", tool_id, {"exit_code": 0, "stdout": "done"})
+        )
+        t.join(timeout=8)
+        self.assertEqual(box["res"], {"exit_code": 0, "stdout": "done"})
+
+    def test_note_progress_owner_missing_fails_closed(self):
+        """owner 记录缺失（内部状态不一致）时按 fail-closed 拒绝续期。
+
+        手工构造"pending 存在但 _pending_owner 无记录"的异常状态，验证
+        note_progress 不因 owner 缺失而放行跨用户/无主续期。
+        """
+        client = self._make_client("u9")
+        ws = _FakeWS()
+        box = {}
+
+        def do_request():
+            box["res"] = client.request(
+                ws, "u9",
+                {"op": "exec_shell", "workspace_id": "top", "command": "sleep"},
+                timeout=30,
+            )
+
+        t = threading.Thread(target=do_request)
+        t.start()
+        msg = ws.wait_message()
+        tool_id = msg["data"]["tool_id"]
+        # 破坏不变式：删除 owner 记录，仅保留 pending
+        del client._pending_owner[tool_id]
+        self.assertFalse(client.note_progress("u9", tool_id))
+        self.assertNotIn(tool_id, client._progress_at)
+        # 还原并正常收尾，避免影响其他清理
+        client._pending_owner[tool_id] = ("u9", "top")
+        self.assertTrue(client.resolve("u9", tool_id, {"exit_code": 0, "stdout": "ok"}))
+        t.join(timeout=8)
+        self.assertEqual(box["res"], {"exit_code": 0, "stdout": "ok"})
+
 
 if __name__ == "__main__":
     unittest.main()

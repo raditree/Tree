@@ -403,7 +403,10 @@ class LocalExecutorClient:
         if fut is None or fut.done():
             return False
         owner = self._pending_owner.get(tool_id)
-        if owner is not None and owner[0] != user_id:
+        # 归属校验：只有请求归属 user_id 本人才能续期其卡死窗口，防止跨用户
+        # 续期。pending 存在但 owner 缺失说明内部状态不一致，按"非本用户"
+        # 处理（fail-closed）：宁可拒绝续期也不放行。
+        if owner is None or owner[0] != user_id:
             return False
         self._progress_at[tool_id] = time.time()
         return True

@@ -41,6 +41,31 @@ String? resolveShellForDir(String path) {
   return isUnixLikePath(path) ? 'bash' : 'cmd';
 }
 
+/// Windows 下 cmd 会话的 UTF-8 代码页切换前缀（纯函数，供 [_execShell] 与
+/// hook 临时 bat 复用；单元测试可验证拼接结果）。
+///
+/// Windows 的 cmd 内置命令（dir/type/findstr 等）按当前代码页输出字节
+/// （中文系统默认 GBK），后端按 UTF-8 严格解码会抛 FormatException 导致
+/// 工具失败。以 `chcp.com 65001 >nul 2>&1 & ` 前缀执行，使同一 cmd 会话的
+/// 输出统一为 UTF-8（子进程输出经环境变量 PYTHONUTF8=1 强开 UTF-8）。
+String windowsCmdUtf8Prefix() => 'chcp.com 65001 >nul 2>&1 & ';
+
+/// 解码进程输出字节：严格 UTF-8 优先，失败回退 latin1 逐字节（不抛异常）。
+///
+/// Windows 下少量程序仍按 GBK 输出（chcp 65001 后基本消除），latin1 兜底
+/// 保证工具成功返回（个别字符可能显示为扩展拉丁字符，但不中断任务）。
+/// 纯函数，供 [_runProcess] / [_readFile] / [_searchFile] 复用与单测。
+String decodeProcessBytes(dynamic value) {
+  if (value == null) return '';
+  if (value is String) return value;
+  final List<int> bytes = value is List<int> ? value : <int>[];
+  try {
+    return utf8.decode(bytes);
+  } catch (_) {
+    return latin1.decode(bytes, allowInvalid: true);
+  }
+}
+
 /// 本地执行器服务 - 在本地运行模式下执行后端推送的工具请求
 ///
 /// 本地运行模式：后端完整运行在云端，但工具调用环境转移到用户本机。
@@ -546,7 +571,11 @@ class LocalExecutorService extends ChangeNotifier {
         final String batPath =
             '${Directory.systemTemp.path}${Platform.pathSeparator}'
             'hook_${toolId}_exec.bat';
-        await File(batPath).writeAsString('@echo off\r\n$command\r\n');
+        // 先 chcp 65001 再执行命令：与 _execShell 同步路径一致，确保管道/
+        // 输出文件中的字节为 UTF-8（后端按 UTF-8 读取 hook 日志）。
+        await File(batPath).writeAsString(
+          '@echo off\r\n${windowsCmdUtf8Prefix()}\r\n$command\r\n',
+        );
         process = await Process.start(
           'cmd',
           <String>['/d', '/s', '/c', batPath],
@@ -743,7 +772,8 @@ class LocalExecutorService extends ChangeNotifier {
           'stdout': '',
         };
       }
-      final String content = await file.readAsString(encoding: _encoding(encoding));
+      final String content =
+          await _readTextWithFallback(file, encoding);
       return <String, dynamic>{
         'exit_code': 0,
         'stdout': content,
@@ -753,6 +783,24 @@ class LocalExecutorService extends ChangeNotifier {
     } catch (e) {
       return <String, dynamic>{'error': '读取文件失败: $e'};
     }
+  }
+
+  /// 按指定编码读取文本；UTF-8 解码失败时回退 latin1 逐字节（GBK 文件兜底）。
+  ///
+  /// 旧实现 ``readAsString(encoding: utf8)`` 对 GBK/ANSI 文件（Windows 常见
+  /// 产物）抛 ``Failed to decode data using encoding 'utf-8'``，read 工具
+  /// 整条失败；回退后能返回内容（中文可能显示为扩展拉丁字符，但不中断）。
+  Future<String> _readTextWithFallback(
+    File file,
+    String encoding,
+  ) async {
+    final Encoding enc = _encoding(encoding);
+    if (enc == utf8) {
+      // 默认 UTF-8：先按字节严格解码，失败回退 latin1（不抛异常）
+      final List<int> bytes = await file.readAsBytes();
+      return _decodeProcessBytes(bytes);
+    }
+    return file.readAsString(encoding: enc);
   }
 
   /// 读取文件原始字节（base64 编码回传），用于本地模式下的文件下载与 PDF 预览。
@@ -809,8 +857,8 @@ class LocalExecutorService extends ChangeNotifier {
           '--pretty=format:%H%x1f%an%x1f%aI%x1f%s',
         ],
         workingDirectory: wsDir.path,
-        stdoutEncoding: utf8,
-        stderrEncoding: utf8,
+        stdoutEncoding: null,
+        stderrEncoding: null,
       );
       if (result.exitCode != 0) {
         final String err = _decode(result.stderr).trim();
@@ -861,8 +909,8 @@ class LocalExecutorService extends ChangeNotifier {
         'git',
         <String>['branch', '-a'],
         workingDirectory: wsDir.path,
-        stdoutEncoding: utf8,
-        stderrEncoding: utf8,
+        stdoutEncoding: null,
+        stderrEncoding: null,
       );
       if (result.exitCode != 0) {
         final String err = _decode(result.stderr).trim();
@@ -1085,11 +1133,14 @@ class LocalExecutorService extends ChangeNotifier {
       return _runUnixShellInDir(workDir, command, timeout: timeout);
     }
     // 纯 Windows 目录：保持 cmd /c 行为，向后兼容。
+    // 先 chcp 65001 切换代码页为 UTF-8：cmd 内置命令（dir/type/findstr 等）
+    // 与子进程输出均以 UTF-8 字节写入管道，后端按 UTF-8 严格解码不再触发
+    // FormatException（GBK 字节被误当 UTF-8 解析是中文乱码/报错的根因）。
     final bool isWindows = Platform.isWindows;
     return _runProcess(
       wsDir,
       isWindows
-          ? <String>['cmd', '/c', command]
+          ? <String>['cmd', '/c', '${windowsCmdUtf8Prefix()}$command']
           : <String>['sh', '-c', command],
       timeout: timeout,
     );
@@ -1163,6 +1214,13 @@ class LocalExecutorService extends ChangeNotifier {
   /// [workingDirectory] 可覆盖工作目录；缺省时若 [wsDir] 为 Unix/WSL
   /// 风格路径（Windows API 无法识别）则不传 workingDirectory（用当前目录），
   /// 由调用方以 `bash -lc "cd .. && ..."` 等内嵌方式进入；否则用 [wsDir]。
+  ///
+  /// 编码策略：
+  /// - 注入 ``PYTHONUTF8=1/PYTHONIOENCODING=utf-8``（Windows 下 Python 默认按
+  ///   GBK 代码页输出中文，强开 UTF-8 后与全链路 UTF-8 约定一致）；
+  /// - stdout/stderr 以原始字节获取（``stdoutEncoding: null``），经
+  ///   [_decodeProcessBytes] 先严格 UTF-8、失败回退 latin1 逐字节解码，
+  ///   任何编码的意外字节都不会抛出 FormatException 导致整条命令失败。
   Future<Map<String, dynamic>> _runProcess(
     Directory wsDir,
     List<String> argv, {
@@ -1182,23 +1240,31 @@ class LocalExecutorService extends ChangeNotifier {
           ? Process.run(
               argv.first,
               argv.sublist(1),
-              stdoutEncoding: utf8,
-              stderrEncoding: utf8,
+              environment: <String, String>{
+                'PYTHONUTF8': '1',
+                'PYTHONIOENCODING': 'utf-8',
+              },
+              stdoutEncoding: null,
+              stderrEncoding: null,
             )
           : Process.run(
               argv.first,
               argv.sublist(1),
               workingDirectory: cwd,
-              stdoutEncoding: utf8,
-              stderrEncoding: utf8,
+              environment: <String, String>{
+                'PYTHONUTF8': '1',
+                'PYTHONIOENCODING': 'utf-8',
+              },
+              stdoutEncoding: null,
+              stderrEncoding: null,
             );
       final ProcessResult result = timeout > 0
           ? await future.timeout(Duration(seconds: timeout))
           : await future;
       return <String, dynamic>{
         'exit_code': result.exitCode,
-        'stdout': _decode(result.stdout),
-        'stderr': _decode(result.stderr),
+        'stdout': decodeProcessBytes(result.stdout),
+        'stderr': decodeProcessBytes(result.stderr),
       };
     } on TimeoutException {
       return <String, dynamic>{
@@ -1216,6 +1282,12 @@ class LocalExecutorService extends ChangeNotifier {
       };
     }
   }
+
+  /// 解码进程输出字节：严格 UTF-8 优先，失败回退 latin1 逐字节（不抛异常）。
+  ///
+  /// Windows 下少量程序仍按 GBK 输出（chcp 65001 后基本消除），latin1 兜底
+  /// 保证工具成功返回（个别字符可能显示为扩展拉丁字符，但不中断任务）。
+  String _decodeProcessBytes(dynamic value) => decodeProcessBytes(value);
 
   /// 在工作空间内按模式递归搜索（排除 .git 与二进制文件），
   /// 返回 ``{exit_code, stdout}``，无命中时 exit_code 为 1（与 grep 一致）。
@@ -1236,20 +1308,42 @@ class LocalExecutorService extends ChangeNotifier {
     final bool ignoreCase = (data['ignore_case'] as bool?) ?? false;
     final List<String> lines = <String>[];
     try {
-      Directory dir = wsDir;
-      if (path.isNotEmpty) {
-        dir = Directory(_resolveInWorkspace(wsDir, path));
-      }
       final RegExp? re = regex
           ? RegExp(pattern, caseSensitive: !ignoreCase)
           : null;
-      await _walkSearch(
-        dir,
-        pattern,
-        lines,
-        re: re,
-        ignoreCase: ignoreCase,
-      );
+      if (path.isEmpty) {
+        await _walkSearch(
+          wsDir,
+          pattern,
+          lines,
+          re: re,
+          ignoreCase: ignoreCase,
+        );
+      } else {
+        // path 可能是目录或文件：文件走单文件搜索，目录才递归遍历。
+        // 若一律按 Directory 处理（旧实现），传文件路径会在 Windows 上
+        // 报 "Directory listing failed"（Dart 对文件路径执行 list 无效）。
+        final String full = _resolveInWorkspace(wsDir, path);
+        final FileSystemEntityType type =
+            FileSystemEntity.typeSync(full, followLinks: false);
+        if (type == FileSystemEntityType.file) {
+          await _searchFile(
+            File(full),
+            pattern,
+            lines,
+            re: re,
+            ignoreCase: ignoreCase,
+          );
+        } else {
+          await _walkSearch(
+            Directory(full),
+            pattern,
+            lines,
+            re: re,
+            ignoreCase: ignoreCase,
+          );
+        }
+      }
     } on FormatException {
       return <String, dynamic>{'error': '非法正则表达式: $pattern'};
     } catch (e) {
@@ -1262,6 +1356,37 @@ class LocalExecutorService extends ChangeNotifier {
       'exit_code': 0,
       'stdout': lines.join('\n'),
     };
+  }
+
+  /// 在单个文件中匹配 [pattern]，命中行以 ``绝对路径:行内容`` 追加到 [out]。
+  ///
+  /// 读取字节后按 [_decodeProcessBytes] 解码（UTF-8 严格优先，latin1 回退），
+  /// 与 [_walkSearch] 的编码策略一致：GBK 文件不会因解码失败被整文件跳过。
+  Future<void> _searchFile(
+    File file,
+    String pattern,
+    List<String> out, {
+    RegExp? re,
+    bool ignoreCase = false,
+  }) async {
+    try {
+      final List<int> bytes = await file.readAsBytes();
+      final String content = _decodeProcessBytes(bytes);
+      final List<String> fileLines = content.split('\n');
+      final String lowerPattern = ignoreCase ? pattern.toLowerCase() : pattern;
+      for (final String line in fileLines) {
+        final bool hit = re != null
+            ? re.hasMatch(line)
+            : ignoreCase
+                ? line.toLowerCase().contains(lowerPattern)
+                : line.contains(pattern);
+        if (hit) {
+          out.add('${file.path}:$line');
+        }
+      }
+    } catch (_) {
+      // 忽略二进制 / 不可读文件
+    }
   }
 
   /// 递归遍历目录，收集包含 [pattern] 的行（[re] 非空时按正则匹配）。
@@ -1286,24 +1411,13 @@ class LocalExecutorService extends ChangeNotifier {
           ignoreCase: ignoreCase,
         );
       } else if (entity is File) {
-        try {
-          final String content = await entity.readAsString(encoding: utf8);
-          final List<String> fileLines = content.split('\n');
-          // 提前转换一次，避免每行重复调用 pattern.toLowerCase()
-          final String lowerPattern = ignoreCase ? pattern.toLowerCase() : pattern;
-          for (final String line in fileLines) {
-            final bool hit = re != null
-                ? re.hasMatch(line)
-                : ignoreCase
-                    ? line.toLowerCase().contains(lowerPattern)
-                    : line.contains(pattern);
-            if (hit) {
-              out.add('${entity.path}:$line');
-            }
-          }
-        } catch (_) {
-          // 忽略二进制 / 不可解码文件
-        }
+        await _searchFile(
+          entity,
+          pattern,
+          out,
+          re: re,
+          ignoreCase: ignoreCase,
+        );
       }
     }
   }
