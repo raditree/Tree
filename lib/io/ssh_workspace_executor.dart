@@ -194,7 +194,7 @@ class SshWorkspaceExecutor {
     final String rel = path.replaceAll('\\', '/').replaceFirst(RegExp(r'^/+'), '');
     final String root =
         _isSelfToken(rel) ? '$base/agentspace/$workspaceId' : base;
-    return rel.isEmpty ? root : _posixNorm('$root/$rel');
+    return rel.isEmpty ? root : posixNormPath('$root/$rel');
   }
 
   /// 映射远端绝对路径并做穿越防护；非法路径返回 null（调用方据此返回错误）。
@@ -210,8 +210,8 @@ class SshWorkspaceExecutor {
     final String root =
         _isSelfToken(rel) ? '$base/agentspace/$workspaceId' : base;
     if (rel.isEmpty) return root;
-    final String norm = _posixNorm('$root/$rel');
-    final String baseNorm = _posixNorm(base);
+    final String norm = posixNormPath('$root/$rel');
+    final String baseNorm = posixNormPath(base);
     if (baseNorm.isEmpty || baseNorm == '/') {
       // base 未配置或为根目录：保持原有行为，视为允许
       return norm;
@@ -221,8 +221,15 @@ class SshWorkspaceExecutor {
     return null;
   }
 
-  /// POSIX 路径归一化：折叠 ``.`` / ``..``，统一 ``/``。
-  String _posixNorm(String path) {
+  /// POSIX 路径归一化：折叠 ``.`` / ``..``、统一 ``/``，并**保留绝对路径的开头 ``/``**。
+  ///
+  /// 若丢弃根标记，绝对路径会被还原成相对路径：SFTP 等以服务端 cwd 为基准的
+  /// 通道（如 sftp-server 默认落在用户 home）会把 ``home/open/CodeStudio/x``
+  /// 解析到错误位置而报 ``No such file``，故此处必须保留。
+  ///
+  /// 公开为静态方法（不依赖实例），便于单元测试覆盖路径归一化语义。
+  static String posixNormPath(String path) {
+    final bool rooted = path.startsWith('/');
     final List<String> parts = <String>[];
     for (final String part in path.split('/')) {
       if (part.isEmpty || part == '.') continue;
@@ -232,7 +239,8 @@ class SshWorkspaceExecutor {
         parts.add(part);
       }
     }
-    return parts.join('/');
+    if (parts.isEmpty) return rooted ? '/' : '';
+    return rooted ? '/${parts.join('/')}' : parts.join('/');
   }
 
   // ------------------------------------------------------------------
@@ -373,6 +381,28 @@ class SshWorkspaceExecutor {
     return "'${s.replaceAll("'", "'\\''")}'";
   }
 
+  /// SFTP 错误上下文后缀：把「尝试的远端绝对路径 / base 映射 / 连接对象」
+  /// 固化进错误信息，便于审查与复现（此前仅返回服务端一句话，难以判断是
+  /// 路径错、映射错还是通道错）。
+  String _sftpCtx(String remote) {
+    return ' (remote=$remote, base=${_resolveBase()}, '
+        'host=${config['host'] ?? ''}, user=${config['username'] ?? ''})';
+  }
+
+  /// 格式化 SFTP 服务端状态错误：``描述(code=数值)``，数值比文本更便于核对。
+  String _sftpErrText(SftpStatusError e) => '${e.message} (code=${e.code})';
+
+  /// 用 exec（与 SFTP 同一连接）探测远端路径是否存在：SFTP 报 No such file 时
+  /// 交叉核验，区分「远端确实不存在」与「SFTP 与 exec 文件系统视图不一致」。
+  Future<bool> _remoteExistsViaExec(SSHClient client, String remote) async {
+    final Map<String, dynamic> r = await _exec(
+      client,
+      'test -e -- ${_shQuote(remote)} && printf exists',
+    );
+    return r['exit_code'] == 0 &&
+        (r['stdout'] as String? ?? '').contains('exists');
+  }
+
   // ------------------------------------------------------------------
   // 操作实现
   // ------------------------------------------------------------------
@@ -413,9 +443,17 @@ class SshWorkspaceExecutor {
         // 工作空间目录尚未创建，按空目录处理
         return <String, dynamic>{'exit_code': 0, 'files': <dynamic>[]};
       }
-      return <String, dynamic>{'exit_code': 1, 'files': <dynamic>[], 'error': '列出目录失败: ${e.message}'};
+      return <String, dynamic>{
+        'exit_code': 1,
+        'files': <dynamic>[],
+        'error': '列出目录失败: ${_sftpErrText(e)}${_sftpCtx(target)}',
+      };
     } catch (e) {
-      return <String, dynamic>{'exit_code': 1, 'files': <dynamic>[], 'error': '列出目录失败: $e'};
+      return <String, dynamic>{
+        'exit_code': 1,
+        'files': <dynamic>[],
+        'error': '列出目录失败: $e${_sftpCtx(target)}',
+      };
     } finally {
       sftp.close();
     }
@@ -440,7 +478,11 @@ class SshWorkspaceExecutor {
     try {
       final Uint8List? bytes = await _sftpReadBytes(sftp, remote);
       if (bytes == null) {
-        return <String, dynamic>{'error': '文件不存在或无法读取: $path', 'exit_code': 1, 'stdout': ''};
+        return <String, dynamic>{
+          'error': '远端不存在该文件或目录: $path${_sftpCtx(remote)}',
+          'exit_code': 1,
+          'stdout': '',
+        };
       }
       final String content = _decodeText(bytes, encoding);
       return <String, dynamic>{
@@ -451,11 +493,25 @@ class SshWorkspaceExecutor {
       };
     } on SftpStatusError catch (e) {
       if (e.code == SftpStatusCode.noSuchFile) {
-        return <String, dynamic>{'error': '文件不存在或无法读取: $path', 'exit_code': 1, 'stdout': ''};
+        final bool viaExec = await _remoteExistsViaExec(client, remote);
+        return <String, dynamic>{
+          'error': viaExec
+              ? '文件读取失败: SFTP 报不存在但 exec 侧可见同一绝对路径，'
+                  '疑似 SFTP 视图/路径映射不一致: $path${_sftpCtx(remote)}'
+              : '文件不存在或无法读取（exec 侧亦不存在）: $path${_sftpCtx(remote)}',
+          'exit_code': 1,
+          'stdout': '',
+        };
       }
-      return <String, dynamic>{'error': 'SSH 读取失败: ${e.message}', 'exit_code': 1};
+      return <String, dynamic>{
+        'error': 'SSH 读取失败: ${_sftpErrText(e)}${_sftpCtx(remote)}',
+        'exit_code': 1,
+      };
     } catch (e) {
-      return <String, dynamic>{'error': 'SSH 读取失败: $e', 'exit_code': 1};
+      return <String, dynamic>{
+        'error': 'SSH 读取失败: $e${_sftpCtx(remote)}',
+        'exit_code': 1,
+      };
     } finally {
       sftp.close();
     }
@@ -479,7 +535,10 @@ class SshWorkspaceExecutor {
     try {
       final Uint8List? bytes = await _sftpReadBytes(sftp, remote);
       if (bytes == null) {
-        return <String, dynamic>{'error': '文件不存在或无法读取: $path', 'exit_code': 1};
+        return <String, dynamic>{
+          'error': '远端不存在该文件或目录: $path${_sftpCtx(remote)}',
+          'exit_code': 1,
+        };
       }
       return <String, dynamic>{
         'exit_code': 0,
@@ -487,11 +546,24 @@ class SshWorkspaceExecutor {
       };
     } on SftpStatusError catch (e) {
       if (e.code == SftpStatusCode.noSuchFile) {
-        return <String, dynamic>{'error': '文件不存在或无法读取: $path', 'exit_code': 1};
+        final bool viaExec = await _remoteExistsViaExec(client, remote);
+        return <String, dynamic>{
+          'error': viaExec
+              ? '文件读取失败: SFTP 报不存在但 exec 侧可见同一绝对路径，'
+                  '疑似 SFTP 视图/路径映射不一致: $path${_sftpCtx(remote)}'
+              : '文件不存在或无法读取（exec 侧亦不存在）: $path${_sftpCtx(remote)}',
+          'exit_code': 1,
+        };
       }
-      return <String, dynamic>{'error': 'SSH 读取失败: ${e.message}', 'exit_code': 1};
+      return <String, dynamic>{
+        'error': 'SSH 读取失败: ${_sftpErrText(e)}${_sftpCtx(remote)}',
+        'exit_code': 1,
+      };
     } catch (e) {
-      return <String, dynamic>{'error': 'SSH 读取失败: $e', 'exit_code': 1};
+      return <String, dynamic>{
+        'error': 'SSH 读取失败: $e${_sftpCtx(remote)}',
+        'exit_code': 1,
+      };
     } finally {
       sftp.close();
     }
@@ -525,7 +597,11 @@ class SshWorkspaceExecutor {
       }
       return <String, dynamic>{'success': true, 'file_path': path};
     } catch (e) {
-      return <String, dynamic>{'error': 'SSH 写入失败: $e', 'file_path': path};
+      final String detail = e is SftpStatusError ? _sftpErrText(e) : '$e';
+      return <String, dynamic>{
+        'error': 'SSH 写入失败: $detail${_sftpCtx(remote)}',
+        'file_path': path,
+      };
     } finally {
       sftp.close();
     }
@@ -565,7 +641,11 @@ class SshWorkspaceExecutor {
       }
       return <String, dynamic>{'success': true, 'file_path': relPath};
     } catch (e) {
-      return <String, dynamic>{'error': 'SSH 上传失败: $e', 'file_path': relPath};
+      final String detail = e is SftpStatusError ? _sftpErrText(e) : '$e';
+      return <String, dynamic>{
+        'error': 'SSH 上传失败: $detail${_sftpCtx(remote)}',
+        'file_path': relPath,
+      };
     } finally {
       sftp.close();
     }
@@ -619,7 +699,10 @@ class SshWorkspaceExecutor {
         // 关闭失败无碍
       }
       sftp.close();
-      return <String, dynamic>{'error': '初始化分片上传失败: $e'};
+      final String detail = e is SftpStatusError ? _sftpErrText(e) : '$e';
+      return <String, dynamic>{
+        'error': '初始化分片上传失败: $detail${_sftpCtx(remote)}',
+      };
     }
   }
 
