@@ -8,6 +8,7 @@
 - 活动日志 / 取消事件 / 记忆更新阶段
 """
 import asyncio
+import base64
 import datetime
 import hashlib
 import logging
@@ -40,7 +41,7 @@ from data.session_store import (
     touch_session,
     update_session_title_from_first_message,
 )
-from io_.mode_resolver import ensure_mode_locked
+from io_.mode_resolver import ensure_mode_locked, resolve_mode
 from io_.workspace_io import run_io
 from llm.llm import AgentLLMSession, _AskPaused
 from tool import register_builtin_tools
@@ -368,6 +369,10 @@ def _upload_attachments(
       ``base_dir/.input/yyyymmdd/``，与 agent 本地工具同一根目录；
     - 云端模式：写入 Docker 容器。Docker 不可用或文件不存在时跳过该文件。
 
+    SSH 模式不在此处处理：附件须落在 SSH **远端主机**上（经前端执行器
+    SFTP），由异步调用方按 ``resolve_mode == "ssh"`` 走
+    :func:`_upload_attachments_ssh`（本函数不感知 SSH，防止误写云端）。
+
     写入失败仅记录日志，不中断。
 
     :param workspace_id: agent 工作空间标识
@@ -423,6 +428,82 @@ def _upload_attachments(
             )
             continue
         uploaded.append(f"/workspace/{container_path}")
+    return uploaded
+
+
+async def _upload_attachments_ssh(
+    workspace_id: str,
+    paths: Any,
+    user_id: str = "",
+    team_id: str = "",
+) -> List[str]:
+    """SSH 模式：把后端可读的附件内容转发前端 SSH 执行器，落盘**远端**。
+
+    目标目录与本地/云端语义一致：前端 SSH 执行器把工作空间相对路径
+    ``.input/yyyymmdd/name`` 映射到远端 ``remote_base_dir/.input/yyyymmdd/``
+    （upload_file 经 SFTP 写入），附件落地后 agent 的 SSH 工具即可经相对路径
+    ``.input/yyyymmdd/name`` 读取。
+
+    仅在"该顶部 agent 处于 SSH 模式且执行器已注册（前端在线）"时执行：
+    - 前端失联/未注册时记录 warning 并跳过，**不静默回退 Docker/云端**——
+      与"锁定 SSH 模式绝不回落云端执行"的既有约定一致；
+    - 后端无法按路径读到附件（如后端与用户文件不在同一台机器）时同样跳过
+      并告警，交由文件面板的多字节上传通道兜底。
+
+    :param workspace_id: agent 工作空间标识
+    :param paths: 用户上传的本地文件路径列表
+    :param user_id: 用户标识
+    :param team_id: 顶部 agent 标识
+    :return: 工作空间语义路径列表（如 ``/workspace/.input/20260906/xxx``）
+    """
+    if not paths:
+        return []
+    executor = state.local_executor
+    ws_manager = getattr(state, "ws_manager", None)
+    if executor is None or ws_manager is None:
+        return []
+    if not executor.is_ssh(user_id, team_id):
+        logger.warning(
+            "SSH 模式附件跳过上传：SSH 执行器未注册/前端失联"
+            "（user_id=%s team_id=%s，模式锁定不变，等待重注册后重发）",
+            user_id, team_id,
+        )
+        return []
+    date_dir = datetime.datetime.now().strftime("%Y%m%d")
+    uploaded: List[str] = []
+    for p in paths:
+        path = str(p)
+        if not os.path.isfile(path):
+            logger.debug("附件不存在，跳过上传: %s", path)
+            continue
+        name = os.path.basename(path.replace("\\", "/"))
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as exc:  # noqa: BLE001
+            logger.warning("读取附件失败: %s (%s)", path, exc)
+            continue
+        rel_path = f".input/{date_dir}/{name}"
+        # executor.request 为阻塞式反向 WS 请求：放线程池执行，避免阻塞
+        # 事件循环（否则 WS 接收无法处理 tool_exec_response 造成死锁）。
+        result = await asyncio.to_thread(
+            executor.request,
+            ws_manager,
+            user_id,
+            {
+                "op": "upload_file",
+                "workspace_id": workspace_id,
+                "rel_path": rel_path,
+                "data_base64": base64.b64encode(data).decode("ascii"),
+            },
+            team_id=team_id,
+        )
+        if "error" in result:
+            logger.warning(
+                "附件写入 SSH 远端失败: %s (%s)", name, result.get("error"),
+            )
+            continue
+        uploaded.append(f"/workspace/{rel_path}")
     return uploaded
 
 
@@ -2593,14 +2674,27 @@ async def _handle_user_message(
     if not workspace_id:
         workspace_id = agent_id if agent else "top"
 
-    # 上传附件到工作空间 .input/yyyymmdd/，仅将路径告知 LLM
-    # （user_id/agent_id 用于本地模式判定：附件需落到用户选择的本地目录）
-    uploaded_paths = _upload_attachments(
-        workspace_id,
-        attachments,
-        user_id=user_id,
-        team_id=agent_id,
-    )
+    # 上传附件到工作空间 .input/yyyymmdd/，仅将路径告知 LLM。
+    # 三模式分派：local 直接写 base_dir/.input；cloud 写云端容器/本地降级
+    # workspaces；SSH 必须经前端执行器 SFTP 落**远端** .input——走异步
+    # _upload_attachments_ssh，否则附件会误写云端容器而后端 agent（SSH 工具
+    # 全部跑在远端主机）读不到，表现为「提示已上传、实际找不到」。
+    _le = state.local_executor
+    if (
+        _le is not None
+        and not _le.is_local(user_id, agent_id)
+        and resolve_mode(user_id, agent_id) == "ssh"
+    ):
+        uploaded_paths = await _upload_attachments_ssh(
+            workspace_id, attachments, user_id=user_id, team_id=agent_id,
+        )
+    else:
+        uploaded_paths = _upload_attachments(
+            workspace_id,
+            attachments,
+            user_id=user_id,
+            team_id=agent_id,
+        )
     attachments_prompt = _build_attachments_prompt(uploaded_paths)
     if attachments_prompt:
         llm_content = f"{llm_content}\n\n{attachments_prompt}" if llm_content else attachments_prompt

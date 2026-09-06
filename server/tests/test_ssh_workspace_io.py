@@ -158,6 +158,26 @@ def test_git_log_delegates():
     assert call["limit"] == 10
 
 
+def test_git_branches_delegates():
+    """SSH 模式 git branches：委托前端执行器并透传 branches/current。"""
+    io = make_io(_FakeExecutor({
+        "branches": ["main", "dev"], "current": "dev", "exit_code": 0,
+    }))
+    result = run(io.git_branches("top1"))
+    assert result["branches"] == ["main", "dev"]
+    assert result["current"] == "dev"
+    assert result["exit_code"] == 0
+    call = io._executor.request_calls[0]
+    assert call["op"] == "git_branches"
+    assert call["workspace_id"] == "top1"
+
+
+def test_git_branches_error_passthrough():
+    io = make_io(_FakeExecutor({"error": "git 执行失败"}))
+    result = run(io.git_branches("top1"))
+    assert result["error"] == "git 执行失败"
+
+
 def test_list_files_delegates():
     io = make_io(_FakeExecutor({"files": [{"name": "a.txt", "type": "file"}],
                                 "exit_code": 0}))

@@ -510,6 +510,16 @@ class LocalWorkspaceIO(WorkspaceIO):
             "exit_code": result.get("exit_code", 0),
         }
 
+    async def git_branches(self, workspace_id: str) -> Dict[str, Any]:
+        result = await self._request(workspace_id, "git_branches")
+        if result.get("error"):
+            return result
+        return {
+            "branches": result.get("branches", []),
+            "current": result.get("current", ""),
+            "exit_code": result.get("exit_code", 0),
+        }
+
     async def list_files(
         self, workspace_id: str, path: str = ""
     ) -> Dict[str, Any]:
