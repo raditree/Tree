@@ -34,6 +34,10 @@ upload:
   max_file_size: "300m"
   # 沙箱内全部文件总大小上限（上传前校验，避免单 agent 工作空间膨胀）
   sandbox_max_size: "8g"
+  # 大文件分片上传阈值：超过该大小的文件走 init/chunk/complete 三段式分片通道
+  chunk_threshold: "8m"
+  # 分片大小（服务端定标，随 upload_init 返回，前端按该值切片）
+  chunk_size: "4m"
 
 # LLM 调用行为（应用级默认值）
 llm:

@@ -19,13 +19,61 @@ import 'websocket_service.dart';
 /// - 前端侧"是否已启用 SSH 模式"的状态持久化（按顶部 agent），供三态开关显示；
 /// - 启用时先在**前端本机**做连接测试（真正"相对前端"的可达性验证），通过后
 ///   发送 ``register_ssh_executor`` 等待 ack，成功则建立并缓存 SSH 连接；
-/// - 接管 ``tool_exec_request``：当前顶部 agent 处于 SSH 模式时经 SSH 会话
+/// - 接管 ``tool_exec_request``：请求所属 team 处于 SSH 模式时经 SSH 会话
 ///   执行并回传 ``tool_exec_response``；
 /// - 注销/清理时关闭前端持有的 SSH 连接。
+///
+/// 内部状态为 per-team 的 ``Map<teamId, _SshTeamState>``：所有执行路径按请求
+/// payload 的 ``team_id`` 查找对应状态，与"当前选中 agent"解耦。注册由懒激活
+/// 驱动：消息发送前 [ensureTeam] 幂等地加载并注册已启用的 team，WS 重连后
+/// [syncRegisteredTeams] 恢复"已注册且启用"team 的注册。
 ///
 /// 与 [LocalExecutorService] 的差异：SSH 配置在后端是持久化的，因此
 /// [cleanup] 不注销（避免应用退出误删用户配置），重启后前端按持久化状态
 /// 恢复显示，后端仍按 DB 配置继续执行。
+
+/// 单个顶部 agent（team）的 SSH 执行器状态。
+class _SshTeamState {
+  _SshTeamState({required this.teamId});
+
+  /// 顶部 agent（team）ID
+  final String teamId;
+
+  /// SSH 模式是否启用（持久化）
+  bool enabled = false;
+
+  /// SSH 连接配置（host/port/username/auth_type/remote_base_dir/...）
+  Map<String, dynamic> config = <String, dynamic>{};
+
+  /// 是否已向后端注册 SSH 执行器
+  bool registered = false;
+
+  /// 该 team 等待后端 ack 的挂起请求（per-team Completer）
+  Completer<Map<String, dynamic>>? pendingAck;
+}
+
+/// 在途 SSH hook 任务定位记录（取消 ``tool_exec_cancel`` 时使用）。
+///
+/// 后端取消 hook 时发送 ``tool_exec_cancel``（tool_id + pidfile）；hook 请求
+/// 到达本端时记录其归属 team 与 workspace，取消处理者据此经该 team 的 SSH
+/// 会话执行远端 ``kill -TERM``。
+class _SshHookTarget {
+  const _SshHookTarget({
+    required this.teamId,
+    required this.workspaceId,
+    required this.pidfile,
+  });
+
+  /// 发起 hook 请求的顶部 agent（team）ID
+  final String teamId;
+
+  /// hook 请求的 workspace_id
+  final String workspaceId;
+
+  /// 远端 pidfile 路径（workspace 相对路径，= output_file + '.pid'）
+  final String pidfile;
+}
+
 class SshExecutorService extends ChangeNotifier {
   SshExecutorService._();
 
@@ -35,85 +83,128 @@ class SshExecutorService extends ChangeNotifier {
   /// 前端 SSH 连接管理器（按顶部 agent 懒建连 / 缓存 / 失活重建）
   final SshConnectionManager _connectionManager = SshConnectionManager();
 
-  /// SSH 工具执行器（从服务当前状态取配置与顶部 agent ID）
-  late final SshWorkspaceExecutor _workspaceExecutor = SshWorkspaceExecutor(
-    _connectionManager,
-    configProvider: () => _config,
-    topAgentIdProvider: () => _currentTopAgentId,
-  );
+  /// per-team 状态：team_id -> SSH 执行器状态。
+  ///
+  /// 所有执行路径按请求 payload 的 ``team_id`` 查找状态，与"当前选中
+  /// agent"解耦；条目由 [loadTeamSettings] / [ensureTeam] 懒创建。
+  final Map<String, _SshTeamState> _states = <String, _SshTeamState>{};
 
-  /// 当前选中的顶部 agent ID（SSH 模式按此单独控制）
-  String _currentTopAgentId = '';
+  /// 在途 SSH hook 任务记录：tool_id -> 定位信息（取消处理用）。
+  ///
+  /// hook 请求（op=``exec_shell_hook``）到达时记录，hook 执行结束（正常/
+  /// 出错/取消）后移除；取消处理者据此把 tool_id 关联回 team 与 pidfile。
+  final Map<String, _SshHookTarget> _hookTargets =
+      <String, _SshHookTarget>{};
 
-  /// 当前服务的顶部 agent ID（供本地执行器等校验被服务方归属）
-  String get currentTopAgentId => _currentTopAgentId;
+  /// 等待后端 ack 的 FIFO 队列（按注册消息发送顺序排列）。
+  ///
+  /// 后端对每条 ``register_ssh_executor`` 恰好回一条 ack 且不回显 team_id，
+  /// 同一连接上按发送顺序逐条匹配即可准确路由到对应 team 的 per-team
+  /// Completer。
+  final List<_SshTeamState> _ackQueue = <_SshTeamState>[];
 
-  /// SharedPreferences 键前缀（后接顶部 agent ID，实现按顶部 agent 持久化）
+  /// SharedPreferences 键前缀（后接团队 ID，实现按顶部 agent 持久化）
   static const String _kEnabledPrefix = 'ssh_exec_enabled_';
   static const String _kConfigPrefix = 'ssh_exec_config_';
 
-  static String _kEnabledKey(String topAgentId) => '$_kEnabledPrefix$topAgentId';
-  static String _kConfigKey(String topAgentId) => '$_kConfigPrefix$topAgentId';
+  static String _kEnabledKey(String teamId) => '$_kEnabledPrefix$teamId';
+  static String _kConfigKey(String teamId) => '$_kConfigPrefix$teamId';
 
   /// 承载当前 WebSocket 通道的服务（用于发送注册/注销消息）
   WebSocketService? _ws;
 
-  /// 当前顶部 agent 的 SSH 模式是否启用（持久化）
-  bool _enabled = false;
-  bool get enabled => _enabled;
+  /// 指定 team 的 SSH 模式是否已启用（无状态时视为未启用，供 UI 显示）
+  bool isTeamEnabled(String teamId) => _states[teamId]?.enabled ?? false;
 
-  /// 当前顶部 agent 的 SSH 连接配置（host/port/username/auth_type/...）
-  Map<String, dynamic> _config = <String, dynamic>{};
-  Map<String, dynamic> get config => Map<String, dynamic>.from(_config);
+  /// 指定 team 的 SSH 连接配置（无状态时返回空 Map，供配置表单预填）
+  Map<String, dynamic> teamConfig(String teamId) =>
+      Map<String, dynamic>.from(_states[teamId]?.config ??
+          const <String, dynamic>{});
 
-  /// 等待后端 ack 的挂起请求（同时只有一个进行中）
-  Completer<Map<String, dynamic>>? _pendingAck;
-
-  /// 切换当前操作的顶部 agent，并重置其 SSH 状态。
-  ///
-  /// 不注销后端注册、不关闭既有连接：各顶部 agent 的 SSH 模式相互独立，
-  /// 配置持久化在 DB，连接按顶部 agent 缓存，切换只影响前端显示与后续注册动作。
-  void setCurrentTopAgent(String topAgentId) {
-    if (topAgentId == _currentTopAgentId) return;
-    _currentTopAgentId = topAgentId;
-    _enabled = false;
-    _config = <String, dynamic>{};
-    notifyListeners();
+  /// 读取指定 team 的持久化设置到内存状态（不触发注册，供 UI 显示/预填）。
+  Future<void> loadTeamSettings(String teamId) async {
+    if (teamId.isEmpty) return;
+    final _SshTeamState state =
+        _states.putIfAbsent(teamId, () => _SshTeamState(teamId: teamId));
+    await _loadTeamSettings(state);
   }
 
-  /// 从 SharedPreferences 恢复当前顶部 agent 的 SSH 模式设置
-  Future<void> loadSettings() async {
-    final String id = _currentTopAgentId;
-    // 竞态防护：等待期间可能已切换顶部 agent，丢弃过期恢复结果
-    // （否则旧 agent 的 SSH 启用态会被写回当前 agent 内存态，
-    // 造成本地 agent 的工具请求被残留 SSH 启用态误接管）
+  /// 从 SharedPreferences 恢复单个 team 的 SSH 模式设置。
+  ///
+  /// 竞态防护：等待期间该条目可能已被 [deactivateTeam] 移除或替换，
+  /// 丢弃过期恢复结果（否则已删除 team 的 SSH 启用态会被写回内存态）。
+  Future<void> _loadTeamSettings(_SshTeamState state) async {
+    final String id = state.teamId;
     final prefs = await SharedPreferences.getInstance();
-    if (id != _currentTopAgentId) return;
-    _enabled = prefs.getBool(_kEnabledKey(id)) ?? false;
+    if (!identical(_states[id], state)) return;
+    state.enabled = prefs.getBool(_kEnabledKey(id)) ?? false;
     final String? raw = prefs.getString(_kConfigKey(id));
     if (raw != null && raw.isNotEmpty) {
       try {
-        _config = jsonDecode(raw) as Map<String, dynamic>;
+        state.config = jsonDecode(raw) as Map<String, dynamic>;
       } catch (_) {
-        _config = <String, dynamic>{};
+        state.config = <String, dynamic>{};
       }
     }
   }
 
-  /// 绑定 WebSocket 服务并接管 ``tool_exec_request`` 消息。
+  /// 懒激活指定 team 的 SSH 执行器（幂等）。
   ///
-  /// 与本地执行器共同注册为工具请求处理者；本处理者仅在 SSH 模式启用时接管。
-  void attach(WebSocketService ws) {
-    _ws = ws;
-    ws.addToolExecRequestHandler(_handleToolExecRequest);
+  /// - 状态不存在：创建并从 SharedPreferences 恢复设置；
+  /// - 已启用且有配置但未注册：发送注册并等待 ack（per-team Completer，
+  ///   最长 15s），成功后预热 SSH 连接；
+  /// - 未启用 / 无配置：静默返回（后端按"无执行器"回落云端执行）。
+  Future<void> ensureTeam(String teamId) async {
+    if (teamId.isEmpty) return;
+    _SshTeamState? state = _states[teamId];
+    if (state == null) {
+      final _SshTeamState created = _SshTeamState(teamId: teamId);
+      _states[teamId] = created;
+      await _loadTeamSettings(created);
+      state = _states[teamId];
+      if (state == null) return; // 等待期间被 deactivateTeam 移除
+    }
+    if (state.enabled && state.config.isNotEmpty && !state.registered) {
+      await _registerTeam(state);
+    }
   }
 
-  /// 启用 SSH 模式：前端本机连接测试 → 注册并等待 ack → 建立并缓存连接。
+  /// 注销指定 team 的 SSH 执行器并移除其状态（删除顶部 agent 时调用）：
+  /// 持久化关闭开关、通知后端注销、关闭该 team 的 SSH 连接、清理等待。
+  Future<void> deactivateTeam(String teamId) async {
+    if (teamId.isEmpty) return;
+    final _SshTeamState? state = _states.remove(teamId);
+    if (state == null) return;
+    final Completer<Map<String, dynamic>>? completer = state.pendingAck;
+    state.pendingAck = null;
+    if (completer != null && !completer.isCompleted) {
+      completer.complete(<String, dynamic>{
+        'success': false,
+        'message': '该顶部 agent 已删除',
+      });
+    }
+    _ackQueue.remove(state);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_kEnabledKey(teamId), false);
+    await _connectionManager.close(teamId);
+    _sendUnregister(teamId);
+  }
+
+  /// 启用指定 team 的 SSH 模式（模式切换弹窗调用）：前端本机连接测试 →
+  /// 注册并等待 ack → 建立并缓存连接。
   ///
   /// 返回 ``{success: true}`` 或 ``{success: false, message}``。
   /// 连接测试在**前端本机**进行（IP 相对前端），失败即返回，不再发后端；
-  /// ack 成功才持久化启用状态并建立 SSH 连接。
-  Future<Map<String, dynamic>> enable(Map<String, dynamic> config) async {
+  /// ack 成功才持久化启用状态并预热 SSH 连接。
+  Future<Map<String, dynamic>> enableTeam(
+    String teamId,
+    Map<String, dynamic> config,
+  ) async {
+    if (teamId.isEmpty) {
+      return <String, dynamic>{'success': false, 'message': '未选择顶部 agent'};
+    }
+    final _SshTeamState state =
+        _states.putIfAbsent(teamId, () => _SshTeamState(teamId: teamId));
     // ① 前端本机连接测试（建立→关闭），验证"相对前端"可达性与认证
     final Map<String, dynamic> test =
         await _connectionManager.testConnection(config);
@@ -124,162 +215,286 @@ class SshExecutorService extends ChangeNotifier {
       };
     }
     // ② 发送注册并等待后端 ack（互斥校验 / 持久化由后端完成）
-    final Map<String, dynamic> ack = await _register(config);
+    state.config = Map<String, dynamic>.from(config);
+    final Map<String, dynamic> ack = await _registerTeam(state);
     if (ack['success'] == true) {
-      // ③ ack 成功则建立并缓存 SSH 连接（预热；执行时失活会按需重建）
-      try {
-        await _connectionManager.connect(_currentTopAgentId, config);
-      } catch (_) {
-        // 预热建连失败不阻塞启用：工具执行时会按需重建（execute 内兜底）
-      }
-      _enabled = true;
-      _config = Map<String, dynamic>.from(config);
+      // ③ ack 成功则持久化启用状态（SSH 连接由注册流程预热；执行时失活
+      // 会按需重建）
+      state.enabled = true;
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(_kEnabledKey(_currentTopAgentId), true);
-      await prefs.setString(
-          _kConfigKey(_currentTopAgentId), jsonEncode(_config));
+      await prefs.setBool(_kEnabledKey(teamId), true);
+      await prefs.setString(_kConfigKey(teamId), jsonEncode(state.config));
       notifyListeners();
     } else {
-      _enabled = false;
+      state.enabled = false;
       notifyListeners();
     }
     return ack;
   }
 
-  /// 禁用 SSH 模式：持久化关闭、关闭 SSH 连接并通知后端注销。
-  Future<void> disable() async {
-    _enabled = false;
+  /// 禁用指定 team 的 SSH 模式：持久化关闭、关闭 SSH 连接并通知后端注销。
+  Future<void> disableTeam(String teamId) async {
+    if (teamId.isEmpty) return;
+    final _SshTeamState? state = _states[teamId];
+    if (state == null) return;
+    state.enabled = false;
+    state.registered = false;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_kEnabledKey(_currentTopAgentId), false);
-    await _connectionManager.close(_currentTopAgentId);
-    _sendUnregister(_currentTopAgentId);
+    await prefs.setBool(_kEnabledKey(teamId), false);
+    await _connectionManager.close(teamId);
+    _sendUnregister(teamId);
     notifyListeners();
   }
 
-  /// 按当前顶部 agent 的持久化 SSH 状态同步注册/建连（重连/切换后调用）。
+  /// WS 重连/首连后恢复注册：仅对"已注册且启用"的 team 重新发送注册确认
+  /// 并重建 SSH 连接（不等待 ack）；未激活的 team 不注册。
   ///
-  /// 配置后端已持久化，这里仅重建 SSH 连接（若已断开）并重新发送注册确认，
-  /// 不等待 ack。
-  void syncRegistration() {
-    if (_currentTopAgentId.isEmpty) return;
-    if (_enabled && _config.isNotEmpty) {
-      // 重建（或复用）SSH 连接：失活后按配置自动重建（失败由执行时兜底）
-      unawaited(_rebuildConnection());
-      _send(<String, dynamic>{
-        'type': 'register_ssh_executor',
-        'data': <String, dynamic>{
-          'top_agent_id': _currentTopAgentId,
-          'config': _config,
-        },
-      });
+  /// 配置后端已持久化，这里仅重建 SSH 连接（若已断开）并重新发送注册确认。
+  void syncRegisteredTeams() {
+    // 断线期间挂起的 ack 永远不会到达：先清空旧队列，避免新旧注册的
+    // ack 错位匹配
+    _failAllPendingAcks('连接已断开，注册结果未知');
+    for (final _SshTeamState state in _states.values) {
+      if (state.enabled && state.config.isNotEmpty && state.registered) {
+        unawaited(_rebuildConnection(state));
+        _registerTeam(state, waitForAck: false);
+      }
     }
   }
 
-  /// 按当前配置重建（或复用）SSH 连接；失败静默忽略（工具执行时按需重建）。
-  Future<void> _rebuildConnection() async {
+  /// 按该 team 配置重建（或复用）SSH 连接；失败静默忽略（工具执行时按需重建）。
+  Future<void> _rebuildConnection(_SshTeamState state) async {
     try {
-      await _connectionManager.connect(_currentTopAgentId, _config);
+      await _connectionManager.connect(state.teamId, state.config);
     } catch (_) {
       // 建连失败不阻塞注册流程，首个工具调用会按需重建
     }
   }
 
   /// 处理后端 ack 消息（由 message_panel 在 WS 分发中调用）。
+  ///
+  /// ack 不回显 team_id，按注册消息发送顺序（FIFO）匹配到对应 team 的
+  /// per-team Completer 完成挂起等待。
   void resolveAck(Map<String, dynamic> ackData) {
-    final Completer<Map<String, dynamic>>? completer = _pendingAck;
-    _pendingAck = null;
-    if (completer != null && !completer.isCompleted) {
-      completer.complete(ackData);
+    while (_ackQueue.isNotEmpty) {
+      final _SshTeamState state = _ackQueue.removeAt(0);
+      final Completer<Map<String, dynamic>>? completer = state.pendingAck;
+      state.pendingAck = null;
+      if (completer != null && !completer.isCompleted) {
+        completer.complete(ackData);
+        return;
+      }
     }
   }
 
   /// 释放资源（应用退出时调用）。
   ///
-  /// 不注销后端 SSH 注册（配置后端持久化，注销会误删用户配置），仅关闭前端
-  /// 持有的 SSH 连接并移除工具请求处理者。
+  /// 不注销后端 SSH 注册（配置后端持久化，注销会误删用户配置），仅关闭
+  /// 前端持有的 SSH 连接、终结挂起的 ack 等待并移除工具请求/取消处理者。
   void cleanup() {
+    _failAllPendingAcks('连接已关闭');
     _ws?.removeToolExecRequestHandler(_handleToolExecRequest);
+    _ws?.removeToolExecCancelHandler(_handleToolExecCancel);
+    _hookTargets.clear();
     _ws = null;
-    _pendingAck = null;
     unawaited(_connectionManager.closeAll());
   }
 
-  /// 处理 ``tool_exec_request``：当前顶部 agent 处于 SSH 模式时经 SSH 会话
+  /// 终结所有挂起的 ack 等待（per-team Completer 以失败完成）并清空队列。
+  void _failAllPendingAcks(String message) {
+    for (final _SshTeamState state in _ackQueue) {
+      final Completer<Map<String, dynamic>>? completer = state.pendingAck;
+      state.pendingAck = null;
+      if (completer != null && !completer.isCompleted) {
+        completer.complete(<String, dynamic>{
+          'success': false,
+          'message': message,
+        });
+      }
+    }
+    _ackQueue.clear();
+  }
+
+  /// 绑定 WebSocket 服务并接管 ``tool_exec_request`` / ``tool_exec_cancel``。
+  ///
+  /// 与本地执行器共同注册为工具请求/取消处理者；本处理者仅在 SSH 模式
+  /// 启用时接管请求，取消按 hook 记录匹配。
+  void attach(WebSocketService ws) {
+    _ws = ws;
+    ws.addToolExecRequestHandler(_handleToolExecRequest);
+    ws.addToolExecCancelHandler(_handleToolExecCancel);
+  }
+
+  /// 处理 ``tool_exec_request``：请求所属 team 处于 SSH 模式时经 SSH 会话
   /// 执行并回传 ``tool_exec_response``。
   ///
-  /// 返回 `true` 表示已接管（SSH 模式启用时）；否则返回 `false` 放行。
+  /// 返回 `true` 表示已接管（该 team 的 SSH 模式已注册且启用时）；否则返回
+  /// `false` 放行。
   ///
-  /// 归属校验：请求由后端按 (user_id, top_agent_id) 广播到用户全部 WS 连接，
-  /// 消息携带 ``top_agent_id`` 时，只接管属于本执行器当前服务 agent 的请求。
-  /// 修复"同窗口先与 SSH 模式 agent 对话后切回本地 agent，工具请求被残留
-  /// SSH 启用态误截获发往错误远端主机"的问题（findstr 等命令随机连不通）。
+  /// 归属校验（集合化）：请求由后端按 (user_id, team_id) 广播到用户全部 WS
+  /// 连接，仅接管"本前端已注册且启用 SSH 模式"的 team——按请求 payload 的
+  /// ``team_id`` 查 per-team 状态，不读"当前选中 agent"槽位，避免残留其他
+  /// team 的 SSH 启用态把请求误截获发往错误远端主机。
   bool _handleToolExecRequest(Map<String, dynamic> message) {
-    if (!_enabled) return false;
     final Map<String, dynamic> data =
         (message['data'] as Map<String, dynamic>?) ?? <String, dynamic>{};
-    final String execId = (data['exec_id'] as String?) ?? '';
-    if (execId.isEmpty) return false;
-    // 归属校验：请求明确属于其他顶部 agent 时不接管（放行给正确执行器/实例）
-    final String reqAgent = (data['top_agent_id'] as String?) ?? '';
-    if (reqAgent.isNotEmpty && reqAgent != _currentTopAgentId) return false;
+    final String toolId = (data['tool_id'] as String?) ?? '';
+    final String reqTeam = (data['team_id'] as String?) ?? '';
+    // payload 校验：tool_id 缺失时后端 pending 无法定位、本端无法回包，放行
+    if (toolId.isEmpty) return false;
+    // team_id 缺失：直接快速失败回包，避免后端 pending 空等 120s
+    if (reqTeam.isEmpty) {
+      _sendToolExecResponse(toolId, <String, dynamic>{
+        'success': false,
+        'error': 'missing team_id/tool_id',
+      });
+      return true;
+    }
+    final _SshTeamState? state = _states[reqTeam];
+    if (state == null || !state.enabled || !state.registered) {
+      return false;
+    }
     final String workspaceId = (data['workspace_id'] as String?) ?? '';
     final String op = (data['op'] as String?) ?? '';
 
-    _workspaceExecutor.execute(workspaceId, op, data)
+    // hook 模式：记录 tool_id → (team, workspace, pidfile)，供取消时定位；
+    // hook 执行结束（正常/出错）后移除记录
+    if (op == 'exec_shell_hook') {
+      final String outputFile = (data['output_file'] as String?) ?? '';
+      _hookTargets[toolId] = _SshHookTarget(
+        teamId: reqTeam,
+        workspaceId: workspaceId,
+        pidfile: outputFile.isEmpty ? '' : '$outputFile.pid',
+      );
+    }
+
+    // 按请求 team 构建执行器：连接与路径映射都用该 team 自己的配置，
+    // 执行 A team 请求时不会读到 B team 的配置（per-team 隔离）
+    SshWorkspaceExecutor(_connectionManager, teamId: reqTeam,
+            config: state.config)
+        .execute(workspaceId, op, data)
         .then((Map<String, dynamic> result) {
-      _sendToolExecResponse(execId, result);
+      if (op == 'exec_shell_hook') {
+        _hookTargets.remove(toolId);
+      }
+      _sendToolExecResponse(toolId, result);
     }).catchError((Object error) {
-      _sendToolExecResponse(execId, <String, dynamic>{
+      _hookTargets.remove(toolId);
+      _sendToolExecResponse(toolId, <String, dynamic>{
         'error': error.toString(),
       });
     });
     return true;
   }
 
+  /// 处理 ``tool_exec_cancel``：终止对应 hook 的远端后台进程。
+  ///
+  /// 按 tool_id 找到 hook 启动时记录的 team/workspace/pidfile（payload 中
+  /// 的 pidfile 优先），经该 team 的 SSH 会话执行 ``kill -TERM``（尽力终止）。
+  /// 不立即回执：远端 wrapped 命令的 wait 在进程退出后返回，hook 请求随即
+  /// 回传退出码，后端据此把任务落定为 cancelled（与本地执行器语义一致）。
+  void _handleToolExecCancel(Map<String, dynamic> message) {
+    final Map<String, dynamic> data =
+        (message['data'] as Map<String, dynamic>?) ?? <String, dynamic>{};
+    final String toolId = (data['tool_id'] as String?) ?? '';
+    if (toolId.isEmpty) return;
+    final _SshHookTarget? target = _hookTargets.remove(toolId);
+    if (target == null) return; // 非本端 hook（本地模式/已结束），静默忽略
+    final String payloadPidfile = (data['pidfile'] as String?) ?? '';
+    final String pidfile = payloadPidfile.isNotEmpty ? payloadPidfile : target.pidfile;
+    if (pidfile.isEmpty) return;
+    final _SshTeamState? state = _states[target.teamId];
+    if (state == null || state.config.isEmpty) return;
+    unawaited(
+      SshWorkspaceExecutor(_connectionManager,
+              teamId: target.teamId, config: state.config)
+          .cancelHook(target.workspaceId, pidfile),
+    );
+  }
+
   /// 回传一次工具执行结果（``tool_exec_response``，格式对齐 LocalExecutorService）。
-  void _sendToolExecResponse(String execId, Map<String, dynamic> result) {
+  void _sendToolExecResponse(String toolId, Map<String, dynamic> result) {
     _send(<String, dynamic>{
       'type': 'tool_exec_response',
       'data': <String, dynamic>{
-        'exec_id': execId,
+        'tool_id': toolId,
         'result': result,
       },
     });
   }
 
-  /// 发送注册消息并等待 ack（超时 15 秒）
-  Future<Map<String, dynamic>> _register(Map<String, dynamic> config) async {
-    if (_currentTopAgentId.isEmpty) {
-      return <String, dynamic>{'success': false, 'message': '未选择顶部 agent'};
+  /// 发送指定 team 的注册消息并按需等待 ack。
+  ///
+  /// 发送时即乐观置位 registered：后端处理注册后即开始向本端转发工具请求，
+  /// 此时该 team 的配置已知可直接接管；ack 失败再回退。
+  ///
+  /// [waitForAck] 为 false 时（WS 重连恢复注册场景）不等待结果：ack 由
+  /// [resolveAck] 按 FIFO 匹配后丢弃。
+  Future<Map<String, dynamic>> _registerTeam(
+    _SshTeamState state, {
+    bool waitForAck = true,
+  }) {
+    if (state.teamId.isEmpty) {
+      return Future<Map<String, dynamic>>.value(
+        <String, dynamic>{'success': false, 'message': '未选择顶部 agent'},
+      );
     }
     final Completer<Map<String, dynamic>> completer =
         Completer<Map<String, dynamic>>();
-    _pendingAck = completer;
+    state.pendingAck = completer;
+    state.registered = true;
+    _ackQueue.add(state);
     _send(<String, dynamic>{
       'type': 'register_ssh_executor',
       'data': <String, dynamic>{
-        'top_agent_id': _currentTopAgentId,
-        'config': config,
+        'team_id': state.teamId,
+        'config': state.config,
       },
     });
+    if (!waitForAck) {
+      unawaited(completer.future.then<void>((_) {
+        if (identical(state.pendingAck, completer)) {
+          state.pendingAck = null;
+        }
+      }));
+      return Future<Map<String, dynamic>>.value(
+        <String, dynamic>{'success': true},
+      );
+    }
+    return _awaitAck(state, completer);
+  }
+
+  /// 等待指定 team 的注册 ack（超时 15 秒）；成功后预热该 team 的 SSH 连接。
+  Future<Map<String, dynamic>> _awaitAck(
+    _SshTeamState state,
+    Completer<Map<String, dynamic>> completer,
+  ) async {
     try {
-      return await completer.future.timeout(
+      final Map<String, dynamic> ack = await completer.future.timeout(
         const Duration(seconds: 15),
         onTimeout: () {
           return <String, dynamic>{'success': false, 'message': '等待后端确认超时'};
         },
       );
-    } finally {
-      if (identical(_pendingAck, completer)) {
-        _pendingAck = null;
+      if (ack['success'] == true) {
+        // 预热建连（失败不阻塞注册流程，工具执行时按需重建）
+        unawaited(_rebuildConnection(state));
+      } else {
+        state.registered = false;
       }
+      return ack;
+    } finally {
+      if (identical(state.pendingAck, completer)) {
+        state.pendingAck = null;
+      }
+      _ackQueue.remove(state);
     }
   }
 
-  void _sendUnregister(String topAgentId) {
+  void _sendUnregister(String teamId) {
     _send(<String, dynamic>{
       'type': 'unregister_ssh_executor',
-      'data': <String, dynamic>{'top_agent_id': topAgentId},
+      'data': <String, dynamic>{'team_id': teamId},
     });
   }
 

@@ -64,6 +64,16 @@ async def lifespan(app: FastAPI):
 
     load_user_levels()
 
+    # 启动时全量清理过期登录 token（auth_tokens 表；verify 路径另有小概率惰性清理）
+    from data.auth_token_store import purge_expired as purge_expired_auth_tokens
+
+    try:
+        removed_tokens = purge_expired_auth_tokens()
+        if removed_tokens:
+            print(f"[启动] 已清理 {removed_tokens} 个过期登录 token")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[启动] 清理过期登录 token 失败: {exc}")
+
     # 本地执行器客户端：本地模式下工具调用经反向 WS 转发给前端本地执行
     local_executor = LocalExecutorClient()
     # 绑定主事件循环，供后台线程通过 run_coroutine_threadsafe 安全推送 WS 消息

@@ -18,4 +18,13 @@ logger = logging.getLogger(__name__)
 
 
 class SSHWorkspaceIO(LocalWorkspaceIO):
-    """SSH 模式实现：与本地模式相同，工具调用委托前端执行器（前端建连 SSH）。"""
+    """SSH 模式实现：与本地模式相同，工具调用委托前端执行器（前端建连 SSH）。
+
+    hook 模式同样继承 :meth:`LocalWorkspaceIO.exec_shell_hook` /
+    :meth:`LocalWorkspaceIO.cancel_exec_hook`（完成回执与取消链路与 local
+    一致），**不实现** :meth:`io_.workspace_io.WorkspaceIO.exec_shell_no_timeout`
+    （那是云端后端线程直连容器的路径）。差异仅在于命令内容由
+    ``tool.hook_manager`` 包装：wrapped 自带 ``> output_file 2>&1`` 重定向
+    （前端 dartssh2 不流式写输出文件）与 pidfile（供取消时远端 kill），``cd``
+    到远端工作空间根由前端拼接。
+    """

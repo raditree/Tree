@@ -49,12 +49,12 @@ async def main_async() -> None:
         req = json.loads(await ws.recv())
         print("req:", json.dumps(req, ensure_ascii=False)[:180])
         assert req["type"] == "tool_exec_request"
-        exec_id = req["data"]["exec_id"]
+        tool_id = req["data"]["tool_id"]
         await ws.send(
             json.dumps(
                 {
                     "type": "tool_exec_response",
-                    "data": {"exec_id": exec_id, "result": {"exit_code": 1, "stdout": ""}},
+                    "data": {"tool_id": tool_id, "result": {"exit_code": 1, "stdout": ""}},
                 }
             )
         )

@@ -1,0 +1,57 @@
+# Tasks
+
+- [ ] Task 1: 搭建嵌入式 SSH 测试服务器（`server/tests/ssh_perf/ssh_test_server.py`）
+  - [ ] SubTask 1.1: paramiko `ServerInterface` 实现密码认证、exec 通道、SFTP 通道（自实现 `SFTPServerInterface`，根目录为临时目录）
+  - [ ] SubTask 1.2: 支持 `--host/--port/--max-connections/--root` 参数与并发连接数限制
+  - [ ] SubTask 1.3: 故障注入接口：延迟、限速、主动断连、优雅/强制停止
+  - [ ] SubTask 1.4: 自检：paramiko 客户端 + dartssh2 客户端均可连接、执行命令、SFTP 读写
+- [ ] Task 2: 统一指标采集与统计模块（`server/tests/ssh_perf/metrics.py`）
+  - [ ] SubTask 2.1: 指标模型：连接建立/释放耗时、单次调用延迟、吞吐、错误、内存 RSS、CPU%、网络收发字节
+  - [ ] SubTask 2.2: JSONL 落盘 + 汇总统计（p50/p95/p99/均值/错误率/QPS）
+  - [ ] SubTask 2.3: psutil 周期采样器（进程内存/CPU/网络，可指定采样间隔）
+- [ ] Task 3: 后端转发层压测脚本（`server/tests/ssh_perf/backend_stress.py`）
+  - [ ] SubTask 3.1: 进程内启动 uvicorn（复用 `main:app`），生成 N=300+ 用户 JWT token
+  - [ ] SubTask 3.2: 模拟前端：每条 WS 连接接收 `tool_exec_request`，经 paramiko 连嵌入式 SSH 服务器执行后回传 `tool_exec_response`
+  - [ ] SubTask 3.3: 并发驱动 `state.local_executor.request()`（多线程模拟工具消费线程），混合 op（exec_shell/read_file/write_file/list_files）
+  - [ ] SubTask 3.4: 记录连接建立/释放时间、吞吐、错误率；结束后检查 `_pending`/`connections` 残留
+- [ ] Task 4: 前端 dartssh2 连接层压测脚本（`tool/ssh_perf/ssh_dart_load.dart`）
+  - [ ] SubTask 4.1: 直接复用 `lib/io/ssh_connection_manager.dart` 与 `lib/io/ssh_workspace_executor.dart`（纯 Dart，`dart run`）
+  - [ ] SubTask 4.2: 300 并发建连/释放计时；并发 exec/SFTP 混合操作吞吐与错误率
+  - [ ] SubTask 4.3: 连接缓存/失活重建行为验证；进程 RSS（`ProcessInfo.currentRss`）趋势采样
+- [ ] Task 5: 多 agent/teammates 资源竞争测试（`server/tests/ssh_perf/contention_test.py` + Dart 侧竞争用例）
+  - [ ] SubTask 5.1: 同 top agent + K 个 teammates 并发 exec / SFTP 写同一与各自目录
+  - [ ] SubTask 5.2: 校验路径映射隔离（top→base，成员→base/workspaces/{id}）与并发 `mkdir` 竞态
+  - [ ] SubTask 5.3: 检查无死锁、无跨工作空间串扰、SFTP 句柄正确释放
+- [ ] Task 6: 异常注入与风险点专项测试（`server/tests/ssh_perf/fault_test.py`）
+  - [ ] SubTask 6.1: WS 断连/杀 SSH 服务器/响应超时风暴/无响应前端 四类注入
+  - [ ] SubTask 6.2: 检查 `_pending` 无泄漏、连续超时自动停用生效、恢复注册可用
+  - [ ] SubTask 6.3: 连接/SFTP 通道释放与 fd 数量检查（SSH 服务器侧统计活动连接）
+- [ ] Task 7: 耐久性压测脚本（`server/tests/ssh_perf/durability.py`，面向 7×24 设计）
+  - [ ] SubTask 7.1: 固定 QPS 混合负载循环 + 周期指标采样 + JSONL 记录 + 崩溃自愈（异常后继续）
+  - [ ] SubTask 7.2: 支持 `--duration` 与 `--qps`，默认设计为 7×24；执行期内运行代表性时长采集实测数据
+- [ ] Task 8: 执行压测并收集数据
+  - [ ] SubTask 8.1: 运行 Task 3/4/5/6/7 全部场景，输出 JSONL 与汇总
+  - [ ] SubTask 8.2: 记录环境配置（OS/Python/Dart/paramiko/dartssh2 版本、测试服务器参数）
+- [ ] Task 9: 数据分析与问题定位
+  - [ ] SubTask 9.1: 对照五类风险点逐项给出结论与复现
+  - [ ] SubTask 9.2: 识别需要修复的关键问题（如有）并给出最小修复方案
+- [ ] Task 10: 关键问题修复与复测（条件性）
+  - [ ] SubTask 10.1: 对 Task 9 认定的阻塞性/高危问题实施最小化修复
+  - [ ] SubTask 10.2: 重跑相关用例验证通过，记录修复前后对比
+- [ ] Task 11: 编写详细测试报告（`docs/test_report_ssh_io_toolchain.md`）
+  - [ ] SubTask 11.1: 测试环境配置、测试用例设计、实测数据（表格/趋势）、问题分析、优化建议
+  - [ ] SubTask 11.2: 7×24 耐久测试完整方法论说明（脚本用法、指标口径、预期结论）
+
+# Task Dependencies
+
+- [Task 1] 无依赖（先行）
+- [Task 2] 依赖 [Task 1]（指标可独立开发，但压测脚本依赖其汇总能力）
+- [Task 3] 依赖 [Task 1]、[Task 2]
+- [Task 4] 依赖 [Task 1]、[Task 2]
+- [Task 5] 依赖 [Task 1]、[Task 2]（Dart 侧竞争依赖 [Task 4]）
+- [Task 6] 依赖 [Task 1]、[Task 2]
+- [Task 7] 依赖 [Task 1]、[Task 2]
+- [Task 8] 依赖 [Task 3]-[Task 7]（可并行执行各场景）
+- [Task 9] 依赖 [Task 8]
+- [Task 10] 依赖 [Task 9]（若无关键问题则跳过）
+- [Task 11] 依赖 [Task 8]、[Task 9]、[Task 10]

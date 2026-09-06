@@ -110,7 +110,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   Future<void> _handleNavigateToQuestion({
     required bool isMember,
     required String agentId,
-    required String topAgentId,
+    required String teamId,
     required String sessionId,
     required String messageId,
   }) async {
@@ -118,7 +118,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       // 成员提问：打开成员进度详情窗口并滚动定位
       Agent? leader;
       for (final Agent a in _agents) {
-        if (a.id == topAgentId) {
+        if (a.id == teamId) {
           leader = a;
           break;
         }
@@ -219,22 +219,22 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
 
   /// 删除指定 agent（连同其对话历史），并同步后端
   ///
-  /// 若删除的是当前选中的 agent，则清除选中态，并注销其本地执行器，
-  /// 避免删除/重建后旧注册残留导致新 agent 走错执行通道。
+  /// 按 teamId 注销该 agent 的执行器（注销后端注册、关闭 SSH 连接、清理
+  /// per-team 内存状态），无论其是否为当前选中 agent——避免删除/重建后
+  /// 旧注册残留导致新 agent 走错执行通道。
   Future<void> _handleDeleteAgent(Agent agent) async {
     try {
       await ApiService.deleteAgent(agent.id);
       if (!mounted) return;
       setState(() {
         _agents.removeWhere((a) => a.id == agent.id);
+        // 注销该 team 的本地执行器（后端清注册，前端移除状态）
+        LocalExecutorService.instance.deactivateTeam(agent.id);
+        // 注销该 team 的 SSH 执行器（后端清注册并删除该 agent 的 SSH 配置，
+        // 前端关闭连接并移除状态）
+        unawaited(SshExecutorService.instance.deactivateTeam(agent.id));
         if (_selectedAgent?.id == agent.id) {
           _selectedAgent = null;
-          // 注销当前顶部 agent 的本地执行器（后端清注册，前端复位状态）
-          LocalExecutorService.instance.unregister();
-          LocalExecutorService.instance.setCurrentTopAgent('');
-          // 注销当前顶部 agent 的 SSH 执行器（后端删除该 agent 的 SSH 配置）
-          unawaited(SshExecutorService.instance.disable());
-          SshExecutorService.instance.setCurrentTopAgent('');
         }
       });
     } catch (e) {
@@ -402,7 +402,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
               : FilePanel(
                   key: ValueKey(workspaceId),
                   workspaceId: workspaceId,
-                  topAgentId: _selectedAgent?.id,
+                  teamId: _selectedAgent?.id,
                   sessionId: _currentSessionId,
                   onNavigateToQuestion: _handleNavigateToQuestion,
                 ),
@@ -651,7 +651,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     return FilePanel(
       key: ValueKey(workspaceId),
       workspaceId: workspaceId,
-      topAgentId: _selectedAgent?.id,
+      teamId: _selectedAgent?.id,
       sessionId: _currentSessionId,
       onCollapse: () {
         setState(() {

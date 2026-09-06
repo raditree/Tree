@@ -88,7 +88,7 @@ server/
 
 ## 三运行模式
 
-工具执行统一抽象为 `WorkspaceIO`，按 `(user_id, top_agent_id)` 判定模式（`local > ssh > cloud`）：
+工具执行统一抽象为 `WorkspaceIO`，按 `(user_id, team_id)` 判定模式（`local > ssh > cloud`）：
 
 | 模式 | 执行位置 | 实现 |
 | --- | --- | --- |

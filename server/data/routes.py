@@ -109,6 +109,7 @@ class LoginRequest(BaseModel):
 
     username: str
     password: str
+    device: str = ""  # 可选设备备注名（多设备登录态管理，缺省空串）
 
 
 def _strip_sensitive_fields(user: Dict[str, Any]) -> Dict[str, Any]:
@@ -167,7 +168,7 @@ async def auth_login(request: Request, req: LoginRequest):
     if user is None:
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     public_user = _strip_sensitive_fields(user)
-    token = create_token(public_user)
+    token = create_token(public_user, device=req.device)
     return {"token": token, "user": public_user}
 
 

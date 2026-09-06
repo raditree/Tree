@@ -41,7 +41,7 @@ def _make_tool():
             user_id="u1",
             agent_id="top1",
             leader_id="",
-            top_agent_id="top1",
+            team_id="top1",
         )
     tool.members = [{
         "id": "m1",

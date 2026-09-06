@@ -138,7 +138,7 @@ class TestLiveStatus(unittest.TestCase):
             user_id="u1",
             agent_id="top1",
             leader_id="",
-            top_agent_id="top1",
+            team_id="top1",
         )
         # 表/内存中残留假 working（历史遗留），但 _active_tasks 无登记
         tool.members = [{"id": "m1", "name": "成员", "work_status": "working"}]
@@ -167,7 +167,7 @@ class TestLiveStatus(unittest.TestCase):
             user_id="u1",
             agent_id="top1",
             leader_id="",
-            top_agent_id="top1",
+            team_id="top1",
         )
         tool.members = [{"id": "m1", "name": "成员", "work_status": "idle"}]
         result = tool._action_update_member(

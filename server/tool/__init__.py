@@ -102,7 +102,7 @@ def register_builtin_tools(
     ws_manager: Optional[WebSocketManager] = None,
     agent_id: str = "",
     leader_id: str = "",
-    top_agent_id: str = "",
+    team_id: str = "",
     local_executor: Optional[Any] = None,
     message_dispatcher: Optional[Callable] = None,
     extra_info_refresher: Optional[Callable[[], dict]] = None,
@@ -123,7 +123,7 @@ def register_builtin_tools(
                        向用户推送问题卡片
     :param agent_id: 当前 agent 的 ID
     :param leader_id: 当前 agent 的上级 leader ID
-    :param top_agent_id: 顶层 agent 的 ID（团队成员共享顶层工作空间）
+    :param team_id: 顶层 agent 的 ID（团队成员共享顶层工作空间）
     :param local_executor: 可选，本地执行器客户端（本地模式下提供，否则使用云端容器）
     :param message_dispatcher: 消息投递回调
     :param extra_info_refresher: 额外信息刷新回调
@@ -142,18 +142,24 @@ def register_builtin_tools(
     # 工具经 refresh 列出、set 选择、mcp call 调用，而非直接作为 tool 注入。
     workspace_id = getattr(session, "workspace_id", "") or ""
 
-    # 本地模式按顶部 agent 单独控制：以 top_agent_id 为判定键（顶部 agent 自身
-    # 会话 top_agent_id == agent_id；成员会话 top_agent_id 为其所属顶部 agent）。
+    # 本地模式按顶部 agent 单独控制：以 team_id 为判定键（顶部 agent 自身
+    # 会话 team_id == agent_id；成员会话 team_id 为其所属顶部 agent）。
     # 经 ModeResolver 统一判定三模式（local > ssh > cloud），SSH 与 local 均
     # 在进程内调用（后端直接转发），仅 cloud 使用 stdio 子进程。
-    mode_key = top_agent_id or agent_id or user_id
+    mode_key = team_id or agent_id or user_id
     from io_.mode_resolver import resolve_mode
 
     mode = resolve_mode(user_id, mode_key)
+    # tool_exec_request 归属标识：注册/执行均以顶部 agent ID（team_id）为键，
+    # 顶层会话 team_id == agent_id；两者都缺时回退 mode_key（含 user_id 的
+    # 历史兜底），但正常链路经入口校验 team_id 必非空。
+    request_team_id = team_id or agent_id or mode_key
     if mode == "local":
         # 本地模式：工作空间 IO 通过反向 WS 到前端本地执行器，本进程内调用
         from io_.workspace_io import LocalWorkspaceIO
-        io = LocalWorkspaceIO(local_executor, ws_manager, user_id)
+        io = LocalWorkspaceIO(
+            local_executor, ws_manager, user_id, team_id=request_team_id
+        )
         mcp_manager.register_service(
             "workspace",
             {
@@ -171,7 +177,10 @@ def register_builtin_tools(
     elif mode == "ssh":
         # SSH 模式：SSH 连接由前端发起，后端经反向 WS 委托前端执行，本进程内调用
         from io_.ssh_workspace_io import SSHWorkspaceIO
-        io = SSHWorkspaceIO(state.local_executor, state.ws_manager, user_id)
+        io = SSHWorkspaceIO(
+            state.local_executor, state.ws_manager, user_id,
+            team_id=request_team_id,
+        )
         mcp_manager.register_service(
             "workspace",
             {
@@ -219,14 +228,14 @@ def register_builtin_tools(
     )
     team_tool = TeamTool(
         session, docker_manager, model_configs, broker=broker, user_id=user_id,
-        agent_id=agent_id, leader_id=leader_id, top_agent_id=top_agent_id,
+        agent_id=agent_id, leader_id=leader_id, team_id=team_id,
         message_dispatcher=message_dispatcher, io=io,
         # 透传当前会话：成员上下文按 session 隔离
         session_id=session_id,
     )
     ask_tool = AskUserQuestionTool(
         ws_manager=ws_manager, user_id=user_id,
-        agent_id=agent_id, top_agent_id=top_agent_id or agent_id,
+        agent_id=agent_id, team_id=team_id or agent_id,
         session_id=session_id, is_member=is_member,
         # 透传会话：提问时读取 session.sender_id 持久化原发送方，
         # 供成员续跑后总结精确回发（"谁发给它的就回发给谁"）

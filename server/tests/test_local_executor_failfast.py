@@ -92,8 +92,8 @@ class TestLocalExecutorFailFast(unittest.TestCase):
         t = threading.Thread(target=do_request)
         t.start()
         msg = ws.wait_message()
-        exec_id = msg["data"]["exec_id"]
-        self.assertTrue(client.resolve("f2", exec_id, {"exit_code": 0, "content": "hi"}))
+        tool_id = msg["data"]["tool_id"]
+        self.assertTrue(client.resolve("f2", tool_id, {"exit_code": 0, "content": "hi"}))
         t.join(timeout=8)
         self.assertEqual(box["res"], {"exit_code": 0, "content": "hi"})
         # 成功已清零计数
@@ -138,8 +138,8 @@ class TestLocalExecutorFailFast(unittest.TestCase):
         t = threading.Thread(target=do_request)
         t.start()
         msg = ws.wait_message()
-        exec_id = msg["data"]["exec_id"]
-        self.assertTrue(client.resolve("f4", exec_id, {"exit_code": 0, "content": "hi"}))
+        tool_id = msg["data"]["tool_id"]
+        self.assertTrue(client.resolve("f4", tool_id, {"exit_code": 0, "content": "hi"}))
         t.join(timeout=8)
         self.assertEqual(box["res"], {"exit_code": 0, "content": "hi"})
         self.assertFalse(client._is_cold("f4"))

@@ -52,189 +52,265 @@ String? resolveShellForDir(String path) {
 /// LocalBackendService）：切换开关只改变"工具执行位置"，不再启动任何
 /// 本地 Python 后端进程。
 ///
-/// 本地模式按顶部 agent 单独控制：开关与工作目录以顶部 agent 为单位持久化，
-/// 通过 [setCurrentTopAgent] 指定当前操作的顶部 agent；[register] 会把
-/// ``top_agent_id`` 一并发送给后端，使不同顶部 agent 可分别处于本地/云端模式。
+/// 本地模式按顶部 agent（team）单独控制：开关与工作目录以顶部 agent 为单位
+/// 持久化，内部状态为 per-team 的 ``Map<teamId, _LocalTeamState>``；所有执行
+/// 路径按请求 payload 的 ``team_id`` 查找对应状态，与"当前选中 agent"解耦。
+/// 注册由懒激活驱动：消息发送前 [ensureTeam] 幂等地加载并注册已启用的 team，
+/// WS 重连后 [syncRegisteredTeams] 恢复"已注册且启用"team 的注册。
 ///
-/// 工作空间路径映射（与后端 ``docker_manager._local_workspace_path`` 一致）：
-/// - 顶级 agent（workspace_id == "top"）→ 用户选择的工作目录 <baseDir>
-/// - 其他 agent → <baseDir>/workspaces/{workspace_id}
+/// 工作空间路径映射（与后端协同布局保持一致）：
+/// - 顶级 agent 与团队成员的工作根统一为用户选择的工作目录 <baseDir>；
+/// - 各 agent 的私人记忆空间（``.self`` 令牌路径）按 workspace_id
+///   分目录落 <baseDir>/agentspace/{workspace_id}/.self（workspace_id =
+///   顶层的 teamId / 成员的 member_id）。
+
+/// 大文件分片上传会话状态（本地执行器）。
+///
+/// 后端分片通道（upload_init/chunk/complete）按 upload_id 关联：init 打开
+/// 文件句柄并记录分片/总大小，chunk 按偏移追加，complete 关闭句柄并校验。
+class _LocalUploadSession {
+  _LocalUploadSession({
+    required this.raf,
+    required this.relPath,
+    required this.fullPath,
+    this.chunkSize = 4 * 1024 * 1024,
+    this.totalSize = 0,
+  });
+
+  /// 已打开的本地文件句柄（FileMode.write，截断写）
+  final RandomAccessFile raf;
+
+  /// 工作空间内相对路径（如 ``.input/20260906/big.bin``）
+  final String relPath;
+
+  /// 本机绝对路径（complete 后校验大小用）
+  final String fullPath;
+
+  /// 分片大小（后端 upload_init 下发，chunk 偏移 = index × chunkSize）
+  final int chunkSize;
+
+  /// 期望总大小（complete 时校验；0 表示不校验）
+  final int totalSize;
+
+  /// 已接收字节数（记录用）
+  int received = 0;
+}
+
+/// 单个顶部 agent（team）的本地执行器状态。
+class _LocalTeamState {
+  _LocalTeamState({required this.teamId});
+
+  /// 顶部 agent（team）ID
+  final String teamId;
+
+  /// 本地执行模式是否启用（持久化）
+  bool enabled = false;
+
+  /// 本地工作目录（持久化）
+  String baseDir = '';
+
+  /// 是否已向后端注册本地执行器
+  bool registered = false;
+}
+
 class LocalExecutorService extends ChangeNotifier {
   LocalExecutorService._();
 
   /// 全局单例
   static final LocalExecutorService instance = LocalExecutorService._();
 
-  /// 当前选中的顶部 agent ID（本地模式按此单独控制）
-  String _currentTopAgentId = '';
-
-  /// SharedPreferences 键前缀（后接顶部 agent ID，实现按顶部 agent 持久化）
+  /// SharedPreferences 键前缀（后接团队 ID，实现按顶部 agent 持久化）
   static const String _kEnabledPrefix = 'local_exec_enabled_';
   static const String _kWorkDirPrefix = 'local_exec_working_dir_';
 
-  static String _kEnabledKey(String topAgentId) => '$_kEnabledPrefix$topAgentId';
-  static String _kWorkDirKey(String topAgentId) => '$_kWorkDirPrefix$topAgentId';
+  static String _kEnabledKey(String teamId) => '$_kEnabledPrefix$teamId';
+  static String _kWorkDirKey(String teamId) => '$_kWorkDirPrefix$teamId';
 
   /// 承载当前 WebSocket 通道的服务（用于接收请求与回传结果）
   WebSocketService? _ws;
 
-  /// hook 模式分离进程集合：exec_id -> Process（可被 kill 终止）。
+  /// hook 模式分离进程集合：tool_id -> Process（可被 kill 终止）。
   ///
   /// 本地模式长任务（terminal hook）由 [Process.start] 托管句柄，进程退出时
   /// 回传 ``tool_exec_response``；取消时经 ``tool_exec_cancel`` 触发 [killProcess]。
   final Map<String, Process> _hookProcesses = <String, Process>{};
 
-  /// 当前顶部 agent 的本地工作目录
-  String _baseDir = '';
-
-  /// 当前顶部 agent 的本地执行模式是否启用（持久化）
-  bool _enabled = false;
-  bool get enabled => _enabled;
-
-  /// 已向后端注册过本地执行器的顶部 agent 集合。
+  /// 大文件分片上传会话：upload_id -> 上传状态（已打开文件句柄 + 已写入偏移）。
   ///
-  /// [_currentTopAgentId] 只反映当前选中的顶部 agent，而切换顶部 agent 时
-  /// 后端不会自动注销旧注册；若清理时只注销当前 agent，残留注册会让后端
-  /// 继续向本端转发工具请求而无人响应（每次请求空等 120s，表现为发消息卡死）。
-  /// 因此单独记录所有注册过的顶部 agent，[cleanup] 时逐一注销。
-  final Set<String> _registeredTopAgents = <String>{};
+  /// 后端 REST 分片通道（init/chunk/complete）按 upload_id 转发到本端，
+  /// init 时打开文件句柄，chunk 按 offset 追加，complete 时关闭并校验。
+  final Map<String, _LocalUploadSession> _uploadSessions =
+      <String, _LocalUploadSession>{};
 
-  /// 当前顶部 agent 的工作目录（持久化）
-  String get workingDirectory => _baseDir;
-
-  /// 当前顶部 agent 是否已注册本地执行器
-  bool _registered = false;
-  bool get registered => _registered;
-
-  /// 当前服务的顶部 agent ID（供请求归属校验）
-  String get currentTopAgentId => _currentTopAgentId;
-
-  /// 切换当前操作的顶部 agent，并重置其本地状态（下次 [loadSettings] 后生效）。
+  /// per-team 状态：team_id -> 本地执行器状态。
   ///
-  /// 不会自动注销上一个顶部 agent——各顶部 agent 的本地模式相互独立，
-  /// 注销只发生在用户显式关闭该 agent 的本地模式时。
-  void setCurrentTopAgent(String topAgentId) {
-    if (topAgentId == _currentTopAgentId) return;
-    _currentTopAgentId = topAgentId;
-    _enabled = false;
-    _baseDir = '';
-    _registered = false;
+  /// 所有执行路径按请求 payload 的 ``team_id`` 查找状态，与"当前选中
+  /// agent"解耦；条目由 [loadTeamSettings] / [ensureTeam] 懒创建。
+  final Map<String, _LocalTeamState> _states = <String, _LocalTeamState>{};
+
+  /// 指定 team 的本地执行模式是否已启用（无状态时视为未启用，供 UI 显示）
+  bool isTeamEnabled(String teamId) => _states[teamId]?.enabled ?? false;
+
+  /// 指定 team 的本地工作目录（无状态时返回空串，供 UI 显示）
+  String teamWorkingDirectory(String teamId) => _states[teamId]?.baseDir ?? '';
+
+  /// 读取指定 team 的持久化设置到内存状态（不触发注册，供 UI 显示/预填）。
+  Future<void> loadTeamSettings(String teamId) async {
+    if (teamId.isEmpty) return;
+    final _LocalTeamState state =
+        _states.putIfAbsent(teamId, () => _LocalTeamState(teamId: teamId));
+    await _loadTeamSettings(state);
+  }
+
+  /// 从 SharedPreferences 恢复单个 team 的设置。
+  ///
+  /// 竞态防护：等待期间该条目可能已被 [deactivateTeam] 移除或替换，
+  /// 丢弃过期恢复结果（否则已删除 team 的设置会被写回内存态）。
+  Future<void> _loadTeamSettings(_LocalTeamState state) async {
+    final String id = state.teamId;
+    final SharedPreferences prefs = await SharedPreferences.getInstance();
+    if (!identical(_states[id], state)) return;
+    state.enabled = prefs.getBool(_kEnabledKey(id)) ?? false;
+    state.baseDir = prefs.getString(_kWorkDirKey(id)) ?? '';
+  }
+
+  /// 懒激活指定 team 的本地执行器（幂等）。
+  ///
+  /// - 状态不存在：创建并从 SharedPreferences 恢复设置；
+  /// - 已启用且配置了工作目录但未注册：执行注册流程；
+  /// - 未启用 / 未配置目录：静默返回（后端按"无执行器"回落云端执行）。
+  Future<void> ensureTeam(String teamId) async {
+    if (teamId.isEmpty) return;
+    _LocalTeamState? state = _states[teamId];
+    if (state == null) {
+      final _LocalTeamState created = _LocalTeamState(teamId: teamId);
+      _states[teamId] = created;
+      await _loadTeamSettings(created);
+      state = _states[teamId];
+      if (state == null) return; // 等待期间被 deactivateTeam 移除
+    }
+    if (isMobile) return; // 移动端不支持本地执行模式，不注册
+    if (state.enabled && state.baseDir.isNotEmpty && !state.registered) {
+      _registerTeam(state);
+    }
+  }
+
+  /// 注销指定 team 的本地执行器并移除其状态（删除顶部 agent 时调用）：
+  /// 通知后端该 team 恢复云端执行，并清理内存状态。
+  void deactivateTeam(String teamId) {
+    if (teamId.isEmpty) return;
+    if (_states.remove(teamId) == null) return;
+    _sendUnregister(teamId);
     notifyListeners();
   }
 
-  /// 从 SharedPreferences 恢复当前顶部 agent 的本地执行模式设置
-  Future<void> loadSettings() async {
-    final String id = _currentTopAgentId;
-    final prefs = await SharedPreferences.getInstance();
-    // 竞态防护：等待期间可能已切换顶部 agent，丢弃过期恢复结果
-    // （否则旧 agent 的持久化设置会被写回当前 agent 的内存态）
-    if (id != _currentTopAgentId) return;
-    _enabled = prefs.getBool(_kEnabledKey(id)) ?? false;
-    _baseDir = prefs.getString(_kWorkDirKey(id)) ?? '';
-  }
-
-  /// 设置当前顶部 agent 的本地执行模式开关。
+  /// 启用/禁用指定 team 的本地执行模式（模式切换弹窗调用）。
   ///
   /// 开启时若已有工作目录立即注册本地执行器；关闭时注销并恢复云端执行。
   /// 不启动任何本地进程——工具执行位置由后端通过反向 WS 转发决定。
   /// 移动端（Android/iOS）无桌面文件系统访问能力，禁止开启。
-  Future<void> setEnabled(bool value) async {
+  Future<void> setTeamEnabled(String teamId, bool value) async {
+    if (teamId.isEmpty) return;
     if (isMobile && value) return; // 移动端不支持本地执行模式
-    if (value == _enabled) {
+    final _LocalTeamState state =
+        _states.putIfAbsent(teamId, () => _LocalTeamState(teamId: teamId));
+    if (value == state.enabled) {
       // 状态一致但连接可能已重建，重新确保注册/注销
-      if (value && _baseDir.isNotEmpty) {
-        register(_baseDir);
-      } else if (!value && _registered) {
-        unregister();
+      if (value && state.baseDir.isNotEmpty) {
+        _registerTeam(state);
+      } else if (!value && state.registered) {
+        _unregisterTeam(state);
       }
       return;
     }
-    _enabled = value;
+    state.enabled = value;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_kEnabledKey(_currentTopAgentId), value);
+    await prefs.setBool(_kEnabledKey(teamId), value);
     if (value) {
-      if (_baseDir.isNotEmpty) register(_baseDir);
+      if (state.baseDir.isNotEmpty) _registerTeam(state);
     } else {
-      unregister();
+      _unregisterTeam(state);
     }
     notifyListeners();
   }
 
-  /// 设置当前顶部 agent 的工作目录并持久化
-  Future<void> setWorkingDirectory(String path) async {
-    _baseDir = path;
+  /// 设置指定 team 的工作目录并持久化
+  Future<void> setTeamWorkingDirectory(String teamId, String path) async {
+    if (teamId.isEmpty) return;
+    final _LocalTeamState state =
+        _states.putIfAbsent(teamId, () => _LocalTeamState(teamId: teamId));
+    state.baseDir = path;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_kWorkDirKey(_currentTopAgentId), path);
+    await prefs.setString(_kWorkDirKey(teamId), path);
     notifyListeners();
   }
 
-  /// 按当前顶部 agent 的本地模式同步注册/注销（切换顶部 agent / 重连后调用）。
-  void syncRegistration() {
-    if (_currentTopAgentId.isEmpty) return;
-    if (isMobile) return; // 移动端不支持本地执行模式，不注册
-    if (_enabled && _baseDir.isNotEmpty) {
-      register(_baseDir);
-    } else if (_registered) {
-      unregister();
+  /// WS 重连/首连后恢复注册：仅对"已注册且启用"的 team 重新发送注册消息。
+  ///
+  /// 后端在 WS 断连时按连接自动清理注册，重连后需要恢复；未激活的 team
+  /// （未启用 / 未配置目录）不注册，后端按"无执行器"回落云端。
+  void syncRegisteredTeams() {
+    for (final _LocalTeamState state in _states.values) {
+      if (state.enabled && state.baseDir.isNotEmpty && state.registered) {
+        _registerTeam(state);
+      }
     }
   }
 
-  /// 绑定 WebSocket 服务并接管 ``tool_exec_request`` 消息。
+  /// 绑定 WebSocket 服务并接管 ``tool_exec_request`` / ``tool_exec_cancel``。
   ///
   /// 每个 WebSocket 连接建立后都应调用一次（本地模式）。内部只接管
-  /// 工具执行请求，其余消息仍正常派发给页面。
+  /// 工具执行请求与取消消息，其余消息仍正常派发给页面。
   void attach(WebSocketService ws) {
     _ws = ws;
     ws.addToolExecRequestHandler(_handleToolExecRequest);
-    ws.onToolExecCancel = _handleToolExecCancel;
+    ws.addToolExecCancelHandler(_handleToolExecCancel);
   }
 
-  /// 处理 ``tool_exec_cancel``：终止对应 hook 分离进程。
+  /// 处理 ``tool_exec_cancel``：终止对应 hook 分离进程（payload 中的
+  /// pidfile 为 SSH 模式字段，本地模式忽略）。
   void _handleToolExecCancel(Map<String, dynamic> message) {
     final Map<String, dynamic> data =
         (message['data'] as Map<String, dynamic>?) ?? <String, dynamic>{};
-    final String execId = (data['exec_id'] as String?) ?? '';
-    if (execId.isEmpty) return;
-    killProcess(execId);
+    final String toolId = (data['tool_id'] as String?) ?? '';
+    if (toolId.isEmpty) return;
+    killProcess(toolId);
   }
 
   /// 终止指定 hook 分离进程（尽力终止）。
   ///
   /// 取消后进程退出仍会经 ``tool_exec_response`` 回传，后端据此将任务标记
   /// 为 cancelled。进程未运行/已退出时静默忽略。
-  void killProcess(String execId) {
-    _hookProcesses.remove(execId)?.kill();
+  void killProcess(String toolId) {
+    _hookProcesses.remove(toolId)?.kill();
   }
 
-  /// 注册当前顶部 agent 的本地执行器：设置工作目录并通知后端转发工具请求。
-  void register(String baseDir) {
-    if (_currentTopAgentId.isEmpty) return;
+  /// 注册单个 team 的本地执行器：通知后端把该 team 的工具请求转发到本端。
+  void _registerTeam(_LocalTeamState state) {
+    if (state.teamId.isEmpty) return;
     if (isMobile) return; // 移动端不支持本地执行模式，不注册
-    _baseDir = baseDir;
-    _registered = true;
-    _registeredTopAgents.add(_currentTopAgentId);
+    state.registered = true;
     _send(<String, dynamic>{
       'type': 'register_local_executor',
       'data': <String, dynamic>{
-        'base_dir': baseDir,
-        'top_agent_id': _currentTopAgentId,
+        'base_dir': state.baseDir,
+        'team_id': state.teamId,
       },
     });
   }
 
-  /// 注销当前顶部 agent 的本地执行器：通知后端该 agent 恢复云端执行。
-  void unregister() {
-    if (_currentTopAgentId.isEmpty) return;
-    _registered = false;
-    _registeredTopAgents.remove(_currentTopAgentId);
-    _sendUnregister(_currentTopAgentId);
+  /// 注销单个 team 的本地执行器：通知后端该 team 恢复云端执行。
+  void _unregisterTeam(_LocalTeamState state) {
+    state.registered = false;
+    _sendUnregister(state.teamId);
   }
 
   /// 向后端发送注销指定顶部 agent 的本地执行器消息。
-  void _sendUnregister(String topAgentId) {
+  void _sendUnregister(String teamId) {
+    if (teamId.isEmpty) return;
     _send(<String, dynamic>{
       'type': 'unregister_local_executor',
-      'data': <String, dynamic>{'top_agent_id': topAgentId},
+      'data': <String, dynamic>{'team_id': teamId},
     });
   }
 
@@ -243,34 +319,36 @@ class LocalExecutorService extends ChangeNotifier {
   /// 替代已废弃的 LocalBackendService.dispose()：本服务不持有本地进程，
   /// 只需通知后端注销本地执行器（避免后端残留注册导致工具请求被错误路由），
   /// 并释放 WebSocket 引用、复位注册状态。清理后下次连接会通过
-  /// [attach] + [syncRegistration] 按持久化设置重新注册。
+  /// [attach] + [syncRegisteredTeams] 按状态恢复注册。
   void cleanup() {
-    // 无论 [_registered] 是否置位都要通知后端注销：切换顶部 agent 后
-    // [_registered] 只反映当前 agent，后端可能仍残留其他顶部 agent 的注册，
-    // 若只注销当前 agent，残留注册会让后端继续向本端转发工具请求而无人响应
-    // （每次请求空等 120s，表现为发消息卡死）。逐一注销所有注册过的顶部 agent。
-    final List<String> agents = _registeredTopAgents.toList();
-    for (final String topAgentId in agents) {
-      _sendUnregister(topAgentId);
+    for (final _LocalTeamState state in _states.values) {
+      if (state.registered) {
+        _sendUnregister(state.teamId);
+        state.registered = false;
+      }
     }
-    _registeredTopAgents.clear();
     _ws?.removeToolExecRequestHandler(_handleToolExecRequest);
+    _ws?.removeToolExecCancelHandler(_handleToolExecCancel);
     _ws = null;
-    _registered = false;
   }
 
   /// 解析工具请求的工作目录（与后端本地路径映射保持一致）。
   ///
-  /// 新的协同语义：
+  /// 协同语义：
   /// - 所有 agent（顶层 agent 与团队成员）的工作文件都在工作目录
   ///   <baseDir> 中读写执行，实现全队协同工作——因此非记忆路径一律返回 base。
-  /// - 每个 agent 的私人记忆文件（``.self`` 开头的路径）存放于各自的私人空间
-  ///   <baseDir>/workspaces/{workspace_id}，与共享工作目录隔离，互不泄露。
-  Directory _resolveWorkspaceDir(String workspaceId, [String path = '']) {
-    final String base =
-        _baseDir.isEmpty ? Directory.current.path : _baseDir;
+  /// - 每个 agent 的私人记忆文件（``.self`` 开头的路径，相对令牌 ``.self/xxx``）
+  ///   按各自的 workspace_id 解析到 <baseDir>/agentspace/{workspace_id} 下
+  ///   （相对令牌仍保留 ``.self`` 前缀，最终物理落点为
+  ///   <baseDir>/agentspace/{workspace_id}/.self/xxx）。
+  Directory _resolveWorkspaceDir(
+    String baseDir,
+    String workspaceId, [
+    String path = '',
+  ]) {
+    final String base = baseDir.isEmpty ? Directory.current.path : baseDir;
     if (_isPrivatePath(path)) {
-      return Directory('$base${Platform.pathSeparator}workspaces'
+      return Directory('$base${Platform.pathSeparator}agentspace'
           '${Platform.pathSeparator}$workspaceId');
     }
     return Directory(base);
@@ -290,33 +368,43 @@ class LocalExecutorService extends ChangeNotifier {
   /// 处理 ``tool_exec_request``，异步执行后回传 ``tool_exec_response``。
   ///
   /// 返回 `true` 表示已接管该请求（工具执行请求在本地模式下发到本端时
-  /// 总是由本处理者执行）；当前顶部 agent 处于 SSH 模式或本实例未启用
-  /// 本地模式时返回 `false`，把请求放行给 SSH 执行器 / 其他实例处理。
+  /// 总是由本处理者执行）；请求不属于本前端已注册且启用的 team、或该 team
+  /// 处于 SSH 模式时返回 `false`，把请求放行给 SSH 执行器 / 其他实例处理。
   bool _handleToolExecRequest(Map<String, dynamic> message) {
     final Map<String, dynamic> data =
         (message['data'] as Map<String, dynamic>?) ?? <String, dynamic>{};
-    final String execId = (data['exec_id'] as String?) ?? '';
-    if (execId.isEmpty) return false;
-    // 归属校验：请求明确属于其他顶部 agent 时不接管（放行给对应执行器/实例）
-    final String reqAgent = (data['top_agent_id'] as String?) ?? '';
-    if (reqAgent.isNotEmpty && reqAgent != _currentTopAgentId) return false;
-    // SSH 模式守卫：当前顶部 agent 处于 SSH 模式时，工具请求交给 SSH 执行器
-    // （仅当 SSH 执行器服务的就是同一个 agent 时让位——防止残留其他 agent 的
-    // SSH 启用态把本地 agent 的请求误让给 SSH 通道）
-    if (SshExecutorService.instance.enabled &&
-        SshExecutorService.instance.currentTopAgentId == _currentTopAgentId) {
+    final String toolId = (data['tool_id'] as String?) ?? '';
+    final String reqTeam = (data['team_id'] as String?) ?? '';
+    // payload 校验：tool_id 缺失时后端 pending 无法定位、本端无法回包，放行
+    if (toolId.isEmpty) return false;
+    // team_id 缺失：直接快速失败回包，避免后端 pending 空等 120s
+    if (reqTeam.isEmpty) {
+      _sendToolExecResponse(toolId, <String, dynamic>{
+        'success': false,
+        'error': 'missing team_id/tool_id',
+      });
+      return true;
+    }
+    // 归属校验（集合化）：仅接管"本前端已注册且启用本地模式"的 team——按
+    // 请求 payload 的 team_id 查 per-team 状态，不读"当前选中 agent"槽位。
+    // 同一用户可能并行开多个前端实例（后端按 user_id 向该用户所有 WS 连接
+    // 广播请求），只有真正注册且启用了本地模式的实例才执行——否则未配置的
+    // 实例会以 Directory.current（Windows 桌面打包运行时为
+    // build\windows\runner\Release）兜底执行并回传"文件不存在"错误，先于
+    // 正确实例的成功结果到达后端。
+    final _LocalTeamState? state = _states[reqTeam];
+    if (state == null || !state.enabled || !state.registered) {
       return false;
     }
-    // 本地模式守卫：本实例未启用本地执行时不接管工具请求。同一用户可能
-    // 并行开多个前端实例（后端按 user_id 向该用户所有 WS 连接广播请求），
-    // 只有真正启用了本地模式的实例才执行——否则未配置的实例会以
-    // Directory.current（Windows 桌面打包运行时为 build\windows\runner\Release）
-    // 兜底执行并回传"文件不存在"错误，先于正确实例的成功结果到达后端。
-    if (!_enabled) return false;
+    // SSH 模式守卫（按 team 粒度）：同一 team 启用了 SSH 模式时让位给
+    // SSH 执行器（SSH 优先）；不同 team 的 SSH 启用态互不影响。
+    if (SshExecutorService.instance.isTeamEnabled(reqTeam)) {
+      return false;
+    }
     // 已启用但未选择工作目录：明确报错，禁止用 Directory.current 兜底
     // （打包运行时的当前目录是 exe 所在目录，工具会在错误位置执行）
-    if (_baseDir.isEmpty) {
-      _sendToolExecResponse(execId, <String, dynamic>{
+    if (state.baseDir.isEmpty) {
+      _sendToolExecResponse(toolId, <String, dynamic>{
         'error': '本地模式未选择工作目录，请在标题栏选择目录后重试',
         'exit_code': -1,
       });
@@ -328,15 +416,17 @@ class LocalExecutorService extends ChangeNotifier {
     // hook 模式：分离进程后台执行，进程退出时再回传（不在此处立即响应）
     if (op == 'exec_shell_hook') {
       final String path = (data['output_file'] as String?) ?? '';
-      final Directory wsDir = _resolveWorkspaceDir(workspaceId, path);
-      _execShellHookDeferred(wsDir, execId, data);
+      final Directory wsDir =
+          _resolveWorkspaceDir(state.baseDir, workspaceId, path);
+      _execShellHookDeferred(wsDir, toolId, data);
       return true;
     }
 
-    _execute(workspaceId, op, data).then((Map<String, dynamic> result) {
-      _sendToolExecResponse(execId, result);
+    _execute(workspaceId, op, data, state.baseDir)
+        .then((Map<String, dynamic> result) {
+      _sendToolExecResponse(toolId, result);
     }).catchError((Object error) {
-      _sendToolExecResponse(execId, <String, dynamic>{
+      _sendToolExecResponse(toolId, <String, dynamic>{
         'error': error.toString(),
       });
     });
@@ -344,11 +434,11 @@ class LocalExecutorService extends ChangeNotifier {
   }
 
   /// 回传一次工具执行结果（``tool_exec_response``）。
-  void _sendToolExecResponse(String execId, Map<String, dynamic> result) {
+  void _sendToolExecResponse(String toolId, Map<String, dynamic> result) {
     _send(<String, dynamic>{
       'type': 'tool_exec_response',
       'data': <String, dynamic>{
-        'exec_id': execId,
+        'tool_id': toolId,
         'result': result,
       },
     });
@@ -366,12 +456,12 @@ class LocalExecutorService extends ChangeNotifier {
   /// 日志；本端改用绝对路径流式写入（stdout/stderr 管道 → 文件）。
   Future<void> _execShellHookDeferred(
     Directory wsDir,
-    String execId,
+    String toolId,
     Map<String, dynamic> data,
   ) async {
     final String command = (data['command'] as String?) ?? '';
     if (command.isEmpty) {
-      _sendToolExecResponse(execId, <String, dynamic>{
+      _sendToolExecResponse(toolId, <String, dynamic>{
         'error': 'exec_shell_hook 缺少 command',
         'exit_code': -1,
       });
@@ -386,7 +476,7 @@ class LocalExecutorService extends ChangeNotifier {
         await File(fullOut).parent.create(recursive: true);
       }
     } catch (e) {
-      _sendToolExecResponse(execId, <String, dynamic>{
+      _sendToolExecResponse(toolId, <String, dynamic>{
         'error': '输出文件路径非法: $e',
         'exit_code': -1,
       });
@@ -409,7 +499,7 @@ class LocalExecutorService extends ChangeNotifier {
         // stdout 丢失，表现为 hook 日志为空），确保输出可靠进入管道
         final String batPath =
             '${Directory.systemTemp.path}${Platform.pathSeparator}'
-            'hook_${execId}_exec.bat';
+            'hook_${toolId}_exec.bat';
         await File(batPath).writeAsString('@echo off\r\n$command\r\n');
         process = await Process.start(
           'cmd',
@@ -431,7 +521,7 @@ class LocalExecutorService extends ChangeNotifier {
           workingDirectory: workDir,
         );
       }
-      _hookProcesses[execId] = process;
+      _hookProcesses[toolId] = process;
       // 实时把 stdout/stderr 写入输出文件（不依赖 shell 重定向）。
       // outputFile 为空时也无碍（hook_manager 总会生成），此处仍兜底。
       final StringBuffer memOut = StringBuffer();
@@ -459,7 +549,7 @@ class LocalExecutorService extends ChangeNotifier {
         if (!errDone.isCompleted) errDone.complete();
       }, cancelOnError: true);
       process.exitCode.then((int code) async {
-        _hookProcesses.remove(execId);
+        _hookProcesses.remove(toolId);
         // 等待 stdout/stderr 流 EOF 后再落盘回传：避免后端立刻读取
         // 输出文件读到未刷新/缺失尾部的内容
         try {
@@ -471,19 +561,19 @@ class LocalExecutorService extends ChangeNotifier {
         } catch (_) {
           if (sink != null) sink.close();
         }
-        _sendToolExecResponse(execId, <String, dynamic>{
+        _sendToolExecResponse(toolId, <String, dynamic>{
           'exit_code': code,
           'stdout': sink != null ? '' : memOut.toString(),
           'stderr': '',
         });
       });
     } on ProcessException catch (e) {
-      _sendToolExecResponse(execId, <String, dynamic>{
+      _sendToolExecResponse(toolId, <String, dynamic>{
         'error': '启动命令失败: ${e.message}',
         'exit_code': -1,
       });
     } catch (e) {
-      _sendToolExecResponse(execId, <String, dynamic>{
+      _sendToolExecResponse(toolId, <String, dynamic>{
         'error': '启动命令失败: $e',
         'exit_code': -1,
       });
@@ -495,10 +585,11 @@ class LocalExecutorService extends ChangeNotifier {
     String workspaceId,
     String op,
     Map<String, dynamic> data,
+    String baseDir,
   ) async {
     // 携带操作路径，按路径路由：.self 记忆 → 私人空间；其余 → 工作目录 base
     final String path = (data['path'] as String?) ?? '';
-    final Directory wsDir = _resolveWorkspaceDir(workspaceId, path);
+    final Directory wsDir = _resolveWorkspaceDir(baseDir, workspaceId, path);
     switch (op) {
       case 'list_files':
         return _listFiles(wsDir, data);
@@ -508,6 +599,14 @@ class LocalExecutorService extends ChangeNotifier {
         return _readFileBytes(wsDir, data);
       case 'write_file':
         return _writeFile(wsDir, data);
+      case 'upload_file':
+        return _uploadFile(wsDir, data);
+      case 'upload_init':
+        return _uploadInit(wsDir, data);
+      case 'upload_chunk':
+        return _uploadChunk(data);
+      case 'upload_complete':
+        return _uploadComplete(data);
       case 'exec_shell':
         return _execShell(wsDir, data);
       case 'exec_argv':
@@ -545,8 +644,10 @@ class LocalExecutorService extends ChangeNotifier {
       await for (final FileSystemEntity entity in dir.list()) {
         final String name = _basename(entity.path);
         final bool isDir = entity is Directory;
-        // 隐藏 .git 与 workspaces（私人记忆空间），避免在共享工作目录中互相暴露
-        if (name == '.git' || name == 'workspaces') continue;
+        // 隐藏 .git 与 workspaces/agentspace（私人记忆空间容器），避免在共享工作目录中互相暴露
+        if (name == '.git' || name == 'workspaces' || name == 'agentspace') {
+          continue;
+        }
         int size = 0;
         String modified = '';
         try {
@@ -783,6 +884,140 @@ class LocalExecutorService extends ChangeNotifier {
     }
   }
 
+  /// 单请求上传文件（base64 内容直接落盘），返回 ``{success, file_path}``。
+  ///
+  /// 小文件通道：后端把整个文件 base64 后转发到本端，写入工作空间
+  /// ``.input/yyyymmdd/`` 目录（与云端/SSH 模式语义一致）。
+  Future<Map<String, dynamic>> _uploadFile(
+    Directory wsDir,
+    Map<String, dynamic> data,
+  ) async {
+    final String relPath = (data['rel_path'] as String?) ?? '';
+    final String dataB64 = (data['data_base64'] as String?) ?? '';
+    if (relPath.isEmpty) {
+      return <String, dynamic>{'error': 'upload_file 缺少 rel_path'};
+    }
+    try {
+      final String full = _resolveInWorkspace(wsDir, relPath);
+      final File file = File(full);
+      await file.parent.create(recursive: true);
+      await file.writeAsBytes(base64Decode(dataB64), flush: true);
+      return <String, dynamic>{'success': true, 'file_path': relPath};
+    } catch (e) {
+      return <String, dynamic>{'error': '上传文件失败: $e', 'file_path': relPath};
+    }
+  }
+
+  /// 初始化分片上传会话：打开本地文件句柄（截断写），按 upload_id 记录。
+  ///
+  /// 返回 ``{success, file_path}``；同名会话已存在时先关闭旧句柄（重复 init
+  /// 视为重新上传）。
+  Future<Map<String, dynamic>> _uploadInit(
+    Directory wsDir,
+    Map<String, dynamic> data,
+  ) async {
+    final String uploadId = (data['upload_id'] as String?) ?? '';
+    final String relPath = (data['rel_path'] as String?) ?? '';
+    if (uploadId.isEmpty || relPath.isEmpty) {
+      return <String, dynamic>{'error': 'upload_init 缺少 upload_id/rel_path'};
+    }
+    try {
+      final String full = _resolveInWorkspace(wsDir, relPath);
+      final File file = File(full);
+      await file.parent.create(recursive: true);
+      final RandomAccessFile raf = await file.open(mode: FileMode.write);
+      // 重复 init：关闭旧句柄，避免句柄泄漏
+      final _LocalUploadSession? old = _uploadSessions.remove(uploadId);
+      if (old != null) {
+        try {
+          await old.raf.close();
+        } catch (_) {
+          // 旧句柄关闭失败无碍
+        }
+      }
+      _uploadSessions[uploadId] = _LocalUploadSession(
+        raf: raf,
+        relPath: relPath,
+        fullPath: full,
+        // 后端 init 下发的分片定标与期望总大小：chunk 偏移定位与 complete
+        // 校验都依赖这两个值，缺省时偏移会错位且跳过大小校验
+        chunkSize: ((data['chunk_size'] as num?) ?? 4 * 1024 * 1024).toInt(),
+        totalSize: ((data['total_size'] as num?) ?? 0).toInt(),
+      );
+      return <String, dynamic>{'success': true, 'file_path': relPath};
+    } catch (e) {
+      return <String, dynamic>{'error': '初始化分片上传失败: $e'};
+    }
+  }
+
+  /// 追加一个分片：按 index × chunk_size 偏移定位写入。
+  ///
+  /// 返回 ``{success, received}``；会话不存在（未 init / 已完成）时报错。
+  Future<Map<String, dynamic>> _uploadChunk(
+    Map<String, dynamic> data,
+  ) async {
+    final String uploadId = (data['upload_id'] as String?) ?? '';
+    final int index = ((data['index'] as num?) ?? -1).toInt();
+    final String dataB64 = (data['data_base64'] as String?) ?? '';
+    if (uploadId.isEmpty) {
+      return <String, dynamic>{'error': 'upload_chunk 缺少 upload_id'};
+    }
+    final _LocalUploadSession? session = _uploadSessions[uploadId];
+    if (session == null) {
+      return <String, dynamic>{'error': '分片会话不存在或已完成', 'exit_code': 1};
+    }
+    if (index < 0) {
+      return <String, dynamic>{'error': 'upload_chunk index 非法'};
+    }
+    try {
+      final Uint8List chunk = base64Decode(dataB64);
+      await session.raf.setPosition(index * session.chunkSize);
+      await session.raf.writeFrom(chunk);
+      session.received += chunk.length;
+      return <String, dynamic>{'success': true, 'received': chunk.length};
+    } catch (e) {
+      return <String, dynamic>{'error': '写入分片失败: $e'};
+    }
+  }
+
+  /// 完成分片上传：flush + 关闭句柄，按 init 的 total_size 校验大小。
+  ///
+  /// 返回 ``{success, path, size}``；会话不存在时报错。
+  Future<Map<String, dynamic>> _uploadComplete(
+    Map<String, dynamic> data,
+  ) async {
+    final String uploadId = (data['upload_id'] as String?) ?? '';
+    if (uploadId.isEmpty) {
+      return <String, dynamic>{'error': 'upload_complete 缺少 upload_id'};
+    }
+    final _LocalUploadSession? session = _uploadSessions.remove(uploadId);
+    if (session == null) {
+      return <String, dynamic>{'error': '分片会话不存在或已完成', 'exit_code': 1};
+    }
+    try {
+      await session.raf.flush();
+      await session.raf.close();
+    } catch (e) {
+      return <String, dynamic>{'error': '关闭上传文件失败: $e'};
+    }
+    int actual = 0;
+    try {
+      actual = await File(session.fullPath).length();
+    } catch (_) {
+      // 长度读取失败不阻塞完成流程
+    }
+    if (session.totalSize > 0 && actual != session.totalSize) {
+      return <String, dynamic>{
+        'error': '分片上传大小校验失败：期望 ${session.totalSize} 字节，实际 $actual 字节',
+      };
+    }
+    return <String, dynamic>{
+      'success': true,
+      'path': session.relPath,
+      'size': actual,
+    };
+  }
+
   /// 执行 shell 命令（使用本机原生 shell）。
   Future<Map<String, dynamic>> _execShell(
     Directory wsDir,
@@ -980,7 +1215,9 @@ class LocalExecutorService extends ChangeNotifier {
     await for (final FileSystemEntity entity in dir.list(followLinks: false)) {
       if (entity is Directory) {
         final String name = _basename(entity.path);
-        if (name == '.git' || name == 'workspaces') continue;
+        if (name == '.git' || name == 'workspaces' || name == 'agentspace') {
+          continue;
+        }
         await _walkSearch(
           entity,
           pattern,

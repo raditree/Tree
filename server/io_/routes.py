@@ -9,6 +9,7 @@ import datetime
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import tempfile
 import uuid
@@ -208,25 +209,57 @@ def _local_mode_ctx(user_id: str, local_key: str) -> Optional[Dict[str, Any]]:
     return {"local_executor": local_executor, "ws_manager": ws_manager}
 
 
+def _frontend_mode_ctx(user_id: str, local_key: str) -> Optional[Dict[str, Any]]:
+    """local 或 ssh 模式下返回前端委托上下文，云端模式返回 None。
+
+    文件 IO 三模式一致（Task 5）：本地与 SSH 模式的文件系统都由**前端**持有
+    （本地执行器持有用户本机目录、SSH 执行器经 dartssh2 持有远端主机），后端
+    对两者的委托方式完全相同——把语义请求包装成 ``tool_exec_request`` 经反向
+    WS 转发（``local_executor.request``），由前端按自身 per-team 状态路由到
+    本地 / SSH 执行器执行。
+    """
+    local_executor = state.local_executor
+    ws_manager = state.ws_manager
+    if local_executor is None or ws_manager is None:
+        return None
+    if local_executor.is_local(user_id, local_key):
+        return {"local_executor": local_executor, "ws_manager": ws_manager}
+    if mode_resolver.resolve_mode(user_id, local_key) == "ssh":
+        return {"local_executor": local_executor, "ws_manager": ws_manager}
+    return None
+
+
+# 文件栏三模式一致（Task 5.4）：文件列表统一隐藏的条目——git 元数据、
+# 各 agent 私人记忆空间、agent 工作区目录
+_HIDDEN_FILE_NAMES = {".git", "workspaces", "agentspace"}
+
+
+def _filter_hidden_files(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """过滤文件列表中的隐藏条目（``.git`` / ``workspaces`` / ``agentspace``）。"""
+    return [f for f in files if f.get("name") not in _HIDDEN_FILE_NAMES]
+
+
 @router.get("/files/{workspace_id}")
 async def list_files(
     workspace_id: str,
     request: Request,
     path: str = Query("", description="子路径，默认根目录"),
-    top_agent_id: str = Query("", description="所属顶层 agent ID（成员浏览时传入，用于本地模式判定）"),
+    # file_tree.dart（lib 侧）尚未携带 team_id，暂为可选；缺省回落 workspace_id
+    team_id: str = Query("", description="所属顶层 agent ID（本地/SSH 模式判定与执行隔离键）"),
     current_user: dict = Depends(get_current_user),
 ):
     """获取工作空间文件列表。
 
     查询参数 ``path`` 指定子路径（默认根目录）。
-    本地模式下通过反向 WS 转发给前端本地执行器，列出用户本机工作目录；
+    三模式分派（与 git 端点一致）：本地/SSH 模式经反向 WS 转发给前端执行器
+    （本地执行器列出用户本机工作目录，SSH 执行器经 dartssh2 列出远端目录）；
     云端模式通过 docker_manager.exec_in_workspace 执行 ``ls -la`` 获取文件列表。
     """
     assert_workspace_owned(workspace_id, current_user)
-    # 本地模式：转发给前端本地执行器，列出本机工作空间目录
+    # 本地/SSH 模式：委托前端执行器列出目录
     user_id = current_user.get("openid", "")
-    local_key = top_agent_id or workspace_id
-    ctx = _local_mode_ctx(user_id, local_key)
+    local_key = team_id or workspace_id
+    ctx = _frontend_mode_ctx(user_id, local_key)
     if ctx is not None:
         # 异步端点内不可阻塞事件循环（否则 WS 接收无法处理响应导致死锁），
         # 因此放入线程池中执行阻塞式请求
@@ -239,10 +272,11 @@ async def list_files(
                 "workspace_id": workspace_id,
                 "path": path,
             },
+            team_id=local_key,
         )
         if "error" in result:
             raise HTTPException(status_code=404, detail=result)
-        return {"files": result.get("files", [])}
+        return {"files": _filter_hidden_files(result.get("files", []))}
 
     docker_manager = _get_docker_manager()
     if not path:
@@ -260,11 +294,10 @@ async def list_files(
         raise HTTPException(status_code=404, detail=result)
     if result.get("exit_code", 0) != 0:
         raise HTTPException(status_code=404, detail=f"路径不存在: {path}")
-    # 云端列表隐藏 .git（git 元数据）与 workspaces（各 agent 私人空间），
-    # 与本地模式的文件浏览语义保持一致，避免私人记忆互相泄露
-    files = _parse_ls_output(
-        result.get("stdout", ""), path, {".git", "workspaces"}
-    )
+    # 云端列表隐藏 .git（git 元数据）、workspaces（各 agent 私人空间）与
+    # agentspace（agent 工作区），与本地/SSH 模式的文件浏览语义保持一致，
+    # 避免私人记忆互相泄露
+    files = _parse_ls_output(result.get("stdout", ""), path, _HIDDEN_FILE_NAMES)
     return {"files": files}
 
 
@@ -273,25 +306,51 @@ async def get_file_content(
     workspace_id: str,
     request: Request,
     path: str = Query(..., description="文件路径"),
-    top_agent_id: str = Query("", description="所属顶层 agent ID（成员浏览时传入，用于本地模式判定）"),
+    # 前端 FileViewer 尚未携带 team_id（lib 侧待补传），暂为可选
+    team_id: str = Query("", description="所属顶层 agent ID（本地模式判定与执行隔离键；前端待补传）"),
     current_user: dict = Depends(get_current_user),
 ):
     """获取文件内容。
 
     查询参数 ``path`` 指定文件路径。
-    本地模式下通过反向 WS 转发给前端本地执行器读取本机文件；
-    云端模式通过 docker_manager.exec_in_workspace 读取文件内容。
+    本地/SSH 模式下通过反向 WS 转发给前端执行器读取文件（文本经 read_file，
+    图片经 read_file_bytes 取 base64）；云端模式通过
+    docker_manager.exec_in_workspace 读取文件内容。
     图片文件（png/jpg/gif 等）返回 base64 编码，``is_base64=true``。
     """
     if not path:
         raise HTTPException(status_code=400, detail="path 参数不能为空")
 
     assert_workspace_owned(workspace_id, current_user)
-    # 本地模式：转发给前端本地执行器，读取本机工作空间文件
+    # 本地/SSH 模式：委托前端执行器读取文件（文本 / 图片分别处理）
     user_id = current_user.get("openid", "")
-    local_key = top_agent_id or workspace_id
-    ctx = _local_mode_ctx(user_id, local_key)
+    local_key = team_id or workspace_id
+    ctx = _frontend_mode_ctx(user_id, local_key)
     if ctx is not None:
+        # 图片等二进制文件：经 read_file_bytes 取 base64，避免文本化损坏
+        _image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico"}
+        lower_path = path.lower()
+        if any(lower_path.endswith(ext) for ext in _image_exts):
+            result = await asyncio.to_thread(
+                ctx["local_executor"].request,
+                ctx["ws_manager"],
+                user_id,
+                {
+                    "op": "read_file_bytes",
+                    "workspace_id": workspace_id,
+                    "path": path,
+                },
+                team_id=local_key,
+            )
+            if "error" in result or result.get("exit_code", 0) != 0:
+                raise HTTPException(status_code=404, detail="文件不存在或无法读取")
+            b64 = "".join(str(result.get("content_base64", "")).split())
+            return {
+                "content": b64,
+                "path": path,
+                "size": len(b64),
+                "is_base64": True,
+            }
         result = await asyncio.to_thread(
             ctx["local_executor"].request,
             ctx["ws_manager"],
@@ -302,6 +361,7 @@ async def get_file_content(
                 "path": path,
                 "encoding": "utf-8",
             },
+            team_id=local_key,
         )
         if "error" in result or result.get("exit_code", 0) != 0:
             raise HTTPException(status_code=404, detail="文件不存在或无法读取")
@@ -340,11 +400,18 @@ async def get_file_content(
     if "error" in result and "exit_code" not in result:
         raise HTTPException(status_code=404, detail=result)
     if result.get("exit_code", 0) != 0:
-        # 兼容旧工作空间：读取 .self/activity.log 缺失时先初始化再返回
+        # 兼容旧工作空间：读取 .self/activity.log 缺失时先初始化再返回。
+        # 物理落点 agentspace/{workspace_id}/.self（顶层与共享成员一致）
         if path.rstrip("/").endswith("activity.log"):
+            priv_dir = docker_manager._private_rel_dir(workspace_id)
             init = docker_manager.exec_in_workspace(
                 workspace_id,
-                ["sh", "-c", "mkdir -p .self && echo '# Agent 活动日志' > .self/activity.log"],
+                [
+                    "sh", "-c",
+                    "mkdir -p {d} && echo '# Agent 活动日志' > {d}/activity.log".format(
+                        d=priv_dir
+                    ),
+                ],
             )
             if init.get("exit_code", 0) == 0:
                 result = docker_manager.exec_in_workspace(
@@ -422,6 +489,8 @@ async def upload_file(
     request: Request,
     files: List[UploadFile] = File(...),
     rel_paths: List[str] = Form(default=[]),
+    # 前端 FileSyncButton 携带 team_id（三模式判定键）；缺省回落 workspace_id
+    team_id: str = Query("", description="所属顶层 agent ID（本地/SSH 模式判定与执行隔离键）"),
     current_user: dict = Depends(get_current_user),
 ):
     """上传多个文件到工作空间 ``.input/yyyymmdd/`` 目录。
@@ -430,22 +499,29 @@ async def upload_file(
     相对路径（含子目录），用于保留文件夹层级；未提供的文件保存到
     ``.input/yyyymmdd/`` 根目录（使用文件名）。
 
+    三模式分派（Task 5 文件 IO 一致）：本地/SSH 模式把文件内容 base64 后经
+    反向 WS 委托前端执行器落盘（本机目录 / SFTP 远端），单请求通道仅限
+    ``upload.chunk_threshold`` 以内的文件，更大文件走 init/chunk/complete
+    分片通道；云端模式在容器内经 base64 解码写入。
+
     上传前校验：
     - 单文件大小不超过 ``upload.max_file_size``
     - 沙箱总大小（当前已用 + 本次新增）不超过 ``upload.sandbox_max_size``
+      （仅云端模式：本地/SSH 文件落在用户自己的机器上，空间由用户自管）
 
     返回 ``{"success": true, "paths": [...]}``（工作空间内绝对路径列表）。
     """
-    docker_manager = _get_docker_manager()
     upload_cfg = get_config().get("upload", {})
     max_file_size = _parse_size(upload_cfg.get("max_file_size"), 10 * 1024 * 1024)
-    sandbox_max_size = _parse_size(
-        upload_cfg.get("sandbox_max_size"), 1024 * 1024 * 1024
-    )
+    chunk_threshold = _parse_size(upload_cfg.get("chunk_threshold"), 8 * 1024 * 1024)
 
     date_dir = datetime.datetime.now().strftime("%Y%m%d")
 
     assert_workspace_owned(workspace_id, current_user)
+
+    user_id = current_user.get("openid", "")
+    local_key = team_id or workspace_id
+    ctx = _frontend_mode_ctx(user_id, local_key)
 
     # 读取全部文件并统一校验
     payloads: List[tuple] = []  # (相对路径, 字节内容)
@@ -462,7 +538,42 @@ async def upload_file(
         rel = (rel_paths[i].strip("/") if i < len(rel_paths) and rel_paths[i] else name)
         payloads.append((rel, data))
 
-    # 沙箱总大小校验
+    if ctx is not None:
+        # 本地/SSH 模式：委托前端执行器写入（base64 经反向 WS 传输）。
+        # 超过分片阈值的文件拒绝单请求通道（WS 消息体过大），提示走分片通道。
+        saved: List[str] = []
+        for rel, data in payloads:
+            if len(data) > chunk_threshold:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"文件过大（{rel}），单请求上传上限 {chunk_threshold} 字节，"
+                        "请使用分片上传通道（upload_init/upload_chunk/upload_complete）"
+                    ),
+                )
+            rel_path = f".input/{date_dir}/{rel}"
+            result = await asyncio.to_thread(
+                ctx["local_executor"].request,
+                ctx["ws_manager"],
+                user_id,
+                {
+                    "op": "upload_file",
+                    "workspace_id": workspace_id,
+                    "rel_path": rel_path,
+                    "data_base64": base64.b64encode(data).decode("ascii"),
+                },
+                team_id=local_key,
+            )
+            if "error" in result:
+                raise HTTPException(status_code=500, detail=result)
+            saved.append(f"/workspace/{rel_path}")
+        return {"success": True, "paths": saved}
+
+    # 云端模式：沙箱总大小校验 + 容器内 base64 解码写入
+    docker_manager = _get_docker_manager()
+    sandbox_max_size = _parse_size(
+        upload_cfg.get("sandbox_max_size"), 1024 * 1024 * 1024
+    )
     current_size = _get_workspace_size(docker_manager, workspace_id)
     if current_size + total_new > sandbox_max_size:
         raise HTTPException(
@@ -471,7 +582,7 @@ async def upload_file(
         )
 
     # 逐个写入 .input/yyyymmdd/ 目录
-    saved: List[str] = []
+    saved = []
     for rel, data in payloads:
         b64_content = base64.b64encode(data).decode("ascii")
         target = f".input/{date_dir}/{rel}"
@@ -498,6 +609,295 @@ async def upload_file(
     return {"success": True, "paths": saved}
 
 
+# ===== 大文件分片上传（init / chunk / complete 三段式） =====
+
+
+class UploadInitRequest(BaseModel):
+    """分片上传初始化请求体。"""
+
+    file_name: str
+    rel_path: str = ""  # 相对目录（保留文件夹层级），空为 .input 根
+    total_size: int
+    chunk_size: int = 4 * 1024 * 1024
+
+
+class UploadChunkRequest(BaseModel):
+    """分片上传数据块请求体（data 为 base64 编码的块内容）。"""
+
+    upload_id: str
+    index: int
+    data: str
+
+
+class UploadCompleteRequest(BaseModel):
+    """分片上传完成请求体。"""
+
+    upload_id: str
+    total_chunks: int
+
+
+def _sanitize_rel_path(rel: str, field: str = "rel_path") -> str:
+    """校验工作空间内相对路径：拒绝绝对路径 / ``..`` 段 / 反斜杠，非法抛 400。"""
+    p = (rel or "").strip().replace("\\", "/").strip("/")
+    if not p:
+        raise HTTPException(status_code=400, detail=f"{field} 不能为空")
+    if p.startswith("/"):
+        raise HTTPException(status_code=400, detail=f"{field} 不允许绝对路径")
+    if ".." in p.split("/"):
+        raise HTTPException(status_code=400, detail=f"{field} 不允许包含 .. 段")
+    return p
+
+
+def _validate_upload_id(upload_id: str) -> None:
+    """校验 upload_id 格式（32 位 hex），防止路径穿越。"""
+    import re
+
+    if not re.fullmatch(r"[0-9a-f]{32}", upload_id or ""):
+        raise HTTPException(status_code=400, detail="upload_id 非法")
+
+
+def _upload_staging_dir(upload_id: str) -> Path:
+    """云端模式分片暂存目录（server/data/upload_chunks/{upload_id}/）。"""
+    return (
+        Path(__file__).resolve().parent.parent
+        / "data" / "upload_chunks" / upload_id
+    )
+
+
+def _default_chunk_size() -> int:
+    """分片大小（服务端定标）：``upload.chunk_size``，缺省 4MB。
+
+    服务端统一定标并随 init 返回，前端按返回值切片，避免各端不一致。
+    """
+    upload_cfg = get_config().get("upload", {})
+    return max(64 * 1024, _parse_size(upload_cfg.get("chunk_size"), 4 * 1024 * 1024))
+
+
+@router.post("/files/{workspace_id}/upload_init")
+async def upload_init(
+    workspace_id: str,
+    req: UploadInitRequest,
+    request: Request,
+    team_id: str = Query("", description="所属顶层 agent ID（本地/SSH 模式判定与执行隔离键）"),
+    current_user: dict = Depends(get_current_user),
+):
+    """初始化大文件分片上传，返回 ``{"upload_id", "chunk_size"}``。
+
+    三模式分派：本地/SSH 模式把 ``upload_init`` 委托前端执行器（前端打开
+    本地文件 / SFTP 远端文件等待追加写）；云端模式在服务端建立分片暂存目录
+    （server/data/upload_chunks/{upload_id}/），complete 时组装进容器。
+
+    校验：``total_size`` 不超过 ``upload.max_file_size``；云端模式额外校验
+    沙箱总大小上限。
+    """
+    assert_workspace_owned(workspace_id, current_user)
+    upload_cfg = get_config().get("upload", {})
+    max_file_size = _parse_size(upload_cfg.get("max_file_size"), 10 * 1024 * 1024)
+    if req.total_size > max_file_size:
+        raise HTTPException(
+            status_code=413,
+            detail=f"文件过大（{req.file_name}），最大支持 {max_file_size} 字节",
+        )
+    # 相对路径 = 子目录（可空）+ 文件名，统一落在 .input/{日期}/ 下
+    sub_dir = _sanitize_rel_path(req.rel_path, "rel_path") if req.rel_path.strip() else ""
+    file_name = _sanitize_rel_path(req.file_name, "file_name")
+    rel = f"{sub_dir}/{file_name}" if sub_dir else file_name
+    date_dir = datetime.datetime.now().strftime("%Y%m%d")
+    rel_path = f".input/{date_dir}/{rel}"
+
+    user_id = current_user.get("openid", "")
+    local_key = team_id or workspace_id
+    ctx = _frontend_mode_ctx(user_id, local_key)
+    upload_id = uuid.uuid4().hex
+
+    if ctx is not None:
+        # 本地/SSH 模式：委托前端执行器初始化（打开文件句柄等待分片追加）
+        result = await asyncio.to_thread(
+            ctx["local_executor"].request,
+            ctx["ws_manager"],
+            user_id,
+            {
+                "op": "upload_init",
+                "workspace_id": workspace_id,
+                "upload_id": upload_id,
+                "rel_path": rel_path,
+                "total_size": int(req.total_size),
+                "chunk_size": _default_chunk_size(),
+            },
+            team_id=local_key,
+        )
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result)
+        return {"upload_id": upload_id, "chunk_size": _default_chunk_size()}
+
+    # 云端模式：沙箱总大小校验 + 建立分片暂存目录
+    docker_manager = _get_docker_manager()
+    sandbox_max_size = _parse_size(
+        upload_cfg.get("sandbox_max_size"), 1024 * 1024 * 1024
+    )
+    current_size = _get_workspace_size(docker_manager, workspace_id)
+    if current_size + req.total_size > sandbox_max_size:
+        raise HTTPException(
+            status_code=413,
+            detail=f"沙箱总大小将超过上限 {sandbox_max_size} 字节",
+        )
+    staging = _upload_staging_dir(upload_id)
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "meta.json").write_text(
+        json.dumps(
+            {
+                "workspace_id": workspace_id,
+                "rel_path": rel_path,
+                "total_size": int(req.total_size),
+                "received": 0,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return {"upload_id": upload_id, "chunk_size": _default_chunk_size()}
+
+
+@router.post("/files/{workspace_id}/upload_chunk")
+async def upload_chunk(
+    workspace_id: str,
+    req: UploadChunkRequest,
+    request: Request,
+    team_id: str = Query("", description="所属顶层 agent ID（本地/SSH 模式判定与执行隔离键）"),
+    current_user: dict = Depends(get_current_user),
+):
+    """上传一个分片（base64 编码），返回 ``{"received": true, "index": N}``。
+
+    本地/SSH 模式委托前端执行器在已打开的文件上按 offset 追加；云端模式把
+    分片字节写入暂存目录（``{index:06d}.part``）。
+    """
+    assert_workspace_owned(workspace_id, current_user)
+    _validate_upload_id(req.upload_id)
+    if req.index < 0:
+        raise HTTPException(status_code=400, detail="index 不能为负")
+
+    user_id = current_user.get("openid", "")
+    local_key = team_id or workspace_id
+    ctx = _frontend_mode_ctx(user_id, local_key)
+
+    if ctx is not None:
+        result = await asyncio.to_thread(
+            ctx["local_executor"].request,
+            ctx["ws_manager"],
+            user_id,
+            {
+                "op": "upload_chunk",
+                "workspace_id": workspace_id,
+                "upload_id": req.upload_id,
+                "index": int(req.index),
+                "data_base64": req.data,
+            },
+            team_id=local_key,
+        )
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result)
+        return {"received": True, "index": req.index}
+
+    staging = _upload_staging_dir(req.upload_id)
+    meta_path = staging / "meta.json"
+    if not meta_path.exists():
+        raise HTTPException(status_code=404, detail="分片会话不存在或已过期")
+    try:
+        chunk = base64.b64decode(req.data, validate=True)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"data 不是合法 base64: {exc}")
+    (staging / f"{req.index:06d}.part").write_bytes(chunk)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["received"] = int(meta.get("received", 0)) + len(chunk)
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    return {"received": True, "index": req.index}
+
+
+@router.post("/files/{workspace_id}/upload_complete")
+async def upload_complete(
+    workspace_id: str,
+    req: UploadCompleteRequest,
+    request: Request,
+    team_id: str = Query("", description="所属顶层 agent ID（本地/SSH 模式判定与执行隔离键）"),
+    current_user: dict = Depends(get_current_user),
+):
+    """完成分片上传：组装文件并返回 ``{"success": true, "path": "..."}``。
+
+    本地/SSH 模式委托前端执行器关闭文件句柄并校验大小；云端模式按序组装
+    暂存分片写入容器 ``.input/{日期}/{rel_path}``（首个分片经
+    ``docker_manager.write_file`` 流式落盘，后续分片 base64 追加，避免单条
+    巨型命令），完成后清理暂存目录。
+    """
+    assert_workspace_owned(workspace_id, current_user)
+    _validate_upload_id(req.upload_id)
+
+    user_id = current_user.get("openid", "")
+    local_key = team_id or workspace_id
+    ctx = _frontend_mode_ctx(user_id, local_key)
+
+    if ctx is not None:
+        # 本地/SSH 模式：执行器按 init 时记录的 rel_path 关闭句柄并校验
+        result = await asyncio.to_thread(
+            ctx["local_executor"].request,
+            ctx["ws_manager"],
+            user_id,
+            {
+                "op": "upload_complete",
+                "workspace_id": workspace_id,
+                "upload_id": req.upload_id,
+                "total_chunks": int(req.total_chunks),
+            },
+            team_id=local_key,
+        )
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result)
+        return {
+            "success": True,
+            "path": result.get("path") or result.get("file_path") or "",
+            "size": result.get("size", 0),
+        }
+
+    # 云端模式：组装暂存分片 → 写入容器 → 清理
+    staging = _upload_staging_dir(req.upload_id)
+    meta_path = staging / "meta.json"
+    if not meta_path.exists():
+        raise HTTPException(status_code=404, detail="分片会话不存在或已过期")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    parts = sorted(staging.glob("*.part"))
+    if len(parts) != req.total_chunks:
+        raise HTTPException(
+            status_code=400,
+            detail=f"分片不完整：已收到 {len(parts)}/{req.total_chunks}",
+        )
+    docker_manager = _get_docker_manager()
+    rel_path = meta.get("rel_path", "")
+    target = rel_path
+    safe_target = _escape_shell_path(target)
+    # 首个分片经 write_file 流式落盘（put_archive，无 shell 参与）
+    first = parts[0].read_bytes()
+    result = docker_manager.write_file(workspace_id, target, first)
+    if result.get("exit_code", -1) != 0 or "error" in result:
+        raise HTTPException(
+            status_code=500,
+            detail=f"上传失败: {result.get('error') or result.get('detail') or ''}",
+        )
+    # 后续分片 base64 追加（分片 ≤ chunk_size，命令体可控）
+    for part in parts[1:]:
+        b64_content = base64.b64encode(part.read_bytes()).decode("ascii")
+        result = docker_manager.exec_in_workspace(
+            workspace_id,
+            ["sh", "-c", 'echo "$1" | base64 -d >> "$2"', "sh", b64_content, safe_target],
+        )
+        if "error" in result and "exit_code" not in result:
+            raise HTTPException(status_code=404, detail=result)
+        if result.get("exit_code", 0) != 0:
+            raise HTTPException(
+                status_code=500, detail=f"上传失败: {result.get('stdout', '')}"
+            )
+    shutil.rmtree(staging, ignore_errors=True)
+    return {"success": True, "path": f"/workspace/{target}", "size": meta.get("total_size", 0)}
+
+
 class FileDownloadRequest(BaseModel):
     """文件下载请求体。"""
 
@@ -509,7 +909,8 @@ async def download_file(
     workspace_id: str,
     req: FileDownloadRequest,
     request: Request,
-    top_agent_id: str = Query("", description="所属顶层 agent ID（成员浏览时传入，用于本地模式判定）"),
+    # 前端 FileViewer 尚未携带 team_id（lib 侧待补传），暂为可选
+    team_id: str = Query("", description="所属顶层 agent ID（本地模式判定与执行隔离键；前端待补传）"),
     current_user: dict = Depends(get_current_user),
 ):
     """从工作空间下载文件，返回文件内容（StreamingResponse）。
@@ -519,7 +920,7 @@ async def download_file(
     """
     assert_workspace_owned(workspace_id, current_user)
     content = await _read_file_bytes(
-        workspace_id, req.path, current_user, top_agent_id
+        workspace_id, req.path, current_user, team_id
     )
     filename = req.path.rsplit("/", 1)[-1] or "download"
     # 使用 RFC 5987 格式支持非 Latin-1 字符（如中文文件名）
@@ -538,18 +939,19 @@ async def download_folder(
     workspace_id: str,
     req: FileDownloadRequest,
     request: Request,
-    top_agent_id: str = Query("", description="所属顶层 agent ID（成员浏览时传入，用于本地模式判定）"),
+    # 前端 FilePanel 尚未携带 team_id（lib 侧待补传），暂为可选
+    team_id: str = Query("", description="所属顶层 agent ID（本地模式判定与执行隔离键；前端待补传）"),
     current_user: dict = Depends(get_current_user),
 ):
     """从工作空间下载文件夹，打包为 tar.gz 返回。"""
     assert_workspace_owned(workspace_id, current_user)
-    # 本地模式暂不支持文件夹打包下载（tar 命令与路径跨平台差异较大）
+    # 本地/SSH 模式暂不支持文件夹打包下载（tar 命令与路径跨平台差异较大）
     user_id = current_user.get("openid", "")
-    local_key = top_agent_id or workspace_id
-    if _local_mode_ctx(user_id, local_key) is not None:
+    local_key = team_id or workspace_id
+    if _frontend_mode_ctx(user_id, local_key) is not None:
         raise HTTPException(
             status_code=400,
-            detail="本地模式暂不支持文件夹打包下载，请逐个下载文件",
+            detail="本地/SSH 模式暂不支持文件夹打包下载，请逐个下载文件",
         )
     docker_manager = _get_docker_manager()
     safe_path = _escape_shell_path(req.path)
@@ -581,19 +983,19 @@ async def _read_file_bytes(
     workspace_id: str,
     path: str,
     current_user: Optional[dict] = None,
-    top_agent_id: str = "",
+    team_id: str = "",
 ) -> bytes:
     """从工作空间读取文件原始字节。
 
-    本地模式下通过反向 WS 让前端本地执行器读取本机文件（base64 回传），
+    本地/SSH 模式下通过反向 WS 让前端执行器读取文件（base64 回传），
     服务器端解码后返回字节；云端模式在容器内用 base64 编码文件内容，
     服务器端解码后返回字节。适用于 PDF 等二进制文件。
     """
-    # 本地模式：转发给前端本地执行器，读取本机文件字节（base64 回传）
+    # 本地/SSH 模式：委托前端执行器读取文件字节（base64 回传）
     if current_user:
         user_id = current_user.get("openid", "")
-        local_key = top_agent_id or workspace_id
-        ctx = _local_mode_ctx(user_id, local_key)
+        local_key = team_id or workspace_id
+        ctx = _frontend_mode_ctx(user_id, local_key)
         if ctx is not None:
             result = await asyncio.to_thread(
                 ctx["local_executor"].request,
@@ -604,6 +1006,7 @@ async def _read_file_bytes(
                     "workspace_id": workspace_id,
                     "path": path,
                 },
+                team_id=local_key,
             )
             if "error" in result or result.get("exit_code", 0) != 0:
                 raise HTTPException(status_code=404, detail="文件不存在或无法读取")
@@ -653,7 +1056,8 @@ async def get_pdf_info(
     workspace_id: str,
     request: Request,
     path: str = Query(..., description="PDF 文件路径"),
-    top_agent_id: str = Query("", description="所属顶层 agent ID（成员浏览时传入，用于本地模式判定）"),
+    # 前端 FileViewer 尚未携带 team_id（lib 侧待补传），暂为可选
+    team_id: str = Query("", description="所属顶层 agent ID（本地模式判定与执行隔离键；前端待补传）"),
     current_user: dict = Depends(get_current_user),
 ):
     """获取 PDF 文件信息（总页数、标题、作者）。
@@ -668,7 +1072,7 @@ async def get_pdf_info(
 
     assert_workspace_owned(workspace_id, current_user)
     pdf_bytes = await _read_file_bytes(
-        workspace_id, path, current_user, top_agent_id
+        workspace_id, path, current_user, team_id
     )
     tmp_path = _save_temp_pdf(pdf_bytes)
     try:
@@ -696,7 +1100,8 @@ async def get_pdf_preview(
     path: str = Query(..., description="PDF 文件路径"),
     page: int = Query(1, ge=1, description="页码，从 1 开始"),
     scale: float = Query(2.0, gt=0, description="缩放比例"),
-    top_agent_id: str = Query("", description="所属顶层 agent ID（成员浏览时传入，用于本地模式判定）"),
+    # 前端 FileViewer 尚未携带 team_id（lib 侧待补传），暂为可选
+    team_id: str = Query("", description="所属顶层 agent ID（本地模式判定与执行隔离键；前端待补传）"),
     current_user: dict = Depends(get_current_user),
 ):
     """获取 PDF 指定页的预览图片（PNG，base64 编码）。
@@ -711,7 +1116,7 @@ async def get_pdf_preview(
 
     assert_workspace_owned(workspace_id, current_user)
     pdf_bytes = await _read_file_bytes(
-        workspace_id, path, current_user, top_agent_id
+        workspace_id, path, current_user, team_id
     )
     tmp_path = _save_temp_pdf(pdf_bytes)
     try:
@@ -952,7 +1357,7 @@ async def git_log(
     workspace_id: str,
     request: Request,
     limit: int = 50,
-    top_agent_id: str = Query("", description="所属顶层 agent ID（成员浏览时传入，用于本地模式判定）"),
+    team_id: str = Query(..., description="所属顶层 agent ID（本地模式判定与执行隔离键，必填）"),
     current_user: dict = Depends(get_current_user),
 ):
     """查看提交历史。
@@ -963,7 +1368,7 @@ async def git_log(
     assert_workspace_owned(workspace_id, current_user)
     # 本地模式：转发给前端本地执行器，在本机工作空间执行 git log
     user_id = current_user.get("openid", "")
-    local_key = top_agent_id or workspace_id
+    local_key = team_id or workspace_id
     ctx = _local_mode_ctx(user_id, local_key)
     if ctx is not None:
         result = await asyncio.to_thread(
@@ -975,17 +1380,21 @@ async def git_log(
                 "workspace_id": workspace_id,
                 "limit": int(limit),
             },
+            team_id=local_key,
         )
         if "error" in result:
             raise HTTPException(status_code=500, detail=result)
         return {"commits": result.get("commits", [])}
 
     # SSH 模式：SSH 连接由前端发起，后端经反向 WS 委托前端执行 git log
-    mode = mode_resolver.resolve_mode(user_id, top_agent_id or workspace_id)
+    mode = mode_resolver.resolve_mode(user_id, team_id or workspace_id)
     if mode == "ssh":
         from io_.ssh_workspace_io import SSHWorkspaceIO
 
-        ssh = SSHWorkspaceIO(state.local_executor, state.ws_manager, user_id)
+        ssh = SSHWorkspaceIO(
+            state.local_executor, state.ws_manager, user_id,
+            team_id=team_id or workspace_id,
+        )
         result = await ssh.git_log(workspace_id, limit=int(limit))
         if result.get("error"):
             raise HTTPException(status_code=500, detail=result)
@@ -1002,14 +1411,14 @@ async def git_log(
 async def git_branches(
     workspace_id: str,
     request: Request,
-    top_agent_id: str = Query("", description="所属顶层 agent ID（成员浏览时传入，用于本地模式判定）"),
+    team_id: str = Query(..., description="所属顶层 agent ID（本地模式判定与执行隔离键，必填）"),
     current_user: dict = Depends(get_current_user),
 ):
     """查看分支列表，返回 ``{"branches": [...], "current": "..."}``。"""
     assert_workspace_owned(workspace_id, current_user)
     # 本地模式：转发给前端本地执行器，在本机工作空间执行 git branch
     user_id = current_user.get("openid", "")
-    local_key = top_agent_id or workspace_id
+    local_key = team_id or workspace_id
     ctx = _local_mode_ctx(user_id, local_key)
     if ctx is not None:
         result = await asyncio.to_thread(
@@ -1017,6 +1426,7 @@ async def git_branches(
             ctx["ws_manager"],
             user_id,
             {"op": "git_branches", "workspace_id": workspace_id},
+            team_id=local_key,
         )
         if "error" in result:
             raise HTTPException(status_code=500, detail=result)
@@ -1026,11 +1436,14 @@ async def git_branches(
         }
 
     # SSH 模式：SSH 连接由前端发起，后端经反向 WS 委托前端执行 git branch
-    mode = mode_resolver.resolve_mode(user_id, top_agent_id or workspace_id)
+    mode = mode_resolver.resolve_mode(user_id, team_id or workspace_id)
     if mode == "ssh":
         from io_.ssh_workspace_io import SSHWorkspaceIO
 
-        ssh = SSHWorkspaceIO(state.local_executor, state.ws_manager, user_id)
+        ssh = SSHWorkspaceIO(
+            state.local_executor, state.ws_manager, user_id,
+            team_id=team_id or workspace_id,
+        )
         result = await ssh.git_branches(workspace_id)
         if result.get("error"):
             raise HTTPException(status_code=500, detail=result)
@@ -1115,7 +1528,7 @@ async def git_fetch(
 class SSHRegisterRequest(BaseModel):
     """注册 SSH 运行模式请求体。"""
 
-    top_agent_id: str
+    team_id: str
     host: str
     port: int = 22
     username: str = ""
@@ -1143,20 +1556,20 @@ async def register_ssh(
     与 local 模式互斥：同一 top agent 已启用 local 时拒绝（须先注销 local）。
     """
     user_id = current_user.get("openid", "")
-    top_agent_id = req.top_agent_id.strip()
-    if not top_agent_id:
-        raise HTTPException(status_code=400, detail="top_agent_id 不能为空")
+    team_id = req.team_id.strip()
+    if not team_id:
+        raise HTTPException(status_code=400, detail="team_id 不能为空")
 
     from io_.mode_resolver import check_exclusive
 
-    ok, reason = check_exclusive(user_id, top_agent_id, "ssh")
+    ok, reason = check_exclusive(user_id, team_id, "ssh")
     if not ok:
         raise HTTPException(status_code=409, detail=reason)
 
     ssh_manager = _get_ssh_manager()
     ok, message = ssh_manager.register(
         user_id,
-        top_agent_id,
+        team_id,
         {
             "host": req.host,
             "port": req.port,
@@ -1168,18 +1581,18 @@ async def register_ssh(
     )
     if not ok:
         raise HTTPException(status_code=400, detail=message)
-    return {"success": True, "top_agent_id": top_agent_id}
+    return {"success": True, "team_id": team_id}
 
 
 @router.delete("/ssh")
 async def unregister_ssh(
-    top_agent_id: str = Query("", description="顶部 agent ID"),
+    team_id: str = Query(..., description="顶部 agent ID（必填）"),
     current_user: dict = Depends(get_current_user),
 ):
     """注销 SSH 运行模式：关闭连接并删除配置（该 agent 恢复云端执行）。"""
     user_id = current_user.get("openid", "")
-    if not top_agent_id:
-        raise HTTPException(status_code=400, detail="top_agent_id 不能为空")
+    if not team_id:
+        raise HTTPException(status_code=400, detail="team_id 不能为空")
     ssh_manager = _get_ssh_manager()
-    removed = ssh_manager.unregister(user_id, top_agent_id)
+    removed = ssh_manager.unregister(user_id, team_id)
     return {"success": True, "removed": removed}

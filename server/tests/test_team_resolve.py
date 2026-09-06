@@ -36,7 +36,7 @@ def _tool(user_id="u1", agent_id="a1", top="top1", members=None):
         user_id=user_id,
         agent_id=agent_id,
         leader_id=agent_id,
-        top_agent_id=top,
+        team_id=top,
     )
     tool.members = members or []
     return tool

@@ -19,10 +19,10 @@ class _FakeLocalExecutor:
     def __init__(self, base_dir: str = "") -> None:
         self._base_dir = base_dir
 
-    def is_local(self, user_id: str, top_agent_id=None) -> bool:
+    def is_local(self, user_id: str, team_id=None) -> bool:
         return bool(self._base_dir)
 
-    def base_dir_of(self, user_id: str, top_agent_id=None) -> str:
+    def base_dir_of(self, user_id: str, team_id=None) -> str:
         return self._base_dir
 
 
@@ -47,7 +47,7 @@ def test_local_mode_writes_to_base_dir(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(state, "docker_manager", None)
 
     uploaded = _upload_attachments(
-        "top", [str(src)], user_id="u1", top_agent_id="top"
+        "top", [str(src)], user_id="u1", team_id="top"
     )
 
     assert uploaded, "本地模式应成功上报附件路径"
@@ -66,7 +66,7 @@ def test_local_mode_skips_non_existent(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(state, "docker_manager", None)
 
     uploaded = _upload_attachments(
-        "top", [str(tmp_path / "nope.png")], user_id="u1", top_agent_id="top"
+        "top", [str(tmp_path / "nope.png")], user_id="u1", team_id="top"
     )
     assert uploaded == []
 
@@ -77,7 +77,7 @@ def test_cloud_mode_skips_when_docker_unavailable(tmp_path, monkeypatch) -> None
     monkeypatch.setattr(state, "docker_manager", None)
 
     uploaded = _upload_attachments(
-        "top", [str(tmp_path / "x.png")], user_id="u1", top_agent_id="top"
+        "top", [str(tmp_path / "x.png")], user_id="u1", team_id="top"
     )
     assert uploaded == []
 
@@ -91,7 +91,7 @@ def test_cloud_mode_writes_to_docker(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(state, "docker_manager", docker)
 
     uploaded = _upload_attachments(
-        "top", [str(src)], user_id="u1", top_agent_id="top"
+        "top", [str(src)], user_id="u1", team_id="top"
     )
     assert uploaded and uploaded[0].startswith("/workspace/.input/")
     assert docker.calls, "云端模式应调用 docker write_file"

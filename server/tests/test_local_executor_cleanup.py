@@ -80,10 +80,10 @@ class TestPendingCleanup(unittest.TestCase):
         t = threading.Thread(target=do_request)
         t.start()
         msg = ws.wait_message()
-        exec_id = msg["data"]["exec_id"]
+        tool_id = msg["data"]["tool_id"]
 
         def do_resolve():
-            box["resolved"] = client.resolve("u1", exec_id, {"exit_code": 0, "content": "hello"})
+            box["resolved"] = client.resolve("u1", tool_id, {"exit_code": 0, "content": "hello"})
 
         tr = threading.Thread(target=do_resolve)
         tr.start()
@@ -111,16 +111,16 @@ class TestPendingCleanup(unittest.TestCase):
         t = threading.Thread(target=do_request)
         t.start()
         msg = ws.wait_message()
-        exec_id = msg["data"]["exec_id"]
+        tool_id = msg["data"]["tool_id"]
         t.join(timeout=8)
 
         self.assertIn("error", box["res"])
         self.assertEqual(len(client._pending), 0)
         # 迟到响应：无法匹配，返回 False
-        self.assertFalse(client.resolve("u2", exec_id, {"exit_code": 0, "stdout": "late"}))
+        self.assertFalse(client.resolve("u2", tool_id, {"exit_code": 0, "stdout": "late"}))
 
     def test_duplicate_repush_after_success_is_safely_rejected(self):
-        """成功后前端重复推送同一 exec_id：resolve 返回 False，无副作用。"""
+        """成功后前端重复推送同一 tool_id：resolve 返回 False，无副作用。"""
         client = self._make_client(user="u3")
         ws = _FakeWS()
         box = {}
@@ -133,11 +133,11 @@ class TestPendingCleanup(unittest.TestCase):
         t = threading.Thread(target=do_request)
         t.start()
         msg = ws.wait_message()
-        exec_id = msg["data"]["exec_id"]
-        self.assertTrue(client.resolve("u3", exec_id, {"exit_code": 0, "content": "hello"}))
+        tool_id = msg["data"]["tool_id"]
+        self.assertTrue(client.resolve("u3", tool_id, {"exit_code": 0, "content": "hello"}))
         t.join(timeout=8)
         self.assertEqual(box["res"], {"exit_code": 0, "content": "hello"})
-        self.assertFalse(client.resolve("u3", exec_id, {"exit_code": 0, "content": "hello"}))
+        self.assertFalse(client.resolve("u3", tool_id, {"exit_code": 0, "content": "hello"}))
         self.assertEqual(len(client._pending), 0)
 
     def test_unregister_fails_pending_requests(self):
@@ -148,7 +148,10 @@ class TestPendingCleanup(unittest.TestCase):
 
         def do_request():
             box["res"] = client.request(
-                ws, "u4", {"op": "exec_shell", "workspace_id": "top", "command": "sleep"}, timeout=8
+                ws, "u4",
+                {"op": "exec_shell", "workspace_id": "top", "command": "sleep",
+                 "team_id": "top"},
+                timeout=8
             )
 
         t = threading.Thread(target=do_request)

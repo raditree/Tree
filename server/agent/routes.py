@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 import state
 from agent.chat import (
+    USER_AGENT_ID,
     _active_tasks,
     _clear_compacting_task,
     _dispatch_agent_message,
@@ -573,6 +574,9 @@ async def send_teammate_message(
     # 会话隔离：成员处理按 session_id 归集，缺省回退默认会话。
     # 若丢失 session_id，会串入默认会话（与其他会话交叉）。
     session_id = (body or {}).get("session_id") or DEFAULT_SESSION
+    # active（Task 7.1）：是否为用户主动发起，默认 true；被动推送场景
+    # 可显式传 false，接收侧不触发总结反向推送。
+    active = bool((body or {}).get("active", True))
 
     # 收敛出口：统一消息 API（用户 -> 成员，走顶部 agent 的 roster 校验与投递）
     # 本地模式下 _find_roster_member 经反向 WS 读 roster（阻塞），放入线程池
@@ -581,11 +585,14 @@ async def send_teammate_message(
         user_id,
         [member_id],
         content,
-        source_agent_id="",
-        top_agent_id=agent_id,
-        # 用户直发：sender_id 置空，成员总结只留在成员会话/teammates 窗口，
-        # 不转发给任何 agent（更不回发给 top），避免把顶部 agent 卷进来。
-        extra={"session_id": session_id, "sender_id": ""},
+        # 用户直发：source_agent_id 统一标记为 USER_AGENT_ID（历史为空串）
+        source_agent_id=USER_AGENT_ID,
+        team_id=agent_id,
+        # 用户直发：sender_id 统一标记为 USER_AGENT_ID，成员总结只留在成员
+        # 会话/teammates 窗口，不转发给任何 agent（更不回发给 top），避免把
+        # 顶部 agent 卷进来。
+        extra={"session_id": session_id, "sender_id": USER_AGENT_ID},
+        active=active,
     )
     if result.get("status") == "error":
         return {"success": False, "error": "消息投递失败", "detail": result}
@@ -1017,11 +1024,13 @@ async def answer_question_api(
         resume_after_answer(
             pending["user_id"],
             pending["agent_id"],
-            pending["top_agent_id"],
+            pending["team_id"],
             pending["session_id"],
             answer,
             pending["is_member"],
-            pending.get("sender_id", ""),
+            # 原发送方：成员续跑后总结精确回发到"谁发给它的那位"；
+            # 旧数据空串（用户直发）归一为 USER_AGENT_ID（读取侧等效）。
+            pending.get("sender_id") or USER_AGENT_ID,
         )
     )
     return {"success": True, "qid": qid, "status": "answered"}

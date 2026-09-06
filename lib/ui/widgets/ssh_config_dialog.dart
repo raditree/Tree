@@ -203,7 +203,7 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
                 decoration: const InputDecoration(
                   labelText: '远端基础目录',
                   hintText: '/',
-                  helperText: '顶部 agent 文件落在此目录下；成员落在其 workspaces/ 子目录',
+                  helperText: '成员与顶部 agent 共用此目录；各 agent 私人记忆在 agentspace/{id}/.self 下',
                   prefixIcon: Icon(Icons.folder_outlined, size: 20),
                                     isDense: true,
                 ),

@@ -55,25 +55,25 @@ def _fmt_ts(value: Any) -> str:
         return str(value)
 
 
-def _resolve_team_limits(top_agent_id: str) -> Tuple[int, int]:
+def _resolve_team_limits(team_id: str) -> Tuple[int, int]:
     """按 TOP 的团队记录解析规模限制，返回 ``(max_level, max_members_per_level)``。
 
     团队配置在创建 TOP agent 时由用户设定并持久化到 ``teams`` 表
     （创建后不可修改，成员只增不减）；旧数据无团队记录/配置列缺失时回退
     ``config.team`` 的代码默认值。不再读取用户等级 / app.yaml / docker 配置。
 
-    :param top_agent_id: 所属顶层 agent ID（顶部 agent 自身即 agent_id）
+    :param team_id: 所属顶层 agent ID（顶部 agent 自身即 agent_id）
     :return: ``(max_level, max_members_per_level)``，均 >=1
     """
     from config.team import DEFAULT_TEAM_MAX_LEVEL, DEFAULT_TEAM_MAX_MEMBERS
     from data.team_store import get_team
 
     team = None
-    if top_agent_id:
+    if team_id:
         try:
-            team = get_team(top_agent_id)
+            team = get_team(team_id)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("读取团队配置失败(按默认值): %s: %s", top_agent_id, exc)
+            logger.warning("读取团队配置失败(按默认值): %s: %s", team_id, exc)
     max_level = DEFAULT_TEAM_MAX_LEVEL
     max_members = DEFAULT_TEAM_MAX_MEMBERS
     if isinstance(team, dict):
@@ -109,7 +109,7 @@ class TeamTool:
         user_id: str = "",
         agent_id: str = "",
         leader_id: str = "",
-        top_agent_id: str = "",
+        team_id: str = "",
         message_dispatcher: Any = None,
         io: Any = None,
         session_id: str = "",
@@ -124,7 +124,7 @@ class TeamTool:
         :param user_id: 当前 leader 的用户标识，投递成员消息时使用
         :param agent_id: 当前 agent 的 ID
         :param leader_id: 当前 agent 的上级 leader ID（用于队友向 leader 发消息）
-        :param top_agent_id: 顶层 agent 的 ID，用于预算追踪（团队成员共享顶层预算）
+        :param team_id: 顶层 agent 的 ID，用于预算追踪（团队成员共享顶层预算）
         :param session_id: 当前会话 ID（透传到成员投递，保证成员上下文
                            按 session 隔离；为空时投递回退默认会话）
         """
@@ -136,14 +136,14 @@ class TeamTool:
         self.user_id = user_id
         self.agent_id = agent_id
         self.leader_id = leader_id
-        self.top_agent_id = top_agent_id or agent_id
+        self.team_id = team_id or agent_id
         # 当前会话 ID：leader 投递成员消息时透传，成员上下文按 session 隔离
         self.session_id = session_id or ""
         # 统一消息发送回调（main 提供）：User-Agent / Agent-Agent 收敛出口
         self.message_dispatcher = message_dispatcher
         # 统一工作空间 IO（WorkspaceIO）：成员空间/roster/身份文件读写走统一通道，
         # 解决双轨制（team 工具走容器、成员工具走本地）导致的私人空间不可见问题。
-        # 本地模式 -> baseDir/workspaces/{id}/.self；云端模式 -> 容器路径。
+        # 本地模式 -> baseDir/agentspace/{id}/.self；云端模式 -> 容器路径。
         self.io: Any = io
 
         # 成员列表（内存，同时持久化到 team_roster.md）
@@ -158,7 +158,7 @@ class TeamTool:
         # 团队最大层级深度 + 每层成员上限：按所属 TOP 的团队记录解析
         # （创建 TOP 时设定，之后不可修改；未建队/旧数据回退代码默认值）
         self.max_team_level, self.max_members_per_level = _resolve_team_limits(
-            self.top_agent_id or self.agent_id
+            self.team_id or self.agent_id
         )
         # 当前 agent 是否可带领团队（由 set 工具设置；False 时不可创建子团队）
         self.can_lead_team: bool = True
@@ -428,11 +428,11 @@ class TeamTool:
         # 一致）：建队默认继承 TOP 模型，兼容历史空 model_id 成员，避免
         # 消息被 _process_member_message 因"模型不存在"静默丢弃。
         member_model = member.get("model_id", "") or ""
-        if not member_model and self.top_agent_id:
+        if not member_model and self.team_id:
             try:
                 from data.agent_store import get_agent
 
-                top_rec = get_agent(self.user_id, self.top_agent_id) or {}
+                top_rec = get_agent(self.user_id, self.team_id) or {}
                 member_model = top_rec.get("model_id") or ""
             except Exception as exc:  # noqa: BLE001
                 logger.warning("成员空 model_id 回退 TOP 模型失败: %s", exc)
@@ -446,7 +446,7 @@ class TeamTool:
                 "model_id": member_model,
                 "system_prompt": member.get("system_prompt", ""),
                 "leader_id": self.leader_id,
-                "top_agent_id": self.top_agent_id,
+                "team_id": self.team_id,
                 "content": content,
                 # 透传当前会话：成员上下文/历史按 session 隔离，避免多会话串扰
                 "session_id": self.session_id,
@@ -504,7 +504,7 @@ class TeamTool:
             f"({member.get('parent_workspace_id', '')})\n"
             f"- can_lead_team: {leading}\n"
         )
-        # 优先走统一 WorkspaceIO（本地模式 -> baseDir/workspaces/{id}/.self，
+        # 优先走统一 WorkspaceIO（本地模式 -> baseDir/agentspace/{id}/.self，
         # 成员工具立即可见）；io 不可用时回退 docker exec（云端容器）
         if self._io_write(ws_id, ".self/identity.md", content):
             return
@@ -638,7 +638,7 @@ class TeamTool:
             workspace_id=member_id,
             parent_workspace_id=self.workspace_id or None,
             agent_name=member_name,
-            shared_with=self.top_agent_id,
+            shared_with=self.team_id,
         )
         if "error" in ws_result:
             return {"error": "创建成员工作空间失败", "detail": ws_result}
@@ -682,7 +682,7 @@ class TeamTool:
 
         # 初始化成员私人空间 .self（identity/rule/memory/activity），确保成员
         # 工具循环立即可读自己的身份与记忆，无需自行猜测路径（双轨制统一：
-        # 本地模式经 WorkspaceIO 落到 baseDir/workspaces/{member_id}/.self）
+        # 本地模式经 WorkspaceIO 落到 baseDir/agentspace/{member_id}/.self）
         self._init_member_private_space(member)
 
         # 记录到成员管理表（视图）+ team_members 表（权威名单，含直属 leader）。
@@ -695,7 +695,7 @@ class TeamTool:
 
             add_member(
                 user_id=self.user_id,
-                top_agent_id=self.top_agent_id or self.agent_id,
+                team_id=self.team_id or self.agent_id,
                 member_id=member_id,
                 name=member.get("name", ""),
                 role=member.get("role", ""),
@@ -851,7 +851,7 @@ class TeamTool:
         """
         from data.team_store import get_members
 
-        top_id = self.top_agent_id or self.agent_id
+        top_id = self.team_id or self.agent_id
         if not top_id:
             return []
         try:
@@ -879,7 +879,7 @@ class TeamTool:
                 "container_id": "",
                 "parent_workspace_id": self.workspace_id,
                 "parent_agent_id": parent_id,
-                "top_agent_id": top_id,
+                "team_id": top_id,
                 "leader_name": leader_name,
                 "created_at": _fmt_ts(r.get("created_at")),
                 "work_status": r.get("work_status", "idle"),
@@ -1243,7 +1243,7 @@ class TeamTool:
         """把内存中的成员字段变更同步到 ``team_members`` 表（权威名单）。"""
         from data.team_store import get_members, update_member
 
-        top_id = self.top_agent_id or self.agent_id
+        top_id = self.team_id or self.agent_id
         if not top_id:
             return
         patch = {k: v for k, v in fields.items() if v is not None}
@@ -1280,7 +1280,7 @@ class TeamTool:
         """
         from data.team_store import get_members
 
-        top_id = self.top_agent_id or self.agent_id
+        top_id = self.team_id or self.agent_id
         if not top_id:
             return 0
         members = []
@@ -1331,7 +1331,7 @@ class TeamTool:
                 "model_id": m.get("model_id", ""),
                 "system_prompt": m.get("system_prompt", ""),
                 "leader_id": self.agent_id or top_id,
-                "top_agent_id": top_id,
+                "team_id": top_id,
                 "content": ("【团队名单已更新】\n"
                             "请刷新你的成员拓扑认知，以最新名单为准：\n"
                             + roster_md),
@@ -1587,7 +1587,7 @@ class TeamTool:
                 resolved_ids,
                 message,
                 source_agent_id=self.agent_id,
-                top_agent_id=self.top_agent_id,
+                team_id=self.team_id,
                 system_prompt="",
                 # 透传当前会话：成员上下文/历史按 session 隔离
                 extra={"session_id": self.session_id},
@@ -1657,7 +1657,7 @@ class TeamTool:
                 member_ids,
                 message,
                 source_agent_id=self.agent_id,
-                top_agent_id=self.top_agent_id,
+                team_id=self.team_id,
                 # 透传当前会话：成员上下文/历史按 session 隔离
                 extra={"session_id": self.session_id},
             )

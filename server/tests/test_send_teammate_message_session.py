@@ -66,22 +66,22 @@ class TestSendTeammateMessageSession(unittest.TestCase):
         self.assertEqual(tuple(dispatch.call_args.args)[:2],
                          (self.user_id, [self.member_id]))
         self.assertEqual(kwargs["extra"]["session_id"], self.session_id)
-        # 用户直发：sender_id 为显式空串（成员总结不回发给任何 agent）
-        self.assertEqual(kwargs["extra"]["sender_id"], "")
+        # 用户直发：sender_id 统一标记为 USER_AGENT_ID（"0"，成员总结不回发给任何 agent）
+        self.assertEqual(kwargs["extra"]["sender_id"], routes.USER_AGENT_ID)
 
     def test_user_direct_never_auto_replies_to_top(self):
-        """用户直发：extra 必须显式带 sender_id=""，绝不允许兜底成 top。"""
+        """用户直发：extra 必须显式带 sender_id=USER_AGENT_ID，绝不允许兜底成 top。"""
         result, dispatch = self._call(
             body={"content": "开工", "session_id": self.session_id},
             dispatch_result=FakeResult("sent"),
         )
         self.assertTrue(result["success"])
         kwargs = dispatch.call_args.kwargs
-        # source_agent_id 为空、top_agent_id 为顶部 agent；
-        # sender_id 必须被显式覆盖为空，而非 source or top 兜底成 top。
-        self.assertEqual(kwargs.get("source_agent_id"), "")
-        self.assertEqual(kwargs.get("top_agent_id"), self.agent_id)
-        self.assertEqual(kwargs["extra"]["sender_id"], "")
+        # source_agent_id 为用户标记（USER_AGENT_ID）、team_id 为顶部 agent；
+        # sender_id 必须被显式覆盖为用户标记，而非 source or top 兜底成 top。
+        self.assertEqual(kwargs.get("source_agent_id"), routes.USER_AGENT_ID)
+        self.assertEqual(kwargs.get("team_id"), self.agent_id)
+        self.assertEqual(kwargs["extra"]["sender_id"], routes.USER_AGENT_ID)
         self.assertNotEqual(kwargs["extra"]["sender_id"], self.agent_id)
 
     def test_defaults_to_default_session_when_absent(self):

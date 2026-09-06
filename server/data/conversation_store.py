@@ -116,7 +116,7 @@ def _ensure_db() -> None:
                 qid TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL,
                 agent_id TEXT NOT NULL,
-                top_agent_id TEXT NOT NULL DEFAULT '',
+                team_id TEXT NOT NULL DEFAULT '',
                 session_id TEXT NOT NULL,
                 is_member INTEGER NOT NULL DEFAULT 0,
                 question TEXT NOT NULL,
@@ -628,7 +628,7 @@ def prune_archived_context(retention_days: int) -> int:
 def save_pending_question(
     user_id: str,
     agent_id: str,
-    top_agent_id: str,
+    team_id: str,
     session_id: str,
     qid: str,
     question: str,
@@ -646,14 +646,14 @@ def save_pending_question(
     with _write_lock, connect() as conn:
         conn.execute(
             "INSERT INTO pending_questions "
-            "(qid, user_id, agent_id, top_agent_id, session_id, is_member, "
+            "(qid, user_id, agent_id, team_id, session_id, is_member, "
             "question, options, answer, status, sender_id, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending', ?, ?) "
             "ON CONFLICT(qid) DO UPDATE SET "
             "answer = NULL, status = 'pending', "
             "sender_id = excluded.sender_id, "
             "created_at = excluded.created_at",
-            (qid, user_id, agent_id, top_agent_id, session_id, is_member,
+            (qid, user_id, agent_id, team_id, session_id, is_member,
              question, options_json, sender_id, ts),
         )
         conn.commit()
@@ -666,7 +666,7 @@ def get_pending_question(qid: str) -> Optional[Dict[str, Any]]:
     try:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT qid, user_id, agent_id, top_agent_id, session_id, is_member, "
+            "SELECT qid, user_id, agent_id, team_id, session_id, is_member, "
             "question, options, answer, status, sender_id, created_at "
             "FROM pending_questions WHERE qid = ?",
             (qid,),
@@ -681,7 +681,7 @@ def get_pending_question(qid: str) -> Optional[Dict[str, Any]]:
             "qid": row["qid"],
             "user_id": row["user_id"],
             "agent_id": row["agent_id"],
-            "top_agent_id": row["top_agent_id"] or "",
+            "team_id": row["team_id"] or "",
             "session_id": row["session_id"],
             "is_member": bool(row["is_member"]),
             "question": row["question"],
@@ -744,7 +744,7 @@ def list_questions(
         conn.row_factory = sqlite3.Row
         if session_id:
             rows = conn.execute(
-                "SELECT qid, user_id, agent_id, top_agent_id, session_id, "
+                "SELECT qid, user_id, agent_id, team_id, session_id, "
                 "is_member, question, options, answer, status, sender_id, "
                 "created_at "
                 "FROM pending_questions WHERE user_id = ? AND session_id = ? "
@@ -753,7 +753,7 @@ def list_questions(
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT qid, user_id, agent_id, top_agent_id, session_id, "
+                "SELECT qid, user_id, agent_id, team_id, session_id, "
                 "is_member, question, options, answer, status, sender_id, "
                 "created_at "
                 "FROM pending_questions WHERE user_id = ? "
@@ -771,7 +771,7 @@ def list_questions(
                     "qid": row["qid"],
                     "user_id": row["user_id"],
                     "agent_id": row["agent_id"],
-                    "top_agent_id": row["top_agent_id"] or "",
+                    "team_id": row["team_id"] or "",
                     "session_id": row["session_id"],
                     "is_member": bool(row["is_member"]),
                     "question": row["question"],

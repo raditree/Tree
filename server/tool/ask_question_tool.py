@@ -47,7 +47,7 @@ class AskUserQuestionTool:
         ws_manager: Any = None,
         user_id: str = "",
         agent_id: str = "",
-        top_agent_id: str = "",
+        team_id: str = "",
         session_id: str = "",
         is_member: bool = False,
         session: Any = None,
@@ -57,7 +57,7 @@ class AskUserQuestionTool:
         :param ws_manager: WebSocketManager 实例，用于向前端推送问题卡片
         :param user_id: 当前用户标识，用于 WS 推送与注册
         :param agent_id: 提问方 agent（主 agent 或成员 id），持久化/唤醒定位用
-        :param top_agent_id: 所属顶部 agent（成员提问时为成员所属 TOP；主 agent
+        :param team_id: 所属顶部 agent（成员提问时为成员所属 TOP；主 agent
             提问时即自身），唤醒路由成员 roster 时使用
         :param session_id: 所属会话 id（多会话隔离）
         :param is_member: 是否团队成员提问（决定唤醒时的分发路径）
@@ -67,7 +67,7 @@ class AskUserQuestionTool:
         self.ws_manager = ws_manager
         self.user_id = user_id
         self.agent_id = agent_id
-        self.top_agent_id = top_agent_id or agent_id
+        self.team_id = team_id or agent_id
         self.session_id = session_id
         self.is_member = is_member
         self._session = session
@@ -130,7 +130,7 @@ class AskUserQuestionTool:
             save_pending_question(
                 self.user_id,
                 self.agent_id,
-                self.top_agent_id,
+                self.team_id,
                 self.session_id,
                 qid,
                 question,

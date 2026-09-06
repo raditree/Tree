@@ -17,12 +17,16 @@ class FileSyncButton extends StatelessWidget {
   /// 工作空间 ID
   final String workspaceId;
 
+  /// 所属顶层 agent ID（后端三模式分派判定键：本地/SSH/云端）
+  final String teamId;
+
   /// 上传成功后的回调（用于通知文件面板刷新）
   final VoidCallback? onUploaded;
 
   const FileSyncButton({
     super.key,
     required this.workspaceId,
+    this.teamId = '',
     this.onUploaded,
   });
 
@@ -91,7 +95,11 @@ class FileSyncButton extends StatelessWidget {
       task: () async {
         try {
           final List<String> paths =
-              await ApiService.uploadToCloud(workspaceId, files);
+              await uploadWithChannelSelection(
+            workspaceId,
+            files,
+            teamId: teamId,
+          );
           // 上传成功，通知文件面板刷新文件列表
           onUploaded?.call();
           return '上传完成，已保存到：\n${paths.join('\n')}';
@@ -100,6 +108,49 @@ class FileSyncButton extends StatelessWidget {
         }
       },
     );
+  }
+
+  /// 按文件大小选择上传通道（三模式一致 + 大文件分片）
+  ///
+  /// - 小文件（≤ [ApiService.chunkUploadThreshold]）：批量 multipart 单请求
+  ///   通道（[ApiService.uploadToCloud]）；
+  /// - 大文件：逐个走 init/chunk/complete 三段式分片通道
+  ///   （[ApiService.uploadFileChunked]）。
+  ///
+  /// [teamId] 随请求透传，供后端按三模式分派（本地/SSH 模式委托前端执行器
+  /// 落盘到本机目录 / 远端主机）。返回上传后的工作空间内路径列表。
+  static Future<List<String>> uploadWithChannelSelection(
+    String workspaceId,
+    List<MapEntry<String, String>> files, {
+    String teamId = '',
+  }) async {
+    final List<MapEntry<String, String>> small = <MapEntry<String, String>>[];
+    final List<MapEntry<String, String>> large = <MapEntry<String, String>>[];
+    for (final MapEntry<String, String> entry in files) {
+      final int size = await File(entry.key).length();
+      if (size > ApiService.chunkUploadThreshold) {
+        large.add(entry);
+      } else {
+        small.add(entry);
+      }
+    }
+    final List<String> paths = <String>[];
+    if (small.isNotEmpty) {
+      paths.addAll(
+        await ApiService.uploadToCloud(workspaceId, small, teamId: teamId),
+      );
+    }
+    for (final MapEntry<String, String> entry in large) {
+      paths.add(
+        await ApiService.uploadFileChunked(
+          workspaceId,
+          entry.key,
+          entry.value,
+          teamId: teamId,
+        ),
+      );
+    }
+    return paths;
   }
 
   /// 上传文件夹到云端

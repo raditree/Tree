@@ -22,7 +22,7 @@ from tool.team_tool import TeamTool  # noqa: E402
 
 
 def _make_tool(max_level=3, max_members=7, agent_id="top1",
-               top_agent_id="top1", user_id="u1", leader_id=""):
+               team_id="top1", user_id="u1", leader_id=""):
     """构造 TeamTool（get_team/get_members 打桩，避免真实 DB）。"""
     mc = ModelConfig(
         name="m", base_url="http://x", api_key="k", model_id="m",
@@ -32,7 +32,7 @@ def _make_tool(max_level=3, max_members=7, agent_id="top1",
         model_config=mc, workspace_id="ws1", system_prompt=""
     )
     with patch("data.team_store.get_team", return_value={
-        "top_agent_id": top_agent_id,
+        "team_id": team_id,
         "max_level": max_level,
         "max_members_per_level": max_members,
     }), patch("data.team_store.get_members", return_value=[]):
@@ -44,7 +44,7 @@ def _make_tool(max_level=3, max_members=7, agent_id="top1",
             user_id=user_id,
             agent_id=agent_id,
             leader_id=leader_id,
-            top_agent_id=top_agent_id,
+            team_id=team_id,
         )
     return tool
 
@@ -62,7 +62,7 @@ class TestCreateMemberDispatch(unittest.TestCase):
 class TestCreateMemberFlow(unittest.TestCase):
     def test_create_member_persists_and_dispatches_init(self):
         """创建后：落 team_members 表（含 system_prompt/parent）+ 投递初始化消息。"""
-        tool = _make_tool(agent_id="top1", top_agent_id="top1")
+        tool = _make_tool(agent_id="top1", team_id="top1")
         tool.can_lead_team = True
         tool.docker_manager.create_workspace.return_value = {
             "workspace_id": "member_x",
@@ -83,7 +83,7 @@ class TestCreateMemberFlow(unittest.TestCase):
         kwargs = add_member.call_args.kwargs
         self.assertEqual(kwargs["system_prompt"], "你是测试工程师，负责后端验证。")
         self.assertEqual(kwargs["parent_agent_id"], "top1")
-        self.assertEqual(kwargs["top_agent_id"], "top1")
+        self.assertEqual(kwargs["team_id"], "top1")
         # 初始化消息携带 system prompt
         tool._dispatch_to_member.assert_called_once()
         init_content = tool._dispatch_to_member.call_args.args[1]
@@ -92,7 +92,7 @@ class TestCreateMemberFlow(unittest.TestCase):
 
     def test_create_member_count_checks_direct_only(self):
         """直属成员上限按 parent_agent_id 计数：同 TOP 非直属成员不占用名额。"""
-        tool = _make_tool(max_members=2, agent_id="top1", top_agent_id="top1")
+        tool = _make_tool(max_members=2, agent_id="top1", team_id="top1")
         tool.can_lead_team = True
         # 1 名直属 + 2 名同 TOP 非直属（如平级/上层创建的成员）
         tool.members = [
@@ -106,7 +106,7 @@ class TestCreateMemberFlow(unittest.TestCase):
         # 未达上限：继续走创建流程（model 存在则创建，无需校验错误）
         self.assertNotIn("已达上限", str(result))
 
-        tool2 = _make_tool(max_members=2, agent_id="top1", top_agent_id="top1")
+        tool2 = _make_tool(max_members=2, agent_id="top1", team_id="top1")
         tool2.can_lead_team = True
         tool2.members = [
             {"id": "d1", "parent_agent_id": "top1"},
@@ -121,7 +121,7 @@ class TestCreateMemberFlow(unittest.TestCase):
 
     def test_level_error_message_dynamic(self):
         """层级超限错误信息使用实际配置（非硬编码 Level 3）。"""
-        tool = _make_tool(max_level=2, agent_id="top1", top_agent_id="top1")
+        tool = _make_tool(max_level=2, agent_id="top1", team_id="top1")
         tool.level = 2  # Level 2 且 max_team_level=2 → 拒绝
         tool.can_lead_team = True
         result = tool.execute({
@@ -131,7 +131,7 @@ class TestCreateMemberFlow(unittest.TestCase):
         self.assertNotIn("Level 3", str(result))
 
     def test_cannot_create_when_can_lead_team_false(self):
-        tool = _make_tool(agent_id="top1", top_agent_id="top1")
+        tool = _make_tool(agent_id="top1", team_id="top1")
         tool.can_lead_team = False
         result = tool.execute({
             "action": "create_member", "model_id": "m",
@@ -142,7 +142,7 @@ class TestCreateMemberFlow(unittest.TestCase):
 class TestListMembersGrouping(unittest.TestCase):
     def test_grouping_by_parent_agent_id(self):
         """list_members：teammates=直属，team_member=同 TOP 非直属。"""
-        tool = _make_tool(agent_id="top1", top_agent_id="top1")
+        tool = _make_tool(agent_id="top1", team_id="top1")
         tool.members = [
             {"id": "d1", "name": "直属1", "parent_agent_id": "top1",
              "role": "后端", "duty": "接口", "model_id": "m", "level": 1},

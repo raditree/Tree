@@ -16,6 +16,9 @@ class FileTree extends StatefulWidget {
   /// 工作空间 ID
   final String workspaceId;
 
+  /// 顶层 agent（team）ID，用于后端三模式分派；为空时后端按 workspaceId 兜底
+  final String? teamId;
+
   /// 文件选中回调，参数为文件的相对路径
   final ValueChanged<String>? onFileSelected;
 
@@ -28,6 +31,7 @@ class FileTree extends StatefulWidget {
   const FileTree({
     super.key,
     required this.workspaceId,
+    this.teamId,
     this.onFileSelected,
     this.onDownload,
     this.refreshTrigger = 0,
@@ -80,6 +84,7 @@ class _FileTreeState extends State<FileTree> {
       final List<FileNode> files = await ApiService.getFiles(
         widget.workspaceId,
         path: _currentPath,
+        teamId: widget.teamId ?? '',
       );
       // 排序：目录在前，文件在后；同类按名称字母序
       files.sort((FileNode a, FileNode b) {

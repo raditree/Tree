@@ -68,7 +68,7 @@ def _unused_names(pool: List[str], used: set) -> List[str]:
     return [n for n in pool if n not in used]
 
 
-def _used_names(user_id: str, top_agent_id: str) -> set:
+def _used_names(user_id: str, team_id: str) -> set:
     """收集同用户内已占用的名字（其他 agent 的 TOP 名 + 全部成员名）。"""
     from data.agent_store import get_agents
     from data.team_store import get_members
@@ -78,33 +78,33 @@ def _used_names(user_id: str, top_agent_id: str) -> set:
     for a in get_agents(user_id) or []:
         used.add(a.get("name", ""))
     # 该 TOP 旗下成员名
-    for m in get_members(top_agent_id) or []:
+    for m in get_members(team_id) or []:
         used.add(m.get("name", ""))
     return used
 
 
-def _pick_names(user_id: str, top_agent_id: str, count: int) -> List[str]:
+def _pick_names(user_id: str, team_id: str, count: int) -> List[str]:
     """从名字池为成员取名字（同用户全局唯一，随机打乱抽取）。
 
     :raises ValueError: 名字池不足以提供 count 个未用名字
     """
     pool = _load_names()
-    used = _used_names(user_id, top_agent_id)
+    used = _used_names(user_id, team_id)
     avail = [n for n in pool if n not in used]
     if len(avail) < count:
         raise ValueError(
             f"名字池不足：需 {count} 个名字，可用 {len(avail)} 个"
-            f"（已用 {len(used) - (0 if _team_exists(top_agent_id) else 0)} / 池 {len(pool)}）。"
+            f"（已用 {len(used) - (0 if _team_exists(team_id) else 0)} / 池 {len(pool)}）。"
             "请扩充 server/data/names.json。"
         )
     random.shuffle(avail)
     return avail[:count]
 
 
-def _team_exists(top_agent_id: str) -> bool:
+def _team_exists(team_id: str) -> bool:
     from data.team_store import get_team
 
-    return get_team(top_agent_id) is not None
+    return get_team(team_id) is not None
 
 
 def _generate_member_ids(count: int) -> List[str]:
@@ -230,9 +230,9 @@ def init_team_for_top(
         init_team,
     )
 
-    top_agent_id = top_agent.get("id", "")
-    if not top_agent_id:
-        return {"error": "缺少 top_agent_id"}
+    team_id = top_agent.get("id", "")
+    if not team_id:
+        return {"error": "缺少 team_id"}
 
     # 团队配置在创建 TOP 时设定：归一化后持久化到 teams 表（此后不可修改）
     from config.team import resolve_team_config
@@ -242,11 +242,11 @@ def init_team_for_top(
     team_max_members = cfg["max_members_per_level"]
 
     # 幂等：已建团队直接返回现状（重复 TOP 记录/重试）
-    existing = get_team(top_agent_id)
+    existing = get_team(team_id)
     if existing is not None:
         return {
             "team": existing,
-            "members": get_members(top_agent_id),
+            "members": get_members(team_id),
             "created_count": 0,
         }
 
@@ -255,13 +255,13 @@ def init_team_for_top(
     count = max(1, min(count, team_max_members))
 
     team = init_team(
-        user_id, top_agent_id, top_agent.get("name", ""),
+        user_id, team_id, top_agent.get("name", ""),
         max_level=team_max_level, max_members_per_level=team_max_members,
     )
-    top_ws = top_agent.get("workspace_id") or top_agent_id
+    top_ws = top_agent.get("workspace_id") or team_id
 
     # 取名字（同名用户全局唯一）与生成成员 ID
-    names = _pick_names(user_id, top_agent_id, count)
+    names = _pick_names(user_id, team_id, count)
     ids = _generate_member_ids(count)
 
     created: List[Dict[str, Any]] = []
@@ -270,7 +270,7 @@ def init_team_for_top(
         role = _DEFAULT_ROLES[i % len(_DEFAULT_ROLES)]
         member = add_member(
             user_id=user_id,
-            top_agent_id=top_agent_id,
+            team_id=team_id,
             member_id=ids[i],
             name=names[i],
             role=role,
@@ -283,7 +283,7 @@ def init_team_for_top(
             level=1,
             system_prompt="",
             # P4 全量建队：直属 leader 即 TOP 自身
-            parent_agent_id=top_agent_id,
+            parent_agent_id=team_id,
         )
         member["workspace_id"] = member["id"]
         member["top_workspace_id"] = top_ws
@@ -299,7 +299,7 @@ def init_team_for_top(
     _write_roster_view(docker_manager, top_agent, created)
 
     logger.info(
-        "TOP 全量建队完成: %s (%d 名成员)", top_agent_id, len(created)
+        "TOP 全量建队完成: %s (%d 名成员)", team_id, len(created)
     )
     return {
         "team": team,
@@ -308,8 +308,8 @@ def init_team_for_top(
     }
 
 
-def get_top_members(top_agent_id: str) -> List[Dict[str, Any]]:
+def get_top_members(team_id: str) -> List[Dict[str, Any]]:
     """读取某 TOP 旗下全部成员（供 system prompt 拓扑注入 / 名单推送）。"""
     from data.team_store import get_members
 
-    return get_members(top_agent_id) or []
+    return get_members(team_id) or []

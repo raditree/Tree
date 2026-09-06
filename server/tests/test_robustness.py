@@ -175,7 +175,7 @@ class TestMcpPromptChapter(unittest.TestCase):
         from agent.chat import _build_agent_system_prompt
 
         prompt = _build_agent_system_prompt(
-            "ws1", user_id="u1", agent_id="a1", top_agent_id="a1",
+            "ws1", user_id="u1", agent_id="a1", team_id="a1",
             session_id="s1",
             extra_info={"identity": "顶层 Agent", "memory": "",
                         "exec_mode": "local"},
@@ -185,7 +185,7 @@ class TestMcpPromptChapter(unittest.TestCase):
         self.assertIn("服务 `workspace`", prompt)
 
         prompt2 = _build_agent_system_prompt(
-            "ws1", user_id="u1", agent_id="a1", top_agent_id="a1",
+            "ws1", user_id="u1", agent_id="a1", team_id="a1",
             session_id="s1",
             extra_info={"identity": "顶层 Agent", "memory": "",
                         "exec_mode": "local"},

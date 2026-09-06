@@ -3,7 +3,7 @@
 
 回归场景（用户反馈）：在某会话里向成员 agent 发消息，结果成员的最终总结
 被自动回发给 top agent，把 top 卷了进来。根因：回发目标用的是
-``leader_id = source_agent_id or top_agent_id``，用户直发时 ``source_agent_id``
+``leader_id = source_agent_id or team_id``，用户直发时 ``source_agent_id``
 为空，兜底成了 top。
 
 修复后：成员负载新增 ``sender_id`` 记录真实发送方（上游/平级/下级 agent，
@@ -38,7 +38,7 @@ def _run_with_mocks(dispatched, stream, q, payload):
 
 def _fake_dispatch(dispatched):
     def _wrap(user_id, target_ids, content,
-              source_agent_id="", top_agent_id="",
+              source_agent_id="", team_id="",
               system_prompt="", extra=None):
         dispatched.append(target_ids)
         return {"status": "sent", "sent": list(target_ids), "rejected": []}
@@ -89,7 +89,7 @@ class TestMemberReplyToSender(unittest.TestCase):
     def setUp(self):
         self.base = {
             "user_id": "u1", "agent_id": "mem-1", "workspace_id": "w1",
-            "model_id": "m1", "top_agent_id": "top-1",
+            "model_id": "m1", "team_id": "top-1",
             "system_prompt": "", "content": "开工", "session_id": "s1",
         }
         self.q = _queue.Queue()

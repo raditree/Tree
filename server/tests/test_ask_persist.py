@@ -45,7 +45,7 @@ class PendingQuestionStoreTest(unittest.TestCase):
         row = store.get_pending_question(qid)
         self.assertIsNotNone(row)
         self.assertEqual(row["agent_id"], agent)
-        self.assertEqual(row["top_agent_id"], top)
+        self.assertEqual(row["team_id"], top)
         self.assertEqual(row["session_id"], session)
         self.assertEqual(row["status"], "pending")
         self.assertEqual(row["options"], ["A", "B"])
@@ -124,16 +124,22 @@ class AskToolSentinelTest(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         store._DB_PATH = Path(self.tmpdir.name) / "conv_test_ask2.db"
         store._initialized = False
+        # 共享 connect()（data.db）一并重定向，避免打开真实库
+        self._old_shared_db = db_mod._DB_PATH
+        db_mod._DB_PATH = Path(self.tmpdir.name) / "conv_test_ask2.db"
+        db_mod._wal_configured = False
 
     def tearDown(self) -> None:
         store._initialized = False
+        db_mod._DB_PATH = self._old_shared_db
+        db_mod._wal_configured = False
         self.tmpdir.cleanup()
 
     def test_execute_returns_sentinel_and_persists(self) -> None:
         # ws_manager=None 时跳过推送，仅验证持久化与哨兵
         tool = AskUserQuestionTool(
             ws_manager=None, user_id="u1", agent_id="a1",
-            top_agent_id="a1", session_id="s1", is_member=False,
+            team_id="a1", session_id="s1", is_member=False,
         )
         result = tool.execute({"question": "需要你选择？", "options": ["A", "B"]})
         self.assertTrue(result.get(ASK_PAUSED_KEY))
@@ -155,7 +161,7 @@ class AskToolSentinelTest(unittest.TestCase):
         session.sender_id = "peerA"
         tool = AskUserQuestionTool(
             ws_manager=None, user_id="u6", agent_id="a6",
-            top_agent_id="top-6", session_id="s6", is_member=True,
+            team_id="top-6", session_id="s6", is_member=True,
             session=session,
         )
         result = tool.execute({"question": "确认？"})

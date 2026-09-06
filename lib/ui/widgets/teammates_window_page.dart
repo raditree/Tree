@@ -539,7 +539,7 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
       case 'files':
         return _MemberFileBrowser(
           workspaceId: widget.memberId,
-          topAgentId: widget.leader.id,
+          teamId: widget.leader.id,
         );
       case 'progress':
       default:
@@ -614,12 +614,12 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
 class _MemberFileBrowser extends StatefulWidget {
   final String workspaceId;
 
-  /// 所属顶层 agent ID（本地模式下用于后端判定，使成员面板也浏览共享 base）
-  final String topAgentId;
+  /// 所属团队 ID（本地模式下用于后端判定，使成员面板也浏览共享 base）
+  final String teamId;
 
   const _MemberFileBrowser({
     required this.workspaceId,
-    required this.topAgentId,
+    required this.teamId,
   });
 
   @override
@@ -648,7 +648,7 @@ class _MemberFileBrowserState extends State<_MemberFileBrowser> {
       final List<FileNode> files = await ApiService.getFiles(
         widget.workspaceId,
         path: _currentPath,
-        topAgentId: widget.topAgentId,
+        teamId: widget.teamId,
       );
       if (!mounted) return;
       setState(() {

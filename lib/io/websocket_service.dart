@@ -10,6 +10,12 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 /// 给后续处理者）；返回 `false` 表示未接管（交由其他处理者按需处理）。
 typedef ToolExecRequestHandler = bool Function(Map<String, dynamic> message);
 
+/// 工具执行取消处理者签名。
+///
+/// 各处理者（本地执行器 / SSH 执行器）按自身记录（hook 分离进程 / SSH hook
+/// pidfile）判断该取消是否归属本端，无关时静默忽略。
+typedef ToolExecCancelHandler = void Function(Map<String, dynamic> message);
+
 /// WebSocket 服务 - 与后端实时消息通信
 ///
 /// 负责建立 WebSocket 连接、发送消息、接收消息与心跳保活。
@@ -37,10 +43,27 @@ class WebSocketService {
   /// 收到消息时的回调（已解析为 Map）
   void Function(Map<String, dynamic> message)? onMessage;
 
-  /// 工具执行取消回调（本地执行器 hook 模式）
+  /// 未知会话消息回调（Task 7 接收方会话保障）。
   ///
-  /// 收到 ``tool_exec_cancel`` 时通知本地执行器终止对应分离进程。
-  void Function(Map<String, dynamic> message)? onToolExecCancel;
+  /// 收到携带未知 session_id（不在 [knownSessionIds] 中）的
+  /// ``msg_chunk`` / ``msg_end`` 时触发，早于 [onMessage] 派发。UI 层据此
+  /// 自动创建本地会话条目并纳入列表，保证被动接收（如跨 team 推送、
+  /// 成员主动汇报）的消息在会话列表可见。
+  void Function(Map<String, dynamic> message)? onUnknownSession;
+
+  /// 已知会话 id 集合（UI 层在会话列表/选中会话变化时经
+  /// [registerKnownSessions] 同步；未注册时视为全部未知）。
+  final Set<String> knownSessionIds = <String>{};
+
+  /// 同步已知会话 id（增量合并，供未知会话判定）。
+  void registerKnownSessions(Iterable<String> ids) {
+    knownSessionIds.addAll(ids);
+  }
+
+  /// 清空已知会话 id（切换 agent / 会话列表整体重载前调用）。
+  void clearKnownSessions() {
+    knownSessionIds.clear();
+  }
 
   /// 工具执行请求处理者列表（本地执行器 / SSH 执行器共同注册）。
   ///
@@ -61,6 +84,26 @@ class WebSocketService {
   /// 注销一个工具执行请求处理者。
   void removeToolExecRequestHandler(ToolExecRequestHandler handler) {
     _toolExecRequestHandlers.remove(handler);
+  }
+
+  /// 工具执行取消处理者列表（本地执行器 / SSH 执行器 hook 模式）。
+  ///
+  /// 收到 ``tool_exec_cancel`` 时逐个调用：本地执行器终止对应分离进程，
+  /// SSH 执行器经远端 ``kill -TERM`` 终止对应 hook 后台进程；无关的
+  /// tool_id 由各处理者自行静默忽略。
+  final List<ToolExecCancelHandler> _toolExecCancelHandlers =
+      <ToolExecCancelHandler>[];
+
+  /// 注册一个工具执行取消处理者（重复注册会被忽略）。
+  void addToolExecCancelHandler(ToolExecCancelHandler handler) {
+    if (!_toolExecCancelHandlers.contains(handler)) {
+      _toolExecCancelHandlers.add(handler);
+    }
+  }
+
+  /// 注销一个工具执行取消处理者。
+  void removeToolExecCancelHandler(ToolExecCancelHandler handler) {
+    _toolExecCancelHandlers.remove(handler);
   }
 
   /// 连接状态变化回调
@@ -137,10 +180,25 @@ class WebSocketService {
         }
         return;
       }
-      // 工具执行取消交给本地执行器（hook 模式终止分离进程，不向上派发）
+      // 工具执行取消分发给已注册的执行器处理者：本地执行器终止对应分离
+      // 进程，SSH 执行器经远端 kill -TERM 终止 hook 后台进程（不向上派发）
       if (type == 'tool_exec_cancel') {
-        onToolExecCancel?.call(json);
+        final List<ToolExecCancelHandler> handlers =
+            List<ToolExecCancelHandler>.of(_toolExecCancelHandlers);
+        for (final ToolExecCancelHandler handler in handlers) {
+          handler(json);
+        }
         return;
+      }
+      // 未知会话消息（Task 7 接收方会话保障）：msg_chunk / msg_end 携带
+      // 不在已知列表中的 session_id 时，先回调 UI 层创建本地会话条目，
+      // 再照常派发 onMessage（是否渲染仍由 UI 按当前会话过滤）。
+      if ((type == 'msg_chunk' || type == 'msg_end') &&
+          onUnknownSession != null) {
+        final String? sid = json['session_id'] as String?;
+        if (sid != null && sid.isNotEmpty && !knownSessionIds.contains(sid)) {
+          onUnknownSession!(json);
+        }
       }
       onMessage?.call(json);
     } catch (e) {

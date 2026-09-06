@@ -152,11 +152,13 @@ class WorkspaceIO(ABC):
         """在工作空间内执行 shell 命令（hook 后台任务专用，**无时长上限**）。
 
         与 :meth:`exec_shell` 的区别：**不做 ``timeout N`` 包装、无超时封顶**，
-        由调用方（hook_manager）以后台线程/进程执行并自行负责终止。仅
-        cloud / ssh 需要实现；local 模式走 :meth:`LocalWorkspaceIO.exec_shell_hook`，
+        由调用方（hook_manager）以后台线程执行并自行负责终止。仅 cloud 需要
+        实现（后端线程直连容器执行）；ssh 模式 hook 经
+        :meth:`LocalWorkspaceIO.exec_shell_hook` 委托前端执行（wrapped 自带
+        重定向 + pidfile），local 模式同样走 :meth:`LocalWorkspaceIO.exec_shell_hook`，
         因此基类默认返回错误（不应被调用）。
         """
-        return {"error": "exec_shell_no_timeout 未实现（仅 cloud/ssh 支持）"}
+        return {"error": "exec_shell_no_timeout 未实现（仅 cloud 支持）"}
 
     async def read_file_base64(
         self, workspace_id: str, path: str
@@ -225,8 +227,8 @@ class CloudWorkspaceIO(WorkspaceIO):
     ) -> Dict[str, Any]:
         # 通过 docker_manager.write_file 走 put_archive 流式写入：
         # - 避免 heredoc 转义问题与内容中含 .self 导致的误重写
-        # - 共享成员（云端共享顶层主工作区）的 .self 私人路径自动路由到
-        #   workspaces/{workspace_id} 子目录
+        # - .self 相对令牌由 docker_manager 统一改写为工作根下
+        #   agentspace/{workspace_id}/.self（顶层 agent 与共享成员一致）
         result = await asyncio.to_thread(
             self.docker_manager.write_file,
             workspace_id, path, content.encode("utf-8"),
@@ -363,30 +365,31 @@ class LocalWorkspaceIO(WorkspaceIO):
     """
 
     def __init__(self, local_executor: Any, ws_manager: Any, user_id: str,
-                 agent_id: str = "") -> None:
+                 team_id: str = "") -> None:
         """初始化本地 IO。
 
         :param local_executor: LocalExecutorClient 实例
         :param ws_manager: WebSocketManager 实例
         :param user_id: 用户标识（用于反向 WS 通道）
-        :param agent_id: 顶部 agent ID（mode key），随 ``tool_exec_request``
-            透传，供前端执行器校验请求归属（避免其他 agent 的 SSH 执行器
-            误接管本 agent 的请求）
+        :param team_id: 顶部 agent ID（mode key），随 ``tool_exec_request``
+            透传并作为请求隔离粒度，供前端执行器校验请求归属（避免其他
+            agent 的 SSH 执行器误接管本 agent 的请求）
         """
         self._executor = local_executor
         self._ws_manager = ws_manager
         self._user_id = user_id
-        self._agent_id = agent_id
+        self._team_id = team_id
 
     async def _request(self, workspace_id: str, op: str, **kwargs: Any) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "op": op,
             "workspace_id": workspace_id,
-            "top_agent_id": self._agent_id,
+            "team_id": self._team_id,
             **kwargs,
         }
         return await asyncio.to_thread(
-            self._executor.request, self._ws_manager, self._user_id, payload
+            self._executor.request, self._ws_manager, self._user_id, payload,
+            team_id=self._team_id,
         )
 
     async def read_file(
@@ -425,7 +428,7 @@ class LocalWorkspaceIO(WorkspaceIO):
     async def exec_shell_hook(
         self,
         workspace_id: str,
-        exec_id: str,
+        tool_id: str,
         command: str,
         output_file: str,
         timeout: Optional[int],
@@ -437,14 +440,16 @@ class LocalWorkspaceIO(WorkspaceIO):
         发送 ``exec_shell_hook`` 请求；发送失败时以错误结果收尾回调并返回错误，
         避免 hook 挂起。
         """
-        self._executor.register_hook(self._user_id, exec_id, on_done)
+        self._executor.register_hook(
+            self._user_id, tool_id, on_done, team_id=self._team_id
+        )
         result = await asyncio.to_thread(
             self._executor.send_request, self._ws_manager, self._user_id,
             {
                 "op": "exec_shell_hook",
                 "workspace_id": workspace_id,
-                "exec_id": exec_id,
-                "top_agent_id": self._agent_id,
+                "tool_id": tool_id,
+                "team_id": self._team_id,
                 "command": command,
                 "output_file": output_file,
                 "timeout": timeout,
@@ -453,14 +458,23 @@ class LocalWorkspaceIO(WorkspaceIO):
         if result.get("error"):
             # 发送失败：触发 on_done 以错误收尾，避免 hook 永久悬挂
             self._executor.resolve(
-                self._user_id, exec_id, {"error": result["error"]}
+                self._user_id, tool_id, {"error": result["error"]},
+                team_id=self._team_id,
             )
         return result
 
-    async def cancel_exec_hook(self, exec_id: str) -> Dict[str, Any]:
-        """取消本地 hook 分离进程：向后端 WS 发 ``tool_exec_cancel``。"""
+    async def cancel_exec_hook(
+        self, tool_id: str, pidfile: str = ""
+    ) -> Dict[str, Any]:
+        """取消本地/SSH hook 任务：向后端 WS 发 ``tool_exec_cancel``。
+
+        :param tool_id: hook 任务标识（前端据此定位分离进程 / pidfile）
+        :param pidfile: SSH hook 的远端 pidfile 路径（workspace 相对路径，
+            前端经 SSH 会话 ``kill -TERM $(cat pidfile)``；local 模式忽略）
+        """
         return await asyncio.to_thread(
-            self._executor.cancel_hook, self._ws_manager, self._user_id, exec_id
+            self._executor.cancel_hook, self._ws_manager, self._user_id,
+            tool_id, pidfile,
         )
 
     async def exec_argv(

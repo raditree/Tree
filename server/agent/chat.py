@@ -36,15 +36,74 @@ from data.session_cache import get_session, pop_session, set_session
 from data.session_store import (
     DEFAULT_SESSION,
     create_session,
+    get_session_record,
     touch_session,
     update_session_title_from_first_message,
 )
+from io_.mode_resolver import ensure_mode_locked
 from io_.workspace_io import run_io
 from llm.llm import AgentLLMSession, _AskPaused
 from tool import register_builtin_tools
 
 # 模块级日志器
 logger = logging.getLogger(__name__)
+
+# 用户自身 agent_id：统一消息接口中"用户直发"的发送方标记。
+# 历史实现/旧数据以空串表示，读取侧经 is_user_sender 两者等效处理。
+USER_AGENT_ID = "0"
+
+
+def is_user_sender(id_: Any) -> bool:
+    """判断消息发送方是否为用户直发。
+
+    兼容两种标记：空串（历史/内部旧数据）与 ``USER_AGENT_ID``（"0"，
+    统一消息接口的新标记）。凡对 sender_id / source_agent_id 做真值判断
+    （``if sender_id:`` / ``sender_id or ...``）的地方必须改用本函数，
+    因为 "0" 在 Python 中为真值，直接归一会改变用户直发路径的行为。
+    """
+    return not id_ or id_ == USER_AGENT_ID
+
+
+# 主事件循环引用：消息分发层（同步函数，可能运行在工具线程/线程池）推送
+# WS 消息时，经 run_coroutine_threadsafe 线程安全提交到主循环。由运行在
+# 主循环的入口（WS 连接建立、_stream_agent_reply）opportunistic 绑定。
+_MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _bind_main_loop() -> None:
+    """绑定主事件循环（须在主循环线程内调用；无运行循环时静默跳过）。"""
+    global _MAIN_LOOP
+    try:
+        _MAIN_LOOP = asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+
+
+def _push_ws(user_id: str, message: Dict[str, Any]) -> None:
+    """分发层（同步上下文）向用户推送一条 WS 消息。
+
+    - 当前线程有运行中的事件循环：直接调度；
+    - 工具线程/线程池：提交到绑定的主循环（``_bind_main_loop``）；
+    - 无循环 / 无 ws_manager：静默跳过（推送失败不影响投递主流程）。
+    """
+    wsm = getattr(state, "ws_manager", None)
+    if wsm is None:
+        return
+    try:
+        coro = wsm.send_message(user_id, message)
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        asyncio.get_running_loop().create_task(coro)
+        return
+    except RuntimeError:
+        pass
+    loop = _MAIN_LOOP
+    if loop is not None and loop.is_running():
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _store_message(
@@ -70,7 +129,7 @@ def _store_message(
 
 async def _register_tools(
     session: AgentLLMSession, agent_id: str, user_id: str = "",
-    leader_id: str = "", top_agent_id: str = "", member_system_prompt: str = "",
+    leader_id: str = "", team_id: str = "", member_system_prompt: str = "",
     session_id: str = DEFAULT_SESSION, is_member: bool = False,
     member_system_prompt_provider: Optional[Callable[[], str]] = None,
 ) -> None:
@@ -112,7 +171,7 @@ async def _register_tools(
         member_system_prompt=member_system_prompt,
         user_id=user_id,
         agent_id=agent_id,
-        top_agent_id=top_agent_id,
+        team_id=team_id,
         session_id=session_id,
         member_system_prompt_provider=member_system_prompt_provider,
         mcp_text_provider=_mcp_text_provider,
@@ -134,7 +193,7 @@ async def _register_tools(
             workspace_id,
             member_system_prompt=member_prompt,
             user_id=user_id,
-            agent_id=top_agent_id or agent_id,
+            agent_id=team_id or agent_id,
             local_executor=state.local_executor,
         )
 
@@ -163,14 +222,17 @@ async def _register_tools(
             if is_member:
                 _dispatch_agent_message(
                     user_id, [agent_id], content,
-                    source_agent_id=top_agent_id or agent_id,
-                    top_agent_id=top_agent_id,
+                    source_agent_id=team_id or agent_id,
+                    team_id=team_id,
                     extra={"session_id": session_id, "sender_id": sender},
+                    # 唤醒续跑属被动注入（Task 7.1）：不触发总结反向推送
+                    active=False,
                 )
             else:
                 _dispatch_agent_message(
                     user_id, [agent_id], content, "",
-                    top_agent_id or agent_id, "", {"session_id": session_id},
+                    team_id or agent_id, "", {"session_id": session_id},
+                    active=False,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.exception(
@@ -187,7 +249,7 @@ async def _register_tools(
         ws_manager=state.ws_manager,
         agent_id=agent_id,
         leader_id=leader_id,
-        top_agent_id=top_agent_id,
+        team_id=team_id,
         local_executor=state.local_executor,
         message_dispatcher=_dispatch_agent_message,
         extra_info_refresher=_extra_info_refresher,
@@ -202,7 +264,7 @@ def _make_system_prompt_rebuilder(
     member_system_prompt: str = "",
     user_id: str = "",
     agent_id: str = "",
-    top_agent_id: str = "",
+    team_id: str = "",
     session_id: str = "",
     member_system_prompt_provider: Optional[Callable[[], str]] = None,
     mcp_text_provider: Optional[Callable[[], str]] = None,
@@ -233,7 +295,7 @@ def _make_system_prompt_rebuilder(
             workspace_id,
             member_system_prompt=member_prompt,
             user_id=user_id,
-            agent_id=top_agent_id or agent_id,
+            agent_id=team_id or agent_id,
             local_executor=state.local_executor,
         )
         mcp_text = ""
@@ -247,7 +309,7 @@ def _make_system_prompt_rebuilder(
             member_system_prompt=member_prompt,
             user_id=user_id,
             agent_id=agent_id,
-            top_agent_id=top_agent_id,
+            team_id=team_id,
             session_id=session_id,
             extra_info=extra_info,
             mcp_tools_text=mcp_text,
@@ -297,7 +359,7 @@ def _upload_attachments(
     workspace_id: str,
     paths: Any,
     user_id: str = "",
-    top_agent_id: str = "",
+    team_id: str = "",
 ) -> List[str]:
     """将对话框上传的本地文件写入工作空间 ``.input/yyyymmdd/`` 目录。
 
@@ -311,18 +373,18 @@ def _upload_attachments(
     :param workspace_id: agent 工作空间标识
     :param paths: 用户上传的本地文件路径列表
     :param user_id: 用户标识（本地模式判定用）
-    :param top_agent_id: 顶部 agent 标识（本地模式判定用）
+    :param team_id: 顶部 agent 标识（本地模式判定用）
     :return: 成功写入工作空间的路径列表
     """
     if not paths:
         return []
     # 本地模式优先：附件落到用户选择的本地目录，否则云端容器里 agent
     # 本地工具根本读不到（表现为「提示已存入工作空间，实际无法访问」）。
-    if user_id and top_agent_id and state.local_executor is not None:
+    if user_id and team_id and state.local_executor is not None:
         try:
-            if state.local_executor.is_local(user_id, top_agent_id):
+            if state.local_executor.is_local(user_id, team_id):
                 base_dir = state.local_executor.base_dir_of(
-                    user_id, top_agent_id
+                    user_id, team_id
                 ) or ""
                 if not base_dir:
                     logger.warning(
@@ -488,7 +550,7 @@ def _build_agent_system_prompt(
     member_system_prompt: str = "",
     user_id: str = "",
     agent_id: str = "",
-    top_agent_id: str = "",
+    team_id: str = "",
     session_id: str = "",
     extra_info: Optional[Dict[str, Any]] = None,
     mcp_tools_text: str = "",
@@ -521,7 +583,7 @@ def _build_agent_system_prompt(
     :param member_system_prompt: 成员专属系统提示词（leader 通过 update_member 设置）
     :param user_id: 用户标识
     :param agent_id: 当前 agent 的 ID
-    :param top_agent_id: 所属顶层 agent ID（顶层 agent 自身即 agent_id）
+    :param team_id: 所属顶层 agent ID（顶层 agent 自身即 agent_id）
     :param session_id: 当前会话 ID（读取已选 Spec）
     :param extra_info: ``_build_workspace_extra_info`` 的输出（identity/memory/
                        exec_mode/storage_warning 等现算信息）
@@ -530,7 +592,7 @@ def _build_agent_system_prompt(
     :return: 13 章节系统提示词
     """
     extra_info = extra_info or {}
-    mode_key = top_agent_id or agent_id
+    mode_key = team_id or agent_id
     chapters: List[str] = []
 
     # 审计头：版本 + 章节清单（可审计、可追溯）
@@ -726,7 +788,7 @@ def _build_member_topology_text(
 def _load_members_from_team_store(mode_key: str) -> List[Dict[str, Any]]:
     """从 ``team_members`` 表读取所属 TOP 的权威成员名单（含 role/duty）。
 
-    ``mode_key`` 即顶部 agent ID（system prompt 构建时传 ``top_agent_id or
+    ``mode_key`` 即顶部 agent ID（system prompt 构建时传 ``team_id or
     agent_id``）。名单为空或读取失败时返回空列表（调用方回退 roster 文件）。
     """
     try:
@@ -748,9 +810,12 @@ def _build_exec_mode_text(
 
     复用 ``io_.mode_resolver.describe_mode`` 透出三模式与 shell 类型（spec「shell
     类型透出」：cloud=Linux sh / local Windows=cmd.exe / local mac·linux=bash /
-    ssh=远端 shell）。本地模式额外注明工作目录与 .self 私人空间位置；云端注明容器工作空间。
+    ssh=远端 shell）。三种模式都给出成员与顶层共享的工作根（本地=用户 base_dir、
+    云端=/workspace、ssh=远端 base）及本 agent 私人空间 .self 的**完整物理路径**
+    ``{工作根}/agentspace/{workspace_id}/.self``：成员与顶层共享同一工作目录，
+    agent 间 .self 相互可见，可直接用完整路径访问（Task 6 统一布局）。
     """
-    from io_.mode_resolver import describe_mode
+    from io_.mode_resolver import describe_mode, resolve_mode
 
     mode_key = agent_id or user_id or ""
     mode_text = ""
@@ -762,29 +827,36 @@ def _build_exec_mode_text(
     if not mode_text:
         mode_text = "执行模式: 云端 Linux 容器。shell = sh (POSIX)，遵循 POSIX 命令语法。"
 
-    is_local = False
-    base_dir = ""
-    if local_executor is not None and mode_key:
-        try:
-            is_local = bool(local_executor.is_local(user_id, mode_key))
-        except Exception:  # noqa: BLE001
-            is_local = False
-        if is_local:
+    mode = "cloud"
+    try:
+        mode = resolve_mode(user_id, mode_key)
+    except Exception:  # noqa: BLE001
+        mode = "cloud"
+
+    if mode == "local":
+        base_dir = ""
+        if local_executor is not None:
             try:
-                reg = getattr(local_executor, "_users", {}) or {}
-                base_dir = ((reg.get(user_id) or {}).get(mode_key) or "") or ""
+                base_dir = local_executor.base_dir_of(user_id, mode_key) or ""
             except Exception:  # noqa: BLE001
                 base_dir = ""
-    if is_local:
-        ws_self = f"{base_dir or '<用户选择目录>'}/workspaces/{workspace_id}/.self"
-        return (
-            f"{mode_text}；工作目录 {base_dir or '<用户选择目录>'}"
-            f"；你的私人空间 .self 位于 {ws_self}；"
-            "团队成员共享该工作目录，直接在此读写文件协作（无需跨沙箱）"
-        )
+        root = base_dir or "<用户选择目录>"
+    elif mode == "ssh":
+        remote_base = ""
+        try:
+            if state.ssh_manager is not None:
+                cfg = state.ssh_manager.get_config(user_id, mode_key) or {}
+                remote_base = cfg.get("remote_base_dir") or ""
+        except Exception:  # noqa: BLE001
+            remote_base = ""
+        root = remote_base or "<远端工作目录>"
+    else:
+        root = "/workspace"
+    ws_self = f"{root}/agentspace/{workspace_id}/.self"
     return (
-        f"{mode_text}；工作空间 {workspace_id} 位于 Docker 容器，"
-        "工作文件与私人空间 .self 都在容器内"
+        f"{mode_text}；成员与顶层共享工作目录 {root}，各 agent 的私人空间 .self "
+        f"位于 {ws_self}（agent 间 .self 相互可见，可用该完整路径直接读写）；"
+        "工作文件也在该工作目录下，直接在此读写协作。"
     )
 
 
@@ -860,10 +932,10 @@ def _get_workspace_io(user_id: str, agent_id: str) -> Any:
     """构建与内置工具一致的 WorkspaceIO 通道（经 ModeResolver 三模式统一判定）。
 
     本地模式经反向 WS 到前端本地执行器，由前端把 workspace 相对路径映射到
-    用户选择的工作目录（.self 私人空间 → baseDir/workspaces/{workspace_id}/.self）；
+    用户选择的 base_dir（顶层与成员共享，.self → base_dir/agentspace/{workspace_id}/.self）；
     SSH 模式由前端发起 SSH 连接、经反向 WS 委托前端执行；云端模式走 Docker 容器。
     用于读 .self 文档时与内置工具（read/write/edit/terminal）保持同一路径语义，
-    避免双轨制（记忆维护写本地 baseDir，help 注入却读 Docker 容器）导致
+    避免双轨制（记忆维护写本地 base_dir，help 注入却读 Docker 容器）导致
     memory/rule 注入读到旧内容或缺失。
     """
     from io_.mode_resolver import build_workspace_io
@@ -930,7 +1002,7 @@ def _build_workspace_extra_info(
         return _read_workspace_file(workspace_id, rel_path)
 
     # 执行模式（本地 vs 云端沙箱）：让 agent 无需猜测自己的工作环境。
-    # 本地执行器按顶部 agent 注册（mode_key=top_agent_id；顶部 agent 自身即 agent_id）。
+    # 本地执行器按顶部 agent 注册（mode_key=team_id；顶部 agent 自身即 agent_id）。
     exec_mode = _build_exec_mode_text(
         workspace_id, user_id=user_id, agent_id=agent_id,
         local_executor=local_executor,
@@ -1329,6 +1401,10 @@ def _append_activity_log(workspace_id: str, message: str) -> None:
     供 team leader 通过 ``view_member_log`` 查看成员文字输出，判断工作是否卡死。
     - 记录带时间戳，便于判断最后活动时间
     - 使用 base64 写入，避免特殊字符导致命令注入或转义问题
+    - 命令保留相对令牌 ``.self/activity.log``，exec_in_workspace 兼容层会按
+      当前 agent 改写为物理落点 agentspace/{workspace_id}/.self/activity.log
+      （顶层 agent 与共享成员一致；云端容器内即
+      /workspace/agentspace/{workspace_id}/.self/activity.log）。
     """
     if not workspace_id:
         return
@@ -1386,6 +1462,9 @@ async def _stream_agent_reply(
              文本段 id（可能为 None），供调用方在确定 usage 后补发 ``msg_usage``。
     """
     loop = asyncio.get_running_loop()
+    # 顺带绑定主事件循环：分发层从工具线程推送 WS（session_created /
+    # 总结反向推送）时经 run_coroutine_threadsafe 线程安全提交
+    _bind_main_loop()
     out_q: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
 
     def _consume() -> None:
@@ -1693,7 +1772,7 @@ async def _process_member_message(
     model_id = payload.get("model_id", "")
     content = payload.get("content", "")
     leader_id = payload.get("leader_id", "")
-    top_agent_id = payload.get("top_agent_id", "")
+    team_id = payload.get("team_id", "")
     session_id = payload.get("session_id", DEFAULT_SESSION)
     # 真正触发本条处理的发送方：agent 发送 = 该 agent（上级/平级/下级均可）；
     # 用户直发 = 空串（成员总结不转发给任何 agent）。key 存在（含空串）即用之，
@@ -1705,12 +1784,12 @@ async def _process_member_message(
         return
 
     model_config = state.model_configs.get(model_id)
-    if model_config is None and not model_id and top_agent_id:
+    if model_config is None and not model_id and team_id:
         # 空 model_id 自动回退所属 TOP 的模型：建队默认继承 TOP 模型，
         # 此处兼容历史空 model_id 成员（无论从哪条投递路径进入，都不因
         # 模型缺失丢消息）。
         try:
-            top_rec = get_agent(user_id, top_agent_id) or {}
+            top_rec = get_agent(user_id, team_id) or {}
             top_model = top_rec.get("model_id") or ""
             if top_model and top_model in state.model_configs:
                 model_config = state.model_configs[top_model]
@@ -1725,7 +1804,7 @@ async def _process_member_message(
         )
         # 明确回传错误给发送方（仅当发送方是 agent；用户直发不转发任何 agent），
         # 避免消息被静默丢弃（表现为"成员没收到"）
-        if sender_id:
+        if not is_user_sender(sender_id):
             try:
                 _dispatch_agent_message(
                     user_id,
@@ -1734,7 +1813,7 @@ async def _process_member_message(
                     f"（model_id={model_id!r}），消息已丢弃：{content[:120]}。"
                     "请用 team update_member 为该成员设置 model_id 后重试。",
                     source_agent_id=agent_id,
-                    top_agent_id=top_agent_id or sender_id,
+                    team_id=team_id or sender_id,
                     extra={"auto_reply": True, "session_id": session_id},
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1760,7 +1839,7 @@ async def _process_member_message(
         try:
             from data.team_store import get_member
 
-            rec = get_member(top_agent_id or agent_id, agent_id)
+            rec = get_member(team_id or agent_id, agent_id)
             if rec:
                 return str(rec.get("system_prompt") or "")
         except Exception as exc:  # noqa: BLE001
@@ -1776,7 +1855,7 @@ async def _process_member_message(
             user_id=user_id,
             agent_id=agent_id,
             result_redirect_writer=_make_result_redirect_writer(
-                workspace_id, user_id, top_agent_id or agent_id
+                workspace_id, user_id, team_id or agent_id
             ),
         )
         set_session(user_id, agent_id, session, session_id)
@@ -1784,7 +1863,7 @@ async def _process_member_message(
             await _register_tools(
                 session, agent_id, user_id,
                 leader_id=leader_id,
-                top_agent_id=top_agent_id,
+                team_id=team_id,
                 member_system_prompt=member_system_prompt,
                 session_id=session_id,
                 is_member=True,
@@ -1798,7 +1877,7 @@ async def _process_member_message(
         extra_info = await asyncio.to_thread(
             _build_workspace_extra_info,
             workspace_id, member_system_prompt=member_system_prompt,
-            user_id=user_id, agent_id=top_agent_id or agent_id,
+            user_id=user_id, agent_id=team_id or agent_id,
             local_executor=state.local_executor,
         )
         mcp_text = _build_mcp_tools_text(
@@ -1810,7 +1889,7 @@ async def _process_member_message(
             member_system_prompt=member_system_prompt,
             user_id=user_id,
             agent_id=agent_id,
-            top_agent_id=top_agent_id,
+            team_id=team_id,
             session_id=session_id,
             extra_info=extra_info,
             mcp_tools_text=mcp_text,
@@ -1903,15 +1982,16 @@ async def _process_member_message(
                            session_id=session_id)
         _append_activity_log(workspace_id, f"[{_clock_now()}] [done(成员)] 回复完成")
         # 成员工具循环最后一次回复的 content 自动回发"最后将消息发给它的那位"
-        # （用户直发时为空串 → 不转发任何 agent，仅留在成员会话/teammates 窗口）
-        if full_reply and reply_sender:
+        # （用户直发时为 USER_AGENT_ID/空串 → 不转发任何 agent，仅留在成员
+        # 会话/teammates 窗口）
+        if full_reply and not is_user_sender(reply_sender):
             try:
                 _dispatch_agent_message(
                     user_id,
                     [reply_sender],
                     f"[成员 {agent_id} 完成回复] {full_reply}",
                     source_agent_id=agent_id,
-                    top_agent_id=top_agent_id or reply_sender,
+                    team_id=team_id or reply_sender,
                     extra={"auto_reply": True, "session_id": session_id},
                 )
             except Exception as exc:  # noqa: BLE001
@@ -2008,14 +2088,115 @@ def _find_roster_member(
     return None
 
 
+def _session_title_from_content(content: str) -> str:
+    """用首条消息内容生成会话标题（首行/前 30 字符，空内容回退默认标题）。"""
+    text = (content or "").strip().replace("\n", " ").strip()
+    if not text:
+        return "新会话"
+    return text[:30] + ("…" if len(text) > 30 else "")
+
+
+def _ensure_receiver_session(
+    user_id: str, agent_id: str, session_id: str, content: str
+) -> None:
+    """接收方会话保障（Task 7.2）：消息送达接收 agent 前确保会话元数据存在。
+
+    会话行缺失时以首条消息摘要为标题创建（sessions 表主键含 agent_id，
+    同一会话 id 可被发起方与接收方各自持有元数据行），并通过 WS 推送
+    ``session_created`` 会话元数据，使前端（无需重新拉取会话列表）即时
+    纳入展示；跨 team（TOP↔TOP）与用户直发同样保障。
+    """
+    sid = session_id or DEFAULT_SESSION
+    try:
+        if get_session_record(user_id, sid, agent_id=agent_id) is not None:
+            return
+        title = _session_title_from_content(content)
+        create_session(user_id, agent_id, title=title, session_id=sid)
+        _push_ws(
+            user_id,
+            {
+                "type": "session_created",
+                "data": {
+                    "agent_id": agent_id,
+                    "session_id": sid,
+                    "title": title,
+                },
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("接收方会话保障失败(不影响投递): %s agent=%s", exc, agent_id)
+
+
+def _get_last_summary(user_id: str, agent_id: str, session_id: str) -> str:
+    """取接收 agent 指定会话的"最后总结"：最近一条 assistant 文本消息。
+
+    优先读内存会话上下文（session_cache），缺失时回退持久化上下文
+    （conversation_store.load_context）。纯工具调用轮（assistant 消息
+    content 为空）向前跳过；无总结返回空串。
+    """
+    context: Any = None
+    session = get_session(user_id, agent_id, session_id)
+    if session is not None:
+        context = getattr(session, "context", None)
+    if not context:
+        try:
+            context = load_context(user_id, agent_id, session_id) or []
+        except Exception:  # noqa: BLE001
+            context = []
+    for msg in reversed(context):
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    return ""
+
+
+def _maybe_push_last_summary(
+    user_id: str,
+    target_id: str,
+    source_agent_id: str,
+    owner_top: str,
+    session_id: str,
+) -> None:
+    """总结反向推送（Task 7.1，显式化）：active 消息触达已有总结的目标时，
+    复用消息发送接口把目标最近一轮的 assistant 总结回发给发起方。
+
+    - 仅 agent 主动发起（active=true 且非用户直发、非 auto_reply 被动
+      通道）触发；推送消息自身标记 active=false，不会级联触发反向推送
+      （防循环）；
+    - 仅做"给发起方看的上下文恢复"，不改变目标 agent 的处理逻辑；
+      成员完成回复的既有回发链路（reply_sender）保持不变。
+    """
+    if is_user_sender(source_agent_id) or source_agent_id == target_id:
+        return
+    summary = _get_last_summary(user_id, target_id, session_id)
+    if not summary:
+        return
+    try:
+        _dispatch_agent_message(
+            user_id,
+            [source_agent_id],
+            f"[{target_id} 最近总结] {summary}",
+            source_agent_id=target_id,
+            team_id=owner_top or target_id,
+            extra={"auto_reply": True, "session_id": session_id},
+            # 推送消息标记 active=false：接收方不再级联反向推送
+            active=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("总结反向推送失败: %s target=%s", exc, target_id)
+
+
 def _dispatch_agent_message(
     user_id: str,
     target_ids: Any,
     content: str,
     source_agent_id: str = "",
-    top_agent_id: str = "",
+    team_id: str = "",
     system_prompt: str = "",
     extra: Optional[Dict[str, Any]] = None,
+    active: bool = True,
 ) -> Dict[str, Any]:
     """统一消息发送 API：对本顶部 agent 旗下任意 agent_id 发送消息（一对多）。
 
@@ -2024,14 +2205,32 @@ def _dispatch_agent_message(
     - 团队隔离：仅允许发送给与本 agent 有关系的对象（上级 leader / 直属成员），
       不同顶部 agent 旗下互不可见、不可达；
     - update memory 锁：目标正处于记忆维护时拒绝投递；
-    - 目标解析：顶部 agent 经 agent_store 查询；成员经发送方 roster 解析。
+    - 目标解析：顶部 agent 经 agent_store 查询；成员经发送方 roster 解析；
+    - 接收方会话保障（Task 7.2）：目标会话元数据缺失时创建并推送
+      ``session_created``；
+    - 总结反向推送（Task 7.1）：active=true 的 agent 主动发起消息触达
+      已有"最后总结"的目标时，把总结回发给发起方（推送消息标记
+      active=false，防循环；用户直发与 auto_reply 被动通道不触发）。
+
+    :param active: 消息是否为主动发起（默认 true）。被动推送（auto_reply、
+                   唤醒续跑等）传 false，不触发总结反向推送。
     """
+    active = bool(active)
     if isinstance(target_ids, str):
         target_ids = [target_ids]
+    # ID 存在性校验（Task 2）：user_id 与归属（team_id/发送方）必须非空，
+    # 缺失记日志并拒绝，绝不静默降级继续投递。
+    if not user_id or not (team_id or source_agent_id):
+        logger.error(
+            "_dispatch_agent_message 缺少必需 ID，拒绝投递: user_id=%r "
+            "team_id=%r source_agent_id=%r targets=%r",
+            user_id, team_id, source_agent_id, target_ids,
+        )
+        return {"error": "缺少 user_id 或 team_id，消息未投递"}
     if not target_ids or not content:
         return {"error": "目标 ID 或消息内容不能为空"}
 
-    owner_top = top_agent_id or source_agent_id or ""
+    owner_top = team_id or source_agent_id or ""
     sent: List[str] = []
     rejected: List[str] = []
     # 因用户并发执行上限被拒绝的 target（Task 7：按用户等级限制并发 agent 数）
@@ -2039,6 +2238,9 @@ def _dispatch_agent_message(
     # auto_reply（agent 侧自动回复）消息跳过并发检查，防止递归拒绝/误伤
     # 既有 auto_reply 通道（成员模型缺失回传、成员完成回传等）。
     is_auto_reply = bool((extra or {}).get("auto_reply"))
+    # 投递负载按 session_id 归集（缺省回退默认会话）；接收方会话保障与
+    # 总结反向推送均按该会话定位。
+    session_id = str((extra or {}).get("session_id") or "") or DEFAULT_SESSION
     for target_id in target_ids:
         if not target_id or target_id == source_agent_id:
             rejected.append(target_id)
@@ -2047,13 +2249,16 @@ def _dispatch_agent_message(
         # 并发执行上限检查（Task 7）：
         # - 仅当目标当前未在 working（这条消息会使其新进入 working、新增并发名额）才检查；
         #   已 working 的目标消息只是入队，不新增并发，直接放行。
-        # - 用户直发（source_agent_id==""）命中上限时拒绝投递（由 _dispatch_user_message
-        #   提示用户）；agent→agent 命中上限时以 auto_reply 方式回发 429 给发送方。
+        # - 用户直发（source_agent_id 为用户标记）命中上限时拒绝投递（由
+        #   _dispatch_user_message 提示用户）；agent→agent 命中上限时以
+        #   auto_reply 方式回发 429 给发送方。
         if not is_auto_reply and not _is_agent_working(user_id, target_id):
-            limit_reached, active = _concurrency_limit_reached(user_id)
+            # 注意：此处解包变量名为 active_count，勿用 active——active 是
+            # 本函数的"主动发起"参数（Task 7.1），随负载透传。
+            limit_reached, active_count = _concurrency_limit_reached(user_id)
             if limit_reached:
                 concurrency_limited.append(target_id)
-                if source_agent_id:
+                if not is_user_sender(source_agent_id):
                     _reply_session = (extra or {}).get(
                         "session_id", DEFAULT_SESSION
                     )
@@ -2062,9 +2267,9 @@ def _dispatch_agent_message(
                             user_id,
                             [source_agent_id],
                             f"[成员 {target_id} 无法处理] 当前并发任务已达上限"
-                            f"（{active} 个），请稍等片刻再试。",
+                            f"（{active_count} 个），请稍等片刻再试。",
                             source_agent_id=target_id,
-                            top_agent_id=top_agent_id or source_agent_id,
+                            team_id=team_id or source_agent_id,
                             extra={
                                 "auto_reply": True,
                                 "session_id": _reply_session,
@@ -2081,8 +2286,9 @@ def _dispatch_agent_message(
             # - 成员向其他顶部 agent 发送被拒绝（跨顶部顶层通信仅限 TOP agent 之间）；
             # - TOP agent（source == owner_top）可向任意同用户 TOP 寻址（top-to-top）。
             # 目标经 get_agent(user_id) 查询，天然限同用户（跨用户不开放）。
+            # 用户直发（source 为用户标记）不做隔离检查（原空串行为保持）。
             if (
-                source_agent_id
+                not is_user_sender(source_agent_id)
                 and owner_top
                 and source_agent_id != owner_top
                 and target_id != owner_top
@@ -2096,11 +2302,16 @@ def _dispatch_agent_message(
                 "model_id": target_agent.get("model_id") or "",
                 "system_prompt": system_prompt,
                 "leader_id": "",
-                "top_agent_id": target_id,
+                "team_id": target_id,
                 "content": content,
             }
             if extra:
                 payload.update(extra)
+            # active 随负载透传（接收侧不消费；是否触发总结反向推送由发送层判定）
+            payload["active"] = active
+            # 接收方会话保障（Task 7.2）：broker 消费前确保会话元数据存在
+            # 并推送 session_created（跨 team TOP↔TOP 与用户直发同样保障）
+            _ensure_receiver_session(user_id, target_id, session_id, content)
             dispatched = False
             if state.top_chat_broker is not None:
                 dispatched = state.top_chat_broker.dispatch(
@@ -2108,13 +2319,18 @@ def _dispatch_agent_message(
                 )
             if dispatched:
                 sent.append(target_id)
+                # 总结反向推送（Task 7.1）：active 主动发起且非被动通道时触发
+                if active and not is_auto_reply:
+                    _maybe_push_last_summary(
+                        user_id, target_id, source_agent_id, owner_top, session_id
+                    )
             else:
                 rejected.append(target_id)
             continue
 
         # 2) 目标为成员：从发送方（或所属顶部 agent）roster 查找直属成员
         member = _find_roster_member(
-            user_id, top_agent_id or source_agent_id, target_id
+            user_id, team_id or source_agent_id, target_id
         )
         if member is None:
             rejected.append(target_id)
@@ -2135,20 +2351,37 @@ def _dispatch_agent_message(
             "workspace_id": member.get("workspace_id") or target_id,
             "model_id": member_model,
             "system_prompt": member.get("system_prompt", "") or system_prompt,
-            "leader_id": source_agent_id or top_agent_id,
-            "top_agent_id": owner_top,
-            # 真正触发本条处理的发送方（可被调用方经 extra 显式覆盖：用户直发==""、
-            # 续跑=原发送方、团队工具缺省=source_agent_id=发送的 agent）。
-            "sender_id": source_agent_id or top_agent_id,
+            # 用户直发时直属 leader 仍为所属 TOP（保持空串时代行为）
+            "leader_id": (
+                team_id if is_user_sender(source_agent_id)
+                else source_agent_id or team_id
+            ),
+            "team_id": owner_top,
+            # 真正触发本条处理的发送方（可被调用方经 extra 显式覆盖：用户直发
+            # =USER_AGENT_ID、续跑=原发送方、团队工具缺省=source_agent_id=
+            # 发送的 agent）。
+            "sender_id": (
+                USER_AGENT_ID if is_user_sender(source_agent_id)
+                else source_agent_id or team_id
+            ),
             "content": content,
         }
         if extra:
             payload.update(extra)
+        # active 随负载透传（接收侧不消费；是否触发总结反向推送由发送层判定）
+        payload["active"] = active
+        # 接收方会话保障（Task 7.2）：broker 消费前确保会话元数据存在
+        _ensure_receiver_session(user_id, target_id, session_id, content)
         dispatched = False
         if state.team_broker is not None:
             dispatched = state.team_broker.dispatch((user_id, target_id), payload)
         if dispatched:
             sent.append(target_id)
+            # 总结反向推送（Task 7.1）：active 主动发起且非被动通道时触发
+            if active and not is_auto_reply:
+                _maybe_push_last_summary(
+                    user_id, target_id, source_agent_id, owner_top, session_id
+                )
         else:
             rejected.append(target_id)
 
@@ -2185,7 +2418,24 @@ async def _dispatch_user_message(user_id: str, data: Dict[str, Any]) -> None:
     """
     agent_id = data.get("agent_id", "")
     if not agent_id:
-        asyncio.create_task(_handle_user_message(user_id, data))
+        # ID 存在性校验（Task 2）：缺 agent_id（team_id 由其派生）即拒绝，
+        # 记日志并回错误，不以空串降级到无 agent 的历史兜底路径。
+        logger.error(
+            "_dispatch_user_message 缺少 agent_id，拒绝投递: user_id=%r "
+            "data_keys=%s",
+            user_id, sorted(data.keys()),
+        )
+        if state.ws_manager is not None:
+            try:
+                await state.ws_manager.send_message(
+                    user_id,
+                    {
+                        "type": "error",
+                        "data": {"message": "消息缺少 agent_id，已拒绝"},
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                pass
         return
     content = data.get("content", "") or ""
     if not content and data.get("attachments"):
@@ -2193,13 +2443,17 @@ async def _dispatch_user_message(user_id: str, data: Dict[str, Any]) -> None:
 
     # 本地模式下 _dispatch_agent_message 内部可能经反向 WS 读 roster（阻塞），
     # 放入线程池执行，避免在事件循环线程内空等（阻塞期间其他请求全部卡住）。
+    # 用户直发：source_agent_id 统一标记为 USER_AGENT_ID（历史为空串，
+    # _dispatch_agent_message 经 is_user_sender 等效识别）。
+    # active（Task 7.1）：用户主动发起默认 true；前端/调用方可显式传 false。
     result = await asyncio.to_thread(
         _dispatch_agent_message,
         user_id, [agent_id], content,
-        "",
+        USER_AGENT_ID,
         agent_id,
         "",
         dict(data),
+        bool(data.get("active", True)),
     )
     if result.get("status") == "concurrency_limited":
         # 并发执行上限命中（Task 7）：提示用户稍后再试，不回落到
@@ -2219,7 +2473,7 @@ async def _dispatch_user_message(user_id: str, data: Dict[str, Any]) -> None:
 async def resume_after_answer(
     user_id: str,
     agent_id: str,
-    top_agent_id: str,
+    team_id: str,
     session_id: str,
     answer: str,
     is_member: bool,
@@ -2232,26 +2486,29 @@ async def resume_after_answer(
     通道重新投递给该 agent，使其续跑原任务。
 
     - 成员：经 ``_dispatch_agent_message``（team_broker）分发，需
-      ``top_agent_id`` 解析 roster。
+      ``team_id`` 解析 roster。
     - 主 agent：经 ``_dispatch_user_message``（top_chat_broker）分发。
 
     ``sender_id`` 为提问时持久化的原发送方；成员续跑后最终总结仍回发给它，
     保证"谁发给它的总结就回发给谁"在提问-回答边缘路径同样成立。
     """
     content = f"[AskUserQuestion 用户回答] {answer}"
+    # 作答唤醒属被动注入（Task 7.1）：以 active=false 投递，不触发总结反向推送
     try:
         if is_member:
             await asyncio.to_thread(
                 _dispatch_agent_message,
                 user_id, [agent_id], content,
-                top_agent_id, top_agent_id, "",
+                team_id, team_id, "",
                 {"session_id": session_id, "sender_id": sender_id},
+                False,
             )
         else:
             await _dispatch_user_message(user_id, {
                 "agent_id": agent_id,
                 "session_id": session_id,
                 "content": content,
+                "active": False,
             })
     except Exception as exc:  # noqa: BLE001
         logger.exception("唤醒 agent 失败: %s agent=%s", exc, agent_id)
@@ -2297,6 +2554,15 @@ async def _handle_user_message(
         )
         return
 
+    # 运行模式锁定（SubTask 6.5）：team 首次收到消息、正式进入 agent 处理
+    # 循环前，确定并持久化运行模式（agents.mode）。此后 resolve_mode 优先
+    # 读取该持久化值，不再随执行器运行时注册态漂移（local/ssh 执行器注销
+    # 时仍回落 cloud，见 io_/mode_resolver.py）。本地/SSH 的 base 与
+    # agentspace/ 目录由前端执行器负责初始化；云端沙箱在 agent 创建时已由
+    # POST /agents → docker_manager.create_workspace 创建（首消息 ensure 仅
+    # 注释级确认，幂等不重复创建）。锁定失败（DB 异常等）不阻断消息处理。
+    ensure_mode_locked(user_id, agent_id)
+
     # 确保会话元数据存在（多会话并行），更新访问时间并用首条消息生成标题
     create_session(user_id, agent_id, session_id=session_id)
     touch_session(user_id, session_id)
@@ -2330,7 +2596,7 @@ async def _handle_user_message(
         workspace_id,
         attachments,
         user_id=user_id,
-        top_agent_id=agent_id,
+        team_id=agent_id,
     )
     attachments_prompt = _build_attachments_prompt(uploaded_paths)
     if attachments_prompt:
@@ -2379,7 +2645,7 @@ async def _handle_user_message(
             set_session(user_id, agent_id, session, session_id)
             try:
                 await _register_tools(session, agent_id, user_id,
-                                      top_agent_id=agent_id,
+                                      team_id=agent_id,
                                       session_id=session_id)
             except Exception:
                 # 工具注册失败：清掉半成品会话，避免下次消息拿到无工具会话
@@ -2404,7 +2670,7 @@ async def _handle_user_message(
                 workspace_id,
                 user_id=user_id,
                 agent_id=agent_id,
-                top_agent_id=agent_id,
+                team_id=agent_id,
                 session_id=session_id,
                 extra_info=extra_info,
                 mcp_tools_text=mcp_text,

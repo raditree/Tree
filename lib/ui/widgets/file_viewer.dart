@@ -48,6 +48,9 @@ class FileViewer extends StatefulWidget {
   /// 工作空间 ID
   final String workspaceId;
 
+  /// 顶层 agent（team）ID，用于后端三模式分派；为空时后端按 workspaceId 兜底
+  final String? teamId;
+
   /// 文件相对路径
   final String filePath;
 
@@ -57,6 +60,7 @@ class FileViewer extends StatefulWidget {
   const FileViewer({
     super.key,
     required this.workspaceId,
+    this.teamId,
     required this.filePath,
     this.onClose,
   });
@@ -169,6 +173,7 @@ class _FileViewerState extends State<FileViewer> {
       final String content = await ApiService.getFileContent(
         widget.workspaceId,
         widget.filePath,
+        teamId: widget.teamId ?? '',
       );
       if (!mounted) return;
       if (type == _FileType.image) {
@@ -211,6 +216,7 @@ class _FileViewerState extends State<FileViewer> {
       final Map<String, dynamic> info = await ApiService.getPdfInfo(
         widget.workspaceId,
         widget.filePath,
+        teamId: widget.teamId ?? '',
       );
       if (!mounted) return;
       _totalPages = (info['total_pages'] as num?)?.toInt() ?? 0;
@@ -240,6 +246,7 @@ class _FileViewerState extends State<FileViewer> {
         widget.filePath,
         page: page,
         scale: 2.0,
+        teamId: widget.teamId ?? '',
       );
       if (!mounted) return;
       final String imgB64 = data['image'] as String? ?? '';
@@ -308,6 +315,7 @@ class _FileViewerState extends State<FileViewer> {
           workspaceId: widget.workspaceId,
           filePath: widget.filePath,
           filename: filename,
+          teamId: widget.teamId ?? '',
         );
       },
     );
@@ -1116,10 +1124,14 @@ class _DownloadProgressDialog extends StatefulWidget {
   /// 建议的文件名
   final String filename;
 
+  /// 顶层 agent（team）ID，用于后端三模式分派；为空时后端按 workspaceId 兜底
+  final String? teamId;
+
   const _DownloadProgressDialog({
     required this.workspaceId,
     required this.filePath,
     required this.filename,
+    this.teamId,
   });
 
   @override
@@ -1150,6 +1162,7 @@ class _DownloadProgressDialogState extends State<_DownloadProgressDialog> {
       final Uint8List bytes = await ApiService.downloadFile(
         widget.workspaceId,
         widget.filePath,
+        teamId: widget.teamId ?? '',
       );
       if (!mounted) return;
 

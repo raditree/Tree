@@ -261,19 +261,34 @@ class TestUserMessageSessionChain(unittest.TestCase):
         self.assertEqual(store_kwargs[-1]["session_id"], "session_default")
 
     def test_dispatch_agent_message_passes_through_session(self):
-        """_dispatch_user_message 无 agent_id 时直接透传 data（含 session_id）。"""
+        """_dispatch_user_message 经 extra 透传 data（含 session_id）给 dispatch。"""
         from agent import chat
 
         captured = {}
 
-        async def _fake_handle(user_id, data):
-            captured["session_id"] = data.get("session_id")
+        def _fake_dispatch(user_id, target_ids, content, source_agent_id="",
+                           team_id="", system_prompt="", extra=None,
+                           active=True):
+            captured["session_id"] = (extra or {}).get("session_id")
+            return {"status": "sent", "sent": list(target_ids), "rejected": []}
 
-        with patch.object(chat, "_handle_user_message", new=_fake_handle):
+        with patch.object(chat, "_dispatch_agent_message", new=_fake_dispatch):
+            self._run(chat._dispatch_user_message(
+                "u1", {"agent_id": "a1", "content": "x", "session_id": "sess-abc"}
+            ))
+        self.assertEqual(captured.get("session_id"), "sess-abc")
+
+    def test_dispatch_user_message_rejects_missing_agent_id(self):
+        """_dispatch_user_message 缺 agent_id 时拒绝投递（不降级、不静默）。"""
+        from agent import chat
+
+        with patch.object(chat, "_dispatch_agent_message") as fake_dispatch, \
+                patch.object(chat, "_handle_user_message") as fake_handle:
             self._run(chat._dispatch_user_message(
                 "u1", {"agent_id": "", "content": "x", "session_id": "sess-abc"}
             ))
-        self.assertEqual(captured.get("session_id"), "sess-abc")
+        fake_dispatch.assert_not_called()
+        fake_handle.assert_not_called()
 
 
 class TestSessionMessageCount(RestApiBase):
@@ -355,7 +370,7 @@ class TestTeamMemberSessionIsolation(unittest.TestCase):
             user_id="u1",
             agent_id="leader-1",
             leader_id="top-1",
-            top_agent_id="top-1",
+            team_id="top-1",
             session_id=session_id,
         )
         tool.members = [{
@@ -388,7 +403,7 @@ class TestTeamMemberSessionIsolation(unittest.TestCase):
         tool = self._make_tool(session_id="sess-abc")
 
         def _fake_dispatcher(user_id, target_ids, content, source_agent_id="",
-                             top_agent_id="", system_prompt="", extra=None):
+                             team_id="", system_prompt="", extra=None):
             self.assertEqual(extra, {"session_id": "sess-abc"})
             return {"status": "sent", "sent": target_ids, "rejected": []}
 
@@ -405,7 +420,7 @@ class TestTeamMemberSessionIsolation(unittest.TestCase):
         tool = self._make_tool(session_id="sess-bc")
 
         def _fake_dispatcher(user_id, target_ids, content, source_agent_id="",
-                             top_agent_id="", system_prompt="", extra=None):
+                             team_id="", system_prompt="", extra=None):
             self.assertEqual(extra, {"session_id": "sess-bc"})
             return {"status": "sent", "sent": target_ids, "rejected": []}
 
@@ -458,11 +473,11 @@ class TestQueueInjectionSessionIsolation(unittest.TestCase):
         q = _queue.Queue()
         q.put({"user_id": "u1", "agent_id": "mem-1", "workspace_id": "w1",
                "model_id": "m1", "leader_id": "leader-1",
-               "top_agent_id": "top-1", "content": "other-session-msg",
+               "team_id": "top-1", "content": "other-session-msg",
                "session_id": "sess-other"})
         q.put({"user_id": "u1", "agent_id": "mem-1", "workspace_id": "w1",
                "model_id": "m1", "leader_id": "leader-1",
-               "top_agent_id": "top-1", "content": "current-session-msg",
+               "team_id": "top-1", "content": "current-session-msg",
                "session_id": "sess-current"})
 
         with patch.object(chat, "_stream_agent_reply", new=_fake_stream), \
@@ -487,7 +502,7 @@ class TestQueueInjectionSessionIsolation(unittest.TestCase):
             payload = {
                 "user_id": "u1", "agent_id": "mem-1", "workspace_id": "w1",
                 "model_id": "m1", "leader_id": "leader-1",
-                "top_agent_id": "top-1",
+                "team_id": "top-1",
                 "system_prompt": "", "content": "start",
                 "session_id": "sess-current",
             }
@@ -516,7 +531,7 @@ class TestQueueInjectionSessionIsolation(unittest.TestCase):
         q = _queue.Queue()
         q.put({"user_id": "u1", "agent_id": "mem-1", "workspace_id": "w1",
                "model_id": "m1", "leader_id": "leader-1",
-               "top_agent_id": "top-1", "content": "same-session-msg",
+               "team_id": "top-1", "content": "same-session-msg",
                "session_id": "sess-current"})
 
         with patch.object(chat, "_stream_agent_reply", new=_fake_stream), \
@@ -541,7 +556,7 @@ class TestQueueInjectionSessionIsolation(unittest.TestCase):
             payload = {
                 "user_id": "u1", "agent_id": "mem-1", "workspace_id": "w1",
                 "model_id": "m1", "leader_id": "leader-1",
-                "top_agent_id": "top-1",
+                "team_id": "top-1",
                 "system_prompt": "", "content": "start",
                 "session_id": "sess-current",
             }

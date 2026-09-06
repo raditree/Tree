@@ -8,6 +8,9 @@
 约定：
 - 默认会话 id 为 ``session_default``（旧数据迁移目标 / 前端未选择时的兜底）
 - 删除会话为软删除（deleted_at 置位），底层消息与上下文保留用于审计
+- 同一会话 id 可被多个 agent 各自持有元数据行（主键含 agent_id）：
+  团队内/跨 team 投递复用发起方 session_id（接收方按同一会话 id 处理与
+  存储历史），接收 agent 也需要自己的会话行才能在会话列表中可见。
 """
 
 import json
@@ -34,34 +37,81 @@ _initialized = False
 
 
 def _ensure_db() -> None:
-    """确保 sessions 表已创建（线程安全的惰性初始化）。"""
+    """确保 sessions 表已创建并迁移到含 agent_id 的复合主键（线程安全惰性初始化）。"""
     global _initialized
     if _initialized:
         return
-    _DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with connect() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                agent_id TEXT NOT NULL,
-                title TEXT NOT NULL DEFAULT '新会话',
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active',
-                deleted_at INTEGER,
-                selected_spec_ids TEXT,
-                PRIMARY KEY (session_id)
+    with _write_lock:
+        if _initialized:  # 双重检查：并发首调时只迁移一次
+            return
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    session_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '新会话',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    deleted_at INTEGER,
+                    selected_spec_ids TEXT,
+                    PRIMARY KEY (session_id, user_id, agent_id)
+                )
+                """
             )
-            """
+            _migrate_sessions_pk(conn)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_user_agent "
+                "ON sessions (user_id, agent_id, updated_at)"
+            )
+            conn.commit()
+        _initialized = True
+
+
+def _migrate_sessions_pk(conn: sqlite3.Connection) -> None:
+    """旧库迁移：sessions 主键由 ``session_id`` 扩为 (session_id, user_id, agent_id)。
+
+    背景（Task 7 接收方会话保障）：团队内/跨 team 投递复用发起方 session_id，
+    接收 agent 按同一会话 id 处理与存储历史，但其会话元数据行此前因主键
+    冲突无法落库，导致接收方会话列表看不到该会话。扩主键后每个 agent 可
+    各自持有同一会话 id 的元数据行。
+    """
+    info = conn.execute("PRAGMA table_info(sessions)").fetchall()
+    pk_cols = [
+        row[1] for row in sorted(
+            (row for row in info if row[5] > 0), key=lambda row: row[5]
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sessions_user_agent "
-            "ON sessions (user_id, agent_id, updated_at)"
+    ]
+    if pk_cols != ["session_id"]:
+        return  # 已是复合主键（新库或已迁移）
+    conn.execute("ALTER TABLE sessions RENAME TO sessions_old")
+    conn.execute(
+        """
+        CREATE TABLE sessions (
+            session_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '新会话',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            deleted_at INTEGER,
+            selected_spec_ids TEXT,
+            PRIMARY KEY (session_id, user_id, agent_id)
         )
-        conn.commit()
-    _initialized = True
+        """
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO sessions "
+        "(session_id, user_id, agent_id, title, created_at, updated_at, "
+        "status, deleted_at, selected_spec_ids) "
+        "SELECT session_id, user_id, agent_id, title, created_at, updated_at, "
+        "status, deleted_at, selected_spec_ids FROM sessions_old"
+    )
+    conn.execute("DROP TABLE sessions_old")
 
 
 def _connect():
@@ -96,7 +146,7 @@ def create_session(
             (sid, user_id, agent_id, final_title, ts, ts),
         )
         conn.commit()
-    return get_session_record(user_id, sid) or {
+    return get_session_record(user_id, sid, agent_id=agent_id) or {
         "session_id": sid,
         "user_id": user_id,
         "agent_id": agent_id,
@@ -108,17 +158,28 @@ def create_session(
     }
 
 
-def get_session_record(user_id: str, session_id: str) -> Optional[Dict[str, Any]]:
-    """按 session_id 查询会话记录；不存在或已软删除时返回 None。"""
+def get_session_record(
+    user_id: str, session_id: str, agent_id: str = ""
+) -> Optional[Dict[str, Any]]:
+    """按 session_id 查询会话记录；不存在或已软删除时返回 None。
+
+    :param agent_id: 可选。传入时按 (session_id, user_id, agent_id) 精确
+        匹配（同一会话 id 可被多个 agent 各自持有元数据行）；缺省返回
+        任意一条匹配记录（兼容历史单行语义）。
+    """
     _ensure_db()
     conn = _connect()
     try:
         conn.row_factory = sqlite3.Row
-        row = conn.execute(
+        sql = (
             "SELECT * FROM sessions "
-            "WHERE session_id = ? AND user_id = ? AND deleted_at IS NULL",
-            (session_id, user_id),
-        ).fetchone()
+            "WHERE session_id = ? AND user_id = ? AND deleted_at IS NULL"
+        )
+        params: List[Any] = [session_id, user_id]
+        if agent_id:
+            sql += " AND agent_id = ?"
+            params.append(agent_id)
+        row = conn.execute(sql, params).fetchone()
         if row is None:
             return None
         return _row_to_dict(row)

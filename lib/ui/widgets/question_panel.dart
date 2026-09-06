@@ -8,7 +8,7 @@ import '../models/agent.dart';
 class _QuestionItem {
   final String qid;
   final String agentId;
-  final String topAgentId;
+  final String teamId;
   final String sessionId;
   final bool isMember;
   final String question;
@@ -20,7 +20,7 @@ class _QuestionItem {
   _QuestionItem({
     required this.qid,
     required this.agentId,
-    required this.topAgentId,
+    required this.teamId,
     required this.sessionId,
     required this.isMember,
     required this.question,
@@ -36,7 +36,7 @@ class _QuestionItem {
     return _QuestionItem(
       qid: (json['qid'] ?? '').toString(),
       agentId: (json['agent_id'] ?? '').toString(),
-      topAgentId: (json['top_agent_id'] ?? '').toString(),
+      teamId: (json['team_id'] ?? '').toString(),
       sessionId: (json['session_id'] ?? '').toString(),
       isMember: json['is_member'] == true,
       question: (json['question'] ?? '').toString(),
@@ -57,7 +57,7 @@ class _QuestionItem {
 typedef QuestionNavigateCallback = void Function({
   required bool isMember,
   required String agentId,
-  required String topAgentId,
+  required String teamId,
   required String sessionId,
   required String messageId,
 });
@@ -186,7 +186,7 @@ class _QuestionPanelState extends State<QuestionPanel> {
           _questions[idx] = _QuestionItem(
             qid: item.qid,
             agentId: item.agentId,
-            topAgentId: item.topAgentId,
+            teamId: item.teamId,
             sessionId: item.sessionId,
             isMember: item.isMember,
             question: item.question,
@@ -215,7 +215,7 @@ class _QuestionPanelState extends State<QuestionPanel> {
 
   /// 来源标签：成员提问加「成员」前缀，名称优先按 top_agent 映射
   String _sourceLabel(_QuestionItem item) {
-    final String refId = item.topAgentId.isNotEmpty ? item.topAgentId : item.agentId;
+    final String refId = item.teamId.isNotEmpty ? item.teamId : item.agentId;
     final String name = _agentNames[refId] ?? refId;
     final String label = name.isEmpty ? '未知来源' : name;
     return item.isMember ? '成员 · $label' : label;
@@ -227,7 +227,7 @@ class _QuestionPanelState extends State<QuestionPanel> {
     cb(
       isMember: item.isMember,
       agentId: item.agentId,
-      topAgentId: item.topAgentId.isNotEmpty ? item.topAgentId : item.agentId,
+      teamId: item.teamId.isNotEmpty ? item.teamId : item.agentId,
       sessionId: item.sessionId,
       messageId: item.qid,
     );

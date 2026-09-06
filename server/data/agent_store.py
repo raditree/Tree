@@ -36,7 +36,8 @@ def _ensure_db() -> None:
                 name TEXT NOT NULL,
                 model_id TEXT NOT NULL,
                 system_prompt TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                mode TEXT
             )
             """
         )
@@ -48,6 +49,8 @@ def _ensure_db() -> None:
         _migrate_add_workspace_id(conn)
         # 迁移：补充 deleted_at 列（软删除标记，NULL 表示未删除）
         _migrate_add_deleted_at(conn)
+        # 迁移：补充 mode 列（运行模式锁定值，NULL 表示未锁定；旧库补列）
+        _migrate_add_mode(conn)
         conn.commit()
     _initialized = True
 
@@ -77,6 +80,18 @@ def _migrate_add_deleted_at(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(agents)")}
     if "deleted_at" not in cols:
         conn.execute("ALTER TABLE agents ADD COLUMN deleted_at INTEGER")
+
+
+def _migrate_add_mode(conn: sqlite3.Connection) -> None:
+    """为 agents 表增加 mode 列（若缺失）。
+
+    运行模式锁定值：NULL/空串 = 未锁定（首条消息时经 resolve_mode 确定并写回，
+    此后按持久化模式工作）；"cloud" / "local" / "ssh" = 已锁定。
+    旧库（Task 1 自动重建前遗留）经本迁移惰性补列，无迁移框架。
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(agents)")}
+    if "mode" not in cols:
+        conn.execute("ALTER TABLE agents ADD COLUMN mode TEXT")
 
 
 def _connect():
@@ -219,3 +234,47 @@ def delete_agent(user_id: str, agent_id: str) -> bool:
         )
         conn.commit()
         return cursor.rowcount > 0
+
+
+def get_agent_mode(user_id: str, agent_id: str) -> Optional[str]:
+    """读取 agent 持久化运行模式（agents.mode 列）。
+
+    :return: 已锁定模式（"cloud" / "local" / "ssh"）；未锁定（NULL/空串）、
+             agent 不存在或已软删除返回 None
+    """
+    _ensure_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT mode FROM agents "
+            "WHERE user_id = ? AND id = ? AND deleted_at IS NULL",
+            (user_id, agent_id),
+        ).fetchone()
+        if row is None:
+            return None
+        mode = row[0]
+        return mode or None
+    finally:
+        conn.close()
+
+
+def lock_agent_mode(user_id: str, agent_id: str, mode: str) -> bool:
+    """首消息运行模式锁定：仅当 mode 尚未写入时设置（先到先得，幂等）。
+
+    :param mode: 待持久化的运行模式（"cloud" / "local" / "ssh"）
+    :return: 本次是否真正写入；False = 已锁定（不覆盖）或 agent 不存在/已删除
+    """
+    _ensure_db()
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.execute(
+                "UPDATE agents SET mode = ? "
+                "WHERE user_id = ? AND id = ? AND deleted_at IS NULL "
+                "AND (mode IS NULL OR mode = '')",
+                (mode, user_id, agent_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()

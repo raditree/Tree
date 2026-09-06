@@ -1,0 +1,63 @@
+# Tasks
+
+- [x] Task 1: ID 更名与统一（基础，先行）
+  - [x] SubTask 1.1: 后端全局 `top_agent_id` → `team_id`（payload 字段、REST query 参数、函数参数、缓存 key、注释）；`exec_id` → `tool_id`
+  - [x] SubTask 1.2: 前端全局 `top_agent_id`/`topAgentId` → `team_id`/`teamId`；`exec_id`/`execId` → `tool_id`/`toolId`
+  - [x] SubTask 1.3: 用户自身 agent_id="0" 归一：消息接口入站处将"用户直发"统一标记 agent_id="0"（接口层归一，不订正历史数据）
+  - [x] SubTask 1.4: 全局搜索清零校验（`top_agent_id`/`exec_id` 在 server/ lib/ 无残留），跑通 `server/tests` 与 `flutter analyze`
+- [x] Task 2: ID 存在性校验
+  - [x] SubTask 2.1: 后端入口校验：WS 消息（user_message/tool_exec_response/register/unregister）、REST（files/git/ssh）、内部 dispatch（_dispatch_agent_message/_dispatch_user_message）缺必需 id 即拒绝回错
+  - [x] SubTask 2.2: tool_exec_request payload 强制携带非空 team_id 与 tool_id（IO 构造点补传）
+  - [x] SubTask 2.3: 前端执行器 handler 校验：缺 team_id/tool_id 的请求拒绝并回错
+- [x] Task 3: 后端委托链隔离与健壮性修复
+  - [x] SubTask 3.1: `_pending`/`_last_ok`/`_consecutive_timeouts` key 收窄为 (user_id, team_id)；unregister/unregister_ssh 仅失效本 team pending
+  - [x] SubTask 3.2: 自动停用覆盖 SSH（`_register_timeout` 同时处理 `_ssh_users`），恢复"失联快速失败 + 回退云端"
+  - [x] SubTask 3.3: ws_manager 连接增加 connection_id；WS 断连时按 connection 清理执行器注册；send_message 每连接写超时 + 失败剔除
+  - [x] SubTask 3.4: 单元测试：多 team 并行请求互不误伤、失联快速失败、注销不误伤
+- [x] Task 4: 前端 per-team 执行器模型（依赖 Task 1/3 的 id 语义）
+  - [x] SubTask 4.1: LocalExecutorService/SshExecutorService 状态改为 `Map<teamId, ExecutorState>`（enabled/baseDir/config/registered/pendingAck 按 team 隔离）
+  - [x] SubTask 4.2: 懒创建：移除启动/切换 agent 时全量 loadSettings+syncRegistration；发消息前对目标 team ensure（创建状态→loadSettings→syncRegistration→attach 保持全局一次）
+  - [x] SubTask 4.3: 归属校验改为集合匹配（reqTeam ∈ 已注册启用集合）；移除对"当前选中 agent"的依赖
+  - [x] SubTask 4.4: 生命周期：team 删除时注销清理（main_page 删除分支改按 team）；应用退出统一收口（SSH 退出注销策略与 DB 持久化语义对齐）
+  - [x] SubTask 4.5: SshConnectionManager.connect 增加 in-flight 去重（同 team 并发首连只建一条）
+- [x] Task 5: 文件 IO 三模式一致（依赖 Task 1）
+  - [x] SubTask 5.1: 上传接口按 mode 分派：cloud 保留 docker 沙箱写入；local/ssh 经 WorkspaceIO 写 `.input/yyyymmdd/`（SSH 由前端执行器 SFTP 落远端；top 的 `.input` 位于 base/ 下，用户文件栏可见）
+  - [x] SubTask 5.2: list_files/get_file_content/download 补 SSH 分支（经 WorkspaceIO/执行器），移除"仅 local/docker 两分支"的漏斗
+  - [x] SubTask 5.3: 文件栏请求补传 team_id（api_service/file_panel/file_sync_button/git_history 全链路）
+  - [x] SubTask 5.4: 大文件分片上传：init/chunk/complete 三接口 + 阈值配置（`upload.chunk_threshold` 默认 8MB）；cloud 后端组装落沙箱，local 执行器本地直写，SSH 执行器 SFTP 按偏移续写；完成时校验分片数与总大小，失败分片可重试；小文件保留现有单请求通道
+- [x] Task 6: agentspace 布局与沙箱策略（依赖 Task 3、5、9）
+  - [x] SubTask 6.1: 布局统一：top 与成员工作根目录均为其 base（local=本机用户指定目录、ssh=远端用户指定目录、cloud=沙箱 /workspace），不按 agent 隔离工作区（成员不再落入 `agentspace/<member_id>/` 子工作区）
+  - [x] SubTask 6.2: agentspace 与 .self：base 下创建 `agentspace/`；各 agent .self 统一位于 `<base>/agentspace/<agent_id>/.self/`；系统提示词直接给出各 agent 的 .self 绝对路径，不做按 agent 的相对路径路由；.self 允许所有 agent 查看（不设 agent 间读权限隔离）
+  - [x] SubTask 6.3: 文件栏/terminal 语义：右侧文件栏展示 base/（隐藏 `agentspace/` 与 `.git`）；top agent terminal 工作目录为 base；SSH 执行器路径映射调整（top 与成员工作根均为 base，非 `agentspace/<id>`）
+  - [x] SubTask 6.4: local/ssh 移除沙箱创建与沙箱内命令执行路径（activity.log、roster、memory、工具结果重定向全部经 WorkspaceIO 落 base）
+  - [x] SubTask 6.5: 模式锁定：team 首条消息时 resolve 并持久化模式；local/ssh 在锁定后创建 `agentspace/` 目录；cloud 在锁定后按需创建沙箱（每 team 一个，`/workspace` 挂载 base，内部 `agentspace/<agent_id>/.self` 同构）；模式变更时清理旧模式资源并重新锁定
+  - [x] SubTask 6.6: 旧测试数据移除：不做读旧写新兼容（项目未发布，现 DB 均为测试数据）；修改完成后清除旧测试数据（DB 测试库与旧目录 `base/.self`、`base/workspaces/<id>/`），不保留兼容路径
+- [x] Task 7: 消息 active 语义与接收方会话保障
+  - [x] SubTask 7.1: 消息发送接口（统一发送 API + WS 入站）增加 active 参数；active=true 主动发起时反向推送最后总结（复用发送接口、active=false）；被动消息不推送
+  - [x] SubTask 7.2: 投递时确保接收方 session 存在（不存在即创建），WS 推送携带会话元数据；跨 team（TOP↔TOP）消息同样保障
+  - [x] SubTask 7.3: 前端收到未知 session 的消息（msg_chunk/msg_end）时自动创建会话条目并显示
+- [x] Task 8: auth_token 生命周期管理（独立，可与 Task 4-7 并行）
+  - [x] SubTask 8.1: 新增 token store（DB 表：user_id、token id、签发/过期时间、撤销状态、设备标记）；登录签发入表
+  - [x] SubTask 8.2: verify_token 改为"签名有效 ∧ 在表中 ∧ 未撤销 ∧ 未过期"；REST 与 WS 统一走该校验
+  - [x] SubTask 8.3: 登出撤销单 token；过期清理（惰性 + 定期）；保留内存撤销表作为快速路径
+- [x] Task 9: 工具调用链修复（依赖 Task 1）
+  - [x] SubTask 9.1: hook 路由由 isinstance 改为显式 mode：SSH hook 输出落盘（重定向或流式写）+ 可取消（远端命令终止）
+  - [x] SubTask 9.2: tool_id 贯穿 pending/hook/取消/响应（更名后全链路核对）
+  - [x] SubTask 9.3: SSH 执行器 grep 等路径参数穿越校验（对齐 local 语义）；`_exec` 超时/异常时关闭 SSHSession，`exec_argv` 超时兜底
+- [x] Task 10: 回归验证（依赖 Task 2-9）
+  - [x] SubTask 10.1: `server/tests` 全量通过；`flutter analyze` 无错误
+  - [x] SubTask 10.2: 按 checklist.md 逐项人工核验（多 team 并行、SSH 上传/文件栏/hook、跨 team 消息、多设备登录）
+
+# Task Dependencies
+
+- [Task 1] 无依赖（先行，其余全部依赖其 id 语义）
+- [Task 2] 依赖 [Task 1]
+- [Task 3] 依赖 [Task 1]
+- [Task 4] 依赖 [Task 1]、[Task 3]
+- [Task 5] 依赖 [Task 1]
+- [Task 6] 依赖 [Task 3]、[Task 5]
+- [Task 7] 依赖 [Task 1]（可与 Task 4/5/6/8 并行）
+- [Task 8] 依赖 [Task 1]（可与 Task 4-7 并行）
+- [Task 9] 依赖 [Task 1]
+- [Task 10] 依赖 [Task 2]-[Task 9]
+- 并行组建议：{[Task 2], [Task 3]} → {[Task 4], [Task 5], [Task 7], [Task 8], [Task 9]} → [Task 6] → [Task 10]

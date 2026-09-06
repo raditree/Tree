@@ -191,7 +191,7 @@ class TestListModelsReturnsConcrete(unittest.TestCase):
                           model_id="deepseek-v4-flash-0731")
         tool = TeamTool(session, MagicMock(),
                         {"deepseek-v4-flash-0731": cfg},
-                        user_id="u", agent_id="a", top_agent_id="t")
+                        user_id="u", agent_id="a", team_id="t")
         out = tool.execute({"action": "list_models"})
         self.assertEqual(out["total"], 1)
         self.assertEqual(out["models"][0]["model_id"], "deepseek-v4-flash-0731")
@@ -281,7 +281,7 @@ class TestMemberReplyFallbackPushback(unittest.TestCase):
         dispatched: list = []
 
         def _fake_dispatch(user_id, target_ids, content,
-                           source_agent_id="", top_agent_id="",
+                           source_agent_id="", team_id="",
                            system_prompt="", extra=None):
             dispatched.append((target_ids, content))
             return {"status": "sent", "sent": list(target_ids), "rejected": []}
@@ -316,7 +316,7 @@ class TestMemberReplyFallbackPushback(unittest.TestCase):
             payload = {
                 "user_id": "u1", "agent_id": "mem-1", "workspace_id": "w1",
                 "model_id": "m1", "leader_id": "leader-1",
-                "top_agent_id": "top-1",
+                "team_id": "top-1",
                 "system_prompt": "", "content": "start",
                 "session_id": "sess-current",
             }

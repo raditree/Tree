@@ -38,8 +38,8 @@ class TodoPanel extends StatefulWidget {
   /// 工作空间 ID
   final String workspaceId;
 
-  /// 所属顶层 agent ID（查询 todos 用）
-  final String? topAgentId;
+  /// 所属团队 ID（查询 todos 用）
+  final String? teamId;
 
   /// 当前会话 ID（todos 按会话隔离）
   final String sessionId;
@@ -50,7 +50,7 @@ class TodoPanel extends StatefulWidget {
   const TodoPanel({
     super.key,
     required this.workspaceId,
-    this.topAgentId,
+    this.teamId,
     this.sessionId = 'session_default',
     this.refreshTrigger = 0,
   });
@@ -88,7 +88,7 @@ class _TodoPanelState extends State<TodoPanel> {
       _error = null;
     });
     try {
-      final agentId = widget.topAgentId ?? '';
+      final agentId = widget.teamId ?? '';
       final List<Map<String, dynamic>> todoMaps =
           await ApiService.getAgentTodos(agentId, sessionId: widget.sessionId);
       final List<TodoItem> items =

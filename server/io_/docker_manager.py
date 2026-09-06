@@ -92,7 +92,7 @@ class DockerManager:
         )
         # 云端共享主工作区：member_workspace_id -> 顶层 agent workspace_id。
         # 团队成员共享顶层 agent 的容器/卷（/workspace 主工作区），
-        # 各 agent 的 .self 私人路径路由到共享容器内 workspaces/{agent_id}/.self。
+        # 各 agent 的 .self 私人路径统一为工作区根下 agentspace/{agent_id}/.self。
         self._shared_owner: Dict[str, str] = {}
         self._load_shared_map()
     @property
@@ -104,12 +104,12 @@ class DockerManager:
     # ------------------------------------------------------------------
     @staticmethod
     def _local_workspace_path(workspace_id: str) -> "os.PathLike":
-        """返回 Docker 不可用时的工作空间目录路径。
+        """返回 Docker 不可用时（后端本地降级）的工作空间目录路径。
 
-        - 顶级 agent（workspace_id == "top"）：直接映射到后端当前工作目录
-          ``<cwd>`` 本身。
-        - 其他 agent：位于 ``<cwd>/workspaces/{workspace_id}`` 子目录，
-          彼此隔离且不污染用户项目目录。
+        - 降级目录位于 ``<server>/workspaces/{workspace_id}``，充当该工作空间
+          的工作根（对应云端容器的 /workspace）；
+        - 各 agent 的 .self 私人空间物理落点统一为工作根下
+          ``agentspace/{workspace_id}/.self``（顶层与共享成员一致）。
 
         注意：新架构下本地运行模式（工具执行经反向 WS 到用户本机）不由
         本方法决定——Frontend 端的 :class:`LocalExecutorService` 拥有独立的
@@ -215,6 +215,16 @@ class DockerManager:
         return self._container_name(self.get_container_owner(workspace_id))
 
     @staticmethod
+    def _private_rel_dir(workspace_id: str) -> str:
+        """返回工作区根下某 agent 私人空间 .self 的物理相对目录。
+
+        顶层 agent 与共享成员统一为 ``agentspace/{workspace_id}/.self``
+        （云端容器内即 ``/workspace/agentspace/{workspace_id}/.self``）。
+        相对令牌 ``.self/...`` 经兼容层改写为该物理目录。
+        """
+        return f"agentspace/{workspace_id}/.self"
+
+    @staticmethod
     def _is_private_path(path: str) -> bool:
         """判断路径是否属于 agent 的私人记忆空间（``.self`` 开头的路径）。
 
@@ -234,12 +244,11 @@ class DockerManager:
     def resolve_private_path(self, workspace_id: str, path: str) -> str:
         """解析工作空间内相对路径（相对于 /workspace）。
 
-        共享成员（云端模式下共享顶层 agent 容器）的 ``.self`` 私人路径
-        路由到共享容器内 ``workspaces/{workspace_id}`` 子目录；其余路径
-        保持不变（即顶层 agent 的主工作区，团队共享）。
+        顶层 agent 与共享成员统一：相对令牌 ``.self``（含兼容的
+        ``/workspace/.self`` 绝对形式）改写为工作区根下
+        ``agentspace/{workspace_id}/.self``；其余路径保持不变
+        （即共享主工作区 /workspace）。
         """
-        if not self.is_shared(workspace_id):
-            return path
         p = (path or "").replace("\\", "/").strip()
         if p.startswith("/workspace/"):
             p = p[len("/workspace/"):]
@@ -250,19 +259,31 @@ class DockerManager:
         if not (p == ".self" or p.startswith(".self/")):
             return path
         rest = p[len(".self"):].lstrip("/")
-        prefix = f"workspaces/{workspace_id}/.self"
+        prefix = self._private_rel_dir(workspace_id)
         return prefix if not rest else f"{prefix}/{rest}"
 
     def _rewrite_private_tokens(self, workspace_id: str, text: str) -> str:
-        """重写命令中的 ``.self`` 路径令牌（共享成员→私人子目录）。
+        """重写命令中的 ``.self`` 路径令牌（顶层 agent 与共享成员一致）。
 
-        仅当目标工作空间为共享成员时生效；顶层 agent 的命令原样返回。
-        使用词边界正则，避免误伤 ``myself`` / ``.selfish`` 等含 .self 的串。
+        顶层 agent 与共享成员都启用：把命令中的 ``.self`` 路径令牌统一改写为
+        ``agentspace/{workspace_id}/.self``，目标=各自 agentspace/{wid}/.self。
+        使用词边界正则，避免误伤 ``myself`` / ``.selfish`` 等含 .self 的串；
+        已显式带 ``agentspace/<某 agent id>/.self`` 的完整路径不再二次改写
+        （跨 agent 全路径访问保持原样）。
         """
-        if not self.is_shared(workspace_id) or not text:
+        if not text:
             return text
+        prefix = self._private_rel_dir(workspace_id)
+
+        def _mask(m: "re.Match") -> str:
+            return m.group(0).replace(".self", "\x00")
+
+        masked = re.sub(
+            r"agentspace/[A-Za-z0-9_.-]+/\.self", _mask, text
+        )
         pattern = re.compile(r"(?<![A-Za-z0-9_.-])\.self(?![A-Za-z0-9_.-])")
-        return pattern.sub(f"workspaces/{workspace_id}/.self", text)
+        rewritten = pattern.sub(prefix, masked)
+        return rewritten.replace("\x00", ".self")
     def _exec(self, container, command: str) -> Dict[str, Any]:
         """在容器内通过 sh -c 执行复合命令，返回执行结果。"""
         result = container.exec_run(["sh", "-c", command])
@@ -381,7 +402,7 @@ class DockerManager:
         :param agent_name: agent 名称，用于 git user 配置；缺省时从 workspace_id 派生
         :param shared_with: 所属顶层 agent 的工作空间标识。提供时表示该工作空间为
             团队成员，云端模式下不创建独立容器/卷，而是共享顶层 agent 的容器与
-            /workspace 主工作区，仅在其内初始化私人空间 workspaces/{id}/.self。
+            /workspace 主工作区，仅在其内初始化私人空间 agentspace/{id}/.self。
         :return: 包含 workspace_id / container_id / volume_name 的字典；
                  Docker 不可用时返回 error 字段
         """
@@ -405,8 +426,8 @@ class DockerManager:
                 container = self.client.containers.get(
                     self._container_name_for(workspace_id)
                 )
-                # 在共享容器内初始化成员私人空间 workspaces/{member_id}/.self
-                private_dir = f"workspaces/{workspace_id}/.self"
+                # 在共享容器内初始化成员私人空间 agentspace/{member_id}/.self
+                private_dir = self._private_rel_dir(workspace_id)
                 init_cmd = " && ".join([
                     f"mkdir -p {private_dir}",
                     f"echo '# Agent 活动日志' > {private_dir}/activity.log",
@@ -475,18 +496,21 @@ class DockerManager:
             )
             container_id = container.id
             # 3. 容器内执行 Git 仓库初始化
+            #    顶层 agent 的 .self 也迁入 agentspace/{workspace_id}/.self：
+            #    activity.log / rule.md 预建在顶层自己的 agentspace 物理目录。
+            top_private_dir = self._private_rel_dir(workspace_id)
             git_init_cmd = " && ".join([
                 "cd /workspace",
                 "git init",
                 f'git config user.name "{name}"',
                 f'git config user.email "{name}@agent.local"',
-                "mkdir -p .self",
+                f"mkdir -p {top_private_dir}",
                 # 预创建活动日志，避免前端读取 activity.log 时 404
-                "echo '# Agent 活动日志' > .self/activity.log",
+                f"echo '# Agent 活动日志' > {top_private_dir}/activity.log",
             ])
             self._exec(container, git_init_cmd)
-            # 3.1 初始化 .self/rule.md 模板（checklist 9：每个 agent 的工作准则文件）
-            self._init_rule_md(container, name)
+            # 3.1 初始化 rule.md 模板（checklist 9：每个 agent 的工作准则文件）
+            self._init_rule_md(container, name, workspace_id)
             # 3.2 应用沙箱网络白名单与 pip 下载限制（checklist 13/14）
             self._apply_sandbox_policy(container, workspace_id)
             # 4. 若存在父工作空间，配置父 agent git remote 并切换分支
@@ -522,7 +546,9 @@ class DockerManager:
         """本地模式：在用户选择目录下创建本地工作空间并完成 Git 初始化。
 
         工作空间目录为 ``<cwd>/workspaces/{workspace_id}``，其中 cwd 即前端
-        启动本地后端时选择的工作目录。
+        启动本地后端时选择的工作目录。.self 私人空间物理落点同步为
+        ``<cwd>/workspaces/{workspace_id}/agentspace/{workspace_id}/.self``
+        （与云端 /workspace/agentspace/{id}/.self 同一布局语义）。
         :return: 包含 workspace_id / is_local 的字典
         """
         import subprocess
@@ -552,9 +578,9 @@ class DockerManager:
                     capture_output=True,
                     text=True,
                 )
-                # .self 目录与活动日志
-                self_dir = local_workspace / ".self"
-                self_dir.mkdir(exist_ok=True)
+                # .self 目录与活动日志（物理落点 agentspace/{wid}/.self）
+                self_dir = local_workspace / "agentspace" / workspace_id / ".self"
+                self_dir.mkdir(parents=True, exist_ok=True)
                 (self_dir / "activity.log").write_text(
                     "# Agent 活动日志\n", encoding="utf-8"
                 )
@@ -596,8 +622,10 @@ class DockerManager:
                 "error": "本地模式创建工作空间失败",
                 "detail": str(exc),
             }
-    def _init_rule_md(self, container, agent_name: str) -> None:
+    def _init_rule_md(self, container, agent_name: str, workspace_id: str) -> None:
         """在工作空间中初始化 ``.self/rule.md`` 模板（若不存在）。
+
+        物理落点为工作区根下 ``agentspace/{workspace_id}/.self/rule.md``。
         每个 agent 通过维护 rule.md 记录自己的工作准则、偏好与协作方式，
         内容会在初始化或 compact 时注入 normal LLM 系统提示词（checklist 9/10）。
         team leader 有职责提醒 teammates 维护各自的 rule.md。
@@ -611,12 +639,13 @@ class DockerManager:
             "# - 协作方式与沟通偏好\n"
             "# - 需要遵守的团队约定与禁忌\n".format(name=agent_name)
         )
+        rule_md = f"{self._private_rel_dir(workspace_id)}/rule.md"
         cmd = (
-            "cd /workspace && if [ ! -f .self/rule.md ]; then "
-            "cat > .self/rule.md << 'RULE_EOF'\n"
+            "cd /workspace && if [ ! -f {rule_md} ]; then "
+            "cat > {rule_md} << 'RULE_EOF'\n"
             f"{rule_template}RULE_EOF\n"
             "fi"
-        )
+        ).format(rule_md=rule_md)
         # 注意：_exec 内部会包一层 `sh -c <command>`，这里必须传字符串而非列表
         self._exec(container, cmd)
     def _setup_parent_remote(
@@ -1469,8 +1498,9 @@ class DockerManager:
                 capture_output=True,
                 text=True,
             )
-            (local_workspace / ".self").mkdir(exist_ok=True)
-            (local_workspace / ".self" / "activity.log").write_text(
+            self_dir = local_workspace / "agentspace" / workspace_id / ".self"
+            self_dir.mkdir(parents=True, exist_ok=True)
+            (self_dir / "activity.log").write_text(
                 "# Agent 活动日志\n", encoding="utf-8"
             )
             logger.info("本地模式：自动确保工作空间目录存在: %s", local_workspace)
@@ -1492,6 +1522,12 @@ class DockerManager:
         :param command: 命令及其参数列表，如 ``["git", "status"]``
         Docker 不可用时，降级为直接在本地工作空间目录执行。
         """
+        # 相对令牌兼容层：顶层 agent 与共享成员统一把命令中的 .self 路径令牌
+        # 改写为 agentspace/{workspace_id}/.self（云端容器/本地降级工作根下），
+        # 保证 activity.log / memory.md 等全部落到各自 agentspace 物理目录。
+        command = [
+            self._rewrite_private_tokens(workspace_id, c) for c in command
+        ]
         if self._use_local():
             # 本地模式（或 Docker 不可用）：直接在用户选择目录下执行命令
             import subprocess
@@ -1521,8 +1557,9 @@ class DockerManager:
                     capture_output=True,
                     text=True,
                 )
-                (local_workspace / ".self").mkdir(exist_ok=True)
-                (local_workspace / ".self" / "activity.log").write_text(
+                self_dir = local_workspace / "agentspace" / workspace_id / ".self"
+                self_dir.mkdir(parents=True, exist_ok=True)
+                (self_dir / "activity.log").write_text(
                     "# Agent 活动日志\n", encoding="utf-8"
                 )
                 logger.info("本地模式：自动创建工作空间目录: %s", local_workspace)
@@ -1612,12 +1649,8 @@ class DockerManager:
                     "detail": str(exc),
                     "exit_code": -1,
                 }
-        # 共享成员：将命令中的 .self 路径令牌重写为私人子目录 workspaces/{id}/.self，
-        # 并把容器解析到所属顶层 agent 的共享容器（主工作区 /workspace）
-        if self.is_shared(workspace_id):
-            command = [
-                self._rewrite_private_tokens(workspace_id, c) for c in command
-            ]
+        # 容器解析到所属顶层 agent 的容器（主工作区 /workspace）：
+        # 顶层 agent 用自身容器；共享成员用所属顶层 agent 的共享容器
         try:
             container = self.client.containers.get(self._container_name_for(workspace_id))
         except NotFound:
@@ -1676,6 +1709,9 @@ class DockerManager:
         :param data: 待写入的文件字节内容
         :return: ``{"exit_code": 0, "stdout": ...}`` 或在失败时带 ``error``
         """
+        # 相对令牌兼容层：顶层 agent 与共享成员统一把 .self 路径改写为
+        # agentspace/{workspace_id}/.self（云端 /workspace 根 / 本地降级工作根）
+        container_path = self.resolve_private_path(workspace_id, container_path)
         if self._use_local():
             # 本地模式（或 Docker 不可用）：直接在用户选择目录下写入文件
             local_workspace = self._local_workspace_path(workspace_id)
@@ -1696,9 +1732,8 @@ class DockerManager:
                     "detail": str(exc),
                     "exit_code": -1,
                 }
-        # 共享成员：将 .self 私人路径路由到共享容器内 workspaces/{id}/.self
-        if self.is_shared(workspace_id):
-            container_path = self.resolve_private_path(workspace_id, container_path)
+        # .self 私人路径已在函数入口改写为 agentspace/{id}/.self；
+        # 此处把容器解析到所属顶层 agent 的容器（顶层自身 / 共享成员归顶层）
         try:
             container = self.client.containers.get(self._container_name_for(workspace_id))
         except NotFound:

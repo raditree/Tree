@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
@@ -147,6 +149,11 @@ class _MessagePanelState extends State<MessagePanel> {
   void initState() {
     super.initState();
     _webSocket.onMessage = _handleIncomingMessage;
+    // 未知会话消息（Task 7 接收方会话保障）：msg_chunk/msg_end 携带不在
+    // 已知列表中的 session_id 时自动创建本地会话条目，使被动接收
+    // （跨 team 推送等）的消息在会话列表可见
+    _webSocket.onUnknownSession = _ensureLocalSessionEntry;
+    _syncKnownSessions();
     // 连接建立/重连时清空 working 集合：后端重启会清空其内存态 _active_tasks，
     // 若不清空，前端会残留旧的 working（无 API 调用却显示工作中）。
     // 清空后由后端在 WS 建立时补推真实的 agent_status（仍在工作的才重新标记）。
@@ -156,10 +163,15 @@ class _MessagePanelState extends State<MessagePanel> {
           _workingAgents.clear();
           _compactingAgents.clear();
         });
+        // WS 连接建立/重连后恢复"已注册且启用"team 的执行器注册
+        //（未激活的 team 不注册；后端断连时按连接自动清理了注册）
+        LocalExecutorService.instance.syncRegisteredTeams();
+        SshExecutorService.instance.syncRegisteredTeams();
       }
     };
-    // 先恢复本地模式设置（按顶部 agent），再建立 WebSocket 连接，
-    // 确保连接建立后能按正确的本地模式注册执行器
+    // 先恢复当前顶部 agent 的运行模式设置（仅供标题栏显示），再建立
+    // WebSocket 连接；执行器注册由懒激活（发送前 ensureTeam）与重连
+    // 恢复（syncRegisteredTeams）按 per-team 状态完成
     _initAsync();
     // 首次进入时若已选中 agent 则加载会话与历史
     if (widget.selectedAgent != null) {
@@ -174,36 +186,29 @@ class _MessagePanelState extends State<MessagePanel> {
     await _connectWebSocket();
   }
 
-  /// 加载当前顶部 agent 的本地/SSH 执行模式持久化设置，并同步注册/注销
+  /// 加载当前顶部 agent 的本地/SSH 执行模式持久化设置（仅供 UI 显示）。
+  ///
+  /// per-team 模型下不再在此处做全量注册：注册由消息发送前的懒激活
+  /// （[LocalExecutorService.ensureTeam] / [SshExecutorService.ensureTeam]）
+  /// 与 WS 重连后的 syncRegisteredTeams 恢复负责；这里只把该 team 的持久化
+  /// 设置读入服务内存并刷新标题栏的模式显示。
   Future<void> _loadModeSettings() async {
-    // 始终重置执行器状态：selectedAgent 为 null 时清空（传 ''），
-    // 避免旧 agent 的 SSH/local 启用态残留导致新 agent 请求被误路由
-    LocalExecutorService.instance
-        .setCurrentTopAgent(widget.selectedAgent?.id ?? '');
-    SshExecutorService.instance.setCurrentTopAgent(widget.selectedAgent?.id ?? '');
+    final String teamId = widget.selectedAgent?.id ?? '';
     await Future.wait(<Future<void>>[
-      LocalExecutorService.instance.loadSettings(),
-      SshExecutorService.instance.loadSettings(),
+      LocalExecutorService.instance.loadTeamSettings(teamId),
+      SshExecutorService.instance.loadTeamSettings(teamId),
     ]);
     if (!mounted) return;
     // 竞态防护：等待期间已切换顶部 agent 时放弃本次恢复
-    // （新切换会重新进入本函数，避免旧 agent 的恢复结果误同步）
-    final String nowAgent = widget.selectedAgent?.id ?? '';
-    if (LocalExecutorService.instance.currentTopAgentId != nowAgent ||
-        SshExecutorService.instance.currentTopAgentId != nowAgent) {
-      return;
-    }
+    // （新切换会重新进入本函数，避免旧 agent 的显示状态误刷新）
+    if (teamId != (widget.selectedAgent?.id ?? '')) return;
     setState(() {
-      _localEnabled = LocalExecutorService.instance.enabled;
-      _localWorkingDir = LocalExecutorService.instance.workingDirectory;
-      _sshEnabled = SshExecutorService.instance.enabled;
-      _sshConfig = SshExecutorService.instance.config;
+      _localEnabled = LocalExecutorService.instance.isTeamEnabled(teamId);
+      _localWorkingDir =
+          LocalExecutorService.instance.teamWorkingDirectory(teamId);
+      _sshEnabled = SshExecutorService.instance.isTeamEnabled(teamId);
+      _sshConfig = SshExecutorService.instance.teamConfig(teamId);
     });
-    // 连接已建立时，按当前顶部 agent 的运行模式同步注册/注销
-    if (_wsConnected && _webSocket.isConnected) {
-      LocalExecutorService.instance.syncRegistration();
-      SshExecutorService.instance.syncRegistration();
-    }
   }
 
   @override
@@ -231,8 +236,10 @@ class _MessagePanelState extends State<MessagePanel> {
         _pendingScrollId = null;
         _pendingSessionId = null;
       });
+      // 已知会话基线属于旧 agent：先清空，待新 agent 会话列表加载后重建
+      _webSocket.clearKnownSessions();
       _loadSessions();
-      // 切换顶部 agent：加载其独立的运行模式设置并同步注册/注销
+      // 切换顶部 agent：加载其独立的运行模式设置（仅供显示，不注册）
       _loadModeSettings();
     } else if (oldWidget.refreshTrigger != widget.refreshTrigger) {
       setState(() {
@@ -272,6 +279,61 @@ class _MessagePanelState extends State<MessagePanel> {
       _scrollToMessageId = id;
       _scrollToRevision++;
     });
+  }
+
+  /// 同步当前 agent 的已知会话 id 到 WebSocketService（未知会话判定基线）。
+  void _syncKnownSessions() {
+    _webSocket.clearKnownSessions();
+    _webSocket.registerKnownSessions(
+      _sessions.map((ChatSession s) => s.sessionId),
+    );
+    _webSocket.registerKnownSessions(<String>[_currentSessionId]);
+  }
+
+  /// 未知会话自动建条（Task 7.2 前端兜底）。
+  ///
+  /// 由 WebSocketService.onUnknownSession 触发（msg_chunk/msg_end 携带未知
+  /// session_id）：若消息属于当前选中 agent 且该会话不在列表中，则插入
+  /// 本地会话条目（标题取首条消息摘要或"新会话"），使该会话可见、切换
+  /// 后可加载历史。后端同时会落库并推送 session_created，权威列表重载时
+  /// 以服务端为准。
+  void _ensureLocalSessionEntry(Map<String, dynamic> data) {
+    if (!mounted) return;
+    final String agentId = (data['agent_id'] as String?) ?? '';
+    final String sessionId = (data['session_id'] as String?) ?? '';
+    if (sessionId.isEmpty) return;
+    final Agent? agent = widget.selectedAgent;
+    if (agent == null || agentId != agent.id) return;
+    if (_sessions.any((ChatSession s) => s.sessionId == sessionId)) return;
+    final String chunk = ((data['chunk'] as String?) ?? '').trim();
+    final String title = chunk.isNotEmpty
+        ? (chunk.length > 30 ? '${chunk.substring(0, 30)}…' : chunk)
+        : '新会话';
+    setState(() {
+      _sessions.insert(0, ChatSession(sessionId: sessionId, title: title));
+    });
+    _webSocket.registerKnownSessions(<String>[sessionId]);
+  }
+
+  /// 处理后端 session_created 推送（Task 7.2 接收方会话保障）：
+  /// 后端为接收 agent 创建会话元数据后即时纳入当前列表。
+  void _handleSessionCreated(Map<String, dynamic> data) {
+    if (!mounted) return;
+    final Map<String, dynamic> d =
+        (data['data'] as Map<String, dynamic>?) ?? data;
+    final String agentId = (d['agent_id'] as String?) ?? '';
+    final String sessionId = (d['session_id'] as String?) ?? '';
+    if (sessionId.isEmpty) return;
+    final Agent? agent = widget.selectedAgent;
+    if (agent == null || agentId != agent.id) return;
+    if (_sessions.any((ChatSession s) => s.sessionId == sessionId)) return;
+    setState(() {
+      _sessions.insert(
+        0,
+        ChatSession(sessionId: sessionId, title: (d['title'] as String?) ?? '新会话'),
+      );
+    });
+    _webSocket.registerKnownSessions(<String>[sessionId]);
   }
 
   /// 拉取当前 agent 的会话列表；切换会话时清空消息并重新加载历史
@@ -319,6 +381,8 @@ class _MessagePanelState extends State<MessagePanel> {
       });
       // 记录该 agent 本次实际生效的会话，供下次切换回来恢复
       _lastSessionByAgent[agentId] = _currentSessionId;
+      // 会话列表已更新：同步未知会话判定基线
+      _syncKnownSessions();
       _loadHistory();
       // 无论显式选会话还是自动选中，都把实际生效的会话 id 广播给
       // main_page -> FilePanel -> TodoPanel，保证"进入会话无 tool 调用"时
@@ -441,11 +505,10 @@ class _MessagePanelState extends State<MessagePanel> {
     LocalExecutorService.instance.attach(_webSocket);
     // SSH 执行器发送注册/注销消息
     SshExecutorService.instance.attach(_webSocket);
-    _webSocket.connect(token);
     _wsConnected = true;
-    // 按当前顶部 agent 的运行模式注册/注销（须在连接建立后发送）
-    LocalExecutorService.instance.syncRegistration();
-    SshExecutorService.instance.syncRegistration();
+    _webSocket.connect(token);
+    // 连接建立后会同步触发 onConnectionChange(true)（见 initState）：
+    // 在其中对"已注册且启用"的 team 恢复执行器注册，未激活的 team 不注册
   }
 
   /// 处理后端推送的消息
@@ -610,6 +673,9 @@ class _MessagePanelState extends State<MessagePanel> {
         _scrollRevision++;
         _bottomJump = false;
       });
+    } else if (type == 'session_created') {
+      // 接收方会话保障（Task 7.2）：后端为接收 agent 新建会话后即时入列
+      _handleSessionCreated(data);
     }
     // 其余控制消息（file_sync_progress / heartbeat / error 等）忽略
   }
@@ -698,9 +764,14 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 处理发送
   ///
   /// 先在本地追加用户消息，再通过 WebSocket 发送给后端。
+  /// 发送前对目标 team 懒激活两个执行器（幂等，fire-and-forget 不阻塞发送）。
   void _handleSend(String text, List<String> filePaths) {
     final Agent? agent = widget.selectedAgent;
     if (agent == null) return;
+    // 发送前懒激活目标 team 的执行器（幂等）：未加载的 team 从持久化恢复
+    // 设置；已启用但未注册的 team 走注册流程。fire-and-forget + 超时兜底，
+    // 绝不阻塞消息发送——若注册未及时完成，后端按"无执行器"回落云端执行。
+    _ensureExecutorsReady(agent.id);
 
     final List<Attachment> attachments = filePaths
         .map((String p) => Attachment(
@@ -735,6 +806,26 @@ class _MessagePanelState extends State<MessagePanel> {
     });
   }
 
+  /// 发送前确保目标 team 的执行器状态就绪（幂等懒激活）。
+  ///
+  /// 本地注册为单条 WS 消息（毫秒级）；SSH 注册需等后端 ack（最长 15s），
+  /// 因此两步都加超时兜底并 fire-and-forget，失败静默——发送链路不被阻塞，
+  /// 后端在执行器就绪前会按"无执行器"回落云端。
+  void _ensureExecutorsReady(String teamId) {
+    unawaited(() async {
+      try {
+        await LocalExecutorService.instance
+            .ensureTeam(teamId)
+            .timeout(const Duration(seconds: 5), onTimeout: () {});
+        await SshExecutorService.instance
+            .ensureTeam(teamId)
+            .timeout(const Duration(seconds: 5), onTimeout: () {});
+      } catch (_) {
+        // 激活失败不阻塞发送
+      }
+    }());
+  }
+
   /// 从路径中提取文件名（兼容 / 与 \）
   String _basename(String path) {
     final String replaced = path.replaceAll('\\', '/');
@@ -744,6 +835,7 @@ class _MessagePanelState extends State<MessagePanel> {
 
   /// 切换当前顶部 agent 的运行模式（cloud / local / ssh，三态互斥）。
   ///
+  /// 开关均面向当前选中 agent 的 teamId 调用（per-team API）：
   /// - 切到 local：若 ssh 已启用先注销 ssh；未选目录则先选目录，再启用本地执行器。
   /// - 切到 ssh：若 local 已启用先注销 local；弹出 SSH 配置表单，确认后注册并等待
   ///   后端 ack（连接测试失败会回显错误）。
@@ -755,6 +847,8 @@ class _MessagePanelState extends State<MessagePanel> {
       _showSnackBar('对话已开始，该顶部 agent 的运行模式已锁定，无法切换');
       return;
     }
+    final String? teamId = widget.selectedAgent?.id;
+    if (teamId == null || teamId.isEmpty) return; // 未选择 agent 不切换
     final String current = _currentMode;
     if (targetMode == current) return;
 
@@ -762,9 +856,9 @@ class _MessagePanelState extends State<MessagePanel> {
     try {
       if (targetMode == 'cloud') {
         if (current == 'local') {
-          await LocalExecutorService.instance.setEnabled(false);
+          await LocalExecutorService.instance.setTeamEnabled(teamId, false);
         } else if (current == 'ssh') {
-          await SshExecutorService.instance.disable();
+          await SshExecutorService.instance.disableTeam(teamId);
         }
         if (!mounted) return;
         setState(() {
@@ -780,7 +874,7 @@ class _MessagePanelState extends State<MessagePanel> {
         }
         // 与 SSH 互斥：先注销 ssh
         if (current == 'ssh') {
-          await SshExecutorService.instance.disable();
+          await SshExecutorService.instance.disableTeam(teamId);
         }
         // 开启前先选目录（工具执行结果写入此目录）
         // 注意：新 agent 的 _localWorkingDir 可能是空字符串而非 null，
@@ -790,7 +884,7 @@ class _MessagePanelState extends State<MessagePanel> {
           // 用户取消选择或路径仍为空，不启用本地模式
           if (_localWorkingDir == null || _localWorkingDir!.isEmpty) return;
         }
-        await LocalExecutorService.instance.setEnabled(true);
+        await LocalExecutorService.instance.setTeamEnabled(teamId, true);
         if (!mounted) return;
         setState(() {
           _localEnabled = true;
@@ -800,7 +894,7 @@ class _MessagePanelState extends State<MessagePanel> {
       } else if (targetMode == 'ssh') {
         // 与 local 互斥：先注销 local
         if (current == 'local') {
-          await LocalExecutorService.instance.setEnabled(false);
+          await LocalExecutorService.instance.setTeamEnabled(teamId, false);
         }
         if (!mounted) return;
         // 弹出 SSH 配置表单（预填已有配置）
@@ -812,7 +906,7 @@ class _MessagePanelState extends State<MessagePanel> {
         if (config == null || !mounted) return;
         // 注册并等待后端 ack（后端会先测试连接）
         final Map<String, dynamic> ack =
-            await SshExecutorService.instance.enable(config);
+            await SshExecutorService.instance.enableTeam(teamId, config);
         if (!mounted) return;
         if (ack['success'] == true) {
           setState(() {
@@ -836,7 +930,10 @@ class _MessagePanelState extends State<MessagePanel> {
       dialogTitle: '选择项目根目录（工具执行结果写入此目录）',
     );
     if (path == null || path.isEmpty) return;
-    await LocalExecutorService.instance.setWorkingDirectory(path);
+    final String? teamId = widget.selectedAgent?.id;
+    if (teamId != null && teamId.isNotEmpty) {
+      await LocalExecutorService.instance.setTeamWorkingDirectory(teamId, path);
+    }
     if (!mounted) return;
     setState(() {
       _localWorkingDir = path;
@@ -1213,6 +1310,7 @@ class _MessagePanelState extends State<MessagePanel> {
       _scrollRevision++;
     });
     _lastSessionByAgent[agent.id] = session.sessionId;
+    _syncKnownSessions();
     widget.onSessionChanged?.call(_currentSessionId);
     _loadHistory();
   }
@@ -1231,6 +1329,7 @@ class _MessagePanelState extends State<MessagePanel> {
         _scrollRevision++;
       });
       _lastSessionByAgent[agent.id] = session.sessionId;
+      _syncKnownSessions();
       widget.onSessionChanged?.call(_currentSessionId);
       _loadHistory();
     } catch (e) {
@@ -1339,6 +1438,7 @@ class _MessagePanelState extends State<MessagePanel> {
       // 同步更新该 agent 的上次浏览会话（删除当前会话时已切到剩余首个；
       // 删除非当前会话时值不变，赋值无副作用）
       _lastSessionByAgent[agent.id] = _currentSessionId;
+      _syncKnownSessions();
       _loadHistory();
     } catch (e) {
       if (!mounted) return;

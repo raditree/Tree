@@ -6,7 +6,7 @@
 给 LLM 看的可读镜像，由 team_init / team_tool 同步维护。
 
 表结构：
-- ``teams``：一个 TOP agent 对应一行（top_agent_id 主键）。
+- ``teams``：一个 TOP agent 对应一行（team_id 主键）。
 - ``team_members``：每个成员一行（member_id 主键），归属某 TOP agent；
   记录 name/role/duty/model_id/level/work_status/comment/scores/system_prompt。
   评分维度（quality/efficiency/collaboration/accuracy，0-10）序列化为 scores_json。
@@ -47,7 +47,7 @@ def _ensure_db() -> None:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS teams (
-                top_agent_id TEXT PRIMARY KEY,
+                team_id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL,
                 name TEXT NOT NULL,
                 member_count INTEGER NOT NULL DEFAULT 0,
@@ -62,7 +62,7 @@ def _ensure_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS team_members (
                 id TEXT PRIMARY KEY,
-                top_agent_id TEXT NOT NULL,
+                team_id TEXT NOT NULL,
                 user_id TEXT NOT NULL,
                 name TEXT NOT NULL,
                 role TEXT NOT NULL DEFAULT '',
@@ -81,7 +81,7 @@ def _ensure_db() -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_team_members_top "
-            "ON team_members (top_agent_id, created_at)"
+            "ON team_members (team_id, created_at)"
         )
         # 旧库迁移（幂等）：检查列是否存在，缺失则 ALTER 补充
         _migrate_column(conn, "teams", "max_level",
@@ -170,7 +170,7 @@ def render_roster_md(members: List[Dict[str, Any]]) -> str:
 # ----------------------------------------------------------------------
 def init_team(
     user_id: str,
-    top_agent_id: str,
+    team_id: str,
     name: str,
     max_level: int = 3,
     max_members_per_level: int = 7,
@@ -186,44 +186,44 @@ def init_team(
     now = int(time.time() * 1000)
     with _write_lock, connect() as conn:
         conn.execute(
-            "INSERT INTO teams (top_agent_id, user_id, name, member_count, "
+            "INSERT INTO teams (team_id, user_id, name, member_count, "
             "max_level, max_members_per_level, created_at, updated_at) "
             "VALUES (?, ?, ?, 0, ?, ?, ?, ?) "
-            "ON CONFLICT(top_agent_id) DO UPDATE SET "
+            "ON CONFLICT(team_id) DO UPDATE SET "
             "name = excluded.name, user_id = excluded.user_id, "
             "max_level = excluded.max_level, "
             "max_members_per_level = excluded.max_members_per_level, "
             "updated_at = excluded.updated_at",
-            (top_agent_id, user_id, name, max_level, max_members_per_level,
+            (team_id, user_id, name, max_level, max_members_per_level,
              now, now),
         )
         conn.commit()
-    team = get_team(top_agent_id)
+    team = get_team(team_id)
     assert team is not None
     return team
 
 
-def get_team(top_agent_id: str) -> Optional[Dict[str, Any]]:
+def get_team(team_id: str) -> Optional[Dict[str, Any]]:
     """按 TOP agent ID 获取团队信息。"""
     _ensure_db()
     conn = _connect()
     try:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT * FROM teams WHERE top_agent_id = ?", (top_agent_id,)
+            "SELECT * FROM teams WHERE team_id = ?", (team_id,)
         ).fetchone()
         return dict(row) if row else None
     finally:
         conn.close()
 
 
-def delete_team(top_agent_id: str) -> bool:
+def delete_team(team_id: str) -> bool:
     """删除团队及全部成员（TOP agent 被删除时调用）。"""
     _ensure_db()
     with _write_lock, connect() as conn:
-        conn.execute("DELETE FROM team_members WHERE top_agent_id = ?", (top_agent_id,))
+        conn.execute("DELETE FROM team_members WHERE team_id = ?", (team_id,))
         cursor = conn.execute(
-            "DELETE FROM teams WHERE top_agent_id = ?", (top_agent_id,)
+            "DELETE FROM teams WHERE team_id = ?", (team_id,)
         )
         conn.commit()
         return cursor.rowcount > 0
@@ -234,7 +234,7 @@ def delete_team(top_agent_id: str) -> bool:
 # ----------------------------------------------------------------------
 def add_member(
     user_id: str,
-    top_agent_id: str,
+    team_id: str,
     member_id: str,
     name: str,
     role: str = "",
@@ -247,7 +247,7 @@ def add_member(
     """新增一名团队成员并更新团队 member_count。
 
     :param parent_agent_id: 直属 leader（创建者的 agent_id）；P4 全量建队时
-                            为 top_agent_id，leader 经 create_member 创建时为
+                            为 team_id，leader 经 create_member 创建时为
                             创建者的 agent_id（用于「每层成员上限」与
                             teammates/team_member 分组）。
     """
@@ -256,37 +256,37 @@ def add_member(
     with _write_lock, connect() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO team_members "
-            "(id, top_agent_id, user_id, name, role, duty, model_id, level, "
+            "(id, team_id, user_id, name, role, duty, model_id, level, "
             "work_status, comment, scores_json, system_prompt, parent_agent_id, "
             "created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'idle', '', '{}', ?, ?, ?, ?)",
             (
-                member_id, top_agent_id, user_id, name, role, duty,
+                member_id, team_id, user_id, name, role, duty,
                 model_id, level, system_prompt, parent_agent_id, now, now,
             ),
         )
         conn.execute(
             "UPDATE teams SET member_count = "
-            "(SELECT COUNT(*) FROM team_members WHERE top_agent_id = ?), "
-            "updated_at = ? WHERE top_agent_id = ?",
-            (top_agent_id, now, top_agent_id),
+            "(SELECT COUNT(*) FROM team_members WHERE team_id = ?), "
+            "updated_at = ? WHERE team_id = ?",
+            (team_id, now, team_id),
         )
         conn.commit()
-    member = get_member(top_agent_id, member_id)
+    member = get_member(team_id, member_id)
     assert member is not None
     return member
 
 
-def get_members(top_agent_id: str) -> List[Dict[str, Any]]:
+def get_members(team_id: str) -> List[Dict[str, Any]]:
     """列出某 TOP agent 旗下全部成员，按创建时间升序。"""
     _ensure_db()
     conn = _connect()
     try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT * FROM team_members WHERE top_agent_id = ? "
+            "SELECT * FROM team_members WHERE team_id = ? "
             "ORDER BY created_at ASC, id ASC",
-            (top_agent_id,),
+            (team_id,),
         ).fetchall()
         result = []
         for row in rows:
@@ -301,15 +301,15 @@ def get_members(top_agent_id: str) -> List[Dict[str, Any]]:
         conn.close()
 
 
-def get_member(top_agent_id: str, member_id: str) -> Optional[Dict[str, Any]]:
+def get_member(team_id: str, member_id: str) -> Optional[Dict[str, Any]]:
     """按 ID 获取某个成员。"""
     _ensure_db()
     conn = _connect()
     try:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT * FROM team_members WHERE top_agent_id = ? AND id = ?",
-            (top_agent_id, member_id),
+            "SELECT * FROM team_members WHERE team_id = ? AND id = ?",
+            (team_id, member_id),
         ).fetchone()
         if row is None:
             return None
@@ -324,7 +324,7 @@ def get_member(top_agent_id: str, member_id: str) -> Optional[Dict[str, Any]]:
 
 
 def update_member(
-    top_agent_id: str, member_id: str, **fields: Any
+    team_id: str, member_id: str, **fields: Any
 ) -> Optional[Dict[str, Any]]:
     """更新成员字段（name/role/duty/model_id/level/work_status/comment/
     system_prompt/scores），返回更新后的成员；成员不存在返回 None。"""
@@ -334,7 +334,7 @@ def update_member(
     }
     updates: Dict[str, Any] = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
-        return get_member(top_agent_id, member_id)
+        return get_member(team_id, member_id)
 
     if "scores" in updates:
         scores = updates.pop("scores")
@@ -348,17 +348,17 @@ def update_member(
 
     now = int(time.time() * 1000)
     set_clause = ", ".join(f"{k} = ?" for k in updates)
-    values = list(updates.values()) + [now, top_agent_id, member_id]
+    values = list(updates.values()) + [now, team_id, member_id]
     _ensure_db()
     with _write_lock, connect() as conn:
         cursor = conn.execute(
             f"UPDATE team_members SET {set_clause}, updated_at = ? "
-            "WHERE top_agent_id = ? AND id = ?",
+            "WHERE team_id = ? AND id = ?",
             values,
         )
         conn.execute(
-            "UPDATE teams SET updated_at = ? WHERE top_agent_id = ?",
-            (now, top_agent_id),
+            "UPDATE teams SET updated_at = ? WHERE team_id = ?",
+            (now, team_id),
         )
         conn.commit()
-    return get_member(top_agent_id, member_id) if cursor.rowcount else None
+    return get_member(team_id, member_id) if cursor.rowcount else None

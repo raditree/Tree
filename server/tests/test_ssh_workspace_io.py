@@ -41,9 +41,10 @@ class _FakeExecutor:
         self.request_calls = []
         self.send_calls = []
         self.cancel_calls = []
+        self.cancel_pidfiles = []
         self.hook_on_done = None
 
-    def request(self, ws_manager, user_id, payload):
+    def request(self, ws_manager, user_id, payload, team_id=""):
         self.request_calls.append(payload)
         return dict(self.response)
 
@@ -51,21 +52,22 @@ class _FakeExecutor:
         self.send_calls.append(payload)
         return {"success": True}
 
-    def register_hook(self, user_id, exec_id, on_done):
+    def register_hook(self, user_id, tool_id, on_done, team_id=""):
         self.hook_on_done = on_done
 
-    def resolve(self, user_id, exec_id, result):
+    def resolve(self, user_id, tool_id, result, team_id=""):
         # 模拟真实 LocalExecutorClient.resolve：唤醒已登记的 hook 完成回调
         if self.hook_on_done is not None:
             self.hook_on_done(result)
         return True
 
-    def cancel_hook(self, ws_manager, user_id, exec_id):
-        self.cancel_calls.append(exec_id)
+    def cancel_hook(self, ws_manager, user_id, tool_id, pidfile=""):
+        self.cancel_calls.append(tool_id)
+        self.cancel_pidfiles.append(pidfile)
         return {"success": True}
 
 
-def make_io(executor, top_agent_id="top1"):
+def make_io(executor, team_id="top1"):
     from io_.ssh_workspace_io import SSHWorkspaceIO
 
     return SSHWorkspaceIO(executor, _FakeWS(), "u1")
@@ -181,7 +183,7 @@ def test_exec_shell_hook_delegates():
     assert io._executor.hook_on_done is on_done
     call = io._executor.send_calls[0]
     assert call["op"] == "exec_shell_hook"
-    assert call["exec_id"] == "exec1"
+    assert call["tool_id"] == "exec1"
     assert call["output_file"] == ".o"
 
 
@@ -211,6 +213,105 @@ def test_cancel_exec_hook_delegates():
     result = run(io.cancel_exec_hook("exec3"))
     assert result["success"] is True
     assert io._executor.cancel_calls == ["exec3"]
+    assert io._executor.cancel_pidfiles == [""]
+
+
+def test_cancel_exec_hook_passes_pidfile():
+    """SSH hook 取消：pidfile 随 tool_exec_cancel 透传给前端执行器。"""
+    io = make_io(_FakeExecutor())
+    result = run(io.cancel_exec_hook("exec4", pidfile=".output/a.log.pid"))
+    assert result["success"] is True
+    assert io._executor.cancel_calls == ["exec4"]
+    assert io._executor.cancel_pidfiles == [".output/a.log.pid"]
+
+
+# ----------------------------------------------------------------------
+# hook_manager SSH 路由：SSH 分支显式化（输出重定向落盘 + pidfile 取消）
+# ----------------------------------------------------------------------
+def test_hook_manager_ssh_start_wraps_redirect_and_pidfile():
+    """SSH hook 启动：经 exec_shell_hook 下发，wrapped 含重定向 + pidfile + wait。"""
+    from tool.hook_manager import get_hook_manager
+
+    executor = _FakeExecutor()
+    io = make_io(executor)
+    mgr = get_hook_manager()
+    result = mgr.start(io, "top1", "python server.py",
+                       output_file=".output/s.log")
+    assert result["task_id"]
+    assert result["output_file"] == ".output/s.log"
+    # 占位输出文件先经前端 write_file 建立（SSH 走 SFTP 写入）
+    assert executor.request_calls[0]["op"] == "write_file"
+    assert executor.request_calls[0]["path"] == ".output/s.log"
+    # hook 命令非阻塞下发（exec_shell_hook），tool_id 与任务 id 同源
+    assert len(executor.send_calls) == 1
+    send = executor.send_calls[0]
+    assert send["op"] == "exec_shell_hook"
+    assert send["tool_id"] == result["task_id"]
+    assert send["output_file"] == ".output/s.log"
+    # wrapped：重定向落盘 + pidfile + wait（完成回执语义与 local 一致）
+    wrapped = send["command"]
+    assert "python server.py" in wrapped
+    assert "python server.py > .output/s.log 2>&1" in wrapped
+    assert "echo $! > .output/s.log.pid" in wrapped
+    assert wrapped.rstrip().endswith("wait")
+    # 任务运行中（等前端 tool_exec_response 回执，而非后端线程直接落定）
+    assert mgr.status(result["task_id"])["state"] == "running"
+    assert mgr.status(result["task_id"])["task_id"] == result["task_id"]
+
+    # 模拟前端回传退出码 → 任务落定 completed
+    executor.resolve("u1", result["task_id"], {"exit_code": 0})
+    status = mgr.status(result["task_id"])
+    assert status["state"] == "completed"
+    assert status["exit_code"] == 0
+
+
+def test_hook_manager_ssh_cancel_sends_pidfile():
+    """SSH hook 取消：tool_exec_cancel 携带 pidfile，回执后任务落定 cancelled。"""
+    from tool.hook_manager import get_hook_manager
+
+    executor = _FakeExecutor()
+    io = make_io(executor)
+    mgr = get_hook_manager()
+    result = mgr.start(io, "top1", "sleep 100",
+                       output_file=".output/c2.log")
+    task_id = result["task_id"]
+
+    st = mgr.cancel(task_id)
+    assert st["task_id"] == task_id
+    assert st["state"] == "running"  # 远端进程退出回执后才落定
+    # 取消经 tool_exec_cancel（cancel_exec_hook）携带 pidfile
+    assert executor.cancel_calls == [task_id]
+    assert executor.cancel_pidfiles == [".output/c2.log.pid"]
+    assert mgr.status(task_id)["state"] == "running"
+
+    # 模拟远端进程被 kill 后 wrapped wait 返回，前端回传退出码
+    executor.resolve("u1", task_id, {"exit_code": 143})
+    status = mgr.status(task_id)
+    assert status["state"] == "cancelled"
+
+
+def test_hook_manager_ssh_send_failure_completes_with_error():
+    """SSH hook 发送失败：立即以错误收尾回调，避免 hook 悬挂。"""
+    from tool.hook_manager import get_hook_manager
+
+    class _FailExecutor(_FakeExecutor):
+        def send_request(self, ws_manager, user_id, payload):
+            self.send_calls.append(payload)
+            return {"error": "推送失败"}
+
+    executor = _FailExecutor()
+    io = make_io(executor)
+    mgr = get_hook_manager()
+    completed = []
+    result = mgr.start(
+        io, "top1", "sleep 100", output_file=".output/f.log",
+        on_complete=lambda *a, **kw: completed.append(a),
+    )
+    assert "error" in result
+    assert executor.cancel_calls == []
+    # exec_shell_hook 内部已触发 on_done 收尾
+    assert mgr.status(result["task_id"])["state"] == "failed"
+    assert len(completed) == 1
 
 
 # ----------------------------------------------------------------------
@@ -282,7 +383,7 @@ class FakeLocalExecutor:
     def __init__(self, local=False):
         self.local = local
 
-    def is_local(self, user_id, top_agent_id=None):
+    def is_local(self, user_id, team_id=None):
         return self.local
 
 

@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show Platform;
+import 'dart:io' show File, Platform, RandomAccessFile;
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart' show kIsWeb;
@@ -237,12 +237,12 @@ class ApiService {
   static Future<List<FileNode>> getFiles(
     String workspaceId, {
     String path = '',
-    String topAgentId = '',
+    String teamId = '',
   }) async {
     final Map<String, dynamic> data =
         await _getJson('/api/files/$workspaceId', query: {
       if (path.isNotEmpty) 'path': path,
-      if (topAgentId.isNotEmpty) 'top_agent_id': topAgentId,
+      if (teamId.isNotEmpty) 'team_id': teamId,
     });
     final List<dynamic> files = data['files'] as List<dynamic>? ?? [];
     return files
@@ -257,12 +257,12 @@ class ApiService {
   static Future<String> getFileContent(
     String workspaceId,
     String path, {
-    String topAgentId = '',
+    String teamId = '',
   }) async {
     final Map<String, dynamic> data =
         await _getJson('/api/files/$workspaceId/content', query: {
       'path': path,
-      if (topAgentId.isNotEmpty) 'top_agent_id': topAgentId,
+      if (teamId.isNotEmpty) 'team_id': teamId,
     });
     return data['content'] as String? ?? '';
   }
@@ -275,11 +275,11 @@ class ApiService {
   static Future<Map<String, dynamic>> getPdfInfo(
     String workspaceId,
     String path, {
-    String topAgentId = '',
+    String teamId = '',
   }) async {
     return _getJson('/api/files/$workspaceId/pdf_info', query: {
       'path': path,
-      if (topAgentId.isNotEmpty) 'top_agent_id': topAgentId,
+      if (teamId.isNotEmpty) 'team_id': teamId,
     });
   }
 
@@ -294,13 +294,13 @@ class ApiService {
     String path, {
     int page = 1,
     double scale = 2.0,
-    String topAgentId = '',
+    String teamId = '',
   }) async {
     return _getJson('/api/files/$workspaceId/pdf_preview', query: {
       'path': path,
       'page': page.toString(),
       'scale': scale.toString(),
-      if (topAgentId.isNotEmpty) 'top_agent_id': topAgentId,
+      if (teamId.isNotEmpty) 'team_id': teamId,
     });
   }
 
@@ -314,12 +314,12 @@ class ApiService {
   static Future<List<Map<String, dynamic>>> getGitLog(
     String workspaceId, {
     int limit = 50,
-    String topAgentId = '',
+    String teamId = '',
   }) async {
     final Map<String, dynamic> data =
         await _getJson('/api/workspaces/$workspaceId/git/log', query: {
       'limit': limit.toString(),
-      if (topAgentId.isNotEmpty) 'top_agent_id': topAgentId,
+      if (teamId.isNotEmpty) 'team_id': teamId,
     });
     final List<dynamic> commits = data['commits'] as List<dynamic>? ?? [];
     return commits
@@ -334,10 +334,10 @@ class ApiService {
   /// 网络异常或后端返回错误时抛出中文异常。
   static Future<Map<String, dynamic>> getGitBranches(
     String workspaceId, {
-    String topAgentId = '',
+    String teamId = '',
   }) async {
     return _getJson('/api/workspaces/$workspaceId/git/branches', query: {
-      if (topAgentId.isNotEmpty) 'top_agent_id': topAgentId,
+      if (teamId.isNotEmpty) 'team_id': teamId,
     });
   }
 
@@ -365,10 +365,10 @@ class ApiService {
   static Future<Uint8List> downloadFile(
     String workspaceId,
     String filePath, {
-    String topAgentId = '',
+    String teamId = '',
   }) async {
     final String query =
-        topAgentId.isNotEmpty ? '?top_agent_id=${Uri.encodeQueryComponent(topAgentId)}' : '';
+        teamId.isNotEmpty ? '?team_id=${Uri.encodeQueryComponent(teamId)}' : '';
     final Uri uri = Uri.parse(
         '$baseUrl/api/files/$workspaceId/download$query');
     try {
@@ -402,10 +402,10 @@ class ApiService {
   static Future<Uint8List> downloadFolder(
     String workspaceId,
     String folderPath, {
-    String topAgentId = '',
+    String teamId = '',
   }) async {
     final String query =
-        topAgentId.isNotEmpty ? '?top_agent_id=${Uri.encodeQueryComponent(topAgentId)}' : '';
+        teamId.isNotEmpty ? '?team_id=${Uri.encodeQueryComponent(teamId)}' : '';
     final Uri uri =
         Uri.parse('$baseUrl/api/files/$workspaceId/download_folder$query');
     try {
@@ -431,17 +431,23 @@ class ApiService {
     }
   }
 
-  /// 上传本地文件到工作空间
+  /// 上传本地文件到工作空间（小文件单请求通道）
   ///
   /// 调用 `POST /api/files/{workspace_id}/upload`，以 multipart/form-data 方式
   /// 批量上传。[files] 为 (本地路径, 相对路径) 列表，相对路径用于保留文件夹层级，
   /// 后端统一保存到 `.input/yyyymmdd/` 目录。返回上传后的工作空间内路径列表。
-  /// 非 200 状态码时抛出中文异常。
+  /// 后端按 teamId 判定三模式分派（本地/SSH 委托前端执行器落盘），单文件超过
+  /// 分片阈值（upload.chunk_threshold，默认 8MB）时后端拒绝，请改用
+  /// [uploadFileChunked]。非 200 状态码时抛出中文异常。
   static Future<List<String>> uploadToCloud(
     String workspaceId,
-    List<MapEntry<String, String>> files,
-  ) async {
-    final Uri uri = Uri.parse('$baseUrl/api/files/$workspaceId/upload');
+    List<MapEntry<String, String>> files, {
+    String teamId = '',
+  }) async {
+    final String query = teamId.isNotEmpty
+        ? '?team_id=${Uri.encodeQueryComponent(teamId)}'
+        : '';
+    final Uri uri = Uri.parse('$baseUrl/api/files/$workspaceId/upload$query');
     final http.MultipartRequest request = http.MultipartRequest('POST', uri);
     for (final MapEntry<String, String> entry in files) {
       // 字段名必须与后端 FastAPI 参数一致：files / rel_paths
@@ -467,6 +473,89 @@ class ApiService {
     } catch (e) {
       throw Exception('网络请求失败，请检查后端服务是否启动');
     }
+  }
+
+  /// 大文件分片上传阈值：文件超过该大小时走 init/chunk/complete 分片通道
+  /// （与后端 `upload.chunk_threshold` 默认值一致）
+  static const int chunkUploadThreshold = 8 * 1024 * 1024;
+
+  /// 大文件分片上传（init/chunk/complete 三段式）
+  ///
+  /// 调用 `POST /api/files/{workspace_id}/upload_init` 建立会话并获取服务端
+  /// 定标的分片大小，按分片逐个 `POST .../upload_chunk`（base64），
+  /// 最后 `POST .../upload_complete` 组装。[relPath] 为保留层级的相对路径，
+  /// 后端统一落到 `.input/yyyymmdd/` 目录。[onProgress] 回传 (已传字节, 总字节)。
+  /// 返回工作空间内保存路径（如 `/workspace/.input/20260906/big.bin`）。
+  static Future<String> uploadFileChunked(
+    String workspaceId,
+    String filePath,
+    String relPath, {
+    String teamId = '',
+    void Function(int sent, int total)? onProgress,
+  }) async {
+    final Map<String, String> query = <String, String>{
+      if (teamId.isNotEmpty) 'team_id': teamId,
+    };
+    final File file = File(filePath);
+    final int total = await file.length();
+
+    // ① init：建立分片会话，服务端定标 chunk_size
+    final Map<String, dynamic> initData = await _postJson(
+      '/api/files/$workspaceId/upload_init',
+      query: query,
+      body: <String, dynamic>{
+        'file_name': relPath.split('/').last,
+        'rel_path': relPath.contains('/')
+            ? relPath.substring(0, relPath.lastIndexOf('/'))
+            : '',
+        'total_size': total,
+      },
+    );
+    final String uploadId = initData['upload_id'] as String? ?? '';
+    final int chunkSize =
+        (initData['chunk_size'] as num?)?.toInt() ?? 4 * 1024 * 1024;
+    if (uploadId.isEmpty) {
+      throw Exception('上传失败：初始化分片会话未返回 upload_id');
+    }
+
+    // ② chunk：按分片逐个上传（base64）
+    final RandomAccessFile raf = await file.open();
+    int index = 0;
+    int sent = 0;
+    try {
+      while (sent < total) {
+        final Uint8List chunk = await raf.read(chunkSize);
+        if (chunk.isEmpty) break;
+        await _postJson(
+          '/api/files/$workspaceId/upload_chunk',
+          query: query,
+          body: <String, dynamic>{
+            'upload_id': uploadId,
+            'index': index,
+            'data': base64Encode(chunk),
+          },
+        );
+        index++;
+        sent += chunk.length;
+        onProgress?.call(sent, total);
+      }
+    } finally {
+      await raf.close();
+    }
+
+    // ③ complete：组装文件
+    final Map<String, dynamic> done = await _postJson(
+      '/api/files/$workspaceId/upload_complete',
+      query: query,
+      body: <String, dynamic>{
+        'upload_id': uploadId,
+        'total_chunks': index,
+      },
+    );
+    if (done['success'] != true) {
+      throw Exception('上传失败：${done['detail'] ?? done['path'] ?? '未知错误'}');
+    }
+    return done['path'] as String? ?? '';
   }
 
   /// 拉取指定 agent/会话的对话历史
@@ -984,13 +1073,16 @@ class ApiService {
 
   /// 发送 POST 请求并解析 JSON 响应
   ///
-  /// [path] 为接口路径（以 / 开头），[body] 为请求体。
+  /// [path] 为接口路径（以 / 开头），[body] 为请求体，[query] 为可选查询参数
+  /// （如 team_id 等三模式判定键）。
   /// 非 200 状态码或 501 时抛出对应中文异常。
   static Future<Map<String, dynamic>> _postJson(
     String path, {
     Map<String, dynamic>? body,
+    Map<String, String>? query,
   }) async {
-    final Uri uri = Uri.parse('$baseUrl$path');
+    final Uri uri =
+        Uri.parse('$baseUrl$path').replace(queryParameters: query);
     try {
       final http.Response response = await http.post(
         uri,

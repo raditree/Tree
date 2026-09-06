@@ -159,7 +159,7 @@ class TestProcessMemberMessageSessionKeys(unittest.TestCase):
 
     BASE = {
         "user_id": "u1", "agent_id": "mem-1", "workspace_id": "w1",
-        "model_id": "m1", "top_agent_id": "top-1",
+        "model_id": "m1", "team_id": "top-1",
         "system_prompt": "", "content": "开工",
     }
 
@@ -206,7 +206,7 @@ class TestCrossSessionQueueIsolation(unittest.TestCase):
 
     BASE = {
         "user_id": "u1", "agent_id": "mem-1", "workspace_id": "w1",
-        "model_id": "m1", "top_agent_id": "top-1",
+        "model_id": "m1", "team_id": "top-1",
         "system_prompt": "", "content": "当前会话任务",
     }
 
@@ -267,7 +267,7 @@ class TestMemberSftCollection(unittest.TestCase):
 
     BASE = {
         "user_id": "u1", "agent_id": "mem-1", "workspace_id": "w1",
-        "model_id": "m1", "top_agent_id": "top-1",
+        "model_id": "m1", "team_id": "top-1",
         "system_prompt": "", "content": "开工",
     }
 

@@ -1,9 +1,20 @@
 """后台任务管理器 - 支撑 terminal 工具 hook 模式的长任务。
 
-hook 模式把一条长命令放到独立进程后台执行（本地=前端托管分离进程，
-云端/SSH=后端独立线程执行），输出实时重定向到工作空间内文件，工具立即
-返回不阻塞 tool loop；命令结束后经 :mod:`agent.chat` 注入的 ``on_complete``
-回调唤醒发起该命令的 agent 续跑。
+hook 模式把一条长命令放到独立进程后台执行，输出实时重定向到工作空间内
+文件，工具立即返回不阻塞 tool loop；命令结束后经 :mod:`agent.chat` 注入的
+``on_complete`` 回调唤醒发起该命令的 agent 续跑。
+
+按 IO 实现显式三分（SSHWorkspaceIO 继承 LocalWorkspaceIO，isinstance
+判断必须 SSH 优先，否则永远误入 local 分支）：
+
+- local：前端托管分离进程（``exec_shell_hook``），命令**不含**重定向
+  （输出由前端以绝对路径流式写入文件），退出时回传真实退出码；
+- ssh：命令同样经 ``exec_shell_hook`` 委托前端 dartssh2 会话执行（与 local
+  相同的完成回执模型），但 wrapped 命令**自带重定向 + pidfile + wait**
+  （前端不流式写文件；pidfile 供取消时远端 kill；wait 保证退出码回执语义
+  不变）；
+- cloud：后端独立线程执行 ``exec_shell_no_timeout``（无时长上限），
+  pidfile kill 经 ``exec_shell`` 下发。
 
 任务状态统一由模块级单例 :class:`HookTaskManager` 管理，支持
 ``start`` / ``status`` / ``cancel``，local / ssh / cloud 三种模式共用。
@@ -12,11 +23,13 @@ hook 模式把一条长命令放到独立进程后台执行（本地=前端托�
 from __future__ import annotations
 
 import logging
+import shlex
 import threading
 import time
 import uuid
 from typing import Any, Callable, Dict, Optional
 
+from io_.ssh_workspace_io import SSHWorkspaceIO
 from io_.workspace_io import LocalWorkspaceIO, WorkspaceIO, run_io
 
 logger = logging.getLogger(__name__)
@@ -66,7 +79,9 @@ class HookTaskManager:
         """后台启动一条 hook 命令并立即返回。
 
         - local：前端托管分离进程（``exec_shell_hook``），退出时回传真实退出码。
-        - cloud/ssh：后端独立后台线程执行 ``exec_shell_no_timeout``（无时长上限）。
+        - ssh：经 ``exec_shell_hook`` 委托前端 dartssh2 会话执行，wrapped 含
+          重定向 + pidfile + wait（完成回执语义与 local 相同）。
+        - cloud：后端独立后台线程执行 ``exec_shell_no_timeout``（无时长上限）。
 
         :param io: 工作空间 IO 实现
         :param workspace_id: 工作空间标识
@@ -94,7 +109,33 @@ class HookTaskManager:
             )
             return {"error": task.error, "task_id": task_id}
 
-        if isinstance(io, LocalWorkspaceIO):
+        if isinstance(io, SSHWorkspaceIO):
+            # SSH 模式（先于 LocalWorkspaceIO 判断：SSHWorkspaceIO 继承自它）：
+            # 命令经 exec_shell_hook 委托前端 dartssh2 会话执行。前端不流式写
+            # 输出文件，wrapped 必须自带重定向；同时写 pidfile 记录后台进程
+            # pid 供取消（tool_exec_cancel → 前端远端 kill -TERM）；末尾 wait
+            # 等待命令退出，shell 退出码即命令退出码，完成回执语义与 local 一致。
+            # 注意：cd 由前端拼接（远端 workspace 绝对路径仅前端可知）。
+            pidfile = f"{output_file}.pid"
+            wrapped = (
+                f"{command} > {shlex.quote(output_file)} 2>&1 "
+                f"& echo $! > {shlex.quote(pidfile)}; wait"
+            )
+            try:
+                result = run_io(io.exec_shell_hook(
+                    workspace_id, task_id, wrapped, output_file,
+                    timeout, lambda r: self._complete(task, r, on_complete),
+                ))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("启动 SSH hook 失败: %s (%s)", task_id, exc)
+                self._complete(
+                    task, {"error": f"启动 SSH hook 失败: {exc}"}, on_complete
+                )
+                return {"error": task.error, "task_id": task_id}
+            if result.get("error"):
+                # 发送失败已由 exec_shell_hook 内部触发 on_done 收尾
+                return {"error": result["error"], "task_id": task_id}
+        elif isinstance(io, LocalWorkspaceIO):
             # 本地模式：前端托管分离进程。输出文件由前端以**绝对路径流式写入**
             # （Process 管道 → 文件），命令中不附加 shell 重定向——命令内
             # `cd` 会改变 cmd 工作目录，相对路径（.output/hook_xxx.log）会
@@ -115,7 +156,7 @@ class HookTaskManager:
                 # 发送失败已由 exec_shell_hook 内部触发 on_done 收尾
                 return {"error": result["error"], "task_id": task_id}
         else:
-            # 云端 / SSH：sh 语法后台 + pidfile + wait，后端线程执行（无上限）
+            # 云端：sh 语法后台 + pidfile + wait，后端线程执行（无上限）
             wrapped = (
                 f"{command} > {output_file} 2>&1 "
                 f"& echo $! > {output_file}.pid; wait"
@@ -136,7 +177,7 @@ class HookTaskManager:
         wrapped: str,
         on_complete: Optional[Callable[..., Any]],
     ) -> None:
-        """云端 / SSH 后台线程入口：执行无超时命令并落定任务。"""
+        """云端后台线程入口：执行无超时命令并落定任务。"""
         try:
             result = run_io(io.exec_shell_no_timeout(workspace_id, wrapped))
         except Exception as exc:  # noqa: BLE001
@@ -210,7 +251,9 @@ class HookTaskManager:
         """取消一个后台 hook 任务（尽力终止，进程退出后仍走完成回调）。
 
         - local：向后端 WS 发 ``tool_exec_cancel`` → 前端 ``process.kill()``；
-        - cloud/ssh：经 pidfile ``kill -TERM``（尽力终止，不保证杀掉全部孙进程）。
+        - ssh：向后端 WS 发 ``tool_exec_cancel``（含 pidfile）→ 前端经 SSH
+          会话远端 ``kill -TERM $(cat pidfile)``；
+        - cloud：经 pidfile ``kill -TERM``（尽力终止，不保证杀掉全部孙进程）。
         """
         task = self._tasks.get(task_id)
         if task is None:
@@ -220,7 +263,11 @@ class HookTaskManager:
             if task.finished_at is not None:
                 return self.status(task_id)
         try:
-            if isinstance(task.io, LocalWorkspaceIO):
+            if isinstance(task.io, SSHWorkspaceIO):
+                run_io(task.io.cancel_exec_hook(
+                    task_id, pidfile=f"{task.output_file}.pid"
+                ))
+            elif isinstance(task.io, LocalWorkspaceIO):
                 run_io(task.io.cancel_exec_hook(task_id))
             else:
                 kill_cmd = (

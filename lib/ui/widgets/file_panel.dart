@@ -30,8 +30,8 @@ class FilePanel extends StatefulWidget {
   /// 工作空间 ID
   final String workspaceId;
 
-  /// 所属顶层 agent ID（Todo 面板本地模式读取、模型信息页需要）
-  final String? topAgentId;
+  /// 所属团队 ID（Todo 面板本地模式读取、模型信息页需要）
+  final String? teamId;
 
   /// 当前会话 ID（Todo 面板按会话隔离查询 todos）
   final String sessionId;
@@ -45,7 +45,7 @@ class FilePanel extends StatefulWidget {
   const FilePanel({
     super.key,
     required this.workspaceId,
-    this.topAgentId,
+    this.teamId,
     this.sessionId = 'session_default',
     this.onCollapse,
     this.onNavigateToQuestion,
@@ -153,8 +153,10 @@ class _FilePanelState extends State<FilePanel>
       // 显示加载提示
       _showSnackBar('正在下载...');
       final Uint8List bytes = isDirectory
-          ? await ApiService.downloadFolder(widget.workspaceId, path)
-          : await ApiService.downloadFile(widget.workspaceId, path);
+          ? await ApiService.downloadFolder(
+              widget.workspaceId, path, teamId: widget.teamId ?? '')
+          : await ApiService.downloadFile(
+              widget.workspaceId, path, teamId: widget.teamId ?? '');
 
       // 弹出系统保存对话框
       final String? savePath = await FilePicker.platform.saveFile(
@@ -214,7 +216,7 @@ class _FilePanelState extends State<FilePanel>
                 children: [
                   _buildFileSection(),
                   const McpConfigPanel(),
-                  ModelInfoPanel(agentId: widget.topAgentId ?? ''),
+                  ModelInfoPanel(agentId: widget.teamId ?? ''),
                   QuestionPanel(
                     sessionId: widget.sessionId,
                     onNavigateToQuestion: widget.onNavigateToQuestion,
@@ -320,6 +322,7 @@ class _FilePanelState extends State<FilePanel>
                 children: [
                   FileTree(
                     workspaceId: widget.workspaceId,
+                    teamId: widget.teamId,
                     refreshTrigger: _fileRefreshTrigger,
                     onDownload: _handleDownload,
                     onFileSelected: (String path) {
@@ -330,12 +333,12 @@ class _FilePanelState extends State<FilePanel>
                   ),
                   GitHistory(
                       workspaceId: widget.workspaceId,
-                      topAgentId: widget.topAgentId,
+                      teamId: widget.teamId,
                       refreshTrigger: _gitRefreshTrigger,
                     ),
                   TodoPanel(
                     workspaceId: widget.workspaceId,
-                    topAgentId: widget.topAgentId,
+                    teamId: widget.teamId,
                     sessionId: widget.sessionId,
                     refreshTrigger: _todoRefreshTrigger,
                   ),
@@ -346,6 +349,7 @@ class _FilePanelState extends State<FilePanel>
                 Positioned.fill(
                   child: FileViewer(
                     workspaceId: widget.workspaceId,
+                    teamId: widget.teamId,
                     filePath: _selectedFilePath!,
                     onClose: _closeViewer,
                   ),
