@@ -71,11 +71,20 @@ class SshWorkspaceExecutor {
     // 条连接上新开会话型通道，走并发闸（超出排队）。
     //
     // 排队等待期间 ssh_executor_service 的 tool_exec_progress 心跳持续发送
-    // （其周期 timer 覆盖整个 execute 期间），后端卡死检测不会误判超时。
+    // （其周期 timer 覆盖整个 execute 期间），后端卡死检测不会误判超时；
+    // 若排队超过闸的最大等待时限仍无槽位，闸会自行移除该项并抛超时，
+    // 此处转成可读错误返回（不无限排队）。
     if (op == 'upload_chunk' || op == 'upload_complete') {
       return run();
     }
-    return manager.runWithSlot(teamId, run);
+    try {
+      return await manager.runWithSlot(teamId, run);
+    } on TimeoutException {
+      return <String, dynamic>{
+        'error': 'SSH 执行排队超时：等待执行槽位超过 '
+            '${SshConnectionManager.queueWaitTimeout.inMinutes} 分钟，请稍后重试',
+      };
+    }
   }
 
   /// 在已连接的 [client] 上按 op 分发执行一次（不处理连接级错误）。

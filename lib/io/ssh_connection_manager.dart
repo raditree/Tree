@@ -21,23 +21,39 @@ class SshConnectionManager {
   /// SFTP 等会话型通道留余量，避免并发会话占满后新命令全部 ``open failed``。
   static const int maxConcurrentPerTeam = 6;
 
+  /// 排队等槽位的最长时限：超过即自动移出队列并报错（见 [_TeamGate.acquire]），
+  /// 保证等待项不永久驻留、队列长度有界。
+  static const Duration queueWaitTimeout = Duration(minutes: 5);
+
   /// 已建立的连接缓存：team_id -> SSHClient
   final Map<String, SSHClient> _clients = <String, SSHClient>{};
 
   /// 每 team 的并发闸（同一连接上的工具并发上限，超出排队）：team_id -> 闸
   final Map<String, _TeamGate> _gates = <String, _TeamGate>{};
 
-  /// 在 [teamId] 的并发配额内执行 [action]：同连接并发已达
-  /// [maxConcurrentPerTeam] 时排队等待槽位，前一个执行结束即让位。
+  /// 在 [teamId] 的并发配额内执行 [action]：同连接并发已达上限时排队等待
+  /// 槽位，前一个执行结束即让位；排队超过 [SshConnectionManager.queueWaitTimeout]
+  /// 未拿到槽位时抛 [TimeoutException]（该项自动移出队列）。
   ///
   /// 排队等待期间调用方的进度心跳仍在发送（后端卡死检测因此不会误判超时）。
   /// 注意：取消 hook / 复用既有分片会话的操作**不要**经此排队——它们要么需要
   /// 立即执行以解除卡死，要么本就不开新通道，应直连执行。
+  ///
+  /// [maxConcurrent] / [queueWait] 仅在该 team 尚无闸时生效（测试可注入更小
+  /// 的并发上限与等待时限；生产走默认值）。
   Future<T> runWithSlot<T>(
     String teamId,
-    Future<T> Function() action,
-  ) async {
-    final _TeamGate gate = _gates.putIfAbsent(teamId, _TeamGate.new);
+    Future<T> Function() action, {
+    int? maxConcurrent,
+    Duration? queueWait,
+  }) async {
+    final _TeamGate gate = _gates.putIfAbsent(
+      teamId,
+      () => _TeamGate(
+        max: maxConcurrent ?? maxConcurrentPerTeam,
+        queueWait: queueWait ?? queueWaitTimeout,
+      ),
+    );
     await gate.acquire();
     try {
       return await action();
@@ -148,6 +164,12 @@ class SshConnectionManager {
         // 忽略关闭异常
       }
     }
+    // 连接已关闭：顺手回收空闲的并发闸，防止 _gates 随 team 反复建/销而膨胀
+    // （仍在执行或仍有排队的闸保留，由它们的 finally/排队超时自行收尾）
+    final _TeamGate? gate = _gates[teamId];
+    if (gate != null && gate._isIdle) {
+      _gates.remove(teamId);
+    }
   }
 
   /// 关闭全部连接并清空缓存。
@@ -160,6 +182,7 @@ class SshConnectionManager {
       }
     }
     _clients.clear();
+    _gates.clear();
   }
 
   /// 若缓存中仍是 [client]，则移除（transport 已失活）。
@@ -232,11 +255,21 @@ class SshConnectionManager {
 /// 同一条 SSH 连接上的会话型通道数量受 sshd ``MaxSessions`` 限制（默认
 /// 10），此闸把并发工具数限制在 [SshConnectionManager.maxConcurrentPerTeam]，
 /// 超出部分排队等槽位——避免并发会话打满通道上限后新命令 ``open failed``。
+///
+/// 注：Dart 2.19 没有原生 Future 取消（也无 ``CanceledException``），等待中
+/// 的请求无法被调用方"取消"，因此 [acquire] 通过**排队超时 + 自动移出队列**
+/// 保证任何等待项都不会永久驻留在 [_waiters] 中（队列长度有界）。
 class _TeamGate {
-  _TeamGate({this.max = SshConnectionManager.maxConcurrentPerTeam});
+  _TeamGate({
+    this.max = SshConnectionManager.maxConcurrentPerTeam,
+    this.queueWait = SshConnectionManager.queueWaitTimeout,
+  });
 
   /// 允许同时执行的并发上限
   final int max;
+
+  /// 排队等槽位的最长时限（测试可注入更小值以缩短验证耗时）
+  final Duration queueWait;
 
   /// 当前占用槽位的执行数（不含等待者）
   int _active = 0;
@@ -244,7 +277,13 @@ class _TeamGate {
   /// 排队等待槽位的请求（FIFO 让位）
   final List<Completer<void>> _waiters = <Completer<void>>[];
 
+  /// 是否空闲（无执行中、无排队），供连接关闭时清理闸本身、防 map 膨胀。
+  bool get _isIdle => _active == 0 && _waiters.isEmpty;
+
   /// 申请一个槽位：未满立即占用；已满则排队等待，直到被让位唤醒。
+  ///
+  /// 排队超过 [queueWait] 未拿到槽位时，把自己从 [_waiters] 移出后
+  /// 抛出 [TimeoutException]（不会进入执行，也不占槽位）。
   Future<void> acquire() async {
     if (_active < max) {
       _active++;
@@ -252,7 +291,15 @@ class _TeamGate {
     }
     final Completer<void> waiter = Completer<void>();
     _waiters.add(waiter);
-    await waiter.future;
+    try {
+      await waiter.future.timeout(queueWait);
+    } on TimeoutException {
+      // 拿到槽位的路径由 timeout 正常返回走，不会落到本分支；能走到这里
+      // 说明本 waiter 尚未被让位，仍在队列中，移除即可（单线程模型下无
+      // 并发插入/让位的竞态）。
+      _waiters.remove(waiter);
+      rethrow;
+    }
   }
 
   /// 释放当前槽位：有等待者则让位给队首（槽位数不变），否则归还槽位。
