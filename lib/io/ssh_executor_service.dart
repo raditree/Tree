@@ -110,6 +110,14 @@ class SshExecutorService extends ChangeNotifier {
   static String _kEnabledKey(String teamId) => '$_kEnabledPrefix$teamId';
   static String _kConfigKey(String teamId) => '$_kConfigPrefix$teamId';
 
+  /// 同步工具执行期间的进度上报间隔（与 LocalExecutorService 一致）。
+  ///
+  /// 后端等待响应时以"距最近一次进度上报"做卡死判定：只要前端还在经 SSH
+  /// 执行就周期上报 ``tool_exec_progress`` 续期，远程长任务（grep 数分钟 /
+  /// terminal 360s+）不会被后端等待窗口误杀；本间隔应明显小于后端的
+  /// _STALL_WITHOUT_PROGRESS_SECONDS（60s），留足网络/调度余量。
+  static const Duration _kToolProgressInterval = Duration(seconds: 10);
+
   /// 承载当前 WebSocket 通道的服务（用于发送注册/注销消息）
   WebSocketService? _ws;
 
@@ -262,6 +270,25 @@ class SshExecutorService extends ChangeNotifier {
     }
   }
 
+  /// 处理后端 ``registration_lost`` 通知：该 team 的 SSH 执行器注册已被后端
+  /// 清除（WS 断连清理 / 连续超时自动停用）。
+  ///
+  /// 复位 registered=false，使后续 [ensureTeam]（发消息/作答/重连自动补注册）
+  /// 不会因 stale registered=true 而跳过——否则后端已注销执行器、前端仍以为
+  /// 注册在册，工具调用会一直"前端执行器未启用"无法自愈。启用开关与 SSH
+  /// 配置等持久化设置不受影响。
+  void handleRegistrationLost(String teamId) {
+    if (teamId.isEmpty) return;
+    final _SshTeamState? state = _states[teamId];
+    if (state != null && state.registered) {
+      state.registered = false;
+      debugPrint(
+        '[SshExecutor] 后端通知 SSH 执行器注册已丢失(team=$teamId)，'
+        '将在下次动作时自动重注册',
+      );
+    }
+  }
+
   /// 按该 team 配置重建（或复用）SSH 连接；失败静默忽略（工具执行时按需重建）。
   Future<void> _rebuildConnection(_SshTeamState state) async {
     try {
@@ -368,6 +395,15 @@ class SshExecutorService extends ChangeNotifier {
       );
     }
 
+    // 非 hook 的同步工具执行：执行期间每 _kToolProgressInterval 上报一次进度，
+    // 让后端的卡死检测续期——远程长任务（grep / terminal 等）只要在跑就不会
+    // 被误判为超时；hook 走非阻塞通道、无后端等待窗口，不需进度续期。
+    final Timer? progressTimer = op == 'exec_shell_hook'
+        ? null
+        : Timer.periodic(
+            _kToolProgressInterval,
+            (_) => _sendToolProgress(toolId, reqTeam),
+          );
     // 按请求 team 构建执行器：连接与路径映射都用该 team 自己的配置，
     // 执行 A team 请求时不会读到 B team 的配置（per-team 隔离）
     SshWorkspaceExecutor(_connectionManager, teamId: reqTeam,
@@ -383,8 +419,19 @@ class SshExecutorService extends ChangeNotifier {
       _sendToolExecResponse(toolId, <String, dynamic>{
         'error': error.toString(),
       });
-    });
+    }).whenComplete(() => progressTimer?.cancel());
     return true;
+  }
+
+  /// 上报一次工具执行进度（``tool_exec_progress``，供后端卡死检测续期）。
+  void _sendToolProgress(String toolId, String teamId) {
+    _send(<String, dynamic>{
+      'type': 'tool_exec_progress',
+      'data': <String, dynamic>{
+        'tool_id': toolId,
+        'team_id': teamId,
+      },
+    });
   }
 
   /// 处理 ``tool_exec_cancel``：终止对应 hook 的远端后台进程。

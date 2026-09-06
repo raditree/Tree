@@ -2556,11 +2556,14 @@ async def _handle_user_message(
 
     # 运行模式锁定（SubTask 6.5）：team 首次收到消息、正式进入 agent 处理
     # 循环前，确定并持久化运行模式（agents.mode）。此后 resolve_mode 优先
-    # 读取该持久化值，不再随执行器运行时注册态漂移（local/ssh 执行器注销
-    # 时仍回落 cloud，见 io_/mode_resolver.py）。本地/SSH 的 base 与
-    # agentspace/ 目录由前端执行器负责初始化；云端沙箱在 agent 创建时已由
-    # POST /agents → docker_manager.create_workspace 创建（首消息 ensure 仅
-    # 注释级确认，幂等不重复创建）。锁定失败（DB 异常等）不阻断消息处理。
+    # 读取该持久化值，不再随执行器运行时注册态漂移：已锁定 local/ssh 的
+    # agent 即使执行器瞬时失联（WS 断连/连续超时自动停用）也保持 local/ssh，
+    # 由执行器 request 快速失败 + 前端收到 registration_lost 后自动重注册
+    # 自愈（绝不静默回退云端执行，见 io_/mode_resolver.py）。本地/SSH 的
+    # base 与 agentspace/ 目录由前端执行器负责初始化；云端沙箱在 agent 创建
+    # 时已由 POST /agents → docker_manager.create_workspace 创建（首消息
+    # ensure 仅注释级确认，幂等不重复创建）。锁定失败（DB 异常等）不阻断
+    # 消息处理。
     ensure_mode_locked(user_id, agent_id)
 
     # 确保会话元数据存在（多会话并行），更新访问时间并用首条消息生成标题

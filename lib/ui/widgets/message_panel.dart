@@ -167,6 +167,15 @@ class _MessagePanelState extends State<MessagePanel> {
         //（未激活的 team 不注册；后端断连时按连接自动清理了注册）
         LocalExecutorService.instance.syncRegisteredTeams();
         SshExecutorService.instance.syncRegisteredTeams();
+        // 新进程/重连后前端内存里可能没有任何"已注册"记忆（registered=false
+        // 会被 syncRegisteredTeams 跳过），仅靠懒注册会在下次发消息才恢复；
+        // 这里对当前选中 agent 直接补一次 ensureTeam——若该 agent 启用了
+        // 本地/SSH 执行器（含持久化设置）则自动补注册，进会话即自愈（幂等：
+        // 已注册/未启用时静默跳过）。
+        final String? curId = widget.selectedAgent?.id;
+        if (curId != null && curId.isNotEmpty) {
+          _ensureExecutorsReady(curId);
+        }
       }
     };
     // 先恢复当前顶部 agent 的运行模式设置（仅供标题栏显示），再建立
@@ -191,7 +200,10 @@ class _MessagePanelState extends State<MessagePanel> {
   /// per-team 模型下不再在此处做全量注册：注册由消息发送前的懒激活
   /// （[LocalExecutorService.ensureTeam] / [SshExecutorService.ensureTeam]）
   /// 与 WS 重连后的 syncRegisteredTeams 恢复负责；这里只把该 team 的持久化
-  /// 设置读入服务内存并刷新标题栏的模式显示。
+  /// 设置读入服务内存并刷新标题栏的模式显示。加载完成后对当前 agent 补一次
+  /// ensureTeam：进入会话（首次进入/切换 agent）时若启用了本地/SSH 执行器
+  /// 而前端因进程重启丢了注册记忆，则自动补注册自愈（连接未就绪时静默跳过，
+  /// 由 WS 连接建立后的同款 ensureTeam 兜底）。
   Future<void> _loadModeSettings() async {
     final String teamId = widget.selectedAgent?.id ?? '';
     await Future.wait(<Future<void>>[
@@ -209,6 +221,9 @@ class _MessagePanelState extends State<MessagePanel> {
       _sshEnabled = SshExecutorService.instance.isTeamEnabled(teamId);
       _sshConfig = SshExecutorService.instance.teamConfig(teamId);
     });
+    if (teamId.isNotEmpty) {
+      _ensureExecutorsReady(teamId);
+    }
   }
 
   @override
@@ -521,6 +536,20 @@ class _MessagePanelState extends State<MessagePanel> {
     if (!mounted) return;
     final String? type = data['type'] as String?;
 
+    // 后端通知执行器注册已丢失（断连清理 / 连续超时自动停用）：本地/SSH
+    // 执行器据此复位 registered=false，避免 stale registered 使下次
+    // ensureTeam 跳过补注册；下次动作（发消息/作答/重连）即自动重注册自愈。
+    if (type == 'registration_lost') {
+      final Map<String, dynamic> regData =
+          (data['data'] as Map<String, dynamic>?) ?? <String, dynamic>{};
+      final String lostTeam = (regData['team_id'] as String?) ?? '';
+      if (lostTeam.isNotEmpty) {
+        LocalExecutorService.instance.handleRegistrationLost(lostTeam);
+        SshExecutorService.instance.handleRegistrationLost(lostTeam);
+      }
+      return;
+    }
+
     // SSH 执行器注册/注销确认：交给服务完成挂起的等待
     if (type == 'register_ssh_executor_ack' ||
         type == 'unregister_ssh_executor_ack') {
@@ -742,6 +771,13 @@ class _MessagePanelState extends State<MessagePanel> {
       setState(() {
         _messages[idx].answered = true;
       });
+    }
+    // 作答会驱动 agent 继续（resume 后可能立刻发起工具调用）：若前端曾重启/
+    // 断连导致执行器注册丢失，先补注册（幂等）再发送答案，避免续轮工具调用
+    // 撞上"前端执行器未启用"。本地/SSH 一并处理，fire-and-forget 不阻塞作答。
+    final Agent? agent = widget.selectedAgent;
+    if (agent != null) {
+      _ensureExecutorsReady(agent.id);
     }
     _webSocket.send(<String, dynamic>{
       'type': 'user_answer',

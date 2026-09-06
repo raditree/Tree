@@ -5,7 +5,9 @@
 
 - :func:`resolve_mode`：返回 ``"local"`` / ``"ssh"`` / ``"cloud"``；team 首次
   收到消息后按 ``agents.mode`` 持久化值优先判定（模式锁定，见
-  :func:`ensure_mode_locked`）
+  :func:`ensure_mode_locked`）。已锁定的 local/ssh 即使在执行器当前未注册
+  （WS 断连 / 连续超时自动停用等瞬时失联）也返回持久化模式——绝不静默回退
+  云端执行；由执行器请求快速失败 + 前端自动重注册恢复
 - :func:`ensure_mode_locked`：首消息锁定辅助——mode 为空时按运行时判定结果
   写回 agents 表，此后不再变更（除非用户显式变更）
 - :func:`build_workspace_io`：构建与当前模式一致的 WorkspaceIO（供 chat
@@ -44,22 +46,20 @@ def _persisted_mode(user_id: str, team_id: str) -> Optional[str]:
 def resolve_mode(user_id: str, team_id: str) -> str:
     """判定某 top agent 当前运行模式（local > ssh > cloud）。
 
-    已锁定的 agent（agents.mode 持久化）优先返回持久化值：
-    - ``mode == cloud``：不依赖执行器运行时注册态（此后注册/注销 local/ssh
-      不改变判定）；
-    - ``mode == local/ssh``：以对应执行器当前仍注册为前提；执行器已注销
-      （WS 断连/连续超时自动停用）时回落运行时判定（通常为 cloud），保持
-      既有"执行器未注册 → 云端"的回退行为，不空等挂死；
+    已锁定的 agent（agents.mode 持久化）优先返回持久化值，即用户对该 top
+    agent 的执行模式意图：
+    - ``mode == cloud``：不依赖执行器运行时注册态；
+    - ``mode == local/ssh``：**即使对应执行器当前未注册**（WS 断连 / 连续
+      超时自动停用等瞬时失联）也返回该持久化模式——保持"本地/SSH 绑定，
+      等待前端重注册恢复"的语义，绝不静默改跑云端；执行器侧的 request 会
+      以"前端执行器未启用"快速失败，前端收到 registration_lost 后于下次
+      动作自动重注册自愈；
     - 未锁定：按运行时注册态判定（local > ssh > cloud），与历史行为一致。
     """
     mode = _persisted_mode(user_id, team_id)
-    if mode == "cloud":
-        return "cloud"
-    if mode == "local" and _is_local(user_id, team_id):
-        return "local"
-    if mode == "ssh" and _is_ssh(user_id, team_id):
-        return "ssh"
-    # 未锁定 / 已锁定 local·ssh 但执行器未注册 → 按运行时注册态判定（回落 cloud）
+    if mode in ("local", "ssh", "cloud"):
+        return mode
+    # 未锁定 → 按运行时注册态判定（回落 cloud 仅发生在"从未持久化模式"的 agent）
     if _is_local(user_id, team_id):
         return "local"
     if _is_ssh(user_id, team_id):

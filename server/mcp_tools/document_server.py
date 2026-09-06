@@ -42,8 +42,39 @@ def _tool_description(name: str, baseline: str) -> str:
         return baseline
 
 
-def _exec_python(workspace_id: str, io: WorkspaceIO, script: str) -> dict:
-    """在工作空间内执行 Python 脚本并返回解析后的 JSON 结果。"""
+_PY_INTERP_CACHE: dict = {}
+
+
+def _pick_python(workspace_id: str, io: WorkspaceIO) -> str:
+    """探测工作空间内可用的 Python 解释器（``python3`` 优先，回退 ``python``）。
+
+    云端容器 / SSH 通常只有 ``python3``；本地（Windows）通常只有 ``python``。
+    探测结果按 workspace 缓存，避免每次工具调用重复探测。
+    """
+    cached = _PY_INTERP_CACHE.get(workspace_id)
+    if cached:
+        return cached
+    for cand in ("python3", "python"):
+        try:
+            probe = run_io(io.exec_argv(workspace_id, [cand, "-c", "print(1)"], timeout=20))
+        except Exception:  # noqa: BLE001
+            continue
+        if not probe.get("error") and probe.get("exit_code", -1) == 0:
+            _PY_INTERP_CACHE[workspace_id] = cand
+            return cand
+    _PY_INTERP_CACHE[workspace_id] = "python3"
+    return "python3"
+
+
+def _exec_python(
+    workspace_id: str, io: WorkspaceIO, script: str, timeout: int = 120
+) -> dict:
+    """在工作空间内执行 Python 脚本并返回解析后的 JSON 结果。
+
+    - 脚本模板负责将 stdout 重配置为 UTF-8（中文支持），后端按 UTF-8 解析。
+    - 解释器按 ``python3 -> python`` 顺序探测：云端容器 / SSH 用 python3，
+      本地 Windows 无 python3 时自动回退 python（修复 exit_code=9009）。
+    """
     # 将脚本内容缩进 4 格（放入 try 块），避免 f-string 多行替换丢失缩进
     indented_script = textwrap.indent(script, "    ")
     full_script = (
@@ -53,11 +84,16 @@ def _exec_python(workspace_id: str, io: WorkspaceIO, script: str) -> dict:
         "except Exception as e:\n"
         '    print(json.dumps({"success": False, "error": str(e)}))\n'
     )
-    result = run_io(io.exec_argv(workspace_id, ["python3", "-c", full_script]))
+    interp = _pick_python(workspace_id, io)
+    result = run_io(
+        io.exec_argv(workspace_id, [interp, "-c", full_script], timeout=timeout)
+    )
     exit_code = result.get("exit_code", -1)
     stdout = result.get("stdout", "") or ""
     stderr = result.get("stderr", "") or ""
 
+    if result.get("error"):
+        return {"success": False, "error": result["error"]}
     if exit_code != 0:
         return {"success": False, "error": stderr or stdout or f"exit_code={exit_code}"}
 
@@ -82,18 +118,36 @@ TOOLS = [
         "name": "read_pdf",
         "description": _tool_description(
             "read_pdf",
-            "[解析 PDF 提取文本] | 贡献维度: 外部能力/文档处理\n"
-            "何时使用: 需要读取 .pdf 文件内容（按页返回文本）\n"
-            "何时不用: 非 PDF 文档用 read_docx/read_pptx/read_xlsx\n"
-            "前置依赖: 文件须存在于工作空间且为 PDF",
+            "[解析 PDF：目录/按章节阅读/全文] | 贡献维度: 外部能力/文档处理\n"
+            "何时使用: 需要读取 .pdf 文件，建议先取目录（默认 mode=toc），再按章节取正文\n"
+            "何时不用: 非 PDF 文档用 read_docx/read_pptx/read_xlsx；目录阅读用 mode=chapters\n"
+            "前置依赖: 文件须存在于工作空间且为 PDF；支持中文路径与中文书签标题\n"
+            "参数说明: mode=toc 返回章节目录；mode=chapters + chapters 返回所选章节正文（如 1,3-5 或标题关键词或 p:5-8 页码范围）；mode=text 按页返回全文（兼容旧行为，可用 pages 限定范围）；max_chars 控制正文返回字符数（默认 8000，超出截断并标记）",
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "工作空间内的 PDF 文件路径（如 /workspace/doc.pdf）",
-                }
+                    "description": "工作空间内的 PDF 文件路径（支持中文路径，如 /workspace/docs/测试文档.pdf）",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["toc", "chapters", "text"],
+                    "description": "读取模式，默认 toc：toc=仅返回章节目录（含页码）；chapters=按章节返回正文；text=按页返回全文",
+                },
+                "chapters": {
+                    "type": "string",
+                    "description": "mode=chapters 时选择章节（可一次多个）：书签序号 1 / 1,3-5；或章节标题关键词（如 第一章）；或页码范围 p:5-8",
+                },
+                "pages": {
+                    "type": "string",
+                    "description": "mode=text 时可选页范围（如 3-8 或 5）；不传返回全部页（受 max_chars 截断）",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "正文返回的最大字符数，默认 8000；超出部分截断并在结果中标记（建议保持默认，避免结果被重定向）",
+                },
             },
             "required": ["file_path"],
         },
@@ -248,18 +302,293 @@ def _handle_tool_call(name: str, arguments: dict, workspace_id: str, io: Workspa
         })
 
 
+# ── PDF 读取（中文支持 / 目录 / 按章节阅读） ──────────────────────────
+
+# 模板占位符: %%FILE_B64%% / %%MODE_LIT%% / %%CHAPTERS_LIT%% / %%PAGES_LIT%% / %%MAX_CHARS%%
+_PDF_SCRIPT_TEMPLATE = r"""
+import base64, json, re, sys
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+try:
+    import pymupdf
+except Exception:
+    import fitz as pymupdf
+
+def _clean(t):
+    if not t:
+        return ""
+    t = re.sub(r"[ \t]+\n", "\n", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+def _toc_entries(doc):
+    raw = doc.get_toc(simple=True) or []
+    entries = []
+    for i, item in enumerate(raw):
+        try:
+            lvl = int(item[0]) if len(item) > 0 else 1
+        except Exception:
+            lvl = 1
+        title = str(item[1]).strip() if len(item) > 1 and item[1] else "(未命名章节)"
+        try:
+            page = int(item[2]) if len(item) > 2 else 1
+        except Exception:
+            page = 1
+        if page < 1:
+            page = 1
+        entries.append({"index": i + 1, "level": max(1, lvl), "title": title[:120], "page": page})
+    n = len(entries)
+    for i, e in enumerate(entries):
+        nxt = entries[i + 1]["page"] if i + 1 < n else doc.page_count + 1
+        e["page_end"] = max(e["page"], nxt - 1)
+    return entries
+
+def _parse_chapters(expr, entries):
+    result = []
+    used = set()
+    if not expr:
+        return result
+    for tok in re.split(r"[,\uff0c\u3001;；\s]+", expr.strip()):
+        tok = tok.strip()
+        if not tok:
+            continue
+        m = re.match(r"(?i)^(?:p|page|页)\s*[:：]?\s*(.+)$", tok)
+        if m:
+            seg = m.group(1)
+            mm = re.fullmatch(r"(\d+)\s*[-~－]\s*(\d+)", seg)
+            if mm:
+                s, e = int(mm.group(1)), int(mm.group(2))
+                if s > e:
+                    s, e = e, s
+                result.append({"index": None, "title": "第 %d-%d 页" % (s, e), "level": 0, "page": s, "page_end": e})
+            elif seg.isdigit():
+                n = int(seg)
+                result.append({"index": None, "title": "第 %d 页" % n, "level": 0, "page": n, "page_end": n})
+            continue
+        m = re.fullmatch(r"(\d+)\s*[-~－]\s*(\d+)", tok)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if a > b:
+                a, b = b, a
+            for idx in range(a, b + 1):
+                if 1 <= idx <= len(entries) and idx not in used:
+                    used.add(idx)
+                    result.append(entries[idx - 1])
+            continue
+        if tok.isdigit():
+            idx = int(tok)
+            if 1 <= idx <= len(entries) and idx not in used:
+                used.add(idx)
+                result.append(entries[idx - 1])
+            continue
+        for ent in entries:
+            if ent["index"] not in used and tok in ent["title"]:
+                used.add(ent["index"])
+                result.append(ent)
+    return result
+
+def _page_expr(expr):
+    expr = (expr or "").strip()
+    if not expr:
+        return None
+    m = re.fullmatch(r"(\d+)\s*[-~－]\s*(\d+)", expr)
+    if m:
+        s, e = int(m.group(1)), int(m.group(2))
+        if s > e:
+            s, e = e, s
+        return (s, e)
+    if expr.isdigit():
+        n = int(expr)
+        return (n, n)
+    return None
+
+def _section_text(doc, ent):
+    parts = []
+    for pno in range(ent["page"], ent["page_end"] + 1):
+        if 1 <= pno <= doc.page_count:
+            parts.append(doc[pno - 1].get_text())
+    return _clean("\n".join(parts))
+
+def _emit(obj):
+    print(json.dumps(obj, ensure_ascii=False))
+
+file_path = base64.b64decode("%%FILE_B64%%").decode("utf-8")
+mode = %%MODE_LIT%%
+chapters_expr = %%CHAPTERS_LIT%%
+pages_expr = %%PAGES_LIT%%
+max_chars = int(%%MAX_CHARS%%)
+
+try:
+    doc = pymupdf.open(file_path)
+except Exception as e:
+    _emit({"success": False, "error": "打开 PDF 失败: %s" % e})
+    sys.exit(0)
+
+info = {
+    "success": True,
+    "file": file_path,
+    "pages": doc.page_count,
+    "title": (doc.metadata or {}).get("title", "") or "",
+    "author": (doc.metadata or {}).get("author", "") or "",
+}
+
+if mode == "toc":
+    entries = _toc_entries(doc)
+    info["mode"] = "toc"
+    info["toc"] = entries
+    if not entries:
+        info["note"] = "该 PDF 未包含书签目录；可用 mode=text 按页阅读，或 mode=chapters 配合 p:页-页 指定范围"
+    _emit(info)
+    sys.exit(0)
+
+if mode == "chapters":
+    entries = _toc_entries(doc)
+    if not entries:
+        if not re.match(r"(?i)^(?:p|page|页)", (chapters_expr or "").strip()):
+            info["success"] = False
+            info["error"] = "该 PDF 无书签目录，无法按章节选择；可用 chapters=p:5-8 指定页码范围，或使用 mode=text"
+            _emit(info)
+            sys.exit(0)
+    selected = _parse_chapters(chapters_expr, entries) if chapters_expr else []
+    if not selected:
+        info["success"] = False
+        info["error"] = ("chapters=%r 未匹配到章节；请先用 mode=toc 查看目录序号。"
+                         "支持: 1 / 1,3-5 / 标题关键词 / p:5-8") % chapters_expr
+        _emit(info)
+        sys.exit(0)
+    budget = max(1, int(max_chars))
+    used = 0
+    sections = []
+    truncated = False
+    rest_hint = ""
+    for pos, ent in enumerate(selected):
+        text = _section_text(doc, ent)
+        sec = {
+            "index": ent.get("index"),
+            "level": ent.get("level", 1),
+            "title": ent.get("title", ""),
+            "page_start": ent["page"],
+            "page_end": ent["page_end"],
+        }
+        if not text:
+            sec["text"] = ""
+            sec["note"] = "该章节未提取到文本（可能为扫描件/图片页）"
+            sections.append(sec)
+            continue
+        if used + len(text) > budget:
+            remain = budget - used
+            if remain >= 64:
+                sec["text"] = text[:remain]
+                sec["truncated"] = True
+                sec["note"] = "该章节文本超出字符预算，已截断"
+            else:
+                sec["text"] = ""
+                sec["truncated"] = True
+                sec["note"] = "该章节未返回（字符预算不足）"
+            sections.append(sec)
+            truncated = True
+            rest = []
+            for e in selected[pos + 1:]:
+                if e.get("index") is not None:
+                    rest.append(str(e["index"]))
+                else:
+                    rest.append("p:%d-%d" % (e["page"], e["page_end"]))
+            rest_hint = ", ".join(rest)
+            break
+        used += len(text)
+        sec["text"] = text
+        sections.append(sec)
+    info["mode"] = "chapters"
+    info["count"] = len(sections)
+    info["sections"] = sections
+    info["truncated"] = truncated
+    if rest_hint:
+        info["message"] = "未返回章节: " + rest_hint + "（字符预算不足）；可缩小章节范围或分次读取"
+    _emit(info)
+    sys.exit(0)
+
+if mode == "text":
+    rng = _page_expr(pages_expr) if pages_expr else None
+    if rng:
+        start, end = rng
+    else:
+        start, end = 1, doc.page_count
+    start = max(1, start)
+    end = min(doc.page_count, end)
+    budget = max(1, int(max_chars))
+    used = 0
+    out_pages = []
+    truncated = False
+    for pno in range(start, end + 1):
+        t = _clean(doc[pno - 1].get_text())
+        if used + len(t) > budget:
+            remain = budget - used
+            if remain >= 64:
+                out_pages.append({"page": pno, "text": t[:remain], "truncated": True})
+            truncated = True
+            break
+        used += len(t)
+        out_pages.append({"page": pno, "text": t})
+    info["mode"] = "text"
+    info["page_range"] = "%d-%d" % (start, end)
+    info["pages_result"] = out_pages
+    info["truncated"] = truncated
+    if truncated:
+        last_pg = out_pages[-1]["page"] if out_pages else start
+        info["message"] = ("文本超长已截断（max_chars=%d，已返回至第 %d 页）；"
+                           "可用 pages=%d-%d 缩小范围") % (budget, last_pg, start, end)
+    _emit(info)
+    sys.exit(0)
+
+_emit({"success": False, "error": "未知 mode: %s" % mode})
+sys.exit(0)
+"""
+
+
+def _run_read_pdf(workspace_id: str, io: WorkspaceIO, arguments: dict) -> str:
+    """执行 read_pdf：目录 / 按章节阅读 / 按页全文（含中文支持与截断控制）。"""
+    file_path = str(arguments.get("file_path", "") or "").strip()
+    if not file_path:
+        return json.dumps({"success": False, "error": "缺少 file_path 参数"})
+    mode = str(arguments.get("mode", "toc") or "toc").strip().lower()
+    if mode not in ("toc", "chapters", "text"):
+        return json.dumps({
+            "success": False,
+            "error": f"无效 mode={mode!r}，可选值: toc | chapters | text",
+        })
+    chapters = str(arguments.get("chapters", "") or "").strip()
+    if mode == "chapters" and not chapters:
+        return json.dumps({
+            "success": False,
+            "error": "mode=chapters 需要 chapters 参数（如 1 / 1,3-5 / 标题关键词 / p:5-8）",
+        })
+    pages = str(arguments.get("pages", "") or "").strip()
+    try:
+        max_chars = int(arguments.get("max_chars", 8000) or 8000)
+    except (TypeError, ValueError):
+        max_chars = 8000
+    max_chars = max(1, min(max_chars, 50000))
+    # 路径经 base64 传入脚本，规避中文/空格/反斜杠/引号的字符串转义问题
+    file_b64 = base64.b64encode(file_path.encode("utf-8")).decode("ascii")
+    script = (
+        _PDF_SCRIPT_TEMPLATE
+        .replace("%%FILE_B64%%", file_b64)
+        .replace("%%MODE_LIT%%", json.dumps(mode))
+        .replace("%%CHAPTERS_LIT%%", json.dumps(chapters))
+        .replace("%%PAGES_LIT%%", json.dumps(pages))
+        .replace("%%MAX_CHARS%%", str(max_chars))
+    )
+    return _dump(_exec_python(workspace_id, io, script))
+
+
 def _execute_tool(name: str, arguments: dict, workspace_id: str, io: WorkspaceIO) -> str:
     """执行具体工具逻辑。"""
     file_path = arguments.get("file_path", "")
 
     if name == "read_pdf":
-        script = textwrap.dedent(f"""\
-            import pymupdf
-            doc = pymupdf.open("{file_path}")
-            pages = [{{"page": i+1, "text": page.get_text()}} for i, page in enumerate(doc)]
-            print(json.dumps({{"success": True, "pages": len(doc), "content": pages}}))
-        """)
-        return _dump(_exec_python(workspace_id, io, script))
+        return _run_read_pdf(workspace_id, io, arguments)
 
     elif name == "read_docx":
         script = textwrap.dedent(f"""\

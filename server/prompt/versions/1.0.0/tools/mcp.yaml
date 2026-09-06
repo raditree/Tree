@@ -2,12 +2,17 @@
 # 文档工具（document_server；后端 _get_document_tool_defs 引用之）
 # embed_search 分两分支：embed（已配置嵌入模型，向量语义搜索）/ grep（grep 降级）
 read_pdf:
-  version: 1
+  version: 2
   description: |
-    [解析 PDF 提取文本] | 贡献维度: 外部能力/文档处理
-    何时使用: 需要读取 .pdf 文件内容（按页返回文本）
-    何时不用: 非 PDF 文档用 read_docx/read_pptx/read_xlsx
-    前置依赖: 文件须存在于工作空间且为 PDF
+    [解析 PDF：章节目录/按章节阅读/全文] | 贡献维度: 外部能力/文档处理
+    何时使用: 需要读取 .pdf 文件时——先用默认 mode=toc 取章节目录，再按章节取正文（支持中文标题与中文路径）
+    何时不用: 非 PDF 文档用 read_docx/read_pptx/read_xlsx；目录已明确且需全部内容时用 mode=text
+    前置依赖: 文件须存在于工作空间且为 PDF；中文书签标题/中文路径均受支持
+    参数说明:
+      - mode=toc（默认）：仅返回文档信息与章节目录（每项含序号/标题/页码），不返回正文
+      - mode=chapters + chapters：按章节直接返回正文，支持一次多个章节（chapters=1,3-5 或 1-3；也支持标题关键词如 第一章；无书签时可用 p:5-8 指定页码范围）
+      - mode=text：按页返回全文（兼容旧行为），可用 pages=3-8 限定页范围
+      - max_chars：正文返回最大字符数（默认 8000），超出部分截断并在结果中标记 truncated/message
 
 read_docx:
   version: 1

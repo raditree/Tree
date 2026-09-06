@@ -5,8 +5,10 @@ Issue：本地执行器失联（前端未注销、WS 断开等）时，后端每
 120s 超时；一条消息叠加多次请求（.self 读取 + 工具调用 + 记忆更新循环）
 表现为"发消息卡大半天"，且大量空等线程占满线程池导致其他请求阻塞。
 
-修复：冷启动短超时探测 + 连续超时自动停用执行器（回退云端），
-重新注册时清零计数自动恢复。
+修复：卡死窗口判定（距最近一次 tool_exec_progress 进度 / 请求发出超过窗口
+则判疑似卡死快速失败）+ 连续超时自动停用执行器；前端在执行长任务时周期
+上报 tool_exec_progress 续期，使真正在干活的任务（grep 数分钟 / terminal
+360s+）不被窗口误杀。重新注册时清零计数自动恢复。
 """
 
 import sys
@@ -143,6 +145,82 @@ class TestLocalExecutorFailFast(unittest.TestCase):
         t.join(timeout=8)
         self.assertEqual(box["res"], {"exit_code": 0, "content": "hi"})
         self.assertFalse(client._is_cold("f4"))
+
+    def test_progress_renews_stall_window(self):
+        """执行中周期上报 tool_exec_progress → 等待时间可越过请求 timeout 窗口。
+
+        模拟"任务确实在跑（每 0.15s 上报一次进度）但完成耗时远超 timeout=0.6s"
+        的场景：有进度续期则等待不中断、正常拿到结果，且执行器不被误停用；
+        对应真实场景里的 grep 数分钟 / terminal 360s+ 长任务。
+        """
+        client = self._make_client("f5")
+        ws = _FakeWS()
+        box = {}
+
+        def do_request():
+            box["res"] = client.request(
+                ws, "f5",
+                {"op": "exec_shell", "workspace_id": "top", "command": "sleep"},
+                timeout=0.6,
+            )
+
+        t = threading.Thread(target=do_request)
+        t.start()
+        msg = ws.wait_message()
+        tool_id = msg["data"]["tool_id"]
+
+        # 任务执行约 1.2s（远超 timeout 窗口 0.6s），期间每 0.15s 上报一次进度
+        deadline = time.time() + 1.2
+        while time.time() < deadline:
+            self.assertTrue(client.note_progress("f5", tool_id))
+            time.sleep(0.15)
+        # 任务结束回传结果
+        self.assertTrue(
+            client.resolve("f5", tool_id, {"exit_code": 0, "stdout": "done"})
+        )
+        t.join(timeout=8)
+        self.assertEqual(box["res"], {"exit_code": 0, "stdout": "done"})
+        # 进度续期下等待未被中断，执行器未被自动停用
+        self.assertTrue(client.is_local("f5"))
+
+    def test_progress_interruption_fails_fast(self):
+        """进度中断（曾上报后停止）→ 距最后进度超过卡死窗口即快速失败。
+
+        请求 timeout=30s（远超窗口），但只凭"距最后上报进度 > 窗口"就在秒级
+        判死——验证卡死检测依据的是进度续期窗口，而不是笼统的请求超时。
+        单次卡死不触发自动停用（计数 1 < 阈值 2）。
+        """
+        import io_.local_executor as le_mod
+
+        orig = le_mod._STALL_WITHOUT_PROGRESS_SECONDS
+        le_mod._STALL_WITHOUT_PROGRESS_SECONDS = 0.4
+        try:
+            client = self._make_client("f6")
+            ws = _FakeWS()
+            box = {}
+
+            def do_request():
+                box["res"] = client.request(
+                    ws, "f6",
+                    {"op": "exec_shell", "workspace_id": "top", "command": "sleep"},
+                    timeout=30,
+                )
+
+            t = threading.Thread(target=do_request)
+            t.start()
+            msg = ws.wait_message()
+            tool_id = msg["data"]["tool_id"]
+            # 有过一次进度，随后中断（模拟执行器冻结 / 前端卡死）
+            self.assertTrue(client.note_progress("f6", tool_id))
+            t0 = time.time()
+            t.join(timeout=8)
+            self.assertIn("error", box.get("res", {}))
+            elapsed = time.time() - t0
+            self.assertGreaterEqual(elapsed, 0.4, "应等到卡死窗口滑出才失败")
+            self.assertLess(elapsed, 6, "不应等满 30s 请求超时")
+            self.assertTrue(client.is_local("f6"), "单次卡死不触发自动停用")
+        finally:
+            le_mod._STALL_WITHOUT_PROGRESS_SECONDS = orig
 
 
 if __name__ == "__main__":

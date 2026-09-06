@@ -84,7 +84,7 @@ TOOL_MANIFEST: Dict[str, Dict[str, object]] = {
     "spec": {"version": 1, "purpose": "任务型规范检索/选择/读取/沉淀"},
     # MCP 工作空间 / 文档
     "embed_search": {"version": 1, "purpose": "工作空间向量/文本搜索"},
-    "read_pdf": {"version": 1, "purpose": "解析 PDF 提取文本"},
+    "read_pdf": {"version": 2, "purpose": "解析 PDF：章节目录/按章节阅读/全文（中文支持）"},
     "read_docx": {"version": 1, "purpose": "解析 DOCX 提取段落与表格"},
     "read_pptx": {"version": 1, "purpose": "解析 PPTX 提取幻灯片文本"},
     "read_xlsx": {"version": 1, "purpose": "解析 XLSX 提取工作表数据"},

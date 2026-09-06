@@ -52,6 +52,25 @@ def _extract_token(ws: WebSocket) -> str:
     return ""
 
 
+def _persist_agent_mode(user_id: str, team_id: str, mode: str) -> None:
+    """把执行器注册/注销消息表达的用户意图写回 agents.mode（尽力而为）。
+
+    - 注册 local/ssh → 写回 "local"/"ssh"：断连/超时等瞬时失联后模式仍锁定，
+      绝不静默回退云端；
+    - 显式注销（切回 cloud）→ 写回 "cloud"：该 agent 后续消息按云端执行。
+    仅记录意图，不影响注册/注销本身的成功判定；DB 异常时记 warning 放行。
+    """
+    try:
+        from data.agent_store import set_agent_mode
+
+        set_agent_mode(user_id, team_id, mode)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "持久化运行模式失败（忽略）: user_id=%s team_id=%s mode=%s err=%s",
+            user_id, team_id, mode, exc,
+        )
+
+
 def register_ws(app: FastAPI) -> None:
     """将 /ws 端点挂载到 FastAPI 应用。"""
 
@@ -336,6 +355,9 @@ def register_ws(app: FastAPI) -> None:
                     # 清除该 agent 的会话缓存：即使此前会话已绑定云端工具，
                     # 下次发消息会重建会话并按本地模式重新绑定工具
                     clear_user_agent(user_id, team_id)
+                    # 注册即表达"该 agent 走本地执行"的用户意图：写回 agents.mode，
+                    # 断连/超时等瞬时失联后 resolve_mode 仍锁定 local（不静默回退云端）
+                    _persist_agent_mode(user_id, team_id, "local")
                     # 注册成功回应
                     await state.ws_manager.send_message(
                         user_id,
@@ -366,6 +388,12 @@ def register_ws(app: FastAPI) -> None:
                         r for r in conn_regs
                         if not (r["mode"] == "local" and r["team_id"] == team_id)
                     ]
+                    # 显式注销即用户把该 agent 切回云端：更新模式锁定并清会话
+                    # 缓存（下次消息重建会话并按 cloud 模式绑定工具）。断连清理
+                    # 路径（finally）不写 mode，避免前端瞬时掉线把已锁定 local
+                    # 误改成 cloud 而静默回退云端执行。
+                    _persist_agent_mode(user_id, team_id, "cloud")
+                    clear_user_agent(user_id, team_id)
                     await state.ws_manager.send_message(
                         user_id,
                         {
@@ -427,6 +455,9 @@ def register_ws(app: FastAPI) -> None:
                     conn_regs.append({"mode": "ssh", "team_id": team_id})
                     # 清除会话缓存：下次发消息重建会话并按 SSH 模式绑定工具
                     clear_user_agent(user_id, team_id)
+                    # 注册即表达"该 agent 走 SSH 执行"的用户意图：写回 agents.mode，
+                    # 断连/超时等瞬时失联后 resolve_mode 仍锁定 ssh（不静默回退云端）
+                    _persist_agent_mode(user_id, team_id, "ssh")
                     await state.ws_manager.send_message(
                         user_id,
                         {
@@ -457,6 +488,9 @@ def register_ws(app: FastAPI) -> None:
                         r for r in conn_regs
                         if not (r["mode"] == "ssh" and r["team_id"] == team_id)
                     ]
+                    # 显式注销即用户把该 agent 切回云端：更新模式锁定并清会话缓存
+                    _persist_agent_mode(user_id, team_id, "cloud")
+                    clear_user_agent(user_id, team_id)
                     await state.ws_manager.send_message(
                         user_id,
                         {
@@ -491,8 +525,11 @@ def register_ws(app: FastAPI) -> None:
                             tool_id,
                         )
                 elif msg_type == "tool_exec_progress":
-                    # 前端返回工具执行进度（响应类消息）：校验 tool_id 存在性，
-                    # 缺失回错；进度当前仅记录（无 pending 状态需要更新）。
+                    # 前端回报工具执行进度：刷新该 tool 的"最近活动"时间戳，
+                    # 使后端 request() 的卡死判定（_STALL_WITHOUT_PROGRESS）得以
+                    # 续期——区分"正在执行的长任务（允许 360s+）"与"真卡死/
+                    # 失联（无进度滑出窗口判死）"。仅对待响应的 pending 生效，
+                    # 乱报/未知 tool_id 被 note_progress 拒绝，不产生副作用。
                     tool_id = data.get("tool_id", "")
                     if not tool_id:
                         await state.ws_manager.send_message(
@@ -503,9 +540,13 @@ def register_ws(app: FastAPI) -> None:
                             },
                         )
                         continue
+                    team_id = str(data.get("team_id") or "")
+                    noted = state.local_executor.note_progress(
+                        user_id, tool_id, team_id=team_id
+                    )
                     logger.debug(
-                        "tool_exec_progress: user_id=%s team_id=%s tool_id=%s",
-                        user_id, data.get("team_id", ""), tool_id,
+                        "tool_exec_progress: user_id=%s team_id=%s tool_id=%s noted=%s",
+                        user_id, data.get("team_id", ""), tool_id, noted,
                     )
                 else:
                     await state.ws_manager.send_message(
@@ -521,6 +562,9 @@ def register_ws(app: FastAPI) -> None:
             state.ws_manager.disconnect_by_id(user_id, connection_id)
             # 2) 断连清理执行器注册：本连接注册过的 (mode, team_id) 一并注销，
             #    与前端主动 unregister 等价，避免幽灵注册（工具请求继续空等）。
+            #    注意：此处只清运行时注册、**不写 agents.mode**——本地/SSH 是
+            #    用户对该 agent 的持久化意图，瞬时断连不得把它静默改成 cloud
+            #    （否则前端重连前的后台任务会悄悄改跑云端执行）。
             for reg in conn_regs:
                 try:
                     if reg["mode"] == "local":
@@ -533,6 +577,20 @@ def register_ws(app: FastAPI) -> None:
                         "WS 断连清理执行器注册: user_id=%s team_id=%s mode=%s connection_id=%s",
                         user_id, reg["team_id"], reg["mode"], connection_id,
                     )
+                    # 3) 通知该用户仍存活的连接：该 team 的执行器注册已丢失。
+                    #    前端据此复位 registered=false，待下次动作经 ensureTeam
+                    #    自动重注册自愈（本地/SSH 一致）。
+                    if state.ws_manager.connections.get(user_id):
+                        await state.ws_manager.send_message(
+                            user_id,
+                            {
+                                "type": "registration_lost",
+                                "data": {
+                                    "mode": reg["mode"],
+                                    "team_id": reg["team_id"],
+                                },
+                            },
+                        )
                 except Exception:  # noqa: BLE001
                     logger.exception(
                         "WS 断连清理执行器注册失败: user_id=%s reg=%r",

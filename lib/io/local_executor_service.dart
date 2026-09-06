@@ -126,6 +126,14 @@ class LocalExecutorService extends ChangeNotifier {
   static String _kEnabledKey(String teamId) => '$_kEnabledPrefix$teamId';
   static String _kWorkDirKey(String teamId) => '$_kWorkDirPrefix$teamId';
 
+  /// 同步工具执行期间的进度上报间隔。
+  ///
+  /// 后端等待响应时以"距最近一次进度上报"做卡死判定：只要前端还在执行就
+  /// 周期上报 ``tool_exec_progress`` 续期，真正在干活的长任务（grep 数分钟 /
+  /// terminal 360s+）不会被后端等待窗口误杀；本间隔应明显小于后端的
+  /// _STALL_WITHOUT_PROGRESS_SECONDS（60s），留足网络/调度余量。
+  static const Duration _kToolProgressInterval = Duration(seconds: 10);
+
   /// 承载当前 WebSocket 通道的服务（用于接收请求与回传结果）
   WebSocketService? _ws;
 
@@ -254,6 +262,25 @@ class LocalExecutorService extends ChangeNotifier {
       if (state.enabled && state.baseDir.isNotEmpty && state.registered) {
         _registerTeam(state);
       }
+    }
+  }
+
+  /// 处理后端 ``registration_lost`` 通知：该 team 的执行器注册已被后端清除
+  /// （WS 断连清理 / 连续超时自动停用）。
+  ///
+  /// 复位 registered=false，使后续 [ensureTeam]（发消息/作答/重连自动补注册）
+  /// 不会因 stale registered=true 而跳过——否则后端已注销执行器、前端仍以为
+  /// 注册在册，工具调用会一直"前端执行器未启用"无法自愈。启用开关与工作目录
+  /// 等持久化设置不受影响。
+  void handleRegistrationLost(String teamId) {
+    if (teamId.isEmpty) return;
+    final _LocalTeamState? state = _states[teamId];
+    if (state != null && state.registered) {
+      state.registered = false;
+      debugPrint(
+        '[LocalExecutor] 后端通知执行器注册已丢失(team=$teamId)，'
+        '将在下次动作时自动重注册',
+      );
     }
   }
 
@@ -422,6 +449,14 @@ class LocalExecutorService extends ChangeNotifier {
       return true;
     }
 
+    // 同步工具执行：执行期间每 _kToolProgressInterval 上报一次进度，让后端
+    // 的卡死检测续期——长任务（grep / terminal 等）只要在跑就不会被误判为
+    // 超时；执行结束/出错即取消定时器并回传结果。
+    // （hook 分支已在上方 return，此处必为同步执行，定时器必然创建）
+    final Timer progressTimer = Timer.periodic(
+      _kToolProgressInterval,
+      (_) => _sendToolProgress(toolId, reqTeam),
+    );
     _execute(workspaceId, op, data, state.baseDir)
         .then((Map<String, dynamic> result) {
       _sendToolExecResponse(toolId, result);
@@ -429,8 +464,19 @@ class LocalExecutorService extends ChangeNotifier {
       _sendToolExecResponse(toolId, <String, dynamic>{
         'error': error.toString(),
       });
-    });
+    }).whenComplete(() => progressTimer.cancel());
     return true;
+  }
+
+  /// 上报一次工具执行进度（``tool_exec_progress``，供后端卡死检测续期）。
+  void _sendToolProgress(String toolId, String teamId) {
+    _send(<String, dynamic>{
+      'type': 'tool_exec_progress',
+      'data': <String, dynamic>{
+        'tool_id': toolId,
+        'team_id': teamId,
+      },
+    });
   }
 
   /// 回传一次工具执行结果（``tool_exec_response``）。
@@ -763,6 +809,8 @@ class LocalExecutorService extends ChangeNotifier {
           '--pretty=format:%H%x1f%an%x1f%aI%x1f%s',
         ],
         workingDirectory: wsDir.path,
+        stdoutEncoding: utf8,
+        stderrEncoding: utf8,
       );
       if (result.exitCode != 0) {
         final String err = _decode(result.stderr).trim();
@@ -813,6 +861,8 @@ class LocalExecutorService extends ChangeNotifier {
         'git',
         <String>['branch', '-a'],
         workingDirectory: wsDir.path,
+        stdoutEncoding: utf8,
+        stderrEncoding: utf8,
       );
       if (result.exitCode != 0) {
         final String err = _decode(result.stderr).trim();
@@ -1125,12 +1175,22 @@ class LocalExecutorService extends ChangeNotifier {
     final String? cwd = workingDirectory ??
         (isUnixLikePath(wsDir.path) ? null : wsDir.path);
     try {
+      // 显式 utf8 解码 stdout/stderr：Windows 下 Process.run 默认按系统编码
+      // （GBK/cp936）解码，UTF-8 字节（如 Python 中文输出）会被错误转码，
+      // 导致工具结果中文乱码（本地模式全链路 UTF-8 约定）。
       final Future<ProcessResult> future = cwd == null
-          ? Process.run(argv.first, argv.sublist(1))
+          ? Process.run(
+              argv.first,
+              argv.sublist(1),
+              stdoutEncoding: utf8,
+              stderrEncoding: utf8,
+            )
           : Process.run(
               argv.first,
               argv.sublist(1),
               workingDirectory: cwd,
+              stdoutEncoding: utf8,
+              stderrEncoding: utf8,
             );
       final ProcessResult result = timeout > 0
           ? await future.timeout(Duration(seconds: timeout))

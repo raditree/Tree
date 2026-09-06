@@ -33,18 +33,28 @@ from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# 本地执行请求默认超时（秒）
+# 本地执行请求默认超时（秒）。注意：它只是"无进度时的最大容忍窗口"——
+# 前端周期性上报 tool_exec_progress（默认每 10s 一次）后会自动续期，真正在
+# 执行的长任务（grep 数分钟 / terminal 360s+ / 测试脚本）不受该上限误杀。
 _LOCAL_EXEC_TIMEOUT = 120
 
-# 执行器"冷启动"判定：距上次成功往返超过该时长视为冷（首次响应需先探测）。
-# 冷执行器用短超时等待首个响应，避免前端执行器已失联时每个请求都空等满
-# _LOCAL_EXEC_TIMEOUT，导致一条消息要卡几分钟（表现为"发消息卡大半天"）。
+# 响应等待轮询切片（秒）：等待以该粒度刷新"最近活动时间"，前端在执行中
+# 周期性上报 tool_exec_progress 时能及时续期，而不是一次性 long sleep 到死。
+_WAIT_SLICE_SECONDS = 10.0
+# 卡死判定窗口（秒）：距"最近一次进度上报（无进度时=请求发出时刻）"超过该
+# 值仍无结果，判定该请求疑似卡死（前端失联 / 心跳中断），不等满默认 120s
+# 就快速失败并触发自动停用——避免"发消息卡大半天"。区分"真卡死"与"只是
+# 慢"的关键：只要前端在干活就会周期性上报进度（见 tool_exec_progress），
+# 有进度上报即无限续期；只有进度中断（或从未上报）才滑出窗口判死。
+_STALL_WITHOUT_PROGRESS_SECONDS = 60.0
+# （诊断 / 回归测试用）执行器"冷热"状态阈值：仅供 _is_cold 冷热展示；
+# 实际等待期的"活动/卡死"判定已由 tool_exec_progress 进度续期取代
+# （见 _STALL_WITHOUT_PROGRESS_SECONDS 与 request 的切片轮询逻辑）。
 _PROBE_GAP_SECONDS = 60.0
-# 冷启动探测超时（秒）：远小于响应超时，失联执行器快速失败并触发自动停用
-_PROBE_TIMEOUT_SECONDS = 15.0
-# 连续响应超时达到该次数后自动停用该 (user_id, team_id) 的前端执行器
-# （回退云端执行），防止后续请求继续逐个空等超时并占用线程池线程导致
-# 其他请求被阻塞。
+# 连续响应超时（含卡死判定）达到该次数后自动停用该 (user_id, team_id) 的
+# 前端执行器（注销运行时注册，使请求快速失败并推送 registration_lost 供前端
+# 复位后重注册自愈；已锁定 local/ssh 的 agents.mode 不随之改变，绝不静默回退
+# 云端执行），防止后续请求继续逐个空等并占用线程池线程导致其他请求被阻塞。
 _MAX_CONSECUTIVE_TIMEOUTS = 2
 
 
@@ -92,10 +102,17 @@ class LocalExecutorClient:
         self._pending_owner: Dict[str, Tuple[str, str]] = {}
         # 主事件循环（lifespan 中绑定，用于从后台线程安全推送 WS 消息）
         self._loop: "Optional[asyncio.AbstractEventLoop]" = None
-        # (user_id, team_id) -> 最近一次成功往返时间戳（冷启动探测依据）
+        # (user_id, team_id) -> 最近一次成功往返时间戳（日志诊断 / 测试用；
+        # 卡死判定的"活动"依据已由 tool_exec_progress 进度时间戳 _progress_at 取代）
         self._last_ok: Dict[Tuple[str, str], float] = {}
         # (user_id, team_id) -> 连续响应超时次数（达到阈值自动停用执行器）
         self._consecutive_timeouts: Dict[Tuple[str, str], int] = {}
+        # tool_id -> 最近一次 tool_exec_progress 到达时间（时间戳）。
+        # 请求等待循环据此区分"正在工作（进度续期）"与"疑似卡死（进度中断）"。
+        self._progress_at: Dict[str, float] = {}
+        # 后台推送（registration_lost 通知）的 in-flight future 集合：
+        # run_coroutine_threadsafe 的 future 需持有引用，防止被 GC 静默取消
+        self._send_futs: set = set()
 
     def bind_loop(self, loop: "asyncio.AbstractEventLoop") -> None:
         """绑定后端主事件循环。
@@ -178,6 +195,7 @@ class LocalExecutorClient:
                 continue
             fut = self._pending.pop(key, None)
             self._pending_owner.pop(key, None)
+            self._progress_at.pop(key, None)
             if fut is not None and not fut.done():
                 fut.set_exception(RuntimeError(reason))
 
@@ -255,10 +273,10 @@ class LocalExecutorClient:
         return bool(self._users.get(user_id)) or bool(self._ssh_users.get(user_id))
 
     def _is_cold(self, user_id: str, team_id: str = "") -> bool:
-        """执行器是否处于"冷"状态：距上次成功往返超过探测间隔。
+        """执行器是否处于"冷"状态（诊断 / 回归测试用）。
 
-        冷状态下首个响应改用短超时探测，失联执行器快速失败；热状态下
-        （对话进行中频繁往返）保持完整响应超时，不误伤慢速但正常的工具。
+        仅基于最近一次成功往返时间展示冷热；请求等待期的快速失败判定不再
+        依赖本方法（已由 tool_exec_progress 进度续期 + 卡死窗口取代）。
         """
         return (
             time.time() - self._last_ok.get((user_id, team_id), 0.0)
@@ -266,11 +284,11 @@ class LocalExecutorClient:
         )
 
     def _disable_ssh_mode(self, user_id: str, team_id: str) -> None:
-        """注销该 (user_id, team_id) 的 SSH 持久化配置。
+        """注销该 (user_id, team_id) 的 SSH 持久化配置（运行时侧）。
 
-        使后续 ``resolve_mode`` 判定为 cloud（新会话/工具绑定回落云端 IO），
-        与 local 执行器停用后的回落行为保持一致。state.ssh_manager 未初始化
-        （单测环境）时跳过。
+        使未锁定（agents.mode 为空）的 team 在失联后回落运行时判定（cloud）；
+        已锁定 ``ssh`` 的 agent 模式取自 agents.mode，不受本注销影响（仍等
+        前端重注册自愈）。state.ssh_manager 未初始化（单测环境）时跳过。
         """
         try:
             import state
@@ -284,13 +302,53 @@ class LocalExecutorClient:
                 user_id, team_id, exc,
             )
 
-    def _register_timeout(self, user_id: str, team_id: str = "") -> None:
+    def _notify_registration_lost(
+        self,
+        ws_manager: Any,
+        user_id: str,
+        team_id: str,
+        mode: str,
+    ) -> None:
+        """向该用户仍存活的连接推送 ``registration_lost``（尽力而为）。
+
+        后端因内部原因（连续超时自动停用 / WS 断连清理等）注销执行器注册时
+        调用：前端据此把该 team 的 registered 复位为 false，待下次动作（发
+        消息 / AskUserQuestion 作答等）经 ensureTeam 自动重注册自愈。已无
+        活跃连接 / ws_manager 不可用 / 推送失败时静默降级为 warning 日志。
+        """
+        if ws_manager is None:
+            return
+        message = {
+            "type": "registration_lost",
+            "data": {"team_id": team_id, "mode": mode},
+        }
+        try:
+            loop = self._loop
+            if loop is not None and loop.is_running():
+                fut = asyncio.run_coroutine_threadsafe(
+                    ws_manager.send_message(user_id, message), loop
+                )
+                self._send_futs.add(fut)
+                fut.add_done_callback(self._send_futs.discard)
+            else:
+                _run_async(ws_manager.send_message(user_id, message))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "推送 registration_lost 失败: user_id=%s team_id=%s mode=%s (%s)",
+                user_id, team_id, mode, exc,
+            )
+
+    def _register_timeout(
+        self, user_id: str, team_id: str = "", ws_manager: Any = None
+    ) -> None:
         """记录一次响应超时；连续超时达到阈值时自动停用该 team 的执行器。
 
         停用范围：该 (user_id, team_id) 的 local 与 SSH 注册一并注销（B2：
-        SSH 失联同样快速失败），并注销 SSH 持久化配置使后续请求按
-        "无执行器"处理（resolve_mode 回落 cloud）。team_id 未知（空串，
-        兼容未携带 team_id 的历史调用）时回退为停用该用户全部注册。
+        SSH 失联同样快速失败），并注销 SSH 持久化配置使未锁定的 team 后续
+        按"无执行器"判定；已锁定 local/ssh 的 agents.mode 不改变，绝不静默
+        回退云端执行。team_id 未知（空串，兼容未携带 team_id 的历史调用）
+        时回退为停用该用户全部注册。停用后向仍存活的连接推送
+        ``registration_lost``，前端复位 registered 后于下次动作自动重注册。
         前端重新注册（register / register_ssh）时计数清零自动恢复。
         """
         key = (user_id, team_id)
@@ -300,8 +358,8 @@ class LocalExecutorClient:
         if self._consecutive_timeouts[key] < _MAX_CONSECUTIVE_TIMEOUTS:
             return
         logger.warning(
-            "前端执行器连续 %d 次响应超时，自动停用（回退云端执行）: "
-            "user_id=%s team_id=%r",
+            "前端执行器连续 %d 次响应超时，自动停用执行器注册（模式锁定不变，"
+            "等待前端重注册恢复）: user_id=%s team_id=%r",
             _MAX_CONSECUTIVE_TIMEOUTS, user_id, team_id,
         )
         if team_id:
@@ -316,14 +374,39 @@ class LocalExecutorClient:
             try:
                 if t in (self._users.get(user_id) or {}):
                     self.unregister(user_id, t)
+                    self._notify_registration_lost(ws_manager, user_id, t, "local")
                 if t in (self._ssh_users.get(user_id) or set()):
                     self.unregister_ssh(user_id, t)
-                    # SSH 持久化配置一并注销 → 后续 resolve_mode 回落 cloud
+                    # SSH 持久化配置一并注销 → 未锁定 team 的 resolve_mode 回落
+                    # cloud（已锁定 ssh 的 agent 仍等前端重注册恢复）
                     self._disable_ssh_mode(user_id, t)
+                    self._notify_registration_lost(ws_manager, user_id, t, "ssh")
             except Exception:  # noqa: BLE001
                 pass
         # 停用后计数清零
         self._consecutive_timeouts[key] = 0
+
+    def note_progress(
+        self,
+        user_id: str,
+        tool_id: str,
+        team_id: str = "",
+    ) -> bool:
+        """由 WS 接收处理调用：记录一次工具执行进度（刷新活动时间戳）。
+
+        前端在执行长任务期间周期性上报 ``tool_exec_progress``，等待该请求的
+        :meth:`request` 据此区分"正在工作（进度续期，允许 360s+）"与"疑似
+        卡死（进度中断，滑出窗口判死）"。仅在请求确实待响应（pending 存在
+        且归属该用户）时刷新，乱报进度不产生副作用。
+        """
+        fut = self._pending.get(tool_id)
+        if fut is None or fut.done():
+            return False
+        owner = self._pending_owner.get(tool_id)
+        if owner is not None and owner[0] != user_id:
+            return False
+        self._progress_at[tool_id] = time.time()
+        return True
 
     def request(
         self,
@@ -390,46 +473,64 @@ class LocalExecutorClient:
                 exc, tool_id, payload.get("op"),
             )
             return {"error": f"推送本地执行请求失败: {exc}"}
-        # 冷启动探测：执行器长时间无成功往返时，先用短超时等待首个响应，
-        # 避免前端执行器已失联（未注销、WS 断开等）后每个请求都空等满
-        # timeout（默认 120s），一条消息叠加多次请求就是"卡大半天"。
-        wait_timeout = timeout
-        if self._is_cold(user_id, team_id):
-            wait_timeout = min(timeout, _PROBE_TIMEOUT_SECONDS)
+        # 等待响应并做"卡死 vs 慢"检测：以切片轮询取代一次性 long sleep。
+        # 判据：距"最近一次活动"（请求发出 或 tool_exec_progress 上报）超过
+        # stall 窗口仍无结果 → 判定疑似卡死，快速失败并触发自动停用计数；
+        # 前端在执行中周期性上报进度时无限续期——真正在干活的长任务
+        # （grep 数分钟 / terminal 360s+）不会被等待上限误杀，而失联/冻结
+        # 的前端（无任何进度上报）会在窗口内尽快暴露而不是空等满 120s。
+        stall = min(float(timeout), _STALL_WITHOUT_PROGRESS_SECONDS)
+        last_activity = time.time()
         try:
-            result = fut.result(timeout=wait_timeout)
-            if isinstance(result, BaseException):
-                raise result
-            # 成功往返：记录存活时间并清零连续超时计数（探测不再触发）
-            self._last_ok[(user_id, team_id)] = time.time()
-            self._consecutive_timeouts[(user_id, team_id)] = 0
-            return result if isinstance(result, dict) else {"error": str(result)}
+            while True:
+                # 每次切片结束都在循环顶部重新读取最新进度时间戳后再判窗：
+                # 防止"切片粒度(~10s) 与前端上报周期(~10s) 恰好对齐"时，读取
+                # 永远赶在刚写入之前，导致有进度也误判卡死。_progress_at 只在
+                # resolve/超时/清理时才移除，错过一个切片也会在下个切片读到。
+                progress_ts = self._progress_at.get(key, 0.0)
+                if progress_ts > last_activity:
+                    last_activity = progress_ts
+                if time.time() - last_activity >= stall:
+                    # 滑出活动窗口：疑似卡死（从未上报进度 / 进度已中断）
+                    raise concurrent.futures.TimeoutError()
+                wait_for = min(
+                    _WAIT_SLICE_SECONDS,
+                    max(0.0, stall - (time.time() - last_activity)),
+                )
+                try:
+                    result = fut.result(timeout=wait_for)
+                except concurrent.futures.TimeoutError:
+                    # 切片超时：回到循环顶部检查最新进度（续期或滑窗判死）
+                    continue
+                if isinstance(result, BaseException):
+                    raise result
+                # 成功往返：记录存活时间并清零连续超时计数
+                self._last_ok[(user_id, team_id)] = time.time()
+                self._consecutive_timeouts[(user_id, team_id)] = 0
+                self._progress_at.pop(key, None)
+                return result if isinstance(result, dict) else {"error": str(result)}
         except concurrent.futures.TimeoutError:
+            # 疑似卡死：清理并快速失败（连带自动停用计数，见 _register_timeout）
             self._pending.pop(key, None)
             self._pending_owner.pop(key, None)
+            self._progress_at.pop(key, None)
             # 取消可能仍在排队的发送协程，避免极晚投递导致响应无人匹配
             if send_fut is not None and not send_fut.done():
                 send_fut.cancel()
             logger.warning(
-                "本地执行请求超时(等待 %.0fs): tool_id=%s op=%s",
-                wait_timeout, tool_id, payload.get("op"),
+                "本地执行请求疑似卡死(%.1fs 无结果且无进度上报): "
+                "tool_id=%s op=%s",
+                stall, tool_id, payload.get("op"),
             )
-            self._register_timeout(user_id, team_id)
-            return {"error": "本地执行器响应超时"}
+            self._register_timeout(user_id, team_id, ws_manager)
+            return {"error": "本地执行器响应超时（疑似卡死，执行器已自动停用/待重注册）"}
         except Exception as exc:  # noqa: BLE001
+            # 其它异常（如执行器注销 set_exception / 传输层错误）：快速失败
             self._pending.pop(key, None)
             self._pending_owner.pop(key, None)
+            self._progress_at.pop(key, None)
             logger.warning("本地执行请求异常: %r (tool_id=%s)", exc, tool_id)
             return {"error": f"本地执行器错误: {exc}"}
-        finally:
-            # 仅当请求被放弃（future 仍未完成，即超时/异常路径）时才兜底清理，
-            # 避免在正常返回路径上把已交付的结果从 pending 中提前移除；
-            # 正常路径的清理由 resolve() 在匹配时完成（set_result + pop）。
-            # 注意：不使用 fut.set_running_or_notify_cancel() 判断，因为它会把
-            # 尚未完成的 future 置为 RUNNING，导致后续 set_result 抛 InvalidStateError。
-            if not fut.done():
-                self._pending.pop(key, None)
-                self._pending_owner.pop(key, None)
 
     def send_request(
         self, ws_manager: Any, user_id: str, payload: Dict[str, Any]
@@ -561,4 +662,5 @@ class LocalExecutorClient:
         fut.set_result(result)
         self._pending.pop(tool_id, None)
         self._pending_owner.pop(tool_id, None)
+        self._progress_at.pop(tool_id, None)
         return True

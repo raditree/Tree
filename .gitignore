@@ -90,3 +90,4 @@ server/logs/
 server/data/sft/
 *.Key
 server/data/*.zip
+agentspace

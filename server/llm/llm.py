@@ -40,7 +40,7 @@ _MAX_VALUE_CHARS = 120
 
 # 工具结果大小门控：单个工具结果字符串超过该字符数时，不再直进上下文，
 # 重定向到工作空间 .self 私有目录文件，只把「文件位置+查看建议+原因」给 agent
-RESULT_REDIRECT_THRESHOLD = 10_000
+RESULT_REDIRECT_THRESHOLD = 60_000
 # 重定向提示中附带的结果预览长度（让 agent 快速判断是否值得查看）
 _REDIRECT_PREVIEW_CHARS = 300
 

@@ -5,7 +5,8 @@
 1. team 首条消息（ensure_mode_locked）后 agents.mode 非空且 = resolve_mode 结果；
 2. 已锁定后再 resolve 走持久化值：cloud 锁定后 mock local/ssh 注册态变化不改变判定；
    未锁定的其他 team 仍按运行时注册态判定（行为=现状）；
-3. local/ssh 持久化但执行器注销时回落 cloud（保持既有超时回落行为）；
+3. local/ssh 持久化后执行器注销（断连/超时停用）**不回落 cloud**：resolve_mode
+   仍返回持久化模式（保持本地/SSH 绑定，由执行器快速失败 + 前端重注册自愈）；
 4. 锁定幂等：重复锁定不覆盖、不报错（云 ensure/锁定的幂等语义）。
 
 隔离：临时目录重定位 data.db._DB_PATH（agent_store 经共享 connect 打开）
@@ -124,22 +125,51 @@ class TestModeLock(ModeLockBase):
         self._state.ssh_manager = _FakeSSH(teams=[aid_b])
         self.assertEqual(mr.resolve_mode("u1", aid_b), "ssh")
 
-    def test_locked_local_falls_back_cloud_when_executor_unregistered(self):
-        """已锁定 local 但执行器注销（断连/超时停用）→ resolve 回落 cloud。"""
+    def test_locked_local_keeps_local_when_executor_unregistered(self):
+        """已锁定 local/ssh 但执行器注销（断连/超时停用）→ resolve_mode 仍锁定。
+
+        保持"本地/SSH 绑定等待前端重注册自愈"的语义，绝不静默回退云端执行。
+        """
         from io_.local_executor import LocalExecutorClient
         from io_ import mode_resolver as mr
 
+        # --- local：锁定后注销执行器，模式不回落 cloud ---
         aid = self._make_agent()
         client = LocalExecutorClient()
         client.register("u1", aid, "C:/base")
         self._state.local_executor = client
         self.assertEqual(mr.ensure_mode_locked("u1", aid), "local")
-        # 执行器注销 → 回落 cloud（不空等挂死）
+        # 执行器注销（模拟 WS 断连/超时停用）：已锁定的 local 仍保持 local
         client.unregister("u1", aid)
-        self.assertEqual(mr.resolve_mode("u1", aid), "cloud")
-        # 执行器重新注册 → 回到持久化的 local
+        self.assertEqual(mr.resolve_mode("u1", aid), "local")
+        # 前端重注册 → 恢复（mode 不变）
         client.register("u1", aid, "C:/base")
         self.assertEqual(mr.resolve_mode("u1", aid), "local")
+
+        # --- ssh：锁定后注销执行器与持久化配置，模式不回落 cloud ---
+        aid2 = self._make_agent()
+        client.register_ssh("u1", aid2)
+        self._state.ssh_manager = _FakeSSH(teams=[aid2])
+        self.assertEqual(mr.ensure_mode_locked("u1", aid2), "ssh")
+        # 注销 SSH 注册且移除 ssh_manager 配置（模拟超时停用 _disable_ssh_mode）
+        client.unregister_ssh("u1", aid2)
+        self._state.ssh_manager = _FakeSSH()
+        self.assertEqual(mr.resolve_mode("u1", aid2), "ssh")
+
+    def test_set_agent_mode_overwrites_and_missing_noop(self):
+        """set_agent_mode：显式覆盖运行模式（注册/注销意图）；agent 不存在返回 False。"""
+        aid = self._make_agent()
+        # 注册 local 后首次锁定可先由首消息写入 cloud，注册事件再显式改 local
+        self.assertEqual(agent_store.get_agent_mode("u1", aid), None)
+        self.assertTrue(agent_store.set_agent_mode("u1", aid, "local"))
+        self.assertEqual(agent_store.get_agent_mode("u1", aid), "local")
+        # 显式注销（切回云端）无条件覆盖已锁定模式
+        self.assertTrue(agent_store.set_agent_mode("u1", aid, "cloud"))
+        self.assertEqual(agent_store.get_agent_mode("u1", aid), "cloud")
+        self.assertTrue(agent_store.set_agent_mode("u1", aid, "ssh"))
+        self.assertEqual(agent_store.get_agent_mode("u1", aid), "ssh")
+        # agent 不存在/已删除：返回 False 且不抛错
+        self.assertFalse(agent_store.set_agent_mode("u1", "ghost_top", "local"))
 
     def test_lock_is_idempotent_and_never_overwrites(self):
         """重复锁定幂等：第二次不覆盖、不报错，mode 保持不变。"""

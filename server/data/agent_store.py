@@ -278,3 +278,28 @@ def lock_agent_mode(user_id: str, agent_id: str, mode: str) -> bool:
             return cursor.rowcount > 0
         finally:
             conn.close()
+
+
+def set_agent_mode(user_id: str, agent_id: str, mode: str) -> bool:
+    """显式写入 agent 的运行模式（agents.mode，无条件覆盖）。
+
+    供执行器注册/注销消息使用：注册 local/ssh 即表达用户对该 top agent 的
+    执行模式意图，写回 ``mode`` 使模式在断连/超时等瞬时失联后仍保持锁定；
+    显式注销（切回 cloud）时写回 ``"cloud"``。
+
+    :param mode: 运行模式（"cloud" / "local" / "ssh"）
+    :return: 是否成功写入；False = agent 不存在或已软删除
+    """
+    _ensure_db()
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.execute(
+                "UPDATE agents SET mode = ? "
+                "WHERE user_id = ? AND id = ? AND deleted_at IS NULL",
+                (mode, user_id, agent_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
