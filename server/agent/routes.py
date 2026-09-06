@@ -460,6 +460,34 @@ async def get_agent_todos(
     return {"agent_id": agent_id, "session_id": session_id, "todos": todos}
 
 
+def _collect_team_tree(agent_id: str, get_team_members) -> List[Dict[str, Any]]:
+    """BFS 收集某 agent（顶部或成员 leader）的直属 + 子孙成员名单。
+
+    成员的子团队有两种归属：历史实现直接把所有层级挂在顶部 team_id 下；
+    成员自建子团队时把行挂在成员自身的 agent_id 名下。统一按
+    ``team_members.team_id`` 自顶向下 BFS 去重收集，保证 teammates 窗口
+    能看到 Level 2+ 成员，两种存储都不会漏。
+    """
+    seen = {agent_id}
+    collected: List[Dict[str, Any]] = []
+    queue = [agent_id]
+    while queue:
+        cur = queue.pop(0)
+        try:
+            rows = get_team_members(cur)
+        except Exception:  # noqa: BLE001
+            continue
+        for m in rows:
+            mid = m.get("id", "")
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            collected.append(m)
+            # 成员若也是子团队 leader，其直属成员行挂在它自己的 id 名下
+            queue.append(mid)
+    return collected
+
+
 def _roster_from_db(db_members: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """将 team_members 表记录转换为前端 teammates 结构（与 roster 文件解析兼容）。
 
@@ -502,12 +530,11 @@ async def get_agent_teammates(
 
     from data.team_store import get_members as get_team_members
 
-    try:
-        db_members = get_team_members(agent_id)
-    except Exception:  # noqa: BLE001
-        db_members = []
-    if db_members:
-        members = _roster_from_db(db_members)
+    db_rows = _collect_team_tree(agent_id, get_team_members)
+    if db_rows:
+        # 权威名单含子孙团队（Level 2+），按层级、创建时间排序后返回
+        members = _roster_from_db(db_rows)
+        members.sort(key=lambda m: (m.get("level", 1), m.get("created_at", "")))
     else:
         # 回退：roster 文件（未走 P4 建队的历史数据，解析 13 列表格）
         _io = _get_workspace_io(user_id, agent_id)

@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 
 import '../models/agent.dart';
-import '../models/file_node.dart';
 import '../models/message.dart';
 import '../../io/api_service.dart';
 import '../../io/auth_service.dart';
@@ -10,10 +9,11 @@ import 'message_list.dart';
 
 /// teammates 工作进度窗口
 ///
-/// 进入时展示该 agent 的团队成员拓扑结构：根节点为当前 agent，下面按层级
-/// 展示各成员。每个成员卡片显示名称、状态（working/idle）、模型、层级与
-/// 评价。点击成员可进入其工作进度详情页（消息与工具卡片、活动日志、沙箱
-/// 文件、直接发消息）。
+/// 进入时展示该 agent 的团队成员拓扑：根节点为当前 agent，下面按层级
+/// （Level 1/2/…）分组展示各成员。每个成员卡片显示名称、状态
+/// （working/idle）、模型、层级与评价。点击成员可进入其工作进度详情页
+/// （进度消息与工具卡片、活动日志、直接发消息）。
+/// 团队成员与 leader 共享工作目录 base，故不提供单独的文件浏览。
 class TeammatesWindowPage extends StatefulWidget {
   final Agent agent;
 
@@ -158,22 +158,38 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
             textAlign: TextAlign.center),
       );
     }
-    // 拓扑：根为 leader，成员按层级分组展示
+    // 拓扑：根为 leader，成员按层级（Level 1/2/…）分组展示
     return ListView(
       padding: const EdgeInsets.all(16),
       children: <Widget>[
         _buildLeaderCard(),
-        if (_members.isNotEmpty) ...[
-          const SizedBox(height: 16),
-          const Text(
-            '团队成员',
-            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
-          ),
-          const SizedBox(height: 8),
-          ..._members.map(_buildMemberCard),
-        ],
+        const SizedBox(height: 16),
+        ..._buildLevelGroups(),
       ],
     );
+  }
+
+  /// 将成员按 Level 分组，生成「Level N」分组标题与成员卡片
+  List<Widget> _buildLevelGroups() {
+    final Map<int, List<Map<String, dynamic>>> byLevel =
+        <int, List<Map<String, dynamic>>>{};
+    for (final Map<String, dynamic> m in _members) {
+      final int level = (m['level'] as num?)?.toInt() ?? 1;
+      byLevel.putIfAbsent(level, () => <Map<String, dynamic>>[]).add(m);
+    }
+    final List<int> levels = byLevel.keys.toList()..sort();
+    final List<Widget> children = <Widget>[];
+    for (final int level in levels) {
+      children.add(Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Text(
+          'Level $level 成员',
+          style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+        ),
+      ));
+      children.addAll(byLevel[level]!.map(_buildMemberCard));
+    }
+    return children;
   }
 
   Widget _buildLeaderCard() {
@@ -302,11 +318,12 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
 
 /// 单个团队成员的工作进度详情页
 ///
-/// 包含四个部分：
+/// 包含三部分：
 /// - 进度：实时消息与工具调用卡片（订阅 WebSocket，按 agent_id 过滤）
 /// - 日志：成员工作空间的活动日志
-/// - 文件：成员沙箱文件浏览
 /// - 消息：直接向成员发送消息
+/// （成员与 leader 共享工作目录 base，文件由主界面右侧文件栏展示，
+///   此处不再提供独立的成员文件浏览。）
 class TeammateDetailPage extends StatefulWidget {
   final Agent leader;
   final String memberId;
@@ -490,7 +507,7 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
-      length: 3,
+      length: 2,
       child: Scaffold(
         appBar: AppBar(
           title: Text(widget.memberName),
@@ -505,11 +522,10 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
             tabs: const <Widget>[
               Tab(text: '进度'),
               Tab(text: '日志'),
-              Tab(text: '文件'),
             ],
             onTap: (int i) {
               setState(() {
-                _selectedTab = i == 0 ? 'progress' : (i == 1 ? 'log' : 'files');
+                _selectedTab = i == 0 ? 'progress' : 'log';
               });
               if (i == 1) _loadLog();
             },
@@ -535,11 +551,6 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
             _log.isEmpty ? '（暂无活动日志）' : _log,
             style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
           ),
-        );
-      case 'files':
-        return _MemberFileBrowser(
-          workspaceId: widget.memberId,
-          teamId: widget.leader.id,
         );
       case 'progress':
       default:
@@ -603,185 +614,6 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
                 );
               }
             },
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-/// 成员沙箱文件浏览器（轻量版）
-class _MemberFileBrowser extends StatefulWidget {
-  final String workspaceId;
-
-  /// 所属团队 ID（本地模式下用于后端判定，使成员面板也浏览共享 base）
-  final String teamId;
-
-  const _MemberFileBrowser({
-    required this.workspaceId,
-    required this.teamId,
-  });
-
-  @override
-  State<_MemberFileBrowser> createState() => _MemberFileBrowserState();
-}
-
-class _MemberFileBrowserState extends State<_MemberFileBrowser> {
-  List<FileNode>? _files;
-  String? _error;
-
-  /// 当前浏览的目录路径（相对工作空间根，空串表示根目录）
-  String _currentPath = '';
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  Future<void> _load() async {
-    setState(() {
-      _files = null;
-      _error = null;
-    });
-    try {
-      final List<FileNode> files = await ApiService.getFiles(
-        widget.workspaceId,
-        path: _currentPath,
-        teamId: widget.teamId,
-      );
-      if (!mounted) return;
-      setState(() {
-        _files = files;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _error = e.toString();
-      });
-    }
-  }
-
-  /// 进入子目录
-  void _enterDirectory(FileNode node) {
-    if (!node.isDirectory) return;
-    setState(() {
-      _currentPath = _joinPath(_currentPath, node.name);
-    });
-    _load();
-  }
-
-  /// 返回上一级
-  void _goUp() {
-    final int idx = _currentPath.lastIndexOf('/');
-    setState(() {
-      _currentPath = idx <= 0 ? '' : _currentPath.substring(0, idx);
-    });
-    _load();
-  }
-
-  /// 回到根目录
-  void _goRoot() {
-    setState(() {
-      _currentPath = '';
-    });
-    _load();
-  }
-
-  String _joinPath(String parent, String child) =>
-      parent.isEmpty ? child : '$parent/$child';
-
-  @override
-  Widget build(BuildContext context) {
-    if (_error != null) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            Text('加载失败：$_error'),
-            const SizedBox(height: 8),
-            OutlinedButton(onPressed: _load, child: const Text('重试')),
-          ],
-        ),
-      );
-    }
-    if (_files == null) return const Center(child: CircularProgressIndicator());
-    if (_files!.isEmpty) {
-      return Column(
-        children: <Widget>[
-          _buildNavBar(),
-          const Expanded(child: Center(child: Text('该目录下暂无文件'))),
-        ],
-      );
-    }
-    return Column(
-      children: <Widget>[
-        _buildNavBar(),
-        Expanded(
-          child: RefreshIndicator(
-            onRefresh: _load,
-            child: ListView.builder(
-              itemCount: _files!.length,
-              itemBuilder: (BuildContext context, int index) {
-                final FileNode node = _files![index];
-                return ListTile(
-                  dense: true,
-                  leading: Icon(
-                    node.isDirectory
-                        ? Icons.folder
-                        : Icons.insert_drive_file,
-                    size: 18,
-                  ),
-                  title: Text(node.name,
-                      style: const TextStyle(fontSize: 13)),
-                  subtitle: Text(
-                    node.isDirectory ? '目录' : node.formattedSize,
-                    style: const TextStyle(fontSize: 11),
-                  ),
-                  trailing: node.isDirectory
-                      ? const Icon(Icons.chevron_right, size: 18)
-                      : null,
-                  onTap: node.isDirectory ? () => _enterDirectory(node) : null,
-                );
-              },
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  /// 顶部导航栏：面包屑 + 返回上级/回根
-  Widget _buildNavBar() {
-    final cs = Theme.of(context).colorScheme;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: BoxDecoration(
-        color: cs.surface,
-        border: Border(
-          bottom: BorderSide(color: Theme.of(context).dividerColor, width: 1),
-        ),
-      ),
-      child: Row(
-        children: <Widget>[
-          IconButton(
-            tooltip: '返回上级',
-            icon: const Icon(Icons.arrow_upward, size: 18),
-            onPressed: _currentPath.isEmpty ? null : _goUp,
-          ),
-          IconButton(
-            tooltip: '回到根目录',
-            icon: const Icon(Icons.home, size: 18),
-            onPressed: _currentPath.isEmpty ? null : _goRoot,
-          ),
-          const SizedBox(width: 4),
-          Expanded(
-            child: Text(
-              _currentPath.isEmpty ? '/' : '/$_currentPath',
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
-            ),
           ),
         ],
       ),

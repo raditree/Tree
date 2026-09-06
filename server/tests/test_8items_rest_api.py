@@ -205,6 +205,30 @@ class TestTeammatesPriority(RestApiBase):
         self.assertEqual(members[0]["name"], "知遥")
         self.assertEqual(members[0]["id"], "member_x")
 
+    def test_includes_nested_subteam_level2(self):
+        """子团队（成员自建，行挂在成员自身 id 下）也应出现在顶部 teammates 页。"""
+        agent = agent_store.create_agent(USER["openid"], "TOP", "flash")
+        team_store.init_team(USER["openid"], agent["id"], "TOP")
+        team_store.add_member(
+            USER["openid"], agent["id"], "member_l1",
+            name="一层成员", model_id="flash",
+            level=1, parent_agent_id=agent["id"],
+        )
+        # 一层成员作为子团队 leader 创建的 Level 2 成员：行挂在 member_l1 名下
+        team_store.add_member(
+            USER["openid"], "member_l1", "member_l2",
+            name="二层成员", model_id="flash",
+            level=2, parent_agent_id="member_l1",
+        )
+        r = self.client.get(f"/api/agents/{agent['id']}/teammates")
+        self.assertEqual(r.status_code, 200)
+        members = r.json()["members"]
+        self.assertEqual(
+            [m["id"] for m in members], ["member_l1", "member_l2"],
+        )
+        self.assertEqual(members[1]["level"], 2)
+        self.assertEqual(members[1]["name"], "二层成员")
+
 
 class TestUserMessageSessionChain(unittest.TestCase):
     """R2 会话隔离链路层：session_id 从用户消息透传到 _store_message。"""
