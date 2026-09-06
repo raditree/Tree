@@ -1,1 +1,0 @@
-echo '=== workspaces 目录 ==='; ls -la workspaces/ 2>&1; echo '=== 查找 .self 目录 ==='; find . -maxdepth 4 -type d -name '.self' 2>/dev/null; echo '=== 顶层 .self ==='; ls -la .self/ 2>&1 | head -20

@@ -1,1 +1,0 @@
-cd server && ./.venv/Scripts/python.exe -m pytest tests/test_usage_parse.py -v --tb=short 2>&1 | tail -35

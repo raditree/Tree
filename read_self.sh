@@ -1,1 +1,0 @@
-echo '=== agent_1787008529546/.self ==='; ls -la workspaces/agent_1787008529546/.self/ 2>&1; echo '=== 内容 ==='; for f in workspaces/agent_1787008529546/.self/*.md; do echo "--- $f ---"; head -50 "$f" 2>&1; done
