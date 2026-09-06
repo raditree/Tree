@@ -15,15 +15,37 @@ import 'package:dartssh2/dartssh2.dart';
 /// - 私钥（auth_type == "key"）：读取 `private_key_path` 的 PEM 经
 ///   `SSHKeyPair.fromPem` 解析为 identities。
 class SshConnectionManager {
-  /// 单连接上同时允许的并发工具数（超出排队等待槽位）。
+  /// 单连接并发上限的**内置默认值**（超出排队等待槽位）。
   ///
-  /// 必须明显小于常见 sshd 单连接会话上限 ``MaxSessions``（默认 10），并给
-  /// SFTP 等会话型通道留余量，避免并发会话占满后新命令全部 ``open failed``。
-  static const int maxConcurrentPerTeam = 6;
+  /// 运行时可用后端下发值覆盖：后端 app.yaml ``ssh.max_concurrent_per_team``
+  /// 会随 ``register_ssh_executor`` ack 下发，经 [applyMaxConcurrentPerTeam]
+  /// 生效（见 [SshExecutorService.resolveAck]）。此值需严格小于主机 sshd 单
+  /// 连接会话上限 ``MaxSessions``（已约定主机配套调到 50），并给 SFTP 等
+  /// 会话型通道留余量（42 + 8 < 50），避免并发会话打满后新命令全部
+  /// ``open failed``。若主机 ``MaxSessions`` 未同步调大，请把配置调回其以下
+  /// （如主机为默认 10 时取 6~8）。
+  static const int defaultMaxConcurrentPerTeam = 42;
 
   /// 排队等槽位的最长时限：超过即自动移出队列并报错（见 [_TeamGate.acquire]），
   /// 保证等待项不永久驻留、队列长度有界。
   static const Duration queueWaitTimeout = Duration(minutes: 5);
+
+  /// 实际生效的单连接并发上限（新建闸的默认值）：初始为
+  /// [defaultMaxConcurrentPerTeam]，可经 [applyMaxConcurrentPerTeam] 动态调整。
+  int _concurrentLimit = defaultMaxConcurrentPerTeam;
+
+  /// 应用后端下发的并发上限（来自 app.yaml ``ssh.max_concurrent_per_team``）。
+  ///
+  /// 值非正整数时忽略（保持当前值）；对已创建的闸同步生效（仅影响后续的
+  /// 排队判定，正在执行的会话不受影响）。
+  void applyMaxConcurrentPerTeam(Object? value) {
+    final int v = value is num ? value.toInt() : 0;
+    if (v <= 0) return;
+    _concurrentLimit = v;
+    for (final _TeamGate gate in _gates.values) {
+      gate.max = v;
+    }
+  }
 
   /// 已建立的连接缓存：team_id -> SSHClient
   final Map<String, SSHClient> _clients = <String, SSHClient>{};
@@ -40,7 +62,7 @@ class SshConnectionManager {
   /// 立即执行以解除卡死，要么本就不开新通道，应直连执行。
   ///
   /// [maxConcurrent] / [queueWait] 仅在该 team 尚无闸时生效（测试可注入更小
-  /// 的并发上限与等待时限；生产走默认值）。
+  /// 的并发上限与等待时限；生产走 [applyMaxConcurrentPerTeam] 设定的值）。
   Future<T> runWithSlot<T>(
     String teamId,
     Future<T> Function() action, {
@@ -50,7 +72,7 @@ class SshConnectionManager {
     final _TeamGate gate = _gates.putIfAbsent(
       teamId,
       () => _TeamGate(
-        max: maxConcurrent ?? maxConcurrentPerTeam,
+        max: maxConcurrent ?? _concurrentLimit,
         queueWait: queueWait ?? queueWaitTimeout,
       ),
     );
@@ -253,7 +275,9 @@ class SshConnectionManager {
 /// 每 team 的并发闸状态：当前执行数 + 等待队列。
 ///
 /// 同一条 SSH 连接上的会话型通道数量受 sshd ``MaxSessions`` 限制（默认
-/// 10），此闸把并发工具数限制在 [SshConnectionManager.maxConcurrentPerTeam]，
+/// 10），此闸把并发工具数限制在默认
+/// [SshConnectionManager.defaultMaxConcurrentPerTeam]（可经
+/// [SshConnectionManager.applyMaxConcurrentPerTeam] 动态调整 [max]），
 /// 超出部分排队等槽位——避免并发会话打满通道上限后新命令 ``open failed``。
 ///
 /// 注：Dart 2.19 没有原生 Future 取消（也无 ``CanceledException``），等待中
@@ -261,12 +285,13 @@ class SshConnectionManager {
 /// 保证任何等待项都不会永久驻留在 [_waiters] 中（队列长度有界）。
 class _TeamGate {
   _TeamGate({
-    this.max = SshConnectionManager.maxConcurrentPerTeam,
+    this.max = SshConnectionManager.defaultMaxConcurrentPerTeam,
     this.queueWait = SshConnectionManager.queueWaitTimeout,
   });
 
-  /// 允许同时执行的并发上限
-  final int max;
+  /// 允许同时执行的并发上限（可被 [SshConnectionManager.applyMaxConcurrentPerTeam]
+  /// 动态调大/调小，仅影响后续排队判定，正在执行的会话不受影响）
+  int max;
 
   /// 排队等槽位的最长时限（测试可注入更小值以缩短验证耗时）
   final Duration queueWait;

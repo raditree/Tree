@@ -172,5 +172,49 @@ void main() {
       expect(DateTime.now().difference(start).inMilliseconds,
           lessThan(200));
     });
+
+    test('applyMaxConcurrentPerTeam 动态调大已创建的闸并立即生效', () async {
+      final SshConnectionManager manager = SshConnectionManager();
+      const String team = 'gate-test-apply-dynamic';
+      final Completer<void> release = Completer<void>();
+      final Completer<void> barrier = Completer<void>();
+
+      // 用显式 max=1 创建闸并占住唯一槽位
+      final Future<void> holder = manager.runWithSlot(
+        team,
+        () async {
+          await release.future;
+          return;
+        },
+        maxConcurrent: 1,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+
+      // 模拟后端 ack 下发新上限：调大已创建闸（闸 max 1 -> 3）
+      manager.applyMaxConcurrentPerTeam(3);
+
+      int running = 0;
+      int peak = 0;
+      // 无显式 maxConcurrent：应使用 manager 现值 3（holder 占 1，余 2）
+      final List<Future<void>> others = List<Future<void>>.generate(2, (_) {
+        return manager.runWithSlot(
+          team,
+          () async {
+            running++;
+            if (running > peak) peak = running;
+            await barrier.future;
+            running--;
+            return;
+          },
+        );
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      // 若 apply 未生效（闸仍 max=1），两个新任务会排队，peak 将只有 1
+      expect(peak, 2, reason: '动态调大后两个新任务应立即并行执行');
+
+      barrier.complete();
+      release.complete();
+      await Future.wait(<Future<void>>[holder, ...others]);
+    });
   });
 }

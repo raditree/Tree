@@ -303,6 +303,12 @@ class SshExecutorService extends ChangeNotifier {
   /// ack 不回显 team_id，按注册消息发送顺序（FIFO）匹配到对应 team 的
   /// per-team Completer 完成挂起等待。
   void resolveAck(Map<String, dynamic> ackData) {
+    // 应用后端下发（后端 app.yaml: ssh.max_concurrent_per_team）的单连接
+    // 并发上限；缺失/非正整数时保持前端当前值
+    if (ackData['success'] == true) {
+      _connectionManager
+          .applyMaxConcurrentPerTeam(ackData['max_concurrent_per_team']);
+    }
     while (_ackQueue.isNotEmpty) {
       final _SshTeamState state = _ackQueue.removeAt(0);
       final Completer<Map<String, dynamic>>? completer = state.pendingAck;

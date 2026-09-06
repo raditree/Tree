@@ -27,6 +27,7 @@ from agent.chat import (
     _stop_agent_tree,
     resume_after_answer,
 )
+from config.config import get_config
 from data.conversation_store import (
     get_pending_question,
     mark_pending_answered,
@@ -458,11 +459,26 @@ def register_ws(app: FastAPI) -> None:
                     # 注册即表达"该 agent 走 SSH 执行"的用户意图：写回 agents.mode，
                     # 断连/超时等瞬时失联后 resolve_mode 仍锁定 ssh（不静默回退云端）
                     _persist_agent_mode(user_id, team_id, "ssh")
+                    # 附带 app.yaml 下发的单连接并发上限：前端据此限制同一 SSH
+                    # 连接上同时执行的工具数（超出排队），改 app.yaml 后重开 SSH
+                    # 模式即生效，无需重新构建前端。
+                    ssh_cfg_section = get_config().get("ssh") or {}
+                    try:
+                        ssh_max_concurrent = int(
+                            ssh_cfg_section.get("max_concurrent_per_team") or 0
+                        )
+                    except (TypeError, ValueError):
+                        ssh_max_concurrent = 0
                     await state.ws_manager.send_message(
                         user_id,
                         {
                             "type": "register_ssh_executor_ack",
-                            "data": {"success": True},
+                            "data": {
+                                "success": True,
+                                # 0/缺失表示"不覆盖"，前端保持默认 42
+                                "max_concurrent_per_team":
+                                    ssh_max_concurrent or None,
+                            },
                         },
                     )
                 elif msg_type == "unregister_ssh_executor":

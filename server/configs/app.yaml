@@ -2,6 +2,14 @@ server:
   host: "0.0.0.0"
   port: 8000
 
+# SSH 运行模式（连接由前端 dartssh2 发起）单连接并发控制。
+# 该值随 register_ssh_executor ack 下发给前端，前端据此限制每条 SSH 连接上
+# 同时执行的工具数（超出排队）。必须小于远端主机的 sshd MaxSessions（默认
+# 10；已约定配套调到 50），并预留 SFTP 等会话型通道余量，否则并发会话打满
+# 后新命令会全部报 "open failed"。
+ssh:
+  max_concurrent_per_team: 6
+
 # CORS 跨域配置。
 # allow_origins 为空列表表示不放开任意源（默认，安全推荐）；
 # 需要 Web 端跨域访问时，把允许的源列出来（如 ["http://localhost:3000"]）并置 allow_credentials: true。
