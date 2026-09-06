@@ -36,7 +36,7 @@ class SshConnectionManager {
 
   /// 应用后端下发的并发上限（来自 app.yaml ``ssh.max_concurrent_per_team``）。
   ///
-  /// 值非正整数时忽略（保持当前值）；对已创建的闸同步生效（仅影响后续的
+  /// 值非正整数时忽略（保持当前值）（值为零在当前业务下不合理，故也忽略）；对已创建的闸同步生效（仅影响后续的
   /// 排队判定，正在执行的会话不受影响）。
   void applyMaxConcurrentPerTeam(Object? value) {
     final int v = value is num ? value.toInt() : 0;
