@@ -394,13 +394,35 @@ class SshWorkspaceExecutor {
 
   /// 用 exec（与 SFTP 同一连接）探测远端路径是否存在：SFTP 报 No such file 时
   /// 交叉核验，区分「远端确实不存在」与「SFTP 与 exec 文件系统视图不一致」。
-  Future<bool> _remoteExistsViaExec(SSHClient client, String remote) async {
-    final Map<String, dynamic> r = await _exec(
-      client,
-      'test -e -- ${_shQuote(remote)} && printf exists',
-    );
-    return r['exit_code'] == 0 &&
-        (r['stdout'] as String? ?? '').contains('exists');
+  ///
+  /// 返回三态：true=exec 可见；false=exec 亦不可见；null=探测本身失败
+  /// （如通道异常，``_exec`` 对 ``SSHChannelOpenError`` 是 rethrow 的），
+  /// 由调用方如实上报，避免把「通道异常」误报成「远端不存在」。
+  Future<bool?> _remoteExistsViaExec(SSHClient client, String remote) async {
+    try {
+      final Map<String, dynamic> r = await _exec(
+        client,
+        'test -e -- ${_shQuote(remote)} && printf exists',
+      );
+      return r['exit_code'] == 0 &&
+          (r['stdout'] as String? ?? '').contains('exists');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// read 系列遇 SFTP No such file 时，按 exec 交叉核验结果生成可读提示。
+  String _noSuchFileHint(String userPath, String remote, bool? viaExec) {
+    final String tail = _sftpCtx(remote);
+    if (viaExec == true) {
+      return '文件读取失败: SFTP 报不存在但 exec 侧可见同一绝对路径，'
+          '疑似 SFTP 视图/路径映射不一致: $userPath$tail';
+    }
+    if (viaExec == false) {
+      return '文件不存在或无法读取（exec 侧亦不存在）: $userPath$tail';
+    }
+    return '文件不存在或无法读取（exec 侧交叉核验失败，请检查 SSH 通道）: '
+        '$userPath$tail';
   }
 
   // ------------------------------------------------------------------
@@ -493,12 +515,9 @@ class SshWorkspaceExecutor {
       };
     } on SftpStatusError catch (e) {
       if (e.code == SftpStatusCode.noSuchFile) {
-        final bool viaExec = await _remoteExistsViaExec(client, remote);
+        final bool? viaExec = await _remoteExistsViaExec(client, remote);
         return <String, dynamic>{
-          'error': viaExec
-              ? '文件读取失败: SFTP 报不存在但 exec 侧可见同一绝对路径，'
-                  '疑似 SFTP 视图/路径映射不一致: $path${_sftpCtx(remote)}'
-              : '文件不存在或无法读取（exec 侧亦不存在）: $path${_sftpCtx(remote)}',
+          'error': _noSuchFileHint(path, remote, viaExec),
           'exit_code': 1,
           'stdout': '',
         };
@@ -546,12 +565,9 @@ class SshWorkspaceExecutor {
       };
     } on SftpStatusError catch (e) {
       if (e.code == SftpStatusCode.noSuchFile) {
-        final bool viaExec = await _remoteExistsViaExec(client, remote);
+        final bool? viaExec = await _remoteExistsViaExec(client, remote);
         return <String, dynamic>{
-          'error': viaExec
-              ? '文件读取失败: SFTP 报不存在但 exec 侧可见同一绝对路径，'
-                  '疑似 SFTP 视图/路径映射不一致: $path${_sftpCtx(remote)}'
-              : '文件不存在或无法读取（exec 侧亦不存在）: $path${_sftpCtx(remote)}',
+          'error': _noSuchFileHint(path, remote, viaExec),
           'exit_code': 1,
         };
       }
