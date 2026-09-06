@@ -51,7 +51,10 @@ class SshWorkspaceExecutor {
 
   /// 按操作类型分发执行，返回结果字典（结构对齐后端/本地执行器）。
   ///
-  /// 失败时返回 ``{error}``；连接不存在/断开时尝试按配置重建。
+  /// 失败时返回 ``{error}``；连接不存在/断开时尝试按配置重建。执行中若
+  /// 抛出 [SSHChannelOpenError]（连接上堆积的会话撞到 sshd 单连接通道上限
+  /// ``MaxSessions``，表现为所有命令持续 ``open failed``），会丢弃并重建
+  /// 连接后重试一次（自愈），避免整条连接被卡死后所有工具永久失败。
   Future<Map<String, dynamic>> execute(
     String workspaceId,
     String op,
@@ -60,6 +63,73 @@ class SshWorkspaceExecutor {
     if (teamId.isEmpty) {
       return <String, dynamic>{'error': '未选择顶部 agent'};
     }
+    Future<Map<String, dynamic>> run() => _guarded(
+          (SSHClient client) => _runOnce(client, workspaceId, op, data),
+        );
+    // upload_chunk / upload_complete 复用 upload_init 建好的分片会话，不再
+    // 新开通道：无需占并发槽位（且若排队可能等到超时）。其余操作都在同一
+    // 条连接上新开会话型通道，走并发闸（超出排队）。
+    //
+    // 排队等待期间 ssh_executor_service 的 tool_exec_progress 心跳持续发送
+    // （其周期 timer 覆盖整个 execute 期间），后端卡死检测不会误判超时。
+    if (op == 'upload_chunk' || op == 'upload_complete') {
+      return run();
+    }
+    return manager.runWithSlot(teamId, run);
+  }
+
+  /// 在已连接的 [client] 上按 op 分发执行一次（不处理连接级错误）。
+  ///
+  /// 连接建立 / 通道开失败等连接级问题由 [_guarded] 统一负责。
+  Future<Map<String, dynamic>> _runOnce(
+    SSHClient client,
+    String workspaceId,
+    String op,
+    Map<String, dynamic> data,
+  ) async {
+    switch (op) {
+      case 'list_files':
+        return _listFiles(client, workspaceId, data);
+      case 'read_file':
+        return _readFile(client, workspaceId, data);
+      case 'read_file_bytes':
+        return _readFileBytes(client, workspaceId, data);
+      case 'write_file':
+        return _writeFile(client, workspaceId, data);
+      case 'upload_file':
+        return _uploadFile(client, workspaceId, data);
+      case 'upload_init':
+        return _uploadInit(client, workspaceId, data);
+      case 'upload_chunk':
+        return _uploadChunk(data);
+      case 'upload_complete':
+        return _uploadComplete(data);
+      case 'exec_shell':
+        return _execShell(client, workspaceId, data);
+      case 'exec_shell_hook':
+        return _execShellHook(client, workspaceId, data);
+      case 'exec_argv':
+        return _execArgv(client, workspaceId, data);
+      case 'grep_search':
+        return _grepSearch(client, workspaceId, data);
+      case 'git_log':
+        return _gitLog(client, workspaceId, data);
+      case 'git_branches':
+        return _gitBranches(client, workspaceId, data);
+      default:
+        return <String, dynamic>{'error': '未知 SSH 执行操作: $op'};
+    }
+  }
+
+  /// 带通道错误自愈的一次执行：先按配置建连/复用连接，再执行 [action]。
+  ///
+  /// - 建连失败返回 ``SSH 连接失败``；
+  /// - 执行抛出 [SSHChannelOpenError] 时视为连接级通道饱和/卡死：关闭并
+  ///   丢弃该连接，重建后**再执行一次**；仍失败则返回执行错误（单次重试，
+  ///   避免连不上时反复建连造成主机侧连接风暴）。
+  Future<Map<String, dynamic>> _guarded(
+    Future<Map<String, dynamic>> Function(SSHClient client) action,
+  ) async {
     SSHClient client;
     try {
       client = await manager.connect(teamId, config);
@@ -67,37 +137,18 @@ class SshWorkspaceExecutor {
       return <String, dynamic>{'error': 'SSH 连接失败: $e'};
     }
     try {
-      switch (op) {
-        case 'list_files':
-          return _listFiles(client, workspaceId, data);
-        case 'read_file':
-          return _readFile(client, workspaceId, data);
-        case 'read_file_bytes':
-          return _readFileBytes(client, workspaceId, data);
-        case 'write_file':
-          return _writeFile(client, workspaceId, data);
-        case 'upload_file':
-          return _uploadFile(client, workspaceId, data);
-        case 'upload_init':
-          return _uploadInit(client, workspaceId, data);
-        case 'upload_chunk':
-          return _uploadChunk(data);
-        case 'upload_complete':
-          return _uploadComplete(data);
-        case 'exec_shell':
-          return _execShell(client, workspaceId, data);
-        case 'exec_shell_hook':
-          return _execShellHook(client, workspaceId, data);
-        case 'exec_argv':
-          return _execArgv(client, workspaceId, data);
-        case 'grep_search':
-          return _grepSearch(client, workspaceId, data);
-        case 'git_log':
-          return _gitLog(client, workspaceId, data);
-        case 'git_branches':
-          return _gitBranches(client, workspaceId, data);
-        default:
-          return <String, dynamic>{'error': '未知 SSH 执行操作: $op'};
+      return await action(client);
+    } on SSHChannelOpenError {
+      await manager.close(teamId);
+      try {
+        final SSHClient fresh = await manager.connect(teamId, config);
+        try {
+          return await action(fresh);
+        } catch (e) {
+          return <String, dynamic>{'error': 'SSH 执行失败: $e'};
+        }
+      } catch (e) {
+        return <String, dynamic>{'error': 'SSH 重连失败: $e'};
       }
     } catch (e) {
       return <String, dynamic>{'error': 'SSH 执行失败: $e'};
@@ -232,17 +283,39 @@ class SshWorkspaceExecutor {
       session = await client.execute(command);
       final BytesBuilder out = BytesBuilder(copy: false);
       final BytesBuilder err = BytesBuilder(copy: false);
-      int doneCount = 0;
+      bool outEnded = false;
+      bool errEnded = false;
       final Completer<void> allDone = Completer<void>();
-      void onDone() {
-        doneCount++;
-        if (doneCount == 2 && !allDone.isCompleted) {
+      void checkDone() {
+        if (outEnded && errEnded && !allDone.isCompleted) {
           allDone.complete();
         }
       }
-
-      session.stdout.listen(out.add, onDone: onDone);
-      session.stderr.listen(err.add, onDone: onDone);
+      // stdout/stderr 的 onError 同样按"流结束"处理：连接/通道异常时任一
+      // 一路流可能只有 error 没有 done，若只等 done 会让 hook/exec 无限
+      // 等待并把会话一直占住（通道泄漏、最终撞上 sshd 通道上限的来源之一）。
+      session.stdout.listen(
+        out.add,
+        onDone: () {
+          outEnded = true;
+          checkDone();
+        },
+        onError: (Object _) {
+          outEnded = true;
+          checkDone();
+        },
+      );
+      session.stderr.listen(
+        err.add,
+        onDone: () {
+          errEnded = true;
+          checkDone();
+        },
+        onError: (Object _) {
+          errEnded = true;
+          checkDone();
+        },
+      );
       if (timeout == null || timeout <= 0) {
         await allDone.future;
       } else {
@@ -270,6 +343,9 @@ class SshWorkspaceExecutor {
         'stdout': utf8.decode(out.takeBytes(), allowMalformed: true),
         'stderr': utf8.decode(err.takeBytes(), allowMalformed: true),
       };
+    } on SSHChannelOpenError {
+      // 连接级通道上限/卡死：不在本层吞掉，交由 _guarded 丢弃连接并重试
+      rethrow;
     } catch (e) {
       return <String, dynamic>{'error': 'SSH 执行失败: $e'};
     } finally {
@@ -692,16 +768,13 @@ class SshWorkspaceExecutor {
     if (pidfile.isEmpty) {
       return <String, dynamic>{'error': '取消 hook 失败: 缺少 pidfile'};
     }
-    SSHClient client;
-    try {
-      client = await manager.connect(teamId, config);
-    } catch (e) {
-      return <String, dynamic>{'error': 'SSH 连接失败: $e'};
-    }
     final String cwd = _remotePath(workspaceId, '');
     final String full = 'cd ${_shQuote(cwd)} || exit 1; '
         'kill -TERM \$(cat ${_shQuote(pidfile)}) 2>/dev/null || true';
-    return _exec(client, full, timeout: 10);
+    // 同样经 _guarded：取消时若连接已被卡死（通道开不出），先重建连接再执行
+    return _guarded(
+      (SSHClient client) => _exec(client, full, timeout: 10),
+    );
   }
 
   /// 在远端工作空间按模式递归搜索，返回 ``{exit_code, stdout}``。

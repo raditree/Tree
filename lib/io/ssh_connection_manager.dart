@@ -15,8 +15,36 @@ import 'package:dartssh2/dartssh2.dart';
 /// - 私钥（auth_type == "key"）：读取 `private_key_path` 的 PEM 经
 ///   `SSHKeyPair.fromPem` 解析为 identities。
 class SshConnectionManager {
+  /// 单连接上同时允许的并发工具数（超出排队等待槽位）。
+  ///
+  /// 必须明显小于常见 sshd 单连接会话上限 ``MaxSessions``（默认 10），并给
+  /// SFTP 等会话型通道留余量，避免并发会话占满后新命令全部 ``open failed``。
+  static const int maxConcurrentPerTeam = 6;
+
   /// 已建立的连接缓存：team_id -> SSHClient
   final Map<String, SSHClient> _clients = <String, SSHClient>{};
+
+  /// 每 team 的并发闸（同一连接上的工具并发上限，超出排队）：team_id -> 闸
+  final Map<String, _TeamGate> _gates = <String, _TeamGate>{};
+
+  /// 在 [teamId] 的并发配额内执行 [action]：同连接并发已达
+  /// [maxConcurrentPerTeam] 时排队等待槽位，前一个执行结束即让位。
+  ///
+  /// 排队等待期间调用方的进度心跳仍在发送（后端卡死检测因此不会误判超时）。
+  /// 注意：取消 hook / 复用既有分片会话的操作**不要**经此排队——它们要么需要
+  /// 立即执行以解除卡死，要么本就不开新通道，应直连执行。
+  Future<T> runWithSlot<T>(
+    String teamId,
+    Future<T> Function() action,
+  ) async {
+    final _TeamGate gate = _gates.putIfAbsent(teamId, _TeamGate.new);
+    await gate.acquire();
+    try {
+      return await action();
+    } finally {
+      gate.release();
+    }
+  }
 
   /// 建立中的连接（in-flight 去重）：team_id -> 建连 Future。
   ///
@@ -196,5 +224,43 @@ class SshConnectionManager {
       rethrow;
     }
     return client;
+  }
+}
+
+/// 每 team 的并发闸状态：当前执行数 + 等待队列。
+///
+/// 同一条 SSH 连接上的会话型通道数量受 sshd ``MaxSessions`` 限制（默认
+/// 10），此闸把并发工具数限制在 [SshConnectionManager.maxConcurrentPerTeam]，
+/// 超出部分排队等槽位——避免并发会话打满通道上限后新命令 ``open failed``。
+class _TeamGate {
+  _TeamGate({this.max = SshConnectionManager.maxConcurrentPerTeam});
+
+  /// 允许同时执行的并发上限
+  final int max;
+
+  /// 当前占用槽位的执行数（不含等待者）
+  int _active = 0;
+
+  /// 排队等待槽位的请求（FIFO 让位）
+  final List<Completer<void>> _waiters = <Completer<void>>[];
+
+  /// 申请一个槽位：未满立即占用；已满则排队等待，直到被让位唤醒。
+  Future<void> acquire() async {
+    if (_active < max) {
+      _active++;
+      return;
+    }
+    final Completer<void> waiter = Completer<void>();
+    _waiters.add(waiter);
+    await waiter.future;
+  }
+
+  /// 释放当前槽位：有等待者则让位给队首（槽位数不变），否则归还槽位。
+  void release() {
+    if (_waiters.isNotEmpty) {
+      _waiters.removeAt(0).complete();
+      return;
+    }
+    _active--;
   }
 }
