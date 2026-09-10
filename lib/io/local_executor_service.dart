@@ -66,6 +66,19 @@ String decodeProcessBytes(dynamic value) {
   }
 }
 
+/// 返回 stdio 字节缓冲中首个完整行（含结尾 ``\n``）的结束下标。
+///
+/// MCP 的 stdio 传输以换行分隔 JSON-RPC 报文：一次读取可能只拿到半行、也可能
+/// 一次拿到多行，必须按 ``\n`` 切分——半行留在缓冲里等后续字节，完整行原样
+/// （含 ``\n``）回传后端，后端据此重组帧。尚未出现完整行时返回 -1。
+/// 纯函数，供 MCP 隧道与单测复用。
+int mcpStdioLineEnd(List<int> buffer) {
+  for (int i = 0; i < buffer.length; i++) {
+    if (buffer[i] == 0x0A) return i;
+  }
+  return -1;
+}
+
 /// 本地执行器服务 - 在本地运行模式下执行后端推送的工具请求
 ///
 /// 本地运行模式：后端完整运行在云端，但工具调用环境转移到用户本机。
@@ -138,6 +151,82 @@ class _LocalTeamState {
   bool registered = false;
 }
 
+/// 第三方 MCP 服务的 stdio 隧道会话（本机子进程）。
+///
+/// local 模式下后端不直接接触 MCP 服务进程：由本端按 ``mcp_stdio_open`` 拉起
+/// 子进程，后端写出的 JSON-RPC 帧经 ``mcp_stdio_write`` 写入其 stdin，子进程
+/// stdout 上按换行分隔的完整帧经 ``mcp_stdio_read`` 原样（base64）回传，直至
+/// ``mcp_stdio_close`` 终止会话。一次工具调用对应一个会话（open → call →
+/// close），与后端直连 stdio 的语义一致。
+class _McpStdioSession {
+  _McpStdioSession({
+    required this.id,
+    required this.teamId,
+    required this.process,
+  });
+
+  /// 会话 id（后端按此 id 收发隧道报文）
+  final String id;
+
+  /// 归属 team（顶部 agent 被删除 / 清理时据此回收子进程）
+  final String teamId;
+
+  /// MCP 服务子进程
+  final Process process;
+
+  /// 已从 stdout 收到但尚未被后端取走的字节（可能含不完整行）
+  final List<int> buffer = <int>[];
+
+  /// stderr 最近若干字节：子进程异常退出时随错误回传，便于定位启动失败原因
+  final List<int> stderrTail = <int>[];
+
+  /// 挂起中的 ``mcp_stdio_read`` 等待者（有新数据或会话关闭时唤醒）
+  Completer<void>? waiter;
+
+  /// 会话是否已关闭（close 主动关闭或子进程已退出）
+  bool closed = false;
+
+  /// 子进程退出码（尚未退出时为 null）
+  int? exitCode;
+
+  /// stderr 保留上限（仅用于错误提示，无需全量）
+  static const int _kStderrTailBytes = 4096;
+
+  /// 订阅 stdout：累积字节并唤醒等待中的读取请求。
+  ///
+  /// 不解析内容——切行由 ``mcp_stdio_read`` 按 [buffer] 完成，避免在这里
+  /// 与「半行」状态纠缠。
+  void listenStdout() {
+    process.stdout.listen(
+      (List<int> chunk) {
+        buffer.addAll(chunk);
+        wakeReader();
+      },
+      onError: (Object _) {},
+    );
+  }
+
+  /// 订阅 stderr：仅保留尾部若干字节（子进程写满 stderr 管道会阻塞，
+  /// 因此必须消费，不能忽略）。
+  void listenStderr() {
+    process.stderr.listen(
+      (List<int> chunk) {
+        stderrTail.addAll(chunk);
+        if (stderrTail.length > _kStderrTailBytes) {
+          stderrTail.removeRange(0, stderrTail.length - _kStderrTailBytes);
+        }
+      },
+      onError: (Object _) {},
+    );
+  }
+
+  /// 唤醒挂起中的读取请求（幂等）。
+  void wakeReader() {
+    final Completer<void>? pending = waiter;
+    if (pending != null && !pending.isCompleted) pending.complete();
+  }
+}
+
 class LocalExecutorService extends ChangeNotifier {
   LocalExecutorService._();
 
@@ -174,6 +263,16 @@ class LocalExecutorService extends ChangeNotifier {
   /// init 时打开文件句柄，chunk 按 offset 追加，complete 时关闭并校验。
   final Map<String, _LocalUploadSession> _uploadSessions =
       <String, _LocalUploadSession>{};
+
+  /// 第三方 MCP 服务的 stdio 隧道会话：session_id -> 会话状态。
+  ///
+  /// 后端每发起一次 MCP 工具调用就 open 一个会话并驱动其 stdin/stdout，
+  /// 调用结束后 close；本表仅在会话存活期间持有子进程句柄。
+  final Map<String, _McpStdioSession> _mcpSessions =
+      <String, _McpStdioSession>{};
+
+  /// MCP 会话 id 自增序号（与时间戳拼接，避免同微秒内碰撞）
+  int _mcpSessionSeq = 0;
 
   /// per-team 状态：team_id -> 本地执行器状态。
   ///
@@ -232,6 +331,7 @@ class LocalExecutorService extends ChangeNotifier {
   /// 通知后端该 team 恢复云端执行，并清理内存状态。
   void deactivateTeam(String teamId) {
     if (teamId.isEmpty) return;
+    _disposeMcpSessionsOf(teamId);
     if (_states.remove(teamId) == null) return;
     _sendUnregister(teamId);
     notifyListeners();
@@ -368,10 +468,10 @@ class LocalExecutorService extends ChangeNotifier {
 
   /// 应用退出 / 页面销毁时清理资源。
   ///
-  /// 替代已废弃的 LocalBackendService.dispose()：本服务不持有本地进程，
-  /// 只需通知后端注销本地执行器（避免后端残留注册导致工具请求被错误路由），
-  /// 并释放 WebSocket 引用、复位注册状态。清理后下次连接会通过
-  /// [attach] + [syncRegisteredTeams] 按状态恢复注册。
+  /// 替代已废弃的 LocalBackendService.dispose()：本服务不常驻本地后端进程，
+  /// 只需通知后端注销本地执行器（避免后端残留注册导致工具请求被错误路由）、
+  /// 回收存活的 MCP 隧道子进程，并释放 WebSocket 引用、复位注册状态。清理后
+  /// 下次连接会通过 [attach] + [syncRegisteredTeams] 按状态恢复注册。
   void cleanup() {
     for (final _LocalTeamState state in _states.values) {
       if (state.registered) {
@@ -379,6 +479,12 @@ class LocalExecutorService extends ChangeNotifier {
         state.registered = false;
       }
     }
+    // 回收所有残留的 MCP 隧道子进程（调用中途退出时后端不再回 close）
+    for (final _McpStdioSession session
+        in _mcpSessions.values.toList(growable: false)) {
+      _disposeMcpSession(session);
+    }
+    _mcpSessions.clear();
     _ws?.removeToolExecRequestHandler(_handleToolExecRequest);
     _ws?.removeToolExecCancelHandler(_handleToolExecCancel);
     _ws = null;

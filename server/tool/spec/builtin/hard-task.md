@@ -14,10 +14,11 @@ pinned: true
 builtin: true
 created_at: 0
 updated_at: 0
-version: 2
+version: 3
 classification: 内部规范
 risk: high
 changelog:
+  - "v3(2026-09-10): team 工具拆分后修正工具引用：会议召集/派活改用 message send_message、broadcast，成员产出经统一工作目录日志验收"
   - "v2(2026-08-30): 修正工具名引用（set_todo_list/ask_user_question/read）；新增判型确认清单、流水线阶段准入准出标准、决策记录模板（ADR）、风险评估框架、高危确认单"
   - "v1(2026-08-23): 初版：纳入版本化提示词体系，补充版本与审计元数据"
 ---
@@ -46,7 +47,7 @@ changelog:
    写入 `.self/` 文档（可追溯）；同时用 `set_todo_list` 建立全任务计划（含各阶段评审点）。
 3. **团队会议**：遵循 **team-meeting** Spec（会议期间只讨论、只产出方案，禁止落地）。
    - `team update_member` 激活架构/前端/后端/测试/安全等角色成员并设置分工；
-   - `team send_message` 发起会议，各成员按角色给出方案（按 team-meeting 的发言模板）；
+   - `message send_message`（或 `message broadcast`）发起会议，各成员按角色给出方案（按 team-meeting 的发言模板）；
    - 汇总方案、按选型矩阵比较，用**决策记录模板**记录选型理由（写入工作空间方案文档）。
 4. **标准团队开发流水线**（每阶段有产出物与评审，**不跳过任何阶段**）：
    需求分析 → 方案设计 → 方案评审 → 实现 → 测试 → 交付；

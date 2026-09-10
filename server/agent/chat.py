@@ -134,10 +134,10 @@ async def _register_tools(
     session_id: str = DEFAULT_SESSION, is_member: bool = False,
     member_system_prompt_provider: Optional[Callable[[], str]] = None,
 ) -> None:
-    """给会话注册内置工具（team / mcp / spec 等）。
+    """给会话注册内置工具（team / message / mcp / spec 等）。
 
     封装对 register_builtin_tools 的调用，避免重复展开 mcp_config 取值逻辑。
-    同时把消息投递器与用户标识传给 team 工具，用于异步触发成员处理。
+    同时把消息投递器与用户标识传给 team/message 工具，用于异步触发成员处理。
     并给会话挂上 compact 时的 system prompt 重建回调（spec「注入时机」：
     重构 context 时重建 system prompt，注入最新 Spec 索引/已选 Spec/memory/
     成员拓扑/MCP 工具清单）。
@@ -579,10 +579,11 @@ _SPEC_INDEX_LIMIT = 12
 def _build_mcp_tools_text(mcp_manager: Any) -> str:
     """生成「⑩b MCP 工具与外部服务」章节文本（不启动 stdio 子进程）。
 
-    进程内服务（本地/SSH 模式的 workspace/document，handler + tool_defs）
-    直接列工具名；stdio 外部服务只列服务名与工具数，完整列表由模型按需
-    ``mcp help`` 查询——prompt 构建/重建发生在会话创建与 compact 时机，
-    逐服务拉起子进程在 300+ agent 规模下不可接受。
+    进程内服务（workspace/document，server_factory + SDK 内存流）的工具已在
+    会话注册期经 ``tools/list`` 发现并按 ``mcp__<服务名>__<工具名>`` 注入模型
+    工具列表，这里直接从缓存列名；外部 stdio 服务只列服务名与工具数，完整
+    清单由模型按需 ``mcp help`` 查询——prompt 构建/重建发生在会话创建与
+    compact 时机，逐服务拉起子进程在 300+ agent 规模下不可接受。
 
     :param mcp_manager: 会话级 MCPManager（``session.mcp_manager``）
     :return: 章节正文；无可用服务/异常时返回空串（调用方跳过章节）
@@ -596,14 +597,13 @@ def _build_mcp_tools_text(mcp_manager: Any) -> str:
         lines: List[str] = []
         for name in services:
             service = getattr(mcp_manager, "services", {}).get(name) or {}
-            in_process = service.get("handler") is not None
+            in_process = service.get("server_factory") is not None
             if in_process:
-                tools = service.get("tool_defs", []) or []
-                names: List[str] = []
-                for t in tools:
-                    fn = t.get("function", t) or t
-                    if fn.get("name"):
-                        names.append(str(fn["name"]))
+                names = [
+                    str(t.get("mcp_name") or t.get("name") or "")
+                    for t in (service.get("tools", []) or [])
+                ]
+                names = [n for n in names if n]
                 if names:
                     lines.append(f"- 服务 `{name}`（进程内）: {', '.join(names)}")
                 else:
@@ -611,15 +611,24 @@ def _build_mcp_tools_text(mcp_manager: Any) -> str:
             else:
                 tool_count = len(service.get("tools", []) or [])
                 hint = f"（{tool_count} 个工具）" if tool_count else ""
+                # 执行落点：隧道服务在宿主进程（本机 / 远端主机）拉起子进程，
+                # 其余由后端进程直连；模型据此判断"第三方能力在谁的机器上跑"。
+                tunnel = service.get("tunnel")
+                if tunnel is not None:
+                    host = "本机执行" if getattr(tunnel, "mode", "") == "local" else "远端主机执行"
+                else:
+                    host = "后端执行"
                 lines.append(
-                    f"- 服务 `{name}`{hint}：工具列表用 `mcp` 工具的 help 动作查看"
+                    f"- 服务 `{name}`{hint}（{host}）："
+                    "工具列表用 `mcp` 工具的 help 动作查看"
                 )
         if not lines:
             return ""
         return (
             "可用 MCP 服务与工具：\n" + "\n".join(lines) + "\n"
-            "（调用方式：mcp 工具 call，action=call，tool_name 为上述工具名；"
-            "stdio 服务的完整工具清单可用 action=help 查询）"
+            "（进程内服务的工具已按 `mcp__<服务名>__<工具名>` 直接注入可用工具，"
+            "可直接调用；其余服务的工具清单用 `mcp` 工具的 help 动作查询，"
+            "再以 action=call、tool_name 为 `mcp__<服务名>__<工具名>` 调用）"
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("构建 MCP 工具清单章节失败(跳过): %s", exc)
@@ -837,7 +846,7 @@ def _build_member_topology_text(
 
     lines = ["## ⑩ 成员拓扑与寻址规则"]
     if members:
-        lines.append("当前团队成员（ID | 名称 | 角色 | 职责 | 模型 | 状态 | 层级）:")
+        lines.append("当前团队成员（ID | 名称 | 角色 | 职责 | 模型 | 状态 | 层级 | 直属上级 | 可带队）:")
         for m in members:
             # 状态列注入**实际执行态**（基于 _active_tasks），
             # 不读表/roster 快照（避免假 working）
@@ -847,21 +856,42 @@ def _build_member_topology_text(
                 if (user_id and mid and _is_agent_working(user_id, mid))
                 else "idle"
             )
+            can_lead = m.get("can_lead_team", "")
+            if can_lead is True or can_lead == 1:
+                can_lead_text = "是"
+            elif can_lead is False or can_lead == 0:
+                can_lead_text = "否"
+            else:
+                can_lead_text = ""
             lines.append(
                 f"- {mid} | {m.get('name', '')} | "
                 f"{m.get('role', '')} | {m.get('duty', '')} | "
                 f"{m.get('model_id', '')} | {live_status} | "
-                f"L{m.get('level', 1)}"
+                f"L{m.get('level', 1)} | {m.get('parent_agent_id', '')} | "
+                f"{can_lead_text}"
             )
     else:
-        lines.append("当前为顶层 Agent，尚无成员（需要分工时经 team 指派/带领子团队）。")
+        lines.append("当前为顶层 Agent，尚无成员（需要分工时：应用户要求经 "
+                     "team create_member 建队，再用 message send_message 派活）。")
     lines.append("寻址规则:")
-    lines.append("- 本团队内按成员名称（name）寻址：team 派发任务/收成果时用成员 name。")
-    lines.append("- 跨团队顶层沟通：先 list_teams 熟悉本用户名下 TOP，向其他 TOP agent "
-                "按 TOP 名称寻址，经 team 投递。")
+    lines.append("- 管理与通信已拆为两个工具：team 负责 list_models/list_teams/"
+                 "list_members/create_member/query_member/update_member/query_status；"
+                 "message 负责 send_message/broadcast/wait_for（list_members/list_teams "
+                 "两个工具都可调用）。")
+    lines.append("- 本团队内按成员名称（name）或成员 ID 寻址：先 team list_members "
+                 "确认名单，用 message send_message 派活/沟通、wait_for 等待交付；"
+                 "broadcast 只发给你的**直属成员**（不跨层级）。")
+    lines.append("- 验收产出：直接 read 成员活动日志 "
+                 "agentspace/{member_id}/.self/activity.log（每行带 "
+                 "YYYY-MM-DD HH:MM:SS 时间戳，可 grep '[done]'/'[tool]' 定位产出）"
+                 "及其工作目录内文件；team query_status 仅提供实时工作状态、"
+                 "最后活动时间与日志路径。")
+    lines.append("- 跨团队顶层沟通：先 team list_teams 熟悉本用户名下 TOP，向其他 "
+                 "TOP agent 按 TOP 名称寻址，经 message send_message 投递（仅 TOP "
+                 "本人可发起；成员需跨团队时请直属 leader 转达）。")
     lines.append("- 回复路径：成员→上级（TOP）；TOP→用户。成员不直接面向用户。")
-    lines.append("- 使用 team 工具前先检查成员基本信息：role/duty 为空时用 "
-                "update_member 补充完善再派发任务；model_id 为空会自动回退所属 "
+    lines.append("- 派活前先 team list_members/query_member 核对：role/duty 为空时 "
+                "用 team update_member 补充完善；model_id 为空会自动回退所属 "
                 "TOP 模型（无需强制 update_member）。")
     return "\n".join(lines)
 
@@ -1357,7 +1387,7 @@ def _reset_member_status_to_idle(
     """（已废弃）成员工作状态复位占位。
 
     【状态治理】工作状态唯一权威是 ``_active_tasks``（实际 tool loop 登记），
-    不再写入 team_members 表 / roster / team_tool 内存态。停止 = 取消
+    不再写入 team_members 表 / roster 持久态。停止 = 取消
     ``_active_tasks`` 中的任务 + 清空 broker 队列；成员 tool loop 的 finally
     会 ``_clear_active_task`` 并推送 ``agent_status=idle``，前端/API 状态
     自然回到 idle。保留本函数仅为兼容调用方，不再写任何持久化状态。
@@ -1472,27 +1502,65 @@ async def _stop_agent_tree(
 
 
 def _clock_now() -> str:
-    """返回 HH:MM:SS 时间戳，用于活动日志。"""
-    return time.strftime("%H:%M:%S")
+    """返回 ``YYYY-MM-DD HH:MM:SS`` 时间戳（服务器本地时间），用于活动日志。
+
+    带日期以便跨天判断成员产出时间；旧日志行可能只有 HH:MM:SS（legacy）。
+    """
+    return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _append_activity_log(workspace_id: str, message: str) -> None:
+# 活动日志单文件字符上限（超出后只保留尾部，read-modify-write 通道用）
+_ACTIVITY_LOG_MAX_CHARS = 200_000
+
+
+def _append_activity_log(
+    workspace_id: str, message: str,
+    user_id: str = "", mode_key: str = "",
+) -> None:
     """将一行活动日志追加写入 agent 工作空间的 ``.self/activity.log``。
 
-    供 team leader 通过 ``view_member_log`` 查看成员文字输出，判断工作是否卡死。
-    - 记录带时间戳，便于判断最后活动时间
-    - 使用 base64 写入，避免特殊字符导致命令注入或转义问题
-    - 命令保留相对令牌 ``.self/activity.log``，exec_in_workspace 兼容层会按
-      当前 agent 改写为物理落点 agentspace/{workspace_id}/.self/activity.log
-      （顶层 agent 与共享成员一致；云端容器内即
-      /workspace/agentspace/{workspace_id}/.self/activity.log）。
+    统一工作目录后，leader 直接 read 成员日志文件
+    （``agentspace/{member_id}/.self/activity.log``）查看成员活动与产出。
+    - 记录带日期时间戳（YYYY-MM-DD HH:MM:SS），便于判断最后活动/产出时间
+    - **本地反向 WS / SSH 模式**：经与内置工具一致的统一 IO 通道
+      read-modify-write 追加（前端执行器映射 ``.self`` →
+      baseDir/agentspace/{workspace_id}/.self），避免 docker 可用时日志
+      错落到云端容器；mode 按 (user_id, 所属 TOP mode_key) 判定
+    - **云端模式/兜底**：容器内 base64 安全 ``>>`` 追加（exec_in_workspace
+      兼容层把 ``.self`` 令牌改写为 agentspace/{workspace_id}/.self）
+
+    :param mode_key: 运行模式归属键（所属 TOP agent id）；成员传 team_id，
+                     顶层传自身 id。为空时按云端兜底路径处理
     """
     if not workspace_id:
         return
+    line = message if message.endswith("\n") else message + "\n"
+
+    # 非云端模式：统一 IO 通道（三模式与内置工具同路径语义）
+    if user_id and mode_key:
+        try:
+            if resolve_mode(user_id, mode_key) in ("local", "ssh"):
+                io = _get_workspace_io(user_id, mode_key)
+                r = run_io(io.read_file(workspace_id, ".self/activity.log"))
+                existing = "" if r.get("error") else str(r.get("content") or "")
+                content = existing + line
+                if len(content) > _ACTIVITY_LOG_MAX_CHARS:
+                    # 超上限只保留尾部（按字符截断，可能切断首行，可接受）
+                    content = content[-_ACTIVITY_LOG_MAX_CHARS:]
+                w = run_io(io.write_file(
+                    workspace_id, ".self/activity.log", content
+                ))
+                if not w.get("error"):
+                    return
+                logger.warning("统一 IO 写活动日志失败，回退 docker 通道")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("统一 IO 写活动日志异常，回退 docker 通道: %s", exc)
+
+    # 云端/兜底：base64 安全追加，避免特殊字符导致命令注入或转义问题
     try:
         import base64 as _b64
 
-        b64 = _b64.b64encode(message.encode("utf-8")).decode("ascii")
+        b64 = _b64.b64encode(line.encode("utf-8")).decode("ascii")
         cmd = [
             "sh",
             "-c",
@@ -1520,6 +1588,7 @@ async def _stream_agent_reply(
     cancel_event: Optional[threading.Event] = None,
     silent: bool = False,
     session_id: str = DEFAULT_SESSION,
+    team_id: str = "",
 ) -> Tuple[str, str]:
     """在后台线程中运行 chat 循环，并向前端实时推送进度事件。
 
@@ -1671,7 +1740,10 @@ async def _stream_agent_reply(
                 _close_text()
                 status = "paused"
                 if flush_buf and workspace_id:
-                    _append_activity_log(workspace_id, f"[{_clock_now()}] {flush_buf}")
+                    _append_activity_log(
+                        workspace_id, f"[{_clock_now()}] {flush_buf}",
+                        user_id=user_id, mode_key=team_id or agent_id,
+                    )
                     flush_buf = ""
                 break
             if itype == "thinking":
@@ -1734,7 +1806,10 @@ async def _stream_agent_reply(
                 if workspace_id:
                     flush_buf += content
                     if len(flush_buf) >= _ACTIVITY_FLUSH_CHARS:
-                        _append_activity_log(workspace_id, f"[{_clock_now()}] {flush_buf}")
+                        _append_activity_log(
+                            workspace_id, f"[{_clock_now()}] {flush_buf}",
+                            user_id=user_id, mode_key=team_id or agent_id,
+                        )
                         flush_buf = ""
             elif itype == "tool_call":
                 # 结束上一段文本与 thinking（中间输出独立成消息）
@@ -1750,6 +1825,7 @@ async def _stream_agent_reply(
                         workspace_id,
                         f"[{_clock_now()}] [tool] {name} args="
                         f"{str(args)[:200]} -> {str(result)[:150]}",
+                        user_id=user_id, mode_key=team_id or agent_id,
                     )
                 flush_buf = ""
                 if not silent:
@@ -1816,7 +1892,10 @@ async def _stream_agent_reply(
         # 结束未关闭的 thinking 段（msg_end + 持久化）
         _close_thinking()
         if flush_buf and workspace_id:
-            _append_activity_log(workspace_id, f"[{_clock_now()}] {flush_buf}")
+            _append_activity_log(
+                workspace_id, f"[{_clock_now()}] {flush_buf}",
+                user_id=user_id, mode_key=team_id or agent_id,
+            )
 
     # 结束时仍打开的文本段即最终回复，交由调用方补发 msg_usage
     last_text_id = text_id
@@ -1834,13 +1913,13 @@ async def _stream_agent_reply(
 async def _process_member_message(
     payload: Dict[str, Any], queue: Optional[asyncio.Queue] = None
 ) -> None:
-    """处理投递给成员的消息（leader 通过 team send_message/assign_task 触发）。
+    """处理投递给成员的消息（leader 通过 message send_message/broadcast 触发）。
 
     每个成员由 broker 的独立 worker 串行调用本函数。消息不在双方的
     tool_call / token 生成执行中途打断，而是在当前消息的 tool_call 间隙
     通过 ``on_tool_turn`` 回调切入处理新消息（append 到上下文供下一轮处理）。
-    成员处理过程中的文字输出写入其工作空间活动日志，leader 可通过
-    ``team view_member_log`` 查看判断进度。
+    成员处理过程中的文字输出写入其工作空间活动日志
+    （agentspace/{member_id}/.self/activity.log），leader 直接 read 判断进度。
 
     :param payload: 投递负载，含 user_id / agent_id / workspace_id /
                     model_id / content
@@ -1882,6 +1961,7 @@ async def _process_member_message(
             workspace_id,
             f"[{_clock_now()}] [error] 成员模型不存在: {model_id!r}，"
             "消息未处理（leader 需先用 team update_member 为该成员设置 model_id）",
+            user_id=user_id, mode_key=team_id or agent_id,
         )
         # 明确回传错误给发送方（仅当发送方是 agent；用户直发不转发任何 agent），
         # 避免消息被静默丢弃（表现为"成员没收到"）
@@ -1989,6 +2069,7 @@ async def _process_member_message(
     _append_activity_log(
         workspace_id,
         f"[{_clock_now()}] [start(成员)] 收到 leader 消息: {content[:120]}",
+        user_id=user_id, mode_key=team_id or agent_id,
     )
 
     # 成员最终总结的回发目标：默认 = 本条消息的发送方；中途切入新消息时
@@ -2024,6 +2105,7 @@ async def _process_member_message(
             workspace_id,
             f"[{_clock_now()}] [切入] 收到 leader 新消息: "
             f"{incoming_content[:120]}",
+            user_id=user_id, mode_key=team_id or agent_id,
         )
         return incoming_content
 
@@ -2049,6 +2131,7 @@ async def _process_member_message(
             on_tool_turn=_pick_incoming,
             cancel_event=cancel_event,
             session_id=session_id,
+            team_id=team_id,
         )
         # 关闭最终文本段（无 usage）
         if _last:
@@ -2061,7 +2144,10 @@ async def _process_member_message(
         if full_reply:
             _store_message(user_id, agent_id, "agent", full_reply,
                            session_id=session_id)
-        _append_activity_log(workspace_id, f"[{_clock_now()}] [done(成员)] 回复完成")
+        _append_activity_log(
+            workspace_id, f"[{_clock_now()}] [done(成员)] 回复完成",
+            user_id=user_id, mode_key=team_id or agent_id,
+        )
         # 成员工具循环最后一次回复的 content 自动回发"最后将消息发给它的那位"
         # （用户直发时为 USER_AGENT_ID/空串 → 不转发任何 agent，仅留在成员
         # 会话/teammates 窗口）
@@ -2080,7 +2166,8 @@ async def _process_member_message(
     except Exception as exc:  # noqa: BLE001
         logger.exception("成员消息处理失败: %s", exc)
         _append_activity_log(
-            workspace_id, f"[{_clock_now()}] [error] 成员处理失败: {exc}"
+            workspace_id, f"[{_clock_now()}] [error] 成员处理失败: {exc}",
+            user_id=user_id, mode_key=team_id or agent_id,
         )
     finally:
         # 状态治理：工作状态唯一权威是 _active_tasks——此处清除任务登记并
@@ -2785,6 +2872,7 @@ async def _handle_user_message(
             _append_activity_log(
                 workspace_id,
                 f"[{_clock_now()}] [start] 收到输入: {llm_content[:120]}",
+                user_id=user_id, mode_key=agent_id,
             )
 
         def _pick_incoming() -> Optional[str]:
@@ -2814,6 +2902,7 @@ async def _handle_user_message(
                     workspace_id,
                     f"[{_clock_now()}] [切入] 收到用户新消息: "
                     f"{incoming_content[:120]}",
+                    user_id=user_id, mode_key=agent_id,
                 )
             return incoming_content
 
@@ -2831,27 +2920,32 @@ async def _handle_user_message(
             on_tool_turn=_pick_incoming,
             cancel_event=cancel_event,
             session_id=session_id,
+            team_id=agent_id,
         )
 
         if stream_status == "cancelled":
             if workspace_id:
                 _append_activity_log(
-                    workspace_id, f"[{_clock_now()}] [stopped] 已停止"
+                    workspace_id, f"[{_clock_now()}] [stopped] 已停止",
+                    user_id=user_id, mode_key=agent_id,
                 )
         elif stream_status == "paused":
             if workspace_id:
                 _append_activity_log(
-                    workspace_id, f"[{_clock_now()}] [wait] 已提问，等待用户回答"
+                    workspace_id, f"[{_clock_now()}] [wait] 已提问，等待用户回答",
+                    user_id=user_id, mode_key=agent_id,
                 )
         elif stream_status == "error":
             if workspace_id:
                 _append_activity_log(
-                    workspace_id, f"[{_clock_now()}] [error] LLM 请求失败: {full_reply}"
+                    workspace_id, f"[{_clock_now()}] [error] LLM 请求失败: {full_reply}",
+                    user_id=user_id, mode_key=agent_id,
                 )
         else:
             if workspace_id:
                 _append_activity_log(
-                    workspace_id, f"[{_clock_now()}] [done] 回复完成"
+                    workspace_id, f"[{_clock_now()}] [done] 回复完成",
+                    user_id=user_id, mode_key=agent_id,
                 )
         # 对话结束后将上下文持久化到数据库（重启后恢复）
         if session is not None:
@@ -2872,7 +2966,8 @@ async def _handle_user_message(
         last_text_id = None
         if workspace_id:
             _append_activity_log(
-                workspace_id, f"[{_clock_now()}] [error] LLM 请求失败: {exc}"
+                workspace_id, f"[{_clock_now()}] [error] LLM 请求失败: {exc}",
+                user_id=user_id, mode_key=agent_id,
             )
     finally:
         # 计算 token 用量

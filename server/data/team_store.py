@@ -74,6 +74,7 @@ def _ensure_db() -> None:
                 scores_json TEXT NOT NULL DEFAULT '{}',
                 system_prompt TEXT NOT NULL DEFAULT '',
                 parent_agent_id TEXT NOT NULL DEFAULT '',
+                can_lead_team INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )
@@ -93,6 +94,9 @@ def _ensure_db() -> None:
         _migrate_column(conn, "team_members", "parent_agent_id",
                         "ALTER TABLE team_members ADD COLUMN parent_agent_id "
                         "TEXT NOT NULL DEFAULT ''")
+        _migrate_column(conn, "team_members", "can_lead_team",
+                        "ALTER TABLE team_members ADD COLUMN can_lead_team "
+                        "INTEGER NOT NULL DEFAULT 1")
         conn.commit()
     _initialized = True
 
@@ -131,26 +135,28 @@ def render_roster_md(members: List[Dict[str, Any]]) -> str:
 
     列顺序与既有 ``_parse_roster_table`` / team_tool 保持一致
     （前 7 列 ID|名称|模型|层级|创建时间|工作状态|评价 保持不变），
-    角色/职责列追加在评价之后、评分之前，避免破坏已有解析索引。
+    角色/职责列追加在评价之后、评分之前，避免破坏已有解析索引；
+    「可带队」列追加在最末（旧 roster 缺该列时解析按缺省处理）。
     完整列：ID | 名称 | 模型 | 层级 | 创建时间 | 工作状态 | 评价 |
-    角色 | 职责 | 质量 | 效率 | 协作性 | 准确性
+    角色 | 职责 | 质量 | 效率 | 协作性 | 准确性 | 可带队
 
     【状态治理】工作状态列输出占位 ``-``（不写任何状态值）：成员是否在
     工作的唯一权威是 ``chat._active_tasks``（实际 tool loop 登记），由
     ``team query_status`` / teammates API 实时计算；roster 不再承载状态，
-    避免名册中的状态与实际情况脱节（曾被 leader/assign_task 写入假状态）。
+    避免名册中的状态与实际情况脱节。
     """
     header = (
         "| ID | 名称 | 模型 | 层级 | 创建时间 | 工作状态 | 评价 | "
-        "角色 | 职责 | 质量 | 效率 | 协作性 | 准确性 |"
+        "角色 | 职责 | 质量 | 效率 | 协作性 | 准确性 | 可带队 |"
     )
     separator = (
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | "
-        "--- | --- | --- | --- |"
+        "--- | --- | --- | --- | --- |"
     )
     lines = [header, separator]
     for m in members:
         s = m.get("scores") or {}
+        can_lead = "是" if m.get("can_lead_team", 1) else "否"
         lines.append(
             f"| {m.get('id', '')} | {m.get('name', '')} | "
             f"{m.get('model_id', '')} | {m.get('level', 1)} | "
@@ -160,7 +166,7 @@ def render_roster_md(members: List[Dict[str, Any]]) -> str:
             f"{_to_score(s.get('quality', 0))} | "
             f"{_to_score(s.get('efficiency', 0))} | "
             f"{_to_score(s.get('collaboration', 0))} | "
-            f"{_to_score(s.get('accuracy', 0))} |"
+            f"{_to_score(s.get('accuracy', 0))} | {can_lead} |"
         )
     return "\n".join(lines) + "\n"
 
@@ -243,6 +249,7 @@ def add_member(
     level: int = 1,
     system_prompt: str = "",
     parent_agent_id: str = "",
+    can_lead_team: bool = True,
 ) -> Dict[str, Any]:
     """新增一名团队成员并更新团队 member_count。
 
@@ -250,6 +257,7 @@ def add_member(
                             为 team_id，leader 经 create_member 创建时为
                             创建者的 agent_id（用于「每层成员上限」与
                             teammates/team_member 分组）。
+    :param can_lead_team: 是否允许该成员再建下级团队，默认允许。
     """
     _ensure_db()
     now = int(time.time() * 1000)
@@ -258,11 +266,12 @@ def add_member(
             "INSERT OR REPLACE INTO team_members "
             "(id, team_id, user_id, name, role, duty, model_id, level, "
             "work_status, comment, scores_json, system_prompt, parent_agent_id, "
-            "created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'idle', '', '{}', ?, ?, ?, ?)",
+            "can_lead_team, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'idle', '', '{}', ?, ?, ?, ?, ?)",
             (
                 member_id, team_id, user_id, name, role, duty,
-                model_id, level, system_prompt, parent_agent_id, now, now,
+                model_id, level, system_prompt, parent_agent_id,
+                1 if can_lead_team else 0, now, now,
             ),
         )
         conn.execute(
@@ -327,14 +336,19 @@ def update_member(
     team_id: str, member_id: str, **fields: Any
 ) -> Optional[Dict[str, Any]]:
     """更新成员字段（name/role/duty/model_id/level/work_status/comment/
-    system_prompt/scores），返回更新后的成员；成员不存在返回 None。"""
+    system_prompt/scores/can_lead_team/parent_agent_id），返回更新后的成员；
+    成员不存在返回 None。"""
     allowed = {
         "name", "role", "duty", "model_id", "level", "work_status",
-        "comment", "system_prompt", "scores",
+        "comment", "system_prompt", "scores", "can_lead_team",
+        "parent_agent_id",
     }
     updates: Dict[str, Any] = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return get_member(team_id, member_id)
+
+    if "can_lead_team" in updates:
+        updates["can_lead_team"] = 1 if updates["can_lead_team"] else 0
 
     if "scores" in updates:
         scores = updates.pop("scores")
@@ -362,3 +376,59 @@ def update_member(
         )
         conn.commit()
     return get_member(team_id, member_id) if cursor.rowcount else None
+
+
+def _row_to_member(row: sqlite3.Row) -> Dict[str, Any]:
+    d = dict(row)
+    try:
+        d["scores"] = json.loads(d.pop("scores_json") or "{}")
+    except (ValueError, TypeError):
+        d["scores"] = {}
+    return d
+
+
+def get_member_by_name(
+    team_id: str, name: str
+) -> Optional[Dict[str, Any]]:
+    """按名称在团队内精确查找成员（无重名约束时返回创建最早的一条）。"""
+    _ensure_db()
+    conn = _connect()
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM team_members WHERE team_id = ? AND name = ? "
+            "ORDER BY created_at ASC, id ASC LIMIT 1",
+            (team_id, name),
+        ).fetchone()
+        return _row_to_member(row) if row else None
+    finally:
+        conn.close()
+
+
+def count_members_by_name(team_id: str, name: str) -> int:
+    """统计团队内同名成员数量（重名校验用）。"""
+    _ensure_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM team_members WHERE team_id = ? AND name = ?",
+            (team_id, name),
+        ).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
+def count_direct_members(team_id: str, parent_agent_id: str) -> int:
+    """实时统计某 leader 的直属成员数（每层人数上限校验用）。"""
+    _ensure_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM team_members "
+            "WHERE team_id = ? AND parent_agent_id = ?",
+            (team_id, parent_agent_id),
+        ).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()

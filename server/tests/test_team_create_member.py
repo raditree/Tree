@@ -49,12 +49,19 @@ def _make_tool(max_level=3, max_members=7, agent_id="top1",
     return tool
 
 
+def _patch_members(tool):
+    """把实时名单锁定为该工具的内存名单，隔离真实 DB 同名团队数据。"""
+    return patch("data.team_store.get_members",
+                 side_effect=lambda *a, **k: [dict(m) for m in tool.members])
+
+
 class TestCreateMemberDispatch(unittest.TestCase):
     def test_dispatch_contains_create_member(self):
         """create_member 已注册到 team 工具 dispatch 表（LLM 可调用）。"""
         tool = _make_tool()
         # 未指定 model_id 时返回模型池（而非「未知 action」错误 → 证明已注册）
-        result = tool.execute({"action": "create_member"})
+        with _patch_members(tool):
+            result = tool.execute({"action": "create_member"})
         self.assertIn("models", result)
         self.assertNotIn("error", result)
 
@@ -68,7 +75,8 @@ class TestCreateMemberFlow(unittest.TestCase):
             "workspace_id": "member_x",
         }
         tool._dispatch_to_member = MagicMock(return_value=True)  # type: ignore[method-assign]
-        with patch("data.team_store.add_member") as add_member:
+        with patch("data.team_store.add_member") as add_member, \
+                _patch_members(tool):
             result = tool.execute({
                 "action": "create_member",
                 "member_name": "测试成员",
@@ -100,9 +108,10 @@ class TestCreateMemberFlow(unittest.TestCase):
             {"id": "o1", "parent_agent_id": "top2"},
             {"id": "o2", "parent_agent_id": "top2"},
         ]
-        result = tool.execute({
-            "action": "create_member", "model_id": "m",
-        })
+        with _patch_members(tool):
+            result = tool.execute({
+                "action": "create_member", "model_id": "m",
+            })
         # 未达上限：继续走创建流程（model 存在则创建，无需校验错误）
         self.assertNotIn("已达上限", str(result))
 
@@ -113,9 +122,10 @@ class TestCreateMemberFlow(unittest.TestCase):
             {"id": "d2", "parent_agent_id": "top1"},
             {"id": "o1", "parent_agent_id": "top2"},
         ]
-        result2 = tool2.execute({
-            "action": "create_member", "model_id": "m",
-        })
+        with _patch_members(tool2):
+            result2 = tool2.execute({
+                "action": "create_member", "model_id": "m",
+            })
         self.assertIn("已达上限", str(result2))
         self.assertIn("2", str(result2))
 
@@ -149,7 +159,8 @@ class TestListMembersGrouping(unittest.TestCase):
             {"id": "o1", "name": "平级1", "parent_agent_id": "top2",
              "role": "前端", "duty": "页面", "model_id": "m", "level": 1},
         ]
-        result = tool._action_list_members({})
+        with _patch_members(tool):
+            result = tool._action_list_members({})
         groups = result["groups"]
         teammates = groups["teammates"]
         team_member = groups["team_member"]

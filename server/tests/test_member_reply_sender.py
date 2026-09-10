@@ -49,7 +49,7 @@ def _make_fake_stream(insert_cb=None):
     """返回 _stream_agent_reply 的替身；可选在 tool_call 间隙调用插入回调。"""
     async def _fake_stream(user_id, agent_id, workspace_id, session,
                            content, on_tool_turn=None, cancel_event=None,
-                           session_id=None):
+                           session_id=None, team_id=None):
         if insert_cb is not None:
             insert_cb(on_tool_turn)
         return ("成员最终总结内容", "ok", None)

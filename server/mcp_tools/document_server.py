@@ -1,40 +1,34 @@
-"""MCP stdio server - 文档处理服务（PDF/PPTX/DOCX/XLSX）。
+"""MCP 文档处理服务（PDF/PPTX/DOCX/XLSX）。
 
-通过环境变量 ``WORKSPACE_ID`` 绑定到指定 agent 的 Docker 工作空间，
-使用容器内安装的 Python 文档处理库（pymupdf / python-pptx / python-docx / openpyxl）
-来读取和生成常见复杂文档。
+以「进程内 MCP server」形式提供：``build_server`` 构造标准 MCP server，
+后端以内存流对接 ClientSession（见 ``mcp_tools.inproc_server``）。
+文档处理脚本经 ``WorkspaceIO`` 在执行环境内运行——cloud 走容器、local 走
+用户本地执行器、ssh 走远端主机；服务端本身始终在后端进程内，三种模式下
+协议一致，差异只在背后的 WorkspaceIO。
 
-注意：本 server 不依赖 mcp SDK / fastmcp，直接通过 JSON-RPC over stdio 通信，
-避免项目内 anyio 版本兼容性问题。
+本模块不再提供 stdio 入口，也不再自行实现 JSON-RPC 帧解析。
 """
 
 import base64
 import json
 import logging
-import os
-import sys
 import textwrap
-import traceback
+from typing import Any, Dict, List
 
-# 确保 server 目录在 sys.path 中，便于导入 core
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from mcp.server.lowlevel import Server
 
-from io_.docker_manager import DockerManager  # noqa: E402
-from io_.workspace_io import CloudWorkspaceIO, WorkspaceIO, run_io  # noqa: E402
-from prompt import versions  # noqa: E402
+from io_.workspace_io import WorkspaceIO, run_io
+from mcp_tools.inproc_server import build_inproc_server
+from prompt import versions
 
 logger = logging.getLogger(__name__)
-
-# MCP 协议版本
-_PROTOCOL_VERSION = "2024-11-05"
 
 
 def _tool_description(name: str, baseline: str) -> str:
     """取**激活版本**的工具描述；无法解析时回退到内联基线（v1.0.0 文本）。
 
-    document_server 可作为后端进程（local/ssh 进程内）或云端 stdio 子进程运行，
-    二者均有配置文件读取路径；此处兜底保证在缺少配置的裸沙箱中不至于使整个
-    文档服务崩溃。
+    服务端在后端进程内构建（内存流传输），配置文件读取路径可用；此处兜底
+    保证在缺少配置的环境下不至于使整个文档服务崩溃。
     """
     try:
         return versions.active_tool_description(name)
@@ -288,18 +282,16 @@ TOOLS = [
 
 
 def _handle_tool_call(name: str, arguments: dict, workspace_id: str, io: WorkspaceIO) -> str:
-    """执行工具调用并返回 MCP CallToolResult 的 JSON 字符串。"""
+    """执行工具调用并返回业务结果 JSON 字符串。
+
+    MCP 结果封装（CallToolResult 与 ``isError``）由适配层
+    （``mcp_tools.inproc_server.to_call_tool_result``）统一完成，本函数只负责
+    业务分发，异常也归一为 ``success=false`` 的业务结果。
+    """
     try:
-        result_text = _execute_tool(name, arguments, workspace_id, io)
-        return json.dumps({
-            "content": [{"type": "text", "text": result_text}],
-            "isError": False,
-        })
+        return _execute_tool(name, arguments, workspace_id, io)
     except Exception as e:
-        return json.dumps({
-            "content": [{"type": "text", "text": json.dumps({"success": False, "error": str(e)})}],
-            "isError": True,
-        })
+        return json.dumps({"success": False, "error": str(e)})
 
 
 # ── PDF 读取（中文支持 / 目录 / 按章节阅读） ──────────────────────────
@@ -696,107 +688,18 @@ def _execute_tool(name: str, arguments: dict, workspace_id: str, io: WorkspaceIO
         return json.dumps({"success": False, "error": f"未知工具: {name}"})
 
 
-def _handle_request(request: dict, workspace_id: str, io: WorkspaceIO) -> str:
-    """处理单个 JSON-RPC 请求，返回 JSON-RPC 响应字符串。"""
-    req_id = request.get("id")
-    method = request.get("method", "")
-    params = request.get("params", {}) or {}
+def build_server(workspace_id: str, io: WorkspaceIO) -> Server:
+    """构建文档处理服务的进程内 MCP server。
 
-    if method == "initialize":
-        return json.dumps({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "protocolVersion": _PROTOCOL_VERSION,
-                "capabilities": {
-                    "tools": {},
-                },
-                "serverInfo": {
-                    "name": f"document-{workspace_id or 'default'}",
-                    "version": "1.0.0",
-                },
-            },
-        })
+    :param workspace_id: 工作空间标识（进入 serverInfo，并供工具定位文件）
+    :param io: 工作空间 IO（cloud/local/ssh 三模式差异的唯一来源）
+    """
 
-    elif method == "notifications/initialized":
-        # 不需要响应
-        return ""
+    def _dispatch(tool_name: str, arguments: Dict[str, Any]) -> str:
+        return _handle_tool_call(tool_name, arguments, workspace_id, io)
 
-    elif method == "tools/list":
-        return json.dumps({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "tools": TOOLS,
-            },
-        })
-
-    elif method == "tools/call":
-        name = params.get("name", "")
-        arguments = params.get("arguments", {}) or {}
-        result_text = _handle_tool_call(name, arguments, workspace_id, io)
-        # 返回结果已经包含 content
-        resp = json.loads(result_text)
-        return json.dumps({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": resp,
-        })
-
-    elif method == "ping":
-        return json.dumps({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {},
-        })
-
-    else:
-        return json.dumps({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "error": {"code": -32601, "message": f"Method not found: {method}"},
-        })
-
-
-def main() -> None:
-    """启动文档处理 MCP stdio server（直接 JSON-RPC over stdio）。"""
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
-    workspace_id = os.environ.get("WORKSPACE_ID", "")
-    docker_manager = DockerManager()
-    io: WorkspaceIO = CloudWorkspaceIO(docker_manager)
-
-    if not docker_manager.available:
-        logger.warning("Docker 不可用，文档处理服务将无法工作")
-
-    logger.info("启动文档处理 MCP server: document-%s", workspace_id or "default")
-
-    # 逐行读取 stdin 的 JSON-RPC 请求，处理后写入 stdout
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            request = json.loads(line)
-        except json.JSONDecodeError:
-            logger.error("无效的 JSON-RPC 请求: %s", line[:200])
-            continue
-
-        try:
-            response = _handle_request(request, workspace_id, io)
-            if response:
-                sys.stdout.write(response + "\n")
-                sys.stdout.flush()
-        except Exception as e:
-            logger.error("处理请求失败: %s", e)
-            traceback.print_exc()
-            error_resp = json.dumps({
-                "jsonrpc": "2.0",
-                "id": request.get("id"),
-                "error": {"code": -32603, "message": str(e)},
-            })
-            sys.stdout.write(error_resp + "\n")
-            sys.stdout.flush()
-
-
-if __name__ == "__main__":
-    main()
+    return build_inproc_server(
+        name=f"document-{workspace_id or 'default'}",
+        tool_specs=TOOLS,
+        dispatch=_dispatch,
+    )

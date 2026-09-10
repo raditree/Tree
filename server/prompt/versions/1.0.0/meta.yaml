@@ -29,3 +29,8 @@ changelog:
     changes:
       - "内置 read/write/edit 工具描述与参数说明明确 file_path 必须为工作空间内相对路径、禁止绝对路径或盘符（如 E:\\foo.dart / E:/foo.dart）；非法路径错误提示补充修复引导，便于模型自纠。"
       - "edit 工具新增 CRLF 自动容错：文件为 CRLF 时 old_text/new_text 自动按 CRLF 归一后匹配与写回（LLM 传参通常为 LF），无需手动转换文件换行；描述同步标注。"
+  - version: "1.0.0"
+    date: "2026-09-10"
+    scope: "tool"
+    changes:
+      - "MCP 语义对齐：内置服务（workspace/document）的工具在会话创建时经 tools/list 发现并按 mcp__<服务名>__<工具名> 命名空间直接注入可用工具列表，可直接调用；mcp 工具收敛为外部服务/未注入工具的发现（help）与兜底调用（call）；同步刷新 mcp 工具描述与 tool-routing 路由表。"

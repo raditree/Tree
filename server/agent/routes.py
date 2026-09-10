@@ -924,6 +924,8 @@ class RegisterMcpServiceRequest(BaseModel):
     name: str
     command: str
     args: List[str] = []
+    scope: str = ""
+    env: Dict[str, str] = {}
 
 
 @router.get("/mcp/services")
@@ -932,9 +934,9 @@ async def list_mcp_services(
 ) -> Dict[str, Any]:
     """列出已注册的外部 MCP 服务（含内置服务标记）。
 
-    外部服务来自 SQLite ``mcp_services`` 表（REST 注册，权威持久化）；
-    内置服务（workspace / document / embed_search）在会话构建时由
-    ``register_builtin_tools`` 注册，此处仅列出外部配置。
+    外部服务来自 SQLite ``mcp_services`` 表（REST 注册，权威持久化），
+    每项含 scope / env / needs_confirmation；内置服务（workspace / document）
+    在会话构建时由 ``register_builtin_tools`` 注册，此处仅列出外部配置。
     """
     from data.mcp_service_store import list_services
 
@@ -947,7 +949,6 @@ async def list_mcp_services(
     builtin = {
         "workspace": "工作空间基础工具（read/write/edit/terminal/embed_search）",
         "document": "文档处理服务（PDF/PPTX/DOCX/XLSX）",
-        "embed_search": "embed 向量搜索服务",
     }
     for svc in services:
         svc["builtin"] = False
@@ -970,13 +971,16 @@ async def register_mcp_service(
 ) -> Dict[str, Any]:
     """注册一个外部 MCP 服务（stdio 外接），持久化到 SQLite。
 
-    安全校验（spec「MCP services CRUD 安全红线」）：命令白名单/绝对路径、
-    禁 shell 元字符、禁危险参数，防止注册任意命令导致 RCE。
+    安全校验（spec「MCP services CRUD」）：底线形态过滤（禁 shell 解释器、
+    禁 shell 元字符与内联执行参数），非可信启动器由前端首次确认后启动。
+    ``scope`` / ``env`` 原样透传并持久化（env 值不写入日志）。
     """
     from data.mcp_service_store import register_service
 
     try:
-        record = register_service(req.name, req.command, req.args)
+        record = register_service(
+            req.name, req.command, req.args, scope=req.scope, env=req.env
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"success": True, "service": record}

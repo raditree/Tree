@@ -129,21 +129,55 @@ class TestSessionCacheLRU(unittest.TestCase):
                 sc._sessions.clear()
 
 
+class TestMcpServiceScope(unittest.TestCase):
+    """第三方 MCP 服务的执行落点判定（local / ssh 隧道 vs 后端直连）。"""
+
+    def test_scope_server_always_backend(self):
+        from tool import _resolve_service_host
+
+        for mode in ("cloud", "local", "ssh"):
+            self.assertEqual(_resolve_service_host("server", mode), "server")
+
+    def test_scope_unspecified_follows_mode(self):
+        from tool import _resolve_service_host
+
+        self.assertEqual(_resolve_service_host("", "cloud"), "server")
+        self.assertEqual(_resolve_service_host("", "local"), "tunnel")
+        self.assertEqual(_resolve_service_host("", "ssh"), "tunnel")
+
+    def test_scope_must_match_current_mode(self):
+        from tool import _resolve_service_host
+
+        self.assertEqual(_resolve_service_host("local", "local"), "tunnel")
+        self.assertEqual(_resolve_service_host("ssh", "ssh"), "tunnel")
+        self.assertIsNone(_resolve_service_host("ssh", "local"))
+        self.assertIsNone(_resolve_service_host("local", "cloud"))
+
+    def test_build_tunnel_requires_local_or_ssh_with_deps(self):
+        from tool import _build_mcp_tunnel
+
+        self.assertIsNone(_build_mcp_tunnel("cloud", "u1", "t1", None, None))
+        self.assertIsNone(_build_mcp_tunnel("local", "u1", "t1", None, None))
+        tunnel = _build_mcp_tunnel("ssh", "u1", "t1", None, None)
+        # state 在单测环境未装配执行器 → 无隧道可用
+        self.assertIsNone(tunnel)
+
+
 class TestMcpPromptChapter(unittest.TestCase):
     def _fake_manager(self):
         mgr = MagicMock()
         mgr.list_services.return_value = ["workspace", "external"]
         mgr.services = {
             "workspace": {
-                "handler": lambda *a: None,
-                "tool_defs": [
-                    {"function": {"name": "read_file", "description": "读取"}},
-                    {"function": {"name": "write_file", "description": "写入"}},
+                "server_factory": lambda: None,
+                "tools": [
+                    {"name": "embed_search",
+                     "mcp_name": "mcp__workspace__embed_search",
+                     "description": "检索"},
                 ],
-                "tools": [],
             },
             "external": {
-                "handler": None,
+                "server_factory": None,
                 "command": "npx",
                 "args": [],
                 "env": {},
@@ -157,8 +191,7 @@ class TestMcpPromptChapter(unittest.TestCase):
 
         text = _build_mcp_tools_text(self._fake_manager())
         self.assertIn("workspace", text)
-        self.assertIn("read_file", text)
-        self.assertIn("write_file", text)
+        self.assertIn("mcp__workspace__embed_search", text)
         # stdio 服务：只列服务名 + mcp help 提示，不展开
         self.assertIn("external", text)
         self.assertIn("mcp", text)
@@ -170,6 +203,17 @@ class TestMcpPromptChapter(unittest.TestCase):
         mgr = MagicMock()
         mgr.list_services.return_value = []
         self.assertEqual(_build_mcp_tools_text(mgr), "")
+
+    def test_build_mcp_tools_text_annotates_tunnel_host(self):
+        from agent.chat import _build_mcp_tools_text
+
+        mgr = self._fake_manager()
+        mgr.services["external"]["tunnel"] = MagicMock(mode="ssh")
+        text = _build_mcp_tools_text(mgr)
+        self.assertIn("远端主机执行", text)
+
+        mgr.services["external"]["tunnel"] = MagicMock(mode="local")
+        self.assertIn("本机执行", _build_mcp_tools_text(mgr))
 
     def test_system_prompt_injects_chapter(self):
         from agent.chat import _build_agent_system_prompt

@@ -195,10 +195,11 @@ class TestMcpServiceStore(unittest.TestCase):
         err = validate_service_config("evil", "npx", [";rm -rf /"])
         self.assertIsNotNone(err)
 
-    def test_validate_rejects_unknown_command(self):
+    def test_validate_allows_non_allowlisted_command(self):
+        # 「MCP 语义修正」后不再枚举可执行名：非可信启动器允许注册
+        # （仅需底线形态合法），是否确认交由 needs_user_confirmation。
         from data.mcp_service_store import validate_service_config
-        err = validate_service_config("svc", "some-random-cmd", [])
-        self.assertIsNotNone(err)
+        self.assertIsNone(validate_service_config("svc", "some-random-cmd", []))
 
     def test_validate_rejects_dangerous_arg(self):
         from data.mcp_service_store import validate_service_config

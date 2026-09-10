@@ -6,8 +6,11 @@
   - 不调用 docker remove_workspace / create_workspace（不重建工作区）
   - 不调用 clear_user_agent / clear_context（不清空上下文）
   - roster 视图与 team_members 表照常同步
-  - 其他字段（scores/comment/model_id）保留
-- 返回值不再包含 rebirth 字段
+  - 未变更字段（scores/comment/model_id）不被覆盖写入
+- 返回值不再包含 rebirth 字段，且回显 leader 维护字段
+
+注：成员名单权威源已是 team_members 表，读取类动作实时查库，故本测试
+以 get_members 为数据源，断言写入 team_store 的字段而非内存副本。
 """
 
 import sys
@@ -20,6 +23,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config.models import ModelConfig  # noqa: E402
 from llm.llm import AgentLLMSession  # noqa: E402
 from tool.team_tool import TeamTool  # noqa: E402
+
+MEMBER_ROW = {
+    "id": "m1",
+    "name": "旧名",
+    "role": "",
+    "duty": "",
+    "model_id": "m",
+    "level": 1,
+    "workspace_id": "m1",
+    "parent_agent_id": "top1",
+    "team_id": "top1",
+    "created_at": 1767225600000,
+    "work_status": "idle",
+    "can_lead_team": True,
+    "system_prompt": "",
+    "scores": {"quality": 8.0, "efficiency": 7.0,
+               "collaboration": 9.0, "accuracy": 6.0},
+    "comment": "表现良好",
+}
 
 
 def _make_tool():
@@ -43,27 +65,12 @@ def _make_tool():
             leader_id="",
             team_id="top1",
         )
-    tool.members = [{
-        "id": "m1",
-        "name": "旧名",
-        "role": "",
-        "duty": "",
-        "model_id": "m",
-        "level": 1,
-        "workspace_id": "m1",
-        "parent_agent_id": "top1",
-        "created_at": "2026-01-01 00:00:00",
-        "work_status": "idle",
-        "current_task": "",
-        "can_lead_team": True,
-        "system_prompt": "",
-        "scores": {"quality": 8.0, "efficiency": 7.0,
-                   "collaboration": 9.0, "accuracy": 6.0},
-        "comment": "表现良好",
-        "task_ids": [],
-        "message_history": [],
-    }]
     return tool
+
+
+def _patch_members():
+    return patch("data.team_store.get_members",
+                 side_effect=lambda *a, **k: [dict(MEMBER_ROW)])
 
 
 class TestUpdateMemberPreservesInfo(unittest.TestCase):
@@ -71,8 +78,7 @@ class TestUpdateMemberPreservesInfo(unittest.TestCase):
         """改 name/system_prompt：不重建工作区、不清空上下文、不重生。"""
         tool = _make_tool()
         with patch("data.team_store.update_member") as upd, \
-             patch("data.team_store.get_members",
-                   return_value=[dict(tool.members[0])]), \
+             _patch_members(), \
              patch.object(tool, "_save_roster") as save_roster, \
              patch.object(tool, "_push_roster_update", return_value=0):
             result = tool._action_update_member({
@@ -86,16 +92,19 @@ class TestUpdateMemberPreservesInfo(unittest.TestCase):
         # 关键：不触发工作区重建 / 上下文清空
         tool.docker_manager.remove_workspace.assert_not_called()
         tool.docker_manager.create_workspace.assert_not_called()
-        # 信息保留：其他字段不变
-        m = tool.members[0]
+        # 信息保留：未变更字段不被覆盖，回显更新后的值
+        m = result["member"]
         self.assertEqual(m["name"], "新角色名")
         self.assertEqual(m["system_prompt"], "新的职责说明")
         self.assertEqual(m["scores"]["quality"], 8.0)
         self.assertEqual(m["comment"], "表现良好")
         self.assertEqual(m["model_id"], "m")
-        # roster 与 team_store 照常同步
-        save_roster.assert_called_once()
+        # 只同步实际变更列（name/system_prompt）
         upd.assert_called_once()
+        kwargs = upd.call_args.kwargs
+        self.assertEqual(set(kwargs), {"name", "system_prompt"})
+        # roster 照常同步
+        save_roster.assert_called_once()
         # 返回结构不再含 rebirth
         self.assertNotIn("rebirth", result)
 
@@ -103,8 +112,7 @@ class TestUpdateMemberPreservesInfo(unittest.TestCase):
         """只改评分/评价：与既有行为一致，信息保留。"""
         tool = _make_tool()
         with patch("data.team_store.update_member") as upd, \
-             patch("data.team_store.get_members",
-                   return_value=[dict(tool.members[0])]), \
+             _patch_members(), \
              patch.object(tool, "_save_roster"), \
              patch.object(tool, "_push_roster_update", return_value=0):
             result = tool._action_update_member({
@@ -116,6 +124,11 @@ class TestUpdateMemberPreservesInfo(unittest.TestCase):
         self.assertEqual(result["member"]["comment"], "更好了")
         tool.docker_manager.remove_workspace.assert_not_called()
         upd.assert_called_once()
+        kwargs = upd.call_args.kwargs
+        self.assertEqual(kwargs["comment"], "更好了")
+        self.assertEqual(kwargs["scores"]["quality"], 9.5)
+        # 未提供的评分维度保留原值
+        self.assertEqual(kwargs["scores"]["efficiency"], 7.0)
 
     def test_update_member_rejects_work_status(self):
         """work_status 仍为只读（状态治理不变）。"""

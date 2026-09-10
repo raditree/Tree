@@ -138,7 +138,7 @@ class WorkspaceIO(ABC):
     async def list_files(
         self, workspace_id: str, path: str = ""
     ) -> Dict[str, Any]:
-        """列出工作空间内指定目录的文件（供 team 工具 view_member_output 使用）。
+        """列出工作空间内指定目录的文件（通用目录列举能力）。
 
         :param workspace_id: 工作空间标识
         :param path: 相对工作空间根的目录路径，空串表示根目录

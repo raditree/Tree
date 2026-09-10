@@ -1,63 +1,61 @@
-"""MCP stdio server - 将工作空间搜索工具以 MCP 形式暴露。
+"""MCP 工作空间服务——把工作空间级检索能力以 MCP 形式暴露。
 
-通过环境变量 ``WORKSPACE_ID`` 绑定到指定 agent 的 Docker 工作空间，
-供后端 MCPManager 以 stdio 方式连接、列出并调用。
-read / write / edit / terminal 已改为内置工具（不经 MCP），
-本服务仅保留 embed_search。
+以「进程内 MCP server」形式提供：``build_server`` 构造标准 MCP server，
+后端以内存流对接 ClientSession（见 ``mcp_tools.inproc_server``）。检索经
+``WorkspaceIO`` 在执行环境内进行——cloud 走容器、local 走用户本地执行器、
+ssh 走远端主机；服务端本身始终在后端进程内。
+
+read / write / edit / terminal 是内置工具，不经 MCP 暴露；本服务仅保留
+embed_search。
 """
 
-import asyncio
 import json
 import logging
-import os
-import sys
+from typing import Any, Dict, List
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.lowlevel import Server
 
-# 确保 server 目录在 sys.path 中，便于导入 core / mcp_tools
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from io_.docker_manager import DockerManager  # noqa: E402
-from io_.workspace_io import CloudWorkspaceIO  # noqa: E402
-from mcp_tools.embed_search_tool import EmbedSearchTool  # noqa: E402
+from io_.workspace_io import WorkspaceIO
+from mcp_tools.embed_search_tool import EmbedSearchTool
+from mcp_tools.inproc_server import build_inproc_server
 
 logger = logging.getLogger(__name__)
 
+_EMPTY_SCHEMA: Dict[str, Any] = {"type": "object", "properties": {}}
 
-def _build_server() -> MCPServer:
-    """构建暴露工作空间基础工具的 MCP server。"""
-    workspace_id = os.environ.get("WORKSPACE_ID", "")
-    docker_manager = DockerManager()
-    io = CloudWorkspaceIO(docker_manager)
 
+def _tool_specs() -> List[Dict[str, Any]]:
+    """把 EmbedSearchTool 的工具定义转成 MCP 工具规格（含参数 schema）。"""
+    definition = EmbedSearchTool(None, "").get_tool_definition()
+    fn = definition.get("function", definition) or definition
+    return [
+        {
+            "name": fn.get("name", ""),
+            "description": fn.get("description", ""),
+            "inputSchema": fn.get("parameters")
+            or fn.get("inputSchema")
+            or _EMPTY_SCHEMA,
+        }
+    ]
+
+
+def build_server(workspace_id: str, io: WorkspaceIO) -> Server:
+    """构建工作空间服务的进程内 MCP server。
+
+    :param workspace_id: 工作空间标识（进入 serverInfo）
+    :param io: 工作空间 IO（cloud/local/ssh 三模式差异的唯一来源）
+    """
     embed_tool = EmbedSearchTool(io, workspace_id)
 
-    server = MCPServer(
+    def _dispatch(tool_name: str, arguments: Dict[str, Any]) -> str:
+        if tool_name == "embed_search":
+            return json.dumps(embed_tool.execute(arguments), ensure_ascii=False)
+        return json.dumps(
+            {"success": False, "error": f"未知工具: {tool_name}"}, ensure_ascii=False
+        )
+
+    return build_inproc_server(
         name=f"workspace-{workspace_id or 'default'}",
-        version="1.0.0",
+        tool_specs=_tool_specs(),
+        dispatch=_dispatch,
     )
-
-    def _dump(result: dict) -> str:
-        return json.dumps(result, ensure_ascii=False)
-
-    def _embed_search(query: str, top_k: int = 5) -> str:
-        return _dump(embed_tool.execute({"query": query, "top_k": top_k}))
-
-    server.add_tool(
-        _embed_search,
-        name="embed_search",
-        description="在工作空间内搜索文本（当前为 grep 实现）",
-    )
-    return server
-
-
-def main() -> None:
-    """启动 MCP stdio server。"""
-    logging.basicConfig(level=logging.INFO)
-    server = _build_server()
-    logger.info("启动 MCP server: %s", server.name)
-    asyncio.run(server.run_stdio_async())
-
-
-if __name__ == "__main__":
-    main()

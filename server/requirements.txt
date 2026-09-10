@@ -6,6 +6,9 @@ pyyaml>=6.0
 PyJWT>=2.8.0
 httpx>=0.24.0
 mcp>=0.1.0
+# mcp 包要求 anyio>=4.5：anyio 3.7.x 会让 ClientSession.initialize() 抛
+# TypeError: 'function' object is not subscriptable
+anyio>=4.5
 python-multipart>=0.0.6
 PyMuPDF>=1.28.2
 python-pptx>=1.0.0

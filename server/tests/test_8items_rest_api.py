@@ -60,8 +60,13 @@ class RestApiBase(unittest.TestCase):
 
     def setUp(self):
         self._tmp = Path(tempfile.mkdtemp(prefix="trae_rest_"))
-        # 记录原始 DB 路径，tearDown 恢复，避免污染其他测试文件
+        # 记录原始全局状态，恢复动作注册为 addCleanup：setUp 中途抛错（例如
+        # TestClient 依赖不兼容）时 tearDown 不会执行，只靠 tearDown 会把 DB
+        # 重定向泄漏给后续用例（表现为 no such table: auth_tokens），
+        # addCleanup 在 setUp 失败时仍会执行。
         self._orig_db = {m: m._DB_PATH for m in self._REDIRECT_MODS}
+        self._orig_model_configs = state.model_configs
+        self.addCleanup(self._restore_globals)
         _redirect_db(self._tmp)
         state.model_configs = {
             "flash": ModelConfig(
@@ -77,10 +82,12 @@ class RestApiBase(unittest.TestCase):
         app.dependency_overrides[get_current_user] = lambda: dict(USER)
         self.client = TestClient(app)
 
-    def tearDown(self):
+    def _restore_globals(self):
+        """恢复 DB 重定向与 state.model_configs（addCleanup，幂等）。"""
         for m in self._REDIRECT_MODS:
             m._DB_PATH = self._orig_db[m]
             m._initialized = False
+        state.model_configs = self._orig_model_configs
         shutil.rmtree(self._tmp, ignore_errors=True)
 
 
@@ -143,7 +150,6 @@ class TestMcpServicesApi(RestApiBase):
         names = {s["name"] for s in r.json()["services"]}
         self.assertIn("workspace", names)
         self.assertIn("document", names)
-        self.assertIn("embed_search", names)
 
     def test_register_list_delete_roundtrip(self):
         r = self.client.post(
@@ -380,13 +386,19 @@ class TestTeamMemberSessionIsolation(unittest.TestCase):
     3. _dispatch_roster_event 广播 payload 同样带 session_id。
     """
 
-    def _make_tool(self, session_id: str = "sess-m"):
-        """构造带指定 session_id 的 TeamTool（依赖为占位，仅测投递 payload）。"""
-        from tool.team_tool import TeamTool
+    def _make_tool(self, session_id: str = "sess-m", tool_cls=None):
+        """构造带指定 session_id 的工具实例（依赖为占位，仅测投递 payload）。
+
+        ``tool_cls`` 默认 TeamTool（管理域）；通信域用例传 MessageTool。
+        """
+        from tool.message_tool import MessageTool
+
+        if tool_cls is None:
+            tool_cls = MessageTool
 
         session = MagicMock()
         session.workspace_id = "ws-m"
-        tool = TeamTool(
+        tool = tool_cls(
             session=session,
             docker_manager=None,
             model_configs={},
@@ -400,6 +412,7 @@ class TestTeamMemberSessionIsolation(unittest.TestCase):
         tool.members = [{
             "id": "mem-1", "workspace_id": "ws-m", "model_id": "m1",
             "system_prompt": "", "name": "成员一", "role": "执行",
+            "duty": "落地实现", "parent_agent_id": "leader-1", "level": 1,
         }]
         return tool
 
@@ -483,7 +496,7 @@ class TestQueueInjectionSessionIsolation(unittest.TestCase):
 
         async def _fake_stream(user_id, agent_id, workspace_id, session,
                                content, on_tool_turn=None, cancel_event=None,
-                               session_id=None):
+                               session_id=None, team_id=None):
             # 模拟 tool_call 间隙：先尝试切入（此刻队列头是其他会话消息，
             # 应被跳过放回），再尝试切入（当前会话消息可被取出）
             first = on_tool_turn()
@@ -546,7 +559,7 @@ class TestQueueInjectionSessionIsolation(unittest.TestCase):
 
         async def _fake_stream(user_id, agent_id, workspace_id, session,
                                content, on_tool_turn=None, cancel_event=None,
-                               session_id=None):
+                               session_id=None, team_id=None):
             injected.append(on_tool_turn())
             return ("ok", "ok", None)
 

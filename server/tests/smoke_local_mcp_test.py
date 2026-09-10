@@ -1,84 +1,68 @@
-"""临时单测：验证本地模式下 MCPManager 进程内 handler 能列出并调用 read/terminal 工具。"""
+"""临时冒烟测试：验证内置服务经标准 MCP（SDK 内存流）暴露与调用。
+
+覆盖 cloud / local / ssh 三模式共用的注册形态（``server_factory``）：
+工具发现（tools/list）与工具调用（tools/call）都走真实 MCP 协议，差异只在
+背后的 WorkspaceIO；这里用 StubIO 代替真实执行环境。
+"""
+import json
 import os
 import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from tool.mcp_tool import MCPManager
+from tool.mcp_tool import MCPManager, namespaced_tool_name
 
 
-class FakeLocalExecutor:
-    def is_local(self, user_id: str) -> bool:
-        return True
+class StubIO:
+    """最小 WorkspaceIO 桩：只实现文档脚本执行所需的 exec_argv。"""
 
-
-def build_io(executor):
-    # 最小化 LocalWorkspaceIO 桩：直接返回结果
-    class StubIO:
-        def __init__(self, e):
-            self.e = e
-
-        def read_file(self, workspace_id, path, encoding="utf-8"):
-            return {"content": "hello from stub", "file_path": path}
-
-        def exec_shell(self, workspace_id, command, timeout=30):
-            return {"exit_code": 0, "stdout": "stub-out", "stderr": ""}
-
-    return StubIO(executor)
+    async def exec_argv(self, workspace_id, argv, timeout=30):
+        # 文档工具的工作空间脚本以 print(json) 回传结果，这里直接回一个成功 JSON
+        return {
+            "exit_code": 0,
+            "stdout": json.dumps({"success": True, "stub": True}),
+            "stderr": "",
+            "error": None,
+        }
 
 
 def main() -> None:
-    from tool import _build_in_process_handler, _get_workspace_tool_defs
-    from tool import _build_document_in_process_handler, _get_document_tool_defs
+    from mcp_tools import document_server
 
-    executor = FakeLocalExecutor()
-    io = build_io(executor)
-
+    io = StubIO()
     mgr = MCPManager()
     mgr.register_service(
-        "workspace",
-        {
-            "handler": _build_in_process_handler("top", io),
-            "tool_defs": _get_workspace_tool_defs(),
-        },
-    )
-    mgr.register_service(
         "document",
-        {
-            "handler": _build_document_in_process_handler("top", io),
-            "tool_defs": _get_document_tool_defs(),
-        },
+        {"server_factory": lambda: document_server.build_server("top", io)},
     )
 
+    # 发现：经 initialize + tools/list
     tools = mgr.get_tools(force=True)
     names = [t["name"] for t in tools]
     print("tools:", names)
-    assert "read" in names, names
-    assert "terminal" in names, names
     assert "read_pdf" in names, names
-    # 校验每个工具都有 name/description/parameters
     for t in tools:
         assert t["name"], t
-        assert t["description"], t
-        assert isinstance(t["parameters"], dict), t
+        assert t["parameters"] is not None, t
+        assert t["mcp_name"] == namespaced_tool_name("document", t["name"]), t
 
-    # 调用 read（进程内 handler 分发）
-    res = mgr.call_tool("read", {"file_path": "test.txt"})
-    print("call read:", res)
-    assert res.get("content") == "hello from stub", res
+    # 调用：模型注入路径（命名空间名）
+    res = mgr.call_tool("mcp__document__read_pdf", {"file_path": "test.pdf"})
+    print("call namespaced:", res)
+    assert res.get("service") == "document", res
     assert "error" not in res, res
+    assert '"success": true' in res.get("content", ""), res
+    assert res.get("isError") is False, res
 
-    res2 = mgr.call_tool("terminal", {"command": "echo hi"})
-    print("call terminal:", res2)
-    assert res2.get("stdout") == "stub-out", res2
-    assert "error" not in res2, res2
+    # 调用：mcp 工具 call 兜底路径（裸工具名）
+    res2 = mgr.call_tool("read_pdf", {"file_path": "test.pdf"})
+    assert res2.get("service") == "document", res2
 
-    # 未知工具应报错
-    res3 = mgr.call_tool("no_such", {})
-    print("call unknown:", res3)
-    assert "error" in res3, res3
+    # 未知工具 / 未知服务应返回错误而非抛异常
+    assert "error" in mgr.call_tool("no_such", {}), "未知工具应报错"
+    assert "error" in mgr.call_tool("mcp__no_such_svc__t", {}), "未知服务应报错"
 
-    print("LOCAL MCP HANDLER TEST PASSED")
+    print("STANDARD MCP (IN-PROC MEMORY STREAM) SMOKE TEST PASSED")
 
 
 if __name__ == "__main__":

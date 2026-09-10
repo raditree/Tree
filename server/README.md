@@ -50,7 +50,9 @@ server/
 │   ├── read_tool.py / write_tool.py / edit_tool.py   # 文件读写与替换
 │   ├── terminal_tool.py    # terminal：命令执行 + hook 后台长任务
 │   ├── mcp_tool.py         # mcp：外部 MCP 能力
-│   ├── team_tool.py        # team：成员/消息/任务管理
+│   ├── team_base.py        # team/message 公共基类（名单/寻址/投递/状态）
+│   ├── team_tool.py        # team：团队/成员/模型管理（7 个 action）
+│   ├── message_tool.py     # message：send_message/broadcast/wait_for 等通信
 │   ├── ask_question_tool.py# ask_user_question：持久化异步提问
 │   ├── spec_tool.py / todo_tool.py
 │   └── hook_manager.py     # 后台任务管理器（hook 模式）

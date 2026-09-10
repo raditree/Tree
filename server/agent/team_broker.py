@@ -1,6 +1,6 @@
 """团队成员消息投递器。
 
-leader 通过 ``team send_message`` / ``assign_task`` 给成员投递消息时，
+leader 通过 ``message send_message`` / ``message broadcast`` 给成员投递消息时，
 本模块负责把消息异步投递到对应成员的消息队列，并由每个成员独立的
 后台 worker 串行消费处理。
 

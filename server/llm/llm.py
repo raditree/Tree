@@ -21,6 +21,15 @@ logger = logging.getLogger(__name__)
 _ASK_PAUSED_KEY = "__ask_paused__"
 
 
+def _result_timestamp_footer() -> str:
+    """工具结果统一时间脚注（服务器本地时间，带日期）。
+
+    每次工具调用结果都带上返回时间，便于模型判断成员产出/状态的时间是否
+    合理（例如活动日志时间、query_status、消息投递结果）。
+    """
+    return f"\n\n---\n结果返回时间：{time.strftime('%Y-%m-%d %H:%M:%S')}（服务器本地时间）"
+
+
 class _AskPaused(Exception):
     """发出"已向用户提问、本轮应暂停等待作答"的信号。
 
@@ -1024,7 +1033,7 @@ class AgentLLMSession:
                             "role": "tool",
                             "tool_call_id": tc["id"],
                             "content": (
-                                f"等待用户回答..."
+                                "等待用户回答..." + _result_timestamp_footer()
                             ),
                         })
                         raise _AskPaused(str(result.get("qid", "")))
@@ -1036,12 +1045,14 @@ class AgentLLMSession:
                     result_str = self._maybe_redirect_result(
                         tc["name"], result_str
                     )
+                    result_ts = time.strftime("%Y-%m-%d %H:%M:%S")
 
                     yield {
                         "type": "tool_call",
                         "name": tc["name"],
                         "arguments": args,
                         "result": result_str,
+                        "timestamp": result_ts,
                     }
 
                     # 将工具结果添加到上下文（含图像时按模型视觉能力构造 content）
@@ -1076,6 +1087,13 @@ class AgentLLMSession:
                             f"当前 selected spec（selected spec）：\n"
                             f"{current_spec_text}\n\n"
                             f"{base_content}"
+                        )
+                    # 统一追加结果返回时间（异常/未找到工具同样覆盖，因为这些
+                    # 路径与正常结果共用本装配点），供模型判断产出时间合理性
+                    if isinstance(base_content, str):
+                        base_content = (
+                            base_content
+                            + f"\n\n---\n结果返回时间：{result_ts}（服务器本地时间）"
                         )
                     self.context.append({
                         "role": "tool",

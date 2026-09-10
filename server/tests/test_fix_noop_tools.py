@@ -288,7 +288,7 @@ class TestMemberReplyFallbackPushback(unittest.TestCase):
 
         async def _fake_stream(user_id, agent_id, workspace_id, session,
                                content, on_tool_turn=None, cancel_event=None,
-                               session_id=None):
+                               session_id=None, team_id=None):
             return ("（本轮无文字输出，最后执行：[工具 terminal] 提交成功: abc123）",
                     "ok", None)
 

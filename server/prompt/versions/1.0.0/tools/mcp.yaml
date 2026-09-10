@@ -1,5 +1,5 @@
 # MCP 工具描述（v1.0.0，单一事实来源）
-# 文档工具（document_server；后端 _get_document_tool_defs 引用之）
+# 文档工具（document_server.build_server 引用的工具规格）
 # embed_search 分两分支：embed（已配置嵌入模型，向量语义搜索）/ grep（grep 降级）
 read_pdf:
   version: 2
