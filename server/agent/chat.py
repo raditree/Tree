@@ -1573,6 +1573,28 @@ def _append_activity_log(
         logger.warning("写入活动日志失败: %s", exc)
 
 
+async def _append_activity_log_async(
+    workspace_id: str, message: str,
+    user_id: str = "", mode_key: str = "",
+) -> None:
+    """事件循环线程内的 ``_append_activity_log`` 包装（经线程池执行）。
+
+    本地/SSH 模式下 ``_append_activity_log`` 内部经统一 IO 走反向 WS，
+    若在事件循环线程直接调用，会进入 :func:`run_io` 的"已有事件循环"分支：
+    以 ``pool.submit(asyncio.run, coro).result()`` 阻塞事件循环等待前端
+    响应，而请求下发与进度/响应接收都依赖这同一个被阻塞的事件循环 →
+    自死锁（前端收不到请求，后端等满 60s 判"疑似卡死"并自动停用执行器）。
+
+    ``async`` 调用方一律经本包装走线程池（与 ``_build_workspace_extra_info``
+    的既有约定一致）；同步调用方（工具线程 / 子进程主线程）继续直接调用
+    ``_append_activity_log``。
+    """
+    await asyncio.to_thread(
+        _append_activity_log, workspace_id, message,
+        user_id=user_id, mode_key=mode_key,
+    )
+
+
 def _new_seg_id(agent_id: str) -> str:
     """生成一条段（文本消息/工具卡片）的唯一 id。"""
     return f"{agent_id}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
@@ -1740,7 +1762,7 @@ async def _stream_agent_reply(
                 _close_text()
                 status = "paused"
                 if flush_buf and workspace_id:
-                    _append_activity_log(
+                    await _append_activity_log_async(
                         workspace_id, f"[{_clock_now()}] {flush_buf}",
                         user_id=user_id, mode_key=team_id or agent_id,
                     )
@@ -1806,7 +1828,7 @@ async def _stream_agent_reply(
                 if workspace_id:
                     flush_buf += content
                     if len(flush_buf) >= _ACTIVITY_FLUSH_CHARS:
-                        _append_activity_log(
+                        await _append_activity_log_async(
                             workspace_id, f"[{_clock_now()}] {flush_buf}",
                             user_id=user_id, mode_key=team_id or agent_id,
                         )
@@ -1821,7 +1843,7 @@ async def _stream_agent_reply(
                 # 记录最后一次工具调用摘要（结果截断，避免超长）
                 last_tool_text = f"[工具 {name}] {str(result)[:500]}"
                 if workspace_id:
-                    _append_activity_log(
+                    await _append_activity_log_async(
                         workspace_id,
                         f"[{_clock_now()}] [tool] {name} args="
                         f"{str(args)[:200]} -> {str(result)[:150]}",
@@ -1892,7 +1914,7 @@ async def _stream_agent_reply(
         # 结束未关闭的 thinking 段（msg_end + 持久化）
         _close_thinking()
         if flush_buf and workspace_id:
-            _append_activity_log(
+            await _append_activity_log_async(
                 workspace_id, f"[{_clock_now()}] {flush_buf}",
                 user_id=user_id, mode_key=team_id or agent_id,
             )
@@ -1957,7 +1979,7 @@ async def _process_member_message(
         except Exception as exc:  # noqa: BLE001
             logger.warning("成员空 model_id 回退 TOP 模型失败: %s", exc)
     if model_config is None:
-        _append_activity_log(
+        await _append_activity_log_async(
             workspace_id,
             f"[{_clock_now()}] [error] 成员模型不存在: {model_id!r}，"
             "消息未处理（leader 需先用 team update_member 为该成员设置 model_id）",
@@ -2066,7 +2088,7 @@ async def _process_member_message(
     # 并由中途插入的消息实时更新为"最后发送方"（见 _pick_incoming）。
     session.sender_id = sender_id
 
-    _append_activity_log(
+    await _append_activity_log_async(
         workspace_id,
         f"[{_clock_now()}] [start(成员)] 收到 leader 消息: {content[:120]}",
         user_id=user_id, mode_key=team_id or agent_id,
@@ -2144,7 +2166,7 @@ async def _process_member_message(
         if full_reply:
             _store_message(user_id, agent_id, "agent", full_reply,
                            session_id=session_id)
-        _append_activity_log(
+        await _append_activity_log_async(
             workspace_id, f"[{_clock_now()}] [done(成员)] 回复完成",
             user_id=user_id, mode_key=team_id or agent_id,
         )
@@ -2165,7 +2187,7 @@ async def _process_member_message(
                 logger.warning("成员回复回传 leader 失败: %s", exc)
     except Exception as exc:  # noqa: BLE001
         logger.exception("成员消息处理失败: %s", exc)
-        _append_activity_log(
+        await _append_activity_log_async(
             workspace_id, f"[{_clock_now()}] [error] 成员处理失败: {exc}",
             user_id=user_id, mode_key=team_id or agent_id,
         )
@@ -2869,7 +2891,7 @@ async def _handle_user_message(
 
         # 活动日志：记录本次对话开始，供 leader 判断是否卡死
         if workspace_id:
-            _append_activity_log(
+            await _append_activity_log_async(
                 workspace_id,
                 f"[{_clock_now()}] [start] 收到输入: {llm_content[:120]}",
                 user_id=user_id, mode_key=agent_id,
@@ -2925,25 +2947,25 @@ async def _handle_user_message(
 
         if stream_status == "cancelled":
             if workspace_id:
-                _append_activity_log(
+                await _append_activity_log_async(
                     workspace_id, f"[{_clock_now()}] [stopped] 已停止",
                     user_id=user_id, mode_key=agent_id,
                 )
         elif stream_status == "paused":
             if workspace_id:
-                _append_activity_log(
+                await _append_activity_log_async(
                     workspace_id, f"[{_clock_now()}] [wait] 已提问，等待用户回答",
                     user_id=user_id, mode_key=agent_id,
                 )
         elif stream_status == "error":
             if workspace_id:
-                _append_activity_log(
+                await _append_activity_log_async(
                     workspace_id, f"[{_clock_now()}] [error] LLM 请求失败: {full_reply}",
                     user_id=user_id, mode_key=agent_id,
                 )
         else:
             if workspace_id:
-                _append_activity_log(
+                await _append_activity_log_async(
                     workspace_id, f"[{_clock_now()}] [done] 回复完成",
                     user_id=user_id, mode_key=agent_id,
                 )
@@ -2965,7 +2987,7 @@ async def _handle_user_message(
         stream_status = "error"
         last_text_id = None
         if workspace_id:
-            _append_activity_log(
+            await _append_activity_log_async(
                 workspace_id, f"[{_clock_now()}] [error] LLM 请求失败: {exc}",
                 user_id=user_id, mode_key=agent_id,
             )

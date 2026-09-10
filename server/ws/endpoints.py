@@ -350,7 +350,9 @@ def register_ws(app: FastAPI) -> None:
                             },
                         )
                         continue
-                    state.local_executor.register(user_id, team_id, base_dir)
+                    state.local_executor.register(
+                        user_id, team_id, base_dir, connection_id
+                    )
                     # 记录到本连接：断连时等价 unregister，避免幽灵注册
                     conn_regs.append({"mode": "local", "team_id": team_id})
                     # 清除该 agent 的会话缓存：即使此前会话已绑定云端工具，
@@ -383,7 +385,23 @@ def register_ws(app: FastAPI) -> None:
                             },
                         )
                         continue
-                    state.local_executor.unregister(user_id, team_id)
+                    if not state.local_executor.unregister(
+                        user_id, team_id, connection_id
+                    ):
+                        # 该 team 的注册已归属同用户其他连接（另一实例已接管）：
+                        # 本连接的注销不影响它，也不得把 agents.mode 改成 cloud
+                        # （否则会静默关掉仍在生效的本地模式）。
+                        await state.ws_manager.send_message(
+                            user_id,
+                            {
+                                "type": "unregister_local_executor_ack",
+                                "data": {
+                                    "success": False,
+                                    "message": "该 agent 的本地执行器已由其他连接接管",
+                                },
+                            },
+                        )
+                        continue
                     # 该 team 的注册不再归属本连接（防重复清理）
                     conn_regs = [
                         r for r in conn_regs
@@ -451,7 +469,9 @@ def register_ws(app: FastAPI) -> None:
                         )
                         continue
                     # 登记到前端执行器客户端：SSH 模式工具调用经反向 WS 委托前端执行
-                    state.local_executor.register_ssh(user_id, team_id)
+                    state.local_executor.register_ssh(
+                        user_id, team_id, connection_id
+                    )
                     # 记录到本连接：断连时等价 unregister，避免幽灵注册
                     conn_regs.append({"mode": "ssh", "team_id": team_id})
                     # 清除会话缓存：下次发消息重建会话并按 SSH 模式绑定工具
@@ -497,8 +517,23 @@ def register_ws(app: FastAPI) -> None:
                             },
                         )
                         continue
+                    if not state.local_executor.unregister_ssh(
+                        user_id, team_id, connection_id
+                    ):
+                        # 同 local：注册已归属同用户其他连接，不得清掉 ssh_manager
+                        # 配置、也不得把 agents.mode 改成 cloud。
+                        await state.ws_manager.send_message(
+                            user_id,
+                            {
+                                "type": "unregister_ssh_executor_ack",
+                                "data": {
+                                    "success": False,
+                                    "message": "该 agent 的 SSH 执行器已由其他连接接管",
+                                },
+                            },
+                        )
+                        continue
                     state.ssh_manager.unregister(user_id, team_id)
-                    state.local_executor.unregister_ssh(user_id, team_id)
                     # 该 team 的注册不再归属本连接（防重复清理）
                     conn_regs = [
                         r for r in conn_regs
@@ -581,14 +616,24 @@ def register_ws(app: FastAPI) -> None:
             #    注意：此处只清运行时注册、**不写 agents.mode**——本地/SSH 是
             #    用户对该 agent 的持久化意图，瞬时断连不得把它静默改成 cloud
             #    （否则前端重连前的后台任务会悄悄改跑云端执行）。
+            #    归属校验：该 team 的注册已由同用户其他连接接管时跳过（见
+            #    LocalExecutorClient._owns_executor），不清掉生效中的注册。
             for reg in conn_regs:
                 try:
                     if reg["mode"] == "local":
-                        state.local_executor.unregister(user_id, reg["team_id"])
+                        cleared = state.local_executor.unregister(
+                            user_id, reg["team_id"], connection_id
+                        )
                     else:
                         if state.ssh_manager is not None:
                             state.ssh_manager.unregister(user_id, reg["team_id"])
-                        state.local_executor.unregister_ssh(user_id, reg["team_id"])
+                        cleared = state.local_executor.unregister_ssh(
+                            user_id, reg["team_id"], connection_id
+                        )
+                    if not cleared:
+                        # 该 team 的注册已归属其他连接（其他实例已接管）：
+                        # 本连接断连不影响它，也不需要通知前端"注册已丢失"。
+                        continue
                     logger.info(
                         "WS 断连清理执行器注册: user_id=%s team_id=%s mode=%s connection_id=%s",
                         user_id, reg["team_id"], reg["mode"], connection_id,

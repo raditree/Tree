@@ -93,6 +93,12 @@ class LocalExecutorClient:
         # user_id -> {team_id}（SSH 模式按顶部 agent 单独控制；
         # 仅记录"该顶部 agent 的工具调用应转发到前端 SSH 会话执行"）
         self._ssh_users: Dict[str, set] = {}
+        # (user_id, team_id) -> 注册该执行器的 WS connection_id（定向投递用）。
+        # 同用户可能并行开多个前端实例（每个实例一条 WS 连接），注册消息来自
+        # 哪条连接就把请求只投给哪条连接，其余实例收不到请求、不会用自身失败
+        # 结果抢先占位。空串表示注册时未提供连接（回归测试替身 / 历史调用），
+        # 投递回落为"按用户广播"以保证兼容。
+        self._exec_conn: Dict[Tuple[str, str], str] = {}
         # tool_id -> concurrent.futures.Future 待响应。
         # tool_id 全局唯一且自描述：request 生成的 id 形如
         # ``{user_id}:{team_id}:{uuid}``，hook 请求沿用外部传入的 tool_id。
@@ -164,16 +170,20 @@ class LocalExecutorClient:
         user_id: str,
         team_id: str,
         base_dir: Optional[str] = None,
+        connection_id: str = "",
     ) -> None:
         """注册某个顶部 agent 的本地执行器。
 
         :param user_id: 用户标识
         :param team_id: 顶部 agent ID（本地模式按顶部 agent 单独控制）
         :param base_dir: 用户为该顶部 agent 选择的本地工作目录（仅供记录，不参与路径映射）
+        :param connection_id: 发送注册消息的 WS 连接 id；非空时该 team 的
+            工具请求只投递给这条连接（见 :meth:`request`）
         """
         if not team_id:
             team_id = user_id
         self._users.setdefault(user_id, {})[team_id] = base_dir or ""
+        self._exec_conn[(user_id, team_id)] = connection_id
         # 重新注册视为执行器恢复：清零该 (user_id, team_id) 的连续超时计数，
         # 避免旧失败记录继续触发停用
         self._consecutive_timeouts.pop((user_id, team_id), None)
@@ -199,21 +209,30 @@ class LocalExecutorClient:
             if fut is not None and not fut.done():
                 fut.set_exception(RuntimeError(reason))
 
-    def unregister(self, user_id: str, team_id: str) -> None:
+    def unregister(
+        self, user_id: str, team_id: str, connection_id: str = ""
+    ) -> bool:
         """注销某个顶部 agent 的本地执行器，并使该 team 的待响应请求失败。
 
         :param user_id: 用户标识
         :param team_id: 顶部 agent ID
+        :param connection_id: 发起注销的 WS 连接 id；非空且该 team 的注册已归
+            属其他连接时拒绝（其他实例接管后，先注册实例断连不应清掉生效中的注册）
+        :return: 是否实际执行了注销（False = 归属校验拒绝，注册保持不变）
         """
         if not team_id:
             team_id = user_id
+        if not self._owns_executor(user_id, team_id, connection_id):
+            return False
         regs = self._users.get(user_id)
         if regs is not None:
             regs.pop(team_id, None)
             if not regs:
                 self._users.pop(user_id, None)
+        self._exec_conn.pop((user_id, team_id), None)
         self._fail_pending(user_id, team_id, "本地执行器已注销")
         logger.info("用户 %s 顶部 agent %s 已注销本地执行器", user_id, team_id)
+        return True
 
     def is_ssh(self, user_id: str, team_id: Optional[str] = None) -> bool:
         """当前用户/顶部 agent 是否已注册 SSH 前端执行器。
@@ -229,34 +248,84 @@ class LocalExecutorClient:
             return True
         return team_id in regs
 
-    def register_ssh(self, user_id: str, team_id: str) -> None:
+    def register_ssh(
+        self, user_id: str, team_id: str, connection_id: str = ""
+    ) -> None:
         """注册某个顶部 agent 的 SSH 前端执行器。
 
         :param user_id: 用户标识
         :param team_id: 顶部 agent ID（SSH 模式按顶部 agent 单独控制）
+        :param connection_id: 发送注册消息的 WS 连接 id（定向投递语义同本地）
         """
         if not team_id:
             team_id = user_id
         self._ssh_users.setdefault(user_id, set()).add(team_id)
+        self._exec_conn[(user_id, team_id)] = connection_id
         # 重新注册视为执行器恢复：清零该 (user_id, team_id) 的连续超时计数
         self._consecutive_timeouts.pop((user_id, team_id), None)
         logger.info("用户 %s 顶部 agent %s 已启用 SSH 前端执行器", user_id, team_id)
 
-    def unregister_ssh(self, user_id: str, team_id: str) -> None:
+    def unregister_ssh(
+        self, user_id: str, team_id: str, connection_id: str = ""
+    ) -> bool:
         """注销某个顶部 agent 的 SSH 前端执行器，并使该 team 的待响应请求失败。
 
         :param user_id: 用户标识
         :param team_id: 顶部 agent ID
+        :param connection_id: 发起注销的 WS 连接 id（归属校验同 :meth:`unregister`）
+        :return: 是否实际执行了注销（False = 归属校验拒绝，注册保持不变）
         """
         if not team_id:
             team_id = user_id
+        if not self._owns_executor(user_id, team_id, connection_id):
+            return False
         regs = self._ssh_users.get(user_id)
         if regs is not None:
             regs.discard(team_id)
             if not regs:
                 self._ssh_users.pop(user_id, None)
+        self._exec_conn.pop((user_id, team_id), None)
         self._fail_pending(user_id, team_id, "SSH 前端执行器已注销")
         logger.info("用户 %s 顶部 agent %s 已注销 SSH 前端执行器", user_id, team_id)
+        return True
+
+    def executor_connection(self, user_id: str, team_id: str) -> str:
+        """返回注册该 team 执行器的 WS 连接 id；未记录时返回空串。
+
+        空串表示后端无法定向投递，发送侧回落为"按用户广播"（兼容历史调用
+        与测试替身），此时前端不能安全地对不可执行的请求回传错误——同用户
+        其他实例可能才是真正的执行器。
+        """
+        return self._exec_conn.get((user_id, team_id), "")
+
+    def _owns_executor(
+        self, user_id: str, team_id: str, connection_id: str
+    ) -> bool:
+        """该连接是否有权注销该 (user_id, team_id) 的执行器注册。
+
+        仅当调用方提供了 connection_id、该 team 已记录归属连接且两者不一致
+        时返回 False：防止"同用户后注册实例接管后，先注册实例断连把生效中的
+        注册一并清掉"。connection_id 为空（内部自动停用 / 历史调用）时放行。
+        """
+        if not connection_id:
+            return True
+        owner = self._exec_conn.get((user_id, team_id))
+        return not owner or owner == connection_id
+
+    def _deliver(
+        self,
+        ws_manager: Any,
+        user_id: str,
+        connection_id: str,
+        message: Dict[str, Any],
+    ) -> Any:
+        """投递请求消息的协程工厂：定向优先，未记录连接时回退广播。
+
+        每次调用返回新的协程对象（协程只能被驱动一次，故不能在多个分支间复用）。
+        """
+        if connection_id:
+            return ws_manager.send_to_connection(user_id, connection_id, message)
+        return ws_manager.send_message(user_id, message)
 
     def _has_frontend_executor(self, user_id: str, team_id: str = "") -> bool:
         """该用户/顶部 agent 是否注册了前端执行器（本地或 SSH）。
@@ -442,9 +511,20 @@ class LocalExecutorClient:
         fut: "concurrent.futures.Future[Dict[str, Any]]" = concurrent.futures.Future()
         self._pending[key] = fut
         self._pending_owner[key] = (user_id, team_id)
+        # 定向投递：只发给"注册该 team 执行器的那条连接"（同用户其他前端实例
+        # 收不到请求，也就不会用自身的失败结果抢先占位）。未记录连接时回落
+        # 广播（兼容历史调用/测试替身），此时 targeted=False，前端在自身不可
+        # 执行时保持静默放行——广播下回传失败会与真正执行器的成功结果竞争。
+        connection_id = self.executor_connection(user_id, team_id)
+        targeted = bool(connection_id)
         message = {
             "type": "tool_exec_request",
-            "data": {"tool_id": tool_id, "team_id": team_id, **payload},
+            "data": {
+                "tool_id": tool_id,
+                "team_id": team_id,
+                **payload,
+                "targeted": targeted,
+            },
         }
         # 发送超时远小于响应超时：send 仅推送 WS 消息，正常毫秒级完成。
         # 主事件循环短暂繁忙时 send_message 可能延迟入队，此时不立即放弃——
@@ -456,11 +536,24 @@ class LocalExecutorClient:
             loop = self._loop
             if loop is not None and loop.is_running():
                 send_fut = asyncio.run_coroutine_threadsafe(
-                    ws_manager.send_message(user_id, message), loop
+                    self._deliver(ws_manager, user_id, connection_id, message), loop
                 )
-                send_fut.result(timeout=send_timeout)
+                delivered = send_fut.result(timeout=send_timeout)
             else:
-                _run_async(ws_manager.send_message(user_id, message))
+                delivered = _run_async(
+                    self._deliver(ws_manager, user_id, connection_id, message)
+                )
+            if targeted and delivered is False:
+                # 目标连接已不在连接表（实例退出 / 连接被替换）：不可能再收到
+                # 响应，立即失败，避免空等满卡死窗口后误判"前端卡死"。
+                self._pending.pop(key, None)
+                self._pending_owner.pop(key, None)
+                self._progress_at.pop(key, None)
+                logger.warning(
+                    "本地执行请求目标连接已断开: tool_id=%s connection_id=%s op=%s",
+                    tool_id, connection_id, payload.get("op"),
+                )
+                return {"error": "本地执行器连接已断开，请重连后重试"}
         except concurrent.futures.TimeoutError:
             # 发送超时：消息可能仍在主事件循环队列中等待投递。
             # 不移除 pending、不返回错误，继续等待响应（前端执行后回传结果时仍能匹配）。
@@ -549,24 +642,32 @@ class LocalExecutorClient:
         :param payload: 执行请求负载（必须含 tool_id / op 等）
         :return: ``{"success": True}`` 或 ``{"error": ...}``
         """
-        if not self._has_frontend_executor(
-            user_id, str(payload.get("team_id") or "")
-        ):
+        team_id = str(payload.get("team_id") or "")
+        if not self._has_frontend_executor(user_id, team_id):
             return {"error": "前端执行器未启用（本地或 SSH）"}
         tool_id = payload.get("tool_id", "")
+        connection_id = self.executor_connection(user_id, team_id)
         message = {
             "type": "tool_exec_request",
-            "data": {"tool_id": tool_id, **payload},
+            "data": {
+                "tool_id": tool_id,
+                **payload,
+                "targeted": bool(connection_id),
+            },
         }
         try:
             loop = self._loop
             if loop is not None and loop.is_running():
                 send_fut = asyncio.run_coroutine_threadsafe(
-                    ws_manager.send_message(user_id, message), loop
+                    self._deliver(ws_manager, user_id, connection_id, message), loop
                 )
-                send_fut.result(timeout=10.0)
+                delivered = send_fut.result(timeout=10.0)
             else:
-                _run_async(ws_manager.send_message(user_id, message))
+                delivered = _run_async(
+                    self._deliver(ws_manager, user_id, connection_id, message)
+                )
+            if connection_id and delivered is False:
+                return {"error": "本地执行器连接已断开，请重连后重试"}
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "推送本地 hook 执行请求失败: %r (tool_id=%s, op=%s)",

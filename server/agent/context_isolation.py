@@ -20,7 +20,7 @@ class ContextIsolator:
     """
 
     # 工作结果摘要最大保留字符数
-    RESULT_SUMMARY_MAX_CHARS: int = 500
+    RESULT_SUMMARY_MAX_CHARS: int = 2000
 
     def __init__(self) -> None:
         """初始化上下文隔离器。"""

@@ -469,20 +469,31 @@ class LocalExecutorService extends ChangeNotifier {
       });
       return true;
     }
-    // 归属校验（集合化）：仅接管"本前端已注册且启用本地模式"的 team——按
-    // 请求 payload 的 team_id 查 per-team 状态，不读"当前选中 agent"槽位。
-    // 同一用户可能并行开多个前端实例（后端按 user_id 向该用户所有 WS 连接
-    // 广播请求），只有真正注册且启用了本地模式的实例才执行——否则未配置的
-    // 实例会以 Directory.current（Windows 桌面打包运行时为
-    // build\windows\runner\Release）兜底执行并回传"文件不存在"错误，先于
-    // 正确实例的成功结果到达后端。
-    final _LocalTeamState? state = _states[reqTeam];
-    if (state == null || !state.enabled || !state.registered) {
+    // SSH 模式守卫（按 team 粒度）：同一 team 启用了 SSH 模式时让位给
+    // SSH 执行器（SSH 优先），由后者接管该请求——本端"本地不可执行"并不
+    // 等于该请求无人处理，故必须先于下面的回错分支判断，否则会截断
+    // SSH 执行器的接管（返回 true 后不再派发给后续处理者）。
+    if (SshExecutorService.instance.isTeamEnabled(reqTeam)) {
       return false;
     }
-    // SSH 模式守卫（按 team 粒度）：同一 team 启用了 SSH 模式时让位给
-    // SSH 执行器（SSH 优先）；不同 team 的 SSH 启用态互不影响。
-    if (SshExecutorService.instance.isTeamEnabled(reqTeam)) {
+    // 归属校验（集合化）：仅接管"本前端已注册且启用本地模式"的 team——按
+    // 请求 payload 的 team_id 查 per-team 状态，不读"当前选中 agent"槽位。
+    // 后端按注册连接定向投递（``targeted=true``），请求落到本端即说明后端
+    // 认定本端是该 team 的执行器——此时本地却不可执行（刚被 registration_lost
+    // 复位 / 已关闭本地模式 / 状态不一致），必须明确回传错误：否则后端会空等
+    // 满卡死窗口（60s）后误判"前端卡死"并自动停用执行器注册。
+    // ``targeted=false``（后端未记录注册连接的广播兜底）下保持静默放行：同用户
+    // 其他实例可能才是真正的执行器，抢先回错会占位并丢弃对方的成功结果
+    // （见 LocalExecutorClient.resolve 取首个响应即唤醒等待方）。
+    final _LocalTeamState? state = _states[reqTeam];
+    if (state == null || !state.enabled || !state.registered) {
+      if ((data['targeted'] as bool?) ?? false) {
+        _sendToolExecResponse(toolId, <String, dynamic>{
+          'error': '本地执行器当前不可用（未注册或未启用本地模式），'
+              '请重新开启该 agent 的本地模式后重试',
+        });
+        return true;
+      }
       return false;
     }
     // 已启用但未选择工作目录：明确报错，禁止用 Directory.current 兜底

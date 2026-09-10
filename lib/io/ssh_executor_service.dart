@@ -372,8 +372,8 @@ class SshExecutorService extends ChangeNotifier {
   /// 返回 `true` 表示已接管（该 team 的 SSH 模式已注册且启用时）；否则返回
   /// `false` 放行。
   ///
-  /// 归属校验（集合化）：请求由后端按 (user_id, team_id) 广播到用户全部 WS
-  /// 连接，仅接管"本前端已注册且启用 SSH 模式"的 team——按请求 payload 的
+  /// 归属校验（集合化）：后端按注册连接定向投递（``data.targeted=true``），
+  /// 仅接管"本前端已注册且启用 SSH 模式"的 team——按请求 payload 的
   /// ``team_id`` 查 per-team 状态，不读"当前选中 agent"槽位，避免残留其他
   /// team 的 SSH 启用态把请求误截获发往错误远端主机。
   bool _handleToolExecRequest(Map<String, dynamic> message) {
@@ -393,6 +393,18 @@ class SshExecutorService extends ChangeNotifier {
     }
     final _SshTeamState? state = _states[reqTeam];
     if (state == null || !state.enabled || !state.registered) {
+      // 定向投递到本连接说明后端认定本端是该 team 的 SSH 执行器，本端却不
+      // 可执行（刚被 registration_lost 复位 / 已关闭 SSH 模式 / 状态不一致）：
+      // 明确回传错误，避免后端空等满卡死窗口（60s）后误判卡死并自动停用。
+      // 广播兜底（targeted=false）下保持静默放行，理由同本地执行器。
+      if ((data['targeted'] as bool?) ?? false) {
+        _sendToolExecResponse(toolId, <String, dynamic>{
+          'success': false,
+          'error': 'SSH 执行器当前不可用（未注册或未启用 SSH 模式），'
+              '请重新开启该 agent 的 SSH 模式后重试',
+        });
+        return true;
+      }
       return false;
     }
     final String workspaceId = (data['workspace_id'] as String?) ?? '';

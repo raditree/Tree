@@ -5,7 +5,9 @@
 
 每条连接分配唯一 ``connection_id``（uuid4.hex），连接表为
 ``user_id -> {connection_id: WebSocket}``：端点层可按 connection_id 精确
-断连/清理该连接注册的执行器（避免幽灵注册），消息推送仍按用户广播全部连接。
+断连/清理该连接注册的执行器（避免幽灵注册）。消息推送默认按用户广播全部
+连接（:meth:`send_message`）；需要精确定位时用 :meth:`send_to_connection`
+只投递给指定连接（工具执行请求即按"注册该执行器的连接"定向投递）。
 
 发送保护：``send_json`` 经 ``asyncio.wait_for`` 包裹（超时可注入，默认
 ``_SEND_TIMEOUT_SECONDS``），超时/异常即移除该连接并关闭，避免慢连接
@@ -111,6 +113,42 @@ class WebSocketManager:
             await self._close_quietly(ws)
         if user_id in self.connections and not self.connections[user_id]:
             self.connections.pop(user_id, None)
+
+    async def send_to_connection(
+        self, user_id: str, connection_id: str, message: Dict[str, Any]
+    ) -> bool:
+        """向指定用户的指定连接发送 JSON 消息（定向投递）。
+
+        与 :meth:`send_message` 的差别：只投递给 ``connection_id`` 对应的那一条
+        连接，同用户其他并行实例（其他连接）不会收到——工具执行请求据此精确
+        投递给"注册了该执行器的连接"，非目标实例收不到请求，也就不会用自身的
+        失败结果抢先占位。
+
+        连接不存在 / 已被移除时返回 ``False``（调用方可据此快速失败，不必空等
+        响应超时）；发送超时或异常时按 :meth:`send_message` 同样的策略把该连接
+        移除并关闭后返回 ``False``。
+
+        :param user_id: 用户标识
+        :param connection_id: 目标连接 id
+        :param message: 消息字典，遵循 ``{"type": "...", "data": {...}}`` 协议
+        :return: 是否成功投递
+        """
+        ws = (self.connections.get(user_id) or {}).get(connection_id)
+        if ws is None:
+            return False
+        try:
+            await asyncio.wait_for(
+                ws.send_json(message), timeout=self.send_timeout
+            )
+        except Exception:  # noqa: BLE001
+            self._drop_dead(user_id, connection_id)
+            logger.warning(
+                "WS 定向发送失败/超时，已移除连接: user_id=%s connection_id=%s",
+                user_id, connection_id,
+            )
+            await self._close_quietly(ws)
+            return False
+        return True
 
     async def broadcast(self, message: Dict[str, Any]) -> None:
         """向所有已连接用户广播 JSON 消息。
