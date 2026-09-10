@@ -181,6 +181,8 @@ class SshExecutorService extends ChangeNotifier {
   /// 持久化关闭开关、通知后端注销、关闭该 team 的 SSH 连接、清理等待。
   Future<void> deactivateTeam(String teamId) async {
     if (teamId.isEmpty) return;
+    // 回收该 team 的 MCP 隧道会话：远端 kill 需要通道，须在关闭连接之前执行
+    SshWorkspaceExecutor.disposeMcpSessionsOf(teamId);
     final _SshTeamState? state = _states.remove(teamId);
     if (state == null) return;
     final Completer<Map<String, dynamic>>? completer = state.pendingAck;
@@ -249,6 +251,9 @@ class SshExecutorService extends ChangeNotifier {
     state.registered = false;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_kEnabledKey(teamId), false);
+    // 关闭连接前先回收该 team 的 MCP 隧道会话：远端 kill 依赖通道，
+    // 连接一关就只剩本地残留记录（远端进程会随通道挂断，但记录须清掉）
+    SshWorkspaceExecutor.disposeMcpSessionsOf(teamId);
     await _connectionManager.close(teamId);
     _sendUnregister(teamId);
     notifyListeners();
@@ -329,6 +334,9 @@ class SshExecutorService extends ChangeNotifier {
     _ws?.removeToolExecRequestHandler(_handleToolExecRequest);
     _ws?.removeToolExecCancelHandler(_handleToolExecCancel);
     _hookTargets.clear();
+    // 回收残留的 MCP 隧道会话（调用中途退出时后端不再回 close）：
+    // 远端 kill 需要通道，须在关闭连接之前执行
+    SshWorkspaceExecutor.disposeAllMcpSessions();
     _ws = null;
     unawaited(_connectionManager.closeAll());
   }

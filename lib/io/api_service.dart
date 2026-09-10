@@ -723,17 +723,23 @@ class ApiService {
 
   /// 注册一个 MCP 服务（stdio 外接）
   ///
-  /// 调用 `POST /api/mcp/services`，请求体为 `{"name","command","args"}`。
+  /// 调用 `POST /api/mcp/services`，请求体为
+  /// `{"name","command","args","scope","env"}`。`scope` 取
+  /// ``""``/``server``/``local``/``ssh``，空串表示按当前会话模式自动落点。
   /// 网络异常或后端返回错误时抛出中文异常。
   static Future<Map<String, dynamic>> registerMcpService({
     required String name,
     required String command,
     List<String> args = const [],
+    String scope = '',
+    Map<String, String> env = const <String, String>{},
   }) async {
     return _postJson('/api/mcp/services', body: {
       'name': name,
       'command': command,
       'args': args,
+      'scope': scope,
+      'env': env,
     });
   }
 

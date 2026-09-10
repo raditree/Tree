@@ -99,7 +99,7 @@ class FrontendTunnel:
                 "command": command,
                 "args": list(args or []),
                 "env": dict(env or {}),
-                # 非可信启动器需宿主侧用户首次确认（见前端 MCPTrustStore）
+                # 非可信启动器需宿主侧用户首次确认（见前端 McpTrustStore）
                 "needs_confirmation": bool(needs_confirmation),
             },
             OPEN_TIMEOUT_SECONDS,

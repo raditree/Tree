@@ -4,6 +4,8 @@ import 'dart:typed_data';
 
 import 'package:dartssh2/dartssh2.dart';
 
+import 'mcp_stdio_tunnel.dart';
+import 'mcp_trust_store.dart';
 import 'ssh_connection_manager.dart';
 
 /// SSH 工具执行器 - 在前端发起的 dartssh2 会话上执行后端委托的工具操作。
@@ -42,6 +44,19 @@ class SshWorkspaceExecutor {
   /// 必须复用同一条通道），complete 时关闭并移除。
   static final Map<String, _SftpUploadSession> _uploadSessions =
       <String, _SftpUploadSession>{};
+
+  /// 第三方 MCP 服务的 stdio 隧道会话：key = "$teamId|$sessionId"。
+  ///
+  /// 与分片上传同理，[SshWorkspaceExecutor] 为请求级实例，而一次 MCP 工具
+  /// 调用会跨多个 ``mcp_stdio_*`` 请求（open → write/read 若干轮 → close），
+  /// 会话必须跨请求存活，故按执行器类静态存储。远端进程由 SSH exec 通道
+  /// （[SSHSession]）承载，会话经写管道闭包与 exitCode 回调持有该通道引用；
+  /// close / 清理时 kill 远端进程并关闭通道。
+  static final Map<String, McpStdioTunnelSession> _mcpSessions =
+      <String, McpStdioTunnelSession>{};
+
+  /// MCP 会话 id 自增序号（与时间戳拼接，避免同微秒内碰撞）
+  static int _mcpSessionSeq = 0;
 
   SshWorkspaceExecutor(
     this.manager, {
@@ -125,6 +140,15 @@ class SshWorkspaceExecutor {
         return _gitLog(client, workspaceId, data);
       case 'git_branches':
         return _gitBranches(client, workspaceId, data);
+      // 第三方 MCP 服务的 stdio 隧道（不涉及工作空间目录）
+      case 'mcp_stdio_open':
+        return _mcpStdioOpen(client, data);
+      case 'mcp_stdio_write':
+        return _mcpStdioWrite(data);
+      case 'mcp_stdio_read':
+        return _mcpStdioRead(data);
+      case 'mcp_stdio_close':
+        return _mcpStdioClose(data);
       default:
         return <String, dynamic>{'error': '未知 SSH 执行操作: $op'};
     }
@@ -987,6 +1011,175 @@ class SshWorkspaceExecutor {
       'current': current,
       'exit_code': result['exit_code'] ?? 0,
     };
+  }
+
+  // ------------------------------------------------------------------
+  // 第三方 MCP 服务的 stdio 隧道（远端宿主）
+  // ------------------------------------------------------------------
+
+  /// 在远端拉起 MCP 服务子进程（``mcp_stdio_open``），返回 ``{session_id}``。
+  ///
+  /// SSH 模式下第三方 MCP 服务的子进程必须跑在**远端主机**（与工作文件同处），
+  /// 因此后端不直连其 stdio，而是把 JSON-RPC 帧经反向 WS 下发到本端、由本端
+  /// 经 SSH exec 通道搬运。本方法只负责启动进程，不参与协议握手：initialize /
+  /// tools/list / tools/call 全部由后端经 write/read 驱动，与后端直连 stdio 及
+  /// 本地模式隧道的语义一致。
+  ///
+  /// 远端命令形如 ``env KEY=VAL <command> <args...>``：环境变量内联进命令行，
+  /// 不依赖 sshd 的 ``AcceptEnv``（多数主机未配置，单独的 ``sendEnv`` 会被静默
+  /// 丢弃）。不开 pty（[SSHClient.execute] 默认）：pty 会回显输入并把 ``\n``
+  /// 转成 ``\r\n``，破坏 JSON-RPC 的换行分帧。
+  ///
+  /// 启动前按后端下发的 ``needs_confirmation`` 校验本端信任指纹（见
+  /// [McpTrustStore]）：与本地宿主共用同一校验，确保两侧拒绝语义一致。
+  Future<Map<String, dynamic>> _mcpStdioOpen(
+    SSHClient client,
+    Map<String, dynamic> data,
+  ) async {
+    final String command = ((data['command'] as String?) ?? '').trim();
+    if (command.isEmpty) {
+      return <String, dynamic>{'error': 'mcp_stdio_open 缺少 command'};
+    }
+    final List<String> args = ((data['args'] as List<dynamic>?) ?? <dynamic>[])
+        .map((dynamic e) => e.toString())
+        .toList();
+    final Map<String, String> env = <String, String>{};
+    final Object? rawEnv = data['env'];
+    if (rawEnv is Map) {
+      rawEnv.forEach((dynamic key, dynamic value) {
+        env[key.toString()] = value.toString();
+      });
+    }
+    final String? denied = await McpTrustStore.checkLaunch(
+      command,
+      args,
+      needsConfirmation: (data['needs_confirmation'] as bool?) ?? false,
+    );
+    if (denied != null) {
+      return <String, dynamic>{'error': denied};
+    }
+    final StringBuffer line = StringBuffer();
+    if (env.isNotEmpty) {
+      line.write('env');
+      env.forEach((String key, String value) {
+        line.write(' ${_shQuote('$key=$value')}');
+      });
+      line.write(' ');
+    }
+    line.write(_shQuote(command));
+    for (final String arg in args) {
+      line.write(' ${_shQuote(arg)}');
+    }
+    try {
+      final SSHSession session = await client.execute(line.toString());
+      _mcpSessionSeq++;
+      final McpStdioTunnelSession tunnel = McpStdioTunnelSession(
+        id: '${DateTime.now().microsecondsSinceEpoch}-$_mcpSessionSeq',
+        teamId: teamId,
+        write: (Uint8List payload) => session.stdin.add(payload),
+        kill: () {
+          try {
+            session.kill(SSHSignal.TERM);
+            session.close();
+          } catch (_) {
+            // 通道已关闭：忽略
+          }
+        },
+      );
+      tunnel.bindStreams(session.stdout, session.stderr);
+      _mcpSessions['$teamId|${tunnel.id}'] = tunnel;
+      // 远端进程退出（通道关闭）：唤醒挂起读取，让后端立刻失败而不是耗完等待窗口
+      unawaited(
+        session.done.then(
+          (_) => tunnel.markExited(session.exitCode),
+          onError: (Object _) => tunnel.markExited(session.exitCode),
+        ),
+      );
+      return <String, dynamic>{'session_id': tunnel.id};
+    } on SSHChannelOpenError {
+      // 连接级通道上限/卡死：交由 _guarded 丢弃连接并重试
+      rethrow;
+    } catch (e) {
+      return <String, dynamic>{'error': '启动远端 MCP 服务失败: $e'};
+    }
+  }
+
+  /// 把后端写出的一帧 JSON-RPC 报文写入远端子进程 stdin（``mcp_stdio_write``）。
+  Future<Map<String, dynamic>> _mcpStdioWrite(
+    Map<String, dynamic> data,
+  ) async {
+    final McpStdioTunnelSession? session = _mcpLookup(data);
+    if (session == null) {
+      return <String, dynamic>{'error': 'MCP 隧道会话不存在或已关闭'};
+    }
+    final String encoded = (data['data'] as String?) ?? '';
+    if (encoded.isEmpty) return <String, dynamic>{'ok': true};
+    Uint8List payload;
+    try {
+      payload = base64Decode(encoded);
+    } catch (e) {
+      return <String, dynamic>{'error': 'MCP 隧道报文不是合法 base64: $e'};
+    }
+    try {
+      session.writeBytes(payload);
+      return <String, dynamic>{'ok': true};
+    } catch (e) {
+      return <String, dynamic>{'error': '写入远端 MCP 服务 stdin 失败: $e'};
+    }
+  }
+
+  /// 取走远端子进程 stdout 上的一条完整帧（``mcp_stdio_read``，base64 回传）。
+  ///
+  /// 等待窗口（后端下发 ``timeout`` 秒）内没有整行时返回空串，由后端续等；
+  /// 远端子进程此时已退出则返回错误，让后端立刻判定隧道中断。
+  Future<Map<String, dynamic>> _mcpStdioRead(Map<String, dynamic> data) async {
+    final McpStdioTunnelSession? session = _mcpLookup(data);
+    if (session == null) {
+      return <String, dynamic>{'error': 'MCP 隧道会话不存在或已关闭'};
+    }
+    final double seconds = ((data['timeout'] as num?) ?? 10).toDouble();
+    final List<int>? line = await session.takeLine(
+      Duration(milliseconds: (seconds * 1000).round().clamp(1, 60000)),
+    );
+    if (line == null) {
+      if (session.closed) {
+        return <String, dynamic>{'error': session.exitedMessage()};
+      }
+      return <String, dynamic>{'data': ''};
+    }
+    return <String, dynamic>{'data': base64Encode(line)};
+  }
+
+  /// 关闭 MCP 隧道会话并终止远端子进程（``mcp_stdio_close``，幂等）。
+  Future<Map<String, dynamic>> _mcpStdioClose(Map<String, dynamic> data) async {
+    final String sessionId = (data['session_id'] as String?) ?? '';
+    _mcpSessions.remove('$teamId|$sessionId')?.dispose();
+    return <String, dynamic>{'ok': true};
+  }
+
+  /// 按 payload 的 session_id 取本 team 的隧道会话（跨请求共享，见 [_mcpSessions]）。
+  McpStdioTunnelSession? _mcpLookup(Map<String, dynamic> data) {
+    final String sessionId = (data['session_id'] as String?) ?? '';
+    return _mcpSessions['$teamId|$sessionId'];
+  }
+
+  /// 回收指定 team 的全部 MCP 隧道会话（删除顶部 agent 时调用）。
+  static void disposeMcpSessionsOf(String teamId) {
+    final List<String> owned = _mcpSessions.keys
+        .where((String key) => key.startsWith('$teamId|'))
+        .toList();
+    for (final String key in owned) {
+      _mcpSessions.remove(key)?.dispose();
+    }
+  }
+
+  /// 回收全部 MCP 隧道会话（应用退出 / 清理时调用）。
+  static void disposeAllMcpSessions() {
+    for (final McpStdioTunnelSession session
+        in _mcpSessions.values.toList(growable: false)) {
+      session.dispose();
+    }
+    _mcpSessions.clear();
   }
 
   // ------------------------------------------------------------------

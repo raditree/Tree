@@ -5,6 +5,8 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'mcp_stdio_tunnel.dart';
+import 'mcp_trust_store.dart';
 import 'platform_support.dart';
 import 'ssh_executor_service.dart';
 import 'websocket_service.dart';
@@ -64,19 +66,6 @@ String decodeProcessBytes(dynamic value) {
   } catch (_) {
     return latin1.decode(bytes, allowInvalid: true);
   }
-}
-
-/// 返回 stdio 字节缓冲中首个完整行（含结尾 ``\n``）的结束下标。
-///
-/// MCP 的 stdio 传输以换行分隔 JSON-RPC 报文：一次读取可能只拿到半行、也可能
-/// 一次拿到多行，必须按 ``\n`` 切分——半行留在缓冲里等后续字节，完整行原样
-/// （含 ``\n``）回传后端，后端据此重组帧。尚未出现完整行时返回 -1。
-/// 纯函数，供 MCP 隧道与单测复用。
-int mcpStdioLineEnd(List<int> buffer) {
-  for (int i = 0; i < buffer.length; i++) {
-    if (buffer[i] == 0x0A) return i;
-  }
-  return -1;
 }
 
 /// 本地执行器服务 - 在本地运行模式下执行后端推送的工具请求
@@ -151,82 +140,18 @@ class _LocalTeamState {
   bool registered = false;
 }
 
-/// 第三方 MCP 服务的 stdio 隧道会话（本机子进程）。
+/// 第三方 MCP 服务的 stdio 隧道（本地模式）。
 ///
 /// local 模式下后端不直接接触 MCP 服务进程：由本端按 ``mcp_stdio_open`` 拉起
 /// 子进程，后端写出的 JSON-RPC 帧经 ``mcp_stdio_write`` 写入其 stdin，子进程
 /// stdout 上按换行分隔的完整帧经 ``mcp_stdio_read`` 原样（base64）回传，直至
 /// ``mcp_stdio_close`` 终止会话。一次工具调用对应一个会话（open → call →
-/// close），与后端直连 stdio 的语义一致。
-class _McpStdioSession {
-  _McpStdioSession({
-    required this.id,
-    required this.teamId,
-    required this.process,
-  });
-
-  /// 会话 id（后端按此 id 收发隧道报文）
-  final String id;
-
-  /// 归属 team（顶部 agent 被删除 / 清理时据此回收子进程）
-  final String teamId;
-
-  /// MCP 服务子进程
-  final Process process;
-
-  /// 已从 stdout 收到但尚未被后端取走的字节（可能含不完整行）
-  final List<int> buffer = <int>[];
-
-  /// stderr 最近若干字节：子进程异常退出时随错误回传，便于定位启动失败原因
-  final List<int> stderrTail = <int>[];
-
-  /// 挂起中的 ``mcp_stdio_read`` 等待者（有新数据或会话关闭时唤醒）
-  Completer<void>? waiter;
-
-  /// 会话是否已关闭（close 主动关闭或子进程已退出）
-  bool closed = false;
-
-  /// 子进程退出码（尚未退出时为 null）
-  int? exitCode;
-
-  /// stderr 保留上限（仅用于错误提示，无需全量）
-  static const int _kStderrTailBytes = 4096;
-
-  /// 订阅 stdout：累积字节并唤醒等待中的读取请求。
-  ///
-  /// 不解析内容——切行由 ``mcp_stdio_read`` 按 [buffer] 完成，避免在这里
-  /// 与「半行」状态纠缠。
-  void listenStdout() {
-    process.stdout.listen(
-      (List<int> chunk) {
-        buffer.addAll(chunk);
-        wakeReader();
-      },
-      onError: (Object _) {},
-    );
-  }
-
-  /// 订阅 stderr：仅保留尾部若干字节（子进程写满 stderr 管道会阻塞，
-  /// 因此必须消费，不能忽略）。
-  void listenStderr() {
-    process.stderr.listen(
-      (List<int> chunk) {
-        stderrTail.addAll(chunk);
-        if (stderrTail.length > _kStderrTailBytes) {
-          stderrTail.removeRange(0, stderrTail.length - _kStderrTailBytes);
-        }
-      },
-      onError: (Object _) {},
-    );
-  }
-
-  /// 唤醒挂起中的读取请求（幂等）。
-  void wakeReader() {
-    final Completer<void>? pending = waiter;
-    if (pending != null && !pending.isCompleted) pending.complete();
-  }
-}
-
+/// close），与后端直连 stdio 的语义一致；会话语义（行缓冲 / 挂起读取 / 退出
+/// 感知）由 [McpStdioTunnelSession] 提供并与 SSH 宿主共用，本地侧只补上
+/// "本机子进程"这一管道。
+///
+/// 会话 id 由本端生成（时间戳 + 自增序号），在 [_mcpSessions] 中与子进程一一
+/// 对应；子进程退出或会话关闭时回收。
 class LocalExecutorService extends ChangeNotifier {
   LocalExecutorService._();
 
@@ -267,9 +192,10 @@ class LocalExecutorService extends ChangeNotifier {
   /// 第三方 MCP 服务的 stdio 隧道会话：session_id -> 会话状态。
   ///
   /// 后端每发起一次 MCP 工具调用就 open 一个会话并驱动其 stdin/stdout，
-  /// 调用结束后 close；本表仅在会话存活期间持有子进程句柄。
-  final Map<String, _McpStdioSession> _mcpSessions =
-      <String, _McpStdioSession>{};
+  /// 调用结束后 close；本表仅在会话存活期间持有子进程句柄（经 [Process] 的
+  /// 写管道闭包与退出回调维持引用）。
+  final Map<String, McpStdioTunnelSession> _mcpSessions =
+      <String, McpStdioTunnelSession>{};
 
   /// MCP 会话 id 自增序号（与时间戳拼接，避免同微秒内碰撞）
   int _mcpSessionSeq = 0;
@@ -480,9 +406,9 @@ class LocalExecutorService extends ChangeNotifier {
       }
     }
     // 回收所有残留的 MCP 隧道子进程（调用中途退出时后端不再回 close）
-    for (final _McpStdioSession session
+    for (final McpStdioTunnelSession session
         in _mcpSessions.values.toList(growable: false)) {
-      _disposeMcpSession(session);
+      session.dispose();
     }
     _mcpSessions.clear();
     _ws?.removeToolExecRequestHandler(_handleToolExecRequest);
@@ -588,7 +514,7 @@ class LocalExecutorService extends ChangeNotifier {
       _kToolProgressInterval,
       (_) => _sendToolProgress(toolId, reqTeam),
     );
-    _execute(workspaceId, op, data, state.baseDir)
+    _execute(workspaceId, op, data, state.baseDir, reqTeam)
         .then((Map<String, dynamic> result) {
       _sendToolExecResponse(toolId, result);
     }).catchError((Object error) {
@@ -767,6 +693,7 @@ class LocalExecutorService extends ChangeNotifier {
     String op,
     Map<String, dynamic> data,
     String baseDir,
+    String teamId,
   ) async {
     // 携带操作路径，按路径路由：.self 记忆 → 私人空间；其余 → 工作目录 base
     final String path = (data['path'] as String?) ?? '';
@@ -798,6 +725,15 @@ class LocalExecutorService extends ChangeNotifier {
         return _gitLog(wsDir, data);
       case 'git_branches':
         return _gitBranches(wsDir, data);
+      // 第三方 MCP 服务的 stdio 隧道（不涉及工作空间目录）
+      case 'mcp_stdio_open':
+        return _mcpStdioOpen(data, teamId);
+      case 'mcp_stdio_write':
+        return _mcpStdioWrite(data);
+      case 'mcp_stdio_read':
+        return _mcpStdioRead(data);
+      case 'mcp_stdio_close':
+        return _mcpStdioClose(data);
       default:
         return <String, dynamic>{'error': '未知本地执行操作: $op'};
     }
@@ -1394,6 +1330,170 @@ class LocalExecutorService extends ChangeNotifier {
   /// Windows 下少量程序仍按 GBK 输出（chcp 65001 后基本消除），latin1 兜底
   /// 保证工具成功返回（个别字符可能显示为扩展拉丁字符，但不中断任务）。
   String _decodeProcessBytes(dynamic value) => decodeProcessBytes(value);
+
+  /// 拉起第三方 MCP 服务子进程（``mcp_stdio_open``），返回 ``{session_id}``。
+  ///
+  /// 只负责启动与登记会话，不做协议握手：JSON-RPC 的 initialize / tools/list /
+  /// tools/call 全部由后端经 ``mcp_stdio_write`` / ``mcp_stdio_read`` 驱动，
+  /// 与后端直连 stdio 的语义完全一致。
+  ///
+  /// 启动前按后端下发的 ``needs_confirmation`` 校验本端信任指纹（见
+  /// [McpTrustStore]）：非可信启动器的服务未经用户确认时拒绝启动，返回可读
+  /// 错误由「MCP 配置」面板引导确认。
+  Future<Map<String, dynamic>> _mcpStdioOpen(
+    Map<String, dynamic> data,
+    String teamId,
+  ) async {
+    final String command = ((data['command'] as String?) ?? '').trim();
+    if (command.isEmpty) {
+      return <String, dynamic>{'error': 'mcp_stdio_open 缺少 command'};
+    }
+    final List<String> args = ((data['args'] as List<dynamic>?) ?? <dynamic>[])
+        .map((dynamic e) => e.toString())
+        .toList();
+    final Map<String, String> env = <String, String>{};
+    final Object? rawEnv = data['env'];
+    if (rawEnv is Map) {
+      rawEnv.forEach((dynamic key, dynamic value) {
+        env[key.toString()] = value.toString();
+      });
+    }
+    final String? denied = await McpTrustStore.checkLaunch(
+      command,
+      args,
+      needsConfirmation: (data['needs_confirmation'] as bool?) ?? false,
+    );
+    if (denied != null) {
+      return <String, dynamic>{'error': denied};
+    }
+    try {
+      final Process process = await _startMcpProcess(command, args, env);
+      _mcpSessionSeq++;
+      final McpStdioTunnelSession tunnel = McpStdioTunnelSession(
+        id: '${DateTime.now().microsecondsSinceEpoch}-$_mcpSessionSeq',
+        teamId: teamId,
+        write: (Uint8List data) => process.stdin.add(data),
+        kill: () {
+          try {
+            process.kill();
+          } catch (_) {
+            // 进程已退出：忽略
+          }
+        },
+      );
+      tunnel.bindStreams(process.stdout, process.stderr);
+      _mcpSessions[tunnel.id] = tunnel;
+      // 子进程退出：标记会话已结束并唤醒挂起中的读取请求，让后端立刻失败，
+      // 而不是把剩余等待窗口耗完。
+      process.exitCode.then((int code) => tunnel.markExited(code));
+      return <String, dynamic>{'session_id': tunnel.id};
+    } on ProcessException catch (e) {
+      return <String, dynamic>{'error': '启动 MCP 服务失败: ${e.message}'};
+    } catch (e) {
+      return <String, dynamic>{'error': '启动 MCP 服务失败: $e'};
+    }
+  }
+
+  /// 启动 MCP 服务子进程。
+  ///
+  /// Windows 下 `npx` / `uvx` 等常见启动器是 ``.cmd`` / ``.bat`` 脚本，
+  /// ``CreateProcess`` 无法直接执行（报"系统找不到指定的文件"）；首次尝试失败
+  /// 后经 ``runInShell`` 由 cmd.exe 启动一次。参数由 Dart 按 CreateProcess
+  /// 规则转义，实测带空格/引号的参数在 shell 回退路径下不被破坏。
+  ///
+  /// 环境变量：沿用父进程环境并追加 ``PYTHONUTF8`` / ``PYTHONIOENCODING``
+  /// （与 [_runProcess] 一致，避免 Windows 下 Python 类启动器按 GBK 输出），
+  /// 服务自定义 env 优先级最高。
+  Future<Process> _startMcpProcess(
+    String command,
+    List<String> args,
+    Map<String, String> env,
+  ) async {
+    final Map<String, String> environment = <String, String>{
+      'PYTHONUTF8': '1',
+      'PYTHONIOENCODING': 'utf-8',
+      ...env,
+    };
+    try {
+      return await Process.start(command, args, environment: environment);
+    } on ProcessException {
+      if (!Platform.isWindows) rethrow;
+      return Process.start(
+        command,
+        args,
+        environment: environment,
+        runInShell: true,
+      );
+    }
+  }
+
+  /// 把后端写出的一帧 JSON-RPC 报文写入子进程 stdin（``mcp_stdio_write``）。
+  Future<Map<String, dynamic>> _mcpStdioWrite(
+    Map<String, dynamic> data,
+  ) async {
+    final String sessionId = (data['session_id'] as String?) ?? '';
+    final McpStdioTunnelSession? session = _mcpSessions[sessionId];
+    if (session == null) {
+      return <String, dynamic>{'error': 'MCP 隧道会话不存在或已关闭'};
+    }
+    final String encoded = (data['data'] as String?) ?? '';
+    if (encoded.isEmpty) return <String, dynamic>{'ok': true};
+    Uint8List payload;
+    try {
+      payload = base64Decode(encoded);
+    } catch (e) {
+      return <String, dynamic>{'error': 'MCP 隧道报文不是合法 base64: $e'};
+    }
+    try {
+      session.writeBytes(payload);
+      return <String, dynamic>{'ok': true};
+    } catch (e) {
+      return <String, dynamic>{'error': '写入 MCP 服务 stdin 失败: $e'};
+    }
+  }
+
+  /// 取走子进程 stdout 上的一条完整帧（``mcp_stdio_read``，base64 回传）。
+  ///
+  /// 等待窗口（后端下发 ``timeout`` 秒）内没有整行时返回空串，由后端续等——
+  /// 数分钟的 tools/call 因此不会被单次等待上限截断；子进程此时已退出则返回
+  /// 错误，让后端立刻判定隧道中断。
+  Future<Map<String, dynamic>> _mcpStdioRead(Map<String, dynamic> data) async {
+    final String sessionId = (data['session_id'] as String?) ?? '';
+    final McpStdioTunnelSession? session = _mcpSessions[sessionId];
+    if (session == null) {
+      return <String, dynamic>{'error': 'MCP 隧道会话不存在或已关闭'};
+    }
+    final double seconds = ((data['timeout'] as num?) ?? 10).toDouble();
+    final List<int>? line = await session.takeLine(
+      Duration(milliseconds: (seconds * 1000).round().clamp(1, 60000)),
+    );
+    if (line == null) {
+      if (session.closed) {
+        return <String, dynamic>{'error': session.exitedMessage()};
+      }
+      return <String, dynamic>{'data': ''};
+    }
+    return <String, dynamic>{'data': base64Encode(line)};
+  }
+
+  /// 关闭 MCP 隧道会话并终止子进程（``mcp_stdio_close``，幂等）。
+  Future<Map<String, dynamic>> _mcpStdioClose(Map<String, dynamic> data) async {
+    final String sessionId = (data['session_id'] as String?) ?? '';
+    _mcpSessions.remove(sessionId)?.dispose();
+    return <String, dynamic>{'ok': true};
+  }
+
+  /// 回收指定 team 的全部 MCP 隧道会话（顶部 agent 被删除时调用）。
+  void _disposeMcpSessionsOf(String teamId) {
+    final List<String> owned = _mcpSessions.entries
+        .where((MapEntry<String, McpStdioTunnelSession> e) =>
+            e.value.teamId == teamId)
+        .map((MapEntry<String, McpStdioTunnelSession> e) => e.key)
+        .toList();
+    for (final String id in owned) {
+      _mcpSessions.remove(id)?.dispose();
+    }
+  }
 
   /// 在工作空间内按模式递归搜索（排除 .git 与二进制文件），
   /// 返回 ``{exit_code, stdout}``，无命中时 exit_code 为 1（与 grep 一致）。
