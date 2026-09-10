@@ -47,9 +47,10 @@ server/
 │   ├── team_broker.py      # 团队成员 / 顶部 agent 消息串行投递
 │   └── context_isolation.py
 ├── tool/                   # LLM 内置工具组件
-│   ├── read_tool.py / write_tool.py / edit_tool.py   # 文件读写与替换
+│   ├── read_tool.py / write_tool.py / edit_tool.py / grep_tool.py
+│   │                       # 文件读写、替换与工作空间检索
 │   ├── terminal_tool.py    # terminal：命令执行 + hook 后台长任务
-│   ├── mcp_tool.py         # mcp：外部 MCP 能力
+│   ├── mcp_tool.py         # mcp：MCP 服务管理与工具调用（help / call）
 │   ├── team_base.py        # team/message 公共基类（名单/寻址/投递/状态）
 │   ├── team_tool.py        # team：团队/成员/模型管理（7 个 action）
 │   ├── message_tool.py     # message：send_message/broadcast/wait_for 等通信
@@ -82,9 +83,23 @@ server/
 │   ├── registry.py / loader.py / llm_prompts.py
 │   └── versions.py
 ├── docker/Dockerfile       # 工作空间基础镜像
-├── mcp_tools/              # MCP 工具实现（document_server / embed_search / server）
+├── mcp_tools/              # MCP 服务实现
+│   ├── server.py           # workspace 服务：进程内 MCP server（仅 embed_search）
+│   ├── document_server.py  # document 服务：文档处理（PDF/PPTX/DOCX/XLSX）
+│   ├── inproc_server.py    # 进程内 MCP server 适配器（SDK 内存流对接）
+│   ├── frontend_tunnel.py  # 第三方 MCP 的宿主隧道（local/ssh 经 WS 转发 stdio 帧）
+│   └── embed_search_tool.py
 └── tests/                  # 后端测试
 ```
+
+---
+
+## MCP 语义
+
+- **内置服务（workspace / document）始终在后端进程内**：以标准 MCP server 构建（`build_server`），后端用 SDK 内存流对接 `ClientSession`，经 `initialize` / `tools/list` / `tools/call` 调用；差异只体现在背后的 `WorkspaceIO`（cloud 容器 / local 本机 / ssh 远端）。
+- **第三方服务（用户注册的 stdio 外接）由 `scope` 决定落点**：`server` 后端直连子进程；`local` / `ssh` 或未指定（按当前模式自动）时经反向 WS 把 stdio 帧透传到宿主进程（用户本机 / 远端主机）拉起，见 `mcp_tools/frontend_tunnel.py`；后端不直连该进程。
+- **信任授权**：非可信启动器的服务在宿主侧首次拉起前需用户在「MCP 配置」面板确认启动命令（后端下发 `needs_confirmation`）。
+- **对模型暴露**：MCP 工具以 `mcp__<服务名>__<工具名>` 注入模型工具列表；`mcp` 工具提供 `help`（查看可用工具）与 `call`（调用指定工具）。
 
 ---
 

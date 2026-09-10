@@ -2,6 +2,11 @@
 
 > 时间：2026-08-18
 > 范围：统一消息 API / update memory 门控与锁 / terminal 内置化 / list_members 分组 / send_file 取消 / 成员回复回传 leader
+>
+> **阅读提示（后续目录重构后补注）**：本文是当时的实施记录，文中模块路径为**当时名称**——
+> ``server/tools/`` → 现 ``server/tool/``；``server/core/llm.py`` → 现 ``server/llm/llm.py``；
+> ``server/core/workspace_io.py`` → 现 ``server/io_/workspace_io.py``；
+> ``server/core/conversation_store.py`` → 现 ``server/data/conversation_store.py``。
 
 ---
 
