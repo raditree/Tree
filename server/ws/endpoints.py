@@ -625,8 +625,6 @@ def register_ws(app: FastAPI) -> None:
                             user_id, reg["team_id"], connection_id
                         )
                     else:
-                        if state.ssh_manager is not None:
-                            state.ssh_manager.unregister(user_id, reg["team_id"])
                         cleared = state.local_executor.unregister_ssh(
                             user_id, reg["team_id"], connection_id
                         )
@@ -634,6 +632,11 @@ def register_ws(app: FastAPI) -> None:
                         # 该 team 的注册已归属其他连接（其他实例已接管）：
                         # 本连接断连不影响它，也不需要通知前端"注册已丢失"。
                         continue
+                    if reg["mode"] == "ssh" and state.ssh_manager is not None:
+                        # 仅在本连接确实注销成功后才清 SSH 持久化配置：注册已
+                        # 被其他连接接管时必须保留（与 unregister_ssh_executor
+                        # 分支同一归属原则），否则会误清接管连接的 SSH 配置。
+                        state.ssh_manager.unregister(user_id, reg["team_id"])
                     logger.info(
                         "WS 断连清理执行器注册: user_id=%s team_id=%s mode=%s connection_id=%s",
                         user_id, reg["team_id"], reg["mode"], connection_id,

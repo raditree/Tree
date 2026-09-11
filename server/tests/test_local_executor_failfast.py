@@ -292,6 +292,54 @@ class TestLocalExecutorFailFast(unittest.TestCase):
         t.join(timeout=8)
         self.assertEqual(box["res"], {"exit_code": 0, "stdout": "ok"})
 
+    def test_target_connection_gone_marks_future_failed(self):
+        """目标连接已断开（定向投递 delivered=False）→ 立即失败且 fut 显式置异常。
+
+        回归点：旧实现仅清理 _pending/_pending_owner/_progress_at 后直接
+        return，被放弃的 fut 未 set_exception——fut 状态不完备。修复后与
+        _fail_pending 语义对齐：fut 立即以 "目标连接已断开，无法投递请求"
+        完结，任何持有该 future 的等待方都不会悬挂等待。
+        """
+        client = LocalExecutorClient()
+        # 注册时记录归属连接：请求将定向投递给该连接
+        client.register("g1", "top", "C:/proj", "conn-GONE")
+
+        captured = {}
+
+        class _GoneWS:
+            async def send_message(self, user_id, message):
+                return True
+
+            async def send_to_connection(self, user_id, connection_id, message):
+                # 模拟目标连接已不在连接表：投递失败（delivered=False）；
+                # 顺手抓取此刻的 pending future 供断言
+                captured["fut"] = next(iter(client._pending.values()), None)
+                return False
+
+        t0 = time.time()
+        res = client.request(
+            _GoneWS(), "g1",
+            {"op": "exec_shell", "workspace_id": "top", "command": "x",
+             "team_id": "top"},
+            timeout=30,
+        )
+        self.assertIn("error", res)
+        self.assertLess(
+            time.time() - t0, 2.0, "目标连接断开应立即失败，不应空等超时"
+        )
+
+        fut = captured.get("fut")
+        self.assertIsNotNone(fut, "投递前应已登记 pending future")
+        # 关键回归点：被放弃的 fut 已显式置异常（等待方不会悬挂）
+        self.assertTrue(fut.done(), "被放弃的 fut 必须已完结")
+        exc = fut.exception()
+        self.assertIsInstance(exc, RuntimeError)
+        self.assertIn("目标连接已断开", str(exc))
+        # pending 各表清理完备
+        self.assertEqual(client._pending, {})
+        self.assertEqual(client._pending_owner, {})
+        self.assertEqual(client._progress_at, {})
+
 
 if __name__ == "__main__":
     unittest.main()

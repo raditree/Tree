@@ -549,6 +549,11 @@ class LocalExecutorClient:
                 self._pending.pop(key, None)
                 self._pending_owner.pop(key, None)
                 self._progress_at.pop(key, None)
+                # 防御性对齐 _fail_pending：被放弃的 fut 显式置异常。当前调用方
+                # 由下方 return 直接失败、不依赖此异常；补此兜底保证 fut 状态
+                # 完备——任何持有该 future 的等待方都会立即失败而非悬挂等待。
+                if not fut.done():
+                    fut.set_exception(RuntimeError("目标连接已断开，无法投递请求"))
                 logger.warning(
                     "本地执行请求目标连接已断开: tool_id=%s connection_id=%s op=%s",
                     tool_id, connection_id, payload.get("op"),
