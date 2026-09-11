@@ -502,7 +502,7 @@ class TestQueueInjectionSessionIsolation(unittest.TestCase):
             first = on_tool_turn()
             second = on_tool_turn()
             injected.append((first, second))
-            return ("ok", "ok", None)
+            return ("ok", "ok", None, "ok")
 
         # 队列先放其他会话消息，再放当前会话消息
         import queue as _queue
@@ -561,7 +561,7 @@ class TestQueueInjectionSessionIsolation(unittest.TestCase):
                                content, on_tool_turn=None, cancel_event=None,
                                session_id=None, team_id=None):
             injected.append(on_tool_turn())
-            return ("ok", "ok", None)
+            return ("ok", "ok", None, "ok")
 
         import queue as _queue
 

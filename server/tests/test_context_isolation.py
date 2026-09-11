@@ -47,11 +47,12 @@ class TestCreateWorkSummary(unittest.TestCase):
         self.assertIn("Git 提交: (无提交)", summary)
 
     def test_truncate_long_result(self):
-        result = "x" * 600
+        # 输入长度取阈值 + 100，确保触发截断（实现调整阈值时用例自适应）
+        result = "x" * (ContextIsolator.RESULT_SUMMARY_MAX_CHARS + 100)
         summary = self.iso.create_work_summary("t", [], {}, result)
         # 截断到 RESULT_SUMMARY_MAX_CHARS + 省略号
         self.assertIn("..." , summary)
-        # 结果段截断后长度 ≤ 500 + 省略号
+        # 结果段截断后长度 ≤ 阈值 + 省略号
         idx = summary.index("工作结果摘要:") + len("工作结果摘要:\n")
         rest = summary[idx:]
         self.assertLessEqual(len(rest), ContextIsolator.RESULT_SUMMARY_MAX_CHARS + 3)

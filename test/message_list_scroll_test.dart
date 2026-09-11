@@ -4,124 +4,239 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:tree/ui/models/message.dart';
 import 'package:tree/ui/widgets/message_list.dart';
 
-/// 构造一条消息：[lines] 行文本决定气泡高度（1 行=短消息，多行=长消息），
-/// [content] 可覆盖默认文本（用于验证渲染顺序）
-ChatMessage _msg(String id, {int lines = 1, String? content}) {
-  return ChatMessage(
-    id: id,
-    role: 'user',
-    content: content ??
-        List<String>.filled(lines, 'line content for height').join('\n'),
-    timestamp: DateTime(2026, 1, 1),
-  );
-}
-
-/// 不均匀超长会话：前 [shortCount] 条短消息 + 后 [longCount] 条高消息。
+/// MessageList 滚动跟随行为测试
 ///
-/// 关键：前面的短消息决定了首帧「平均高度外推」的 maxScrollExtent 严重偏小，
-/// 只有迭代校正（每帧复查 extent 并继续 jump）才能到达真实底部——
-/// 正是「超长会话一次 animateTo 到不了底」的复现场景。
-List<ChatMessage> _longSession({
-  int shortCount = 250,
-  int longCount = 50,
-  int longLines = 60,
-}) {
-  return <ChatMessage>[
-    for (int i = 0; i < shortCount; i++) _msg('short_$i'),
-    for (int i = 0; i < longCount; i++) _msg('long_$i', lines: longLines),
-  ];
-}
-
-Widget _wrap(
-  List<ChatMessage> messages, {
-  int revision = 0,
-  bool bottomJump = true,
-}) {
-  return MaterialApp(
-    home: Scaffold(
-      body: SizedBox(
-        width: 400,
-        height: 600,
-        child: MessageList(
-          messages: messages,
-          revision: revision,
-          bottomJump: bottomJump,
-        ),
-      ),
-    ),
-  );
-}
-
-/// 读取列表滚动位置（controller 由 MessageList 内部持有，经 ListView.widget 读取）
-ScrollPosition _position(WidgetTester tester) {
-  final ListView list = tester.widget<ListView>(find.byType(ListView));
-  return list.controller!.position;
-}
-
-/// 推进若干帧，让滚动动画/重载后的 post-frame 回调跑完
-Future<void> _settleJump(WidgetTester tester) async {
-  for (int i = 0; i < 90; i++) {
-    await tester.pump();
-  }
-}
-
+/// 覆盖：
+/// - 贴底时新增消息保持贴底、回底按钮隐藏；
+/// - 用户上滚脱离后，内容更新不把视口拽回底部（核心回归）；
+/// - 「回到底部」按钮：显隐 / 点击回底 / 回底动画被拖拽打断后不回拽；
+/// - 滚回底部附近自动恢复跟随；
+/// - 历史整批重载直达底部并恢复跟随；
+/// - 定位跳转进入脱离态。
 void main() {
-  testWidgets('反转列表视觉顺序：最新消息在底部、最旧在顶部', (WidgetTester tester) async {
-    await tester.pumpWidget(_wrap(<ChatMessage>[
-      _msg('oldest', content: 'oldest message'),
-      _msg('middle', content: 'middle message'),
-      _msg('newest', content: 'newest message'),
-    ]));
+  // 取第一个 Scrollable（即外层 ListView 的），消息气泡内 EditableText 亦含 Scrollable
+  double offsetOf(WidgetTester tester) => tester
+      .state<ScrollableState>(find.byType(Scrollable).first)
+      .position
+      .pixels;
 
-    final Finder oldest = find.textContaining('oldest message');
-    final Finder newest = find.textContaining('newest message');
-    expect(oldest, findsOneWidget);
-    expect(newest, findsOneWidget);
-    // 反转列表 + 反向索引：视觉上「顶→底 = 旧→新」，
-    // 最新消息 y 坐标最大（在底部），最旧消息在顶部
-    expect(tester.getTopLeft(newest).dy,
-        greaterThan(tester.getTopLeft(oldest).dy));
-  });
+  /// 获取「回到底部」按钮的显隐透明度（0=隐藏 / 1=显示）
+  double buttonOpacity(WidgetTester tester) {
+    final Finder f = find.ancestor(
+      of: find.byIcon(Icons.arrow_downward),
+      matching: find.byType(AnimatedOpacity),
+    );
+    return tester.widget<AnimatedOpacity>(f).opacity;
+  }
 
-  testWidgets('超长会话初始进入即直接渲染在底部（反转列表 offset 0）',
-      (WidgetTester tester) async {
-    await tester.pumpWidget(_wrap(_longSession()));
-    await tester.pump(); // 首帧
+  Future<GlobalKey<_HarnessState>> pumpList(WidgetTester tester) async {
+    final GlobalKey<_HarnessState> k = GlobalKey<_HarnessState>();
+    await tester.pumpWidget(_Harness(key: k));
+    await tester.pumpAndSettle();
+    return k;
+  }
 
-    final ScrollPosition pos = _position(tester);
-    expect(pos.maxScrollExtent, greaterThan(0), reason: '列表应有可滚动内容');
-    // 反转列表：offset 0 即视觉底部，首帧即贴底
-    // （无「顶部闪一下再滑到底部」，也无「到不了真实底部」问题）
-    expect(pos.pixels, closeTo(0, 1), reason: '初始位置应直接落在底部');
-  });
+  /// 从列表右侧空白区拖动，避免与文本选择手势竞争
+  const Offset blankPoint = Offset(720, 300);
 
-  testWidgets('历史整批重载（bottomJump=true）后直达底部', (WidgetTester tester) async {
-    // 首次：短会话
-    await tester.pumpWidget(_wrap(<ChatMessage>[_msg('a')], revision: 1));
-    await _settleJump(tester);
+  testWidgets('贴底时新增消息保持贴底，回底按钮隐藏', (WidgetTester tester) async {
+    final GlobalKey<_HarnessState> key = await pumpList(tester);
+    expect(offsetOf(tester), 0);
 
-    // 同位置重建（State 保留，触发 didUpdateWidget）：revision 变化 + 超长列表
-    await tester.pumpWidget(_wrap(_longSession(), revision: 2));
-    await _settleJump(tester);
-
-    final ScrollPosition pos = _position(tester);
-    expect(pos.maxScrollExtent, greaterThan(0));
-    expect(pos.pixels, closeTo(0, 1),
-        reason: '历史重载应直达底部而非下滑动画');
-  });
-
-  testWidgets('流式追加（bottomJump=false）平滑跟随到新底部', (WidgetTester tester) async {
-    await tester.pumpWidget(_wrap(_longSession(), revision: 1));
-    await _settleJump(tester);
-
-    // 底部追加一条新消息：bottomJump=false → 平滑动画滚动 + 完成后校正
-    final List<ChatMessage> more =
-        <ChatMessage>[..._longSession(), _msg('new')];
-    await tester.pumpWidget(_wrap(more, revision: 2, bottomJump: false));
+    key.currentState!.addMessage();
     await tester.pumpAndSettle();
 
-    final ScrollPosition pos = _position(tester);
-    expect(pos.pixels, closeTo(0, 1),
-        reason: '流式追加后应跟随到新底部');
+    expect(offsetOf(tester), lessThanOrEqualTo(1));
+    expect(buttonOpacity(tester), 0);
   });
+
+  testWidgets('用户上滚脱离后，内容更新不把视口拽回底部（核心回归）',
+      (WidgetTester tester) async {
+    final GlobalKey<_HarnessState> key = await pumpList(tester);
+
+    // 向上翻历史（反转列表：向下拖动 = 看更旧内容）
+    await tester.dragFrom(blankPoint, const Offset(0, 260));
+    await tester.pumpAndSettle();
+    final double off1 = offsetOf(tester);
+    expect(off1, greaterThan(150));
+    expect(buttonOpacity(tester), 1); // 脱离态：按钮出现
+
+    // 记录一条可见锚点消息的 y 坐标（用于验证视口锁定）
+    String? anchor;
+    double? anchorDy;
+    for (int i = 39; i >= 0; i--) {
+      final Finder f = find.text('消息内容 $i');
+      if (f.evaluate().isEmpty) continue;
+      final double dy = tester.getTopLeft(f.first).dy;
+      if (dy > 60 && dy < 520) {
+        anchor = '消息内容 $i';
+        anchorDy = dy;
+        break;
+      }
+    }
+    expect(anchor, isNotNull);
+
+    // 多次内容更新（新消息 / 流式增量触发的 revision 变化）
+    key.currentState!.addMessage();
+    key.currentState!.touch();
+    await tester.pumpAndSettle();
+
+    final double off2 = offsetOf(tester);
+    expect(off2, greaterThan(100)); // 未被拽回底部
+    expect(off2, greaterThanOrEqualTo(off1 - 1)); // 不回退
+
+    final double dy2 = tester.getTopLeft(find.text(anchor!).first).dy;
+    expect((dy2 - anchorDy!).abs(), lessThan(4)); // 视口锁定：锚点消息不动
+  });
+
+  testWidgets('点击「回到底部」按钮：平滑回底并恢复跟随', (WidgetTester tester) async {
+    await pumpList(tester);
+    await tester.dragFrom(blankPoint, const Offset(0, 260));
+    await tester.pumpAndSettle();
+    expect(buttonOpacity(tester), 1);
+
+    await tester.tap(find.byIcon(Icons.arrow_downward));
+    await tester.pumpAndSettle();
+
+    expect(offsetOf(tester), lessThanOrEqualTo(1));
+    expect(buttonOpacity(tester), 0);
+  });
+
+  testWidgets('回底动画被拖拽打断后不再拽回底部', (WidgetTester tester) async {
+    await pumpList(tester);
+    await tester.dragFrom(blankPoint, const Offset(0, 260));
+    await tester.pumpAndSettle();
+
+    // 点击回底 → 动画启动（260 → 0，200ms）
+    await tester.tap(find.byIcon(Icons.arrow_downward));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 40));
+
+    // 用户改主意：继续向上翻历史（打断动画）
+    await tester.dragFrom(blankPoint, const Offset(0, 220));
+    await tester.pumpAndSettle();
+
+    // 关键回归：不得被无条件 jumpTo(0) 拽回底部
+    expect(offsetOf(tester), greaterThan(80));
+  });
+
+  testWidgets('滚回底部附近自动恢复跟随', (WidgetTester tester) async {
+    final GlobalKey<_HarnessState> key = await pumpList(tester);
+    await tester.dragFrom(blankPoint, const Offset(0, 260));
+    await tester.pumpAndSettle();
+    expect(buttonOpacity(tester), 1);
+
+    // 反向拖回底部
+    await tester.dragFrom(blankPoint, const Offset(0, -320));
+    await tester.pumpAndSettle();
+    expect(offsetOf(tester), lessThanOrEqualTo(1));
+    expect(buttonOpacity(tester), 0); // 已恢复跟随
+
+    key.currentState!.addMessage();
+    await tester.pumpAndSettle();
+    expect(offsetOf(tester), lessThanOrEqualTo(1)); // 继续跟随
+  });
+
+  testWidgets('历史整批重载：直达底部并恢复跟随', (WidgetTester tester) async {
+    final GlobalKey<_HarnessState> key = await pumpList(tester);
+    await tester.dragFrom(blankPoint, const Offset(0, 260));
+    await tester.pumpAndSettle();
+    expect(buttonOpacity(tester), 1);
+
+    key.currentState!.reload();
+    await tester.pumpAndSettle();
+
+    expect(offsetOf(tester), 0);
+    expect(buttonOpacity(tester), 0);
+  });
+
+  testWidgets('定位到历史消息后进入脱离态', (WidgetTester tester) async {
+    final GlobalKey<_HarnessState> key = await pumpList(tester);
+
+    key.currentState!.locate('m5');
+    await tester.pumpAndSettle();
+
+    expect(offsetOf(tester), greaterThan(100)); // 已离开底部
+    expect(buttonOpacity(tester), 1); // 进入脱离态
+    expect(find.text('消息内容 5'), findsWidgets); // 目标消息已构建
+  });
+}
+
+/// 测试用宿主：持有消息列表并驱动 MessageList 的 revision/bottomJump 更新
+class _Harness extends StatefulWidget {
+  const _Harness({super.key});
+
+  @override
+  State<_Harness> createState() => _HarnessState();
+}
+
+class _HarnessState extends State<_Harness> {
+  final List<ChatMessage> _messages = <ChatMessage>[
+    for (int i = 0; i < 40; i++)
+      ChatMessage(
+        id: 'm$i',
+        role: 'agent',
+        content: '消息内容 $i',
+        timestamp: DateTime(2026, 1, 1, 12, i % 60),
+      ),
+  ];
+  int _revision = 0;
+  bool _bottomJump = false;
+  String? _locateId;
+  int _locateRevision = 0;
+  int _live = 0;
+
+  /// 模拟新增消息（流式 msg_start / 新消息到达）
+  void addMessage() {
+    final int n = _live++;
+    setState(() {
+      _messages.add(ChatMessage(
+        id: 'live$n',
+        role: 'agent',
+        content: '新消息 $n',
+        timestamp: DateTime(2026, 1, 1, 13, 0),
+      ));
+      _revision++;
+      _bottomJump = false;
+    });
+  }
+
+  /// 模拟 revision 变化但无新消息（如 msg_end / tool 卡片更新）
+  void touch() {
+    setState(() {
+      _revision++;
+      _bottomJump = false;
+    });
+  }
+
+  /// 模拟历史整批重载（切会话 / 切 agent）
+  void reload() {
+    setState(() {
+      _revision++;
+      _bottomJump = true;
+    });
+  }
+
+  /// 模拟定位跳转到指定消息
+  void locate(String id) {
+    setState(() {
+      _locateId = id;
+      _locateRevision++;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      home: Scaffold(
+        body: MessageList(
+          messages: _messages,
+          revision: _revision,
+          scrollToMessageId: _locateId,
+          scrollToRevision: _locateRevision,
+          bottomJump: _bottomJump,
+        ),
+      ),
+    );
+  }
 }

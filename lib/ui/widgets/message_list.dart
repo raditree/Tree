@@ -93,8 +93,17 @@ class _MessageListView extends StatefulWidget {
 class _MessageListViewState extends State<_MessageListView> {
   final ScrollController _controller = ScrollController();
 
-  /// 用户是否靠近底部（用于判断流式追加时是否自动跟随）
-  bool _nearBottom = true;
+  /// 用户是否已主动脱离底部跟随：向上滚动离开底部超过 [_detachThreshold]
+  /// 后置位，此后新内容不再把视口拽回底部；回到底部附近或点击
+  /// 「回到底部」按钮后清除。
+  bool _userDetached = false;
+
+  /// 锚定校正挂起标记：用户手势/惯性滚动期间跳过 jumpTo 校正
+  /// （避免与用户滚动打架），滚动结束后统一结算一次。
+  bool _anchorPending = false;
+
+  /// 脱离判定阈值（px）：拖拽离开底部超过该值即视为用户主动脱离跟随
+  static const double _detachThreshold = 12.0;
 
   /// 消息 id → GlobalKey（定位目标可寻址）
   final Map<String, GlobalKey> _itemKeys = <String, GlobalKey>{};
@@ -119,7 +128,6 @@ class _MessageListViewState extends State<_MessageListView> {
   @override
   void initState() {
     super.initState();
-    _controller.addListener(_onScroll);
     // 列表为反转模式（reverse: true），初始 offset 0 即视觉底部：
     // 打开会话时首帧直接渲染在底部（最新消息），无需任何滚动。
   }
@@ -127,24 +135,28 @@ class _MessageListViewState extends State<_MessageListView> {
   @override
   void didUpdateWidget(covariant _MessageListView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // 仅在用户已处于底部附近时，才随新消息自动滚动（避免打断用户查看历史）
-    if (oldWidget.revision != widget.revision && _nearBottom) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
+    // 仅在用户未主动脱离跟随（未向上查看历史）时，才随新消息自动滚动
+    if (oldWidget.revision != widget.revision) {
+      if (widget.bottomJump) {
         // 历史整批重载（切会话/切 agent/清空重拉）：无动画直达底部，
-        // 避免「从顶部下滑」的粗糙观感；流式追加/增量更新：平滑跟随。
-        if (widget.bottomJump) {
+        // 并恢复跟随（用户可能仍停留在旧会话的脱离态）
+        _userDetached = false;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
           _jumpToBottom();
-        } else {
+        });
+      } else if (!_userDetached) {
+        // 流式追加/增量更新：平滑跟随
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
           _scrollToBottomSmooth();
-        }
-      });
-    } else if (!_nearBottom) {
-      // 用户在查看历史：底部新增内容（工具卡片推送/流式追加等）会抬高
-      // 反转列表的 maxScrollExtent，固定 offset 时视口内容整体向新消息
-      // 方向偏移，表现为「推送一个卡片就下滚一个卡片高度」。
-      // 锚定视口顶部第一条可见消息，布局完成后按消息实际位置精确还原，
-      // 彻底消除被动下滚（不依赖未构建卡片高度的估算值）。
+        });
+      } else {
+        // 用户在看历史：锁定视口（细节见 _captureAnchorAndRestore）
+        _captureAnchorAndRestore();
+      }
+    } else if (_userDetached) {
+      // 用户在查看历史时的一切内容更新（含流式追加）：锁定视口
       _captureAnchorAndRestore();
     }
     // 定位触发：scrollToRevision 变化且存在目标消息 id
@@ -166,6 +178,12 @@ class _MessageListViewState extends State<_MessageListView> {
   /// 沿该坐标逐帧校正 offset（迭代至残差 <0.5px），使视口内容保持不动。
   void _captureAnchorAndRestore() {
     if (!_controller.hasClients) return;
+    // 用户手势/惯性滚动进行中：跳过校正（避免与用户滚动打架/跳变），
+    // 滚动结束后由 ScrollEndNotification 统一结算一次
+    if (_controller.position.isScrollingNotifier.value) {
+      _anchorPending = true;
+      return;
+    }
     final String? id = _firstVisibleMessageId();
     if (id == null) return;
     final BuildContext? ctx = _itemKeys[id]?.currentContext;
@@ -211,6 +229,11 @@ class _MessageListViewState extends State<_MessageListView> {
   /// 校正一帧：把锚定消息移回其原全局 y 坐标；残差大时下一帧继续。
   void _restoreAnchorStep() {
     if (!mounted || !_controller.hasClients || _anchorId == null) return;
+    // 用户在滚动（拖拽/惯性）：暂停校正，滚动结束后结算
+    if (_controller.position.isScrollingNotifier.value) {
+      _anchorPending = true;
+      return;
+    }
     final BuildContext? ctx = _itemKeys[_anchorId]?.currentContext;
     if (ctx == null) return;
     final RenderBox? ro = ctx.findRenderObject() as RenderBox?;
@@ -248,6 +271,8 @@ class _MessageListViewState extends State<_MessageListView> {
       );
       setState(() {
         _highlightedId = id;
+        // 定位到历史消息：视为用户脱离跟随（不把视口再拽回底部）
+        _userDetached = true;
       });
       _highlightTimer?.cancel();
       _highlightTimer = Timer(const Duration(seconds: 2), () {
@@ -272,12 +297,40 @@ class _MessageListViewState extends State<_MessageListView> {
     }
   }
 
-  /// 监听滚动位置，更新 _nearBottom 标志
-  void _onScroll() {
-    if (!_controller.hasClients) return;
-    final double pos = _controller.position.pixels;
-    // 反转列表：offset 0 即视觉底部，靠近底部 = pixels 接近 0
-    _nearBottom = pos < 120;
+  /// 滚动通知：维护「用户脱离」状态与锚定校正结算。
+  ///
+  /// - 用户拖拽（dragDetails != null）离开底部超过 [_detachThreshold] →
+  ///   置位脱离（此后新内容不再把视口拽回底部）；拖回底部附近 → 恢复跟随。
+  /// - 滚动结束（拖拽/惯性停止）：结算挂起的锚定校正。
+  ///
+  /// 注意：程序性滚动（jumpTo/animateTo）不携带 dragDetails，不影响脱离状态。
+  bool _onScrollNotification(ScrollNotification notification) {
+    final double pixels = notification.metrics.pixels;
+    if (notification is ScrollUpdateNotification &&
+        notification.dragDetails != null) {
+      if (!_userDetached && pixels > _detachThreshold) {
+        _setUserDetached(true);
+      } else if (_userDetached && pixels <= _detachThreshold) {
+        _setUserDetached(false);
+      }
+    } else if (notification is ScrollEndNotification) {
+      if (_userDetached && pixels <= _detachThreshold) {
+        _setUserDetached(false);
+      }
+      if (_anchorPending) {
+        _anchorPending = false;
+        _captureAnchorAndRestore();
+      }
+    }
+    return false;
+  }
+
+  /// 更新脱离状态（仅在变化时 setState，驱动「回到底部」按钮显隐）
+  void _setUserDetached(bool value) {
+    if (_userDetached == value) return;
+    setState(() {
+      _userDetached = value;
+    });
   }
 
   /// 无动画直达底部。
@@ -292,8 +345,8 @@ class _MessageListViewState extends State<_MessageListView> {
 
   /// 平滑滚动到底部（流式追加/增量更新时跟随）。
   ///
-  /// 反转列表底部即 offset 0；动画完成后校正一次，
-  /// 兼容动画被用户触摸打断未到底的情况。
+  /// 反转列表底部即 offset 0；动画完成后**仅在仍应跟随**时校正一次。
+  /// （修复：不再无条件 jumpTo(0)，避免用户拖拽打断动画后被强行拉回底部）
   void _scrollToBottomSmooth() {
     if (!_controller.hasClients) return;
     _controller
@@ -303,7 +356,9 @@ class _MessageListViewState extends State<_MessageListView> {
           curve: Curves.easeOut,
         )
         .then((_) {
-      if (!mounted) return;
+      if (!mounted || !_controller.hasClients) return;
+      // 用户已主动脱离（动画可能被其拖拽打断）：保持用户当前位置
+      if (_userDetached) return;
       _jumpToBottom();
     });
   }
@@ -311,7 +366,6 @@ class _MessageListViewState extends State<_MessageListView> {
   @override
   void dispose() {
     _highlightTimer?.cancel();
-    _controller.removeListener(_onScroll);
     _controller.dispose();
     super.dispose();
   }
@@ -337,67 +391,120 @@ class _MessageListViewState extends State<_MessageListView> {
         ),
       );
     }
-    return ListView.builder(
-      controller: _controller,
-      // 反转列表：offset 0 即视觉底部。配合 itemBuilder 的反向索引，
-      // 视觉上「顶→底 = 旧→新」，最新消息固定显示在底部：
-      // 打开会话时首帧直接渲染在底部（最新消息），无「顶部闪一下再滑到底」；
-      // 追加新消息不顶动视图；查看历史向上滚。
-      reverse: true,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      itemCount: widget.messages.length,
-      itemBuilder: (BuildContext context, int index) {
-        // 反转列表中 index 0 渲染在视觉底部，故反向取数据：
-        // messages[len-1]（最新）在底部，messages[0]（最旧）在顶部
-        final ChatMessage message =
-            widget.messages[widget.messages.length - 1 - index];
-        // 工具调用卡片：默认折叠，独立渲染
-        Widget child;
-        if (message.kind == 'tool') {
-          child = Padding(
-            padding: const EdgeInsets.only(bottom: 4),
-            child: ToolCallCard(message: message),
-          );
-        } else if (message.kind == 'thinking') {
-          // 思考（推理）卡片：默认折叠，可展开查看完整推理内容
-          child = Padding(
-            padding: const EdgeInsets.only(bottom: 4),
-            child: ThinkingCard(message: message),
-          );
-        } else if (message.kind == 'ask_user_question') {
-          // 内联提问卡片：非阻塞，允许查看上下文与右侧信息后再作答
-          child = Padding(
-            padding: const EdgeInsets.only(bottom: 12),
-            child: _AskQuestionCard(
-              message: message,
-              onAnswer: widget.onAskAnswer,
-            ),
-          );
-        } else {
-          child = Padding(
-            padding: const EdgeInsets.only(bottom: 12),
-            child: _MessageBubble(message: message),
-          );
-        }
-        // 定位目标：为每条消息挂 GlobalKey，命中定位时短暂高亮
-        final GlobalKey key =
-            _itemKeys.putIfAbsent(message.id, GlobalKey.new);
-        final bool highlighted = _highlightedId == message.id;
-        if (!highlighted) {
-          return KeyedSubtree(key: key, child: child);
-        }
-        final ColorScheme cs = Theme.of(context).colorScheme;
-        return Container(
-          key: key,
-          decoration: BoxDecoration(
-            color: cs.primary.withOpacity(0.10),
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: cs.primary, width: 2),
+    return Stack(
+      children: <Widget>[
+        // 滚动通知：维护用户脱离状态 / 结算锚定校正（见 _onScrollNotification）
+        NotificationListener<ScrollNotification>(
+          onNotification: _onScrollNotification,
+          child: ListView.builder(
+            controller: _controller,
+            // 反转列表：offset 0 即视觉底部。配合 itemBuilder 的反向索引，
+            // 视觉上「顶→底 = 旧→新」，最新消息固定显示在底部：
+            // 打开会话时首帧直接渲染在底部（最新消息），无「顶部闪一下再滑到底」；
+            // 追加新消息不顶动视图；查看历史向上滚。
+            reverse: true,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            itemCount: widget.messages.length,
+            itemBuilder: (BuildContext context, int index) {
+              // 反转列表中 index 0 渲染在视觉底部，故反向取数据：
+              // messages[len-1]（最新）在底部，messages[0]（最旧）在顶部
+              final ChatMessage message =
+                  widget.messages[widget.messages.length - 1 - index];
+              // 工具调用卡片：默认折叠，独立渲染
+              Widget child;
+              if (message.kind == 'tool') {
+                child = Padding(
+                  padding: const EdgeInsets.only(bottom: 4),
+                  child: ToolCallCard(message: message),
+                );
+              } else if (message.kind == 'thinking') {
+                // 思考（推理）卡片：默认折叠，可展开查看完整推理内容
+                child = Padding(
+                  padding: const EdgeInsets.only(bottom: 4),
+                  child: ThinkingCard(message: message),
+                );
+              } else if (message.kind == 'ask_user_question') {
+                // 内联提问卡片：非阻塞，允许查看上下文与右侧信息后再作答
+                child = Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: _AskQuestionCard(
+                    message: message,
+                    onAnswer: widget.onAskAnswer,
+                  ),
+                );
+              } else {
+                child = Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: _MessageBubble(message: message),
+                );
+              }
+              // 定位目标：为每条消息挂 GlobalKey，命中定位时短暂高亮
+              final GlobalKey key =
+                  _itemKeys.putIfAbsent(message.id, GlobalKey.new);
+              final bool highlighted = _highlightedId == message.id;
+              if (!highlighted) {
+                return KeyedSubtree(key: key, child: child);
+              }
+              final ColorScheme cs = Theme.of(context).colorScheme;
+              return Container(
+                key: key,
+                decoration: BoxDecoration(
+                  color: cs.primary.withOpacity(0.10),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: cs.primary, width: 2),
+                ),
+                child: child,
+              );
+            },
           ),
-          child: child,
-        );
-      },
+        ),
+        // 「回到底部」按钮：用户脱离跟随（向上查看历史）时显示，
+        // 点击后平滑回到底部并恢复自动跟随
+        Positioned(
+          right: 16,
+          bottom: 16,
+          child: AnimatedOpacity(
+            opacity: _userDetached ? 1 : 0,
+            duration: const Duration(milliseconds: 150),
+            child: IgnorePointer(
+              ignoring: !_userDetached,
+              child: _buildScrollToBottomButton(),
+            ),
+          ),
+        ),
+      ],
     );
+  }
+
+  /// 「回到底部」悬浮按钮
+  Widget _buildScrollToBottomButton() {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: '回到底部',
+      child: Material(
+        color: cs.surface,
+        elevation: 3,
+        shape: const CircleBorder(),
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: _scrollToBottomFromButton,
+          child: Padding(
+            padding: const EdgeInsets.all(8),
+            child: Icon(
+              Icons.arrow_downward,
+              size: 18,
+              color: cs.onSurfaceVariant,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 点击「回到底部」：恢复跟随并平滑滚到底
+  void _scrollToBottomFromButton() {
+    _setUserDetached(false);
+    _scrollToBottomSmooth();
   }
 }
 
@@ -570,12 +677,14 @@ class _MessageBubbleState extends State<_MessageBubble> {
       );
     }
     // agent 消息渲染 markdown（模型输出默认 markdown 格式）
-    // - hover 显示「复制全文」按钮（一次性复制完整内容，不因选段拆断）
-    // - 外层 SelectionArea 兜底跨段落选择复制（markdown 内部 selectable 关闭避免嵌套冲突）
+    // - selectable: true → 段落/代码块内可任意框选复制（Flutter 3.7 下
+    //   SelectionArea 无法选择 flutter_markdown 输出的 RichText，故启用
+    //   markdown 自带选择模式；跨段落一次性拖选不受支持）
+    // - hover 显示「复制全文」按钮（跨段落整条复制兜底）
     return _buildMarkdownContent(message, textColor);
   }
 
-  /// 构建 agent 消息的 markdown 内容：SelectionArea 兜底 + hover「复制全文」按钮
+  /// 构建 agent 消息的 markdown 内容：可选择文本 + hover「复制全文」按钮
   Widget _buildMarkdownContent(ChatMessage message, Color textColor) {
     final bool streaming = message.isStreaming;
     return MouseRegion(
@@ -592,13 +701,11 @@ class _MessageBubbleState extends State<_MessageBubble> {
       child: Stack(
         clipBehavior: Clip.none,
         children: [
-          // SelectionArea 提供跨段落选择复制
-          SelectionArea(
-            child: MarkdownBody(
-              data: message.content,
-              selectable: false,
-              styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)),
-            ),
+          // selectable: true → 段落/代码块内可框选复制（跨段落复制用「复制全文」）
+          MarkdownBody(
+            data: message.content,
+            selectable: true,
+            styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)),
           ),
           // 流式输出中不显示复制按钮（内容仍在变化）
           if (_hoverCopy && !streaming)

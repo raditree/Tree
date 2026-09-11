@@ -1629,9 +1629,12 @@ async def _stream_agent_reply(
     :param silent: 静默模式。为 True 时不向前端推送任何 WS 事件（文本段、
                    工具卡片、历史持久化均跳过），仅执行工具与写活动日志，
                    用于后台记忆更新阶段。
-    :return: ``(full_text, status, last_text_id)``，status 为 ``"ok"`` /
-             ``"cancelled"`` / ``"error"``；``last_text_id`` 为结束时仍打开的
-             文本段 id（可能为 None），供调用方在确定 usage 后补发 ``msg_usage``。
+    :return: ``(full_text, status, last_text_id, final_reply_text)``，status 为
+             ``"ok"`` / ``"cancelled"`` / ``"error"``；``last_text_id`` 为结束时
+             仍打开的文本段 id（可能为 None），供调用方在确定 usage 后补发
+             ``msg_usage``；``final_reply_text`` 为"最终回复"文本（结束时仍打开
+             的文本段内容；纯工具轮/错误轮回退 full_text；过程段均已关闭时为空串），
+             供调用方持久化/回传，避免最后一条携带全部过程文字。
     """
     loop = asyncio.get_running_loop()
     # 顺带绑定主事件循环：分发层从工具线程推送 WS（session_created /
@@ -1672,6 +1675,9 @@ async def _stream_agent_reply(
     full_parts: List[str] = []
     text_parts: List[str] = []  # 当前文本段的累积内容
     text_id: Optional[str] = None
+    # 本轮是否产出过文本段（含已随工具调用关闭的中间段）：决定结束时的
+    # "最终回复"取值策略（本轮从未产出文本段时回退 full_text 兜底）
+    text_seen = False
     # 最后一次工具调用摘要（纯 tool loop 无文字输出时，兜底为回复内容推送
     # 给上一级 leader，避免成员完成工作后 leader 收不到任何结果）
     last_tool_text = ""
@@ -1802,6 +1808,7 @@ async def _stream_agent_reply(
                 content = item.get("content", "")
                 full_parts.append(content)
                 text_parts.append(content)
+                text_seen = True
                 if not silent:
                     if text_id is None:
                         text_id = _new_seg_id(agent_id)
@@ -1929,7 +1936,21 @@ async def _stream_agent_reply(
         and last_tool_text
     ):
         full_parts.append(f"（本轮无文字输出，最后执行：{last_tool_text}）")
-    return "".join(full_parts), status, last_text_id
+
+    # 最终回复文本（第 4 个返回值，供调用方持久化/回传）：
+    # - 结束时仍打开的文本段即"最终回复"，取其内容；
+    # - 本轮从未产出文本段（纯工具轮/错误轮）：回退 full_text（兜底摘要或
+    #   错误信息），保证调用方仍有一条可展示的回复；
+    # - 其余情况（文本段均已随工具调用关闭并各自持久化为独立消息）：返回
+    #   空串——调用方不得再保存全量拼接，避免历史最后一条携带全部过程文字。
+    if text_id is not None:
+        final_reply_text = "".join(text_parts)
+    elif not text_seen and full_parts:
+        final_reply_text = "".join(full_parts)
+    else:
+        final_reply_text = ""
+
+    return "".join(full_parts), status, last_text_id, final_reply_text
 
 
 async def _process_member_message(
@@ -2144,7 +2165,7 @@ async def _process_member_message(
                                            "session_id": session_id}},
     )
     try:
-        full_reply, _status, _last = await _stream_agent_reply(
+        full_reply, _status, _last, _final_text = await _stream_agent_reply(
             user_id,
             agent_id,
             workspace_id,
@@ -2162,9 +2183,10 @@ async def _process_member_message(
                 {"type": "msg_end", "id": _last, "agent_id": agent_id,
                  "usage": None, "session_id": session_id},
             )
-        # 保存成员回复到历史（teammates 进度页可加载显示）
-        if full_reply:
-            _store_message(user_id, agent_id, "agent", full_reply,
+        # 保存成员回复到历史（teammates 进度页可加载显示）：仅保存"最终回复"，
+        # 中间过程段已各自独立持久化，避免最后一条携带全部过程文字
+        if _final_text:
+            _store_message(user_id, agent_id, "agent", _final_text,
                            session_id=session_id)
         await _append_activity_log_async(
             workspace_id, f"[{_clock_now()}] [done(成员)] 回复完成",
@@ -2172,13 +2194,13 @@ async def _process_member_message(
         )
         # 成员工具循环最后一次回复的 content 自动回发"最后将消息发给它的那位"
         # （用户直发时为 USER_AGENT_ID/空串 → 不转发任何 agent，仅留在成员
-        # 会话/teammates 窗口）
-        if full_reply and not is_user_sender(reply_sender):
+        # 会话/teammates 窗口）。仅回传"最终回复"，不带过程段拼接。
+        if _final_text and not is_user_sender(reply_sender):
             try:
                 _dispatch_agent_message(
                     user_id,
                     [reply_sender],
-                    f"[成员 {agent_id} 完成回复] {full_reply}",
+                    f"[成员 {agent_id} 完成回复] {_final_text}",
                     source_agent_id=agent_id,
                     team_id=team_id or reply_sender,
                     extra={"auto_reply": True, "session_id": session_id},
@@ -2832,6 +2854,8 @@ async def _handle_user_message(
     session = None
     full_reply = ""
     last_text_id = None
+    # "最终回复"文本（仅最后一个文本段，供持久化；不含过程段拼接）
+    final_reply_text = ""
     try:
         # normal LLM：按 (user_id, agent_id, session_id) 复用会话，使上下文跨消息累积
         session = get_session(user_id, agent_id, session_id)
@@ -2933,7 +2957,7 @@ async def _handle_user_message(
         context_before = list(session.context) if session is not None else []
 
         # 在后台线程运行 chat 循环，实时推送中间输出与工具调用
-        full_reply, stream_status, last_text_id = await _stream_agent_reply(
+        full_reply, stream_status, last_text_id, final_reply_text = await _stream_agent_reply(
             user_id,
             agent_id,
             workspace_id,
@@ -3011,13 +3035,16 @@ async def _handle_user_message(
                 },
             )
 
-        # 保存 agent 回复到历史（附带 token 用量，便于切换 agent 后恢复显示）
-        if full_reply:
+        # 保存 agent 回复到历史（仅"最终回复"，附带 token 用量，便于切换
+        # agent 后恢复显示）。中间过程段（thinking / 工具卡片 / 中间文本段）
+        # 已各自独立持久化，此处不再保存全量拼接——避免会话历史最后一条
+        # 携带该过程中的所有过程性输出文字。
+        if final_reply_text:
             _store_message(
                 user_id,
                 agent_id,
                 "agent",
-                full_reply,
+                final_reply_text,
                 usage=usage_payload,
                 session_id=session_id,
             )

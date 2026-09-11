@@ -97,7 +97,7 @@ void main() {
   testWidgets('A1 现状: SelectionArea + selectable:false', (tester) async {
     installClipboardMock(tester);
     await tester.pumpWidget(
-      wrap(SelectionArea(child: MarkdownBody(data: md1))),
+      wrap(const SelectionArea(child: MarkdownBody(data: md1))),
     );
     await tester.pumpAndSettle();
 

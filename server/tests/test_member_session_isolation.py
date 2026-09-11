@@ -104,7 +104,7 @@ def _fake_stream_ok():
     async def _fake(user_id, agent_id, workspace_id, session,
                     content, on_tool_turn=None, cancel_event=None,
                     session_id=None, team_id=None):
-        return ("成员回复", "ok", None)
+        return ("成员回复", "ok", None, "成员回复")
 
     return _fake
 
@@ -221,7 +221,7 @@ class TestCrossSessionQueueIsolation(unittest.TestCase):
                                session_id=None, team_id=None):
             # 模拟 tool_call 间隙的切入检查
             picked["value"] = on_tool_turn() if on_tool_turn else None
-            return ("成员回复", "ok", None)
+            return ("成员回复", "ok", None, "成员回复")
 
         captured = {}
         with ExitStack() as stack:
@@ -248,7 +248,7 @@ class TestCrossSessionQueueIsolation(unittest.TestCase):
                                content, on_tool_turn=None, cancel_event=None,
                                session_id=None, team_id=None):
             picked["value"] = on_tool_turn() if on_tool_turn else None
-            return ("成员回复", "ok", None)
+            return ("成员回复", "ok", None, "成员回复")
 
         captured = {}
         with ExitStack() as stack:

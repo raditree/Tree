@@ -52,7 +52,7 @@ def _make_fake_stream(insert_cb=None):
                            session_id=None, team_id=None):
         if insert_cb is not None:
             insert_cb(on_tool_turn)
-        return ("成员最终总结内容", "ok", None)
+        return ("成员最终总结内容", "ok", None, "成员最终总结内容")
     return _fake_stream
 
 

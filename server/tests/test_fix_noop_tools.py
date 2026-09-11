@@ -230,7 +230,7 @@ class TestMemberReplyFallbackPushback(unittest.TestCase):
                 patch.object(chat_mod, "_new_seg_id", return_value="seg1"), \
                 patch.object(chat_mod, "_store_message", return_value=None), \
                 patch("agent.chat.state.ws_manager", ws):
-            full, status, last_id = asyncio.run(
+            full, status, last_id, final_text = asyncio.run(
                 chat_mod._stream_agent_reply(
                     "u1", "mem-1", "w1", FakeSession(), "do it",
                     session_id="s1"))
@@ -238,6 +238,8 @@ class TestMemberReplyFallbackPushback(unittest.TestCase):
         # 兜底内容包含最后一次工具调用摘要
         self.assertIn("terminal", full)
         self.assertIn("提交成功: abc123", full)
+        # 纯工具轮：最终回复回退兜底文本（供调用方持久化/回传）
+        self.assertEqual(final_text, full)
 
     def test_stream_reply_keeps_text_when_present(self):
         import asyncio
@@ -259,17 +261,28 @@ class TestMemberReplyFallbackPushback(unittest.TestCase):
                 }
                 yield {"type": "text", "content": "总结完毕"}
 
+        stored: list = []
+
+        def _fake_store(user_id, agent_id, role, content, **kwargs):
+            stored.append(content)
+
         ws = MagicMock(send_message=AsyncMock())
         with patch.object(chat_mod, "_append_activity_log", return_value=None), \
                 patch.object(chat_mod, "_new_seg_id", return_value="seg1"), \
-                patch.object(chat_mod, "_store_message", return_value=None), \
+                patch.object(chat_mod, "_store_message",
+                             side_effect=_fake_store), \
                 patch("agent.chat.state.ws_manager", ws):
-            full, status, last_id = asyncio.run(
+            full, status, last_id, final_text = asyncio.run(
                 chat_mod._stream_agent_reply(
                     "u1", "mem-1", "w1", FakeSession(), "do it",
                     session_id="s1"))
-        # 有文字输出时不兜底，保持原文本（拼接所有 text 段）
+        # 有文字输出时不兜底，full 保持全量拼接（活动日志/兜底用途）
         self.assertEqual(full, "已完成任务总结完毕")
+        # 最终回复只含最后一个文本段（"总结完毕"），不携带过程段
+        self.assertEqual(final_text, "总结完毕")
+        # 函数内仅持久化中间段（工具调用前关闭的那段），不保存全量拼接
+        self.assertIn("已完成任务", stored)
+        self.assertNotIn("已完成任务总结完毕", stored)
 
     def test_member_reply_pushed_to_leader_when_tool_loop(self):
         """成员 tool loop 结束（_stream_agent_reply 返回兜底文本）后，
@@ -290,7 +303,8 @@ class TestMemberReplyFallbackPushback(unittest.TestCase):
                                content, on_tool_turn=None, cancel_event=None,
                                session_id=None, team_id=None):
             return ("（本轮无文字输出，最后执行：[工具 terminal] 提交成功: abc123）",
-                    "ok", None)
+                    "ok", None,
+                    "（本轮无文字输出，最后执行：[工具 terminal] 提交成功: abc123）")
 
         q = _queue.Queue()
         with patch.object(chat_mod, "_stream_agent_reply", new=_fake_stream), \
