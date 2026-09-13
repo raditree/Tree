@@ -4,10 +4,10 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:tree/ui/models/message.dart';
 import 'package:tree/ui/widgets/message_list.dart';
 
-/// 回归测试：用户向上滚动查看历史时，底部推送新工具卡片，
-/// 视口内容必须保持稳定（不滚回底部、也不被动下滚一个卡片高度）。
+/// 回归测试：用户上滚进入阅读模式后，底部推送新工具卡片，
+/// 视口内容必须保持稳定（不滚回底部、也不发生任何漂移）。
 void main() {
-  testWidgets('查看历史时推送工具卡片：视口内容位置不变', (WidgetTester tester) async {
+  testWidgets('阅读模式推送工具卡片：视口内容位置不变', (WidgetTester tester) async {
     // 30 条历史文本消息，内容唯一（user 角色：SelectableText 渲染，
     // find.text 可直接匹配，且单行高度恒定）
     final List<ChatMessage> initial = <ChatMessage>[
@@ -38,7 +38,7 @@ void main() {
     await tester.pumpWidget(buildList(initial, 0));
     await tester.pumpAndSettle();
 
-    // 用户向上滚动查看历史（反转列表：向下拖动 = 滚向更旧消息）
+    // 向下拖动 = 看更旧内容 → 进入阅读模式（列表为常规布局）
     await tester.drag(find.byType(ListView), const Offset(0, 300));
     await tester.pumpAndSettle();
 
@@ -47,7 +47,7 @@ void main() {
     expect(anchor, findsOneWidget);
     final double beforeDy = tester.getTopLeft(anchor).dy;
 
-    // 推送一个工具调用卡片：底部新增一条消息 + revision 递增
+    // 推送一个工具调用卡片：末尾新增一条消息 + revision 递增
     final List<ChatMessage> updated = List<ChatMessage>.from(initial)
       ..add(ChatMessage(
         id: 'tool-1',
@@ -61,7 +61,7 @@ void main() {
     await tester.pumpWidget(buildList(updated, 1));
     await tester.pumpAndSettle();
 
-    // 锚点消息仍在视口内，且屏幕位置不变（没有被动下滚）
+    // 锚点消息仍在视口内，且屏幕位置不变（无被动下滚、无漂移）
     expect(anchor, findsOneWidget);
     final double afterDy = tester.getTopLeft(anchor).dy;
     expect(

@@ -7,7 +7,7 @@ read:
     何时使用: 修改任何文件前必须先 read 看清楚当前内容；查找代码/配置/文档内容；排查问题时读取相关文件；读取图像文件（png/jpg/jpeg/webp/gif，自动识别并返回 base64）
     何时不用: 已确定文件内容无需重读；大目录浏览用 Terminal ls
     前置依赖: 文件必须存在于工作空间；file_path 必须为工作空间内相对路径（如 lib/foo.dart），禁止绝对路径或盘符（如 E:\foo.dart、E:/foo.dart 会被拒绝）
-    省钱技巧: 大文件用 start_line/line_count 只读需要的行为表/函数，避免整文件全读占用大量上下文
+    省钱技巧: `read` 时设置 start_line/line_count ，只读需要的行为表/函数，避免整文件全读占用大量上下文
 
 write:
   version: 2

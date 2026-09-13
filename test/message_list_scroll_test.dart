@@ -4,21 +4,33 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:tree/ui/models/message.dart';
 import 'package:tree/ui/widgets/message_list.dart';
 
-/// MessageList 滚动跟随行为测试
+/// MessageList 跟随/阅读模式行为测试
+///
+/// 列表为常规（非反转）布局：offset 0 = 顶部（最旧），maxScrollExtent = 底部。
+/// 两种模式（由「与底部距离」判定）：
+/// - 跟随模式：与底部距离 ≤1px，内容变化时本帧同步钉底；
+/// - 阅读模式：一旦离开底部即进入，视口锁定、不做任何补偿（零漂移）。
 ///
 /// 覆盖：
 /// - 贴底时新增消息保持贴底、回底按钮隐藏；
-/// - 用户上滚脱离后，内容更新不把视口拽回底部（核心回归）；
-/// - 「回到底部」按钮：显隐 / 点击回底 / 回底动画被拖拽打断后不回拽；
-/// - 滚回底部附近自动恢复跟随；
+/// - 用户上滚进入阅读后，内容更新既不移动已渲染内容、也不改变 offset（核心回归）；
+/// - 只有**完全**回到底部才恢复跟随；
+/// - 「回到底部」按钮：显隐 / 点击回底 / 回底动画被拖拽打断后不拽回；
 /// - 历史整批重载直达底部并恢复跟随；
-/// - 定位跳转进入脱离态。
+/// - 定位跳转进入阅读模式。
 void main() {
   // 取第一个 Scrollable（即外层 ListView 的），消息气泡内 EditableText 亦含 Scrollable
-  double offsetOf(WidgetTester tester) => tester
+  ScrollPosition positionOf(WidgetTester tester) => tester
       .state<ScrollableState>(find.byType(Scrollable).first)
-      .position
-      .pixels;
+      .position;
+
+  double offsetOf(WidgetTester tester) => positionOf(tester).pixels;
+
+  /// 与底部的距离（0 = 完全压到底部）
+  double distanceFromBottom(WidgetTester tester) {
+    final ScrollPosition p = positionOf(tester);
+    return p.maxScrollExtent - p.pixels;
+  }
 
   /// 获取「回到底部」按钮的显隐透明度（0=隐藏 / 1=显示）
   double buttonOpacity(WidgetTester tester) {
@@ -41,25 +53,25 @@ void main() {
 
   testWidgets('贴底时新增消息保持贴底，回底按钮隐藏', (WidgetTester tester) async {
     final GlobalKey<_HarnessState> key = await pumpList(tester);
-    expect(offsetOf(tester), 0);
+    expect(distanceFromBottom(tester), lessThanOrEqualTo(1));
 
     key.currentState!.addMessage();
     await tester.pumpAndSettle();
 
-    expect(offsetOf(tester), lessThanOrEqualTo(1));
+    expect(distanceFromBottom(tester), lessThanOrEqualTo(1));
     expect(buttonOpacity(tester), 0);
   });
 
-  testWidgets('用户上滚脱离后，内容更新不把视口拽回底部（核心回归）',
+  testWidgets('上滚进入阅读后：内容更新不移动视口、offset 零漂移（核心回归）',
       (WidgetTester tester) async {
     final GlobalKey<_HarnessState> key = await pumpList(tester);
 
-    // 向上翻历史（反转列表：向下拖动 = 看更旧内容）
+    // 向下拖动 = 看更旧内容 → 进入阅读模式
     await tester.dragFrom(blankPoint, const Offset(0, 260));
     await tester.pumpAndSettle();
     final double off1 = offsetOf(tester);
-    expect(off1, greaterThan(150));
-    expect(buttonOpacity(tester), 1); // 脱离态：按钮出现
+    expect(distanceFromBottom(tester), greaterThan(150));
+    expect(buttonOpacity(tester), 1); // 阅读模式：按钮出现
 
     // 记录一条可见锚点消息的 y 坐标（用于验证视口锁定）
     String? anchor;
@@ -81,66 +93,64 @@ void main() {
     key.currentState!.touch();
     await tester.pumpAndSettle();
 
-    final double off2 = offsetOf(tester);
-    expect(off2, greaterThan(100)); // 未被拽回底部
-    expect(off2, greaterThanOrEqualTo(off1 - 1)); // 不回退
+    // 关键回归：offset 完全不变（零漂移），且未被拽回底部
+    expect((offsetOf(tester) - off1).abs(), lessThan(0.5),
+        reason: '阅读模式下属视口锁定，offset 不应发生任何漂移');
+    expect(distanceFromBottom(tester), greaterThan(100));
 
     final double dy2 = tester.getTopLeft(find.text(anchor!).first).dy;
-    expect((dy2 - anchorDy!).abs(), lessThan(4)); // 视口锁定：锚点消息不动
+    expect((dy2 - anchorDy!).abs(), lessThan(1));
   });
 
-  testWidgets('鼠标滚轮上滚脱离后：新消息推送不把视口拽回底部（滚轮场景）',
+  testWidgets('鼠标滚轮上滚进入阅读后：新消息推送不把视口拽回底部（滚轮场景）',
       (WidgetTester tester) async {
     final GlobalKey<_HarnessState> key = await pumpList(tester);
 
-    // 桌面端典型操作：鼠标滚轮 / 拖动滚动条翻阅历史。二者在滚动通知层
-    // 都表现为「无 dragDetails 的 ScrollUpdateNotification」（与在列表上
-    // 拖拽不同），这里以 position.jumpTo 模拟该形态（滚轮事件在测试中
-    // 会被消息内层富文本组件优先截获，无法直接注入到外层列表）。
-    tester.state<ScrollableState>(find.byType(Scrollable).first)
-        .position
-        .jumpTo(400);
+    // 桌面端典型操作：鼠标滚轮 / 拖动滚动条。以 position.jumpTo 模拟该形态
+    final ScrollPosition pos = positionOf(tester);
+    pos.jumpTo(pos.maxScrollExtent - 400);
     await tester.pumpAndSettle();
 
-    // 已把视口移离底部，且应进入脱离态（回底按钮出现）
-    final double off1 = offsetOf(tester);
-    expect(off1, greaterThan(12));
+    expect(distanceFromBottom(tester), greaterThan(1));
     expect(buttonOpacity(tester), 1);
 
-    // 此时推送新消息（msg_start / 流式增量 / 工具卡片到达）
+    final double off1 = offsetOf(tester);
     key.currentState!.addMessage();
     await tester.pumpAndSettle();
 
-    // 关键回归：不得被拽回底部，脱离态保持
-    expect(offsetOf(tester), greaterThan(12));
+    expect((offsetOf(tester) - off1).abs(), lessThan(0.5));
     expect(buttonOpacity(tester), 1);
   });
 
-  testWidgets('滚轮方式滚回底部附近自动恢复跟随', (WidgetTester tester) async {
+  testWidgets('只有完全压到底部才恢复跟随（差一点仍是阅读模式）',
+      (WidgetTester tester) async {
     final GlobalKey<_HarnessState> key = await pumpList(tester);
 
-    // 无拖拽参与地滚离底部（滚轮/滚动条形态）→ 进入脱离
-    final ScrollableState scrollable =
-        tester.state<ScrollableState>(find.byType(Scrollable).first);
-    scrollable.position.jumpTo(400);
+    final ScrollPosition pos = positionOf(tester);
+    pos.jumpTo(pos.maxScrollExtent - 400);
     await tester.pumpAndSettle();
     expect(buttonOpacity(tester), 1);
 
-    // 无拖拽参与地滚回底部附近 → 应恢复跟随
-    scrollable.position.jumpTo(8);
+    // 距底部 8px：未完全贴底 → 仍是阅读模式
+    pos.jumpTo(pos.maxScrollExtent - 8);
+    await tester.pumpAndSettle();
+    expect(buttonOpacity(tester), 1);
+
+    // 完全贴底 → 恢复跟随
+    pos.jumpTo(pos.maxScrollExtent);
     await tester.pumpAndSettle();
     expect(buttonOpacity(tester), 0);
 
     key.currentState!.addMessage();
     await tester.pumpAndSettle();
-    expect(offsetOf(tester), lessThanOrEqualTo(1)); // 继续跟随
+    expect(distanceFromBottom(tester), lessThanOrEqualTo(1)); // 继续跟随
   });
 
-  testWidgets('回底动画被打断后：后续滚动与恢复功能仍正常（计数不泄漏守护）',
+  testWidgets('回底动画被拖拽打断后：后续滚动与恢复功能仍正常',
       (WidgetTester tester) async {
     final GlobalKey<_HarnessState> key = await pumpList(tester);
 
-    // 上滚脱离，再点回底启动动画后用拖拽打断
+    // 进入阅读，再点回底启动动画后用拖拽打断
     await tester.dragFrom(blankPoint, const Offset(0, 260));
     await tester.pumpAndSettle();
     await tester.tap(find.byIcon(Icons.arrow_downward));
@@ -148,26 +158,24 @@ void main() {
     await tester.pump(const Duration(milliseconds: 40));
     await tester.dragFrom(blankPoint, const Offset(0, 220));
     await tester.pumpAndSettle();
-    expect(offsetOf(tester), greaterThan(80));
+    expect(distanceFromBottom(tester), greaterThan(80));
 
-    // 计数泄漏回归：若动画计数未回收（_autoScrollCount 卡 > 0），
-    // 以下所有滚动更新都会被忽略——脱离态无法恢复。
-    tester.state<ScrollableState>(find.byType(Scrollable).first)
-        .position
-        .jumpTo(8);
+    // 完全滚回底部 → 恢复跟随
+    final ScrollPosition pos = positionOf(tester);
+    pos.jumpTo(pos.maxScrollExtent);
     await tester.pumpAndSettle();
-    expect(buttonOpacity(tester), 0); // 计数正常时：已恢复跟随
+    expect(buttonOpacity(tester), 0);
 
     key.currentState!.addMessage();
     await tester.pumpAndSettle();
-    expect(offsetOf(tester), lessThanOrEqualTo(1));
+    expect(distanceFromBottom(tester), lessThanOrEqualTo(1));
   });
 
   testWidgets('回底动画进行中组件被移除：dispose 安全（无未处理异常）',
       (WidgetTester tester) async {
     await pumpList(tester);
 
-    // 制造真实动画：上滚脱离 → 点击回底（260 → 0 的 200ms 动画）
+    // 制造真实动画：进入阅读 → 点击回底（动画进行中）
     await tester.dragFrom(blankPoint, const Offset(0, 260));
     await tester.pumpAndSettle();
     await tester.tap(find.byIcon(Icons.arrow_downward));
@@ -175,7 +183,6 @@ void main() {
     await tester.pump(const Duration(milliseconds: 40)); // 动画进行中
 
     // 动画未完成即移除组件：future 在 dispose 后完成，回调不得抛异常
-    // （存在未处理异步异常时本测试将失败）
     await tester.pumpWidget(const SizedBox());
     await tester.pumpAndSettle();
   });
@@ -189,7 +196,7 @@ void main() {
     await tester.tap(find.byIcon(Icons.arrow_downward));
     await tester.pumpAndSettle();
 
-    expect(offsetOf(tester), lessThanOrEqualTo(1));
+    expect(distanceFromBottom(tester), lessThanOrEqualTo(1));
     expect(buttonOpacity(tester), 0);
   });
 
@@ -198,7 +205,7 @@ void main() {
     await tester.dragFrom(blankPoint, const Offset(0, 260));
     await tester.pumpAndSettle();
 
-    // 点击回底 → 动画启动（260 → 0，200ms）
+    // 点击回底 → 动画启动
     await tester.tap(find.byIcon(Icons.arrow_downward));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 40));
@@ -207,11 +214,11 @@ void main() {
     await tester.dragFrom(blankPoint, const Offset(0, 220));
     await tester.pumpAndSettle();
 
-    // 关键回归：不得被无条件 jumpTo(0) 拽回底部
-    expect(offsetOf(tester), greaterThan(80));
+    // 关键回归：不得被无条件拉回底部
+    expect(distanceFromBottom(tester), greaterThan(80));
   });
 
-  testWidgets('滚回底部附近自动恢复跟随', (WidgetTester tester) async {
+  testWidgets('拖拽回到底部：自动恢复跟随', (WidgetTester tester) async {
     final GlobalKey<_HarnessState> key = await pumpList(tester);
     await tester.dragFrom(blankPoint, const Offset(0, 260));
     await tester.pumpAndSettle();
@@ -220,12 +227,12 @@ void main() {
     // 反向拖回底部
     await tester.dragFrom(blankPoint, const Offset(0, -320));
     await tester.pumpAndSettle();
-    expect(offsetOf(tester), lessThanOrEqualTo(1));
+    expect(distanceFromBottom(tester), lessThanOrEqualTo(1));
     expect(buttonOpacity(tester), 0); // 已恢复跟随
 
     key.currentState!.addMessage();
     await tester.pumpAndSettle();
-    expect(offsetOf(tester), lessThanOrEqualTo(1)); // 继续跟随
+    expect(distanceFromBottom(tester), lessThanOrEqualTo(1)); // 继续跟随
   });
 
   testWidgets('历史整批重载：直达底部并恢复跟随', (WidgetTester tester) async {
@@ -237,18 +244,18 @@ void main() {
     key.currentState!.reload();
     await tester.pumpAndSettle();
 
-    expect(offsetOf(tester), 0);
+    expect(distanceFromBottom(tester), lessThanOrEqualTo(1));
     expect(buttonOpacity(tester), 0);
   });
 
-  testWidgets('定位到历史消息后进入脱离态', (WidgetTester tester) async {
+  testWidgets('定位到历史消息后进入阅读模式', (WidgetTester tester) async {
     final GlobalKey<_HarnessState> key = await pumpList(tester);
 
     key.currentState!.locate('m5');
     await tester.pumpAndSettle();
 
-    expect(offsetOf(tester), greaterThan(100)); // 已离开底部
-    expect(buttonOpacity(tester), 1); // 进入脱离态
+    expect(distanceFromBottom(tester), greaterThan(100)); // 已离开底部
+    expect(buttonOpacity(tester), 1); // 进入阅读模式
     expect(find.text('消息内容 5'), findsWidgets); // 目标消息已构建
   });
 }

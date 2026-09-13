@@ -36,9 +36,9 @@ class MessageList extends StatelessWidget {
 
   /// 本次 revision 变化是否以「无动画直达底部」方式响应。
   ///
-  /// 列表反转（reverse: true）后 offset 0 即视觉底部：历史整批重载
-  /// （切会话/切 agent/清空重拉）传 true 直接落在底部；流式追加/
-  /// 增量更新传 false 平滑滚动跟随（动画完成后校正一次）。
+  /// 历史整批重载（切会话/切 agent/清空重拉）传 true：恢复跟随并直达底部
+  /// （本帧布局阶段同步钉底）。流式追加/增量更新传 false：跟随模式下同步
+  /// 钉底；阅读模式下不做任何补偿（视口保持不动）。
   final bool bottomJump;
 
   const MessageList({
@@ -89,22 +89,21 @@ class _MessageListView extends StatefulWidget {
   State<_MessageListView> createState() => _MessageListViewState();
 }
 
-/// 「布局同帧」视口锁定滚动控制器。
+/// 底部锚定滚动控制器：把「钉在底部」做成**布局同帧**的同步操作。
 ///
-/// 反转列表底部新增/增长内容时，固定 offset 的视口内容会被推移（用户感知为
-/// 「推一个卡片就下滚一点」）。若在布局**之后**的 postFrame 里再 jumpTo 校正，
-/// 被推移的那一帧已经绘制出来——每个流式 chunk 闪一帧，表现为严重抖动。
-/// 这里把校正放进 [ScrollPosition.applyContentDimensions]（布局过程中执行，
-/// 早于绘制），实现同步、无闪烁的视口锁定。
-class _ViewportPinScrollController extends ScrollController {
-  _ViewportPinScrollController({required this.shouldPin});
+/// 列表为常规（非反转）布局：offset 0 在顶部，`maxScrollExtent` 即底部。
+/// - 跟随模式：内容变化时在布局阶段把 offset 同步钉到 `maxScrollExtent`
+///   （早于绘制，无「先位移一帧再拉回」的逐帧闪烁抖动）。
+/// - 阅读模式：**不做任何校正**。常规布局下在末尾追加/增长内容不会移动
+///   已渲染内容的坐标，视口天然稳定，因此零漂移（无需任何 offset 补偿）。
+class _BottomAnchorScrollController extends ScrollController {
+  _BottomAnchorScrollController({required this.shouldFollow});
 
-  /// 是否处于「用户查看历史」状态（需要锁定视口）
-  final bool Function() shouldPin;
+  /// 是否处于跟随模式（需要钉底）
+  final bool Function() shouldFollow;
 
-  /// 本次布局帧是否需要校正：内容变化时由 State 置位（[_schedulePin]），
-  /// 布局帧结束后清除。
-  bool pinPending = false;
+  /// 是否需要把 offset 钉到底部：内容变化/首帧时由 State 置位，布局时消费。
+  bool pinToBottom = false;
 
   @override
   ScrollPosition createScrollPosition(
@@ -112,7 +111,7 @@ class _ViewportPinScrollController extends ScrollController {
     ScrollContext context,
     ScrollPosition? oldPosition,
   ) {
-    return _ViewportPinScrollPosition(
+    return _BottomAnchorScrollPosition(
       physics: physics,
       context: context,
       oldPosition: oldPosition,
@@ -121,34 +120,27 @@ class _ViewportPinScrollController extends ScrollController {
   }
 }
 
-/// 见 [_ViewportPinScrollController]：在布局阶段把 offset 同步加回内容增量。
-class _ViewportPinScrollPosition extends ScrollPositionWithSingleContext {
-  _ViewportPinScrollPosition({
+/// 见 [_BottomAnchorScrollController]：在布局阶段把 offset 同步钉到底部。
+class _BottomAnchorScrollPosition extends ScrollPositionWithSingleContext {
+  _BottomAnchorScrollPosition({
     required super.physics,
     required super.context,
     super.oldPosition,
     required this.controller,
   });
 
-  final _ViewportPinScrollController controller;
+  final _BottomAnchorScrollController controller;
 
   @override
   bool applyContentDimensions(double minScrollExtent, double maxScrollExtent) {
-    final bool had = hasContentDimensions;
-    final double oldMax = had ? this.maxScrollExtent : maxScrollExtent;
     final bool ok =
         super.applyContentDimensions(minScrollExtent, maxScrollExtent);
-    if (ok && had && controller.pinPending && controller.shouldPin()) {
-      // 反转列表：maxScrollExtent 的增量即底部新增内容的高度；offset 同步
-      // 加回同等量即可保持视口内容不动。
-      final double delta = maxScrollExtent - oldMax;
-      if (delta.abs() > 0.01) {
-        correctPixels(
-          (pixels + delta).clamp(minScrollExtent, maxScrollExtent),
-        );
-        // 返回 false 请求 RenderViewport 用校正后的 offset 重跑布局：
-        // 校正发生在同一布局帧内（早于绘制），因此不会出现「位移一帧后
-        // 再拉回」的闪烁抖动。下一次迭代 delta 归零 → 返回 true 收敛。
+    if (ok && controller.pinToBottom && controller.shouldFollow()) {
+      controller.pinToBottom = false; // 消费一次
+      if ((pixels - maxScrollExtent).abs() > 0.01) {
+        correctPixels(maxScrollExtent.clamp(minScrollExtent, maxScrollExtent));
+        // 返回 false 请求 RenderViewport 用校正后的 offset 同帧重跑布局：
+        // 绘制前即已贴底（下一次迭代残差归零 → 返回 true 收敛）。
         return false;
       }
     }
@@ -157,23 +149,22 @@ class _ViewportPinScrollPosition extends ScrollPositionWithSingleContext {
 }
 
 class _MessageListViewState extends State<_MessageListView> {
-  /// 支持「布局同帧」视口锁定的滚动控制器（见 [_ViewportPinScrollController]）
-  late final _ViewportPinScrollController _controller;
+  /// 底部锚定滚动控制器（见 [_BottomAnchorScrollController]）
+  late final _BottomAnchorScrollController _controller;
 
-  /// 用户是否已主动脱离底部跟随：向上滚动离开底部超过 [_detachThreshold]
-  /// 后置位，此后新内容不再把视口拽回底部；回到底部附近或点击
-  /// 「回到底部」按钮后清除。
+  /// 模式开关（唯一的滚动行为状态）：
+  /// - false = 跟随模式：始终钉在底部，随新内容一起移动；
+  /// - true = 阅读模式：用户主动上滚查看历史，视口锁定、不随新内容移动。
+  ///
+  /// 进入阅读：任意一次离开底部的滚动；恢复跟随：**完全压到底部**才切换。
   bool _userDetached = false;
 
-  /// 脱离判定阈值（px）：视口离开底部超过该值即视为用户主动脱离跟随
-  static const double _detachThreshold = 12.0;
+  /// 「回到底部」动画进行中：期间的中间位置不算用户上滚（避免刚点回底
+  /// 就被判定为阅读模式）。
+  bool _returningToBottom = false;
 
-  /// 上一次滚动像素位置：用位移方向区分程序动画与用户滚动。
-  ///
-  /// 反转列表 offset 0 即底部：程序动画（animateTo 向底部）表现为像素
-  /// **减小**；用户上滚查看历史表现为像素**增大**。据此判定可避免
-  /// 「动画进行中一律忽略滚动更新」把用户的上滚也吞掉（导致无法脱离）。
-  double _lastPixels = 0;
+  /// 贴底判定阈值（px）：与底部距离不超过该值即视为「完全压到底部」。
+  static const double _bottomEpsilon = 1.0;
 
   /// 消息 id → GlobalKey（定位目标可寻址）
   final Map<String, GlobalKey> _itemKeys = <String, GlobalKey>{};
@@ -190,37 +181,28 @@ class _MessageListViewState extends State<_MessageListView> {
   @override
   void initState() {
     super.initState();
-    _controller = _ViewportPinScrollController(shouldPin: () => _userDetached);
-    // 列表为反转模式（reverse: true），初始 offset 0 即视觉底部：
-    // 打开会话时首帧直接渲染在底部（最新消息），无需任何滚动。
+    _controller = _BottomAnchorScrollController(
+      shouldFollow: () => !_userDetached,
+    );
+    // 首帧即把视口钉到底部（最新消息），避免「顶部闪一下再落底」。
+    _controller.pinToBottom = true;
   }
 
   @override
   void didUpdateWidget(covariant _MessageListView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // 仅在用户未主动脱离跟随（未向上查看历史）时，才随新消息自动滚动
     if (oldWidget.revision != widget.revision) {
       if (widget.bottomJump) {
-        // 历史整批重载（切会话/切 agent/清空重拉）：无动画直达底部，
-        // 并恢复跟随（用户可能仍停留在旧会话的脱离态）
+        // 历史整批重载（切会话/切 agent/清空重拉）：恢复跟随并直达底部
         _userDetached = false;
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!mounted) return;
-          _jumpToBottom();
-        });
+        _schedulePin();
       } else if (!_userDetached) {
-        // 流式追加/增量更新：平滑跟随。postFrame 回调再判一次脱离态：
-        // 回调排队到真正执行期间用户可能已上滚脱离，避免又把它拽回底部。
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!mounted || _userDetached) return;
-          _scrollToBottomSmooth();
-        });
-      } else {
-        // 用户在看历史：本帧布局阶段同步锁定视口（见 _schedulePin）
+        // 跟随模式：本帧布局阶段同步钉底
         _schedulePin();
       }
-    } else if (_userDetached) {
-      // 用户在查看历史时的一切内容更新（含流式追加）：本帧同步锁定视口
+      // 阅读模式：不做任何校正——常规布局下末尾新增/增长内容不会移动
+      // 已渲染内容，视口天然稳定（零漂移）。
+    } else if (!_userDetached) {
       _schedulePin();
     }
     // 定位触发：scrollToRevision 变化且存在目标消息 id
@@ -234,17 +216,9 @@ class _MessageListViewState extends State<_MessageListView> {
     }
   }
 
-  /// 请求在**本次布局帧内**同步锁定视口（细节见 [_ViewportPinScrollPosition]）。
-  ///
-  /// 反转列表底部新增/增长内容会推移视口（用户感知为「推一个卡片就下滚
-  /// 一点」）。旧实现在布局后的 postFrame 里再 jumpTo 校正：被推移的那一帧
-  /// 已绘制出来，每个流式 chunk 闪一帧 → 严重抖动。这里改为在布局阶段
-  /// （applyContentDimensions，早于绘制）同步把 offset 加回增量，闭环无闪烁。
+  /// 请求在本次布局帧内把视口同步钉到底部（细节见 [_BottomAnchorScrollPosition]）。
   void _schedulePin() {
-    _controller.pinPending = true;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _controller.pinPending = false;
-    });
+    _controller.pinToBottom = true;
   }
 
   /// 滚动定位到指定消息并短暂高亮。
@@ -282,48 +256,36 @@ class _MessageListViewState extends State<_MessageListView> {
       // 目标尚未构建：按索引比例粗跳，下一帧重试精确定位
       if (_scrollRetries >= 2 || widget.messages.isEmpty) return;
       _scrollRetries++;
-      final double ratio = idx / widget.messages.length;
-      // 反转列表：idx 越靠前（越旧）越靠近顶部（offset 大）；
-      // 按 (1 - ratio) 比例粗跳，使目标进入构建范围。
-      _controller
-          .jumpTo(_controller.position.maxScrollExtent * (1 - ratio));
+      // 常规布局：idx 越靠后（越新）越靠近底部（offset 越大），按比例粗跳
+      // 使目标进入构建范围。
+      final double ratio = widget.messages.length <= 1
+          ? 0.0
+          : idx / (widget.messages.length - 1);
+      _controller.jumpTo(_controller.position.maxScrollExtent * ratio);
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _scrollToMessage(id);
       });
     }
   }
 
-  /// 滚动通知：维护「用户脱离」状态。
+  /// 滚动通知：在「跟随 / 阅读」两种模式间切换。
   ///
-  /// - 任何来源的滚动更新（在列表上拖拽 / 鼠标滚轮 / 触控板 / 拖动滚动条 /
-  ///   惯性衰减等，均表现为 ScrollUpdateNotification）离开底部超过
-  ///   [_detachThreshold] → 进入脱离（此后新内容不再把视口拽回底部）；
-  ///   回到/接近底部 → 恢复跟随。
-  /// - 脱离判定用像素**位移方向**而非「动画计数」：反转列表向底部的
-  ///   程序动画表现为像素减小，用户上滚表现为像素增大；只要在朝远离底部
-  ///   的方向移动就立即脱离。这样流式期间跟随动画频繁重启也不会吞掉用户
-  ///   的滚动更新（旧实现整体忽略动画期更新 → 无法脱离底部）。
+  /// - 完全贴底（与底部距离 ≤ [_bottomEpsilon]）→ 跟随模式；
+  /// - 任意一次离开底部的滚动（拖拽 / 滚轮 / 触控板 / 拖动滚动条）→
+  ///   立即进入阅读模式。
+  ///
+  /// 跟随模式下的贴底由 [_BottomAnchorScrollPosition] 在布局阶段同步完成，
+  /// 不产生中间位移，故这里的「离开底部」只可能来自用户输入。
   bool _onScrollNotification(ScrollNotification notification) {
-    final double pixels = notification.metrics.pixels;
-    if (notification is ScrollUpdateNotification) {
-      final double delta = pixels - _lastPixels;
-      _lastPixels = pixels;
-      if (!_userDetached && pixels > _detachThreshold && delta > 0) {
-        // 视口正在远离底部（用户上滚/滚轮/拖动滚动条）→ 立即脱离跟随
-        _setUserDetached(true);
-      } else if (_userDetached && pixels <= _detachThreshold) {
-        _setUserDetached(false);
-      }
-    } else if (notification is ScrollEndNotification) {
-      _lastPixels = pixels;
-      if (_userDetached && pixels <= _detachThreshold) {
-        _setUserDetached(false);
-      }
-    }
+    if (notification is! ScrollUpdateNotification) return false;
+    // 回底动画的中间帧不算用户上滚
+    if (_returningToBottom) return false;
+    final ScrollMetrics m = notification.metrics;
+    _setUserDetached(m.maxScrollExtent - m.pixels > _bottomEpsilon);
     return false;
   }
 
-  /// 更新脱离状态（仅在变化时 setState，驱动「回到底部」按钮显隐）
+  /// 更新模式（仅在变化时 setState，驱动「回到底部」按钮显隐）
   void _setUserDetached(bool value) {
     if (_userDetached == value) return;
     setState(() {
@@ -331,51 +293,26 @@ class _MessageListViewState extends State<_MessageListView> {
     });
   }
 
-  /// 无动画直达底部。
+  /// 平滑滚到底部并恢复跟随（点击「回到底部」按钮）。
   ///
-  /// 列表为反转模式（reverse: true），offset 0 即视觉底部，与懒加载的
-  /// maxScrollExtent 估算无关：jumpTo(0) 必达真实底部，不存在
-  /// 「到不了底」问题，也无需逐帧迭代校正。
-  void _jumpToBottom() {
+  /// 动画完成后按落点重新结算模式：若被用户中途打断则回到阅读模式；
+  /// 否则已贴底、保持跟随。使用 whenComplete：动画被拖拽打断或组件被移除
+  /// 时 future 均会完成，不会挂起。
+  void _returnToBottom() {
     if (!_controller.hasClients) return;
-    _controller.jumpTo(0);
-  }
-
-  /// 平滑滚动到底部（流式追加/增量更新时跟随）。
-  ///
-  /// 反转列表底部即 offset 0：贴底（pixels≈0）时新增/增长的底部内容本来
-  /// 就不会移动视口，**无需滚动**；此前无条件 animateTo(0) 会在流式高频
-  /// 更新下不断重启动画去打断用户上滚（表现为「难以脱离底部 + 抖动」）。
-  /// 因此这里：已脱离 / 用户正在滚动 / 已在底部，均直接返回，不做动画。
-  ///
-  /// 动画完成/被打断后按当前视口结算一次脱离状态；仅在仍应跟随时校正到
-  /// 真实底部。使用 whenComplete 而非 then：无论动画自然完成、被用户滚动
-  /// 打断，还是组件被移除（ScrollPosition dispose），future 均会完成
-  /// （DrivenScrollActivity.dispose 第一行即 `_completer.complete()`）。
-  void _scrollToBottomSmooth() {
-    if (!_controller.hasClients || _userDetached) return;
-    // 用户手势/惯性滚动进行中：不启动跟随动画（避免与用户滚动打架）
-    if (_controller.position.isScrollingNotifier.value) return;
-    // 已在底部：反转列表会自动保持贴底，无需动画
-    if (_controller.position.pixels <= 0.5) return;
+    _setUserDetached(false);
+    _returningToBottom = true;
     _controller
         .animateTo(
-          0,
+          _controller.position.maxScrollExtent,
           duration: const Duration(milliseconds: 200),
           curve: Curves.easeOut,
         )
         .whenComplete(() {
+      _returningToBottom = false;
       if (!mounted || !_controller.hasClients) return;
-      final double px = _controller.position.pixels;
-      // 动画完成时若视口仍远离底部（被用户滚动打断/用户已在历史位置）：
-      // 进入脱离态并保持用户当前位置；否则校正到真实底部。
-      if (!_userDetached && px > _detachThreshold) {
-        _setUserDetached(true);
-      } else if (_userDetached && px <= _detachThreshold) {
-        _setUserDetached(false);
-      }
-      if (_userDetached) return;
-      _jumpToBottom();
+      final ScrollPosition pos = _controller.position;
+      _setUserDetached(pos.maxScrollExtent - pos.pixels > _bottomEpsilon);
     });
   }
 
@@ -409,23 +346,20 @@ class _MessageListViewState extends State<_MessageListView> {
     }
     return Stack(
       children: <Widget>[
-        // 滚动通知：维护用户脱离状态 / 结算锚定校正（见 _onScrollNotification）
+        // 滚动通知：切换跟随/阅读模式（见 _onScrollNotification）
         NotificationListener<ScrollNotification>(
           onNotification: _onScrollNotification,
           child: ListView.builder(
             controller: _controller,
-            // 反转列表：offset 0 即视觉底部。配合 itemBuilder 的反向索引，
-            // 视觉上「顶→底 = 旧→新」，最新消息固定显示在底部：
-            // 打开会话时首帧直接渲染在底部（最新消息），无「顶部闪一下再滑到底」；
-            // 追加新消息不顶动视图；查看历史向上滚。
-            reverse: true,
+            // 常规（非反转）布局：offset 0 = 顶部（最旧），maxScrollExtent = 底部。
+            // 跟随模式下由 _BottomAnchorScrollPosition 在布局阶段同步钉底
+            // （首帧即贴底，无「顶部闪一下再落底」）；阅读模式下不做任何补偿，
+            // 末尾新增内容天然不影响已渲染内容的位置（零漂移）。
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
             itemCount: widget.messages.length,
             itemBuilder: (BuildContext context, int index) {
-              // 反转列表中 index 0 渲染在视觉底部，故反向取数据：
-              // messages[len-1]（最新）在底部，messages[0]（最旧）在顶部
-              final ChatMessage message =
-                  widget.messages[widget.messages.length - 1 - index];
+              // 常规布局：index 递增 = 由旧到新，最新消息在底部
+              final ChatMessage message = widget.messages[index];
               // 工具调用卡片：默认折叠，独立渲染
               Widget child;
               if (message.kind == 'tool') {
@@ -519,8 +453,7 @@ class _MessageListViewState extends State<_MessageListView> {
 
   /// 点击「回到底部」：恢复跟随并平滑滚到底
   void _scrollToBottomFromButton() {
-    _setUserDetached(false);
-    _scrollToBottomSmooth();
+    _returnToBottom();
   }
 }
 
