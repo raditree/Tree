@@ -357,6 +357,12 @@ class _MessageListViewState extends State<_MessageListView> {
   /// 修复历史：① 不再无条件 jumpTo(0)，避免用户拖拽打断动画后被强行拉
   /// 回底部；② 动画结束/被打断后按当前视口结算一次脱离状态——打断瞬间的
   /// 用户滚动（滚轮/滚动条等）会被动画计数忽略，这里补判以免漏。
+  ///
+  /// 使用 whenComplete 而非 then：无论动画自然完成、被用户滚动打断，
+  /// 还是组件被移除（ScrollPosition dispose），future 均会完成
+  /// （DrivenScrollActivity.dispose 第一行即 `_completer.complete()`），
+  /// 保证 [_autoScrollCount] 必然回减、不泄漏；此处不吞异常——若未来出现
+  /// 异常完成，应保留可见性而非静默掩盖。
   void _scrollToBottomSmooth() {
     if (!_controller.hasClients) return;
     _autoScrollCount++;
@@ -366,7 +372,7 @@ class _MessageListViewState extends State<_MessageListView> {
           duration: const Duration(milliseconds: 200),
           curve: Curves.easeOut,
         )
-        .then((_) {
+        .whenComplete(() {
       if (_autoScrollCount > 0) _autoScrollCount--;
       if (!mounted || !_controller.hasClients) return;
       final double px = _controller.position.pixels;

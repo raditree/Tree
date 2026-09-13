@@ -136,6 +136,50 @@ void main() {
     expect(offsetOf(tester), lessThanOrEqualTo(1)); // 继续跟随
   });
 
+  testWidgets('回底动画被打断后：后续滚动与恢复功能仍正常（计数不泄漏守护）',
+      (WidgetTester tester) async {
+    final GlobalKey<_HarnessState> key = await pumpList(tester);
+
+    // 上滚脱离，再点回底启动动画后用拖拽打断
+    await tester.dragFrom(blankPoint, const Offset(0, 260));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.arrow_downward));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 40));
+    await tester.dragFrom(blankPoint, const Offset(0, 220));
+    await tester.pumpAndSettle();
+    expect(offsetOf(tester), greaterThan(80));
+
+    // 计数泄漏回归：若动画计数未回收（_autoScrollCount 卡 > 0），
+    // 以下所有滚动更新都会被忽略——脱离态无法恢复。
+    tester.state<ScrollableState>(find.byType(Scrollable).first)
+        .position
+        .jumpTo(8);
+    await tester.pumpAndSettle();
+    expect(buttonOpacity(tester), 0); // 计数正常时：已恢复跟随
+
+    key.currentState!.addMessage();
+    await tester.pumpAndSettle();
+    expect(offsetOf(tester), lessThanOrEqualTo(1));
+  });
+
+  testWidgets('回底动画进行中组件被移除：dispose 安全（无未处理异常）',
+      (WidgetTester tester) async {
+    await pumpList(tester);
+
+    // 制造真实动画：上滚脱离 → 点击回底（260 → 0 的 200ms 动画）
+    await tester.dragFrom(blankPoint, const Offset(0, 260));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.arrow_downward));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 40)); // 动画进行中
+
+    // 动画未完成即移除组件：future 在 dispose 后完成，回调不得抛异常
+    // （存在未处理异步异常时本测试将失败）
+    await tester.pumpWidget(const SizedBox());
+    await tester.pumpAndSettle();
+  });
+
   testWidgets('点击「回到底部」按钮：平滑回底并恢复跟随', (WidgetTester tester) async {
     await pumpList(tester);
     await tester.dragFrom(blankPoint, const Offset(0, 260));
