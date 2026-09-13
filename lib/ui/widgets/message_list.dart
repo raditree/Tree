@@ -1,7 +1,6 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 
@@ -90,17 +89,81 @@ class _MessageListView extends StatefulWidget {
   State<_MessageListView> createState() => _MessageListViewState();
 }
 
+/// 「布局同帧」视口锁定滚动控制器。
+///
+/// 反转列表底部新增/增长内容时，固定 offset 的视口内容会被推移（用户感知为
+/// 「推一个卡片就下滚一点」）。若在布局**之后**的 postFrame 里再 jumpTo 校正，
+/// 被推移的那一帧已经绘制出来——每个流式 chunk 闪一帧，表现为严重抖动。
+/// 这里把校正放进 [ScrollPosition.applyContentDimensions]（布局过程中执行，
+/// 早于绘制），实现同步、无闪烁的视口锁定。
+class _ViewportPinScrollController extends ScrollController {
+  _ViewportPinScrollController({required this.shouldPin});
+
+  /// 是否处于「用户查看历史」状态（需要锁定视口）
+  final bool Function() shouldPin;
+
+  /// 本次布局帧是否需要校正：内容变化时由 State 置位（[_schedulePin]），
+  /// 布局帧结束后清除。
+  bool pinPending = false;
+
+  @override
+  ScrollPosition createScrollPosition(
+    ScrollPhysics physics,
+    ScrollContext context,
+    ScrollPosition? oldPosition,
+  ) {
+    return _ViewportPinScrollPosition(
+      physics: physics,
+      context: context,
+      oldPosition: oldPosition,
+      controller: this,
+    );
+  }
+}
+
+/// 见 [_ViewportPinScrollController]：在布局阶段把 offset 同步加回内容增量。
+class _ViewportPinScrollPosition extends ScrollPositionWithSingleContext {
+  _ViewportPinScrollPosition({
+    required super.physics,
+    required super.context,
+    super.oldPosition,
+    required this.controller,
+  });
+
+  final _ViewportPinScrollController controller;
+
+  @override
+  bool applyContentDimensions(double minScrollExtent, double maxScrollExtent) {
+    final bool had = hasContentDimensions;
+    final double oldMax = had ? this.maxScrollExtent : maxScrollExtent;
+    final bool ok =
+        super.applyContentDimensions(minScrollExtent, maxScrollExtent);
+    if (ok && had && controller.pinPending && controller.shouldPin()) {
+      // 反转列表：maxScrollExtent 的增量即底部新增内容的高度；offset 同步
+      // 加回同等量即可保持视口内容不动。
+      final double delta = maxScrollExtent - oldMax;
+      if (delta.abs() > 0.01) {
+        correctPixels(
+          (pixels + delta).clamp(minScrollExtent, maxScrollExtent),
+        );
+        // 返回 false 请求 RenderViewport 用校正后的 offset 重跑布局：
+        // 校正发生在同一布局帧内（早于绘制），因此不会出现「位移一帧后
+        // 再拉回」的闪烁抖动。下一次迭代 delta 归零 → 返回 true 收敛。
+        return false;
+      }
+    }
+    return ok;
+  }
+}
+
 class _MessageListViewState extends State<_MessageListView> {
-  final ScrollController _controller = ScrollController();
+  /// 支持「布局同帧」视口锁定的滚动控制器（见 [_ViewportPinScrollController]）
+  late final _ViewportPinScrollController _controller;
 
   /// 用户是否已主动脱离底部跟随：向上滚动离开底部超过 [_detachThreshold]
   /// 后置位，此后新内容不再把视口拽回底部；回到底部附近或点击
   /// 「回到底部」按钮后清除。
   bool _userDetached = false;
-
-  /// 锚定校正挂起标记：用户手势/惯性滚动期间跳过 jumpTo 校正
-  /// （避免与用户滚动打架），滚动结束后统一结算一次。
-  bool _anchorPending = false;
 
   /// 脱离判定阈值（px）：视口离开底部超过该值即视为用户主动脱离跟随
   static const double _detachThreshold = 12.0;
@@ -124,21 +187,10 @@ class _MessageListViewState extends State<_MessageListView> {
   /// 定位重试次数（防止目标未构建时无限重试）
   int _scrollRetries = 0;
 
-  /// 视口锚定：用户查看历史时，记录视口顶部第一条可见消息，
-  /// 内容更新后按其实位置还原视口（消除被动下滚）
-  String? _anchorId;
-  double _anchorDy = 0;
-
-  /// 锚定还原迭代次数（最多 3 帧迭代校正）
-  int _restoreAttempts = 0;
-
-  /// 锚定校正链是否进行中：内容高频更新时保证同一时刻只有一条校正链，
-  /// 避免多条链并发 jumpTo 相互拉扯（表现为视口抖动）。
-  bool _restoreActive = false;
-
   @override
   void initState() {
     super.initState();
+    _controller = _ViewportPinScrollController(shouldPin: () => _userDetached);
     // 列表为反转模式（reverse: true），初始 offset 0 即视觉底部：
     // 打开会话时首帧直接渲染在底部（最新消息），无需任何滚动。
   }
@@ -164,12 +216,12 @@ class _MessageListViewState extends State<_MessageListView> {
           _scrollToBottomSmooth();
         });
       } else {
-        // 用户在看历史：锁定视口（细节见 _captureAnchorAndRestore）
-        _captureAnchorAndRestore();
+        // 用户在看历史：本帧布局阶段同步锁定视口（见 _schedulePin）
+        _schedulePin();
       }
     } else if (_userDetached) {
-      // 用户在查看历史时的一切内容更新（含流式追加）：锁定视口
-      _captureAnchorAndRestore();
+      // 用户在查看历史时的一切内容更新（含流式追加）：本帧同步锁定视口
+      _schedulePin();
     }
     // 定位触发：scrollToRevision 变化且存在目标消息 id
     if (oldWidget.scrollToRevision != widget.scrollToRevision &&
@@ -182,101 +234,16 @@ class _MessageListViewState extends State<_MessageListView> {
     }
   }
 
-  /// 捕获当前视口顶部第一条可见消息，并在下一帧按其实位置还原视口。
+  /// 请求在**本次布局帧内**同步锁定视口（细节见 [_ViewportPinScrollPosition]）。
   ///
-  /// 反转列表在底部新增内容（工具卡片/流式文本）时，固定 offset 的视口
-  /// 内容会向新消息方向偏移（用户感知为「推一个卡片就下滚一点」）。
-  /// 这里在内容变化前记录视口顶部第一条可见消息的全局 y 坐标，布局完成后
-  /// 沿该坐标逐帧校正 offset（迭代至残差 <0.5px），使视口内容保持不动。
-  void _captureAnchorAndRestore() {
-    if (!_controller.hasClients) return;
-    // 用户手势/惯性滚动进行中：跳过校正（避免与用户滚动打架/跳变），
-    // 滚动结束后由 ScrollEndNotification 统一结算一次
-    if (_controller.position.isScrollingNotifier.value) {
-      _anchorPending = true;
-      return;
-    }
-    final String? id = _firstVisibleMessageId();
-    if (id == null) return;
-    final BuildContext? ctx = _itemKeys[id]?.currentContext;
-    if (ctx == null) return;
-    final RenderBox? ro = ctx.findRenderObject() as RenderBox?;
-    if (ro == null || !ro.hasSize || ro.size.height <= 0) return;
-    _anchorId = id;
-    _anchorDy = ro.localToGlobal(Offset.zero).dy;
-    _restoreAttempts = 0;
-    // 已有校正链在跑：只需刷新锚点目标（链内每次迭代读取最新
-    // _anchorId/_anchorDy），不再另起一条链，避免并发 jumpTo 互相拉扯。
-    if (_restoreActive) return;
-    _restoreActive = true;
+  /// 反转列表底部新增/增长内容会推移视口（用户感知为「推一个卡片就下滚
+  /// 一点」）。旧实现在布局后的 postFrame 里再 jumpTo 校正：被推移的那一帧
+  /// 已绘制出来，每个流式 chunk 闪一帧 → 严重抖动。这里改为在布局阶段
+  /// （applyContentDimensions，早于绘制）同步把 offset 加回增量，闭环无闪烁。
+  void _schedulePin() {
+    _controller.pinPending = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) _restoreAnchorStep();
-    });
-  }
-
-  /// 视口顶部（视觉最上）第一条可见消息 id。
-  ///
-  /// 遍历已构建消息项（ListView.builder 懒加载只构建视口附近项），
-  /// 以全局 y 坐标落在视口范围内、且 dy 最小者为「顶部第一条可见」。
-  String? _firstVisibleMessageId() {
-    String? best;
-    double bestDy = double.infinity;
-    RenderBox? viewportBox;
-    for (final String id in _itemKeys.keys) {
-      final BuildContext? ctx = _itemKeys[id]?.currentContext;
-      if (ctx == null) continue;
-      final RenderBox? ro = ctx.findRenderObject() as RenderBox?;
-      if (ro == null || !ro.hasSize || ro.size.height <= 0) continue;
-      viewportBox ??=
-          (RenderAbstractViewport.maybeOf(ro) as RenderBox?) ?? ro;
-      final double vpTop = viewportBox.localToGlobal(Offset.zero).dy;
-      final double vpBottom = vpTop + viewportBox.size.height;
-      final double dy = ro.localToGlobal(Offset.zero).dy;
-      final double bottom = dy + ro.size.height;
-      if (bottom <= vpTop || dy >= vpBottom) continue; // 完全不在视口内
-      if (dy < bestDy) {
-        bestDy = dy;
-        best = id;
-      }
-    }
-    return best;
-  }
-
-  /// 校正一帧：把锚定消息移回其原全局 y 坐标；残差大时下一帧继续。
-  void _restoreAnchorStep() {
-    if (!mounted || !_controller.hasClients || _anchorId == null) {
-      _restoreActive = false;
-      return;
-    }
-    // 用户在滚动（拖拽/惯性）：暂停校正，滚动结束后结算
-    if (_controller.position.isScrollingNotifier.value) {
-      _anchorPending = true;
-      _restoreActive = false;
-      return;
-    }
-    final BuildContext? ctx = _itemKeys[_anchorId]?.currentContext;
-    if (ctx == null) {
-      _restoreActive = false;
-      return;
-    }
-    final RenderBox? ro = ctx.findRenderObject() as RenderBox?;
-    if (ro == null || !ro.hasSize) {
-      _restoreActive = false;
-      return;
-    }
-    final double nowDy = ro.localToGlobal(Offset.zero).dy;
-    final double diff = _anchorDy - nowDy;
-    if (diff.abs() < 0.5 || _restoreAttempts >= 3) {
-      _restoreActive = false;
-      return;
-    }
-    _restoreAttempts++;
-    // 反转列表：offset 增大 = 视口内容整体向下移动（消息 dy 增大），
-    // 故 offset 修正量 = diff（目标 y - 当前 y）。
-    final ScrollPosition pos = _controller.position;
-    pos.jumpTo((pos.pixels + diff).clamp(0.0, pos.maxScrollExtent));
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) _restoreAnchorStep();
+      _controller.pinPending = false;
     });
   }
 
@@ -326,7 +293,7 @@ class _MessageListViewState extends State<_MessageListView> {
     }
   }
 
-  /// 滚动通知：维护「用户脱离」状态与锚定校正结算。
+  /// 滚动通知：维护「用户脱离」状态。
   ///
   /// - 任何来源的滚动更新（在列表上拖拽 / 鼠标滚轮 / 触控板 / 拖动滚动条 /
   ///   惯性衰减等，均表现为 ScrollUpdateNotification）离开底部超过
@@ -336,7 +303,6 @@ class _MessageListViewState extends State<_MessageListView> {
   ///   程序动画表现为像素减小，用户上滚表现为像素增大；只要在朝远离底部
   ///   的方向移动就立即脱离。这样流式期间跟随动画频繁重启也不会吞掉用户
   ///   的滚动更新（旧实现整体忽略动画期更新 → 无法脱离底部）。
-  /// - 滚动结束（拖拽/惯性停止）：结算挂起的锚定校正。
   bool _onScrollNotification(ScrollNotification notification) {
     final double pixels = notification.metrics.pixels;
     if (notification is ScrollUpdateNotification) {
@@ -352,10 +318,6 @@ class _MessageListViewState extends State<_MessageListView> {
       _lastPixels = pixels;
       if (_userDetached && pixels <= _detachThreshold) {
         _setUserDetached(false);
-      }
-      if (_anchorPending) {
-        _anchorPending = false;
-        _captureAnchorAndRestore();
       }
     }
     return false;
