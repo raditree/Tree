@@ -1513,7 +1513,8 @@ class LocalExecutorService extends ChangeNotifier {
   /// 缺省整个工作空间）、``regex``（是否正则，缺省 false 字面量）、
   /// ``ignore_case``（是否忽略大小写，缺省 false）、``max_depth``（递归深度
   /// 上限，1=仅目标目录本层，缺省 0 不限）、``exclude``（逗号分隔的排除
-  /// glob，按文件/目录名称匹配）。
+  /// glob，仅按文件/目录名称（basename）匹配、支持 * 与 ?；带路径的模式由
+  /// 工具层 GrepTool._parse_exclude 拒绝）。
   Future<Map<String, dynamic>> _grepSearch(
     Directory wsDir,
     Map<String, dynamic> data,

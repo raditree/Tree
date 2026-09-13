@@ -122,9 +122,11 @@ class WorkspaceIO(ABC):
         :param ignore_case: 是否忽略大小写（缺省 False）
         :param max_depth: 目录递归深度上限；1 表示只搜索目标目录本层文件
             （不进入子目录），0 表示不限深度
-        :param exclude: 排除的文件/目录 glob 列表（按名称匹配，如
-            ``["node_modules", "*.min.js"]``）；None/空表示不额外排除
-            （``.git`` 始终排除）
+        :param exclude: 排除的文件/目录 glob 列表，**仅按名称（basename）
+            匹配**、支持 ``*`` 与 ``?``（如 ``["node_modules", "*.min.js"]``）；
+            带路径的模式（如 ``lib/*.dart``）在 grep 命令行文件下会退化为路径
+            后缀匹配，故工具层（GrepTool._parse_exclude）直接拒绝。None/空表示
+            不额外排除（``.git`` 始终排除）
         :return: ``{"exit_code": 0|1, "stdout": "<grep 输出>"}``；grep 无命中时
                  exit_code 为 1；失败 ``{"error": ...}``
         """
@@ -299,7 +301,10 @@ class CloudWorkspaceIO(WorkspaceIO):
             ic = "i"
         mode = "-E" if regex else "-F"
         target = shlex.quote(path.strip("/")) if path else "."
-        # 排除项：grep 按文件名/目录名 glob 过滤；.git 始终排除
+        # 排除项统一按「名称(basename)」匹配：递归分支用 grep
+        # --exclude/--exclude-dir（-r 下二者均按基名匹配）；深度分支改由 find
+        # 过滤——GNU grep 对命令行文件采用「路径后缀」匹配（--exclude=lib/*.dart
+        # 会命中 ./lib/a.dart），若沿用会让同一 exclude 在不同分支行为不一致。
         excl_patterns = list(exclude or [])
         excl_flags = "--exclude-dir=.git"
         for pat in excl_patterns:
@@ -311,12 +316,18 @@ class CloudWorkspaceIO(WorkspaceIO):
             # （xargs 无文件时不执行；grep -H 保证输出仍带文件名前缀）
             find_excl = ""
             for pat in excl_patterns:
-                find_excl += f" -not -path {shlex.quote('*/' + pat + '/*')}"
+                # -not -path 排除同名目录下的文件；-not -name 排除同名文件/
+                # 目录本身。find -name/-path 只按基名匹配，带 / 的模式与递归
+                # 分支一致地不生效（其告警随 2>/dev/null 丢弃）。
+                find_excl += (
+                    f" -not -path {shlex.quote('*/' + pat + '/*')}"
+                    f" -not -name {shlex.quote(pat)}"
+                )
             cmd = (
                 f"find {target} -maxdepth {int(max_depth)} -type f "
                 f"-not -path {shlex.quote('*/.git/*')}{find_excl} -print0 "
                 f"2>/dev/null | xargs -0 -r grep -nH{ic}I {mode} "
-                f"{excl_flags} -- {shlex.quote(pattern)}"
+                f"-- {shlex.quote(pattern)}"
             )
         else:
             cmd = (

@@ -914,8 +914,8 @@ class SshWorkspaceExecutor {
   /// 支持参数：``pattern``（必填）、``path``（搜索范围，workspace 内相对
   /// 路径，缺省整个工作空间）、``regex``（是否正则，缺省 false 字面量）、
   /// ``ignore_case``（缺省 false）、``max_depth``（递归深度上限，1=仅目标
-  /// 目录本层，缺省 0 不限）、``exclude``（逗号分隔的排除 glob，按文件/
-  /// 目录名称匹配）。
+  /// 目录本层，缺省 0 不限）、``exclude``（逗号分隔的排除 glob，仅按文件/
+  /// 目录名称（basename）匹配、支持 * 与 ?；带路径的模式由工具层拒绝）。
   ///
   /// 路径穿越防护：path 经 [_sanitizeRemotePath] 校验（对齐本地执行器
   /// ``_resolveInWorkspace`` 语义——拒绝绝对路径与 ``..`` 段，解析后必须仍在
@@ -946,6 +946,10 @@ class SshWorkspaceExecutor {
     final String mode = regex ? '-E' : '-F';
     final String ic = ignoreCase ? 'i' : '';
     final String target = targetRemote == null ? '.' : _shQuote(targetRemote);
+    // 排除项统一按「名称(basename)」匹配：递归分支用 grep --exclude/--exclude-dir
+    // （-r 下均按基名匹配）；深度分支改由 find 过滤——GNU grep 对命令行文件采用
+    // 「路径后缀」匹配（--exclude=lib/*.dart 会命中 ./lib/a.dart），沿用会让同一
+    // exclude 在不同分支行为不一致。
     final StringBuffer excl = StringBuffer('--exclude-dir=.git');
     for (final String pat in exclude) {
       excl.write(' --exclude=${_shQuote(pat)} --exclude-dir=${_shQuote(pat)}');
@@ -957,11 +961,13 @@ class SshWorkspaceExecutor {
       final StringBuffer findExcl =
           StringBuffer(' -not -path ${_shQuote('*/.git/*')}');
       for (final String pat in exclude) {
+        // -not -path 排除同名目录下的文件；-not -name 排除同名文件/目录本身
         findExcl.write(' -not -path ${_shQuote('*/$pat/*')}');
+        findExcl.write(' -not -name ${_shQuote(pat)}');
       }
       full = 'cd ${_shQuote(cwd)} && find $target -maxdepth $maxDepth -type f'
           '$findExcl -print0 2>/dev/null | xargs -0 -r grep -nH${ic}I $mode '
-          '$excl -- ${_shQuote(pattern)}';
+          '-- ${_shQuote(pattern)}';
     } else {
       full = 'cd ${_shQuote(cwd)} && grep -rn${ic}I $mode $excl '
           '-- ${_shQuote(pattern)} $target';

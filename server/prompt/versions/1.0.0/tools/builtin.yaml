@@ -23,7 +23,7 @@ grep:
     [在工作空间内按模式搜索文件内容] | 贡献维度: 上下文获取（快速定位关键字/正则出现的位置，先定位再精读）
     何时使用: 需要在工作空间内查找某关键字/标识符/配置项出现的位置；用正则批量定位模式（如 TODO|FIXME、函数调用点）；不确定目标文件时先 grep 缩小范围再 read 精读
     何时不用: 已确定目标文件时直接 read；需要语义/向量检索用 embed_search（内置工作空间 MCP 工具，已直接注入为 mcp__workspace__embed_search）；浏览目录结构用 Terminal ls
-    前置依赖: pattern 必填；regex=false 时 pattern 为字面量、regex=true 时为正则；path 可限定搜索范围（工作空间内相对路径）；ignore_case 控制大小写；max_depth 限制递归层数（1=仅目标目录本层、缺省 0 不限）；exclude 按名称排除文件/目录（逗号分隔 glob，如 'node_modules,*.min.js,build'，.git 始终排除）
+    前置依赖: pattern 必填；regex=false 时 pattern 为字面量、regex=true 时为正则；path 可限定搜索范围（工作空间内相对路径）；ignore_case 控制大小写；max_depth 限制递归层数（1=仅目标目录本层、缺省 0 不限）；exclude 排除文件/目录，逗号分隔 glob，仅按名称（basename）匹配、支持 * 与 ?（如 'node_modules,*.min.js,build'，.git 始终排除；不接受 lib/*.dart 这类带路径的模式，会直接报错）
     省钱技巧: 用 path 缩小搜索范围、用 max_depth/exclude 裁剪无关子树（如排除 node_modules、build、*.min.js）、用 max_results 限制返回行数（缺省 200），避免大海捞针占用上下文
 
 edit:

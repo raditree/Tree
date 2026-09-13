@@ -111,7 +111,12 @@ class GrepTool:
 
     @staticmethod
     def _parse_exclude(raw: Any) -> Tuple[List[str], str]:
-        """解析 exclude 参数（逗号分隔的 glob 列表）。
+        """解析 exclude 参数（逗号分隔的 basename glob 列表）。
+
+        三模式的排除语义统一为「按名称（basename）匹配」：grep 的
+        ``--exclude`` 在递归下按基名匹配、但在命令行文件下会退化为「路径后缀」
+        匹配，Dart 本地实现只按基名匹配。为杜绝同一模式在不同模式/分支下行为
+        不一致，这里直接拒绝含路径分隔符的模式。
 
         :param raw: 原始参数（缺省/空串表示不额外排除）
         :return: ``(模式列表, 错误信息)``，错误信息非空表示参数非法
@@ -135,6 +140,12 @@ class GrepTool:
                 )
             if any(ord(ch) < 32 for ch in pat):
                 return [], "exclude 模式不能包含控制字符/换行"
+            if "/" in pat or "\\" in pat:
+                return [], (
+                    f"exclude 仅支持按名称（basename）匹配，不能包含路径分隔符: "
+                    f"{pat}（如排除 lib 下生成的 .g.dart 请写 '*.g.dart'，"
+                    f"排除目录请写目录名如 'build'）"
+                )
             if pat not in patterns:  # 去重保序
                 patterns.append(pat)
         if len(patterns) > _MAX_EXCLUDE_PATTERNS:
@@ -178,9 +189,12 @@ class GrepTool:
                         },
                         "exclude": {
                             "type": "string",
-                            "description": "排除的文件/目录模式，逗号分隔的 glob"
-                            "（按名称匹配，如 'node_modules,*.min.js,build'）；"
-                            "缺省不额外排除（.git 始终排除）",
+                            "description": "排除的文件/目录模式，逗号分隔的 glob，"
+                            "仅按名称（basename）匹配、支持 * 与 ?，"
+                            "如 'node_modules,*.min.js,build'；不接受带路径的"
+                            "模式（如 lib/*.dart，会报错），请改用名称模式"
+                            "（*.g.dart）或目录名（build）。缺省不额外排除"
+                            "（.git 始终排除）",
                         },
                         "max_results": {
                             "type": "integer",

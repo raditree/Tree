@@ -148,6 +148,24 @@ class TestExecute(unittest.TestCase):
         self.assertIn("error", ret)
         self.io.grep_search.assert_not_awaited()
 
+    def test_exclude_with_path_separator_rejected(self):
+        """带路径的模式在 grep 命令行文件下会变成路径后缀匹配，三模式不一致，
+        故直接拒绝（详见 GrepTool._parse_exclude）。"""
+        for bad in ("lib/*.dart", "lib\\*.dart", "node_modules,lib/*.dart"):
+            ret = self.tool.execute({"pattern": "x", "exclude": bad})
+            self.assertIn("error", ret)
+            self.assertIn("basename", ret["error"])
+        self.io.grep_search.assert_not_awaited()
+
+    def test_exclude_basename_glob_accepted(self):
+        self.tool.execute(
+            {"pattern": "x", "exclude": "*.g.dart,build,node_modules"}
+        )
+        self.assertEqual(
+            self.io.grep_search.await_args.kwargs["exclude"],
+            ["*.g.dart", "build", "node_modules"],
+        )
+
     def test_no_hits(self):
         self.io.grep_search = AsyncMock(return_value={"exit_code": 1, "stdout": ""})
         ret = self.tool.execute({"pattern": "nope"})
