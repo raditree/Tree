@@ -899,6 +899,20 @@ class AgentLLMSession:
         :param cancel_event: 可选取消事件；未传入时回退到会话级
                              ``self.cancel_event``（构造时注入）。
         """
+        # 消息切入模式（直接切入）：本轮处理期间若仍有新消息到达，在给出最终
+        # 文本后继续本轮（并入同一上下文），使"几乎同时到达"的多条消息一起
+        # 处理；串行排队（缺省）保持原行为——本轮结束，剩余消息由队列 worker
+        # 作为独立一轮再处理。读取失败一律按串行排队，不影响主链路。
+        direct_cutin = False
+        try:
+            from data.message_mode_store import is_direct_cutin
+
+            direct_cutin = is_direct_cutin(
+                str(getattr(self, "user_id", "") or "")
+            )
+        except Exception:  # noqa: BLE001
+            direct_cutin = False
+
         while True:
             # 停止中止：每轮循环开始检查取消事件（阻塞环节之间的间隙可响应停止）
             if self._is_cancelled(cancel_event):
@@ -1210,6 +1224,19 @@ class AgentLLMSession:
                 if thinking_text:
                     final_msg["reasoning_content"] = thinking_text
                 self.context.append(final_msg)
+                # 直接切入：本轮已产出最终文本，但处理期间到达的新消息尚未
+                # 切入——并入同一上下文继续下一轮，而不是等本轮结束由 worker
+                # 再起一轮（串行）。串行排队模式不进入此分支（保持原行为）。
+                if direct_cutin and on_tool_turn is not None:
+                    try:
+                        inserted = on_tool_turn()
+                    except Exception:  # noqa: BLE001
+                        inserted = None
+                    if inserted:
+                        self.context.append(
+                            {"role": "user", "content": inserted}
+                        )
+                        continue
             break
 
     # ------------------------------------------------------------------

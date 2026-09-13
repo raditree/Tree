@@ -33,6 +33,7 @@ from data.conversation_store import (
     store_message,
 )
 from data.data_collection_store import collect_sft_turn
+from data.message_mode_store import is_direct_cutin
 from data.session_cache import get_session, pop_session, set_session
 from data.session_store import (
     DEFAULT_SESSION,
@@ -52,6 +53,12 @@ logger = logging.getLogger(__name__)
 # 用户自身 agent_id：统一消息接口中"用户直发"的发送方标记。
 # 历史实现/旧数据以空串表示，读取侧经 is_user_sender 两者等效处理。
 USER_AGENT_ID = "0"
+
+# 队列取空异常：broker 传入标准库 queue.Queue；部分调用方/测试用
+# asyncio.Queue。两者的 Empty 类型不同且都需要捕获，显式并列避免遗漏
+# （历史上 ``except queue.Empty`` 因参数名 queue 遮蔽模块而失效——空队列时
+# 取消息抛出的 Empty 未被捕获，靠上层 try/except 兜底）。
+_QUEUE_EMPTY_EXC = (queue.Empty, asyncio.QueueEmpty)
 
 
 def is_user_sender(id_: Any) -> bool:
@@ -1953,6 +1960,54 @@ async def _stream_agent_reply(
     return "".join(full_parts), status, last_text_id, final_reply_text
 
 
+def _drain_session_payloads(
+    queue: Optional[Any], session_id: str, drain_all: bool
+) -> List[Dict[str, Any]]:
+    """从 agent 消息队列取出当前会话待处理的负载。
+
+    - ``drain_all=False``（串行排队）：仅取队首一条；若其属于其他会话则放回
+      并返回空（不继续向后扫描），与历史行为逐字一致。
+    - ``drain_all=True``（直接切入）：取出队列中**全部**当前会话消息，其他
+      会话消息原样放回队尾；使几乎同时到达的多条消息一起切入同一轮上下文，
+      而不是每条各起一轮（串行）。
+
+    队列既可能是 broker 的标准库 ``queue.Queue``，也可能是测试用的
+    ``asyncio.Queue``；两者 ``get_nowait`` / ``put_nowait`` 语义一致。
+    """
+    if queue is None:
+        return []
+    if not drain_all:
+        try:
+            item = queue.get_nowait()
+        except _QUEUE_EMPTY_EXC:
+            return []
+        if (
+            not isinstance(item, dict)
+            or item.get("session_id", DEFAULT_SESSION) != session_id
+        ):
+            queue.put_nowait(item)
+            return []
+        return [item]
+
+    picked: List[Dict[str, Any]] = []
+    others: List[Any] = []
+    while True:
+        try:
+            item = queue.get_nowait()
+        except _QUEUE_EMPTY_EXC:
+            break
+        if (
+            isinstance(item, dict)
+            and item.get("session_id", DEFAULT_SESSION) == session_id
+        ):
+            picked.append(item)
+        else:
+            others.append(item)
+    for item in others:
+        queue.put_nowait(item)
+    return picked
+
+
 async def _process_member_message(
     payload: Dict[str, Any], queue: Optional[asyncio.Queue] = None
 ) -> None:
@@ -2128,43 +2183,45 @@ async def _process_member_message(
         or bool(payload.get("auto_reply"))
     )
 
+    # 切入模式：直接切入时一次性切入队列中当前会话的全部消息（串行排队则
+    # 逐条），使几乎同时到达的多条回传一起进入本轮上下文。
+    direct_cutin = is_direct_cutin(user_id)
+
     def _pick_incoming() -> Optional[str]:
         """在 tool_call 间隙从队列切入 leader 发来的新消息。"""
         nonlocal reply_sender, reply_passive
-        if queue is None:
-            return None
-        try:
-            incoming = queue.get_nowait()
-        except queue.Empty:
-            return None
         # 跨会话隔离：只切入当前会话的消息；其他会话的消息放回队列，
         # 待当前消息处理完后由 worker 作为独立消息继续处理（不串入本会话上下文）
-        incoming_session = incoming.get("session_id", DEFAULT_SESSION)
-        if incoming_session != session_id:
-            queue.put_nowait(incoming)
+        incoming_list = _drain_session_payloads(queue, session_id, direct_cutin)
+        if not incoming_list:
             return None
-        incoming_content = incoming.get("content", "")
-        if not incoming_content:
+        picked_contents: List[str] = []
+        for incoming in incoming_list:
+            incoming_content = incoming.get("content", "")
+            if not incoming_content:
+                continue
+            # 更新"最后发送方"：插入的新消息到来时，把最终总结的回发目标切换为
+            # 这条新消息的发送方（feature：自动回复仅回给最后发给它的那位）。
+            inc_sender = incoming.get("sender_id")
+            if inc_sender is None:
+                inc_sender = incoming.get("leader_id", "")
+            reply_sender = inc_sender
+            # 回发目标切换时同步被动标记：新消息是被动注入则同样不回传
+            reply_passive = (
+                not bool(incoming.get("active", True))
+                or bool(incoming.get("auto_reply"))
+            )
+            session.sender_id = inc_sender
+            _append_activity_log(
+                workspace_id,
+                f"[{_clock_now()}] [切入] 收到 leader 新消息: "
+                f"{incoming_content[:120]}",
+                user_id=user_id, mode_key=team_id or agent_id,
+            )
+            picked_contents.append(incoming_content)
+        if not picked_contents:
             return None
-        # 更新"最后发送方"：插入的新消息到来时，把最终总结的回发目标切换为
-        # 这条新消息的发送方（feature：自动回复仅回给最后发给它的那位）。
-        inc_sender = incoming.get("sender_id")
-        if inc_sender is None:
-            inc_sender = incoming.get("leader_id", "")
-        reply_sender = inc_sender
-        # 回发目标切换时同步被动标记：新消息是被动注入则同样不回传
-        reply_passive = (
-            not bool(incoming.get("active", True))
-            or bool(incoming.get("auto_reply"))
-        )
-        session.sender_id = inc_sender
-        _append_activity_log(
-            workspace_id,
-            f"[{_clock_now()}] [切入] 收到 leader 新消息: "
-            f"{incoming_content[:120]}",
-            user_id=user_id, mode_key=team_id or agent_id,
-        )
-        return incoming_content
+        return "\n\n".join(picked_contents)
 
     # SFT 数据收集：记录该轮处理前的上下文基线（与 TOP 路径一致，含 CoT 的
     # 完整 context 在成员处理结束后与基线求 diff）。收集开关按用户生效，
@@ -2938,6 +2995,11 @@ async def _handle_user_message(
                 user_id=user_id, mode_key=agent_id,
             )
 
+        # 切入模式：直接切入时一次性切入队列中当前会话的全部消息（串行排队
+        # 则逐条），使几乎同时到达的消息（如多名成员几乎同时回传的总结）
+        # 一起进入本轮上下文，而不是各起一轮串行处理。
+        direct_cutin = is_direct_cutin(user_id)
+
         def _pick_incoming() -> Optional[str]:
             """在 tool_call 间隙从队列切入用户新发的消息（checklist 7）。
 
@@ -2947,27 +3009,25 @@ async def _handle_user_message(
             跨会话隔离：只切入当前会话的消息；其他会话的消息放回队列，
             待当前消息处理完后由 worker 作为独立消息继续处理（不串入本会话上下文）。
             """
-            if queue is None:
+            incoming_list = _drain_session_payloads(queue, session_id, direct_cutin)
+            if not incoming_list:
                 return None
-            try:
-                incoming = queue.get_nowait()
-            except queue.Empty:
+            picked_contents: List[str] = []
+            for incoming in incoming_list:
+                incoming_content = incoming.get("content", "")
+                if not incoming_content:
+                    continue
+                if workspace_id:
+                    _append_activity_log(
+                        workspace_id,
+                        f"[{_clock_now()}] [切入] 收到用户新消息: "
+                        f"{incoming_content[:120]}",
+                        user_id=user_id, mode_key=agent_id,
+                    )
+                picked_contents.append(incoming_content)
+            if not picked_contents:
                 return None
-            incoming_session = incoming.get("session_id", DEFAULT_SESSION)
-            if incoming_session != session_id:
-                queue.put_nowait(incoming)
-                return None
-            incoming_content = incoming.get("content", "")
-            if not incoming_content:
-                return None
-            if workspace_id:
-                _append_activity_log(
-                    workspace_id,
-                    f"[{_clock_now()}] [切入] 收到用户新消息: "
-                    f"{incoming_content[:120]}",
-                    user_id=user_id, mode_key=agent_id,
-                )
-            return incoming_content
+            return "\n\n".join(picked_contents)
 
         # SFT 数据收集：记录该轮处理前的上下文基线（仅开启数据收集期间有效，
         # 内部按开关过滤；含 CoT 的完整 context 在对话结束后与基线求 diff）

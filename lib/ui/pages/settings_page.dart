@@ -57,6 +57,9 @@ class _SettingsPageState extends State<SettingsPage> {
   // --- 主动延迟（限制单个 agent 的 API 调用频率，平均 6 次/分钟） ---
   bool _rateLimitEnabled = false;
 
+  // --- 消息切入模式（false=串行排队，true=直接切入） ---
+  bool _directCutin = false;
+
   @override
   void initState() {
     super.initState();
@@ -65,6 +68,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _loadBackendConfig();
     _loadDataCollectionSetting();
     _loadRateLimitSetting();
+    _loadMessageCutinSetting();
   }
 
   @override
@@ -145,6 +149,36 @@ class _SettingsPageState extends State<SettingsPage> {
     }
     if (mounted) {
       setState(() => _rateLimitEnabled = value);
+    }
+  }
+
+  /// 加载消息切入模式设置
+  Future<void> _loadMessageCutinSetting() async {
+    final prefs = await SharedPreferences.getInstance();
+    final local = prefs.getBool('message_cutin_direct') ?? false;
+    if (mounted) {
+      setState(() => _directCutin = local);
+    }
+    // 尝试从后端拉取权威状态（后端未启动/未登录时忽略，保留本地值）
+    try {
+      final bool remote = await ApiService.getMessageCutinDirect();
+      if (mounted) setState(() => _directCutin = remote);
+    } catch (_) {
+      // 后端不可达时保留本地持久化值
+    }
+  }
+
+  /// 切换消息切入模式（false=串行排队，true=直接切入）
+  Future<void> _toggleMessageCutin(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('message_cutin_direct', value);
+    try {
+      await ApiService.setMessageCutinDirect(value);
+    } catch (_) {
+      // 后端设置失败不阻塞本地持久化
+    }
+    if (mounted) {
+      setState(() => _directCutin = value);
     }
   }
 
@@ -384,6 +418,10 @@ class _SettingsPageState extends State<SettingsPage> {
           _buildSectionTitle('主动延迟'),
           const SizedBox(height: 8),
           _buildRateLimitCard(),
+          const SizedBox(height: 24),
+          _buildSectionTitle('消息切入模式'),
+          const SizedBox(height: 8),
+          _buildMessageCutinCard(),
           const SizedBox(height: 24),
           _buildSectionTitle('注销账号'),
           const SizedBox(height: 8),
@@ -653,6 +691,49 @@ class _SettingsPageState extends State<SettingsPage> {
             Switch(
               value: _rateLimitEnabled,
               onChanged: _toggleRateLimit,
+              activeColor: cs.primary,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 消息切入模式卡片
+  ///
+  /// 关闭（默认，串行排队）：新消息入队，仅在当前消息的 tool_call 间隙
+  /// 逐条切入，当前轮结束后再逐条处理剩余消息。
+  /// 开启（直接切入）：间隙把队列中当前会话的消息一次性全部切入；且本轮
+  /// 给出最终文本后若仍有新消息则继续本轮，使几乎同时到达的消息一起处理。
+  Widget _buildMessageCutinCard() {
+    final cs = Theme.of(context).colorScheme;
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    '直接切入新消息（不排队）',
+                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    _directCutin
+                        ? '已开启：新消息一次性全部切入当前上下文，几乎同时到达的消息（如多名成员的回传总结）一起处理'
+                        : '已关闭（串行排队）：新消息逐条切入，当前轮结束后再逐条处理剩余消息',
+                    style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+                  ),
+                ],
+              ),
+            ),
+            Switch(
+              value: _directCutin,
+              onChanged: _toggleMessageCutin,
               activeColor: cs.primary,
             ),
           ],

@@ -24,6 +24,12 @@ from data.rate_limit_store import (
     is_rate_limit_enabled,
     set_rate_limit_enabled,
 )
+from data.message_mode_store import (
+    MODE_DIRECT,
+    MODE_QUEUE,
+    get_message_mode,
+    set_message_mode,
+)
 from data.embed_model import (
     get_embedding,
     get_embeddings_batch,
@@ -618,6 +624,41 @@ async def set_rate_limit(
 
     set_user_enabled(openid, req.enabled)
     return {"enabled": req.enabled, "openid": openid}
+
+
+# ===== 消息切入模式（串行排队 / 直接切入） =====
+
+
+class MessageCutinRequest(BaseModel):
+    """消息切入模式请求体（``queue`` 串行排队 / ``direct`` 直接切入）。"""
+
+    mode: str = MODE_QUEUE
+
+
+@router.get("/settings/message-cutin")
+async def get_message_cutin(
+    current_user: dict = Depends(get_current_user),
+):
+    """查询当前用户的消息切入模式（缺省 ``queue`` 串行排队）。"""
+    openid = current_user.get("openid", "")
+    return {"mode": get_message_mode(openid), "openid": openid}
+
+
+@router.post("/settings/message-cutin")
+async def set_message_cutin(
+    req: MessageCutinRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """设置当前用户的消息切入模式。
+
+    - ``queue``（默认）：新消息串行排队，仅在 tool_call 间隙逐条切入；
+    - ``direct``：新消息在间隙一次性全部切入，且本轮最终文本后仍有新消息
+      时继续本轮，避免几乎同时到达的消息被拆成多轮串行处理。
+    """
+    openid = current_user.get("openid", "")
+    mode = req.mode if req.mode in (MODE_QUEUE, MODE_DIRECT) else MODE_QUEUE
+    set_message_mode(openid, mode)
+    return {"mode": mode, "openid": openid}
 
 
 def _is_admin(openid: str) -> bool:
