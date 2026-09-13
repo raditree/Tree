@@ -294,6 +294,8 @@ class AgentLLMSession:
         cancel_event: Optional[threading.Event] = None,
         user_id: str = "",
         agent_id: str = "",
+        team_id: str = "",
+        session_id: str = "",
         result_redirect_writer: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         """初始化 LLM 会话。
@@ -307,6 +309,9 @@ class AgentLLMSession:
                              使停止能快速中止 tool loop（不再启动新的工具调用）。
         :param user_id: 用户标识（主动延迟限流按用户开关判定）
         :param agent_id: agent 标识（主动延迟限流按 (user_id, agent_id) 粒度）
+        :param team_id: 团队标识（插件埋点 scope 装配用；口径=所属顶层 agent ID，
+            取不到时留空——fail-closed 语义下留空即不匹配该级约束）
+        :param session_id: 会话标识（插件埋点 scope 装配用；缺省留空）
         :param result_redirect_writer: 可选同步回调 ``(rel_path, content) -> None``，
             用于把超长工具结果写入工作空间（如 ``.self/results/...``）；为 None
             时超长结果退化为本地截断。回调由 chat.py 注入，与内置工具共用
@@ -319,6 +324,10 @@ class AgentLLMSession:
         # 主动延迟限流归属：REST 设置接口按 openid 开关，限流器按 (user, agent)
         self.user_id = user_id or ""
         self.agent_id = agent_id or ""
+        # 插件埋点 scope 装配（一期补线）：团队/会话标识随会话携带；
+        # 缺省空串（fail-closed：事件缺字段时不命中要求该字段的实例）
+        self.team_id = team_id or ""
+        self.session_id = session_id or ""
         # 工具结果重定向写入器与重定向文件序号（会话级，工具循环单线程执行）
         self.result_redirect_writer = result_redirect_writer
         self._redirect_seq = 0

@@ -2058,6 +2058,8 @@ async def _process_member_message(
             workspace_id=workspace_id,
             user_id=user_id,
             agent_id=agent_id,
+            team_id=team_id or agent_id,  # 插件埋点 scope：团队=所属顶层 agent
+            session_id=session_id,        # 插件埋点 scope：会话标识
             result_redirect_writer=_make_result_redirect_writer(
                 workspace_id, user_id, team_id or agent_id
             ),
@@ -2881,6 +2883,8 @@ async def _handle_user_message(
                 workspace_id=workspace_id,
                 user_id=user_id,
                 agent_id=agent_id,
+                team_id=agent_id,        # 插件埋点 scope：团队=自身（顶层会话）
+                session_id=session_id,   # 插件埋点 scope：会话标识
                 result_redirect_writer=_make_result_redirect_writer(
                     workspace_id, user_id, agent_id
                 ),

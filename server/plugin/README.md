@@ -6,7 +6,7 @@
 
 > **状态（2026-09-13）**：一期已接线（`main.py` lifespan 挂载 + `agent/routes.py`
 > 级联清理 4 处）；**默认关闭**，设 `TREE_PLUGIN_ENABLED=1` 并重启后端进程生效。
-> 联调对齐：知遥 isolation/async v2 + 栖迟 core 三件套 **60 passed + 1 skipped**
+> 联调对齐：知遥 isolation/async v2 + 栖迟 core 四件套 **64 passed + 1 skipped**
 > （skip = J5 活跃组上限，见文末差异清单）；全量回归相对基线零破坏。
 
 ## 模块结构
@@ -115,15 +115,20 @@ plugin.safe_publish(
 ```
 
 - payload 为**最小字段**（不含参数值与结果正文，防敏感数据扩散）；
-- scope 从 LLM 会话对象尽力提取（缺失留空）；`user_id` 为空的事件拒绝发布；
+- scope 四元组由 `AgentLLMSession` 携带并装配（`user_id/team_id/agent_id/session_id`）；
+  三个生产构造点补传口径：成员会话 `team_id=team_id or agent_id`（chat.py 成员路径）、
+  agent 会话 `team_id=agent_id`（顶层会话）、compact 临时会话仅装配 `session_id`
+  （该路径无团队上下文且不执行工具循环，`team_id` 如实留空）；
+- 未装配时字段为空串：fail-closed 语义下，事件缺字段时不命中要求该字段的实例；
+  `user_id` 为空的事件拒绝发布；
 - 兼容包装 `plugin.publish_tool_event(session, ...)` 保留（内部经 `safe_publish`）。
 
 ## 测试与演示
 
 ```bat
-:: 插件三件套（isolation / async / core）
-cd server && .venv\Scripts\python.exe -m pytest tests/test_plugin_isolation.py tests/test_plugin_async.py tests/test_plugin_core.py -q
-::  → 60 passed + 1 skipped（skip = J5 活跃组上限，已知差异；含 D-13 并发注册用例）
+:: 插件四件套（isolation / async / core / scope_assembly）
+cd server && .venv\Scripts\python.exe -m pytest tests/test_plugin_isolation.py tests/test_plugin_async.py tests/test_plugin_core.py tests/test_plugin_scope_assembly.py -q
+::  → 64 passed + 1 skipped（skip = J5 活跃组上限，已知差异；含 D-13 并发注册用例、D-08 装配链路用例）
 
 :: 端到端演示（publish → 处理 → 出站；含越权拒绝演示）
 server\.venv\Scripts\python.exe .output\plugin_demo.py
@@ -131,7 +136,7 @@ server\.venv\Scripts\python.exe .output\plugin_demo.py
 :: C1 验证：TTL 周期清扫实测（小 TTL 常量；日志：.output/plugin_c1_ttl_sweep.log）
 server\.venv\Scripts\python.exe .output\plugin_c1_ttl_sweep_demo.py
 
-:: 全量回归（对比基线：621 passed → 681 passed / 1 skipped，零破坏）
+:: 全量回归（对比基线：621 passed → 685 passed / 1 skipped，零破坏；含 D-08 +4 用例）
 cd server && .venv\Scripts\python.exe -m pytest tests/ -q
 ```
 

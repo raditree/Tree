@@ -188,12 +188,17 @@ async def compact_agent_context(
         model_config = state.model_configs.get(model_id)
         if model_config is None:
             model_config = next(iter(state.model_configs.values()))
+        # 插件埋点 scope：user/agent/session 装配；team_id 留空——
+        # 本路径为 compact"从 DB 恢复的临时会话"，无团队上下文、亦无
+        # "成员→团队"的轻量反查接口；该会话仅用于压缩（不执行工具循环、
+        # 不发埋点事件），留空不影响一期埋点链路（详见 .output 交付说明）。
         session = AgentLLMSession(
             model_config=model_config,
             workspace_id=(agent or {}).get("workspace_id", "") or agent_id,
             system_prompt="",
             user_id=user_id,
             agent_id=agent_id,
+            session_id=session_id,
         )
         session.context = restored
         restored_from_db = True
