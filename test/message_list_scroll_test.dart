@@ -89,6 +89,53 @@ void main() {
     expect((dy2 - anchorDy!).abs(), lessThan(4)); // 视口锁定：锚点消息不动
   });
 
+  testWidgets('鼠标滚轮上滚脱离后：新消息推送不把视口拽回底部（滚轮场景）',
+      (WidgetTester tester) async {
+    final GlobalKey<_HarnessState> key = await pumpList(tester);
+
+    // 桌面端典型操作：鼠标滚轮 / 拖动滚动条翻阅历史。二者在滚动通知层
+    // 都表现为「无 dragDetails 的 ScrollUpdateNotification」（与在列表上
+    // 拖拽不同），这里以 position.jumpTo 模拟该形态（滚轮事件在测试中
+    // 会被消息内层富文本组件优先截获，无法直接注入到外层列表）。
+    tester.state<ScrollableState>(find.byType(Scrollable).first)
+        .position
+        .jumpTo(400);
+    await tester.pumpAndSettle();
+
+    // 已把视口移离底部，且应进入脱离态（回底按钮出现）
+    final double off1 = offsetOf(tester);
+    expect(off1, greaterThan(12));
+    expect(buttonOpacity(tester), 1);
+
+    // 此时推送新消息（msg_start / 流式增量 / 工具卡片到达）
+    key.currentState!.addMessage();
+    await tester.pumpAndSettle();
+
+    // 关键回归：不得被拽回底部，脱离态保持
+    expect(offsetOf(tester), greaterThan(12));
+    expect(buttonOpacity(tester), 1);
+  });
+
+  testWidgets('滚轮方式滚回底部附近自动恢复跟随', (WidgetTester tester) async {
+    final GlobalKey<_HarnessState> key = await pumpList(tester);
+
+    // 无拖拽参与地滚离底部（滚轮/滚动条形态）→ 进入脱离
+    final ScrollableState scrollable =
+        tester.state<ScrollableState>(find.byType(Scrollable).first);
+    scrollable.position.jumpTo(400);
+    await tester.pumpAndSettle();
+    expect(buttonOpacity(tester), 1);
+
+    // 无拖拽参与地滚回底部附近 → 应恢复跟随
+    scrollable.position.jumpTo(8);
+    await tester.pumpAndSettle();
+    expect(buttonOpacity(tester), 0);
+
+    key.currentState!.addMessage();
+    await tester.pumpAndSettle();
+    expect(offsetOf(tester), lessThanOrEqualTo(1)); // 继续跟随
+  });
+
   testWidgets('点击「回到底部」按钮：平滑回底并恢复跟随', (WidgetTester tester) async {
     await pumpList(tester);
     await tester.dragFrom(blankPoint, const Offset(0, 260));

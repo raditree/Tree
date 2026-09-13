@@ -1657,14 +1657,16 @@ class LocalExecutorService extends ChangeNotifier {
       final String content = _decodeProcessBytes(bytes);
       final List<String> fileLines = content.split('\n');
       final String lowerPattern = ignoreCase ? pattern.toLowerCase() : pattern;
-      for (final String line in fileLines) {
+      for (int i = 0; i < fileLines.length; i++) {
+        final String line = fileLines[i];
         final bool hit = re != null
             ? re.hasMatch(line)
             : ignoreCase
                 ? line.toLowerCase().contains(lowerPattern)
                 : line.contains(pattern);
         if (hit) {
-          out.add('${file.path}:$line');
+          // 与 grep -n 一致：输出 path:行号:内容（行号从 1 起）
+          out.add('${file.path}:${i + 1}:$line');
         }
       }
     } catch (_) {

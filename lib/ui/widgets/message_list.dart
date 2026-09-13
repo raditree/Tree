@@ -102,8 +102,12 @@ class _MessageListViewState extends State<_MessageListView> {
   /// （避免与用户滚动打架），滚动结束后统一结算一次。
   bool _anchorPending = false;
 
-  /// 脱离判定阈值（px）：拖拽离开底部超过该值即视为用户主动脱离跟随
+  /// 脱离判定阈值（px）：视口离开底部超过该值即视为用户主动脱离跟随
   static const double _detachThreshold = 12.0;
+
+  /// 平滑跟随动画进行中的计数：>0 时滚动通知不更新脱离状态，
+  /// 避免把程序动画（animateTo 的中间帧）误判为用户滚动。
+  int _autoScrollCount = 0;
 
   /// 消息 id → GlobalKey（定位目标可寻址）
   final Map<String, GlobalKey> _itemKeys = <String, GlobalKey>{};
@@ -299,16 +303,20 @@ class _MessageListViewState extends State<_MessageListView> {
 
   /// 滚动通知：维护「用户脱离」状态与锚定校正结算。
   ///
-  /// - 用户拖拽（dragDetails != null）离开底部超过 [_detachThreshold] →
-  ///   置位脱离（此后新内容不再把视口拽回底部）；拖回底部附近 → 恢复跟随。
+  /// - 任何来源的滚动更新（在列表上拖拽 / 鼠标滚轮 / 触控板 / 拖动滚动条 /
+  ///   惯性衰减等，均表现为 ScrollUpdateNotification）离开底部超过
+  ///   [_detachThreshold] → 进入脱离（此后新内容不再把视口拽回底部）；
+  ///   回到/接近底部 → 恢复跟随。
+  /// - 仅「平滑跟随动画」进行中（[_autoScrollCount] > 0）忽略更新，避免把
+  ///   程序动画自身误判为用户滚动；动画结束/被打断后由 [_scrollToBottomSmooth]
+  ///   的回调统一结算一次，避免漏判打断瞬间的用户滚动。
   /// - 滚动结束（拖拽/惯性停止）：结算挂起的锚定校正。
-  ///
-  /// 注意：程序性滚动（jumpTo/animateTo）不携带 dragDetails，不影响脱离状态。
   bool _onScrollNotification(ScrollNotification notification) {
     final double pixels = notification.metrics.pixels;
-    if (notification is ScrollUpdateNotification &&
-        notification.dragDetails != null) {
-      if (!_userDetached && pixels > _detachThreshold) {
+    if (notification is ScrollUpdateNotification) {
+      if (_autoScrollCount > 0) {
+        // 平滑跟随动画进行中：跳过（交由动画回调结算）
+      } else if (!_userDetached && pixels > _detachThreshold) {
         _setUserDetached(true);
       } else if (_userDetached && pixels <= _detachThreshold) {
         _setUserDetached(false);
@@ -346,9 +354,12 @@ class _MessageListViewState extends State<_MessageListView> {
   /// 平滑滚动到底部（流式追加/增量更新时跟随）。
   ///
   /// 反转列表底部即 offset 0；动画完成后**仅在仍应跟随**时校正一次。
-  /// （修复：不再无条件 jumpTo(0)，避免用户拖拽打断动画后被强行拉回底部）
+  /// 修复历史：① 不再无条件 jumpTo(0)，避免用户拖拽打断动画后被强行拉
+  /// 回底部；② 动画结束/被打断后按当前视口结算一次脱离状态——打断瞬间的
+  /// 用户滚动（滚轮/滚动条等）会被动画计数忽略，这里补判以免漏。
   void _scrollToBottomSmooth() {
     if (!_controller.hasClients) return;
+    _autoScrollCount++;
     _controller
         .animateTo(
           0,
@@ -356,8 +367,16 @@ class _MessageListViewState extends State<_MessageListView> {
           curve: Curves.easeOut,
         )
         .then((_) {
+      if (_autoScrollCount > 0) _autoScrollCount--;
       if (!mounted || !_controller.hasClients) return;
-      // 用户已主动脱离（动画可能被其拖拽打断）：保持用户当前位置
+      final double px = _controller.position.pixels;
+      // 动画完成时若视口仍远离底部（被用户滚动打断/用户已在历史位置）：
+      // 进入脱离态并保持用户当前位置；否则校正到真实底部。
+      if (!_userDetached && px > _detachThreshold) {
+        _setUserDetached(true);
+      } else if (_userDetached && px <= _detachThreshold) {
+        _setUserDetached(false);
+      }
       if (_userDetached) return;
       _jumpToBottom();
     });

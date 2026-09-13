@@ -206,11 +206,13 @@ class GrepTool:
             - max_depth: 目录递归深度上限（可选，1=仅目标目录本层，缺省 0 不限）
             - exclude: 排除的文件/目录 glob，逗号分隔（可选）
             - max_results: 返回行数上限（可选，缺省 200）
-        :return: 成功 ``{"exit_code": 0, "matches": ["path:line", ...], "count": N,
-                 "total": N, "truncated": bool, "line_truncated": bool,
-                 "stdout": "..."}``；无命中 exit_code=1、matches 为空；失败
-                 返回 ``{"error": "..."}``。超长单行按命中位置截断为上下文
-                 窗口（标注 line_truncated），行数/总字符超出则标注 truncated
+        :return: 成功 ``{"exit_code": 0, "matches": ["path:行号:内容", ...],
+                 "count": N, "total": N, "truncated": bool,
+                 "line_truncated": bool, "stdout": "..."}``；无命中 exit_code=1、
+                 matches 为空；失败返回 ``{"error": "..."}``。三模式统一输出
+                 ``path:行号:内容``（与 ``grep -n`` 一致，行号从 1 起）。超长
+                 单行按命中位置截断为上下文窗口（标注 line_truncated），
+                 行数/总字符超出则标注 truncated
         """
         if not isinstance(arguments, dict):
             return {"error": "参数必须是字典类型"}
