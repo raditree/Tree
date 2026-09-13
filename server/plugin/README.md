@@ -143,7 +143,7 @@ cd server && .venv\Scripts\python.exe -m pytest tests/ -q
 ## 与 interface-contract v1 的对齐与差异（联调逐项评审输入）
 
 > **评审状态**（观澜，2026-09-13）：有条件通过 → C1/C2 已补齐并经独立补验
-> （知遥 `test-report.md` v2，ALL PASS）→ **待复核转"通过"**。
+> （知遥 `test-report.md` v2，ALL PASS）→ **通过**（v2 收口，复核记录见 `review-notes.md` §9）。
 
 **已对齐（本轮）**：
 
