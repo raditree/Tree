@@ -156,6 +156,21 @@ class TestMemberReplyToSender(unittest.TestCase):
         self.assertEqual(dispatched, [],
                          "最后发送方为用户时，总结只留在成员会话")
 
+    def test_auto_reply_incoming_no_forward(self):
+        """被动 auto_reply 消息（反向推送/成员完成回传）→ 不再自动回传，
+        打破两个成员 A↔B 的无限来回。"""
+        payload = dict(self.base, leader_id="top-1", sender_id="peerA",
+                       auto_reply=True)
+        dispatched = self._run_payload(payload)
+        self.assertEqual(dispatched, [], "auto_reply 被动消息不应回传任何 agent")
+
+    def test_passive_active_false_no_forward(self):
+        """被动 active=false（唤醒续跑等注入）→ 不再自动回传。"""
+        payload = dict(self.base, leader_id="top-1", sender_id="top-1",
+                       active=False)
+        dispatched = self._run_payload(payload)
+        self.assertEqual(dispatched, [], "active=false 被动消息不应回传任何 agent")
+
 
 if __name__ == "__main__":
     unittest.main()

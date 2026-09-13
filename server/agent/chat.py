@@ -2118,10 +2118,17 @@ async def _process_member_message(
     # 成员最终总结的回发目标：默认 = 本条消息的发送方；中途切入新消息时
     # 更新为最后一位发送方（feature：自动回复仅回给最后发给它的那位）。
     reply_sender = sender_id
+    # 被动标记（Task 7.1）：本条消息为被动注入（active=false 的唤醒续跑，
+    # 或 auto_reply 的反向推送/成员完成回传/错误回传）时，处理完不再自动
+    # 回传给发送方——否则两个成员互发会形成 A→B→A… 的无限来回。
+    reply_passive = (
+        not bool(payload.get("active", True))
+        or bool(payload.get("auto_reply"))
+    )
 
     def _pick_incoming() -> Optional[str]:
         """在 tool_call 间隙从队列切入 leader 发来的新消息。"""
-        nonlocal reply_sender
+        nonlocal reply_sender, reply_passive
         if queue is None:
             return None
         try:
@@ -2143,6 +2150,11 @@ async def _process_member_message(
         if inc_sender is None:
             inc_sender = incoming.get("leader_id", "")
         reply_sender = inc_sender
+        # 回发目标切换时同步被动标记：新消息是被动注入则同样不回传
+        reply_passive = (
+            not bool(incoming.get("active", True))
+            or bool(incoming.get("auto_reply"))
+        )
         session.sender_id = inc_sender
         _append_activity_log(
             workspace_id,
@@ -2195,7 +2207,8 @@ async def _process_member_message(
         # 成员工具循环最后一次回复的 content 自动回发"最后将消息发给它的那位"
         # （用户直发时为 USER_AGENT_ID/空串 → 不转发任何 agent，仅留在成员
         # 会话/teammates 窗口）。仅回传"最终回复"，不带过程段拼接。
-        if _final_text and not is_user_sender(reply_sender):
+        # 被动注入（active=false / auto_reply）不回传：打破成员间 A↔B 来回。
+        if _final_text and not is_user_sender(reply_sender) and not reply_passive:
             try:
                 _dispatch_agent_message(
                     user_id,

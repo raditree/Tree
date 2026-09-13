@@ -1309,13 +1309,23 @@ class _MessagePanelState extends State<MessagePanel> {
 
   /// 打开 teammates 工作进度窗口
   void _openTeammatesWindow(Agent agent) {
+    // 会话未就绪（首次加载 / 刚切换 agent，_loadSessions 尚未返回）时不得
+    // 回退默认会话：否则窗口按 session_default 过滤，显示的是默认会话的
+    // 成员进度而非当前会话。此时拒绝打开并提示，待会话确定后再进入。
+    final String? sessionId = _currentSession?.sessionId;
+    if (sessionId == null || sessionId.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('会话加载中，请稍候再打开工作进度')),
+      );
+      return;
+    }
     Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => TeammatesWindowPage(
           agent: agent,
           // 透传当前会话：进度页历史/实时 WS 按该成员+该会话过滤，
           // 避免把该成员其他会话的工作进度混进当前窗口（跨会话）。
-          sessionId: _currentSessionId,
+          sessionId: sessionId,
         ),
       ),
     );

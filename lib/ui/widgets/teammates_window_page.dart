@@ -85,6 +85,10 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
       final String? agentId = d['agent_id'] as String?;
       final String? status = d['status'] as String?;
       if (agentId == null) return;
+      // 会话隔离：仅反映本窗口会话的状态；事件带 session_id 且不属于本会话时
+      // 忽略（避免成员在其他会话工作时本窗口误显示"工作中"）。
+      final String? sessionId = d['session_id'] as String?;
+      if (sessionId != null && sessionId != widget.sessionId) return;
       setState(() {
         if (status == 'working' ||
             status == 'updating_memory' ||
@@ -482,6 +486,10 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
       final Map<String, dynamic> d =
           (data['data'] as Map<String, dynamic>?)?.cast<String, dynamic>() ??
               {};
+      // 会话隔离：agent_status 的 session_id 在 data 内层，带值且不属于本会话
+      // 时忽略（与顶层过滤统一：缺省视为本会话）。
+      final String? statusSession = d['session_id'] as String?;
+      if (statusSession != null && statusSession != widget.sessionId) return;
       if (d['agent_id'] == widget.memberId) {
         _loadLog();
       }
