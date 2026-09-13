@@ -31,6 +31,18 @@ _MAX_DEPTH_CAP = 100
 # exclude 的模式数量与单条长度上限（防超长 shell 参数 / 滥用）
 _MAX_EXCLUDE_PATTERNS = 50
 _MAX_EXCLUDE_PATTERN_CHARS = 256
+# 默认排除目录（依赖 / 缓存 / 构建产物）。这些目录动辄数百 MB 且几乎不含项目
+# 源码，纳入扫描有两个后果：本地模式把海量命中行一次性经反向 WS 回传，单帧超过
+# uvicorn ws_max_size 默认 16MiB 会被静默关闭连接（连带注销执行器注册、打断
+# 在途工具调用）；云端/SSH 模式则白白耗时。显式把 path 指向其中某个目录
+# （如 path='.venv/lib'）时该目录不再被排除，见 _merge_default_excludes。
+DEFAULT_EXCLUDE_PATTERNS = [
+    ".venv", "venv",
+    "node_modules",
+    ".pub-cache", ".dart_tool",
+    "build", "dist",
+    "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
+]
 
 
 class GrepTool:
@@ -152,6 +164,30 @@ class GrepTool:
             return [], f"exclude 模式过多（上限 {_MAX_EXCLUDE_PATTERNS} 个）"
         return patterns, ""
 
+    @staticmethod
+    def _merge_default_excludes(exclude: List[str], path: str) -> List[str]:
+        """把 :data:`DEFAULT_EXCLUDE_PATTERNS` 并入用户 exclude（用户在前、去重保序）。
+
+        :param exclude: 用户显式传入的排除模式
+        :param path: 搜索目标（工作空间内相对路径），空串表示整个工作空间
+        :return: 实际生效的排除模式列表
+
+        ``path`` 的任一路径段命中某个默认模式时跳过该模式：显式写
+        ``path='.venv'`` / ``path='.venv/lib'`` 说明就是要在该目录内搜索，
+        默认排除不应把它挡掉。按路径段（而非仅最后一段）放行是为了让云端
+        ``grep --exclude-dir`` 对命令行目录的匹配行为与本地/SSH 一致，避免
+        同一 path 在不同模式下有的被排除、有的没有。
+        """
+        segments = (
+            {seg for seg in path.strip("/").split("/") if seg} if path else set()
+        )
+        merged = list(exclude)
+        for pat in DEFAULT_EXCLUDE_PATTERNS:
+            if pat in segments or pat in merged:
+                continue
+            merged.append(pat)
+        return merged
+
     def get_tool_definition(self) -> Dict[str, Any]:
         """返回 OpenAI function calling 格式的工具定义。"""
         return {
@@ -189,12 +225,15 @@ class GrepTool:
                         },
                         "exclude": {
                             "type": "string",
-                            "description": "排除的文件/目录模式，逗号分隔的 glob，"
-                            "仅按名称（basename）匹配、支持 * 与 ?，"
-                            "如 'node_modules,*.min.js,build'；不接受带路径的"
-                            "模式（如 lib/*.dart，会报错），请改用名称模式"
-                            "（*.g.dart）或目录名（build）。缺省不额外排除"
-                            "（.git 始终排除）",
+                            "description": "在默认排除之外追加排除的文件/目录模式，"
+                            "逗号分隔的 glob，仅按名称（basename）匹配、支持 * 与 ?，"
+                            "如 '*.g.dart,*.min.js'；不接受带路径的模式（如 "
+                            "lib/*.dart，会报错），请改用名称模式（*.g.dart）或"
+                            "目录名（build）。默认已排除 .git 与依赖/缓存/构建产物"
+                            "目录（.venv、venv、node_modules、.pub-cache、"
+                            ".dart_tool、build、dist、__pycache__、.mypy_cache、"
+                            ".pytest_cache、.ruff_cache、.tox）；显式把 path 指向"
+                            "其中某个目录（如 path='.venv'）时该目录不再被排除",
                         },
                         "max_results": {
                             "type": "integer",
@@ -218,7 +257,7 @@ class GrepTool:
             - regex: 是否正则（可选，缺省 false）
             - ignore_case: 是否忽略大小写（可选，缺省 false）
             - max_depth: 目录递归深度上限（可选，1=仅目标目录本层，缺省 0 不限）
-            - exclude: 排除的文件/目录 glob，逗号分隔（可选）
+            - exclude: 在默认排除之外追加排除的文件/目录 glob，逗号分隔（可选）
             - max_results: 返回行数上限（可选，缺省 200）
         :return: 成功 ``{"exit_code": 0, "matches": ["path:行号:内容", ...],
                  "count": N, "total": N, "truncated": bool,
@@ -226,7 +265,11 @@ class GrepTool:
                  matches 为空；失败返回 ``{"error": "..."}``。三模式统一输出
                  ``path:行号:内容``（与 ``grep -n`` 一致，行号从 1 起）。超长
                  单行按命中位置截断为上下文窗口（标注 line_truncated），
-                 行数/总字符超出则标注 truncated
+                 行数/总字符超出则标注 truncated（本地模式下前端已在发送端
+                 按同一套上限截断并把标记并入，故 ``total`` 是"收到的命中行
+                 数"，可能小于真实命中数）。返回的 ``exclude`` 是
+                 「用户模式 + :data:`DEFAULT_EXCLUDE_PATTERNS`」的合并结果
+                 （显式 path 指向的默认排除目录会被放行）
         """
         if not isinstance(arguments, dict):
             return {"error": "参数必须是字典类型"}
@@ -261,6 +304,11 @@ class GrepTool:
         exclude, exclude_err = self._parse_exclude(arguments.get("exclude"))
         if exclude_err:
             return {"error": exclude_err}
+        # 并入默认排除目录（显式 path 指向者放行），避免依赖/缓存/构建产物目录
+        # 被全工作区扫描（本地模式下会造成超大回传帧，见 DEFAULT_EXCLUDE_PATTERNS）
+        exclude = self._merge_default_excludes(
+            exclude, path if isinstance(path, str) else ""
+        )
 
         try:
             max_results = int(arguments.get("max_results") or DEFAULT_MAX_RESULTS)
@@ -286,6 +334,12 @@ class GrepTool:
         stdout = result.get("stdout", "") or ""
         exit_code = int(result.get("exit_code", 0))
         all_lines: List[str] = [ln for ln in stdout.splitlines() if ln.strip()]
+        # 本地模式的前端已按同一套上限在发送端截断（见 local_executor_service
+        # .dart: truncateGrepLine / _GrepCollector）——超限帧会被 WS 服务端按
+        # ws_max_size 静默关闭，所以截断不能只留在这里。把它的标记并入结果，
+        # 避免模型把"被截断的部分命中"当成全量。
+        sender_truncated = bool(result.get("truncated"))
+        sender_line_truncated = bool(result.get("line_truncated"))
 
         # 两道截断防线：行数（max_results）+ 超长单行（命中点窗口）。
         # 另设总字符上限，防止多行超长行叠加后仍撑爆上下文。
@@ -306,12 +360,16 @@ class GrepTool:
                 break
             retained.append(tline)
             total_chars += add_len
+        truncated = truncated or sender_truncated
+        line_truncated = line_truncated or sender_line_truncated
 
         logger.info(
             "grep 工具搜索完成: pattern=%r path=%r regex=%s ignore_case=%s "
-            "max_depth=%d exclude=%s 命中=%d 返回=%d 单行截断=%s 总字符=%d",
+            "max_depth=%d exclude=%s 收到=%d 返回=%d 单行截断=%s 截断=%s "
+            "发送端截断=%s 总字符=%d",
             pattern, path, regex, ignore_case, max_depth, exclude,
-            len(all_lines), len(retained), line_truncated, total_chars,
+            len(all_lines), len(retained), line_truncated, truncated,
+            sender_truncated, total_chars,
         )
         return {
             "pattern": pattern,

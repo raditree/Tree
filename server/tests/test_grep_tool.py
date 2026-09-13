@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock
 
 from tool.grep_tool import (
+    DEFAULT_EXCLUDE_PATTERNS,
     DEFAULT_MAX_LINE_CHARS,
     DEFAULT_MAX_RESULTS,
     DEFAULT_MAX_TOTAL_CHARS,
@@ -94,8 +95,26 @@ class TestExecute(unittest.TestCase):
         self.assertEqual(ret["matches"][0], "lib/a.dart:hello")
         self.io.grep_search.assert_awaited_once_with(
             "ws", "hello", path="", regex=False, ignore_case=False,
-            max_depth=0, exclude=[],
+            max_depth=0, exclude=DEFAULT_EXCLUDE_PATTERNS,
         )
+
+    def test_sender_truncation_flags_merged(self):
+        """本地模式前端在发送端截断的标记并入结果，避免部分命中被当全量。"""
+        self.io.grep_search = AsyncMock(return_value={
+            "exit_code": 0,
+            "stdout": "lib/a.dart:hello\nlib/b.dart:hello2",
+            "truncated": True,
+            "line_truncated": True,
+        })
+        ret = self.tool.execute({"pattern": "hello"})
+        self.assertTrue(ret["truncated"])
+        self.assertTrue(ret["line_truncated"])
+
+    def test_sender_flags_absent_for_cloud_and_ssh(self):
+        """云端/SSH 不返回发送端标记时，行为与旧版一致。"""
+        ret = self.tool.execute({"pattern": "hello"})
+        self.assertFalse(ret["truncated"])
+        self.assertFalse(ret["line_truncated"])
 
     def test_params_forwarded(self):
         self.tool.execute(
@@ -103,7 +122,7 @@ class TestExecute(unittest.TestCase):
         )
         self.io.grep_search.assert_awaited_once_with(
             "ws", r"\d+", path="lib/src", regex=True, ignore_case=True,
-            max_depth=0, exclude=[],
+            max_depth=0, exclude=DEFAULT_EXCLUDE_PATTERNS,
         )
 
     def test_max_depth_and_exclude_forwarded(self):
@@ -111,12 +130,40 @@ class TestExecute(unittest.TestCase):
             {"pattern": "x", "max_depth": 2,
              "exclude": "node_modules, *.min.js,"}
         )
+        expected = ["node_modules", "*.min.js"] + [
+            p for p in DEFAULT_EXCLUDE_PATTERNS if p != "node_modules"
+        ]
         self.io.grep_search.assert_awaited_once_with(
             "ws", "x", path="", regex=False, ignore_case=False,
-            max_depth=2, exclude=["node_modules", "*.min.js"],
+            max_depth=2, exclude=expected,
         )
         self.assertEqual(ret["max_depth"], 2)
-        self.assertEqual(ret["exclude"], ["node_modules", "*.min.js"])
+        self.assertEqual(ret["exclude"], expected)
+
+    def test_default_excludes_merged(self):
+        """未传 exclude 时也会并入默认排除目录（依赖/缓存/构建产物）。"""
+        ret = self.tool.execute({"pattern": "x"})
+        self.assertEqual(ret["exclude"], DEFAULT_EXCLUDE_PATTERNS)
+        self.assertIn(".venv", ret["exclude"])
+        self.assertIn("node_modules", ret["exclude"])
+
+    def test_explicit_path_overrides_default_exclude(self):
+        """path 明确指向某个默认排除目录（或其子目录）时，该目录不再被排除。"""
+        for path, freed in (
+            (".venv", ".venv"),
+            (".venv/lib", ".venv"),
+            ("node_modules/foo", "node_modules"),
+            ("build", "build"),
+        ):
+            self.io.grep_search.reset_mock()
+            ret = self.tool.execute({"pattern": "x", "path": path})
+            self.assertEqual(
+                self.io.grep_search.await_args.kwargs["exclude"], ret["exclude"]
+            )
+            self.assertNotIn(freed, ret["exclude"])
+            # 其余默认排除项仍然生效
+            others = [p for p in DEFAULT_EXCLUDE_PATTERNS if p != freed]
+            self.assertEqual(ret["exclude"], others)
 
     def test_max_depth_clamped(self):
         self.tool.execute({"pattern": "x", "max_depth": 999})
@@ -163,7 +210,11 @@ class TestExecute(unittest.TestCase):
         )
         self.assertEqual(
             self.io.grep_search.await_args.kwargs["exclude"],
-            ["*.g.dart", "build", "node_modules"],
+            ["*.g.dart", "build", "node_modules"]
+            + [
+                p for p in DEFAULT_EXCLUDE_PATTERNS
+                if p not in ("build", "node_modules")
+            ],
         )
 
     def test_no_hits(self):

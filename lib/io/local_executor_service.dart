@@ -68,6 +68,142 @@ String decodeProcessBytes(dynamic value) {
   }
 }
 
+/// grep 命中行回传的单行最大字符数（与后端 GrepTool.DEFAULT_MAX_LINE_CHARS 一致）。
+const int kGrepMaxLineChars = 2000;
+
+/// 超长行截断时在命中点前后保留的上下文宽度（与后端 GrepTool 一致）。
+const int kGrepMatchContextChars = 1000;
+
+/// grep 结果回传的总字符上限（与后端 GrepTool.DEFAULT_MAX_TOTAL_CHARS 一致）。
+const int kGrepMaxTotalChars = 100000;
+
+/// 发送端截断单条 grep 命中行：取「命中点 ± 上下文」窗口，被裁掉处标 `…`。
+///
+/// 本地 grep 的结果要经反向 WS 单帧回传给后端，而 jsonl / SQLite 库这类文件
+/// 单行可达数百万字符，整行回传会把单帧撑到数十 MB。uvicorn 的 ``ws_max_size``
+/// 默认为 16MiB，超限帧会被**静默**关闭连接（不产生 WARNING/ERROR 日志），连带
+/// 注销执行器注册、把在途工具调用全部打断。后端 GrepTool 的同名上限只在"收到
+/// 之后"才生效，救不了已经超限的帧，因此截断必须在发送端完成。
+///
+/// 窗口宽度与后端 ``_truncate_line`` 对齐，区别是把 `…` 标记也算进
+/// [kGrepMaxLineChars] 预算内，保证回传行长度不超过该值、不会被后端二次截断。
+///
+/// :param line: 待检查的命中行
+/// :param pattern: 搜索模式（用于定位命中点；正则非法时退化为行首窗口）
+/// :param regex: pattern 是否为正则
+/// :param ignoreCase: 是否忽略大小写
+/// :return: 截断后的文本；未超长时返回 null（调用方保留原文即可）
+///
+/// 纯函数，供 [_searchFile] 与单测复用。
+String? truncateGrepLine(
+  String line,
+  String pattern, {
+  bool regex = false,
+  bool ignoreCase = false,
+}) {
+  if (line.length <= kGrepMaxLineChars) return null;
+
+  int start = -1;
+  if (regex) {
+    try {
+      final RegExpMatch? m =
+          RegExp(pattern, caseSensitive: !ignoreCase).firstMatch(line);
+      if (m != null) start = m.start;
+    } on FormatException {
+      start = -1;
+    }
+  } else {
+    final String key = ignoreCase ? line.toLowerCase() : line;
+    final String needle = ignoreCase ? pattern.toLowerCase() : pattern;
+    start = key.indexOf(needle);
+  }
+  if (start < 0) start = 0;
+
+  int begin = start - kGrepMatchContextChars;
+  if (begin < 0) begin = 0;
+  int end = begin + kGrepMaxLineChars;
+  if (end > line.length) {
+    end = line.length;
+    begin = end - kGrepMaxLineChars;
+    if (begin < 0) begin = 0;
+  }
+  final bool head = begin > 0;
+  final bool tail = end < line.length;
+  // 省略号也占预算：只从"被裁掉的那一侧"收缩（该侧已被裁剪、有余量），
+  // 保证命中点始终落在窗口内，且最终长度不超过 kGrepMaxLineChars
+  int over = (end - begin) + (head ? 1 : 0) + (tail ? 1 : 0) -
+      kGrepMaxLineChars;
+  while (over > 0) {
+    if (head) {
+      begin++;
+      over--;
+    }
+    if (over > 0 && tail) {
+      end--;
+      over--;
+    }
+  }
+  return '${head ? '…' : ''}${line.substring(begin, end)}${tail ? '…' : ''}';
+}
+
+/// grep 命中的发送端收集器：逐行按 [truncateGrepLine] 截断，并在累计字符数
+/// 达到 [kGrepMaxTotalChars] 后停止收集（``full`` 为真，遍历随之终止）。
+///
+/// 上限取值与后端 GrepTool 的同名常量一致，保证"前端截一刀、后端不再截"
+/// 的语义可预期：结果总量受控，`truncated` / `line_truncated` 由本类产生并
+/// 随 ``tool_exec_response`` 回传。
+class _GrepCollector {
+  _GrepCollector({
+    required this.pattern,
+    required this.regex,
+    required this.ignoreCase,
+  });
+
+  /// 搜索模式（用于定位超长行的命中点）
+  final String pattern;
+
+  /// pattern 是否为正则
+  final bool regex;
+
+  /// 是否忽略大小写
+  final bool ignoreCase;
+
+  /// 已收集的 ``路径:行号:内容`` 行
+  final List<String> lines = <String>[];
+
+  /// 累计字符数（含换行符）
+  int _chars = 0;
+
+  /// 是否已达总量上限（后续命中全部丢弃）
+  bool truncated = false;
+
+  /// 是否至少有一行被按命中点截断
+  bool lineTruncated = false;
+
+  /// 是否已达总量上限（遍历据此提前收敛）
+  bool get full => truncated;
+
+  /// 记录一条命中；超过总量上限时置 [truncated] 并丢弃该行。
+  void add(String filePath, int lineNo, String line) {
+    if (truncated) return;
+    final String? cut = truncateGrepLine(
+      line,
+      pattern,
+      regex: regex,
+      ignoreCase: ignoreCase,
+    );
+    if (cut != null) lineTruncated = true;
+    final String entry = '$filePath:$lineNo:${cut ?? line}';
+    final int addLen = entry.length + 1; // +1 记换行符
+    if (_chars > 0 && _chars + addLen > kGrepMaxTotalChars) {
+      truncated = true;
+      return;
+    }
+    lines.add(entry);
+    _chars += addLen;
+  }
+}
+
 /// 本地执行器服务 - 在本地运行模式下执行后端推送的工具请求
 ///
 /// 本地运行模式：后端完整运行在云端，但工具调用环境转移到用户本机。
@@ -1515,6 +1651,9 @@ class LocalExecutorService extends ChangeNotifier {
   /// 上限，1=仅目标目录本层，缺省 0 不限）、``exclude``（逗号分隔的排除
   /// glob，仅按文件/目录名称（basename）匹配、支持 * 与 ?；带路径的模式由
   /// 工具层 GrepTool._parse_exclude 拒绝）。
+  ///
+  /// 结果在**发送端**按 [_GrepCollector] 截断（单行窗口 + 总量上限）后才回传：
+  /// 超限的单帧会被 WS 服务端静默关闭连接（见 [truncateGrepLine]）。
   Future<Map<String, dynamic>> _grepSearch(
     Directory wsDir,
     Map<String, dynamic> data,
@@ -1528,7 +1667,11 @@ class LocalExecutorService extends ChangeNotifier {
     final bool ignoreCase = (data['ignore_case'] as bool?) ?? false;
     final int maxDepth = _parseMaxDepth(data['max_depth']);
     final List<String> exclude = _parseExclude(data['exclude']);
-    final List<String> lines = <String>[];
+    final _GrepCollector out = _GrepCollector(
+      pattern: pattern,
+      regex: regex,
+      ignoreCase: ignoreCase,
+    );
     try {
       final RegExp? re = regex
           ? RegExp(pattern, caseSensitive: !ignoreCase)
@@ -1537,7 +1680,7 @@ class LocalExecutorService extends ChangeNotifier {
         await _walkSearch(
           wsDir,
           pattern,
-          lines,
+          out,
           re: re,
           ignoreCase: ignoreCase,
           maxDepth: maxDepth,
@@ -1555,7 +1698,7 @@ class LocalExecutorService extends ChangeNotifier {
             await _searchFile(
               File(full),
               pattern,
-              lines,
+              out,
               re: re,
               ignoreCase: ignoreCase,
             );
@@ -1564,7 +1707,7 @@ class LocalExecutorService extends ChangeNotifier {
           await _walkSearch(
             Directory(full),
             pattern,
-            lines,
+            out,
             re: re,
             ignoreCase: ignoreCase,
             maxDepth: maxDepth,
@@ -1577,12 +1720,15 @@ class LocalExecutorService extends ChangeNotifier {
     } catch (e) {
       return <String, dynamic>{'error': '搜索失败: $e'};
     }
-    if (lines.isEmpty) {
+    if (out.lines.isEmpty) {
       return <String, dynamic>{'exit_code': 1, 'stdout': ''};
     }
     return <String, dynamic>{
       'exit_code': 0,
-      'stdout': lines.join('\n'),
+      'stdout': out.lines.join('\n'),
+      // 发送端已截断：标记随结果回传，避免模型把部分命中当成全量
+      'truncated': out.truncated,
+      'line_truncated': out.lineTruncated,
     };
   }
 
@@ -1642,14 +1788,15 @@ class LocalExecutorService extends ChangeNotifier {
     return RegExp(re.toString(), caseSensitive: false).hasMatch(name);
   }
 
-  /// 在单个文件中匹配 [pattern]，命中行以 ``绝对路径:行内容`` 追加到 [out]。
+  /// 在单个文件中匹配 [pattern]，命中行以 ``绝对路径:行号:内容`` 追加到 [out]。
   ///
   /// 读取字节后按 [_decodeProcessBytes] 解码（UTF-8 严格优先，latin1 回退），
   /// 与 [_walkSearch] 的编码策略一致：GBK 文件不会因解码失败被整文件跳过。
+  /// [out] 达到总量上限（``out.full``）后立即停止本文件的后续匹配。
   Future<void> _searchFile(
     File file,
     String pattern,
-    List<String> out, {
+    _GrepCollector out, {
     RegExp? re,
     bool ignoreCase = false,
   }) async {
@@ -1667,7 +1814,8 @@ class LocalExecutorService extends ChangeNotifier {
                 : line.contains(pattern);
         if (hit) {
           // 与 grep -n 一致：输出 path:行号:内容（行号从 1 起）
-          out.add('${file.path}:${i + 1}:$line');
+          out.add(file.path, i + 1, line);
+          if (out.full) return;
         }
       }
     } catch (_) {
@@ -1679,11 +1827,11 @@ class LocalExecutorService extends ChangeNotifier {
   ///
   /// [maxDepth] > 0 时限制下钻层数（1=仅当前目录本层文件）；[exclude]
   /// 为按名称匹配的排除 glob。另始终跳过 ``.git`` / ``workspaces`` /
-  /// ``agentspace``。
+  /// ``agentspace``。[out] 达到总量上限（``out.full``）后立即停止遍历。
   Future<void> _walkSearch(
     Directory dir,
     String pattern,
-    List<String> out, {
+    _GrepCollector out, {
     RegExp? re,
     bool ignoreCase = false,
     int maxDepth = 0,
@@ -1691,6 +1839,7 @@ class LocalExecutorService extends ChangeNotifier {
     int depth = 1,
   }) async {
     await for (final FileSystemEntity entity in dir.list(followLinks: false)) {
+      if (out.full) return;
       if (entity is Directory) {
         final String name = _basename(entity.path);
         if (name == '.git' || name == 'workspaces' || name == 'agentspace') {
