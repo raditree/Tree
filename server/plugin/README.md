@@ -12,9 +12,9 @@
 > 自动注册）；**M3 工程小件已实施**（巡检联动 / F3 / 防呆 / 链深 / F5 / read
 > encoding；见「M3 工程小件（二期 M3）」章节）。
 > 联调对齐：知遥 isolation/async v2 + 栖迟 core 四件套 **64 passed + 1 skipped**
-> （skip = J5 活跃组上限，见文末差异清单）；**全量回归 810 passed / 1 skipped /
-> 23 subtests / 0 failed**（对照 M2 收口 783：净增 +27＝M3 新增 21 + EN1 先行 6，
-> 零破坏）。
+> （skip = J5 活跃组上限，见文末差异清单）；**全量回归 816 passed / 1 skipped /
+> 23 subtests / 0 failed**（对照 M2 收口 783：净增 +33＝M3 21 + EN1 先行 6 +
+> F-M3 补测 6，零破坏）。
 
 ## 模块结构
 
@@ -297,7 +297,11 @@ server\.venv\Scripts\python.exe .output\plugin_station_selftest.py
 cd server && .venv\Scripts\python.exe -m pytest tests/test_plugin_m3_patrol.py tests/test_plugin_m3_guard.py -q
 ::  → 21 passed
 
-:: 全量回归（当前 810 passed / 1 skipped / 23 subtests；对照 M2 收口 783+1+23 净增 +27、零破坏）
+:: F-M3 补测（快照端点 fail-closed / id 主键 / F5 前缀兜底 / 回归）
+cd server && .venv\Scripts\python.exe -m pytest tests/test_plugin_m3_fixes.py -q
+::  → 6 passed
+
+:: 全量回归（当前 816 passed / 1 skipped / 23 subtests；对照 M2 收口 783+1+23 净增 +33、零破坏）
 cd server && .venv\Scripts\python.exe -m pytest tests/ -q
 ```
 
