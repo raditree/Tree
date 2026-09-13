@@ -22,6 +22,13 @@ cors:
 prompt:
   version: "1.0.0"
 
+# 插件化埋点体系总开关（进程启动时生效）。
+# - 环境变量 TREE_PLUGIN_ENABLED 显式设置时优先（含 "0" 显式关闭）；
+# - 未设置环境变量时按此处 enabled 判定（键缺失/异常按 false，兼容旧行为）。
+# - 插件关闭时对现有行为零副作用；启用后可在前端「插件（只读）」面板查看运行态。
+plugin:
+  enabled: true
+
 # 用户可创建的顶层 agent 数量上限
 # 注：团队规模（最大层级深度 / 每层成员上限）不再在此配置——由用户创建
 # TOP agent 时指定（见 data/team_store 的 teams 表 max_level /

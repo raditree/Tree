@@ -5,7 +5,8 @@
 接口契约见 `agentspace/.hard/20260913-plugin-stations/artifacts/interface-contract.md` v1）。
 
 > **状态（2026-09-13）**：一期已接线（`main.py` lifespan 挂载 + `agent/routes.py`
-> 级联清理 4 处）；**默认关闭**，设 `TREE_PLUGIN_ENABLED=1` 并重启后端进程生效。
+> 级联清理 4 处）；总开关已配置化：**env `TREE_PLUGIN_ENABLED` 显式优先 → `app.yaml`
+> `plugin.enabled` 回落（缺省 false）**，重启后端进程生效。
 > **半二期处理站已实施**（`stations.py` + read 结果站接入；默认无订阅=零影响，
 > 见「处理站（半二期）」章节）。
 > **二期 M1/M2 已提交**（plugin_status + 面板快照；宿主通道后端承接面 + 示范插件
@@ -31,7 +32,7 @@
 | `plugins/architecture_analyzer.py` | 示例插件：订阅工具事件 → 读工作空间 → 推送摘要（三站全链路） | 一期示范 |
 | `plugins/read_station_demo.py` | 处理站示范插件：read 结果加标记前缀（确定性转换；E2E 载体） | 半二期示范 |
 
-## 总开关（默认关闭；关闭时零副作用）
+## 总开关（来源链：env 优先 → app.yaml；缺省关闭；关闭时零副作用）
 
 ```python
 import plugin
@@ -42,7 +43,8 @@ plugin.set_enabled(False)    # 关闭事件接收（组件保留，处理完积�
 plugin.shutdown()            # 完整停止（组件销毁 + 开关复位；测试/退出用）
 ```
 
-- 环境变量 `TREE_PLUGIN_ENABLED=1`（`1/true/yes/on`）可在进程启动时默认启用；
+- 环境变量 `TREE_PLUGIN_ENABLED=1`（`1/true/yes/on`）可在进程启动时启用——显式设置时优先（含 `0` 显式关闭）；
+- 未设置环境变量时，按 `server/configs/app.yaml` → `plugin.enabled` 判定（缺省 false）；两者均为进程启动时生效（重启后端后应用新值）。
 - **关闭状态**：埋点 `safe_publish` / 级联清理 `plugin_cascade` 立即返回
   （False / 0）——不校验、不创建组件、不入队、不起线程（对现有行为零副作用）。
 

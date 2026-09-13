@@ -2,7 +2,10 @@
 
 **启用开关（默认关闭；关闭时对现有行为零副作用）**：
 
-- 环境变量 ``TREE_PLUGIN_ENABLED=1``：进程启动时默认启用；
+- 环境变量 ``TREE_PLUGIN_ENABLED=1``：进程启动时启用（显式设置时优先，
+  含 ``0`` 表示显式关闭）；
+- 配置文件 ``server/configs/app.yaml`` → ``plugin.enabled: true``：未设置
+  环境变量时按它启用（默认 false；进程启动时生效）；
 - 代码调用 ``plugin.set_enabled(True)``：运行时启用（演示/测试/后续接线）；
 - 关闭状态下：埋点 ``publish_tool_event`` 直接返回 False，不创建组件、
   不入队、不起线程（零副作用）。
@@ -27,7 +30,8 @@ join 最小原语（D5）、白名单埋点（llm.py 工具执行处）+ 1 个�
   判死阈值 ``PLUGIN_WATCHDOG_DEAD_STRIKES`` / ``PLUGIN_WATCHDOG_MAX_CONSECUTIVE_DEAD``）；
   F3 阈值 ``PLUGIN_STATION_ERROR_THRESHOLD``；链深上限 ``PLUGIN_STATION_CHAIN_MAX``；
   站防呆 ``loop_bypass`` / 链深 ``chain_bypass`` 计数；SDK ``workspace_read(..., encoding=...)``；
-- 启用方式：设 ``TREE_PLUGIN_ENABLED=1`` 后重启后端进程生效。
+- 启用方式：``app.yaml`` 配 ``plugin.enabled: true``（或设 ``TREE_PLUGIN_ENABLED=1``
+  覆盖）后重启后端进程生效。
 """
 
 from __future__ import annotations
@@ -146,13 +150,37 @@ def _read_env_enabled() -> bool:
     return value in ("1", "true", "yes", "on")
 
 
+def _read_config_enabled() -> bool:
+    """读取 app.yaml 总开关（``plugin.enabled``；缺省/异常按关闭处理）。"""
+    try:
+        from config.config import get_config  # noqa: PLC0415（懒 import：避免循环依赖）
+
+        section = get_config().get("plugin") or {}
+        return bool(section.get("enabled", False))
+    except Exception:  # noqa: BLE001
+        logger.debug("插件总开关读取 app.yaml 失败（按关闭处理）", exc_info=True)
+        return False
+
+
+def _read_enabled() -> bool:
+    """总开关初始值（进程启动时）：env 显式设置时优先，未设置回落 app.yaml。
+
+    - ``TREE_PLUGIN_ENABLED`` 显式设置（非空，含 ``0`` 显式关闭）→ 以 env 为准；
+    - 未设置 → ``app.yaml`` 的 ``plugin.enabled``（默认 false）。
+    """
+    raw = str(os.environ.get(ENV_ENABLED, "") or "").strip()
+    if raw:
+        return _read_env_enabled()
+    return _read_config_enabled()
+
+
 # 示范插件自动注册（D-P2-6；默认关；开启=演示/体验用；零协议面）
 ENV_DEMO_READ_STATION = "TREE_PLUGIN_DEMO_READ_STATION"
 ENV_DEMO_SCOPE = "TREE_PLUGIN_DEMO_SCOPE"
 
 
 _lock = threading.Lock()
-_enabled = _read_env_enabled()
+_enabled = _read_enabled()
 _bus: Optional[EventBus] = None
 _registry: Optional[PluginRegistry] = None
 _watchdog: Optional[ProgressWatchdog] = None
