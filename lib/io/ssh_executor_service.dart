@@ -181,8 +181,10 @@ class SshExecutorService extends ChangeNotifier {
   /// 持久化关闭开关、通知后端注销、关闭该 team 的 SSH 连接、清理等待。
   Future<void> deactivateTeam(String teamId) async {
     if (teamId.isEmpty) return;
-    // 回收该 team 的 MCP 隧道会话：远端 kill 需要通道，须在关闭连接之前执行
+    // 回收该 team 的 MCP 隧道会话与插件宿主会话：远端 kill 需要通道，
+    // 须在关闭连接之前执行（M2 §14.3.2 级联）
     SshWorkspaceExecutor.disposeMcpSessionsOf(teamId);
+    await SshWorkspaceExecutor.disposePluginHostSessionsOf(teamId);
     final _SshTeamState? state = _states.remove(teamId);
     if (state == null) return;
     final Completer<Map<String, dynamic>>? completer = state.pendingAck;
@@ -254,6 +256,7 @@ class SshExecutorService extends ChangeNotifier {
     // 关闭连接前先回收该 team 的 MCP 隧道会话：远端 kill 依赖通道，
     // 连接一关就只剩本地残留记录（远端进程会随通道挂断，但记录须清掉）
     SshWorkspaceExecutor.disposeMcpSessionsOf(teamId);
+    await SshWorkspaceExecutor.disposePluginHostSessionsOf(teamId);
     await _connectionManager.close(teamId);
     _sendUnregister(teamId);
     notifyListeners();
@@ -273,6 +276,12 @@ class SshExecutorService extends ChangeNotifier {
         _registerTeam(state, waitForAck: false);
       }
     }
+    // 宿主会话对账：team 未注册/未启用 → 回收（经远端 kill，尽力而为）
+    final Set<String> usable = _states.values
+        .where((_SshTeamState s) => s.enabled && s.registered)
+        .map((_SshTeamState s) => s.teamId)
+        .toSet();
+    unawaited(SshWorkspaceExecutor.reconcilePluginHostSessions(usable));
   }
 
   /// 处理后端 ``registration_lost`` 通知：该 team 的 SSH 执行器注册已被后端
@@ -338,7 +347,11 @@ class SshExecutorService extends ChangeNotifier {
     // 远端 kill 需要通道，须在关闭连接之前执行
     SshWorkspaceExecutor.disposeAllMcpSessions();
     _ws = null;
-    unawaited(_connectionManager.closeAll());
+    // 插件宿主会话回收依赖远端通道：kill 完成后才关连接（尽力而为）
+    unawaited(
+      SshWorkspaceExecutor.disposeAllPluginHostSessions()
+          .whenComplete(() => _connectionManager.closeAll()),
+    );
   }
 
   /// 终结所有挂起的 ack 等待（per-team Completer 以失败完成）并清空队列。

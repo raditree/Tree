@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'mcp_stdio_tunnel.dart';
 import 'mcp_trust_store.dart';
 import 'platform_support.dart';
+import 'plugin_host_sessions.dart';
 import 'ssh_executor_service.dart';
 import 'websocket_service.dart';
 
@@ -51,6 +52,39 @@ String? resolveShellForDir(String path) {
 /// 工具失败。以 `chcp.com 65001 >nul 2>&1 & ` 前缀执行，使同一 cmd 会话的
 /// 输出统一为 UTF-8（子进程输出经环境变量 PYTHONUTF8=1 强开 UTF-8）。
 String windowsCmdUtf8Prefix() => 'chcp.com 65001 >nul 2>&1 & ';
+
+/// 本地宿主进程启动器（M2 `plugin_host_*`）：包装 [Process] 为句柄。
+///
+/// 本批固定最小空转进程（安全收口：不执行取自 payload 的任意命令）；
+/// 进程形态由 [defaultIdleArgv] 决定（Windows ping / Unix sleep；
+/// WSL 目录经 bash 进入）。stdout 排空（宿主会话不需要其内容）；stderr
+/// 交由 [PluginHostSessionManager] 聚合尾部。
+Future<PluginHostProcessHandle> spawnLocalPluginHostProcess(
+  PluginHostSpawnRequest request,
+) async {
+  final bool isWindows = Platform.isWindows;
+  final List<String> argv = defaultIdleArgv(
+    isWindows: isWindows,
+    unixLike: request.unixLike,
+    workingDirectory: request.workingDirectory,
+  );
+  final Process process = (isWindows && request.unixLike)
+      // WSL/Unix 风格目录：Windows API 无法作为 cwd，argv 已含 cd（同上）
+      ? await Process.start(argv[0], argv.sublist(1))
+      : await Process.start(
+          argv[0],
+          argv.sublist(1),
+          workingDirectory: request.workingDirectory,
+        );
+  // 排空 stdout，避免管道背压（宿主会话不消费 stdout）
+  process.stdout.listen((List<int> _) {}, onError: (Object _) {});
+  return PluginHostProcessHandle(
+    pid: process.pid,
+    exitCode: process.exitCode,
+    stderr: process.stderr,
+    kill: () => process.kill(),
+  );
+}
 
 /// 解码进程输出字节：严格 UTF-8 优先，失败回退 latin1 逐字节（不抛异常）。
 ///
@@ -336,6 +370,20 @@ class LocalExecutorService extends ChangeNotifier {
   /// MCP 会话 id 自增序号（与时间戳拼接，避免同微秒内碰撞）
   int _mcpSessionSeq = 0;
 
+  /// 插件宿主会话管理器（M2：`plugin_host_*` 通道，契约 v1.3 §14）。
+  ///
+  /// 启动器 = [spawnLocalPluginHostProcess]（本机 Process；测试可注入 fake）。
+  late PluginHostSessionManager _pluginHosts = PluginHostSessionManager(
+    spawn: spawnLocalPluginHostProcess,
+    notify: _send,
+  );
+
+  /// 测试注入口：替换宿主会话管理器（fake 启动器，避免真进程）。
+  @visibleForTesting
+  void debugSetPluginHostManager(PluginHostSessionManager manager) {
+    _pluginHosts = manager;
+  }
+
   /// per-team 状态：team_id -> 本地执行器状态。
   ///
   /// 所有执行路径按请求 payload 的 ``team_id`` 查找状态，与"当前选中
@@ -394,6 +442,8 @@ class LocalExecutorService extends ChangeNotifier {
   void deactivateTeam(String teamId) {
     if (teamId.isEmpty) return;
     _disposeMcpSessionsOf(teamId);
+    // 级联回收该 team 的插件宿主会话（M2 §14.3.2）
+    _pluginHosts.recycleTeam(teamId);
     if (_states.remove(teamId) == null) return;
     _sendUnregister(teamId);
     notifyListeners();
@@ -407,6 +457,10 @@ class LocalExecutorService extends ChangeNotifier {
   Future<void> setTeamEnabled(String teamId, bool value) async {
     if (teamId.isEmpty) return;
     if (isMobile && value) return; // 移动端不支持本地执行模式
+    if (!value) {
+      // 关闭本地模式：插件宿主会话不再可用，立即级联回收（M2 §14.3.2）
+      _pluginHosts.recycleTeam(teamId);
+    }
     final _LocalTeamState state =
         _states.putIfAbsent(teamId, () => _LocalTeamState(teamId: teamId));
     if (value == state.enabled) {
@@ -445,11 +499,18 @@ class LocalExecutorService extends ChangeNotifier {
   /// 后端在 WS 断连时按连接自动清理注册，重连后需要恢复；未激活的 team
   /// （未启用 / 未配置目录）不注册，后端按"无执行器"回落云端。
   void syncRegisteredTeams() {
+    // WS（重）连：宿主会话先全部标记失联，重注册后按"本端可继续承载"对账回收
+    _pluginHosts.markAllLost();
     for (final _LocalTeamState state in _states.values) {
       if (state.enabled && state.baseDir.isNotEmpty && state.registered) {
         _registerTeam(state);
       }
     }
+    _pluginHosts.reconcileAfterReconnect(
+      (String teamId) =>
+          _states[teamId]?.enabled == true &&
+          _states[teamId]?.registered == true,
+    );
   }
 
   /// 处理后端 ``registration_lost`` 通知：该 team 的执行器注册已被后端清除
@@ -461,6 +522,8 @@ class LocalExecutorService extends ChangeNotifier {
   /// 等持久化设置不受影响。
   void handleRegistrationLost(String teamId) {
     if (teamId.isEmpty) return;
+    // 注册丢失：该 team 宿主会话标记失联（不 kill；重连后对账，M2 §14.3.3）
+    _pluginHosts.markTeamLost(teamId);
     final _LocalTeamState? state = _states[teamId];
     if (state != null && state.registered) {
       state.registered = false;
@@ -547,6 +610,8 @@ class LocalExecutorService extends ChangeNotifier {
       session.dispose();
     }
     _mcpSessions.clear();
+    // 回收全部插件宿主会话（M2；本地进程不可随应用退出存活，直接终止）
+    _pluginHosts.recycleAll();
     _ws?.removeToolExecRequestHandler(_handleToolExecRequest);
     _ws?.removeToolExecCancelHandler(_handleToolExecCancel);
     _ws = null;
@@ -881,6 +946,27 @@ class LocalExecutorService extends ChangeNotifier {
         return _mcpStdioRead(data);
       case 'mcp_stdio_close':
         return _mcpStdioClose(data);
+      // 插件宿主会话（M2 宿主通道，契约 v1.3 §14；与 SSH 侧同构）
+      case 'plugin_host_start':
+        return _pluginHosts.start(
+          hostKey: (data['host_key'] as String?) ?? '',
+          teamId: teamId,
+          workingDirectory: baseDir,
+          unixLike: isUnixLikePath(baseDir),
+          payload: data['payload'] is Map<String, dynamic>
+              ? data['payload'] as Map<String, dynamic>
+              : null,
+        );
+      case 'plugin_host_stop':
+        return _pluginHosts.stop(
+          hostSessionId: (data['host_session_id'] as String?) ?? '',
+          teamId: teamId,
+        );
+      case 'plugin_host_status':
+        return _pluginHosts.status(
+          hostSessionId: (data['host_session_id'] as String?) ?? '',
+          teamId: teamId,
+        );
       default:
         return <String, dynamic>{'error': '未知本地执行操作: $op'};
     }

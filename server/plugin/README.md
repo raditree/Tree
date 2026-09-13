@@ -8,6 +8,8 @@
 > 级联清理 4 处）；**默认关闭**，设 `TREE_PLUGIN_ENABLED=1` 并重启后端进程生效。
 > **半二期处理站已实施**（`stations.py` + read 结果站接入；默认无订阅=零影响，
 > 见「处理站（半二期）」章节）。
+> **二期 M1 已提交**（plugin_status + 面板快照）；**M2 已实施**（宿主通道后端承接面
+> + 示范插件自动注册；见「宿主通道（二期 M2）」章节）。
 > 联调对齐：知遥 isolation/async v2 + 栖迟 core 四件套 **64 passed + 1 skipped**
 > （skip = J5 活跃组上限，见文末差异清单）；全量回归相对基线零破坏。
 
@@ -22,6 +24,7 @@
 | `sdk.py` | 受控出站 SDK：workspace / dispatch / ws / log（白名单 + scope 强校验） | D6 |
 | `join.py` | join 最小原语：键值/计数齐备 + 超时 + partial 交付 | D5 |
 | `stations.py` | 处理站（半二期）：站×scope 键位唯一订阅、触发/等待/回填、fail-open 降级、分类计数 | D-PS1..PS7 |
+| `host.py` | 宿主通道（二期 M2）：`plugin_host_*` op 承接 / 会话表 / 清理契约四场景 / fail-closed 计数 | D-P2-5 |
 | `plugins/architecture_analyzer.py` | 示例插件：订阅工具事件 → 读工作空间 → 推送摘要（三站全链路） | 一期示范 |
 | `plugins/read_station_demo.py` | 处理站示范插件：read 结果加标记前缀（确定性转换；E2E 载体） | 半二期示范 |
 
@@ -186,6 +189,49 @@ server\.venv\Scripts\python.exe .output\plugin_station_selftest.py :: 自测 19 
 **真实链路观察**（部署后）：设 `TREE_PLUGIN_ENABLED=1` 重启 → 注册示范插件 →
 agent 调用 read → 工具结果应带 `[处理站示范]` 前缀。
 
+## 宿主通道（二期 M2；契约 §14）
+
+**定位**：插件 ↔ 宿主（本机前端执行器 / SSH 会话）的受控通道——op 命名空间
+`plugin_host_*`（**只增不改**；不与 `mcp_stdio_*` / `exec_*` 混用），传输复用既有
+反向 WS `tool_exec_request / tool_exec_response` 链路；策略收后端、前端薄。
+
+**op（本批最小生命周期）**：`plugin_host_start`（幂等：同 host_key 复用）/
+`plugin_host_stop`（幂等；尽力而为）/ `plugin_host_status`（running/closed +
+exit_code + stderr_tail）。后端承接面 `host.py::HostChannel`；门面
+`plugin.get_host_channel()`。
+
+**上行帧**：`plugin_host_event`（本批仅 `event='exit'`；未知 event / 未知会话
+静默忽略 + 计数）。
+
+**清理契约四场景（§14.3）**：
+
+1. stop 指令（显式调用；幂等）；
+2. scope 级联 → 挂接入 `plugin_cascade` 单点（running 会话 best-effort 停止）；
+3. 断连回收：WS 断连 / 执行器注销 → 会话标 `lost`（不 kill）；
+4. 退出上报：上行帧命中 → 状态转 `closed` + `exit_code`/`stderr_tail`。
+
+**重连对账（§14.3-3）**：执行器（重）注册后 `plugin_host_reconcile` best-effort
+逐个 `status` 探测失联会话（closed → 回收；running → 恢复；失败保持 lost）。
+
+**参数（env / 构造 / 时钟三通道可注入）**：`PLUGIN_HOST_OP_TIMEOUT_S`（默认 30s）、
+`PLUGIN_HOST_STOP_WAIT_S`（默认 5s）。观测：`plugin.get_host_channel().stats()`
+（分类计数 + in_flight/lost/closed）。
+
+**示范插件自动注册（D-P2-6；默认关）**：
+
+```bat
+set TREE_PLUGIN_ENABLED=1
+set TREE_PLUGIN_DEMO_READ_STATION=1
+set TREE_PLUGIN_DEMO_SCOPE=user_id=<你的 user_id>;team_id=<可选>
+:: 重启后端 → read 结果带 [处理站示范] 前缀；面板可见示范插件实例
+```
+
+- `TREE_PLUGIN_DEMO_SCOPE` 至少含 `user_id`（缺省跳过 + 告警，fail-closed）；
+  粒度自动推导（session_id > agent_id > team）；键位占用等失败幂等静默。
+
+**边界（本批）**：仅系统内置插件；`payload` 透传容忍、后端不消费、不执行任意命令；
+SSH 退出上报=status 探测可知（watcher 列后续批次）。
+
 ## 状态事件与面板快照（二期 M1）
 
 - **plugin_status**（WS，只增不改）：实例生命周期变化即发（`registered` / `destroyed`；
@@ -205,6 +251,10 @@ agent 调用 read → 工具结果应带 `[处理站示范]` 前缀。
 cd server && .venv\Scripts\python.exe -m pytest tests/test_plugin_isolation.py tests/test_plugin_async.py tests/test_plugin_core.py tests/test_plugin_scope_assembly.py -q
 ::  → 64 passed + 1 skipped（skip = J5 活跃组上限，已知差异；含 D-13 并发注册用例、D-08 装配链路用例）
 
+:: 宿主通道（二期 M2）模块单测（15 例：幂等/清理/mark_lost/reconcile/cascade/门面/注册入口）
+cd server && .venv\Scripts\python.exe -m pytest tests/test_plugin_host_core.py -q
+::  → 15 passed
+
 :: 端到端演示（publish → 处理 → 出站；含越权拒绝演示）
 server\.venv\Scripts\python.exe .output\plugin_demo.py
 
@@ -215,7 +265,7 @@ server\.venv\Scripts\python.exe .output\plugin_c1_ttl_sweep_demo.py
 server\.venv\Scripts\python.exe .output\plugin_station_demo.py
 server\.venv\Scripts\python.exe .output\plugin_station_selftest.py
 
-:: 全量回归（对比基线：621 passed → 685 passed / 1 skipped，零破坏；含 D-08 +4 用例）
+:: 全量回归（当前 774 passed / 1 skipped / 23 subtests；对照 M1 基线 759+1+23 净增 +15、零破坏）
 cd server && .venv\Scripts\python.exe -m pytest tests/ -q
 ```
 

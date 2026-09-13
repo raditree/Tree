@@ -7,6 +7,7 @@
 - ``user_answer`` / ``cancel_question``：AskUserQuestion 工具应答
 - ``register_local_executor`` / ``unregister_local_executor``：本地执行器注册
 - ``tool_exec_response``：前端工具执行结果回传
+- ``plugin_host_event``：宿主通道上行（二期 M2；退出上报等）
 """
 import asyncio
 import json
@@ -34,6 +35,11 @@ from data.conversation_store import (
     mark_pending_cancelled,
 )
 from data.session_cache import clear_user_agent
+from plugin import (
+    plugin_host_event,
+    plugin_host_mark_lost,
+    plugin_host_reconcile,
+)
 from ws.auth import TokenRevokedError, verify_token
 
 logger = logging.getLogger(__name__)
@@ -361,6 +367,9 @@ def register_ws(app: FastAPI) -> None:
                     # 注册即表达"该 agent 走本地执行"的用户意图：写回 agents.mode，
                     # 断连/超时等瞬时失联后 resolve_mode 仍锁定 local（不静默回退云端）
                     _persist_agent_mode(user_id, team_id, "local")
+                    # 宿主通道（二期 M2；契约 §14.3-3）：执行器（重）注册后
+                    # best-effort 对账回收失联会话（总开关关闭时零副作用）
+                    plugin_host_reconcile(user_id, team_id)
                     # 注册成功回应
                     await state.ws_manager.send_message(
                         user_id,
@@ -479,6 +488,9 @@ def register_ws(app: FastAPI) -> None:
                     # 注册即表达"该 agent 走 SSH 执行"的用户意图：写回 agents.mode，
                     # 断连/超时等瞬时失联后 resolve_mode 仍锁定 ssh（不静默回退云端）
                     _persist_agent_mode(user_id, team_id, "ssh")
+                    # 宿主通道（二期 M2；契约 §14.3-3）：执行器（重）注册后
+                    # best-effort 对账回收失联会话（总开关关闭时零副作用）
+                    plugin_host_reconcile(user_id, team_id)
                     # 附带 app.yaml 下发的单连接并发上限：前端据此限制同一 SSH
                     # 连接上同时执行的工具数（超出排队），改 app.yaml 后重开 SSH
                     # 模式即生效，无需重新构建前端。
@@ -599,6 +611,10 @@ def register_ws(app: FastAPI) -> None:
                         "tool_exec_progress: user_id=%s team_id=%s tool_id=%s noted=%s",
                         user_id, data.get("team_id", ""), tool_id, noted,
                     )
+                elif msg_type == "plugin_host_event":
+                    # 宿主通道上行（二期 M2；契约 §14.3-4）：退出上报等。
+                    # 独立命名空间分支（只增不改）；未启用/未知会话静默忽略。
+                    plugin_host_event(user_id, data)
                 else:
                     await state.ws_manager.send_message(
                         user_id,
@@ -618,6 +634,7 @@ def register_ws(app: FastAPI) -> None:
             #    （否则前端重连前的后台任务会悄悄改跑云端执行）。
             #    归属校验：该 team 的注册已由同用户其他连接接管时跳过（见
             #    LocalExecutorClient._owns_executor），不清掉生效中的注册。
+            cleared_teams: list = []
             for reg in conn_regs:
                 try:
                     if reg["mode"] == "local":
@@ -632,6 +649,7 @@ def register_ws(app: FastAPI) -> None:
                         # 该 team 的注册已归属其他连接（其他实例已接管）：
                         # 本连接断连不影响它，也不需要通知前端"注册已丢失"。
                         continue
+                    cleared_teams.append(reg["team_id"])
                     if reg["mode"] == "ssh" and state.ssh_manager is not None:
                         # 仅在本连接确实注销成功后才清 SSH 持久化配置：注册已
                         # 被其他连接接管时必须保留（与 unregister_ssh_executor
@@ -660,6 +678,10 @@ def register_ws(app: FastAPI) -> None:
                         "WS 断连清理执行器注册失败: user_id=%s reg=%r",
                         user_id, reg,
                     )
+            # 4) 宿主通道（二期 M2；契约 §14.3-3）：本连接注销成功的 team
+            #    会话标记失联（不 kill；前端重连/执行器重注册后对账回收）
+            if cleared_teams:
+                plugin_host_mark_lost(user_id, cleared_teams)
 
 
 __all__ = ["register_ws"]

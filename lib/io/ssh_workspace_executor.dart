@@ -6,7 +6,36 @@ import 'package:dartssh2/dartssh2.dart';
 
 import 'mcp_stdio_tunnel.dart';
 import 'mcp_trust_store.dart';
+import 'plugin_host_sessions.dart';
 import 'ssh_connection_manager.dart';
+
+/// 插件宿主会话（SSH 侧，M2 宿主通道）：跨请求持存于
+/// [SshWorkspaceExecutor] 的静态会话表；记录远端 pidfile 与会话归属，
+/// 供状态探测与回收（远端 kill）时重建执行器使用。
+class _SshPluginHostSession {
+  _SshPluginHostSession({
+    required this.hostSessionId,
+    required this.hostKey,
+    required this.teamId,
+    required this.pidFile,
+    required this.manager,
+    required this.config,
+  });
+
+  final String hostSessionId;
+  final String hostKey;
+  final String teamId;
+
+  /// 远端 pidfile 绝对路径（``/tmp/tree_ph_<id>.pid``）。
+  final String pidFile;
+
+  /// 创建时的连接管理器与配置（回收时构造执行器执行远端 kill）。
+  final SshConnectionManager manager;
+  final Map<String, dynamic> config;
+
+  /// 最近一次探测到的远端状态（``running`` / ``closed``）。
+  String state = 'running';
+}
 
 /// SSH 工具执行器 - 在前端发起的 dartssh2 会话上执行后端委托的工具操作。
 ///
@@ -57,6 +86,13 @@ class SshWorkspaceExecutor {
 
   /// MCP 会话 id 自增序号（与时间戳拼接，避免同微秒内碰撞）
   static int _mcpSessionSeq = 0;
+
+  /// 插件宿主会话（M2 宿主通道）：key = "$teamId|$hostSessionId"。
+  ///
+  /// 与 MCP 隧道同理跨请求存活（执行器为请求级实例）；本批仅生命周期三 op，
+  /// 远端固定最小空转型（``sleep 3600``；安全收口不执行任意命令）。
+  static final Map<String, _SshPluginHostSession> _pluginHostSessions =
+      <String, _SshPluginHostSession>{};
 
   SshWorkspaceExecutor(
     this.manager, {
@@ -149,6 +185,13 @@ class SshWorkspaceExecutor {
         return _mcpStdioRead(data);
       case 'mcp_stdio_close':
         return _mcpStdioClose(data);
+      // 插件宿主会话（M2 宿主通道；与本地执行器同构）
+      case 'plugin_host_start':
+        return _pluginHostStart(client, workspaceId, data);
+      case 'plugin_host_stop':
+        return _pluginHostStop(client, data);
+      case 'plugin_host_status':
+        return _pluginHostStatus(client, data);
       default:
         return <String, dynamic>{'error': '未知 SSH 执行操作: $op'};
     }
@@ -909,6 +952,147 @@ class SshWorkspaceExecutor {
     );
   }
 
+  // -- 插件宿主会话（M2 宿主通道，契约 v1.3 §14；本批生命周期三 op） --------
+
+  /// 按 host_key 查本 team 的宿主会话（幂等复用索引；线性扫描够用）。
+  _SshPluginHostSession? _findHostByKey(String hostKey) {
+    for (final _SshPluginHostSession session in _pluginHostSessions.values) {
+      if (session.teamId == teamId && session.hostKey == hostKey) {
+        return session;
+      }
+    }
+    return null;
+  }
+
+  /// 启动远端宿主会话（``plugin_host_start``，本批固定最小空转型）。
+  ///
+  /// 远端后台常驻（``nohup sleep 3600``），pid 写入 ``/tmp`` pidfile；会话
+  /// 记录持存于类静态表（跨请求）。幂等：同 host_key 且远端存活 → 复用；
+  /// 已失活 → 回收旧记录后重建。
+  Future<Map<String, dynamic>> _pluginHostStart(
+    SSHClient client,
+    String workspaceId,
+    Map<String, dynamic> data,
+  ) async {
+    final String hostKey = (data['host_key'] as String?) ?? '';
+    if (hostKey.isEmpty) {
+      return <String, dynamic>{'error': 'plugin_host_start 缺少 host_key'};
+    }
+    final _SshPluginHostSession? existing = _findHostByKey(hostKey);
+    if (existing != null) {
+      String probe = 'running';
+      try {
+        probe = await _pluginHostProbe(client, existing.pidFile);
+      } catch (_) {
+        // 探测不可达：按复用处理（避免重复起进程；后端重试幂等兜底）
+      }
+      if (probe == 'running') {
+        return <String, dynamic>{'host_session_id': existing.hostSessionId};
+      }
+      _pluginHostSessions
+          .remove('${existing.teamId}|${existing.hostSessionId}');
+    }
+    final String id = newPluginHostSessionId();
+    final String pidFile = '/tmp/tree_ph_$id.pid';
+    final String cwd = _remotePath(workspaceId, '');
+    final String full = buildRemoteHostStartCommand(cwd: cwd, pidFile: pidFile);
+    final Map<String, dynamic> result = await _exec(client, full, timeout: 10);
+    final Object? exitCode = result['exit_code'];
+    if (result['error'] != null || (exitCode is int && exitCode != 0)) {
+      return <String, dynamic>{
+        'error': 'plugin_host_start 远端启动失败: '
+            '${result['error'] ?? 'exit_code=$exitCode'}',
+      };
+    }
+    _pluginHostSessions['$teamId|$id'] = _SshPluginHostSession(
+      hostSessionId: id,
+      hostKey: hostKey,
+      teamId: teamId,
+      pidFile: pidFile,
+      manager: manager,
+      config: config,
+    );
+    return <String, dynamic>{'host_session_id': id};
+  }
+
+  /// 停止远端宿主会话（``plugin_host_stop``，幂等；尽力而为，失败仅记日志）。
+  Future<Map<String, dynamic>> _pluginHostStop(
+    SSHClient client,
+    Map<String, dynamic> data,
+  ) async {
+    final String hostSessionId = (data['host_session_id'] as String?) ?? '';
+    if (hostSessionId.isEmpty) {
+      return <String, dynamic>{'error': 'plugin_host_stop 缺少 host_session_id'};
+    }
+    final _SshPluginHostSession? session =
+        _pluginHostSessions.remove('$teamId|$hostSessionId');
+    if (session == null) {
+      // 幂等：已回收 / 从未存在的会话视为已停止
+      return <String, dynamic>{'ok': true};
+    }
+    try {
+      await _exec(
+        client,
+        buildRemoteHostStopCommand(pidFile: session.pidFile),
+        timeout: 10,
+      );
+    } catch (_) {
+      // 尽力而为：远端 kill 失败仅忽略（契约 §14.2 stop 语义）
+    }
+    return <String, dynamic>{'ok': true};
+  }
+
+  /// 查询远端宿主会话状态（``plugin_host_status``）。
+  ///
+  /// 本批远端不采集 exit_code / stderr_tail（无持续 watcher；拿不到留缺省）。
+  Future<Map<String, dynamic>> _pluginHostStatus(
+    SSHClient client,
+    Map<String, dynamic> data,
+  ) async {
+    final String hostSessionId = (data['host_session_id'] as String?) ?? '';
+    if (hostSessionId.isEmpty) {
+      return <String, dynamic>{
+        'error': 'plugin_host_status 缺少 host_session_id',
+      };
+    }
+    final _SshPluginHostSession? session =
+        _pluginHostSessions['$teamId|$hostSessionId'];
+    if (session == null) {
+      return <String, dynamic>{'error': '宿主会话不存在（可能已回收）'};
+    }
+    try {
+      session.state = await _pluginHostProbe(client, session.pidFile);
+    } catch (_) {
+      // 探测不可达：保留原状态（后端重连对账兜底）
+    }
+    return <String, dynamic>{'state': session.state};
+  }
+
+  /// 远端状态探测：返回 ``running`` / ``closed``；命令级失败抛错由调用方转译。
+  Future<String> _pluginHostProbe(SSHClient client, String pidFile) async {
+    final Map<String, dynamic> result = await _exec(
+      client,
+      buildRemoteHostStatusCommand(pidFile: pidFile),
+      timeout: 10,
+    );
+    if (result['error'] != null) {
+      throw StateError('${result['error']}');
+    }
+    return parseRemoteHostStatusOutput((result['stdout'] as String?) ?? '');
+  }
+
+  /// 远端 kill 宿主会话（供静态回收复用；尽力而为）。
+  Future<void> killHost(String pidFile) async {
+    if (pidFile.isEmpty) return;
+    await _guarded(
+      (SSHClient client) => _exec(
+        client,
+        buildRemoteHostStopCommand(pidFile: pidFile),
+        timeout: 10,
+      ),
+    );
+  }
+
   /// 在远端工作空间按模式递归搜索，返回 ``{exit_code, stdout}``。
   ///
   /// 支持参数：``pattern``（必填）、``path``（搜索范围，workspace 内相对
@@ -1243,6 +1427,54 @@ class SshWorkspaceExecutor {
       session.dispose();
     }
     _mcpSessions.clear();
+  }
+
+  /// 回收指定 team 的全部插件宿主会话（删 agent / 关闭模式时调用）。
+  ///
+  /// 远端 kill 依赖通道，须在连接关闭之前调用（调用方保证）；失败仅吞掉，
+  /// 不阻塞清理流程。
+  static Future<void> disposePluginHostSessionsOf(String teamId) async {
+    final List<_SshPluginHostSession> owned = _pluginHostSessions.values
+        .where((_SshPluginHostSession s) => s.teamId == teamId)
+        .toList(growable: false);
+    for (final _SshPluginHostSession session in owned) {
+      _pluginHostSessions.remove('${session.teamId}|${session.hostSessionId}');
+      await _killRemoteHostSession(session);
+    }
+  }
+
+  /// 回收全部插件宿主会话（应用退出 / 清理时调用）。
+  static Future<void> disposeAllPluginHostSessions() async {
+    final List<_SshPluginHostSession> all =
+        _pluginHostSessions.values.toList(growable: false);
+    _pluginHostSessions.clear();
+    for (final _SshPluginHostSession session in all) {
+      await _killRemoteHostSession(session);
+    }
+  }
+
+  /// 重连对账：team 不可用（未注册 / 未启用）→ 回收（§14.3.3，尽力而为）。
+  static Future<void> reconcilePluginHostSessions(Set<String> usableTeams) async {
+    final List<_SshPluginHostSession> stale = _pluginHostSessions.values
+        .where((_SshPluginHostSession s) => !usableTeams.contains(s.teamId))
+        .toList(growable: false);
+    for (final _SshPluginHostSession session in stale) {
+      _pluginHostSessions.remove('${session.teamId}|${session.hostSessionId}');
+      await _killRemoteHostSession(session);
+    }
+  }
+
+  /// 经会话记录重建执行器，执行远端 kill（best-effort；异常吞掉）。
+  static Future<void> _killRemoteHostSession(
+    _SshPluginHostSession session,
+  ) async {
+    try {
+      await SshWorkspaceExecutor(session.manager,
+              teamId: session.teamId, config: session.config)
+          .killHost(session.pidFile);
+    } catch (_) {
+      // 尽力而为：远端不可达仅忽略，不阻塞清理流程
+    }
   }
 
   // ------------------------------------------------------------------

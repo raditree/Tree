@@ -18,6 +18,11 @@ join 最小原语（D5）、白名单埋点（llm.py 工具执行处）+ 1 个�
 - ``server/agent/routes.py`` 4 处清理点调用 ``plugin_cascade(...)``：
   会话删除 / 历史清空 / agent 删除（含 TOP 团队解散）/ 配置更新；
 - 埋点唯一入口为 ``safe_publish(...)``（llm.py 工具执行处示范点位）；
+- 宿主通道（二期 M2；契约 §14）：``server/ws/endpoints.py`` 接线
+  ``plugin_host_event``（上行帧）与 ``plugin_host_mark_lost``（断连回收）；
+  执行器（重）注册处调用 ``plugin_host_reconcile``（best-effort 对账）；
+- 示范插件自动注册（D-P2-6，默认关）：``TREE_PLUGIN_DEMO_READ_STATION=1`` +
+  ``TREE_PLUGIN_DEMO_SCOPE="user_id=..."``（重启生效；零协议面）；
 - 启用方式：设 ``TREE_PLUGIN_ENABLED=1`` 后重启后端进程生效。
 """
 
@@ -25,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 from typing import Any, Dict, Optional
 
@@ -43,6 +49,13 @@ from plugin.registry import (  # noqa: F401
     PluginInstance,
     PluginRegistry,
     scope_key,
+)
+from plugin.host import (  # noqa: F401（对外门面 re-export）
+    OP_HOST_START,
+    OP_HOST_STOP,
+    OP_HOST_STATUS,
+    HostChannel,
+    HostSession,
 )
 from plugin.sdk import PluginSDK, bind_loop as _sdk_bind_loop  # noqa: F401
 from plugin.stations import (  # noqa: F401（对外门面 re-export）
@@ -76,8 +89,14 @@ __all__ = [
     "get_snapshot",
     "init_plugin_system",
     "plugin_cascade",
+    "get_host_channel",
+    "plugin_host_event",
+    "plugin_host_mark_lost",
+    "plugin_host_reconcile",
     # 开关常量
     "ENV_ENABLED",
+    "ENV_DEMO_READ_STATION",
+    "ENV_DEMO_SCOPE",
     # 类型（re-export）
     "EventBus",
     "PluginEvent",
@@ -100,6 +119,11 @@ __all__ = [
     "StationSub",
     "StationRequest",
     "STATION_READ_RESULT",
+    "HostChannel",
+    "HostSession",
+    "OP_HOST_START",
+    "OP_HOST_STOP",
+    "OP_HOST_STATUS",
 ]
 
 # 环境变量开关名（进程启动默认值）
@@ -112,12 +136,19 @@ def _read_env_enabled() -> bool:
     return value in ("1", "true", "yes", "on")
 
 
+# 示范插件自动注册（D-P2-6；默认关；开启=演示/体验用；零协议面）
+ENV_DEMO_READ_STATION = "TREE_PLUGIN_DEMO_READ_STATION"
+ENV_DEMO_SCOPE = "TREE_PLUGIN_DEMO_SCOPE"
+
+
 _lock = threading.Lock()
 _enabled = _read_env_enabled()
 _bus: Optional[EventBus] = None
 _registry: Optional[PluginRegistry] = None
 _watchdog: Optional[ProgressWatchdog] = None
 _stations: Optional[StationsHub] = None
+_host: Optional[HostChannel] = None
+_demo_plugin: Any = None
 _initialized = False
 
 
@@ -142,7 +173,58 @@ def set_enabled(value: bool) -> None:
     _enabled = bool(value)
     if _enabled:
         _ensure_initialized()
+        # D-P2-6：开关开启时尝试 env 自动注册示范插件（默认关；幂等）
+        _maybe_register_demo()
     logger.info("插件体系开关: %s", "enabled" if _enabled else "disabled")
+
+
+def _maybe_register_demo() -> bool:
+    """D-P2-6：env 自动注册示范插件（默认关；开启=演示/体验用；零协议面）。
+
+    - ``TREE_PLUGIN_DEMO_READ_STATION=1`` 开启（1/true/yes/on）；
+    - ``TREE_PLUGIN_DEMO_SCOPE`` 提供作用域（逗号/分号分隔 ``k=v``），至少含
+      ``user_id``（缺省即跳过 + 告警，fail-closed）；粒度按提供字段推导
+      （session_id > agent_id > team）；
+    - 幂等：键位已占用 / 订阅失败仅记日志（返回 False），不影响启动。
+    """
+    global _demo_plugin
+    raw = str(os.environ.get(ENV_DEMO_READ_STATION, "") or "").strip().lower()
+    if raw not in ("1", "true", "yes", "on"):
+        return False
+    scope: Dict[str, str] = {}
+    for part in re.split(r"[;,]", str(os.environ.get(ENV_DEMO_SCOPE, "") or "")):
+        if "=" not in part:
+            continue
+        key, _, value = part.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key in SCOPE_KEYS and value:
+            scope[key] = value
+    if not scope.get("user_id"):
+        logger.warning(
+            "示范插件自动注册跳过：缺 %s（需含 user_id；fail-closed）",
+            ENV_DEMO_SCOPE,
+        )
+        return False
+    if scope.get("session_id"):
+        granularity = "session"
+    elif scope.get("agent_id"):
+        granularity = "agent"
+    else:
+        granularity = "team"
+    try:
+        from plugin.plugins.read_station_demo import register_demo_plugin  # noqa: PLC0415
+
+        got = register_demo_plugin(granularity=granularity, scope=scope, pin=True)
+    except Exception:  # noqa: BLE001
+        logger.exception("示范插件自动注册异常（已忽略）")
+        return False
+    if got is None:
+        logger.info("示范插件自动注册未生效：键位已占用或订阅失败（幂等静默）")
+        return False
+    _demo_plugin = got
+    logger.info("示范插件已自动注册：%s（%s 粒度）", ENV_DEMO_READ_STATION, granularity)
+    return True
 
 
 # ----------------------------------------------------------------------
@@ -150,7 +232,7 @@ def set_enabled(value: bool) -> None:
 # ----------------------------------------------------------------------
 def _ensure_initialized() -> None:
     """创建并启动单例组件（幂等，线程安全）。"""
-    global _bus, _registry, _watchdog, _stations, _initialized
+    global _bus, _registry, _watchdog, _stations, _host, _initialized
     with _lock:
         if _initialized:
             return
@@ -158,12 +240,14 @@ def _ensure_initialized() -> None:
         _bus = EventBus()
         _registry = PluginRegistry(bus=_bus, watchdog=_watchdog)
         _stations = StationsHub(registry=_registry, watchdog=_watchdog)
+        # 宿主通道（二期 M2）：会话表 + op 承接（不自起线程；按需后台任务）
+        _host = HostChannel()
         _bus.start()
         # D-12/C1：启动 TTL 周期清扫（空闲实例逐出；Pin 豁免；间隔 env 可配）
         _registry.start_sweeper()
         _initialized = True
         logger.info(
-            "插件体系已初始化（bus/registry/watchdog/stations + TTL 清扫就绪）"
+            "插件体系已初始化（bus/registry/watchdog/stations/host + TTL 清扫就绪）"
         )
 
 
@@ -193,6 +277,13 @@ def get_stations() -> StationsHub:
     _ensure_initialized()
     assert _stations is not None
     return _stations
+
+
+def get_host_channel() -> HostChannel:
+    """获取宿主通道单例（懒初始化；二期 M2）。"""
+    _ensure_initialized()
+    assert _host is not None
+    return _host
 
 
 def get_snapshot(user_id: str = "", team_id: str = "") -> Dict[str, Any]:
@@ -231,19 +322,24 @@ def startup() -> None:
 
 def shutdown() -> None:
     """停止全部组件并置总开关为关（幂等；测试清理/进程退出用）。"""
-    global _initialized, _bus, _registry, _watchdog, _stations, _enabled
+    global _initialized, _bus, _registry, _watchdog, _stations, _host, _demo_plugin, _enabled
     with _lock:
         if not _initialized and _bus is None:
             _enabled = False
             return
-        registry, bus, stations = _registry, _bus, _stations
+        registry, bus, stations, host = _registry, _bus, _stations, _host
         _initialized = False
         _bus = None
         _registry = None
         _watchdog = None
         _stations = None
+        _host = None
+        _demo_plugin = None
         _enabled = False
     try:
+        if host is not None:
+            # 宿主通道后台任务（级联停止/对账）有界收尾；daemon 线程不阻塞退出
+            host.drain(0.5)
         if stations is not None:
             stations.reset()
         if registry is not None:
@@ -383,6 +479,8 @@ def init_plugin_system() -> None:
         loop = None
     if loop is not None:
         _sdk_bind_loop(loop)
+    # D-P2-6：进程启动路径的示范插件自动注册（默认关；幂等）
+    _maybe_register_demo()
 
 
 def plugin_cascade(
@@ -420,4 +518,67 @@ def plugin_cascade(
             )
         except Exception:  # noqa: BLE001
             logger.exception("站订阅级联清理失败（已忽略，不影响主流程）")
+    # 宿主通道（二期 M2）：scope 销毁 → 会话回收（best-effort；失败不影响主流程）
+    host = _host
+    if host is not None:
+        try:
+            host.cascade_cleanup(
+                user_id, team_id=team_id, agent_id=agent_id, session_id=session_id
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("宿主通道级联清理失败（已忽略，不影响主流程）")
     return removed
+
+
+# ----------------------------------------------------------------------
+# 宿主通道（二期 M2；契约 §14）
+# ----------------------------------------------------------------------
+def plugin_host_event(user_id: str, data: Any) -> bool:
+    """宿主通道上行帧入口（供 ``server/ws/endpoints.py`` 接线）。
+
+    - 总开关关闭 / 组件未初始化：False（零副作用）；
+    - 一切异常吞掉：绝不影响 WS 主循环。
+    """
+    if not _enabled:
+        return False
+    host = _host
+    if host is None:
+        return False
+    try:
+        return host.on_event(
+            str(user_id or ""), data if isinstance(data, dict) else {}
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("宿主通道上行处理失败（已忽略）")
+        return False
+
+
+def plugin_host_mark_lost(user_id: str, team_ids: Any) -> int:
+    """断连回收：把该用户指定 team 的宿主会话标记 ``lost``（不 kill）。
+
+    :return: 新标记数（总开关关闭 / 未初始化时 0）
+    """
+    if not _enabled:
+        return 0
+    host = _host
+    if host is None:
+        return 0
+    try:
+        return host.mark_lost(str(user_id or ""), team_ids)
+    except Exception:  # noqa: BLE001
+        logger.exception("宿主通道断连标记失败（已忽略）")
+        return 0
+
+
+def plugin_host_reconcile(user_id: str, team_id: str) -> int:
+    """执行器（重）注册后 best-effort 对账调度（后台线程；返回排期数）。"""
+    if not _enabled:
+        return 0
+    host = _host
+    if host is None:
+        return 0
+    try:
+        return host.reconcile_async(str(user_id or ""), str(team_id or ""))
+    except Exception:  # noqa: BLE001
+        logger.exception("宿主通道对账调度失败（已忽略）")
+        return 0
