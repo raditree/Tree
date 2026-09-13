@@ -14,16 +14,18 @@ import 'file_viewer.dart';
 import 'git_history.dart';
 import 'mcp_config_panel.dart';
 import 'model_info_panel.dart';
+import 'plugin_panel.dart';
 import 'question_panel.dart';
 import 'todo_panel.dart';
 
 /// 文件管理面板（右栏）
 ///
-/// 作为右栏的主容器，以 Tab 组织四个分区：
+/// 作为右栏的主容器，以 Tab 组织五个分区：
 /// - 「文件」：文件浏览（[FileTree]）/ Git 历史（[GitHistory]）/ Todo（[TodoPanel]）
 /// - 「MCP 配置」：MCP 服务列表与注册（[McpConfigPanel]）
 /// - 「模型信息」：模型下拉与系统提示词编辑（[ModelInfoPanel]）
 /// - 「问题回复」：统一汇总并答复所有提问（[QuestionPanel]）
+/// - 「插件」：插件实例 / 处理站 / 看门狗只读快照（[PluginPanel]）
 ///
 /// 点击文件时以覆盖层方式弹出 [FileViewer]，点击返回按钮关闭查看器。
 class FilePanel extends StatefulWidget {
@@ -85,7 +87,7 @@ class _FilePanelState extends State<FilePanel>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 4, vsync: this);
+    _tabController = TabController(length: 5, vsync: this);
     _fileTabController = TabController(length: 3, vsync: this);
     // 本地模式开关/工作目录变化时重新加载文件列表
     LocalExecutorService.instance.addListener(_onLocalModeChanged);
@@ -194,7 +196,7 @@ class _FilePanelState extends State<FilePanel>
       color: Theme.of(context).scaffoldBackgroundColor,
       child: Column(
         children: [
-          // 顶层 Tab 栏（文件 / MCP 配置 / 模型信息）+ 折叠按钮
+          // 顶层 Tab 栏（文件 / MCP 配置 / 模型信息 / 问题回复 / 插件）+ 折叠按钮
           _buildTopTabBar(),
           Divider(
             height: 1,
@@ -221,6 +223,7 @@ class _FilePanelState extends State<FilePanel>
                     sessionId: widget.sessionId,
                     onNavigateToQuestion: widget.onNavigateToQuestion,
                   ),
+                  PluginPanel(teamId: widget.teamId),
                 ],
               ),
             ),
@@ -256,6 +259,7 @@ class _FilePanelState extends State<FilePanel>
                 Tab(text: 'MCP 配置'),
                 Tab(text: '模型信息'),
                 Tab(text: '问题回复'),
+                Tab(text: '插件'),
               ],
             ),
           ),

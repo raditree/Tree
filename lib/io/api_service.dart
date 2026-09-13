@@ -707,6 +707,21 @@ class ApiService {
     return _getJson('/api/agents/$agentId/models-info');
   }
 
+  // ==================== 插件体系接口（右栏「插件」页） ====================
+
+  /// 获取插件体系只读快照（右栏「插件」面板数据源）
+  ///
+  /// 调用 `GET /api/plugin/snapshot`（可选 `team_id` 过滤；user 由 token 归属）。
+  /// 返回结构见契约 v1.3 §15.1（instances / stations / watchdog / config）；
+  /// 总开关关闭时后端仍返回 200 + `enabled: false`（空集）。
+  /// 前端对响应做宽容解析（缺字段/未知字段容忍），此处不做校验。
+  /// 网络异常或后端返回错误时抛出中文异常。
+  static Future<Map<String, dynamic>> getPluginSnapshot({String? teamId}) async {
+    return _getJson('/api/plugin/snapshot', query: <String, String>{
+      if (teamId != null && teamId.isNotEmpty) 'team_id': teamId,
+    });
+  }
+
   // ==================== MCP 服务管理接口（右栏 MCP 配置页） ====================
 
   /// 列出已注册的 MCP 服务
@@ -1034,6 +1049,26 @@ class ApiService {
   static Future<bool> getRateLimit() async {
     final Map<String, dynamic> data = await _getJson('/api/settings/rate-limit');
     return (data['enabled'] as bool?) ?? false;
+  }
+
+  /// 设置消息切入模式
+  ///
+  /// `direct=true` 直接切入：新消息一次性全部切入当前上下文，几乎同时到达的
+  /// 消息一起处理；`false` 串行排队（默认）。调用
+  /// `POST /api/settings/message-cutin`，请求体为 `{"mode": "direct"/"queue"}`。
+  static Future<void> setMessageCutinDirect(bool direct) async {
+    await _postJson('/api/settings/message-cutin', body: {
+      'mode': direct ? 'direct' : 'queue',
+    });
+  }
+
+  /// 查询消息切入模式：true=直接切入，false=串行排队
+  ///
+  /// 调用 `GET /api/settings/message-cutin`，返回 `{"mode": "queue"|"direct"}`。
+  static Future<bool> getMessageCutinDirect() async {
+    final Map<String, dynamic> data =
+        await _getJson('/api/settings/message-cutin');
+    return (data['mode'] as String?) == 'direct';
   }
 
   /// 登出：撤销当前 token（后端侧）

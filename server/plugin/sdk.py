@@ -118,6 +118,55 @@ def _resolve_loop() -> Optional[Any]:
     return None
 
 
+def ws_push_message(user_id: str, message: Dict[str, Any]) -> bool:
+    """向前端推送一条插件消息（模块级；供 SDK 与内部件复用）。
+
+    要求 ``message`` 为含 ``type`` 的字典。调度链：注入实现（测试/演示）→
+    显式绑定循环 → local_executor 兜底循环；均不可用时降级丢弃并返回
+    False（不阻塞、不抛异常）。
+    """
+    if not isinstance(message, dict) or not message.get("type"):
+        logger.warning("插件 ws_push 被拒：消息须为含 type 的字典")
+        return False
+    if _ws_sender is not None:
+        try:
+            return bool(_ws_sender(user_id, dict(message)))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("插件 ws_push（注入实现）失败: %s", exc)
+            return False
+    loop = _resolve_loop()
+    if loop is None:
+        logger.warning(
+            "插件 ws_push 丢弃：主事件循环未绑定"
+            "（plugin.bind_loop / local_executor 均不可用）"
+        )
+        return False
+    try:
+        import asyncio  # noqa: PLC0415
+
+        import state  # noqa: PLC0415
+
+        ws_manager = getattr(state, "ws_manager", None)
+        if ws_manager is None:
+            logger.warning("插件 ws_push 丢弃：ws_manager 未初始化")
+            return False
+        coro = ws_manager.send_message(user_id, dict(message))
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            # 已在目标循环线程内：直接建任务，不阻塞等待
+            loop.create_task(coro)
+            return True
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        fut.result(timeout=10.0)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("插件 ws_push 失败: %s", exc)
+        return False
+
+
 class PluginSDK:
     """绑定某一插件实例 scope 的出站能力封装（无状态、可跨线程调用）。"""
 
@@ -266,52 +315,14 @@ class PluginSDK:
 
         调度链：注入实现（测试/演示）→ 显式绑定循环 → local_executor 兜底
         循环；均不可用时降级丢弃并返回 False（不阻塞、不抛异常）。
+        （实现见模块级 :func:`ws_push_message`——供内部件复用。）
         """
         try:
             user_id = self._require_user()
         except PermissionError as exc:
             logger.warning("插件 ws_push 被拒: %s", exc)
             return False
-        if not isinstance(message, dict) or not message.get("type"):
-            logger.warning("插件 ws_push 被拒：消息须为含 type 的字典")
-            return False
-        if _ws_sender is not None:
-            try:
-                return bool(_ws_sender(user_id, dict(message)))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("插件 ws_push（注入实现）失败: %s", exc)
-                return False
-        loop = _resolve_loop()
-        if loop is None:
-            logger.warning(
-                "插件 ws_push 丢弃：主事件循环未绑定"
-                "（plugin.bind_loop / local_executor 均不可用）"
-            )
-            return False
-        try:
-            import asyncio  # noqa: PLC0415
-
-            import state  # noqa: PLC0415
-
-            ws_manager = getattr(state, "ws_manager", None)
-            if ws_manager is None:
-                logger.warning("插件 ws_push 丢弃：ws_manager 未初始化")
-                return False
-            coro = ws_manager.send_message(user_id, dict(message))
-            try:
-                running = asyncio.get_running_loop()
-            except RuntimeError:
-                running = None
-            if running is loop:
-                # 已在目标循环线程内：直接建任务，不阻塞等待
-                loop.create_task(coro)
-                return True
-            fut = asyncio.run_coroutine_threadsafe(coro, loop)
-            fut.result(timeout=10.0)
-            return True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("插件 ws_push 失败: %s", exc)
-            return False
+        return ws_push_message(user_id, message)
 
     # ------------------------------------------------------------------
     # 能力 4：活动日志

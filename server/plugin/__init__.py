@@ -73,6 +73,7 @@ __all__ = [
     "safe_publish",
     "safe_process",
     "get_stations",
+    "get_snapshot",
     "init_plugin_system",
     "plugin_cascade",
     # 开关常量
@@ -192,6 +193,24 @@ def get_stations() -> StationsHub:
     _ensure_initialized()
     assert _stations is not None
     return _stations
+
+
+def get_snapshot(user_id: str = "", team_id: str = "") -> Dict[str, Any]:
+    """面板只读快照（二期 M1-b；契约 §15.1）。
+
+    - 总开关关闭 / 组件未初始化：返回 ``enabled=false`` 骨架（200 语义）；
+    - 只读、无副作用；按 ``user_id`` 过滤（可选再按 ``team_id``）。
+    """
+    from plugin.snapshot import build_snapshot  # noqa: PLC0415
+
+    return build_snapshot(
+        enabled=is_enabled(),
+        user_id=str(user_id or ""),
+        team_id=str(team_id or ""),
+        registry=_registry,
+        stations=_stations,
+        watchdog=_watchdog,
+    )
 
 
 def bind_loop(loop: Any) -> None:

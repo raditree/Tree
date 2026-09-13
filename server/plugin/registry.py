@@ -39,6 +39,27 @@ logger = logging.getLogger(__name__)
 DEFAULT_INBOX_MAX = 256
 
 
+def _emit_status_safe(
+    plugin_id: str,
+    scope: Dict[str, str],
+    status: str,
+    *,
+    reason: str = "",
+    inst_key: str = "",
+) -> None:
+    """发射 ``plugin_status`` 生命周期事件（二期 M1-a；懒 import + 全异常吞）。
+
+    生命周期主流程零影响：任何异常（含 import 失败）仅忽略，
+    绝不影响注册 / 注销等调用方行为（fail-open）。
+    """
+    try:
+        from plugin.status import emit_status  # noqa: PLC0415
+
+        emit_status(plugin_id, scope, status, reason=reason, inst_key=inst_key)
+    except Exception:  # noqa: BLE001
+        logger.debug("plugin_status 发射失败（忽略）", exc_info=True)
+
+
 def _read_idle_ttl_default() -> float:
     """读取实例空闲 TTL 默认值（env ``PLUGIN_INSTANCE_TTL_S``，默认 3600s）。"""
     try:
@@ -346,6 +367,7 @@ class PluginRegistry:
             inst.subscription = self._make_subscription(inst)
             self._bus.add_subscription(inst.subscription)
         logger.info("插件实例已注册: %s", key)
+        _emit_status_safe(inst.plugin_id, inst.scope, "registered", inst_key=key)
         return inst
 
     def get(self, instance_key: str) -> Optional[PluginInstance]:
@@ -358,8 +380,12 @@ class PluginRegistry:
         with self._lock:
             return list(self._instances.values())
 
-    def unregister(self, instance: Any) -> bool:
-        """注销实例（停 worker、移订阅、清心跳）；接受实例对象或键字符串。"""
+    def unregister(self, instance: Any, reason: str = "") -> bool:
+        """注销实例（停 worker、移订阅、清心跳）；接受实例对象或键字符串。
+
+        :param reason: 销毁原因（可选；随 ``plugin_status(destroyed)`` 上报，
+            如 ``ttl`` / ``cascade`` / ``shutdown``，缺省空串）。
+        """
         if isinstance(instance, PluginInstance):
             key = instance.instance_key()
         else:
@@ -375,6 +401,9 @@ class PluginRegistry:
             self._bus.remove_subscription(inst.subscription)
             inst.subscription = None
         logger.info("插件实例已注销: %s", key)
+        _emit_status_safe(
+            inst.plugin_id, inst.scope, "destroyed", reason=reason, inst_key=key
+        )
         return True
 
     # ------------------------------------------------------------------
@@ -394,7 +423,7 @@ class PluginRegistry:
         """清理空闲超时的非 Pin 实例（TTL），返回清理数量。"""
         removed = 0
         for inst in self.collect_stale(now=now):
-            if self.unregister(inst):
+            if self.unregister(inst, reason="ttl"):
                 removed += 1
         return removed
 
@@ -477,7 +506,7 @@ class PluginRegistry:
         removed = 0
         for inst in self.instances():
             if scope_matches(cond, inst.scope):
-                if self.unregister(inst):
+                if self.unregister(inst, reason="cascade"):
                     removed += 1
         return removed
 
@@ -544,7 +573,7 @@ class PluginRegistry:
         """停止周期清扫、停止全部实例并清空注册表（进程退出 / 测试清理用）。"""
         self.stop_sweeper()
         for inst in self.instances():
-            self.unregister(inst)
+            self.unregister(inst, reason="shutdown")
 
     # ------------------------------------------------------------------
     # 内部：订阅构造

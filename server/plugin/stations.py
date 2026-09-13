@@ -313,6 +313,10 @@ class StationsHub:
         }
         self._runs_registered = 0
         self._runs_finished = 0
+        # 观测（二期 M1：供面板"站"区块；规格见 observability-guard-design-notes §1.2）
+        self._waits_in_flight = 0      # 等待在飞数（_await_response 入口 +1 / finally −1）
+        self._wait_ms_total = 0.0      # 累计等待时长（毫秒；投递成功后等待段墙钟）
+        self._wait_ms_max = 0.0        # 单次等待峰值（毫秒，单调不减）
 
     # ------------------------------------------------------------------
     # 站注册
@@ -605,6 +609,11 @@ class StationsHub:
         cancel_event: Optional[threading.Event],
     ) -> Tuple[Optional[str], Optional[str]]:
         """等待回填（分段；≤亚秒级响应取消/失效；接通进度通道）。"""
+        # 观测计时用 perf_counter：Windows 下 time.monotonic() 粒度为 ~15.6ms，
+        # 会把毫秒级等待吞成 0（deadline/节拍等秒级判定仍用 monotonic，不受影响）。
+        t0 = time.perf_counter()
+        with self._lock:
+            self._waits_in_flight += 1
         inst_key = inst.instance_key()
         run_id = f"station:{req.req_id}"
         wd = self._watchdog
@@ -650,6 +659,12 @@ class StationsHub:
                             pass
                         last_beat = now
         finally:
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            with self._lock:
+                self._waits_in_flight -= 1
+                self._wait_ms_total += dt_ms
+                if dt_ms > self._wait_ms_max:
+                    self._wait_ms_max = dt_ms
             if registered:
                 try:
                     wd.finish_run(inst_key, run_id)
@@ -731,7 +746,7 @@ class StationsHub:
         return removed
 
     def stats(self) -> Dict[str, Any]:
-        """统计快照（观测 / 验收用；含分类计数 + 进度通道观测）。"""
+        """统计快照（观测 / 验收用；含分类计数 + 进度通道 + 等待观测）。"""
         with self._lock:
             subs = [
                 {
@@ -747,6 +762,11 @@ class StationsHub:
             stations = {sid: dict(meta) for sid, meta in self._stations.items()}
             counts = dict(self._counts)
             active = self._active_count
+            gauges = {"waits_in_flight": self._waits_in_flight}
+            timing = {
+                "wait_ms_total": round(self._wait_ms_total, 3),
+                "wait_ms_max": round(self._wait_ms_max, 3),
+            }
         progress: Dict[str, Any] = {
             "runs_registered": self._runs_registered,
             "runs_finished": self._runs_finished,
@@ -761,6 +781,8 @@ class StationsHub:
             "subscriptions": subs,
             "subscription_count": active,
             "counts": counts,
+            "gauges": gauges,
+            "timing": timing,
             "progress": progress,
         }
 
@@ -774,6 +796,9 @@ class StationsHub:
                 self._counts[key] = 0
             self._runs_registered = 0
             self._runs_finished = 0
+            self._waits_in_flight = 0
+            self._wait_ms_total = 0.0
+            self._wait_ms_max = 0.0
 
     # ------------------------------------------------------------------
     # 内部工具

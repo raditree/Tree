@@ -186,6 +186,18 @@ server\.venv\Scripts\python.exe .output\plugin_station_selftest.py :: 自测 19 
 **真实链路观察**（部署后）：设 `TREE_PLUGIN_ENABLED=1` 重启 → 注册示范插件 →
 agent 调用 read → 工具结果应带 `[处理站示范]` 前缀。
 
+## 状态事件与面板快照（二期 M1）
+
+- **plugin_status**（WS，只增不改）：实例生命周期变化即发（`registered` / `destroyed`；
+  `disabled` 随 M3 巡检联动），字段按契约 §8；全量低频 + 去重/限频（防风暴；去重仅约束连续同状态重复，生命周期跃迁必发）；
+  交付语义＝尽力而为、最终一致（对账以快照为准）。
+  参数：`PLUGIN_STATUS_DEDUP_S`（默认 1.0）、`PLUGIN_STATUS_MAX_PER_SEC`（默认 20）、
+  `PLUGIN_STATUS_RATE_WINDOW_S`（默认 1.0）。
+- **面板快照**（REST 只读）：`GET /api/plugin/snapshot?team_id=`（user 由 token 归属）——
+  实例 / 站（含 `gauges.waits_in_flight`、`timing.wait_ms_*`）/ 看门狗 / 配置摘要；
+  未启用时返回 `enabled=false` 骨架（200）。前端触点＝右栏第 5 Tab（防御式解析）。
+- 测试：`tests/test_plugin_status.py` / `tests/test_plugin_snapshot.py`。
+
 ## 测试与演示
 
 ```bat
