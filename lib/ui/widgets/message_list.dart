@@ -105,9 +105,12 @@ class _MessageListViewState extends State<_MessageListView> {
   /// 脱离判定阈值（px）：视口离开底部超过该值即视为用户主动脱离跟随
   static const double _detachThreshold = 12.0;
 
-  /// 平滑跟随动画进行中的计数：>0 时滚动通知不更新脱离状态，
-  /// 避免把程序动画（animateTo 的中间帧）误判为用户滚动。
-  int _autoScrollCount = 0;
+  /// 上一次滚动像素位置：用位移方向区分程序动画与用户滚动。
+  ///
+  /// 反转列表 offset 0 即底部：程序动画（animateTo 向底部）表现为像素
+  /// **减小**；用户上滚查看历史表现为像素**增大**。据此判定可避免
+  /// 「动画进行中一律忽略滚动更新」把用户的上滚也吞掉（导致无法脱离）。
+  double _lastPixels = 0;
 
   /// 消息 id → GlobalKey（定位目标可寻址）
   final Map<String, GlobalKey> _itemKeys = <String, GlobalKey>{};
@@ -128,6 +131,10 @@ class _MessageListViewState extends State<_MessageListView> {
 
   /// 锚定还原迭代次数（最多 3 帧迭代校正）
   int _restoreAttempts = 0;
+
+  /// 锚定校正链是否进行中：内容高频更新时保证同一时刻只有一条校正链，
+  /// 避免多条链并发 jumpTo 相互拉扯（表现为视口抖动）。
+  bool _restoreActive = false;
 
   @override
   void initState() {
@@ -150,9 +157,10 @@ class _MessageListViewState extends State<_MessageListView> {
           _jumpToBottom();
         });
       } else if (!_userDetached) {
-        // 流式追加/增量更新：平滑跟随
+        // 流式追加/增量更新：平滑跟随。postFrame 回调再判一次脱离态：
+        // 回调排队到真正执行期间用户可能已上滚脱离，避免又把它拽回底部。
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!mounted) return;
+          if (!mounted || _userDetached) return;
           _scrollToBottomSmooth();
         });
       } else {
@@ -197,6 +205,10 @@ class _MessageListViewState extends State<_MessageListView> {
     _anchorId = id;
     _anchorDy = ro.localToGlobal(Offset.zero).dy;
     _restoreAttempts = 0;
+    // 已有校正链在跑：只需刷新锚点目标（链内每次迭代读取最新
+    // _anchorId/_anchorDy），不再另起一条链，避免并发 jumpTo 互相拉扯。
+    if (_restoreActive) return;
+    _restoreActive = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _restoreAnchorStep();
     });
@@ -232,19 +244,32 @@ class _MessageListViewState extends State<_MessageListView> {
 
   /// 校正一帧：把锚定消息移回其原全局 y 坐标；残差大时下一帧继续。
   void _restoreAnchorStep() {
-    if (!mounted || !_controller.hasClients || _anchorId == null) return;
+    if (!mounted || !_controller.hasClients || _anchorId == null) {
+      _restoreActive = false;
+      return;
+    }
     // 用户在滚动（拖拽/惯性）：暂停校正，滚动结束后结算
     if (_controller.position.isScrollingNotifier.value) {
       _anchorPending = true;
+      _restoreActive = false;
       return;
     }
     final BuildContext? ctx = _itemKeys[_anchorId]?.currentContext;
-    if (ctx == null) return;
+    if (ctx == null) {
+      _restoreActive = false;
+      return;
+    }
     final RenderBox? ro = ctx.findRenderObject() as RenderBox?;
-    if (ro == null || !ro.hasSize) return;
+    if (ro == null || !ro.hasSize) {
+      _restoreActive = false;
+      return;
+    }
     final double nowDy = ro.localToGlobal(Offset.zero).dy;
     final double diff = _anchorDy - nowDy;
-    if (diff.abs() < 0.5 || _restoreAttempts >= 3) return;
+    if (diff.abs() < 0.5 || _restoreAttempts >= 3) {
+      _restoreActive = false;
+      return;
+    }
     _restoreAttempts++;
     // 反转列表：offset 增大 = 视口内容整体向下移动（消息 dy 增大），
     // 故 offset 修正量 = diff（目标 y - 当前 y）。
@@ -307,21 +332,24 @@ class _MessageListViewState extends State<_MessageListView> {
   ///   惯性衰减等，均表现为 ScrollUpdateNotification）离开底部超过
   ///   [_detachThreshold] → 进入脱离（此后新内容不再把视口拽回底部）；
   ///   回到/接近底部 → 恢复跟随。
-  /// - 仅「平滑跟随动画」进行中（[_autoScrollCount] > 0）忽略更新，避免把
-  ///   程序动画自身误判为用户滚动；动画结束/被打断后由 [_scrollToBottomSmooth]
-  ///   的回调统一结算一次，避免漏判打断瞬间的用户滚动。
+  /// - 脱离判定用像素**位移方向**而非「动画计数」：反转列表向底部的
+  ///   程序动画表现为像素减小，用户上滚表现为像素增大；只要在朝远离底部
+  ///   的方向移动就立即脱离。这样流式期间跟随动画频繁重启也不会吞掉用户
+  ///   的滚动更新（旧实现整体忽略动画期更新 → 无法脱离底部）。
   /// - 滚动结束（拖拽/惯性停止）：结算挂起的锚定校正。
   bool _onScrollNotification(ScrollNotification notification) {
     final double pixels = notification.metrics.pixels;
     if (notification is ScrollUpdateNotification) {
-      if (_autoScrollCount > 0) {
-        // 平滑跟随动画进行中：跳过（交由动画回调结算）
-      } else if (!_userDetached && pixels > _detachThreshold) {
+      final double delta = pixels - _lastPixels;
+      _lastPixels = pixels;
+      if (!_userDetached && pixels > _detachThreshold && delta > 0) {
+        // 视口正在远离底部（用户上滚/滚轮/拖动滚动条）→ 立即脱离跟随
         _setUserDetached(true);
       } else if (_userDetached && pixels <= _detachThreshold) {
         _setUserDetached(false);
       }
     } else if (notification is ScrollEndNotification) {
+      _lastPixels = pixels;
       if (_userDetached && pixels <= _detachThreshold) {
         _setUserDetached(false);
       }
@@ -353,19 +381,21 @@ class _MessageListViewState extends State<_MessageListView> {
 
   /// 平滑滚动到底部（流式追加/增量更新时跟随）。
   ///
-  /// 反转列表底部即 offset 0；动画完成后**仅在仍应跟随**时校正一次。
-  /// 修复历史：① 不再无条件 jumpTo(0)，避免用户拖拽打断动画后被强行拉
-  /// 回底部；② 动画结束/被打断后按当前视口结算一次脱离状态——打断瞬间的
-  /// 用户滚动（滚轮/滚动条等）会被动画计数忽略，这里补判以免漏。
+  /// 反转列表底部即 offset 0：贴底（pixels≈0）时新增/增长的底部内容本来
+  /// 就不会移动视口，**无需滚动**；此前无条件 animateTo(0) 会在流式高频
+  /// 更新下不断重启动画去打断用户上滚（表现为「难以脱离底部 + 抖动」）。
+  /// 因此这里：已脱离 / 用户正在滚动 / 已在底部，均直接返回，不做动画。
   ///
-  /// 使用 whenComplete 而非 then：无论动画自然完成、被用户滚动打断，
-  /// 还是组件被移除（ScrollPosition dispose），future 均会完成
-  /// （DrivenScrollActivity.dispose 第一行即 `_completer.complete()`），
-  /// 保证 [_autoScrollCount] 必然回减、不泄漏；此处不吞异常——若未来出现
-  /// 异常完成，应保留可见性而非静默掩盖。
+  /// 动画完成/被打断后按当前视口结算一次脱离状态；仅在仍应跟随时校正到
+  /// 真实底部。使用 whenComplete 而非 then：无论动画自然完成、被用户滚动
+  /// 打断，还是组件被移除（ScrollPosition dispose），future 均会完成
+  /// （DrivenScrollActivity.dispose 第一行即 `_completer.complete()`）。
   void _scrollToBottomSmooth() {
-    if (!_controller.hasClients) return;
-    _autoScrollCount++;
+    if (!_controller.hasClients || _userDetached) return;
+    // 用户手势/惯性滚动进行中：不启动跟随动画（避免与用户滚动打架）
+    if (_controller.position.isScrollingNotifier.value) return;
+    // 已在底部：反转列表会自动保持贴底，无需动画
+    if (_controller.position.pixels <= 0.5) return;
     _controller
         .animateTo(
           0,
@@ -373,7 +403,6 @@ class _MessageListViewState extends State<_MessageListView> {
           curve: Curves.easeOut,
         )
         .whenComplete(() {
-      if (_autoScrollCount > 0) _autoScrollCount--;
       if (!mounted || !_controller.hasClients) return;
       final double px = _controller.position.pixels;
       // 动画完成时若视口仍远离底部（被用户滚动打断/用户已在历史位置）：
