@@ -913,7 +913,9 @@ class SshWorkspaceExecutor {
   ///
   /// 支持参数：``pattern``（必填）、``path``（搜索范围，workspace 内相对
   /// 路径，缺省整个工作空间）、``regex``（是否正则，缺省 false 字面量）、
-  /// ``ignore_case``（缺省 false）。
+  /// ``ignore_case``（缺省 false）、``max_depth``（递归深度上限，1=仅目标
+  /// 目录本层，缺省 0 不限）、``exclude``（逗号分隔的排除 glob，按文件/
+  /// 目录名称匹配）。
   ///
   /// 路径穿越防护：path 经 [_sanitizeRemotePath] 校验（对齐本地执行器
   /// ``_resolveInWorkspace`` 语义——拒绝绝对路径与 ``..`` 段，解析后必须仍在
@@ -930,6 +932,8 @@ class SshWorkspaceExecutor {
     final bool regex = (data['regex'] as bool?) ?? false;
     final bool ignoreCase = (data['ignore_case'] as bool?) ?? false;
     final String path = (data['path'] as String?) ?? '';
+    final int maxDepth = _parseMaxDepth(data['max_depth']);
+    final List<String> exclude = _parseExclude(data['exclude']);
     String? targetRemote;
     if (path.isNotEmpty) {
       targetRemote = _sanitizeRemotePath(workspaceId, path);
@@ -942,10 +946,63 @@ class SshWorkspaceExecutor {
     final String mode = regex ? '-E' : '-F';
     final String ic = ignoreCase ? 'i' : '';
     final String target = targetRemote == null ? '.' : _shQuote(targetRemote);
-    final String full =
-        'cd ${_shQuote(cwd)} && grep -rn${ic}I $mode --exclude-dir=.git '
-        '-- ${_shQuote(pattern)} $target';
-    return _exec(client, full);
+    final StringBuffer excl = StringBuffer('--exclude-dir=.git');
+    for (final String pat in exclude) {
+      excl.write(' --exclude=${_shQuote(pat)} --exclude-dir=${_shQuote(pat)}');
+    }
+    String full;
+    if (maxDepth > 0) {
+      // GNU grep 无目录深度选项：用 find -maxdepth 枚举文件后交给 grep
+      // （xargs 无文件时不执行；grep -H 保证输出仍带文件名前缀）
+      final StringBuffer findExcl =
+          StringBuffer(' -not -path ${_shQuote('*/.git/*')}');
+      for (final String pat in exclude) {
+        findExcl.write(' -not -path ${_shQuote('*/$pat/*')}');
+      }
+      full = 'cd ${_shQuote(cwd)} && find $target -maxdepth $maxDepth -type f'
+          '$findExcl -print0 2>/dev/null | xargs -0 -r grep -nH${ic}I $mode '
+          '$excl -- ${_shQuote(pattern)}';
+    } else {
+      full = 'cd ${_shQuote(cwd)} && grep -rn${ic}I $mode $excl '
+          '-- ${_shQuote(pattern)} $target';
+    }
+    final Map<String, dynamic> result = await _exec(client, full);
+    // find 管道下 xargs 在 grep 无命中时返回 123，归一为 grep 语义的 1
+    if (maxDepth > 0 && result['exit_code'] == 123) {
+      result['exit_code'] = 1;
+    }
+    return result;
+  }
+
+  /// 解析 ``max_depth``：非数字/缺省为 0（不限），负值归零、上限 100。
+  int _parseMaxDepth(dynamic raw) {
+    int depth = 0;
+    if (raw is num) {
+      depth = raw.toInt();
+    } else if (raw is String) {
+      depth = int.tryParse(raw.trim()) ?? 0;
+    }
+    if (depth < 0) return 0;
+    return depth > 100 ? 100 : depth;
+  }
+
+  /// 解析 ``exclude``：兼容字符串（逗号分隔）与数组两种载荷形式，
+  /// 去空白、去空项、去重。
+  List<String> _parseExclude(dynamic raw) {
+    final List<String> items = <String>[];
+    if (raw is String) {
+      items.addAll(raw.split(','));
+    } else if (raw is List) {
+      for (final dynamic item in raw) {
+        if (item != null) items.add(item.toString());
+      }
+    }
+    final List<String> patterns = <String>[];
+    for (final String item in items) {
+      final String pat = item.trim();
+      if (pat.isNotEmpty && !patterns.contains(pat)) patterns.add(pat);
+    }
+    return patterns;
   }
 
   /// 查看远端工作空间 git 提交历史，返回 ``{exit_code, commits}``。

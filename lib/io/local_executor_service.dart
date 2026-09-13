@@ -1511,7 +1511,9 @@ class LocalExecutorService extends ChangeNotifier {
   ///
   /// 支持参数：``pattern``（必填）、``path``（搜索范围，工作空间内相对路径，
   /// 缺省整个工作空间）、``regex``（是否正则，缺省 false 字面量）、
-  /// ``ignore_case``（是否忽略大小写，缺省 false）。
+  /// ``ignore_case``（是否忽略大小写，缺省 false）、``max_depth``（递归深度
+  /// 上限，1=仅目标目录本层，缺省 0 不限）、``exclude``（逗号分隔的排除
+  /// glob，按文件/目录名称匹配）。
   Future<Map<String, dynamic>> _grepSearch(
     Directory wsDir,
     Map<String, dynamic> data,
@@ -1523,6 +1525,8 @@ class LocalExecutorService extends ChangeNotifier {
     final String path = (data['path'] as String?) ?? '';
     final bool regex = (data['regex'] as bool?) ?? false;
     final bool ignoreCase = (data['ignore_case'] as bool?) ?? false;
+    final int maxDepth = _parseMaxDepth(data['max_depth']);
+    final List<String> exclude = _parseExclude(data['exclude']);
     final List<String> lines = <String>[];
     try {
       final RegExp? re = regex
@@ -1535,6 +1539,8 @@ class LocalExecutorService extends ChangeNotifier {
           lines,
           re: re,
           ignoreCase: ignoreCase,
+          maxDepth: maxDepth,
+          exclude: exclude,
         );
       } else {
         // path 可能是目录或文件：文件走单文件搜索，目录才递归遍历。
@@ -1544,13 +1550,15 @@ class LocalExecutorService extends ChangeNotifier {
         final FileSystemEntityType type =
             FileSystemEntity.typeSync(full, followLinks: false);
         if (type == FileSystemEntityType.file) {
-          await _searchFile(
-            File(full),
-            pattern,
-            lines,
-            re: re,
-            ignoreCase: ignoreCase,
-          );
+          if (!_isExcluded(_basename(full), exclude)) {
+            await _searchFile(
+              File(full),
+              pattern,
+              lines,
+              re: re,
+              ignoreCase: ignoreCase,
+            );
+          }
         } else {
           await _walkSearch(
             Directory(full),
@@ -1558,6 +1566,8 @@ class LocalExecutorService extends ChangeNotifier {
             lines,
             re: re,
             ignoreCase: ignoreCase,
+            maxDepth: maxDepth,
+            exclude: exclude,
           );
         }
       }
@@ -1573,6 +1583,62 @@ class LocalExecutorService extends ChangeNotifier {
       'exit_code': 0,
       'stdout': lines.join('\n'),
     };
+  }
+
+  /// 解析 ``max_depth``：非数字/缺省为 0（不限），负值归零、上限 100。
+  int _parseMaxDepth(dynamic raw) {
+    int depth = 0;
+    if (raw is num) {
+      depth = raw.toInt();
+    } else if (raw is String) {
+      depth = int.tryParse(raw.trim()) ?? 0;
+    }
+    if (depth < 0) return 0;
+    return depth > 100 ? 100 : depth;
+  }
+
+  /// 解析 ``exclude``：兼容字符串（逗号分隔）与数组两种载荷形式，
+  /// 去空白、去空项、去重。
+  List<String> _parseExclude(dynamic raw) {
+    final List<String> items = <String>[];
+    if (raw is String) {
+      items.addAll(raw.split(','));
+    } else if (raw is List) {
+      for (final dynamic item in raw) {
+        if (item != null) items.add(item.toString());
+      }
+    }
+    final List<String> patterns = <String>[];
+    for (final String item in items) {
+      final String pat = item.trim();
+      if (pat.isNotEmpty && !patterns.contains(pat)) patterns.add(pat);
+    }
+    return patterns;
+  }
+
+  /// 名称是否命中任一排除 glob（按名称匹配，不区分大小写）。
+  bool _isExcluded(String name, List<String> patterns) {
+    for (final String pat in patterns) {
+      if (_globMatch(pat, name)) return true;
+    }
+    return false;
+  }
+
+  /// glob（``*`` / ``?``）匹配单个名称，不跨路径分隔符。
+  bool _globMatch(String pattern, String name) {
+    final StringBuffer re = StringBuffer('^');
+    for (final int rune in pattern.runes) {
+      final String ch = String.fromCharCode(rune);
+      if (ch == '*') {
+        re.write('.*');
+      } else if (ch == '?') {
+        re.write('.');
+      } else {
+        re.write(RegExp.escape(ch));
+      }
+    }
+    re.write(r'$');
+    return RegExp(re.toString(), caseSensitive: false).hasMatch(name);
   }
 
   /// 在单个文件中匹配 [pattern]，命中行以 ``绝对路径:行内容`` 追加到 [out]。
@@ -1607,12 +1673,19 @@ class LocalExecutorService extends ChangeNotifier {
   }
 
   /// 递归遍历目录，收集包含 [pattern] 的行（[re] 非空时按正则匹配）。
+  ///
+  /// [maxDepth] > 0 时限制下钻层数（1=仅当前目录本层文件）；[exclude]
+  /// 为按名称匹配的排除 glob。另始终跳过 ``.git`` / ``workspaces`` /
+  /// ``agentspace``。
   Future<void> _walkSearch(
     Directory dir,
     String pattern,
     List<String> out, {
     RegExp? re,
     bool ignoreCase = false,
+    int maxDepth = 0,
+    List<String> exclude = const <String>[],
+    int depth = 1,
   }) async {
     await for (final FileSystemEntity entity in dir.list(followLinks: false)) {
       if (entity is Directory) {
@@ -1620,14 +1693,20 @@ class LocalExecutorService extends ChangeNotifier {
         if (name == '.git' || name == 'workspaces' || name == 'agentspace') {
           continue;
         }
+        if (_isExcluded(name, exclude)) continue;
+        if (maxDepth > 0 && depth >= maxDepth) continue; // 达深度上限，不再下钻
         await _walkSearch(
           entity,
           pattern,
           out,
           re: re,
           ignoreCase: ignoreCase,
+          maxDepth: maxDepth,
+          exclude: exclude,
+          depth: depth + 1,
         );
       } else if (entity is File) {
+        if (_isExcluded(_basename(entity.path), exclude)) continue;
         await _searchFile(
           entity,
           pattern,

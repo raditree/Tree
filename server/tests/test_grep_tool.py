@@ -3,7 +3,8 @@
 覆盖：
 - 工具定义（name=grep、必填 pattern、参数齐全）
 - 参数校验（空 pattern / 非法路径：绝对路径、盘符、.. 回溯、非法字符）
-- 执行分发（pattern/path/regex/ignore_case 正确透传 WorkspaceIO.grep_search）
+- 执行分发（pattern/path/regex/ignore_case/max_depth/exclude 正确透传
+  WorkspaceIO.grep_search）
 - 结果组装（命中 / 无命中 exit_code=1 / max_results 截断标注）
 """
 
@@ -29,7 +30,10 @@ class TestToolDefinition(unittest.TestCase):
 
     def test_has_all_params(self):
         props = self.tool.get_tool_definition()["function"]["parameters"]["properties"]
-        for key in ("pattern", "path", "regex", "ignore_case", "max_results"):
+        for key in (
+            "pattern", "path", "regex", "ignore_case",
+            "max_depth", "exclude", "max_results",
+        ):
             self.assertIn(key, props)
 
 
@@ -89,7 +93,8 @@ class TestExecute(unittest.TestCase):
         self.assertFalse(ret["truncated"])
         self.assertEqual(ret["matches"][0], "lib/a.dart:hello")
         self.io.grep_search.assert_awaited_once_with(
-            "ws", "hello", path="", regex=False, ignore_case=False
+            "ws", "hello", path="", regex=False, ignore_case=False,
+            max_depth=0, exclude=[],
         )
 
     def test_params_forwarded(self):
@@ -97,8 +102,51 @@ class TestExecute(unittest.TestCase):
             {"pattern": r"\d+", "path": "lib/src", "regex": True, "ignore_case": True}
         )
         self.io.grep_search.assert_awaited_once_with(
-            "ws", r"\d+", path="lib/src", regex=True, ignore_case=True
+            "ws", r"\d+", path="lib/src", regex=True, ignore_case=True,
+            max_depth=0, exclude=[],
         )
+
+    def test_max_depth_and_exclude_forwarded(self):
+        ret = self.tool.execute(
+            {"pattern": "x", "max_depth": 2,
+             "exclude": "node_modules, *.min.js,"}
+        )
+        self.io.grep_search.assert_awaited_once_with(
+            "ws", "x", path="", regex=False, ignore_case=False,
+            max_depth=2, exclude=["node_modules", "*.min.js"],
+        )
+        self.assertEqual(ret["max_depth"], 2)
+        self.assertEqual(ret["exclude"], ["node_modules", "*.min.js"])
+
+    def test_max_depth_clamped(self):
+        self.tool.execute({"pattern": "x", "max_depth": 999})
+        self.assertEqual(
+            self.io.grep_search.await_args.kwargs["max_depth"], 100
+        )
+        self.io.grep_search.reset_mock()
+        self.tool.execute({"pattern": "x", "max_depth": -5})
+        self.assertEqual(
+            self.io.grep_search.await_args.kwargs["max_depth"], 0
+        )
+
+    def test_invalid_max_depth_rejected(self):
+        ret = self.tool.execute({"pattern": "x", "max_depth": "abc"})
+        self.assertIn("error", ret)
+        self.io.grep_search.assert_not_awaited()
+
+    def test_invalid_exclude_rejected(self):
+        ret = self.tool.execute({"pattern": "x", "exclude": ["node_modules"]})
+        self.assertIn("error", ret)
+        ret2 = self.tool.execute({"pattern": "x", "exclude": "a" * 300})
+        self.assertIn("error", ret2)
+        self.io.grep_search.assert_not_awaited()
+
+    def test_huge_exclude_rejected(self):
+        ret = self.tool.execute(
+            {"pattern": "x", "exclude": ",".join(f"p{i}" for i in range(51))}
+        )
+        self.assertIn("error", ret)
+        self.io.grep_search.assert_not_awaited()
 
     def test_no_hits(self):
         self.io.grep_search = AsyncMock(return_value={"exit_code": 1, "stdout": ""})

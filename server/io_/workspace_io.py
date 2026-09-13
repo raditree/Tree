@@ -110,6 +110,8 @@ class WorkspaceIO(ABC):
         path: str = "",
         regex: bool = False,
         ignore_case: bool = False,
+        max_depth: int = 0,
+        exclude: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """在工作空间内按文本模式/正则搜索候选行（供 embed_search / grep 工具使用）。
 
@@ -118,6 +120,11 @@ class WorkspaceIO(ABC):
         :param path: 搜索范围（工作空间内相对目录/文件），空串表示整个工作空间
         :param regex: 是否将 pattern 视为正则表达式（缺省 False 字面量）
         :param ignore_case: 是否忽略大小写（缺省 False）
+        :param max_depth: 目录递归深度上限；1 表示只搜索目标目录本层文件
+            （不进入子目录），0 表示不限深度
+        :param exclude: 排除的文件/目录 glob 列表（按名称匹配，如
+            ``["node_modules", "*.min.js"]``）；None/空表示不额外排除
+            （``.git`` 始终排除）
         :return: ``{"exit_code": 0|1, "stdout": "<grep 输出>"}``；grep 无命中时
                  exit_code 为 1；失败 ``{"error": ...}``
         """
@@ -278,24 +285,52 @@ class CloudWorkspaceIO(WorkspaceIO):
         path: str = "",
         regex: bool = False,
         ignore_case: bool = False,
+        max_depth: int = 0,
+        exclude: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         import shlex
 
         # -F 固定字符串（字面量）/ -E 扩展正则；-- 之后均为位置参数，pattern
         # 以 - 开头也不会被解析为选项；pattern 统一 shlex.quote 防注入。
         flags = "-rnI"
+        ic = ""
         if ignore_case:
             flags += "i"
+            ic = "i"
         mode = "-E" if regex else "-F"
         target = shlex.quote(path.strip("/")) if path else "."
-        grep_cmd = (
-            f"grep {flags} {mode} --exclude-dir=.git -- "
-            f"{shlex.quote(pattern)} {target}"
-        )
-        return await asyncio.to_thread(
+        # 排除项：grep 按文件名/目录名 glob 过滤；.git 始终排除
+        excl_patterns = list(exclude or [])
+        excl_flags = "--exclude-dir=.git"
+        for pat in excl_patterns:
+            q = shlex.quote(pat)
+            excl_flags += f" --exclude={q} --exclude-dir={q}"
+
+        if max_depth and max_depth > 0:
+            # GNU grep 无目录深度选项：用 find -maxdepth 枚举文件后交给 grep
+            # （xargs 无文件时不执行；grep -H 保证输出仍带文件名前缀）
+            find_excl = ""
+            for pat in excl_patterns:
+                find_excl += f" -not -path {shlex.quote('*/' + pat + '/*')}"
+            cmd = (
+                f"find {target} -maxdepth {int(max_depth)} -type f "
+                f"-not -path {shlex.quote('*/.git/*')}{find_excl} -print0 "
+                f"2>/dev/null | xargs -0 -r grep -nH{ic}I {mode} "
+                f"{excl_flags} -- {shlex.quote(pattern)}"
+            )
+        else:
+            cmd = (
+                f"grep {flags} {mode} {excl_flags} -- "
+                f"{shlex.quote(pattern)} {target}"
+            )
+        result = await asyncio.to_thread(
             self.docker_manager.exec_in_workspace,
-            workspace_id, ["sh", "-c", grep_cmd],
+            workspace_id, ["sh", "-c", cmd],
         )
+        # find 管道下 xargs 在 grep 无命中时返回 123，归一为 grep 语义的 1
+        if max_depth and max_depth > 0 and result.get("exit_code") == 123:
+            result["exit_code"] = 1
+        return result
 
     async def git_log(
         self, workspace_id: str, limit: int = 50
@@ -491,6 +526,8 @@ class LocalWorkspaceIO(WorkspaceIO):
         path: str = "",
         regex: bool = False,
         ignore_case: bool = False,
+        max_depth: int = 0,
+        exclude: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         return await self._request(
             workspace_id,
@@ -499,6 +536,8 @@ class LocalWorkspaceIO(WorkspaceIO):
             path=path or "",
             regex=regex,
             ignore_case=ignore_case,
+            max_depth=int(max_depth or 0),
+            exclude=list(exclude or []),
         )
 
     async def git_log(

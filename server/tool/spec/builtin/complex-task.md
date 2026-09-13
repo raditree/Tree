@@ -44,29 +44,31 @@ changelog:
 
 ## 工作流（workflow）
 
-1. **检索 Spec**：用 `spec search` 找适用自定义 Spec。
-   - 明确命中 → `spec read` 取全文 + `spec select` 挂 hook，并遵循其工作流执行。
-   - 未命中 → 走下方通用流程，完成后 `spec create` 沉淀新 Spec。
-
-2. **侦察（Recon）**：动手规划前先系统侦察，禁止凭想象拆解。
-   - **代码侦察**：`read` 相关入口文件、模块、接口、数据模型、配置、测试、现有模式与约定；梳理数据流与调用链。
-   - **环境侦察**：`terminal` 确认构建命令、测试命令、依赖版本、运行环境、git 工作区与当前分支状态。
-   - **历史侦察**：`spec list`/`spec search` 查历史 Spec 与决策记录；查近期相关提交、历史遗留问题与已知坑。
-   - **约束侦察**：明确不可改范围、外部依赖、兼容性要求、对外接口/存储格式约束。
-   - **产出**：侦察笔记写入 `.self/recon.md`，至少含——现状、涉及面（文件/模块/接口清单）、依赖与约束、未知项、初始风险、待确认问题。
-   - 侦察发现判型有变（如需分工/架构级影响）→ 立即按边界与异常处理升级 hard。
-
-3. **任务分解**：调用 `set_todo_list` 将任务拆成 todo 项，拆分标准：
+1. **任务分解**：调用 `set_todo_list` 将任务拆成 todo 项，拆分标准：
+   - 初始化：初始 todo 可仅包含基本工作流，到每个实际流程中要求**先细化再执行**。
    - 每项**可独立验证**，有明确完成判据（写明"什么算完成"）；
    - 粒度适中：一项 = 一个可验证交付物（一个功能点/一个模块改造），不拆碎到单行改动；
    - 首项固定为"检索 Spec 与确认环境（依赖/构建/分支状态）"；
    - 每项标注：依赖、影响面、回归范围、涉及文件（基于侦察笔记）。
 
+2. **检索 Spec**：用 `spec search` 找适用自定义 Spec。
+   - 明确命中 → `spec read` 取全文 + `spec select` 挂 hook，并遵循其工作流执行。
+   - 未命中 → 走下方通用流程，完成后 `spec create` 沉淀新 Spec。
+
+3. **侦察（Recon）**：动手规划前先系统侦察，禁止凭想象拆解。
+   - **边界侦察**：`grep` 相关入口文件、模块、接口、上下游调用链及侦察范围。
+   - **代码侦察**：`read` 数据模型、配置、测试、现有模式与约定；梳理数据流与调用链。
+   - **环境侦察**：`terminal` 确认构建命令、测试命令、依赖版本、运行环境（是否有虚拟环境）、git 工作区与当前分支状态。
+   - **历史侦察**：`spec list`/`spec search` 查历史 Spec 与决策记录；查近期相关提交、历史遗留问题与已知坑。
+   - **约束侦察**：明确不可改范围、外部依赖、兼容性要求、对外接口/存储格式约束。
+   - **产出**：侦察笔记写入 `.self/plan/{YYYYMMDD}-{task_slug}/recon.md`，至少含——现状、涉及面（文件/模块/接口清单）、依赖与约束、未知项、初始风险、待确认问题；构建命令、测试命令、依赖版本、运行环境、git 工作区与当前分支状态写入 .self/memory.md。
+   - 侦察发现判型有变（如需分工/架构级影响）→ 立即按边界与异常处理升级 hard。
+
 4. **生成 plan 文件（强制，除非用户明确特殊要求跳过审核）**：
-   - 默认必须产出 `.self/plan/{YYYYMMDD}-{task_slug}.md`，并请求用户审核；未获批准前不得正式实施修改。
+   - 默认必须产出 `.self/plan/{YYYYMMDD}-{task_slug}/plan.md`，并请求用户审核；未获批准前不得正式实施修改。
    - 用户明确说"直接做 / 跳过计划 / 无需审核"等特殊要求时，可跳过审核，但仍应在 plan 中记录跳过原因，且不得省略测试与回归。
    - **4.1 生成前：上下文背景识别**
-     - 以 `.self/recon.md` 为主要输入，补读必要文件；
+     - 以 `.self/plan/{YYYYMMDD}-{task_slug}/recon.md` 为主要输入，补读必要文件；
      - 明确：目标、范围、不做项、约束、验收标准、未知项、初始风险。
    - **4.2 生成前：任务调研拆解方法论**
      - 基于侦察结论拆解，不凭想象拆；
@@ -78,7 +80,7 @@ changelog:
      - plan 文件必须包含以下章节，缺一不可：
        1. 任务标识与摘要
        2. 目标与范围（含明确不做项）
-       3. 上下文与现状（引用 `.self/recon.md` 要点：相关文件、模块、依赖、约束、git 状态）
+       3. 上下文与现状（引用 `.self/plan/{YYYYMMDD}-{task_slug}/recon.md` 要点：相关文件、模块、依赖、约束、git 状态）
        4. 方案与步骤（为何这样改，简述替代方案与否决理由）
        5. 影响面与文件清单（拟改文件、接口/数据/配置变更）
        6. 测试计划（单元、集成、回归、关键路径、手工核对）
@@ -86,12 +88,12 @@ changelog:
        8. 风险与回滚方案
        9. todo 映射与依赖顺序
        10. 待用户确认项
-   - **4.4 审核**：plan 生成后，`set_todo_list update` 建立映射，并用 `ask_user_question` 请求用户审核：
+   - **4.4 审核**：plan 生成后，`set_todo_list update` 建立细化映射，并用 `ask_user_question` 请求用户审核：
      - 用户批准 → 进入实施；
      - 用户要求修改 → 修订 plan 后重新请求审核；
      - 用户特殊要求跳过 → 记录原因后实施，但测试/回归不可省略。
 
-5. **按 todo 执行**：每项走 `read` → `edit`/`write`/`terminal` → 验证 的循环完成；
+5. **按 todo 执行**：每项走 `grep`/`read` → `edit`/`write`/`terminal` → 验证 的循环完成；
    - 每完成一项立即 `set_todo_list update` 更新状态与进度，不得攒到全部完成才统一标注；
    - 遇阻塞也即时更新 todo 状态并注明阻塞原因；
    - 每项完成后至少做局部自测，不把测试全部堆到最后。
@@ -110,8 +112,8 @@ changelog:
 ## 该类任务规范
 
 - **单人串行，不分工**：complex 不调用 team/message 派活，不设成员，不做团队验收；发现需要分工协作、多角色并行、需要会议决策 → 立即升级 hard-task。
-- **先侦察再规划**：开工必须先完成 Recon 并写入 `.self/recon.md`，禁止无侦察直接拆 todo 或写 plan。
-- **plan 必产出且先审后做**：用户无特殊要求时，必须先生成 `.self/plan/xxx.md` 并经用户审核；未批准不得 edit/write 业务文件。
+- **先侦察再规划**：开工必须先完成 Recon 并写入 `.self/plan/{YYYYMMDD}-{task_slug}/recon.md`，禁止无侦察直接拆 todo 或写 plan。
+- **plan 必产出且先审后做**：用户无特殊要求时，必须先生成 `.self/plan/{YYYYMMDD}-{task_slug}/plan.md` 并经用户审核；未批准不得 edit/write 业务文件。
 - **todo 必建且全程跟踪**：开工即 `set_todo_list set`；过程中每完成/阻塞一项立即 update。
 - **先检索 Spec 再执行**：开工前必须 `spec search`，不盲目直接动手。
 - **测试与回归内建**：每项有局部验证，最终有全量验证、回归验证、关键路径核对；禁止只改不验。
@@ -123,16 +125,16 @@ changelog:
 - **无团队分工**：complex 不涉及文件所有权分配、成员派活、成员验收。
 - **文件串行原则**：同一文件同一时刻只有一个执行者（即当前单人），按 todo 顺序串行修改，避免并行冲突。
 - **强耦合任务**：不强行拆分；按 todo 依赖顺序串行执行。
-- **若发现需要多人并行/多角色评审/正式会议**：停止 complex，升级 hard-task，并保留 `.self/recon.md`、plan 与 todo 作为 hard 的输入。
+- **若发现需要多人并行/多角色评审/正式会议**：停止 complex，升级 hard-task，并保留 `.self/plan/{YYYYMMDD}-{task_slug}/recon.md`、plan 与 todo 作为 hard 的输入。
 - **回滚策略**：破坏性步骤前用 git 记录检查点，出问题可回退；回退后在 plan/todo 中记录原因。
 
 ## 中断恢复
 
-- **todo、plan、recon 为进度事实源**：状态以 `.self/todos.md` 为准（`set_todo_list get` 读取），计划以 `.self/plan/xxx.md` 为准，侦察结论以 `.self/recon.md` 为准；禁止在对话中口头跟踪后失忆。
+- **todo、plan、recon 为进度事实源**：状态以 `.self/todos.md` 为准（`set_todo_list get` 读取），计划以 `.self/plan/{YYYYMMDD}-{task_slug}/plan.md` 为准，侦察结论以 `.self/plan/{YYYYMMDD}-{task_slug}/recon.md` 为准；禁止在对话中口头跟踪后失忆。
 - **会话 compact/重建后恢复步骤**：
   1. `spec list` 确认本会话 selected Spec 状态（compact 后 hook 注入是否仍在）；
   2. `set_todo_list get` 取回进度快照；
-  3. `read` `.self/recon.md`、plan 文件与关键产物文件恢复上下文；
+  3. `read` `.self/plan/{YYYYMMDD}-{task_slug}/recon.md`、plan 文件与关键产物文件恢复上下文；
   4. 从首个未完成项继续，不推倒重来。
 
 ## 汇报模板
@@ -161,7 +163,7 @@ changelog:
 ## 注意事项
 
 - complex **无团队分工**；分工与 team 是 hard 专属能力。
-- **侦察先于规划**：先 `.self/recon.md`，再 todo，再 plan；三者缺一不可。
+- **侦察先于规划**：先 todo ，再`.self/plan/{YYYYMMDD}-{task_slug}/recon.md`，再 plan；三者缺一不可。
 - plan 未审核通过前不得正式实施修改；用户特殊要求跳过的，必须记录原因。
-- todo 状态以 `.self/todos.md` 为准，计划以 `.self/plan/xxx.md` 为准，勿在对话中口头跟踪。
+- todo 状态以 `.self/todos.md` 为准，计划以 `.self/plan/{YYYYMMDD}-{task_slug}/plan.md` 为准，勿在对话中口头跟踪。
 - 汇报先结论后细节；遗留项必须给出原因，不允许无声消失。

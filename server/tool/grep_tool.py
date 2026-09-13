@@ -26,6 +26,11 @@ DEFAULT_MAX_LINE_CHARS = 2000
 DEFAULT_MAX_TOTAL_CHARS = 100_000
 # 超长行截断时，在命中点前后保留的上下文宽度
 _MATCH_CONTEXT_CHARS = 1000
+# max_depth 的硬上限（防模型传超大值），0 表示不限深度
+_MAX_DEPTH_CAP = 100
+# exclude 的模式数量与单条长度上限（防超长 shell 参数 / 滥用）
+_MAX_EXCLUDE_PATTERNS = 50
+_MAX_EXCLUDE_PATTERN_CHARS = 256
 
 
 class GrepTool:
@@ -104,6 +109,38 @@ class GrepTool:
         suffix = "…" if end < len(line) else ""
         return prefix + seg + suffix, True
 
+    @staticmethod
+    def _parse_exclude(raw: Any) -> Tuple[List[str], str]:
+        """解析 exclude 参数（逗号分隔的 glob 列表）。
+
+        :param raw: 原始参数（缺省/空串表示不额外排除）
+        :return: ``(模式列表, 错误信息)``，错误信息非空表示参数非法
+        """
+        if raw is None or raw == "":
+            return [], ""
+        if not isinstance(raw, str):
+            return [], (
+                "exclude 必须为字符串（逗号分隔的 glob，"
+                "如 'node_modules,*.min.js'）"
+            )
+        patterns: List[str] = []
+        for item in raw.split(","):
+            pat = item.strip()
+            if not pat:
+                continue
+            if len(pat) > _MAX_EXCLUDE_PATTERN_CHARS:
+                return [], (
+                    f"exclude 模式过长（>{_MAX_EXCLUDE_PATTERN_CHARS} 字符）: "
+                    f"{pat[:_MAX_EXCLUDE_PATTERN_CHARS]}"
+                )
+            if any(ord(ch) < 32 for ch in pat):
+                return [], "exclude 模式不能包含控制字符/换行"
+            if pat not in patterns:  # 去重保序
+                patterns.append(pat)
+        if len(patterns) > _MAX_EXCLUDE_PATTERNS:
+            return [], f"exclude 模式过多（上限 {_MAX_EXCLUDE_PATTERNS} 个）"
+        return patterns, ""
+
     def get_tool_definition(self) -> Dict[str, Any]:
         """返回 OpenAI function calling 格式的工具定义。"""
         return {
@@ -133,6 +170,18 @@ class GrepTool:
                             "type": "boolean",
                             "description": "是否忽略大小写；缺省 false",
                         },
+                        "max_depth": {
+                            "type": "integer",
+                            "description": "目录递归深度上限：1 表示只搜索目标目录"
+                            "本层的文件（不进入子目录），N 表示最多向下 N 层；"
+                            "缺省 0 表示不限深度（上限 100）",
+                        },
+                        "exclude": {
+                            "type": "string",
+                            "description": "排除的文件/目录模式，逗号分隔的 glob"
+                            "（按名称匹配，如 'node_modules,*.min.js,build'）；"
+                            "缺省不额外排除（.git 始终排除）",
+                        },
                         "max_results": {
                             "type": "integer",
                             "description": "返回的最大匹配行数，缺省 200、上限 2000；"
@@ -154,6 +203,8 @@ class GrepTool:
             - path: 搜索范围（可选，缺省整个工作空间）
             - regex: 是否正则（可选，缺省 false）
             - ignore_case: 是否忽略大小写（可选，缺省 false）
+            - max_depth: 目录递归深度上限（可选，1=仅目标目录本层，缺省 0 不限）
+            - exclude: 排除的文件/目录 glob，逗号分隔（可选）
             - max_results: 返回行数上限（可选，缺省 200）
         :return: 成功 ``{"exit_code": 0, "matches": ["path:line", ...], "count": N,
                  "total": N, "truncated": bool, "line_truncated": bool,
@@ -180,6 +231,21 @@ class GrepTool:
 
         regex = bool(arguments.get("regex"))
         ignore_case = bool(arguments.get("ignore_case"))
+
+        # max_depth：缺省/空值按 0（不限深度）处理，负值归零，超上限截断
+        max_depth = 0
+        raw_depth = arguments.get("max_depth")
+        if raw_depth not in (None, ""):
+            try:
+                max_depth = int(raw_depth)
+            except (TypeError, ValueError):
+                return {"error": "max_depth 必须为整数（1 起为层数，0 表示不限）"}
+            max_depth = max(0, min(max_depth, _MAX_DEPTH_CAP))
+
+        exclude, exclude_err = self._parse_exclude(arguments.get("exclude"))
+        if exclude_err:
+            return {"error": exclude_err}
+
         try:
             max_results = int(arguments.get("max_results") or DEFAULT_MAX_RESULTS)
         except (TypeError, ValueError):
@@ -193,6 +259,8 @@ class GrepTool:
                 path=path if isinstance(path, str) else "",
                 regex=regex,
                 ignore_case=ignore_case,
+                max_depth=max_depth,
+                exclude=exclude,
             )
         )
 
@@ -225,15 +293,17 @@ class GrepTool:
 
         logger.info(
             "grep 工具搜索完成: pattern=%r path=%r regex=%s ignore_case=%s "
-            "命中=%d 返回=%d 单行截断=%s 总字符=%d",
-            pattern, path, regex, ignore_case, len(all_lines), len(retained),
-            line_truncated, total_chars,
+            "max_depth=%d exclude=%s 命中=%d 返回=%d 单行截断=%s 总字符=%d",
+            pattern, path, regex, ignore_case, max_depth, exclude,
+            len(all_lines), len(retained), line_truncated, total_chars,
         )
         return {
             "pattern": pattern,
             "path": path if isinstance(path, str) and path else ".",
             "regex": regex,
             "ignore_case": ignore_case,
+            "max_depth": max_depth,
+            "exclude": exclude,
             "exit_code": exit_code,
             "matches": retained,
             "count": len(retained),
