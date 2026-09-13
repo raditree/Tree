@@ -45,6 +45,12 @@ from plugin.registry import (  # noqa: F401
     scope_key,
 )
 from plugin.sdk import PluginSDK, bind_loop as _sdk_bind_loop  # noqa: F401
+from plugin.stations import (  # noqa: F401（对外门面 re-export）
+    STATION_READ_RESULT,
+    StationRequest,
+    StationSub,
+    StationsHub,
+)
 from plugin.watchdog import (  # noqa: F401
     DEFAULT_BEAT_INTERVAL,
     DEFAULT_STALL_SECONDS,
@@ -65,6 +71,8 @@ __all__ = [
     "shutdown",
     "publish_tool_event",
     "safe_publish",
+    "safe_process",
+    "get_stations",
     "init_plugin_system",
     "plugin_cascade",
     # 开关常量
@@ -87,6 +95,10 @@ __all__ = [
     "PluginSDK",
     "JoinBuffer",
     "JoinResult",
+    "StationsHub",
+    "StationSub",
+    "StationRequest",
+    "STATION_READ_RESULT",
 ]
 
 # 环境变量开关名（进程启动默认值）
@@ -104,6 +116,7 @@ _enabled = _read_env_enabled()
 _bus: Optional[EventBus] = None
 _registry: Optional[PluginRegistry] = None
 _watchdog: Optional[ProgressWatchdog] = None
+_stations: Optional[StationsHub] = None
 _initialized = False
 
 
@@ -136,18 +149,21 @@ def set_enabled(value: bool) -> None:
 # ----------------------------------------------------------------------
 def _ensure_initialized() -> None:
     """创建并启动单例组件（幂等，线程安全）。"""
-    global _bus, _registry, _watchdog, _initialized
+    global _bus, _registry, _watchdog, _stations, _initialized
     with _lock:
         if _initialized:
             return
         _watchdog = ProgressWatchdog()
         _bus = EventBus()
         _registry = PluginRegistry(bus=_bus, watchdog=_watchdog)
+        _stations = StationsHub(registry=_registry, watchdog=_watchdog)
         _bus.start()
         # D-12/C1：启动 TTL 周期清扫（空闲实例逐出；Pin 豁免；间隔 env 可配）
         _registry.start_sweeper()
         _initialized = True
-        logger.info("插件体系已初始化（bus/registry/watchdog + TTL 清扫就绪）")
+        logger.info(
+            "插件体系已初始化（bus/registry/watchdog/stations + TTL 清扫就绪）"
+        )
 
 
 def get_bus() -> EventBus:
@@ -171,6 +187,13 @@ def get_watchdog() -> ProgressWatchdog:
     return _watchdog
 
 
+def get_stations() -> StationsHub:
+    """获取处理站中枢单例（懒初始化）。"""
+    _ensure_initialized()
+    assert _stations is not None
+    return _stations
+
+
 def bind_loop(loop: Any) -> None:
     """绑定主事件循环（供 ws_push 等出站调度；可选，缺失时按兜底链尝试）。"""
     _sdk_bind_loop(loop)
@@ -189,18 +212,21 @@ def startup() -> None:
 
 def shutdown() -> None:
     """停止全部组件并置总开关为关（幂等；测试清理/进程退出用）。"""
-    global _initialized, _bus, _registry, _watchdog, _enabled
+    global _initialized, _bus, _registry, _watchdog, _stations, _enabled
     with _lock:
         if not _initialized and _bus is None:
             _enabled = False
             return
-        registry, bus = _registry, _bus
+        registry, bus, stations = _registry, _bus, _stations
         _initialized = False
         _bus = None
         _registry = None
         _watchdog = None
+        _stations = None
         _enabled = False
     try:
+        if stations is not None:
+            stations.reset()
         if registry is not None:
             registry.shutdown()
         if bus is not None:
@@ -286,6 +312,41 @@ def safe_publish(
         return False
 
 
+def safe_process(
+    station_id: str,
+    data: Any,
+    scope: Any = None,
+    *,
+    meta: Any = None,
+    cancel_event: Any = None,
+    timeout_s: Any = None,
+) -> Any:
+    """处理站安全触发入口（业务代码唯一允许调用的站入口；fail-open）。
+
+    - 总开关关闭 / 组件未初始化：原样返回 ``data``（零副作用，近零开销）；
+    - 有订阅：交由插件处理并回填（回填结果作为返回值）；
+    - 一切异常路径（无订阅/超时/取消/插件异常/非法回填/实例失效/队列满）：
+      原样返回 ``data`` + 分类计数（站内部统计），绝不抛出、绝不影响主链路。
+    """
+    if not _enabled:
+        return data
+    hub = _stations
+    if hub is None:
+        return data
+    try:
+        return hub.process(
+            station_id,
+            data,
+            scope,
+            meta=meta,
+            cancel_event=cancel_event,
+            timeout_s=timeout_s,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("处理站调用失败（已忽略，返回原数据）")
+        return data
+
+
 def init_plugin_system() -> None:
     """插件体系初始化挂载点（供 ``server/main.py`` lifespan 调用）。
 
@@ -324,10 +385,20 @@ def plugin_cascade(
     registry = _registry
     if registry is None:
         return 0
+    removed = 0
     try:
-        return registry.cascade_cleanup(
+        removed = registry.cascade_cleanup(
             user_id, team_id=team_id, agent_id=agent_id, session_id=session_id
         )
     except Exception:  # noqa: BLE001
         logger.exception("插件级联清理失败（已忽略，不影响主流程）")
-        return 0
+    # 处理站（半二期）：订阅随 scope 级联销毁（并入级联单点；失败不影响主流程）
+    hub = _stations
+    if hub is not None:
+        try:
+            hub.cascade_cleanup(
+                user_id, team_id=team_id, agent_id=agent_id, session_id=session_id
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("站订阅级联清理失败（已忽略，不影响主流程）")
+    return removed

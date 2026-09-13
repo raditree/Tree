@@ -6,6 +6,8 @@
 
 > **状态（2026-09-13）**：一期已接线（`main.py` lifespan 挂载 + `agent/routes.py`
 > 级联清理 4 处）；**默认关闭**，设 `TREE_PLUGIN_ENABLED=1` 并重启后端进程生效。
+> **半二期处理站已实施**（`stations.py` + read 结果站接入；默认无订阅=零影响，
+> 见「处理站（半二期）」章节）。
 > 联调对齐：知遥 isolation/async v2 + 栖迟 core 四件套 **64 passed + 1 skipped**
 > （skip = J5 活跃组上限，见文末差异清单）；全量回归相对基线零破坏。
 
@@ -13,13 +15,15 @@
 
 | 文件 | 职责 | ADR 对应 |
 |------|------|----------|
-| `__init__.py` | 模块门面：总开关 / 单例获取 / 生命周期 / 埋点入口（safe_publish）/ 级联清理入口（plugin_cascade） | — |
+| `__init__.py` | 模块门面：总开关 / 单例获取 / 生命周期 / 埋点入口（safe_publish）/ 处理站入口（safe_process）/ 级联清理入口（plugin_cascade） | — |
 | `bus.py` | 事件总线：统一信封、非阻塞发布、scope/type 过滤、异步分发、有界队列背压（drop_oldest） | D1 / D4 / D9 |
 | `registry.py` | 插件实例注册表：实例按 scope 四元组隔离、TTL/Pin（周期清扫驱动）、级联清理（cascade_cleanup）、实例内串行 | D2 / D3 |
 | `watchdog.py` | 通用看门狗：进度续期 + 滑窗判死（10s/60s）+ fail-closed 归属校验；实例级心跳 | D7 |
 | `sdk.py` | 受控出站 SDK：workspace / dispatch / ws / log（白名单 + scope 强校验） | D6 |
 | `join.py` | join 最小原语：键值/计数齐备 + 超时 + partial 交付 | D5 |
+| `stations.py` | 处理站（半二期）：站×scope 键位唯一订阅、触发/等待/回填、fail-open 降级、分类计数 | D-PS1..PS7 |
 | `plugins/architecture_analyzer.py` | 示例插件：订阅工具事件 → 读工作空间 → 推送摘要（三站全链路） | 一期示范 |
+| `plugins/read_station_demo.py` | 处理站示范插件：read 结果加标记前缀（确定性转换；E2E 载体） | 半二期示范 |
 
 ## 总开关（默认关闭；关闭时零副作用）
 
@@ -123,6 +127,65 @@ plugin.safe_publish(
   `user_id` 为空的事件拒绝发布；
 - 兼容包装 `plugin.publish_tool_event(session, ...)` 保留（内部经 `safe_publish`）。
 
+## 处理站（半二期：read 结果站）
+
+**定位**：数据流拦截点——数据流入站时触发订阅插件（**站 × scope 键位唯一**，
+先到先得），插件处理后回填为最终数据。本期接入 1 个站：`tool.read.result`
+（read 工具返回前；`stringify` 后、`redirect` 前单点替换——插件拿到**完整原始
+结果**，处理结果仍受 redirect 门控兜底，工具面板展示与上下文自动同值）。
+图像本体 / AskUser 直通；图像摘要文本随文本结果经站；仅成功结果触发（错误结果直通）。
+
+**订阅（插件侧，一键）**：
+
+```python
+from plugin import get_stations
+from plugin.stations import STATION_READ_RESULT, StationRequest
+
+def on_station(req: StationRequest):
+    return f"[已处理] {req.data}"   # str=替换；None=不改动；其它类型=非法（走降级）
+
+get_stations().subscribe(STATION_READ_RESULT, "my_plugin", on_station,
+                         granularity="agent", scope={"user_id": "u", "agent_id": "a"})
+# 便捷演示入口：plugins/read_station_demo.py::register_demo_plugin(scope=...)
+```
+
+**系统侧触发（单点）**：`plugin.safe_process(station_id, data, scope, meta=…, cancel_event=…, timeout_s=…)`
+
+- 无订阅 / 总开关关闭：原样返回（近零开销；2000 次调用实测 ~6.5ms）；
+- 有订阅：交由插件处理并等待回填（超时默认 30s，env `PLUGIN_STATION_TIMEOUT_S` 可配；
+  等待分段 `PLUGIN_STATION_WAIT_SLICE_S` 默认 0.5s——决定取消/失效发现延迟）。
+
+**降级（fail-open 红线）**：无订阅 / 超时 / 取消 / 插件异常 / 非法回填 / 实例失效 /
+队列满 → **一律放行原数据** + 分类计数（`get_stations().stats()["counts"]`）：
+
+| 计数键 | 含义 |
+|---|---|
+| `requests` / `responded` | 进入处理流程 / 有效回填（str 或 None） |
+| `timeout` / `cancelled` | 超时 / 取消与在途失效（含实例销毁；≤1 等待段发现） |
+| `no_subscriber` / `rejected_conflict` | 0 命中 / 订阅冲突被拒（先到先得） |
+| `invalid_response` / `overflow` / `handler_error` | 非法回填 / 队列满 / 插件异常 |
+| `late_response` / `duplicate_response` | 迟到 / 重复回填（respond 先到先赢，无效化） |
+| `reentrant_bypass` | 防重入立即放行（同实例 worker 线程内触发；F1 裁决补） |
+| `unsubscribed` / `subscriptions_cascaded` / `internal_errors` | 退订 / 级联清理 / 兜底异常 |
+
+**插件约束（handler 内）**：
+
+1. 请勿在 handler 内**同步**触发同实例站——框架已作防重入 bypass 消解（立即放行 +
+   `reentrant_bypass` 计数），属兜底而非推荐用法；
+2. 请避免同步链中的**跨实例环形等待**——超时兜底有界（默认 30s），但会消耗等待预算；
+   链深上限列二期；
+3. 等待期与降级语义（切片 / 取消 / 超时 / fail-open 分类）参见上方「降级」与计数表。
+
+**演示与自测**（确定性、不经 LLM）：
+
+```bat
+server\.venv\Scripts\python.exe .output\plugin_station_demo.py     :: 端到端：替换/放行/超时降级
+server\.venv\Scripts\python.exe .output\plugin_station_selftest.py :: 自测 19 项（全绿）
+```
+
+**真实链路观察**（部署后）：设 `TREE_PLUGIN_ENABLED=1` 重启 → 注册示范插件 →
+agent 调用 read → 工具结果应带 `[处理站示范]` 前缀。
+
 ## 测试与演示
 
 ```bat
@@ -135,6 +198,10 @@ server\.venv\Scripts\python.exe .output\plugin_demo.py
 
 :: C1 验证：TTL 周期清扫实测（小 TTL 常量；日志：.output/plugin_c1_ttl_sweep.log）
 server\.venv\Scripts\python.exe .output\plugin_c1_ttl_sweep_demo.py
+
+:: 处理站（半二期）演示 + 自测
+server\.venv\Scripts\python.exe .output\plugin_station_demo.py
+server\.venv\Scripts\python.exe .output\plugin_station_selftest.py
 
 :: 全量回归（对比基线：621 passed → 685 passed / 1 skipped，零破坏；含 D-08 +4 用例）
 cd server && .venv\Scripts\python.exe -m pytest tests/ -q

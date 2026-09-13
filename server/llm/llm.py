@@ -1051,6 +1051,37 @@ class AgentLLMSession:
 
                     # dict 结果提取可读内容，避免前端显示原始 dict 字符串
                     result_str = _stringify_tool_result(result)
+                    # 处理站（半二期）单点替换：read 结果返回前经订阅插件处理
+                    # （stringify 后、redirect 前；无订阅/关闭零副作用；失败
+                    # fail-open 放行原数据，绝不影响工具主链路）
+                    if tc["name"] == "read" and not (
+                        isinstance(result, dict) and bool(result.get("error"))
+                    ):
+                        try:
+                            from plugin import safe_process as _plugin_safe_process
+
+                            result_str = _plugin_safe_process(
+                                "tool.read.result",
+                                result_str,
+                                scope={
+                                    "user_id": str(getattr(self, "user_id", "") or ""),
+                                    "team_id": str(getattr(self, "team_id", "") or ""),
+                                    "agent_id": str(
+                                        getattr(self, "agent_id", "") or ""
+                                    ),
+                                    "session_id": str(
+                                        getattr(self, "session_id", "") or ""
+                                    ),
+                                },
+                                meta={"tool_name": "read"},
+                                cancel_event=(
+                                    cancel_event
+                                    if cancel_event is not None
+                                    else self.cancel_event
+                                ),
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.debug("处理站调用失败（已忽略）", exc_info=True)
                     # 工具结果大小门控：超长结果重定向到 .self 文件，
                     # 上下文/前端/历史表三处均只携带重定向提示
                     result_str = self._maybe_redirect_result(

@@ -128,7 +128,8 @@ class PluginInstance:
         self.dropped = 0
         self.errors = 0
 
-        self.inbox: "queue.Queue[Optional[PluginEvent]]" = queue.Queue(
+        # 队列元素：PluginEvent（事件）/ callable（站任务，半二期）/ None（哨兵）
+        self.inbox: "queue.Queue[Any]" = queue.Queue(
             maxsize=int(inbox_max)
         )
         self.subscription: Optional[Subscription] = None
@@ -162,6 +163,24 @@ class PluginInstance:
             self.dropped += 1
             logger.warning(
                 "插件实例队列已满，丢弃事件: %s key=%s", self.name, self.key
+            )
+            return False
+
+    def offer_task(self, task: Callable[[], None]) -> bool:
+        """非阻塞投递一个任务到实例队列（半二期：处理站请求复用实例 worker）。
+
+        与 ``offer`` 同一背压语义（满则丢弃 + ``dropped`` 计数 + 返回 False）。
+        任务由 worker 按 FIFO 与事件串行执行（实例内串行语义不变）。
+        """
+        if not self.alive or not callable(task):
+            return False
+        try:
+            self.inbox.put_nowait(task)
+            return True
+        except queue.Full:
+            self.dropped += 1
+            logger.warning(
+                "插件实例队列已满，丢弃任务: %s key=%s", self.name, self.key
             )
             return False
 
@@ -202,7 +221,12 @@ class PluginInstance:
                 # 停止哨兵
                 return
             try:
-                self.handler(event)
+                if callable(event):
+                    # 半二期允许点②：站任务分派（处理站请求复用实例 worker）。
+                    # 事件对象不可调用——事件分支行为与一期完全一致。
+                    event()
+                else:
+                    self.handler(event)
                 self.processed += 1
             except Exception:  # noqa: BLE001
                 self.errors += 1
@@ -274,12 +298,16 @@ class PluginRegistry:
         pin: bool = False,
         idle_ttl: float = DEFAULT_IDLE_TTL,
         name: str = "",
+        inbox_max: Optional[int] = None,
     ) -> PluginInstance:
         """注册（或幂等复用）一个插件实例。
 
         同一 (plugin_id, 粒度, scope) 已存在且存活时复用现有实例
         （更新 handler / 订阅类型 / Pin 标记），否则创建新实例
         （启动 worker，并在绑定总线时自动挂上订阅）。
+
+        :param inbox_max: 实例队列容量（仅新建实例时生效；None=默认
+            ``DEFAULT_INBOX_MAX``；半二期测试注入用）。
         """
         inst = PluginInstance(
             plugin_id,
@@ -289,6 +317,9 @@ class PluginRegistry:
             event_types=event_types,
             pin=pin,
             idle_ttl=idle_ttl,
+            inbox_max=(
+                int(inbox_max) if inbox_max is not None else DEFAULT_INBOX_MAX
+            ),
             watchdog=self._watchdog,
             name=name,
         )
