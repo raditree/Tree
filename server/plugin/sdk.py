@@ -223,9 +223,16 @@ class PluginSDK:
     # 能力 1：workspaceIO（读 / 写）
     # ------------------------------------------------------------------
     def workspace_read(
-        self, path: str, workspace_id: Optional[str] = None
+        self,
+        path: str,
+        workspace_id: Optional[str] = None,
+        encoding: str = "utf-8",
     ) -> Dict[str, Any]:
-        """读取工作空间文件（经统一 WorkspaceIO 通道；三模式路径语义一致）。"""
+        """读取工作空间文件（经统一 WorkspaceIO 通道；三模式路径语义一致）。
+
+        :param encoding: 文本编码（M3 新增可选参，缺省 utf-8 兼容既有调用；
+            非法/解码失败按 fail-open 返回 ``{"error": ...}``，绝不抛出）。
+        """
         try:
             ws = self._resolve_workspace_id(workspace_id)
         except PermissionError as exc:
@@ -235,7 +242,14 @@ class PluginSDK:
             io = provider(self.scope["user_id"], self._mode_key())
             from io_.workspace_io import run_io  # noqa: PLC0415
 
-            result = run_io(io.read_file(ws, str(path)))
+            try:
+                pending = io.read_file(
+                    ws, str(path), encoding=str(encoding or "utf-8")
+                )
+            except TypeError:
+                # 兼容不接受 encoding 形参的既有 provider（按默认编码读取）
+                pending = io.read_file(ws, str(path))
+            result = run_io(pending)
             if isinstance(result, dict):
                 return result
             return {"error": "workspace_read 返回异常结果"}

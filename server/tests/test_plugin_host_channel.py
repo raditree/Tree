@@ -4,8 +4,8 @@ r"""二期 M2 专项：宿主通道 CH 组（独立验证 · 矩阵 CH1–CH8）
 - CH1/CH3 全链序列 + 计数账本（start→status→stop 逐步对账）；
 - CH3 边界：lost 会话再 start → 不复用、新会话替换（重连重建语义）；
 - CH4 边界：reconcile 探测上限（>16 lost → 单轮 ≤16 防风暴，逐轮收敛）；
-- CH6 传输异常（executor raise）→ fail-closed 且异常不外抛（含 stop 异常路径
-  的 lost 语义记录，供差异核对）；
+- CH6 传输异常（executor raise）→ fail-closed 且异常不外抛（stop 异常路径补标
+  lost——写路径三失败分支一致，CH6 修正后口径）；
 - 缩参三通道：env（PLUGIN_HOST_OP_TIMEOUT_S / STOP_WAIT_S）/ 构造 / 时钟注入
   （created_at / updated_at）；
 - 观测：stats() lost/closed 汇总；并发 start 收敛（观测性，防孤儿）。
@@ -219,7 +219,7 @@ class TestReconcileCapAndStats(unittest.TestCase):
 
 
 class TestFailClosedTransport(unittest.TestCase):
-    """CH6：传输异常 fail-closed（异常不外抛；含 stop 异常路径的记录）。"""
+    """CH6：传输异常 fail-closed（异常不外抛；stop 异常路径补标 lost——修正后口径）。"""
 
     def setUp(self):
         self.ch = _make_channel()
@@ -245,7 +245,8 @@ class TestFailClosedTransport(unittest.TestCase):
         r2 = self.ch.query_status(self.ex, self.ws, U1, "phs_1", team_id=T1)
         self.assertIn("error", r2)
         self.assertEqual(self.ch.stats()["counts"]["status_failed"], 1)
-        # stop 异常（记录：异常路径不标记 lost——与"宿主返回 error"路径的差异核对点）
+        # stop 异常（修正后口径：写路径三失败分支一致标 lost——异常路径与
+        # "无执行器"/"宿主返回 error"对齐，交重连对账；下方断言核对）
         self.ex.raise_on = {OP_HOST_STOP}
         r3 = self.ch.stop_session(self.ex, self.ws, U1, "phs_1", team_id=T1)
         self.assertFalse(r3["ok"])

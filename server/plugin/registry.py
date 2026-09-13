@@ -148,6 +148,10 @@ class PluginInstance:
         self.processed = 0
         self.dropped = 0
         self.errors = 0
+        # M3：停用联动状态（巡检判死/F3 达阈；disabled_reason 供面板呈现）
+        self.disabled = False
+        self.disabled_reason = ""
+        self.handler_error_streak = 0
 
         # 队列元素：PluginEvent（事件）/ callable（站任务，半二期）/ None（哨兵）
         self.inbox: "queue.Queue[Any]" = queue.Queue(
@@ -167,7 +171,7 @@ class PluginInstance:
 
     def matches(self, event: PluginEvent) -> bool:
         """事件匹配（type + scope，fail-closed 方向）。"""
-        if not self.alive:
+        if not self.alive or self.disabled:
             return False
         if self.event_types is not None and event.type not in self.event_types:
             return False
@@ -175,7 +179,7 @@ class PluginInstance:
 
     def offer(self, event: PluginEvent) -> bool:
         """非阻塞投递到实例队列（满则丢弃 + 计数）。"""
-        if not self.alive:
+        if not self.alive or self.disabled:
             return False
         try:
             self.inbox.put_nowait(event)
@@ -193,7 +197,7 @@ class PluginInstance:
         与 ``offer`` 同一背压语义（满则丢弃 + ``dropped`` 计数 + 返回 False）。
         任务由 worker 按 FIFO 与事件串行执行（实例内串行语义不变）。
         """
-        if not self.alive or not callable(task):
+        if not self.alive or self.disabled or not callable(task):
             return False
         try:
             self.inbox.put_nowait(task)
@@ -215,6 +219,20 @@ class PluginInstance:
         """距最近一次活跃的秒数（TTL 判定用）。"""
         current = time.time() if now is None else float(now)
         return current - self.last_active
+
+    # ------------------------------------------------------------------
+    # M3：站处理结果计数（F3 连续失败；与判死独立计数）
+    # ------------------------------------------------------------------
+    def note_station_error(self) -> int:
+        """站点 handler 异常 +1（返回当前连续失败计数）。"""
+        with self._lock:
+            self.handler_error_streak += 1
+            return int(self.handler_error_streak)
+
+    def note_station_success(self) -> None:
+        """站点 handler 成功 → 连续失败计数重置（F3 纯计数语义）。"""
+        with self._lock:
+            self.handler_error_streak = 0
 
     # ------------------------------------------------------------------
     # worker：实例内串行处理
@@ -286,6 +304,8 @@ class PluginInstance:
             "errors": self.errors,
             "inbox": self.inbox.qsize(),
             "last_active": self.last_active,
+            "disabled": self.disabled,
+            "disabled_reason": self.disabled_reason,
         }
 
 
@@ -301,6 +321,11 @@ class PluginRegistry:
         self._instances: Dict[str, PluginInstance] = {}
         self._bus = bus
         self._watchdog = watchdog or ProgressWatchdog()
+        try:
+            # M3：巡检"连续判死达阈 → 停用实例"回调接线（fail-safe；幂等）
+            self._watchdog.set_disable_handler(self._on_watchdog_disable)
+        except Exception:  # noqa: BLE001
+            logger.debug("看门狗停用回调接线失败（忽略）", exc_info=True)
         # TTL 周期清扫线程（D-12/C1：显式 start_sweeper() 后启动）
         self._sweeper: Optional[threading.Thread] = None
         self._sweeper_stop = threading.Event()
@@ -350,6 +375,9 @@ class PluginRegistry:
         # 通过检查、后者覆盖前者，前者成为"不在注册表、却已启动 worker/订阅"
         # 的孤儿实例（重复投递/泄漏）。归并后任何线程要么自己插入、要么必然
         # 看到先插入的实例并复用，不再存在孤儿窗口。
+        reuse = False
+        recovered = False
+        existing: Optional[PluginInstance] = None
         with self._lock:
             existing = self._instances.get(key)
             if existing is not None and existing.alive:
@@ -358,9 +386,24 @@ class PluginRegistry:
                 existing.event_types = inst.event_types
                 existing.pin = bool(pin)
                 existing.touch()
-                return existing
-            # 不存在（或旧实例已停）→ 同一临界区内立即插入
-            self._instances[key] = inst
+                reuse = True
+                if existing.disabled:
+                    # M3：重新注册 = 恢复信号（停用联动；清标记后按常规规则）
+                    existing.disabled = False
+                    existing.disabled_reason = ""
+                    existing.handler_error_streak = 0
+                    recovered = True
+            else:
+                existing = None
+                # 不存在（或旧实例已停）→ 同一临界区内立即插入
+                self._instances[key] = inst
+        if reuse and existing is not None:
+            if recovered:
+                logger.info("插件实例恢复（重新注册）: %s", key)
+                _emit_status_safe(
+                    existing.plugin_id, existing.scope, "registered", inst_key=key
+                )
+            return existing
         inst.start_worker()
         inst.touch()
         if self._bus is not None:
@@ -405,6 +448,48 @@ class PluginRegistry:
             inst.plugin_id, inst.scope, "destroyed", reason=reason, inst_key=key
         )
         return True
+
+    def disable(self, instance: Any, reason: str = "") -> bool:
+        """停用实例（M3 巡检 / F3 联动；幂等，只增不改）。
+
+        停用语义（契约 §13.10）：
+
+        - 不再接收新事件 / 站任务（``matches`` / ``offer`` / ``offer_task`` 拒绝）；
+        - 站请求按"实例不可用"路径 fail-open 直通（归因 ``no_subscriber`` + 日志）；
+        - 订阅记录保留（不主动清扫）；面板 / status 呈现 ``disabled`` + reason；
+        - 重新注册同键实例 = 恢复信号（清停用标记，发 ``registered``）。
+
+        :return: 本次是否发生"停用→生效"跃迁（重复停用返回 False）
+        """
+        if isinstance(instance, PluginInstance):
+            key = instance.instance_key()
+            inst: Optional[PluginInstance] = instance
+        else:
+            key = str(instance)
+            inst = self.get(key)
+        if inst is None or not inst.alive:
+            return False
+        with self._lock:
+            if inst.disabled:
+                return False
+            inst.disabled = True
+            inst.disabled_reason = str(reason or "")
+        logger.warning("插件实例已停用: %s reason=%s", key, inst.disabled_reason)
+        _emit_status_safe(
+            inst.plugin_id,
+            inst.scope,
+            "disabled",
+            reason=inst.disabled_reason,
+            inst_key=key,
+        )
+        return True
+
+    def _on_watchdog_disable(self, instance_key: str, reason: str) -> None:
+        """看门狗巡检回调：连续判死达阈 → 停用对应实例（fail-safe）。"""
+        try:
+            self.disable(str(instance_key), reason=str(reason or "watchdog_dead"))
+        except Exception:  # noqa: BLE001
+            logger.debug("巡检停用处理异常（忽略）: %s", instance_key, exc_info=True)
 
     # ------------------------------------------------------------------
     # 生命周期：TTL / 级联清理

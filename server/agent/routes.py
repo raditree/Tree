@@ -59,7 +59,7 @@ from data.session_store import (
     touch_session,
     update_session_title_from_first_message,
 )
-from ws.auth import get_current_user
+from ws.auth import _user_id_of, get_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -1106,10 +1106,12 @@ async def get_plugin_snapshot(
     """插件面板只读快照（二期 M1-b；契约 §15.1）。
 
     - 未启用（默认）/ 组件未初始化：返回 ``enabled=false`` 骨架（200）；
-    - 按 user 过滤（token 归属）；可选 ``team_id`` 进一步过滤；
-    - 只读、无副作用。
+    - 按 user 过滤（token 归属；``openid``/``id`` 兼容提取）；可选 ``team_id`` 进一步过滤；
+    - 归属为空 fail-closed（不得因空值放行全量）；只读、无副作用。
     """
-    user_id = current_user.get("openid", "")
+    user_id = _user_id_of(current_user or {})
+    if not user_id:
+        return {"success": False, "error": "缺少用户归属"}
     from plugin import get_snapshot  # noqa: PLC0415（懒 import：插件模块按需加载）
 
     return get_snapshot(user_id=user_id, team_id=team_id or "")

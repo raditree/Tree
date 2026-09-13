@@ -8,10 +8,13 @@
 > 级联清理 4 处）；**默认关闭**，设 `TREE_PLUGIN_ENABLED=1` 并重启后端进程生效。
 > **半二期处理站已实施**（`stations.py` + read 结果站接入；默认无订阅=零影响，
 > 见「处理站（半二期）」章节）。
-> **二期 M1 已提交**（plugin_status + 面板快照）；**M2 已实施**（宿主通道后端承接面
-> + 示范插件自动注册；见「宿主通道（二期 M2）」章节）。
+> **二期 M1/M2 已提交**（plugin_status + 面板快照；宿主通道后端承接面 + 示范插件
+> 自动注册）；**M3 工程小件已实施**（巡检联动 / F3 / 防呆 / 链深 / F5 / read
+> encoding；见「M3 工程小件（二期 M3）」章节）。
 > 联调对齐：知遥 isolation/async v2 + 栖迟 core 四件套 **64 passed + 1 skipped**
-> （skip = J5 活跃组上限，见文末差异清单）；全量回归相对基线零破坏。
+> （skip = J5 活跃组上限，见文末差异清单）；**全量回归 810 passed / 1 skipped /
+> 23 subtests / 0 failed**（对照 M2 收口 783：净增 +27＝M3 新增 21 + EN1 先行 6，
+> 零破坏）。
 
 ## 模块结构
 
@@ -19,11 +22,11 @@
 |------|------|----------|
 | `__init__.py` | 模块门面：总开关 / 单例获取 / 生命周期 / 埋点入口（safe_publish）/ 处理站入口（safe_process）/ 级联清理入口（plugin_cascade） | — |
 | `bus.py` | 事件总线：统一信封、非阻塞发布、scope/type 过滤、异步分发、有界队列背压（drop_oldest） | D1 / D4 / D9 |
-| `registry.py` | 插件实例注册表：实例按 scope 四元组隔离、TTL/Pin（周期清扫驱动）、级联清理（cascade_cleanup）、实例内串行 | D2 / D3 |
-| `watchdog.py` | 通用看门狗：进度续期 + 滑窗判死（10s/60s）+ fail-closed 归属校验；实例级心跳 | D7 |
+| `registry.py` | 插件实例注册表：实例按 scope 四元组隔离、TTL/Pin（周期清扫驱动）、级联清理（cascade_cleanup）、实例内串行；M3：`disable`（判死/F3 联动） | D2 / D3 |
+| `watchdog.py` | 通用看门狗：进度续期 + 滑窗判死（10s/60s）+ fail-closed 归属校验；实例级心跳；**M3 巡检循环**（判死双阈值 → 停用联动） | D7 / D-P2-7 |
 | `sdk.py` | 受控出站 SDK：workspace / dispatch / ws / log（白名单 + scope 强校验） | D6 |
 | `join.py` | join 最小原语：键值/计数齐备 + 超时 + partial 交付 | D5 |
-| `stations.py` | 处理站（半二期）：站×scope 键位唯一订阅、触发/等待/回填、fail-open 降级、分类计数 | D-PS1..PS7 |
+| `stations.py` | 处理站（半二期）：站×scope 键位唯一订阅、触发/等待/回填、fail-open 降级、分类计数；M3：防呆/链深/F3/F5 | D-PS1..PS7 |
 | `host.py` | 宿主通道（二期 M2）：`plugin_host_*` op 承接 / 会话表 / 清理契约四场景 / fail-closed 计数 | D-P2-5 |
 | `plugins/architecture_analyzer.py` | 示例插件：订阅工具事件 → 读工作空间 → 推送摘要（三站全链路） | 一期示范 |
 | `plugins/read_station_demo.py` | 处理站示范插件：read 结果加标记前缀（确定性转换；E2E 载体） | 半二期示范 |
@@ -93,7 +96,7 @@ plugin.get_bus().publish("tool.call.completed", scope, {"tool_name": "read"}, so
 
 | 方法 | 说明 |
 |------|------|
-| `workspace_read(path, workspace_id=None)` / `workspace_write(path, content, workspace_id=None)` | 读 / 写工作空间（workspace_id 白名单：agent_id / team_id） |
+| `workspace_read(path, workspace_id=None, encoding="utf-8")` / `workspace_write(path, content, workspace_id=None)` | 读 / 写工作空间（workspace_id 白名单：agent_id / team_id；M3：read 支持 `encoding` 可选参，非法编码 fail-open） |
 | `dispatch_agent_message(target_ids, content, ...)` / `push_to_agent(target_ids, content, session_id="")` | 向 agent 推送（默认 `active=False` 防循环；后为契约 §7 别名） |
 | `ws_push({"type": "plugin_*", ...})` / `emit_frontend(event_type, data)` | 向前端推送（需主循环绑定；后为契约 §7 别名，构造 `plugin_event` 消息） |
 | `activity_log(message)` / `log_activity(message)` | 追加活动日志（后为契约 §7 别名） |
@@ -168,15 +171,15 @@ get_stations().subscribe(STATION_READ_RESULT, "my_plugin", on_station,
 | `no_subscriber` / `rejected_conflict` | 0 命中 / 订阅冲突被拒（先到先得） |
 | `invalid_response` / `overflow` / `handler_error` | 非法回填 / 队列满 / 插件异常 |
 | `late_response` / `duplicate_response` | 迟到 / 重复回填（respond 先到先赢，无效化） |
-| `reentrant_bypass` | 防重入立即放行（同实例 worker 线程内触发；F1 裁决补） |
+| `reentrant_bypass` / `loop_bypass` / `chain_bypass` | 防重入 / M3 防呆（事件循环线程内同步触发）/ 链深超限——均为立即放行 |
 | `unsubscribed` / `subscriptions_cascaded` / `internal_errors` | 退订 / 级联清理 / 兜底异常 |
 
 **插件约束（handler 内）**：
 
 1. 请勿在 handler 内**同步**触发同实例站——框架已作防重入 bypass 消解（立即放行 +
    `reentrant_bypass` 计数），属兜底而非推荐用法；
-2. 请避免同步链中的**跨实例环形等待**——超时兜底有界（默认 30s），但会消耗等待预算；
-   链深上限列二期；
+2. 请避免同步链中的**跨实例环形等待**——M3 已加**链深上限**兜底（超限立即放行 +
+   `chain_bypass` 计数；默认上限 8、可配），超时兜底仍保留；
 3. 等待期与降级语义（切片 / 取消 / 超时 / fail-open 分类）参见上方「降级」与计数表。
 
 **演示与自测**（确定性、不经 LLM）：
@@ -244,6 +247,31 @@ SSH 退出上报=status 探测可知（watcher 列后续批次）。
   未启用时返回 `enabled=false` 骨架（200）。前端触点＝右栏第 5 Tab（防御式解析）。
 - 测试：`tests/test_plugin_status.py` / `tests/test_plugin_snapshot.py`。
 
+## M3 工程小件（二期 M3）
+
+- **巡检联动（D-P2-7）**：看门狗巡检循环（默认 10s 检查；随插件体系初始化启动、
+  `plugin.shutdown()` 停止）。连续 `dead_strikes`（默认 2）轮无进度 / 超
+  `max_run_seconds` → 判死该 run（累计 `runs_judged_dead`，供快照
+  `watchdog.judged_dead`）；同一实例**连续判死 ≥2**（`MAX_CONSECUTIVE_DEAD`）→
+  停用实例（`plugin_status(disabled)` + `disabled_reason="watchdog_dead"`）。
+- **停用联动（契约 §13.10）**：站请求按“实例不可用”路径 **fail-open 直通**
+  （归因 `no_subscriber` + 日志 `disabled`）；订阅记录保留；重新注册同键实例 =
+  恢复信号（清停用标记）。
+- **F3（纯计数）**：站 handler 连续异常 ≥ `PLUGIN_STATION_ERROR_THRESHOLD`（默认 3）
+  → 停用（`disabled_reason="handler_error"`）；任一次成功重置；与判死独立计数。
+- **防呆（事件循环线程）**：`process()` 快速路径检测主 loop 线程（判据 A=bind 时
+  记录 ident + B=running-loop 叠加）→ 立即放行 + `loop_bypass`（绝不阻塞事件循环）。
+- **链深上限**：嵌套等待链深达 `PLUGIN_STATION_CHAIN_MAX`（默认 8）→ 立即放行 +
+  `chain_bypass`（跨实例环防护，补 F1 同实例判定之外的面）。
+- **F5 日志前缀**：站日志统一 `[plugin:station:<site>]`。
+- **read encoding**：`sdk.workspace_read(path, workspace_id=None, encoding="utf-8")`；
+  非法编码 fail-open 返回 `{"error": ...}`（不抛出）。
+- **参数（构造参数优先、env 覆盖）**：`PLUGIN_WATCHDOG_CHECK_INTERVAL_S`（10s）、
+  `PLUGIN_WATCHDOG_DEAD_STRIKES`（2）、`PLUGIN_WATCHDOG_MAX_CONSECUTIVE_DEAD`（2）、
+  `PLUGIN_STATION_ERROR_THRESHOLD`（3）、`PLUGIN_STATION_CHAIN_MAX`（8）。
+- 测试：`tests/test_plugin_m3_patrol.py`（9 例）+ `tests/test_plugin_m3_guard.py`
+  （12 例）→ **21 passed**。
+
 ## 测试与演示
 
 ```bat
@@ -265,7 +293,11 @@ server\.venv\Scripts\python.exe .output\plugin_c1_ttl_sweep_demo.py
 server\.venv\Scripts\python.exe .output\plugin_station_demo.py
 server\.venv\Scripts\python.exe .output\plugin_station_selftest.py
 
-:: 全量回归（当前 774 passed / 1 skipped / 23 subtests；对照 M1 基线 759+1+23 净增 +15、零破坏）
+:: M3 专项（巡检/判死停用/F3 + 防呆/链深/F5/read encoding）
+cd server && .venv\Scripts\python.exe -m pytest tests/test_plugin_m3_patrol.py tests/test_plugin_m3_guard.py -q
+::  → 21 passed
+
+:: 全量回归（当前 810 passed / 1 skipped / 23 subtests；对照 M2 收口 783+1+23 净增 +27、零破坏）
 cd server && .venv\Scripts\python.exe -m pytest tests/ -q
 ```
 

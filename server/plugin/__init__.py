@@ -23,6 +23,10 @@ join 最小原语（D5）、白名单埋点（llm.py 工具执行处）+ 1 个�
   执行器（重）注册处调用 ``plugin_host_reconcile``（best-effort 对账）；
 - 示范插件自动注册（D-P2-6，默认关）：``TREE_PLUGIN_DEMO_READ_STATION=1`` +
   ``TREE_PLUGIN_DEMO_SCOPE="user_id=..."``（重启生效；零协议面）；
+- M3 工程小件（均可配/可注入）：巡检循环（``PLUGIN_WATCHDOG_CHECK_INTERVAL_S``；
+  判死阈值 ``PLUGIN_WATCHDOG_DEAD_STRIKES`` / ``PLUGIN_WATCHDOG_MAX_CONSECUTIVE_DEAD``）；
+  F3 阈值 ``PLUGIN_STATION_ERROR_THRESHOLD``；链深上限 ``PLUGIN_STATION_CHAIN_MAX``；
+  站防呆 ``loop_bypass`` / 链深 ``chain_bypass`` 计数；SDK ``workspace_read(..., encoding=...)``；
 - 启用方式：设 ``TREE_PLUGIN_ENABLED=1`` 后重启后端进程生效。
 """
 
@@ -66,6 +70,9 @@ from plugin.stations import (  # noqa: F401（对外门面 re-export）
 )
 from plugin.watchdog import (  # noqa: F401
     DEFAULT_BEAT_INTERVAL,
+    DEFAULT_CHECK_INTERVAL,
+    DEFAULT_DEAD_STRIKES,
+    DEFAULT_MAX_CONSECUTIVE_DEAD,
     DEFAULT_STALL_SECONDS,
     ProgressWatchdog,
 )
@@ -112,6 +119,9 @@ __all__ = [
     "ProgressWatchdog",
     "DEFAULT_BEAT_INTERVAL",
     "DEFAULT_STALL_SECONDS",
+    "DEFAULT_CHECK_INTERVAL",
+    "DEFAULT_DEAD_STRIKES",
+    "DEFAULT_MAX_CONSECUTIVE_DEAD",
     "PluginSDK",
     "JoinBuffer",
     "JoinResult",
@@ -245,9 +255,14 @@ def _ensure_initialized() -> None:
         _bus.start()
         # D-12/C1：启动 TTL 周期清扫（空闲实例逐出；Pin 豁免；间隔 env 可配）
         _registry.start_sweeper()
+        # M3/D-P2-7：启动看门狗巡检循环（check 周期 env 可配；判死/停用联动就绪）
+        try:
+            _watchdog.start()
+        except Exception:  # noqa: BLE001
+            logger.exception("看门狗巡检循环启动失败（忽略，不影响主流程）")
         _initialized = True
         logger.info(
-            "插件体系已初始化（bus/registry/watchdog/stations/host + TTL 清扫就绪）"
+            "插件体系已初始化（bus/registry/watchdog/stations/host + TTL 清扫 + 巡检就绪）"
         )
 
 
@@ -307,6 +322,12 @@ def get_snapshot(user_id: str = "", team_id: str = "") -> Dict[str, Any]:
 def bind_loop(loop: Any) -> None:
     """绑定主事件循环（供 ws_push 等出站调度；可选，缺失时按兜底链尝试）。"""
     _sdk_bind_loop(loop)
+    if _stations is not None:
+        # M3 防呆判据 A：记录主 loop 线程 ident（事件循环线程内同步触发即放行）
+        try:
+            _stations.bind_main_loop_ident()
+        except Exception:  # noqa: BLE001
+            logger.debug("站防呆主循环 ident 绑定失败（忽略）", exc_info=True)
 
 
 # ----------------------------------------------------------------------
@@ -327,7 +348,13 @@ def shutdown() -> None:
         if not _initialized and _bus is None:
             _enabled = False
             return
-        registry, bus, stations, host = _registry, _bus, _stations, _host
+        registry, bus, stations, host, watchdog = (
+            _registry,
+            _bus,
+            _stations,
+            _host,
+            _watchdog,
+        )
         _initialized = False
         _bus = None
         _registry = None
@@ -337,6 +364,9 @@ def shutdown() -> None:
         _demo_plugin = None
         _enabled = False
     try:
+        if watchdog is not None:
+            # M3：巡检循环先停（避免拆卸期间触发停用回调）
+            watchdog.stop()
         if host is not None:
             # 宿主通道后台任务（级联停止/对账）有界收尾；daemon 线程不阻塞退出
             host.drain(0.5)
@@ -479,6 +509,12 @@ def init_plugin_system() -> None:
         loop = None
     if loop is not None:
         _sdk_bind_loop(loop)
+        if _stations is not None:
+            # M3 防呆判据 A：记录主 loop 线程 ident（本函数在 lifespan 主 loop 线程执行）
+            try:
+                _stations.bind_main_loop_ident()
+            except Exception:  # noqa: BLE001
+                logger.debug("站防呆主循环 ident 绑定失败（忽略）", exc_info=True)
     # D-P2-6：进程启动路径的示范插件自动注册（默认关；幂等）
     _maybe_register_demo()
 

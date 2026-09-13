@@ -74,16 +74,21 @@ def _collect_instances(
                     "granularity": str(getattr(inst, "granularity", "")),
                     "scope": scope,
                     "status": (
-                        "registered"
-                        if getattr(inst, "alive", False)
-                        else "destroyed"
+                        "disabled"
+                        if getattr(inst, "disabled", False)
+                        else (
+                            "registered"
+                            if getattr(inst, "alive", False)
+                            else "destroyed"
+                        )
                     ),
                     "last_heartbeat": float(
                         getattr(inst, "last_active", 0.0) or 0.0
                     ),
                     "queue_depth": queue_depth,
-                    # M3 巡检停用（判死联动）落地后填充
-                    "disabled_reason": "",
+                    "disabled_reason": str(
+                        getattr(inst, "disabled_reason", "") or ""
+                    ),
                 }
             )
     except Exception:  # noqa: BLE001
@@ -135,14 +140,19 @@ def _collect_stations(stations: Optional[Any]) -> List[Dict[str, Any]]:
 
 
 def _collect_watchdog(watchdog: Optional[Any]) -> Dict[str, Any]:
-    """看门狗区块（active_runs=存活 run 数；judged_dead 待 M3 接入）。"""
+    """看门狗区块（active_runs=存活 run 数；judged_dead=累计判死数，M3 接入）。"""
     active = 0
+    judged = 0
     if watchdog is not None:
         try:
             active = int(watchdog.task_count())
         except Exception:  # noqa: BLE001
             active = 0
-    return {"active_runs": active, "judged_dead": 0}
+        try:
+            judged = int(watchdog.judged_dead_count())
+        except Exception:  # noqa: BLE001
+            judged = 0
+    return {"active_runs": active, "judged_dead": judged}
 
 
 def build_snapshot(

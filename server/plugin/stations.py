@@ -12,8 +12,11 @@
 - **fail-open 红线**：一切异常路径放行原数据 + 分类计数 + 日志；
   绝不抛出、绝不出半成品；在途请求快速失败（实例销毁 / 队列满 →
   立即放行，不静默等满超时）。
-- **进度通道**：等待期接通 watchdog run 登记/续期/结束（软窗、自动
-  续期与判死联动留二期）；等待期续期由等待循环按节拍显式上报。
+- **进度通道**：等待期接通 watchdog run 登记/续期/结束（M3：软窗/自动
+  续期与判死停用联动已落地）；等待期续期由等待循环按节拍显式上报。
+- **M3 工程小件**：防呆（事件循环线程内同步触发 → ``loop_bypass`` 直通）；
+  链深上限（``chain_bypass``，跨实例环防护）；F3 连续失败停用；F5 日志
+  前缀 ``[plugin:station:<site>]``；read encoding（SDK 可选参）。
 
 模块独立管理订阅记录（站 × 键位 → 订阅）；执行投递复用注册表实例
 worker。对 ``registry`` 的接触点（显式 ≤3，既有事件路径行为不变）：
@@ -27,6 +30,7 @@ worker。对 ``registry`` 的接触点（显式 ≤3，既有事件路径行为�
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
@@ -53,6 +57,43 @@ _STATION_NOOP_TYPES = {"plugin.station.noop"}
 
 # 粒度排序（越细越优先；触发解析用）
 _GRANULARITY_RANK = {"team": 1, "agent": 2, "session": 3}
+
+
+def _default_chain_max() -> int:
+    """M3 链深上限（env ``PLUGIN_STATION_CHAIN_MAX`` 可配，默认 8）。"""
+    try:
+        value = int(float(os.environ.get("PLUGIN_STATION_CHAIN_MAX", "") or 8))
+    except (TypeError, ValueError):
+        return 8
+    return value if value >= 1 else 8
+
+
+def _default_error_threshold() -> int:
+    """M3 F3 阈值（env ``PLUGIN_STATION_ERROR_THRESHOLD`` 可配，默认 3）。"""
+    try:
+        value = int(float(os.environ.get("PLUGIN_STATION_ERROR_THRESHOLD", "") or 3))
+    except (TypeError, ValueError):
+        return 3
+    return value if value >= 1 else 3
+
+
+# M3：链深计数（线程局部；随任务投递传播——跨实例嵌套等待计数，防环）
+_CHAIN_DEPTH = threading.local()
+
+
+def _chain_get() -> int:
+    """当前线程站嵌套链深（0 = 非嵌套调用）。"""
+    return int(getattr(_CHAIN_DEPTH, "depth", 0) or 0)
+
+
+def _chain_set(value: int) -> None:
+    """设置当前线程站嵌套链深。"""
+    _CHAIN_DEPTH.depth = int(value)
+
+
+def _flog(level: int, site: str, msg: str, *args: Any) -> None:
+    """F5：站日志统一前缀 ``[plugin:station:<site>]``。"""
+    logger.log(level, "[plugin:station:%s] " + msg, str(site or "?"), *args)
 
 
 def _env_float(name: str, default: float, *, minimum: float = 0.001) -> float:
@@ -283,10 +324,24 @@ class StationsHub:
         self,
         registry: PluginRegistry,
         watchdog: Optional[ProgressWatchdog] = None,
+        *,
+        chain_max: Optional[int] = None,
+        error_threshold: Optional[int] = None,
     ) -> None:
         self._registry = registry
         self._watchdog = watchdog
         self._lock = threading.Lock()
+        # M3：链深上限 / F3 阈值（构造参数优先；env 提供默认，测试可缩参）
+        self._chain_max = (
+            int(chain_max) if chain_max is not None else _default_chain_max()
+        )
+        self._error_threshold = (
+            int(error_threshold)
+            if error_threshold is not None
+            else _default_error_threshold()
+        )
+        # M3：主事件循环线程 ident（防呆判据 A；bind 时记录）
+        self._main_loop_ident: Optional[int] = None
         # 订阅表：{(station_id, *scope_key) : StationSub}
         self._subs: Dict[Tuple[str, ...], StationSub] = {}
         # 站元信息：{station_id: {"description":..., "created_at":...}}
@@ -305,6 +360,8 @@ class StationsHub:
             "overflow": 0,            # 实例队列满，投递失败（放行）
             "handler_error": 0,       # 插件处理异常（放行）
             "reentrant_bypass": 0,    # 防重入立即放行（同实例 worker 线程内触发）
+            "loop_bypass": 0,         # M3 防呆：事件循环线程内同步触发（立即放行）
+            "chain_bypass": 0,        # M3 链深上限：嵌套过深立即放行（跨实例环防护）
             "late_response": 0,       # 迟到回填（请求已终结后到达）
             "duplicate_response": 0,  # 重复回填（已成功回填后再次）
             "unsubscribed": 0,        # 显式退订 / 替换移除
@@ -317,6 +374,48 @@ class StationsHub:
         self._waits_in_flight = 0      # 等待在飞数（_await_response 入口 +1 / finally −1）
         self._wait_ms_total = 0.0      # 累计等待时长（毫秒；投递成功后等待段墙钟）
         self._wait_ms_max = 0.0        # 单次等待峰值（毫秒，单调不减）
+
+    # ------------------------------------------------------------------
+    # M3：防呆 / 链深 / F3 支撑
+    # ------------------------------------------------------------------
+    def bind_main_loop_ident(self, ident: Optional[int] = None) -> int:
+        """绑定主事件循环线程 ident（防呆判据 A；缺省取当前线程）。"""
+        value = int(ident) if ident is not None else threading.get_ident()
+        self._main_loop_ident = value
+        return value
+
+    def reset_chain_depth(self) -> None:
+        """重置当前线程链深（测试隔离用）。"""
+        _chain_set(0)
+
+    def _is_loop_caller(self) -> bool:
+        """防呆判据（A 主 loop ident + B running-loop 检测，叠加）。
+
+        命中即调用方位于事件循环线程——同步等待会阻塞全局循环，
+        必须立即放行（fail-open 方向；计数 ``loop_bypass``）。
+        """
+        ident = self._main_loop_ident
+        if ident is not None and threading.get_ident() == ident:
+            return True
+        try:
+            asyncio.get_running_loop()
+            return True
+        except RuntimeError:
+            return False
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _note_handler_result(self, inst: PluginInstance, *, ok: bool) -> None:
+        """F3：连续 ``handler_error`` 计数（成功重置；达阈停用 + reason）。"""
+        try:
+            if ok:
+                inst.note_station_success()
+                return
+            streak = inst.note_station_error()
+            if streak >= self._error_threshold:
+                self._registry.disable(inst, reason="handler_error")
+        except Exception:  # noqa: BLE001
+            _flog(logging.DEBUG, "f3", "F3 计数/停用异常（忽略）")
 
     # ------------------------------------------------------------------
     # 站注册
@@ -367,13 +466,13 @@ class StationsHub:
         sid = str(station_id or "")
         pid = str(plugin_id or "")
         if not sid or not pid or not callable(handler):
-            logger.warning("站订阅参数非法: station=%r plugin=%r", sid, pid)
+            _flog(logging.WARNING, sid, "站订阅参数非法: plugin=%r", pid)
             return False
         g = str(granularity or "agent")
         try:
             key = scope_key(g, scope or {})
         except ValueError:
-            logger.warning("站订阅粒度非法: %r", granularity)
+            _flog(logging.WARNING, sid, "站订阅粒度非法: %r", granularity)
             return False
         sc = make_scope(
             **{
@@ -383,7 +482,7 @@ class StationsHub:
         )
         if not sc["user_id"]:
             # fail-closed 入口防线（与总线/埋点同向）：无归属不订阅
-            logger.warning("站订阅缺少 user_id，拒绝: station=%s plugin=%s", sid, pid)
+            _flog(logging.WARNING, sid, "站订阅缺少 user_id，拒绝: plugin=%s", pid)
             return False
         inst_key = f"{pid}|{g}|" + "|".join(key)
         full_key: Tuple[str, ...] = (sid, *key)
@@ -398,13 +497,20 @@ class StationsHub:
                 if old_inst is None or not old_inst.alive:
                     # 残留订阅（实例已销毁）：惰性清理后接受新订阅
                     self._subs.pop(full_key, None)
-                    logger.info("清理残留站订阅: %s → %s", full_key, existing.plugin_id)
+                    _flog(
+                        logging.INFO,
+                        sid,
+                        "清理残留站订阅: %s → %s",
+                        full_key,
+                        existing.plugin_id,
+                    )
                     existing = None
             if existing is not None and not replace:
                 self._counts["rejected_conflict"] += 1
-                logger.info(
-                    "站订阅冲突（先到先得拒绝）: %s 已被 %s 订阅",
+                _flog(
+                    logging.INFO,
                     sid,
+                    "站订阅冲突（先到先得拒绝）: 已被 %s 订阅",
                     existing.plugin_id,
                 )
                 return False
@@ -438,12 +544,14 @@ class StationsHub:
                     name=str(name or f"{pid}:station"),
                 )
             except Exception:  # noqa: BLE001
-                logger.exception("站订阅实例创建失败: %s", inst_key)
+                logger.exception(
+                    "[plugin:station:%s] 站订阅实例创建失败: inst=%s", sid, inst_key
+                )
                 with self._lock:
                     self._subs.pop(full_key, None)
                     self._active_count = len(self._subs)
                 return False
-        logger.info("站订阅成功: %s ← %s（%s 粒度）", sid, pid, g)
+        _flog(logging.INFO, sid, "站订阅成功: ← %s（%s 粒度）", pid, g)
         return True
 
     def unsubscribe(
@@ -482,7 +590,7 @@ class StationsHub:
                 self._counts["unsubscribed"] += removed
                 self._active_count = len(self._subs)
         if removed:
-            logger.info("站显式退订: %s（%d 条）", sid, removed)
+            _flog(logging.INFO, sid, "站显式退订（%d 条）", removed)
         return removed
 
     def resolve(self, station_id: str, scope: Dict[str, str]) -> Optional[StationSub]:
@@ -538,33 +646,64 @@ class StationsHub:
                 # 快速路径：无任何订阅（近零开销）
                 return data
             if not isinstance(data, str):
-                logger.debug("站输入非 str（直通）: station=%s", station_id)
+                _flog(logging.DEBUG, station_id, "站输入非 str（直通）")
                 return data
             req_scope = normalize_scope(scope)
             if not req_scope["user_id"]:
-                logger.debug("站请求缺少 user_id（直通）: station=%s", station_id)
+                _flog(logging.DEBUG, station_id, "站请求缺少 user_id（直通）")
+                return data
+            # M3 防呆（契定 §15.5）：事件循环线程内同步触发 → 立即放行 + loop_bypass
+            # （判据 A+B 叠加；位置：快速路径、resolve/F1 之前）
+            if self._is_loop_caller():
+                self._bump("loop_bypass")
+                _flog(
+                    logging.DEBUG,
+                    station_id,
+                    "事件循环线程内调用（loop_bypass，立即放行）",
+                )
                 return data
             sub = self.resolve(station_id, req_scope)
             if sub is None:
                 self._bump("no_subscriber")
                 return data
             inst = self._registry.get(sub.inst_key)
-            if inst is None or not inst.alive:
-                # 订阅实例缺失/已销毁：放行（订阅残留由下次 subscribe 惰性清理）
+            if inst is None or not inst.alive or getattr(inst, "disabled", False):
+                # 订阅实例缺失/已销毁/已停用（M3 停用联动）：
+                # 放行（订阅残留由下次 subscribe 惰性清理）
                 self._bump("no_subscriber")
-                logger.debug("站订阅实例不可用（放行）: %s", sub.inst_key)
+                _flog(
+                    logging.DEBUG,
+                    station_id,
+                    "站订阅实例不可用（放行）: inst=%s disabled=%s",
+                    sub.inst_key,
+                    bool(getattr(inst, "disabled", False)),
+                )
                 return data
             # F1 防重入（裁决补最小实现）：目标实例 worker 线程 == 当前线程
             # （插件 handler 内同步触发、命中同实例站）→ 立即放行 + 计数，
             # 避免请求排入自身队列形成自等（最坏 30s 卡顿）。
-            # 说明：仅只读比较线程对象（不修改 registry）；跨实例环不在本
-            # 判定范围（留超时兜底收敛；链深上限二期）。
+            # 说明：仅只读比较线程对象（不修改 registry）；跨实例环由
+            # 链深上限（M3）兜底，超时兜底收敛仍保留。
             worker = getattr(inst, "_worker", None)
             if worker is not None and worker is threading.current_thread():
                 self._bump("reentrant_bypass")
-                logger.info(
-                    "站重入 bypass（同实例 worker 线程内触发，立即放行）: %s",
+                _flog(
+                    logging.INFO,
+                    station_id,
+                    "站重入 bypass（同实例 worker 线程内触发，立即放行）: inst=%s",
                     sub.inst_key,
+                )
+                return data
+            # M3 链深上限（跨实例环防护）：当前链深已达上限 → 立即放行 + chain_bypass
+            depth = _chain_get()
+            if depth >= self._chain_max:
+                self._bump("chain_bypass")
+                _flog(
+                    logging.WARNING,
+                    station_id,
+                    "链深超限 bypass（chain_depth=%d, max=%d，立即放行）",
+                    depth,
+                    self._chain_max,
                 )
                 return data
             eff_timeout = self._pick_timeout(timeout_s, sub)
@@ -576,27 +715,45 @@ class StationsHub:
                 deadline=time.monotonic() + eff_timeout,
                 bump=self._bump,
             )
-            task = self._make_task(sub, req)
+            task = self._make_task(sub, req, depth)
             if not inst.offer_task(task):
                 # 实例队列满：立即 fail-open（快速失败；绝不静默等超时）
                 self._bump("overflow")
-                logger.warning("站请求投递失败（队列满，放行）: %s", sub.station_id)
+                _flog(
+                    logging.WARNING,
+                    sub.station_id,
+                    "站请求投递失败（队列满，放行）",
+                )
                 return data
             self._bump("requests")
             outcome, result = self._await_response(req, inst, cancel_event)
             if outcome == "responded":
                 self._bump("responded")
+                self._note_handler_result(inst, ok=True)
                 # None = 不改动（放行原数据）；str（含空串）= 替换
                 return data if result is None else result
             for reason in ("timeout", "cancelled", "invalid", "handler_error"):
                 if outcome == reason:
                     self._bump(reason if reason != "invalid" else "invalid_response")
                     break
+            if outcome == "timeout":
+                _flog(
+                    logging.INFO,
+                    station_id,
+                    "等待超时（放行原数据）: timeout=%.2fs",
+                    eff_timeout,
+                )
+            if outcome == "handler_error":
+                # F3：连续 handler_error 计数（成功重置；达阈停用 + disabled_reason）
+                self._note_handler_result(inst, ok=False)
             return data
         except Exception:  # noqa: BLE001
             # 单一入口吞异常（绝不影响工具主链路）
             self._bump("internal_errors")
-            logger.exception("处理站内部异常（已忽略，放行原数据）: %s", station_id)
+            logger.exception(
+                "[plugin:station:%s] 处理站内部异常（已忽略，放行原数据）",
+                station_id,
+            )
             return data
 
     # ------------------------------------------------------------------
@@ -625,7 +782,11 @@ class StationsHub:
                 with self._lock:
                     self._runs_registered += 1
             except Exception:  # noqa: BLE001
-                logger.debug("站进度通道登记失败（忽略）", exc_info=True)
+                logger.debug(
+                    "[plugin:station:%s] 站进度通道登记失败（忽略）",
+                    req.station_id,
+                    exc_info=True,
+                )
         slice_s = _default_wait_slice_s()
         beat_s = _default_beat_interval_s()
         last_beat = time.monotonic()
@@ -674,23 +835,34 @@ class StationsHub:
                     pass
 
     def _make_task(
-        self, sub: StationSub, req: StationRequest
+        self, sub: StationSub, req: StationRequest, chain_depth: int = 0
     ) -> Callable[[], None]:
         """构造投递给订阅实例 worker 的任务闭包。
 
         插件处理函数返回值即回填（``str``/``None``）；若函数内部已自行
         ``respond``，框架不再重复回填；异常 → 请求以 ``handler_error`` 终结。
+        ``chain_depth``：投递时刻调用方链深（M3 链深传播——handler 执行期间
+        线程链深 = 调用方链深 + 1，用于跨实例环防护）。
         """
 
         def _task() -> None:
+            prev_depth = _chain_get()
+            _chain_set(int(chain_depth) + 1)
             try:
-                ret = sub.handler(req)
-            except Exception:  # noqa: BLE001
-                logger.exception("站插件处理异常: %s", sub.station_id)
-                req._end("handler_error")
-                return
-            if not req.is_done():
-                req.respond(ret)
+                try:
+                    ret = sub.handler(req)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "[plugin:station:%s] 站插件处理异常: inst=%s",
+                        sub.station_id,
+                        sub.inst_key,
+                    )
+                    req._end("handler_error")
+                    return
+                if not req.is_done():
+                    req.respond(ret)
+            finally:
+                _chain_set(prev_depth)
 
         return _task
 
@@ -742,7 +914,7 @@ class StationsHub:
                 self._counts["subscriptions_cascaded"] += removed
                 self._active_count = len(self._subs)
         if removed:
-            logger.info("站订阅级联清理: user=%s（%d 条）", user_id, removed)
+            _flog(logging.INFO, "cascade", "站订阅级联清理: user=%s（%d 条）", user_id, removed)
         return removed
 
     def stats(self) -> Dict[str, Any]:
@@ -799,6 +971,7 @@ class StationsHub:
             self._waits_in_flight = 0
             self._wait_ms_total = 0.0
             self._wait_ms_max = 0.0
+            self._main_loop_ident = None
 
     # ------------------------------------------------------------------
     # 内部工具
