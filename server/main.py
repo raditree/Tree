@@ -98,6 +98,15 @@ async def lifespan(app: FastAPI):
     # WebSocket 连接管理器（全局单例）
     state.ws_manager = WebSocketManager()
 
+    # 插件化埋点体系（一期）：默认关闭（TREE_PLUGIN_ENABLED=1 启用）；
+    # 未启用/初始化失败时零副作用，不影响主流程（独立部署步骤，重启生效）
+    try:
+        from plugin import init_plugin_system
+
+        init_plugin_system()
+    except Exception as plugin_exc:  # noqa: BLE001
+        print(f"[启动] 插件体系初始化跳过: {plugin_exc}")
+
     print(f"[启动] 服务配置: {config.get('server', {})}")
     print(f"[启动] 已加载模型: {list(state.model_configs.keys())}")
     if docker_manager.available:

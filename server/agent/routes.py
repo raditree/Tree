@@ -63,6 +63,20 @@ from ws.auth import get_current_user
 
 logger = logging.getLogger(__name__)
 
+
+def _plugin_cascade(*args: Any, **kwargs: Any) -> None:
+    """插件化埋点体系（一期）：实例级联清理接线（契约 §5.1 / §10.2）。
+
+    默认关闭时零副作用；任何异常均吞掉，绝不影响路由主流程。
+    """
+    try:
+        from plugin import plugin_cascade
+
+        plugin_cascade(*args, **kwargs)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 router = APIRouter(prefix="/api")
 
 
@@ -121,9 +135,13 @@ async def delete_conversation(
         # （clear_user_agent 按 (user_id, agent_id) 清理，此处逐 agent 处理）
         for agent in get_agents(user_id):
             clear_user_agent(user_id, agent["id"], session_id=session_id)
+            # 插件体系：级联清理该会话的 session 级实例（§5.1 接线点 2）
+            _plugin_cascade(user_id, agent_id=agent["id"], session_id=session_id)
     else:
         clear_context(user_id, target, session_id=session_id)
         clear_user_agent(user_id, target, session_id=session_id)
+        # 插件体系：级联清理该会话的 session 级实例（§5.1 接线点 2）
+        _plugin_cascade(user_id, agent_id=target, session_id=session_id)
     return {"success": True, "deleted": deleted}
 
 
@@ -351,6 +369,8 @@ async def delete_agent_session(
     if not ok:
         raise HTTPException(status_code=404, detail="会话不存在")
     clear_user_agent(user_id, agent_id, session_id=session_id)
+    # 插件体系：级联清理该会话的 session 级实例（§5.1 接线点 1）
+    _plugin_cascade(user_id, agent_id=agent_id, session_id=session_id)
     return {"success": True}
 
 
@@ -788,6 +808,8 @@ async def update_agent_endpoint(
         raise HTTPException(status_code=404, detail="Agent 不存在")
     # 清会话缓存（含上下文），下次发消息按新配置重建
     clear_user_agent(user_id, agent_id)
+    # 插件体系：级联清理该 agent 的实例（对齐 clear_user_agent 行为；§5.1 接线点 4）
+    _plugin_cascade(user_id, agent_id=agent_id)
     return {"success": True, "agent": _agent_to_response(record)}
 
 
@@ -859,6 +881,10 @@ async def delete_agent_endpoint(
             logger.warning("删除 agent 工作空间失败(已忽略): %s (%s)", agent_id, exc)
     # 清理该 agent 的 normal LLM 会话缓存，避免内存泄漏
     clear_user_agent(user_id, agent_id)
+    # 插件体系：级联清理该 agent 的 agent/会话级实例；
+    # 若该 agent 为 TOP（团队解散），同时清理团队级实例（§5.1 接线点 3）
+    _plugin_cascade(user_id, agent_id=agent_id)
+    _plugin_cascade(user_id, team_id=agent_id)
     # 清理该 agent 持久化的会话上下文（数据库）
     clear_context(user_id, agent_id)
     # 清理 broker 队列/worker 与限流器注册（TOP 自身 + 其下全部成员），

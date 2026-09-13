@@ -1012,6 +1012,8 @@ class AgentLLMSession:
                     # 已停止时不再启动新的工具调用（阻塞工具可被跳过）
                     if self._is_cancelled(cancel_event):
                         return
+                    # 插件埋点：工具阶段计时（duration_ms，见工具执行后的发布点）
+                    tc_t0 = time.time()
                     handler = self._find_handler(tc["name"])
                     # 参数与结果：默认空参数，解析失败/未找到 handler 时
                     # 仍能安全 yield（避免 yield 引用未定义变量）
@@ -1046,6 +1048,37 @@ class AgentLLMSession:
                         tc["name"], result_str
                     )
                     result_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+
+                    # 插件埋点（白名单示范，契约 §10.1 唯一入口 safe_publish）：
+                    # 工具执行事件。总开关默认关闭（TREE_PLUGIN_ENABLED /
+                    # plugin.set_enabled），关闭时零副作用；异常一律吞掉，
+                    # 绝不影响工具主链路；payload 最小化（不含参数值与结果正文）。
+                    try:
+                        from plugin import safe_publish as _plugin_safe_publish
+
+                        _plugin_safe_publish(
+                            "tool.call.completed",
+                            scope={
+                                "user_id": str(getattr(self, "user_id", "") or ""),
+                                "team_id": str(getattr(self, "team_id", "") or ""),
+                                "agent_id": str(getattr(self, "agent_id", "") or ""),
+                                "session_id": str(
+                                    getattr(self, "session_id", "") or ""
+                                ),
+                            },
+                            payload={
+                                "tool_name": str(tc["name"] or ""),
+                                "duration_ms": int(max(0.0, time.time() - tc_t0) * 1000),
+                                "ok": not (
+                                    isinstance(result, dict)
+                                    and bool(result.get("error"))
+                                ),
+                                "result_size": len(result_str or ""),
+                            },
+                            source="embedded:llm",
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.debug("插件埋点发布失败（已忽略）", exc_info=True)
 
                     yield {
                         "type": "tool_call",
