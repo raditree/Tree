@@ -144,7 +144,8 @@ class TestSendMessage(MessageToolBase):
         self.assertEqual(result["status"], "sent")
         self.assertEqual(sorted(result["sent"]), ["l1a", "l1b"])
         self.assertEqual(result["unknown"], [])
-        self.assertNotIn("hint", result)
+        # 投递成功时带"回复机制"提醒：系统不代回传总结 + 提醒防交火
+        self.assertIn("不会替对方回传总结", result["hint"])
 
     def test_member_cross_top_denied_with_isolation_hint(self):
         """成员（非 TOP）跨 TOP 寻址被拒，hint 说明需经直属 leader 转达。"""
@@ -247,14 +248,15 @@ class TestWaitFor(MessageToolBase):
         self.assertFalse(result["timed_out"])
 
     def test_timeout_while_working_gives_hint(self):
-        """始终 working → 超时，hint 说明可结束本轮等成员回发唤醒。"""
+        """始终 working → 超时，hint 说明需对方主动回发或自行核实/追问。"""
         tool = self._tool("top1")
         with patch.object(MessageTool, "_live_work_status", return_value="working"):
             result = self._wait(tool, target_member_ids="l1a", timeout=1)
         self.assertTrue(result["timed_out"])
         self.assertEqual(result["members"][0]["outcome"], "working")
         self.assertIn("等待超时", result["hint"])
-        self.assertIn("自动回发消息唤醒", result["hint"])
+        # 总结自动回传已移除：提示明确"若主动回发才会唤醒"，并要求自行核实
+        self.assertIn("主动回发消息", result["hint"])
 
     def test_unknown_target_rejected(self):
         tool = self._tool("top1")

@@ -155,81 +155,34 @@ class Task7TestBase(unittest.TestCase):
         return content
 
 
-class TestActiveSummaryPush(Task7TestBase):
-    """7.1 active 语义：总结反向推送（显式化）。"""
+class TestNoSummaryPushback(Task7TestBase):
+    """总结反向推送已移除：active 消息不再自动把目标总结回发给发起方。
 
-    def test_active_message_pushes_summary_back_with_active_false(self):
-        """active=true 且目标有总结 → 反向推送一条 active=false 消息给发起方。"""
-        self._seed_summary(self.top_b)
-        agents = {
+    原 Task 7.1 的"总结反向推送"会让两个 agent 互相发消息时各自自动回传总结，
+    形成 A↔B→A… 的无限交火并浪费大量 API 调用。现改为由提示词约定：需要对方
+    知道结果时由 agent 自己显式 send_message。本类锁定"任何情况下都不再推送"。
+    """
+
+    def _agents(self):
+        return {
             self.top_a: self._agent_record(),
             self.top_b: self._agent_record(),
         }
+
+    def test_active_message_does_not_push_summary_back(self):
+        """active=true 且目标已有总结 → 仍只投递原消息，不反向推送。"""
+        self._seed_summary(self.top_b)
         ws, top, team = self._dispatch(
             self.top_b, "新任务", self.top_a, self.top_a,
-            active=True, agents=agents,
+            active=True, agents=self._agents(),
         )
-        # 原消息投递给 topB，负载标记 active=True
-        originals = [p for p in top.payloads if p["agent_id"] == self.top_b]
-        self.assertEqual(len(originals), 1)
-        self.assertIs(originals[0]["active"], True)
-        # 反向推送：回发给发起方 topA，内容含目标总结，标记 active=False
-        pushed = [p for p in top.payloads if p["agent_id"] == self.top_a]
-        self.assertEqual(len(pushed), 1)
-        self.assertIn("SUMMARY", pushed[0]["content"])
-        self.assertIs(pushed[0]["active"], False)
+        # 仅原消息投递给 topB；发起方 topA 不会额外收到"最近总结"消息
+        self.assertEqual([p["agent_id"] for p in top.payloads], [self.top_b])
+        self.assertIs(top.payloads[0]["active"], True)
         self.assertEqual(team.payloads, [])
 
-    def test_active_false_does_not_push(self):
-        """active=false（被动推送）→ 不触发反向推送。"""
-        self._seed_summary(self.top_b)
-        agents = {
-            self.top_a: self._agent_record(),
-            self.top_b: self._agent_record(),
-        }
-        ws, top, team = self._dispatch(
-            self.top_b, "新任务", self.top_a, self.top_a,
-            active=False, agents=agents,
-        )
-        self.assertEqual([p["agent_id"] for p in top.payloads], [self.top_b])
-
-    def test_auto_reply_channel_does_not_push(self):
-        """auto_reply 被动通道（active 缺省 true）→ 不触发反向推送。"""
-        self._seed_summary(self.top_b)
-        agents = {
-            self.top_a: self._agent_record(),
-            self.top_b: self._agent_record(),
-        }
-        ws, top, team = self._dispatch(
-            self.top_b, "新任务", self.top_a, self.top_a,
-            active=True, extra={"auto_reply": True}, agents=agents,
-        )
-        self.assertEqual([p["agent_id"] for p in top.payloads], [self.top_b])
-
-    def test_user_sender_does_not_push(self):
-        """用户直发不触发反向推送（用户已可见目标会话历史）。"""
-        self._seed_summary(self.top_b)
-        agents = {self.top_b: self._agent_record()}
-        ws, top, team = self._dispatch(
-            self.top_b, "用户直发", USER_AGENT_ID, self.top_b,
-            active=True, agents=agents,
-        )
-        self.assertEqual([p["agent_id"] for p in top.payloads], [self.top_b])
-
-    def test_no_summary_does_not_push(self):
-        """目标无"最后总结" → 不推送。"""
-        agents = {
-            self.top_a: self._agent_record(),
-            self.top_b: self._agent_record(),
-        }
-        ws, top, team = self._dispatch(
-            self.top_b, "新任务", self.top_a, self.top_a,
-            active=True, agents=agents,
-        )
-        self.assertEqual([p["agent_id"] for p in top.payloads], [self.top_b])
-
-    def test_member_summary_pushed_to_leader(self):
-        """TOP → 成员（active）：成员已有总结时反向回发给发起 TOP。"""
+    def test_member_target_does_not_push_summary_back(self):
+        """TOP → 成员（active）：成员已有总结时也不再反向回发给发起 TOP。"""
         self._seed_summary(self.member_id)
         member = {
             "id": self.member_id, "name": "m", "model_id": "m1",
@@ -243,11 +196,23 @@ class TestActiveSummaryPush(Task7TestBase):
                 member if mid == self.member_id else None
             ),
         )
-        # 成员总结回发给发起 TOP（经 top broker 解析 TOP 目标）
-        pushed = [p for p in top.payloads if p["agent_id"] == self.top_a]
-        self.assertEqual(len(pushed), 1)
-        self.assertIn("SUMMARY", pushed[0]["content"])
-        self.assertIs(pushed[0]["active"], False)
+        self.assertEqual([p["agent_id"] for p in team.payloads], [self.member_id])
+        self.assertEqual(top.payloads, [])
+
+    def test_active_flag_still_passed_through_payload(self):
+        """移除推送后 active 仍随负载透传（接收侧只读，用于区分主动/被动注入）。"""
+        agents = {self.top_b: self._agent_record()}
+        ws, top, team = self._dispatch(
+            self.top_b, "主动消息", self.top_a, self.top_a,
+            active=True, agents=agents,
+        )
+        self.assertIs(top.payloads[0]["active"], True)
+
+        ws2, top2, team2 = self._dispatch(
+            self.top_b, "被动消息", self.top_a, self.top_a,
+            active=False, agents=agents,
+        )
+        self.assertIs(top2.payloads[0]["active"], False)
 
 
 class TestReceiverSessionGuarantee(Task7TestBase):

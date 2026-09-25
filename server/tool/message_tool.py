@@ -227,6 +227,14 @@ class MessageTool(TeamToolBase):
             hints.append(
                 "部分目标投递失败，可稍后重试或改用 list_members 核对成员状态"
             )
+        if sent:
+            # 回复机制的显式提醒：系统不会替任何一方回传总结，需要对方知道
+            # 结果时必须自己回发；同时警告无实质内容的互发会形成交火循环。
+            hints.append(
+                "消息已投递，但系统不会替对方回传总结：如需对方回复，请在"
+                "消息中明确要求，对方需自行 send_message 回发；若对方回发，"
+                "只在有实质新信息或需要其决策时再回复，避免无内容的来回互发"
+            )
         if hints:
             result["hint"] = "；".join(hints)
         return result
@@ -450,8 +458,9 @@ class MessageTool(TeamToolBase):
         if timed_out:
             hints.append(
                 "等待超时，以下成员仍在工作：" + "、".join(wk)
-                + "。你可以结束本轮（无需继续 wait_for 轮询）：成员完成回复后"
-                "会自动回发消息唤醒你，届时再 read 日志/产出验收"
+                + "。你可以结束本轮（无需继续 wait_for 轮询）：对方完成工作后"
+                "**若主动回发消息**才会唤醒你，否则请稍后 read 其活动日志/产出"
+                "核实，或自行 send_message 追问"
             )
         if hints:
             result["hint"] = "；".join(hints)
