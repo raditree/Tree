@@ -1098,6 +1098,26 @@ class LocalExecutorService extends ChangeNotifier {
           'exit_code': 1,
         };
       }
+      // 可选偏移读取：跨工作空间文件中转按块拉取，避免整文件驻留内存。
+      // 缺省（offset/length 均为 0）保持原语义——一次读回整个文件。
+      final int offset = ((data['offset'] as num?) ?? 0).toInt();
+      final int length = ((data['length'] as num?) ?? 0).toInt();
+      if (offset > 0 || length > 0) {
+        final RandomAccessFile raf = await file.open();
+        try {
+          final int size = await raf.length();
+          final int start = offset.clamp(0, size);
+          final int want = length > 0 ? length : size - start;
+          await raf.setPosition(start);
+          final Uint8List chunk = await raf.read(want.clamp(0, size - start));
+          return <String, dynamic>{
+            'exit_code': 0,
+            'content_base64': base64Encode(chunk),
+          };
+        } finally {
+          await raf.close();
+        }
+      }
       final List<int> bytes = await file.readAsBytes();
       return <String, dynamic>{
         'exit_code': 0,

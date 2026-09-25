@@ -18,6 +18,7 @@ MCP 文件工具（read / write / edit / terminal / embed_search）与文档工�
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from abc import ABC, abstractmethod
 from concurrent import futures
@@ -230,6 +231,58 @@ class CloudWorkspaceIO(WorkspaceIO):
             "stderr": result.get("stderr", ""),
             "content": content,
         }
+
+    async def read_file_base64(
+        self,
+        workspace_id: str,
+        path: str,
+        offset: int = 0,
+        length: int = 0,
+    ) -> Dict[str, Any]:
+        """按偏移读文件字节（base64），供跨工作空间中转与二进制读取。
+
+        :param offset: 起始字节偏移（从 0 开始）
+        :param length: 读取字节数；``0`` = 读到文件末尾
+        :return: 成功 ``{"exit_code": 0, "chunk": <bytes>, "eof": bool}``；
+                 失败 ``{"error": "..."}``
+        """
+        start = max(0, int(offset or 0))
+        count = max(0, int(length or 0))
+        # dd 从 start 偏移读 count 字节；length=0 时读到末尾
+        dd_args = f"bs=1 skip={start}" + (f" count={count}" if count else "")
+        cmd = (
+            f"test -f {path!r} || {{ echo 'NOFILE' >&2; exit 1; }}; "
+            f"dd if={path!r} {dd_args} 2>/dev/null | base64 | tr -d '\\n'"
+        )
+        result = await asyncio.to_thread(
+            self.docker_manager.exec_in_workspace,
+            workspace_id, ["sh", "-c", cmd],
+        )
+        if result.get("error"):
+            return result
+        if result.get("exit_code", -1) != 0:
+            return {
+                "error": f"文件不存在或无法读取: {path}",
+                "stderr": (result.get("stderr") or "")[:200],
+            }
+        try:
+            raw = base64.b64decode((result.get("stdout") or "").strip() or b"")
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"读取结果解码失败: {exc}"}
+        return {
+            "exit_code": 0,
+            "chunk": raw,
+            # 读到少于请求量即视为已到末尾（length=0 时一次读完，天然 eof）
+            "eof": (not count) or len(raw) < count,
+        }
+
+    async def write_file_base64(
+        self, workspace_id: str, path: str, data: bytes
+    ) -> Dict[str, Any]:
+        """把字节写入工作空间文件（自动建父目录），供中转落盘。"""
+        return await asyncio.to_thread(
+            self.docker_manager.write_file, workspace_id, path, data
+        )
 
     async def write_file(
         self, workspace_id: str, path: str, content: str
@@ -459,6 +512,50 @@ class LocalWorkspaceIO(WorkspaceIO):
     ) -> Dict[str, Any]:
         result = await self._request(
             workspace_id, "write_file", path=path, content=content
+        )
+        if result.get("error"):
+            return {"error": result["error"], "file_path": path}
+        return {"success": True, "file_path": path}
+
+    async def read_file_base64(
+        self,
+        workspace_id: str,
+        path: str,
+        offset: int = 0,
+        length: int = 0,
+    ) -> Dict[str, Any]:
+        """按偏移读文件字节，经反向 WS 委托前端执行器 ``read_file_bytes``。
+
+        :param offset: 起始字节偏移
+        :param length: 读取字节数；``0`` = 读到末尾
+        :return: 成功 ``{"exit_code": 0, "chunk": <bytes>, "eof": bool}``；
+                 失败 ``{"error": "..."}``
+        """
+        result = await self._request(
+            workspace_id, "read_file_bytes", path=path,
+            offset=max(0, int(offset or 0)), length=max(0, int(length or 0)),
+        )
+        if result.get("error"):
+            return result
+        encoded = result.get("content_base64") or ""
+        try:
+            raw = base64.b64decode(encoded) if encoded else b""
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"读取结果解码失败: {exc}"}
+        count = max(0, int(length or 0))
+        return {
+            "exit_code": 0,
+            "chunk": raw,
+            "eof": (not count) or len(raw) < count,
+        }
+
+    async def write_file_base64(
+        self, workspace_id: str, path: str, data: bytes
+    ) -> Dict[str, Any]:
+        """把字节写入工作空间文件（经反向 WS 的 ``upload_file`` 单请求通道）。"""
+        result = await self._request(
+            workspace_id, "upload_file", rel_path=path,
+            data_base64=base64.b64encode(data).decode("ascii"),
         )
         if result.get("error"):
             return {"error": result["error"], "file_path": path}

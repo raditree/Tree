@@ -17,6 +17,7 @@ from typing import Any, Dict, List
 
 from prompt import versions
 
+from io_.file_transfer import hint_block
 from tool.team_base import TeamToolBase
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,23 @@ class MessageTool(TeamToolBase):
                             "description": "消息内容（send_message/broadcast 必填）。"
                                            "派活时写清工作内容、预期产出与完成后回复要求",
                         },
+                        "files": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "send_message 可选：要一并送达的文件"
+                                           "（本 agent 工作空间内的相对路径列表，"
+                                           "如 ['out/report.md']）。文件会被复制到"
+                                           "接收方工作空间 .input/<日期>/ 下，接收方"
+                                           "用 read 即可读取。同 team 成员之间在共享"
+                                           "目录内直接复制（不经过后端）；跨 TOP 时"
+                                           "由后端中转。单文件上限 32MB",
+                        },
+                        "dest_dir": {
+                            "type": "string",
+                            "description": "send_message 可选：files 的目标目录"
+                                           "（接收方工作空间相对路径，缺省 "
+                                           ".input/<日期>）",
+                        },
                         "timeout": {
                             "type": "integer",
                             "description": "wait_for 最长等待秒数，默认 300，上限 600",
@@ -143,10 +161,79 @@ class MessageTool(TeamToolBase):
         return ("目标不存在或不可达：团队内按成员名称/id 寻址（先 list_members），"
                 "跨 TOP 按 TOP 名称寻址（先 list_teams，且仅 TOP 自己可发起）")
 
+    def _resolve_agent_workspace(self, user_id: str, agent_id: str) -> str:
+        """解析某 agent 的工作空间 id（查 agents 行，缺省回退 agent_id）。"""
+        try:
+            from data.agent_store import get_agent
+
+            record = get_agent(user_id, agent_id) or {}
+            return str(record.get("workspace_id") or "") or agent_id
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("解析工作空间失败(回退 agent_id) %s: %s", agent_id, exc)
+            return agent_id
+
+    def _deliver_files(
+        self, resolved: Dict[str, Any], files: List[str], dest_dir: str
+    ) -> Dict[str, Any]:
+        """把文件复制到目标 agent 的工作空间，返回 ``{copied, failed}``。
+
+        传输策略由 :mod:`io_.file_transfer` 决定：
+        - 同 team（同一共享工作根）→ 共享目录内 ``cp``，后端不接触内容；
+        - 跨 TOP / 跨模式 → 后端内存中转（不落盘、不经 docker）；
+        - 任一端 cloud → 由 CloudWorkspaceIO 落 docker（前端触达不到容器）。
+        """
+        from io_.file_transfer import copy_file
+
+        target_id = resolved.get("id", "")
+        target_ws = self._resolve_agent_workspace(self.user_id, target_id)
+        source_ws = self.workspace_id or self.agent_id
+        # 目标所属工作根：团队内为 TOP 自身，跨 TOP 为对方 TOP
+        target_top = (
+            self.team_id
+            if resolved.get("type") == "member"
+            else target_id
+        )
+        source_top = self.team_id or self.agent_id
+
+        from io_.mode_resolver import build_workspace_io
+
+        src_io = build_workspace_io(self.user_id, source_top)
+        if target_top == source_top:
+            dst_io = src_io
+        else:
+            dst_io = build_workspace_io(self.user_id, target_top)
+
+        copied: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        for raw in files:
+            path = str(raw or "").strip()
+            if not path:
+                continue
+            try:
+                result = copy_file(
+                    src_io, source_ws, path,
+                    dst_io, target_ws,
+                    dest_dir=dest_dir,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("发送文件异常 %s -> %s: %s", path, target_id, exc)
+                result = {"error": f"发送文件异常: {exc}"}
+            if result.get("error"):
+                failed.append({"path": path, "error": result["error"],
+                               "detail": result.get("detail", "")})
+            else:
+                copied.append({"source": path, **result})
+        return {"copied": copied, "failed": failed}
+
     def _action_send_message(self, arguments: dict) -> dict:
-        """点对点发送（支持一对多），返回逐目标投递明细。"""
+        """点对点发送（支持一对多 + 随消息发送文件），返回逐目标投递明细。"""
         target_raw = arguments.get("target_member_id") or arguments.get("target_ids")
         message = arguments.get("message", "")
+        files_raw = arguments.get("files") or []
+        if isinstance(files_raw, str):
+            files_raw = [files_raw]
+        files: List[str] = [str(f) for f in files_raw if str(f).strip()]
+        dest_dir = str(arguments.get("dest_dir") or "").strip()
         if not target_raw:
             return {
                 "error": "缺少 target_member_id（或 target_ids）",
@@ -186,7 +273,16 @@ class MessageTool(TeamToolBase):
                     "type": "unknown", "status": "unknown", "reason": reason,
                 })
                 continue
-            status = self._deliver_one(resolved, message)
+            # 随消息发送文件：先复制到对方工作空间，再把路径写进正文，
+            # 使接收方 agent 直接 read 即可（无需解析私有字段）
+            body = message
+            transferred: Dict[str, Any] = {"copied": [], "failed": []}
+            if files:
+                transferred = self._deliver_files(resolved, files, dest_dir)
+                block = hint_block(transferred["copied"])
+                if block:
+                    body = f"{message}\n\n{block}"
+            status = self._deliver_one(resolved, body)
             rid = resolved.get("id", "")
             entry = {
                 "target": raw,
@@ -195,6 +291,10 @@ class MessageTool(TeamToolBase):
                 "type": rtype,
                 "status": status,
             }
+            if files:
+                entry["files_copied"] = transferred["copied"]
+                if transferred["failed"]:
+                    entry["files_failed"] = transferred["failed"]
             details.append(entry)
             if status == "sent":
                 sent.append(rid)

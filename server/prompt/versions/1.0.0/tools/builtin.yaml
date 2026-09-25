@@ -68,12 +68,13 @@ team:
     注意: remove_member 只能移除自己的直属/下级成员，不可移除自身或任何上级；目标仍有下级时须显式 cascade=true（否则拒绝，避免留下孤儿成员）；移除会连带清理该成员的工作空间、会话上下文与运行时注册，磁盘数据保留供审计，操作不可撤销。role/duty 为空时先 update_member 补充；update_member/remove_member/review_member 必须携带 target_member_id（或 member_name），先从 list_members 获取，禁止省略
     验收产出: 统一工作目录下可直接 read 成员日志 agentspace/{member_id}/.self/activity.log（带日期时间戳，可检索 [done]/[tool] 等标记）及其工作目录内文件，不存在"查看产出"类 action；query_status 只返回实时工作状态、最后活动时间与日志路径；remove_member 返回 removed_ids/subtree_removed/persisted/roster_pushed；review_member 返回 review_status 与是否已可工作
 message:
-  version: 2
+  version: 3
   description: |
     [团队协作-通信域：消息派发、广播、等待完成] | 贡献维度: 协同（向成员派活、点对点沟通、直属广播、等待交付）
     何时使用: 向成员派活或沟通（send_message：消息中写清工作内容、预期产出与完成后回复要求）；向自己的直属 leader 汇报（target_member_id 传 leader）；TOP 之间跨团队协作（先 list_teams，仅 TOP 自己可发起）；向全体**直属成员**广播（broadcast，不跨层级）；等待成员完成当前工作（wait_for）
     何时不用: 建队/改成员档案/移除成员/查模型用 team 工具；简单任务（easy）无需团队；仅需给自己排进度用 set_todo_list
     前置依赖: 先 list_members/list_teams 获取确切 ID/名称；broadcast 仅发给 parent 为本 agent 的直属成员（无直属时返回 no_recipients，不会伪装成功）；send_message 支持一对多（target_ids），返回逐目标 sent/rejected/unknown 明细
+    发送文件: send_message 的 files 接受**本 agent 工作空间内**的相对路径列表（如 ['out/report.md']），系统把它复制到接收方工作空间 .input/<日期>/（可用 dest_dir 改目标目录），接收方用 read 即可打开；正文会自动附上送达路径，无需手写。同 team 成员之间在共享目录内直接复制（不经过后端、不受大小限制）；跨 TOP 时由后端中转，单文件上限 32MB，超限请改用共享目录或文件面板
     回复机制（重要）: **系统不会替你回传任何总结**——收到消息后如需让对方知道结果，必须自己用 send_message 回发。何时必须回发：交付了对方要的产出、被明确要求回复、发现阻塞或需要对方决策。何时禁止回发：仅为确认收到、寒暄、复述对方原话、无新增信息——**不要与同一对象连续互发无实质内容的消息**，否则两个 agent 会陷入 A→B→A… 的无限交火循环并烧掉大量 API 调用
     wait_for 语义: 目标必须先被观测到 working 再转 idle 才算 completed；启动宽限内从未工作的成员标 never_started（可能未接单或已瞬间完成，须 send_message 确认或 read 其 agentspace/{member_id}/.self/activity.log 核实，禁止假定完成）；超时后可结束本轮，对方主动回发的消息会唤醒你
     任务范式: 不存在任务类 action——派活即 send_message；你自行用 set_todo_list 跟踪派发事项；成员产出落在统一工作目录，验收以 read activity.log 与工作目录产出为准（不依赖任何自动总结回传）
