@@ -1,13 +1,19 @@
 """内置 team 工具 - 团队与成员管理。
 
 仅覆盖团队管理子域（通信相关动作在独立的 ``message`` 工具中）：
-- list_models：可用模型池
 - list_teams：本用户名下的 TOP 团队（与 message 工具共用同一实现）
 - list_members：成员名单（team_leader/teammates/team_member 分组，实时）
-- create_member：团队 leader 创建成员（含工作空间/身份/私人空间/初始化消息）
+- create_member：团队 leader 创建成员（工作空间/身份/私人空间；模型留待用户配置）
+- remove_member：团队 leader 移除成员（默认连同下级子树）
 - query_member：成员详情
-- update_member：编辑成员信息（role/duty/model/can_lead_team/提示词/评分）
+- update_member：编辑成员信息（role/duty/can_lead_team/提示词/评分）
+- review_member：同步用户审核结论（放行/驳回）
 - query_status：成员实时工作状态与活动日志位置
+
+**模型配置边界（重要）**：本工具**没有任何**模型相关的写入口——既没有
+``list_models``（模型池查询）动作，``create_member`` / ``update_member`` /
+``review_member`` 也不接受 ``model_id`` 参数（传入即报错拒绝）。成员的模型
+由**用户本人**在「团队成员 → 模型配置」页亲自选择，agent 不得代替用户配置。
 
 层级约束：TOP 为 Level 0；最大层级深度与每层成员上限在创建 TOP 时写入
 teams 表（不可修改）；can_lead_team=False 的成员不可再建子团队。
@@ -45,7 +51,6 @@ __all__ = [
 
 # team 工具支持的 action（未知 action 错误中回显）
 TEAM_ACTIONS = (
-    "list_models",
     "list_teams",
     "list_members",
     "create_member",
@@ -82,22 +87,16 @@ class TeamTool(TeamToolBase):
                                          "update_member / remove_member / "
                                          "review_member / query_status。"
                                          "create_member 为团队 leader 权限：仅在用户"
-                                         "明确要求组建/扩充团队时调用；新建成员**默认"
-                                         "不分配模型**，需用户在「团队成员 → 模型配置」"
-                                         "页赋模型并审核通过后才会接收消息。"
+                                         "明确要求组建/扩充团队时调用；新建成员**不"
+                                         "分配模型**（本工具无此能力），需用户在"
+                                         "「团队成员 → 模型配置」页赋模型并审核通过"
+                                         "后才会接收消息。"
                                          "remove_member 为团队 leader 权限：仅在用户"
                                          "明确要求移除/裁撤成员时调用，默认连同其下级"
                                          "子树一并移除（cascade=true）。"
                                          "review_member 仅在用户明确要求放行/驳回某成员"
                                          "时调用（审核权属于用户，不得自行放行）。"
                                          "派活/催进度/等待完成请改用 message 工具。",
-                        },
-                        "model_id": {
-                            "type": "string",
-                            "description": "create_member 时可选的成员模型（省略则由用户"
-                                           "在模型配置页赋值）；update_member 时修改成员"
-                                           "模型；review_member 时可与审核一并赋模型；"
-                                           "list_members 时可作为筛选条件",
                         },
                         "member_name": {
                             "type": "string",
@@ -189,7 +188,6 @@ class TeamTool(TeamToolBase):
     def execute(self, arguments: dict) -> dict:
         """根据 action 分发执行对应子流程。"""
         dispatch = {
-            "list_models": self._action_list_models,
             "list_teams": self._action_list_teams,
             "list_members": self._action_list_members,
             "create_member": self._action_create_member,
@@ -202,29 +200,16 @@ class TeamTool(TeamToolBase):
         return self._dispatch_actions(dispatch, arguments)
 
     # ------------------------------------------------------------------
-    # list_models
-    # ------------------------------------------------------------------
-    def _action_list_models(self, arguments: dict) -> dict:
-        """列出可用模型池。"""
-        models = [
-            {"model_id": mid, "name": cfg.name}
-            for mid, cfg in self.model_configs.items()
-        ]
-        return {
-            "models": models,
-            "total": len(models),
-            "generated_at": self._now(),
-        }
-
-    # ------------------------------------------------------------------
     # create_member
     # ------------------------------------------------------------------
     def _action_create_member(self, arguments: dict) -> dict:
         """创建新成员（leader 权限）。
 
-        校验顺序：层级深度 → can_lead_team → 直属实时人数 → 模型 → 重名。
+        校验顺序：层级深度 → can_lead_team → 直属实时人数 → 重名。
         创建后：工作空间（云端共享 TOP / 本地统一目录）→ 身份文件 →
         私人空间 → roster 视图 → team_members 落库 → 初始化消息投递。
+        模型**不由本工具设置**：新成员一律 ``model_id=""`` +
+        ``review_status=pending_model``，等用户在「模型配置」页赋模型并审核。
         """
         if self.level >= self.max_team_level:
             return {
@@ -256,21 +241,19 @@ class TeamTool(TeamToolBase):
                 "generated_at": self._now(),
             }
 
-        model_id = arguments.get("model_id")
-        # 模型**可选**：成员创建后不继承 TOP 模型，缺省留空并置 pending_model，
-        # 由用户在「团队成员 → 模型配置」页赋模型 + 审核通过。leader 若确实指定
-        # 了模型，则该成员进入 pending_review（赋了模型但用户尚未过审），
-        # 仍需用户审核通过才能执行 —— 审核权始终在用户手里。
-        if model_id:
-            if model_id not in self.model_configs:
-                return {
-                    "error": f"模型不存在: {model_id}",
-                    "hint": "请先用 list_models 获取可用模型 ID，或省略 model_id "
-                            "交由用户在「团队成员 → 模型配置」页赋值",
-                    "generated_at": self._now(),
-                }
-        else:
-            model_id = ""
+        # 模型**不可由本工具设置**：成员创建后模型留空、置 pending_model，
+        # 由用户在「团队成员 → 模型配置」页赋模型 + 审核通过后才能工作。
+        # 传入 model_id 直接拒绝（而非静默忽略），避免 agent 以为已配置成功
+        # 而向用户谎报成员的模型。
+        if arguments.get("model_id") is not None:
+            return {
+                "error": "team 工具无权为成员分配模型",
+                "hint": "成员模型由用户本人在「团队成员 → 模型配置」页亲自选择，"
+                        "你无权代替；请直接创建成员（不要传 model_id），"
+                        "创建后提示用户去配置模型并审核",
+                "generated_at": self._now(),
+            }
+        model_id = ""
 
         member_id = self._generate_member_id()
         member_name = str(
@@ -370,13 +353,11 @@ class TeamTool(TeamToolBase):
             persisted = False
             logger.warning("持久化新成员到 team_store 失败 %s: %s", member_id, exc)
 
-        # 未赋模型 / 未过审的成员不投递初始化消息：此时消息必然被
-        # _process_member_message 的审核闸拒绝（无模型无法执行），
-        # 提前跳过避免制造一条注定失败的死信。
+        # 新成员必然未就绪（模型由用户配置 → review_status=pending_model），
+        # 此时消息必被 _process_member_message 的审核闸拒绝（无模型无法执行），
+        # 故不投递初始化消息，避免制造一条注定失败的死信；改由用户审核通过后
+        # 在 REST 侧经 _dispatch_member_init_after_approval 补投。
         initialized = False
-        awaiting_review = review_status != "approved"
-        if not awaiting_review:
-            initialized = self._dispatch_member_init(member)
 
         result = {
             "member_id": member_id,
@@ -394,59 +375,15 @@ class TeamTool(TeamToolBase):
             "persisted": persisted,
             "generated_at": now,
         }
-        if awaiting_review:
-            result["hint"] = (
-                "成员已创建，但处于等待用户处理状态"
-                f"（review_status={review_status}）："
-                "请让用户在「团队成员 → 模型配置」页为其选择模型并审核通过后，"
-                "该成员才会接收并执行消息。在此之前它无法工作。"
-            )
-        elif not initialized:
-            result["hint"] = (
-                "成员已创建但初始化消息投递失败（消息通道未就绪），"
-                "可稍后用 message send_message 通知该成员"
-            )
-        elif not persisted:
-            result["hint"] = "成员已创建并通知，但名单持久化失败，请稍后重试或联系管理员"
+        result["hint"] = (
+            "成员已创建，但处于等待用户处理状态"
+            f"（review_status={review_status}）："
+            "请让用户在「团队成员 → 模型配置」页为其选择模型并审核通过后，"
+            "该成员才会接收并执行消息。在此之前它无法工作。"
+        )
+        if not persisted:
+            result["hint"] += "（注意：名单持久化失败，请稍后重试或联系管理员）"
         return result
-
-    def _dispatch_member_init(self, member: Dict[str, Any]) -> bool:
-        """向新成员投递初始化消息（含角色职责/system prompt）。"""
-        sp = (member.get("system_prompt") or "").strip()
-        content = (
-            "【团队初始化】你已加入团队（直属 leader: "
-            f"{member.get('leader_name') or self._leader_display_name()}）。\n"
-        )
-        if member.get("role") or member.get("duty"):
-            content += (
-                f"你的角色：{member.get('role') or '（未设）'}\n"
-                f"你的职责：{member.get('duty') or '（未设）'}\n"
-            )
-        if sp:
-            content += f"你的角色与职责（system prompt）如下，请阅读并确认理解：\n{sp}\n"
-        elif not (member.get("role") or member.get("duty")):
-            content += "目前未设置独立分工，请先向 leader 确认你的角色与职责。\n"
-        content += (
-            "确认后等待 leader 用 message send_message 派发工作；"
-            "工作过程与产出请持续写入 .self/activity.log。"
-        )
-        # 优先统一 dispatcher（与 message 工具同通道，leader_id 由 dispatcher
-        # 按 source_agent_id 注入），不可用时回退 broker 直投
-        if self.message_dispatcher is not None:
-            try:
-                r = self.message_dispatcher(
-                    self.user_id,
-                    [member.get("id", "")],
-                    content,
-                    source_agent_id=self.agent_id,
-                    team_id=self.team_id,
-                    extra={"session_id": self.session_id},
-                )
-                return bool(r and r.get("status") in ("sent", "partial")) \
-                    or bool(r and r.get("sent"))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("初始化消息 dispatcher 投递失败，回退 broker: %s", exc)
-        return self._dispatch_to_member(member, content)
 
     # ------------------------------------------------------------------
     # remove_member
@@ -728,8 +665,10 @@ class TeamTool(TeamToolBase):
     VALID_WORK_STATUS = ("idle", "working", "waiting_input", "stopped", "error")
 
     def _action_update_member(self, arguments: dict) -> dict:
-        """编辑成员信息（name/role/duty/model_id/can_lead_team/comment/
-        scores/system_prompt）。只改信息，不重建工作区、不清空成员上下文。"""
+        """编辑成员信息（name/role/duty/can_lead_team/comment/
+        scores/system_prompt）。只改信息，不重建工作区、不清空成员上下文。
+        **不含模型**：模型配置是用户界面操作，本工具无权修改。
+        """
         target = (
             arguments.get("target_member_id")
             or arguments.get("member_id")
@@ -739,6 +678,13 @@ class TeamTool(TeamToolBase):
             return {
                 "error": "缺少 target_member_id",
                 "hint": "请先调用 list_members 获取成员 ID 或名称",
+                "generated_at": self._now(),
+            }
+        if arguments.get("model_id") is not None:
+            return {
+                "error": "team 工具无权修改成员模型",
+                "hint": "成员模型由用户本人在「团队成员 → 模型配置」页亲自选择，"
+                        "你无权代替；如需变更请提示用户去该页操作",
                 "generated_at": self._now(),
             }
         if arguments.get("work_status") is not None:
@@ -796,33 +742,6 @@ class TeamTool(TeamToolBase):
             updated.append("system_prompt")
             sync_fields["system_prompt"] = str(system_prompt)
 
-        model_id = arguments.get("model_id")
-        if model_id is not None:
-            if model_id not in self.model_configs:
-                return {
-                    "error": f"模型不存在: {model_id}",
-                    "hint": "请先用 list_models 获取可用模型 ID",
-                    "generated_at": self._now(),
-                }
-            member["model_id"] = model_id
-            updated.append("model_id")
-            sync_fields["model_id"] = model_id
-            # 模型变更会牵动审核状态：赋模型 → pending_review，清空 → pending_model；
-            # 已审核结论（approved/rejected）在模型非空时保留。显式同步到
-            # team_store，避免内存视图与库中状态不一致（list_members 读库、
-            # 本条返回读内存）。
-            from data.team_store import derive_review_status_for
-
-            current_status = member.get("review_status") or ""
-            if not model_id:
-                new_status = derive_review_status_for("")
-            elif current_status in ("approved", "rejected"):
-                new_status = current_status
-            else:
-                new_status = derive_review_status_for(model_id)
-            member["review_status"] = new_status
-            sync_fields["review_status"] = new_status
-
         can_lead_team = arguments.get("can_lead_team")
         if can_lead_team is not None:
             flag = bool(can_lead_team)
@@ -848,8 +767,9 @@ class TeamTool(TeamToolBase):
         if not updated:
             return {
                 "error": "未提供任何可更新的字段",
-                "hint": "可更新字段：name/role/duty/model_id/can_lead_team/"
-                        "comment/system_prompt/scores（work_status 只读）",
+                "hint": "可更新字段：name/role/duty/can_lead_team/"
+                        "comment/system_prompt/scores（work_status 只读，模型由"
+                        "用户在模型配置页设置）",
                 "generated_at": self._now(),
             }
 
@@ -880,13 +800,14 @@ class TeamTool(TeamToolBase):
     # review_member
     # ------------------------------------------------------------------
     def _action_review_member(self, arguments: dict) -> dict:
-        """审核成员（approve / reject / 撤销），并可选一并赋模型。
+        """审核成员（approve / reject / 撤销）。
 
         **权限边界（重要）**：新成员默认处于 ``pending_model`` /
         ``pending_review``，在用户审核通过（``approved``）之前不会接收也不会
         执行任何消息。审核权属于**用户**；本 action 存在是为了让用户在
         「团队成员 → 模型配置」页点过按钮后，由 agent 侧同步一次状态，
         **不得**在没有用户明确指示的情况下自行放行成员。
+        **不含模型**：本 action 不接受 model_id（模型由用户配置）。
         """
         target = (
             arguments.get("target_member_id")
@@ -897,6 +818,13 @@ class TeamTool(TeamToolBase):
             return {
                 "error": "缺少 target_member_id",
                 "hint": "请先调用 list_members 获取成员 ID 或名称",
+                "generated_at": self._now(),
+            }
+        if arguments.get("model_id") is not None:
+            return {
+                "error": "team 工具无权为成员分配模型",
+                "hint": "成员模型由用户本人在「团队成员 → 模型配置」页亲自选择；"
+                        "本 action 只能同步审核状态",
                 "generated_at": self._now(),
             }
         member = self._find_member(target)
@@ -912,7 +840,6 @@ class TeamTool(TeamToolBase):
             approve = arguments.get("approve")
             approve = True if approve is None else bool(approve)
             raw = "approved" if approve else "rejected"
-        model_id = arguments.get("model_id")
 
         from data.team_store import update_member_review_status
 
@@ -921,7 +848,6 @@ class TeamTool(TeamToolBase):
                 self.team_id or self.agent_id,
                 str(member.get("id") or ""),
                 value=raw,
-                model_id=model_id,
             )
         except ValueError as exc:
             return {
@@ -935,8 +861,6 @@ class TeamTool(TeamToolBase):
 
         # 内存视图与 roster 同步（list_members 读库，此处保持本实例一致）
         member["review_status"] = row.get("review_status", "")
-        if model_id is not None:
-            member["model_id"] = row.get("model_id", "")
         self._save_roster()
         pushed = self._push_roster_update()
 

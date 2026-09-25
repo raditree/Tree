@@ -58,12 +58,13 @@ mcp:
     注意: 区分 mcp 与内置工具职责；工具名遵循 mcp__<服务名>__<工具名> 命名空间
 
 team:
-  version: 4
+  version: 5
   description: |
     [团队协作-管理域：成员与团队信息管理] | 贡献维度: 协同（建队、成员档案、分工与状态查询）
-    何时使用: 查看本用户名下团队（list_teams）；查看本团队名单与拓扑（list_members）；查看可用模型池（list_models）；应用户自然语言要求创建成员（create_member，仅限 team leader）；应用户明确要求移除/裁撤成员（remove_member，仅限 team leader，默认连同其下级子树一并移除）；查询/调整成员档案（query_member / update_member：role 角色、duty 职责、can_lead_team 能否带队）；应用户明确要求放行/驳回成员（review_member）；查询成员实时工作状态与日志路径（query_status）
+    何时使用: 查看本用户名下团队（list_teams）；查看本团队名单与拓扑（list_members）；应用户自然语言要求创建成员（create_member，仅限 team leader）；应用户明确要求移除/裁撤成员（remove_member，仅限 team leader，默认连同其下级子树一并移除）；查询/调整成员档案（query_member / update_member：role 角色、duty 职责、can_lead_team 能否带队）；应用户明确要求放行/驳回成员（review_member）；查询成员实时工作状态与日志路径（query_status）
     何时不用: 发消息/派活/等待完成请用 message 工具；简单任务（easy）无需团队；仅需给自己排进度用 set_todo_list。create_member/remove_member/review_member 都是**破坏性或权限性**动作，未经用户明确要求不要调用
     前置依赖: 成员已预建（TOP 创建时建队 3 名）或由 leader 经 create_member 扩充；按 name 或 member id 寻址；分工前先 list_members 确认拓扑；成员职责未设时先 update_member 设置；remove_member 前先 list_members 确认目标及其下级
+    模型边界（重要）: 本工具**不提供任何模型能力**——没有 list_models（模型池）动作，create_member/update_member/review_member 也**不接受 model_id 参数**（传入即报错）。成员的模型一律由**用户本人**在「团队成员 → 模型配置」页亲自选择，你无权查看模型池、无权指定、无权修改；需要变更模型时只提示用户去该页操作
     成员就绪（重要）: 新成员**不继承 TOP 模型**，model_id 留空、review_status=pending_model，**在用户赋模型并审核通过前不接收也不执行任何消息**。赋模型与审核都是**用户的界面操作**（「团队成员 → 模型配置」页），你无权替代；list_members 返回 not_ready_count 与 hint 标出未就绪成员，看到它们时应当**提示用户去配置**，而不是反复 send_message 派活（必被拒绝）。review_member 仅在用户明确指示时使用
     注意: remove_member 只能移除自己的直属/下级成员，不可移除自身或任何上级；目标仍有下级时须显式 cascade=true（否则拒绝，避免留下孤儿成员）；移除会连带清理该成员的工作空间、会话上下文与运行时注册，磁盘数据保留供审计，操作不可撤销。role/duty 为空时先 update_member 补充；update_member/remove_member/review_member 必须携带 target_member_id（或 member_name），先从 list_members 获取，禁止省略
     验收产出: 统一工作目录下可直接 read 成员日志 agentspace/{member_id}/.self/activity.log（带日期时间戳，可检索 [done]/[tool] 等标记）及其工作目录内文件，不存在"查看产出"类 action；query_status 只返回实时工作状态、最后活动时间与日志路径；remove_member 返回 removed_ids/subtree_removed/persisted/roster_pushed；review_member 返回 review_status 与是否已可工作
@@ -72,7 +73,7 @@ message:
   description: |
     [团队协作-通信域：消息派发、广播、等待完成] | 贡献维度: 协同（向成员派活、点对点沟通、直属广播、等待交付）
     何时使用: 向成员派活或沟通（send_message：消息中写清工作内容、预期产出与完成后回复要求）；向自己的直属 leader 汇报（target_member_id 传 leader）；TOP 之间跨团队协作（先 list_teams，仅 TOP 自己可发起）；向全体**直属成员**广播（broadcast，不跨层级）；等待成员完成当前工作（wait_for）
-    何时不用: 建队/改成员档案/移除成员/查模型用 team 工具；简单任务（easy）无需团队；仅需给自己排进度用 set_todo_list
+    何时不用: 建队/改成员档案/移除成员用 team 工具（模型配置是用户在界面上的操作，不是工具能力）；简单任务（easy）无需团队；仅需给自己排进度用 set_todo_list
     前置依赖: 先 list_members/list_teams 获取确切 ID/名称；broadcast 仅发给 parent 为本 agent 的直属成员（无直属时返回 no_recipients，不会伪装成功）；send_message 支持一对多（target_ids），返回逐目标 sent/rejected/unknown 明细
     发送文件: send_message 的 files 接受**本 agent 工作空间内**的相对路径列表（如 ['out/report.md']），系统把它复制到接收方工作空间 .input/<日期>/（可用 dest_dir 改目标目录），接收方用 read 即可打开；正文会自动附上送达路径，无需手写。同 team 成员之间在共享目录内直接复制（不经过后端、不受大小限制）；跨 TOP 时由后端中转，单文件上限 32MB，超限请改用共享目录或文件面板
     回复机制（重要）: **系统不会替你回传任何总结**——收到消息后如需让对方知道结果，必须自己用 send_message 回发。何时必须回发：交付了对方要的产出、被明确要求回复、发现阻塞或需要对方决策。何时禁止回发：仅为确认收到、寒暄、复述对方原话、无新增信息——**不要与同一对象连续互发无实质内容的消息**，否则两个 agent 会陷入 A→B→A… 的无限交火循环并烧掉大量 API 调用

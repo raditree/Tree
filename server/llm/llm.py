@@ -71,8 +71,7 @@ def _fmt_value(v: Any, max_chars: int = _MAX_VALUE_CHARS) -> str:
 def _fmt_list_item(item: Any) -> str:
     """把列表中的一项格式化为一行（dict 紧凑 key=value）。
 
-    保留空值字段（如 ``model_id=``），让模型能感知字段存在但为空
-    （配合自动回退机制，避免"看不到 model_id"而误判）。
+    保留空值字段（如 ``model_id=``），让模型能感知字段存在但为空。
     """
     if isinstance(item, dict):
         parts = []
@@ -87,8 +86,8 @@ def _fmt_list_item(item: Any) -> str:
 def _format_list_block(label: str, items: list) -> str:
     """把工具结果中的列表字段展开为逐项可读文本（而非只显示数量）。
 
-    修复"list_models / spec list 等仅返回数量、模型拿不到具体内容"的
-    类 no-op 问题：models/specs/teams/members/tasks/tools 等列表字段
+    修复"team/message 等列表结果仅返回数量、模型拿不到具体内容"的
+    类 no-op 问题：specs/teams/members/tasks/tools 等列表字段
     全部展开具体项，控制规模（最多 _MAX_LIST_ITEMS 项、每项最多
     _MAX_ITEM_FIELDS 字段）。
     """

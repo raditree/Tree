@@ -111,7 +111,7 @@ class TestBootstrapLevel(MemberLifecycleBase):
     def test_l1_create_member_persists_level2(self):
         tool = self._tool("l1a", leader_id="top1")
         result = tool._action_create_member(
-            {"member_name": "小兵", "model_id": "m"}
+            {"member_name": "小兵"}
         )
         self.assertNotIn("error", result)
         self.assertEqual(result["level"], 2)
@@ -123,7 +123,7 @@ class TestBootstrapLevel(MemberLifecycleBase):
     def test_top_create_member_persists_level1(self):
         tool = self._tool("top1", leader_id="")
         result = tool._action_create_member(
-            {"member_name": "直属一", "model_id": "m"}
+            {"member_name": "直属一"}
         )
         self.assertNotIn("error", result)
         self.assertEqual(result["level"], 1)
@@ -134,7 +134,7 @@ class TestBootstrapLevel(MemberLifecycleBase):
         tool = self._tool("l1a", leader_id="top1")
         self.assertEqual(tool.max_team_level, 1)
         result = tool._action_create_member(
-            {"member_name": "越级", "model_id": "m"}
+            {"member_name": "越级"}
         )
         self.assertIn("已达最大层级", result["error"])
         self.assertIn("Level 1", result["error"])
@@ -156,7 +156,7 @@ class TestCanLeadTeamClosure(MemberLifecycleBase):
         l1_tool = self._tool("l1a", leader_id="top1")
         self.assertFalse(l1_tool.can_lead_team)
         refused = l1_tool._action_create_member(
-            {"member_name": "子成员", "model_id": "m"}
+            {"member_name": "子成员"}
         )
         self.assertIn("can_lead_team=False", refused["error"])
 
@@ -178,7 +178,7 @@ class TestRoleDuty(MemberLifecycleBase):
     def test_create_with_role_duty_and_query_back(self):
         tool = self._tool("top1", leader_id="")
         result = tool._action_create_member({
-            "member_name": "后端匠", "model_id": "m",
+            "member_name": "后端匠",
             "role": "后端工程师", "duty": "接口与数据",
         })
         self.assertNotIn("error", result)
@@ -213,7 +213,7 @@ class TestCreateMemberRealtimeGuards(MemberLifecycleBase):
         tool = self._tool("top1", leader_id="")
         # top1 已有 2 名直属（l1a/l1b）→ 达上限
         result = tool._action_create_member(
-            {"member_name": "第三人", "model_id": "m"}
+            {"member_name": "第三人"}
         )
         self.assertIn("已达上限", result["error"])
         self.assertIn("2", result["error"])
@@ -221,7 +221,7 @@ class TestCreateMemberRealtimeGuards(MemberLifecycleBase):
     def test_duplicate_name_rejected(self):
         tool = self._tool("top1", leader_id="")
         result = tool._action_create_member(
-            {"member_name": "一组组长", "model_id": "m"}
+            {"member_name": "一组组长"}
         )
         self.assertIn("成员名称已存在", result["error"])
         self.assertIn("list_members", result["hint"])
@@ -234,7 +234,7 @@ class TestCreateMemberRealtimeGuards(MemberLifecycleBase):
         self.assertIn("成员名称已存在", result["error"])
 
     def test_missing_model_id_creates_pending_member(self):
-        """省略 model_id 不再返回模型池：成员留空模型并进入待用户赋模型状态。"""
+        """成员创建时不带模型：留空模型并进入待用户赋模型状态。"""
         tool = self._tool("top1", leader_id="")
         result = tool._action_create_member({"member_name": "无模型"})
         self.assertEqual(result["model_id"], "")

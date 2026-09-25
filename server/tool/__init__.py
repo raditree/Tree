@@ -100,7 +100,8 @@ def register_builtin_tools(
 
     :param session: LLM 会话实例（工具将通过 register_tool 挂载）
     :param docker_manager: Docker 工作空间管理器（team 工具使用）
-    :param model_configs: 可用模型配置字典（team 工具创建成员时使用）
+    :param model_configs: 可用模型配置字典（历史参数：模型配置已收敛为
+                          **用户界面操作**，内置工具不再读写它）
     :param mcp_config: 可选外部 MCP 服务配置字典（name -> {command, args, env}）
     :param broker: 团队成员消息投递器（TeamMessageBroker），team 工具用于
                    触发成员异步处理

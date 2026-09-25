@@ -485,16 +485,9 @@ class TeamToolBase:
         member_id = member.get("id", "")
         if not member_id:
             return False
+        # model_id **原样透传，不回退 TOP 模型**：空模型代表该成员尚未被用户
+        # 赋模型（未就绪），补上 TOP 模型会让其在未授权时具备可执行模型。
         member_model = member.get("model_id", "") or ""
-        if not member_model and self.team_id:
-            try:
-                from data.agent_store import get_agent
-
-                top_rec = get_agent(self.user_id, self.team_id) or {}
-                member_model = top_rec.get("model_id") or ""
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("成员空 model_id 回退 TOP 模型失败: %s", exc)
-                member_model = ""
         leader_id = member.get("parent_agent_id", "") or self.leader_id
         return self.broker.dispatch(
             (self.user_id, member_id),
@@ -714,7 +707,8 @@ class TeamToolBase:
         - teammates：parent_agent_id == 本 agent 的直属成员；
         - team_member：同 TOP 其余成员（排除自己），relation 标 peer/indirect。
         顶层 members 为三组合集（字段一致），total 与合集一致；筛选参数
-        model_id/level/work_status 只作用于两个成员组。
+        level/work_status 只作用于两个成员组（**不提供 model_id 筛选**：
+        模型配置属用户界面职责，team 工具不涉及模型）。
         """
         rows = [m for m in self._live_members() if m.get("id") != self.agent_id]
         names_map = self._build_names_map(rows)
@@ -728,10 +722,6 @@ class TeamToolBase:
         ]
 
         # 筛选（不含 leader 组）
-        model_id = arguments.get("model_id")
-        if model_id:
-            teammates_raw = [m for m in teammates_raw if m.get("model_id") == model_id]
-            others_raw = [m for m in others_raw if m.get("model_id") == model_id]
         level = arguments.get("level")
         if level is not None:
             try:

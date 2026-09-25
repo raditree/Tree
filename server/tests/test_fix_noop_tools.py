@@ -7,7 +7,7 @@
 - spec_tool.current_status_text：selected spec 三类文案
   （未选择 / 已选但无内置 / 正常含内置），并标注内置/自定义（问题 3）。
 - spec search/list 返回项标注 builtin 字段（问题 4）。
-- TeamTool._action_list_models 返回具体模型（配合 _stringify 展开，问题 1）。
+- team 工具**不提供模型能力**：无 list_models 动作、不接受 model_id 参数。
 """
 
 import unittest
@@ -21,6 +21,7 @@ class TestStringifyToolResultLists(unittest.TestCase):
     """_stringify_tool_result 列表字段必须展开具体项，而非只给数量。"""
 
     def test_models_list_expanded_not_count_only(self):
+        """通用列表展开：任何形如 models 的列表字段都逐项展开。"""
         out = _stringify_tool_result({
             "models": [
                 {"model_id": "deepseek-v4-flash-0731", "name": "DeepSeek V4"},
@@ -50,7 +51,7 @@ class TestStringifyToolResultLists(unittest.TestCase):
         self.assertIn("builtin=否", out)
 
     def test_members_list_expanded_empty_model_id_visible(self):
-        # 空 model_id 字段也要可见（配合自动回退机制，模型能感知字段存在）
+        # 空 model_id 字段也要可见（"空 = 未就绪"依赖模型能感知字段存在但为空）
         out = _stringify_tool_result({
             "members": [
                 {"id": "m1", "name": "婉宁", "role": "产品经理",
@@ -180,22 +181,53 @@ class TestSpecListBuiltinFlag(unittest.TestCase):
         self.assertTrue(out["specs"][0]["builtin"])
 
 
-class TestListModelsReturnsConcrete(unittest.TestCase):
-    """list_models 返回具体模型（模型 id + 名称），配合 _stringify 展开。"""
+class TestTeamToolHasNoModelCapability(unittest.TestCase):
+    """team 工具不提供任何模型能力：无 list_models 动作、三处写路径均拒绝 model_id。
 
-    def test_action_list_models_returns_models(self):
+    模型配置是**用户界面操作**（「团队成员 → 模型配置」页），agent 侧工具
+    既不能枚举模型池，也不能为成员指定/修改模型。
+    """
+
+    def _tool(self):
         from tool.team_tool import TeamTool
+
         session = MagicMock()
         session.workspace_id = "ws"
         cfg = ModelConfig(name="DeepSeek V4", base_url="u", api_key="k",
                           model_id="deepseek-v4-flash-0731")
-        tool = TeamTool(session, MagicMock(),
+        return TeamTool(session, MagicMock(),
                         {"deepseek-v4-flash-0731": cfg},
                         user_id="u", agent_id="a", team_id="t")
-        out = tool.execute({"action": "list_models"})
-        self.assertEqual(out["total"], 1)
-        self.assertEqual(out["models"][0]["model_id"], "deepseek-v4-flash-0731")
-        self.assertEqual(out["models"][0]["name"], "DeepSeek V4")
+
+    def test_list_models_action_removed(self):
+        out = self._tool().execute({"action": "list_models"})
+        self.assertIn("未知 action", str(out))
+
+    def test_tool_schema_has_no_model_id_param(self):
+        params = self._tool().get_tool_definition()["function"]["parameters"]
+        self.assertNotIn("model_id", params["properties"])
+        self.assertNotIn("list_models", params["properties"]["action"]["enum"])
+
+    def test_create_member_rejects_model_id(self):
+        out = self._tool().execute({
+            "action": "create_member", "member_name": "甲",
+            "model_id": "deepseek-v4-flash-0731",
+        })
+        self.assertIn("无权为成员分配模型", out["error"])
+
+    def test_update_member_rejects_model_id(self):
+        out = self._tool().execute({
+            "action": "update_member", "target_member_id": "m1",
+            "model_id": "deepseek-v4-flash-0731",
+        })
+        self.assertIn("无权修改成员模型", out["error"])
+
+    def test_review_member_rejects_model_id(self):
+        out = self._tool().execute({
+            "action": "review_member", "target_member_id": "m1",
+            "model_id": "deepseek-v4-flash-0731",
+        })
+        self.assertIn("无权为成员分配模型", out["error"])
 
 
 class TestMemberReplyFallbackPushback(unittest.TestCase):

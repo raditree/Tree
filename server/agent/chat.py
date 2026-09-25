@@ -882,8 +882,9 @@ def _build_member_topology_text(
         lines.append("当前为顶层 Agent，尚无成员（需要分工时：应用户要求经 "
                      "team create_member 建队，再用 message send_message 派活）。")
     lines.append("寻址规则:")
-    lines.append("- 管理与通信已拆为两个工具：team 负责 list_models/list_teams/"
-                 "list_members/create_member/query_member/update_member/query_status；"
+    lines.append("- 管理与通信已拆为两个工具：team 负责 list_teams/list_members/"
+                 "create_member/query_member/update_member/remove_member/"
+                 "review_member/query_status；"
                  "message 负责 send_message/broadcast/wait_for（list_members/list_teams "
                  "两个工具都可调用）。")
     lines.append("- 本团队内按成员名称（name）或成员 ID 寻址：先 team list_members "
@@ -899,8 +900,10 @@ def _build_member_topology_text(
                  "本人可发起；成员需跨团队时请直属 leader 转达）。")
     lines.append("- 回复路径：成员→上级（TOP）；TOP→用户。成员不直接面向用户。")
     lines.append("- 派活前先 team list_members/query_member 核对：role/duty 为空时 "
-                "用 team update_member 补充完善；model_id 为空会自动回退所属 "
-                "TOP 模型（无需强制 update_member）。")
+                "用 team update_member 补充完善。成员模型由**用户**在「团队成员 → "
+                "模型配置」页配置，team 工具无权设置（传入 model_id 会被拒绝）；"
+                "成员模型为空即**尚未就绪**（会拦截消息），应提示用户去配置，"
+                "而不是反复派活。")
     return "\n".join(lines)
 
 
@@ -2875,16 +2878,11 @@ def _dispatch_agent_message(
         if member is None:
             rejected.append(target_id)
             continue
-        # 成员 model_id 为空时回退所属 TOP 的模型：建队默认继承 TOP 模型，
-        # 此处兼容历史空 model_id 成员，避免消息被 _process_member_message
-        # 因"模型不存在"静默丢弃（成员"收不到"消息）。
+        # 成员 model_id **原样透传，不回退所属 TOP 的模型**：空模型意味着该成员
+        # 尚未由用户赋模型（未就绪），此处若悄悄补上 TOP 模型，一旦
+        # _member_review_block 因读库异常而按放行处理，成员就会在未授权的情况下
+        # 自主执行。留空则由下游按"成员模型不存在"拒绝并回传明确原因（fail closed）。
         member_model = member.get("model_id") or ""
-        if not member_model and owner_top:
-            try:
-                top_rec = get_agent(user_id, owner_top) or {}
-                member_model = top_rec.get("model_id") or ""
-            except Exception:  # noqa: BLE001
-                member_model = ""
         payload = {
             "user_id": user_id,
             "agent_id": target_id,

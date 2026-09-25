@@ -6,7 +6,7 @@
 2. L1 视角：leader=TOP(level 0)、自建 L2 在 teammates、平级在 team_member、
    自己不出现在任何组
 3. L2 视角：leader 经 team_members 解析为 L1（level/名称正确，非裸 id）
-4. 实时 work_status 叠加 + 三种筛选（model_id/level/work_status）+ log_path
+4. 实时 work_status 叠加 + 两种筛选（level/work_status）+ log_path
 5. legacy roster 回退：非 TOP 视角不产生伪直属
 6. team 与 message 两工具 list_members/list_teams 输出完全一致（防行为漂移）
 7. query_status 输出形状（缺陷 #9）：含 work_status/last_active_at/log_path，
@@ -183,11 +183,12 @@ class TestFiltersAndLiveStatus(ListMembersBase):
         self.assertEqual(self._ids(groups["teammates"]), ["l1a"])
         self.assertEqual(groups["team_member"], [])
 
-    def test_model_filter(self):
+    def test_model_filter_no_longer_supported(self):
+        """team 工具不涉及模型：model_id 不再是筛选参数（传了也不生效）。"""
         tool = self._tool("top1", leader_id="")
         result = tool._action_list_members({"model_id": "m2"})
         groups = result["groups"]
-        self.assertEqual(groups["teammates"], [])
+        self.assertEqual(self._ids(groups["teammates"]), ["l1a", "l1b"])
         self.assertEqual(self._ids(groups["team_member"]), ["l2a"])
 
     def test_level_filter(self):

@@ -336,7 +336,7 @@ def reload_model_configs() -> Dict[str, ModelConfig]:
 
     **必须**在每次自定义模型写/删之后调用：``state.model_configs`` 是进程启动
     时的快照，而全部生效路径（``PATCH /api/agents/{id}`` 的模型校验、agent 会话
-    创建、team 工具的 list_models/create_member）都读该快照。只写 YAML 而不刷新
+    创建、成员模型解析、team 工具的 create_member）都读该快照。只写 YAML 而不刷新
     快照，会出现"下拉里看得见新模型、选中却被 400 拒绝"的双轨制问题。
 
     延迟 import ``state`` 以避免 ``config`` 包反向依赖 ``state`` 造成循环导入。

@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""P6 create_member 测试：dispatch 注册、初始化消息、直属上限、动态层级错误。
+"""P6 create_member 测试：dispatch 注册、待用户配置、直属上限、动态层级错误。
 
 覆盖：
 - team 工具 dispatch 表含 create_member（LLM 可调用）
-- 创建成员后自动向新成员投递含 system_prompt 的初始化消息
+- 创建成员后**不投递**初始化消息：模型由用户配置，未就绪前不接收消息
 - 直属成员数量上限（按 parent_agent_id 计数，非 TOP 总人数）
 - 层级校验错误信息动态（不再硬编码 Level 3）
 - list_members 分组：teammates=直属 / team_member=同 TOP 非直属
@@ -59,8 +59,8 @@ class TestCreateMemberDispatch(unittest.TestCase):
     def test_dispatch_contains_create_member(self):
         """create_member 已注册到 team 工具 dispatch 表（LLM 可调用）。
 
-        未指定 model_id 时**不再返回模型池**：成员创建后不继承 TOP 模型，
-        ``model_id`` 变为可选（缺省留空 + pending_model，等用户赋模型 + 审核）。
+        成员创建后不继承 TOP 模型：``model_id`` 一律留空 + pending_model
+        （等用户赋模型 + 审核）。工具**不接受** model_id 参数。
         """
         tool = _make_tool()
         tool.docker_manager.create_workspace.return_value = {
@@ -81,11 +81,11 @@ class TestCreateMemberDispatch(unittest.TestCase):
 
 
 class TestCreateMemberFlow(unittest.TestCase):
-    def test_create_member_persists_and_awaits_review(self):
+    def test_create_member_persists_and_awaits_user_config(self):
         """创建后：落 team_members 表（含 system_prompt/parent）+ 不进初始化投递。
 
-        成员在用户审核通过前不接收任何消息，故 create_member **不投递**
-        初始化消息（避免制造注定失败的死信），返回 awaiting 提示。
+        成员在用户赋模型并审核通过前不接收任何消息，故 create_member **不投递**
+        初始化消息（避免制造注定失败的死信），返回等待用户处理提示。
         """
         tool = _make_tool(agent_id="top1", team_id="top1")
         tool.can_lead_team = True
@@ -98,13 +98,13 @@ class TestCreateMemberFlow(unittest.TestCase):
             result = tool.execute({
                 "action": "create_member",
                 "member_name": "测试成员",
-                "model_id": "m",
                 "system_prompt": "你是测试工程师，负责后端验证。",
             })
         self.assertTrue(result["member_id"].startswith("member_"))
         self.assertEqual(result["workspace_id"], "member_x")
-        # 指定了模型 → pending_review（赋了模型但用户尚未过审）
-        self.assertEqual(result["review_status"], "pending_review")
+        # 模型由用户配置 → 创建即 pending_model，等用户赋模型 + 审核
+        self.assertEqual(result["model_id"], "")
+        self.assertEqual(result["review_status"], "pending_model")
         self.assertFalse(result["initialized"])
         self.assertIn("等待用户处理", result["hint"])
         tool._dispatch_to_member.assert_not_called()
@@ -114,10 +114,22 @@ class TestCreateMemberFlow(unittest.TestCase):
         self.assertEqual(kwargs["system_prompt"], "你是测试工程师，负责后端验证。")
         self.assertEqual(kwargs["parent_agent_id"], "top1")
         self.assertEqual(kwargs["team_id"], "top1")
-        self.assertEqual(kwargs["review_status"], "pending_review")
+        self.assertEqual(kwargs["review_status"], "pending_model")
+
+    def test_create_member_rejects_model_id(self):
+        """工具无权指定模型：传 model_id 直接拒绝（而非静默忽略）。"""
+        tool = _make_tool(agent_id="top1", team_id="top1")
+        tool.can_lead_team = True
+        with _patch_members(tool):
+            result = tool.execute({
+                "action": "create_member", "member_name": "带模型成员",
+                "model_id": "m",
+            })
+        self.assertIn("无权为成员分配模型", result["error"])
+        self.assertEqual(tool.members, [])
 
     def test_create_member_without_model_is_pending_model(self):
-        """省略 model_id：成员留空模型 + pending_model（由用户赋模型）。"""
+        """成员模型留空 + pending_model（由用户赋模型）。"""
         tool = _make_tool(agent_id="top1", team_id="top1")
         tool.can_lead_team = True
         tool.docker_manager.create_workspace.return_value = {
@@ -149,9 +161,9 @@ class TestCreateMemberFlow(unittest.TestCase):
         ]
         with _patch_members(tool):
             result = tool.execute({
-                "action": "create_member", "model_id": "m",
+                "action": "create_member",
             })
-        # 未达上限：继续走创建流程（model 存在则创建，无需校验错误）
+        # 未达上限：继续走创建流程（无模型 → 建为待用户配置成员，非校验错误）
         self.assertNotIn("已达上限", str(result))
 
         tool2 = _make_tool(max_members=2, agent_id="top1", team_id="top1")
@@ -163,7 +175,7 @@ class TestCreateMemberFlow(unittest.TestCase):
         ]
         with _patch_members(tool2):
             result2 = tool2.execute({
-                "action": "create_member", "model_id": "m",
+                "action": "create_member",
             })
         self.assertIn("已达上限", str(result2))
         self.assertIn("2", str(result2))
@@ -174,7 +186,7 @@ class TestCreateMemberFlow(unittest.TestCase):
         tool.level = 2  # Level 2 且 max_team_level=2 → 拒绝
         tool.can_lead_team = True
         result = tool.execute({
-            "action": "create_member", "model_id": "m",
+            "action": "create_member",
         })
         self.assertIn("Level 2", str(result))
         self.assertNotIn("Level 3", str(result))
@@ -183,7 +195,7 @@ class TestCreateMemberFlow(unittest.TestCase):
         tool = _make_tool(agent_id="top1", team_id="top1")
         tool.can_lead_team = False
         result = tool.execute({
-            "action": "create_member", "model_id": "m",
+            "action": "create_member",
         })
         self.assertIn("can_lead_team=False", str(result))
 

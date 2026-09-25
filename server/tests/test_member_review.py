@@ -14,7 +14,8 @@
   其它字段不冲掉审核结论
 - 旧库迁移：已存在的表补 ``review_status`` 列并按有无模型回填
 - ``team_init``：建队预建 3 名、受每层上限钳制、成员无模型 + pending
-- ``team_tool.create_member``：省略 model_id 仍可创建；不投递初始化消息
+- ``team_tool.create_member``：不接受 model_id（拒绝）；一律留空模型 + 不投递
+  初始化消息
 - ``team_tool.review_member``：放行 / 驳回 / 非法状态 / 成员不存在
 - ``chat._member_review_block``：审核闸口径（未就绪拒绝、已通过放行、
   TOP 自身与未建队不拦）
@@ -291,7 +292,7 @@ class TestTeamInitDefaults(TeamStoreBase):
 
 
 class TestCreateMemberWithoutModel(TeamStoreBase):
-    """team_tool.create_member：模型可选，且不投递注定失败的消息。"""
+    """team_tool.create_member：模型不由工具设置（不接受 model_id），不投递注定失败的消息。"""
 
     def _tool(self):
         from tool.team_tool import TeamTool
@@ -342,24 +343,26 @@ class TestCreateMemberWithoutModel(TeamStoreBase):
             add_member.call_args.kwargs["review_status"], "pending_model"
         )
 
-    def test_create_with_model_enters_pending_review(self):
+    def test_create_with_model_rejected(self):
+        """create_member 不接受 model_id：模型由用户在界面配置。"""
         tool = self._tool()
-        with patch("data.team_store.add_member"), self._patch_members(tool):
+        with self._patch_members(tool):
             result = tool.execute({
                 "action": "create_member", "member_name": "带模型成员",
                 "model_id": "m",
             })
-        self.assertEqual(result["review_status"], "pending_review")
-        self.assertFalse(result["initialized"])
+        self.assertIn("无权为成员分配模型", result["error"])
+        self.assertEqual(tool.members, [])
 
-    def test_unknown_model_still_rejected(self):
+    def test_unknown_model_also_rejected(self):
+        """即使模型 ID 非法也走同一拒绝口径（本工具根本不处理模型）。"""
         tool = self._tool()
         with self._patch_members(tool):
             result = tool.execute({
                 "action": "create_member", "member_name": "错模型",
                 "model_id": "nope",
             })
-        self.assertIn("模型不存在", result["error"])
+        self.assertIn("无权为成员分配模型", result["error"])
 
 
 class TestReviewMemberAction(TeamStoreBase):
@@ -403,13 +406,23 @@ class TestReviewMemberAction(TeamStoreBase):
         })
         self.assertEqual(result["review_status"], "rejected")
 
-    def test_assign_model_and_approve_together(self):
-        result = self._tool().execute({
+    def test_assign_model_rejected_approve_still_works(self):
+        """review_member 不能顺手赋模型（用户职责）；不带 model_id 仍可审核。"""
+        tool = self._tool()
+        rejected = tool.execute({
             "action": "review_member", "target_member_id": "m1",
             "model_id": "m2", "review_status": "approved",
         })
-        self.assertEqual(result["model_id"], "m2")
+        self.assertIn("无权为成员分配模型", rejected["error"])
+        # 未被顺手赋模型
+        self.assertEqual(team_store.get_member("top1", "m1")["model_id"], "m")
+        # 不带 model_id 的审核照常生效
+        result = tool.execute({
+            "action": "review_member", "target_member_id": "m1",
+            "review_status": "approved",
+        })
         self.assertEqual(result["review_status"], "approved")
+        self.assertEqual(result["model_id"], "m")
 
     def test_pending_model_hint(self):
         team_store.add_member("u1", "top1", "m2", "B")
