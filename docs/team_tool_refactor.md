@@ -55,6 +55,13 @@
 
 - ``_process_member_message`` 在成员工具循环完成后，把最后一次回复 content 经统一消息 API 回传 ``leader_id``（前缀 ``[成员 xxx 完成回复]``），leader 收到后作为普通消息进入其串行队列。
 
+> **已废弃（后续变更）**：该"成员完成回复自动回传"与 Task 7.1 的"总结反向推送"
+> 均**已整体移除**（commit ``c2acf4c`` / 后续 fix）。现在系统不对任何消息做自动
+> 回传：成员最终回复只落库到成员自己的会话，并实时写入
+> ``agentspace/{member_id}/.self/activity.log``；需要对方知道结果时，由 agent
+> 自己显式 ``send_message`` 回发（见 ``prompt/versions/*/tools/builtin.yaml`` 的
+> message 条目"回复机制"）。本节仅作历史记录保留。
+
 ## 7. 验证结果
 
 - 所有修改文件 ``ast.parse`` 语法检查通过；``import main`` OK；

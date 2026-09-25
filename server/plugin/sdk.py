@@ -4,7 +4,7 @@
 
 - **workspace**：workspaceIO 读写（``io_.workspace_io`` 统一三模式通道）；
 - **dispatch**：向 agent 推送消息（``agent.chat._dispatch_agent_message``，
-  默认 ``active=False`` 防循环）；
+  不做任何自动回传，无需被动标记）；
 - **ws**：向前端推送（``ws.ws_manager.send_message``，只增不改的 plugin_* 类型）；
 - **log**：活动日志（``agent.chat._append_activity_log``）。
 
@@ -279,7 +279,7 @@ class PluginSDK:
             return {"error": f"workspace_write 失败: {exc}"}
 
     # ------------------------------------------------------------------
-    # 能力 2：向 agent 推送（默认 active=False 防循环）
+    # 能力 2：向 agent 推送
     # ------------------------------------------------------------------
     def dispatch_agent_message(
         self,
@@ -288,9 +288,12 @@ class PluginSDK:
         *,
         session_id: Optional[str] = None,
         extra: Optional[Dict[str, Any]] = None,
-        active: bool = False,
     ) -> Dict[str, Any]:
-        """向指定 agent 推送消息（默认被动通道，不触发总结反向推送）。"""
+        """向指定 agent 推送消息。
+
+        系统**不对任何消息做自动回传**（既不推总结也不回传成员最终回复），
+        因此这里不需要"被动标记"参数——收到消息的一方不会自动把结果发回来。
+        """
         try:
             user_id = self._require_user()
         except PermissionError as exc:
@@ -309,7 +312,6 @@ class PluginSDK:
             "source_agent_id": self.scope["agent_id"] or self.scope["team_id"],
             "team_id": self.scope["team_id"],
             "extra": payload_extra,
-            "active": bool(active),
         }
         try:
             dispatch = _dispatcher or _default_dispatcher
@@ -373,7 +375,7 @@ class PluginSDK:
         content: str,
         session_id: str = "",
     ) -> Dict[str, Any]:
-        """向 agent 推送消息（契约 §7；active=False 防循环，归属取实例 scope）。"""
+        """向 agent 推送消息（契约 §7；归属取实例 scope）。"""
         return self.dispatch_agent_message(
             target_ids, content, session_id=(session_id or None)
         )

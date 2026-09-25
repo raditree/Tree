@@ -236,7 +236,7 @@ def register_ws(app: FastAPI) -> None:
         connection_id = await state.ws_manager.connect(user_id, ws)
         # 本连接运行在主事件循环线程：绑定循环引用，供消息分发层（同步
         # 函数，可能运行在工具线程/线程池）经 run_coroutine_threadsafe
-        # 线程安全推送 WS 消息（session_created / 总结反向推送等）。
+        # 线程安全推送 WS 消息（session_created / agent_status / 文本段等）。
         _bind_main_loop()
         # 本连接注册过的执行器 (mode, team_id) 列表：断连时等价前端主动
         # unregister，避免连接死亡后执行器幽灵注册（工具请求继续空等）。
@@ -309,13 +309,11 @@ def register_ws(app: FastAPI) -> None:
                 # 兼容两种字段位置：优先 data 子对象，回退到顶层字段
                 # 注意必须保留 session_id：前端 user_message 将字段放在顶层，
                 # 若丢弃 session_id 会回退到默认会话，造成跨会话串扰。
-                # active（Task 7.1）：主动/被动标记同样透传（缺省由
-                # _dispatch_user_message 兜底为 true）。
                 if not data:
                     data = {
                         k: message.get(k)
                         for k in ("agent_id", "content", "attachments",
-                                  "session_id", "active")
+                                  "session_id")
                         if message.get(k) is not None
                     }
 

@@ -99,7 +99,7 @@ plugin.get_bus().publish("tool.call.completed", scope, {"tool_name": "read"}, so
 | 方法 | 说明 |
 |------|------|
 | `workspace_read(path, workspace_id=None, encoding="utf-8")` / `workspace_write(path, content, workspace_id=None)` | 读 / 写工作空间（workspace_id 白名单：agent_id / team_id；M3：read 支持 `encoding` 可选参，非法编码 fail-open） |
-| `dispatch_agent_message(target_ids, content, ...)` / `push_to_agent(target_ids, content, session_id="")` | 向 agent 推送（默认 `active=False` 防循环；后为契约 §7 别名） |
+| `dispatch_agent_message(target_ids, content, ...)` / `push_to_agent(target_ids, content, session_id="")` | 向 agent 推送（系统不做任何自动回传，故无被动标记参数；后为契约 §7 别名） |
 | `ws_push({"type": "plugin_*", ...})` / `emit_frontend(event_type, data)` | 向前端推送（需主循环绑定；后为契约 §7 别名，构造 `plugin_event` 消息） |
 | `activity_log(message)` / `log_activity(message)` | 追加活动日志（后为契约 §7 别名） |
 

@@ -232,7 +232,7 @@ class TestTeamToolHasNoModelCapability(unittest.TestCase):
 
 class TestMemberReplyFallbackPushback(unittest.TestCase):
     """问题 2：成员完成 tool loop 但无文字输出时，最后一次工具结果
-    兜底为回复内容，_process_member_message 据此推送给上一级 leader。"""
+    兜底为回复内容，_process_member_message 只把它落库到成员自己的会话。"""
 
     def _run(self, coro):
         import asyncio

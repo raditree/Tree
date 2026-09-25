@@ -234,14 +234,11 @@ async def _register_tools(
                     source_agent_id=team_id or agent_id,
                     team_id=team_id,
                     extra={"session_id": session_id, "sender_id": sender},
-                    # 唤醒续跑属被动注入：标记 active=false（接收侧只读）
-                    active=False,
                 )
             else:
                 _dispatch_agent_message(
                     user_id, [agent_id], content, "",
                     team_id or agent_id, "", {"session_id": session_id},
-                    active=False,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.exception(
@@ -1981,8 +1978,8 @@ async def _stream_agent_reply(
     # 本轮是否产出过文本段（含已随工具调用关闭的中间段）：决定结束时的
     # "最终回复"取值策略（本轮从未产出文本段时回退 full_text 兜底）
     text_seen = False
-    # 最后一次工具调用摘要（纯 tool loop 无文字输出时，兜底为回复内容推送
-    # 给上一级 leader，避免成员完成工作后 leader 收不到任何结果）
+    # 最后一次工具调用摘要（纯 tool loop 无文字输出时，兜底为回复内容：
+    # 落库到该成员自己的会话，作为"本轮无文字输出"的可读记录）
     last_tool_text = ""
     # thinking（推理）段累积：每段独立 id，收到非 thinking 产出时关闭并持久化
     thinking_parts: List[str] = []
@@ -2239,7 +2236,7 @@ async def _stream_agent_reply(
     # 结束时仍打开的文本段即最终回复，交由调用方补发 msg_usage
     last_text_id = text_id
     # 纯 tool loop 无文字输出兜底：status=ok 且无任何文本时，用最后一次
-    # 工具调用摘要作为回复内容（_process_member_message 据此推送给 leader）。
+    # 工具调用摘要作为回复内容（由 _process_member_message 落库到成员会话）。
     if (
         status == "ok"
         and not full_parts
@@ -2712,7 +2709,6 @@ def _dispatch_agent_message(
     team_id: str = "",
     system_prompt: str = "",
     extra: Optional[Dict[str, Any]] = None,
-    active: bool = True,
 ) -> Dict[str, Any]:
     """统一消息发送 API：对本顶部 agent 旗下任意 agent_id 发送消息（一对多）。
 
@@ -2733,11 +2729,7 @@ def _dispatch_agent_message(
     （见 ``prompt/versions/*/tools/builtin.yaml`` 的 message 条目"回复机制"）。
     成员若无法处理消息（未就绪/无模型/命中并发上限），仍会以 ``auto_reply``
     方式回传一条明确错误，避免消息被静默丢弃。
-
-    :param active: 消息是否为主动发起（默认 true）。仅作为负载透传给接收侧
-                    （用于区分主动/被动注入），不再影响任何回传行为。
     """
-    active = bool(active)
     if isinstance(target_ids, str):
         target_ids = [target_ids]
     # ID 存在性校验（Task 2）：user_id 与归属（team_id/发送方）必须非空，
@@ -2828,8 +2820,6 @@ def _dispatch_agent_message(
             }
             if extra:
                 payload.update(extra)
-            # active 随负载透传（接收侧只读不消费：用于区分主动/被动注入）
-            payload["active"] = active
             # 接收方会话保障（Task 7.2）：broker 消费前确保会话元数据存在
             # 并推送 session_created（跨 team TOP↔TOP 与用户直发同样保障）
             _ensure_receiver_session(user_id, target_id, session_id, content)
@@ -2879,8 +2869,6 @@ def _dispatch_agent_message(
         }
         if extra:
             payload.update(extra)
-        # active 随负载透传（接收侧只读不消费：用于区分主动/被动注入）
-        payload["active"] = active
         # 接收方会话保障（Task 7.2）：broker 消费前确保会话元数据存在
         _ensure_receiver_session(user_id, target_id, session_id, content)
         dispatched = False
@@ -2951,7 +2939,6 @@ async def _dispatch_user_message(user_id: str, data: Dict[str, Any]) -> None:
     # 放入线程池执行，避免在事件循环线程内空等（阻塞期间其他请求全部卡住）。
     # 用户直发：source_agent_id 统一标记为 USER_AGENT_ID（历史为空串，
     # _dispatch_agent_message 经 is_user_sender 等效识别）。
-    # active（Task 7.1）：用户主动发起默认 true；前端/调用方可显式传 false。
     result = await asyncio.to_thread(
         _dispatch_agent_message,
         user_id, [agent_id], content,
@@ -2959,7 +2946,6 @@ async def _dispatch_user_message(user_id: str, data: Dict[str, Any]) -> None:
         agent_id,
         "",
         dict(data),
-        bool(data.get("active", True)),
     )
     if result.get("status") == "concurrency_limited":
         # 并发执行上限命中（Task 7）：提示用户稍后再试，不回落到
@@ -2995,11 +2981,12 @@ async def resume_after_answer(
       ``team_id`` 解析 roster。
     - 主 agent：经 ``_dispatch_user_message``（top_chat_broker）分发。
 
-    ``sender_id`` 为提问时持久化的原发送方；成员续跑后最终总结仍回发给它，
-    保证"谁发给它的总结就回发给谁"在提问-回答边缘路径同样成立。
+    ``sender_id`` 为提问时持久化的原发送方：它决定**错误回传**的接收者
+    （成员处理失败/未就绪时把原因发给谁），也是会话级 ``sender_id``
+    溯源（AskUserQuestion 再次提问时据此找回答方）。注意系统**不做任何
+    自动总结回传**，续跑产出的最终回复只留在成员自己的会话。
     """
     content = f"[AskUserQuestion 用户回答] {answer}"
-    # 作答唤醒属被动注入：以 active=false 投递（接收侧只读）
     try:
         if is_member:
             await asyncio.to_thread(
@@ -3007,14 +2994,12 @@ async def resume_after_answer(
                 user_id, [agent_id], content,
                 team_id, team_id, "",
                 {"session_id": session_id, "sender_id": sender_id},
-                False,
             )
         else:
             await _dispatch_user_message(user_id, {
                 "agent_id": agent_id,
                 "session_id": session_id,
                 "content": content,
-                "active": False,
             })
     except Exception as exc:  # noqa: BLE001
         logger.exception("唤醒 agent 失败: %s agent=%s", exc, agent_id)

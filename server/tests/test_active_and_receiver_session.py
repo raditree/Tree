@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Task 7：消息 active 语义（active 仅作透传标记）+ 接收方会话保障。
+"""Task 7：消息投递无自动回传（active 参数已移除）+ 接收方会话保障。
 
 覆盖：
-1. 总结反向推送已移除：active / auto_reply / 用户直发等任何情况下，投递都
-   不会把目标的最近总结回发给发起方（只投递原消息）。
+1. 自动回传已全部移除：任何情况下投递都不会把目标的最近总结回发给发起方，
+   也不会把成员处理完的最终回复回发给发送方（只投递原消息）。
 2. 接收方无 session → 自动创建会话元数据并经 WS 推送 session_created；
    跨 team（TOP↔TOP）、用户直发、成员目标同样保障；已存在会话不重复推送。
 3. sessions 表主键迁移（session_id → (session_id, user_id, agent_id)）：
    旧库数据保留，同一会话 id 可被多个 agent 各自持有元数据行。
-4. REST send_teammate_message 透传 active 参数。
+4. REST send_teammate_message 透传 session_id，且不再有 active 参数。
 """
 
 import asyncio
@@ -106,7 +106,7 @@ class Task7TestBase(unittest.TestCase):
         return {"workspace_id": None, "model_id": "m1"}
 
     def _dispatch(self, target, content, source_agent_id, team_id,
-                  active=True, extra=None, agents=None, find_member=None):
+                  extra=None, agents=None, find_member=None):
         """执行统一消息投递，返回 (ws, top_broker, team_broker) 捕获替身。
 
         事件循环内先 _bind_main_loop，使分发层 _push_ws 经 create_task
@@ -133,7 +133,6 @@ class Task7TestBase(unittest.TestCase):
                     source_agent_id=source_agent_id,
                     team_id=team_id,
                     extra={"session_id": self.session_id, **(extra or {})},
-                    active=active,
                 )
 
             _flush_async(main)
@@ -155,7 +154,7 @@ class Task7TestBase(unittest.TestCase):
 
 
 class TestNoSummaryPushback(Task7TestBase):
-    """总结反向推送已移除：active 消息不再自动把目标总结回发给发起方。
+    """总结反向推送已移除：任何消息都不再把目标总结回发给发起方。
 
     原 Task 7.1 的"总结反向推送"会让两个 agent 互相发消息时各自自动回传总结，
     形成 A↔B→A… 的无限交火并浪费大量 API 调用。现改为由提示词约定：需要对方
@@ -168,20 +167,21 @@ class TestNoSummaryPushback(Task7TestBase):
             self.top_b: self._agent_record(),
         }
 
-    def test_active_message_does_not_push_summary_back(self):
-        """active=true 且目标已有总结 → 仍只投递原消息，不反向推送。"""
+    def test_message_does_not_push_summary_back(self):
+        """目标已有总结 → 仍只投递原消息，不反向推送。"""
         self._seed_summary(self.top_b)
         ws, top, team = self._dispatch(
             self.top_b, "新任务", self.top_a, self.top_a,
-            active=True, agents=self._agents(),
+            agents=self._agents(),
         )
         # 仅原消息投递给 topB；发起方 topA 不会额外收到"最近总结"消息
         self.assertEqual([p["agent_id"] for p in top.payloads], [self.top_b])
-        self.assertIs(top.payloads[0]["active"], True)
+        # 负载不再携带已移除的 active 字段
+        self.assertNotIn("active", top.payloads[0])
         self.assertEqual(team.payloads, [])
 
     def test_member_target_does_not_push_summary_back(self):
-        """TOP → 成员（active）：成员已有总结时也不再反向回发给发起 TOP。"""
+        """TOP → 成员：成员已有总结时也不再反向回发给发起 TOP。"""
         self._seed_summary(self.member_id)
         member = {
             "id": self.member_id, "name": "m", "model_id": "m1",
@@ -190,7 +190,7 @@ class TestNoSummaryPushback(Task7TestBase):
         agents = {self.top_a: self._agent_record()}
         ws, top, team = self._dispatch(
             self.member_id, "去做事", self.top_a, self.top_a,
-            active=True, agents=agents,
+            agents=agents,
             find_member=lambda uid, owner, mid: (
                 member if mid == self.member_id else None
             ),
@@ -198,20 +198,19 @@ class TestNoSummaryPushback(Task7TestBase):
         self.assertEqual([p["agent_id"] for p in team.payloads], [self.member_id])
         self.assertEqual(top.payloads, [])
 
-    def test_active_flag_still_passed_through_payload(self):
-        """移除推送后 active 仍随负载透传（接收侧只读，用于区分主动/被动注入）。"""
+    def test_no_active_field_in_payload(self):
+        """active 参数链已整体移除：负载与调用签名都不再有该字段。"""
+        import inspect
+
+        self.assertNotIn(
+            "active", inspect.signature(chat_mod._dispatch_agent_message).parameters
+        )
         agents = {self.top_b: self._agent_record()}
         ws, top, team = self._dispatch(
             self.top_b, "主动消息", self.top_a, self.top_a,
-            active=True, agents=agents,
+            agents=agents,
         )
-        self.assertIs(top.payloads[0]["active"], True)
-
-        ws2, top2, team2 = self._dispatch(
-            self.top_b, "被动消息", self.top_a, self.top_a,
-            active=False, agents=agents,
-        )
-        self.assertIs(top2.payloads[0]["active"], False)
+        self.assertNotIn("active", top.payloads[0])
 
 
 class TestReceiverSessionGuarantee(Task7TestBase):
@@ -228,7 +227,7 @@ class TestReceiverSessionGuarantee(Task7TestBase):
         content = "帮我看看跨 team 的会话保障"
         ws, top, team = self._dispatch(
             self.top_b, content, self.top_a, self.top_a,
-            active=True, agents=self._agents(),
+            agents=self._agents(),
         )
         # 接收方会话元数据落库（sessions 主键含 agent_id），标题取首条消息摘要
         rec = session_store.get_session_record(
@@ -248,10 +247,10 @@ class TestReceiverSessionGuarantee(Task7TestBase):
         """同一会话再次投递：不重复推送 session_created。"""
         agents = self._agents()
         self._dispatch(self.top_b, "第一条", self.top_a, self.top_a,
-                       active=True, agents=agents)
+                       agents=agents)
         ws2, top2, team2 = self._dispatch(
             self.top_b, "第二条", self.top_a, self.top_a,
-            active=True, agents=agents,
+            agents=agents,
         )
         created = [m for m in ws2.sent if m.get("type") == "session_created"]
         self.assertEqual(created, [])
@@ -261,7 +260,7 @@ class TestReceiverSessionGuarantee(Task7TestBase):
         agents = {self.top_b: self._agent_record()}
         ws, top, team = self._dispatch(
             self.top_b, "用户直发内容", USER_AGENT_ID, self.top_b,
-            active=True, agents=agents,
+            agents=agents,
         )
         rec = session_store.get_session_record(
             self.user_id, self.session_id, agent_id=self.top_b
@@ -280,7 +279,7 @@ class TestReceiverSessionGuarantee(Task7TestBase):
         agents = {self.top_a: self._agent_record()}
         ws, top, team = self._dispatch(
             self.member_id, "给成员的任务", self.top_a, self.top_a,
-            active=True, agents=agents,
+            agents=agents,
             find_member=lambda uid, owner, mid: (
                 member if mid == self.member_id else None
             ),
@@ -292,11 +291,11 @@ class TestReceiverSessionGuarantee(Task7TestBase):
         created = [m for m in ws.sent if m.get("type") == "session_created"]
         self.assertEqual(len(created), 1)
         self.assertEqual(created[0]["data"]["agent_id"], self.member_id)
-        # 成员负载携带 active
+        # 成员负载不再携带已移除的 active 字段
         member_payloads = [p for p in team.payloads
                            if p["agent_id"] == self.member_id]
         self.assertEqual(len(member_payloads), 1)
-        self.assertIs(member_payloads[0]["active"], True)
+        self.assertNotIn("active", member_payloads[0])
 
     def test_existing_session_not_repushed(self):
         """接收方会话已存在 → 不推送 session_created（避免刷屏）。"""
@@ -306,7 +305,7 @@ class TestReceiverSessionGuarantee(Task7TestBase):
         )
         ws, top, team = self._dispatch(
             self.top_b, "新消息", self.top_a, self.top_a,
-            active=True, agents=self._agents(),
+            agents=self._agents(),
         )
         created = [m for m in ws.sent if m.get("type") == "session_created"]
         self.assertEqual(created, [])
@@ -372,8 +371,8 @@ class TestSessionsPkMigration(unittest.TestCase):
         )
 
 
-class TestRestActiveParam(unittest.TestCase):
-    """REST send_teammate_message 透传 active 参数。"""
+class TestRestSendTeammateMessage(unittest.TestCase):
+    """REST send_teammate_message：透传 session_id；active 参数已移除。"""
 
     def setUp(self):
         self.user_id = "u7_" + uuid.uuid4().hex[:8]
@@ -386,18 +385,18 @@ class TestRestActiveParam(unittest.TestCase):
             )
         )
 
-    def test_active_default_true(self):
+    def test_session_id_passed_through(self):
         with patch.object(routes, "_dispatch_agent_message") as m:
             m.return_value = SimpleNamespace(get=lambda k, d=None: "sent")
             self._run({"content": "开工", "session_id": "s1"})
-            self.assertIs(m.call_args.kwargs["active"], True)
+            self.assertEqual(m.call_args.kwargs["extra"]["session_id"], "s1")
 
-    def test_active_false_passthrough(self):
+    def test_active_body_field_ignored(self):
+        """请求体带 active 不再被解析/转发（该参数链已整体移除）。"""
         with patch.object(routes, "_dispatch_agent_message") as m:
             m.return_value = SimpleNamespace(get=lambda k, d=None: "sent")
-            self._run({"content": "开工", "session_id": "s1",
-                       "active": False})
-            self.assertIs(m.call_args.kwargs["active"], False)
+            self._run({"content": "开工", "session_id": "s1", "active": False})
+            self.assertNotIn("active", m.call_args.kwargs)
 
 
 if __name__ == "__main__":

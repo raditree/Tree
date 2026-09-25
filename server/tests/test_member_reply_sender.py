@@ -149,12 +149,6 @@ class TestMemberNoAutoForward(unittest.TestCase):
                        auto_reply=True)
         self.assertEqual(self._run_payload(payload), [])
 
-    def test_passive_active_false_no_forward(self):
-        """被动 active=false（唤醒续跑等注入）→ 不回传任何 agent。"""
-        payload = dict(self.base, leader_id="top-1", sender_id="top-1",
-                       active=False)
-        self.assertEqual(self._run_payload(payload), [])
-
     def test_final_text_kept_in_own_session(self):
         """回传移除后，最终回复仍须落库到成员自己的会话（进度页可读）。"""
         stored = []

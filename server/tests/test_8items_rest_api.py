@@ -297,8 +297,7 @@ class TestUserMessageSessionChain(unittest.TestCase):
         captured = {}
 
         def _fake_dispatch(user_id, target_ids, content, source_agent_id="",
-                           team_id="", system_prompt="", extra=None,
-                           active=True):
+                           team_id="", system_prompt="", extra=None):
             captured["session_id"] = (extra or {}).get("session_id")
             return {"status": "sent", "sent": list(target_ids), "rejected": []}
 

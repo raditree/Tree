@@ -166,9 +166,17 @@ class TestRelayCopy(unittest.TestCase):
 
         src.read_file_base64 = _read  # type: ignore[assignment]
         dst = _FakeIO({})
-        result = ft.copy_file(src, "ws-a", "a/big.bin", dst, "ws-b")
+        # 上限压到 2 块：按真实 32MiB 上限要跑 512 轮 run_io（每轮新建一个事件
+        # 循环），在 Windows 上偶发事件循环生命周期竞态导致假失败。这里只测
+        # "超限即拒绝"的逻辑，量级口径由 test_relay_cap_is_32mib 单独锁定。
+        with patch.object(ft, "MAX_RELAY_BYTES", big * 2):
+            result = ft.copy_file(src, "ws-a", "a/big.bin", dst, "ws-b")
         self.assertIn("error", result)
         self.assertIn("中转上限", result["error"])
+
+    def test_relay_cap_is_32mib(self):
+        """中转上限口径固定 32 MiB（同根 cp 不受此限）。"""
+        self.assertEqual(ft.MAX_RELAY_BYTES, 32 * 1024 * 1024)
 
     def test_relay_reports_read_error(self):
         src = _FakeIO({})

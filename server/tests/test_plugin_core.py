@@ -5,7 +5,7 @@
 - 事件信封 / scope 四元组 / fail-closed 过滤（D1/D2/D4）；
 - 注册表：幂等注册、scope 匹配、实例内串行处理、TTL/Pin、级联清理（D2/D3）；
 - 看门狗：进度续期、fail-closed 归属校验、滑窗判死、实例心跳（D7）；
-- SDK：workspace 白名单校验、dispatch（active=False）、ws 注入、日志（D6）；
+- SDK：workspace 白名单校验、dispatch（不再传 active：系统无自动回传）、ws 注入、日志（D6）；
 - join 原语：键值/计数齐备、超时 partial、强制 partial、复用（D5）；
 - 门面：总开关关闭零副作用、启用全链路、环境变量开关。
 """
@@ -382,7 +382,7 @@ class TestSDK(unittest.TestCase):
         self.assertEqual(kw["user_id"], "u")
         self.assertEqual(kw["team_id"], "t")
         self.assertEqual(kw["source_agent_id"], "a")
-        self.assertFalse(kw["active"])  # D6：默认被动通道防循环
+        self.assertNotIn("active", kw)  # active 参数链已整体移除
         self.assertEqual(kw["extra"]["session_id"], "s")
         # 参数不完整 → 直接拒绝
         self.assertIn("error", sdk.dispatch_agent_message([], "x"))
