@@ -37,7 +37,11 @@ def _ensure_db() -> None:
                 model_id TEXT NOT NULL,
                 system_prompt TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL,
-                mode TEXT
+                mode TEXT,
+                reasoning_effort TEXT,
+                max_seqlen_override INTEGER,
+                max_output_tokens INTEGER,
+                compress_threshold REAL
             )
             """
         )
@@ -51,6 +55,8 @@ def _ensure_db() -> None:
         _migrate_add_deleted_at(conn)
         # 迁移：补充 mode 列（运行模式锁定值，NULL 表示未锁定；旧库补列）
         _migrate_add_mode(conn)
+        # 迁移：补充模型参数覆盖列（思考强度/输入长度/输出长度/压缩阈值）
+        _migrate_add_model_overrides(conn)
         conn.commit()
     _initialized = True
 
@@ -92,6 +98,33 @@ def _migrate_add_mode(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(agents)")}
     if "mode" not in cols:
         conn.execute("ALTER TABLE agents ADD COLUMN mode TEXT")
+
+
+# 模型参数覆盖列：列名 -> SQL 类型。
+# 全部 NULL = 不覆盖（回退模型 YAML 配置 / AgentLLMSession 的类常量默认值）。
+_MODEL_OVERRIDE_COLUMNS = {
+    "reasoning_effort": "TEXT",
+    "max_seqlen_override": "INTEGER",
+    "max_output_tokens": "INTEGER",
+    "compress_threshold": "REAL",
+}
+
+
+def _migrate_add_model_overrides(conn: sqlite3.Connection) -> None:
+    """为 agents 表补充每 agent 的模型参数覆盖列（若缺失）。
+
+    - ``reasoning_effort``：思考强度（透传 OpenAI 顶层参数，仅推理模型支持）
+    - ``max_seqlen_override``：最大输入（上下文预算）覆盖
+    - ``max_output_tokens``：最大输出 token（下发 ``max_tokens``）
+    - ``compress_threshold``：上下文压缩触发阈值（占 max_seqlen 的比例）
+
+    幂等：按 ``PRAGMA table_info`` 判定缺列后逐个 ``ALTER TABLE``（对齐
+    ``_migrate_add_mode`` 的既有写法）。
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(agents)")}
+    for column, sql_type in _MODEL_OVERRIDE_COLUMNS.items():
+        if column not in cols:
+            conn.execute(f"ALTER TABLE agents ADD COLUMN {column} {sql_type}")
 
 
 def _connect():
@@ -164,7 +197,9 @@ def get_agent(user_id: str, agent_id: str) -> Optional[Dict[str, Any]]:
     try:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT id, name, model_id, system_prompt, created_at, workspace_id "
+            "SELECT id, name, model_id, system_prompt, created_at, workspace_id, "
+            "reasoning_effort, max_seqlen_override, max_output_tokens, "
+            "compress_threshold "
             "FROM agents WHERE user_id = ? AND id = ? AND deleted_at IS NULL",
             (user_id, agent_id),
         ).fetchone()
@@ -178,15 +213,30 @@ def update_agent(
     agent_id: str,
     model_id: Optional[str] = None,
     system_prompt: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    max_seqlen_override: Optional[int] = None,
+    max_output_tokens: Optional[int] = None,
+    compress_threshold: Optional[float] = None,
+    clear_model_overrides: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """更新 agent 字段（model_id / system_prompt），仅更新非 None 字段。
+    """更新 agent 字段，仅更新非 None 字段。
 
-    用于 ``PATCH /api/agents/{id}``（右侧面板"模型信息"页修改模型与提示词）。
+    用于 ``PATCH /api/agents/{id}``（右侧面板"模型信息"页修改模型、提示词与
+    模型参数覆盖）。
+
+    模型参数覆盖语义：``None`` = **不修改**（保留库中原值）；``clear_model_overrides``
+    为 True 时把四个覆盖列一次性置 NULL（前端「清除自定义参数」）。
+    由此避免"传 None 到底是清空还是不改"的歧义。
 
     :param user_id: 用户标识
     :param agent_id: agent 标识
     :param model_id: 新模型 ID（可选）
     :param system_prompt: 新系统提示词（可选）
+    :param reasoning_effort: 思考强度覆盖（可选）
+    :param max_seqlen_override: 最大输入（上下文预算）覆盖（可选）
+    :param max_output_tokens: 最大输出 token 覆盖（可选）
+    :param compress_threshold: 上下文压缩阈值覆盖（可选，0.1~0.95）
+    :param clear_model_overrides: 是否一次性清除全部模型参数覆盖
     :return: 更新后的 agent 字典；agent 不存在返回 None
     """
     _ensure_db()
@@ -195,6 +245,17 @@ def update_agent(
         updates["model_id"] = model_id
     if system_prompt is not None:
         updates["system_prompt"] = system_prompt
+    if reasoning_effort is not None:
+        updates["reasoning_effort"] = reasoning_effort
+    if max_seqlen_override is not None:
+        updates["max_seqlen_override"] = max_seqlen_override
+    if max_output_tokens is not None:
+        updates["max_output_tokens"] = max_output_tokens
+    if compress_threshold is not None:
+        updates["compress_threshold"] = compress_threshold
+    if clear_model_overrides:
+        for column in _MODEL_OVERRIDE_COLUMNS:
+            updates[column] = None
     if not updates:
         return get_agent(user_id, agent_id)
 

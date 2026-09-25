@@ -23,7 +23,15 @@ from agent.chat import (
     resume_after_answer,
 )
 from config.config import get_config
-from config.models import get_model_configs
+from config.models import (
+    REASONING_EFFORT_ACCEPTED,
+    REASONING_EFFORT_CANONICAL,
+    declared_reasoning_effort_options,
+    get_model_configs,
+    normalize_reasoning_effort,
+    normalize_reasoning_effort_options,
+    resolve_reasoning_effort_options,
+)
 from data.agent_store import (
     create_agent,
     delete_agent,
@@ -526,6 +534,8 @@ def _roster_from_db(db_members: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "id": m["id"],
             "name": m["name"],
             "model_id": m.get("model_id", ""),
+            # 审核状态：前端据此渲染"等待赋模型/待审核"提示与红点
+            "review_status": m.get("review_status", "") or "",
             "level": m.get("level", 1),
             "created_at": m.get("created_at", ""),
             "work_status": m.get("work_status", "idle"),
@@ -553,6 +563,7 @@ async def get_agent_teammates(
     agent = get_agent(user_id, agent_id)
     workspace_id = (agent.get("workspace_id") if agent else None) or agent_id
 
+    from data.team_store import REVIEW_STATUS_NEEDS_USER
     from data.team_store import get_members as get_team_members
 
     db_rows = _collect_team_tree(agent_id, get_team_members)
@@ -578,7 +589,155 @@ async def get_agent_teammates(
             if any(k[0] == user_id and k[1] == mid for k in _active_tasks)
             else "idle"
         )
-    return {"agent_id": agent_id, "members": members}
+        if not m.get("review_status"):
+            # roster 文件回退路径没有该列（历史数据）：按有无模型兜底
+            m["review_status"] = (
+                "approved" if str(m.get("model_id") or "").strip()
+                else "pending_model"
+            )
+    pending = sum(
+        1 for m in members if m["review_status"] in REVIEW_STATUS_NEEDS_USER
+    )
+    return {
+        "agent_id": agent_id,
+        "members": members,
+        # 等待用户处理的成员数（未赋模型 / 待审核）：前端红点徽章计数
+        "pending_member_count": pending,
+    }
+
+
+@router.patch("/agents/{agent_id}/teammate/{member_id}")
+async def update_teammate_endpoint(
+    agent_id: str,
+    member_id: str,
+    body: Dict[str, Any],
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """为用户分配成员的模型 / 审核成员（「团队成员 → 模型配置」页提交）。
+
+    这是**用户侧**入口，与 team 工具的 ``review_member`` 分开：
+    TOP agent（LLM）无权设置成员模型，成员在用户审核通过前不接收任何消息。
+
+    请求体（至少一项）：
+    - ``model_id``：要分配的模型；显式传空串 = 清空模型（退回 ``pending_model``）
+    - ``review_status``：``approved`` / ``rejected`` / ``pending_review``
+    """
+    from data.agent_store import get_agent as _get_agent
+    from data.team_store import (
+        REVIEW_STATUSES,
+        get_member,
+        update_member_review_status,
+    )
+
+    user_id = current_user.get("openid", "")
+    payload = body or {}
+    has_model = "model_id" in payload
+    has_status = "review_status" in payload
+    if not has_model and not has_status:
+        raise HTTPException(
+            status_code=400,
+            detail="至少提供 model_id 或 review_status 之一",
+        )
+    # 成员归属校验：必须确实在该 TOP 旗下，避免跨团队改成员
+    member = get_member(agent_id, member_id)
+    if member is None:
+        raise HTTPException(status_code=404, detail=f"成员不存在: {member_id}")
+
+    model_id = payload.get("model_id") if has_model else None
+    if has_model and str(model_id or "").strip():
+        model_id = str(model_id).strip()
+        if model_id not in state.model_configs:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"模型不存在: {model_id}"
+                    "（可先用 GET /api/models 获取可用模型池）"
+                ),
+            )
+    elif has_model:
+        model_id = ""  # 显式清空
+
+    review_status = payload.get("review_status") if has_status else None
+    if has_status and review_status is not None:
+        review_status = str(review_status).strip().lower()
+        if review_status not in REVIEW_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"审核状态非法: {review_status!r}"
+                    f"（可选: {', '.join(REVIEW_STATUSES)}）"
+                ),
+            )
+
+    try:
+        row = update_member_review_status(
+            agent_id, member_id, value=review_status, model_id=model_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"成员不存在: {member_id}")
+
+    # 审核通过后补投初始化消息：赋模型与审核期间成员收不到任何消息，
+    # 这里补一次，让成员知道自己的角色与职责（此前在 create_member 时被跳过）。
+    initialized = False
+    if row.get("review_status") == "approved":
+        initialized = await _dispatch_member_init_after_approval(
+            user_id, agent_id, row
+        )
+
+    return {
+        "success": True,
+        "member": {
+            "id": row.get("id", ""),
+            "name": row.get("name", ""),
+            "model_id": row.get("model_id", ""),
+            "review_status": row.get("review_status", ""),
+        },
+        "initialized": initialized,
+        "top_agent_name": (_get_agent(user_id, agent_id) or {}).get("name", ""),
+    }
+
+
+async def _dispatch_member_init_after_approval(
+    user_id: str, agent_id: str, member: Dict[str, Any]
+) -> bool:
+    """成员审核通过后经 broker 补投一次初始化消息（失败返回 False）。
+
+    成员在"未赋模型 / 未审核"期间被审核闸挡住，因此 create_member 当时跳过了
+    初始化消息；审核通过后在这里补投，让成员知道自己的角色与职责。
+    """
+    broker = getattr(state, "team_broker", None)
+    if broker is None:
+        return False
+    role = member.get("role") or "（未设）"
+    duty = member.get("duty") or "（未设）"
+    content = (
+        "【团队初始化】你已通过用户审核，可以开始工作了。\n"
+        f"你的角色：{role}\n你的职责：{duty}\n"
+        "等待 leader 用 message send_message 派发工作；"
+        "工作过程与产出请持续写入 .self/activity.log。"
+    )
+    try:
+        return bool(
+            broker.dispatch(
+                (user_id, member.get("id", "")),
+                {
+                    "user_id": user_id,
+                    "agent_id": member.get("id", ""),
+                    "workspace_id": member.get("workspace_id") or member.get("id", ""),
+                    "model_id": member.get("model_id", ""),
+                    "system_prompt": member.get("system_prompt", ""),
+                    "leader_id": member.get("parent_agent_id") or agent_id,
+                    "team_id": agent_id,
+                    "content": content,
+                    "event": "member_approved",
+                },
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("成员审核通过后补投初始化消息失败 %s: %s", member.get("id"), exc)
+        return False
 
 
 @router.get("/agents/{agent_id}/teammate/{member_id}/log")
@@ -655,9 +814,32 @@ async def send_teammate_message(
 
 
 def _agent_to_response(record: Dict[str, Any]) -> Dict[str, Any]:
-    """将数据库记录转为前端 Agent 字段结构。"""
+    """将数据库记录转为前端 Agent 字段结构。
+
+    叠加 ``pending_member_count``：该 TOP 旗下"等待用户处理"（未赋模型 /
+    待审核）的成员数，前端据此在 Agent 列表与 teammates 入口显示红点徽章
+    （要求 3：成员未就绪时需要用户去赋模型 + 审核）。
+    """
+    agent_id = record.get("id", "")
+    pending = 0
+    if agent_id:
+        try:
+            from data.team_store import (
+                REVIEW_STATUS_NEEDS_USER,
+                get_members as _get_members,
+            )
+
+            # 与 teammates 接口同一口径：按 parent/子团队逐层收集
+            rows = _collect_team_tree(agent_id, _get_members)
+            pending = sum(
+                1 for m in rows
+                if (m.get("review_status") or "") in REVIEW_STATUS_NEEDS_USER
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("统计待处理成员数失败(按 0 处理) %s: %s", agent_id, exc)
+            pending = 0
     return {
-        "id": record["id"],
+        "id": agent_id,
         "name": record["name"],
         "model_id": record["model_id"],
         "type": "normal",
@@ -665,6 +847,7 @@ def _agent_to_response(record: Dict[str, Any]) -> Dict[str, Any]:
         "workspace_id": record.get("workspace_id", ""),
         "last_message": "已创建，等待任务分配",
         "last_message_time": None,
+        "pending_member_count": pending,
     }
 
 
@@ -694,11 +877,21 @@ class CreateAgentRequest(BaseModel):
 class UpdateAgentRequest(BaseModel):
     """修改 agent 请求体（右侧"模型信息"页）。
 
-    model_id / system_prompt 至少提供一个；均可不传（不修改）。
+    model_id / system_prompt / 四个模型参数覆盖至少提供一个；均可不传（不修改）。
+
+    模型参数覆盖语义（见 ``data.agent_store.update_agent``）：
+    - 某字段为 None = **不修改**（保留库中原值）；
+    - ``clear_model_overrides=True`` = 一次性清除全部模型参数覆盖（回退模型默认）。
+    这样避免"传 None 是清空还是不改"的歧义。
     """
 
     model_id: Optional[str] = None
     system_prompt: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+    max_seqlen: Optional[int] = None
+    max_output_tokens: Optional[int] = None
+    compress_threshold: Optional[float] = None
+    clear_model_overrides: bool = False
 
 
 @router.post("/agents")
@@ -784,6 +977,55 @@ async def create_agent_endpoint(
     }
 
 
+def _validate_agent_reasoning_effort(
+    value: str,
+    model_id: Optional[str],
+    user_id: str,
+    agent_id: str,
+) -> str:
+    """归一化并校验 per-agent 的思考强度覆盖。
+
+    校验基准是**该 agent 生效模型**声明的可用档位
+    （``config.models.resolve_reasoning_effort_options``：模型显式声明的
+    ``reasoning_effort_options`` 优先，未声明则回退全局有实际区分度的档位）。
+
+    这里拦下非法值，是为了把网关侧的
+    ``422 unknown variant `xhigh```
+    转换成路由侧一条可读的 400 —— 否则该错误会原样透传到前端，且每次发言都复现。
+
+    :return: 归一化后的档位（别名已折叠，如 minimal→low）
+    :raises HTTPException: 枚举外取值，或不属于该模型声明的档位
+    """
+    normalized = normalize_reasoning_effort(value)
+    if normalized is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"思考强度取值非法: {value!r}"
+                f"（可选: {', '.join(REASONING_EFFORT_ACCEPTED)}）"
+            ),
+        )
+    # 未显式传 model_id 时按 agent 当前绑定的模型校验
+    effective_model_id = model_id
+    if effective_model_id is None:
+        record = get_agent(user_id, agent_id) or {}
+        effective_model_id = record.get("model_id") or ""
+    cfg = state.model_configs.get(effective_model_id or "")
+    if cfg is None:
+        # 模型不存在（历史脏数据 / 已删除自定义模型）：不阻塞保存
+        return normalized
+    options = resolve_reasoning_effort_options(cfg.extra)
+    if normalized not in options:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"模型 {effective_model_id} 的思考强度可选: "
+                f"{', '.join(options)}；收到 {value!r}（归一化后 {normalized}）"
+            ),
+        )
+    return normalized
+
+
 @router.patch("/agents/{agent_id}")
 async def update_agent_endpoint(
     agent_id: str,
@@ -796,10 +1038,46 @@ async def update_agent_endpoint(
     避免旧模型上下文（工具注册/模型参数）残留；历史消息保留。
     """
     user_id = current_user.get("openid", "")
-    if req.model_id is None and req.system_prompt is None:
-        raise HTTPException(status_code=400, detail="至少提供 model_id 或 system_prompt 之一")
+    if (
+        req.model_id is None
+        and req.system_prompt is None
+        and req.reasoning_effort is None
+        and req.max_seqlen is None
+        and req.max_output_tokens is None
+        and req.compress_threshold is None
+        and not req.clear_model_overrides
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="至少提供 model_id / system_prompt / 模型参数覆盖之一",
+        )
     if req.model_id is not None and req.model_id not in state.model_configs:
         raise HTTPException(status_code=400, detail=f"模型不存在: {req.model_id}")
+    # 数值范围校验（压缩阈值必须落在 (0,1)，否则会导致永不压缩或每轮压缩）
+    if req.max_seqlen is not None and req.max_seqlen <= 0:
+        raise HTTPException(status_code=400, detail="max_seqlen 必须为正整数")
+    if req.max_output_tokens is not None and req.max_output_tokens <= 0:
+        raise HTTPException(status_code=400, detail="max_output_tokens 必须为正整数")
+    if req.compress_threshold is not None and not (
+        0.1 <= float(req.compress_threshold) <= 0.95
+    ):
+        raise HTTPException(
+            status_code=400, detail="compress_threshold 必须在 0.1~0.95 之间"
+        )
+    # 思考强度：归一化（strip/lower/别名折叠）后校验属于**该 agent 绑定的模型**
+    # 声明的可用档位。校验放在这里而不是等到网关，是为了把 422
+    # 「unknown variant」变成一条可读的 400；同时把别名折叠为规范档位再入库，
+    # 避免库中出现 minimal/medium 这类与 low/high 等价的重复表示。
+    effort: Optional[str] = None
+    if req.reasoning_effort is not None:
+        raw_effort = req.reasoning_effort
+        if isinstance(raw_effort, str) and raw_effort.strip():
+            effort = _validate_agent_reasoning_effort(
+                raw_effort,
+                model_id=req.model_id,
+                user_id=user_id,
+                agent_id=agent_id,
+            )
     record = update_agent(
         user_id,
         agent_id,
@@ -808,6 +1086,11 @@ async def update_agent_endpoint(
             req.system_prompt.strip()
             if req.system_prompt is not None else None
         ),
+        reasoning_effort=effort,
+        max_seqlen_override=req.max_seqlen,
+        max_output_tokens=req.max_output_tokens,
+        compress_threshold=req.compress_threshold,
+        clear_model_overrides=req.clear_model_overrides,
     )
     if record is None:
         raise HTTPException(status_code=404, detail="Agent 不存在")
@@ -855,12 +1138,25 @@ async def get_agent_models_info(
             "thinking": cfg.thinking,
             "if_vision": cfg.if_vision,
             "base_url": _mask_base_url(cfg.base_url),
+            # 模型级默认值（右栏三个旋钮的"模型默认"参照）
+            "reasoning_effort": cfg.extra.get("reasoning_effort"),
+            "max_output_tokens": cfg.extra.get("max_output_tokens"),
+            "compress_threshold": cfg.extra.get("compress_threshold"),
+            # 该模型可选的思考强度档位（前端下拉据此渲染；未声明时回退全局档位）
+            "reasoning_effort_options": resolve_reasoning_effort_options(cfg.extra),
         })
     return {
         "agent": {
             "id": agent["id"],
             "model_id": agent["model_id"],
             "system_prompt": agent.get("system_prompt", ""),
+        },
+        # 该 agent 的模型参数覆盖（NULL 表示未覆盖，前端控件留空）
+        "overrides": {
+            "reasoning_effort": agent.get("reasoning_effort"),
+            "max_seqlen": agent.get("max_seqlen_override"),
+            "max_output_tokens": agent.get("max_output_tokens"),
+            "compress_threshold": agent.get("compress_threshold"),
         },
         "models": models,
     }
@@ -941,9 +1237,267 @@ async def list_models(
                 "thinking": cfg.thinking,
                 "if_vision": cfg.if_vision,
                 "base_url": _mask_base_url(cfg.base_url),
+                "reasoning_effort": cfg.extra.get("reasoning_effort"),
+                "max_output_tokens": cfg.extra.get("max_output_tokens"),
+                "compress_threshold": cfg.extra.get("compress_threshold"),
+                # 模型可选思考强度档位（与 models-info 同一口径）
+                "reasoning_effort_options": resolve_reasoning_effort_options(
+                    cfg.extra
+                ),
             }
         )
     return {"models": models}
+
+
+# ===== 自定义模型管理（设置页「自定义模型」） =====
+
+
+def _model_to_response(cfg: Any) -> Dict[str, Any]:
+    """把 ModelConfig 转为前端可用的**白名单**字典。
+
+    绝不返回 ``api_key``：``ModelConfig.to_dict()`` 会带上密钥，故此处逐字段
+    手写（与 ``/models`` / ``models-info`` 同一口径）。``api_key`` 只回传
+    「是否已配置」的布尔量，供前端表单提示。
+    """
+    return {
+        "model_id": cfg.model_id,
+        "name": cfg.name,
+        "api_model_id": cfg.api_model_id,
+        "base_url": _mask_base_url(cfg.base_url),
+        "thinking": cfg.thinking,
+        "if_vision": cfg.if_vision,
+        "max_seqlen": cfg.extra.get("max_seqlen"),
+        "reasoning_effort": cfg.extra.get("reasoning_effort"),
+        "reasoning_effort_options": resolve_reasoning_effort_options(cfg.extra),
+        "max_output_tokens": cfg.extra.get("max_output_tokens"),
+        "compress_threshold": cfg.extra.get("compress_threshold"),
+        "temperature": cfg.extra.get("temperature"),
+        "top_k": cfg.extra.get("top_k"),
+        "timeout_seconds": cfg.extra.get("timeout_seconds"),
+        "has_api_key": bool(cfg.api_key),
+    }
+
+
+class SaveModelRequest(BaseModel):
+    """自定义模型创建/更新请求体。
+
+    更新语义：``api_key`` 留空 = **不修改**（保留原密钥）。密钥不回显到前端，
+    因此"留空"是唯一不与数据最小化冲突的语义（不存在"清空密钥"操作）。
+    """
+
+    model_id: str
+    name: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    api_model_id: Optional[str] = None
+    thinking: Optional[bool] = None
+    if_vision: Optional[bool] = None
+    max_seqlen: Optional[int] = None
+    reasoning_effort: Optional[str] = None
+    reasoning_effort_options: Optional[List[str]] = None
+    max_output_tokens: Optional[int] = None
+    compress_threshold: Optional[float] = None
+    temperature: Optional[float] = None
+    top_k: Optional[int] = None
+    timeout_seconds: Optional[int] = None
+
+
+def _validate_model_payload(body: SaveModelRequest) -> None:
+    """校验数值范围与思考强度（越界/非法直接 400，避免写入后 agent 静默异常）。
+
+    ``reasoning_effort`` 在此处一律**归一化后落库**（strip + lower + 别名折叠），
+    并校验属于 ``reasoning_effort_options`` 声明（未声明则用全局有区分度的档位）。
+    否则一个手输的大写/带空格值会写进 YAML，此后每次发言都被网关 422 拒绝。
+    """
+    if body.max_seqlen is not None and body.max_seqlen <= 0:
+        raise HTTPException(status_code=400, detail="max_seqlen 必须为正整数")
+    if body.max_output_tokens is not None and body.max_output_tokens <= 0:
+        raise HTTPException(status_code=400, detail="max_output_tokens 必须为正整数")
+    if body.compress_threshold is not None and not (
+        0.1 <= float(body.compress_threshold) <= 0.95
+    ):
+        raise HTTPException(
+            status_code=400, detail="compress_threshold 必须在 0.1~0.95 之间"
+        )
+    if body.temperature is not None and not (0.0 <= float(body.temperature) <= 2.0):
+        raise HTTPException(status_code=400, detail="temperature 必须在 0~2 之间")
+    if body.timeout_seconds is not None and body.timeout_seconds <= 0:
+        raise HTTPException(status_code=400, detail="timeout_seconds 必须为正整数")
+
+    # 思考强度：先归一化可选档位声明，再校验默认值是否落在其中。
+    # 未声明档位时回退「有实际区分度」的全局档位，而不是接受枚举全集——
+    # 全集里 minimal/medium/xhigh/ultra 与服务端档位一一等价，属于假选项。
+    declared_options = normalize_reasoning_effort_options(
+        body.reasoning_effort_options
+    )
+    if body.reasoning_effort_options is not None and not declared_options:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "reasoning_effort_options 声明无效：需为档位列表，可选 "
+                f"{', '.join(REASONING_EFFORT_ACCEPTED)}（别名会被折叠）"
+            ),
+        )
+    options = declared_options or list(REASONING_EFFORT_CANONICAL)
+    if body.reasoning_effort is None or not str(body.reasoning_effort).strip():
+        # 空白一律视为「未指定」并**从 payload 中剔除**，而不是落盘成 ""：
+        # 空串不是合法枚举（网关 422 unknown variant），写进 YAML 会让
+        # 该模型每次请求都触发一次"非法值已丢弃"告警。
+        body.reasoning_effort = None
+    else:
+        normalized = normalize_reasoning_effort(body.reasoning_effort)
+        if normalized is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"reasoning_effort 取值非法: {body.reasoning_effort!r}"
+                    f"（可选: {', '.join(REASONING_EFFORT_ACCEPTED)}）"
+                ),
+            )
+        if normalized not in options:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"reasoning_effort={body.reasoning_effort!r} 不在该模型声明的"
+                    f"可选档位内: {', '.join(options)}"
+                ),
+            )
+        body.reasoning_effort = normalized
+    if body.reasoning_effort_options is not None:
+        body.reasoning_effort_options = options
+
+
+@router.post("/models")
+async def create_model(
+    body: SaveModelRequest,
+    _: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """新增一个自定义模型（写入 ``configs/models/<model_id>.yaml``）。
+
+    写入成功后立即刷新 ``state.model_configs``，否则新模型"下拉可见、选中 400"
+    （全部生效路径读的是启动快照，见 ``config.models.reload_model_configs``）。
+    """
+    from config.models import (
+        is_valid_model_id,
+        model_config_path,
+        reload_model_configs,
+        save_model_config,
+    )
+
+    if not is_valid_model_id(body.model_id):
+        raise HTTPException(
+            status_code=400,
+            detail="model_id 非法：仅允许字母、数字与 . _ -",
+        )
+    path = model_config_path(body.model_id)
+    if path is not None and path.exists():
+        raise HTTPException(status_code=400, detail=f"模型已存在: {body.model_id}")
+    # 新增必须齐备定位信息（更新时可由既有配置回填，故只在 create 校验）
+    if not body.name.strip():
+        raise HTTPException(status_code=400, detail="name 不能为空")
+    if not body.base_url.strip():
+        raise HTTPException(status_code=400, detail="base_url 不能为空")
+    if not body.api_key.strip():
+        raise HTTPException(status_code=400, detail="api_key 不能为空")
+    _validate_model_payload(body)
+    try:
+        cfg = save_model_config(body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"写入模型配置失败: {exc}") from None
+    reload_model_configs()
+    return {"success": True, "model": _model_to_response(cfg)}
+
+
+@router.patch("/models/{model_id}")
+async def update_model(
+    model_id: str,
+    body: SaveModelRequest,
+    _: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """更新一个自定义模型（``api_key`` 留空则保留原密钥）。"""
+    from config.models import (
+        get_model_configs,
+        reload_model_configs,
+        save_model_config,
+    )
+
+    existing = get_model_configs().get(model_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"模型不存在: {model_id}")
+    _validate_model_payload(body)
+
+    payload = body.model_dump()
+    payload["model_id"] = model_id
+    if not str(payload.get("api_key") or "").strip():
+        payload["api_key"] = existing.api_key
+    # 未传的可选字段沿用现值（避免"部分更新"把已有配置清空）
+    for key, current in (
+        ("name", existing.name),
+        ("base_url", existing.base_url),
+        ("api_model_id", existing.api_model_id),
+        ("thinking", existing.thinking),
+        ("if_vision", existing.if_vision),
+        ("max_seqlen", existing.extra.get("max_seqlen")),
+        ("reasoning_effort", existing.extra.get("reasoning_effort")),
+        # 档位声明不在设置页表单里（新增时才显式声明）；更新时未传则沿用文件现值，
+        # 避免用全局回退值覆盖掉 YAML 里手工写的自定义档位
+        (
+            "reasoning_effort_options",
+            declared_reasoning_effort_options(existing.extra),
+        ),
+        ("max_output_tokens", existing.extra.get("max_output_tokens")),
+        ("compress_threshold", existing.extra.get("compress_threshold")),
+        ("temperature", existing.extra.get("temperature")),
+        ("top_k", existing.extra.get("top_k")),
+        ("timeout_seconds", existing.extra.get("timeout_seconds")),
+    ):
+        if (payload.get(key) is None or payload.get(key) == "") and current is not None:
+            payload[key] = current
+    # 回填后仍缺关键定位信息则拒绝（避免写出不可用配置）
+    if not str(payload.get("name") or "").strip():
+        raise HTTPException(status_code=400, detail="name 不能为空")
+    if not str(payload.get("base_url") or "").strip():
+        raise HTTPException(status_code=400, detail="base_url 不能为空")
+    if not str(payload.get("api_key") or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="api_key 为空且原配置也没有密钥，请在本次更新中提供",
+        )
+    try:
+        cfg = save_model_config(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"写入模型配置失败: {exc}") from None
+    reload_model_configs()
+    return {"success": True, "model": _model_to_response(cfg)}
+
+
+@router.delete("/models/{model_id}")
+async def delete_model(
+    model_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """删除一个自定义模型配置文件。
+
+    若仍有 agent 绑定该模型，一并返回 ``bound_agents`` 供前端提示（删除本身
+    仍执行：配置文件已不可用，保留绑定只会让这些 agent 继续报"模型不存在"）。
+    """
+    from config.models import delete_model_config, reload_model_configs
+
+    user_id = current_user.get("openid", "")
+    bound = [
+        {"id": record["id"], "name": record.get("name", "")}
+        for record in (get_agents(user_id) or [])
+        if record.get("model_id") == model_id
+    ]
+    removed = delete_model_config(model_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"模型不存在或不可删除: {model_id}")
+    reload_model_configs()
+    return {"success": True, "model_id": model_id, "bound_agents": bound}
 
 
 # ===== MCP 服务管理（右侧" MCP 配置"页） =====

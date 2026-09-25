@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, Generator, List, Optional
 from openai import BadRequestError, OpenAI, RateLimitError
 
 from config.config import get_config
-from config.models import ModelConfig
+from config.models import ModelConfig, normalize_reasoning_effort
 from prompt import versions
 
 logger = logging.getLogger(__name__)
@@ -297,6 +297,7 @@ class AgentLLMSession:
         team_id: str = "",
         session_id: str = "",
         result_redirect_writer: Optional[Callable[[str, str], None]] = None,
+        max_seqlen_override: Optional[int] = None,
     ) -> None:
         """初始化 LLM 会话。
 
@@ -316,6 +317,8 @@ class AgentLLMSession:
             用于把超长工具结果写入工作空间（如 ``.self/results/...``）；为 None
             时超长结果退化为本地截断。回调由 chat.py 注入，与内置工具共用
             同一 WorkspaceIO 通道，保证 .self 路径语义一致。
+        :param max_seqlen_override: 每 agent 的最大输入（上下文预算）覆盖；
+                                    为 None/非正数时使用模型配置的 ``max_seqlen``。
         """
         self.model_config = model_config
         self.workspace_id = workspace_id
@@ -351,6 +354,38 @@ class AgentLLMSession:
             else None
         )
         self.max_seqlen: int = int(model_config.extra.get("max_seqlen", 8192))
+        # 每 agent 的输入长度覆盖（None = 用模型配置值）
+        if max_seqlen_override is not None and int(max_seqlen_override) > 0:
+            self.max_seqlen = int(max_seqlen_override)
+
+        # 模型参数覆盖（每 agent 可调；None = 用模型 YAML / 类常量默认值）。
+        # reasoning_effort 不在此处读取：它作为 OpenAI 顶层参数经 _build_api_kwargs
+        # 的透传分支直接下发（不在 reserved 内），无需实例属性。
+        #
+        # 上下文压缩阈值：模型级可覆盖，缺省回退类常量 COMPRESS_THRESHOLD(0.8)。
+        # 说明：data/memory.py 的"压缩前记忆更新"判定也读该实例属性，两处必须
+        # 取同一个值，否则判定与实际压缩阈值会分歧。
+        _cfg_threshold = model_config.extra.get("compress_threshold")
+        try:
+            _threshold = float(
+                _cfg_threshold
+                if _cfg_threshold is not None
+                else self.COMPRESS_THRESHOLD
+            )
+        except (TypeError, ValueError):
+            _threshold = self.COMPRESS_THRESHOLD
+        # 夹到 (0, 1)：<=0 会导致每轮都压缩，>=1 会导致永不压缩
+        self.compress_threshold: float = min(0.95, max(0.1, _threshold))
+
+        # 最大输出 token：显式下发 max_tokens（OpenAI 标准顶层参数）。
+        # 注意与 usage["max_tokens"] 区分——后者在 agent/chat.py 里承载的是
+        # max_seqlen（前端进度条分母），与输出长度无关。
+        _cfg_max_out = model_config.extra.get("max_output_tokens")
+        try:
+            _max_out = int(_cfg_max_out) if _cfg_max_out else 0
+        except (TypeError, ValueError):
+            _max_out = 0
+        self.max_output_tokens: Optional[int] = _max_out if _max_out > 0 else None
 
         # 是否启用 thinking（推理）模式：ModelConfig 顶层布尔字段（默认 false）。
         # 仅 when True 时解析流式 reasoning_content 并产生 thinking 段。
@@ -494,6 +529,9 @@ class AgentLLMSession:
         # temperature 仅在 yaml 显式配置或通过 set 工具设置时下发
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
+        # 最大输出 token：显式下发的 OpenAI 标准顶层参数（未配置时不带）
+        if self.max_output_tokens is not None:
+            kwargs["max_tokens"] = self.max_output_tokens
         # thinking 模式仅用于解析流式 reasoning_content（见 _run_completion_loop），
         # 不作为 OpenAI 顶层参数透传——推理由模型配置的 extra_body.thinking 开启，
         # 顶层传 thinking 会被 OpenAI SDK 校验为未知参数而抛 TypeError。
@@ -518,10 +556,33 @@ class AgentLLMSession:
             "input_price", "output_price", "cached_input_price",
             # 视觉能力开关是配置元数据，不透传给 API（防 OpenAI SDK 未知参数校验）
             "if_vision",
+            # 模型参数覆盖字段：由本类读取为实例属性后按需下发（max_output_tokens
+            # → max_tokens），不透传原始键，否则会以未知名传给 OpenAI SDK 抛
+            # TypeError（历史故障：is_limitless_context 曾导致 agent 完全无响应）
+            "compress_threshold", "max_output_tokens",
+            # 思考强度「可选档位」是纯声明字段（前端下拉 + 路由校验用），
+            # 与 API 无关；透传同样会触发 SDK TypeError
+            "reasoning_effort_options",
         }
         for key, value in extra.items():
             if key not in reserved:
                 kwargs[key] = value
+        # reasoning_effort 归一化（strip + lower + 别名折叠）：
+        # 此处是**所有** LLM 请求的唯一咽喉，覆盖"YAML 里的模型默认值"与
+        # "_apply_agent_model_overrides 并入的 per-agent 覆盖"两条来源，任一处
+        # 带空白/大写/别名到达网关都会被 422 拒绝（网关对枚举取值大小写与空白
+        # 敏感）。归一化失败（枚举外取值）时不下发该参数，让模型用自身默认档位，
+        # 而不是让整轮对话失败。
+        if "reasoning_effort" in kwargs:
+            effort = normalize_reasoning_effort(kwargs["reasoning_effort"])
+            if effort is None:
+                logger.warning(
+                    "模型 %s 的 reasoning_effort=%r 非法，本轮不下发该参数",
+                    self.model_config.model_id,
+                    kwargs.pop("reasoning_effort"),
+                )
+            else:
+                kwargs["reasoning_effort"] = effort
         kwargs["extra_body"] = extra_body
         return kwargs
 
@@ -1416,7 +1477,9 @@ class AgentLLMSession:
         total_tokens = self._estimate_context_tokens()
 
         # 未超过阈值，且非强制压缩时跳过
-        threshold = int(self.max_seqlen * self.COMPRESS_THRESHOLD)
+        # 阈值取实例属性（支持模型 YAML / 每 agent 覆盖），与 data/memory.py
+        # 的"压缩前记忆更新"判定共用同一口径
+        threshold = int(self.max_seqlen * self.compress_threshold)
         if not force and total_tokens <= threshold:
             return False
 

@@ -188,7 +188,12 @@ class MemoryManager:
             context = getattr(session, "context", [])
             # 近似 token 估算：len(str(msg)) // 4
             total_tokens = sum(len(str(msg)) // 4 for msg in context)
-            compress_threshold = getattr(session, "COMPRESS_THRESHOLD", 0.8)
+            # 阈值口径必须与 llm.AgentLLMSession.compress 一致：优先读实例属性
+            # compress_threshold（支持模型 YAML / 每 agent 覆盖），旧对象缺该
+            # 属性时回退类常量默认值 0.8
+            compress_threshold = getattr(session, "compress_threshold", None)
+            if compress_threshold is None:
+                compress_threshold = getattr(session, "COMPRESS_THRESHOLD", 0.8)
             threshold = int(max_seqlen * compress_threshold)
             if total_tokens >= threshold:
                 return True

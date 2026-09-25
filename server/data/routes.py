@@ -626,6 +626,56 @@ async def set_rate_limit(
     return {"enabled": req.enabled, "openid": openid}
 
 
+# ===== 流式帧率（主动延迟开启时叠加的生成器帧率控制） =====
+
+
+class FrameRateRequest(BaseModel):
+    """流式帧率请求体（帧/秒，范围 20~1000）。"""
+
+    frame_rate: int
+
+
+@router.get("/settings/frame-rate")
+async def get_frame_rate(
+    current_user: dict = Depends(get_current_user),
+):
+    """查询当前用户的流式帧率（主动延迟开启时生效的生成器帧率）。"""
+    openid = current_user.get("openid", "")
+    from data.frame_rate_store import (
+        MAX_FRAME_RATE,
+        MIN_FRAME_RATE,
+        get_frame_rate as read_frame_rate,
+    )
+
+    return {
+        "frame_rate": read_frame_rate(openid),
+        "min": MIN_FRAME_RATE,
+        "max": MAX_FRAME_RATE,
+        "openid": openid,
+    }
+
+
+@router.post("/settings/frame-rate")
+async def set_frame_rate(
+    req: FrameRateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """设置当前用户的流式帧率（帧/秒，越界自动夹到 20~1000）。
+
+    开启主动延迟后，等级限速管 API 调用频率，本值管**生成器帧率**：把同一轮
+    回复内的流式产出按该帧率合并投递。持久化到 ``frame_rate_prefs`` 表，并
+    同步内存缓存（立即对进行中的回复生效，无需重启或重建会话）。
+    """
+    openid = current_user.get("openid", "")
+    from data.frame_rate_store import set_frame_rate as write_frame_rate
+
+    effective = write_frame_rate(openid, req.frame_rate)
+    from llm.rate_limit import set_user_frame_rate
+
+    set_user_frame_rate(openid, effective)
+    return {"frame_rate": effective, "openid": openid}
+
+
 # ===== 消息切入模式（串行排队 / 直接切入） =====
 
 

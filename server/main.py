@@ -55,9 +55,12 @@ async def lifespan(app: FastAPI):
     # 预载「主动延迟」开关到内存：限流器按 (user_id, agent_id) 从内存缓存判定，
     # 避免每次 API 调用查 SQLite（REST 设置接口写库后同步更新缓存）
     from data.rate_limit_store import load_all_rate_limit_prefs
-    from llm.rate_limit import load_enabled_users
+    from data.frame_rate_store import load_all_frame_rates
+    from llm.rate_limit import load_enabled_users, load_frame_rates
 
     load_enabled_users(load_all_rate_limit_prefs())
+    # 预载流式帧率（主动延迟开启时叠加的生成器帧率控制，见 llm/rate_limit）
+    load_frame_rates(load_all_frame_rates())
 
     # 预载用户等级到内存缓存（按配置 registration.restore_level 决定是否从 DB 恢复）
     from data.user_store import load_user_levels
