@@ -2495,24 +2495,12 @@ async def _process_member_message(
         user_id=user_id, mode_key=team_id or agent_id,
     )
 
-    # 成员最终总结的回发目标：默认 = 本条消息的发送方；中途切入新消息时
-    # 更新为最后一位发送方（feature：自动回复仅回给最后发给它的那位）。
-    reply_sender = sender_id
-    # 被动标记（Task 7.1）：本条消息为被动注入（active=false 的唤醒续跑，
-    # 或 auto_reply 的反向推送/成员完成回传/错误回传）时，处理完不再自动
-    # 回传给发送方——否则两个成员互发会形成 A→B→A… 的无限来回。
-    reply_passive = (
-        not bool(payload.get("active", True))
-        or bool(payload.get("auto_reply"))
-    )
-
     # 切入模式：直接切入时一次性切入队列中当前会话的全部消息（串行排队则
-    # 逐条），使几乎同时到达的多条回传一起进入本轮上下文。
+    # 逐条），使几乎同时到达的多条消息一起进入本轮上下文。
     direct_cutin = is_direct_cutin(user_id)
 
     def _pick_incoming() -> Optional[str]:
         """在 tool_call 间隙从队列切入 leader 发来的新消息。"""
-        nonlocal reply_sender, reply_passive
         # 跨会话隔离：只切入当前会话的消息；其他会话的消息放回队列，
         # 待当前消息处理完后由 worker 作为独立消息继续处理（不串入本会话上下文）
         incoming_list = _drain_session_payloads(queue, session_id, direct_cutin)
@@ -2523,17 +2511,11 @@ async def _process_member_message(
             incoming_content = incoming.get("content", "")
             if not incoming_content:
                 continue
-            # 更新"最后发送方"：插入的新消息到来时，把最终总结的回发目标切换为
-            # 这条新消息的发送方（feature：自动回复仅回给最后发给它的那位）。
+            # 记录本条消息的发送方：供 AskUserQuestion 溯源（会话级 sender_id
+            # 始终等于"当前正在处理的消息"的发送方）
             inc_sender = incoming.get("sender_id")
             if inc_sender is None:
                 inc_sender = incoming.get("leader_id", "")
-            reply_sender = inc_sender
-            # 回发目标切换时同步被动标记：新消息是被动注入则同样不回传
-            reply_passive = (
-                not bool(incoming.get("active", True))
-                or bool(incoming.get("auto_reply"))
-            )
             session.sender_id = inc_sender
             _append_activity_log(
                 workspace_id,
@@ -2586,22 +2568,10 @@ async def _process_member_message(
             workspace_id, f"[{_clock_now()}] [done(成员)] 回复完成",
             user_id=user_id, mode_key=team_id or agent_id,
         )
-        # 成员工具循环最后一次回复的 content 自动回发"最后将消息发给它的那位"
-        # （用户直发时为 USER_AGENT_ID/空串 → 不转发任何 agent，仅留在成员
-        # 会话/teammates 窗口）。仅回传"最终回复"，不带过程段拼接。
-        # 被动注入（active=false / auto_reply）不回传：打破成员间 A↔B 来回。
-        if _final_text and not is_user_sender(reply_sender) and not reply_passive:
-            try:
-                _dispatch_agent_message(
-                    user_id,
-                    [reply_sender],
-                    f"[成员 {agent_id} 完成回复] {_final_text}",
-                    source_agent_id=agent_id,
-                    team_id=team_id or reply_sender,
-                    extra={"auto_reply": True, "session_id": session_id},
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("成员回复回传 leader 失败: %s", exc)
+        # 不做任何自动回传：成员产出的最终回复只留在自己的会话
+        # （teammates 进度页可读）。想让 leader/平级知道结果，由成员自己
+        # 主动 send_message 回发（见 tool/message_tool.py 的"回复机制"提示
+        # 与 prompt 的 message 条目：系统不替任何一方回传总结）。
     except Exception as exc:  # noqa: BLE001
         logger.exception("成员消息处理失败: %s", exc)
         await _append_activity_log_async(
@@ -2755,11 +2725,14 @@ def _dispatch_agent_message(
     - 接收方会话保障（Task 7.2）：目标会话元数据缺失时创建并推送
       ``session_created``。
 
-    **不再做"总结反向推送"**（原 Task 7.1 已于本次移除）：active 消息触达目标后
-    不再自动把目标的最近总结回发给发起方。理由是该机制会让两个 agent 在互相
-    发消息时各自自动回传总结，形成 A↔B→A… 的无限交火并烧掉大量 API 调用。
-    现在改由提示词约定：需要对方知道结果时，由 agent 自己显式 send_message
+    **不做任何自动回传**（原 Task 7.1 的"总结反向推送"与成员侧"完成回复
+    回传"均已移除）：消息触达目标后，系统既不会把目标的最近总结回发给发起方，
+    也不会把成员处理完的最终回复回发给发送方——否则两个 agent 互相发消息会
+    各自自动回传，形成 A↔B→A… 的无限交火并烧掉大量 API 调用。现在改由提示词
+    约定：需要对方知道结果时，由 agent 自己显式 send_message
     （见 ``prompt/versions/*/tools/builtin.yaml`` 的 message 条目"回复机制"）。
+    成员若无法处理消息（未就绪/无模型/命中并发上限），仍会以 ``auto_reply``
+    方式回传一条明确错误，避免消息被静默丢弃。
 
     :param active: 消息是否为主动发起（默认 true）。仅作为负载透传给接收侧
                     （用于区分主动/被动注入），不再影响任何回传行为。
@@ -2785,7 +2758,7 @@ def _dispatch_agent_message(
     # 因用户并发执行上限被拒绝的 target（Task 7：按用户等级限制并发 agent 数）
     concurrency_limited: List[str] = []
     # auto_reply（agent 侧自动回复）消息跳过并发检查，防止递归拒绝/误伤
-    # 既有 auto_reply 通道（成员模型缺失回传、成员完成回传等）。
+    # 既有 auto_reply 通道（成员未就绪/模型缺失错误回传、429 并发回传等）。
     is_auto_reply = bool((extra or {}).get("auto_reply"))
     # 投递负载按 session_id 归集（缺省回退默认会话）；接收方会话保障按该会话定位。
     session_id = str((extra or {}).get("session_id") or "") or DEFAULT_SESSION

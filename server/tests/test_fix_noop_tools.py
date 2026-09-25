@@ -316,20 +316,26 @@ class TestMemberReplyFallbackPushback(unittest.TestCase):
         self.assertIn("已完成任务", stored)
         self.assertNotIn("已完成任务总结完毕", stored)
 
-    def test_member_reply_pushed_to_leader_when_tool_loop(self):
+    def test_member_reply_not_pushed_to_leader_when_tool_loop(self):
         """成员 tool loop 结束（_stream_agent_reply 返回兜底文本）后，
-        _process_member_message 把最后回复推送给 leader。"""
+        _process_member_message 只把最后回复落库到成员自己的会话，
+        **不**推送给 leader（自动回传已移除，需成员主动 send_message）。"""
         from agent import chat as chat_mod
         from unittest.mock import AsyncMock
         import queue as _queue
 
         dispatched: list = []
+        stored: list = []
 
         def _fake_dispatch(user_id, target_ids, content,
                            source_agent_id="", team_id="",
                            system_prompt="", extra=None):
             dispatched.append((target_ids, content))
             return {"status": "sent", "sent": list(target_ids), "rejected": []}
+
+        def _fake_store(user_id, agent_id, role, content, session_id=None):
+            stored.append((agent_id, role, content))
+            return None
 
         async def _fake_stream(user_id, agent_id, workspace_id, session,
                                content, on_tool_turn=None, cancel_event=None,
@@ -342,7 +348,8 @@ class TestMemberReplyFallbackPushback(unittest.TestCase):
         with patch.object(chat_mod, "_stream_agent_reply", new=_fake_stream), \
                 patch.object(chat_mod, "_dispatch_agent_message",
                              side_effect=_fake_dispatch), \
-                patch.object(chat_mod, "_store_message", return_value=None), \
+                patch.object(chat_mod, "_store_message",
+                             side_effect=_fake_store), \
                 patch.object(chat_mod, "_register_active_task",
                              return_value=MagicMock()), \
                 patch.object(chat_mod, "_clear_active_task", return_value=None), \
@@ -368,11 +375,13 @@ class TestMemberReplyFallbackPushback(unittest.TestCase):
             }
             self._run(chat_mod._process_member_message(payload, q))
 
-        # 必须推送给 leader，且内容包含成员最后回复
-        self.assertTrue(dispatched, "成员完成回复后应推送 leader")
-        targets, content = dispatched[0]
-        self.assertIn("leader-1", targets)
-        self.assertIn("提交成功: abc123", content)
+        # 不得推送给 leader（自动回传已移除）
+        self.assertEqual(dispatched, [], "成员完成回复不应自动回传 leader")
+        # 兜底文本仍须落库到成员自己的会话（进度页可读）
+        replies = [s for s in stored if s[1] == "agent"]
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(replies[0][0], "mem-1")
+        self.assertIn("提交成功: abc123", replies[0][2])
 
 
 class TestWarningAccountabilityPrompt(unittest.TestCase):

@@ -646,6 +646,8 @@ async def update_teammate_endpoint(
     请求体（至少一项）：
     - ``model_id``：要分配的模型；显式传空串 = 清空模型（退回 ``pending_model``）
     - ``review_status``：``approved`` / ``rejected`` / ``pending_review``
+    - ``session_id``：当前会话 id（teammates 窗口透传）。审核通过后的补投
+      初始化消息按该会话归集；缺失回退默认会话
     - ``reasoning_effort`` / ``max_seqlen`` / ``max_output_tokens`` /
       ``compress_threshold``：成员级模型参数覆盖；传 ``null`` = 清除该项
       （回退 TOP 的同名设置；TOP 也没有则用模型 .yaml 默认值）
@@ -778,7 +780,8 @@ async def update_teammate_endpoint(
     initialized = False
     if row.get("review_status") == "approved":
         initialized = await _dispatch_member_init_after_approval(
-            user_id, agent_id, row
+            user_id, agent_id, row,
+            session_id=str(payload.get("session_id") or ""),
         )
 
     return {
@@ -822,12 +825,24 @@ def _member_override_view(
 
 
 async def _dispatch_member_init_after_approval(
-    user_id: str, agent_id: str, member: Dict[str, Any]
+    user_id: str,
+    agent_id: str,
+    member: Dict[str, Any],
+    session_id: str = "",
 ) -> bool:
     """成员审核通过后经 broker 补投一次初始化消息（失败返回 False）。
 
     成员在"未赋模型 / 未审核"期间被审核闸挡住，因此 create_member 当时跳过了
     初始化消息；审核通过后在这里补投，让成员知道自己的角色与职责。
+
+    两条与用户直发同口径的约束（缺一即出问题）：
+    - ``session_id``：由调用方（teammates 窗口当前会话）透传，缺失才回退
+      ``DEFAULT_SESSION``。不透传会让成员在本会话之外（默认会话）开工，
+      进度不进 teammates 窗口，且与其他会话交叉。
+    - ``sender_id`` = ``USER_AGENT_ID``：本消息是用户审核动作的补投，不是
+      leader 派活。负载缺 ``sender_id`` 时成员侧会回退成 ``leader_id``
+      （= 所属顶部 agent），于是"成员未就绪/无模型"这类**错误回传**会误发给
+      顶部 agent，会话的 sender_id 溯源（AskUserQuestion）也会指错人。
     """
     broker = getattr(state, "team_broker", None)
     if broker is None:
@@ -854,6 +869,10 @@ async def _dispatch_member_init_after_approval(
                     "team_id": agent_id,
                     "content": content,
                     "event": "member_approved",
+                    # 会话隔离：审批补投按当前会话归集（与用户直发同一口径）
+                    "session_id": session_id or DEFAULT_SESSION,
+                    # 用户直发标记：成员总结不转发给任何 agent（含顶部 agent）
+                    "sender_id": USER_AGENT_ID,
                 },
             )
         )

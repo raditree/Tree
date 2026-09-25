@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""成员最终总结回发目标：按"谁发给它的就回发给谁"。
+"""成员与发送方之间**不做任何自动回传**：最终回复只留在成员自己的会话。
 
-回归场景（用户反馈）：在某会话里向成员 agent 发消息，结果成员的最终总结
-被自动回发给 top agent，把 top 卷了进来。根因：回发目标用的是
-``leader_id = source_agent_id or team_id``，用户直发时 ``source_agent_id``
-为空，兜底成了 top。
+历史背景：成员处理完消息后，会把最终回复自动回发给"最后发给它的那位发送方"
+（``[成员 X 完成回复] ...``），把 leader / 平级 / 顶部 agent 卷进对话。
 
-修复后：成员负载新增 ``sender_id`` 记录真实发送方（上游/平级/下级 agent，
-或用户直发的空串），成员的最终总结回发给这个真实发送方。
-feature：中途切入新消息时，自动回复仅回给**最后**发给它的那位发送方。
+现口径（用户要求）：message 工具完全移除回传，需要对方知道结果时由 agent
+自己主动 ``send_message`` 回发（见 ``tool/message_tool.py`` 的"回复机制"提示
+与 prompt 的 message 条目）。因此无论发送方是谁（用户直发 / 顶部 agent /
+平级成员）、负载是否携带 ``sender_id``，成员处理完都不回传任何 agent；最终
+回复仅落库到成员自己的会话（teammates 进度页可读）。
 """
 
 import asyncio
@@ -28,10 +28,10 @@ def _run(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
 
 
-def _run_with_mocks(dispatched, stream, q, payload):
+def _run_with_mocks(dispatched, stream, q, payload, stored=None):
     """进入全部 mock 上下文后运行 _process_member_message。"""
     with ExitStack() as stack:
-        for p in _make_context(dispatched, stream, q):
+        for p in _make_context(dispatched, stream, q, stored):
             stack.enter_context(p)
         _run(chat_mod._process_member_message(payload, q))
 
@@ -56,13 +56,21 @@ def _make_fake_stream(insert_cb=None):
     return _fake_stream
 
 
-def _make_context(dispatched, fake_stream, q=None):
-    """构造 _process_member_message 运行所需的全部 mock 上下文。"""
+def _make_context(dispatched, fake_stream, q=None, stored=None):
+    """构造 _process_member_message 运行所需的全部 mock 上下文。
+
+    [stored] 传入 list 时记录 ``_store_message`` 的调用（落库断言用）。
+    """
+    def _fake_store(user_id, agent_id, role, content, session_id=None):
+        if stored is not None:
+            stored.append((agent_id, role, content, session_id))
+        return None
+
     return [
         patch.object(chat_mod, "_stream_agent_reply", new=fake_stream),
         patch.object(chat_mod, "_dispatch_agent_message",
                      side_effect=_fake_dispatch(dispatched)),
-        patch.object(chat_mod, "_store_message", return_value=None),
+        patch.object(chat_mod, "_store_message", side_effect=_fake_store),
         patch.object(chat_mod, "_register_active_task",
                      return_value=MagicMock()),
         patch.object(chat_mod, "_clear_active_task", return_value=None),
@@ -85,7 +93,7 @@ def _make_context(dispatched, fake_stream, q=None):
     ]
 
 
-class TestMemberReplyToSender(unittest.TestCase):
+class TestMemberNoAutoForward(unittest.TestCase):
     def setUp(self):
         self.base = {
             "user_id": "u1", "agent_id": "mem-1", "workspace_id": "w1",
@@ -101,32 +109,27 @@ class TestMemberReplyToSender(unittest.TestCase):
         return dispatched
 
     def test_user_direct_no_auto_forward(self):
-        """用户直发（sender_id=""）→ 成员总结不转发给任何 agent。"""
+        """用户直发（sender_id=""）→ 不回传任何 agent。"""
         payload = dict(self.base, leader_id="top-1", sender_id="")
-        dispatched = self._run_payload(payload)
-        self.assertEqual(dispatched, [], "用户直发不应回发给任何 agent")
+        self.assertEqual(self._run_payload(payload), [])
 
-    def test_top_sent_forwards_to_top(self):
-        """顶部 agent 直发（sender_id="top-1"）→ 总结回发给 top-1。"""
+    def test_top_sent_no_auto_forward(self):
+        """顶部 agent 直发（sender_id="top-1"）→ 不回传给 top-1。"""
         payload = dict(self.base, leader_id="top-1", sender_id="top-1")
-        dispatched = self._run_payload(payload)
-        self.assertEqual(dispatched, [["top-1"]])
+        self.assertEqual(self._run_payload(payload), [])
 
-    def test_peer_sent_forwards_to_peer(self):
-        """平级成员发送（sender_id="peerA"）→ 总结回发给 peerA，而非 top。"""
+    def test_peer_sent_no_auto_forward(self):
+        """平级成员发送（sender_id="peerA"）→ 不回传给 peerA。"""
         payload = dict(self.base, leader_id="top-1", sender_id="peerA")
-        dispatched = self._run_payload(payload)
-        self.assertEqual(dispatched, [["peerA"]])
+        self.assertEqual(self._run_payload(payload), [])
 
-    def test_no_sender_falls_back_to_leader(self):
-        """老负载（无 sender_id）→ 回退 leader_id，保持旧行为。"""
+    def test_missing_sender_no_auto_forward(self):
+        """老负载（无 sender_id，回退 leader_id）→ 同样不回传。"""
         payload = dict(self.base, leader_id="leader-1")
-        dispatched = self._run_payload(payload)
-        self.assertEqual(dispatched, [["leader-1"]])
+        self.assertEqual(self._run_payload(payload), [])
 
-    def test_inserted_msg_last_sender_wins(self):
-        """feature：中途插入新消息时，最终总结只回给最后发送方 peerC。"""
-        # 初始发送方 top-1，中途切入 peerC 发来的消息 → 回发给 peerC
+    def test_inserted_msg_no_auto_forward(self):
+        """中途切入新消息（peerC）→ 处理完仍不回传给最后发送方。"""
         def _insert(on_tool_turn):
             self.q.put_nowait(dict(self.base, agent_id="mem-1",
                                    leader_id="top-1", sender_id="peerC",
@@ -138,38 +141,30 @@ class TestMemberReplyToSender(unittest.TestCase):
         stream = _make_fake_stream(insert_cb=_insert)
         payload = dict(self.base, leader_id="top-1", sender_id="top-1")
         _run_with_mocks(dispatched, stream, self.q, payload)
-        self.assertEqual(dispatched, [["peerC"]],
-                         "插入消息后应把总结回发给最后发送方 peerC")
-
-    def test_inserted_user_msg_suppresses_forward(self):
-        """feature：中途插入用户直发消息（sender_id=""）→ 不回发任何 agent。"""
-        def _insert(on_tool_turn):
-            self.q.put_nowait(dict(self.base, agent_id="mem-1",
-                                   leader_id="top-1", sender_id="",
-                                   content="用户插话", session_id="s1"))
-            on_tool_turn()
-
-        dispatched = []
-        stream = _make_fake_stream(insert_cb=_insert)
-        payload = dict(self.base, leader_id="top-1", sender_id="top-1")
-        _run_with_mocks(dispatched, stream, self.q, payload)
-        self.assertEqual(dispatched, [],
-                         "最后发送方为用户时，总结只留在成员会话")
+        self.assertEqual(dispatched, [])
 
     def test_auto_reply_incoming_no_forward(self):
-        """被动 auto_reply 消息（反向推送/成员完成回传）→ 不再自动回传，
-        打破两个成员 A↔B 的无限来回。"""
+        """被动 auto_reply 消息（错误回传等）→ 不回传任何 agent。"""
         payload = dict(self.base, leader_id="top-1", sender_id="peerA",
                        auto_reply=True)
-        dispatched = self._run_payload(payload)
-        self.assertEqual(dispatched, [], "auto_reply 被动消息不应回传任何 agent")
+        self.assertEqual(self._run_payload(payload), [])
 
     def test_passive_active_false_no_forward(self):
-        """被动 active=false（唤醒续跑等注入）→ 不再自动回传。"""
+        """被动 active=false（唤醒续跑等注入）→ 不回传任何 agent。"""
         payload = dict(self.base, leader_id="top-1", sender_id="top-1",
                        active=False)
-        dispatched = self._run_payload(payload)
-        self.assertEqual(dispatched, [], "active=false 被动消息不应回传任何 agent")
+        self.assertEqual(self._run_payload(payload), [])
+
+    def test_final_text_kept_in_own_session(self):
+        """回传移除后，最终回复仍须落库到成员自己的会话（进度页可读）。"""
+        stored = []
+        payload = dict(self.base, leader_id="top-1", sender_id="top-1")
+        _run_with_mocks([], _make_fake_stream(), self.q, payload, stored)
+        replies = [s for s in stored if s[1] == "agent"]
+        self.assertEqual(
+            [(s[0], s[2], s[3]) for s in replies],
+            [("mem-1", "成员最终总结内容", "s1")],
+        )
 
 
 if __name__ == "__main__":

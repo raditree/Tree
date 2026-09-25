@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Task 7：消息 active 语义（总结反向推送显式化）+ 接收方会话保障。
+"""Task 7：消息 active 语义（active 仅作透传标记）+ 接收方会话保障。
 
 覆盖：
-1. active=true 且目标已有"最后总结" → 反向推送一条 active=false 消息给发起方
-   （mock ws_manager / broker 捕获断言）；active=false / 用户直发 /
-   auto_reply 被动通道 / 无总结 → 不推送。
+1. 总结反向推送已移除：active / auto_reply / 用户直发等任何情况下，投递都
+   不会把目标的最近总结回发给发起方（只投递原消息）。
 2. 接收方无 session → 自动创建会话元数据并经 WS 推送 session_created；
    跨 team（TOP↔TOP）、用户直发、成员目标同样保障；已存在会话不重复推送。
 3. sessions 表主键迁移（session_id → (session_id, user_id, agent_id)）：
