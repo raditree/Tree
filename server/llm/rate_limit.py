@@ -43,6 +43,8 @@ MIN_INTERVAL = _cfg_interval if _cfg_interval > 0 else 60.0 / RATE_PER_MINUTE
 
 # 用户开关内存缓存：user_id -> enabled
 _user_enabled: Dict[str, bool] = {}
+# 用户流式帧率内存缓存：user_id -> fps（缺省 DEFAULT_FRAME_RATE）
+_user_frame_rate: Dict[str, int] = {}
 # 按 (user_id, agent_id) 的限流器实例
 _limiters: Dict[Tuple[str, str], "AgentRateLimiter"] = {}
 _registry_lock = threading.Lock()
@@ -148,10 +150,66 @@ def load_enabled_users(prefs: Dict[str, bool]) -> None:
     logger.info("已加载 %d 个用户的主动延迟开关", len(_user_enabled))
 
 
+# ----------------------------------------------------------------------
+# 流式帧率（主动延迟开启时叠加的第二把旋钮）
+# ----------------------------------------------------------------------
+def set_user_frame_rate(user_id: str, frame_rate: int) -> int:
+    """设置某用户的流式帧率（内存缓存，由 REST 设置接口调用）。
+
+    :return: 规范化后的实际生效值（fps）
+    """
+    from data.frame_rate_store import clamp_frame_rate
+
+    rate = clamp_frame_rate(frame_rate)
+    with _registry_lock:
+        _user_frame_rate[user_id] = rate
+    return rate
+
+
+def get_user_frame_rate(user_id: str) -> int:
+    """查询某用户的流式帧率（fps）；未设置时返回库缺省值。"""
+    from data.frame_rate_store import DEFAULT_FRAME_RATE, clamp_frame_rate
+
+    with _registry_lock:
+        if user_id in _user_frame_rate:
+            return _user_frame_rate[user_id]
+    return clamp_frame_rate(DEFAULT_FRAME_RATE)
+
+
+def load_frame_rates(prefs: Dict[str, int]) -> None:
+    """启动时预载全部用户的流式帧率（来自 SQLite 持久化）。"""
+    from data.frame_rate_store import clamp_frame_rate
+
+    with _registry_lock:
+        _user_frame_rate.clear()
+        _user_frame_rate.update(
+            {str(k): clamp_frame_rate(v) for k, v in (prefs or {}).items()}
+        )
+    logger.info("已加载 %d 个用户的流式帧率", len(_user_frame_rate))
+
+
+def frame_interval(user_id: str) -> float:
+    """解析当前用户应采用的**帧间隔（秒）**：0 表示不节流。
+
+    - 主动延迟未开启 → 0（不开帧率控制，保持原生流式速度）；
+    - 已开启 → ``1 / fps``（fps 由用户在「设置」中调整，范围 20~1000）。
+
+    每帧现查内存缓存（O(1) dict 读），因此**会话中途切换开关或调整帧率都能
+    立即生效**，无需重建会话。
+    """
+    if not user_id or not is_user_enabled(user_id):
+        return 0.0
+    fps = get_user_frame_rate(user_id)
+    if fps <= 0:
+        return 0.0
+    return 1.0 / float(fps)
+
+
 def reset_user(user_id: str) -> None:
-    """用户注销彻底删除时清理其开关缓存与限流器实例。"""
+    """用户注销彻底删除时清理其开关/帧率缓存与限流器实例。"""
     with _registry_lock:
         _user_enabled.pop(user_id, None)
+        _user_frame_rate.pop(user_id, None)
         for key in [k for k in _limiters if k[0] == user_id]:
             _limiters.pop(key, None)
 
@@ -205,11 +263,15 @@ def acquire(
 __all__ = [
     "AgentRateLimiter",
     "acquire",
+    "frame_interval",
+    "get_user_frame_rate",
     "is_user_enabled",
     "load_enabled_users",
+    "load_frame_rates",
     "remove_agent",
     "reset_user",
     "set_user_enabled",
+    "set_user_frame_rate",
     "set_user_level",
     "MIN_INTERVAL",
     "RATE_PER_MINUTE",

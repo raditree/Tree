@@ -683,18 +683,33 @@ class ApiService {
     }
   }
 
-  /// 修改 agent 的模型或系统提示词（右栏「模型信息」页使用）
+  /// 修改 agent 的模型、系统提示词或模型参数覆盖（右栏「模型信息」页使用）
   ///
-  /// 调用 `PATCH /api/agents/{id}`，请求体为 `{"model_id"?, "system_prompt"?}`，
-  /// 只传需要修改的字段。网络异常或后端返回错误时抛出中文异常。
+  /// 调用 `PATCH /api/agents/{id}`，只传需要修改的字段。
+  ///
+  /// 模型参数覆盖语义（与后端 `UpdateAgentRequest` 对齐）：
+  /// - 传 `null` = **不修改**（保留库中原值）；
+  /// - [clearOverrides] 为 true = 一次性清除全部覆盖，回退模型默认值。
+  /// 因此单个字段无法"单独清空"，需要清空时用 [clearOverrides] 整体重置。
   static Future<Map<String, dynamic>> updateAgent(
     String agentId, {
     String? modelId,
     String? systemPrompt,
+    String? reasoningEffort,
+    int? maxSeqlen,
+    int? maxOutputTokens,
+    double? compressThreshold,
+    bool clearOverrides = false,
   }) async {
     return _patchJson('/api/agents/$agentId', body: {
       if (modelId != null && modelId.isNotEmpty) 'model_id': modelId,
       if (systemPrompt != null) 'system_prompt': systemPrompt,
+      if (reasoningEffort != null && reasoningEffort.isNotEmpty)
+        'reasoning_effort': reasoningEffort,
+      if (maxSeqlen != null) 'max_seqlen': maxSeqlen,
+      if (maxOutputTokens != null) 'max_output_tokens': maxOutputTokens,
+      if (compressThreshold != null) 'compress_threshold': compressThreshold,
+      if (clearOverrides) 'clear_model_overrides': true,
     });
   }
 
@@ -705,6 +720,59 @@ class ApiService {
   /// 网络异常或后端返回错误时抛出中文异常。
   static Future<Map<String, dynamic>> getAgentModelsInfo(String agentId) async {
     return _getJson('/api/agents/$agentId/models-info');
+  }
+
+  // ==================== 自定义模型管理（设置页） ====================
+
+  /// 新增自定义模型
+  ///
+  /// 调用 `POST /api/models`，写入 `server/configs/models/<model_id>.yaml`。
+  /// 后端返回 `{success, model}`，`model` 内**不含** api_key。
+  static Future<Map<String, dynamic>> createModel(
+    Map<String, dynamic> payload,
+  ) async {
+    return _postJson('/api/models', body: payload);
+  }
+
+  /// 更新自定义模型
+  ///
+  /// 调用 `PATCH /api/models/{model_id}`。`api_key` 留空 = 不修改（保留原密钥）。
+  static Future<Map<String, dynamic>> updateModel(
+    String modelId,
+    Map<String, dynamic> payload,
+  ) async {
+    return _patchJson(
+      '/api/models/${Uri.encodeComponent(modelId)}',
+      body: payload,
+    );
+  }
+
+  /// 删除自定义模型
+  ///
+  /// 调用 `DELETE /api/models/{model_id}`。返回体含 `bound_agents`，供提示
+  /// "仍有 agent 绑定该模型"。
+  static Future<Map<String, dynamic>> deleteModel(String modelId) async {
+    return _deleteJson('/api/models/${Uri.encodeComponent(modelId)}');
+  }
+
+  // ==================== 流式帧率（主动延迟叠加项） ====================
+
+  /// 查询流式帧率设置
+  ///
+  /// 调用 `GET /api/settings/frame-rate`，返回 `{frame_rate, min, max}`。
+  static Future<Map<String, dynamic>> getFrameRate() async {
+    return _getJson('/api/settings/frame-rate');
+  }
+
+  /// 设置流式帧率（帧/秒，越界由后端夹到 20~1000）
+  ///
+  /// 调用 `POST /api/settings/frame-rate`。开启主动延迟后生效，管生成器帧率。
+  static Future<int> setFrameRate(int frameRate) async {
+    final Map<String, dynamic> data = await _postJson(
+      '/api/settings/frame-rate',
+      body: <String, dynamic>{'frame_rate': frameRate},
+    );
+    return (data['frame_rate'] as num?)?.toInt() ?? frameRate;
   }
 
   // ==================== 插件体系接口（右栏「插件」页） ====================
@@ -929,15 +997,42 @@ class ApiService {
   }
 
   /// 拉取某 agent 的团队成员拓扑（teammates 工作进度窗口）
+  ///
+  /// 返回体含 `members` 与 `pending_member_count`（等待用户处理的成员数，
+  /// 未分配模型 / 待审核）。只取成员列表的兼容入口见 [getTeammates]。
+  static Future<Map<String, dynamic>> getTeammatesPayload(String agentId) async {
+    return _getJson('/api/agents/$agentId/teammates');
+  }
+
+  /// 拉取某 agent 的团队成员列表（兼容入口：只要 `members`）
   static Future<List<Map<String, dynamic>>> getTeammates(
       String agentId) async {
-    final Map<String, dynamic> data =
-        await _getJson('/api/agents/$agentId/teammates');
+    final Map<String, dynamic> data = await getTeammatesPayload(agentId);
     final List<dynamic>? members = data['members'] as List<dynamic>?;
     return members
             ?.map((dynamic e) => (e as Map<String, dynamic>).cast<String, dynamic>())
             .toList() ??
         <Map<String, dynamic>>[];
+  }
+
+  /// 为用户分配成员模型 / 审核成员（「团队成员 → 模型配置」页提交）
+  ///
+  /// 调用 `PATCH /api/agents/{leaderId}/teammate/{memberId}`。
+  /// 两个参数都可为 null 表示不改该项；`modelId` 传空串 = 清空模型
+  /// （成员退回未分配状态，无法工作）。
+  static Future<Map<String, dynamic>> updateTeammate(
+    String leaderId,
+    String memberId, {
+    String? modelId,
+    String? reviewStatus,
+  }) async {
+    final Map<String, dynamic> body = <String, dynamic>{};
+    if (modelId != null) body['model_id'] = modelId;
+    if (reviewStatus != null) body['review_status'] = reviewStatus;
+    return _patchJson(
+      '/api/agents/$leaderId/teammate/$memberId',
+      body: body,
+    );
   }
 
   /// 按 user_id + agent_id + session_id 查询该 agent 当前会话的追加 todos
@@ -957,6 +1052,10 @@ class ApiService {
   }
 
   /// 读取成员工作空间的活动日志
+  ///
+  /// 注意：成员进度详情页的「日志」Tab 已移除（用户侧更需要的是赋模型入口），
+  /// 成员日志现由 leader agent 直接 read/grep 共享工作目录。本方法保留供排查
+  /// 问题与后续复用，当前无 UI 调用方。
   static Future<String> getTeammateLog(String memberId, {int lines = 60}) async {
     final Map<String, dynamic> data = await _getJson(
       '/api/agents/$memberId/teammate/$memberId/log',
@@ -1154,6 +1253,24 @@ class ApiService {
         headers: _getHeaders(),
         body: body != null ? jsonEncode(body) : null,
       );
+      return _handleResponse(response);
+    } catch (e) {
+      if (e is Exception) {
+        rethrow;
+      }
+      throw Exception('网络请求失败，请检查后端服务是否启动');
+    }
+  }
+
+  /// 发送 DELETE 请求并解析 JSON 响应
+  ///
+  /// [path] 为接口路径（以 / 开头）。复用 [_handleResponse] 的状态码处理
+  /// （401 清 token 跳登录、非 200 抛中文异常），避免各处手写重复逻辑。
+  static Future<Map<String, dynamic>> _deleteJson(String path) async {
+    final Uri uri = Uri.parse('$baseUrl$path');
+    try {
+      final http.Response response =
+          await http.delete(uri, headers: _getHeaders());
       return _handleResponse(response);
     } catch (e) {
       if (e is Exception) {
