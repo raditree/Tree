@@ -2,16 +2,34 @@ import 'package:flutter/material.dart';
 
 import '../../io/plugin_monitor_service.dart';
 
-/// 插件面板（右栏第 5 页签；只读）。
+/// 插件面板（左侧活动栏「插件」页；只读）。
 ///
 /// 数据源 = [PluginMonitorService]（REST 快照 + WS `plugin_status` 增量），
 /// 显式三态：断连（重连中）/ 空（已连接、无实例与站）/ 错误（快照拉取失败）。
 /// 渲染防御式：未知字段与未知状态一律忽略（不崩、不臆测）。
+///
+/// 位于左栏时由活动栏承担标题，可传 [showHeader] = false 避免双标题。
+///
+/// 位于左栏时还应传 [onCollapse]：面板内容下方的空白区域可点击折叠左栏
+/// （与 Agent 列表一致的交互）。
 class PluginPanel extends StatefulWidget {
   /// 所属团队 ID（null / 空串 = 不过滤，展示当前用户可见全部实例）
   final String? teamId;
 
-  const PluginPanel({super.key, this.teamId});
+  /// 是否渲染自带标题栏（左栏由活动栏承担标题时传 false）
+  final bool showHeader;
+
+  /// 左栏折叠回调（内容下方空白区域点击触发）
+  ///
+  /// 为 null 时不注册点击（右栏等常驻场景不需要折叠语义）。
+  final VoidCallback? onCollapse;
+
+  const PluginPanel({
+    super.key,
+    this.teamId,
+    this.showHeader = true,
+    this.onCollapse,
+  });
 
   @override
   State<PluginPanel> createState() => _PluginPanelState();
@@ -54,7 +72,7 @@ class _PluginPanelState extends State<PluginPanel> {
     final PluginSnapshot? snap = _svc.snapshot;
     return Column(
       children: [
-        _buildHeader(cs),
+        if (widget.showHeader) _buildHeader(cs),
         if (!_svc.connected)
           _buildBanner(cs, '连接断开，正在重连…（下方为最近一次数据）'),
         if (_svc.error != null) _buildBanner(cs, '快照获取失败：${_svc.error}'),
@@ -128,35 +146,130 @@ class _PluginPanelState extends State<PluginPanel> {
   Widget _buildBody(ColorScheme cs, PluginSnapshot? snap) {
     if (snap == null) {
       if (!_svc.connected) {
-        return _centeredHint(cs, '等待连接…');
+        return _buildEmptyArea(cs, '等待连接…');
       }
       if (_svc.loading) {
         return const Center(child: CircularProgressIndicator());
       }
-      return _centeredHint(cs, '暂无数据');
+      return _buildEmptyArea(cs, '暂无数据');
     }
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 16),
-      children: [
-        _sectionTitle(cs, '开关与配置'),
-        _buildSwitchSection(cs, snap),
-        const SizedBox(height: 12),
-        _sectionTitle(cs, '插件实例（${snap.instances.length}）'),
-        if (snap.instances.isEmpty)
-          _emptyHint(cs, '暂无插件实例')
-        else
-          ...snap.instances.map(
-            (PluginInstanceInfo e) => _instanceCard(cs, e),
+    // 用 CustomScrollView 而非 ListView：内容不足一屏时，底部剩余空白由
+    // SliverFillRemaining 撑满，成为"点击空白处折叠左栏"的折叠区
+    // （与 AgentList 的实现一致）。
+    return CustomScrollView(
+      slivers: <Widget>[
+        SliverPadding(
+          padding: const EdgeInsets.only(top: 8),
+          sliver: SliverList(
+            delegate: SliverChildListDelegate(<Widget>[
+              _bodyContent(cs, snap),
+            ]),
           ),
-        const SizedBox(height: 12),
-        _sectionTitle(cs, '处理站（${snap.stations.length}）'),
-        if (snap.stations.isEmpty)
-          _emptyHint(cs, '暂无处理站订阅')
-        else
-          ...snap.stations.map((PluginStationInfo s) => _stationCard(cs, s)),
-        const SizedBox(height: 12),
-        _sectionTitle(cs, '看门狗'),
-        _buildWatchdog(cs, snap),
+        ),
+        SliverFillRemaining(
+          hasScrollBody: false,
+          child: _buildCollapseZone(cs, snap),
+        ),
+      ],
+    );
+  }
+
+  /// 面板主体内容（各区块，原 ListView 的 children）。
+  Widget _bodyContent(ColorScheme cs, PluginSnapshot snap) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _sectionTitle(cs, '开关与配置'),
+          _buildSwitchSection(cs, snap),
+          const SizedBox(height: 12),
+          _sectionTitle(cs, '插件实例（${snap.instances.length}）'),
+          if (snap.instances.isEmpty)
+            _emptyHint(cs, '暂无插件实例')
+          else
+            ...snap.instances.map(
+              (PluginInstanceInfo e) => _instanceCard(cs, e),
+            ),
+          const SizedBox(height: 12),
+          _sectionTitle(cs, '处理站（${snap.stations.length}）'),
+          if (snap.stations.isEmpty)
+            _emptyHint(cs, '暂无处理站订阅')
+          else
+            ...snap.stations.map((PluginStationInfo s) => _stationCard(cs, s)),
+          const SizedBox(height: 12),
+          _sectionTitle(cs, '看门狗'),
+          _buildWatchdog(cs, snap),
+        ],
+      ),
+    );
+  }
+
+  /// 空态占位（等待连接 / 暂无数据），点击任意空白处折叠左栏。
+  Widget _buildEmptyArea(ColorScheme cs, String text) {
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onTap: widget.onCollapse,
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Text(
+              text,
+              style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+            ),
+            if (widget.onCollapse != null) ...<Widget>[
+              const SizedBox(height: 10),
+              _buildCollapseHint(cs, ''),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 数据态下方的折叠区：占满内容之外的剩余空白，点击即折叠左栏。
+  ///
+  /// 内容超过一屏时该区域被挤到滚动末尾，折叠入口仍保留在标题栏与活动栏。
+  Widget _buildCollapseZone(ColorScheme cs, PluginSnapshot snap) {
+    // 没有任何实例时，在折叠提示上方补一行空态说明：面板数据稀疏时，
+    // 下方大片空白容易被误认为"还在加载"。
+    final String hint = snap.instances.isNotEmpty ? '' : '暂无插件实例';
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onTap: widget.onCollapse,
+      child: Container(
+        width: double.infinity,
+        alignment: Alignment.center,
+        padding: const EdgeInsets.only(top: 16, bottom: 24),
+        child: _buildCollapseHint(cs, hint),
+      ),
+    );
+  }
+
+  /// 折叠提示（图标 + 文案，可选上方附加一行空态说明）。
+  ///
+  /// 仅注册 onTap：同时注册 onDoubleTap 会让 GestureDetector 等待双击超时
+  /// （约 300ms）再响应单击，折叠出现明显延迟。
+  Widget _buildCollapseHint(ColorScheme cs, String extra) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        if (extra.isNotEmpty) ...<Widget>[
+          Text(
+            extra,
+            style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+          ),
+          const SizedBox(height: 10),
+        ],
+        if (widget.onCollapse != null) ...<Widget>[
+          Icon(Icons.chevron_left, size: 20, color: cs.outline),
+          const SizedBox(height: 4),
+          Text(
+            '点击空白处折叠左栏',
+            style: TextStyle(fontSize: 11, color: cs.outline),
+          ),
+        ],
       ],
     );
   }
@@ -373,16 +486,6 @@ class _PluginPanelState extends State<PluginPanel> {
   Widget _emptyHint(ColorScheme cs, String text) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 6),
-      child: Text(
-        text,
-        style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-      ),
-    );
-  }
-
-  /// 居中提示（空态 / 断连态）。
-  Widget _centeredHint(ColorScheme cs, String text) {
-    return Center(
       child: Text(
         text,
         style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
