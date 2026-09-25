@@ -20,10 +20,15 @@ class TeammatesWindowPage extends StatefulWidget {
   /// 打开窗口时的当前会话 id；透传给成员进度页，使历史/实时按会话过滤
   final String sessionId;
 
+  /// 成员配置变更后的回调（透传到成员详情页；主界面据此重拉 agent 列表，
+  /// 刷新待处理成员红点——本窗口自身的计数由 [_load] 刷新）
+  final VoidCallback? onMembersChanged;
+
   const TeammatesWindowPage({
     super.key,
     required this.agent,
     required this.sessionId,
+    this.onMembersChanged,
   });
 
   @override
@@ -320,8 +325,12 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
                 memberName: name.isNotEmpty ? name : id,
                 sessionId: widget.sessionId,
                 member: member,
-                // 子页面处理完审核/赋模型后回到本页需要刷新计数与列表
-                onChanged: _load,
+                // 子页面处理完审核/赋模型后回到本页需要刷新计数与列表；
+                // 同时通知主界面重拉 agent 列表（agent 列表红点同一口径）
+                onChanged: () async {
+                  await _load();
+                  widget.onMembersChanged?.call();
+                },
               ),
             ),
           );

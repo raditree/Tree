@@ -112,10 +112,11 @@ class SshWorkspaceExecutor {
 
   /// 按操作类型分发执行，返回结果字典（结构对齐后端/本地执行器）。
   ///
-  /// 失败时返回 ``{error}``；连接不存在/断开时尝试按配置重建。执行中若
-  /// 抛出 [SSHChannelOpenError]（连接上堆积的会话撞到 sshd 单连接通道上限
-  /// ``MaxSessions``，表现为所有命令持续 ``open failed``），会丢弃并重建
-  /// 连接后重试一次（自愈），避免整条连接被卡死后所有工具永久失败。
+  /// 失败时返回 ``{error}``；连接不存在/断开时尝试按配置重建。建连失败或
+  /// 执行中抛出 [SSHChannelOpenError]（连接上堆积的会话撞到 sshd 单连接通道
+  /// 上限 ``MaxSessions``，表现为所有命令持续 ``open failed``）时，丢弃并重建
+  /// 连接后重试（自愈），避免整条连接被卡死后所有工具永久失败；重试耗尽后
+  /// 请 UI 补录凭据（见 [_guarded]）。
   Future<Map<String, dynamic>> execute(
     String workspaceId,
     String op,
@@ -207,37 +208,73 @@ class SshWorkspaceExecutor {
     }
   }
 
-  /// 带通道错误自愈的一次执行：先按配置建连/复用连接，再执行 [action]。
+  /// 建连/执行失败的最大尝试次数（凭据补录后的重试不计入）。
+  static const int _maxAttempts = 3;
+
+  /// 带连接级自愈的执行：先按配置建连/复用连接，再执行 [action]。
   ///
-  /// - 建连失败返回 ``SSH 连接失败``；
-  /// - 执行抛出 [SSHChannelOpenError] 时视为连接级通道饱和/卡死：关闭并
-  ///   丢弃该连接，重建后**再执行一次**；仍失败则返回执行错误（单次重试，
-  ///   避免连不上时反复建连造成主机侧连接风暴）。
+  /// - 建连失败（认证失败、凭据缺失、连接断开等）或执行抛出
+  ///   [SSHChannelOpenError]（连接上堆积的会话撞到 sshd 单连接通道上限
+  ///   ``MaxSessions``，表现为所有命令持续 ``open failed``）时，丢弃连接并
+  ///   重建，最多重试 [_maxAttempts] 次；
+  /// - 重试仍失败时经 [SshConnectionManager.onCredentialNeeded] 请 UI 补录
+  ///   密码（凭据丢失 / 密码未落盘 / 连接断开都会走到这里），补录成功后重新
+  ///   获得完整的重试次数；用户取消则返回可读错误；
+  /// - 非连接级错误（命令本身的失败）不重试，直接返回。
   Future<Map<String, dynamic>> _guarded(
     Future<Map<String, dynamic>> Function(SSHClient client) action,
   ) async {
-    SSHClient client;
-    try {
-      client = await manager.connect(teamId, config);
-    } catch (e) {
-      return <String, dynamic>{'error': 'SSH 连接失败: $e'};
-    }
-    try {
-      return await action(client);
-    } on SSHChannelOpenError {
-      await manager.close(teamId);
+    // 只补录一次凭据，避免"弹窗 → 再失败 → 再弹窗"的循环
+    bool prompted = false;
+    int attempt = 0;
+    while (true) {
+      attempt++;
+      SSHClient client;
       try {
-        final SSHClient fresh = await manager.connect(teamId, config);
-        try {
-          return await action(fresh);
-        } catch (e) {
-          return <String, dynamic>{'error': 'SSH 执行失败: $e'};
-        }
+        client = await manager.connect(teamId, config);
       } catch (e) {
-        return <String, dynamic>{'error': 'SSH 重连失败: $e'};
+        // 清掉可能卡死的在建项/缓存，下一次尝试真正重建
+        await manager.close(teamId);
+        if (attempt < _maxAttempts) continue;
+        if (!prompted &&
+            await _requestCredential('SSH 连接失败（已重试 $_maxAttempts 次）：$e')) {
+          prompted = true;
+          attempt = 0;
+          continue;
+        }
+        return <String, dynamic>{'error': 'SSH 连接失败: $e'};
       }
+      try {
+        return await action(client);
+      } on SSHChannelOpenError catch (e) {
+        // 连接级通道上限/卡死：丢弃连接，重建后重试
+        await manager.close(teamId);
+        if (attempt < _maxAttempts) continue;
+        if (!prompted &&
+            await _requestCredential(
+                'SSH 连接反复失败（通道打开失败，已重试 $_maxAttempts 次）：$e')) {
+          prompted = true;
+          attempt = 0;
+          continue;
+        }
+        return <String, dynamic>{'error': 'SSH 执行失败: $e'};
+      } catch (e) {
+        return <String, dynamic>{'error': 'SSH 执行失败: $e'};
+      }
+    }
+  }
+
+  /// 重试耗尽后请 UI 层补录 SSH 密码。
+  ///
+  /// 未注入回调（测试 / 无 UI 场景）或用户取消补录时返回 false。
+  Future<bool> _requestCredential(String reason) async {
+    final Future<bool> Function(String teamId, String reason)? request =
+        manager.onCredentialNeeded;
+    if (request == null) return false;
+    try {
+      return await request(teamId, reason);
     } catch (e) {
-      return <String, dynamic>{'error': 'SSH 执行失败: $e'};
+      return false;
     }
   }
 

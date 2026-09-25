@@ -75,13 +75,27 @@ class _SshHookTarget {
 }
 
 class SshExecutorService extends ChangeNotifier {
-  SshExecutorService._();
+  SshExecutorService._() {
+    // 建连重试耗尽 → 本服务向上请 UI 补录密码（见 _handleCredentialNeeded）
+    _connectionManager.onCredentialNeeded = _handleCredentialNeeded;
+  }
 
   /// 全局单例
   static final SshExecutorService instance = SshExecutorService._();
 
   /// 前端 SSH 连接管理器（按顶部 agent 懒建连 / 缓存 / 失活重建）
   final SshConnectionManager _connectionManager = SshConnectionManager();
+
+  /// UI 层（[MessagePanel]）注入的密码补录弹窗回调：入参 (team_id, 失败原因)，
+  /// 返回 ``{password, persist}``；用户取消返回 null。
+  ///
+  /// 服务不持有 BuildContext，弹窗只能由 UI 层实现；未注入时视为放弃补录
+  /// （仅按重试次数处理）。
+  Future<Map<String, dynamic>?> Function(String teamId, String reason)?
+      onCredentialRequired;
+
+  /// 该 team 正在进行的补录请求：并发工具调用同时失败时只弹一个窗口。
+  final Map<String, Future<bool>> _credentialPrompts = <String, Future<bool>>{};
 
   /// per-team 状态：team_id -> SSH 执行器状态。
   ///
@@ -158,6 +172,56 @@ class SshExecutorService extends ChangeNotifier {
     }
     copy.remove('persist_password');
     return copy;
+  }
+
+  /// 建连重试耗尽时的凭据补录入口（[SshConnectionManager.onCredentialNeeded]）。
+  ///
+  /// 同一 team 的并发失败共享同一次弹窗（只弹一个窗口），完成后清理在途记录。
+  Future<bool> _handleCredentialNeeded(String teamId, String reason) {
+    final Future<bool>? inFlight = _credentialPrompts[teamId];
+    if (inFlight != null) return inFlight;
+    final Future<bool> future = _promptCredential(teamId, reason);
+    _credentialPrompts[teamId] = future;
+    return future.whenComplete(() {
+      if (identical(_credentialPrompts[teamId], future)) {
+        _credentialPrompts.remove(teamId);
+      }
+    });
+  }
+
+  /// 弹出密码输入框补录凭据，成功后更新该 team 的内存配置（按勾选决定是否
+  /// 落盘）并丢弃已失效的连接，返回 true 表示可再连一次。
+  ///
+  /// 用户取消 / 未注入弹窗回调 / 密码为空时返回 false（调用方转为可读错误）。
+  Future<bool> _promptCredential(String teamId, String reason) async {
+    final Future<Map<String, dynamic>?> Function(String, String)? prompt =
+        onCredentialRequired;
+    final _SshTeamState? state = _states[teamId];
+    if (prompt == null || state == null) return false;
+    Map<String, dynamic>? input;
+    try {
+      input = await prompt(teamId, reason);
+    } catch (e) {
+      debugPrint('[SshExecutor] SSH 凭据补录弹窗失败: $e');
+      return false;
+    }
+    if (input == null) return false; // 用户取消
+    final String password = (input['password'] as String?) ?? '';
+    if (password.isEmpty) return false;
+    // 补录密码即改用密码认证（密钥路径可能已失效 / 本就缺失）
+    state.config['auth_type'] = 'password';
+    state.config['password'] = password;
+    state.config['persist_password'] = input['persist'] == true;
+    // 连接已失效：丢弃缓存，下一次 connect 重新认证
+    await _connectionManager.close(teamId);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _kConfigKey(teamId),
+      jsonEncode(_sanitizedForPersistence(state.config)),
+    );
+    notifyListeners();
+    debugPrint('[SshExecutor] 已补录 SSH 凭据(team=$teamId)，将重新建连');
+    return true;
   }
 
   /// 从 SharedPreferences 恢复单个 team 的 SSH 模式设置。

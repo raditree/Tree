@@ -407,6 +407,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             navigateMessageId: _navigateMessageId,
             navigateSessionId: _currentSessionId,
             navigateTrigger: _navigateTrigger,
+            // 成员配置变更后重拉 agent 列表：刷新待处理成员红点/角标
+            onAgentsChanged: _loadAgents,
           ),
           workspaceId.isEmpty
               ? _buildMobileFilePlaceholder()
@@ -539,6 +541,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             navigateMessageId: _navigateMessageId,
             navigateSessionId: _currentSessionId,
             navigateTrigger: _navigateTrigger,
+            // 成员配置变更后重拉 agent 列表：刷新待处理成员红点/角标
+            onAgentsChanged: _loadAgents,
           ),
         ),
         // 拖拽分隔条 2（控制右栏宽度；折叠时平滑收为 0）

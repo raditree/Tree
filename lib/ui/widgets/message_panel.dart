@@ -50,6 +50,9 @@ class MessagePanel extends StatefulWidget {
   /// 定位触发号：外部递增触发导航定位
   final int navigateTrigger;
 
+  /// 成员配置变更后的回调（父页面重新拉取 agent 列表，刷新待处理成员红点）
+  final VoidCallback? onAgentsChanged;
+
   const MessagePanel({
     super.key,
     this.selectedAgent,
@@ -58,6 +61,7 @@ class MessagePanel extends StatefulWidget {
     this.navigateMessageId,
     this.navigateSessionId,
     this.navigateTrigger = 0,
+    this.onAgentsChanged,
   });
 
   @override
@@ -153,6 +157,8 @@ class _MessagePanelState extends State<MessagePanel> {
     // 已知列表中的 session_id 时自动创建本地会话条目，使被动接收
     // （跨 team 推送等）的消息在会话列表可见
     _webSocket.onUnknownSession = _ensureLocalSessionEntry;
+    // SSH 建连重试耗尽时由服务回调本面板弹密码补录窗口（服务无 BuildContext）
+    SshExecutorService.instance.onCredentialRequired = _requestSshCredential;
     _syncKnownSessions();
     // 连接建立/重连时清空 working 集合：后端重启会清空其内存态 _active_tasks，
     // 若不清空，前端会残留旧的 working（无 API 调用却显示工作中）。
@@ -989,8 +995,34 @@ class _MessagePanelState extends State<MessagePanel> {
 
   @override
   void dispose() {
+    // 解绑密码补录回调：面板销毁后服务不再往上弹窗（避免用已失效的 context）
+    if (identical(
+        SshExecutorService.instance.onCredentialRequired, _requestSshCredential)) {
+      SshExecutorService.instance.onCredentialRequired = null;
+    }
     _webSocket.disconnect();
     super.dispose();
+  }
+
+  /// SSH 建连重试耗尽后补录密码（由 [SshExecutorService] 回调）：
+  /// 弹出密码输入框，返回 ``{password, persist}``；取消返回 null。
+  Future<Map<String, dynamic>?> _requestSshCredential(
+    String teamId,
+    String reason,
+  ) async {
+    if (!mounted) return null;
+    final Map<String, dynamic> config =
+        SshExecutorService.instance.teamConfig(teamId);
+    return showDialog<Map<String, dynamic>>(
+      context: context,
+      // 必须输入或显式取消：避免误点空白关闭导致重连直接放弃
+      barrierDismissible: false,
+      builder: (BuildContext dialogContext) => SshPasswordDialog(
+        host: (config['host'] as String?) ?? '',
+        username: (config['username'] as String?) ?? '',
+        reason: reason,
+      ),
+    );
   }
 
   @override
@@ -1311,7 +1343,11 @@ class _MessagePanelState extends State<MessagePanel> {
   }
 
   /// 打开 teammates 工作进度窗口
-  void _openTeammatesWindow(Agent agent) {
+  ///
+  /// 窗口内成员配置（赋模型 / 审核）变更时经 [MessagePanel.onAgentsChanged]
+  /// 让父页面重拉 agent 列表，使待处理成员红点在配置完成后立即消失；
+  /// 关闭窗口后再兜底刷新一次。
+  Future<void> _openTeammatesWindow(Agent agent) async {
     // 会话未就绪（首次加载 / 刚切换 agent，_loadSessions 尚未返回）时不得
     // 回退默认会话：否则窗口按 session_default 过滤，显示的是默认会话的
     // 成员进度而非当前会话。此时拒绝打开并提示，待会话确定后再进入。
@@ -1322,16 +1358,21 @@ class _MessagePanelState extends State<MessagePanel> {
       );
       return;
     }
-    Navigator.of(context).push(
+    await Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => TeammatesWindowPage(
           agent: agent,
           // 透传当前会话：进度页历史/实时 WS 按该成员+该会话过滤，
           // 避免把该成员其他会话的工作进度混进当前窗口（跨会话）。
           sessionId: sessionId,
+          // 成员配置变更 → 重拉 agent 列表，刷新待处理成员红点
+          onMembersChanged: widget.onAgentsChanged,
         ),
       ),
     );
+    if (!mounted) return;
+    // 关闭窗口兜底刷新（成员可能被其它入口改动过）
+    widget.onAgentsChanged?.call();
   }
 
   /// teammates 入口图标：有待处理成员时叠一个红色小圆点。

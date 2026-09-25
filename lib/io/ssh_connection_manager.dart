@@ -199,6 +199,13 @@ class SshConnectionManager {
     }
   }
 
+  /// 建连重试耗尽后的凭据补录回调：入参为 (team_id, 失败原因)，返回 true
+  /// 表示配置已被更新（补录了密码）、可以再连一次。
+  ///
+  /// 由 [SshExecutorService] 注入（其再向上弹密码输入框）；未注入（测试 /
+  /// 无 UI 场景）时视为用户放弃补录。
+  Future<bool> Function(String teamId, String reason)? onCredentialNeeded;
+
   /// 建立（或复用）指定顶部 agent 的 SSH 连接，返回已认证的 `SSHClient`。
   ///
   /// [config] 由调用方传入（来自该 team 的 per-team 状态，而非全局槽位）。

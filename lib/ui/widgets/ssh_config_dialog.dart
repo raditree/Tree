@@ -301,3 +301,150 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
     );
   }
 }
+
+/// SSH 密码补录对话框（连接反复失败时弹出）。
+///
+/// 只接收密码：SSH 建连重试耗尽（认证失败 / 密码未落盘 / 连接断开 / 密钥
+/// 丢失）后由 `SshExecutorService` 回调 UI 弹出，补录成功后按新凭据重连。
+/// 勾选「在本机记住密码」时密码会明文写入本机存储（见
+/// `SshExecutorService._sanitizedForPersistence`）。
+///
+/// 确认后以 ``{password, persist}`` 返回；取消返回 null。
+class SshPasswordDialog extends StatefulWidget {
+  const SshPasswordDialog({
+    super.key,
+    required this.host,
+    required this.username,
+    required this.reason,
+  });
+
+  /// 目标主机（用于提示"正在补录哪台机器"）
+  final String host;
+
+  /// 登录用户名
+  final String username;
+
+  /// 失败原因（建连异常信息，供用户判断是密码错还是别的问题）
+  final String reason;
+
+  @override
+  State<SshPasswordDialog> createState() => _SshPasswordDialogState();
+}
+
+class _SshPasswordDialogState extends State<SshPasswordDialog> {
+  final TextEditingController _passwordController = TextEditingController();
+
+  /// 是否把密码明文写入本机 SharedPreferences（默认否）
+  bool _persist = false;
+
+  /// 密码可见性切换
+  bool _obscure = true;
+
+  @override
+  void dispose() {
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final String password = _passwordController.text;
+    if (password.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请输入 SSH 密码')),
+      );
+      return;
+    }
+    Navigator.of(context).pop(<String, dynamic>{
+      'password': password,
+      'persist': _persist,
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final String target = widget.username.isEmpty
+        ? widget.host
+        : '${widget.username}@${widget.host}';
+    return AlertDialog(
+      title: const Text('SSH 连接失败，请补录密码'),
+      content: SizedBox(
+        width: 380,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(
+              '目标主机：$target',
+              style: const TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '失败原因：${widget.reason}',
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _passwordController,
+              obscureText: _obscure,
+              autofocus: true,
+              onSubmitted: (_) => _submit(),
+              decoration: InputDecoration(
+                labelText: '密码',
+                prefixIcon: const Icon(Icons.lock_outline, size: 20),
+                suffixIcon: IconButton(
+                  tooltip: _obscure ? '显示密码' : '隐藏密码',
+                  icon: Icon(
+                    _obscure ? Icons.visibility_off : Icons.visibility,
+                    size: 18,
+                  ),
+                  onPressed: () => setState(() => _obscure = !_obscure),
+                ),
+                isDense: true,
+              ),
+            ),
+            CheckboxListTile(
+              contentPadding: EdgeInsets.zero,
+              dense: true,
+              value: _persist,
+              onChanged: (bool? value) {
+                setState(() => _persist = value ?? false);
+              },
+              controlAffinity: ListTileControlAffinity.leading,
+              title: const Text(
+                '在本机记住密码（明文存储）',
+                style: TextStyle(fontSize: 13),
+              ),
+              subtitle: const Text(
+                '不勾选时密码只用于本次运行；也可改用环境变量 '
+                'TREE_SSH_PASSWORD',
+                style: TextStyle(fontSize: 11),
+              ),
+            ),
+            Text(
+              '提示：若是私钥丢失或需要改主机/用户名，请关闭本窗口后改用'
+              '「SSH 执行模式配置」表单。',
+              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+            ),
+          ],
+        ),
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('取消'),
+        ),
+        ElevatedButton(
+          onPressed: _submit,
+          style: ElevatedButton.styleFrom(
+            backgroundColor: cs.primary,
+            foregroundColor: cs.onPrimary,
+          ),
+          child: const Text('保存并重连'),
+        ),
+      ],
+    );
+  }
+}
