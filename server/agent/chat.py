@@ -17,6 +17,7 @@ import queue
 import threading
 import time
 import uuid
+from dataclasses import replace
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from openai import RateLimitError
@@ -233,7 +234,7 @@ async def _register_tools(
                     source_agent_id=team_id or agent_id,
                     team_id=team_id,
                     extra={"session_id": session_id, "sender_id": sender},
-                    # 唤醒续跑属被动注入（Task 7.1）：不触发总结反向推送
+                    # 唤醒续跑属被动注入：标记 active=false（接收侧只读）
                     active=False,
                 )
             else:
@@ -1602,6 +1603,215 @@ async def _append_activity_log_async(
     )
 
 
+# 帧率控制的 sleep 切片（秒）：等待下一帧时最多睡这么久就回头检查一次
+# cancel_event，保证「停止」按钮在节流状态下依然灵敏（对齐 llm/rate_limit.py
+# 与 llm.py 重试等待的既有 0.2s 分片写法）。
+_PACER_SLEEP_SLICE = 0.2
+
+
+class _FramePacer:
+    """生成器帧率控制（主动延迟开启时叠加的"呈现层"节流）。
+
+    设计要点：
+
+    - **固定时间步**（fixed time-step）：``self._next_at += interval`` 后等待到该
+      时刻，而不是"每帧固定 sleep(interval)"——后者会与生成器自身耗时叠加造成
+      累积漂移，使实际帧率明显低于设定值。
+    - **只节流文本/推理**：``tool_call`` / ``ask_paused`` / ``error`` / ``done``
+      等控制事件必须立即放行，否则工具卡片会随帧率一起变慢、"停止"也要等一帧。
+    - **首帧立即放行**：``_next_at`` 初值 0，首帧等待为 0，因此首 token 不会被
+      帧间隔拖慢。
+    - **可取消**：sleep 按 [_PACER_SLEEP_SLICE] 分片轮询 ``cancel_event``，
+      保证「停止」响应不因节流而退化。
+    - **每帧现查开关**：``frame_interval`` 读内存缓存，用户中途开关主动延迟或
+      调整帧率立即生效（无需重建会话）。
+    - ``silent=True``（后台记忆维护阶段，不推 WS）时整体跳过：该阶段节流毫无
+      收益，只会拖慢纯后台工作。
+    """
+
+    #: 参与帧率控制的产出类型
+    PACED_TYPES = frozenset({"text", "thinking"})
+
+    def __init__(self, user_id: str, silent: bool = False) -> None:
+        self._user_id = user_id or ""
+        self._silent = bool(silent)
+        self._next_at = 0.0
+        self._interval = -1.0
+
+    def _resolve_interval(self) -> float:
+        """解析当前帧间隔（秒）；0 表示不节流。
+
+        失败一律视为不节流：帧率是体验优化，不能因设置读取异常阻断回复。
+        """
+        try:
+            from llm.rate_limit import frame_interval
+
+            return float(frame_interval(self._user_id))
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def wait_turn(
+        self,
+        item: Dict[str, Any],
+        cancel_event: Optional[threading.Event] = None,
+    ) -> bool:
+        """在投递 [item] 前按帧率等待。
+
+        :return: False 表示等待期间收到取消信号，调用方应中止本轮
+        """
+        if self._silent:
+            return True
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        if not isinstance(item, dict) or item.get("type") not in self.PACED_TYPES:
+            return True
+
+        interval = self._resolve_interval()
+        now = time.monotonic()
+        if interval != self._interval:
+            # 帧率变化（含 0→N 开启 / N→0 关闭）：重置时间基，避免按旧节奏追赶
+            self._interval = interval
+            self._next_at = now
+        if interval <= 0:
+            return True
+
+        if now >= self._next_at:
+            self._next_at = now + interval
+            return True
+
+        deadline = self._next_at
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._next_at = time.monotonic() + interval
+                return True
+            if cancel_event is not None:
+                if cancel_event.wait(min(remaining, _PACER_SLEEP_SLICE)):
+                    return False
+            else:
+                time.sleep(min(remaining, _PACER_SLEEP_SLICE))
+
+
+def _apply_agent_model_overrides(
+    model_config: Any, owner_agent_id: str, user_id: str
+) -> Any:
+    """把 agents 行的模型参数覆盖合并进模型配置，返回新的 ModelConfig。
+
+    覆盖项（右栏「模型信息」页可调，见 ``data/agent_store.update_agent``）：
+    ``reasoning_effort`` / ``max_seqlen_override`` / ``max_output_tokens`` /
+    ``compress_threshold``。全部为空时不构造新对象，直接返回原配置。
+
+    实现方式是把覆盖值并入 ``extra`` 副本，而不是新增构造参数——这样
+    ``state.model_configs`` 里的共享配置实例**不会被就地污染**（否则同一模型
+    的其他 agent 会连带生效）。
+
+    注意 ``max_seqlen`` 覆盖写的是 ``extra["max_seqlen"]``（会话读该键作为
+    上下文预算），库列名 ``max_seqlen_override`` 只是为避免与模型键混淆。
+    """
+    if not owner_agent_id or not user_id:
+        return model_config
+    try:
+        record = get_agent(user_id, owner_agent_id) or {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("读取 agent 模型参数覆盖失败(忽略): %s", exc)
+        return model_config
+
+    merged = dict(getattr(model_config, "extra", None) or {})
+    changed = False
+
+    effort = record.get("reasoning_effort")
+    if isinstance(effort, str) and effort.strip():
+        merged["reasoning_effort"] = effort.strip()
+        changed = True
+
+    max_in = record.get("max_seqlen_override")
+    if isinstance(max_in, int) and max_in > 0:
+        merged["max_seqlen"] = max_in
+        changed = True
+
+    max_out = record.get("max_output_tokens")
+    if isinstance(max_out, int) and max_out > 0:
+        merged["max_output_tokens"] = max_out
+        changed = True
+
+    threshold = record.get("compress_threshold")
+    if isinstance(threshold, (int, float)) and 0 < float(threshold) < 1:
+        merged["compress_threshold"] = float(threshold)
+        changed = True
+
+    if not changed:
+        return model_config
+    return replace(model_config, extra=merged)
+
+
+def _resolve_member_model(
+    user_id: str, agent_id: str, team_id: str, model_id: str
+) -> Tuple[Any, str]:
+    """解析成员使用的模型配置，并应用其模型参数覆盖。
+
+    返回 ``(model_config, model_id)``；找不到时返回 ``(None, model_id)``。
+
+    **空 ``model_id`` 不再回退 TOP 模型**：建队成员创建时模型留空、审核状态为
+    ``pending_model``，必须由用户在「团队成员 → 模型配置」页赋模型并审核通过
+    （见 ``_member_review_block`` 的审核闸）。若在此处悄悄回退 TOP 模型，成员
+    会在"未经用户确认"的情况下自主执行，正是要求 3 要治理的行为。
+
+    覆盖值优先取成员自身 agents 行，成员无覆盖时回退所属 TOP 的覆盖
+    （用户通常只在 TOP 上配置）。
+    """
+    config = state.model_configs.get(model_id)
+    if config is None:
+        return None, model_id
+
+    # 优先成员自身覆盖
+    overridden = _apply_agent_model_overrides(config, agent_id, user_id)
+    if overridden is not config:
+        return overridden, model_id
+    # 成员无覆盖：回退所属 TOP 的覆盖
+    return _apply_agent_model_overrides(config, team_id or agent_id, user_id), model_id
+
+
+def _member_review_block(
+    user_id: str, agent_id: str, team_id: str
+) -> Optional[str]:
+    """成员审核闸：返回拒绝原因；允许执行时返回 None。
+
+    成员在 ``approved`` 之前一律不接收、不执行任何消息（要求 3：新建成员保持
+    空模型 + 禁用 + 等待用户审核）。判定口径：
+
+    - 无 ``team_id`` / 未建队 → 不拦（历史单 agent 路径）；
+    - 目标是所属团队所有者（TOP 自身，``agent_id == team_id``）→ 不拦
+      （TOP 不在 ``team_members`` 表内，本就无行）；
+    - 查不到成员行 → 不拦（旧数据未建队，保持原行为）；
+    - 有行 → 仅 ``approved`` 放行。
+    """
+    if not team_id or agent_id == team_id:
+        return None
+    try:
+        from data.team_store import get_member
+
+        row = get_member(team_id, agent_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("读取成员审核状态失败(按放行处理) %s: %s", agent_id, exc)
+        return None
+    if not row:
+        return None
+    status = str(row.get("review_status") or "")
+    if status == "approved":
+        return None
+    if status == "rejected":
+        return "已被用户驳回（review_status=rejected），不会接收任何消息"
+    if not str(row.get("model_id") or "").strip():
+        return (
+            "尚未分配模型（review_status=pending_model）："
+            "需用户在「团队成员 → 模型配置」页选择模型并审核通过"
+        )
+    return (
+        f"尚未通过用户审核（review_status={status or 'pending_review'}）："
+        "需用户在「团队成员 → 模型配置」页确认放行"
+    )
+
+
 def _new_seg_id(agent_id: str) -> str:
     """生成一条段（文本消息/工具卡片）的唯一 id。"""
     return f"{agent_id}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
@@ -1644,16 +1854,27 @@ async def _stream_agent_reply(
              供调用方持久化/回传，避免最后一条携带全部过程文字。
     """
     loop = asyncio.get_running_loop()
-    # 顺带绑定主事件循环：分发层从工具线程推送 WS（session_created /
-    # 总结反向推送）时经 run_coroutine_threadsafe 线程安全提交
+    # 顺带绑定主事件循环：分发层从工具线程推送 WS（session_created）时经
+    # run_coroutine_threadsafe 线程安全提交
     _bind_main_loop()
     out_q: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
 
     def _consume() -> None:
-        """线程内消费 chat 生成器，产出经线程安全方式回传事件循环。"""
+        """线程内消费 chat 生成器，产出经线程安全方式回传事件循环。
+
+        主动延迟开启时叠加**生成器帧率控制**（见 [_FramePacer]）：把同一轮回复
+        内的 text/thinking 产出按固定帧率投递，避免以 token 速度刷屏（每 chunk
+        一次 WS 帧 + 每次前端全量 markdown 重解析）。节流放在**生产者线程**而非
+        事件循环侧：`asyncio.Queue` 无界且 `call_soon_threadsafe` 零背压，只有
+        阻塞生成器才能形成真正的背压；事件循环里 sleep 只会让队列无限膨胀。
+        """
+        pacer = _FramePacer(user_id, silent=silent)
         try:
             for item in session.chat(llm_content, on_tool_turn=on_tool_turn, cancel_event=cancel_event):
                 if cancel_event is not None and cancel_event.is_set():
+                    loop.call_soon_threadsafe(out_q.put_nowait, {"type": "cancelled"})
+                    return
+                if not pacer.wait_turn(item, cancel_event):
                     loop.call_soon_threadsafe(out_q.put_nowait, {"type": "cancelled"})
                     return
                 loop.call_soon_threadsafe(out_q.put_nowait, item)
@@ -1905,10 +2126,17 @@ async def _stream_agent_reply(
                     # last_usage，立即同步给前端，让「上下文长度」统计在 tool 循环
                     # 中持续跟进，而非等最终回复结束才一次性更新。
                     if getattr(session, "last_usage", None):
+                        # 进度条分母：取会话**生效**的 max_seqlen（含每 agent 覆盖），
+                        # 否则覆盖后分母与实际上下文预算不一致
                         _mc = getattr(session, "model_config", None)
-                        mid_max = (
-                            int(_mc.extra.get("max_seqlen", 8192))
-                            if _mc is not None else 8192
+                        mid_max = int(
+                            getattr(
+                                session,
+                                "max_seqlen",
+                                getattr(_mc, "extra", {}).get("max_seqlen", 8192)
+                                if _mc is not None else 8192,
+                            )
+                            or 8192
                         )
                         await state.ws_manager.send_message(
                             user_id,
@@ -2041,24 +2269,44 @@ async def _process_member_message(
     if not agent_id or not content:
         return
 
-    model_config = state.model_configs.get(model_id)
-    if model_config is None and not model_id and team_id:
-        # 空 model_id 自动回退所属 TOP 的模型：建队默认继承 TOP 模型，
-        # 此处兼容历史空 model_id 成员（无论从哪条投递路径进入，都不因
-        # 模型缺失丢消息）。
-        try:
-            top_rec = get_agent(user_id, team_id) or {}
-            top_model = top_rec.get("model_id") or ""
-            if top_model and top_model in state.model_configs:
-                model_config = state.model_configs[top_model]
-                model_id = top_model
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("成员空 model_id 回退 TOP 模型失败: %s", exc)
+    # 审核闸：成员在用户审核通过前不接收、不执行任何消息（要求 3）。
+    # 放在模型解析**之前**：未赋模型的成员本就没有可用模型，先给出
+    # "等待用户赋模型/审核"的可执行提示，而不是含糊的"模型不存在"。
+    blocked = _member_review_block(user_id, agent_id, team_id or "")
+    if blocked is not None:
+        await _append_activity_log_async(
+            workspace_id,
+            f"[{_clock_now()}] [blocked] 成员未就绪：{blocked}，消息未处理",
+            user_id=user_id,
+            mode_key=team_id or agent_id,
+        )
+        # 明确回传错误给发送方（仅当发送方是 agent；用户直发不转发任何 agent），
+        # 避免消息被静默丢弃（表现为"成员没收到"）
+        if not is_user_sender(sender_id):
+            try:
+                _dispatch_agent_message(
+                    user_id,
+                    [sender_id],
+                    f"[成员 {agent_id} 无法处理消息] {blocked}。"
+                    f"消息已丢弃：{content[:120]}",
+                    source_agent_id=agent_id,
+                    team_id=team_id or sender_id,
+                    extra={"auto_reply": True, "session_id": session_id},
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("回传成员未就绪错误失败: %s", exc)
+        return
+
+    # 解析成员模型并应用其模型参数覆盖（空 model_id 不再回退 TOP 模型：
+    # 空模型 = 未审核就绪，已被上面的审核闸拦下）
+    model_config, model_id = _resolve_member_model(
+        user_id, agent_id, team_id or "", model_id
+    )
     if model_config is None:
         await _append_activity_log_async(
             workspace_id,
             f"[{_clock_now()}] [error] 成员模型不存在: {model_id!r}，"
-            "消息未处理（leader 需先用 team update_member 为该成员设置 model_id）",
+            "消息未处理（请让用户在「团队成员 → 模型配置」页为该成员选择模型）",
             user_id=user_id, mode_key=team_id or agent_id,
         )
         # 明确回传错误给发送方（仅当发送方是 agent；用户直发不转发任何 agent），
@@ -2070,7 +2318,7 @@ async def _process_member_message(
                     [sender_id],
                     f"[成员 {agent_id} 无法处理消息] 未配置 LLM 模型"
                     f"（model_id={model_id!r}），消息已丢弃：{content[:120]}。"
-                    "请用 team update_member 为该成员设置 model_id 后重试。",
+                    "请让用户在「团队成员 → 模型配置」页为该成员选择模型后重试。",
                     source_agent_id=agent_id,
                     team_id=team_id or sender_id,
                     extra={"auto_reply": True, "session_id": session_id},
@@ -2411,67 +2659,6 @@ def _ensure_receiver_session(
         logger.warning("接收方会话保障失败(不影响投递): %s agent=%s", exc, agent_id)
 
 
-def _get_last_summary(user_id: str, agent_id: str, session_id: str) -> str:
-    """取接收 agent 指定会话的"最后总结"：最近一条 assistant 文本消息。
-
-    优先读内存会话上下文（session_cache），缺失时回退持久化上下文
-    （conversation_store.load_context）。纯工具调用轮（assistant 消息
-    content 为空）向前跳过；无总结返回空串。
-    """
-    context: Any = None
-    session = get_session(user_id, agent_id, session_id)
-    if session is not None:
-        context = getattr(session, "context", None)
-    if not context:
-        try:
-            context = load_context(user_id, agent_id, session_id) or []
-        except Exception:  # noqa: BLE001
-            context = []
-    for msg in reversed(context):
-        if not isinstance(msg, dict) or msg.get("role") != "assistant":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str) and content.strip():
-            return content.strip()
-    return ""
-
-
-def _maybe_push_last_summary(
-    user_id: str,
-    target_id: str,
-    source_agent_id: str,
-    owner_top: str,
-    session_id: str,
-) -> None:
-    """总结反向推送（Task 7.1，显式化）：active 消息触达已有总结的目标时，
-    复用消息发送接口把目标最近一轮的 assistant 总结回发给发起方。
-
-    - 仅 agent 主动发起（active=true 且非用户直发、非 auto_reply 被动
-      通道）触发；推送消息自身标记 active=false，不会级联触发反向推送
-      （防循环）；
-    - 仅做"给发起方看的上下文恢复"，不改变目标 agent 的处理逻辑；
-      成员完成回复的既有回发链路（reply_sender）保持不变。
-    """
-    if is_user_sender(source_agent_id) or source_agent_id == target_id:
-        return
-    summary = _get_last_summary(user_id, target_id, session_id)
-    if not summary:
-        return
-    try:
-        _dispatch_agent_message(
-            user_id,
-            [source_agent_id],
-            f"[{target_id} 最近总结] {summary}",
-            source_agent_id=target_id,
-            team_id=owner_top or target_id,
-            extra={"auto_reply": True, "session_id": session_id},
-            # 推送消息标记 active=false：接收方不再级联反向推送
-            active=False,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("总结反向推送失败: %s target=%s", exc, target_id)
-
-
 def _dispatch_agent_message(
     user_id: str,
     target_ids: Any,
@@ -2491,13 +2678,16 @@ def _dispatch_agent_message(
     - update memory 锁：目标正处于记忆维护时拒绝投递；
     - 目标解析：顶部 agent 经 agent_store 查询；成员经发送方 roster 解析；
     - 接收方会话保障（Task 7.2）：目标会话元数据缺失时创建并推送
-      ``session_created``；
-    - 总结反向推送（Task 7.1）：active=true 的 agent 主动发起消息触达
-      已有"最后总结"的目标时，把总结回发给发起方（推送消息标记
-      active=false，防循环；用户直发与 auto_reply 被动通道不触发）。
+      ``session_created``。
 
-    :param active: 消息是否为主动发起（默认 true）。被动推送（auto_reply、
-                   唤醒续跑等）传 false，不触发总结反向推送。
+    **不再做"总结反向推送"**（原 Task 7.1 已于本次移除）：active 消息触达目标后
+    不再自动把目标的最近总结回发给发起方。理由是该机制会让两个 agent 在互相
+    发消息时各自自动回传总结，形成 A↔B→A… 的无限交火并烧掉大量 API 调用。
+    现在改由提示词约定：需要对方知道结果时，由 agent 自己显式 send_message
+    （见 ``prompt/versions/*/tools/builtin.yaml`` 的 message 条目"回复机制"）。
+
+    :param active: 消息是否为主动发起（默认 true）。仅作为负载透传给接收侧
+                    （用于区分主动/被动注入），不再影响任何回传行为。
     """
     active = bool(active)
     if isinstance(target_ids, str):
@@ -2522,8 +2712,7 @@ def _dispatch_agent_message(
     # auto_reply（agent 侧自动回复）消息跳过并发检查，防止递归拒绝/误伤
     # 既有 auto_reply 通道（成员模型缺失回传、成员完成回传等）。
     is_auto_reply = bool((extra or {}).get("auto_reply"))
-    # 投递负载按 session_id 归集（缺省回退默认会话）；接收方会话保障与
-    # 总结反向推送均按该会话定位。
+    # 投递负载按 session_id 归集（缺省回退默认会话）；接收方会话保障按该会话定位。
     session_id = str((extra or {}).get("session_id") or "") or DEFAULT_SESSION
     for target_id in target_ids:
         if not target_id or target_id == source_agent_id:
@@ -2591,7 +2780,7 @@ def _dispatch_agent_message(
             }
             if extra:
                 payload.update(extra)
-            # active 随负载透传（接收侧不消费；是否触发总结反向推送由发送层判定）
+            # active 随负载透传（接收侧只读不消费：用于区分主动/被动注入）
             payload["active"] = active
             # 接收方会话保障（Task 7.2）：broker 消费前确保会话元数据存在
             # 并推送 session_created（跨 team TOP↔TOP 与用户直发同样保障）
@@ -2603,11 +2792,6 @@ def _dispatch_agent_message(
                 )
             if dispatched:
                 sent.append(target_id)
-                # 总结反向推送（Task 7.1）：active 主动发起且非被动通道时触发
-                if active and not is_auto_reply:
-                    _maybe_push_last_summary(
-                        user_id, target_id, source_agent_id, owner_top, session_id
-                    )
             else:
                 rejected.append(target_id)
             continue
@@ -2652,7 +2836,7 @@ def _dispatch_agent_message(
         }
         if extra:
             payload.update(extra)
-        # active 随负载透传（接收侧不消费；是否触发总结反向推送由发送层判定）
+        # active 随负载透传（接收侧只读不消费：用于区分主动/被动注入）
         payload["active"] = active
         # 接收方会话保障（Task 7.2）：broker 消费前确保会话元数据存在
         _ensure_receiver_session(user_id, target_id, session_id, content)
@@ -2661,11 +2845,6 @@ def _dispatch_agent_message(
             dispatched = state.team_broker.dispatch((user_id, target_id), payload)
         if dispatched:
             sent.append(target_id)
-            # 总结反向推送（Task 7.1）：active 主动发起且非被动通道时触发
-            if active and not is_auto_reply:
-                _maybe_push_last_summary(
-                    user_id, target_id, source_agent_id, owner_top, session_id
-                )
         else:
             rejected.append(target_id)
 
@@ -2777,7 +2956,7 @@ async def resume_after_answer(
     保证"谁发给它的总结就回发给谁"在提问-回答边缘路径同样成立。
     """
     content = f"[AskUserQuestion 用户回答] {answer}"
-    # 作答唤醒属被动注入（Task 7.1）：以 active=false 投递，不触发总结反向推送
+    # 作答唤醒属被动注入：以 active=false 投递（接收侧只读）
     try:
         if is_member:
             await asyncio.to_thread(
@@ -2868,10 +3047,14 @@ async def _handle_user_message(
         await _send_status_idle(user_id, agent_id, session_id)
         return
 
-    # 根据 agent 绑定的模型选择模型配置
+    # 根据 agent 绑定的模型选择模型配置，并应用该 agent 的模型参数覆盖
+    # （思考强度/输入长度/输出长度/压缩阈值，见右栏「模型信息」页）
     agent = get_agent(user_id, agent_id)
-    model_id = agent.get("model_id") if agent else None
+    model_id = (agent.get("model_id") if agent else None) or ""
     model_config = state.model_configs.get(model_id) if model_id else None
+    model_config = _apply_agent_model_overrides(
+        model_config, agent_id, user_id
+    ) if model_config is not None else None
     # agent 的独立工作空间（旧数据回填为 agent 自身 id）
     workspace_id = agent.get("workspace_id") if agent else None
     if not workspace_id:
@@ -3096,7 +3279,11 @@ async def _handle_user_message(
         # 计算 token 用量
         usage_payload = None
         if session is not None and getattr(session, "last_usage", None):
-            max_tokens = int(model_config.extra.get("max_seqlen", 8192))
+            # 同工具循环口径：取会话生效的 max_seqlen（含每 agent 覆盖）
+            max_tokens = int(
+                getattr(session, "max_seqlen", None)
+                or model_config.extra.get("max_seqlen", 8192)
+            )
             usage_payload = {**session.last_usage, "max_tokens": max_tokens}
 
         # 若最终文本段仍打开，补发 msg_end（附带 usage）

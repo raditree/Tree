@@ -35,6 +35,9 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
   bool _loading = true;
   String? _error;
 
+  /// 等待用户处理的成员数（未分配模型 / 待审核）——顶部红色提示条
+  int _pendingCount = 0;
+
   /// 实时 working 的成员 ID 集合（通过 WS agent_status 更新）
   final Set<String> _workingMembers = <String>{};
 
@@ -107,11 +110,21 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
       _error = null;
     });
     try {
-      final List<Map<String, dynamic>> members =
-          await ApiService.getTeammates(widget.agent.id);
+      final Map<String, dynamic> data =
+          await ApiService.getTeammatesPayload(widget.agent.id);
+      final List<dynamic> raw = data['members'] as List<dynamic>? ?? <dynamic>[];
+      final List<Map<String, dynamic>> members = raw
+          .map((dynamic e) =>
+              (e as Map<dynamic, dynamic>).cast<String, dynamic>())
+          .toList();
       if (!mounted) return;
       setState(() {
         _members = members;
+        _pendingCount = (data['pending_member_count'] as num?)?.toInt() ??
+            members
+                .where((Map<String, dynamic> m) =>
+                    _needsUserAction(m['review_status'] as String? ?? ''))
+                .length;
         _loading = false;
       });
     } catch (e) {
@@ -122,6 +135,10 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
       });
     }
   }
+
+  /// 该审核状态是否"等待用户处理"（与后端 REVIEW_STATUS_NEEDS_USER 同一口径）。
+  static bool _needsUserAction(String status) =>
+      status == 'pending_model' || status == 'pending_review';
 
   @override
   Widget build(BuildContext context) {
@@ -166,10 +183,40 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: <Widget>[
+        if (_pendingCount > 0) _buildPendingBanner(),
         _buildLeaderCard(),
         const SizedBox(height: 16),
         ..._buildLevelGroups(),
       ],
+    );
+  }
+
+  /// 顶部红色提示条：有成员等待用户分配模型 / 审核。
+  ///
+  /// 成员在这之前**完全不工作**（后端审核闸拒收消息），必须让用户一眼看到
+  /// 入口在哪，否则表现为"派活了但成员毫无反应"。
+  Widget _buildPendingBanner() {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: cs.errorContainer,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: <Widget>[
+          Icon(Icons.error_outline, size: 18, color: cs.onErrorContainer),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '有 $_pendingCount 名成员尚未就绪：需要你分配模型并审核后才会工作。'
+              '点开对应成员 →「模型配置」页处理',
+              style: TextStyle(fontSize: 12, color: cs.onErrorContainer),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -245,6 +292,8 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
     final String model = member['model_id'] as String? ?? '';
     final int level = (member['level'] as num?)?.toInt() ?? 0;
     final String comment = member['comment'] as String? ?? '';
+    final String reviewStatus = member['review_status'] as String? ?? '';
+    final bool needsAction = _needsUserAction(reviewStatus);
     // 实时状态：优先用 WS 维护的集合，回退到 API 返回的 live_status
     final bool working = _workingMembers.contains(id) ||
         (member['live_status'] as String?) == 'working';
@@ -254,6 +303,13 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
 
     return Card(
       margin: const EdgeInsets.only(bottom: 8),
+      // 待处理成员用错误色描边，与顶部提示条呼应（一眼看出该点哪个）
+      shape: needsAction
+          ? RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: BorderSide(color: cs.error, width: 1),
+            )
+          : null,
       child: ListTile(
         onTap: () {
           Navigator.of(context).push(
@@ -263,19 +319,28 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
                 memberId: id,
                 memberName: name.isNotEmpty ? name : id,
                 sessionId: widget.sessionId,
+                member: member,
+                // 子页面处理完审核/赋模型后回到本页需要刷新计数与列表
+                onChanged: _load,
               ),
             ),
           );
         },
         leading: CircleAvatar(
           radius: 16,
-          backgroundColor: working
-              ? Colors.orange.withOpacity(0.2)
-              : cs.surfaceVariant,
+          backgroundColor: needsAction
+              ? cs.errorContainer
+              : (working
+                  ? Colors.orange.withOpacity(0.2)
+                  : cs.surfaceVariant),
           child: Icon(
-            working ? Icons.sync : Icons.person,
+            needsAction
+                ? Icons.report_problem_outlined
+                : (working ? Icons.sync : Icons.person),
             size: 18,
-            color: working ? Colors.orange : cs.onSurfaceVariant,
+            color: needsAction
+                ? cs.onErrorContainer
+                : (working ? Colors.orange : cs.onSurfaceVariant),
           ),
         ),
         title: Text(
@@ -287,9 +352,14 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
           children: <Widget>[
             const SizedBox(height: 2),
             Text(
-              'Level $level · ${model.isEmpty ? '未知模型' : model}',
+              'Level $level · ${model.isEmpty ? '未分配模型' : model}',
               style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
             ),
+            if (needsAction)
+              Text(
+                _reviewHint(reviewStatus),
+                style: TextStyle(fontSize: 11, color: cs.error),
+              ),
             if (comment.isNotEmpty)
               Text(
                 comment,
@@ -318,16 +388,31 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
       ),
     );
   }
+
+  /// 审核状态的中文提示（与后端拒绝原因同一口径）。
+  static String _reviewHint(String status) {
+    switch (status) {
+      case 'pending_model':
+        return '待分配模型（点开选择模型并审核后才能工作）';
+      case 'pending_review':
+        return '待审核（模型已选，点开确认放行）';
+      case 'rejected':
+        return '已驳回（不会接收任何消息）';
+      default:
+        return '';
+    }
+  }
 }
 
 /// 单个团队成员的工作进度详情页
 ///
 /// 包含三部分：
 /// - 进度：实时消息与工具调用卡片（订阅 WebSocket，按 agent_id 过滤）
-/// - 日志：成员工作空间的活动日志
+/// - 模型配置：为用户分配成员模型 + 审核放行（成员就绪的唯一入口）
 /// - 消息：直接向成员发送消息
 /// （成员与 leader 共享工作目录 base，文件由主界面右侧文件栏展示，
-///   此处不再提供独立的成员文件浏览。）
+///   此处不再提供独立的成员文件浏览。原「日志」Tab 已移除：成员日志由
+///   leader agent 直接 read/grep 共享工作目录，用户侧更需要的是赋模型入口。）
 class TeammateDetailPage extends StatefulWidget {
   final Agent leader;
   final String memberId;
@@ -339,6 +424,12 @@ class TeammateDetailPage extends StatefulWidget {
   /// 定位目标消息 id（右侧「问题回复」成员提问导航触发；历史加载后滚动定位）
   final String? scrollToMessageId;
 
+  /// 该成员的名单行（含 model_id / review_status / role / duty 等）
+  final Map<String, dynamic>? member;
+
+  /// 配置变更后的回调（父页面刷新成员列表与待处理计数）
+  final Future<void> Function()? onChanged;
+
   const TeammateDetailPage({
     super.key,
     required this.leader,
@@ -346,6 +437,8 @@ class TeammateDetailPage extends StatefulWidget {
     required this.memberName,
     required this.sessionId,
     this.scrollToMessageId,
+    this.member,
+    this.onChanged,
   });
 
   @override
@@ -357,7 +450,6 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
   final List<ChatMessage> _liveMessages = <ChatMessage>[];
   int _scrollRevision = 0;
   bool _wsConnected = false;
-  String _log = '';
   String? _selectedTab = 'progress';
 
   /// MessageList 定位触发号（右侧「问题回复」成员提问导航用）
@@ -366,13 +458,59 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
   /// MessageList 定位目标消息 id
   String? _scrollToMessageId;
 
+  /// 成员名单行（模型配置页的数据源；配置成功后就地更新）
+  late Map<String, dynamic> _member;
+
+  /// 可用模型池（模型配置页下拉）
+  List<Map<String, dynamic>> _models = <Map<String, dynamic>>[];
+  bool _modelsLoading = false;
+  String? _modelsError;
+
+  /// 模型配置页当前选中的模型 id（'' = 未选择）
+  String _selectedModelId = '';
+
+  /// 是否正在提交配置
+  bool _saving = false;
+
   @override
   void initState() {
     super.initState();
+    _member = Map<String, dynamic>.from(widget.member ?? <String, dynamic>{});
+    _selectedModelId = _member['model_id'] as String? ?? '';
     _webSocket.onMessage = _handleIncoming;
     _connectWs();
     _loadHistory();
-    _loadLog();
+    _loadModels();
+  }
+
+  /// 加载可用模型池（模型配置页下拉数据源）。
+  ///
+  /// 复用 `models-info`：它返回 `models[]`（逐字段白名单、不含密钥），
+  /// 与右栏「模型信息」同一份数据源，避免再开一个只读接口。
+  Future<void> _loadModels() async {
+    setState(() {
+      _modelsLoading = true;
+      _modelsError = null;
+    });
+    try {
+      final Map<String, dynamic> data =
+          await ApiService.getAgentModelsInfo(widget.leader.id);
+      if (!mounted) return;
+      final List<dynamic> raw = data['models'] as List<dynamic>? ?? <dynamic>[];
+      setState(() {
+        _models = raw
+            .map((dynamic e) =>
+                (e as Map<dynamic, dynamic>).cast<String, dynamic>())
+            .toList();
+        _modelsLoading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _modelsError = '$e';
+        _modelsLoading = false;
+      });
+    }
   }
 
   /// 加载该成员当前会话的历史进度（对话历史 + 实时 WS 增量合并）
@@ -491,19 +629,93 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
       final String? statusSession = d['session_id'] as String?;
       if (statusSession != null && statusSession != widget.sessionId) return;
       if (d['agent_id'] == widget.memberId) {
-        _loadLog();
+        // 成员状态变化（含审核放行后开始工作）：刷新名单行的实时状态
+        _refreshMember();
       }
     }
   }
 
-  Future<void> _loadLog() async {
+  /// 重新拉取本成员的名单行（审核/模型可能已被其它入口改动）。
+  Future<void> _refreshMember() async {
     try {
-      final String log = await ApiService.getTeammateLog(widget.memberId);
+      final List<Map<String, dynamic>> members =
+          await ApiService.getTeammates(widget.leader.id);
       if (!mounted) return;
+      for (final Map<String, dynamic> m in members) {
+        if ((m['id'] as String?) == widget.memberId) {
+          setState(() {
+            _member = m;
+            if ((m['model_id'] as String? ?? '').isNotEmpty) {
+              _selectedModelId = m['model_id'] as String;
+            }
+          });
+          return;
+        }
+      }
+    } catch (_) {
+      // 拉取失败保持现有数据
+    }
+  }
+
+  /// 提交模型配置 / 审核（「模型配置」页）
+  ///
+  /// 语义：`assign` 只赋模型（进入待审核）；`approve` 赋模型并审核通过；
+  /// `reject` 驳回；`reset` 退回待审核。赋模型与审核是成员能否工作的唯一闸门，
+  /// 全部经用户侧接口 `PATCH /api/agents/{leader}/teammate/{member}`。
+  Future<void> _submitMemberConfig(String action) async {
+    if (_saving) return;
+    final String modelId = _selectedModelId.trim();
+    if (action != 'reject' && modelId.isEmpty) {
+      _showSnack('请先选择模型');
+      return;
+    }
+    setState(() => _saving = true);
+    try {
+      String? reviewStatus;
+      switch (action) {
+        case 'approve':
+          reviewStatus = 'approved';
+          break;
+        case 'reject':
+          reviewStatus = 'rejected';
+          break;
+        case 'reset':
+          reviewStatus = 'pending_review';
+          break;
+        default:
+          reviewStatus = null; // assign：只赋模型，状态由后端推导为待审核
+      }
+      final Map<String, dynamic> resp = await ApiService.updateTeammate(
+        widget.leader.id,
+        widget.memberId,
+        // reject 不改模型（仅改状态）；其余一律带上当前选择的模型
+        modelId: action == 'reject' ? null : modelId,
+        reviewStatus: reviewStatus,
+      );
+      if (!mounted) return;
+      final Map<String, dynamic>? m =
+          (resp['member'] as Map<String, dynamic>?)?.cast<String, dynamic>();
       setState(() {
-        _log = log;
+        if (m != null) {
+          _member = <String, dynamic>{..._member, ...m};
+          _selectedModelId = m['model_id'] as String? ?? _selectedModelId;
+        }
       });
-    } catch (_) {}
+      final String status = m?['review_status'] as String? ?? '';
+      _showSnack(status == 'approved' ? '已审核通过，成员现在可以工作' : '配置已保存');
+      if (widget.onChanged != null) await widget.onChanged!();
+    } catch (e) {
+      if (!mounted) return;
+      _showSnack('保存失败：$e');
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  void _showSnack(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), duration: const Duration(seconds: 2)),
+    );
   }
 
   @override
@@ -514,28 +726,43 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
 
   @override
   Widget build(BuildContext context) {
+    final bool needsAction = _needsUserAction(
+      _member['review_status'] as String? ?? '',
+    );
     return DefaultTabController(
       length: 2,
       child: Scaffold(
         appBar: AppBar(
           title: Text(widget.memberName),
-          actions: <Widget>[
-            IconButton(
-              tooltip: '刷新日志',
-              icon: const Icon(Icons.refresh),
-              onPressed: _loadLog,
-            ),
-          ],
+          // 未就绪成员：标题旁挂红色标记，避免用户误以为"派活没反应"
           bottom: TabBar(
-            tabs: const <Widget>[
-              Tab(text: '进度'),
-              Tab(text: '日志'),
+            tabs: <Widget>[
+              const Tab(text: '进度'),
+              Tab(
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: <Widget>[
+                    const Text('模型配置'),
+                    if (needsAction) ...<Widget>[
+                      const SizedBox(width: 4),
+                      Container(
+                        width: 8,
+                        height: 8,
+                        decoration: const BoxDecoration(
+                          color: Color(0xFFEF4444),
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
             ],
             onTap: (int i) {
               setState(() {
-                _selectedTab = i == 0 ? 'progress' : 'log';
+                _selectedTab = i == 0 ? 'progress' : 'model';
               });
-              if (i == 1) _loadLog();
+              if (i == 1) _loadModels();
             },
           ),
         ),
@@ -551,15 +778,8 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
 
   Widget _buildTabContent() {
     switch (_selectedTab) {
-      case 'log':
-        return Container(
-          width: double.infinity,
-          padding: const EdgeInsets.all(12),
-          child: SelectableText(
-            _log.isEmpty ? '（暂无活动日志）' : _log,
-            style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
-          ),
-        );
+      case 'model':
+        return _buildModelConfigTab();
       case 'progress':
       default:
         return MessageList(
@@ -570,6 +790,185 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
         );
     }
   }
+
+  /// 「模型配置」页：为用户分配成员模型 + 审核放行。
+  ///
+  /// 这是成员能否工作的**唯一闸门**：成员创建时模型为空、状态 pending_model，
+  /// 在用户赋模型并审核通过前后端会拒收其全部消息。
+  Widget _buildModelConfigTab() {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final String reviewStatus = _member['review_status'] as String? ?? '';
+    final bool needsAction = _needsUserAction(reviewStatus);
+    final String role = _member['role'] as String? ?? '';
+    final String duty = _member['duty'] as String? ?? '';
+    final int level = (_member['level'] as num?)?.toInt() ?? 1;
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: <Widget>[
+        if (needsAction)
+          Container(
+            margin: const EdgeInsets.only(bottom: 12),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(
+              color: cs.errorContainer,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Row(
+              children: <Widget>[
+                Icon(Icons.error_outline,
+                    size: 18, color: cs.onErrorContainer),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _reviewHint(reviewStatus),
+                    style:
+                        TextStyle(fontSize: 12, color: cs.onErrorContainer),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        _infoRow('成员 ID', widget.memberId),
+        _infoRow('层级', 'Level $level'),
+        _infoRow('角色', role.isEmpty ? '（未设置）' : role),
+        _infoRow('职责', duty.isEmpty ? '（未设置）' : duty),
+        _infoRow('审核状态', _reviewStatusLabel(reviewStatus)),
+        const Divider(height: 28),
+        Text('分配模型', style: TextStyle(
+          fontSize: 13, fontWeight: FontWeight.w600, color: cs.onSurface)),
+        const SizedBox(height: 8),
+        if (_modelsLoading)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 12),
+            child: Center(child: CircularProgressIndicator()),
+          )
+        else if (_modelsError != null)
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Text('模型列表加载失败：$_modelsError',
+                  style: TextStyle(fontSize: 12, color: cs.error)),
+              const SizedBox(height: 8),
+              OutlinedButton(onPressed: _loadModels, child: const Text('重试')),
+            ],
+          )
+        else
+          DropdownButtonFormField<String>(
+            value: _models.any((Map<String, dynamic> m) =>
+                    (m['model_id'] as String? ?? '') == _selectedModelId)
+                ? _selectedModelId
+                : '',
+            isExpanded: true,
+            decoration: const InputDecoration(
+              labelText: '成员使用的模型',
+              helperText: '选择后需审核通过，成员才会开始接收消息',
+              isDense: true,
+              border: OutlineInputBorder(),
+            ),
+            items: <DropdownMenuItem<String>>[
+              const DropdownMenuItem<String>(
+                value: '',
+                child: Text('（未选择）'),
+              ),
+              ..._models.map(
+                (Map<String, dynamic> m) => DropdownMenuItem<String>(
+                  value: m['model_id'] as String? ?? '',
+                  child: Text(m['name'] as String? ??
+                      (m['model_id'] as String? ?? '')),
+                ),
+              ),
+            ],
+            onChanged: (String? value) {
+              setState(() => _selectedModelId = value ?? '');
+            },
+          ),
+        const SizedBox(height: 16),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: <Widget>[
+            FilledButton.icon(
+              onPressed: _saving ? null : () => _submitMemberConfig('approve'),
+              icon: const Icon(Icons.verified_outlined, size: 18),
+              label: const Text('保存并审核通过'),
+            ),
+            OutlinedButton.icon(
+              onPressed: _saving ? null : () => _submitMemberConfig('assign'),
+              icon: const Icon(Icons.save_outlined, size: 18),
+              label: const Text('仅保存（待审核）'),
+            ),
+            if (reviewStatus == 'approved')
+              OutlinedButton.icon(
+                onPressed:
+                    _saving ? null : () => _submitMemberConfig('reject'),
+                icon: const Icon(Icons.block, size: 18),
+                label: const Text('驳回（停止接收消息）'),
+              ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Text(
+          '说明：成员的模型与审核状态决定它能否工作。未分配模型或未审核通过的'
+          '成员不会接收任何消息，leader 向其派活会被后端拒绝。审核通过后系统会'
+          '向其补发一次初始化消息。',
+          style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+        ),
+      ],
+    );
+  }
+
+  Widget _infoRow(String label, String value) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          SizedBox(
+            width: 76,
+            child: Text(label,
+                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+          ),
+          Expanded(
+            child: Text(value, style: const TextStyle(fontSize: 12)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  static String _reviewStatusLabel(String status) {
+    switch (status) {
+      case 'approved':
+        return '已审核通过';
+      case 'pending_model':
+        return '待分配模型';
+      case 'pending_review':
+        return '待审核';
+      case 'rejected':
+        return '已驳回';
+      default:
+        return '未知';
+    }
+  }
+
+  static String _reviewHint(String status) {
+    switch (status) {
+      case 'pending_model':
+        return '该成员尚未分配模型，当前不接收任何消息。请选择模型后点「保存并审核通过」。';
+      case 'pending_review':
+        return '该成员已选模型但尚未审核，当前不接收任何消息。确认无误后点「保存并审核通过」。';
+      case 'rejected':
+        return '该成员已被驳回，不会接收任何消息。如需重新启用请选择模型并审核通过。';
+      default:
+        return '';
+    }
+  }
+
+  /// 该审核状态是否"等待用户处理"（与后端 REVIEW_STATUS_NEEDS_USER 同一口径）
+  static bool _needsUserAction(String status) =>
+      status == 'pending_model' || status == 'pending_review';
 
   Widget _buildMessageInput() {
     final TextEditingController controller = TextEditingController();

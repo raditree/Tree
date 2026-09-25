@@ -13,6 +13,7 @@ import '../widgets/agent_list.dart';
 import '../widgets/create_agent_dialog.dart';
 import '../widgets/file_panel.dart';
 import '../widgets/message_panel.dart';
+import '../widgets/plugin_panel.dart';
 import '../widgets/teammates_window_page.dart';
 import 'login_page.dart';
 import 'settings_page.dart';
@@ -44,6 +45,16 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
 
   // 折叠时宽度
   static const double _collapsedWidth = 40;
+
+  /// 左侧活动栏宽度（VS Code 风格图标条，常驻不参与折叠动画）
+  ///
+  /// 必须**独立于** [_leftCollapsed] 的宽度动画：若把活动栏放进
+  /// `AnimatedContainer` 内部，折叠左栏时它会被压到 [_collapsedWidth]，
+  /// 图标显示不全。
+  static const double _activityBarWidth = 48;
+
+  /// 左侧活动栏当前选中的功能面板：0=Agent 列表，1=插件面板
+  int _leftPanel = 0;
 
   // 侧栏折叠/展开的动画时长与曲线（宽度平滑过渡 + 内容淡入淡出）
   static const Duration _sidebarAnimDuration = Duration(milliseconds: 60);
@@ -493,12 +504,14 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   Widget _buildThreeColumnLayout() {
     return Row(
       children: [
-        // 左栏：Agent 列表（折叠时宽度平滑过渡，内容淡入淡出）
+        // 左侧活动栏：切换左栏功能面板（Agent 列表 / 插件），常驻显示
+        _buildActivityBar(),
+        // 左栏面板区（Agent 列表或插件；折叠时宽度平滑过渡，内容淡入淡出）
         _buildAnimatedSidebar(
           collapsed: _leftCollapsed,
           expandedWidth: _leftWidth,
           collapsedBar: _buildCollapsedLeftBar(),
-          expandedBar: _buildAgentPanel(),
+          expandedBar: _buildLeftPanel(),
         ),
         // 拖拽分隔条 1（控制左栏宽度；折叠时平滑收为 0）
         _buildAnimatedDivider(
@@ -612,6 +625,159 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     );
   }
 
+  /// 构建左侧活动栏（VS Code 风格图标条：Agent 列表 / 插件 / 设置）
+  ///
+  /// 固定在整列最左侧且**不随面板折叠**：折叠只影响右侧的 [_leftWidth] 面板区。
+  /// 插件面板由右栏迁到此处后，Agent 列表仍在最上面（默认选中项）。
+  ///
+  /// 设置入口固定在底部：它属于**全局**入口而非某个面板的功能，原先挂在
+  /// Agent 面板标题栏上，切到插件面板后整个标题栏消失、设置也就找不到了。
+  /// 放在活动栏底部后切任何面板都可见（与 VS Code 的齿轮位置一致）。
+  Widget _buildActivityBar() {
+    return Container(
+      width: _activityBarWidth,
+      color: Theme.of(context).scaffoldBackgroundColor,
+      child: Column(
+        children: [
+          const SizedBox(height: 8),
+          _buildActivityItem(
+            index: 0,
+            icon: Icons.groups_outlined,
+            selectedIcon: Icons.groups,
+            tooltip: 'Agent 列表',
+          ),
+          const SizedBox(height: 4),
+          _buildActivityItem(
+            index: 1,
+            icon: Icons.extension_outlined,
+            selectedIcon: Icons.extension,
+            tooltip: '插件（只读）',
+          ),
+          // 撑开剩余空间，把设置压到底部
+          const Spacer(),
+          _buildActivityAction(
+            icon: Icons.settings_outlined,
+            tooltip: '设置',
+            onTap: _openSettings,
+          ),
+          const SizedBox(height: 8),
+        ],
+      ),
+    );
+  }
+
+  /// 打开设置页（活动栏底部全局入口）
+  void _openSettings() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (BuildContext context) => const SettingsPage(),
+      ),
+    );
+  }
+
+  /// 活动栏里的**动作**按钮（非面板切换：不参与选中态、无高亮指示条）
+  ///
+  /// 与 [_buildActivityItem] 共用尺寸与图标规格，保证视觉一致；区别是没有
+  /// 选中态（点它不会切换左栏面板）。
+  Widget _buildActivityAction({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback onTap,
+  }) {
+    final cs = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        onTap: onTap,
+        child: SizedBox(
+          height: 44,
+          child: Row(
+            children: [
+              // 与面板项对齐的占位（无选中色）
+              const SizedBox(width: 2),
+              Expanded(
+                child: Icon(
+                  icon,
+                  size: 22,
+                  color: cs.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 单个活动栏图标项（选中态带左侧高亮指示条 + 主色图标）
+  Widget _buildActivityItem({
+    required int index,
+    required IconData icon,
+    required IconData selectedIcon,
+    required String tooltip,
+  }) {
+    final bool selected = _leftPanel == index;
+    final cs = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        onTap: () {
+          setState(() {
+            _leftPanel = index;
+            // 切到某个面板时顺带展开左栏（折叠状态下点图标应能看到内容）
+            _leftCollapsed = false;
+          });
+        },
+        child: SizedBox(
+          height: 44,
+          child: Row(
+            children: [
+              // 选中指示条
+              Container(
+                width: 2,
+                height: 44,
+                color: selected ? cs.primary : Colors.transparent,
+              ),
+              Expanded(
+                child: Icon(
+                  selected ? selectedIcon : icon,
+                  size: 22,
+                  color: selected ? cs.primary : cs.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 构建左栏当前选中的功能面板
+  ///
+  /// 用 [IndexedStack] 而非条件渲染：两个面板都保持挂载，因此
+  /// - Agent 列表滚动位置、插件面板的最近快照都不丢；
+  /// - `PluginMonitorService` 的引用计数稳定为 1，**切换面板不会断开/重建它
+  ///   自有的 WebSocket**（条件渲染会每次 start/stop 造成连接抖动）。
+  Widget _buildLeftPanel() {
+    return IndexedStack(
+      index: _leftPanel,
+      children: <Widget>[
+        _buildAgentPanel(),
+        // 左栏由活动栏承担标题，避免与面板自带标题重复。
+        // onCollapse：内容下方空白区域点击折叠左栏（与 Agent 列表一致）。
+        PluginPanel(
+          teamId: _selectedAgent?.id,
+          showHeader: false,
+          onCollapse: () {
+            setState(() {
+              _leftCollapsed = true;
+            });
+          },
+        ),
+      ],
+    );
+  }
+
   /// 构建右栏文件面板
   ///
   /// 显示当前选中 agent 的工作空间文件与 git 历史；
@@ -696,7 +862,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     );
   }
 
-  /// 构建左栏标题栏（标题 + 设置/创建/折叠按钮）
+  /// 构建左栏标题栏（标题 + 创建/折叠按钮）
+  ///
+  /// 设置入口已移到活动栏底部（全局入口，切面板后不应消失）。
   Widget _buildAgentHeader() {
     final cs = Theme.of(context).colorScheme;
     return Container(
@@ -718,19 +886,6 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 fontWeight: FontWeight.w600,
               ),
             ),
-          ),
-          // 设置入口
-          IconButton(
-            tooltip: '设置',
-            onPressed: () {
-              Navigator.of(context).push(
-                MaterialPageRoute<void>(
-                  builder: (BuildContext context) => const SettingsPage(),
-                ),
-              );
-            },
-            icon: const Icon(Icons.settings_outlined),
-            color: cs.primary,
           ),
           // 创建 Agent
           IconButton(
@@ -795,7 +950,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 quarterTurns: 1,
                 child: Center(
                   child: Text(
-                    'Agent 列表',
+                    // 折叠窄条文案随活动栏选择变化（左栏不再只有 Agent 列表）
+                    _leftPanel == 0 ? 'Agent 列表' : '插件',
                     style: TextStyle(
                       fontSize: 12,
                       color: cs.onSurfaceVariant,
@@ -851,7 +1007,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 quarterTurns: 1,
                 child: Center(
                   child: Text(
-                    '文件管理',
+                    // 右栏现在含「文件 / MCP 配置 / 模型信息 / 问题回复」，
+                    // 原「文件管理」文案已不准确
+                    '工作区',
                     style: TextStyle(
                       fontSize: 12,
                       color: cs.onSurfaceVariant,

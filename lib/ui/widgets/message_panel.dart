@@ -1206,8 +1206,11 @@ class _MessagePanelState extends State<MessagePanel> {
             ),
           if (agent != null)
             IconButton(
-              tooltip: '查看 teammates 工作进度',
-              icon: const Icon(Icons.hub, size: 20),
+              tooltip: (agent.pendingMemberCount > 0)
+                  ? '查看 teammates 工作进度（有 ${agent.pendingMemberCount} 名成员'
+                      '等待分配模型 / 审核）'
+                  : '查看 teammates 工作进度',
+              icon: _buildTeammatesIcon(agent),
               onPressed: () => _openTeammatesWindow(agent),
             ),
           if (working)
@@ -1328,6 +1331,37 @@ class _MessagePanelState extends State<MessagePanel> {
           sessionId: sessionId,
         ),
       ),
+    );
+  }
+
+  /// teammates 入口图标：有待处理成员时叠一个红色小圆点。
+  ///
+  /// 与 Agent 列表的红点同一口径（成员未分配模型 / 待审核）。用角标而非替换
+  /// 图标，保证入口位置与形状不变，只增加一个"有事要做"的信号。
+  Widget _buildTeammatesIcon(Agent agent) {
+    const Widget icon = Icon(Icons.hub, size: 20);
+    if (agent.pendingMemberCount <= 0) return icon;
+    return Stack(
+      clipBehavior: Clip.none,
+      children: <Widget>[
+        icon,
+        Positioned(
+          right: -2,
+          top: -2,
+          child: Container(
+            width: 9,
+            height: 9,
+            decoration: BoxDecoration(
+              color: const Color(0xFFEF4444),
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: Theme.of(context).colorScheme.surface,
+                width: 1,
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 

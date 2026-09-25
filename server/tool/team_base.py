@@ -233,6 +233,8 @@ class TeamToolBase:
             "scores": row.get("scores") or {},
             "comment": row.get("comment", "") or "",
             "system_prompt": row.get("system_prompt", "") or "",
+            # 审核状态：成员能否工作的前置条件（用户审核通过才放行）
+            "review_status": row.get("review_status", "") or "",
         }
 
     def _fetch_store_members(self) -> List[Dict[str, Any]]:
@@ -665,6 +667,7 @@ class TeamToolBase:
             "leader_name": leader_name,
             "relation": relation,
             "work_status": self._live_work_status(mid),
+            "review_status": member.get("review_status", "") or "",
             "log_path": self._log_path(mid),
             "created_at": member.get("created_at", "") or "",
         }
@@ -789,15 +792,29 @@ class TeamToolBase:
             for m in teammates
             if not (m.get("role") and m.get("duty"))
         ]
-        hint = ""
+        # 未就绪成员（未赋模型 / 待审核）必须显著提示：向它们派活必然被审核闸拒绝
+        not_ready = [
+            (m.get("name") or m.get("id"))
+            for m in teammates
+            if (m.get("review_status") or "") not in ("", "approved")
+        ]
+        hints: List[str] = []
+        if not_ready:
+            hints.append(
+                "以下直属成员**尚未就绪**（未分配模型 / 未经用户审核），"
+                "现在派活必被拒绝，请提示用户在「团队成员 → 模型配置」页"
+                "为其选择模型并审核通过: " + "、".join(not_ready[:5])
+            )
+            if len(not_ready) > 5:
+                hints[-1] += f" 等 {len(not_ready)} 名"
         if missing:
-            hint = (
+            hints.append(
                 "以下直属成员 role/duty 为空，建议用 team update_member 补充完善后"
-                "再用 message send_message 派发工作（model_id 为空会自动回退所属 "
-                "TOP 模型，无需设置）: " + "、".join(missing[:5])
+                "再用 message send_message 派发工作: " + "、".join(missing[:5])
             )
             if len(missing) > 5:
-                hint += f" 等 {len(missing)} 名"
+                hints[-1] += f" 等 {len(missing)} 名"
+        hint = "；".join(hints)
 
         members_all = team_leader + teammates + team_member
         return {
@@ -808,6 +825,7 @@ class TeamToolBase:
             },
             "members": members_all,
             "total": len(members_all),
+            "not_ready_count": len(not_ready),
             "hint": hint,
             "generated_at": self._now(),
         }

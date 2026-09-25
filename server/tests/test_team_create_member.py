@@ -57,18 +57,36 @@ def _patch_members(tool):
 
 class TestCreateMemberDispatch(unittest.TestCase):
     def test_dispatch_contains_create_member(self):
-        """create_member 已注册到 team 工具 dispatch 表（LLM 可调用）。"""
+        """create_member 已注册到 team 工具 dispatch 表（LLM 可调用）。
+
+        未指定 model_id 时**不再返回模型池**：成员创建后不继承 TOP 模型，
+        ``model_id`` 变为可选（缺省留空 + pending_model，等用户赋模型 + 审核）。
+        """
         tool = _make_tool()
-        # 未指定 model_id 时返回模型池（而非「未知 action」错误 → 证明已注册）
-        with _patch_members(tool):
-            result = tool.execute({"action": "create_member"})
-        self.assertIn("models", result)
+        tool.docker_manager.create_workspace.return_value = {
+            "workspace_id": "member_probe",
+        }
+        # 落库与重名查询一并 mock：本用例只验证 dispatch 注册，
+        # 真实写库会让后续重复运行撞上"成员名称已存在"
+        with patch("data.team_store.add_member"), \
+                patch("data.team_store.count_members_by_name", return_value=0), \
+                patch("data.team_store.get_members", return_value=[]), \
+                _patch_members(tool):
+            result = tool.execute({"action": "create_member",
+                                   "member_name": "调度探针"})
+        self.assertNotIn("未知 action", str(result))
         self.assertNotIn("error", result)
+        self.assertEqual(result["review_status"], "pending_model")
+        self.assertEqual(result["model_id"], "")
 
 
 class TestCreateMemberFlow(unittest.TestCase):
-    def test_create_member_persists_and_dispatches_init(self):
-        """创建后：落 team_members 表（含 system_prompt/parent）+ 投递初始化消息。"""
+    def test_create_member_persists_and_awaits_review(self):
+        """创建后：落 team_members 表（含 system_prompt/parent）+ 不进初始化投递。
+
+        成员在用户审核通过前不接收任何消息，故 create_member **不投递**
+        初始化消息（避免制造注定失败的死信），返回 awaiting 提示。
+        """
         tool = _make_tool(agent_id="top1", team_id="top1")
         tool.can_lead_team = True
         tool.docker_manager.create_workspace.return_value = {
@@ -85,18 +103,39 @@ class TestCreateMemberFlow(unittest.TestCase):
             })
         self.assertTrue(result["member_id"].startswith("member_"))
         self.assertEqual(result["workspace_id"], "member_x")
-        self.assertTrue(result["initialized"])
+        # 指定了模型 → pending_review（赋了模型但用户尚未过审）
+        self.assertEqual(result["review_status"], "pending_review")
+        self.assertFalse(result["initialized"])
+        self.assertIn("等待用户处理", result["hint"])
+        tool._dispatch_to_member.assert_not_called()
         # 权威名单持久化：system_prompt / parent_agent_id（直属 leader）
         add_member.assert_called_once()
         kwargs = add_member.call_args.kwargs
         self.assertEqual(kwargs["system_prompt"], "你是测试工程师，负责后端验证。")
         self.assertEqual(kwargs["parent_agent_id"], "top1")
         self.assertEqual(kwargs["team_id"], "top1")
-        # 初始化消息携带 system prompt
-        tool._dispatch_to_member.assert_called_once()
-        init_content = tool._dispatch_to_member.call_args.args[1]
-        self.assertIn("你是测试工程师，负责后端验证。", init_content)
-        self.assertIn("团队初始化", init_content)
+        self.assertEqual(kwargs["review_status"], "pending_review")
+
+    def test_create_member_without_model_is_pending_model(self):
+        """省略 model_id：成员留空模型 + pending_model（由用户赋模型）。"""
+        tool = _make_tool(agent_id="top1", team_id="top1")
+        tool.can_lead_team = True
+        tool.docker_manager.create_workspace.return_value = {
+            "workspace_id": "member_x",
+        }
+        tool._dispatch_to_member = MagicMock(return_value=True)  # type: ignore[method-assign]
+        with patch("data.team_store.add_member") as add_member, \
+                _patch_members(tool):
+            result = tool.execute({
+                "action": "create_member", "member_name": "待赋模型成员",
+            })
+        self.assertEqual(result["model_id"], "")
+        self.assertEqual(result["review_status"], "pending_model")
+        self.assertFalse(result["initialized"])
+        tool._dispatch_to_member.assert_not_called()
+        self.assertEqual(
+            add_member.call_args.kwargs["review_status"], "pending_model"
+        )
 
     def test_create_member_count_checks_direct_only(self):
         """直属成员上限按 parent_agent_id 计数：同 TOP 非直属成员不占用名额。"""

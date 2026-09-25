@@ -27,6 +27,12 @@ class Agent {
   /// 该 agent 的独立 Docker 工作空间 ID（后端容器名为 workspace_{workspace_id}）
   final String workspaceId;
 
+  /// 等待用户处理的团队成员数（未分配模型 / 待审核）
+  ///
+  /// 后端 `/api/agents` 按 TOP 的整棵成员树统计。> 0 时在 Agent 列表与
+  /// teammates 入口显示红点徽章，提示用户去「模型配置」为成员赋模型并审核。
+  final int pendingMemberCount;
+
   Agent({
     required this.id,
     required this.name,
@@ -36,6 +42,7 @@ class Agent {
     this.unreadCount = 0,
     this.avatarUrl,
     this.workspaceId = '',
+    this.pendingMemberCount = 0,
   });
 
   /// 从 JSON 构造 Agent 实例
@@ -61,6 +68,9 @@ class Agent {
       ),
       avatarUrl: json['avatar_url'] as String? ?? json['avatarUrl'] as String?,
       workspaceId: json['workspace_id'] as String? ?? json['workspaceId'] as String? ?? '',
+      pendingMemberCount: _parseInt(
+        json['pending_member_count'] ?? json['pendingMemberCount'],
+      ),
     );
   }
 

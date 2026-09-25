@@ -233,11 +233,13 @@ class TestCreateMemberRealtimeGuards(MemberLifecycleBase):
         })
         self.assertIn("成员名称已存在", result["error"])
 
-    def test_missing_model_id_returns_pool(self):
+    def test_missing_model_id_creates_pending_member(self):
+        """省略 model_id 不再返回模型池：成员留空模型并进入待用户赋模型状态。"""
         tool = self._tool("top1", leader_id="")
         result = tool._action_create_member({"member_name": "无模型"})
-        self.assertIn("models", result)
-        self.assertIn("hint", result)
+        self.assertEqual(result["model_id"], "")
+        self.assertEqual(result["review_status"], "pending_model")
+        self.assertIn("等待用户处理", result["hint"])
 
 
 class TestLegacyDbMigration(unittest.TestCase):

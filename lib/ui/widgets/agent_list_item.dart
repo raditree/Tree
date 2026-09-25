@@ -89,8 +89,13 @@ class AgentListItem extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 8),
+              // 右侧：成员待处理红点（未赋模型 / 待审核的成员，点击进入团队处理）
+              if (agent.pendingMemberCount > 0) _buildPendingMembersDot(),
               // 右侧：未读数徽章（0 时不显示）
-              if (agent.unreadCount > 0) _buildUnreadBadge(),
+              if (agent.unreadCount > 0) ...[
+                if (agent.pendingMemberCount > 0) const SizedBox(width: 6),
+                _buildUnreadBadge(),
+              ],
             ],
           ),
         ),
@@ -129,6 +134,25 @@ class AgentListItem extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// 构建「成员待处理」小红点（未赋模型 / 待审核的成员）。
+  ///
+  /// 与未读数徽章区分：徽章是数字（有多少条未读），红点只表示"有事要做"，
+  /// 具体数量放在长按/悬停提示里（`Tooltip`），避免两种数字并排混淆。
+  Widget _buildPendingMembersDot() {
+    return Tooltip(
+      message: '有 ${agent.pendingMemberCount} 名成员等待你分配模型 / 审核\n'
+          '打开该 Agent 的团队成员面板即可处理',
+      child: Container(
+        width: 10,
+        height: 10,
+        decoration: const BoxDecoration(
+          color: _unreadBadgeColor,
+          shape: BoxShape.circle,
+        ),
       ),
     );
   }
