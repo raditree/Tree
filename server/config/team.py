@@ -14,6 +14,14 @@ from typing import Any, Dict, Optional
 DEFAULT_TEAM_MAX_LEVEL: int = 3
 DEFAULT_TEAM_MAX_MEMBERS: int = 7
 
+# P4 全量建队时**自动创建**的成员数（缺省值，非上限）。
+#
+# 与「每层成员上限」是两个不同口径：建队只预建 3 名，leader 之后仍可按
+# ``max_members_per_level``（默认 7）继续用 team create_member 扩编。
+# 建队成员**不再**继承 TOP 的模型：model_id 留空、审核状态 pending_model，
+# 需由用户在「团队成员 → 模型配置」页赋模型并审核通过后才接收消息。
+DEFAULT_TEAM_INIT_MEMBERS: int = 3
+
 # 硬上限：创建请求校验用（超出即 400，不静默截断）
 HARD_MAX_LEVEL: int = 5
 HARD_MAX_MEMBERS: int = 100

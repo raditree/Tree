@@ -1,10 +1,18 @@
 """团队全量建队 - TOP agent 创建时预建全部成员（P4 团队初始化）。
 
-spec「TOP 创建即全量建队」：创建 TOP agent 时 SHALL 同时预建全部成员——
+spec「TOP 创建即全量建队」：创建 TOP agent 时 SHALL 同时预建成员——
 名字取自 ``server/data/names.json``（同用户内全局唯一）、角色取自标准角色模板
 （默认 16 个，可配置）、职责留空、状态 idle，并初始化 ``workspace/<agent id>/``
 （含 ``.self/`` 与 ``spec/``）、登记 ``teams`` / ``team_members`` 表、
 生成 ``.self/team_roster.md`` 视图。
+
+预建人数与每层上限是两个口径：本模块缺省只预建
+``DEFAULT_TEAM_INIT_MEMBERS``（3）名，而 ``max_members_per_level``（默认 7）
+仍是团队上限，leader 之后可用 ``team create_member`` 继续扩编到上限。
+
+成员**不继承 TOP 的模型**：``model_id`` 留空、``review_status`` =
+``pending_model``，在用户于「团队成员 → 模型配置」页赋模型并审核通过前，
+后端审核闸会拒收其全部消息。
 
 说明：
 - 建队发生在后端的 REST 创建 TOP 接口内，该时刻前端 WebSocket（local executor）
@@ -156,6 +164,9 @@ def _write_member_workspace(
             f"- top_agent: {leader} ({top_agent.get('id', '')})\n"
             f"- level: {level}\n"
             f"- can_lead_team: 是\n"
+            # 成员未就绪前不会收到任何消息，身份文件里写明原因与解除方式，
+            # 便于事后审计「为什么这个成员一直没动过」
+            f"- review_status: {mem.get('review_status', '')}\n"
         ),
         ".self/rule.md": (
             f"# 工作准则 (rule.md)\n\n"
@@ -216,14 +227,21 @@ def init_team_for_top(
     :param user_id: 用户标识
     :param top_agent: 刚创建的 TOP agent 记录（需含 id/name/workspace_id）
     :param docker_manager: DockerManager 或 None
-    :param member_count: 要创建的成员数，缺省按 ``max_members_per_level``
+    :param member_count: 要创建的成员数，缺省 ``DEFAULT_TEAM_INIT_MEMBERS``（3），
+        并钳制在 1..``max_members_per_level``。注意这是**建队预建数**，
+        不是团队上限——leader 之后仍可按每层上限继续扩编
     :param max_level: 团队最大层级深度（创建 TOP 时设定，缺省用代码默认值）
     :param max_members_per_level: 每层成员上限（创建 TOP 时设定，缺省用代码
-        默认值；成员数 = clamp(member_count or 上限, 1, 上限)，只增不减）
+        默认值；也是建队成员数的上限钳制值）
     :return: ``{"team":..., "members": [...], "created_count": n}``；
              名字池不足抛 ValueError
+
+    成员模型：**不再继承 TOP 的模型**，一律留空并置 ``pending_model``——
+    由用户在「团队成员 → 模型配置」页显式赋模型并审核通过后才会接收消息
+    （TOP agent 无权设置成员模型）。因此这里也不投递初始化消息。
     """
     from data.team_store import (
+        REVIEW_STATUS_PENDING_MODEL,
         add_member,
         get_members,
         get_team,
@@ -235,7 +253,7 @@ def init_team_for_top(
         return {"error": "缺少 team_id"}
 
     # 团队配置在创建 TOP 时设定：归一化后持久化到 teams 表（此后不可修改）
-    from config.team import resolve_team_config
+    from config.team import DEFAULT_TEAM_INIT_MEMBERS, resolve_team_config
 
     cfg = resolve_team_config(max_level, max_members_per_level)
     team_max_level = cfg["max_level"]
@@ -250,8 +268,15 @@ def init_team_for_top(
             "created_count": 0,
         }
 
-    # 初始成员数：显式 member_count 缺省按每层成员上限，钳制在 1..上限
-    count = int(member_count or team_max_members)
+    # 初始成员数：显式 member_count 缺省 3（DEFAULT_TEAM_INIT_MEMBERS），
+    # 钳制在 1..每层上限
+    raw_count = (
+        member_count if member_count is not None else DEFAULT_TEAM_INIT_MEMBERS
+    )
+    try:
+        count = int(raw_count)
+    except (TypeError, ValueError):
+        count = DEFAULT_TEAM_INIT_MEMBERS
     count = max(1, min(count, team_max_members))
 
     team = init_team(
@@ -275,11 +300,11 @@ def init_team_for_top(
             name=names[i],
             role=role,
             duty="",
-            # 成员默认继承 TOP 的模型：保证建队即可接收消息并真正执行
-            # （此前 model_id 为空导致 _process_member_message 因模型缺失
-            #   静默丢弃消息，成员"收不到"leader 的任务；leader 仍可经
-            #   team update_member 为成员改配独立模型）
-            model_id=top_agent.get("model_id", ""),
+            # 成员**不继承** TOP 模型：留空 + pending_model，等用户在
+            # 「团队成员 → 模型配置」页赋模型并审核通过。此前继承 TOP 模型
+            # 会让成员处于"未经用户确认即自主执行"的状态（要求 3 要治理的点）。
+            model_id="",
+            review_status=REVIEW_STATUS_PENDING_MODEL,
             level=1,
             system_prompt="",
             # P4 全量建队：直属 leader 即 TOP 自身
