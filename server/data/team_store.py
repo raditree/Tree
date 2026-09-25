@@ -57,6 +57,49 @@ REVIEW_STATUS_NEEDS_USER = (
     REVIEW_STATUS_PENDING_REVIEW,
 )
 
+# ---------------------------------------------------------------------------
+# 成员级模型参数覆盖
+# ---------------------------------------------------------------------------
+# 与 ``agents`` 表的四个覆盖列同名同义（思考强度/输入长度/输出长度/压缩阈值），
+# 但**落在 team_members**：
+#
+# - 成员在 ``agents`` 表里没有行（建队/群工具都不创建），若为成员建 agents 行，
+#   它会因 ``get_agents`` 不做区分而出现在顶层 Agent 列表里——副作用过大；
+# - 参数与成员模型同表，语义最贴近（模型的"在哪跑"和"怎么跑"放一起）。
+#
+# 生效优先级（见 ``chat._resolve_member_model``）：成员显式设过的项 > TOP 的
+# 对应项 > 模型 .yaml 默认值。NULL = 未设置（回退 TOP），因此"显式设成与 TOP
+# 相同"与"未设置"在行为上等价、但前者更明确。
+MEMBER_OVERRIDE_COLUMNS = {
+    "reasoning_effort": "TEXT",
+    "max_seqlen_override": "INTEGER",
+    "max_output_tokens": "INTEGER",
+    "compress_threshold": "REAL",
+}
+
+
+def member_overrides(row: Dict[str, Any]) -> Dict[str, Any]:
+    """从成员行提取**已设置**的覆盖项（未设置的键不出现在结果里）。
+
+    下游（``chat._apply_agent_model_overrides``）据此决定是否覆盖 TOP 的同名项：
+    只覆盖本函数返回的键，其余继续沿用 TOP 或模型默认值。
+    """
+    result: Dict[str, Any] = {}
+    for column in MEMBER_OVERRIDE_COLUMNS:
+        value = row.get(column)
+        if value is None:
+            continue
+        if column == "reasoning_effort" and not str(value).strip():
+            continue
+        if column in ("max_seqlen_override", "max_output_tokens"):
+            if not isinstance(value, int) or value <= 0:
+                continue
+        if column == "compress_threshold":
+            if not isinstance(value, (int, float)) or not 0 < float(value) < 1:
+                continue
+        result[column] = value
+    return result
+
 
 def _derive_review_status(model_id: Any, current: Any) -> str:
     """由模型与当前状态推导合法审核状态（缺列/脏值时按旧数据兜底）。
@@ -212,6 +255,10 @@ def _ensure_db() -> None:
                 parent_agent_id TEXT NOT NULL DEFAULT '',
                 can_lead_team INTEGER NOT NULL DEFAULT 1,
                 review_status TEXT NOT NULL DEFAULT '',
+                reasoning_effort TEXT,
+                max_seqlen_override INTEGER,
+                max_output_tokens INTEGER,
+                compress_threshold REAL,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )
@@ -237,6 +284,10 @@ def _ensure_db() -> None:
         _migrate_column(conn, "team_members", "review_status",
                         "ALTER TABLE team_members ADD COLUMN review_status "
                         "TEXT NOT NULL DEFAULT ''")
+        # 成员级模型参数覆盖列（旧库补列，默认 NULL = 未设置 = 回退 TOP）
+        for column, sql_type in MEMBER_OVERRIDE_COLUMNS.items():
+            _migrate_column(conn, "team_members", column,
+                            f"ALTER TABLE team_members ADD COLUMN {column} {sql_type}")
         # 回填旧行的审核状态（幂等）：有模型视为已审核，无模型视为待赋模型。
         # 不回填的话，旧行 review_status='' 既不属于"待用户处理"也不属于
         # "已审核"，会在前端显示为第三种状态且列表徽章统计不到它们。
@@ -591,6 +642,8 @@ def update_member(
         "name", "role", "duty", "model_id", "level", "work_status",
         "comment", "system_prompt", "scores", "can_lead_team",
         "parent_agent_id", "review_status",
+        # 成员级模型参数覆盖（NULL 由调用方显式传入以清空）
+        *MEMBER_OVERRIDE_COLUMNS.keys(),
     }
     updates: Dict[str, Any] = {k: v for k, v in fields.items() if k in allowed}
     if not updates:

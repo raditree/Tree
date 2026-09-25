@@ -1692,14 +1692,50 @@ class _FramePacer:
                 time.sleep(min(remaining, _PACER_SLEEP_SLICE))
 
 
-def _apply_agent_model_overrides(
-    model_config: Any, owner_agent_id: str, user_id: str
-) -> Any:
-    """把 agents 行的模型参数覆盖合并进模型配置，返回新的 ModelConfig。
+def _read_override_record(
+    user_id: str, owner_agent_id: str, team_id: str = ""
+) -> Dict[str, Any]:
+    """读取某 agent 的模型参数覆盖记录（键名与四个覆盖列一致）。
 
-    覆盖项（右栏「模型信息」页可调，见 ``data/agent_store.update_agent``）：
+    两类承载表，按"该 id 是不是团队成员"分流：
+
+    - **TOP agent** → ``agents`` 表（右栏「模型信息」页写入）；
+    - **团队成员** → ``team_members`` 表（「团队成员 → 模型配置」页写入）。
+      成员在 ``agents`` 表里没有行（建队/群工具都不创建），若强行建行会让它
+      出现在顶层 Agent 列表里，故成员级覆盖落在 team_members。
+
+    查不到时返回空 dict（= 无覆盖，调用方继续沿用下一优先级）。
+    """
+    if not owner_agent_id or not user_id:
+        return {}
+    if team_id and owner_agent_id != team_id:
+        # 成员：查 team_members
+        try:
+            from data.team_store import get_member
+
+            row = get_member(team_id, owner_agent_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取成员模型参数覆盖失败(忽略): %s", exc)
+            return {}
+        return dict(row) if row else {}
+    try:
+        return get_agent(user_id, owner_agent_id) or {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("读取 agent 模型参数覆盖失败(忽略): %s", exc)
+        return {}
+
+
+def _apply_agent_model_overrides(
+    model_config: Any, owner_agent_id: str, user_id: str, team_id: str = ""
+) -> Any:
+    """把模型参数覆盖合并进模型配置，返回新的 ModelConfig。
+
+    覆盖项（TOP 在右栏「模型信息」页、成员在「团队成员 → 模型配置」页可调）：
     ``reasoning_effort`` / ``max_seqlen_override`` / ``max_output_tokens`` /
     ``compress_threshold``。全部为空时不构造新对象，直接返回原配置。
+
+    ``team_id`` 用于区分覆盖的承载表（见 :func:`_read_override_record`）：
+    传了且 ``owner_agent_id != team_id`` 时按**成员**读 ``team_members``。
 
     实现方式是把覆盖值并入 ``extra`` 副本，而不是新增构造参数——这样
     ``state.model_configs`` 里的共享配置实例**不会被就地污染**（否则同一模型
@@ -1708,12 +1744,8 @@ def _apply_agent_model_overrides(
     注意 ``max_seqlen`` 覆盖写的是 ``extra["max_seqlen"]``（会话读该键作为
     上下文预算），库列名 ``max_seqlen_override`` 只是为避免与模型键混淆。
     """
-    if not owner_agent_id or not user_id:
-        return model_config
-    try:
-        record = get_agent(user_id, owner_agent_id) or {}
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("读取 agent 模型参数覆盖失败(忽略): %s", exc)
+    record = _read_override_record(user_id, owner_agent_id, team_id)
+    if not record:
         return model_config
 
     merged = dict(getattr(model_config, "extra", None) or {})
@@ -1744,6 +1776,40 @@ def _apply_agent_model_overrides(
     return replace(model_config, extra=merged)
 
 
+def _member_effective_overrides(
+    user_id: str, agent_id: str, team_id: str
+) -> Dict[str, Any]:
+    """成员**实际生效**的四个参数及其来源，供前端展示（含 TOP 回退）。
+
+    键名统一用**线名**（``max_seqlen`` 而非库列名 ``max_seqlen_override``），
+    与右栏「模型信息」的 ``overrides`` 块以及前端表单字段一一对应，避免前端
+    在两套命名之间来回换算。
+
+    来源取值：``member``（成员自己设过）/ ``top``（继承所属 TOP）/
+    ``model``（模型 .yaml 默认值）。
+    """
+    own = _read_override_record(user_id, agent_id, team_id)
+    top = _read_override_record(user_id, team_id, team_id) if team_id else {}
+    result: Dict[str, Any] = {}
+    for wire, column in (
+        ("reasoning_effort", "reasoning_effort"),
+        ("max_seqlen", "max_seqlen_override"),
+        ("max_output_tokens", "max_output_tokens"),
+        ("compress_threshold", "compress_threshold"),
+    ):
+        if own.get(column) is not None:
+            result[wire] = own[column]
+            result[f"{wire}_source"] = "member"
+        elif top.get(column) is not None:
+            result[wire] = top[column]
+            result[f"{wire}_source"] = "top"
+        else:
+            result[wire] = None
+            result[f"{wire}_source"] = "model"
+    return result
+
+
+
 def _resolve_member_model(
     user_id: str, agent_id: str, team_id: str, model_id: str
 ) -> Tuple[Any, str]:
@@ -1756,19 +1822,25 @@ def _resolve_member_model(
     （见 ``_member_review_block`` 的审核闸）。若在此处悄悄回退 TOP 模型，成员
     会在"未经用户确认"的情况下自主执行，正是要求 3 要治理的行为。
 
-    覆盖值优先取成员自身 agents 行，成员无覆盖时回退所属 TOP 的覆盖
-    （用户通常只在 TOP 上配置）。
+    覆盖优先级是**逐项**的：成员显式设过的项 > TOP 的同名项 > 模型 .yaml 默认值。
+    因此实现为"先叠 TOP、再叠成员"，而不是"成员有覆盖就整体返回成员配置"——
+    后者会让成员只覆盖一项时丢掉 TOP 的其余项（TOP 上的输入/输出/阈值被静默忽略）。
     """
     config = state.model_configs.get(model_id)
     if config is None:
         return None, model_id
 
-    # 优先成员自身覆盖
-    overridden = _apply_agent_model_overrides(config, agent_id, user_id)
-    if overridden is not config:
-        return overridden, model_id
-    # 成员无覆盖：回退所属 TOP 的覆盖
-    return _apply_agent_model_overrides(config, team_id or agent_id, user_id), model_id
+    # 第一层：TOP 的覆盖（agents 表）
+    baseline = _apply_agent_model_overrides(
+        config, team_id or agent_id, user_id, team_id=team_id or agent_id
+    )
+    # 第二层：成员自身的覆盖（team_members 表）叠在 TOP 之上
+    return (
+        _apply_agent_model_overrides(
+            baseline, agent_id, user_id, team_id=team_id
+        ),
+        model_id,
+    )
 
 
 def _member_review_block(
@@ -3053,7 +3125,7 @@ async def _handle_user_message(
     model_id = (agent.get("model_id") if agent else None) or ""
     model_config = state.model_configs.get(model_id) if model_id else None
     model_config = _apply_agent_model_overrides(
-        model_config, agent_id, user_id
+        model_config, agent_id, user_id, team_id=agent_id
     ) if model_config is not None else None
     # agent 的独立工作空间（旧数据回填为 agent 自身 id）
     workspace_id = agent.get("workspace_id") if agent else None

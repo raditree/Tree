@@ -536,6 +536,16 @@ def _roster_from_db(db_members: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "model_id": m.get("model_id", ""),
             # 审核状态：前端据此渲染"等待赋模型/待审核"提示与红点
             "review_status": m.get("review_status", "") or "",
+            # 成员级模型参数覆盖（供「模型配置」页回填；_row_to_member 已带出）。
+            # 键名统一用线名 max_seqlen（而非库列名 max_seqlen_override），
+            # 与 PATCH 请求体、右栏「模型信息」保持一致，前端无需换算。
+            "reasoning_effort": m.get("reasoning_effort"),
+            "max_seqlen": m.get("max_seqlen_override"),
+            # 同时保留库列名：teammates 接口的 overrides 块与审核闸按库列名取值，
+            # 两个名字指向同一字段可避免"接口这套名、内部那套名"的对齐错误
+            "max_seqlen_override": m.get("max_seqlen_override"),
+            "max_output_tokens": m.get("max_output_tokens"),
+            "compress_threshold": m.get("compress_threshold"),
             "level": m.get("level", 1),
             "created_at": m.get("created_at", ""),
             "work_status": m.get("work_status", "idle"),
@@ -565,6 +575,8 @@ async def get_agent_teammates(
 
     from data.team_store import REVIEW_STATUS_NEEDS_USER
     from data.team_store import get_members as get_team_members
+    # 成员生效参数（含 TOP 回退）的计算在 chat 里，与运行时同一份实现
+    from agent.chat import _member_effective_overrides
 
     db_rows = _collect_team_tree(agent_id, get_team_members)
     if db_rows:
@@ -595,6 +607,19 @@ async def get_agent_teammates(
                 "approved" if str(m.get("model_id") or "").strip()
                 else "pending_model"
             )
+        # 成员级模型参数覆盖（null = 未设置）+ 实际生效值（含 TOP 回退），
+        # 供「模型配置」页回填与提示"当前值来自 TOP"
+        m["overrides"] = {
+            "reasoning_effort": m.get("reasoning_effort"),
+            "max_seqlen": m.get("max_seqlen_override"),
+            "max_output_tokens": m.get("max_output_tokens"),
+            "compress_threshold": m.get("compress_threshold"),
+        }
+        try:
+            m["effective"] = _member_effective_overrides(user_id, mid, agent_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("计算成员生效参数失败(忽略) %s: %s", mid, exc)
+            m["effective"] = {}
     pending = sum(
         1 for m in members if m["review_status"] in REVIEW_STATUS_NEEDS_USER
     )
@@ -621,11 +646,16 @@ async def update_teammate_endpoint(
     请求体（至少一项）：
     - ``model_id``：要分配的模型；显式传空串 = 清空模型（退回 ``pending_model``）
     - ``review_status``：``approved`` / ``rejected`` / ``pending_review``
+    - ``reasoning_effort`` / ``max_seqlen`` / ``max_output_tokens`` /
+      ``compress_threshold``：成员级模型参数覆盖；传 ``null`` = 清除该项
+      （回退 TOP 的同名设置；TOP 也没有则用模型 .yaml 默认值）
+      —— 不传该键 = 不修改
     """
     from data.agent_store import get_agent as _get_agent
     from data.team_store import (
         REVIEW_STATUSES,
         get_member,
+        update_member,
         update_member_review_status,
     )
 
@@ -633,10 +663,18 @@ async def update_teammate_endpoint(
     payload = body or {}
     has_model = "model_id" in payload
     has_status = "review_status" in payload
-    if not has_model and not has_status:
+    override_keys = (
+        "reasoning_effort", "max_seqlen", "max_output_tokens",
+        "compress_threshold",
+    )
+    present_overrides = [k for k in override_keys if k in payload]
+    if not has_model and not has_status and not present_overrides:
         raise HTTPException(
             status_code=400,
-            detail="至少提供 model_id 或 review_status 之一",
+            detail=(
+                "至少提供 model_id / review_status / 模型参数覆盖之一"
+                f"（可覆盖项：{', '.join(override_keys)}）"
+            ),
         )
     # 成员归属校验：必须确实在该 TOP 旗下，避免跨团队改成员
     member = get_member(agent_id, member_id)
@@ -678,6 +716,63 @@ async def update_teammate_endpoint(
     if row is None:
         raise HTTPException(status_code=404, detail=f"成员不存在: {member_id}")
 
+    # 成员级模型参数覆盖：不传的键不动，显式 null 清空（回退 TOP）
+    if present_overrides:
+        patch: Dict[str, Any] = {}
+        if "reasoning_effort" in payload:
+            raw_effort = payload.get("reasoning_effort")
+            if raw_effort is None or not str(raw_effort).strip():
+                patch["reasoning_effort"] = None
+            else:
+                # 与 TOP 侧同一口径：按该成员生效模型的档位校验并归一化
+                patch["reasoning_effort"] = _validate_agent_reasoning_effort(
+                    str(raw_effort),
+                    model_id=row.get("model_id") or None,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                )
+        for key, column in (
+            ("max_seqlen", "max_seqlen_override"),
+            ("max_output_tokens", "max_output_tokens"),
+        ):
+            if key not in payload:
+                continue
+            value = payload.get(key)
+            if value is None or value == "":
+                patch[column] = None
+                continue
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400, detail=f"{key} 必须为正整数"
+                ) from None
+            if number <= 0:
+                raise HTTPException(status_code=400, detail=f"{key} 必须为正整数")
+            patch[column] = number
+        if "compress_threshold" in payload:
+            raw_threshold = payload.get("compress_threshold")
+            if raw_threshold is None or raw_threshold == "":
+                patch["compress_threshold"] = None
+            else:
+                try:
+                    threshold = float(raw_threshold)
+                except (TypeError, ValueError):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="compress_threshold 必须是 0.1~0.95 之间的数值",
+                    ) from None
+                if not 0.1 <= threshold <= 0.95:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="compress_threshold 必须在 0.1~0.95 之间",
+                    )
+                patch["compress_threshold"] = threshold
+        updated_row = update_member(agent_id, member_id, **patch)
+        if updated_row is None:
+            raise HTTPException(status_code=404, detail=f"成员不存在: {member_id}")
+        row = updated_row
+
     # 审核通过后补投初始化消息：赋模型与审核期间成员收不到任何消息，
     # 这里补一次，让成员知道自己的角色与职责（此前在 create_member 时被跳过）。
     initialized = False
@@ -688,15 +783,42 @@ async def update_teammate_endpoint(
 
     return {
         "success": True,
-        "member": {
-            "id": row.get("id", ""),
-            "name": row.get("name", ""),
-            "model_id": row.get("model_id", ""),
-            "review_status": row.get("review_status", ""),
-        },
+        "member": _member_override_view(user_id, agent_id, row),
         "initialized": initialized,
         "top_agent_name": (_get_agent(user_id, agent_id) or {}).get("name", ""),
     }
+
+
+def _member_override_view(
+    user_id: str, team_id: str, row: Dict[str, Any]
+) -> Dict[str, Any]:
+    """成员配置回显：基础字段 + 成员自身覆盖 + 实际生效值（含 TOP 回退）。
+
+    前端据此既能把控件回填为"该成员设过的值"，也能提示"当前生效值来自 TOP"。
+    """
+    from agent.chat import _member_effective_overrides
+
+    own = {
+        "reasoning_effort": row.get("reasoning_effort"),
+        "max_seqlen": row.get("max_seqlen_override"),
+        "max_output_tokens": row.get("max_output_tokens"),
+        "compress_threshold": row.get("compress_threshold"),
+    }
+    view = {
+        "id": row.get("id", ""),
+        "name": row.get("name", ""),
+        "model_id": row.get("model_id", ""),
+        "review_status": row.get("review_status", ""),
+        # 该成员**自己设过**的覆盖（null = 未设置，沿用 TOP/模型默认）
+        "overrides": own,
+    }
+    try:
+        effective = _member_effective_overrides(user_id, row.get("id", ""), team_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("计算成员生效参数失败(仅回自身覆盖): %s", exc)
+        effective = {}
+    view["effective"] = effective
+    return view
 
 
 async def _dispatch_member_init_after_approval(

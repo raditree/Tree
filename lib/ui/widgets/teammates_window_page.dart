@@ -469,6 +469,21 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
   /// 模型配置页当前选中的模型 id（'' = 未选择）
   String _selectedModelId = '';
 
+  /// 成员级模型参数覆盖（留空 = 未设置 → 沿用 TOP / 模型默认）
+  ///
+  /// 键与后端覆盖列一致：``reasoning_effort`` / ``max_seqlen`` /
+  /// ``max_output_tokens`` / ``compress_threshold``。
+  final Map<String, String> _overrideText = <String, String>{
+    'reasoning_effort': '',
+    'max_seqlen': '',
+    'max_output_tokens': '',
+    'compress_threshold': '',
+  };
+
+  /// 进入本页时各覆盖项的原始文本，用于判断"用户是否改过这一项"
+  /// （未改过就不提交该键 → 后端保持原值；改空 → 显式清除，回退 TOP）
+  final Map<String, String> _overrideInitial = <String, String>{};
+
   /// 是否正在提交配置
   bool _saving = false;
 
@@ -477,10 +492,43 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
     super.initState();
     _member = Map<String, dynamic>.from(widget.member ?? <String, dynamic>{});
     _selectedModelId = _member['model_id'] as String? ?? '';
+    _syncOverrideControllers();
     _webSocket.onMessage = _handleIncoming;
     _connectWs();
     _loadHistory();
     _loadModels();
+  }
+
+  /// 用成员自身的覆盖值回填控件（null = 未设置 → 留空）
+  void _syncOverrideControllers() {
+    final Map<String, dynamic> own =
+        (_member['overrides'] as Map<String, dynamic>?)?.cast<String, dynamic>() ??
+            <String, dynamic>{};
+    for (final String key in _overrideText.keys) {
+      final Object? value = own[key];
+      _overrideText[key] = value == null ? '' : '$value';
+    }
+    _overrideInitial
+      ..clear()
+      ..addAll(_overrideText);
+  }
+
+  /// 该覆盖项的当前生效值描述（用于提示"留空时实际用的是谁的值"）
+  String _effectiveHint(String key) {
+    final Map<String, dynamic> eff =
+        (_member['effective'] as Map<String, dynamic>?)?.cast<String, dynamic>() ??
+            <String, dynamic>{};
+    final Object? value = eff[key];
+    if (value == null) return '模型默认';
+    final String source = (eff['${key}_source'] as String?) ?? '';
+    switch (source) {
+      case 'member':
+        return '$value（本成员）';
+      case 'top':
+        return '$value（继承 TOP）';
+      default:
+        return '$value（模型默认）';
+    }
   }
 
   /// 加载可用模型池（模型配置页下拉数据源）。
@@ -685,12 +733,39 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
         default:
           reviewStatus = null; // assign：只赋模型，状态由后端推导为待审核
       }
+      // 只提交**改动过**的覆盖项：未改 = 后端保持原值；改空 = 显式清除该项
+      // （回退 TOP / 模型默认）。这样"改模型参数"与"只审核"可以分开操作。
+      final Map<String, Object?> overridePatch = <String, Object?>{};
+      for (final String key in _overrideText.keys) {
+        final String now = _overrideText[key]!.trim();
+        if (now == (_overrideInitial[key] ?? '')) continue;
+        if (now.isEmpty) {
+          overridePatch[key] = null; // 清除该覆盖
+        } else if (key == 'compress_threshold') {
+          final double? parsed = double.tryParse(now);
+          if (parsed == null || parsed < 0.1 || parsed > 0.95) {
+            _showSnack('压缩阈值需为 0.1~0.95 的数值（当前输入：$now）');
+            setState(() => _saving = false);
+            return;
+          }
+          overridePatch[key] = parsed;
+        } else {
+          final int? parsed = int.tryParse(now);
+          if (parsed == null || parsed <= 0) {
+            _showSnack('最大输入/输出需为正整数（当前输入：$now）');
+            setState(() => _saving = false);
+            return;
+          }
+          overridePatch[key] = parsed;
+        }
+      }
       final Map<String, dynamic> resp = await ApiService.updateTeammate(
         widget.leader.id,
         widget.memberId,
         // reject 不改模型（仅改状态）；其余一律带上当前选择的模型
         modelId: action == 'reject' ? null : modelId,
         reviewStatus: reviewStatus,
+        overrides: overridePatch.isEmpty ? null : overridePatch,
       );
       if (!mounted) return;
       final Map<String, dynamic>? m =
@@ -699,6 +774,8 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
         if (m != null) {
           _member = <String, dynamic>{..._member, ...m};
           _selectedModelId = m['model_id'] as String? ?? _selectedModelId;
+          // 提交成功后以服务端返回的自身覆盖为准重算基线
+          _syncOverrideControllers();
         }
       });
       final String status = m?['review_status'] as String? ?? '';
@@ -883,6 +960,41 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
               setState(() => _selectedModelId = value ?? '');
             },
           ),
+        const Divider(height: 28),
+        Text('模型参数（本成员）', style: TextStyle(
+          fontSize: 13, fontWeight: FontWeight.w600, color: cs.onSurface)),
+        const SizedBox(height: 4),
+        Text(
+          '留空 = 不单独设置，沿用「生效值」；填入则覆盖 TOP 的设置。'
+          '只有改动过的项会被提交，清空即回退继承。',
+          style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+        ),
+        const SizedBox(height: 10),
+        _buildEffortField(cs),
+        const SizedBox(height: 10),
+        _overrideField(
+          cs,
+          key: 'max_seqlen',
+          label: '最大输入 tokens',
+          hint: '如 65536',
+          numeric: true,
+        ),
+        const SizedBox(height: 10),
+        _overrideField(
+          cs,
+          key: 'max_output_tokens',
+          label: '最大输出 tokens',
+          hint: '如 4096',
+          numeric: true,
+        ),
+        const SizedBox(height: 10),
+        _overrideField(
+          cs,
+          key: 'compress_threshold',
+          label: '上下文压缩阈值',
+          hint: '0.1~0.95，如 0.8',
+          numeric: true,
+        ),
         const SizedBox(height: 16),
         Wrap(
           spacing: 8,
@@ -916,6 +1028,82 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
         ),
       ],
     );
+  }
+
+  /// 单个参数覆盖输入框：label + 生效值提示 + 输入框
+  ///
+  /// 用 TextEditingController 会带来"外部更新控件"的同步负担，这里用
+  /// ``TextFormField(initialValue)`` + ``key`` 绑定当前值——值变化时 key 变化
+  /// 会重建控件并带上新值；用户输入期间 key 不变，不会打断输入。
+  Widget _overrideField(
+    ColorScheme cs, {
+    required String key,
+    required String label,
+    String hint = '',
+    bool numeric = false,
+  }) {
+    final String value = _overrideText[key] ?? '';
+    return TextFormField(
+      key: ValueKey<String>('$key=$value'),
+      initialValue: value,
+      keyboardType: numeric ? TextInputType.number : TextInputType.text,
+      decoration: InputDecoration(
+        labelText: label,
+        hintText: hint,
+        helperText: '生效值：${_effectiveHint(key)}',
+        isDense: true,
+        border: const OutlineInputBorder(),
+      ),
+      onChanged: (String text) => _overrideText[key] = text,
+    );
+  }
+
+  /// 思考强度：可选档位来自该模型声明，另加"不单独设置"
+  Widget _buildEffortField(ColorScheme cs) {
+    final List<String> options = _effortOptions();
+    final String value = _overrideText['reasoning_effort'] ?? '';
+    final List<String> candidates = <String>[
+      '',
+      ...options,
+      if (value.isNotEmpty && !options.contains(value)) value,
+    ];
+    return DropdownButtonFormField<String>(
+      value: value,
+      isExpanded: true,
+      decoration: InputDecoration(
+        labelText: '思考强度',
+        helperText: '生效值：${_effectiveHint('reasoning_effort')}',
+        isDense: true,
+        border: const OutlineInputBorder(),
+      ),
+      items: candidates
+          .map((String e) => DropdownMenuItem<String>(
+                value: e,
+                child: Text(e.isEmpty ? '（不单独设置）' : e),
+              ))
+          .toList(),
+      onChanged: (String? v) =>
+          setState(() => _overrideText['reasoning_effort'] = v ?? ''),
+    );
+  }
+
+  /// 当前选中模型声明的思考强度可选档位（与右栏「模型信息」同一口径）
+  List<String> _effortOptions() {
+    // firstWhere 的 orElse 保证非空，故直接接非空 Map（用 `?[]` 会触发
+    // unnecessary_null_aware_operator，接 `??` 又会触发 dead_null_aware）
+    final Map<String, dynamic> model = _models.firstWhere(
+      (Map<String, dynamic> m) =>
+          (m['model_id'] as String? ?? '') == _selectedModelId,
+      orElse: () => <String, dynamic>{},
+    );
+    final List<dynamic>? raw =
+        model['reasoning_effort_options'] as List<dynamic>?;
+    if (raw == null) return const <String>['low', 'high', 'max'];
+    final List<String> options = raw
+        .map((dynamic e) => e.toString().trim())
+        .where((String e) => e.isNotEmpty)
+        .toList();
+    return options.isEmpty ? const <String>['low', 'high', 'max'] : options;
   }
 
   Widget _infoRow(String label, String value) {

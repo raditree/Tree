@@ -641,5 +641,254 @@ class TestTeammateReviewApi(TeamStoreBase):
         self.assertEqual(r.json()["agents"][0]["pending_member_count"], 0)
 
 
+class TestMemberModelParamOverrides(TeamStoreBase):
+    """成员级模型参数覆盖：存储、生效优先级（成员 > TOP > 模型默认）。"""
+
+    def setUp(self):
+        super().setUp()
+        # TOP 的 agent 行 id 必须与 team_id 一致：否则 _read_override_record
+        # 会把 TOP 当成成员去查 team_members，读不到覆盖
+        self.top = agent_store.create_agent("u1", "TOP", "flash")
+        team_store.init_team("u1", self.top["id"], "T")
+
+    def _url(self) -> str:
+        return f"/api/agents/{self.top['id']}/teammate/m1"
+
+    def test_columns_exist_and_default_null(self):
+        m = team_store.add_member("u1", self.top["id"], "m1", "A",
+                                  model_id="flash")
+        for column in team_store.MEMBER_OVERRIDE_COLUMNS:
+            self.assertIn(column, m)
+            self.assertIsNone(m[column], column)
+
+    def test_update_member_sets_overrides(self):
+        team_store.add_member("u1", self.top["id"], "m1", "A", model_id="flash")
+        row = team_store.update_member(
+            self.top["id"], "m1",
+            reasoning_effort="high",
+            max_seqlen_override=32768,
+            max_output_tokens=2048,
+            compress_threshold=0.5,
+        )
+        self.assertEqual(row["reasoning_effort"], "high")
+        self.assertEqual(row["max_seqlen_override"], 32768)
+        self.assertEqual(row["max_output_tokens"], 2048)
+        self.assertAlmostEqual(row["compress_threshold"], 0.5)
+
+    def test_explicit_none_clears_override(self):
+        team_store.add_member("u1", self.top["id"], "m1", "A", model_id="flash")
+        team_store.update_member(self.top["id"], "m1", max_seqlen_override=4096)
+        row = team_store.update_member(self.top["id"], "m1",
+                                       max_seqlen_override=None)
+        self.assertIsNone(row["max_seqlen_override"])
+
+    def test_member_overrides_helper_filters_invalid(self):
+        row = {
+            "reasoning_effort": "  ",
+            "max_seqlen_override": 0,
+            "max_output_tokens": -5,
+            "compress_threshold": 1.5,
+        }
+        self.assertEqual(team_store.member_overrides(row), {})
+        ok = team_store.member_overrides({
+            "reasoning_effort": "high",
+            "max_seqlen_override": 2048,
+            "max_output_tokens": 512,
+            "compress_threshold": 0.7,
+        })
+        self.assertEqual(len(ok), 4)
+
+    def test_member_override_applied_to_model_config(self):
+        """成员设过的项覆盖模型默认，且不污染共享配置实例。"""
+        from agent.chat import _apply_agent_model_overrides
+        from config.models import ModelConfig
+
+        base = ModelConfig(
+            name="f", base_url="http://x", api_key="k", model_id="flash",
+            extra={"max_seqlen": 8192},
+        )
+        team_store.add_member("u1", self.top["id"], "m1", "A", model_id="flash")
+        team_store.update_member(
+            self.top["id"], "m1", max_seqlen_override=2048, compress_threshold=0.4
+        )
+        merged = _apply_agent_model_overrides(
+            base, "m1", "u1", team_id=self.top["id"]
+        )
+        self.assertIsNot(merged, base)
+        self.assertEqual(merged.extra["max_seqlen"], 2048)
+        self.assertAlmostEqual(merged.extra["compress_threshold"], 0.4)
+        # 共享实例未被就地污染
+        self.assertEqual(base.extra["max_seqlen"], 8192)
+
+    def test_member_override_wins_over_top(self):
+        """成员显式设过的项优先于 TOP 的同名项（核心语义）。"""
+        from agent.chat import _resolve_member_model
+        from config.models import ModelConfig
+
+        original = state.model_configs
+        self.addCleanup(setattr, state, "model_configs", original)
+        state.model_configs = {
+            "flash": ModelConfig(
+                name="f", base_url="http://x", api_key="k", model_id="flash",
+                extra={"max_seqlen": 8192},
+            )
+        }
+        top_id = self.top["id"]
+        team_store.add_member("u1", top_id, "m1", "A", model_id="flash")
+        # TOP 设 max_seqlen=4096、compress=0.3
+        agent_store.update_agent(
+            "u1", top_id, max_seqlen_override=4096, compress_threshold=0.3
+        )
+        # 成员只覆盖 max_seqlen=1024，compress 未设 → 应继承 TOP 的 0.3
+        team_store.update_member(top_id, "m1", max_seqlen_override=1024)
+        config, _ = _resolve_member_model("u1", "m1", top_id, "flash")
+        self.assertEqual(config.extra["max_seqlen"], 1024)
+        self.assertAlmostEqual(config.extra["compress_threshold"], 0.3)
+
+    def test_member_without_override_inherits_top(self):
+        from agent.chat import _resolve_member_model
+        from config.models import ModelConfig
+
+        original = state.model_configs
+        self.addCleanup(setattr, state, "model_configs", original)
+        state.model_configs = {
+            "flash": ModelConfig(
+                name="f", base_url="http://x", api_key="k", model_id="flash",
+                extra={"max_seqlen": 8192},
+            )
+        }
+        top_id = self.top["id"]
+        team_store.add_member("u1", top_id, "m1", "A", model_id="flash")
+        agent_store.update_agent("u1", top_id, max_seqlen_override=4096)
+        config, _ = _resolve_member_model("u1", "m1", top_id, "flash")
+        self.assertEqual(config.extra["max_seqlen"], 4096)
+
+    def test_effective_overrides_reports_source(self):
+        from agent.chat import _member_effective_overrides
+
+        top_id = self.top["id"]
+        team_store.add_member("u1", top_id, "m1", "A", model_id="flash")
+        agent_store.update_agent("u1", top_id, max_output_tokens=999)
+        team_store.update_member(top_id, "m1", max_seqlen_override=2048)
+        eff = _member_effective_overrides("u1", "m1", top_id)
+        self.assertEqual(eff["max_seqlen"], 2048)
+        self.assertEqual(eff["max_seqlen_source"], "member")
+        self.assertEqual(eff["max_output_tokens"], 999)
+        self.assertEqual(eff["max_output_tokens_source"], "top")
+        self.assertIsNone(eff["compress_threshold"])
+        self.assertEqual(eff["compress_threshold_source"], "model")
+
+    def test_legacy_db_migration_adds_override_columns(self):
+        """旧库（无覆盖列）迁移后列存在且为 NULL。"""
+        team_store._initialized = False  # type: ignore[attr-defined]
+        team_store.add_member("u1", self.top["id"], "m9", "老成员",
+                              model_id="flash")
+        row = team_store.get_member(self.top["id"], "m9")
+        for column in team_store.MEMBER_OVERRIDE_COLUMNS:
+            self.assertIn(column, row)
+
+
+class TestTeammateOverrideApi(TeamStoreBase):
+    """REST：成员级参数覆盖的写入、清除与回显。"""
+
+    def setUp(self):
+        super().setUp()
+        self._orig_state_configs = state.model_configs
+        state.model_configs = {
+            "flash": ModelConfig(
+                name="Flash", base_url="http://x", api_key="sk-1",
+                model_id="flash",
+                extra={"max_seqlen": 8192,
+                       "reasoning_effort_options": ["low", "high", "max"]},
+            ),
+        }
+        self.addCleanup(setattr, state, "model_configs", self._orig_state_configs)
+        self._agent = agent_store.create_agent(USER["openid"], "TOP", "flash")
+        self.top_id = self._agent["id"]
+        team_store.init_team(USER["openid"], self.top_id, "TOP")
+        team_store.add_member(USER["openid"], self.top_id, "m1", "成员A",
+                              model_id="flash")
+        team_store.update_member_review_status(self.top_id, "m1",
+                                               value="approved")
+
+        app = FastAPI()
+        from agent.routes import router as agent_router
+        from ws.auth import get_current_user
+
+        app.include_router(agent_router)
+        app.dependency_overrides[get_current_user] = lambda: dict(USER)
+        self.client = TestClient(app)
+
+    def _url(self) -> str:
+        return f"/api/agents/{self.top_id}/teammate/m1"
+
+    def test_patch_sets_overrides_and_echoes(self):
+        r = self.client.patch(self._url(), json={
+            "reasoning_effort": "high",
+            "max_seqlen": 32768,
+            "max_output_tokens": 2048,
+            "compress_threshold": 0.5,
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        own = r.json()["member"]["overrides"]
+        self.assertEqual(own["reasoning_effort"], "high")
+        self.assertEqual(own["max_seqlen"], 32768)
+        self.assertEqual(own["max_output_tokens"], 2048)
+        self.assertAlmostEqual(own["compress_threshold"], 0.5)
+        effective = r.json()["member"]["effective"]
+        self.assertEqual(effective["max_seqlen"], 32768)
+        self.assertEqual(effective["max_seqlen_source"], "member")
+
+    def test_patch_null_clears_override(self):
+        self.client.patch(self._url(), json={"max_seqlen": 4096})
+        r = self.client.patch(self._url(), json={"max_seqlen": None})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIsNone(r.json()["member"]["overrides"]["max_seqlen"])
+
+    def test_unspecified_keys_untouched(self):
+        self.client.patch(self._url(), json={"max_seqlen": 4096,
+                                             "max_output_tokens": 111})
+        r = self.client.patch(self._url(), json={"max_seqlen": 8192})
+        own = r.json()["member"]["overrides"]
+        self.assertEqual(own["max_seqlen"], 8192)
+        self.assertEqual(own["max_output_tokens"], 111)
+
+    def test_range_validation(self):
+        for payload in (
+            {"max_seqlen": 0},
+            {"max_output_tokens": -1},
+            {"compress_threshold": 0.05},
+            {"compress_threshold": 0.99},
+        ):
+            r = self.client.patch(self._url(), json=payload)
+            self.assertEqual(r.status_code, 400, f"{payload} 应 400")
+
+    def test_effort_outside_options_rejected(self):
+        r = self.client.patch(self._url(), json={"reasoning_effort": "none"})
+        self.assertEqual(r.status_code, 400, r.text)
+
+    def test_empty_body_still_400(self):
+        r = self.client.patch(self._url(), json={})
+        self.assertEqual(r.status_code, 400, r.text)
+
+    def test_teammates_endpoint_exposes_overrides_and_effective(self):
+        self.client.patch(self._url(), json={"max_seqlen": 2048})
+        r = self.client.get(f"/api/agents/{self.top_id}/teammates")
+        self.assertEqual(r.status_code, 200, r.text)
+        member = r.json()["members"][0]
+        self.assertEqual(member["overrides"]["max_seqlen"], 2048)
+        self.assertEqual(member["effective"]["max_seqlen"], 2048)
+        self.assertEqual(member["effective"]["max_seqlen_source"], "member")
+
+    def test_member_inherits_top_in_effective(self):
+        agent_store.update_agent(USER["openid"], self.top_id,
+                                 max_output_tokens=777)
+        r = self.client.get(f"/api/agents/{self.top_id}/teammates")
+        member = r.json()["members"][0]
+        self.assertIsNone(member["overrides"]["max_output_tokens"])
+        self.assertEqual(member["effective"]["max_output_tokens"], 777)
+        self.assertEqual(member["effective"]["max_output_tokens_source"], "top")
+
+
 if __name__ == "__main__":
     unittest.main()

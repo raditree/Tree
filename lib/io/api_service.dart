@@ -1015,20 +1015,30 @@ class ApiService {
         <Map<String, dynamic>>[];
   }
 
-  /// 为用户分配成员模型 / 审核成员（「团队成员 → 模型配置」页提交）
+  /// 为用户分配成员模型 / 审核成员 / 调整成员级模型参数
   ///
   /// 调用 `PATCH /api/agents/{leaderId}/teammate/{memberId}`。
-  /// 两个参数都可为 null 表示不改该项；`modelId` 传空串 = 清空模型
+  /// 各参数为 null 表示不改该项；`modelId` 传空串 = 清空模型
   /// （成员退回未分配状态，无法工作）。
+  ///
+  /// [overrides] 支持四个键：`reasoning_effort` / `max_seqlen` /
+  /// `max_output_tokens` / `compress_threshold`；**值为 null 表示清除该项覆盖**
+  /// （回退 TOP 设置），键缺省表示不修改。只提交用户改过的键即可。
   static Future<Map<String, dynamic>> updateTeammate(
     String leaderId,
     String memberId, {
     String? modelId,
     String? reviewStatus,
+    Map<String, Object?>? overrides,
   }) async {
     final Map<String, dynamic> body = <String, dynamic>{};
     if (modelId != null) body['model_id'] = modelId;
     if (reviewStatus != null) body['review_status'] = reviewStatus;
+    if (overrides != null) {
+      overrides.forEach((String key, Object? value) {
+        body[key] = value;
+      });
+    }
     return _patchJson(
       '/api/agents/$leaderId/teammate/$memberId',
       body: body,
