@@ -1,11 +1,19 @@
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
+import '../../io/platform_support.dart';
+import '../../io/ssh_connection_manager.dart';
+
 /// SSH 连接配置表单对话框。
 ///
 /// 字段：主机 / 端口 / 用户名 / 认证方式（密码或私钥）/ 密码或私钥路径 /
-/// 远端基础目录。确认后以 ``Map<String, dynamic>`` 返回：
-/// ``{host, port, username, auth_type, password, private_key_path, remote_base_dir}``。
+/// 远端基础目录 / 是否在本机记住密码。确认后以 ``Map<String, dynamic>`` 返回：
+/// ``{host, port, username, auth_type, password, private_key_path,
+/// remote_base_dir, persist_password}``。
+///
+/// 凭据可用环境变量提供（表单留空时兜底，见 `SshConnectionManager`）：
+/// ``TREE_SSH_PASSWORD`` / ``TREE_SSH_PRIVATE_KEY`` / ``TREE_SSH_HOST`` /
+/// ``TREE_SSH_PORT`` / ``TREE_SSH_USER`` / ``TREE_SSH_REMOTE_DIR``。
 class SshConfigDialog extends StatefulWidget {
   const SshConfigDialog({super.key, this.initialConfig});
 
@@ -28,19 +36,32 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
   /// 认证方式：'password' | 'key'
   String _authType = 'password';
 
+  /// 是否把密码明文写入本机 SharedPreferences（默认否）
+  bool _persistPassword = false;
+
+  /// 是否存在环境变量提供的密码/私钥（用于提示"可留空"）
+  bool _hasEnvPassword = false;
+  bool _hasEnvKey = false;
+
   @override
   void initState() {
     super.initState();
+    _hasEnvPassword = envVar(SshConnectionManager.envPassword) != null;
+    _hasEnvKey = envVar(SshConnectionManager.envPrivateKey) != null;
     final Map<String, dynamic>? cfg = widget.initialConfig;
     if (cfg != null) {
       _hostController.text = (cfg['host'] as String?) ?? '';
       _portController.text = ((cfg['port'] as num?) ?? 22).toString();
       _usernameController.text = (cfg['username'] as String?) ?? '';
       _authType = (cfg['auth_type'] as String?) ?? 'password';
-      _passwordController.text = (cfg['password'] as String?) ?? '';
+      // 密码不预填（默认不落盘；即便落盘过也不回显，避免明文在界面上暴露）
+      _persistPassword = cfg['persist_password'] == true;
       _keyPathController.text = (cfg['private_key_path'] as String?) ?? '';
       final String remoteDir = (cfg['remote_base_dir'] as String?) ?? '';
       _remoteDirController.text = remoteDir.isNotEmpty ? remoteDir : '/';
+    } else if (_hasEnvKey && !_hasEnvPassword) {
+      // 仅提供了私钥环境变量：默认切到私钥认证，减少一次手工选择
+      _authType = 'key';
     }
   }
 
@@ -70,9 +91,28 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
 
   void _submit() {
     final String host = _hostController.text.trim();
-    if (host.isEmpty) {
+    // 主机/用户名允许留空——建连时会用 TREE_SSH_HOST / TREE_SSH_USER 兜底
+    final bool hostFromEnv =
+        host.isEmpty && envVar(SshConnectionManager.envHost) != null;
+    if (host.isEmpty && !hostFromEnv) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('主机地址不能为空')),
+        const SnackBar(
+          content: Text(
+            '主机地址不能为空：请填写，或设置环境变量 TREE_SSH_HOST',
+          ),
+        ),
+      );
+      return;
+    }
+    final String password =
+        _authType == 'password' ? _passwordController.text : '';
+    if (_authType == 'password' && password.isEmpty && !_hasEnvPassword) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            '未提供 SSH 密码：请填写，或设置环境变量 TREE_SSH_PASSWORD',
+          ),
+        ),
       );
       return;
     }
@@ -81,12 +121,14 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
       'port': int.tryParse(_portController.text.trim()) ?? 22,
       'username': _usernameController.text.trim(),
       'auth_type': _authType,
-      'password': _authType == 'password' ? _passwordController.text : '',
+      'password': password,
       'private_key_path':
           _authType == 'key' ? _keyPathController.text.trim() : '',
       'remote_base_dir': _remoteDirController.text.trim().isEmpty
           ? '/'
           : _remoteDirController.text.trim(),
+      // 是否把密码明文写入本机存储（默认否；密码来自环境变量时无意义）
+      'persist_password': _persistPassword,
     });
   }
 
@@ -104,12 +146,14 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
             children: <Widget>[
               TextField(
                 controller: _hostController,
-                decoration: const InputDecoration(
+                decoration: InputDecoration(
                   labelText: '主机地址',
                   hintText: '例如 192.168.1.10 或 host.example.com',
-                  helperText: '需从前端所在机器可达（IP 相对前端）',
-                  prefixIcon: Icon(Icons.dns_outlined, size: 20),
-                                    isDense: true,
+                  helperText: envVar(SshConnectionManager.envHost) != null
+                      ? '留空将使用环境变量 ${SshConnectionManager.envHost}'
+                      : '需从前端所在机器可达（IP 相对前端）',
+                  prefixIcon: const Icon(Icons.dns_outlined, size: 20),
+                  isDense: true,
                 ),
               ),
               const SizedBox(height: 12),
@@ -170,10 +214,14 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
                 TextField(
                   controller: _passwordController,
                   obscureText: true,
-                  decoration: const InputDecoration(
+                  decoration: InputDecoration(
                     labelText: '密码',
-                    prefixIcon: Icon(Icons.lock_outline, size: 20),
-                                        isDense: true,
+                    helperText: _hasEnvPassword
+                        ? '留空将使用环境变量 '
+                            '${SshConnectionManager.envPassword}'
+                        : null,
+                    prefixIcon: const Icon(Icons.lock_outline, size: 20),
+                    isDense: true,
                   ),
                 )
               else
@@ -182,10 +230,13 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
                     Expanded(
                       child: TextField(
                         controller: _keyPathController,
-                        decoration: const InputDecoration(
+                        decoration: InputDecoration(
                           labelText: '私钥路径',
-                          hintText: '例如 C:\\Users\\xxx\\.ssh\\id_rsa',
-                                                    isDense: true,
+                          hintText: _hasEnvKey
+                              ? '留空将使用环境变量 '
+                                  '${SshConnectionManager.envPrivateKey}'
+                              : '例如 C:\\Users\\xxx\\.ssh\\id_rsa',
+                          isDense: true,
                         ),
                       ),
                     ),
@@ -197,6 +248,27 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
                     ),
                   ],
                 ),
+              if (_authType == 'password') ...[
+                const SizedBox(height: 4),
+                CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  dense: true,
+                  value: _persistPassword,
+                  onChanged: (bool? value) {
+                    setState(() => _persistPassword = value ?? false);
+                  },
+                  controlAffinity: ListTileControlAffinity.leading,
+                  title: const Text(
+                    '在本机记住密码（明文存储）',
+                    style: TextStyle(fontSize: 13),
+                  ),
+                  subtitle: const Text(
+                    '不勾选时密码只用于本次运行，不写入本机存储；'
+                    '推荐改用环境变量 TREE_SSH_PASSWORD',
+                    style: TextStyle(fontSize: 11),
+                  ),
+                ),
+              ],
               const SizedBox(height: 12),
               TextField(
                 controller: _remoteDirController,

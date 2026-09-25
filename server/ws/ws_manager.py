@@ -11,12 +11,19 @@
 
 发送保护：``send_json`` 经 ``asyncio.wait_for`` 包裹（超时可注入，默认
 ``_SEND_TIMEOUT_SECONDS``），超时/异常即移除该连接并关闭，避免慢连接
-无限堆积发送协程拖垮事件循环。
+无限堆积发送协程拖垮事件循环。**该超时按"单次 send_json"计时**：大帧分片后
+每片独立计时，不按整条逻辑消息累计（否则大消息必然被误判死链）。
+
+大帧分片：编码后超过 ``_WS_CHUNK_THRESHOLD_BYTES`` 的逻辑消息被切成
+``frame_begin`` / ``frame_chunk`` x N / ``frame_end`` 序列逐片发送，由前端
+传输层重组为同一条消息。动因见 ``tool/grep_tool.py`` 的 ``ws_max_size``
+说明：后端 uvicorn 默认 16MiB，超限会**静默**关闭连接。
 """
 import asyncio
+import json
 import logging
 import uuid
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from fastapi import WebSocket
 
@@ -26,6 +33,94 @@ logger = logging.getLogger(__name__)
 _SEND_TIMEOUT_SECONDS = 10.0
 # 移除死连接后尝试 close 的超时（秒）
 _CLOSE_TIMEOUT_SECONDS = 1.0
+
+# 大帧分片阈值（UTF-8 字节）：超过即分片。
+# uvicorn ws_max_size 默认 16MiB，取 12MiB 留 4MiB 余量覆盖 JSON 转义膨胀。
+_WS_CHUNK_THRESHOLD_BYTES = 12 * 1024 * 1024
+# 单个分片的目标字节数（按字符边界回退，不切断码点）
+_WS_CHUNK_PART_BYTES = 4 * 1024 * 1024
+
+# 传输层分片帧类型名（不与任何既有业务 type 冲突）
+_FRAME_BEGIN = "frame_begin"
+_FRAME_CHUNK = "frame_chunk"
+_FRAME_END = "frame_end"
+
+
+def _peek_message_type(message: Dict[str, Any]) -> str:
+    """取逻辑消息的 type（仅供分片日志，失败不抛）。"""
+    try:
+        value = message.get("type")
+        return str(value) if value is not None else "?"
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
+def split_payload_by_bytes(text: str, max_bytes: int) -> List[str]:
+    """按 UTF-8 字节预算切分 [text]，切点回退到**字符边界**（不切断码点）。
+
+    与前端 ``_takeFramePart`` 同一口径：逐码点累加其 UTF-8 长度，超出预算即停。
+    单个码点本身超过预算时单独成片，保证必然推进（不死循环）。
+    """
+    if max_bytes <= 0 or not text:
+        return [text]
+    parts: List[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        slice_start = index
+        bytes_used = 0
+        while index < length:
+            ch = text[index]
+            # 代理对按一个码点处理，避免把补充平面字符切成两半
+            if 0xD800 <= ord(ch) <= 0xDBFF and index + 1 < length:
+                segment = text[index:index + 2]
+            else:
+                segment = ch
+            size = len(segment.encode("utf-8"))
+            if bytes_used and bytes_used + size > max_bytes:
+                break
+            bytes_used += size
+            index += len(segment)
+        parts.append(text[slice_start:index])
+    return parts or [text]
+
+
+def chunk_message_frame(message: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """把逻辑消息切成可发送的帧序列（未超阈值时原样单帧返回）。
+
+    超阈值时产出 ``frame_begin`` + ``frame_chunk`` x N + ``frame_end``，
+    前端传输层据 ``id`` 重组为原始 JSON 后再走业务分发。
+    """
+    payload = json.dumps(message, ensure_ascii=False)
+    encoded_len = len(payload.encode("utf-8"))
+    if encoded_len <= _WS_CHUNK_THRESHOLD_BYTES:
+        return [message]
+
+    transfer_id = f"frg_{uuid.uuid4().hex}"
+    parts = split_payload_by_bytes(payload, _WS_CHUNK_PART_BYTES)
+    logger.warning(
+        "WS 出站消息超过分片阈值，已分片: type=%s bytes=%d chunks=%d id=%s",
+        _peek_message_type(message), encoded_len, len(parts), transfer_id,
+    )
+    frames: List[Dict[str, Any]] = [{
+        "type": _FRAME_BEGIN,
+        "id": transfer_id,
+        "total": len(parts),
+        "bytes": encoded_len,
+    }]
+    for seq, part in enumerate(parts):
+        frames.append({
+            "type": _FRAME_CHUNK,
+            "id": transfer_id,
+            "seq": seq,
+            "part": part,
+        })
+    frames.append({
+        "type": _FRAME_END,
+        "id": transfer_id,
+        "total": len(parts),
+    })
+    return frames
 
 
 class WebSocketManager:
@@ -84,11 +179,25 @@ class WebSocketManager:
         except Exception:  # noqa: BLE001
             pass
 
+    async def _send_maybe_chunked(
+        self, websocket: WebSocket, message: Dict[str, Any]
+    ) -> None:
+        """发送单条逻辑消息：超阈值时分片逐片发送。
+
+        **超时按单次 ``send_json`` 计时**（而非整条逻辑消息累计）：分片后每片
+        独立套 ``asyncio.wait_for``，否则大消息必然超过 ``send_timeout`` 而被
+        误判为死链移除。任一片失败即向上抛，由调用方走既有的移除/关闭策略。
+        """
+        for frame in chunk_message_frame(message):
+            await asyncio.wait_for(
+                websocket.send_json(frame), timeout=self.send_timeout
+            )
+
     async def send_message(self, user_id: str, message: Dict[str, Any]) -> None:
         """向指定用户的所有连接发送 JSON 消息；用户无连接时静默忽略。
 
         每条连接的发送经 ``asyncio.wait_for`` 超时保护：超时/异常即把该连接
-        移除并关闭，不无限堆积发送协程。
+        移除并关闭，不无限堆积发送协程。超限消息自动分片（见 [_send_maybe_chunked]）。
 
         :param user_id: 用户标识
         :param message: 消息字典，遵循 ``{"type": "...", "data": {...}}`` 协议
@@ -99,9 +208,7 @@ class WebSocketManager:
         dead: list = []
         for connection_id, ws in list(conns.items()):
             try:
-                await asyncio.wait_for(
-                    ws.send_json(message), timeout=self.send_timeout
-                )
+                await self._send_maybe_chunked(ws, message)
             except Exception:  # noqa: BLE001
                 dead.append((connection_id, ws))
         for connection_id, ws in dead:
@@ -137,9 +244,7 @@ class WebSocketManager:
         if ws is None:
             return False
         try:
-            await asyncio.wait_for(
-                ws.send_json(message), timeout=self.send_timeout
-            )
+            await self._send_maybe_chunked(ws, message)
         except Exception:  # noqa: BLE001
             self._drop_dead(user_id, connection_id)
             logger.warning(

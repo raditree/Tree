@@ -9,6 +9,16 @@ import 'mcp_trust_store.dart';
 import 'plugin_host_sessions.dart';
 import 'ssh_connection_manager.dart';
 
+/// grep 结果的发送端截断预算（与 `local_executor_service.dart` 的
+/// `kGrepMaxLineChars` / `kGrepMaxTotalChars` 对齐）。
+///
+/// 远端 stdout 会被整包经反向 WS 回传：单帧超过 uvicorn 的 16MiB 上限会被
+/// **静默**关闭连接（连带注销执行器注册、打断在途工具调用）。本地模式早有
+/// 这两道截断，SSH 侧此前缺失，构成回归缺口——在 SSH 机器上 grep 大型目录
+/// 即可触发。截断后回传 `truncated` / `line_truncated` 标记供模型知晓。
+const int kSshGrepMaxLineChars = 2000;
+const int kSshGrepMaxTotalChars = 100000;
+
 /// 插件宿主会话（SSH 侧，M2 宿主通道）：跨请求持存于
 /// [SshWorkspaceExecutor] 的静态会话表；记录远端 pidfile 与会话归属，
 /// 供状态探测与回收（远端 kill）时重建执行器使用。
@@ -1161,7 +1171,44 @@ class SshWorkspaceExecutor {
     if (maxDepth > 0 && result['exit_code'] == 123) {
       result['exit_code'] = 1;
     }
-    return result;
+    return _truncateGrepResult(result);
+  }
+
+  /// 对 grep 的远端 stdout 做发送端截断（逐行 + 总量双预算）。
+  ///
+  /// 与本地执行器同一口径：超长单行在 [kSshGrepMaxLineChars] 处截断，
+  /// 总量达 [kSshGrepMaxTotalChars] 后停止收集；两者都通过
+  /// `truncated` / `line_truncated` 标记回传，避免模型把部分命中当全量。
+  Map<String, dynamic> _truncateGrepResult(Map<String, dynamic> result) {
+    final Object? raw = result['stdout'];
+    if (raw is! String || raw.isEmpty) return result;
+    final List<String> srcLines = raw.split('\n');
+    final List<String> kept = <String>[];
+    int total = 0;
+    bool truncated = false;
+    bool lineTruncated = false;
+    for (final String line in srcLines) {
+      String item = line;
+      if (item.length > kSshGrepMaxLineChars) {
+        item = '${item.substring(0, kSshGrepMaxLineChars)}…';
+        lineTruncated = true;
+      }
+      // +1 为换行符开销
+      if (total + item.length + 1 > kSshGrepMaxTotalChars) {
+        truncated = true;
+        break;
+      }
+      kept.add(item);
+      total += item.length + 1;
+    }
+    if (kept.length == srcLines.length && !lineTruncated) {
+      return result;
+    }
+    final Map<String, dynamic> out = Map<String, dynamic>.from(result);
+    out['stdout'] = kept.join('\n');
+    out['truncated'] = truncated;
+    out['line_truncated'] = lineTruncated;
+    return out;
   }
 
   /// 解析 ``max_depth``：非数字/缺省为 0（不限），负值归零、上限 100。

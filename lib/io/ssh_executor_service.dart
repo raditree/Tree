@@ -137,6 +137,29 @@ class SshExecutorService extends ChangeNotifier {
     await _loadTeamSettings(state);
   }
 
+  /// 从配置中剔除不应落盘的敏感字段，返回可安全写入 SharedPreferences 的副本。
+  ///
+  /// 密码默认**不落盘**（改用环境变量 `TREE_SSH_PASSWORD` 或每次启用时输入）：
+  /// SharedPreferences 是明文存储，把 SSH 密码写进去等于在本机留一份明文凭据。
+  /// 仅当用户在配置表单显式勾选「在本机记住密码」时才保留。
+  ///
+  /// 无论是否落盘，内存中的 `state.config` 始终保留完整配置，供本次运行使用；
+  /// 应用重启后若既无环境变量也无落盘密码，建连会给出明确的中文提示。
+  static Map<String, dynamic> _sanitizedForPersistence(
+    Map<String, dynamic> config,
+  ) {
+    final Map<String, dynamic> copy = Map<String, dynamic>.from(config);
+    // 派生键不落盘（每次建连由 resolveCredential 重新推导）
+    copy.remove('effective_password');
+    copy.remove('password_from_env');
+    final bool remember = config['persist_password'] == true;
+    if (!remember) {
+      copy.remove('password');
+    }
+    copy.remove('persist_password');
+    return copy;
+  }
+
   /// 从 SharedPreferences 恢复单个 team 的 SSH 模式设置。
   ///
   /// 竞态防护：等待期间该条目可能已被 [deactivateTeam] 移除或替换，
@@ -235,7 +258,11 @@ class SshExecutorService extends ChangeNotifier {
       state.enabled = true;
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool(_kEnabledKey(teamId), true);
-      await prefs.setString(_kConfigKey(teamId), jsonEncode(state.config));
+      // 密码默认不落盘（明文存储风险）；详见 _sanitizedForPersistence
+      await prefs.setString(
+        _kConfigKey(teamId),
+        jsonEncode(_sanitizedForPersistence(state.config)),
+      );
       notifyListeners();
     } else {
       state.enabled = false;

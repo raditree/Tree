@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:dartssh2/dartssh2.dart';
 
+import 'platform_support.dart';
+
 /// SSH 连接管理器 - 由前端（本机）发起并持有 dartssh2 连接。
 ///
 /// SSH 运行模式下，SSH 连接由**前端机器**建立（IP 相对前端），后端仅经反向
@@ -10,11 +12,92 @@ import 'package:dartssh2/dartssh2.dart';
 /// 失活时自动从缓存移除（下次请求按需重建），对齐原后端 `SSHConnectionManager`
 /// 的语义。
 ///
-/// 认证：
+/// 认证（按优先级合并，见 [resolveCredential]）：
 /// - 密码（auth_type == "password"）：`onPasswordRequest` 返回密码；
+///   密码来源依次为 表单值 → 环境变量 `TREE_SSH_PASSWORD`；
 /// - 私钥（auth_type == "key"）：读取 `private_key_path` 的 PEM 经
-///   `SSHKeyPair.fromPem` 解析为 identities。
+///   `SSHKeyPair.fromPem` 解析为 identities；路径来源依次为
+///   表单值 → 环境变量 `TREE_SSH_PRIVATE_KEY`；
+/// - 主机/端口/用户名/远端目录同样支持环境变量兜底
+///   （`TREE_SSH_HOST` / `TREE_SSH_PORT` / `TREE_SSH_USER` /
+///   `TREE_SSH_REMOTE_DIR`）。
+///
+/// 环境变量仅在**建连时**读取，因此不落盘、不出现在 SharedPreferences；
+/// 适合"不想把密码写进本机配置文件"的场景。
 class SshConnectionManager {
+  /// SSH 凭据相关环境变量名（表单值优先，环境变量兜底）。
+  static const String envPassword = 'TREE_SSH_PASSWORD';
+  static const String envPrivateKey = 'TREE_SSH_PRIVATE_KEY';
+  static const String envHost = 'TREE_SSH_HOST';
+  static const String envPort = 'TREE_SSH_PORT';
+  static const String envUser = 'TREE_SSH_USER';
+  static const String envRemoteDir = 'TREE_SSH_REMOTE_DIR';
+
+  /// 解析一份 SSH 连接配置的**生效凭据**：表单值优先，环境变量兜底。
+  ///
+  /// 返回补齐后的配置副本，并额外给出 `effective_password` /
+  /// `effective_key_path` / `password_from_env` 三个派生键（供调用方决定
+  /// 是否允许落盘，以及给出准确报错）。
+  ///
+  /// `auth_type` 缺省推导：显式给了私钥路径（表单或环境变量）→ `key`；
+  /// 否则 → `password`。这样只设置环境变量 `TREE_SSH_PRIVATE_KEY` 也能直接
+  /// 走密钥登录，无需在表单里再选一次认证方式。
+  static Map<String, dynamic> resolveCredential(Map<String, dynamic> config) {
+    final Map<String, dynamic> merged = Map<String, dynamic>.from(config);
+
+    String pick(String key, String envName) {
+      final String formValue = ((merged[key] as String?) ?? '').trim();
+      if (formValue.isNotEmpty) return formValue;
+      return envVar(envName)?.trim() ?? '';
+    }
+
+    // 注意：密码不做 trim（前后空格可能是密码的一部分），只判空
+    final String formPassword = (merged['password'] as String?) ?? '';
+    final String envPasswordValue = formPassword.isEmpty
+        ? (envVar(envPassword) ?? '')
+        : '';
+    final String effectivePassword =
+        formPassword.isNotEmpty ? formPassword : envPasswordValue;
+
+    final String formKeyPath = ((merged['private_key_path'] as String?) ?? '').trim();
+    final String effectiveKeyPath =
+        formKeyPath.isNotEmpty ? formKeyPath : (envVar(envPrivateKey) ?? '');
+
+    // auth_type 推导（仅在未显式设置时）
+    String authType = ((merged['auth_type'] as String?) ?? '').trim();
+    if (authType.isEmpty) {
+      authType = effectiveKeyPath.isNotEmpty ? 'key' : 'password';
+    }
+    // 显式 password 但无任何密码且存在私钥路径 → 自动改用密钥（避免必然失败的建连）
+    if (authType == 'password' &&
+        effectivePassword.isEmpty &&
+        effectiveKeyPath.isNotEmpty) {
+      authType = 'key';
+    }
+
+    merged['host'] = pick('host', envHost);
+    merged['username'] = pick('username', envUser);
+    merged['auth_type'] = authType;
+    merged['private_key_path'] = effectiveKeyPath;
+    // 远端基础目录：表单值优先，环境变量兜底，仍为空则 '/'
+    final String remoteDir = pick('remote_base_dir', envRemoteDir);
+    merged['remote_base_dir'] = remoteDir.isNotEmpty ? remoteDir : '/';
+
+    final Object? rawPort = merged['port'];
+    final int formPort = rawPort is num ? rawPort.toInt() : 0;
+    if (formPort > 0) {
+      merged['port'] = formPort;
+    } else {
+      final int envPortValue = int.tryParse(envVar(envPort) ?? '') ?? 0;
+      merged['port'] = envPortValue > 0 ? envPortValue : 22;
+    }
+
+    merged['effective_password'] = effectivePassword;
+    merged['password_from_env'] =
+        formPassword.isEmpty && envPasswordValue.isNotEmpty;
+    return merged;
+  }
+
   /// 单连接并发上限的**内置默认值**（超出排队等待槽位）。
   ///
   /// 运行时可用后端下发值覆盖：后端 app.yaml ``ssh.max_concurrent_per_team``
@@ -216,20 +299,27 @@ class SshConnectionManager {
 
   /// 依据配置建立并完成认证的 SSH 连接。
   ///
+  /// 凭据经 [resolveCredential] 合并（表单值优先，环境变量兜底），因此调用方
+  /// 可以直接传入只含环境变量来源的配置。
   /// 认证失败 / 连接超时会抛异常，由调用方捕获转成可读错误。
   Future<SSHClient> _buildClient(Map<String, dynamic> config) async {
-    final String host = ((config['host'] as String?) ?? '').trim();
-    final int port = ((config['port'] as num?) ?? 22).toInt();
-    final String username = ((config['username'] as String?) ?? '').trim();
-    final String authType = (config['auth_type'] as String?) ?? 'password';
-    final String password = (config['password'] as String?) ?? '';
-    final String keyPath = ((config['private_key_path'] as String?) ?? '').trim();
+    final Map<String, dynamic> resolved = resolveCredential(config);
+    final String host = (resolved['host'] as String? ?? '').trim();
+    final int port = (resolved['port'] as num?)?.toInt() ?? 22;
+    final String username = (resolved['username'] as String? ?? '').trim();
+    final String authType = (resolved['auth_type'] as String?) ?? 'password';
+    final String password = (resolved['effective_password'] as String?) ?? '';
+    final String keyPath = (resolved['private_key_path'] as String? ?? '').trim();
 
     if (host.isEmpty) {
-      throw StateError('SSH 主机地址为空');
+      throw StateError(
+        'SSH 主机地址为空：请在配置表单填写，或设置环境变量 $envHost',
+      );
     }
     if (username.isEmpty) {
-      throw StateError('SSH 用户名不能为空');
+      throw StateError(
+        'SSH 用户名不能为空：请在配置表单填写，或设置环境变量 $envUser',
+      );
     }
 
     final SSHSocket socket = await SSHSocket.connect(
@@ -243,11 +333,39 @@ class SshConnectionManager {
     if (authType == 'key') {
       if (keyPath.isEmpty) {
         socket.destroy();
-        throw StateError('私钥认证需提供私钥文件路径');
+        throw StateError(
+          '私钥认证需提供私钥文件路径：请在配置表单选择，'
+          '或设置环境变量 $envPrivateKey',
+        );
       }
-      final String pem = await File(keyPath).readAsString();
-      identities = SSHKeyPair.fromPem(pem);
+      final String pem;
+      try {
+        pem = await File(keyPath).readAsString();
+      } on FileSystemException catch (e) {
+        socket.destroy();
+        throw StateError('无法读取私钥文件 $keyPath：${e.osError?.message ?? e.message}');
+      }
+      try {
+        identities = SSHKeyPair.fromPem(pem);
+      } catch (e) {
+        socket.destroy();
+        throw StateError(
+          '私钥解析失败（$keyPath）：$e。'
+          '若私钥有 passphrase 或不是 PEM 格式，请改用密码认证',
+        );
+      }
+      if (identities.isEmpty) {
+        socket.destroy();
+        throw StateError('私钥文件未解析出任何密钥：$keyPath');
+      }
     } else {
+      if (password.isEmpty) {
+        socket.destroy();
+        throw StateError(
+          '未提供 SSH 密码：请在配置表单填写，'
+          '或设置环境变量 $envPassword',
+        );
+      }
       onPasswordRequest = () => password;
     }
 

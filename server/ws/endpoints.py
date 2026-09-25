@@ -8,11 +8,17 @@
 - ``register_local_executor`` / ``unregister_local_executor``：本地执行器注册
 - ``tool_exec_response``：前端工具执行结果回传
 - ``plugin_host_event``：宿主通道上行（二期 M2；退出上报等）
+
+传输层分片重组：``frame_begin`` / ``frame_chunk`` x N / ``frame_end`` 由前端
+在消息超过 12MiB 时发出；本模块在 ``json.loads`` **之前**收齐并拼回原始
+JSON，使后续分发逻辑完全无感。分解动因见 ``ws/ws_manager.py`` 的分片说明。
 """
 import asyncio
 import json
 import logging
-from typing import Any, Dict
+import threading
+import time
+from typing import Any, Dict, Optional
 
 import jwt
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -43,6 +49,115 @@ from plugin import (
 from ws.auth import TokenRevokedError, verify_token
 
 logger = logging.getLogger(__name__)
+
+# 传输层分片帧类型名（与 ws_manager 保持一致；前端同名）
+_FRAME_BEGIN = "frame_begin"
+_FRAME_CHUNK = "frame_chunk"
+_FRAME_END = "frame_end"
+# 在途分片序列的保活时限（秒）：超时未收齐即丢弃（防内存泄漏与永久悬挂）
+_FRAME_TTL_SECONDS = 60.0
+
+
+class _InboundFrames:
+    """一条在途入站分片序列（按 (connection_id, transfer_id) 隔离）。"""
+
+    __slots__ = ("total", "parts", "started_at")
+
+    def __init__(self, total: int, started_at: float) -> None:
+        self.total = total
+        self.parts: Dict[int, str] = {}
+        self.started_at = started_at
+
+
+# 在途入站分片：(connection_id, transfer_id) -> 序列。
+# 按连接隔离是必要的：同一用户可能有多个并行 WS 实例，若按 user_id 清理会把
+# 兄弟连接正在拼装的序列一并丢掉。
+_inbound_frames: Dict[tuple, _InboundFrames] = {}
+_inbound_lock = threading.Lock()
+
+
+def _drop_inbound_frames(connection_id: str) -> None:
+    """丢弃指定连接的全部在途入站分片序列（断连时调用）。"""
+    if not connection_id:
+        return
+    with _inbound_lock:
+        for key in [k for k in _inbound_frames if k[0] == connection_id]:
+            _inbound_frames.pop(key, None)
+
+
+def _reassemble_inbound_frame(
+    user_id: str, connection_id: str, raw: str
+) -> Optional[str]:
+    """尝试把 [raw] 当作传输层分片帧处理。
+
+    :return: 已收齐时返回拼好的原始 JSON 字符串；属于分片但尚未收齐（或已
+             消费）时返回 None（调用方应跳过本条）；非分片消息返回 [raw] 原值。
+    """
+    if '"frame_' not in raw:
+        return raw
+    try:
+        frame = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(frame, dict):
+        return raw
+    frame_type = frame.get("type")
+    if frame_type not in (_FRAME_BEGIN, _FRAME_CHUNK, _FRAME_END):
+        return raw
+
+    transfer_id = str(frame.get("id") or "")
+    if not transfer_id:
+        return None
+    key = (connection_id, transfer_id)
+
+    now = time.time()
+    with _inbound_lock:
+        # TTL 清理：丢弃过期残片（断开/丢包导致永远收不齐）
+        for stale in [
+            k for k, v in _inbound_frames.items()
+            if now - v.started_at > _FRAME_TTL_SECONDS
+        ]:
+            _inbound_frames.pop(stale, None)
+
+        if frame_type == _FRAME_BEGIN:
+            try:
+                total = int(frame.get("total") or 0)
+            except (TypeError, ValueError):
+                total = 0
+            if total <= 0:
+                return None
+            _inbound_frames[key] = _InboundFrames(total, now)
+            return None
+
+        pending = _inbound_frames.get(key)
+        if pending is None:
+            logger.warning(
+                "WS 收到无起始帧的分片，已丢弃: user_id=%s id=%s type=%s",
+                user_id, transfer_id, frame_type,
+            )
+            return None
+
+        if frame_type == _FRAME_CHUNK:
+            try:
+                seq = int(frame.get("seq"))
+            except (TypeError, ValueError):
+                return None
+            part = frame.get("part")
+            if isinstance(part, str):
+                pending.parts[seq] = part
+
+        complete = len(pending.parts) >= pending.total
+        if not complete and frame_type != _FRAME_END:
+            return None
+        _inbound_frames.pop(key, None)
+        joined = "".join(pending.parts.get(i, "") for i in range(pending.total))
+        total_parts = pending.total
+
+    logger.warning(
+        "WS 入站分片重组完成: user_id=%s id=%s parts=%d bytes=%d",
+        user_id, transfer_id, total_parts, len(joined),
+    )
+    return joined
 
 
 def _extract_token(ws: WebSocket) -> str:
@@ -162,6 +277,15 @@ def register_ws(app: FastAPI) -> None:
             # 3. 循环接收消息并处理
             while True:
                 message_text = await ws.receive_text()
+                # 传输层分片重组：大消息被前端切成 frame_begin / frame_chunk x N
+                # / frame_end，齐片后拼回原始 JSON 再走既有分发（超 16MiB 的
+                # 单帧会被 uvicorn 以 1009 静默关闭连接，故必须先重组）。
+                reassembled = _reassemble_inbound_frame(
+                    user_id, connection_id, message_text
+                )
+                if reassembled is None:
+                    continue
+                message_text = reassembled
                 try:
                     message = json.loads(message_text)
                 except json.JSONDecodeError:
@@ -624,6 +748,9 @@ def register_ws(app: FastAPI) -> None:
             # 客户端主动断开连接
             pass
         finally:
+            # 0) 丢弃本连接的在途入站分片：跨连接的残片无法拼接，不清会内存
+            #    泄漏并让该次传输永久悬挂（前端重连后不会重发旧 transfer_id）。
+            _drop_inbound_frames(connection_id)
             # 1) 从连接表移除本连接（按 connection_id 精确移除，不影响同用户
             #    其他并行连接）
             state.ws_manager.disconnect_by_id(user_id, connection_id)

@@ -27,3 +27,22 @@ bool get isDesktop =>
 
 /// 是否 Linux 桌面
 bool get isLinux => !kIsWeb && Platform.isLinux;
+
+/// 读取环境变量（多端安全：Web 端无 `Platform.environment`，一律返回 null）。
+///
+/// 用于支持"用环境变量提供凭据/配置"的场景（如 SSH 密码
+/// `TREE_SSH_PASSWORD`），避免把密钥落盘到 SharedPreferences。
+///
+/// :param name: 环境变量名
+/// :return: 变量值；未设置、为空串或平台不支持时返回 null
+String? envVar(String name) {
+  if (kIsWeb) return null;
+  try {
+    final String? value = Platform.environment[name];
+    if (value == null || value.isEmpty) return null;
+    return value;
+  } catch (_) {
+    // 平台不支持/受限环境：静默降级为"未提供"
+    return null;
+  }
+}
