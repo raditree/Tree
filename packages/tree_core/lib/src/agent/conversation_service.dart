@@ -3,7 +3,7 @@ import 'dart:async';
 import 'package:tree_protocol/tree_protocol.dart';
 
 import '../settings/core_settings.dart';
-import '../store/memory_store.dart';
+import '../store/tree_store.dart';
 import '../util/ids.dart';
 import '../ws/ws_hub.dart';
 import 'scripted_agent.dart';
@@ -30,7 +30,7 @@ class ConversationService {
     ReplyEngine? engine,
   }) : engine = engine ?? ScriptedAgent();
 
-  final MemoryStore store;
+  final TreeStore store;
   final WsHub hub;
   final CoreSettings settings;
   final ReplyEngine engine;

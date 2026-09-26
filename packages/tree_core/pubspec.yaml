@@ -11,6 +11,12 @@ dependencies:
     path: ../tree_protocol
   tree_local_exec:
     path: ../tree_local_exec
+  # 以下两个是 Dart 官方包（纯 Dart、可 AOT），核心进程因此不再是"零依赖"。
+  # 取舍见 lib/src/store/tree_paths.dart 与 yaml_codec.dart 的说明：
+  # - path：跨平台路径拼接（Windows 盘符/分隔符由官方实现保证正确）
+  # - yaml：配置文件要允许用户**手改**，必须接受任意合法 YAML（手写解析器不现实）
+  path: ^1.9.0
+  yaml: ^3.1.2
 
 dev_dependencies:
   lints: ^6.0.0

@@ -398,7 +398,7 @@ void main() {
       expect(items.length, 1);
       expect(
         (items.first as Map<String, dynamic>)['session_id'],
-        MemoryStore.defaultSessionId,
+        TreeStore.defaultSessionId,
       );
       expect((items.first as Map<String, dynamic>)['message_count'], 0);
       expect((items.first as Map<String, dynamic>)['created_at'], isA<int>());
@@ -415,7 +415,7 @@ void main() {
       final String sessionId =
           (created.json['session'] as Map<String, dynamic>)['session_id']
               as String;
-      expect(sessionId, isNot(MemoryStore.defaultSessionId));
+      expect(sessionId, isNot(TreeStore.defaultSessionId));
 
       expect(
         (await client.send(
@@ -585,7 +585,7 @@ void main() {
         'type': WsInboundType.userMessage,
         'agent_id': agentId,
         'content': '你好，核心进程',
-        'session_id': MemoryStore.defaultSessionId,
+        'session_id': TreeStore.defaultSessionId,
       });
       await ws.until(
         (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgEnd,
@@ -605,7 +605,7 @@ void main() {
         (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgStart,
       );
       expect(start['agent_id'], agentId);
-      expect(start['session_id'], MemoryStore.defaultSessionId);
+      expect(start['session_id'], TreeStore.defaultSessionId);
       expect(start['kind'], 'text');
       final String messageId = start['id'] as String;
       expect(messageId, isNotEmpty);
@@ -641,7 +641,7 @@ void main() {
           .join();
       final _Res history = await client.send(
         'GET',
-        '/api/conversations/$agentId?session_id=${MemoryStore.defaultSessionId}',
+        '/api/conversations/$agentId?session_id=${TreeStore.defaultSessionId}',
       );
       final List<dynamic> messages = history.json['messages'] as List<dynamic>;
       expect(messages, hasLength(2));
@@ -691,7 +691,7 @@ void main() {
       );
       final Map<String, dynamic> data = created['data'] as Map<String, dynamic>;
       expect(data['agent_id'], agentId);
-      expect(data['session_id'], isNot(MemoryStore.defaultSessionId));
+      expect(data['session_id'], isNot(TreeStore.defaultSessionId));
       expect(data['title'], isA<String>());
       expect((data['title'] as String).endsWith('…'), isTrue);
       expect(
@@ -713,7 +713,7 @@ void main() {
         'type': WsInboundType.userMessage,
         'agent_id': agentId,
         'content': '这条会被中途停止',
-        'session_id': MemoryStore.defaultSessionId,
+        'session_id': TreeStore.defaultSessionId,
       });
       await ws.until(
         (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgChunk,
@@ -723,7 +723,7 @@ void main() {
         'type': WsInboundType.stop,
         'data': <String, dynamic>{
           'agent_id': agentId,
-          'session_id': MemoryStore.defaultSessionId,
+          'session_id': TreeStore.defaultSessionId,
         },
       });
       await ws.until(
@@ -753,7 +753,7 @@ void main() {
         'type': WsInboundType.userMessage,
         'agent_id': 'agt_missing',
         'content': 'x',
-        'session_id': MemoryStore.defaultSessionId,
+        'session_id': TreeStore.defaultSessionId,
       });
       await ws.until(
         (Map<String, dynamic> f) => f['type'] == WsOutboundType.error,
@@ -830,7 +830,7 @@ void main() {
         'type': WsInboundType.userMessage,
         'agent_id': agentId,
         'content': '分片内容' * 40,
-        'session_id': MemoryStore.defaultSessionId,
+        'session_id': TreeStore.defaultSessionId,
       };
       final String raw = jsonEncode(frame);
       final List<String> parts = WsConnection.splitByUtf8Budget(raw, 64);
@@ -858,7 +858,7 @@ void main() {
       );
       final _Res history = await client.send(
         'GET',
-        '/api/conversations/$agentId?session_id=${MemoryStore.defaultSessionId}',
+        '/api/conversations/$agentId?session_id=${TreeStore.defaultSessionId}',
       );
       final List<dynamic> messages = history.json['messages'] as List<dynamic>;
       expect((messages.first as Map<String, dynamic>)['content'], '分片内容' * 40);
@@ -872,13 +872,20 @@ void main() {
       b.record();
       addTearDown(a.close);
       addTearDown(b.close);
+      // 服务端在 upgrade 完成后才登记连接：客户端 connect 返回可能更早，
+      // 因此这里轮询等待，而不是直接断言（否则是竞态型 flaky）
+      final DateTime deadline = DateTime.now().add(const Duration(seconds: 5));
+      while (server.hub.connectionCount < 2 &&
+          DateTime.now().isBefore(deadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
       expect(server.hub.connectionCount, 2);
 
       a.send(<String, dynamic>{
         'type': WsInboundType.userMessage,
         'agent_id': agentId,
         'content': '广播',
-        'session_id': MemoryStore.defaultSessionId,
+        'session_id': TreeStore.defaultSessionId,
       });
       await b.until(
         (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgEnd,
@@ -902,14 +909,14 @@ void main() {
           'type': WsInboundType.userMessage,
           'agent_id': agentId,
           'content': i == 0 ? '一' : '二',
-          'session_id': MemoryStore.defaultSessionId,
+          'session_id': TreeStore.defaultSessionId,
         });
         await ws.untilCount(WsOutboundType.msgEnd, i + 1);
       }
       expect(server.store.totalMessageCount, 4);
       final _Res cleared = await client.send(
         'DELETE',
-        '/api/conversations/$agentId?session_id=${MemoryStore.defaultSessionId}',
+        '/api/conversations/$agentId?session_id=${TreeStore.defaultSessionId}',
       );
       expect(cleared.json['deleted'], 4);
       expect(server.store.totalMessageCount, 0);

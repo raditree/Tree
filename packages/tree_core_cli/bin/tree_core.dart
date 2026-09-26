@@ -20,6 +20,8 @@ import 'package:tree_core/tree_core.dart';
 /// 命令行参数：
 ///   `--port <n>`           监听端口（0 = 内核分配，默认）
 ///   `--chunk-delay-ms <n>` 流式片段间隔毫秒（默认 40，0 = 不限速）
+///   `--data-dir <path>`   数据根目录（默认：平台规范位置，见 TreePaths）
+///   --print-paths         打印解析出的数据根目录后退出
 ///   --no-heartbeat         关闭保活心跳下发
 ///   --verbose              打开请求级日志
 ///   -v, --version          打印版本
@@ -33,15 +35,31 @@ Future<void> main(List<String> args) async {
     stderr.writeln(_usage);
     return;
   }
+  final TreePaths paths = TreePaths.resolve(
+    override: _stringArg(args, '--data-dir'),
+  );
+  if (args.contains('--print-paths')) {
+    stdout.writeln(paths.root);
+    return;
+  }
   final int port = _intArg(args, '--port') ?? 0;
   final int chunkDelayMs = _intArg(args, '--chunk-delay-ms') ?? 40;
   final bool enableHeartbeat = !args.contains('--no-heartbeat');
   final bool verbose = args.contains('--verbose');
 
+  // 落盘装配：存储（agents/sessions/messages）与设置/模型池。核心进程的所有
+  // 状态都在 ~/.tree 下的纯文本文件里，用户可直接查看与手改。
+  void logStore(String message) => stderr.writeln('[core:store] $message');
+  final FileTreeStore store = FileTreeStore(paths, log: logStore);
+  final CoreSettings settings = CoreSettings();
+  FileSettingsSink(paths, log: logStore).load(settings);
+
   final CoreServer server = await CoreServer.start(
     port: port,
     streamChunkDelay: Duration(milliseconds: chunkDelayMs),
     enableHeartbeat: enableHeartbeat,
+    store: store,
+    settings: settings,
   );
   if (verbose) {
     // 访问日志走 stderr（stdout 是进程间协议，绝不能混入日志）
@@ -55,6 +73,7 @@ Future<void> main(List<String> args) async {
     '[tree_core] v${TreeCore.version} listening on '
     '127.0.0.1:${server.port} (pid ${server.processId})',
   );
+  stderr.writeln('[tree_core] 数据目录：${paths.root}');
 
   final Completer<void> shutdown = Completer<void>();
   // 可靠退出通道：stdin 逐行命令（父进程写 `shutdown\n`）。
@@ -123,12 +142,20 @@ int? _intArg(List<String> args, String name) {
   return int.tryParse(args[index + 1]);
 }
 
+String? _stringArg(List<String> args, String name) {
+  final int index = args.indexOf(name);
+  if (index < 0 || index + 1 >= args.length) return null;
+  return args[index + 1];
+}
+
 const String _usage = '''
 tree_core — Tree 桌面端核心进程（本地回环 HTTP + WS）
 
 用法: tree_core [选项]
   --port <n>             监听端口（0 = 内核分配，默认）
   --chunk-delay-ms <n>   流式片段间隔毫秒（默认 40）
+  --data-dir <path>      数据根目录（默认：%APPDATA%\\Tree 等平台规范位置）
+  --print-paths          打印解析出的数据根目录后退出
   --no-heartbeat         关闭保活心跳下发
   --verbose              打开请求级日志
   -v, --version          打印版本

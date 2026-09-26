@@ -1,252 +1,11 @@
 import '../util/ids.dart';
-import '../util/json_time.dart';
+import 'tree_store.dart';
 
-/// agent 记录（现状 server `agents` 表的桌面替身）。
+/// 纯内存存储（M1 起作为测试与"无落盘"场景的实现）。
 ///
-/// `toJson` 是**持久化形态**（M2 落 `~/.tree/agents/<id>.yaml`，时间用
-/// ISO 字符串便于人读）；`toApiJson` 是**前端形态**（字段名与现状 server
-/// 的 `GET /api/agents` 一致，时间用毫秒整数）。
-class CoreAgent {
-  CoreAgent({
-    required this.id,
-    required this.name,
-    required this.createdAt,
-    required this.updatedAt,
-    this.systemPrompt = '',
-    this.modelId = '',
-    this.workspaceId = '',
-    this.teamMemberCount = 0,
-    this.maxLevel = 1,
-    this.maxMembersPerLevel = 0,
-  });
-
-  final String id;
-  String name;
-  String systemPrompt;
-  String modelId;
-  String workspaceId;
-  int teamMemberCount;
-  int maxLevel;
-  int maxMembersPerLevel;
-  final int createdAt;
-  int updatedAt;
-
-  /// 持久化形态。
-  Map<String, dynamic> toJson() => <String, dynamic>{
-    'id': id,
-    'name': name,
-    'system_prompt': systemPrompt,
-    'model_id': modelId,
-    'workspace_id': workspaceId,
-    'team_member_count': teamMemberCount,
-    'max_level': maxLevel,
-    'max_members_per_level': maxMembersPerLevel,
-    'created_at': JsonTime.encode(createdAt),
-    'updated_at': JsonTime.encode(updatedAt),
-  };
-
-  /// 从前端形态或持久化形态还原（两种形态字段名一致，仅时间表示不同）。
-  static CoreAgent fromJson(Map<String, dynamic> json) {
-    final int now = DateTime.now().millisecondsSinceEpoch;
-    return CoreAgent(
-      id: json['id'] as String? ?? CoreIds.agent(),
-      name: json['name'] as String? ?? '',
-      systemPrompt: json['system_prompt'] as String? ?? '',
-      modelId: json['model_id'] as String? ?? '',
-      workspaceId: json['workspace_id'] as String? ?? '',
-      teamMemberCount: (json['team_member_count'] as num?)?.toInt() ?? 0,
-      maxLevel: (json['max_level'] as num?)?.toInt() ?? 1,
-      maxMembersPerLevel: (json['max_members_per_level'] as num?)?.toInt() ?? 0,
-      createdAt: JsonTime.decode(json['created_at']) ?? now,
-      updatedAt: JsonTime.decode(json['updated_at']) ?? now,
-    );
-  }
-
-  /// 前端形态（`GET /api/agents` 列表项与创建响应）。
-  Map<String, dynamic> toApiJson({
-    String lastMessage = '',
-    int? lastMessageTime,
-    int unreadCount = 0,
-    int pendingMemberCount = 0,
-  }) => <String, dynamic>{
-    'id': id,
-    'name': name,
-    'type': 'normal',
-    'system_prompt': systemPrompt,
-    'model_id': modelId,
-    'workspace_id': workspaceId,
-    'last_message': lastMessage,
-    'last_message_time': lastMessageTime,
-    'unread_count': unreadCount,
-    'avatar_url': null,
-    'pending_member_count': pendingMemberCount,
-    'created_at': createdAt,
-    'updated_at': updatedAt,
-  };
-}
-
-/// 会话记录（现状 server `sessions` 表的桌面替身）。
-class CoreSession {
-  CoreSession({
-    required this.sessionId,
-    required this.agentId,
-    required this.title,
-    required this.createdAt,
-    required this.updatedAt,
-    this.status = 'active',
-    List<String>? selectedSpecIds,
-  }) : selectedSpecIds = selectedSpecIds ?? <String>[];
-
-  /// 兜底默认会话 id（与前端 `_currentSessionId` 的缺省值一致）。
-  static const String defaultSessionId = 'session_default';
-
-  final String sessionId;
-  final String agentId;
-  String title;
-  String status;
-  final int createdAt;
-  int updatedAt;
-  List<String> selectedSpecIds;
-
-  /// 是否为兜底默认会话。
-  bool get isDefault => sessionId == defaultSessionId;
-
-  Map<String, dynamic> toJson() => <String, dynamic>{
-    'session_id': sessionId,
-    'agent_id': agentId,
-    'title': title,
-    'status': status,
-    'selected_spec_ids': selectedSpecIds,
-    'created_at': JsonTime.encode(createdAt),
-    'updated_at': JsonTime.encode(updatedAt),
-  };
-
-  static CoreSession fromJson(Map<String, dynamic> json) {
-    final int now = DateTime.now().millisecondsSinceEpoch;
-    return CoreSession(
-      sessionId: json['session_id'] as String? ?? defaultSessionId,
-      agentId: json['agent_id'] as String? ?? '',
-      title: json['title'] as String? ?? '新会话',
-      status: json['status'] as String? ?? 'active',
-      selectedSpecIds:
-          (json['selected_spec_ids'] as List<dynamic>?)
-              ?.map((dynamic e) => e.toString())
-              .toList() ??
-          <String>[],
-      createdAt: JsonTime.decode(json['created_at']) ?? now,
-      updatedAt: JsonTime.decode(json['updated_at']) ?? now,
-    );
-  }
-
-  Map<String, dynamic> toApiJson({int messageCount = 0}) => <String, dynamic>{
-    'session_id': sessionId,
-    'agent_id': agentId,
-    'title': title,
-    'status': status,
-    'selected_spec_ids': selectedSpecIds,
-    'message_count': messageCount,
-    'created_at': createdAt,
-    'updated_at': updatedAt,
-  };
-}
-
-/// 消息记录（现状 server `messages` 表的桌面替身）。
-///
-/// 形态即前端 `ChatMessage.fromJson` 的输入（`GET /api/conversations/...`
-/// 与 WS `message` 帧共用），因此 [toJson] 同时是持久化形态与 API 形态。
-class CoreMessage {
-  CoreMessage({
-    required this.id,
-    required this.agentId,
-    required this.sessionId,
-    required this.role,
-    required this.content,
-    required this.timestamp,
-    this.kind = 'text',
-    this.toolName,
-    this.toolArguments,
-    this.toolResult = '',
-    this.usage,
-    this.attachments,
-    this.options,
-    this.answered = false,
-  });
-
-  final String id;
-  final String agentId;
-  final String sessionId;
-  final String role;
-  final String content;
-  final int timestamp;
-  final String kind;
-  final String? toolName;
-  final Map<String, dynamic>? toolArguments;
-  final String toolResult;
-  final Map<String, dynamic>? usage;
-  final List<Map<String, dynamic>>? attachments;
-  final List<String>? options;
-  final bool answered;
-
-  bool get isTool => kind == 'tool';
-
-  Map<String, dynamic> toJson() => <String, dynamic>{
-    'id': id,
-    'agent_id': agentId,
-    'session_id': sessionId,
-    'role': role,
-    'content': content,
-    'timestamp': JsonTime.encode(timestamp),
-    'kind': kind,
-    'tool_name': toolName,
-    'tool_arguments': toolArguments,
-    'tool_result': toolResult,
-    'usage': usage,
-    'attachments': attachments,
-    'options': options ?? const <String>[],
-    'answered': answered,
-    'is_streaming': false,
-  };
-
-  static CoreMessage fromJson(Map<String, dynamic> json) {
-    return CoreMessage(
-      id: json['id'] as String? ?? CoreIds.message(),
-      agentId: json['agent_id'] as String? ?? '',
-      sessionId: json['session_id'] as String? ?? CoreSession.defaultSessionId,
-      role: json['role'] as String? ?? 'agent',
-      content: json['content'] as String? ?? '',
-      timestamp:
-          JsonTime.decode(json['timestamp']) ??
-          DateTime.now().millisecondsSinceEpoch,
-      kind: json['kind'] as String? ?? 'text',
-      toolName: json['tool_name'] as String?,
-      toolArguments: (json['tool_arguments'] as Map<dynamic, dynamic>?)?.map(
-        (dynamic k, dynamic v) => MapEntry(k.toString(), v),
-      ),
-      toolResult: json['tool_result'] as String? ?? '',
-      usage: (json['usage'] as Map<dynamic, dynamic>?)?.map(
-        (dynamic k, dynamic v) => MapEntry(k.toString(), v),
-      ),
-      attachments: (json['attachments'] as List<dynamic>?)
-          ?.map(
-            (dynamic e) =>
-                Map<String, dynamic>.from(e as Map<dynamic, dynamic>),
-          )
-          .toList(),
-      options: (json['options'] as List<dynamic>?)
-          ?.map((dynamic e) => e.toString())
-          .toList(),
-      answered: json['answered'] as bool? ?? false,
-    );
-  }
-}
-
-/// 纯内存存储（M1 骨架 -> M2 落盘）。
-///
-/// **接口即契约**：M2 会用 `~/.tree` 下的 `config/*.yaml` + 每会话一个
-/// `session.json` / `messages.jsonl` 实现同一组方法，调用方（HTTP 路由、
-/// WS 会话服务）无需改动。因此这里刻意不暴露任何 Map 细节，只提供
-/// 语义化操作与 [toJson] / [fromJson] 记录，便于 M2 直接复用序列化格式。
-class MemoryStore {
+/// 与落盘实现（`FileTreeStore`）共享同一份契约测试，因此业务代码不会依赖
+/// 任何内存实现特有的行为。
+class MemoryStore implements TreeStore {
   /// 默认会话 id（与前端 `_currentSessionId` 的兜底值一致）。
   static const String defaultSessionId = CoreSession.defaultSessionId;
 
@@ -257,11 +16,14 @@ class MemoryStore {
 
   // ── agent ────────────────────────────────────────────────────────────
 
+  @override
   List<CoreAgent> agents() => _agents.values.toList()
     ..sort((CoreAgent a, CoreAgent b) => b.updatedAt.compareTo(a.updatedAt));
 
+  @override
   CoreAgent? agent(String id) => _agents[id];
 
+  @override
   CoreAgent createAgent({
     required String name,
     String systemPrompt = '',
@@ -290,12 +52,13 @@ class MemoryStore {
     return agent;
   }
 
+  @override
   void putAgent(CoreAgent agent) {
     _agents[agent.id] = agent;
     ensureDefaultSession(agent.id);
   }
 
-  /// 更新 agent；仅当传入非 null 的字段被覆盖。
+  @override
   CoreAgent? updateAgent(
     String id, {
     String? name,
@@ -311,6 +74,7 @@ class MemoryStore {
     return agent;
   }
 
+  @override
   bool deleteAgent(String id) {
     if (_agents.remove(id) == null) return false;
     _sessions.removeWhere((_, CoreSession s) => s.agentId == id);
@@ -318,7 +82,7 @@ class MemoryStore {
     return true;
   }
 
-  /// 该 agent 最近一条文本消息（列表页预览用）。
+  @override
   CoreMessage? lastTextMessage(String agentId) {
     CoreMessage? latest;
     for (final MapEntry<String, List<CoreMessage>> entry in _messages.entries) {
@@ -331,21 +95,22 @@ class MemoryStore {
     return latest;
   }
 
-  // ── session ──────────────────────────────────────────────────────────
+  // ── 会话 ─────────────────────────────────────────────────────────────
 
+  @override
   List<CoreSession> sessions(String agentId) =>
       _sessions.values.where((CoreSession s) => s.agentId == agentId).toList()
         ..sort(
           (CoreSession a, CoreSession b) => b.updatedAt.compareTo(a.updatedAt),
         );
 
+  @override
   CoreSession? session(String agentId, String sessionId) {
     final CoreSession? session = _sessions[sessionId];
     return (session != null && session.agentId == agentId) ? session : null;
   }
 
-  /// 兜底默认会话：前端在无会话时回退 `session_default`，故每个 agent
-  /// 建立时即保证该会话存在（对齐现状 server 的 `list_sessions` 行为）。
+  @override
   CoreSession ensureDefaultSession(String agentId) {
     final CoreSession? existing = session(agentId, defaultSessionId);
     if (existing != null) return existing;
@@ -361,6 +126,7 @@ class MemoryStore {
     return created;
   }
 
+  @override
   CoreSession? createSession(
     String agentId, {
     String title = '',
@@ -383,6 +149,7 @@ class MemoryStore {
     return created;
   }
 
+  @override
   bool renameSession(String agentId, String sessionId, String title) {
     final CoreSession? session = this.session(agentId, sessionId);
     if (session == null) return false;
@@ -391,6 +158,7 @@ class MemoryStore {
     return true;
   }
 
+  @override
   bool deleteSession(String agentId, String sessionId) {
     final CoreSession? session = this.session(agentId, sessionId);
     if (session == null) return false;
@@ -399,6 +167,7 @@ class MemoryStore {
     return true;
   }
 
+  @override
   int setSelectedSpecs(String agentId, String sessionId, List<String> specIds) {
     final CoreSession? session = this.session(agentId, sessionId);
     if (session == null) return 0;
@@ -406,37 +175,42 @@ class MemoryStore {
     return session.selectedSpecIds.length;
   }
 
-  // ── message ──────────────────────────────────────────────────────────
+  // ── 消息 ─────────────────────────────────────────────────────────────
 
   static String _messagesKey(String agentId, String sessionId) =>
       '$agentId::$sessionId';
 
+  @override
   List<CoreMessage> messages(String agentId, String sessionId) =>
       List<CoreMessage>.unmodifiable(
         _messages[_messagesKey(agentId, sessionId)] ?? const <CoreMessage>[],
       );
 
-  /// 该会话的「有效消息数」：仅统计文本消息（工具卡片不计入）。
-  ///
-  /// 前端用 `message_count > 0` 判定该 agent 是否已开始过对话（运行模式
-  /// 锁定），工具卡片不算对话开始，故与文本消息口径对齐。
+  @override
   int messageCount(String agentId, String sessionId) =>
       messages(agentId, sessionId).where((CoreMessage m) => !m.isTool).length;
 
+  @override
   CoreMessage appendMessage(CoreMessage message) {
     final List<CoreMessage> list = _messages.putIfAbsent(
       _messagesKey(message.agentId, message.sessionId),
       () => <CoreMessage>[],
     );
     list.add(message);
+    // updated_at 只前进不后退：消息时间戳理论上递增，但导入/补投的历史消息可能
+    // 更旧，此时不应把"最近活跃时间"改回去
     final CoreSession? session = _sessions[message.sessionId];
-    if (session != null) session.updatedAt = message.timestamp;
+    if (session != null && message.timestamp > session.updatedAt) {
+      session.updatedAt = message.timestamp;
+    }
     final CoreAgent? agent = _agents[message.agentId];
-    if (agent != null) agent.updatedAt = message.timestamp;
+    if (agent != null && message.timestamp > agent.updatedAt) {
+      agent.updatedAt = message.timestamp;
+    }
     return message;
   }
 
-  /// 清空某会话消息；[sessionId] 为 null 或 'all' 时清空该 agent 全部会话。
+  @override
   int clearMessages(String agentId, {String? sessionId}) {
     if (sessionId == null || sessionId.isEmpty || sessionId == 'all') {
       int deleted = 0;
@@ -453,9 +227,15 @@ class MemoryStore {
     return removed?.length ?? 0;
   }
 
-  /// 全部 agent 的消息总量（自检/日志用）。
+  @override
   int get totalMessageCount => _messages.values.fold<int>(
     0,
     (int sum, List<CoreMessage> list) => sum + list.length,
   );
+
+  @override
+  Future<void> flush() async {}
+
+  @override
+  Future<void> close() async {}
 }

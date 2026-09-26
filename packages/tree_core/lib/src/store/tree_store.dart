@@ -1,0 +1,113 @@
+import 'records.dart';
+
+export 'records.dart';
+
+/// 核心进程的存储契约（agent / 会话 / 消息）。
+///
+/// **接口即契约**：M1 的内存实现（[MemoryStore]）与 M2 的落盘实现
+/// （`FileTreeStore`）都实现本接口，HTTP 路由与会话服务只依赖接口，因此
+/// "换持久化"不影响任何业务代码。两份实现由同一套**契约测试**
+/// （`test/store_contract.dart`）双向约束，避免行为漂移。
+///
+/// **写语义（重要）**：写操作先改内存缓存、返回结果，再把落盘任务排入
+/// **每文件串行**的写队列（write-behind）。理由与代价：
+/// - 单用户本机应用，写延迟不该阻塞 WS 流式对话；
+/// - 队列保证同一文件的写入顺序与调用顺序一致；
+/// - [flush] 等待全部落盘，**关停与测试必须调用**；
+/// - 因此"进程被硬杀"最多丢失最后若干次尚未落盘的写入（已 flush 的不受影响）。
+abstract interface class TreeStore {
+  /// 兜底默认会话 id（前端在无会话时回退该值）。
+  static const String defaultSessionId = CoreSession.defaultSessionId;
+
+  // ── agent ────────────────────────────────────────────────────────────
+
+  /// 全部 agent（按 `updated_at` 倒序，最近活跃在前）。
+  List<CoreAgent> agents();
+
+  /// 按 id 取 agent；不存在返回 null。
+  CoreAgent? agent(String id);
+
+  /// 新建 agent 并保证其兜底默认会话存在。
+  CoreAgent createAgent({
+    required String name,
+    String systemPrompt = '',
+    String modelId = '',
+    int teamMemberCount = 0,
+    int maxLevel = 1,
+    int maxMembersPerLevel = 0,
+  });
+
+  /// 直接写入/覆盖一个 agent 记录（持久化层装载用，也用于测试构造）。
+  void putAgent(CoreAgent agent);
+
+  /// 更新 agent；仅当传入非 null 的字段被覆盖。不存在返回 null。
+  CoreAgent? updateAgent(
+    String id, {
+    String? name,
+    String? systemPrompt,
+    String? modelId,
+  });
+
+  /// 删除 agent 及其全部会话与消息。
+  bool deleteAgent(String id);
+
+  /// 该 agent 最近一条**文本**消息（列表页预览用）；无则 null。
+  CoreMessage? lastTextMessage(String agentId);
+
+  // ── 会话 ─────────────────────────────────────────────────────────────
+
+  /// 某 agent 的全部会话（`updated_at` 倒序）。
+  List<CoreSession> sessions(String agentId);
+
+  /// 按 (agent, session) 取会话；不存在返回 null。
+  CoreSession? session(String agentId, String sessionId);
+
+  /// 确保兜底默认会话存在（幂等），返回该会话。
+  CoreSession ensureDefaultSession(String agentId);
+
+  /// 新建会话；agent 不存在返回 null，sessionId 已存在时返回既有会话。
+  CoreSession? createSession(
+    String agentId, {
+    String title = '',
+    String? sessionId,
+  });
+
+  /// 重命名会话；不存在返回 false。
+  bool renameSession(String agentId, String sessionId, String title);
+
+  /// 删除会话及其消息；不存在返回 false。
+  bool deleteSession(String agentId, String sessionId);
+
+  /// 设置会话选中的 Spec 列表（M5 交付 Spec 体系前只做存取）。
+  int setSelectedSpecs(String agentId, String sessionId, List<String> specIds);
+
+  // ── 消息 ─────────────────────────────────────────────────────────────
+
+  /// 某会话的全部消息（按写入顺序）。
+  List<CoreMessage> messages(String agentId, String sessionId);
+
+  /// 该会话的「有效消息数」：仅统计文本消息（工具卡片不计入）。
+  ///
+  /// 前端用 `message_count > 0` 判定该 agent 是否已开始过对话（运行模式
+  /// 锁定），工具卡片不算对话开始，故与文本消息口径对齐。
+  int messageCount(String agentId, String sessionId);
+
+  /// 追加一条消息（同时更新所属会话与 agent 的 `updated_at`）。
+  CoreMessage appendMessage(CoreMessage message);
+
+  /// 清空消息；`sessionId` 为 null/空/`all` 时清空该 agent 全部会话。
+  /// 返回被删除的消息条数。
+  int clearMessages(String agentId, {String? sessionId});
+
+  /// **本进程已知**的消息总数（已加载/已写入；不扫描未加载的历史文件）。
+  /// 仅用于自检与日志，不保证等于磁盘上的历史总量。
+  int get totalMessageCount;
+
+  // ── 生命周期 ─────────────────────────────────────────────────────────
+
+  /// 等待全部在途落盘任务完成（关停与测试必须调用）。
+  Future<void> flush();
+
+  /// flush 并释放资源（幂等）。
+  Future<void> close();
+}

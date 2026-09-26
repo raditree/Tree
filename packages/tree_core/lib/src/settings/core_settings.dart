@@ -144,7 +144,30 @@ class CoreModelConfig {
   int get effectiveMaxSeqlen => maxSeqlen > 0 ? maxSeqlen : 128000;
 }
 
-/// 核心进程的设置集合（M1 全内存，M2 落 `~/.tree/config/settings.yaml`）。
+/// 设置落盘后端（M2 起由 `FileSettingsSink` 提供）。
+///
+/// 设置层只声明"该保存了"，不认识文件系统；`FileSettingsSink` 负责序列化与
+/// write-behind 排队。测试与"无落盘"场景把 [CoreSettings.sink] 留空即可。
+abstract interface class CoreSettingsSink {
+  /// 保存全局设置（`config/settings.yaml`）。
+  void saveSettings(CoreSettings settings);
+
+  /// 保存单个模型配置（`config/models/<model_id>.yaml`）。
+  void saveModel(CoreModelConfig model);
+
+  /// 删除模型配置文件。
+  void deleteModel(String modelId);
+
+  /// 等待全部在途落盘（关停与测试用）。
+  Future<void> flush();
+}
+
+/// 核心进程的设置集合。
+///
+/// 两个设计点直接服务"用户绕开 UI 直接改配置文件"：
+/// - 读取用 [_bool]/[_int] 做宽容转换，手写 `"true"` / `1` 也能生效；
+/// - **未知键原样保留**在 [extra] 中并在保存时写回，用户自己加的配置项不会
+///   被界面操作悄悄抹掉。
 ///
 /// 说明：`dataCollection` 在桌面单用户形态下**没有收集方**，保留该开关
 /// 只为兼容既有设置页；M7 删除设置页对应卡片后应一并移除。
@@ -155,12 +178,70 @@ class CoreSettings {
   /// 流式帧率上限。
   static const int frameRateMax = 1000;
 
-  bool rateLimitEnabled = false;
-  bool dataCollectionEnabled = false;
-  bool messageCutinDirect = false;
-  int frameRate = frameRateMin;
+  /// 落盘后端；为 null 时所有改动只留在内存（测试/无盘场景）。
+  CoreSettingsSink? sink;
+
+  /// settings.yaml 中**不属于已知键**的内容（原样保留并写回）。
+  Map<String, dynamic> extra = <String, dynamic>{};
+
+  bool _rateLimitEnabled = false;
+  bool _dataCollectionEnabled = false;
+  bool _messageCutinDirect = false;
+  int _frameRate = frameRateMin;
+
+  /// 是否开启主动延迟（限制单 agent 的 API 调用频率）。
+  bool get rateLimitEnabled => _rateLimitEnabled;
+
+  set rateLimitEnabled(bool value) {
+    if (_rateLimitEnabled == value) return;
+    _rateLimitEnabled = value;
+    sink?.saveSettings(this);
+  }
+
+  /// 是否允许收集使用数据（桌面形态下无收集方，见类文档）。
+  bool get dataCollectionEnabled => _dataCollectionEnabled;
+
+  set dataCollectionEnabled(bool value) {
+    if (_dataCollectionEnabled == value) return;
+    _dataCollectionEnabled = value;
+    sink?.saveSettings(this);
+  }
+
+  /// 消息切入模式：true = 直接切入，false = 串行排队。
+  bool get messageCutinDirect => _messageCutinDirect;
+
+  set messageCutinDirect(bool value) {
+    if (_messageCutinDirect == value) return;
+    _messageCutinDirect = value;
+    sink?.saveSettings(this);
+  }
+
+  /// 流式帧率（帧/秒）。
+  int get frameRate => _frameRate;
 
   final Map<String, CoreModelConfig> _models = <String, CoreModelConfig>{};
+
+  /// 从 settings.yaml 的映射装载（未知键进入 [extra]）。
+  void applyMap(Map<String, dynamic> map) {
+    _frameRate = _clampFrameRate(_int(map, 'frame_rate', frameRateMin));
+    _rateLimitEnabled = _bool(map, 'rate_limit_enabled', false);
+    _dataCollectionEnabled = _bool(map, 'data_collection_enabled', false);
+    _messageCutinDirect = _bool(map, 'message_cutin_direct', false);
+    extra = Map<String, dynamic>.from(map)
+      ..remove('frame_rate')
+      ..remove('rate_limit_enabled')
+      ..remove('data_collection_enabled')
+      ..remove('message_cutin_direct');
+  }
+
+  /// 序列化为 settings.yaml 的映射（已知键 + [extra] 保留的未知键）。
+  Map<String, dynamic> toMap() => <String, dynamic>{
+    ...extra,
+    'frame_rate': _frameRate,
+    'rate_limit_enabled': _rateLimitEnabled,
+    'data_collection_enabled': _dataCollectionEnabled,
+    'message_cutin_direct': _messageCutinDirect,
+  };
 
   /// 模型列表（按 model_id 排序，稳定可预测）。
   List<CoreModelConfig> models() {
@@ -174,6 +255,7 @@ class CoreSettings {
 
   CoreModelConfig? model(String modelId) => _models[modelId];
 
+  /// 直接放入模型（装载用；不触发落盘）。
   void putModel(CoreModelConfig model) => _models[model.modelId] = model;
 
   /// 新建模型；`model_id` 已存在时返回 null（调用方回 409）。
@@ -183,6 +265,7 @@ class CoreSettings {
     final CoreModelConfig model = CoreModelConfig(modelId: modelId);
     model.merge(payload);
     _models[modelId] = model;
+    sink?.saveModel(model);
     return model;
   }
 
@@ -191,11 +274,16 @@ class CoreSettings {
     final CoreModelConfig? model = _models[modelId];
     if (model == null) return null;
     model.merge(payload);
+    sink?.saveModel(model);
     return model;
   }
 
   /// 删除模型；返回是否真的删除了条目。
-  bool deleteModel(String modelId) => _models.remove(modelId) != null;
+  bool deleteModel(String modelId) {
+    final bool removed = _models.remove(modelId) != null;
+    if (removed) sink?.deleteModel(modelId);
+    return removed;
+  }
 
   /// 校验新增模型必填项（与前端拦截一致：base_url / api_key 必填）。
   static String? validateNewModel(Map<String, dynamic> payload) {
@@ -210,9 +298,35 @@ class CoreSettings {
 
   /// 帧率夹取到 [frameRateMin, frameRateMax]。
   int setFrameRate(int value) {
-    frameRate = value < frameRateMin
-        ? frameRateMin
-        : (value > frameRateMax ? frameRateMax : value);
-    return frameRate;
+    _frameRate = _clampFrameRate(value);
+    sink?.saveSettings(this);
+    return _frameRate;
+  }
+
+  static int _clampFrameRate(int value) => value < frameRateMin
+      ? frameRateMin
+      : (value > frameRateMax ? frameRateMax : value);
+
+  static bool _bool(Map<String, dynamic> map, String key, bool fallback) {
+    final Object? value = map[key];
+    if (value is bool) return value;
+    if (value is String) {
+      final String text = value.trim().toLowerCase();
+      if (text == 'true' || text == 'yes' || text == 'on' || text == '1') {
+        return true;
+      }
+      if (text == 'false' || text == 'no' || text == 'off' || text == '0') {
+        return false;
+      }
+    }
+    if (value is num) return value != 0;
+    return fallback;
+  }
+
+  static int _int(Map<String, dynamic> map, String key, int fallback) {
+    final Object? value = map[key];
+    if (value is num) return value.toInt();
+    if (value is String) return int.tryParse(value.trim()) ?? fallback;
+    return fallback;
   }
 }

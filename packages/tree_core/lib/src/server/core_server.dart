@@ -8,6 +8,7 @@ import '../agent/conversation_service.dart';
 import '../agent/scripted_agent.dart';
 import '../settings/core_settings.dart';
 import '../store/memory_store.dart';
+import '../store/tree_store.dart';
 import '../util/token.dart';
 import '../version.dart';
 import '../ws/inbound_frames.dart';
@@ -82,8 +83,8 @@ class CoreServer {
   /// 本次运行的一次性本地 token。
   final String token;
 
-  /// 内存存储（M2 换持久化实现）。
-  final MemoryStore store;
+  /// 存储（默认内存实现；CLI 注入 `FileTreeStore` 落 `~/.tree`）。
+  final TreeStore store;
 
   /// 设置与模型池。
   final CoreSettings settings;
@@ -150,7 +151,7 @@ class CoreServer {
     Duration streamChunkDelay = const Duration(milliseconds: 40),
     bool enableHeartbeat = true,
     Duration heartbeatInterval = const Duration(seconds: 30),
-    MemoryStore? store,
+    TreeStore? store,
     CoreSettings? settings,
     ReplyEngine? engine,
   }) async {
@@ -160,7 +161,7 @@ class CoreServer {
     );
     // 静态方法内 `pid` 即 `dart:io` 顶层 getter（本类字段名为 processId，无遮蔽）
     final int currentPid = pid;
-    final MemoryStore resolvedStore = store ?? MemoryStore();
+    final TreeStore resolvedStore = store ?? MemoryStore();
     final CoreSettings resolvedSettings = settings ?? CoreSettings();
     final WsHub hub = WsHub();
     final CoreServer server = CoreServer._(
@@ -195,6 +196,8 @@ class CoreServer {
     conversation.dispose();
     reassembler.clear();
     await hub.closeAll();
+    // 先把在途落盘任务写完再关闭监听（write-behind 的收尾）
+    await store.flush();
     await _http.close(force: force);
   }
 
@@ -726,8 +729,7 @@ class CoreServer {
       return;
     }
     final String sessionId =
-        request.uri.queryParameters['session_id'] ??
-        MemoryStore.defaultSessionId;
+        request.uri.queryParameters['session_id'] ?? TreeStore.defaultSessionId;
     final List<CoreMessage> messages = (sessionId == 'all')
         ? <CoreMessage>[
             for (final CoreSession s in store.sessions(agentId))
@@ -788,7 +790,7 @@ class CoreServer {
     final String agentId = params['agentId'] ?? '';
     final CoreSession? session = store.session(
       agentId,
-      request.uri.queryParameters['session_id'] ?? MemoryStore.defaultSessionId,
+      request.uri.queryParameters['session_id'] ?? TreeStore.defaultSessionId,
     );
     // Spec 体系（可挂载的能力声明文件）由 M5 交付；M1 返回空索引
     await writeJson(request, 200, <String, dynamic>{

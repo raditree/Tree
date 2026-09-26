@@ -17,8 +17,13 @@ import 'package:tree_protocol/tree_protocol.dart';
 ///    会留下孤儿核心进程。
 void main() {
   test('CLI 启动核心：单行握手 + 鉴权 HTTP 可用 + shutdown 命令优雅退出', () async {
-    final _CoreProcess core = await _CoreProcess.start();
+    // 显式隔离数据目录：绝不写真实用户的 %APPDATA%\Tree
+    final Directory tempData = Directory.systemTemp.createTempSync('tree_cli_');
+    final _CoreProcess core = await _CoreProcess.start(dataDir: tempData.path);
     addTearDown(core.dispose);
+    addTearDown(() {
+      if (tempData.existsSync()) tempData.deleteSync(recursive: true);
+    });
 
     final CoreHandshake handshake = core.handshake;
     expect(handshake.port, greaterThan(0));
@@ -55,13 +60,34 @@ void main() {
       hasLength(1),
       reason: 'stdout 被非协议输出污染：${core.stdoutLines}',
     );
-    // 人类可读日志走 stderr
-    expect(core.stderrLines.join('\n'), contains('listening on'));
+    // 人类可读日志走 stderr（含数据目录提示）
+    final String stderrText = core.stderrLines.join('\n');
+    expect(stderrText, contains('listening on'));
+    expect(stderrText, contains('数据目录'));
+
+    // 启动即建好 ~/.tree 目录骨架，方便用户直接打开查看/手改
+    final String sep = Platform.pathSeparator;
+    for (final String sub in <String>[
+      'config',
+      'config${sep}models',
+      'agents',
+      'data',
+    ]) {
+      expect(
+        Directory('${tempData.path}$sep$sub').existsSync(),
+        isTrue,
+        reason: '缺少目录：$sub',
+      );
+    }
   }, timeout: const Timeout(Duration(minutes: 3)));
 
   test('stdin 关闭（无控制通道）不会终止核心进程', () async {
-    final _CoreProcess core = await _CoreProcess.start();
+    final Directory tempData = Directory.systemTemp.createTempSync('tree_cli_');
+    final _CoreProcess core = await _CoreProcess.start(dataDir: tempData.path);
     addTearDown(core.dispose);
+    addTearDown(() {
+      if (tempData.existsSync()) tempData.deleteSync(recursive: true);
+    });
     // 模拟 Start-Process / 任务计划 / 双击：父进程不提供 stdin
     await core.process.stdin.close();
     // 给足退出时机：若 EOF 被当成退出信号，进程会在此窗口内消失
@@ -78,17 +104,20 @@ void main() {
 
 /// 已启动并完成握手的核心子进程。
 class _CoreProcess {
-  _CoreProcess._(this.process, this.handshake);
+  _CoreProcess._(this.process, this.handshake, this.dataDir);
 
   final Process process;
   final CoreHandshake handshake;
+
+  /// 传入的数据根目录（null = 平台默认，测试始终显式传入以避免写到真实用户目录）。
+  final String? dataDir;
   final List<String> stdoutLines = <String>[];
   final List<String> stderrLines = <String>[];
   late final HttpClient _client;
   late final StreamSubscription<String> _outSub;
   late final StreamSubscription<String> _errSub;
 
-  static Future<_CoreProcess> start() async {
+  static Future<_CoreProcess> start({String? dataDir}) async {
     final Process process = await Process.start(
       Platform.resolvedExecutable,
       <String>[
@@ -97,6 +126,7 @@ class _CoreProcess {
         '--chunk-delay-ms',
         '0',
         '--no-heartbeat',
+        if (dataDir != null) ...<String>['--data-dir', dataDir],
       ],
       workingDirectory: Directory.current.path,
     );
@@ -104,6 +134,7 @@ class _CoreProcess {
       process,
       // 占位，随后被真实握手替换
       const CoreHandshake(port: 0, token: '', pid: 0, version: ''),
+      dataDir,
     );
     core._outSub = process.stdout
         .transform(utf8.decoder)
@@ -115,7 +146,7 @@ class _CoreProcess {
         .listen(core.stderrLines.add);
     core._client = HttpClient();
     final CoreHandshake handshake = await _waitForHandshake(core);
-    return _CoreProcess._(process, handshake)
+    return _CoreProcess._(process, handshake, dataDir)
       ..stdoutLines.addAll(core.stdoutLines)
       ..stderrLines.addAll(core.stderrLines)
       .._outSub = core._outSub
