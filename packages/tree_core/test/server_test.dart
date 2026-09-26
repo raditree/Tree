@@ -273,14 +273,16 @@ void main() {
       expect((await client.send('GET', '/api/nope')).status, 404);
       expect(server.notFoundRequests, 1);
 
-      final _Res stub = await client.send('GET', '/api/files/ws_1');
+      // 注意：`/api/files/*` 的读路径与 Git 路径已在 M7d 实现，这里改探仍未实现的
+      // 写路径（上传），否则测的是"已实现路由"而不是"501 桩"。
+      final _Res stub = await client.send('GET', '/api/files/ws_1/upload_init');
       expect(stub.status, 501);
       expect((stub.json['detail'] as String), contains('功能开发中'));
       expect(server.stubRequests, 1);
 
       // 桩对所有方法一致（POST/PATCH/DELETE 同样 501）
       expect(
-        (await client.send('POST', '/api/workspaces/ws_1/git/log')).status,
+        (await client.send('POST', '/api/files/ws_1/upload_init')).status,
         501,
       );
     });

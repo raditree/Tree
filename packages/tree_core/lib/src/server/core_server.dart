@@ -10,6 +10,7 @@ import '../agent/conversation_service.dart';
 import '../agent/question_broker.dart';
 import '../agent/question_store.dart';
 import '../agent/scripted_agent.dart';
+import '../files/file_service.dart';
 import '../mcp/mcp_client.dart';
 import '../mcp/mcp_service.dart';
 import '../plugin/plugin_bus.dart';
@@ -56,6 +57,7 @@ class CoreServer {
     required this.specIoFor,
     required this.mcpService,
     required this.pluginBus,
+    required this.fileService,
     required this.hub,
     required this.questions,
     required this.conversation,
@@ -75,16 +77,13 @@ class CoreServer {
   ///   `fileSyncToLocal`（M4 本地执行 + M7 文档能力）
   /// - Git 历史：`workspaceGitLog` / `workspaceGitBranches`（M4）
   static const Set<String> stubApiPaths = <String>{
-    ApiPaths.files,
-    ApiPaths.fileContent,
-    ApiPaths.filePdfInfo,
+    // PDF 预览需要 PDF 光栅化（纯 Dart 无此能力，待决策）；上传/同步属写路径，
+    // 留待与下载一起做（M7d-2）
     ApiPaths.filePdfPreview,
     ApiPaths.fileUploadInit,
     ApiPaths.fileUploadChunk,
     ApiPaths.fileUploadComplete,
     ApiPaths.fileSyncToLocal,
-    ApiPaths.workspaceGitLog,
-    ApiPaths.workspaceGitBranches,
   };
 
   final HttpServer _http;
@@ -124,6 +123,9 @@ class CoreServer {
 
   /// 插件总线（M6b）；为 null 时快照返回 `enabled: false` 空集。
   final PluginBus? pluginBus;
+
+  /// 工作空间文件服务（M7d）；为 null 时文件路由返回 501。
+  final FileService? fileService;
 
   /// 提问回路（M5a）；为 null 时核心不提供 `ask_user_question`（测试/最小骨架）。
   final QuestionBroker? questions;
@@ -198,6 +200,7 @@ class CoreServer {
     Future<WorkspaceIO?> Function(String agentId)? specIoFor,
     McpService? mcpService,
     PluginBus? pluginBus,
+    FileService? fileService,
   }) async {
     final HttpServer http = await HttpServer.bind(
       address ?? InternetAddress.loopbackIPv4,
@@ -222,6 +225,7 @@ class CoreServer {
       specIoFor: specIoFor,
       mcpService: mcpService,
       pluginBus: pluginBus,
+      fileService: fileService,
       hub: hub,
       questions: questions,
       conversation: ConversationService(
@@ -481,6 +485,11 @@ class CoreServer {
     router.add('GET', ApiPaths.settingsMessageCutin, _getMessageCutin);
     router.add('POST', ApiPaths.settingsMessageCutin, _setMessageCutin);
     router.add('POST', ApiPaths.settingsDataCollection, _setDataCollection);
+    router.add('GET', ApiPaths.files, _listFiles);
+    router.add('GET', ApiPaths.fileContent, _fileContent);
+    router.add('GET', ApiPaths.filePdfInfo, _filePdfInfo);
+    router.add('GET', ApiPaths.workspaceGitLog, _workspaceGitLog);
+    router.add('GET', ApiPaths.workspaceGitBranches, _workspaceGitBranches);
     router.add('GET', ApiPaths.pluginSnapshot, _pluginSnapshot);
     router.add('GET', ApiPaths.mcpServices, _mcpServices);
     router.add('POST', ApiPaths.mcpServices, _registerMcpService);
@@ -1237,6 +1246,109 @@ class CoreServer {
   }
 
   // ── 插件 / MCP ───────────────────────────────────────────────────────
+
+  /// 文件/工作空间路由的统一错误处理（FileService 用 `{error, status}` 表达失败）。
+  Future<bool> _writeFileError(
+    HttpRequest request,
+    Map<String, dynamic> result,
+  ) async {
+    final Object? error = result['error'];
+    if (error == null) return false;
+    final int status = (result['status'] as num?)?.toInt() ?? 404;
+    await writeJson(request, status, errorBody(error.toString()));
+    return true;
+  }
+
+  /// `GET /api/files/{workspaceId}?path=`：目录树。
+  Future<void> _listFiles(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final FileService? files = fileService;
+    if (files == null) {
+      await writeJson(request, 501, errorBody('文件服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic> result = files.list(
+      params['workspaceId'] ?? '',
+      path: request.uri.queryParameters['path'] ?? '',
+    );
+    if (await _writeFileError(request, result)) return;
+    await writeJson(request, 200, result);
+  }
+
+  /// `GET /api/files/{workspaceId}/content?path=`：文件内容（图片为 base64）。
+  Future<void> _fileContent(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final FileService? files = fileService;
+    if (files == null) {
+      await writeJson(request, 501, errorBody('文件服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic> result = files.content(
+      params['workspaceId'] ?? '',
+      request.uri.queryParameters['path'] ?? '',
+    );
+    if (await _writeFileError(request, result)) return;
+    await writeJson(request, 200, result);
+  }
+
+  /// `GET /api/files/{workspaceId}/pdf_info?path=`：PDF 基本信息。
+  Future<void> _filePdfInfo(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final FileService? files = fileService;
+    if (files == null) {
+      await writeJson(request, 501, errorBody('文件服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic> result = files.pdfInfo(
+      params['workspaceId'] ?? '',
+      request.uri.queryParameters['path'] ?? '',
+    );
+    if (await _writeFileError(request, result)) return;
+    await writeJson(request, 200, result);
+  }
+
+  /// `GET /api/workspaces/{workspaceId}/git/log?limit=`：提交历史。
+  Future<void> _workspaceGitLog(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final FileService? files = fileService;
+    if (files == null) {
+      await writeJson(request, 501, errorBody('文件服务尚未接入'));
+      return;
+    }
+    final int limit =
+        int.tryParse(request.uri.queryParameters['limit'] ?? '') ?? 50;
+    final Map<String, dynamic> result = await files.gitLog(
+      params['workspaceId'] ?? '',
+      limit: limit,
+    );
+    if (await _writeFileError(request, result)) return;
+    await writeJson(request, 200, result);
+  }
+
+  /// `GET /api/workspaces/{workspaceId}/git/branches`：分支列表。
+  Future<void> _workspaceGitBranches(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final FileService? files = fileService;
+    if (files == null) {
+      await writeJson(request, 501, errorBody('文件服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic> result = await files.gitBranches(
+      params['workspaceId'] ?? '',
+    );
+    if (await _writeFileError(request, result)) return;
+    await writeJson(request, 200, result);
+  }
 
   Future<void> _pluginSnapshot(
     HttpRequest request,

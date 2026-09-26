@@ -78,6 +78,14 @@ Future<void> main(List<String> args) async {
   );
   await mcp.refresh();
 
+  // 工作空间文件服务（M7d）：文件面板 / 查看器 / Git 面板的数据源。
+  // 工作空间就在本机，但前端仍只经 REST 读，路径安全边界都在 FileService 里。
+  final FileService files = FileService(
+    store: store,
+    defaultWorkspaceDir: paths.defaultWorkspaceDir,
+    log: (String message) => stderr.writeln('[core:files] $message'),
+  );
+
   // 提问回路与插件总线都要"工具层先建、核心后建 WS 广播"，因此统一用一个可后置
   // 绑定的广播槽（核心起监听后立即接上 `hub.broadcast`）。
   void Function(Map<String, dynamic> frame)? hubSink;
@@ -221,6 +229,7 @@ Future<void> main(List<String> args) async {
     specIoFor: tools.ioFor,
     mcpService: mcp,
     pluginBus: plugins,
+    fileService: files,
   );
   // 起监听后才存在的三个依赖一次性接上：广播、在途状态、消息投递
   hubSink = server.hub.broadcast;

@@ -37,6 +37,7 @@ export 'src/llm/llm_transport.dart';
 export 'src/llm/llm_types.dart';
 export 'src/llm/openai_codec.dart';
 export 'src/llm/sse_parser.dart';
+export 'src/files/file_service.dart';
 export 'src/mcp/mcp_client.dart';
 export 'src/mcp/mcp_service.dart';
 export 'src/plugin/plugin_bus.dart';
