@@ -61,6 +61,8 @@ Future<void> main(List<String> args) async {
   final FileTodoStore todos = FileTodoStore(paths);
   final WorkspaceToolRunner tools = WorkspaceToolRunner(
     todoStore: todos,
+    // SSH 后端（dartssh2）在 M4b-2 接入；当前配置了 ssh 的 agent 会明确报未接入
+    resolveSshConfig: (String agentId) => store.agent(agentId)?.sshConfig,
     resolveWorkspaceDir: (String agentId) {
       final String configured = store.agent(agentId)?.workspaceDir ?? '';
       return configured.trim().isNotEmpty

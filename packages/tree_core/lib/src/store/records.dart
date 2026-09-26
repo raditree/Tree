@@ -1,3 +1,4 @@
+import '../settings/ssh_config.dart';
 import '../util/ids.dart';
 import '../util/json_time.dart';
 
@@ -22,6 +23,7 @@ class CoreAgent {
     this.modelId = '',
     this.workspaceId = '',
     this.workspaceDir = '',
+    this.sshConfig,
     this.teamMemberCount = 0,
     this.maxLevel = 1,
     this.maxMembersPerLevel = 0,
@@ -39,6 +41,11 @@ class CoreAgent {
   /// 用户可以直接手改 `agents/<id>.yaml` 的 `workspace_dir` 指向自己的项目目录
   /// —— 这是"绕开 UI 直接改配置"的关键入口。
   String workspaceDir;
+
+  /// SSH 执行配置（非空 = 该 agent 的工具跑在远端主机上）。
+  ///
+  /// 用户可以直接手写 `agents/<id>.yaml` 的 `ssh:` 段接入远端，无需任何 UI。
+  SshConfig? sshConfig;
   int teamMemberCount;
   int maxLevel;
   int maxMembersPerLevel;
@@ -53,6 +60,7 @@ class CoreAgent {
     'model_id': modelId,
     'workspace_id': workspaceId,
     'workspace_dir': workspaceDir,
+    if (sshConfig != null) 'ssh': sshConfig!.toJson(),
     'team_member_count': teamMemberCount,
     'max_level': maxLevel,
     'max_members_per_level': maxMembersPerLevel,
@@ -70,6 +78,7 @@ class CoreAgent {
       modelId: json['model_id'] as String? ?? '',
       workspaceId: json['workspace_id'] as String? ?? '',
       workspaceDir: json['workspace_dir'] as String? ?? '',
+      sshConfig: SshConfig.parse(json['ssh']),
       teamMemberCount: (json['team_member_count'] as num?)?.toInt() ?? 0,
       maxLevel: (json['max_level'] as num?)?.toInt() ?? 1,
       maxMembersPerLevel: (json['max_members_per_level'] as num?)?.toInt() ?? 0,
@@ -92,6 +101,8 @@ class CoreAgent {
     'model_id': modelId,
     'workspace_id': workspaceId,
     'workspace_dir': workspaceDir,
+    // 只暴露"是否配了 SSH"，凭据绝不出现在 API 响应里
+    'has_ssh': sshConfig != null,
     'last_message': lastMessage,
     'last_message_time': lastMessageTime,
     'unread_count': unreadCount,

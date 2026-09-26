@@ -41,6 +41,7 @@ export 'src/server/http_io.dart';
 export 'src/server/http_router.dart';
 export 'src/settings/core_settings.dart';
 export 'src/settings/file_settings_sink.dart';
+export 'src/settings/ssh_config.dart';
 export 'src/store/atomic_file.dart';
 export 'src/store/file_store.dart';
 export 'src/store/memory_store.dart';

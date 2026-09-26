@@ -3,6 +3,8 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 import 'package:tree_local_exec/tree_local_exec.dart';
 
+import '../settings/ssh_config.dart';
+
 import 'builtin_tools.dart';
 import 'terminal_hooks.dart';
 import 'todo_store.dart';
@@ -21,6 +23,8 @@ typedef WorkspaceDirResolver = String Function(String agentId);
 class WorkspaceToolRunner implements ToolRunner {
   WorkspaceToolRunner({
     required this.resolveWorkspaceDir,
+    this.resolveSshConfig,
+    this.sshIoFactory,
     this.maxResultChars = 24000,
     this.todoStore,
     WorkspaceIO Function(String dir)? ioFactory,
@@ -39,6 +43,14 @@ class WorkspaceToolRunner implements ToolRunner {
 
   /// 解析 agent 的工作空间目录。
   final WorkspaceDirResolver resolveWorkspaceDir;
+
+  /// 解析 agent 的 SSH 配置（非空 = 该 agent 的工具跑在远端主机上）。
+  final SshConfig? Function(String agentId)? resolveSshConfig;
+
+  /// SSH 后端工厂。**M4b-2 交付真实实现**（dartssh2 + SFTP/exec）；
+  /// 为 null 时对配置了 SSH 的 agent 明确报"尚未接入"而不是静默回落本地——
+  /// 静默回落会把远端该做的活干在用户本机，是更坏的失败方式。
+  final WorkspaceIO Function(SshConfig config)? sshIoFactory;
 
   /// 单条工具结果的字符上限。
   final int maxResultChars;
@@ -71,7 +83,8 @@ class WorkspaceToolRunner implements ToolRunner {
     final WorkspaceIO? io = await _ioFor(invocation.agentId);
     if (io == null) {
       return ToolOutcome(
-        '无法准备工作空间：${invocation.agentId} 的目录不可用',
+        '无法准备工作空间：${invocation.agentId} 的工作目录不可用，'
+        '或 SSH 配置不完整/尚未接入（详见核心日志）',
         isError: true,
       );
     }
@@ -103,6 +116,26 @@ class WorkspaceToolRunner implements ToolRunner {
   Future<WorkspaceIO?> _ioFor(String agentId) async {
     final WorkspaceIO? cached = _ios[agentId];
     if (cached != null) return cached;
+
+    final SshConfig? ssh = resolveSshConfig?.call(agentId);
+    if (ssh != null) {
+      final WorkspaceIO Function(SshConfig config)? factory = sshIoFactory;
+      if (factory == null) {
+        log?.call(
+          'agent $agentId 配置了 SSH ${ssh.redacted()}，'
+          '但 SSH 执行后端尚未接入（M4b-2）',
+        );
+        return null;
+      }
+      if (!ssh.isComplete) {
+        log?.call('agent $agentId 的 SSH 配置缺少：${ssh.missingFields.join('、')}');
+        return null;
+      }
+      final WorkspaceIO io = factory(ssh);
+      _ios[agentId] = io;
+      return io;
+    }
+
     final String dir = resolveWorkspaceDir(agentId);
     if (dir.trim().isEmpty) {
       log?.call('agent $agentId 的工作空间目录为空');
