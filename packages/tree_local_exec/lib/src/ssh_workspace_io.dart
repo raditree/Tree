@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
+import 'git_output.dart';
 import 'local_workspace_io.dart';
 import 'workspace_io.dart';
 
@@ -45,7 +46,14 @@ abstract interface class SshTransport {
   Future<bool> exists(String absolutePath);
 
   /// 执行命令，返回退出码与解码后的输出。
+  ///
+  /// [timeout] 是 M9 之前的硬超时；1.1 起**不再据此终止远端命令**（本地执行，
+  /// 没有多服务器争抢资源的后果），链路活性由 keepalive 心跳体现。参数保留
+  /// 只为不改调用方签名，已无实际作用。
   Future<SshExecResult> run(String command, {Duration timeout});
+
+  /// 连接是否还活着（心跳/重连决策要的"状态标记"入口；不在这里杀连接）。
+  bool get isConnected;
 
   /// 释放连接。
   Future<void> close();
@@ -78,6 +86,8 @@ class SshExecResult {
   final int exitCode;
   final String stdout;
   final String stderr;
+
+  /// 是否因超时被终止；M9 1.1 起恒为 false（字段留着不改调用方）。
   final bool timedOut;
 }
 
@@ -256,12 +266,35 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
       maxDepth: query.maxDepth,
     );
     final List<GrepMatch> matches = <GrepMatch>[];
+    // Q10：扫描清单与"实际生效的排除目录"在下面这一轮里顺手记录，
+    // 复用同一次 listFiles + read，不额外扫一遍远端。
+    final List<String> scannedPaths = <String>[];
+    final List<String> excludedDirs = <String>[];
+    final Set<String> seenExcludedDirs = <String>{};
     int scanned = 0;
     bool truncated = false;
+    String relPath(String child) => p.posix
+        .join(relativize(start), child)
+        .replaceFirst(RegExp(r'^\./'), '');
     for (final String rel in relativeFiles) {
       if (matches.length >= query.maxResults) {
         truncated = true;
         break;
+      }
+      // 先看路径上有没有被排除的目录：命中就整棵子树跳过。远端 listFiles 只列
+      // 文件，只按文件 basename 判是拦不住 node_modules/... 里的文件的——本地
+      // _walk 是剪枝，这里必须一致，排除清单也才名副其实。
+      final String? excludedDir = _excludedAncestor(
+        rel,
+        extraExcludes: query.exclude,
+      );
+      if (excludedDir != null) {
+        final String dir = relPath(excludedDir);
+        if (seenExcludedDirs.add(dir) &&
+            excludedDirs.length < GrepOutcome.maxExcludedDirs) {
+          excludedDirs.add(dir);
+        }
+        continue;
       }
       final String name = p.posix.basename(rel);
       if (defaultExcludedDirs.contains(name)) continue;
@@ -276,6 +309,9 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
       }
       if (bytes.contains(0)) continue;
       scanned++;
+      if (scannedPaths.length < GrepOutcome.maxScannedFilePaths) {
+        scannedPaths.add(relPath(rel));
+      }
       int lineNumber = 0;
       for (final String line in const LineSplitter().convert(
         LocalWorkspaceIO.decodeBytes(bytes),
@@ -284,9 +320,7 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
         if (!pattern.hasMatch(line)) continue;
         matches.add(
           GrepMatch(
-            path: p.posix
-                .join(relativize(start), rel)
-                .replaceFirst(RegExp(r'^\./'), ''),
+            path: relPath(rel),
             lineNumber: lineNumber,
             line: line.length > 500 ? '${line.substring(0, 500)}…' : line,
           ),
@@ -299,9 +333,32 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     }
     return GrepOutcome(
       matches: matches,
-      scannedFiles: scanned,
+      scannedFileCount: scanned,
       truncated: truncated,
+      scannedFilePaths: scannedPaths,
+      excludedDirs: excludedDirs,
     );
+  }
+
+  /// 相对搜索根的路径 [rel] 上第一个命中的排除目录（不含自身的文件名）；
+  /// 没有则 null。
+  ///
+  /// 远端给的是"文件相对路径"，排除目录只能从前缀反推：
+  /// node_modules/pkg/a.js 的 node_modules 就是被剪掉的目录。
+  static String? _excludedAncestor(
+    String rel, {
+    required List<String> extraExcludes,
+  }) {
+    final List<String> parts = rel.split('/');
+    // 最后一段是文件名，只判它前面的目录段
+    for (int i = 0; i < parts.length - 1; i++) {
+      final String name = parts[i];
+      if (defaultExcludedDirs.contains(name) ||
+          extraExcludes.any((String glob) => _matchesGlob(name, glob))) {
+        return parts.sublist(0, i + 1).join('/');
+      }
+    }
+    return null;
   }
 
   @override
@@ -331,6 +388,7 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     Duration timeout = const Duration(seconds: 120),
     int maxOutputBytes = 200 * 1024,
   }) async {
+    // [timeout] 已无作用（M9 1.1 取消硬超时终止）：保留参数只为不改调用方签名。
     final String trimmed = command.trim();
     if (trimmed.isEmpty) throw WorkspaceIoException('command 不能为空');
     final SshExecResult result = await _transport.run(
@@ -344,6 +402,39 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
       timedOut: result.timedOut,
       truncated: result.stdout.length + result.stderr.length > maxOutputBytes,
       shell: 'ssh',
+    );
+  }
+
+  // ── Git（M9 Q4）：走 exec 通道跑 git，命令与解析与本地共用 git_output.dart ─
+
+  @override
+  Future<GitLogOutcome> gitLog({int limit = 50}) async {
+    final SshExecResult result = await _transport.run(
+      'cd ${_quote(root)} && ${GitOutput.logCommand(GitOutput.clampLimit(limit))}',
+    );
+    // 非仓库 / 远端没有 git：退出码非 0，stdout 是报错文本 → 空列表 + 退出码，
+    // 不抛异常（面板显示空态而不是 400）。
+    return GitLogOutcome(
+      commits: result.exitCode == 0
+          ? GitOutput.parseLog(result.stdout)
+          : const <GitCommit>[],
+      exitCode: result.exitCode,
+    );
+  }
+
+  @override
+  Future<GitBranchesOutcome> gitBranches() async {
+    final SshExecResult result = await _transport.run(
+      'cd ${_quote(root)} && ${GitOutput.branchCommand}',
+    );
+    final ({List<String> branches, String current}) parsed =
+        result.exitCode == 0
+        ? GitOutput.parseBranches(result.stdout)
+        : (branches: const <String>[], current: '');
+    return GitBranchesOutcome(
+      branches: parsed.branches,
+      current: parsed.current,
+      exitCode: result.exitCode,
     );
   }
 

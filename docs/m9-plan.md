@@ -199,7 +199,7 @@
 
 ## 8. 实施记录（WIP，随并行波次更新）
 
-### Wave 1-C 执行器层（packages/tree_local_exec）— 已交付，提交 f6f1567
+### Wave 1-C 执行器层（packages/tree_local_exec）— 已交付，提交 fb3fd79
 | 条目 | 结果 | 要点 |
 |---|---|---|
 | Q4 | 完成 | 新增 lib/src/git_output.dart（本地/SSH 共用命令与解析）；WorkspaceIO.gitLog/gitBranches；非仓库或无 git → 空列表 + 退出码 |

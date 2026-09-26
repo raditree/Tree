@@ -9,6 +9,7 @@
 library;
 
 export 'src/dartssh_transport.dart';
+export 'src/git_output.dart';
 export 'src/local_workspace_io.dart';
 export 'src/ssh_workspace_io.dart';
 export 'src/shell.dart';
@@ -27,6 +28,8 @@ abstract final class TreeLocalExec {
     'grep_search',
     'list_files',
     'exec_shell',
+    'git_log',
+    'git_branches',
   ];
 
   /// 内置工具名（工具层声明用；team/message/spec/ask_user_question 属 M5，mcp 属 M6）。

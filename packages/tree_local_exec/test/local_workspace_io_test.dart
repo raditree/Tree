@@ -258,6 +258,58 @@ void main() {
       expect(limited.scannedFiles, greaterThan(0));
     });
 
+    test('无匹配时给出扫描清单与生效的排除目录（Q10）', () async {
+      writeFile('src/a.txt', 'nothing');
+      writeFile('src/b.txt', 'nothing');
+      writeFile('node_modules/pkg/c.txt', 'nothing');
+      writeFile('build/d.txt', 'nothing');
+      final GrepOutcome out = await io.grep(const GrepQuery(pattern: '查无此词'));
+      expect(out.matches, isEmpty);
+      expect(out.scannedFileCount, 2);
+      expect(out.scannedFilePaths, hasLength(2));
+      expect(
+        out.scannedFilePaths,
+        containsAll(<String>['src/a.txt', 'src/b.txt']),
+      );
+      expect(
+        out.excludedDirs,
+        containsAll(<String>['node_modules', 'build']),
+        reason: '排除清单只列真的存在、真的被跳过的目录',
+      );
+      expect(out.scannedFiles, 2, reason: '旧的 int 字段语义不变');
+    });
+
+    test('有匹配时既有字段不变，清单同样可用（Q10）', () async {
+      writeFile('lib/a.dart', 'needle');
+      writeFile('lib/b.dart', 'other');
+      final GrepOutcome out = await io.grep(const GrepQuery(pattern: 'needle'));
+      expect(out.matches.single.path, 'lib/a.dart');
+      expect(out.scannedFileCount, 2);
+      expect(out.scannedFilePaths, hasLength(2));
+      expect(out.excludedDirs, isEmpty);
+    });
+
+    test('扫描清单最多 200 条，总数不封顶（Q10）', () async {
+      for (int i = 0; i < 230; i++) {
+        writeFile('many/f$i.txt', 'zzz');
+      }
+      final GrepOutcome out = await io.grep(const GrepQuery(pattern: '查无此词'));
+      expect(out.scannedFileCount, 230);
+      expect(out.scannedFilePaths, hasLength(GrepOutcome.maxScannedFilePaths));
+    });
+
+    test('exclude glob 命中的目录进排除清单，且不重复计（Q10）', () async {
+      writeFile('src/a.dart', 'x');
+      writeFile('src/gen.skip/b.dart', 'x');
+      writeFile('src/gen.skip/deep/c.dart', 'x');
+      final GrepOutcome out = await io.grep(
+        GrepQuery(pattern: '查无此词', exclude: const <String>['*.skip']),
+      );
+      expect(out.scannedFileCount, 1);
+      expect(out.scannedFilePaths, <String>['src/a.dart']);
+      expect(out.excludedDirs, <String>['src/gen.skip']);
+    });
+
     test('max_depth 限制递归层数', () async {
       writeFile('a.txt', 'hit');
       writeFile('sub/b.txt', 'hit');
@@ -330,17 +382,76 @@ void main() {
       expect(outcome.stdout, contains('plain-ascii'));
     });
 
-    test('超时会终止整棵进程树并标记 timedOut', () async {
+    test('timeout 不再终止命令：慢命令跑完，输出照常可读（M9 1.1）', () async {
       final ExecOutcome outcome = await io.exec(
-        Platform.isWindows ? 'ping -n 10 127.0.0.1 >nul' : 'sleep 5',
-        timeout: const Duration(seconds: 1),
+        Platform.isWindows
+            ? 'ping -n 3 127.0.0.1 >nul & echo done'
+            : 'sleep 2; echo done',
+        timeout: const Duration(milliseconds: 200),
       );
-      expect(outcome.timedOut, isTrue);
-      expect(outcome.exitCode, -1);
+      expect(outcome.timedOut, isFalse, reason: '执行器取消硬超时：不再杀进程，也不标记超时');
+      expect(outcome.exitCode, 0);
+      expect(outcome.stdout, contains('done'), reason: '进程跑完后输出仍可读取');
     });
 
     test('空命令被拒绝', () async {
       await expectLater(io.exec('   '), throwsA(isA<WorkspaceIoException>()));
+    });
+  });
+
+  group('git（M9 Q4：本机 git）', () {
+    Future<void> git(List<String> args) async {
+      final ProcessResult result = await Process.run(
+        'git',
+        args,
+        workingDirectory: root.path,
+      );
+      expect(
+        result.exitCode,
+        0,
+        reason: 'git ${args.join(' ')}: ${result.stderr}',
+      );
+    }
+
+    test('非仓库：空列表 + 非零退出码，不抛异常', () async {
+      final GitLogOutcome log = await io.gitLog();
+      expect(log.commits, isEmpty);
+      expect(log.exitCode, isNot(0));
+      final GitBranchesOutcome branches = await io.gitBranches();
+      expect(branches.branches, isEmpty);
+      expect(branches.current, '');
+      expect(branches.exitCode, isNot(0));
+    });
+
+    test('真仓库：提交历史与分支（含当前分支）', () async {
+      final ProcessResult probe = await Process.run('git', <String>[
+        '--version',
+      ]);
+      if (probe.exitCode != 0) {
+        markTestSkipped('本机没有 git，跳过');
+        return;
+      }
+      writeFile('a.txt', 'hello');
+      await git(<String>['init', '-q']);
+      await git(<String>['config', 'user.email', 'test@example.com']);
+      await git(<String>['config', 'user.name', 'Tree Test']);
+      await git(<String>['add', 'a.txt']);
+      await git(<String>['commit', '-q', '-m', '初次提交']);
+      await git(<String>['branch', 'feature']);
+
+      final GitLogOutcome log = await io.gitLog(limit: 1);
+      expect(log.exitCode, 0);
+      expect(log.commits, hasLength(1), reason: 'limit=1 只回一条');
+      expect(log.commits.single.message, '初次提交');
+      expect(log.commits.single.author, 'Tree Test');
+      expect(log.commits.single.hash, isNotEmpty);
+      expect(log.commits.single.date, isNotEmpty);
+
+      final GitBranchesOutcome branches = await io.gitBranches();
+      expect(branches.exitCode, 0);
+      expect(branches.current, isNotEmpty);
+      expect(branches.branches, contains('feature'));
+      expect(branches.branches, contains(branches.current));
     });
   });
 

@@ -122,20 +122,45 @@ class GrepMatch {
 }
 
 /// grep 结果。
+///
+/// M9（Q10）：除命中之外还要带回**扫描清单**与**生效的排除目录清单**——无匹配时
+/// 上层靠它区分"真没有"与"被误排除"。两份清单都在遍历/读取过程中顺手记录
+/// （只留 [maxScannedFilePaths] / [maxExcludedDirs] 条抽样），**不额外做一次全树扫描**。
 class GrepOutcome {
   const GrepOutcome({
     required this.matches,
-    required this.scannedFiles,
+    required this.scannedFileCount,
     required this.truncated,
+    this.scannedFilePaths = const <String>[],
+    this.excludedDirs = const <String>[],
   });
+
+  /// [scannedFilePaths] 的条数上限：扫描面可能上万，给模型一份可读的抽样即可。
+  static const int maxScannedFilePaths = 200;
+
+  /// [excludedDirs] 的条数上限。
+  static const int maxExcludedDirs = 50;
 
   final List<GrepMatch> matches;
 
-  /// 实际扫描的文件数。
-  final int scannedFiles;
+  /// 实际扫描（读过内容）的文件总数，可能远多于 [scannedFilePaths] 的条数。
+  final int scannedFileCount;
+
+  /// 实际扫描过的文件（工作空间相对路径，按扫描顺序，最多 [maxScannedFilePaths] 条）。
+  final List<String> scannedFilePaths;
+
+  /// **实际生效**的排除目录（工作空间相对路径，最多 [maxExcludedDirs] 条）。
+  ///
+  /// 只列真的存在、真的被跳过的目录（依赖/构建目录与 exclude glob 命中的），
+  /// 不是把规则表照抄一遍——否则模型无法判断"目录不存在"与"被排除"。
+  final List<String> excludedDirs;
 
   /// 是否因为 max_results 截断。
   final bool truncated;
+
+  /// 兼容旧字段名：M9 之前这个名字指的就是上面的 **int 计数**，语义不变
+  /// （tree_core 工具层仍按计数使用）；扫描路径清单是 [scannedFilePaths]。
+  int get scannedFiles => scannedFileCount;
 }
 
 /// 命令执行结果。
@@ -150,13 +175,17 @@ class ExecOutcome {
     this.nonUtf8Output = false,
   });
 
-  /// 退出码（超时被杀为 -1）。
+  /// 退出码（进程根本没能启动等异常情况下为 -1）。
   final int exitCode;
 
   final String stdout;
   final String stderr;
 
   /// 是否因超时被终止。
+  ///
+  /// M9 1.1 起执行器取消硬超时，**恒为 false**（字段留着是为了不改动调用方：
+  /// tree_core 的 terminal 工具仍按这个字段拼提示）。长任务改由上层的心跳/
+  /// 软超时机制处理，执行器不再杀进程。
   final bool timedOut;
 
   /// 输出是否被截断（保留头尾）。
@@ -170,6 +199,77 @@ class ExecOutcome {
   final bool nonUtf8Output;
 
   bool get ok => exitCode == 0 && !timedOut;
+}
+
+/// 一条 Git 提交（M9 Q4）。
+class GitCommit {
+  const GitCommit({
+    required this.hash,
+    required this.author,
+    required this.date,
+    required this.message,
+  });
+
+  final String hash;
+  final String author;
+
+  /// 提交时间：git log --date=iso 的原文（形如 2026-01-02 03:04:05 +0800）。
+  final String date;
+
+  /// 提交标题（**可以含 tab**——解析时只按 tab 切分，余下的都归 message）。
+  final String message;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'hash': hash,
+    'author': author,
+    'date': date,
+    'message': message,
+  };
+}
+
+/// git log 的结果（M9 Q4）。
+///
+/// 非仓库 / 没有 git 时**不抛异常**：[commits] 为空、[exitCode] 是 git 的非零
+/// 退出码（本地连可执行文件都找不到时是 127），上层据此显示空态而不是 400。
+class GitLogOutcome {
+  const GitLogOutcome({required this.commits, required this.exitCode});
+
+  final List<GitCommit> commits;
+
+  /// git 的退出码（0 = 正常）。
+  final int exitCode;
+
+  /// REST / 工具层的 JSON 形状（键名沿用旧后端的下划线风格）。
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'commits': commits.map((GitCommit c) => c.toJson()).toList(),
+    'exit_code': exitCode,
+  };
+}
+
+/// git branch -a 的结果（M9 Q4）。
+class GitBranchesOutcome {
+  const GitBranchesOutcome({
+    required this.branches,
+    required this.current,
+    required this.exitCode,
+  });
+
+  /// 全部分支名（含当前分支；远端分支形如 remotes/origin/main）。
+  final List<String> branches;
+
+  /// 当前分支；分离头指针时是 git 给的描述文本，取不到为空串。
+  final String current;
+
+  /// git 的退出码（0 = 正常）。
+  final int exitCode;
+
+  /// REST / 工具层的 JSON 形状：branches 是字符串数组（前端同时兼容
+  /// {name: ...} 形状，见 git_history.dart），exit_code 与旧后端一致。
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'branches': branches,
+    'current': current,
+    'exit_code': exitCode,
+  };
 }
 
 /// 工作空间 IO。
@@ -210,11 +310,23 @@ abstract interface class WorkspaceIO {
   });
 
   /// 执行 shell 命令（cwd = 工作空间根）。
+  ///
+  /// [timeout] 是 M9 之前的硬超时；1.1 起执行器**不再据此终止命令**（本地执行，
+  /// 不存在多服务器场景下"无限期等待耗尽资源"的后果，长任务靠心跳保活）。
+  /// 参数保留只为不改调用方签名，已无实际作用。
   Future<ExecOutcome> exec(
     String command, {
     Duration timeout,
     int maxOutputBytes,
   });
+
+  /// Git 提交历史。
+  ///
+  /// 非仓库 / 没有 git **不抛异常**：返回空列表 + 退出码，由上层显示空态。
+  Future<GitLogOutcome> gitLog({int limit = 50});
+
+  /// Git 分支列表（含当前分支）；非仓库 / 没有 git 同样只回空列表 + 退出码。
+  Future<GitBranchesOutcome> gitBranches();
 
   /// 释放资源（幂等）。
   Future<void> close();

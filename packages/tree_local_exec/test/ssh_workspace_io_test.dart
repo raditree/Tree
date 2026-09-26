@@ -131,10 +131,15 @@ class FakeSshTransport implements SshTransport {
     Duration timeout = const Duration(seconds: 120),
   }) async {
     commands.add(command);
+    // timeout 只记录下来：M9 1.1 起执行器不再据此终止命令，测试据此确认
+    // "签名还在、终止没了"。
     timeouts.add(timeout);
     return onRun?.call(command) ??
         const SshExecResult(exitCode: 0, stdout: '', stderr: '');
   }
+
+  @override
+  bool get isConnected => !closed;
 
   @override
   Future<void> close() async => closed = true;
@@ -366,6 +371,51 @@ void main() {
         'src/keep.txt',
       ]);
     });
+
+    test('无匹配时给出扫描清单与生效的排除目录（Q10）', () async {
+      t.seed('/ws/src/a.txt', 'nothing');
+      t.seed('/ws/src/b.txt', 'nothing');
+      // 排除目录里的文件：本地 walk 会剪枝，远端也要一致（只按文件 basename
+      // 是拦不住它们的），否则排除清单就是假的
+      t.seed('/ws/node_modules/pkg/c.txt', 'nothing');
+      t.seed('/ws/build/d.txt', 'nothing');
+      final GrepOutcome out = await io.grep(const GrepQuery(pattern: '查无此词'));
+      expect(out.matches, isEmpty);
+      expect(out.scannedFileCount, 2);
+      expect(out.scannedFilePaths, <String>['src/a.txt', 'src/b.txt']);
+      expect(out.excludedDirs, containsAll(<String>['node_modules', 'build']));
+    });
+
+    test('有匹配时既有字段不变，清单同样可用（Q10）', () async {
+      t.seed('/ws/src/a.txt', 'needle');
+      t.seed('/ws/src/b.txt', 'other');
+      final GrepOutcome out = await io.grep(const GrepQuery(pattern: 'needle'));
+      expect(out.matches.single.path, 'src/a.txt');
+      expect(out.scannedFileCount, 2);
+      expect(out.scannedFiles, 2, reason: '旧的 int 字段语义不变');
+      expect(out.scannedFilePaths, hasLength(2));
+      expect(out.excludedDirs, isEmpty);
+    });
+
+    test('扫描清单最多 200 条，总数不封顶（Q10）', () async {
+      for (int i = 0; i < 230; i++) {
+        t.seed('/ws/many/f$i.txt', 'zzz');
+      }
+      final GrepOutcome out = await io.grep(const GrepQuery(pattern: '查无此词'));
+      expect(out.scannedFileCount, 230);
+      expect(out.scannedFilePaths, hasLength(GrepOutcome.maxScannedFilePaths));
+    });
+
+    test('exclude glob 命中的目录进排除清单（Q10）', () async {
+      t.seed('/ws/src/a.dart', 'x');
+      t.seed('/ws/src/gen.skip/b.dart', 'x');
+      final GrepOutcome out = await io.grep(
+        const GrepQuery(pattern: '查无此词', exclude: <String>['*.skip']),
+      );
+      expect(out.scannedFileCount, 1);
+      expect(out.scannedFilePaths, <String>['src/a.dart']);
+      expect(out.excludedDirs, <String>['src/gen.skip']);
+    });
   });
 
   group('listFiles', () {
@@ -406,20 +456,16 @@ void main() {
       expect(t.commands.single, 'cd \'/ws/it\'\\\'\'s\' && pwd');
     });
 
-    test('透传超时并标记 timedOut', () async {
-      t.onRun = (String _) => const SshExecResult(
-        exitCode: 124,
-        stdout: '',
-        stderr: '',
-        timedOut: true,
-      );
+    test('timeout 只透传、不再据此终止命令（M9 1.1）', () async {
+      t.onRun = (String _) =>
+          const SshExecResult(exitCode: 0, stdout: 'done', stderr: '');
       final ExecOutcome r = await io.exec(
         'sleep 300',
         timeout: const Duration(seconds: 5),
       );
-      expect(t.timeouts.single, const Duration(seconds: 5));
-      expect(r.timedOut, isTrue);
-      expect(r.exitCode, 124);
+      expect(t.timeouts.single, const Duration(seconds: 5), reason: '签名保留');
+      expect(r.exitCode, 0);
+      expect(r.timedOut, isFalse, reason: '执行器不再产生超时终止');
     });
 
     test('超长输出截断并带标记', () async {
@@ -479,6 +525,97 @@ void main() {
           ),
         ),
       );
+    });
+  });
+
+  group('git（M9 Q4：exec 通道）', () {
+    test('gitLog：命令形状与旧实现一致，按 tab 解析且 message 可含 tab', () async {
+      t.onRun = (String _) => const SshExecResult(
+        exitCode: 0,
+        stdout:
+            'abc123\t张三\t2026-01-02 03:04:05 +0800\t修复：\t多标签\n'
+            'def456\t李四\t2026-01-01 00:00:00 +0800\t初次提交\n',
+        stderr: '',
+      );
+      final GitLogOutcome out = await io.gitLog(limit: 10);
+      expect(
+        t.commands.single,
+        "cd '/ws' && git log --pretty=format:%H%x09%an%x09%ad%x09%s "
+        '--date=iso -n 10',
+      );
+      expect(out.exitCode, 0);
+      expect(out.commits, hasLength(2));
+      expect(out.commits.first.hash, 'abc123');
+      expect(out.commits.first.author, '张三');
+      expect(out.commits.first.date, '2026-01-02 03:04:05 +0800');
+      expect(out.commits.first.message, '修复：\t多标签', reason: '标题里的 tab 要保留');
+      expect(out.commits.last.message, '初次提交');
+    });
+
+    test('gitLog 默认 limit=50，且夹在 1..1000', () async {
+      await io.gitLog();
+      expect(t.commands.last, endsWith('-n 50'));
+      await io.gitLog(limit: 0);
+      expect(t.commands.last, endsWith('-n 1'));
+      await io.gitLog(limit: 99999);
+      expect(t.commands.last, endsWith('-n 1000'));
+    });
+
+    test('gitBranches：* 标出当前分支，远端分支照收', () async {
+      t.onRun = (String _) => const SshExecResult(
+        exitCode: 0,
+        stdout: '* main\n  dev\n  remotes/origin/main\n',
+        stderr: '',
+      );
+      final GitBranchesOutcome out = await io.gitBranches();
+      expect(t.commands.single, "cd '/ws' && git branch -a");
+      expect(out.current, 'main');
+      expect(out.branches, <String>['main', 'dev', 'remotes/origin/main']);
+      expect(out.exitCode, 0);
+    });
+
+    test('非仓库 / 远端没有 git：空列表 + 退出码，不抛异常', () async {
+      t.onRun = (String _) => const SshExecResult(
+        exitCode: 128,
+        stdout: '',
+        stderr:
+            'fatal: not a git repository (or any of the parent directories)',
+      );
+      final GitLogOutcome log = await io.gitLog();
+      expect(log.commits, isEmpty);
+      expect(log.exitCode, 128);
+
+      final GitBranchesOutcome branches = await io.gitBranches();
+      expect(branches.branches, isEmpty);
+      expect(branches.current, '');
+      expect(branches.exitCode, 128);
+    });
+
+    test('退出码非 0 时不解析 stdout（报错文本不该变成提交）', () async {
+      t.onRun = (String _) => const SshExecResult(
+        exitCode: 129,
+        stdout: 'usage: git log ...\n',
+        stderr: '',
+      );
+      final GitLogOutcome out = await io.gitLog();
+      expect(out.commits, isEmpty);
+      expect(out.exitCode, 129);
+    });
+
+    test('toJson 形状与旧后端一致（下划线 exit_code）', () async {
+      t.onRun = (String _) =>
+          const SshExecResult(exitCode: 0, stdout: '', stderr: '');
+      final GitLogOutcome log = await io.gitLog();
+      expect(log.toJson(), <String, dynamic>{
+        'commits': <Map<String, dynamic>>[],
+        'exit_code': 0,
+      });
+      final GitBranchesOutcome branches = await io.gitBranches();
+      expect(branches.toJson(), <String, dynamic>{
+        'branches': <String>[],
+        'current': '',
+        'exit_code': 0,
+      });
     });
   });
 

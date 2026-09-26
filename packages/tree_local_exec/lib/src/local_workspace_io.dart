@@ -1,10 +1,10 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
+import 'git_output.dart';
 import 'shell.dart';
 import 'workspace_io.dart';
 
@@ -247,6 +247,10 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     final RegExp pattern = _buildPattern(query);
     final List<String> extras = query.exclude;
     final List<GrepMatch> matches = <GrepMatch>[];
+    // Q10：扫描清单与"实际生效的排除目录"在遍历/读取过程中顺手记录，
+    // 复用下面这一次遍历与这一轮读取，不额外扫一遍树。
+    final List<String> scannedPaths = <String>[];
+    final List<String> excludedDirs = <String>[];
     int scanned = 0;
     bool truncated = false;
 
@@ -263,6 +267,10 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
         excludedDirs: defaultExcludedDirs,
         extraExcludes: extras,
         respectExclusion: true,
+        onExcludedDir: (Directory dir) {
+          if (excludedDirs.length >= GrepOutcome.maxExcludedDirs) return;
+          excludedDirs.add(relativize(dir.path));
+        },
       );
     }
 
@@ -279,6 +287,9 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
       }
       if (_looksBinary(bytes)) continue;
       scanned++;
+      if (scannedPaths.length < GrepOutcome.maxScannedFilePaths) {
+        scannedPaths.add(relativize(file.path));
+      }
       final String text = decodeBytes(bytes);
       int lineNumber = 0;
       for (final String line in const LineSplitter().convert(text)) {
@@ -299,8 +310,10 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     }
     return GrepOutcome(
       matches: matches,
-      scannedFiles: scanned,
+      scannedFileCount: scanned,
       truncated: truncated,
+      scannedFilePaths: scannedPaths,
+      excludedDirs: excludedDirs,
     );
   }
 
@@ -338,6 +351,7 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     Duration timeout = const Duration(seconds: 120),
     int maxOutputBytes = 200 * 1024,
   }) async {
+    // [timeout] 已无作用（M9 1.1 取消硬超时终止）：保留参数只为不改调用方签名。
     final String trimmed = command.trim();
     if (trimmed.isEmpty) {
       throw WorkspaceIoException('command 不能为空');
@@ -362,18 +376,13 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
         .listen(err.add)
         .asFuture<void>();
 
-    bool timedOut = false;
-    int exitCode;
-    try {
-      exitCode = await process.exitCode.timeout(timeout);
-    } on TimeoutException {
-      timedOut = true;
-      await Shell.killProcessTree(process.pid);
-      exitCode = -1;
-    }
-    // 给输出流一点时间收尾（进程已退出但管道可能还有缓冲）
-    await Future.wait<void>(<Future<void>>[outDone, errDone])
-        .timeout(const Duration(seconds: 5), onTimeout: () => <void>[]);
+    // M9 1.1：不再按 timeout 杀进程——本地执行，不存在服务器上"多用户无限期
+    // 等待把资源耗光"的后果，慢命令等它跑完即可（长任务的心跳/软超时在上层）。
+    // 因此 Shell.killProcessTree 不在这里用（它仍服务于 terminal 的后台取消）。
+    final int exitCode = await process.exitCode;
+    // 进程已退出，管道里剩下的缓冲会自然读完；这里也不再用 5s 超时把收尾掐掉
+    // （掐掉就等于丢输出尾巴，与"输出仍可读取"的要求相反）。
+    await Future.wait<void>(<Future<void>>[outDone, errDone]);
 
     final List<int> stdoutBytes = out.bytes;
     final List<int> stderrBytes = err.bytes;
@@ -381,7 +390,7 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
       exitCode: exitCode,
       stdout: out.text,
       stderr: err.text,
-      timedOut: timedOut,
+      timedOut: false,
       truncated: out.truncated || err.truncated,
       shell: Shell.executable,
       // 严格 UTF-8 解不开 → 用了 latin1 兜底 → 中文可能乱码，如实标注
@@ -389,6 +398,68 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
           _isStrictUtf8(stdoutBytes) == false ||
           _isStrictUtf8(stderrBytes) == false,
     );
+  }
+
+  // ── Git（M9 Q4）：命令与解析与 SSH 侧共用 git_output.dart ──────────────
+
+  @override
+  Future<GitLogOutcome> gitLog({int limit = 50}) async {
+    final ProcessResult? result = await _runGit(
+      GitOutput.logArgs(GitOutput.clampLimit(limit)),
+    );
+    if (result == null) {
+      return const GitLogOutcome(
+        commits: <GitCommit>[],
+        exitCode: GitOutput.missingGitExitCode,
+      );
+    }
+    // 非仓库时 git 退出码非 0（且 stdout 是报错文本）：空列表 + 退出码，
+    // 不抛异常、也不拿报错文本硬解析出垃圾提交。
+    return GitLogOutcome(
+      commits: result.exitCode == 0
+          ? GitOutput.parseLog('${result.stdout}')
+          : const <GitCommit>[],
+      exitCode: result.exitCode,
+    );
+  }
+
+  @override
+  Future<GitBranchesOutcome> gitBranches() async {
+    final ProcessResult? result = await _runGit(GitOutput.branchArgs());
+    if (result == null) {
+      return const GitBranchesOutcome(
+        branches: <String>[],
+        current: '',
+        exitCode: GitOutput.missingGitExitCode,
+      );
+    }
+    final ({List<String> branches, String current}) parsed =
+        result.exitCode == 0
+        ? GitOutput.parseBranches('${result.stdout}')
+        : (branches: const <String>[], current: '');
+    return GitBranchesOutcome(
+      branches: parsed.branches,
+      current: parsed.current,
+      exitCode: result.exitCode,
+    );
+  }
+
+  /// 跑一次 git（cwd = 工作空间根）。
+  ///
+  /// 本机没有 git 可执行文件（或工作空间目录不存在）时返回 null：调用方按
+  /// "没有 git" 处理（空列表 + 127），而不是把 ProcessException 抛给工具层。
+  Future<ProcessResult?> _runGit(List<String> args) async {
+    try {
+      return await Process.run(
+        'git',
+        args,
+        workingDirectory: root,
+        stdoutEncoding: utf8,
+        stderrEncoding: utf8,
+      );
+    } on ProcessException {
+      return null;
+    }
   }
 
   // ── 文件面板（M7g）：列一层目录 + 原始字节读写 ─────────────────────────
@@ -550,6 +621,9 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   }
 
   /// 递归遍历；[maxDepth] 为 0 表示不限。
+  ///
+  /// [onExcludedDir] 只在**目录**被排除规则真的跳过时回调（Q10 的排除清单）；
+  /// 名字撞上排除规则的普通文件不算"被排除的目录"。
   static void _walk(
     Directory dir,
     int maxDepth,
@@ -557,6 +631,7 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     required Set<String> excludedDirs,
     required List<String> extraExcludes,
     required bool respectExclusion,
+    void Function(Directory dir)? onExcludedDir,
     bool onDirectory = false,
     int depth = 0,
   }) {
@@ -570,8 +645,11 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     for (final FileSystemEntity entity in children) {
       final String name = p.basename(entity.path);
       if (respectExclusion) {
-        if (excludedDirs.contains(name)) continue;
-        if (extraExcludes.any((String glob) => _matchesGlob(name, glob))) {
+        final bool excluded =
+            excludedDirs.contains(name) ||
+            extraExcludes.any((String glob) => _matchesGlob(name, glob));
+        if (excluded) {
+          if (entity is Directory) onExcludedDir?.call(entity);
           continue;
         }
       }
@@ -584,6 +662,7 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
           excludedDirs: excludedDirs,
           extraExcludes: extraExcludes,
           respectExclusion: respectExclusion,
+          onExcludedDir: onExcludedDir,
           onDirectory: onDirectory,
           depth: depth + 1,
         );
