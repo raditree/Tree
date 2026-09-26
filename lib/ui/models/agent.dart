@@ -27,6 +27,12 @@ class Agent {
   /// 该 agent 的独立 Docker 工作空间 ID（后端容器名为 workspace_{workspace_id}）
   final String workspaceId;
 
+  /// 是否已配置 SSH（> false = 该 agent 的工具在远端主机执行）
+  final bool hasSsh;
+
+  /// 工作空间目录（空 = 核心默认 `<数据根>/workspaces/<agent_id>`）
+  final String workspaceDir;
+
   /// 等待用户处理的团队成员数（未分配模型 / 待审核）
   ///
   /// 后端 `/api/agents` 按 TOP 的整棵成员树统计。> 0 时在 Agent 列表与
@@ -42,6 +48,8 @@ class Agent {
     this.unreadCount = 0,
     this.avatarUrl,
     this.workspaceId = '',
+    this.hasSsh = false,
+    this.workspaceDir = '',
     this.pendingMemberCount = 0,
   });
 
@@ -68,6 +76,10 @@ class Agent {
       ),
       avatarUrl: json['avatar_url'] as String? ?? json['avatarUrl'] as String?,
       workspaceId: json['workspace_id'] as String? ?? json['workspaceId'] as String? ?? '',
+      hasSsh: json['has_ssh'] == true || json['hasSsh'] == true,
+      workspaceDir: json['workspace_dir'] as String? ??
+          json['workspaceDir'] as String? ??
+          '',
       pendingMemberCount: _parseInt(
         json['pending_member_count'] ?? json['pendingMemberCount'],
       ),

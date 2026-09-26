@@ -559,9 +559,9 @@ class CoreServer {
     }
     await writeJson(request, 200, <String, dynamic>{
       'agent': agent.toApiJson(),
-      // SSH 配置的**非机密**部分（host/port/username/key_path/root 与认证方式），
-      // 供前端编辑；密码与口令永不回显。
-      if (agent.sshConfig != null) 'ssh': agent.sshConfig!.redacted(),
+      // SSH 配置的**非机密**部分（host/port/username/auth/root/key_path），
+      // 供前端表单预填；密码与口令永不回显。
+      if (agent.sshConfig != null) 'ssh': _sshView(agent.sshConfig!),
     });
   }
 
@@ -655,9 +655,16 @@ class CoreServer {
     await writeJson(request, 200, <String, dynamic>{
       'success': true,
       'agent': agent.toApiJson(),
-      if (agent.sshConfig != null) 'ssh': agent.sshConfig!.redacted(),
+      if (agent.sshConfig != null) 'ssh': _sshView(agent.sshConfig!),
     });
   }
+
+  /// SSH 配置的前端形态：在 `redacted()` 基础上补 `key_path`（表单预填需要），
+  /// **仍然绝不含 password / key_passphrase**。
+  static Map<String, dynamic> _sshView(SshConfig config) => <String, dynamic>{
+    ...config.redacted(),
+    if (config.keyPath.isNotEmpty) 'key_path': config.keyPath,
+  };
 
   Future<void> _deleteAgent(
     HttpRequest request,

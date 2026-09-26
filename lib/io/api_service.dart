@@ -532,6 +532,9 @@ class ApiService {
     int? maxOutputTokens,
     double? compressThreshold,
     bool clearOverrides = false,
+    String? workspaceDir,
+    Map<String, dynamic>? ssh,
+    bool clearSsh = false,
   }) async {
     return _patchJson('/api/agents/$agentId', body: {
       if (modelId != null && modelId.isNotEmpty) 'model_id': modelId,
@@ -542,7 +545,19 @@ class ApiService {
       'max_output_tokens': ?maxOutputTokens,
       'compress_threshold': ?compressThreshold,
       if (clearOverrides) 'clear_model_overrides': true,
+      'workspace_dir': ?workspaceDir,
+      'ssh': ?ssh,
+      if (clearSsh) 'ssh': null,
     });
+  }
+
+  /// 获取单个 agent 的完整配置（含 SSH 的非机密字段与工作目录）。
+  ///
+  /// 调用 `GET /api/agents/{id}`，返回 `{"agent": {...}, "ssh": {...}?}`。
+  /// 说明：桌面端「运行模式」不再由前端执行器承载，而是这份配置（核心据此决定
+  /// 工具在哪跑）。
+  static Future<Map<String, dynamic>> getAgent(String agentId) async {
+    return _getJson('/api/agents/$agentId');
   }
 
   /// 获取 agent 的可用模型池与当前模型信息（右栏「模型信息」页使用）
