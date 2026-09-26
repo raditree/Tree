@@ -355,8 +355,8 @@ class TeamTool(TeamToolBase):
 
         # 新成员必然未就绪（模型由用户配置 → review_status=pending_model），
         # 此时消息必被 _process_member_message 的审核闸拒绝（无模型无法执行），
-        # 故不投递初始化消息，避免制造一条注定失败的死信；改由用户审核通过后
-        # 在 REST 侧经 _dispatch_member_init_after_approval 补投。
+        # 故不投递初始化消息，避免制造一条注定失败的死信；用户审核通过后也
+        # 不补投（成员保持空闲，等 leader 派活消息驱动开工）。
         initialized = False
 
         result = {

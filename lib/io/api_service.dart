@@ -1032,15 +1032,11 @@ class ApiService {
     String memberId, {
     String? modelId,
     String? reviewStatus,
-    String? sessionId,
     Map<String, Object?>? overrides,
   }) async {
     final Map<String, dynamic> body = <String, dynamic>{};
     if (modelId != null) body['model_id'] = modelId;
     if (reviewStatus != null) body['review_status'] = reviewStatus;
-    if (sessionId != null && sessionId.isNotEmpty) {
-      body['session_id'] = sessionId;
-    }
     if (overrides != null) {
       overrides.forEach((String key, Object? value) {
         body[key] = value;

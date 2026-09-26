@@ -646,8 +646,6 @@ async def update_teammate_endpoint(
     请求体（至少一项）：
     - ``model_id``：要分配的模型；显式传空串 = 清空模型（退回 ``pending_model``）
     - ``review_status``：``approved`` / ``rejected`` / ``pending_review``
-    - ``session_id``：当前会话 id（teammates 窗口透传）。审核通过后的补投
-      初始化消息按该会话归集；缺失回退默认会话
     - ``reasoning_effort`` / ``max_seqlen`` / ``max_output_tokens`` /
       ``compress_threshold``：成员级模型参数覆盖；传 ``null`` = 清除该项
       （回退 TOP 的同名设置；TOP 也没有则用模型 .yaml 默认值）
@@ -775,19 +773,11 @@ async def update_teammate_endpoint(
             raise HTTPException(status_code=404, detail=f"成员不存在: {member_id}")
         row = updated_row
 
-    # 审核通过后补投初始化消息：赋模型与审核期间成员收不到任何消息，
-    # 这里补一次，让成员知道自己的角色与职责（此前在 create_member 时被跳过）。
-    initialized = False
-    if row.get("review_status") == "approved":
-        initialized = await _dispatch_member_init_after_approval(
-            user_id, agent_id, row,
-            session_id=str(payload.get("session_id") or ""),
-        )
-
+    # 审核通过 / 修改成员模型配置都**不**向成员补投初始化消息：
+    # 成员在收到 leader 的派活消息前保持空闲，由领活消息驱动开工。
     return {
         "success": True,
         "member": _member_override_view(user_id, agent_id, row),
-        "initialized": initialized,
         "top_agent_name": (_get_agent(user_id, agent_id) or {}).get("name", ""),
     }
 
@@ -822,63 +812,6 @@ def _member_override_view(
         effective = {}
     view["effective"] = effective
     return view
-
-
-async def _dispatch_member_init_after_approval(
-    user_id: str,
-    agent_id: str,
-    member: Dict[str, Any],
-    session_id: str = "",
-) -> bool:
-    """成员审核通过后经 broker 补投一次初始化消息（失败返回 False）。
-
-    成员在"未赋模型 / 未审核"期间被审核闸挡住，因此 create_member 当时跳过了
-    初始化消息；审核通过后在这里补投，让成员知道自己的角色与职责。
-
-    两条与用户直发同口径的约束（缺一即出问题）：
-    - ``session_id``：由调用方（teammates 窗口当前会话）透传，缺失才回退
-      ``DEFAULT_SESSION``。不透传会让成员在本会话之外（默认会话）开工，
-      进度不进 teammates 窗口，且与其他会话交叉。
-    - ``sender_id`` = ``USER_AGENT_ID``：本消息是用户审核动作的补投，不是
-      leader 派活。负载缺 ``sender_id`` 时成员侧会回退成 ``leader_id``
-      （= 所属顶部 agent），于是"成员未就绪/无模型"这类**错误回传**会误发给
-      顶部 agent，会话的 sender_id 溯源（AskUserQuestion）也会指错人。
-    """
-    broker = getattr(state, "team_broker", None)
-    if broker is None:
-        return False
-    role = member.get("role") or "（未设）"
-    duty = member.get("duty") or "（未设）"
-    content = (
-        "【团队初始化】你已通过用户审核，可以开始工作了。\n"
-        f"你的角色：{role}\n你的职责：{duty}\n"
-        "等待 leader 用 message send_message 派发工作；"
-        "工作过程与产出请持续写入 .self/activity.log。"
-    )
-    try:
-        return bool(
-            broker.dispatch(
-                (user_id, member.get("id", "")),
-                {
-                    "user_id": user_id,
-                    "agent_id": member.get("id", ""),
-                    "workspace_id": member.get("workspace_id") or member.get("id", ""),
-                    "model_id": member.get("model_id", ""),
-                    "system_prompt": member.get("system_prompt", ""),
-                    "leader_id": member.get("parent_agent_id") or agent_id,
-                    "team_id": agent_id,
-                    "content": content,
-                    "event": "member_approved",
-                    # 会话隔离：审批补投按当前会话归集（与用户直发同一口径）
-                    "session_id": session_id or DEFAULT_SESSION,
-                    # 用户直发标记：成员总结不转发给任何 agent（含顶部 agent）
-                    "sender_id": USER_AGENT_ID,
-                },
-            )
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("成员审核通过后补投初始化消息失败 %s: %s", member.get("id"), exc)
-        return False
 
 
 @router.get("/agents/{agent_id}/teammate/{member_id}/log")

@@ -774,9 +774,6 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
         // reject 不改模型（仅改状态）；其余一律带上当前选择的模型
         modelId: action == 'reject' ? null : modelId,
         reviewStatus: reviewStatus,
-        // 会话隔离：审核通过后的补投初始化消息按当前会话归集，
-        // 不传会落到默认会话（成员进度不会出现在本窗口）
-        sessionId: widget.sessionId,
         overrides: overridePatch.isEmpty ? null : overridePatch,
       );
       if (!mounted) return;

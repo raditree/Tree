@@ -666,21 +666,16 @@ class FakeTeamBroker:
         return self.ok
 
 
-class TestMemberApprovalInitDispatch(TeamStoreBase):
-    """审核通过后的补投消息：会话归属 + 发送方标记（用户反馈回归）。
+class TestMemberApprovalDoesNotDispatch(TeamStoreBase):
+    """审核通过 / 修改成员模型配置都不补投初始化消息（用户反馈：没必要）。
 
-    回归场景（用户反馈）：用户在 teammates 窗口审核通过成员后，该补投消息
-    落到**默认会话**（当前会话看不到成员进度）；且负载不带 ``sender_id``，
-    成员侧会回退成 ``leader_id``（= 所属顶部 agent），使"成员未就绪/无模型"
-    这类错误回传误发给顶部 agent、会话 sender_id 溯源也指错人。
-    根因：补投负载既不带 ``session_id`` 也不带 ``sender_id``。
+    回归场景（用户反馈）：改成员模型配置、启用（审核通过）成员时会向成员
+    发一条初始化消息；用户明确表示不需要——成员应在收到 leader 派活消息时才
+    开工，配置动作本身不产生发给成员的消息。
     """
 
     def setUp(self):
         super().setUp()
-        from agent import routes as routes_mod
-
-        self.routes = routes_mod
         self._orig_state_configs = state.model_configs
         state.model_configs = {
             "flash": ModelConfig(
@@ -689,11 +684,11 @@ class TestMemberApprovalInitDispatch(TeamStoreBase):
             ),
         }
         self.addCleanup(setattr, state, "model_configs", self._orig_state_configs)
-        # team_id 必须等于 agent 主键（补投负载的 team_id 取该值）
+        # team_id 必须等于 agent 主键
         self._agent = agent_store.create_agent(USER["openid"], "TOP", "flash")
         self.top_id = self._agent["id"]
         team_store.init_team(USER["openid"], self.top_id, "TOP")
-        # 成员已赋模型（待审核），审核通过即触发补投
+        # 成员已赋模型（待审核）：审核通过后不应产生任何投递
         team_store.add_member(USER["openid"], self.top_id, "m1", "成员A",
                               model_id="flash")
         self._orig_broker = getattr(state, "team_broker", None)
@@ -712,68 +707,34 @@ class TestMemberApprovalInitDispatch(TeamStoreBase):
             f"/api/agents/{self.top_id}/teammate/m1", json=body
         )
 
-    def test_approve_dispatches_init_in_current_session(self):
+    def test_approve_does_not_dispatch(self):
+        """审核通过只改配置，不向成员投递任何消息。"""
         broker = FakeTeamBroker()
         state.team_broker = broker
         r = self._patch({"review_status": "approved", "session_id": "s_team"})
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertTrue(r.json()["initialized"])
-        self.assertEqual(len(broker.calls), 1)
-        key, payload = broker.calls[0]
-        self.assertEqual(key, (USER["openid"], "m1"))
-        # 会话隔离：补投按当前会话归集，而非默认会话
-        self.assertEqual(payload["session_id"], "s_team")
-        self.assertNotEqual(payload["session_id"], self.routes.DEFAULT_SESSION)
-        self.assertEqual(payload["agent_id"], "m1")
-        self.assertEqual(payload["team_id"], self.top_id)
+        self.assertEqual(r.json()["member"]["review_status"], "approved")
+        self.assertEqual(broker.calls, [])
 
-    def test_init_payload_marked_user_sender(self):
-        """发送方必须显式标记为用户直发，不允许兜底成 leader（顶部 agent）：
-        否则成员侧错误回传会误发给顶部 agent。"""
+    def test_edit_model_of_approved_member_does_not_dispatch(self):
+        """已审核通过的成员改模型 / 改参数不重复投递初始化消息。"""
         broker = FakeTeamBroker()
         state.team_broker = broker
-        self._patch({"review_status": "approved", "session_id": "s_team"})
-        payload = broker.calls[0][1]
-        self.assertEqual(payload["sender_id"], self.routes.USER_AGENT_ID)
-        self.assertNotEqual(payload["sender_id"], self.top_id)
-        self.assertNotEqual(payload["sender_id"], payload["leader_id"])
-
-    def test_missing_session_falls_back_to_default(self):
-        broker = FakeTeamBroker()
-        state.team_broker = broker
-        self._patch({"review_status": "approved"})
-        self.assertEqual(broker.calls[0][1]["session_id"],
-                         self.routes.DEFAULT_SESSION)
+        self._patch({"model_id": "flash", "review_status": "approved"})
+        r = self._patch({
+            "model_id": "flash", "max_seqlen": 4096,
+            "review_status": "approved", "session_id": "s_team",
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["member"]["review_status"], "approved")
+        self.assertEqual(broker.calls, [])
 
     def test_reject_does_not_dispatch(self):
         broker = FakeTeamBroker()
         state.team_broker = broker
         r = self._patch({"review_status": "rejected", "session_id": "s_team"})
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertFalse(r.json()["initialized"])
         self.assertEqual(broker.calls, [])
-
-    def test_assign_only_does_not_dispatch(self):
-        """仅赋模型（进入待审核）不补投：成员还没被放行。"""
-        broker = FakeTeamBroker()
-        state.team_broker = broker
-        r = self._patch({"model_id": "flash", "session_id": "s_team"})
-        self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(r.json()["member"]["review_status"], "pending_review")
-        self.assertFalse(r.json()["initialized"])
-        self.assertEqual(broker.calls, [])
-
-    def test_no_broker_reports_not_initialized(self):
-        state.team_broker = None
-        r = self._patch({"review_status": "approved", "session_id": "s_team"})
-        self.assertEqual(r.status_code, 200, r.text)
-        self.assertFalse(r.json()["initialized"])
-
-    def test_dispatch_failure_reports_not_initialized(self):
-        state.team_broker = FakeTeamBroker(ok=False)
-        r = self._patch({"review_status": "approved", "session_id": "s_team"})
-        self.assertEqual(r.status_code, 200, r.text)
-        self.assertFalse(r.json()["initialized"])
 
 
 class TestMemberModelParamOverrides(TeamStoreBase):
