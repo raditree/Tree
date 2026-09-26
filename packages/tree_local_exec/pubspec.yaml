@@ -9,6 +9,9 @@ environment:
 dependencies:
   # 跨平台路径处理（Windows 盘符/分隔符由官方实现保证正确）
   path: ^1.9.0
+  # SSH/SFTP 客户端（纯 Dart，桌面可用）；密钥与口令都在进程内处理，
+  # 因此不依赖系统 ssh 客户端，也支持口令认证
+  dartssh2: ^4.1.0
 
 dev_dependencies:
   lints: ^6.0.0

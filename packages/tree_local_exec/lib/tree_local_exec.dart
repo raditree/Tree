@@ -9,6 +9,7 @@
 library;
 
 export 'src/local_workspace_io.dart';
+export 'src/ssh_workspace_io.dart';
 export 'src/shell.dart';
 export 'src/workspace_io.dart';
 
