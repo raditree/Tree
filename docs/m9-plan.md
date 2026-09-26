@@ -375,6 +375,27 @@ _paceToken 现为每增量 Future.delayed(1ms)（11e1376 引入，常开无开�
 
 **M9 复现的一处环境教训（值得留档）**：用户报「Ctrl+V 一个文件都传不了」时，实测其正在运行的是**改动前的 Release 产物**（原生无 readFiles、Dart 内核亦为旧版）；拖动上传是旧版就有的 desktop_drop 路径所以仍可用。核实手段：原生函数隔离探针（真实 CF_HDROP → 3 条路径）+ 二进制与 kernel_blob 字串检查 + LNK1104「文件被占用」反证运行中的进程。
 
+### Wave 3-L/M/N/O/P — 收尾（全部已交付提交）
+| 波次 | 内容 |
+|---|---|
+| 3-L / 3-L2 | **流式帧单调序号**：协议定义 + 前端 (id,seq) 精确判重 + 核心 _ChunkPump 按 id 独立编号（帧窗口合并占一号、空增量不占号、msg_end 带封口水位）；缺 seq 的老核心自动退回 id 级判据 |
+| 3-M | 陈旧文案修正（builtin_specs 的 wait_for、team_tool_diagnosis 的 timed_out）、README 补插件契约（station/command 入参/result/错误码/「scope 只取插件声明」）、**terminal hook 任务表与工具层共用**（stationHooks 注入 + 所有权语义 + CLI 传 tools.hooks） |
+| 3-N | **心跳参数 I/N 设置页可调**：区间 1..600s / 1..60 次，默认 10/3；I×N ≤ 10s 时抬高 I 并给可读原因（永不拒绝）；WS 侧 PATCH 后立即生效、插件/MCP 下次启动、SSH 下次建连；跨仓测试锁住「前端固定 10s 心跳 == minLivenessWindowSeconds」 |
+| 3-O | **中文乱码统一治理**：新增 ansi_code_page.dart 作为唯一解码入口（严格 UTF-8 → CP_ACP(FFI) → latin1，永不抛；编码对称、编不回去显式拒绝）；shell 换 PowerShell（UTF-8 输出 + 退出码透传）；文件读走解码链、**写/编辑保编码往返**；hook 日志/配置/MCP·插件 stdio 全部容错解码 |
+| 3-P | PowerShell 5.1 的 && / || 引号感知翻译（保守回退、绝不半翻译）、terminal 描述补 shell 说明、AtomicFile 两处严格解码改容错 |
+
+### 事故与教训（务必留档）
+1. **外部覆盖（21:56:32）**：另一套 SDK（D:\app\flutter\flutter）的 **VS Code Dart language-server**（client-id=VS-Code）等 3 个进程自该秒起存活；工作区里被写回旧版本的文件集与那个编辑器会话打开的文件一致 ⇒ 判定为**陈旧编辑器缓冲区被保存**覆盖了已提交内容。
+   处置：取证备份（%TEMP%\m9-forensics-2156）→ 从 HEAD 恢复 4 个受损文件 → 重做被冲掉的核心侧序号。
+   教训：**同一工作区不要有两个编辑器/工具链在写**；收尾前关掉另一套 SDK 的 IDE。
+2. **陈旧产物**（两次踩坑）：先是 13:27 的 Release 界面（Ctrl+V 不可用），后是 10:38 的核心（工具表只剩 5 个、无 spec 与系统提示词）。核心是**独立进程**，搜索顺序 TREE_CORE_EXE → App 同目录 → 向上 8 层找 .output。
+   处置：新增**陈旧核心告警**（产物时间对比 + 主界面可关闭横幅，纯函数 + 4 例测试）；打包时把核心放到 App 同目录。
+3. **编码边界**：字节↔文本边界共 20+ 处，按「唯一入口 + 三类清单（用户数据 / 健壮性 / 协议内 UTF-8）」系统性治理，而不是逐点打补丁。
+
+### 最终门禁（M9 收口）
+dart analyze packages 零 issue；tree_protocol 29；tree_local_exec 146 passed/1 skipped；tree_core **548 passed/1 skipped**；flutter analyze 零 issue；app **139 passed**。
+产物：.output/tree_core.exe（10.8MB，并复制到 Debug 同目录）、build/windows/x64/runner/Release/{Tree.exe, tree_core.exe}（打包自检握手 OK）。
+
 ---
 
 ## 9. 变更记录
