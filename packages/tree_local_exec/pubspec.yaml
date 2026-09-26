@@ -1,10 +1,14 @@
 name: tree_local_exec
-description: Tree 桌面端本机执行原语（从 lib/io/local_executor_service.dart 抽出的纯 Dart 实现）。
+description: Tree 桌面端本机执行原语（WorkspaceIO 的本地实现：文件读写/编辑/搜索/命令执行）。
 publish_to: 'none'
 version: 0.1.0
 
 environment:
   sdk: ^3.13.0
+
+dependencies:
+  # 跨平台路径处理（Windows 盘符/分隔符由官方实现保证正确）
+  path: ^1.9.0
 
 dev_dependencies:
   lints: ^6.0.0

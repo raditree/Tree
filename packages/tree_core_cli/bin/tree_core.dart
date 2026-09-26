@@ -56,8 +56,20 @@ Future<void> main(List<String> args) async {
 
   // 回复引擎：真实 LLM（OpenAI 兼容端点）。模型池来自 ~/.tree/config/models，
   // 因此"换模型/改密钥"只需改配置文件，不必改代码。
+  // 工具执行器：工作空间目录取 agent 配置里的 workspace_dir，未配置则落到
+  // <数据根>/workspaces/<agent_id>（首次使用时自动创建）。
+  final WorkspaceToolRunner tools = WorkspaceToolRunner(
+    resolveWorkspaceDir: (String agentId) {
+      final String configured = store.agent(agentId)?.workspaceDir ?? '';
+      return configured.trim().isNotEmpty
+          ? configured
+          : paths.defaultWorkspaceDir(agentId);
+    },
+    log: (String message) => stderr.writeln('[core:tool] $message'),
+  );
   final LlmAgentEngine engine = LlmAgentEngine(
     resolveModel: settings.model,
+    toolRunner: tools,
     log: (String message) => stderr.writeln('[core:llm] $message'),
   );
 
@@ -114,6 +126,7 @@ Future<void> main(List<String> args) async {
   await control.cancel();
   stderr.writeln('[tree_core] shutting down');
   await server.close();
+  await tools.close();
   await stdout.flush();
   await stderr.flush();
   // 显式退出：stdin 订阅会让事件循环保持存活，返回 main 不保证 VM 结束

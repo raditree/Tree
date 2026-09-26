@@ -103,6 +103,13 @@ class TreePaths {
   String messagesFile(String agentId, String sessionId) =>
       p.join(sessionDir(agentId, sessionId), 'messages.jsonl');
 
+  /// agent 的**默认工作空间目录**（`<root>/workspaces/<agent_id>`）。
+  ///
+  /// 仅当 agent 配置里 `workspace_dir` 为空时使用；用户可以在
+  /// `agents/<id>.yaml` 里直接改成自己的项目目录。
+  String defaultWorkspaceDir(String agentId) =>
+      p.join(root, 'workspaces', safeSegment(agentId));
+
   /// 创建全部必需目录（幂等）。
   Future<void> ensureLayout() async {
     for (final String dir in <String>[

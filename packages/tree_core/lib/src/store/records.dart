@@ -21,6 +21,7 @@ class CoreAgent {
     this.systemPrompt = '',
     this.modelId = '',
     this.workspaceId = '',
+    this.workspaceDir = '',
     this.teamMemberCount = 0,
     this.maxLevel = 1,
     this.maxMembersPerLevel = 0,
@@ -31,6 +32,13 @@ class CoreAgent {
   String systemPrompt;
   String modelId;
   String workspaceId;
+
+  /// agent 的工作空间目录（绝对路径）。
+  ///
+  /// 空串 = 未指定，由工具层落到默认位置 `<数据根>/workspaces/<agent_id>`。
+  /// 用户可以直接手改 `agents/<id>.yaml` 的 `workspace_dir` 指向自己的项目目录
+  /// —— 这是"绕开 UI 直接改配置"的关键入口。
+  String workspaceDir;
   int teamMemberCount;
   int maxLevel;
   int maxMembersPerLevel;
@@ -44,6 +52,7 @@ class CoreAgent {
     'system_prompt': systemPrompt,
     'model_id': modelId,
     'workspace_id': workspaceId,
+    'workspace_dir': workspaceDir,
     'team_member_count': teamMemberCount,
     'max_level': maxLevel,
     'max_members_per_level': maxMembersPerLevel,
@@ -60,6 +69,7 @@ class CoreAgent {
       systemPrompt: json['system_prompt'] as String? ?? '',
       modelId: json['model_id'] as String? ?? '',
       workspaceId: json['workspace_id'] as String? ?? '',
+      workspaceDir: json['workspace_dir'] as String? ?? '',
       teamMemberCount: (json['team_member_count'] as num?)?.toInt() ?? 0,
       maxLevel: (json['max_level'] as num?)?.toInt() ?? 1,
       maxMembersPerLevel: (json['max_members_per_level'] as num?)?.toInt() ?? 0,
@@ -81,6 +91,7 @@ class CoreAgent {
     'system_prompt': systemPrompt,
     'model_id': modelId,
     'workspace_id': workspaceId,
+    'workspace_dir': workspaceDir,
     'last_message': lastMessage,
     'last_message_time': lastMessageTime,
     'unread_count': unreadCount,

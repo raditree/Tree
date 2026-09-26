@@ -72,6 +72,9 @@ abstract interface class ToolRunner {
     ToolInvocation invocation, {
     bool Function()? isCancelled,
   });
+
+  /// 释放资源（幂等）。
+  Future<void> close();
 }
 
 /// M3 的占位执行器：不声明任何工具。
@@ -93,4 +96,7 @@ class EmptyToolRunner implements ToolRunner {
     ToolInvocation invocation, {
     bool Function()? isCancelled,
   }) async => const ToolOutcome('工具执行器尚未接入（M4）：无法执行该工具', isError: true);
+
+  @override
+  Future<void> close() async {}
 }

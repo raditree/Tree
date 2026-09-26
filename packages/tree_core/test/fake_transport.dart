@@ -75,6 +75,9 @@ class FakeToolRunner implements ToolRunner {
     if (error != null) return ToolOutcome('$error', isError: true);
     return ToolOutcome(result);
   }
+
+  @override
+  Future<void> close() async {}
 }
 
 /// 组装一段"正文流式输出"的脚本。

@@ -1,32 +1,37 @@
-/// 本机执行原语（M0b 骨架，M4 落实现）。
+/// 本机执行原语（M4 落地）。
 ///
 /// 迁移来源：`lib/io/local_executor_service.dart`（1663 行）与
-/// `lib/io/ssh_workspace_executor.dart`（1375 行）中**与 Flutter 无关**的部分——
-/// 重点是 Windows 下已踩过坑的细节，必须原样保留：
-/// - cmd/bash 选择与 WSL/Unix 风格目录判定（`isUnixLikePath` / `resolveShellForDir`）；
-/// - `chcp.com 65001` 前缀（cmd 内置命令输出 UTF-8）；
-/// - 严格 UTF-8 → latin1 回退解码（不抛异常）；
-/// - grep 命中行**发送端**截断（避免超帧被静默断连）。
+/// `lib/io/ssh_workspace_executor.dart`（1375 行）中**与 Flutter 无关**的部分。
+///
+/// 在 desktop 分支里这些原语**直接由核心进程调用**（核心就跑在用户机器上），
+/// 不再需要"核心 → 前端反向 WS → 前端执行"的往返：因此 `tool_exec_request` /
+/// `tool_exec_response` 那套反向协议与前端两个执行器服务都成了多余（M7 清理）。
 library;
 
-/// 本机执行后端分组（M0b 占位，M4 拆分为 local / ssh 两个实现）。
+export 'src/local_workspace_io.dart';
+export 'src/workspace_io.dart';
+
+/// 本机执行后端分组（本地已实现；SSH 在 M4-4 落地）。
 abstract final class TreeLocalExec {
-  /// 当前已实现的后端分组数。
+  /// 当前已实现的后端分组数（local / ssh）。
   static const int backendCount = 2;
 
-  /// 工作空间 IO 原语名（与 server `WorkspaceIO` 抽象一一对应）。
+  /// 工作空间 IO 原语名（与 [WorkspaceIO] 的方法一一对应）。
   static const List<String> ioPrimitives = <String>[
     'read_file',
     'write_file',
-    'read_file_base64',
-    'write_file_base64',
-    'exec_shell',
-    'exec_shell_hook',
-    'cancel_exec_hook',
-    'exec_argv',
+    'edit_file',
     'grep_search',
-    'git_log',
-    'git_branches',
     'list_files',
+    'exec_shell',
+  ];
+
+  /// 内置工具名（工具层声明用；team/message/spec/ask_user_question 属 M5，mcp 属 M6）。
+  static const List<String> builtinToolNames = <String>[
+    'read',
+    'write',
+    'edit',
+    'grep',
+    'terminal',
   ];
 }
