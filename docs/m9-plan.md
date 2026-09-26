@@ -339,6 +339,24 @@ _paceToken 现为每增量 Future.delayed(1ms)（11e1376 引入，常开无开�
 1. **Q3 消息分段**（照旧后端 server/agent/chat.py:1984-2210）：thinking 段遇 text / tool_call / 提问即关闭；text 段遇 tool_call 即关闭并**独立落库**（中间输出不再并进最终回复）；tool 调用一条一张卡片；最终回复带 usage；落库加**单调序号**保证重载顺序稳定。
 2. **Q13 token 管道**：工具调用参数按 `字符数 / token_scale` 折算 token，与思考**共用同一条 token rate 管道**推送 tool_start；tool_end **直接推**；推完再进下一轮 API 调用。
 
+### Wave 3-H 基础设施工（tree_core：util / mcp / team / server）— 已交付（提交见 git log feat(m9-h)）
+| 条目 | 结果 | 要点 |
+|---|---|---|
+| 通用心跳台账 | 完成 | 新增 util/liveness.dart 的 **LivenessTracker**（I=10s / N=3 可配、clock 可注入、guard/watchStale/reset、LivenessLostException 含「心跳丢失」「链路失活」）；语义与 Wave 1-C 的 SshLiveness 一致 |
+| MCP | 完成 | 静态超时全删（含原 20s 握手）；每 I 发一次 ping（只发不等）+ 收到任意合法 JSON-RPC 消息即算心跳；连续 N 拍无心跳 ⇒ degraded，在途请求抛 McpLivenessException（不挂起、不杀进程、不关连接），恢复自动清除 |
+| 消息派发 / WS 发送 | 完成 | 发送无静态超时、无 TTL；失活或断链的帧进待补发队列（上限 + 计数丢弃）；判死 ⇒ 错误日志 + 关连接（触发前端重连）+ 重连后按拍补发；派发判活点在 _deliverOne 最开头，失活 ⇒ fail-closed（不落库、不触发生成、显式 rejected、登记补发），flushPendingResends 不丢不重 |
+
+验证：dart analyze（mcp/team/server/util/barrel）零 issue；相关 7 文件 **48 passed**；整包全量 **471 passed / 1 skipped / 0 failed**（基线 447+1skip，未劣化）。
+
+**主控收口**
+- WS 判活窗口：H 交付时取 30s（对齐前端 30s 心跳），与用户确认的 I=10s/N=3 不一致 ⇒ 已两侧一起拉回：前端 lib/io/websocket_service.dart 心跳 30s → 10s，服务端 heartbeatInterval 默认 → LivenessTracker.defaultInterval（提交 fix(m9)）。约束写入两侧注释：**前端心跳间隔必须小于服务端判活窗口 I×N**。
+
+**待办（Wave 3-I 收尾）**
+1. plugin_host / plugin_bus 残留的 connectTimeout/callTimeout 与 plugin_heartbeat.dart 双台账 ⇒ 统一到 util/liveness.dart（已指令 F）。
+2. wait_for 的 timeout（默认 300 / 上限 600）与 terminal 的 timeout_seconds：按 1.1 处理（无静态上限；失活 ⇒ 返回部分结果 + 标注未响应者；terminal 的 schema 不应再宣称可限定时长）。
+3. WS 断线补发帧重播可能与前端重连后的历史重拉重复渲染 ⇒ 核对前端是否按 message id 去重。
+4. LLM 传输内部 _HeartbeatCounter 与 LivenessTracker 语义等价 ⇒ 可选统一，本轮不动。
+
 ---
 
 ## 9. 变更记录
