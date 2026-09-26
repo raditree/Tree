@@ -268,6 +268,7 @@ _paceToken 现为每增量 Future.delayed(1ms)（11e1376 引入，常开无开�
 - 本地 exec：活性 = 进程存活，活着永不超时；**唯一的静态窗口**是「进程已死之后的残余管道收尾」（300ms 输出静默 + 3s 兜底，放弃时取消订阅）——属收尾而非任务上限；主控裁定保留（否则持续输出型后台进程会让工具调用永久挂住，与「不要永久挂起」冲突）。
 - 接口变更：SshTransport.isConnected → SshLiveness get liveness（全仓无包外实现者）。
 - **服务端兼容性提醒**：心跳观测依赖服务端对 keepalive 全局请求有回包（OpenSSH 回 FAILURE 算回）；静默忽略该请求的非常规服务端会被判失活。
+- **真机实证（2026，主控临时探针，跑完即删）**：对 open@192.168.0.208（/mnt/space）连接后静默 35s（> I×N=30s），观测到 `missed=0 / stale=false`，随后 `pwd` 正常返回 `/mnt/space` —— 真机 OpenSSH 确实回 keepalive 全局请求，兼容性风险已排除。
 - 验证：dart analyze packages/tree_local_exec 零 issue；包内 103 passed / 1 skipped（新增 17 例）。
 
 ### Wave 2 任务定义（Wave 1-A 收口后启动）
