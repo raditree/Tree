@@ -1,53 +1,43 @@
-import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show File, Platform, RandomAccessFile;
+import 'dart:io' show File, RandomAccessFile;
 import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
 
 import '../ui/models/agent.dart';
 import '../ui/models/file_node.dart';
 import '../ui/models/session.dart';
-import 'auth_service.dart';
 
-/// API 服务 - 封装后端 REST API 调用
+/// API 服务 - 封装对**本机核心进程**的 REST 调用。
 ///
-/// 统一管理对后端（FastAPI）的 HTTP 请求，包括微信扫码登录、
-/// 文件管理、Git 历史等接口。网络错误或非 200 状态码时抛出中文异常，
-/// 便于在 UI 上直接展示。
+/// desktop 分支已取消后端与账号体系：`baseUrl` 指向核心进程在本机回环上
+/// 监听的随机端口（由 [CoreProcessLauncher] 通过握手下发），并且每个请求都
+/// 必须携带核心下发的一次性本地 token。协议形状（路径/字段/状态码）与既有
+/// 后端保持一致，因此上层 UI 无需改动。
 class ApiService {
-  /// 后端服务地址
-  static String baseUrl = 'http://localhost:8000';
-
-  /// 平台默认后端主机名
+  /// 核心进程基址（形如 `http://127.0.0.1:54321`）。
   ///
-  /// - Android 模拟器通过 ``10.0.2.2`` 访问宿主机（localhost 指模拟器自身）
-  /// - 其余平台（Windows / Linux / macOS / Web）默认 ``localhost``
-  /// 用户在后端配置页自定义 IP+端口后不再使用此默认值。
-  static String defaultBackendHost() {
-    if (!kIsWeb && Platform.isAndroid) return '10.0.2.2';
-    return 'localhost';
-  }
+  /// 由 main() 在启动核心后写入；未启动时该值无意义。
+  static String baseUrl = 'http://127.0.0.1:0';
 
-  /// 当前 JWT token（登录后设置，用于鉴权请求）
+  /// 当前本地 token（核心进程每次启动重新生成）
   static String? _token;
 
-  /// 认证失败回调（token 过期/无效时触发，用于跳转登录页）
-  static void Function()? onAuthError;
+  /// 当前本地 token（供 WebSocket 与执行器服务复用）。
+  static String? get token => _token;
 
-  /// 设置全局 JWT token
+  /// 设置全局本地 token
   ///
-  /// 登录成功或应用启动恢复登录态时调用，后续所有需要鉴权的请求
-  /// 会自动携带 `Authorization: Bearer <token>` 头。
+  /// 应用启动拿到核心握手后调用一次，之后所有请求自动携带
+  /// `Authorization: Bearer <token>` 头。
   static void setToken(String? token) {
     _token = token;
   }
 
   /// 构造请求头
   ///
-  /// 默认携带 `Content-Type: application/json`，若已设置 token 则追加
-  /// `Authorization` 头。公开接口（二维码、登录状态查询）不使用此方法。
+  /// 核心进程要求全部 `/api/*` 请求携带本地 token；未设置 token 时请求会
+  /// 被核心以 401 拒绝（这是编程错误，正常情况下启动流程已设置好）。
   static Map<String, String> _getHeaders() {
     final headers = <String, String>{
       'Content-Type': 'application/json',
@@ -58,163 +48,7 @@ class ApiService {
     return headers;
   }
 
-  /// 获取微信扫码登录二维码
-  ///
-  /// 调用 `GET /api/auth/wechat/qrcode`，返回 `{"url": "...", "state": "..."}`。
-  /// 网络异常或后端返回错误时抛出中文异常。
-  @Deprecated('已由账号密码登录替代（checklist 1）')
-  static Future<Map<String, dynamic>> getQrCode() async {
-    final Uri uri = Uri.parse('$baseUrl/api/auth/wechat/qrcode');
-    try {
-      final http.Response response = await http.get(uri);
-      if (response.statusCode != 200) {
-        throw Exception('获取二维码失败（HTTP ${response.statusCode}）');
-      }
-      return _parseJson(response.body);
-    } on Exception {
-      rethrow;
-    } catch (e) {
-      throw Exception('网络请求失败，请检查后端服务是否启动');
-    }
-  }
-
-  /// 查询微信扫码登录状态
-  ///
-  /// 调用 `GET /api/auth/wechat/status?state=xxx`，返回
-  /// `{"status": "pending"}` 或
-  /// `{"status": "success", "token": "...", "user": {...}}`。
-  /// 网络异常或后端返回错误时抛出中文异常。
-  @Deprecated('已由账号密码登录替代（checklist 1）')
-  static Future<Map<String, dynamic>> checkLoginStatus(String state) async {
-    final Uri uri = Uri.parse(
-      '$baseUrl/api/auth/wechat/status?state=$state',
-    );
-    try {
-      final http.Response response = await http.get(uri);
-      if (response.statusCode != 200) {
-        throw Exception('查询登录状态失败（HTTP ${response.statusCode}）');
-      }
-      return _parseJson(response.body);
-    } on Exception {
-      rethrow;
-    } catch (e) {
-      throw Exception('网络请求失败，请检查后端服务是否启动');
-    }
-  }
-
-  /// 开发模式模拟微信扫码登录
-  ///
-  /// 调用 `GET /api/auth/wechat/callback?code=mock_code&state=xxx`，
-  /// 后端在开发模式下返回模拟用户数据与 JWT token。
-  /// 网络异常或后端返回错误时抛出中文异常。
-  @Deprecated('已由账号密码登录替代（checklist 1）')
-  static Future<Map<String, dynamic>> mockWechatLogin(String state) async {
-    final Uri uri = Uri.parse(
-      '$baseUrl/api/auth/wechat/callback?code=mock_code&state=$state',
-    );
-    try {
-      final http.Response response = await http.get(uri);
-      if (response.statusCode != 200) {
-        throw Exception('模拟登录失败（HTTP ${response.statusCode}）');
-      }
-      return _parseJson(response.body);
-    } on Exception {
-      rethrow;
-    } catch (e) {
-      throw Exception('网络请求失败，请检查后端服务是否启动');
-    }
-  }
-
-  /// 账号密码注册
-  ///
-  /// 调用 `POST /api/auth/register`，请求体为
-  /// `{"username", "password", "nickname"}`，返回 `{"token", "user"}`。
-  /// 注册开启邀请码时，[invitationCode] 非空会附带 `invitation_code` 字段。
-  /// 用户名冲突或校验失败时抛出中文异常。
-  static Future<Map<String, dynamic>> register({
-    required String username,
-    required String password,
-    String nickname = '',
-    String invitationCode = '',
-  }) async {
-    final http.Response response = await http.post(
-      Uri.parse('$baseUrl/api/auth/register'),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'username': username,
-        'password': password,
-        'nickname': nickname,
-        if (invitationCode.isNotEmpty) 'invitation_code': invitationCode,
-      }),
-    );
-    if (response.statusCode != 200) {
-      throw Exception(_errorFromBody(response));
-    }
-    return _parseJson(utf8.decode(response.bodyBytes));
-  }
-
-  /// 账号密码登录
-  ///
-  /// 调用 `POST /api/auth/login`，请求体为 `{"username", "password"}`，
-  /// 返回 `{"token", "user"}`。用户名或密码错误时抛出中文异常。
-  static Future<Map<String, dynamic>> login({
-    required String username,
-    required String password,
-  }) async {
-    final http.Response response = await http.post(
-      Uri.parse('$baseUrl/api/auth/login'),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({'username': username, 'password': password}),
-    );
-    if (response.statusCode != 200) {
-      throw Exception(_errorFromBody(response));
-    }
-    return _parseJson(utf8.decode(response.bodyBytes));
-  }
-
-  /// 查询注册配置（邀请码注册开关与等级配置）
-  ///
-  /// 调用 `GET /api/auth/registration-config`，返回
-  /// `{"enabled": bool, "levels": {level: {...}}}`。
-  /// 网络异常或后端返回错误时抛出中文异常。
-  static Future<Map<String, dynamic>> getRegistrationConfig() async {
-    return _getJson('/api/auth/registration-config');
-  }
-
-  /// 使用邀请码升级等级
-  ///
-  /// 调用 `POST /api/auth/upgrade`，请求体为 `{"invitation_code": "..."}`，
-  /// 需登录。返回 `{"level": "...", "user": {...}}`。
-  /// 网络异常或后端返回错误时抛出中文异常。
-  static Future<Map<String, dynamic>> upgradeLevel(String invitationCode) async {
-    return _postJson('/api/auth/upgrade', body: {
-      'invitation_code': invitationCode,
-    });
-  }
-
-  /// 查询账号注销状态
-  ///
-  /// 调用 `GET /api/auth/account/status`，返回
-  /// `{"status": "active"|"pending_delete"|"deleting", ...}`。
-  static Future<Map<String, dynamic>> getAccountStatus() async {
-    return _getJson('/api/auth/account/status');
-  }
-
-  /// 请求注销账号（进入十日倒计时）
-  ///
-  /// 调用 `POST /api/auth/account/delete-request`。
-  static Future<Map<String, dynamic>> requestAccountDelete() async {
-    return _postJson('/api/auth/account/delete-request');
-  }
-
-  /// 取消注销账号
-  ///
-  /// 调用 `POST /api/auth/account/delete-cancel`。
-  static Future<Map<String, dynamic>> cancelAccountDelete() async {
-    return _postJson('/api/auth/account/delete-cancel');
-  }
-
-  /// 从响应中提取后端返回的错误信息（detail 字段）
+  /// 从响应中提取核心进程返回的错误信息（detail 字段）
   static String _errorFromBody(http.Response response) {
     try {
       final Map<String, dynamic> data =
@@ -271,7 +105,7 @@ class ApiService {
   ///
   /// 调用 `GET /api/files/{workspace_id}/pdf_info?path=xxx`，返回
   /// `{"total_pages": N, "title": "...", "author": "..."}`。
-  /// 网络异常或后端返回错误时抛出中文异常。
+  /// 网络异常或核心进程返回错误时抛出中文异常。
   static Future<Map<String, dynamic>> getPdfInfo(
     String workspaceId,
     String path, {
@@ -288,7 +122,7 @@ class ApiService {
   /// 调用 `GET /api/files/{workspace_id}/pdf_preview?path=xxx&page=N&scale=S`，
   /// 返回 `{"image": "base64...", "page": N, "total_pages": M, "width": W, "height": H}`。
   /// [page] 从 1 开始，[scale] 控制分辨率（默认 2.0）。
-  /// 网络异常或后端返回错误时抛出中文异常。
+  /// 网络异常或核心进程返回错误时抛出中文异常。
   static Future<Map<String, dynamic>> getPdfPreview(
     String workspaceId,
     String path, {
@@ -310,7 +144,7 @@ class ApiService {
   ///
   /// 调用 `GET /api/workspaces/{workspace_id}/git/log?limit=50`，返回
   /// `{"commits": [...]}`，每条提交包含 hash、message、date 等字段。
-  /// 网络异常或后端返回错误时抛出中文异常。
+  /// 网络异常或核心进程返回错误时抛出中文异常。
   static Future<List<Map<String, dynamic>>> getGitLog(
     String workspaceId, {
     int limit = 50,
@@ -331,7 +165,7 @@ class ApiService {
   ///
   /// 调用 `GET /api/workspaces/{workspace_id}/git/branches`，返回
   /// `{"branches": [...], "current": "..."}`。
-  /// 网络异常或后端返回错误时抛出中文异常。
+  /// 网络异常或核心进程返回错误时抛出中文异常。
   static Future<Map<String, dynamic>> getGitBranches(
     String workspaceId, {
     String teamId = '',
@@ -378,9 +212,8 @@ class ApiService {
         body: jsonEncode({'path': filePath}),
       );
       if (response.statusCode == 401) {
-        _token = null;
-        onAuthError?.call();
-        throw Exception('登录已过期，请重新登录');
+        // 本地 token 无效（核心重启会换 token）：正常流程不应出现
+        throw Exception('核心进程拒绝了本次请求（本地 token 无效）');
       }
       if (response.statusCode != 200) {
         throw Exception(_errorFromBody(response));
@@ -390,7 +223,7 @@ class ApiService {
       if (e is Exception) {
         rethrow;
       }
-      throw Exception('网络请求失败，请检查后端服务是否启动');
+      throw Exception('核心进程不可达，请重启应用');
     }
   }
 
@@ -415,9 +248,8 @@ class ApiService {
         body: jsonEncode({'path': folderPath}),
       );
       if (response.statusCode == 401) {
-        _token = null;
-        onAuthError?.call();
-        throw Exception('登录已过期，请重新登录');
+        // 本地 token 无效（核心重启会换 token）：正常流程不应出现
+        throw Exception('核心进程拒绝了本次请求（本地 token 无效）');
       }
       if (response.statusCode != 200) {
         throw Exception(_errorFromBody(response));
@@ -427,7 +259,7 @@ class ApiService {
       if (e is Exception) {
         rethrow;
       }
-      throw Exception('网络请求失败，请检查后端服务是否启动');
+      throw Exception('核心进程不可达，请重启应用');
     }
   }
 
@@ -471,7 +303,7 @@ class ApiService {
     } on Exception {
       rethrow;
     } catch (e) {
-      throw Exception('网络请求失败，请检查后端服务是否启动');
+      throw Exception('核心进程不可达，请重启应用');
     }
   }
 
@@ -563,7 +395,7 @@ class ApiService {
   /// 调用 `GET /api/conversations/{agent_id}?session_id=xxx`，返回
   /// `{"agent_id": "...", "session_id": "...", "messages": [...]}`。
   /// [sessionId] 缺省为默认会话；传 `"all"` 时返回该 agent 全部会话的消息。
-  /// 网络异常或后端返回错误时抛出中文异常。
+  /// 网络异常或核心进程返回错误时抛出中文异常。
   static Future<List<Map<String, dynamic>>> getConversationHistory(
     String agentId, {
     String sessionId = 'session_default',
@@ -584,7 +416,7 @@ class ApiService {
   /// `{"success": true, "deleted": N}`。
   /// 传 "all" 可清空当前用户所有 agent 的历史；[sessionId] 为空时清空该
   /// agent 全部会话。
-  /// 网络异常或后端返回错误时抛出中文异常。
+  /// 网络异常或核心进程返回错误时抛出中文异常。
   static Future<int> clearConversationHistory(
     String agentId, {
     String? sessionId,
@@ -606,7 +438,7 @@ class ApiService {
     } on Exception {
       rethrow;
     } catch (e) {
-      throw Exception('网络请求失败，请检查后端服务是否启动');
+      throw Exception('核心进程不可达，请重启应用');
     }
   }
 
@@ -679,7 +511,7 @@ class ApiService {
     } on Exception {
       rethrow;
     } catch (e) {
-      throw Exception('网络请求失败，请检查后端服务是否启动');
+      throw Exception('核心进程不可达，请重启应用');
     }
   }
 
@@ -717,7 +549,7 @@ class ApiService {
   ///
   /// 调用 `GET /api/agents/{id}/models-info`，返回
   /// `{"models": [{"model_id","name","max_seqlen","thinking","if_vision","base_url"}], "current": {...}}`。
-  /// 网络异常或后端返回错误时抛出中文异常。
+  /// 网络异常或核心进程返回错误时抛出中文异常。
   static Future<Map<String, dynamic>> getAgentModelsInfo(String agentId) async {
     return _getJson('/api/agents/$agentId/models-info');
   }
@@ -783,7 +615,7 @@ class ApiService {
   /// 返回结构见契约 v1.3 §15.1（instances / stations / watchdog / config）；
   /// 总开关关闭时后端仍返回 200 + `enabled: false`（空集）。
   /// 前端对响应做宽容解析（缺字段/未知字段容忍），此处不做校验。
-  /// 网络异常或后端返回错误时抛出中文异常。
+  /// 网络异常或核心进程返回错误时抛出中文异常。
   static Future<Map<String, dynamic>> getPluginSnapshot({String? teamId}) async {
     return _getJson('/api/plugin/snapshot', query: <String, String>{
       if (teamId != null && teamId.isNotEmpty) 'team_id': teamId,
@@ -795,7 +627,7 @@ class ApiService {
   /// 列出已注册的 MCP 服务
   ///
   /// 调用 `GET /api/mcp/services`，返回 `{"services": [{"name","command","args","builtin","enabled"}]}`。
-  /// 网络异常或后端返回错误时抛出中文异常。
+  /// 网络异常或核心进程返回错误时抛出中文异常。
   static Future<List<Map<String, dynamic>>> getMcpServices() async {
     final Map<String, dynamic> data = await _getJson('/api/mcp/services');
     final List<dynamic> services = data['services'] as List<dynamic>? ?? [];
@@ -809,7 +641,7 @@ class ApiService {
   /// 调用 `POST /api/mcp/services`，请求体为
   /// `{"name","command","args","scope","env"}`。`scope` 取
   /// ``""``/``server``/``local``/``ssh``，空串表示按当前会话模式自动落点。
-  /// 网络异常或后端返回错误时抛出中文异常。
+  /// 网络异常或核心进程返回错误时抛出中文异常。
   static Future<Map<String, dynamic>> registerMcpService({
     required String name,
     required String command,
@@ -829,7 +661,7 @@ class ApiService {
   /// 删除一个 MCP 服务
   ///
   /// 调用 `DELETE /api/mcp/services/{name}`。
-  /// 网络异常或后端返回错误时抛出中文异常。
+  /// 网络异常或核心进程返回错误时抛出中文异常。
   static Future<void> deleteMcpService(String name) async {
     final Uri uri = Uri.parse(
       '$baseUrl/api/mcp/services/${Uri.encodeComponent(name)}',
@@ -843,7 +675,7 @@ class ApiService {
     } on Exception {
       rethrow;
     } catch (e) {
-      throw Exception('网络请求失败，请检查后端服务是否启动');
+      throw Exception('核心进程不可达，请重启应用');
     }
   }
 
@@ -871,7 +703,7 @@ class ApiService {
     } on Exception {
       rethrow;
     } catch (e) {
-      throw Exception('网络请求失败，请检查后端服务是否启动');
+      throw Exception('核心进程不可达，请重启应用');
     }
   }
 
@@ -951,7 +783,7 @@ class ApiService {
     } on Exception {
       rethrow;
     } catch (e) {
-      throw Exception('网络请求失败，请检查后端服务是否启动');
+      throw Exception('核心进程不可达，请重启应用');
     }
   }
 
@@ -1121,19 +953,6 @@ class ApiService {
     );
   }
 
-  /// 修改密码
-  ///
-  /// 调用 `POST /api/auth/change-password`，请求体为 `{"old_password": "...", "new_password": "..."}`。
-  static Future<void> changePassword({
-    required String oldPassword,
-    required String newPassword,
-  }) async {
-    await _postJson('/api/auth/change-password', body: {
-      'old_password': oldPassword,
-      'new_password': newPassword,
-    });
-  }
-
   /// 设置数据收集开关
   ///
   /// 调用 `POST /api/settings/data-collection`，请求体为 `{"enabled": true/false}`。
@@ -1183,25 +1002,6 @@ class ApiService {
     return (data['mode'] as String?) == 'direct';
   }
 
-  /// 登出：撤销当前 token（后端侧）
-  ///
-  /// 调用 `POST /api/auth/logout`。本地清理由调用方（AuthService）负责。
-  static Future<void> logout() async {
-    try {
-      final http.Response response = await http.post(
-        Uri.parse('$baseUrl/api/auth/logout'),
-        headers: _getHeaders(),
-      );
-      if (response.statusCode != 200) {
-        throw Exception('登出失败（HTTP ${response.statusCode}）');
-      }
-    } on Exception {
-      rethrow;
-    } catch (e) {
-      throw Exception('网络请求失败，请检查后端服务是否启动');
-    }
-  }
-
   // ==================== 内部工具方法 ====================
 
   /// 发送 GET 请求并解析 JSON 响应
@@ -1220,7 +1020,7 @@ class ApiService {
       if (e is Exception) {
         rethrow;
       }
-      throw Exception('网络请求失败，请检查后端服务是否启动');
+      throw Exception('核心进程不可达，请重启应用');
     }
   }
 
@@ -1247,7 +1047,7 @@ class ApiService {
       if (e is Exception) {
         rethrow;
       }
-      throw Exception('网络请求失败，请检查后端服务是否启动');
+      throw Exception('核心进程不可达，请重启应用');
     }
   }
 
@@ -1271,7 +1071,7 @@ class ApiService {
       if (e is Exception) {
         rethrow;
       }
-      throw Exception('网络请求失败，请检查后端服务是否启动');
+      throw Exception('核心进程不可达，请重启应用');
     }
   }
 
@@ -1289,23 +1089,21 @@ class ApiService {
       if (e is Exception) {
         rethrow;
       }
-      throw Exception('网络请求失败，请检查后端服务是否启动');
+      throw Exception('核心进程不可达，请重启应用');
     }
   }
 
   /// 统一处理响应状态码
   ///
-  /// - 401：token 过期或无效，清除 token 并触发跳转登录页
-  /// - 501：抛出"功能开发中"异常
+  /// - 401：本地 token 无效（核心进程重启会换 token）
+  /// - 501：该能力尚未在核心进程实现（迁移期里程碑的显式标记）
   /// - 非 200：抛出 HTTP 状态码异常
   /// - 200：解析 JSON 响应体（强制 UTF-8 解码，避免中文乱码）
   static Map<String, dynamic> _handleResponse(http.Response response) {
     if (response.statusCode == 401) {
-      // token 过期或无效，清除本地凭证并跳转登录页
-      unawaited(AuthService().clearToken());
-      setToken(null);
-      onAuthError?.call();
-      throw Exception('登录已过期，请重新登录');
+      // 桌面分支没有账号体系：401 只可能是本地 token 不对（例如应用连上了
+      // 上一轮遗留的核心实例）。**不清 token、不跳登录页**，只报错。
+      throw Exception('核心进程拒绝了本次请求（本地 token 无效）');
     }
     if (response.statusCode == 501) {
       throw Exception('功能开发中');
@@ -1313,7 +1111,7 @@ class ApiService {
     if (response.statusCode != 200) {
       throw Exception(_errorFromBody(response));
     }
-    // 后端 Content-Type 为 application/json（无 charset），
+    // 核心进程的 Content-Type 为 application/json（无 charset），
     // http 包默认按 latin-1 解码导致中文乱码，这里强制 UTF-8。
     final String body = utf8.decode(response.bodyBytes);
     return _parseJson(body);
@@ -1326,7 +1124,7 @@ class ApiService {
     try {
       return jsonDecode(body) as Map<String, dynamic>;
     } catch (e) {
-      throw Exception('解析后端响应失败');
+      throw Exception('解析核心进程响应失败');
     }
   }
 }

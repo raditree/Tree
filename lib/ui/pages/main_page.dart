@@ -4,18 +4,15 @@ import 'package:flutter/material.dart';
 
 import '../models/agent.dart';
 import '../../io/api_service.dart';
-import '../../io/auth_service.dart';
 import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
 import '../../io/ssh_executor_service.dart';
-import '../../io/websocket_service.dart';
 import '../widgets/agent_list.dart';
 import '../widgets/create_agent_dialog.dart';
 import '../widgets/file_panel.dart';
 import '../widgets/message_panel.dart';
 import '../widgets/plugin_panel.dart';
 import '../widgets/teammates_window_page.dart';
-import 'login_page.dart';
 import 'settings_page.dart';
 
 /// 主页面 - 三栏布局
@@ -261,35 +258,17 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    // 注册认证失败回调：token 过期时跳转登录页
-    ApiService.onAuthError = _handleAuthError;
-    WebSocketService.onAuthError = _handleAuthError;
     _loadAgents();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    // 清除回调，避免内存泄漏
-    ApiService.onAuthError = null;
-    WebSocketService.onAuthError = null;
-    // 清理本地执行器：注销后端注册并释放 WebSocket 引用
+    // 清理本地执行器：注销核心进程注册并释放 WebSocket 引用
     LocalExecutorService.instance.cleanup();
     // 清理 SSH 执行器：仅释放引用（不注销，SSH 配置后端持久化）
     SshExecutorService.instance.cleanup();
     super.dispose();
-  }
-
-  /// 处理认证失败：清除 token 并跳转回登录页
-  void _handleAuthError() {
-    // 清除本地 token
-    unawaited(AuthService().clearToken());
-    ApiService.setToken(null);
-    // 跳转登录页
-    Navigator.of(context).pushAndRemoveUntil(
-      MaterialPageRoute(builder: (_) => const LoginPage()),
-      (route) => false,
-    );
   }
 
   @override

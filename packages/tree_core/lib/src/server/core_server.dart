@@ -109,6 +109,13 @@ class CoreServer {
   /// 启动时刻。
   DateTime startedAt = DateTime.now();
 
+  /// 请求级访问日志回调（CLI `--verbose` 打开；默认关闭以免刷屏）。
+  void Function(String message)? accessLog;
+
+  void _access(HttpRequest request, int status) {
+    accessLog?.call('${request.method} ${request.uri.path} -> $status');
+  }
+
   // ── 运行统计（自检、测试与日志用） ──────────────────────────────────
   int httpRequests = 0;
   int rejectedRequests = 0;
@@ -197,6 +204,7 @@ class CoreServer {
     unawaited(
       _handle(request).catchError((Object error, StackTrace _) async {
         internalErrors++;
+        _access(request, 500);
         try {
           await writeJson(request, 500, errorBody('核心进程内部错误：$error'));
         } catch (_) {
@@ -217,6 +225,7 @@ class CoreServer {
       request.headers.value(HttpHeaders.authorizationHeader),
     )) {
       rejectedRequests++;
+      _access(request, 401);
       await writeJson(request, 401, errorBody('本地 token 无效'));
       return;
     }
@@ -228,9 +237,11 @@ class CoreServer {
         stubRouter.match(request.method, segments);
     if (match != null) {
       await match.route.handler(request, match.params);
+      _access(request, request.response.statusCode);
       return;
     }
     notFoundRequests++;
+    _access(request, 404);
     await writeJson(request, 404, errorBody('未知接口：${request.uri.path}'));
   }
 
@@ -239,16 +250,20 @@ class CoreServer {
   Future<void> _handleWebSocket(HttpRequest request) async {
     if (!CoreToken.matches(token, request.uri.queryParameters['token'])) {
       rejectedRequests++;
+      _access(request, 401);
       await writeJson(request, 401, errorBody('本地 token 无效'));
       return;
     }
     if (!WebSocketTransformer.isUpgradeRequest(request)) {
+      _access(request, 400);
       await writeJson(request, 400, errorBody('该端点需要 WebSocket 升级握手'));
       return;
     }
     final WebSocket socket = await WebSocketTransformer.upgrade(request);
     final WsConnection connection = WsConnection(socket: socket);
     hub.register(connection);
+    // 101 = Switching Protocols（升级成功的 HTTP 语义状态码）
+    _access(request, 101);
     socket.listen(
       (dynamic data) => _handleWsFrame(connection, data),
       onDone: () => hub.unregister(connection.id),

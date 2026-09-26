@@ -61,6 +61,43 @@ void main() {
     );
   });
 
+  test('前端已不再引用账号体系路径（M1b 删除登录与账号设置）', () {
+    final Set<String> used = _scanFrontendApiPaths(
+      Directory('${repoRoot.path}/lib'),
+    );
+    final Set<String> accountPaths = used
+        .where((String p) => p.startsWith('/api/auth'))
+        .toSet();
+    expect(
+      accountPaths,
+      isEmpty,
+      reason: 'desktop 分支已取消账号体系，前端不应再出现这些调用：$accountPaths',
+    );
+  });
+
+  test('前端不再重复定义分帧常量（必须引用协议包）', () {
+    final Directory lib = Directory('${repoRoot.path}/lib');
+    // 只匹配"定义"（const <类型> kWsFrame...），不匹配引用
+    final RegExp redefinition = RegExp(
+      r'^\s*const\s+(?:int|Duration|String)\s+kWsFrame',
+      multiLine: true,
+    );
+    final List<String> offenders = <String>[];
+    for (final FileSystemEntity entity in lib.listSync(recursive: true)) {
+      if (entity is! File || !entity.path.endsWith('.dart')) continue;
+      if (redefinition.hasMatch(entity.readAsStringSync())) {
+        offenders.add(entity.path);
+      }
+    }
+    expect(
+      offenders,
+      isEmpty,
+      reason:
+          '分帧阈值/分片预算/TTL 与三件套类型名必须来自 tree_protocol，'
+          '否则核心与前端阈值会再次漂移：$offenders',
+    );
+  });
+
   test('常量集合内部无重复且非空', () {
     for (final MapEntry<String, Set<String>> e in <String, Set<String>>{
       'WsInboundType': WsInboundType.all,

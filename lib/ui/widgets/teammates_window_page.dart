@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import '../models/agent.dart';
 import '../models/message.dart';
 import '../../io/api_service.dart';
-import '../../io/auth_service.dart';
 import '../../io/websocket_service.dart';
 import 'message_list.dart';
 
@@ -76,8 +75,7 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
 
   Future<void> _connectWs() async {
     if (_wsConnected) return;
-    final AuthService auth = AuthService();
-    final String? token = await auth.getToken();
+    final String? token = ApiService.token;
     if (token == null || token.isEmpty) return;
     _webSocket.connect(token);
     _wsConnected = true;
@@ -601,8 +599,7 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
 
   Future<void> _connectWs() async {
     if (_wsConnected) return;
-    final AuthService auth = AuthService();
-    final String? token = await auth.getToken();
+    final String? token = ApiService.token;
     if (token == null || token.isEmpty) return;
     _webSocket.connect(token);
     _wsConnected = true;

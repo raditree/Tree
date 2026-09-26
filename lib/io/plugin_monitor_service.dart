@@ -3,7 +3,6 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 
 import 'api_service.dart';
-import 'auth_service.dart';
 import 'websocket_service.dart';
 
 // ==================== 数据模型（宽容解析：缺字段给默认值、坏条目跳过） ====================
@@ -377,8 +376,7 @@ class PluginMonitorService extends ChangeNotifier {
       ws.onMessage = handleMessage;
       ws.onConnectionChange = handleConnectionChange;
       _ws = ws;
-      final AuthService auth = AuthService();
-      final String? token = await auth.getToken();
+      final String? token = ApiService.token;
       if (token != null && token.isNotEmpty) {
         ws.connect(token);
       }

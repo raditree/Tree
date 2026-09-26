@@ -36,12 +36,17 @@ Future<void> main(List<String> args) async {
   final int port = _intArg(args, '--port') ?? 0;
   final int chunkDelayMs = _intArg(args, '--chunk-delay-ms') ?? 40;
   final bool enableHeartbeat = !args.contains('--no-heartbeat');
+  final bool verbose = args.contains('--verbose');
 
   final CoreServer server = await CoreServer.start(
     port: port,
     streamChunkDelay: Duration(milliseconds: chunkDelayMs),
     enableHeartbeat: enableHeartbeat,
   );
+  if (verbose) {
+    // 访问日志走 stderr（stdout 是进程间协议，绝不能混入日志）
+    server.accessLog = (String message) => stderr.writeln('[core] $message');
+  }
 
   // 唯一的 stdout 输出：就绪握手（父进程按行读取并解析）
   stdout.writeln(server.handshake.encode());

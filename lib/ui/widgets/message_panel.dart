@@ -7,7 +7,6 @@ import '../models/agent.dart';
 import '../models/message.dart';
 import '../models/session.dart';
 import '../../io/api_service.dart';
-import '../../io/auth_service.dart';
 import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
 import '../../io/question_update_service.dart';
@@ -519,8 +518,7 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 建立 WebSocket 连接
   Future<void> _connectWebSocket() async {
     if (_wsConnected) return;
-    final AuthService auth = AuthService();
-    final String? token = await auth.getToken();
+    final String? token = ApiService.token;
     if (token == null || token.isEmpty) return;
     // 本地执行器接管工具执行请求（始终接管，按是否本地模式决定是否注册）
     LocalExecutorService.instance.attach(_webSocket);

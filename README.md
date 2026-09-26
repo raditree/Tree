@@ -6,6 +6,68 @@ LLM 驱动的 **agent 团队桌面效率工具**：根据任务难度动态组�
 - **后端**：Python / FastAPI 服务（REST + WebSocket），七核心组件（ws / agent / tool / io_ / llm / data / config）组件化装配
 - **目标平台**：Windows 7+ / Linux 桌面 + Android 移动端（受 Flutter 版本约束，请勿升级 Flutter ≥ 3.19）
 
+> **分支说明**：`desktop` 分支正在把后端逻辑迁入前端进程，最终形态是**单机桌面
+> 应用**（无后端、无账号体系、无 Docker/云端模式）。迁移期间下方章节仍描述
+> `main` 分支的"Flutter 前端 + Python 后端"架构，M7 删除 `server/` 后整体改写。
+
+---
+
+## desktop 分支：单进程架构与开发运行
+
+**运行形态**是 Flutter UI 进程 + **核心进程**（纯 Dart，`packages/tree_core`）：
+核心在 `127.0.0.1` 上监听**随机端口**并持有**一次性随机 token**，启动时把
+`{port, token, pid, version}` 以单行 JSON（`CoreHandshake`）写到 stdout；UI 解析后
+据此配置 `ApiService.baseUrl` / `WebSocketService.baseUrl` 与 token。REST 路径与 WS
+帧的形状与既有后端完全一致，因此 `lib/ui`（约 15k 行）**零改动**。
+
+```
+┌──────────────── Flutter UI 进程 ─────────────────┐
+│ main.dart → CoreProcessLauncher.start()          │
+│   ① 附着模式：TREE_CORE_URL + TREE_CORE_TOKEN    │
+│   ② 否则拉起 tree_core（应用同目录 → .output/）  │
+│   ③ 读 stdout 首行握手 → 注入 baseUrl + token    │
+│ ApiService / WebSocketService → 127.0.0.1:<port> │
+└──────────────────────────────────────────────────┘
+                        │ HTTP + WS（本地 token 鉴权）
+┌──────────────── tree_core 进程 ──────────────────┐
+│ CoreServer         路由 + 401/501/404            │
+│ MemoryStore        M1 内存；M2 落 ~/.tree        │
+│ ConversationService + ReplyEngine（M1 固定回显） │
+└──────────────────────────────────────────────────┘
+```
+
+### 开发运行
+
+```powershell
+# 1. 编译核心进程（首次，或核心代码改动后）
+dart compile exe packages/tree_core_cli/bin/tree_core.dart -o .output/tree_core.exe
+
+# 2. 运行应用（自动定位 .output/tree_core.exe 并拉起）
+flutter run -d windows
+```
+
+核心可执行文件的查找顺序：`TREE_CORE_EXE` 环境变量 → **应用同目录**（发行版布局：
+M7 打包时把 `tree_core.exe` 与 `Tree.exe` 放在一起）→ 从应用目录向上 8 层查找
+`.output/tree_core.exe`（开发期）。都找不到时应用显示**带修复指引的错误页**，而不是白屏。
+
+关闭应用窗口时，应用会向核心 stdin 写一行 `shutdown` 请它优雅退出（超时再强杀），
+不会留下孤儿进程。
+
+### 调试技巧
+
+| 需求 | 做法 |
+| --- | --- |
+| 单独调试/重启核心（不必重启应用） | 先跑 `tree_core.exe --port 8001 --verbose`，再给应用设 `TREE_CORE_URL=http://127.0.0.1:8001` 与 `TREE_CORE_TOKEN=<握手行里的 token>` |
+| 查看核心请求日志 | 核心加 `--verbose`（访问日志走 stderr；stdout 只放握手行） |
+| 只跑核心的协议与链路测试 | `cd packages/tree_core && dart test`（49 例，含真实 HTTP + WS 端到端） |
+
+### 里程碑进度
+
+- **M0a / M0b**：升级 Flutter 3.47.5 / Dart 3.13.4（放弃 Windows 7/8）；建立 `packages/` 纯 Dart 包骨架；协议冻结 + 完备性门禁
+- **M1a**：`tree_core` 回环 HTTP + WS 服务（握手、本地 token 鉴权、路由与覆盖度不变量、WS 分帧与心跳、内存存储、流式回复骨架）
+- **M1b**：前端接管（启动/附着核心、去登录与账号设置，`lib/ui` 零改动对接）
+- **M2–M7**：`~/.tree` 的 yaml + jsonl 持久化（含 DB 迁移工具）→ 真实 LLM → 工具层 → 团队编排 → 插件/MCP → 文档能力与打包（删除 `server/`）
+
 ---
 
 ## 功能特性

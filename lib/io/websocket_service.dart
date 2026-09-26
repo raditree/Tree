@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:tree_protocol/tree_protocol.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 /// 工具执行请求处理者签名。
@@ -16,23 +17,11 @@ typedef ToolExecRequestHandler = bool Function(Map<String, dynamic> message);
 /// pidfile）判断该取消是否归属本端，无关时静默忽略。
 typedef ToolExecCancelHandler = void Function(Map<String, dynamic> message);
 
-/// 大帧分片阈值（UTF-8 字节）：单帧编码后超过该值即分片传输。
-///
-/// 后端 uvicorn 的 ``ws_max_size`` 默认 16 MiB，且**只约束「前端→后端」的
-/// 接收方向**（后端→前端方向 sans-io 实现不做大小校验，超限表现为对端静默
-/// 关闭）。取 12 MiB 留 4 MiB 余量，覆盖 JSON 转义膨胀。
-const int kWsFrameChunkThresholdBytes = 12 * 1024 * 1024;
-
-/// 单个分片的最大 UTF-8 字节数（按字符边界回退，不切断码点）。
-const int kWsFrameChunkPartBytes = 4 * 1024 * 1024;
-
-/// 在途分片序列的保活时限：超时未收齐即丢弃（防内存泄漏与永久悬挂）。
-const Duration kWsFrameChunkTtl = Duration(seconds: 30);
-
-/// 传输层分片帧的类型名（不与任何既有业务 type 冲突）。
-const String kWsFrameBegin = 'frame_begin';
-const String kWsFrameChunk = 'frame_chunk';
-const String kWsFrameEnd = 'frame_end';
+// 分帧参数（阈值 kWsFrameChunkThresholdBytes / 分片预算
+// kWsFrameChunkPartBytes / 在途 TTL kWsFrameChunkTtl）与三件套类型名统一由
+// 协议包提供（见 package:tree_protocol 的 ws_frame.dart 与
+// WsOutboundType.frameBegin/frameChunk/frameEnd）——核心进程使用同一组常量，
+// 两侧阈值不可能再漂移。
 
 /// 在途分片序列（接收侧重组缓冲）。
 class _InboundFrames {
@@ -66,13 +55,11 @@ class _FrameSlice {
 /// 通过 [connect] 传入 JWT token 完成鉴权连接。
 ///
 /// 连接异常断开时会按指数退避策略自动重连（手动 [disconnect] 不重连）。
-/// 若连接失败是因 token 过期导致，会触发 [onAuthError] 回调跳转登录页。
+/// 桌面分支已取消账号体系：token 是核心进程下发的一次性本地 token，不存在
+/// "过期"语义，因此不再有跳登录页的回调。
 class WebSocketService {
-  /// WebSocket 基础地址（可运行时切换，用于本地/远程模式切换）
-  static String baseUrl = 'ws://localhost:8000';
-
-  /// 认证失败回调（token 过期/无效时触发，用于跳转登录页）
-  static void Function()? onAuthError;
+  /// WebSocket 基础地址（核心进程回环地址，形如 `ws://127.0.0.1:54321`）
+  static String baseUrl = 'ws://127.0.0.1:0';
 
   /// WebSocket 通道
   WebSocketChannel? _channel;
@@ -303,9 +290,9 @@ class WebSocketService {
       return false;
     }
     final String? type = frame['type'] as String?;
-    if (type != kWsFrameBegin &&
-        type != kWsFrameChunk &&
-        type != kWsFrameEnd) {
+    if (type != WsOutboundType.frameBegin &&
+        type != WsOutboundType.frameChunk &&
+        type != WsOutboundType.frameEnd) {
       return false;
     }
     final String id = frame['id'] as String? ?? '';
@@ -316,7 +303,7 @@ class WebSocketService {
     _inboundFrames.removeWhere((_, _InboundFrames f) =>
         now.difference(f.startedAt) > kWsFrameChunkTtl);
 
-    if (type == kWsFrameBegin) {
+    if (type == WsOutboundType.frameBegin) {
       final int total = (frame['total'] as num?)?.toInt() ?? 0;
       if (total <= 0) return true;
       _inboundFrames[id] = _InboundFrames(total, now);
@@ -330,7 +317,7 @@ class WebSocketService {
       return true;
     }
 
-    if (type == kWsFrameChunk) {
+    if (type == WsOutboundType.frameChunk) {
       final int seq = (frame['seq'] as num?)?.toInt() ?? -1;
       final String? part = frame['part'] as String?;
       if (seq >= 0 && part != null) {
@@ -339,7 +326,8 @@ class WebSocketService {
     }
 
     // 片数齐了（或收到结束帧）即尝试提交
-    if (buffer.parts.length >= buffer.total || type == kWsFrameEnd) {
+    if (buffer.parts.length >= buffer.total ||
+        type == WsOutboundType.frameEnd) {
       _inboundFrames.remove(id);
       final String joined = List<String>.generate(
         buffer.total,
@@ -401,15 +389,8 @@ class WebSocketService {
   ///
   /// 先标记为已断开，再按指数退避策略（最长 30 秒）启动重连定时器。
   /// 手动断开（[_shouldReconnect] 为 false）或超过最大重连次数时不再重连。
-  /// 若 token 已过期，直接触发 [onAuthError] 回调跳转登录页。
   void _scheduleReconnect() {
     _markDisconnected();
-    // 检查 token 是否过期
-    if (_isTokenExpired()) {
-      _shouldReconnect = false;
-      onAuthError?.call();
-      return;
-    }
     if (_shouldReconnect && _reconnectAttempts < _maxReconnectAttempts) {
       // 指数退避：2、4、6 … 30 秒封顶（下限 2s，避免 0 秒重连风暴）
       final int delay = (_reconnectAttempts + 1) * 2;
@@ -419,27 +400,6 @@ class WebSocketService {
         _reconnect,
       );
       _reconnectAttempts++;
-    }
-  }
-
-  /// 检查本地存储的 JWT token 是否已过期
-  ///
-  /// 解码 token 的 payload（不验证签名），比对 `exp` 字段与当前时间。
-  /// 无法解码或无 `exp` 字段时返回 false，避免误判。
-  bool _isTokenExpired() {
-    final String? token = _token;
-    if (token == null || token.isEmpty) return false;
-    try {
-      final List<String> parts = token.split('.');
-      if (parts.length < 2) return false;
-      final String normalized = base64Url.normalize(parts[1]);
-      final String decoded = utf8.decode(base64Url.decode(normalized));
-      final Map<String, dynamic> payload =
-          jsonDecode(decoded) as Map<String, dynamic>;
-      final int exp = payload['exp'] as int;
-      return DateTime.now().millisecondsSinceEpoch ~/ 1000 > exp;
-    } catch (_) {
-      return false;
     }
   }
 
@@ -508,7 +468,7 @@ class WebSocketService {
       'chunks=$count id=$id',
     );
     _channel!.sink.add(jsonEncode(<String, dynamic>{
-      'type': kWsFrameBegin,
+      'type': WsOutboundType.frameBegin,
       'id': id,
       'total': count,
       'bytes': totalBytes,
@@ -520,7 +480,7 @@ class WebSocketService {
           _takeFramePart(encoded, offset, kWsFrameChunkPartBytes);
       if (slice.consumedCodeUnits <= 0) break;
       _channel!.sink.add(jsonEncode(<String, dynamic>{
-        'type': kWsFrameChunk,
+        'type': WsOutboundType.frameChunk,
         'id': id,
         'seq': seq,
         'part': slice.part,
@@ -529,7 +489,7 @@ class WebSocketService {
       seq++;
     }
     _channel!.sink.add(jsonEncode(<String, dynamic>{
-      'type': kWsFrameEnd,
+      'type': WsOutboundType.frameEnd,
       'id': id,
       'total': seq,
     }));

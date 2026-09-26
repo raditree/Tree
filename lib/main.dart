@@ -1,58 +1,50 @@
-import 'package:flutter/material.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+// AppExitResponse 定义在 dart:ui（material/widgets 只转引类型，不导出枚举本体）
+import 'dart:ui' show AppExitResponse;
 
-import 'ui/pages/login_page.dart';
-import 'ui/pages/main_page.dart';
+import 'package:flutter/material.dart';
+import 'package:tree_protocol/tree_protocol.dart';
+
 import 'io/api_service.dart';
-import 'io/auth_service.dart';
+import 'io/core_process_launcher.dart';
 import 'io/websocket_service.dart';
+import 'ui/pages/main_page.dart';
 import 'ui/theme_service.dart';
 
-/// 应用入口
+/// 应用入口（desktop 分支：无登录、无后端地址配置）。
 ///
-/// 启动前先检查本地是否存在有效 JWT token，据此决定初始路由：
-/// 已登录进入主页，未登录进入登录页。
-void main() async {
-  // 确保 Flutter 绑定初始化（shared_preferences 等插件依赖此步骤）
+/// 启动顺序：
+/// 1. 加载本地主题；
+/// 2. 拉起（或附着）**本机核心进程**，拿到随机端口与一次性本地 token；
+/// 3. 把 HTTP/WS 基址与 token 交给 [ApiService] / [WebSocketService]；
+/// 4. 进入主界面；核心启动失败时显示可操作的错误页而不是白屏。
+Future<void> main() async {
+  // shared_preferences / path_provider 等插件依赖绑定先初始化
   WidgetsFlutterBinding.ensureInitialized();
 
   // 加载本地保存的主题模式
   await ThemeService.instance.load();
 
-  // 加载自定义后端地址配置；未自定义时使用平台默认地址
-  // （Android 模拟器为 10.0.2.2，其余平台 localhost）
-  final prefs = await SharedPreferences.getInstance();
-  final host = prefs.getString('custom_backend_host') ?? '';
-  final port = prefs.getString('custom_backend_port') ?? '';
-  final bool hasCustom = host.isNotEmpty && port.isNotEmpty;
-  final String backendHost = hasCustom ? host : ApiService.defaultBackendHost();
-  final String backendPort = hasCustom ? port : '8000';
-  // HTTP 与 WebSocket 使用同一后端地址，避免自定义后 WS 仍连 localhost
-  ApiService.baseUrl = 'http://$backendHost:$backendPort';
-  WebSocketService.baseUrl = 'ws://$backendHost:$backendPort';
-
-  // 读取本地登录状态以决定初始路由
-  final authService = AuthService();
-  final loggedIn = await authService.isLoggedIn();
-
-  // 已登录时预先加载 token 到 ApiService，供后续鉴权请求携带
-  if (loggedIn) {
-    final token = await authService.getToken();
-    ApiService.setToken(token);
+  final CoreHandshake? handshake = await CoreProcessLauncher.instance.start();
+  if (handshake == null) {
+    runApp(CoreStartupErrorApp(
+      message: CoreProcessLauncher.instance.lastError ?? '未知错误',
+    ));
+    return;
   }
+  // 核心只监听 127.0.0.1，HTTP 与 WS 同源；token 每次启动都重新生成
+  ApiService.baseUrl = handshake.httpBaseUrl;
+  WebSocketService.baseUrl = handshake.wsBaseUrl;
+  ApiService.setToken(handshake.token);
 
-  runApp(AgentTeamApp(initialRoute: loggedIn ? '/main' : '/login'));
+  runApp(const AgentTeamApp());
 }
 
 /// 根 Widget - Agent 团队效率工具应用
 ///
-/// 配置应用主题（浅色/深色/跟随系统）与命名路由。
-/// 监听 [ThemeService] 以在切换主题时即时重建界面。
-class AgentTeamApp extends StatelessWidget {
-  // 初始路由，由 main() 根据登录状态传入
-  final String initialRoute;
-
-  const AgentTeamApp({super.key, required this.initialRoute});
+/// 配置应用主题（浅色/深色/跟随系统）与主界面路由，并在应用退出时回收核心
+/// 子进程（否则会留下孤儿进程，用户再也连不上旧实例）。
+class AgentTeamApp extends StatefulWidget {
+  const AgentTeamApp({super.key});
 
   // ==================== 品牌色板（对齐 web/icons/Icon-512.png） ====================
   /// 图标主亮绿（HUD 弧线）
@@ -77,7 +69,7 @@ class AgentTeamApp extends StatelessWidget {
   ///
   /// 主色用 brandDeep（#00904A 图标渐变深绿），白底上保持足够对比度；
   /// 文字走 Material 浅色派生（近黑墨绿），避免黑字黑底的不可读问题。
-  ThemeData _buildLightTheme() {
+  static ThemeData _buildLightTheme() {
     return ThemeData(
       fontFamily: 'Microsoft YaHei',
       fontFamilyFallback: const ['PingFang SC', 'Noto Sans CJK SC', 'sans-serif'],
@@ -146,7 +138,7 @@ class AgentTeamApp extends StatelessWidget {
   }
 
   /// 深色主题（黑背景 + 亮绿 HUD 弧线，主色 #00FF8C 与图标一致）
-  ThemeData _buildDarkTheme() {
+  static ThemeData _buildDarkTheme() {
     return ThemeData(
       fontFamily: 'Microsoft YaHei',
       fontFamilyFallback: const ['PingFang SC', 'Noto Sans CJK SC', 'sans-serif'],
@@ -213,6 +205,40 @@ class AgentTeamApp extends StatelessWidget {
   }
 
   @override
+  State<AgentTeamApp> createState() => _AgentTeamAppState();
+}
+
+class _AgentTeamAppState extends State<AgentTeamApp> {
+  /// 应用退出钩子：请求核心优雅关闭（stdin 写 shutdown，超时再强杀）。
+  ///
+  /// 用 AppLifecycleListener 而不是 dispose：dispose 在窗口关闭流程中不保证
+  /// 被调用，而 onExitRequested 是桌面端"用户要求退出"的明确信号
+  /// （Windows runner 把 WM_CLOSE 转发给引擎，见 flutter_window.cpp 的
+  /// HandleTopLevelWindowProc）。
+  ///
+  /// **必须在 initState 里立即创建**：若写成 `late final _lifecycle = ...`
+  /// 惰性初始化，则该监听器直到 dispose 才被构造（那时再注册观察者已无意义），
+  /// 实测表现为"关窗后应用退出、核心进程变成孤儿继续占着端口与内存"。
+  AppLifecycleListener? _lifecycle;
+
+  @override
+  void initState() {
+    super.initState();
+    _lifecycle = AppLifecycleListener(
+      onExitRequested: () async {
+        await CoreProcessLauncher.instance.stop();
+        return AppExitResponse.exit;
+      },
+    );
+  }
+
+  @override
+  void dispose() {
+    _lifecycle?.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
       animation: ThemeService.instance,
@@ -220,17 +246,82 @@ class AgentTeamApp extends StatelessWidget {
         return MaterialApp(
           title: 'Agent 团队效率工具',
           debugShowCheckedModeBanner: false,
-          theme: _buildLightTheme(),
-          darkTheme: _buildDarkTheme(),
+          theme: AgentTeamApp._buildLightTheme(),
+          darkTheme: AgentTeamApp._buildDarkTheme(),
           themeMode: ThemeService.instance.mode,
-          initialRoute: initialRoute,
-          routes: {
-            '/login': (context) => const LoginPage(),
-            '/main': (context) => const MainPage(),
-          },
+          // 单一入口：桌面分支没有登录页
+          home: const MainPage(),
         );
       },
     );
   }
 }
 
+/// 核心进程启动失败时的兜底界面。
+///
+/// 桌面分支没有后端，核心进程就是全部能力来源；启动失败必须给出**可操作的**
+/// 原因与修复指引，而不是白屏或反复重连的登录页。
+class CoreStartupErrorApp extends StatelessWidget {
+  const CoreStartupErrorApp({super.key, required this.message});
+
+  /// 失败原因（含已尝试的路径与修复命令）。
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Agent 团队效率工具 - 核心启动失败',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        fontFamily: 'Microsoft YaHei',
+        fontFamilyFallback: const ['PingFang SC', 'Noto Sans CJK SC', 'sans-serif'],
+        colorScheme: const ColorScheme.dark(
+          primary: AgentTeamApp.brandBright,
+          surface: AgentTeamApp.brandBlack,
+          onSurface: Color(0xFFE6F3EC),
+        ),
+        scaffoldBackgroundColor: AgentTeamApp.brandBlack,
+        useMaterial3: false,
+      ),
+      home: Scaffold(
+        body: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 720),
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(32),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Text(
+                    '核心进程未能启动',
+                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                          color: AgentTeamApp.brandBright,
+                        ),
+                  ),
+                  const SizedBox(height: 16),
+                  const Text('桌面分支不再使用后端服务：全部逻辑由本机核心进程提供，'
+                      '核心未就绪时应用无法工作。'),
+                  const SizedBox(height: 16),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: AgentTeamApp.brandCard,
+                      border: Border.all(color: AgentTeamApp.brandDivider),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: SelectableText(
+                      message,
+                      style: const TextStyle(fontFamily: 'Consolas', fontSize: 12),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
