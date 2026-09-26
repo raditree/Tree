@@ -197,7 +197,31 @@
 
 ---
 
-## 8. 变更记录
+## 8. 实施记录（WIP，随并行波次更新）
+
+### Wave 1-C 执行器层（packages/tree_local_exec）— 已交付，提交 f6f1567
+| 条目 | 结果 | 要点 |
+|---|---|---|
+| Q4 | 完成 | 新增 lib/src/git_output.dart（本地/SSH 共用命令与解析）；WorkspaceIO.gitLog/gitBranches；非仓库或无 git → 空列表 + 退出码 |
+| Q10 执行层 | 完成 | GrepOutcome 新增 scannedFileCount / scannedFilePaths(≤200) / excludedDirs(≤50) |
+| 1.1 执行器 | 完成 | 本地 exec 与 SSH run/建连/认证去超时；keepAliveInterval 10s + isConnected |
+
+验证：dart analyze packages/tree_local_exec 零 issue；包内 dart test 86 passed / 1 skipped（真机 gate 未动）。
+
+**口径偏差（Wave 2 必须遵守）**
+1. grep 清单字段名 = scannedFilePaths（scannedFiles 已是既有 int 计数，语义不可改）；计数用 scannedFileCount。
+2. SSH grep 改为按路径前缀剪枝（与本地一致）：以前 node_modules/** 的匹配会返回，现在不返回——属修正。
+3. exec(timeout:) 与 timedOut 保留但语义恒为"永不超时"（恒 false），仅为兼容调用方签名。
+4. DartSshTransport.connect 的 timeout 参数已删除（全仓无调用方）。
+
+**待接线**
+- packages/tree_core/lib/src/files/file_service.dart 的 gitLog/gitBranches 对 SSH 仍返回可读 400 → 接 WorkspaceIO.gitLog/gitBranches；注意 files_api_test.dart:315 断言 branches.single['name']，统一用 GitBranchesOutcome.toJson()（[String]）时需在 FileService 映射或同步改测试（前端 git_history.dart 两种都认）。
+- README.md:174 关于"远端 Git 仍 400"的描述待更新（Wave 3-G）。
+- 真机 SSH 回归留到 Wave 3-G。
+
+---
+
+## 9. 变更记录
 
 | 时间 | 变更 |
 |---|---|
