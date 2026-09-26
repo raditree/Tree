@@ -69,6 +69,10 @@ class ExecuteStationMounts {
     required this.ioFor,
     required this.agentTeamOf,
     required this.agentModeOf,
+    // 后台任务管理器：null = 自建一份（见 [_hooks]）；传了就用调用方那一份，
+    // 使**插件下发的 hook 任务与 agent 自己起的 hook 任务共用同一张任务表**
+    // （M9 Wave 3-I 第 2 条）。注入的实例归注入方所有：它的完成回调与 close
+    // 都由注入方负责，本类只管用。
     TerminalHooks? hooks,
     this.onHookFinished,
     this.messageSender,
@@ -138,7 +142,9 @@ class ExecuteStationMounts {
   /// `terminal.exec` 用的后台任务管理器。
   ///
   /// 注入了就用注入的那一份（与工具层共用，`hook_action=status/cancel` 因此能查到
-  /// agent 自己起的后台任务）；没注入就自建一份并把完成回调接到 [onHookFinished]。
+  /// agent 自己起的后台任务；完成回调也归注入方，本类不接管）；没注入就自建一份并把
+  /// 完成回调接到 [onHookFinished]。两条路径下 `terminal.exec` 的行为一致，
+  /// 差别只在**任务表是不是与工具层同一张**。
   TerminalHooks get _hooks {
     final TerminalHooks? injected = _injectedHooks;
     if (injected != null) return injected;

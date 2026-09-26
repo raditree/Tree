@@ -7,6 +7,7 @@ import 'package:tree_core/src/plugin/station_instance.dart';
 import 'package:tree_core/src/plugin/station_runtime.dart';
 import 'package:tree_core/src/plugin/station_scope.dart';
 import 'package:tree_core/src/plugin/stations.dart';
+import 'package:tree_core/src/tool/terminal_hooks.dart';
 import 'package:tree_local_exec/tree_local_exec.dart';
 
 /// 执行站首命令集的**挂载位置**（M9 Wave 3-I）。
@@ -268,6 +269,37 @@ void main() {
       },
     );
     expect(status.ok, isTrue, reason: status.error);
+  });
+
+  test('terminal.exec 用注入的 hooks（任务落在注入实例里）；close 不关注入实例', () async {
+    // CLI 的接线形状：注入工具层那一份 hooks ⇒ 插件命令与 agent 工具调用同一张任务表
+    final TerminalHooks shared = TerminalHooks();
+    addTearDown(shared.close);
+    final ExecuteStationMounts withSharedHooks = ExecuteStationMounts(
+      ioFor: (String agentId) async => LocalWorkspaceIO(workspace),
+      agentTeamOf: (String agentId) => agentId == agent ? team : '',
+      agentModeOf: (String agentId) =>
+          agentId == agent ? StationModeKey.local : '',
+      hooks: shared,
+    );
+    opened.add(withSharedHooks);
+    final ExecuteStation station = stationWith(withSharedHooks);
+
+    final StationCommandResult hook = await run(
+      station,
+      'terminal.exec',
+      arguments: <String, dynamic>{'command': 'echo shared-hook', 'hook': true},
+    );
+    expect(hook.ok, isTrue, reason: hook.error);
+    expect(shared.tasks, hasLength(1), reason: '任务必须落在注入实例里（与工具层同一张表）');
+    final HookTask task = shared.tasks.single;
+    expect(task.agentId, agent);
+    expect(task.command, contains('shared-hook'));
+
+    // 注入实例归注入方所有：挂载位置 close 不得清空它的任务表（也不得关它）
+    await withSharedHooks.close();
+    expect(shared.task(task.id), isNotNull, reason: 'close 不得清空外部注入的实例');
+    expect(shared.tasks, hasLength(1));
   });
 
   test('隔离：跨 team / 跨模式 / agent 不一致一律拒绝，且不动工作空间', () async {

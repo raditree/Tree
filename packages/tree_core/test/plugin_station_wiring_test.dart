@@ -19,6 +19,20 @@ void main() {
   late PluginBus bus;
   late CoreServer server;
 
+  // 起一个核心（可注入执行站要用的后台任务管理器）：多次调用会**替换**同一批
+  // mountId 的挂载位置（ExecuteStation.mount 幂等），因此用例可以拿第二个核心
+  // 验证「注入 hooks」的分支。
+  Future<CoreServer> boot({TerminalHooks? stationHooks}) => CoreServer.start(
+    store: store,
+    pluginBus: bus,
+    specIoFor: (String agentId) async =>
+        agentId == agent.id ? LocalWorkspaceIO(workspace) : null,
+    enableHeartbeat: false,
+    streamChunkDelay: Duration.zero,
+    engine: ScriptedAgent(chunkDelay: Duration.zero),
+    stationHooks: stationHooks,
+  );
+
   setUp(() async {
     temp = Directory.systemTemp.createTempSync('tree_station_wire_');
     workspace = p.join(temp.path, 'ws');
@@ -36,15 +50,7 @@ void main() {
       configFile: file.path,
       heartbeatInterval: const Duration(seconds: 30),
     );
-    server = await CoreServer.start(
-      store: store,
-      pluginBus: bus,
-      specIoFor: (String agentId) async =>
-          agentId == agent.id ? LocalWorkspaceIO(workspace) : null,
-      enableHeartbeat: false,
-      streamChunkDelay: Duration.zero,
-      engine: ScriptedAgent(chunkDelay: Duration.zero),
-    );
+    server = await boot();
   });
 
   tearDown(() async {
@@ -176,5 +182,101 @@ void main() {
     );
     expect(compact.ok, isFalse);
     expect(compact.error, contains('压缩'));
+  });
+
+  // ── Wave 3-I 第 2 条：执行站 terminal.exec 与工具层**共用同一张任务表** ──
+
+  test('未注入 hooks：核心自建一份，terminal.exec 的 hook 模式照常可用', () async {
+    final ExecuteStation execute = station(StationModeKey.local);
+    final StationScope stationScope = bus.runtimeScopeFor(
+      agentId: agent.id,
+      sessionId: 'ses_1',
+    );
+
+    final StationCommandResult hook = await execute.execute(
+      command: 'terminal.exec',
+      scope: stationScope,
+      arguments: <String, dynamic>{
+        'agent_id': agent.id,
+        'command': 'echo self-hook',
+        'hook': true,
+      },
+    );
+    expect(hook.ok, isTrue, reason: hook.error);
+    final String text =
+        (hook.payload! as Map<String, dynamic>)['text'] as String;
+    expect(text, contains('[terminal hook]'));
+    final RegExpMatch? taskId = RegExp(r'task_id: (\S+)').firstMatch(text);
+    expect(taskId, isNotNull, reason: '自建路径必须照旧返回 task_id');
+
+    // 自建实例自己查得到（与注入路径行为一致）；它随核心 close() 一起释放（tearDown）
+    final StationCommandResult status = await execute.execute(
+      command: 'terminal.exec',
+      scope: stationScope,
+      arguments: <String, dynamic>{
+        'agent_id': agent.id,
+        'hook_action': 'status',
+        'task_id': taskId!.group(1),
+      },
+    );
+    expect(status.ok, isTrue, reason: status.error);
+    expect(
+      ((status.payload! as Map<String, dynamic>)['text'] as String),
+      contains(taskId.group(1)!),
+    );
+  });
+
+  test('注入 hooks：terminal.exec 落到工具层同一张任务表；核心 close 不关注入实例', () async {
+    // 模拟 CLI 的 tools.hooks：实例归工具层所有，核心只是借用
+    final TerminalHooks shared = TerminalHooks();
+    addTearDown(shared.close);
+    final CoreServer second = await boot(stationHooks: shared);
+    addTearDown(second.close);
+
+    final ExecuteStation execute = station(StationModeKey.local);
+    final StationScope stationScope = bus.runtimeScopeFor(
+      agentId: agent.id,
+      sessionId: 'ses_1',
+    );
+    final StationCommandResult hook = await execute.execute(
+      command: 'terminal.exec',
+      scope: stationScope,
+      arguments: <String, dynamic>{
+        'agent_id': agent.id,
+        'command': 'echo shared-hook',
+        'hook': true,
+      },
+    );
+    expect(hook.ok, isTrue, reason: hook.error);
+    expect(shared.tasks, hasLength(1), reason: '任务必须落在注入的那一份（工具层同一张表）');
+    final HookTask task = shared.tasks.single;
+    expect(task.agentId, agent.id);
+    expect(task.command, contains('shared-hook'));
+
+    // 等 echo 收尾，再用同一实例按 task_id 查到它（插件与 agent 互相可见）
+    final DateTime deadline = DateTime.now().add(const Duration(seconds: 15));
+    while (task.running && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    expect(task.running, isFalse, reason: 'echo 很快结束');
+    final StationCommandResult status = await execute.execute(
+      command: 'terminal.exec',
+      scope: stationScope,
+      arguments: <String, dynamic>{
+        'agent_id': agent.id,
+        'hook_action': 'status',
+        'task_id': task.id,
+      },
+    );
+    expect(status.ok, isTrue, reason: status.error);
+    expect(
+      ((status.payload! as Map<String, dynamic>)['text'] as String),
+      contains('shared-hook'),
+    );
+
+    // 核心 close 只关自建的那一份：注入实例归注入方（工具层）所有，任务表仍在
+    await second.close();
+    expect(shared.task(task.id), isNotNull, reason: 'close 不得清空外部注入的实例');
+    expect(shared.tasks, hasLength(1));
   });
 }

@@ -259,6 +259,12 @@ Future<void> main(List<String> args) async {
     pluginBus: plugins,
     fileService: files,
     compaction: compaction,
+    // M9 Wave 3-I 第 2 条：执行站 terminal.exec 与工具层**共用同一份 TerminalHooks**，
+    // 插件下发的 hook 任务与 agent 自己起的 hook 任务因此互相看得到 task_id
+    // （hook_action=status/cancel 能查到对方起的任务）。该实例归工具层所有：
+    // 完成回调走 tools.onHookFinished（下面接到 conversation.wake），
+    // 释放由 tools.close() 负责，核心 close 不会重复关它。
+    stationHooks: tools.hooks,
   );
   // 起监听后才存在的三个依赖一次性接上：广播、在途状态、消息投递
   hubSink = server.hub.broadcast;

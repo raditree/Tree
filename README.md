@@ -246,6 +246,52 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 
 ---
 
+## 插件契约（插件 ↔ 核心）
+
+插件是**进程外子进程**，与核心之间走**行分隔 JSON-RPC 2.0**（方法与 MCP 同风格、独立命名）。两个方向的能力不对称，插件作者按下面对照即可。
+
+### 插件 → 核心：主动请求（Wave 3-K）
+
+插件用标准 JSON-RPC **请求**（`method` + `id`）**主动**调核心；核心**必回且只回一条**响应——成功 `{jsonrpc, id, result}`，失败 `{jsonrpc, id, error: {code, message}}`。处理器抛异常也会被收敛成**错误响应**：异常不会冲掉读循环，插件也不会永久挂起等回包。
+
+判别只看报文形状（**有 `method` + 有 `id` ⇒ 请求**），因此插件用自增 int id 发请求，不会与核心在途请求撞号而被当成回包吞掉。
+
+目前支持的方法只有 **`station/command`**（执行站命令）：
+
+```jsonc
+// 插件 → 核心
+{"jsonrpc":"2.0","id":7,"method":"station/command",
+ "params":{"command":"fs.read","arguments":{"agent_id":"agt_1","path":"README.md"}}}
+```
+
+- **入参** `{command, arguments}`：`command` 取执行站白名单——`fs.read` / `fs.write` / `fs.list` / `fs.grep` / `terminal.exec` / `agent.message` / `agent.stop` / `agent.compact` / `ui.push`；`arguments` 是该命令自己的参数对象（可省略）。
+- **result 形状** `{command, ok, mount_id, payload, error}`：`ok=false` 时**可读失败原因在 `error`**（跨 team / 跨模式 / 参数缺失 / 挂载位置未接线…），**不是 JSON-RPC 错误**——插件据此自查原因，不会只看到一句「调用失败」；`mount_id` 是实际执行命令的挂载位置（如 `core.execute.fs.read`），空串 = 未挂载。
+- **错误码**（JSON-RPC `error.code`）：`-32601` 未知方法 · `-32602` 参数非法 · `-32603` 处理器异常 · `-32001` scope 不满足。
+- **scope 只来自插件自己在 `plugins.yaml` 的声明**（`scope.team_id` / `agent_id` / `session_id`）；**请求参数里的 `team_id` / `agent_id` / `session_id` / `mode_key` 一律被忽略**——插件不得放大作用域，也放大不了。**未声明 `team` 的插件不能用执行站**（回 `-32001`），这类插件仍可照旧用 `tools/list` 申报工具。
+- 命令参数里的 `agent_id` 只用来**指名目标**：仍要与插件声明的 scope、以及目标 agent 的真实归属（team + `local|ssh` 工作面）精确匹配，任一不符即 `ok=false` 明确拒绝（fail-closed，跨 scope 的命令不会打到别的工作空间）。
+
+```yaml
+# <数据根>/config/plugins.yaml（片段）
+plugins:
+  - id: sample
+    command: node
+    args: ["sample-plugin.js"]
+    granularity: team
+    scope: {team_id: team-1}   # 执行站命令的作用域就取自这里
+```
+
+### 核心 → 插件：请求与通知
+
+| 报文 | 形态 | 说明 |
+| --- | --- | --- |
+| `hello` / `tools/list` / `tools/call` / `ping` / `shutdown` | 请求（核心等回包） | 握手、工具申报、工具调用、心跳探测、优雅关闭 |
+| `station/request` | 请求（核心等回包） | **收集站请求**：站点把请求投给订阅的插件，`params` = `{request_id, station_id, kind, scope, payload, meta?, schema?}`；插件按站点 schema 回 `{"reply": {"payload": ...}}`（失败回 `{"reply": {"error": "可读原因"}}`）。回包可回带 `scope`，带了就必须与请求四元组精确相等 |
+| `event` | **通知（不等回包）** | 插件订阅到的总线事件（按四元组过滤），`params` 即事件体 |
+
+插件也可主动发**通知**（如 `log` / `event`，不带 `id`），核心收集后转成前端 `plugin_event`。站点体系（广播 / 执行 / 中转 / 收集）与订阅、schema、部分结果语义见上文「站点体系」。
+
+---
+
 ## 架构概览
 
 ```

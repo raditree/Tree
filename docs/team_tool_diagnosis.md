@@ -100,8 +100,13 @@ if model_config is None:
 - 实证：Leader 容器 roster 中 3 名成员 work_status 全部为 **working**（`assign_task` 设为 working 后从未改回）。
 - 前端 teammates 窗口：`_active_tasks` 为空时回退 roster 的 work_status → **永远显示"工作中"**。
 
-### 4.2 wait_for 必然等到超时
-轮询 Leader TeamTool 内存 `member.work_status`；成员完成仅发 WS 事件（`_send_status_idle`）+ 清 `_active_tasks`，**无任何代码更新 Leader 内存状态** → 轮询永不满足，默认 300s 后 timed_out=True。
+### 4.2 wait_for 轮询错状态源，必然空等到静态超时（旧后端）
+轮询 Leader TeamTool 内存 `member.work_status`；成员完成仅发 WS 事件（`_send_status_idle`）+ 清 `_active_tasks`，**无任何代码更新 Leader 内存状态** → 轮询永不满足，旧后端最终以 `timed_out=True`（默认 300s）收口。
+
+> **M9 语义更新（桌面线，2026）**：`wait_for` 已**删除 `timeout` 参数与 `timed_out` 结果字段**，也不再有「默认 300s / 上限 600s」这类静态时长（M9 plan §1.1：一切静态时间超时取消，判超时改看**心跳丢失**）。新口径：
+> - **判据 = 成员活性**：成员不存在 / 链路心跳丢失 ⇒ 该成员记为**未响应**；成员在途生成 = 明确活着，等待**不因总时长结束**（心跳还在就永不超时）；
+> - **收口形态 = 部分结果 + 未响应者清单**：`completed`（已确认完成的成员）、`never_started`（启动宽限内没等到 working）、`unresponsive[]`（明确失联者，逐条给可读原因）；**不整体失败、不静默**；
+> - 因此本节的旧结论只剩历史意义：状态源改为**运行期活性探针**（`ConversationService.isRunning` + agent 归属解析），不再轮询 Leader 内存的 `work_status`。
 
 ### 4.3 广播不投递（实证）
 `_action_broadcast` 只追加 `self.messages` 与成员 `message_history`，**从不调用 `_dispatch_to_member`** → 成员收不到广播。
@@ -150,7 +155,7 @@ if model_config is None:
    - 成员→Leader 消息路由到 `_top_chat_broker`（复用 Leader 串行队列）；
    - Leader 回复后经 broker 回投成员。
 3. **打通任务闭环**：注册 complete_task/report_task_completion action；完成后同步更新 Leader 内存 work_status 与 roster。
-4. **重做 wait_for**：轮询全局 `_active_tasks` / broker 队列长度，而非 Leader 内存 work_status。
+4. **重做 wait_for**：轮询全局 `_active_tasks` / broker 队列长度，而非 Leader 内存 work_status。**（M9 已按新语义落地）**：静态 `timeout` / `timed_out` 删除，改为**活性判据**（成员是否存在、是否在途生成、链路心跳是否丢失）；判活窗口内无回应的成员进 `unresponsive[]`，整体返回**部分结果**而不是整体失败（详见 §4.2 的语义更新）。
 5. **修复广播/文件通知**：broadcast/send_file 对每个成员 `_dispatch_to_member`。
 6. **成员级 Git 隔离**：共享容器内为成员建立独立 git 仓库（如 `workspaces/{id}/.git`）或按目录过滤；`git_log` 按成员解析。
 7. 修复 `_resolve_sh` 动态探测、TeamTool 加锁、leader_name 透传、can_lead_team 联动。

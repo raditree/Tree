@@ -27,6 +27,7 @@ import '../store/memory_store.dart';
 import '../store/tree_store.dart';
 import '../team/message_dispatcher.dart';
 import '../team/team_service.dart';
+import '../tool/terminal_hooks.dart';
 import '../tool/todo_store.dart';
 import '../util/liveness.dart';
 import '../util/token.dart';
@@ -198,6 +199,14 @@ class CoreServer {
   ///
   /// [port] 为 0 时由内核分配空闲端口（默认，避免固定端口冲突）。
   /// [streamChunkDelay] 是流式片段之间的延迟（测试传 `Duration.zero`）。
+  ///
+  /// [stationHooks] 是执行站 `terminal.exec` 要用的**后台任务管理器**；不传（null）
+  /// 时核心自建一份（与 M9 之前完全一致：自建、自理完成回调、关服务时一起关）。
+  /// 传了就用调用方的那一份——这样**插件下发的 hook 任务与 agent 自己起的 hook
+  /// 任务共用同一张任务表**（`hook_action=status/cancel` 因此能互相看到 task_id）。
+  /// 注入的实例**归调用方所有**：核心不接管它的完成回调、close 时也**不关它**
+  /// （完成回调由注入方自己接，CLI 里是 `WorkspaceToolRunner.hooks.onFinished`
+  /// → `tools.onHookFinished` → `conversation.wake`）。
   static Future<CoreServer> start({
     InternetAddress? address,
     int port = 0,
@@ -220,6 +229,7 @@ class CoreServer {
     PluginBus? pluginBus,
     FileService? fileService,
     CompactionService? compaction,
+    TerminalHooks? stationHooks,
   }) async {
     final HttpServer http = await HttpServer.bind(
       address ?? InternetAddress.loopbackIPv4,
@@ -298,8 +308,9 @@ class CoreServer {
     };
     // 调用方自带台账时不覆盖（??=），只补空缺
     messageDispatcher?.linkLiveness ??= hub.linkLiveness;
-    // M9 Wave 3-I：执行站挂载位置 + 运行期四元组（站点隔离的运行期依据）
-    server._wirePluginStations();
+    // M9 Wave 3-I：执行站挂载位置 + 运行期四元组（站点隔离的运行期依据）。
+    // Wave 3-I 第 2 条：工具层把它的 hooks 传进来 ⇒ 插件与 agent 共用一张任务表。
+    server._wirePluginStations(stationHooks: stationHooks);
     server._registerRoutes();
     server._registerStubRoutes();
     if (enableHeartbeat) {
@@ -318,7 +329,8 @@ class CoreServer {
     reassembler.clear();
     await hub.closeAll();
     await mcpService?.close();
-    // 执行站挂载位置自建的后台任务管理器：随服务一起释放
+    // 执行站挂载位置：只释放它**自建**的后台任务管理器（外部注入的那一份归注入方
+    // 所有——CLI 里由 WorkspaceToolRunner.close() 关，这里重复关会把共用任务表清空）
     await _stationMounts?.close();
     await pluginBus?.close();
     // 总结器可能持有自己的 HTTP 连接池（与引擎的池分开）：随服务一起释放
@@ -344,7 +356,11 @@ class CoreServer {
   ///    agent 的工作空间模式（local | ssh），因此 SSH 团队的命令不会打到本地工作空间。
   ///
   /// 未接线（pluginBus 为空）时什么都不做；工具层与 REST 路径不受影响。
-  void _wirePluginStations() {
+  ///
+  /// [stationHooks] 见 [start]：null = 自建一份（完成回调接 [ConversationService.wake]），
+  /// 非 null = **与工具层共用**调用方那一份（插件命令与 agent 的工具调用因此看到同一张
+  /// 任务表；完成回调归注入方，核心不接管、close 也不关它）。
+  void _wirePluginStations({TerminalHooks? stationHooks}) {
     final PluginBus? bus = pluginBus;
     if (bus == null) return;
     // 调用点上下文：team 取 agent 的团队归属（agent / session 由调用点给）
@@ -382,6 +398,11 @@ class CoreServer {
         if (resolver == null) return null;
         return resolver(agentId);
       },
+      // 后台任务管理器：没注入就自建，并把它完成回调接到会话唤醒（下面这条
+      // onHookFinished 只对**自建**的那一份生效；注入的那份由注入方接回调——
+      // 在 CLI 里是 WorkspaceToolRunner.hooks.onFinished → tools.onHookFinished
+      // → conversation.wake，语义与自建路径一致）。
+      hooks: stationHooks,
       onHookFinished: (String agentId, String sessionId, String notice) {
         unawaited(
           conversation
