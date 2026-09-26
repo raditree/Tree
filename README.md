@@ -72,6 +72,24 @@ M7 打包时把 `tree_core.exe` 与 `Tree.exe` 放在一起）→ 从应用目�
 | 只跑核心的协议与链路测试 | `cd packages/tree_core && dart test`（299 例，含真实 HTTP + WS 端到端） |
 | 真 SSH 集成测试（本机无 sshd 时自动跳过） | 设 `TREE_SSH_TEST_HOST` / `TREE_SSH_TEST_USER` / `TREE_SSH_TEST_KEY` 后 `cd packages/tree_local_exec && dart test` |
 
+### 打包（桌面发布形态）
+
+```powershell
+dart run tool/build_core.dart            # 默认输出 dist/tree_core.exe
+dart run tool/build_core.dart --out build\core\tree_core.exe
+```
+
+产物是**单文件原生可执行**（约 10 MB，无需 Dart 运行时）。发布时把它与 Flutter 壳
+（`Tree.exe`）放在同一目录即可：前端按"从应用目录向上 8 层查找 `tree_core.exe`"+
+`TREE_CORE_URL`/`TREE_CORE_TOKEN` 两种方式附着核心（见上文「调试技巧」）。
+
+门控冒烟测试（验证编译产物本身能起、能握手、能鉴权、能优雅退出）：
+
+```powershell
+$env:TREE_CORE_EXE='E:\programs\Tree\desktop\dist\tree_core.exe'
+cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
+```
+
 ### 里程碑进度
 
 - **M0a / M0b**：升级 Flutter 3.47.5 / Dart 3.13.4（放弃 Windows 7/8）；建立 `packages/` 纯 Dart 包骨架；协议冻结 + 完备性门禁
@@ -87,7 +105,9 @@ M7 打包时把 `tree_core.exe` 与 `Tree.exe` 放在一起）→ 从应用目�
 - **M5c**：`message` 工具 + 消息派发（审核闸门、活动日志、`wait_for`、附件）+ 级联停止（含排队任务丢弃）
 - **M5d**：Spec 体系（内置模板内嵌 + 自定义 spec 落盘工作空间、`spec` 工具、specs REST）+ 会话状态注入（todo / 已选 Spec 进入模型上下文）
 - **M6**：插件总线 + MCP + 进程外插件宿主
-- **M7**：文档能力（PDF/docx）、`dart compile exe` 打包与安装器、删除 `server/` 与前端多余执行器
+- **M6a**：MCP（stdio JSON-RPC 客户端 + `mcp` 工具 + 已就绪 MCP 工具的原生注入 + 服务注册 REST）
+- **M7a**：打包（`dart run tool/build_core.dart` → 单文件 `tree_core.exe`；`TREE_CORE_EXE` 门控的真可执行文件冒烟测试：握手 → HTTP 鉴权 → shutdown 优雅退出）
+- **M7**：文档能力（PDF/docx）、安装器、删除 `server/` 与前端多余执行器
 
 ---
 
