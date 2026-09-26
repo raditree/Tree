@@ -253,9 +253,9 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: cs.surfaceVariant.withOpacity(0.5),
+        color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: cs.primary.withOpacity(0.4)),
+        border: Border.all(color: cs.primary.withValues(alpha: 0.4)),
       ),
       child: Row(
         children: <Widget>[
@@ -340,8 +340,8 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
           backgroundColor: needsAction
               ? cs.errorContainer
               : (working
-                  ? Colors.orange.withOpacity(0.2)
-                  : cs.surfaceVariant),
+                  ? Colors.orange.withValues(alpha: 0.2)
+                  : cs.surfaceContainerHighest),
           child: Icon(
             needsAction
                 ? Icons.report_problem_outlined
@@ -941,7 +941,7 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
           )
         else
           DropdownButtonFormField<String>(
-            value: _models.any((Map<String, dynamic> m) =>
+            initialValue: _models.any((Map<String, dynamic> m) =>
                     (m['model_id'] as String? ?? '') == _selectedModelId)
                 ? _selectedModelId
                 : '',
@@ -1077,7 +1077,7 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
       if (value.isNotEmpty && !options.contains(value)) value,
     ];
     return DropdownButtonFormField<String>(
-      value: value,
+      initialValue: value,
       isExpanded: true,
       decoration: InputDecoration(
         labelText: '思考强度',

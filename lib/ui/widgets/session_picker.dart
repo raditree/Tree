@@ -308,7 +308,7 @@ class _SessionPickerState extends State<SessionPicker> {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
         color: selected
-            ? cs.primaryContainer.withOpacity(0.5)
+            ? cs.primaryContainer.withValues(alpha: 0.5)
             : Colors.transparent,
         child: Row(
           children: <Widget>[
@@ -355,7 +355,7 @@ class _SessionPickerState extends State<SessionPicker> {
         height: 28,
         padding: const EdgeInsets.symmetric(horizontal: 8),
         decoration: BoxDecoration(
-          color: cs.surfaceVariant.withOpacity(0.4),
+          color: cs.surfaceContainerHighest.withValues(alpha: 0.4),
           borderRadius: BorderRadius.circular(6),
           border: Border.all(color: cs.outlineVariant, width: 0.5),
         ),

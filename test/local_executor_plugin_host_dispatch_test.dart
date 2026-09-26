@@ -58,9 +58,9 @@ Map<String, dynamic> _request({
       'tool_id': 't_$op',
       'team_id': _teamId,
       'op': op,
-      if (hostKey != null) 'host_key': hostKey,
-      if (hostSessionId != null) 'host_session_id': hostSessionId,
-      if (payload != null) 'payload': payload,
+      'host_key': ?hostKey,
+      'host_session_id': ?hostSessionId,
+      'payload': ?payload,
       'targeted': targeted,
       // plugin_host_* 用 team 工作目录，workspace_id 仅为信封齐备
       'workspace_id': _teamId,

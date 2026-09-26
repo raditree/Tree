@@ -2,7 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
 import '../models/message.dart';
 import 'thinking_card.dart';
@@ -399,7 +399,7 @@ class _MessageListViewState extends State<_MessageListView> {
               return Container(
                 key: key,
                 decoration: BoxDecoration(
-                  color: cs.primary.withOpacity(0.10),
+                  color: cs.primary.withValues(alpha: 0.10),
                   borderRadius: BorderRadius.circular(10),
                   border: Border.all(color: cs.primary, width: 2),
                 ),
@@ -719,7 +719,7 @@ class _MessageBubbleState extends State<_MessageBubble> {
         ? '$mm-$dd'
         : '${t.year}-$mm-$dd';
     final Color color = isUser
-        ? Theme.of(context).colorScheme.onPrimary.withOpacity(0.7)
+        ? Theme.of(context).colorScheme.onPrimary.withValues(alpha: 0.7)
         : Theme.of(context).colorScheme.outline;
     return Text(
       '$date $hour:$minute',
@@ -733,9 +733,9 @@ class _MessageBubbleState extends State<_MessageBubble> {
     final cs = Theme.of(context).colorScheme;
     final Color textColor = isUser ? cs.onPrimary : cs.onSurface;
     final Color subColor =
-        isUser ? cs.onPrimary.withOpacity(0.7) : cs.onSurfaceVariant;
+        isUser ? cs.onPrimary.withValues(alpha: 0.7) : cs.onSurfaceVariant;
     final Color borderColor =
-        isUser ? cs.onPrimary.withOpacity(0.3) : Theme.of(context).dividerColor;
+        isUser ? cs.onPrimary.withValues(alpha: 0.3) : Theme.of(context).dividerColor;
     return Wrap(
       spacing: 6,
       runSpacing: 6,
@@ -743,7 +743,7 @@ class _MessageBubbleState extends State<_MessageBubble> {
         return Container(
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
           decoration: BoxDecoration(
-            color: isUser ? cs.onPrimary.withOpacity(0.08) : cs.surface,
+            color: isUser ? cs.onPrimary.withValues(alpha: 0.08) : cs.surface,
             borderRadius: BorderRadius.circular(6),
             border: Border.all(color: borderColor),
           ),

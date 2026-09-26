@@ -1,5 +1,4 @@
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
@@ -82,9 +81,9 @@ class _MessageInputState extends State<MessageInput> {
     // Ctrl+V：拦截默认粘贴，优先处理"粘贴上传"（剪贴板图片 / 复制的文件路径），
     // 普通文本则在手动插入（见 _handlePaste），避免被默认粘贴重复插入。
     if (event.logicalKey == LogicalKeyboardKey.keyV &&
-        (RawKeyboard.instance.keysPressed
+        (HardwareKeyboard.instance.logicalKeysPressed
                 .contains(LogicalKeyboardKey.controlLeft) ||
-            RawKeyboard.instance.keysPressed
+            HardwareKeyboard.instance.logicalKeysPressed
                 .contains(LogicalKeyboardKey.controlRight))) {
       _handlePaste();
       return KeyEventResult.handled;
@@ -92,8 +91,8 @@ class _MessageInputState extends State<MessageInput> {
     if (event.logicalKey != LogicalKeyboardKey.enter) {
       return KeyEventResult.ignored;
     }
-    if (RawKeyboard.instance.keysPressed.contains(LogicalKeyboardKey.shiftLeft) ||
-        RawKeyboard.instance.keysPressed.contains(LogicalKeyboardKey.shiftRight)) {
+    if (HardwareKeyboard.instance.logicalKeysPressed.contains(LogicalKeyboardKey.shiftLeft) ||
+        HardwareKeyboard.instance.logicalKeysPressed.contains(LogicalKeyboardKey.shiftRight)) {
       return KeyEventResult.ignored;
     }
     _handleSend();
@@ -103,13 +102,11 @@ class _MessageInputState extends State<MessageInput> {
   /// 处理文件选择
   Future<void> _pickFile() async {
     try {
-      final FilePickerResult? result = await FilePicker.platform.pickFiles(
-        allowMultiple: true,
-      );
-      if (result != null && result.paths.isNotEmpty) {
+      final List<PlatformFile> picked = await FilePicker.pickFiles();
+      if (picked.isNotEmpty) {
         setState(() {
           _filePaths.addAll(
-            result.paths.whereType<String>(),
+            picked.map((PlatformFile f) => f.path).whereType<String>(),
           );
         });
       }
@@ -264,10 +261,10 @@ class _MessageInputState extends State<MessageInput> {
                 margin: const EdgeInsets.only(bottom: 8),
                 padding: const EdgeInsets.symmetric(vertical: 12),
                 decoration: BoxDecoration(
-                  color: cs.primary.withOpacity(0.08),
+                  color: cs.primary.withValues(alpha: 0.08),
                   borderRadius: BorderRadius.circular(8),
                   border: Border.all(
-                    color: cs.primary.withOpacity(0.3),
+                    color: cs.primary.withValues(alpha: 0.3),
                     width: 1.5,
                     strokeAlign: BorderSide.strokeAlignInside,
                   ),

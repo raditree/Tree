@@ -703,12 +703,12 @@ class ApiService {
   }) async {
     return _patchJson('/api/agents/$agentId', body: {
       if (modelId != null && modelId.isNotEmpty) 'model_id': modelId,
-      if (systemPrompt != null) 'system_prompt': systemPrompt,
+      'system_prompt': ?systemPrompt,
       if (reasoningEffort != null && reasoningEffort.isNotEmpty)
         'reasoning_effort': reasoningEffort,
-      if (maxSeqlen != null) 'max_seqlen': maxSeqlen,
-      if (maxOutputTokens != null) 'max_output_tokens': maxOutputTokens,
-      if (compressThreshold != null) 'compress_threshold': compressThreshold,
+      'max_seqlen': ?maxSeqlen,
+      'max_output_tokens': ?maxOutputTokens,
+      'compress_threshold': ?compressThreshold,
       if (clearOverrides) 'clear_model_overrides': true,
     });
   }

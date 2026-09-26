@@ -388,7 +388,7 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
-        color: cs.surfaceVariant.withOpacity(0.4),
+        color: cs.surfaceContainerHighest.withValues(alpha: 0.4),
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: cs.outlineVariant, width: 0.5),
       ),
@@ -429,7 +429,7 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
           ),
           const SizedBox(height: 8),
           DropdownButtonFormField<String>(
-            value: _scope,
+            initialValue: _scope,
             isDense: true,
             decoration: const InputDecoration(
               labelText: '执行落点',
@@ -533,7 +533,7 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
                         padding: const EdgeInsets.symmetric(
                             horizontal: 4, vertical: 1),
                         decoration: BoxDecoration(
-                          color: cs.primaryContainer.withOpacity(0.6),
+                          color: cs.primaryContainer.withValues(alpha: 0.6),
                           borderRadius: BorderRadius.circular(4),
                         ),
                         child: Text(

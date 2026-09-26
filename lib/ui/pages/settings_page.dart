@@ -739,7 +739,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 Switch(
                   value: _dataCollectionEnabled,
                   onChanged: _toggleDataCollection,
-                  activeColor: cs.primary,
+                  activeThumbColor: cs.primary,
                 ),
               ],
             ),
@@ -782,7 +782,7 @@ class _SettingsPageState extends State<SettingsPage> {
             Switch(
               value: _rateLimitEnabled,
               onChanged: _toggleRateLimit,
-              activeColor: cs.primary,
+              activeThumbColor: cs.primary,
             ),
           ],
         ),
@@ -1105,7 +1105,7 @@ class _SettingsPageState extends State<SettingsPage> {
             Switch(
               value: _directCutin,
               onChanged: _toggleMessageCutin,
-              activeColor: cs.primary,
+              activeThumbColor: cs.primary,
             ),
           ],
         ),
@@ -1350,65 +1350,65 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   /// 主题管理卡片
+  ///
+  /// Flutter 3.32+ 起 Radio 的 groupValue/onChanged 迁移到 [RadioGroup] 祖先：
+  /// 组状态与变更回调由 RadioGroup 统一持有，子项 RadioListTile 只声明自身 value。
   Widget _buildThemeCard() {
     final ThemeService themeService = ThemeService.instance;
     return Card(
       margin: EdgeInsets.zero,
-      child: Column(
-        children: [
-          _buildThemeOption(
-            themeService,
-            ThemeMode.light,
-            Icons.light_mode_outlined,
-            '浅色',
-            '明亮模式，适合白天使用',
-          ),
-          _buildThemeOption(
-            themeService,
-            ThemeMode.dark,
-            Icons.dark_mode_outlined,
-            '深色',
-            '深色模式，适合夜间或省电',
-          ),
-          _buildThemeOption(
-            themeService,
-            ThemeMode.system,
-            Icons.brightness_auto_outlined,
-            '跟随系统',
-            '根据操作系统自动切换',
-          ),
-        ],
+      child: AnimatedBuilder(
+        animation: themeService,
+        builder: (BuildContext context, _) {
+          return RadioGroup<ThemeMode>(
+            groupValue: themeService.mode,
+            onChanged: (ThemeMode? value) {
+              if (value != null) {
+                themeService.setMode(value);
+              }
+            },
+            child: Column(
+              children: [
+                _buildThemeOption(
+                  ThemeMode.light,
+                  Icons.light_mode_outlined,
+                  '浅色',
+                  '明亮模式，适合白天使用',
+                ),
+                _buildThemeOption(
+                  ThemeMode.dark,
+                  Icons.dark_mode_outlined,
+                  '深色',
+                  '深色模式，适合夜间或省电',
+                ),
+                _buildThemeOption(
+                  ThemeMode.system,
+                  Icons.brightness_auto_outlined,
+                  '跟随系统',
+                  '根据操作系统自动切换',
+                ),
+              ],
+            ),
+          );
+        },
       ),
     );
   }
 
-  /// 单个主题选项（RadioListTile 风格）
+  /// 单个主题选项（RadioListTile 风格；组状态由 [_buildThemeCard] 的 RadioGroup 持有）
   Widget _buildThemeOption(
-    ThemeService themeService,
     ThemeMode mode,
     IconData icon,
     String title,
     String subtitle,
   ) {
-    // 监听 ThemeService，切换时重建以更新选中态
-    return AnimatedBuilder(
-      animation: themeService,
-      builder: (BuildContext context, _) {
-        final cs = Theme.of(context).colorScheme;
-        return RadioListTile<ThemeMode>(
-          value: mode,
-          groupValue: themeService.mode,
-          onChanged: (ThemeMode? value) {
-            if (value != null) {
-              themeService.setMode(value);
-            }
-          },
-          activeColor: cs.primary,
-          secondary: Icon(icon, color: cs.primary),
-          title: Text(title),
-          subtitle: Text(subtitle),
-        );
-      },
+    final cs = Theme.of(context).colorScheme;
+    return RadioListTile<ThemeMode>(
+      value: mode,
+      activeColor: cs.primary,
+      secondary: Icon(icon, color: cs.primary),
+      title: Text(title),
+      subtitle: Text(subtitle),
     );
   }
 }
@@ -1619,7 +1619,7 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
               ),
               const SizedBox(height: 10),
               DropdownButtonFormField<String>(
-                value: _reasoningEffort,
+                initialValue: _reasoningEffort,
                 isExpanded: true,
                 decoration: const InputDecoration(
                   labelText: '思考强度默认档位（reasoning_effort）',
@@ -1678,7 +1678,7 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
                 dense: true,
                 value: _thinking,
                 onChanged: (bool v) => setState(() => _thinking = v),
-                activeColor: cs.primary,
+                activeThumbColor: cs.primary,
                 title: const Text('思考模型（thinking）',
                     style: TextStyle(fontSize: 13)),
               ),
@@ -1687,7 +1687,7 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
                 dense: true,
                 value: _ifVision,
                 onChanged: (bool v) => setState(() => _ifVision = v),
-                activeColor: cs.primary,
+                activeThumbColor: cs.primary,
                 title: const Text('支持图像输入（if_vision）',
                     style: TextStyle(fontSize: 13)),
               ),

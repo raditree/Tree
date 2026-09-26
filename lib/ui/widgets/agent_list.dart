@@ -112,7 +112,7 @@ class _AgentListState extends State<AgentList> {
     );
 
     if (choice == 'clear') {
-      if (!mounted) return;
+      if (!context.mounted) return;
       final bool? confirmed = await showDialog<bool>(
         context: context,
         builder: (BuildContext ctx) => AlertDialog(
@@ -134,7 +134,7 @@ class _AgentListState extends State<AgentList> {
         widget.onClearHistory?.call(agent);
       }
     } else if (choice == 'delete') {
-      if (!mounted) return;
+      if (!context.mounted) return;
       final bool? confirmed = await showDialog<bool>(
         context: context,
         builder: (BuildContext ctx) => AlertDialog(

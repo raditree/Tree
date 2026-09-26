@@ -36,10 +36,9 @@ class McpStdioTunnelSession {
   McpStdioTunnelSession({
     required this.id,
     required this.teamId,
-    required void Function(Uint8List data) write,
-    required void Function() kill,
-  })  : _write = write,
-        _kill = kill;
+    required this._write,
+    required this._kill,
+  });
 
   /// 会话 id（后端按此 id 收发隧道报文）
   final String id;

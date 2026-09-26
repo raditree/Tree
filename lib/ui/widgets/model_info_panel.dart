@@ -382,7 +382,7 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
         // 不硬编码 —— 硬编码会在模型只支持少数档位时给出选起来无差别的假选项，
         // 也会让"模型换档位后旧覆盖值非法"无法被发现。
         DropdownButtonFormField<String>(
-          value: _reasoningEffort.isEmpty ? '' : _reasoningEffort,
+          initialValue: _reasoningEffort.isEmpty ? '' : _reasoningEffort,
           isExpanded: true,
           decoration: InputDecoration(
             labelText: '思考强度（模型默认：$defaultEffort）',
@@ -492,7 +492,7 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
       );
     }
     return DropdownButtonFormField<String>(
-      value: _selectedModelId,
+      initialValue: _selectedModelId,
       isExpanded: true,
       decoration: const InputDecoration(
         isDense: true,
@@ -590,7 +590,7 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
       width: double.infinity,
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
-        color: cs.surfaceVariant.withOpacity(0.3),
+        color: cs.surfaceContainerHighest.withValues(alpha: 0.3),
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: cs.outlineVariant, width: 0.5),
       ),

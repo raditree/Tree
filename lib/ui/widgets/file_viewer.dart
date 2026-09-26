@@ -500,7 +500,6 @@ class _FileViewerState extends State<FileViewer> {
         return _buildOfficeView();
       case _FileType.text:
       case _FileType.unknown:
-      default:
         return _buildTextView();
     }
   }
@@ -1170,14 +1169,24 @@ class _DownloadProgressDialogState extends State<_DownloadProgressDialog> {
       // 桌面端：系统保存对话框（file_picker.saveFile 仅桌面支持）
       // 移动端：无系统文件选择器，保存到应用文档目录并提示完整路径
       String? savePath;
+      // 桌面分支由 file_picker.saveFile 直接落盘（已写入）；移动分支仍需手动写
+      bool alreadyWritten = false;
       if (isMobile) {
         final Directory docDir = await getApplicationDocumentsDirectory();
         savePath = '${docDir.path}${Platform.pathSeparator}${widget.filename}';
       } else {
-        savePath = await FilePicker.platform.saveFile(
+        // file_picker 13：saveFile 直接接收字节并落盘，返回目标 Uri（已写入，无需再写）
+        final Uri? savedUri = await FilePicker.saveFile(
           dialogTitle: '保存文件',
           fileName: widget.filename,
+          bytes: bytes,
         );
+        if (savedUri != null) {
+          savePath = savedUri.scheme == 'file'
+              ? savedUri.toFilePath()
+              : savedUri.toString();
+          alreadyWritten = true;
+        }
       }
       if (!mounted) return;
 
@@ -1195,8 +1204,10 @@ class _DownloadProgressDialogState extends State<_DownloadProgressDialog> {
         return;
       }
 
-      // 3. 写入本地文件
-      await File(savePath).writeAsBytes(bytes);
+      // 3. 写入本地文件（桌面端 file_picker 已写入，仅移动端在此落盘）
+      if (!alreadyWritten) {
+        await File(savePath).writeAsBytes(bytes);
+      }
 
       if (!mounted) return;
       setState(() {

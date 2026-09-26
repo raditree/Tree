@@ -161,18 +161,20 @@ class _FilePanelState extends State<FilePanel>
           : await ApiService.downloadFile(
               widget.workspaceId, path, teamId: widget.teamId ?? '');
 
-      // 弹出系统保存对话框
-      final String? savePath = await FilePicker.platform.saveFile(
+      // 弹出系统保存对话框（file_picker 13：saveFile 直接接收字节并落盘，返回目标 Uri）
+      final Uri? savedUri = await FilePicker.saveFile(
         dialogTitle: isDirectory ? '保存文件夹' : '保存文件',
         fileName: isDirectory
             ? '${path.split('/').last}.tar.gz'
             : path.split('/').last,
+        bytes: bytes,
       );
 
-      if (savePath != null) {
-        // 手动写入文件（file_picker 5.3.1 不支持 bytes 参数）
-        await File(savePath).writeAsBytes(bytes);
-        _showSnackBar('下载完成：${savePath.split(Platform.pathSeparator).last}');
+      if (savedUri != null) {
+        final String savedPath = savedUri.scheme == 'file'
+            ? savedUri.toFilePath()
+            : savedUri.toString();
+        _showSnackBar('下载完成：${savedPath.split(Platform.pathSeparator).last}');
       }
     } on Exception catch (e) {
       String msg = e.toString().replaceFirst('Exception: ', '');

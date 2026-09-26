@@ -968,7 +968,7 @@ class _MessagePanelState extends State<MessagePanel> {
 
   /// 选择工作目录（用户项目根目录，工具读写/命令执行都在此目录下）
   Future<void> _pickWorkingDirectory() async {
-    final String? path = await FilePicker.platform.getDirectoryPath(
+    final String? path = await FilePicker.getDirectoryPath(
       dialogTitle: '选择项目根目录（工具执行结果写入此目录）',
     );
     if (path == null || path.isEmpty) return;
@@ -1079,7 +1079,7 @@ class _MessagePanelState extends State<MessagePanel> {
       height: 32,
       padding: const EdgeInsets.symmetric(horizontal: 8),
       decoration: BoxDecoration(
-        color: cs.surfaceVariant.withOpacity(0.3),
+        color: cs.surfaceContainerHighest.withValues(alpha: 0.3),
         border: Border(
           bottom: BorderSide(color: Theme.of(context).dividerColor, width: 0.5),
         ),
@@ -1096,7 +1096,7 @@ class _MessagePanelState extends State<MessagePanel> {
                 borderRadius: BorderRadius.circular(2),
                 child: LinearProgressIndicator(
                   value: (promptTokens / maxTokens).clamp(0.0, 1.0),
-                  backgroundColor: cs.surfaceVariant.withOpacity(0.5),
+                  backgroundColor: cs.surfaceContainerHighest.withValues(alpha: 0.5),
                   valueColor: AlwaysStoppedAnimation<Color>(
                     promptTokens > maxTokens * 0.9
                         ? cs.error

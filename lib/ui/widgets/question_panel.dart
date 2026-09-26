@@ -295,11 +295,11 @@ class _QuestionPanelState extends State<QuestionPanel> {
     return Card(
       margin: const EdgeInsets.only(bottom: 8),
       elevation: 0,
-      color: cs.surfaceVariant.withOpacity(0.5),
+      color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(8),
         side: BorderSide(
-          color: item.isPending ? cs.primary.withOpacity(0.5) : cs.outlineVariant,
+          color: item.isPending ? cs.primary.withValues(alpha: 0.5) : cs.outlineVariant,
         ),
       ),
       child: Padding(
@@ -417,7 +417,7 @@ class _QuestionPanelState extends State<QuestionPanel> {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.12),
+        color: color.withValues(alpha: 0.12),
         borderRadius: BorderRadius.circular(4),
       ),
       child: Text(

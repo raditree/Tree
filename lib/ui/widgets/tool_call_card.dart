@@ -39,7 +39,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
         decoration: BoxDecoration(
           color: cs.surface,
           borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: style.color.withOpacity(0.4)),
+          border: Border.all(color: style.color.withValues(alpha: 0.4)),
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -56,7 +56,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                       width: 28,
                       height: 28,
                       decoration: BoxDecoration(
-                        color: style.color.withOpacity(0.15),
+                        color: style.color.withValues(alpha: 0.15),
                         borderRadius: BorderRadius.circular(6),
                       ),
                       child: Icon(style.icon, size: 17, color: style.color),
@@ -197,7 +197,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
       decoration: BoxDecoration(
-        color: cs.surfaceVariant.withOpacity(0.35),
+        color: cs.surfaceContainerHighest.withValues(alpha: 0.35),
         borderRadius: const BorderRadius.vertical(bottom: Radius.circular(10)),
       ),
       child: Column(
@@ -400,7 +400,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
         width: double.infinity,
         padding: const EdgeInsets.all(8),
         decoration: BoxDecoration(
-          color: Theme.of(context).colorScheme.surfaceVariant,
+          color: Theme.of(context).colorScheme.surfaceContainerHighest,
           borderRadius: BorderRadius.circular(6),
         ),
         child: SingleChildScrollView(

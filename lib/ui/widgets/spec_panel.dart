@@ -218,7 +218,7 @@ class _SpecPanelState extends State<SpecPanel> {
 
     return Card(
       elevation: 0,
-      color: _cs.surfaceVariant.withOpacity(0.35),
+      color: _cs.surfaceContainerHighest.withValues(alpha: 0.35),
       margin: const EdgeInsets.only(bottom: 10),
       // 选中态（挂 hook）高亮描边，便于识别当前生效的 Spec
       shape: RoundedRectangleBorder(
@@ -384,7 +384,7 @@ class _TaskTypeBadge extends StatelessWidget {
         fg = cs.onErrorContainer;
         break;
       default:
-        bg = cs.surfaceVariant;
+        bg = cs.surfaceContainerHighest;
         fg = cs.onSurfaceVariant;
     }
     return Container(
@@ -485,7 +485,7 @@ class _ExpandedMarkdown extends StatelessWidget {
           text: token.substring(1, token.length - 1),
           style: TextStyle(
             fontFamily: 'monospace',
-            backgroundColor: cs.surfaceVariant,
+            backgroundColor: cs.surfaceContainerHighest,
             fontSize: 11,
           ),
         ));

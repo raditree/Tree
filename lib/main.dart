@@ -108,7 +108,7 @@ class AgentTeamApp extends StatelessWidget {
         onSurface: Color(0xFF1A2E21),
         // 显式补充（ColorScheme.light 未传时默认黑色/极端值，会在浅色底上
         // 造成同色不可读或过重描边）：灰绿系，与品牌绿协调且白底清晰
-        surfaceVariant: Color(0xFFDCEAE1),
+        surfaceContainerHighest: Color(0xFFDCEAE1),
         onSurfaceVariant: Color(0xFF44584C),
         outline: Color(0xFF6FA98A),
       ),
@@ -122,14 +122,14 @@ class AgentTeamApp extends StatelessWidget {
         ),
       ),
       // 卡片：白底 + 浅绿描边
-      cardTheme: CardTheme(
+      cardTheme: CardThemeData(
         color: Colors.white,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(8),
           side: const BorderSide(color: Color(0xFFC9E5D3)),
         ),
       ),
-      dialogTheme: const DialogTheme(
+      dialogTheme: const DialogThemeData(
         backgroundColor: Colors.white,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.all(Radius.circular(8)),
@@ -177,7 +177,7 @@ class AgentTeamApp extends StatelessWidget {
         onSurface: Color(0xFFE6F3EC),
         // 显式补充（ColorScheme.dark 未传时默认白色，半透明表层/状态文字
         // 会亮到与深底失去层次，甚至同色不可见）：深绿灰系与品牌绿协调
-        surfaceVariant: Color(0xFF14251B),
+        surfaceContainerHighest: Color(0xFF14251B),
         onSurfaceVariant: Color(0xFFA9C9B6),
         outline: Color(0xFF5E8E71),
       ),
@@ -189,14 +189,14 @@ class AgentTeamApp extends StatelessWidget {
           borderSide: BorderSide(color: brandBright, width: 1.5),
         ),
       ),
-      cardTheme: CardTheme(
+      cardTheme: CardThemeData(
         color: brandCard,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(8),
           side: const BorderSide(color: brandDivider),
         ),
       ),
-      dialogTheme: const DialogTheme(
+      dialogTheme: const DialogThemeData(
         backgroundColor: brandCard,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.all(Radius.circular(8)),

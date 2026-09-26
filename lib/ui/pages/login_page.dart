@@ -163,6 +163,7 @@ class _LoginPageState extends State<LoginPage> {
     ApiService.baseUrl = 'http://$backendHost:$backendPort';
     WebSocketService.baseUrl = 'ws://$backendHost:$backendPort';
 
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text('已切换后端地址：$backendHost:$backendPort')),
     );

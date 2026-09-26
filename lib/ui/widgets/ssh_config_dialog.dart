@@ -77,12 +77,11 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
   }
 
   Future<void> _pickKeyPath() async {
-    final FilePickerResult? result = await FilePicker.platform.pickFiles(
+    final PlatformFile? picked = await FilePicker.pickFile(
       dialogTitle: '选择 SSH 私钥文件',
-      allowMultiple: false,
     );
-    if (result != null && result.files.isNotEmpty) {
-      final String? path = result.files.single.path;
+    if (picked != null) {
+      final String? path = picked.path;
       if (path != null && path.isNotEmpty && mounted) {
         setState(() => _keyPathController.text = path);
       }
@@ -187,7 +186,7 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
               ),
               const SizedBox(height: 12),
               DropdownButtonFormField<String>(
-                value: _authType,
+                initialValue: _authType,
                 decoration: const InputDecoration(
                   labelText: '认证方式',
                   prefixIcon: Icon(Icons.vpn_key_outlined, size: 20),

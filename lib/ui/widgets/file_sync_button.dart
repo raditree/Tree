@@ -41,7 +41,7 @@ class FileSyncButton extends StatelessWidget {
       return;
     }
     // 选择本地目录
-    final String? dirPath = await FilePicker.platform.getDirectoryPath(
+    final String? dirPath = await FilePicker.getDirectoryPath(
       dialogTitle: '选择本地保存目录',
     );
     if (dirPath == null) return; // 用户取消选择
@@ -70,15 +70,14 @@ class FileSyncButton extends StatelessWidget {
   /// 调用 file_picker 多选本地文件，然后调用 [ApiService.uploadToCloud]
   /// 批量上传到工作空间 `.input/yyyymmdd/` 目录。上传期间展示进度对话框。
   Future<void> _uploadFiles(BuildContext context) async {
-    // 多选本地文件
-    final FilePickerResult? result = await FilePicker.platform.pickFiles(
+    // 多选本地文件（file_picker 13：pickFiles 即多选，返回空列表表示取消）
+    final List<PlatformFile> picked = await FilePicker.pickFiles(
       dialogTitle: '选择要上传的文件（可多选）',
-      allowMultiple: true,
     );
-    if (result == null || result.files.isEmpty) return; // 用户取消选择
+    if (picked.isEmpty) return; // 用户取消选择
 
     final List<MapEntry<String, String>> files = <MapEntry<String, String>>[];
-    for (final PlatformFile file in result.files) {
+    for (final PlatformFile file in picked) {
       if (file.path != null) {
         files.add(MapEntry<String, String>(file.path!, _basename(file.path!)));
       }
@@ -164,7 +163,7 @@ class FileSyncButton extends StatelessWidget {
       return;
     }
     // 选择本地文件夹
-    final String? dirPath = await FilePicker.platform.getDirectoryPath(
+    final String? dirPath = await FilePicker.getDirectoryPath(
       dialogTitle: '选择要上传的文件夹',
     );
     if (dirPath == null) return; // 用户取消选择

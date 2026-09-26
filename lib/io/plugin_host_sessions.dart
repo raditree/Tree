@@ -222,12 +222,10 @@ class PluginHostSession {
 /// 进程退出的异步回调串行到达，天然有序。
 class PluginHostSessionManager {
   PluginHostSessionManager({
-    required PluginHostSpawn spawn,
-    required void Function(Map<String, dynamic> frame) notify,
+    required this._spawn,
+    required this._notify,
     DateTime Function()? now,
-  })  : _spawn = spawn,
-        _notify = notify,
-        _now = now ?? DateTime.now;
+  }) : _now = now ?? DateTime.now;
 
   final PluginHostSpawn _spawn;
   final void Function(Map<String, dynamic> frame) _notify;

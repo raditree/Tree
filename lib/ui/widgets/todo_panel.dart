@@ -188,7 +188,7 @@ class _TodoPanelState extends State<TodoPanel> {
     return Card(
       margin: const EdgeInsets.only(bottom: 6),
       elevation: 0,
-      color: cs.surfaceVariant.withOpacity(0.5),
+      color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
       child: Padding(
         padding: const EdgeInsets.all(10),
         child: Column(

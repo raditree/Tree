@@ -6,42 +6,35 @@ publish_to: 'none'
 # 应用版本号与构建号
 version: 1.0.0+1
 
+# desktop 分支：升级到 Dart 3（Flutter 3.47.5 / Dart 3.13.4），放弃 Windows 7/8（最低 Windows 10）
 environment:
-  sdk: '>=2.19.6 <3.0.0'
+  sdk: ^3.13.0
 
 dependencies:
   flutter:
     sdk: flutter
   # iOS 风格图标
-  cupertino_icons: ^1.0.2
+  cupertino_icons: ^1.0.9
   # WebSocket 通信（与后端实时消息）
-  web_socket_channel: ^2.3.0
+  web_socket_channel: ^3.0.3
   # HTTP 请求（REST API 调用）
-  http: ^0.13.5
-  # 文件选择器
-  file_picker: ^5.2.0
+  http: ^1.6.0
   # 桌面文件拖拽
-  desktop_drop: ^0.4.4
-  # 本地键值存储（保存 JWT token 等）
-  shared_preferences: ^2.1.0
-  # 状态管理
-  provider: ^6.0.5
-  # 文件系统路径访问
-  path_provider: ^2.0.14
+  desktop_drop: ^0.8.4
   # Markdown 渲染（模型输出默认 markdown 格式）
-  # 注意：0.6.15+1 起要求 Dart 3.0，本项目为 Dart 2.19.6，故精确锁定 0.6.15
-  flutter_markdown: 0.6.15
-  # SSH/SFTP 客户端（纯 Dart，Windows 桌面可用）
-  # 注意：dartssh2 >=2.10.0 依赖 meta ^1.15.0，与本项目 Flutter SDK 锁定的
-  # meta 1.8.0（Dart 2.19.6）冲突，故锁定 2.8.2（依赖 meta ^1.1.6，min Dart 2.14）
-  # SSH 模式连接由前端发起，IP 相对前端机器
-  dartssh2: 2.8.2
+  # 原 flutter_markdown 已停止维护（pub 标记 discontinued），改用其官方继任 fork
+  flutter_markdown_plus: ^1.0.12
+  # SSH/SFTP 客户端（纯 Dart，Windows 桌面可用）；SSH 模式连接由前端发起，IP 相对前端机器
+  dartssh2: ^4.1.0
+  file_picker: ^13.1.0
+  shared_preferences: ^2.5.5
+  path_provider: ^2.1.6
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   # 代码规范 lint 规则集
-  flutter_lints: ^2.0.0
+  flutter_lints: ^6.0.0
 
 # Flutter 相关配置
 flutter:

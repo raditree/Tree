@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
 import '../models/message.dart';
 
@@ -38,7 +38,7 @@ class _ThinkingCardState extends State<ThinkingCard> {
         decoration: BoxDecoration(
           color: cs.surface,
           borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: cs.tertiary.withOpacity(0.35)),
+          border: Border.all(color: cs.tertiary.withValues(alpha: 0.35)),
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -55,7 +55,7 @@ class _ThinkingCardState extends State<ThinkingCard> {
                       width: 28,
                       height: 28,
                       decoration: BoxDecoration(
-                        color: cs.tertiary.withOpacity(0.15),
+                        color: cs.tertiary.withValues(alpha: 0.15),
                         borderRadius: BorderRadius.circular(6),
                       ),
                       child: Icon(
@@ -116,7 +116,7 @@ class _ThinkingCardState extends State<ThinkingCard> {
                 width: double.infinity,
                 padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
                 decoration: BoxDecoration(
-                  color: cs.surfaceVariant.withOpacity(0.35),
+                  color: cs.surfaceContainerHighest.withValues(alpha: 0.35),
                   borderRadius:
                       const BorderRadius.vertical(bottom: Radius.circular(10)),
                 ),

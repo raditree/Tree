@@ -1,5 +1,8 @@
 import 'package:flutter/material.dart';
 
+// 诊断探针：本文件刻意用 print 输出主题色值，不接入日志框架。
+// ignore_for_file: avoid_print
+
 void main() {
   final ThemeData light = ThemeData(
     primaryColor: const Color(0xFF00904A),
@@ -19,7 +22,7 @@ void main() {
   );
   print('LIGHT outline=${light.colorScheme.outline}');
   print('LIGHT onSurfaceVariant=${light.colorScheme.onSurfaceVariant}');
-  print('LIGHT surfaceVariant=${light.colorScheme.surfaceVariant}');
+  print('LIGHT surfaceContainerHighest=${light.colorScheme.surfaceContainerHighest}');
 
   final ThemeData dark = ThemeData(
     brightness: Brightness.dark,
@@ -40,5 +43,5 @@ void main() {
   );
   print('DARK outline=${dark.colorScheme.outline}');
   print('DARK onSurfaceVariant=${dark.colorScheme.onSurfaceVariant}');
-  print('DARK surfaceVariant=${dark.colorScheme.surfaceVariant}');
+  print('DARK surfaceContainerHighest=${dark.colorScheme.surfaceContainerHighest}');
 }

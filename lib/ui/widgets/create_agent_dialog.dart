@@ -360,7 +360,7 @@ class _CreateAgentDialogState extends State<CreateAgentDialog> {
       );
     }
     return DropdownButtonFormField<String>(
-      value: _selectedModelId,
+      initialValue: _selectedModelId,
       isExpanded: true,
       decoration: const InputDecoration(
         isDense: true,

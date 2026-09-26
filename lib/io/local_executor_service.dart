@@ -256,9 +256,9 @@ class _GrepCollector {
 /// WS 重连后 [syncRegisteredTeams] 恢复"已注册且启用"team 的注册。
 ///
 /// 工作空间路径映射（与后端协同布局保持一致）：
-/// - 顶级 agent 与团队成员的工作根统一为用户选择的工作目录 <baseDir>；
+/// - 顶级 agent 与团队成员的工作根统一为用户选择的工作目录 `<baseDir>`；
 /// - 各 agent 的私人记忆空间（``.self`` 令牌路径）按 workspace_id
-///   分目录落 <baseDir>/agentspace/{workspace_id}/.self（workspace_id =
+///   分目录落 `<baseDir>/agentspace/{workspace_id}/.self`（workspace_id =
 ///   顶层的 teamId / 成员的 member_id）。
 
 /// 大文件分片上传会话状态（本地执行器）。
@@ -621,11 +621,11 @@ class LocalExecutorService extends ChangeNotifier {
   ///
   /// 协同语义：
   /// - 所有 agent（顶层 agent 与团队成员）的工作文件都在工作目录
-  ///   <baseDir> 中读写执行，实现全队协同工作——因此非记忆路径一律返回 base。
+  ///   `<baseDir>` 中读写执行，实现全队协同工作——因此非记忆路径一律返回 base。
   /// - 每个 agent 的私人记忆文件（``.self`` 开头的路径，相对令牌 ``.self/xxx``）
-  ///   按各自的 workspace_id 解析到 <baseDir>/agentspace/{workspace_id} 下
+  ///   按各自的 workspace_id 解析到 `<baseDir>/agentspace/{workspace_id}` 下
   ///   （相对令牌仍保留 ``.self`` 前缀，最终物理落点为
-  ///   <baseDir>/agentspace/{workspace_id}/.self/xxx）。
+  ///   `<baseDir>/agentspace/{workspace_id}/.self/xxx`）。
   Directory _resolveWorkspaceDir(
     String baseDir,
     String workspaceId, [
