@@ -50,6 +50,16 @@ class CoreProcessLauncher {
   /// 最近一次失败的原因（供启动失败页展示）。
   String? lastError;
 
+  /// 本次实际使用的核心可执行文件路径（附着模式为 null）。
+  String? coreExecutablePath;
+
+  /// 启动期诊断（非致命）：目前用于「核心产物比界面旧」。
+  ///
+  /// 为什么需要：核心是**独立进程**，它的产物可能来自更早的构建；此时界面是新
+  /// 功能、核心是旧行为（工具表缺项、系统提示词缺章节、spec 索引消失……），现象
+  /// 极难自证。用一次产物时间对比就能把这类问题直接摆到用户面前。
+  String? buildWarning;
+
   /// 本次连接的核心握手信息；未启动成功时为 null。
   CoreHandshake? get handshake => _handshake;
 
@@ -93,6 +103,8 @@ class CoreProcessLauncher {
       _process = process;
       final CoreHandshake handshake = await _readHandshake(process);
       _handshake = handshake;
+      coreExecutablePath = executable;
+      buildWarning = _staleCoreWarning(executable);
       debugPrint(
         '[core] 已启动：$executable → ${handshake.httpBaseUrl} '
         '(pid ${handshake.pid})',
@@ -155,6 +167,56 @@ class CoreProcessLauncher {
       version: 'attached',
     );
   }
+
+  /// 核心产物是否比界面旧（陈旧产物的典型信号）。
+  ///
+  /// 判定：核心文件修改时间早于应用主程序 **60 秒以上**。容差是为了避开"同一次
+  /// 构建里两个产物先后落盘"的正常情况；开发期只重建了 App 没重建核心时，两者
+  /// 通常相差几十分钟到几小时，一定能命中。
+  ///
+  /// 只在能读到两个文件时间时判定，任何异常都当作"无法判定"（返回 null，不打扰
+  /// 用户）。
+  String? _staleCoreWarning(String executable) {
+    try {
+      return staleCoreWarningFor(
+        coreMtime: File(executable).lastModifiedSync(),
+        appMtime: File(Platform.resolvedExecutable).lastModifiedSync(),
+        coreName: p.basename(executable),
+        appName: p.basename(Platform.resolvedExecutable),
+        coreExecutableName: executableName,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 陈旧产物的纯判定（可单测）：核心早于界面超过 [tolerance] 就给出告警文案。
+  ///
+  /// 抽成纯函数的原因：真实调用要读 `Platform.resolvedExecutable` 的修改时间，
+  /// 在测试里无法构造；把"两个时间 + 两个文件名"作为输入，判定与文案就能被
+  /// 直接验证。
+  static String? staleCoreWarningFor({
+    required DateTime coreMtime,
+    required DateTime appMtime,
+    required String coreName,
+    required String appName,
+    required String coreExecutableName,
+    Duration tolerance = const Duration(seconds: 60),
+  }) {
+    if (!coreMtime.isBefore(appMtime.subtract(tolerance))) return null;
+    return '核心进程产物比界面旧：\n'
+        '  核心 $coreName（${_formatStamp(coreMtime)}）\n'
+        '  界面 $appName（${_formatStamp(appMtime)}）\n'
+        '界面上的新功能可能因为核心是旧产物而不可用（例如工具表缺项、系统提示词\n'
+        '缺章节）。请重建核心后重启应用：\n'
+        '  dart run tool/build_core.dart --out <与界面同目录>/$coreExecutableName';
+  }
+
+  static String _formatStamp(DateTime t) =>
+      '${t.year}-${_two(t.month)}-${_two(t.day)} '
+      '${_two(t.hour)}:${_two(t.minute)}';
+
+  static String _two(int value) => value < 10 ? '0$value' : '$value';
 
   /// 解析核心可执行文件路径；找不到返回 null（[lastError] 由调用方设置）。
   ///

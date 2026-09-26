@@ -36,7 +36,9 @@ Future<void> main() async {
   WebSocketService.baseUrl = handshake.wsBaseUrl;
   ApiService.setToken(handshake.token);
 
-  runApp(const AgentTeamApp());
+  // 启动期诊断（例如核心产物比界面旧）随 App 一起渲染：这类问题一旦发生，
+  // 现象是"界面有新功能、核心按旧行为跑"，不主动提示几乎无法自证。
+  runApp(AgentTeamApp(startupWarning: CoreProcessLauncher.instance.buildWarning));
 }
 
 /// 根 Widget - Agent 团队效率工具应用
@@ -44,7 +46,13 @@ Future<void> main() async {
 /// 配置应用主题（浅色/深色/跟随系统）与主界面路由，并在应用退出时回收核心
 /// 子进程（否则会留下孤儿进程，用户再也连不上旧实例）。
 class AgentTeamApp extends StatefulWidget {
-  const AgentTeamApp({super.key});
+  const AgentTeamApp({super.key, this.startupWarning});
+
+  /// 启动期诊断横幅（非致命）：非空时显示在主界面顶部，可关闭。
+  ///
+  /// 典型来源是「核心产物比界面旧」——核心是独立进程，界面新、核心旧时现象是
+  /// 功能莫名缺失（工具表缺项、系统提示词缺章节），不提示几乎无法自证。
+  final String? startupWarning;
 
   // ==================== 品牌色板（对齐 web/icons/Icon-512.png） ====================
   /// 图标主亮绿（HUD 弧线）
@@ -250,9 +258,72 @@ class _AgentTeamAppState extends State<AgentTeamApp> {
           darkTheme: AgentTeamApp._buildDarkTheme(),
           themeMode: ThemeService.instance.mode,
           // 单一入口：桌面分支没有登录页
-          home: const MainPage(),
+          home: _StartupWarningHost(
+            warning: widget.startupWarning,
+            child: const MainPage(),
+          ),
         );
       },
+    );
+  }
+}
+
+/// 启动期诊断横幅的宿主：把非致命警告显示在主界面顶部，可关闭。
+///
+/// 为什么不做成 SnackBar：这类问题（核心是旧产物）在整个会话里都成立，一闪而过
+/// 的提示等于没提示；横幅留在顶部直到用户主动关掉。
+class _StartupWarningHost extends StatefulWidget {
+  const _StartupWarningHost({required this.warning, required this.child});
+
+  final String? warning;
+  final Widget child;
+
+  @override
+  State<_StartupWarningHost> createState() => _StartupWarningHostState();
+}
+
+class _StartupWarningHostState extends State<_StartupWarningHost> {
+  bool _dismissed = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final String? warning = widget.warning;
+    if (warning == null || warning.isEmpty || _dismissed) {
+      return widget.child;
+    }
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return Column(
+      children: <Widget>[
+        Material(
+          color: cs.errorContainer,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 10, 4, 10),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Icon(Icons.warning_amber_rounded, color: cs.onErrorContainer),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: SelectableText(
+                    warning,
+                    style: TextStyle(
+                      color: cs.onErrorContainer,
+                      fontSize: 12.5,
+                      height: 1.35,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  tooltip: '知道了',
+                  icon: Icon(Icons.close, size: 18, color: cs.onErrorContainer),
+                  onPressed: () => setState(() => _dismissed = true),
+                ),
+              ],
+            ),
+          ),
+        ),
+        Expanded(child: widget.child),
+      ],
     );
   }
 }
