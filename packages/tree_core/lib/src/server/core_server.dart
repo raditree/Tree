@@ -10,9 +10,10 @@ import '../agent/question_broker.dart';
 import '../agent/question_store.dart';
 import '../agent/scripted_agent.dart';
 import '../settings/core_settings.dart';
+import '../store/atomic_file.dart';
 import '../store/memory_store.dart';
 import '../store/tree_store.dart';
-import '../team/team_model.dart';
+import '../team/message_dispatcher.dart';
 import '../team/team_service.dart';
 import '../tool/todo_store.dart';
 import '../util/token.dart';
@@ -45,6 +46,7 @@ class CoreServer {
     required this.settings,
     required this.todoStore,
     required this.teamService,
+    required this.messageDispatcher,
     required this.hub,
     required this.questions,
     required this.conversation,
@@ -66,8 +68,6 @@ class CoreServer {
   ///   `fileSyncToLocal`（M4 本地执行 + M7 文档能力）
   /// - Git 历史：`workspaceGitLog` / `workspaceGitBranches`（M4）
   static const Set<String> stubApiPaths = <String>{
-    ApiPaths.teammateLog,
-    ApiPaths.teammateMessage,
     ApiPaths.agentSpec,
     ApiPaths.files,
     ApiPaths.fileContent,
@@ -103,6 +103,9 @@ class CoreServer {
 
   /// 团队服务（M5b）；为 null 时不提供 teammates 路由（测试/最小骨架）。
   final TeamService? teamService;
+
+  /// 团队消息派发（M5c）；为 null 时不提供消息/日志路由。
+  final TeamMessageDispatcher? messageDispatcher;
 
   /// 提问回路（M5a）；为 null 时核心不提供 `ask_user_question`（测试/最小骨架）。
   final QuestionBroker? questions;
@@ -172,6 +175,7 @@ class CoreServer {
     AgentEngine? engine,
     QuestionBroker? questions,
     TeamService? teamService,
+    TeamMessageDispatcher? messageDispatcher,
   }) async {
     final HttpServer http = await HttpServer.bind(
       address ?? InternetAddress.loopbackIPv4,
@@ -191,6 +195,7 @@ class CoreServer {
       settings: resolvedSettings,
       todoStore: resolvedTodos,
       teamService: teamService,
+      messageDispatcher: messageDispatcher,
       hub: hub,
       questions: questions,
       conversation: ConversationService(
@@ -320,7 +325,7 @@ class CoreServer {
         unawaited(conversation.handleUserMessage(frame));
         break;
       case WsInboundType.stop:
-        conversation.handleStop(frame);
+        _handleStop(connection, frame);
         break;
       case WsInboundType.registerLocalExecutor:
         connection.send(<String, dynamic>{
@@ -423,6 +428,8 @@ class CoreServer {
     router.add('GET', ApiPaths.agentTodos, _agentTodos);
     router.add('GET', ApiPaths.agentTeammates, _agentTeammates);
     router.add('PATCH', ApiPaths.teammate, _updateTeammate);
+    router.add('GET', ApiPaths.teammateLog, _teammateLog);
+    router.add('POST', ApiPaths.teammateMessage, _teammateMessage);
     router.add('GET', ApiPaths.models, _listModels);
     router.add('POST', ApiPaths.models, _createModel);
     router.add('PATCH', ApiPaths.model, _updateModel);
@@ -648,6 +655,123 @@ class CoreServer {
       );
       return;
     }
+    await writeJson(request, 200, result);
+  }
+
+  /// 处理 `stop`：**级联**语义（参考实现 `_stop_agent_tree`）。
+  ///
+  /// `agent_id` 是 TOP 时停整棵团队树：先自身、再成员。每个被取消的 agent 都作废
+  /// 排队任务（见 `ConversationService.cancelAgent`）；**没有在途任务**的成员补一条
+  /// `idle`，否则前端/成员窗口的"工作中"标识会一直亮着。
+  void _handleStop(WsConnection connection, Map<String, dynamic> frame) {
+    final Object? raw = frame['data'];
+    final Map<String, dynamic> data = raw is Map
+        ? raw.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
+        : frame;
+    final String agentId = (data['agent_id'] ?? frame['agent_id'] ?? '')
+        .toString()
+        .trim();
+    final String sessionId = (data['session_id'] ?? frame['session_id'] ?? '')
+        .toString()
+        .trim();
+    if (agentId.isEmpty) {
+      connection.send(<String, dynamic>{
+        'type': WsOutboundType.error,
+        'data': <String, dynamic>{'message': '缺少 agent_id'},
+      });
+      return;
+    }
+    final List<String> ids =
+        teamService?.cascadeIds(agentId) ?? <String>[agentId];
+    bool anyRunning = false;
+    for (final String id in ids) {
+      final bool running = conversation.cancelAgent(id);
+      anyRunning = anyRunning || running;
+      if (!running) {
+        hub.broadcast(<String, dynamic>{
+          'type': WsOutboundType.agentStatus,
+          'data': <String, dynamic>{
+            'agent_id': id,
+            'status': 'idle',
+            if (sessionId.isNotEmpty) 'session_id': sessionId,
+          },
+        });
+      }
+    }
+    if (!anyRunning && ids.length == 1) {
+      connection.send(<String, dynamic>{
+        'type': WsOutboundType.error,
+        'data': <String, dynamic>{'message': '没有进行中的任务可停止'},
+      });
+      return;
+    }
+    // 请求方：立刻回一条 stopping（前端把它当"已在停"处理）
+    connection.send(<String, dynamic>{
+      'type': WsOutboundType.agentStatus,
+      'data': <String, dynamic>{
+        'agent_id': agentId,
+        'status': 'stopping',
+        if (sessionId.isNotEmpty) 'session_id': sessionId,
+      },
+    });
+  }
+
+  /// `GET /api/agents/{memberId}/teammate/{memberId}/log?lines=60`：成员活动日志尾部。
+  Future<void> _teammateLog(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final TeamMessageDispatcher? dispatcher = messageDispatcher;
+    if (dispatcher == null) {
+      await writeJson(request, 501, errorBody('团队服务尚未接入'));
+      return;
+    }
+    final String memberId = params['memberId'] ?? '';
+    final int lines =
+        int.tryParse(request.uri.queryParameters['lines'] ?? '') ?? 60;
+    final String? path = dispatcher.activityLogPath(memberId);
+    String log = '';
+    if (path != null) {
+      final String? tail = AtomicFile.readTailOrNullSync(path, 64 * 1024);
+      if (tail != null && tail.isNotEmpty) {
+        final List<String> all = const LineSplitter().convert(tail);
+        log = all.length <= lines
+            ? all.join('\n')
+            : all.sublist(all.length - lines).join('\n');
+      }
+    }
+    await writeJson(request, 200, <String, dynamic>{
+      'success': true,
+      'log': log,
+      'path': path ?? '',
+    });
+  }
+
+  /// `POST /api/agents/{leaderId}/teammate/{memberId}/message`：用户直接给成员发消息。
+  Future<void> _teammateMessage(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final TeamMessageDispatcher? dispatcher = messageDispatcher;
+    if (dispatcher == null) {
+      await writeJson(request, 501, errorBody('团队服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic> body = await readJsonBody(request);
+    final String content = (body['content'] ?? '').toString();
+    if (content.trim().isEmpty) {
+      await writeJson(request, 200, <String, dynamic>{
+        'success': false,
+        'error': '缺少 content',
+      });
+      return;
+    }
+    final String sessionId = (body['session_id'] ?? '').toString().trim();
+    final Map<String, dynamic> result = await dispatcher.sendFromUser(
+      targetId: params['memberId'] ?? '',
+      content: content,
+      sessionId: sessionId.isEmpty ? TreeStore.defaultSessionId : sessionId,
+    );
     await writeJson(request, 200, result);
   }
 

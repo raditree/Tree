@@ -2,7 +2,9 @@ import 'dart:convert';
 
 import 'package:tree_local_exec/tree_local_exec.dart';
 
+import '../team/message_dispatcher.dart';
 import '../team/team_service.dart';
+import 'message_tool.dart';
 import 'question_channel.dart';
 import 'terminal_hooks.dart';
 import 'team_tool.dart';
@@ -38,8 +40,10 @@ abstract final class BuiltinTools {
     bool withTodos = false,
     bool withQuestions = false,
     bool withTeam = false,
+    bool withMessage = false,
   }) => <ToolSpec>[
     if (withTeam) TeamTool.spec(),
+    if (withMessage) MessageTool.spec(),
     if (withTodos)
       ToolSpec(
         name: setTodoList,
@@ -270,9 +274,11 @@ abstract final class BuiltinTools {
     TerminalHooks? hooks,
     AskQuestion? askQuestion,
     TeamService? teamService,
+    TeamMessageDispatcher? messageDispatcher,
     bool withTodos = false,
     bool withQuestions = false,
     bool withTeam = false,
+    bool withMessage = false,
   }) async {
     try {
       if (io == null && needsWorkspace(invocation.name)) {
@@ -284,6 +290,11 @@ abstract final class BuiltinTools {
             return const ToolOutcome('团队服务未接入：无法使用该工具', isError: true);
           }
           return await TeamTool.run(invocation, teamService);
+        case MessageTool.name:
+          if (messageDispatcher == null) {
+            return const ToolOutcome('消息通道未接入：无法使用该工具', isError: true);
+          }
+          return await MessageTool.run(invocation, messageDispatcher);
         case askUserQuestion:
           return await _askUserQuestion(
             invocation,
@@ -313,7 +324,7 @@ abstract final class BuiltinTools {
         default:
           return ToolOutcome(
             '未知工具：${invocation.name}'
-            '（可用：${specs(withTodos: withTodos, withQuestions: withQuestions, withTeam: withTeam).map((ToolSpec s) => s.name).join('、')}）',
+            '（可用：${specs(withTodos: withTodos, withQuestions: withQuestions, withTeam: withTeam, withMessage: withMessage).map((ToolSpec s) => s.name).join('、')}）',
             isError: true,
           );
       }

@@ -80,10 +80,47 @@ Future<void> main(List<String> args) async {
     isWorking: (String agentId) => workingSink?.call(agentId) ?? false,
     log: (String message) => stderr.writeln('[core:team] $message'),
   );
+  // 消息派发：投递实现要等核心起监听后才有（ConversationService 由核心创建），
+  // 因此同样用可后置绑定的槽。
+  TeamDelivery? deliverSink;
+  final TeamMessageDispatcher messages = TeamMessageDispatcher(
+    store: store,
+    teams: teams,
+    deliver:
+        ({
+          required String agentId,
+          required String sessionId,
+          required String content,
+          String senderId = '',
+          String senderName = '',
+        }) {
+          final TeamDelivery? sink = deliverSink;
+          if (sink == null) return Future<void>.value();
+          return sink(
+            agentId: agentId,
+            sessionId: sessionId,
+            content: content,
+            senderId: senderId,
+            senderName: senderName,
+          );
+        },
+    // 活动日志与文件投递只走**本机**工作空间：SSH 成员的工作空间在远端，
+    // 这里返回空串，投递会明确报"不支持"而不是复制到无关目录。
+    workspaceDirOf: (String agentId) {
+      final CoreAgent? agent = store.agent(agentId);
+      if (agent != null && agent.sshConfig != null) return '';
+      final String configured = agent?.workspaceDir ?? '';
+      return configured.trim().isNotEmpty
+          ? configured
+          : paths.defaultWorkspaceDir(agentId);
+    },
+    log: (String message) => stderr.writeln('[core:msg] $message'),
+  );
   final WorkspaceToolRunner tools = WorkspaceToolRunner(
     todoStore: todos,
     askQuestion: questions.ask,
     teamService: teams,
+    messageDispatcher: messages,
     resolveSshConfig: (String agentId) => store.agent(agentId)?.sshConfig,
     // SSH 后端（dartssh2 + SFTP/exec）：每个 agent 一条连接，按需建立并缓存；
     // 远端根目录取 ssh.root（空 = 远端登录用户的 HOME）。
@@ -137,10 +174,12 @@ Future<void> main(List<String> args) async {
     engine: engine,
     questions: questions,
     teamService: teams,
+    messageDispatcher: messages,
   );
-  // 提问卡片要广播到前端、成员状态要读会话在途表：核心起监听后把两个槽接上
+  // 起监听后才存在的三个依赖一次性接上：广播、在途状态、消息投递
   hubSink = server.hub.broadcast;
   workingSink = server.conversation.isRunning;
+  deliverSink = server.conversation.deliver;
   if (verbose) {
     // 访问日志走 stderr（stdout 是进程间协议，绝不能混入日志）
     server.accessLog = (String message) => stderr.writeln('[core] $message');

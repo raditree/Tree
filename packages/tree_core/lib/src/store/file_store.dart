@@ -95,8 +95,8 @@ class FileTreeStore implements TreeStore {
     String systemPrompt = '',
     String modelId = '',
     int teamMemberCount = 0,
-    int maxLevel = 1,
-    int maxMembersPerLevel = 0,
+    int maxLevel = TeamLimits.defaultMaxLevel,
+    int maxMembersPerLevel = TeamLimits.defaultMaxMembersPerLevel,
   }) {
     final int now = DateTime.now().millisecondsSinceEpoch;
     final String id = CoreIds.next('agt');

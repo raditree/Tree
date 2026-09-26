@@ -39,8 +39,8 @@ abstract interface class TreeStore {
     String systemPrompt = '',
     String modelId = '',
     int teamMemberCount = 0,
-    int maxLevel = 1,
-    int maxMembersPerLevel = 0,
+    int maxLevel = TeamLimits.defaultMaxLevel,
+    int maxMembersPerLevel = TeamLimits.defaultMaxMembersPerLevel,
   });
 
   /// 直接写入/覆盖一个 agent 记录（持久化层装载用，也用于测试构造）。

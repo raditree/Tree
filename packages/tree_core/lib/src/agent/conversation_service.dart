@@ -71,6 +71,12 @@ class ConversationService {
   /// 每个 agent 当前在途任务的取消令牌。
   final Map<String, _RunToken> _running = <String, _RunToken>{};
 
+  /// 每个 agent 的**任务代次**：stop 时 +1，丢弃此前还在排队、尚未开始的任务。
+  final Map<String, int> _epoch = <String, int>{};
+
+  /// 因 `stop` 被丢弃的排队任务数（自检/测试用）。
+  int droppedQueuedCount = 0;
+
   /// 当前在途生成数（自检/日志用）。
   int get activeRunCount => _running.length;
 
@@ -106,7 +112,8 @@ class ConversationService {
     return _enqueue(agent.id, () => _runReply(agent, session, content));
   }
 
-  /// 处理 `stop`：置位取消令牌，正在流式的任务会在下个检查点退出。
+  /// 处理 `stop`（单个 agent；`agent_id` 为 TOP 时的**级联**由核心层展开，
+  /// 见 `CoreServer._handleStop`）。
   ///
   /// 帧字段：`{type, data:{agent_id, session_id}}`。
   void handleStop(Map<String, dynamic> frame) {
@@ -114,11 +121,56 @@ class ConversationService {
     final String agentId =
         (data['agent_id'] as String?) ?? (frame['agent_id'] as String?) ?? '';
     if (agentId.isEmpty) return;
+    cancelAgent(agentId);
+  }
+
+  /// 取消某 agent 的当前生成，并**作废它的排队任务**；返回是否真有在途任务。
+  ///
+  /// 为什么要作废排队任务：`stop` 之后那些还没开始的消息会接着把 agent 拉起来，
+  /// 用户看到的"停止"就是假的。参考实现在 stop 时清空 broker 队列，这里用
+  /// **epoch** 表达同一语义：入队时记下代次，stop 时代次 +1，旧代次的任务直接
+  /// 丢弃（`droppedQueuedCount` 计数便于测试与排障）。
+  bool cancelAgent(String agentId) {
     // 先取消在途提问：等待中的工具会立刻拿到 cancelled 结果，工具循环才能收敛。
     questions?.cancelForAgent(agentId);
+    _epoch[agentId] = (_epoch[agentId] ?? 0) + 1;
     final _RunToken? token = _running[agentId];
-    if (token == null) return;
+    if (token == null) return false;
     token.cancelled = true;
+    return true;
+  }
+
+  /// 团队消息投递（M5c）：把 **agent** 发来的消息落库并触发一轮生成。
+  ///
+  /// 与 `user_message` 的区别：
+  /// - 消息带 `[来自 <发送者>]` 前缀——本项目的消息模型没有 sender 字段，而模型
+  ///   必须知道该向谁回发（参考实现用 session.sender_id 表达同一件事）；
+  /// - 到点即执行：投递是"新消息"，不受此前 stop 的历史代次影响。
+  Future<void> deliver({
+    required String agentId,
+    required String sessionId,
+    required String content,
+    String senderId = '',
+    String senderName = '',
+  }) {
+    final CoreAgent? agent = store.agent(agentId);
+    if (agent == null) return Future<void>.value();
+    final CoreSession session = _resolveSession(agent, sessionId, content);
+    final String sender = senderName.trim().isEmpty ? senderId : senderName;
+    final String text = sender.trim().isEmpty
+        ? content
+        : '[来自 $sender] $content';
+    store.appendMessage(
+      CoreMessage(
+        id: CoreIds.message(),
+        agentId: agent.id,
+        sessionId: session.sessionId,
+        role: 'user',
+        content: text,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+      ),
+    );
+    return _enqueue(agent.id, () => _runReply(agent, session, text));
   }
 
   /// 处理 `user_answer`（`ask_user_question` 的应答）。
@@ -452,11 +504,19 @@ class ConversationService {
     final Future<void> previous = _chains[agentId] ?? Future<void>.value();
     final Completer<void> gate = Completer<void>();
     _chains[agentId] = gate.future;
+    final int epoch = _epoch[agentId] ?? 0;
     unawaited(() async {
       try {
         await previous;
       } catch (_) {
         // 前序任务的错误已在内部上报，不阻断队列
+      }
+      // stop 之后旧代次的排队任务一律丢弃（参考实现清空 broker 队列的等价语义）
+      if ((_epoch[agentId] ?? 0) != epoch) {
+        droppedQueuedCount++;
+        if (!gate.isCompleted) gate.complete();
+        if (identical(_chains[agentId], gate.future)) _chains.remove(agentId);
+        return;
       }
       try {
         await task();

@@ -62,6 +62,95 @@ class TeamService {
   String workStatus(String agentId) =>
       (isWorking?.call(agentId) ?? false) ? 'working' : 'idle';
 
+  /// agent 的全部下级（BFS；父先于子，不含自身）。
+  List<CoreAgent> descendants(String agentId) {
+    final CoreAgent? self = store.agent(agentId);
+    if (self == null) return const <CoreAgent>[];
+    final Map<String, List<CoreAgent>> children = _childrenIndex(
+      teamIdOf(agentId),
+    );
+    final List<CoreAgent> out = <CoreAgent>[];
+    final List<CoreAgent> cursor = <CoreAgent>[self];
+    for (int i = 0; i < cursor.length; i++) {
+      final List<CoreAgent> kids =
+          children[cursor[i].id] ?? const <CoreAgent>[];
+      out.addAll(kids);
+      cursor.addAll(kids);
+    }
+    return out;
+  }
+
+  /// 级联停止要覆盖的 id：自身 +（TOP 时）整棵团队树。
+  ///
+  /// 与参考实现一致：**先自身、再成员**；非 TOP 只停自己（成员不该顺带停掉全队）。
+  List<String> cascadeIds(String agentId) {
+    final CoreAgent? agent = store.agent(agentId);
+    if (agent == null || agent.teamId.isNotEmpty) return <String>[agentId];
+    return <String>[
+      agentId,
+      ...descendants(agentId).map((CoreAgent m) => m.id),
+    ];
+  }
+
+  /// 直属成员（`broadcast` 只发给直属，不跨层级）。
+  List<CoreAgent> directMembers(String agentId) =>
+      members(teamIdOf(agentId))
+          .where((CoreAgent m) => m.parentAgentId == agentId)
+          .toList(growable: false);
+
+  /// 消息寻址：团队内成员（id/名称）、直属 leader、同机其他 TOP。
+  ///
+  /// 返回 [MessageTarget]；不可达时返回 null 并把原因写进 [lastTargetReason]：
+  /// `empty` / `not_found` / `cross_top_denied`（**成员不得跨 TOP**，与参考实现一致）。
+  MessageTarget? resolveMessageTarget(String agentId, String raw) {
+    final String target = raw.trim();
+    lastTargetReason = '';
+    if (target.isEmpty) {
+      lastTargetReason = 'empty';
+      return null;
+    }
+    final CoreAgent? self = store.agent(agentId);
+    if (self == null) {
+      lastTargetReason = 'not_found';
+      return null;
+    }
+    final String teamId = teamIdOf(agentId);
+    for (final CoreAgent member in members(teamId)) {
+      if (member.id == target || member.name == target) {
+        return MessageTarget(id: member.id, name: member.name, type: 'member');
+      }
+    }
+    final CoreAgent? leader = store.agent(self.parentAgentId);
+    if (leader != null && (leader.id == target || leader.name == target)) {
+      return MessageTarget(id: leader.id, name: leader.name, type: 'leader');
+    }
+    for (final CoreAgent team in teams()) {
+      if (team.id == self.id) continue;
+      if (team.id != target && team.name != target) continue;
+      // 跨 TOP 通信只有 TOP 自己可以发起（成员必须先报给本队 TOP）
+      if (self.teamId.isNotEmpty) {
+        lastTargetReason = 'cross_top_denied';
+        return null;
+      }
+      return MessageTarget(id: team.id, name: team.name, type: 'top');
+    }
+    lastTargetReason = 'not_found';
+    return null;
+  }
+
+  /// 最近一次寻址失败的原因（[resolveMessageTarget] 的附带输出）。
+  String lastTargetReason = '';
+
+  Map<String, List<CoreAgent>> _childrenIndex(String teamId) {
+    final Map<String, List<CoreAgent>> children = <String, List<CoreAgent>>{};
+    for (final CoreAgent member in members(teamId)) {
+      children
+          .putIfAbsent(member.parentAgentId, () => <CoreAgent>[])
+          .add(member);
+    }
+    return children;
+  }
+
   /// 审核闸门（M5c 派发前调用）：返回拒绝原因，null = 放行。
   ///
   /// 与参考实现一致：TOP / 非成员放行；rejected、未分配模型、未审核分别给出
@@ -814,6 +903,25 @@ class TeamService {
     return '${now.year}-${two(now.month)}-${two(now.day)} '
         '${two(now.hour)}:${two(now.minute)}:${two(now.second)}';
   }
+}
+
+/// 消息寻址结果（`member` / `leader` / `top`）。
+class MessageTarget {
+  const MessageTarget({
+    required this.id,
+    required this.name,
+    required this.type,
+  });
+
+  final String id;
+  final String name;
+  final String type;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'id': id,
+    'name': name,
+    'type': type,
+  };
 }
 
 /// 目标成员解析结果。
