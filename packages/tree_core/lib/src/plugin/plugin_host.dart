@@ -2,6 +2,10 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import '../util/liveness.dart';
+import 'station_runtime.dart';
+import 'station_scope.dart';
+
 /// 进程外插件宿主（M6b）。
 ///
 /// 协议（行分隔 JSON-RPC 2.0，方法与 MCP 同风格但独立命名）：
@@ -10,16 +14,30 @@ import 'dart:io';
 /// - 插件 → 核心：只要求**应答**；插件主动发的 `log` / `event` 通知会被收集成
 ///   [PluginHost.notifications]，由总线转成前端事件（M6c）。
 ///
-/// 与 MCP 客户端一样是"本机直跑、不做安全隔离"：只做超时、崩溃感知与优雅关闭。
+/// 与 MCP 客户端一样是"本机直跑、不做安全隔离"：只做**心跳判活**、崩溃感知与优雅关闭。
+///
+/// M9 §1.1：**取消静态总时间上限**——tools/call 跑多久都不因时间失败，判据换成
+/// 心跳丢失（连续 N 拍没有任何入站证据 ⇒ 标记 degraded；只标记、不终止，见
+/// PluginBus.watchdog）。唯一保留的短窗口是**建连握手**（hello / 首次 tools/list）：
+/// 没有它就无法诊断"插件根本没起来"。
 /// （stdio/JSON-RPC 的搬运代码与 `mcp_client.dart` 同构：两者协议细节不同、都只有
 /// 一份实现，暂时各自持有；出现第三个消费者时再抽公共传输层。）
 class PluginHost {
-  PluginHost._(this.config, this._process, this._stderr);
+  PluginHost._(
+    this.config,
+    this._process,
+    this._stderr,
+    Duration heartbeatInterval,
+  ) : liveness = LivenessTracker(
+        label: '插件 ${config.id}',
+        interval: heartbeatInterval,
+      );
 
   /// 启动插件进程并完成 `hello` 握手。
   static Future<PluginHost> start(
     PluginConfig config, {
     Duration timeout = const Duration(seconds: 20),
+    Duration heartbeatInterval = LivenessTracker.defaultInterval,
     String coreVersion = '',
     void Function(Map<String, dynamic> notification)? onNotification,
   }) async {
@@ -41,8 +59,12 @@ class PluginHost {
     process.stderr
         .transform(utf8.decoder)
         .listen(stderr.write, onError: (Object _) {});
-    final PluginHost host = PluginHost._(config, process, stderr)
-      .._onNotification = onNotification;
+    final PluginHost host = PluginHost._(
+      config,
+      process,
+      stderr,
+      heartbeatInterval,
+    ).._onNotification = onNotification;
     process.stdout
         .transform(utf8.decoder)
         .transform(const LineSplitter())
@@ -59,7 +81,7 @@ class PluginHost {
           'core_version': coreVersion,
           'plugin_id': config.id,
         },
-        timeout,
+        timeout: timeout,
       );
       host.pluginId = (hello['plugin_id'] ?? config.id).toString();
       host.name = (hello['name'] ?? config.name).toString();
@@ -105,6 +127,12 @@ class PluginHost {
   /// 插件声明的能力（如 tools/events）。
   List<String> capabilities = const <String>[];
 
+  /// 心跳台账（M9 §1.1）：**任意入站报文都算一次心跳**（数据还在流动即链路活着），
+  /// 由 PluginBus 的看门狗每过一拍探测一次；连续 N 拍未达 ⇒ degraded。
+  ///
+  /// 单拍窗口 = 心跳间隔 I（由总线注入，默认 10s）。
+  final LivenessTracker liveness;
+
   /// 插件主动发的通知（`log` / `event`），供总线转成前端事件。
   final List<Map<String, dynamic>> notifications = <Map<String, dynamic>>[];
 
@@ -122,7 +150,7 @@ class PluginHost {
     final Map<String, dynamic> result = await _request(
       'tools/list',
       const <String, dynamic>{},
-      timeout,
+      timeout: timeout,
     );
     final Object? raw = result['tools'];
     if (raw is! List<dynamic>) return const <PluginToolInfo>[];
@@ -138,16 +166,17 @@ class PluginHost {
   }
 
   /// 调用插件工具；失败返回**可读结果**（不抛异常，工具层直接用）。
+  ///
+  /// **无静态总时长上限**（M9 §1.1）：插件跑多久都等；只有插件进程退出 / 输出流
+  /// 关闭（[_failPending]）才会让在途调用以可读错误显式失败。
   Future<PluginCallResult> callTool(
     String toolName,
-    Map<String, dynamic> arguments, {
-    Duration timeout = const Duration(seconds: 60),
-  }) async {
+    Map<String, dynamic> arguments,
+  ) async {
     try {
       final Map<String, dynamic> result = await _request(
         'tools/call',
         <String, dynamic>{'name': toolName, 'arguments': arguments},
-        timeout,
       );
       final List<String> parts = <String>[];
       final Object? content = result['content'];
@@ -190,14 +219,50 @@ class PluginHost {
     }
   }
 
-  /// 心跳探测：返回是否存活。
-  Future<bool> ping({Duration timeout = const Duration(seconds: 5)}) async {
+  /// 心跳探测：返回**这一拍**是否活着。
+  ///
+  /// 窗口 = 一个心跳间隔 I（默认 10s）——这是「这一拍有没有心跳」的窗口，
+  /// **不是**任务总时长上限（见 [LivenessTracker] 的说明）。
+  Future<bool> ping({Duration? timeout}) async {
     if (isClosed) return false;
     try {
-      await _request('ping', const <String, dynamic>{}, timeout);
+      await _request(
+        'ping',
+        const <String, dynamic>{},
+        timeout: timeout ?? liveness.interval,
+      );
       return true;
     } catch (_) {
       return false;
+    }
+  }
+
+  /// **收集站请求（站 → 插件）**：把站点请求经 stdio 发过去并等回包。
+  ///
+  /// 无静态超时（同 tools/call）；插件未实现 / 异常时返回**可读失败回包**，
+  /// 由站点的收集语义把它记成「未响应者」，不静默。
+  Future<StationReply> requestStation(StationRequest request) async {
+    if (isClosed) return StationReply.failed('插件 ${config.id} 已关闭');
+    try {
+      final Map<String, dynamic> result = await _request(
+        'station/request',
+        request.toJson(),
+      );
+      final Object? rawReply = result['reply'] ?? result;
+      // 回包可选回带 scope：带了就必须与请求四元组精确相等（fail-closed），
+      // 没带则由站点按 request_id → 订阅者身份归属，不存在"投给别人"的路径。
+      if (rawReply is Map && rawReply['scope'] != null) {
+        final StationScope echoed = StationScope.parse(rawReply['scope']);
+        if (!echoed.exactEquals(request.scope)) {
+          return StationReply.failed(
+            '回包 scope 与请求不一致（跨 scope 回包被拒）：'
+            '请求 ${request.scope.describe()}，回包 ${echoed.describe()}',
+          );
+        }
+      }
+      return StationReply.fromJson(rawReply);
+    } catch (error) {
+      return StationReply.failed('插件未响应收集站请求：$error');
     }
   }
 
@@ -213,11 +278,14 @@ class PluginHost {
     return <String, dynamic>{};
   }
 
+  /// [timeout] 为 null（默认）= **无静态超时**：只有进程退出 / 输出流关闭 /
+  /// 显式 close 才会让在途请求失败——这就是 1.1 的「取消静态时间超时」。
+  /// 只有「建连握手」这种必须能诊断的场景才传一个小窗口。
   Future<Map<String, dynamic>> _request(
     String method,
-    Map<String, dynamic> params,
-    Duration timeout,
-  ) {
+    Map<String, dynamic> params, {
+    Duration? timeout,
+  }) {
     if (isClosed) {
       return Future<Map<String, dynamic>>.error(
         PluginException('插件 ${config.id} 已关闭'),
@@ -233,12 +301,13 @@ class PluginHost {
       'method': method,
       'params': params,
     });
+    if (timeout == null) return completer.future;
     return completer.future.timeout(
       timeout,
       onTimeout: () {
         _pending.remove(id);
         throw PluginException(
-          '插件 ${config.id} 的 $method 超时（${timeout.inSeconds}s）',
+          '插件 ${config.id} 的 $method 无响应（建连窗口 ${timeout.inMilliseconds}ms）',
         );
       },
     );
@@ -251,6 +320,8 @@ class PluginHost {
   void _onLine(String line) {
     final String text = line.trim();
     if (text.isEmpty) return;
+    // 任意入站报文都是「链路还活着」的证据（M9 §1.1：成功响应同样算心跳）
+    liveness.recordBeat();
     Object? decoded;
     try {
       decoded = jsonDecode(text);

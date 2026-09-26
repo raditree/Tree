@@ -52,7 +52,8 @@ void main() {
     bus = PluginBus(
       configFile: config.path,
       coreVersion: 'test',
-      watchdogInterval: const Duration(seconds: 30),
+      heartbeatInterval: const Duration(milliseconds: 50),
+      missThreshold: 3,
       broadcast: (Map<String, dynamic> frame) {
         frames.add(frame);
         sink?.call(frame);
@@ -132,16 +133,21 @@ void main() {
     await Future<void>.delayed(const Duration(milliseconds: 200));
     expect(File(eventsFile).readAsStringSync(), contains('task'));
   });
-
-  test('看门狗判定死亡 → plugin_status(disabled) 带原因', () async {
+  test('心跳丢失 → plugin_status(health: degraded) 且插件不被终止', () async {
     await bus.start();
+    bus.pauseHeartbeat(); // 手动控制每一拍（定时器会叠加丢失计数）
+    // I=50ms / N=3：三拍未达即 degraded（只标健康度，不杀进程）
     await bus.watchdog();
+    await bus.watchdog();
+    await bus.watchdog();
+    expect(bus.healthOf('deaf')['health'], 'degraded');
+    expect(bus.instances(), hasLength(2), reason: '两个插件都还在跑');
     await ws.until(
       (Map<String, dynamic> f) =>
           f['type'] == WsOutboundType.pluginStatus &&
           ((f['data'] as Map<String, dynamic>)['plugin_id'] == 'deaf') &&
-          ((f['data'] as Map<String, dynamic>)['status'] == 'disabled'),
-      reason: 'plugin_status(disabled)',
+          ((f['data'] as Map<String, dynamic>)['health'] == 'degraded'),
+      reason: 'plugin_status(degraded)',
     );
     final Map<String, dynamic> data =
         ws.frames.firstWhere(
@@ -149,12 +155,13 @@ void main() {
                   f['type'] == WsOutboundType.pluginStatus &&
                   ((f['data'] as Map<String, dynamic>)['plugin_id'] ==
                       'deaf') &&
-                  ((f['data'] as Map<String, dynamic>)['status'] == 'disabled'),
+                  ((f['data'] as Map<String, dynamic>)['health'] == 'degraded'),
             )['data']
             as Map<String, dynamic>;
-    expect(data['reason'], contains('心跳失败'));
-    expect(bus.errorOf('deaf'), contains('心跳失败'));
+    expect(data['reason'], contains('心跳丢失'));
+    expect(data['status'], 'registered', reason: '插件活着，状态不是 disabled');
     // 另一个插件不受影响
     expect(bus.errorOf('sample'), isNull);
+    expect(bus.healthOf('sample')['health'], 'ok');
   });
 }

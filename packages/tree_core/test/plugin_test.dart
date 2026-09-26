@@ -82,16 +82,25 @@ void main() {
     expect(await host.ping(), isTrue);
   });
 
-  test('宿主：工具超时与 command 为空都是可读错误', () async {
-    final PluginHost host = await PluginHost.start(config());
+  test('宿主：工具调用无静态超时；进程退出才以可读错误失败', () async {
+    // M9 §1.1：取消静态总时长上限——插件不回应时调用**一直等**（不会因时间被杀）。
+    // 这里让插件进程直接退出，验证在途调用以可读错误显式失败（不静默、不永久挂起）。
+    final PluginHost host = await PluginHost.start(
+      config(extra: <String>['--exit-on-slow']),
+    );
     addTearDown(host.close);
     final PluginCallResult slow = await host.callTool(
       'slow',
       <String, dynamic>{},
-      timeout: const Duration(milliseconds: 200),
     );
     expect(slow.isError, isTrue);
-    expect(slow.text, contains('超时'));
+    expect(
+      slow.text,
+      anyOf(contains('退出'), contains('输出流已关闭')),
+      reason: '进程消失 ⇒ 在途调用显式失败（不静默、不永久挂起）',
+    );
+
+    // 建连握手仍保留短窗口：command 为空是启动期可读错误
     await expectLater(
       PluginHost.start(PluginConfig(id: 'x', command: '')),
       throwsA(isA<PluginException>()),
@@ -115,7 +124,7 @@ void main() {
     final PluginBus bus = PluginBus(
       configFile: file.path,
       coreVersion: 'test',
-      watchdogInterval: const Duration(seconds: 30),
+      heartbeatInterval: const Duration(seconds: 30),
     );
     addTearDown(bus.close);
     expect(bus.configs().single.id, 'sample');
@@ -156,6 +165,18 @@ void main() {
     expect(lines, hasLength(1));
     expect(jsonDecode(lines.single), containsPair('type', 'task'));
 
+    // 站点体系：插件启动 = 工具表刷新点 ⇒ 自动建立该 team 的收集站并挂上插件
+    final List<dynamic> stations = bus.snapshot()['stations'] as List<dynamic>;
+    expect(stations, hasLength(1));
+    final Map<String, dynamic> station =
+        stations.single as Map<String, dynamic>;
+    expect(station['station_id'], contains('plugin.tool.define'));
+    expect(station['kind'], 'collect');
+    expect(
+      (station['subscriptions'] as List<dynamic>).single['plugin_id'],
+      'sample',
+    );
+
     // 工具调用（命名空间名）
     final PluginCallResult called = await bus.callTool(
       'plugin__sample__echo',
@@ -190,7 +211,8 @@ void main() {
     expect(snapshot['stations'], isEmpty);
     final Map<String, dynamic> watchdog =
         snapshot['watchdog'] as Map<String, dynamic>;
-    expect(watchdog['interval_s'], 15);
+    expect(watchdog['interval_s'], 10, reason: '心跳间隔 I = 10s（M9 §1.1）');
+    expect(watchdog['miss_threshold'], 3, reason: '连续丢失阈值 N = 3');
     expect(watchdog['disabled_count'], 1);
     final Map<String, dynamic> instance =
         (snapshot['instances'] as List<dynamic>).single as Map<String, dynamic>;
@@ -207,31 +229,58 @@ void main() {
     );
   });
 
-  test('看门狗：忽略 ping 的插件被标记不可用', () async {
+  test('心跳：忽略 ping 的插件标记 degraded（不终止），恢复后自动清除', () async {
     final File file = File('${temp.path}/config/plugins.yaml');
+    final File gate = File('${temp.path}/ping-gate');
     file.createSync(recursive: true);
     file.writeAsStringSync(
       'enabled: true\n'
       'plugins:\n'
       '  - id: deaf\n'
       '    command: "${Platform.resolvedExecutable.replaceAll('\\', '/')}"\n'
-      '    args: ["${script.replaceAll('\\', '/')}", "--ignore-ping"]\n',
+      '    args: ["${script.replaceAll('\\', '/')}", "--ignore-ping-until", '
+      '"${gate.path.replaceAll('\\', '/')}"]\n',
     );
+    // 缩参：I=50ms / N=3 ⇒ 3 拍未达即 degraded（活性窗口 = I×N）
     final PluginBus bus = PluginBus(
       configFile: file.path,
-      watchdogInterval: const Duration(seconds: 30),
+      heartbeatInterval: const Duration(milliseconds: 50),
+      missThreshold: 3,
     );
     addTearDown(bus.close);
     await bus.start();
+    bus.pauseHeartbeat(); // 测试要手动控制每一拍，避免定时器叠加丢失计数
     expect(bus.instances(), hasLength(1));
 
     await bus.watchdog();
-    expect(bus.instances(), isEmpty, reason: '心跳失败应断开并标记');
-    expect(bus.errorOf('deaf'), contains('心跳失败'));
+    await bus.watchdog();
+    expect(bus.healthOf('deaf')['health'], 'ok', reason: '未达阈值前不算心跳丢失');
+    await bus.watchdog();
+    expect(bus.healthOf('deaf')['health'], 'degraded');
+    expect(bus.healthOf('deaf')['missed_heartbeats'], greaterThanOrEqualTo(3));
+    expect(
+      bus.instances(),
+      hasLength(1),
+      reason: '心跳丢失**不终止插件**（用户口径：只做健康度标记）',
+    );
+    expect(
+      bus.errorOf('deaf'),
+      isNull,
+      reason: 'degraded 不是"停用"，不写 disabled 原因',
+    );
     final Map<String, dynamic> instance =
         (bus.snapshot()['instances'] as List<dynamic>).single
             as Map<String, dynamic>;
-    expect(instance['status'], 'disabled');
+    expect(instance['health'], 'degraded');
+    expect(instance['status'], 'registered', reason: '插件还活着，只是健康度降级');
+    expect(instance['degraded_reason'], contains('心跳丢失'));
+
+    // 恢复：插件重新回 ping ⇒ degraded 自动清除，进程始终没被杀
+    gate.writeAsStringSync('go');
+    await bus.watchdog();
+    expect(bus.healthOf('deaf')['health'], 'ok');
+    expect(bus.healthOf('deaf')['missed_heartbeats'], 0);
+    expect(bus.instances(), hasLength(1));
   });
 
   group('工具层', () {

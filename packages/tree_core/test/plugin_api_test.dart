@@ -71,7 +71,7 @@ void main() {
     file.writeAsStringSync(yaml);
     final PluginBus bus = PluginBus(
       configFile: file.path,
-      watchdogInterval: const Duration(seconds: 30),
+      heartbeatInterval: const Duration(seconds: 30),
     );
     await bus.start();
     return bus;
