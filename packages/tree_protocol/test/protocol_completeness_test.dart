@@ -3,15 +3,17 @@ import 'dart:io';
 import 'package:test/test.dart';
 import 'package:tree_protocol/tree_protocol.dart';
 
-/// 协议冻结的**完备性门禁**：迁移期以 server 源码与前端调用点为基准，
-/// 确保没有"server 发了但核心不认识"或"前端调了但未声明"的漂移。
+/// 协议冻结的**完备性门禁**。
 ///
-/// M7 删除 server/ 后，第一组测试改用前端事件断言替代。
+/// M7 删除 `server/` 后，原先"扫 Python 源码"的两条门禁换成**本仓库内**的等价断言：
+/// 1. 前端/核心源码里出现的 `'type': 'x'` 字面量，要么是协议帧，要么在
+///    [nonProtocolTypeLiterals] 登记并写明原因（否则协议无声漂移）；
+/// 2. 核心必须**逐一处理**每一种上行帧常量（新增帧不能被 default 静默吞掉）。
 void main() {
   final Directory repoRoot = Directory('../..');
 
-  test('server 侧 type 字面量（下行帧 + 上行分发）全部被协议常量覆盖', () {
-    final Set<String> scanned = _scanServerLiterals(repoRoot);
+  test('源码里的 "type" 字面量全部是协议帧或在登记表中', () {
+    final Set<String> scanned = _scanTypeLiterals(repoRoot);
     expect(scanned, isNotEmpty, reason: '未扫描到任何 type 字面量：路径或正则失效');
 
     final Set<String> covered = <String>{
@@ -25,23 +27,27 @@ void main() {
       uncovered,
       isEmpty,
       reason:
-          '以下 server 侧 type 字面量未纳入协议常量：'
-          '${uncovered.toList()..sort()} —— 请补充常量，'
-          '或在 nonProtocolTypeLiterals 中登记并写明原因',
+          '以下 type 字面量既不是协议帧，也没在 nonProtocolTypeLiterals 登记：'
+          '${uncovered.toList()..sort()} —— 请补充常量，或登记并写明原因',
     );
   });
 
-  test('分帧三件套与 server 的 _FRAME_* 常量一致', () {
-    final File src = File('${repoRoot.path}/server/ws/ws_manager.py');
-    expect(src.existsSync(), isTrue, reason: 'ws_manager.py 不存在：${src.path}');
-
-    final RegExp frameConst = RegExp(r'_FRAME_[A-Z_]+\s*=\s*"([a-z_]+)"');
-    final Set<String> serverFrames = frameConst
-        .allMatches(src.readAsStringSync())
-        .map((RegExpMatch m) => m.group(1)!)
-        .toSet();
-    expect(serverFrames, isNotEmpty, reason: '未在 ws_manager.py 找到 _FRAME_* 常量');
-    expect(serverFrames, WsOutboundType.frameChunking);
+  test('核心逐一处理每种上行帧（新增帧不得被 default 静默忽略）', () {
+    final File core = File(
+      '${repoRoot.path}/packages/tree_core/lib/src/server/core_server.dart',
+    );
+    expect(core.existsSync(), isTrue, reason: 'core_server.dart 不存在');
+    final String src = core.readAsStringSync();
+    final List<String> missing = <String>[];
+    for (final String value in WsInboundType.all) {
+      // 常量名 = 值名的 camelCase（register_local_executor → registerLocalExecutor）
+      if (!src.contains('WsInboundType.${_camel(value)}')) missing.add(value);
+    }
+    expect(
+      missing,
+      isEmpty,
+      reason: '核心未显式处理以下上行帧：$missing —— 前端会发它们，静默忽略会造成"点了没反应"',
+    );
   });
 
   test('前端使用的 /api 路径全部在 ApiPaths 中声明', () {
@@ -55,9 +61,7 @@ void main() {
     expect(
       undeclared,
       isEmpty,
-      reason:
-          '以下前端路径未在 ApiPaths 中声明：'
-          '${undeclared.toList()..sort()}',
+      reason: '以下前端路径未在 ApiPaths 中声明：${undeclared.toList()..sort()}',
     );
   });
 
@@ -75,18 +79,28 @@ void main() {
     );
   });
 
-  test('前端不再重复定义分帧常量（必须引用协议包）', () {
-    final Directory lib = Directory('${repoRoot.path}/lib');
-    // 只匹配"定义"（const <类型> kWsFrame...），不匹配引用
+  test('分帧常量只能来自协议包：前后端都不得重复定义或硬编码字面量', () {
+    // 1) 不得定义 kWsFrame*（阈值/预算/TTL）
     final RegExp redefinition = RegExp(
       r'^\s*const\s+(?:int|Duration|String)\s+kWsFrame',
       multiLine: true,
     );
     final List<String> offenders = <String>[];
-    for (final FileSystemEntity entity in lib.listSync(recursive: true)) {
-      if (entity is! File || !entity.path.endsWith('.dart')) continue;
-      if (redefinition.hasMatch(entity.readAsStringSync())) {
-        offenders.add(entity.path);
+    final List<String> hardcoded = <String>[];
+    final RegExp literal = RegExp(r"'(frame_begin|frame_chunk|frame_end)'");
+    for (final String tree in <String>[
+      'lib',
+      'packages/tree_core/lib',
+      'packages/tree_local_exec/lib',
+      'packages/tree_core_cli/bin',
+    ]) {
+      final Directory dir = Directory('${repoRoot.path}/$tree');
+      if (!dir.existsSync()) continue;
+      for (final FileSystemEntity entity in dir.listSync(recursive: true)) {
+        if (entity is! File || !entity.path.endsWith('.dart')) continue;
+        final String src = entity.readAsStringSync();
+        if (redefinition.hasMatch(src)) offenders.add(entity.path);
+        if (literal.hasMatch(src)) hardcoded.add(entity.path);
       }
     }
     expect(
@@ -95,6 +109,11 @@ void main() {
       reason:
           '分帧阈值/分片预算/TTL 与三件套类型名必须来自 tree_protocol，'
           '否则核心与前端阈值会再次漂移：$offenders',
+    );
+    expect(
+      hardcoded,
+      isEmpty,
+      reason: '分帧三件套必须引用 WsOutboundType.*，不能硬编码字面量：$hardcoded',
     );
   });
 
@@ -125,34 +144,43 @@ void main() {
   });
 }
 
-/// 扫描 server 源码：`"type": "x"`（下行帧/噪声）与 `msg_type == "x"`（上行分发）。
-Set<String> _scanServerLiterals(Directory repoRoot) {
-  final Directory server = Directory('${repoRoot.path}/server');
-  if (!server.existsSync()) {
-    fail('server 目录不存在：${server.path}');
-  }
-  final RegExp typeLiteral = RegExp(r'"type"\s*:\s*"([a-z_][a-z0-9_]*)"');
-  final RegExp dispatchLiteral = RegExp(
-    r'msg_type\s*==\s*"([a-z_][a-z0-9_]*)"',
-  );
+/// 扫描本仓库源码（前端 + 各包）里的 `'type': 'x'` 字面量。
+Set<String> _scanTypeLiterals(Directory repoRoot) {
+  final RegExp literal = RegExp(r"'type'\s*:\s*'([a-z_][a-z0-9_]*)'");
   final Set<String> found = <String>{};
-
-  for (final FileSystemEntity entity in server.listSync(recursive: true)) {
-    if (entity is! File || !entity.path.endsWith('.py')) continue;
-    final String p = entity.path.replaceAll('\\', '/');
-    if (p.contains('__pycache__') ||
-        p.contains('.venv') ||
-        p.contains('/tests/')) {
-      continue;
-    }
-    final String src = entity.readAsStringSync();
-    for (final RegExp re in <RegExp>[typeLiteral, dispatchLiteral]) {
-      for (final RegExpMatch m in re.allMatches(src)) {
+  for (final String tree in <String>[
+    'lib',
+    'packages/tree_core/lib',
+    'packages/tree_local_exec/lib',
+    'packages/tree_protocol/lib',
+    'packages/tree_core_cli/bin',
+  ]) {
+    final Directory dir = Directory('${repoRoot.path}/$tree');
+    if (!dir.existsSync()) continue;
+    for (final FileSystemEntity entity in dir.listSync(recursive: true)) {
+      if (entity is! File || !entity.path.endsWith('.dart')) continue;
+      if (entity.path.contains('non_protocol_literals')) continue;
+      for (final RegExpMatch m in literal.allMatches(
+        entity.readAsStringSync(),
+      )) {
         found.add(m.group(1)!);
       }
     }
   }
   return found;
+}
+
+/// `register_local_executor` → `registerLocalExecutor`。
+String _camel(String snake) {
+  final List<String> parts = snake.split('_');
+  return parts.first +
+      parts
+          .skip(1)
+          .map(
+            (String p) =>
+                p.isEmpty ? '' : '${p[0].toUpperCase()}${p.substring(1)}',
+          )
+          .join();
 }
 
 /// 扫描前端 Dart 源码中的 `'/api/...'` 字面量并按占位符归一化。

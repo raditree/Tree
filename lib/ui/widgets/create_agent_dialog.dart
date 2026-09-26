@@ -355,7 +355,7 @@ class _CreateAgentDialogState extends State<CreateAgentDialog> {
     }
     if (_models.isEmpty) {
       return const Text(
-        '模型池为空，请先在 server/configs/models/ 下添加模型配置',
+        '模型池为空，请先在 ~/.tree/config/models/ 下添加模型配置',
         style: TextStyle(fontSize: 13, color: Colors.grey),
       );
     }

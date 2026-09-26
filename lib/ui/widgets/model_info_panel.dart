@@ -487,7 +487,7 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
   Widget _buildModelDropdown() {
     if (_models.isEmpty) {
       return const Text(
-        '模型池为空，请先在 server/configs/models/ 下添加模型配置',
+        '模型池为空，请先在 ~/.tree/config/models/ 下添加模型配置',
         style: TextStyle(fontSize: 12, color: Colors.grey),
       );
     }

@@ -461,7 +461,7 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
             const SizedBox(height: 4),
             const Text(
-              '写入 server/configs/models/<model_id>.yaml，保存后立即对全部 Agent 生效。'
+              '写入 ~/.tree/config/models/<model_id>.yaml，保存后立即对全部 Agent 生效。'
               'API Key 以明文保存在该文件（已在 .gitignore 中忽略）。',
               style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
             ),

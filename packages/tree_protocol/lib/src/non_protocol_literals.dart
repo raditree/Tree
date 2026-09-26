@@ -1,8 +1,9 @@
-/// 在 server 源码中出现的 `"type": "..."` 字面量，但**不属于**本协议。
+/// 本仓库源码里出现的 `'type': '...'` 字面量，但**不属于**本协议。
 ///
-/// 完备性测试用：扫描 server 源码时把这些排除，避免为了"覆盖"而把
-/// JSON Schema 类型、角色枚举等误当成协议事件。每项都必须给出原因，
-/// 新增项需评审——否则协议会出现无声漂移。
+/// 完备性测试用：扫描前端与各包的 Dart 源码时把这些排除，避免为了"覆盖"而把
+/// JSON Schema 类型、消息 kind、角色枚举等误当成协议事件。每项都必须给出原因，
+/// 新增项需评审——否则协议会出现无声漂移。（原先扫的是 server 的 Python 源码，
+/// M7 删除 `server/` 后换成扫本仓库。）
 const Map<String, String> nonProtocolTypeLiterals = <String, String>{
   // JSON Schema 类型（工具参数定义）
   'array': 'JSON Schema 类型（工具 parameters）',

@@ -558,7 +558,7 @@ class ApiService {
 
   /// 新增自定义模型
   ///
-  /// 调用 `POST /api/models`，写入 `server/configs/models/<model_id>.yaml`。
+  /// 调用 `POST /api/models`，写入 `~/.tree/config/models/<model_id>.yaml`。
   /// 后端返回 `{success, model}`，`model` 内**不含** api_key。
   static Future<Map<String, dynamic>> createModel(
     Map<String, dynamic> payload,
