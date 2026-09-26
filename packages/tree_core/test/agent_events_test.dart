@@ -1,7 +1,6 @@
 import 'dart:async';
 
 import 'package:test/test.dart';
-import 'package:tree_core/src/plugin/agent_events.dart';
 import 'package:tree_core/tree_core.dart';
 import 'package:tree_protocol/tree_protocol.dart';
 

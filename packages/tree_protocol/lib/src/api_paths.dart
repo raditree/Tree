@@ -88,6 +88,37 @@ abstract final class ApiPaths {
   static const String settingsMessageCutin = '/api/settings/message-cutin';
   static const String settingsDataCollection = '/api/settings/data-collection';
   static const String pluginSnapshot = '/api/plugin/snapshot';
+
+  /// 插件清单的**读写面**（M9 §4.2 插件开关：内置与自定义都可在前端增删改）。
+  ///
+  /// 与只读快照 [pluginSnapshot] 的分工：
+  /// - [pluginSnapshot] 是**运行态**快照（实例 / 站点 / 看门狗 / 心跳健康度），
+  ///   数据源是插件总线**启动时读进内存**的配置，落盘改动不会反映在它里面；
+  /// - [pluginConfigs] 系列直接读写「<数据根>/config/plugins.yaml」（持久态），
+  ///   因此"刚保存的开关状态"以这一组为准（前端两个都取：列表用这组、健康度用快照）。
+  static const String pluginConfigs = '/api/plugin/configs';
+
+  /// 单条自定义插件配置（PATCH 局部更新 / DELETE 删除）。
+  static const String pluginConfig = '/api/plugin/configs/{pluginId}';
+
+  /// 显式重启某个插件实例（调插件总线的 restart）。
+  static const String pluginConfigRestart =
+      '/api/plugin/configs/{pluginId}/restart';
+
+  /// 内置插件目录（清单 + 每项的启用态 + 运行时解析结果）。
+  ///
+  /// 内置插件的身份来自核心的**静态清单**（builtin_plugins.dart），前端只能开关；
+  /// 打开时核心把它落成一条普通插件配置（带 builtin: true 标记供 UI 分组）。
+  static const String pluginBuiltins = '/api/plugin/builtins';
+
+  /// 打开一个内置插件：解析运行时与脚本路径 → 写一条普通插件配置 → 热启动。
+  static const String pluginBuiltinEnable =
+      '/api/plugin/builtins/{pluginId}/enable';
+
+  /// 关闭一个内置插件：把该条置 enabled: false 并断开——**条目保留**，
+  /// 面板显示「已停用」而不是让这一项消失。
+  static const String pluginBuiltinDisable =
+      '/api/plugin/builtins/{pluginId}/disable';
   static const String mcpServices = '/api/mcp/services';
   static const String mcpService = '/api/mcp/services/{name}';
 
@@ -130,6 +161,12 @@ abstract final class ApiPaths {
     settingsMessageCutin,
     settingsDataCollection,
     pluginSnapshot,
+    pluginConfigs,
+    pluginConfig,
+    pluginConfigRestart,
+    pluginBuiltins,
+    pluginBuiltinEnable,
+    pluginBuiltinDisable,
     mcpServices,
     mcpService,
   };

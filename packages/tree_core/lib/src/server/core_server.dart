@@ -16,8 +16,12 @@ import '../agent/workspace_prompt.dart';
 import '../files/file_service.dart';
 import '../mcp/mcp_client.dart';
 import '../mcp/mcp_service.dart';
+import '../plugin/builtin_plugins.dart';
 import '../plugin/execute_mounts.dart';
 import '../plugin/plugin_bus.dart';
+import '../plugin/plugin_config_store.dart';
+// PluginConfig 的定义处（只用到不可变的值对象，不碰宿主实现）
+import '../plugin/plugin_host.dart';
 import '../plugin/station_scope.dart';
 import '../settings/core_settings.dart';
 import '../settings/ssh_config.dart';
@@ -66,6 +70,8 @@ class CoreServer {
     required this.specIoFor,
     required this.mcpService,
     required this.pluginBus,
+    required this.builtinPlugins,
+    required this.pluginHotApplier,
     required this.fileService,
     required this.hub,
     required this.questions,
@@ -149,6 +155,19 @@ class CoreServer {
 
   /// 插件总线（M6b）；为 null 时快照返回 `enabled: false` 空集。
   final PluginBus? pluginBus;
+
+  /// 内置插件目录（M9 §4.2）：静态清单 + 运行时/脚本解析。
+  ///
+  /// 默认一份（探测 python / py -3、脚本查可执行文件同级的 plugins/）；测试注入
+  /// 假的探测器与脚本目录，才能确定性地覆盖"运行时缺失 / 脚本缺失"的可读错误。
+  final BuiltinPluginCatalog builtinPlugins;
+
+  /// 热应用接缝（把"配置已落盘"翻译成"对运行中的插件总线做了什么"）。
+  ///
+  /// null = 用默认实现 [BusPluginHotApplier]（只用 PluginBus 的公开方法，因此
+  /// "新增 / 改启动参数 / 停用"在本轮只能**如实回报**热应用失败——见该类的文档）；
+  /// 测试注入假实现可以直接断言"热应用失败"这条路径。
+  final PluginHotApplier? pluginHotApplier;
 
   /// 执行站首命令集的**挂载位置**（M9 Wave 3-I）；为 null = 未接线（命令会显式报
   /// 「暂无挂载位置」而不是静默成功）。
@@ -255,6 +274,8 @@ class CoreServer {
     Future<WorkspaceIO?> Function(String agentId)? specIoFor,
     McpService? mcpService,
     PluginBus? pluginBus,
+    BuiltinPluginCatalog? builtinPlugins,
+    PluginHotApplier? pluginHotApplier,
     FileService? fileService,
     CompactionService? compaction,
     TerminalHooks? stationHooks,
@@ -295,6 +316,11 @@ class CoreServer {
       specIoFor: specIoFor,
       mcpService: mcpService,
       pluginBus: pluginBus,
+      builtinPlugins: builtinPlugins ?? BuiltinPluginCatalog(),
+      // 默认热应用 = 总线公开面实现；总线为空时也用同一份（apply 前会先判空）
+      pluginHotApplier:
+          pluginHotApplier ??
+          (pluginBus == null ? null : BusPluginHotApplier(pluginBus)),
       fileService: fileService,
       compaction: compaction,
       hub: hub,
@@ -407,6 +433,9 @@ class CoreServer {
   void _wirePluginStations({TerminalHooks? stationHooks}) {
     final PluginBus? bus = pluginBus;
     if (bus == null) return;
+    // agent 工具调用事件 → 插件（Q8：轮次上限删掉后，限制能力交给插件：插件自己数
+    // 轮次，超限时用执行站的 agent.stop 发停止信号）。未接线 = no-op，与改动前一致。
+    conversation.agentEvents.sink = bus.dispatchAgentEvent;
     // 调用点上下文：team 取 agent 的团队归属（agent / session 由调用点给）
     bus.callSiteContext ??= (String agentId, String sessionId) {
       final CoreAgent? agent = store.agent(agentId);
@@ -880,6 +909,15 @@ class CoreServer {
     router.add('GET', ApiPaths.workspaceGitLog, _workspaceGitLog);
     router.add('GET', ApiPaths.workspaceGitBranches, _workspaceGitBranches);
     router.add('GET', ApiPaths.pluginSnapshot, _pluginSnapshot);
+    // 插件清单的读写面（M9 §4.2）：与只读快照分工见 ApiPaths.pluginConfigs 的注释。
+    router.add('GET', ApiPaths.pluginConfigs, _listPluginConfigs);
+    router.add('POST', ApiPaths.pluginConfigs, _createPluginConfig);
+    router.add('PATCH', ApiPaths.pluginConfig, _updatePluginConfig);
+    router.add('DELETE', ApiPaths.pluginConfig, _deletePluginConfig);
+    router.add('POST', ApiPaths.pluginConfigRestart, _restartPluginConfig);
+    router.add('GET', ApiPaths.pluginBuiltins, _listBuiltinPlugins);
+    router.add('POST', ApiPaths.pluginBuiltinEnable, _enableBuiltinPlugin);
+    router.add('POST', ApiPaths.pluginBuiltinDisable, _disableBuiltinPlugin);
     router.add('GET', ApiPaths.mcpServices, _mcpServices);
     router.add('POST', ApiPaths.mcpServices, _registerMcpService);
     router.add('DELETE', ApiPaths.mcpService, _deleteMcpService);
@@ -2252,9 +2290,410 @@ class CoreServer {
     final String requested =
         request.uri.queryParameters['team_id']?.trim() ?? '';
     final CoreAgent? named = requested.isEmpty ? null : store.agent(requested);
-    final String teamId =
-        named != null && named.teamId.isNotEmpty ? named.teamId : requested;
+    final String teamId = named != null && named.teamId.isNotEmpty
+        ? named.teamId
+        : requested;
     await writeJson(request, 200, bus.snapshot(teamId: teamId));
+  }
+
+  // ── 插件清单读写（M9 §4.2：内置与自定义都要能在前端增删改 + 各自一个开关） ──
+
+  /// 插件清单的存储层。
+  ///
+  /// 路径 = **插件总线正在用的那一份** plugins.yaml（bus.configFile）：这样"前台
+  /// 写盘"和"总线读盘"永远是同一个文件，不会出现两处路径口径不一致。
+  PluginConfigStore _pluginStore(PluginBus bus) => PluginConfigStore(
+    bus.configFile,
+    log: (String message) => errorLog?.call('[core:plugin-config] $message'),
+  );
+
+  /// 未接入插件总线时的统一可读拒绝。
+  ///
+  /// 刻意不用 501：前端对 501 有专门文案「功能开发中」，而这里不是"没做"，
+  /// 而是"这台核心没接插件总线"（只有测试 / 最小骨架会这样，CLI 恒接线）。
+  Future<void> _writePluginNotWired(HttpRequest request) async {
+    await writeJson(request, 503, errorBody('插件总线尚未接入核心，插件管理不可用（快照接口仍返回空集）'));
+  }
+
+  /// 热应用一次落盘改动（默认实现见 [BusPluginHotApplier]）。
+  Future<PluginHotApplyOutcome> _applyPluginChange(
+    PluginBus bus,
+    Map<String, dynamic> entry, {
+    required bool enable,
+  }) {
+    final PluginHotApplier applier =
+        pluginHotApplier ?? BusPluginHotApplier(bus);
+    return applier.apply(entry, enable: enable);
+  }
+
+  /// 写操作的统一响应体（落盘结果 + 热应用结果）。
+  ///
+  /// 「配置已保存，但本次热应用失败，重启核心后生效」这句话**只在核心拼一次**
+  /// （[PluginHotApplyOutcome.restartNotice]），前端原样显示——避免两边各写一句、
+  /// 说法漂移。
+  Map<String, dynamic> _pluginWriteBody(
+    PluginConfigStore store,
+    PluginStoreResult result,
+    PluginHotApplyOutcome outcome,
+  ) => <String, dynamic>{
+    'ok': true,
+    'path': store.path,
+    'config': result.entry,
+    'configs': result.entries,
+    'hot_applied': outcome.applied,
+    'notice': outcome.applied ? '' : PluginHotApplyOutcome.restartNotice,
+    'hot_apply_detail': outcome.detail,
+  };
+
+  /// 每条插件的运行态（给面板显示"在跑 / 已停用 / 心跳降级 / 启动失败原因"）。
+  ///
+  /// 数据源是插件总线的公开探针（healthOf / errorOf），不是自己另立台账。
+  Map<String, dynamic> _pluginRuntimeOf(
+    PluginBus bus,
+    List<Map<String, dynamic>> configs,
+  ) {
+    final Map<String, dynamic> out = <String, dynamic>{};
+    for (final Map<String, dynamic> config in configs) {
+      final String id = (config['id'] ?? '').toString();
+      if (id.isEmpty) continue;
+      final Map<String, dynamic> health = bus.healthOf(id);
+      out[id] = <String, dynamic>{
+        'running': health['health'] != 'unavailable',
+        'health': health['health'],
+        'reason': health['reason'] ?? '',
+        'error': bus.errorOf(id) ?? '',
+        // 总线启动时是否读到过这一条：false = 新增条目，热应用一定做不到
+        'known': bus.config(id) != null,
+      };
+    }
+    return out;
+  }
+
+  /// GET /api/plugin/configs：插件清单（**持久态**：刚保存的开关状态以它为准）。
+  ///
+  /// 与 GET /api/plugin/snapshot 的分工：快照给运行态（实例 / 站点 / 健康度），
+  /// 这里给"文件里到底写了什么"（含编辑界面要回填的 env / scope / 未知键）。
+  Future<void> _listPluginConfigs(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    final PluginConfigStore store = _pluginStore(bus);
+    final List<Map<String, dynamic>> configs = store.readEntries();
+    await writeJson(request, 200, <String, dynamic>{
+      'path': store.path,
+      'enabled': store.totalEnabled(),
+      'configs': configs,
+      'runtime': _pluginRuntimeOf(bus, configs),
+    });
+  }
+
+  /// POST /api/plugin/configs：新增一个自定义插件（写盘后尝试热应用）。
+  Future<void> _createPluginConfig(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    final Map<String, dynamic>? body = await _jsonBody(request);
+    if (body == null) return;
+    // 内置插件的 id 已被清单占用：新增同 id 的自定义插件会让"内置组"与"自定义组"
+    // 指向同一条配置（开关互相踩），直接拒绝并指路。
+    final String newId = (body['id'] ?? '').toString().trim();
+    final BuiltinPluginSpec? builtin = BuiltinPluginCatalog.specOf(newId);
+    if (builtin != null) {
+      await writeJson(
+        request,
+        400,
+        errorBody(
+          'id「$newId」是内置插件（${builtin.name}）：'
+          '内置插件请用「内置插件」清单里的开关，或换一个 id',
+        ),
+      );
+      return;
+    }
+    final PluginConfigStore store = _pluginStore(bus);
+    final PluginStoreResult result = store.create(body);
+    final Map<String, dynamic>? entry = result.entry;
+    if (!result.ok || entry == null) {
+      await writeJson(request, 400, errorBody(result.error));
+      return;
+    }
+    final PluginHotApplyOutcome outcome = await _applyPluginChange(
+      bus,
+      entry,
+      enable: true,
+    );
+    await writeJson(request, 200, _pluginWriteBody(store, result, outcome));
+  }
+
+  /// PATCH /api/plugin/configs/{pluginId}：局部更新（每项的开关也走这里）。
+  Future<void> _updatePluginConfig(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    final String id = (params['pluginId'] ?? '').trim();
+    final Map<String, dynamic>? body = await _jsonBody(request);
+    if (body == null) return;
+    final PluginConfigStore store = _pluginStore(bus);
+    if (store.readEntry(id) == null) {
+      await writeJson(request, 404, errorBody('插件不存在：$id'));
+      return;
+    }
+    final PluginStoreResult result = store.update(id, body);
+    final Map<String, dynamic>? entry = result.entry;
+    if (!result.ok || entry == null) {
+      await writeJson(request, 400, errorBody(result.error));
+      return;
+    }
+    final PluginHotApplyOutcome outcome = await _applyPluginChange(
+      bus,
+      entry,
+      enable: entry['enabled'] != false,
+    );
+    await writeJson(request, 200, _pluginWriteBody(store, result, outcome));
+  }
+
+  /// DELETE /api/plugin/configs/{pluginId}：删除一个自定义插件。
+  Future<void> _deletePluginConfig(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    final String id = (params['pluginId'] ?? '').trim();
+    final PluginConfigStore store = _pluginStore(bus);
+    final Map<String, dynamic>? before = store.readEntry(id);
+    if (before == null) {
+      await writeJson(request, 404, errorBody('插件不存在：$id'));
+      return;
+    }
+    // 内置条目不给删除（M9 §4.2：内置项只给"停用"，条目保留才能再次打开）
+    if (before['builtin'] == true) {
+      await writeJson(
+        request,
+        400,
+        errorBody('内置插件 $id 不提供删除：请用停用（条目保留，可再次打开）'),
+      );
+      return;
+    }
+    final PluginStoreResult result = store.remove(id);
+    if (!result.ok) {
+      await writeJson(request, 400, errorBody(result.error));
+      return;
+    }
+    // 删除后要断开：拿被删的那条（不是 null）去热应用，实现才能判断它当时在不在跑
+    final PluginHotApplyOutcome outcome = await _applyPluginChange(
+      bus,
+      before,
+      enable: false,
+    );
+    await writeJson(request, 200, _pluginWriteBody(store, result, outcome));
+  }
+
+  /// POST /api/plugin/configs/{pluginId}/restart：显式重启一个插件实例。
+  ///
+  /// 这是**唯一**能真正作用到运行中总线上的操作（PluginBus.restart 是公开入口），
+  /// 主要用于心跳 degraded 之后由用户手动恢复。
+  Future<void> _restartPluginConfig(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    final String id = (params['pluginId'] ?? '').trim();
+    final PluginConfigStore store = _pluginStore(bus);
+    if (store.readEntry(id) == null) {
+      await writeJson(request, 404, errorBody('插件不存在：$id'));
+      return;
+    }
+    if (bus.config(id) == null) {
+      await writeJson(
+        request,
+        400,
+        errorBody('插件 $id 不在本次核心启动时读取的配置里（新增条目要重启核心后才会被拉起）'),
+      );
+      return;
+    }
+    final bool ok = await bus.restart(id);
+    final String reason = bus.errorOf(id) ?? '';
+    if (!ok) {
+      await writeJson(
+        request,
+        400,
+        errorBody(reason.isEmpty ? '插件 $id 重启后未就绪' : '插件 $id 重启失败：$reason'),
+      );
+      return;
+    }
+    await writeJson(request, 200, <String, dynamic>{
+      'ok': true,
+      'plugin_id': id,
+      'running': true,
+      'path': store.path,
+    });
+  }
+
+  /// GET /api/plugin/builtins：内置插件目录（清单 + 每项启用态 + 运行时解析结果）。
+  ///
+  /// 内置项**永远在响应里**（未启用也可见，面板才有"带说明的开关"可点）；
+  /// config 为落盘的那一条（从未启用过 = null），resolution 是核心此刻解析出来的
+  /// 运行时与脚本路径（含可读错误，前端直接显示）。
+  Future<void> _listBuiltinPlugins(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    final PluginConfigStore store = _pluginStore(bus);
+    // refresh=1 强制重探运行时（用户可能刚装好 Python：一次点击就该看到变化）
+    final bool refresh = request.uri.queryParameters['refresh'] == '1';
+    final List<Map<String, dynamic>> builtins = <Map<String, dynamic>>[];
+    for (final BuiltinPluginSpec spec in BuiltinPluginCatalog.specs) {
+      final Map<String, dynamic>? entry = store.readEntry(spec.id);
+      final BuiltinResolution resolution = await builtinPlugins.resolve(
+        spec,
+        refresh: refresh,
+      );
+      builtins.add(<String, dynamic>{
+        ...spec.toJson(),
+        'enabled': entry != null && entry['enabled'] != false,
+        'configured': entry != null,
+        'config': entry,
+        'resolution': resolution.toJson(),
+      });
+    }
+    await writeJson(request, 200, <String, dynamic>{
+      'path': store.path,
+      'enabled': store.totalEnabled(),
+      'runtime_checked': refresh,
+      'builtins': builtins,
+    });
+  }
+
+  /// POST /api/plugin/builtins/{pluginId}/enable：打开一个内置插件。
+  ///
+  /// 打开 = 解析运行时与脚本 → 写一条**普通插件配置**（带 builtin: true 标记）→
+  /// 尝试热启动。解析不出来（没装 Python / 找不到脚本）时回**可读 400**，
+  /// 不写盘、不假装成功。
+  Future<void> _enableBuiltinPlugin(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    final String id = (params['pluginId'] ?? '').trim();
+    final BuiltinPluginSpec? spec = BuiltinPluginCatalog.specOf(id);
+    if (spec == null) {
+      await writeJson(
+        request,
+        404,
+        errorBody('未知的内置插件：$id（清单见 GET /api/plugin/builtins）'),
+      );
+      return;
+    }
+    // 用户点"打开"就重探一次：装了 Python / 补了脚本之后不需要重启核心
+    final BuiltinResolution resolution = await builtinPlugins.resolve(
+      spec,
+      refresh: true,
+    );
+    if (!resolution.ok) {
+      await writeJson(request, 400, errorBody(resolution.error));
+      return;
+    }
+    final PluginConfigStore store = _pluginStore(bus);
+    final PluginStoreResult result = store.upsert(
+      BuiltinPluginCatalog.entryFor(spec, resolution),
+    );
+    final Map<String, dynamic>? entry = result.entry;
+    if (!result.ok || entry == null) {
+      await writeJson(request, 400, errorBody(result.error));
+      return;
+    }
+    final PluginHotApplyOutcome outcome = await _applyPluginChange(
+      bus,
+      entry,
+      enable: true,
+    );
+    await writeJson(request, 200, <String, dynamic>{
+      ..._pluginWriteBody(store, result, outcome),
+      'resolution': resolution.toJson(),
+    });
+  }
+
+  /// POST /api/plugin/builtins/{pluginId}/disable：关闭一个内置插件。
+  ///
+  /// 关闭 = 把该条置 enabled: false —— **条目保留**（面板显示「已停用」而不是让
+  /// 这一项消失），下次打开沿用同一 id。从未启用过的内置项不落盘（没什么可改的），
+  /// 只如实回报"本来就关着"。
+  Future<void> _disableBuiltinPlugin(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    final String id = (params['pluginId'] ?? '').trim();
+    final BuiltinPluginSpec? spec = BuiltinPluginCatalog.specOf(id);
+    if (spec == null) {
+      await writeJson(
+        request,
+        404,
+        errorBody('未知的内置插件：$id（清单见 GET /api/plugin/builtins）'),
+      );
+      return;
+    }
+    final PluginConfigStore store = _pluginStore(bus);
+    final Map<String, dynamic>? entry = store.readEntry(id);
+    if (entry == null) {
+      await writeJson(request, 200, <String, dynamic>{
+        'ok': true,
+        'path': store.path,
+        'config': null,
+        'configs': store.readEntries(),
+        'hot_applied': true,
+        'notice': '',
+        'hot_apply_detail': '内置插件 $id 尚未启用，无需停用',
+      });
+      return;
+    }
+    final PluginStoreResult result = store.setEnabled(id, false);
+    final Map<String, dynamic>? updated = result.entry;
+    if (!result.ok || updated == null) {
+      await writeJson(request, 400, errorBody(result.error));
+      return;
+    }
+    final PluginHotApplyOutcome outcome = await _applyPluginChange(
+      bus,
+      updated,
+      enable: false,
+    );
+    await writeJson(request, 200, _pluginWriteBody(store, result, outcome));
   }
 
   Future<void> _mcpServices(HttpRequest request, Map<String, String> _) async {
@@ -2325,6 +2764,188 @@ class CoreServer {
       error == null ? 200 : 404,
       error == null ? result : errorBody(error.toString()),
     );
+  }
+}
+
+/// 一次热应用的结果：配置**已经落盘**，这里只说"对运行中的插件总线做了什么"。
+class PluginHotApplyOutcome {
+  const PluginHotApplyOutcome.applied(this.detail) : applied = true;
+  const PluginHotApplyOutcome.notApplied(this.detail) : applied = false;
+
+  /// 是否真的作用到了运行中的插件上。
+  final bool applied;
+
+  /// 可读说明（applied 时是"做了什么"，否则是"为什么做不到"）。
+  final String detail;
+
+  /// 热应用失败时给前端显示的**统一话术**。
+  ///
+  /// 只在核心拼一次（REST 响应里的 notice 字段），前端原样显示：两边各写一句
+  /// 迟早会说法漂移，而这句话是用户判断"我要不要重启核心"的唯一依据。
+  static const String restartNotice = '配置已保存，但本次热应用失败，重启核心后生效';
+}
+
+/// 热应用接缝：把"配置已落盘"翻译成"对运行中的插件总线做了什么"。
+///
+/// 做成接缝（而不是把逻辑写死在处理器里）有两个理由：
+/// 1. 插件总线正在另一路并行演进——将来它一旦提供"重新读盘 / 单插件断开"的公开
+///    方法，只需换掉这个接口的实现，REST 层与前端一个字都不用改；
+/// 2. 测试需要确定性地覆盖"热应用失败"这条路径（注入一个永远失败的实现即可）。
+abstract class PluginHotApplier {
+  Future<PluginHotApplyOutcome> apply(
+    Map<String, dynamic> entry, {
+    required bool enable,
+  });
+}
+
+/// 默认热应用：**只用 PluginBus 的公开面**（configs / config / start / restart / close）。
+///
+/// 为什么"热应用失败"在本轮是常态而不是 bug：PluginBus 的配置是**核心启动时读一次**
+/// 进内存的（load 幂等），运行期既没有"重新读盘"，也没有"单独断开某个插件"的公开
+/// 入口（只有 restart 与 close）。于是真正能生效的只有两类动作：
+/// - 让一个总线内存里**已存在、启动参数没变**的插件重启（典型场景：心跳 degraded
+///   之后手动恢复，或它启动失败后重试）；
+/// - 该插件本来就没在跑时的"停用"（无需断开 = 已经达成目标）。
+///
+/// 其余情况一律**如实回报**，绝不"拿旧定义重启"假装成功：
+///
+/// | 改动 | 结果 | 原因 |
+/// |---|---|---|
+/// | 新增条目 | 未热应用 | 总线运行期不认识它（config(id) 为 null） |
+/// | 改 command / args / env / granularity / scope / name | 未热应用 | 总线不重读配置，restart 只会用旧定义拉起 |
+/// | 改 enabled（开或关，条目在总线内存里） | 未热应用 | 启用态在核心启动时定死；且没有单插件断开入口 |
+/// | 条目完全没变 | 已一致 | 运行中 ⇒ 无需重启；没在跑 ⇒ 顺手重试一次启动 |
+///
+/// 因此前端会显示「配置已保存，但本次热应用失败，重启核心后生效」——这是**如实**的
+/// 回报。要让启用 / 停用真正热生效，需要 PluginBus 提供一个"重新读盘并按新配置增删
+/// 实例"的公开方法；本文件已经把它收敛成 [PluginHotApplier] 接缝，加好后换实现即可。
+class BusPluginHotApplier implements PluginHotApplier {
+  BusPluginHotApplier(this.bus);
+
+  final PluginBus bus;
+
+  @override
+  Future<PluginHotApplyOutcome> apply(
+    Map<String, dynamic> entry, {
+    required bool enable,
+  }) async {
+    final String id = (entry['id'] ?? '').toString().trim();
+    if (id.isEmpty) {
+      return const PluginHotApplyOutcome.notApplied('插件条目缺少 id，无法热应用');
+    }
+    final PluginConfig? known = bus.config(id);
+    if (known == null) {
+      if (!enable) {
+        // 删除 / 停用一个总线不认识的条目：它本来就没跑起来，目标已达成
+        return const PluginHotApplyOutcome.applied('该插件未在运行，无需断开');
+      }
+      return const PluginHotApplyOutcome.notApplied(
+        '该条目不在核心启动时读取的配置里（新增条目）：插件总线运行期不重读配置，'
+        '无法把它拉起来',
+      );
+    }
+    final String diff = _diff(known, entry);
+    final bool running = bus.healthOf(id)['health'] != 'unavailable';
+    if (diff.isEmpty) {
+      if (!enable) {
+        return running
+            ? const PluginHotApplyOutcome.notApplied(
+                '插件总线没有"单独断开某个插件"的公开入口（只有 restart / close），'
+                '无法只停它一个',
+              )
+            : const PluginHotApplyOutcome.applied('该插件未在运行，无需断开');
+      }
+      if (running) {
+        return const PluginHotApplyOutcome.applied('配置与运行中的实例一致，无需重启');
+      }
+      // 配置没变但它不在跑（启动失败 / 进程已退出）：重启是安全且唯一有用的动作
+      final bool restarted = await bus.restart(id);
+      if (restarted) {
+        return const PluginHotApplyOutcome.applied('插件已按现有配置重新拉起');
+      }
+      final String reason = bus.errorOf(id) ?? '';
+      return PluginHotApplyOutcome.notApplied(
+        reason.isEmpty ? '插件重启后仍未就绪' : '插件重启失败：$reason',
+      );
+    }
+    if (!enable) {
+      return PluginHotApplyOutcome.notApplied(
+        '插件总线运行期没有"单独断开某个插件"的公开入口（只有 restart / close），'
+        '无法只停它一个；它也不重读磁盘配置（本次改动：$diff）',
+      );
+    }
+    return PluginHotApplyOutcome.notApplied(
+      '插件总线的配置在核心启动时读一次、运行期不重读，本次改动（$diff）'
+      '无法热应用：拿旧定义 restart 只会"看起来成功"',
+    );
+  }
+
+  /// 与总线内存里那一份配置的差异（可读字段名列表；无差异返回空串）。
+  static String _diff(PluginConfig known, Map<String, dynamic> entry) {
+    final List<String> fields = <String>[];
+    if (known.name != (entry['name'] ?? '').toString()) fields.add('name');
+    if (known.command != (entry['command'] ?? '').toString()) {
+      fields.add('command');
+    }
+    if (!_sameArgs(known.args, _argsOf(entry))) fields.add('args');
+    if (!_sameEnv(known.env, _envOf(entry))) fields.add('env');
+    if (known.enabled != (entry['enabled'] != false)) fields.add('enabled');
+    if (known.granularity != (entry['granularity'] ?? 'team').toString()) {
+      fields.add('granularity');
+    }
+    if (!_sameScope(known.scope, _scopeOf(entry))) fields.add('scope');
+    return fields.join(' / ');
+  }
+
+  static List<String> _argsOf(Map<String, dynamic> entry) {
+    final Object? raw = entry['args'];
+    if (raw is! List) return const <String>[];
+    return <String>[for (final Object? a in raw) a.toString()];
+  }
+
+  static Map<String, String> _envOf(Map<String, dynamic> entry) {
+    final Object? raw = entry['env'];
+    if (raw is! Map) return const <String, String>{};
+    return <String, String>{
+      for (final MapEntry<Object?, Object?> e in raw.entries)
+        e.key.toString(): e.value?.toString() ?? '',
+    };
+  }
+
+  static Map<String, dynamic> _scopeOf(Map<String, dynamic> entry) {
+    final Object? raw = entry['scope'];
+    if (raw is! Map) return const <String, dynamic>{};
+    return <String, dynamic>{
+      for (final MapEntry<Object?, Object?> e in raw.entries)
+        e.key.toString(): e.value ?? '',
+    };
+  }
+
+  /// 三个"同构比较"：逐项比而不是拼串，避免分隔符出现在值里造成误判。
+  static bool _sameArgs(List<String> a, List<String> b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  static bool _sameEnv(Map<String, String> a, Map<String, String> b) {
+    if (a.length != b.length) return false;
+    for (final MapEntry<String, String> e in a.entries) {
+      if (b[e.key] != e.value) return false;
+    }
+    return true;
+  }
+
+  /// scope 的值是 dynamic（YAML 里可能是数字 / 布尔），一律按文本比较。
+  static bool _sameScope(Map<String, dynamic> a, Map<String, dynamic> b) {
+    if (a.length != b.length) return false;
+    for (final MapEntry<String, dynamic> e in a.entries) {
+      if (!b.containsKey(e.key)) return false;
+      if (b[e.key].toString() != e.value.toString()) return false;
+    }
+    return true;
   }
 }
 

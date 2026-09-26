@@ -738,6 +738,107 @@ class ApiService {
     );
   }
 
+  /// 读取插件清单（**持久态**）与每条的运行态：GET /api/plugin/configs
+  ///
+  /// 返回 {path, enabled, configs, runtime}：
+  /// - configs 是 plugins.yaml 里真实写着的条目（含 env / scope / builtin 标记），
+  ///   编辑弹窗的回填就以它为准；
+  /// - runtime 按 id 给运行态（running / health / reason / error / known）。
+  ///
+  /// 与 [getPluginSnapshot] 的分工：快照给**运行态**（实例 / 站点 / 心跳健康度），
+  /// 这里给"文件里到底写了什么"。刚保存的开关状态**以这里为准**——插件总线的配置
+  /// 是启动时读一次进内存的，运行期不重读，所以快照会滞后到下次重启核心。
+  static Future<Map<String, dynamic>> getPluginConfigs() async {
+    return _getJson('/api/plugin/configs');
+  }
+
+  /// 新增一个自定义插件：POST /api/plugin/configs
+  ///
+  /// 返回值里的 notice **必须**显示给用户：热应用失败时它是
+  /// 「配置已保存，但本次热应用失败，重启核心后生效」——不显示就等于骗用户
+  /// "已经生效了"（本轮插件总线运行期不重读配置，新增条目一定需要重启核心）。
+  static Future<Map<String, dynamic>> createPluginConfig({
+    required String id,
+    required String name,
+    required String command,
+    List<String> args = const <String>[],
+    Map<String, String> env = const <String, String>{},
+    String granularity = 'team',
+    Map<String, String> scope = const <String, String>{},
+    bool enabled = true,
+  }) async {
+    return _postJson(
+      '/api/plugin/configs',
+      body: <String, dynamic>{
+        'id': id,
+        'name': name,
+        'command': command,
+        'args': args,
+        'env': env,
+        'enabled': enabled,
+        'granularity': granularity,
+        'scope': scope,
+      },
+    );
+  }
+
+  /// 局部更新一个插件（开关、编辑都走这里）：PATCH /api/plugin/configs/{id}
+  ///
+  /// [patch] 只放要改的字段（例如开关只发一个 enabled）。
+  static Future<Map<String, dynamic>> updatePluginConfig(
+    String id,
+    Map<String, dynamic> patch,
+  ) async {
+    // 先编码再拼串：id 允许的字符集由核心校验，但 URL 里仍要转义（防御式）
+    final String encoded = Uri.encodeComponent(id);
+    return _patchJson('/api/plugin/configs/$encoded', body: patch);
+  }
+
+  /// 删除一个自定义插件：DELETE /api/plugin/configs/{id}
+  static Future<Map<String, dynamic>> deletePluginConfig(String id) async {
+    final String encoded = Uri.encodeComponent(id);
+    return _deleteJson('/api/plugin/configs/$encoded');
+  }
+
+  /// 显式重启一个插件实例：POST /api/plugin/configs/{id}/restart
+  ///
+  /// 这是唯一真正作用到运行中总线上的操作（心跳 degraded 之后手动恢复用）。
+  static Future<Map<String, dynamic>> restartPluginConfig(String id) async {
+    final String encoded = Uri.encodeComponent(id);
+    return _postJson('/api/plugin/configs/$encoded/restart');
+  }
+
+  /// 内置插件目录：GET /api/plugin/builtins
+  ///
+  /// 返回 {path, builtins: [...]}，每项含 id / 名称 / 说明 / 默认粒度与 scope /
+  /// 启用态 / 落盘条目（config，未启用过为 null）/ 运行时解析结果（resolution）。
+  /// [refresh] = 强制核心重探运行时（用户刚装好 Python 时用）。
+  static Future<Map<String, dynamic>> getPluginBuiltins({
+    bool refresh = false,
+  }) async {
+    return _getJson(
+      '/api/plugin/builtins',
+      query: <String, String>{if (refresh) 'refresh': '1'},
+    );
+  }
+
+  /// 打开 / 关闭一个内置插件（**每项各自一个开关**，没有批量开关）
+  ///
+  /// - 打开：POST /api/plugin/builtins/{id}/enable —— 核心解析运行时与脚本，
+  ///   写成一条普通插件配置（带 builtin 标记）再热启动；运行时 / 脚本缺失时
+  ///   核心回**可读 400**（如「未检测到 Python，请先安装或改用自定义命令」）；
+  /// - 关闭：POST /api/plugin/builtins/{id}/disable —— 条目置 enabled:false 并保留
+  ///   （面板显示「已停用」而不是让它消失）。
+  static Future<Map<String, dynamic>> setBuiltinPluginEnabled(
+    String id, {
+    required bool enabled,
+  }) async {
+    final String encoded = Uri.encodeComponent(id);
+    return _postJson(
+      '/api/plugin/builtins/$encoded/${enabled ? 'enable' : 'disable'}',
+    );
+  }
+
   // ==================== MCP 服务管理接口（右栏 MCP 配置页） ====================
 
   /// 列出已注册的 MCP 服务

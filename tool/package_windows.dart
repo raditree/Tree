@@ -129,6 +129,19 @@ Future<void> _package(List<String> args) async {
     }
   }
 
+  // ②c 内置插件脚本：examples/plugins/ → 发行目录 plugins/（与 Tree.exe / tree_core.exe 同级）
+  //
+  // 为什么必须拷：核心按**自身可执行文件同级的** plugins/<name>.py 解析内置插件的
+  // 脚本（见 packages/tree_core/lib/src/plugin/builtin_plugins.dart 的 scriptRoots）。
+  // 漏了这一层，用户在界面上打开「示例插件」只会得到"找不到内置插件脚本"。
+  // 目录不存在不算失败（有人可能只要核心，不带示例脚本），但要**打印一行**说明。
+  final int pluginFiles = _copyPlugins(root, releaseDir);
+  stdout.writeln(
+    pluginFiles < 0
+        ? '   插件脚本：跳过（没有 examples/plugins 目录）'
+        : '   插件脚本：plugins/（$pluginFiles 个文件）',
+  );
+
   // ③ 便携包说明（首次运行指引：数据在哪、怎么手改配置、出问题看哪）
   final File guide = File(_join(releaseDir.path, '使用说明.txt'));
   // 带 UTF-8 BOM 写出：目标是 Windows 用户，记事本/PowerShell 5.1 对无 BOM 的
@@ -219,10 +232,16 @@ Tree 桌面端（Windows 便携版）
     config/settings.yaml        全局设置（token 帧率 / 推送帧率 / 消息切入…）
     config/models/<id>.yaml     每个模型一个文件（含明文 api_key，只在本机）
     config/mcp.yaml             MCP 服务（stdio 命令 + 环境变量）
-    config/plugins.yaml         插件清单
+    config/plugins.yaml         插件清单（内置与自定义插件各有一个开关）
     agents/<id>.yaml            agent 配置（system prompt / 模型 / ssh / workspace_dir）
     spec/builtin/*.md           内置 Spec 模板
     data/<agent>/<session>/     会话数据：session.json + messages.jsonl（一行一条消息）
+
+内置插件
+  plugins/ 目录与 Tree.exe 同级，里面是核心自带的示例插件脚本。界面上「插件」页把
+  内置插件与自定义插件分开列出，每一项都有自己的开关；打开内置插件时核心会去探测
+  Python（python / py -3）并解析 plugins/<name>.py 的绝对路径，两者缺一都会给可读
+  错误（装了 Python 之后点面板上的刷新即可重新探测）。
 
 出问题先看这里
   - 提示"未找到核心进程可执行文件 tree_core.exe"：确认 tree_core.exe 与 Tree.exe
@@ -243,6 +262,30 @@ Future<Never> _fail(String message, int code) async {
     // 输出流已关闭：能报的已经报了，别在兜底路径上再炸一次
   }
   exit(code);
+}
+
+/// 把 examples/plugins/ 复制到发行目录的 plugins/（返回复制的文件数）。
+///
+/// 目录不存在返回 -1（"没有可拷的"与"拷了 0 个文件"是两件事，调用方要能区分）。
+/// 递归复制、保留子目录结构：插件常带自己的模块与数据文件。
+int _copyPlugins(Directory root, Directory releaseDir) {
+  final Directory source = Directory(_join(root.path, 'examples/plugins'));
+  if (!source.existsSync()) return -1;
+  final Directory target = Directory(_join(releaseDir.path, 'plugins'))
+    ..createSync(recursive: true);
+  int copied = 0;
+  for (final FileSystemEntity entity in source.listSync(recursive: true)) {
+    if (entity is! File) continue;
+    final String relative = entity.path
+        .substring(source.path.length)
+        .replaceAll(RegExp(r'^[\\/]+'), '');
+    if (relative.isEmpty) continue;
+    final File destination = File(_join(target.path, relative));
+    destination.parent.createSync(recursive: true);
+    entity.copySync(destination.path);
+    copied++;
+  }
+  return copied;
 }
 
 /// 启动核心读握手（打包产物自检）。
