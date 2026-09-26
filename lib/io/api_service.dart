@@ -754,9 +754,10 @@ class ApiService {
 
   /// 新增一个自定义插件：POST /api/plugin/configs
   ///
-  /// 返回值里的 notice **必须**显示给用户：热应用失败时它是
+  /// 返回值里的 notice **必须**显示给用户：热应用现在走总线对账（applyConfigs），
+  /// 正常情况下写入即生效；只有对账失败（启动失败、YAML 读不动等）才会是
   /// 「配置已保存，但本次热应用失败，重启核心后生效」——不显示就等于骗用户
-  /// "已经生效了"（本轮插件总线运行期不重读配置，新增条目一定需要重启核心）。
+  /// "已经生效了"。
   static Future<Map<String, dynamic>> createPluginConfig({
     required String id,
     required String name,

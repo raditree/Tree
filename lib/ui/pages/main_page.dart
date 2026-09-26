@@ -68,7 +68,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   /// 移动端底部导航当前页（0=Agent 列表，1=消息，2=文件）
   int _mobileTab = 0;
 
-  /// 内置左栏面板数量（Agent 列表 / 插件（只读）/ 下载）：插件活动栏槽位从它之后编号
+  /// 内置左栏面板数量（Agent 列表 / 插件管理 / 下载）：插件活动栏槽位从它之后编号
   static const int _builtinLeftPanelCount = 3;
 
   /// 当前选中的**插件活动栏槽位键**（null = 选中的是内置面板）

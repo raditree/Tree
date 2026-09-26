@@ -846,15 +846,16 @@ class _PluginPanelState extends State<PluginPanel> {
 
   /// 自定义插件的运行态一句话。
   ///
-  /// known=false 表示这一条是**新写的**（插件总线启动时没读到它）——如实说
-  /// "需重启核心后生效"，而不是含糊地说"未运行"。
+  /// known=false 表示这条配置**还没被总线对账过**（例如刚写盘、或在旧核心上）。
+  /// 热应用（applyConfigs）落地后这种情况几乎不再出现：写入即对账，所以这里
+  /// 提示用户"可点重启或看原因"，而不是断言一定要重启核心。
   String _runtimeText(bool enabled, Map<String, dynamic> runtime) {
     if (!enabled) return '状态：已停用（条目保留）';
     if (runtime['running'] == true) {
       return runtime['health'] == 'degraded' ? '状态：运行中（心跳降级，仍注册）' : '状态：运行中';
     }
     if (runtime['known'] == true) return '状态：已启用但未运行（可点「重启」）';
-    return '状态：已启用，需重启核心后生效';
+    return '状态：已启用但未运行（可点「重启」，或看上方原因）';
   }
 
   Color _runtimeColor(
