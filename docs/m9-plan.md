@@ -159,6 +159,22 @@
 
 ---
 
+### 4.1 插件布局契约（Q12，暂定稿：前端/协议先行，核心侧由 Wave 3-F 接线）
+
+**传输**：沿用现有 WS 帧通道（不动既有帧形状），新增三类帧（定义在 packages/tree_protocol）：
+- `plugin_ui_manifest`（核心 → 前端）：某插件的槽位声明（slot 列表 + 各槽位初始视图）
+- `plugin_ui_update`（核心 → 前端）：按 slot_key 局部替换某槽位视图（整块替换，不做 diff）
+- `plugin_ui_action`（前端 → 核心）：用户在插件视图上的交互回调（slot_key + action_id + payload）
+
+**槽位（4 类）**：`activity`（左侧活动栏项）、`panel`（右栏 Tab）、`status`（状态栏项）、`card`（消息流内联卡片，允许插件注入）。
+槽位一律带 `team_id`，前端只呈现当前 team 的槽位（与 1.2 的隔离口径一致）。
+
+**视图模型（声明式、受限控件集，不做 webview/iframe）**：
+`text` / `list` / `table`（columns + rows）/ `form`（字段 + 提交）/ `progress` / `actions`（按钮组）；
+按钮与表单提交 → `plugin_ui_action` 帧；未知控件类型渲染成可读占位（「不支持的控件」）而不是崩溃。
+
+**生产方（Wave 3-F）**：执行站的 `ui.push` 命令复用同一套 card 槽位帧；插件 manifest 声明槽位。
+
 ## 5. 分工与文件所有权（并行执行）
 
 **规则**：一个文件同时只有一个执行者；子代理**不做 git 操作**（`add`/`commit` 由主控统一按子系统提交）；只跑与改动相关的测试。
