@@ -199,7 +199,7 @@ class CoreServer {
     String version = treeCoreVersion,
     Duration streamChunkDelay = const Duration(milliseconds: 40),
     bool enableHeartbeat = true,
-    Duration heartbeatInterval = const Duration(seconds: 30),
+    Duration heartbeatInterval = LivenessTracker.defaultInterval,
     int heartbeatMissLimit = LivenessTracker.defaultMaxMisses,
     TreeStore? store,
     CoreSettings? settings,
@@ -224,10 +224,10 @@ class CoreServer {
     final TreeStore resolvedStore = store ?? MemoryStore();
     final CoreSettings resolvedSettings = settings ?? CoreSettings();
     final TodoStore resolvedTodos = todoStore ?? MemoryTodoStore();
-    // M9 规约 1.1：WS 侧的发送/心跳不再依赖任何静态超时；判活看"连接心跳有没有丢"。
-    // 心跳间隔沿用 [heartbeatInterval]（默认 30s，与前端自己的 30s 心跳节奏对齐，
-    // 否则 30s 的判活窗口会把"在线但空闲"的连接误判失活），连续 [heartbeatMissLimit]
-    // 拍收不到任何入站帧才判失活。详见 LivenessWsHub 的类文档。
+    // 心跳间隔沿用 [heartbeatInterval]（默认 I=10s，与前端 10s 心跳节奏对齐；
+    // 前端间隔必须小于本处判活窗口 I×N，否则"在线但空闲"的连接会被误判失活），
+    // 连续 [heartbeatMissLimit]（默认 N=3）拍收不到任何入站帧才判失活。
+    // 详见 LivenessWsHub 的类文档。
     final LivenessWsHub hub = LivenessWsHub(
       interval: heartbeatInterval,
       maxMisses: heartbeatMissLimit,

@@ -55,7 +55,7 @@ class WebSocketService {
   /// WebSocket 通道
   WebSocketChannel? _channel;
 
-  /// 心跳定时器（每 30 秒发送一次）
+  /// 心跳定时器（每 10 秒发送一次；与服务端判活口径 I=10s×N=3 对齐）
   Timer? _heartbeatTimer;
 
   /// 流式订阅
@@ -359,11 +359,14 @@ class WebSocketService {
 
   /// 启动心跳定时器
   ///
-  /// 每 30 秒发送一次 `{"type": "heartbeat"}` 消息，保持连接活跃。
+  /// 每 10 秒发送一次 `{"type": "heartbeat"}` 消息，保持连接活跃。
+  ///
+  /// 间隔必须**小于**服务端的判活窗口（I×N = 10s×3 = 30s），否则"在线但空闲"的
+  /// 连接会被判失活并强制重连。
   void _startHeartbeat() {
     _heartbeatTimer?.cancel();
     _heartbeatTimer = Timer.periodic(
-      const Duration(seconds: 30),
+      const Duration(seconds: 10),
       (_) => send(<String, dynamic>{'type': 'heartbeat'}),
     );
   }
