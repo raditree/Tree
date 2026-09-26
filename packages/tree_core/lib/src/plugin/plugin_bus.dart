@@ -304,6 +304,11 @@ class PluginBus {
     if (_hosts.containsKey(config.id)) return;
     try {
       final PluginHost host = await _spawn(config);
+      // **插件 → 核心请求通道**（M9 §3）：插件主动下命令（station/command）在这里
+      // 接线。生产路径已在 _spawn 里接好（建连即生效），这里再设一次是为了覆盖
+      // hostFactory 注入的宿主（测试 / 自定义宿主）。
+      host.onPluginRequest = (String method, Map<String, dynamic> params) =>
+          _handlePluginRequest(config, method, params);
       _hosts[config.id] = host;
       _errors.remove(config.id);
       _queueDepth[config.id] = 0;
@@ -769,6 +774,102 @@ class PluginBus {
     return failed.join('；');
   }
 
+  // ── 插件 → 核心的请求通道（M9 §3「插件主动下命令」） ────────────────────
+
+  /// 插件主动发起的请求（JSON-RPC `method` + `id`）的总入口（宿主
+  /// [PluginHost.onPluginRequest] 的接线实现）。
+  ///
+  /// 当前实现执行站的 `station/command`；未知 method ⇒ `-32601`（不静默）。
+  /// 失败一律抛 [PluginRequestException]，由宿主变成 `{jsonrpc, id, error}` 响应。
+  Future<Map<String, dynamic>> _handlePluginRequest(
+    PluginConfig config,
+    String method,
+    Map<String, dynamic> params,
+  ) async {
+    switch (method) {
+      case 'station/command':
+        return _handleStationCommand(config, params);
+      default:
+        throw PluginRequestException(
+          PluginRpcErrorCode.methodNotFound,
+          'method not found: $method',
+        );
+    }
+  }
+
+  /// **执行站命令（插件 → 核心）**：参数 `{command: string, arguments: object?}`。
+  ///
+  /// **scope 只取插件自己的声明**（[_scopeOf]，与订阅 / 收集站同一套解析）：
+  /// 插件在 `arguments` 里塞 `team_id` / `agent_id` / `session_id` / `mode_key`
+  /// **不会改变作用域**——本方法根本不读这几个键（命令参数只用来指名“目标”），
+  /// 站点实例与挂载位置再按插件声明的四元组做隔离判定（fail-closed，不得放大）。
+  ///
+  /// 执行站的结论（含**可读错误**）原样放进 `result` 回给插件：命令被拒 / 挂载位置
+  /// 失败不是 JSON-RPC 错误，而是 `{ok: false, error: ...}`——插件据此自查原因，
+  /// 不会被吞成一句“调用失败”。
+  Future<Map<String, dynamic>> _handleStationCommand(
+    PluginConfig config,
+    Map<String, dynamic> params,
+  ) async {
+    final String command = (params['command'] ?? '').toString().trim();
+    if (command.isEmpty) {
+      throw const PluginRequestException(
+        PluginRpcErrorCode.invalidParams,
+        'station/command 需要 command（执行站命令名，如 fs.read / ui.push）',
+      );
+    }
+    final Object? rawArguments = params['arguments'];
+    if (rawArguments != null && rawArguments is! Map) {
+      throw const PluginRequestException(
+        PluginRpcErrorCode.invalidParams,
+        'station/command 的 arguments 必须是 JSON 对象',
+      );
+    }
+    final Map<String, dynamic> arguments = rawArguments is Map
+        ? rawArguments.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
+        : <String, dynamic>{};
+    // scope：插件实例**自己的声明**（团队归属 + 它自己声明的更细粒度）。
+    // 上下文同样由声明派生（不含插件的请求参数）：声明了 agent 的插件因此能按
+    // 该 agent 的工作空间模式（local | ssh）落到正确的执行站。
+    final StationScope declared = StationScope.parse(config.scope);
+    final StationScope scope = _scopeOf(
+      config,
+      StationScopeContext(
+        teamId: declared.teamId,
+        agentId: declared.agentId,
+        sessionId: declared.sessionId,
+      ),
+    );
+    if (!scope.isValid) {
+      throw PluginRequestException(
+        PluginRpcErrorCode.scopeDenied,
+        '插件 ${config.id} 未声明 team，不能使用执行站'
+        '（plugins.yaml 的 scope.team_id 必须非空）',
+      );
+    }
+    final ExecuteStation? station = stations.executeFor(scope);
+    if (station == null) {
+      throw PluginRequestException(
+        PluginRpcErrorCode.scopeDenied,
+        '插件 ${config.id} 的 scope（${scope.describe()}）没有可用的执行站',
+      );
+    }
+    final StationCommandResult result = await station.execute(
+      command: command,
+      scope: scope,
+      arguments: arguments,
+      sourcePluginId: config.id,
+    );
+    // 结果原样回给插件（ok / payload / error 三件套，执行站说什么就回什么）
+    return <String, dynamic>{
+      'command': result.command,
+      'ok': result.ok,
+      'mount_id': result.mountId,
+      'payload': result.payload,
+      'error': result.error,
+    };
+  }
+
   void _scheduleToolTableRefresh(StationScope? scope) {
     if (_toolTableRefreshing) return;
     _toolTableRefreshing = true;
@@ -1012,6 +1113,10 @@ class PluginBus {
       coreVersion: coreVersion,
       onNotification: (Map<String, dynamic> notification) =>
           _emitPluginEvent(config.id, notification),
+      // 插件主动请求（station/command）的处理器：建连时即接线，
+      // 因此插件在 hello 握手期间就能下命令（不会撞上"未接线 ⇒ -32601"的窗口）。
+      onPluginRequest: (String method, Map<String, dynamic> params) =>
+          _handlePluginRequest(config, method, params),
     );
   }
 

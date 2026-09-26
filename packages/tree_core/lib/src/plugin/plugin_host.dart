@@ -11,8 +11,16 @@ import 'station_scope.dart';
 /// 协议（行分隔 JSON-RPC 2.0，方法与 MCP 同风格但独立命名）：
 /// - 核心 → 插件：`hello`（握手）→ `tools/list` → `tools/call`，另有 `ping` 与
 ///   `event`（通知，用于把总线事件推给插件）；
-/// - 插件 → 核心：只要求**应答**；插件主动发的 `log` / `event` 通知会被收集成
-///   [PluginHost.notifications]，由总线转成前端事件（M6c）。
+/// - 插件 → 核心：入站报文按**三类**判别（见 [_onLine]）——
+///   ① **响应**：有 `id` 且**没有 `method`**（JSON-RPC 的 Response 形态）——
+///      `int id` 命中在途请求即回填，未知 / 重复的回包丢弃；
+///   ② **请求**：带 `method` + `id`（插件**主动**调核心；执行站的
+///      `station/command` 走这里，M9 §3「插件主动下命令」）。这类报文一律交给
+///      [onPluginRequest]，并**必须且只能回一条**响应（成功 result / 失败 error），
+///      处理器抛异常也变成 error 响应（异常绝不冲掉读循环）；未接线处理器 ⇒
+///      `-32601`（不静默）；
+///   ③ **通知**：其余（如 `log` / `event`，含不带 id 的通知形态），收集成
+///      [PluginHost.notifications]，由总线转成前端事件（M6c）。
 ///
 /// 与 MCP 客户端一样是"本机直跑、不做安全隔离"：只做**心跳判活**、崩溃感知与优雅关闭。
 ///
@@ -40,6 +48,11 @@ class PluginHost {
     Duration heartbeatInterval = LivenessTracker.defaultInterval,
     String coreVersion = '',
     void Function(Map<String, dynamic> notification)? onNotification,
+    Future<Map<String, dynamic>> Function(
+      String method,
+      Map<String, dynamic> params,
+    )?
+    onPluginRequest,
   }) async {
     if (config.command.trim().isEmpty) {
       throw PluginException('插件 ${config.id} 未配置 command');
@@ -59,12 +72,10 @@ class PluginHost {
     process.stderr
         .transform(utf8.decoder)
         .listen(stderr.write, onError: (Object _) {});
-    final PluginHost host = PluginHost._(
-      config,
-      process,
-      stderr,
-      heartbeatInterval,
-    ).._onNotification = onNotification;
+    final PluginHost host =
+        PluginHost._(config, process, stderr, heartbeatInterval)
+          .._onNotification = onNotification
+          ..onPluginRequest = onPluginRequest;
     process.stdout
         .transform(utf8.decoder)
         .transform(const LineSplitter())
@@ -113,6 +124,19 @@ class PluginHost {
 
   /// 插件主动通知的转发口（总线用它转成前端 `plugin_event`）；null = 只收集。
   void Function(Map<String, dynamic> notification)? _onNotification;
+
+  /// **插件 → 核心**的请求处理器（M9 §3 执行站的核心语义）：插件主动发
+  /// `method` + `id` 的请求时调用，返回值作为响应 `result` 回给插件。
+  ///
+  /// - 可随时设置（总线在插件启动后接线）；null ⇒ 一律回 `-32601`（不静默）；
+  /// - 抛 [PluginRequestException] ⇒ 该异常自带的 code / message 变成 error 响应；
+  ///   抛其它异常 ⇒ `-32603` + 可读文本（异常绝不冲掉读循环）；
+  /// - **一次请求只回一条响应**，失败也回（插件侧不会永久挂起等回包）。
+  Future<Map<String, dynamic>> Function(
+    String method,
+    Map<String, dynamic> params,
+  )?
+  onPluginRequest;
 
   final Map<int, Completer<Map<String, dynamic>>> _pending =
       <int, Completer<Map<String, dynamic>>>{};
@@ -317,6 +341,19 @@ class PluginHost {
     _process.stdin.writeln(jsonEncode(message));
   }
 
+  /// 入站报文的**三类判别**（顺序即优先级）：
+  ///
+  /// ① **响应**：有 `id` 且**没有 `method`**（JSON-RPC 的 Response 形态）⇒
+  ///    `int id` 命中 [_pending] 即完成在途 Future；未知 / 重复的回包丢弃
+  ///    （不重复完成、不抛异常）。判别用"有没有 method"而不是"id 命中"，是为了
+  ///    插件用自增 int id 发请求时不会与核心在途请求撞号而被当成回包吞掉。
+  /// ② **请求**：带非空字符串 `method` + 有 `id` ⇒ 交给 [onPluginRequest]，
+  ///    由 [_answerRequest] **必回一条**响应（插件主动调核心的通道）。
+  /// ③ **通知**：其余（`log` / `event`，含不带 id 的通知形态）⇒ 收集 + 转发。
+  ///
+  /// 判别只看报文形状，不看"插件有没有这个能力"：插件发的请求即使 method 没人
+  /// 认识，也会得到 `-32601` 响应而不是被静默丢掉（这是 M9 §3「插件主动下命令」
+  /// 此前缺失的一环）。
   void _onLine(String line) {
     final String text = line.trim();
     if (text.isEmpty) return;
@@ -330,18 +367,90 @@ class PluginHost {
     }
     if (decoded is! Map<String, dynamic>) return;
     final Object? id = decoded['id'];
-    if (id is! int) {
-      // 插件主动通知（log/event）：收集并转发（总线转前端 plugin_event）
-      notifications.add(decoded);
-      _onNotification?.call(decoded);
+    final Object? rawMethod = decoded['method'];
+
+    // ① 响应：核心发出的请求的回包。**响应形态 = 有 id、没有 method**
+    //    （JSON-RPC 2.0 的 Response 不带 method）——这样"带 method 的 int id"一定
+    //    是插件的**请求**，不会因为 id 恰好撞上在途请求而被当成回包吞掉。
+    //    命中 _pending ⇒ 完成在途 Future；未知 / 重复的回包 ⇒ 丢弃（既不落通知，
+    //    也不当新请求）。
+    if (rawMethod == null && id != null) {
+      final Completer<Map<String, dynamic>>? completer = id is int
+          ? _pending.remove(id)
+          : null;
+      if (completer != null && !completer.isCompleted) {
+        try {
+          completer.complete(_requestResult(decoded));
+        } catch (error) {
+          completer.completeError(error);
+        }
+      }
       return;
     }
-    final Completer<Map<String, dynamic>>? completer = _pending.remove(id);
-    if (completer == null || completer.isCompleted) return;
+
+    // ② 请求：插件主动调核心（method + id）；必回一条响应，且不阻塞读循环
+    if (rawMethod is String && rawMethod.isNotEmpty && id != null) {
+      unawaited(_answerRequest(id, rawMethod, decoded['params']));
+      return;
+    }
+
+    // ③ 通知：收集并转发（总线转前端 plugin_event）
+    notifications.add(decoded);
+    _onNotification?.call(decoded);
+  }
+
+  /// 回**一条**响应给插件主动发起的请求：成功 `{jsonrpc, id, result}`，
+  /// 失败 `{jsonrpc, id, error: {code, message}}`。
+  ///
+  /// 任何异常都在这里收敛成 error 响应（绝不冒泡到读循环）；写回失败（插件已死）
+  /// 只吞掉写异常，由心跳 / 在途调用路径感知不可用。
+  Future<void> _answerRequest(
+    Object? id,
+    String method,
+    Object? rawParams,
+  ) async {
+    final Map<String, dynamic> params = rawParams is Map
+        ? rawParams.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
+        : <String, dynamic>{};
+    Map<String, dynamic>? result;
+    Map<String, dynamic>? error;
+    final Future<Map<String, dynamic>> Function(
+      String method,
+      Map<String, dynamic> params,
+    )?
+    handler = onPluginRequest;
+    if (handler == null) {
+      error = <String, dynamic>{
+        'code': PluginRpcErrorCode.methodNotFound,
+        'message': 'method not found: $method（宿主未接线 onPluginRequest）',
+      };
+    } else {
+      try {
+        result = await handler(method, params);
+      } on PluginRequestException catch (failure) {
+        error = <String, dynamic>{
+          'code': failure.code,
+          'message': failure.message,
+        };
+      } catch (failure) {
+        error = <String, dynamic>{
+          'code': PluginRpcErrorCode.internalError,
+          'message': '插件请求 $method 处理异常：$failure',
+        };
+      }
+    }
+    final Map<String, dynamic> response = <String, dynamic>{
+      'jsonrpc': '2.0',
+      'id': id,
+      if (error != null)
+        'error': error
+      else
+        'result': result ?? <String, dynamic>{},
+    };
     try {
-      completer.complete(_requestResult(decoded));
-    } catch (error) {
-      completer.completeError(error);
+      _write(response);
+    } catch (_) {
+      // 插件已死：回包写不进去不算错误（不可用状态由心跳 / 调用路径标记）
     }
   }
 
@@ -385,6 +494,38 @@ class PluginHost {
 class PluginException implements Exception {
   PluginException(this.message);
   final String message;
+  @override
+  String toString() => message;
+}
+
+/// **插件 → 核心请求**的 JSON-RPC 错误码（与 JSON-RPC 2.0 / MCP 同表）。
+abstract final class PluginRpcErrorCode {
+  /// 方法不存在（宿主未接线处理器 / 总线不认识的 method）。
+  static const int methodNotFound = -32601;
+
+  /// 参数非法（缺 command、arguments 不是对象…）。
+  static const int invalidParams = -32602;
+
+  /// 处理器内部异常（异常文本进 message）。
+  static const int internalError = -32603;
+
+  /// 服务端自定义：归属 / scope 不满足（如插件未声明 team ⇒ 不能使用执行站）。
+  static const int scopeDenied = -32001;
+}
+
+/// 插件请求的**可读失败**（带 JSON-RPC 错误码）。
+///
+/// [PluginHost.onPluginRequest] 的处理器抛出它 ⇒ 原样变成 `{code, message}` 错误
+/// 响应；抛其它异常 ⇒ `-32603` + 异常文本。两种都不会让插件永久等回包。
+class PluginRequestException implements Exception {
+  const PluginRequestException(this.code, this.message);
+
+  /// JSON-RPC 错误码（见 [PluginRpcErrorCode]）。
+  final int code;
+
+  /// 可读中文原因。
+  final String message;
+
   @override
   String toString() => message;
 }
