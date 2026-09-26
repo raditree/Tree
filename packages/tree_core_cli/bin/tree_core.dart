@@ -60,8 +60,20 @@ Future<void> main(List<String> args) async {
   // 工具执行器：工作空间目录取 agent 配置里的 workspace_dir，未配置则落到
   // <数据根>/workspaces/<agent_id>（首次使用时自动创建）。
   final FileTodoStore todos = FileTodoStore(paths);
+
+  // 提问回路：工具层先建好、核心后建 WS 广播，因此广播目标用一个可后置绑定的
+  // 槽（core 起监听后立即接上 `hub.broadcast`）。
+  final FileQuestionStore questionStore = FileQuestionStore(paths);
+  void Function(Map<String, dynamic> frame)? hubSink;
+  final QuestionBroker questions = QuestionBroker(
+    questions: questionStore,
+    transcript: store,
+    broadcast: (Map<String, dynamic> frame) => hubSink?.call(frame),
+    log: (String message) => stderr.writeln('[core:ask] $message'),
+  );
   final WorkspaceToolRunner tools = WorkspaceToolRunner(
     todoStore: todos,
+    askQuestion: questions.ask,
     resolveSshConfig: (String agentId) => store.agent(agentId)?.sshConfig,
     // SSH 后端（dartssh2 + SFTP/exec）：每个 agent 一条连接，按需建立并缓存；
     // 远端根目录取 ssh.root（空 = 远端登录用户的 HOME）。
@@ -100,7 +112,10 @@ Future<void> main(List<String> args) async {
     settings: settings,
     todoStore: todos,
     engine: engine,
+    questions: questions,
   );
+  // 提问卡片要广播到前端：核心起监听后把广播槽接上
+  hubSink = server.hub.broadcast;
   if (verbose) {
     // 访问日志走 stderr（stdout 是进程间协议，绝不能混入日志）
     server.accessLog = (String message) => stderr.writeln('[core] $message');

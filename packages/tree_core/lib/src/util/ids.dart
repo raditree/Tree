@@ -34,6 +34,9 @@ abstract final class CoreIds {
   /// 消息 id。
   static String message() => next('msg');
 
+  /// 提问 id（同时作为会话里提问卡片的消息 id）。
+  static String question() => next('qst');
+
   /// WS 连接 id（仅用于日志排障）。
   static String connection() => next('conn');
 }

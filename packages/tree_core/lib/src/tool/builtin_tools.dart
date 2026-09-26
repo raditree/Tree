@@ -2,16 +2,20 @@ import 'dart:convert';
 
 import 'package:tree_local_exec/tree_local_exec.dart';
 
+import 'question_channel.dart';
 import 'terminal_hooks.dart';
 import 'todo_store.dart';
 import 'tool_runner.dart';
 
-/// 内置工具集（M4 交付**工作空间类** 5 个：read / write / edit / grep / terminal）。
+/// 内置工具集：**工作空间类** 5 个（read / write / edit / grep / terminal）
+/// + `set_todo_list`（接 todo 存储时声明）+ `ask_user_question`（接提问通道时声明）。
 ///
-/// 其余 6 个内置工具（`set_todo_list` / `ask_user_question` / `spec` /
-/// `team` / `message` 属 M5，`mcp` 属 M6）**现在不声明**：声明了但没实现，模型
-/// 会去调用并浪费一整轮 token。声明与实现必须同步发布，因此 [specs] 是唯一的
-/// 工具清单来源。
+/// 其余内置工具（`spec` / `team` / `message` 属 M5 后续，`mcp` 属 M6）**现在不声明**：
+/// 声明了但没实现，模型会去调用并浪费一整轮 token。声明与实现必须同步发布，
+/// 因此 [specs] 是唯一的工具清单来源，[run] 的默认分支也用它列出"可用工具"。
+///
+/// 工作空间类工具需要 [WorkspaceIO]；其余工具**不需要**（[needsWorkspace]），
+/// 因此 IO 可以为 null——否则 SSH 配置不全时连 `set_todo_list` 都用不了。
 ///
 /// 结果格式面向模型：先一行摘要（路径/行号/命中数/退出码），再放内容；截断与
 /// 超时都会显式写出来，模型才知道"这不是全部"。
@@ -22,12 +26,16 @@ abstract final class BuiltinTools {
   static const String grep = 'grep';
   static const String terminal = 'terminal';
   static const String setTodoList = 'set_todo_list';
+  static const String askUserQuestion = 'ask_user_question';
 
   /// 工具声明（顺序稳定：便于提示词缓存与测试断言）。
   ///
   /// [withTodos] 为 true 时才声明 `set_todo_list`：声明了但没接存储会让模型白调
   /// 一轮（与"未实现的工具不声明"同一原则）。
-  static List<ToolSpec> specs({bool withTodos = false}) => <ToolSpec>[
+  static List<ToolSpec> specs({
+    bool withTodos = false,
+    bool withQuestions = false,
+  }) => <ToolSpec>[
     if (withTodos)
       ToolSpec(
         name: setTodoList,
@@ -70,6 +78,29 @@ abstract final class BuiltinTools {
             },
           },
           'required': <String>['action'],
+        },
+      ),
+    if (withQuestions)
+      ToolSpec(
+        name: askUserQuestion,
+        description:
+            '向用户提问并**等待**用户回答（本轮生成会暂停直到作答）。'
+            '只在"必须由用户决定/补充信息"时使用；能从工作空间自己查到的不要问。'
+            '一次只问一件事；options 给出候选答案，用户也可以自由输入。',
+        parameters: <String, dynamic>{
+          'type': 'object',
+          'properties': <String, dynamic>{
+            'question': <String, dynamic>{
+              'type': 'string',
+              'description': '要问用户的问题（一次只问一件事）',
+            },
+            'options': <String, dynamic>{
+              'type': 'array',
+              'items': <String, dynamic>{'type': 'string'},
+              'description': '候选选项（可空；前端渲染为可点选按钮）',
+            },
+          },
+          'required': <String>['question'],
         },
       ),
     ToolSpec(
@@ -216,38 +247,62 @@ abstract final class BuiltinTools {
   ///
   /// 任何失败（路径非法/文件不存在/匹配不唯一/命令超时）都返回
   /// `isError: true` 的**可读结果**，不抛异常——模型要能读到原因并自我纠正。
+  /// 该工具是否需要工作空间（派发前据此决定是否准备 [WorkspaceIO]）。
+  ///
+  /// `set_todo_list` / `ask_user_question` 与工作空间无关，因此即使工作空间
+  /// 不可用（SSH 配置不全等）也必须能用。
+  static bool needsWorkspace(String name) =>
+      name == read ||
+      name == write ||
+      name == edit ||
+      name == grep ||
+      name == terminal;
+
   static Future<ToolOutcome> run(
     ToolInvocation invocation,
-    WorkspaceIO io, {
+    WorkspaceIO? io, {
     bool Function()? isCancelled,
     TodoStore? todos,
     TerminalHooks? hooks,
+    AskQuestion? askQuestion,
+    bool withTodos = false,
+    bool withQuestions = false,
   }) async {
     try {
+      if (io == null && needsWorkspace(invocation.name)) {
+        return const ToolOutcome('工作空间尚未就绪：无法执行该工具（详见核心日志）', isError: true);
+      }
       switch (invocation.name) {
+        case askUserQuestion:
+          return await _askUserQuestion(
+            invocation,
+            askQuestion,
+            isCancelled: isCancelled,
+          );
         case setTodoList:
           if (todos == null) {
             return const ToolOutcome('待办存储未接入：无法使用该工具', isError: true);
           }
           return await _setTodoList(invocation, todos);
         case read:
-          return await _read(invocation, io);
+          return await _read(invocation, io!);
         case write:
-          return await _write(invocation, io);
+          return await _write(invocation, io!);
         case edit:
-          return await _edit(invocation, io);
+          return await _edit(invocation, io!);
         case grep:
-          return await _grep(invocation, io);
+          return await _grep(invocation, io!);
         case terminal:
           return await _terminal(
             invocation,
-            io,
+            io!,
             isCancelled: isCancelled,
             hooks: hooks,
           );
         default:
           return ToolOutcome(
-            '未知工具：${invocation.name}（可用：${specs().map((ToolSpec s) => s.name).join('、')}）',
+            '未知工具：${invocation.name}'
+            '（可用：${specs(withTodos: withTodos, withQuestions: withQuestions).map((ToolSpec s) => s.name).join('、')}）',
             isError: true,
           );
       }
@@ -264,6 +319,48 @@ abstract final class BuiltinTools {
   }
 
   // ── 各工具实现 ───────────────────────────────────────────────────────
+
+  /// `ask_user_question`：把问题交给 [AskQuestion] 通道并等待作答。
+  ///
+  /// 取消时给出的文案刻意包含"不要重复提问"：模型收到空答案时最自然的错误反应
+  /// 就是再问一遍，那会让用户陷入"停止不了"的循环。
+  static Future<ToolOutcome> _askUserQuestion(
+    ToolInvocation invocation,
+    AskQuestion? askQuestion, {
+    bool Function()? isCancelled,
+  }) async {
+    if (askQuestion == null) {
+      return const ToolOutcome('提问通道未接入：无法使用该工具', isError: true);
+    }
+    final String question = _string(invocation, 'question').trim();
+    if (question.isEmpty) {
+      return const ToolOutcome('question 不能为空', isError: true);
+    }
+    final List<String> options = <String>[];
+    final Object? raw = invocation.arguments['options'];
+    if (raw is List<dynamic>) {
+      for (final dynamic item in raw) {
+        final String text = item?.toString().trim() ?? '';
+        if (text.isNotEmpty && !options.contains(text)) options.add(text);
+      }
+    }
+    final QuestionOutcome outcome = await askQuestion(
+      AskQuestionRequest(
+        agentId: invocation.agentId,
+        sessionId: invocation.sessionId,
+        question: question,
+        options: options,
+        isCancelled: isCancelled ?? () => false,
+      ),
+    );
+    if (outcome.cancelled) {
+      return const ToolOutcome(
+        '提问已取消（用户未作答）：请不要重复提问，'
+        '改为说明你的假设并继续，或等待用户主动发起。',
+      );
+    }
+    return ToolOutcome('用户回答：${outcome.answer}');
+  }
 
   static Future<ToolOutcome> _read(
     ToolInvocation invocation,

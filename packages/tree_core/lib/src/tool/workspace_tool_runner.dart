@@ -6,6 +6,7 @@ import 'package:tree_local_exec/tree_local_exec.dart';
 import '../settings/ssh_config.dart';
 
 import 'builtin_tools.dart';
+import 'question_channel.dart';
 import 'terminal_hooks.dart';
 import 'todo_store.dart';
 import 'tool_runner.dart';
@@ -27,6 +28,7 @@ class WorkspaceToolRunner implements ToolRunner {
     this.sshIoFactory,
     this.maxResultChars = 24000,
     this.todoStore,
+    this.askQuestion,
     WorkspaceIO Function(String dir)? ioFactory,
     this.log,
   }) : _ioFactory = ioFactory ?? LocalWorkspaceIO.new {
@@ -58,6 +60,9 @@ class WorkspaceToolRunner implements ToolRunner {
   /// 待办存储（为 null 时不声明 `set_todo_list`）。
   final TodoStore? todoStore;
 
+  /// 提问通道（为 null 时不声明 `ask_user_question`）。
+  final AskQuestion? askQuestion;
+
   final WorkspaceIO Function(String dir) _ioFactory;
 
   /// 可读日志（工具报错、结果截断等）。
@@ -73,20 +78,28 @@ class WorkspaceToolRunner implements ToolRunner {
   List<ToolSpec> specsFor({
     required String agentId,
     required String sessionId,
-  }) => BuiltinTools.specs(withTodos: todoStore != null);
+  }) => BuiltinTools.specs(
+    withTodos: todoStore != null,
+    withQuestions: askQuestion != null,
+  );
 
   @override
   Future<ToolOutcome> run(
     ToolInvocation invocation, {
     bool Function()? isCancelled,
   }) async {
-    final WorkspaceIO? io = await _ioFor(invocation.agentId);
-    if (io == null) {
-      return ToolOutcome(
-        '无法准备工作空间：${invocation.agentId} 的工作目录不可用，'
-        '或 SSH 配置不完整/尚未接入（详见核心日志）',
-        isError: true,
-      );
+    // 不依赖工作空间的工具（set_todo_list / ask_user_question）先走：工作空间
+    // 不可用（SSH 配置不全等）不该连带它们一起失败。
+    WorkspaceIO? io;
+    if (BuiltinTools.needsWorkspace(invocation.name)) {
+      io = await _ioFor(invocation.agentId);
+      if (io == null) {
+        return ToolOutcome(
+          '无法准备工作空间：${invocation.agentId} 的工作目录不可用，'
+          '或 SSH 配置不完整/尚未接入（详见核心日志）',
+          isError: true,
+        );
+      }
     }
     final ToolOutcome outcome = await BuiltinTools.run(
       invocation,
@@ -94,6 +107,9 @@ class WorkspaceToolRunner implements ToolRunner {
       isCancelled: isCancelled,
       todos: todoStore,
       hooks: hooks,
+      askQuestion: askQuestion,
+      withTodos: todoStore != null,
+      withQuestions: askQuestion != null,
     );
     return _truncate(outcome);
   }

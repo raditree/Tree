@@ -6,6 +6,8 @@ import 'package:tree_protocol/tree_protocol.dart';
 
 import '../agent/agent_engine.dart';
 import '../agent/conversation_service.dart';
+import '../agent/question_broker.dart';
+import '../agent/question_store.dart';
 import '../agent/scripted_agent.dart';
 import '../settings/core_settings.dart';
 import '../store/memory_store.dart';
@@ -41,6 +43,7 @@ class CoreServer {
     required this.settings,
     required this.todoStore,
     required this.hub,
+    required this.questions,
     required this.conversation,
     required this.router,
     required this.stubRouter,
@@ -56,7 +59,6 @@ class CoreServer {
   /// 分组与归属里程碑：
   /// - 团队成员编排：`teammate` / `teammateLog` / `teammateMessage`（M5）
   /// - Spec 详情：`agentSpec`（M5）
-  /// - 提问作答：`questionAnswer`（M5，需 ask_user_question 回路）
   /// - 文件与工作空间：`files` / `fileContent` / `filePdf*` / `fileUpload*` /
   ///   `fileSyncToLocal`（M4 本地执行 + M7 文档能力）
   /// - Git 历史：`workspaceGitLog` / `workspaceGitBranches`（M4）
@@ -65,7 +67,6 @@ class CoreServer {
     ApiPaths.teammateLog,
     ApiPaths.teammateMessage,
     ApiPaths.agentSpec,
-    ApiPaths.questionAnswer,
     ApiPaths.files,
     ApiPaths.fileContent,
     ApiPaths.filePdfInfo,
@@ -97,6 +98,9 @@ class CoreServer {
 
   /// WS 连接注册表与广播。
   final WsHub hub;
+
+  /// 提问回路（M5a）；为 null 时核心不提供 `ask_user_question`（测试/最小骨架）。
+  final QuestionBroker? questions;
 
   /// 会话服务（用户消息 → 流式回复）。
   final ConversationService conversation;
@@ -161,6 +165,7 @@ class CoreServer {
     CoreSettings? settings,
     TodoStore? todoStore,
     AgentEngine? engine,
+    QuestionBroker? questions,
   }) async {
     final HttpServer http = await HttpServer.bind(
       address ?? InternetAddress.loopbackIPv4,
@@ -180,10 +185,12 @@ class CoreServer {
       settings: resolvedSettings,
       todoStore: resolvedTodos,
       hub: hub,
+      questions: questions,
       conversation: ConversationService(
         store: resolvedStore,
         hub: hub,
         settings: resolvedSettings,
+        questions: questions,
         engine: engine ?? ScriptedAgent(chunkDelay: streamChunkDelay),
       ),
       router: CoreRouter(),
@@ -203,11 +210,13 @@ class CoreServer {
   /// 关闭服务并释放全部连接（幂等）。
   Future<void> close({bool force = true}) async {
     conversation.dispose();
+    questions?.dispose();
     // 引擎可能持有 HTTP 连接池（真实 LLM 传输层）：随服务一起释放
     await conversation.engine.close();
     reassembler.clear();
     await hub.closeAll();
     // 先把在途落盘任务写完再关闭监听（write-behind 的收尾）
+    await questions?.questions.flush();
     await store.flush();
     await _http.close(force: force);
   }
@@ -339,8 +348,22 @@ class CoreServer {
         });
         break;
       case WsInboundType.userAnswer:
+        // 作答必须放进 `data` 子对象（前端 message_panel 的口径）；顶层回退
+        // 只是兼容手段。
+        if (!conversation.handleUserAnswer(frame)) {
+          connection.send(<String, dynamic>{
+            'type': WsOutboundType.error,
+            'data': <String, dynamic>{'message': '没有等待回答的问题'},
+          });
+        }
+        break;
       case WsInboundType.cancelQuestion:
-        // M5 交付 ask_user_question 回路时处理；M1 无在途提问
+        if (!conversation.handleCancelQuestion(frame)) {
+          connection.send(<String, dynamic>{
+            'type': WsOutboundType.error,
+            'data': <String, dynamic>{'message': '没有等待回答的问题'},
+          });
+        }
         break;
       case WsInboundType.toolExecResponse:
       case WsInboundType.toolExecProgress:
@@ -406,6 +429,7 @@ class CoreServer {
     router.add('POST', ApiPaths.agentSessionSpecs, _setSessionSpecs);
     router.add('GET', ApiPaths.agentSpecs, _listSpecs);
     router.add('GET', ApiPaths.questions, _listQuestions);
+    router.add('POST', ApiPaths.questionAnswer, _answerQuestion);
     router.add('GET', ApiPaths.settingsFrameRate, _getFrameRate);
     router.add('POST', ApiPaths.settingsFrameRate, _setFrameRate);
     router.add('GET', ApiPaths.settingsRateLimit, _getRateLimit);
@@ -508,12 +532,19 @@ class CoreServer {
     HttpRequest request,
     Map<String, String> params,
   ) async {
-    final bool removed = store.deleteAgent(params['agentId'] ?? '');
+    final String agentId = params['agentId'] ?? '';
+    final bool removed = store.deleteAgent(agentId);
     if (!removed) {
       await writeJson(request, 404, errorBody('agent 不存在'));
       return;
     }
-    await writeJson(request, 200, <String, dynamic>{'success': true});
+    // 提问记录不随会话数据删除：agent 没了还留着提问会让右栏出现孤儿卡片
+    final int questionsRemoved =
+        questions?.questions.removeForAgent(agentId) ?? 0;
+    await writeJson(request, 200, <String, dynamic>{
+      'success': true,
+      if (questionsRemoved > 0) 'questions_removed': questionsRemoved,
+    });
   }
 
   Future<void> _agentModelsInfo(
@@ -767,8 +798,23 @@ class CoreServer {
     await writeJson(request, 200, <String, dynamic>{
       'agent_id': agentId,
       'session_id': sessionId,
-      'messages': ordered.map((CoreMessage m) => m.toJson()).toList(),
+      'messages': ordered.map((CoreMessage m) => _messageJson(m)).toList(),
     });
+  }
+
+  /// 消息的前端形态：提问卡片额外叠加提问记录里的状态与答案。
+  ///
+  /// 消息日志是**只追加**的，`answered` 落盘后永远是 false；真源在提问记录里，
+  /// 因此历史加载时按 `qid == message.id` 覆盖。
+  Map<String, dynamic> _messageJson(CoreMessage message) {
+    final Map<String, dynamic> json = message.toJson();
+    if (message.kind != 'ask_user_question') return json;
+    final QuestionRecord? record = questions?.questions.byId(message.id);
+    if (record == null) return json;
+    json['answered'] = !record.isPending;
+    json['answer'] = record.answer;
+    if (record.options.isNotEmpty) json['options'] = record.options;
+    return json;
   }
 
   Future<void> _clearConversation(
@@ -827,10 +873,63 @@ class CoreServer {
     HttpRequest request,
     Map<String, String> _,
   ) async {
-    // 提问卡片由 ask_user_question 工具产出（M5）
+    final Map<String, String> query = request.uri.queryParameters;
+    final QuestionBroker? broker = questions;
+    final List<QuestionRecord> records = broker == null
+        ? const <QuestionRecord>[]
+        : broker.questions.list(
+            agentId: query['agent_id'],
+            sessionId: query['session_id'],
+          );
+    final String status = query['status'] ?? '';
+    final List<QuestionRecord> filtered = status.isEmpty
+        ? records
+        : records
+              .where((QuestionRecord r) => r.status == status)
+              .toList(growable: false);
+    // 最新的排前面（右栏「问题回复」页的首要需求是看到刚提出的问题）
+    final List<QuestionRecord> ordered = List<QuestionRecord>.of(filtered)
+      ..sort(
+        (QuestionRecord a, QuestionRecord b) =>
+            b.createdAt.compareTo(a.createdAt),
+      );
     await writeJson(request, 200, <String, dynamic>{
-      'questions': <Map<String, dynamic>>[],
-      'total': 0,
+      'questions': ordered.map((QuestionRecord r) => r.toApiJson()).toList(),
+      'total': ordered.length,
+    });
+  }
+
+  /// `POST /api/questions/{qid}/answer`：与 WS `user_answer` 等价（REST 入口）。
+  Future<void> _answerQuestion(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final QuestionBroker? broker = questions;
+    if (broker == null) {
+      await writeJson(request, 501, errorBody('提问回路尚未接入'));
+      return;
+    }
+    final String qid = params['qid'] ?? '';
+    final Map<String, dynamic> body = await readJsonBody(request);
+    final String answer = (body['answer'] ?? '').toString();
+    final QuestionRecord? record = broker.questions.byId(qid);
+    if (record == null) {
+      await writeJson(request, 404, errorBody('没有等待回答的问题'));
+      return;
+    }
+    if (!record.isPending) {
+      await writeJson(request, 400, errorBody('没有等待回答的问题'));
+      return;
+    }
+    // 幂等：并发（WS + REST 同时作答）时只有第一次生效
+    if (!broker.answer(qid, answer)) {
+      await writeJson(request, 400, errorBody('没有等待回答的问题'));
+      return;
+    }
+    await writeJson(request, 200, <String, dynamic>{
+      'success': true,
+      'qid': qid,
+      'status': QuestionStatus.answered,
     });
   }
 

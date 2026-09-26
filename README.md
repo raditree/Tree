@@ -69,7 +69,8 @@ M7 打包时把 `tree_core.exe` 与 `Tree.exe` 放在一起）→ 从应用目�
 | --- | --- |
 | 单独调试/重启核心（不必重启应用） | 先跑 `tree_core.exe --port 8001 --verbose`，再给应用设 `TREE_CORE_URL=http://127.0.0.1:8001` 与 `TREE_CORE_TOKEN=<握手行里的 token>` |
 | 查看核心请求日志 | 核心加 `--verbose`（访问日志走 stderr；stdout 只放握手行） |
-| 只跑核心的协议与链路测试 | `cd packages/tree_core && dart test`（49 例，含真实 HTTP + WS 端到端） |
+| 只跑核心的协议与链路测试 | `cd packages/tree_core && dart test`（239 例，含真实 HTTP + WS 端到端） |
+| 真 SSH 集成测试（本机无 sshd 时自动跳过） | 设 `TREE_SSH_TEST_HOST` / `TREE_SSH_TEST_USER` / `TREE_SSH_TEST_KEY` 后 `cd packages/tree_local_exec && dart test` |
 
 ### 里程碑进度
 
@@ -77,7 +78,14 @@ M7 打包时把 `tree_core.exe` 与 `Tree.exe` 放在一起）→ 从应用目�
 - **M1a**：`tree_core` 回环 HTTP + WS 服务（握手、本地 token 鉴权、路由与覆盖度不变量、WS 分帧与心跳、内存存储、流式回复骨架）
 - **M1b**：前端接管（启动/附着核心、去登录与账号设置，`lib/ui` 零改动对接）
 - **M2**：`~/.tree` 的 yaml（配置）+ jsonl/快照（会话）持久化，替换 M1 的内存存储
-- **M3–M7**：真实 LLM → 工具层 → 团队编排 → 插件/MCP → 文档能力与打包（删除 `server/`）
+- **M3**：真实 LLM（手写 OpenAI 兼容 SSE + 完整工具循环语义：用量累计、上下文裁剪、取消、tool_call 回灌）
+- **M4a**：本机工作空间 IO（read/write/edit/grep/terminal 与进程树终止、非 UTF-8 输出标记）
+- **M4b**：`set_todo_list` + 后台 hook 模式 + SSH 工作空间（dartssh2 传输 + 远端根解析，语义单测 + 门控真机测试）
+- **M4c / M4d**：待办 REST / Git 与模型信息等前端所需路由
+- **M5a**：`ask_user_question` 提问回路（提问落盘 + 卡片帧 + 作答/取消/超时 + 重启补答 + REST 与历史叠加）
+- **M5b–M5d**：团队编排（team/message 工具、broker 队列、成员审核闸门、级联停止）→ Spec 体系
+- **M6**：插件总线 + MCP + 进程外插件宿主
+- **M7**：文档能力（PDF/docx）、`dart compile exe` 打包与安装器、删除 `server/` 与前端多余执行器
 
 ---
 

@@ -7,6 +7,7 @@ import '../store/tree_store.dart';
 import '../util/ids.dart';
 import '../ws/ws_hub.dart';
 import 'agent_engine.dart';
+import 'question_broker.dart';
 import 'scripted_agent.dart';
 
 /// 一次生成任务的取消令牌。
@@ -51,12 +52,17 @@ class ConversationService {
     required this.store,
     required this.hub,
     required this.settings,
+    this.questions,
     AgentEngine? engine,
   }) : engine = engine ?? ScriptedAgent();
 
   final TreeStore store;
   final WsHub hub;
   final CoreSettings settings;
+
+  /// 提问回路（M5a）；为 null 时 `user_answer` / `cancel_question` 帧被忽略。
+  final QuestionBroker? questions;
+
   final AgentEngine engine;
 
   /// 每个 agent 的任务链尾（保证串行）。
@@ -101,13 +107,48 @@ class ConversationService {
   ///
   /// 帧字段：`{type, data:{agent_id, session_id}}`。
   void handleStop(Map<String, dynamic> frame) {
-    final Map<String, dynamic> data =
-        (frame['data'] as Map<String, dynamic>?) ?? <String, dynamic>{};
+    final Map<String, dynamic> data = _dataOf(frame);
     final String agentId =
         (data['agent_id'] as String?) ?? (frame['agent_id'] as String?) ?? '';
+    if (agentId.isEmpty) return;
+    // 先取消在途提问：等待中的工具会立刻拿到 cancelled 结果，工具循环才能收敛。
+    questions?.cancelForAgent(agentId);
     final _RunToken? token = _running[agentId];
     if (token == null) return;
     token.cancelled = true;
+  }
+
+  /// 处理 `user_answer`（`ask_user_question` 的应答）。
+  ///
+  /// 帧口径（前端 `message_panel._handleAskAnswer`）：
+  /// `{type: 'user_answer', data: {question_id, answer}}`。
+  /// 返回是否真的改变了状态（重复作答返回 false，幂等）。
+  bool handleUserAnswer(Map<String, dynamic> frame) {
+    final Map<String, dynamic> data = _dataOf(frame);
+    final String qid =
+        (data['question_id'] ?? data['qid'] ?? frame['question_id'] ?? '')
+            .toString();
+    if (qid.isEmpty) return false;
+    final String answer = (data['answer'] ?? frame['answer'] ?? '').toString();
+    return questions?.answer(qid, answer) ?? false;
+  }
+
+  /// 处理 `cancel_question`（用户放弃作答）。
+  bool handleCancelQuestion(Map<String, dynamic> frame) {
+    final Map<String, dynamic> data = _dataOf(frame);
+    final String qid = (data['question_id'] ?? data['qid'] ?? data['id'] ?? '')
+        .toString();
+    if (qid.isEmpty) return false;
+    return questions?.cancel(qid, reason: '用户取消') ?? false;
+  }
+
+  /// 兼容两种帧形状：`{data: {...}}` 与把字段直接放在顶层。
+  static Map<String, dynamic> _dataOf(Map<String, dynamic> frame) {
+    final Object? raw = frame['data'];
+    if (raw is Map) {
+      return raw.map((dynamic k, dynamic v) => MapEntry(k.toString(), v));
+    }
+    return frame;
   }
 
   /// 后台任务完成后唤醒 agent（terminal hook 模式）。

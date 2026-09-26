@@ -24,6 +24,8 @@ import 'src/version.dart';
 
 export 'src/agent/agent_engine.dart';
 export 'src/agent/conversation_service.dart';
+export 'src/agent/question_broker.dart';
+export 'src/agent/question_store.dart';
 export 'src/agent/scripted_agent.dart';
 export 'src/llm/llm_agent_engine.dart';
 export 'src/llm/llm_session.dart';
@@ -32,6 +34,7 @@ export 'src/llm/llm_types.dart';
 export 'src/llm/openai_codec.dart';
 export 'src/llm/sse_parser.dart';
 export 'src/tool/builtin_tools.dart';
+export 'src/tool/question_channel.dart';
 export 'src/tool/terminal_hooks.dart';
 export 'src/tool/todo_store.dart';
 export 'src/tool/tool_runner.dart';

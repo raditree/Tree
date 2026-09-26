@@ -79,6 +79,13 @@ class TreePaths {
   /// 全局设置文件。
   String get settingsFile => p.join(configDir, 'settings.yaml');
 
+  /// 全部提问的原子快照（跨会话，右侧「问题回复」页用）。
+  ///
+  /// 为什么不像消息那样按会话拆文件：提问是**跨会话**查询的队列（`GET /api/questions`），
+  /// 且单条很小；集中一个文件才能一次原子覆盖、不必扫描目录。会话内的提问卡片
+  /// 另有消息日志承载（`kind = ask_user_question`）。
+  String get questionsFile => p.join(sessionsDataDir, 'questions.json');
+
   /// 单个模型配置文件。
   String modelFile(String modelId) =>
       p.join(modelsDir, '${safeSegment(modelId)}.yaml');
