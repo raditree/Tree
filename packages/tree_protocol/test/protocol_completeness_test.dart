@@ -129,6 +129,41 @@ void main() {
     );
   });
 
+  test('流式序号字段只能来自协议包（不得硬编码 seq 字面量）', () {
+    // 流式增量帧的 seq 是 [WsStreamSeq] 管的跨端契约：核心产出、前端判重，两侧必须
+    // 用同一个字段名与同一套"缺字段 = 未知"口径。任一侧改成别的写法（'seq' /
+    // 'sequence' / 直接索引），去重会**静默失效**（退回 id 级判据、重复渲染正文），
+    // 所以这里按文件登记"非流式帧的 seq 用法"，其余一律必须走 WsStreamSeq。
+    const Map<String, String> registered = <String, String>{
+      'lib/io/websocket_service.dart': '大帧分片 frame_chunk 的分片序号（传输层）',
+      'packages/tree_core/lib/src/ws/ws_hub.dart': '大帧分片 frame_chunk 的分片序号（传输层）',
+      'packages/tree_core/lib/src/ws/inbound_frames.dart': '核心侧重组成大帧时读分片序号',
+      'packages/tree_core/lib/src/plugin/station_instance.dart':
+          '广播站公告板条目的单调序号（站点协议域，非流式帧）',
+    };
+    final RegExp literal = RegExp(r'''['"]seq['"]''');
+    final List<String> offenders = <String>[];
+    for (final String tree in <String>['lib', 'packages/tree_core/lib']) {
+      final Directory dir = Directory('${repoRoot.path}/$tree');
+      if (!dir.existsSync()) continue;
+      for (final FileSystemEntity entity in dir.listSync(recursive: true)) {
+        if (entity is! File || !entity.path.endsWith('.dart')) continue;
+        if (!literal.hasMatch(entity.readAsStringSync())) continue;
+        final String relative = _relativeTo(repoRoot, entity.path);
+        if (registered.containsKey(relative)) continue;
+        offenders.add(relative);
+      }
+    }
+    expect(
+      offenders..sort(),
+      isEmpty,
+      reason:
+          '以下文件硬编码了 seq 字面量：$offenders —— 流式帧请改用 '
+          'WsStreamSeq.field / WsStreamSeq.of()；确属别的协议域（分帧 / 站点等）'
+          '请在 registered 里登记并写明原因',
+    );
+  });
+
   test('常量集合内部无重复且非空', () {
     for (final MapEntry<String, Set<String>> e in <String, Set<String>>{
       'WsInboundType': WsInboundType.all,
@@ -183,6 +218,15 @@ Set<String> _scanTypeLiterals(Directory repoRoot) {
     }
   }
   return found;
+}
+
+/// 相对仓库根、统一用 `/` 分隔的路径（登记表用；Windows 上 listSync 给的是 `\`）。
+String _relativeTo(Directory repoRoot, String path) {
+  String relative = path.replaceFirst(repoRoot.path, '').replaceAll('\\', '/');
+  while (relative.startsWith('/')) {
+    relative = relative.substring(1);
+  }
+  return relative;
 }
 
 /// `register_local_executor` → `registerLocalExecutor`。

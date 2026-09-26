@@ -9,9 +9,18 @@ abstract final class WsOutboundType {
   static const String msgStart = 'msg_start';
 
   /// 段内容增量。
+  ///
+  /// 帧形状：`{type, id, chunk, seq, agent_id, session_id}`。[seq] 是**同一 id 内
+  /// 严格递增的帧序号**（从 [WsStreamSeq.firstSeq] 起，攒帧合并后一帧一个序号），
+  /// 前端据此丢弃"重播的、已经渲染过的增量"；老核心不带该字段，前端退回按 id 去重。
+  /// 语义与兼容口径见 [WsStreamSeq]。
   static const String msgChunk = 'msg_chunk';
 
   /// 段结束。
+  ///
+  /// 帧形状：`{type, id, usage, cancelled, seq?, agent_id, session_id}`。可选的
+  /// [seq] 是**封口水位** = 本段最后一条增量帧的序号（本段没下发过增量时省略）：
+  /// 核心保证"≤ 该序号的增量都已下发完毕"，前端封口时把已消费水位一并推进。
   static const String msgEnd = 'msg_end';
 
   /// 段/轮次的 token 用量（进度条分母为 max_seqlen）。

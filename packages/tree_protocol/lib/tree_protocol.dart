@@ -14,4 +14,5 @@ export 'src/non_protocol_literals.dart';
 export 'src/plugin_ui.dart';
 export 'src/ws_frame.dart';
 export 'src/ws_inbound.dart';
+export 'src/ws_stream_seq.dart';
 export 'src/ws_outbound.dart';

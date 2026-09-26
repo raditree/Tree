@@ -498,7 +498,8 @@ class _MessagePanelState extends State<MessagePanel> {
         }
         // 历史整批重建 = 这批消息都是**已关闭的段**（核心"段关闭即落库"），
         // 正文即终稿 ⇒ 全部封口：此后重播的 msg_chunk 不再往它们身上追加
-        // （M9 重播去重，替代"靠时序碰运气"）。
+        // （M9 重播去重，替代"靠时序碰运气"）。序号水位随之作废（同生命周期，
+        // 见 MessageReplayGuard.resetToHistory）。
         _replayGuard.resetToHistory(_messages.map((ChatMessage m) => m.id));
         // 历史整批重载：驱动 MessageList 无动画直达底部（避免下滑动画）
         _bottomJump = true;
@@ -621,17 +622,29 @@ class _MessagePanelState extends State<MessagePanel> {
       final String id = (data['id'] as String?) ?? '';
       final String chunk = (data['chunk'] as String?) ?? '';
       final int idx = _indexOfMessage(id);
-      // 重播去重：已封口的 id（历史终稿 / 已 msg_end）不再追加——同一片段重播
-      // 就会渲染两遍；没有对应消息的孤立增量同样丢弃（既有行为）。
-      if (!_replayGuard.shouldAppendChunk(id: id, exists: idx >= 0)) {
+      // 单调序号（M9 去重判据）：新核心给每条 msg_chunk 带同一 id 内严格递增的
+      // seq（缺字段 = 老核心 ⇒ null = 未知，退回 id 级判据），见 WsStreamSeq。
+      final int? seq = WsStreamSeq.of(data);
+      // 重播去重：已封口的 id（历史终稿 / 已 msg_end）不再追加；序号不大于已消费
+      // 水位的增量 = 已经渲染过的同一片段被重播（断线补发重播的主要形态）；
+      // 没有对应消息的孤立增量同样丢弃（既有行为）。
+      if (!_replayGuard.shouldAppendChunk(
+        id: id,
+        exists: idx >= 0,
+        seq: seq,
+      )) {
         debugPrint(
-          '[消息] 丢弃增量（${_replayGuard.describe(id: id, exists: idx >= 0)}）: $id',
+          '[消息] 丢弃增量（'
+          '${_replayGuard.describe(id: id, exists: idx >= 0, seq: seq)}）: $id',
         );
         return;
       }
       setState(() {
         _messages[idx].content += chunk;
       });
+      // 判据与记账成对：**放行的这一帧**就是"已消费到的高水位"。放在真正写入
+      // 之后，保证水位只描述"正文里确实有的内容"。
+      _replayGuard.markConsumed(id: id, seq: seq);
     } else if (type == 'msg_end') {
       if (!_isForCurrentSession(data)) return;
       final String id = (data['id'] as String?) ?? '';
@@ -639,6 +652,21 @@ class _MessagePanelState extends State<MessagePanel> {
       // 段关闭即封口：核心保证 msg_end 之前已 flush 全部增量（帧序有保证），
       // 此后该 id 的正文即终稿 ⇒ 再来 msg_chunk 一律是重播。
       _replayGuard.seal(id);
+      // msg_end 的 seq 是**封口水位**（本段最后一条增量帧的序号，老核心不带）。
+      // ① 把水位一并推进：即使封口集合被历史整批重建清掉，更老的重播帧仍被挡住；
+      // ② 位次对不上 = 断线期间确实丢了增量帧（补发队列溢出 / 连接异常），
+      //    显式记一笔——正文补不回来，但绝不静默。
+      final int? sealSeq = WsStreamSeq.of(data);
+      if (sealSeq != null) {
+        final int consumed = _replayGuard.lastConsumedSeq(id) ?? -1;
+        if (consumed != sealSeq) {
+          debugPrint(
+            '[消息] 段封口水位 $sealSeq，本端已消费 $consumed（差 '
+            '${sealSeq - consumed} 帧，断线期间丢失的增量）: $id',
+          );
+        }
+        _replayGuard.markConsumed(id: id, seq: sealSeq);
+      }
       if (idx >= 0) {
         final Map<String, dynamic>? usage =
             (data['usage'] as Map<String, dynamic>?)?.cast<String, dynamic>();
