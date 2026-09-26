@@ -261,6 +261,15 @@ _paceToken 现为每增量 Future.delayed(1ms)（11e1376 引入，常开无开�
 - README.md:174 关于"远端 Git 仍 400"的描述待更新（Wave 3-G）。
 - 真机 SSH 回归留到 Wave 3-G。
 
+### Wave 1-C 追加：超时判据改为心跳判活（提交见 git log feat(m9-c2)）
+- 新增 ssh_liveness.dart（SshLiveness 台账 + SshLinkStaleException）：lastBeatAt / missedCount / isStale，I=10s、N=3 可配；任意成功读/写响应也算心跳并清零丢失。
+- **心跳观测要点（踩坑记录）**：dartssh2 的 SSHClient.ping() 等的是 keepalive 全局请求的回包，_globalRequestReplyQueue 同时被 Success 与 **Failure** 喂（OpenSSH 回 REQUEST_FAILURE，也算回了）；而内置 SSHKeepAlive 把结果全吞掉 → 因此关掉内置心跳（keepAliveInterval: null），自建 Timer 循环，每拍 ping().timeout(I)：**窗口 = 一个心跳间隔（单拍 deadline，不是任务总时长）**。
+- 在途操作显式失败：guard(op) 先查失活，再让 op 与失活信号赛跑；失活即抛 SshLinkStaleException（含「链路失活」「心跳丢失」）；**不关连接**，恢复（成功心跳 / reset / 重连）自动清除标记；流式读取逐块赛跑。
+- 本地 exec：活性 = 进程存活，活着永不超时；**唯一的静态窗口**是「进程已死之后的残余管道收尾」（300ms 输出静默 + 3s 兜底，放弃时取消订阅）——属收尾而非任务上限；主控裁定保留（否则持续输出型后台进程会让工具调用永久挂住，与「不要永久挂起」冲突）。
+- 接口变更：SshTransport.isConnected → SshLiveness get liveness（全仓无包外实现者）。
+- **服务端兼容性提醒**：心跳观测依赖服务端对 keepalive 全局请求有回包（OpenSSH 回 FAILURE 算回）；静默忽略该请求的非常规服务端会被判失活。
+- 验证：dart analyze packages/tree_local_exec 零 issue；包内 103 passed / 1 skipped（新增 17 例）。
+
 ### Wave 2 任务定义（Wave 1-A 收口后启动）
 
 **D — 工具层**（packages/tree_core/lib/src/tool/**、lib/src/spec/**、lib/src/files/file_service.dart，以及 core_server 里 FileService 构造的那一处）
