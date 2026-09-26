@@ -24,12 +24,13 @@ class FlutterWindow : public Win32Window {
                          LPARAM const lparam) noexcept override;
 
  private:
-  // 注册"读取剪贴板图片"的 platform channel（供前端 Ctrl+V 粘贴上传使用）。
-  void RegisterClipboardImageChannel();
+  // 注册剪贴板读取 channel（供前端 Ctrl+V 粘贴上传使用）：
+  // readImage 取单张位图，readFiles 取 CF_HDROP 文件列表（可多个）。
+  void RegisterClipboardChannel();
 
-  // 剪贴板图片 channel 实例（需在窗口生命周期内存活）。
+  // 剪贴板 channel 实例（需在窗口生命周期内存活）。
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
-      clipboard_image_channel_;
+      clipboard_channel_;
 
   // The project to run.
   flutter::DartProject project_;

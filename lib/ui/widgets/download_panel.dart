@@ -1,11 +1,15 @@
 import 'package:flutter/material.dart';
 
 import '../services/download_center.dart';
+import '../services/file_reveal.dart';
 
 /// 左侧活动栏「下载」面板（M8d）。
 ///
 /// 列出全部下载任务（单文件走流式、文件夹是 tar.gz），**每条都标来源 team**：
 /// 同一个列表里会混着不同 agent 工作空间的产物，不标来源就分不清是哪个 agent 下的。
+///
+/// 每行提供「打开文件所在位置」（M9 Q7）：文件夹任务保存的是 tar.gz，定位到的
+/// 就是这个压缩包本身；产物已被移动/删除时给 SnackBar 提示而不是静默失败。
 class DownloadPanel extends StatelessWidget {
   const DownloadPanel({super.key, this.onCollapse});
 
@@ -110,6 +114,23 @@ class DownloadPanel extends StatelessWidget {
     );
   }
 
+  /// 打开文件所在位置（M9 Q7）。
+  ///
+  /// 文件夹任务的 [DownloadTask.savePath] 就是保存对话框选定的 tar.gz 完整路径，
+  /// 因此这里原样交给 [FileReveal]——不做"取父目录/去掉扩展名"的处理。
+  Future<void> _revealInFileManager(
+    BuildContext context,
+    DownloadTask task,
+  ) async {
+    // await 之前取好 messenger，避免异步间隙后再用 context
+    final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
+    final String? error = await FileReveal.reveal(task.savePath);
+    if (error == null) return;
+    messenger.showSnackBar(
+      SnackBar(content: Text(error), duration: const Duration(seconds: 3)),
+    );
+  }
+
   Widget _buildRow(
     BuildContext context,
     DownloadCenter center,
@@ -144,6 +165,15 @@ class DownloadPanel extends StatelessWidget {
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(fontSize: 13, color: cs.onSurface),
                 ),
+              ),
+              // 打开文件所在位置（M9 Q7）：运行中也留可用——单文件下载落盘
+              // 中途路径就已存在，能直接看到进度产出的那个文件
+              IconButton(
+                tooltip: '打开文件所在位置',
+                iconSize: 18,
+                visualDensity: VisualDensity.compact,
+                onPressed: () => _revealInFileManager(context, task),
+                icon: const Icon(Icons.folder_open),
               ),
               if (task.isRunning)
                 IconButton(

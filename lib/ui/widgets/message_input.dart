@@ -7,19 +7,73 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
+/// 一条未发送完的输入草稿（M9 Q6）。
+///
+/// 文本与附件列表**一起**存：只恢复文本会让用户以为附件还在。
+class MessageDraft {
+  const MessageDraft({required this.text, required this.filePaths});
+
+  final String text;
+  final List<String> filePaths;
+}
+
+/// 输入框草稿缓存（M9 Q6）：键 = team + session（见 [MessageInput.cacheKey]）。
+///
+/// 为什么只放内存、不落盘：草稿是"切过去看一眼再切回来"的临时状态，重启后为空
+/// 才是预期；落盘会让用户下次启动看到上次的残留内容。
+/// 为什么由输入框自己管：草稿（文本 + 附件）就是输入控件的内部状态，面板只负责
+/// 把当前 team/session 拼成键传进来。
+class MessageDraftCache {
+  MessageDraftCache._();
+
+  /// 全局单例：输入框会随 agent/会话切换重建，缓存不能跟着丢。
+  static final MessageDraftCache instance = MessageDraftCache._();
+
+  final Map<String, MessageDraft> _drafts = <String, MessageDraft>{};
+
+  /// 读草稿；无缓存返回 null（调用方据此清空输入框）。
+  MessageDraft? read(String key) => _drafts[key];
+
+  /// 写回草稿；文本与附件都为空时删除该键，不留空条目。
+  void write(String key, String text, List<String> filePaths) {
+    if (text.isEmpty && filePaths.isEmpty) {
+      _drafts.remove(key);
+      return;
+    }
+    _drafts[key] = MessageDraft(
+      text: text,
+      filePaths: List<String>.from(filePaths),
+    );
+  }
+
+  /// 清空某个键的草稿（发送成功后调用）。
+  void clear(String key) => _drafts.remove(key);
+
+  /// 清空全部草稿（测试与整体重置用）。
+  void clearAll() => _drafts.clear();
+}
+
 /// 消息输入框组件
 ///
 /// 包含多行输入框、文件上传按钮与发送按钮。
 /// - Enter 发送，Shift+Enter 换行
 /// - 输入为空且无附件时禁用发送按钮
-/// - 发送后清空输入框与附件列表
+/// - 发送后清空输入框与附件列表，并作废该 team+session 的草稿缓存
+/// - Ctrl+V 依次尝试：剪贴板文件列表（可多个）→ 剪贴板位图 → 文件路径文本 → 文本
+/// - [cacheKey] 非空时按 team+session 缓存草稿，切走再切回来内容还在
 class MessageInput extends StatefulWidget {
   /// 发送回调，参数为文本内容与附件文件路径列表
   final void Function(String text, List<String> filePaths) onSend;
 
+  /// 草稿缓存键（调用方用 team + session 拼接）。
+  ///
+  /// 为 null 表示不缓存——复用方（如 teammates 窗口）不传时行为与旧版一致。
+  final String? cacheKey;
+
   const MessageInput({
     super.key,
     required this.onSend,
+    this.cacheKey,
   });
 
   @override
@@ -27,7 +81,8 @@ class MessageInput extends StatefulWidget {
 }
 
 class _MessageInputState extends State<MessageInput> {
-  /// 剪贴板图片读取通道（Windows 原生实现于 flutter_window.cpp）
+  /// 剪贴板读取通道（Windows 原生实现于 flutter_window.cpp）：
+  /// readImage 取单张位图，readFiles 取文件列表（可多个）。
   static const MethodChannel _clipboardChannel =
       MethodChannel('tree/clipboard');
 
@@ -37,15 +92,34 @@ class _MessageInputState extends State<MessageInput> {
   /// 已选择的文件路径列表
   final List<String> _filePaths = [];
 
+  /// 是否正在回填草稿：回填会改 controller 并同步触发监听，但这不是用户编辑，
+  /// 不能写回缓存（否则会把上一个键的文本/附件写进刚切过去的新键）
+  bool _restoringDraft = false;
+
   /// 是否正在拖拽文件经过输入框区域
   bool _isDragging = false;
 
   @override
   void initState() {
     super.initState();
+    // 先回填草稿再挂监听：回填本身会改 controller.value，若监听已挂上，
+    // 就会在 initState 里触发一次多余的 setState。
+    _restoreDraft();
     _controller.addListener(() {
+      _saveDraft();
       if (mounted) setState(() {});
     });
+  }
+
+  @override
+  void didUpdateWidget(covariant MessageInput oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 切换 team/session：旧键的草稿在每次编辑时已写回，这里只需取新键的草稿
+    // （无缓存则清空输入框与附件），避免把上一个会话没发完的内容发到新会话
+    if (oldWidget.cacheKey != widget.cacheKey) {
+      _restoreDraft();
+      setState(() {});
+    }
   }
 
   @override
@@ -59,9 +133,54 @@ class _MessageInputState extends State<MessageInput> {
   bool get _canSend =>
       _controller.text.trim().isNotEmpty || _filePaths.isNotEmpty;
 
+  /// 把当前文本 + 附件写回当前键（编辑即写，切换时无需再补存）
+  void _saveDraft() {
+    if (_restoringDraft) return;
+    final String? key = widget.cacheKey;
+    if (key == null) return;
+    MessageDraftCache.instance.write(key, _controller.text, _filePaths);
+  }
+
+  /// 取当前键的草稿回填输入框与附件（无缓存则清空）
+  void _restoreDraft() {
+    final String? key = widget.cacheKey;
+    final MessageDraft? draft =
+        key == null ? null : MessageDraftCache.instance.read(key);
+    final String text = draft?.text ?? '';
+    // 先换附件再改文本：文本赋值会同步通知监听者，附件必须是新键的那一份
+    _restoringDraft = true;
+    _filePaths
+      ..clear()
+      ..addAll(draft?.filePaths ?? const <String>[]);
+    _controller.value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(offset: text.length),
+    );
+    _restoringDraft = false;
+  }
+
+  /// 追加附件（统一入口：改完立即写回草稿，避免漏掉某个入口导致附件丢失）
+  void _addFiles(Iterable<String> paths) {
+    final List<String> added = paths.where((String p) => p.isNotEmpty).toList();
+    if (added.isEmpty) return;
+    setState(() {
+      _filePaths.addAll(added);
+    });
+    _saveDraft();
+  }
+
+  /// 移除附件（同步写回草稿）
+  void _removeFile(String path) {
+    setState(() {
+      _filePaths.remove(path);
+    });
+    _saveDraft();
+  }
+
   /// 处理发送
   ///
-  /// 先通过回调发出消息，再清空输入框与附件列表。
+  /// 先通过回调发出消息（同步回调返回即视为发送成功），再清空输入框与附件，
+  /// 并作废该 team+session 的草稿——否则切走再切回来会看到已发出的内容又回来了。
   void _handleSend() {
     final String text = _controller.text.trim();
     if (text.isEmpty && _filePaths.isEmpty) return;
@@ -70,6 +189,8 @@ class _MessageInputState extends State<MessageInput> {
     setState(() {
       _filePaths.clear();
     });
+    final String? key = widget.cacheKey;
+    if (key != null) MessageDraftCache.instance.clear(key);
   }
 
   /// 处理键盘事件：Enter 发送，Shift+Enter 换行
@@ -103,31 +224,36 @@ class _MessageInputState extends State<MessageInput> {
   Future<void> _pickFile() async {
     try {
       final List<PlatformFile> picked = await FilePicker.pickFiles();
-      if (picked.isNotEmpty) {
-        setState(() {
-          _filePaths.addAll(
-            picked.map((PlatformFile f) => f.path).whereType<String>(),
-          );
-        });
-      }
+      _addFiles(picked.map((PlatformFile f) => f.path).whereType<String>());
     } catch (e) {
       // 忽略文件选择异常
     }
   }
 
   /// 处理粘贴上传（Ctrl+V）：
-  /// 1) 剪贴板图片 → 保存为临时文件并加入附件；
-  /// 2) 复制的文件路径文本（一个或多个）→ 加入附件；
-  /// 3) 普通文本 → 手动插入输入框当前光标处。
+  /// 1) 剪贴板**文件列表**（CF_HDROP，资源管理器里多选文件复制）→ 全部加入附件；
+  /// 2) 剪贴板位图（截图工具）→ 存为临时文件后加入附件；
+  /// 3) 复制的文件路径文本（一个或多个）→ 加入附件；
+  /// 4) 普通文本 → 手动插入输入框当前光标处。
+  ///
+  /// 文件列表必须排在位图之前：Windows 剪贴板一次只放得下一张位图，多选文件
+  /// 复制只以 CF_HDROP 形式出现；若先取位图，多选文件会被误判成"一张图片"。
   Future<void> _handlePaste() async {
-    // 1) 剪贴板图片
+    // 1) 剪贴板文件列表（可多个）
+    final List<String> files = await _readClipboardFiles();
+    if (files.isNotEmpty) {
+      if (!mounted) return;
+      _addFiles(files);
+      return;
+    }
+    // 2) 剪贴板位图
     final String? imagePath = await _readClipboardImage();
     if (imagePath != null) {
       if (!mounted) return;
-      setState(() => _filePaths.add(imagePath));
+      _addFiles(<String>[imagePath]);
       return;
     }
-    // 2) 剪贴板文本
+    // 3) 剪贴板文本
     ClipboardData? data;
     String text;
     try {
@@ -140,12 +266,30 @@ class _MessageInputState extends State<MessageInput> {
     final List<String> paths = _extractFilePaths(text);
     if (paths.isNotEmpty) {
       if (!mounted) return;
-      setState(() => _filePaths.addAll(paths));
+      _addFiles(paths);
       return;
     }
-    // 3) 普通文本：手动插入（已拦截默认粘贴，需自行插入）
+    // 4) 普通文本：手动插入（已拦截默认粘贴，需自行插入）
     if (!mounted) return;
     _insertText(text);
+  }
+
+  /// 读取剪贴板文件列表（Windows 原生 CF_HDROP，可多个）。
+  ///
+  /// 通道未实现（非 Windows 平台）或剪贴板被其它进程占用时返回空表，
+  /// 由 [_handlePaste] 继续按位图/文本处理，不打断粘贴。
+  Future<List<String>> _readClipboardFiles() async {
+    try {
+      final List<dynamic>? result = await _clipboardChannel
+          .invokeMethod<List<dynamic>>('readFiles');
+      if (result == null) return const <String>[];
+      return result
+          .map((dynamic e) => e.toString())
+          .where((String p) => p.isNotEmpty)
+          .toList();
+    } catch (_) {
+      return const <String>[];
+    }
   }
 
   /// 读取剪贴板图片并保存为临时文件，无图片时返回 null
@@ -294,7 +438,7 @@ class _MessageInputState extends State<MessageInput> {
                   icon: const Icon(Icons.attach_file),
                   onPressed: _pickFile,
                   color: cs.onSurfaceVariant,
-                  tooltip: '上传文件（或直接 Ctrl+V 粘贴图片/文件）',
+                  tooltip: '上传文件（或直接 Ctrl+V 粘贴图片/文件，支持一次粘多个）',
                 ),
                 Expanded(
                   child: Focus(
@@ -358,13 +502,8 @@ class _MessageInputState extends State<MessageInput> {
   void _onDragDone(DropDoneDetails details) {
     setState(() {
       _isDragging = false;
-      for (final xfile in details.files) {
-        final String path = xfile.path;
-        if (path.isNotEmpty) {
-          _filePaths.add(path);
-        }
-      }
     });
+    _addFiles(details.files.map((dynamic f) => f.path as String));
   }
 
   /// 构建已选文件列表（Chip 形式，可删除）
@@ -381,11 +520,7 @@ class _MessageInputState extends State<MessageInput> {
               style: const TextStyle(fontSize: 12),
             ),
             deleteIcon: const Icon(Icons.close, size: 16),
-            onDeleted: () {
-              setState(() {
-                _filePaths.remove(path);
-              });
-            },
+            onDeleted: () => _removeFile(path),
           );
         }).toList(),
       ),

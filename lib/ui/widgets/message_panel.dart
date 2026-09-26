@@ -118,15 +118,17 @@ class _MessagePanelState extends State<MessagePanel> {
   /// SSH 连接配置（host/port/...，供配置表单预填）
   Map<String, dynamic> _sshConfig = <String, dynamic>{};
 
-  /// 当前运行模式：ssh > local > cloud
-  String get _currentMode =>
-      _sshEnabled ? 'ssh' : (_localEnabled ? 'local' : 'cloud');
+  /// 当前运行模式：两态（M9 Q2 删除 cloud），**默认 local**。
+  ///
+  /// 只有明确配置了 SSH 才算远端执行，其余一律本机执行——"无执行器"不是一种
+  /// 可选状态（进入页面/切 team 时会自动落本地，见 [_loadModeSettings]）。
+  String get _currentMode => _sshEnabled ? 'ssh' : 'local';
 
   /// 切换运行模式时的防重入守卫（不再启动任何本地后端，仅防双击）
   bool _togglingMode = false;
 
   /// 当前顶部 agent 的对话是否已开始（发送首条消息后运行模式锁定，
-  /// 防止因后端会话已绑定本地/云端工具而出现模式切换"不生效"的困惑）
+  /// 防止因后端会话已绑定该模式的工具执行位置而出现模式切换"不生效"的困惑）
   bool _modeLocked = false;
 
   /// 各 agent 最近一次回复的 token 用量（agent_id -> usage）。
@@ -218,8 +220,36 @@ class _MessagePanelState extends State<MessagePanel> {
       _sshConfig = SshExecutorService.instance.teamConfig(teamId);
     });
     if (teamId.isNotEmpty) {
+      // 两态模型下不允许停在"无执行器"（M9 Q2）：进入页面/切换 team 后若两个
+      // 执行器都未启用，自动落回本地执行器
+      if (!_localEnabled && !_sshEnabled) {
+        await _enableLocalFallback(teamId);
+      }
       _ensureExecutorsReady(teamId);
     }
+  }
+
+  /// 自动落本地执行器（M9 Q2 删除 cloud 后的兜底）。
+  ///
+  /// 桌面上"本地执行器"等价于"该 agent 未配置 SSH"（见 LocalExecutorService），
+  /// 因此写入本地模式**不弹目录选择**：工作目录留空即用核心默认工作空间，免得
+  /// 每次进入会话都弹一次选目录。写入失败（核心不可达）不报错打断进入——界面
+  /// 仍按默认 local 显示，下次进入或发送前会重试。
+  Future<void> _enableLocalFallback(String teamId) async {
+    try {
+      await LocalExecutorService.instance.setTeamEnabled(teamId, true);
+    } catch (_) {
+      // 核心不可达：保持默认 local 的显示，不做失败弹窗（用户没主动做任何操作）
+    }
+    if (!mounted) return;
+    // 竞态防护：等待期间已切换顶部 agent 时放弃本次回写
+    if (teamId != (widget.selectedAgent?.id ?? '')) return;
+    setState(() {
+      _localEnabled = LocalExecutorService.instance.isTeamEnabled(teamId);
+      _localWorkingDir =
+          LocalExecutorService.instance.teamWorkingDirectory(teamId);
+      _sshEnabled = SshExecutorService.instance.isTeamEnabled(teamId);
+    });
   }
 
   @override
@@ -772,9 +802,8 @@ class _MessagePanelState extends State<MessagePanel> {
   void _handleSend(String text, List<String> filePaths) {
     final Agent? agent = widget.selectedAgent;
     if (agent == null) return;
-    // 发送前懒激活目标 team 的执行器（幂等）：未加载的 team 从持久化恢复
-    // 设置；已启用但未注册的 team 走注册流程。fire-and-forget + 超时兜底，
-    // 绝不阻塞消息发送——若注册未及时完成，后端按"无执行器"回落云端执行。
+    // 发送前懒激活目标 team 的执行器配置（幂等）：未加载的从核心重新读取，
+    // 已启用的走注册/写入流程。fire-and-forget + 超时兜底，绝不阻塞消息发送。
     _ensureExecutorsReady(agent.id);
 
     final List<Attachment> attachments = filePaths
@@ -797,7 +826,7 @@ class _MessagePanelState extends State<MessagePanel> {
       _messages.add(userMessage);
       _scrollRevision++;
       _bottomJump = false;
-      // 发送首条消息后锁定运行模式（后端会话自此绑定本地/云端工具）
+      // 发送首条消息后锁定运行模式（后端会话自此绑定该模式的工具执行位置）
       _modeLocked = true;
     });
 
@@ -812,9 +841,9 @@ class _MessagePanelState extends State<MessagePanel> {
 
   /// 发送前确保目标 team 的执行器状态就绪（幂等懒激活）。
   ///
-  /// 本地注册为单条 WS 消息（毫秒级）；SSH 注册需等后端 ack（最长 15s），
-  /// 因此两步都加超时兜底并 fire-and-forget，失败静默——发送链路不被阻塞，
-  /// 后端在执行器就绪前会按"无执行器"回落云端。
+  /// 桌面端"注册"已等价于读/写该 agent 的配置（见 LocalExecutorService /
+  /// SshExecutorService），这里仍保留超时兜底并 fire-and-forget：配置读取失败
+  /// 不阻塞消息发送，重连与下次进入会重新自愈。
   void _ensureExecutorsReady(String teamId) {
     unawaited(() async {
       try {
@@ -837,16 +866,15 @@ class _MessagePanelState extends State<MessagePanel> {
     return idx >= 0 ? replaced.substring(idx + 1) : replaced;
   }
 
-  /// 切换当前顶部 agent 的运行模式（cloud / local / ssh，三态互斥）。
+  /// 切换当前顶部 agent 的运行模式（local / ssh 两态互斥，M9 Q2 删除 cloud）。
   ///
   /// 开关均面向当前选中 agent 的 teamId 调用（per-team API）：
   /// - 切到 local：若 ssh 已启用先注销 ssh；未选目录则先选目录，再启用本地执行器。
   /// - 切到 ssh：若 local 已启用先注销 local；弹出 SSH 配置表单，确认后注册并等待
   ///   后端 ack（连接测试失败会回显错误）。
-  /// - 切到 cloud：注销 local 与 ssh，恢复云端执行。
   Future<void> _switchMode(String targetMode) async {
     if (_togglingMode) return;
-    // 发送首条消息后会话已绑定本地/云端工具，禁止再切换运行模式
+    // 发送首条消息后会话已绑定该模式的工具执行位置，禁止再切换运行模式
     if (_modeLocked) {
       _showSnackBar('对话已开始，该顶部 agent 的运行模式已锁定，无法切换');
       return;
@@ -858,22 +886,10 @@ class _MessagePanelState extends State<MessagePanel> {
 
     _togglingMode = true;
     try {
-      if (targetMode == 'cloud') {
-        if (current == 'local') {
-          await LocalExecutorService.instance.setTeamEnabled(teamId, false);
-        } else if (current == 'ssh') {
-          await SshExecutorService.instance.disableTeam(teamId);
-        }
-        if (!mounted) return;
-        setState(() {
-          _localEnabled = false;
-          _sshEnabled = false;
-        });
-        _showSnackBar('已切换为云端执行模式（Docker 容器）');
-      } else if (targetMode == 'local') {
+      if (targetMode == 'local') {
         // 移动端（Android/iOS）无桌面文件系统与目录选择能力，本地执行不可用
         if (isMobile) {
-          _showSnackBar('移动端不支持本地执行模式，请使用云端或 SSH 模式');
+          _showSnackBar('移动端不支持本地执行模式，请使用 SSH 模式');
           return;
         }
         // 与 SSH 互斥：先注销 ssh
@@ -993,7 +1009,13 @@ class _MessagePanelState extends State<MessagePanel> {
                         bottomJump: _bottomJump,
                       ),
                     ),
-          if (agent != null) MessageInput(onSend: _handleSend),
+          if (agent != null)
+            MessageInput(
+              // 草稿按 team + session 隔离（M9 Q6）：切 agent/会话各自恢复
+              // 自己没发完的文本与附件，互不串味
+              cacheKey: '${agent.id}::$_currentSessionId',
+              onSend: _handleSend,
+            ),
         ],
       ),
     );
@@ -1089,7 +1111,7 @@ class _MessagePanelState extends State<MessagePanel> {
       ),
       child: Row(
         children: <Widget>[
-          // 运行模式三态开关（消息窗口左上：cloud / local / ssh）
+          // 运行模式两态开关（消息窗口左上：local / ssh，M9 Q2 删除 cloud）
           _buildModeSwitch(cs),
           // 工作目录选择（仅本地模式启用时显示）
           if (_localEnabled) _buildWorkingDirSelector(cs),
@@ -1204,7 +1226,7 @@ class _MessagePanelState extends State<MessagePanel> {
     );
   }
 
-  /// 构建运行模式三态开关（消息窗口左上）
+  /// 构建运行模式两态开关（消息窗口左上，local / ssh）
   Widget _buildModeSwitch(ColorScheme cs) {
     return SizedBox(
       width: 36,

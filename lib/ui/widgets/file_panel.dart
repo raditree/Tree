@@ -137,8 +137,8 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
 
   /// 本地执行模式状态变化（切换开关/选择工作目录）时刷新文件树。
   ///
-  /// 本地模式下文件面板数据源从云端容器切换到用户本机目录，
-  /// 若不刷新则仍显示旧的（容器内）文件列表。
+  /// 切换执行模式会改变文件面板的数据源（本机目录 / 远端工作空间），
+  /// 若不刷新则仍显示上一个数据源的文件列表。
   void _onLocalModeChanged() {
     if (!mounted) return;
     _refreshFileTree();

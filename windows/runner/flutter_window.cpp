@@ -68,6 +68,61 @@ bool ReadClipboardImageBytes(std::vector<uint8_t>& png_out,
   return found;
 }
 
+// 宽字符 → UTF-8：Dart 侧把 std::string 当 UTF-8 解码，路径里的中文必须转换，
+// 否则前端拿到的是乱码路径。
+std::string WideToUtf8(const std::wstring& wide) {
+  if (wide.empty()) {
+    return std::string();
+  }
+  const int wide_length = static_cast<int>(wide.size());
+  const int size = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), wide_length,
+                                       nullptr, 0, nullptr, nullptr);
+  if (size <= 0) {
+    return std::string();
+  }
+  std::string utf8(static_cast<size_t>(size), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), wide_length, utf8.data(), size,
+                      nullptr, nullptr);
+  return utf8;
+}
+
+// 读取剪贴板中的**文件列表**（CF_HDROP）。资源管理器里多选文件复制时只有这种
+// 形式能拿到全部路径（剪贴板位图一次只允许一张），所以 Dart 侧优先用它。
+// 返回 true 表示至少取到一个路径；剪贴板无文件时返回 false（不是错误）。
+bool ReadClipboardFilePaths(std::vector<std::string>& paths_out) {
+  if (!OpenClipboard(nullptr)) {
+    return false;
+  }
+  bool found = false;
+  if (IsClipboardFormatAvailable(CF_HDROP)) {
+    HANDLE handle = GetClipboardData(CF_HDROP);
+    if (handle != nullptr) {
+      // HDROP 句柄只在剪贴板打开期间有效，DragQueryFileW 必须在这段区间内调用
+      HDROP drop = static_cast<HDROP>(handle);
+      const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+      for (UINT i = 0; i < count; ++i) {
+        const UINT length = DragQueryFileW(drop, i, nullptr, 0);
+        if (length == 0) {
+          continue;
+        }
+        std::wstring path(static_cast<size_t>(length) + 1, L'\0');
+        if (DragQueryFileW(drop, i, path.data(), length + 1) == 0) {
+          continue;
+        }
+        path.resize(length);
+        const std::string utf8 = WideToUtf8(path);
+        if (utf8.empty()) {
+          continue;
+        }
+        paths_out.push_back(utf8);
+        found = true;
+      }
+    }
+  }
+  CloseClipboard();
+  return found;
+}
+
 }  // namespace
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
@@ -91,7 +146,7 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
-  RegisterClipboardImageChannel();
+  RegisterClipboardChannel();
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
@@ -114,13 +169,29 @@ void FlutterWindow::OnDestroy() {
   Win32Window::OnDestroy();
 }
 
-void FlutterWindow::RegisterClipboardImageChannel() {
-  clipboard_image_channel_ =
+void FlutterWindow::RegisterClipboardChannel() {
+  clipboard_channel_ =
       std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
           flutter_controller_->engine()->messenger(), "tree/clipboard",
           &flutter::StandardMethodCodec::GetInstance());
-  clipboard_image_channel_->SetMethodCallHandler(
+  clipboard_channel_->SetMethodCallHandler(
       [](const auto& call, auto result) {
+        // 文件列表（可多个）：资源管理器多选文件复制只在这里拿得到
+        if (call.method_name() == "readFiles") {
+          std::vector<std::string> paths;
+          if (!ReadClipboardFilePaths(paths)) {
+            // 剪贴板无文件：返回 null，Dart 侧继续按位图/文本处理
+            result->Success(flutter::EncodableValue());
+            return;
+          }
+          flutter::EncodableList list;
+          list.reserve(paths.size());
+          for (const std::string& path : paths) {
+            list.push_back(flutter::EncodableValue(path));
+          }
+          result->Success(flutter::EncodableValue(list));
+          return;
+        }
         if (call.method_name() != "readImage") {
           result->NotImplemented();
           return;
