@@ -206,6 +206,26 @@
 
 ## 8. 实施记录（WIP，随并行波次更新）
 
+### Wave 1-A 核心 LLM / 设置 / 压缩（packages/tree_core）— 已交付（提交 feat(m9-a)，见 git log）
+| 条目 | 结果 | 要点 |
+|---|---|---|
+| Q8 | 完成 | maxToolTurns 全删；终止条件只剩 取消 / 出错 / 模型给最终文本 |
+| Q1-① | 完成 | estimateTokens = ceil(字符数 / token_scale) 单一标量；token_scale / longest_session_tokens 落 models/<id>.yaml；真实 prompt_tokens 破水位线才学习，区间护栏 [0.2, 20] 外整条丢弃；无 usage 只读不写 |
+| Q1-② | 完成 | 新增 lib/src/llm/llm_result_gate.dart（8000 token、预览 300 字符、落 .self/results/）；只替换送模型那一份，前端与落库留全文；历史重载同样过门控；同 run 同结果只落一份 |
+| Q1-③ | 完成 | 每轮 API 调用前压缩；端点报超限强制压缩一次并重试该轮（**整轮仅一次**，防死循环）；max_seqlen 兜底显式标注；压缩失败/降级用**不落库** message 帧提示（落库会插进上下文让模型回应它） |
+| 1.1 LLM | 完成 | 无总时长上限；判死=心跳丢失（收到任意字节即续期，连续 10s×3 无字节 ⇒ livenessLost）；暴露 isAlive / missedHeartbeats / lastHeartbeatAt |
+
+验证：dart analyze packages/tree_core 零 issue；tree_core 全量 **425 passed / 1 skipped / 1 failed**；flutter analyze 零 issue；app flutter test **81 passed**。
+
+**已知失败（归属 Wave 2-E）**：server_test.dart「推送刷新帧率：同一帧窗口内的增量合并为一条 msg_chunk」——
+_paceToken 现为每增量 Future.delayed(1ms)（11e1376 引入，常开无开关），本机 Windows 计时器粒度约 15.6ms，
+7 个增量实测约 105ms > 50ms 帧窗口，必然切成两帧。修法见 Wave 2 任务定义（令牌桶 + 测试旋钮真正关掉节奏控制），**不得靠放宽断言掩盖**。
+
+**待接线**：
+- 门控与工具层截断的相互作用：WorkspaceToolRunner.maxResultChars = 24000 先截断，门控只覆盖 16000~24000 字符 → 已列入 Wave 2-D（让门控接管）。
+- 真正的状态栏展示需要协议+前端加帧类型（当前用 message 帧）→ 随 Q12 插件布局的状态栏槽位一起做。
+- AgentError 若需带结构化 livenessLost 标志，需改 agent_engine.dart（本轮未动）。
+
 ### Wave 1-B 前端消息区与下载列表（lib/ui、windows/runner、test）— 已交付（提交 feat(m9-b)）
 | 条目 | 结果 | 要点 |
 |---|---|---|
