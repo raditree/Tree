@@ -9,6 +9,16 @@ LLM 驱动的 **agent 团队桌面效率工具**：根据任务难度动态组�
 > **分支说明**：`desktop` 分支正在把后端逻辑迁入前端进程，最终形态是**单机桌面
 > 应用**（无后端、无账号体系、无 Docker/云端模式）。迁移期间下方章节仍描述
 > `main` 分支的"Flutter 前端 + Python 后端"架构，M7 删除 `server/` 后整体改写。
+>
+> **两条线并行开发**：本分支检出在**独立 git worktree** 中，`main`（服务端线）留在
+> 原目录，两条线互不干扰：
+> - 服务端线（`main`）：Flutter 3.7.12 / Dart 2.19.6（旧 SDK 在 `D:\app\flutter\flutter`），
+>   保留 `server/`、`server/data/conversations.db`、`server/.venv` 与全部服务端配置；
+> - 桌面线（`desktop`，本 worktree）：Flutter 3.47.5 / Dart 3.13.4，
+>   核心进程在 `packages/`，长期目标是把 `server/` 整体删除。
+>
+> **两条线之间不迁移数据**：桌面线从空的 `~/.tree` 起步，服务端库（含历史会话与
+> SFT 数据）仍只属于服务端线。
 
 ---
 
@@ -66,7 +76,8 @@ M7 打包时把 `tree_core.exe` 与 `Tree.exe` 放在一起）→ 从应用目�
 - **M0a / M0b**：升级 Flutter 3.47.5 / Dart 3.13.4（放弃 Windows 7/8）；建立 `packages/` 纯 Dart 包骨架；协议冻结 + 完备性门禁
 - **M1a**：`tree_core` 回环 HTTP + WS 服务（握手、本地 token 鉴权、路由与覆盖度不变量、WS 分帧与心跳、内存存储、流式回复骨架）
 - **M1b**：前端接管（启动/附着核心、去登录与账号设置，`lib/ui` 零改动对接）
-- **M2–M7**：`~/.tree` 的 yaml + jsonl 持久化（含 DB 迁移工具）→ 真实 LLM → 工具层 → 团队编排 → 插件/MCP → 文档能力与打包（删除 `server/`）
+- **M2**：`~/.tree` 的 yaml（配置）+ jsonl/快照（会话）持久化，替换 M1 的内存存储
+- **M3–M7**：真实 LLM → 工具层 → 团队编排 → 插件/MCP → 文档能力与打包（删除 `server/`）
 
 ---
 
