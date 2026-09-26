@@ -9,6 +9,9 @@ environment:
 dependencies:
   tree_core:
     path: ../tree_core
+  # 集成测试直接断言进程间握手信封（CoreHandshake）
+  tree_protocol:
+    path: ../tree_protocol
 
 dev_dependencies:
   lints: ^6.0.0

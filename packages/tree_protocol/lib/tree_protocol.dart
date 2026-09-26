@@ -9,6 +9,8 @@ library;
 
 export 'src/api_paths.dart';
 export 'src/core_event.dart';
+export 'src/core_handshake.dart';
 export 'src/non_protocol_literals.dart';
+export 'src/ws_frame.dart';
 export 'src/ws_inbound.dart';
 export 'src/ws_outbound.dart';

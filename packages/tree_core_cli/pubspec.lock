@@ -336,7 +336,7 @@ packages:
     source: path
     version: "0.1.0"
   tree_protocol:
-    dependency: transitive
+    dependency: "direct main"
     description:
       path: "../tree_protocol"
       relative: true

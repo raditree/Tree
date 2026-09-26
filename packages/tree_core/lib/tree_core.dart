@@ -1,29 +1,52 @@
-/// Tree 桌面端核心进程（M0b 骨架）。
+/// Tree 桌面端核心进程（desktop 分支）。
 ///
-/// 设计约束（见 desktop 迁移方案 §5）：
+/// 设计约束（见 desktop 迁移方案 §4/§5）：
 /// - **纯 Dart**：不依赖 Flutter，可用 `dart compile exe` 独立分发；
 /// - **单进程单事件循环**：原 server 的"生成器 + to_thread + 线程安全队列"
 ///   改为 `Stream` + `await`；
 /// - 面向 Flutter UI 暴露**本地回环 HTTP + WS**（协议见 tree_protocol），
-///   使 lib/ui 无需改动。
+///   使 lib/ui 无需改动；
+/// - **零第三方依赖**：便于打包为单文件可执行。
 ///
-/// 后续里程碑在此逐步落地：store（M2）/ llm（M3）/ tool（M4）/ agent（M5）/
-/// plugin+mcp（M6）。
+/// 里程碑进度：
+/// - M1：回环服务（握手/鉴权/路由）+ 内存存储 + WS 流式骨架（本文件所在的包）
+/// - M2：`~/.tree` 的 yaml + jsonl 持久化
+/// - M3：真实 LLM（openai_dart 或手写 SSE）+ 完整 LlmSession 语义
+/// - M4：工具层（本机/SSH 工作空间 IO + 11 个内置工具）
+/// - M5：团队编排（broker 队列、成员审核闸门、级联停止、提问回路）
+/// - M6：插件总线 + MCP（mcp_dart）+ 进程外插件宿主
 library;
 
-import 'package:tree_protocol/tree_protocol.dart';
 import 'package:tree_local_exec/tree_local_exec.dart';
+import 'package:tree_protocol/tree_protocol.dart';
 
-/// 核心版本与骨架自描述（M0b 占位，供 CLI 与测试断言）。
+import 'src/version.dart';
+
+export 'src/agent/conversation_service.dart';
+export 'src/agent/scripted_agent.dart';
+export 'src/server/core_server.dart';
+export 'src/server/http_io.dart';
+export 'src/server/http_router.dart';
+export 'src/settings/core_settings.dart';
+export 'src/store/memory_store.dart';
+export 'src/util/ids.dart';
+export 'src/util/json_time.dart';
+export 'src/util/token.dart';
+export 'src/version.dart';
+export 'src/ws/inbound_frames.dart';
+export 'src/ws/ws_hub.dart';
+
+/// 核心版本与骨架自描述（供 CLI 与测试断言）。
 abstract final class TreeCore {
   /// 核心包版本。
-  static const String version = '0.1.0';
+  static const String version = treeCoreVersion;
 
   /// 协议里保留的 REST 路径数量（骨架自检用）。
   static int get keptApiPathCount => ApiPaths.kept.length;
 
   /// 本机执行原语可用性（M4 前仅报告实现分组数）。
-  static String describe() => 'tree_core $version '
+  static String describe() =>
+      'tree_core $version '
       '(apiPaths=${ApiPaths.kept.length}, '
       'inbound=${WsInboundType.all.length}, '
       'outbound=${WsOutboundType.all.length}, '
