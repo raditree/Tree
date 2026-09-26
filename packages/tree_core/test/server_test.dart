@@ -721,6 +721,18 @@ void main() {
 
     test('推送刷新帧率：同一帧窗口内的增量合并为一条 msg_chunk', () async {
       // 零片间延迟 = 全部增量落在同一帧窗口内；默认 20fps（50ms）下应合并成一帧。
+      // 该旋钮的含义是"不模拟时间"：引擎瞬时产出全部增量，节奏控制（token 管道
+      // 与帧窗口定时器）随之整体关闭，攒帧只在显式 flush 点落地——否则窗口边界
+      // 落在哪一毫秒取决于 OS 计时器粒度（Windows 约 15.6ms）与机器负载，
+      // "合并成一帧"就不再是确定性的。
+      const String content = '合并一下';
+      final String reply = ScriptedAgent.replyFor(content);
+      // **牙齿**：占位引擎按 chunkChars 切片，回复必然是多片；若攒帧失效（每片
+      // 一帧），下面的 hasLength(1) 会立刻失败——本用例证明的是"合并确实发生"，
+      // 不是"引擎只产出了一片"。
+      final ScriptedAgent probe = ScriptedAgent();
+      expect(reply.length, greaterThan(probe.chunkChars));
+
       final CoreServer coalesced = await CoreServer.start(
         streamChunkDelay: Duration.zero,
         enableHeartbeat: false,
@@ -734,7 +746,7 @@ void main() {
       ws.send(<String, dynamic>{
         'type': WsInboundType.userMessage,
         'agent_id': agentId,
-        'content': '合并一下',
+        'content': content,
         'session_id': TreeStore.defaultSessionId,
       });
       await ws.until(
@@ -749,7 +761,7 @@ void main() {
           .toList();
       // 逐 token 片段被攒帧合并：多片内容合成一条帧，且正文完整无缺
       expect(chunks, hasLength(1));
-      expect(chunks.single['chunk'], ScriptedAgent.replyFor('合并一下'));
+      expect(chunks.single['chunk'], reply);
     });
 
     test('stop 中断流式并回 cancelled=true + message 提示', () async {

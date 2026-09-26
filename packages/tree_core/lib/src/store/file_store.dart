@@ -315,7 +315,17 @@ class FileTreeStore implements TreeStore {
     _loadAgent(message.agentId);
     _loadMessages(message.agentId, message.sessionId);
     final String key = _key(message.agentId, message.sessionId);
-    _messages.putIfAbsent(key, () => <CoreMessage>[]).add(message);
+    final List<CoreMessage> list = _messages.putIfAbsent(
+      key,
+      () => <CoreMessage>[],
+    );
+    // 单调序号（Q3）：同毫秒的多条消息在"按时间戳排序"的历史接口里会重排
+    // （`List.sort` 不保证稳定），把落库顺序直接压进时间戳就不会漂移。
+    message.timestamp = monotonicMessageStamp(
+      message.timestamp,
+      list.isEmpty ? 0 : list.last.timestamp,
+    );
+    list.add(message);
     // 预览只关心"最后一条 agent 文本消息"，工具卡片与用户消息不覆盖它
     if (!message.isTool && message.role == 'agent') {
       _preview[key] = message;

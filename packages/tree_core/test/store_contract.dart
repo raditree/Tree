@@ -224,7 +224,10 @@ void runStoreContract(String label, TreeStore Function() create) {
         ),
         isTrue,
       );
-      expect(store.session(agent.id, session.sessionId)?.compactedMessageCount, 0);
+      expect(
+        store.session(agent.id, session.sessionId)?.compactedMessageCount,
+        0,
+      );
       expect(store.session(agent.id, session.sessionId)?.compacted, isFalse);
     });
 
@@ -253,6 +256,30 @@ void runStoreContract(String label, TreeStore Function() create) {
         store.agent(agent.id)!.updatedAt,
         greaterThanOrEqualTo(agentUpdated),
       );
+    });
+
+    test('appendMessage：同一会话内时间戳严格递增（重载顺序不漂移）', () {
+      final CoreAgent agent = store.createAgent(name: 'a');
+      const String sid = TreeStore.defaultSessionId;
+      // 一轮回复里的多条消息（思考段 / 中间正文 / 工具卡片 / 最终回复）常常落在
+      // 同一毫秒；历史接口按时间戳排序而 `List.sort` 不保证稳定，因此落库必须把
+      // 它们抬成严格递增，"追加顺序 = 读回顺序"才成立。
+      const int base = 1700000000000;
+      for (int i = 0; i < 5; i++) {
+        store.appendMessage(text(agent.id, sid, id: 'm$i', timestamp: base));
+      }
+      expect(
+        store
+            .messages(agent.id, sid)
+            .map((CoreMessage m) => m.timestamp)
+            .toList(),
+        <int>[base, base + 1, base + 2, base + 3, base + 4],
+      );
+      // 真实时刻不被推远：比上一条更新的时间戳原样保留
+      store.appendMessage(
+        text(agent.id, sid, id: 'later', timestamp: base + 100),
+      );
+      expect(store.messages(agent.id, sid).last.timestamp, base + 100);
     });
 
     test('messages() 返回不可变视图，改不动底层集合', () {

@@ -2,6 +2,13 @@ import 'records.dart';
 
 export 'records.dart';
 
+/// 消息时间戳的**单调序号**（Q3，见 [TreeStore.appendMessage]）。
+///
+/// [requested] 已经晚于上一条时原样保留（绝不伪造时间）；否则取"上一条 + 1ms"。
+/// 因此它只把**同值/更旧**的抬成严格递增，不会把时间戳推离真实时刻。
+int monotonicMessageStamp(int requested, int previous) =>
+    requested > previous ? requested : previous + 1;
+
 /// 核心进程的存储契约（agent / 会话 / 消息）。
 ///
 /// **接口即契约**：M1 的内存实现（[MemoryStore]）与 M2 的落盘实现
@@ -110,6 +117,13 @@ abstract interface class TreeStore {
   int messageCount(String agentId, String sessionId);
 
   /// 追加一条消息（同时更新所属会话与 agent 的 `updated_at`）。
+  ///
+  /// **单调序号（Q3）**：实现必须把消息时间戳抬成"同一 (agent, session) 内严格
+  /// 递增"（见 [monotonicMessageStamp]）。理由是一轮回复里的多条消息——思考段、
+  /// 中间正文、工具卡片、最终回复——常常落在同一毫秒，而历史接口
+  /// （`GET /api/conversations`）会**按时间戳排序**，Dart 的 `List.sort` 又不
+  /// 保证稳定：同值时间戳会让重载顺序漂移。让"落库顺序"直接体现在时间戳上，
+  /// 追加顺序 = 读回顺序就与任何排序实现无关。
   CoreMessage appendMessage(CoreMessage message);
 
   /// 清空消息；`sessionId` 为 null/空/`all` 时清空该 agent 全部会话。

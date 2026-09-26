@@ -226,6 +226,12 @@ class MemoryStore implements TreeStore {
       _messagesKey(message.agentId, message.sessionId),
       () => <CoreMessage>[],
     );
+    // 单调序号（Q3）：同毫秒的多条消息在"按时间戳排序"的历史接口里会重排
+    // （`List.sort` 不保证稳定），把落库顺序直接压进时间戳就不会漂移。
+    message.timestamp = monotonicMessageStamp(
+      message.timestamp,
+      list.isEmpty ? 0 : list.last.timestamp,
+    );
     list.add(message);
     // updated_at 只前进不后退：消息时间戳理论上递增，但导入/补投的历史消息可能
     // 更旧，此时不应把"最近活跃时间"改回去

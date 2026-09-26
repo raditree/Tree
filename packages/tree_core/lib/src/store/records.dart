@@ -367,7 +367,13 @@ class CoreMessage {
   final String sessionId;
   final String role;
   final String content;
-  final int timestamp;
+
+  /// 消息时间戳（毫秒）。
+  ///
+  /// 不是 final：存储层在追加时把它抬成**同一会话内严格递增**（见
+  /// [TreeStore.appendMessage] 的"单调序号"），这样按时间戳排序的历史接口也不会
+  /// 重排同一轮的多条消息。
+  int timestamp;
   final String kind;
   final String? toolName;
   final Map<String, dynamic>? toolArguments;

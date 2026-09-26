@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:tree_protocol/tree_protocol.dart';
 
@@ -30,8 +31,6 @@ class _PendingMessage {
   Map<String, dynamic>? toolArguments;
   String toolResult = '';
   String toolCallId = '';
-
-  bool get isEmpty => content.isEmpty && kind != 'tool';
 }
 
 /// 会话服务：把 WS 上行的 `user_message` / `stop` 变成"落库 + 流式下行"。
@@ -40,17 +39,24 @@ class _PendingMessage {
 /// 并把本轮产生的消息按事件顺序落库。生成逻辑（真实 LLM / 占位回显）在引擎里，
 /// 因此 M5 的成员编排可以复用同一套事件而无需改这里。
 ///
-/// 帧映射：
-/// - [AgentText] → `msg_start(kind=text)` + `msg_chunk`；
-/// - [AgentThinking] → `msg_start(kind=thinking)` + `msg_chunk`（前端渲染思考卡片）；
-/// - [AgentToolStart]/[AgentToolEnd] → `tool_start`/`tool_end`（工具卡片）；
-/// - [AgentUsage] → `msg_usage`；
+/// 帧映射（Q3 起按**段**下发，与参考实现 `server/agent/chat.py:1984-2210` 一致）：
+/// - [AgentText]：每段一个 `msg_start(kind=text)` + `msg_chunk`…，段遇工具调用
+///   即关闭（`msg_end`）并**独立落库**——工具轮之间的中间正文因此单独成消息，
+///   不会被并进最终回复；
+/// - [AgentThinking]：每段一个 `msg_start(kind=thinking)` + `msg_chunk`…，段遇
+///   正文 / 工具调用 / 提问即关闭并落库（`kind=thinking`）；
+/// - [AgentToolStart]/[AgentToolEnd]：先关掉在开的思考与正文段，再立卡片、填结果
+///   （同 id，落库 `kind=tool`）；
+/// - [AgentUsage] → `msg_usage`（挂在最近开始的段上）；
 /// - [AgentError] → `error` 帧 **+ 一条可见的 agent 文本消息**
 ///   （前端对 `error` 帧是静默忽略的，只发 error 用户会看不到任何反馈）；
-/// - [AgentDone] → 每个流式消息的 `msg_end` + `agent_status(idle)`。
+/// - [AgentDone] → 逐段 `msg_end` + `agent_status(idle)`；结束时仍打开的正文段
+///   就是**最终回复**，整段全文与 usage 都挂在它上面（usage 只挂最后一条）。
 ///
-/// 节奏控制（**均常开、无开关**，见 [CoreSettings]）：
-/// - token 获取帧率：消费文本/思考增量时按帧率让帧（[_paceToken]）；
+/// 节奏控制（Q13，可整体关闭，见 [pacingEnabled]）：
+/// - token 管道：思考 / 正文 / **工具调用参数**共用同一条 [TokenPacer]，口径为
+///   `token = ceil(字符数 / token_scale)`（`util/tokens.dart` 的唯一实现），
+///   速率取 `settings.token_acquisition_rate`；工具结果**直接推**、不延迟；
 /// - 推送刷新帧率：增量攒帧后按帧率合并成一条 `msg_chunk`（[_ChunkPump]）。
 ///
 /// 并发策略：**按 agent 串行**（同一 agent 的多条消息排队执行）。同一会话的
@@ -63,6 +69,8 @@ class ConversationService {
     this.questions,
     this.compaction,
     AgentEngine? engine,
+    this.pacer,
+    this.pacingEnabled,
   }) : engine = engine ?? ScriptedAgent() {
     // 工具循环内压缩（Q1-③）：引擎（调用方构造）不认识存储与压缩服务，压缩服务
     // 也拿不到引擎；会话服务两边都有，因此在这里把钩子接上。没接的引擎只是少了
@@ -84,6 +92,17 @@ class ConversationService {
   final CompactionService? compaction;
 
   final AgentEngine engine;
+
+  /// token 管道节拍器（Q13）；非 null 时**每一轮都复用它**（测试注入可控时钟）。
+  ///
+  /// 为空时按 [settings] 的 token 速率与 [pacingEnabled] 每轮新建一个。
+  final TokenPacer? pacer;
+
+  /// 节奏控制总开关；null = 自动（见 [_pacingByDefault]）。
+  ///
+  /// 关闭后 token 管道直接放行、攒帧也不再看计时器——测试要的是"没有时间轴"的
+  /// 确定性，而不是"用真实计时器伪造一条时间轴"。
+  final bool? pacingEnabled;
 
   /// 每个 agent 的任务链尾（保证串行）。
   final Map<String, Future<void>> _chains = <String, Future<void>>{};
@@ -301,11 +320,26 @@ class ConversationService {
       'agent_id': agent.id,
       'session_id': session.sessionId,
     };
+    // Q13：token 管道（思考 / 正文 / 工具参数**共用一条**）。本轮内复用同一个
+    // 节拍器，三者的时间轴因此连续，速率口径也完全一致。
+    final TokenPacer roundPacer =
+        pacer ??
+        TokenPacer(
+          tokensPerSecond: settings.tokenAcquisitionRate.toDouble(),
+          enabled: pacingEnabled ?? _pacingByDefault,
+        );
+    // 逐模型的字符 → token 比例（Q1-①）：工具参数与思考/正文必须同口径。
+    final double tokenScale =
+        settings.model(agent.modelId)?.tokenScale ?? tokens.defaultTokenScale;
     // 推送刷新帧率：本轮所有流式增量先攒帧，按帧率合并成一条 `msg_chunk` 下发。
     // 内容总量不变（落库用完整文本），只把「逐 token 下发」降为「按帧率下发」，
-    // 避免以 token 速率刷屏。常开、无开关，帧率由设置页调节。
+    // 避免以 token 速率刷屏。帧窗口由设置页调节；节奏控制被整体关闭时（测试旋钮）
+    // 不挂定时器——攒下的增量只在显式 flush 点落地，"同一帧窗口内合并成一帧"
+    // 因此与 OS 计时器粒度无关。
     final _ChunkPump pump = _ChunkPump(
-      frameRate: settings.frameRate,
+      frameWindow: roundPacer.enabled
+          ? frameWindowFor(settings.frameRate)
+          : Duration.zero,
       envelope: envelope,
       hub: hub,
     );
@@ -314,32 +348,112 @@ class ConversationService {
       'data': <String, dynamic>{'agent_id': agent.id, 'status': 'working'},
     });
 
-    // 本轮消息按**事件首次出现的顺序**记录，结束时统一落库：
-    // 这样"界面看到的顺序"与"重载历史后的顺序"一致。
-    final List<_PendingMessage> pending = <_PendingMessage>[];
-    _PendingMessage? textMessage;
-    _PendingMessage? thinkingMessage;
-    final Map<String, _PendingMessage> toolMessages =
+    // ── Q3 消息分段 ──────────────────────────────────────────────────────
+    // 每个 thinking 段 / 正文段 / 工具卡片各自是一条消息。用 `??=` 复用单条消息
+    // 会让所有思考挤进同一张卡片、把工具轮之间的中间正文并进最终回复，最终输出的
+    // 位置也会随第一次 text 事件漂移到最前面。
+    _PendingMessage? thinkingSegment;
+    _PendingMessage? textSegment;
+    final Map<String, _PendingMessage> toolSegments =
         <String, _PendingMessage>{};
+    // 最近开始的段 id：`msg_usage` 要挂在一张已存在的卡片上（工具循环里就挂在
+    // 工具卡片上，与参考实现一致）。
+    String lastSegmentId = '';
+    // 整轮正文：端点没给 usage 时，completion 的兜底口径是**整轮**生成量。
+    final StringBuffer roundText = StringBuffer();
     Map<String, dynamic>? usage;
     bool cancelled = false;
     String? errorMessage;
 
-    void startStreamingMessage(_PendingMessage message) {
+    void startSegment(_PendingMessage message) {
       pump.flush(); // 先把上一批增量落地，保证界面顺序与事件顺序一致
-      pending.add(message);
       hub.broadcast(<String, dynamic>{
         'type': WsOutboundType.msgStart,
         'id': message.id,
         'kind': message.kind,
         ...envelope,
       });
+      lastSegmentId = message.id;
     }
 
     void appendChunk(_PendingMessage message, String delta) {
       // 正文完整写入（落库口径不变），下发则交给 pump 按帧率攒帧合并
       message.content.write(delta);
       pump.add(message.id, delta);
+    }
+
+    // 落库一段：思考段 / 正文段各自独立成消息（中间输出不再并进最终回复），
+    // 工具调用一条一张卡片；空文本不落库。
+    void persistSegment(
+      _PendingMessage message, {
+      Map<String, dynamic>? usage,
+    }) {
+      if (message.kind == 'tool') {
+        if (message.toolName == null) return;
+        store.appendMessage(
+          CoreMessage(
+            id: message.id,
+            agentId: agent.id,
+            sessionId: session.sessionId,
+            role: 'agent',
+            content: '',
+            timestamp: DateTime.now().millisecondsSinceEpoch,
+            kind: 'tool',
+            toolName: message.toolName,
+            toolArguments: message.toolArguments,
+            toolResult: message.toolResult,
+            toolCallId: message.toolCallId.isEmpty ? null : message.toolCallId,
+          ),
+        );
+        return;
+      }
+      final String body = message.content.toString();
+      if (body.isEmpty) return;
+      store.appendMessage(
+        CoreMessage(
+          id: message.id,
+          agentId: agent.id,
+          sessionId: session.sessionId,
+          role: 'agent',
+          content: body,
+          timestamp: DateTime.now().millisecondsSinceEpoch,
+          kind: message.kind,
+          usage: usage,
+        ),
+      );
+    }
+
+    /// 结束一段：`msg_end` + 落库（对应参考实现的 `_close_thinking` / `_close_text`）。
+    void endSegment(
+      _PendingMessage message, {
+      Map<String, dynamic>? usage,
+      bool cancelled = false,
+    }) {
+      pump.flush();
+      hub.broadcast(<String, dynamic>{
+        'type': WsOutboundType.msgEnd,
+        'id': message.id,
+        'usage': usage,
+        'cancelled': cancelled,
+        ...envelope,
+      });
+      persistSegment(message, usage: usage);
+    }
+
+    // thinking 段：遇正文 / 工具调用 / 提问即关闭（独立 id，落库 kind=thinking）。
+    void closeThinking({bool cancelled = false}) {
+      final _PendingMessage? message = thinkingSegment;
+      if (message == null) return;
+      thinkingSegment = null;
+      endSegment(message, cancelled: cancelled); // 思考段不带 usage
+    }
+
+    // text 段：遇工具调用即关闭，且**独立落库**（中间输出不带 usage）。
+    void closeText() {
+      final _PendingMessage? message = textSegment;
+      if (message == null) return;
+      textSegment = null;
+      endSegment(message);
     }
 
     // 自动压缩（M7d-4）：长会话先把早期历史总结掉，再按「摘要 + 近期消息」生成。
@@ -355,29 +469,42 @@ class ConversationService {
         isCancelled: () => token.cancelled,
       )) {
         if (event is AgentText) {
-          final _PendingMessage message = textMessage ??= _PendingMessage(
+          closeThinking(); // thinking 段遇正文即关闭
+          final _PendingMessage message = textSegment ??= _PendingMessage(
             id: CoreIds.message(),
             kind: 'text',
           );
-          if (message.content.isEmpty) startStreamingMessage(message);
+          if (message.content.isEmpty) startSegment(message);
           appendChunk(message, event.delta);
-          await _paceToken();
+          roundText.write(event.delta);
+          await roundPacer.consume(
+            estimateTokens(event.delta, scale: tokenScale),
+          );
         } else if (event is AgentThinking) {
-          final _PendingMessage message = thinkingMessage ??= _PendingMessage(
+          final _PendingMessage message = thinkingSegment ??= _PendingMessage(
             id: CoreIds.message(),
             kind: 'thinking',
           );
-          if (message.content.isEmpty) startStreamingMessage(message);
+          if (message.content.isEmpty) startSegment(message);
           appendChunk(message, event.delta);
-          await _paceToken();
+          await roundPacer.consume(
+            estimateTokens(event.delta, scale: tokenScale),
+          );
         } else if (event is AgentToolStart) {
+          // 工具调用：先关掉在开的思考与正文段（各自 msg_end + 落库），再立卡片
+          closeThinking();
+          closeText();
           final _PendingMessage message =
               _PendingMessage(id: event.id, kind: 'tool')
                 ..toolName = event.name
                 ..toolArguments = event.arguments
                 ..toolCallId = event.callId;
-          toolMessages[event.id] = message;
-          pending.add(message);
+          toolSegments[event.id] = message;
+          // Q13：工具参数按 `字符数 / token_scale` 折算 token，走**同一条** token
+          // 管道排队推送 —— write 这类大参数调用自然产生等待，read 几乎不等待。
+          await roundPacer.consume(
+            estimateTokens(jsonEncode(event.arguments), scale: tokenScale),
+          );
           pump.flush(); // 工具卡片前先落地正文，避免界面顺序错位
           hub.broadcast(<String, dynamic>{
             'type': WsOutboundType.toolStart,
@@ -386,10 +513,12 @@ class ConversationService {
             'arguments': event.arguments,
             ...envelope,
           });
+          lastSegmentId = message.id;
         } else if (event is AgentToolEnd) {
-          final _PendingMessage? message = toolMessages[event.id];
+          final _PendingMessage? message = toolSegments.remove(event.id);
           if (message == null) continue;
           message.toolResult = event.result;
+          // 工具结果**直接推**、不延迟（Q13）：等待只花在参数上；推完即进入下一轮
           pump.flush();
           hub.broadcast(<String, dynamic>{
             'type': WsOutboundType.toolEnd,
@@ -398,12 +527,13 @@ class ConversationService {
             'result': event.result,
             ...envelope,
           });
+          persistSegment(message); // 工具卡片与结果一起落库（与帧同 id）
         } else if (event is AgentUsage) {
           usage = event.usage;
           pump.flush();
           hub.broadcast(<String, dynamic>{
             'type': WsOutboundType.msgUsage,
-            'id': textMessage?.id ?? '',
+            'id': lastSegmentId,
             'usage': event.usage,
             ...envelope,
           });
@@ -420,59 +550,26 @@ class ConversationService {
     // 结束/中断本轮：停表并落地残余增量，保证 msg_end 之前正文已全部下发
     pump.dispose();
 
-    // 端点没给 usage 时用本地估算兜底（前端上下文进度条依赖该字段）
+    // 端点没给 usage 时用本地估算兜底（前端上下文进度条依赖该字段）；
+    // completion 的兜底口径是**整轮正文**（工具循环里模型生成了多轮内容）。
     final Map<String, dynamic> finalUsage =
-        usage ??
-        usageOf(agent, userContent, textMessage?.content.toString() ?? '');
+        usage ?? usageOf(agent, userContent, roundText.toString());
 
-    // 每个已开始的流式消息都要收尾（前端据此结束流式态）
-    for (final _PendingMessage message in pending) {
-      if (message.kind == 'tool') continue;
-      hub.broadcast(<String, dynamic>{
-        'type': WsOutboundType.msgEnd,
-        'id': message.id,
-        'usage': message.kind == 'text' ? finalUsage : null,
-        'cancelled': cancelled,
-        ...envelope,
-      });
+    // 仍在开的思考段：收尾（不带 usage，对应参考实现 finally 里的 _close_thinking）
+    closeThinking(cancelled: cancelled);
+
+    // 结束时仍打开的正文段 = **最终回复**：整段全文 + usage（usage 只挂最后一条）
+    final _PendingMessage? finalText = textSegment;
+    if (finalText != null) {
+      textSegment = null;
+      endSegment(finalText, usage: finalUsage, cancelled: cancelled);
     }
 
-    // 落库（顺序与 UI 一致；空文本不落库）
-    for (final _PendingMessage message in pending) {
-      if (message.kind == 'tool') {
-        if (message.toolName == null) continue;
-        store.appendMessage(
-          CoreMessage(
-            id: message.id,
-            agentId: agent.id,
-            sessionId: session.sessionId,
-            role: 'agent',
-            content: '',
-            timestamp: DateTime.now().millisecondsSinceEpoch,
-            kind: 'tool',
-            toolName: message.toolName,
-            toolArguments: message.toolArguments,
-            toolResult: message.toolResult,
-            toolCallId: message.toolCallId.isEmpty ? null : message.toolCallId,
-          ),
-        );
-        continue;
-      }
-      final String text = message.content.toString();
-      if (text.isEmpty) continue;
-      store.appendMessage(
-        CoreMessage(
-          id: message.id,
-          agentId: agent.id,
-          sessionId: session.sessionId,
-          role: 'agent',
-          content: text,
-          timestamp: DateTime.now().millisecondsSinceEpoch,
-          kind: message.kind,
-          usage: message.kind == 'text' ? finalUsage : null,
-        ),
-      );
+    // 没等到结果的工具卡片（中途取消 / 异常）：照旧落库，历史里不丢这张卡
+    for (final _PendingMessage message in toolSegments.values) {
+      persistSegment(message);
     }
+    toolSegments.clear();
 
     final String? failure = errorMessage;
     if (failure != null) {
@@ -490,15 +587,17 @@ class ConversationService {
     _running.remove(agent.id);
   }
 
-  /// token 获取帧率：每消费一个文本/思考增量后按帧率间隔让出一帧。
+  /// 默认是否做节奏控制。
   ///
-  /// 这是「从 LLM 流取回复」的节奏控制（替代旧的「主动延迟」），常开无开关；
-  /// 取上限值（1000）时约 1ms/增量，等价于逐 token 不限速。
-  Future<void> _paceToken() {
-    final int fps = settings.tokenAcquisitionRate < 1
-        ? 1
-        : settings.tokenAcquisitionRate;
-    return Future<void>.delayed(Duration(microseconds: (1000000 / fps).ceil()));
+  /// [ScriptedAgent.chunkDelay] 是 `CoreServer.start(streamChunkDelay:)` 这个
+  /// 测试旋钮的落点：为 [Duration.zero] 表示"不模拟时间"，一轮事件会在同一批
+  /// 微任务里全部产出。此时再按 token/帧率节流，等于用真实计时器伪造一条时间轴
+  /// ——Windows 的计时器粒度约 15.6ms（6 次 1ms 的延迟实测要 88~96ms，配置
+  /// 1000 token/s 实际只有 ~64 token/s），攒帧断言必然随负载抖动。
+  /// 因此**零延迟 = 关掉节奏控制**；真实引擎（[LlmAgentEngine]）永远按速率节流。
+  bool get _pacingByDefault {
+    final AgentEngine current = engine;
+    return current is! ScriptedAgent || current.chunkDelay > Duration.zero;
   }
 
   /// 推一条完整的 agent 文本消息（`message` 帧）并落库。
@@ -755,27 +854,35 @@ class ConversationService {
   }
 }
 
+/// 推送刷新帧率（帧/秒）→ 帧窗口时长。
+Duration frameWindowFor(int frameRate) {
+  final int fps = frameRate < 1 ? 1 : frameRate;
+  return Duration(microseconds: (1000000 / fps).ceil());
+}
+
 /// 流式「推送刷新帧率」：把同一消息的增量攒帧后按帧率合并成一条 `msg_chunk`。
 ///
 /// 定时器每 `1/帧率` 秒把攒下的增量合并广播一次（同一消息一次一帧）；内容总量
 /// 不变，只是把下发/渲染频率从「token 速率」降到「帧率」。任何非增量帧下发前都
 /// 要先 [flush]，[dispose] 时停表并落地残余，保证界面顺序与事件顺序一致。
+///
+/// [frameWindow] 为 [Duration.zero] 时**不挂定时器**（节奏控制被关闭的测试形态）：
+/// 攒下的增量只在显式 flush 点落地，整轮因此落在"同一帧窗口"里——这是确定性的
+/// 关键，否则窗口边界落在哪一毫秒取决于 OS 计时器粒度与机器负载。
 class _ChunkPump {
   _ChunkPump({
-    required int frameRate,
+    required Duration frameWindow,
     required this.envelope,
     required this.hub,
   }) {
-    final int fps = frameRate < 1 ? 1 : frameRate;
-    _timer = Timer.periodic(
-      Duration(microseconds: (1000000 / fps).ceil()),
-      (_) => flush(),
-    );
+    if (frameWindow > Duration.zero) {
+      _timer = Timer.periodic(frameWindow, (_) => flush());
+    }
   }
 
   final Map<String, dynamic> envelope;
   final WsHub hub;
-  late final Timer _timer;
+  Timer? _timer;
 
   /// 待下发增量：按消息首次出现的顺序保留（Dart Map 保序）。
   final Map<String, StringBuffer> _pending = <String, StringBuffer>{};
@@ -806,7 +913,67 @@ class _ChunkPump {
 
   /// 结束本轮：停表并落地残余增量。
   void dispose() {
-    _timer.cancel();
+    _timer?.cancel();
+    _timer = null;
     flush();
+  }
+}
+
+/// token rate 管道（Q13）：**思考 / 正文 / 工具参数共用**的一条速率节流器。
+///
+/// 口径：`token = ceil(字符数 / token_scale)`（见 `util/tokens.dart`，全局唯一
+/// 换算），速率取设置里的 token 速率（token/秒）。
+///
+/// 为什么是「目标时间轴 + 累计欠账」而不是「每个增量延迟 1/速率」：
+/// - 后者会被 OS 计时器粒度放大成"实际速率随负载抖动"——Windows 上 6 次 1ms 的
+///   `Future.delayed` 实测要 88~96ms，配置 1000 token/s 实际只有 ~64 token/s；
+/// - 这里按 `已消费 token 数 / 速率` 算出**应到达的时刻**（时间轴原点在首次
+///   消费时锚定）：落后于目标就直接放行（欠账一次性补掉，允许突发），超前才等到
+///   目标时刻。平均速率因此恒等于配置值，与计时器粒度无关——与参考实现
+///   `_FramePacer` 的"固定时间步"同一个道理。
+///
+/// 测试可注入 [clock] / [wait]（可控时钟 + 可控睡眠），断言不再依赖真实计时器。
+class TokenPacer {
+  TokenPacer({
+    required this.tokensPerSecond,
+    this.enabled = true,
+    DateTime Function()? clock,
+    Future<void> Function(Duration delay)? wait,
+  }) : _clock = clock ?? DateTime.now,
+       _wait = wait ?? Future<void>.delayed;
+
+  /// 速率（token/秒）；<= 0 视为不限速。
+  final double tokensPerSecond;
+
+  /// 总开关：false 时 [consume] 直接放行（关闭节奏控制，见 [pacingEnabled]）。
+  final bool enabled;
+
+  final DateTime Function() _clock;
+  final Future<void> Function(Duration delay) _wait;
+
+  /// 已消费的 token 数（累计欠账的分子）。
+  double _consumed = 0;
+
+  /// 时间轴原点；首次消费时才锚定，避免把"本轮开始前的等待"算进来。
+  DateTime? _origin;
+
+  /// 已消费的 token 总数（自检 / 测试用）。
+  double get consumedTokens => _consumed;
+
+  /// 消费 [tokens] 个 token 的额度。
+  ///
+  /// 返回时保证"应到达时刻"已到（或本来就已经落后于它）。
+  Future<void> consume(int tokens) async {
+    if (!enabled || tokensPerSecond <= 0 || tokens <= 0) return;
+    final DateTime origin = _origin ??= _clock();
+    _consumed += tokens;
+    final Duration target = Duration(
+      microseconds:
+          (_consumed / tokensPerSecond * Duration.microsecondsPerSecond)
+              .round(),
+    );
+    final Duration lag = target - _clock().difference(origin);
+    if (lag <= Duration.zero) return; // 落后：欠账直接补掉（可突发）
+    await _wait(lag);
   }
 }
