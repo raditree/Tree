@@ -57,7 +57,9 @@ class _PendingMessage {
 /// - token 管道：思考 / 正文 / **工具调用参数**共用同一条 [TokenPacer]，口径为
 ///   `token = ceil(字符数 / token_scale)`（`util/tokens.dart` 的唯一实现），
 ///   速率取 `settings.token_acquisition_rate`；工具结果**直接推**、不延迟；
-/// - 推送刷新帧率：增量攒帧后按帧率合并成一条 `msg_chunk`（[_ChunkPump]）。
+/// - 推送刷新帧率：增量攒帧后按帧率合并成一条 `msg_chunk`（[_ChunkPump]），
+///   同一 message id 内带**严格递增的单调序号**（`WsStreamSeq`）——断线补发队列
+///   原样重播帧时，前端据此把"已经渲染过的同一片段"判掉（M9 重播去重）。
 ///
 /// 并发策略：**按 agent 串行**（同一 agent 的多条消息排队执行）。同一会话的
 /// 流式片段若交错下发，前端的 `msg_chunk` 追加会互相污染。
@@ -429,12 +431,21 @@ class ConversationService {
       Map<String, dynamic>? usage,
       bool cancelled = false,
     }) {
+      // msg_end 之前必须先落地全部增量：这样封口水位才是"本段最后一条增量帧的
+      // 序号"，前端收到的正文也才完整（帧序与事件序一致，见 [_ChunkPump]）。
       pump.flush();
+      // 封口水位（可选字段）：值 = 本段最后一条 `msg_chunk` 的序号，本段没下发过
+      // 增量时**省略**（不是写 0——0 是合法序号，会把第一条增量判成重播）。
+      // 前端封口时把已消费水位一并推进到段末，即使封口集合被历史整批重建清掉，
+      // 更老的重播帧仍会被序号判据挡住（协议见 `WsStreamSeq`）。
+      final int? sealSeq = pump.sealSeq(message.id);
       hub.broadcast(<String, dynamic>{
         'type': WsOutboundType.msgEnd,
         'id': message.id,
         'usage': usage,
         'cancelled': cancelled,
+        // 空值 = 本段没下发过增量：整条字段省略（空值标记由 Dart 的空感知元素负责）
+        WsStreamSeq.field: ?sealSeq,
         ...envelope,
       });
       persistSegment(message, usage: usage);
@@ -866,6 +877,17 @@ Duration frameWindowFor(int frameRate) {
 /// 不变，只是把下发/渲染频率从「token 速率」降到「帧率」。任何非增量帧下发前都
 /// 要先 [flush]，[dispose] 时停表并落地残余，保证界面顺序与事件顺序一致。
 ///
+/// **单调序号**（M9 断线补发重播去重，协议契约见 `WsStreamSeq`）：本类是同一条
+/// `msg_chunk` 的**唯一产出点**，序号因此在这里记账——
+/// - **作用域**：按 message id 各自维护，**跨 id 独立**计数、互不干扰，各自从
+///   [WsStreamSeq.firstSeq] 起；
+/// - **一帧一个序号**：同一帧窗口里被合并的多个增量（多次 [add]）只占**一个**序号
+///   ——序号是"第几帧"（帧计数），不是字节偏移 / token 下标；
+/// - **严格递增**：同一 id 内每下发一条非空 `msg_chunk` 消耗一个序号；空增量不
+///   落帧、也就不占号（否则前端水位会凭空多走一格）；
+/// - **允许缺口**：本类只保证递增，不保证下游一定送达（补发队列溢出会丢最老的帧），
+///   缺口由前端当作"那几帧没送到"处理，不是协议错误。
+///
 /// [frameWindow] 为 [Duration.zero] 时**不挂定时器**（节奏控制被关闭的测试形态）：
 /// 攒下的增量只在显式 flush 点落地，整轮因此落在"同一帧窗口"里——这是确定性的
 /// 关键，否则窗口边界落在哪一毫秒取决于 OS 计时器粒度与机器负载。
@@ -887,9 +909,28 @@ class _ChunkPump {
   /// 待下发增量：按消息首次出现的顺序保留（Dart Map 保序）。
   final Map<String, StringBuffer> _pending = <String, StringBuffer>{};
 
+  /// 每条消息**下一个要用的序号**（缺项 = 该 id 还没下发过任何增量帧）。
+  ///
+  /// 只在下发一条非空 `msg_chunk` 时前进，因此"同一帧窗口合并掉的多个增量"
+  /// 天然只占一个序号。计数器跨 [flush] 存活（攒帧窗口不止一个），随本轮
+  /// pump 一起作废——message id 逐段唯一，不存在跨轮复用的旧水位。
+  final Map<String, int> _nextSeq = <String, int>{};
+
   /// 追加一段增量（同消息的连续增量会在同一帧内合并）。
   void add(String id, String delta) {
     (_pending[id] ??= StringBuffer()).write(delta);
+  }
+
+  /// 该 id 的**封口水位** = 本段最后一条增量帧的序号；本段没下发过增量时返回 null
+  /// （调用方据此**省略** `msg_end` 的序号字段，而不是写 [WsStreamSeq.firstSeq]：
+  /// 0 是合法序号，写成 0 会让前端把第一条增量判成重播）。
+  ///
+  /// 调用方必须先 [flush]：还攒在 [_pending] 里的增量尚未下发，水位不该把它们算作
+  /// "已下发"；而 `msg_end` 的语义是"≤ 该序号的增量都已下发完毕"，所以顺序必须是
+  /// 先 flush 再取封口水位。
+  int? sealSeq(String id) {
+    final int? next = _nextSeq[id];
+    return next == null ? null : next - 1;
   }
 
   /// 把攒下的增量合并成 `msg_chunk` 广播出去。
@@ -901,11 +942,17 @@ class _ChunkPump {
     _pending.clear();
     for (final MapEntry<String, StringBuffer> entry in batch) {
       final String chunk = entry.value.toString();
+      // 空增量不落帧：不占用序号（序号是"第几帧"，不是"第几次 add"）
       if (chunk.isEmpty) continue;
+      // 取号即消费：一条帧一个序号，本 id 的下一条帧顺延。序号写在**帧上**，
+      // 补发队列原样重播时随之回来 —— 前端按 (id, seq) 判重才成立。
+      final int seq = _nextSeq[entry.key] ?? WsStreamSeq.firstSeq;
+      _nextSeq[entry.key] = seq + 1;
       hub.broadcast(<String, dynamic>{
         'type': WsOutboundType.msgChunk,
         'id': entry.key,
         'chunk': chunk,
+        WsStreamSeq.field: seq,
         ...envelope,
       });
     }
