@@ -97,16 +97,38 @@ M7 打包时把 `tree_core.exe` 与 `Tree.exe` 放在一起）→ 从应用目�
 只要核心单文件（例如自己写壳）：`dart run tool/build_core.dart`，默认输出
 `dist/tree_core.exe`（约 10 MB，无需 Dart 运行时）。
 
-安装包（可选，需要 Inno Setup 6 的 `iscc` 在 PATH 上）：
+安装包（可选，需要 Inno Setup 6）：
 
 ```powershell
-dart run tool/package_windows.dart --installer   # 自动带好宏并调用 iscc
-# 或手工：iscc /DAppVersion=1.0.0 /DReleaseDir="<...>\Release" tool\installer\tree-desktop.iss
+dart run tool/package_windows.dart --installer      # 自动探测 iscc 并编译
+dart run tool/package_windows.dart --installer --iscc "D:\app\Inno Setup 6\ISCC.exe"
+# 或手工：ISCC.exe /DAppVersion=1.0.0 /DReleaseDir="<...>\Release" tool\installer\tree-desktop.iss
 ```
 
-`tool/installer/tree-desktop.iss` 会把整个 Release 目录装进 Program Files、建开始
-菜单与桌面快捷方式；**卸载不动 `%APPDATA%\Tree`**（模型密钥、agent 配置、会话记录
-是用户数据，不静默删）。
+`iscc` **不需要在 PATH 上**：脚本会依次探测 PATH 与常见安装目录（`C:\Program Files
+(x86)\Inno Setup 6`、`D:\app\Inno Setup 6`、`%LOCALAPPDATA%\Programs\Inno Setup 6`），
+找不到才提示用 `--iscc` 指定——Inno 默认不把自己加进 PATH，只报「没有 iscc」会让人
+以为装失败了。
+
+`tool/installer/tree-desktop.iss` 会把整个 Release 目录（含 `tree_core.exe` 与
+`pdfium.dll`）装进同一个目录、建开始菜单与桌面快捷方式；
+
+- **默认每用户安装**（`PrivilegesRequired=lowest` → `%LOCALAPPDATA%\Programs`，不弹 UAC）；
+  需要装到 Program Files 时用 `setup.exe /ALLUSERS` 或右键以管理员身份运行；
+- **卸载不动 `%APPDATA%\Tree`**（模型密钥、agent 配置、会话记录是用户数据，不静默删）。
+
+安装包自检（本仓库验证过的流程）：静默装到临时目录 → 检查 `Tree.exe` / `tree_core.exe` /
+`pdfium.dll` / `使用说明.txt` 是否齐 → **用装好的核心跑一遍冒烟与文件写路径测试** →
+静默卸载并确认无残留：
+
+```powershell
+$dir = "$env:TEMP\tree_probe"
+Start-Process -Wait .\dist\installer\tree-desktop-1.0.0-windows-x64-setup.exe `
+  -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/MERGETASKS=\"!desktopicon\"","/DIR=`"$dir`""
+$env:TREE_CORE_EXE = "$dir\tree_core.exe"
+cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
+Start-Process -Wait "$dir\unins000.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART"
+```
 
 门控冒烟测试（验证编译产物本身能起、能握手、能鉴权、能优雅退出）：
 

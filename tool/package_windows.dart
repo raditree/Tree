@@ -22,7 +22,8 @@ import 'package:tree_protocol/tree_protocol.dart';
 ///   --release-dir dir  直接指定已构建的 Release 目录（隐含 --skip-build）
 ///   --out dir          产物目录（默认 dist）
 ///   --version x.y.z    版本号（默认取 pubspec.yaml 里 + 之前的部分）
-///   --installer          额外编译 Inno Setup 安装包（需要 iscc 在 PATH 上）
+///   --iscc path          Inno Setup 的 ISCC.exe（默认自动探测 PATH 与常见安装目录）
+///   --installer          额外编译 Inno Setup 安装包
 ///   --no-zip             只准备便携目录，不压缩
 ///   --skip-verify        跳过"启动打包好的核心读握手"自检
 Future<void> main(List<String> args) async {
@@ -171,11 +172,11 @@ Future<void> _package(List<String> args) async {
 
   // ⑥ 可选：Inno Setup 安装包（本机没装 iscc 时给出手工命令，不假装成功）
   if (options.installer) {
-    final String iscc = _which('iscc') ?? '';
+    final String iscc = options.iscc ?? _findIscc() ?? '';
     if (iscc.isEmpty) {
       stdout.writeln(
-        '== 跳过安装包：PATH 上没有 iscc（Inno Setup）==\n'
-        '   装好 Inno Setup 后执行：\n'
+        '== 跳过安装包：没找到 ISCC.exe ==\n'
+        '   装好 Inno Setup 后可用 --iscc <路径> 指定，或手工执行：\n'
         '   iscc /DAppName=$appName /DAppExe=$appExeName /DAppVersion=$version '
         '/DReleaseDir="${releaseDir.path}" tool/installer/tree-desktop.iss',
       );
@@ -384,6 +385,29 @@ String _dartOf(String flutterRoot) {
   return Platform.resolvedExecutable;
 }
 
+/// 找 Inno Setup 编译器：PATH 优先，其次常见安装目录。
+///
+/// 为什么不能只看 PATH：Inno 的安装器默认**不**把自己加进 PATH（本机就装在
+/// D:\app\Inno Setup 6，直接敲 iscc 是找不到的），只报「没有 iscc」会让用户以为
+/// 没装成功。
+String? _findIscc() {
+  final String? onPath = _which('iscc');
+  if (onPath != null) return onPath;
+  final List<String> roots = <String>[
+    r'C:\Program Files (x86)\Inno Setup 6',
+    r'C:\Program Files\Inno Setup 6',
+    r'D:\app\Inno Setup 6',
+    r'D:\Program Files (x86)\Inno Setup 6',
+    '${Platform.environment['LOCALAPPDATA'] ?? ''}\\Programs\\Inno Setup 6',
+  ];
+  for (final String root in roots) {
+    if (root.trim().isEmpty) continue;
+    final File candidate = File(_join(root, 'ISCC.exe'));
+    if (candidate.existsSync()) return candidate.path;
+  }
+  return null;
+}
+
 String? _which(String exe) {
   final String pathVar = Platform.environment['PATH'] ?? '';
   for (final String dir in pathVar.split(Platform.isWindows ? ';' : ':')) {
@@ -424,6 +448,7 @@ class _UsageError implements Exception {
 class _Options {
   const _Options({
     this.flutter,
+    this.iscc,
     this.skipBuild = false,
     this.releaseDir,
     this.out = 'dist',
@@ -434,6 +459,7 @@ class _Options {
   });
 
   final String? flutter;
+  final String? iscc;
   final bool skipBuild;
   final String? releaseDir;
   final String out;
@@ -444,6 +470,7 @@ class _Options {
 
   static _Options parse(List<String> args) {
     String? flutter;
+    String? iscc;
     String? releaseDir;
     String out = 'dist';
     String? version;
@@ -456,6 +483,8 @@ class _Options {
       switch (args[i]) {
         case '--flutter':
           flutter = value();
+        case '--iscc':
+          iscc = value();
         case '--release-dir':
           releaseDir = value();
           skipBuild = true;
@@ -480,6 +509,7 @@ class _Options {
     }
     return _Options(
       flutter: flutter,
+      iscc: iscc,
       skipBuild: skipBuild,
       releaseDir: releaseDir,
       out: out,

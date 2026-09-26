@@ -46,6 +46,10 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+; 默认**每用户安装**（装到 %LOCALAPPDATA%\Programs，不需要 UAC）；需要装到
+; Program Files 时用 setup.exe /ALLUSERS（会触发提权），或右键以管理员身份运行。
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog commandline
 ; 安装包不带数字签名：Windows 会提示"未知发布者"，这是预期行为（自签名证书反而更糟）
 
 [Languages]
