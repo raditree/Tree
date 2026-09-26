@@ -357,6 +357,24 @@ _paceToken 现为每增量 Future.delayed(1ms)（11e1376 引入，常开无开�
 3. WS 断线补发帧重播可能与前端重连后的历史重拉重复渲染 ⇒ 核对前端是否按 message id 去重。
 4. LLM 传输内部 _HeartbeatCounter 与 LivenessTracker 语义等价 ⇒ 可选统一，本轮不动。
 
+### Wave 3-F / G / I / J / K — 插件体系、插件布局与收尾（均已交付提交）
+| 波次 | 范围 | 结果 |
+|---|---|---|
+| 3-F | tree_core 插件四站 + 插件定义 tool + 插件心跳 | 站点 = 持久化实例（stations.yaml）；触发 = 实例方法 publish/execute/relay/collect；广播站持久公告板；执行站白名单 + 挂载点；中转站键位唯一 + 最细粒度 + fail-open；收集站站点定义 schema + **部分结果 + 未响应者清单**；隔离 fail-closed 四个校验点；自建 plugin_heartbeat 删除、统一 LivenessTracker；插件 degraded 不终止进程 |
+| 3-G | 前端 + 协议：插件布局（Q12） | plugin_ui_manifest/update/action 三类帧 + 四类槽位（activity/panel/status/card）+ 六控件两容器 + 受限渲染器（未知控件占位、markdown 禁图、无 webview）；注册表 team 过滤 fail-closed、manifest = 完整声明；四处接入（活动栏/右栏 Tab/状态栏/消息流卡片） |
+| 3-I | tree_core 执行站挂载 + 工具表刷新 + 运行期四元组 + 1.1 收口 | 八条命令全部有挂载点（fs.* / terminal.exec / agent.message/stop/compact）且按四元组 fail-closed；specsFor 处触发收集站（脏才后台收集，toolTableRefreshCount 证明不重复）；**terminal 删除 timeout_seconds**；**wait_for 删静态 timeout，改活性判据 + unresponsive[] 部分结果** |
+| 3-J | 前端降级展示 + 补发去重 + README | registered + health=degraded 不误判停用（橙色角标 + 说明）；新增 message_replay_guard（按 message id 去重；明确不做内容级去重）；README 补 M9 十四项 + 「心跳判活口径」整节 + 删除陈旧描述 |
+| 3-K | 插件 → 核心请求通道 | PluginHost 入站分三类（响应 / 请求 / 通知），onPluginRequest 必回且只回一条、异常收敛为 -32603；plugin_bus 实现 station/command，**scope 只取插件声明**（不读请求参数，插件不得放大作用域）；撞号用例反证判据有牙齿 |
+
+**主控接线与裁定**
+- 完备性门禁收紧：`WsInboundType.pluginUiAction`（别名）+ core_server 分支路由（插件不在线 ⇒ 显式 error + 日志）；plugin_ui.dart 旧「暂不并入」注释同步去除。
+- WS 判活窗口回到 I=10s/N=3（前端心跳 30s→10s）。
+- barrel 补 7 个 plugin 导出 + execute_mounts。
+- 3-I 超范围改了 team/message_dispatcher.dart（wait_for 实现体所在，无法绕开）：追加式改动，复核后接受。
+- **粘贴诊断修复**：Ctrl+V 拿不到剪贴板文件时不再静默 —— 区分「原生通道缺 readFiles」与「剪贴板无文件」，前者 SnackBar 明说「C++ 改动不会被热重载应用，请重新构建并重启客户端」。
+
+**M9 复现的一处环境教训（值得留档）**：用户报「Ctrl+V 一个文件都传不了」时，实测其正在运行的是**改动前的 Release 产物**（原生无 readFiles、Dart 内核亦为旧版）；拖动上传是旧版就有的 desktop_drop 路径所以仍可用。核实手段：原生函数隔离探针（真实 CF_HDROP → 3 条路径）+ 二进制与 kernel_blob 字串检查 + LNK1104「文件被占用」反证运行中的进程。
+
 ---
 
 ## 9. 变更记录
