@@ -8,7 +8,7 @@ import '../../io/platform_support.dart';
 
 /// 文件同步按钮组件
 ///
-/// 提供三个入口："同步到本地"（选择本地目录后把整棵工作空间复制过去）、
+/// 提供三个入口："同步到本地"（选择本地目录后把当前目录子树复制过去）、
 /// "上传文件"（多选本地文件上传到工作空间 `.input/`）、"上传文件夹"
 /// （递归上传并保留层级）。点击后通过 file_picker 选择路径，再调用核心进程的
 /// 对应接口，过程与结果都由对话框展示。
@@ -22,6 +22,12 @@ class FileSyncButton extends StatelessWidget {
   /// 所属顶层 agent ID（随请求透传，供核心按团队/工作空间定位）
   final String teamId;
 
+  /// 文件树当前所在的工作空间相对目录（空 = 根）。
+  ///
+  /// 「同步到本地」只同步这一层子树（M8b）：文件面板逐层懒加载，用户点进哪个
+  /// 目录就同步哪个目录，不再默认把整棵根拉下来。
+  final String currentPath;
+
   /// 上传成功后的回调（用于通知文件面板刷新）
   final VoidCallback? onUploaded;
 
@@ -29,6 +35,7 @@ class FileSyncButton extends StatelessWidget {
     super.key,
     required this.workspaceId,
     this.teamId = '',
+    this.currentPath = '',
     this.onUploaded,
   });
 
@@ -51,16 +58,18 @@ class FileSyncButton extends StatelessWidget {
     // ignore: use_build_context_synchronously
     if (!context.mounted) return;
 
-    // 展示进度对话框
+    // 只同步当前所在的那层子树（空 = 根）
+    final String scope = currentPath.isEmpty ? '根目录' : currentPath;
     _showProgressDialog(
       context: context,
       title: '同步到本地',
-      statusText: '正在同步文件到 $dirPath ...',
+      statusText: '正在同步 $scope 到 $dirPath ...',
       task: () async {
         try {
           final Map<String, dynamic> result = await ApiService.syncToLocal(
             workspaceId,
             dirPath,
+            path: currentPath,
           );
           final int files = (result['files'] as num?)?.toInt() ?? 0;
           final int bytes = (result['bytes'] as num?)?.toInt() ?? 0;
@@ -179,17 +188,15 @@ class FileSyncButton extends StatelessWidget {
       }
     } on FileSystemException {
       if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('读取文件夹失败，可能无访问权限')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('读取文件夹失败，可能无访问权限')));
       }
       return;
     }
     if (files.isEmpty) {
       if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('文件夹内没有可上传的文件')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('文件夹内没有可上传的文件')));
       }
       return;
     }

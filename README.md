@@ -167,6 +167,7 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 - **M7g**：SSH 远端文件面板——`SshTransport` 增加 SFTP 一层目录列举（名字/类型/大小/mtime），`WorkspaceFiles`（列目录 / 读字节 / 写字节）由 `LocalWorkspaceIO` 与 `SshWorkspaceIO` 各自实现，`FileService` 按 agent 是否配 `ssh:` 分流：list/content/download/pdf_info 读远端字节，分片上传仍是「本地暂存 → complete 时一次 SFTP 写」，`download_folder` 先把子树拉回本地临时目录再本地 tar 打包（远端不一定有 tar，且二进制过 `exec` 会被当文本解码），`syncToLocal` 补上**条数 + 字节双上限**（真机验收在巨大远端根上被拖到超时，光有条数限制挡不住）。真机验收：`open@192.168.0.208:22`（密钥 `~/.ssh/id_ed25519`），`TREE_SSH_TEST_HOST` 门控测试跑通全链路
 - **M7f**：Windows 打包与安装——`tool/package_windows.dart` 一条命令出便携 zip（构建应用 + 用同一 SDK 编译核心到同目录 + 写首次运行说明 + 启动核心读握手自检 + bsdtar 压缩），`tool/installer/tree-desktop.iss` 提供 Inno Setup 安装包（卸载保留 `%APPDATA%\Tree` 用户数据）
 - **M8a**：工作空间根口径与**软约束**——SSH 的根不收窄（`ssh.root` 留空 = 远端登录用户的 `HOME`，`~`/相对路径按远端 HOME 展开），文件面板与工具层同根；系统提示词在运行时追加「工作空间（软约束）」一段（数据/项目文件可能分处根下不同子目录、不得自行收窄），**不落库**且与压缩估算共用同一函数（否则阈值会失真）。顺带修掉前端 SSH 配置弹窗与核心 `SshConfig.parse` 的键名错位（弹窗写 `private_key_path` / `remote_base_dir`，核心只读 `key_path` / `root`，此前私钥会被静默丢弃、远端根永远落回 HOME），弹窗默认值也从 `/` 改为留空
+- **M8b**：按需加载与增量传输——文件面板保持**逐层懒加载**（点开一层才列一层，根目录只发一次 `listdir`），`syncToLocal` 新增 `path`（空 = 根）：「同步到本地」只同步**当前所在目录**，不再默认拉整棵根；远端同步/打包去掉「先全树统计再复制」的双遍遍历，改为**边走边拉边算**（列一层复制一层，触顶即停并回报已处理进度）。真机验收 `open@192.168.0.208`：整棵 3 文件 / 5019 字节，子树 2 文件 / 19 字节
 - **M7（剩余）**：
   - 远端 Git 面板（`gitLog`/`gitBranches` 目前对 SSH 仍返回可读 400：需要经 `exec` 跑 git 再解析输出）；SSH 连接的断线重连策略调优
 

@@ -58,8 +58,7 @@ class FilePanel extends StatefulWidget {
   State<FilePanel> createState() => _FilePanelState();
 }
 
-class _FilePanelState extends State<FilePanel>
-    with TickerProviderStateMixin {
+class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
   /// 顶层 Tab 控制器（0=文件，1=MCP 配置，2=模型信息）
   late final TabController _tabController;
 
@@ -71,6 +70,9 @@ class _FilePanelState extends State<FilePanel>
 
   /// 文件树刷新触发器（上传等操作后递增，触发 FileTree 重新加载）
   int _fileRefreshTrigger = 0;
+
+  /// 文件树当前所在目录（空 = 根）；「同步到本地」按它限定作用域（M8b）
+  String _treePath = '';
 
   /// Git 历史刷新触发器
   int _gitRefreshTrigger = 0;
@@ -111,8 +113,8 @@ class _FilePanelState extends State<FilePanel>
   /// 不再"切 Tab 再切回"也无需整表重拉。
   void _onWorkspaceChanged() {
     if (!mounted) return;
-    final Set<WorkspaceArea>? areas =
-        WorkspaceRefreshService.instance.takeAreas();
+    final Set<WorkspaceArea>? areas = WorkspaceRefreshService.instance
+        .takeAreas();
     if (areas == null || areas.isEmpty) return;
     setState(() {
       if (areas.contains(WorkspaceArea.files)) {
@@ -157,9 +159,15 @@ class _FilePanelState extends State<FilePanel>
       _showSnackBar('正在下载...');
       final Uint8List bytes = isDirectory
           ? await ApiService.downloadFolder(
-              widget.workspaceId, path, teamId: widget.teamId ?? '')
+              widget.workspaceId,
+              path,
+              teamId: widget.teamId ?? '',
+            )
           : await ApiService.downloadFile(
-              widget.workspaceId, path, teamId: widget.teamId ?? '');
+              widget.workspaceId,
+              path,
+              teamId: widget.teamId ?? '',
+            );
 
       // 弹出系统保存对话框（file_picker 13：saveFile 直接接收字节并落盘，返回目标 Uri）
       final Uri? savedUri = await FilePicker.saveFile(
@@ -186,10 +194,7 @@ class _FilePanelState extends State<FilePanel>
   void _showSnackBar(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        duration: const Duration(seconds: 2),
-      ),
+      SnackBar(content: Text(message), duration: const Duration(seconds: 2)),
     );
   }
 
@@ -214,8 +219,7 @@ class _FilePanelState extends State<FilePanel>
               // （列表项、Tab、按钮等）会优先消费，只有点到真正空白处才命中，
               // 不会误伤内容交互。打开 FileViewer 时禁止折叠。
               behavior: HitTestBehavior.translucent,
-              onTap:
-                  _selectedFilePath == null ? widget.onCollapse : null,
+              onTap: _selectedFilePath == null ? widget.onCollapse : null,
               child: TabBarView(
                 controller: _tabController,
                 children: [
@@ -307,16 +311,14 @@ class _FilePanelState extends State<FilePanel>
               ),
               FileSyncButton(
                 workspaceId: widget.workspaceId,
+                teamId: widget.teamId ?? '',
+                currentPath: _treePath,
                 onUploaded: _refreshFileTree,
               ),
             ],
           ),
         ),
-        Divider(
-          height: 1,
-          thickness: 1,
-          color: Theme.of(context).dividerColor,
-        ),
+        Divider(height: 1, thickness: 1, color: Theme.of(context).dividerColor),
         // 内容区域（使用 Stack 叠加 FileViewer 覆盖层）
         Expanded(
           child: Stack(
@@ -330,6 +332,12 @@ class _FilePanelState extends State<FilePanel>
                     teamId: widget.teamId,
                     refreshTrigger: _fileRefreshTrigger,
                     onDownload: _handleDownload,
+                    onPathChanged: (String path) {
+                      if (path == _treePath) return;
+                      setState(() {
+                        _treePath = path;
+                      });
+                    },
                     onFileSelected: (String path) {
                       setState(() {
                         _selectedFilePath = path;
@@ -337,10 +345,10 @@ class _FilePanelState extends State<FilePanel>
                     },
                   ),
                   GitHistory(
-                      workspaceId: widget.workspaceId,
-                      teamId: widget.teamId,
-                      refreshTrigger: _gitRefreshTrigger,
-                    ),
+                    workspaceId: widget.workspaceId,
+                    teamId: widget.teamId,
+                    refreshTrigger: _gitRefreshTrigger,
+                  ),
                   TodoPanel(
                     workspaceId: widget.workspaceId,
                     teamId: widget.teamId,

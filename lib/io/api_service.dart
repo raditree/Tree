@@ -39,9 +39,7 @@ class ApiService {
   /// 核心进程要求全部 `/api/*` 请求携带本地 token；未设置 token 时请求会
   /// 被核心以 401 拒绝（这是编程错误，正常情况下启动流程已设置好）。
   static Map<String, String> _getHeaders() {
-    final headers = <String, String>{
-      'Content-Type': 'application/json',
-    };
+    final headers = <String, String>{'Content-Type': 'application/json'};
     if (_token != null) {
       headers['Authorization'] = 'Bearer $_token';
     }
@@ -73,11 +71,13 @@ class ApiService {
     String path = '',
     String teamId = '',
   }) async {
-    final Map<String, dynamic> data =
-        await _getJson('/api/files/$workspaceId', query: {
-      if (path.isNotEmpty) 'path': path,
-      if (teamId.isNotEmpty) 'team_id': teamId,
-    });
+    final Map<String, dynamic> data = await _getJson(
+      '/api/files/$workspaceId',
+      query: {
+        if (path.isNotEmpty) 'path': path,
+        if (teamId.isNotEmpty) 'team_id': teamId,
+      },
+    );
     final List<dynamic> files = data['files'] as List<dynamic>? ?? [];
     return files
         .map((dynamic e) => FileNode.fromJson(e as Map<String, dynamic>))
@@ -93,11 +93,10 @@ class ApiService {
     String path, {
     String teamId = '',
   }) async {
-    final Map<String, dynamic> data =
-        await _getJson('/api/files/$workspaceId/content', query: {
-      'path': path,
-      if (teamId.isNotEmpty) 'team_id': teamId,
-    });
+    final Map<String, dynamic> data = await _getJson(
+      '/api/files/$workspaceId/content',
+      query: {'path': path, if (teamId.isNotEmpty) 'team_id': teamId},
+    );
     return data['content'] as String? ?? '';
   }
 
@@ -111,12 +110,11 @@ class ApiService {
     String path, {
     String teamId = '',
   }) async {
-    return _getJson('/api/files/$workspaceId/pdf_info', query: {
-      'path': path,
-      if (teamId.isNotEmpty) 'team_id': teamId,
-    });
+    return _getJson(
+      '/api/files/$workspaceId/pdf_info',
+      query: {'path': path, if (teamId.isNotEmpty) 'team_id': teamId},
+    );
   }
-
 
   // ==================== Git 相关接口 ====================
 
@@ -130,14 +128,18 @@ class ApiService {
     int limit = 50,
     String teamId = '',
   }) async {
-    final Map<String, dynamic> data =
-        await _getJson('/api/workspaces/$workspaceId/git/log', query: {
-      'limit': limit.toString(),
-      if (teamId.isNotEmpty) 'team_id': teamId,
-    });
+    final Map<String, dynamic> data = await _getJson(
+      '/api/workspaces/$workspaceId/git/log',
+      query: {
+        'limit': limit.toString(),
+        if (teamId.isNotEmpty) 'team_id': teamId,
+      },
+    );
     final List<dynamic> commits = data['commits'] as List<dynamic>? ?? [];
     return commits
-        .map((dynamic e) => Map<String, dynamic>.from(e as Map<dynamic, dynamic>))
+        .map(
+          (dynamic e) => Map<String, dynamic>.from(e as Map<dynamic, dynamic>),
+        )
         .toList();
   }
 
@@ -150,9 +152,10 @@ class ApiService {
     String workspaceId, {
     String teamId = '',
   }) async {
-    return _getJson('/api/workspaces/$workspaceId/git/branches', query: {
-      if (teamId.isNotEmpty) 'team_id': teamId,
-    });
+    return _getJson(
+      '/api/workspaces/$workspaceId/git/branches',
+      query: {if (teamId.isNotEmpty) 'team_id': teamId},
+    );
   }
 
   // ==================== 文件同步相关接口 ====================
@@ -160,18 +163,23 @@ class ApiService {
   /// 同步工作空间文件到本地目录
   ///
   /// 调用 `POST /api/files/{workspace_id}/syncToLocal`，请求体为
-  /// `{"local_path": "..."}`。核心进程与前端同机，所以核心**直接复制**整棵
-  /// 工作空间（保留相对层级、覆盖同名文件、排除 `.git`），不再走旧后端那套
-  /// "容器内打包 → base64 → 前端解包"。返回
-  /// `{"success": true, "local_path": ..., "files": N, "bytes": N}`，
-  /// 供界面显示复制了多少个文件。
+  /// `{"local_path": "...", "path": "..."}`。核心进程与前端同机，所以核心
+  /// **直接复制**（保留相对层级、覆盖同名文件、排除 `.git`），不再走旧后端那套
+  /// "容器内打包 → base64 → 前端解包"。
+  ///
+  /// [path] 是要同步的工作空间相对子树（空 = 整棵根）。文件面板是逐层懒加载的，
+  /// 调用方应传**当前所在目录**，避免在巨大工作空间上拉起整棵树（M8b）。
+  /// 返回 `{"success": true, "local_path": ..., "path": ..., "files": N,
+  /// "bytes": N}`，供界面显示复制了多少个文件。
   static Future<Map<String, dynamic>> syncToLocal(
     String workspaceId,
-    String localPath,
-  ) async {
-    return _postJson('/api/files/$workspaceId/syncToLocal', body: {
-      'local_path': localPath,
-    });
+    String localPath, {
+    String path = '',
+  }) async {
+    return _postJson(
+      '/api/files/$workspaceId/syncToLocal',
+      body: {'local_path': localPath, if (path.isNotEmpty) 'path': path},
+    );
   }
 
   /// 下载单个文件
@@ -184,10 +192,10 @@ class ApiService {
     String filePath, {
     String teamId = '',
   }) async {
-    final String query =
-        teamId.isNotEmpty ? '?team_id=${Uri.encodeQueryComponent(teamId)}' : '';
-    final Uri uri = Uri.parse(
-        '$baseUrl/api/files/$workspaceId/download$query');
+    final String query = teamId.isNotEmpty
+        ? '?team_id=${Uri.encodeQueryComponent(teamId)}'
+        : '';
+    final Uri uri = Uri.parse('$baseUrl/api/files/$workspaceId/download$query');
     try {
       final http.Response response = await http.post(
         uri,
@@ -220,10 +228,12 @@ class ApiService {
     String folderPath, {
     String teamId = '',
   }) async {
-    final String query =
-        teamId.isNotEmpty ? '?team_id=${Uri.encodeQueryComponent(teamId)}' : '';
-    final Uri uri =
-        Uri.parse('$baseUrl/api/files/$workspaceId/download_folder$query');
+    final String query = teamId.isNotEmpty
+        ? '?team_id=${Uri.encodeQueryComponent(teamId)}'
+        : '';
+    final Uri uri = Uri.parse(
+      '$baseUrl/api/files/$workspaceId/download_folder$query',
+    );
     try {
       final http.Response response = await http.post(
         uri,
@@ -322,10 +332,7 @@ class ApiService {
     final Map<String, dynamic> done = await _postJson(
       '/api/files/$workspaceId/upload_complete',
       query: query,
-      body: <String, dynamic>{
-        'upload_id': uploadId,
-        'total_chunks': index,
-      },
+      body: <String, dynamic>{'upload_id': uploadId, 'total_chunks': index},
     );
     if (done['success'] != true) {
       throw Exception('上传失败：${done['detail'] ?? done['path'] ?? '未知错误'}');
@@ -349,7 +356,9 @@ class ApiService {
     );
     final List<dynamic> messages = data['messages'] as List<dynamic>? ?? [];
     return messages
-        .map((dynamic e) => Map<String, dynamic>.from(e as Map<dynamic, dynamic>))
+        .map(
+          (dynamic e) => Map<String, dynamic>.from(e as Map<dynamic, dynamic>),
+        )
         .toList();
   }
 
@@ -394,7 +403,9 @@ class ApiService {
     final Map<String, dynamic> data = await _getJson('/api/models');
     final List<dynamic> models = data['models'] as List<dynamic>? ?? [];
     return models
-        .map((dynamic e) => Map<String, dynamic>.from(e as Map<dynamic, dynamic>))
+        .map(
+          (dynamic e) => Map<String, dynamic>.from(e as Map<dynamic, dynamic>),
+        )
         .toList();
   }
 
@@ -427,16 +438,19 @@ class ApiService {
     int? maxLevel,
     int? maxMembersPerLevel,
   }) async {
-    final Map<String, dynamic> data = await _postJson('/api/agents', body: {
-      'name': name,
-      'model_id': modelId,
-      'system_prompt': systemPrompt,
-      if (teamMemberCount != null && teamMemberCount > 0)
-        'team_member_count': teamMemberCount,
-      if (maxLevel != null && maxLevel > 0) 'max_level': maxLevel,
-      if (maxMembersPerLevel != null && maxMembersPerLevel > 0)
-        'max_members_per_level': maxMembersPerLevel,
-    });
+    final Map<String, dynamic> data = await _postJson(
+      '/api/agents',
+      body: {
+        'name': name,
+        'model_id': modelId,
+        'system_prompt': systemPrompt,
+        if (teamMemberCount != null && teamMemberCount > 0)
+          'team_member_count': teamMemberCount,
+        if (maxLevel != null && maxLevel > 0) 'max_level': maxLevel,
+        if (maxMembersPerLevel != null && maxMembersPerLevel > 0)
+          'max_members_per_level': maxMembersPerLevel,
+      },
+    );
     return Agent.fromJson(data['agent'] as Map<String, dynamic>);
   }
 
@@ -446,8 +460,10 @@ class ApiService {
   static Future<void> deleteAgent(String agentId) async {
     final Uri uri = Uri.parse('$baseUrl/api/agents/$agentId');
     try {
-      final http.Response response =
-          await http.delete(uri, headers: _getHeaders());
+      final http.Response response = await http.delete(
+        uri,
+        headers: _getHeaders(),
+      );
       if (response.statusCode != 200) {
         throw Exception('删除失败（HTTP ${response.statusCode}）');
       }
@@ -479,19 +495,22 @@ class ApiService {
     Map<String, dynamic>? ssh,
     bool clearSsh = false,
   }) async {
-    return _patchJson('/api/agents/$agentId', body: {
-      if (modelId != null && modelId.isNotEmpty) 'model_id': modelId,
-      'system_prompt': ?systemPrompt,
-      if (reasoningEffort != null && reasoningEffort.isNotEmpty)
-        'reasoning_effort': reasoningEffort,
-      'max_seqlen': ?maxSeqlen,
-      'max_output_tokens': ?maxOutputTokens,
-      'compress_threshold': ?compressThreshold,
-      if (clearOverrides) 'clear_model_overrides': true,
-      'workspace_dir': ?workspaceDir,
-      'ssh': ?ssh,
-      if (clearSsh) 'ssh': null,
-    });
+    return _patchJson(
+      '/api/agents/$agentId',
+      body: {
+        if (modelId != null && modelId.isNotEmpty) 'model_id': modelId,
+        'system_prompt': ?systemPrompt,
+        if (reasoningEffort != null && reasoningEffort.isNotEmpty)
+          'reasoning_effort': reasoningEffort,
+        'max_seqlen': ?maxSeqlen,
+        'max_output_tokens': ?maxOutputTokens,
+        'compress_threshold': ?compressThreshold,
+        if (clearOverrides) 'clear_model_overrides': true,
+        'workspace_dir': ?workspaceDir,
+        'ssh': ?ssh,
+        if (clearSsh) 'ssh': null,
+      },
+    );
   }
 
   /// 获取单个 agent 的完整配置（含 SSH 的非机密字段与工作目录）。
@@ -574,10 +593,15 @@ class ApiService {
   /// 总开关关闭时后端仍返回 200 + `enabled: false`（空集）。
   /// 前端对响应做宽容解析（缺字段/未知字段容忍），此处不做校验。
   /// 网络异常或核心进程返回错误时抛出中文异常。
-  static Future<Map<String, dynamic>> getPluginSnapshot({String? teamId}) async {
-    return _getJson('/api/plugin/snapshot', query: <String, String>{
-      if (teamId != null && teamId.isNotEmpty) 'team_id': teamId,
-    });
+  static Future<Map<String, dynamic>> getPluginSnapshot({
+    String? teamId,
+  }) async {
+    return _getJson(
+      '/api/plugin/snapshot',
+      query: <String, String>{
+        if (teamId != null && teamId.isNotEmpty) 'team_id': teamId,
+      },
+    );
   }
 
   // ==================== MCP 服务管理接口（右栏 MCP 配置页） ====================
@@ -590,7 +614,9 @@ class ApiService {
     final Map<String, dynamic> data = await _getJson('/api/mcp/services');
     final List<dynamic> services = data['services'] as List<dynamic>? ?? [];
     return services
-        .map((dynamic e) => Map<String, dynamic>.from(e as Map<dynamic, dynamic>))
+        .map(
+          (dynamic e) => Map<String, dynamic>.from(e as Map<dynamic, dynamic>),
+        )
         .toList();
   }
 
@@ -607,13 +633,16 @@ class ApiService {
     String scope = '',
     Map<String, String> env = const <String, String>{},
   }) async {
-    return _postJson('/api/mcp/services', body: {
-      'name': name,
-      'command': command,
-      'args': args,
-      'scope': scope,
-      'env': env,
-    });
+    return _postJson(
+      '/api/mcp/services',
+      body: {
+        'name': name,
+        'command': command,
+        'args': args,
+        'scope': scope,
+        'env': env,
+      },
+    );
   }
 
   /// 删除一个 MCP 服务
@@ -625,8 +654,10 @@ class ApiService {
       '$baseUrl/api/mcp/services/${Uri.encodeComponent(name)}',
     );
     try {
-      final http.Response response =
-          await http.delete(uri, headers: _getHeaders());
+      final http.Response response = await http.delete(
+        uri,
+        headers: _getHeaders(),
+      );
       if (response.statusCode != 200) {
         throw Exception(_errorFromBody(response));
       }
@@ -672,8 +703,9 @@ class ApiService {
   /// 调用 `GET /api/agents/{agentId}/sessions`，返回
   /// `{"agent_id": "...", "sessions": [...]}`。
   static Future<List<ChatSession>> getSessions(String agentId) async {
-    final Map<String, dynamic> data =
-        await _getJson('/api/agents/$agentId/sessions');
+    final Map<String, dynamic> data = await _getJson(
+      '/api/agents/$agentId/sessions',
+    );
     final List<dynamic> sessions = data['sessions'] as List<dynamic>? ?? [];
     return sessions
         .map((dynamic e) => ChatSession.fromJson(e as Map<String, dynamic>))
@@ -728,8 +760,9 @@ class ApiService {
   ///
   /// 调用 `DELETE /api/agents/{agentId}/sessions/{sessionId}`。
   static Future<void> deleteSession(String agentId, String sessionId) async {
-    final Uri uri =
-        Uri.parse('$baseUrl/api/agents/$agentId/sessions/$sessionId');
+    final Uri uri = Uri.parse(
+      '$baseUrl/api/agents/$agentId/sessions/$sessionId',
+    );
     try {
       final http.Response response = await http.delete(
         uri,
@@ -770,9 +803,10 @@ class ApiService {
     String agentId, {
     String sessionId = '',
   }) async {
-    return _getJson('/api/agents/$agentId/specs', query: {
-      if (sessionId.isNotEmpty) 'session_id': sessionId,
-    });
+    return _getJson(
+      '/api/agents/$agentId/specs',
+      query: {if (sessionId.isNotEmpty) 'session_id': sessionId},
+    );
   }
 
   /// 获取单个 Spec 详情（元数据 + 全文）
@@ -790,17 +824,21 @@ class ApiService {
   ///
   /// 返回体含 `members` 与 `pending_member_count`（等待用户处理的成员数，
   /// 未分配模型 / 待审核）。只取成员列表的兼容入口见 [getTeammates]。
-  static Future<Map<String, dynamic>> getTeammatesPayload(String agentId) async {
+  static Future<Map<String, dynamic>> getTeammatesPayload(
+    String agentId,
+  ) async {
     return _getJson('/api/agents/$agentId/teammates');
   }
 
   /// 拉取某 agent 的团队成员列表（兼容入口：只要 `members`）
-  static Future<List<Map<String, dynamic>>> getTeammates(
-      String agentId) async {
+  static Future<List<Map<String, dynamic>>> getTeammates(String agentId) async {
     final Map<String, dynamic> data = await getTeammatesPayload(agentId);
     final List<dynamic>? members = data['members'] as List<dynamic>?;
     return members
-            ?.map((dynamic e) => (e as Map<String, dynamic>).cast<String, dynamic>())
+            ?.map(
+              (dynamic e) =>
+                  (e as Map<String, dynamic>).cast<String, dynamic>(),
+            )
             .toList() ??
         <Map<String, dynamic>>[];
   }
@@ -832,10 +870,7 @@ class ApiService {
         body[key] = value;
       });
     }
-    return _patchJson(
-      '/api/agents/$leaderId/teammate/$memberId',
-      body: body,
-    );
+    return _patchJson('/api/agents/$leaderId/teammate/$memberId', body: body);
   }
 
   /// 按 user_id + agent_id + session_id 查询该 agent 当前会话的追加 todos
@@ -849,7 +884,10 @@ class ApiService {
     );
     final List<dynamic>? todos = data['todos'] as List<dynamic>?;
     return todos
-            ?.map((dynamic e) => (e as Map<String, dynamic>).cast<String, dynamic>())
+            ?.map(
+              (dynamic e) =>
+                  (e as Map<String, dynamic>).cast<String, dynamic>(),
+            )
             .toList() ??
         <Map<String, dynamic>>[];
   }
@@ -859,7 +897,10 @@ class ApiService {
   /// 注意：成员进度详情页的「日志」Tab 已移除（用户侧更需要的是赋模型入口），
   /// 成员日志现由 leader agent 直接 read/grep 共享工作目录。本方法保留供排查
   /// 问题与后续复用，当前无 UI 调用方。
-  static Future<String> getTeammateLog(String memberId, {int lines = 60}) async {
+  static Future<String> getTeammateLog(
+    String memberId, {
+    int lines = 60,
+  }) async {
     final Map<String, dynamic> data = await _getJson(
       '/api/agents/$memberId/teammate/$memberId/log',
       query: {'lines': '$lines'},
@@ -879,8 +920,7 @@ class ApiService {
       body: {
         'content': content,
         // 会话隔离：携带当前会话 id，避免成员消息串入默认会话
-        if (sessionId != null && sessionId.isNotEmpty)
-          'session_id': sessionId,
+        if (sessionId != null && sessionId.isNotEmpty) 'session_id': sessionId,
       },
     );
   }
@@ -888,8 +928,9 @@ class ApiService {
   /// 列出当前用户的提问（可选按会话过滤），供右侧「问题回复」页使用。
   ///
   /// ``sessionId`` 为空时返回全部提问（含各 agent 与成员提问）。
-  static Future<List<Map<String, dynamic>>> getQuestions(
-      {String? sessionId}) async {
+  static Future<List<Map<String, dynamic>>> getQuestions({
+    String? sessionId,
+  }) async {
     final Map<String, dynamic> data = await _getJson(
       '/api/questions',
       query: (sessionId != null && sessionId.isNotEmpty)
@@ -898,26 +939,27 @@ class ApiService {
     );
     final List<dynamic>? questions = data['questions'] as List<dynamic>?;
     return questions
-            ?.map((dynamic e) => (e as Map<String, dynamic>).cast<String, dynamic>())
+            ?.map(
+              (dynamic e) =>
+                  (e as Map<String, dynamic>).cast<String, dynamic>(),
+            )
             .toList() ??
         <Map<String, dynamic>>[];
   }
 
   /// 回答某条待答提问（REST 入口，与 WS user_answer 等价）。
   static Future<void> answerQuestion(String qid, String answer) async {
-    await _postJson(
-      '/api/questions/$qid/answer',
-      body: {'answer': answer},
-    );
+    await _postJson('/api/questions/$qid/answer', body: {'answer': answer});
   }
 
   /// 设置数据收集开关
   ///
   /// 调用 `POST /api/settings/data-collection`，请求体为 `{"enabled": true/false}`。
   static Future<void> setDataCollection(bool enabled) async {
-    await _postJson('/api/settings/data-collection', body: {
-      'enabled': enabled,
-    });
+    await _postJson(
+      '/api/settings/data-collection',
+      body: {'enabled': enabled},
+    );
   }
 
   /// 设置主动延迟开关
@@ -926,9 +968,7 @@ class ApiService {
   /// 适合交互式开发。调用 `POST /api/settings/rate-limit`，请求体
   /// 为 `{"enabled": true/false}`。
   static Future<void> setRateLimit(bool enabled) async {
-    await _postJson('/api/settings/rate-limit', body: {
-      'enabled': enabled,
-    });
+    await _postJson('/api/settings/rate-limit', body: {'enabled': enabled});
   }
 
   /// 查询主动延迟开关状态
@@ -936,7 +976,9 @@ class ApiService {
   /// 调用 `GET /api/settings/rate-limit`，返回 `{"enabled": bool, ...}`。
   /// 查询失败时抛出中文异常（由调用方决定是否忽略）。
   static Future<bool> getRateLimit() async {
-    final Map<String, dynamic> data = await _getJson('/api/settings/rate-limit');
+    final Map<String, dynamic> data = await _getJson(
+      '/api/settings/rate-limit',
+    );
     return (data['enabled'] as bool?) ?? false;
   }
 
@@ -946,17 +988,19 @@ class ApiService {
   /// 消息一起处理；`false` 串行排队（默认）。调用
   /// `POST /api/settings/message-cutin`，请求体为 `{"mode": "direct"/"queue"}`。
   static Future<void> setMessageCutinDirect(bool direct) async {
-    await _postJson('/api/settings/message-cutin', body: {
-      'mode': direct ? 'direct' : 'queue',
-    });
+    await _postJson(
+      '/api/settings/message-cutin',
+      body: {'mode': direct ? 'direct' : 'queue'},
+    );
   }
 
   /// 查询消息切入模式：true=直接切入，false=串行排队
   ///
   /// 调用 `GET /api/settings/message-cutin`，返回 `{"mode": "queue"|"direct"}`。
   static Future<bool> getMessageCutinDirect() async {
-    final Map<String, dynamic> data =
-        await _getJson('/api/settings/message-cutin');
+    final Map<String, dynamic> data = await _getJson(
+      '/api/settings/message-cutin',
+    );
     return (data['mode'] as String?) == 'direct';
   }
 
@@ -972,7 +1016,10 @@ class ApiService {
   }) async {
     final Uri uri = Uri.parse('$baseUrl$path').replace(queryParameters: query);
     try {
-      final http.Response response = await http.get(uri, headers: _getHeaders());
+      final http.Response response = await http.get(
+        uri,
+        headers: _getHeaders(),
+      );
       return _handleResponse(response);
     } catch (e) {
       if (e is Exception) {
@@ -992,8 +1039,7 @@ class ApiService {
     Map<String, dynamic>? body,
     Map<String, String>? query,
   }) async {
-    final Uri uri =
-        Uri.parse('$baseUrl$path').replace(queryParameters: query);
+    final Uri uri = Uri.parse('$baseUrl$path').replace(queryParameters: query);
     try {
       final http.Response response = await http.post(
         uri,
@@ -1040,8 +1086,10 @@ class ApiService {
   static Future<Map<String, dynamic>> _deleteJson(String path) async {
     final Uri uri = Uri.parse('$baseUrl$path');
     try {
-      final http.Response response =
-          await http.delete(uri, headers: _getHeaders());
+      final http.Response response = await http.delete(
+        uri,
+        headers: _getHeaders(),
+      );
       return _handleResponse(response);
     } catch (e) {
       if (e is Exception) {

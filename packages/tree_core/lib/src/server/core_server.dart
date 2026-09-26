@@ -1559,6 +1559,7 @@ class CoreServer {
     final Map<String, dynamic> result = await files.syncToLocal(
       params['workspaceId'] ?? '',
       (body['local_path'] ?? '').toString(),
+      path: (body['path'] ?? '').toString(),
     );
     if (await _writeResultError(request, result)) return;
     await writeJson(request, 200, result);

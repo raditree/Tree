@@ -237,5 +237,21 @@ void main() {
       '远端内容 A\n',
     );
     print('真机 syncToLocal: ${sync['files']} 个文件 / ${sync['bytes']} 字节');
+
+    // ⑧ 同步**子树**（M8b：文件面板逐层懒加载，同步只作用于当前那一层，
+    //    不再先把整棵根走一遍）
+    final (int subStatus, List<int> subBytes) = await call(
+      'POST',
+      '/api/files/$ws/syncToLocal',
+      body: <String, dynamic>{'local_path': localOut.path, 'path': '$dir/seed'},
+    );
+    expect(subStatus, 200, reason: utf8.decode(subBytes));
+    final Map<String, dynamic> sub = asJson(subBytes);
+    expect(sub['path'], '$dir/seed');
+    expect(
+      File('${localOut.path}/$dir/seed/a.txt').readAsStringSync(),
+      '远端内容 A\n',
+    );
+    print('真机 syncToLocal(sub): ${sub['files']} 个文件 / ${sub['bytes']} 字节');
   }, timeout: const Timeout(Duration(minutes: 3)));
 }

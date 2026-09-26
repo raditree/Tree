@@ -28,12 +28,18 @@ class FileTree extends StatefulWidget {
   /// 刷新触发器：递增时重新加载当前目录文件列表
   final int refreshTrigger;
 
+  /// 当前目录变化回调（进入子目录 / 点面包屑时触发）。
+  ///
+  /// 「同步到本地」用它把作用域限制在当前这一层（M8b）。
+  final ValueChanged<String>? onPathChanged;
+
   const FileTree({
     super.key,
     required this.workspaceId,
     this.teamId,
     this.onFileSelected,
     this.onDownload,
+    this.onPathChanged,
     this.refreshTrigger = 0,
   });
 
@@ -58,6 +64,10 @@ class _FileTreeState extends State<FileTree> {
   void initState() {
     super.initState();
     _loadFiles();
+    // 初始路径（根）在首帧后通知父组件：initState 里回调会撞上父组件 build
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) widget.onPathChanged?.call(_currentPath);
+    });
   }
 
   @override
@@ -123,6 +133,7 @@ class _FileTreeState extends State<FileTree> {
       newPath = '$_currentPath/${dir.name}';
     }
     _currentPath = newPath;
+    widget.onPathChanged?.call(_currentPath);
     _loadFiles();
   }
 
@@ -136,6 +147,7 @@ class _FileTreeState extends State<FileTree> {
       final List<String> segments = _currentPath.split('/');
       _currentPath = segments.sublist(0, index).join('/');
     }
+    widget.onPathChanged?.call(_currentPath);
     _loadFiles();
   }
 
@@ -163,15 +175,9 @@ class _FileTreeState extends State<FileTree> {
         // 面包屑导航
         _buildBreadcrumb(),
         // 分隔线
-        Divider(
-          height: 1,
-          thickness: 1,
-          color: Theme.of(context).dividerColor,
-        ),
+        Divider(height: 1, thickness: 1, color: Theme.of(context).dividerColor),
         // 文件列表区域
-        Expanded(
-          child: _buildBody(),
-        ),
+        Expanded(child: _buildBody()),
       ],
     );
   }
@@ -205,11 +211,7 @@ class _FileTreeState extends State<FileTree> {
         chips.add(
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 2),
-            child: Icon(
-              Icons.chevron_right,
-              size: 14,
-              color: cs.outline,
-            ),
+            child: Icon(Icons.chevron_right, size: 14, color: cs.outline),
           ),
         );
       }
@@ -297,37 +299,24 @@ class _FileTreeState extends State<FileTree> {
                   node.name,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 13,
-                    color: cs.onSurface,
-                  ),
+                  style: TextStyle(fontSize: 13, color: cs.onSurface),
                 ),
               ),
               // 大小 + 修改时间
               const SizedBox(width: 8),
               Text(
                 node.formattedSize,
-                style: TextStyle(
-                  fontSize: 11,
-                  color: cs.outline,
-                ),
+                style: TextStyle(fontSize: 11, color: cs.outline),
               ),
               const SizedBox(width: 8),
               Text(
                 _formatModified(node.modified),
-                style: TextStyle(
-                  fontSize: 11,
-                  color: cs.outline,
-                ),
+                style: TextStyle(fontSize: 11, color: cs.outline),
               ),
               // 目录右侧显示进入箭头
               if (isDir) ...[
                 const SizedBox(width: 4),
-                Icon(
-                  Icons.chevron_right,
-                  size: 16,
-                  color: cs.outline,
-                ),
+                Icon(Icons.chevron_right, size: 16, color: cs.outline),
               ],
             ],
           ),
@@ -341,15 +330,21 @@ class _FileTreeState extends State<FileTree> {
     showMenu<String>(
       context: context,
       position: RelativeRect.fromLTRB(
-        position.dx, position.dy, position.dx + 1, position.dy + 1,
+        position.dx,
+        position.dy,
+        position.dx + 1,
+        position.dy + 1,
       ),
       items: [
         PopupMenuItem<String>(
           value: 'download',
           child: Row(
             children: [
-              Icon(Icons.download, size: 18,
-                  color: Theme.of(context).colorScheme.primary),
+              Icon(
+                Icons.download,
+                size: 18,
+                color: Theme.of(context).colorScheme.primary,
+              ),
               const SizedBox(width: 8),
               const Text('下载'),
             ],

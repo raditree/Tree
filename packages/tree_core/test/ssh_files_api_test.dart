@@ -341,6 +341,47 @@ void main() {
     expect(File('${out.path}/sub/b.md').existsSync(), isTrue);
   });
 
+  test('syncToLocal 支持子树与单文件：不再先走完整棵远端（M8b）', () async {
+    await start();
+    final Directory out = Directory.systemTemp.createTempSync('tree_ssh_sub_');
+    addTearDown(() {
+      if (out.existsSync()) out.deleteSync(recursive: true);
+    });
+
+    final _Res sub = await client.send(
+      'POST',
+      '/api/files/${ws()}/syncToLocal',
+      body: <String, dynamic>{'local_path': out.path, 'path': 'sub'},
+    );
+    expect(sub.status, 200, reason: sub.raw);
+    expect(sub.json['files'], 1);
+    expect(File('${out.path}/sub/b.md').existsSync(), isTrue);
+    expect(
+      File('${out.path}/a.txt').existsSync(),
+      isFalse,
+      reason: '只同步 sub 子树',
+    );
+
+    final _Res one = await client.send(
+      'POST',
+      '/api/files/${ws()}/syncToLocal',
+      body: <String, dynamic>{'local_path': out.path, 'path': 'a.txt'},
+    );
+    expect(one.status, 200, reason: one.raw);
+    expect(one.json['files'], 1);
+    expect(File('${out.path}/a.txt').readAsStringSync(), 'hello\n世界\n');
+
+    // 不存在的路径：404，而不是空成功
+    expect(
+      (await client.send(
+        'POST',
+        '/api/files/${ws()}/syncToLocal',
+        body: <String, dynamic>{'local_path': out.path, 'path': 'nope'},
+      )).status,
+      404,
+    );
+  });
+
   test('配了 ssh 但核心没接远端后端：可读 400，不假装成功', () async {
     await start(wireRemote: false);
     final _Res res = await client.send('GET', '/api/files/${ws()}');

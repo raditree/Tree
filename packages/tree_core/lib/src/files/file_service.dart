@@ -681,17 +681,24 @@ class FileService {
     };
   }
 
-  /// 把整棵工作空间复制到本机目录（`POST /api/files/{id}/syncToLocal`）。
+  /// 把工作空间（或其中一棵子树）复制到本机目录
+  /// （`POST /api/files/{id}/syncToLocal`）。
   ///
   /// 桌面端核心与前端同机，所以这里是**直接复制**，不再走旧后端那套
-  /// "容器内打包 → base64 → 前端解包"。语义与旧后端一致：保留相对层级、
-  /// 覆盖同名文件、排除 `.git`、目标目录不存在则创建。
+  /// "容器内打包 → base64 → 前端解包"。语义：保留相对层级、覆盖同名文件、
+  /// 排除 `.git`、目标目录不存在则创建。
   ///
-  /// 先做一遍有界统计再复制：超限时**一个文件都不写**，而不是复制一半才报错。
+  /// M8b：支持 [path]（工作空间相对路径，空 = 根）。文件面板逐层懒加载，
+  /// 因此同步的是**用户当前所在的那一层**，不再默认整棵根——真机验收时在
+  /// 巨大远端根上"同步整棵树"曾被拖到超时。
+  ///
+  /// 遍历**边走边复制**：不再先全树统计一遍再复制。上限只作兜底，超限时报告
+  /// 已复制的进度（而不是安静地走完整棵树再拒绝）。
   Future<Map<String, dynamic>> syncToLocal(
     String workspaceId,
-    String localPath,
-  ) async {
+    String localPath, {
+    String path = '',
+  }) async {
     final CoreAgent? agent = agentFor(workspaceId);
     if (agent == null) return _error('工作空间不存在：$workspaceId');
     final WorkspaceFiles? remote = await remoteFor(agent);
@@ -702,7 +709,7 @@ class FileService {
     if (raw.isEmpty) return _error('local_path 不能为空', 400);
     final String target = p.normalize(p.absolute(raw));
     // 远端工作空间：本机目录不可能"落在远端工作空间内部"，直接拉取
-    if (remote != null) return _syncRemoteToLocal(remote, target);
+    if (remote != null) return _syncRemoteToLocal(remote, target, path: path);
     final String root = p.normalize(rootFor(agent));
     if (!Directory(root).existsSync()) {
       return _error('工作空间目录不存在：$root', 404);
@@ -711,39 +718,42 @@ class FileService {
     if (target == root || p.isWithin(root, target)) {
       return _error('目标目录不能是工作空间本身或它的子目录：$raw', 400);
     }
-    final List<_WalkEntry> entries = _enumerate(root, Directory(root));
-    if (entries.length > maxSyncFiles) {
-      return _error(
-        '工作空间文件过多（${entries.length} > $maxSyncFiles），请改用文件夹打包下载',
-        413,
-      );
-    }
-    final Set<String> created = <String>{};
-    int copied = 0;
-    int bytes = 0;
+    final String source;
     try {
-      for (final _WalkEntry entry in entries) {
-        final String destination = p.joinAll(<String>[
+      source = resolve(root, path, allowRoot: true);
+    } on FileServiceException catch (error) {
+      return _error(error.message, 400);
+    }
+    final FileSystemEntityType type = FileSystemEntity.typeSync(source);
+    if (type == FileSystemEntityType.notFound) {
+      return _error('目录不存在：${path.isEmpty ? '/' : path}');
+    }
+    final _CopyCounters counters = _CopyCounters(
+      maxFiles: maxSyncFiles,
+      maxBytes: maxSyncBytes,
+    );
+    try {
+      if (type == FileSystemEntityType.directory) {
+        await _copyLocalTree(Directory(source), root, target, counters);
+      } else {
+        await _copyLocalFile(
+          File(source),
+          _relative(root, source),
           target,
-          ...p.posix.split(entry.relativePath),
-        ]);
-        final String parent = p.dirname(destination);
-        if (created.add(parent)) {
-          await Directory(parent).create(recursive: true);
-        }
-        await File(entry.absolutePath).copy(destination);
-        copied++;
-        bytes += entry.size;
+          counters,
+        );
       }
     } catch (error) {
-      return _error('同步失败（已复制 $copied 个文件）：$error', 500);
+      return _error('同步失败（已复制 ${counters.files} 个文件）：$error', 500);
     }
-    log?.call('同步到本地：$root → $target（$copied 个文件）');
+    if (counters.limitHit) return _limitError('同步', counters);
+    log?.call('同步到本地：$source → $target（${counters.files} 个文件）');
     return <String, dynamic>{
       'success': true,
       'local_path': target,
-      'files': copied,
-      'bytes': bytes,
+      'path': path,
+      'files': counters.files,
+      'bytes': counters.bytes,
     };
   }
 
@@ -861,114 +871,118 @@ class FileService {
     }
   }
 
-  /// 远端子树（M7g）：列出 [relPath] 下的全部文件（相对工作空间根、POSIX 分隔符）。
+  /// 远端路径是否目录（M8b）。
   ///
-  /// 有界：条数超过 [maxSyncFiles] 立刻返回（调用方据此给 413），不把巨目录读爆
-  /// 内存；跳过 `.git`（与本地 `_enumerate` 同口径），避免把版本库整个拖下来。
-  Future<List<_RemoteEntry>> _walkRemote(
-    WorkspaceFiles remote,
-    String relPath,
-  ) async {
-    final List<_RemoteEntry> out = <_RemoteEntry>[];
-    final List<String> pending = <String>[relPath.trim()];
-    while (pending.isNotEmpty) {
-      final String dir = pending.removeLast();
-      final List<WorkspaceEntry> entries = await remote.listEntries(
-        dir,
-        maxEntries: maxListEntries,
-      );
-      for (final WorkspaceEntry entry in entries) {
-        if (entry.name == '.git') continue;
-        if (entry.isDirectory) {
-          pending.add(entry.relativePath);
-          continue;
-        }
-        out.add(_RemoteEntry(rel: entry.relativePath, size: entry.size));
-        if (out.length > maxSyncFiles) return out;
-      }
+  /// SFTP 的 listdir 对"文件"与"不存在"都报错，因此这里用"能不能列"来判类型：
+  /// 单文件下载/打包与子树遍历共用一条入口，不必再为文件单独加 stat。
+  Future<bool> _remoteIsDirectory(WorkspaceFiles remote, String rel) async {
+    if (rel.trim().isEmpty) return true;
+    try {
+      await remote.listEntries(rel, maxEntries: 1);
+      return true;
+    } on WorkspaceIoException {
+      return false;
     }
-    out.sort((_RemoteEntry a, _RemoteEntry b) => a.rel.compareTo(b.rel));
-    return out;
   }
 
-  /// 把远端文件拉到本地目录（保留相对层级）；返回写入字节数。
-  Future<int> _materializeRemote(
+  /// 递归把远端目录拉到 [destinationRoot]（保留工作空间相对层级）。
+  ///
+  /// **增量**：列一层就复制一层，不再先全树统计。计数与上限边走边算，
+  /// 触顶立刻停下（[counters].limitHit），不会安静地把整棵巨树走完。
+  Future<void> _copyRemoteTree(
     WorkspaceFiles remote,
-    List<_RemoteEntry> entries,
+    String dir,
     String destinationRoot,
+    _CopyCounters counters,
   ) async {
-    final Set<String> created = <String>{};
-    int bytes = 0;
-    for (final _RemoteEntry entry in entries) {
-      final String destination = p.joinAll(<String>[
-        destinationRoot,
-        ...p.posix.split(entry.rel),
-      ]);
-      final String parent = p.dirname(destination);
-      if (created.add(parent)) {
-        await Directory(parent).create(recursive: true);
+    // 空串就是根：两个实现都自己把空路径归一成 '.'，这里不要替它们转
+    final List<WorkspaceEntry> entries = await remote.listEntries(
+      dir,
+      maxEntries: maxListEntries,
+    );
+    for (final WorkspaceEntry entry in entries) {
+      if (counters.limitHit) return;
+      if (entry.name == '.git') continue;
+      if (entry.isDirectory) {
+        await _copyRemoteTree(
+          remote,
+          entry.relativePath,
+          destinationRoot,
+          counters,
+        );
+        continue;
       }
-      final Uint8List data = await remote.readBytes(entry.rel);
-      await File(destination).writeAsBytes(data, flush: true);
-      bytes += data.length;
+      await _copyRemoteFile(
+        remote,
+        entry.relativePath,
+        destinationRoot,
+        counters,
+      );
     }
-    return bytes;
   }
 
-  /// 远端工作空间 → 本机目录（`syncToLocal` 的 SSH 分支）。
+  /// 拉单个远端文件到 [destinationRoot] 下的工作空间相对路径处。
+  Future<void> _copyRemoteFile(
+    WorkspaceFiles remote,
+    String rel,
+    String destinationRoot,
+    _CopyCounters counters,
+  ) async {
+    final String destination = p.joinAll(<String>[
+      destinationRoot,
+      ...p.posix.split(rel),
+    ]);
+    await Directory(p.dirname(destination)).create(recursive: true);
+    final Uint8List data = await remote.readBytes(rel);
+    await File(destination).writeAsBytes(data, flush: true);
+    counters.add(data.length);
+  }
+
+  /// 远端工作空间（或子树）→ 本机目录（`syncToLocal` 的 SSH 分支）。
+  ///
+  /// M8b：边走边拉，不再先 `_walkRemote` 全树统计；[path] 为空 = 整棵根。
   Future<Map<String, dynamic>> _syncRemoteToLocal(
     WorkspaceFiles remote,
-    String target,
-  ) async {
-    final List<_RemoteEntry> entries;
+    String target, {
+    required String path,
+  }) async {
+    final _CopyCounters counters = _CopyCounters(
+      maxFiles: maxSyncFiles,
+      maxBytes: maxSyncBytes,
+    );
     try {
-      entries = await _walkRemote(remote, '');
+      if (await _remoteIsDirectory(remote, path)) {
+        await _copyRemoteTree(remote, path, target, counters);
+      } else {
+        await _copyRemoteFile(remote, path, target, counters);
+      }
     } on WorkspacePathException catch (error) {
       return _error(error.toString(), 400);
+    } on WorkspaceIoException catch (error) {
+      return _error(error.message, 404);
     } catch (error) {
       return _error('读取远端工作空间失败：$error', 500);
     }
-    if (entries.length > maxSyncFiles) {
-      return _error(
-        '工作空间文件过多（${entries.length} > $maxSyncFiles），请改用文件夹打包下载',
-        413,
-      );
-    }
-    final int totalBytes = entries.fold<int>(
-      0,
-      (int sum, _RemoteEntry entry) => sum + entry.size,
-    );
-    if (totalBytes > maxSyncBytes) {
-      return _error(
-        '工作空间过大（${totalBytes ~/ (1024 * 1024)} MB > 上限 '
-        '${maxSyncBytes ~/ (1024 * 1024)} MB），请改用文件夹打包下载',
-        413,
-      );
-    }
-    int copied = 0;
-    int bytes = 0;
-    try {
-      for (final _RemoteEntry entry in entries) {
-        final String destination = p.joinAll(<String>[
-          target,
-          ...p.posix.split(entry.rel),
-        ]);
-        await Directory(p.dirname(destination)).create(recursive: true);
-        final Uint8List data = await remote.readBytes(entry.rel);
-        await File(destination).writeAsBytes(data, flush: true);
-        copied++;
-        bytes += data.length;
-      }
-    } catch (error) {
-      return _error('同步失败（已复制 $copied 个文件）：$error', 500);
-    }
-    log?.call('同步到本地（SSH）：$copied 个文件 → $target');
+    if (counters.limitHit) return _limitError('同步', counters);
+    log?.call('同步到本地（SSH）：${counters.files} 个文件 → $target');
     return <String, dynamic>{
       'success': true,
       'local_path': target,
-      'files': copied,
-      'bytes': bytes,
+      'path': path,
+      'files': counters.files,
+      'bytes': counters.bytes,
     };
+  }
+
+  /// 走量超限时的统一 413：**报进度**而不是一句"太大了"。
+  Map<String, dynamic> _limitError(String action, _CopyCounters counters) {
+    return _error(
+      '$action中断：已处理 ${counters.files} 个文件 / '
+      '${counters.bytes ~/ (1024 * 1024)} MB，超过上限（'
+      '${counters.maxFiles} 个 / ${counters.maxBytes ~/ (1024 * 1024)} MB）。'
+      '请改用文件夹打包下载，或分目录/分批处理',
+      413,
+    );
   }
 
   /// 远端目录打包（`archive` 的 SSH 分支）：先把子树拉回本地临时目录，再本地 tar。
@@ -976,53 +990,56 @@ class FileService {
   /// 为什么不遥控远端 tar：① 远端不一定有 tar/bsdtar；② 二进制经 exec 的 stdout
   /// 会被当成文本解码（本机那条路径已经踩过一次：bsdtar 经管道还会把 \n 变 \r\n），
   /// 传回来还得走 base64；③ 各发行版 tar 行为不一致。拉回来再打包只有一条代码路径，
-  /// 也复用了同一份大小上限与 gzip 校验。
+  /// 也复用了同一份 gzip 校验。
+  ///
+  /// M8b：与同步共用**增量**遍历（边拉边算），不再先全树统计；上限按未压缩字节
+  /// 计，触顶就删掉临时目录并报已拉取的进度。[path] 也可以指向单个文件。
   Future<Map<String, dynamic>> _archiveRemote(
     WorkspaceFiles remote,
     String path,
   ) async {
-    final List<_RemoteEntry> entries;
-    try {
-      entries = await _walkRemote(remote, path);
-    } on WorkspacePathException catch (error) {
-      return _error(error.toString(), 400);
-    } on WorkspaceIoException catch (error) {
-      return _error(error.message, 404);
-    } catch (error) {
-      return _error('读取远端目录失败：$error', 500);
-    }
-    final int total = entries.fold<int>(
-      0,
-      (int sum, _RemoteEntry entry) => sum + entry.size,
-    );
-    if (total > maxArchiveBytes) {
-      return _error(
-        '目录过大（${total ~/ (1024 * 1024)} MB > 上限 '
-        '${maxArchiveBytes ~/ (1024 * 1024)} MB），请分批下载',
-        413,
-      );
-    }
     final String trimmed = path.trim();
-    final String baseName = trimmed.isEmpty
-        ? 'workspace'
-        : p.posix.basename(p.posix.normalize(trimmed));
     final Directory temp;
     try {
       temp = await Directory.systemTemp.createTemp('tree_remote_tar_');
-      // 按**工作空间相对路径**铺开（不额外套一层目录名）：这样 tar 的 -C + rel 与
-      // 本地打包完全同构，包内成员名也与工作空间里看到的一致。
-      await _materializeRemote(remote, entries, temp.path);
-    } on WorkspacePathException catch (error) {
-      return _error(error.toString(), 400);
     } catch (error) {
+      return _error('创建临时目录失败：$error', 500);
+    }
+    final _CopyCounters counters = _CopyCounters(
+      maxFiles: maxSyncFiles,
+      maxBytes: maxArchiveBytes,
+    );
+    try {
+      if (await _remoteIsDirectory(remote, trimmed)) {
+        // 按**工作空间相对路径**铺开（不额外套一层目录名）：这样 tar 的 -C + rel 与
+        // 本地打包完全同构，包内成员名也与工作空间里看到的一致。
+        await _copyRemoteTree(remote, trimmed, temp.path, counters);
+      } else {
+        await _copyRemoteFile(remote, trimmed, temp.path, counters);
+      }
+    } on WorkspacePathException catch (error) {
+      await _deleteQuietly(temp);
+      return _error(error.toString(), 400);
+    } on WorkspaceIoException catch (error) {
+      await _deleteQuietly(temp);
+      return _error(error.message, 404);
+    } catch (error) {
+      await _deleteQuietly(temp);
       return _error('拉取远端目录失败：$error', 500);
     }
+    if (counters.limitHit) {
+      await _deleteQuietly(temp);
+      return _limitError('打包', counters);
+    }
+    final String baseName = trimmed.isEmpty
+        ? 'workspace'
+        : p.posix.basename(p.posix.normalize(trimmed));
     try {
       return await _tarGz(
         root: temp.path,
         rel: trimmed.isEmpty ? '.' : trimmed,
         name: '$baseName.tar.gz',
-        entries: entries.length,
+        entries: counters.files,
       );
     } finally {
       await _deleteQuietly(temp);
@@ -1066,6 +1083,60 @@ class FileService {
 
     walk(dir);
     return entries;
+  }
+
+  /// 递归复制本地子树（M8b）：**边走边复制**，`.git` 不参与。
+  ///
+  /// 与 [`_enumerate`] 的区别：那个是"先枚举后打包"（本地 tar 需要知道总量），
+  /// 这里同步只在复制途中走量，列一层复制一层。
+  Future<void> _copyLocalTree(
+    Directory dir,
+    String root,
+    String target,
+    _CopyCounters counters,
+  ) async {
+    final List<FileSystemEntity> children;
+    try {
+      children = dir.listSync(followLinks: false);
+    } catch (error) {
+      log?.call('遍历目录失败（${dir.path}）：$error');
+      return;
+    }
+    for (final FileSystemEntity entity in children) {
+      if (counters.limitHit) return;
+      final String name = p.basename(entity.path);
+      if (name == '.git') continue;
+      if (entity is Directory) {
+        await _copyLocalTree(entity, root, target, counters);
+      } else if (entity is File) {
+        await _copyLocalFile(
+          entity,
+          _relative(root, entity.path),
+          target,
+          counters,
+        );
+      }
+    }
+  }
+
+  /// 复制单个本地文件到 [target] 下的工作空间相对路径处。
+  Future<void> _copyLocalFile(
+    File file,
+    String relativePath,
+    String target,
+    _CopyCounters counters,
+  ) async {
+    final String destination = p.joinAll(<String>[
+      target,
+      ...p.posix.split(relativePath),
+    ]);
+    final String parent = p.dirname(destination);
+    if (counters.created.add(parent)) {
+      await Directory(parent).create(recursive: true);
+    }
+    final int size = await file.length();
+    await file.copy(destination);
+    counters.add(size);
   }
 
   /// 丢弃超时未完成的分片会话（每次新建会话时顺手清理）。
@@ -1280,12 +1351,27 @@ class _UploadSession {
   DateTime touchedAt = DateTime.now();
 }
 
-/// 远端子树里的一个文件（M7g）：相对工作空间根、字节数。
-class _RemoteEntry {
-  const _RemoteEntry({required this.rel, required this.size});
+/// 同步/打包的走量与上限（M8b）：**边走边算**，不再先全树统计一遍。
+class _CopyCounters {
+  _CopyCounters({required this.maxFiles, required this.maxBytes});
 
-  final String rel;
-  final int size;
+  final int maxFiles;
+  final int maxBytes;
+
+  int files = 0;
+  int bytes = 0;
+
+  /// 是否已触顶（触顶后调用方应立即停下）。
+  bool limitHit = false;
+
+  /// 已创建过的父目录（避免每个文件都 create 一次）。
+  final Set<String> created = <String>{};
+
+  void add(int size) {
+    files++;
+    bytes += size;
+    if (files > maxFiles || bytes > maxBytes) limitHit = true;
+  }
 }
 
 /// 遍历到的一个文件（打包与同步共用）。

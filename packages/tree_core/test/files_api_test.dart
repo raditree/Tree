@@ -515,6 +515,38 @@ void main() {
     }
   });
 
+  test('POST syncToLocal：只同步 path 指定的子树（M8b 按需加载）', () async {
+    await start();
+    final Directory out = Directory.systemTemp.createTempSync('tree_sync_sub_');
+    addTearDown(() {
+      if (out.existsSync()) out.deleteSync(recursive: true);
+    });
+
+    final _Res res = await client.send(
+      'POST',
+      '/api/files/${ws()}/syncToLocal',
+      body: <String, dynamic>{'local_path': out.path, 'path': 'sub'},
+    );
+    expect(res.status, 200, reason: res.raw);
+    expect(res.json['path'], 'sub');
+    expect(File('${out.path}/sub/b.md').existsSync(), isTrue);
+    expect(
+      File('${out.path}/a.txt').existsSync(),
+      isFalse,
+      reason: '只同步 sub 子树，根下的 a.txt 不该被复制',
+    );
+
+    // 越界的 path 要拒绝，不能被当成"根下某个名字"糊弄过去
+    expect(
+      (await client.send(
+        'POST',
+        '/api/files/${ws()}/syncToLocal',
+        body: <String, dynamic>{'local_path': out.path, 'path': '../x'},
+      )).status,
+      400,
+    );
+  });
+
   test('POST download_folder：真实 tar.gz（gzip 可解、排除 .git、越界拒绝）', () async {
     await start();
     Directory('${temp.path}/.git').createSync();
