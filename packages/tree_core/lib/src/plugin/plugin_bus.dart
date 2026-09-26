@@ -395,6 +395,36 @@ class PluginBus {
     return delivered;
   }
 
+  /// **agent 事件派发**（M9 追加）：把会话服务发布的 agent 侧事件（如
+  /// `agent.tool_call`）按**既有订阅口径**投给插件实例。
+  ///
+  /// 「既有口径」= [_subscribes]：`config.scope` 里为空即通配，非空则精确匹配
+  /// `team_id` / `agent_id` / `session_id`（**不发明新的订阅语法**）；插件声明得
+  /// 更细（agent / session 级）就只收该更细范围的事件，声明 team 就收该 team 的事件。
+  ///
+  /// 与 [dispatch] 的区别只在**取数与兜底**（agent 数据面的唯一入口）：
+  /// - 事件名取 `event` 字段：缺失 / 空 ⇒ **拒发并记日志**（不静默丢一条无名字的事件）；
+  /// - 补一个 `ts`（epoch 秒）便于插件与自己日志对时间（已有则原样保留）；
+  /// - **绝不抛异常**：本方法在生成循环里被调用（工具调用处），插件侧的任何问题都不该
+  ///   让生成失败——异常一律收敛成日志 + 返回 0。
+  int dispatchAgentEvent(Map<String, dynamic> event) {
+    final String name = (event['event'] ?? '').toString().trim();
+    if (name.isEmpty) {
+      log?.call('agent 事件缺少 event 名称，未派发：$event');
+      return 0;
+    }
+    try {
+      return dispatch(<String, dynamic>{
+        ...event,
+        'event': name,
+        if (!event.containsKey('ts')) 'ts': _nowSeconds(),
+      });
+    } catch (error) {
+      log?.call('agent 事件 $name 派发失败（已忽略，不影响生成）：$error');
+      return 0;
+    }
+  }
+
   bool _subscribes(PluginConfig config, Map<String, dynamic> event) {
     bool matches(String key) {
       final String wanted = (config.scope[key] ?? '').toString();

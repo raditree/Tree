@@ -3,6 +3,7 @@ import 'dart:convert';
 
 import 'package:tree_protocol/tree_protocol.dart';
 
+import '../plugin/agent_events.dart';
 import '../settings/core_settings.dart';
 import '../store/tree_store.dart';
 import '../util/ids.dart';
@@ -31,6 +32,9 @@ class _PendingMessage {
   Map<String, dynamic>? toolArguments;
   String toolResult = '';
   String toolCallId = '';
+
+  /// **工具调用轮次**（本任务内从 1 开始；插件生态的 `agent.tool_call` 事件带它）。
+  int round = 0;
 }
 
 /// 会话服务：把 WS 上行的 `user_message` / `stop` 变成"落库 + 流式下行"。
@@ -60,6 +64,10 @@ class _PendingMessage {
 /// - 推送刷新帧率：增量攒帧后按帧率合并成一条 `msg_chunk`（[_ChunkPump]），
 ///   同一 message id 内带**严格递增的单调序号**（`WsStreamSeq`）——断线补发队列
 ///   原样重播帧时，前端据此把"已经渲染过的同一片段"判掉（M9 重播去重）。
+///
+/// 插件生态（M9 追加）：每次工具调用开始 / 结束各发一条 `agent.tool_call` 事件
+/// （[agentEvents]），插件据此统计轮次与耗时、超限时用执行站的 `agent.stop` 停下
+/// 这一轮——核心侧不再有工具轮次静态上限（plan §2 Q8）。**默认未接线 = no-op**。
 ///
 /// 并发策略：**按 agent 串行**（同一 agent 的多条消息排队执行）。同一会话的
 /// 流式片段若交错下发，前端的 `msg_chunk` 追加会互相污染。
@@ -105,6 +113,17 @@ class ConversationService {
   /// 关闭后 token 管道直接放行、攒帧也不再看计时器——测试要的是"没有时间轴"的
   /// 确定性，而不是"用真实计时器伪造一条时间轴"。
   final bool? pacingEnabled;
+
+  /// **agent 事件发布器**（插件生态，M9 追加）：工具调用开始 / 结束时各发一条
+  /// `agent.tool_call`，插件据此统计轮次与耗时（见 `agent_events.dart`）。
+  ///
+  /// **默认未接线 = no-op**：不接线时事件根本不构造，行为与本改动之前完全一致。
+  /// 接线点（主控在 core_server 里接一行）：
+  /// ```dart
+  /// conversation.agentEvents.sink = pluginBus.dispatchAgentEvent;
+  /// ```
+  /// 测试可以注入自己的记录器（或 CLI 接总线）来决定要不要发。
+  final AgentEventPublisher agentEvents = AgentEventPublisher();
 
   /// 每个 agent 的任务链尾（保证串行）。
   final Map<String, Future<void>> _chains = <String, Future<void>>{};
@@ -361,6 +380,9 @@ class ConversationService {
     // 最近开始的段 id：`msg_usage` 要挂在一张已存在的卡片上（工具循环里就挂在
     // 工具卡片上，与参考实现一致）。
     String lastSegmentId = '';
+    // 工具调用轮次（插件生态）：**本任务内**从 1 开始计数，随 `agent.tool_call`
+    // 事件下发给插件——插件据此实现"超过 N 次就停"（Q8：限制交给插件做）。
+    int toolRound = 0;
     // 整轮正文：端点没给 usage 时，completion 的兜底口径是**整轮**生成量。
     final StringBuffer roundText = StringBuffer();
     Map<String, dynamic>? usage;
@@ -509,8 +531,13 @@ class ConversationService {
               _PendingMessage(id: event.id, kind: 'tool')
                 ..toolName = event.name
                 ..toolArguments = event.arguments
-                ..toolCallId = event.callId;
+                ..toolCallId = event.callId
+                // 轮次 = 本任务内第几次工具调用（插件按它判"超限"）
+                ..round = ++toolRound;
           toolSegments[event.id] = message;
+          // 插件生态：**工具调用开始**事件。先发事件再等工具执行——插件因此有机会在
+          // 工具真正跑起来之前（乃至下次调用之前）用 `agent.stop` 掐掉超限的轮次。
+          _publishToolCall(agent, session, message, AgentEvents.phaseStart);
           // Q13：工具参数按 `字符数 / token_scale` 折算 token，走**同一条** token
           // 管道排队推送 —— write 这类大参数调用自然产生等待，read 几乎不等待。
           await roundPacer.consume(
@@ -529,6 +556,15 @@ class ConversationService {
           final _PendingMessage? message = toolSegments.remove(event.id);
           if (message == null) continue;
           message.toolResult = event.result;
+          // 插件生态：**工具调用结束**事件（与开始事件同 `call_id` / `round`，插件
+          // 据此统计每次耗时；工具名以结束事件为准，兜底用卡片里的名字）。
+          _publishToolCall(
+            agent,
+            session,
+            message,
+            AgentEvents.phaseEnd,
+            tool: event.name,
+          );
           // 工具结果**直接推**、不延迟（Q13）：等待只花在参数上；推完即进入下一轮
           pump.flush();
           hub.broadcast(<String, dynamic>{
@@ -596,6 +632,29 @@ class ConversationService {
       'data': <String, dynamic>{'agent_id': agent.id, 'status': 'idle'},
     });
     _running.remove(agent.id);
+  }
+
+  /// 发布一条工具调用事件（`agent.tool_call`；字段口径见 [AgentEvents.toolCall]）。
+  ///
+  /// - `team_id` 取 agent 的团队归属（空串 = 无归属，插件按 scope 通配/不匹配自行裁定）；
+  /// - `round` 取卡片里记的本任务轮次（start / end 同值），插件因此能把一对事件配上；
+  /// - 未接线（[AgentEventPublisher.sink] 为空）时是**纯 no-op**，不影响既有行为。
+  void _publishToolCall(
+    CoreAgent agent,
+    CoreSession session,
+    _PendingMessage message,
+    String phase, {
+    String tool = '',
+  }) {
+    agentEvents.toolCall(
+      agentId: agent.id,
+      sessionId: session.sessionId,
+      teamId: agent.teamId,
+      tool: tool.isEmpty ? (message.toolName ?? '') : tool,
+      callId: message.toolCallId,
+      round: message.round,
+      phase: phase,
+    );
   }
 
   /// 默认是否做节奏控制。
