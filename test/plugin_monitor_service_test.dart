@@ -13,23 +13,23 @@ import 'package:tree/io/plugin_monitor_service.dart';
 
 /// 构造一份最小可用快照数据（含 1 个实例）。
 Map<String, dynamic> _snapshotData() => <String, dynamic>{
-      'enabled': true,
-      'instances': <dynamic>[
-        <String, dynamic>{
-          'plugin_id': 'demo.a',
-          'granularity': 'agent',
-          'scope': <String, dynamic>{
-            'user_id': 'u1',
-            'team_id': 't1',
-            'agent_id': 'a1',
-            'session_id': '',
-          },
-          'status': 'registered',
-        },
-      ],
-      'stations': <dynamic>[],
-      'watchdog': <String, dynamic>{'active_runs': 0, 'judged_dead': 0},
-    };
+  'enabled': true,
+  'instances': <dynamic>[
+    <String, dynamic>{
+      'plugin_id': 'demo.a',
+      'granularity': 'agent',
+      'scope': <String, dynamic>{
+        'user_id': 'u1',
+        'team_id': 't1',
+        'agent_id': 'a1',
+        'session_id': '',
+      },
+      'status': 'registered',
+    },
+  ],
+  'stations': <dynamic>[],
+  'watchdog': <String, dynamic>{'active_runs': 0, 'judged_dead': 0},
+};
 
 /// 构造一个已注入 [data] 并完成一次刷新的测试服务。
 Future<PluginMonitorService> _serviceWithSnapshot(
@@ -141,16 +141,17 @@ void main() {
     });
 
     test('counts 混入非数值键值 → 仅保留数值项', () {
-      final PluginStationInfo? st =
-          PluginStationInfo.tryParse(<String, dynamic>{
-        'station_id': 'tool.read.result',
-        'counts': <dynamic, dynamic>{
-          'requests': 1,
-          'weird': 'text',
-          'timeout': 2.0,
-          3: 4, // 非字符串键：忽略
+      final PluginStationInfo? st = PluginStationInfo.tryParse(
+        <String, dynamic>{
+          'station_id': 'tool.read.result',
+          'counts': <dynamic, dynamic>{
+            'requests': 1,
+            'weird': 'text',
+            'timeout': 2.0,
+            3: 4, // 非字符串键：忽略
+          },
         },
-      });
+      );
       expect(st, isNotNull);
       expect(st!.counts['requests'], 1);
       expect(st.counts['timeout'], 2);
@@ -158,15 +159,82 @@ void main() {
     });
 
     test('实例键组合：不同 scope 不混淆', () {
-      final String k1 = PluginInstanceInfo.keyOf(
-        'p',
-        <String, dynamic>{'team_id': 't', 'agent_id': 'a1'},
-      );
-      final String k2 = PluginInstanceInfo.keyOf(
-        'p',
-        <String, dynamic>{'team_id': 't', 'agent_id': 'a2'},
-      );
+      final String k1 = PluginInstanceInfo.keyOf('p', <String, dynamic>{
+        'team_id': 't',
+        'agent_id': 'a1',
+      });
+      final String k2 = PluginInstanceInfo.keyOf('p', <String, dynamic>{
+        'team_id': 't',
+        'agent_id': 'a2',
+      });
       expect(k1, isNot(k2));
+    });
+
+    test('健康度解析（M9 §1.1）：degraded 是心跳丢失，不是停用', () {
+      final PluginSnapshot s = PluginSnapshot.fromJson(<String, dynamic>{
+        'enabled': true,
+        'instances': <dynamic>[
+          <String, dynamic>{
+            'plugin_id': 'demo.deaf',
+            'scope': <String, dynamic>{'team_id': 't1'},
+            'status': 'registered',
+            'health': 'degraded',
+            'missed_heartbeats': 3,
+            'heartbeat_interval_s': 10.0,
+            'degraded_reason': '心跳丢失：连续 3 拍未达',
+            'disabled_reason': '',
+          },
+          <String, dynamic>{
+            'plugin_id': 'demo.ok',
+            'scope': <String, dynamic>{'team_id': 't1'},
+            'status': 'registered',
+            'health': 'ok',
+            'missed_heartbeats': 0,
+            'heartbeat_interval_s': 10.0,
+          },
+        ],
+        'watchdog': <String, dynamic>{
+          'active_runs': 0,
+          'judged_dead': 0,
+          'degraded_count': 1,
+          'interval_s': 10,
+          'miss_threshold': 3,
+        },
+      });
+      expect(s.instances, hasLength(2));
+      final PluginInstanceInfo deaf = s.instances.first;
+      expect(deaf.status, 'registered'); // 降级 ≠ 停用
+      expect(deaf.health, PluginInstanceInfo.healthDegraded);
+      expect(deaf.isDegraded, isTrue);
+      expect(deaf.missedHeartbeats, 3);
+      expect(deaf.heartbeatIntervalS, 10.0);
+      expect(deaf.degradedReason, contains('心跳丢失'));
+      expect(deaf.disabledReason, isEmpty); // 不得落到"停用原因"
+      expect(s.instances[1].isDegraded, isFalse);
+      expect(s.watchdog?.degradedCount, 1);
+      expect(s.watchdog?.missThreshold, 3);
+    });
+
+    test('缺健康度字段 → 未知（hasHealth=false），不臆测降级', () {
+      final PluginSnapshot s = PluginSnapshot.fromJson(<String, dynamic>{
+        'instances': <dynamic>[
+          <String, dynamic>{'plugin_id': 'legacy', 'status': 'registered'},
+          <String, dynamic>{
+            'plugin_id': 'bad-type',
+            'status': 'registered',
+            'health': 42, // 非字符串：视为缺失
+            'missed_heartbeats': 'oops',
+            'heartbeat_interval_s': null,
+          },
+        ],
+      });
+      for (final PluginInstanceInfo e in s.instances) {
+        expect(e.hasHealth, isFalse);
+        expect(e.isDegraded, isFalse);
+        expect(e.health, '');
+        expect(e.missedHeartbeats, isNull);
+        expect(e.heartbeatIntervalS, isNull);
+      }
     });
   });
 
@@ -191,8 +259,9 @@ void main() {
     });
 
     test('registered：已存在实例不重复添加（按实例键对齐）', () async {
-      final PluginMonitorService svc =
-          await _serviceWithSnapshot(_snapshotData());
+      final PluginMonitorService svc = await _serviceWithSnapshot(
+        _snapshotData(),
+      );
       svc.handleMessage(<String, dynamic>{
         'type': 'plugin_status',
         'data': <String, dynamic>{
@@ -209,8 +278,9 @@ void main() {
     });
 
     test('disabled：更新状态与原因', () async {
-      final PluginMonitorService svc =
-          await _serviceWithSnapshot(_snapshotData());
+      final PluginMonitorService svc = await _serviceWithSnapshot(
+        _snapshotData(),
+      );
       svc.handleMessage(<String, dynamic>{
         'type': 'plugin_status',
         'data': <String, dynamic>{
@@ -225,8 +295,9 @@ void main() {
     });
 
     test('destroyed：移除实例', () async {
-      final PluginMonitorService svc =
-          await _serviceWithSnapshot(_snapshotData());
+      final PluginMonitorService svc = await _serviceWithSnapshot(
+        _snapshotData(),
+      );
       svc.handleMessage(<String, dynamic>{
         'type': 'plugin_status',
         'data': <String, dynamic>{
@@ -239,8 +310,9 @@ void main() {
     });
 
     test('未知消息类型/未知 status/畸形 data → 忽略且不抛错（CP1/CP2）', () async {
-      final PluginMonitorService svc =
-          await _serviceWithSnapshot(_snapshotData());
+      final PluginMonitorService svc = await _serviceWithSnapshot(
+        _snapshotData(),
+      );
       svc.handleMessage(<String, dynamic>{'type': 'plugin_event'}); // 未知类型
       svc.handleMessage(<String, dynamic>{'type': 'msg_chunk'});
       svc.handleMessage(<String, dynamic>{'type': 42}); // 非字符串 type
@@ -264,14 +336,19 @@ void main() {
       final PluginMonitorService svc = PluginMonitorService.forTesting();
       svc.handleMessage(<String, dynamic>{
         'type': 'plugin_status',
-        'data': <String, dynamic>{'plugin_id': 'demo.b', 'status': 'registered'},
+        'data': <String, dynamic>{
+          'plugin_id': 'demo.b',
+          'status': 'registered',
+        },
       });
       expect(svc.snapshot, isNull);
     });
 
     test('团队过滤：teamId 已设置时忽略其他团队事件；缺 team_id 不拒绝', () async {
-      final PluginMonitorService svc =
-          await _serviceWithSnapshot(_snapshotData(), teamId: 't1');
+      final PluginMonitorService svc = await _serviceWithSnapshot(
+        _snapshotData(),
+        teamId: 't1',
+      );
       svc.handleMessage(<String, dynamic>{
         'type': 'plugin_status',
         'data': <String, dynamic>{
@@ -283,9 +360,179 @@ void main() {
       expect(svc.snapshot!.instances, hasLength(1)); // 跨团队被忽略
       svc.handleMessage(<String, dynamic>{
         'type': 'plugin_status',
-        'data': <String, dynamic>{'plugin_id': 'demo.y', 'status': 'registered'},
+        'data': <String, dynamic>{
+          'plugin_id': 'demo.y',
+          'status': 'registered',
+        },
       });
       expect(svc.snapshot!.instances, hasLength(2)); // 缺失不拒绝
+    });
+
+    test('registered + health=degraded：status 仍是 registered（不误判停用）', () async {
+      final PluginMonitorService svc = await _serviceWithSnapshot(
+        _snapshotData(),
+      );
+      svc.handleMessage(<String, dynamic>{
+        'type': 'plugin_status',
+        'data': <String, dynamic>{
+          'plugin_id': 'demo.a',
+          'scope': <String, dynamic>{'team_id': 't1', 'agent_id': 'a1'},
+          'status': 'registered', // 核心口径：降级不改 status
+          'health': 'degraded',
+          'reason': '心跳丢失：连续 3 拍未达',
+          'missed_heartbeats': 3,
+          'heartbeat_interval_s': 10.0,
+          'ts': 1789290200.0,
+        },
+      });
+      final PluginInstanceInfo e = svc.snapshot!.instances.first;
+      expect(e.status, 'registered');
+      expect(e.isDegraded, isTrue);
+      expect(e.health, 'degraded');
+      expect(e.missedHeartbeats, 3);
+      expect(e.heartbeatIntervalS, 10.0);
+      expect(e.degradedReason, contains('心跳丢失'));
+      expect(e.disabledReason, isEmpty); // reason 不得误落成停用原因
+      // 实例键不变：没有变成第二条实例
+      expect(svc.snapshot!.instances, hasLength(1));
+    });
+
+    test('degraded 增量新建未知实例：带健康度落库（status 仍 registered）', () async {
+      final PluginMonitorService svc = await _serviceWithSnapshot(
+        <String, dynamic>{'enabled': true, 'instances': <dynamic>[]},
+      );
+      svc.handleMessage(<String, dynamic>{
+        'type': 'plugin_status',
+        'data': <String, dynamic>{
+          'plugin_id': 'demo.new',
+          'scope': <String, dynamic>{'team_id': 't1'},
+          'status': 'registered',
+          'health': 'degraded',
+          'reason': '连续 3 拍未达',
+          'missed_heartbeats': 4,
+          'heartbeat_interval_s': 10.0,
+        },
+      });
+      final PluginInstanceInfo e = svc.snapshot!.instances.single;
+      expect(e.status, 'registered');
+      expect(e.isDegraded, isTrue);
+      expect(e.missedHeartbeats, 4);
+      expect(e.degradedReason, '连续 3 拍未达');
+    });
+
+    test('registered + health=ok：降级恢复，角标与计数清零', () async {
+      final PluginMonitorService svc = await _serviceWithSnapshot(
+        _snapshotData(),
+      );
+      svc.handleMessage(<String, dynamic>{
+        'type': 'plugin_status',
+        'data': <String, dynamic>{
+          'plugin_id': 'demo.a',
+          'scope': <String, dynamic>{'team_id': 't1', 'agent_id': 'a1'},
+          'status': 'registered',
+          'health': 'degraded',
+          'reason': '连续 3 拍未达',
+          'missed_heartbeats': 3,
+        },
+      });
+      expect(svc.snapshot!.instances.first.isDegraded, isTrue);
+      // 心跳恢复（核心的恢复增量：degraded=false、missed=0）
+      svc.handleMessage(<String, dynamic>{
+        'type': 'plugin_status',
+        'data': <String, dynamic>{
+          'plugin_id': 'demo.a',
+          'scope': <String, dynamic>{'team_id': 't1', 'agent_id': 'a1'},
+          'status': 'registered',
+          'health': 'ok',
+          'missed_heartbeats': 0,
+        },
+      });
+      final PluginInstanceInfo e = svc.snapshot!.instances.first;
+      expect(e.status, 'registered');
+      expect(e.isDegraded, isFalse);
+      expect(e.health, 'ok');
+      expect(e.degradedReason, isEmpty); // 不残留
+      expect(e.missedHeartbeats, 0);
+    });
+
+    test('registered 增量缺 health：保持原健康度（不臆测、不清零）', () async {
+      final PluginMonitorService svc = await _serviceWithSnapshot(
+        _snapshotData(),
+      );
+      svc.handleMessage(<String, dynamic>{
+        'type': 'plugin_status',
+        'data': <String, dynamic>{
+          'plugin_id': 'demo.a',
+          'scope': <String, dynamic>{'team_id': 't1', 'agent_id': 'a1'},
+          'status': 'registered',
+          'health': 'degraded',
+          'reason': '连续 3 拍未达',
+          'missed_heartbeats': 5,
+        },
+      });
+      svc.handleMessage(<String, dynamic>{
+        'type': 'plugin_status',
+        'data': <String, dynamic>{
+          'plugin_id': 'demo.a',
+          'scope': <String, dynamic>{'team_id': 't1', 'agent_id': 'a1'},
+          'status': 'registered', // 没有 health 字段
+        },
+      });
+      final PluginInstanceInfo e = svc.snapshot!.instances.first;
+      expect(e.isDegraded, isTrue);
+      expect(e.missedHeartbeats, 5); // 保持
+      expect(e.degradedReason, '连续 3 拍未达');
+    });
+
+    test('disabled：清降级标记并按快照口径落 unavailable', () async {
+      final PluginMonitorService svc = await _serviceWithSnapshot(
+        _snapshotData(),
+      );
+      svc.handleMessage(<String, dynamic>{
+        'type': 'plugin_status',
+        'data': <String, dynamic>{
+          'plugin_id': 'demo.a',
+          'scope': <String, dynamic>{'team_id': 't1', 'agent_id': 'a1'},
+          'status': 'registered',
+          'health': 'degraded',
+          'reason': '连续 3 拍未达',
+          'missed_heartbeats': 3,
+        },
+      });
+      svc.handleMessage(<String, dynamic>{
+        'type': 'plugin_status',
+        'data': <String, dynamic>{
+          'plugin_id': 'demo.a',
+          'scope': <String, dynamic>{'team_id': 't1', 'agent_id': 'a1'},
+          'status': 'disabled',
+          'reason': '启动失败',
+        },
+      });
+      final PluginInstanceInfo e = svc.snapshot!.instances.first;
+      expect(e.status, 'disabled');
+      expect(e.disabledReason, '启动失败');
+      expect(e.isDegraded, isFalse);
+      expect(e.degradedReason, isEmpty);
+      expect(e.health, PluginInstanceInfo.healthUnavailable);
+    });
+
+    test('未知 health 值原样保留、不崩（防御式）', () async {
+      final PluginMonitorService svc = await _serviceWithSnapshot(
+        _snapshotData(),
+      );
+      svc.handleMessage(<String, dynamic>{
+        'type': 'plugin_status',
+        'data': <String, dynamic>{
+          'plugin_id': 'demo.a',
+          'scope': <String, dynamic>{'team_id': 't1', 'agent_id': 'a1'},
+          'status': 'registered',
+          'health': 'melted',
+        },
+      });
+      final PluginInstanceInfo e = svc.snapshot!.instances.first;
+      expect(e.health, 'melted');
+      expect(e.isDegraded, isFalse); // 未知值 ≠ 降级
+      expect(e.status, 'registered');
     });
   });
 
@@ -332,11 +579,10 @@ void main() {
       expect(svc.snapshot, isNotNull); // 旧数据保留
       expect(svc.snapshot!.instances, hasLength(1));
 
-      svc.snapshotFetcher =
-          ({String? teamId}) async => <String, dynamic>{
-                'enabled': false,
-                'instances': <dynamic>[],
-              };
+      svc.snapshotFetcher = ({String? teamId}) async => <String, dynamic>{
+        'enabled': false,
+        'instances': <dynamic>[],
+      };
       await svc.refresh();
       expect(svc.error, isNull); // 成功清空错误
       expect(svc.snapshot!.enabled, isFalse);
@@ -345,10 +591,10 @@ void main() {
     test('断连态与空态可由 (connected, snapshot) 组合区分', () async {
       final PluginMonitorService svc = PluginMonitorService.forTesting();
       svc.snapshotFetcher = ({String? teamId}) async => <String, dynamic>{
-            'enabled': true,
-            'instances': <dynamic>[],
-            'stations': <dynamic>[],
-          };
+        'enabled': true,
+        'instances': <dynamic>[],
+        'stations': <dynamic>[],
+      };
       await svc.refresh();
       expect(svc.connected, isFalse); // 断连态：未连接（即使已有快照）
       expect(svc.snapshot, isNotNull);

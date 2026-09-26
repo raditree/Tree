@@ -14,6 +14,7 @@ import '../../io/question_update_service.dart';
 import '../../io/ssh_executor_service.dart';
 import '../../io/websocket_service.dart';
 import '../../io/workspace_refresh_service.dart';
+import '../services/message_replay_guard.dart';
 import '../services/plugin_ui_registry.dart';
 import 'message_input.dart';
 import 'message_list.dart';
@@ -73,6 +74,13 @@ class MessagePanel extends StatefulWidget {
 class _MessagePanelState extends State<MessagePanel> {
   /// 消息列表
   final List<ChatMessage> _messages = <ChatMessage>[];
+
+  /// 断线补发帧的「重播去重」闸（M9 §1.1 / Wave 3-H 待办 3）。
+  ///
+  /// 核心断线期间的广播帧会进补发队列、重连后原样重播（帧无 TTL、无序号）；
+  /// 本闸按**消息 id** 挡住重复渲染：已封口（历史终稿 / 已 msg_end）的 id 不再
+  /// 追加增量，列表里已有的 id 不再新建气泡。详见 [MessageReplayGuard]。
+  final MessageReplayGuard _replayGuard = MessageReplayGuard();
 
   /// WebSocket 服务
   final WebSocketService _webSocket = WebSocketService();
@@ -227,8 +235,9 @@ class _MessagePanelState extends State<MessagePanel> {
     if (teamId != (widget.selectedAgent?.id ?? '')) return;
     setState(() {
       _localEnabled = LocalExecutorService.instance.isTeamEnabled(teamId);
-      _localWorkingDir =
-          LocalExecutorService.instance.teamWorkingDirectory(teamId);
+      _localWorkingDir = LocalExecutorService.instance.teamWorkingDirectory(
+        teamId,
+      );
       _sshEnabled = SshExecutorService.instance.isTeamEnabled(teamId);
       _sshConfig = SshExecutorService.instance.teamConfig(teamId);
     });
@@ -259,8 +268,9 @@ class _MessagePanelState extends State<MessagePanel> {
     if (teamId != (widget.selectedAgent?.id ?? '')) return;
     setState(() {
       _localEnabled = LocalExecutorService.instance.isTeamEnabled(teamId);
-      _localWorkingDir =
-          LocalExecutorService.instance.teamWorkingDirectory(teamId);
+      _localWorkingDir = LocalExecutorService.instance.teamWorkingDirectory(
+        teamId,
+      );
       _sshEnabled = SshExecutorService.instance.isTeamEnabled(teamId);
     });
   }
@@ -269,7 +279,8 @@ class _MessagePanelState extends State<MessagePanel> {
   void didUpdateWidget(covariant MessagePanel oldWidget) {
     super.didUpdateWidget(oldWidget);
     // 右侧「问题回复」导航定位触发：记录待消费的定位目标
-    final bool navTriggered = oldWidget.navigateTrigger != widget.navigateTrigger &&
+    final bool navTriggered =
+        oldWidget.navigateTrigger != widget.navigateTrigger &&
         widget.navigateMessageId != null &&
         widget.navigateMessageId!.isNotEmpty;
     if (navTriggered) {
@@ -384,7 +395,10 @@ class _MessagePanelState extends State<MessagePanel> {
     setState(() {
       _sessions.insert(
         0,
-        ChatSession(sessionId: sessionId, title: (d['title'] as String?) ?? '新会话'),
+        ChatSession(
+          sessionId: sessionId,
+          title: (d['title'] as String?) ?? '新会话',
+        ),
       );
     });
     _webSocket.registerKnownSessions(<String>[sessionId]);
@@ -396,8 +410,7 @@ class _MessagePanelState extends State<MessagePanel> {
     if (agent == null) return;
     final String agentId = agent.id;
     try {
-      final List<ChatSession> sessions =
-          await ApiService.getSessions(agent.id);
+      final List<ChatSession> sessions = await ApiService.getSessions(agent.id);
       if (!mounted) return;
       // 竞态防护：等待期间可能已切换 agent，丢弃过期响应
       // （否则旧 agent 的会话列表会覆盖新 agent，表现为"不稳定"）
@@ -416,9 +429,8 @@ class _MessagePanelState extends State<MessagePanel> {
         // 无消息时（list_sessions 的兜底条目必然匹配），用户实际对话所在
         // 的非默认会话会被丢弃，compact/历史加载错位，误报
         // "该 agent 无活跃的会话上下文"。
-        final String prev = _pendingSessionId ??
-            _lastSessionByAgent[agentId] ??
-            '';
+        final String prev =
+            _pendingSessionId ?? _lastSessionByAgent[agentId] ?? '';
         _pendingSessionId = null;
         ChatSession? target;
         if (prev.isNotEmpty) {
@@ -430,7 +442,8 @@ class _MessagePanelState extends State<MessagePanel> {
         // 无明确目标（重启/首次进入/目标会话已删除）时：优先恢复最近
         // 有消息的会话，避免回退到空的默认会话导致会话错位
         target ??= _firstActiveSession(sessions);
-        _currentSession = target ?? (sessions.isNotEmpty ? sessions.first : null);
+        _currentSession =
+            target ?? (sessions.isNotEmpty ? sessions.first : null);
         _messages.clear();
       });
       // 记录该 agent 本次实际生效的会话，供下次切换回来恢复
@@ -469,9 +482,9 @@ class _MessagePanelState extends State<MessagePanel> {
     try {
       final List<Map<String, dynamic>> raw =
           await ApiService.getConversationHistory(
-        agent.id,
-        sessionId: sessionId,
-      );
+            agent.id,
+            sessionId: sessionId,
+          );
       if (!mounted) return;
       // 会话可能在等待期间被切换，丢弃过期的历史
       if (sessionId != _currentSessionId) return;
@@ -483,6 +496,10 @@ class _MessagePanelState extends State<MessagePanel> {
         for (final Map<String, dynamic> item in raw) {
           _messages.add(ChatMessage.fromJson(item));
         }
+        // 历史整批重建 = 这批消息都是**已关闭的段**（核心"段关闭即落库"），
+        // 正文即终稿 ⇒ 全部封口：此后重播的 msg_chunk 不再往它们身上追加
+        // （M9 重播去重，替代"靠时序碰运气"）。
+        _replayGuard.resetToHistory(_messages.map((ChatMessage m) => m.id));
         // 历史整批重载：驱动 MessageList 无动画直达底部（避免下滑动画）
         _bottomJump = true;
         // 注意：不再按「当前会话历史是否为空」重置 _modeLocked——
@@ -584,6 +601,15 @@ class _MessagePanelState extends State<MessagePanel> {
         kind: data['kind'] as String? ?? 'text',
       );
       if (message.id.isEmpty) return;
+      // 重播去重：同 id 已经在列表里（历史终稿 / 本端已在流式）⇒ 不再建第二条。
+      // 否则同一个 id 会出现两个气泡，后续增量只打进第一条，第二条永久空转。
+      if (!_replayGuard.shouldCreateMessage(
+        id: message.id,
+        exists: _indexOfMessage(message.id) >= 0,
+      )) {
+        debugPrint('[消息] 忽略重播的 msg_start（同 id 已存在）: ${message.id}');
+        return;
+      }
       setState(() {
         _messages.add(message);
         _scrollRevision++;
@@ -594,16 +620,25 @@ class _MessagePanelState extends State<MessagePanel> {
       if (!_isForCurrentSession(data)) return;
       final String id = (data['id'] as String?) ?? '';
       final String chunk = (data['chunk'] as String?) ?? '';
-      final int idx = _messages.indexWhere((ChatMessage m) => m.id == id);
-      if (idx >= 0) {
-        setState(() {
-          _messages[idx].content += chunk;
-        });
+      final int idx = _indexOfMessage(id);
+      // 重播去重：已封口的 id（历史终稿 / 已 msg_end）不再追加——同一片段重播
+      // 就会渲染两遍；没有对应消息的孤立增量同样丢弃（既有行为）。
+      if (!_replayGuard.shouldAppendChunk(id: id, exists: idx >= 0)) {
+        debugPrint(
+          '[消息] 丢弃增量（${_replayGuard.describe(id: id, exists: idx >= 0)}）: $id',
+        );
+        return;
       }
+      setState(() {
+        _messages[idx].content += chunk;
+      });
     } else if (type == 'msg_end') {
       if (!_isForCurrentSession(data)) return;
       final String id = (data['id'] as String?) ?? '';
-      final int idx = _messages.indexWhere((ChatMessage m) => m.id == id);
+      final int idx = _indexOfMessage(id);
+      // 段关闭即封口：核心保证 msg_end 之前已 flush 全部增量（帧序有保证），
+      // 此后该 id 的正文即终稿 ⇒ 再来 msg_chunk 一律是重播。
+      _replayGuard.seal(id);
       if (idx >= 0) {
         final Map<String, dynamic>? usage =
             (data['usage'] as Map<String, dynamic>?)?.cast<String, dynamic>();
@@ -622,7 +657,7 @@ class _MessagePanelState extends State<MessagePanel> {
       final String id = (data['id'] as String?) ?? '';
       final Map<String, dynamic>? usage =
           (data['usage'] as Map<String, dynamic>?)?.cast<String, dynamic>();
-      final int idx = _messages.indexWhere((ChatMessage m) => m.id == id);
+      final int idx = _indexOfMessage(id);
       if (idx >= 0) {
         setState(() {
           _messages[idx].usage = usage;
@@ -640,6 +675,15 @@ class _MessagePanelState extends State<MessagePanel> {
       if (!_isForCurrentAgent(data) || !_isForCurrentSession(data)) return;
       final String id = (data['id'] as String?) ?? '';
       if (id.isEmpty) return;
+      // 重播去重：同一工具卡片 id 已有卡片时不再新建（重播帧的 tool_end 会照旧
+      // 填到既有卡片上，是幂等的）。
+      if (!_replayGuard.shouldCreateMessage(
+        id: id,
+        exists: _indexOfMessage(id) >= 0,
+      )) {
+        debugPrint('[消息] 忽略重播的 tool_start（同 id 已存在）: $id');
+        return;
+      }
       final Map<String, dynamic>? args =
           (data['arguments'] as Map<String, dynamic>?)?.cast<String, dynamic>();
       final ChatMessage toolMsg = ChatMessage(
@@ -660,7 +704,7 @@ class _MessagePanelState extends State<MessagePanel> {
     } else if (type == 'tool_end') {
       if (!_isForCurrentSession(data)) return;
       final String id = (data['id'] as String?) ?? '';
-      final int idx = _messages.indexWhere((ChatMessage m) => m.id == id);
+      final int idx = _indexOfMessage(id);
       if (idx >= 0) {
         setState(() {
           _messages[idx].toolRunning = false;
@@ -669,15 +713,16 @@ class _MessagePanelState extends State<MessagePanel> {
       }
       // 工具执行结束：按工具类型增量通知右栏刷新对应区域（文件/Git/Todo）。
       // 只读类工具不触发，避免每次工具结束右栏都闪一下。
-      final Set<WorkspaceArea> areas =
-          _areasForToolName((data['name'] as String?) ?? '');
+      final Set<WorkspaceArea> areas = _areasForToolName(
+        (data['name'] as String?) ?? '',
+      );
       if (areas.isNotEmpty) {
         WorkspaceRefreshService.instance.notifyWorkspaceChanged(areas);
       }
     } else if (type == 'agent_status') {
       final Map<String, dynamic> d =
           (data['data'] as Map<String, dynamic>?)?.cast<String, dynamic>() ??
-              {};
+          {};
       final String? agentId = d['agent_id'] as String?;
       final String? status = d['status'] as String?;
       if (agentId == null) return;
@@ -696,11 +741,9 @@ class _MessagePanelState extends State<MessagePanel> {
       _handleAskUserQuestion(data);
     } else if (type == 'ask_user_question_resolved') {
       // 右栏作答后，中栏对应内联卡片即时置灰
-      final String qid =
-          (((data['data'] as Map?)?['id']) as String?) ?? '';
+      final String qid = (((data['data'] as Map?)?['id']) as String?) ?? '';
       if (qid.isNotEmpty) {
-        final int idx =
-            _messages.indexWhere((ChatMessage m) => m.id == qid);
+        final int idx = _indexOfMessage(qid);
         if (idx >= 0) {
           setState(() {
             _messages[idx].answered = true;
@@ -711,6 +754,16 @@ class _MessagePanelState extends State<MessagePanel> {
       if (!_isForCurrentAgent(data) || !_isForCurrentSession(data)) return;
       // 完整 agent 消息（如后端 _send_text_as_agent 发送的错误提示）
       final ChatMessage message = ChatMessage.fromJson(data);
+      // 重播去重：诊断类 message 帧（_sendAdvisory）**不落库**，历史里没有，
+      // 若重播帧再走一遍就会多出一条一模一样的系统提示；空 id 保持既有行为。
+      if (message.id.isNotEmpty &&
+          !_replayGuard.shouldCreateMessage(
+            id: message.id,
+            exists: _indexOfMessage(message.id) >= 0,
+          )) {
+        debugPrint('[消息] 忽略重播的 message 帧（同 id 已存在）: ${message.id}');
+        return;
+      }
       setState(() {
         _messages.add(message);
         _scrollRevision++;
@@ -722,6 +775,10 @@ class _MessagePanelState extends State<MessagePanel> {
     }
     // 其余控制消息（file_sync_progress / heartbeat / error 等）忽略
   }
+
+  /// 消息在列表中的下标（-1 = 不存在；空 id 一律视为不存在）。
+  int _indexOfMessage(String id) =>
+      id.isEmpty ? -1 : _messages.indexWhere((ChatMessage m) => m.id == id);
 
   /// 判断消息是否属于当前选中的 agent（避免工作中的成员消息污染主面板）
   bool _isForCurrentAgent(Map<String, dynamic> data) {
@@ -739,12 +796,10 @@ class _MessagePanelState extends State<MessagePanel> {
   }
 
   /// 记录 token 用量：按 (agent, 会话) 粒度存储，切换会话后互不影响
-  void _recordUsage(
-    Map<String, dynamic> data,
-    Map<String, dynamic> usage,
-  ) {
+  void _recordUsage(Map<String, dynamic> data, Map<String, dynamic> usage) {
     final String agentId = (data['agent_id'] as String?) ?? '';
-    final String sessionId = (data['session_id'] as String?) ?? _currentSessionId;
+    final String sessionId =
+        (data['session_id'] as String?) ?? _currentSessionId;
     _usageByAgent['$agentId::$sessionId'] = usage;
   }
 
@@ -756,20 +811,31 @@ class _MessagePanelState extends State<MessagePanel> {
     if (_asking) return;
     final String qid = (data['id'] as String?) ?? '';
     if (qid.isEmpty) return;
+    // 重播去重：卡片本身落库（历史里会有），断线期间重播的提问帧不得再插一张
+    // （否则已作答的旧问题会重新冒出来抢答）。
+    if (!_replayGuard.shouldCreateMessage(
+      id: qid,
+      exists: _indexOfMessage(qid) >= 0,
+    )) {
+      debugPrint('[消息] 忽略重播的提问卡片（同 id 已存在）: $qid');
+      return;
+    }
     _asking = true;
     final String question = (data['question'] as String?) ?? '提问';
     final List<String> options =
         (data['options'] as List?)?.map((e) => e.toString()).toList() ??
-            <String>[];
+        <String>[];
     setState(() {
-      _messages.add(ChatMessage(
-        id: qid,
-        role: 'agent',
-        content: question,
-        timestamp: DateTime.now(),
-        kind: 'ask_user_question',
-        options: options,
-      ));
+      _messages.add(
+        ChatMessage(
+          id: qid,
+          role: 'agent',
+          content: question,
+          timestamp: DateTime.now(),
+          kind: 'ask_user_question',
+          options: options,
+        ),
+      );
       _scrollRevision++;
       _bottomJump = false;
     });
@@ -823,11 +889,7 @@ class _MessagePanelState extends State<MessagePanel> {
     _ensureExecutorsReady(agent.id);
 
     final List<Attachment> attachments = filePaths
-        .map((String p) => Attachment(
-              name: _basename(p),
-              size: 0,
-              type: '',
-            ))
+        .map((String p) => Attachment(name: _basename(p), size: 0, type: ''))
         .toList();
 
     final ChatMessage userMessage = ChatMessage(
@@ -934,15 +996,16 @@ class _MessagePanelState extends State<MessagePanel> {
         }
         if (!mounted) return;
         // 弹出 SSH 配置表单（预填已有配置）
-        final Map<String, dynamic>? config = await showDialog<Map<String, dynamic>>(
-          context: context,
-          builder: (BuildContext dialogContext) =>
-              SshConfigDialog(initialConfig: _sshConfig),
-        );
+        final Map<String, dynamic>? config =
+            await showDialog<Map<String, dynamic>>(
+              context: context,
+              builder: (BuildContext dialogContext) =>
+                  SshConfigDialog(initialConfig: _sshConfig),
+            );
         if (config == null || !mounted) return;
         // 注册并等待后端 ack（后端会先测试连接）
-        final Map<String, dynamic> ack =
-            await SshExecutorService.instance.enableTeam(teamId, config);
+        final Map<String, dynamic> ack = await SshExecutorService.instance
+            .enableTeam(teamId, config);
         if (!mounted) return;
         if (ack['success'] == true) {
           setState(() {
@@ -980,10 +1043,7 @@ class _MessagePanelState extends State<MessagePanel> {
   void _showSnackBar(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        duration: const Duration(seconds: 2),
-      ),
+      SnackBar(content: Text(message), duration: const Duration(seconds: 2)),
     );
   }
 
@@ -1025,8 +1085,9 @@ class _MessagePanelState extends State<MessagePanel> {
               child: ListenableBuilder(
                 listenable: PluginUiRegistry.instance,
                 builder: (BuildContext context, Widget? child) {
-                  final bool hasCards = PluginUiRegistry.instance
-                      .hasKind(PluginUiSlotKind.card);
+                  final bool hasCards = PluginUiRegistry.instance.hasKind(
+                    PluginUiSlotKind.card,
+                  );
                   return MessageList(
                     messages: _messages,
                     revision: _scrollRevision,
@@ -1066,8 +1127,7 @@ class _MessagePanelState extends State<MessagePanel> {
     final Map<String, dynamic>? usage = agent != null
         ? _usageByAgent['${agent.id}::$_currentSessionId']
         : null;
-    final int promptTokens =
-        (usage?['prompt_tokens'] as num?)?.toInt() ?? 0;
+    final int promptTokens = (usage?['prompt_tokens'] as num?)?.toInt() ?? 0;
     final int maxTokens = (usage?['max_tokens'] as num?)?.toInt() ?? 0;
 
     return Container(
@@ -1083,7 +1143,10 @@ class _MessagePanelState extends State<MessagePanel> {
         children: <Widget>[
           Icon(Icons.data_usage, size: 14, color: cs.onSurfaceVariant),
           const SizedBox(width: 4),
-          Text('上下文', style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+          Text(
+            '上下文',
+            style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+          ),
           const SizedBox(width: 8),
           if (maxTokens > 0)
             Expanded(
@@ -1091,11 +1154,11 @@ class _MessagePanelState extends State<MessagePanel> {
                 borderRadius: BorderRadius.circular(2),
                 child: LinearProgressIndicator(
                   value: (promptTokens / maxTokens).clamp(0.0, 1.0),
-                  backgroundColor: cs.surfaceContainerHighest.withValues(alpha: 0.5),
+                  backgroundColor: cs.surfaceContainerHighest.withValues(
+                    alpha: 0.5,
+                  ),
                   valueColor: AlwaysStoppedAnimation<Color>(
-                    promptTokens > maxTokens * 0.9
-                        ? cs.error
-                        : cs.primary,
+                    promptTokens > maxTokens * 0.9 ? cs.error : cs.primary,
                   ),
                   minHeight: 4,
                 ),
@@ -1105,13 +1168,8 @@ class _MessagePanelState extends State<MessagePanel> {
           Text(
             maxTokens > 0
                 ? '${_formatTokens(promptTokens)} / ${_formatTokens(maxTokens)}'
-                : (promptTokens > 0
-                    ? _formatTokens(promptTokens)
-                    : '暂无数据'),
-            style: TextStyle(
-              fontSize: 11,
-              color: cs.onSurfaceVariant,
-            ),
+                : (promptTokens > 0 ? _formatTokens(promptTokens) : '暂无数据'),
+            style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
           ),
         ],
       ),
@@ -1184,10 +1242,7 @@ class _MessagePanelState extends State<MessagePanel> {
                     const SizedBox(width: 4),
                     const Text(
                       '工作中',
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: Colors.orange,
-                      ),
+                      style: TextStyle(fontSize: 11, color: Colors.orange),
                     ),
                   ],
                   if (compacting) ...<Widget>[
@@ -1203,10 +1258,7 @@ class _MessagePanelState extends State<MessagePanel> {
                     const SizedBox(width: 4),
                     Text(
                       '压缩中',
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: cs.tertiary,
-                      ),
+                      style: TextStyle(fontSize: 11, color: cs.tertiary),
                     ),
                   ],
                 ],
@@ -1235,7 +1287,7 @@ class _MessagePanelState extends State<MessagePanel> {
             IconButton(
               tooltip: (agent.pendingMemberCount > 0)
                   ? '查看 teammates 工作进度（有 ${agent.pendingMemberCount} 名成员'
-                      '等待分配模型 / 审核）'
+                        '等待分配模型 / 审核）'
                   : '查看 teammates 工作进度',
               icon: _buildTeammatesIcon(agent),
               onPressed: () => _openTeammatesWindow(agent),
@@ -1293,10 +1345,7 @@ class _MessagePanelState extends State<MessagePanel> {
           label.isEmpty ? 'SSH' : label,
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
-          style: const TextStyle(
-            fontSize: 11,
-            color: Colors.orange,
-          ),
+          style: const TextStyle(fontSize: 11, color: Colors.orange),
         ),
       ),
     );
@@ -1316,10 +1365,7 @@ class _MessagePanelState extends State<MessagePanel> {
               displayPath.isEmpty ? '选择目录' : displayPath,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: 11,
-                color: cs.onSurfaceVariant,
-              ),
+              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
             ),
           ),
         ),
@@ -1348,9 +1394,8 @@ class _MessagePanelState extends State<MessagePanel> {
     // 成员进度而非当前会话。此时拒绝打开并提示，待会话确定后再进入。
     final String? sessionId = _currentSession?.sessionId;
     if (sessionId == null || sessionId.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('会话加载中，请稍候再打开工作进度')),
-      );
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('会话加载中，请稍候再打开工作进度')));
       return;
     }
     await Navigator.of(context).push(
@@ -1405,10 +1450,7 @@ class _MessagePanelState extends State<MessagePanel> {
   void _openSpecPanel(Agent agent) {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) => SpecPanel(
-          agent: agent,
-          sessionId: _currentSessionId,
-        ),
+        builder: (_) => SpecPanel(agent: agent, sessionId: _currentSessionId),
       ),
     );
   }
@@ -1450,9 +1492,8 @@ class _MessagePanelState extends State<MessagePanel> {
       _loadHistory();
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('新建会话失败：$e')),
-      );
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('新建会话失败：$e')));
     }
   }
 
@@ -1460,8 +1501,9 @@ class _MessagePanelState extends State<MessagePanel> {
   Future<void> _handleRenameSession(ChatSession session) async {
     final Agent? agent = widget.selectedAgent;
     if (agent == null) return;
-    final TextEditingController controller =
-        TextEditingController(text: session.title);
+    final TextEditingController controller = TextEditingController(
+      text: session.title,
+    );
     final String? newTitle = await showDialog<String>(
       context: context,
       builder: (BuildContext dialogContext) => AlertDialog(
@@ -1492,23 +1534,24 @@ class _MessagePanelState extends State<MessagePanel> {
       if (!mounted) return;
       setState(() {
         _sessions = _sessions
-            .map((ChatSession s) => s.sessionId == session.sessionId
-                ? ChatSession(
-                    sessionId: s.sessionId,
-                    title: newTitle,
-                    status: s.status,
-                    createdAt: s.createdAt,
-                    updatedAt: s.updatedAt,
-                    selectedSpecIds: s.selectedSpecIds,
-                  )
-                : s)
+            .map(
+              (ChatSession s) => s.sessionId == session.sessionId
+                  ? ChatSession(
+                      sessionId: s.sessionId,
+                      title: newTitle,
+                      status: s.status,
+                      createdAt: s.createdAt,
+                      updatedAt: s.updatedAt,
+                      selectedSpecIds: s.selectedSpecIds,
+                    )
+                  : s,
+            )
             .toList();
       });
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('重命名失败：$e')),
-      );
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('重命名失败：$e')));
     }
   }
 
@@ -1558,9 +1601,8 @@ class _MessagePanelState extends State<MessagePanel> {
       _loadHistory();
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('删除会话失败：$e')),
-      );
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('删除会话失败：$e')));
     }
   }
 
@@ -1597,10 +1639,7 @@ class _MessagePanelState extends State<MessagePanel> {
         message = '上下文无需压缩';
       }
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(message),
-          duration: const Duration(seconds: 2),
-        ),
+        SnackBar(content: Text(message), duration: const Duration(seconds: 2)),
       );
     } catch (e) {
       if (!mounted) return;

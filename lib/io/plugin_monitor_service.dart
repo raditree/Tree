@@ -9,9 +9,13 @@ import 'websocket_service.dart';
 
 /// 插件实例信息（快照条目 / `plugin_status` 增量条目）。
 ///
-/// 字段口径见契约 v1.3 §15.1（与后端对齐）：
+/// 字段口径见契约 v1.3 §15.1（与后端对齐；M9 起补健康度）：
 /// `name` 为展示名（可能为空串，展示层回退 [pluginId]）；
-/// `disabled_reason` M1 恒为空串（M3 巡检联动后启用）。
+/// `disabled_reason` = 启动/注册失败原因（正常时为空串）；
+/// `health` / `missed_heartbeats` / `heartbeat_interval_s` / `degraded_reason`
+/// 是 M9 §1.1 的**心跳判活**产物：`degraded` 表示**心跳连续丢失**，
+/// **不是停用**——此时 `status` 仍是 `registered`（插件进程活着，只是不回应心跳）；
+/// 缺失这些字段（旧核心 / 总开关关闭）时按「未知」处理，展示层不臆测。
 class PluginInstanceInfo {
   /// 插件 ID（实例去重键的一部分）
   final String pluginId;
@@ -34,8 +38,30 @@ class PluginInstanceInfo {
   /// 入站队列深度（缺失为 null）
   final int? queueDepth;
 
-  /// 停用原因（M1 恒为空；展示层为空时不渲染）
+  /// 停用原因（启动/注册失败原因；为空时不渲染）
   final String disabledReason;
+
+  /// 健康度（M9 §1.1）：ok / degraded / unavailable；缺失为**空串 = 未知**
+  /// （未知值原样保留，展示层不崩、不臆测）。
+  final String health;
+
+  /// 连续丢失的心跳拍数（缺失为 null）；`isDegraded` 时通常 ≥ N=3
+  final int? missedHeartbeats;
+
+  /// 心跳间隔 I（秒；缺失为 null）——判活窗口 = I × N（前端按 I=10s / N=3 显示）
+  final double? heartbeatIntervalS;
+
+  /// 心跳降级原因（core 的 `degraded_reason` / 增量 `reason`；未降级为空串）
+  final String degradedReason;
+
+  /// 健康度取值：正常
+  static const String healthOk = 'ok';
+
+  /// 健康度取值：心跳连续丢失（**不是**停用）
+  static const String healthDegraded = 'degraded';
+
+  /// 健康度取值：宿主不可用（未启动 / 已断开）
+  static const String healthUnavailable = 'unavailable';
 
   const PluginInstanceInfo({
     required this.pluginId,
@@ -46,7 +72,20 @@ class PluginInstanceInfo {
     this.lastHeartbeat,
     this.queueDepth,
     this.disabledReason = '',
+    this.health = '',
+    this.missedHeartbeats,
+    this.heartbeatIntervalS,
+    this.degradedReason = '',
   });
+
+  /// 是否处于「心跳降级」（M9 §1.1）：连续 N 拍没收到心跳。
+  ///
+  /// 语义边界：降级**不等于**停用——插件仍注册、仍在跑（只是不回应心跳）；
+  /// 因此这里要求 `status == 'registered'`，停用的实例走「停用原因」那条线。
+  bool get isDegraded => health == healthDegraded && status != 'disabled';
+
+  /// 是否已知健康度（空串 = 旧核心 / 未提供，展示层不据此渲染降级角标）。
+  bool get hasHealth => health.isNotEmpty;
 
   /// 宽容解析单条实例；无法使用（非 Map / 缺 plugin_id）时返回 null（跳过）。
   static PluginInstanceInfo? tryParse(Object? raw) {
@@ -65,6 +104,10 @@ class PluginInstanceInfo {
     }
     final Object? rawHeartbeat = m['last_heartbeat'];
     final Object? rawQueueDepth = m['queue_depth'];
+    // M9 §1.1 健康度字段：宽容解析（类型不符视为缺失，未知字符串原样保留）
+    final Object? rawHealth = m['health'];
+    final Object? rawMissed = m['missed_heartbeats'];
+    final Object? rawInterval = m['heartbeat_interval_s'];
     return PluginInstanceInfo(
       pluginId: pluginId,
       name: (m['name'] ?? '').toString(),
@@ -74,6 +117,10 @@ class PluginInstanceInfo {
       lastHeartbeat: rawHeartbeat is num ? rawHeartbeat.toDouble() : null,
       queueDepth: rawQueueDepth is num ? rawQueueDepth.toInt() : null,
       disabledReason: (m['disabled_reason'] ?? '').toString(),
+      health: rawHealth is String ? rawHealth : '',
+      missedHeartbeats: rawMissed is num ? rawMissed.toInt() : null,
+      heartbeatIntervalS: rawInterval is num ? rawInterval.toDouble() : null,
+      degradedReason: (m['degraded_reason'] ?? '').toString(),
     );
   }
 
@@ -88,12 +135,19 @@ class PluginInstanceInfo {
   }
 
   /// 复制并覆盖可变字段（增量合并用；null 表示保持原值）。
+  ///
+  /// 注意：清空一个字符串字段要传**空串**（如 `degradedReason: ''`），
+  /// 传 null 是"保持原值"——降级恢复时必须显式清零，否则角标会残留。
   PluginInstanceInfo copyWith({
     String? name,
     String? status,
     double? lastHeartbeat,
     int? queueDepth,
     String? disabledReason,
+    String? health,
+    int? missedHeartbeats,
+    double? heartbeatIntervalS,
+    String? degradedReason,
   }) {
     return PluginInstanceInfo(
       pluginId: pluginId,
@@ -104,6 +158,10 @@ class PluginInstanceInfo {
       lastHeartbeat: lastHeartbeat ?? this.lastHeartbeat,
       queueDepth: queueDepth ?? this.queueDepth,
       disabledReason: disabledReason ?? this.disabledReason,
+      health: health ?? this.health,
+      missedHeartbeats: missedHeartbeats ?? this.missedHeartbeats,
+      heartbeatIntervalS: heartbeatIntervalS ?? this.heartbeatIntervalS,
+      degradedReason: degradedReason ?? this.degradedReason,
     );
   }
 }
@@ -224,10 +282,25 @@ class PluginWatchdogInfo {
   /// 活跃 run 数
   final int activeRuns;
 
-  /// 判死数（M1 恒为 0）
+  /// 判死数（M9 起心跳巡检**只标健康度、不终止插件**，因此恒为 0）
   final int judgedDead;
 
-  const PluginWatchdogInfo({this.activeRuns = 0, this.judgedDead = 0});
+  /// 心跳降级实例数（`degraded_count`；缺失为 null = 未知）
+  final int? degradedCount;
+
+  /// 巡检间隔（秒；`interval_s`，即心跳间隔 I；缺失为 null）
+  final double? intervalS;
+
+  /// 判降级阈值（`miss_threshold`，即连续丢失拍数 N；缺失为 null）
+  final int? missThreshold;
+
+  const PluginWatchdogInfo({
+    this.activeRuns = 0,
+    this.judgedDead = 0,
+    this.degradedCount,
+    this.intervalS,
+    this.missThreshold,
+  });
 
   /// 宽容解析；非 Map 返回 null。
   static PluginWatchdogInfo? tryParse(Object? raw) {
@@ -236,9 +309,15 @@ class PluginWatchdogInfo {
     }
     final Map<String, dynamic> m = Map<String, dynamic>.from(raw);
     int i(Object? v) => v is num ? v.toInt() : 0;
+    final Object? rawDegraded = m['degraded_count'];
+    final Object? rawInterval = m['interval_s'];
+    final Object? rawThreshold = m['miss_threshold'];
     return PluginWatchdogInfo(
       activeRuns: i(m['active_runs']),
       judgedDead: i(m['judged_dead']),
+      degradedCount: rawDegraded is num ? rawDegraded.toInt() : null,
+      intervalS: rawInterval is num ? rawInterval.toDouble() : null,
+      missThreshold: rawThreshold is num ? rawThreshold.toInt() : null,
     );
   }
 }
@@ -327,7 +406,9 @@ class PluginSnapshot {
 ///
 /// 数据两条路径（契约 v1.3 §15.1 / §15.4）：
 /// 1. 快照——`GET /api/plugin/snapshot`：打开面板 / 重连 / 手动刷新时拉取；
-/// 2. 增量——WS `plugin_status`：仅合并 registered / disabled / destroyed；
+/// 2. 增量——WS `plugin_status`：合并 registered / disabled / destroyed，
+///    并在 registered 上叠加 M9 §1.1 的**健康度**（health / missed_heartbeats /
+///    heartbeat_interval_s / degraded_reason）；
 ///    未知消息类型、未知 status、畸形载荷一律忽略（防御式解析）。
 ///
 /// 一致性策略：**快照为准**（事件尽力而为、最终一致）；断连重连后自动重拉。
@@ -434,6 +515,9 @@ class PluginMonitorService extends ChangeNotifier {
   ///
   /// 防御式：未知消息类型 / 畸形 data / 空 plugin_id / 未知 status 一律忽略；
   /// 快照未就绪时忽略增量（快照为权威来源）。
+  ///
+  /// 健康度（M9 §1.1）：`health == 'degraded'` 时 **status 仍是 registered**
+  /// （核心口径：插件活着，只是心跳连续丢失），因此合并结果绝不能落成"停用"。
   void handleMessage(Map<String, dynamic> data) {
     final Object? rawType = data['type'];
     if (rawType is! String || rawType != 'plugin_status') {
@@ -464,31 +548,61 @@ class PluginMonitorService extends ChangeNotifier {
     final String reason = (d['reason'] ?? '').toString();
     final Object? rawTs = d['ts'];
     final double? ts = rawTs is num ? rawTs.toDouble() : null;
+    // M9 §1.1 健康度增量：`health` 缺失 ≠ 正常，而是"本次增量没说" ⇒ 保持原值。
+    // 注意 `reason` 是**歧义字段**：disabled 时是停用原因，registered+degraded 时
+    // 是心跳降级原因——只有 `health` 能区分该往哪个字段落，不能只看 reason。
+    final Object? rawHealth = d['health'];
+    final String? health = rawHealth is String && rawHealth.isNotEmpty
+        ? rawHealth
+        : null;
+    final Object? rawMissed = d['missed_heartbeats'];
+    final int? missed = rawMissed is num ? rawMissed.toInt() : null;
+    final Object? rawInterval = d['heartbeat_interval_s'];
+    final double? interval = rawInterval is num ? rawInterval.toDouble() : null;
 
     final PluginSnapshot? snap = _snapshot;
     if (snap == null) {
       return; // 快照未就绪：忽略增量（以快照为准）
     }
 
-    final List<PluginInstanceInfo> list =
-        List<PluginInstanceInfo>.of(snap.instances);
+    final List<PluginInstanceInfo> list = List<PluginInstanceInfo>.of(
+      snap.instances,
+    );
     final String key = PluginInstanceInfo.keyOf(pluginId, scope);
     final int idx = list.indexWhere((PluginInstanceInfo e) => e.key == key);
     switch (status) {
       case 'registered':
+        // 心跳降级**不改 status**（核心就是这么发的：status 仍 registered）：
+        // 只落健康度 / 丢失计数 / 降级原因，避免前端把降级误判成"停用"。
         if (idx >= 0) {
           list[idx] = list[idx].copyWith(
             status: 'registered',
             disabledReason: '',
             lastHeartbeat: ts ?? list[idx].lastHeartbeat,
+            health: health,
+            // 明确报 ok 却没带丢失计数 ⇒ 视为已清零（核心的恢复增量会带 0）
+            missedHeartbeats:
+                missed ?? (health == PluginInstanceInfo.healthOk ? 0 : null),
+            heartbeatIntervalS: interval,
+            degradedReason: health == null
+                ? null
+                : (health == PluginInstanceInfo.healthDegraded ? reason : ''),
           );
         } else {
-          list.add(PluginInstanceInfo(
-            pluginId: pluginId,
-            scope: scope,
-            status: 'registered',
-            lastHeartbeat: ts,
-          ));
+          list.add(
+            PluginInstanceInfo(
+              pluginId: pluginId,
+              scope: scope,
+              status: 'registered',
+              lastHeartbeat: ts,
+              health: health ?? '',
+              missedHeartbeats: missed,
+              heartbeatIntervalS: interval,
+              degradedReason: health == PluginInstanceInfo.healthDegraded
+                  ? reason
+                  : '',
+            ),
+          );
         }
         break;
       case 'disabled':
@@ -497,6 +611,12 @@ class PluginMonitorService extends ChangeNotifier {
             status: 'disabled',
             disabledReason: reason,
             lastHeartbeat: ts ?? list[idx].lastHeartbeat,
+            // 核心推 disabled 前会先断开宿主：快照口径即 unavailable。
+            // 停用不再谈"心跳降级"，降级文案一并清掉（别和停用原因混淆）。
+            health: health ?? PluginInstanceInfo.healthUnavailable,
+            missedHeartbeats: missed ?? 0,
+            heartbeatIntervalS: interval,
+            degradedReason: '',
           );
         }
         break;

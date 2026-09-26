@@ -8,6 +8,9 @@ import '../../io/plugin_monitor_service.dart';
 /// 显式三态：断连（重连中）/ 空（已连接、无实例与站）/ 错误（快照拉取失败）。
 /// 渲染防御式：未知字段与未知状态一律忽略（不崩、不臆测）。
 ///
+/// 健康度（M9 §1.1）：心跳连续丢失的实例打橙色「心跳降级」角标 + 一行说明，
+/// 但状态标签**仍是「已注册」**——降级不是停用，别把两者混成一个状态。
+///
 /// 位于左栏时由活动栏承担标题，可传 [showHeader] = false 避免双标题。
 ///
 /// 位于左栏时还应传 [onCollapse]：面板内容下方的空白区域可点击折叠左栏
@@ -73,8 +76,7 @@ class _PluginPanelState extends State<PluginPanel> {
     return Column(
       children: [
         if (widget.showHeader) _buildHeader(cs),
-        if (!_svc.connected)
-          _buildBanner(cs, '连接断开，正在重连…（下方为最近一次数据）'),
+        if (!_svc.connected) _buildBanner(cs, '连接断开，正在重连…（下方为最近一次数据）'),
         if (_svc.error != null) _buildBanner(cs, '快照获取失败：${_svc.error}'),
         Expanded(child: _buildBody(cs, snap)),
       ],
@@ -161,9 +163,7 @@ class _PluginPanelState extends State<PluginPanel> {
         SliverPadding(
           padding: const EdgeInsets.only(top: 8),
           sliver: SliverList(
-            delegate: SliverChildListDelegate(<Widget>[
-              _bodyContent(cs, snap),
-            ]),
+            delegate: SliverChildListDelegate(<Widget>[_bodyContent(cs, snap)]),
           ),
         ),
         SliverFillRemaining(
@@ -189,7 +189,7 @@ class _PluginPanelState extends State<PluginPanel> {
             _emptyHint(cs, '暂无插件实例')
           else
             ...snap.instances.map(
-              (PluginInstanceInfo e) => _instanceCard(cs, e),
+              (PluginInstanceInfo e) => _instanceCard(cs, e, snap.watchdog),
             ),
           const SizedBox(height: 12),
           _sectionTitle(cs, '处理站（${snap.stations.length}）'),
@@ -265,10 +265,7 @@ class _PluginPanelState extends State<PluginPanel> {
         if (widget.onCollapse != null) ...<Widget>[
           Icon(Icons.chevron_left, size: 20, color: cs.outline),
           const SizedBox(height: 4),
-          Text(
-            '点击空白处折叠左栏',
-            style: TextStyle(fontSize: 11, color: cs.outline),
-          ),
+          Text('点击空白处折叠左栏', style: TextStyle(fontSize: 11, color: cs.outline)),
         ],
       ],
     );
@@ -297,34 +294,53 @@ class _PluginPanelState extends State<PluginPanel> {
   }
 
   /// 看门狗概要。
+  ///
+  /// 「判死」在 M9 §1.1 下恒为 0：心跳巡检只标健康度（degraded）**不终止插件**，
+  /// 所以真正要看的数字是「降级」——有降级实例时该 pill 转橙提示。
   Widget _buildWatchdog(ColorScheme cs, PluginSnapshot snap) {
     final PluginWatchdogInfo? w = snap.watchdog;
     if (w == null) {
       return _emptyHint(cs, '暂无数据');
     }
-    return Wrap(
-      spacing: 6,
-      runSpacing: 6,
-      children: <Widget>[
-        _pill(cs, '活跃 runs: ${w.activeRuns}'),
-        _pill(cs, '判死: ${w.judgedDead}'),
-      ],
-    );
+    final int? degraded = w.degradedCount;
+    final List<Widget> pills = <Widget>[
+      _pill(cs, '活跃 runs: ${w.activeRuns}'),
+      _pill(cs, '判死: ${w.judgedDead}'),
+      if (degraded != null)
+        _pill(cs, '降级: $degraded', color: degraded > 0 ? Colors.orange : null),
+      if (w.intervalS != null && w.missThreshold != null)
+        _pill(cs, '判活窗口 ${_trimNumber(w.intervalS!)}s×${w.missThreshold}'),
+    ];
+    return Wrap(spacing: 6, runSpacing: 6, children: pills);
   }
 
   /// 单个插件实例卡片。
-  Widget _instanceCard(ColorScheme cs, PluginInstanceInfo e) {
+  ///
+  /// 健康度（M9 §1.1）：心跳连续丢失 ⇒ 角标「心跳降级」+ 一行说明；
+  /// 此时 **状态标签仍是「已注册」**——降级不是停用，文案不得写成"已停用"。
+  Widget _instanceCard(
+    ColorScheme cs,
+    PluginInstanceInfo e,
+    PluginWatchdogInfo? watchdog,
+  ) {
     final String title = e.name.isNotEmpty ? e.name : e.pluginId;
     final List<String> meta = <String>[
       if (e.granularity.isNotEmpty) '粒度 ${e.granularity}',
       '心跳 ${_relativeTime(e.lastHeartbeat)}',
+      if (e.missedHeartbeats != null && e.missedHeartbeats! > 0)
+        '丢失 ${e.missedHeartbeats} 拍',
       if (e.queueDepth != null && e.queueDepth! > 0) '队列 ${e.queueDepth}',
     ];
     return Container(
       margin: const EdgeInsets.only(bottom: 6),
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
-        border: Border.all(color: Theme.of(context).dividerColor),
+        border: Border.all(
+          // 降级实例描边转橙：不靠读文字也能一眼扫到
+          color: e.isDegraded
+              ? Colors.orange.withValues(alpha: 0.7)
+              : Theme.of(context).dividerColor,
+        ),
         borderRadius: BorderRadius.circular(8),
       ),
       child: Column(
@@ -342,6 +358,10 @@ class _PluginPanelState extends State<PluginPanel> {
                   ),
                 ),
               ),
+              if (e.isDegraded) ...<Widget>[
+                _pill(cs, '心跳降级', color: Colors.orange),
+                const SizedBox(width: 6),
+              ],
               _statusLabel(cs, e.status),
             ],
           ),
@@ -359,6 +379,11 @@ class _PluginPanelState extends State<PluginPanel> {
             'scope: ${_scopeSummary(e.scope)}',
             style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
           ),
+          if (e.isDegraded)
+            Text(
+              _degradedDetail(e, watchdog),
+              style: const TextStyle(fontSize: 11, color: Colors.orange),
+            ),
           if (e.disabledReason.isNotEmpty)
             Text(
               '停用原因: ${e.disabledReason}',
@@ -369,14 +394,41 @@ class _PluginPanelState extends State<PluginPanel> {
     );
   }
 
+  /// 降级说明（角标下方那行橙字）：原因 + 丢失拍数 + 判活窗口 I×N。
+  ///
+  /// 文案纪律：**不出现"已停用"**——降级 = 心跳连续丢失，插件仍注册、仍在跑，
+  /// 心跳恢复即自动清除；缺失的字段不臆测（缺失就不写）。
+  String _degradedDetail(PluginInstanceInfo e, PluginWatchdogInfo? watchdog) {
+    final int? n = watchdog?.missThreshold;
+    final double? interval = e.heartbeatIntervalS ?? watchdog?.intervalS;
+    final String head = e.degradedReason.isNotEmpty
+        ? e.degradedReason
+        : (n != null ? '连续 $n 拍未收到心跳' : '心跳连续丢失');
+    final List<String> tail = <String>[
+      '插件仍注册运行（非停用）',
+      if (e.missedHeartbeats != null) '丢失 ${e.missedHeartbeats} 拍',
+      if (interval != null && n != null)
+        '判活窗口 ${_trimNumber(interval)}s×$n'
+      else if (interval != null)
+        '心跳间隔 ${_trimNumber(interval)}s',
+    ];
+    return '$head · ${tail.join(' · ')}';
+  }
+
+  /// 秒数去掉多余小数（30.0 → 30；2.5 → 2.5）。
+  String _trimNumber(double value) => value == value.roundToDouble()
+      ? value.toInt().toString()
+      : value.toStringAsFixed(1);
+
   /// 单个处理站卡片（计数白名单裁剪，未知键忽略）。
   Widget _stationCard(ColorScheme cs, PluginStationInfo s) {
-    final String subscriber = s.subscriptions.isEmpty ||
-            s.subscriptions.first.subscriber.isEmpty
+    final String subscriber =
+        s.subscriptions.isEmpty || s.subscriptions.first.subscriber.isEmpty
         ? '—'
         : s.subscriptions.first.subscriber;
-    final String subNote =
-        s.subscriptions.length > 1 ? '（+${s.subscriptions.length - 1}）' : '';
+    final String subNote = s.subscriptions.length > 1
+        ? '（+${s.subscriptions.length - 1}）'
+        : '';
     const List<String> countKeys = <String>[
       'requests',
       'responded',
@@ -449,7 +501,14 @@ class _PluginPanelState extends State<PluginPanel> {
   }
 
   /// 小圆角标签。
-  Widget _pill(ColorScheme cs, String text, {bool emphasize = false}) {
+  ///
+  /// [color] 覆盖文字色（如降级用橙色）；[emphasize] 给"当前态"标签上底色。
+  Widget _pill(
+    ColorScheme cs,
+    String text, {
+    bool emphasize = false,
+    Color? color,
+  }) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
       decoration: BoxDecoration(
@@ -461,7 +520,9 @@ class _PluginPanelState extends State<PluginPanel> {
         text,
         style: TextStyle(
           fontSize: 11,
-          color: emphasize ? cs.onPrimaryContainer : cs.onSurfaceVariant,
+          color:
+              color ??
+              (emphasize ? cs.onPrimaryContainer : cs.onSurfaceVariant),
         ),
       ),
     );
@@ -510,8 +571,7 @@ class _PluginPanelState extends State<PluginPanel> {
     if (ts == null) {
       return '—';
     }
-    final DateTime t =
-        DateTime.fromMillisecondsSinceEpoch((ts * 1000).round());
+    final DateTime t = DateTime.fromMillisecondsSinceEpoch((ts * 1000).round());
     final Duration diff = DateTime.now().difference(t);
     if (diff.inSeconds >= 0 && diff.inSeconds < 60) {
       return '${diff.inSeconds}s 前';

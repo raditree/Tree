@@ -24,7 +24,7 @@ LLM 驱动的 **agent 团队桌面效率工具**：根据任务难度动态组�
 核心在 `127.0.0.1` 上监听**随机端口**并持有**一次性随机 token**，启动时把
 `{port, token, pid, version}` 以单行 JSON（`CoreHandshake`）写到 stdout；UI 解析后
 据此配置 `ApiService.baseUrl` / `WebSocketService.baseUrl` 与 token。REST 路径与 WS
-帧的形状与既有后端完全一致，因此 `lib/ui`（约 15k 行）**零改动**。
+帧的形状与既有后端完全一致，因此 `lib/ui`（约 15k 行）在 M1 迁移时**零改动**即完成对接（后续里程碑按需演进）。
 
 ```
 ┌──────────────── Flutter UI 进程 ─────────────────┐
@@ -65,7 +65,7 @@ M7 打包时把 `tree_core.exe` 与 `Tree.exe` 放在一起）→ 从应用目�
 | --- | --- |
 | 单独调试/重启核心（不必重启应用） | 先跑 `tree_core.exe --port 8001 --verbose`，再给应用设 `TREE_CORE_URL=http://127.0.0.1:8001` 与 `TREE_CORE_TOKEN=<握手行里的 token>` |
 | 查看核心请求日志 | 核心加 `--verbose`（访问日志走 stderr；stdout 只放握手行） |
-| 只跑核心的协议与链路测试 | `cd packages/tree_core && dart test`（299 例，含真实 HTTP + WS 端到端） |
+| 只跑核心的协议与链路测试 | `cd packages/tree_core && dart test`（含真实 HTTP + WS 端到端） |
 | 真 SSH 集成测试（本机无 sshd 时自动跳过） | 设 `TREE_SSH_TEST_HOST` / `TREE_SSH_TEST_USER` / `TREE_SSH_TEST_KEY` 后 `cd packages/tree_local_exec && dart test` |
 | 真机 SSH 文件面板（列举/上传/打包/同步） | 设同样变量（可加 `TREE_SSH_TEST_ROOT`）后 `cd packages/tree_core && dart test test/ssh_files_integration_test.dart` |
 
@@ -153,8 +153,8 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 - **M5d**：Spec 体系（内置模板内嵌 + 自定义 spec 落盘工作空间、`spec` 工具、specs REST）+ 会话状态注入（todo / 已选 Spec 进入模型上下文）
 - **M6a**：MCP（stdio JSON-RPC 客户端 + `mcp` 工具 + 已就绪 MCP 工具原生注入 + 服务注册 REST）
 - **M6b**：插件总线 + 进程外插件宿主（`config/plugins.yaml`、`plugin__<id>__<tool>` 原生工具、事件分发、心跳巡检、快照 REST）
-- **M6c**：插件 WS 增量（`plugin_status` 注册/停用、`plugin_event` 插件通知）
-  - 说明：参考实现的"处理站（stations，插件间订阅路由）"**未在桌面端实现**——单用户本机插件以工具与事件为主，快照里的 `stations` 恒为空数组（字段保留，前端显示 0）；如需该能力再单独立项
+- **M6c**：插件 WS 增量（`plugin_status` 注册/停用/健康度、`plugin_event` 插件通知）
+  - 说明：当时"处理站（stations，插件间订阅路由）"未在桌面端实现，快照里的 `stations` 恒为空数组；**M9 Q11 已补齐站点体系**（广播站 / 执行站 / 中转站 + 新增收集站），`stations` 现在返回真实站点实例与订阅
 - **M6a**：MCP（stdio JSON-RPC 客户端 + `mcp` 工具 + 已就绪 MCP 工具的原生注入 + 服务注册 REST）
 - **M7a**：打包（`dart run tool/build_core.dart` → 单文件 `tree_core.exe`；`TREE_CORE_EXE` 门控的真可执行文件冒烟测试：握手 → HTTP 鉴权 → shutdown 优雅退出）
 - **M7b**：删除 `server/`（服务端 Python 整体移除）；完备性门禁从"扫 Python 源码"改为"扫本仓库源码"；README 改写为桌面架构
@@ -170,14 +170,28 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 - **M8b**：按需加载与增量传输——文件面板保持**逐层懒加载**（点开一层才列一层，根目录只发一次 `listdir`），`syncToLocal` 新增 `path`（空 = 根）：「同步到本地」只同步**当前所在目录**，不再默认拉整棵根；远端同步/打包去掉「先全树统计再复制」的双遍遍历，改为**边走边拉边算**（列一层复制一层，触顶即停并回报已处理进度）。真机验收 `open@192.168.0.208`：整棵 3 文件 / 5019 字节，子树 2 文件 / 19 字节
 - **M8c**：单文件**不设大小上限**，改流式/分片——`WorkspaceFiles` 增加 `sizeOf` / `openRead(offset,length)` / `writeStream`（本地走 `dart:io`，远端走 dartssh2 的 `SftpFile.read(offset,length)` / `write(stream)`）；核心 `/download` 边读边发（`FileService.openDownload` + `http_io.writeStream`），上传去掉单文件上限、远端 `upload_complete` 改成流式写；`content` 预览先问大小、只读前 8 MB 并返回 `truncated`/`size`/`preview_bytes`（不再 413），PDF 信息对大文件只读头尾；前端查看器与文件面板都**流式落盘**，PDF 预览下载到临时文件后交给 `PdfViewer.file` 渐进加载
 - **M8d**：左侧活动栏新增「下载」面板——`DownloadCenter`（全局任务状态机：running/done/failed/cancelled + 进度 + 取消）与 `DownloadPanel`；文件下载在后台流式进行，进度、取消、落盘路径都在列表里；**每条任务标注来源 team**（顶部 agent 名，缺名时退回 agent id），因为同一个列表里会混着不同 agent 工作空间的产物
-- **M7（剩余）**：
-  - 远端 Git 面板（`gitLog`/`gitBranches` 目前对 SSH 仍返回可读 400：需要经 `exec` 跑 git 再解析输出）；SSH 连接的断线重连策略调优
+- **M9**：14 项修复与优化（Q1–Q13 + 全局「心跳判活」规约）——收口 M7 遗留的远端 Git 与 SSH 判活/重连
+  - **全局规约**：**一切静态时间超时取消**，判超时改看**心跳丢失**（I=10s / N=3，判活窗口 I×N=30s）；本地执行体活性 = **进程存活**（活着永不超时）；丢失必须**显式**报错/标记，不静默丢弃。详见[心跳判活口径](#心跳判活口径m9-规约)
+  - **Q1** 上下文超限：工具结果按 **8000 token** 门控（全文落 `.self/results/`，送模型的只有"字符数 + 路径 + 300 字符预览"；界面与落库仍留全文）；**每轮 API 调用前**压缩；端点报超限自动压缩一次并重试该轮；`max_seqlen` 取不到不再默默兜 128000（显式提示）。Token 口径统一为 `tokens = ceil(字符数 / token_scale)`，`token_scale` 逐模型存 `models/<id>.yaml`（初值 2.00），端点回真实 `prompt_tokens` 破水位线时才学习
+  - **Q2** 删除 cloud 运行模式：前端三态改两态（local / ssh），**默认 local**，进页面/切 team 自动落本地执行器
+  - **Q3** 消息按**段**聚合：thinking 段遇正文/工具即关闭；正文段遇工具即关闭并**独立落库**（工具轮之间的中间输出不再并进最终回复）；工具调用一条一张卡片；落库顺序用**单调序号**（同一 agent+session 时间戳严格递增），历史重载顺序与事件顺序严格一致
+  - **Q4** 远端 Git：SSH 侧加 exec 通道 + `gitLog` / `gitBranches`（本地侧复用既有实现）；非仓库 / 无 git ⇒ 空列表 + 退出码，面板显示空而不是 400
+  - **Q5** 多文件粘贴：原生侧读 **CF_HDROP** 文件列表（多选文件 Ctrl+V ⇒ 多个附件），优先级 文件列表 → 单张位图 → 文本路径 → 普通文本
+  - **Q6** 输入框草稿按 **team+session** 缓存（文本与附件一起、**纯内存**），切换即恢复，发送成功后清空该键
+  - **Q7** 下载列表「打开文件所在位置」：Windows `explorer /select,"<path>"`；**文件夹任务定位到 tar.gz 压缩包本身**；文件已被移动/删除给提示而非静默失败
+  - **Q8** 删除工具轮次上限：终止条件只剩 取消 / 出错 / 模型给出最终文本；限额交给插件（插件监视轮次，超限经执行站 `agent.stop` 发停止信号）
+  - **Q9** `spec` 工具瘦身：只留 `select` / `create` / `update`；`select` **直接返回所选 Spec 全文**（删除 `search` / `list` 与"先 read 再 select"约束）；索引**注入系统提示词**（默认全列、>50 条截断）；内置 4 条只读
+  - **Q10** `grep` 无匹配时返回**扫描文件清单**（≤200，超出注明总数）+ **生效的排除目录** + 扫描根，帮模型区分"真没有"与"被误排除"
+  - **Q11** 站点体系（三站 + 收集站）：执行站首命令集 `fs.read` / `fs.write` / `fs.list` / `fs.grep` / `terminal.exec` / `agent.message` / `agent.stop` / `agent.compact` / `ui.push`；中转站"站 × scope 键位唯一"（先到先得）；收集站由**站点定义输入格式**、多订阅者各回目标数据、站点汇总后交后续处理（如注册工具）；订阅者未响应 ⇒ **返回部分结果 + 显式列出未响应者**（不整体失败、不静默）
+  - **Q12** 插件布局：声明式槽位（左侧活动栏项 / 右栏 Tab / 状态栏 / 消息流内联卡片，**不做 webview/iframe**），槽位走独立通道（manifest 声明 + `plugin_ui_manifest` / `plugin_ui_update` / `plugin_ui_action` 三帧，**不经三站**）；受限控件集 text / list / table / form / progress / actions，未知控件渲染成「不支持的控件」占位；槽位带 `team_id`，只呈现当前 team；插件可经 `ui.push` 注入消息流卡片
+  - **Q13** token rate 管道统一：**思考 / 正文 / 工具调用参数**共用同一条节拍器（参数按 `字符数 / token_scale` 折算 token ⇒ `write` 这类大参数自然排队、`read` 几乎不等），工具结果**直推不延迟** ⇒ UI 只有一条速率曲线
+  - **降级与补发**：插件 / MCP / 站点均无静态超时；插件连续 N 拍无心跳 ⇒ `degraded`（status 仍 `registered`，**不是停用**）；MCP 在途请求抛错但不杀进程 / 不关连接；WS 断链期间广播帧进**待补发队列**（上限 + 计数丢弃），重连后按拍原样重播（帧**无 TTL**），前端按**消息 id** 去重防重复渲染
 
 ---
 
 ## 功能特性
 
-- **单进程、无后端**：Flutter UI + 核心进程；无账号体系、无 Docker/云端模式、无跨设备同步。
+- **单进程、无后端**：Flutter UI + 核心进程；无账号体系、无 Docker/云端模式、无跨设备同步。运行模式只有两态：**local（默认）/ ssh**（M9 Q2 删除 cloud，进页面/切 team 自动落 local）。
 - **本地 / SSH 工作空间**：本地直接在工作目录里执行工具；SSH 用 `dartssh2` 连远端（连接由核心发起，IP 相对本机；私钥/口令存在用户自己的 `agents/<id>.yaml`）。
 - **Agent 团队**：成员就是 agent（`agents/<id>.yaml` 里的 `team_id`/`parent_agent_id`/`level`）；层级与每层人数可配（默认 3 / 7）；**审核闸门**（未分配模型或未审核的成员不接收消息）；消息派发与**级联停止**；成员活动日志。
 - **内置工具**：
@@ -189,22 +203,53 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
   | `set_todo_list` | 任务分解与增量进度汇报 |
   | `ask_user_question` | 向用户提问并等待作答（落盘、跨重启用） |
   | `team` / `message` | 建队 / 名册 / 档案 / 审核状态；派活、广播、等待完成 |
-  | `spec` | 任务规范检索 / 选择 / 沉淀（4 个内置模板 + 工作空间自定义） |
+  | `spec` | 规范**选择 / 创建 / 更新**（`select` 直接返回全文；索引注入系统提示词；4 个内置模板 + 工作空间自定义） |
   | `mcp` | 已注册 MCP 服务的工具（原生注入 + 兜底调用） |
   | `plugin` | 已加载插件的工具（同上） |
 
 - **提问回路**：提问落盘 `data/questions.json` → 前端卡片 → 作答幂等 → 继续生成；`stop` 取消在途提问；重启后的补答会写回会话。
-- **Spec 与会话状态**：`select` 之前必须先 `read`；每次工具结果前注入"当前 in_progress todo + 已选 Spec"，模型不会忘记约定。
+- **Spec 与会话状态**：Spec **索引注入系统提示词**（行格式 `- <id> [task_type] 标题（内置）（适用: when 摘要）`，id 用反引号包裹；默认全列、>50 条截断并注明「其余可用 `spec select` 直取」），模型直接 `spec select` 拿全文——M9 Q9 删除了 `search` / `list` / `read` 与"先 read 再 select"约束；每次工具结果前注入"当前 in_progress todo + 已选 Spec"，模型不会忘记约定。
 - **MCP**：`config/mcp.yaml` 注册 stdio 服务，工具以 `mcp__<服务>__<工具>` 原生注入模型工具列表；服务不可用只影响自己（可读错误 + 重连一次）。
-- **插件**：`config/plugins.yaml` 注册进程外插件，工具以 `plugin__<插件>__<工具>` 注入；事件总线（按 scope 过滤）+ 心跳巡检 + `plugin_status` / `plugin_event` 增量。
+- **插件**：`config/plugins.yaml` 注册进程外插件，工具以 `plugin__<插件>__<工具>` 注入；事件总线（按 scope 四元组过滤）+ 心跳巡检 + `plugin_status` / `plugin_event` 增量；心跳连续丢失只标 **degraded**（插件面板橙色「心跳降级」角标 + 丢失拍数/判活窗口），**不杀进程**，恢复即自动清除。插件可经声明式槽位（活动栏 / 右栏 Tab / 状态栏 / 消息流卡片）出界面，也可经**收集站**申报自己的工具定义。
+- **站点体系（M9 Q11）**：广播站 / 执行站 / 中转站 + **收集站**（一对多收集、不回填）；站点是**持久化实例**（类型 / schema / 订阅上限 / scope / 订阅者，跨重启保留），触发即调用实例方法；所有站点消息带并校验**四元组 scope** `(team_id, agent_id, session_id, mode_key)`，跨 scope 不投递（fail-closed）。
 - **数据都在用户能直接看的地方**：`~/.tree` 下的 yaml / jsonl / 快照，可手改。
+
+---
+
+## 心跳判活口径（M9 规约）
+
+**一句话**：**一切"静态时间"超时都取消**——任务跑多久都不因为时间失败；但**仍然会超时**，判据换成**心跳丢失**（怕的是"心跳还在、却因为总时间到了被丢掉"）。
+
+| 项 | 口径 |
+| --- | --- |
+| 心跳间隔 | **I = 10s**（好心跳的节奏；Dart 侧是可被设置覆盖的常量，设置页可调列入 Wave 3 设置项） |
+| 丢失阈值 | **N = 3**（连续 3 拍没收到心跳即判"心跳丢失"） |
+| 判活窗口 | **I × N = 30s**：窗口内没有任何心跳 ⇒ 判失活 / 超时 |
+| 不是总时长上限 | **心跳还在的任务永远不超时**——判据是"最近一次心跳过了多久"，不是"任务总共跑了多久" |
+| 本地执行体 | 活性 = **进程存活**（OS 层）：进程活着永不超时，进程消失按正常退出处理 |
+| 失败必须显式 | 心跳丢失一律显式报错 / 标记，**不得静默丢弃**；消息改为重连补发 |
+
+统一心跳形态：`heartbeat{scope, seq, ts}` ⇒ `heartbeat_ack`；同时记录**最近心跳时间**与**连续丢失计数**，供上层重连决策与界面显示。
+
+| 对象 | 落地形态 |
+| --- | --- |
+| 工具调用 | 无静态上限；执行端心跳丢失 ⇒ 该次调用以显式「心跳丢失」失败 |
+| `terminal` | 无静态上限；心跳丢失 ⇒ **软超时**：不杀进程，转 hook 模式后台执行并返回查询 / 续看方式 |
+| 消息发送（WS / 团队派发） | 无静态上限；连接心跳丢失 ⇒ 判超时并**登记补发**，重连后按拍重播（帧**无 TTL**，只有队列上限） |
+| 执行器命令（local / ssh RPC） | 无静态上限；心跳丢失 ⇒ 显式失败并触发重连 |
+| 插件宿主（stdio 通道） | 无静态上限；连续 N 拍丢失 ⇒ 标 **degraded**（插件面板橙色「心跳降级」角标），**不杀进程**，心跳恢复即自动清除 |
+| MCP 客户端 | 无静态上限；每 I 发一次 ping，连续 N 拍无心跳 ⇒ 在途请求显式抛错（不挂起、不杀进程、不关连接） |
+| LLM 传输 | 只有**建连**保留短超时（否则无法诊断）；流式读取**无总时长上限**，收到任意字节即刷新心跳，空闲到心跳丢失才判超时 |
+| 前端 WS 心跳 | 前端每 **10s** 发一次 `heartbeat`；**必须小于核心判活窗口 I×N = 30s**（两侧注释都写死了这条约束：只改一侧会让"在线但空闲"的连接被判失活） |
+
+> 唯一保留的"静态窗口"是收尾性质的：本地进程**已经死了之后**，残余管道再等 300ms 输出静默 + 3s 兜底才放弃——属收尾而不是任务上限（否则持续输出型后台进程会让工具调用永久挂住）。
 
 ---
 
 ## 架构概览
 
 ```
-┌────────── Flutter UI（lib/ui 零改动对接） ──────────┐
+┌────────── Flutter UI（lib/ui 直连本地核心） ────────┐
 │ ApiService / WebSocketService → 127.0.0.1:<端口>    │
 └──────────────────────┬──────────────────────────────┘
                        │ 本地回环 HTTP + WS（一次性 token，仅经 stdout 握手下发）
@@ -267,6 +312,7 @@ Windows 上是 `%APPDATA%\Tree`；`TREE_HOME` 环境变量或 `--data-dir` 可�
 - **SSH 连不上**：连接由**核心**发起，地址需从本机可达；检查 `agents/<id>.yaml` 的 `ssh:` 段。文件面板与工具层的「工作空间根」就是这里的 `root`（`workspace_dir` 只对本地工作空间生效）。
 - **SSH 的根填哪一级**（M8a）：**不收窄**——`root` 留空就是远端登录用户的 `HOME`。数据文件与项目文件常常分处根下不同子目录（例如 `~/data` 与 `~/proj`），所以根保留在用户给的那一级，由系统提示词里的「工作空间（软约束）」说明“布局是混合的、按用户指示定位”，而不是要求你把根改到某个项目子目录。SSH 配置弹窗的「远端根目录」留空即 HOME（历史键名 `private_key_path` / `remote_base_dir` 仍被核心解析器兼容）。
 - **插件 / MCP 没生效**：看对应 yaml 的 `command` 是否可执行；`GET /api/plugin/snapshot` 与 `GET /api/mcp/services` 会给出 `disabled_reason` / `errors`。坏服务只影响自己。
+- **插件面板出现橙色「心跳降级」角标**：表示连续 3 拍（≈30s）没收到该插件的心跳——**不是停用**（`status` 仍是 `registered`，进程还活着，只是不回应心跳）。先查插件是否卡在某个长任务上；确认无救再显式重启（核心**不会**因为它降级而杀进程）。
 - **模型不可用**：`~/.tree/config/models/<id>.yaml` 的 `base_url` / `api_key`，以及 agent 的 `model_id` 是否指向它。
 - **改配置何时生效**：`agents/*.yaml` 与 `config/*.yaml` 在核心启动时读取；MCP / 插件也可经 REST 即时注册。
 
@@ -275,6 +321,7 @@ Windows 上是 `%APPDATA%\Tree`；`TREE_HOME` 环境变量或 `--data-dir` 可�
 ## 文档
 
 - [开发规格（迁移方案与历史规格）](.trae/specs/)
+- [M9 计划：14 项修复与优化（唯一事实源）](docs/m9-plan.md)
 - [里程碑进度](#里程碑进度)
 
 ---
@@ -295,5 +342,5 @@ Windows 上是 `%APPDATA%\Tree`；`TREE_HOME` 环境变量或 `--data-dir` 可�
 - **Google Flutter/Dart 团队** —— 跨端桌面 + 移动应用框架与工具链。
 - **FastAPI 作者及社区** —— 高性能异步 Python Web 框架。
 - **OpenAI** —— Chat Completions 协议，作为本项目 LLM 统一接入的基础。
-- **Docker 及容器生态** —— 云端模式 agent 工作空间的沙箱隔离基础。
+- **Docker 及容器生态** —— 服务端线（`main` 分支）云端模式 agent 工作空间的沙箱隔离基础（桌面线已无云端模式）。
 - 以及所有直接或间接支撑本项目的**开源软件与贡献者**。
