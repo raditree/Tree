@@ -228,6 +228,8 @@ class CoreSession {
     required this.createdAt,
     required this.updatedAt,
     this.status = 'active',
+    this.compactedSummary = '',
+    this.compactedMessageCount = 0,
     List<String>? selectedSpecIds,
   }) : selectedSpecIds = selectedSpecIds ?? <String>[];
 
@@ -242,6 +244,19 @@ class CoreSession {
   int updatedAt;
   List<String> selectedSpecIds;
 
+  /// 上下文压缩后的摘要（M7d-4）：空串 = 从未压缩。
+  ///
+  /// 压缩**不删除任何消息**（用户仍能在界面回看全文），只是告诉引擎
+  /// "前 [compactedMessageCount] 条已经总结过，请带摘要替代它们"。
+  String compactedSummary;
+
+  /// 已被摘要覆盖的历史消息条数（按写入顺序的前缀长度）。
+  int compactedMessageCount;
+
+  /// 是否已经压缩过上下文。
+  bool get compacted =>
+      compactedMessageCount > 0 && compactedSummary.trim().isNotEmpty;
+
   /// 是否为兜底默认会话。
   bool get isDefault => sessionId == defaultSessionId;
 
@@ -252,6 +267,8 @@ class CoreSession {
     'title': title,
     'status': status,
     'selected_spec_ids': selectedSpecIds,
+    'compacted_summary': compactedSummary,
+    'compacted_message_count': compactedMessageCount,
     'created_at': JsonTime.encode(createdAt),
     'updated_at': JsonTime.encode(updatedAt),
   };
@@ -263,6 +280,9 @@ class CoreSession {
       agentId: json['agent_id'] as String? ?? '',
       title: json['title'] as String? ?? '新会话',
       status: json['status'] as String? ?? 'active',
+      compactedSummary: json['compacted_summary'] as String? ?? '',
+      compactedMessageCount:
+          (json['compacted_message_count'] as num?)?.toInt() ?? 0,
       selectedSpecIds:
           (json['selected_spec_ids'] as List<dynamic>?)
               ?.map((dynamic e) => e.toString())

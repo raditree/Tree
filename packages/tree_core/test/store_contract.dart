@@ -189,6 +189,45 @@ void runStoreContract(String label, TreeStore Function() create) {
       expect(store.deleteSession(agent.id, session.sessionId), isFalse);
     });
 
+    test('setCompacted：记录摘要与已压缩前缀长度；会话不存在返回 false', () {
+      final CoreAgent agent = store.createAgent(name: 'a');
+      final CoreSession session = store.createSession(agent.id)!;
+      expect(
+        store.setCompacted(
+          agent.id,
+          'ses_missing',
+          summary: 's',
+          messageCount: 1,
+        ),
+        isFalse,
+      );
+      expect(
+        store.setCompacted(
+          agent.id,
+          session.sessionId,
+          summary: '早期对话摘要',
+          messageCount: 4,
+        ),
+        isTrue,
+      );
+      final CoreSession? reloaded = store.session(agent.id, session.sessionId);
+      expect(reloaded?.compactedSummary, '早期对话摘要');
+      expect(reloaded?.compactedMessageCount, 4);
+      expect(reloaded?.compacted, isTrue);
+      // 负数按 0 处理（不抛异常，也不留下非法水位）
+      expect(
+        store.setCompacted(
+          agent.id,
+          session.sessionId,
+          summary: '',
+          messageCount: -3,
+        ),
+        isTrue,
+      );
+      expect(store.session(agent.id, session.sessionId)?.compactedMessageCount, 0);
+      expect(store.session(agent.id, session.sessionId)?.compacted, isFalse);
+    });
+
     test('appendMessage：按写入顺序保存并推进会话/agent 的 updated_at', () async {
       final CoreAgent agent = store.createAgent(name: 'a');
       final int agentUpdated = agent.updatedAt;

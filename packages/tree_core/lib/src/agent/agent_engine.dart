@@ -140,6 +140,8 @@ class AgentRunContext {
     required this.userContent,
     required this.history,
     this.modelId = '',
+    this.contextSummary = '',
+    this.compactedMessageCount = 0,
   });
 
   final String agentId;
@@ -156,6 +158,13 @@ class AgentRunContext {
 
   /// 完整会话历史（按时间顺序，已含本次用户消息）。
   final List<CoreMessageRef> history;
+
+  /// 上下文压缩摘要（M7d-4）：非空时引擎会把它作为一条 system 消息插在系统
+  /// 提示词之后，替代 [compactedMessageCount] 条已总结的历史。
+  final String contextSummary;
+
+  /// 历史开头多少条已被 [contextSummary] 覆盖（引擎翻译时跳过它们）。
+  final int compactedMessageCount;
 }
 
 /// 回复引擎：给定一次 [AgentRunContext]，流式产出 [AgentEvent]。

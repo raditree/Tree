@@ -7,6 +7,7 @@ import 'package:tree_local_exec/tree_local_exec.dart';
 import 'package:tree_protocol/tree_protocol.dart';
 
 import '../agent/agent_engine.dart';
+import '../agent/compaction_service.dart';
 import '../agent/conversation_service.dart';
 import '../agent/question_broker.dart';
 import '../agent/question_store.dart';
@@ -62,6 +63,7 @@ class CoreServer {
     required this.fileService,
     required this.hub,
     required this.questions,
+    required this.compaction,
     required this.conversation,
     required this.router,
     required this.stubRouter,
@@ -74,13 +76,9 @@ class CoreServer {
 
   /// 尚未实现、但前端会调用的路径（以 501 明确拒绝，而非静默 404）。
   ///
-  /// 桌面分支只剩两项：PDF 预览（把某页渲染成图片需要光栅化依赖，待用户决策）
-  /// 与手动压缩上下文（M7d-4）。文件读 / 写 / 上传 / 同步 / 打包下载已在 M7d
-  /// 全部实现。
-  static const Set<String> stubApiPaths = <String>{
-    ApiPaths.agentCompact,
-    ApiPaths.filePdfPreview,
-  };
+  /// 桌面分支只剩一项：PDF 预览（把某页渲染成图片需要光栅化依赖，待用户决策）。
+  /// 文件读写 / 上传同步 / 打包下载与上下文压缩都已在 M7d 落地。
+  static const Set<String> stubApiPaths = <String>{ApiPaths.filePdfPreview};
 
   final HttpServer _http;
 
@@ -125,6 +123,9 @@ class CoreServer {
 
   /// 提问回路（M5a）；为 null 时核心不提供 `ask_user_question`（测试/最小骨架）。
   final QuestionBroker? questions;
+
+  /// 上下文压缩（M7d-4）；为 null 时 `agentCompact` 返回 501。
+  final CompactionService? compaction;
 
   /// 会话服务（用户消息 → 流式回复）。
   final ConversationService conversation;
@@ -203,6 +204,7 @@ class CoreServer {
     McpService? mcpService,
     PluginBus? pluginBus,
     FileService? fileService,
+    CompactionService? compaction,
   }) async {
     final HttpServer http = await HttpServer.bind(
       address ?? InternetAddress.loopbackIPv4,
@@ -228,6 +230,7 @@ class CoreServer {
       mcpService: mcpService,
       pluginBus: pluginBus,
       fileService: fileService,
+      compaction: compaction,
       hub: hub,
       questions: questions,
       conversation: ConversationService(
@@ -235,6 +238,7 @@ class CoreServer {
         hub: hub,
         settings: resolvedSettings,
         questions: questions,
+        compaction: compaction,
         engine: engine ?? ScriptedAgent(chunkDelay: streamChunkDelay),
       ),
       router: CoreRouter(),
@@ -261,6 +265,8 @@ class CoreServer {
     await hub.closeAll();
     await mcpService?.close();
     await pluginBus?.close();
+    // 总结器可能持有自己的 HTTP 连接池（与引擎的池分开）：随服务一起释放
+    await compaction?.dispose();
     // 先把在途落盘任务写完再关闭监听（write-behind 的收尾）
     await questions?.questions.flush();
     await store.flush();
@@ -438,6 +444,7 @@ class CoreServer {
     router.add('POST', ApiPaths.agentSessionSpecs, _setSessionSpecs);
     router.add('GET', ApiPaths.agentSpecs, _listSpecs);
     router.add('GET', ApiPaths.agentSpec, _getSpec);
+    router.add('POST', ApiPaths.agentCompact, _compactAgent);
     router.add('GET', ApiPaths.questions, _listQuestions);
     router.add('POST', ApiPaths.questionAnswer, _answerQuestion);
     router.add('GET', ApiPaths.settingsFrameRate, _getFrameRate);
@@ -465,6 +472,67 @@ class CoreServer {
   }
 
   // ── agent ────────────────────────────────────────────────────────────
+
+  /// `POST /api/agents/{agentId}/compact`：手动压缩上下文（M7d-4）。
+  ///
+  /// 状态帧与旧后端一致：压缩期间推 `agent_status=compacting`（前端显示「压缩中」
+  /// 并禁用按钮），结束（含异常）后按**实际**工作状态推 working/idle——压缩期间
+  /// 可能又来了新消息，无脑推 idle 会把前端的状态指示清掉。
+  Future<void> _compactAgent(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final CompactionService? service = compaction;
+    if (service == null) {
+      await writeJson(request, 501, errorBody('上下文压缩尚未接入'));
+      return;
+    }
+    final Map<String, dynamic>? body = await _jsonBody(request);
+    if (body == null) return;
+    final String agentId = params['agentId'] ?? '';
+    final String sessionId = (body['session_id'] ?? '').toString();
+    // 该会话正在生成：拒绝压缩（压缩会改写上下文，与生成并发读写不安全）
+    if (conversation.isRunning(agentId)) {
+      await writeJson(request, 200, <String, dynamic>{
+        'success': true,
+        'compressed': false,
+        'reason': 'agent_working',
+        'context_size': 0,
+      });
+      return;
+    }
+    _broadcastCompactStatus(agentId, sessionId, 'compacting');
+    try {
+      final CompactionResult result = await service.compact(agentId, sessionId);
+      if (result.error.isNotEmpty) {
+        await writeJson(request, result.status, errorBody(result.error));
+        return;
+      }
+      await writeJson(request, 200, result.toJson());
+    } finally {
+      _broadcastCompactStatus(
+        agentId,
+        sessionId,
+        conversation.isRunning(agentId) ? 'working' : 'idle',
+      );
+    }
+  }
+
+  /// 推一条 `agent_status` 帧（前端据此显示/清除「压缩中」）。
+  void _broadcastCompactStatus(
+    String agentId,
+    String sessionId,
+    String status,
+  ) {
+    hub.broadcast(<String, dynamic>{
+      'type': WsOutboundType.agentStatus,
+      'data': <String, dynamic>{
+        'agent_id': agentId,
+        'session_id': sessionId,
+        'status': status,
+      },
+    });
+  }
 
   Future<void> _listAgents(HttpRequest request, Map<String, String> _) async {
     final List<Map<String, dynamic>> items = <Map<String, dynamic>>[];
@@ -1309,7 +1377,11 @@ class CoreServer {
     return int.tryParse('${value ?? ''}') ?? 0;
   }
 
-  Future<bool> _writeFileError(
+  /// 服务层结果里带 `error` 时写回错误响应并返回 true（文件、压缩等共用）。
+  ///
+  /// 服务层统一用 `{error, status}` 表达失败，路由层只判断一次，避免每个处理器
+  /// 各写一遍状态码映射（写错就是「该 400 的变成 500」）。
+  Future<bool> _writeResultError(
     HttpRequest request,
     Map<String, dynamic> result,
   ) async {
@@ -1334,7 +1406,7 @@ class CoreServer {
       params['workspaceId'] ?? '',
       path: request.uri.queryParameters['path'] ?? '',
     );
-    if (await _writeFileError(request, result)) return;
+    if (await _writeResultError(request, result)) return;
     await writeJson(request, 200, result);
   }
 
@@ -1352,7 +1424,7 @@ class CoreServer {
       params['workspaceId'] ?? '',
       request.uri.queryParameters['path'] ?? '',
     );
-    if (await _writeFileError(request, result)) return;
+    if (await _writeResultError(request, result)) return;
     await writeJson(request, 200, result);
   }
 
@@ -1371,7 +1443,7 @@ class CoreServer {
       params['workspaceId'] ?? '',
       (body['path'] ?? '').toString(),
     );
-    if (await _writeFileError(request, result)) return;
+    if (await _writeResultError(request, result)) return;
     await writeBytes(
       request,
       200,
@@ -1396,7 +1468,7 @@ class CoreServer {
       params['workspaceId'] ?? '',
       (body['path'] ?? '').toString(),
     );
-    if (await _writeFileError(request, result)) return;
+    if (await _writeResultError(request, result)) return;
     await writeBytes(
       request,
       200,
@@ -1423,7 +1495,7 @@ class CoreServer {
       relPath: (body['rel_path'] ?? '').toString(),
       totalSize: _asInt(body['total_size']),
     );
-    if (await _writeFileError(request, result)) return;
+    if (await _writeResultError(request, result)) return;
     await writeJson(request, 200, result);
   }
 
@@ -1445,7 +1517,7 @@ class CoreServer {
       index: _asInt(body['index']),
       data: (body['data'] ?? '').toString(),
     );
-    if (await _writeFileError(request, result)) return;
+    if (await _writeResultError(request, result)) return;
     await writeJson(request, 200, result);
   }
 
@@ -1467,7 +1539,7 @@ class CoreServer {
       uploadId: (body['upload_id'] ?? '').toString(),
       totalChunks: chunks == null ? null : _asInt(chunks),
     );
-    if (await _writeFileError(request, result)) return;
+    if (await _writeResultError(request, result)) return;
     await writeJson(request, 200, result);
   }
 
@@ -1487,7 +1559,7 @@ class CoreServer {
       params['workspaceId'] ?? '',
       (body['local_path'] ?? '').toString(),
     );
-    if (await _writeFileError(request, result)) return;
+    if (await _writeResultError(request, result)) return;
     await writeJson(request, 200, result);
   }
 
@@ -1505,7 +1577,7 @@ class CoreServer {
       params['workspaceId'] ?? '',
       request.uri.queryParameters['path'] ?? '',
     );
-    if (await _writeFileError(request, result)) return;
+    if (await _writeResultError(request, result)) return;
     await writeJson(request, 200, result);
   }
 
@@ -1525,7 +1597,7 @@ class CoreServer {
       params['workspaceId'] ?? '',
       limit: limit,
     );
-    if (await _writeFileError(request, result)) return;
+    if (await _writeResultError(request, result)) return;
     await writeJson(request, 200, result);
   }
 
@@ -1542,7 +1614,7 @@ class CoreServer {
     final Map<String, dynamic> result = await files.gitBranches(
       params['workspaceId'] ?? '',
     );
-    if (await _writeFileError(request, result)) return;
+    if (await _writeResultError(request, result)) return;
     await writeJson(request, 200, result);
   }
 

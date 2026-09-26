@@ -280,6 +280,22 @@ class FileTreeStore implements TreeStore {
     return session.selectedSpecIds.length;
   }
 
+  @override
+  bool setCompacted(
+    String agentId,
+    String sessionId, {
+    required String summary,
+    required int messageCount,
+  }) {
+    final CoreSession? session = this.session(agentId, sessionId);
+    if (session == null) return false;
+    session.compactedSummary = summary;
+    session.compactedMessageCount = messageCount < 0 ? 0 : messageCount;
+    session.updatedAt = DateTime.now().millisecondsSinceEpoch;
+    _writeSession(session);
+    return true;
+  }
+
   // ── 消息 ─────────────────────────────────────────────────────────────
 
   @override

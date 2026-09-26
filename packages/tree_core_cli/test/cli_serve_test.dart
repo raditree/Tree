@@ -43,10 +43,10 @@ void main() {
     expect(unauthorized.$1, 401, reason: unauthorized.$2);
 
     // 未实现路径必须是明确的 501（前端有专门文案），而不是 404。
-    // 注意：`/api/files/*` 的读写路径已在 M7d 全部实现，这里改探仍未实现的
-    // 手动压缩上下文（M7d-4）；用 ApiPaths 常量拼，避免测试里散落路径字面量。
+    // 注意：文件读写与上下文压缩都已在 M7d 实现，这里改探仍未实现的 PDF 预览；
+    // 用 ApiPaths 常量拼，避免测试里散落路径字面量。
     final (int, String) stub = await core.get(
-      ApiPaths.agentCompact.replaceAll('{agentId}', 'ws_1'),
+      ApiPaths.filePdfPreview.replaceAll('{workspaceId}', 'ws_1'),
     );
     expect(stub.$1, 501, reason: stub.$2);
 

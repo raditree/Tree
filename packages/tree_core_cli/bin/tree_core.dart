@@ -187,22 +187,28 @@ Future<void> main(List<String> args) async {
     },
     log: (String message) => stderr.writeln('[core:tool] $message'),
   );
+
+  /// 成员级模型参数覆盖（M5b）：用户在「团队成员 → 模型配置」页设置的
+  /// reasoning_effort / max_seqlen / max_output_tokens。
+  ///
+  /// 抽成局部函数是为了让**对话引擎与总结器共用同一口径**：压缩阈值按
+  /// `agent.compressThreshold × max_seqlen` 判定，两处 max_seqlen 不一致就会
+  /// 出现"压了还是超"或"没超就压"的怪象。
+  Map<String, Object?> agentOverrides(String agentId) {
+    final CoreAgent? agent = store.agent(agentId);
+    if (agent == null) return const <String, Object?>{};
+    return <String, Object?>{
+      if (agent.reasoningEffort.trim().isNotEmpty)
+        'reasoning_effort': agent.reasoningEffort,
+      if (agent.maxSeqlenOverride > 0) 'max_seqlen': agent.maxSeqlenOverride,
+      if (agent.maxOutputTokens > 0) 'max_output_tokens': agent.maxOutputTokens,
+    };
+  }
+
   final LlmAgentEngine engine = LlmAgentEngine(
     resolveModel: settings.model,
     toolRunner: tools,
-    // 成员级模型参数覆盖（M5b）：用户在「团队成员 → 模型配置」页设置的
-    // reasoning_effort / max_seqlen / max_output_tokens 在这里作用到请求上。
-    agentOverrides: (String agentId) {
-      final CoreAgent? agent = store.agent(agentId);
-      if (agent == null) return const <String, Object?>{};
-      return <String, Object?>{
-        if (agent.reasoningEffort.trim().isNotEmpty)
-          'reasoning_effort': agent.reasoningEffort,
-        if (agent.maxSeqlenOverride > 0) 'max_seqlen': agent.maxSeqlenOverride,
-        if (agent.maxOutputTokens > 0)
-          'max_output_tokens': agent.maxOutputTokens,
-      };
-    },
+    agentOverrides: agentOverrides,
     // 每次工具结果前告诉模型当下的 todo 与已选 Spec。不接这个，用户在 UI 里
     // 勾选的 Spec 与 set_todo_list 的进度对模型来说就是装饰。
     sessionStatusText: (String agentId, String sessionId) => sessionStatusText(
@@ -212,6 +218,20 @@ Future<void> main(List<String> args) async {
           const <String>[],
     ),
     log: (String message) => stderr.writeln('[core:llm] $message'),
+  );
+
+  // 上下文压缩（M7d-4）：总结走独立传输（不带工具，避免递归触发工具循环），
+  // 阈值与水位线由 CompactionService 管；日志单独打 [core:compact] 前缀，
+  // 这样用户报"压缩没生效"时能一眼看出核心到底压了没压。
+  final CompactionService compaction = CompactionService(
+    store: store,
+    settings: settings,
+    summarizer: LlmSummarizer(
+      resolveModel: settings.model,
+      agentOverrides: agentOverrides,
+      log: (String message) => stderr.writeln('[core:compact] $message'),
+    ),
+    log: (String message) => stderr.writeln('[core:compact] $message'),
   );
 
   final CoreServer server = await CoreServer.start(
@@ -230,6 +250,7 @@ Future<void> main(List<String> args) async {
     mcpService: mcp,
     pluginBus: plugins,
     fileService: files,
+    compaction: compaction,
   );
   // 起监听后才存在的三个依赖一次性接上：广播、在途状态、消息投递
   hubSink = server.hub.broadcast;

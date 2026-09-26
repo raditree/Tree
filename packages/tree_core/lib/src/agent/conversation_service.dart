@@ -5,8 +5,10 @@ import 'package:tree_protocol/tree_protocol.dart';
 import '../settings/core_settings.dart';
 import '../store/tree_store.dart';
 import '../util/ids.dart';
+import '../util/tokens.dart' as tokens;
 import '../ws/ws_hub.dart';
 import 'agent_engine.dart';
+import 'compaction_service.dart';
 import 'question_broker.dart';
 import 'scripted_agent.dart';
 
@@ -53,6 +55,7 @@ class ConversationService {
     required this.hub,
     required this.settings,
     this.questions,
+    this.compaction,
     AgentEngine? engine,
   }) : engine = engine ?? ScriptedAgent();
 
@@ -62,6 +65,9 @@ class ConversationService {
 
   /// 提问回路（M5a）；为 null 时 `user_answer` / `cancel_question` 帧被忽略。
   final QuestionBroker? questions;
+
+  /// 上下文压缩（M7d-4）；为 null 时不做自动压缩（最小骨架/部分测试）。
+  final CompactionService? compaction;
 
   final AgentEngine engine;
 
@@ -313,15 +319,24 @@ class ConversationService {
       });
     }
 
+    // 自动压缩（M7d-4）：长会话先把早期历史总结掉，再按「摘要 + 近期消息」生成。
+    // 放在生成前而不是塞进工具循环里：压缩会改写这个会话的上下文，必须在
+    // 本轮请求构造之前尘埃落定。
+    await _autoCompact(agent, session);
+    // 压缩会把摘要与水位线写回会话对象；重新取一次避免拿到过期快照
+    final CoreSession effective =
+        store.session(agent.id, session.sessionId) ?? session;
     final AgentRunContext context = AgentRunContext(
       agentId: agent.id,
-      sessionId: session.sessionId,
+      sessionId: effective.sessionId,
       modelId: agent.modelId,
       systemPrompt: agent.systemPrompt,
       userContent: userContent,
+      contextSummary: effective.compactedSummary,
+      compactedMessageCount: effective.compactedMessageCount,
       // 用户消息已在 handleUserMessage 里落库，因此这里取到的历史已含本次输入
       history: store
-          .messages(agent.id, session.sessionId)
+          .messages(agent.id, effective.sessionId)
           .map(_toRef)
           .toList(growable: false),
     );
@@ -546,20 +561,19 @@ class ConversationService {
     );
   }
 
-  /// 粗略 token 估算：CJK 码点 ≈ 1 token，其余按 4 字符 ≈ 1 token。
-  static int estimateTokens(String text) {
-    int cjk = 0;
-    int other = 0;
-    for (final int rune in text.runes) {
-      if ((rune >= 0x2E80 && rune <= 0x9FFF) ||
-          (rune >= 0xF900 && rune <= 0xFAFF) ||
-          (rune >= 0xFF00 && rune <= 0xFFEF)) {
-        cjk++;
-      } else {
-        other++;
-      }
+  /// 粗略 token 估算（唯一实现在 util/tokens.dart，压缩阈值与进度条共用）。
+  static int estimateTokens(String text) => tokens.estimateTokens(text);
+
+  /// 自动压缩：只在超过阈值时动，失败只记日志——压缩绝不能把本轮生成搞挂。
+  Future<void> _autoCompact(CoreAgent agent, CoreSession session) async {
+    final CompactionService? service = compaction;
+    if (service == null) return;
+    try {
+      await service.autoCompact(agent, session);
+    } catch (error) {
+      // CompactionService 内部已对"总结失败"做了回退；这里兜的是存储层等
+      // 非预期异常。宁可这轮上下文大一点，也不能因此拒绝回复。
     }
-    return cjk + (other + 3) ~/ 4;
   }
 
   void _sendError(String message) {

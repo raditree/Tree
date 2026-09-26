@@ -273,19 +273,19 @@ void main() {
       expect((await client.send('GET', '/api/nope')).status, 404);
       expect(server.notFoundRequests, 1);
 
-      // 注意：`/api/files/*` 的读写路径与 Git 路径已在 M7d 实现，这里改探仍未
-      // 实现的路径（手动压缩上下文 / PDF 预览），否则测的是"已实现路由"。
-      final String compact = ApiPaths.agentCompact.replaceAll(
-        '{agentId}',
+      // 注意：`/api/files/*` 与 `agentCompact` 都已在 M7d 实现，这里改探仍未
+      // 实现的 PDF 预览，否则测的是"已实现路由"而不是"501 桩"。
+      final String preview = ApiPaths.filePdfPreview.replaceAll(
+        '{workspaceId}',
         'ws_1',
       );
-      final _Res stub = await client.send('GET', compact);
+      final _Res stub = await client.send('GET', preview);
       expect(stub.status, 501);
       expect((stub.json['detail'] as String), contains('功能开发中'));
       expect(server.stubRequests, 1);
 
       // 桩对所有方法一致（POST/PATCH/DELETE 同样 501）
-      expect((await client.send('POST', compact)).status, 501);
+      expect((await client.send('POST', preview)).status, 501);
     });
   });
 

@@ -33,6 +33,8 @@ void main() {
     List<CoreMessageRef> history = const <CoreMessageRef>[
       CoreMessageRef(role: 'user', content: '你好'),
     ],
+    String contextSummary = '',
+    int compactedMessageCount = 0,
   }) => AgentRunContext(
     agentId: 'agt_1',
     sessionId: 'ses_1',
@@ -40,6 +42,8 @@ void main() {
     systemPrompt: systemPrompt,
     userContent: userContent,
     history: history,
+    contextSummary: contextSummary,
+    compactedMessageCount: compactedMessageCount,
   );
 
   group('模型解析的报错必须可操作', () {
@@ -200,6 +204,72 @@ void main() {
       expect(request.reasoningEffort, 'high');
       expect(request.tools.single.name, 'read_file');
       expect(request.tools.single.description, '读文件');
+    });
+
+    test('压缩摘要作为第二条 system 消息注入，被总结的前缀不再发送', () async {
+      final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+        textScript('ok'),
+      ]);
+      await engine(transport)
+          .run(
+            context(
+              history: const <CoreMessageRef>[
+                CoreMessageRef(role: 'user', content: '早期需求'),
+                CoreMessageRef(role: 'agent', content: '早期回答'),
+                CoreMessageRef(role: 'user', content: '本轮问题'),
+              ],
+              contextSummary: '以下是此前对话的总结：用户想要 X',
+              compactedMessageCount: 2,
+            ),
+            isCancelled: () => false,
+          )
+          .toList();
+      final List<LlmMessage> sent = transport.requests.single.messages;
+      expect(sent.first.content, '系统提示');
+      expect(sent[1].role, LlmRole.system);
+      expect(sent[1].content, contains('用户想要 X'));
+      expect(sent.map((LlmMessage m) => m.content), isNot(contains('早期需求')));
+      expect(sent.last.content, '本轮问题');
+    });
+
+    test('切点落在工具卡片上时，引擎把 tool_calls 补回来（序列依然合法）', () async {
+      final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+        textScript('ok'),
+      ]);
+      await engine(transport)
+          .run(
+            context(
+              history: const <CoreMessageRef>[
+                CoreMessageRef(role: 'user', content: '早期需求'),
+                CoreMessageRef(role: 'agent', content: '早期回答'),
+                CoreMessageRef(
+                  role: 'agent',
+                  content: '',
+                  kind: 'tool',
+                  toolName: 'read_file',
+                  toolArguments: <String, dynamic>{'path': 'a.txt'},
+                  toolResult: 'A 的内容',
+                  toolCallId: 'call_a',
+                ),
+                CoreMessageRef(role: 'user', content: '本轮问题'),
+              ],
+              contextSummary: '摘要：读过 a.txt',
+              compactedMessageCount: 2,
+            ),
+            isCancelled: () => false,
+          )
+          .toList();
+      final List<LlmMessage> sent = transport.requests.single.messages;
+      final LlmMessage assistant = sent.firstWhere(
+        (LlmMessage m) => m.toolCalls.isNotEmpty,
+      );
+      expect(assistant.toolCalls.single.name, 'read_file');
+      expect(assistant.toolCalls.single.id, 'call_a');
+      final LlmMessage result = sent.firstWhere(
+        (LlmMessage m) => m.isToolResult,
+      );
+      expect(result.content, 'A 的内容');
+      expect(result.toolCallId, 'call_a');
     });
   });
 

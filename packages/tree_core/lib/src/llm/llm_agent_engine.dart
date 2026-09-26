@@ -139,6 +139,10 @@ class LlmAgentEngine implements AgentEngine {
     if (context.systemPrompt.trim().isNotEmpty) {
       out.add(LlmMessage.system(context.systemPrompt));
     }
+    // 上下文压缩摘要（M7d-4）：紧跟系统提示词，替代已被总结的历史前缀
+    if (context.contextSummary.trim().isNotEmpty) {
+      out.add(LlmMessage.system(context.contextSummary));
+    }
     final List<CoreMessageRef> toolBatch = <CoreMessageRef>[];
 
     void flushTools() {
@@ -177,7 +181,13 @@ class LlmAgentEngine implements AgentEngine {
       toolBatch.clear();
     }
 
-    for (final CoreMessageRef ref in context.history) {
+    // 已压缩的前缀不再翻译：它的内容已经由摘要代表，再发一遍等于没压缩
+    final List<CoreMessageRef> visible = context.compactedMessageCount > 0
+        ? context.history
+              .skip(context.compactedMessageCount)
+              .toList(growable: false)
+        : context.history;
+    for (final CoreMessageRef ref in visible) {
       if (ref.isTool) {
         toolBatch.add(ref);
         continue;

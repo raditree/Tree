@@ -87,6 +87,17 @@ abstract interface class TreeStore {
   /// 设置会话选中的 Spec 列表（M5 交付 Spec 体系前只做存取）。
   int setSelectedSpecs(String agentId, String sessionId, List<String> specIds);
 
+  /// 记录一次上下文压缩（M7d-4）：[messageCount] 是**已被摘要覆盖**的前缀消息
+  /// 数，[summary] 是替代它们的摘要。会话不存在返回 false。
+  ///
+  /// 消息本体不动——压缩只改"引擎该看多少历史"，历史全文仍可回看。
+  bool setCompacted(
+    String agentId,
+    String sessionId, {
+    required String summary,
+    required int messageCount,
+  });
+
   // ── 消息 ─────────────────────────────────────────────────────────────
 
   /// 某会话的全部消息（按写入顺序）。
