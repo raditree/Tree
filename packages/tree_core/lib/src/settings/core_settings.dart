@@ -140,6 +140,38 @@ class CoreModelConfig {
         : '${uri.scheme}://${uri.host}:${uri.port}';
   }
 
+  /// 应用**成员级模型参数覆盖**（M5b）：只覆盖传入的非空项，返回新对象。
+  ///
+  /// 覆盖来自成员 agent 的 `agents/<id>.yaml`（用户在「团队成员 → 模型配置」页
+  /// 设置）。注意 `compress_threshold` 只存不在这里用：压缩策略由后续里程碑
+  /// （上下文 compaction）读取，当前请求不受它影响。
+  CoreModelConfig withOverrides(Map<String, Object?> overrides) {
+    if (overrides.isEmpty) return this;
+    final CoreModelConfig copy = CoreModelConfig(
+      modelId: modelId,
+      name: name,
+      baseUrl: baseUrl,
+      apiKey: apiKey,
+      thinking: thinking,
+      ifVision: ifVision,
+      reasoningEffort: reasoningEffort,
+      reasoningEffortOptions: reasoningEffortOptions,
+      maxSeqlen: maxSeqlen,
+      maxOutputTokens: maxOutputTokens,
+    );
+    final Object? effort = overrides['reasoning_effort'];
+    if (effort is String && effort.trim().isNotEmpty) {
+      copy.reasoningEffort = effort.trim();
+    }
+    final Object? seqlen = overrides['max_seqlen'];
+    if (seqlen is num && seqlen.toInt() > 0) copy.maxSeqlen = seqlen.toInt();
+    final Object? output = overrides['max_output_tokens'];
+    if (output is num && output.toInt() > 0) {
+      copy.maxOutputTokens = output.toInt();
+    }
+    return copy;
+  }
+
   /// 模型上下文长度（前端进度条分母）；未配置时给保守兜底。
   int get effectiveMaxSeqlen => maxSeqlen > 0 ? maxSeqlen : 128000;
 }

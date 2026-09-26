@@ -71,9 +71,19 @@ Future<void> main(List<String> args) async {
     broadcast: (Map<String, dynamic> frame) => hubSink?.call(frame),
     log: (String message) => stderr.writeln('[core:ask] $message'),
   );
+  // 团队服务：成员就是 agent（`agents/<id>.yaml`）。working 状态同样后置绑定到
+  // 会话服务的在途任务表，避免"服务先于核心构造"的顺序环。
+  bool Function(String agentId)? workingSink;
+  final TeamService teams = TeamService(
+    store: store,
+    settings: settings,
+    isWorking: (String agentId) => workingSink?.call(agentId) ?? false,
+    log: (String message) => stderr.writeln('[core:team] $message'),
+  );
   final WorkspaceToolRunner tools = WorkspaceToolRunner(
     todoStore: todos,
     askQuestion: questions.ask,
+    teamService: teams,
     resolveSshConfig: (String agentId) => store.agent(agentId)?.sshConfig,
     // SSH 后端（dartssh2 + SFTP/exec）：每个 agent 一条连接，按需建立并缓存；
     // 远端根目录取 ssh.root（空 = 远端登录用户的 HOME）。
@@ -101,6 +111,19 @@ Future<void> main(List<String> args) async {
   final LlmAgentEngine engine = LlmAgentEngine(
     resolveModel: settings.model,
     toolRunner: tools,
+    // 成员级模型参数覆盖（M5b）：用户在「团队成员 → 模型配置」页设置的
+    // reasoning_effort / max_seqlen / max_output_tokens 在这里作用到请求上。
+    agentOverrides: (String agentId) {
+      final CoreAgent? agent = store.agent(agentId);
+      if (agent == null) return const <String, Object?>{};
+      return <String, Object?>{
+        if (agent.reasoningEffort.trim().isNotEmpty)
+          'reasoning_effort': agent.reasoningEffort,
+        if (agent.maxSeqlenOverride > 0) 'max_seqlen': agent.maxSeqlenOverride,
+        if (agent.maxOutputTokens > 0)
+          'max_output_tokens': agent.maxOutputTokens,
+      };
+    },
     log: (String message) => stderr.writeln('[core:llm] $message'),
   );
 
@@ -113,9 +136,11 @@ Future<void> main(List<String> args) async {
     todoStore: todos,
     engine: engine,
     questions: questions,
+    teamService: teams,
   );
-  // 提问卡片要广播到前端：核心起监听后把广播槽接上
+  // 提问卡片要广播到前端、成员状态要读会话在途表：核心起监听后把两个槽接上
   hubSink = server.hub.broadcast;
+  workingSink = server.conversation.isRunning;
   if (verbose) {
     // 访问日志走 stderr（stdout 是进程间协议，绝不能混入日志）
     server.accessLog = (String message) => stderr.writeln('[core] $message');

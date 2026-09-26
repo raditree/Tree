@@ -27,6 +27,12 @@ abstract interface class TreeStore {
   /// 按 id 取 agent；不存在返回 null。
   CoreAgent? agent(String id);
 
+  /// 全部**顶部 agent**（未加入任何团队的 agent），按 `updated_at` 倒序。
+  List<CoreAgent> teams();
+
+  /// 某团队（TOP agent id）的全部成员（按 `created_at` 升序；不含 TOP 自身）。
+  List<CoreAgent> members(String teamId);
+
   /// 新建 agent 并保证其兜底默认会话存在。
   CoreAgent createAgent({
     required String name,

@@ -74,6 +74,9 @@ class ConversationService {
   /// 当前在途生成数（自检/日志用）。
   int get activeRunCount => _running.length;
 
+  /// 某 agent 是否正在生成（团队名单的 `working` 状态唯一权威）。
+  bool isRunning(String agentId) => _running.containsKey(agentId);
+
   /// 处理 `user_message`。
   ///
   /// 帧字段（与现状 server 一致）：

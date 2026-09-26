@@ -2,8 +2,10 @@ import 'dart:convert';
 
 import 'package:tree_local_exec/tree_local_exec.dart';
 
+import '../team/team_service.dart';
 import 'question_channel.dart';
 import 'terminal_hooks.dart';
+import 'team_tool.dart';
 import 'todo_store.dart';
 import 'tool_runner.dart';
 
@@ -35,7 +37,9 @@ abstract final class BuiltinTools {
   static List<ToolSpec> specs({
     bool withTodos = false,
     bool withQuestions = false,
+    bool withTeam = false,
   }) => <ToolSpec>[
+    if (withTeam) TeamTool.spec(),
     if (withTodos)
       ToolSpec(
         name: setTodoList,
@@ -265,14 +269,21 @@ abstract final class BuiltinTools {
     TodoStore? todos,
     TerminalHooks? hooks,
     AskQuestion? askQuestion,
+    TeamService? teamService,
     bool withTodos = false,
     bool withQuestions = false,
+    bool withTeam = false,
   }) async {
     try {
       if (io == null && needsWorkspace(invocation.name)) {
         return const ToolOutcome('工作空间尚未就绪：无法执行该工具（详见核心日志）', isError: true);
       }
       switch (invocation.name) {
+        case TeamTool.name:
+          if (teamService == null) {
+            return const ToolOutcome('团队服务未接入：无法使用该工具', isError: true);
+          }
+          return await TeamTool.run(invocation, teamService);
         case askUserQuestion:
           return await _askUserQuestion(
             invocation,
@@ -302,7 +313,7 @@ abstract final class BuiltinTools {
         default:
           return ToolOutcome(
             '未知工具：${invocation.name}'
-            '（可用：${specs(withTodos: withTodos, withQuestions: withQuestions).map((ToolSpec s) => s.name).join('、')}）',
+            '（可用：${specs(withTodos: withTodos, withQuestions: withQuestions, withTeam: withTeam).map((ToolSpec s) => s.name).join('、')}）',
             isError: true,
           );
       }

@@ -24,6 +24,21 @@ class MemoryStore implements TreeStore {
   CoreAgent? agent(String id) => _agents[id];
 
   @override
+  List<CoreAgent> teams() =>
+      agents().where((CoreAgent a) => a.teamId.isEmpty).toList(growable: false);
+
+  @override
+  List<CoreAgent> members(String teamId) =>
+      agents()
+          .where((CoreAgent a) => a.teamId == teamId)
+          .toList(growable: false)
+        ..sort(
+          (CoreAgent a, CoreAgent b) => a.createdAt == b.createdAt
+              ? a.id.compareTo(b.id)
+              : a.createdAt.compareTo(b.createdAt),
+        );
+
+  @override
   CoreAgent createAgent({
     required String name,
     String systemPrompt = '',

@@ -5,6 +5,7 @@ import 'package:tree_local_exec/tree_local_exec.dart';
 
 import '../settings/ssh_config.dart';
 
+import '../team/team_service.dart';
 import 'builtin_tools.dart';
 import 'question_channel.dart';
 import 'terminal_hooks.dart';
@@ -29,6 +30,7 @@ class WorkspaceToolRunner implements ToolRunner {
     this.maxResultChars = 24000,
     this.todoStore,
     this.askQuestion,
+    this.teamService,
     WorkspaceIO Function(String dir)? ioFactory,
     this.log,
   }) : _ioFactory = ioFactory ?? LocalWorkspaceIO.new {
@@ -63,6 +65,9 @@ class WorkspaceToolRunner implements ToolRunner {
   /// 提问通道（为 null 时不声明 `ask_user_question`）。
   final AskQuestion? askQuestion;
 
+  /// 团队服务（为 null 时不声明 `team`）。
+  final TeamService? teamService;
+
   final WorkspaceIO Function(String dir) _ioFactory;
 
   /// 可读日志（工具报错、结果截断等）。
@@ -81,6 +86,7 @@ class WorkspaceToolRunner implements ToolRunner {
   }) => BuiltinTools.specs(
     withTodos: todoStore != null,
     withQuestions: askQuestion != null,
+    withTeam: teamService != null,
   );
 
   @override
@@ -108,8 +114,10 @@ class WorkspaceToolRunner implements ToolRunner {
       todos: todoStore,
       hooks: hooks,
       askQuestion: askQuestion,
+      teamService: teamService,
       withTodos: todoStore != null,
       withQuestions: askQuestion != null,
+      withTeam: teamService != null,
     );
     return _truncate(outcome);
   }

@@ -1,4 +1,5 @@
 import '../settings/ssh_config.dart';
+import '../team/team_model.dart';
 import '../util/ids.dart';
 import '../util/json_time.dart';
 
@@ -25,9 +26,22 @@ class CoreAgent {
     this.workspaceDir = '',
     this.sshConfig,
     this.teamMemberCount = 0,
-    this.maxLevel = 1,
-    this.maxMembersPerLevel = 0,
-  });
+    this.maxLevel = 3,
+    this.maxMembersPerLevel = 7,
+    this.teamId = '',
+    this.parentAgentId = '',
+    this.level = 0,
+    this.role = '',
+    this.duty = '',
+    this.canLeadTeam = true,
+    this.reviewStatus = '',
+    this.comment = '',
+    Map<String, double>? scores,
+    this.reasoningEffort = '',
+    this.maxSeqlenOverride = 0,
+    this.maxOutputTokens = 0,
+    this.compressThreshold = 0,
+  }) : scores = scores ?? <String, double>{};
 
   final String id;
   String name;
@@ -47,10 +61,55 @@ class CoreAgent {
   /// 用户可以直接手写 `agents/<id>.yaml` 的 `ssh:` 段接入远端，无需任何 UI。
   SshConfig? sshConfig;
   int teamMemberCount;
+
+  /// 每层最大层级（创建 TOP 时设定；0/负数按 [TeamLimits.defaultMaxLevel]）。
   int maxLevel;
+
+  /// 每层最大直属成员数（0/负数按 [TeamLimits.defaultMaxMembersPerLevel]）。
   int maxMembersPerLevel;
+
+  // ── 团队（M5b）：成员就是 agent，团队字段直接写进 `agents/<id>.yaml` ────
+
+  /// 所属团队（= TOP agent 的 id）。TOP 自身为空串。
+  String teamId;
+
+  /// 直属上级（TOP 的直属成员为 TOP 的 id）。TOP 自身为空串。
+  String parentAgentId;
+
+  /// 层级：TOP = 0，成员 = 上级 + 1。
+  int level;
+
+  /// 角色 / 职责（leader 分工用）。
+  String role;
+  String duty;
+
+  /// 是否允许再建子团队。
+  bool canLeadTeam;
+
+  /// 审核状态（[ReviewStatus]）；TOP 为空串（不适用）。
+  String reviewStatus;
+
+  /// leader 评价。
+  String comment;
+
+  /// 评分（quality / efficiency / collaboration / accuracy，0~10）。
+  Map<String, double> scores;
+
+  // ── 成员级模型参数覆盖（M5b）：0 / 空串 = 未覆盖，回退 TOP 的模型配置 ──
+
+  String reasoningEffort;
+  int maxSeqlenOverride;
+  int maxOutputTokens;
+  double compressThreshold;
+
   final int createdAt;
   int updatedAt;
+
+  /// 是否为团队成员（TOP 不在成员名单里）。
+  bool get isMember => teamId.isNotEmpty;
+
+  /// 是否已通过用户审核、可以接收并执行消息。
+  bool get isApproved => reviewStatus == ReviewStatus.approved;
 
   /// 持久化形态（`agents/<id>.yaml`）。
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -64,6 +123,19 @@ class CoreAgent {
     'team_member_count': teamMemberCount,
     'max_level': maxLevel,
     'max_members_per_level': maxMembersPerLevel,
+    'team_id': teamId,
+    'parent_agent_id': parentAgentId,
+    'level': level,
+    'role': role,
+    'duty': duty,
+    'can_lead_team': canLeadTeam,
+    'review_status': reviewStatus,
+    'comment': comment,
+    'scores': scores,
+    'reasoning_effort': reasoningEffort,
+    'max_seqlen_override': maxSeqlenOverride,
+    'max_output_tokens': maxOutputTokens,
+    'compress_threshold': compressThreshold,
     'created_at': JsonTime.encode(createdAt),
     'updated_at': JsonTime.encode(updatedAt),
   };
@@ -80,8 +152,24 @@ class CoreAgent {
       workspaceDir: json['workspace_dir'] as String? ?? '',
       sshConfig: SshConfig.parse(json['ssh']),
       teamMemberCount: (json['team_member_count'] as num?)?.toInt() ?? 0,
-      maxLevel: (json['max_level'] as num?)?.toInt() ?? 1,
-      maxMembersPerLevel: (json['max_members_per_level'] as num?)?.toInt() ?? 0,
+      maxLevel:
+          (json['max_level'] as num?)?.toInt() ?? TeamLimits.defaultMaxLevel,
+      maxMembersPerLevel:
+          (json['max_members_per_level'] as num?)?.toInt() ??
+          TeamLimits.defaultMaxMembersPerLevel,
+      teamId: json['team_id'] as String? ?? '',
+      parentAgentId: json['parent_agent_id'] as String? ?? '',
+      level: (json['level'] as num?)?.toInt() ?? 0,
+      role: json['role'] as String? ?? '',
+      duty: json['duty'] as String? ?? '',
+      canLeadTeam: json['can_lead_team'] as bool? ?? true,
+      reviewStatus: json['review_status'] as String? ?? '',
+      comment: json['comment'] as String? ?? '',
+      scores: _scoreMap(json['scores']),
+      reasoningEffort: json['reasoning_effort'] as String? ?? '',
+      maxSeqlenOverride: (json['max_seqlen_override'] as num?)?.toInt() ?? 0,
+      maxOutputTokens: (json['max_output_tokens'] as num?)?.toInt() ?? 0,
+      compressThreshold: (json['compress_threshold'] as num?)?.toDouble() ?? 0,
       createdAt: JsonTime.decode(json['created_at']) ?? now,
       updatedAt: JsonTime.decode(json['updated_at']) ?? now,
     );
@@ -108,9 +196,28 @@ class CoreAgent {
     'unread_count': unreadCount,
     'avatar_url': null,
     'pending_member_count': pendingMemberCount,
+    'team_id': teamId,
+    'parent_agent_id': parentAgentId,
+    'level': level,
+    'role': role,
+    'duty': duty,
+    'can_lead_team': canLeadTeam,
+    'review_status': reviewStatus,
     'created_at': createdAt,
     'updated_at': updatedAt,
   };
+}
+
+Map<String, double> _scoreMap(Object? raw) {
+  if (raw is! Map) return <String, double>{};
+  final Map<String, double> out = <String, double>{};
+  raw.forEach((dynamic key, dynamic value) {
+    final double? parsed = value is num
+        ? value.toDouble()
+        : double.tryParse(value?.toString() ?? '');
+    if (parsed != null) out[key.toString()] = parsed;
+  });
+  return out;
 }
 
 /// 会话记录（现状 server `sessions` 表的桌面替身）。

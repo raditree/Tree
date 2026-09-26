@@ -30,6 +30,7 @@ class LlmAgentEngine implements AgentEngine {
     required this.resolveModel,
     this.toolRunner = const EmptyToolRunner(),
     this.transportFactory,
+    this.agentOverrides,
     this.log,
   });
 
@@ -42,6 +43,11 @@ class LlmAgentEngine implements AgentEngine {
   /// 传输层工厂；为空时用 [HttpSseTransport] 并按 (base_url, api_key) 缓存。
   final TransportFactory? transportFactory;
 
+  /// 成员级模型参数覆盖（M5b）：按 agentId 取覆盖并叠加到解析出的模型配置上。
+  ///
+  /// 为什么不放在 `resolveModel` 里：解析器只认识 model_id，而覆盖是**成员**属性。
+  final Map<String, Object?> Function(String agentId)? agentOverrides;
+
   /// 可读日志。
   final void Function(String message)? log;
 
@@ -52,7 +58,10 @@ class LlmAgentEngine implements AgentEngine {
     AgentRunContext context, {
     required bool Function() isCancelled,
   }) async* {
-    final CoreModelConfig? config = resolveModel(context.modelId);
+    final CoreModelConfig? resolved = resolveModel(context.modelId);
+    final CoreModelConfig? config = resolved?.withOverrides(
+      agentOverrides?.call(context.agentId) ?? const <String, Object?>{},
+    );
     if (config == null) {
       yield AgentError(
         context.modelId.isEmpty

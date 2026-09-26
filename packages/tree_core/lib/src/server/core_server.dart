@@ -12,6 +12,8 @@ import '../agent/scripted_agent.dart';
 import '../settings/core_settings.dart';
 import '../store/memory_store.dart';
 import '../store/tree_store.dart';
+import '../team/team_model.dart';
+import '../team/team_service.dart';
 import '../tool/todo_store.dart';
 import '../util/token.dart';
 import '../version.dart';
@@ -42,6 +44,7 @@ class CoreServer {
     required this.store,
     required this.settings,
     required this.todoStore,
+    required this.teamService,
     required this.hub,
     required this.questions,
     required this.conversation,
@@ -63,7 +66,6 @@ class CoreServer {
   ///   `fileSyncToLocal`（M4 本地执行 + M7 文档能力）
   /// - Git 历史：`workspaceGitLog` / `workspaceGitBranches`（M4）
   static const Set<String> stubApiPaths = <String>{
-    ApiPaths.teammate,
     ApiPaths.teammateLog,
     ApiPaths.teammateMessage,
     ApiPaths.agentSpec,
@@ -98,6 +100,9 @@ class CoreServer {
 
   /// WS 连接注册表与广播。
   final WsHub hub;
+
+  /// 团队服务（M5b）；为 null 时不提供 teammates 路由（测试/最小骨架）。
+  final TeamService? teamService;
 
   /// 提问回路（M5a）；为 null 时核心不提供 `ask_user_question`（测试/最小骨架）。
   final QuestionBroker? questions;
@@ -166,6 +171,7 @@ class CoreServer {
     TodoStore? todoStore,
     AgentEngine? engine,
     QuestionBroker? questions,
+    TeamService? teamService,
   }) async {
     final HttpServer http = await HttpServer.bind(
       address ?? InternetAddress.loopbackIPv4,
@@ -184,6 +190,7 @@ class CoreServer {
       store: resolvedStore,
       settings: resolvedSettings,
       todoStore: resolvedTodos,
+      teamService: teamService,
       hub: hub,
       questions: questions,
       conversation: ConversationService(
@@ -415,6 +422,7 @@ class CoreServer {
     router.add('GET', ApiPaths.agentModelsInfo, _agentModelsInfo);
     router.add('GET', ApiPaths.agentTodos, _agentTodos);
     router.add('GET', ApiPaths.agentTeammates, _agentTeammates);
+    router.add('PATCH', ApiPaths.teammate, _updateTeammate);
     router.add('GET', ApiPaths.models, _listModels);
     router.add('POST', ApiPaths.models, _createModel);
     router.add('PATCH', ApiPaths.model, _updateModel);
@@ -478,8 +486,8 @@ class CoreServer {
       systemPrompt: body['system_prompt'] as String? ?? '',
       modelId: modelId,
       teamMemberCount: (body['team_member_count'] as num?)?.toInt() ?? 0,
-      maxLevel: (body['max_level'] as num?)?.toInt() ?? 1,
-      maxMembersPerLevel: (body['max_members_per_level'] as num?)?.toInt() ?? 0,
+      maxLevel: TeamLimits.level(body['max_level']),
+      maxMembersPerLevel: TeamLimits.members(body['max_members_per_level']),
     );
     await writeJson(request, 200, <String, dynamic>{
       'success': true,
@@ -594,13 +602,53 @@ class CoreServer {
 
   Future<void> _agentTeammates(
     HttpRequest request,
-    Map<String, String> _,
+    Map<String, String> params,
   ) async {
-    // 团队成员树由 M5 交付；M1 返回空树（前端渲染空态）
-    await writeJson(request, 200, <String, dynamic>{
-      'members': <Map<String, dynamic>>[],
-      'pending_member_count': 0,
-    });
+    final TeamService? teams = teamService;
+    if (teams == null) {
+      // 未接入团队服务时返回空树（前端渲染空态），而不是 501 让窗口报错
+      await writeJson(request, 200, <String, dynamic>{
+        'agent_id': params['agentId'] ?? '',
+        'members': <Map<String, dynamic>>[],
+        'pending_member_count': 0,
+      });
+      return;
+    }
+    await writeJson(
+      request,
+      200,
+      teams.teammatesPayload(params['agentId'] ?? ''),
+    );
+  }
+
+  /// `PATCH /api/agents/{leaderId}/teammate/{memberId}`：**用户侧**唯一的模型写入口
+  /// （team 工具三处都拒绝改模型）。
+  Future<void> _updateTeammate(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final TeamService? teams = teamService;
+    if (teams == null) {
+      await writeJson(request, 501, errorBody('团队服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic> body = await readJsonBody(request);
+    final Map<String, dynamic> result = teams.assignModel(
+      topId: params['leaderId'] ?? '',
+      memberId: params['memberId'] ?? '',
+      body: body,
+    );
+    final Object? error = result['error'];
+    if (error != null) {
+      final String message = error.toString();
+      await writeJson(
+        request,
+        message.startsWith('成员不存在') ? 404 : 400,
+        errorBody(message),
+      );
+      return;
+    }
+    await writeJson(request, 200, result);
   }
 
   // ── 模型 ─────────────────────────────────────────────────────────────
