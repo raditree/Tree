@@ -61,22 +61,9 @@ abstract final class WsOutboundType {
   /// 大帧分片：结束片。
   static const String frameEnd = 'frame_end';
 
-  // ── 执行器注册回执 ────────────────────────────────────────────────────
-  static const String registerLocalExecutorAck = 'register_local_executor_ack';
-  static const String unregisterLocalExecutorAck =
-      'unregister_local_executor_ack';
-  static const String registerSshExecutorAck = 'register_ssh_executor_ack';
-  static const String unregisterSshExecutorAck = 'unregister_ssh_executor_ack';
-
-  /// 执行器注册丢失通知（需前端重新注册）。
-  static const String registrationLost = 'registration_lost';
-
-  // ── 反向执行通道（核心进程 → 前端执行器） ──────────────────────────────
-  /// 工具执行请求。
-  static const String toolExecRequest = 'tool_exec_request';
-
-  /// 工具执行取消。
-  static const String toolExecCancel = 'tool_exec_cancel';
+  // 说明（M7c）：执行器注册回执（`register_*_ack` / `registration_lost`）与反向
+  // 执行通道（`tool_exec_request` / `tool_exec_cancel`）已删除——桌面端工具由核心
+  // 本机执行，不存在"核心委托前端执行"这回事。
 
   // ── 插件 ──────────────────────────────────────────────────────────────
   /// 插件自定义事件（`plugin_event`）。
@@ -104,13 +91,6 @@ abstract final class WsOutboundType {
     frameBegin,
     frameChunk,
     frameEnd,
-    registerLocalExecutorAck,
-    unregisterLocalExecutorAck,
-    registerSshExecutorAck,
-    unregisterSshExecutorAck,
-    registrationLost,
-    toolExecRequest,
-    toolExecCancel,
     pluginEvent,
     pluginStatus,
   };

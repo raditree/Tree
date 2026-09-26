@@ -364,38 +364,8 @@ class CoreServer {
       case WsInboundType.stop:
         _handleStop(connection, frame);
         break;
-      case WsInboundType.registerLocalExecutor:
-        connection.send(<String, dynamic>{
-          'type': WsOutboundType.registerLocalExecutorAck,
-          'data': <String, dynamic>{
-            'success': true,
-            'team_id': _dataField(frame, 'team_id'),
-          },
-        });
-        break;
-      case WsInboundType.unregisterLocalExecutor:
-        connection.send(<String, dynamic>{
-          'type': WsOutboundType.unregisterLocalExecutorAck,
-          'data': <String, dynamic>{
-            'success': true,
-            'team_id': _dataField(frame, 'team_id'),
-          },
-        });
-        break;
-      case WsInboundType.registerSshExecutor:
-        // 前端按 FIFO 匹配 ack 且不回显 team_id（见 SshExecutorService）。
-        // M4 接入真实 SSH 前先回成功，避免设置面板等待 15s 超时。
-        connection.send(<String, dynamic>{
-          'type': WsOutboundType.registerSshExecutorAck,
-          'data': <String, dynamic>{'success': true},
-        });
-        break;
-      case WsInboundType.unregisterSshExecutor:
-        connection.send(<String, dynamic>{
-          'type': WsOutboundType.unregisterSshExecutorAck,
-          'data': <String, dynamic>{'success': true},
-        });
-        break;
+      // 说明（M7c）：`register_*_executor` / `unregister_*_executor` 已随"前端执行器"
+      // 一起删除——桌面端工具由核心本机执行，不存在委托前端执行这回事。
       case WsInboundType.userAnswer:
         // 作答必须放进 `data` 子对象（前端 message_panel 的口径）；顶层回退
         // 只是兼容手段。
@@ -414,13 +384,6 @@ class CoreServer {
           });
         }
         break;
-      case WsInboundType.toolExecResponse:
-      case WsInboundType.toolExecProgress:
-        // M4 反向执行通道的回报；M1 不会下发 tool_exec_request
-        break;
-      case WsInboundType.pluginHostEvent:
-        // M6 插件宿主生命周期事件
-        break;
       default:
         // 未知帧静默忽略（前向兼容：新前端配旧核心不应崩溃）
         break;
@@ -434,12 +397,6 @@ class CoreServer {
     } catch (_) {
       return null;
     }
-  }
-
-  static String _dataField(Map<String, dynamic> frame, String key) {
-    final Map<String, dynamic> data =
-        (frame['data'] as Map<String, dynamic>?) ?? <String, dynamic>{};
-    return (data[key] as String?) ?? '';
   }
 
   // ── 路由注册 ─────────────────────────────────────────────────────────

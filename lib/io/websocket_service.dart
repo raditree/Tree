@@ -5,17 +5,8 @@ import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:tree_protocol/tree_protocol.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
-/// 工具执行请求处理者签名。
-///
-/// 返回 `true` 表示已接管该 ``tool_exec_request``（WebSocket 服务不再派发
-/// 给后续处理者）；返回 `false` 表示未接管（交由其他处理者按需处理）。
-typedef ToolExecRequestHandler = bool Function(Map<String, dynamic> message);
-
-/// 工具执行取消处理者签名。
-///
-/// 各处理者（本地执行器 / SSH 执行器）按自身记录（hook 分离进程 / SSH hook
-/// pidfile）判断该取消是否归属本端，无关时静默忽略。
-typedef ToolExecCancelHandler = void Function(Map<String, dynamic> message);
+// 说明：桌面端工具由核心进程在本机执行，``tool_exec_request`` / ``tool_exec_cancel``
+// 这一反向执行通道**已不存在**（M7c 删除），因此这里不再有执行器处理者注册表。
 
 // 分帧参数（阈值 kWsFrameChunkThresholdBytes / 分片预算
 // kWsFrameChunkPartBytes / 在途 TTL kWsFrameChunkTtl）与三件套类型名统一由
@@ -93,47 +84,6 @@ class WebSocketService {
   /// 清空已知会话 id（切换 agent / 会话列表整体重载前调用）。
   void clearKnownSessions() {
     knownSessionIds.clear();
-  }
-
-  /// 工具执行请求处理者列表（本地执行器 / SSH 执行器共同注册）。
-  ///
-  /// 收到 ``tool_exec_request`` 时按注册顺序依次调用各处理者；返回 `true`
-  /// 表示该处理者已接管消息（不再派发给后续处理者，也不会派发给
-  /// [onMessage]，避免页面重复解析）。本地与 SSH 模式互斥，由各处理者
-  /// 按自身模式状态决定是否接管（本地处理者在 SSH 模式时返回 false 放行）。
-  final List<ToolExecRequestHandler> _toolExecRequestHandlers =
-      <ToolExecRequestHandler>[];
-
-  /// 注册一个工具执行请求处理者（重复注册会被忽略）。
-  void addToolExecRequestHandler(ToolExecRequestHandler handler) {
-    if (!_toolExecRequestHandlers.contains(handler)) {
-      _toolExecRequestHandlers.add(handler);
-    }
-  }
-
-  /// 注销一个工具执行请求处理者。
-  void removeToolExecRequestHandler(ToolExecRequestHandler handler) {
-    _toolExecRequestHandlers.remove(handler);
-  }
-
-  /// 工具执行取消处理者列表（本地执行器 / SSH 执行器 hook 模式）。
-  ///
-  /// 收到 ``tool_exec_cancel`` 时逐个调用：本地执行器终止对应分离进程，
-  /// SSH 执行器经远端 ``kill -TERM`` 终止对应 hook 后台进程；无关的
-  /// tool_id 由各处理者自行静默忽略。
-  final List<ToolExecCancelHandler> _toolExecCancelHandlers =
-      <ToolExecCancelHandler>[];
-
-  /// 注册一个工具执行取消处理者（重复注册会被忽略）。
-  void addToolExecCancelHandler(ToolExecCancelHandler handler) {
-    if (!_toolExecCancelHandlers.contains(handler)) {
-      _toolExecCancelHandlers.add(handler);
-    }
-  }
-
-  /// 注销一个工具执行取消处理者。
-  void removeToolExecCancelHandler(ToolExecCancelHandler handler) {
-    _toolExecCancelHandlers.remove(handler);
   }
 
   /// 连接状态变化回调
@@ -347,26 +297,6 @@ class WebSocketService {
       // 过滤心跳响应
       final String? type = json['type'] as String?;
       if (type == 'heartbeat' || type == 'pong') {
-        return;
-      }
-      // 工具执行请求交给已注册的执行器处理者（本地/SSH 按模式互斥接管，
-      // 不向上派发）。某处理者返回 true 表示已接管，停止后续派发。
-      if (type == 'tool_exec_request') {
-        final List<ToolExecRequestHandler> handlers =
-            List<ToolExecRequestHandler>.of(_toolExecRequestHandlers);
-        for (final ToolExecRequestHandler handler in handlers) {
-          if (handler(json)) return;
-        }
-        return;
-      }
-      // 工具执行取消分发给已注册的执行器处理者：本地执行器终止对应分离
-      // 进程，SSH 执行器经远端 kill -TERM 终止 hook 后台进程（不向上派发）
-      if (type == 'tool_exec_cancel') {
-        final List<ToolExecCancelHandler> handlers =
-            List<ToolExecCancelHandler>.of(_toolExecCancelHandlers);
-        for (final ToolExecCancelHandler handler in handlers) {
-          handler(json);
-        }
         return;
       }
       // 未知会话消息（Task 7 接收方会话保障）：msg_chunk / msg_end 携带

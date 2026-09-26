@@ -18,26 +18,10 @@ abstract final class WsInboundType {
   /// 取消提问。
   static const String cancelQuestion = 'cancel_question';
 
-  /// 注册本地执行器（本机工具执行能力）。
-  static const String registerLocalExecutor = 'register_local_executor';
-
-  /// 注销本地执行器。
-  static const String unregisterLocalExecutor = 'unregister_local_executor';
-
-  /// 注册 SSH 执行器。
-  static const String registerSshExecutor = 'register_ssh_executor';
-
-  /// 注销 SSH 执行器。
-  static const String unregisterSshExecutor = 'unregister_ssh_executor';
-
-  /// 工具执行结果回报（反向通道）。
-  static const String toolExecResponse = 'tool_exec_response';
-
-  /// 工具执行进度续期（长任务防误判卡死）。
-  static const String toolExecProgress = 'tool_exec_progress';
-
-  /// 插件宿主通道上行（本批仅 event='exit'）。
-  static const String pluginHostEvent = 'plugin_host_event';
+  // 说明（M7c）：桌面端工具由**核心进程本机执行**，因此原先的
+  // `register_*_executor`（注册前端执行能力）与 `tool_exec_response` /
+  // `tool_exec_progress`（反向执行结果回报）整套上行帧已删除——它们描述的
+  // "前端执行器"不存在了。插件宿主同理（核心自己拉起插件进程）。
 
   /// 全部上行类型（完备性测试与文档用）。
   static const Set<String> all = <String>{
@@ -46,12 +30,5 @@ abstract final class WsInboundType {
     stop,
     userAnswer,
     cancelQuestion,
-    registerLocalExecutor,
-    unregisterLocalExecutor,
-    registerSshExecutor,
-    unregisterSshExecutor,
-    toolExecResponse,
-    toolExecProgress,
-    pluginHostEvent,
   };
 }

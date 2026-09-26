@@ -156,8 +156,6 @@ class _MessagePanelState extends State<MessagePanel> {
     // 已知列表中的 session_id 时自动创建本地会话条目，使被动接收
     // （跨 team 推送等）的消息在会话列表可见
     _webSocket.onUnknownSession = _ensureLocalSessionEntry;
-    // SSH 建连重试耗尽时由服务回调本面板弹密码补录窗口（服务无 BuildContext）
-    SshExecutorService.instance.onCredentialRequired = _requestSshCredential;
     _syncKnownSessions();
     // 连接建立/重连时清空 working 集合：后端重启会清空其内存态 _active_tasks，
     // 若不清空，前端会残留旧的 working（无 API 调用却显示工作中）。
@@ -168,15 +166,8 @@ class _MessagePanelState extends State<MessagePanel> {
           _workingAgents.clear();
           _compactingAgents.clear();
         });
-        // WS 连接建立/重连后恢复"已注册且启用"team 的执行器注册
-        //（未激活的 team 不注册；后端断连时按连接自动清理了注册）
-        LocalExecutorService.instance.syncRegisteredTeams();
-        SshExecutorService.instance.syncRegisteredTeams();
-        // 新进程/重连后前端内存里可能没有任何"已注册"记忆（registered=false
-        // 会被 syncRegisteredTeams 跳过），仅靠懒注册会在下次发消息才恢复；
-        // 这里对当前选中 agent 直接补一次 ensureTeam——若该 agent 启用了
-        // 本地/SSH 执行器（含持久化设置）则自动补注册，进会话即自愈（幂等：
-        // 已注册/未启用时静默跳过）。
+        // 重连后刷新当前 agent 的运行模式显示（本地/SSH 写的是 agent 配置，
+        // 不存在"重新注册执行器"这回事）。
         final String? curId = widget.selectedAgent?.id;
         if (curId != null && curId.isNotEmpty) {
           _ensureExecutorsReady(curId);
@@ -520,10 +511,6 @@ class _MessagePanelState extends State<MessagePanel> {
     if (_wsConnected) return;
     final String? token = ApiService.token;
     if (token == null || token.isEmpty) return;
-    // 本地执行器接管工具执行请求（始终接管，按是否本地模式决定是否注册）
-    LocalExecutorService.instance.attach(_webSocket);
-    // SSH 执行器发送注册/注销消息
-    SshExecutorService.instance.attach(_webSocket);
     _wsConnected = true;
     _webSocket.connect(token);
     // 连接建立后会同步触发 onConnectionChange(true)（见 initState）：
@@ -539,29 +526,6 @@ class _MessagePanelState extends State<MessagePanel> {
   void _handleIncomingMessage(Map<String, dynamic> data) {
     if (!mounted) return;
     final String? type = data['type'] as String?;
-
-    // 后端通知执行器注册已丢失（断连清理 / 连续超时自动停用）：本地/SSH
-    // 执行器据此复位 registered=false，避免 stale registered 使下次
-    // ensureTeam 跳过补注册；下次动作（发消息/作答/重连）即自动重注册自愈。
-    if (type == 'registration_lost') {
-      final Map<String, dynamic> regData =
-          (data['data'] as Map<String, dynamic>?) ?? <String, dynamic>{};
-      final String lostTeam = (regData['team_id'] as String?) ?? '';
-      if (lostTeam.isNotEmpty) {
-        LocalExecutorService.instance.handleRegistrationLost(lostTeam);
-        SshExecutorService.instance.handleRegistrationLost(lostTeam);
-      }
-      return;
-    }
-
-    // SSH 执行器注册/注销确认：交给服务完成挂起的等待
-    if (type == 'register_ssh_executor_ack' ||
-        type == 'unregister_ssh_executor_ack') {
-      SshExecutorService.instance.resolveAck(
-        (data['data'] as Map<String, dynamic>?) ?? <String, dynamic>{},
-      );
-      return;
-    }
 
     if (type == 'msg_start') {
       if (!_isForCurrentAgent(data) || !_isForCurrentSession(data)) return;
@@ -993,34 +957,8 @@ class _MessagePanelState extends State<MessagePanel> {
 
   @override
   void dispose() {
-    // 解绑密码补录回调：面板销毁后服务不再往上弹窗（避免用已失效的 context）
-    if (identical(
-        SshExecutorService.instance.onCredentialRequired, _requestSshCredential)) {
-      SshExecutorService.instance.onCredentialRequired = null;
-    }
     _webSocket.disconnect();
     super.dispose();
-  }
-
-  /// SSH 建连重试耗尽后补录密码（由 [SshExecutorService] 回调）：
-  /// 弹出密码输入框，返回 ``{password, persist}``；取消返回 null。
-  Future<Map<String, dynamic>?> _requestSshCredential(
-    String teamId,
-    String reason,
-  ) async {
-    if (!mounted) return null;
-    final Map<String, dynamic> config =
-        SshExecutorService.instance.teamConfig(teamId);
-    return showDialog<Map<String, dynamic>>(
-      context: context,
-      // 必须输入或显式取消：避免误点空白关闭导致重连直接放弃
-      barrierDismissible: false,
-      builder: (BuildContext dialogContext) => SshPasswordDialog(
-        host: (config['host'] as String?) ?? '',
-        username: (config['username'] as String?) ?? '',
-        reason: reason,
-      ),
-    );
   }
 
   @override

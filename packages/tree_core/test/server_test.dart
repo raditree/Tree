@@ -796,45 +796,38 @@ void main() {
       );
     });
 
-    test('执行器注册/注销回执齐全（前端据此避免等待超时）', () async {
+    test('已删除的反向执行帧被静默忽略（老前端不崩、正常帧照常处理）', () async {
       final _WsClient ws = await _WsClient.connect(server);
       ws.record();
       addTearDown(ws.close);
-      ws.send(<String, dynamic>{
-        'type': WsInboundType.registerLocalExecutor,
-        'data': <String, dynamic>{'team_id': 'agt_1', 'base_dir': 'C:\\ws'},
-      });
-      ws.send(<String, dynamic>{
-        'type': WsInboundType.unregisterLocalExecutor,
-        'data': <String, dynamic>{'team_id': 'agt_1'},
-      });
-      ws.send(<String, dynamic>{
-        'type': WsInboundType.registerSshExecutor,
-        'data': <String, dynamic>{'team_id': 'agt_1'},
-      });
-      ws.send(<String, dynamic>{
-        'type': WsInboundType.unregisterSshExecutor,
-        'data': <String, dynamic>{'team_id': 'agt_1'},
-      });
+      // M7c 删除了"前端执行器"与反向执行通道：老版本前端若仍发这些帧，
+      // 核心必须**静默忽略**（前向兼容），而不是崩溃或回错——它们描述的
+      // 执行器已不存在，但协议宽容性不能退化。
+      for (final String removed in <String>[
+        'register_local_executor',
+        'unregister_local_executor',
+        'register_ssh_executor',
+        'unregister_ssh_executor',
+        'tool_exec_response',
+        'tool_exec_progress',
+        'plugin_host_event',
+      ]) {
+        ws.send(<String, dynamic>{
+          'type': removed,
+          'data': <String, dynamic>{'team_id': 'agt_1'},
+        });
+      }
+      // 之后正常帧仍被处理（心跳必须有应答）
+      ws.send(<String, dynamic>{'type': WsInboundType.heartbeat});
       await ws.until(
-        (Map<String, dynamic> f) =>
-            f['type'] == WsOutboundType.unregisterSshExecutorAck,
-        reason: '四个回执',
+        (Map<String, dynamic> f) => f['type'] == WsOutboundType.heartbeat,
+        reason: '心跳应答',
       );
       expect(
         ws.types(),
-        containsAll(<String>[
-          WsOutboundType.registerLocalExecutorAck,
-          WsOutboundType.unregisterLocalExecutorAck,
-          WsOutboundType.registerSshExecutorAck,
-          WsOutboundType.unregisterSshExecutorAck,
-        ]),
+        isNot(contains(WsOutboundType.error)),
+        reason: '已删除的帧不应触发错误帧',
       );
-      final Map<String, dynamic> localAck = ws.frames.firstWhere(
-        (Map<String, dynamic> f) =>
-            f['type'] == WsOutboundType.registerLocalExecutorAck,
-      );
-      expect((localAck['data'] as Map<String, dynamic>)['team_id'], 'agt_1');
     });
 
     test('分片上行被重组后按普通帧处理（大帧不再静默丢弃）', () async {
