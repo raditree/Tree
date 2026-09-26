@@ -85,6 +85,9 @@ class TreePaths {
   /// MCP 服务配置（可直接手改的 yaml）。
   String get mcpConfigFile => p.join(configDir, 'mcp.yaml');
 
+  /// 插件配置（可直接手改的 yaml）。
+  String get pluginsConfigFile => p.join(configDir, 'plugins.yaml');
+
   /// 全部提问的原子快照（跨会话，右侧「问题回复」页用）。
   ///
   /// 为什么不像消息那样按会话拆文件：提问是**跨会话**查询的队列（`GET /api/questions`），

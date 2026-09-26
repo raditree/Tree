@@ -78,6 +78,15 @@ Future<void> main(List<String> args) async {
   );
   await mcp.refresh();
 
+  // 插件总线（M6b）：配置在 <数据根>/config/plugins.yaml；启动时拉起全部启用插件
+  // 并开始心跳巡检。坏插件只标记为不可用，不拦住核心启动。
+  final PluginBus plugins = PluginBus(
+    configFile: paths.pluginsConfigFile,
+    coreVersion: TreeCore.version,
+    log: (String message) => stderr.writeln('[core:plugin] $message'),
+  );
+  await plugins.start();
+
   // 提问回路：工具层先建好、核心后建 WS 广播，因此广播目标用一个可后置绑定的
   // 槽（core 起监听后立即接上 `hub.broadcast`）。
   final FileQuestionStore questionStore = FileQuestionStore(paths);
@@ -140,6 +149,7 @@ Future<void> main(List<String> args) async {
     messageDispatcher: messages,
     specService: specs,
     mcpService: mcp,
+    pluginBus: plugins,
     resolveSshConfig: (String agentId) => store.agent(agentId)?.sshConfig,
     // SSH 后端（dartssh2 + SFTP/exec）：每个 agent 一条连接，按需建立并缓存；
     // 远端根目录取 ssh.root（空 = 远端登录用户的 HOME）。
@@ -205,6 +215,7 @@ Future<void> main(List<String> args) async {
     specService: specs,
     specIoFor: tools.ioFor,
     mcpService: mcp,
+    pluginBus: plugins,
   );
   // 起监听后才存在的三个依赖一次性接上：广播、在途状态、消息投递
   hubSink = server.hub.broadcast;

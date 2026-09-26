@@ -60,7 +60,10 @@ void main() {
       hasLength(1),
       reason: 'stdout 被非协议输出污染：${core.stdoutLines}',
     );
-    // 人类可读日志走 stderr（含数据目录提示）
+    // 人类可读日志走 stderr（含数据目录提示）。
+    // stderr 与 stdout 是两条独立管道，没有先后保证：必须轮询等待而不是立刻断言，
+    // 否则偶发"日志还没到"就会误报失败。
+    await _waitForStderr(core, 'listening on');
     final String stderrText = core.stderrLines.join('\n');
     expect(stderrText, contains('listening on'));
     expect(stderrText, contains('数据目录'));
@@ -100,6 +103,19 @@ void main() {
     final (int, String) res = await core.get('/api/agents');
     expect(res.$1, 200, reason: '控制通道关闭后仍须继续服务：${res.$2}');
   }, timeout: const Timeout(Duration(minutes: 3)));
+}
+
+/// 轮询等待 stderr 出现某段文本（两条管道无顺序保证）。
+Future<void> _waitForStderr(
+  _CoreProcess core,
+  String needle, {
+  Duration timeout = const Duration(seconds: 15),
+}) async {
+  final DateTime deadline = DateTime.now().add(timeout);
+  while (DateTime.now().isBefore(deadline)) {
+    if (core.stderrLines.join('\n').contains(needle)) return;
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+  }
 }
 
 /// 已启动并完成握手的核心子进程。

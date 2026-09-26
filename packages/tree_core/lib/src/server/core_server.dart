@@ -12,6 +12,7 @@ import '../agent/question_store.dart';
 import '../agent/scripted_agent.dart';
 import '../mcp/mcp_client.dart';
 import '../mcp/mcp_service.dart';
+import '../plugin/plugin_bus.dart';
 import '../settings/core_settings.dart';
 import '../spec/spec_service.dart';
 import '../store/atomic_file.dart';
@@ -54,6 +55,7 @@ class CoreServer {
     required this.specService,
     required this.specIoFor,
     required this.mcpService,
+    required this.pluginBus,
     required this.hub,
     required this.questions,
     required this.conversation,
@@ -119,6 +121,9 @@ class CoreServer {
 
   /// MCP 服务（M6a）；为 null 时返回空服务列表。
   final McpService? mcpService;
+
+  /// 插件总线（M6b）；为 null 时快照返回 `enabled: false` 空集。
+  final PluginBus? pluginBus;
 
   /// 提问回路（M5a）；为 null 时核心不提供 `ask_user_question`（测试/最小骨架）。
   final QuestionBroker? questions;
@@ -192,6 +197,7 @@ class CoreServer {
     SpecService? specService,
     Future<WorkspaceIO?> Function(String agentId)? specIoFor,
     McpService? mcpService,
+    PluginBus? pluginBus,
   }) async {
     final HttpServer http = await HttpServer.bind(
       address ?? InternetAddress.loopbackIPv4,
@@ -215,6 +221,7 @@ class CoreServer {
       specService: specService,
       specIoFor: specIoFor,
       mcpService: mcpService,
+      pluginBus: pluginBus,
       hub: hub,
       questions: questions,
       conversation: ConversationService(
@@ -247,6 +254,7 @@ class CoreServer {
     reassembler.clear();
     await hub.closeAll();
     await mcpService?.close();
+    await pluginBus?.close();
     // 先把在途落盘任务写完再关闭监听（write-behind 的收尾）
     await questions?.questions.flush();
     await store.flush();
@@ -1234,14 +1242,23 @@ class CoreServer {
     HttpRequest request,
     Map<String, String> _,
   ) async {
-    // 插件总线（bus/stations/watchdog）由 M6 交付；总开关关闭时返回空集
-    await writeJson(request, 200, <String, dynamic>{
-      'enabled': false,
-      'instances': <Map<String, dynamic>>[],
-      'stations': <Map<String, dynamic>>[],
-      'watchdog': <String, dynamic>{},
-      'config': <String, dynamic>{},
-    });
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      // 未接入插件总线：返回空集（前端渲染空态），而不是 501 让面板报错
+      await writeJson(request, 200, <String, dynamic>{
+        'enabled': false,
+        'instances': <Map<String, dynamic>>[],
+        'stations': <Map<String, dynamic>>[],
+        'watchdog': <String, dynamic>{},
+        'config': <String, dynamic>{},
+      });
+      return;
+    }
+    await writeJson(
+      request,
+      200,
+      bus.snapshot(teamId: request.uri.queryParameters['team_id']),
+    );
   }
 
   Future<void> _mcpServices(HttpRequest request, Map<String, String> _) async {
