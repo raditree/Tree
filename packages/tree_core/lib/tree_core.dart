@@ -12,8 +12,9 @@
 /// - M1：回环服务（握手/鉴权/路由）+ 内存存储 + WS 流式骨架（本文件所在的包）
 /// - M2：`~/.tree` 的 yaml + jsonl 持久化
 /// - M3：真实 LLM（openai_dart 或手写 SSE）+ 完整 LlmSession 语义
-/// - M4：工具层（本机/SSH 工作空间 IO + 11 个内置工具）
-/// - M5：团队编排（broker 队列、成员审核闸门、级联停止、提问回路）
+/// - M4：工具层（本机/SSH 工作空间 IO + 5 个工作空间工具 + 待办/hook）
+/// - M5：人机协作与团队编排（提问回路、team/message 工具、成员审核闸门、级联停止、
+///   Spec 体系与会话状态注入）
 /// - M6：插件总线 + MCP（mcp_dart）+ 进程外插件宿主
 library;
 
@@ -39,6 +40,8 @@ export 'src/llm/sse_parser.dart';
 export 'src/tool/builtin_tools.dart';
 export 'src/tool/message_tool.dart';
 export 'src/tool/question_channel.dart';
+export 'src/tool/spec_tool.dart';
+export 'src/tool/status_text.dart';
 export 'src/tool/team_tool.dart';
 export 'src/tool/terminal_hooks.dart';
 export 'src/tool/todo_store.dart';
@@ -48,6 +51,8 @@ export 'src/server/core_server.dart';
 export 'src/server/http_io.dart';
 export 'src/server/http_router.dart';
 export 'src/settings/core_settings.dart';
+export 'src/spec/builtin_specs.dart';
+export 'src/spec/spec_service.dart';
 export 'src/settings/file_settings_sink.dart';
 export 'src/settings/ssh_config.dart';
 export 'src/store/atomic_file.dart';

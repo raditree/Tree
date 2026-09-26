@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:tree_local_exec/tree_local_exec.dart';
 import 'package:tree_protocol/tree_protocol.dart';
 
 import '../agent/agent_engine.dart';
@@ -10,6 +11,7 @@ import '../agent/question_broker.dart';
 import '../agent/question_store.dart';
 import '../agent/scripted_agent.dart';
 import '../settings/core_settings.dart';
+import '../spec/spec_service.dart';
 import '../store/atomic_file.dart';
 import '../store/memory_store.dart';
 import '../store/tree_store.dart';
@@ -47,6 +49,8 @@ class CoreServer {
     required this.todoStore,
     required this.teamService,
     required this.messageDispatcher,
+    required this.specService,
+    required this.specIoFor,
     required this.hub,
     required this.questions,
     required this.conversation,
@@ -62,13 +66,10 @@ class CoreServer {
   /// M1 尚未实现、但前端会调用的路径（以 501 明确拒绝，而非静默 404）。
   ///
   /// 分组与归属里程碑：
-  /// - 团队成员编排：`teammate` / `teammateLog` / `teammateMessage`（M5）
-  /// - Spec 详情：`agentSpec`（M5）
   /// - 文件与工作空间：`files` / `fileContent` / `filePdf*` / `fileUpload*` /
   ///   `fileSyncToLocal`（M4 本地执行 + M7 文档能力）
   /// - Git 历史：`workspaceGitLog` / `workspaceGitBranches`（M4）
   static const Set<String> stubApiPaths = <String>{
-    ApiPaths.agentSpec,
     ApiPaths.files,
     ApiPaths.fileContent,
     ApiPaths.filePdfInfo,
@@ -106,6 +107,12 @@ class CoreServer {
 
   /// 团队消息派发（M5c）；为 null 时不提供消息/日志路由。
   final TeamMessageDispatcher? messageDispatcher;
+
+  /// Spec 体系（M5d）；为 null 时 specs 路由返回空索引。
+  final SpecService? specService;
+
+  /// 取某 agent 的工作空间 IO（Spec 的自定义文件在工作空间里）。
+  final Future<WorkspaceIO?> Function(String agentId)? specIoFor;
 
   /// 提问回路（M5a）；为 null 时核心不提供 `ask_user_question`（测试/最小骨架）。
   final QuestionBroker? questions;
@@ -176,6 +183,8 @@ class CoreServer {
     QuestionBroker? questions,
     TeamService? teamService,
     TeamMessageDispatcher? messageDispatcher,
+    SpecService? specService,
+    Future<WorkspaceIO?> Function(String agentId)? specIoFor,
   }) async {
     final HttpServer http = await HttpServer.bind(
       address ?? InternetAddress.loopbackIPv4,
@@ -196,6 +205,8 @@ class CoreServer {
       todoStore: resolvedTodos,
       teamService: teamService,
       messageDispatcher: messageDispatcher,
+      specService: specService,
+      specIoFor: specIoFor,
       hub: hub,
       questions: questions,
       conversation: ConversationService(
@@ -443,6 +454,7 @@ class CoreServer {
     router.add('DELETE', ApiPaths.agentSession, _deleteSession);
     router.add('POST', ApiPaths.agentSessionSpecs, _setSessionSpecs);
     router.add('GET', ApiPaths.agentSpecs, _listSpecs);
+    router.add('GET', ApiPaths.agentSpec, _getSpec);
     router.add('GET', ApiPaths.questions, _listQuestions);
     router.add('POST', ApiPaths.questionAnswer, _answerQuestion);
     router.add('GET', ApiPaths.settingsFrameRate, _getFrameRate);
@@ -1034,10 +1046,43 @@ class CoreServer {
       agentId,
       request.uri.queryParameters['session_id'] ?? TreeStore.defaultSessionId,
     );
-    // Spec 体系（可挂载的能力声明文件）由 M5 交付；M1 返回空索引
+    final SpecService? specs = specService;
+    if (specs == null) {
+      await writeJson(request, 200, <String, dynamic>{
+        'specs': <Map<String, dynamic>>[],
+        'selected_spec_ids': session?.selectedSpecIds ?? <String>[],
+      });
+      return;
+    }
+    final WorkspaceIO? io = await specIoFor?.call(agentId);
+    final List<SpecDocument> documents = await specs.index(agentId, io);
     await writeJson(request, 200, <String, dynamic>{
-      'specs': <Map<String, dynamic>>[],
+      'specs': documents.map((SpecDocument d) => d.toMetaJson()).toList(),
       'selected_spec_ids': session?.selectedSpecIds ?? <String>[],
+    });
+  }
+
+  /// `GET /api/agents/{agentId}/specs/{specId}`：Spec 详情（元数据 + 全文）。
+  Future<void> _getSpec(HttpRequest request, Map<String, String> params) async {
+    final SpecService? specs = specService;
+    final String specId = params['specId'] ?? '';
+    if (specs == null) {
+      await writeJson(request, 200, <String, dynamic>{
+        'meta': <String, dynamic>{},
+        'content': '',
+      });
+      return;
+    }
+    final String agentId = params['agentId'] ?? '';
+    final WorkspaceIO? io = await specIoFor?.call(agentId);
+    final SpecDocument? document = await specs.detail(agentId, io, specId);
+    if (document == null) {
+      await writeJson(request, 404, errorBody('Spec 不存在: $specId'));
+      return;
+    }
+    await writeJson(request, 200, <String, dynamic>{
+      'meta': document.toMetaJson(),
+      'content': document.raw,
     });
   }
 

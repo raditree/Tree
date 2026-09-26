@@ -5,6 +5,7 @@ import 'package:tree_local_exec/tree_local_exec.dart';
 
 import '../settings/ssh_config.dart';
 
+import '../spec/spec_service.dart';
 import '../team/message_dispatcher.dart';
 import '../team/team_service.dart';
 import 'builtin_tools.dart';
@@ -33,6 +34,7 @@ class WorkspaceToolRunner implements ToolRunner {
     this.askQuestion,
     this.teamService,
     this.messageDispatcher,
+    this.specService,
     WorkspaceIO Function(String dir)? ioFactory,
     this.log,
   }) : _ioFactory = ioFactory ?? LocalWorkspaceIO.new {
@@ -73,6 +75,9 @@ class WorkspaceToolRunner implements ToolRunner {
   /// 消息派发（为 null 时不声明 `message`）。
   final TeamMessageDispatcher? messageDispatcher;
 
+  /// Spec 体系（为 null 时不声明 `spec`）。
+  final SpecService? specService;
+
   final WorkspaceIO Function(String dir) _ioFactory;
 
   /// 可读日志（工具报错、结果截断等）。
@@ -93,6 +98,7 @@ class WorkspaceToolRunner implements ToolRunner {
     withQuestions: askQuestion != null,
     withTeam: teamService != null,
     withMessage: messageDispatcher != null,
+    withSpec: specService != null,
   );
 
   @override
@@ -122,10 +128,12 @@ class WorkspaceToolRunner implements ToolRunner {
       askQuestion: askQuestion,
       teamService: teamService,
       messageDispatcher: messageDispatcher,
+      specService: specService,
       withTodos: todoStore != null,
       withQuestions: askQuestion != null,
       withTeam: teamService != null,
       withMessage: messageDispatcher != null,
+      withSpec: specService != null,
     );
     return _truncate(outcome);
   }
@@ -144,6 +152,10 @@ class WorkspaceToolRunner implements ToolRunner {
     if (callback == null) return;
     callback(task.agentId, task.sessionId, hookNotice(task, exitCode));
   }
+
+  /// 供核心层（Spec 索引、待办读取等）复用同一份工作空间缓存：
+  /// 解析失败返回 null（调用方决定降级行为）。
+  Future<WorkspaceIO?> ioFor(String agentId) => _ioFor(agentId);
 
   Future<WorkspaceIO?> _ioFor(String agentId) async {
     final WorkspaceIO? cached = _ios[agentId];

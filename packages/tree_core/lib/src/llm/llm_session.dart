@@ -29,6 +29,7 @@ class LlmSession {
     this.reasoningEffort,
     this.temperature,
     this.maxToolTurns = 24,
+    this.statusText,
     this.log,
   });
 
@@ -58,6 +59,11 @@ class LlmSession {
 
   /// 工具循环最大轮次。
   final int maxToolTurns;
+
+  /// 每次工具结果前要拼上的"会话状态"（todo + 已选 Spec）；null = 不拼。
+  ///
+  /// 每次调用实时取：模型可能在工具循环中途改 todo 或挂 Spec，状态必须是当下的。
+  final String Function()? statusText;
 
   /// 可读日志（上下文裁剪、工具异常等）。
   final void Function(String message)? log;
@@ -240,8 +246,15 @@ class LlmSession {
           name: call.name,
           result: outcome.content,
         );
+        final String status = statusText?.call() ?? '';
         working.add(
-          LlmMessage.toolResult(content: outcome.content, toolCallId: call.id),
+          LlmMessage.toolResult(
+            // 状态只进模型上下文；UI 的工具卡片仍显示原始结果（AgentToolEnd）
+            content: status.isEmpty
+                ? outcome.content
+                : '$status${outcome.content}',
+            toolCallId: call.id,
+          ),
         );
       }
     }

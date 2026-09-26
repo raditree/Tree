@@ -31,6 +31,7 @@ class LlmAgentEngine implements AgentEngine {
     this.toolRunner = const EmptyToolRunner(),
     this.transportFactory,
     this.agentOverrides,
+    this.sessionStatusText,
     this.log,
   });
 
@@ -47,6 +48,9 @@ class LlmAgentEngine implements AgentEngine {
   ///
   /// 为什么不放在 `resolveModel` 里：解析器只认识 model_id，而覆盖是**成员**属性。
   final Map<String, Object?> Function(String agentId)? agentOverrides;
+
+  /// 每次工具结果前拼上的会话状态（todo + 已选 Spec）；null = 不拼。
+  final String Function(String agentId, String sessionId)? sessionStatusText;
 
   /// 可读日志。
   final void Function(String message)? log;
@@ -95,6 +99,9 @@ class LlmAgentEngine implements AgentEngine {
           ? config.maxOutputTokens
           : null,
       reasoningEffort: config.reasoningEffort,
+      statusText: sessionStatusText == null
+          ? null
+          : () => sessionStatusText!(context.agentId, context.sessionId),
       log: log,
     );
     yield* session.run(

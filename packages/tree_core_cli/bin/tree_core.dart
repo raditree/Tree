@@ -61,6 +61,15 @@ Future<void> main(List<String> args) async {
   // <数据根>/workspaces/<agent_id>（首次使用时自动创建）。
   final FileTodoStore todos = FileTodoStore(paths);
 
+  // Spec 体系：内置模板内嵌在核心包里，首次启动写到 <数据根>/spec/builtin/
+  // （用户可查看与手改副本）；自定义 Spec 落在各 agent 工作空间的 spec/。
+  final SpecService specs = SpecService(
+    store: store,
+    builtinSpecsDir: paths.builtinSpecsDir,
+    log: (String message) => stderr.writeln('[core:spec] $message'),
+  );
+  await specs.seedBuiltins();
+
   // 提问回路：工具层先建好、核心后建 WS 广播，因此广播目标用一个可后置绑定的
   // 槽（core 起监听后立即接上 `hub.broadcast`）。
   final FileQuestionStore questionStore = FileQuestionStore(paths);
@@ -121,6 +130,7 @@ Future<void> main(List<String> args) async {
     askQuestion: questions.ask,
     teamService: teams,
     messageDispatcher: messages,
+    specService: specs,
     resolveSshConfig: (String agentId) => store.agent(agentId)?.sshConfig,
     // SSH 后端（dartssh2 + SFTP/exec）：每个 agent 一条连接，按需建立并缓存；
     // 远端根目录取 ssh.root（空 = 远端登录用户的 HOME）。
@@ -161,6 +171,14 @@ Future<void> main(List<String> args) async {
           'max_output_tokens': agent.maxOutputTokens,
       };
     },
+    // 每次工具结果前告诉模型当下的 todo 与已选 Spec。不接这个，用户在 UI 里
+    // 勾选的 Spec 与 set_todo_list 的进度对模型来说就是装饰。
+    sessionStatusText: (String agentId, String sessionId) => sessionStatusText(
+      todos: todos.read(agentId, sessionId),
+      selectedSpecIds:
+          store.session(agentId, sessionId)?.selectedSpecIds ??
+          const <String>[],
+    ),
     log: (String message) => stderr.writeln('[core:llm] $message'),
   );
 
@@ -175,6 +193,8 @@ Future<void> main(List<String> args) async {
     questions: questions,
     teamService: teams,
     messageDispatcher: messages,
+    specService: specs,
+    specIoFor: tools.ioFor,
   );
   // 起监听后才存在的三个依赖一次性接上：广播、在途状态、消息投递
   hubSink = server.hub.broadcast;

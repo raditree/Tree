@@ -2,9 +2,11 @@ import 'dart:convert';
 
 import 'package:tree_local_exec/tree_local_exec.dart';
 
+import '../spec/spec_service.dart';
 import '../team/message_dispatcher.dart';
 import '../team/team_service.dart';
 import 'message_tool.dart';
+import 'spec_tool.dart';
 import 'question_channel.dart';
 import 'terminal_hooks.dart';
 import 'team_tool.dart';
@@ -41,9 +43,11 @@ abstract final class BuiltinTools {
     bool withQuestions = false,
     bool withTeam = false,
     bool withMessage = false,
+    bool withSpec = false,
   }) => <ToolSpec>[
     if (withTeam) TeamTool.spec(),
     if (withMessage) MessageTool.spec(),
+    if (withSpec) SpecTool.spec(),
     if (withTodos)
       ToolSpec(
         name: setTodoList,
@@ -264,7 +268,8 @@ abstract final class BuiltinTools {
       name == write ||
       name == edit ||
       name == grep ||
-      name == terminal;
+      name == terminal ||
+      name == SpecTool.name;
 
   static Future<ToolOutcome> run(
     ToolInvocation invocation,
@@ -275,10 +280,12 @@ abstract final class BuiltinTools {
     AskQuestion? askQuestion,
     TeamService? teamService,
     TeamMessageDispatcher? messageDispatcher,
+    SpecService? specService,
     bool withTodos = false,
     bool withQuestions = false,
     bool withTeam = false,
     bool withMessage = false,
+    bool withSpec = false,
   }) async {
     try {
       if (io == null && needsWorkspace(invocation.name)) {
@@ -295,6 +302,11 @@ abstract final class BuiltinTools {
             return const ToolOutcome('消息通道未接入：无法使用该工具', isError: true);
           }
           return await MessageTool.run(invocation, messageDispatcher);
+        case SpecTool.name:
+          if (specService == null) {
+            return const ToolOutcome('Spec 服务未接入：无法使用该工具', isError: true);
+          }
+          return await SpecTool.run(invocation, specService, io!);
         case askUserQuestion:
           return await _askUserQuestion(
             invocation,
@@ -324,7 +336,7 @@ abstract final class BuiltinTools {
         default:
           return ToolOutcome(
             '未知工具：${invocation.name}'
-            '（可用：${specs(withTodos: withTodos, withQuestions: withQuestions, withTeam: withTeam, withMessage: withMessage).map((ToolSpec s) => s.name).join('、')}）',
+            '（可用：${specs(withTodos: withTodos, withQuestions: withQuestions, withTeam: withTeam, withMessage: withMessage, withSpec: withSpec).map((ToolSpec s) => s.name).join('、')}）',
             isError: true,
           );
       }
