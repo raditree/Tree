@@ -8,16 +8,18 @@ import '../../io/platform_support.dart';
 
 /// 文件同步按钮组件
 ///
-/// 提供两个按钮："同步到本地"（选择本地目录后下载工作空间文件）和
-/// "上传到云端"（选择本地文件后上传到工作空间）。点击后通过 file_picker
-/// 选择目标路径，然后调用对应 API 完成同步，同步过程通过对话框展示进度。
+/// 提供三个入口："同步到本地"（选择本地目录后把整棵工作空间复制过去）、
+/// "上传文件"（多选本地文件上传到工作空间 `.input/`）、"上传文件夹"
+/// （递归上传并保留层级）。点击后通过 file_picker 选择路径，再调用核心进程的
+/// 对应接口，过程与结果都由对话框展示。
 ///
-/// 当前后端同步接口暂未实现（返回 501），UI 会提示"功能开发中"。
+/// 上传统一走核心的分片通道（[uploadAll]）：不再按文件大小分流，也不再依赖
+/// multipart 那条小文件捷径。
 class FileSyncButton extends StatelessWidget {
   /// 工作空间 ID
   final String workspaceId;
 
-  /// 所属顶层 agent ID（后端三模式分派判定键：本地/SSH/云端）
+  /// 所属顶层 agent ID（随请求透传，供核心按团队/工作空间定位）
   final String teamId;
 
   /// 上传成功后的回调（用于通知文件面板刷新）
@@ -56,8 +58,14 @@ class FileSyncButton extends StatelessWidget {
       statusText: '正在同步文件到 $dirPath ...',
       task: () async {
         try {
-          await ApiService.syncToLocal(workspaceId, dirPath);
-          return '同步完成';
+          final Map<String, dynamic> result = await ApiService.syncToLocal(
+            workspaceId,
+            dirPath,
+          );
+          final int files = (result['files'] as num?)?.toInt() ?? 0;
+          final int bytes = (result['bytes'] as num?)?.toInt() ?? 0;
+          return '同步完成：$files 个文件'
+              '（${(bytes / 1024 / 1024).toStringAsFixed(1)} MB）';
         } on Exception catch (e) {
           return e.toString().replaceFirst('Exception: ', '');
         }
@@ -65,10 +73,10 @@ class FileSyncButton extends StatelessWidget {
     );
   }
 
-  /// 上传文件到云端（支持多选）
+  /// 上传本地文件到工作空间（支持多选）
   ///
-  /// 调用 file_picker 多选本地文件，然后调用 [ApiService.uploadToCloud]
-  /// 批量上传到工作空间 `.input/yyyymmdd/` 目录。上传期间展示进度对话框。
+  /// 调用 file_picker 多选本地文件，然后逐个走核心的分片通道上传到工作空间
+  /// `.input/{yyyymmdd}/`。上传期间展示进度对话框。
   Future<void> _uploadFiles(BuildContext context) async {
     // 多选本地文件（file_picker 13：pickFiles 即多选，返回空列表表示取消）
     final List<PlatformFile> picked = await FilePicker.pickFiles(
@@ -89,12 +97,11 @@ class FileSyncButton extends StatelessWidget {
 
     _showProgressDialog(
       context: context,
-      title: '上传到云端',
+      title: '上传到工作空间',
       statusText: '正在上传 ${files.length} 个文件 ...',
       task: () async {
         try {
-          final List<String> paths =
-              await uploadWithChannelSelection(
+          final List<String> paths = await uploadAll(
             workspaceId,
             files,
             teamId: teamId,
@@ -109,53 +116,42 @@ class FileSyncButton extends StatelessWidget {
     );
   }
 
-  /// 按文件大小选择上传通道（三模式一致 + 大文件分片）
+  /// 逐个上传文件（统一走核心的分片通道）
   ///
-  /// - 小文件（≤ [ApiService.chunkUploadThreshold]）：批量 multipart 单请求
-  ///   通道（[ApiService.uploadToCloud]）；
-  /// - 大文件：逐个走 init/chunk/complete 三段式分片通道
-  ///   （[ApiService.uploadFileChunked]）。
+  /// 每个文件都调用 [ApiService.uploadFileChunked]（init/chunk/complete）：核心把
+  /// 分片顺序追加到系统临时文件，收齐后整体落到工作空间 `.input/{yyyymmdd}/`。
+  /// 因此**不再按大小分流**——multipart 小文件捷径已随 M7d-3 删除，小文件走分片
+  /// 同样只多两次轻量请求，却少维护一条契约。
   ///
-  /// [teamId] 随请求透传，供后端按三模式分派（本地/SSH 模式委托前端执行器
-  /// 落盘到本机目录 / 远端主机）。返回上传后的工作空间内路径列表。
-  static Future<List<String>> uploadWithChannelSelection(
+  /// [onProgress] 回传 (第几个文件, 总数, 已传字节, 总字节)，供进度对话框使用。
+  /// 返回上传后的工作空间内路径列表。
+  static Future<List<String>> uploadAll(
     String workspaceId,
     List<MapEntry<String, String>> files, {
     String teamId = '',
+    void Function(int index, int total, int sent, int bytes)? onProgress,
   }) async {
-    final List<MapEntry<String, String>> small = <MapEntry<String, String>>[];
-    final List<MapEntry<String, String>> large = <MapEntry<String, String>>[];
-    for (final MapEntry<String, String> entry in files) {
-      final int size = await File(entry.key).length();
-      if (size > ApiService.chunkUploadThreshold) {
-        large.add(entry);
-      } else {
-        small.add(entry);
-      }
-    }
     final List<String> paths = <String>[];
-    if (small.isNotEmpty) {
-      paths.addAll(
-        await ApiService.uploadToCloud(workspaceId, small, teamId: teamId),
-      );
-    }
-    for (final MapEntry<String, String> entry in large) {
+    for (int i = 0; i < files.length; i++) {
+      final MapEntry<String, String> entry = files[i];
       paths.add(
         await ApiService.uploadFileChunked(
           workspaceId,
           entry.key,
           entry.value,
           teamId: teamId,
+          onProgress: (int sent, int total) =>
+              onProgress?.call(i + 1, files.length, sent, total),
         ),
       );
     }
     return paths;
   }
 
-  /// 上传文件夹到云端
+  /// 上传文件夹到工作空间
   ///
   /// 调用 file_picker 选择本地文件夹，递归收集其中所有文件，
-  /// 以相对路径上传到工作空间 `.input/yyyymmdd/`，保留文件夹层级。
+  /// 以相对路径上传到工作空间 `.input/{yyyymmdd}/`，保留文件夹层级。
   /// 移动端不支持目录选择（file_picker.getDirectoryPath 仅桌面），直接提示。
   Future<void> _uploadFolder(BuildContext context) async {
     if (isMobile) {
@@ -207,8 +203,11 @@ class FileSyncButton extends StatelessWidget {
       statusText: '正在上传 ${files.length} 个文件 ...',
       task: () async {
         try {
-          final List<String> paths =
-              await ApiService.uploadToCloud(workspaceId, files);
+          final List<String> paths = await uploadAll(
+            workspaceId,
+            files,
+            teamId: teamId,
+          );
           // 上传成功，通知文件面板刷新文件列表
           onUploaded?.call();
           return '上传完成，共 ${paths.length} 个文件';

@@ -52,9 +52,16 @@ Future<void> writeBytes(
   response.headers.contentType = ContentType.parse(contentType);
   response.headers.contentLength = bytes.length;
   if (filename != null && filename.isNotEmpty) {
+    // HTTP 头只能是 ASCII：中文文件名直接塞进 Content-Disposition 会被
+    // `HttpHeaders.set` 以 FormatException 拒绝（真 exe 冒烟测试才暴露出来，
+    // 表现为"连接被关掉"）。因此 ASCII 回退名 + RFC 5987 的 filename*。
+    final String ascii = filename
+        .replaceAll(RegExp(r'[^\x20-\x7e]'), '_')
+        .replaceAll(RegExp(r'["\\]'), '_');
     response.headers.set(
       'content-disposition',
-      'attachment; filename="${filename.replaceAll('"', '')}"',
+      'attachment; filename="$ascii"; '
+          "filename*=UTF-8''${Uri.encodeComponent(filename)}",
     );
   }
   response.add(bytes);

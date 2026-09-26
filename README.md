@@ -110,8 +110,9 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 - **M7d-1**：工作空间文件服务（目录树 / 文件内容 / PDF 基本信息 / Git 历史与分支；路径安全边界 + 可读错误）
 - **M7c**：前端"运行模式"改为写 agent 配置（`workspace_dir` / `ssh` 经 `PATCH /api/agents/{id}`，核心据此决定工具在哪跑）；**删除前端执行引擎**（`ssh_workspace_executor` / `mcp_stdio_tunnel` / `plugin_host_sessions` + 两个执行器服务改为配置适配器）与**反向执行协议**（7 个上行 + 7 个下行帧、WS 处理者注册表、核心桩）
 - **M7d-2**：文件下载 + 前端路径门禁收紧（`Uri.parse('$baseUrl/api/...')` 这类调用点此前全部漏检）
+- **M7d-3**：文件写路径——分片上传（`upload_init+chunk+complete`，分片顺序追加到系统临时文件后整体落 `.input/{yyyymmdd}/`）、`syncToLocal`（核心与前端同机，直接复制整棵工作空间、排除 `.git`）、`download_folder`（系统 `tar` 打包 tar.gz，先按未压缩大小设上限）。**删除 multipart `upload` 通道**：小文件走分片只多两次轻量请求，却少维护一条契约。附带修掉两个只有真跑才暴露的问题：中文文件名/目录的 `Content-Disposition` 会让 `dart:io` 抛 `FormatException`（改用 RFC 5987 `filename*`）、未捕获异常时 500 回包本身也会失败导致客户端只看到"连接被关掉"（新增 `errorLog` 落到 stderr）；真 exe 冒烟测试扩到"上传 → 打包下载 → 同步到本地"全链路
 - **M7（剩余）**：
-  - 文件写路径（`upload` 多部分 / `upload_init+chunk+complete` 分片 / `syncToLocal` / `download_folder`）；SSH 工作空间的远端文件读写接线
+  - SSH 工作空间的远端文件读写接线（需要 SFTP 二进制通道：`SshWorkspaceIO` 目前只有文本读写，文件面板对远端一律给可读的 400）
   - 上下文压缩（`agentCompact` 目前为 501 桩）
   - **PDF 预览的渲染方案待决策**（`pdf_preview` 需要 PDF 光栅化）：① 核心侧引入 Syncfusion 纯 Dart 渲染（涉商业许可）；② 前端加 Flutter PDF 插件（如 pdfx/pdfrx，核心只提供字节）；③ 不做预览，PDF 仅下载后用系统查看器打开。当前为 ③（返回 501 + 明确文案）
   - 安装器（Windows 安装包 / 首次启动引导）

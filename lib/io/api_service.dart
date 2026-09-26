@@ -180,13 +180,16 @@ class ApiService {
   /// 同步工作空间文件到本地目录
   ///
   /// 调用 `POST /api/files/{workspace_id}/syncToLocal`，请求体为
-  /// `{"local_path": "..."}`。后端在容器内 tar 打包所有文件（排除 .git），
-  /// base64 编码后传回服务端解包到指定本地目录。
-  static Future<void> syncToLocal(
+  /// `{"local_path": "..."}`。核心进程与前端同机，所以核心**直接复制**整棵
+  /// 工作空间（保留相对层级、覆盖同名文件、排除 `.git`），不再走旧后端那套
+  /// "容器内打包 → base64 → 前端解包"。返回
+  /// `{"success": true, "local_path": ..., "files": N, "bytes": N}`，
+  /// 供界面显示复制了多少个文件。
+  static Future<Map<String, dynamic>> syncToLocal(
     String workspaceId,
     String localPath,
   ) async {
-    await _postJson('/api/files/$workspaceId/syncToLocal', body: {
+    return _postJson('/api/files/$workspaceId/syncToLocal', body: {
       'local_path': localPath,
     });
   }
@@ -263,61 +266,21 @@ class ApiService {
     }
   }
 
-  /// 上传本地文件到工作空间（小文件单请求通道）
+  /// 上传本地文件到工作空间（init/chunk/complete 三段式分片）
   ///
-  /// 调用 `POST /api/files/{workspace_id}/upload`，以 multipart/form-data 方式
-  /// 批量上传。[files] 为 (本地路径, 相对路径) 列表，相对路径用于保留文件夹层级，
-  /// 后端统一保存到 `.input/yyyymmdd/` 目录。返回上传后的工作空间内路径列表。
-  /// 后端按 teamId 判定三模式分派（本地/SSH 委托前端执行器落盘），单文件超过
-  /// 分片阈值（upload.chunk_threshold，默认 8MB）时后端拒绝，请改用
-  /// [uploadFileChunked]。非 200 状态码时抛出中文异常。
-  static Future<List<String>> uploadToCloud(
-    String workspaceId,
-    List<MapEntry<String, String>> files, {
-    String teamId = '',
-  }) async {
-    final String query = teamId.isNotEmpty
-        ? '?team_id=${Uri.encodeQueryComponent(teamId)}'
-        : '';
-    final Uri uri = Uri.parse('$baseUrl/api/files/$workspaceId/upload$query');
-    final http.MultipartRequest request = http.MultipartRequest('POST', uri);
-    for (final MapEntry<String, String> entry in files) {
-      // 字段名必须与后端 FastAPI 参数一致：files / rel_paths
-      request.files.add(await http.MultipartFile.fromPath('files', entry.key));
-      request.fields['rel_paths'] = entry.value;
-    }
-    if (_token != null) {
-      request.headers['Authorization'] = 'Bearer $_token';
-    }
-    try {
-      final http.StreamedResponse response = await request.send();
-      if (response.statusCode != 200) {
-        final String body = utf8.decode(await response.stream.toBytes());
-        throw Exception('上传失败: $body');
-      }
-      final Map<String, dynamic> data = _parseJson(
-        utf8.decode(await response.stream.toBytes()),
-      );
-      final List<dynamic> paths = data['paths'] as List<dynamic>? ?? [];
-      return paths.map((dynamic p) => p.toString()).toList();
-    } on Exception {
-      rethrow;
-    } catch (e) {
-      throw Exception('核心进程不可达，请重启应用');
-    }
-  }
-
-  /// 大文件分片上传阈值：文件超过该大小时走 init/chunk/complete 分片通道
-  /// （与后端 `upload.chunk_threshold` 默认值一致）
-  static const int chunkUploadThreshold = 8 * 1024 * 1024;
-
-  /// 大文件分片上传（init/chunk/complete 三段式）
+  /// 契约（字段名与核心处理器一致）：
+  /// `POST .../upload_init`（`{file_name, rel_path, total_size}` →
+  /// `{upload_id, chunk_size}`）、`POST .../upload_chunk`
+  /// （`{upload_id, index, data: base64}` → `{received, index}`）、
+  /// `POST .../upload_complete`（`{upload_id, total_chunks}` →
+  /// `{success, path, size}`）。
   ///
-  /// 调用 `POST /api/files/{workspace_id}/upload_init` 建立会话并获取服务端
-  /// 定标的分片大小，按分片逐个 `POST .../upload_chunk`（base64），
-  /// 最后 `POST .../upload_complete` 组装。[relPath] 为保留层级的相对路径，
-  /// 后端统一落到 `.input/yyyymmdd/` 目录。[onProgress] 回传 (已传字节, 总字节)。
-  /// 返回工作空间内保存路径（如 `/workspace/.input/20260906/big.bin`）。
+  /// **所有大小的文件都走这一条通道**：核心把分片顺序追加到系统临时文件，最后
+  /// 整体落到 `.input/{yyyymmdd}/`，因此 multipart 那条"小文件捷径"已在 M7d-3
+  /// 删除（多一条路径就多一份契约要维护，而分片通道对小文件同样够快）。
+  /// [relPath] 是保留层级的相对路径（`a/b.txt`），[onProgress] 回传
+  /// (已传字节, 总字节)。返回工作空间内保存路径（如
+  /// `.input/20260906/a/b.txt`）。
   static Future<String> uploadFileChunked(
     String workspaceId,
     String filePath,

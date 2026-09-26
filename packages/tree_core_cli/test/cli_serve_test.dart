@@ -43,8 +43,11 @@ void main() {
     expect(unauthorized.$1, 401, reason: unauthorized.$2);
 
     // 未实现路径必须是明确的 501（前端有专门文案），而不是 404。
-    // 注意：`/api/files/*` 的读路径已在 M7d 实现，这里改探仍未实现的写路径（上传）。
-    final (int, String) stub = await core.get('/api/files/ws_1/upload_init');
+    // 注意：`/api/files/*` 的读写路径已在 M7d 全部实现，这里改探仍未实现的
+    // 手动压缩上下文（M7d-4）；用 ApiPaths 常量拼，避免测试里散落路径字面量。
+    final (int, String) stub = await core.get(
+      ApiPaths.agentCompact.replaceAll('{agentId}', 'ws_1'),
+    );
     expect(stub.$1, 501, reason: stub.$2);
 
     // 控制通道：写一行 shutdown => 优雅退出（退出码 0）

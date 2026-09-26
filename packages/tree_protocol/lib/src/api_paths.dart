@@ -68,7 +68,6 @@ abstract final class ApiPaths {
   static const String fileDownload = '/api/files/{workspaceId}/download';
   static const String fileDownloadFolder =
       '/api/files/{workspaceId}/download_folder';
-  static const String fileUpload = '/api/files/{workspaceId}/upload';
   static const String workspaceGitLog = '/api/workspaces/{workspaceId}/git/log';
   static const String workspaceGitBranches =
       '/api/workspaces/{workspaceId}/git/branches';
@@ -113,7 +112,6 @@ abstract final class ApiPaths {
     fileSyncToLocal,
     fileDownload,
     fileDownloadFolder,
-    fileUpload,
     workspaceGitLog,
     workspaceGitBranches,
     settingsFrameRate,

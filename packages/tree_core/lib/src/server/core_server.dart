@@ -72,23 +72,14 @@ class CoreServer {
   /// WS 端点路径（前端 `WebSocketService.connect` 固定拼接 `/ws?token=`）。
   static const String wsPath = '/ws';
 
-  /// M1 尚未实现、但前端会调用的路径（以 501 明确拒绝，而非静默 404）。
+  /// 尚未实现、但前端会调用的路径（以 501 明确拒绝，而非静默 404）。
   ///
-  /// 分组与归属里程碑：
-  /// - 文件与工作空间：`files` / `fileContent` / `filePdf*` / `fileUpload*` /
-  ///   `fileSyncToLocal`（M4 本地执行 + M7 文档能力）
-  /// - Git 历史：`workspaceGitLog` / `workspaceGitBranches`（M4）
+  /// 桌面分支只剩两项：PDF 预览（把某页渲染成图片需要光栅化依赖，待用户决策）
+  /// 与手动压缩上下文（M7d-4）。文件读 / 写 / 上传 / 同步 / 打包下载已在 M7d
+  /// 全部实现。
   static const Set<String> stubApiPaths = <String>{
-    // PDF 预览需要 PDF 光栅化（纯 Dart 无此能力，待决策）；上传/同步属写路径，
-    // 留待与下载一起做（M7d-2）
     ApiPaths.agentCompact,
-    ApiPaths.fileDownloadFolder,
-    ApiPaths.fileUpload,
     ApiPaths.filePdfPreview,
-    ApiPaths.fileUploadInit,
-    ApiPaths.fileUploadChunk,
-    ApiPaths.fileUploadComplete,
-    ApiPaths.fileSyncToLocal,
   };
 
   final HttpServer _http;
@@ -155,6 +146,12 @@ class CoreServer {
 
   /// 请求级访问日志回调（CLI `--verbose` 打开；默认关闭以免刷屏）。
   void Function(String message)? accessLog;
+
+  /// 未捕获异常日志回调（CLI 接到 stderr，始终打开）。
+  ///
+  /// 这条日志存在的理由：处理器在**响应已开始写出**时抛异常，兜底的 500 回包也会
+  /// 失败，此时客户端只看到"连接被关掉"，错误本身只剩这里能说清楚。
+  void Function(String message)? errorLog;
 
   void _access(HttpRequest request, int status) {
     accessLog?.call('${request.method} ${request.uri.path} -> $status');
@@ -274,13 +271,16 @@ class CoreServer {
 
   void _dispatch(HttpRequest request) {
     unawaited(
-      _handle(request).catchError((Object error, StackTrace _) async {
+      _handle(request).catchError((Object error, StackTrace stack) async {
         internalErrors++;
         _access(request, 500);
+        errorLog?.call(
+          '未捕获异常：${request.method} ${request.uri.path} -> $error\n$stack',
+        );
         try {
           await writeJson(request, 500, errorBody('核心进程内部错误：$error'));
         } catch (_) {
-          // 响应已关闭：无法回包，仅计数
+          // 响应已关闭：无法回包，仅计数（错误已由 errorLog 记下）
         }
       }),
     );
@@ -451,6 +451,11 @@ class CoreServer {
     router.add('GET', ApiPaths.fileContent, _fileContent);
     router.add('GET', ApiPaths.filePdfInfo, _filePdfInfo);
     router.add('POST', ApiPaths.fileDownload, _downloadFile);
+    router.add('POST', ApiPaths.fileDownloadFolder, _downloadFolder);
+    router.add('POST', ApiPaths.fileUploadInit, _uploadInit);
+    router.add('POST', ApiPaths.fileUploadChunk, _uploadChunk);
+    router.add('POST', ApiPaths.fileUploadComplete, _uploadComplete);
+    router.add('POST', ApiPaths.fileSyncToLocal, _syncToLocal);
     router.add('GET', ApiPaths.workspaceGitLog, _workspaceGitLog);
     router.add('GET', ApiPaths.workspaceGitBranches, _workspaceGitBranches);
     router.add('GET', ApiPaths.pluginSnapshot, _pluginSnapshot);
@@ -1288,6 +1293,22 @@ class CoreServer {
   // ── 插件 / MCP ───────────────────────────────────────────────────────
 
   /// 文件/工作空间路由的统一错误处理（FileService 用 `{error, status}` 表达失败）。
+  /// 读 JSON 请求体；非法 JSON 时回 400 并返回 null（不留到 500）。
+  Future<Map<String, dynamic>?> _jsonBody(HttpRequest request) async {
+    try {
+      return await readJsonBody(request);
+    } on FormatException catch (error) {
+      await writeJson(request, 400, errorBody('请求体非法：${error.message}'));
+      return null;
+    }
+  }
+
+  /// 宽松解析整数字段（前端偶尔把数字序列化成字符串）。
+  static int _asInt(Object? value) {
+    if (value is num) return value.toInt();
+    return int.tryParse('${value ?? ''}') ?? 0;
+  }
+
   Future<bool> _writeFileError(
     HttpRequest request,
     Map<String, dynamic> result,
@@ -1357,6 +1378,117 @@ class CoreServer {
       result['bytes'] as List<int>,
       filename: result['name'] as String?,
     );
+  }
+
+  /// `POST /api/files/{workspaceId}/download_folder`：目录打包为 tar.gz。
+  Future<void> _downloadFolder(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final FileService? files = fileService;
+    if (files == null) {
+      await writeJson(request, 501, errorBody('文件服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic>? body = await _jsonBody(request);
+    if (body == null) return;
+    final Map<String, dynamic> result = await files.archive(
+      params['workspaceId'] ?? '',
+      (body['path'] ?? '').toString(),
+    );
+    if (await _writeFileError(request, result)) return;
+    await writeBytes(
+      request,
+      200,
+      result['bytes'] as List<int>,
+      filename: result['name'] as String?,
+    );
+  }
+
+  /// `POST /api/files/{workspaceId}/upload_init`：建立分片上传会话。
+  Future<void> _uploadInit(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final FileService? files = fileService;
+    if (files == null) {
+      await writeJson(request, 501, errorBody('文件服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic>? body = await _jsonBody(request);
+    if (body == null) return;
+    final Map<String, dynamic> result = await files.uploadInit(
+      params['workspaceId'] ?? '',
+      fileName: (body['file_name'] ?? '').toString(),
+      relPath: (body['rel_path'] ?? '').toString(),
+      totalSize: _asInt(body['total_size']),
+    );
+    if (await _writeFileError(request, result)) return;
+    await writeJson(request, 200, result);
+  }
+
+  /// `POST /api/files/{workspaceId}/upload_chunk`：追加一个分片（base64）。
+  Future<void> _uploadChunk(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final FileService? files = fileService;
+    if (files == null) {
+      await writeJson(request, 501, errorBody('文件服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic>? body = await _jsonBody(request);
+    if (body == null) return;
+    final Map<String, dynamic> result = await files.uploadChunk(
+      params['workspaceId'] ?? '',
+      uploadId: (body['upload_id'] ?? '').toString(),
+      index: _asInt(body['index']),
+      data: (body['data'] ?? '').toString(),
+    );
+    if (await _writeFileError(request, result)) return;
+    await writeJson(request, 200, result);
+  }
+
+  /// `POST /api/files/{workspaceId}/upload_complete`：组装分片并落盘。
+  Future<void> _uploadComplete(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final FileService? files = fileService;
+    if (files == null) {
+      await writeJson(request, 501, errorBody('文件服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic>? body = await _jsonBody(request);
+    if (body == null) return;
+    final Object? chunks = body['total_chunks'];
+    final Map<String, dynamic> result = await files.uploadComplete(
+      params['workspaceId'] ?? '',
+      uploadId: (body['upload_id'] ?? '').toString(),
+      totalChunks: chunks == null ? null : _asInt(chunks),
+    );
+    if (await _writeFileError(request, result)) return;
+    await writeJson(request, 200, result);
+  }
+
+  /// `POST /api/files/{workspaceId}/syncToLocal`：整棵工作空间复制到本机目录。
+  Future<void> _syncToLocal(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final FileService? files = fileService;
+    if (files == null) {
+      await writeJson(request, 501, errorBody('文件服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic>? body = await _jsonBody(request);
+    if (body == null) return;
+    final Map<String, dynamic> result = await files.syncToLocal(
+      params['workspaceId'] ?? '',
+      (body['local_path'] ?? '').toString(),
+    );
+    if (await _writeFileError(request, result)) return;
+    await writeJson(request, 200, result);
   }
 
   /// `GET /api/files/{workspaceId}/pdf_info?path=`：PDF 基本信息。

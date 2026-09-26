@@ -239,6 +239,8 @@ Future<void> main(List<String> args) async {
     // 访问日志走 stderr（stdout 是进程间协议，绝不能混入日志）
     server.accessLog = (String message) => stderr.writeln('[core] $message');
   }
+  // 未捕获异常始终记下来：此时 500 回包往往也写不出去，客户端只能看到连接断开
+  server.errorLog = (String message) => stderr.writeln('[core:error] $message');
   // 后台长任务结束后唤醒 agent（把完成提示注入会话并继续生成）
   tools.onHookFinished = (String agentId, String sessionId, String notice) {
     unawaited(

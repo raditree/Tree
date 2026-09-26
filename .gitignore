@@ -32,6 +32,9 @@ migrate_working_dir/
 .pub/
 /build/
 
+# 核心进程编译产物（dart run tool/build_core.dart → dist/tree_core.exe）
+/dist/
+
 # Symbolication related
 app.*.symbols
 
