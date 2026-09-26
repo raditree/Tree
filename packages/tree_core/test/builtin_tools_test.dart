@@ -14,8 +14,16 @@ void main() {
     io = LocalWorkspaceIO(root.path);
   });
 
-  tearDown(() {
-    if (root.existsSync()) root.deleteSync(recursive: true);
+  tearDown(() async {
+    // hook 模式会拉起真实子进程：Windows 上子进程退出后可能还短暂持有日志文件
+    // 句柄，直接删会偶发 PathAccessException，因此重试几次
+    for (int i = 0; i < 10 && root.existsSync(); i++) {
+      try {
+        root.deleteSync(recursive: true);
+      } catch (_) {
+        await Future<void>.delayed(const Duration(milliseconds: 150));
+      }
+    }
   });
 
   ToolInvocation call(String name, [Map<String, dynamic> args = const {}]) =>
@@ -340,6 +348,98 @@ void main() {
       });
       expect(missingId.isError, isTrue);
       expect(missingId.content, contains('必须带 id'));
+    });
+  });
+
+  group('terminal hook 模式', () {
+    test('声明里带 hook 相关参数', () {
+      final ToolSpec spec = BuiltinTools.specs().firstWhere(
+        (ToolSpec s) => s.name == 'terminal',
+      );
+      final Map<String, dynamic> props =
+          spec.parameters['properties'] as Map<String, dynamic>;
+      expect(
+        props.keys,
+        containsAll(<String>['hook', 'output_file', 'hook_action', 'task_id']),
+      );
+      expect((props['hook_action'] as Map<String, dynamic>)['enum'], <String>[
+        'status',
+        'cancel',
+      ]);
+    });
+
+    test('未接入 hooks 时：hook=true 与 hook_action 都回可读错误', () async {
+      final ToolOutcome hookOff = await run('terminal', <String, dynamic>{
+        'command': 'echo x',
+        'hook': true,
+      });
+      expect(hookOff.isError, isTrue);
+      expect(hookOff.content, contains('后台任务未接入'));
+
+      final ToolOutcome statusOff = await run('terminal', <String, dynamic>{
+        'command': 'echo x',
+        'hook_action': 'status',
+        'task_id': 'nope',
+      });
+      expect(statusOff.isError, isTrue);
+      expect(statusOff.content, contains('后台任务未接入'));
+    });
+
+    test('启动/查询/取消：立即返回 task_id，未知 id 与未知 action 有可读错误', () async {
+      final TerminalHooks hooks = TerminalHooks();
+      addTearDown(hooks.close);
+      Future<ToolOutcome> hookCall(Map<String, dynamic> args) =>
+          BuiltinTools.run(call('terminal', args), io, hooks: hooks);
+
+      final ToolOutcome started = await hookCall(<String, dynamic>{
+        'command': 'echo tool-hook-ok',
+        'hook': true,
+      });
+      expect(started.isError, isFalse);
+      expect(started.content, contains('task_id: hook_'));
+      expect(started.content, contains('日志：.output/hook_'));
+      expect(hooks.tasks, hasLength(1));
+
+      final String taskId = hooks.tasks.single.id;
+      // 等命令结束（echo 很快）
+      final DateTime deadline = DateTime.now().add(const Duration(seconds: 15));
+      while (hooks.tasks.single.running && DateTime.now().isBefore(deadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+
+      final ToolOutcome status = await hookCall(<String, dynamic>{
+        'command': 'echo x',
+        'hook_action': 'status',
+        'task_id': taskId,
+      });
+      expect(status.isError, isFalse);
+      expect(status.content, contains('已结束'));
+      expect(status.content, contains('退出码 0'));
+      expect(status.content, contains('tool-hook-ok'));
+
+      final ToolOutcome unknownTask = await hookCall(<String, dynamic>{
+        'command': 'echo x',
+        'hook_action': 'status',
+        'task_id': 'hook_nope',
+      });
+      expect(unknownTask.isError, isTrue);
+      expect(unknownTask.content, contains('未知 task_id'));
+      expect(unknownTask.content, contains(taskId), reason: '错误里要列出现有任务');
+
+      final ToolOutcome missingTask = await hookCall(<String, dynamic>{
+        'command': 'echo x',
+        'hook_action': 'status',
+      });
+      expect(missingTask.isError, isTrue);
+      expect(missingTask.content, contains('需要 task_id'));
+
+      final ToolOutcome badAction = await hookCall(<String, dynamic>{
+        'command': 'echo x',
+        'hook_action': 'watch',
+        'task_id': taskId,
+      });
+      expect(badAction.isError, isTrue);
+      expect(badAction.content, contains('未知 hook_action'));
     });
   });
 

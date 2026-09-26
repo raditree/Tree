@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
+import 'shell.dart';
 import 'workspace_io.dart';
 
 /// 工具层把 IO 失败翻成"模型可读的错误结果"时使用的异常。
@@ -342,16 +343,9 @@ class LocalWorkspaceIO implements WorkspaceIO {
       throw WorkspaceIoException('command 不能为空');
     }
     await Directory(root).create(recursive: true);
-    final bool windows = Platform.isWindows;
-    // Windows：前置 chcp 65001 让 cmd 内建命令也输出 UTF-8
-    final String executable = windows ? 'cmd.exe' : '/bin/sh';
-    final List<String> args = windows
-        ? <String>['/c', 'chcp 65001 >nul && $trimmed']
-        : <String>['-c', trimmed];
-
     final Process process = await Process.start(
-      executable,
-      args,
+      Shell.executable,
+      Shell.argsFor(trimmed),
       workingDirectory: root,
       runInShell: false,
     );
@@ -374,7 +368,7 @@ class LocalWorkspaceIO implements WorkspaceIO {
       exitCode = await process.exitCode.timeout(timeout);
     } on TimeoutException {
       timedOut = true;
-      await _killTree(process.pid);
+      await Shell.killProcessTree(process.pid);
       exitCode = -1;
     }
     // 给输出流一点时间收尾（进程已退出但管道可能还有缓冲）
@@ -389,7 +383,7 @@ class LocalWorkspaceIO implements WorkspaceIO {
       stderr: err.text,
       timedOut: timedOut,
       truncated: out.truncated || err.truncated,
-      shell: windows ? 'cmd.exe' : '/bin/sh',
+      shell: Shell.executable,
       // 严格 UTF-8 解不开 → 用了 latin1 兜底 → 中文可能乱码，如实标注
       nonUtf8Output:
           _isStrictUtf8(stdoutBytes) == false ||
@@ -457,21 +451,6 @@ class LocalWorkspaceIO implements WorkspaceIO {
     } on FormatException {
       return false;
     }
-  }
-
-  /// 用 `taskkill /T` 杀整棵进程树（Windows 上只杀 cmd 会留下子进程）。
-  static Future<void> _killTree(int pid) async {
-    if (Platform.isWindows) {
-      try {
-        await Process.run('taskkill', <String>['/PID', '$pid', '/T', '/F']);
-      } catch (_) {
-        // 尽力而为
-      }
-      return;
-    }
-    Process.killPid(pid, ProcessSignal.sigterm);
-    await Future<void>.delayed(const Duration(milliseconds: 200));
-    Process.killPid(pid, ProcessSignal.sigkill);
   }
 
   /// 递归遍历；[maxDepth] 为 0 表示不限。

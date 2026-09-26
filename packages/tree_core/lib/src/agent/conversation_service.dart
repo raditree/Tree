@@ -110,6 +110,22 @@ class ConversationService {
     token.cancelled = true;
   }
 
+  /// 后台任务完成后唤醒 agent（terminal hook 模式）。
+  ///
+  /// 提示以 **agent 角色**消息进入会话（前端直接渲染，历史重载也还在），随后
+  /// 发起新一轮生成——新一轮读到的历史最后一条就是它，模型因此能接着任务继续。
+  Future<void> wake({
+    required String agentId,
+    required String sessionId,
+    required String notice,
+  }) {
+    final CoreAgent? agent = store.agent(agentId);
+    final CoreSession? session = store.session(agentId, sessionId);
+    if (agent == null || session == null) return Future<void>.value();
+    _sendNotice(agent, session, notice);
+    return _enqueue(agentId, () => _runReply(agent, session, notice));
+  }
+
   /// 中止全部在途生成（服务器关闭时）。
   void dispose() {
     for (final _RunToken token in _running.values) {

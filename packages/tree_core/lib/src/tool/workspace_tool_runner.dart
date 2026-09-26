@@ -4,6 +4,7 @@ import 'package:path/path.dart' as p;
 import 'package:tree_local_exec/tree_local_exec.dart';
 
 import 'builtin_tools.dart';
+import 'terminal_hooks.dart';
 import 'todo_store.dart';
 import 'tool_runner.dart';
 
@@ -24,7 +25,17 @@ class WorkspaceToolRunner implements ToolRunner {
     this.todoStore,
     WorkspaceIO Function(String dir)? ioFactory,
     this.log,
-  }) : _ioFactory = ioFactory ?? LocalWorkspaceIO.new;
+  }) : _ioFactory = ioFactory ?? LocalWorkspaceIO.new {
+    hooks = TerminalHooks(log: log);
+    hooks.onFinished = _finished;
+  }
+
+  /// 后台长任务管理器（terminal 的 hook 模式）。
+  late final TerminalHooks hooks;
+
+  /// 后台任务完成回调（CLI 接到 `ConversationService.wake`）。
+  void Function(String agentId, String sessionId, String notice)?
+  onHookFinished;
 
   /// 解析 agent 的工作空间目录。
   final WorkspaceDirResolver resolveWorkspaceDir;
@@ -69,16 +80,24 @@ class WorkspaceToolRunner implements ToolRunner {
       io,
       isCancelled: isCancelled,
       todos: todoStore,
+      hooks: hooks,
     );
     return _truncate(outcome);
   }
 
   @override
   Future<void> close() async {
+    await hooks.close();
     for (final WorkspaceIO io in _ios.values) {
       await io.close();
     }
     _ios.clear();
+  }
+
+  void _finished(HookTask task, int exitCode) {
+    final void Function(String, String, String)? callback = onHookFinished;
+    if (callback == null) return;
+    callback(task.agentId, task.sessionId, hookNotice(task, exitCode));
   }
 
   Future<WorkspaceIO?> _ioFor(String agentId) async {

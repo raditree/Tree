@@ -591,6 +591,14 @@ void main() {
         (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgEnd,
         reason: 'msg_end',
       );
+      // 再等终止的 idle 帧：msg_end 到达不等于 idle 已到达（帧是异步过网的），
+      // 不等就容易在负载高时把"最后一帧是 msg_end"读成断言失败
+      await ws.until(
+        (Map<String, dynamic> f) =>
+            f['type'] == WsOutboundType.agentStatus &&
+            ((f['data'] as Map<String, dynamic>?)?['status'] ?? '') == 'idle',
+        reason: 'agent_status(idle)',
+      );
 
       final List<String> types = ws.types();
       expect(types.first, WsOutboundType.agentStatus);
@@ -729,6 +737,13 @@ void main() {
       await ws.until(
         (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgEnd,
         reason: 'msg_end',
+      );
+      // 同上：等 idle 帧到齐再断言"最后一帧是 agent_status"
+      await ws.until(
+        (Map<String, dynamic> f) =>
+            f['type'] == WsOutboundType.agentStatus &&
+            ((f['data'] as Map<String, dynamic>?)?['status'] ?? '') == 'idle',
+        reason: 'agent_status(idle)',
       );
       final Map<String, dynamic> end = ws.frames.firstWhere(
         (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgEnd,

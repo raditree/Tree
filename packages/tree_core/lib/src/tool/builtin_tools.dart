@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:tree_local_exec/tree_local_exec.dart';
 
+import 'terminal_hooks.dart';
 import 'todo_store.dart';
 import 'tool_runner.dart';
 
@@ -174,7 +175,10 @@ abstract final class BuiltinTools {
       description:
           '在工作空间根目录执行 shell 命令（Windows 用 cmd.exe，其他平台用 sh）。'
           '用于运行构建/测试/git/文件管理。stdout/stderr 都会被自动捕获，'
-          '无需追加 2>&1。超时会终止整棵进程树并回报 timed_out。',
+          '无需追加 2>&1。超时会终止整棵进程树并回报 timed_out。'
+          '预计很长的命令（构建/全量测试/长脚本）请用 hook=true 后台执行：'
+          '立即拿到 task_id，输出实时写进日志文件，命令结束后会自动收到'
+          '[terminal hook] 提示，届时用 read 读取日志继续任务。',
       parameters: <String, dynamic>{
         'type': 'object',
         'properties': <String, dynamic>{
@@ -182,6 +186,25 @@ abstract final class BuiltinTools {
           'timeout_seconds': <String, dynamic>{
             'type': 'integer',
             'description': '超时秒数（缺省 120，上限 1800）',
+          },
+          'hook': <String, dynamic>{
+            'type': 'boolean',
+            'description': 'true = 后台执行（长任务用），立即返回 task_id',
+          },
+          'output_file': <String, dynamic>{
+            'type': 'string',
+            'description':
+                'hook 模式的日志文件（工作空间相对路径，'
+                '缺省 .output/hook_<id>.log）',
+          },
+          'hook_action': <String, dynamic>{
+            'type': 'string',
+            'enum': <String>['status', 'cancel'],
+            'description': '查询/取消后台任务（需配合 task_id）',
+          },
+          'task_id': <String, dynamic>{
+            'type': 'string',
+            'description': 'hook 模式返回的任务 id',
           },
         },
         'required': <String>['command'],
@@ -198,6 +221,7 @@ abstract final class BuiltinTools {
     WorkspaceIO io, {
     bool Function()? isCancelled,
     TodoStore? todos,
+    TerminalHooks? hooks,
   }) async {
     try {
       switch (invocation.name) {
@@ -215,7 +239,12 @@ abstract final class BuiltinTools {
         case grep:
           return await _grep(invocation, io);
         case terminal:
-          return await _terminal(invocation, io, isCancelled: isCancelled);
+          return await _terminal(
+            invocation,
+            io,
+            isCancelled: isCancelled,
+            hooks: hooks,
+          );
         default:
           return ToolOutcome(
             '未知工具：${invocation.name}（可用：${specs().map((ToolSpec s) => s.name).join('、')}）',
@@ -337,8 +366,78 @@ abstract final class BuiltinTools {
     ToolInvocation invocation,
     WorkspaceIO io, {
     bool Function()? isCancelled,
+    TerminalHooks? hooks,
   }) async {
     final String command = _string(invocation, 'command');
+    final String hookAction = _string(
+      invocation,
+      'hook_action',
+    ).trim().toLowerCase();
+
+    // ① 查询/取消后台任务（不执行新命令）
+    if (hookAction.isNotEmpty) {
+      if (hooks == null) {
+        return const ToolOutcome('后台任务未接入：无法查询/取消', isError: true);
+      }
+      final String taskId = _string(invocation, 'task_id').trim();
+      if (taskId.isEmpty) {
+        return ToolOutcome(
+          'hook_action=$hookAction 需要 task_id'
+          '（现有任务：${hooks.tasks.map((HookTask t) => t.id).join('、')}）',
+          isError: true,
+        );
+      }
+      final HookTask? task = hooks.task(taskId);
+      if (task == null) {
+        return ToolOutcome(
+          '未知 task_id：$taskId'
+          '（现有任务：${hooks.tasks.map((HookTask t) => t.id).join('、')}）',
+          isError: true,
+        );
+      }
+      if (hookAction == 'cancel') {
+        final bool requested = await hooks.cancel(taskId);
+        return ToolOutcome(
+          requested
+              ? '已请求终止。\n${hooks.renderStatus(task)}'
+              : '该任务已结束。\n${hooks.renderStatus(task)}',
+          isError: !requested,
+        );
+      }
+      if (hookAction == 'status') {
+        return ToolOutcome(hooks.renderStatus(task));
+      }
+      return ToolOutcome(
+        '未知 hook_action：$hookAction（可用：status / cancel）',
+        isError: true,
+      );
+    }
+
+    // ② 后台执行（长任务）
+    if (_bool(invocation, 'hook')) {
+      if (hooks == null) {
+        return const ToolOutcome('后台任务未接入：无法后台执行', isError: true);
+      }
+      if (command.isEmpty) {
+        return const ToolOutcome('command 不能为空', isError: true);
+      }
+      final HookTask task = await hooks.start(
+        io: io,
+        agentId: invocation.agentId,
+        sessionId: invocation.sessionId,
+        command: command,
+        outputFile: _string(invocation, 'output_file'),
+      );
+      return ToolOutcome(
+        '[terminal hook] 已在后台启动，本轮不必等待。\n'
+        'task_id: ${task.id}\n'
+        '日志：${task.logRelative}（可用 read 查看进度，'
+        '或 hook_action=status + task_id 查询）\n'
+        '命令结束后会自动收到 [terminal hook] 完成提示。',
+      );
+    }
+
+    // ③ 同步执行
     if (command.isEmpty) {
       return const ToolOutcome('command 不能为空', isError: true);
     }

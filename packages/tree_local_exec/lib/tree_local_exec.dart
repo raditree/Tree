@@ -9,6 +9,7 @@
 library;
 
 export 'src/local_workspace_io.dart';
+export 'src/shell.dart';
 export 'src/workspace_io.dart';
 
 /// 本机执行后端分组（本地已实现；SSH 在 M4-4 落地）。

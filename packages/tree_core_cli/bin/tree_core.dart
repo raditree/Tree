@@ -88,6 +88,16 @@ Future<void> main(List<String> args) async {
     // 访问日志走 stderr（stdout 是进程间协议，绝不能混入日志）
     server.accessLog = (String message) => stderr.writeln('[core] $message');
   }
+  // 后台长任务结束后唤醒 agent（把完成提示注入会话并继续生成）
+  tools.onHookFinished = (String agentId, String sessionId, String notice) {
+    unawaited(
+      server.conversation.wake(
+        agentId: agentId,
+        sessionId: sessionId,
+        notice: notice,
+      ),
+    );
+  };
 
   // 唯一的 stdout 输出：就绪握手（父进程按行读取并解析）
   stdout.writeln(server.handshake.encode());
