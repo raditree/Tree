@@ -50,6 +50,46 @@ class FakeSshTransport implements SshTransport {
     return out;
   }
 
+  /// 显式声明的空目录（[files] 只描述文件，空目录推不出来）。
+  final Set<String> dirs = <String>{};
+
+  @override
+  Future<List<SshFileEntry>> listEntries(
+    String absolutePath, {
+    int maxEntries = 2000,
+  }) async {
+    final String prefix = absolutePath.endsWith('/')
+        ? absolutePath
+        : '$absolutePath/';
+    final Map<String, SshFileEntry> byName = <String, SshFileEntry>{};
+    final DateTime stamp = DateTime.fromMillisecondsSinceEpoch(1700000000000);
+    for (final String dir in dirs) {
+      if (!dir.startsWith(prefix)) continue;
+      final String rest = dir.substring(prefix.length);
+      if (rest.isEmpty || rest.contains('/')) continue;
+      byName[rest] = SshFileEntry(
+        name: rest,
+        isDirectory: true,
+        modified: stamp,
+      );
+    }
+    for (final MapEntry<String, List<int>> entry in files.entries) {
+      if (!entry.key.startsWith(prefix)) continue;
+      final String rest = entry.key.substring(prefix.length);
+      if (rest.isEmpty) continue;
+      final int slash = rest.indexOf('/');
+      final String name = slash < 0 ? rest : rest.substring(0, slash);
+      byName[name] = SshFileEntry(
+        name: name,
+        isDirectory: slash >= 0,
+        size: slash >= 0 ? 0 : entry.value.length,
+        modified: stamp,
+      );
+    }
+    final List<SshFileEntry> out = byName.values.toList();
+    return out.length > maxEntries ? out.sublist(0, maxEntries) : out;
+  }
+
   @override
   Future<bool> exists(String absolutePath) async =>
       files.containsKey(absolutePath) ||
@@ -408,6 +448,62 @@ void main() {
             contains('HOME'),
           ),
         ),
+      );
+    });
+  });
+
+  group('文件面板接口（M7g）', () {
+    test('listEntries：一层目录、目录在前、相对路径以工作空间根为基准', () async {
+      t.seed('/ws/sub/a.txt', 'hello');
+      t.seed('/ws/sub/deep/b.txt', 'x');
+      t.dirs.add('/ws/sub/empty');
+      final List<WorkspaceEntry> entries = await io.listEntries('sub');
+      final List<String> names = entries
+          .map((WorkspaceEntry e) => e.name)
+          .toList();
+      expect(names.first, 'deep', reason: '目录在前（字母序里 deep < empty < a? 不，目录整体在前）');
+      expect(names, containsAll(<String>['a.txt', 'deep', 'empty']));
+      final WorkspaceEntry file = entries.firstWhere(
+        (WorkspaceEntry e) => e.name == 'a.txt',
+      );
+      expect(file.isDirectory, isFalse);
+      expect(file.size, 5);
+      expect(file.relativePath, 'sub/a.txt');
+      expect(file.modified, isNotNull);
+      final WorkspaceEntry dir = entries.firstWhere(
+        (WorkspaceEntry e) => e.name == 'deep',
+      );
+      expect(dir.isDirectory, isTrue);
+      expect(dir.size, 0);
+      expect(dir.relativePath, 'sub/deep');
+    });
+
+    test('listEntries：根目录可用，越界路径拒绝', () async {
+      t.seed('/ws/a.txt', 'a');
+      final List<WorkspaceEntry> root = await io.listEntries('');
+      expect(root.single.relativePath, 'a.txt');
+      expect(
+        () => io.listEntries('../escape'),
+        throwsA(isA<WorkspacePathException>()),
+      );
+      expect(
+        () => io.listEntries('/abs'),
+        throwsA(isA<WorkspacePathException>()),
+      );
+    });
+
+    test('readBytes / writeBytes：原始字节往返，写入自动建父目录', () async {
+      t.seedBytes('/ws/binary.bin', <int>[0, 1, 2, 255]);
+      expect(await io.readBytes('binary.bin'), <int>[0, 1, 2, 255]);
+      await io.writeBytes('out/deep/new.bin', <int>[9, 8, 7]);
+      expect(t.files['/ws/out/deep/new.bin'], <int>[9, 8, 7]);
+      expect(
+        () => io.writeBytes('../escape.bin', <int>[1]),
+        throwsA(isA<WorkspacePathException>()),
+      );
+      expect(
+        () => io.readBytes('missing.bin'),
+        throwsA(isA<WorkspaceIoException>()),
       );
     });
   });

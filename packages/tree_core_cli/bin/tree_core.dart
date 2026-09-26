@@ -78,14 +78,6 @@ Future<void> main(List<String> args) async {
   );
   await mcp.refresh();
 
-  // 工作空间文件服务（M7d）：文件面板 / 查看器 / Git 面板的数据源。
-  // 工作空间就在本机，但前端仍只经 REST 读，路径安全边界都在 FileService 里。
-  final FileService files = FileService(
-    store: store,
-    defaultWorkspaceDir: paths.defaultWorkspaceDir,
-    log: (String message) => stderr.writeln('[core:files] $message'),
-  );
-
   // 提问回路与插件总线都要"工具层先建、核心后建 WS 广播"，因此统一用一个可后置
   // 绑定的广播槽（核心起监听后立即接上 `hub.broadcast`）。
   void Function(Map<String, dynamic> frame)? hubSink;
@@ -186,6 +178,22 @@ Future<void> main(List<String> args) async {
           : paths.defaultWorkspaceDir(agentId);
     },
     log: (String message) => stderr.writeln('[core:tool] $message'),
+  );
+
+  // 工作空间文件服务（M7d/M7g）：文件面板 / 查看器 / Git 面板的数据源。
+  // 前端仍只经 REST 读写，路径安全边界都在 FileService 里；配了 ssh 的 agent
+  // 走同一份 SshWorkspaceIO（与工具层共用连接，避免文件面板再连一条）。
+  final FileService files = FileService(
+    store: store,
+    defaultWorkspaceDir: paths.defaultWorkspaceDir,
+    remoteFilesFor: (String agentId) async {
+      // SshWorkspaceIO 同时实现了 WorkspaceIO 与 WorkspaceFiles，这里只做窄化。
+      // 用 Object? 接收是为了让 `is` 提升干净：WorkspaceIO 与 WorkspaceFiles 是
+      // 并列接口，直接在三元里提升会得到无法表达的交类型提示。
+      final Object? io = await tools.ioFor(agentId);
+      return io is WorkspaceFiles ? io : null;
+    },
+    log: (String message) => stderr.writeln('[core:files] $message'),
   );
 
   /// 成员级模型参数覆盖（M5b）：用户在「团队成员 → 模型配置」页设置的

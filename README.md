@@ -67,6 +67,7 @@ M7 打包时把 `tree_core.exe` 与 `Tree.exe` 放在一起）→ 从应用目�
 | 查看核心请求日志 | 核心加 `--verbose`（访问日志走 stderr；stdout 只放握手行） |
 | 只跑核心的协议与链路测试 | `cd packages/tree_core && dart test`（299 例，含真实 HTTP + WS 端到端） |
 | 真 SSH 集成测试（本机无 sshd 时自动跳过） | 设 `TREE_SSH_TEST_HOST` / `TREE_SSH_TEST_USER` / `TREE_SSH_TEST_KEY` 后 `cd packages/tree_local_exec && dart test` |
+| 真机 SSH 文件面板（列举/上传/打包/同步） | 设同样变量（可加 `TREE_SSH_TEST_ROOT`）后 `cd packages/tree_core && dart test test/ssh_files_integration_test.dart` |
 
 ### 打包（桌面发布形态）
 
@@ -141,9 +142,10 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 - **M7d-3**：文件写路径——分片上传（`upload_init+chunk+complete`，分片顺序追加到系统临时文件后整体落 `.input/{yyyymmdd}/`）、`syncToLocal`（核心与前端同机，直接复制整棵工作空间、排除 `.git`）、`download_folder`（系统 `tar` 打包 tar.gz，先按未压缩大小设上限）。**删除 multipart `upload` 通道**：小文件走分片只多两次轻量请求，却少维护一条契约。附带修掉两个只有真跑才暴露的问题：中文文件名/目录的 `Content-Disposition` 会让 `dart:io` 抛 `FormatException`（改用 RFC 5987 `filename*`）、未捕获异常时 500 回包本身也会失败导致客户端只看到"连接被关掉"（新增 `errorLog` 落到 stderr）；真 exe 冒烟测试扩到"上传 → 打包下载 → 同步到本地"全链路
 - **M7d-4**：上下文压缩——`POST /api/agents/{id}/compact` 把会话早期历史交给模型总结成一条摘要，此后每轮只发「摘要 + 未压缩的近期消息」；保留规则 = 最近 3 条用户要求及其之后 + 尾部 8 条，单轮超长时退化为只留尾部；**不删除任何消息**（水位线是 `session.json` 里的"已总结前缀条数"，界面历史完整可回看）；估算超过 `compress_threshold × max_seqlen` 时在生成前自动压缩；压缩期间推 `agent_status=compacting` 并与生成互斥（`agent_working` / `already_compacting`）；旧摘要并入新摘要，不会越压越多
 - **M7e**：PDF 预览改成**前端渲染**（方案②）——核心只提供 PDF 字节（`/download`），光栅化交给 Flutter 插件 pdfrx（内置 pdfium）：`PdfPreview` 组件替掉旧的"核心逐页渲染成 PNG + 自绘翻页栏"，滚动/缩放/翻页/选中复制都由插件处理。删掉 `pdf_preview` 接口与前端的 `getPdfPreview`，核心的 501 桩集合因此**清空**（覆盖度测试也改成断言"空集合"，别让桩悄悄长回来）；打包脚本新增 native assets 拷贝（否则发布包缺 `pdfium.dll`）
+- **M7g**：SSH 远端文件面板——`SshTransport` 增加 SFTP 一层目录列举（名字/类型/大小/mtime），`WorkspaceFiles`（列目录 / 读字节 / 写字节）由 `LocalWorkspaceIO` 与 `SshWorkspaceIO` 各自实现，`FileService` 按 agent 是否配 `ssh:` 分流：list/content/download/pdf_info 读远端字节，分片上传仍是「本地暂存 → complete 时一次 SFTP 写」，`download_folder` 先把子树拉回本地临时目录再本地 tar 打包（远端不一定有 tar，且二进制过 `exec` 会被当文本解码），`syncToLocal` 补上**条数 + 字节双上限**（真机验收在巨大远端根上被拖到超时，光有条数限制挡不住）。真机验收：`open@192.168.0.208:22`（密钥 `~/.ssh/id_ed25519`），`TREE_SSH_TEST_HOST` 门控测试跑通全链路
 - **M7f**：Windows 打包与安装——`tool/package_windows.dart` 一条命令出便携 zip（构建应用 + 用同一 SDK 编译核心到同目录 + 写首次运行说明 + 启动核心读握手自检 + bsdtar 压缩），`tool/installer/tree-desktop.iss` 提供 Inno Setup 安装包（卸载保留 `%APPDATA%\Tree` 用户数据）
 - **M7（剩余）**：
-  - SSH 工作空间的远端文件读写接线（需要 SFTP 二进制通道：`SshWorkspaceIO` 目前只有文本读写，文件面板对远端一律给可读的 400）；真机验收主机：`open@192.168.0.208:22`（密钥 `~/.ssh/id_ed25519`，远端根 `/mnt/space`）
+  - 远端 Git 面板（`gitLog`/`gitBranches` 目前对 SSH 仍返回可读 400：需要经 `exec` 跑 git 再解析输出）；SSH 连接的断线重连策略调优
 
 ---
 
@@ -236,7 +238,7 @@ Windows 上是 `%APPDATA%\Tree`；`TREE_HOME` 环境变量或 `--data-dir` 可�
 ## 常见问题
 
 - **核心进程没起来**：检查 `TREE_CORE_URL` / `TREE_CORE_TOKEN` 是否指向手工启动的 `tree_core --verbose`；发行版布局下 `tree_core.exe` 应与 `Tree.exe` 同目录。
-- **SSH 连不上**：连接由**核心**发起，地址需从本机可达；检查 `agents/<id>.yaml` 的 `ssh:` 段（`root` 为空 = 远端登录用户的 HOME）。
+- **SSH 连不上**：连接由**核心**发起，地址需从本机可达；检查 `agents/<id>.yaml` 的 `ssh:` 段（`root` 为空 = 远端登录用户的 HOME）。文件面板对 SSH 的「工作空间根」就是这里的 `root`，`workspace_dir` 只对本地工作空间生效。
 - **插件 / MCP 没生效**：看对应 yaml 的 `command` 是否可执行；`GET /api/plugin/snapshot` 与 `GET /api/mcp/services` 会给出 `disabled_reason` / `errors`。坏服务只影响自己。
 - **模型不可用**：`~/.tree/config/models/<id>.yaml` 的 `base_url` / `api_key`，以及 agent 的 `model_id` 是否指向它。
 - **改配置何时生效**：`agents/*.yaml` 与 `config/*.yaml` 在核心启动时读取；MCP / 插件也可经 REST 即时注册。

@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 import 'package:tree_local_exec/tree_local_exec.dart';
@@ -17,16 +18,20 @@ import '../store/tree_store.dart';
 /// - 读：`list` / `content` / `readBytes` / `pdfInfo` / `gitLog` / `gitBranches`；
 /// - 写（M7d-3）：`uploadInit`/`uploadChunk`/`uploadComplete` 分片上传、
 ///   `syncToLocal`（整棵工作空间复制到本机目录）、`archive`（目录打包 tar.gz）；
-/// - **只支持本机工作空间**：配了 SSH 的 agent 其工作空间在远端，需要远端 IO
-///   （`SshWorkspaceIO` 目前只有文本读写，二进制 SFTP 通道留给后续里程碑），
-///   这里返回可读错误；
-/// - `pdf_preview`（把 PDF 某页渲染成图片）**未实现**：纯 Dart 进程没有 PDF 光栅化
-///   能力，需要引入渲染依赖（或改成前端渲染），属于待用户决策项。
+/// - **本机与 SSH 都要支持**（M7g）：配了 `ssh:` 的 agent 走 [remoteFilesFor] 拿到
+///   [WorkspaceFiles]（SFTP 实现），本机走 dart:io；两条路径共用同一套安全边界与
+///   REST 语义。远端上传仍然是"本地暂存分片 → complete 时一次 SFTP 写"（不需要
+///   远端追加写）；远端 `archive` 是"先把子树拉回本地临时目录，再用本地 tar 打包"
+///   （远端不一定有 tar，且这样只需一条代码路径）；
+/// - **远端 Git 面板暂不支持**（`gitLog`/`gitBranches` 仍返回可读 400）：那需要经
+///   `exec` 跑 git 并解析输出，属于后续项；
+/// - PDF 预览：M7e 起由**前端**渲染（核心只给字节），因此这里没有 `pdf_preview`。
 class FileService {
   FileService({
     required this.store,
     required this.defaultWorkspaceDir,
     this.log,
+    this.remoteFilesFor,
     this.maxListEntries = 2000,
     this.maxContentBytes = 8 * 1024 * 1024,
     this.gitTimeout = const Duration(seconds: 10),
@@ -34,6 +39,7 @@ class FileService {
     this.maxUploadBytes = 1024 * 1024 * 1024,
     this.maxArchiveBytes = 256 * 1024 * 1024,
     this.maxSyncFiles = 50000,
+    this.maxSyncBytes = 2 * 1024 * 1024 * 1024,
     this.uploadTimeout = const Duration(minutes: 30),
     this.archiveTimeout = const Duration(minutes: 2),
     this.tarCommand = 'tar',
@@ -61,6 +67,12 @@ class FileService {
   /// 「同步到本地」允许复制的文件数上限。
   final int maxSyncFiles;
 
+  /// 「同步到本地」允许复制的总字节上限。
+  ///
+  /// 光有条数上限挡不住"目录不大但每个文件都巨大"（远端根甚至可能是整个数据盘），
+  /// 真机验收时就在一个巨大的远端根上把 3 分钟测试跑超时了——先统计再决定要不要拉。
+  final int maxSyncBytes;
+
   /// 未完成的分片会话存活时间（超时即作废并清理暂存文件）。
   final Duration uploadTimeout;
 
@@ -69,6 +81,10 @@ class FileService {
 
   /// 打包命令（默认 `tar`：Windows 10+ 自带 bsdtar，Linux/macOS 也有；测试可注入）。
   final String tarCommand;
+
+  /// 取某 agent 的**远端**文件面板后端（M7g）；null = 该 agent 的工作空间不在远端，
+  /// 或核心没接线（此时远端 agent 会拿到可读 400 而不是假装成功）。
+  final Future<WorkspaceFiles?> Function(String agentId)? remoteFilesFor;
 
   /// 进行中的分片上传会话（`upload_id` → 会话）。
   final Map<String, _UploadSession> _uploads = <String, _UploadSession>{};
@@ -89,12 +105,29 @@ class FileService {
     return configured.isNotEmpty ? configured : defaultWorkspaceDir(agent.id);
   }
 
+  /// 取该 agent 的远端文件面板后端；本机 agent 恒为 null。
+  ///
+  /// 为什么要 await：SSH 连接是懒建的（首次用到才连），与工具层共用同一个
+  /// `ioFor` 工厂，避免"文件面板一条连接、工具又一条"。
+  Future<WorkspaceFiles?> remoteFor(CoreAgent agent) async {
+    if (agent.sshConfig == null) return null;
+    final Future<WorkspaceFiles?> Function(String agentId)? factory =
+        remoteFilesFor;
+    if (factory == null) return null;
+    return factory(agent.id);
+  }
+
   /// 列出目录（`path` 为空 = 根）。目录在前，各自按名字排序。
-  Map<String, dynamic> list(String workspaceId, {String path = ''}) {
+  Future<Map<String, dynamic>> list(
+    String workspaceId, {
+    String path = '',
+  }) async {
     final CoreAgent? agent = agentFor(workspaceId);
     if (agent == null) return _error('工作空间不存在：$workspaceId');
+    final WorkspaceFiles? remote = await remoteFor(agent);
+    if (remote != null) return _listRemote(remote, path);
     if (agent.sshConfig != null) {
-      return _error('该工作空间在远端（SSH）：文件面板暂不支持远端目录，请用终端工具查看', 400);
+      return _error('该工作空间在远端（SSH）：核心未接入远端文件后端，请用终端工具查看', 400);
     }
     final String root = rootFor(agent);
     final Directory dir;
@@ -139,12 +172,129 @@ class FileService {
     };
   }
 
+  /// 远端目录列举（M7g）：与本地同一份 JSON 形状，前端零改动。
+  Future<Map<String, dynamic>> _listRemote(
+    WorkspaceFiles remote,
+    String path,
+  ) async {
+    final List<WorkspaceEntry> entries;
+    try {
+      entries = await remote.listEntries(path, maxEntries: maxListEntries);
+    } on WorkspacePathException catch (error) {
+      return _error(error.toString(), 400);
+    } on WorkspaceIoException catch (error) {
+      // 目录不存在/无权限：与本地实现同样报 404，前端提示口径一致
+      return _error(error.message, 404);
+    } catch (error) {
+      return _error('读取远端目录失败：$error', 500);
+    }
+    final List<Map<String, dynamic>> files = <Map<String, dynamic>>[
+      for (final WorkspaceEntry entry in entries)
+        <String, dynamic>{
+          'name': entry.name,
+          'size': entry.isDirectory ? 0 : entry.size,
+          'type': entry.isDirectory ? 'dir' : 'file',
+          'modified': entry.modified?.toIso8601String() ?? '',
+          'path': entry.relativePath,
+        },
+    ];
+    return <String, dynamic>{
+      'files': files,
+      'path': path,
+      'total': files.length,
+      if (files.length >= maxListEntries) 'truncated': true,
+    };
+  }
+
+  /// 远端文件内容（图片 base64，其余文本）。
+  Future<Map<String, dynamic>> _contentRemote(
+    WorkspaceFiles remote,
+    String path,
+  ) async {
+    final Uint8List bytes;
+    try {
+      bytes = await remote.readBytes(path);
+    } on WorkspacePathException catch (error) {
+      return _error(error.toString(), 400);
+    } on WorkspaceIoException catch (error) {
+      return _error(error.message, 404);
+    } catch (error) {
+      return _error('读取远端文件失败：$error', 500);
+    }
+    if (bytes.length > maxContentBytes) {
+      return _error(
+        '文件过大（${bytes.length ~/ 1024} KB > ${maxContentBytes ~/ 1024} KB），请用终端/工具处理',
+      );
+    }
+    final String ext = p.extension(path).replaceFirst('.', '').toLowerCase();
+    return _contentJson(path, bytes, extension: ext);
+  }
+
+  /// 远端原始字节下载。
+  Future<Map<String, dynamic>> _readBytesRemote(
+    WorkspaceFiles remote,
+    String path,
+  ) async {
+    try {
+      final Uint8List bytes = await remote.readBytes(path);
+      return <String, dynamic>{'bytes': bytes, 'name': p.posix.basename(path)};
+    } on WorkspacePathException catch (error) {
+      return _error(error.toString(), 400);
+    } on WorkspaceIoException catch (error) {
+      return _error(error.message, 404);
+    } catch (error) {
+      return _error('读取远端文件失败：$error', 500);
+    }
+  }
+
+  /// 远端 PDF 基本信息：读回字节后走与本地同一套启发式解析。
+  Future<Map<String, dynamic>> _pdfInfoRemote(
+    WorkspaceFiles remote,
+    String path,
+  ) async {
+    final Uint8List bytes;
+    try {
+      bytes = await remote.readBytes(path);
+    } on WorkspacePathException catch (error) {
+      return _error(error.toString(), 400);
+    } on WorkspaceIoException catch (error) {
+      return _error(error.message, 404);
+    } catch (error) {
+      return _error('读取远端文件失败：$error', 500);
+    }
+    return pdfInfoFromBytes(bytes);
+  }
+
+  /// 字节 → 前端文件内容 JSON（图片 base64，其余文本解码）。
+  static Map<String, dynamic> _contentJson(
+    String path,
+    List<int> bytes, {
+    String extension = '',
+  }) {
+    if (LocalWorkspaceIO.imageExtensions.contains(extension)) {
+      return <String, dynamic>{
+        'content': base64Encode(bytes),
+        'path': path,
+        'size': bytes.length,
+        'encoding': 'base64',
+      };
+    }
+    return <String, dynamic>{
+      'content': LocalWorkspaceIO.decodeBytes(bytes),
+      'path': path,
+      'size': bytes.length,
+      'encoding': 'utf-8',
+    };
+  }
+
   /// 读取文件内容：图片返回 base64，其余按文本解码（UTF-8 失败退 latin1）。
-  Map<String, dynamic> content(String workspaceId, String path) {
+  Future<Map<String, dynamic>> content(String workspaceId, String path) async {
     final CoreAgent? agent = agentFor(workspaceId);
     if (agent == null) return _error('工作空间不存在：$workspaceId');
+    final WorkspaceFiles? remote = await remoteFor(agent);
+    if (remote != null) return _contentRemote(remote, path);
     if (agent.sshConfig != null) {
-      return _error('该工作空间在远端（SSH）：文件面板暂不支持远端文件内容，请用 read 工具', 400);
+      return _error('该工作空间在远端（SSH）：核心未接入远端文件后端，请用 read 工具', 400);
     }
     final String root = rootFor(agent);
     final String absolute;
@@ -191,11 +341,16 @@ class FileService {
   ///
   /// 与 [content] 的区别：这里不做文本/图片分支、不设文本上限，纯粹把字节交给
   /// 前端落盘（下载按钮）。
-  Map<String, dynamic> readBytes(String workspaceId, String path) {
+  Future<Map<String, dynamic>> readBytes(
+    String workspaceId,
+    String path,
+  ) async {
     final CoreAgent? agent = agentFor(workspaceId);
     if (agent == null) return _error('工作空间不存在：$workspaceId');
+    final WorkspaceFiles? remote = await remoteFor(agent);
+    if (remote != null) return _readBytesRemote(remote, path);
     if (agent.sshConfig != null) {
-      return _error('该工作空间在远端（SSH）：暂不支持远端文件下载', 400);
+      return _error('该工作空间在远端（SSH）：核心未接入远端文件后端，请用 read 工具', 400);
     }
     final String root = rootFor(agent);
     final String absolute;
@@ -221,11 +376,13 @@ class FileService {
   /// **页数是启发式的**：优先取页树 `/Count` 的最大值（根节点即总数），取不到
   /// 再数 `/Type /Page` 的出现次数。返回值里带 `pages_source` 说明来源，不假装
   /// 这是权威解析（真正的解析器需要引入 PDF 库，属于待决策项）。
-  Map<String, dynamic> pdfInfo(String workspaceId, String path) {
+  Future<Map<String, dynamic>> pdfInfo(String workspaceId, String path) async {
     final CoreAgent? agent = agentFor(workspaceId);
     if (agent == null) return _error('工作空间不存在：$workspaceId');
+    final WorkspaceFiles? remote = await remoteFor(agent);
+    if (remote != null) return _pdfInfoRemote(remote, path);
     if (agent.sshConfig != null) {
-      return _error('该工作空间在远端（SSH）：暂不支持远端 PDF 信息', 400);
+      return _error('该工作空间在远端（SSH）：核心未接入远端文件后端', 400);
     }
     final String root = rootFor(agent);
     final String absolute;
@@ -236,11 +393,16 @@ class FileService {
     }
     final File file = File(absolute);
     if (!file.existsSync()) return _error('文件不存在：$path');
-    final String text = latin1.decode(
-      file.readAsBytesSync(),
-      allowInvalid: true,
-    );
+    return pdfInfoFromBytes(file.readAsBytesSync());
+  }
 
+  /// PDF 基本信息（总页数 / 标题 / 作者）——**页数是启发式的**。
+  ///
+  /// 本地与远端共用（远端先把字节读回来）：优先取页树 `/Count` 的最大值（根节点
+  /// 即总数），取不到再数 `/Type /Page` 的出现次数；`pages_source` 说明来源，
+  /// 不假装这是权威解析（真正的解析器要引入 PDF 库）。
+  static Map<String, dynamic> pdfInfoFromBytes(List<int> bytes) {
+    final String text = latin1.decode(bytes, allowInvalid: true);
     int pages = 0;
     String source = '';
     for (final RegExpMatch match in RegExp(
@@ -350,8 +512,10 @@ class FileService {
   }) async {
     final CoreAgent? agent = agentFor(workspaceId);
     if (agent == null) return _error('工作空间不存在：$workspaceId');
-    final Map<String, dynamic>? blocked = _remoteBlocked(agent, '文件上传');
-    if (blocked != null) return blocked;
+    final WorkspaceFiles? remote = await remoteFor(agent);
+    if (agent.sshConfig != null && remote == null) {
+      return _error('该工作空间在远端（SSH）：核心未接入远端文件后端', 400);
+    }
     if (totalSize < 0) return _error('total_size 不能为负', 400);
     if (totalSize > maxUploadBytes) {
       return _error(
@@ -367,11 +531,18 @@ class FileService {
     final String target = '.input/${_dateStamp()}/$rel';
     final String root = rootFor(agent);
     final String absolute;
-    try {
-      // 目标路径提前过一遍安全边界：等 complete 才失败会让用户白传一整个文件
-      absolute = resolve(root, target);
-    } on FileServiceException catch (error) {
-      return _error(error.message, 400);
+    if (remote != null) {
+      // 远端：分片仍暂存在本机，complete 时一次 SFTP 写过去（远端不需要追加写）。
+      // 目标路径已由 _safeSubPath/_safeSegment 校验，且远端根由工作空间 IO 约束，
+      // 因此这里不需要（也不能）用本机根目录去 resolve。
+      absolute = '';
+    } else {
+      try {
+        // 目标路径提前过一遍安全边界：等 complete 才失败会让用户白传一整个文件
+        absolute = resolve(root, target);
+      } on FileServiceException catch (error) {
+        return _error(error.message, 400);
+      }
     }
 
     await _pruneUploads();
@@ -390,6 +561,7 @@ class FileService {
       agentId: agent.id,
       relativePath: target,
       absolutePath: absolute,
+      remote: remote != null,
       stagingDir: staging.path,
       sink: sink,
       totalSize: totalSize,
@@ -481,10 +653,21 @@ class FileService {
     }
     _uploads.remove(uploadId);
     final File staged = File(p.join(session.stagingDir, 'part.bin'));
-    final File target = File(session.absolutePath);
     try {
-      await target.parent.create(recursive: true);
-      await _moveFile(staged, target);
+      if (session.remote) {
+        final WorkspaceFiles? remote = await remoteFor(agent);
+        if (remote == null) {
+          throw StateError('远端文件后端不可用（连接可能已断开）');
+        }
+        await remote.writeBytes(
+          session.relativePath,
+          await staged.readAsBytes(),
+        );
+      } else {
+        final File target = File(session.absolutePath);
+        await target.parent.create(recursive: true);
+        await _moveFile(staged, target);
+      }
     } catch (error) {
       await _deleteQuietly(Directory(session.stagingDir));
       return _error('保存文件失败：$error', 500);
@@ -511,15 +694,19 @@ class FileService {
   ) async {
     final CoreAgent? agent = agentFor(workspaceId);
     if (agent == null) return _error('工作空间不存在：$workspaceId');
-    final Map<String, dynamic>? blocked = _remoteBlocked(agent, '同步到本地');
-    if (blocked != null) return blocked;
+    final WorkspaceFiles? remote = await remoteFor(agent);
+    if (agent.sshConfig != null && remote == null) {
+      return _error('该工作空间在远端（SSH）：核心未接入远端文件后端', 400);
+    }
     final String raw = localPath.trim();
     if (raw.isEmpty) return _error('local_path 不能为空', 400);
+    final String target = p.normalize(p.absolute(raw));
+    // 远端工作空间：本机目录不可能"落在远端工作空间内部"，直接拉取
+    if (remote != null) return _syncRemoteToLocal(remote, target);
     final String root = p.normalize(rootFor(agent));
     if (!Directory(root).existsSync()) {
       return _error('工作空间目录不存在：$root', 404);
     }
-    final String target = p.normalize(p.absolute(raw));
     // 目标落在工作空间内部会"边写边遍历"（刚写入的文件又被下一次遍历读到）
     if (target == root || p.isWithin(root, target)) {
       return _error('目标目录不能是工作空间本身或它的子目录：$raw', 400);
@@ -569,8 +756,11 @@ class FileService {
   Future<Map<String, dynamic>> archive(String workspaceId, String path) async {
     final CoreAgent? agent = agentFor(workspaceId);
     if (agent == null) return _error('工作空间不存在：$workspaceId');
-    final Map<String, dynamic>? blocked = _remoteBlocked(agent, '目录打包下载');
-    if (blocked != null) return blocked;
+    final WorkspaceFiles? remote = await remoteFor(agent);
+    if (agent.sshConfig != null && remote == null) {
+      return _error('该工作空间在远端（SSH）：核心未接入远端文件后端', 400);
+    }
+    if (remote != null) return _archiveRemote(remote, path);
     final String root = p.normalize(rootFor(agent));
     final String absolute;
     try {
@@ -611,6 +801,21 @@ class FileService {
       );
     }
     final String rel = path.trim().isEmpty ? '.' : _relative(root, absolute);
+    return _tarGz(
+      root: root,
+      rel: rel,
+      name: '${p.basename(absolute)}.tar.gz',
+      entries: entries.length,
+    );
+  }
+
+  /// 跑一次本地 tar 打包并读回字节（本地与远端共用：远端先把子树拉回本地）。
+  Future<Map<String, dynamic>> _tarGz({
+    required String root,
+    required String rel,
+    required String name,
+    required int entries,
+  }) async {
     final Directory temp;
     final File archiveFile;
     final ProcessResult result;
@@ -645,8 +850,8 @@ class FileService {
       }
       return <String, dynamic>{
         'bytes': bytes,
-        'name': '${p.basename(absolute)}.tar.gz',
-        'entries': entries.length,
+        'name': name,
+        'entries': entries,
         'size': bytes.length,
       };
     } catch (error) {
@@ -656,15 +861,172 @@ class FileService {
     }
   }
 
-  /// 远端（SSH）工作空间的统一拒绝：读写远端文件需要 SFTP 二进制通道，
-  /// 属于后续里程碑；这里给可读错误，而不是假装成功。
-  Map<String, dynamic>? _remoteBlocked(CoreAgent agent, String feature) {
-    if (agent.sshConfig == null) return null;
-    return _error(
-      '该工作空间在远端（SSH）：暂不支持$feature（需要 SFTP 二进制通道），'
-      '请用终端工具或本地挂载盘',
-      400,
+  /// 远端子树（M7g）：列出 [relPath] 下的全部文件（相对工作空间根、POSIX 分隔符）。
+  ///
+  /// 有界：条数超过 [maxSyncFiles] 立刻返回（调用方据此给 413），不把巨目录读爆
+  /// 内存；跳过 `.git`（与本地 `_enumerate` 同口径），避免把版本库整个拖下来。
+  Future<List<_RemoteEntry>> _walkRemote(
+    WorkspaceFiles remote,
+    String relPath,
+  ) async {
+    final List<_RemoteEntry> out = <_RemoteEntry>[];
+    final List<String> pending = <String>[relPath.trim()];
+    while (pending.isNotEmpty) {
+      final String dir = pending.removeLast();
+      final List<WorkspaceEntry> entries = await remote.listEntries(
+        dir,
+        maxEntries: maxListEntries,
+      );
+      for (final WorkspaceEntry entry in entries) {
+        if (entry.name == '.git') continue;
+        if (entry.isDirectory) {
+          pending.add(entry.relativePath);
+          continue;
+        }
+        out.add(_RemoteEntry(rel: entry.relativePath, size: entry.size));
+        if (out.length > maxSyncFiles) return out;
+      }
+    }
+    out.sort((_RemoteEntry a, _RemoteEntry b) => a.rel.compareTo(b.rel));
+    return out;
+  }
+
+  /// 把远端文件拉到本地目录（保留相对层级）；返回写入字节数。
+  Future<int> _materializeRemote(
+    WorkspaceFiles remote,
+    List<_RemoteEntry> entries,
+    String destinationRoot,
+  ) async {
+    final Set<String> created = <String>{};
+    int bytes = 0;
+    for (final _RemoteEntry entry in entries) {
+      final String destination = p.joinAll(<String>[
+        destinationRoot,
+        ...p.posix.split(entry.rel),
+      ]);
+      final String parent = p.dirname(destination);
+      if (created.add(parent)) {
+        await Directory(parent).create(recursive: true);
+      }
+      final Uint8List data = await remote.readBytes(entry.rel);
+      await File(destination).writeAsBytes(data, flush: true);
+      bytes += data.length;
+    }
+    return bytes;
+  }
+
+  /// 远端工作空间 → 本机目录（`syncToLocal` 的 SSH 分支）。
+  Future<Map<String, dynamic>> _syncRemoteToLocal(
+    WorkspaceFiles remote,
+    String target,
+  ) async {
+    final List<_RemoteEntry> entries;
+    try {
+      entries = await _walkRemote(remote, '');
+    } on WorkspacePathException catch (error) {
+      return _error(error.toString(), 400);
+    } catch (error) {
+      return _error('读取远端工作空间失败：$error', 500);
+    }
+    if (entries.length > maxSyncFiles) {
+      return _error(
+        '工作空间文件过多（${entries.length} > $maxSyncFiles），请改用文件夹打包下载',
+        413,
+      );
+    }
+    final int totalBytes = entries.fold<int>(
+      0,
+      (int sum, _RemoteEntry entry) => sum + entry.size,
     );
+    if (totalBytes > maxSyncBytes) {
+      return _error(
+        '工作空间过大（${totalBytes ~/ (1024 * 1024)} MB > 上限 '
+        '${maxSyncBytes ~/ (1024 * 1024)} MB），请改用文件夹打包下载',
+        413,
+      );
+    }
+    int copied = 0;
+    int bytes = 0;
+    try {
+      for (final _RemoteEntry entry in entries) {
+        final String destination = p.joinAll(<String>[
+          target,
+          ...p.posix.split(entry.rel),
+        ]);
+        await Directory(p.dirname(destination)).create(recursive: true);
+        final Uint8List data = await remote.readBytes(entry.rel);
+        await File(destination).writeAsBytes(data, flush: true);
+        copied++;
+        bytes += data.length;
+      }
+    } catch (error) {
+      return _error('同步失败（已复制 $copied 个文件）：$error', 500);
+    }
+    log?.call('同步到本地（SSH）：$copied 个文件 → $target');
+    return <String, dynamic>{
+      'success': true,
+      'local_path': target,
+      'files': copied,
+      'bytes': bytes,
+    };
+  }
+
+  /// 远端目录打包（`archive` 的 SSH 分支）：先把子树拉回本地临时目录，再本地 tar。
+  ///
+  /// 为什么不遥控远端 tar：① 远端不一定有 tar/bsdtar；② 二进制经 exec 的 stdout
+  /// 会被当成文本解码（本机那条路径已经踩过一次：bsdtar 经管道还会把 \n 变 \r\n），
+  /// 传回来还得走 base64；③ 各发行版 tar 行为不一致。拉回来再打包只有一条代码路径，
+  /// 也复用了同一份大小上限与 gzip 校验。
+  Future<Map<String, dynamic>> _archiveRemote(
+    WorkspaceFiles remote,
+    String path,
+  ) async {
+    final List<_RemoteEntry> entries;
+    try {
+      entries = await _walkRemote(remote, path);
+    } on WorkspacePathException catch (error) {
+      return _error(error.toString(), 400);
+    } on WorkspaceIoException catch (error) {
+      return _error(error.message, 404);
+    } catch (error) {
+      return _error('读取远端目录失败：$error', 500);
+    }
+    final int total = entries.fold<int>(
+      0,
+      (int sum, _RemoteEntry entry) => sum + entry.size,
+    );
+    if (total > maxArchiveBytes) {
+      return _error(
+        '目录过大（${total ~/ (1024 * 1024)} MB > 上限 '
+        '${maxArchiveBytes ~/ (1024 * 1024)} MB），请分批下载',
+        413,
+      );
+    }
+    final String trimmed = path.trim();
+    final String baseName = trimmed.isEmpty
+        ? 'workspace'
+        : p.posix.basename(p.posix.normalize(trimmed));
+    final Directory temp;
+    try {
+      temp = await Directory.systemTemp.createTemp('tree_remote_tar_');
+      // 按**工作空间相对路径**铺开（不额外套一层目录名）：这样 tar 的 -C + rel 与
+      // 本地打包完全同构，包内成员名也与工作空间里看到的一致。
+      await _materializeRemote(remote, entries, temp.path);
+    } on WorkspacePathException catch (error) {
+      return _error(error.toString(), 400);
+    } catch (error) {
+      return _error('拉取远端目录失败：$error', 500);
+    }
+    try {
+      return await _tarGz(
+        root: temp.path,
+        rel: trimmed.isEmpty ? '.' : trimmed,
+        name: '$baseName.tar.gz',
+        entries: entries.length,
+      );
+    } finally {
+      await _deleteQuietly(temp);
+    }
   }
 
   /// 枚举目录下所有文件（跳过 `.git` 与符号链接），相对路径统一用 `/` 分隔。
@@ -881,6 +1243,7 @@ class _UploadSession {
     required this.agentId,
     required this.relativePath,
     required this.absolutePath,
+    required this.remote,
     required this.stagingDir,
     required this.sink,
     required this.totalSize,
@@ -894,6 +1257,9 @@ class _UploadSession {
 
   /// 目标绝对路径（已过 [FileService.resolve] 边界检查）。
   final String absolutePath;
+
+  /// 目标是否在远端（true 时 [absolutePath] 无意义，落盘走 SFTP 写）。
+  final bool remote;
 
   /// 系统临时目录里的暂存目录。
   final String stagingDir;
@@ -912,6 +1278,14 @@ class _UploadSession {
 
   /// 最后一次活动时刻（用于超时清理）。
   DateTime touchedAt = DateTime.now();
+}
+
+/// 远端子树里的一个文件（M7g）：相对工作空间根、字节数。
+class _RemoteEntry {
+  const _RemoteEntry({required this.rel, required this.size});
+
+  final String rel;
+  final int size;
 }
 
 /// 遍历到的一个文件（打包与同步共用）。

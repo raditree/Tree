@@ -125,6 +125,39 @@ class DartSshTransport implements SshTransport {
   }
 
   @override
+  Future<List<SshFileEntry>> listEntries(
+    String absolutePath, {
+    int maxEntries = 2000,
+  }) async {
+    final List<SftpName> names;
+    try {
+      names = await _sftp.listdir(absolutePath);
+    } catch (error) {
+      throw WorkspaceIoException('远端目录不存在或无法读取：$absolutePath');
+    }
+    final List<SshFileEntry> out = <SshFileEntry>[];
+    for (final SftpName entry in names) {
+      if (out.length >= maxEntries) break;
+      final String name = entry.filename;
+      if (name == '.' || name == '..') continue;
+      final SftpFileAttrs attr = entry.attr;
+      final int? mtime = attr.modifyTime;
+      out.add(
+        SshFileEntry(
+          name: name,
+          isDirectory: attr.isDirectory,
+          size: attr.size ?? 0,
+          // dartssh2 给的是 epoch 秒
+          modified: mtime == null
+              ? null
+              : DateTime.fromMillisecondsSinceEpoch(mtime * 1000),
+        ),
+      );
+    }
+    return out;
+  }
+
+  @override
   Future<bool> exists(String absolutePath) async {
     final SshExecResult result = await run('test -e ${_quote(absolutePath)}');
     return result.exitCode == 0;

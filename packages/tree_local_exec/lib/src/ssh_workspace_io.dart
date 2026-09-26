@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
@@ -21,6 +22,12 @@ abstract interface class SshTransport {
   /// 递归列出目录下的**文件**相对路径（POSIX 分隔符）。
   Future<List<String>> listFiles(String absolutePath, {int maxDepth});
 
+  /// 列出**一层**目录（M7g 文件面板用）：名字/类型/大小/修改时间。
+  ///
+  /// 与 [listFiles] 的区别：那个是给 grep/工具层用的「文件路径清单」，不递归、
+  /// 也不需要元信息；文件面板要显示大小与时间，用 SFTP 的 listdir 一次拿全。
+  Future<List<SshFileEntry>> listEntries(String absolutePath, {int maxEntries});
+
   /// 路径是否存在且是文件/目录。
   Future<bool> exists(String absolutePath);
 
@@ -29,6 +36,21 @@ abstract interface class SshTransport {
 
   /// 释放连接。
   Future<void> close();
+}
+
+/// 远端一层目录条目（M7g）。
+class SshFileEntry {
+  const SshFileEntry({
+    required this.name,
+    required this.isDirectory,
+    this.size = 0,
+    this.modified,
+  });
+
+  final String name;
+  final bool isDirectory;
+  final int size;
+  final DateTime? modified;
 }
 
 /// 远端命令执行结果。
@@ -82,7 +104,7 @@ Future<String> resolveRemoteRoot(
 /// - grep/list 需要一次远端遍历（[SshTransport.listFiles]），因此默认排除目录
 ///   与深度上限同样生效，避免把 node_modules 拉下来；
 /// - exec 不做 `chcp`（远端不是 cmd）。
-class SshWorkspaceIO implements WorkspaceIO {
+class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   SshWorkspaceIO(this.root, this._transport);
 
   @override
@@ -310,6 +332,64 @@ class SshWorkspaceIO implements WorkspaceIO {
       truncated: result.stdout.length + result.stderr.length > maxOutputBytes,
       shell: 'ssh',
     );
+  }
+
+  // ── 文件面板（M7g）：列一层目录 + 原始字节读写 ─────────────────────────
+
+  @override
+  Future<List<WorkspaceEntry>> listEntries(
+    String relativePath, {
+    int maxEntries = 2000,
+  }) async {
+    final String start = resolve(
+      relativePath.trim().isEmpty ? '.' : relativePath,
+    );
+    final List<SshFileEntry> entries;
+    try {
+      entries = await _transport.listEntries(start, maxEntries: maxEntries);
+    } on WorkspaceIoException {
+      rethrow;
+    } catch (error) {
+      throw WorkspaceIoException('列目录失败（$relativePath）：$error');
+    }
+    final String base = relativize(start);
+    final List<WorkspaceEntry> out = <WorkspaceEntry>[];
+    for (final SshFileEntry entry in entries) {
+      out.add(
+        WorkspaceEntry(
+          name: entry.name,
+          relativePath: p.posix
+              .join(base, entry.name)
+              .replaceFirst(RegExp(r'^\./'), ''),
+          isDirectory: entry.isDirectory,
+          size: entry.isDirectory ? 0 : entry.size,
+          modified: entry.modified,
+        ),
+      );
+    }
+    out.sort((WorkspaceEntry a, WorkspaceEntry b) {
+      if (a.isDirectory != b.isDirectory) return a.isDirectory ? -1 : 1;
+      return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    });
+    return out;
+  }
+
+  @override
+  Future<Uint8List> readBytes(String relativePath) async {
+    final String absolute = resolve(relativePath);
+    return Uint8List.fromList(await _read(absolute, relativePath));
+  }
+
+  @override
+  Future<void> writeBytes(String relativePath, List<int> bytes) async {
+    final String absolute = resolve(relativePath);
+    try {
+      await _transport.write(absolute, bytes);
+    } on WorkspaceIoException {
+      rethrow;
+    } catch (error) {
+      throw WorkspaceIoException('写入失败（$relativePath）：$error');
+    }
   }
 
   @override

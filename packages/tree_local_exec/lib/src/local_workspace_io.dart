@@ -29,7 +29,7 @@ class WorkspaceIoException implements Exception {
 /// 路径安全：一切工具参数都是工作空间相对路径，[resolve] 拒绝绝对路径/盘符/UNC
 /// 以及 `..` 越界。注意符号链接可以绕过（本机单用户场景接受该风险，已在文档中
 /// 记录；真要防需要 O_NOFOLLOW 级别的处理，Dart 标准库不提供）。
-class LocalWorkspaceIO implements WorkspaceIO {
+class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   LocalWorkspaceIO(this.root, {this.maxReadBytes = 512 * 1024});
 
   @override
@@ -389,6 +389,70 @@ class LocalWorkspaceIO implements WorkspaceIO {
           _isStrictUtf8(stdoutBytes) == false ||
           _isStrictUtf8(stderrBytes) == false,
     );
+  }
+
+  // ── 文件面板（M7g）：列一层目录 + 原始字节读写 ─────────────────────────
+
+  @override
+  Future<List<WorkspaceEntry>> listEntries(
+    String relativePath, {
+    int maxEntries = 2000,
+  }) async {
+    final String absolute = resolve(
+      relativePath.trim().isEmpty ? '.' : relativePath,
+    );
+    final Directory dir = Directory(absolute);
+    if (!await dir.exists()) {
+      throw WorkspaceIoException('目录不存在：$relativePath');
+    }
+    final List<WorkspaceEntry> out = <WorkspaceEntry>[];
+    await for (final FileSystemEntity entity in dir.list(followLinks: false)) {
+      if (out.length >= maxEntries) break;
+      FileStat stat;
+      try {
+        stat = await entity.stat();
+      } catch (_) {
+        // 列目录途中被删/无权限：跳过这一条，不让整个列举失败
+        continue;
+      }
+      final bool isDir = stat.type == FileSystemEntityType.directory;
+      out.add(
+        WorkspaceEntry(
+          name: p.basename(entity.path),
+          relativePath: relativize(entity.path),
+          isDirectory: isDir,
+          size: isDir ? 0 : stat.size,
+          modified: stat.modified,
+        ),
+      );
+    }
+    _sortEntries(out);
+    return out;
+  }
+
+  @override
+  Future<Uint8List> readBytes(String relativePath) async {
+    final String absolute = resolve(relativePath);
+    final File file = File(absolute);
+    if (!await file.exists()) {
+      throw WorkspaceIoException('文件不存在：$relativePath');
+    }
+    return file.readAsBytes();
+  }
+
+  @override
+  Future<void> writeBytes(String relativePath, List<int> bytes) async {
+    final String absolute = resolve(relativePath);
+    await File(absolute).parent.create(recursive: true);
+    await File(absolute).writeAsBytes(bytes, flush: true);
+  }
+
+  /// 目录在前，各自按名字（不区分大小写）排序——与前端文件树一致。
+  static void _sortEntries(List<WorkspaceEntry> entries) {
+    entries.sort((WorkspaceEntry a, WorkspaceEntry b) {
+      if (a.isDirectory != b.isDirectory) return a.isDirectory ? -1 : 1;
+      return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    });
   }
 
   @override

@@ -1403,7 +1403,7 @@ class CoreServer {
       await writeJson(request, 501, errorBody('文件服务尚未接入'));
       return;
     }
-    final Map<String, dynamic> result = files.list(
+    final Map<String, dynamic> result = await files.list(
       params['workspaceId'] ?? '',
       path: request.uri.queryParameters['path'] ?? '',
     );
@@ -1421,7 +1421,7 @@ class CoreServer {
       await writeJson(request, 501, errorBody('文件服务尚未接入'));
       return;
     }
-    final Map<String, dynamic> result = files.content(
+    final Map<String, dynamic> result = await files.content(
       params['workspaceId'] ?? '',
       request.uri.queryParameters['path'] ?? '',
     );
@@ -1440,7 +1440,7 @@ class CoreServer {
       return;
     }
     final Map<String, dynamic> body = await readJsonBody(request);
-    final Map<String, dynamic> result = files.readBytes(
+    final Map<String, dynamic> result = await files.readBytes(
       params['workspaceId'] ?? '',
       (body['path'] ?? '').toString(),
     );
@@ -1574,7 +1574,7 @@ class CoreServer {
       await writeJson(request, 501, errorBody('文件服务尚未接入'));
       return;
     }
-    final Map<String, dynamic> result = files.pdfInfo(
+    final Map<String, dynamic> result = await files.pdfInfo(
       params['workspaceId'] ?? '',
       request.uri.queryParameters['path'] ?? '',
     );

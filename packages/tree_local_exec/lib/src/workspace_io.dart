@@ -10,6 +10,8 @@
 ///   "是不是还有更多"，而不是看到一份被悄悄截断的结果。
 library;
 
+import 'dart:typed_data';
+
 /// 路径越界/非法（工具层会把它翻成模型可读的错误结果）。
 class WorkspacePathException implements Exception {
   WorkspacePathException(this.relativePath, this.reason);
@@ -216,4 +218,49 @@ abstract interface class WorkspaceIO {
 
   /// 释放资源（幂等）。
   Future<void> close();
+}
+
+/// 文件面板的一层目录条目（M7g）。
+class WorkspaceEntry {
+  const WorkspaceEntry({
+    required this.name,
+    required this.relativePath,
+    required this.isDirectory,
+    this.size = 0,
+    this.modified,
+  });
+
+  /// 名字（不含路径）。
+  final String name;
+
+  /// 工作空间内相对路径（POSIX 分隔符）。
+  final String relativePath;
+
+  final bool isDirectory;
+
+  /// 文件字节数（目录恒为 0）。
+  final int size;
+
+  /// 修改时间（远端/本地都可能拿不到，故可空）。
+  final DateTime? modified;
+}
+
+/// 文件面板需要的三个操作（M7g）：列一层目录、读原始字节、写原始字节。
+///
+/// 与 [WorkspaceIO] 分开的理由：工具层只需要"读一个文件 / 写一个文件 / 列出一批
+/// 路径"，而文件面板要的是**一层目录的元信息**（名字/类型/大小/时间）与原始字节
+/// （图片、PDF、压缩包都不能当文本走）。本地实现是 dart:io 的薄封装，SSH 实现走
+/// SFTP；`FileService` 只依赖本接口，因此两条路径共用同一套 REST 语义与安全边界。
+abstract interface class WorkspaceFiles {
+  /// 列出一层目录（不递归）；越界/非法路径抛 [WorkspacePathException]。
+  Future<List<WorkspaceEntry>> listEntries(
+    String relativePath, {
+    int maxEntries = 2000,
+  });
+
+  /// 读取原始字节（不存在抛 [WorkspaceIoException]）。
+  Future<Uint8List> readBytes(String relativePath);
+
+  /// 写入原始字节（自动创建父目录）。
+  Future<void> writeBytes(String relativePath, List<int> bytes);
 }
