@@ -234,6 +234,18 @@
 - README.md:174 关于"远端 Git 仍 400"的描述待更新（Wave 3-G）。
 - 真机 SSH 回归留到 Wave 3-G。
 
+### Wave 2 任务定义（Wave 1-A 收口后启动）
+
+**D — 工具层**（packages/tree_core/lib/src/tool/**、lib/src/spec/**、lib/src/files/file_service.dart，以及 core_server 里 FileService 构造的那一处）
+1. **Q9 spec 瘦身**：tool/spec_tool.dart 只保留 select / create / update；select **直接返回所选 Spec 全文**（删除"必须先 read"约束、删除 search 与 list）；索引注入系统提示词（agent/workspace_prompt.dart），格式照旧 `- \`id\` [task_type] 标题（内置）（适用: when 摘要）`，默认全列、>50 条截断并注明"其余可用 spec select 直取"。
+2. **Q10 grep 结果文案**：无匹配时在工具结果里给出 扫描根 / scannedFileCount / scannedFilePaths（≤200，超出注明总数）/ excludedDirs（生效排除目录）。字段契约来自 Wave 1-C：**是 scannedFilePaths，不是 scannedFiles**。
+3. **terminal 软超时 → hook 后台**：到点**不杀进程**，转 hook 模式后台执行并返回查询/续看方式（参考 .trae/documents/terminal_hook_mode_plan.md；执行器侧已去超时，见 Wave 1-C）。
+4. **Q4 端到端接线**：file_service.dart 的 gitLog/gitBranches 的 SSH 分支改为经 WorkspaceIO 执行（参考 core_server 的 specIoFor 注入方式与 FileService.remoteFor 的写法）；返回体保持 REST 形状（`commits: [...]`、`branches: [{'name': ...}]`），以免破坏 files_api_test.dart:315 与前端 git_history.dart。
+
+**E — 会话/存储层**（packages/tree_core/lib/src/agent/conversation_service.dart、lib/src/store/**、settings 的 tokenRate 读取）
+1. **Q3 消息分段**（照旧后端 server/agent/chat.py:1984-2210）：thinking 段遇 text / tool_call / 提问即关闭；text 段遇 tool_call 即关闭并**独立落库**（中间输出不再并进最终回复）；tool 调用一条一张卡片；最终回复带 usage；落库加**单调序号**保证重载顺序稳定。
+2. **Q13 token 管道**：工具调用参数按 `字符数 / token_scale` 折算 token，与思考**共用同一条 token rate 管道**推送 tool_start；tool_end **直接推**；推完再进下一轮 API 调用。
+
 ---
 
 ## 9. 变更记录
