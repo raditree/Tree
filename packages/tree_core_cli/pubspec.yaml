@@ -1,0 +1,15 @@
+name: tree_core_cli
+description: Tree 桌面端核心进程的可执行入口（dart compile exe → tree_core.exe）。
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.13.0
+
+dependencies:
+  tree_core:
+    path: ../tree_core
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.0

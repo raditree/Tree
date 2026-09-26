@@ -1,0 +1,17 @@
+name: tree_core
+description: Tree 桌面端核心（agent 编排 / LLM / 工具 / 存储 / 插件）；纯 Dart，不含 Flutter。
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.13.0
+
+dependencies:
+  tree_protocol:
+    path: ../tree_protocol
+  tree_local_exec:
+    path: ../tree_local_exec
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.0

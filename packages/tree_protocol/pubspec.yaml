@@ -1,0 +1,12 @@
+name: tree_protocol
+description: Tree desktop 核心与前端共用的协议定义（REST 路径 / WS 事件类型 / 信封字段）。
+# 纯 Dart 包：不得依赖 Flutter，保证 tree_core 可独立进程运行
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.13.0
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.0

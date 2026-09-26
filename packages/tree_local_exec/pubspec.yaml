@@ -1,0 +1,11 @@
+name: tree_local_exec
+description: Tree 桌面端本机执行原语（从 lib/io/local_executor_service.dart 抽出的纯 Dart 实现）。
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.13.0
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.0
