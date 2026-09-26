@@ -4,18 +4,21 @@ import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:tree_protocol/tree_protocol.dart';
 
 import '../../io/api_service.dart';
 import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
 import '../../io/workspace_refresh_service.dart';
 import '../services/download_center.dart';
+import '../services/plugin_ui_registry.dart';
 import 'file_sync_button.dart';
 import 'file_tree.dart';
 import 'file_viewer.dart';
 import 'git_history.dart';
 import 'mcp_config_panel.dart';
 import 'model_info_panel.dart';
+import 'plugin_ui_slots.dart';
 import 'question_panel.dart';
 import 'todo_panel.dart';
 
@@ -28,7 +31,12 @@ import 'todo_panel.dart';
 /// - 「问题回复」：统一汇总并答复所有提问（[QuestionPanel]）
 ///
 /// 「插件」原本是这里的第 5 个页签，已迁到**左侧活动栏**（见
-/// `main_page.dart` 的 `_buildActivityBar`），与 Agent 列表并列。
+/// main_page.dart 的 _buildActivityBar），与 Agent 列表并列。
+///
+/// Q12 插件布局：插件声明的 `panel` 槽位作为**插件 Tab 追加在既有 Tab 之后**
+/// （见 [PluginUiRegistry.slotsOfKind]），内容由 [PluginPanelSlotView] 渲染；
+/// 槽位变化（manifest / 注销 / 切 team）时按槽位键比对，仅在集合真变化时重建
+/// TabController——避免每次 plugin_ui_update 都重置当前页签。
 ///
 /// 点击文件时以覆盖层方式弹出 [FileViewer]，点击返回按钮关闭查看器。
 class FilePanel extends StatefulWidget {
@@ -50,6 +58,9 @@ class FilePanel extends StatefulWidget {
   /// 提问定位回调（透传给 [QuestionPanel]）
   final QuestionNavigateCallback? onNavigateToQuestion;
 
+  /// 插件槽位注册表（默认全局单例；测试注入独立实例，避免污染单例）
+  final PluginUiRegistry? registry;
+
   const FilePanel({
     super.key,
     required this.workspaceId,
@@ -58,6 +69,7 @@ class FilePanel extends StatefulWidget {
     this.sessionId = 'session_default',
     this.onCollapse,
     this.onNavigateToQuestion,
+    this.registry,
   });
 
   @override
@@ -65,8 +77,21 @@ class FilePanel extends StatefulWidget {
 }
 
 class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
-  /// 顶层 Tab 控制器（0=文件，1=MCP 配置，2=模型信息）
-  late final TabController _tabController;
+  /// 内置顶层 Tab 数量（文件 / MCP 配置 / 模型信息 / 问题回复）
+  static const int _builtinTabCount = 4;
+
+  /// 顶层 Tab 控制器（0=文件，1=MCP 配置，2=模型信息，3=问题回复，
+  /// 之后是插件 panel 槽位；插件槽位集合变化时重建）
+  late TabController _tabController;
+
+  /// 顶层 Tab 当前选中索引（重建控制器时保持选中页）
+  int _topTabIndex = 0;
+
+  /// 当前 team 可见的插件面板槽位（右栏顶层 Tab 的插件段）
+  List<PluginUiSlot> _pluginPanels = <PluginUiSlot>[];
+
+  /// 槽位注册表（默认全局单例）
+  PluginUiRegistry get _registry => widget.registry ?? PluginUiRegistry.instance;
 
   /// 文件子 Tab 控制器（0=文件浏览，1=Git 历史，2=Todo）
   late final TabController _fileTabController;
@@ -96,8 +121,15 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 4, vsync: this);
+    _pluginPanels = _registry.slotsOfKind(PluginUiSlotKind.panel);
+    _tabController = TabController(
+      length: _builtinTabCount + _pluginPanels.length,
+      vsync: this,
+    );
+    _tabController.addListener(_onTopTabChanged);
     _fileTabController = TabController(length: 3, vsync: this);
+    // Q12：插件槽位（manifest / 注销 / 切 team）变化时重算插件 Tab
+    _registry.addListener(_onPluginSlotsChanged);
     // 本地模式开关/工作目录变化时重新加载文件列表
     LocalExecutorService.instance.addListener(_onLocalModeChanged);
     // 工作空间数据变更（文件/Git/Todo 工具执行）时即时刷新右栏
@@ -108,9 +140,61 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
   void dispose() {
     LocalExecutorService.instance.removeListener(_onLocalModeChanged);
     WorkspaceRefreshService.instance.removeListener(_onWorkspaceChanged);
+    _registry.removeListener(_onPluginSlotsChanged);
     _tabController.dispose();
     _fileTabController.dispose();
     super.dispose();
+  }
+
+  /// 顶层 Tab 选中索引跟踪（TabController 重建时保持当前页）
+  void _onTopTabChanged() {
+    if (_tabController.index != _topTabIndex) {
+      _topTabIndex = _tabController.index;
+    }
+  }
+
+  /// 插件槽位集合变化：只有"槽位键序列"真的变了才重建 TabController。
+  ///
+  /// 视图更新（plugin_ui_update）不改变槽位键，因此不会重置当前页签，也不会
+  /// 让用户正在填的表单被重建。
+  void _onPluginSlotsChanged() {
+    if (!mounted) return;
+    final List<PluginUiSlot> slots =
+        _registry.slotsOfKind(PluginUiSlotKind.panel);
+    if (_samePanelKeys(slots)) {
+      return;
+    }
+    setState(() {
+      _pluginPanels = slots;
+      _rebuildTopTabController();
+    });
+  }
+
+  /// 槽位键序列是否与当前一致（顺序敏感：Tab 顺序必须稳定）。
+  bool _samePanelKeys(List<PluginUiSlot> slots) {
+    if (slots.length != _pluginPanels.length) {
+      return false;
+    }
+    for (int i = 0; i < slots.length; i++) {
+      if (slots[i].slotKey != _pluginPanels[i].slotKey) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /// 重建顶层 TabController（长度变了必须重建；保持当前选中页）
+  void _rebuildTopTabController() {
+    final int length = _builtinTabCount + _pluginPanels.length;
+    final int index = _topTabIndex.clamp(0, length - 1);
+    _tabController.dispose();
+    _tabController = TabController(
+      length: length,
+      vsync: this,
+      initialIndex: index,
+    );
+    _tabController.addListener(_onTopTabChanged);
+    _topTabIndex = index;
   }
 
   /// 工作空间数据变更（工具写文件 / git 提交 / 更新 todo）时增量刷新右栏。
@@ -261,7 +345,7 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
               onTap: _selectedFilePath == null ? widget.onCollapse : null,
               child: TabBarView(
                 controller: _tabController,
-                children: [
+                children: <Widget>[
                   _buildFileSection(),
                   const McpConfigPanel(),
                   ModelInfoPanel(agentId: widget.teamId ?? ''),
@@ -269,6 +353,14 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
                     sessionId: widget.sessionId,
                     onNavigateToQuestion: widget.onNavigateToQuestion,
                   ),
+                  // Q12：插件面板 Tab（追加在既有 Tab 之后）
+                  for (final PluginUiSlot slot in _pluginPanels)
+                    PluginPanelSlotView(
+                      slot: slot,
+                      registry: _registry,
+                      agentId: widget.teamId ?? '',
+                      sessionId: widget.sessionId,
+                    ),
                 ],
               ),
             ),
@@ -299,11 +391,14 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
                 fontWeight: FontWeight.w600,
               ),
               unselectedLabelStyle: const TextStyle(fontSize: 13),
-              tabs: const [
-                Tab(text: '文件'),
-                Tab(text: 'MCP 配置'),
-                Tab(text: '模型信息'),
-                Tab(text: '问题回复'),
+              tabs: <Widget>[
+                const Tab(text: '文件'),
+                const Tab(text: 'MCP 配置'),
+                const Tab(text: '模型信息'),
+                const Tab(text: '问题回复'),
+                // Q12 插件 Tab：追加在既有四个 Tab 之后，文案用槽位 title
+                for (final PluginUiSlot slot in _pluginPanels)
+                  Tab(text: pluginSlotLabel(slot)),
               ],
             ),
           ),

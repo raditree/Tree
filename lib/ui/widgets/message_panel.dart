@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:tree_protocol/tree_protocol.dart';
 
 import '../models/agent.dart';
 import '../models/message.dart';
@@ -13,8 +14,10 @@ import '../../io/question_update_service.dart';
 import '../../io/ssh_executor_service.dart';
 import '../../io/websocket_service.dart';
 import '../../io/workspace_refresh_service.dart';
+import '../services/plugin_ui_registry.dart';
 import 'message_input.dart';
 import 'message_list.dart';
+import 'plugin_ui_slots.dart';
 import 'mode_switch.dart';
 import 'session_picker.dart';
 import 'spec_panel.dart';
@@ -73,6 +76,13 @@ class _MessagePanelState extends State<MessagePanel> {
 
   /// WebSocket 服务
   final WebSocketService _webSocket = WebSocketService();
+
+  /// 插件动作帧发送通道（Q12）：plugin_ui_action 经本面板的 WS 连接回核心。
+  ///
+  /// 存成字段（而不是每次现取 tear-off）是为了 dispose 时能用 identical 判断
+  /// "通道还是不是自己装的"——重连/重建后不能把新面板的通道清掉。
+  late final void Function(Map<String, dynamic> frame) _pluginActionSink =
+      _webSocket.send;
 
   /// 是否已尝试连接 WebSocket（避免重复连接）
   bool _wsConnected = false;
@@ -153,6 +163,9 @@ class _MessagePanelState extends State<MessagePanel> {
   @override
   void initState() {
     super.initState();
+    // Q12 插件布局：本面板的 WS 连接同时承载插件 UI 帧（manifest / update /
+    // plugin_status 卸载），并作为 plugin_ui_action 的发送出口。
+    PluginUiRegistry.instance.actionSender = _pluginActionSink;
     _webSocket.onMessage = _handleIncomingMessage;
     // 未知会话消息（Task 7 接收方会话保障）：msg_chunk/msg_end 携带不在
     // 已知列表中的 session_id 时自动创建本地会话条目，使被动接收
@@ -555,6 +568,9 @@ class _MessagePanelState extends State<MessagePanel> {
   /// `msg_usage`（token 用量）。
   void _handleIncomingMessage(Map<String, dynamic> data) {
     if (!mounted) return;
+    // Q12 插件布局帧先行分流：manifest / update / plugin_status(destroyed)
+    // 由槽位注册表消费（按 team 过滤 + 槽位生命周期），不落到下面的消息分支。
+    if (PluginUiRegistry.instance.handleFrame(data)) return;
     final String? type = data['type'] as String?;
 
     if (type == 'msg_start') {
@@ -973,6 +989,10 @@ class _MessagePanelState extends State<MessagePanel> {
 
   @override
   void dispose() {
+    // 只回收自己装上的通道：期间可能已有新面板接管（多窗口/重建）
+    if (identical(PluginUiRegistry.instance.actionSender, _pluginActionSink)) {
+      PluginUiRegistry.instance.actionSender = null;
+    }
     _webSocket.disconnect();
     super.dispose();
   }
@@ -1000,15 +1020,32 @@ class _MessagePanelState extends State<MessagePanel> {
             )
           else
             Expanded(
-                      child: MessageList(
-                        messages: _messages,
-                        revision: _scrollRevision,
-                        onAskAnswer: _handleAskAnswer,
-                        scrollToMessageId: _scrollToMessageId,
-                        scrollToRevision: _scrollToRevision,
-                        bottomJump: _bottomJump,
-                      ),
-                    ),
+              // Q12 消息流内联卡片：有插件卡片槽位时，在消息列表末尾追加卡片区
+              // （无卡片时传空列表，列表项数不变，不占位）。
+              child: ListenableBuilder(
+                listenable: PluginUiRegistry.instance,
+                builder: (BuildContext context, Widget? child) {
+                  final bool hasCards = PluginUiRegistry.instance
+                      .hasKind(PluginUiSlotKind.card);
+                  return MessageList(
+                    messages: _messages,
+                    revision: _scrollRevision,
+                    onAskAnswer: _handleAskAnswer,
+                    scrollToMessageId: _scrollToMessageId,
+                    scrollToRevision: _scrollToRevision,
+                    bottomJump: _bottomJump,
+                    trailingCards: hasCards
+                        ? <Widget>[
+                            PluginInlineCards(
+                              agentId: agent.id,
+                              sessionId: _currentSessionId,
+                            ),
+                          ]
+                        : const <Widget>[],
+                  );
+                },
+              ),
+            ),
           if (agent != null)
             MessageInput(
               // 草稿按 team + session 隔离（M9 Q6）：切 agent/会话各自恢复

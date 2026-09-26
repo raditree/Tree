@@ -41,6 +41,12 @@ class MessageList extends StatelessWidget {
   /// 钉底；阅读模式下不做任何补偿（视口保持不动）。
   final bool bottomJump;
 
+  /// 消息流末尾追加的**插件内联卡片**（Q12）：按到达顺序排在最后一条消息之后。
+  ///
+  /// 单独用 Widget 列表而不是协议模型：消息列表只负责"在流里让出一段位置"，
+  /// 卡片内容（渲染、动作回插件）由 lib/ui/widgets/plugin_ui_slots.dart 负责。
+  final List<Widget> trailingCards;
+
   const MessageList({
     super.key,
     required this.messages,
@@ -49,6 +55,7 @@ class MessageList extends StatelessWidget {
     this.scrollToMessageId,
     this.scrollToRevision = 0,
     this.bottomJump = false,
+    this.trailingCards = const <Widget>[],
   });
 
   @override
@@ -60,6 +67,7 @@ class MessageList extends StatelessWidget {
       scrollToMessageId: scrollToMessageId,
       scrollToRevision: scrollToRevision,
       bottomJump: bottomJump,
+      trailingCards: trailingCards,
     );
   }
 }
@@ -75,6 +83,7 @@ class _MessageListView extends StatefulWidget {
   final String? scrollToMessageId;
   final int scrollToRevision;
   final bool bottomJump;
+  final List<Widget> trailingCards;
 
   const _MessageListView({
     required this.messages,
@@ -83,6 +92,7 @@ class _MessageListView extends StatefulWidget {
     this.scrollToMessageId,
     this.scrollToRevision = 0,
     this.bottomJump = false,
+    this.trailingCards = const <Widget>[],
   });
 
   @override
@@ -325,8 +335,8 @@ class _MessageListViewState extends State<_MessageListView> {
 
   @override
   Widget build(BuildContext context) {
-    if (widget.messages.isEmpty) {
-      // 空态：居中排版，emoji 与文字分行
+    if (widget.messages.isEmpty && widget.trailingCards.isEmpty) {
+      // 空态：居中排版，emoji 与文字分行（有插件卡片时不显示欢迎页）
       return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -356,8 +366,16 @@ class _MessageListViewState extends State<_MessageListView> {
             // （首帧即贴底，无「顶部闪一下再落底」）；阅读模式下不做任何补偿，
             // 末尾新增内容天然不影响已渲染内容的位置（零漂移）。
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            itemCount: widget.messages.length,
+            itemCount: widget.messages.length + widget.trailingCards.length,
             itemBuilder: (BuildContext context, int index) {
+              // 消息之后的槽位让给插件内联卡片（Q12）：按到达顺序逐项渲染，
+              // 位置 = 消息流末尾（最新消息之后），与流式追加同一个滚动语义。
+              if (index >= widget.messages.length) {
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: widget.trailingCards[index - widget.messages.length],
+                );
+              }
               // 常规布局：index 递增 = 由旧到新，最新消息在底部
               final ChatMessage message = widget.messages[index];
               // 工具调用卡片：默认折叠，独立渲染

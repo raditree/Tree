@@ -1,0 +1,21 @@
+00:00 +0: loading test/plugin_ui_test.dart
+00:00 +0: test/plugin_ui_test.dart: 三类帧编解码往返 manifest：解码 → 编码与原始帧逐字段相等
+00:00 +1: test/plugin_ui_test.dart: 三类帧编解码往返 manifest：槽位缺 plugin_id / team_id 时回落到帧级字段
+00:00 +2: test/plugin_ui_test.dart: 三类帧编解码往返 update：解码 → 编码与原始帧逐字段相等
+00:00 +3: test/plugin_ui_test.dart: 三类帧编解码往返 update：view 显式 null ⇒ 注销该槽位（view == null）
+00:00 +4: test/plugin_ui_test.dart: 三类帧编解码往返 action：解码 → 编码与原始帧逐字段相等
+00:00 +5: test/plugin_ui_test.dart: 三类帧编解码往返 帧类型不匹配时 fromFrame 返回 null（不误吞别的帧）
+00:00 +6: test/protocol_completeness_test.dart: 源码里的 "type" 字面量全部是协议帧或在登记表中
+00:00 +7: test/protocol_completeness_test.dart: 源码里的 "type" 字面量全部是协议帧或在登记表中
+00:00 +8: test/protocol_completeness_test.dart: 源码里的 "type" 字面量全部是协议帧或在登记表中
+00:00 +9: test/protocol_completeness_test.dart: 源码里的 "type" 字面量全部是协议帧或在登记表中
+00:00 +10: test/protocol_completeness_test.dart: 源码里的 "type" 字面量全部是协议帧或在登记表中
+00:00 +11: test/protocol_completeness_test.dart: 源码里的 "type" 字面量全部是协议帧或在登记表中
+00:00 +12: test/protocol_completeness_test.dart: 源码里的 "type" 字面量全部是协议帧或在登记表中
+00:00 +13: test/protocol_completeness_test.dart: 源码里的 "type" 字面量全部是协议帧或在登记表中
+00:00 +14: test/protocol_completeness_test.dart: 核心逐一处理每种上行帧（新增帧不得被 default 静默忽略）
+00:00 +15: test/protocol_completeness_test.dart: 前端使用的 /api 路径全部在 ApiPaths 中声明
+00:00 +16: test/protocol_completeness_test.dart: 前端已不再引用账号体系路径（M1b 删除登录与账号设置）
+00:00 +17: test/protocol_completeness_test.dart: 分帧常量只能来自协议包：前后端都不得重复定义或硬编码字面量
+00:00 +18: test/protocol_completeness_test.dart: 常量集合内部无重复且非空
+00:00 +19: All tests passed!

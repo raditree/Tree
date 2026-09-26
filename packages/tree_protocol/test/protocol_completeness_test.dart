@@ -22,6 +22,9 @@ void main() {
       ...WsInboundType.all,
       ...WsOutboundType.all,
       ...CoreEventType.all,
+      // Q12 插件布局三件套（manifest / update / action）：单独成集登记，
+      // 见 PluginUiFrameType.inbound 里"为何暂不并入 WsInboundType"的说明。
+      ...PluginUiFrameType.all,
       ...nonProtocolTypeLiterals.keys,
     };
     final Set<String> uncovered = scanned.difference(covered);
@@ -130,6 +133,12 @@ void main() {
       'WsInboundType': WsInboundType.all,
       'WsOutboundType': WsOutboundType.all,
       'CoreEventType': CoreEventType.all,
+      // Q12 插件布局常量集（帧 / 槽位 / 控件 / 字段 / 按钮样式）
+      'PluginUiFrameType': PluginUiFrameType.all,
+      'PluginUiSlotKind': PluginUiSlotKind.all,
+      'PluginUiViewType': PluginUiViewType.all,
+      'PluginUiFieldKind': PluginUiFieldKind.all,
+      'PluginUiButtonStyle': PluginUiButtonStyle.all,
       'ApiPaths.kept': ApiPaths.kept,
       'ApiPaths.removedWithAccounts': ApiPaths.removedWithAccounts,
     }.entries) {

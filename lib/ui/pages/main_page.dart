@@ -1,18 +1,22 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:tree_protocol/tree_protocol.dart';
 
 import '../models/agent.dart';
 import '../../io/api_service.dart';
 import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
 import '../../io/ssh_executor_service.dart';
+import '../services/plugin_ui_registry.dart';
+import '../widgets/activity_bar_item.dart';
 import '../widgets/agent_list.dart';
 import '../widgets/create_agent_dialog.dart';
 import '../widgets/download_panel.dart';
 import '../widgets/file_panel.dart';
 import '../widgets/message_panel.dart';
 import '../widgets/plugin_panel.dart';
+import '../widgets/plugin_ui_slots.dart';
 import '../widgets/teammates_window_page.dart';
 import 'settings_page.dart';
 
@@ -25,7 +29,10 @@ import 'settings_page.dart';
 /// 支持通过拖拽分隔条调整左栏和右栏宽度；
 /// 窗口尺寸过小时显示提示页面。
 class MainPage extends StatefulWidget {
-  const MainPage({super.key});
+  /// 插件槽位注册表（默认全局单例；测试注入独立实例，避免污染单例）
+  final PluginUiRegistry? registry;
+
+  const MainPage({super.key, this.registry});
 
   @override
   State<MainPage> createState() => _MainPageState();
@@ -61,6 +68,18 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   /// 移动端底部导航当前页（0=Agent 列表，1=消息，2=文件）
   int _mobileTab = 0;
 
+  /// 内置左栏面板数量（Agent 列表 / 插件（只读）/ 下载）：插件活动栏槽位从它之后编号
+  static const int _builtinLeftPanelCount = 3;
+
+  /// 当前选中的**插件活动栏槽位键**（null = 选中的是内置面板）
+  String? _selectedPluginActivityKey;
+
+  /// 上一次算出的活动栏插件槽位键序列（只在集合真变化时重建左栏）
+  List<String> _pluginActivityKeys = <String>[];
+
+  /// 插件槽位注册表（默认全局单例）
+  PluginUiRegistry get _registry => widget.registry ?? PluginUiRegistry.instance;
+
   // 当前选中的 Agent（未选择时为 null）
   Agent? _selectedAgent;
 
@@ -89,6 +108,51 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   // 窗口最小尺寸
   static const double _minWindowWidth = 1024;
   static const double _minWindowHeight = 600;
+
+  /// 当前 team 可见的活动栏插件槽位键（顺序即活动栏顺序）。
+  List<String> _activitySlotKeys() => <String>[
+    for (final PluginUiSlot slot
+        in _registry.slotsOfKind(PluginUiSlotKind.activity))
+      slot.slotKey,
+  ];
+
+  /// 活动栏插件项集合变化：仅当**槽位键序列**变化时才重建左栏。
+  ///
+  /// 插件视图更新（plugin_ui_update）不改变键序列，因此不会让整页重建——
+  /// 槽位视图本身由 [PluginActivityBarItems] / [PluginPanelSlotView] 各自监听。
+  void _onPluginSlotsChanged() {
+    if (!mounted) return;
+    final List<String> keys = _activitySlotKeys();
+    bool same = keys.length == _pluginActivityKeys.length;
+    if (same) {
+      for (int i = 0; i < keys.length; i++) {
+        if (keys[i] != _pluginActivityKeys[i]) {
+          same = false;
+          break;
+        }
+      }
+    }
+    final bool stale = _selectedPluginActivityKey != null &&
+        !keys.contains(_selectedPluginActivityKey);
+    if (same && !stale) {
+      return;
+    }
+    setState(() {
+      _pluginActivityKeys = keys;
+      if (stale) {
+        // 选中的插件槽位被注销（插件卸载/断连/切 team）→ 回落到内置面板
+        _selectedPluginActivityKey = null;
+      }
+    });
+  }
+
+  /// 切换插件槽位的 team 作用域（Q12 + M9 1.2 隔离口径）。
+  ///
+  /// 注册表只呈现"当前 team"的槽位；未选 agent 时当前 team 为空串，此时只呈现
+  /// team_id 也为空的全局槽位（fail-closed，不把别的 team 的槽位漏出来）。
+  void _setTeamScope(String? teamId) {
+    _registry.setTeam(teamId ?? '');
+  }
 
   /// 处理清空 agent 对话历史
   ///
@@ -182,11 +246,14 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       }
       return;
     }
+    final Agent targetAgent = target;
     setState(() {
-      _selectedAgent = target;
+      _selectedAgent = targetAgent;
       _currentSessionId = sessionId;
       _navigateMessageId = messageId;
       _navigateTrigger++;
+      // 切 team 即切插件槽位作用域（Q12）
+      _setTeamScope(targetAgent.id);
     });
   }
 
@@ -214,6 +281,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         _agents.add(agent);
         _selectedAgent = agent;
         _currentSessionId = 'session_default';
+        _setTeamScope(agent.id);
       });
     } catch (e) {
       if (mounted) {
@@ -241,6 +309,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         unawaited(SshExecutorService.instance.deactivateTeam(agent.id));
         if (_selectedAgent?.id == agent.id) {
           _selectedAgent = null;
+          // 当前 team 消失：插件槽位作用域回落为空（只呈现全局槽位）
+          _setTeamScope(null);
         }
       });
     } catch (e) {
@@ -255,12 +325,16 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // Q12：活动栏插件项集合变化时重建左栏（视图更新不触发整页重建）
+    _pluginActivityKeys = _activitySlotKeys();
+    _registry.addListener(_onPluginSlotsChanged);
     _loadAgents();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _registry.removeListener(_onPluginSlotsChanged);
     // 清理本地执行器：注销核心进程注册并释放 WebSocket 引用
     LocalExecutorService.instance.cleanup();
     // 清理 SSH 执行器：仅释放引用（不注销，SSH 配置后端持久化）
@@ -298,19 +372,32 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: LayoutBuilder(
-        builder: (context, constraints) {
-          // 移动端（Android/iOS）：任意屏幕尺寸使用单栏底部导航布局。
-          // 桌面三栏 + 最小 1024×600 限制在手机上会导致整页不可用
-          // （手机竖屏宽度通常仅 360~430dp）。
-          if (isMobile) return _buildMobileLayout();
-          // 检查窗口尺寸是否满足最小要求
-          if (constraints.maxWidth < _minWindowWidth ||
-              constraints.maxHeight < _minWindowHeight) {
-            return _buildSmallSizePrompt();
-          }
-          return _buildThreeColumnLayout();
-        },
+      body: Column(
+        children: <Widget>[
+          Expanded(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                // 移动端（Android/iOS）：任意屏幕尺寸使用单栏底部导航布局。
+                // 桌面三栏 + 最小 1024×600 限制在手机上会导致整页不可用
+                // （手机竖屏宽度通常仅 360~430dp）。
+                if (isMobile) return _buildMobileLayout();
+                // 检查窗口尺寸是否满足最小要求
+                if (constraints.maxWidth < _minWindowWidth ||
+                    constraints.maxHeight < _minWindowHeight) {
+                  return _buildSmallSizePrompt();
+                }
+                return _buildThreeColumnLayout();
+              },
+            ),
+          ),
+          // Q12 状态栏：主界面底部细条，只展示插件 status 槽位；
+          // 没有任何状态项时整条不出现（零高度），不改变既有界面高度。
+          PluginStatusBar(
+            registry: _registry,
+            agentId: _selectedAgent?.id ?? '',
+            sessionId: _currentSessionId,
+          ),
+        ],
       ),
     );
   }
@@ -366,6 +453,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 _selectedAgent = agent;
                 _currentSessionId = 'session_default';
                 _mobileTab = 1;
+                _setTeamScope(agent.id);
               });
             },
             onClearHistory: _handleClearHistory,
@@ -608,29 +696,38 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       child: Column(
         children: [
           const SizedBox(height: 8),
-          _buildActivityItem(
-            index: 0,
+          ActivityBarItem(
             icon: Icons.groups_outlined,
             selectedIcon: Icons.groups,
             tooltip: 'Agent 列表',
+            selected: _isBuiltinPanelSelected(0),
+            onTap: () => _selectBuiltinPanel(0),
           ),
           const SizedBox(height: 4),
-          _buildActivityItem(
-            index: 1,
+          ActivityBarItem(
             icon: Icons.extension_outlined,
             selectedIcon: Icons.extension,
             tooltip: '插件（只读）',
+            selected: _isBuiltinPanelSelected(1),
+            onTap: () => _selectBuiltinPanel(1),
           ),
           const SizedBox(height: 4),
-          _buildActivityItem(
-            index: 2,
+          ActivityBarItem(
             icon: Icons.download_outlined,
             selectedIcon: Icons.download,
             tooltip: '下载列表',
+            selected: _isBuiltinPanelSelected(2),
+            onTap: () => _selectBuiltinPanel(2),
+          ),
+          // Q12：插件活动栏项追加在内置项之后（同一套尺寸 / 选中态 / 折叠行为）
+          PluginActivityBarItems(
+            registry: _registry,
+            selectedSlotKey: _selectedPluginActivityKey,
+            onSelect: _selectPluginPanel,
           ),
           // 撑开剩余空间，把设置压到底部
           const Spacer(),
-          _buildActivityAction(
+          ActivityBarAction(
             icon: Icons.settings_outlined,
             tooltip: '设置',
             onTap: _openSettings,
@@ -639,6 +736,27 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         ],
       ),
     );
+  }
+
+  /// 内置面板项是否处于选中态（选中插件项时内置项一律不高亮）
+  bool _isBuiltinPanelSelected(int index) =>
+      _selectedPluginActivityKey == null && _leftPanel == index;
+
+  /// 切到内置左栏面板（并展开左栏，与既有行为一致）
+  void _selectBuiltinPanel(int index) {
+    setState(() {
+      _leftPanel = index;
+      _selectedPluginActivityKey = null;
+      _leftCollapsed = false;
+    });
+  }
+
+  /// 切到插件活动栏槽位（同样展开左栏；折叠态行为与内置项一致）
+  void _selectPluginPanel(String slotKey) {
+    setState(() {
+      _selectedPluginActivityKey = slotKey;
+      _leftCollapsed = false;
+    });
   }
 
   /// 打开设置页（活动栏底部全局入口）
@@ -650,77 +768,6 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     );
   }
 
-  /// 活动栏里的**动作**按钮（非面板切换：不参与选中态、无高亮指示条）
-  ///
-  /// 与 [_buildActivityItem] 共用尺寸与图标规格，保证视觉一致；区别是没有
-  /// 选中态（点它不会切换左栏面板）。
-  Widget _buildActivityAction({
-    required IconData icon,
-    required String tooltip,
-    required VoidCallback onTap,
-  }) {
-    final cs = Theme.of(context).colorScheme;
-    return Tooltip(
-      message: tooltip,
-      child: InkWell(
-        onTap: onTap,
-        child: SizedBox(
-          height: 44,
-          child: Row(
-            children: [
-              // 与面板项对齐的占位（无选中色）
-              const SizedBox(width: 2),
-              Expanded(child: Icon(icon, size: 22, color: cs.onSurfaceVariant)),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// 单个活动栏图标项（选中态带左侧高亮指示条 + 主色图标）
-  Widget _buildActivityItem({
-    required int index,
-    required IconData icon,
-    required IconData selectedIcon,
-    required String tooltip,
-  }) {
-    final bool selected = _leftPanel == index;
-    final cs = Theme.of(context).colorScheme;
-    return Tooltip(
-      message: tooltip,
-      child: InkWell(
-        onTap: () {
-          setState(() {
-            _leftPanel = index;
-            // 切到某个面板时顺带展开左栏（折叠状态下点图标应能看到内容）
-            _leftCollapsed = false;
-          });
-        },
-        child: SizedBox(
-          height: 44,
-          child: Row(
-            children: [
-              // 选中指示条
-              Container(
-                width: 2,
-                height: 44,
-                color: selected ? cs.primary : Colors.transparent,
-              ),
-              Expanded(
-                child: Icon(
-                  selected ? selectedIcon : icon,
-                  size: 22,
-                  color: selected ? cs.primary : cs.onSurfaceVariant,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
   /// 构建左栏当前选中的功能面板
   ///
   /// 用 [IndexedStack] 而非条件渲染：两个面板都保持挂载，因此
@@ -728,8 +775,19 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   /// - `PluginMonitorService` 的引用计数稳定为 1，**切换面板不会断开/重建它
   ///   自有的 WebSocket**（条件渲染会每次 start/stop 造成连接抖动）。
   Widget _buildLeftPanel() {
+    // Q12：插件活动栏槽位排在三个内置面板之后；栈索引按"当前选中槽位"计算，
+    // 槽位被注销时回落到内置面板（_onPluginSlotsChanged 会清掉过期选中）。
+    final List<PluginUiSlot> activitySlots =
+        _registry.slotsOfKind(PluginUiSlotKind.activity);
+    final String? selectedKey = _selectedPluginActivityKey;
+    final int pluginIndex = selectedKey == null
+        ? -1
+        : activitySlots.indexWhere((PluginUiSlot s) => s.slotKey == selectedKey);
+    final int stackIndex = pluginIndex >= 0
+        ? _builtinLeftPanelCount + pluginIndex
+        : _leftPanel.clamp(0, _builtinLeftPanelCount - 1);
     return IndexedStack(
-      index: _leftPanel,
+      index: stackIndex,
       children: <Widget>[
         _buildAgentPanel(),
         // 左栏由活动栏承担标题，避免与面板自带标题重复。
@@ -751,6 +809,14 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             });
           },
         ),
+        // Q12：每个活动栏插件槽位一个面板页（视图更新由该控件自行监听）
+        for (final PluginUiSlot slot in activitySlots)
+          PluginPanelSlotView(
+            slot: slot,
+            registry: _registry,
+            agentId: _selectedAgent?.id ?? '',
+            sessionId: _currentSessionId,
+          ),
       ],
     );
   }
@@ -797,6 +863,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       teamId: _selectedAgent?.id,
       teamName: _selectedAgent?.name ?? '',
       sessionId: _currentSessionId,
+      // 与主页面共用同一注册表（注入实例优先，便于测试）
+      registry: widget.registry,
       onCollapse: () {
         setState(() {
           _rightCollapsed = true;
@@ -824,6 +892,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 setState(() {
                   _selectedAgent = agent;
                   _currentSessionId = 'session_default';
+                  _setTeamScope(agent.id);
                 });
               },
               onClearHistory: _handleClearHistory,
@@ -884,6 +953,25 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     );
   }
 
+  /// 折叠窄条上的文案：插件槽位用槽位标签，内置面板用固定文案。
+  String _collapsedLeftLabel() {
+    final String? key = _selectedPluginActivityKey;
+    if (key != null) {
+      final PluginUiSlot? slot = _registry.slot(key);
+      if (slot != null) {
+        return pluginSlotLabel(slot);
+      }
+    }
+    switch (_leftPanel) {
+      case 1:
+        return '插件';
+      case 2:
+        return '下载';
+      default:
+        return 'Agent 列表';
+    }
+  }
+
   /// 构建折叠状态的左侧栏（窄条 + 展开按钮）
   Widget _buildCollapsedLeftBar() {
     final cs = Theme.of(context).colorScheme;
@@ -928,10 +1016,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 quarterTurns: 1,
                 child: Center(
                   child: Text(
-                    // 折叠窄条文案随活动栏选择变化（左栏不再只有 Agent 列表）
-                    _leftPanel == 0
-                        ? 'Agent 列表'
-                        : (_leftPanel == 1 ? '插件' : '下载'),
+                    // 折叠窄条文案随活动栏选择变化（含插件活动栏槽位）
+                    _collapsedLeftLabel(),
                     style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
                   ),
                 ),
