@@ -124,7 +124,7 @@ Future<void> _package(List<String> args) async {
       final String name = _basename(entity.path);
       entity.copySync(_join(releaseDir.path, name));
       stdout.writeln(
-        '   原生库：$name（\${(entity.lengthSync() / 1024 / 1024).toStringAsFixed(1)} MB）',
+        '   原生库：$name（${(entity.lengthSync() / 1024 / 1024).toStringAsFixed(1)} MB）',
       );
     }
   }
