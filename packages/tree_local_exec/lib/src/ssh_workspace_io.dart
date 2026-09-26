@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
+import 'ansi_code_page.dart';
 import 'git_output.dart';
 import 'local_workspace_io.dart';
 import 'ssh_liveness.dart';
@@ -223,9 +224,50 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   @override
   Future<int> writeFile(String relativePath, String content) async {
     final String absolute = resolve(relativePath);
-    final List<int> bytes = utf8.encode(content);
+    final List<int> bytes = await _encodeForExisting(
+      absolute,
+      relativePath,
+      content,
+    );
     await _link.guard(() => _transport.write(absolute, bytes));
     return bytes.length;
+  }
+
+  /// 覆盖写时尽量沿用**远端已有文件的编码**（与本地 [LocalWorkspaceIO.writeFile] 同一套取舍）。
+  ///
+  /// 注意：按系统代码页解码用的是**本机**的 ANSI 代码页（远端可能是 Linux）。这里要的性质
+  /// 只是"解码与编码用同一个代码页 ⇒ 字节级可逆"，代码页本身对不对不影响这个性质；
+  /// 编不回去就**显式拒绝**，绝不静默把远端文件转成 UTF-8。
+  Future<List<int>> _encodeForExisting(
+    String absolute,
+    String relativePath,
+    String content,
+  ) async {
+    final List<int> existing;
+    try {
+      existing = await _read(absolute, relativePath);
+    } catch (_) {
+      return utf8.encode(content); // 文件不存在 / 读不到：按新文件写 UTF-8
+    }
+    if (existing.isEmpty ||
+        existing.length > LocalWorkspaceIO.encodingSniffMaxBytes) {
+      return utf8.encode(content);
+    }
+    final DecodedText decoded = PlatformTextDecoder.decode(existing);
+    if (decoded.isUtf8) return utf8.encode(content);
+    final List<int>? bytes = LocalWorkspaceIO.encodeForWriteBack(
+      decoded,
+      existing,
+      content,
+    );
+    if (bytes == null) {
+      throw WorkspaceIoException(
+        '该文件不是 UTF-8（检测为 ${LocalWorkspaceIO.decodingLabel(decoded.decoding)}），'
+        '按原编码写回无法逐字节还原，已拒绝覆盖写：$relativePath；'
+        '请改用 UTF-8 能表示的内容，或先用工具把文件转成 UTF-8',
+      );
+    }
+    return bytes;
   }
 
   @override
@@ -237,11 +279,12 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   }) async {
     if (oldText.isEmpty) throw WorkspaceIoException('old_text 不能为空');
     final String absolute = resolve(relativePath);
-    final String original = LocalWorkspaceIO.decodeBytes(
-      await _read(absolute, relativePath),
-    );
-    final bool crlf = original.contains('\r\n');
-    final String haystack = crlf ? original.replaceAll('\r\n', '\n') : original;
+    final List<int> rawBytes = await _read(absolute, relativePath);
+    final DecodedText original = PlatformTextDecoder.decode(rawBytes);
+    final bool crlf = original.text.contains('\r\n');
+    final String haystack = crlf
+        ? original.text.replaceAll('\r\n', '\n')
+        : original.text;
     final String needle = oldText.replaceAll('\r\n', '\n');
     final int occurrences = _count(haystack, needle);
     if (occurrences == 0) {
@@ -259,9 +302,20 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
       needle,
       newText.replaceAll('\r\n', '\n'),
     );
-    final List<int> bytes = utf8.encode(
+    // 保编码写回：远端文件不是 UTF-8 时按原编码写回，且要求逐字节可还原；
+    // 做不到就显式拒绝（绝不静默把远端 GBK 文件转成 UTF-8）
+    final List<int>? bytes = LocalWorkspaceIO.encodeForWriteBack(
+      original,
+      rawBytes,
       crlf ? updated.replaceAll('\n', '\r\n') : updated,
     );
+    if (bytes == null) {
+      throw WorkspaceIoException(
+        '该文件不是 UTF-8（检测为 ${LocalWorkspaceIO.decodingLabel(original.decoding)}），'
+        '按原编码写回无法逐字节还原，已拒绝编辑：$relativePath；'
+        '请先用工具把文件转成 UTF-8',
+      );
+    }
     await _link.guard(() => _transport.write(absolute, bytes));
     return EditOutcome(
       path: relativePath,

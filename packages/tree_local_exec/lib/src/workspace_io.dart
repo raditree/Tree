@@ -173,6 +173,7 @@ class ExecOutcome {
     this.truncated = false,
     this.shell = '',
     this.nonUtf8Output = false,
+    this.garbledOutput = false,
   });
 
   /// 退出码（进程根本没能启动等异常情况下为 -1）。
@@ -196,9 +197,20 @@ class ExecOutcome {
   /// 实际使用的 shell 描述（诊断用）。
   final String shell;
 
-  /// 输出不是合法 UTF-8（Windows 非 UTF-8 代码页下 cmd 内建命令的已知限制，
-  /// 此时文本是 latin1 兜底解码，中文可能显示为乱码）。
+  /// 输出不是合法 UTF-8：**已尝试按系统 ANSI 代码页解码**（Windows 上 cmd 内建命令
+  /// 写管道用的就是系统代码页，中文机器 = GBK/CP936；非 Windows 不参与代码页解码）。
+  ///
+  /// 语义修订（字段名/类型/构造参数/默认值都不变，老调用方不受影响）：它现在只表示
+  /// "走了非 UTF-8 解码路径"，**不再等于"中文一定是乱码"**——是否真的解不开由
+  /// [garbledOutput] 区分。
   final bool nonUtf8Output;
+
+  /// 真乱码：输出既不是合法 UTF-8，也不是合法的**系统 ANSI 代码页**字节序列，
+  /// 只能用 latin1 逐字节兜底（**字节不丢**、可原样还原，但中文不可读）。
+  ///
+  /// 恒有 `garbledOutput → nonUtf8Output`。非 Windows 上不尝试代码页解码，凡是非
+  /// UTF-8 输出都会落到这里（平台限制，不是解码 bug）。
+  final bool garbledOutput;
 
   bool get ok => exitCode == 0 && !timedOut;
 }

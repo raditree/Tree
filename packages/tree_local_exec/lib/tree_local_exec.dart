@@ -8,6 +8,7 @@
 /// `tool_exec_response` 那套反向协议与前端两个执行器服务都成了多余（M7 清理）。
 library;
 
+export 'src/ansi_code_page.dart';
 export 'src/dartssh_transport.dart';
 export 'src/git_output.dart';
 export 'src/local_workspace_io.dart';

@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
+import 'package:tree_local_exec/tree_local_exec.dart';
 
 import 'atomic_file.dart';
 import '../util/ids.dart';
@@ -408,9 +409,15 @@ class FileTreeStore implements TreeStore {
 
   CoreAgent? _readAgentFile(File file) {
     try {
-      final Map<String, dynamic> map = YamlCodec.decode(
-        file.readAsStringSync(),
+      // 手改坏的 yaml 不该让整个 agent 列表读不出来：容错解码（非法字节 U+FFFD 顶替），
+      // 真解析不了会走下面的 catch 记日志跳过。
+      final DecodedText decoded = PlatformTextDecoder.decodeTolerant(
+        file.readAsBytesSync(),
       );
+      if (decoded.decoding == TextDecoding.utf8Malformed) {
+        log?.call('agent 配置含非法 UTF-8 字节，已按 U+FFFD 顶替后解析：${file.path}');
+      }
+      final Map<String, dynamic> map = YamlCodec.decode(decoded.text);
       final CoreAgent agent = CoreAgent.fromJson(map);
       if (agent.id.isEmpty) {
         log?.call('agent 配置缺少 id，已跳过：${file.path}');
@@ -441,7 +448,13 @@ class FileTreeStore implements TreeStore {
       final File meta = File(p.join(entity.path, 'session.json'));
       if (!meta.existsSync()) continue;
       try {
-        final Object? decoded = jsonDecode(meta.readAsStringSync());
+        final DecodedText text = PlatformTextDecoder.decodeTolerant(
+          meta.readAsBytesSync(),
+        );
+        if (text.decoding == TextDecoding.utf8Malformed) {
+          log?.call('会话元数据含非法 UTF-8 字节，已按 U+FFFD 顶替后解析：${meta.path}');
+        }
+        final Object? decoded = jsonDecode(text.text);
         if (decoded is! Map<String, dynamic>) continue;
         final CoreSession session = CoreSession.fromJson(decoded);
         if (session.sessionId.isEmpty) continue;

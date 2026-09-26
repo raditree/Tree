@@ -102,8 +102,10 @@ class _StdioMcpClient implements McpClient {
       throw McpException('启动 MCP 服务 ${config.name} 失败：$error');
     }
     final StringBuffer stderr = StringBuffer();
+    // 协议上都是 UTF-8，但一个坏字节不该中断整条通道：allowMalformed 把非法字节换成
+    // U+FFFD，stderr 照常收进错误文本里，进程与心跳都不受影响。
     process.stderr
-        .transform(utf8.decoder)
+        .transform(const Utf8Decoder(allowMalformed: true))
         .listen(stderr.write, onError: (Object _) {});
     final _StdioMcpClient client = _StdioMcpClient._(
       config,
@@ -115,10 +117,24 @@ class _StdioMcpClient implements McpClient {
         maxMisses: missedHeartbeatLimit,
       ),
     );
+    bool warnedMalformed = false;
     process.stdout
-        .transform(utf8.decoder)
+        .transform(const Utf8Decoder(allowMalformed: true))
         .transform(const LineSplitter())
-        .listen(client._onLine, onError: (Object _) {}, onDone: client._onDone);
+        .listen(
+          (String line) {
+            if (!warnedMalformed && line.contains('\uFFFD')) {
+              warnedMalformed = true;
+              // 只说一次：坏字节替换成 U+FFFD 是"看得见的告警"，但**不中断**通道
+              stderr.writeln(
+                '[tree] 警告：MCP 服务 ${config.name} 的输出含非法 UTF-8 字节，已按 U+FFFD 顶替',
+              );
+            }
+            client._onLine(line);
+          },
+          onError: (Object _) {},
+          onDone: client._onDone,
+        );
     process.exitCode.then((int code) {
       client._exitCode = code;
       client._failPending('MCP 服务进程已退出（exit=$code）');

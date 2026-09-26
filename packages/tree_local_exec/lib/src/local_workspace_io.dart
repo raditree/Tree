@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
+import 'ansi_code_page.dart';
 import 'git_output.dart';
 import 'shell.dart';
 import 'workspace_io.dart';
@@ -22,9 +23,12 @@ class WorkspaceIoException implements Exception {
 /// [WorkspaceIO] 的**本地**实现（`dart:io`）。
 ///
 /// Windows 上踩过的坑（M0b 迁移清单要求原样保留）：
-/// - 命令走 `cmd.exe /c` 并**前置 `chcp 65001`**：否则 cmd 内建命令（dir/type…）
-///   按 GBK 输出，中文全是乱码；
-/// - 输出解码**严格 UTF-8 失败后回退 latin1**（不抛异常、不丢字节）；
+/// - 命令走 PowerShell（优先 pwsh，其次系统自带 Windows PowerShell，都没才回退 cmd，
+///   见 [Shell]）：cmd 内建命令（dir/type…）的管道输出是**系统 ANSI 代码页**（GBK）字节，
+///   `chcp` 管不住管道——所以下面那级按代码页解码必须保留；
+/// - 输出解码走**严格 UTF-8 → 系统 ANSI 代码页（Windows = CP_ACP）→ latin1 兜底**：
+///   cmd 内建命令写管道用的就是系统代码页，chcp 管不住（详见 [decodeBytes]）；
+///   只有连代码页也解不开时才落到 latin1 保字节兜底，并标成"真乱码"；
 /// - 超时杀进程要用 `taskkill /T` 杀**整棵进程树**，否则 `cmd` 死了子进程还在跑。
 ///
 /// 路径安全：一切工具参数都是工作空间相对路径，[resolve] 拒绝绝对路径/盘符/UNC
@@ -178,15 +182,63 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     );
   }
 
+  /// 覆盖写时"嗅探原编码"的体积上限：超过它就只按 UTF-8 写。
+  ///
+  /// 取舍：写工具是**整段替换**，为保编码把超大文件整读一遍不值当；1 MiB 以内读一遍
+  /// 换"不把用户的 GBK 文件悄悄转成 UTF-8"，值。
+  static const int encodingSniffMaxBytes = 1024 * 1024;
+
   @override
   Future<int> writeFile(String relativePath, String content) async {
     final String absolute = resolve(relativePath);
     final File file = File(absolute);
     await file.parent.create(recursive: true);
-    final List<int> bytes = utf8.encode(content);
+    final List<int> bytes = await _encodeForExisting(
+      file,
+      content,
+      relativePath,
+    );
     await file.writeAsBytes(bytes, flush: true);
     return bytes.length;
   }
+
+  /// 覆盖写时尽量沿用**已有文件的编码**（[PlatformTextDecoder.encodeLike]）。
+  ///
+  /// - 文件不存在 / 空文件 / 超过 [_encodingSniffMaxBytes]：按 UTF-8 写（write 的默认语义）；
+  /// - 已有文件是 UTF-8：按 UTF-8 写；
+  /// - 已有文件是非 UTF-8：用**同一个代码页**写回；编不回去就**显式拒绝**，
+  ///   绝不静默转成 UTF-8——那等于替用户改文件编码。
+  Future<List<int>> _encodeForExisting(
+    File file,
+    String content,
+    String relativePath,
+  ) async {
+    if (!await file.exists()) return utf8.encode(content);
+    final int size = await file.length();
+    if (size == 0 || size > encodingSniffMaxBytes) return utf8.encode(content);
+    final DecodedText existing = PlatformTextDecoder.decode(
+      await file.readAsBytes(),
+    );
+    if (existing.isUtf8) return utf8.encode(content);
+    final List<int>? bytes = PlatformTextDecoder.encodeLike(existing, content);
+    if (bytes == null) {
+      throw WorkspaceIoException(
+        '该文件不是 UTF-8（检测为 ${decodingLabel(existing.decoding)}），'
+        '新内容里有原编码表示不了的字符，按原编码写回会损坏文件；'
+        '请改写内容，或先用工具把文件转成 UTF-8：$relativePath',
+      );
+    }
+    return bytes;
+  }
+
+  /// 解码路径的中文标签：错误信息里要能说清"检测成什么编码"。
+  static String decodingLabel(TextDecoding decoding) => switch (decoding) {
+    TextDecoding.utf8 => 'UTF-8',
+    TextDecoding.utf8Malformed => 'UTF-8（含非法字节）',
+    TextDecoding.systemCodePage =>
+      '系统代码页 CP${AnsiCodePage.systemCodePage ?? '?'}',
+    TextDecoding.latin1Fallback => 'latin1（既不是 UTF-8 也不是合法系统代码页）',
+  };
 
   @override
   Future<EditOutcome> editFile(
@@ -203,12 +255,14 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     if (!await file.exists()) {
       throw WorkspaceIoException('文件不存在：$relativePath');
     }
-    final String original = decodeBytes(await file.readAsBytes());
+    final List<int> rawBytes = await file.readAsBytes();
+    // 解码结果连同"走的哪条路径"一起留着：写回必须用同一条路径编码，否则就是静默转码
+    final DecodedText original = PlatformTextDecoder.decode(rawBytes);
     // 换行兼容：模型给的片段可能是 LF，而文件是 CRLF（Windows 常见）
-    final bool fileUsesCrlf = original.contains('\r\n');
+    final bool fileUsesCrlf = original.text.contains('\r\n');
     final String haystack = fileUsesCrlf
-        ? original.replaceAll('\r\n', '\n')
-        : original;
+        ? original.text.replaceAll('\r\n', '\n')
+        : original.text;
     final String needle = oldText.replaceAll('\r\n', '\n');
     final String replacement = newText.replaceAll('\r\n', '\n');
 
@@ -229,7 +283,16 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     final String restored = fileUsesCrlf
         ? updated.replaceAll('\n', '\r\n')
         : updated;
-    final List<int> bytes = utf8.encode(restored);
+    // 保编码写回（[encodeForWriteBack]）：非 UTF-8 文件按原代码页写回，且要求逐字节可还原；
+    // 做不到就**显式拒绝**——绝不静默把 GBK 文件转成 UTF-8 写下去。
+    final List<int>? bytes = encodeForWriteBack(original, rawBytes, restored);
+    if (bytes == null) {
+      throw WorkspaceIoException(
+        '该文件不是 UTF-8（检测为 ${decodingLabel(original.decoding)}），'
+        '按原编码写回无法逐字节还原（新内容里有该编码表示不了的字符，或重新编码会改动'
+        '未触碰的字节），已拒绝编辑：$relativePath；请先用工具把文件转成 UTF-8',
+      );
+    }
     await file.writeAsBytes(bytes, flush: true);
     return EditOutcome(
       path: relativePath,
@@ -408,19 +471,21 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
       errSub,
     );
 
-    final List<int> stdoutBytes = out.bytes;
-    final List<int> stderrBytes = err.bytes;
+    // 文本与"走了哪条解码路径"来自同一次解码，标注不会和文本对不上。
+    final DecodedText outDecoded = out.decoded;
+    final DecodedText errDecoded = err.decoded;
     return ExecOutcome(
       exitCode: exitCode,
-      stdout: out.text,
-      stderr: err.text,
+      stdout: outDecoded.text,
+      stderr: errDecoded.text,
       timedOut: false,
       truncated: out.truncated || err.truncated,
       shell: Shell.executable,
-      // 严格 UTF-8 解不开 → 用了 latin1 兜底 → 中文可能乱码，如实标注
-      nonUtf8Output:
-          _isStrictUtf8(stdoutBytes) == false ||
-          _isStrictUtf8(stderrBytes) == false,
+      // nonUtf8Output 只说"不是 UTF-8、走了非 UTF-8 解码路径"——Windows 上 cmd
+      // 内建命令的管道输出通常已按系统 ANSI 代码页解成可读中文；只有连代码页也
+      // 解不开（latin1 保字节兜底）时才是真乱码，由 garbledOutput 如实区分。
+      nonUtf8Output: !outDecoded.isUtf8 || !errDecoded.isUtf8,
+      garbledOutput: outDecoded.isGarbled || errDecoded.isGarbled,
     );
   }
 
@@ -647,6 +712,38 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     }
   }
 
+  /// 保编码写回：把 [text] 按 [original] 当初的解码路径编回去，**并且**要求原文本能
+  /// 逐字节还原（[originalBytes]）。
+  ///
+  /// 返回 null = **不能安全写回**：可能是编不回去（新文本里有该代码页表示不了的字符），
+  /// 也可能是重新编码会改动我们没碰过的字节（代码页里的重复映射）。两种情况都必须由
+  /// 调用方**显式拒绝**，绝不能退回 UTF-8 写下去——那是破坏用户文件。
+  ///
+  /// 本地与 SSH 两条写回路径共用这一份逻辑。
+  static List<int>? encodeForWriteBack(
+    DecodedText original,
+    List<int> originalBytes,
+    String text,
+  ) {
+    if (!original.isUtf8) {
+      final List<int>? identity = PlatformTextDecoder.encodeLike(
+        original,
+        original.text,
+      );
+      if (identity == null || !_sameBytes(identity, originalBytes)) return null;
+    }
+    return PlatformTextDecoder.encodeLike(original, text);
+  }
+
+  /// 逐字节相等（保编码自检用；不用 ListEquality 免得为一个工具函数引依赖）。
+  static bool _sameBytes(List<int> a, List<int> b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
   static int _countOccurrences(String haystack, String needle) {
     int count = 0;
     int index = haystack.indexOf(needle);
@@ -666,32 +763,20 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     return false;
   }
 
-  /// 严格 UTF-8，失败则回退 latin1（不抛异常、不丢字节）。
+  /// 统一解码链：**严格 UTF-8 →（Windows）系统 ANSI 代码页 → latin1 兜底**。
   ///
-  /// **已知限制**：Windows 上 cmd 内建命令（dir/type/echo）与部分系统错误信息
-  /// 在管道输出时使用**系统 ANSI 代码页**（中文机器上是 GBK/CP936），
-  /// 而且 `chcp 65001` **管不住管道输出**（实测：加不加 chcp，echo 中文都是 GBK
-  /// 字节）。此时 latin1 兜底能保住字节但显示为乱码，[ExecOutcome.nonUtf8Output]
-  /// 会把它标出来让工具层提示使用者。
-  /// 真正的修复要按系统代码页解码（Windows 上是 `MultiByteToWideChar` + FFI），
-  /// 属于后续增强项，不在本里程碑内。
-  static String decodeBytes(List<int> bytes) {
-    try {
-      return utf8.decode(bytes);
-    } on FormatException {
-      return latin1.decode(bytes);
-    }
-  }
-
-  /// 是否严格合法的 UTF-8（空字节串视为合法）。
-  static bool _isStrictUtf8(List<int> bytes) {
-    try {
-      utf8.decode(bytes);
-      return true;
-    } on FormatException {
-      return false;
-    }
-  }
+  /// 为什么要按系统代码页解一次：Windows 上 cmd 内建命令（dir/type/echo）与部分
+  /// 系统错误信息写到**管道**时用的是**系统 ANSI 代码页**（中文机器 = GBK/CP936），
+  /// 而 `chcp 65001` **管不住管道输出**（实测：加不加 chcp，echo 中文都是 GBK 字节）。
+  /// 以前严格 UTF-8 解不开就直接 latin1——字节不丢但中文是乱码；现在中间加一级
+  /// [AnsiCodePage]（dart:ffi → kernel32 `MultiByteToWideChar(CP_ACP)`，仅 Windows），
+  /// 只有"既不是 UTF-8、也不是合法的系统代码页字节序列"时才落到 latin1 兜底。
+  ///
+  /// 不抛异常、不丢字节：非 Windows / FFI 不可用 / 代码页解不开，一律降级到 latin1
+  /// （逐字节映射，可原样还原）。需要区分"已按系统代码页解开"与"真乱码"的调用方，
+  /// 用 [PlatformTextDecoder.decode] 取 [DecodedText.decoding]。
+  static String decodeBytes(List<int> bytes) =>
+      PlatformTextDecoder.decodeToString(bytes);
 
   /// 递归遍历；[maxDepth] 为 0 表示不限。
   ///
@@ -759,6 +844,20 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   }
 }
 
+/// 取两者里"更差"的解码路径（顺序：UTF-8 < 系统代码页 < 有顶替 < 真乱码）。
+///
+/// 不能直接用 enum 的 index：容错解码（utf8Malformed）是在 latin1Fallback 之后追加的，
+/// 声明顺序不再等于严重程度。
+TextDecoding _worseDecoding(TextDecoding a, TextDecoding b) =>
+    _decodingRank(a) >= _decodingRank(b) ? a : b;
+
+int _decodingRank(TextDecoding decoding) => switch (decoding) {
+  TextDecoding.utf8 => 0,
+  TextDecoding.systemCodePage => 1,
+  TextDecoding.utf8Malformed => 2,
+  TextDecoding.latin1Fallback => 3,
+};
+
 /// 有上限的输出收集器：超限时保留**头 60% + 尾 40%**（错误往往在末尾）。
 class _OutputCollector {
   _OutputCollector({required this.maxOutputBytes});
@@ -789,13 +888,18 @@ class _OutputCollector {
     }
   }
 
-  /// 原始字节（用于判断编码是否可信）。
-  List<int> get bytes => <int>[..._head.toBytes(), ..._tail.toBytes()];
-
-  String get text {
-    final String head = LocalWorkspaceIO.decodeBytes(_head.toBytes());
-    final String tail = LocalWorkspaceIO.decodeBytes(_tail.toBytes());
+  /// 文本 + 实际走的解码路径。
+  ///
+  /// 头/尾**各自解码**（截断点是拼接出来的，中间可能切开一个多字节字符），路径取两者
+  /// 里"最差"的那条：任何一段降级了，整份输出就按降级如实标注。
+  DecodedText get decoded {
+    final DecodedText head = PlatformTextDecoder.decode(_head.toBytes());
     if (!truncated) return head;
-    return '$head\n…（输出过长已截断）…\n$tail';
+    final DecodedText tail = PlatformTextDecoder.decode(_tail.toBytes());
+    return DecodedText(
+      text: '${head.text}\n…（输出过长已截断）…\n${tail.text}',
+      decoding: _worseDecoding(head.decoding, tail.decoding),
+      byteLength: head.byteLength + tail.byteLength,
+    );
   }
 }

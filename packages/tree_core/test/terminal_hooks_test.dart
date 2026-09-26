@@ -100,7 +100,7 @@ void main() {
     expect(finished, contains(quick.logRelative));
 
     final HookTask slow = await start(
-      Platform.isWindows ? 'ping -n 10 127.0.0.1 >nul' : 'sleep 5',
+      Platform.isWindows ? 'ping -n 10 127.0.0.1 | Out-Null' : 'sleep 5',
     );
     await Future<void>.delayed(const Duration(milliseconds: 300));
     expect(hooks.renderStatus(slow), contains('运行中'));
@@ -108,7 +108,7 @@ void main() {
 
   test('cancel 杀整棵进程树：任务在超时前结束且标记 cancelled', () async {
     final HookTask task = await start(
-      Platform.isWindows ? 'ping -n 30 127.0.0.1 >nul' : 'sleep 30',
+      Platform.isWindows ? 'ping -n 30 127.0.0.1 | Out-Null' : 'sleep 30',
     );
     await Future<void>.delayed(const Duration(milliseconds: 300));
     expect(hooks.runningCount, 1);
@@ -123,7 +123,7 @@ void main() {
 
   test('close 杀掉全部在途任务', () async {
     final HookTask a = await start(
-      Platform.isWindows ? 'ping -n 30 127.0.0.1 >nul' : 'sleep 30',
+      Platform.isWindows ? 'ping -n 30 127.0.0.1 | Out-Null' : 'sleep 30',
     );
     await Future<void>.delayed(const Duration(milliseconds: 300));
     expect(hooks.runningCount, 1);

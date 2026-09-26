@@ -109,20 +109,18 @@ class TerminalHooks {
     );
 
     // **用脚本文件而不是把命令塞进 Process.start 的参数**：
-    // Windows 下 Dart 按 C 运行时规则转义参数里的引号（\"），而 cmd.exe 的引号
-    // 规则不同，带引号的命令（例如重定向路径）会被解析坏——实测表现为命令立刻
-    // 以退出码 1 失败。写成 `.cmd`/`.sh` 由 shell 自己解析，彻底绕开这层转义，
-    // 顺带把"到底跑了什么"留在磁盘上可复查。
+    // Windows 下 Dart 按 C 运行时规则转义参数里的引号（\"），而 shell 的引号规则不同，
+    // 带引号的命令（例如重定向路径）会被解析坏——实测表现为命令立刻以退出码 1 失败。
+    // 写成 .ps1/.cmd/.sh 由 shell 自己解析，彻底绕开这层转义，顺带把「到底跑了什么」
+    // 留在磁盘上可复查。
     final bool windows = Platform.isWindows;
+    // 脚本 shell 与同步执行**必须一致**（见 [Shell.scriptFor]）：否则同一条命令前台能跑、
+    // 后台报「不是内部或外部命令」。
     final String scriptPath =
-        '${absolute.substring(0, absolute.length - 4)}${windows ? '.cmd' : '.sh'}';
-    final String script = windows
-        ? '@echo off\r\nchcp 65001 >nul\r\n'
-              '$command${Shell.redirectTo(absolute)}\r\n'
-              'exit /b %ERRORLEVEL%\r\n'
-        : '#!/bin/sh\n'
-              '$command${Shell.redirectTo(absolute)}\n'
-              'exit \$?\n';
+        '${absolute.substring(0, absolute.length - 4)}${Shell.scriptExtension}';
+    final String script = Shell.scriptFor(
+      '$command${Shell.redirectTo(absolute)}',
+    );
     await File(scriptPath).writeAsString(script, flush: true);
 
     // Windows 上并发创建进程偶发失败（"拒绝访问"），重试一次即可稳定；
@@ -159,8 +157,9 @@ class TerminalHooks {
     String scriptPath,
     bool windows,
   ) => Process.start(
-    windows ? 'cmd.exe' : '/bin/sh',
-    <String>[windows ? '/c' : scriptPath, if (windows) scriptPath],
+    // 与同步执行同一个 shell（Windows 上是 PowerShell / cmd 回退），参数由 Shell 给出
+    Shell.executable,
+    Shell.argsForScript(scriptPath),
     workingDirectory: workingDirectory,
     runInShell: false,
   );
@@ -298,7 +297,13 @@ class TerminalHooks {
   static String? readTailSync(String path, int maxChars) {
     final File file = File(path);
     if (!file.existsSync()) return null;
-    final String text = file.readAsStringSync();
+    // 日志是 shell 重定向写出来的：多数是 UTF-8（PowerShell 已把输出编码钉成 UTF-8），
+    // 也可能是系统代码页（Windows 上 cmd 内建命令的管道输出），还可能被截断在多字节字符
+    // 中间——readAsStringSync 的严格 UTF-8 遇到非法字节会**直接抛异常**，把 hook 状态查询
+    // 整条路打挂。这里走统一解码链 + 容错顶替，永远给得出文本。
+    final String text = PlatformTextDecoder.decodeTolerant(
+      file.readAsBytesSync(),
+    ).text;
     if (text.length <= maxChars) return text;
     return text.substring(text.length - maxChars);
   }

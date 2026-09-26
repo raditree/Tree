@@ -641,10 +641,19 @@ abstract final class BuiltinTools {
     if (outcome.stdout.trim().isEmpty && outcome.stderr.trim().isEmpty) {
       buffer.writeln('（无输出）');
     }
-    if (outcome.nonUtf8Output) {
+    if (outcome.garbledOutput) {
+      // 真乱码：UTF-8 与系统代码页都解不开，只剩 latin1 逐字节兜底（字节没丢但不可读）
       buffer.writeln(
-        '（注意：命令输出不是 UTF-8，中文可能显示为乱码——'
-        'Windows 非 UTF-8 代码页下 cmd 内建命令的已知限制）',
+        '（注意：命令输出不是 UTF-8，也不是合法的系统代码页（Windows ANSI 代码页，'
+        '中文机器为 GBK/CP936）字节序列，中文可能显示为乱码——'
+        '已按 latin1 逐字节保留，未丢字节）',
+      );
+    } else if (outcome.nonUtf8Output) {
+      // 正常情况：Windows 上 cmd 内建命令（dir/echo/type）写管道用的是系统 ANSI
+      // 代码页（中文机器 = GBK/CP936），执行器已按该代码页解码，中文可正常显示。
+      buffer.writeln(
+        '（提示：命令输出不是 UTF-8，已按系统代码页（Windows ANSI 代码页，'
+        '中文机器通常为 GBK/CP936）解码，中文可正常显示）',
       );
     }
     return ToolOutcome(buffer.toString().trimRight(), isError: !outcome.ok);

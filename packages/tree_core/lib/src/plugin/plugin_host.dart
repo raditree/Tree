@@ -69,17 +69,31 @@ class PluginHost {
       throw PluginException('启动插件 ${config.id} 失败：$error');
     }
     final StringBuffer stderr = StringBuffer();
+    // 同 MCP：协议是 UTF-8，但坏字节只顶替（U+FFFD）不中断通道
     process.stderr
-        .transform(utf8.decoder)
+        .transform(const Utf8Decoder(allowMalformed: true))
         .listen(stderr.write, onError: (Object _) {});
     final PluginHost host =
         PluginHost._(config, process, stderr, heartbeatInterval)
           .._onNotification = onNotification
           ..onPluginRequest = onPluginRequest;
+    bool warnedMalformed = false;
     process.stdout
-        .transform(utf8.decoder)
+        .transform(const Utf8Decoder(allowMalformed: true))
         .transform(const LineSplitter())
-        .listen(host._onLine, onError: (Object _) {}, onDone: host._onDone);
+        .listen(
+          (String line) {
+            if (!warnedMalformed && line.contains('\uFFFD')) {
+              warnedMalformed = true;
+              stderr.writeln(
+                '[tree] 警告：插件 ${config.id} 的输出含非法 UTF-8 字节，已按 U+FFFD 顶替',
+              );
+            }
+            host._onLine(line);
+          },
+          onError: (Object _) {},
+          onDone: host._onDone,
+        );
     process.exitCode.then((int code) {
       host._exitCode = code;
       host._failPending('插件进程已退出（exit=$code）');

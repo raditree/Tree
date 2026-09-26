@@ -5,6 +5,41 @@ import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_local_exec/tree_local_exec.dart';
 
+/// 中文 Windows（系统 ANSI 代码页 = GBK/936）：本仓库的主要目标环境，也是
+/// "cmd 内建命令的管道输出是 GBK 字节、严格 UTF-8 解不开"这个 bug 的现场。
+///
+/// 其它 ANSI 代码页（含把系统区域设成 UTF-8 的 65001）下，cmd 会把它表示不了的汉字
+/// 换成 '?'（字节退化成纯 ASCII），下面几个依赖 GBK 字节前提的用例会自行跳过。
+bool get _isGbkWindows =>
+    Platform.isWindows && AnsiCodePage.systemCodePage == 936;
+
+/// Windows 上命令是否走 PowerShell（见 [Shell.windowsShell] 的探测顺序）。
+bool get _isPowerShellWindows =>
+    Platform.isWindows && !Shell.windowsShell.toLowerCase().endsWith('cmd.exe');
+
+/// GBK/CP936 的「中文测试」字节：不是合法 UTF-8，做"非 UTF-8 输出"的确定性样本。
+const List<int> _gbkZhongWenBytes = <int>[
+  0xD6,
+  0xD0,
+  0xCE,
+  0xC4,
+  0xB2,
+  0xE2,
+  0xCA,
+  0xD4,
+];
+
+/// 把 [bytes] 原样写进 stdout 的 PowerShell 命令（绕过 PowerShell 的编码层）。
+///
+/// 这样"非 UTF-8 输出"有了**不依赖 cmd 内建命令行为**的确定性来源：换 shell、换控制台
+/// 代码页都不影响它是 GBK 字节这件事。
+String _rawStdoutCommand(List<int> bytes) {
+  final String literals = bytes
+      .map((int b) => '0x${b.toRadixString(16)}')
+      .join(',');
+  return '[Console]::OpenStandardOutput().Write([byte[]]($literals), 0, ${bytes.length})';
+}
+
 void main() {
   late Directory root;
   late LocalWorkspaceIO io;
@@ -132,11 +167,20 @@ void main() {
       expect(content.text.length, lessThan(5000));
     });
 
-    test('非法 UTF-8 回退 latin1（不抛异常、不丢字节）', () async {
-      File(p.join(root.path, 'gbk.txt'))
-          .writeAsBytesSync(<int>[0xC4, 0xE3, 0xBA, 0xC3]);
+    test('非 UTF-8 文件走统一解码链：按系统代码页解码，解不开才 latin1 兜底', () async {
+      // GBK/CP936 的「你好」（C4 E3 BA C3）：不是合法 UTF-8，正是 Windows 上
+      // 非 UTF-8 文本文件的常见形态。
+      const List<int> gbk = <int>[0xC4, 0xE3, 0xBA, 0xC3];
+      File(p.join(root.path, 'gbk.txt')).writeAsBytesSync(gbk);
       final FileContent content = await io.readFile('gbk.txt');
-      expect(content.text.runes.length, 4);
+      final DecodedText decoded = PlatformTextDecoder.decode(gbk);
+      expect(content.text, decoded.text, reason: '文件读取必须与统一解码链完全一致');
+      if (decoded.isGarbled) {
+        expect(latin1.encode(content.text), gbk, reason: '兜底路径逐字节保底，不丢字节');
+      }
+      if (Platform.isWindows && AnsiCodePage.systemCodePage == 936) {
+        expect(content.text, '你好', reason: '中文机器上按 CP936 解出正确中文');
+      }
     });
   });
 
@@ -198,6 +242,98 @@ void main() {
       final String after = File(p.join(root.path, 'crlf.txt'))
           .readAsStringSync();
       expect(after, 'line1\r\nLINE2\r\nline3\r\n');
+    });
+
+    test('非 UTF-8 文件：edit 保编码往返，不静默转成 UTF-8', () async {
+      if (!_isGbkWindows) return; // 需要"系统代码页能表示这些中文"的机器
+      // GBK 的「你好世界」：未改动的部分必须**字节不变**地写回去
+      const List<int> gbk = <int>[
+        0xC4,
+        0xE3,
+        0xBA,
+        0xC3,
+        0xCA,
+        0xC0,
+        0xBD,
+        0xE7,
+      ];
+      final File file = File(p.join(root.path, 'gbk.txt'))
+        ..writeAsBytesSync(gbk);
+      final EditOutcome outcome = await io.editFile(
+        'gbk.txt',
+        oldText: '世界',
+        newText: '世界!',
+      );
+      expect(outcome.replacements, 1);
+      final List<int> after = file.readAsBytesSync();
+      expect(
+        after.sublist(0, 6),
+        gbk.sublist(0, 6),
+        reason: '未触碰的「你好」必须还是原 GBK 字节',
+      );
+      expect(after.length, gbk.length + 1);
+      expect(
+        (await io.readFile('gbk.txt')).text,
+        '你好世界!',
+        reason: '写回后仍然是原编码，读出来还是正确中文',
+      );
+    });
+
+    test('非 UTF-8 文件：替换进原编码表示不了的字符 → 显式拒绝且文件不动', () async {
+      if (!_isGbkWindows) return;
+      const List<int> gbk = <int>[0xC4, 0xE3, 0xBA, 0xC3]; // GBK「你好」
+      final File file = File(p.join(root.path, 'gbk2.txt'))
+        ..writeAsBytesSync(gbk);
+      await expectLater(
+        // 😀 不在 CP936 里：写回只能靠 '?' 顶替，必须拒绝而不是写坏
+        io.editFile('gbk2.txt', oldText: '你好', newText: '你好😀'),
+        throwsA(isA<WorkspaceIoException>()),
+      );
+      expect(file.readAsBytesSync(), gbk, reason: '拒绝时文件必须原封不动');
+    });
+
+    test('非 UTF-8 文件：write 覆盖写沿用原编码（不静默转 UTF-8）', () async {
+      if (!_isGbkWindows) return;
+      final File file = File(p.join(root.path, 'gbk3.txt'))
+        ..writeAsBytesSync(<int>[0xC4, 0xE3, 0xBA, 0xC3]); // GBK「你好」
+      await io.writeFile('gbk3.txt', '中文');
+      expect(file.readAsBytesSync(), <int>[
+        0xD6,
+        0xD0,
+        0xCE,
+        0xC4,
+      ], reason: 'GBK 文件被覆盖写后仍应是 GBK 字节，而不是 UTF-8');
+      expect((await io.readFile('gbk3.txt')).text, '中文');
+    });
+
+    test('代码页不可用（非 Windows / FFI 失败）：edit 走 latin1 逐字节回写', () async {
+      // 非 UTF-8 且不是合法代码页序列：解码链落到 latin1 兜底
+      const List<int> raw = <int>[
+        0xC4,
+        0xE3,
+        0x41,
+        0x42,
+      ]; // 两个非 UTF-8 字节 + "AB"
+      final File file = File(p.join(root.path, 'raw.txt'))
+        ..writeAsBytesSync(raw);
+      AnsiCodePage.debugDecoderOverride = (List<int> bytes) => null;
+      try {
+        final EditOutcome outcome = await io.editFile(
+          'raw.txt',
+          oldText: 'AB',
+          newText: 'CD',
+        );
+        expect(outcome.replacements, 1);
+      } finally {
+        // 注入点是全局静态：这里是 writeFile/editFile 组，没有 exec 组的 tearDown
+        AnsiCodePage.debugDecoderOverride = null;
+      }
+      expect(file.readAsBytesSync(), <int>[
+        0xC4,
+        0xE3,
+        0x43,
+        0x44,
+      ], reason: 'latin1 逐字节回写：未触碰的字节原样，改动按 latin1 编码');
     });
   });
 
@@ -338,6 +474,11 @@ void main() {
   });
 
   group('exec', () {
+    tearDown(() {
+      // 下面有用例注入"代码页解码不可用"，它是全局静态，用完必须复原
+      AnsiCodePage.debugDecoderOverride = null;
+    });
+
     test('退出码/stdout/stderr，cwd 为工作空间根', () async {
       final ExecOutcome ok = await io.exec('echo tree-ok');
       expect(ok.exitCode, 0);
@@ -347,33 +488,68 @@ void main() {
       expect(fail.exitCode, 3);
       expect(fail.ok, isFalse);
 
-      final ExecOutcome err = await io.exec('echo oops 1>&2');
+      // Windows 走 PowerShell：1>&2 在 Windows PowerShell 5.1 上是解析错误（只有 PS 7
+      // 支持），所以用 PS 5.1/7 通吃的 [Console]::Error.WriteLine 写 stderr。
+      final ExecOutcome err = await io.exec(
+        Platform.isWindows
+            ? r"[Console]::Error.WriteLine('oops')"
+            : 'echo oops 1>&2',
+      );
       expect(err.stderr, contains('oops'));
 
-      final ExecOutcome cwd = await io.exec(Platform.isWindows ? 'cd' : 'pwd');
+      // PowerShell 的 cd（Set-Location）不打印当前目录，取路径要显式写 $PWD.Path
+      final ExecOutcome cwd = await io.exec(
+        Platform.isWindows ? r'$PWD.Path' : 'pwd',
+      );
       expect(
         cwd.stdout.trim().replaceAll('\\', '/'),
         root.path.replaceAll('\\', '/'),
       );
     });
 
-    test('非 UTF-8 输出（Windows cmd 内建命令）保字节并标记 nonUtf8Output', () async {
-      // 实测：Windows 上 cmd 内建命令经管道输出用的是系统 ANSI 代码页（zh-CN=GBK），
-      // chcp 65001 管不住管道。此处的契约是"字节不丢 + 明确标记"，好让工具层提示
-      // 使用者；按系统代码页正确解码是后续增强项（需要 FFI MultiByteToWideChar）。
+    test('中文输出可读：PowerShell 下是 UTF-8，cmd 下是系统代码页', () async {
+      // Windows 换 PowerShell 后，OutputEncoding 固定 UTF-8，所以中文走 UTF-8 分支；
+      // 退回 cmd 时是系统代码页字节，由解码链按 CP_ACP 解开。两条路都不该出现乱码。
       final ExecOutcome outcome = await io.exec('echo 中文测试');
-      if (Platform.isWindows) {
-        expect(outcome.stdout.trim(), isNotEmpty);
-        expect(
-          latin1.encode(outcome.stdout.trim()).length,
-          greaterThanOrEqualTo(8),
-          reason: 'latin1 兜底应保住原始字节数',
-        );
-        expect(outcome.nonUtf8Output, isTrue);
-      } else {
-        expect(outcome.stdout, contains('中文测试'));
-        expect(outcome.nonUtf8Output, isFalse);
+      expect(outcome.stdout.trim(), '中文测试', reason: '中文必须可读，不能是乱码');
+      expect(outcome.garbledOutput, isFalse, reason: '不该落到 latin1 兜底');
+    });
+
+    test('非 UTF-8 原始字节（GBK）：按系统代码页解码，标 nonUtf8Output 不标 garbled', () async {
+      if (!_isPowerShellWindows) return; // 该命令是 PowerShell 写法
+      final ExecOutcome outcome = await io.exec(
+        _rawStdoutCommand(_gbkZhongWenBytes),
+      );
+      expect(outcome.nonUtf8Output, isTrue, reason: '这 8 个字节不是合法 UTF-8');
+      if (_isGbkWindows) {
+        expect(outcome.stdout, '中文测试', reason: 'CP936 下必须解成中文');
+        expect(outcome.garbledOutput, isFalse, reason: '代码页解开了就不是真乱码');
       }
+    });
+
+    test('代码页不可用（非 Windows / FFI 失败）时降级 latin1 并标 garbled', () async {
+      if (!_isPowerShellWindows) return;
+      // 注入"代码页解码不可用"：与"非 Windows / FFI 加载失败"走同一条降级分支
+      AnsiCodePage.debugDecoderOverride = (List<int> bytes) => null;
+      final ExecOutcome outcome = await io.exec(
+        _rawStdoutCommand(_gbkZhongWenBytes),
+      );
+      expect(outcome.nonUtf8Output, isTrue);
+      expect(outcome.garbledOutput, isTrue, reason: '连代码页都不可用 → 如实标记真乱码');
+      expect(
+        latin1.encode(outcome.stdout),
+        _gbkZhongWenBytes,
+        reason: 'latin1 兜底逐字节保底，不丢字节',
+      );
+    });
+
+    test('真机 dir：自建中文目录名可读', () async {
+      if (!Platform.isWindows) return;
+      const String name = '中文目录验证';
+      Directory(p.join(root.path, name)).createSync();
+      final ExecOutcome outcome = await io.exec('dir');
+      expect(outcome.stdout, contains(name), reason: '中文目录名必须可读');
+      expect(outcome.garbledOutput, isFalse, reason: '不该落到 latin1 兜底');
     });
 
     test('纯 ASCII 输出不标记 nonUtf8Output', () async {
@@ -385,7 +561,7 @@ void main() {
     test('timeout 不再终止命令：慢命令跑完，输出照常可读（M9 1.1）', () async {
       final ExecOutcome outcome = await io.exec(
         Platform.isWindows
-            ? 'ping -n 3 127.0.0.1 >nul & echo done'
+            ? r'ping -n 3 127.0.0.1 | Out-Null; echo done'
             : 'sleep 2; echo done',
         timeout: const Duration(milliseconds: 200),
       );
@@ -403,12 +579,13 @@ void main() {
       // 输出：这时"等流关闭"要等到后台进程结束（60s），"等输出静默"也永远等不到。
       // 进程已死即命令结束，收尾只该把残余缓冲收干净——所以这里要求它明显早于
       // 60s 返回，且已经拿到的输出完整。
-      // Windows 上后台进程会把 cwd（= 工作空间）锁住，所以用 /d 把它挪到 %TEMP%，
-      // 否则 tearDown 删临时目录会失败。
+      // Windows 上后台进程会把 cwd（= 工作空间）锁住，所以把它挪到 %TEMP%，
+      // 否则 tearDown 删临时目录会失败（PowerShell 用 -WorkingDirectory）。
       final DateTime started = DateTime.now();
       final ExecOutcome outcome = await io.exec(
         Platform.isWindows
-            ? 'start /b /d "%TEMP%" ping -n 60 127.0.0.1 & echo done'
+            ? r'$p = Start-Process -FilePath ping -ArgumentList "-n","60","127.0.0.1"'
+                  r' -NoNewWindow -WorkingDirectory $env:TEMP -PassThru; echo done'
             : 'sleep 60 & echo done',
       );
       final int elapsedMs = DateTime.now().difference(started).inMilliseconds;

@@ -1,5 +1,7 @@
 import 'dart:io';
 
+import 'package:tree_local_exec/tree_local_exec.dart';
+
 import '../store/atomic_file.dart';
 import '../store/tree_paths.dart';
 import '../store/write_queue.dart';
@@ -40,7 +42,14 @@ class FileSettingsSink implements CoreSettingsSink {
     final File file = File(paths.settingsFile);
     if (file.existsSync()) {
       try {
-        settings.applyMap(YamlCodec.decode(file.readAsStringSync()));
+        // 配置被手改坏时**不能抛**（那会让启动直接失败）：容错解码 + 记一条可见日志
+        final DecodedText decoded = PlatformTextDecoder.decodeTolerant(
+          file.readAsBytesSync(),
+        );
+        if (decoded.decoding == TextDecoding.utf8Malformed) {
+          log?.call('settings.yaml 含非法 UTF-8 字节，已按 U+FFFD 顶替后解析：${file.path}');
+        }
+        settings.applyMap(YamlCodec.decode(decoded.text));
       } catch (error) {
         log?.call('settings.yaml 解析失败，本次使用默认设置：${file.path}：$error');
       }
@@ -50,9 +59,13 @@ class FileSettingsSink implements CoreSettingsSink {
       for (final FileSystemEntity entity in dir.listSync()) {
         if (entity is! File || !entity.path.endsWith('.yaml')) continue;
         try {
-          final Map<String, dynamic> map = YamlCodec.decode(
-            entity.readAsStringSync(),
+          final DecodedText decoded = PlatformTextDecoder.decodeTolerant(
+            entity.readAsBytesSync(),
           );
+          if (decoded.decoding == TextDecoding.utf8Malformed) {
+            log?.call('模型配置含非法 UTF-8 字节，已按 U+FFFD 顶替后解析：${entity.path}');
+          }
+          final Map<String, dynamic> map = YamlCodec.decode(decoded.text);
           final CoreModelConfig model = CoreModelConfig.fromJson(map);
           if (model.modelId.isEmpty) {
             log?.call('模型配置缺少 model_id，已跳过：${entity.path}');

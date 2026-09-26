@@ -258,7 +258,9 @@ void main() {
       final TerminalHooks hooks = TerminalHooks();
       addTearDown(hooks.close);
       final String command = Platform.isWindows
-          ? 'ping -n 3 127.0.0.1 >nul'
+          // Windows 现在走 PowerShell：>nul 是 cmd 语法（PS 下会报 FileOpenFailure），
+          // 丢弃输出要用 | Out-Null
+          ? 'ping -n 3 127.0.0.1 | Out-Null'
           : 'sleep 2';
       final DateTime started = DateTime.now();
       final ToolOutcome outcome = await BuiltinTools.run(
