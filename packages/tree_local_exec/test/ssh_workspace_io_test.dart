@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:test/test.dart';
@@ -19,8 +20,12 @@ class FakeSshTransport implements SshTransport {
 
   void seedBytes(String path, List<int> bytes) => files[path] = bytes;
 
+  /// 读某文件前的钩子（测试用：模拟"读到一半链路失活"）。
+  Future<void> Function(String absolutePath)? beforeRead;
+
   @override
   Future<List<int>> read(String absolutePath) async {
+    if (beforeRead != null) await beforeRead!(absolutePath);
     final List<int>? bytes = files[absolutePath];
     if (bytes == null) throw StateError('no such file: $absolutePath');
     return bytes;
@@ -38,12 +43,16 @@ class FakeSshTransport implements SshTransport {
     return bytes.length;
   }
 
+  /// 让读流永不产出（模拟"远端半天不给下一块"）。
+  bool stallReadStream = false;
+
   @override
   Stream<List<int>> readStream(
     String absolutePath, {
     int offset = 0,
     int? length,
   }) async* {
+    if (stallReadStream) await Completer<void>().future;
     final List<int>? bytes = files[absolutePath];
     if (bytes == null) throw StateError('no such file: $absolutePath');
     final int end = length == null
@@ -131,15 +140,20 @@ class FakeSshTransport implements SshTransport {
     Duration timeout = const Duration(seconds: 120),
   }) async {
     commands.add(command);
-    // timeout 只记录下来：M9 1.1 起执行器不再据此终止命令，测试据此确认
-    // "签名还在、终止没了"。
+    // timeout 只记录下来：M9 1.1 的判据是心跳不是总时长，测试据此确认
+    // "签名还在、按时间终止没了"。
     timeouts.add(timeout);
+    if (pendingRun != null) return pendingRun!.future; // 在途命令：由测试决定何时结束
     return onRun?.call(command) ??
         const SshExecResult(exitCode: 0, stdout: '', stderr: '');
   }
 
+  /// 活性：真实现由心跳循环驱动，假传输由测试直接喂（recordMiss/recordBeat）。
   @override
-  bool get isConnected => !closed;
+  final SshLiveness liveness = SshLiveness();
+
+  /// 假传输上的"在途操作"：由测试决定什么时候完成（null = 立刻成功返回）。
+  Completer<SshExecResult>? pendingRun;
 
   @override
   Future<void> close() async => closed = true;
@@ -525,6 +539,109 @@ void main() {
           ),
         ),
       );
+    });
+  });
+
+  group('链路活性（M9 1.1：心跳丢了才判超时）', () {
+    test('在途命令遇连续 N 次心跳丢失 → 显式失败，不永久挂起', () async {
+      t.pendingRun = Completer<SshExecResult>(); // 远端永远不回
+      final Future<ExecOutcome> pending = io.exec('sleep 9999');
+      await Future<void>.delayed(Duration.zero);
+      expect(t.commands, hasLength(1), reason: '命令已经发出去了');
+
+      // 连续 3 次"心跳窗口内没有回包"（默认 N=3）
+      for (int i = 0; i < 3; i++) {
+        t.liveness.recordMiss();
+      }
+      await expectLater(
+        pending,
+        throwsA(
+          isA<SshLinkStaleException>().having(
+            (SshLinkStaleException e) => e.message,
+            'message',
+            contains('心跳丢失'),
+          ),
+        ),
+      );
+      expect(t.liveness.isStale, isTrue);
+    });
+
+    test('已失活：新操作立刻显式失败，且不再往链路上发东西', () async {
+      for (int i = 0; i < 3; i++) {
+        t.liveness.recordMiss();
+      }
+      await expectLater(
+        io.exec('echo hi'),
+        throwsA(isA<SshLinkStaleException>()),
+      );
+      await expectLater(
+        io.readFile('a.txt'),
+        throwsA(isA<SshLinkStaleException>()),
+      );
+      expect(t.commands, isEmpty, reason: '判死的链路不该再收到命令');
+      expect(t.liveness.lastBeatAt, isNull);
+    });
+
+    test('心跳正常：行为不变，成功响应记一次心跳并清零丢失计数', () async {
+      t.seed('/ws/a.txt', 'hello');
+      t.liveness.recordMiss();
+      t.liveness.recordMiss();
+      expect(t.liveness.isStale, isFalse, reason: '还没到阈值');
+
+      final ExecOutcome exec = await io.exec('echo hi');
+      expect(exec.exitCode, 0);
+      expect(t.liveness.missedCount, 0, reason: '成功的读/写响应也是心跳');
+      expect(t.liveness.lastBeatAt, isNotNull);
+      expect((await io.readFile('a.txt')).text, 'hello');
+      expect(t.liveness.isAlive, isTrue);
+    });
+
+    test('心跳恢复 → 失活标记清除，操作恢复可用（不主动关连接）', () async {
+      for (int i = 0; i < 3; i++) {
+        t.liveness.recordMiss();
+      }
+      await expectLater(
+        io.exec('echo a'),
+        throwsA(isA<SshLinkStaleException>()),
+      );
+
+      t.liveness.recordBeat(); // 下一拍回来了（等价于重连成功后的 reset）
+      final ExecOutcome ok = await io.exec('echo b');
+      expect(ok.exitCode, 0);
+      expect(t.liveness.isStale, isFalse);
+      expect(t.closed, isFalse, reason: '心跳丢失期间不关连接');
+    });
+
+    test('流式读：远端不给数据时以心跳丢失错误结束，不永久挂起', () async {
+      t.seed('/ws/big.bin', 'x');
+      t.stallReadStream = true;
+      final Future<List<List<int>>> collected = io.openRead('big.bin').toList();
+      await Future<void>.delayed(Duration.zero); // 让守卫先注册在途信号
+      for (int i = 0; i < 3; i++) {
+        t.liveness.recordMiss();
+      }
+      // 守卫必须把显式错误交给调用方：源流卡住时连 cancel 都不会完成，
+      // 所以这里等的是"流报错"，不是"流结束"
+      await expectLater(collected, throwsA(isA<SshLinkStaleException>()));
+    });
+
+    test('grep：单文件读不到照旧跳过，但心跳丢失要如实抛出', () async {
+      t.seed('/ws/a.txt', 'needle');
+      t.seed('/ws/b.txt', 'needle');
+      final Completer<void> reading = Completer<void>();
+      t.beforeRead = (String path) async {
+        if (!path.endsWith('/a.txt')) return;
+        reading.complete();
+        await Completer<void>().future; // 这一读卡住了
+      };
+      final Future<GrepOutcome> pending = io.grep(
+        const GrepQuery(pattern: 'needle'),
+      );
+      await reading.future;
+      for (int i = 0; i < 3; i++) {
+        t.liveness.recordMiss();
+      }
+      await expectLater(pending, throwsA(isA<SshLinkStaleException>()));
     });
   });
 

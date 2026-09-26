@@ -11,6 +11,7 @@ library;
 export 'src/dartssh_transport.dart';
 export 'src/git_output.dart';
 export 'src/local_workspace_io.dart';
+export 'src/ssh_liveness.dart';
 export 'src/ssh_workspace_io.dart';
 export 'src/shell.dart';
 export 'src/workspace_io.dart';

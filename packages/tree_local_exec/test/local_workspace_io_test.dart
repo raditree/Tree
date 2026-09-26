@@ -397,6 +397,24 @@ void main() {
     test('空命令被拒绝', () async {
       await expectLater(io.exec('   '), throwsA(isA<WorkspaceIoException>()));
     });
+
+    test('进程已退出、后台子进程还攥着管道：收尾不永久挂住（1.1）', () async {
+      // 命令行自己立刻退出，但它 fork/start 出来的后台进程继承着管道写端并**持续**
+      // 输出：这时"等流关闭"要等到后台进程结束（60s），"等输出静默"也永远等不到。
+      // 进程已死即命令结束，收尾只该把残余缓冲收干净——所以这里要求它明显早于
+      // 60s 返回，且已经拿到的输出完整。
+      // Windows 上后台进程会把 cwd（= 工作空间）锁住，所以用 /d 把它挪到 %TEMP%，
+      // 否则 tearDown 删临时目录会失败。
+      final DateTime started = DateTime.now();
+      final ExecOutcome outcome = await io.exec(
+        Platform.isWindows
+            ? 'start /b /d "%TEMP%" ping -n 60 127.0.0.1 & echo done'
+            : 'sleep 60 & echo done',
+      );
+      final int elapsedMs = DateTime.now().difference(started).inMilliseconds;
+      expect(outcome.stdout, contains('done'));
+      expect(elapsedMs, lessThan(20000), reason: '不能等到后台子进程自己结束（那是 60s）');
+    }, timeout: const Timeout(Duration(seconds: 45)));
   });
 
   group('git（M9 Q4：本机 git）', () {

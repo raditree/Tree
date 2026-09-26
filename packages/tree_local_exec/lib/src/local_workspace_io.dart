@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -351,7 +352,9 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     Duration timeout = const Duration(seconds: 120),
     int maxOutputBytes = 200 * 1024,
   }) async {
-    // [timeout] 已无作用（M9 1.1 取消硬超时终止）：保留参数只为不改调用方签名。
+    // [timeout]（静态总时长）已无作用：本地执行的活性判据就是**进程还活着**
+    // （OS 层）——进程活着就永不超时，进程消失就当正常退出处理，绝不因为"太久"
+    // 去杀它（M9 1.1）。参数保留只为不改调用方签名。
     final String trimmed = command.trim();
     if (trimmed.isEmpty) {
       throw WorkspaceIoException('command 不能为空');
@@ -369,20 +372,41 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     final _OutputCollector err = _OutputCollector(
       maxOutputBytes: maxOutputBytes,
     );
-    final Future<void> outDone = process.stdout
-        .listen(out.add)
-        .asFuture<void>();
-    final Future<void> errDone = process.stderr
-        .listen(err.add)
-        .asFuture<void>();
+    final Completer<void> outDone = Completer<void>();
+    final Completer<void> errDone = Completer<void>();
+    // onDone 与 onError 都可能在同一个流上触发（出错后流不一定立刻结束），
+    // 所以两边都先看 isCompleted，别让第二次 complete 抛"已经完成"。
+    final StreamSubscription<List<int>> outSub = process.stdout.listen(
+      out.add,
+      onDone: () {
+        if (!outDone.isCompleted) outDone.complete();
+      },
+      onError: (Object _) {
+        if (!outDone.isCompleted) outDone.complete();
+      },
+    );
+    final StreamSubscription<List<int>> errSub = process.stderr.listen(
+      err.add,
+      onDone: () {
+        if (!errDone.isCompleted) errDone.complete();
+      },
+      onError: (Object _) {
+        if (!errDone.isCompleted) errDone.complete();
+      },
+    );
 
-    // M9 1.1：不再按 timeout 杀进程——本地执行，不存在服务器上"多用户无限期
-    // 等待把资源耗光"的后果，慢命令等它跑完即可（长任务的心跳/软超时在上层）。
-    // 因此 Shell.killProcessTree 不在这里用（它仍服务于 terminal 的后台取消）。
+    // M9 1.1：本地执行的活性判据就是**进程还活着**（OS 层）——不去按静态时间杀
+    // 它（本地执行，不存在服务器上"多用户无限期等待把资源耗光"的后果）。
+    // Shell.killProcessTree 因此不在这里用（它仍服务于 terminal 的后台取消）。
     final int exitCode = await process.exitCode;
-    // 进程已退出，管道里剩下的缓冲会自然读完；这里也不再用 5s 超时把收尾掐掉
-    // （掐掉就等于丢输出尾巴，与"输出仍可读取"的要求相反）。
-    await Future.wait<void>(<Future<void>>[outDone, errDone]);
+    await _drainOutput(
+      out,
+      err,
+      outDone.future,
+      errDone.future,
+      outSub,
+      errSub,
+    );
 
     final List<int> stdoutBytes = out.bytes;
     final List<int> stderrBytes = err.bytes;
@@ -563,6 +587,55 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
 
   // ── 内部工具 ─────────────────────────────────────────────────────────
 
+  /// [exec] 输出收尾的检查节奏、"静默"阈值与兜底上限。
+  ///
+  /// **只作用于"进程已经退出之后"的残余管道读取**，不参与命令执行时长的判断，
+  /// 也不杀任何进程——所以它不是 1.1 要取消的那种"静态总时长超时"。
+  static const Duration _drainTick = Duration(milliseconds: 100);
+  static const int _drainIdleTicks = 3; // ≈300ms 没有新字节 = 输出已静默
+  static const int _drainMaxTicks = 30; // 兜底 ≈3s
+
+  /// 进程退出后的输出收尾（M9 1.1）。
+  ///
+  /// 进程正常退出时管道会立刻关闭，这里即时返回。收尾判据按"数据还在不在动"：
+  /// 连续 [_drainIdleTicks] 次检查都没有新字节就认为输出已经静默。
+  ///
+  /// 为什么还要一个 [_drainMaxTicks] 兜底：命令派生的后台进程可能一边攥着管道
+  /// 写端、一边**持续**输出（典型是 start /b 拉起的 ping 之类），"静默"就永远
+  /// 不会到来——那已经不是这条命令的输出了，工具调用不该被它永久挂住。进程已死
+  /// 即命令结束，这里只把残余缓冲收干净，超时就取消订阅返回（1.1 要求"不要永久
+  /// 挂起"）。
+  static Future<void> _drainOutput(
+    _OutputCollector out,
+    _OutputCollector err,
+    Future<void> outDone,
+    Future<void> errDone,
+    StreamSubscription<List<int>> outSub,
+    StreamSubscription<List<int>> errSub,
+  ) async {
+    bool closed = false;
+    Future.wait<void>(<Future<void>>[outDone, errDone])
+        .then((void _) => closed = true, onError: (Object _) => closed = true);
+    int idleTicks = 0;
+    int ticks = 0;
+    int seen = out.receivedBytes + err.receivedBytes;
+    while (!closed && idleTicks < _drainIdleTicks && ticks < _drainMaxTicks) {
+      ticks++;
+      await Future<void>.delayed(_drainTick);
+      final int now = out.receivedBytes + err.receivedBytes;
+      if (now != seen) {
+        seen = now;
+        idleTicks = 0;
+      } else {
+        idleTicks++;
+      }
+    }
+    if (!closed) {
+      await outSub.cancel();
+      await errSub.cancel();
+    }
+  }
+
   static RegExp _buildPattern(GrepQuery query) {
     final String source = query.regex
         ? query.pattern
@@ -695,7 +768,12 @@ class _OutputCollector {
   final BytesBuilder _tail = BytesBuilder();
   bool truncated = false;
 
+  /// 累计收到的字节数（**单调递增**）：[_head]/[_tail] 会被截断，长度反映不了
+  /// "还有没有新数据在动"，收尾判据只能看这个。
+  int receivedBytes = 0;
+
   void add(List<int> chunk) {
+    receivedBytes += chunk.length;
     // 未截断前全部进头部；一旦超出预算，之后**只**保留尾部（错误通常在末尾），
     // 绝不把截断点之后的内容再拼回头部（那会造出乱序输出）
     if (!truncated && _head.length + chunk.length <= maxOutputBytes) {

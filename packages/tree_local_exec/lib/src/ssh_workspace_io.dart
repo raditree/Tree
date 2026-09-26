@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -5,6 +6,7 @@ import 'package:path/path.dart' as p;
 
 import 'git_output.dart';
 import 'local_workspace_io.dart';
+import 'ssh_liveness.dart';
 import 'workspace_io.dart';
 
 /// SSH 传输抽象：把"远端文件系统 + 远端命令执行"压成 6 个方法。
@@ -47,13 +49,16 @@ abstract interface class SshTransport {
 
   /// 执行命令，返回退出码与解码后的输出。
   ///
-  /// [timeout] 是 M9 之前的硬超时；1.1 起**不再据此终止远端命令**（本地执行，
-  /// 没有多服务器争抢资源的后果），链路活性由 keepalive 心跳体现。参数保留
-  /// 只为不改调用方签名，已无实际作用。
+  /// [timeout] 是 M9 之前的**静态总时长**硬超时；1.1 修正后**不再按时间终止**
+  /// 远端命令（本地执行，没有多服务器争抢资源的后果）——判据换成心跳：只要心跳
+  /// 还在回，命令跑多久都等；心跳连续丢失才由 [liveness] 判失活并以显式错误
+  /// 结束在途操作。参数保留只为不改调用方签名，已无实际作用。
   Future<SshExecResult> run(String command, {Duration timeout});
 
-  /// 连接是否还活着（心跳/重连决策要的"状态标记"入口；不在这里杀连接）。
-  bool get isConnected;
+  /// 链路活性快照：最近一次心跳时间、连续丢失计数、是否失活（1.1 的心跳判据）。
+  ///
+  /// 给上层做重连决策与 UI 展示用；心跳丢失期间**不会**主动关连接。
+  SshLiveness get liveness;
 
   /// 释放连接。
   Future<void> close();
@@ -106,7 +111,9 @@ Future<String> resolveRemoteRoot(
   final String raw = root.trim();
   final String candidate = raw.isEmpty ? fallback : raw;
   if (candidate.startsWith('/')) return p.posix.normalize(candidate);
-  final SshExecResult result = await transport.run(r'printf %s "$HOME"');
+  final SshExecResult result = await transport.liveness.guard(
+    () => transport.run(r'printf %s "$HOME"'),
+  );
   final String home = result.stdout.trim();
   if (result.exitCode != 0 || !home.startsWith('/')) {
     throw WorkspaceIoException('无法解析远端 HOME（exit=${result.exitCode}，输出：$home）');
@@ -126,7 +133,10 @@ Future<String> resolveRemoteRoot(
 /// - 路径用 **POSIX** 规则（`p.posix`），Windows 盘符/UNC 判断不适用；
 /// - grep/list 需要一次远端遍历（[SshTransport.listFiles]），因此默认排除目录
 ///   与深度上限同样生效，避免把 node_modules 拉下来；
-/// - exec 不做 `chcp`（远端不是 cmd）。
+/// - exec 不做 `chcp`（远端不是 cmd）；
+/// - **每次传输都过一遍活性守卫**（M9 1.1）：先查 [SshTransport.liveness]，在途
+///   操作与"链路被判失活"的信号赛跑，成功则记一次心跳。因此远端半天不响应时
+///   操作会以"心跳丢失"的显式错误结束，而不是永久挂起；正常链路上零行为变化。
 class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   SshWorkspaceIO(this.root, this._transport);
 
@@ -134,6 +144,9 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   final String root;
 
   final SshTransport _transport;
+
+  /// 链路活性（M9 1.1）：所有传输都从这里过一遍守卫。
+  SshLiveness get _link => _transport.liveness;
 
   /// 与本地实现共用同一套排除目录（依赖/构建产物）。
   static Set<String> get defaultExcludedDirs =>
@@ -211,7 +224,7 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   Future<int> writeFile(String relativePath, String content) async {
     final String absolute = resolve(relativePath);
     final List<int> bytes = utf8.encode(content);
-    await _transport.write(absolute, bytes);
+    await _link.guard(() => _transport.write(absolute, bytes));
     return bytes.length;
   }
 
@@ -249,7 +262,7 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     final List<int> bytes = utf8.encode(
       crlf ? updated.replaceAll('\n', '\r\n') : updated,
     );
-    await _transport.write(absolute, bytes);
+    await _link.guard(() => _transport.write(absolute, bytes));
     return EditOutcome(
       path: relativePath,
       replacements: replaceAll ? occurrences : 1,
@@ -261,9 +274,8 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   Future<GrepOutcome> grep(GrepQuery query) async {
     final String start = resolve(query.relativePath);
     final RegExp pattern = _buildPattern(query);
-    final List<String> relativeFiles = await _transport.listFiles(
-      start,
-      maxDepth: query.maxDepth,
+    final List<String> relativeFiles = await _link.guard(
+      () => _transport.listFiles(start, maxDepth: query.maxDepth),
     );
     final List<GrepMatch> matches = <GrepMatch>[];
     // Q10：扫描清单与"实际生效的排除目录"在下面这一轮里顺手记录，
@@ -303,7 +315,10 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
       }
       final List<int> bytes;
       try {
-        bytes = await _transport.read(p.posix.join(start, rel));
+        bytes = await _read(p.posix.join(start, rel), rel);
+      } on SshLinkStaleException {
+        // 心跳丢了不是"这个文件读不到"：整轮如实失败，不要静默跳过剩下的文件
+        rethrow;
       } catch (_) {
         continue;
       }
@@ -391,9 +406,8 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     // [timeout] 已无作用（M9 1.1 取消硬超时终止）：保留参数只为不改调用方签名。
     final String trimmed = command.trim();
     if (trimmed.isEmpty) throw WorkspaceIoException('command 不能为空');
-    final SshExecResult result = await _transport.run(
-      'cd ${_quote(root)} && $trimmed',
-      timeout: timeout,
+    final SshExecResult result = await _link.guard(
+      () => _transport.run('cd ${_quote(root)} && $trimmed', timeout: timeout),
     );
     return ExecOutcome(
       exitCode: result.exitCode,
@@ -409,8 +423,11 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
 
   @override
   Future<GitLogOutcome> gitLog({int limit = 50}) async {
-    final SshExecResult result = await _transport.run(
-      'cd ${_quote(root)} && ${GitOutput.logCommand(GitOutput.clampLimit(limit))}',
+    final SshExecResult result = await _link.guard(
+      () => _transport.run(
+        'cd ${_quote(root)} && '
+        '${GitOutput.logCommand(GitOutput.clampLimit(limit))}',
+      ),
     );
     // 非仓库 / 远端没有 git：退出码非 0，stdout 是报错文本 → 空列表 + 退出码，
     // 不抛异常（面板显示空态而不是 400）。
@@ -424,8 +441,8 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
 
   @override
   Future<GitBranchesOutcome> gitBranches() async {
-    final SshExecResult result = await _transport.run(
-      'cd ${_quote(root)} && ${GitOutput.branchCommand}',
+    final SshExecResult result = await _link.guard(
+      () => _transport.run('cd ${_quote(root)} && ${GitOutput.branchCommand}'),
     );
     final ({List<String> branches, String current}) parsed =
         result.exitCode == 0
@@ -450,7 +467,9 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     );
     final List<SshFileEntry> entries;
     try {
-      entries = await _transport.listEntries(start, maxEntries: maxEntries);
+      entries = await _link.guard(
+        () => _transport.listEntries(start, maxEntries: maxEntries),
+      );
     } on WorkspaceIoException {
       rethrow;
     } catch (error) {
@@ -488,7 +507,7 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   Future<void> writeBytes(String relativePath, List<int> bytes) async {
     final String absolute = resolve(relativePath);
     try {
-      await _transport.write(absolute, bytes);
+      await _link.guard(() => _transport.write(absolute, bytes));
     } on WorkspaceIoException {
       rethrow;
     } catch (error) {
@@ -500,7 +519,7 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   Future<int> sizeOf(String relativePath) async {
     final String absolute = resolve(relativePath);
     try {
-      return await _transport.size(absolute);
+      return await _link.guard(() => _transport.size(absolute));
     } on WorkspaceIoException {
       rethrow;
     } catch (error) {
@@ -515,14 +534,16 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     int? length,
   }) {
     final String absolute = resolve(relativePath);
-    return _transport.readStream(absolute, offset: offset, length: length);
+    return _guardStream(
+      _transport.readStream(absolute, offset: offset, length: length),
+    );
   }
 
   @override
   Future<void> writeStream(String relativePath, Stream<List<int>> data) async {
     final String absolute = resolve(relativePath);
     try {
-      await _transport.writeStream(absolute, data);
+      await _link.guard(() => _transport.writeStream(absolute, data));
     } on WorkspaceIoException {
       rethrow;
     } catch (error) {
@@ -535,11 +556,51 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
 
   Future<List<int>> _read(String absolute, String relativePath) async {
     try {
-      return await _transport.read(absolute);
+      return await _link.guard(() => _transport.read(absolute));
     } on WorkspaceIoException {
       rethrow;
     } catch (error) {
       throw WorkspaceIoException('读取失败（$relativePath）：$error');
+    }
+  }
+
+  /// 流式读取的活性守卫（M9 1.1）。
+  ///
+  /// 流没法用 [SshLiveness.guard] 包（它返回的是 Stream 不是 Future），但"远端
+  /// 半天不给下一块"正是最容易永久挂住的地方：这里逐块与"链路被判失活"的信号
+  /// 赛跑，失活就以显式的心跳丢失错误结束这个流，而不是让下载一直等下去。
+  /// 每拿到一块都记一次心跳（数据在动 = 链路活着），正常链路上零行为变化。
+  Stream<List<int>> _guardStream(Stream<List<int>> source) async* {
+    final SshLiveness link = _link;
+    link.ensureAlive();
+    final StreamIterator<List<int>> iterator = StreamIterator<List<int>>(
+      source,
+    );
+    try {
+      while (true) {
+        final Completer<void> stale = link.watchStale();
+        final Future<bool> next = Future.any<bool>(<Future<bool>>[
+          iterator.moveNext(),
+          stale.future.then<bool>(
+            (void _) => throw SshLinkStaleException(link.staleMessage),
+          ),
+        ]);
+        // 信号用完必须注销：失活信号只唤醒"当时在途"的操作。两条分支都显式
+        // 处理，别派生出一个"没人接错误"的 future（那会变成未捕获异常）。
+        next.then(
+          (bool _) => link.unwatchStale(stale),
+          onError: (Object _) => link.unwatchStale(stale),
+        );
+        final bool hasNext = await next;
+        if (!hasNext) return;
+        link.recordBeat();
+        yield iterator.current;
+      }
+    } finally {
+      // 取消订阅但**不 await**：源流卡在"永远不来的下一块"上时，cancel 的 future
+      // 也永远不会完成（async* 生成器停在 await 上没法被终止），而这里要的是把
+      // 显式错误立刻交给调用方——1.1 明确要求"不要永久挂起"。
+      unawaited(iterator.cancel().catchError((Object _) {}));
     }
   }
 
