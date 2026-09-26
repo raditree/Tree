@@ -75,6 +75,9 @@ class CoreProcessLauncher {
           '未找到核心进程可执行文件 $executableName。\n'
           '已尝试：环境变量 $envExe、应用目录、以及从应用目录向上查找'
           '`.output/$executableName`（开发期）。\n'
+          '便携版/安装版：请确认 $executableName 与 '
+          '${p.basename(Platform.resolvedExecutable)} 在**同一目录**'
+          '（整包解压，不要只复制主程序）。\n'
           '开发期请先执行：\n'
           '  dart compile exe packages/tree_core_cli/bin/tree_core.dart '
           '-o .output/$executableName';

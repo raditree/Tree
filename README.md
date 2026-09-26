@@ -70,14 +70,39 @@ M7 打包时把 `tree_core.exe` 与 `Tree.exe` 放在一起）→ 从应用目�
 
 ### 打包（桌面发布形态）
 
+一条命令出便携包（构建应用 + 编译核心 + 自检 + 压缩 zip）：
+
 ```powershell
-dart run tool/build_core.dart            # 默认输出 dist/tree_core.exe
-dart run tool/build_core.dart --out build\core\tree_core.exe
+# 用与构建应用同一个 SDK 的 dart 运行脚本（混用 SDK 会出现 AOT 产物与
+# Flutter 引擎不匹配的怪问题）
+& 'D:\app\flutter-sdk-3.47.5\flutter\bin\cache\dart-sdk\bin\dart.exe' `
+    run tool/package_windows.dart `
+    --flutter 'D:\app\flutter-sdk-3.47.5\flutter\bin\flutter.bat'
+# 产物：dist/tree-desktop-1.0.0-windows-x64.zip
 ```
 
-产物是**单文件原生可执行**（约 10 MB，无需 Dart 运行时）。发布时把它与 Flutter 壳
-（`Tree.exe`）放在同一目录即可：前端按"从应用目录向上 8 层查找 `tree_core.exe`"+
-`TREE_CORE_URL`/`TREE_CORE_TOKEN` 两种方式附着核心（见上文「调试技巧」）。
+脚本做的事（以及为什么必须由脚本做）：
+
+1. `flutter build windows --release`；
+2. 用**同一个 SDK** 的 dart 把核心编译成 `tree_core.exe` 放进 Release 目录——
+   发行版布局要求核心与 `Tree.exe`（`windows/CMakeLists.txt` 的 `BINARY_NAME`）**同目录**（`CoreProcessLauncher` 的解析顺序）；
+3. 写入 `使用说明.txt`（首次运行指引：数据目录、可直接手改的配置文件、常见问题）；
+4. **自检**：真的启动一次打包好的核心，读到握手再让它优雅退出；
+5. `tar -a -cf` 压成 zip（Windows 10+ 自带 bsdtar），产物在 `dist/`。
+
+只要核心单文件（例如自己写壳）：`dart run tool/build_core.dart`，默认输出
+`dist/tree_core.exe`（约 10 MB，无需 Dart 运行时）。
+
+安装包（可选，需要 Inno Setup 6 的 `iscc` 在 PATH 上）：
+
+```powershell
+dart run tool/package_windows.dart --installer   # 自动带好宏并调用 iscc
+# 或手工：iscc /DAppVersion=1.0.0 /DReleaseDir="<...>\Release" tool\installer\tree-desktop.iss
+```
+
+`tool/installer/tree-desktop.iss` 会把整个 Release 目录装进 Program Files、建开始
+菜单与桌面快捷方式；**卸载不动 `%APPDATA%\Tree`**（模型密钥、agent 配置、会话记录
+是用户数据，不静默删）。
 
 门控冒烟测试（验证编译产物本身能起、能握手、能鉴权、能优雅退出）：
 
@@ -112,10 +137,10 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 - **M7d-2**：文件下载 + 前端路径门禁收紧（`Uri.parse('$baseUrl/api/...')` 这类调用点此前全部漏检）
 - **M7d-3**：文件写路径——分片上传（`upload_init+chunk+complete`，分片顺序追加到系统临时文件后整体落 `.input/{yyyymmdd}/`）、`syncToLocal`（核心与前端同机，直接复制整棵工作空间、排除 `.git`）、`download_folder`（系统 `tar` 打包 tar.gz，先按未压缩大小设上限）。**删除 multipart `upload` 通道**：小文件走分片只多两次轻量请求，却少维护一条契约。附带修掉两个只有真跑才暴露的问题：中文文件名/目录的 `Content-Disposition` 会让 `dart:io` 抛 `FormatException`（改用 RFC 5987 `filename*`）、未捕获异常时 500 回包本身也会失败导致客户端只看到"连接被关掉"（新增 `errorLog` 落到 stderr）；真 exe 冒烟测试扩到"上传 → 打包下载 → 同步到本地"全链路
 - **M7d-4**：上下文压缩——`POST /api/agents/{id}/compact` 把会话早期历史交给模型总结成一条摘要，此后每轮只发「摘要 + 未压缩的近期消息」；保留规则 = 最近 3 条用户要求及其之后 + 尾部 8 条，单轮超长时退化为只留尾部；**不删除任何消息**（水位线是 `session.json` 里的"已总结前缀条数"，界面历史完整可回看）；估算超过 `compress_threshold × max_seqlen` 时在生成前自动压缩；压缩期间推 `agent_status=compacting` 并与生成互斥（`agent_working` / `already_compacting`）；旧摘要并入新摘要，不会越压越多
+- **M7f**：Windows 打包与安装——`tool/package_windows.dart` 一条命令出便携 zip（构建应用 + 用同一 SDK 编译核心到同目录 + 写首次运行说明 + 启动核心读握手自检 + bsdtar 压缩），`tool/installer/tree-desktop.iss` 提供 Inno Setup 安装包（卸载保留 `%APPDATA%\Tree` 用户数据）
 - **M7（剩余）**：
   - SSH 工作空间的远端文件读写接线（需要 SFTP 二进制通道：`SshWorkspaceIO` 目前只有文本读写，文件面板对远端一律给可读的 400）
   - **PDF 预览的渲染方案待决策**（`pdf_preview` 需要 PDF 光栅化）：① 核心侧引入 Syncfusion 纯 Dart 渲染（涉商业许可）；② 前端加 Flutter PDF 插件（如 pdfx/pdfrx，核心只提供字节）；③ 不做预览，PDF 仅下载后用系统查看器打开。当前为 ③（返回 501 + 明确文案）
-  - 安装器（Windows 安装包 / 首次启动引导）
 
 ---
 
