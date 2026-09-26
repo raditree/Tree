@@ -4,10 +4,13 @@ import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
 
-/// MCP stdio 客户端（M6a）：**真进程**验证握手、工具列表、调用、超时与错误。
+/// MCP stdio 客户端（M6a）：**真进程**验证握手、工具列表、调用与错误。
 ///
 /// 假服务是一个 Dart 脚本（`test/fixtures/fake_mcp_server.dart`），通过 stdio
 /// 说 JSON-RPC —— 与本机任何真实 MCP Server 走的是同一条路径。
+///
+/// 超时口径（M9 1.1）见 mcp_client_liveness_test.dart：判据是**心跳丢失**，
+/// 这里只保留功能路径（需要慢/不响应的用例都在那边用心跳参数钉死）。
 void main() {
   late String script;
 
@@ -36,7 +39,11 @@ void main() {
     expect(client.isClosed, isFalse);
 
     final List<McpToolInfo> tools = await client.listTools();
-    expect(tools.map((McpToolInfo t) => t.name), <String>['echo', 'slow']);
+    expect(tools.map((McpToolInfo t) => t.name), <String>[
+      'echo',
+      'slow',
+      'slow-alive',
+    ]);
     expect(tools.first.description, '回显输入');
     expect(
       (tools.first.inputSchema['properties'] as Map<String, dynamic>)
@@ -59,20 +66,19 @@ void main() {
     expect(unknown.text, contains('未知工具 nope'));
   });
 
-  test('工具超时 → 可读异常（不让核心永久挂着）', () async {
-    final McpClient client = await McpClient.start(config());
-    addTearDown(client.close);
+  test('服务一声不吭：握手以「心跳丢失」失败（没有静态握手超时）', () async {
+    // --silent：进程活着但连 ping 都不回，只能靠心跳判死
     await expectLater(
-      client.callTool(
-        'slow',
-        <String, dynamic>{},
-        timeout: const Duration(milliseconds: 200),
-      ),
+      McpClient.start(
+        config(extra: <String>['--silent']),
+        heartbeatInterval: const Duration(milliseconds: 250),
+        missedHeartbeatLimit: 2,
+      ).timeout(const Duration(seconds: 10)),
       throwsA(
-        isA<McpException>().having(
-          (McpException e) => e.message,
+        isA<McpLivenessException>().having(
+          (McpLivenessException e) => e.message,
           'message',
-          contains('超时'),
+          allOf(contains('心跳丢失'), contains('链路失活')),
         ),
       ),
     );

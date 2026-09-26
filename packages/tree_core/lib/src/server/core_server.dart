@@ -26,12 +26,14 @@ import '../store/tree_store.dart';
 import '../team/message_dispatcher.dart';
 import '../team/team_service.dart';
 import '../tool/todo_store.dart';
+import '../util/liveness.dart';
 import '../util/token.dart';
 import '../version.dart';
 import '../ws/inbound_frames.dart';
 import '../ws/ws_hub.dart';
 import 'http_io.dart';
 import 'http_router.dart';
+import 'ws_liveness.dart';
 
 /// 核心进程的回环 HTTP + WS 服务（M1 骨架）。
 ///
@@ -198,6 +200,7 @@ class CoreServer {
     Duration streamChunkDelay = const Duration(milliseconds: 40),
     bool enableHeartbeat = true,
     Duration heartbeatInterval = const Duration(seconds: 30),
+    int heartbeatMissLimit = LivenessTracker.defaultMaxMisses,
     TreeStore? store,
     CoreSettings? settings,
     TodoStore? todoStore,
@@ -221,7 +224,14 @@ class CoreServer {
     final TreeStore resolvedStore = store ?? MemoryStore();
     final CoreSettings resolvedSettings = settings ?? CoreSettings();
     final TodoStore resolvedTodos = todoStore ?? MemoryTodoStore();
-    final WsHub hub = WsHub();
+    // M9 规约 1.1：WS 侧的发送/心跳不再依赖任何静态超时；判活看"连接心跳有没有丢"。
+    // 心跳间隔沿用 [heartbeatInterval]（默认 30s，与前端自己的 30s 心跳节奏对齐，
+    // 否则 30s 的判活窗口会把"在线但空闲"的连接误判失活），连续 [heartbeatMissLimit]
+    // 拍收不到任何入站帧才判失活。详见 LivenessWsHub 的类文档。
+    final LivenessWsHub hub = LivenessWsHub(
+      interval: heartbeatInterval,
+      maxMisses: heartbeatMissLimit,
+    );
     final CoreServer server = CoreServer._(
       http,
       processId: currentPid,
@@ -267,6 +277,21 @@ class CoreServer {
       server._specIndexBinding = binding;
       specIndexProvider = binding;
     }
+    // 判死与恢复都要**可见**、要能触发补发（不静默）：
+    // - 判死：写错误日志 + 关连接（前端会自动重连，这就是"触发重连"）；
+    // - 恢复：把消息派发侧在失活期间登记的待补发消息补出去；
+    // - 派发侧活性：接上"全体连接"级别的台账（心跳丢失 ⇒ 派发显式报错 + 登记补发）。
+    hub.onStale = (String connectionId, LivenessTracker beat) =>
+        server.errorLog?.call('WS 连接 $connectionId ${beat.staleMessage}');
+    hub.onLinkStale = (LivenessTracker beat) =>
+        server.errorLog?.call('WS 链路 ${beat.staleMessage}');
+    hub.onLinkRecovered = () {
+      final TeamMessageDispatcher? dispatcher = messageDispatcher;
+      if (dispatcher == null) return;
+      unawaited(dispatcher.flushPendingResends());
+    };
+    // 调用方自带台账时不覆盖（??=），只补空缺
+    messageDispatcher?.linkLiveness ??= hub.linkLiveness;
     server._registerRoutes();
     server._registerStubRoutes();
     if (enableHeartbeat) {
@@ -363,7 +388,7 @@ class CoreServer {
       return;
     }
     final WebSocket socket = await WebSocketTransformer.upgrade(request);
-    final WsConnection connection = WsConnection(socket: socket);
+    final WsConnection connection = _createConnection(socket);
     hub.register(connection);
     // 101 = Switching Protocols（升级成功的 HTTP 语义状态码）
     _access(request, 101);
@@ -375,7 +400,19 @@ class CoreServer {
     );
   }
 
+  /// 建连接：核心默认用带活性观测的 [LivenessWsConnection]（M9 1.1）；
+  /// 注入普通 [WsHub] 的调用方退回基类连接（行为与旧版完全一致）。
+  WsConnection _createConnection(WebSocket socket) {
+    final WsHub registry = hub;
+    if (registry is LivenessWsHub) return registry.createConnection(socket);
+    return WsConnection(socket: socket);
+  }
+
   void _handleWsFrame(WsConnection connection, dynamic data) {
+    // 收到**任意**入站帧（业务帧、心跳帧、分片帧……）= 链路还在 ⇒ 续期。
+    // 这就是连接活性心跳的观测点：判据只在这里与保活定时器里产生，不看"上次发送
+    // 过了多久"，因此不存在任何静态发送超时（M9 规约 1.1）。
+    if (connection is LivenessWsConnection) connection.recordBeat();
     Map<String, dynamic>? frame = _decodeFrame(data.toString());
     if (frame == null) return;
     // 传输层分片：先重组为完整 JSON 文本，再走业务分发

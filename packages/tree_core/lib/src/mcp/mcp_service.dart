@@ -2,6 +2,7 @@ import 'package:path/path.dart' as p;
 
 import '../store/atomic_file.dart';
 import '../store/yaml_codec.dart';
+import '../util/liveness.dart';
 import 'mcp_client.dart';
 
 /// MCP 服务管理器（M6a）：配置落盘 + 连接缓存 + 工具聚合 + 调用兜底。
@@ -16,13 +17,18 @@ import 'mcp_client.dart';
 /// ```
 /// 连接是**懒建 + 缓存**：启动时尝试一次（`refresh`），之后只有调用失败/服务被改
 /// 才重连；一个坏插件只会体现在它自己的错误里，不影响其它服务与核心本身。
+///
+/// **超时口径（M9 规约 1.1）**：这里**没有任何连接/调用超时**——判据全在客户端侧
+/// 的心跳（MCP `ping` 回包或任意一条协议消息；连续 N 拍没有 ⇒ 判失活）。因此
+/// [heartbeatInterval] / [missedHeartbeatLimit] 是**心跳参数**而不是超时：
+/// 它们只决定"多久没有心跳算死"，与"这次调用总共跑了多久"无关。
 class McpService {
   McpService({
     required this.configFile,
     this.clientFactory,
     this.log,
-    this.connectTimeout = const Duration(seconds: 20),
-    this.callTimeout = const Duration(seconds: 60),
+    this.heartbeatInterval = LivenessTracker.defaultInterval,
+    this.missedHeartbeatLimit = LivenessTracker.defaultMaxMisses,
   });
 
   /// 配置文件（`<数据根>/config/mcp.yaml`）。
@@ -32,8 +38,12 @@ class McpService {
   final Future<McpClient> Function(McpServerConfig config)? clientFactory;
 
   final void Function(String message)? log;
-  final Duration connectTimeout;
-  final Duration callTimeout;
+
+  /// 心跳间隔 I（判活节拍，不是超时）。
+  final Duration heartbeatInterval;
+
+  /// 连续丢失多少次判失活 N。
+  final int missedHeartbeatLimit;
 
   final List<McpServerConfig> _servers = <McpServerConfig>[];
   final Map<String, McpClient> _clients = <String, McpClient>{};
@@ -85,6 +95,12 @@ class McpService {
 
   /// 某服务最近一次连接/调用错误（无则 null）。
   String? errorOf(String name) => _errors[name];
+
+  /// 某服务是否已判 degraded（连续 N 次心跳丢失；心跳恢复自动变回 false）。
+  bool isDegraded(String name) => _clients[name]?.isDegraded ?? false;
+
+  /// 某服务的链路活性台账（未连接则 null），供上层观测/重连决策与 UI 展示。
+  LivenessTracker? livenessOf(String name) => _clients[name]?.liveness;
 
   /// 全部已就绪服务暴露的工具（带服务名）。
   List<({String service, McpToolInfo tool})> allTools() {
@@ -177,7 +193,7 @@ class McpService {
       try {
         final McpClient client = await _connect(config);
         _clients[config.name] = client;
-        _tools[config.name] = await client.listTools(timeout: connectTimeout);
+        _tools[config.name] = await client.listTools();
         _errors.remove(config.name);
         log?.call(
           'MCP 服务 ${config.name} 就绪（${toolsOf(config.name).length} 个工具）',
@@ -244,11 +260,8 @@ class McpService {
       );
     }
     try {
-      final McpCallResult result = await client.callTool(
-        targetTool,
-        arguments,
-        timeout: callTimeout,
-      );
+      // 无静态超时：跑多久由客户端侧的心跳判据说了算（M9 规约 1.1）
+      final McpCallResult result = await client.callTool(targetTool, arguments);
       _errors.remove(targetService);
       return result;
     } catch (error) {
@@ -284,7 +297,11 @@ class McpService {
     final Future<McpClient> Function(McpServerConfig config)? factory =
         clientFactory;
     if (factory != null) return factory(config);
-    return McpClient.start(config, timeout: connectTimeout);
+    return McpClient.start(
+      config,
+      heartbeatInterval: heartbeatInterval,
+      missedHeartbeatLimit: missedHeartbeatLimit,
+    );
   }
 
   Future<void> _disconnect(String name) async {

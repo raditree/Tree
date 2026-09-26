@@ -60,15 +60,20 @@ class _FakeMcpClient implements McpClient {
   @override
   bool get isClosed => closed;
   @override
-  Future<List<McpToolInfo>> listTools({
-    Duration timeout = const Duration(seconds: 20),
-  }) async => <McpToolInfo>[McpToolInfo(name: 'echo', description: '回显')];
+  final LivenessTracker liveness = LivenessTracker(label: '假 MCP 服务');
+  @override
+  bool get isDegraded => liveness.isStale;
+  @override
+  int get degradeCount => 0;
+  @override
+  Future<List<McpToolInfo>> listTools() async => <McpToolInfo>[
+    McpToolInfo(name: 'echo', description: '回显'),
+  ];
   @override
   Future<McpCallResult> callTool(
     String toolName,
-    Map<String, dynamic> arguments, {
-    Duration timeout = const Duration(seconds: 60),
-  }) async => McpCallResult(text: 'echo: ${arguments['text']}');
+    Map<String, dynamic> arguments,
+  ) async => McpCallResult(text: 'echo: ${arguments['text']}');
   @override
   Future<void> close() async => closed = true;
 }

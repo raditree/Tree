@@ -332,4 +332,165 @@ void main() {
     expect(tree.toSet(), <String>{top.id, a, b});
     expect(teams.cascadeIds(a), <String>[a]);
   });
+
+  group('发送判活（M9 1.1：心跳丢失 ⇒ 显式报错 + 登记补发，不静默丢）', () {
+    late LivenessTracker link;
+    late TeamMessageDispatcher guarded;
+
+    /// 与外部 setUp 同款的投递实现（共用 delivered / blocker 观测点）。
+    TeamDelivery sink() =>
+        ({
+          required String agentId,
+          required String sessionId,
+          required String content,
+          String senderId = '',
+          String senderName = '',
+        }) {
+          delivered.add(<String, String>{
+            'agentId': agentId,
+            'sessionId': sessionId,
+            'content': content,
+            'senderId': senderId,
+          });
+          return blocker?.future ?? Future<void>.value();
+        };
+
+    setUp(() {
+      // 判活窗口压到 40ms（I=20ms × N=2）：测试里手工记录丢失，不依赖真实计时
+      link = LivenessTracker(
+        label: 'WS 连接',
+        interval: const Duration(milliseconds: 20),
+        maxMisses: 2,
+      );
+      guarded = TeamMessageDispatcher(
+        store: store,
+        teams: teams,
+        deliver: sink(),
+        workspaceDirOf: (String id) => p.join(temp.path, id),
+        linkLiveness: link,
+        startGrace: const Duration(milliseconds: 40),
+        pollInterval: const Duration(milliseconds: 10),
+      );
+    });
+
+    void markStale() {
+      link.recordMiss();
+      link.recordMiss();
+      expect(link.isStale, isTrue);
+    }
+
+    test('心跳丢失：显式报错、不投递、登记待补发（不静默丢）', () async {
+      final String ready = member(approved: true);
+      markStale();
+
+      final Map<String, dynamic> result = await guarded.run(
+        top.id,
+        <String, dynamic>{
+          'action': 'send_message',
+          'target_member_id': ready,
+          'message': '去做 A',
+        },
+      );
+
+      expect(result['status'], 'error');
+      expect(
+        delivered,
+        isEmpty,
+        reason: 'fail-closed：失活时不落库、不触发生成，补发才不会产生重复消息',
+      );
+      final Map<String, dynamic> rejected =
+          (result['rejected'] as List<dynamic>).single as Map<String, dynamic>;
+      expect(rejected['reason'], contains('心跳丢失'));
+      expect(rejected['reason'], contains('链路失活'));
+      expect(result['resend_pending'], 1);
+      expect(guarded.pendingResendCount, 1);
+      expect(guarded.pendingResendViews().single['target'], ready);
+      expect(result['hint'], contains('心跳丢失'));
+
+      // 不静默：目标活动日志里有 [stale] 记录（用户/排障都看得见）
+      final String logFile = p.join(temp.path, ready, '.self', 'activity.log');
+      expect(File(logFile).readAsStringSync(), contains('[stale]'));
+    });
+
+    test('心跳恢复：flushPendingResends 补发同一批消息（不丢、不重复）', () async {
+      final String ready = member(approved: true);
+      markStale();
+      await guarded.run(top.id, <String, dynamic>{
+        'action': 'send_message',
+        'target_member_id': ready,
+        'message': '去做 A',
+      });
+      expect(guarded.pendingResendCount, 1);
+
+      // 链路仍失活：不补发、队列留着（继续等，不会丢）
+      expect(await guarded.flushPendingResends(), 0);
+      expect(guarded.pendingResendCount, 1);
+      expect(delivered, isEmpty);
+
+      // 心跳恢复 ⇒ 自动补发
+      link.recordBeat();
+      expect(await guarded.flushPendingResends(), 1);
+      expect(guarded.pendingResendCount, 0);
+      expect(delivered.single['agentId'], ready);
+      expect(delivered.single['content'], '去做 A');
+      expect(delivered.single['senderId'], top.id);
+
+      // 队列已清空：再补发不会产生第二条
+      expect(await guarded.flushPendingResends(), 0);
+      expect(delivered, hasLength(1));
+    });
+
+    test('broadcast 与用户直发同样 fail-closed 并登记补发', () async {
+      final String a = member(name: '甲', approved: true);
+      final String b = member(name: '乙', approved: true);
+      markStale();
+
+      final Map<String, dynamic> cast = await guarded.run(
+        top.id,
+        <String, dynamic>{'action': 'broadcast', 'message': '大家好'},
+      );
+      expect(cast['status'], 'error');
+      expect((cast['rejected'] as List<dynamic>), hasLength(2));
+      expect(guarded.pendingResendCount, 2);
+      expect(delivered, isEmpty);
+
+      final Map<String, dynamic> fromUser = await guarded.sendFromUser(
+        targetId: a,
+        content: '帮个忙',
+        sessionId: TreeStore.defaultSessionId,
+      );
+      expect(fromUser['success'], isFalse);
+      expect(fromUser['error'], contains('心跳丢失'));
+      expect(fromUser['resend_pending'], 3);
+      expect(delivered, isEmpty);
+
+      // 恢复后三条一起补发（`a` 收到广播 + 用户直发共 2 条）
+      link.recordBeat();
+      expect(await guarded.flushPendingResends(), 3);
+      expect(
+        delivered.where((Map<String, String> d) => d['agentId'] == a),
+        hasLength(2),
+      );
+      expect(
+        delivered.where((Map<String, String> d) => d['agentId'] == b),
+        hasLength(1),
+      );
+      expect(guarded.pendingResendCount, 0);
+    });
+
+    test('未注入台账（null）时行为与旧版一致：照常投递', () async {
+      final String ready = member(approved: true);
+      final Map<String, dynamic> result = await dispatcher.run(
+        top.id,
+        <String, dynamic>{
+          'action': 'send_message',
+          'target_member_id': ready,
+          'message': '照常投递',
+        },
+      );
+      expect(result['status'], 'sent');
+      expect(delivered.single['content'], '照常投递');
+      expect(dispatcher.pendingResendCount, 0);
+    });
+  });
 }

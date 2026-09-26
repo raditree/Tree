@@ -5,6 +5,7 @@ import 'package:path/path.dart' as p;
 
 import '../store/atomic_file.dart';
 import '../store/tree_store.dart';
+import '../util/liveness.dart';
 import 'team_model.dart';
 import 'team_service.dart';
 
@@ -26,6 +27,7 @@ class DeliveryResult {
     this.name = '',
     this.type = '',
     this.reason = '',
+    this.livenessLost = false,
   });
 
   final String target;
@@ -37,6 +39,12 @@ class DeliveryResult {
   final String type;
   final String reason;
 
+  /// 是否因为**连接心跳丢失（链路失活）**而没投出去（M9 规约 1.1）。
+  ///
+  /// 与"成员未就绪被闸门拒绝"分开：前者该等重连后补发（已自动登记），
+  /// 后者该让发送方去处理成员配置。
+  final bool livenessLost;
+
   Map<String, dynamic> toJson() => <String, dynamic>{
     'target': target,
     'id': id,
@@ -44,6 +52,38 @@ class DeliveryResult {
     'type': type,
     'status': status,
     if (reason.isNotEmpty) 'reason': reason,
+    if (livenessLost) 'liveness_lost': true,
+  };
+}
+
+/// 一条"因连接心跳丢失而未投递、等恢复/重连后补发"的消息（M9 规约 1.1）。
+class _PendingDelivery {
+  const _PendingDelivery({
+    required this.senderId,
+    required this.target,
+    required this.content,
+    required this.sessionId,
+    required this.files,
+    required this.destDir,
+    required this.reason,
+  });
+
+  final String senderId;
+  final MessageTarget target;
+  final String content;
+  final String sessionId;
+  final List<String> files;
+  final String destDir;
+
+  /// 登记时的心跳丢失原因（给日志/排障看）。
+  final String reason;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'target': target.id,
+    'name': target.name,
+    'sender_id': senderId,
+    'session_id': sessionId,
+    'reason': reason,
   };
 }
 
@@ -55,6 +95,17 @@ class DeliveryResult {
 /// - 投递**不阻塞**（参考实现同样立即返回 `sent`）；要等结果用 `wait_for`；
 /// - **无静默回传**：成员正常完成不会自动发给任何人，只有"未就绪/模型缺失"这类
 ///   错误才会以 auto_reply 回到 agent 发送方。
+///
+/// **发送口径（M9 规约 1.1：取消静态超时，改心跳丢失判超时）**：
+/// - 派发路径**没有任何静态超时**（不存在"发送超过 N 秒就丢弃/报错"）；
+/// - 判活点是**连接活性台账** [linkLiveness]（核心把 WS 连接的活性接进来：收到任意
+///   入站帧即续期）：连续 N 次心跳丢失即判链路失活；
+/// - 失活期间派发 **fail-closed**：不落库、不触发生成，直接以**显式错误**拒绝
+///   （原因含「心跳丢失」），同时把这条消息**登记进待补发队列**——重连/心跳恢复后
+///   由 [flushPendingResends] 补发，所以**不静默丢消息**；
+/// - 为什么失活时不"先投递再补发"：`ConversationService.deliver` 会**先**把消息
+///   写进成员会话再触发生成，那样补发会产生重复消息；fail-closed 既避免重复，也
+///   避免"落了库但成员永远看不到"的静默假成功。
 class TeamMessageDispatcher {
   TeamMessageDispatcher({
     required this.store,
@@ -63,6 +114,7 @@ class TeamMessageDispatcher {
     this.workspaceDirOf,
     this.activityLogPathOf,
     this.log,
+    this.linkLiveness,
     this.startGrace = const Duration(seconds: 5),
     this.pollInterval = const Duration(seconds: 2),
     this.maxFileBytes = 32 * 1024 * 1024,
@@ -82,6 +134,12 @@ class TeamMessageDispatcher {
 
   final void Function(String message)? log;
 
+  /// 连接活性台账（WS 发送链路）。
+  ///
+  /// 可写：核心在构造之后接线（`CoreServer.start` 会把 WS 连接的活性接进来）；
+  /// null = 不判活（内嵌使用 / 测试 / 没有前端连接的场景），行为与旧版一致。
+  LivenessTracker? linkLiveness;
+
   /// `wait_for` 的启动宽限（这段时间内没观测到 working 就记 never_started）。
   final Duration startGrace;
 
@@ -90,6 +148,16 @@ class TeamMessageDispatcher {
 
   /// 单文件投递上限。
   final int maxFileBytes;
+
+  /// 因心跳丢失而登记待补发的消息队列（重连后由 [flushPendingResends] 补发）。
+  final List<_PendingDelivery> _pendingResends = <_PendingDelivery>[];
+
+  /// 待补发消息条数（0 = 没有欠账）。
+  int get pendingResendCount => _pendingResends.length;
+
+  /// 待补发明细（日志 / 接口 / 测试观测用）。
+  List<Map<String, dynamic>> pendingResendViews() =>
+      _pendingResends.map((_PendingDelivery p) => p.toJson()).toList();
 
   static const List<String> actions = <String>[
     'send_message',
@@ -189,8 +257,15 @@ class TeamMessageDispatcher {
       'sent': sent,
       'rejected': rejected,
       'unknown': unknown,
+      if (_pendingResends.isNotEmpty) 'resend_pending': _pendingResends.length,
       if (unknown.isNotEmpty) 'hint': _unknownHint(unknown),
-      if (rejected.isNotEmpty && unknown.isEmpty)
+      if (details.any((DeliveryResult d) => d.livenessLost))
+        'hint':
+            '连接心跳丢失（链路失活）：这些消息**没有**投递，已登记待补发，'
+            '心跳恢复/前端重连后会自动补发（不静默丢弃）',
+      if (rejected.isNotEmpty &&
+          unknown.isEmpty &&
+          !details.any((DeliveryResult d) => d.livenessLost))
         'hint': '部分目标投递失败，可稍后重试或改用 list_members 核对成员状态',
       if (status == 'sent')
         'hint':
@@ -231,8 +306,11 @@ class TeamMessageDispatcher {
     }
     return <String, dynamic>{
       'success': false,
-      'error': '投递失败（通道拒绝或未就绪）',
+      'error': result.livenessLost
+          ? '投递失败（${result.reason}）'
+          : '投递失败（通道拒绝或未就绪）',
       'detail': result.toJson(),
+      if (result.livenessLost) 'resend_pending': _pendingResends.length,
     };
   }
 
@@ -412,6 +490,38 @@ class TeamMessageDispatcher {
     List<String> files = const <String>[],
     String destDir = '',
   }) async {
+    // ── 发送判活（M9 规约 1.1）────────────────────────────────────────────
+    // 判据只有"连接心跳有没有丢"，没有静态超时。失活时 fail-closed：**不投递**
+    // （因此不会落库、不会触发生成），登记待补发并如实报错——既不静默丢弃，
+    // 也不会因为补发而产生重复消息。
+    final LivenessTracker? link = linkLiveness;
+    if (link != null && link.isStale) {
+      final String reason =
+          '连接心跳丢失（链路失活），消息未投递、已登记待补发：'
+          '${link.staleMessage}';
+      _pendingResends.add(
+        _PendingDelivery(
+          senderId: senderId,
+          target: target,
+          content: content,
+          sessionId: sessionId,
+          files: files,
+          destDir: destDir,
+          reason: reason,
+        ),
+      );
+      await _activity(target.id, '[stale] $reason');
+      log?.call('投递给 ${target.id} 因链路失活暂缓（已登记待补发）：$reason');
+      return DeliveryResult(
+        target: target.id,
+        id: target.id,
+        name: target.name,
+        type: target.type,
+        status: 'rejected',
+        reason: reason,
+        livenessLost: true,
+      );
+    }
     final String? blocked = teams.reviewBlock(target.id);
     if (blocked != null) {
       // 消息**不静默丢弃**：写活动日志 + 向 agent 发送方回传原因（参考实现同语义）
@@ -469,6 +579,42 @@ class TeamMessageDispatcher {
       type: target.type,
       status: 'sent',
     );
+  }
+
+  /// 心跳恢复 / 前端重连后，把失活期间登记的消息补发出去；返回补发成功条数。
+  ///
+  /// 由核心在**连接心跳恢复**时调用（CoreServer 把 LivenessWsHub.onLinkRecovered
+  /// 接到这里）。链路仍然失活时不动队列（继续等），所以既不会丢，也不会重复。
+  Future<int> flushPendingResends() async {
+    if (_pendingResends.isEmpty) return 0;
+    final LivenessTracker? link = linkLiveness;
+    if (link != null && link.isStale) {
+      log?.call(
+        'WS 链路仍失活，${_pendingResends.length} 条消息继续等待补发：'
+        '${link.staleMessage}',
+      );
+      return 0;
+    }
+    final List<_PendingDelivery> queue = List<_PendingDelivery>.of(
+      _pendingResends,
+    );
+    _pendingResends.clear();
+    int delivered = 0;
+    for (final _PendingDelivery pending in queue) {
+      final DeliveryResult result = await _deliverOne(
+        senderId: pending.senderId,
+        target: pending.target,
+        content: pending.content,
+        sessionId: pending.sessionId,
+        files: pending.files,
+        destDir: pending.destDir,
+      );
+      if (result.status == 'sent') delivered++;
+    }
+    if (delivered > 0) {
+      log?.call('链路恢复：已补发 $delivered 条因心跳丢失暂缓的消息');
+    }
+    return delivered;
   }
 
   /// 错误回传到 **agent** 发送方；用户自己发的（senderId 为空）不回传。

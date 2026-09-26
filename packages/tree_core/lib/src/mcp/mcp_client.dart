@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import '../util/liveness.dart';
+
 /// MCP（Model Context Protocol）stdio 客户端（M6a）。
 ///
 /// 协议边界：JSON-RPC 2.0、**按行分隔**（MCP stdio 传输的规定），流程为
@@ -10,14 +12,37 @@ import 'dart:io';
 /// prompts/sampling 那些面。
 ///
 /// 进程外运行、无沙箱（用户明确要求"插件直接本机运行"）：因此**不做安全隔离**，
-/// 只做超时、崩溃感知与优雅关闭，避免一个坏插件把核心进程拖死。
+/// 只做活性判定、崩溃感知与优雅关闭，避免一个坏插件把核心进程拖死。
+///
+/// **超时口径（M9 规约 1.1：取消静态时间超时，改心跳丢失判超时）**
+/// - **没有任务总时长上限**：一次 `tools/call` 想跑多久就跑多久，绝不因为"总耗时到了"
+///   被丢弃。要避开的正是"心跳还在、只是总时间长了就被判超时丢掉"；
+/// - 判死的唯一依据是**心跳丢失**：MCP 有 `ping` 语义，就用它——每 [heartbeatInterval]
+///   发一次 `ping`，一拍内**没有收到任何协议消息**（ping 回包、任意请求的成功/错误
+///   响应、服务端通知都算）就记一次丢失；连续 [missedHeartbeatLimit] 次（默认 3）即判
+///   **链路失活（degraded）**，在途请求立刻以**显式错误**结束（既不静默挂死，也不
+///   静默丢弃），并可从 [isDegraded] / [missedCount] 观测到；
+/// - **为什么不用静态超时**：慢的 MCP 服务（拉远端数据、跑大模型、编译）本来就可能
+///   跑几分钟——用"总时长"当判据必然误杀；而"连续 N 拍一声不吭"只说明链路死了，
+///   这才是真实的失败信号。心跳恢复（任意一条协议消息）后失活标记**自动清除**，
+///   连接不重建也能继续用；
+/// - 握手（`initialize`）同样不用静态窗口：进程起来了却一声不吭 = 心跳丢失，
+///   由同一套心跳判据负责，所以这里**没有任何 timeout 参数**。副作用是"启动窗口"
+///   也由心跳给出（默认 I×N = 30s）：npx/node 冷启动几秒绰绰有余，真起不来就以
+///   心跳丢失显式失败，而不是让核心一直挂着；
+///
 /// MCP 客户端接口：真实现是 [McpClient.start]（stdio 子进程），测试可注入假实现。
 abstract interface class McpClient {
-  /// 启动一个 MCP 服务进程并完成握手。
+  /// 启动一个 MCP 服务进程并完成握手（用心跳判活，没有静态握手超时）。
   static Future<McpClient> start(
     McpServerConfig config, {
-    Duration timeout = const Duration(seconds: 20),
-  }) => _StdioMcpClient.start(config, timeout: timeout);
+    Duration heartbeatInterval = LivenessTracker.defaultInterval,
+    int missedHeartbeatLimit = LivenessTracker.defaultMaxMisses,
+  }) => _StdioMcpClient.start(
+    config,
+    heartbeatInterval: heartbeatInterval,
+    missedHeartbeatLimit: missedHeartbeatLimit,
+  );
 
   /// 已握手的服务信息（initialize 的 result）。
   Map<String, dynamic> get serverInfo;
@@ -30,25 +55,36 @@ abstract interface class McpClient {
 
   bool get isClosed;
 
+  /// 链路活性台账：最近心跳时间 / 连续丢失次数 / 是否失活（供上层观测与重连决策）。
+  LivenessTracker get liveness;
+
+  /// 是否已判 degraded（连续 N 次心跳丢失）；心跳恢复后自动变回 false。
+  bool get isDegraded;
+
+  /// 累计进入 degraded 的次数（排障与 UI 展示用）。
+  int get degradeCount;
+
   /// `tools/list`：返回该服务暴露的工具。
-  Future<List<McpToolInfo>> listTools({Duration timeout});
+  Future<List<McpToolInfo>> listTools();
 
   /// `tools/call`：调用一个工具，把 content 拼成文本（模型直接可读）。
+  ///
+  /// **没有 timeout 参数**：跑多久由心跳说了算（见类文档）。
   Future<McpCallResult> callTool(
     String toolName,
-    Map<String, dynamic> arguments, {
-    Duration timeout,
-  });
+    Map<String, dynamic> arguments,
+  );
 
   /// 关闭：先关 stdin（礼貌退出），再杀进程（兜底）。
   Future<void> close();
 }
 
 class _StdioMcpClient implements McpClient {
-  /// 启动一个 MCP 服务进程并完成握手。
+  /// 启动一个 MCP 服务进程并完成握手（心跳判活，见类文档）。
   static Future<McpClient> start(
     McpServerConfig config, {
-    Duration timeout = const Duration(seconds: 20),
+    Duration heartbeatInterval = LivenessTracker.defaultInterval,
+    int missedHeartbeatLimit = LivenessTracker.defaultMaxMisses,
   }) async {
     if (config.command.trim().isEmpty) {
       throw McpException('MCP 服务 ${config.name} 未配置 command');
@@ -69,7 +105,16 @@ class _StdioMcpClient implements McpClient {
     process.stderr
         .transform(utf8.decoder)
         .listen(stderr.write, onError: (Object _) {});
-    final _StdioMcpClient client = _StdioMcpClient._(config, process, stderr);
+    final _StdioMcpClient client = _StdioMcpClient._(
+      config,
+      process,
+      stderr,
+      LivenessTracker(
+        label: 'MCP 服务 ${config.name}',
+        interval: heartbeatInterval,
+        maxMisses: missedHeartbeatLimit,
+      ),
+    );
     process.stdout
         .transform(utf8.decoder)
         .transform(const LineSplitter())
@@ -78,8 +123,11 @@ class _StdioMcpClient implements McpClient {
       client._exitCode = code;
       client._failPending('MCP 服务进程已退出（exit=$code）');
     });
+    // 心跳循环在**握手之前**就起来：进程起了却一直不说话会被判"心跳丢失"，
+    // 而不是等一个静态的握手超时——判据因此只有一套（M9 规约 1.1）。
+    client._startHeartbeat();
     try {
-      await client._initialize(timeout);
+      await client._initialize();
     } catch (error) {
       await client.close();
       rethrow;
@@ -87,7 +135,7 @@ class _StdioMcpClient implements McpClient {
     return client;
   }
 
-  _StdioMcpClient._(this.config, this._process, this._stderr);
+  _StdioMcpClient._(this.config, this._process, this._stderr, this.liveness);
 
   static bool _needsShell(String command) {
     final String lower = command.toLowerCase();
@@ -103,11 +151,32 @@ class _StdioMcpClient implements McpClient {
   final Process _process;
   final StringBuffer _stderr;
 
+  /// 链路活性台账（心跳丢失判据）。
+  @override
+  final LivenessTracker liveness;
+
   final Map<int, Completer<Map<String, dynamic>>> _pending =
       <int, Completer<Map<String, dynamic>>>{};
   int _nextId = 0;
   int? _exitCode;
   bool _closed = false;
+
+  /// 心跳探活循环（每 [LivenessTracker.interval] 一拍）。
+  Timer? _heartbeatTimer;
+
+  /// 本拍内是否收到过任何协议消息（收到即算心跳）。
+  bool _beatSinceTick = false;
+
+  /// 上一拍结束时是否已判失活（用来只在"刚判死"的那一刻计一次降级）。
+  bool _wasStale = false;
+
+  int _degradeCount = 0;
+
+  @override
+  bool get isDegraded => liveness.isStale;
+
+  @override
+  int get degradeCount => _degradeCount;
 
   /// 已握手的服务信息（initialize 的 result）。
   @override
@@ -129,13 +198,10 @@ class _StdioMcpClient implements McpClient {
 
   /// `tools/list`：返回该服务暴露的工具。
   @override
-  Future<List<McpToolInfo>> listTools({
-    Duration timeout = const Duration(seconds: 20),
-  }) async {
+  Future<List<McpToolInfo>> listTools() async {
     final Map<String, dynamic> result = await _request(
       'tools/list',
       const <String, dynamic>{},
-      timeout,
     );
     final Object? raw = result['tools'];
     if (raw is! List<dynamic>) return const <McpToolInfo>[];
@@ -153,13 +219,11 @@ class _StdioMcpClient implements McpClient {
   @override
   Future<McpCallResult> callTool(
     String toolName,
-    Map<String, dynamic> arguments, {
-    Duration timeout = const Duration(seconds: 60),
-  }) async {
+    Map<String, dynamic> arguments,
+  ) async {
     final Map<String, dynamic> result = await _request(
       'tools/call',
       <String, dynamic>{'name': toolName, 'arguments': arguments},
-      timeout,
     );
     final List<String> parts = <String>[];
     final Object? content = result['content'];
@@ -186,7 +250,7 @@ class _StdioMcpClient implements McpClient {
     );
   }
 
-  Future<void> _initialize(Duration timeout) async {
+  Future<void> _initialize() async {
     final Map<String, dynamic> result = await _request(
       'initialize',
       <String, dynamic>{
@@ -197,7 +261,6 @@ class _StdioMcpClient implements McpClient {
           'version': '1.0.0',
         },
       },
-      timeout,
     );
     serverInfo =
         (result['serverInfo'] as Map<dynamic, dynamic>?)?.map(
@@ -220,35 +283,133 @@ class _StdioMcpClient implements McpClient {
     return <String, dynamic>{};
   }
 
+  /// 发一个请求并等回包。
+  ///
+  /// **没有静态超时**：等待时长完全由心跳决定——[LivenessTracker.guard] 让"等回包"
+  /// 与"链路被判失活"赛跑：失活即抛显式错误，心跳一直在就一直等下去（M9 规约 1.1）。
   Future<Map<String, dynamic>> _request(
     String method,
     Map<String, dynamic> params,
-    Duration timeout,
   ) {
     if (isClosed) {
       return Future<Map<String, dynamic>>.error(
         McpException('MCP 服务 ${config.name} 已关闭'),
       );
     }
+    // 已判失活就不必再往这条链路发新请求：直接显式失败（最快的失败，也最省事）
+    if (liveness.isStale) {
+      return Future<Map<String, dynamic>>.error(_livenessError(method));
+    }
     final int id = ++_nextId;
     final Completer<Map<String, dynamic>> completer =
         Completer<Map<String, dynamic>>();
     _pending[id] = completer;
-    _write(<String, dynamic>{
-      'jsonrpc': '2.0',
-      'id': id,
-      'method': method,
-      'params': params,
-    });
-    return completer.future.timeout(
-      timeout,
-      onTimeout: () {
-        _pending.remove(id);
-        throw McpException(
-          'MCP 服务 ${config.name} 的 $method 超时（${timeout.inSeconds}s）',
-        );
-      },
-    );
+    try {
+      _write(<String, dynamic>{
+        'jsonrpc': '2.0',
+        'id': id,
+        'method': method,
+        'params': params,
+      });
+    } catch (error) {
+      _pending.remove(id);
+      return Future<Map<String, dynamic>>.error(error);
+    }
+    return _awaitReply(id, method, completer);
+  }
+
+  /// 等回包：在途期间链路被判失活 ⇒ 以「心跳丢失」显式失败（不挂起、不静默）。
+  Future<Map<String, dynamic>> _awaitReply(
+    int id,
+    String method,
+    Completer<Map<String, dynamic>> completer,
+  ) async {
+    try {
+      return await liveness.guard(() => completer.future);
+    } on LivenessLostException catch (error) {
+      _pending.remove(id);
+      final McpLivenessException lost = _livenessError(method, cause: error);
+      // 回包可能永远不来；这里主动收口，避免留下一个悬空的 completer
+      if (!completer.isCompleted) completer.completeError(lost);
+      throw lost;
+    } finally {
+      _pending.remove(id);
+    }
+  }
+
+  /// 心跳丢失时的显式错误（文案含「心跳丢失」「链路失活」，上层与模型都能读懂）。
+  McpLivenessException _livenessError(String method, {Object? cause}) =>
+      McpLivenessException(
+        'MCP 服务 ${config.name} 的 $method 心跳丢失（链路失活）：'
+        '连续 ${liveness.missedCount} 次心跳未达（心跳间隔 '
+        '${LivenessTracker.formatDuration(liveness.interval)}，阈值 '
+        '${liveness.maxMisses} 次）；连接未关闭，心跳恢复后自动清除',
+        service: config.name,
+        method: method,
+        missedCount: liveness.missedCount,
+        interval: liveness.interval,
+        maxMisses: liveness.maxMisses,
+        cause: cause,
+      );
+
+  // ── 心跳探活（M9 规约 1.1：判据是"心跳丢了"，不是"总时长超了"）────────────
+
+  /// 启动心跳循环：每 [LivenessTracker.interval] 一拍——结算上一拍 + 发一次 ping。
+  ///
+  /// 间隔非正数 = 关闭心跳观测（测试 / 特殊场景）。
+  void _startHeartbeat() {
+    final Duration interval = liveness.interval;
+    if (interval <= Duration.zero) return;
+    _heartbeatTimer = Timer.periodic(interval, (Timer _) => _heartbeatTick());
+  }
+
+  void _heartbeatTick() {
+    if (_closed) {
+      _stopHeartbeat();
+      return;
+    }
+    // 一拍结算：这一拍内收到过任何协议消息 ⇒ 心跳在，清零；否则记一次丢失。
+    if (_beatSinceTick) {
+      _beatSinceTick = false;
+    } else {
+      final bool staleNow = liveness.recordMiss();
+      if (staleNow && !_wasStale) {
+        // 刚判死：记一次降级。在途请求由 guard 同步唤醒并以显式错误结束。
+        _degradeCount++;
+      }
+      _wasStale = staleNow;
+    }
+    _sendPing();
+  }
+
+  /// 主动探活：MCP 有 ping 语义就用它。
+  ///
+  /// 只发不等：ping 的回包（成功或 method-not-found 错误都算）会在 [_onLine] 里被
+  /// 记成一次心跳。这样"服务端不支持 ping"也不会把自己判死——只要它还在回别的消息。
+  void _sendPing() {
+    if (isClosed) return;
+    try {
+      _write(<String, dynamic>{
+        'jsonrpc': '2.0',
+        'id': ++_nextId,
+        'method': 'ping',
+        'params': const <String, dynamic>{},
+      });
+    } catch (_) {
+      // 写失败：进程已经不在了，退出码回调会负责收口
+    }
+  }
+
+  /// 记一次心跳：收到任意一条协议消息（成功响应 / 错误响应 / 服务端通知）都算。
+  void _beat() {
+    _beatSinceTick = true;
+    _wasStale = false;
+    liveness.recordBeat();
+  }
+
+  void _stopHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
   }
 
   void _notify(String method, Map<String, dynamic> params) {
@@ -274,9 +435,13 @@ class _StdioMcpClient implements McpClient {
     try {
       decoded = jsonDecode(text);
     } catch (_) {
-      return; // 非 JSON 输出（插件日志）：忽略，不打断协议
+      return; // 非 JSON 输出（插件日志）：忽略，不打断协议，也不算心跳
     }
     if (decoded is! Map<String, dynamic>) return;
+    // 任意一条合法 JSON-RPC 消息都是"链路还活着"的证据：请求的响应（成功或错误）、
+    // ping 的回包、服务端主动发的通知，一律记一次心跳——这正是"心跳还在就永不判死"
+    // 的依据（M9 规约 1.1）。
+    _beat();
     final Object? id = decoded['id'];
     if (id is! int) return; // 通知/日志：无需应答
     final Completer<Map<String, dynamic>>? completer = _pending.remove(id);
@@ -306,11 +471,14 @@ class _StdioMcpClient implements McpClient {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
+    _stopHeartbeat();
     _failPending('MCP 服务 ${config.name} 已关闭');
     try {
       await _process.stdin.close();
     } catch (_) {}
     try {
+      // 这 2s 是**关闭时的收尾窗口**（等礼貌退出的进程自己走），不是任务时长上限：
+      // 超时就杀进程兜底，避免关核心时被一个坏插件挂住。
       await _process.exitCode.timeout(const Duration(seconds: 2));
     } catch (_) {
       _process.kill();
@@ -324,6 +492,44 @@ class McpException implements Exception {
   final String message;
   @override
   String toString() => message;
+}
+
+/// MCP 链路**心跳丢失**（link degraded）时抛出的显式错误（M9 规约 1.1）。
+///
+/// 单独一个类型是为了让上层（工具层 / UI / 测试）能把"链路心跳丢了"与"这个工具自己
+/// 报错"分开：前者该提示用户检查 MCP 服务 / 等它恢复，后者该让模型改参数重试。
+/// 文案里同时含「心跳丢失」与「链路失活」，并且带上观测值（连续丢失次数、间隔、阈值）。
+class McpLivenessException extends McpException {
+  McpLivenessException(
+    super.message, {
+    this.service = '',
+    this.method = '',
+    this.missedCount = 0,
+    this.interval = LivenessTracker.defaultInterval,
+    this.maxMisses = LivenessTracker.defaultMaxMisses,
+    this.cause,
+  });
+
+  /// 出问题的 MCP 服务名。
+  final String service;
+
+  /// 触发这次失败的方法（如 tools/call）。
+  final String method;
+
+  /// 判死时的连续丢失次数。
+  final int missedCount;
+
+  /// 心跳间隔 I。
+  final Duration interval;
+
+  /// 允许连续丢失的次数 N。
+  final int maxMisses;
+
+  /// 原始失活错误（若来自通用台账）。
+  final Object? cause;
+
+  /// 显式标志：这是"链路失活"而不是工具自身失败。
+  bool get livenessLost => true;
 }
 
 /// 一个 MCP 服务（stdio 外接）的配置。
