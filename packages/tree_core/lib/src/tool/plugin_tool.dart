@@ -29,7 +29,24 @@ abstract final class PluginTool {
   static Future<ToolDefinitionRefresh> refreshToolDefinitions(
     PluginBus bus, {
     StationScope? scope,
-  }) => bus.refreshToolDefinitions(scope: scope);
+    StationScopeContext context = const StationScopeContext(),
+  }) => bus.refreshToolDefinitions(scope: scope, context: context);
+
+  /// **工具表刷新点**（同步）：取某个调用点（agent + 会话）的插件工具声明。
+  ///
+  /// 内部走 [PluginBus.toolTable]：**缓存 + 失效点**——工具表脏了才在后台补一次
+  /// 收集站触发，本次仍返回手上这份，因此「每次工具调用都全量收集」不会发生。
+  static List<ToolSpec> dynamicSpecsFor(
+    PluginBus bus, {
+    required String agentId,
+    required String sessionId,
+  }) {
+    final StationScope scope = bus.runtimeScopeFor(
+      agentId: agentId,
+      sessionId: sessionId,
+    );
+    return dynamicSpecs(bus, scope: scope);
+  }
 
   static ToolSpec spec() => ToolSpec(
     name: name,
@@ -62,8 +79,14 @@ abstract final class PluginTool {
   /// 已就绪插件工具的原生声明（直接注入模型工具列表）。
   ///
   /// 表内容来自动态工具表（收集站收集后注册）；这里只做形状转换，不重新收集。
-  static List<ToolSpec> dynamicSpecs(PluginBus bus) => <ToolSpec>[
-    for (final ({String pluginId, PluginToolInfo tool}) entry in bus.allTools())
+  /// [scope] 非空时按站点四元组过滤（跨 team / 跨模式的插件工具不进这张表）。
+  static List<ToolSpec> dynamicSpecs(
+    PluginBus bus, {
+    StationScope? scope,
+  }) => <ToolSpec>[
+    for (final ({String pluginId, PluginToolInfo tool}) entry in bus.toolTable(
+      scope: scope,
+    ))
       ToolSpec(
         name: namespacedPluginTool(entry.pluginId, entry.tool.name),
         description:
@@ -92,11 +115,23 @@ abstract final class PluginTool {
     switch (action) {
       case 'help':
         await bus.start();
-        // 工具表刷新处：先触发收集站，再列当前注册结果（未响应者会显式列出）
-        final ToolDefinitionRefresh refresh = await bus
-            .refreshToolDefinitions();
+        // 工具表刷新处：按**调用点四元组**触发一次收集，再列当前注册结果
+        // （未响应者会显式列出；跨 team / 跨模式的插件工具不进这张表）
+        final StationScope callScope = bus.runtimeScopeFor(
+          agentId: invocation.agentId,
+          sessionId: invocation.sessionId,
+        );
+        final ToolDefinitionRefresh refresh = await bus.refreshToolDefinitions(
+          scope: callScope.teamId.isEmpty ? null : callScope,
+          context: StationScopeContext(
+            teamId: callScope.teamId,
+            agentId: callScope.agentId,
+            sessionId: callScope.sessionId,
+            modeKey: callScope.modeKey,
+          ),
+        );
         final List<({String pluginId, PluginToolInfo tool})> tools = bus
-            .allTools();
+            .toolTable(scope: callScope);
         if (tools.isEmpty) {
           final List<String> configured = bus
               .configs()

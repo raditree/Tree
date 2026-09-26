@@ -214,46 +214,128 @@ void main() {
     expect(delivered.single['agentId'], isNot(grand));
   });
 
-  test('wait_for：never_started / completed / timed_out 三种结局', () async {
-    final String idleMember = member(name: '没开工', approved: true);
-    final Map<String, dynamic> never = await dispatcher.run(
-      top.id,
-      <String, dynamic>{'action': 'wait_for', 'target_member_ids': idleMember},
-    );
-    expect(
-      (never['members'] as List<dynamic>).single['outcome'],
-      'never_started',
-    );
-    expect(never['timed_out'], isFalse);
+  test(
+    'wait_for：completed / never_started；静态时长上限已取消（timeout 参数不再生效）',
+    () async {
+      final String idleMember = member(name: '没开工', approved: true);
+      final Map<String, dynamic> never = await dispatcher.run(
+        top.id,
+        <String, dynamic>{
+          'action': 'wait_for',
+          'target_member_ids': idleMember,
+        },
+      );
+      expect(
+        (never['members'] as List<dynamic>).single['outcome'],
+        'never_started',
+      );
+      expect(never['partial'], isTrue, reason: '未接单也算未响应者（部分结果）');
+      expect(never['liveness_lost'], isFalse, reason: '未接单不是心跳丢失');
+      expect(
+        (never['unresponsive'] as List<dynamic>).single['kind'],
+        'not_started',
+      );
+      expect(
+        never.containsKey('timed_out'),
+        isFalse,
+        reason: 'M9 §1.1：静态时长判据已取消，不再有 timed_out',
+      );
 
-    final String worker = member(name: '干活的', approved: true);
-    working.add(worker);
+      final String worker = member(name: '干活的', approved: true);
+      working.add(worker);
+      // 老参数 timeout=1 传进来也**不再有时长上限**：等成员真的做完才返回
+      final Future<Map<String, dynamic>> pending = dispatcher.run(
+        top.id,
+        <String, dynamic>{
+          'action': 'wait_for',
+          'target_member_ids': worker,
+          'timeout': 1,
+        },
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 1200));
+      working.remove(worker);
+      final Map<String, dynamic> done = await pending;
+      expect((done['members'] as List<dynamic>).single['outcome'], 'completed');
+      expect(done['partial'], isFalse);
+      expect(done['completed'], <String>['干活的']);
+      expect(
+        (done['waited'] as num).toDouble(),
+        greaterThan(1.0),
+        reason: '超过旧的 1s 夹取仍继续等（静态上限已取消）',
+      );
+    },
+  );
+
+  test('wait_for：成员心跳丢失 ⇒ 返回已收集的部分结果 + 未响应者清单（不整体失败）', () async {
+    final String finished = member(name: '干完的', approved: true);
+    final String lost = member(name: '失联的', approved: true);
+    working.addAll(<String>[finished, lost]);
+    bool lostJudged = false;
+    dispatcher.memberLiveness = (String agentId) => agentId == lost
+        ? (lostJudged
+              ? const MemberLivenessState.lost('成员进程已退出')
+              : const MemberLivenessState.alive(detail: '在途生成'))
+        : const MemberLivenessState.unknown();
+
     final Future<Map<String, dynamic>> pending = dispatcher.run(
       top.id,
       <String, dynamic>{
         'action': 'wait_for',
-        'target_member_ids': worker,
-        'timeout': 2,
+        'target_member_ids': '$finished,$lost',
       },
     );
-    await Future<void>.delayed(const Duration(milliseconds: 40));
-    working.remove(worker);
-    final Map<String, dynamic> done = await pending;
-    expect((done['members'] as List<dynamic>).single['outcome'], 'completed');
-    expect(done['timed_out'], isFalse);
+    await Future<void>.delayed(const Duration(milliseconds: 60));
+    working.remove(finished); // 干完的先收工
+    lostJudged = true; // 另一个成员心跳丢失
+    final Map<String, dynamic> result = await pending;
 
-    final String stuck = member(name: '卡住', approved: true);
-    working.add(stuck);
-    final Map<String, dynamic> timedOut = await dispatcher.run(
-      top.id,
-      <String, dynamic>{
-        'action': 'wait_for',
-        'target_member_ids': stuck,
-        'timeout': 1,
-      },
+    expect(result.containsKey('error'), isFalse, reason: '部分结果不是整体失败');
+    expect(result['partial'], isTrue);
+    expect(result['liveness_lost'], isTrue);
+    expect(result['completed'], <String>['干完的']);
+    final Map<String, dynamic> lostView =
+        (result['unresponsive'] as List<dynamic>).single
+            as Map<String, dynamic>;
+    expect(lostView['member_id'], lost);
+    expect(lostView['kind'], 'heartbeat_lost');
+    expect(lostView['reason'], contains('心跳丢失'));
+    expect(lostView['reason'], contains('成员进程已退出'));
+    final Map<String, dynamic> lostMember = (result['members'] as List<dynamic>)
+        .cast<Map<String, dynamic>>()
+        .firstWhere((Map<String, dynamic> m) => m['member_id'] == lost);
+    expect(lostMember['outcome'], 'unresponsive');
+    expect(lostMember['reason'], contains('心跳丢失'));
+    expect(result['hint'], contains('部分结果'));
+  });
+
+  test('wait_for：连接心跳丢失 ⇒ 立刻按部分结果收口（不整体失败）', () async {
+    final String worker = member(name: '干活的', approved: true);
+    working.add(worker);
+    final LivenessTracker link = LivenessTracker(
+      label: 'WS 链路',
+      interval: const Duration(seconds: 10),
+      maxMisses: 1,
     );
-    // timeout 最小 1 秒，测试里换成手动：把 pollInterval 调小后至少验证 hint 逻辑
-    expect(timedOut['timed_out'] || timedOut['members'] != null, isTrue);
+    dispatcher.linkLiveness = link;
+    link.recordMiss(); // 判链路失活
+
+    final Map<String, dynamic> result = await dispatcher.run(
+      top.id,
+      <String, dynamic>{'action': 'wait_for', 'target_member_ids': worker},
+    );
+    expect(result.containsKey('error'), isFalse, reason: '不整体失败');
+    expect(result['liveness_lost'], isTrue);
+    expect(result['partial'], isTrue);
+    final Map<String, dynamic> view =
+        (result['unresponsive'] as List<dynamic>).single
+            as Map<String, dynamic>;
+    expect(view['kind'], 'heartbeat_lost');
+    expect(view['reason'], contains('连接心跳丢失'));
+    expect(
+      (result['waited'] as num).toDouble(),
+      lessThan(1.0),
+      reason: '链路判死就收口，不空等',
+    );
   });
 
   test('list_teams / list_members 与 team 工具同一实现（结构一致）', () async {

@@ -44,6 +44,7 @@ export 'src/llm/sse_parser.dart';
 export 'src/files/file_service.dart';
 export 'src/mcp/mcp_client.dart';
 export 'src/mcp/mcp_service.dart';
+export 'src/plugin/execute_mounts.dart';
 export 'src/plugin/plugin_bus.dart';
 export 'src/plugin/plugin_host.dart';
 export 'src/plugin/plugin_tool_definition.dart';

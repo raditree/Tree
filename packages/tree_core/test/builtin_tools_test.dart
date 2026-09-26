@@ -254,7 +254,7 @@ void main() {
       expect(empty.content, contains('command 不能为空'));
     });
 
-    test('跑得比 timeout_seconds 久也不转后台、不终止（1.1：静态时长不再是判据）', () async {
+    test('跑得比旧的 timeout_seconds 上限久也不转后台、不终止（1.1：静态时长不再是判据）', () async {
       final TerminalHooks hooks = TerminalHooks();
       addTearDown(hooks.close);
       final String command = Platform.isWindows
@@ -279,12 +279,25 @@ void main() {
       );
     });
 
-    test('timeout_seconds 越界被夹取（1~1800）', () async {
+    test('schema 不再声明 timeout_seconds；老参数被忽略', () async {
+      final ToolSpec spec = BuiltinTools.specs().firstWhere(
+        (ToolSpec s) => s.name == 'terminal',
+      );
+      final Map<String, dynamic> properties =
+          spec.parameters['properties'] as Map<String, dynamic>;
+      expect(
+        properties.containsKey('timeout_seconds'),
+        isFalse,
+        reason: 'M9 1.1：没有静态时长上限，schema 不能留可限定时长的参数',
+      );
+      expect(spec.description, contains('没有静态超时'));
+      // 兼容：老调用方仍传该参数时直接忽略，不影响执行
       final ToolOutcome outcome = await run('terminal', <String, dynamic>{
         'command': 'echo quick',
         'timeout_seconds': 99999,
       });
       expect(outcome.isError, isFalse);
+      expect(outcome.content, contains('quick'));
     });
   });
 

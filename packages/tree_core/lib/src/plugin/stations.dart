@@ -117,6 +117,13 @@ class StationHub {
   /// 活性探针（由总线在接线时注入：pluginId → 心跳判活状态）。
   StationLivenessProbe? livenessProbe;
 
+  /// **执行站挂载钩子**（M9 Wave 3-I）：执行站实例被创建或从落盘恢复时调用。
+  ///
+  /// 「执行器只是执行站的一种挂载位置」——首命令集（fs.* / terminal.exec /
+  /// agent.* / ui.push）的挂载位置由核心在这里接上；不接的话命令会以
+  /// 「暂无挂载位置」显式失败（不静默）。
+  void Function(ExecuteStation station)? onExecuteStation;
+
   /// 探测节拍（等待回包时轮询订阅者心跳的间隔）。
   final Duration livenessProbeInterval;
 
@@ -286,6 +293,17 @@ class StationHub {
     return removed;
   }
 
+  /// **把挂载位置接到全部执行站**（含落盘恢复的与将来新建的）。
+  ///
+  /// 幂等：挂载位置按 mountId 覆盖，重复接线不会叠加。
+  void mountExecuteStations(void Function(ExecuteStation station) mounter) {
+    load();
+    onExecuteStation = mounter;
+    for (final StationInstance station in _stations.values) {
+      if (station is ExecuteStation) mounter(station);
+    }
+  }
+
   /// 显式退订某站点上的某插件；返回移除条数。
   int unsubscribe(String stationId, String pluginId) {
     load();
@@ -351,7 +369,10 @@ class StationHub {
     station.livenessProbeInterval = livenessProbeInterval;
     station.livenessWindow = livenessWindow;
     station.onMutated = save;
-    if (station is ExecuteStation) _ensureUiPushMount(station);
+    if (station is ExecuteStation) {
+      _ensureUiPushMount(station);
+      onExecuteStation?.call(station);
+    }
   }
 
   /// 内置 ui.push 挂载位置：**复用 4.1 的 card 槽位帧**（不发明新帧）。

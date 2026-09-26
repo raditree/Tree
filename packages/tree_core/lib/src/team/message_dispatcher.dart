@@ -18,6 +18,44 @@ typedef TeamDelivery = Future<void> Function({
   String senderName,
 });
 
+/// 成员活性状态（[TeamMessageDispatcher.memberLiveness] 的返回形状）。
+///
+/// 与站点的 `StationLivenessState` 同构：`unknown` = 没有活性信息（**不判死**），
+/// `lost` = 有明确证据说明该成员已经不在工作（心跳丢失），`wait_for` 据此收口。
+class MemberLivenessState {
+  const MemberLivenessState({
+    required this.known,
+    required this.alive,
+    this.detail = '',
+  });
+
+  /// 无活性信息（不判死；退回启动宽限判据）。
+  const MemberLivenessState.unknown()
+    : known = false,
+      alive = false,
+      detail = '';
+
+  /// 有明确证据说明成员在工作（心跳在）。
+  const MemberLivenessState.alive({this.detail = ''})
+    : known = true,
+      alive = true;
+
+  /// 有明确证据说明成员已失联（心跳丢失）；[detail] 是可读原因。
+  const MemberLivenessState.lost(this.detail) : known = true, alive = false;
+
+  /// 是否有活性信息。
+  final bool known;
+
+  /// 是否活着。
+  final bool alive;
+
+  /// 可读说明（回报给模型 / 日志）。
+  final String detail;
+}
+
+/// 成员活性探针：按 agent id 查询活性结论（核心接线）。
+typedef MemberLivenessProbe = MemberLivenessState Function(String agentId);
+
 /// 单目标投递结果。
 class DeliveryResult {
   const DeliveryResult({
@@ -133,6 +171,13 @@ class TeamMessageDispatcher {
   final String Function(String agentId)? activityLogPathOf;
 
   final void Function(String message)? log;
+
+  /// 成员活性探针（M9 §1.1 的成员投影）。
+  ///
+  /// `wait_for` 用它判「目标成员是不是已经失联」：核心接线后可以给出
+  /// 「成员已不存在 / 已停止」这类**明确结论**；返回 [MemberLivenessState.unknown]
+  /// 或未接线时退回「启动宽限 + 观测到 working」的既有判据。
+  MemberLivenessProbe? memberLiveness;
 
   /// 连接活性台账（WS 发送链路）。
   ///
@@ -386,6 +431,17 @@ class TeamMessageDispatcher {
   ///
   /// 为什么强调"先 working"：否则"消息还没被处理"会被误判成"已经做完了"，
   /// 这是最危险的假完成。参考实现用同一规则（START_GRACE + 只认 working→idle）。
+  ///
+  /// **M9 §1.1：等待没有静态时长上限**（原来的 `timeout` 参数与 300/600 夹取已
+  /// 删除），判据换成**成员活性**：
+  /// 1. 连接心跳丢失（[linkLiveness] 判失活）⇒ 未完成的目标全部记「连接心跳丢失」
+  ///    并立刻收口——链路已经没意义，再等就是空等；
+  /// 2. 注入的 [memberLiveness] 探针给出失活结论 ⇒ 该成员记「心跳丢失」，其余继续等；
+  /// 3. 探针无信息时用**启动宽限**判「未接单」（[startGrace] 内没观测到 working）；
+  /// 4. 观测到 working 之后只要心跳还在就**一直等**（跑多久都不因时间失败）。
+  ///
+  /// 收口时返回**已收集的部分结果 + 未响应者清单**（`unresponsive`），不整体失败：
+  /// 干完的照旧 completed，未响应的写明原因（心跳丢失 / 未接单）并附 hint。
   Future<Map<String, dynamic>> waitFor(
     String agentId,
     Map<String, dynamic> args,
@@ -414,68 +470,125 @@ class TeamMessageDispatcher {
         'hint': '请用 list_members 核对成员 ID/名称（仅支持等待本团队成员）',
       };
     }
-    final Duration timeout = _timeout(args);
     final DateTime started = DateTime.now();
     final Set<String> seenWorking = <String>{};
-    bool timedOut = false;
-    while (true) {
-      for (final CoreAgent member in members) {
+    // 未响应者：memberId → 可读原因；心跳丢失者另记一个集合（outcome 不同）
+    final Map<String, String> unresponsive = <String, String>{};
+    final Set<String> heartbeatLost = <String>{};
+
+    bool completed(CoreAgent member) =>
+        seenWorking.contains(member.id) &&
+        teams.workStatus(member.id) != 'working';
+    List<CoreAgent> pending() => members
+        .where(
+          (CoreAgent m) => !completed(m) && !unresponsive.containsKey(m.id),
+        )
+        .toList(growable: false);
+
+    while (pending().isNotEmpty) {
+      for (final CoreAgent member in pending()) {
         if (teams.workStatus(member.id) == 'working') {
           seenWorking.add(member.id);
         }
       }
-      final bool allDone = members.every(
-        (CoreAgent m) =>
-            seenWorking.contains(m.id) && teams.workStatus(m.id) != 'working',
-      );
-      if (allDone) break;
-      final Duration elapsed = DateTime.now().difference(started);
-      if (elapsed >= timeout) {
-        timedOut = true;
+      List<CoreAgent> waiting = pending();
+      if (waiting.isEmpty) break;
+      // ① 连接心跳丢失（M9 §1.1）：未完成的目标全部按「未响应」收口，返回部分结果
+      final LivenessTracker? link = linkLiveness;
+      if (link != null && link.isStale) {
+        for (final CoreAgent member in waiting) {
+          unresponsive[member.id] = '连接心跳丢失（${link.staleMessage}）';
+          heartbeatLost.add(member.id);
+        }
         break;
       }
-      // 宽限期内没等到 working：目标可能没接单或瞬间做完，不再空等
-      final bool graceOver = elapsed >= startGrace;
-      if (graceOver && seenWorking.isEmpty) break;
+      // ② 成员活性探针：有明确失活结论才判「心跳丢失」（unknown 不判死）
+      final MemberLivenessProbe? probe = memberLiveness;
+      if (probe != null) {
+        for (final CoreAgent member in waiting) {
+          final MemberLivenessState state = probe(member.id);
+          if (state.known && !state.alive) {
+            unresponsive[member.id] = '心跳丢失：${state.detail}';
+            heartbeatLost.add(member.id);
+          }
+        }
+        waiting = pending();
+        if (waiting.isEmpty) break;
+      }
+      // ③ 启动宽限：宽限内没观测到 working ⇒ 未接单（既有语义，不是整体失败）
+      if (DateTime.now().difference(started) >= startGrace) {
+        for (final CoreAgent member in waiting) {
+          if (seenWorking.contains(member.id)) continue; // 干过活的继续等
+          unresponsive[member.id] =
+              '启动宽限（${startGrace.inMilliseconds}ms）内未观测到工作状态'
+              '（未接单或已瞬间完成）';
+        }
+        // 连一个开工的都没有 ⇒ 不空等（既有语义）
+        if (seenWorking.isEmpty) break;
+      }
+      // ④ 没有静态时长上限：心跳还在就一直等（plan §1.1）
       await Future<void>.delayed(pollInterval);
     }
+
     final List<Map<String, dynamic>> views = <Map<String, dynamic>>[];
+    final List<Map<String, dynamic>> lostViews = <Map<String, dynamic>>[];
     final List<String> neverStarted = <String>[];
-    final List<String> stillWorking = <String>[];
+    final List<String> completedNames = <String>[];
     for (final CoreAgent member in members) {
       final bool working = teams.workStatus(member.id) == 'working';
-      final String outcome = seenWorking.contains(member.id) && !working
-          ? 'completed'
-          : (working
-                ? 'working'
-                : (seenWorking.contains(member.id)
-                      ? 'working'
-                      : 'never_started'));
+      final String? reason = unresponsive[member.id];
+      final bool lost = heartbeatLost.contains(member.id);
+      final String outcome = reason != null
+          ? (lost ? 'unresponsive' : 'never_started')
+          : (working ? 'working' : 'completed');
       if (outcome == 'never_started') neverStarted.add(member.name);
-      if (working) stillWorking.add(member.name);
+      if (outcome == 'completed') completedNames.add(member.name);
+      if (reason != null) {
+        lostViews.add(<String, dynamic>{
+          'member_id': member.id,
+          'name': member.name,
+          'work_status': teams.workStatus(member.id),
+          'kind': lost ? 'heartbeat_lost' : 'not_started',
+          'reason': reason,
+        });
+      }
       views.add(<String, dynamic>{
         'member_id': member.id,
         'name': member.name,
         'work_status': teams.workStatus(member.id),
         'outcome': outcome,
+        'reason': ?reason,
         'log_path': memberLogPath(member.id),
       });
     }
+    final List<Map<String, dynamic>> heartbeatLostViews = lostViews
+        .where((Map<String, dynamic> v) => v['kind'] == 'heartbeat_lost')
+        .toList(growable: false);
+    final List<String> hints = <String>[];
+    if (neverStarted.isNotEmpty) {
+      hints.add(
+        '以下成员在启动宽限内未观测到工作状态（可能未接单或已瞬间完成）：'
+        '${neverStarted.join('、')}。请用 send_message 确认，或直接 read 其活动日志核实，'
+        '不要直接假定任务完成',
+      );
+    }
+    if (heartbeatLostViews.isNotEmpty) {
+      hints.add(
+        '以下成员/链路心跳丢失（已按**部分结果**返回，未整体失败）：'
+        '${heartbeatLostViews.map((Map<String, dynamic> v) => '${v['name']}（${v['reason']}）').join('、')}。'
+        '链路或成员恢复后可以再次 wait_for，或 read 其活动日志核实进度',
+      );
+    }
     return <String, dynamic>{
       'members': views,
-      'timed_out': timedOut,
-      'waited': DateTime.now().difference(started).inMilliseconds / 1000,
       'total': members.length,
-      if (neverStarted.isNotEmpty)
-        'hint':
-            '以下成员在启动宽限内未观测到工作状态（可能未接单或已瞬间完成）：'
-            '${neverStarted.join('、')}。请用 send_message 确认，或直接 read 其活动日志核实，'
-            '不要直接假定任务完成',
-      if (timedOut && stillWorking.isNotEmpty)
-        'hint':
-            '等待超时，以下成员仍在工作：${stillWorking.join('、')}。'
-            '你可以结束本轮（无需继续 wait_for 轮询）：对方完成工作后**若主动回发消息**才会唤醒你，'
-            '否则请稍后 read 其活动日志/产出核实，或自行 send_message 追问',
+      'completed': completedNames,
+      // **部分结果**：未响应者显式列出（心跳丢失 / 未接单），不静默、不整体失败
+      'unresponsive': lostViews,
+      'partial': lostViews.isNotEmpty,
+      'liveness_lost': heartbeatLostViews.isNotEmpty,
+      'waited': DateTime.now().difference(started).inMilliseconds / 1000,
+      if (hints.isNotEmpty) 'hint': hints.join('\n'),
       'generated_at': _timestamp(),
     };
   }
@@ -771,15 +884,6 @@ class TeamMessageDispatcher {
   String _sessionOf(Map<String, dynamic> args) {
     final String session = (args['session_id'] ?? '').toString().trim();
     return session.isEmpty ? TreeStore.defaultSessionId : session;
-  }
-
-  Duration _timeout(Map<String, dynamic> args) {
-    final Object? raw = args['timeout'];
-    final int seconds = raw is num
-        ? raw.toInt()
-        : int.tryParse(raw?.toString() ?? '') ?? 300;
-    final int clamped = seconds.clamp(1, 600);
-    return Duration(seconds: clamped);
   }
 
   static String _unknownHint(List<Map<String, dynamic>> unknown) {

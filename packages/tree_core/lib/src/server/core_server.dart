@@ -16,7 +16,9 @@ import '../agent/workspace_prompt.dart';
 import '../files/file_service.dart';
 import '../mcp/mcp_client.dart';
 import '../mcp/mcp_service.dart';
+import '../plugin/execute_mounts.dart';
 import '../plugin/plugin_bus.dart';
+import '../plugin/station_scope.dart';
 import '../settings/core_settings.dart';
 import '../settings/ssh_config.dart';
 import '../spec/spec_service.dart';
@@ -121,6 +123,10 @@ class CoreServer {
 
   /// 插件总线（M6b）；为 null 时快照返回 `enabled: false` 空集。
   final PluginBus? pluginBus;
+
+  /// 执行站首命令集的**挂载位置**（M9 Wave 3-I）；为 null = 未接线（命令会显式报
+  /// 「暂无挂载位置」而不是静默成功）。
+  ExecuteStationMounts? _stationMounts;
 
   /// 工作空间文件服务（M7d）；为 null 时文件路由返回 501。
   final FileService? fileService;
@@ -292,6 +298,8 @@ class CoreServer {
     };
     // 调用方自带台账时不覆盖（??=），只补空缺
     messageDispatcher?.linkLiveness ??= hub.linkLiveness;
+    // M9 Wave 3-I：执行站挂载位置 + 运行期四元组（站点隔离的运行期依据）
+    server._wirePluginStations();
     server._registerRoutes();
     server._registerStubRoutes();
     if (enableHeartbeat) {
@@ -310,6 +318,8 @@ class CoreServer {
     reassembler.clear();
     await hub.closeAll();
     await mcpService?.close();
+    // 执行站挂载位置自建的后台任务管理器：随服务一起释放
+    await _stationMounts?.close();
     await pluginBus?.close();
     // 总结器可能持有自己的 HTTP 连接池（与引擎的池分开）：随服务一起释放
     await compaction?.dispose();
@@ -321,6 +331,159 @@ class CoreServer {
       specIndexProvider = null;
     }
     await _http.close(force: force);
+  }
+
+  // ── 站点接线（M9 Wave 3-I） ───────────────────────────────────────────
+
+  /// 执行站首命令集的**挂载位置** + 插件总线需要的**运行期四元组**。
+  ///
+  /// 站点体系的两条硬要求都在这里落地：
+  /// 1. 「执行器只是执行站的一种挂载位置」——八条命令（fs.* / terminal.exec /
+  ///    agent.*）接到核心的既有实现上，不再出现「暂无挂载位置」；
+  /// 2. plan §1.2 的隔离四元组在**运行期**解析：team 取 agent 的归属、mode_key 取
+  ///    agent 的工作空间模式（local | ssh），因此 SSH 团队的命令不会打到本地工作空间。
+  ///
+  /// 未接线（pluginBus 为空）时什么都不做；工具层与 REST 路径不受影响。
+  void _wirePluginStations() {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) return;
+    // 调用点上下文：team 取 agent 的团队归属（agent / session 由调用点给）
+    bus.callSiteContext ??= (String agentId, String sessionId) {
+      final CoreAgent? agent = store.agent(agentId);
+      return StationScopeContext(
+        teamId: agent?.teamId ?? '',
+        agentId: agentId,
+        sessionId: sessionId,
+      );
+    };
+    // mode_key 的运行期来源：agent 有没有配 SSH 决定它属于哪个工作面
+    bus.agentModeKeyResolver ??= (String agentId) =>
+        store.agent(agentId)?.sshConfig != null
+        ? StationModeKey.ssh
+        : StationModeKey.local;
+    // wait_for 的成员活性探针（M9 §1.1）：成员不存在 = 明确失联；在途生成 = 明确
+    // 活着；其余（刚派活尚未接单 / 已干完）**不判死**，交给启动宽限判据。
+    messageDispatcher?.memberLiveness ??= (String agentId) {
+      final CoreAgent? member = store.agent(agentId);
+      if (member == null) {
+        return const MemberLivenessState.lost('成员已不存在（可能已被移除）');
+      }
+      if (conversation.isRunning(agentId)) {
+        return const MemberLivenessState.alive(detail: '成员在途生成');
+      }
+      return const MemberLivenessState.unknown();
+    };
+    final ExecuteStationMounts mounts = ExecuteStationMounts.forStore(
+      store: store,
+      // 工作空间 IO = 工具层同一份解析（local / SSH 都走既有抽象）
+      ioFor: (String agentId) async {
+        final Future<WorkspaceIO?> Function(String agentId)? resolver =
+            specIoFor;
+        if (resolver == null) return null;
+        return resolver(agentId);
+      },
+      onHookFinished: (String agentId, String sessionId, String notice) {
+        unawaited(
+          conversation
+              .wake(agentId: agentId, sessionId: sessionId, notice: notice)
+              .catchError((Object error) {
+                errorLog?.call('terminal hook 唤醒失败（$agentId）：$error');
+              }),
+        );
+      },
+      messageSender: _stationDeliverMessage,
+      agentStopper: (String agentId, {required bool cascade}) async =>
+          _stopAgentTree(agentId, cascade: cascade),
+      compactor: _stationCompact,
+      log: (String message) => errorLog?.call('[core:station] $message'),
+    );
+    _stationMounts = mounts;
+    // 运行期四元组就绪 = 工具表的失效点：下次刷新点按**真实工作面**（local/ssh）
+    // 重新收集一次（CLI 里 plugins.start() 早于本接线，那次用的是声明里的 mode）。
+    bus.invalidateToolTable(reason: '站点接线完成（运行期四元组就绪）');
+    final String? mountError = bus.mountExecuteStations(mounts);
+    if (mountError != null) {
+      errorLog?.call('执行站挂载位置接线不完整：$mountError');
+    }
+  }
+
+  /// 执行站 `agent.message`：插件 → 目标 agent 的会话。
+  ///
+  /// 首选团队派发（过审核闸门、写活动日志、链路失活时登记补发）；没有派发服务时
+  /// 退回会话投递（把来源插件写在发送者位上，模型知道是谁发的）。
+  Future<Map<String, dynamic>> _stationDeliverMessage({
+    required String agentId,
+    required String sessionId,
+    required String content,
+    String sourcePluginId = '',
+  }) async {
+    final CoreAgent? target = store.agent(agentId);
+    if (target == null) {
+      return <String, dynamic>{'error': '目标 agent 不存在：$agentId'};
+    }
+    final TeamMessageDispatcher? dispatcher = messageDispatcher;
+    if (dispatcher != null) {
+      // 插件不是团队成员：走用户侧入口（有审核闸门，且不会 auto_reply 回传给任何人）
+      return dispatcher.sendFromUser(
+        targetId: agentId,
+        content: content,
+        sessionId: sessionId,
+      );
+    }
+    final String sender = sourcePluginId.isEmpty ? '插件' : '插件 $sourcePluginId';
+    try {
+      await conversation.deliver(
+        agentId: agentId,
+        sessionId: sessionId,
+        content: content,
+        senderName: sender,
+      );
+    } catch (error) {
+      return <String, dynamic>{'error': '会话投递失败：$error'};
+    }
+    return <String, dynamic>{
+      'success': true,
+      'detail': <String, dynamic>{
+        'target': agentId,
+        'session_id': sessionId,
+        'sender': sender,
+      },
+    };
+  }
+
+  /// 执行站 `agent.compact`：手动压缩（与 REST 的 compact 同一服务，同样拒绝在途
+  /// 生成期间的压缩——压缩会改写上下文，与生成并发读写不安全）。
+  Future<Map<String, dynamic>> _stationCompact(
+    String agentId,
+    String sessionId,
+  ) async {
+    final CompactionService? service = compaction;
+    if (service == null) {
+      return <String, dynamic>{'error': '上下文压缩尚未接入'};
+    }
+    if (conversation.isRunning(agentId)) {
+      return <String, dynamic>{
+        'error': 'agent 正在生成：压缩会改写上下文，与生成并发读写不安全',
+        'reason': 'agent_working',
+      };
+    }
+    _broadcastCompactStatus(agentId, sessionId, 'compacting');
+    try {
+      final CompactionResult result = await service.compact(agentId, sessionId);
+      if (result.error.isNotEmpty) {
+        return <String, dynamic>{
+          'error': result.error,
+          'status': result.status,
+        };
+      }
+      return result.toJson();
+    } finally {
+      _broadcastCompactStatus(
+        agentId,
+        sessionId,
+        conversation.isRunning(agentId) ? 'working' : 'idle',
+      );
+    }
   }
 
   // ── 请求分发 ─────────────────────────────────────────────────────────
@@ -468,17 +631,19 @@ class CoreServer {
   /// slot_key / action_id / payload 原样透传，插件收到后自行响应（通常是再推一帧
   /// plugin_ui_update 刷新槽位）。插件不在线时**显式回一帧 error 并记日志**，
   /// 不静默丢弃——否则用户点了按钮会「没有任何反应」。
-  void _handlePluginUiAction(WsConnection connection, Map<String, dynamic> frame) {
+  void _handlePluginUiAction(
+    WsConnection connection,
+    Map<String, dynamic> frame,
+  ) {
     final Map<String, dynamic> data =
-        (frame['data'] as Map<String, dynamic>?)?.cast<String, dynamic>() ?? frame;
+        (frame['data'] as Map<String, dynamic>?)?.cast<String, dynamic>() ??
+        frame;
     final String pluginId = (data['plugin_id'] ?? '').toString().trim();
     final PluginBus? bus = pluginBus;
     if (pluginId.isEmpty || bus == null) {
       connection.send(<String, dynamic>{
         'type': WsOutboundType.error,
-        'data': <String, dynamic>{
-          'message': '插件交互未送达：缺少 plugin_id 或插件总线未启用',
-        },
+        'data': <String, dynamic>{'message': '插件交互未送达：缺少 plugin_id 或插件总线未启用'},
       });
       return;
     }
@@ -496,9 +661,7 @@ class CoreServer {
       });
       return;
     }
-    errorLog?.call(
-      '插件交互未送达：插件 $pluginId 未运行（slot_key=${data['slot_key']}）',
-    );
+    errorLog?.call('插件交互未送达：插件 $pluginId 未运行（slot_key=${data['slot_key']}）');
     connection.send(<String, dynamic>{
       'type': WsOutboundType.error,
       'data': <String, dynamic>{'message': '插件 $pluginId 未运行，交互未送达'},
@@ -920,6 +1083,47 @@ class CoreServer {
     await writeJson(request, 200, result);
   }
 
+  /// 停止一个 agent 的当前轮（[cascade] = 连同下级子树）：**既有停止路径的唯一实现**。
+  ///
+  /// WS `stop` 帧与执行站 `agent.stop` 命令共用它，因此两条路的语义严格一致：
+  /// 先 `cascadeIds` 展开子树，再逐个 `cancelAgent`（取消在途生成 + 作废排队任务）；
+  /// **没有在途任务**的成员补推一条 `idle`，否则前端/成员窗口的「工作中」标识会
+  /// 一直亮着（既有行为）。返回可读结论供调用方回报。
+  Map<String, dynamic> _stopAgentTree(
+    String agentId, {
+    bool cascade = true,
+    String sessionId = '',
+  }) {
+    final List<String> ids = cascade
+        ? (teamService?.cascadeIds(agentId) ?? <String>[agentId])
+        : <String>[agentId];
+    final List<String> cancelled = <String>[];
+    final List<String> idle = <String>[];
+    for (final String id in ids) {
+      final bool running = conversation.cancelAgent(id);
+      if (running) {
+        cancelled.add(id);
+        continue;
+      }
+      idle.add(id);
+      hub.broadcast(<String, dynamic>{
+        'type': WsOutboundType.agentStatus,
+        'data': <String, dynamic>{
+          'agent_id': id,
+          'status': 'idle',
+          if (sessionId.isNotEmpty) 'session_id': sessionId,
+        },
+      });
+    }
+    return <String, dynamic>{
+      'cascade': cascade,
+      'cascade_ids': ids,
+      'cancelled': cancelled,
+      'idle': idle,
+      'any_running': cancelled.isNotEmpty,
+    };
+  }
+
   /// 处理 `stop`：**级联**语义（参考实现 `_stop_agent_tree`）。
   ///
   /// `agent_id` 是 TOP 时停整棵团队树：先自身、再成员。每个被取消的 agent 都作废
@@ -943,23 +1147,12 @@ class CoreServer {
       });
       return;
     }
-    final List<String> ids =
-        teamService?.cascadeIds(agentId) ?? <String>[agentId];
-    bool anyRunning = false;
-    for (final String id in ids) {
-      final bool running = conversation.cancelAgent(id);
-      anyRunning = anyRunning || running;
-      if (!running) {
-        hub.broadcast(<String, dynamic>{
-          'type': WsOutboundType.agentStatus,
-          'data': <String, dynamic>{
-            'agent_id': id,
-            'status': 'idle',
-            if (sessionId.isNotEmpty) 'session_id': sessionId,
-          },
-        });
-      }
-    }
+    final Map<String, dynamic> summary = _stopAgentTree(
+      agentId,
+      sessionId: sessionId,
+    );
+    final bool anyRunning = summary['any_running'] == true;
+    final List<dynamic> ids = summary['cascade_ids'] as List<dynamic>;
     if (!anyRunning && ids.length == 1) {
       connection.send(<String, dynamic>{
         'type': WsOutboundType.error,

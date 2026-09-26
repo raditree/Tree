@@ -20,7 +20,9 @@ abstract final class MessageTool {
         '[团队协作-通信域] 向成员派活、点对点沟通、直属广播、等待交付。\n'
         'send_message：给成员/直属 leader/其他 TOP 发消息（写明工作内容、预期产出与'
         '完成后回复要求）；broadcast：给全部直属成员广播；wait_for：等待成员完成'
-        '当前工作；list_members/list_teams：与 team 工具同一实现。\n'
+        '当前工作（**没有静态时长上限**：活着的成员一直等，只有心跳丢失 / 未响应的'
+        '成员才会被列进 unresponsive 并返回部分结果）；list_members/list_teams：'
+        '与 team 工具同一实现。\n'
         '系统不会替你回传任何总结：需要对方知道结果，必须让对方自行 send_message 回发；'
         '禁止仅为确认收到/寒暄/复述而互发。\n'
         'files 为本 agent 工作空间内的相对路径，会复制到接收方 .input/<日期>/'
@@ -59,10 +61,8 @@ abstract final class MessageTool {
           'type': 'string',
           'description': 'files 的目标目录（默认 .input/<日期>）',
         },
-        'timeout': <String, dynamic>{
-          'type': 'integer',
-          'description': 'wait_for 最长等待秒数（默认 300，上限 600）',
-        },
+        // 这里**没有** timeout：M9 §1.1 起等待不再有静态时长上限（判据换成成员
+        // 活性：心跳丢失 / 未响应才收口，并把未响应者显式列出来）。
         'session_id': <String, dynamic>{
           'type': 'string',
           'description': '接收方归集的会话 id（默认 session_default）',

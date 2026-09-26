@@ -125,7 +125,13 @@ class WorkspaceToolRunner implements ToolRunner {
     ],
     if (pluginBus != null) ...<ToolSpec>[
       PluginTool.spec(),
-      ...PluginTool.dynamicSpecs(pluginBus!),
+      // **工具表刷新处**（模型每轮生成前都走这里）：按调用点四元组取插件工具，
+      // 内部是「缓存 + 失效点」——只有插件上线/下线/重启后才后台补一次收集。
+      ...PluginTool.dynamicSpecsFor(
+        pluginBus!,
+        agentId: agentId,
+        sessionId: sessionId,
+      ),
     ],
   ];
 

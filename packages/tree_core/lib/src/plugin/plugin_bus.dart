@@ -3,6 +3,7 @@ import 'dart:async';
 import '../store/atomic_file.dart';
 import '../store/yaml_codec.dart';
 import '../util/liveness.dart';
+import 'execute_mounts.dart';
 import 'plugin_host.dart';
 import 'plugin_tool_definition.dart';
 import 'station_instance.dart';
@@ -10,6 +11,14 @@ import 'station_runtime.dart';
 import 'station_scope.dart';
 import 'station_store.dart';
 import 'stations.dart';
+
+/// 站点四元组的**运行期**解析器：插件配置 + 调用点上下文 → 四元组。
+///
+/// 见 [PluginBus.stationScopeResolver]（主控可在核心启动后注入）。
+typedef RuntimeStationScopeResolver = StationScope Function(
+  PluginConfig config,
+  StationScopeContext context,
+);
 
 /// 插件总线（M6b + M9 Wave 3-F）：配置、实例生命周期、事件分发、工具聚合、
 /// **站点体系**与**心跳判活**。
@@ -42,6 +51,9 @@ class PluginBus {
     this.broadcast,
     StationHub? stations,
     this.stationScopeResolver,
+    this.agentModeKeyResolver,
+    this.callSiteContext,
+    this.toolTableRefreshHook,
   }) : stations =
            stations ??
            StationHub(
@@ -79,11 +91,29 @@ class PluginBus {
   /// 站点中枢（四站、订阅、落盘；落点 = <数据根>/config/stations.yaml）。
   final StationHub stations;
 
-  /// 插件配置 → 站点四元组的**接线点**（默认直接读配置里的 scope）。
+  /// 插件配置 → 站点四元组的**运行期接线点**（M9 Wave 3-I）。
   ///
-  /// 主控接线后这里可以按运行期上下文（当前 team / local-ssh 模式）解析；
-  /// 未接线时按 plugins.yaml 的 scope 字段（mode_key 缺失 = local）。
-  final StationScope Function(PluginConfig config)? stationScopeResolver;
+  /// 入参 = 插件配置 + [StationScopeContext]（调用点上下文：当前 team / agent /
+  /// session）。未接线时走默认解析：team 只认插件自己的声明（**不**用调用点团队替
+  /// 插件认领归属，否则无归属插件会被跨 team 放大），agent / session 取声明（更细）
+  /// 或调用点上下文，mode_key 由 [agentModeKeyResolver] 从 agent 的工作空间模式解析。
+  RuntimeStationScopeResolver? stationScopeResolver;
+
+  /// agent → **工作空间模式**（local | ssh）：mode_key 的运行期来源（plan §1.2）。
+  ///
+  /// 核心侧注入 store.agent(id)?.sshConfig != null ? ssh : local；未接线时退回
+  /// 插件声明里的 mode_key（缺省 local，与既有配置语义一致）。
+  String Function(String agentId)? agentModeKeyResolver;
+
+  /// **调用点上下文**解析（当前 agent / 会话 → team / agent / session）。
+  ///
+  /// 核心侧注入「从 agent 的团队归属取 team_id」；未接线时调用点只带 agent /
+  /// session（team 为空 = 工具表不做 team 过滤，行为与 M9 之前一致）。
+  StationScopeContext Function(String agentId, String sessionId)?
+  callSiteContext;
+
+  /// 工具表刷新时的**观测钩子**（测试 / 日志用：记录收集站真的被触发了几次）。
+  void Function(StationScope? scope)? toolTableRefreshHook;
 
   bool enabled = true;
 
@@ -97,6 +127,26 @@ class PluginBus {
 
   /// 动态工具表（**触发方** = 工具表刷新处；由收集站收集后注册）。
   final PluginToolDefinitionTable _definitions = PluginToolDefinitionTable();
+
+  /// 模型工具表（插件部分）的**按 scope 缓存**（M9 Wave 3-I）。
+  ///
+  /// 缓存的意义：工具表在每个 agent 每轮生成前都要拼一次（WorkspaceToolRunner 的
+  /// specsFor），若每次都全量触发收集站，插件会被高频打扰。失效点 = **插件生命周期
+  /// 事件**（上线 / 下线 / 重启 / 一次收集完成），只有脏了才在后台补一次收集。
+  final Map<String, List<({String pluginId, PluginToolInfo tool})>>
+  _toolTableCache = <String, List<({String pluginId, PluginToolInfo tool})>>{};
+
+  /// 工具表是否需要重新收集（失效标记）。
+  bool _toolTableDirty = true;
+
+  /// 是否已有一次收集在途（防止同一拍里重复触发）。
+  bool _toolTableRefreshing = false;
+
+  /// 收集站被真正触发的次数（观测 / 测试用；缓存命中不增加）。
+  int toolTableRefreshCount = 0;
+
+  /// 最近一次收集的结论（[ensureToolTableFresh] 在不脏时返回它）。
+  ToolDefinitionRefresh? _lastToolTableRefresh;
 
   int _lastWatchdogRun = 0;
   Timer? _watchdogTimer;
@@ -185,16 +235,50 @@ class PluginBus {
   }
 
   /// 全部**可用**插件工具（带插件 id）。
-  List<({String pluginId, PluginToolInfo tool})> allTools() {
+  ///
+  /// [scope] 非空时按**站点四元组**过滤（plan §1.2）：只保留归属该 team 的定义，
+  /// 定义里更细的 agent / session 也必须与调用点一致；无 team 归属的老式定义
+  /// （tools/list 路径）不受站点过滤影响，保持既有行为。
+  List<({String pluginId, PluginToolInfo tool})> allTools({
+    StationScope? scope,
+  }) {
     final List<({String pluginId, PluginToolInfo tool})> out =
         <({String pluginId, PluginToolInfo tool})>[];
     for (final PluginConfig config in configs()) {
       if (!config.enabled) continue;
-      for (final PluginToolInfo tool in toolsOf(config.id)) {
-        out.add((pluginId: config.id, tool: tool));
+      for (final PluginToolDefinition definition in _definitionList(
+        config.id,
+      )) {
+        if (!_visible(definition, scope)) continue;
+        out.add((pluginId: config.id, tool: definition.toToolInfo()));
       }
     }
     return out;
+  }
+
+  /// 某插件的工具定义（**带 scope**，过滤 / 调试用）。
+  List<PluginToolDefinition> _definitionList(String pluginId) => _definitions
+      .definitions()
+      .where((PluginToolDefinition d) => d.pluginId == pluginId)
+      .toList(growable: false);
+
+  /// 一条定义是否对调用点 scope 可见（fail-closed：证明了不一致就不给看）。
+  static bool _visible(PluginToolDefinition definition, StationScope? scope) {
+    if (scope == null) return true;
+    final StationScope declared = definition.scope;
+    // 无 team 归属 = 老式 tools/list 申报路径：不做站点过滤（保持既有行为）
+    if (declared.teamId.trim().isEmpty) return true;
+    // 调用点没有 team 信息：不过滤（M9 之前的行为）
+    if (scope.teamId.trim().isEmpty) return true;
+    if (declared.teamId != scope.teamId) return false;
+    if (declared.agentId.isNotEmpty && declared.agentId != scope.agentId) {
+      return false;
+    }
+    if (declared.sessionId.isNotEmpty &&
+        declared.sessionId != scope.sessionId) {
+      return false;
+    }
+    return true;
   }
 
   /// 已注册的工具定义（按命名空间名；调用路由用）。
@@ -232,6 +316,8 @@ class PluginBus {
           await host.listTools(timeout: connectTimeout),
         );
       }
+      // 插件上线 = 工具表失效点（下次工具表刷新点会重新收集它的申报）
+      invalidateToolTable(reason: '插件 ${config.id} 上线');
       log?.call('插件 ${config.id} 就绪');
       _emitStatus(config, 'registered', degraded: false);
     } catch (error) {
@@ -436,16 +522,37 @@ class PluginBus {
   /// [scope] 非空时只刷新该 team×mode 的收集站。
   Future<ToolDefinitionRefresh> refreshToolDefinitions({
     StationScope? scope,
+    StationScopeContext context = const StationScopeContext(),
   }) async {
     load();
-    if (!enabled) return const ToolDefinitionRefresh();
+    if (!enabled) {
+      // 总开关关闭：不再收集（也把脏标记清掉，免得每次工具表都排一次空刷新）
+      _toolTableDirty = false;
+      _toolTableCache.clear();
+      return const ToolDefinitionRefresh();
+    }
     final Set<String> stationIds = <String>{};
+    final List<String> skipped = <String>[];
+    // 同一 scope 的订阅者合成一组：站点投递按**精确 scope** 匹配（plan §1.2），
+    // 粒度不同的插件（granularity=agent/session）因此各收各的，不互相牵连。
+    final Map<String, List<({String stationId, StationScope scope})>> groups =
+        <String, List<({String stationId, StationScope scope})>>{};
     for (final PluginConfig config in _configs) {
       if (!config.enabled) continue;
       final PluginHost? host = _hosts[config.id];
       if (host == null || host.isClosed) continue;
-      final StationScope pluginScope = _scopeOf(config);
+      final StationScope pluginScope = _scopeOf(config, context);
+      // 无 team 归属 ⇒ 不进站点体系（走既有 tools/list 申报路径，行为不变）
       if (!pluginScope.isValid) continue;
+      final String? crossScope = _crossScopeReason(
+        config.id,
+        pluginScope,
+        context,
+      );
+      if (crossScope != null) {
+        skipped.add(crossScope);
+        continue;
+      }
       final CollectStation? station = stations.toolDefineStationFor(
         pluginScope,
       );
@@ -466,15 +573,34 @@ class PluginBus {
         (StationRequest request) =>
             _respondToToolDefinition(config, host, request),
       );
+      // 采集的**消息 scope** = 调用点运行期四元组（team / agent / session / mode）：
+      // 订阅者是插件实例（team 级或它自己声明的更细粒度），消息比订阅更细是允许的；
+      // 反过来（消息比订阅粗）会被站点 fail-closed 拒绝。因此这里用调用点自己的
+      // 四元组，而不是订阅者的声明 scope（那会把 team 级插件改写成某个 agent 的订阅）。
+      final StationScope messageScope = context.teamId.trim().isEmpty
+          ? station.scope
+          : StationScope(
+              teamId: pluginScope.teamId,
+              agentId: context.agentId.trim(),
+              sessionId: context.sessionId.trim(),
+              modeKey: pluginScope.modeKey,
+            );
+      groups
+          .putIfAbsent(
+            pluginScope.key,
+            () => <({String stationId, StationScope scope})>[],
+          )
+          .add((stationId: station.id, scope: messageScope));
     }
     final List<StationCollectedItem> collected = <StationCollectedItem>[];
     final List<StationUnresponsive> unresponsive = <StationUnresponsive>[];
-    final List<String> skipped = <String>[];
-    for (final String stationId in stationIds) {
-      final StationInstance? instance = stations.station(stationId);
+    for (final List<({String stationId, StationScope scope})> group
+        in groups.values) {
+      final StationInstance? instance = stations.station(group.first.stationId);
       if (instance is! CollectStation) continue;
+      // 消息 scope = 调用点四元组（订阅者是插件实例，消息更细才允许）
       final StationCollectResult result = await instance.collect(
-        scope: instance.scope,
+        scope: group.first.scope,
         meta: <String, dynamic>{
           'purpose': 'tool_definition',
           'plugin_config': configFile,
@@ -528,7 +654,8 @@ class PluginBus {
         '未响应 $unresponsiveCount 个；跳过 $skippedCount 条',
       );
     }
-    return ToolDefinitionRefresh(
+    // 一次收集完成 = 工具表不再脏（缓存随即清空，下次取表按新定义重建）
+    final ToolDefinitionRefresh outcome = ToolDefinitionRefresh(
       stationIds: stationIds.toList(growable: false),
       collected: collected,
       unresponsive: unresponsive,
@@ -536,6 +663,164 @@ class PluginBus {
       registered: registered,
       removed: removed,
     );
+    _toolTableDirty = false;
+    _toolTableCache.clear();
+    _lastToolTableRefresh = outcome;
+    toolTableRefreshCount++;
+    return outcome;
+  }
+
+  // ── 工具表：缓存 + 失效点（M9 Wave 3-I） ──────────────────────────────
+
+  /// **模型工具表刷新点**（同步）：返回当前模型工具表（插件部分）。
+  ///
+  /// 「收集站的触发时机由调用方决定」：这里就是触发方入口。工具表脏了（插件上线 /
+  /// 下线 / 重启 / 换 scope）才**后台**触发一次收集，本次仍返回手上这一份——
+  /// 「缓存 + 失效点」因此保证**每次工具调用都不会全量收集**；插件工具列表的变化
+  /// 在本次就立刻体现（定义表随生命周期事件同步增删），重新收集只是把插件的申报
+  /// 再核一遍（心跳仍在的插件照旧应答）。
+  List<({String pluginId, PluginToolInfo tool})> toolTable({
+    StationScope? scope,
+  }) {
+    load();
+    if (_toolTableDirty) _scheduleToolTableRefresh(scope);
+    final String key = _toolTableKey(scope);
+    final List<({String pluginId, PluginToolInfo tool})>? cached =
+        _toolTableCache[key];
+    if (cached != null) return cached;
+    final List<({String pluginId, PluginToolInfo tool})> built = allTools(
+      scope: scope,
+    );
+    _toolTableCache[key] = built;
+    return built;
+  }
+
+  /// **确保**工具表已收集过（异步；需要确定性的调用点与测试用）。
+  ///
+  /// 不脏的时候不会重复触发收集（返回上一次的结论）。
+  Future<ToolDefinitionRefresh> ensureToolTableFresh({
+    StationScope? scope,
+    StationScopeContext context = const StationScopeContext(),
+  }) async {
+    load();
+    if (!_toolTableDirty) {
+      return _lastToolTableRefresh ?? const ToolDefinitionRefresh();
+    }
+    return refreshToolDefinitions(scope: scope, context: context);
+  }
+
+  /// 工具表是否脏（有失效点未处理）。
+  bool get toolTableDirty => _toolTableDirty;
+
+  /// **失效点**：插件上线 / 下线 / 重启时标脏并清缓存（下次刷新点重新收集）。
+  void invalidateToolTable({String reason = ''}) {
+    _toolTableDirty = true;
+    _toolTableCache.clear();
+    if (reason.isNotEmpty) {
+      log?.call('插件工具表失效（$reason）：下次工具表刷新点会重新收集');
+    }
+  }
+
+  /// 调用点 → **运行期四元组**（M9 Wave 3-I）。
+  ///
+  /// - team / agent / session：取 [callSiteContext]（核心按 agent 的团队归属解析），
+  ///   未接线时只带 agent / session；
+  /// - mode_key：由 [agentModeKeyResolver] 从**目标 agent 的工作空间模式**解析
+  ///   （local | ssh），证明不了时退回上下文 / 声明里的值（缺省 local）。
+  StationScope runtimeScopeFor({
+    required String agentId,
+    required String sessionId,
+  }) {
+    final StationScopeContext context =
+        callSiteContext?.call(agentId, sessionId) ??
+        StationScopeContext(agentId: agentId, sessionId: sessionId);
+    final String agent = context.agentId.trim().isNotEmpty
+        ? context.agentId.trim()
+        : agentId.trim();
+    final String session = context.sessionId.trim().isNotEmpty
+        ? context.sessionId.trim()
+        : sessionId.trim();
+    final String fromAgent = agent.isEmpty
+        ? ''
+        : (agentModeKeyResolver?.call(agent) ?? '');
+    final String mode = StationModeKey.isValid(fromAgent)
+        ? fromAgent
+        : (StationModeKey.isValid(context.modeKey)
+              ? context.modeKey
+              : StationModeKey.local);
+    return StationScope(
+      teamId: context.teamId.trim(),
+      agentId: agent,
+      sessionId: session,
+      modeKey: mode,
+    );
+  }
+
+  /// 把**执行站首命令集的挂载位置**接到全部执行站（M9 Wave 3-I；幂等）。
+  ///
+  /// 返回 null = 全部挂载成功；否则是可读原因（不静默）。
+  String? mountExecuteStations(ExecuteStationMounts mounts) {
+    final List<String> failed = <String>[];
+    stations.mountExecuteStations((ExecuteStation station) {
+      final String? error = mounts.mountInto(station);
+      if (error != null) failed.add(error);
+    });
+    if (failed.isEmpty) return null;
+    return failed.join('；');
+  }
+
+  void _scheduleToolTableRefresh(StationScope? scope) {
+    if (_toolTableRefreshing) return;
+    _toolTableRefreshing = true;
+    toolTableRefreshHook?.call(scope);
+    // 后台补一次收集：失败只记日志（插件不可用不该让工具表刷新点抛错）
+    unawaited(() async {
+      try {
+        await refreshToolDefinitions(
+          scope: scope,
+          context: scope == null
+              ? const StationScopeContext()
+              : StationScopeContext(
+                  teamId: scope.teamId,
+                  agentId: scope.agentId,
+                  sessionId: scope.sessionId,
+                  modeKey: scope.modeKey,
+                ),
+        );
+      } catch (error) {
+        log?.call('插件工具表刷新失败（已忽略，保留现有工具表）：$error');
+      } finally {
+        _toolTableRefreshing = false;
+      }
+    }());
+  }
+
+  /// 缓存键：四元组全等（team / agent / session / mode 任一不同就是不同的表）。
+  static String _toolTableKey(StationScope? scope) => scope?.key ?? '';
+
+  /// 调用点上下文与插件声明不一致 ⇒ **不收集**并给出可读原因（fail-closed）。
+  static String? _crossScopeReason(
+    String pluginId,
+    StationScope pluginScope,
+    StationScopeContext context,
+  ) {
+    final String team = context.teamId.trim();
+    if (team.isNotEmpty && pluginScope.teamId != team) {
+      return '插件 $pluginId 归属 team=${pluginScope.teamId}，与调用点 team=$team 不一致（跨 team 不收集）';
+    }
+    final String agent = context.agentId.trim();
+    if (agent.isNotEmpty &&
+        pluginScope.agentId.isNotEmpty &&
+        pluginScope.agentId != agent) {
+      return '插件 $pluginId 限定 agent=${pluginScope.agentId}，与调用点 agent=$agent 不一致（跨 scope 不收集）';
+    }
+    final String session = context.sessionId.trim();
+    if (session.isNotEmpty &&
+        pluginScope.sessionId.isNotEmpty &&
+        pluginScope.sessionId != session) {
+      return '插件 $pluginId 限定 session=${pluginScope.sessionId}，与调用点 session=$session 不一致（跨 scope 不收集）';
+    }
+    return null;
   }
 
   /// 无 team 归属插件的申报路径（tools/list → 动态工具表）。
@@ -583,11 +868,43 @@ class PluginBus {
     });
   }
 
-  /// 插件配置 → 站点四元组（未接线时读配置 scope；mode_key 缺失 = local）。
-  StationScope _scopeOf(PluginConfig config) {
-    final StationScope Function(PluginConfig)? resolver = stationScopeResolver;
-    if (resolver != null) return resolver(config);
-    return StationScope.parse(config.scope);
+  /// 插件配置 + 调用点上下文 → **运行期四元组**（M9 Wave 3-I）。
+  ///
+  /// 默认口径（未接线 [stationScopeResolver] 时）：
+  /// - team / agent / session：**只认插件自己的声明**（订阅身份 = 插件实例的声明
+  ///   粒度）。调用点上下文不替插件认领归属：既避免无 team 归属的插件被跨 team
+  ///   放大（plan §1.2 fail-closed），也避免 team 级插件被收窄成某个 agent 的订阅
+  ///   （那会让同队其他 agent 再也看不到它的工具）；
+  /// - mode_key：优先由 [agentModeKeyResolver] 从**调用点 agent 的工作空间模式**
+  ///   解析（local | ssh），其次上下文显式值，最后声明兜底（缺省 local）——这是
+  ///   「SSH 团队的命令不会打到本地工作空间」在工具表这一侧的落点。
+  ///
+  /// 调用点上下文另有两个用途：过滤不该参与本次收集的插件（见 [_crossScopeReason]）
+  /// 与作为采集请求的**消息 scope**（见 refreshToolDefinitions）。
+  StationScope _scopeOf(
+    PluginConfig config, [
+    StationScopeContext context = const StationScopeContext(),
+  ]) {
+    final RuntimeStationScopeResolver? resolver = stationScopeResolver;
+    if (resolver != null) return resolver(config, context);
+    final StationScope declared = StationScope.parse(config.scope);
+    if (!declared.isValid) return declared;
+    // mode_key：调用点 agent 的工作空间模式（解析不出来才退回上下文 / 声明）
+    final String callAgent = context.agentId.trim();
+    final String fromAgent = callAgent.isEmpty
+        ? ''
+        : (agentModeKeyResolver?.call(callAgent) ?? '');
+    final String mode = StationModeKey.isValid(fromAgent)
+        ? fromAgent
+        : (StationModeKey.isValid(context.modeKey)
+              ? context.modeKey
+              : declared.modeKey);
+    return StationScope(
+      teamId: declared.teamId,
+      agentId: declared.agentId,
+      sessionId: declared.sessionId,
+      modeKey: mode,
+    );
   }
 
   /// 站点活性探针：订阅者（插件）心跳还在不在。
@@ -706,6 +1023,8 @@ class PluginBus {
     stations.unsubscribePlugin(pluginId);
     // 动态工具表：下线插件的定义一并移除（避免调用到不存在的插件）
     _definitions.removePlugin(pluginId);
+    // 插件下线 = 工具表失效点（模型工具表必须随之变化）
+    invalidateToolTable(reason: '插件 $pluginId 下线');
     if (host == null) return;
     try {
       await host.close();

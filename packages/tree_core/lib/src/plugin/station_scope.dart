@@ -110,6 +110,57 @@ class StationScope {
   String toString() => 'StationScope($key)';
 }
 
+/// **调用点上下文**（M9 Wave 3-I）：站点四元组里 team / agent / session 的
+/// **运行期**来源。
+///
+/// 站点 scope 是「站点/订阅者归属哪个 team×mode」的声明；调用点上下文是
+/// 「这一次是谁在问」——工具表刷新、执行站下命令这类调用点把当前 agent / 会话
+/// 带进来，四元组才有运行期含义（而不是只认 plugins.yaml 里写死的 scope）。
+///
+/// - [modeKey] 一般情况下**留空**：mode 由 `PluginBus.agentModeKeyResolver` 从
+///   **目标 agent 的工作空间模式**解析（local | ssh），否则 SSH 团队的命令会打到
+///   本地工作空间（plan §1.2）；显式给值 = 调用点已经知道模式，作为覆盖。
+class StationScopeContext {
+  const StationScopeContext({
+    this.teamId = '',
+    this.agentId = '',
+    this.sessionId = '',
+    this.modeKey = '',
+  });
+
+  /// 当前 team（空 = 调用点没有 team 上下文）。
+  final String teamId;
+
+  /// 当前 agent（空 = 无）。
+  final String agentId;
+
+  /// 当前会话（空 = 无）。
+  final String sessionId;
+
+  /// 显式 mode_key 覆盖（空 = 交给 agent 的工作空间模式解析）。
+  final String modeKey;
+
+  /// 是否完全没有上下文（四个字段都空）。
+  bool get isEmpty =>
+      teamId.trim().isEmpty &&
+      agentId.trim().isEmpty &&
+      sessionId.trim().isEmpty &&
+      modeKey.trim().isEmpty;
+
+  /// 转四元组（空字段保留为空串 = 不限定，交由调用方按方向校验）。
+  StationScope toScope() => StationScope(
+    teamId: teamId,
+    agentId: agentId,
+    sessionId: sessionId,
+    modeKey: StationModeKey.isValid(modeKey) ? modeKey : StationModeKey.local,
+  );
+
+  @override
+  String toString() =>
+      'StationScopeContext(team=$teamId, agent=$agentId, '
+      'session=$sessionId, mode=${modeKey.isEmpty ? '（按 agent 工作空间解析）' : modeKey})';
+}
+
 /// 隔离校验结论（fail-closed：ok == false 时 reason 必须是可读中文原因）。
 class StationIsolationVerdict {
   const StationIsolationVerdict.ok() : ok = true, reason = '';

@@ -233,10 +233,8 @@ abstract final class BuiltinTools {
         'type': 'object',
         'properties': <String, dynamic>{
           'command': <String, dynamic>{'type': 'string'},
-          'timeout_seconds': <String, dynamic>{
-            'type': 'integer',
-            'description': '兼容参数（缺省 120，上限 1800）：M9 起不再按静态时长终止命令',
-          },
+          // 这里**没有** timeout_seconds：M9 §1.1 起 duration 不再是判据。
+          // 兼容：老调用方仍传该参数时被忽略（命令跑多久都等，见 _terminal）。
           'hook': <String, dynamic>{
             'type': 'boolean',
             'description': 'true = 后台执行（长任务用），立即返回 task_id',
@@ -610,19 +608,16 @@ abstract final class BuiltinTools {
     if (command.isEmpty) {
       return const ToolOutcome('command 不能为空', isError: true);
     }
-    int seconds = _int(invocation, 'timeout_seconds') ?? 120;
-    if (seconds < 1) {
-      seconds = 1;
-    }
-    if (seconds > 1800) {
-      seconds = 1800;
-    }
+    // M9 §1.1：**没有任何静态时长上限**——本地执行的活性 = 进程存活，活着就永不
+    // 超时；SSH 只在心跳丢失（会话失联）时以 SshLinkStaleException 显式失败，
+    // 然后转 hook 后台（见 _terminalStale）。schema 里也不再声明 timeout_seconds；
+    // 老调用方仍传该参数时直接忽略，不改变行为。
     if (isCancelled?.call() ?? false) {
       return const ToolOutcome('已取消：命令未执行', isError: true);
     }
     final ExecOutcome outcome;
     try {
-      outcome = await io.exec(command, timeout: Duration(seconds: seconds));
+      outcome = await io.exec(command);
     } on SshLinkStaleException catch (error) {
       // M9 1.1：terminal 的「超时」判据是**活性**（心跳丢失 / 会话失联），不是静态时长。
       // 本地执行的活性 = 进程存活，所以正常运行永远走不到这里；只有 SSH 心跳连续丢失
