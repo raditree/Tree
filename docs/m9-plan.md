@@ -261,6 +261,25 @@ _paceToken 现为每增量 Future.delayed(1ms)（11e1376 引入，常开无开�
 - README.md:174 关于"远端 Git 仍 400"的描述待更新（Wave 3-G）。
 - 真机 SSH 回归留到 Wave 3-G。
 
+### Wave 2-E 会话/存储层（packages/tree_core）— 已交付（提交见 git log feat(m9-e)）
+| 条目 | 结果 | 要点 |
+|---|---|---|
+| Q3 | 完成 | 按段管理：thinking 段遇正文/工具即关闭；text 段遇工具即关闭并**独立落库**；结束仍打开的 text 段 = 最终回复（带 usage）；落库时机改为「段关闭即落库」 |
+| Q13 | 完成 | 新增 TokenPacer：思考 / 正文 / 工具参数（jsonEncode(arguments)）共用同一条节拍器；tool_end 零延迟直接推 |
+| 令牌桶 | 完成 | 目标时间轴 + 累计欠账：平均速率恒等于配置值且不受 OS 计时器粒度影响；可注入 clock/wait/enabled |
+| 帧率用例 | 完成 | 零延迟占位引擎 ⇒ 整体关闭节奏控制；用例保留牙齿（先断言回复必然多片，再断言恰好 1 条 msg_chunk） |
+
+验证：dart analyze packages/tree_core 零 issue；相关既有 + 新增约 265 例全绿（含原先恒失败的帧率合并用例）。
+
+**两条新口径（后续必须遵守）**
+1. **单调序号落在 store 的 timestamp 上**（不加 seq 字段）：TreeStore.appendMessage 契约 = 同一 (agent, session) 内时间戳**严格递增**；jsonl 形状不变；代价是 CoreMessage.timestamp 变为可变。若将来要改成 seq 字段 + core_server 稳定排序，改动面收敛在 store 四个文件 + conversation_service。
+2. **零延迟引擎 = 节奏控制整体关闭**（token 管道 + 帧窗口定时器都关）：Duration.zero 的语义就是「不模拟时间」，此时再节流等于用真实计时器伪造时间轴。真实引擎（LlmAgentEngine）永远按速率节流。
+
+**待接线（Wave 3-G）**：CoreServer.start(streamChunkDelay: Duration.zero) 目前只对 ScriptedAgent 生效；若要泛化到任意注入引擎，需 core_server 透传 pacingEnabled / pacer（ConversationService 已就绪）。
+
+**偏离与裁定**
+- ① 单调序号用 store timestamp（理由见上）；② 「最终回复用整轮全文」落地为「最终段全文 + usage，usage 兜底的 completion 取整轮正文」（拼接所有中间段会与「中间输出独立成段」冲突）；③ 本架构里提问即一次工具调用，ask_paused 由「工具调用关段」规则覆盖；④ 纯工具轮不产生兜底文本（与旧 Dart 行为一致；旧后端的 last_tool_text 兜底暂不引入）；⑤ 令牌桶无最大突发上限（落后即放行）。
+
 ### Wave 1-C 追加：超时判据改为心跳判活（提交见 git log feat(m9-c2)）
 - 新增 ssh_liveness.dart（SshLiveness 台账 + SshLinkStaleException）：lastBeatAt / missedCount / isStale，I=10s、N=3 可配；任意成功读/写响应也算心跳并清零丢失。
 - **心跳观测要点（踩坑记录）**：dartssh2 的 SSHClient.ping() 等的是 keepalive 全局请求的回包，_globalRequestReplyQueue 同时被 Success 与 **Failure** 喂（OpenSSH 回 REQUEST_FAILURE，也算回了）；而内置 SSHKeepAlive 把结果全吞掉 → 因此关掉内置心跳（keepAliveInterval: null），自建 Timer 循环，每拍 ping().timeout(I)：**窗口 = 一个心跳间隔（单拍 deadline，不是任务总时长）**。
