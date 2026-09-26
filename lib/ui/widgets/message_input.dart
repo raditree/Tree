@@ -240,7 +240,8 @@ class _MessageInputState extends State<MessageInput> {
   /// 复制只以 CF_HDROP 形式出现；若先取位图，多选文件会被误判成"一张图片"。
   Future<void> _handlePaste() async {
     // 1) 剪贴板文件列表（可多个）
-    final List<String> files = await _readClipboardFiles();
+    final (List<String> files, bool channelMissing) =
+        await _readClipboardFiles();
     if (files.isNotEmpty) {
       if (!mounted) return;
       _addFiles(files);
@@ -262,7 +263,17 @@ class _MessageInputState extends State<MessageInput> {
     } catch (_) {
       text = '';
     }
-    if (text.trim().isEmpty) return;
+    if (text.trim().isEmpty) {
+      // 四条路都空：如果原因是原生通道缺 readFiles（旧二进制 / 热重载未重建
+      // C++），必须说出来——否则表现就是「Ctrl+V 毫无反应」。
+      if (channelMissing) {
+        _notifyPasteProblem(
+          '剪贴板文件读取不可用：当前客户端缺少原生 readFiles。'
+          'C++ 改动不会被热重载应用，请重新构建并重启 Windows 客户端。',
+        );
+      }
+      return;
+    }
     final List<String> paths = _extractFilePaths(text);
     if (paths.isNotEmpty) {
       if (!mounted) return;
@@ -276,20 +287,35 @@ class _MessageInputState extends State<MessageInput> {
 
   /// 读取剪贴板文件列表（Windows 原生 CF_HDROP，可多个）。
   ///
-  /// 通道未实现（非 Windows 平台）或剪贴板被其它进程占用时返回空表，
-  /// 由 [_handlePaste] 继续按位图/文本处理，不打断粘贴。
-  Future<List<String>> _readClipboardFiles() async {
+  /// 返回 (文件列表, 通道是否缺失)。**必须把「通道缺失」与「剪贴板里确实没有
+  /// 文件」分开**：前者（跑着旧二进制、或只热重载了 Dart 而 C++ 改动未重建）
+  /// 会让 Ctrl+V 完全没有反应，用户无从判断；后者才是正常情况。通道缺失时由
+  /// [_handlePaste] 给出可见提示。
+  Future<(List<String>, bool)> _readClipboardFiles() async {
     try {
       final List<dynamic>? result = await _clipboardChannel
           .invokeMethod<List<dynamic>>('readFiles');
-      if (result == null) return const <String>[];
-      return result
-          .map((dynamic e) => e.toString())
-          .where((String p) => p.isNotEmpty)
-          .toList();
+      if (result == null) return (const <String>[], false);
+      return (
+        result
+            .map((dynamic e) => e.toString())
+            .where((String p) => p.isNotEmpty)
+            .toList(),
+        false,
+      );
+    } on MissingPluginException {
+      return (const <String>[], true);
     } catch (_) {
-      return const <String>[];
+      return (const <String>[], false);
     }
+  }
+
+  /// 粘贴拿不到任何内容时给出可见原因（不静默）。
+  void _notifyPasteProblem(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      SnackBar(content: Text(message)),
+    );
   }
 
   /// 读取剪贴板图片并保存为临时文件，无图片时返回 null
