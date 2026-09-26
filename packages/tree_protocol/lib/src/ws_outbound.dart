@@ -7,30 +7,41 @@ abstract final class WsOutboundType {
   // ── 流式回复分段（agent 输出） ─────────────────────────────────────────
   /// 文本/思考段开始。
   static const String msgStart = 'msg_start';
+
   /// 段内容增量。
   static const String msgChunk = 'msg_chunk';
+
   /// 段结束。
   static const String msgEnd = 'msg_end';
+
   /// 段/轮次的 token 用量（进度条分母为 max_seqlen）。
   static const String msgUsage = 'msg_usage';
+
   /// 工具调用开始（含参数）。
   static const String toolStart = 'tool_start';
+
   /// 工具调用结束（含结果）。
   static const String toolEnd = 'tool_end';
 
   // ── 会话与状态 ────────────────────────────────────────────────────────
   /// agent 工作状态（working/idle/...）。
   static const String agentStatus = 'agent_status';
+
   /// 会话被创建（成员自动建会话时通知前端刷新）。
   static const String sessionCreated = 'session_created';
+
   /// todo 列表更新。
   static const String todoUpdate = 'todo_update';
+
   /// 提问卡片推送。
   static const String askUserQuestion = 'ask_user_question';
+
   /// 提问已解决（跨端/多窗口同步）。
   static const String askUserQuestionResolved = 'ask_user_question_resolved';
+
   /// 通用文本消息（`_send_text_as_agent` 路径）。
   static const String message = 'message';
+
   /// 错误提示（`data.message` 携带可读文案）。
   static const String error = 'error';
 
@@ -40,10 +51,13 @@ abstract final class WsOutboundType {
   /// 注意：**双向**使用同一字面量——前端定时上报，核心进程也会主动下发
   /// （`ws_manager.py` 保活循环），故同时存在于上行与下行常量中。
   static const String heartbeat = 'heartbeat';
+
   /// 大帧分片：起始片。
   static const String frameBegin = 'frame_begin';
+
   /// 大帧分片：中间片。
   static const String frameChunk = 'frame_chunk';
+
   /// 大帧分片：结束片。
   static const String frameEnd = 'frame_end';
 
@@ -52,20 +66,22 @@ abstract final class WsOutboundType {
   static const String unregisterLocalExecutorAck =
       'unregister_local_executor_ack';
   static const String registerSshExecutorAck = 'register_ssh_executor_ack';
-  static const String unregisterSshExecutorAck =
-      'unregister_ssh_executor_ack';
+  static const String unregisterSshExecutorAck = 'unregister_ssh_executor_ack';
+
   /// 执行器注册丢失通知（需前端重新注册）。
   static const String registrationLost = 'registration_lost';
 
   // ── 反向执行通道（核心进程 → 前端执行器） ──────────────────────────────
   /// 工具执行请求。
   static const String toolExecRequest = 'tool_exec_request';
+
   /// 工具执行取消。
   static const String toolExecCancel = 'tool_exec_cancel';
 
   // ── 插件 ──────────────────────────────────────────────────────────────
   /// 插件自定义事件（`plugin_event`）。
   static const String pluginEvent = 'plugin_event';
+
   /// 插件实例生命周期状态。
   static const String pluginStatus = 'plugin_status';
 

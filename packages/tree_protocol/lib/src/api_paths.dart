@@ -62,8 +62,7 @@ abstract final class ApiPaths {
   static const String fileUploadComplete =
       '/api/files/{workspaceId}/upload_complete';
   static const String fileSyncToLocal = '/api/files/{workspaceId}/syncToLocal';
-  static const String workspaceGitLog =
-      '/api/workspaces/{workspaceId}/git/log';
+  static const String workspaceGitLog = '/api/workspaces/{workspaceId}/git/log';
   static const String workspaceGitBranches =
       '/api/workspaces/{workspaceId}/git/branches';
 

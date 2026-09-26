@@ -24,7 +24,8 @@ void main() {
     expect(
       uncovered,
       isEmpty,
-      reason: '以下 server 侧 type 字面量未纳入协议常量：'
+      reason:
+          '以下 server 侧 type 字面量未纳入协议常量：'
           '${uncovered.toList()..sort()} —— 请补充常量，'
           '或在 nonProtocolTypeLiterals 中登记并写明原因',
     );
@@ -44,16 +45,18 @@ void main() {
   });
 
   test('前端使用的 /api 路径全部在 ApiPaths 中声明', () {
-    final Set<String> used = _scanFrontendApiPaths(Directory('${repoRoot.path}/lib'));
+    final Set<String> used = _scanFrontendApiPaths(
+      Directory('${repoRoot.path}/lib'),
+    );
     expect(used, isNotEmpty, reason: '未扫描到任何 /api 路径字符串');
 
-    final Set<String> declared =
-        ApiPaths.all.map(_normalizePath).toSet();
+    final Set<String> declared = ApiPaths.all.map(_normalizePath).toSet();
     final Set<String> undeclared = used.difference(declared);
     expect(
       undeclared,
       isEmpty,
-      reason: '以下前端路径未在 ApiPaths 中声明：'
+      reason:
+          '以下前端路径未在 ApiPaths 中声明：'
           '${undeclared.toList()..sort()}',
     );
   });
@@ -73,11 +76,9 @@ void main() {
     }
     // 上行/下行唯一允许的重名：heartbeat（双向保活，两侧都用同一字面量）。
     // 其余任何重名都意味着协议建模错误，必须在这里暴露。
-    expect(
-      WsInboundType.all.intersection(WsOutboundType.all),
-      <String>{WsInboundType.heartbeat},
-      reason: '上/下行除 heartbeat（双向保活）外不应重名',
-    );
+    expect(WsInboundType.all.intersection(WsOutboundType.all), <String>{
+      WsInboundType.heartbeat,
+    }, reason: '上/下行除 heartbeat（双向保活）外不应重名');
     // 账号组必须真的被保留组排除
     expect(
       ApiPaths.kept.intersection(ApiPaths.removedWithAccounts),
@@ -94,8 +95,9 @@ Set<String> _scanServerLiterals(Directory repoRoot) {
     fail('server 目录不存在：${server.path}');
   }
   final RegExp typeLiteral = RegExp(r'"type"\s*:\s*"([a-z_][a-z0-9_]*)"');
-  final RegExp dispatchLiteral =
-      RegExp(r'msg_type\s*==\s*"([a-z_][a-z0-9_]*)"');
+  final RegExp dispatchLiteral = RegExp(
+    r'msg_type\s*==\s*"([a-z_][a-z0-9_]*)"',
+  );
   final Set<String> found = <String>{};
 
   for (final FileSystemEntity entity in server.listSync(recursive: true)) {
@@ -123,7 +125,9 @@ Set<String> _scanFrontendApiPaths(Directory lib) {
   final Set<String> found = <String>{};
   for (final FileSystemEntity entity in lib.listSync(recursive: true)) {
     if (entity is! File || !entity.path.endsWith('.dart')) continue;
-    for (final RegExpMatch m in apiLiteral.allMatches(entity.readAsStringSync())) {
+    for (final RegExpMatch m in apiLiteral.allMatches(
+      entity.readAsStringSync(),
+    )) {
       found.add(_normalizePath(m.group(1)!));
     }
   }
