@@ -9,6 +9,8 @@ import '../theme_service.dart';
 /// 保留的设置项：
 /// - 数据收集：仅保留开关以兼容历史配置（桌面单用户形态没有收集方，M7 移除）
 /// - token 获取帧率 / 推送刷新帧率 / 消息切入模式：agent 运行节奏控制
+/// - 心跳判活参数（I=心跳间隔秒 / N=连续丢失阈值次）：核心判"链路失活"的唯一判据
+///   （M9 规约 1.1 取消了静态时间超时）；判活窗口 I×N 必须大于前端固定的 10s 心跳
 /// - 自定义模型：模型池 CRUD（M2 起落 `~/.tree/config/models/*.yaml`）
 /// - 主题管理：浅色 / 深色 / 跟随系统三种模式
 class SettingsPage extends StatefulWidget {
@@ -41,6 +43,35 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 推送刷新帧率输入框（允许用户直接键入，提交时按范围夹取）
   final TextEditingController _frameRateController = TextEditingController();
 
+  // --- 心跳判活参数（判活窗口 = 心跳间隔 I × 连续丢失阈值 N，必须 > 前端 10s 心跳） ---
+  int _heartbeatIntervalSeconds = 10;
+  int _heartbeatIntervalMin = 1;
+  int _heartbeatIntervalMax = 600;
+  int _missedHeartbeatLimit = 3;
+  int _missedHeartbeatLimitMin = 1;
+  int _missedHeartbeatLimitMax = 60;
+
+  /// 判活窗口必须**严格大于**的下限（秒）：前端 WS 心跳固定 10s
+  /// （lib/io/websocket_service.dart，本页不可调），窗口不足会把"在线但空闲"的
+  /// 连接判成失活并反复重连。
+  int _minLivenessWindowSeconds = 10;
+
+  /// 当前生效的判活窗口（= I×N，秒）。
+  int _livenessWindowSeconds = 30;
+
+  /// 核心侧**在线生效**的值：与设置值不一致 = 要重启核心（或该消费者重建）才完全一致。
+  int _liveIntervalSeconds = 10;
+  int _liveMissLimit = 3;
+
+  /// 最近一次夹取的可读原因（没有夹取则为 null）。
+  String? _livenessNotice;
+
+  /// 心跳间隔 / 丢失阈值输入框
+  final TextEditingController _heartbeatIntervalController =
+      TextEditingController();
+  final TextEditingController _missedHeartbeatLimitController =
+      TextEditingController();
+
   // --- 自定义模型（设置页 CRUD） ---
   List<Map<String, dynamic>> _models = <Map<String, dynamic>>[];
   bool _modelsLoading = false;
@@ -53,6 +84,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _loadMessageCutinSetting();
     _loadTokenRateSetting();
     _loadFrameRateSetting();
+    _loadHeartbeatSetting();
     _loadModelList();
   }
 
@@ -60,6 +92,8 @@ class _SettingsPageState extends State<SettingsPage> {
   void dispose() {
     _tokenRateController.dispose();
     _frameRateController.dispose();
+    _heartbeatIntervalController.dispose();
+    _missedHeartbeatLimitController.dispose();
     super.dispose();
   }
 
@@ -140,7 +174,10 @@ class _SettingsPageState extends State<SettingsPage> {
       if (!mounted) return;
       setState(() => _tokenRateController.text = '$_tokenRate');
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('token 帧率设置失败：$e'), duration: const Duration(seconds: 2)),
+        SnackBar(
+          content: Text('token 帧率设置失败：$e'),
+          duration: const Duration(seconds: 2),
+        ),
       );
     }
   }
@@ -183,7 +220,134 @@ class _SettingsPageState extends State<SettingsPage> {
       if (!mounted) return;
       setState(() => _frameRateController.text = '$_frameRate');
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('帧率设置失败：$e'), duration: const Duration(seconds: 2)),
+        SnackBar(
+          content: Text('帧率设置失败：$e'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
+  /// 加载心跳判活参数（权威值来自后端；后端不可达时保留默认 10s / 3 次）
+  Future<void> _loadHeartbeatSetting() async {
+    try {
+      final Map<String, dynamic> data =
+          await ApiService.getHeartbeatLivenessSettings();
+      _applyHeartbeatResponse(data);
+    } catch (_) {
+      // 后端不可达：保留默认值，控件仍可编辑（提交时后端还会再夹一次）
+      if (mounted) {
+        setState(() {
+          _heartbeatIntervalController.text = '$_heartbeatIntervalSeconds';
+          _missedHeartbeatLimitController.text = '$_missedHeartbeatLimit';
+        });
+      }
+    }
+  }
+
+  /// 把后端返回的心跳判活参数写进界面。
+  ///
+  /// 两个端点（heartbeat-interval / missed-heartbeat-limit）的响应**同形状**，
+  /// 所以只解析一次：值、各自区间、当前的判活窗口、核心侧在线生效值、夹取说明。
+  /// [fallbackNotice] 是前端预夹取时自己生成的说明（后端没夹取时用它）。
+  void _applyHeartbeatResponse(
+    Map<String, dynamic> data, {
+    String? fallbackNotice,
+  }) {
+    if (!mounted) return;
+    setState(() {
+      _heartbeatIntervalSeconds =
+          (data['heartbeat_interval'] as num?)?.toInt() ??
+          _heartbeatIntervalSeconds;
+      _missedHeartbeatLimit =
+          (data['missed_heartbeat_limit'] as num?)?.toInt() ??
+          _missedHeartbeatLimit;
+      _heartbeatIntervalMin =
+          (data['heartbeat_interval_min'] as num?)?.toInt() ??
+          _heartbeatIntervalMin;
+      _heartbeatIntervalMax =
+          (data['heartbeat_interval_max'] as num?)?.toInt() ??
+          _heartbeatIntervalMax;
+      _missedHeartbeatLimitMin =
+          (data['missed_heartbeat_limit_min'] as num?)?.toInt() ??
+          _missedHeartbeatLimitMin;
+      _missedHeartbeatLimitMax =
+          (data['missed_heartbeat_limit_max'] as num?)?.toInt() ??
+          _missedHeartbeatLimitMax;
+      _minLivenessWindowSeconds =
+          (data['min_window_seconds'] as num?)?.toInt() ??
+          _minLivenessWindowSeconds;
+      _livenessWindowSeconds =
+          (data['window_seconds'] as num?)?.toInt() ??
+          _heartbeatIntervalSeconds * _missedHeartbeatLimit;
+      _liveIntervalSeconds =
+          (data['live_interval_seconds'] as num?)?.toInt() ??
+          _heartbeatIntervalSeconds;
+      _liveMissLimit =
+          (data['live_miss_limit'] as num?)?.toInt() ?? _missedHeartbeatLimit;
+      _livenessNotice = (data['notice'] as String?) ?? fallbackNotice;
+      _heartbeatIntervalController.text = '$_heartbeatIntervalSeconds';
+      _missedHeartbeatLimitController.text = '$_missedHeartbeatLimit';
+    });
+  }
+
+  /// 提交心跳判活参数。
+  ///
+  /// 两个字段**一起**下发：判活窗口是 I×N 的乘积，分两次写会经过非法中间态
+  /// （例如从 10s/3 改成 3s/6 时，先把间隔改成 3 的那一瞬间窗口只剩 9s）。
+  ///
+  /// 前端按后端同一口径先算一遍：窗口必须严格大于 [_minLivenessWindowSeconds]
+  /// （前端固定 10s 心跳），不足时抬高间隔 I——夹取而不是拒绝，并把可读原因同时
+  /// 显示在卡片上（持久）与 SnackBar 里（当下），用户要能知道"我填的 1s 为什么
+  /// 生效成 4s"。后端仍会独立夹取（它是权威），两侧口径一致。
+  Future<void> _applyHeartbeatSetting({
+    int? intervalSeconds,
+    int? limit,
+  }) async {
+    int nextInterval = (intervalSeconds ?? _heartbeatIntervalSeconds).clamp(
+      _heartbeatIntervalMin,
+      _heartbeatIntervalMax,
+    );
+    final int nextLimit = (limit ?? _missedHeartbeatLimit).clamp(
+      _missedHeartbeatLimitMin,
+      _missedHeartbeatLimitMax,
+    );
+    String? localNotice;
+    if (nextInterval * nextLimit <= _minLivenessWindowSeconds) {
+      final int repaired = _minLivenessWindowSeconds ~/ nextLimit + 1;
+      localNotice =
+          '判活窗口 ${nextInterval}s×$nextLimit='
+          '${nextInterval * nextLimit}s 不大于前端固定 '
+          '${_minLivenessWindowSeconds}s 的心跳间隔，空闲连接会被误判失活并反复'
+          '重连；已把心跳间隔夹到 ${repaired}s（判活窗口 ${repaired * nextLimit}s）';
+      nextInterval = repaired;
+    }
+    try {
+      final Map<String, dynamic> data =
+          await ApiService.setHeartbeatLivenessSettings(
+            heartbeatIntervalSeconds: nextInterval,
+            missedHeartbeatLimit: nextLimit,
+          );
+      if (!mounted) return;
+      _applyHeartbeatResponse(data, fallbackNotice: localNotice);
+      final String? notice = (data['notice'] as String?) ?? localNotice;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(notice ?? '心跳判活参数已保存并生效'),
+          duration: Duration(seconds: notice == null ? 2 : 4),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _heartbeatIntervalController.text = '$_heartbeatIntervalSeconds';
+        _missedHeartbeatLimitController.text = '$_missedHeartbeatLimit';
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('心跳判活参数保存失败：$e'),
+          duration: const Duration(seconds: 3),
+        ),
       );
     }
   }
@@ -229,10 +393,7 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('设置'),
-        centerTitle: false,
-      ),
+      appBar: AppBar(title: const Text('设置'), centerTitle: false),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
@@ -245,6 +406,10 @@ class _SettingsPageState extends State<SettingsPage> {
           _buildTokenRateCard(),
           const SizedBox(height: 12),
           _buildFrameRateCard(),
+          const SizedBox(height: 24),
+          _buildSectionTitle('心跳判活'),
+          const SizedBox(height: 8),
+          _buildHeartbeatCard(),
           const SizedBox(height: 24),
           _buildSectionTitle('自定义模型'),
           const SizedBox(height: 8),
@@ -280,14 +445,20 @@ class _SettingsPageState extends State<SettingsPage> {
                     children: [
                       const Text(
                         '允许收集使用数据',
-                        style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+                        style: TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w500,
+                        ),
                       ),
                       const SizedBox(height: 4),
                       Text(
                         _dataCollectionEnabled
                             ? '已开启，仅保存开启期间的使用数据快照'
                             : '关闭状态，不会收集任何使用数据',
-                        style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Color(0xFF94A3B8),
+                        ),
                       ),
                     ],
                   ),
@@ -367,8 +538,9 @@ class _SettingsPageState extends State<SettingsPage> {
                 const Spacer(),
                 OutlinedButton(
                   onPressed: () {
-                    final int? parsed =
-                        int.tryParse(_tokenRateController.text.trim());
+                    final int? parsed = int.tryParse(
+                      _tokenRateController.text.trim(),
+                    );
                     if (parsed != null) _applyTokenRate(parsed);
                   },
                   child: const Text('应用'),
@@ -378,9 +550,9 @@ class _SettingsPageState extends State<SettingsPage> {
             const SizedBox(height: 4),
             Slider(
               value: _tokenRate.toDouble().clamp(
-                    _tokenRateMin.toDouble(),
-                    _tokenRateMax.toDouble(),
-                  ),
+                _tokenRateMin.toDouble(),
+                _tokenRateMax.toDouble(),
+              ),
               min: _tokenRateMin.toDouble(),
               max: _tokenRateMax.toDouble(),
               divisions: 49,
@@ -460,8 +632,9 @@ class _SettingsPageState extends State<SettingsPage> {
                 const Spacer(),
                 OutlinedButton(
                   onPressed: () {
-                    final int? parsed =
-                        int.tryParse(_frameRateController.text.trim());
+                    final int? parsed = int.tryParse(
+                      _frameRateController.text.trim(),
+                    );
                     if (parsed != null) _applyFrameRate(parsed);
                   },
                   child: const Text('应用'),
@@ -471,9 +644,9 @@ class _SettingsPageState extends State<SettingsPage> {
             const SizedBox(height: 4),
             Slider(
               value: _frameRate.toDouble().clamp(
-                    _frameRateMin.toDouble(),
-                    _frameRateMax.toDouble(),
-                  ),
+                _frameRateMin.toDouble(),
+                _frameRateMax.toDouble(),
+              ),
               min: _frameRateMin.toDouble(),
               max: _frameRateMax.toDouble(),
               divisions: 49,
@@ -483,6 +656,182 @@ class _SettingsPageState extends State<SettingsPage> {
               },
               onChangeEnd: (double value) => _applyFrameRate(value.round()),
             ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 心跳判活参数卡片（心跳间隔 I 秒 / 连续丢失阈值 N 次）
+  ///
+  /// 核心判"链路失活"的唯一判据（M9 规约 1.1：静态时间超时全部取消，改心跳丢失），
+  /// 所以这两个值直接决定"多久没有心跳就判死"。硬约束：判活窗口 I×N 必须**严格
+  /// 大于**前端固定的 10s WS 心跳（lib/io/websocket_service.dart，本页不可调），
+  /// 否则"在线但空闲"的连接会被判失活、关连接、反复重连；不足时前后端都会把 I 抬到
+  /// 刚好够，并把可读原因显示在下面。
+  Widget _buildHeartbeatCard() {
+    final cs = Theme.of(context).colorScheme;
+    // 核心侧的"在线生效值"可能落后于设置值：WS 判活节拍会立即热更新，但丢失阈值 N
+    // 与插件宿主 / MCP 客户端的心跳参数要等下次启动核心（SSH 是下次建连）才用新值，
+    // 这里如实说明生效时机，不含糊。
+    final bool liveBehind =
+        _liveIntervalSeconds != _heartbeatIntervalSeconds ||
+        _liveMissLimit != _missedHeartbeatLimit;
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              '心跳判活参数',
+              style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              '核心判链路失活的唯一判据：连续 N 拍没收到心跳即判失活（不做静态时间'
+              '超时）。判活窗口 = 间隔 × 阈值，必须大于前端固定 10s 的心跳，'
+              '否则空闲连接会被误判失活并反复重连。',
+              style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                SizedBox(
+                  width: 104,
+                  child: TextField(
+                    key: const Key('heartbeat-interval-input'),
+                    controller: _heartbeatIntervalController,
+                    keyboardType: TextInputType.number,
+                    decoration: InputDecoration(
+                      labelText: '间隔（秒）',
+                      helperText:
+                          '$_heartbeatIntervalMin~$_heartbeatIntervalMax',
+                      isDense: true,
+                    ),
+                    onSubmitted: (String value) {
+                      final int? parsed = int.tryParse(value.trim());
+                      if (parsed != null) {
+                        _applyHeartbeatSetting(intervalSeconds: parsed);
+                      }
+                    },
+                  ),
+                ),
+                IconButton(
+                  key: const Key('heartbeat-interval-decrease'),
+                  tooltip: '间隔减少 1 秒',
+                  onPressed: _heartbeatIntervalSeconds <= _heartbeatIntervalMin
+                      ? null
+                      : () => _applyHeartbeatSetting(
+                          intervalSeconds: _heartbeatIntervalSeconds - 1,
+                        ),
+                  icon: const Icon(Icons.remove_circle_outline),
+                  color: cs.primary,
+                ),
+                IconButton(
+                  key: const Key('heartbeat-interval-increase'),
+                  tooltip: '间隔增加 1 秒',
+                  onPressed: _heartbeatIntervalSeconds >= _heartbeatIntervalMax
+                      ? null
+                      : () => _applyHeartbeatSetting(
+                          intervalSeconds: _heartbeatIntervalSeconds + 1,
+                        ),
+                  icon: const Icon(Icons.add_circle_outline),
+                  color: cs.primary,
+                ),
+                const SizedBox(width: 8),
+                SizedBox(
+                  width: 104,
+                  child: TextField(
+                    key: const Key('heartbeat-limit-input'),
+                    controller: _missedHeartbeatLimitController,
+                    keyboardType: TextInputType.number,
+                    decoration: InputDecoration(
+                      labelText: '阈值（次）',
+                      helperText:
+                          '$_missedHeartbeatLimitMin~'
+                          '$_missedHeartbeatLimitMax',
+                      isDense: true,
+                    ),
+                    onSubmitted: (String value) {
+                      final int? parsed = int.tryParse(value.trim());
+                      if (parsed != null) {
+                        _applyHeartbeatSetting(limit: parsed);
+                      }
+                    },
+                  ),
+                ),
+                IconButton(
+                  key: const Key('heartbeat-limit-decrease'),
+                  tooltip: '阈值减少 1 次',
+                  onPressed: _missedHeartbeatLimit <= _missedHeartbeatLimitMin
+                      ? null
+                      : () => _applyHeartbeatSetting(
+                          limit: _missedHeartbeatLimit - 1,
+                        ),
+                  icon: const Icon(Icons.remove_circle_outline),
+                  color: cs.primary,
+                ),
+                IconButton(
+                  key: const Key('heartbeat-limit-increase'),
+                  tooltip: '阈值增加 1 次',
+                  onPressed: _missedHeartbeatLimit >= _missedHeartbeatLimitMax
+                      ? null
+                      : () => _applyHeartbeatSetting(
+                          limit: _missedHeartbeatLimit + 1,
+                        ),
+                  icon: const Icon(Icons.add_circle_outline),
+                  color: cs.primary,
+                ),
+                const Spacer(),
+                OutlinedButton(
+                  key: const Key('heartbeat-apply'),
+                  onPressed: () {
+                    // 两个输入框一起提交（I×N 是一个整体）；解析失败的框按"保持原值"
+                    // 处理，不静默当成 0
+                    final int? interval = int.tryParse(
+                      _heartbeatIntervalController.text.trim(),
+                    );
+                    final int? limit = int.tryParse(
+                      _missedHeartbeatLimitController.text.trim(),
+                    );
+                    if (interval == null && limit == null) return;
+                    _applyHeartbeatSetting(
+                      intervalSeconds: interval,
+                      limit: limit,
+                    );
+                  },
+                  child: const Text('应用'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Text(
+              '判活窗口 ${_livenessWindowSeconds}s（间隔 '
+              '${_heartbeatIntervalSeconds}s × 阈值 $_missedHeartbeatLimit 次；'
+              '必须 > ${_minLivenessWindowSeconds}s）',
+              style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+            ),
+            if (liveBehind)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                  '核心侧在线生效：间隔 ${_liveIntervalSeconds}s × 阈值 '
+                  '$_liveMissLimit 次 —— 丢失阈值与插件宿主 / MCP 客户端的'
+                  '心跳参数在下次启动核心后完全一致（WS 判活节拍已立即生效），'
+                  'SSH 在下次建连时生效',
+                  style: const TextStyle(fontSize: 12, color: Colors.orange),
+                ),
+              ),
+            if (_livenessNotice != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                  '已按安全下限夹取：$_livenessNotice',
+                  style: const TextStyle(fontSize: 12, color: Colors.orange),
+                ),
+              ),
           ],
         ),
       ),
@@ -541,10 +890,16 @@ class _SettingsPageState extends State<SettingsPage> {
                   Expanded(
                     child: Text(
                       '模型列表加载失败：$_modelsError',
-                      style: const TextStyle(fontSize: 12, color: Colors.redAccent),
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Colors.redAccent,
+                      ),
                     ),
                   ),
-                  TextButton(onPressed: _loadModelList, child: const Text('重试')),
+                  TextButton(
+                    onPressed: _loadModelList,
+                    child: const Text('重试'),
+                  ),
                 ],
               )
             else if (_models.isEmpty)
@@ -601,10 +956,12 @@ class _SettingsPageState extends State<SettingsPage> {
 
   /// 打开模型编辑对话框（[existing] 为 null 表示新增）
   Future<void> _openModelEditor(Map<String, dynamic>? existing) async {
-    final Map<String, dynamic>? payload = await showDialog<Map<String, dynamic>>(
-      context: context,
-      builder: (BuildContext context) => _ModelEditorDialog(existing: existing),
-    );
+    final Map<String, dynamic>? payload =
+        await showDialog<Map<String, dynamic>>(
+          context: context,
+          builder: (BuildContext context) =>
+              _ModelEditorDialog(existing: existing),
+        );
     if (payload == null || !mounted) return;
     try {
       if (existing == null) {
@@ -624,7 +981,10 @@ class _SettingsPageState extends State<SettingsPage> {
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('保存失败：$e'), duration: const Duration(seconds: 3)),
+        SnackBar(
+          content: Text('保存失败：$e'),
+          duration: const Duration(seconds: 3),
+        ),
       );
     }
   }
@@ -662,13 +1022,19 @@ class _SettingsPageState extends State<SettingsPage> {
           ? ''
           : '；注意：仍有 ${bound.length} 个 Agent 绑定该模型，需重新指定模型';
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('已删除$suffix'), duration: const Duration(seconds: 3)),
+        SnackBar(
+          content: Text('已删除$suffix'),
+          duration: const Duration(seconds: 3),
+        ),
       );
       await _loadModelList();
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('删除失败：$e'), duration: const Duration(seconds: 3)),
+        SnackBar(
+          content: Text('删除失败：$e'),
+          duration: const Duration(seconds: 3),
+        ),
       );
     }
   }
@@ -700,7 +1066,10 @@ class _SettingsPageState extends State<SettingsPage> {
                     _directCutin
                         ? '已开启：新消息一次性全部切入当前上下文，几乎同时到达的消息（如多名成员的回传总结）一起处理'
                         : '已关闭（串行排队）：新消息逐条切入，当前轮结束后再逐条处理剩余消息',
-                    style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: Color(0xFF94A3B8),
+                    ),
                   ),
                 ],
               ),
@@ -854,11 +1223,9 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
     _reasoningEffort = e['reasoning_effort'] as String? ?? '';
     // 后端已按"模型声明或全局回退"解析好档位列表，直接回填（不预设当前选中值：
     // 列表仅表示"哪些可被 agent 覆盖"，与模型自身默认档位是两件事）
-    final List<dynamic>? opts =
-        e['reasoning_effort_options'] as List<dynamic>?;
+    final List<dynamic>? opts = e['reasoning_effort_options'] as List<dynamic>?;
     if (opts != null && opts.isNotEmpty) {
-      _effortOptions.text =
-          opts.map((dynamic v) => v.toString()).join(', ');
+      _effortOptions.text = opts.map((dynamic v) => v.toString()).join(', ');
     }
     final int? seq = (e['max_seqlen'] as num?)?.toInt();
     if (seq != null) _maxSeqlen.text = '$seq';
@@ -885,10 +1252,10 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
   /// value 不在 items 中会直接断言失败，整个编辑弹窗打不开。
   List<DropdownMenuItem<String>> _buildEffortItems() {
     final List<String> options = _parseEffortOptions(_effortOptions.text);
-    final List<String> candidates =
-        options.isEmpty ? List<String>.of(_reasoningEfforts) : options;
-    if (_reasoningEffort.isNotEmpty &&
-        !candidates.contains(_reasoningEffort)) {
+    final List<String> candidates = options.isEmpty
+        ? List<String>.of(_reasoningEfforts)
+        : options;
+    if (_reasoningEffort.isNotEmpty && !candidates.contains(_reasoningEffort)) {
       candidates.add(_reasoningEffort);
     }
     return <DropdownMenuItem<String>>[
@@ -902,9 +1269,8 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
   void _submit() {
     final String modelId = _modelId.text.trim();
     if (modelId.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('model_id 不能为空')),
-      );
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('model_id 不能为空')));
       return;
     }
     final Map<String, dynamic> payload = <String, dynamic>{
@@ -923,8 +1289,7 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
     }
     // 可选档位：留空 = 用后端默认（low/high/max），此时**不下发该键**让后端保留
     // 文件现值或走回退；非空则解析为列表下发（后端会归一化并校验默认档位落在其中）
-    final List<String> effortOptions =
-        _parseEffortOptions(_effortOptions.text);
+    final List<String> effortOptions = _parseEffortOptions(_effortOptions.text);
     if (effortOptions.isNotEmpty) {
       payload['reasoning_effort_options'] = effortOptions;
     }
@@ -1018,7 +1383,8 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
                 decoration: const InputDecoration(
                   labelText: '可选档位（reasoning_effort_options）',
                   hintText: '如 low, high, max',
-                  helperText: '留空 = 默认 low/high/max；'
+                  helperText:
+                      '留空 = 默认 low/high/max；'
                       '只列该端点真正区分的档位，别名会被折叠',
                   isDense: true,
                 ),
@@ -1058,8 +1424,10 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
                 value: _thinking,
                 onChanged: (bool v) => setState(() => _thinking = v),
                 activeThumbColor: cs.primary,
-                title: const Text('思考模型（thinking）',
-                    style: TextStyle(fontSize: 13)),
+                title: const Text(
+                  '思考模型（thinking）',
+                  style: TextStyle(fontSize: 13),
+                ),
               ),
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
@@ -1067,8 +1435,10 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
                 value: _ifVision,
                 onChanged: (bool v) => setState(() => _ifVision = v),
                 activeThumbColor: cs.primary,
-                title: const Text('支持图像输入（if_vision）',
-                    style: TextStyle(fontSize: 13)),
+                title: const Text(
+                  '支持图像输入（if_vision）',
+                  style: TextStyle(fontSize: 13),
+                ),
               ),
             ],
           ),
@@ -1079,10 +1449,7 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('取消'),
         ),
-        ElevatedButton(
-          onPressed: _submit,
-          child: Text(_isEdit ? '保存' : '创建'),
-        ),
+        ElevatedButton(onPressed: _submit, child: Text(_isEdit ? '保存' : '创建')),
       ],
     );
   }

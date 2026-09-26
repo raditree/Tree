@@ -281,6 +281,12 @@ abstract interface class CoreSettingsSink {
 ///
 /// 说明：`dataCollection` 在桌面单用户形态下**没有收集方**，保留该开关
 /// 只为兼容既有设置页；M7 删除设置页对应卡片后应一并移除。
+///
+/// 心跳判活参数（M9 规约 1.1）也在这里：心跳间隔 I 与丢失阈值 N 决定判活窗口
+/// I×N，各心跳消费者（WS 判活 / 插件宿主 / MCP 客户端 / SSH 链路）**默认**从这里
+/// 取值。它们比帧率多一层**跨字段约束**——窗口必须严格大于前端固定的 10s WS 心跳
+/// （见 [minLivenessWindowSeconds]），由 [setLiveness] 在写入时强制满足并把原因写进
+/// [livenessNotice]（夹取而不拒绝，理由见 [setLiveness] 的文档）。
 class CoreSettings {
   /// 推送刷新帧率下限（与前端声明范围一致）。
   static const int frameRateMin = 20;
@@ -293,6 +299,28 @@ class CoreSettings {
 
   /// token 获取帧率上限（= 近似不限速）。
   static const int tokenRateMax = 1000;
+
+  /// 心跳间隔 I 的允许区间（秒）：1s 已经比本地回环的抖动密得多，600s 是"最松"。
+  static const int heartbeatIntervalMin = 1;
+  static const int heartbeatIntervalMax = 600;
+
+  /// 连续丢失阈值 N 的允许区间（次）。
+  static const int missedHeartbeatLimitMin = 1;
+  static const int missedHeartbeatLimitMax = 60;
+
+  /// 心跳间隔 I 的默认值（秒，用户已确认）。
+  static const int defaultHeartbeatIntervalSeconds = 10;
+
+  /// 连续丢失阈值 N 的默认值（次，用户已确认）。
+  static const int defaultMissedHeartbeatLimit = 3;
+
+  /// 判活窗口（I×N）必须**严格大于**的秒数。
+  ///
+  /// 前端 WS 心跳固定在 10s（`lib/io/websocket_service.dart` 的
+  /// `Timer.periodic(Duration(seconds: 10))`，M9 收口不改它）。服务端判活窗口
+  /// 若 ≤ 10s，"在线但空闲"的连接会在前端下一拍心跳到达之前就被判失活、关连接、
+  /// 反复重连——所以这是硬约束而不是建议值，[setLiveness] 会强制满足它。
+  static const int minLivenessWindowSeconds = 10;
 
   /// 模型没配 max_seqlen 时的兜底上下文长度。
   ///
@@ -316,6 +344,15 @@ class CoreSettings {
   ///
   /// 默认上限值（1000）= 近似不限速，保证未调校时行为与逐 token 直取一致。
   int _tokenAcquisitionRate = tokenRateMax;
+
+  /// 心跳间隔 I（秒）：判活节拍，落 settings.yaml 的 `heartbeat_interval`。
+  int _heartbeatIntervalSeconds = defaultHeartbeatIntervalSeconds;
+
+  /// 连续丢失阈值 N（次）：落 settings.yaml 的 `missed_heartbeat_limit`。
+  int _missedHeartbeatLimit = defaultMissedHeartbeatLimit;
+
+  /// 最近一次心跳判活参数写入的**可读说明**（只有真被夹取时才有值）。
+  String? _livenessNotice;
 
   /// 是否允许收集使用数据（桌面形态下无收集方，见类文档）。
   bool get dataCollectionEnabled => _dataCollectionEnabled;
@@ -341,6 +378,28 @@ class CoreSettings {
   /// token 获取帧率（帧/秒）。
   int get tokenAcquisitionRate => _tokenAcquisitionRate;
 
+  /// 心跳间隔 I（秒，判活节拍；设置页可调，默认 10）。
+  int get heartbeatIntervalSeconds => _heartbeatIntervalSeconds;
+
+  /// 心跳间隔 I 的 Duration 形态：各心跳消费者（WS 判活 / 插件宿主 / MCP /
+  /// SSH）直接拿它构造 LivenessTracker，免得每处再写一次 `Duration(seconds:)`。
+  Duration get heartbeatInterval =>
+      Duration(seconds: _heartbeatIntervalSeconds);
+
+  /// 连续丢失阈值 N（次；设置页可调，默认 3）。
+  int get missedHeartbeatLimit => _missedHeartbeatLimit;
+
+  /// 当前判活窗口 = I × N（秒）。
+  int get livenessWindowSeconds =>
+      _heartbeatIntervalSeconds * _missedHeartbeatLimit;
+
+  /// 最近一次写入被夹取时的**可读原因**；没有夹取则为 null。
+  ///
+  /// 存在的理由：夹取必须说得清"为什么"（用户填 1s 却生效成 4s 时要能看到原因）。
+  /// 它同时覆盖"用户绕开 UI 手改 yaml 写出非法组合"的场景——[applyMap] 装载时
+  /// 就修好并留下说明，GET 端点会把 [livenessNotice] 回给前端展示。
+  String? get livenessNotice => _livenessNotice;
+
   final Map<String, CoreModelConfig> _models = <String, CoreModelConfig>{};
 
   /// 从 settings.yaml 的映射装载（未知键进入 [extra]）。
@@ -351,9 +410,26 @@ class CoreSettings {
     );
     _dataCollectionEnabled = _bool(map, 'data_collection_enabled', false);
     _messageCutinDirect = _bool(map, 'message_cutin_direct', false);
+    // 心跳判活参数：手写 yaml 里的越界值 / 非法组合（例如 heartbeat_interval: 1
+    // 配 missed_heartbeat_limit: 1，窗口 1s ≤ 前端 10s 心跳）在这里就被修好，原因
+    // 留在 [livenessNotice] 里给前端看——装载阶段**不落盘**（改文件由下一次保存做）。
+    _applyLiveness(
+      intervalSeconds: _int(
+        map,
+        'heartbeat_interval',
+        defaultHeartbeatIntervalSeconds,
+      ),
+      missedLimit: _int(
+        map,
+        'missed_heartbeat_limit',
+        defaultMissedHeartbeatLimit,
+      ),
+    );
     extra = Map<String, dynamic>.from(map)
       ..remove('frame_rate')
       ..remove('token_acquisition_rate')
+      ..remove('heartbeat_interval')
+      ..remove('missed_heartbeat_limit')
       ..remove('data_collection_enabled')
       ..remove('message_cutin_direct');
   }
@@ -363,6 +439,8 @@ class CoreSettings {
     ...extra,
     'frame_rate': _frameRate,
     'token_acquisition_rate': _tokenAcquisitionRate,
+    'heartbeat_interval': _heartbeatIntervalSeconds,
+    'missed_heartbeat_limit': _missedHeartbeatLimit,
     'data_collection_enabled': _dataCollectionEnabled,
     'message_cutin_direct': _messageCutinDirect,
   };
@@ -450,6 +528,105 @@ class CoreSettings {
   static int _clampTokenRate(int value) => value < tokenRateMin
       ? tokenRateMin
       : (value > tokenRateMax ? tokenRateMax : value);
+
+  /// 写入心跳间隔 I（单字段；与 [setFrameRate] 同风格：夹取后返回生效值）。
+  int setHeartbeatIntervalSeconds(int value) =>
+      setLiveness(intervalSeconds: value).intervalSeconds;
+
+  /// 写入连续丢失阈值 N（单字段；夹取后返回生效值）。
+  int setMissedHeartbeatLimit(int value) =>
+      setLiveness(missedLimit: value).missedLimit;
+
+  /// 写入心跳判活参数（`null` 表示该项保持原值），返回**实际生效**的二元组。
+  ///
+  /// 为什么两个参数要能一起写：判活窗口 = I×N，单字段写入会经过"中间态"（例如
+  /// 想从 10s/3 改成 3s/6，先把 I 改成 3 的那一瞬间窗口只剩 9s）。端点因此都接受
+  /// 两个字段，核心在这一处一次性结算；只给一个字段也照常工作。
+  ///
+  /// 夹取规则（两步，都**不抛错**——端点永远有值可返回，把原因放进
+  /// [livenessNotice]）：
+  /// 1. 各自夹到绝对区间：I ∈ [1, 600] 秒、N ∈ [1, 60] 次；
+  /// 2. 若 `I×N ≤ [minLivenessWindowSeconds]`，**抬高 I**（保留用户给的 N）：
+  ///    用户给的 N 直接表达"连续丢几拍算死"的判据强度，改它更偏离原意；而抬高后的
+  ///    I 有确定上界（`10 ~/ N + 1 ≤ 11 ≤ 600`），必定仍在绝对区间内，所以这一步
+  ///    总能成功——这也是"夹取"能取代"拒绝"的原因。
+  ({int intervalSeconds, int missedLimit}) setLiveness({
+    int? intervalSeconds,
+    int? missedLimit,
+  }) {
+    _applyLiveness(intervalSeconds: intervalSeconds, missedLimit: missedLimit);
+    sink?.saveSettings(this);
+    return (
+      intervalSeconds: _heartbeatIntervalSeconds,
+      missedLimit: _missedHeartbeatLimit,
+    );
+  }
+
+  /// [setLiveness] 的实现体：装载路径（[applyMap]）复用同一套夹取与说明生成。
+  void _applyLiveness({int? intervalSeconds, int? missedLimit}) {
+    final List<String> notes = <String>[];
+    int nextInterval = intervalSeconds == null
+        ? _heartbeatIntervalSeconds
+        : _clampHeartbeatInterval(intervalSeconds);
+    int nextLimit = missedLimit == null
+        ? _missedHeartbeatLimit
+        : _clampMissedLimit(missedLimit);
+    if (intervalSeconds != null && nextInterval != intervalSeconds) {
+      notes.add(
+        '心跳间隔 ${intervalSeconds}s 超出 '
+        '$heartbeatIntervalMin~${heartbeatIntervalMax}s，'
+        '已夹到 ${nextInterval}s',
+      );
+    }
+    if (missedLimit != null && nextLimit != missedLimit) {
+      notes.add(
+        '丢失阈值 $missedLimit 次超出 '
+        '$missedHeartbeatLimitMin~$missedHeartbeatLimitMax 次，'
+        '已夹到 $nextLimit 次',
+      );
+    }
+    // 硬约束：判活窗口必须严格大于前端固定的 10s 心跳，否则空闲连接会被判失活
+    if (nextInterval * nextLimit <= minLivenessWindowSeconds) {
+      final int repaired = minimumIntervalSecondsFor(nextLimit);
+      notes.add(
+        '判活窗口 ${nextInterval}s×$nextLimit='
+        '${nextInterval * nextLimit}s 不大于前端固定 '
+        '${minLivenessWindowSeconds}s 的 WS 心跳间隔，空闲连接会被误判失活并'
+        '反复重连；已把心跳间隔夹到 ${repaired}s'
+        '（判活窗口 ${repaired * nextLimit}s）',
+      );
+      nextInterval = repaired;
+    }
+    _heartbeatIntervalSeconds = nextInterval;
+    _missedHeartbeatLimit = nextLimit;
+    // 没有夹取 = 没有需要解释的东西（顺带清掉上一次遗留下来的说明）
+    _livenessNotice = notes.isEmpty ? null : notes.join('；');
+  }
+
+  /// 满足 `I×N > [minLivenessWindowSeconds]` 的**最小** I（N 固定时）。
+  ///
+  /// 整数秒下最小可行值就是 `10 ~/ N + 1`；N ≤ 0 时不可能满足，返回上限
+  /// （调用方只会在 N ≥ 1 时用它，见 [setLiveness]）。
+  static int minimumIntervalSecondsFor(int missedLimit) => missedLimit <= 0
+      ? heartbeatIntervalMax
+      : minLivenessWindowSeconds ~/ missedLimit + 1;
+
+  /// 给定组合是否满足"判活窗口严格大于前端 WS 心跳间隔"这一硬约束。
+  ///
+  /// 核心启动与设置变更时用它判断"设置值能不能直接热更新到在跑的判活定时器上"
+  /// （见 core_server 的 `_applyLivenessToRunningHub`），测试与前端预校验同口径。
+  static bool livenessWindowOk(int intervalSeconds, int missedLimit) =>
+      intervalSeconds > 0 &&
+      missedLimit > 0 &&
+      intervalSeconds * missedLimit > minLivenessWindowSeconds;
+
+  static int _clampHeartbeatInterval(int value) => value < heartbeatIntervalMin
+      ? heartbeatIntervalMin
+      : (value > heartbeatIntervalMax ? heartbeatIntervalMax : value);
+
+  static int _clampMissedLimit(int value) => value < missedHeartbeatLimitMin
+      ? missedHeartbeatLimitMin
+      : (value > missedHeartbeatLimitMax ? missedHeartbeatLimitMax : value);
 
   static bool _bool(Map<String, dynamic> map, String key, bool fallback) {
     final Object? value = map[key];

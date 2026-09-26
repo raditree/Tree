@@ -72,8 +72,13 @@ Future<void> main(List<String> args) async {
 
   // MCP 服务（M6a）：配置在 <数据根>/config/mcp.yaml；启动时尝试连接一次，
   // 失败只在日志里说明（坏插件不该拦住核心启动）。
+  // 心跳判活参数（M9 1.1）从设置取：MCP 的 ping 节拍与"连续几拍算死"因此可调。
+  // 生效时机 = **下次核心启动**：McpService / McpClient 的这两个字段是 final，
+  // 构造后不再变（设置在运行期改了也不会改到这里，界面上写的是"下次启动生效"）。
   final McpService mcp = McpService(
     configFile: paths.mcpConfigFile,
+    heartbeatInterval: settings.heartbeatInterval,
+    missedHeartbeatLimit: settings.missedHeartbeatLimit,
     log: (String message) => stderr.writeln('[core:mcp] $message'),
   );
   await mcp.refresh();
@@ -84,9 +89,14 @@ Future<void> main(List<String> args) async {
 
   // 插件总线（M6b）：配置在 <数据根>/config/plugins.yaml；启动时拉起全部启用插件
   // 并开始心跳巡检。坏插件只标记为不可用，不拦住核心启动。
+  // 心跳判活参数（M9 1.1）同样来自设置：PluginBus 把它转给插件宿主（stdio 通道
+  // 的 LivenessTracker）与站点看门狗。生效时机 = **下次核心启动**（PluginBus /
+  // PluginHost 的字段是 final；插件重连只是复用同一份参数）。
   final PluginBus plugins = PluginBus(
     configFile: paths.pluginsConfigFile,
     coreVersion: TreeCore.version,
+    heartbeatInterval: settings.heartbeatInterval,
+    missThreshold: settings.missedHeartbeatLimit,
     // plugin_status / plugin_event 广播到前端（起监听后 hubSink 会被接上）
     broadcast: (Map<String, dynamic> frame) => hubSink?.call(frame),
     log: (String message) => stderr.writeln('[core:plugin] $message'),
@@ -159,6 +169,8 @@ Future<void> main(List<String> args) async {
     // SSH 后端（dartssh2 + SFTP/exec）：每个 agent 一条连接，按需建立并缓存；
     // 远端根目录取 ssh.root（空 = 远端登录用户的 HOME）。
     sshIoFactory: (SshConfig config) async {
+      // 心跳判活参数（M9 1.1）在**每次建连时**从设置现读：SSH 的 SshLiveness 归
+      // 这条连接所有，所以设置一改，下一条（重）建的连接就用新值——不必重启核心。
       final DartSshTransport transport = await DartSshTransport.connect(
         host: config.host,
         port: config.port,
@@ -166,6 +178,8 @@ Future<void> main(List<String> args) async {
         password: config.password,
         keyPath: config.resolvedKeyPath(),
         keyPassphrase: config.keyPassphrase,
+        heartbeatInterval: settings.heartbeatInterval,
+        maxMissedHeartbeats: settings.missedHeartbeatLimit,
       );
       final String root = await resolveRemoteRoot(transport, config.root);
       stderr.writeln('[core:tool] SSH 已连接 ${config.redacted()} root=$root');

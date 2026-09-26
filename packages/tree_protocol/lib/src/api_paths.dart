@@ -74,6 +74,17 @@ abstract final class ApiPaths {
   // ── 设置 / 插件 / MCP ─────────────────────────────────────────────────
   static const String settingsFrameRate = '/api/settings/frame-rate';
   static const String settingsTokenRate = '/api/settings/token-rate';
+
+  /// 心跳判活参数（M9 规约 1.1）：I = 心跳间隔（秒）、N = 连续丢失阈值（次）。
+  ///
+  /// 两者是**一个整体**（判活窗口 = I×N），所以两个端点同形状、都接受两个字段；
+  /// 窗口必须**严格大于**前端固定 10s 的 WS 心跳（`lib/io/websocket_service.dart`），
+  /// 否则"在线但空闲"的连接会被判失活并反复重连。
+  static const String settingsHeartbeatInterval =
+      '/api/settings/heartbeat-interval';
+  static const String settingsMissedHeartbeatLimit =
+      '/api/settings/missed-heartbeat-limit';
+
   static const String settingsMessageCutin = '/api/settings/message-cutin';
   static const String settingsDataCollection = '/api/settings/data-collection';
   static const String pluginSnapshot = '/api/plugin/snapshot';
@@ -114,6 +125,8 @@ abstract final class ApiPaths {
     workspaceGitBranches,
     settingsFrameRate,
     settingsTokenRate,
+    settingsHeartbeatInterval,
+    settingsMissedHeartbeatLimit,
     settingsMessageCutin,
     settingsDataCollection,
     pluginSnapshot,

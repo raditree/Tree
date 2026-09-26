@@ -107,6 +107,31 @@ class CoreServer {
   /// WS 连接注册表与广播。
   final WsHub hub;
 
+  /// 在线生效的 WS 判活节拍 I（= 保活定时器的实际间隔）。
+  ///
+  /// 启动时取自设置（或调用方显式传参），设置变更后可按需热更新（见
+  /// [_applyLivenessToRunningHub]）；观测与测试读它。
+  Duration _liveHeartbeatInterval = LivenessTracker.defaultInterval;
+
+  /// 在线生效的 WS 判活阈值 N（在线连接的 `LivenessTracker.maxMisses`）。
+  ///
+  /// 热更新只动节拍：`maxMisses` 与 `interval` 在 [LivenessTracker] 里都是 final，
+  /// 构造后改不了，所以这里记的是"在线台账真正在用的 N"。
+  int _liveHeartbeatMissLimit = LivenessTracker.defaultMaxMisses;
+
+  /// 调用方是否显式传过心跳参数（测试/调试的逃生口）：显式传参后设置不热更新——
+  /// 否则一次设置变更会悄悄改掉调用方明确指定的节拍。
+  bool _heartbeatPinned = false;
+
+  /// 保活/判活是否开启：`enableHeartbeat: false` 时不热更新（那会把定时器重新打开）。
+  bool _heartbeatEnabled = false;
+
+  /// 在线生效的 WS 判活节拍（= 保活定时器实际间隔；设置变更后热更新）。
+  Duration get liveHeartbeatInterval => _liveHeartbeatInterval;
+
+  /// 在线生效的 WS 判活阈值（在线连接台账的 N；热更新不改它，见字段文档）。
+  int get liveHeartbeatMissLimit => _liveHeartbeatMissLimit;
+
   /// 团队服务（M5b）；为 null 时不提供 teammates 路由（测试/最小骨架）。
   final TeamService? teamService;
 
@@ -214,8 +239,11 @@ class CoreServer {
     String version = treeCoreVersion,
     Duration streamChunkDelay = const Duration(milliseconds: 40),
     bool enableHeartbeat = true,
-    Duration heartbeatInterval = LivenessTracker.defaultInterval,
-    int heartbeatMissLimit = LivenessTracker.defaultMaxMisses,
+    // 心跳判活参数（M9 规约 1.1）：默认**读设置**（用户已确认 I=10s / N=3，
+    // 设置页可调）。显式传参仍是测试/调试的逃生口：传了就以传的为准，且不参与
+    // 运行期热更新（见 [_applyLivenessToRunningHub]）。
+    Duration? heartbeatInterval,
+    int? heartbeatMissLimit,
     TreeStore? store,
     CoreSettings? settings,
     TodoStore? todoStore,
@@ -240,13 +268,19 @@ class CoreServer {
     final TreeStore resolvedStore = store ?? MemoryStore();
     final CoreSettings resolvedSettings = settings ?? CoreSettings();
     final TodoStore resolvedTodos = todoStore ?? MemoryTodoStore();
-    // 心跳间隔沿用 [heartbeatInterval]（默认 I=10s，与前端 10s 心跳节奏对齐；
-    // 前端间隔必须小于本处判活窗口 I×N，否则"在线但空闲"的连接会被误判失活），
-    // 连续 [heartbeatMissLimit]（默认 N=3）拍收不到任何入站帧才判失活。
+    // 心跳判活参数默认取设置（I=10s / N=3）：设置层保证 I×N **严格大于**前端固定的
+    // 10s WS 心跳（见 CoreSettings.minLivenessWindowSeconds），否则"在线但空闲"的
+    // 连接会被误判失活。连续 [resolvedHeartbeatMissLimit] 拍收不到任何入站帧才判失活，
     // 详见 LivenessWsHub 的类文档。
+    final bool heartbeatPinned =
+        heartbeatInterval != null || heartbeatMissLimit != null;
+    final Duration resolvedHeartbeatInterval =
+        heartbeatInterval ?? resolvedSettings.heartbeatInterval;
+    final int resolvedHeartbeatMissLimit =
+        heartbeatMissLimit ?? resolvedSettings.missedHeartbeatLimit;
     final LivenessWsHub hub = LivenessWsHub(
-      interval: heartbeatInterval,
-      maxMisses: heartbeatMissLimit,
+      interval: resolvedHeartbeatInterval,
+      maxMisses: resolvedHeartbeatMissLimit,
     );
     final CoreServer server = CoreServer._(
       http,
@@ -278,6 +312,12 @@ class CoreServer {
       reassembler: InboundFrameReassembler(),
       version: version,
     );
+    // 记录"在线生效"的判活参数：设置变更时用它判断能不能热更新节拍，也是观测/
+    // 测试的读数点（见 liveHeartbeatInterval / liveHeartbeatMissLimit）。
+    server._heartbeatPinned = heartbeatPinned;
+    server._heartbeatEnabled = enableHeartbeat;
+    server._liveHeartbeatInterval = resolvedHeartbeatInterval;
+    server._liveHeartbeatMissLimit = resolvedHeartbeatMissLimit;
     // Q9：Spec 索引注入系统提示词。做成**可设置的 provider**（而不是给
     // `systemPromptWithWorkspace` 加参数）是因为提示词在会话生成与压缩估算两处
     // 拼装，两处必须逐字一致；provider 让它们自动同口径，也不需要改会话服务。
@@ -297,10 +337,14 @@ class CoreServer {
     // - 判死：写错误日志 + 关连接（前端会自动重连，这就是"触发重连"）；
     // - 恢复：把消息派发侧在失活期间登记的待补发消息补出去；
     // - 派发侧活性：接上"全体连接"级别的台账（心跳丢失 ⇒ 派发显式报错 + 登记补发）。
-    hub.onStale = (String connectionId, LivenessTracker beat) =>
-        server.errorLog?.call('WS 连接 $connectionId ${beat.staleMessage}');
-    hub.onLinkStale = (LivenessTracker beat) =>
-        server.errorLog?.call('WS 链路 ${beat.staleMessage}');
+    hub.onStale = (String connectionId, LivenessTracker beat) {
+      final String text = server._livenessLogText(beat);
+      server.errorLog?.call('WS 连接 $connectionId $text');
+    };
+    hub.onLinkStale = (LivenessTracker beat) {
+      final String text = server._livenessLogText(beat);
+      server.errorLog?.call('WS 链路 $text');
+    };
     hub.onLinkRecovered = () {
       final TeamMessageDispatcher? dispatcher = messageDispatcher;
       if (dispatcher == null) return;
@@ -314,7 +358,7 @@ class CoreServer {
     server._registerRoutes();
     server._registerStubRoutes();
     if (enableHeartbeat) {
-      hub.startHeartbeat(interval: heartbeatInterval);
+      hub.startHeartbeat(interval: resolvedHeartbeatInterval);
     }
     http.listen(server._dispatch, onError: (Object _) {}, cancelOnError: false);
     return server;
@@ -744,6 +788,38 @@ class CoreServer {
     router.add('POST', ApiPaths.settingsFrameRate, _setFrameRate);
     router.add('GET', ApiPaths.settingsTokenRate, _getTokenRate);
     router.add('POST', ApiPaths.settingsTokenRate, _setTokenRate);
+    // 心跳判活参数：两个端点同形状（都接受两个字段），PATCH 是主用法（部分更新），
+    // POST 作别名与帧率端点保持一致的调用习惯。
+    router.add(
+      'GET',
+      ApiPaths.settingsHeartbeatInterval,
+      _getHeartbeatInterval,
+    );
+    router.add(
+      'PATCH',
+      ApiPaths.settingsHeartbeatInterval,
+      _setHeartbeatInterval,
+    );
+    router.add(
+      'POST',
+      ApiPaths.settingsHeartbeatInterval,
+      _setHeartbeatInterval,
+    );
+    router.add(
+      'GET',
+      ApiPaths.settingsMissedHeartbeatLimit,
+      _getMissedHeartbeatLimit,
+    );
+    router.add(
+      'PATCH',
+      ApiPaths.settingsMissedHeartbeatLimit,
+      _setMissedHeartbeatLimit,
+    );
+    router.add(
+      'POST',
+      ApiPaths.settingsMissedHeartbeatLimit,
+      _setMissedHeartbeatLimit,
+    );
     router.add('GET', ApiPaths.settingsMessageCutin, _getMessageCutin);
     router.add('POST', ApiPaths.settingsMessageCutin, _setMessageCutin);
     router.add('POST', ApiPaths.settingsDataCollection, _setDataCollection);
@@ -1685,6 +1761,150 @@ class CoreServer {
     await writeJson(request, 200, <String, dynamic>{'success': true});
   }
 
+  // ── 心跳判活参数（M9 规约 1.1；用户已确认默认 I=10s / N=3） ─────────────
+  //
+  // 两个参数是一体的：判活窗口 = I×N，且必须**严格大于**前端固定 10s 的 WS 心跳
+  // （lib/io/websocket_service.dart，M9 收口不改它），否则"在线但空闲"的连接会被
+  // 判失活并反复重连。因此：
+  // - 两个端点**同形状**、都接受两个字段一起写（避免两次单字段写入之间出现非法
+  //   中间态），响应永远给出生效值 + 区间 + 窗口；
+  // - 夹取而不拒绝（规则与理由见 CoreSettings.setLiveness 的文档），真夹了就把
+  //   可读原因放进 `notice`——用户要能知道"我填的 1s 为什么生效成 4s"；
+  // - 写成功后立即把新节拍热更新到**在跑**的判活定时器上（见
+  //   [_applyLivenessToRunningHub]），不必重启核心。
+
+  Future<void> _getHeartbeatInterval(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    await writeJson(
+      request,
+      200,
+      _livenessBody(
+        min: CoreSettings.heartbeatIntervalMin,
+        max: CoreSettings.heartbeatIntervalMax,
+      ),
+    );
+  }
+
+  Future<void> _setHeartbeatInterval(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    _patchLiveness(await readJsonBody(request));
+    await writeJson(
+      request,
+      200,
+      _livenessBody(
+        min: CoreSettings.heartbeatIntervalMin,
+        max: CoreSettings.heartbeatIntervalMax,
+      ),
+    );
+  }
+
+  Future<void> _getMissedHeartbeatLimit(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    await writeJson(
+      request,
+      200,
+      _livenessBody(
+        min: CoreSettings.missedHeartbeatLimitMin,
+        max: CoreSettings.missedHeartbeatLimitMax,
+      ),
+    );
+  }
+
+  Future<void> _setMissedHeartbeatLimit(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    _patchLiveness(await readJsonBody(request));
+    await writeJson(
+      request,
+      200,
+      _livenessBody(
+        min: CoreSettings.missedHeartbeatLimitMin,
+        max: CoreSettings.missedHeartbeatLimitMax,
+      ),
+    );
+  }
+
+  /// 写入心跳判活参数（PATCH / POST 同义：只改请求体里出现的字段）并把新值热更新到
+  /// 在跑的 WS 判活节拍上。
+  void _patchLiveness(Map<String, dynamic> body) {
+    settings.setLiveness(
+      intervalSeconds: _optionalInt(body, 'heartbeat_interval'),
+      missedLimit: _optionalInt(body, 'missed_heartbeat_limit'),
+    );
+    _applyLivenessToRunningHub();
+  }
+
+  /// 心跳判活端点的响应体（两个端点同形状）。
+  Map<String, dynamic> _livenessBody({required int min, required int max}) {
+    final String? notice = settings.livenessNotice;
+    return <String, dynamic>{
+      // 设置值（= 实际写入 settings.yaml 的值）
+      'heartbeat_interval': settings.heartbeatIntervalSeconds,
+      'missed_heartbeat_limit': settings.missedHeartbeatLimit,
+      // 本端点管的那一项的绝对区间（与帧率端点同形状）
+      'min': min,
+      'max': max,
+      // 两项各自的绝对区间：前端有两个输入框，而 min/max 只描述本端点那一项
+      'heartbeat_interval_min': CoreSettings.heartbeatIntervalMin,
+      'heartbeat_interval_max': CoreSettings.heartbeatIntervalMax,
+      'missed_heartbeat_limit_min': CoreSettings.missedHeartbeatLimitMin,
+      'missed_heartbeat_limit_max': CoreSettings.missedHeartbeatLimitMax,
+      // 判活窗口 = I×N，必须**严格大于** min_window（前端固定的 10s WS 心跳）
+      'window_seconds': settings.livenessWindowSeconds,
+      'min_window_seconds': CoreSettings.minLivenessWindowSeconds,
+      // 在线生效值：设置变更后 WS 判活节拍会热更新，N 只能等下次核心启动
+      // （LivenessTracker.maxMisses 是 final）；两者不等时前端应说明生效时机。
+      'live_interval_seconds': _liveHeartbeatInterval.inSeconds,
+      'live_miss_limit': _liveHeartbeatMissLimit,
+      // 只有真发生夹取时才给：可读原因（含"为什么"和实际生效值）
+      'notice': ?notice,
+    };
+  }
+
+  /// 把新设置热更新到**在跑**的保活定时器上（"保存后立即生效"）。
+  ///
+  /// 只能热更新节拍 I：在线连接的阈值在 `LivenessTracker.maxMisses`（final）里，
+  /// 而定时器的节拍决定"多久算一拍"，所以热更新后的实际判活窗口 = 新节拍 × 在线 N。
+  /// 因此只在"按**在线** N 计算仍然 > 前端 10s 心跳"时才动定时器——不能为了立即
+  /// 生效把空闲连接推回会被误判失活的窗口；不满足就继续用旧节拍（下次启动核心起
+  /// 用新值，响应里的 live_interval_seconds 会让前端说明这一点）。
+  ///
+  /// 调用方显式传过心跳参数（测试/调试逃生口）或保活被关掉时都不动。
+  void _applyLivenessToRunningHub() {
+    if (_heartbeatPinned || !_heartbeatEnabled) return;
+    final WsHub running = hub;
+    if (running is! LivenessWsHub) return;
+    final int liveMissLimit = running.linkLiveness.maxMisses;
+    final int intervalSeconds = settings.heartbeatIntervalSeconds;
+    if (!CoreSettings.livenessWindowOk(intervalSeconds, liveMissLimit)) return;
+    _liveHeartbeatMissLimit = liveMissLimit;
+    final Duration interval = Duration(seconds: intervalSeconds);
+    if (interval == _liveHeartbeatInterval) return;
+    _liveHeartbeatInterval = interval;
+    running.startHeartbeat(interval: interval);
+  }
+
+  /// 判活上报文案：节拍被热更新过时补一句真相。
+  ///
+  /// 在线台账（[LivenessTracker]）的 I/N 是 final，热更新只改定时器节拍，所以
+  /// `staleMessage` 里的"心跳间隔"可能仍是启动值——日志不能因此骗人：实际窗口按
+  /// 热更新后的节拍算，这里明说。
+  String _livenessLogText(LivenessTracker beat) {
+    final String text = beat.staleMessage;
+    final Duration trackerInterval = beat.interval;
+    if (trackerInterval == _liveHeartbeatInterval) return text;
+    return '$text；节拍已按设置热更新为 '
+        '${LivenessTracker.formatDuration(_liveHeartbeatInterval)}'
+        '（台账仍记启动值 ${LivenessTracker.formatDuration(trackerInterval)}）';
+  }
+
   // ── 插件 / MCP ───────────────────────────────────────────────────────
 
   /// 文件/工作空间路由的统一错误处理（FileService 用 `{error, status}` 表达失败）。
@@ -1702,6 +1922,16 @@ class CoreServer {
   static int _asInt(Object? value) {
     if (value is num) return value.toInt();
     return int.tryParse('${value ?? ''}') ?? 0;
+  }
+
+  /// 宽松解析**可选**整数字段：缺字段 / 非法值一律返回 null = **不改该项**。
+  ///
+  /// 刻意不学 [_asInt] 兜 0：0 会被夹到区间下限，等于"字段写错了却悄悄改了配置"。
+  static int? _optionalInt(Map<String, dynamic> body, String key) {
+    final Object? raw = body[key];
+    if (raw is num) return raw.toInt();
+    if (raw is String) return int.tryParse(raw.trim());
+    return null;
   }
 
   /// 服务层结果里带 `error` 时写回错误响应并返回 true（文件、压缩等共用）。

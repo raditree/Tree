@@ -679,6 +679,45 @@ class ApiService {
     return (data['token_rate'] as num?)?.toInt() ?? tokenRate;
   }
 
+  // ==================== 心跳判活参数（M9 1.1：I × N） ====================
+
+  /// 查询心跳判活参数（心跳间隔 I 秒 + 丢失阈值 N 次）
+  ///
+  /// 调用 `GET /api/settings/heartbeat-interval`，返回：
+  /// `{heartbeat_interval, missed_heartbeat_limit, min, max, window_seconds,
+  /// min_window_seconds, live_interval_seconds, live_miss_limit}`；
+  /// 真发生夹取时多一个 `notice`（可直接显示给用户的原因）。
+  ///
+  /// 两个参数是一体的（判活窗口 = I×N），所以两个端点的响应同形状——前端只读
+  /// 这一个就够；写也一样（见 [setHeartbeatLivenessSettings]）。
+  static Future<Map<String, dynamic>> getHeartbeatLivenessSettings() async {
+    return _getJson('/api/settings/heartbeat-interval');
+  }
+
+  /// 写入心跳判活参数（两个字段可一起给；没给的字段保持原值）
+  ///
+  /// 调用 `PATCH /api/settings/heartbeat-interval`（核心的另一个端点
+  /// `/api/settings/missed-heartbeat-limit` 与它同形状、同语义，供只改 N 的调用方
+  /// 使用）。用 PATCH 是因为语义是**部分更新**（只改请求体里出现的字段），与帧率
+  /// 那两个 POST 端点的"整体覆盖"不同。
+  ///
+  /// 后端夹取（不报错，永远返回生效值）：① 各自夹到绝对区间；② 判活窗口 I×N
+  /// 必须**严格大于**前端固定的 10s WS 心跳（见 lib/io/websocket_service.dart 的
+  /// 心跳定时器，本页不可调），不足时抬高 I。调用方应当把响应里的 `notice`
+  /// （若有）显示给用户——那是"为什么我填的值没生效"的唯一可读解释。
+  static Future<Map<String, dynamic>> setHeartbeatLivenessSettings({
+    int? heartbeatIntervalSeconds,
+    int? missedHeartbeatLimit,
+  }) async {
+    return _patchJson(
+      '/api/settings/heartbeat-interval',
+      body: <String, dynamic>{
+        'heartbeat_interval': ?heartbeatIntervalSeconds,
+        'missed_heartbeat_limit': ?missedHeartbeatLimit,
+      },
+    );
+  }
+
   // ==================== 插件体系接口（右栏「插件」页） ====================
 
   /// 获取插件体系只读快照（右栏「插件」面板数据源）
