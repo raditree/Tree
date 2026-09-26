@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:tree_core/tree_core.dart';
+import 'package:tree_local_exec/tree_local_exec.dart';
 
 /// 核心进程入口（`dart compile exe` → `tree_core.exe`）。
 ///
@@ -61,8 +62,22 @@ Future<void> main(List<String> args) async {
   final FileTodoStore todos = FileTodoStore(paths);
   final WorkspaceToolRunner tools = WorkspaceToolRunner(
     todoStore: todos,
-    // SSH 后端（dartssh2）在 M4b-2 接入；当前配置了 ssh 的 agent 会明确报未接入
     resolveSshConfig: (String agentId) => store.agent(agentId)?.sshConfig,
+    // SSH 后端（dartssh2 + SFTP/exec）：每个 agent 一条连接，按需建立并缓存；
+    // 远端根目录取 ssh.root（空 = 远端登录用户的 HOME）。
+    sshIoFactory: (SshConfig config) async {
+      final DartSshTransport transport = await DartSshTransport.connect(
+        host: config.host,
+        port: config.port,
+        username: config.username,
+        password: config.password,
+        keyPath: config.resolvedKeyPath(),
+        keyPassphrase: config.keyPassphrase,
+      );
+      final String root = await resolveRemoteRoot(transport, config.root);
+      stderr.writeln('[core:tool] SSH 已连接 ${config.redacted()} root=$root');
+      return SshWorkspaceIO(root, transport);
+    },
     resolveWorkspaceDir: (String agentId) {
       final String configured = store.agent(agentId)?.workspaceDir ?? '';
       return configured.trim().isNotEmpty

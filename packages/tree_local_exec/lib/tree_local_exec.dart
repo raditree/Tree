@@ -8,12 +8,13 @@
 /// `tool_exec_response` 那套反向协议与前端两个执行器服务都成了多余（M7 清理）。
 library;
 
+export 'src/dartssh_transport.dart';
 export 'src/local_workspace_io.dart';
 export 'src/ssh_workspace_io.dart';
 export 'src/shell.dart';
 export 'src/workspace_io.dart';
 
-/// 本机执行后端分组（本地已实现；SSH 在 M4-4 落地）。
+/// 本机执行后端分组（本地 / SSH 均已实现：SSH 走 dartssh2 + SFTP/exec）。
 abstract final class TreeLocalExec {
   /// 当前已实现的后端分组数（local / ssh）。
   static const int backendCount = 2;

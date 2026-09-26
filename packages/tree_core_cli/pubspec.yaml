@@ -12,6 +12,9 @@ dependencies:
   # 集成测试直接断言进程间握手信封（CoreHandshake）
   tree_protocol:
     path: ../tree_protocol
+  # 装配工作空间后端（本地 / SSH，含 dartssh2 传输）
+  tree_local_exec:
+    path: ../tree_local_exec
 
 dev_dependencies:
   lints: ^6.0.0

@@ -46,6 +46,34 @@ class SshExecResult {
   final bool timedOut;
 }
 
+/// 把用户填写的远端工作空间根目录解析成**绝对路径**。
+///
+/// 远端只认绝对路径：SFTP 不展开 `~`（那是 shell 的活），也不会跟着登录 shell 的
+/// cwd 走。因此这里先问远端要一次 `$HOME`，再把 `~` / 相对路径拼上去；已是绝对路径
+/// 的只做 POSIX 归一化（去掉尾斜杠——尾斜杠会让 [SshWorkspaceIO] 的越界判断出错）。
+///
+/// 只发一条 `printf`（不读取远端 shell 配置），也不需要远端有任何额外工具。
+Future<String> resolveRemoteRoot(
+  SshTransport transport,
+  String root, {
+  String fallback = '.',
+}) async {
+  final String raw = root.trim();
+  final String candidate = raw.isEmpty ? fallback : raw;
+  if (candidate.startsWith('/')) return p.posix.normalize(candidate);
+  final SshExecResult result = await transport.run(r'printf %s "$HOME"');
+  final String home = result.stdout.trim();
+  if (result.exitCode != 0 || !home.startsWith('/')) {
+    throw WorkspaceIoException('无法解析远端 HOME（exit=${result.exitCode}，输出：$home）');
+  }
+  final String joined = candidate == '~'
+      ? home
+      : (candidate.startsWith('~/')
+            ? '$home/${candidate.substring(2)}'
+            : '$home/$candidate');
+  return p.posix.normalize(joined);
+}
+
 /// [WorkspaceIO] 的 SSH 实现：语义与 [LocalWorkspaceIO] 完全一致，只是字节
 /// 从远端来/去。
 ///
@@ -223,7 +251,7 @@ class SshWorkspaceIO implements WorkspaceIO {
           GrepMatch(
             path: p.posix
                 .join(relativize(start), rel)
-                .replaceFirst(RegExp(r'^\\./'), ''),
+                .replaceFirst(RegExp(r'^\./'), ''),
             lineNumber: lineNumber,
             line: line.length > 500 ? '${line.substring(0, 500)}…' : line,
           ),
@@ -328,7 +356,7 @@ class SshWorkspaceIO implements WorkspaceIO {
     ).hasMatch(name);
   }
 
-  static String _quote(String value) => "'${value.replaceAll("'", r"'\\''")}'";
+  static String _quote(String value) => "'${value.replaceAll("'", "'\\''")}'";
 
   static String _truncate(String text, int maxBytes) {
     if (text.length <= maxBytes) return text;

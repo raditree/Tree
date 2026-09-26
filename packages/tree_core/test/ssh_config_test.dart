@@ -45,6 +45,27 @@ void main() {
       expect(SshConfig.parse(null), isNull);
     });
 
+    test('root / remote_root 解析进 root 并持久化；未配置不落盘', () {
+      final SshConfig? parsed = SshConfig.parse(<String, dynamic>{
+        'host': 'h',
+        'username': 'u',
+        'password': 'p',
+        'remote_root': ' ~/proj ',
+      });
+      expect(parsed?.root, '~/proj');
+      expect(parsed?.toJson()['root'], '~/proj');
+      expect(parsed?.isComplete, isTrue, reason: 'root 不影响最小连接信息');
+
+      final SshConfig plain = SshConfig.parse(<String, dynamic>{
+        'host': 'h',
+        'username': 'u',
+        'password': 'p',
+      })!;
+      expect(plain.root, isEmpty);
+      expect(plain.toJson().containsKey('root'), isFalse);
+      expect(plain.redacted().containsKey('root'), isFalse);
+    });
+
     test('isComplete / missingFields 指出缺什么', () {
       final SshConfig? bare = SshConfig.parse(<String, dynamic>{'host': 'h'});
       expect(bare?.isComplete, isFalse);
@@ -160,7 +181,7 @@ void main() {
           username: 'u',
           password: 'pw',
         ),
-        sshIoFactory: (SshConfig config) {
+        sshIoFactory: (SshConfig config) async {
           used.add(config);
           return LocalWorkspaceIO(remoteRoot.path);
         },
@@ -210,7 +231,8 @@ void main() {
         resolveWorkspaceDir: (String id) => localRoot.path,
         resolveSshConfig: (String id) =>
             SshConfig.parse(<String, dynamic>{'host': 'h'}),
-        sshIoFactory: (SshConfig config) => LocalWorkspaceIO(remoteRoot.path),
+        sshIoFactory: (SshConfig config) async =>
+            LocalWorkspaceIO(remoteRoot.path),
         log: logs.add,
       );
       final ToolOutcome outcome = await runner.run(

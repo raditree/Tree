@@ -19,6 +19,7 @@ class SshConfig {
     this.password = '',
     this.keyPath = '',
     this.keyPassphrase = '',
+    this.root = '',
   });
 
   /// 从 agent yaml 的 `ssh:` 映射解析；缺少 host 时返回 null。
@@ -37,6 +38,9 @@ class SshConfig {
       keyPath: (map['key_path'] ?? map['keyPath'] ?? '').toString().trim(),
       keyPassphrase: (map['key_passphrase'] ?? map['keyPassphrase'] ?? '')
           .toString(),
+      root: (map['root'] ?? map['remote_root'] ?? map['dir'] ?? '')
+          .toString()
+          .trim(),
     );
   }
 
@@ -48,6 +52,12 @@ class SshConfig {
   /// 私钥路径（支持 `~`）；为空则用 [password]。
   final String keyPath;
   final String keyPassphrase;
+
+  /// 远端工作空间根目录（空 = 远端登录用户的 HOME）。
+  ///
+  /// 绝不直接用字符串拼命令：`~` 与相对路径要先问远端 `$HOME` 再展开
+  /// （见 tree_local_exec 的 `resolveRemoteRoot`），SFTP 自己不会展开。
+  final String root;
 
   /// 是否具备建立连接的最小信息。
   bool get isComplete =>
@@ -70,6 +80,7 @@ class SshConfig {
     'auth': password.isNotEmpty
         ? 'password'
         : (keyPath.isNotEmpty ? 'key' : 'none'),
+    if (root.isNotEmpty) 'root': root,
   };
 
   /// 持久化形态（**含凭据**，写进 agent yaml；与模型 api_key 同一策略）。
@@ -80,6 +91,7 @@ class SshConfig {
     if (password.isNotEmpty) 'password': password,
     if (keyPath.isNotEmpty) 'key_path': keyPath,
     if (keyPassphrase.isNotEmpty) 'key_passphrase': keyPassphrase,
+    if (root.isNotEmpty) 'root': root,
   };
 
   /// 展开 `~` 为用户目录（dartssh2 不做这个展开）。
