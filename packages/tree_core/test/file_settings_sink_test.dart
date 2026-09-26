@@ -23,7 +23,7 @@ void main() {
     File(paths.settingsFile).writeAsStringSync('''
 # 手写注释
 frame_rate: 120
-rate_limit_enabled: "true"
+token_acquisition_rate: "240"
 message_cutin_direct: on
 custom_extra_key: 保留我
 ''');
@@ -42,7 +42,7 @@ max_seqlen: 32000
     FileSettingsSink(paths, log: logs.add).load(settings);
 
     expect(settings.frameRate, 120);
-    expect(settings.rateLimitEnabled, isTrue);
+    expect(settings.tokenAcquisitionRate, 240);
     expect(settings.messageCutinDirect, isTrue);
     expect(settings.extra['custom_extra_key'], '保留我');
     expect(settings.model('demo')?.name, '我的手写模型');
@@ -60,7 +60,7 @@ max_seqlen: 32000
 
     settings.extra['custom_extra_key'] = '保留我';
     settings.setFrameRate(300);
-    settings.rateLimitEnabled = true;
+    settings.setTokenAcquisitionRate(240);
     settings.createModel(<String, dynamic>{
       'model_id': 'demo',
       'name': '新模型',
@@ -71,7 +71,7 @@ max_seqlen: 32000
 
     final String settingsYaml = File(paths.settingsFile).readAsStringSync();
     expect(settingsYaml, contains('frame_rate: 300'));
-    expect(settingsYaml, contains('rate_limit_enabled: true'));
+    expect(settingsYaml, contains('token_acquisition_rate: 240'));
     expect(settingsYaml, contains('# Tree 全局设置'));
     // 值含中日韩字符会被保守地加引号（读回来仍是字符串）
     expect(settingsYaml, contains('custom_extra_key:'));
@@ -87,7 +87,7 @@ max_seqlen: 32000
     final CoreSettings reloaded = CoreSettings();
     FileSettingsSink(paths).load(reloaded);
     expect(reloaded.frameRate, 300);
-    expect(reloaded.rateLimitEnabled, isTrue);
+    expect(reloaded.tokenAcquisitionRate, 240);
     expect(reloaded.model('demo')?.apiKey, 'sk-plain');
     expect(reloaded.extra['custom_extra_key'], '保留我');
 

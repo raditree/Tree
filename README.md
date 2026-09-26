@@ -243,7 +243,7 @@ desktop/                       # desktop 分支（独立 git worktree）
 ```
 ~/.tree/
 ├── config/
-│   ├── settings.yaml          # 全局设置（帧率 / 主动延迟 / 消息切入 / 数据收集）
+│   ├── settings.yaml          # 全局设置（token 帧率 / 推送帧率 / 消息切入 / 数据收集）
 │   ├── models/<id>.yaml       # 模型（含明文 api_key；用户私有文件）
 │   ├── mcp.yaml               # MCP 服务
 │   └── plugins.yaml           # 插件

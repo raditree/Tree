@@ -48,6 +48,10 @@ class _PendingMessage {
 ///   （前端对 `error` 帧是静默忽略的，只发 error 用户会看不到任何反馈）；
 /// - [AgentDone] → 每个流式消息的 `msg_end` + `agent_status(idle)`。
 ///
+/// 节奏控制（**均常开、无开关**，见 [CoreSettings]）：
+/// - token 获取帧率：消费文本/思考增量时按帧率让帧（[_paceToken]）；
+/// - 推送刷新帧率：增量攒帧后按帧率合并成一条 `msg_chunk`（[_ChunkPump]）。
+///
 /// 并发策略：**按 agent 串行**（同一 agent 的多条消息排队执行）。同一会话的
 /// 流式片段若交错下发，前端的 `msg_chunk` 追加会互相污染。
 class ConversationService {
@@ -284,6 +288,14 @@ class ConversationService {
       'agent_id': agent.id,
       'session_id': session.sessionId,
     };
+    // 推送刷新帧率：本轮所有流式增量先攒帧，按帧率合并成一条 `msg_chunk` 下发。
+    // 内容总量不变（落库用完整文本），只把「逐 token 下发」降为「按帧率下发」，
+    // 避免以 token 速率刷屏。常开、无开关，帧率由设置页调节。
+    final _ChunkPump pump = _ChunkPump(
+      frameRate: settings.frameRate,
+      envelope: envelope,
+      hub: hub,
+    );
     hub.broadcast(<String, dynamic>{
       'type': WsOutboundType.agentStatus,
       'data': <String, dynamic>{'agent_id': agent.id, 'status': 'working'},
@@ -301,6 +313,7 @@ class ConversationService {
     String? errorMessage;
 
     void startStreamingMessage(_PendingMessage message) {
+      pump.flush(); // 先把上一批增量落地，保证界面顺序与事件顺序一致
       pending.add(message);
       hub.broadcast(<String, dynamic>{
         'type': WsOutboundType.msgStart,
@@ -311,13 +324,9 @@ class ConversationService {
     }
 
     void appendChunk(_PendingMessage message, String delta) {
+      // 正文完整写入（落库口径不变），下发则交给 pump 按帧率攒帧合并
       message.content.write(delta);
-      hub.broadcast(<String, dynamic>{
-        'type': WsOutboundType.msgChunk,
-        'id': message.id,
-        'chunk': delta,
-        ...envelope,
-      });
+      pump.add(message.id, delta);
     }
 
     // 自动压缩（M7d-4）：长会话先把早期历史总结掉，再按「摘要 + 近期消息」生成。
@@ -354,6 +363,7 @@ class ConversationService {
           );
           if (message.content.isEmpty) startStreamingMessage(message);
           appendChunk(message, event.delta);
+          await _paceToken();
         } else if (event is AgentThinking) {
           final _PendingMessage message = thinkingMessage ??= _PendingMessage(
             id: CoreIds.message(),
@@ -361,6 +371,7 @@ class ConversationService {
           );
           if (message.content.isEmpty) startStreamingMessage(message);
           appendChunk(message, event.delta);
+          await _paceToken();
         } else if (event is AgentToolStart) {
           final _PendingMessage message =
               _PendingMessage(id: event.id, kind: 'tool')
@@ -369,6 +380,7 @@ class ConversationService {
                 ..toolCallId = event.callId;
           toolMessages[event.id] = message;
           pending.add(message);
+          pump.flush(); // 工具卡片前先落地正文，避免界面顺序错位
           hub.broadcast(<String, dynamic>{
             'type': WsOutboundType.toolStart,
             'id': message.id,
@@ -380,6 +392,7 @@ class ConversationService {
           final _PendingMessage? message = toolMessages[event.id];
           if (message == null) continue;
           message.toolResult = event.result;
+          pump.flush();
           hub.broadcast(<String, dynamic>{
             'type': WsOutboundType.toolEnd,
             'id': event.id,
@@ -389,6 +402,7 @@ class ConversationService {
           });
         } else if (event is AgentUsage) {
           usage = event.usage;
+          pump.flush();
           hub.broadcast(<String, dynamic>{
             'type': WsOutboundType.msgUsage,
             'id': textMessage?.id ?? '',
@@ -405,6 +419,8 @@ class ConversationService {
       errorMessage ??= '生成失败：$error';
     }
     if (token.cancelled) cancelled = true;
+    // 结束/中断本轮：停表并落地残余增量，保证 msg_end 之前正文已全部下发
+    pump.dispose();
 
     // 端点没给 usage 时用本地估算兜底（前端上下文进度条依赖该字段）
     final Map<String, dynamic> finalUsage =
@@ -474,6 +490,18 @@ class ConversationService {
       'data': <String, dynamic>{'agent_id': agent.id, 'status': 'idle'},
     });
     _running.remove(agent.id);
+  }
+
+  /// token 获取帧率：每消费一个文本/思考增量后按帧率间隔让出一帧。
+  ///
+  /// 这是「从 LLM 流取回复」的节奏控制（替代旧的「主动延迟」），常开无开关；
+  /// 取上限值（1000）时约 1ms/增量，等价于逐 token 不限速。
+  Future<void> _paceToken() {
+    final int fps =
+        settings.tokenAcquisitionRate < 1 ? 1 : settings.tokenAcquisitionRate;
+    return Future<void>.delayed(
+      Duration(microseconds: (1000000 / fps).ceil()),
+    );
   }
 
   /// 推一条完整的 agent 文本消息（`message` 帧）并落库。
@@ -593,5 +621,60 @@ class ConversationService {
               e.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
         )
         .toList();
+  }
+}
+
+/// 流式「推送刷新帧率」：把同一消息的增量攒帧后按帧率合并成一条 `msg_chunk`。
+///
+/// 定时器每 `1/帧率` 秒把攒下的增量合并广播一次（同一消息一次一帧）；内容总量
+/// 不变，只是把下发/渲染频率从「token 速率」降到「帧率」。任何非增量帧下发前都
+/// 要先 [flush]，[dispose] 时停表并落地残余，保证界面顺序与事件顺序一致。
+class _ChunkPump {
+  _ChunkPump({
+    required int frameRate,
+    required this.envelope,
+    required this.hub,
+  }) {
+    final int fps = frameRate < 1 ? 1 : frameRate;
+    _timer = Timer.periodic(
+      Duration(microseconds: (1000000 / fps).ceil()),
+      (_) => flush(),
+    );
+  }
+
+  final Map<String, dynamic> envelope;
+  final WsHub hub;
+  late final Timer _timer;
+
+  /// 待下发增量：按消息首次出现的顺序保留（Dart Map 保序）。
+  final Map<String, StringBuffer> _pending = <String, StringBuffer>{};
+
+  /// 追加一段增量（同消息的连续增量会在同一帧内合并）。
+  void add(String id, String delta) {
+    (_pending[id] ??= StringBuffer()).write(delta);
+  }
+
+  /// 把攒下的增量合并成 `msg_chunk` 广播出去。
+  void flush() {
+    if (_pending.isEmpty) return;
+    final List<MapEntry<String, StringBuffer>> batch =
+        _pending.entries.toList(growable: false);
+    _pending.clear();
+    for (final MapEntry<String, StringBuffer> entry in batch) {
+      final String chunk = entry.value.toString();
+      if (chunk.isEmpty) continue;
+      hub.broadcast(<String, dynamic>{
+        'type': WsOutboundType.msgChunk,
+        'id': entry.key,
+        'chunk': chunk,
+        ...envelope,
+      });
+    }
+  }
+
+  /// 结束本轮：停表并落地残余增量。
+  void dispose() {
+    _timer.cancel();
+    flush();
   }
 }

@@ -522,7 +522,7 @@ void main() {
   });
 
   group('设置', () {
-    test('帧率夹取、主动延迟、消息切入、数据收集开关', () async {
+    test('帧率夹取、token 帧率、消息切入、数据收集开关', () async {
       final _Res initial = await client.send('GET', ApiPaths.settingsFrameRate);
       expect(initial.json['frame_rate'], CoreSettings.frameRateMin);
       expect(initial.json['min'], CoreSettings.frameRateMin);
@@ -535,15 +535,20 @@ void main() {
       );
       expect(set.json['frame_rate'], CoreSettings.frameRateMax);
 
-      await client.send(
+      // token 获取帧率：默认上限（近似不限速），可夹取
+      final _Res tokenInitial = await client.send(
+        'GET',
+        ApiPaths.settingsTokenRate,
+      );
+      expect(tokenInitial.json['token_rate'], CoreSettings.tokenRateMax);
+      expect(tokenInitial.json['min'], CoreSettings.tokenRateMin);
+      expect(tokenInitial.json['max'], CoreSettings.tokenRateMax);
+      final _Res tokenSet = await client.send(
         'POST',
-        ApiPaths.settingsRateLimit,
-        body: <String, dynamic>{'enabled': true},
+        ApiPaths.settingsTokenRate,
+        body: <String, dynamic>{'token_rate': 1},
       );
-      expect(
-        (await client.send('GET', ApiPaths.settingsRateLimit)).json['enabled'],
-        isTrue,
-      );
+      expect(tokenSet.json['token_rate'], CoreSettings.tokenRateMin);
 
       await client.send(
         'POST',
@@ -604,9 +609,11 @@ void main() {
       final List<String> types = ws.types();
       expect(types.first, WsOutboundType.agentStatus);
       expect(types[1], WsOutboundType.msgStart);
+      // 推送刷新帧率常开：增量按帧率合并下发，帧数随节奏而定，至少一帧；
+      // 内容完整性由下面的「流式内容拼接 = 落库正文」兜底断言。
       expect(
         types.where((String t) => t == WsOutboundType.msgChunk).length,
-        greaterThan(1),
+        greaterThanOrEqualTo(1),
       );
       expect(types.last, WsOutboundType.agentStatus);
 
@@ -710,6 +717,39 @@ void main() {
         )).json['sessions'],
         hasLength(2),
       );
+    });
+
+    test('推送刷新帧率：同一帧窗口内的增量合并为一条 msg_chunk', () async {
+      // 零片间延迟 = 全部增量落在同一帧窗口内；默认 20fps（50ms）下应合并成一帧。
+      final CoreServer coalesced = await CoreServer.start(
+        streamChunkDelay: Duration.zero,
+        enableHeartbeat: false,
+      );
+      addTearDown(coalesced.close);
+      final String agentId = coalesced.store.createAgent(name: '合并用例').id;
+      final _WsClient ws = await _WsClient.connect(coalesced);
+      ws.record();
+      addTearDown(ws.close);
+
+      ws.send(<String, dynamic>{
+        'type': WsInboundType.userMessage,
+        'agent_id': agentId,
+        'content': '合并一下',
+        'session_id': TreeStore.defaultSessionId,
+      });
+      await ws.until(
+        (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgEnd,
+        reason: 'msg_end',
+      );
+
+      final List<Map<String, dynamic>> chunks = ws.frames
+          .where(
+            (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgChunk,
+          )
+          .toList();
+      // 逐 token 片段被攒帧合并：多片内容合成一条帧，且正文完整无缺
+      expect(chunks, hasLength(1));
+      expect(chunks.single['chunk'], ScriptedAgent.replyFor('合并一下'));
     });
 
     test('stop 中断流式并回 cancelled=true + message 提示', () async {

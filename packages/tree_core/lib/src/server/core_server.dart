@@ -450,8 +450,8 @@ class CoreServer {
     router.add('POST', ApiPaths.questionAnswer, _answerQuestion);
     router.add('GET', ApiPaths.settingsFrameRate, _getFrameRate);
     router.add('POST', ApiPaths.settingsFrameRate, _setFrameRate);
-    router.add('GET', ApiPaths.settingsRateLimit, _getRateLimit);
-    router.add('POST', ApiPaths.settingsRateLimit, _setRateLimit);
+    router.add('GET', ApiPaths.settingsTokenRate, _getTokenRate);
+    router.add('POST', ApiPaths.settingsTokenRate, _setTokenRate);
     router.add('GET', ApiPaths.settingsMessageCutin, _getMessageCutin);
     router.add('POST', ApiPaths.settingsMessageCutin, _setMessageCutin);
     router.add('POST', ApiPaths.settingsDataCollection, _setDataCollection);
@@ -1313,18 +1313,22 @@ class CoreServer {
     });
   }
 
-  Future<void> _getRateLimit(HttpRequest request, Map<String, String> _) async {
+  Future<void> _getTokenRate(HttpRequest request, Map<String, String> _) async {
     await writeJson(request, 200, <String, dynamic>{
-      'enabled': settings.rateLimitEnabled,
+      'token_rate': settings.tokenAcquisitionRate,
+      'min': CoreSettings.tokenRateMin,
+      'max': CoreSettings.tokenRateMax,
     });
   }
 
-  Future<void> _setRateLimit(HttpRequest request, Map<String, String> _) async {
+  Future<void> _setTokenRate(HttpRequest request, Map<String, String> _) async {
     final Map<String, dynamic> body = await readJsonBody(request);
-    settings.rateLimitEnabled = body['enabled'] as bool? ?? false;
+    final int requested =
+        (body['token_rate'] as num?)?.toInt() ?? CoreSettings.tokenRateMax;
     await writeJson(request, 200, <String, dynamic>{
-      'success': true,
-      'enabled': settings.rateLimitEnabled,
+      'token_rate': settings.setTokenAcquisitionRate(requested),
+      'min': CoreSettings.tokenRateMin,
+      'max': CoreSettings.tokenRateMax,
     });
   }
 

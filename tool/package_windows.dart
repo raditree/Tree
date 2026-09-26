@@ -216,7 +216,7 @@ Tree 桌面端（Windows 便携版）
 数据放在哪里
   %APPDATA%\\Tree（C:\\Users\\<你>\\AppData\\Roaming\\Tree）。
   目录结构（都可以直接用记事本改，改完重启应用生效）：
-    config/settings.yaml        全局设置（帧率 / 主动延迟 / 消息切入…）
+    config/settings.yaml        全局设置（token 帧率 / 推送帧率 / 消息切入…）
     config/models/<id>.yaml     每个模型一个文件（含明文 api_key，只在本机）
     config/mcp.yaml             MCP 服务（stdio 命令 + 环境变量）
     config/plugins.yaml         插件清单

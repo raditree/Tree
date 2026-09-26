@@ -4,8 +4,8 @@ title: 产品设置项+后端限流/停止级联+多端适配（Flutter+FastAPI�
 task_type: complex
 description: Flutter+FastAPI agent 团队产品的「设置项新增+后端限流/停止级联+多端适配」类任务：开关设置走 前端 Switch 卡片 + REST 设置接口 + SQLite 偏好表 + 内存缓存；停止按钮级联 TOP+成员（取消事件+清 broker 队列+复位状态+推送 idle）；多端注意平台通道守卫与权限
 when:
-  - 前端设置页新增开关（主动延迟/数据收集等），需前后端同步
-  - 后端需限制 agent API 调用频率或做停止级联
+  - 前端设置页新增开关/滑块（token 获取帧率、推送刷新帧率、数据收集等），需前后端同步
+  - 后端需限制 agent 流式输出节奏或做停止级联
   - Flutter 应用多端适配（Windows/Android/Linux）
   - 移动端（Android/iOS）响应式布局或平台能力守卫（目录选择/保存对话框/本地执行）
 tags: [complex]

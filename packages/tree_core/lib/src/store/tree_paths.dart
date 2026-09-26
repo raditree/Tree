@@ -8,7 +8,7 @@ import 'package:path/path.dart' as p;
 /// ```
 /// <root>/
 /// ├── config/
-/// │   ├── settings.yaml          # 全局设置（帧率/主动延迟/消息切入/数据收集…）
+/// │   ├── settings.yaml          # 全局设置（token 帧率/推送帧率/消息切入/数据收集…）
 /// │   └── models/<model_id>.yaml # 每个模型一个文件（含明文 api_key）
 /// ├── agents/<agent_id>.yaml     # 每个顶部 agent 一个文件（含 system_prompt）
 /// └── data/<agent_id>/<session_id>/

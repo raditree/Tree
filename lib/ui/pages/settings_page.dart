@@ -8,7 +8,7 @@ import '../theme_service.dart';
 ///
 /// 保留的设置项：
 /// - 数据收集：仅保留开关以兼容历史配置（桌面单用户形态没有收集方，M7 移除）
-/// - 主动延迟 / 流式帧率 / 消息切入模式：agent 运行节奏控制
+/// - token 获取帧率 / 推送刷新帧率 / 消息切入模式：agent 运行节奏控制
 /// - 自定义模型：模型池 CRUD（M2 起落 `~/.tree/config/models/*.yaml`）
 /// - 主题管理：浅色 / 深色 / 跟随系统三种模式
 class SettingsPage extends StatefulWidget {
@@ -22,18 +22,23 @@ class _SettingsPageState extends State<SettingsPage> {
   // --- 数据收集 ---
   bool _dataCollectionEnabled = false;
 
-  // --- 主动延迟（限制单个 agent 的 API 调用频率，平均 6 次/分钟） ---
-  bool _rateLimitEnabled = false;
-
   // --- 消息切入模式（false=串行排队，true=直接切入） ---
   bool _directCutin = false;
 
-  // --- 流式帧率（主动延迟开启时叠加的生成器帧率，帧/秒，20~1000） ---
+  // --- token 获取帧率（从 LLM 流逐 token 取回复的节奏，帧/秒，20~1000） ---
+  int _tokenRate = 1000;
+  int _tokenRateMin = 20;
+  int _tokenRateMax = 1000;
+
+  // --- 推送刷新帧率（把流式增量攒帧后合并下发的频率，帧/秒，20~1000） ---
   int _frameRate = 20;
   int _frameRateMin = 20;
   int _frameRateMax = 1000;
 
-  /// 帧率输入框（允许用户直接键入，提交时按范围夹取）
+  /// token 获取帧率输入框（允许直接键入，提交时按范围夹取）
+  final TextEditingController _tokenRateController = TextEditingController();
+
+  /// 推送刷新帧率输入框（允许用户直接键入，提交时按范围夹取）
   final TextEditingController _frameRateController = TextEditingController();
 
   // --- 自定义模型（设置页 CRUD） ---
@@ -45,14 +50,15 @@ class _SettingsPageState extends State<SettingsPage> {
   void initState() {
     super.initState();
     _loadDataCollectionSetting();
-    _loadRateLimitSetting();
     _loadMessageCutinSetting();
+    _loadTokenRateSetting();
     _loadFrameRateSetting();
     _loadModelList();
   }
 
   @override
   void dispose() {
+    _tokenRateController.dispose();
     _frameRateController.dispose();
     super.dispose();
   }
@@ -63,36 +69,6 @@ class _SettingsPageState extends State<SettingsPage> {
     final enabled = prefs.getBool('data_collection_enabled') ?? false;
     if (mounted) {
       setState(() => _dataCollectionEnabled = enabled);
-    }
-  }
-
-  /// 加载主动延迟设置
-  Future<void> _loadRateLimitSetting() async {
-    final prefs = await SharedPreferences.getInstance();
-    final local = prefs.getBool('rate_limit_enabled') ?? false;
-    if (mounted) {
-      setState(() => _rateLimitEnabled = local);
-    }
-    // 尝试从后端拉取权威状态（后端未启动/未登录时忽略，保留本地值）
-    try {
-      final bool remote = await ApiService.getRateLimit();
-      if (mounted) setState(() => _rateLimitEnabled = remote);
-    } catch (_) {
-      // 后端不可达时保留本地持久化值
-    }
-  }
-
-  /// 切换主动延迟开关
-  Future<void> _toggleRateLimit(bool value) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('rate_limit_enabled', value);
-    try {
-      await ApiService.setRateLimit(value);
-    } catch (_) {
-      // 后端设置失败不阻塞本地持久化
-    }
-    if (mounted) {
-      setState(() => _rateLimitEnabled = value);
     }
   }
 
@@ -126,7 +102,50 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
-  /// 加载流式帧率设置（权威值来自后端；后端不可达时用默认 20）
+  /// 加载 token 获取帧率设置（权威值来自后端；后端不可达时用默认 1000）
+  Future<void> _loadTokenRateSetting() async {
+    try {
+      final Map<String, dynamic> data = await ApiService.getTokenRate();
+      if (!mounted) return;
+      final int rate = (data['token_rate'] as num?)?.toInt() ?? _tokenRate;
+      final int min = (data['min'] as num?)?.toInt() ?? _tokenRateMin;
+      final int max = (data['max'] as num?)?.toInt() ?? _tokenRateMax;
+      setState(() {
+        _tokenRate = rate;
+        _tokenRateMin = min;
+        _tokenRateMax = max;
+        _tokenRateController.text = '$rate';
+      });
+    } catch (_) {
+      // 后端不可达：保留默认值，控件仍可编辑（提交时后端会夹取范围）
+      if (mounted) {
+        setState(() => _tokenRateController.text = '$_tokenRate');
+      }
+    }
+  }
+
+  /// 提交 token 获取帧率（按后端声明的范围夹取，以后端返回的生效值为准）
+  Future<void> _applyTokenRate(int value) async {
+    final int clamped = value < _tokenRateMin
+        ? _tokenRateMin
+        : (value > _tokenRateMax ? _tokenRateMax : value);
+    try {
+      final int effective = await ApiService.setTokenRate(clamped);
+      if (!mounted) return;
+      setState(() {
+        _tokenRate = effective;
+        _tokenRateController.text = '$effective';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _tokenRateController.text = '$_tokenRate');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('token 帧率设置失败：$e'), duration: const Duration(seconds: 2)),
+      );
+    }
+  }
+
+  /// 加载推送刷新帧率设置（权威值来自后端；后端不可达时用默认 20）
   Future<void> _loadFrameRateSetting() async {
     try {
       final Map<String, dynamic> data = await ApiService.getFrameRate();
@@ -148,7 +167,7 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
-  /// 提交流式帧率（按后端声明的范围夹取，以后端返回的生效值为准）
+  /// 提交推送刷新帧率（按后端声明的范围夹取，以后端返回的生效值为准）
   Future<void> _applyFrameRate(int value) async {
     final int clamped = value < _frameRateMin
         ? _frameRateMin
@@ -221,12 +240,10 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 8),
           _buildDataCollectionCard(),
           const SizedBox(height: 24),
-          _buildSectionTitle('主动延迟'),
-          const SizedBox(height: 8),
-          _buildRateLimitCard(),
-          const SizedBox(height: 24),
           _buildSectionTitle('流式帧率'),
           const SizedBox(height: 8),
+          _buildTokenRateCard(),
+          const SizedBox(height: 12),
           _buildFrameRateCard(),
           const SizedBox(height: 24),
           _buildSectionTitle('自定义模型'),
@@ -288,40 +305,90 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  /// 主动延迟卡片
+  /// token 获取帧率卡片
   ///
-  /// 开启后限制单个 agent 的 API 调用频率（平均 6 次/分钟），
-  /// 适合交互式开发——放慢 agent 节奏，让用户跟得上每个步骤。
-  Widget _buildRateLimitCard() {
+  /// 控制**从 LLM 流逐 token 取回复**的节奏：每消费一个文本/思考增量按该帧率
+  /// 间隔让出一帧。常开、无开关——取代旧的「主动延迟」（那是一次性限 API 调用
+  /// 次数，这里是连续可调的取词节奏）。范围 20~1000 帧/秒（1000 近似不限速）。
+  Widget _buildTokenRateCard() {
     final cs = Theme.of(context).colorScheme;
     return Card(
       margin: EdgeInsets.zero,
       child: Padding(
         padding: const EdgeInsets.all(16),
-        child: Row(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    '主动延迟（API 限速）',
-                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    _rateLimitEnabled
-                        ? '已开启：限制单个 agent 的 API 调用频率（平均 6 次/分钟），适合交互式开发'
-                        : '关闭：API 调用不限速',
-                    style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
-                  ),
-                ],
-              ),
+            const Text(
+              'token 获取帧率（帧/秒）',
+              style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
             ),
-            Switch(
-              value: _rateLimitEnabled,
-              onChanged: _toggleRateLimit,
-              activeThumbColor: cs.primary,
+            const SizedBox(height: 4),
+            const Text(
+              '从 LLM 流逐 token 取回复的节奏，常开生效；越慢越能看清生成过程',
+              style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                SizedBox(
+                  width: 110,
+                  child: TextField(
+                    controller: _tokenRateController,
+                    keyboardType: TextInputType.number,
+                    decoration: InputDecoration(
+                      labelText: '帧率',
+                      helperText: '$_tokenRateMin~$_tokenRateMax',
+                      isDense: true,
+                    ),
+                    onSubmitted: (String value) {
+                      final int? parsed = int.tryParse(value.trim());
+                      if (parsed != null) _applyTokenRate(parsed);
+                    },
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  tooltip: '减少 20',
+                  onPressed: _tokenRate <= _tokenRateMin
+                      ? null
+                      : () => _applyTokenRate(_tokenRate - 20),
+                  icon: const Icon(Icons.remove_circle_outline),
+                  color: cs.primary,
+                ),
+                IconButton(
+                  tooltip: '增加 20',
+                  onPressed: _tokenRate >= _tokenRateMax
+                      ? null
+                      : () => _applyTokenRate(_tokenRate + 20),
+                  icon: const Icon(Icons.add_circle_outline),
+                  color: cs.primary,
+                ),
+                const Spacer(),
+                OutlinedButton(
+                  onPressed: () {
+                    final int? parsed =
+                        int.tryParse(_tokenRateController.text.trim());
+                    if (parsed != null) _applyTokenRate(parsed);
+                  },
+                  child: const Text('应用'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Slider(
+              value: _tokenRate.toDouble().clamp(
+                    _tokenRateMin.toDouble(),
+                    _tokenRateMax.toDouble(),
+                  ),
+              min: _tokenRateMin.toDouble(),
+              max: _tokenRateMax.toDouble(),
+              divisions: 49,
+              label: '$_tokenRate fps',
+              onChanged: (double value) {
+                setState(() => _tokenRate = value.round());
+              },
+              onChangeEnd: (double value) => _applyTokenRate(value.round()),
             ),
           ],
         ),
@@ -329,14 +396,13 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  /// 流式帧率卡片
+  /// 推送刷新帧率卡片
   ///
-  /// 两把旋钮互不干扰：上面的「主动延迟」管 **API 调用频率**（等级决定上限），
-  /// 这里的帧率管 **生成器帧率**——把同一轮回复内的流式 token 按该帧率合并
-  /// 投递，避免以 token 速度刷屏。仅在主动延迟开启时生效。
+  /// 控制**流式增量的合并下发频率**：把同一轮回复内的 token 攒帧后按该帧率合并
+  /// 成一条 `msg_chunk` 推送，避免以 token 速度刷屏。常开、无开关。
   ///
-  /// 范围 20~1000 帧/秒：20 是"跟得上的慢放"，1000 近似不限速。可直接键入，
-  /// 提交时按后端声明的范围夹取。
+  /// 与上面的「token 获取帧率」互不干扰：取词慢则下发帧数自然少；取词满速时由
+  /// 这里决定实际刷新频率。范围 20~1000 帧/秒，可直接键入，提交时按范围夹取。
   Widget _buildFrameRateCard() {
     final cs = Theme.of(context).colorScheme;
     return Card(
@@ -347,15 +413,13 @@ class _SettingsPageState extends State<SettingsPage> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              '流式输出帧率（帧/秒）',
+              '推送刷新帧率（帧/秒）',
               style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
             ),
             const SizedBox(height: 4),
-            Text(
-              _rateLimitEnabled
-                  ? '已开启主动延迟：本轮回复的流式输出按该帧率合并投递'
-                  : '主动延迟未开启，帧率暂不生效（开启后立即生效）',
-              style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+            const Text(
+              '把同一轮回复内的流式增量攒帧后按该帧率合并下发，常开生效',
+              style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
             ),
             const SizedBox(height: 12),
             Row(

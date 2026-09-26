@@ -639,24 +639,44 @@ class ApiService {
     return _deleteJson('/api/models/${Uri.encodeComponent(modelId)}');
   }
 
-  // ==================== 流式帧率（主动延迟叠加项） ====================
+  // ==================== 流式帧率（token 获取 + 推送刷新，均常开） ====================
 
-  /// 查询流式帧率设置
+  /// 查询推送刷新帧率设置
   ///
   /// 调用 `GET /api/settings/frame-rate`，返回 `{frame_rate, min, max}`。
+  /// 该帧率把同一轮回复内的流式增量攒帧后合并下发（常开，无开关）。
   static Future<Map<String, dynamic>> getFrameRate() async {
     return _getJson('/api/settings/frame-rate');
   }
 
-  /// 设置流式帧率（帧/秒，越界由后端夹到 20~1000）
+  /// 设置推送刷新帧率（帧/秒，越界由后端夹到 20~1000）
   ///
-  /// 调用 `POST /api/settings/frame-rate`。开启主动延迟后生效，管生成器帧率。
+  /// 调用 `POST /api/settings/frame-rate`，管流式增量的合并下发频率。
   static Future<int> setFrameRate(int frameRate) async {
     final Map<String, dynamic> data = await _postJson(
       '/api/settings/frame-rate',
       body: <String, dynamic>{'frame_rate': frameRate},
     );
     return (data['frame_rate'] as num?)?.toInt() ?? frameRate;
+  }
+
+  /// 查询 token 获取帧率设置
+  ///
+  /// 调用 `GET /api/settings/token-rate`，返回 `{token_rate, min, max}`。
+  /// 该帧率控制从 LLM 流逐 token 取回复的节奏（常开，无开关）。
+  static Future<Map<String, dynamic>> getTokenRate() async {
+    return _getJson('/api/settings/token-rate');
+  }
+
+  /// 设置 token 获取帧率（帧/秒，越界由后端夹到 20~1000）
+  ///
+  /// 调用 `POST /api/settings/token-rate`。
+  static Future<int> setTokenRate(int tokenRate) async {
+    final Map<String, dynamic> data = await _postJson(
+      '/api/settings/token-rate',
+      body: <String, dynamic>{'token_rate': tokenRate},
+    );
+    return (data['token_rate'] as num?)?.toInt() ?? tokenRate;
   }
 
   // ==================== 插件体系接口（右栏「插件」页） ====================
@@ -1035,26 +1055,6 @@ class ApiService {
       '/api/settings/data-collection',
       body: {'enabled': enabled},
     );
-  }
-
-  /// 设置主动延迟开关
-  ///
-  /// 开启后限制单个 agent 的 LLM API 调用频率（平均 6 次/分钟），
-  /// 适合交互式开发。调用 `POST /api/settings/rate-limit`，请求体
-  /// 为 `{"enabled": true/false}`。
-  static Future<void> setRateLimit(bool enabled) async {
-    await _postJson('/api/settings/rate-limit', body: {'enabled': enabled});
-  }
-
-  /// 查询主动延迟开关状态
-  ///
-  /// 调用 `GET /api/settings/rate-limit`，返回 `{"enabled": bool, ...}`。
-  /// 查询失败时抛出中文异常（由调用方决定是否忽略）。
-  static Future<bool> getRateLimit() async {
-    final Map<String, dynamic> data = await _getJson(
-      '/api/settings/rate-limit',
-    );
-    return (data['enabled'] as bool?) ?? false;
   }
 
   /// 设置消息切入模式

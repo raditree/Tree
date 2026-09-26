@@ -73,7 +73,7 @@ abstract final class ApiPaths {
 
   // ── 设置 / 插件 / MCP ─────────────────────────────────────────────────
   static const String settingsFrameRate = '/api/settings/frame-rate';
-  static const String settingsRateLimit = '/api/settings/rate-limit';
+  static const String settingsTokenRate = '/api/settings/token-rate';
   static const String settingsMessageCutin = '/api/settings/message-cutin';
   static const String settingsDataCollection = '/api/settings/data-collection';
   static const String pluginSnapshot = '/api/plugin/snapshot';
@@ -113,7 +113,7 @@ abstract final class ApiPaths {
     workspaceGitLog,
     workspaceGitBranches,
     settingsFrameRate,
-    settingsRateLimit,
+    settingsTokenRate,
     settingsMessageCutin,
     settingsDataCollection,
     pluginSnapshot,

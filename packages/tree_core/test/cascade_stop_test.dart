@@ -117,7 +117,15 @@ void main() {
           (f['data'] as Map<String, dynamic>?)?['status'] == 'idle',
       reason: '成员 idle',
     );
-    await waitIdle(ws);
+    // 必须等 **TOP 自己**回到 idle：waitIdle() 会先匹配到成员补发的 idle 而立即返回，
+    // 于是断言时 TOP 可能仍在收尾（isRunning 还是 true）——那是竞态不是真实行为。
+    await ws.until(
+      (Map<String, dynamic> f) =>
+          f['type'] == WsOutboundType.agentStatus &&
+          (f['data'] as Map<String, dynamic>?)?['agent_id'] == top.id &&
+          (f['data'] as Map<String, dynamic>?)?['status'] == 'idle',
+      reason: 'TOP idle',
+    );
     expect(server.conversation.isRunning(top.id), isFalse);
   });
 

@@ -99,13 +99,13 @@ void main() {
       final Map<String, dynamic> map = YamlCodec.decode('''
 # 顶层注释
 frame_rate: 60          # 行尾注释
-rate_limit_enabled: "true"
+token_acquisition_rate: "240"
 tags: [a, b, 'c d']
 nested: {k: v, n: 2}
 text: "带 \\"引号\\" 的值"
 ''');
       expect(map['frame_rate'], 60);
-      expect(map['rate_limit_enabled'], 'true');
+      expect(map['token_acquisition_rate'], '240');
       expect(map['tags'], <String>['a', 'b', 'c d']);
       expect((map['nested'] as Map<String, dynamic>)['n'], 2);
       expect(map['text'], contains('引号'));
