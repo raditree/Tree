@@ -5,10 +5,12 @@ import 'package:tree_local_exec/tree_local_exec.dart';
 
 import '../settings/ssh_config.dart';
 
+import '../mcp/mcp_service.dart';
 import '../spec/spec_service.dart';
 import '../team/message_dispatcher.dart';
 import '../team/team_service.dart';
 import 'builtin_tools.dart';
+import 'mcp_tool.dart';
 import 'question_channel.dart';
 import 'terminal_hooks.dart';
 import 'todo_store.dart';
@@ -35,6 +37,7 @@ class WorkspaceToolRunner implements ToolRunner {
     this.teamService,
     this.messageDispatcher,
     this.specService,
+    this.mcpService,
     WorkspaceIO Function(String dir)? ioFactory,
     this.log,
   }) : _ioFactory = ioFactory ?? LocalWorkspaceIO.new {
@@ -78,6 +81,9 @@ class WorkspaceToolRunner implements ToolRunner {
   /// Spec 体系（为 null 时不声明 `spec`）。
   final SpecService? specService;
 
+  /// MCP 服务（为 null 时不声明 `mcp` 与各 MCP 工具）。
+  final McpService? mcpService;
+
   final WorkspaceIO Function(String dir) _ioFactory;
 
   /// 可读日志（工具报错、结果截断等）。
@@ -93,19 +99,31 @@ class WorkspaceToolRunner implements ToolRunner {
   List<ToolSpec> specsFor({
     required String agentId,
     required String sessionId,
-  }) => BuiltinTools.specs(
-    withTodos: todoStore != null,
-    withQuestions: askQuestion != null,
-    withTeam: teamService != null,
-    withMessage: messageDispatcher != null,
-    withSpec: specService != null,
-  );
+  }) => <ToolSpec>[
+    ...BuiltinTools.specs(
+      withTodos: todoStore != null,
+      withQuestions: askQuestion != null,
+      withTeam: teamService != null,
+      withMessage: messageDispatcher != null,
+      withSpec: specService != null,
+    ),
+    if (mcpService != null) ...<ToolSpec>[
+      McpTool.spec(),
+      ...McpTool.dynamicSpecs(mcpService!),
+    ],
+  ];
 
   @override
   Future<ToolOutcome> run(
     ToolInvocation invocation, {
     bool Function()? isCancelled,
   }) async {
+    // MCP 工具（含命名空间工具）不经 BuiltinTools 的 switch：它们的名字是
+    // 动态的，且同样不依赖工作空间。
+    final McpService? mcp = mcpService;
+    if (mcp != null && McpTool.handles(invocation.name)) {
+      return _truncate(await McpTool.run(invocation, mcp));
+    }
     // 不依赖工作空间的工具（set_todo_list / ask_user_question）先走：工作空间
     // 不可用（SSH 配置不全等）不该连带它们一起失败。
     WorkspaceIO? io;

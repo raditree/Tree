@@ -70,6 +70,14 @@ Future<void> main(List<String> args) async {
   );
   await specs.seedBuiltins();
 
+  // MCP 服务（M6a）：配置在 <数据根>/config/mcp.yaml；启动时尝试连接一次，
+  // 失败只在日志里说明（坏插件不该拦住核心启动）。
+  final McpService mcp = McpService(
+    configFile: paths.mcpConfigFile,
+    log: (String message) => stderr.writeln('[core:mcp] $message'),
+  );
+  await mcp.refresh();
+
   // 提问回路：工具层先建好、核心后建 WS 广播，因此广播目标用一个可后置绑定的
   // 槽（core 起监听后立即接上 `hub.broadcast`）。
   final FileQuestionStore questionStore = FileQuestionStore(paths);
@@ -131,6 +139,7 @@ Future<void> main(List<String> args) async {
     teamService: teams,
     messageDispatcher: messages,
     specService: specs,
+    mcpService: mcp,
     resolveSshConfig: (String agentId) => store.agent(agentId)?.sshConfig,
     // SSH 后端（dartssh2 + SFTP/exec）：每个 agent 一条连接，按需建立并缓存；
     // 远端根目录取 ssh.root（空 = 远端登录用户的 HOME）。
@@ -195,6 +204,7 @@ Future<void> main(List<String> args) async {
     messageDispatcher: messages,
     specService: specs,
     specIoFor: tools.ioFor,
+    mcpService: mcp,
   );
   // 起监听后才存在的三个依赖一次性接上：广播、在途状态、消息投递
   hubSink = server.hub.broadcast;

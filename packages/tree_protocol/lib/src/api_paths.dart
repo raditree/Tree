@@ -73,6 +73,7 @@ abstract final class ApiPaths {
   static const String settingsDataCollection = '/api/settings/data-collection';
   static const String pluginSnapshot = '/api/plugin/snapshot';
   static const String mcpServices = '/api/mcp/services';
+  static const String mcpService = '/api/mcp/services/{name}';
 
   /// 桌面分支保留的全部路径。
   static const Set<String> kept = <String>{
@@ -110,6 +111,7 @@ abstract final class ApiPaths {
     settingsDataCollection,
     pluginSnapshot,
     mcpServices,
+    mcpService,
   };
 
   /// 全部路径（保留 + 账号组）。

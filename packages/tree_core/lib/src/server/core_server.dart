@@ -10,6 +10,8 @@ import '../agent/conversation_service.dart';
 import '../agent/question_broker.dart';
 import '../agent/question_store.dart';
 import '../agent/scripted_agent.dart';
+import '../mcp/mcp_client.dart';
+import '../mcp/mcp_service.dart';
 import '../settings/core_settings.dart';
 import '../spec/spec_service.dart';
 import '../store/atomic_file.dart';
@@ -51,6 +53,7 @@ class CoreServer {
     required this.messageDispatcher,
     required this.specService,
     required this.specIoFor,
+    required this.mcpService,
     required this.hub,
     required this.questions,
     required this.conversation,
@@ -113,6 +116,9 @@ class CoreServer {
 
   /// 取某 agent 的工作空间 IO（Spec 的自定义文件在工作空间里）。
   final Future<WorkspaceIO?> Function(String agentId)? specIoFor;
+
+  /// MCP 服务（M6a）；为 null 时返回空服务列表。
+  final McpService? mcpService;
 
   /// 提问回路（M5a）；为 null 时核心不提供 `ask_user_question`（测试/最小骨架）。
   final QuestionBroker? questions;
@@ -185,6 +191,7 @@ class CoreServer {
     TeamMessageDispatcher? messageDispatcher,
     SpecService? specService,
     Future<WorkspaceIO?> Function(String agentId)? specIoFor,
+    McpService? mcpService,
   }) async {
     final HttpServer http = await HttpServer.bind(
       address ?? InternetAddress.loopbackIPv4,
@@ -207,6 +214,7 @@ class CoreServer {
       messageDispatcher: messageDispatcher,
       specService: specService,
       specIoFor: specIoFor,
+      mcpService: mcpService,
       hub: hub,
       questions: questions,
       conversation: ConversationService(
@@ -238,6 +246,7 @@ class CoreServer {
     await conversation.engine.close();
     reassembler.clear();
     await hub.closeAll();
+    await mcpService?.close();
     // 先把在途落盘任务写完再关闭监听（write-behind 的收尾）
     await questions?.questions.flush();
     await store.flush();
@@ -466,6 +475,8 @@ class CoreServer {
     router.add('POST', ApiPaths.settingsDataCollection, _setDataCollection);
     router.add('GET', ApiPaths.pluginSnapshot, _pluginSnapshot);
     router.add('GET', ApiPaths.mcpServices, _mcpServices);
+    router.add('POST', ApiPaths.mcpServices, _registerMcpService);
+    router.add('DELETE', ApiPaths.mcpService, _deleteMcpService);
   }
 
   // ── agent ────────────────────────────────────────────────────────────
@@ -1234,10 +1245,73 @@ class CoreServer {
   }
 
   Future<void> _mcpServices(HttpRequest request, Map<String, String> _) async {
-    // MCP 服务注册表由 M6 交付
+    final McpService? mcp = mcpService;
+    if (mcp == null) {
+      await writeJson(request, 200, <String, dynamic>{
+        'services': <Map<String, dynamic>>[],
+      });
+      return;
+    }
+    final Map<String, String> errors = <String, String>{};
+    for (final McpServerConfig config in mcp.servers()) {
+      final String? error = mcp.errorOf(config.name);
+      if (error != null) errors[config.name] = error;
+    }
     await writeJson(request, 200, <String, dynamic>{
-      'services': <Map<String, dynamic>>[],
+      'services': mcp
+          .servers()
+          .map((McpServerConfig s) => s.toApiJson())
+          .toList(),
+      'tools': <Map<String, dynamic>>[
+        for (final ({String service, McpToolInfo tool}) entry in mcp.allTools())
+          <String, dynamic>{
+            'service': entry.service,
+            'name': entry.tool.name,
+            'mcp_name': namespacedToolName(entry.service, entry.tool.name),
+            'description': entry.tool.description,
+          },
+      ],
+      'errors': errors,
     });
+  }
+
+  /// `POST /api/mcp/services`：注册（或覆盖）一个 stdio MCP 服务。
+  Future<void> _registerMcpService(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    final McpService? mcp = mcpService;
+    if (mcp == null) {
+      await writeJson(request, 501, errorBody('MCP 服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic> body = await readJsonBody(request);
+    final Map<String, dynamic> result = await mcp.register(body);
+    final Object? error = result['error'];
+    await writeJson(
+      request,
+      error == null ? 200 : 400,
+      error == null ? result : errorBody(error.toString()),
+    );
+  }
+
+  /// `DELETE /api/mcp/services/{name}`：删除一个服务（内置服务拒绝删除）。
+  Future<void> _deleteMcpService(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final McpService? mcp = mcpService;
+    if (mcp == null) {
+      await writeJson(request, 501, errorBody('MCP 服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic> result = await mcp.remove(params['name'] ?? '');
+    final Object? error = result['error'];
+    await writeJson(
+      request,
+      error == null ? 200 : 404,
+      error == null ? result : errorBody(error.toString()),
+    );
   }
 }
 

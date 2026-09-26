@@ -82,6 +82,9 @@ class TreePaths {
   /// 内置 Spec 模板目录（首次启动由核心写入，用户可查看与手改副本）。
   String get builtinSpecsDir => p.join(root, 'spec', 'builtin');
 
+  /// MCP 服务配置（可直接手改的 yaml）。
+  String get mcpConfigFile => p.join(configDir, 'mcp.yaml');
+
   /// 全部提问的原子快照（跨会话，右侧「问题回复」页用）。
   ///
   /// 为什么不像消息那样按会话拆文件：提问是**跨会话**查询的队列（`GET /api/questions`），
