@@ -13,12 +13,18 @@ import 'team_tool.dart';
 import 'todo_store.dart';
 import 'tool_runner.dart';
 
-/// 内置工具集：**工作空间类** 5 个（read / write / edit / grep / terminal）
-/// + `set_todo_list`（接 todo 存储时声明）+ `ask_user_question`（接提问通道时声明）。
+/// 内置工具集：**工作空间类** 5 个（read / write / edit / grep / terminal）、
+/// `set_todo_list`（接 todo 存储时声明）、`ask_user_question`（接提问通道时声明），
+/// 以及团队类 `team` / `message`（M5）与 `spec`（M5）——后三者由 [specs] 的 `with*`
+/// 开关控制。
 ///
-/// 其余内置工具（`spec` / `team` / `message` 属 M5 后续，`mcp` 属 M6）**现在不声明**：
-/// 声明了但没实现，模型会去调用并浪费一整轮 token。声明与实现必须同步发布，
-/// 因此 [specs] 是唯一的工具清单来源，[run] 的默认分支也用它列出"可用工具"。
+/// MCP 与插件工具**不在这里**：它们由 `WorkspaceToolRunner` 按「已就绪的服务」动态
+/// 注入（工具名带 `mcp__<服务>__` / `plugin__<id>__` 前缀），因为服务列表是运行期才
+/// 知道的。
+///
+/// **声明与实现必须同步发布**：没接线就不声明，否则模型会去调用一个不存在的工具并
+/// 白浪费一整轮 token。因此 [specs] 是静态工具清单的唯一来源，[run] 的默认分支也用
+/// 它列出「可用工具」。
 ///
 /// 工作空间类工具需要 [WorkspaceIO]；其余工具**不需要**（[needsWorkspace]），
 /// 因此 IO 可以为 null——否则 SSH 配置不全时连 `set_todo_list` 都用不了。
