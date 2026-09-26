@@ -152,6 +152,35 @@ class FileService {
     };
   }
 
+  /// 读取原始字节（单文件下载）：`{bytes, name}` 或 `{error, status}`。
+  ///
+  /// 与 [content] 的区别：这里不做文本/图片分支、不设文本上限，纯粹把字节交给
+  /// 前端落盘（下载按钮）。
+  Map<String, dynamic> readBytes(String workspaceId, String path) {
+    final CoreAgent? agent = agentFor(workspaceId);
+    if (agent == null) return _error('工作空间不存在：$workspaceId');
+    if (agent.sshConfig != null) {
+      return _error('该工作空间在远端（SSH）：暂不支持远端文件下载', 400);
+    }
+    final String root = rootFor(agent);
+    final String absolute;
+    try {
+      absolute = resolve(root, path);
+    } on FileServiceException catch (error) {
+      return _error(error.message, 400);
+    }
+    final File file = File(absolute);
+    if (!file.existsSync()) return _error('文件不存在：$path');
+    try {
+      return <String, dynamic>{
+        'bytes': file.readAsBytesSync(),
+        'name': p.basename(absolute),
+      };
+    } catch (error) {
+      return _error('读取文件失败：$error', 500);
+    }
+  }
+
   /// PDF 基本信息（总页数 / 标题 / 作者）。
   ///
   /// **页数是启发式的**：优先取页树 `/Count` 的最大值（根节点即总数），取不到

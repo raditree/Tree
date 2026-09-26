@@ -39,6 +39,28 @@ Map<String, dynamic> notImplementedBody(String path) => <String, dynamic>{
   'detail': '功能开发中：$path 尚未在核心进程实现',
 };
 
+/// 以原始字节写回（文件下载）：调用方给 content type 与可选文件名。
+Future<void> writeBytes(
+  HttpRequest request,
+  int statusCode,
+  List<int> bytes, {
+  String contentType = 'application/octet-stream',
+  String? filename,
+}) async {
+  final HttpResponse response = request.response;
+  response.statusCode = statusCode;
+  response.headers.contentType = ContentType.parse(contentType);
+  response.headers.contentLength = bytes.length;
+  if (filename != null && filename.isNotEmpty) {
+    response.headers.set(
+      'content-disposition',
+      'attachment; filename="${filename.replaceAll('"', '')}"',
+    );
+  }
+  response.add(bytes);
+  await response.close();
+}
+
 /// 统一的错误响应体。
 Map<String, dynamic> errorBody(String message) => <String, dynamic>{
   'detail': message,

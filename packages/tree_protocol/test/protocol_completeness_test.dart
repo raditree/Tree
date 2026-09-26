@@ -8,7 +8,9 @@ import 'package:tree_protocol/tree_protocol.dart';
 /// M7 删除 `server/` 后，原先"扫 Python 源码"的两条门禁换成**本仓库内**的等价断言：
 /// 1. 前端/核心源码里出现的 `'type': 'x'` 字面量，要么是协议帧，要么在
 ///    [nonProtocolTypeLiterals] 登记并写明原因（否则协议无声漂移）；
-/// 2. 核心必须**逐一处理**每一种上行帧常量（新增帧不能被 default 静默吞掉）。
+/// 2. 核心必须**逐一处理**每一种上行帧常量（新增帧不能被 default 静默吞掉）；
+/// 3. 前端调用点的 `/api/...` 路径必须都能在 [ApiPaths] 中找到声明（含用
+///    `$query` 拼接查询串、`Uri.parse('$baseUrl/api/...')` 这类隐式写法）。
 void main() {
   final Directory repoRoot = Directory('../..');
 
@@ -51,27 +53,34 @@ void main() {
   });
 
   test('前端使用的 /api 路径全部在 ApiPaths 中声明', () {
-    final Set<String> used = _scanFrontendApiPaths(
+    final Map<String, Set<String>> used = _scanFrontendApiPaths(
       Directory('${repoRoot.path}/lib'),
     );
     expect(used, isNotEmpty, reason: '未扫描到任何 /api 路径字符串');
 
     final Set<String> declared = ApiPaths.all.map(_normalizePath).toSet();
-    final Set<String> undeclared = used.difference(declared);
+    final List<String> undeclared = <String>[];
+    used.forEach((String literal, Set<String> forms) {
+      // 一个调用点可能同时给出"带查询串插值"与"只到路径"两种形态；
+      // 只要其中一种命中声明即可（例如 `.../download$query`）。
+      if (forms.any(declared.contains)) return;
+      undeclared.add('$literal → ${forms.toList()..sort()}');
+    });
     expect(
-      undeclared,
+      undeclared..sort(),
       isEmpty,
-      reason: '以下前端路径未在 ApiPaths 中声明：${undeclared.toList()..sort()}',
+      reason: '以下前端路径未在 ApiPaths 中声明：$undeclared',
     );
   });
 
   test('前端已不再引用账号体系路径（M1b 删除登录与账号设置）', () {
-    final Set<String> used = _scanFrontendApiPaths(
+    final Map<String, Set<String>> used = _scanFrontendApiPaths(
       Directory('${repoRoot.path}/lib'),
     );
-    final Set<String> accountPaths = used
-        .where((String p) => p.startsWith('/api/auth'))
-        .toSet();
+    final Set<String> accountPaths = <String>{
+      for (final MapEntry<String, Set<String>> entry in used.entries)
+        if (entry.key.contains('/api/auth')) ...entry.value,
+    };
     expect(
       accountPaths,
       isEmpty,
@@ -80,7 +89,6 @@ void main() {
   });
 
   test('分帧常量只能来自协议包：前后端都不得重复定义或硬编码字面量', () {
-    // 1) 不得定义 kWsFrame*（阈值/预算/TTL）
     final RegExp redefinition = RegExp(
       r'^\s*const\s+(?:int|Duration|String)\s+kWsFrame',
       multiLine: true,
@@ -130,12 +138,9 @@ void main() {
         expect(v.trim(), isNotEmpty, reason: '${e.key} 含空字符串');
       }
     }
-    // 上行/下行唯一允许的重名：heartbeat（双向保活，两侧都用同一字面量）。
-    // 其余任何重名都意味着协议建模错误，必须在这里暴露。
     expect(WsInboundType.all.intersection(WsOutboundType.all), <String>{
       WsInboundType.heartbeat,
     }, reason: '上/下行除 heartbeat（双向保活）外不应重名');
-    // 账号组必须真的被保留组排除
     expect(
       ApiPaths.kept.intersection(ApiPaths.removedWithAccounts),
       isEmpty,
@@ -183,17 +188,40 @@ String _camel(String snake) {
           .join();
 }
 
-/// 扫描前端 Dart 源码中的 `'/api/...'` 字面量并按占位符归一化。
-Set<String> _scanFrontendApiPaths(Directory lib) {
+/// 扫描前端 Dart 源码中的 `/api/...` 调用点。
+///
+/// 返回 字面量 → 归一化候选集合：
+/// - 匹配"字符串字面量里出现 /api/"，而不是"以 /api/ 开头"——形如
+///   `Uri.parse('$baseUrl/api/files/x/download')` 的调用点也必须被覆盖；
+/// - 直接拼在字面量里的 `?query` 只取路径部分；
+/// - 用 `$query` 拼接的写法会归一化成尾随 `<X>`，额外给出「去掉尾随 `<X>`」的形态，
+///   由调用方判定其中任一命中声明即可。
+Map<String, Set<String>> _scanFrontendApiPaths(Directory lib) {
   if (!lib.existsSync()) fail('lib 目录不存在：${lib.path}');
-  final RegExp apiLiteral = RegExp(r"'((?:/api/)[^']*)'");
-  final Set<String> found = <String>{};
+  final RegExp apiLiteral = RegExp(r"'([^']*/api/[^']*)'");
+  final Map<String, Set<String>> found = <String, Set<String>>{};
   for (final FileSystemEntity entity in lib.listSync(recursive: true)) {
     if (entity is! File || !entity.path.endsWith('.dart')) continue;
     for (final RegExpMatch m in apiLiteral.allMatches(
       entity.readAsStringSync(),
     )) {
-      found.add(_normalizePath(m.group(1)!));
+      final String raw = m.group(1)!;
+      final int index = raw.indexOf('/api/');
+      if (index < 0) continue;
+      String candidate = raw.substring(index);
+      // 只认"像路径"的字面量：不含空格/反引号/星号，避免把文档注释里的散文
+      // （例如 `/api/...` 的说明文字）误判成前端调用点。
+      if (!RegExp(r'^/api/[A-Za-z0-9_{}$/.-]*$').hasMatch(candidate)) {
+        continue;
+      }
+      final int query = candidate.indexOf('?');
+      if (query >= 0) candidate = candidate.substring(0, query);
+      final Set<String> forms = found.putIfAbsent(candidate, () => <String>{});
+      final String normalized = _normalizePath(candidate);
+      forms.add(normalized);
+      if (normalized.endsWith('<X>')) {
+        forms.add(normalized.substring(0, normalized.length - 3));
+      }
     }
   }
   return found;

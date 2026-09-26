@@ -48,6 +48,9 @@ abstract final class ApiPaths {
   static const String agentSpecs = '/api/agents/{agentId}/specs';
   static const String agentSpec = '/api/agents/{agentId}/specs/{specId}';
 
+  /// 手动压缩上下文（前端「压缩」按钮）。核心尚未实现：显式 501，不静默 404。
+  static const String agentCompact = '/api/agents/{agentId}/compact';
+
   // ── 提问 ──────────────────────────────────────────────────────────────
   static const String questions = '/api/questions';
   static const String questionAnswer = '/api/questions/{qid}/answer';
@@ -62,6 +65,10 @@ abstract final class ApiPaths {
   static const String fileUploadComplete =
       '/api/files/{workspaceId}/upload_complete';
   static const String fileSyncToLocal = '/api/files/{workspaceId}/syncToLocal';
+  static const String fileDownload = '/api/files/{workspaceId}/download';
+  static const String fileDownloadFolder =
+      '/api/files/{workspaceId}/download_folder';
+  static const String fileUpload = '/api/files/{workspaceId}/upload';
   static const String workspaceGitLog = '/api/workspaces/{workspaceId}/git/log';
   static const String workspaceGitBranches =
       '/api/workspaces/{workspaceId}/git/branches';
@@ -93,6 +100,7 @@ abstract final class ApiPaths {
     agentSessionSpecs,
     agentSpecs,
     agentSpec,
+    agentCompact,
     questions,
     questionAnswer,
     files,
@@ -103,6 +111,9 @@ abstract final class ApiPaths {
     fileUploadChunk,
     fileUploadComplete,
     fileSyncToLocal,
+    fileDownload,
+    fileDownloadFolder,
+    fileUpload,
     workspaceGitLog,
     workspaceGitBranches,
     settingsFrameRate,

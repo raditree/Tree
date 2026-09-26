@@ -10,7 +10,11 @@ class _Client {
   final CoreServer _server;
   final HttpClient _http;
 
-  Future<_Res> send(String method, String path) async {
+  Future<_Res> send(
+    String method,
+    String path, {
+    Map<String, dynamic>? body,
+  }) async {
     final HttpClientRequest request = await _http.openUrl(
       method,
       Uri.parse('${_server.handshake.httpBaseUrl}$path'),
@@ -19,13 +23,23 @@ class _Client {
       HttpHeaders.authorizationHeader,
       'Bearer ${_server.token}',
     );
+    if (body != null) {
+      request.headers.contentType = ContentType.json;
+      request.add(utf8.encode(jsonEncode(body)));
+    }
     final HttpClientResponse response = await request.close();
     final String text = await utf8.decoder.bind(response).join();
+    // 下载接口返回**原始字节**（不是 JSON）：解析失败时保留原文供断言
+    Object? decoded;
+    try {
+      decoded = text.trim().isEmpty ? null : jsonDecode(text);
+    } catch (_) {
+      decoded = null;
+    }
     return _Res(
       response.statusCode,
-      text.trim().isEmpty
-          ? <String, dynamic>{}
-          : jsonDecode(text) as Map<String, dynamic>,
+      decoded is Map<String, dynamic> ? decoded : <String, dynamic>{},
+      text,
     );
   }
 
@@ -33,9 +47,10 @@ class _Client {
 }
 
 class _Res {
-  const _Res(this.status, this.json);
+  const _Res(this.status, this.json, this.raw);
   final int status;
   final Map<String, dynamic> json;
+  final String raw;
 }
 
 /// 工作空间文件与 Git 的 REST 面（M7d）：文件面板 / 查看器 / Git 面板。
@@ -172,6 +187,43 @@ void main() {
       (await client.send(
         'GET',
         '/api/files/ws_unknown/content?path=a.txt',
+      )).status,
+      404,
+    );
+  });
+
+  test('POST download：原始字节落盘（含子目录与路径逃逸拒绝）', () async {
+    await start();
+    final _Res res = await client.send(
+      'POST',
+      '/api/files/${ws()}/download',
+      body: <String, dynamic>{'path': 'a.txt'},
+    );
+    expect(res.status, 200);
+    // 下载返回的是原始字节（不是 JSON）：这里用 raw 字符串核对内容
+    expect(res.raw, contains('hello'));
+
+    final _Res nested = await client.send(
+      'POST',
+      '/api/files/${ws()}/download',
+      body: <String, dynamic>{'path': 'sub/b.md'},
+    );
+    expect(nested.status, 200);
+    expect(nested.raw, contains('标题'));
+
+    expect(
+      (await client.send(
+        'POST',
+        '/api/files/${ws()}/download',
+        body: <String, dynamic>{'path': '../escape.txt'},
+      )).status,
+      400,
+    );
+    expect(
+      (await client.send(
+        'POST',
+        '/api/files/${ws()}/download',
+        body: <String, dynamic>{'path': 'missing.bin'},
       )).status,
       404,
     );

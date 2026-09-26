@@ -81,6 +81,9 @@ class CoreServer {
   static const Set<String> stubApiPaths = <String>{
     // PDF 预览需要 PDF 光栅化（纯 Dart 无此能力，待决策）；上传/同步属写路径，
     // 留待与下载一起做（M7d-2）
+    ApiPaths.agentCompact,
+    ApiPaths.fileDownloadFolder,
+    ApiPaths.fileUpload,
     ApiPaths.filePdfPreview,
     ApiPaths.fileUploadInit,
     ApiPaths.fileUploadChunk,
@@ -490,6 +493,7 @@ class CoreServer {
     router.add('GET', ApiPaths.files, _listFiles);
     router.add('GET', ApiPaths.fileContent, _fileContent);
     router.add('GET', ApiPaths.filePdfInfo, _filePdfInfo);
+    router.add('POST', ApiPaths.fileDownload, _downloadFile);
     router.add('GET', ApiPaths.workspaceGitLog, _workspaceGitLog);
     router.add('GET', ApiPaths.workspaceGitBranches, _workspaceGitBranches);
     router.add('GET', ApiPaths.pluginSnapshot, _pluginSnapshot);
@@ -1365,6 +1369,30 @@ class CoreServer {
     );
     if (await _writeFileError(request, result)) return;
     await writeJson(request, 200, result);
+  }
+
+  /// `POST /api/files/{workspaceId}/download`：原始字节下载（body: `{path}`）。
+  Future<void> _downloadFile(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final FileService? files = fileService;
+    if (files == null) {
+      await writeJson(request, 501, errorBody('文件服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic> body = await readJsonBody(request);
+    final Map<String, dynamic> result = files.readBytes(
+      params['workspaceId'] ?? '',
+      (body['path'] ?? '').toString(),
+    );
+    if (await _writeFileError(request, result)) return;
+    await writeBytes(
+      request,
+      200,
+      result['bytes'] as List<int>,
+      filename: result['name'] as String?,
+    );
   }
 
   /// `GET /api/files/{workspaceId}/pdf_info?path=`：PDF 基本信息。
