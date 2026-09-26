@@ -222,13 +222,22 @@ abstract final class BuiltinTools {
     ToolSpec(
       name: terminal,
       description:
-          '在工作空间根目录执行 shell 命令（Windows 用 cmd.exe，其他平台用 sh）。'
+          '在工作空间根目录执行 shell 命令（Windows 用 PowerShell，其他平台用 sh）。'
           '用于运行构建/测试/git/文件管理。stdout/stderr 都会被自动捕获，'
           '无需追加 2>&1。**没有静态超时**：命令跑多久都会等（本地判据是进程还活着）；'
           '只有 SSH 会话心跳丢失（会话失联）时才会不终止地转为后台任务，并返回 task_id'
           '与查询方式。预计很长的命令（构建/全量测试/长脚本）请用 hook=true 后台执行：'
           '立即拿到 task_id，输出实时写进日志文件，命令结束后会自动收到'
-          '[terminal hook] 提示，届时用 read 读取日志继续任务。',
+          '[terminal hook] 提示，届时用 read 读取日志继续任务。'
+          // Windows shell 口径：换 PowerShell 后模型很容易照着 cmd 写法生成命令
+          // （>nul、&&、2>&1），这几条是实测踩过的坑，写进描述让它少走弯路。
+          'Windows 上是 PowerShell（系统自带 5.1；装了 PowerShell 7 就是 7）：'
+          'ls/cat/dir/type 都可用（都是别名）；串联命令优先用 ; 而不是 && ——'
+          '5.1 不支持 && / ||，工具会做兼容翻译但不要依赖它；需要丢弃输出用 | Out-Null'
+          '（不是 >nul）；管道与重定向按 PowerShell 语义。命令输出按 UTF-8 返回；'
+          '确属非 UTF-8 的会在结果里注明：nonUtf8Output 表示已按系统代码页'
+          '（中文机器 GBK/CP936）解码、中文可读，garbledOutput 表示连代码页也解不开的'
+          '真乱码（已逐字节保留，不丢字节）。',
       parameters: <String, dynamic>{
         'type': 'object',
         'properties': <String, dynamic>{

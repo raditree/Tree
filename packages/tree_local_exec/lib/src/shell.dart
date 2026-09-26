@@ -20,8 +20,11 @@ import 'dart:io';
 ///    taskkill /T /F。
 ///
 /// 已知行为差异（如实记录，不粉饰）：
-/// - **&& / ||**：PowerShell 7 支持；Windows PowerShell 5.1 **不支持**，会报解析错误——
-///   此时 stderr 有可读报错、退出码 1，而不是静默空输出。需要兼容 5.1 就用 ; 顺序执行。
+/// - **&& / ||**：PowerShell 7 支持；Windows PowerShell 5.1 **不支持**（ParserError：
+///   The token '&&' is not a valid statement separator in this version）。本机只有 5.1，
+///   而 cmd.exe 时代这两个运算符是合法的，属于换 shell 带来的行为回归；模型生成的命令里
+///   `&&` 又很常见，所以包装层主动做兼容翻译（见 [translateLogicalOperators]）——
+///   但翻译只覆盖能确定的写法，命令里优先写 ; 仍然更稳。
 /// - **1>&2**：同样只有 PS 7 支持（5.1 报 RedirectionNotSupported）；往 stderr 写请用
 ///   「[Console]::Error.WriteLine('…')」或 Write-Error。
 /// - **cmd 内建命令变成别名/cmdlet**：dir→Get-ChildItem、type→Get-Content，输出格式不同；
@@ -148,22 +151,224 @@ abstract final class Shell {
 
   static bool _isCmd(String shell) => shell.toLowerCase().endsWith('cmd.exe');
 
+  /// 把 PowerShell 解析不了的 && / || 翻译成 5.1 也能跑的等价语句。
+  ///
+  /// 为什么在包装层做：本机没有 pwsh 7、只有 Windows PowerShell 5.1，而 5.1 把这两个
+  /// 运算符当语法错误（ParserError），换 shell 之前用 cmd.exe 时它们是合法的——这是换
+  /// shell 带来的行为回归，而模型生成的命令里 && 很常见，所以在包装层兜住。
+  ///
+  /// 翻译规则（; 顺序执行 + $? 判上一条的成败）：
+  /// - a && b → a; if ($?) { b }
+  /// - a || b → a; if (-not $?) { b }
+  /// - 多段链按左折叠**平铺**展开：a && b && c → a; if ($?) { b }; if ($?) { c }
+  ///   为什么平铺而不是层层嵌套：实测 5.1 里 if 语句**不重置 $?**（条件为假时 $? 保持上一条
+  ///   命令的结果，为真且体执行了则取体里最后一条的结果）。于是 c 只在「b 真的跑过且成功」
+  ///   时才执行，与 (a && b) && c 的左结合语义一致；顺着这条规则，混用也成立：
+  ///   a && b || c → a; if ($?) { b }; if (-not $?) { c }。
+  ///
+  /// 结合范围按**语句**算，而不是整条命令：顶层 ; 与换行都是语句边界，所以 a && b; c 里的
+  /// c 永远执行——若把它也塞进 if 块，a 失败时 c 会被静默吞掉，那是改写语义。语句末尾悬着
+  /// 运算符时（a && 换行 b）换行按行继续处理，链可以跨行。
+  ///
+  /// 引号处理：单/双引号内的内容整体照抄（echo "x && y" 原样保留），双引号内认反引号转义
+  /// 与连续两个双引号、单引号内认连续两个单引号（都是 PowerShell 的字面量规则），
+  /// 配对不上就整体回退。
+  ///
+  /// **保守回退**（拿不准就原样返回：宁可让用户看到 PowerShell 的 ParserError，也不要悄悄
+  /// 改写语义）：没有顶层运算符时**逐字节**返回原文；此外引号不闭合、链残缺（a &&）、
+  /// 顶层注释 #、块注释 <#、here-string @' / @" 一律回退。
+  ///
+  /// 分支策略：装了 PowerShell 7 的机器上 && / || 本来就能用，其实可以原样透传；这里
+  /// **不探测 pwsh 版本**，统一走翻译——翻译后的语句在 7 上语义相同（$? 语义没变），
+  /// 少一条版本分支（真要按版本分流，改这一处即可）。
+  ///
+  /// 后台 hook 的 >> 日志 2>&1 后缀由 [redirectTo] 拼在命令末尾，翻译后它跟着**最后一段**
+  /// 走（与 cmd 的重定向绑定规则相同）：a 失败时 b 不跑，日志同样可能是空的，与换 shell 前
+  /// 的行为一致。
+  static String translateLogicalOperators(String command) {
+    // ① 先按语句边界切分。分隔符原样留着，最后按原样拼回去——没有运算符的语句一个字节都不动。
+    final List<String> statements = <String>[];
+    final List<String> separators = <String>[];
+    final StringBuffer current = StringBuffer();
+    int i = 0;
+    while (i < command.length) {
+      final String ch = command[i];
+      if (ch == "'" || ch == '"') {
+        final int end = _skipQuoted(command, i);
+        if (end < 0) return command; // 引号不闭合：拿不准，整体回退
+        current.write(command.substring(i, end));
+        i = end;
+        continue;
+      }
+      if (ch == '`') {
+        // 顶层反引号同样是转义前缀（转义的 & 是字面 &，不是运算符的一半）：
+        // 连被转义的字符一起照抄，免得把它当成运算符。
+        final int end = i + 2 <= command.length ? i + 2 : command.length;
+        current.write(command.substring(i, end));
+        i = end;
+        continue;
+      }
+      if (ch == '#' && _startsComment(command, i)) return command; // 行注释：回退
+      if (ch == '<' && command.startsWith('<#', i)) return command; // 块注释：回退
+      if (ch == '@' &&
+          (command.startsWith("@'", i) || command.startsWith('@"', i))) {
+        return command; // here-string：内部换行/引号规则是另一套，不解析
+      }
+      if (ch == ';' || ch == '\n') {
+        String text = current.toString();
+        String separator = ch == ';' ? ';' : '\n';
+        if (ch == '\n' && text.endsWith('\r')) {
+          // CRLF：别把 \r 留在语句里，跟分隔符一起原样拼回
+          text = text.substring(0, text.length - 1);
+          separator = '\r\n';
+        }
+        if (!_endsWithLogicalOperator(text)) {
+          statements.add(text);
+          separators.add(separator);
+          current.clear();
+          i++;
+          continue;
+        }
+        // 语句末尾悬着运算符 → 这里是行继续，不是语句边界
+      }
+      current.write(ch);
+      i++;
+    }
+    statements.add(current.toString());
+    separators.add('');
+
+    // ② 逐条语句折叠；只要有一处拿不准就整体回退（半翻译是最糟的结果：错误信息会指向
+    //    被改写的半截命令，用户反而更难定位）。
+    bool translated = false;
+    final List<String> folded = <String>[];
+    for (final String statement in statements) {
+      final String? result = _foldLogicalOperators(statement);
+      if (result == null) return command;
+      if (result != statement) translated = true;
+      folded.add(result);
+    }
+    if (!translated) return command; // 没有顶层运算符：逐字节不变，不重排命令
+    final StringBuffer out = StringBuffer();
+    for (int k = 0; k < folded.length; k++) {
+      out.write(folded[k]);
+      out.write(separators[k]);
+    }
+    return out.toString();
+  }
+
+  /// 折叠**一条语句**里的顶层 && / ||；没有运算符时原样返回，拿不准返回 null。
+  static String? _foldLogicalOperators(String statement) {
+    final List<String> segments = <String>[];
+    final List<String> operators = <String>[];
+    final StringBuffer current = StringBuffer();
+    int i = 0;
+    while (i < statement.length) {
+      final String ch = statement[i];
+      if (ch == "'" || ch == '"') {
+        final int end = _skipQuoted(statement, i);
+        if (end < 0) return null;
+        current.write(statement.substring(i, end));
+        i = end;
+        continue;
+      }
+      if (ch == '`') {
+        final int end = i + 2 <= statement.length ? i + 2 : statement.length;
+        current.write(statement.substring(i, end));
+        i = end;
+        continue;
+      }
+      if (ch == '#' && _startsComment(statement, i)) return null;
+      if (ch == '<' && statement.startsWith('<#', i)) return null;
+      if (ch == '@' &&
+          (statement.startsWith("@'", i) || statement.startsWith('@"', i))) {
+        return null;
+      }
+      final String pair = i + 1 < statement.length
+          ? statement.substring(i, i + 2)
+          : '';
+      if (pair == '&&' || pair == '||') {
+        segments.add(current.toString());
+        current.clear();
+        operators.add(pair);
+        i += 2;
+        continue;
+      }
+      current.write(ch);
+      i++;
+    }
+    if (operators.isEmpty) return statement; // 逐字节不变
+    segments.add(current.toString());
+    final List<String> parts = segments
+        .map((String s) => s.trim())
+        .toList(growable: false);
+    if (parts.any((String s) => s.isEmpty)) return null; // 残缺的链（如 a && ）：回退
+    final StringBuffer out = StringBuffer(parts.first);
+    for (int k = 0; k < operators.length; k++) {
+      final String condition = operators[k] == '&&' ? r'$?' : r'-not $?';
+      out.write('; if ($condition) { ${parts[k + 1]} }');
+    }
+    return out.toString();
+  }
+
+  /// 语句是否以悬空的 && / || 结尾（用于判断换行是行继续还是语句边界）。
+  static bool _endsWithLogicalOperator(String text) {
+    final String trimmed = text.trimRight();
+    return trimmed.endsWith('&&') || trimmed.endsWith('||');
+  }
+
+  /// 从 [start] 处的引号跳到它之后（返回结束位置的下一个下标）；不闭合返回 -1。
+  ///
+  /// 只做配对所需的最简转义处理，不解析字符串内容：
+  /// - 单引号内连续两个单引号 = 一个字面单引号；
+  /// - 双引号内连续两个双引号同理，反引号转义下一个字符（转义出来的引号不结束字符串）。
+  static int _skipQuoted(String text, int start) {
+    final String quote = text[start];
+    int i = start + 1;
+    while (i < text.length) {
+      final String ch = text[i];
+      if (quote == '"' && ch == '`') {
+        i += 2;
+        continue;
+      }
+      if (ch == quote) {
+        if (i + 1 < text.length && text[i + 1] == quote) {
+          i += 2; // 连续两个引号 = 字面引号
+          continue;
+        }
+        return i + 1;
+      }
+      i++;
+    }
+    return -1;
+  }
+
+  /// # 是否处在「注释起始」位置：PowerShell 只在 token 开头才把 # 当注释
+  /// （echo a#b 里的 # 是参数的一部分，不是注释）。
+  static bool _startsComment(String text, int index) {
+    if (index == 0) return true;
+    return ' \t\r\n;|({},['.contains(text[index - 1]);
+  }
+
   /// PowerShell 包装器：UTF-8 输出编码 + 退出码透传。
   ///
   /// 退出码为什么要两步：$LASTEXITCODE 只在跑过**原生命令**（git/ping/gradle…）之后才有值，
   /// 纯 PowerShell 命令（Get-Item 之类）失败时它是 $null——直接 exit $LASTEXITCODE 会让
   /// 失败看起来是成功。所以先把 $? 与 $LASTEXITCODE 都取下来，再决定退出码。
   ///
-  /// 用 ; 连接用户命令：等价于「顺序执行、不管前一条成败」，与 cmd 的 & 一致；
-  /// 用户自己写 && 由 PowerShell 自己解释（5.1 会报解析错误，见类文档）。
+  /// 用 ; 连接用户命令：等价于「顺序执行、不管前一条成败」，与 cmd 的 & 一致。
+  ///
+  /// 用户命令先过 [translateLogicalOperators]：5.1 解析不了 && / ||，而模型生成的
+  /// 命令里它们很常见（见类文档）。同步执行与后台 hook 共用这一处包装，两边语义一致。
   ///
   /// 全部用 Dart 原始字符串写 PowerShell 片段：省掉一层 $ / \ 转义，读起来就是 PS 原文。
-  static String _wrapPowerShell(String command) =>
-      r'[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; '
-      r'$OutputEncoding=[System.Text.Encoding]::UTF8; '
-      r"$PSDefaultParameterValues['Out-File:Encoding']='utf8'; "
-      '$command; '
-      r'$__treeOk=$?; $__treeCode=$LASTEXITCODE; '
-      r'if ($__treeCode -is [int] -and $__treeCode -ne 0) { exit $__treeCode }; '
-      r'if ($__treeOk) { exit 0 } else { exit 1 }';
+  static String _wrapPowerShell(String command) {
+    final String translated = translateLogicalOperators(command);
+    return r'[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; '
+        r'$OutputEncoding=[System.Text.Encoding]::UTF8; '
+        r"$PSDefaultParameterValues['Out-File:Encoding']='utf8'; "
+        '$translated; '
+        r'$__treeOk=$?; $__treeCode=$LASTEXITCODE; '
+        r'if ($__treeCode -is [int] -and $__treeCode -ne 0) { exit $__treeCode }; '
+        r'if ($__treeOk) { exit 0 } else { exit 1 }';
+  }
 }

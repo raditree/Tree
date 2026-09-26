@@ -301,6 +301,23 @@ void main() {
       expect(outcome.isError, isFalse);
       expect(outcome.content, contains('quick'));
     });
+
+    test('描述写明 Windows 上是 PowerShell 及配套写法', () {
+      final ToolSpec spec = BuiltinTools.specs().firstWhere(
+        (ToolSpec s) => s.name == 'terminal',
+      );
+      // 描述是给模型看的操作说明：换 shell 后口径必须一起换，否则模型会照着 cmd 的
+      // 写法（>nul / && / 2>&1）生成命令，在 PowerShell 下直接失败。
+      expect(spec.description, contains('PowerShell'));
+      expect(spec.description, contains('Out-Null'), reason: '丢弃输出的写法要写对');
+      expect(spec.description, contains('nonUtf8Output'));
+      expect(spec.description, contains('garbledOutput'));
+      expect(
+        spec.description,
+        isNot(contains('cmd.exe')),
+        reason: 'Windows 上已经不用 cmd.exe，描述不能留旧口径',
+      );
+    });
   });
 
   group('set_todo_list', () {

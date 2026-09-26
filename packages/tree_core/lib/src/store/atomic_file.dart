@@ -70,10 +70,15 @@ abstract final class AtomicFile {
   }
 
   /// 读取文本；文件不存在返回 null（区别于"空文件"）。
+  ///
+  /// 解码口径与 [readTailOrNullSync] 一致：非法 UTF-8 按 U+FFFD 顶替（allowMalformed），
+  /// **不抛异常**。为什么不用严格 readAsString：这里读的是配置/会话/待办这类"坏输入也
+  /// 不能中断流程"的数据，被外部工具写坏或本身就是 GBK 老文件时，读入口抛异常会把
+  /// 调用方（HTTP 处理器、工具调用）整体带崩，比读出一段带替换符的文本更糟。
   static Future<String?> readStringOrNull(String path) async {
     final File file = File(path);
     if (!await file.exists()) return null;
-    return file.readAsString();
+    return _decodeTolerant(await file.readAsBytes(), path);
   }
 
   /// 读取文件**尾部**至多 [maxBytes] 字节（用于"最后一条消息预览"这类
@@ -102,14 +107,28 @@ abstract final class AtomicFile {
     }
   }
 
-  /// 同步读取文本；文件不存在返回 null。
+  /// 同步读取文本；文件不存在返回 null（解码口径同 [readStringOrNull]，不抛异常）。
   ///
   /// 存储层的读接口（`messages()` / `lastTextMessage()`）是同步的，故必须提供
   /// 同步版本：这些读取只发生在首次装载某个会话时（之后走内存缓存）。
   static String? readStringOrNullSync(String path) {
     final File file = File(path);
     if (!file.existsSync()) return null;
-    return file.readAsStringSync();
+    return _decodeTolerant(file.readAsBytesSync(), path);
+  }
+
+  /// 容错解码：先按严格 UTF-8 试（合法时与原来一样，零额外开销），失败才用
+  /// allowMalformed 把坏字节顶成 U+FFFD，并留一条可见日志。
+  ///
+  /// 日志走 stderr + `[tree]` 前缀，与 plugin_host / mcp_client 的既有写法一致：
+  /// 静默吞掉坏字节会让"配置读出来是乱码"变成无迹可查的怪现象。
+  static String _decodeTolerant(List<int> bytes, String path) {
+    try {
+      return utf8.decode(bytes);
+    } on FormatException {
+      stderr.writeln('[tree] 警告：$path 不是合法 UTF-8，已按 U+FFFD 顶替后读出');
+      return utf8.decode(bytes, allowMalformed: true);
+    }
   }
 
   /// 同步读取文件尾部至多 [maxBytes] 字节（见 [readTailOrNull]）。
