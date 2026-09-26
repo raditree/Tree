@@ -317,14 +317,18 @@ void main() {
         PluginUiFrameType.outbound.intersection(PluginUiFrameType.inbound),
         isEmpty,
       );
+      // action 以**别名**登记进 WsInboundType.all（值相同、不重复字面量），
+      // 所以交集恰好是它一个；manifest / update 仍是全新的下行类型。
       expect(
         PluginUiFrameType.all.intersection(<String>{
           ...WsOutboundType.all,
           ...WsInboundType.all,
         }),
-        isEmpty,
-        reason: '插件 UI 三件套必须是与既有帧不同的新类型',
+        <String>{PluginUiFrameType.action},
+        reason: '三件套必须是与既有帧不同的新类型；action 例外（别名登记）',
       );
+      expect(WsInboundType.pluginUiAction, PluginUiFrameType.action);
+      expect(WsInboundType.all, contains(PluginUiFrameType.action));
     });
 
     test('四类槽位 / 六种控件 / 容器 / 字段 / 按钮样式', () {

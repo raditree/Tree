@@ -22,8 +22,9 @@ void main() {
       ...WsInboundType.all,
       ...WsOutboundType.all,
       ...CoreEventType.all,
-      // Q12 插件布局三件套（manifest / update / action）：单独成集登记，
-      // 见 PluginUiFrameType.inbound 里"为何暂不并入 WsInboundType"的说明。
+      // Q12 插件布局三件套（manifest / update / action）：action 已由
+      // WsInboundType.pluginUiAction 别名登记（规则 2 因此强制核心保留其分支），
+      // manifest / update 是下行帧，靠本行进入 covered 集合。
       ...PluginUiFrameType.all,
       ...nonProtocolTypeLiterals.keys,
     };

@@ -452,10 +452,57 @@ class CoreServer {
           });
         }
         break;
+      case WsInboundType.pluginUiAction:
+        _handlePluginUiAction(connection, frame);
+        break;
       default:
         // 未知帧静默忽略（前向兼容：新前端配旧核心不应崩溃）
         break;
     }
+  }
+
+  /// 插件 UI 交互回调（Q12）：把前端在插件槽位上的动作转给**声明该槽位的插件**。
+  ///
+  /// 路由依据只有帧里的 plugin_id（槽位自带优先，缺省回落帧级——前端注册表已经
+  /// 按槽位做过 team 隔离，这里不替插件推断归属）；核心**不解释动作语义**，
+  /// slot_key / action_id / payload 原样透传，插件收到后自行响应（通常是再推一帧
+  /// plugin_ui_update 刷新槽位）。插件不在线时**显式回一帧 error 并记日志**，
+  /// 不静默丢弃——否则用户点了按钮会「没有任何反应」。
+  void _handlePluginUiAction(WsConnection connection, Map<String, dynamic> frame) {
+    final Map<String, dynamic> data =
+        (frame['data'] as Map<String, dynamic>?)?.cast<String, dynamic>() ?? frame;
+    final String pluginId = (data['plugin_id'] ?? '').toString().trim();
+    final PluginBus? bus = pluginBus;
+    if (pluginId.isEmpty || bus == null) {
+      connection.send(<String, dynamic>{
+        'type': WsOutboundType.error,
+        'data': <String, dynamic>{
+          'message': '插件交互未送达：缺少 plugin_id 或插件总线未启用',
+        },
+      });
+      return;
+    }
+    for (final entry in bus.instances()) {
+      if (entry.pluginId != pluginId) continue;
+      entry.host.dispatchEvent(<String, dynamic>{
+        'event': WsInboundType.pluginUiAction,
+        'plugin_id': pluginId,
+        'team_id': data['team_id'] ?? '',
+        'agent_id': data['agent_id'] ?? '',
+        'session_id': data['session_id'] ?? '',
+        'slot_key': data['slot_key'] ?? '',
+        'action_id': data['action_id'] ?? '',
+        'payload': data['payload'] ?? const <String, dynamic>{},
+      });
+      return;
+    }
+    errorLog?.call(
+      '插件交互未送达：插件 $pluginId 未运行（slot_key=${data['slot_key']}）',
+    );
+    connection.send(<String, dynamic>{
+      'type': WsOutboundType.error,
+      'data': <String, dynamic>{'message': '插件 $pluginId 未运行，交互未送达'},
+    });
   }
 
   static Map<String, dynamic>? _decodeFrame(String raw) {

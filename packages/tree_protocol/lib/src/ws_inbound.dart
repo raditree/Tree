@@ -1,9 +1,11 @@
+import 'plugin_ui.dart';
+
 /// WebSocket **上行**消息类型（前端 → 核心进程）。
 ///
 /// 对应 `server/ws/endpoints.py::register_ws` 的 `msg_type` 分发链，共 12 种。
 /// 桌面分支中这些帧改走本地回环 WS（M1），类型与字段保持不变。
 abstract final class WsInboundType {
-  /// 心跳保活（前端每 30s 一次）。
+  /// 心跳保活（前端每 10s 一次；必须小于核心判活窗口 I×N = 30s）。
   static const String heartbeat = 'heartbeat';
 
   /// 用户消息（顶层 agent 会话入口）。
@@ -23,6 +25,12 @@ abstract final class WsInboundType {
   // `tool_exec_progress`（反向执行结果回报）整套上行帧已删除——它们描述的
   // "前端执行器"不存在了。插件宿主同理（核心自己拉起插件进程）。
 
+  /// 插件 UI 交互回调（Q12）：前端在插件槽位上的按钮点击 / 表单提交。
+  ///
+  /// 值复用 [PluginUiFrameType.action]（**别名**，不重复字面量）；核心收到后按
+  /// `plugin_id` 路由给声明该槽位的插件（见 core_server 的 pluginUiAction 分支）。
+  static const String pluginUiAction = PluginUiFrameType.action;
+
   /// 全部上行类型（完备性测试与文档用）。
   static const Set<String> all = <String>{
     heartbeat,
@@ -30,5 +38,6 @@ abstract final class WsInboundType {
     stop,
     userAnswer,
     cancelQuestion,
+    pluginUiAction,
   };
 }

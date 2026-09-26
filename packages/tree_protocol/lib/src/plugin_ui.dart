@@ -39,14 +39,10 @@ abstract final class PluginUiFrameType {
 
   /// 上行（前端 → 核心）。
   ///
-  /// **登记口径（重要）**：本集合并**不**登记进 `WsInboundType.all`。协议完备性
-  /// 门禁有一条硬断言——「每一种上行帧都必须被
-  /// `packages/tree_core/lib/src/server/core_server.dart` 显式处理」（防止新帧被
-  /// `default` 静默吞掉），而核心侧接线属 Wave 3-F；在核心实现之前把它登记进
-  /// `WsInboundType.all` 会让门禁测试恒失败。Wave 3-F 完成核心处理后，应把
-  /// [action] 以**别名常量**（PluginUiFrameType.action）补进
-  /// `WsInboundType`（值不变），本常量集继续作为
-  /// 插件 UI 三件套的单一事实来源。
+  /// **登记口径**：本常量集是该帧的单一事实来源；[action] 已由
+  /// `WsInboundType.pluginUiAction` 以**别名**（值不变）登记进 `WsInboundType.all`，
+  /// 因此协议完备性门禁的硬断言「每一种上行帧都必须被 core_server 显式处理」
+  /// 会强制核心保留 pluginUiAction 分支（不得被 `default` 静默吞掉）。
   static const Set<String> inbound = <String>{action};
 }
 
