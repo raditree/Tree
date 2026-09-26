@@ -3,10 +3,10 @@
 // 锁住的口径：
 // 1. 读写的是**磁盘上的 plugins.yaml**（持久态），不是插件总线内存里的那一份；
 // 2. 校验失败 = 400 + 可读中文原因，且**不落盘**（唯一性、不存在、类型 / 白名单）；
-// 3. 热应用**如实回报**：本轮插件总线只在核心启动时读一次配置，因此"新增条目 /
-//    新条目开关 / 运行中条目的停用"都会得到 hot_applied=false +
-//    「配置已保存，但本次热应用失败，重启核心后生效」——不许假装成功；
-//    唯一真生效的是"总线认识的条目的 restart"（心跳 degraded 后手动恢复用）。
+// 3. 热应用**立刻生效**：插件总线按磁盘配置对账（PluginBus.applyConfigs），所以
+//    "新增 / 启用 / 停用 / 删除"都得到 hot_applied=true；只有**这个插件这次没起来**
+//    （命令不存在等）才回 hot_applied=false +
+//    「配置已保存，但本次热应用失败，重启核心后生效」+ 可读原因——不许假装成功。
 // 4. 内置插件：清单常驻（未启用也可见）、enable 写一条带 builtin 标记的普通配置、
 //    disable 把条目置 enabled:false 但**保留条目**；运行时 / 脚本缺失给可读错误。
 import 'dart:convert';
@@ -14,7 +14,6 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
-import 'package:tree_core/src/plugin/builtin_plugins.dart';
 import 'package:tree_core/tree_core.dart';
 
 /// 极简 HTTP 客户端（带 token，可发 GET / POST / PATCH / DELETE + JSON 体）。
@@ -197,7 +196,7 @@ void main() {
     expect((runtime['sample'] as Map<String, dynamic>)['running'], isTrue);
   });
 
-  test('POST /api/plugin/configs：写盘成功 + 热应用失败如实回报（新增条目）', () async {
+  test('POST /api/plugin/configs：写盘成功 + 新增条目**立刻热启动**', () async {
     final ({CoreServer server, _Client client, PluginBus bus}) ctx =
         await serve('enabled: true\nplugins: []\n');
     addTearDown(() async {
@@ -211,8 +210,8 @@ void main() {
       body: <String, dynamic>{
         'id': 'demo',
         'name': '演示',
-        'command': 'python',
-        'args': <String>['demo.py'],
+        'command': Platform.resolvedExecutable,
+        'args': <String>[script],
         'env': <String, String>{'A': '1'},
         'granularity': 'session',
         'scope': <String, dynamic>{'team_id': '', 'session_id': 's1'},
@@ -220,19 +219,58 @@ void main() {
     );
     expect(res.status, 200);
     expect(res.json['ok'], isTrue);
-    expect(res.json['hot_applied'], isFalse, reason: '新增条目总线运行期不认识');
-    expect(res.json['notice'], '配置已保存，但本次热应用失败，重启核心后生效');
-    expect(res.json['hot_apply_detail'], contains('新增条目'));
+    expect(res.json['hot_applied'], isTrue, reason: '对账后新增条目会被真正拉起来');
+    expect(res.json['notice'], '', reason: '真的生效了就不该说"重启后生效"');
+    expect(res.json['hot_apply_detail'], contains('启动'));
+    expect(
+      ctx.bus.instances().map((i) => i.pluginId),
+      contains('demo'),
+      reason: '实例真的在跑（不是只写了个盘）',
+    );
     // 落盘形状（含规范化后的键）
     final Map<String, dynamic> entry = diskEntry('demo');
     expect(entry['enabled'], isTrue);
-    expect(entry['args'], <String>['demo.py']);
+    expect(entry['args'], <String>[script]);
     expect(entry['env'], <String, String>{'A': '1'});
     expect(entry['granularity'], 'session');
     expect(entry['scope'], <String, dynamic>{
       'team_id': '',
       'session_id': 's1',
     });
+  });
+
+  test('POST：命令不存在 ⇒ hot_applied=false + 具体原因（不假成功），且不牵连同级', () async {
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve(
+          <String>[
+            'enabled: true',
+            'plugins:',
+            ...fakePluginYaml('good'),
+            '',
+          ].join('\n'),
+        );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+    expect(ctx.bus.instances(), hasLength(1), reason: '启动时已拉起好的那一个');
+
+    final _Res res = await ctx.client.send(
+      'POST',
+      '/api/plugin/configs',
+      body: <String, dynamic>{
+        'id': 'broken',
+        'command': 'definitely-not-an-executable-xyz',
+      },
+    );
+    expect(res.status, 200, reason: '配置**已经写盘**，所以不是 4xx');
+    expect(res.json['hot_applied'], isFalse, reason: '起不来就必须如实说没生效');
+    expect(res.json['notice'], '配置已保存，但本次热应用失败，重启核心后生效');
+    expect(res.json['hot_apply_detail'], contains('未能就绪'));
+    expect(ctx.bus.instances().map((i) => i.pluginId), <String>[
+      'good',
+    ], reason: '一个插件起不来不影响另一个（失败隔离）');
+    expect(ctx.bus.toolsOf('good'), isNotEmpty, reason: '好的插件照常注册工具');
   });
 
   test('POST 校验：唯一性 / 必填 / 白名单都给可读 400，且不落盘', () async {
@@ -304,6 +342,9 @@ void main() {
       await ctx.server.close();
     });
 
+    expect(ctx.bus.instances(), hasLength(1), reason: '启动时已拉起假插件');
+
+    // 停用：写盘 **并且真的断开**（条目保留，面板显示"已停用"）
     final _Res off = await ctx.client.send(
       'PATCH',
       '/api/plugin/configs/sample',
@@ -312,10 +353,22 @@ void main() {
     expect(off.status, 200);
     expect(diskEntry('sample')['enabled'], isFalse);
     expect(diskPlugins(), hasLength(1), reason: '停用 = 条目保留');
-    // 总线内存里这一条是 enabled:true 且在跑：没有单插件断开入口 ⇒ 如实回报失败
-    expect(off.json['hot_applied'], isFalse);
-    expect(off.json['hot_apply_detail'], contains('无法只停它一个'));
-    expect(off.json['notice'], '配置已保存，但本次热应用失败，重启核心后生效');
+    expect(off.json['hot_applied'], isTrue, reason: '停用现在会真的断开实例');
+    expect(off.json['hot_apply_detail'], contains('条目已停用'));
+    expect(off.json['notice'], '');
+    expect(ctx.bus.instances(), isEmpty, reason: '实例列表里不再有它');
+    expect(ctx.bus.toolsOf('sample'), isEmpty, reason: '工具定义一并注销');
+
+    // 再打开：同一条目立刻恢复（新进程）
+    final _Res on = await ctx.client.send(
+      'PATCH',
+      '/api/plugin/configs/sample',
+      body: <String, dynamic>{'enabled': true},
+    );
+    expect(on.status, 200);
+    expect(on.json['hot_applied'], isTrue);
+    expect(diskEntry('sample')['enabled'], isTrue);
+    expect(ctx.bus.instances(), hasLength(1), reason: '打开 = 立刻回来');
 
     final _Res missing = await ctx.client.send(
       'PATCH',
@@ -325,30 +378,42 @@ void main() {
     expect(missing.status, 404);
     expect(missing.detail, contains('不存在'));
 
+    // 删除：写盘 + 断开并忘掉（实例与配置都不该留下）
     final _Res removed = await ctx.client.send(
       'DELETE',
       '/api/plugin/configs/sample',
     );
     expect(removed.status, 200);
+    expect(removed.json['hot_applied'], isTrue, reason: '删除要真的断开');
+    expect(removed.json['hot_apply_detail'], contains('已删除'));
     expect(diskPlugins(), isEmpty);
+    expect(ctx.bus.instances(), isEmpty);
+    expect(ctx.bus.config('sample'), isNull);
     expect(
       (await ctx.client.send('DELETE', '/api/plugin/configs/sample')).status,
       404,
     );
   });
 
-  test('PATCH 开关：新条目的停用无需断开（热应用成功）；重启未知条目 400', () async {
+  test('PATCH 开关：没在跑的条目停用无需断开；restart 按磁盘配置重来', () async {
     final ({CoreServer server, _Client client, PluginBus bus}) ctx =
         await serve('enabled: true\nplugins: []\n');
     addTearDown(() async {
       ctx.client.close();
       await ctx.server.close();
     });
-    await ctx.client.send(
+    // 一个必然起不来的条目（命令不存在）：POST 那一刻就如实回报过失败
+    final _Res created = await ctx.client.send(
       'POST',
       '/api/plugin/configs',
-      body: <String, dynamic>{'id': 'demo', 'command': 'python'},
+      body: <String, dynamic>{
+        'id': 'demo',
+        'command': 'definitely-not-an-executable-xyz',
+      },
     );
+    expect(created.json['hot_applied'], isFalse);
+    expect(ctx.bus.instances(), isEmpty, reason: '没起来就是没起来');
+
     final _Res off = await ctx.client.send(
       'PATCH',
       '/api/plugin/configs/demo',
@@ -356,14 +421,17 @@ void main() {
     );
     expect(off.status, 200);
     expect(off.json['hot_applied'], isTrue, reason: '本来就没跑起来，无需断开');
-    expect(off.json['hot_apply_detail'], contains('未在运行'));
+    expect(off.json['hot_apply_detail'], contains('条目已停用'));
+    expect(off.json['notice'], '');
 
+    // restart 不再要求"核心启动时读到过这一条"：它按磁盘上的配置重新拉起，
+    // 起不来就回可读原因（命令不存在这种错误不该被吞成一句"重启后未就绪"）
     final _Res restart = await ctx.client.send(
       'POST',
       '/api/plugin/configs/demo/restart',
     );
     expect(restart.status, 400);
-    expect(restart.detail, contains('不在本次核心启动时读取的配置里'));
+    expect(restart.detail, contains('重启失败'));
   });
 
   test('POST …/restart：总线认识的条目会被真正重启（心跳 degraded 的恢复入口）', () async {
@@ -399,6 +467,37 @@ void main() {
     );
   });
 
+  test('POST …/restart：核心启动后手工加进 plugins.yaml 的条目也能被拉起来', () async {
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve('enabled: true\nplugins: []\n');
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+    // 用户直接手改文件（不经过任何 REST 写接口）：总线运行期还没对过账
+    File(configFile).writeAsStringSync(
+      <String>[
+        'enabled: true',
+        'plugins:',
+        ...fakePluginYaml('manual'),
+        '',
+      ].join('\n'),
+    );
+    expect(ctx.bus.config('manual'), isNull, reason: '还没对账，总线不认识它');
+
+    final _Res res = await ctx.client.send(
+      'POST',
+      '/api/plugin/configs/manual/restart',
+    );
+    expect(res.status, 200, reason: res.detail);
+    expect(res.json['running'], isTrue);
+    expect(
+      ctx.bus.instances().map((i) => i.pluginId),
+      contains('manual'),
+      reason: 'restart 会先按磁盘对一次账，而不是误报"要重启核心"',
+    );
+  });
+
   test('内置插件：清单常驻 + enable 写带 builtin 标记的配置 + disable 保留条目', () async {
     final ({CoreServer server, _Client client, PluginBus bus}) ctx =
         await serve('enabled: true\nplugins: []\n');
@@ -428,8 +527,13 @@ void main() {
       '/api/plugin/builtins/sample/enable',
     );
     expect(on.status, 200, reason: on.detail);
-    expect(on.json['hot_applied'], isFalse);
-    expect(on.json['notice'], '配置已保存，但本次热应用失败，重启核心后生效');
+    // 这个内置条目的命令是 python + 一行注释的示例脚本：握手必然失败。用例在这里
+    // 锁的是"回报自洽"——真起来了就必须 hot_applied=true，没起来就必须带
+    // 「重启核心后生效」+ 可读原因，不许含糊。
+    final bool hot = on.json['hot_applied'] as bool;
+    expect(hot, isFalse, reason: '示例脚本不是真插件，起不来');
+    expect(on.json['notice'], hot ? '' : '配置已保存，但本次热应用失败，重启核心后生效');
+    expect(on.json['hot_apply_detail'], isNotEmpty);
     final Map<String, dynamic> entry = diskEntry('sample');
     expect(entry['builtin'], isTrue, reason: 'UI 靠它把这一条分到「内置」组');
     expect(entry['command'], 'python');

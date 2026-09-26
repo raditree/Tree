@@ -20,8 +20,6 @@ import '../plugin/builtin_plugins.dart';
 import '../plugin/execute_mounts.dart';
 import '../plugin/plugin_bus.dart';
 import '../plugin/plugin_config_store.dart';
-// PluginConfig 的定义处（只用到不可变的值对象，不碰宿主实现）
-import '../plugin/plugin_host.dart';
 import '../plugin/station_scope.dart';
 import '../settings/core_settings.dart';
 import '../settings/ssh_config.dart';
@@ -2362,7 +2360,7 @@ class CoreServer {
         'health': health['health'],
         'reason': health['reason'] ?? '',
         'error': bus.errorOf(id) ?? '',
-        // 总线启动时是否读到过这一条：false = 新增条目，热应用一定做不到
+        // 总线运行期是否认识这一条：false = 还没对账过（写一次盘就会认识）
         'known': bus.config(id) != null,
       };
     }
@@ -2508,8 +2506,11 @@ class CoreServer {
 
   /// POST /api/plugin/configs/{pluginId}/restart：显式重启一个插件实例。
   ///
-  /// 这是**唯一**能真正作用到运行中总线上的操作（PluginBus.restart 是公开入口），
-  /// 主要用于心跳 degraded 之后由用户手动恢复。
+  /// 用途一：心跳 degraded 之后由用户手动恢复；用途二：改完配置想立刻按新参数拉起
+  /// （日常开关走 PATCH，已经会自动对账，不必手动点这里）。
+  ///
+  /// 若总线运行期还没见过这一条（例如用户直接手改了 plugins.yaml 再点重启），先按
+  /// 磁盘对一次账——否则会误报"要重启核心"，而它其实现在就能被拉起来。
   Future<void> _restartPluginConfig(
     HttpRequest request,
     Map<String, String> params,
@@ -2526,10 +2527,15 @@ class CoreServer {
       return;
     }
     if (bus.config(id) == null) {
+      // 运行期还不认识这一条（核心启动后手工加进 plugins.yaml 的）：先对账，
+      // 让总线按磁盘把运行态对齐，再判断它到底在不在清单里。
+      await bus.applyConfigs();
+    }
+    if (bus.config(id) == null) {
       await writeJson(
         request,
         400,
-        errorBody('插件 $id 不在本次核心启动时读取的配置里（新增条目要重启核心后才会被拉起）'),
+        errorBody('插件 $id 不在插件清单里（${store.path}）：请检查 plugins.yaml'),
       );
       return;
     }
@@ -2798,27 +2804,23 @@ abstract class PluginHotApplier {
   });
 }
 
-/// 默认热应用：**只用 PluginBus 的公开面**（configs / config / start / restart / close）。
+/// 默认热应用：把"配置已落盘"翻译成"对运行中的插件总线做了什么"。
 ///
-/// 为什么"热应用失败"在本轮是常态而不是 bug：PluginBus 的配置是**核心启动时读一次**
-/// 进内存的（load 幂等），运行期既没有"重新读盘"，也没有"单独断开某个插件"的公开
-/// 入口（只有 restart 与 close）。于是真正能生效的只有两类动作：
-/// - 让一个总线内存里**已存在、启动参数没变**的插件重启（典型场景：心跳 degraded
-///   之后手动恢复，或它启动失败后重试）；
-/// - 该插件本来就没在跑时的"停用"（无需断开 = 已经达成目标）。
+/// 实现方式是**一层翻译**：调插件总线的配置对账（[PluginBus.applyConfigs]），再把
+/// 对账结论按本条的 plugin_id 回报给 REST 层。真正的事在总线那边：重读 plugins.yaml、
+/// 按新配置增删实例、判定"要不要重启"、隔离单个插件的启动失败。这里只负责回答
+/// "这一条到底算不算生效"，并给一句可读的解释。
 ///
-/// 其余情况一律**如实回报**，绝不"拿旧定义重启"假装成功：
+/// 为什么要留这层接缝（而不是把逻辑写死在处理器里）：
+/// 1. REST 层与前端一个字都不用改就能换实现；
+/// 2. 测试可以注入一个永远失败的实现，确定性地覆盖"热应用失败"这条路径。
 ///
-/// | 改动 | 结果 | 原因 |
-/// |---|---|---|
-/// | 新增条目 | 未热应用 | 总线运行期不认识它（config(id) 为 null） |
-/// | 改 command / args / env / granularity / scope / name | 未热应用 | 总线不重读配置，restart 只会用旧定义拉起 |
-/// | 改 enabled（开或关，条目在总线内存里） | 未热应用 | 启用态在核心启动时定死；且没有单插件断开入口 |
-/// | 条目完全没变 | 已一致 | 运行中 ⇒ 无需重启；没在跑 ⇒ 顺手重试一次启动 |
-///
-/// 因此前端会显示「配置已保存，但本次热应用失败，重启核心后生效」——这是**如实**的
-/// 回报。要让启用 / 停用真正热生效，需要 PluginBus 提供一个"重新读盘并按新配置增删
-/// 实例"的公开方法；本文件已经把它收敛成 [PluginHotApplier] 接缝，加好后换实现即可。
+/// 回报口径（**如实**，不假成功）：
+/// - started / stopped / restarted / unchanged ⇒ `hot_applied: true` + 做了什么；
+/// - failed（命令不存在、脚本缺失等）⇒ `hot_applied: false` +
+///   「配置已保存，但本次热应用失败，重启核心后生效」+ 具体原因；
+/// - 清单读不出来（YAML 被手改坏）⇒ 同上；此时运行实例保持原样，不因为一次
+///   拼写错误把在跑的插件全停掉。
 class BusPluginHotApplier implements PluginHotApplier {
   BusPluginHotApplier(this.bus);
 
@@ -2833,119 +2835,53 @@ class BusPluginHotApplier implements PluginHotApplier {
     if (id.isEmpty) {
       return const PluginHotApplyOutcome.notApplied('插件条目缺少 id，无法热应用');
     }
-    final PluginConfig? known = bus.config(id);
-    if (known == null) {
+    final PluginReconcileResult report;
+    try {
+      // 对账是**整份清单**级的（不是只处理这一条）：只有把磁盘与运行实例全量对齐，
+      // 才谈得上"开关立刻有用"；本次这一条的结论从结果里按 id 取。
+      report = await bus.applyConfigs();
+    } catch (error) {
+      // applyConfigs 内部已做失败隔离；这里兜住任何意外，绝不把异常抛给 REST 层
+      return PluginHotApplyOutcome.notApplied('插件配置热应用失败：$error');
+    }
+    if (report.error.isNotEmpty) {
+      return PluginHotApplyOutcome.notApplied(report.error);
+    }
+    final PluginReconcileAction? action = report.actionOf(id);
+    if (action == null) {
+      // 本次对账**没有**提到这一条：说明它没在跑、也没有任何动作可做。
       if (!enable) {
-        // 删除 / 停用一个总线不认识的条目：它本来就没跑起来，目标已达成
+        // 删除 / 停用一个没在跑的插件：目标（不跑）本来就达成
         return const PluginHotApplyOutcome.applied('该插件未在运行，无需断开');
       }
-      return const PluginHotApplyOutcome.notApplied(
-        '该条目不在核心启动时读取的配置里（新增条目）：插件总线运行期不重读配置，'
-        '无法把它拉起来',
-      );
-    }
-    final String diff = _diff(known, entry);
-    final bool running = bus.healthOf(id)['health'] != 'unavailable';
-    if (diff.isEmpty) {
-      if (!enable) {
-        return running
-            ? const PluginHotApplyOutcome.notApplied(
-                '插件总线没有"单独断开某个插件"的公开入口（只有 restart / close），'
-                '无法只停它一个',
-              )
-            : const PluginHotApplyOutcome.applied('该插件未在运行，无需断开');
+      if (!report.totalEnabled) {
+        return PluginHotApplyOutcome.notApplied(
+          '插件系统总开关为关（plugins.yaml 顶层 enabled: false），本次没有启动 $id',
+        );
       }
-      if (running) {
-        return const PluginHotApplyOutcome.applied('配置与运行中的实例一致，无需重启');
-      }
-      // 配置没变但它不在跑（启动失败 / 进程已退出）：重启是安全且唯一有用的动作
-      final bool restarted = await bus.restart(id);
-      if (restarted) {
-        return const PluginHotApplyOutcome.applied('插件已按现有配置重新拉起');
-      }
-      final String reason = bus.errorOf(id) ?? '';
       return PluginHotApplyOutcome.notApplied(
-        reason.isEmpty ? '插件重启后仍未就绪' : '插件重启失败：$reason',
+        '配置对账后没有插件 $id 的结论：它可能已不在 ${bus.configFile} 里',
       );
     }
-    if (!enable) {
-      return PluginHotApplyOutcome.notApplied(
-        '插件总线运行期没有"单独断开某个插件"的公开入口（只有 restart / close），'
-        '无法只停它一个；它也不重读磁盘配置（本次改动：$diff）',
-      );
-    }
-    return PluginHotApplyOutcome.notApplied(
-      '插件总线的配置在核心启动时读一次、运行期不重读，本次改动（$diff）'
-      '无法热应用：拿旧定义 restart 只会"看起来成功"',
-    );
-  }
-
-  /// 与总线内存里那一份配置的差异（可读字段名列表；无差异返回空串）。
-  static String _diff(PluginConfig known, Map<String, dynamic> entry) {
-    final List<String> fields = <String>[];
-    if (known.name != (entry['name'] ?? '').toString()) fields.add('name');
-    if (known.command != (entry['command'] ?? '').toString()) {
-      fields.add('command');
-    }
-    if (!_sameArgs(known.args, _argsOf(entry))) fields.add('args');
-    if (!_sameEnv(known.env, _envOf(entry))) fields.add('env');
-    if (known.enabled != (entry['enabled'] != false)) fields.add('enabled');
-    if (known.granularity != (entry['granularity'] ?? 'team').toString()) {
-      fields.add('granularity');
-    }
-    if (!_sameScope(known.scope, _scopeOf(entry))) fields.add('scope');
-    return fields.join(' / ');
-  }
-
-  static List<String> _argsOf(Map<String, dynamic> entry) {
-    final Object? raw = entry['args'];
-    if (raw is! List) return const <String>[];
-    return <String>[for (final Object? a in raw) a.toString()];
-  }
-
-  static Map<String, String> _envOf(Map<String, dynamic> entry) {
-    final Object? raw = entry['env'];
-    if (raw is! Map) return const <String, String>{};
-    return <String, String>{
-      for (final MapEntry<Object?, Object?> e in raw.entries)
-        e.key.toString(): e.value?.toString() ?? '',
+    return switch (action.kind) {
+      PluginReconcileKind.started => PluginHotApplyOutcome.applied(
+        '插件已按最新配置启动（${action.reason}）',
+      ),
+      PluginReconcileKind.stopped => PluginHotApplyOutcome.applied(
+        '插件已断开：${action.reason}',
+      ),
+      PluginReconcileKind.restarted => PluginHotApplyOutcome.applied(
+        '插件已按新启动参数重启：${action.reason}',
+      ),
+      PluginReconcileKind.unchanged => PluginHotApplyOutcome.applied(
+        '配置与运行中的实例一致，无需变更：${action.reason}',
+      ),
+      // 只有"这个插件这次没起来"才回失败——具体原因（命令不存在等）原样带上，
+      // 前端会显示「配置已保存，但本次热应用失败，重启核心后生效」+ 这句话。
+      PluginReconcileKind.failed => PluginHotApplyOutcome.notApplied(
+        '插件 $id 本次未能就绪：${action.reason}',
+      ),
     };
-  }
-
-  static Map<String, dynamic> _scopeOf(Map<String, dynamic> entry) {
-    final Object? raw = entry['scope'];
-    if (raw is! Map) return const <String, dynamic>{};
-    return <String, dynamic>{
-      for (final MapEntry<Object?, Object?> e in raw.entries)
-        e.key.toString(): e.value ?? '',
-    };
-  }
-
-  /// 三个"同构比较"：逐项比而不是拼串，避免分隔符出现在值里造成误判。
-  static bool _sameArgs(List<String> a, List<String> b) {
-    if (a.length != b.length) return false;
-    for (int i = 0; i < a.length; i++) {
-      if (a[i] != b[i]) return false;
-    }
-    return true;
-  }
-
-  static bool _sameEnv(Map<String, String> a, Map<String, String> b) {
-    if (a.length != b.length) return false;
-    for (final MapEntry<String, String> e in a.entries) {
-      if (b[e.key] != e.value) return false;
-    }
-    return true;
-  }
-
-  /// scope 的值是 dynamic（YAML 里可能是数字 / 布尔），一律按文本比较。
-  static bool _sameScope(Map<String, dynamic> a, Map<String, dynamic> b) {
-    if (a.length != b.length) return false;
-    for (final MapEntry<String, dynamic> e in a.entries) {
-      if (!b.containsKey(e.key)) return false;
-      if (b[e.key].toString() != e.value.toString()) return false;
-    }
-    return true;
   }
 }
 

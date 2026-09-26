@@ -119,6 +119,13 @@ class PluginBus {
 
   final List<PluginConfig> _configs = <PluginConfig>[];
   final Map<String, PluginHost> _hosts = <String, PluginHost>{};
+
+  /// 每个**正在运行的实例**是按哪一份配置拉起来的（[applyConfigs] 判断"启动参数
+  /// 有没有变"的唯一依据）。
+  ///
+  /// 为什么不能拿 `_configs` 里的那一份比：对账会重读磁盘并**整体覆盖** `_configs`，
+  /// 旧配置当场就没了；而"这个进程当时是按什么参数起来的"才是"要不要重启"的判据。
+  final Map<String, PluginConfig> _spawnedConfigs = <String, PluginConfig>{};
   final Map<String, String> _errors = <String, String>{};
   final Map<String, int> _queueDepth = <String, int>{};
 
@@ -152,29 +159,54 @@ class PluginBus {
   Timer? _watchdogTimer;
   bool _loaded = false;
 
-  /// 读配置（幂等；文件不存在按"无插件"）。
+  /// 读配置（**幂等**；文件不存在按"无插件"）。
+  ///
+  /// 幂等 = 配置只在核心启动时进内存一次。这条口径不能丢：[configs] / [config]
+  /// 在热路径上（每次模型工具表拼装都会问一次"有哪些插件"），每次调用都读盘会把
+  /// 工具表刷新拖成磁盘 IO。运行期的增删改走 [applyConfigs]（它先调 [_reloadConfigs]）。
   void load() {
     if (_loaded) return;
+    _reloadConfigs();
+  }
+
+  /// **强制重读** <数据根>/config/plugins.yaml 到内存（[applyConfigs] 的读盘口）。
+  ///
+  /// 为什么需要它：load() 幂等意味着"用户在盘上改了配置"在运行期没有任何落点，
+  /// 于是每个插件开关都得等重启核心。返回 null = 读盘成功（内存被磁盘整体覆盖；
+  /// 先解析到临时列表、成功才替换，所以重复调用幂等）；返回可读原因 = 解析失败，
+  /// 此时内存配置与运行实例**保持原样**：把用户手改坏的文件当成"没有插件"会顺手
+  /// 停掉全部在跑的插件，那是把一次拼写错误放大成一次全量停机。
+  String? _reloadConfigs() {
     _loaded = true;
     final String? text = AtomicFile.readStringOrNullSync(configFile);
-    if (text == null || text.trim().isEmpty) return;
-    try {
-      final Map<String, dynamic> data = YamlCodec.decode(text);
-      enabled = data['enabled'] != false;
-      final Object? raw = data['plugins'];
-      if (raw is List<dynamic>) {
-        for (final dynamic item in raw) {
-          if (item is! Map) continue;
-          final PluginConfig config = PluginConfig.fromJson(
-            item.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
-          );
-          if (config.id.trim().isEmpty) continue;
-          _configs.add(config);
+    final List<PluginConfig> parsed = <PluginConfig>[];
+    bool totalEnabled = true;
+    if (text != null && text.trim().isNotEmpty) {
+      try {
+        final Map<String, dynamic> data = YamlCodec.decode(text);
+        totalEnabled = data['enabled'] != false;
+        final Object? raw = data['plugins'];
+        if (raw is List<dynamic>) {
+          for (final dynamic item in raw) {
+            if (item is! Map) continue;
+            final PluginConfig config = PluginConfig.fromJson(
+              item.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
+            );
+            if (config.id.trim().isEmpty) continue;
+            parsed.add(config);
+          }
         }
+      } catch (error) {
+        log?.call('插件配置解析失败（$configFile）：$error');
+        return '插件配置解析失败（$configFile）：$error';
       }
-    } catch (error) {
-      log?.call('插件配置解析失败（$configFile）：$error');
     }
+    // 成功解析才整体替换内存配置（追加式更新会让删掉的条目阴魂不散）
+    _configs
+      ..clear()
+      ..addAll(parsed);
+    enabled = totalEnabled;
+    return null;
   }
 
   /// 全部插件配置（按配置顺序）。
@@ -310,6 +342,8 @@ class PluginBus {
       host.onPluginRequest = (String method, Map<String, dynamic> params) =>
           _handlePluginRequest(config, method, params);
       _hosts[config.id] = host;
+      // 记下"这个实例是按哪一份配置起来的"：对账时据此判断启动参数有没有变
+      _spawnedConfigs[config.id] = config;
       _errors.remove(config.id);
       _queueDepth[config.id] = 0;
       host.liveness.recordBeat();
@@ -545,6 +579,247 @@ class PluginBus {
     await _startOne(pluginConfig);
     await refreshToolDefinitions();
     return _hosts.containsKey(pluginId);
+  }
+
+  /// **配置对账**（M9 §4.2「开关立刻有用」的核心入口）：重读磁盘配置，把运行中的
+  /// 实例调整到与文件一致，并返回**结构化**的逐条结论。
+  ///
+  /// 为什么必须单独有这个方法：`load()` 幂等 = 配置只在核心启动时进内存，运行期
+  /// 没有任何落点——于是前端改了开关也只能回"重启核心后生效"。这里把"磁盘 vs
+  /// 运行实例"的差量算清楚，并**复用既有的 [_startOne] / [_disconnect]**（不复制一套
+  /// 生命周期逻辑：握手、工具申报、站点订阅、状态广播、失败隔离因此与核心启动时
+  /// 走的是同一条路径）。
+  ///
+  /// 判定口径：
+  /// - 文件里**新增**且 enabled ⇒ 启动（started）；
+  /// - **在跑且启动参数未变**（command / args / env / granularity / scope 全等）
+  ///   ⇒ 一个字节都不动（unchanged）。**刻意不重启**：重启要打断插件正在跑的活、
+  ///   丢掉它的内存态，而配置没变时重启换不来任何东西；
+  /// - 在跑但启动参数变了 ⇒ 断开后用**新参数**启动（restarted，附变化字段名）；
+  /// - enabled=false ⇒ 断开并从实例列表移除（stopped），配置条目**保留**
+  ///   （面板据此显示"已停用"，再次打开沿用同一个 id）；
+  /// - 文件里已删除 ⇒ 断开并忘掉（stopped；工具定义与站点订阅在 [_disconnect] 里注销）；
+  /// - 单个插件启动失败（命令不存在等）⇒ 只进 failed（带可读原因），**不影响其它
+  ///   插件**，与 [start] 同口径：一个插件崩了不牵连同级与核心；
+  /// - 顶层总开关关闭 ⇒ 只断不启（与 [start] 提前返回同一口径）。
+  ///
+  /// 对账真的改动了运行态时，按既有机制补一次工具定义收集：下线插件的定义与站点
+  /// 订阅已在 [_disconnect] 里注销，新上线插件的申报由这次 [refreshToolDefinitions]
+  /// 收走。什么都没变时**不触发收集**（不白打扰插件），工具表也就没有失效点。
+  Future<PluginReconcileResult> applyConfigs() async {
+    final String? readError = _reloadConfigs();
+    if (readError != null) {
+      // 配置读不出来：保持现状，只把可读原因报上去（见 [_reloadConfigs] 的说明）
+      return PluginReconcileResult(totalEnabled: enabled, error: readError);
+    }
+    final List<PluginReconcileAction> started = <PluginReconcileAction>[];
+    final List<PluginReconcileAction> stopped = <PluginReconcileAction>[];
+    final List<PluginReconcileAction> restarted = <PluginReconcileAction>[];
+    final List<PluginReconcileAction> unchanged = <PluginReconcileAction>[];
+    final List<PluginReconcileAction> failed = <PluginReconcileAction>[];
+    final Map<String, PluginConfig> next = <String, PluginConfig>{
+      for (final PluginConfig config in _configs) config.id: config,
+    };
+
+    // ① 文件里已消失的运行实例：断开并忘掉。放在最前面——被删掉的插件不该继续
+    //    收事件、占着工具命名空间与站点订阅。
+    for (final String pluginId in _hosts.keys.toList(growable: false)) {
+      if (next.containsKey(pluginId)) continue;
+      const String reason = '配置条目已删除：实例已断开并忘掉（工具定义与站点订阅一并注销）';
+      await _stopPlugin(pluginId, reason);
+      _errors.remove(pluginId); // 条目都没了，旧错误不该再留在探针里
+      stopped.add(
+        PluginReconcileAction(
+          kind: PluginReconcileKind.stopped,
+          pluginId: pluginId,
+          reason: reason,
+        ),
+      );
+    }
+
+    // ② 逐条对账（按文件顺序，与 start() 的遍历口径一致）
+    for (final PluginConfig config in _configs) {
+      final bool running = _isRunning(config.id);
+      if (!enabled) {
+        if (running) {
+          const String reason =
+              '插件系统总开关为关（plugins.yaml 顶层 enabled: false）：实例已断开';
+          await _stopPlugin(config.id, reason);
+          stopped.add(
+            PluginReconcileAction(
+              kind: PluginReconcileKind.stopped,
+              pluginId: config.id,
+              reason: reason,
+            ),
+          );
+        }
+        continue;
+      }
+      if (!config.enabled) {
+        if (running) {
+          const String reason = '条目已停用（enabled: false）：实例已断开，条目仍保留在清单里';
+          await _stopPlugin(config.id, reason);
+          stopped.add(
+            PluginReconcileAction(
+              kind: PluginReconcileKind.stopped,
+              pluginId: config.id,
+              reason: reason,
+            ),
+          );
+        } else {
+          unchanged.add(
+            PluginReconcileAction(
+              kind: PluginReconcileKind.unchanged,
+              pluginId: config.id,
+              reason: '条目已停用，实例本来就没在运行',
+            ),
+          );
+        }
+        continue;
+      }
+      if (!running) {
+        // 进程退出 / 被关掉留下的残留实例先摘干净：_startOne 见到"实例表里已经有
+        // 这个 id"会直接返回，那样会把一个死进程当成已就绪（假成功）。
+        if (_hosts.containsKey(config.id)) await _disconnect(config.id);
+        final PluginReconcileAction action = await _startForReconcile(config);
+        (action.kind == PluginReconcileKind.failed ? failed : started).add(
+          action,
+        );
+        continue;
+      }
+      final PluginConfig? spawned = _spawnedConfigs[config.id];
+      // spawned == null 只可能出现在"实例不是 _startOne 拉起来的"这种不该存在的
+      // 情况；此时证明不了参数没变 ⇒ 按当前配置重启一次（宁多重启一次，也不用旧参数硬撑）
+      final String diff = spawned == null
+          ? '没有上次启动参数的记录'
+          : describeStartupDiff(spawned, config);
+      if (diff.isEmpty) {
+        unchanged.add(
+          PluginReconcileAction(
+            kind: PluginReconcileKind.unchanged,
+            pluginId: config.id,
+            reason: '启动参数未变（command / args / env / granularity / scope 全等）：保持运行，不重启',
+          ),
+        );
+        continue;
+      }
+      await _disconnect(config.id);
+      final PluginReconcileAction action = await _startForReconcile(
+        config,
+        changed: diff,
+      );
+      (action.kind == PluginReconcileKind.failed ? failed : restarted).add(
+        action,
+      );
+    }
+
+    final PluginReconcileResult result = PluginReconcileResult(
+      started: started,
+      stopped: stopped,
+      restarted: restarted,
+      unchanged: unchanged,
+      failed: failed,
+      totalEnabled: enabled,
+    );
+    if (result.hasChanges) {
+      invalidateToolTable(reason: '插件配置对账：运行态有变化');
+      await refreshToolDefinitions();
+      // 与 start() 同口径：有实例在跑就该有探活节拍（幂等）。对账刚把插件拉起来
+      // 而心跳巡检还停着的话，它就没人判活了。
+      _watchdogTimer ??= Timer.periodic(heartbeatInterval, (Timer _) {
+        unawaited(watchdog());
+      });
+    }
+    log?.call(result.describe());
+    return result;
+  }
+
+  /// 某插件此刻**真的在跑**吗（实例在表里且进程没退出）。
+  bool _isRunning(String pluginId) {
+    final PluginHost? host = _hosts[pluginId];
+    return host != null && !host.isClosed;
+  }
+
+  /// 拉起一个插件并归类成 started / restarted / failed（**单个插件的失败不外溢**）。
+  Future<PluginReconcileAction> _startForReconcile(
+    PluginConfig config, {
+    String changed = '',
+  }) async {
+    try {
+      await _startOne(config);
+    } catch (error) {
+      // _startOne 自己会吞掉常规失败；这里兜住任何意外，保证"一个插件的问题不会
+      // 中断整轮对账"（失败隔离是对账口径的一部分，不是可选项）。
+      _errors[config.id] = '$error';
+    }
+    if (_hosts.containsKey(config.id)) {
+      return PluginReconcileAction(
+        kind: changed.isEmpty
+            ? PluginReconcileKind.started
+            : PluginReconcileKind.restarted,
+        pluginId: config.id,
+        reason: changed.isEmpty ? '已按配置启动' : '启动参数变化（$changed）：已断开并按新参数启动',
+      );
+    }
+    return PluginReconcileAction(
+      kind: PluginReconcileKind.failed,
+      pluginId: config.id,
+      reason: _errors[config.id] ?? '启动失败（总线没有记录到原因）',
+    );
+  }
+
+  /// 断开一个实例，并把"停用"如实推给前端（[reason] = 面板上显示的可读原因）。
+  ///
+  /// 比 [_disconnect] 多做的事就是**广播状态**：不广播的话前端只能等下一次快照，
+  /// 用户点完开关还会看到"还在跑"——那这次热应用就白做了。
+  Future<void> _stopPlugin(String pluginId, String reason) async {
+    // 先留一份配置：_disconnect 会把这个实例的记录清掉，而广播要用它带
+    // scope / granularity（条目被删时磁盘上已经找不到这一条了）。
+    final PluginConfig? last = _spawnedConfigs[pluginId] ?? config(pluginId);
+    await _disconnect(pluginId);
+    if (last != null) _emitStatus(last, 'disabled', reason: reason);
+  }
+
+  /// 两份配置在**启动参数**上的差异（可读字段名；全等返回空串）。
+  ///
+  /// 只比"改了就必须重新拉起进程"的字段：command / args / env / granularity / scope。
+  /// **name 不在其中**——它只是显示名，改它不需要重启（"不无谓重启"的一部分）；
+  /// enabled 是启停开关，由 [applyConfigs] 的分支单独处理，不算"启动参数"。
+  static String describeStartupDiff(PluginConfig running, PluginConfig next) {
+    final List<String> fields = <String>[];
+    if (running.command != next.command) fields.add('command');
+    if (!_sameArgs(running.args, next.args)) fields.add('args');
+    if (!_sameEnv(running.env, next.env)) fields.add('env');
+    if (running.granularity != next.granularity) fields.add('granularity');
+    if (!_sameScope(running.scope, next.scope)) fields.add('scope');
+    return fields.join(' / ');
+  }
+
+  /// 三个"同构比较"：逐项比而不是拼串（值里出现分隔符会误判）。
+  /// scope 的值是 dynamic（YAML 里可能是数字 / 布尔），一律按文本比。
+  static bool _sameArgs(List<String> a, List<String> b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  static bool _sameEnv(Map<String, String> a, Map<String, String> b) {
+    if (a.length != b.length) return false;
+    for (final MapEntry<String, String> e in a.entries) {
+      if (b[e.key] != e.value) return false;
+    }
+    return true;
+  }
+
+  static bool _sameScope(Map<String, dynamic> a, Map<String, dynamic> b) {
+    if (a.length != b.length) return false;
+    for (final MapEntry<String, dynamic> e in a.entries) {
+      if (!b.containsKey(e.key)) return false;
+      if (b[e.key].toString() != e.value.toString()) return false;
+    }
+    return true;
   }
 
   /// **触发「插件定义 tool」收集站**：插件按 schema 申报 → 收集 → 注册成动态工具。
@@ -1152,6 +1427,8 @@ class PluginBus {
 
   Future<void> _disconnect(String pluginId) async {
     final PluginHost? host = _hosts.remove(pluginId);
+    // 实例没了 ⇒ "上次按什么参数起来的"这条记录也失效（重启会重新记）
+    _spawnedConfigs.remove(pluginId);
     _queueDepth[pluginId] = 0;
     _degraded.remove(pluginId);
     // **插件下线由总线注销其订阅**（站点订阅关系随之落盘）
@@ -1169,6 +1446,124 @@ class PluginBus {
   }
 
   static int _nowSeconds() => DateTime.now().millisecondsSinceEpoch ~/ 1000;
+}
+
+/// 对账里**单个插件**的结论：做了什么（[kind]）+ 对谁（[pluginId]）+ 为什么（[reason]）。
+class PluginReconcileAction {
+  const PluginReconcileAction({
+    required this.kind,
+    required this.pluginId,
+    required this.reason,
+  });
+
+  final PluginReconcileKind kind;
+  final String pluginId;
+
+  /// 可读原因（日志 / 热应用 detail 直接用；失败时就是"为什么没起来"）。
+  final String reason;
+
+  /// 一句话形式。
+  String describe() => '$pluginId：$reason';
+}
+
+/// 对账动作的种类（[PluginBus.applyConfigs] 的五种结论）。
+enum PluginReconcileKind {
+  /// 文件里新增 / 本来没跑：按配置拉起来了。
+  started,
+
+  /// 按配置断开了（enabled=false，或条目已被删除）。
+  stopped,
+
+  /// 启动参数变了：断开后用新参数重新拉起。
+  restarted,
+
+  /// 配置与运行态已经一致，**没有**动它（尤其：启动参数没变 ⇒ 不重启）。
+  unchanged,
+
+  /// 这次没能就绪（可读原因在 [PluginReconcileAction.reason]）。
+  failed;
+
+  /// 中文名（日志 / 回报）。
+  String get label => switch (this) {
+    PluginReconcileKind.started => '启动',
+    PluginReconcileKind.stopped => '停用',
+    PluginReconcileKind.restarted => '重启',
+    PluginReconcileKind.unchanged => '未变',
+    PluginReconcileKind.failed => '失败',
+  };
+}
+
+/// 一次**配置对账**的结论（[PluginBus.applyConfigs]）。
+///
+/// 分五类而不是一个 bool：调用方（热应用接缝 / 日志 / 测试）要能回答"这个插件这次
+/// 到底被怎么处理了"，而不是只知道"整体成功或失败"。
+class PluginReconcileResult {
+  const PluginReconcileResult({
+    this.started = const <PluginReconcileAction>[],
+    this.stopped = const <PluginReconcileAction>[],
+    this.restarted = const <PluginReconcileAction>[],
+    this.unchanged = const <PluginReconcileAction>[],
+    this.failed = const <PluginReconcileAction>[],
+    this.totalEnabled = true,
+    this.error = '',
+  });
+
+  final List<PluginReconcileAction> started;
+  final List<PluginReconcileAction> stopped;
+  final List<PluginReconcileAction> restarted;
+  final List<PluginReconcileAction> unchanged;
+  final List<PluginReconcileAction> failed;
+
+  /// 对账时读到的插件系统总开关（false = 本次只断不启）。
+  final bool totalEnabled;
+
+  /// 读盘失败的可读原因（非空 = 本次没有对账，运行态与内存配置都保持原样）。
+  final String error;
+
+  /// 是否真的改动了运行态（新增 / 停用 / 重启任一非空）。
+  bool get hasChanges =>
+      started.isNotEmpty || stopped.isNotEmpty || restarted.isNotEmpty;
+
+  /// 是否有插件没能就绪。
+  bool get hasFailure => failed.isNotEmpty;
+
+  /// 五类结论的平铺（遍历 / 查找用；顺序 = 启动 / 停用 / 重启 / 未变 / 失败）。
+  List<PluginReconcileAction> get all => <PluginReconcileAction>[
+    ...started,
+    ...stopped,
+    ...restarted,
+    ...unchanged,
+    ...failed,
+  ];
+
+  /// 某个插件这次的结论；本次没提到它 ⇒ null（例如"停用且没在跑的条目被删除"：
+  /// 运行态与配置本来就一致，没有任何动作可做）。
+  PluginReconcileAction? actionOf(String pluginId) {
+    for (final PluginReconcileAction action in all) {
+      if (action.pluginId == pluginId) return action;
+    }
+    return null;
+  }
+
+  /// 可读摘要（日志与热应用 detail 用）。
+  String describe() {
+    if (error.isNotEmpty) return '插件配置对账未执行：$error';
+    final StringBuffer out = StringBuffer('插件配置对账');
+    void segment(String label, List<PluginReconcileAction> items) {
+      if (items.isEmpty) return;
+      out.write('；$label ${items.length} 个：');
+      out.write(items.map((PluginReconcileAction a) => a.describe()).join('、'));
+    }
+
+    segment('启动', started);
+    segment('停用', stopped);
+    segment('重启', restarted);
+    segment('未变', unchanged);
+    segment('失败', failed);
+    if (!hasChanges && !hasFailure) out.write('：配置与运行态一致，无需变更');
+    if (!totalEnabled) out.write('（插件系统总开关为关，未启动任何插件）');
+    return out.toString();
+  }
 }
 
 /// 一次「插件定义 tool」触发的回报（收集站部分结果 + 注册结果）。

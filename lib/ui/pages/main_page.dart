@@ -707,7 +707,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
           ActivityBarItem(
             icon: Icons.extension_outlined,
             selectedIcon: Icons.extension,
-            tooltip: '插件（只读）',
+            tooltip: '插件管理',
             selected: _isBuiltinPanelSelected(1),
             onTap: () => _selectBuiltinPanel(1),
           ),
