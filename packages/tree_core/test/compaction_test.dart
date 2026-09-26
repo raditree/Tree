@@ -276,6 +276,21 @@ void main() {
       expect(result.compressed, isTrue);
       expect(result.summary, contains('历史要点'));
       expect(store.session(agent.id, session.sessionId)!.compacted, isTrue);
+      expect(result.degraded, isTrue, reason: '总结失败必须对调用方可见（Q1-③：压缩失败必须前端可见）');
+      expect(result.toJson()['degraded'], isTrue);
+    });
+
+    test('总结成功不标记降级', () async {
+      addTurn('一');
+      addTurn('二');
+      addTurn('三');
+      final CompactionResult result = await service.compact(
+        agent.id,
+        session.sessionId,
+      );
+      expect(result.compressed, isTrue);
+      expect(result.degraded, isFalse);
+      expect(result.toJson().containsKey('degraded'), isFalse);
     });
   });
 
@@ -333,6 +348,130 @@ void main() {
     test('dispose 转交总结器', () async {
       await service.dispose();
       expect(summarizer.closed, isTrue);
+    });
+  });
+
+  group('预算来源与轮内压缩（Q1-③）', () {
+    test('模型没配 max_seqlen：预算走兜底值并显式标注', () {
+      final CompactionService bare = CompactionService(
+        store: store,
+        settings: CoreSettings(),
+        summarizer: summarizer,
+      );
+      final MaxSeqlenBudget budget = bare.maxSeqlenFor(agent);
+      expect(budget.fallback, isTrue, reason: '没配置就要标注，不能默默兜底');
+      expect(budget.value, CoreSettings.fallbackMaxSeqlen);
+      final MaxSeqlenBudget configured = service.maxSeqlenFor(agent);
+      expect(configured.fallback, isFalse);
+      expect(configured.value, 1000);
+    });
+
+    test('成员级 max_seqlen 覆盖优先于模型默认（与引擎发请求同口径）', () {
+      agent.maxSeqlenOverride = 4000;
+      store.putAgent(agent);
+      expect(service.maxSeqlenFor(agent).value, 4000);
+      expect(service.maxSeqlenFor(agent).fallback, isFalse);
+    });
+
+    test('force：端点已报超限时跳过阈值判断强制压一次', () async {
+      addTurn('一');
+      addTurn('二');
+      addTurn('三');
+      expect(
+        await service.autoCompact(agent, session),
+        isNull,
+        reason: '估算远低于阈值，正常判断不动',
+      );
+      final CompactionResult? forced = await service.autoCompact(
+        agent,
+        session,
+        force: true,
+      );
+      expect(forced, isNotNull);
+      expect(forced!.compressed, isTrue);
+      expect(summarizer.prompts, hasLength(1));
+    });
+
+    test('估算口径跟随逐模型 token_scale（Q1-①）', () {
+      add('user', '内容' * 500);
+      final int atDefault = service.estimateContextTokens(agent, session);
+      settings.model('demo')!.tokenScale = 1;
+      final int atOne = service.estimateContextTokens(agent, session);
+      expect(atOne, greaterThan(atDefault));
+      settings.model('demo')!.tokenScale = 4;
+      expect(
+        service.estimateContextTokens(agent, session),
+        lessThan(atDefault),
+      );
+    });
+  });
+
+  group('会话服务的压缩接线（Q1-③）', () {
+    test('构造会话服务时把轮内压缩钩子接到 LLM 引擎上', () {
+      final LlmAgentEngine engine = LlmAgentEngine(
+        resolveModel: (String id) => null,
+      );
+      expect(engine.toolTurnCompactor, isNull, reason: '引擎自己是不认识存储的');
+      ConversationService(
+        store: store,
+        hub: WsHub(),
+        settings: settings,
+        compaction: service,
+        engine: engine,
+      );
+      expect(engine.toolTurnCompactor, isNotNull);
+    });
+
+    test('钩子回调真的压缩，并交回刷新过的上下文快照', () async {
+      addTurn('一');
+      addTurn('二');
+      addTurn('三');
+      final LlmAgentEngine engine = LlmAgentEngine(
+        resolveModel: (String id) => null,
+      );
+      ConversationService(
+        store: store,
+        hub: WsHub(),
+        settings: settings,
+        compaction: service,
+        engine: engine,
+      );
+      final AgentRunContext? refreshed = await engine.toolTurnCompactor!(
+        agent.id,
+        session.sessionId,
+        force: true,
+      );
+      expect(refreshed, isNotNull);
+      expect(
+        refreshed!.contextSummary,
+        isNotEmpty,
+        reason: '摘要必须刷新进上下文，否则"压了等于没压"',
+      );
+      expect(refreshed.compactedMessageCount, greaterThan(0));
+      expect(refreshed.history.last.content, '回答三');
+      expect(summarizer.prompts, hasLength(1));
+    });
+
+    test('没到阈值时钩子返回 null（引擎保持原上下文）', () async {
+      addTurn('一');
+      final LlmAgentEngine engine = LlmAgentEngine(
+        resolveModel: (String id) => null,
+      );
+      ConversationService(
+        store: store,
+        hub: WsHub(),
+        settings: settings,
+        compaction: service,
+        engine: engine,
+      );
+      expect(
+        await engine.toolTurnCompactor!(
+          agent.id,
+          session.sessionId,
+          force: false,
+        ),
+        isNull,
+      );
     });
   });
 }

@@ -6,6 +6,7 @@ import '../settings/core_settings.dart';
 import '../store/tree_store.dart';
 import '../util/ids.dart';
 import '../util/tokens.dart' as tokens;
+import '../llm/llm_agent_engine.dart';
 import '../ws/ws_hub.dart';
 import 'agent_engine.dart';
 import 'compaction_service.dart';
@@ -62,7 +63,15 @@ class ConversationService {
     this.questions,
     this.compaction,
     AgentEngine? engine,
-  }) : engine = engine ?? ScriptedAgent();
+  }) : engine = engine ?? ScriptedAgent() {
+    // 工具循环内压缩（Q1-③）：引擎（调用方构造）不认识存储与压缩服务，压缩服务
+    // 也拿不到引擎；会话服务两边都有，因此在这里把钩子接上。没接的引擎只是少了
+    // "轮内压缩"这一层保护，其余行为不变。
+    final AgentEngine target = this.engine;
+    if (target is LlmAgentEngine) {
+      target.toolTurnCompactor = _compactTurnContext;
+    }
+  }
 
   final TreeStore store;
   final WsHub hub;
@@ -87,6 +96,9 @@ class ConversationService {
 
   /// 因 `stop` 被丢弃的排队任务数（自检/测试用）。
   int droppedQueuedCount = 0;
+
+  /// 已提示过的"压缩失败 / 模型没配 max_seqlen"（同一件事只打扰用户一次）。
+  final Set<String> _notified = <String>{};
 
   /// 当前在途生成数（自检/日志用）。
   int get activeRunCount => _running.length;
@@ -240,6 +252,7 @@ class ConversationService {
     }
     _running.clear();
     _chains.clear();
+    _notified.clear();
   }
 
   // ── 内部实现 ─────────────────────────────────────────────────────────
@@ -330,26 +343,11 @@ class ConversationService {
     }
 
     // 自动压缩（M7d-4）：长会话先把早期历史总结掉，再按「摘要 + 近期消息」生成。
-    // 放在生成前而不是塞进工具循环里：压缩会改写这个会话的上下文，必须在
-    // 本轮请求构造之前尘埃落定。
+    // 这只是"本轮生成前那一次"；工具循环里**每一轮 API 调用前**还会再检查
+    // （Q1-③），那次由引擎经 [LlmAgentEngine.toolTurnCompactor] 回调回这里，
+    // 用的是同一套阈值与水位线。
     await _autoCompact(agent, session);
-    // 压缩会把摘要与水位线写回会话对象；重新取一次避免拿到过期快照
-    final CoreSession effective =
-        store.session(agent.id, session.sessionId) ?? session;
-    final AgentRunContext context = AgentRunContext(
-      agentId: agent.id,
-      sessionId: effective.sessionId,
-      modelId: agent.modelId,
-      systemPrompt: systemPromptWithWorkspace(agent),
-      userContent: userContent,
-      contextSummary: effective.compactedSummary,
-      compactedMessageCount: effective.compactedMessageCount,
-      // 用户消息已在 handleUserMessage 里落库，因此这里取到的历史已含本次输入
-      history: store
-          .messages(agent.id, effective.sessionId)
-          .map(_toRef)
-          .toList(growable: false),
-    );
+    final AgentRunContext context = _contextOf(agent, session, userContent);
 
     try {
       await for (final AgentEvent event in engine.run(
@@ -497,11 +495,10 @@ class ConversationService {
   /// 这是「从 LLM 流取回复」的节奏控制（替代旧的「主动延迟」），常开无开关；
   /// 取上限值（1000）时约 1ms/增量，等价于逐 token 不限速。
   Future<void> _paceToken() {
-    final int fps =
-        settings.tokenAcquisitionRate < 1 ? 1 : settings.tokenAcquisitionRate;
-    return Future<void>.delayed(
-      Duration(microseconds: (1000000 / fps).ceil()),
-    );
+    final int fps = settings.tokenAcquisitionRate < 1
+        ? 1
+        : settings.tokenAcquisitionRate;
+    return Future<void>.delayed(Duration(microseconds: (1000000 / fps).ceil()));
   }
 
   /// 推一条完整的 agent 文本消息（`message` 帧）并落库。
@@ -576,33 +573,167 @@ class ConversationService {
   }
 
   /// 本地估算的 token 用量（端点未返回 usage 时的兜底，带 `estimated: true`）。
+  ///
+  /// 比例取该模型的 token_scale（Q1-①）：进度条、压缩阈值、工具结果门控必须
+  /// 同口径，否则会出现"进度条说没超、端点却报超限"。
   Map<String, dynamic> usageOf(
     CoreAgent agent,
     String prompt,
     String completion,
   ) {
     final CoreModelConfig? model = settings.model(agent.modelId);
+    final double scale = model?.tokenScale ?? tokens.defaultTokenScale;
     return agentUsageMap(
-      promptTokens: estimateTokens(prompt),
-      completionTokens: estimateTokens(completion),
-      maxTokens: model?.effectiveMaxSeqlen ?? 128000,
+      promptTokens: estimateTokens(prompt, scale: scale),
+      completionTokens: estimateTokens(completion, scale: scale),
+      maxTokens: model?.effectiveMaxSeqlen ?? CoreSettings.fallbackMaxSeqlen,
       estimated: true,
     );
   }
 
   /// 粗略 token 估算（唯一实现在 util/tokens.dart，压缩阈值与进度条共用）。
-  static int estimateTokens(String text) => tokens.estimateTokens(text);
+  static int estimateTokens(
+    String text, {
+    double scale = tokens.defaultTokenScale,
+  }) => tokens.estimateTokens(text, scale: scale);
 
-  /// 自动压缩：只在超过阈值时动，失败只记日志——压缩绝不能把本轮生成搞挂。
-  Future<void> _autoCompact(CoreAgent agent, CoreSession session) async {
+  /// 构造引擎看到的运行上下文（生成前与工具循环内压缩后共用同一份装配逻辑）。
+  AgentRunContext _contextOf(
+    CoreAgent agent,
+    CoreSession session, [
+    String userContent = '',
+  ]) {
+    // 压缩会把摘要与水位线写回会话对象；重新取一次避免拿到过期快照
+    final CoreSession fresh =
+        store.session(agent.id, session.sessionId) ?? session;
+    return AgentRunContext(
+      agentId: agent.id,
+      sessionId: fresh.sessionId,
+      modelId: agent.modelId,
+      systemPrompt: systemPromptWithWorkspace(agent),
+      userContent: userContent,
+      contextSummary: fresh.compactedSummary,
+      compactedMessageCount: fresh.compactedMessageCount,
+      // 用户消息已在 handleUserMessage 里落库，因此这里取到的历史已含本次输入
+      history: store
+          .messages(agent.id, fresh.sessionId)
+          .map(_toRef)
+          .toList(growable: false),
+    );
+  }
+
+  /// 工具循环内压缩（Q1-③）：压动了就把**新的上下文快照**交给引擎重新装配。
+  ///
+  /// 返回 null = 没压（没配压缩器 / 没到阈值 / 已经没有可压的历史），引擎保持
+  /// 原上下文继续——压不动的情况由端点超限重试那条路兜底报错。
+  Future<AgentRunContext?> _compactTurnContext(
+    String agentId,
+    String sessionId, {
+    required bool force,
+  }) async {
+    if (compaction == null) return null;
+    final CoreAgent? agent = store.agent(agentId);
+    if (agent == null) return null;
+    final CoreSession? session = store.session(agentId, sessionId);
+    if (session == null) return null;
+    final bool compacted = await _autoCompact(agent, session, force: force);
+    if (!compacted) return null;
+    return _contextOf(agent, session);
+  }
+
+  /// 自动压缩：返回**是否真的压动了**（工具循环要靠它决定是否重新装配上下文）。
+  ///
+  /// 失败必须**可见**（Q1-③）：以前只写日志，用户看到的是"上下文怎么还是超"，
+  /// 却完全不知道压缩压根没跑起来。同一个错误只提示一次，避免每轮刷屏。
+  Future<bool> _autoCompact(
+    CoreAgent agent,
+    CoreSession session, {
+    bool force = false,
+  }) async {
     final CompactionService? service = compaction;
-    if (service == null) return;
+    if (service == null) return false;
+    _warnIfBudgetFallback(agent, session, service);
     try {
-      await service.autoCompact(agent, session);
+      final CompactionResult? result = await service.autoCompact(
+        agent,
+        session,
+        force: force,
+      );
+      if (result != null && result.compressed && result.degraded) {
+        // 总结模型没跑成功、退化成截断摘要：压缩是压了，但要点可能不全，必须说
+        _notifyOnce(
+          'compact-degraded|${agent.id}',
+          () => _sendAdvisory(
+            agent,
+            session,
+            '上下文已压缩，但总结模型调用失败，本次用的是截断摘要（要点可能不全）；'
+            '下一次压缩会重新尝试完整总结。',
+          ),
+        );
+      }
+      return result?.compressed ?? false;
     } catch (error) {
       // CompactionService 内部已对"总结失败"做了回退；这里兜的是存储层等
-      // 非预期异常。宁可这轮上下文大一点，也不能因此拒绝回复。
+      // 非预期异常。宁可这轮上下文大一点，也不能因此拒绝回复——但要让用户看见。
+      _notifyOnce(
+        'compact-failed|${agent.id}|$error',
+        () => _sendAdvisory(
+          agent,
+          session,
+          '上下文压缩失败：$error\n'
+          '本轮会按未压缩的上下文继续（更可能撞上模型上限）；'
+          '可在会话里手动压缩重试。',
+        ),
+      );
+      return false;
     }
+  }
+
+  /// 模型没配 max_seqlen 时的可见提示（Q1-③：不再默默兜 128000）。
+  ///
+  /// 去重键只含模型：一个模型提示一次，否则每一轮都会往会话里塞同一条消息。
+  void _warnIfBudgetFallback(
+    CoreAgent agent,
+    CoreSession session,
+    CompactionService service,
+  ) {
+    final MaxSeqlenBudget budget = service.maxSeqlenFor(agent);
+    if (!budget.fallback) return;
+    _notifyOnce(
+      'max-seqlen-fallback|${agent.modelId}',
+      () => _sendAdvisory(
+        agent,
+        session,
+        '模型「${agent.modelId}」没有配置 max_seqlen，压缩与上下文进度按兜底值 '
+        '${budget.value} token 判断，可能明显偏离端点的真实上限；'
+        '请到「设置 → 自定义模型」补上该模型的上下文长度。',
+      ),
+    );
+  }
+
+  /// 同一条提示在本次进程内只发一次（键由调用方给）。
+  void _notifyOnce(String key, void Function() notify) {
+    if (!_notified.add(key)) return;
+    notify();
+  }
+
+  /// 推一条**不落库**的 agent 提示（诊断用），前端收到 message 帧就会渲染。
+  ///
+  /// 为什么不复用 [_sendNotice]：那些诊断（压缩失败 / 模型没配 max_seqlen / 压缩
+  /// 降级）往往发生在"用户消息已落库、模型还没回答"之间，落库会让它插进上下文里，
+  /// 模型下一轮会拿这条系统提示当对话内容来回。前端可见即可，历史里不留噪声。
+  ///
+  /// 注：协议里没有独立的"状态栏"帧，message 帧是当前唯一前端可见的通道。
+  void _sendAdvisory(CoreAgent agent, CoreSession session, String content) {
+    hub.broadcast(<String, dynamic>{
+      'type': WsOutboundType.message,
+      'id': CoreIds.message(),
+      'role': 'agent',
+      'content': content,
+      'kind': 'text',
+      'agent_id': agent.id,
+      'session_id': session.sessionId,
+    });
   }
 
   void _sendError(String message) {
@@ -657,8 +788,9 @@ class _ChunkPump {
   /// 把攒下的增量合并成 `msg_chunk` 广播出去。
   void flush() {
     if (_pending.isEmpty) return;
-    final List<MapEntry<String, StringBuffer>> batch =
-        _pending.entries.toList(growable: false);
+    final List<MapEntry<String, StringBuffer>> batch = _pending.entries.toList(
+      growable: false,
+    );
     _pending.clear();
     for (final MapEntry<String, StringBuffer> entry in batch) {
       final String chunk = entry.value.toString();

@@ -110,10 +110,7 @@ void main() {
     test('token 获取帧率默认上限，夹取到 20~1000', () {
       final CoreSettings settings = CoreSettings();
       expect(settings.tokenAcquisitionRate, CoreSettings.tokenRateMax);
-      expect(
-        settings.setTokenAcquisitionRate(1),
-        CoreSettings.tokenRateMin,
-      );
+      expect(settings.setTokenAcquisitionRate(1), CoreSettings.tokenRateMin);
       expect(
         settings.setTokenAcquisitionRate(99999),
         CoreSettings.tokenRateMax,
@@ -211,6 +208,137 @@ void main() {
       });
       expect(settings.tokenAcquisitionRate, 120);
       expect(settings.models(), hasLength(1));
+    });
+  });
+
+  group('token_scale 与最长会话记录（Q1-①）', () {
+    CoreModelConfig model(CoreSettings settings) {
+      settings.createModel(<String, dynamic>{
+        'model_id': 'm1',
+        'base_url': 'https://x',
+        'api_key': 'k',
+      });
+      return settings.model('m1')!;
+    }
+
+    test('初值 2.00 / 0，并写进 toJson / fromJson / toApiJson', () {
+      final CoreModelConfig config = model(CoreSettings());
+      expect(config.tokenScale, defaultTokenScale);
+      expect(config.longestSessionTokens, 0);
+      expect(config.toJson()['token_scale'], 2.0);
+      expect(config.toJson()['longest_session_tokens'], 0);
+      expect(config.toApiJson()['token_scale'], 2.0);
+      expect(config.toApiJson()['longest_session_tokens'], 0);
+      final CoreModelConfig back = CoreModelConfig.fromJson(config.toJson());
+      expect(back.tokenScale, 2.0);
+      expect(back.longestSessionTokens, 0);
+      // 手写 yaml 的字符串也能读进来
+      expect(
+        CoreModelConfig.fromJson(<String, dynamic>{'token_scale': '3.5'})
+            .tokenScale,
+        3.5,
+      );
+      expect(
+        CoreModelConfig.fromJson(<String, dynamic>{'token_scale': -1})
+            .tokenScale,
+        defaultTokenScale,
+        reason: '越界的比例回退到初值',
+      );
+    });
+
+    test('真实 prompt_tokens 刷新最长记录并回写比例（保留两位）', () {
+      final CoreModelConfig config = model(CoreSettings());
+      expect(
+        config.learnTokenScale(contextChars: 6000, promptTokens: 2400),
+        isTrue,
+      );
+      expect(config.tokenScale, 2.5);
+      expect(config.longestSessionTokens, 2400);
+      // 不比记录更长的请求不再刷新
+      expect(
+        config.learnTokenScale(contextChars: 6000, promptTokens: 2400),
+        isFalse,
+      );
+      expect(
+        config.learnTokenScale(contextChars: 300, promptTokens: 100),
+        isFalse,
+      );
+      expect(config.tokenScale, 2.5);
+      // 更长的请求才继续刷新
+      expect(
+        config.learnTokenScale(contextChars: 10000, promptTokens: 3000),
+        isTrue,
+      );
+      expect(config.tokenScale, 3.33, reason: '10/3 保留两位');
+      expect(config.longestSessionTokens, 3000);
+    });
+
+    test('比值明显不合理的样本整条丢弃（不污染全局估算）', () {
+      final CoreModelConfig config = model(CoreSettings());
+      expect(
+        config.learnTokenScale(contextChars: 6, promptTokens: 100),
+        isFalse,
+        reason: '0.06 字符/token：上下文太短或端点另算了固定开销',
+      );
+      expect(
+        config.learnTokenScale(contextChars: 100000, promptTokens: 100),
+        isFalse,
+        reason: '1000 字符/token：不可能',
+      );
+      expect(
+        config.learnTokenScale(contextChars: 0, promptTokens: 100),
+        isFalse,
+      );
+      expect(
+        config.learnTokenScale(contextChars: 100, promptTokens: 0),
+        isFalse,
+      );
+      expect(config.tokenScale, defaultTokenScale);
+      expect(config.longestSessionTokens, 0);
+    });
+
+    test('学习状态不参与 merge（用户编辑模型时不接受该字段）', () {
+      final CoreSettings settings = CoreSettings();
+      final CoreModelConfig config = model(settings);
+      config.learnTokenScale(contextChars: 6000, promptTokens: 2400);
+      settings.updateModel('m1', <String, dynamic>{
+        'token_scale': 9.9,
+        'longest_session_tokens': 99999,
+        'name': '改名',
+      });
+      expect(config.name, '改名');
+      expect(config.tokenScale, 2.5, reason: '学习状态不接受用户编辑');
+      expect(config.longestSessionTokens, 2400);
+    });
+
+    test('学习后按既有落盘路径写回模型 yaml（与手动保存同一条路）', () {
+      final _RecordingSink sink = _RecordingSink();
+      final CoreSettings settings = CoreSettings()..sink = sink;
+      final CoreModelConfig config = model(settings);
+      expect(sink.modelsSaved, <String>['m1'], reason: '新建时保存一次');
+      expect(
+        config.learnTokenScale(contextChars: 6000, promptTokens: 2400),
+        isTrue,
+      );
+      expect(sink.modelsSaved, <String>['m1', 'm1']);
+    });
+
+    test('成员级覆盖的副本带走学习状态（否则估算会随发起者漂移）', () {
+      final CoreModelConfig config = model(CoreSettings());
+      config.learnTokenScale(contextChars: 6000, promptTokens: 2400);
+      final CoreModelConfig copy = config.withOverrides(<String, Object?>{
+        'max_seqlen': 32000,
+      });
+      expect(copy.tokenScale, 2.5);
+      expect(copy.longestSessionTokens, 2400);
+    });
+
+    test('max_seqlen 兜底值是一个显式常量（不再各处硬编码 128000）', () {
+      expect(CoreSettings.fallbackMaxSeqlen, 128000);
+      expect(
+        CoreModelConfig(modelId: 'm').effectiveMaxSeqlen,
+        CoreSettings.fallbackMaxSeqlen,
+      );
     });
   });
 }

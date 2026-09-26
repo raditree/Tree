@@ -283,6 +283,141 @@ void main() {
     await agentEngine.close();
     expect(transport.closed, isTrue);
   });
+
+  group('工具结果门控与 token_scale 学习（Q1-①②）', () {
+    test('历史里的超长工具结果在翻译时被门控（原文交给写入器）', () async {
+      final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+        textScript('ok'),
+      ]);
+      final String huge = 'h' * 40000; // 20000 token > 8000 阈值
+      final List<String> writes = <String>[];
+      final LlmAgentEngine agentEngine = LlmAgentEngine(
+        resolveModel: (String id) => id == config.modelId ? config : null,
+        transportFactory: (CoreModelConfig c) => transport,
+        resultRedirectWriter: (
+          String agentId,
+          String relativePath,
+          String content,
+        ) async => writes.add('$agentId|$relativePath|${content.length}'),
+      );
+      await agentEngine
+          .run(
+            context(
+              history: <CoreMessageRef>[
+                const CoreMessageRef(role: 'user', content: '读大文件'),
+                CoreMessageRef(
+                  role: 'agent',
+                  content: '',
+                  kind: 'tool',
+                  toolName: 'read',
+                  toolArguments: <String, dynamic>{'file_path': 'big.txt'},
+                  toolResult: huge,
+                  toolCallId: 'call_big',
+                ),
+                const CoreMessageRef(role: 'user', content: '继续'),
+              ],
+            ),
+            isCancelled: () => false,
+          )
+          .toList();
+      final LlmMessage forModel = transport.requests.single.messages.firstWhere(
+        (LlmMessage m) => m.isToolResult,
+      );
+      expect(forModel.content, contains('[工具结果已重定向]'));
+      expect(forModel.content, contains('40000 字符'));
+      expect(forModel.content.length, lessThan(1000));
+      expect(writes.single, startsWith('agt_1|.self/results/'));
+      expect(writes.single, endsWith('|40000'));
+      // tool_calls 与 tool 结果仍然严格配对
+      expect(forModel.toolCallId, 'call_big');
+    });
+
+    test('真实 usage 学习 token_scale；内部字符数字段不上行', () async {
+      final CoreModelConfig model = CoreModelConfig(
+        modelId: 'demo',
+        baseUrl: 'https://api.example.com/v1',
+        apiKey: 'sk-test',
+        maxSeqlen: 64000,
+      );
+      final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+        <LlmStreamEvent>[
+          const LlmUsageEvent(
+            LlmUsage(
+              promptTokens: 2000,
+              completionTokens: 5,
+              totalTokens: 2005,
+            ),
+          ),
+          const LlmFinishEvent('stop'),
+        ],
+      ]);
+      final LlmAgentEngine agentEngine = LlmAgentEngine(
+        resolveModel: (String id) => id == 'demo' ? model : null,
+        transportFactory: (CoreModelConfig c) => transport,
+      );
+      final List<AgentEvent> events = await agentEngine
+          .run(
+            context(
+              modelId: 'demo',
+              systemPrompt: '',
+              history: <CoreMessageRef>[
+                CoreMessageRef(role: 'user', content: 'x' * 6000),
+              ],
+            ),
+            isCancelled: () => false,
+          )
+          .toList();
+      // 6000 字符 / 2000 token = 3.00
+      expect(model.tokenScale, 3.0);
+      expect(model.longestSessionTokens, 2000);
+      final Map<String, dynamic> usage = events
+          .whereType<AgentUsage>()
+          .single
+          .usage;
+      expect(
+        usage.containsKey(LlmSession.contextCharsKey),
+        isFalse,
+        reason: '内部学习字段必须剥掉，前端契约不变',
+      );
+      expect(usage['prompt_tokens'], 2000);
+    });
+
+    test('端点没给 usage：只读不写，不学习', () async {
+      final CoreModelConfig model = CoreModelConfig(
+        modelId: 'demo',
+        baseUrl: 'https://api.example.com/v1',
+        apiKey: 'sk-test',
+        maxSeqlen: 64000,
+      );
+      final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+        <LlmStreamEvent>[
+          const LlmTextDelta('ok'),
+          const LlmFinishEvent('stop'),
+        ],
+      ]);
+      final LlmAgentEngine agentEngine = LlmAgentEngine(
+        resolveModel: (String id) => id == 'demo' ? model : null,
+        transportFactory: (CoreModelConfig c) => transport,
+      );
+      final List<AgentEvent> events = await agentEngine
+          .run(
+            context(
+              modelId: 'demo',
+              history: <CoreMessageRef>[
+                CoreMessageRef(role: 'user', content: 'x' * 6000),
+              ],
+            ),
+            isCancelled: () => false,
+          )
+          .toList();
+      expect(model.tokenScale, defaultTokenScale);
+      expect(model.longestSessionTokens, 0);
+      expect(
+        (events.whereType<AgentUsage>().single).usage['estimated'],
+        isTrue,
+      );
+    });
+  });
 }
 
 /// 记录 close 的传输。

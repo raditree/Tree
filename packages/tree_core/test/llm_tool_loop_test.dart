@@ -211,4 +211,55 @@ void main() {
       reason: '应读 workspace_dir（my-project）而不是默认工作空间',
     );
   });
+
+  test('超长工具结果：完整结果落 .self/results，送模型的是提示，落库仍是全文', () async {
+    final String big = 'x' * 20000; // 20000 字符 = 10000 token > 8000 阈值
+    File(p.join(workspace.path, 'big.txt')).writeAsStringSync(big);
+    await start(
+      script: <List<LlmStreamEvent>>[
+        toolCallScript(name: 'read', arguments: '{"file_path":"big.txt"}'),
+        textScript('读完了'),
+      ],
+    );
+    final TestWs ws = await TestWs.connect(server);
+    ws.record();
+    addTearDown(ws.close);
+    ws.send(<String, dynamic>{
+      'type': WsInboundType.userMessage,
+      'agent_id': agentId,
+      'content': '看看 big.txt',
+      'session_id': TreeStore.defaultSessionId,
+    });
+    await waitIdle(ws);
+
+    // 前端卡片拿到的仍是完整结果（门控只替换送模型的那一份）
+    final Map<String, dynamic> toolEnd = ws.frames.firstWhere(
+      (Map<String, dynamic> f) => f['type'] == WsOutboundType.toolEnd,
+    );
+    expect((toolEnd['result'] as String).length, greaterThan(16000));
+
+    // 送模型的那一份：重定向提示 + 工作空间相对路径
+    final LlmMessage forModel = transport.requests[1].messages.firstWhere(
+      (LlmMessage m) => m.isToolResult,
+    );
+    expect(forModel.content, contains('[工具结果已重定向]'));
+    final RegExpMatch? match = RegExp(
+      r'\.self/results/\d{8}_\d{6}_001\.read\.result',
+    ).firstMatch(forModel.content);
+    expect(match, isNotNull, reason: '提示里必须带上重定向文件的相对路径');
+
+    // 工作空间里真的有这份文件，且内容完整
+    final File redirect = File(
+      p.joinAll(<String>[workspace.path, ...match!.group(0)!.split('/')]),
+    );
+    expect(redirect.existsSync(), isTrue, reason: '重定向文件必须真写进工作空间');
+    expect(redirect.readAsStringSync(), contains(big));
+
+    // 落库同样保留全文
+    final List<CoreMessage> stored = server.store.messages(
+      agentId,
+      TreeStore.defaultSessionId,
+    );
+    expect(stored[1].toolResult.length, greaterThan(16000));
+  });
 }

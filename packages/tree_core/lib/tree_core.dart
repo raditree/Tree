@@ -34,6 +34,7 @@ export 'src/team/team_model.dart';
 export 'src/team/team_service.dart';
 export 'src/agent/scripted_agent.dart';
 export 'src/llm/llm_agent_engine.dart';
+export 'src/llm/llm_result_gate.dart';
 export 'src/llm/llm_session.dart';
 export 'src/llm/llm_summarizer.dart';
 export 'src/llm/llm_transport.dart';

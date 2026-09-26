@@ -15,6 +15,8 @@
 /// `openai_dart`，只需再实现一个 [LlmTransport]。
 library;
 
+import '../util/tokens.dart';
+
 /// 对话消息角色。
 enum LlmRole {
   system,
@@ -123,24 +125,29 @@ class LlmMessage {
     }
   }
 
-  /// 估算该消息占用的 token（粗估：CJK 1 token，其余 4 字符 1 token）。
-  int estimatedTokens() {
-    int tokens = 0;
-    for (final int rune in content.runes) {
-      tokens += _isCjk(rune) ? 1 : 0;
-    }
-    final int ascii = content.runes.where((int r) => !_isCjk(r)).length;
-    tokens += (ascii + 3) ~/ 4;
+  /// 该消息的**字符数**（token 换算与 token_scale 学习共用同一口径）。
+  ///
+  /// 只算正文与工具调用的名字/参数：JSON 外壳、role 之类的固定开销由端点侧承担，
+  /// 本地估算刻意不去模拟它们（真要精确就该以端点 usage 为准）。
+  int get charCount =>
+      content.length +
+      toolCalls.fold<int>(
+        0,
+        (int sum, LlmToolCall call) =>
+            sum + call.name.length + call.arguments.length,
+      );
+
+  /// 估算该消息占用的 token（口径见 util/tokens.dart：`ceil(字符数 / scale)`）。
+  ///
+  /// 工具调用额外加 8 token 的协议外壳（id/type/function 这些字段本身要约 20~30
+  /// 字符，按 2.0 的比例折算即可）。
+  int estimatedTokens({double scale = defaultTokenScale}) {
+    int tokens = estimateTokens(content, scale: scale);
     for (final LlmToolCall call in toolCalls) {
-      tokens += call.name.length ~/ 4 + call.arguments.runes.length ~/ 4 + 8;
+      tokens += 8 + estimateTokens(call.name + call.arguments, scale: scale);
     }
     return tokens;
   }
-
-  static bool _isCjk(int rune) =>
-      (rune >= 0x2E80 && rune <= 0x9FFF) ||
-      (rune >= 0xF900 && rune <= 0xFAFF) ||
-      (rune >= 0xFF00 && rune <= 0xFFEF);
 }
 
 /// 工具声明（M4 提供具体工具；M3 只负责把它发给端点并回灌结果）。
@@ -193,10 +200,19 @@ class LlmRequest {
   final Map<String, dynamic> extra;
 
   /// 估算输入 token（用于上下文裁剪与 usage 兜底）。
-  int estimatedPromptTokens() => messages.fold<int>(
-    0,
-    (int sum, LlmMessage m) => sum + m.estimatedTokens(),
-  );
+  ///
+  /// [scale] 是逐模型 token_scale：估算点必须用**同一个**比例，否则进度条、
+  /// 裁剪预算与压缩阈值会互相打架（见 util/tokens.dart）。
+  int estimatedPromptTokens({double scale = defaultTokenScale}) =>
+      messages.fold<int>(
+        0,
+        (int sum, LlmMessage m) => sum + m.estimatedTokens(scale: scale),
+      );
+
+  /// 本次请求上下文的**字符数**（token_scale 学习的分子口径：见 [LlmMessage.charCount]；
+  /// 分母是端点回的真实 prompt_tokens）。
+  int contextChars() =>
+      messages.fold<int>(0, (int sum, LlmMessage m) => sum + m.charCount);
 }
 
 /// token 用量（端点返回；缺失时上层用估算值兜底）。
@@ -273,6 +289,7 @@ final class LlmFailureEvent extends LlmStreamEvent {
     this.message, {
     this.statusCode,
     this.cancelled = false,
+    this.livenessLost = false,
   });
 
   final String message;
@@ -280,4 +297,10 @@ final class LlmFailureEvent extends LlmStreamEvent {
 
   /// 是否因用户取消而中断（不算错误，UI 不报错）。
   final bool cancelled;
+
+  /// 是否因**心跳丢失（链路失活）**而失败。
+  ///
+  /// 与普通端点错误区分开：这一类的正确反应是**重连 / 提示用户链路已断**，而不是
+  /// 让用户去改模型配置。判据见 HttpSseTransport（连续 N 次心跳未达，与总耗时无关）。
+  final bool livenessLost;
 }

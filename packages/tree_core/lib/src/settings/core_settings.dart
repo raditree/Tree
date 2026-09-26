@@ -1,3 +1,5 @@
+import '../util/tokens.dart';
+
 /// 自定义模型配置（现状 server `configs/models/<model_id>.yaml` 的桌面替身）。
 ///
 /// **api_key 永不回显**：`toApiJson` 剥离密钥并把 `base_url` 脱敏为
@@ -15,8 +17,18 @@ class CoreModelConfig {
     List<String>? reasoningEffortOptions,
     this.maxSeqlen = 0,
     this.maxOutputTokens = 0,
+    this.tokenScale = defaultTokenScale,
+    this.longestSessionTokens = 0,
   }) : reasoningEffortOptions =
            reasoningEffortOptions ?? List<String>.of(defaultReasoningEfforts);
+
+  /// token_scale 的可接受区间。
+  ///
+  /// 超出这个区间的"学习样本"一律不采纳（见 [learnTokenScale]）：真实端点里
+  /// 0.2~20 字符/token 已经覆盖了从紧凑中文到稀疏代码的全部情形，超出只可能是
+  /// 上下文太短或端点把缓存/工具声明另算。
+  static const double minTokenScale = 0.2;
+  static const double maxTokenScale = 20;
 
   /// 端点支持的思考强度档位兜底（与前端 `_reasoningEfforts` 一致）。
   static const List<String> defaultReasoningEfforts = <String>[
@@ -36,6 +48,42 @@ class CoreModelConfig {
   int maxSeqlen;
   int maxOutputTokens;
 
+  /// 逐模型的 字符→token 换算比例（plan 1.3 的唯一口径，初值 2.00）。
+  ///
+  /// 由 [learnTokenScale] 用端点真实 usage 持续校准；**不参与 [merge]**——它是
+  /// 学习状态，不是用户可编辑的配置项（用户手改 yaml 也会被下一轮学习覆盖）。
+  double tokenScale;
+
+  /// 学到 [tokenScale] 那次请求的真实 prompt_tokens（"最长会话"水位线）。
+  ///
+  /// 只有更长的请求才有资格刷新它：短请求里系统提示词/工具声明的占比过高，
+  /// 算出来的比例不代表内容本身。
+  int longestSessionTokens;
+
+  /// 学习状态变更后的落盘回调（由 [CoreSettings] 放入模型池时挂上）。
+  ///
+  /// 让模型自己回调而不是把设置层传进来：解析器只交出模型对象，引擎不该认识设置
+  /// 层；挂上这个闭包后，"学到新比例"与"用户在设置页点保存"走**同一条**落盘
+  /// 路径。为 null 时只改内存（测试 / 无盘场景）。
+  void Function(CoreModelConfig model)? onChanged;
+
+  /// 用一次真实 usage 学习 字符/token 比例（Q1-①，plan 1.3）。
+  ///
+  /// 口径：真实 `prompt_tokens` **超过** [longestSessionTokens] 时刷新水位线，
+  /// 并令 `token_scale = 该次请求上下文字符数 / 真实 prompt_tokens`（保留两位）。
+  /// 返回是否采纳了这次样本——**无 usage 的端点只会读不会写**（调用方压根不会
+  /// 调到这里）。
+  bool learnTokenScale({required int contextChars, required int promptTokens}) {
+    if (contextChars <= 0 || promptTokens <= 0) return false;
+    if (promptTokens <= longestSessionTokens) return false;
+    final double ratio = contextChars / promptTokens;
+    if (ratio < minTokenScale || ratio > maxTokenScale) return false;
+    longestSessionTokens = promptTokens;
+    tokenScale = (ratio * 100).round() / 100;
+    onChanged?.call(this);
+    return true;
+  }
+
   /// 持久化形态（含密钥；M2 落 `~/.tree/config/models/<model_id>.yaml`，
   /// 计划中要求 600 权限）。
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -49,6 +97,8 @@ class CoreModelConfig {
     'reasoning_effort_options': reasoningEffortOptions,
     'max_seqlen': maxSeqlen,
     'max_output_tokens': maxOutputTokens,
+    'token_scale': tokenScale,
+    'longest_session_tokens': longestSessionTokens,
   };
 
   /// 前端形态：无密钥、base_url 脱敏。
@@ -62,6 +112,8 @@ class CoreModelConfig {
     'reasoning_effort_options': reasoningEffortOptions,
     'max_seqlen': maxSeqlen,
     'max_output_tokens': maxOutputTokens,
+    'token_scale': tokenScale,
+    'longest_session_tokens': longestSessionTokens,
   };
 
   static CoreModelConfig fromJson(Map<String, dynamic> json) {
@@ -79,6 +131,9 @@ class CoreModelConfig {
               .toList(),
       maxSeqlen: (json['max_seqlen'] as num?)?.toInt() ?? 0,
       maxOutputTokens: (json['max_output_tokens'] as num?)?.toInt() ?? 0,
+      tokenScale: _readScale(json['token_scale']),
+      longestSessionTokens:
+          (json['longest_session_tokens'] as num?)?.toInt() ?? 0,
     );
   }
 
@@ -158,6 +213,10 @@ class CoreModelConfig {
       reasoningEffortOptions: reasoningEffortOptions,
       maxSeqlen: maxSeqlen,
       maxOutputTokens: maxOutputTokens,
+      // 学习状态必须一起带走：成员级覆盖用的是副本，漏掉就等于把学到的比例
+      // 悄悄降回初值 2.00（估算口径会随"谁发起请求"漂移）。
+      tokenScale: tokenScale,
+      longestSessionTokens: longestSessionTokens,
     );
     final Object? effort = overrides['reasoning_effort'];
     if (effort is String && effort.trim().isNotEmpty) {
@@ -173,7 +232,26 @@ class CoreModelConfig {
   }
 
   /// 模型上下文长度（前端进度条分母）；未配置时给保守兜底。
-  int get effectiveMaxSeqlen => maxSeqlen > 0 ? maxSeqlen : 128000;
+  ///
+  /// 兜底值见 [CoreSettings.fallbackMaxSeqlen]：压缩判断走的是
+  /// [CoreSettings]/[CoreAgent] 那条显式路径（会提示用户去补配置），
+  /// 这个 getter 只服务"界面分母不能为空"。
+  int get effectiveMaxSeqlen =>
+      maxSeqlen > 0 ? maxSeqlen : CoreSettings.fallbackMaxSeqlen;
+
+  /// 宽容读取 token_scale：手写 yaml 里的整数 / 字符串也能生效，非法值回初值。
+  static double _readScale(Object? raw) {
+    double? value;
+    if (raw is num) {
+      value = raw.toDouble();
+    } else if (raw is String) {
+      value = double.tryParse(raw.trim());
+    }
+    if (value == null || value < minTokenScale || value > maxTokenScale) {
+      return defaultTokenScale;
+    }
+    return value;
+  }
 }
 
 /// 设置落盘后端（M2 起由 `FileSettingsSink` 提供）。
@@ -215,6 +293,12 @@ class CoreSettings {
 
   /// token 获取帧率上限（= 近似不限速）。
   static const int tokenRateMax = 1000;
+
+  /// 模型没配 max_seqlen 时的兜底上下文长度。
+  ///
+  /// 兜底本身保留（进度条分母不能为空），但**不再静默**：压缩判断会显式标注用了
+  /// 这个值并提示用户去「设置 → 自定义模型」补上真实的上下文长度（Q1-③）。
+  static const int fallbackMaxSeqlen = 128000;
 
   /// 落盘后端；为 null 时所有改动只留在内存（测试/无盘场景）。
   CoreSettingsSink? sink;
@@ -296,7 +380,16 @@ class CoreSettings {
   CoreModelConfig? model(String modelId) => _models[modelId];
 
   /// 直接放入模型（装载用；不触发落盘）。
-  void putModel(CoreModelConfig model) => _models[model.modelId] = model;
+  void putModel(CoreModelConfig model) => _attach(model);
+
+  /// 放进模型池并挂上落盘回调。
+  ///
+  /// 回调里**延迟读** [sink]：FileSettingsSink.load 是先 putModel 再挂 sink 的，
+  /// 提前捕获会让"学习 token_scale"写不回文件。
+  void _attach(CoreModelConfig model) {
+    model.onChanged = (CoreModelConfig changed) => sink?.saveModel(changed);
+    _models[model.modelId] = model;
+  }
 
   /// 新建模型；`model_id` 已存在时返回 null（调用方回 409）。
   CoreModelConfig? createModel(Map<String, dynamic> payload) {
@@ -304,7 +397,7 @@ class CoreSettings {
     if (modelId.isEmpty || _models.containsKey(modelId)) return null;
     final CoreModelConfig model = CoreModelConfig(modelId: modelId);
     model.merge(payload);
-    _models[modelId] = model;
+    _attach(model);
     sink?.saveModel(model);
     return model;
   }

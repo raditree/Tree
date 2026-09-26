@@ -114,36 +114,75 @@ class CompactionService {
 
   /// 自动压缩：估算上下文超过「threshold × max_seqlen」才动，否则返回 null。
   ///
-  /// 由会话服务在**每轮生成前**调用（相当于旧后端 chat 里的 `_compress_context`）。
-  /// 自动压缩失败不影响本轮生成：调用方只记日志。
+  /// 由会话服务在**每轮生成前**与**工具循环的每一轮 API 调用前**调用（相当于旧
+  /// 后端 llm.py 里的 `_compress_context`）。自动压缩失败不影响本轮生成：调用方
+  /// 负责把失败**显示给用户**（只记日志等于没发生，用户只会看到"怎么还是超"）。
+  ///
+  /// [force] 为真 = 端点已经报了上下文超限，此时**跳过阈值判断**强制压一次：
+  /// 本地估算偏小（token_scale 还在学习）时，阈值判断恰恰会说"没超"。
   Future<CompactionResult?> autoCompact(
     CoreAgent agent,
-    CoreSession session,
-  ) async {
+    CoreSession session, {
+    bool force = false,
+  }) async {
     if (summarizer == null || isCompacting(agent.id, session.sessionId)) {
       return null;
     }
-    final int maxSeqlen =
-        settings.model(agent.modelId)?.effectiveMaxSeqlen ?? 128000;
-    final int budget = (maxSeqlen * thresholdFor(agent)).round();
+    final MaxSeqlenBudget budget = maxSeqlenFor(agent);
+    final int limit = (budget.value * thresholdFor(agent)).round();
     final int used = estimateContextTokens(agent, session);
-    if (used <= budget) return null;
+    if (!force && used <= limit) return null;
     log?.call(
-      '上下文估算 $used tokens 超过阈值 $budget'
-      '（${thresholdFor(agent)} × $maxSeqlen），先压缩再生成',
+      force
+          ? '端点报上下文超限，强制压缩：估算 $used tokens（阈值 $limit）'
+          : '上下文估算 $used tokens 超过阈值 $limit'
+                '（${thresholdFor(agent)} × ${budget.value}），先压缩再生成',
     );
+    if (budget.fallback) {
+      log?.call(
+        '模型 ${agent.modelId} 未配置 max_seqlen，'
+        '上面的阈值用的是兜底值 ${CoreSettings.fallbackMaxSeqlen}；'
+        '请到「设置 → 自定义模型」补上该模型的上下文长度',
+      );
+    }
     return compact(agent.id, session.sessionId);
   }
 
+  /// 该 agent 的上下文长度预算（Q1-③）。
+  ///
+  /// 取不到配置时**不再默默兜 128000**：照样返回兜底值让压缩判断继续工作，
+  /// 但 [MaxSeqlenBudget.fallback] 为真，调用方据此在日志与前端显式提示
+  /// "去设置页补模型配置"。成员级覆盖优先于模型默认值——引擎按覆盖后的值发请求，
+  /// 压缩若按模型默认值判断，就会出现"压了还是超"。
+  MaxSeqlenBudget maxSeqlenFor(CoreAgent agent) {
+    if (agent.maxSeqlenOverride > 0) {
+      return MaxSeqlenBudget(agent.maxSeqlenOverride);
+    }
+    final int configured = settings.model(agent.modelId)?.maxSeqlen ?? 0;
+    if (configured > 0) return MaxSeqlenBudget(configured);
+    return const MaxSeqlenBudget(
+      CoreSettings.fallbackMaxSeqlen,
+      fallback: true,
+    );
+  }
+
+  /// 逐模型 token_scale（Q1-①）：模型未登记时用全局初值。
+  double tokenScaleFor(CoreAgent agent) =>
+      settings.model(agent.modelId)?.tokenScale ?? defaultTokenScale;
+
   /// 估算"引擎实际会看到"的上下文 token 数（系统提示词 + 摘要 + 未压缩历史）。
+  ///
+  /// 比例用该模型的 token_scale（Q1-①）：全系统只有 util/tokens.dart 一个换算
+  /// 函数，压缩阈值与进度条才不会各说各话。
   int estimateContextTokens(CoreAgent agent, CoreSession session) {
+    final double scale = tokenScaleFor(agent);
     final List<CoreMessage> all = store.messages(agent.id, session.sessionId);
     final int frozen = session.compactedMessageCount.clamp(0, all.length);
     int total =
-        estimateTokens(systemPromptWithWorkspace(agent)) +
-        estimateTokens(session.compactedSummary);
+        estimateTokens(systemPromptWithWorkspace(agent), scale: scale) +
+        estimateTokens(session.compactedSummary, scale: scale);
     for (final CoreMessage message in all.sublist(frozen)) {
-      total += _messageTokens(message);
+      total += _messageTokens(message, scale);
     }
     return total;
   }
@@ -185,12 +224,16 @@ class CompactionService {
         sessionId: session.sessionId,
       );
     }
-    final String summary = await _summarize(agent, session, plan.summarize);
+    final SummaryText summarized = await _summarize(
+      agent,
+      session,
+      plan.summarize,
+    );
     // 水位线 = 已冻结前缀 + 本次总结掉的条数（被总结的永远是前缀，见类注释）
     store.setCompacted(
       agent.id,
       session.sessionId,
-      summary: summary,
+      summary: summarized.text,
       messageCount: frozen + plan.summarize.length,
     );
     log?.call(
@@ -201,8 +244,11 @@ class CompactionService {
       compressed: true,
       contextSize: 1 + plan.keep.length,
       summarizedMessages: plan.summarize.length,
-      summary: summary,
+      summary: summarized.text,
       sessionId: session.sessionId,
+      // 总结模型调用失败、退化成截断摘要：压缩本身成功了，但要点可能不全，
+      // 调用方要把这件事显示给用户（Q1-③：压缩失败必须可见）
+      degraded: summarized.degraded,
     );
   }
 
@@ -245,7 +291,10 @@ class CompactionService {
   );
 
   /// 总结：把待压缩消息（含上一次的摘要）交给模型；失败回退到截断摘要。
-  Future<String> _summarize(
+  ///
+  /// [SummaryText.degraded] 标记"总结模型没跑成功"，由调用方决定怎么提示用户——
+  /// 静默回退会让用户以为压缩过后的上下文还带着完整要点。
+  Future<SummaryText> _summarize(
     CoreAgent agent,
     CoreSession session,
     List<CoreMessage> messages,
@@ -268,10 +317,13 @@ class CompactionService {
         agent,
         '$summarizeInstruction\n\n$body',
       );
-      return '$summaryHeader\n$text';
+      return SummaryText('$summaryHeader\n$text');
     } catch (error) {
       log?.call('LLM 总结失败，回退到截断摘要：$error');
-      return '$fallbackHeader\n${_digest(messages)}';
+      return SummaryText(
+        '$fallbackHeader\n${_digest(messages)}',
+        degraded: true,
+      );
     }
   }
 
@@ -307,13 +359,14 @@ class CompactionService {
       text.length <= max ? text : '${text.substring(0, max)}…';
 
   /// 单条消息的 token 估算（与 LlmMessage.estimatedTokens 同口径）。
-  static int _messageTokens(CoreMessage message) {
-    int tokens = estimateTokens(message.content);
+  static int _messageTokens(CoreMessage message, double scale) {
+    int tokens = estimateTokens(message.content, scale: scale);
     if (message.isTool) {
-      tokens += estimateTokens(message.toolResult);
-      tokens += estimateTokens(message.toolName ?? '');
+      tokens += estimateTokens(message.toolResult, scale: scale);
+      tokens += estimateTokens(message.toolName ?? '', scale: scale);
       tokens += estimateTokens(
         jsonEncode(message.toolArguments ?? const <String, dynamic>{}),
+        scale: scale,
       );
       tokens += 8;
     }
@@ -344,6 +397,7 @@ class CompactionResult {
     this.sessionId = '',
     this.error = '',
     this.status = 200,
+    this.degraded = false,
   });
 
   /// 是否真的执行了压缩。
@@ -364,6 +418,12 @@ class CompactionResult {
 
   final String sessionId;
 
+  /// 压缩是否**降级**：总结模型调用失败，摘要其实是截断的历史要点。
+  ///
+  /// 压缩本身算成功（上下文确实收缩了），但要点可能不全——会话层据此给用户一条
+  /// 可见提示，而不是让"压过了"这件事掩盖掉总结失败。
+  final bool degraded;
+
   /// 出错原因（非空时 REST 返回非 200）。
   final String error;
 
@@ -379,7 +439,30 @@ class CompactionResult {
           'context_size': contextSize,
           'summarized_messages': summarizedMessages,
           if (sessionId.isNotEmpty) 'session_id': sessionId,
+          if (degraded) 'degraded': true,
         };
+}
+
+/// 一次总结的产物：正文 + 是否降级（见 [CompactionResult.degraded]）。
+class SummaryText {
+  const SummaryText(this.text, {this.degraded = false});
+
+  final String text;
+  final bool degraded;
+}
+
+/// 上下文长度预算（[CompactionService.maxSeqlenFor] 的返回值）。
+///
+/// [fallback] 为真表示模型没配 `max_seqlen`、用的是 [CoreSettings.fallbackMaxSeqlen]：
+/// 压缩照常判断，但调用方**必须**把这件事显示给用户（Q1-③：不再默默兜底）。
+class MaxSeqlenBudget {
+  const MaxSeqlenBudget(this.value, {this.fallback = false});
+
+  /// 生效的上下文长度（token）。
+  final int value;
+
+  /// 是否来自兜底值（模型没配置）。
+  final bool fallback;
 }
 
 /// 保留/总结的划分结果（[CompactionService.buildPlan] 的返回值，供测试断言形状）。
