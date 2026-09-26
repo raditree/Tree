@@ -396,6 +396,20 @@ _paceToken 现为每增量 Future.delayed(1ms)（11e1376 引入，常开无开�
 dart analyze packages 零 issue；tree_protocol 29；tree_local_exec 146 passed/1 skipped；tree_core **548 passed/1 skipped**；flutter analyze 零 issue；app **139 passed**。
 产物：.output/tree_core.exe（10.8MB，并复制到 Debug 同目录）、build/windows/x64/runner/Release/{Tree.exe, tree_core.exe}（打包自检握手 OK）。
 
+### 4.2 插件开关（内置 + 自定义，用户追加要求）
+
+**要求**：内置插件与自定义插件**都要能在前端开/关**。
+
+落地口径：
+- **统一开关语义**：开关就是插件配置里的 `enabled` 字段——关闭 ⇒ 核心不启动它（进程断开），但**条目保留**（面板显示为「已停用」而不是消失），再次打开即恢复。持久化在 plugins.yaml，重启后状态不变。
+- **内置插件目录（built-in catalog）**：核心内置一份静态清单（id / 名称 / 说明 / 脚本相对路径 / 默认 scope / 所需运行时），随应用分发脚本文件（打包时把 `examples/plugins/` 复制到发行目录的 `plugins/`）。
+  - 前端在「插件实例」区显示**内置**与**自定义**两组；内置项在未启用时也可见（带说明与开关）。
+  - 打开内置插件时，核心**解析运行时可执行文件与脚本绝对路径**（Python：依次探测 `python` / `python3` / `py -3`；脚本路径 = 核心自身可执行文件同级的 `plugins/<name>.py`），把解析结果写成一条普通插件配置（带 `builtin: true` 标记供 UI 分组）并热启动；
+  - 运行时缺失或脚本缺失 ⇒ **可读错误**（面板显示"未检测到 Python，请先安装或改为自定义命令"），不要静默失败。
+- **自定义插件**：用户在前端添加（id/名称/命令/参数/环境变量/granularity/scope/启用），同样有开关、编辑、删除、重启。
+- **热应用**：写盘成功后立即应用（新增/启用 ⇒ 启动；停用/删除 ⇒ 断开）；热应用失败要如实回报"配置已保存，但本次热应用失败，重启核心后生效"。
+- **安全提示**：命令字段等于可以用 UI 拉起任意进程（插件系统的固有能力），弹窗内写明并在保存时二次确认。
+
 ---
 
 ## 9. 变更记录
