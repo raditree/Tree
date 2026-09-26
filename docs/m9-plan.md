@@ -8,7 +8,7 @@
 | 项 | 值 |
 |---|---|
 | 工作树 | `E:\programs\Tree\desktop`（分支 `desktop`） |
-| 基线 HEAD | `11e1376` refactor: 替换主动延迟为 token 帧率和推送刷新帧率 |
+| 基线 HEAD | `11e1376`（M8 收口）；M9 计划落盘后为 `f6f1567` |
 | Dart SDK | `D:\app\flutter-sdk-3.47.5\flutter\bin\cache\dart-sdk\bin\dart.exe` |
 | Flutter | `D:\app\flutter-sdk-3.47.5\flutter\bin\flutter.bat` |
 | 包结构 | `packages/tree_protocol`、`packages/tree_local_exec`、`packages/tree_core`、`packages/tree_core_cli`；前端 `lib/`；原生 `windows/runner/` |
@@ -198,6 +198,21 @@
 ---
 
 ## 8. 实施记录（WIP，随并行波次更新）
+
+### Wave 1-B 前端消息区与下载列表（lib/ui、windows/runner、test）— 已交付（提交 feat(m9-b)）
+| 条目 | 结果 | 要点 |
+|---|---|---|
+| Q2 | 完成 | mode_switch 三态改两态；_currentMode 默认 local；新增 _enableLocalFallback（仅在两个执行器状态互相矛盾时触发，不弹目录选择，工作目录留空 = 核心默认工作空间） |
+| Q5 | 完成（原生仅语法级验证） | 原生 readFiles（CF_HDROP + DragQueryFileW，中文路径转 UTF-8）；粘贴顺序 文件列表 → 单张位图 → 文本路径 → 普通文本 |
+| Q6 | 完成 | MessageDraftCache（key = team::session，文本与附件一起、纯内存）；发送成功后清空该键 |
+| Q7 | 完成 | 新增 lib/ui/services/file_reveal.dart（explorer /select, 分两参数传、不看退出码；macOS open -R；Linux 提示不支持） |
+
+验证：dart analyze lib test 零 issue；flutter test 相关 4 个文件 18 passed（其中新增 15）。
+
+**待办**
+- Q5 需一次 flutter build windows + 手工回归（多选文件 Ctrl+V / 位图 / 文本三条路径）；C++ 仅通过 cl /Zs 语法检查，未链接、未运行。
+- 根仓 flutter analyze 曾剩 1 个 error（packages/tree_core/test/llm_session_test.dart 的 maxToolTurns），属核心线 Q8；收口时确认 A 已同步，否则主控补。
+- 产品口径待定：自动落本地时工作目录留空（核心默认工作空间），不弹目录选择。
 
 ### Wave 1-C 执行器层（packages/tree_local_exec）— 已交付（提交 feat(m9-c)：执行器层 SSH Git / grep 扫描清单 / 去超时心跳）
 | 条目 | 结果 | 要点 |
