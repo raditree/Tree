@@ -34,6 +34,10 @@ dependencies:
   # 桌面分支：核心进程与应用共用的协议定义（握手信封 / REST 路径 / WS 帧类型）
   tree_protocol:
     path: packages/tree_protocol
+  # PDF 预览（M7e）：核心只给字节，前端用 pdfrx（Dart native assets 带 pdfium）渲染。
+  # 注意：打 Windows 包时必须把 build/native_assets/windows/pdfium.dll 拷到 exe
+  # 旁边，否则用户机器上一打开 PDF 就报找不到 pdfium——tool/package_windows.dart 已做。
+  pdfrx: ^2.6.5
 
 dev_dependencies:
   flutter_test:

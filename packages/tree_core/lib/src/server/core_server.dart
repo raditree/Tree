@@ -76,9 +76,10 @@ class CoreServer {
 
   /// 尚未实现、但前端会调用的路径（以 501 明确拒绝，而非静默 404）。
   ///
-  /// 桌面分支只剩一项：PDF 预览（把某页渲染成图片需要光栅化依赖，待用户决策）。
-  /// 文件读写 / 上传同步 / 打包下载与上下文压缩都已在 M7d 落地。
-  static const Set<String> stubApiPaths = <String>{ApiPaths.filePdfPreview};
+  /// **M7 已清空**：PDF 预览改成前端渲染（M7e 方案②，核心只给字节，见
+  /// `lib/ui/widgets/pdf_preview.dart`），最后一项桩随之删除。保留这套机制给后续
+  /// 新接口用——「前端会调、核心静默 404」的灰区比多条空集合更值得防。
+  static const Set<String> stubApiPaths = <String>{};
 
   final HttpServer _http;
 

@@ -59,7 +59,6 @@ abstract final class ApiPaths {
   static const String files = '/api/files/{workspaceId}';
   static const String fileContent = '/api/files/{workspaceId}/content';
   static const String filePdfInfo = '/api/files/{workspaceId}/pdf_info';
-  static const String filePdfPreview = '/api/files/{workspaceId}/pdf_preview';
   static const String fileUploadInit = '/api/files/{workspaceId}/upload_init';
   static const String fileUploadChunk = '/api/files/{workspaceId}/upload_chunk';
   static const String fileUploadComplete =
@@ -105,7 +104,6 @@ abstract final class ApiPaths {
     files,
     fileContent,
     filePdfInfo,
-    filePdfPreview,
     fileUploadInit,
     fileUploadChunk,
     fileUploadComplete,

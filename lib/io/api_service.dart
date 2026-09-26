@@ -117,26 +117,6 @@ class ApiService {
     });
   }
 
-  /// 获取 PDF 指定页的预览图片
-  ///
-  /// 调用 `GET /api/files/{workspace_id}/pdf_preview?path=xxx&page=N&scale=S`，
-  /// 返回 `{"image": "base64...", "page": N, "total_pages": M, "width": W, "height": H}`。
-  /// [page] 从 1 开始，[scale] 控制分辨率（默认 2.0）。
-  /// 网络异常或核心进程返回错误时抛出中文异常。
-  static Future<Map<String, dynamic>> getPdfPreview(
-    String workspaceId,
-    String path, {
-    int page = 1,
-    double scale = 2.0,
-    String teamId = '',
-  }) async {
-    return _getJson('/api/files/$workspaceId/pdf_preview', query: {
-      'path': path,
-      'page': page.toString(),
-      'scale': scale.toString(),
-      if (teamId.isNotEmpty) 'team_id': teamId,
-    });
-  }
 
   // ==================== Git 相关接口 ====================
 

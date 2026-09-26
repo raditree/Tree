@@ -86,9 +86,12 @@ M7 打包时把 `tree_core.exe` 与 `Tree.exe` 放在一起）→ 从应用目�
 1. `flutter build windows --release`；
 2. 用**同一个 SDK** 的 dart 把核心编译成 `tree_core.exe` 放进 Release 目录——
    发行版布局要求核心与 `Tree.exe`（`windows/CMakeLists.txt` 的 `BINARY_NAME`）**同目录**（`CoreProcessLauncher` 的解析顺序）；
-3. 写入 `使用说明.txt`（首次运行指引：数据目录、可直接手改的配置文件、常见问题）；
-4. **自检**：真的启动一次打包好的核心，读到握手再让它优雅退出；
-5. `tar -a -cf` 压成 zip（Windows 10+ 自带 bsdtar），产物在 `dist/`。
+3. 把 `build/native_assets/windows/*.dll`（pdfrx 的 `pdfium.dll`）拷到 exe 旁边：
+   Dart native assets 只写进 `NativeAssetsManifest.json`，**不会**自动进发行目录，
+   漏了这一步用户一打开 PDF 就报找不到 pdfium；
+4. 写入 `使用说明.txt`（首次运行指引：数据目录、可直接手改的配置文件、常见问题）；
+5. **自检**：真的启动一次打包好的核心，读到握手再让它优雅退出；
+6. `tar -a -cf` 压成 zip（Windows 10+ 自带 bsdtar），产物在 `dist/`。
 
 只要核心单文件（例如自己写壳）：`dart run tool/build_core.dart`，默认输出
 `dist/tree_core.exe`（约 10 MB，无需 Dart 运行时）。
@@ -137,10 +140,10 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 - **M7d-2**：文件下载 + 前端路径门禁收紧（`Uri.parse('$baseUrl/api/...')` 这类调用点此前全部漏检）
 - **M7d-3**：文件写路径——分片上传（`upload_init+chunk+complete`，分片顺序追加到系统临时文件后整体落 `.input/{yyyymmdd}/`）、`syncToLocal`（核心与前端同机，直接复制整棵工作空间、排除 `.git`）、`download_folder`（系统 `tar` 打包 tar.gz，先按未压缩大小设上限）。**删除 multipart `upload` 通道**：小文件走分片只多两次轻量请求，却少维护一条契约。附带修掉两个只有真跑才暴露的问题：中文文件名/目录的 `Content-Disposition` 会让 `dart:io` 抛 `FormatException`（改用 RFC 5987 `filename*`）、未捕获异常时 500 回包本身也会失败导致客户端只看到"连接被关掉"（新增 `errorLog` 落到 stderr）；真 exe 冒烟测试扩到"上传 → 打包下载 → 同步到本地"全链路
 - **M7d-4**：上下文压缩——`POST /api/agents/{id}/compact` 把会话早期历史交给模型总结成一条摘要，此后每轮只发「摘要 + 未压缩的近期消息」；保留规则 = 最近 3 条用户要求及其之后 + 尾部 8 条，单轮超长时退化为只留尾部；**不删除任何消息**（水位线是 `session.json` 里的"已总结前缀条数"，界面历史完整可回看）；估算超过 `compress_threshold × max_seqlen` 时在生成前自动压缩；压缩期间推 `agent_status=compacting` 并与生成互斥（`agent_working` / `already_compacting`）；旧摘要并入新摘要，不会越压越多
+- **M7e**：PDF 预览改成**前端渲染**（方案②）——核心只提供 PDF 字节（`/download`），光栅化交给 Flutter 插件 pdfrx（内置 pdfium）：`PdfPreview` 组件替掉旧的"核心逐页渲染成 PNG + 自绘翻页栏"，滚动/缩放/翻页/选中复制都由插件处理。删掉 `pdf_preview` 接口与前端的 `getPdfPreview`，核心的 501 桩集合因此**清空**（覆盖度测试也改成断言"空集合"，别让桩悄悄长回来）；打包脚本新增 native assets 拷贝（否则发布包缺 `pdfium.dll`）
 - **M7f**：Windows 打包与安装——`tool/package_windows.dart` 一条命令出便携 zip（构建应用 + 用同一 SDK 编译核心到同目录 + 写首次运行说明 + 启动核心读握手自检 + bsdtar 压缩），`tool/installer/tree-desktop.iss` 提供 Inno Setup 安装包（卸载保留 `%APPDATA%\Tree` 用户数据）
 - **M7（剩余）**：
-  - SSH 工作空间的远端文件读写接线（需要 SFTP 二进制通道：`SshWorkspaceIO` 目前只有文本读写，文件面板对远端一律给可读的 400）
-  - **PDF 预览的渲染方案待决策**（`pdf_preview` 需要 PDF 光栅化）：① 核心侧引入 Syncfusion 纯 Dart 渲染（涉商业许可）；② 前端加 Flutter PDF 插件（如 pdfx/pdfrx，核心只提供字节）；③ 不做预览，PDF 仅下载后用系统查看器打开。当前为 ③（返回 501 + 明确文案）
+  - SSH 工作空间的远端文件读写接线（需要 SFTP 二进制通道：`SshWorkspaceIO` 目前只有文本读写，文件面板对远端一律给可读的 400）；真机验收主机：`open@192.168.0.208:22`（密钥 `~/.ssh/id_ed25519`，远端根 `/mnt/space`）
 
 ---
 

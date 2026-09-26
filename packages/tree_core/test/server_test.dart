@@ -267,25 +267,23 @@ void main() {
         isEmpty,
         reason: '账号体系路径在 desktop 分支已删除，不应登记',
       );
+      expect(
+        CoreServer.stubApiPaths,
+        isEmpty,
+        reason:
+            'M7 已把最后一项桩（PDF 预览）改成前端渲染；新增接口时要么实现、'
+            '要么显式登记，别让这条空集合悄悄长回来',
+      );
     });
 
-    test('未知路径 -> 404；已登记的未实现路径 -> 501', () async {
+    test('未知路径 -> 404；M7 之后已无 501 桩', () async {
       expect((await client.send('GET', '/api/nope')).status, 404);
       expect(server.notFoundRequests, 1);
 
-      // 注意：`/api/files/*` 与 `agentCompact` 都已在 M7d 实现，这里改探仍未
-      // 实现的 PDF 预览，否则测的是"已实现路由"而不是"501 桩"。
-      final String preview = ApiPaths.filePdfPreview.replaceAll(
-        '{workspaceId}',
-        'ws_1',
-      );
-      final _Res stub = await client.send('GET', preview);
-      expect(stub.status, 501);
-      expect((stub.json['detail'] as String), contains('功能开发中'));
-      expect(server.stubRequests, 1);
-
-      // 桩对所有方法一致（POST/PATCH/DELETE 同样 501）
-      expect((await client.send('POST', preview)).status, 501);
+      // M7 把最后一项桩（PDF 预览）改为前端渲染：此时任何未实现路径都该是 404，
+      // 且 stubRequests 计数保持 0（501 只在真登记了桩时才可能出现）。
+      expect((await client.send('POST', '/api/nope')).status, 404);
+      expect(server.stubRequests, 0);
     });
   });
 

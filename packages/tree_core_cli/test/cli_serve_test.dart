@@ -42,13 +42,10 @@ void main() {
     );
     expect(unauthorized.$1, 401, reason: unauthorized.$2);
 
-    // 未实现路径必须是明确的 501（前端有专门文案），而不是 404。
-    // 注意：文件读写与上下文压缩都已在 M7d 实现，这里改探仍未实现的 PDF 预览；
-    // 用 ApiPaths 常量拼，避免测试里散落路径字面量。
-    final (int, String) stub = await core.get(
-      ApiPaths.filePdfPreview.replaceAll('{workspaceId}', 'ws_1'),
-    );
-    expect(stub.$1, 501, reason: stub.$2);
+    // M7 之后协议里的路径全部实现，未实现路径应当就是 404（此前这里探的是 501 桩：
+    // 显式登记未实现路径，避免前端"点了没反应"。桩机制仍在，只是当前集合为空）。
+    final (int, String) unknown = await core.get('/api/nope');
+    expect(unknown.$1, 404, reason: unknown.$2);
 
     // 控制通道：写一行 shutdown => 优雅退出（退出码 0）
     core.process.stdin.writeln('shutdown');

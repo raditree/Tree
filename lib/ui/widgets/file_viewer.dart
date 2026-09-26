@@ -8,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 
 import '../../io/api_service.dart';
 import '../../io/platform_support.dart';
+import 'pdf_preview.dart';
 
 /// 文本文件扩展名
 const List<String> textExtensions = [
@@ -88,17 +89,11 @@ class _FileViewerState extends State<FileViewer> {
   /// 预览模式开关（Markdown / SVG 适用），true=预览，false=源码
   bool _showPreview = true;
 
-  /// PDF 当前页图片字节
-  Uint8List? _pdfPageBytes;
+  /// PDF 原始字节（M7e：渲染在前端，核心只给字节）
+  Uint8List? _pdfBytes;
 
-  /// PDF 当前页码（从 1 开始）
-  int _currentPage = 1;
-
-  /// PDF 总页数
+  /// PDF 总页数（来自核心的启发式 pdf_info，仅用于信息栏展示）
   int _totalPages = 0;
-
-  /// 是否正在加载 PDF 单页（翻页时）
-  bool _isLoadingPage = false;
 
   @override
   void initState() {
@@ -107,7 +102,7 @@ class _FileViewerState extends State<FileViewer> {
     if (_fileType == _FileType.office) {
       _isLoading = false;
     } else if (_fileType == _FileType.pdf) {
-      // PDF 通过 PyMuPDF 后端渲染为图片展示
+      // PDF：核心给字节，前端用 pdfrx 渲染（M7e 方案②）
       _loadPdf();
     } else {
       _loadContent();
@@ -206,7 +201,10 @@ class _FileViewerState extends State<FileViewer> {
     }
   }
 
-  /// 加载 PDF：先获取文件信息（总页数），再加载第一页图片
+  /// 加载 PDF（M7e 方案②）：核心只提供字节，渲染交给前端 pdfrx。
+  ///
+  /// 两步都留着：pdf_info 给标题/页数（信息栏与"文档太大"的判断），
+  /// download 给原始字节。字节走 POST /download（二进制），不再要核心出图片。
   Future<void> _loadPdf() async {
     setState(() {
       _isLoading = true;
@@ -218,12 +216,15 @@ class _FileViewerState extends State<FileViewer> {
         widget.filePath,
         teamId: widget.teamId ?? '',
       );
-      if (!mounted) return;
-      _totalPages = (info['total_pages'] as num?)?.toInt() ?? 0;
-      _currentPage = 1;
-      await _loadPdfPage(_currentPage);
+      final Uint8List bytes = await ApiService.downloadFile(
+        widget.workspaceId,
+        widget.filePath,
+        teamId: widget.teamId ?? '',
+      );
       if (!mounted) return;
       setState(() {
+        _totalPages = (info['total_pages'] as num?)?.toInt() ?? 0;
+        _pdfBytes = bytes;
         _isLoading = false;
       });
     } on Exception catch (e) {
@@ -235,40 +236,6 @@ class _FileViewerState extends State<FileViewer> {
     }
   }
 
-  /// 加载 PDF 指定页图片
-  Future<void> _loadPdfPage(int page) async {
-    setState(() {
-      _isLoadingPage = true;
-    });
-    try {
-      final Map<String, dynamic> data = await ApiService.getPdfPreview(
-        widget.workspaceId,
-        widget.filePath,
-        page: page,
-        scale: 2.0,
-        teamId: widget.teamId ?? '',
-      );
-      if (!mounted) return;
-      final String imgB64 = data['image'] as String? ?? '';
-      final Uint8List? bytes = _decodeBase64(imgB64);
-      if (bytes == null) {
-        throw Exception('PDF 页面图片解码失败');
-      }
-      setState(() {
-        _pdfPageBytes = bytes;
-        _currentPage = page;
-        _totalPages = (data['total_pages'] as num?)?.toInt() ?? _totalPages;
-        _isLoadingPage = false;
-      });
-    } on Exception catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _error = e.toString().replaceFirst('Exception: ', '');
-        _isLoadingPage = false;
-        _isLoading = false;
-      });
-    }
-  }
 
   /// base64 解码，兼容 data URI 前缀与空白字符
   Uint8List? _decodeBase64(String raw) {
@@ -649,69 +616,35 @@ class _FileViewerState extends State<FileViewer> {
     );
   }
 
-  /// PDF 视图（页面图片 + 缩放 + 翻页导航）
+  /// PDF 视图（M7e：**前端渲染**，pdfrx/pdfium）
+  ///
+  /// 核心只给字节；滚动、缩放、翻页、文本选择复制都由 pdfrx 处理——比"核心逐页
+  /// 渲染成 PNG"少一次往返，也不再需要自绘页码导航。
   Widget _buildPdfView() {
+    final Uint8List? bytes = _pdfBytes;
+    if (bytes == null) return _buildErrorView('PDF 内容为空');
     return Column(
       children: [
-        // PDF 页面图片区域（支持缩放）
-        Expanded(
-          child: _isLoadingPage
-              ? const Center(child: CircularProgressIndicator())
-              : (_pdfPageBytes == null
-                  ? _buildErrorView('PDF 页面数据为空')
-                  : InteractiveViewer(
-                      child: Center(
-                        child: Image.memory(
-                          _pdfPageBytes!,
-                          fit: BoxFit.contain,
-                          errorBuilder: (BuildContext ctx, Object error,
-                              StackTrace? stack) {
-                            return _buildErrorView('PDF 页面渲染失败：$error');
-                          },
-                        ),
-                      ),
-                    )),
-        ),
-        // 底部页码导航栏
+        Expanded(child: PdfPreview(bytes: bytes, fileName: _fileName)),
         Container(
-          height: 48,
+          height: 34,
+          width: double.infinity,
           padding: const EdgeInsets.symmetric(horizontal: 16),
+          alignment: Alignment.centerLeft,
           decoration: BoxDecoration(
             color: Theme.of(context).colorScheme.surface,
             border: Border(
               top: BorderSide(color: Theme.of(context).dividerColor, width: 1),
             ),
           ),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              IconButton(
-                icon: const Icon(Icons.chevron_left, size: 20),
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-                tooltip: '上一页',
-                onPressed: (_isLoadingPage || _currentPage <= 1)
-                    ? null
-                    : () => _loadPdfPage(_currentPage - 1),
-              ),
-              Text(
-                _totalPages > 0
-                    ? '$_currentPage / $_totalPages'
-                    : '$_currentPage',
-                style: TextStyle(
-                  fontSize: 13,
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
-              IconButton(
-                icon: const Icon(Icons.chevron_right, size: 20),
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-                tooltip: '下一页',
-                onPressed: (_isLoadingPage || _currentPage >= _totalPages)
-                    ? null
-                    : () => _loadPdfPage(_currentPage + 1),
-              ),
-            ],
+          child: Text(
+            _totalPages > 0
+                ? '$_totalPages 页 · 可滚动缩放、选中文字复制'
+                : '可滚动缩放、选中文字复制',
+            style: TextStyle(
+              fontSize: 12,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
           ),
         ),
       ],

@@ -104,6 +104,30 @@ Future<void> _package(List<String> args) async {
     '   核心：$coreExe（${(coreSize / 1024 / 1024).toStringAsFixed(1)} MB）',
   );
 
+  // ②b 原生资源（Dart native assets）拷进发行目录
+  //
+  // pdfrx 用 native assets 带 pdfium：flutter build windows 会把 DLL 生成到
+  // build/native_assets/windows/ 并写进 data/flutter_assets/NativeAssetsManifest.json，
+  // 但**不会**把它放到 exe 旁边。运行期按 `pdfium.dll` 这个文件名加载时，Windows
+  // 的 DLL 搜索顺序里只有"应用目录"最可靠，所以打包这步必须自己拷——漏了的话
+  // 用户机器上一打开 PDF 就报找不到 pdfium（本机测试发现不了：测试环境用的是
+  // .dart_tool/lib 下的那份）。
+  final Directory nativeAssets = Directory(
+    _join(root.path, 'build/native_assets/windows'),
+  );
+  if (nativeAssets.existsSync()) {
+    for (final FileSystemEntity entity in nativeAssets.listSync()) {
+      if (entity is! File || !entity.path.toLowerCase().endsWith('.dll')) {
+        continue;
+      }
+      final String name = _basename(entity.path);
+      entity.copySync(_join(releaseDir.path, name));
+      stdout.writeln(
+        '   原生库：$name（\${(entity.lengthSync() / 1024 / 1024).toStringAsFixed(1)} MB）',
+      );
+    }
+  }
+
   // ③ 便携包说明（首次运行指引：数据在哪、怎么手改配置、出问题看哪）
   final File guide = File(_join(releaseDir.path, '使用说明.txt'));
   // 带 UTF-8 BOM 写出：目标是 Windows 用户，记事本/PowerShell 5.1 对无 BOM 的
