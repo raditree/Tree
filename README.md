@@ -104,7 +104,10 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 - **M5b**：团队数据模型（**成员即 agent**，团队字段写进 `agents/<id>.yaml`）+ `team` 工具 + 成员审核闸门 + 团队成员 REST + 成员级模型参数覆盖
 - **M5c**：`message` 工具 + 消息派发（审核闸门、活动日志、`wait_for`、附件）+ 级联停止（含排队任务丢弃）
 - **M5d**：Spec 体系（内置模板内嵌 + 自定义 spec 落盘工作空间、`spec` 工具、specs REST）+ 会话状态注入（todo / 已选 Spec 进入模型上下文）
-- **M6**：插件总线 + MCP + 进程外插件宿主
+- **M6a**：MCP（stdio JSON-RPC 客户端 + `mcp` 工具 + 已就绪 MCP 工具原生注入 + 服务注册 REST）
+- **M6b**：插件总线 + 进程外插件宿主（`config/plugins.yaml`、`plugin__<id>__<tool>` 原生工具、事件分发、心跳巡检、快照 REST）
+- **M6c**：插件 WS 增量（`plugin_status` 注册/停用、`plugin_event` 插件通知）
+  - 说明：参考实现的"处理站（stations，插件间订阅路由）"**未在桌面端实现**——单用户本机插件以工具与事件为主，快照里的 `stations` 恒为空数组（字段保留，前端显示 0）；如需该能力再单独立项
 - **M6a**：MCP（stdio JSON-RPC 客户端 + `mcp` 工具 + 已就绪 MCP 工具的原生注入 + 服务注册 REST）
 - **M7a**：打包（`dart run tool/build_core.dart` → 单文件 `tree_core.exe`；`TREE_CORE_EXE` 门控的真可执行文件冒烟测试：握手 → HTTP 鉴权 → shutdown 优雅退出）
 - **M7**：文档能力（PDF/docx）、安装器、删除 `server/` 与前端多余执行器

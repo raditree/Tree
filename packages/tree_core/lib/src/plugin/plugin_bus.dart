@@ -30,6 +30,7 @@ class PluginBus {
     this.callTimeout = const Duration(seconds: 60),
     this.watchdogInterval = const Duration(seconds: 15),
     this.coreVersion = '',
+    this.broadcast,
   });
 
   final String configFile;
@@ -42,6 +43,9 @@ class PluginBus {
   final Duration callTimeout;
   final Duration watchdogInterval;
   final String coreVersion;
+
+  /// WS 下行广播（`plugin_status` / `plugin_event`）；null = 不推（测试/无前端）。
+  final void Function(Map<String, dynamic> frame)? broadcast;
 
   bool enabled = true;
 
@@ -144,11 +148,42 @@ class PluginBus {
       _lastHeartbeat[config.id] = _nowSeconds();
       _queueDepth[config.id] = 0;
       log?.call('插件 ${config.id} 就绪（${toolsOf(config.id).length} 个工具）');
+      _emitStatus(config, 'registered');
     } catch (error) {
       _errors[config.id] = '$error';
       log?.call('插件 ${config.id} 不可用：$error');
       await _disconnect(config.id);
+      _emitStatus(config, 'disabled', reason: '$error');
     }
+  }
+
+  /// 推一条 `plugin_status` 增量（前端按 plugin_id + scope 合并）。
+  void _emitStatus(PluginConfig config, String status, {String reason = ''}) {
+    broadcast?.call(<String, dynamic>{
+      'type': 'plugin_status',
+      'data': <String, dynamic>{
+        'plugin_id': config.id,
+        'name': config.name,
+        'granularity': config.granularity,
+        'scope': config.scope,
+        'status': status,
+        if (reason.isNotEmpty) 'reason': reason,
+        'ts': _nowSeconds(),
+      },
+    });
+  }
+
+  /// 推一条 `plugin_event`（插件主动通知：log / event）。
+  void _emitPluginEvent(String pluginId, Map<String, dynamic> notification) {
+    broadcast?.call(<String, dynamic>{
+      'type': 'plugin_event',
+      'data': <String, dynamic>{
+        'plugin_id': pluginId,
+        'method': (notification['method'] ?? '').toString(),
+        'params': notification['params'] ?? <String, dynamic>{},
+        'ts': _nowSeconds(),
+      },
+    });
   }
 
   /// 把一个总线事件分发给订阅的插件实例，返回收到的实例数。
@@ -239,7 +274,11 @@ class PluginBus {
       }
       _errors[pluginId] = '心跳失败（插件无响应）';
       log?.call('插件 $pluginId 心跳失败，标记为不可用');
+      final PluginConfig? config = this.config(pluginId);
       await _disconnect(pluginId);
+      if (config != null) {
+        _emitStatus(config, 'disabled', reason: '心跳失败（插件无响应）');
+      }
     }
   }
 
@@ -305,7 +344,9 @@ class PluginBus {
     _watchdogTimer?.cancel();
     _watchdogTimer = null;
     for (final String pluginId in _hosts.keys.toList(growable: false)) {
+      final PluginConfig? config = this.config(pluginId);
       await _disconnect(pluginId);
+      if (config != null) _emitStatus(config, 'destroyed');
     }
   }
 
@@ -317,6 +358,8 @@ class PluginBus {
       config,
       timeout: connectTimeout,
       coreVersion: coreVersion,
+      onNotification: (Map<String, dynamic> notification) =>
+          _emitPluginEvent(config.id, notification),
     );
   }
 

@@ -78,11 +78,17 @@ Future<void> main(List<String> args) async {
   );
   await mcp.refresh();
 
+  // 提问回路与插件总线都要"工具层先建、核心后建 WS 广播"，因此统一用一个可后置
+  // 绑定的广播槽（核心起监听后立即接上 `hub.broadcast`）。
+  void Function(Map<String, dynamic> frame)? hubSink;
+
   // 插件总线（M6b）：配置在 <数据根>/config/plugins.yaml；启动时拉起全部启用插件
   // 并开始心跳巡检。坏插件只标记为不可用，不拦住核心启动。
   final PluginBus plugins = PluginBus(
     configFile: paths.pluginsConfigFile,
     coreVersion: TreeCore.version,
+    // plugin_status / plugin_event 广播到前端（起监听后 hubSink 会被接上）
+    broadcast: (Map<String, dynamic> frame) => hubSink?.call(frame),
     log: (String message) => stderr.writeln('[core:plugin] $message'),
   );
   await plugins.start();
@@ -90,7 +96,6 @@ Future<void> main(List<String> args) async {
   // 提问回路：工具层先建好、核心后建 WS 广播，因此广播目标用一个可后置绑定的
   // 槽（core 起监听后立即接上 `hub.broadcast`）。
   final FileQuestionStore questionStore = FileQuestionStore(paths);
-  void Function(Map<String, dynamic> frame)? hubSink;
   final QuestionBroker questions = QuestionBroker(
     questions: questionStore,
     transcript: store,

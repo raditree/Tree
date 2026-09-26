@@ -21,6 +21,7 @@ class PluginHost {
     PluginConfig config, {
     Duration timeout = const Duration(seconds: 20),
     String coreVersion = '',
+    void Function(Map<String, dynamic> notification)? onNotification,
   }) async {
     if (config.command.trim().isEmpty) {
       throw PluginException('插件 ${config.id} 未配置 command');
@@ -40,7 +41,8 @@ class PluginHost {
     process.stderr
         .transform(utf8.decoder)
         .listen(stderr.write, onError: (Object _) {});
-    final PluginHost host = PluginHost._(config, process, stderr);
+    final PluginHost host = PluginHost._(config, process, stderr)
+      .._onNotification = onNotification;
     process.stdout
         .transform(utf8.decoder)
         .transform(const LineSplitter())
@@ -86,6 +88,9 @@ class PluginHost {
   final PluginConfig config;
   final Process _process;
   final StringBuffer _stderr;
+
+  /// 插件主动通知的转发口（总线用它转成前端 `plugin_event`）；null = 只收集。
+  void Function(Map<String, dynamic> notification)? _onNotification;
 
   final Map<int, Completer<Map<String, dynamic>>> _pending =
       <int, Completer<Map<String, dynamic>>>{};
@@ -255,8 +260,9 @@ class PluginHost {
     if (decoded is! Map<String, dynamic>) return;
     final Object? id = decoded['id'];
     if (id is! int) {
-      // 插件主动通知（log/event）：收集起来，由总线转前端事件
+      // 插件主动通知（log/event）：收集并转发（总线转前端 plugin_event）
       notifications.add(decoded);
+      _onNotification?.call(decoded);
       return;
     }
     final Completer<Map<String, dynamic>>? completer = _pending.remove(id);
