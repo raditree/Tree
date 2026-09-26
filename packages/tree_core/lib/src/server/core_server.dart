@@ -463,6 +463,22 @@ class CoreServer {
       log: (String message) => errorLog?.call('[core:station] $message'),
     );
     _stationMounts = mounts;
+    // M9 §3「三站系统自带」+ 用户预期：内置三站原本是**懒创建**的（首次使用时才
+    // 实例化），于是"没配插件 / 没人用过"时面板上就是「站点（0）」，与「三站默认
+    // 设在系统中」不符。这里按存储里已有的 (team, 工作空间模式) 组合预建一遍。
+    //
+    // 幂等 + 持久化由 StationHub.ensureBuiltinStations 保证：已从 stations.yaml
+    // 恢复的不再新建、也不重复落盘；只有真的新建了才写一次盘。
+    // **收集站不预建**：它的 schema 是接入点定义的输入格式（见该方法的 dartdoc）。
+    final List<String> prebuiltStations = bus.stations.ensureBuiltinStations(
+      _storedTeamScopes(),
+    );
+    if (prebuiltStations.isNotEmpty) {
+      errorLog?.call(
+        '[core:station] 预建内置站 '
+        '${prebuiltStations.length} 个：${prebuiltStations.join('、')}',
+      );
+    }
     // 运行期四元组就绪 = 工具表的失效点：下次刷新点按**真实工作面**（local/ssh）
     // 重新收集一次（CLI 里 plugins.start() 早于本接线，那次用的是声明里的 mode）。
     bus.invalidateToolTable(reason: '站点接线完成（运行期四元组就绪）');
@@ -470,6 +486,35 @@ class CoreServer {
     if (mountError != null) {
       errorLog?.call('执行站挂载位置接线不完整：$mountError');
     }
+  }
+
+  /// 存储里已存在的 **(team, 工作空间模式)** 组合（内置三站预建的输入）。
+  ///
+  /// - **team**：agent 的团队归属；**顶层 agent（teamId 为空）拿它自己的 id 当团队
+  ///   id**——与既有口径一致（`TreeStore.teams()` 返回的正是这些顶层 agent，成员用
+  ///   teamId 指回它们，前端插件面板也是拿"选中的 agent id"当 team 过滤）。没有归属
+  ///   的 agent 归不到任何站：站点消息的隔离判定要求 team_id 非空（fail-closed），
+  ///   拿空串凑一个站只会得到一个谁都投不进去的空壳。
+  /// - **mode**：该 agent 的工作空间模式，`sshConfig != null` → ssh，否则 local，
+  ///   与运行期 `PluginBus.agentModeKeyResolver` 同口径；同一 team 两种模式都有
+  ///   agent 就两种都建（SSH 团队的命令不能落到本地工作空间）。
+  ///
+  /// 同一组合去重（`scope.key`）：预建本身幂等，重复喂同一个组合没有意义。
+  List<StationScope> _storedTeamScopes() {
+    final Map<String, StationScope> combos = <String, StationScope>{};
+    for (final CoreAgent agent in store.agents()) {
+      final String declaredTeam = agent.teamId.trim();
+      final String teamId = declaredTeam.isEmpty ? agent.id : declaredTeam;
+      if (teamId.isEmpty) continue;
+      final StationScope scope = StationScope(
+        teamId: teamId,
+        modeKey: agent.sshConfig != null
+            ? StationModeKey.ssh
+            : StationModeKey.local,
+      );
+      combos[scope.key] = scope;
+    }
+    return combos.values.toList(growable: false);
   }
 
   /// 执行站 `agent.message`：插件 → 目标 agent 的会话。

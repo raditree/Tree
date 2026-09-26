@@ -158,6 +158,87 @@ void main() {
       expect(st.counts.containsKey('weird'), isFalse);
     });
 
+    test(
+      '站点字段（M9 §3）：kind / kind_label / builtin / subscriber_count / scope',
+      () {
+        final PluginStationInfo? st = PluginStationInfo.tryParse(
+          <String, dynamic>{
+            'station_id': 'system.broadcast@team-1@local',
+            'kind': 'broadcast',
+            'kind_label': '广播站',
+            'description': '广播站（系统自带）：插件发布 topic → 多订阅者接收 + 持久公告板',
+            'scope': <String, dynamic>{
+              'team_id': 'team-1',
+              'agent_id': '',
+              'session_id': '',
+              'mode_key': 'local',
+            },
+            'builtin': true,
+            'subscriber_count': 0,
+            'subscriptions': <dynamic>[],
+          },
+        );
+        expect(st, isNotNull);
+        expect(st!.kind, 'broadcast');
+        expect(st.kindLabel, '广播站');
+        expect(st.displayKindLabel, '广播站');
+        expect(st.builtin, isTrue);
+        expect(st.subscriberCount, 0);
+        expect(st.description, contains('持久公告板'));
+        expect(st.scope['mode_key'], 'local');
+      },
+    );
+
+    test('站点旧核心兼容：缺 kind_label 按线名兜底、subscriber_count 回退订阅数、未知 kind 不臆测', () {
+      final PluginStationInfo? relay = PluginStationInfo.tryParse(
+        <String, dynamic>{
+          'station_id': 'system.relay@team-1@ssh',
+          'kind': 'relay',
+          'scope': <String, dynamic>{'team_id': 'team-1', 'mode_key': 'ssh'},
+          'subscriptions': <dynamic>[
+            <String, dynamic>{'subscriber': 'p1|team-1||ssh'},
+          ],
+        },
+      );
+      expect(relay!.kindLabel, isEmpty, reason: '老核心没有 kind_label');
+      expect(relay.displayKindLabel, '中转站', reason: '按线名兜底出中文名');
+      expect(relay.builtin, isFalse, reason: '缺失按 false，不臆测"内置"');
+      expect(relay.subscriberCount, 1, reason: '缺失回退订阅列表长度');
+
+      final PluginStationInfo? unknown = PluginStationInfo.tryParse(
+        <String, dynamic>{'station_id': 'x', 'kind': 'future_kind'},
+      );
+      expect(unknown!.displayKindLabel, isEmpty, reason: '认不出的类型不猜中文名');
+    });
+
+    test('插件配置路径：config.path 优先，顶层 plugin_config 兜底，缺失为空串', () {
+      final PluginSnapshot withConfig = PluginSnapshot.fromJson(
+        <String, dynamic>{
+          'config': <String, dynamic>{'path': 'C:/data/config/plugins.yaml'},
+        },
+      );
+      expect(withConfig.pluginConfigPath, 'C:/data/config/plugins.yaml');
+
+      final PluginSnapshot legacy = PluginSnapshot.fromJson(<String, dynamic>{
+        'plugin_config': 'D:/tree/config/plugins.yaml',
+      });
+      expect(legacy.pluginConfigPath, 'D:/tree/config/plugins.yaml');
+
+      final PluginSnapshot none = PluginSnapshot.fromJson(<String, dynamic>{});
+      expect(none.pluginConfigPath, isEmpty);
+      // copyWith（增量合并路径）不得把路径丢掉
+      expect(
+        none.copyWith(instances: const <PluginInstanceInfo>[]).pluginConfigPath,
+        isEmpty,
+      );
+      expect(
+        withConfig
+            .copyWith(instances: const <PluginInstanceInfo>[])
+            .pluginConfigPath,
+        'C:/data/config/plugins.yaml',
+      );
+    });
+
     test('实例键组合：不同 scope 不混淆', () {
       final String k1 = PluginInstanceInfo.keyOf('p', <String, dynamic>{
         'team_id': 't',

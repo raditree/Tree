@@ -27,11 +27,18 @@ class PluginPanel extends StatefulWidget {
   /// 为 null 时不注册点击（右栏等常驻场景不需要折叠语义）。
   final VoidCallback? onCollapse;
 
+  /// 数据源覆盖（**测试注入用**；null = 全局单例 [PluginMonitorService.instance]）。
+  ///
+  /// 面板在真实使用里是单例（一处连接、多处展示），但 widget 测试需要一个干净的
+  /// 服务实例，否则测试之间会共享同一次快照与连接态。
+  final PluginMonitorService? service;
+
   const PluginPanel({
     super.key,
     this.teamId,
     this.showHeader = true,
     this.onCollapse,
+    this.service,
   });
 
   @override
@@ -39,7 +46,8 @@ class PluginPanel extends StatefulWidget {
 }
 
 class _PluginPanelState extends State<PluginPanel> {
-  PluginMonitorService get _svc => PluginMonitorService.instance;
+  PluginMonitorService get _svc =>
+      widget.service ?? PluginMonitorService.instance;
 
   @override
   void initState() {
@@ -186,15 +194,17 @@ class _PluginPanelState extends State<PluginPanel> {
           const SizedBox(height: 12),
           _sectionTitle(cs, '插件实例（${snap.instances.length}）'),
           if (snap.instances.isEmpty)
-            _emptyHint(cs, '暂无插件实例')
+            _emptyHint(cs, _instancesEmptyText(snap))
           else
             ...snap.instances.map(
               (PluginInstanceInfo e) => _instanceCard(cs, e, snap.watchdog),
             ),
           const SizedBox(height: 12),
-          _sectionTitle(cs, '处理站（${snap.stations.length}）'),
+          // M9 §3 的正式名字是「站点」（广播 / 执行 / 中转 / 收集四类），
+          // 旧文案「处理站」是已废弃的旧名（旧「处理站」= 现在的中转站）。
+          _sectionTitle(cs, '站点（${snap.stations.length}）'),
           if (snap.stations.isEmpty)
-            _emptyHint(cs, '暂无处理站订阅')
+            _emptyHint(cs, _stationsEmptyText(snap))
           else
             ...snap.stations.map((PluginStationInfo s) => _stationCard(cs, s)),
           const SizedBox(height: 12),
@@ -420,8 +430,14 @@ class _PluginPanelState extends State<PluginPanel> {
       ? value.toInt().toString()
       : value.toStringAsFixed(1);
 
-  /// 单个处理站卡片（计数白名单裁剪，未知键忽略）。
+  /// 单个站点卡片（计数白名单裁剪，未知键忽略）。
+  ///
+  /// 展示口径（M9 §3）：**类型用核心给的 kind / kind_label**（中文名不写死在前端，
+  /// 旧核心缺 kind_label 时按线名兜底、两者都认不出就不显示类型标签），
+  /// 内置站打「内置」标识（与插件自建站区分），订阅数用核心给的 subscriber_count，
+  /// scope 摘要带 mode_key（local / ssh 是隔离的关键维度，不能省）。
   Widget _stationCard(ColorScheme cs, PluginStationInfo s) {
+    final String kindLabel = s.displayKindLabel;
     final String subscriber =
         s.subscriptions.isEmpty || s.subscriptions.first.subscriber.isEmpty
         ? '—'
@@ -458,12 +474,38 @@ class _PluginPanelState extends State<PluginPanel> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  s.stationId,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              if (kindLabel.isNotEmpty) ...[
+                _pill(cs, kindLabel, emphasize: true),
+                const SizedBox(width: 6),
+              ],
+              if (s.builtin) _pill(cs, '内置'),
+            ],
+          ),
+          if (s.description.isNotEmpty)
+            Text(
+              s.description,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+            ),
           Text(
-            s.stationId,
-            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+            '订阅（${s.subscriberCount}）: $subscriber$subNote',
+            style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
           ),
           Text(
-            '订阅: $subscriber$subNote',
+            'scope: ${_scopeSummary(s.scope)}',
             style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
           ),
           if (countPills.isNotEmpty) ...[
@@ -473,6 +515,42 @@ class _PluginPanelState extends State<PluginPanel> {
         ],
       ),
     );
+  }
+
+  /// 插件实例段的空态说明。
+  ///
+  /// 用户实机反馈（截图）：「插件实例（0）／暂无插件实例」没说清**插件配在哪**。
+  /// 插件来自快照里的配置文件（`config.path`，默认 <数据根>/config/plugins.yaml），
+  /// 所以这里直接把路径写出来，并说明"改完要重启核心"。路径缺失（旧核心 / 未接入
+  /// 总线）时退回原来那句，不臆测路径。
+  String _instancesEmptyText(PluginSnapshot snap) {
+    final String path = snap.pluginConfigPath;
+    if (path.isEmpty) {
+      return '暂无插件实例';
+    }
+    return '暂无插件实例\n插件配置在 $path（可直接编辑，保存后重启核心生效）';
+  }
+
+  /// 站点段的空态说明（可直接照做的文案）。
+  ///
+  /// 用户实机反馈（截图）：「处理站（0）／暂无处理站订阅」既没说清内置站是
+  /// **按需创建**的、也没说清**四类站各自什么时候出现**。现在的口径（M9 §3）：
+  /// 广播 / 执行 / 中转三站在核心启动时按「团队 × 工作空间模式」预建（团队下建有
+  /// agent 就自动就位）；收集站的输入格式由接入点定义，只在接入点需要时出现。
+  /// 真的为空只剩两种情况：存储里还没有任何 team（没有 team_id 就归不到站——
+  /// 隔离判定要求 team_id 非空），或数据来自没有预建逻辑的旧核心。
+  String _stationsEmptyText(PluginSnapshot snap) {
+    final StringBuffer buffer = StringBuffer(
+      '暂无站点实例。'
+      '内置四站（广播 / 执行 / 中转 / 收集）随「团队 × 工作空间模式」创建：'
+      '团队下建有 agent 后，广播站 / 执行站 / 中转站会自动就位；'
+      '收集站的输入格式由接入点定义，只在接入点需要时出现。',
+    );
+    final String path = snap.pluginConfigPath;
+    if (path.isNotEmpty) {
+      buffer.write('\n插件配置：$path');
+    }
+    return buffer.toString();
   }
 
   /// 状态文本（未知状态原样展示、不崩）。
@@ -555,9 +633,18 @@ class _PluginPanelState extends State<PluginPanel> {
   }
 
   /// scope 摘要（仅展示非空维度；空则 '—'）。
+  ///
+  /// **mode_key 必须显示**（M9 §1.2）：local / ssh 是站点隔离的关键维度，
+  /// 同一个团队在两个工作面上是两个不同实例（id 就带 @local / @ssh）——
+  /// 面板上看不出模式，用户就无法理解"为什么有两个广播站"。
   String _scopeSummary(Map<String, dynamic> scope) {
     final List<String> parts = <String>[];
-    for (final String k in <String>['team_id', 'agent_id', 'session_id']) {
+    for (final String k in <String>[
+      'team_id',
+      'agent_id',
+      'session_id',
+      'mode_key',
+    ]) {
       final String v = (scope[k] ?? '').toString();
       if (v.isNotEmpty) {
         parts.add('$k=$v');

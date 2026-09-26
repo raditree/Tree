@@ -166,7 +166,7 @@ class PluginInstanceInfo {
   }
 }
 
-/// 处理站订阅项（`stations[].subscriptions[]` 单条）。
+/// 站点订阅项（`stations[].subscriptions[]` 单条）。
 class PluginStationSub {
   /// 订阅方实例键（展示为主）
   final String subscriber;
@@ -213,10 +213,36 @@ class PluginStationSub {
   }
 }
 
-/// 处理站信息（订阅列表 + 分类计数 + 在飞等待）。
+/// 站点信息（M9 §3 站点体系：类型 + scope 绑定 + 订阅 + 分类计数 + 在飞等待）。
+///
+/// 站点 = **持久化实例**，四类：广播站 / 执行站 / 中转站 / 收集站。核心的
+/// `StationInstance.describe()` 已给出展示需要的全部字段，前端不再自己猜类型：
+/// `kind`（线名）/ `kind_label`（中文名）/ `builtin`（是否系统自带）/
+/// `subscriber_count`（订阅数，执行站恒为 0——它不支持订阅）。
+///
+/// 宽容解析：旧核心没有这些字段时全部按"未知"处理（空串 / false / 回退订阅列表
+/// 长度），展示层不臆测、不崩。
 class PluginStationInfo {
-  /// 站 ID（如 `tool.read.result`）
+  /// 站 ID（含 scope 归属，如 `system.broadcast@team-1@local`）
   final String stationId;
+
+  /// 站点类型线名：broadcast / execute / relay / collect（缺失为空串 = 未知）
+  final String kind;
+
+  /// 站点类型中文名（核心给的 `kind_label`；缺失为空串）
+  final String kindLabel;
+
+  /// 站点说明（核心给的 `description`；缺失为空串）
+  final String description;
+
+  /// 站点绑定的 scope（team_id / mode_key 是关键维度；缺失字段展示层视为空串）
+  final Map<String, dynamic> scope;
+
+  /// 是否系统自带（内置三站为 true；插件自建为 false；缺失按 false）
+  final bool builtin;
+
+  /// 订阅者数量（核心给的 `subscriber_count`；缺失回退订阅列表长度）
+  final int subscriberCount;
 
   /// 订阅列表（站 × scope 键位唯一；当前通常 1 项）
   final List<PluginStationSub> subscriptions;
@@ -229,10 +255,36 @@ class PluginStationInfo {
 
   const PluginStationInfo({
     required this.stationId,
+    this.kind = '',
+    this.kindLabel = '',
+    this.description = '',
+    this.scope = const <String, dynamic>{},
+    this.builtin = false,
+    this.subscriberCount = 0,
     this.subscriptions = const <PluginStationSub>[],
     this.counts = const <String, int>{},
     this.waitsInFlight,
   });
+
+  /// 展示用的中文类型名：核心给的 `kind_label` 优先；旧核心没给时按线名 `kind`
+  /// 兜底；两者都认不出 ⇒ 空串（**不猜**，卡片上就不显示类型标签）。
+  String get displayKindLabel {
+    if (kindLabel.isNotEmpty) {
+      return kindLabel;
+    }
+    switch (kind) {
+      case 'broadcast':
+        return '广播站';
+      case 'execute':
+        return '执行站';
+      case 'relay':
+        return '中转站';
+      case 'collect':
+        return '收集站';
+      default:
+        return '';
+    }
+  }
 
   /// 宽容解析单条站；无法使用（非 Map / 缺 station_id）时返回 null（跳过）。
   static PluginStationInfo? tryParse(Object? raw) {
@@ -254,6 +306,11 @@ class PluginStationInfo {
         }
       }
     }
+    Map<String, dynamic> scope = const <String, dynamic>{};
+    final Object? rawScope = m['scope'];
+    if (rawScope is Map) {
+      scope = Map<String, dynamic>.from(rawScope);
+    }
     final Map<String, int> counts = <String, int>{};
     final Object? rawCounts = m['counts'];
     if (rawCounts is Map) {
@@ -268,8 +325,19 @@ class PluginStationInfo {
     if (rawGauges is Map && rawGauges['waits_in_flight'] is num) {
       waits = (rawGauges['waits_in_flight'] as num).toInt();
     }
+    // 订阅数以核心给的为准（执行站不支持订阅，恒 0）；缺失回退订阅列表长度
+    final Object? rawSubscriberCount = m['subscriber_count'];
+    final int subscriberCount = rawSubscriberCount is num
+        ? rawSubscriberCount.toInt()
+        : subs.length;
     return PluginStationInfo(
       stationId: stationId,
+      kind: (m['kind'] ?? '').toString(),
+      kindLabel: (m['kind_label'] ?? '').toString(),
+      description: (m['description'] ?? '').toString(),
+      scope: scope,
+      builtin: m['builtin'] == true,
+      subscriberCount: subscriberCount,
       subscriptions: subs,
       counts: counts,
       waitsInFlight: waits,
@@ -333,7 +401,7 @@ class PluginSnapshot {
   /// 实例列表（坏条目已跳过）
   final List<PluginInstanceInfo> instances;
 
-  /// 处理站列表（坏条目已跳过）
+  /// 站点列表（四类内置站 + 插件自建站；坏条目已跳过）
   final List<PluginStationInfo> stations;
 
   /// 看门狗概要（缺失为 null）
@@ -342,6 +410,13 @@ class PluginSnapshot {
   /// 配置摘要（展示层按白名单裁剪）
   final Map<String, dynamic> config;
 
+  /// 插件配置文件路径（`config.path`；旧核心 / 未接入总线时为空串）。
+  ///
+  /// 面板用它回答用户最常问的两件事：「插件配在哪」「改完怎么生效」——
+  /// plugins.yaml 是用户可以直接手改的文件，路径必须在界面上看得见。
+  /// 缺失就空串，展示层跳过那一行（不臆测路径）。
+  final String pluginConfigPath;
+
   const PluginSnapshot({
     this.enabled = false,
     this.generatedAt,
@@ -349,6 +424,7 @@ class PluginSnapshot {
     this.stations = const <PluginStationInfo>[],
     this.watchdog,
     this.config = const <String, dynamic>{},
+    this.pluginConfigPath = '',
   });
 
   /// 宽容解析完整快照：缺字段给默认值、坏条目跳过、未知字段忽略。
@@ -375,15 +451,22 @@ class PluginSnapshot {
     }
     final Object? rawGenerated = raw['generated_at'];
     final Object? rawConfig = raw['config'];
+    final Map<String, dynamic> config = rawConfig is Map
+        ? Map<String, dynamic>.from(rawConfig)
+        : const <String, dynamic>{};
+    // 配置路径：新核心给 config.path；老核心/别的生产方可能给顶层 plugin_config。
+    // 两个都没有 ⇒ 空串（面板跳过"插件配置在…"那一行）。
+    final String rawPath = (config['path'] ?? raw['plugin_config'] ?? '')
+        .toString()
+        .trim();
     return PluginSnapshot(
       enabled: raw['enabled'] == true,
       generatedAt: rawGenerated is num ? rawGenerated.toDouble() : null,
       instances: instances,
       stations: stations,
       watchdog: PluginWatchdogInfo.tryParse(raw['watchdog']),
-      config: rawConfig is Map
-          ? Map<String, dynamic>.from(rawConfig)
-          : const <String, dynamic>{},
+      config: config,
+      pluginConfigPath: rawPath,
     );
   }
 
@@ -396,6 +479,7 @@ class PluginSnapshot {
       stations: stations,
       watchdog: watchdog,
       config: config,
+      pluginConfigPath: pluginConfigPath,
     );
   }
 }

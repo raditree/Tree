@@ -131,6 +131,12 @@ class StationHub {
   final Map<String, StationInstance> _stations = <String, StationInstance>{};
   bool _loaded = false;
 
+  /// 批量新建期间的落盘合并深度（见 [save]）：>0 时只置脏，批量结束统一写一次。
+  int _saveSuspend = 0;
+
+  /// 合并落盘期间是否发生过写入（有新建才写，没有就不写）。
+  bool _saveDirtyWhileSuspended = false;
+
   /// 读盘（幂等；文件不存在 = 空表）。
   void load() {
     if (_loaded) return;
@@ -215,6 +221,70 @@ class StationHub {
     );
     _register(station);
     return station;
+  }
+
+  /// **确保内置三站在给定的 (team, 工作空间模式) 组合上存在**（M9 §3「三站系统自带」）。
+  ///
+  /// 为什么需要这一步：[broadcastFor] / [executeFor] / [relayFor] 都是**懒创建**
+  /// （首次使用时才实例化）。按需开销为零是好事，代价却是"没配插件 / 没人用过"时
+  /// 一个内置站都没有——面板上就是「站点（0）」，与用户「三站默认设在系统中」的
+  /// 预期不符。核心在**站点接线处**（`CoreServer._wirePluginStations`）按存储里
+  /// 已有的 (team, mode) 组合各预建一遍，三站因此随 agent 一起就位。
+  ///
+  /// 幂等（重复启动的安全边界）：
+  /// - 已存在的站点（本次启动从 stations.yaml **恢复**的，或之前调用已建的）直接跳过，
+  ///   既不新建也不覆盖——所以重复调用不产生重复实例；
+  /// - 没有新建就**不落盘**，一批新建也只写一次（[_saveSuspend] 合并），
+  ///   所以重复启动既不改文件内容也不刷新文件时间。
+  ///
+  /// **为什么不预建收集站**（本波次的取舍，用户裁定）：收集站的 schema 就是
+  /// **接入点定义的输入格式**（如 [toolDefinitionSchema]）。没有接入点就没有格式，
+  /// 预建一个"空 schema"的收集站毫无意义——既过不了 [register] 的空 schema 校验，
+  /// 也不会有任何订阅者按它产出。收集站一律由接入点在需要时用
+  /// [toolDefineStationFor] / [register] 现建。
+  ///
+  /// 返回**本次新建**的站点 id（已存在的不在内）；空列表 = 纯幂等命中，什么都没做。
+  List<String> ensureBuiltinStations(Iterable<StationScope> scopes) {
+    load();
+    final List<String> created = <String>[];
+    // 一批预建只落一次盘（每个内置站的懒创建都会 save 一次，不合并就是 3×N 次写）
+    _saveSuspend++;
+    try {
+      for (final StationScope raw in scopes) {
+        if (!raw.isValid) continue;
+        // 内置站只绑 team×mode（agent/session 留空 = 不限定），与懒创建同口径；
+        // team_id 顺带 trim，避免空格混进站点 id（隔离判定按精确相等）。
+        final StationScope scope = StationScope(
+          teamId: raw.teamId.trim(),
+          modeKey: raw.modeKey,
+        );
+        _ensureOneBuiltin(() => broadcastFor(scope), created);
+        _ensureOneBuiltin(() => executeFor(scope), created);
+        _ensureOneBuiltin(() => relayFor(scope), created);
+      }
+    } finally {
+      _saveSuspend--;
+      if (_saveDirtyWhileSuspended) {
+        _saveDirtyWhileSuspended = false;
+        save();
+      }
+    }
+    return created;
+  }
+
+  /// 建一个内置站（若不存在），并把"这次真的新建了"记进 [created]。
+  ///
+  /// 用 id 是否新增来判断，而不是拿创建函数的返回值——[StationHub.station] 的
+  /// 同名不同类型的防御分支会返回 null，那种情况不算新建。
+  void _ensureOneBuiltin(
+    StationInstance? Function() create,
+    List<String> created,
+  ) {
+    final int before = _stations.length;
+    final StationInstance? station = create();
+    if (station != null && _stations.length > before) {
+      created.add(station.id);
+    }
   }
 
   /// 收集站「插件定义 tool」（系统自带；收集站的首个接入点）。
@@ -351,8 +421,15 @@ class StationHub {
   }
 
   /// 落盘（原子覆盖写；站点实例与订阅关系一起持久化，跨重启保留）。
+  ///
+  /// **合并落盘**：批量预建（[ensureBuiltinStations]）期间只置脏，由批量末尾统一
+  /// 写一次——「重复启动不重复落盘」的另一半：已存在的站点根本不会再走到这里。
   void save() {
     if (!_loaded) return;
+    if (_saveSuspend > 0) {
+      _saveDirtyWhileSuspended = true;
+      return;
+    }
     _store.save(_stations.values);
   }
 
