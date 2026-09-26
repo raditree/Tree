@@ -1440,16 +1440,17 @@ class CoreServer {
       return;
     }
     final Map<String, dynamic> body = await readJsonBody(request);
-    final Map<String, dynamic> result = await files.readBytes(
+    final Map<String, dynamic> result = await files.openDownload(
       params['workspaceId'] ?? '',
       (body['path'] ?? '').toString(),
     );
     if (await _writeResultError(request, result)) return;
-    await writeBytes(
+    await writeStream(
       request,
       200,
-      result['bytes'] as List<int>,
+      result['stream'] as Stream<List<int>>,
       filename: result['name'] as String?,
+      length: result['size'] as int?,
     );
   }
 

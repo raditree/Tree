@@ -440,8 +440,8 @@ void main() {
     expect((await init(name: 'a/b.bin')).status, 400);
     expect(
       (await init(size: 2 * 1024 * 1024 * 1024)).status,
-      413,
-      reason: '超过单文件上限',
+      200,
+      reason: 'M8c：单文件不设大小上限（分片通道 + 远端流式写）',
     );
     expect(
       (await client.send(
@@ -545,6 +545,34 @@ void main() {
       )).status,
       400,
     );
+  });
+
+  test('大文件：内容只回预览并标注截断；下载流式且逐字节一致（M8c）', () async {
+    await start();
+    // 9 MB > 默认预览上限 8 MB
+    final List<int> payload = List<int>.generate(
+      9 * 1024 * 1024,
+      (int i) => i % 251,
+    );
+    File('${temp.path}/big.bin').writeAsBytesSync(payload);
+
+    final _Res preview = await client.send(
+      'GET',
+      '/api/files/${ws()}/content?path=big.bin',
+    );
+    expect(preview.status, 200, reason: preview.raw);
+    expect(preview.json['truncated'], true, reason: '不再 413，而是标注截断');
+    expect(preview.json['size'], payload.length);
+    expect(preview.json['preview_bytes'], 8 * 1024 * 1024);
+
+    final _Res full = await client.send(
+      'POST',
+      '/api/files/${ws()}/download',
+      body: <String, dynamic>{'path': 'big.bin'},
+    );
+    expect(full.status, 200);
+    expect(full.bytes.length, payload.length);
+    expect(full.bytes, payload, reason: '流式下载必须与源文件逐字节一致');
   });
 
   test('POST download_folder：真实 tar.gz（gzip 可解、排除 .git、越界拒绝）', () async {

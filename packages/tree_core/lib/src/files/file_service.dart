@@ -36,7 +36,6 @@ class FileService {
     this.maxContentBytes = 8 * 1024 * 1024,
     this.gitTimeout = const Duration(seconds: 10),
     this.chunkSize = 4 * 1024 * 1024,
-    this.maxUploadBytes = 1024 * 1024 * 1024,
     this.maxArchiveBytes = 256 * 1024 * 1024,
     this.maxSyncFiles = 50000,
     this.maxSyncBytes = 2 * 1024 * 1024 * 1024,
@@ -57,9 +56,6 @@ class FileService {
 
   /// 服务端定标的分片大小（随 `upload_init` 返回，前端按这个值切片）。
   final int chunkSize;
-
-  /// 单文件上传上限（分片累计字节数）。
-  final int maxUploadBytes;
 
   /// 目录打包下载的**未压缩**大小上限：超过就拒绝，避免把整个工作空间读进内存。
   final int maxArchiveBytes;
@@ -211,9 +207,16 @@ class FileService {
     WorkspaceFiles remote,
     String path,
   ) async {
+    final int size;
     final Uint8List bytes;
     try {
-      bytes = await remote.readBytes(path);
+      // 先问大小：超过预览上限就只读前一段，别为了一次预览把整文件拉回来（M8c）
+      size = await remote.sizeOf(path);
+      bytes = size > maxContentBytes
+          ? await _collect(
+              remote.openRead(path, offset: 0, length: maxContentBytes),
+            )
+          : await remote.readBytes(path);
     } on WorkspacePathException catch (error) {
       return _error(error.toString(), 400);
     } on WorkspaceIoException catch (error) {
@@ -221,13 +224,8 @@ class FileService {
     } catch (error) {
       return _error('读取远端文件失败：$error', 500);
     }
-    if (bytes.length > maxContentBytes) {
-      return _error(
-        '文件过大（${bytes.length ~/ 1024} KB > ${maxContentBytes ~/ 1024} KB），请用终端/工具处理',
-      );
-    }
     final String ext = p.extension(path).replaceFirst('.', '').toLowerCase();
-    return _contentJson(path, bytes, extension: ext);
+    return _previewJson(path, bytes, size: size, extension: ext);
   }
 
   /// 远端原始字节下载。
@@ -252,9 +250,22 @@ class FileService {
     WorkspaceFiles remote,
     String path,
   ) async {
-    final Uint8List bytes;
     try {
-      bytes = await remote.readBytes(path);
+      final int size = await remote.sizeOf(path);
+      if (size <= _pdfFullReadBytes) {
+        return pdfInfoFromBytes(await remote.readBytes(path));
+      }
+      final List<int> head = await _collect(
+        remote.openRead(path, offset: 0, length: _pdfHeadBytes),
+      );
+      final List<int> tail = await _collect(
+        remote.openRead(
+          path,
+          offset: size - _pdfTailBytes,
+          length: _pdfTailBytes,
+        ),
+      );
+      return pdfInfoFromSlices(head, tail);
     } on WorkspacePathException catch (error) {
       return _error(error.toString(), 400);
     } on WorkspaceIoException catch (error) {
@@ -262,7 +273,6 @@ class FileService {
     } catch (error) {
       return _error('读取远端文件失败：$error', 500);
     }
-    return pdfInfoFromBytes(bytes);
   }
 
   /// 字节 → 前端文件内容 JSON（图片 base64，其余文本解码）。
@@ -287,6 +297,34 @@ class FileService {
     };
   }
 
+  /// 大文件预览 JSON：内容只回传前一段，但**如实标注**真实大小与截断（M8c）。
+  ///
+  /// 为什么不再 413：单文件在用户自己的桌面/远端盘上，一个"看不了"的硬上限只会
+  /// 逼用户去开终端。前端拿到 `truncated` 后提示"仅预览前 N MB，完整内容请下载"，
+  /// 下载那条路走流式、不设上限。
+  static Map<String, dynamic> _previewJson(
+    String path,
+    List<int> bytes, {
+    required int size,
+    required String extension,
+  }) {
+    return <String, dynamic>{
+      ..._contentJson(path, bytes, extension: extension),
+      'size': size,
+      'truncated': size > bytes.length,
+      if (size > bytes.length) 'preview_bytes': bytes.length,
+    };
+  }
+
+  /// 把（已显式限长的）字节流收进内存。
+  static Future<Uint8List> _collect(Stream<List<int>> stream) async {
+    final BytesBuilder builder = BytesBuilder(copy: false);
+    await for (final List<int> chunk in stream) {
+      builder.add(chunk);
+    }
+    return builder.takeBytes();
+  }
+
   /// 读取文件内容：图片返回 base64，其余按文本解码（UTF-8 失败退 latin1）。
   Future<Map<String, dynamic>> content(String workspaceId, String path) async {
     final CoreAgent? agent = agentFor(workspaceId);
@@ -306,35 +344,27 @@ class FileService {
     final File file = File(absolute);
     if (!file.existsSync()) return _error('文件不存在：$path');
     final int size = file.lengthSync();
-    if (size > maxContentBytes) {
-      return _error(
-        '文件过大（${size ~/ 1024} KB > ${maxContentBytes ~/ 1024} KB），请用终端/工具处理',
-      );
-    }
-    final List<int> bytes;
-    try {
-      bytes = file.readAsBytesSync();
-    } catch (error) {
-      return _error('读取文件失败：$error', 500);
-    }
     final String ext = p
         .extension(absolute)
         .replaceFirst('.', '')
         .toLowerCase();
-    if (LocalWorkspaceIO.imageExtensions.contains(ext)) {
-      return <String, dynamic>{
-        'content': base64Encode(bytes),
-        'path': path,
-        'size': size,
-        'encoding': 'base64',
-      };
+    final List<int> bytes;
+    try {
+      if (size > maxContentBytes) {
+        // 大文件只读预览那一段：先问大小再读，不再"读完再 413"（M8c）
+        final RandomAccessFile raf = await file.open();
+        try {
+          bytes = await raf.read(maxContentBytes);
+        } finally {
+          await raf.close();
+        }
+      } else {
+        bytes = await file.readAsBytes();
+      }
+    } catch (error) {
+      return _error('读取文件失败：$error', 500);
     }
-    return <String, dynamic>{
-      'content': LocalWorkspaceIO.decodeBytes(bytes),
-      'path': path,
-      'size': size,
-      'encoding': 'utf-8',
-    };
+    return _previewJson(path, bytes, size: size, extension: ext);
   }
 
   /// 读取原始字节（单文件下载）：`{bytes, name}` 或 `{error, status}`。
@@ -371,6 +401,53 @@ class FileService {
     }
   }
 
+  /// 单文件**流式**下载（M8c）：返回字节流 + 文件名 + 大小。
+  ///
+  /// 与 [readBytes] 的区别：那个把整个文件读进内存（`/download` 的兼容路径）；
+  /// 这里把流直接交给 HTTP 响应，本地文件与远端 SFTP 都不设大小上限，
+  /// 内存占用只与块大小有关。
+  Future<Map<String, dynamic>> openDownload(
+    String workspaceId,
+    String path,
+  ) async {
+    final CoreAgent? agent = agentFor(workspaceId);
+    if (agent == null) return _error('工作空间不存在：$workspaceId');
+    final WorkspaceFiles? remote = await remoteFor(agent);
+    if (remote != null) {
+      try {
+        final int size = await remote.sizeOf(path);
+        return <String, dynamic>{
+          'stream': remote.openRead(path),
+          'name': p.posix.basename(path),
+          'size': size,
+        };
+      } on WorkspacePathException catch (error) {
+        return _error(error.toString(), 400);
+      } on WorkspaceIoException catch (error) {
+        return _error(error.message, 404);
+      } catch (error) {
+        return _error('读取远端文件失败：$error', 500);
+      }
+    }
+    if (agent.sshConfig != null) {
+      return _error('该工作空间在远端（SSH）：核心未接入远端文件后端，请用 read 工具', 400);
+    }
+    final String root = rootFor(agent);
+    final String absolute;
+    try {
+      absolute = resolve(root, path);
+    } on FileServiceException catch (error) {
+      return _error(error.message, 400);
+    }
+    final File file = File(absolute);
+    if (!file.existsSync()) return _error('文件不存在：$path');
+    return <String, dynamic>{
+      'stream': file.openRead(),
+      'name': p.basename(absolute),
+      'size': file.lengthSync(),
+    };
+  }
+
   /// PDF 基本信息（总页数 / 标题 / 作者）。
   ///
   /// **页数是启发式的**：优先取页树 `/Count` 的最大值（根节点即总数），取不到
@@ -393,7 +470,22 @@ class FileService {
     }
     final File file = File(absolute);
     if (!file.existsSync()) return _error('文件不存在：$path');
-    return pdfInfoFromBytes(file.readAsBytesSync());
+    final int size = file.lengthSync();
+    if (size <= _pdfFullReadBytes) {
+      return pdfInfoFromBytes(file.readAsBytesSync());
+    }
+    // 大 PDF 只读头尾（M8c）：整读几百 MB 只为看页数/标题不值得
+    final RandomAccessFile raf = await file.open();
+    try {
+      final List<int> head = await raf.read(_pdfHeadBytes);
+      await raf.setPosition(size - _pdfTailBytes);
+      final List<int> tail = await raf.read(_pdfTailBytes);
+      return pdfInfoFromSlices(head, tail);
+    } on FileSystemException catch (error) {
+      return _error('读取 PDF 失败：$error', 500);
+    } finally {
+      await raf.close();
+    }
   }
 
   /// PDF 基本信息（总页数 / 标题 / 作者）——**页数是启发式的**。
@@ -425,6 +517,26 @@ class FileService {
       'pages_source': source,
     };
   }
+
+  /// 大 PDF 的启发式信息：只拿头尾两段解析（M8c）。
+  ///
+  /// 页数本来就是启发式（见 [pdfInfoFromBytes]），为它整读一个几百 MB 的文件
+  /// 不划算；头尾覆盖了线性化文件的 xref（头部）与多数文件的 trailer/Info（尾部）。
+  /// `scanned` 字段如实标注只扫了头尾，不假装修过整份文档。
+  static Map<String, dynamic> pdfInfoFromSlices(
+    List<int> head,
+    List<int> tail,
+  ) {
+    return <String, dynamic>{
+      ...pdfInfoFromBytes(<int>[...head, ...tail]),
+      'scanned': 'head+tail',
+    };
+  }
+
+  /// 小 PDF 直接整读；超过这个值就走头尾扫描。
+  static const int _pdfFullReadBytes = 4 * 1024 * 1024;
+  static const int _pdfHeadBytes = 64 * 1024;
+  static const int _pdfTailBytes = 512 * 1024;
 
   /// Git 提交历史（`GET /api/workspaces/{id}/git/log`）。
   Future<Map<String, dynamic>> gitLog(
@@ -517,12 +629,6 @@ class FileService {
       return _error('该工作空间在远端（SSH）：核心未接入远端文件后端', 400);
     }
     if (totalSize < 0) return _error('total_size 不能为负', 400);
-    if (totalSize > maxUploadBytes) {
-      return _error(
-        '文件过大（$fileName）：$totalSize 字节 > 上限 $maxUploadBytes 字节',
-        413,
-      );
-    }
     final String? name = _safeSegment(fileName);
     if (name == null) return _error('file_name 非法：$fileName', 400);
     final String? sub = _safeSubPath(relPath);
@@ -659,10 +765,8 @@ class FileService {
         if (remote == null) {
           throw StateError('远端文件后端不可用（连接可能已断开）');
         }
-        await remote.writeBytes(
-          session.relativePath,
-          await staged.readAsBytes(),
-        );
+        // 流式写：分片暂存文件边读边推给 SFTP，本机不再把整个文件读进内存（M8c）
+        await remote.writeStream(session.relativePath, staged.openRead());
       } else {
         final File target = File(session.absolutePath);
         await target.parent.create(recursive: true);
@@ -933,9 +1037,18 @@ class FileService {
       ...p.posix.split(rel),
     ]);
     await Directory(p.dirname(destination)).create(recursive: true);
-    final Uint8List data = await remote.readBytes(rel);
-    await File(destination).writeAsBytes(data, flush: true);
-    counters.add(data.length);
+    // 流式拷：一个文件一块一块地过，峰值内存与文件大小无关（M8c）
+    final IOSink sink = File(destination).openWrite();
+    int size = 0;
+    try {
+      await for (final List<int> chunk in remote.openRead(rel)) {
+        sink.add(chunk);
+        size += chunk.length;
+      }
+    } finally {
+      await sink.close();
+    }
+    counters.add(size);
   }
 
   /// 远端工作空间（或子树）→ 本机目录（`syncToLocal` 的 SSH 分支）。

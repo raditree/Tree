@@ -343,4 +343,56 @@ void main() {
       await expectLater(io.exec('   '), throwsA(isA<WorkspaceIoException>()));
     });
   });
+
+  group('工作空间文件流（M8c）', () {
+    Future<List<int>> collect(Stream<List<int>> stream) async {
+      final List<int> out = <int>[];
+      await for (final List<int> chunk in stream) {
+        out.addAll(chunk);
+      }
+      return out;
+    }
+
+    test('sizeOf / openRead / writeStream：可限长读、写流建父目录', () async {
+      final Directory streamRoot = Directory.systemTemp.createTempSync(
+        'tree_stream_',
+      );
+      addTearDown(() {
+        if (streamRoot.existsSync()) {
+          streamRoot.deleteSync(recursive: true);
+        }
+      });
+      final LocalWorkspaceIO streamIo = LocalWorkspaceIO(streamRoot.path);
+      final List<int> payload = List<int>.generate(1000, (int i) => i % 256);
+
+      await streamIo.writeStream(
+        'deep/out.bin',
+        Stream<List<int>>.value(payload),
+      );
+      expect(
+        File(p.join(streamRoot.path, 'deep', 'out.bin')).readAsBytesSync(),
+        payload,
+        reason: '流式写要自动建父目录且逐字节落盘',
+      );
+
+      expect(await streamIo.sizeOf('deep/out.bin'), payload.length);
+      expect(
+        await collect(streamIo.openRead('deep/out.bin', offset: 0, length: 10)),
+        payload.sublist(0, 10),
+      );
+      expect(
+        await collect(streamIo.openRead('deep/out.bin', offset: 990)),
+        payload.sublist(990),
+        reason: '只给 offset = 从该处读到结尾',
+      );
+      expect(
+        () => streamIo.sizeOf('missing.bin'),
+        throwsA(isA<WorkspaceIoException>()),
+      );
+      expect(
+        () => streamIo.openRead('../escape.bin'),
+        throwsA(isA<WorkspacePathException>()),
+      );
+    });
+  });
 }

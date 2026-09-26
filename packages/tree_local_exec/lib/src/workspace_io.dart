@@ -263,4 +263,23 @@ abstract interface class WorkspaceFiles {
 
   /// 写入原始字节（自动创建父目录）。
   Future<void> writeBytes(String relativePath, List<int> bytes);
+
+  /// 文件字节数（不存在抛 [WorkspaceIoException]）。
+  ///
+  /// M8c：大文件要**先问大小再决定读多少**——旧实现是"先读回整个文件，再拿
+  /// 长度去判上限"，对几百 MB 的 PDF 既费内存又白跑一趟。
+  Future<int> sizeOf(String relativePath);
+
+  /// 读取原始字节流（[offset] 起、最多 [length] 字节；null = 读到结尾）。
+  ///
+  /// **流式**是"单文件不设上限"的代价：调用方按块消费（HTTP 响应 / SFTP 写 /
+  /// 本地文件），不要在内存里攒整文件。
+  Stream<List<int>> openRead(
+    String relativePath, {
+    int offset = 0,
+    int? length,
+  });
+
+  /// 把字节流写入文件（自动创建父目录）。
+  Future<void> writeStream(String relativePath, Stream<List<int>> data);
 }

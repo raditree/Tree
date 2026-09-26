@@ -129,6 +129,40 @@ class _FakeRemote implements WorkspaceFiles {
     files[relativePath] = List<int>.of(bytes);
     writes.add(relativePath);
   }
+
+  @override
+  Future<int> sizeOf(String relativePath) async {
+    _guard(relativePath);
+    final List<int>? bytes = files[relativePath];
+    if (bytes == null) throw WorkspaceIoException('文件不存在：$relativePath');
+    return bytes.length;
+  }
+
+  @override
+  Stream<List<int>> openRead(
+    String relativePath, {
+    int offset = 0,
+    int? length,
+  }) async* {
+    _guard(relativePath);
+    final List<int>? bytes = files[relativePath];
+    if (bytes == null) throw WorkspaceIoException('文件不存在：$relativePath');
+    final int end = length == null
+        ? bytes.length
+        : (offset + length > bytes.length ? bytes.length : offset + length);
+    if (offset < end) yield bytes.sublist(offset, end);
+  }
+
+  @override
+  Future<void> writeStream(String relativePath, Stream<List<int>> data) async {
+    _guard(relativePath);
+    final BytesBuilder builder = BytesBuilder(copy: false);
+    await for (final List<int> chunk in data) {
+      builder.add(chunk);
+    }
+    files[relativePath] = builder.takeBytes();
+    writes.add(relativePath);
+  }
 }
 
 /// SSH 工作空间的文件面板 REST 面（M7g）：用内存远端后端验证分流与语义。
@@ -142,7 +176,7 @@ void main() {
   late CoreServer server;
   late _Client client;
 
-  Future<void> start({bool wireRemote = true}) async {
+  Future<void> start({bool wireRemote = true, int? maxContentBytes}) async {
     store = MemoryStore();
     agent = store.createAgent(name: '远端用例', modelId: 'demo');
     agent.sshConfig = const SshConfig(
@@ -170,6 +204,7 @@ void main() {
         store: store,
         defaultWorkspaceDir: (String _) => '/mnt/space/project',
         remoteFilesFor: wireRemote ? (String _) async => remote : null,
+        maxContentBytes: maxContentBytes ?? 8 * 1024 * 1024,
       ),
       enableHeartbeat: false,
       streamChunkDelay: Duration.zero,
@@ -307,6 +342,22 @@ void main() {
     expect(rel, startsWith('.input/'));
     expect(remote.writes, <String>[rel], reason: 'complete 时才写一次远端');
     expect(remote.files[rel], payload);
+  });
+
+  test('大文件预览：先问大小，只读预览段并标注截断（M8c）', () async {
+    await start(maxContentBytes: 16);
+    remote.seedBytes(
+      'sub/big.bin',
+      List<int>.generate(100, (int i) => i % 256),
+    );
+    final _Res res = await client.send(
+      'GET',
+      '/api/files/${ws()}/content?path=sub/big.bin',
+    );
+    expect(res.status, 200, reason: res.raw);
+    expect(res.json['truncated'], true);
+    expect(res.json['size'], 100);
+    expect(res.json['preview_bytes'], 16);
   });
 
   test('download_folder：远端子树拉回本地再打包，gzip 可解', () async {

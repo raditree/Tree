@@ -447,6 +447,38 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     await File(absolute).writeAsBytes(bytes, flush: true);
   }
 
+  @override
+  Future<int> sizeOf(String relativePath) async {
+    final File file = File(resolve(relativePath));
+    if (!await file.exists()) {
+      throw WorkspaceIoException('文件不存在：$relativePath');
+    }
+    return file.length();
+  }
+
+  @override
+  Stream<List<int>> openRead(
+    String relativePath, {
+    int offset = 0,
+    int? length,
+  }) {
+    // dart:io 的 openRead(start, end) 里 end 是**排他**上界；null 表示读到结尾
+    final int? end = length == null ? null : offset + length;
+    return File(resolve(relativePath)).openRead(offset, end);
+  }
+
+  @override
+  Future<void> writeStream(String relativePath, Stream<List<int>> data) async {
+    final File file = File(resolve(relativePath));
+    await file.parent.create(recursive: true);
+    final IOSink sink = file.openWrite();
+    try {
+      await sink.addStream(data);
+    } finally {
+      await sink.close();
+    }
+  }
+
   /// 目录在前，各自按名字（不区分大小写）排序——与前端文件树一致。
   static void _sortEntries(List<WorkspaceEntry> entries) {
     entries.sort((WorkspaceEntry a, WorkspaceEntry b) {

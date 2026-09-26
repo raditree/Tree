@@ -63,6 +63,36 @@ class DartSshTransport implements SshTransport {
 
   @override
   Future<List<int>> read(String absolutePath) async {
+    final BytesBuilder builder = BytesBuilder(copy: false);
+    await for (final List<int> chunk in readStream(absolutePath)) {
+      builder.add(chunk);
+    }
+    return builder.takeBytes();
+  }
+
+  @override
+  Future<void> write(String absolutePath, List<int> bytes) =>
+      writeStream(absolutePath, Stream<List<int>>.value(bytes));
+
+  /// 远端文件大小（M8c：大文件预览/下载先问大小，不再先整读再判上限）。
+  @override
+  Future<int> size(String absolutePath) async {
+    try {
+      final SftpFileAttrs attrs = await _sftp.stat(absolutePath);
+      return attrs.size ?? 0;
+    } catch (error) {
+      throw WorkspaceIoException('远端文件不存在或无法读取：$absolutePath');
+    }
+  }
+
+  /// 远端字节流：dartssh2 的 [SftpFile.read] 自带分块与乱序重排，
+  /// 这里**逐块 yield**，调用方（HTTP 响应 / 本地落盘）拿到一块处理一块。
+  @override
+  Stream<List<int>> readStream(
+    String absolutePath, {
+    int offset = 0,
+    int? length,
+  }) async* {
     final SftpFile file;
     try {
       file = await _sftp.open(absolutePath, mode: SftpFileOpenMode.read);
@@ -70,18 +100,15 @@ class DartSshTransport implements SshTransport {
       throw WorkspaceIoException('远端文件不存在或无法读取：$absolutePath');
     }
     try {
-      final List<int> out = <int>[];
-      await for (final Uint8List chunk in file.read()) {
-        out.addAll(chunk);
-      }
-      return out;
+      yield* file.read(offset: offset, length: length);
     } finally {
       await file.close();
     }
   }
 
+  /// 把字节流直接写进远端文件：SFTP 侧边收边写，本机不再把整个文件读进内存。
   @override
-  Future<void> write(String absolutePath, List<int> bytes) async {
+  Future<void> writeStream(String absolutePath, Stream<List<int>> data) async {
     final int slash = absolutePath.lastIndexOf('/');
     if (slash > 0) {
       await run('mkdir -p ${_quote(absolutePath.substring(0, slash))}');
@@ -94,7 +121,7 @@ class DartSshTransport implements SshTransport {
           SftpFileOpenMode.truncate,
     );
     try {
-      await file.write(Stream<Uint8List>.value(Uint8List.fromList(bytes))).done;
+      await file.write(data.map(Uint8List.fromList)).done;
     } finally {
       await file.close();
     }

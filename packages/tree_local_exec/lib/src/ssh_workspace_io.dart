@@ -19,6 +19,19 @@ abstract interface class SshTransport {
   /// 写入文件（自动建父目录）。
   Future<void> write(String absolutePath, List<int> bytes);
 
+  /// 文件字节数（不存在抛 [WorkspaceIoException]）。
+  Future<int> size(String absolutePath);
+
+  /// 读取字节流（[offset] 起、最多 [length] 字节；null = 读到结尾）。
+  Stream<List<int>> readStream(
+    String absolutePath, {
+    int offset = 0,
+    int? length,
+  });
+
+  /// 把字节流写入文件（自动建父目录）。
+  Future<void> writeStream(String absolutePath, Stream<List<int>> data);
+
   /// 递归列出目录下的**文件**相对路径（POSIX 分隔符）。
   Future<List<String>> listFiles(String absolutePath, {int maxDepth});
 
@@ -385,6 +398,40 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     final String absolute = resolve(relativePath);
     try {
       await _transport.write(absolute, bytes);
+    } on WorkspaceIoException {
+      rethrow;
+    } catch (error) {
+      throw WorkspaceIoException('写入失败（$relativePath）：$error');
+    }
+  }
+
+  @override
+  Future<int> sizeOf(String relativePath) async {
+    final String absolute = resolve(relativePath);
+    try {
+      return await _transport.size(absolute);
+    } on WorkspaceIoException {
+      rethrow;
+    } catch (error) {
+      throw WorkspaceIoException('读取失败（$relativePath）：$error');
+    }
+  }
+
+  @override
+  Stream<List<int>> openRead(
+    String relativePath, {
+    int offset = 0,
+    int? length,
+  }) {
+    final String absolute = resolve(relativePath);
+    return _transport.readStream(absolute, offset: offset, length: length);
+  }
+
+  @override
+  Future<void> writeStream(String relativePath, Stream<List<int>> data) async {
+    final String absolute = resolve(relativePath);
+    try {
+      await _transport.writeStream(absolute, data);
     } on WorkspaceIoException {
       rethrow;
     } catch (error) {

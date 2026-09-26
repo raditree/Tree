@@ -32,6 +32,36 @@ class FakeSshTransport implements SshTransport {
   }
 
   @override
+  Future<int> size(String absolutePath) async {
+    final List<int>? bytes = files[absolutePath];
+    if (bytes == null) throw StateError('no such file: $absolutePath');
+    return bytes.length;
+  }
+
+  @override
+  Stream<List<int>> readStream(
+    String absolutePath, {
+    int offset = 0,
+    int? length,
+  }) async* {
+    final List<int>? bytes = files[absolutePath];
+    if (bytes == null) throw StateError('no such file: $absolutePath');
+    final int end = length == null
+        ? bytes.length
+        : (offset + length > bytes.length ? bytes.length : offset + length);
+    if (offset < end) yield bytes.sublist(offset, end);
+  }
+
+  @override
+  Future<void> writeStream(String absolutePath, Stream<List<int>> data) async {
+    final List<int> out = <int>[];
+    await for (final List<int> chunk in data) {
+      out.addAll(chunk);
+    }
+    files[absolutePath] = out;
+  }
+
+  @override
   Future<List<String>> listFiles(
     String absolutePath, {
     int maxDepth = 2,
@@ -461,7 +491,11 @@ void main() {
       final List<String> names = entries
           .map((WorkspaceEntry e) => e.name)
           .toList();
-      expect(names.first, 'deep', reason: '目录在前（字母序里 deep < empty < a? 不，目录整体在前）');
+      expect(
+        names.first,
+        'deep',
+        reason: '目录在前（字母序里 deep < empty < a? 不，目录整体在前）',
+      );
       expect(names, containsAll(<String>['a.txt', 'deep', 'empty']));
       final WorkspaceEntry file = entries.firstWhere(
         (WorkspaceEntry e) => e.name == 'a.txt',
@@ -505,6 +539,28 @@ void main() {
         () => io.readBytes('missing.bin'),
         throwsA(isA<WorkspaceIoException>()),
       );
+    });
+
+    test('sizeOf / openRead / writeStream：流式读写与限长读（M8c）', () async {
+      t.seedBytes('/ws/big.bin', List<int>.generate(1000, (int i) => i % 256));
+      expect(await io.sizeOf('big.bin'), 1000);
+      expect(
+        await io
+            .openRead('big.bin', offset: 0, length: 4)
+            .expand((c) => c)
+            .toList(),
+        <int>[0, 1, 2, 3],
+      );
+      expect(
+        await io.openRead('big.bin', offset: 998).expand((c) => c).toList(),
+        <int>[998 % 256, 999 % 256],
+      );
+      await io.writeStream(
+        'out/deep/stream.bin',
+        Stream<List<int>>.value(<int>[7, 8, 9]),
+      );
+      expect(t.files['/ws/out/deep/stream.bin'], <int>[7, 8, 9]);
+      expect(() => io.sizeOf('../x'), throwsA(isA<WorkspacePathException>()));
     });
   });
 

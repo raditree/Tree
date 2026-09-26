@@ -68,6 +68,39 @@ Future<void> writeBytes(
   await response.close();
 }
 
+/// 以**流**写回（文件下载，M8c）：边读边发，核心内存占用与文件大小无关。
+///
+/// `length` 未知时不要设置 `contentLength`（用分块传输）；本地文件与远端 SFTP
+/// 都能给出大小，所以正常情况下仍按定长回包。
+Future<void> writeStream(
+  HttpRequest request,
+  int statusCode,
+  Stream<List<int>> data, {
+  String contentType = 'application/octet-stream',
+  String? filename,
+  int? length,
+}) async {
+  final HttpResponse response = request.response;
+  response.statusCode = statusCode;
+  response.headers.contentType = ContentType.parse(contentType);
+  if (length != null && length >= 0) {
+    response.headers.contentLength = length;
+  }
+  if (filename != null && filename.isNotEmpty) {
+    // 与 writeBytes 同一套 ASCII 回退 + RFC 5987 规则（中文名不再炸连接）
+    final String ascii = filename
+        .replaceAll(RegExp(r'[^\x20-\x7e]'), '_')
+        .replaceAll(RegExp(r'["\\]'), '_');
+    response.headers.set(
+      'content-disposition',
+      'attachment; filename="$ascii"; '
+          "filename*=UTF-8''${Uri.encodeComponent(filename)}",
+    );
+  }
+  await response.addStream(data);
+  await response.close();
+}
+
 /// 统一的错误响应体。
 Map<String, dynamic> errorBody(String message) => <String, dynamic>{
   'detail': message,
