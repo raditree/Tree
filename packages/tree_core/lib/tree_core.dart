@@ -32,6 +32,7 @@ export 'src/llm/llm_types.dart';
 export 'src/llm/openai_codec.dart';
 export 'src/llm/sse_parser.dart';
 export 'src/tool/builtin_tools.dart';
+export 'src/tool/todo_store.dart';
 export 'src/tool/tool_runner.dart';
 export 'src/tool/workspace_tool_runner.dart';
 export 'src/server/core_server.dart';

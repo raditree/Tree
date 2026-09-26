@@ -206,6 +206,143 @@ void main() {
     });
   });
 
+  group('set_todo_list', () {
+    test('未接入存储时不声明该工具（声明了没实现会让模型白调一轮）', () {
+      final List<String> bare = BuiltinTools.specs()
+          .map((ToolSpec s) => s.name)
+          .toList();
+      expect(bare, isNot(contains('set_todo_list')));
+      final List<String> withTodos = BuiltinTools.specs(withTodos: true)
+          .map((ToolSpec s) => s.name)
+          .toList();
+      expect(withTodos, contains('set_todo_list'));
+      expect(withTodos.length, bare.length + 1);
+    });
+
+    test('未传存储时执行该工具回可读错误', () async {
+      final ToolOutcome outcome = await BuiltinTools.run(
+        call('set_todo_list', <String, dynamic>{'action': 'get'}),
+        io,
+      );
+      expect(outcome.isError, isTrue);
+      expect(outcome.content, contains('待办存储未接入'));
+    });
+
+    test('set → update → get → clear 全链路，id 自动分配且返回清单', () async {
+      final MemoryTodoStore store = MemoryTodoStore();
+      Future<ToolOutcome> todo(Map<String, dynamic> args) => BuiltinTools.run(
+        call(BuiltinTools.setTodoList, args),
+        io,
+        todos: store,
+      );
+
+      final ToolOutcome setOutcome = await todo(<String, dynamic>{
+        'action': 'set',
+        'todos': <dynamic>[
+          <String, dynamic>{'content': '实现登录'},
+          <String, dynamic>{'content': '写测试', 'status': 'completed'},
+        ],
+      });
+      expect(setOutcome.isError, isFalse);
+      expect(setOutcome.content, contains('已设置 2 项'));
+      expect(setOutcome.content, contains('t1'));
+      expect(setOutcome.content, contains('已完成 1'));
+      expect(
+        store.read('agt_1', 'ses_1').map((TodoItem t) => t.id).toList(),
+        <String>['t1', 't2'],
+      );
+      expect(
+        store.read('agt_1', 'ses_1')[1].progress,
+        100,
+        reason: 'completed 未显式给进度时默认 100%',
+      );
+
+      final ToolOutcome updated = await todo(<String, dynamic>{
+        'action': 'update',
+        'todos': <dynamic>[
+          <String, dynamic>{
+            'id': 't1',
+            'status': 'in_progress',
+            'progress': '40',
+          },
+        ],
+      });
+      expect(updated.isError, isFalse);
+      expect(updated.content, contains('(in_progress 40%)'));
+      expect(store.read('agt_1', 'ses_1')[0].status, 'in_progress');
+      expect(
+        store.read('agt_1', 'ses_1')[0].content,
+        '实现登录',
+        reason: 'update 未给 content 时保留原文',
+      );
+
+      final ToolOutcome got = await todo(<String, dynamic>{'action': 'get'});
+      expect(got.content, contains('t2'));
+
+      final ToolOutcome cleared = await todo(<String, dynamic>{
+        'action': 'clear',
+      });
+      expect(cleared.content, contains('已清空'));
+      expect(store.read('agt_1', 'ses_1'), isEmpty);
+    });
+
+    test('错误路径：未知 action / set 空清单 / 缺 content / update 未知 id', () async {
+      final MemoryTodoStore store = MemoryTodoStore();
+      Future<ToolOutcome> todo(Map<String, dynamic> args) => BuiltinTools.run(
+        call(BuiltinTools.setTodoList, args),
+        io,
+        todos: store,
+      );
+
+      final ToolOutcome badAction = await todo(<String, dynamic>{
+        'action': 'boom',
+      });
+      expect(badAction.isError, isTrue);
+      expect(badAction.content, contains('未知 action'));
+
+      final ToolOutcome emptySet = await todo(<String, dynamic>{
+        'action': 'set',
+      });
+      expect(emptySet.isError, isTrue);
+      expect(emptySet.content, contains('action=clear'));
+
+      final ToolOutcome noContent = await todo(<String, dynamic>{
+        'action': 'set',
+        'todos': <dynamic>[
+          <String, dynamic>{'content': 'ok'},
+          <String, dynamic>{'content': '   '},
+        ],
+      });
+      expect(noContent.isError, isTrue);
+      expect(noContent.content, contains('第 2 项缺少 content'));
+
+      await todo(<String, dynamic>{
+        'action': 'set',
+        'todos': <dynamic>[
+          <String, dynamic>{'content': '唯一'},
+        ],
+      });
+      final ToolOutcome unknownId = await todo(<String, dynamic>{
+        'action': 'update',
+        'todos': <dynamic>[
+          <String, dynamic>{'id': 'zzz', 'status': 'blocked'},
+        ],
+      });
+      expect(unknownId.isError, isTrue);
+      expect(unknownId.content, contains('未知待办 id'));
+      expect(unknownId.content, contains('t1'), reason: '错误里要列出可用 id');
+
+      final ToolOutcome missingId = await todo(<String, dynamic>{
+        'action': 'update',
+        'todos': <dynamic>[
+          <String, dynamic>{'status': 'completed'},
+        ],
+      });
+      expect(missingId.isError, isTrue);
+      expect(missingId.content, contains('必须带 id'));
+    });
+  });
+
   group('WorkspaceToolRunner', () {
     test('按需创建工作空间目录并复用同一实例', () async {
       final String dir = p.join(root.path, 'ws', 'agt_1');

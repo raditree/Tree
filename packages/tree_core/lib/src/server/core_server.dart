@@ -10,6 +10,7 @@ import '../agent/scripted_agent.dart';
 import '../settings/core_settings.dart';
 import '../store/memory_store.dart';
 import '../store/tree_store.dart';
+import '../tool/todo_store.dart';
 import '../util/token.dart';
 import '../version.dart';
 import '../ws/inbound_frames.dart';
@@ -38,6 +39,7 @@ class CoreServer {
     required this.token,
     required this.store,
     required this.settings,
+    required this.todoStore,
     required this.hub,
     required this.conversation,
     required this.router,
@@ -89,6 +91,9 @@ class CoreServer {
 
   /// 设置与模型池。
   final CoreSettings settings;
+
+  /// 会话待办（`GET /api/agents/{id}/todos` 与 `set_todo_list` 工具共用同一份）。
+  final TodoStore todoStore;
 
   /// WS 连接注册表与广播。
   final WsHub hub;
@@ -154,6 +159,7 @@ class CoreServer {
     Duration heartbeatInterval = const Duration(seconds: 30),
     TreeStore? store,
     CoreSettings? settings,
+    TodoStore? todoStore,
     AgentEngine? engine,
   }) async {
     final HttpServer http = await HttpServer.bind(
@@ -164,6 +170,7 @@ class CoreServer {
     final int currentPid = pid;
     final TreeStore resolvedStore = store ?? MemoryStore();
     final CoreSettings resolvedSettings = settings ?? CoreSettings();
+    final TodoStore resolvedTodos = todoStore ?? MemoryTodoStore();
     final WsHub hub = WsHub();
     final CoreServer server = CoreServer._(
       http,
@@ -171,6 +178,7 @@ class CoreServer {
       token: token ?? CoreToken.generate(),
       store: resolvedStore,
       settings: resolvedSettings,
+      todoStore: resolvedTodos,
       hub: hub,
       conversation: ConversationService(
         store: resolvedStore,
@@ -532,11 +540,24 @@ class CoreServer {
     });
   }
 
-  Future<void> _agentTodos(HttpRequest request, Map<String, String> _) async {
-    // todo 列表由工具循环产出（M4/M5）；M1 恒为空集
+  Future<void> _agentTodos(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final String agentId = params['agentId'] ?? '';
+    final String sessionId =
+        request.uri.queryParameters['session_id'] ?? TreeStore.defaultSessionId;
+    if (store.agent(agentId) == null) {
+      await writeJson(request, 404, errorBody('agent 不存在'));
+      return;
+    }
+    // 待办由 set_todo_list 工具写入（落 <会话目录>/todos.md），此处读同一份数据
     await writeJson(request, 200, <String, dynamic>{
-      'todos': <Map<String, dynamic>>[],
-      'session_id': request.uri.queryParameters['session_id'] ?? '',
+      'todos': todoStore
+          .read(agentId, sessionId)
+          .map((TodoItem todo) => todo.toApiJson())
+          .toList(),
+      'session_id': sessionId,
     });
   }
 

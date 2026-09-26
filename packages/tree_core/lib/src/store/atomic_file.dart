@@ -37,6 +37,25 @@ abstract final class AtomicFile {
     }
   }
 
+  /// [writeStringAtomic] 的同步版本（小文件 + 同步读 API 的场景，如会话待办）。
+  ///
+  /// 为什么同步：待办只有几十字节、写入频率是"用户级别"的交互，而读取入口同时
+  /// 被 HTTP 处理器与工具调用使用（两者都是同步接口）。用同步写换来"写完即可读"
+  /// 的确定语义，比引入 write-behind + flush 更简单也更少出错。
+  static void writeStringAtomicSync(String path, String content) {
+    final File target = File(path);
+    target.parent.createSync(recursive: true);
+    final String tempPath = '$path.tmp';
+    final File temp = File(tempPath);
+    temp.writeAsStringSync(content, flush: true);
+    try {
+      temp.renameSync(path);
+    } on FileSystemException {
+      if (target.existsSync()) target.deleteSync();
+      temp.renameSync(path);
+    }
+  }
+
   /// 追加一行（自动补 `\n` 并创建父目录）。
   static Future<void> appendLine(String path, String line) async {
     final File file = File(path);

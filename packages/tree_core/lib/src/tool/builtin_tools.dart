@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:tree_local_exec/tree_local_exec.dart';
 
+import 'todo_store.dart';
 import 'tool_runner.dart';
 
 /// 内置工具集（M4 交付**工作空间类** 5 个：read / write / edit / grep / terminal）。
@@ -19,9 +20,57 @@ abstract final class BuiltinTools {
   static const String edit = 'edit';
   static const String grep = 'grep';
   static const String terminal = 'terminal';
+  static const String setTodoList = 'set_todo_list';
 
   /// 工具声明（顺序稳定：便于提示词缓存与测试断言）。
-  static List<ToolSpec> specs() => <ToolSpec>[
+  ///
+  /// [withTodos] 为 true 时才声明 `set_todo_list`：声明了但没接存储会让模型白调
+  /// 一轮（与"未实现的工具不声明"同一原则）。
+  static List<ToolSpec> specs({bool withTodos = false}) => <ToolSpec>[
+    if (withTodos)
+      ToolSpec(
+        name: setTodoList,
+        description:
+            '把任务拆成可跟踪的待办清单并持续汇报进度。action=set 整体替换'
+            '（返回带 id 的清单）、update 按 id 增量更新、clear 清空、get 读取。'
+            '每完成/推进一项就立即 update，不要攒到全部完成才标注。',
+        parameters: <String, dynamic>{
+          'type': 'object',
+          'properties': <String, dynamic>{
+            'action': <String, dynamic>{
+              'type': 'string',
+              'enum': <String>['set', 'update', 'clear', 'get'],
+            },
+            'todos': <String, dynamic>{
+              'type': 'array',
+              'description':
+                  'action=set/update 时必填；set 时 content 必填，'
+                  'update 时 id 必填',
+              'items': <String, dynamic>{
+                'type': 'object',
+                'properties': <String, dynamic>{
+                  'id': <String, dynamic>{'type': 'string'},
+                  'content': <String, dynamic>{'type': 'string'},
+                  'status': <String, dynamic>{
+                    'type': 'string',
+                    'enum': <String>[
+                      'pending',
+                      'in_progress',
+                      'completed',
+                      'blocked',
+                    ],
+                  },
+                  'progress': <String, dynamic>{
+                    'type': 'integer',
+                    'description': '0~100',
+                  },
+                },
+              },
+            },
+          },
+          'required': <String>['action'],
+        },
+      ),
     ToolSpec(
       name: read,
       description:
@@ -148,9 +197,15 @@ abstract final class BuiltinTools {
     ToolInvocation invocation,
     WorkspaceIO io, {
     bool Function()? isCancelled,
+    TodoStore? todos,
   }) async {
     try {
       switch (invocation.name) {
+        case setTodoList:
+          if (todos == null) {
+            return const ToolOutcome('待办存储未接入：无法使用该工具', isError: true);
+          }
+          return await _setTodoList(invocation, todos);
         case read:
           return await _read(invocation, io);
         case write:
@@ -324,6 +379,137 @@ abstract final class BuiltinTools {
       );
     }
     return ToolOutcome(buffer.toString().trimRight(), isError: !outcome.ok);
+  }
+
+  /// `set_todo_list`：四个动作全部落盘并回显当前清单（模型要能看到状态）。
+  static Future<ToolOutcome> _setTodoList(
+    ToolInvocation invocation,
+    TodoStore store,
+  ) async {
+    final String action = _string(invocation, 'action').trim().toLowerCase();
+    final List<TodoItem> current = store.read(
+      invocation.agentId,
+      invocation.sessionId,
+    );
+    final List<Map<String, dynamic>> items = _mapList(invocation, 'todos');
+    switch (action) {
+      case 'get':
+        return ToolOutcome(renderTodos(current));
+      case 'clear':
+        store.write(invocation.agentId, invocation.sessionId, <TodoItem>[]);
+        return const ToolOutcome('已清空待办。\n（暂无待办）');
+      case 'set':
+        if (items.isEmpty) {
+          return const ToolOutcome(
+            'action=set 需要非空的 todos（要清空请用 action=clear）',
+            isError: true,
+          );
+        }
+        final List<TodoItem> next = <TodoItem>[];
+        for (int i = 0; i < items.length; i++) {
+          final Map<String, dynamic> raw = items[i];
+          final String content = _rawString(raw, 'content').trim();
+          if (content.isEmpty) {
+            return ToolOutcome('第 ${i + 1} 项缺少 content', isError: true);
+          }
+          final String id = _rawString(raw, 'id').trim();
+          final String status = TodoItem.normalizeStatus(
+            _rawString(raw, 'status').isEmpty
+                ? 'pending'
+                : _rawString(raw, 'status'),
+          );
+          final int progress = _rawProgress(raw, status);
+          next.add(
+            TodoItem(
+              id: id.isEmpty ? 't${i + 1}' : id,
+              content: content,
+              status: status,
+              progress: progress,
+              updatedAt: DateTime.now().millisecondsSinceEpoch,
+            ),
+          );
+        }
+        store.write(invocation.agentId, invocation.sessionId, next);
+        return ToolOutcome('已设置 ${next.length} 项。\n${renderTodos(next)}');
+      case 'update':
+        if (items.isEmpty) {
+          return const ToolOutcome('action=update 需要非空的 todos', isError: true);
+        }
+        final Map<String, TodoItem> byId = <String, TodoItem>{
+          for (final TodoItem todo in current) todo.id: todo,
+        };
+        for (final Map<String, dynamic> raw in items) {
+          final String id = _rawString(raw, 'id').trim();
+          if (id.isEmpty) {
+            return const ToolOutcome(
+              'action=update 的每一项都必须带 id（先用 action=get 取清单）',
+              isError: true,
+            );
+          }
+          final TodoItem? existing = byId[id];
+          if (existing == null) {
+            return ToolOutcome(
+              '未知待办 id：$id（现有：${byId.keys.join('、')}）',
+              isError: true,
+            );
+          }
+          final String status = _rawString(raw, 'status').isEmpty
+              ? existing.status
+              : TodoItem.normalizeStatus(_rawString(raw, 'status'));
+          final String content = _rawString(raw, 'content').trim();
+          byId[id] = existing.copyWith(
+            content: content.isEmpty ? null : content,
+            status: status,
+            progress: _rawProgress(raw, status, fallback: existing.progress),
+          );
+        }
+        final List<TodoItem> merged = <TodoItem>[
+          for (final TodoItem todo in current) byId[todo.id]!,
+        ];
+        store.write(invocation.agentId, invocation.sessionId, merged);
+        return ToolOutcome('已更新。\n${renderTodos(merged)}');
+      default:
+        return ToolOutcome(
+          '未知 action：$action（可用：set / update / clear / get）',
+          isError: true,
+        );
+    }
+  }
+
+  /// 读取单项里的 status/progress；`completed` 未显式给进度时视为 100%。
+  static int _rawProgress(
+    Map<String, dynamic> raw,
+    String status, {
+    int fallback = 0,
+  }) {
+    final Object? value = raw['progress'];
+    if (value is num) return TodoItem.clampProgress(value.toInt());
+    if (value is String && value.trim().isNotEmpty) {
+      return TodoItem.clampProgress(int.tryParse(value.trim()) ?? fallback);
+    }
+    if (status == 'completed') return 100;
+    return fallback;
+  }
+
+  static String _rawString(Map<String, dynamic> raw, String key) {
+    final Object? value = raw[key];
+    if (value == null) return '';
+    return '$value';
+  }
+
+  static List<Map<String, dynamic>> _mapList(
+    ToolInvocation invocation,
+    String key,
+  ) {
+    final Object? value = invocation.arguments[key];
+    if (value is! List) return const <Map<String, dynamic>>[];
+    final List<Map<String, dynamic>> out = <Map<String, dynamic>>[];
+    for (final Object? item in value) {
+      if (item is Map) {
+        out.add(item.map((dynamic k, dynamic v) => MapEntry('$k', v)));
+      }
+    }
+    return out;
   }
 
   // ── 参数读取（模型给的参数不可信，一律宽容处理） ──────────────────────

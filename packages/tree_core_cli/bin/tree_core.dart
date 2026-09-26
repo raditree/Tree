@@ -58,7 +58,9 @@ Future<void> main(List<String> args) async {
   // 因此"换模型/改密钥"只需改配置文件，不必改代码。
   // 工具执行器：工作空间目录取 agent 配置里的 workspace_dir，未配置则落到
   // <数据根>/workspaces/<agent_id>（首次使用时自动创建）。
+  final FileTodoStore todos = FileTodoStore(paths);
   final WorkspaceToolRunner tools = WorkspaceToolRunner(
+    todoStore: todos,
     resolveWorkspaceDir: (String agentId) {
       final String configured = store.agent(agentId)?.workspaceDir ?? '';
       return configured.trim().isNotEmpty
@@ -79,6 +81,7 @@ Future<void> main(List<String> args) async {
     enableHeartbeat: enableHeartbeat,
     store: store,
     settings: settings,
+    todoStore: todos,
     engine: engine,
   );
   if (verbose) {

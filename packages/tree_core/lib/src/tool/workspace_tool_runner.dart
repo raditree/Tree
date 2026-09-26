@@ -4,6 +4,7 @@ import 'package:path/path.dart' as p;
 import 'package:tree_local_exec/tree_local_exec.dart';
 
 import 'builtin_tools.dart';
+import 'todo_store.dart';
 import 'tool_runner.dart';
 
 /// 按 agent 解析其工作空间目录（绝对路径）。
@@ -20,6 +21,7 @@ class WorkspaceToolRunner implements ToolRunner {
   WorkspaceToolRunner({
     required this.resolveWorkspaceDir,
     this.maxResultChars = 24000,
+    this.todoStore,
     WorkspaceIO Function(String dir)? ioFactory,
     this.log,
   }) : _ioFactory = ioFactory ?? LocalWorkspaceIO.new;
@@ -29,6 +31,9 @@ class WorkspaceToolRunner implements ToolRunner {
 
   /// 单条工具结果的字符上限。
   final int maxResultChars;
+
+  /// 待办存储（为 null 时不声明 `set_todo_list`）。
+  final TodoStore? todoStore;
 
   final WorkspaceIO Function(String dir) _ioFactory;
 
@@ -45,7 +50,7 @@ class WorkspaceToolRunner implements ToolRunner {
   List<ToolSpec> specsFor({
     required String agentId,
     required String sessionId,
-  }) => BuiltinTools.specs();
+  }) => BuiltinTools.specs(withTodos: todoStore != null);
 
   @override
   Future<ToolOutcome> run(
@@ -63,6 +68,7 @@ class WorkspaceToolRunner implements ToolRunner {
       invocation,
       io,
       isCancelled: isCancelled,
+      todos: todoStore,
     );
     return _truncate(outcome);
   }
