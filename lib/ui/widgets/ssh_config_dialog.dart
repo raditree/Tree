@@ -7,9 +7,10 @@ import '../../io/ssh_connection_manager.dart';
 /// SSH 连接配置表单对话框。
 ///
 /// 字段：主机 / 端口 / 用户名 / 认证方式（密码或私钥）/ 密码或私钥路径 /
-/// 远端基础目录 / 是否在本机记住密码。确认后以 ``Map<String, dynamic>`` 返回：
-/// ``{host, port, username, auth_type, password, private_key_path,
-/// remote_base_dir, persist_password}``。
+/// 远端根目录 / 是否在本机记住密码。确认后以 ``Map<String, dynamic>`` 返回：
+/// ``{host, port, username, auth_type, password, key_path, root,
+/// persist_password}``（M8a 起键名与核心 `SshConfig.parse` 对齐；历史键名
+/// `private_key_path` / `remote_base_dir` 仍被核心解析器兼容）。
 ///
 /// 凭据可用环境变量提供（表单留空时兜底，见 `SshConnectionManager`）：
 /// ``TREE_SSH_PASSWORD`` / ``TREE_SSH_PRIVATE_KEY`` / ``TREE_SSH_HOST`` /
@@ -30,8 +31,8 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
   final TextEditingController _usernameController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
   final TextEditingController _keyPathController = TextEditingController();
-  final TextEditingController _remoteDirController =
-      TextEditingController(text: '/');
+  /// 远端工作空间根。留空 = 远端登录用户的 HOME（推荐，见 M8a 的软约束口径）。
+  final TextEditingController _remoteDirController = TextEditingController();
 
   /// 认证方式：'password' | 'key'
   String _authType = 'password';
@@ -56,9 +57,13 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
       _authType = (cfg['auth_type'] as String?) ?? 'password';
       // 密码不预填（默认不落盘；即便落盘过也不回显，避免明文在界面上暴露）
       _persistPassword = cfg['persist_password'] == true;
-      _keyPathController.text = (cfg['private_key_path'] as String?) ?? '';
-      final String remoteDir = (cfg['remote_base_dir'] as String?) ?? '';
-      _remoteDirController.text = remoteDir.isNotEmpty ? remoteDir : '/';
+      // 键名与核心 `SshConfig.parse` 对齐（key_path / root），并兼容历史键名
+      _keyPathController.text =
+          (cfg['key_path'] as String?) ??
+          (cfg['private_key_path'] as String?) ??
+          '';
+      _remoteDirController.text =
+          (cfg['root'] as String?) ?? (cfg['remote_base_dir'] as String?) ?? '';
     } else if (_hasEnvKey && !_hasEnvPassword) {
       // 仅提供了私钥环境变量：默认切到私钥认证，减少一次手工选择
       _authType = 'key';
@@ -121,11 +126,10 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
       'username': _usernameController.text.trim(),
       'auth_type': _authType,
       'password': password,
-      'private_key_path':
-          _authType == 'key' ? _keyPathController.text.trim() : '',
-      'remote_base_dir': _remoteDirController.text.trim().isEmpty
-          ? '/'
-          : _remoteDirController.text.trim(),
+      // 键名与核心 `SshConfig.parse` 对齐：key_path / root（历史键名也已被解析器认下）
+      'key_path': _authType == 'key' ? _keyPathController.text.trim() : '',
+      'root': _remoteDirController.text.trim(),
+      'remote_base_dir': _remoteDirController.text.trim(),
       // 是否把密码明文写入本机存储（默认否；密码来自环境变量时无意义）
       'persist_password': _persistPassword,
     });
@@ -272,9 +276,9 @@ class _SshConfigDialogState extends State<SshConfigDialog> {
               TextField(
                 controller: _remoteDirController,
                 decoration: const InputDecoration(
-                  labelText: '远端基础目录',
-                  hintText: '/',
-                  helperText: '成员与顶部 agent 共用此目录；各 agent 私人记忆在 agentspace/{id}/.self 下',
+                  labelText: '远端根目录',
+                  hintText: '留空 = 远端用户 HOME（推荐）',
+                  helperText: '根不做收窄：数据文件与项目文件可分处其下不同子目录',
                   prefixIcon: Icon(Icons.folder_outlined, size: 20),
                                     isDense: true,
                 ),

@@ -28,6 +28,7 @@ export 'src/agent/compaction_service.dart';
 export 'src/agent/conversation_service.dart';
 export 'src/agent/question_broker.dart';
 export 'src/agent/question_store.dart';
+export 'src/agent/workspace_prompt.dart';
 export 'src/team/message_dispatcher.dart';
 export 'src/team/team_model.dart';
 export 'src/team/team_service.dart';

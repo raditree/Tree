@@ -77,6 +77,40 @@ void main() {
         hasLength(1),
       );
     });
+
+    test('前端配置弹窗的历史键名（private_key_path / remote_base_dir）也被认下', () {
+      // M8a：弹窗曾写 private_key_path / remote_base_dir，而核心只读 key_path /
+      // root，结果是"私钥被静默丢弃、远端根永远落回 HOME"。别名在这里锁死防回归。
+      final SshConfig? fromDialog = SshConfig.parse(<String, dynamic>{
+        'host': '192.168.0.208',
+        'port': '22',
+        'username': 'open',
+        'auth_type': 'key',
+        'private_key_path': '/home/me/.ssh/id_ed25519',
+        'remote_base_dir': '',
+      });
+      expect(fromDialog?.keyPath, '/home/me/.ssh/id_ed25519');
+      expect(fromDialog?.isComplete, isTrue, reason: '有私钥即可建连');
+      expect(fromDialog?.root, isEmpty, reason: '留空 = 远端登录用户 HOME，不收窄');
+
+      expect(
+        SshConfig.parse(<String, dynamic>{
+          'host': 'h',
+          'key_path': 'k',
+          'remote_base_dir': '/mnt/space',
+        })?.root,
+        '/mnt/space',
+      );
+      // 原生键名优先于历史键名
+      expect(
+        SshConfig.parse(<String, dynamic>{
+          'host': 'h',
+          'private_key_path': 'legacy',
+          'key_path': 'native',
+        })?.keyPath,
+        'native',
+      );
+    });
   });
 
   group('凭据不外泄', () {

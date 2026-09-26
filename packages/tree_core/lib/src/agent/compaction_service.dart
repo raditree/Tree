@@ -4,6 +4,7 @@ import 'dart:math';
 import '../settings/core_settings.dart';
 import '../store/tree_store.dart';
 import '../util/tokens.dart';
+import 'workspace_prompt.dart';
 
 /// 上下文压缩（M7d-4）。
 ///
@@ -139,7 +140,7 @@ class CompactionService {
     final List<CoreMessage> all = store.messages(agent.id, session.sessionId);
     final int frozen = session.compactedMessageCount.clamp(0, all.length);
     int total =
-        estimateTokens(agent.systemPrompt) +
+        estimateTokens(systemPromptWithWorkspace(agent)) +
         estimateTokens(session.compactedSummary);
     for (final CoreMessage message in all.sublist(frozen)) {
       total += _messageTokens(message);

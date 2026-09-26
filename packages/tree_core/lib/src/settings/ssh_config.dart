@@ -35,10 +35,24 @@ class SshConfig {
       port: _port(map['port']),
       username: (map['username'] ?? map['user'] ?? '').toString().trim(),
       password: (map['password'] ?? '').toString(),
-      keyPath: (map['key_path'] ?? map['keyPath'] ?? '').toString().trim(),
+      // `private_key_path` 是前端 SSH 配置弹窗（历史键名）写的，必须一并认，
+      // 否则 UI 里填的私钥会被静默丢弃、核心以“缺凭据”拒绝连接。
+      keyPath: (map['key_path'] ??
+              map['keyPath'] ??
+              map['private_key_path'] ??
+              map['privateKeyPath'] ??
+              '')
+          .toString()
+          .trim(),
       keyPassphrase: (map['key_passphrase'] ?? map['keyPassphrase'] ?? '')
           .toString(),
-      root: (map['root'] ?? map['remote_root'] ?? map['dir'] ?? '')
+      // `remote_base_dir` 同上：前端弹窗的历史键名。留空 = 远端登录用户 HOME。
+      root: (map['root'] ??
+              map['remote_root'] ??
+              map['remoteRoot'] ??
+              map['dir'] ??
+              map['remote_base_dir'] ??
+              '')
           .toString()
           .trim(),
     );
@@ -54,6 +68,9 @@ class SshConfig {
   final String keyPassphrase;
 
   /// 远端工作空间根目录（空 = 远端登录用户的 HOME）。
+  ///
+  /// **根不收窄**（M8a）：真实用法里数据文件与项目文件常分处根下不同子目录，
+  /// 因此这里不要求用户填某个项目子目录；`~`/相对路径都相对远端 HOME 展开。
   ///
   /// 绝不直接用字符串拼命令：`~` 与相对路径要先问远端 `$HOME` 再展开
   /// （见 tree_local_exec 的 `resolveRemoteRoot`），SFTP 自己不会展开。

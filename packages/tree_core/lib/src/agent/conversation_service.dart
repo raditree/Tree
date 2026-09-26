@@ -11,6 +11,7 @@ import 'agent_engine.dart';
 import 'compaction_service.dart';
 import 'question_broker.dart';
 import 'scripted_agent.dart';
+import 'workspace_prompt.dart';
 
 /// 一次生成任务的取消令牌。
 class _RunToken {
@@ -330,7 +331,7 @@ class ConversationService {
       agentId: agent.id,
       sessionId: effective.sessionId,
       modelId: agent.modelId,
-      systemPrompt: agent.systemPrompt,
+      systemPrompt: systemPromptWithWorkspace(agent),
       userContent: userContent,
       contextSummary: effective.compactedSummary,
       compactedMessageCount: effective.compactedMessageCount,

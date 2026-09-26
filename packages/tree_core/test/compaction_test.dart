@@ -311,14 +311,14 @@ void main() {
       expect(service.thresholdFor(agent), 0.8, reason: '0 = 未覆盖，用默认值');
     });
 
-    test('估算口径 = 系统提示词 + 摘要 + 未压缩历史', () async {
+    test('估算口径 = 系统提示词（含工作空间软约束）+ 摘要 + 未压缩历史', () async {
       addTurn('一');
       addTurn('二');
       addTurn('三');
       await service.compact(agent.id, session.sessionId);
       final CoreSession after = store.session(agent.id, session.sessionId)!;
       final int expected =
-          estimateTokens(agent.systemPrompt) +
+          estimateTokens(systemPromptWithWorkspace(agent)) +
           estimateTokens(after.compactedSummary) +
           store
               .messages(agent.id, session.sessionId)

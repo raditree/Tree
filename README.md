@@ -166,6 +166,7 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 - **M7e**：PDF 预览改成**前端渲染**（方案②）——核心只提供 PDF 字节（`/download`），光栅化交给 Flutter 插件 pdfrx（内置 pdfium）：`PdfPreview` 组件替掉旧的"核心逐页渲染成 PNG + 自绘翻页栏"，滚动/缩放/翻页/选中复制都由插件处理。删掉 `pdf_preview` 接口与前端的 `getPdfPreview`，核心的 501 桩集合因此**清空**（覆盖度测试也改成断言"空集合"，别让桩悄悄长回来）；打包脚本新增 native assets 拷贝（否则发布包缺 `pdfium.dll`）
 - **M7g**：SSH 远端文件面板——`SshTransport` 增加 SFTP 一层目录列举（名字/类型/大小/mtime），`WorkspaceFiles`（列目录 / 读字节 / 写字节）由 `LocalWorkspaceIO` 与 `SshWorkspaceIO` 各自实现，`FileService` 按 agent 是否配 `ssh:` 分流：list/content/download/pdf_info 读远端字节，分片上传仍是「本地暂存 → complete 时一次 SFTP 写」，`download_folder` 先把子树拉回本地临时目录再本地 tar 打包（远端不一定有 tar，且二进制过 `exec` 会被当文本解码），`syncToLocal` 补上**条数 + 字节双上限**（真机验收在巨大远端根上被拖到超时，光有条数限制挡不住）。真机验收：`open@192.168.0.208:22`（密钥 `~/.ssh/id_ed25519`），`TREE_SSH_TEST_HOST` 门控测试跑通全链路
 - **M7f**：Windows 打包与安装——`tool/package_windows.dart` 一条命令出便携 zip（构建应用 + 用同一 SDK 编译核心到同目录 + 写首次运行说明 + 启动核心读握手自检 + bsdtar 压缩），`tool/installer/tree-desktop.iss` 提供 Inno Setup 安装包（卸载保留 `%APPDATA%\Tree` 用户数据）
+- **M8a**：工作空间根口径与**软约束**——SSH 的根不收窄（`ssh.root` 留空 = 远端登录用户的 `HOME`，`~`/相对路径按远端 HOME 展开），文件面板与工具层同根；系统提示词在运行时追加「工作空间（软约束）」一段（数据/项目文件可能分处根下不同子目录、不得自行收窄），**不落库**且与压缩估算共用同一函数（否则阈值会失真）。顺带修掉前端 SSH 配置弹窗与核心 `SshConfig.parse` 的键名错位（弹窗写 `private_key_path` / `remote_base_dir`，核心只读 `key_path` / `root`，此前私钥会被静默丢弃、远端根永远落回 HOME），弹窗默认值也从 `/` 改为留空
 - **M7（剩余）**：
   - 远端 Git 面板（`gitLog`/`gitBranches` 目前对 SSH 仍返回可读 400：需要经 `exec` 跑 git 再解析输出）；SSH 连接的断线重连策略调优
 
@@ -260,7 +261,8 @@ Windows 上是 `%APPDATA%\Tree`；`TREE_HOME` 环境变量或 `--data-dir` 可�
 ## 常见问题
 
 - **核心进程没起来**：检查 `TREE_CORE_URL` / `TREE_CORE_TOKEN` 是否指向手工启动的 `tree_core --verbose`；发行版布局下 `tree_core.exe` 应与 `Tree.exe` 同目录。
-- **SSH 连不上**：连接由**核心**发起，地址需从本机可达；检查 `agents/<id>.yaml` 的 `ssh:` 段（`root` 为空 = 远端登录用户的 HOME）。文件面板对 SSH 的「工作空间根」就是这里的 `root`，`workspace_dir` 只对本地工作空间生效。
+- **SSH 连不上**：连接由**核心**发起，地址需从本机可达；检查 `agents/<id>.yaml` 的 `ssh:` 段。文件面板与工具层的「工作空间根」就是这里的 `root`（`workspace_dir` 只对本地工作空间生效）。
+- **SSH 的根填哪一级**（M8a）：**不收窄**——`root` 留空就是远端登录用户的 `HOME`。数据文件与项目文件常常分处根下不同子目录（例如 `~/data` 与 `~/proj`），所以根保留在用户给的那一级，由系统提示词里的「工作空间（软约束）」说明“布局是混合的、按用户指示定位”，而不是要求你把根改到某个项目子目录。SSH 配置弹窗的「远端根目录」留空即 HOME（历史键名 `private_key_path` / `remote_base_dir` 仍被核心解析器兼容）。
 - **插件 / MCP 没生效**：看对应 yaml 的 `command` 是否可执行；`GET /api/plugin/snapshot` 与 `GET /api/mcp/services` 会给出 `disabled_reason` / `errors`。坏服务只影响自己。
 - **模型不可用**：`~/.tree/config/models/<id>.yaml` 的 `base_url` / `api_key`，以及 agent 的 `model_id` 是否指向它。
 - **改配置何时生效**：`agents/*.yaml` 与 `config/*.yaml` 在核心启动时读取；MCP / 插件也可经 REST 即时注册。
