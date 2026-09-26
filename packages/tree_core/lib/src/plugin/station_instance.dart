@@ -33,7 +33,10 @@ sealed class StationInstance {
   /// 站点 id（**含 scope 归属**：同一类型在每个 team×mode 上是不同实例）。
   final String id;
 
-  /// 展示说明（人可读；会出现在前端「处理站」面板）。
+  /// 展示说明（人可读；会出现在前端「站点」面板）。
+  ///
+  /// 命名变更（M9）：旧文档里的「处理站」= 现在的**中转站**；此外还有
+  /// 广播站、执行站、收集站，面板按 kind 分组显示。
   final String description;
 
   /// scope 绑定（站点实例归属的四元组；消息必须与它相容才投递）。

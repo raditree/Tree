@@ -252,8 +252,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       _currentSessionId = sessionId;
       _navigateMessageId = messageId;
       _navigateTrigger++;
-      // 切 team 即切插件槽位作用域（Q12）
-      _setTeamScope(targetAgent.id);
+      // 切 team 即切插件槽位作用域（Q12）：用团队 id（成员回指团队）
+      _setTeamScope(targetAgent.teamScopeId);
     });
   }
 
@@ -281,7 +281,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         _agents.add(agent);
         _selectedAgent = agent;
         _currentSessionId = 'session_default';
-        _setTeamScope(agent.id);
+        _setTeamScope(agent.teamScopeId);
       });
     } catch (e) {
       if (mounted) {
@@ -453,7 +453,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 _selectedAgent = agent;
                 _currentSessionId = 'session_default';
                 _mobileTab = 1;
-                _setTeamScope(agent.id);
+                _setTeamScope(agent.teamScopeId);
               });
             },
             onClearHistory: _handleClearHistory,
@@ -793,7 +793,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         // 左栏由活动栏承担标题，避免与面板自带标题重复。
         // onCollapse：内容下方空白区域点击折叠左栏（与 Agent 列表一致）。
         PluginPanel(
-          teamId: _selectedAgent?.id,
+          // 站点/槽位都以**团队**为单位：成员要回指团队，否则面板会被过滤成「站点（0）」
+          teamId: _selectedAgent?.teamScopeId,
           showHeader: false,
           onCollapse: () {
             setState(() {
@@ -892,7 +893,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 setState(() {
                   _selectedAgent = agent;
                   _currentSessionId = 'session_default';
-                  _setTeamScope(agent.id);
+                  _setTeamScope(agent.teamScopeId);
                 });
               },
               onClearHistory: _handleClearHistory,

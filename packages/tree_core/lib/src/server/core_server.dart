@@ -986,6 +986,14 @@ class CoreServer {
       maxLevel: TeamLimits.level(body['max_level']),
       maxMembersPerLevel: TeamLimits.members(body['max_members_per_level']),
     );
+    // 新 agent 的团队平面刚出现：立刻给它所在的 (team, mode) 预建内置站，
+    // 免得"新建完就去看面板却是站点（0）"要到下次重启核心才补上。
+    pluginBus?.stations.ensureBuiltinStations(<StationScope>[
+      StationScope(
+        teamId: agent.teamId.isEmpty ? agent.id : agent.teamId,
+        modeKey: agent.sshConfig != null ? 'ssh' : 'local',
+      ),
+    ]);
     await writeJson(request, 200, <String, dynamic>{
       'success': true,
       'agent': agent.toApiJson(),
@@ -2238,11 +2246,15 @@ class CoreServer {
       });
       return;
     }
-    await writeJson(
-      request,
-      200,
-      bus.snapshot(teamId: request.uri.queryParameters['team_id']),
-    );
+    // team_id 参数按"团队"解释，但调用方可能传的是**成员 agent 的 id**（前端在
+    // 成员上下文里就是这样）。这里做一次反查：传进来的 id 若是成员，用它回指的
+    // 团队 id——与 _storedTeamScopes 的"顶层 agent 用自身 id 当团队"口径一致。
+    final String requested =
+        request.uri.queryParameters['team_id']?.trim() ?? '';
+    final CoreAgent? named = requested.isEmpty ? null : store.agent(requested);
+    final String teamId =
+        named != null && named.teamId.isNotEmpty ? named.teamId : requested;
+    await writeJson(request, 200, bus.snapshot(teamId: teamId));
   }
 
   Future<void> _mcpServices(HttpRequest request, Map<String, String> _) async {

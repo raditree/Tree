@@ -33,6 +33,14 @@ class Agent {
   /// 工作空间目录（空 = 核心默认 `<数据根>/workspaces/<agent_id>`）
   final String workspaceDir;
 
+  /// 团队归属（空 = 顶层 agent，即团队根）。
+  ///
+  /// 为什么前端需要它：`/api/agents` 返回的是**全部** agent（含团队成员，核心的
+  /// `toApiJson` 带 `team_id`），而插件槽位/站点等作用域都以**团队**为单位。
+  /// 顶层 agent 自身就是团队（用自身 id），成员则要回指它的团队——否则选中成员时
+  /// 插件面板按成员 id 过滤，会把该团队的站点与槽位全滤掉（表现为"站点（0）"）。
+  final String teamId;
+
   /// 等待用户处理的团队成员数（未分配模型 / 待审核）
   ///
   /// 后端 `/api/agents` 按 TOP 的整棵成员树统计。> 0 时在 Agent 列表与
@@ -51,7 +59,11 @@ class Agent {
     this.hasSsh = false,
     this.workspaceDir = '',
     this.pendingMemberCount = 0,
+    this.teamId = '',
   });
+
+  /// 插件作用域用的团队 id：成员回指团队，顶层 agent 用自身 id。
+  String get teamScopeId => teamId.isNotEmpty ? teamId : id;
 
   /// 从 JSON 构造 Agent 实例
   ///
@@ -83,6 +95,7 @@ class Agent {
       pendingMemberCount: _parseInt(
         json['pending_member_count'] ?? json['pendingMemberCount'],
       ),
+      teamId: json['team_id'] as String? ?? json['teamId'] as String? ?? '',
     );
   }
 
