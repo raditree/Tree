@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:path/path.dart' as p;
 import 'package:tree_local_exec/tree_local_exec.dart';
 import 'package:tree_protocol/tree_protocol.dart';
 
@@ -15,6 +16,7 @@ import '../mcp/mcp_client.dart';
 import '../mcp/mcp_service.dart';
 import '../plugin/plugin_bus.dart';
 import '../settings/core_settings.dart';
+import '../settings/ssh_config.dart';
 import '../spec/spec_service.dart';
 import '../store/atomic_file.dart';
 import '../store/memory_store.dart';
@@ -553,6 +555,9 @@ class CoreServer {
     }
     await writeJson(request, 200, <String, dynamic>{
       'agent': agent.toApiJson(),
+      // SSH 配置的**非机密**部分（host/port/username/key_path/root 与认证方式），
+      // 供前端编辑；密码与口令永不回显。
+      if (agent.sshConfig != null) 'ssh': agent.sshConfig!.redacted(),
     });
   }
 
@@ -577,9 +582,76 @@ class CoreServer {
       await writeJson(request, 404, errorBody('agent 不存在'));
       return;
     }
+
+    // ── 工作空间目录与 SSH 配置（M7c）：前端「运行模式」直接改 agent 配置 ──
+    // 语义与模型配置一致：字段缺失 = 不改；显式空值 = 清空。
+    bool touched = false;
+    if (body.containsKey('workspace_dir')) {
+      final String dir = (body['workspace_dir'] as String? ?? '').trim();
+      if (dir.isNotEmpty && !p.isAbsolute(dir)) {
+        await writeJson(
+          request,
+          400,
+          errorBody('workspace_dir 必须是绝对路径或空串（空 = 用默认工作空间）'),
+        );
+        return;
+      }
+      agent.workspaceDir = dir;
+      touched = true;
+    }
+    if (body.containsKey('ssh')) {
+      final Object? raw = body['ssh'];
+      if (raw == null) {
+        agent.sshConfig = null;
+        touched = true;
+      } else if (raw is Map) {
+        final Map<String, dynamic> sshBody = raw.map(
+          (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+        );
+        final SshConfig? parsed = SshConfig.parse(sshBody);
+        if (parsed == null) {
+          await writeJson(request, 400, errorBody('ssh.host 不能为空'));
+          return;
+        }
+        // 密码/口令按 PATCH 语义：键缺失 = 保留原值，显式空串 = 清空
+        final SshConfig? existing = agent.sshConfig;
+        final String password = sshBody.containsKey('password')
+            ? parsed.password
+            : (existing?.password ?? '');
+        final String passphrase = sshBody.containsKey('key_passphrase')
+            ? parsed.keyPassphrase
+            : (existing?.keyPassphrase ?? '');
+        if (password.isEmpty && parsed.keyPath.isEmpty) {
+          await writeJson(
+            request,
+            400,
+            errorBody('SSH 需要 password 或 key_path 之一'),
+          );
+          return;
+        }
+        agent.sshConfig = SshConfig(
+          host: parsed.host,
+          port: parsed.port,
+          username: parsed.username,
+          password: password,
+          keyPath: parsed.keyPath,
+          keyPassphrase: passphrase,
+          root: parsed.root,
+        );
+        touched = true;
+      } else {
+        await writeJson(request, 400, errorBody('ssh 必须是对象或 null'));
+        return;
+      }
+    }
+    if (touched) {
+      agent.updatedAt = DateTime.now().millisecondsSinceEpoch;
+      store.putAgent(agent);
+    }
     await writeJson(request, 200, <String, dynamic>{
       'success': true,
       'agent': agent.toApiJson(),
+      if (agent.sshConfig != null) 'ssh': agent.sshConfig!.redacted(),
     });
   }
 

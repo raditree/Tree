@@ -107,7 +107,13 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 - **M6a**：MCP（stdio JSON-RPC 客户端 + `mcp` 工具 + 已就绪 MCP 工具的原生注入 + 服务注册 REST）
 - **M7a**：打包（`dart run tool/build_core.dart` → 单文件 `tree_core.exe`；`TREE_CORE_EXE` 门控的真可执行文件冒烟测试：握手 → HTTP 鉴权 → shutdown 优雅退出）
 - **M7b**：删除 `server/`（服务端 Python 整体移除）；完备性门禁从"扫 Python 源码"改为"扫本仓库源码"；README 改写为桌面架构
-- **M7（剩余）**：文档能力（PDF/docx）、安装器、删除前端多余执行器
+- **M7d-1**：工作空间文件服务（目录树 / 文件内容 / PDF 基本信息 / Git 历史与分支；路径安全边界 + 可读错误）
+- **M7c**：前端"运行模式"改为写 agent 配置（`workspace_dir` / `ssh` 经 `PATCH /api/agents/{id}`，核心据此决定工具在哪跑）
+- **M7（剩余）**：
+  - 文件写路径（上传 / 下载 / `syncToLocal`）；SSH 工作空间的远端文件读写接线
+  - **PDF 预览的渲染方案待决策**（`pdf_preview` 需要 PDF 光栅化）：① 核心侧引入 Syncfusion 纯 Dart 渲染（涉商业许可）；② 前端加 Flutter PDF 插件（如 pdfx/pdfrx，核心只提供字节）；③ 不做预览，PDF 仅下载后用系统查看器打开。当前为 ③（返回 501 + 明确文案）
+  - 删除前端多余执行器与反向执行协议（`lib/io/local_executor_service.dart`、`ssh_executor_service.dart`、`ssh_workspace_executor.dart`、`mcp_stdio_tunnel.dart`、`plugin_host_sessions.dart` 与 `message_panel`/`main_page` 的接线），同步精简协议与核心 switch
+  - 安装器
 
 ---
 
