@@ -174,6 +174,7 @@ class CoreMessage {
     this.toolName,
     this.toolArguments,
     this.toolResult = '',
+    this.toolCallId,
     this.usage,
     this.attachments,
     this.options,
@@ -196,6 +197,7 @@ class CoreMessage {
         (dynamic k, dynamic v) => MapEntry(k.toString(), v),
       ),
       toolResult: json['tool_result'] as String? ?? '',
+      toolCallId: json['tool_call_id'] as String?,
       usage: (json['usage'] as Map<dynamic, dynamic>?)?.map(
         (dynamic k, dynamic v) => MapEntry(k.toString(), v),
       ),
@@ -222,6 +224,10 @@ class CoreMessage {
   final String? toolName;
   final Map<String, dynamic>? toolArguments;
   final String toolResult;
+
+  /// 端点给的 tool_call id（回灌 `role: tool` 消息时需要原样带回）。
+  /// 前端 `ChatMessage.fromJson` 不认识该字段，会安全忽略。
+  final String? toolCallId;
   final Map<String, dynamic>? usage;
   final List<Map<String, dynamic>>? attachments;
   final List<String>? options;
@@ -241,6 +247,7 @@ class CoreMessage {
     'tool_name': toolName,
     'tool_arguments': toolArguments,
     'tool_result': toolResult,
+    'tool_call_id': toolCallId,
     'usage': usage,
     'attachments': attachments,
     'options': options ?? const <String>[],

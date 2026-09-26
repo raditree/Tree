@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:tree_protocol/tree_protocol.dart';
 
+import '../agent/agent_engine.dart';
 import '../agent/conversation_service.dart';
 import '../agent/scripted_agent.dart';
 import '../settings/core_settings.dart';
@@ -153,7 +154,7 @@ class CoreServer {
     Duration heartbeatInterval = const Duration(seconds: 30),
     TreeStore? store,
     CoreSettings? settings,
-    ReplyEngine? engine,
+    AgentEngine? engine,
   }) async {
     final HttpServer http = await HttpServer.bind(
       address ?? InternetAddress.loopbackIPv4,
@@ -194,6 +195,8 @@ class CoreServer {
   /// 关闭服务并释放全部连接（幂等）。
   Future<void> close({bool force = true}) async {
     conversation.dispose();
+    // 引擎可能持有 HTTP 连接池（真实 LLM 传输层）：随服务一起释放
+    await conversation.engine.close();
     reassembler.clear();
     await hub.closeAll();
     // 先把在途落盘任务写完再关闭监听（write-behind 的收尾）

@@ -22,8 +22,16 @@ import 'package:tree_protocol/tree_protocol.dart';
 
 import 'src/version.dart';
 
+export 'src/agent/agent_engine.dart';
 export 'src/agent/conversation_service.dart';
 export 'src/agent/scripted_agent.dart';
+export 'src/llm/llm_agent_engine.dart';
+export 'src/llm/llm_session.dart';
+export 'src/llm/llm_transport.dart';
+export 'src/llm/llm_types.dart';
+export 'src/llm/openai_codec.dart';
+export 'src/llm/sse_parser.dart';
+export 'src/tool/tool_runner.dart';
 export 'src/server/core_server.dart';
 export 'src/server/http_io.dart';
 export 'src/server/http_router.dart';

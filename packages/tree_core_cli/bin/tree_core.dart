@@ -54,12 +54,20 @@ Future<void> main(List<String> args) async {
   final CoreSettings settings = CoreSettings();
   FileSettingsSink(paths, log: logStore).load(settings);
 
+  // 回复引擎：真实 LLM（OpenAI 兼容端点）。模型池来自 ~/.tree/config/models，
+  // 因此"换模型/改密钥"只需改配置文件，不必改代码。
+  final LlmAgentEngine engine = LlmAgentEngine(
+    resolveModel: settings.model,
+    log: (String message) => stderr.writeln('[core:llm] $message'),
+  );
+
   final CoreServer server = await CoreServer.start(
     port: port,
     streamChunkDelay: Duration(milliseconds: chunkDelayMs),
     enableHeartbeat: enableHeartbeat,
     store: store,
     settings: settings,
+    engine: engine,
   );
   if (verbose) {
     // 访问日志走 stderr（stdout 是进程间协议，绝不能混入日志）

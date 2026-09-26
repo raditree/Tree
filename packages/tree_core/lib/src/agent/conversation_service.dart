@@ -6,6 +6,7 @@ import '../settings/core_settings.dart';
 import '../store/tree_store.dart';
 import '../util/ids.dart';
 import '../ws/ws_hub.dart';
+import 'agent_engine.dart';
 import 'scripted_agent.dart';
 
 /// 一次生成任务的取消令牌。
@@ -13,27 +14,50 @@ class _RunToken {
   bool cancelled = false;
 }
 
+/// 本轮正在生成的一条消息（与前端消息一一对应：先立 start，再追加 chunk）。
+class _PendingMessage {
+  _PendingMessage({required this.id, required this.kind});
+
+  final String id;
+  final String kind;
+  final StringBuffer content = StringBuffer();
+  String? toolName;
+  Map<String, dynamic>? toolArguments;
+  String toolResult = '';
+  String toolCallId = '';
+
+  bool get isEmpty => content.isEmpty && kind != 'tool';
+}
+
 /// 会话服务：把 WS 上行的 `user_message` / `stop` 变成"落库 + 流式下行"。
 ///
-/// 这里是 M1 的**最小纵切面**：会话解析 → 用户消息落库 → agent_status
-/// working → msg_start/msg_chunk/msg_end → agent_status idle。M3 换掉
-/// [ReplyEngine] 实现即接入真实 LLM；M5 在此之上叠加成员编排与提问暂停。
+/// 本类只做**协议适配**：把 [AgentEngine] 产出的 [AgentEvent] 翻成既有 WS 帧，
+/// 并把本轮产生的消息按事件顺序落库。生成逻辑（真实 LLM / 占位回显）在引擎里，
+/// 因此 M5 的成员编排可以复用同一套事件而无需改这里。
 ///
-/// 并发策略：**按 agent 串行**（同一 agent 的多条消息排队执行）。理由与现状
-/// server 的"串行排队"默认一致：同一会话的流式片段若交错下发，前端的
-/// `msg_chunk` 追加会互相污染（消息面板按 id 定位，但语义上仍是一轮一答）。
+/// 帧映射：
+/// - [AgentText] → `msg_start(kind=text)` + `msg_chunk`；
+/// - [AgentThinking] → `msg_start(kind=thinking)` + `msg_chunk`（前端渲染思考卡片）；
+/// - [AgentToolStart]/[AgentToolEnd] → `tool_start`/`tool_end`（工具卡片）；
+/// - [AgentUsage] → `msg_usage`；
+/// - [AgentError] → `error` 帧 **+ 一条可见的 agent 文本消息**
+///   （前端对 `error` 帧是静默忽略的，只发 error 用户会看不到任何反馈）；
+/// - [AgentDone] → 每个流式消息的 `msg_end` + `agent_status(idle)`。
+///
+/// 并发策略：**按 agent 串行**（同一 agent 的多条消息排队执行）。同一会话的
+/// 流式片段若交错下发，前端的 `msg_chunk` 追加会互相污染。
 class ConversationService {
   ConversationService({
     required this.store,
     required this.hub,
     required this.settings,
-    ReplyEngine? engine,
+    AgentEngine? engine,
   }) : engine = engine ?? ScriptedAgent();
 
   final TreeStore store;
   final WsHub hub;
   final CoreSettings settings;
-  final ReplyEngine engine;
+  final AgentEngine engine;
 
   /// 每个 agent 的任务链尾（保证串行）。
   final Map<String, Future<void>> _chains = <String, Future<void>>{};
@@ -73,7 +97,7 @@ class ConversationService {
     return _enqueue(agent.id, () => _runReply(agent, session, content));
   }
 
-  /// 处理 `stop`：置位取消令牌，正在流式的任务会在下个片段检查点退出。
+  /// 处理 `stop`：置位取消令牌，正在流式的任务会在下个检查点退出。
   ///
   /// 帧字段：`{type, data:{agent_id, session_id}}`。
   void handleStop(Map<String, dynamic> frame) {
@@ -137,7 +161,6 @@ class ConversationService {
   ) async {
     final _RunToken token = _RunToken();
     _running[agent.id] = token;
-    final String messageId = CoreIds.message();
     final Map<String, dynamic> envelope = <String, dynamic>{
       'agent_id': agent.id,
       'session_id': session.sessionId,
@@ -146,70 +169,177 @@ class ConversationService {
       'type': WsOutboundType.agentStatus,
       'data': <String, dynamic>{'agent_id': agent.id, 'status': 'working'},
     });
-    hub.broadcast(<String, dynamic>{
-      'type': WsOutboundType.msgStart,
-      'id': messageId,
-      'kind': 'text',
-      ...envelope,
-    });
-    final StringBuffer buffer = StringBuffer();
+
+    // 本轮消息按**事件首次出现的顺序**记录，结束时统一落库：
+    // 这样"界面看到的顺序"与"重载历史后的顺序"一致。
+    final List<_PendingMessage> pending = <_PendingMessage>[];
+    _PendingMessage? textMessage;
+    _PendingMessage? thinkingMessage;
+    final Map<String, _PendingMessage> toolMessages =
+        <String, _PendingMessage>{};
+    Map<String, dynamic>? usage;
     bool cancelled = false;
+    String? errorMessage;
+
+    void startStreamingMessage(_PendingMessage message) {
+      pending.add(message);
+      hub.broadcast(<String, dynamic>{
+        'type': WsOutboundType.msgStart,
+        'id': message.id,
+        'kind': message.kind,
+        ...envelope,
+      });
+    }
+
+    void appendChunk(_PendingMessage message, String delta) {
+      message.content.write(delta);
+      hub.broadcast(<String, dynamic>{
+        'type': WsOutboundType.msgChunk,
+        'id': message.id,
+        'chunk': delta,
+        ...envelope,
+      });
+    }
+
+    final AgentRunContext context = AgentRunContext(
+      agentId: agent.id,
+      sessionId: session.sessionId,
+      modelId: agent.modelId,
+      systemPrompt: agent.systemPrompt,
+      userContent: userContent,
+      // 用户消息已在 handleUserMessage 里落库，因此这里取到的历史已含本次输入
+      history: store
+          .messages(agent.id, session.sessionId)
+          .map(_toRef)
+          .toList(growable: false),
+    );
+
     try {
-      await for (final String chunk in engine.stream(
-        agentId: agent.id,
-        systemPrompt: agent.systemPrompt,
-        userContent: userContent,
+      await for (final AgentEvent event in engine.run(
+        context,
         isCancelled: () => token.cancelled,
       )) {
-        if (token.cancelled) {
-          cancelled = true;
-          break;
+        if (event is AgentText) {
+          final _PendingMessage message = textMessage ??= _PendingMessage(
+            id: CoreIds.message(),
+            kind: 'text',
+          );
+          if (message.content.isEmpty) startStreamingMessage(message);
+          appendChunk(message, event.delta);
+        } else if (event is AgentThinking) {
+          final _PendingMessage message = thinkingMessage ??= _PendingMessage(
+            id: CoreIds.message(),
+            kind: 'thinking',
+          );
+          if (message.content.isEmpty) startStreamingMessage(message);
+          appendChunk(message, event.delta);
+        } else if (event is AgentToolStart) {
+          final _PendingMessage message =
+              _PendingMessage(id: event.id, kind: 'tool')
+                ..toolName = event.name
+                ..toolArguments = event.arguments
+                ..toolCallId = event.callId;
+          toolMessages[event.id] = message;
+          pending.add(message);
+          hub.broadcast(<String, dynamic>{
+            'type': WsOutboundType.toolStart,
+            'id': message.id,
+            'name': event.name,
+            'arguments': event.arguments,
+            ...envelope,
+          });
+        } else if (event is AgentToolEnd) {
+          final _PendingMessage? message = toolMessages[event.id];
+          if (message == null) continue;
+          message.toolResult = event.result;
+          hub.broadcast(<String, dynamic>{
+            'type': WsOutboundType.toolEnd,
+            'id': event.id,
+            'name': event.name,
+            'result': event.result,
+            ...envelope,
+          });
+        } else if (event is AgentUsage) {
+          usage = event.usage;
+          hub.broadcast(<String, dynamic>{
+            'type': WsOutboundType.msgUsage,
+            'id': textMessage?.id ?? '',
+            'usage': event.usage,
+            ...envelope,
+          });
+        } else if (event is AgentError) {
+          errorMessage = event.message;
+        } else if (event is AgentDone) {
+          if (event.cancelled) cancelled = true;
         }
-        buffer.write(chunk);
-        hub.broadcast(<String, dynamic>{
-          'type': WsOutboundType.msgChunk,
-          'id': messageId,
-          'chunk': chunk,
-          ...envelope,
-        });
       }
-    } catch (e) {
-      _sendError('生成失败：$e');
+    } catch (error) {
+      errorMessage ??= '生成失败：$error';
     }
     if (token.cancelled) cancelled = true;
 
-    final String full = buffer.toString();
-    final Map<String, dynamic> usage = usageOf(agent, userContent, full);
-    if (full.isNotEmpty) {
+    // 端点没给 usage 时用本地估算兜底（前端上下文进度条依赖该字段）
+    final Map<String, dynamic> finalUsage =
+        usage ??
+        usageOf(agent, userContent, textMessage?.content.toString() ?? '');
+
+    // 每个已开始的流式消息都要收尾（前端据此结束流式态）
+    for (final _PendingMessage message in pending) {
+      if (message.kind == 'tool') continue;
+      hub.broadcast(<String, dynamic>{
+        'type': WsOutboundType.msgEnd,
+        'id': message.id,
+        'usage': message.kind == 'text' ? finalUsage : null,
+        'cancelled': cancelled,
+        ...envelope,
+      });
+    }
+
+    // 落库（顺序与 UI 一致；空文本不落库）
+    for (final _PendingMessage message in pending) {
+      if (message.kind == 'tool') {
+        if (message.toolName == null) continue;
+        store.appendMessage(
+          CoreMessage(
+            id: message.id,
+            agentId: agent.id,
+            sessionId: session.sessionId,
+            role: 'agent',
+            content: '',
+            timestamp: DateTime.now().millisecondsSinceEpoch,
+            kind: 'tool',
+            toolName: message.toolName,
+            toolArguments: message.toolArguments,
+            toolResult: message.toolResult,
+            toolCallId: message.toolCallId.isEmpty ? null : message.toolCallId,
+          ),
+        );
+        continue;
+      }
+      final String text = message.content.toString();
+      if (text.isEmpty) continue;
       store.appendMessage(
         CoreMessage(
-          id: messageId,
+          id: message.id,
           agentId: agent.id,
           sessionId: session.sessionId,
           role: 'agent',
-          content: full,
+          content: text,
           timestamp: DateTime.now().millisecondsSinceEpoch,
-          usage: usage,
+          kind: message.kind,
+          usage: message.kind == 'text' ? finalUsage : null,
         ),
       );
     }
-    hub.broadcast(<String, dynamic>{
-      'type': WsOutboundType.msgEnd,
-      'id': messageId,
-      'usage': usage,
-      'cancelled': cancelled,
-      ...envelope,
-    });
+
+    final String? failure = errorMessage;
+    if (failure != null) {
+      // 1) error 帧（日志/遥测）；2) 一条**可见**的 agent 消息（前端只忽略 error 帧）
+      _sendError(failure);
+      _sendNotice(agent, session, failure);
+    }
     if (cancelled) {
-      // 停止反馈走 `message` 帧（完整 ChatMessage 形态），前端直接追加一条
-      hub.broadcast(<String, dynamic>{
-        'type': WsOutboundType.message,
-        'id': CoreIds.message(),
-        'role': 'agent',
-        'content': '已停止本轮生成。',
-        'kind': 'text',
-        ...envelope,
-      });
+      _sendNotice(agent, session, '已停止本轮生成。');
     }
     hub.broadcast(<String, dynamic>{
       'type': WsOutboundType.agentStatus,
@@ -217,6 +347,45 @@ class ConversationService {
     });
     _running.remove(agent.id);
   }
+
+  /// 推一条完整的 agent 文本消息（`message` 帧）并落库。
+  ///
+  /// 现状 server 的 `_send_text_as_agent` 走的就是这条路径：错误提示、停止提示
+  /// 等"系统发言"必须出现在会话里，用户才看得到。
+  void _sendNotice(CoreAgent agent, CoreSession session, String content) {
+    final String id = CoreIds.message();
+    hub.broadcast(<String, dynamic>{
+      'type': WsOutboundType.message,
+      'id': id,
+      'role': 'agent',
+      'content': content,
+      'kind': 'text',
+      'agent_id': agent.id,
+      'session_id': session.sessionId,
+    });
+    store.appendMessage(
+      CoreMessage(
+        id: id,
+        agentId: agent.id,
+        sessionId: session.sessionId,
+        role: 'agent',
+        content: content,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+      ),
+    );
+  }
+
+  /// 存储消息 → 引擎视图。
+  static CoreMessageRef _toRef(CoreMessage message) => CoreMessageRef(
+    role: message.role,
+    content: message.content,
+    kind: message.kind,
+    toolName: message.toolName,
+    toolArguments: message.toolArguments,
+    toolResult: message.toolResult,
+    toolCallId: message.toolCallId,
+    timestamp: message.timestamp,
+  );
 
   /// 按 agent 串行执行：前一个任务（含失败）结束后才启动下一个。
   Future<void> _enqueue(String agentId, Future<void> Function() task) {
@@ -242,28 +411,22 @@ class ConversationService {
     return gate.future;
   }
 
-  /// 本轮 token 用量（M1 为估算值；M3 改用端点返回的真实 usage）。
+  /// 本地估算的 token 用量（端点未返回 usage 时的兜底，带 `estimated: true`）。
   Map<String, dynamic> usageOf(
     CoreAgent agent,
     String prompt,
     String completion,
   ) {
-    final int promptTokens = estimateTokens(prompt);
-    final int completionTokens = estimateTokens(completion);
     final CoreModelConfig? model = settings.model(agent.modelId);
-    return <String, dynamic>{
-      'prompt_tokens': promptTokens,
-      'completion_tokens': completionTokens,
-      'total_tokens': promptTokens + completionTokens,
-      'max_tokens': model?.effectiveMaxSeqlen ?? 128000,
-      'estimated': true,
-    };
+    return agentUsageMap(
+      promptTokens: estimateTokens(prompt),
+      completionTokens: estimateTokens(completion),
+      maxTokens: model?.effectiveMaxSeqlen ?? 128000,
+      estimated: true,
+    );
   }
 
   /// 粗略 token 估算：CJK 码点 ≈ 1 token，其余按 4 字符 ≈ 1 token。
-  ///
-  /// 仅在 M1 占位引擎下使用；结果带 `estimated: true` 标记，避免 UI 把它
-  /// 当成真实计费数据。
   static int estimateTokens(String text) {
     int cjk = 0;
     int other = 0;
