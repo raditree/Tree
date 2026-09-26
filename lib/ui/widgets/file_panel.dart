@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -8,6 +9,7 @@ import '../../io/api_service.dart';
 import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
 import '../../io/workspace_refresh_service.dart';
+import '../services/download_center.dart';
 import 'file_sync_button.dart';
 import 'file_tree.dart';
 import 'file_viewer.dart';
@@ -36,6 +38,9 @@ class FilePanel extends StatefulWidget {
   /// 所属团队 ID（Todo 面板本地模式读取、模型信息页需要）
   final String? teamId;
 
+  /// 所属团队显示名（下载列表里标注「来自哪个 team」）；为空时退回 [teamId]。
+  final String teamName;
+
   /// 当前会话 ID（Todo 面板按会话隔离查询 todos）
   final String sessionId;
 
@@ -49,6 +54,7 @@ class FilePanel extends StatefulWidget {
     super.key,
     required this.workspaceId,
     this.teamId,
+    this.teamName = '',
     this.sessionId = 'session_default',
     this.onCollapse,
     this.onNavigateToQuestion,
@@ -145,49 +151,82 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
     });
   }
 
-  /// 处理文件/文件夹下载
+  /// 处理文件/文件夹下载（M8c/M8d）
   ///
-  /// 从后端获取文件/文件夹字节后，弹出系统保存对话框保存到本地。
-  /// 移动端不支持系统保存对话框（file_picker.saveFile 仅桌面），直接提示。
+  /// - 文件：选保存目录后**流式**写盘，任务交给 [DownloadCenter] 在左栏「下载」
+  ///   里展示进度（后台进行，不阻塞界面）；
+  /// - 文件夹：核心先打成 tar.gz 再交给系统保存对话框（受核心打包上限约束）。
   Future<void> _handleDownload(String path, bool isDirectory) async {
     if (isMobile) {
       _showSnackBar('移动端暂不支持保存到本地文件系统，请到桌面端下载');
       return;
     }
-    try {
-      // 显示加载提示
-      _showSnackBar('正在下载...');
-      final Uint8List bytes = isDirectory
-          ? await ApiService.downloadFolder(
-              widget.workspaceId,
-              path,
-              teamId: widget.teamId ?? '',
-            )
-          : await ApiService.downloadFile(
-              widget.workspaceId,
-              path,
-              teamId: widget.teamId ?? '',
-            );
-
-      // 弹出系统保存对话框（file_picker 13：saveFile 直接接收字节并落盘，返回目标 Uri）
-      final Uri? savedUri = await FilePicker.saveFile(
-        dialogTitle: isDirectory ? '保存文件夹' : '保存文件',
-        fileName: isDirectory
-            ? '${path.split('/').last}.tar.gz'
-            : path.split('/').last,
-        bytes: bytes,
+    final String name = path.isEmpty ? 'workspace' : path.split('/').last;
+    if (isDirectory) {
+      final DownloadTask task = DownloadCenter.instance.begin(
+        kind: DownloadKind.folder,
+        name: '$name.tar.gz',
+        sourceTeam: widget.teamName,
+        sourceTeamId: widget.teamId ?? '',
       );
-
-      if (savedUri != null) {
-        final String savedPath = savedUri.scheme == 'file'
-            ? savedUri.toFilePath()
-            : savedUri.toString();
-        _showSnackBar('下载完成：${savedPath.split(Platform.pathSeparator).last}');
+      try {
+        _showSnackBar('正在打包 $name ...');
+        final Uint8List bytes = await ApiService.downloadFolder(
+          widget.workspaceId,
+          path,
+          teamId: widget.teamId ?? '',
+        );
+        final Uri? savedUri = await FilePicker.saveFile(
+          dialogTitle: '保存文件夹',
+          fileName: '$name.tar.gz',
+          bytes: bytes,
+        );
+        if (!mounted) return;
+        if (savedUri == null) {
+          DownloadCenter.instance.cancel(task);
+          return;
+        }
+        DownloadCenter.instance.complete(
+          task,
+          localPath: _uriToPath(savedUri),
+          totalBytes: bytes.length,
+        );
+        _showSnackBar('已保存：${_uriBaseName(savedUri)}');
+      } on Exception catch (e) {
+        final String msg = e.toString().replaceFirst('Exception: ', '');
+        DownloadCenter.instance.fail(task, msg);
+        _showSnackBar('下载失败：$msg');
       }
-    } on Exception catch (e) {
-      String msg = e.toString().replaceFirst('Exception: ', '');
-      _showSnackBar('下载失败：$msg');
+      return;
     }
+
+    final String? dirPath = await FilePicker.getDirectoryPath(
+      dialogTitle: '选择保存目录',
+    );
+    if (dirPath == null || dirPath.isEmpty) return;
+    if (!mounted) return;
+    final String savePath = '$dirPath${Platform.pathSeparator}$name';
+    unawaited(
+      DownloadCenter.instance.startFileDownload(
+        workspaceId: widget.workspaceId,
+        path: path,
+        savePath: savePath,
+        name: name,
+        sourceTeam: widget.teamName,
+        sourceTeamId: widget.teamId ?? '',
+        teamId: widget.teamId ?? '',
+      ),
+    );
+    _showSnackBar('已加入下载列表：$name');
+  }
+
+  /// file_picker 返回的 Uri → 本地路径（非 file 协议时给原样字符串）。
+  static String _uriToPath(Uri uri) =>
+      uri.scheme == 'file' ? uri.toFilePath() : uri.toString();
+
+  static String _uriBaseName(Uri uri) {
+    final String path = _uriToPath(uri);
+    return path.split(Platform.pathSeparator).last;
   }
 
   /// 显示 SnackBar 提示
@@ -363,6 +402,7 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
                   child: FileViewer(
                     workspaceId: widget.workspaceId,
                     teamId: widget.teamId,
+                    teamName: widget.teamName,
                     filePath: _selectedFilePath!,
                     onClose: _closeViewer,
                   ),

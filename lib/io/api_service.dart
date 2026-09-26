@@ -1,5 +1,5 @@
 import 'dart:convert';
-import 'dart:io' show File, RandomAccessFile;
+import 'dart:io' show Directory, File, IOSink, Platform, RandomAccessFile;
 import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
@@ -7,6 +7,17 @@ import 'package:http/http.dart' as http;
 import '../ui/models/agent.dart';
 import '../ui/models/file_node.dart';
 import '../ui/models/session.dart';
+
+/// 流式下载被调用方取消（M8d 下载列表的「取消」按钮）。
+///
+/// 单独一个类型，是为了让调用方能把「用户取消」和「真失败」分开：取消是正常
+/// 结果（把半成品删掉、状态置为已取消），不该弹错误。
+class DownloadCancelledException implements Exception {
+  const DownloadCancelledException();
+
+  @override
+  String toString() => '已取消';
+}
 
 /// API 服务 - 封装对**本机核心进程**的 REST 调用。
 ///
@@ -182,40 +193,104 @@ class ApiService {
     );
   }
 
-  /// 下载单个文件
+  /// **流式**下载单个文件到本地路径（M8c/M8d）：边收边写，内存占用与文件大小无关。
   ///
-  /// 调用 `POST /api/files/{workspace_id}/download`，请求体为
-  /// `{"path": "..."}`，返回文件内容的字节数组。
-  /// 文件不存在或网络异常时抛出异常。
-  static Future<Uint8List> downloadFile(
+  /// 与 [downloadFile] 的区别：那个把整个文件读进内存再交给保存对话框，只适合小
+  /// 文件；这里用 `http.Client.send` 拿到字节流，逐块写进 [savePath]。核心侧
+  /// （`/download`）也已经是流式响应，所以整条链路都不设单文件大小上限。
+  ///
+  /// [onProgress] 回传 (已收字节, 总字节)；总长未知时为 -1。[isCancelled] 返回 true
+  /// 时抛 [DownloadCancelledException]（半成品由调用方清理）。
+  static Future<void> downloadFileTo(
     String workspaceId,
-    String filePath, {
+    String filePath,
+    String savePath, {
     String teamId = '',
+    void Function(int received, int total)? onProgress,
+    bool Function()? isCancelled,
   }) async {
     final String query = teamId.isNotEmpty
         ? '?team_id=${Uri.encodeQueryComponent(teamId)}'
         : '';
     final Uri uri = Uri.parse('$baseUrl/api/files/$workspaceId/download$query');
+    final http.Client client = http.Client();
+    IOSink? sink;
     try {
-      final http.Response response = await http.post(
-        uri,
-        headers: _getHeaders(),
-        body: jsonEncode({'path': filePath}),
-      );
+      final http.Request request = http.Request('POST', uri)
+        ..headers.addAll(_getHeaders())
+        ..body = jsonEncode(<String, dynamic>{'path': filePath});
+      final http.StreamedResponse response = await client.send(request);
       if (response.statusCode == 401) {
-        // 本地 token 无效（核心重启会换 token）：正常流程不应出现
         throw Exception('核心进程拒绝了本次请求（本地 token 无效）');
       }
       if (response.statusCode != 200) {
-        throw Exception(_errorFromBody(response));
+        final String body = await response.stream.bytesToString();
+        throw Exception(_errorFromText(body, response.statusCode));
       }
-      return response.bodyBytes;
-    } catch (e) {
-      if (e is Exception) {
-        rethrow;
+      final File file = File(savePath);
+      await file.parent.create(recursive: true);
+      sink = file.openWrite();
+      int received = 0;
+      final int total = response.contentLength ?? -1;
+      await for (final List<int> chunk in response.stream) {
+        if (isCancelled?.call() ?? false) {
+          throw const DownloadCancelledException();
+        }
+        sink.add(chunk);
+        received += chunk.length;
+        onProgress?.call(received, total);
       }
-      throw Exception('核心进程不可达，请重启应用');
+      await sink.close();
+      sink = null;
+    } finally {
+      if (sink != null) {
+        try {
+          await sink.close();
+        } catch (_) {
+          // 清理路径上的异常不再往上冒：真实原因已经由上面的 throw 决定
+        }
+      }
+      client.close();
     }
+  }
+
+  /// 从错误响应体里取 `detail`（流式响应没有 `http.Response` 可用）。
+  static String _errorFromText(String body, [int statusCode = 0]) {
+    try {
+      final Object? decoded = jsonDecode(body);
+      if (decoded is Map<String, dynamic>) {
+        final String? detail = decoded['detail'] as String?;
+        if (detail != null && detail.isNotEmpty) return detail;
+      }
+    } catch (_) {
+      // 解析失败就用兜底文案
+    }
+    return statusCode > 0 ? '请求失败（HTTP $statusCode）' : '请求失败';
+  }
+
+  /// 下载到系统临时目录并返回文件路径（PDF 预览用）。
+  ///
+  /// 为什么返回路径而不是字节：pdfrx 的 `PdfViewer.file` 能按文件做渐进加载，
+  /// 几百 MB 的 PDF 不必先整个读进内存。调用方负责在关闭预览后删除父目录。
+  static Future<String> downloadFileToTemp(
+    String workspaceId,
+    String filePath, {
+    String teamId = '',
+    void Function(int received, int total)? onProgress,
+    bool Function()? isCancelled,
+  }) async {
+    final Directory dir = await Directory.systemTemp.createTemp('tree_dl_');
+    final String name = filePath.split('/').last;
+    final String path = '${dir.path}${Platform.pathSeparator}$name';
+    await downloadFileTo(
+      workspaceId,
+      filePath,
+      path,
+      teamId: teamId,
+      onProgress: onProgress,
+      isCancelled: isCancelled,
+    );
+    return path;
   }
 
   /// 下载文件夹（打包为 tar.gz）

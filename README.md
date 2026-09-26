@@ -168,6 +168,8 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 - **M7f**：Windows 打包与安装——`tool/package_windows.dart` 一条命令出便携 zip（构建应用 + 用同一 SDK 编译核心到同目录 + 写首次运行说明 + 启动核心读握手自检 + bsdtar 压缩），`tool/installer/tree-desktop.iss` 提供 Inno Setup 安装包（卸载保留 `%APPDATA%\Tree` 用户数据）
 - **M8a**：工作空间根口径与**软约束**——SSH 的根不收窄（`ssh.root` 留空 = 远端登录用户的 `HOME`，`~`/相对路径按远端 HOME 展开），文件面板与工具层同根；系统提示词在运行时追加「工作空间（软约束）」一段（数据/项目文件可能分处根下不同子目录、不得自行收窄），**不落库**且与压缩估算共用同一函数（否则阈值会失真）。顺带修掉前端 SSH 配置弹窗与核心 `SshConfig.parse` 的键名错位（弹窗写 `private_key_path` / `remote_base_dir`，核心只读 `key_path` / `root`，此前私钥会被静默丢弃、远端根永远落回 HOME），弹窗默认值也从 `/` 改为留空
 - **M8b**：按需加载与增量传输——文件面板保持**逐层懒加载**（点开一层才列一层，根目录只发一次 `listdir`），`syncToLocal` 新增 `path`（空 = 根）：「同步到本地」只同步**当前所在目录**，不再默认拉整棵根；远端同步/打包去掉「先全树统计再复制」的双遍遍历，改为**边走边拉边算**（列一层复制一层，触顶即停并回报已处理进度）。真机验收 `open@192.168.0.208`：整棵 3 文件 / 5019 字节，子树 2 文件 / 19 字节
+- **M8c**：单文件**不设大小上限**，改流式/分片——`WorkspaceFiles` 增加 `sizeOf` / `openRead(offset,length)` / `writeStream`（本地走 `dart:io`，远端走 dartssh2 的 `SftpFile.read(offset,length)` / `write(stream)`）；核心 `/download` 边读边发（`FileService.openDownload` + `http_io.writeStream`），上传去掉单文件上限、远端 `upload_complete` 改成流式写；`content` 预览先问大小、只读前 8 MB 并返回 `truncated`/`size`/`preview_bytes`（不再 413），PDF 信息对大文件只读头尾；前端查看器与文件面板都**流式落盘**，PDF 预览下载到临时文件后交给 `PdfViewer.file` 渐进加载
+- **M8d**：左侧活动栏新增「下载」面板——`DownloadCenter`（全局任务状态机：running/done/failed/cancelled + 进度 + 取消）与 `DownloadPanel`；文件下载在后台流式进行，进度、取消、落盘路径都在列表里；**每条任务标注来源 team**（顶部 agent 名，缺名时退回 agent id），因为同一个列表里会混着不同 agent 工作空间的产物
 - **M7（剩余）**：
   - 远端 Git 面板（`gitLog`/`gitBranches` 目前对 SSH 仍返回可读 400：需要经 `exec` 跑 git 再解析输出）；SSH 连接的断线重连策略调优
 

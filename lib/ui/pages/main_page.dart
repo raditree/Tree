@@ -9,6 +9,7 @@ import '../../io/platform_support.dart';
 import '../../io/ssh_executor_service.dart';
 import '../widgets/agent_list.dart';
 import '../widgets/create_agent_dialog.dart';
+import '../widgets/download_panel.dart';
 import '../widgets/file_panel.dart';
 import '../widgets/message_panel.dart';
 import '../widgets/plugin_panel.dart';
@@ -104,9 +105,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('清空失败: $e')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('清空失败: $e')));
       }
     }
   }
@@ -133,9 +133,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       }
       if (leader == null) {
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('该提问所属 Agent 不存在或已删除')),
-          );
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('该提问所属 Agent 不存在或已删除')));
         }
         return;
       }
@@ -177,9 +177,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     }
     if (target == null) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('该提问所属 Agent 不存在或已删除')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('该提问所属 Agent 不存在或已删除')));
       }
       return;
     }
@@ -218,9 +217,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       });
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('创建失败: $e')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('创建失败: $e')));
       }
     }
   }
@@ -247,9 +245,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       });
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('删除失败: $e')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('删除失败: $e')));
       }
     }
   }
@@ -292,9 +289,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     } catch (e) {
       // 加载失败保留空列表，用户仍可尝试创建
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('加载 Agent 列表失败: $e')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('加载 Agent 列表失败: $e')));
       }
     }
   }
@@ -395,6 +391,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                   key: ValueKey(workspaceId),
                   workspaceId: workspaceId,
                   teamId: _selectedAgent?.id,
+                  teamName: _selectedAgent?.name ?? '',
                   sessionId: _currentSessionId,
                   onNavigateToQuestion: _handleNavigateToQuestion,
                 ),
@@ -463,18 +460,12 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
           const SizedBox(height: 16),
           Text(
             '窗口尺寸过小，请调整窗口大小',
-            style: TextStyle(
-              fontSize: 18,
-              color: cs.onSurfaceVariant,
-            ),
+            style: TextStyle(fontSize: 18, color: cs.onSurfaceVariant),
           ),
           const SizedBox(height: 8),
           Text(
             '建议最小尺寸：1024 × 600',
-            style: TextStyle(
-              fontSize: 14,
-              color: cs.onSurfaceVariant,
-            ),
+            style: TextStyle(fontSize: 14, color: cs.onSurfaceVariant),
           ),
         ],
       ),
@@ -578,17 +569,11 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
               width: expandedWidth,
               child: IgnorePointer(
                 ignoring: collapsed,
-                child: TickerMode(
-                  enabled: !collapsed,
-                  child: expandedBar,
-                ),
+                child: TickerMode(enabled: !collapsed, child: expandedBar),
               ),
             ),
             // 折叠窄条：仅折叠时覆盖在展开面板之上
-            if (collapsed)
-              Positioned.fill(
-                child: collapsedBar,
-              ),
+            if (collapsed) Positioned.fill(child: collapsedBar),
           ],
         ),
       ),
@@ -636,6 +621,13 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             selectedIcon: Icons.extension,
             tooltip: '插件（只读）',
           ),
+          const SizedBox(height: 4),
+          _buildActivityItem(
+            index: 2,
+            icon: Icons.download_outlined,
+            selectedIcon: Icons.download,
+            tooltip: '下载列表',
+          ),
           // 撑开剩余空间，把设置压到底部
           const Spacer(),
           _buildActivityAction(
@@ -678,13 +670,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             children: [
               // 与面板项对齐的占位（无选中色）
               const SizedBox(width: 2),
-              Expanded(
-                child: Icon(
-                  icon,
-                  size: 22,
-                  color: cs.onSurfaceVariant,
-                ),
-              ),
+              Expanded(child: Icon(icon, size: 22, color: cs.onSurfaceVariant)),
             ],
           ),
         ),
@@ -757,6 +743,14 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             });
           },
         ),
+        // 「下载」面板（M8d）：全局任务列表，每条标来源 team
+        DownloadPanel(
+          onCollapse: () {
+            setState(() {
+              _leftCollapsed = true;
+            });
+          },
+        ),
       ],
     );
   }
@@ -801,6 +795,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       key: ValueKey(workspaceId),
       workspaceId: workspaceId,
       teamId: _selectedAgent?.id,
+      teamName: _selectedAgent?.name ?? '',
       sessionId: _currentSessionId,
       onCollapse: () {
         setState(() {
@@ -864,10 +859,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
           const Expanded(
             child: Text(
               'Agent 列表',
-              style: TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.w600,
-              ),
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
             ),
           ),
           // 创建 Agent
@@ -905,7 +897,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             decoration: BoxDecoration(
               color: cs.surface,
               border: Border(
-                bottom: BorderSide(color: Theme.of(context).dividerColor, width: 1),
+                bottom: BorderSide(
+                  color: Theme.of(context).dividerColor,
+                  width: 1,
+                ),
               ),
             ),
             child: Center(
@@ -934,11 +929,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 child: Center(
                   child: Text(
                     // 折叠窄条文案随活动栏选择变化（左栏不再只有 Agent 列表）
-                    _leftPanel == 0 ? 'Agent 列表' : '插件',
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: cs.onSurfaceVariant,
-                    ),
+                    _leftPanel == 0
+                        ? 'Agent 列表'
+                        : (_leftPanel == 1 ? '插件' : '下载'),
+                    style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
                   ),
                 ),
               ),
@@ -962,7 +956,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             decoration: BoxDecoration(
               color: cs.surface,
               border: Border(
-                bottom: BorderSide(color: Theme.of(context).dividerColor, width: 1),
+                bottom: BorderSide(
+                  color: Theme.of(context).dividerColor,
+                  width: 1,
+                ),
               ),
             ),
             child: Center(
@@ -993,10 +990,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                     // 右栏现在含「文件 / MCP 配置 / 模型信息 / 问题回复」，
                     // 原「文件管理」文案已不准确
                     '工作区',
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: cs.onSurfaceVariant,
-                    ),
+                    style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
                   ),
                 ),
               ),
@@ -1013,10 +1007,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
 /// 用于在三栏布局中分隔各栏，支持鼠标拖拽调整相邻栏的宽度。
 /// 拖拽时变色提供视觉反馈，鼠标悬停时显示 resize 光标。
 class DraggableDivider extends StatefulWidget {
-  const DraggableDivider({
-    super.key,
-    required this.onDrag,
-  });
+  const DraggableDivider({super.key, required this.onDrag});
 
   /// 拖拽回调，参数为水平方向的增量（dx）
   final ValueChanged<double> onDrag;
@@ -1066,10 +1057,7 @@ class _DraggableDividerState extends State<DraggableDivider> {
             _isDragging = false;
           });
         },
-        child: Container(
-          width: 6,
-          color: _getColor(context),
-        ),
+        child: Container(width: 6, color: _getColor(context)),
       ),
     );
   }

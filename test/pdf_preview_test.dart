@@ -35,6 +35,29 @@ void main() {
     expect(seenName, '季度报告.pdf');
   });
 
+  testWidgets('filePath 模式：生产走 PdfViewer.file，文件名照样交给渲染器', (
+    WidgetTester tester,
+  ) async {
+    String? seenName;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: PdfPreview(
+            filePath: '/tmp/tree_preview/a.pdf',
+            fileName: 'a.pdf',
+            viewBuilder:
+                (BuildContext context, Uint8List data, String fileName) {
+                  seenName = fileName;
+                  return const Text('fake-file-view');
+                },
+          ),
+        ),
+      ),
+    );
+    expect(find.text('fake-file-view'), findsOneWidget);
+    expect(seenName, 'a.pdf');
+  });
+
   testWidgets('空字节：可读提示且不调渲染器', (WidgetTester tester) async {
     bool called = false;
     await tester.pumpWidget(

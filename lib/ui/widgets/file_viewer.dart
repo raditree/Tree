@@ -1,26 +1,63 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:path_provider/path_provider.dart';
 
 import '../../io/api_service.dart';
 import '../../io/platform_support.dart';
+import '../services/download_center.dart';
 import 'pdf_preview.dart';
 
 /// 文本文件扩展名
 const List<String> textExtensions = [
-  '.txt', '.py', '.js', '.ts', '.json', '.yaml', '.yml', '.xml', '.csv',
-  '.dart', '.go', '.rs', '.sh', '.bat', '.css', '.html', '.java', '.c',
-  '.cpp', '.h', '.hpp', '.cs', '.rb', '.php', '.swift', '.kt', '.sql',
-  '.toml', '.ini', '.cfg', '.conf', '.log', '.jsx', '.tsx', '.scss',
+  '.txt',
+  '.py',
+  '.js',
+  '.ts',
+  '.json',
+  '.yaml',
+  '.yml',
+  '.xml',
+  '.csv',
+  '.dart',
+  '.go',
+  '.rs',
+  '.sh',
+  '.bat',
+  '.css',
+  '.html',
+  '.java',
+  '.c',
+  '.cpp',
+  '.h',
+  '.hpp',
+  '.cs',
+  '.rb',
+  '.php',
+  '.swift',
+  '.kt',
+  '.sql',
+  '.toml',
+  '.ini',
+  '.cfg',
+  '.conf',
+  '.log',
+  '.jsx',
+  '.tsx',
+  '.scss',
 ];
 
 /// 图片扩展名
 const List<String> imageExtensions = [
-  '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp',
+  '.jpg',
+  '.jpeg',
+  '.png',
+  '.gif',
+  '.bmp',
+  '.webp',
 ];
 
 /// Markdown 扩展名
@@ -34,7 +71,13 @@ const List<String> pdfExtensions = ['.pdf'];
 
 /// Office 文档扩展名
 const List<String> officeExtensions = [
-  '.docx', '.doc', '.odt', '.rtf', '.pptx', '.xlsx', '.xls',
+  '.docx',
+  '.doc',
+  '.odt',
+  '.rtf',
+  '.pptx',
+  '.xlsx',
+  '.xls',
 ];
 
 /// 文件查看器 - 支持多种文件格式的查看与预览
@@ -52,6 +95,9 @@ class FileViewer extends StatefulWidget {
   /// 顶层 agent（team）ID，用于后端三模式分派；为空时后端按 workspaceId 兜底
   final String? teamId;
 
+  /// 顶层 agent 显示名（下载列表里标注「来自哪个 team」）。
+  final String? teamName;
+
   /// 文件相对路径
   final String filePath;
 
@@ -62,6 +108,7 @@ class FileViewer extends StatefulWidget {
     super.key,
     required this.workspaceId,
     this.teamId,
+    this.teamName,
     required this.filePath,
     this.onClose,
   });
@@ -89,8 +136,8 @@ class _FileViewerState extends State<FileViewer> {
   /// 预览模式开关（Markdown / SVG 适用），true=预览，false=源码
   bool _showPreview = true;
 
-  /// PDF 原始字节（M7e：渲染在前端，核心只给字节）
-  Uint8List? _pdfBytes;
+  /// PDF 本地临时文件路径（M8c：流式下载到临时文件，pdfrx 按文件渐进加载）
+  String? _pdfPath;
 
   /// PDF 总页数（来自核心的启发式 pdf_info，仅用于信息栏展示）
   int _totalPages = 0;
@@ -107,6 +154,27 @@ class _FileViewerState extends State<FileViewer> {
     } else {
       _loadContent();
     }
+  }
+
+  /// 清掉 PDF 预览留下的临时目录（M8c：预览走临时文件，退出时要删）。
+  void _cleanupPdfTemp() {
+    final Directory? dir = _pdfPath == null ? null : File(_pdfPath!).parent;
+    _pdfPath = null;
+    if (dir == null) return;
+    try {
+      // 只删自己建的 tree_dl_ 前缀目录，避免误删用户文件
+      if (dir.existsSync() && dir.path.contains('tree_dl_')) {
+        dir.deleteSync(recursive: true);
+      }
+    } catch (_) {
+      // 临时目录清理失败不影响预览结果
+    }
+  }
+
+  @override
+  void dispose() {
+    _cleanupPdfTemp();
+    super.dispose();
   }
 
   /// 从文件路径提取文件名
@@ -201,10 +269,10 @@ class _FileViewerState extends State<FileViewer> {
     }
   }
 
-  /// 加载 PDF（M7e 方案②）：核心只提供字节，渲染交给前端 pdfrx。
+  /// 加载 PDF（M7e 方案② + M8c 流式）：核心提供元信息与字节，渲染交给前端 pdfrx。
   ///
-  /// 两步都留着：pdf_info 给标题/页数（信息栏与"文档太大"的判断），
-  /// download 给原始字节。字节走 POST /download（二进制），不再要核心出图片。
+  /// 字节**流式下载到临时文件**再交给 pdfrx：`PdfViewer.file` 能按文件渐进加载，
+  /// 几百 MB 的 PDF 不必先整个读进内存（旧的 `downloadFile` 会把整文件读进 RAM）。
   Future<void> _loadPdf() async {
     setState(() {
       _isLoading = true;
@@ -216,15 +284,16 @@ class _FileViewerState extends State<FileViewer> {
         widget.filePath,
         teamId: widget.teamId ?? '',
       );
-      final Uint8List bytes = await ApiService.downloadFile(
+      final String path = await ApiService.downloadFileToTemp(
         widget.workspaceId,
         widget.filePath,
         teamId: widget.teamId ?? '',
       );
       if (!mounted) return;
+      _cleanupPdfTemp();
       setState(() {
         _totalPages = (info['total_pages'] as num?)?.toInt() ?? 0;
-        _pdfBytes = bytes;
+        _pdfPath = path;
         _isLoading = false;
       });
     } on Exception catch (e) {
@@ -235,7 +304,6 @@ class _FileViewerState extends State<FileViewer> {
       });
     }
   }
-
 
   /// base64 解码，兼容 data URI 前缀与空白字符
   Uint8List? _decodeBase64(String raw) {
@@ -260,32 +328,40 @@ class _FileViewerState extends State<FileViewer> {
     await Clipboard.setData(ClipboardData(text: _content));
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('已复制到剪贴板'),
-        duration: Duration(seconds: 2),
-      ),
+      const SnackBar(content: Text('已复制到剪贴板'), duration: Duration(seconds: 2)),
     );
   }
 
-  /// 下载文件（下载单个文件而非同步整个目录）
+  /// 下载文件（单个文件，走流式 + 左栏「下载」列表）
   ///
-  /// 调用 [ApiService.downloadFile] 获取文件字节，然后通过
-  /// [FilePicker.platform.saveFile] 让用户选择保存位置并写入本地。
+  /// M8d：选保存目录后交给 [DownloadCenter] 后台流式落盘，进度与取消都在下载列表里。
   Future<void> _downloadFile() async {
-    // 提取文件名
+    if (isMobile) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('移动端暂不支持保存到本地文件系统，请到桌面端下载')));
+      return;
+    }
     final String filename = widget.filePath.split('/').last;
-    showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (BuildContext ctx) {
-        return _DownloadProgressDialog(
-          workspaceId: widget.workspaceId,
-          filePath: widget.filePath,
-          filename: filename,
-          teamId: widget.teamId ?? '',
-        );
-      },
+    final String? dirPath = await FilePicker.getDirectoryPath(
+      dialogTitle: '选择保存目录',
     );
+    if (dirPath == null || dirPath.isEmpty) return;
+    if (!mounted) return;
+    final String savePath = '$dirPath${Platform.pathSeparator}$filename';
+    unawaited(
+      DownloadCenter.instance.startFileDownload(
+        workspaceId: widget.workspaceId,
+        path: widget.filePath,
+        savePath: savePath,
+        name: filename,
+        sourceTeam: widget.teamName ?? '',
+        sourceTeamId: widget.teamId ?? '',
+        teamId: widget.teamId ?? '',
+      ),
+    );
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text('已加入下载列表：$filename')));
   }
 
   @override
@@ -302,9 +378,7 @@ class _FileViewerState extends State<FileViewer> {
             color: Theme.of(context).dividerColor,
           ),
           // 内容区域
-          Expanded(
-            child: _buildBody(),
-          ),
+          Expanded(child: _buildBody()),
         ],
       ),
     );
@@ -317,11 +391,9 @@ class _FileViewerState extends State<FileViewer> {
   Widget _buildHeader() {
     final _FileType type = _fileType;
     final cs = Theme.of(context).colorScheme;
-    final bool canToggle =
-        type == _FileType.markdown || type == _FileType.svg;
+    final bool canToggle = type == _FileType.markdown || type == _FileType.svg;
     final bool canCopy = !_isLoading && _error == null && _content.isNotEmpty;
-    final bool canRefresh =
-        type != _FileType.pdf && type != _FileType.office;
+    final bool canRefresh = type != _FileType.pdf && type != _FileType.office;
     return Container(
       height: 56,
       padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -356,10 +428,7 @@ class _FileViewerState extends State<FileViewer> {
                     widget.filePath,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: cs.outline,
-                    ),
+                    style: TextStyle(fontSize: 11, color: cs.outline),
                   ),
               ],
             ),
@@ -480,18 +549,11 @@ class _FileViewerState extends State<FileViewer> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(
-              Icons.error_outline,
-              size: 40,
-              color: Color(0xFFEF4444),
-            ),
+            const Icon(Icons.error_outline, size: 40, color: Color(0xFFEF4444)),
             const SizedBox(height: 8),
             Text(
               message,
-              style: TextStyle(
-                color: cs.outline,
-                fontSize: 13,
-              ),
+              style: TextStyle(color: cs.outline, fontSize: 13),
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 16),
@@ -621,11 +683,13 @@ class _FileViewerState extends State<FileViewer> {
   /// 核心只给字节；滚动、缩放、翻页、文本选择复制都由 pdfrx 处理——比"核心逐页
   /// 渲染成 PNG"少一次往返，也不再需要自绘页码导航。
   Widget _buildPdfView() {
-    final Uint8List? bytes = _pdfBytes;
-    if (bytes == null) return _buildErrorView('PDF 内容为空');
+    final String? path = _pdfPath;
+    if (path == null) return _buildErrorView('PDF 内容为空');
     return Column(
       children: [
-        Expanded(child: PdfPreview(bytes: bytes, fileName: _fileName)),
+        Expanded(
+          child: PdfPreview(filePath: path, fileName: _fileName),
+        ),
         Container(
           height: 34,
           width: double.infinity,
@@ -638,9 +702,7 @@ class _FileViewerState extends State<FileViewer> {
             ),
           ),
           child: Text(
-            _totalPages > 0
-                ? '$_totalPages 页 · 可滚动缩放、选中文字复制'
-                : '可滚动缩放、选中文字复制',
+            _totalPages > 0 ? '$_totalPages 页 · 可滚动缩放、选中文字复制' : '可滚动缩放、选中文字复制',
             style: TextStyle(
               fontSize: 12,
               color: Theme.of(context).colorScheme.onSurfaceVariant,
@@ -698,7 +760,11 @@ class _FileViewerState extends State<FileViewer> {
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(Icons.info_outline, size: 16, color: cs.onSurfaceVariant),
+                  Icon(
+                    Icons.info_outline,
+                    size: 16,
+                    color: cs.onSurfaceVariant,
+                  ),
                   const SizedBox(width: 8),
                   Flexible(
                     child: Text(
@@ -736,10 +802,7 @@ class _FileViewerState extends State<FileViewer> {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Text(
-            '$label：',
-            style: TextStyle(fontSize: 12, color: cs.outline),
-          ),
+          Text('$label：', style: TextStyle(fontSize: 12, color: cs.outline)),
           const SizedBox(width: 4),
           ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 240),
@@ -822,15 +885,17 @@ class _MarkdownRenderer extends StatelessWidget {
       } else if (line.startsWith('- ') || line.startsWith('* ')) {
         widgets.add(_buildListItem(line.substring(2), false, context: context));
       } else {
-        final RegExpMatch? orderedMatch =
-            RegExp(r'^(\d+)\.\s+(.*)').firstMatch(line);
+        final RegExpMatch? orderedMatch = RegExp(r'^(\d+)\.\s+(.*)')
+            .firstMatch(line);
         if (orderedMatch != null) {
-          widgets.add(_buildListItem(
-            orderedMatch.group(2)!,
-            true,
-            number: orderedMatch.group(1)!,
-            context: context,
-          ));
+          widgets.add(
+            _buildListItem(
+              orderedMatch.group(2)!,
+              true,
+              number: orderedMatch.group(1)!,
+              context: context,
+            ),
+          );
         } else {
           widgets.add(_buildParagraph(line, context));
         }
@@ -902,9 +967,7 @@ class _MarkdownRenderer extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
         color: Theme.of(context).scaffoldBackgroundColor,
-        border: Border(
-          left: BorderSide(color: cs.primary, width: 3),
-        ),
+        border: Border(left: BorderSide(color: cs.primary, width: 3)),
         borderRadius: const BorderRadius.only(
           topRight: Radius.circular(4),
           bottomRight: Radius.circular(4),
@@ -1000,37 +1063,45 @@ class _MarkdownRenderer extends StatelessWidget {
       }
       final String token = match.group(0)!;
       if (token.startsWith('**')) {
-        spans.add(TextSpan(
-          text: token.substring(2, token.length - 2),
-          style: const TextStyle(fontWeight: FontWeight.bold),
-        ));
-      } else if (token.startsWith('`')) {
-        spans.add(TextSpan(
-          text: token.substring(1, token.length - 1),
-          style: TextStyle(
-            fontFamily: 'monospace',
-            backgroundColor: Theme.of(context).dividerColor,
+        spans.add(
+          TextSpan(
+            text: token.substring(2, token.length - 2),
+            style: const TextStyle(fontWeight: FontWeight.bold),
           ),
-        ));
-      } else if (token.startsWith('[')) {
-        final RegExpMatch? linkMatch =
-            RegExp(r'\[([^\]]+)\]\(([^)]+)\)').firstMatch(token);
-        if (linkMatch != null) {
-          spans.add(TextSpan(
-            text: linkMatch.group(1),
+        );
+      } else if (token.startsWith('`')) {
+        spans.add(
+          TextSpan(
+            text: token.substring(1, token.length - 1),
             style: TextStyle(
-              color: cs.primary,
-              decoration: TextDecoration.underline,
+              fontFamily: 'monospace',
+              backgroundColor: Theme.of(context).dividerColor,
             ),
-          ));
+          ),
+        );
+      } else if (token.startsWith('[')) {
+        final RegExpMatch? linkMatch = RegExp(r'\[([^\]]+)\]\(([^)]+)\)')
+            .firstMatch(token);
+        if (linkMatch != null) {
+          spans.add(
+            TextSpan(
+              text: linkMatch.group(1),
+              style: TextStyle(
+                color: cs.primary,
+                decoration: TextDecoration.underline,
+              ),
+            ),
+          );
         } else {
           spans.add(TextSpan(text: token));
         }
       } else if (token.startsWith('*')) {
-        spans.add(TextSpan(
-          text: token.substring(1, token.length - 1),
-          style: const TextStyle(fontStyle: FontStyle.italic),
-        ));
+        spans.add(
+          TextSpan(
+            text: token.substring(1, token.length - 1),
+            style: const TextStyle(fontStyle: FontStyle.italic),
+          ),
+        );
       }
       lastEnd = match.end;
     }
@@ -1038,160 +1109,5 @@ class _MarkdownRenderer extends StatelessWidget {
       spans.add(TextSpan(text: text.substring(lastEnd)));
     }
     return spans;
-  }
-}
-
-/// 下载进度对话框
-///
-/// 调用 [ApiService.downloadFile] 获取单个文件字节，
-/// 然后通过 [FilePicker.platform.saveFile] 让用户选择保存位置，
-/// 写入本地文件后显示结果，1.5 秒后自动关闭。
-class _DownloadProgressDialog extends StatefulWidget {
-  /// 工作空间 ID
-  final String workspaceId;
-
-  /// 工作空间内的文件路径
-  final String filePath;
-
-  /// 建议的文件名
-  final String filename;
-
-  /// 顶层 agent（team）ID，用于后端三模式分派；为空时后端按 workspaceId 兜底
-  final String? teamId;
-
-  const _DownloadProgressDialog({
-    required this.workspaceId,
-    required this.filePath,
-    required this.filename,
-    this.teamId,
-  });
-
-  @override
-  State<_DownloadProgressDialog> createState() =>
-      _DownloadProgressDialogState();
-}
-
-class _DownloadProgressDialogState extends State<_DownloadProgressDialog> {
-  /// 是否正在执行
-  bool _isRunning = true;
-
-  /// 结果消息
-  String? _result;
-
-  /// 是否成功
-  bool _success = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _runTask();
-  }
-
-  /// 执行下载任务：获取字节 -> 选择保存路径 -> 写入本地
-  Future<void> _runTask() async {
-    try {
-      // 1. 下载文件字节
-      final Uint8List bytes = await ApiService.downloadFile(
-        widget.workspaceId,
-        widget.filePath,
-        teamId: widget.teamId ?? '',
-      );
-      if (!mounted) return;
-
-      // 2. 选择保存位置
-      // 桌面端：系统保存对话框（file_picker.saveFile 仅桌面支持）
-      // 移动端：无系统文件选择器，保存到应用文档目录并提示完整路径
-      String? savePath;
-      // 桌面分支由 file_picker.saveFile 直接落盘（已写入）；移动分支仍需手动写
-      bool alreadyWritten = false;
-      if (isMobile) {
-        final Directory docDir = await getApplicationDocumentsDirectory();
-        savePath = '${docDir.path}${Platform.pathSeparator}${widget.filename}';
-      } else {
-        // file_picker 13：saveFile 直接接收字节并落盘，返回目标 Uri（已写入，无需再写）
-        final Uri? savedUri = await FilePicker.saveFile(
-          dialogTitle: '保存文件',
-          fileName: widget.filename,
-          bytes: bytes,
-        );
-        if (savedUri != null) {
-          savePath = savedUri.scheme == 'file'
-              ? savedUri.toFilePath()
-              : savedUri.toString();
-          alreadyWritten = true;
-        }
-      }
-      if (!mounted) return;
-
-      if (savePath == null) {
-        // 用户取消保存
-        setState(() {
-          _isRunning = false;
-          _result = '已取消';
-          _success = false;
-        });
-        await Future<void>.delayed(const Duration(milliseconds: 1500));
-        if (mounted && Navigator.of(context).canPop()) {
-          Navigator.of(context).pop();
-        }
-        return;
-      }
-
-      // 3. 写入本地文件（桌面端 file_picker 已写入，仅移动端在此落盘）
-      if (!alreadyWritten) {
-        await File(savePath).writeAsBytes(bytes);
-      }
-
-      if (!mounted) return;
-      setState(() {
-        _isRunning = false;
-        _result = isMobile ? '已保存到：$savePath' : '下载完成';
-        _success = true;
-      });
-    } on Exception catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _isRunning = false;
-        _result = e.toString().replaceFirst('Exception: ', '');
-        _success = false;
-      });
-    }
-    // 1.5 秒后自动关闭
-    await Future<void>.delayed(const Duration(milliseconds: 1500));
-    if (mounted && Navigator.of(context).canPop()) {
-      Navigator.of(context).pop();
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('下载文件'),
-      content: Row(
-        children: [
-          if (_isRunning)
-            const SizedBox(
-              width: 20,
-              height: 20,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            )
-          else
-            Icon(
-              _success ? Icons.check_circle : Icons.info_outline,
-              size: 20,
-              color: _success
-                  ? const Color(0xFF10B981)
-                  : const Color(0xFFF59E0B),
-            ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              _isRunning ? '正在下载 ${widget.filename} ...' : (_result ?? ''),
-              style: const TextStyle(fontSize: 13),
-            ),
-          ),
-        ],
-      ),
-    );
   }
 }
