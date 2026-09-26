@@ -14,6 +14,8 @@ class HookTask {
     required this.logAbsolute,
     required this.process,
     required this.startedAt,
+    this.detached = false,
+    this.note = '',
   });
 
   final String id;
@@ -25,8 +27,18 @@ class HookTask {
   final String logRelative;
   final String logAbsolute;
 
-  final Process process;
+  /// 本机进程句柄；null = 这个任务不是在**本机**起的（见 [detached]）。
+  final Process? process;
   final DateTime startedAt;
+
+  /// 是否是「会话失联后转来的」后台任务（[TerminalHooks.adoptDetached]）。
+  ///
+  /// 这类任务：不新起进程、也没有输出重定向，远端命令可能仍在跑；本机既不能等它、
+  /// 也不能杀它，只记下「何时、为什么转的后台」供模型查询/续看。
+  final bool detached;
+
+  /// 转后台的原因（detached 时给模型看的说明）。
+  final String note;
 
   /// 退出码（null = 仍在运行）。
   int? exitCode;
@@ -153,22 +165,79 @@ class TerminalHooks {
     runInShell: false,
   );
 
+  /// 把一个**已经不在本机等待**的命令登记为后台任务（terminal 软超时 → hook 模式）。
+  ///
+  /// 与 [start] 的区别：不新起进程、也不重跑命令——远端那条可能还在跑，重跑会重复
+  /// 副作用。日志文件里只记录转后台的时间、命令与原因：输出抓不回来了（执行器判
+  /// 失活时只是「不再等它」，那条通道上的输出没有落到本机），所以如实写明，不假装
+  /// 有日志可看。
+  Future<HookTask> adoptDetached({
+    required WorkspaceIO io,
+    required String agentId,
+    required String sessionId,
+    required String command,
+    required String reason,
+    String? outputFile,
+  }) async {
+    _seq++;
+    final String id = 'hook_${DateTime.now().millisecondsSinceEpoch}_$_seq';
+    final String relative = (outputFile == null || outputFile.trim().isEmpty)
+        ? '.output/$id.log'
+        : outputFile.trim();
+    // resolve 会拒绝越界路径：转后台的日志同样只能落在工作空间内
+    final String absolute = io.resolve(relative);
+    final DateTime startedAt = DateTime.now();
+    final File file = File(absolute);
+    await file.parent.create(recursive: true);
+    await file.writeAsString(
+      '# [terminal hook] 会话失联后转后台（未终止远端进程、未重跑命令）'
+      '\n# command: $command'
+      '\n# reason: $reason'
+      '\n# at ${startedAt.toIso8601String()}'
+      '\n\n远端命令可能仍在执行；本机已不再等待它，因此拿不到它的退出码与输出。'
+      '\n链路恢复后请用 terminal 重新确认远端进程与产物，不要直接重跑。'
+      '\n',
+      flush: true,
+    );
+    final HookTask task = HookTask(
+      id: id,
+      agentId: agentId,
+      sessionId: sessionId,
+      command: command,
+      logRelative: relative,
+      logAbsolute: absolute,
+      process: null,
+      detached: true,
+      note: reason,
+      startedAt: startedAt,
+    );
+    _tasks[id] = task;
+    log?.call('会话失联：命令转后台 $id（$command）→ $relative');
+    return task;
+  }
+
   /// 取消任务（杀整棵进程树）。返回是否真的发出了终止。
+  ///
+  /// detached 任务没有本机进程句柄（会话失联时转的），这里**只能返回 false**：
+  /// 远端进程不归本机管，别假装杀成功了。
   Future<bool> cancel(String id) async {
     final HookTask? task = _tasks[id];
     if (task == null) return false;
     if (!task.running) return false;
+    final Process? process = task.process;
+    if (process == null) return false;
     task.cancelled = true;
-    await Shell.killProcessTree(task.process.pid);
+    await Shell.killProcessTree(process.pid);
     return true;
   }
 
   /// 关停：杀掉全部在途任务。
   Future<void> close() async {
     for (final HookTask task in _tasks.values.toList()) {
-      if (task.running) {
+      final Process? process = task.process;
+      if (task.running && process != null) {
         task.cancelled = true;
-        await Shell.killProcessTree(task.process.pid);
+        await Shell.killProcessTree(process.pid);
       }
     }
     _tasks.clear();
@@ -176,14 +245,20 @@ class TerminalHooks {
 
   /// status 动作的回传文本：状态 + 退出码 + 耗时 + 日志尾部。
   String renderStatus(HookTask task) {
-    final StringBuffer buffer = StringBuffer()
-      ..writeln('task_id: ${task.id}')
-      ..writeln(
+    final StringBuffer buffer = StringBuffer()..writeln('task_id: ${task.id}');
+    if (task.detached) {
+      // 会话失联转来的任务：远端状态本机看不到，如实说清楚，不要假装知道退出码
+      buffer
+        ..writeln('状态：已转后台（会话失联；远端命令可能仍在运行，本机无法确认也无法终止）')
+        ..writeln('原因：${task.note}');
+    } else {
+      buffer.writeln(
         '状态：${task.running ? '运行中' : '已结束'}'
         '${task.running ? '' : '（退出码 ${task.exitCode}${task.cancelled ? '，已被取消' : ''}）'}'
         '｜耗时 ${task.elapsed.inSeconds}s',
-      )
-      ..writeln('日志：${task.logRelative}');
+      );
+    }
+    buffer.writeln('日志：${task.logRelative}');
     final String? tail = _tail(task.logAbsolute);
     if (tail != null && tail.trim().isNotEmpty) {
       buffer

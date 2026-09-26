@@ -1,6 +1,18 @@
 import '../settings/ssh_config.dart';
 import '../store/records.dart';
 
+/// Spec 索引提供者（M9 Q9）：返回**当前**索引文本（空串 = 不注入）；默认 null。
+///
+/// 为什么用可设置的 provider，而不是给 [systemPromptWithWorkspace] 加必填参数：
+/// 系统提示词在**两处**被拼装——会话生成（ConversationService 的 _contextOf）与压缩
+/// 估算（CompactionService.estimateContextTokens）——两处必须看到逐字一致的字符串，
+/// 否则压缩阈值会失真。provider 让两处自动同口径，接线只要一行（核心启动处）：
+/// `specIndexProvider = (agent) => specs.indexSnapshot(agent.id)`。
+///
+/// 每轮拼提示词都会重新调它（这里不做缓存），因此 `spec create` / `spec update`
+/// 之后下一轮的索引就是新的。
+String Function(CoreAgent agent)? specIndexProvider;
+
 /// 工作空间说明（M8a）——作为**软约束**追加在 agent 自己的系统提示词之后。
 ///
 /// 三个设计决定：
@@ -34,12 +46,31 @@ String workspacePromptSuffix(CoreAgent agent) {
 - 布局不确定时先用 list/grep 看一眼，不要凭猜测拼路径。''';
 }
 
-/// agent 自己的系统提示词 + 工作空间软约束。
+/// Spec 索引段（Q9）：索引文本来自 [specIndexProvider] 或调用方显式传入的 [explicit]。
 ///
-/// 空提示词只返回这一段；非空则保留原文，用空行分隔追加——原文一字不改，
-/// 便于用户对照自己写在 agent 配置里的内容。
-String systemPromptWithWorkspace(CoreAgent agent) {
+/// 行格式（`- id [task_type] 标题（内置）（适用: when 摘要）`，id 自带反引号）与截断口径
+/// 都在 `SpecService.renderIndex` 里——这里只加章节标题与用法说明，不重复实现格式。
+String specIndexSection(String explicit) {
+  final String index = explicit.trim();
+  if (index.isEmpty) return '';
+  return '\n\n## Spec 索引（任务型规范）\n\n$index\n\n'
+      '开工前先按上表的 id 与适用条件判断该挂哪份规范：`spec select` 会**直接返回全文**'
+      '并挂上 hook；没有合适的就不挂（不要硬凑），任务收尾可用 `spec create` 把经验沉淀成新规范。';
+}
+
+/// agent 自己的系统提示词 + 工作空间软约束 + Spec 索引（Q9）。
+///
+/// 空提示词只返回约束段；非空则保留原文，用空行分隔追加——原文一字不改，
+/// 便于用户对照自己写在 agent 配置里的内容。索引为空（没接 Spec 服务）时
+/// 输出与 M8a 完全一致。
+String systemPromptWithWorkspace(CoreAgent agent, {String specIndex = ''}) {
   final String base = agent.systemPrompt.trimRight();
   final String suffix = workspacePromptSuffix(agent);
-  return base.isEmpty ? suffix : '$base\n\n$suffix';
+  final String index = specIndexSection(
+    specIndex.trim().isEmpty
+        ? (specIndexProvider?.call(agent) ?? '')
+        : specIndex,
+  );
+  final String tail = '$suffix$index';
+  return base.isEmpty ? tail : '$base\n\n$tail';
 }

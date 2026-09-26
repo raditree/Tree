@@ -23,8 +23,9 @@ import '../store/tree_store.dart';
 ///   REST 语义。远端上传仍然是"本地暂存分片 → complete 时一次 SFTP 写"（不需要
 ///   远端追加写）；远端 `archive` 是"先把子树拉回本地临时目录，再用本地 tar 打包"
 ///   （远端不一定有 tar，且这样只需一条代码路径）；
-/// - **远端 Git 面板暂不支持**（`gitLog`/`gitBranches` 仍返回可读 400）：那需要经
-///   `exec` 跑 git 并解析输出，属于后续项；
+/// - **远端 Git 也支持**（M9 Q4）：SSH agent 的 `gitLog`/`gitBranches` 经 [WorkspaceIO]
+///   的 exec 通道跑 git（命令与解析在 `tree_local_exec` 的 GitOutput 里，与本地共用），
+///   非仓库 / 远端没有 git 时返回空列表 + 退出码，面板显示空态而不是 400；
 /// - PDF 预览：M7e 起由**前端**渲染（核心只给字节），因此这里没有 `pdf_preview`。
 class FileService {
   FileService({
@@ -32,6 +33,7 @@ class FileService {
     required this.defaultWorkspaceDir,
     this.log,
     this.remoteFilesFor,
+    this.ioFor,
     this.maxListEntries = 2000,
     this.maxContentBytes = 8 * 1024 * 1024,
     this.gitTimeout = const Duration(seconds: 10),
@@ -78,9 +80,21 @@ class FileService {
   /// 打包命令（默认 `tar`：Windows 10+ 自带 bsdtar，Linux/macOS 也有；测试可注入）。
   final String tarCommand;
 
-  /// 取某 agent 的**远端**文件面板后端（M7g）；null = 该 agent 的工作空间不在远端，
+  /// 取某 agent 的**远端后端**（M7g → M9 Q4）；null = 该 agent 的工作空间不在远端，
   /// 或核心没接线（此时远端 agent 会拿到可读 400 而不是假装成功）。
-  final Future<WorkspaceFiles?> Function(String agentId)? remoteFilesFor;
+  ///
+  /// 返回类型是 [Object] 而不是 [WorkspaceFiles]：SSH 后端（`SshWorkspaceIO`）同时
+  /// 实现了 [WorkspaceFiles]（文件面板）与 [WorkspaceIO]（Git 面板要经它跑 exec），
+  /// 两者是**同一个连接对象**。宽类型让调用方各取所需地窄化（[remoteFor] /
+  /// [remoteIoFor]），既不必为 Git 再建一条连接，也不必再加一个工厂。
+  final Future<Object?> Function(String agentId)? remoteFilesFor;
+
+  /// 取某 agent 的**工作空间 IO**（M9 Q4：远端 Git 经它跑 git）。
+  ///
+  /// 两条路都行：显式传 `ioFor`（CLI 里就是 `tools.ioFor`）最直白；不传时从
+  /// [remoteFilesFor] 返回的同一个 SSH 连接对象按运行期类型窄化（`SshWorkspaceIO`
+  /// 同时实现两个接口）。都拿不到就返回可读 400，不假装成功。
+  final Future<WorkspaceIO?> Function(String agentId)? ioFor;
 
   /// 进行中的分片上传会话（`upload_id` → 会话）。
   final Map<String, _UploadSession> _uploads = <String, _UploadSession>{};
@@ -106,9 +120,25 @@ class FileService {
   /// 为什么要 await：SSH 连接是懒建的（首次用到才连），与工具层共用同一个
   /// `ioFor` 工厂，避免"文件面板一条连接、工具又一条"。
   Future<WorkspaceFiles?> remoteFor(CoreAgent agent) async {
+    final Object? backend = await _remoteBackendFor(agent);
+    return backend is WorkspaceFiles ? backend : null;
+  }
+
+  /// 取该 agent 的远端**工作空间 IO**（M9 Q4：远端 Git 面板经它跑 git）。
+  ///
+  /// 本机 agent 恒为 null（本机 Git 直接 `Process.run`）；远端后端不是 [WorkspaceIO]
+  /// 时也返回 null，由调用方给可读 400 而不是假装成功。
+  Future<WorkspaceIO?> remoteIoFor(CoreAgent agent) async {
+    final Future<WorkspaceIO?> Function(String agentId)? explicit = ioFor;
+    if (explicit != null) return explicit(agent.id);
+    final Object? backend = await _remoteBackendFor(agent);
+    return backend is WorkspaceIO ? backend : null;
+  }
+
+  /// 远端后端对象（未窄化）：[remoteFor] / [remoteIoFor] 各自按需窄化。
+  Future<Object?> _remoteBackendFor(CoreAgent agent) async {
     if (agent.sshConfig == null) return null;
-    final Future<WorkspaceFiles?> Function(String agentId)? factory =
-        remoteFilesFor;
+    final Future<Object?> Function(String agentId)? factory = remoteFilesFor;
     if (factory == null) return null;
     return factory(agent.id);
   }
@@ -539,15 +569,16 @@ class FileService {
   static const int _pdfTailBytes = 512 * 1024;
 
   /// Git 提交历史（`GET /api/workspaces/{id}/git/log`）。
+  ///
+  /// 本机直接 `Process.run`；SSH agent 经 [WorkspaceIO] 的 exec 通道（M9 Q4），
+  /// 返回体保持既有的 `{commits: [{hash, author, date, message}]}` 形状。
   Future<Map<String, dynamic>> gitLog(
     String workspaceId, {
     int limit = 50,
   }) async {
     final CoreAgent? agent = agentFor(workspaceId);
     if (agent == null) return _error('工作空间不存在：$workspaceId');
-    if (agent.sshConfig != null) {
-      return _error('该工作空间在远端（SSH）：暂不支持远端 Git 历史', 400);
-    }
+    if (agent.sshConfig != null) return _gitLogRemote(agent, limit);
     final String root = rootFor(agent);
     if (!Directory(root).existsSync()) return _error('工作空间目录不存在：$root');
     final ProcessResult result = await _git(root, <String>[
@@ -575,12 +606,13 @@ class FileService {
   }
 
   /// Git 分支列表（`GET /api/workspaces/{id}/git/branches`）。
+  ///
+  /// 返回体保持既有的 `{branches: [{name: ...}], current}` 形状（前端 `git_history.dart`
+  /// 与 `files_api_test.dart` 都按这个断言）。
   Future<Map<String, dynamic>> gitBranches(String workspaceId) async {
     final CoreAgent? agent = agentFor(workspaceId);
     if (agent == null) return _error('工作空间不存在：$workspaceId');
-    if (agent.sshConfig != null) {
-      return _error('该工作空间在远端（SSH）：暂不支持远端 Git 分支', 400);
-    }
+    if (agent.sshConfig != null) return _gitBranchesRemote(agent);
     final String root = rootFor(agent);
     if (!Directory(root).existsSync()) return _error('工作空间目录不存在：$root');
     final ProcessResult branches = await _git(root, <String>[
@@ -606,6 +638,53 @@ class FileService {
     };
   }
 
+  /// 远端（SSH）Git 历史（M9 Q4）：经该 agent 的 [WorkspaceIO] exec 通道跑 git。
+  ///
+  /// 非仓库 / 远端没有 git 时 [GitLogOutcome] 是**空列表 + 退出码**（执行层不抛异常），
+  /// 面板显示空态——这正是 Q4 要修的行为（以前一律 400）。
+  Future<Map<String, dynamic>> _gitLogRemote(CoreAgent agent, int limit) async {
+    final WorkspaceIO? io = await remoteIoFor(agent);
+    if (io == null) {
+      return _error('该工作空间在远端（SSH）：核心未接入远端 Git 后端（工作空间 IO 不可用）', 400);
+    }
+    final GitLogOutcome outcome;
+    try {
+      outcome = await io.gitLog(limit: limit);
+    } on WorkspaceIoException catch (error) {
+      // 链路失活/读失败必须显式报错，不能返回空列表——空列表会被误读成「仓库没有提交」
+      return _error('读取远端 Git 历史失败：${error.message}', 500);
+    } catch (error) {
+      return _error('读取远端 Git 历史失败：$error', 500);
+    }
+    return <String, dynamic>{
+      'commits': outcome.commits.map((GitCommit c) => c.toJson()).toList(),
+    };
+  }
+
+  /// 远端（SSH）Git 分支（M9 Q4）。
+  Future<Map<String, dynamic>> _gitBranchesRemote(CoreAgent agent) async {
+    final WorkspaceIO? io = await remoteIoFor(agent);
+    if (io == null) {
+      return _error('该工作空间在远端（SSH）：核心未接入远端 Git 后端（工作空间 IO 不可用）', 400);
+    }
+    final GitBranchesOutcome outcome;
+    try {
+      outcome = await io.gitBranches();
+    } on WorkspaceIoException catch (error) {
+      return _error('读取远端 Git 分支失败：${error.message}', 500);
+    } catch (error) {
+      return _error('读取远端 Git 分支失败：$error', 500);
+    }
+    return <String, dynamic>{
+      // REST 形状照旧：branches 是 [{name: ...}]（不是 GitBranchesOutcome 的字符串数组），
+      // 前端 git_history.dart 两种都认，但 files_api_test 与既有前端按对象形态取用
+      'branches': <Map<String, dynamic>>[
+        for (final String name in outcome.branches)
+          <String, dynamic>{'name': name},
+      ],
+      'current': outcome.current,
+    };
+  }
   // ── 写路径（M7d-3）：分片上传 / 同步到本地 / 目录打包下载 ────────────────
 
   /// 建立分片上传会话（`POST /api/files/{id}/upload_init`）。

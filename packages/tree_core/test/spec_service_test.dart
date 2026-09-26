@@ -5,7 +5,7 @@ import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
 import 'package:tree_local_exec/tree_local_exec.dart';
 
-/// Spec 体系（M5d）：内置模板、索引、read→select 前置、沉淀与维护。
+/// Spec 体系（M9 Q9）：内置模板、索引前置（注入系统提示词）、select 直取全文、沉淀与维护。
 void main() {
   late Directory temp;
   late LocalWorkspaceIO io;
@@ -78,29 +78,18 @@ void main() {
     expect(document, isNotNull, reason: '内置优先读内嵌常量，副本改动不影响内置');
   });
 
-  test('read/select：不存在报可读错误；必须先 read 再 select；空数组清空', () async {
+  test('select：直接返回全文（无 read 前置）；空数组清空；不存在报可读错误', () async {
     final Map<String, dynamic> missing = await service.run(
-      call(<String, dynamic>{'action': 'read', 'spec_id': 'nope'}),
-      io,
-    );
-    expect(missing['error'], contains('Spec 不存在: nope'));
-
-    final Map<String, dynamic> guard = await service.run(
       call(<String, dynamic>{
         'action': 'select',
-        'spec_ids': <String>['easy-task'],
+        'spec_ids': <String>['ghost'],
       }),
       io,
     );
-    expect(guard['error'], contains('select 前必须先 read 对应 Spec'));
+    expect(missing['error'], contains('Spec 不存在: [ghost]'));
     expect(selected(), isEmpty, reason: '被拒时不得写入选择');
 
-    final Map<String, dynamic> read = await service.run(
-      call(<String, dynamic>{'action': 'read', 'spec_id': 'easy-task'}),
-      io,
-    );
-    expect(read['content'], kBuiltinSpecs['easy-task']);
-
+    // Q9：不再要求「先 read」——一次调用既拿全文又挂 hook
     final Map<String, dynamic> ok = await service.run(
       call(<String, dynamic>{
         'action': 'select',
@@ -109,6 +98,16 @@ void main() {
       io,
     );
     expect(ok['spec_ids'], <String>['easy-task'], reason: '去重保序');
+    expect(ok['count'], 1);
+    final Map<String, dynamic> first =
+        (ok['specs'] as List<dynamic>).single as Map<String, dynamic>;
+    expect(first['id'], 'easy-task');
+    expect(
+      first['content'],
+      kBuiltinSpecs['easy-task'],
+      reason: 'select 直接回全文',
+    );
+    expect(ok['note'], contains('不需要再 read'));
     expect(selected(), <String>['easy-task']);
 
     final Map<String, dynamic> cleared = await service.run(
@@ -119,14 +118,14 @@ void main() {
     expect(cleared['note'], contains('取消全部'));
     expect(selected(), isEmpty);
 
-    final Map<String, dynamic> ghost = await service.run(
-      call(<String, dynamic>{
-        'action': 'select',
-        'spec_ids': <String>['ghost'],
-      }),
-      io,
-    );
-    expect(ghost['error'], contains('Spec 不存在: [ghost]'));
+    // 删掉的三个动作必须是可读错误，而不是静默成功
+    for (final String gone in <String>['search', 'list', 'read']) {
+      final Map<String, dynamic> result = await service.run(
+        call(<String, dynamic>{'action': gone, 'spec_id': 'easy-task'}),
+        io,
+      );
+      expect(result['error'], contains('未知 spec 动作'), reason: gone);
+    }
   });
 
   test('create：落盘到工作空间并可读回；重名/内置名/缺内容被拒', () async {
@@ -234,44 +233,67 @@ void main() {
     expect(ghost['error'], 'Spec 不存在: ghost');
   });
 
-  test('search：关键词命中 + 内置置顶；缺 query 报错', () async {
-    final Map<String, dynamic> noQuery = await service.run(
-      call(<String, dynamic>{'action': 'search'}),
-      io,
-    );
-    expect(noQuery['error'], contains('search 需要 query'));
+  test('索引渲染：格式照旧、内置标注、when 摘要超 80 截断、>50 条注明其余', () async {
+    final List<SpecDocument> all = await service.index(agent.id, io);
+    final String text = SpecService.renderIndex(all);
+    expect(text, contains('- `easy-task` [easy] 简单任务（直接解决）（内置）'));
+    expect(text, contains('（适用: '));
 
-    final Map<String, dynamic> hit = await service.run(
-      call(<String, dynamic>{'action': 'search', 'query': '困难 企业级 高风险'}),
-      io,
-    );
-    final List<dynamic> specs = hit['specs'] as List<dynamic>;
-    expect(specs, isNotEmpty);
-    expect(
-      (specs.first as Map<String, dynamic>)['id'],
-      'hard-task',
-      reason: '内置置顶 + 关键词命中',
-    );
+    // when 摘要超 80 字符：截断加省略号，不整条塞进提示词
+    final String one = SpecService.renderIndex(<SpecDocument>[
+      SpecDocument(id: 'x', title: '标题', body: '', when: <String>['条' * 100]),
+    ]);
+    expect(one, contains('…'));
+    expect(one.contains('条' * 81), isFalse, reason: '摘要只留前 80 字符');
+
+    // 默认全列、>50 条截断并注明「其余 N 条可用 spec select 直取（需已知 id）」
+    final List<SpecDocument> many = <SpecDocument>[
+      for (int i = 0; i < 55; i++)
+        SpecDocument(id: 'spec-$i', title: '标题 $i', body: ''),
+    ];
+    final String cut = SpecService.renderIndex(many);
+    expect(cut, contains('- `spec-49` '), reason: '第 50 条仍列出');
+    expect(cut, isNot(contains('`spec-50`')));
+    expect(cut, contains('其余 5 条可用 `spec select` 直取（需已知 id）'));
   });
 
-  test('list：返回索引与当前 selected_spec_ids', () async {
-    await service.run(
-      call(<String, dynamic>{'action': 'read', 'spec_id': 'easy-task'}),
-      io,
-    );
-    await service.run(
+  test('索引随系统提示词每轮重建：create/update 后自然刷新', () async {
+    // 模拟核心启动处的接线（CoreServer.start 做的是同一件事）
+    addTearDown(() => specIndexProvider = null);
+    specIndexProvider = (CoreAgent a) => service.indexSnapshot(a.id);
+    service.ioFor = (String _) async => io;
+
+    final String before = systemPromptWithWorkspace(agent);
+    expect(before, contains('## Spec 索引（任务型规范）'));
+    expect(before, contains('easy-task'), reason: '内置 4 条在索引里');
+    expect(before, isNot(contains('db-migration')));
+
+    final Map<String, dynamic> created = await service.run(
       call(<String, dynamic>{
-        'action': 'select',
-        'spec_ids': <String>['easy-task'],
+        'action': 'create',
+        'title': 'DB Migration',
+        'when': <String>['改表结构'],
+        'workflow': '先备份再迁移',
       }),
       io,
     );
-    final Map<String, dynamic> listed = await service.run(
-      call(<String, dynamic>{'action': 'list'}),
+    final String id = created['spec_id'] as String;
+    expect(id, 'db-migration');
+
+    // 没有「刷新索引」这个动作：下一轮提示词的索引里就有它了
+    final String after = systemPromptWithWorkspace(agent);
+    expect(after, contains('`db-migration` [custom] DB Migration'));
+    expect(after, contains('（适用: 改表结构）'));
+
+    await service.run(
+      call(<String, dynamic>{
+        'action': 'update',
+        'spec_id': id,
+        'title': 'DB 迁移规范',
+      }),
       io,
     );
-    expect(listed['count'], 4);
-    expect(listed['selected_spec_ids'], <String>['easy-task']);
+    expect(systemPromptWithWorkspace(agent), contains('DB 迁移规范'));
   });
 
   test('safeSpecId：小写、折叠连字符、去首尾；空则给时间戳兜底', () {
@@ -281,7 +303,7 @@ void main() {
     expect(safeSpecId('数据库'), startsWith('spec-'), reason: '中文标题退化为时间戳 id');
   });
 
-  test('工具声明：spec 需要工作空间、6 个 action、只在接入时才声明', () {
+  test('工具声明：spec 需要工作空间、只保留 select/create/update、只在接入时才声明', () {
     expect(
       BuiltinTools.specs().map((ToolSpec s) => s.name),
       isNot(contains('spec')),
@@ -295,12 +317,10 @@ void main() {
     final Map<String, dynamic> properties =
         spec.parameters['properties'] as Map<String, dynamic>;
     expect((properties['action'] as Map<String, dynamic>)['enum'], <String>[
-      'search',
-      'list',
-      'read',
       'select',
       'create',
       'update',
     ]);
+    expect(properties.containsKey('query'), isFalse, reason: 'search 已删除');
   });
 }

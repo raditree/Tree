@@ -139,11 +139,12 @@ tags: [complex, 多模块, 新功能, 重构, 多步, 单人串行]
 pinned: true
 builtin: true
 created_at: 0
-updated_at: 2026-09-10
-version: 4
+updated_at: 2026-09-26
+version: 5
 classification: 内部规范
 risk: medium
 changelog:
+  - "v5(2026-09-26): M9 Q9 工具瘦身：spec 只保留 select/create/update（索引改为系统提示词注入、select 直接返回全文），同步修正正文里的 spec 工具引用"
   - "v4(2026-09-10): complex 改为单人串行、无分工；team/分工/成员验收全部移除，需要分工即升级 hard；新增 .self/plan/xxx.md 强制计划与用户审核；新增侦察（Recon）阶段并写入 .self/recon.md 作为 plan 上下文输入；把测试、回归、关键路径核对纳入工作流闭环"
   - "v3(2026-09-10): team 工具拆分后修正工具引用：派活用 message send_message/broadcast、等待交付 wait_for；删除 assign_task/view_member_*，验收改为直接 read agentspace/{member_id}/.self/activity.log 与产物"
   - "v2(2026-08-30): 修正工具名引用（set_todo_list/read/edit/write/terminal）；新增判型确认清单、成员产出验收标准、分工与冲突处理、中断恢复、汇报模板"
@@ -177,15 +178,15 @@ changelog:
    - 首项固定为"检索 Spec 与确认环境（依赖/构建/分支状态）"；
    - 每项标注：依赖、影响面、回归范围、涉及文件（基于侦察笔记）。
 
-2. **检索 Spec**：用 `spec search` 找适用自定义 Spec。
-   - 明确命中 → `spec read` 取全文 + `spec select` 挂 hook，并遵循其工作流执行。
+2. **查 Spec 索引**：可用 Spec 已列在系统提示词的「Spec 索引」段（id/类型/标题/适用条件）。
+   - 明确命中 → `spec select`（**直接返回全文**并挂 hook），并遵循其工作流执行。
    - 未命中 → 走下方通用流程，完成后 `spec create` 沉淀新 Spec。
 
 3. **侦察（Recon）**：动手规划前先系统侦察，禁止凭想象拆解。
    - **边界侦察**：`grep` 相关入口文件、模块、接口、上下游调用链及侦察范围。
    - **代码侦察**：`read` 数据模型、配置、测试、现有模式与约定；梳理数据流与调用链。
    - **环境侦察**：`terminal` 确认构建命令、测试命令、依赖版本、运行环境（是否有虚拟环境）、git 工作区与当前分支状态。
-   - **历史侦察**：`spec list`/`spec search` 查历史 Spec 与决策记录；查近期相关提交、历史遗留问题与已知坑。
+   - **历史侦察**：用系统提示词里的 Spec 索引找历史 Spec，用 `spec select` 取全文查决策记录；查近期相关提交、历史遗留问题与已知坑。
    - **约束侦察**：明确不可改范围、外部依赖、兼容性要求、对外接口/存储格式约束。
    - **产出**：侦察笔记写入 `.self/plan/{YYYYMMDD}-{task_slug}/recon.md`，至少含——现状、涉及面（文件/模块/接口清单）、依赖与约束、未知项、初始风险、待确认问题；构建命令、测试命令、依赖版本、运行环境、git 工作区与当前分支状态写入 .self/memory.md。
    - 侦察发现判型有变（如需分工/架构级影响）→ 立即按边界与异常处理升级 hard。
@@ -241,7 +242,7 @@ changelog:
 - **先侦察再规划**：开工必须先完成 Recon 并写入 `.self/plan/{YYYYMMDD}-{task_slug}/recon.md`，禁止无侦察直接拆 todo 或写 plan。
 - **plan 必产出且先审后做**：用户无特殊要求时，必须先生成 `.self/plan/{YYYYMMDD}-{task_slug}/plan.md` 并经用户审核；未批准不得 edit/write 业务文件。
 - **todo 必建且全程跟踪**：开工即 `set_todo_list set`；过程中每完成/阻塞一项立即 update。
-- **先检索 Spec 再执行**：开工前必须 `spec search`，不盲目直接动手。
+- **先查 Spec 索引再执行**：开工前先对照系统提示词里的 Spec 索引，命中就 `spec select` 取全文，不盲目直接动手。
 - **测试与回归内建**：每项有局部验证，最终有全量验证、回归验证、关键路径核对；禁止只改不验。
 - **高风险操作先确认**：删除、覆盖、破坏性变更用 `ask_user_question` 先与用户确认再执行。
 - **回滚检查点**：开工前用 `terminal` 确认 git 工作区干净（有未提交改动先记录/提交）；破坏性步骤前用 git 记录检查点。
@@ -258,7 +259,7 @@ changelog:
 
 - **todo、plan、recon 为进度事实源**：状态以 `.self/todos.md` 为准（`set_todo_list get` 读取），计划以 `.self/plan/{YYYYMMDD}-{task_slug}/plan.md` 为准，侦察结论以 `.self/plan/{YYYYMMDD}-{task_slug}/recon.md` 为准；禁止在对话中口头跟踪后失忆。
 - **会话 compact/重建后恢复步骤**：
-  1. `spec list` 确认本会话 selected Spec 状态（compact 后 hook 注入是否仍在）；
+  1. 用工具结果里的会话状态（selected spec）确认本会话已挂的 Spec（compact 后 hook 注入是否仍在）；
   2. `set_todo_list get` 取回进度快照；
   3. `read` `.self/plan/{YYYYMMDD}-{task_slug}/recon.md`、plan 文件与关键产物文件恢复上下文；
   4. 从首个未完成项继续，不推倒重来。
@@ -311,11 +312,12 @@ tags: [hard, 架构, 团队, 评审, 企业级, 高危, 会议, 工作空间, �
 pinned: true
 builtin: true
 created_at: 0
-updated_at: 2026-09-10
-version: 4
+updated_at: 2026-09-26
+version: 5
 classification: 内部规范
 risk: high
 changelog:
+  - "v5(2026-09-26): M9 Q9 工具瘦身：spec 只保留 select/create/update（索引改为系统提示词注入、select 直接返回全文），同步修正正文里的 spec 工具引用"
   - "v4(2026-09-10): 新增侦察（Recon）阶段并写入 agentspace/.hard/{task_id}/recon.md；新增 hard 专属工作空间（goal.md/meeting/spec.md/task.md/checklist.md）；会议前必须明确上下文并确立议程；明确 top agent 不直接处理业务文件；成员派活给长时预算并允许其带子团队走企业流程；工作流阶段化、准入准出、闭环测试"
   - "v3(2026-09-10): team 工具拆分后修正工具引用：会议召集/派活改用 message send_message、broadcast，成员产出经统一工作目录日志验收"
   - "v2(2026-08-30): 修正工具名引用（set_todo_list/ask_user_question/read）；新增判型确认清单、流水线阶段准入准出标准、决策记录模板（ADR）、风险评估框架、高危确认单"
@@ -345,8 +347,8 @@ changelog:
 
 1. 初始化 todo：初始 todo 可仅包含基本工作流，到每个阶段时要求**先细化再执行**。
 2. 按上方判型表确认 hard。
-3. `spec search`：
-   - 命中适用 Spec → `spec read` + `spec select`，作为 hard 约束执行；
+3. 对照系统提示词里的「Spec 索引」：
+   - 命中适用 Spec → `spec select`（**直接返回全文**），作为 hard 约束执行；
    - 仅模糊命中 / 无命中 → 走本企业级流水线；
    - 若发现实际只需单人、无架构影响 → 按边界降级 complex，并保留已建文档作为输入。
 4. 用 `set_todo_list` 建立全任务计划，包含各阶段评审点。
@@ -360,7 +362,7 @@ changelog:
    - **边界侦察**：`grep` 相关入口文件、模块、接口、上下游调用链及侦察范围。
    - **代码侦察**：`read` 数据模型、配置、测试，梳理分层、调用链、数据流、现有模式与约定、技术债。
    - **环境侦察**：`terminal` 确认构建/测试/部署命令、依赖与版本、运行环境（是否有虚拟环境）、git 工作区与分支状态、CI/发布约束。
-   - **历史侦察**：`spec list`/`spec search` 查历史 Spec 与决策记录；查近期相关提交、历史遗留问题、既往尝试与失败原因。
+   - **历史侦察**：用系统提示词里的 Spec 索引找历史 Spec，用 `spec select` 取全文查决策记录；查近期相关提交、历史遗留问题、既往尝试与失败原因。
    - **约束侦察**：明确不可改范围、对外接口/存储格式/协议兼容性、合规与安全要求、外部依赖。
    - **领域侦察**（判据 2 命中时必做）：对无经验技术域做调研，收集候选方案、参考实现、行业实践与坑。
 3. **产出**：侦察笔记写入 `agentspace/.hard/{task_id}/recon.md`，至少含：

@@ -12,6 +12,7 @@ import '../agent/conversation_service.dart';
 import '../agent/question_broker.dart';
 import '../agent/question_store.dart';
 import '../agent/scripted_agent.dart';
+import '../agent/workspace_prompt.dart';
 import '../files/file_service.dart';
 import '../mcp/mcp_client.dart';
 import '../mcp/mcp_service.dart';
@@ -140,6 +141,10 @@ class CoreServer {
   /// WS 上行分片重组。
   final InboundFrameReassembler reassembler;
 
+  /// 本实例绑定的 Spec 索引 provider（Q9）：close 时按身份解绑，
+  /// 免得已关闭的核心把过期索引留在全局 provider 上。
+  String Function(CoreAgent)? _specIndexBinding;
+
   /// 版本号。
   final String version;
 
@@ -247,6 +252,21 @@ class CoreServer {
       reassembler: InboundFrameReassembler(),
       version: version,
     );
+    // Q9：Spec 索引注入系统提示词。做成**可设置的 provider**（而不是给
+    // `systemPromptWithWorkspace` 加参数）是因为提示词在会话生成与压缩估算两处
+    // 拼装，两处必须逐字一致；provider 让它们自动同口径，也不需要改会话服务。
+    // `ioFor` 让索引在没有快照时（例如首个会话）能在后台补一次全量扫描。
+    if (specService != null) {
+      final SpecService specs = specService;
+      specs.ioFor = specIoFor;
+      // agent 不属于这个 SpecService 的 store（同进程里可能有另一个核心/测试服务器）
+      // 时不注入：否则会把别的 store 的索引写进当前提示词。
+      String binding(CoreAgent agent) => specs.store.agent(agent.id) == null
+          ? ''
+          : specs.indexSnapshot(agent.id);
+      server._specIndexBinding = binding;
+      specIndexProvider = binding;
+    }
     server._registerRoutes();
     server._registerStubRoutes();
     if (enableHeartbeat) {
@@ -271,6 +291,10 @@ class CoreServer {
     // 先把在途落盘任务写完再关闭监听（write-behind 的收尾）
     await questions?.questions.flush();
     await store.flush();
+    // Q9：绑定还在自己身上才解绑（别的核心实例可能已经接管了全局 provider）
+    if (identical(specIndexProvider, _specIndexBinding)) {
+      specIndexProvider = null;
+    }
     await _http.close(force: force);
   }
 

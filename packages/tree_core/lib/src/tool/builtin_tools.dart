@@ -224,8 +224,9 @@ abstract final class BuiltinTools {
       description:
           '在工作空间根目录执行 shell 命令（Windows 用 cmd.exe，其他平台用 sh）。'
           '用于运行构建/测试/git/文件管理。stdout/stderr 都会被自动捕获，'
-          '无需追加 2>&1。超时会终止整棵进程树并回报 timed_out。'
-          '预计很长的命令（构建/全量测试/长脚本）请用 hook=true 后台执行：'
+          '无需追加 2>&1。**没有静态超时**：命令跑多久都会等（本地判据是进程还活着）；'
+          '只有 SSH 会话心跳丢失（会话失联）时才会不终止地转为后台任务，并返回 task_id'
+          '与查询方式。预计很长的命令（构建/全量测试/长脚本）请用 hook=true 后台执行：'
           '立即拿到 task_id，输出实时写进日志文件，命令结束后会自动收到'
           '[terminal hook] 提示，届时用 read 读取日志继续任务。',
       parameters: <String, dynamic>{
@@ -234,7 +235,7 @@ abstract final class BuiltinTools {
           'command': <String, dynamic>{'type': 'string'},
           'timeout_seconds': <String, dynamic>{
             'type': 'integer',
-            'description': '超时秒数（缺省 120，上限 1800）',
+            'description': '兼容参数（缺省 120，上限 1800）：M9 起不再按静态时长终止命令',
           },
           'hook': <String, dynamic>{
             'type': 'boolean',
@@ -494,7 +495,31 @@ abstract final class BuiltinTools {
       buffer.writeln('${match.path}:${match.lineNumber}: ${match.line.trim()}');
     }
     if (outcome.matches.isEmpty) {
-      buffer.writeln('（无匹配；已排除 .git 与依赖/构建目录）');
+      // Q10：无匹配时要能区分「真没有」与「被排除规则挡掉」，因此把本次**实际**扫描
+      // 范围写出来。清单由执行层在遍历/读取时顺手记录，字段名是 scannedFilePaths
+      // （scannedFiles 是既有的 int 计数，语义不变）。
+      buffer
+        ..writeln('无匹配。为区分「真没有」与「被排除规则挡掉」，本次实际扫描范围如下：')
+        ..writeln('- 扫描根：${path.isEmpty ? '.' : path}')
+        ..writeln('- 扫描文件：${outcome.scannedFileCount} 个');
+      final int shown = outcome.scannedFilePaths.length;
+      if (shown > 0) {
+        buffer.writeln(
+          '- 已扫描文件（相对工作空间根，列出 $shown/${outcome.scannedFileCount} 条）：'
+          '${outcome.scannedFilePaths.join('、')}',
+        );
+        if (outcome.scannedFileCount > shown) {
+          buffer.writeln(
+            '  （清单只保留前 $shown 条，本次共扫描 ${outcome.scannedFileCount} 个文件）',
+          );
+        }
+      }
+      buffer.writeln(
+        outcome.excludedDirs.isEmpty
+            ? '- 生效的排除目录：无（.git 与依赖/构建目录若存在会被默认排除）'
+            : '- 生效的排除目录（${outcome.excludedDirs.length} 个）：'
+                  '${outcome.excludedDirs.join('、')}',
+      );
     }
     return ToolOutcome(buffer.toString().trimRight());
   }
@@ -533,6 +558,13 @@ abstract final class BuiltinTools {
         );
       }
       if (hookAction == 'cancel') {
+        if (task.detached) {
+          return ToolOutcome(
+            '该任务是会话失联后转的后台任务，本机没有进程句柄，无法终止'
+            '（远端进程可能仍在运行）。\n${hooks.renderStatus(task)}',
+            isError: true,
+          );
+        }
         final bool requested = await hooks.cancel(taskId);
         return ToolOutcome(
           requested
@@ -588,10 +620,16 @@ abstract final class BuiltinTools {
     if (isCancelled?.call() ?? false) {
       return const ToolOutcome('已取消：命令未执行', isError: true);
     }
-    final ExecOutcome outcome = await io.exec(
-      command,
-      timeout: Duration(seconds: seconds),
-    );
+    final ExecOutcome outcome;
+    try {
+      outcome = await io.exec(command, timeout: Duration(seconds: seconds));
+    } on SshLinkStaleException catch (error) {
+      // M9 1.1：terminal 的「超时」判据是**活性**（心跳丢失 / 会话失联），不是静态时长。
+      // 本地执行的活性 = 进程存活，所以正常运行永远走不到这里；只有 SSH 心跳连续丢失
+      // （链路判失活）才会。此时**不杀进程、也不重跑命令**——远端那条可能还在跑，重跑
+      // 会重复副作用；把这次调用登记成后台任务，给模型一条可查询/续看的可见说明。
+      return _terminalStale(invocation, io, command, error, hooks);
+    }
     final StringBuffer buffer = StringBuffer()
       ..writeln(
         '退出码 ${outcome.exitCode}${outcome.timedOut ? '（超时已终止）' : ''}'
@@ -615,6 +653,45 @@ abstract final class BuiltinTools {
       );
     }
     return ToolOutcome(buffer.toString().trimRight(), isError: !outcome.ok);
+  }
+
+  /// SSH 会话心跳丢失（会话失联）时的软超时结果（M9 1.1）。
+  ///
+  /// 关键取舍：**不终止、不重跑**。执行器侧判失活只是「不再等它」，远端进程可能仍在
+  /// 运行；重跑会重复副作用，杀掉又违背「不因太久丢任务」的口径。因此把它转成 hook
+  /// 模式的后台任务（[TerminalHooks.adoptDetached]），并把查询/续看方式如实写给模型。
+  static Future<ToolOutcome> _terminalStale(
+    ToolInvocation invocation,
+    WorkspaceIO io,
+    String command,
+    SshLinkStaleException error,
+    TerminalHooks? hooks,
+  ) async {
+    final StringBuffer buffer = StringBuffer()
+      ..writeln('[terminal hook] SSH 会话心跳丢失（会话失联），命令没有跑完。')
+      ..writeln('**没有终止远端进程，也没有重跑命令**：远端那条命令可能仍在执行。');
+    if (hooks == null) {
+      buffer
+        ..writeln('原因：${error.message}')
+        ..writeln('续看方式：链路恢复后用 terminal 重新确认远端进程与产物，不要直接重跑。');
+      return ToolOutcome(buffer.toString().trimRight(), isError: true);
+    }
+    final HookTask task = await hooks.adoptDetached(
+      io: io,
+      agentId: invocation.agentId,
+      sessionId: invocation.sessionId,
+      command: command,
+      reason: error.message,
+    );
+    buffer
+      ..writeln('已转为后台任务（hook 模式），本轮不必继续等待。')
+      ..writeln('task_id: ${task.id}')
+      ..writeln('日志：${task.logRelative}')
+      ..writeln('如何查询/续看：')
+      ..writeln('1) terminal hook_action=status + task_id 看状态与日志尾部；')
+      ..writeln('2) read 该日志文件（链路恢复后可再用 terminal 确认远端产物）；')
+      ..writeln('3) 链路恢复前不要重跑同一条命令——远端可能仍在执行。');
+    return ToolOutcome(buffer.toString().trimRight(), isError: true);
   }
 
   /// `set_todo_list`：四个动作全部落盘并回显当前清单（模型要能看到状态）。

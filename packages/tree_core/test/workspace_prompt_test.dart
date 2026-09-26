@@ -1,5 +1,8 @@
+import 'dart:io';
+
 import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
+import 'package:tree_local_exec/tree_local_exec.dart';
 
 /// M8a：工作空间**软约束**。
 ///
@@ -69,12 +72,81 @@ void main() {
       expect(onlyConstraint, isNot(contains('   \n')));
     });
 
+    test('Q9：Spec 索引随提示词注入（provider / 显式参数），默认不注入', () {
+      final CoreAgent agent = makeAgent();
+      // 默认（核心没接线 Spec 服务）：与 M8a 完全一致
+      expect(systemPromptWithWorkspace(agent), isNot(contains('Spec 索引')));
+
+      // 可设置的 provider：会话生成与压缩估算两处自动同口径
+      addTearDown(() => specIndexProvider = null);
+      specIndexProvider = (CoreAgent _) => '- `easy-task` [easy] 简单任务（内置）';
+      final String wired = systemPromptWithWorkspace(agent);
+      expect(wired, contains('## Spec 索引（任务型规范）'));
+      expect(wired, contains('`easy-task`'));
+      expect(wired, startsWith('## 工作空间'), reason: '索引追加在软约束之后');
+
+      // 显式参数优先于 provider（调用方已经算好索引时用）
+      final String explicit = systemPromptWithWorkspace(
+        agent,
+        specIndex: '- `custom-x` [custom] 自定义',
+      );
+      expect(explicit, contains('`custom-x`'));
+      expect(explicit, isNot(contains('`easy-task`')));
+
+      // provider 返回空白 = 不注入（不要多出一个空章节）
+      specIndexProvider = (CoreAgent _) => '   ';
+      expect(systemPromptWithWorkspace(agent), isNot(contains('Spec 索引')));
+    });
+
+    test('Q9：索引不缓存——create 之后下一轮提示词里就有它', () async {
+      final Directory temp = Directory.systemTemp.createTempSync(
+        'tree_prompt_',
+      );
+      addTearDown(() {
+        if (temp.existsSync()) temp.deleteSync(recursive: true);
+      });
+      final LocalWorkspaceIO io = LocalWorkspaceIO(temp.path);
+      final MemoryStore store = MemoryStore();
+      final CoreAgent agent = store.createAgent(name: '索引用例', modelId: 'demo');
+      final SpecService specs = SpecService(store: store);
+      specs.ioFor = (String _) async => io;
+      addTearDown(() => specIndexProvider = null);
+      specIndexProvider = (CoreAgent a) => specs.indexSnapshot(a.id);
+
+      final String before = systemPromptWithWorkspace(agent);
+      expect(before, contains('easy-task'), reason: '内置 4 条随时在');
+      expect(before, isNot(contains('prompt-refresh')));
+
+      await specs.run(
+        ToolInvocation(
+          id: 'tool_1',
+          name: 'spec',
+          arguments: <String, dynamic>{
+            'action': 'create',
+            'title': 'Prompt Refresh',
+            'workflow': 'w',
+          },
+          agentId: agent.id,
+          sessionId: TreeStore.defaultSessionId,
+        ),
+        io,
+      );
+
+      expect(
+        systemPromptWithWorkspace(agent),
+        contains('`prompt-refresh`'),
+        reason: '没有「刷新索引」动作：下一轮拼提示词时索引就是新的',
+      );
+    });
+
     test('压缩估算与实际上下文同口径（阈值不失真）', () {
       final MemoryStore store = MemoryStore();
       final CoreAgent agent = store.createAgent(name: 'a', modelId: 'demo')
         ..systemPrompt = '你是助手';
-      final CoreSession session =
-          store.session(agent.id, TreeStore.defaultSessionId)!;
+      final CoreSession session = store.session(
+        agent.id,
+        TreeStore.defaultSessionId,
+      )!;
       final CompactionService service = CompactionService(
         store: store,
         settings: CoreSettings(),

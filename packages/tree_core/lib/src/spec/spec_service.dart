@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:tree_local_exec/tree_local_exec.dart';
 
 import '../store/atomic_file.dart';
@@ -71,41 +73,17 @@ class SpecDocument {
     'created_at': createdAt,
     'updated_at': updatedAt,
   };
-
-  /// 检索/模型可读形态（不带全文，避免把上下文塞满）。
-  Map<String, dynamic> toSearchJson() => <String, dynamic>{
-    'id': id,
-    'task_type': taskType,
-    'title': title,
-    'description': description,
-    'when': when,
-    'pinned': pinned,
-    'builtin': builtin,
-  };
-
-  /// 按标题/描述/适用条件/标签的文本做关键词打分（0~1）。
-  double score(List<String> tokens) {
-    if (tokens.isEmpty) return 0;
-    final String haystack = <String>[
-      title,
-      description,
-      taskType,
-      ...when,
-      ...tags,
-    ].join(' ').toLowerCase();
-    int hit = 0;
-    for (final String token in tokens) {
-      if (token.isNotEmpty && haystack.contains(token)) hit++;
-    }
-    return hit / tokens.length;
-  }
 }
 
-/// Spec 体系（M5d）：检索 / 索引 / 读全文 / 挂 hook / 沉淀 / 维护。
+/// Spec 体系（M9 Q9 瘦身）：**索引前置 + 选择 / 沉淀 / 维护**。
 ///
-/// 与参考实现的差异：索引不是 SQLite 表，而是**扫文件**（内置模板目录 + 工作空间
-/// `spec/*.md`）。单用户桌面下文件数量是几十个量级，扫描比维护索引更简单、也不会
-/// 出现"文件在、索引缺"的不一致。
+/// 与参考实现的差异：
+/// - **索引不再靠工具查**：索引直接注入系统提示词（见 `workspace_prompt.dart`
+///   的 provider），因此 `search` / `list` / `read` 三个动作被删除，
+///   `select` **直接返回所选 Spec 全文**（模型不必先 read 一遍再挂 hook）；
+/// - 索引不是 SQLite 表，而是**扫文件**（内置模板 + 工作空间 `spec/*.md`）。单用户
+///   桌面下文件数量是几十个量级，扫描比维护索引更简单、也不会出现"文件在、索引缺"
+///   的不一致。
 class SpecService {
   SpecService({required this.store, this.builtinSpecsDir = '', this.log});
 
@@ -116,8 +94,17 @@ class SpecService {
 
   final void Function(String message)? log;
 
-  /// 本会话已 `read` 过的 Spec（`select` 的前置条件；与参考实现同语义）。
-  final Map<String, Set<String>> _readIds = <String, Set<String>>{};
+  /// Q9 索引快照：agentId → 已渲染的索引文本（见 [indexSnapshot]）。
+  final Map<String, String> _indexText = <String, String>{};
+
+  /// 正在后台刷新的 agent（避免每轮提示词都重复发起一次全量扫描）。
+  final Set<String> _indexRefreshing = <String>{};
+
+  /// 取某 agent 工作空间 IO 的解析器（Q9 索引后台刷新用）；由核心启动时接线。
+  ///
+  /// 为什么需要它：系统提示词是**同步**拼装的，而索引要读工作空间文件（异步）。
+  /// 没有快照时 [indexSnapshot] 只能先给内置 4 条，靠这个解析器在后台补全量。
+  Future<WorkspaceIO?> Function(String agentId)? ioFor;
 
   static const String specDir = 'spec';
 
@@ -134,7 +121,10 @@ class SpecService {
     }
   }
 
-  /// 工具入口。
+  /// 工具入口（Q9：只有 select / create / update 三个动作）。
+  ///
+  /// 每个动作成功后都**顺手刷新索引快照**：索引随系统提示词每轮重建，create/update
+  /// 因此不需要额外的"刷新索引"动作——下一轮提示词里的索引就是新的。
   Future<Map<String, dynamic>> run(
     ToolInvocation invocation,
     WorkspaceIO io,
@@ -142,25 +132,23 @@ class SpecService {
     final String action = (invocation.arguments['action'] ?? '')
         .toString()
         .trim();
+    final Map<String, dynamic> result;
     switch (action) {
-      case 'search':
-        return _search(invocation, io);
-      case 'list':
-        return _list(invocation, io);
-      case 'read':
-        return await _read(invocation, io);
       case 'select':
-        return await _select(invocation, io);
+        result = await _select(invocation, io);
       case 'create':
-        return await _create(invocation, io);
+        result = await _create(invocation, io);
       case 'update':
-        return await _update(invocation, io);
+        result = await _update(invocation, io);
       default:
         return <String, dynamic>{
-          'error':
-              '未知 spec 动作: $action（应为 search/list/read/select/create/update）',
+          'error': '未知 spec 动作: $action（应为 select/create/update）',
         };
     }
+    if (!result.containsKey('error')) {
+      await refreshIndex(invocation.agentId, io);
+    }
+    return result;
   }
 
   /// 索引（REST `GET /api/agents/{id}/specs` 与 memory/team 工具共用）。
@@ -179,8 +167,87 @@ class SpecService {
         out.add(custom);
       }
     }
+    // 扫完顺手更新提示词快照：前端打开 Spec 面板（REST 索引）也会刷新它
+    _indexText[agentId] = renderIndex(out);
     return out;
   }
+
+  // ── 索引（Q9：注入系统提示词） ───────────────────────────────────────
+
+  /// 索引最多列多少条（Q9 口径：默认全列，超 50 条截断并在尾部注明其余条数）。
+  static const int indexLimit = 50;
+
+  /// 单条「适用条件」摘要的字符上限（照旧实现：超 80 字符截断加省略号）。
+  static const int whenSummaryLimit = 80;
+
+  /// 把索引渲染成系统提示词里的列表（格式照旧实现）：
+  /// 形如 `- id [task_type] 标题（内置）（适用: when 摘要）`，id 自带反引号。
+  static String renderIndex(
+    List<SpecDocument> specs, {
+    int limit = indexLimit,
+  }) {
+    if (specs.isEmpty) {
+      return '（暂无 Spec；任务完成后可用 spec create 沉淀）';
+    }
+    final StringBuffer buffer = StringBuffer();
+    for (final SpecDocument spec in specs.take(limit)) {
+      String when = spec.when.join('；');
+      if (when.length > whenSummaryLimit) {
+        when = '${when.substring(0, whenSummaryLimit)}…';
+      }
+      buffer.write('- `${spec.id}` [${spec.taskType}] ${spec.title}');
+      if (spec.builtin) buffer.write('（内置）');
+      if (when.trim().isNotEmpty) buffer.write('（适用: $when）');
+      buffer.writeln();
+    }
+    final int rest = specs.length - limit;
+    if (rest > 0) {
+      buffer.writeln('- …其余 $rest 条可用 `spec select` 直取（需已知 id）');
+    }
+    return buffer.toString().trimRight();
+  }
+
+  /// 供系统提示词用的索引快照（**同步**：提示词是同步拼装的）。
+  ///
+  /// 没有快照时先只给**内置 4 条**（内嵌常量，随时算得出来），同时后台补一次全量：
+  /// 会话第一轮不会因为「还没人扫过工作空间」而整段索引缺失，也不必让每轮提示词都
+  /// 去等一次目录扫描（SSH 下那是一串网络往返）。
+  String indexSnapshot(String agentId) {
+    final String? cached = _indexText[agentId];
+    if (cached == null) _refreshLater(agentId);
+    return cached ?? renderIndex(_builtinDocuments());
+  }
+
+  /// 重新扫描并更新快照（[io] 为 null 时只有内置模板）。
+  Future<void> refreshIndex(String agentId, WorkspaceIO? io) async {
+    try {
+      await index(agentId, io);
+    } catch (error) {
+      log?.call('刷新 Spec 索引失败（$agentId）：$error');
+    }
+  }
+
+  /// 后台补一次全量索引（不阻塞本轮提示词）。
+  void _refreshLater(String agentId) {
+    final Future<WorkspaceIO?> Function(String agentId)? resolve = ioFor;
+    if (resolve == null || !_indexRefreshing.add(agentId)) return;
+    unawaited(() async {
+      try {
+        await refreshIndex(agentId, await resolve(agentId));
+      } catch (error) {
+        log?.call('后台刷新 Spec 索引失败（$agentId）：$error');
+      } finally {
+        _indexRefreshing.remove(agentId);
+      }
+    }());
+  }
+
+  /// 内置 4 条（同步，不碰工作空间）。
+  static List<SpecDocument> _builtinDocuments() => <SpecDocument>[
+    for (final String id in kBuiltinSpecIds)
+      if (kBuiltinSpecs[id] != null)
+        parseSpecText(kBuiltinSpecs[id]!, fallbackId: id, builtin: true),
+  ];
 
   /// 单份详情（REST `GET /api/agents/{id}/specs/{specId}`）。
   Future<SpecDocument?> detail(
@@ -199,74 +266,10 @@ class SpecService {
 
   // ── action 实现 ──────────────────────────────────────────────────────
 
-  Future<Map<String, dynamic>> _search(
-    ToolInvocation invocation,
-    WorkspaceIO io,
-  ) async {
-    final String query = (invocation.arguments['query'] ?? '')
-        .toString()
-        .trim();
-    if (query.isEmpty) {
-      return <String, dynamic>{'error': 'search 需要 query（任务描述/关键词）'};
-    }
-    final List<SpecDocument> all = await index(invocation.agentId, io);
-    final List<String> tokens = _tokens(query);
-    final List<SpecDocument> hits = all
-        .where((SpecDocument s) => s.score(tokens) > 0 || s.builtin)
-        .toList();
-    hits.sort((SpecDocument a, SpecDocument b) {
-      if (a.pinned != b.pinned) return a.pinned ? -1 : 1;
-      return b.score(tokens).compareTo(a.score(tokens));
-    });
-    final List<SpecDocument> top = hits.take(10).toList(growable: false);
-    return <String, dynamic>{
-      'action': 'search',
-      'query': query,
-      'count': top.length,
-      'specs': top.map((SpecDocument s) => s.toSearchJson()).toList(),
-    };
-  }
-
-  Future<Map<String, dynamic>> _list(
-    ToolInvocation invocation,
-    WorkspaceIO io,
-  ) async {
-    final List<SpecDocument> all = await index(invocation.agentId, io);
-    final List<String> selectedSpecIds =
-        store
-            .session(invocation.agentId, invocation.sessionId)
-            ?.selectedSpecIds ??
-        const <String>[];
-    return <String, dynamic>{
-      'action': 'list',
-      'count': all.length,
-      'specs': all.map((SpecDocument s) => s.toSearchJson()).toList(),
-      'selected_spec_ids': selectedSpecIds,
-    };
-  }
-
-  Future<Map<String, dynamic>> _read(
-    ToolInvocation invocation,
-    WorkspaceIO io,
-  ) async {
-    final String id = (invocation.arguments['spec_id'] ?? '').toString().trim();
-    if (id.isEmpty) return <String, dynamic>{'error': 'read 需要 spec_id'};
-    final SpecDocument? document = await detail(invocation.agentId, io, id);
-    if (document == null) {
-      return <String, dynamic>{
-        'error': 'Spec 不存在: $id（可先 list/search 查看可用 id）',
-      };
-    }
-    _readIds
-        .putIfAbsent(_sessionKey(invocation), () => <String>{})
-        .add(document.id);
-    return <String, dynamic>{
-      'action': 'read',
-      'spec_id': document.id,
-      'content': document.raw,
-    };
-  }
-
+  /// 选择 Spec：**直接返回所选 Spec 全文**（Q9 删掉了「必须先 read」的前置约束）。
+  ///
+  /// 模型挂 hook 需要看到规范全文，旧实现要求先 `read` 再 `select`，两轮工具调用且
+  /// 容易漏一步；现在一次调用既拿到全文又挂上 hook。空数组 = 取消全部选择。
   Future<Map<String, dynamic>> _select(
     ToolInvocation invocation,
     WorkspaceIO io,
@@ -280,36 +283,35 @@ class SpecService {
       final String id = item.toString().trim();
       if (id.isNotEmpty && !ids.contains(id)) ids.add(id);
     }
-    final Set<String> read = _readIds[_sessionKey(invocation)] ?? <String>{};
     final List<String> missing = <String>[];
-    final List<String> notRead = <String>[];
+    final List<Map<String, dynamic>> selected = <Map<String, dynamic>>[];
     for (final String id in ids) {
       final SpecDocument? document = await detail(invocation.agentId, io, id);
       if (document == null) {
         missing.add(id);
         continue;
       }
-      if (!read.contains(id)) notRead.add(id);
+      selected.add(<String, dynamic>{
+        'id': document.id,
+        'title': document.title,
+        'task_type': document.taskType,
+        'content': document.raw,
+      });
     }
     if (missing.isNotEmpty) {
       return <String, dynamic>{
-        'error': 'Spec 不存在: $missing（可先 list/search 查看可用 id）',
-      };
-    }
-    if (notRead.isNotEmpty) {
-      return <String, dynamic>{
-        'error':
-            'select 前必须先 read 对应 Spec: $notRead'
-            '（请先 spec read 取全文，再 select 挂 hook）',
+        'error': 'Spec 不存在: $missing（可用 id 见系统提示词里的 Spec 索引）',
       };
     }
     store.setSelectedSpecs(invocation.agentId, invocation.sessionId, ids);
     return <String, dynamic>{
       'action': 'select',
       'spec_ids': ids,
+      'count': selected.length,
+      'specs': selected,
       'note': ids.isEmpty
           ? '已取消全部 Spec 选择（selected_spec_ids 已清空），后续重构 context 将不再注入任何 Spec。'
-          : '已挂 hook；实际注入发生在下次重构 context（compact/新建会话）。',
+          : '已挂 hook，且全文已在本次结果里（不需要再 read）；实际注入发生在下次重构 context（compact/新建会话）。',
     };
   }
 
@@ -372,7 +374,7 @@ class SpecService {
       'action': 'create',
       'spec_id': id,
       'title': title,
-      'note': '已创建并落盘到工作空间 spec/；会出现在下次重构 context 的 Spec 索引中。',
+      'note': '已创建并落盘到工作空间 spec/；下一轮系统提示词的 Spec 索引里就会列出它。',
     };
   }
 
@@ -477,16 +479,6 @@ class SpecService {
       return null;
     }
   }
-
-  String _sessionKey(ToolInvocation invocation) =>
-      '${invocation.agentId}/${invocation.sessionId}';
-
-  static List<String> _tokens(String query) => query
-      .toLowerCase()
-      .split(RegExp(r'[\s,，。；;、/]+'))
-      .map((String t) => t.trim())
-      .where((String t) => t.isNotEmpty)
-      .toList(growable: false);
 
   static List<String> _stringList(Object? raw) {
     if (raw is List<dynamic>) {

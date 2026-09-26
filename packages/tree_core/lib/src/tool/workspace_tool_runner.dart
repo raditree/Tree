@@ -24,8 +24,11 @@ typedef WorkspaceDirResolver = String Function(String agentId);
 /// 工具层实现：把 [ToolInvocation] 落到某个 agent 的工作空间（本地文件系统）。
 ///
 /// - 每个 agent 一个 [WorkspaceIO]，按需创建并缓存（目录首次使用时创建）；
-/// - 工具结果统一**截断**：单条工具结果最长 [maxResultChars]，超出保留头 70%
-///   + 尾 30% 并显式标注——一次 `terminal` 的输出不该吃掉整个上下文；
+/// - **默认不截断工具结果**（M9 Q1）：有界性由 LLM 侧的 `ToolResultGate` 保证——
+///   超长结果写进工作空间 `.self/results/`，送模型的那一份换成提示 + 预览，而
+///   落库与前端 `tool_end` 仍是全文。工具层若先按字符截断（M9 之前是 24000 字符），
+///   门控的 8000 token ≈ 16000 字符阈值就只覆盖 16000~24000 这一段，再长就直接
+///   被砍掉、根本走不到重定向。要硬上限的调用方仍可显式传 [maxResultChars]；
 /// - 工作空间目录由外部注入（[resolveWorkspaceDir]），因此这里不认识存储层：
 ///   测试可以直接给一个临时目录。
 class WorkspaceToolRunner implements ToolRunner {
@@ -33,7 +36,7 @@ class WorkspaceToolRunner implements ToolRunner {
     required this.resolveWorkspaceDir,
     this.resolveSshConfig,
     this.sshIoFactory,
-    this.maxResultChars = 24000,
+    this.maxResultChars = 0,
     this.todoStore,
     this.askQuestion,
     this.teamService,
@@ -66,7 +69,10 @@ class WorkspaceToolRunner implements ToolRunner {
   /// 而不是静默回落本地——静默回落会把远端该做的活干在用户本机，是更坏的失败方式。
   final Future<WorkspaceIO> Function(SshConfig config)? sshIoFactory;
 
-  /// 单条工具结果的字符上限。
+  /// 单条工具结果的字符上限；**0（默认）= 不截断**，交给 `ToolResultGate` 门控。
+  ///
+  /// 留这个开关是为了给调用方一个显式的硬上限（例如自检脚本只想要短结果）；
+  /// 默认必须是 0——见类文档里 16000~24000 那一段的取舍。
   final int maxResultChars;
 
   /// 待办存储（为 null 时不声明 `set_todo_list`）。
@@ -230,9 +236,12 @@ class WorkspaceToolRunner implements ToolRunner {
   }
 
   /// 结果过长时保留头 70% + 尾 30%（尾部的错误栈/总结通常最有用）。
+  ///
+  /// [maxResultChars] 为 0（默认）时**不截断**：超长结果由 `ToolResultGate` 重定向到
+  /// `.self/results/`（送模型的只有提示 + 预览），工具层不能抢先把它砍掉。
   ToolOutcome _truncate(ToolOutcome outcome) {
     final String content = outcome.content;
-    if (content.length <= maxResultChars) return outcome;
+    if (maxResultChars <= 0 || content.length <= maxResultChars) return outcome;
     final int headLength = (maxResultChars * 0.7).round();
     final int tailLength = maxResultChars - headLength;
     final String head = content.substring(0, headLength);

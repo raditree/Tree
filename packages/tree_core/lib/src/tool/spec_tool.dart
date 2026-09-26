@@ -5,48 +5,43 @@ import 'package:tree_local_exec/tree_local_exec.dart';
 import '../spec/spec_service.dart';
 import 'tool_runner.dart';
 
-/// `spec` 工具（M5d）：任务型规范（Spec）的检索 / 选择 / 沉淀。
+/// `spec` 工具（M9 Q9 瘦身）：任务型规范（Spec）的**选择 / 沉淀 / 维护**。
 ///
-/// 与参考实现一致的强约束：**select 之前必须先 read**（模型要先看到全文再挂 hook），
-/// 且内置 Spec 只能读不能改（要改就 `create` 自己的）。
+/// 三个设计决定：
+/// - **只留三个动作**：`search` / `list` / `read` 已删除——索引直接写在系统提示词里
+///   （见 `agent/workspace_prompt.dart`），模型看得到 id，`select` 一次就把全文拿回来；
+/// - **删掉「select 之前必须先 read」的硬约束**：那是两轮工具调用，模型还常常漏一步；
+/// - 内置 Spec 只能读不能改（要改就 `create` 自己的）。
 abstract final class SpecTool {
   static const String name = 'spec';
 
   static ToolSpec spec() => ToolSpec(
     name: name,
     description:
-        '[任务型规范（Spec）检索/选择/沉淀] 把任务经验沉淀为可复用规范，并在开工前挂上。\n'
-        'search：按任务描述语义检索；list：看索引；read：读全文；select：挂 hook'
-        '（**必须先 read 对应 Spec**；传空数组表示取消全部选择；实际注入发生在下次'
-        '重构 context）；create/update：沉淀与维护自定义 Spec（落盘到工作空间 spec/）。\n'
-        '内置 Spec（easy-task / complex-task / hard-task / team-meeting）只读。',
+        '[任务型规范（Spec）] 把任务经验沉淀为可复用规范，并在开工前挂上。\n'
+        'select：挂 hook 并**直接返回所选 Spec 全文**（不需要先 read；传空数组表示取消'
+        '全部选择；实际注入发生在下次重构 context）；create/update：沉淀与维护自定义'
+        'Spec（落盘到工作空间 spec/）。\n'
+        '可用 Spec 的索引（id/类型/标题/适用条件）已列在系统提示词里，直接用 id 选取。'
+        '内置 Spec（easy-task / complex-task / hard-task / team-meeting）只读，不可 update。',
     parameters: <String, dynamic>{
       'type': 'object',
       'properties': <String, dynamic>{
         'action': <String, dynamic>{
           'type': 'string',
           'description': '要执行的动作',
-          'enum': <String>[
-            'search',
-            'list',
-            'read',
-            'select',
-            'create',
-            'update',
-          ],
-        },
-        'query': <String, dynamic>{
-          'type': 'string',
-          'description': 'search 用：任务描述/关键词（自然语言）',
+          'enum': <String>['select', 'create', 'update'],
         },
         'spec_ids': <String, dynamic>{
           'type': 'array',
           'items': <String, dynamic>{'type': 'string'},
-          'description': 'select 用：要挂 hook 的 Spec id 列表（空数组 = 取消全部）',
+          'description':
+              'select 用：要挂 hook 的 Spec id 列表（空数组 = 取消全部）；'
+              '返回所选 Spec 全文',
         },
         'spec_id': <String, dynamic>{
           'type': 'string',
-          'description': 'read/update 用：目标 Spec id',
+          'description': 'update 用：目标 Spec id',
         },
         'title': <String, dynamic>{
           'type': 'string',
@@ -59,7 +54,7 @@ abstract final class SpecTool {
         },
         'description': <String, dynamic>{
           'type': 'string',
-          'description': 'create/update 用：一句话描述（供索引与检索）',
+          'description': 'create/update 用：一句话描述（进 Spec 索引）',
         },
         'risk': <String, dynamic>{
           'type': 'string',

@@ -5,6 +5,27 @@ import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
 import 'package:tree_local_exec/tree_local_exec.dart';
 
+/// exec 直接以「SSH 心跳丢失」失败的工作空间（terminal 软超时→hook 用）。
+///
+/// 从 LocalWorkspaceIO 派生而不是手写整个接口：只替换 exec 一个方法，其余行为
+/// （resolve / writeFile）仍是真实实现，转后台的日志因此能真的落盘。
+class _StaleIo extends LocalWorkspaceIO {
+  _StaleIo(super.root);
+
+  /// exec 被调用的次数：用来断言「绝不重跑命令」。
+  int execCalls = 0;
+
+  @override
+  Future<ExecOutcome> exec(
+    String command, {
+    Duration timeout = const Duration(seconds: 120),
+    int maxOutputBytes = 200 * 1024,
+  }) async {
+    execCalls++;
+    throw SshLinkStaleException('SSH 链路失活：连续 3 次心跳丢失（测试）');
+  }
+}
+
 void main() {
   late Directory root;
   late LocalWorkspaceIO io;
@@ -172,6 +193,34 @@ void main() {
       expect(outcome.content, contains('命中 2 处'));
     });
 
+    test('无匹配时列出实际扫描范围：扫描根/文件清单/生效排除目录（Q10）', () async {
+      await io.writeFile('src/a.dart', 'final x = 1;');
+      await io.writeFile('src/b.dart', 'final y = 2;');
+      // 真存在的依赖目录：默认排除规则会跳过它，因此必须出现在「生效的排除目录」里
+      await io.writeFile('node_modules/pkg/index.js', 'module.exports = 1;');
+
+      final ToolOutcome none = await run('grep', <String, dynamic>{
+        'pattern': 'nothing-here',
+      });
+      expect(none.content, contains('命中 0 处'));
+      expect(none.content, contains('扫描根：.'));
+      expect(none.content, contains('扫描文件：2 个'));
+      expect(none.content, contains('src/a.dart'));
+      expect(none.content, contains('src/b.dart'));
+      expect(none.content, contains('生效的排除目录'));
+      expect(none.content, contains('node_modules'));
+    });
+
+    test('有匹配时行为不变（不追加扫描清单）', () async {
+      await io.writeFile('src/a.dart', 'final needle = 1;');
+      final ToolOutcome hit = await run('grep', <String, dynamic>{
+        'pattern': 'needle',
+      });
+      expect(hit.content, contains('命中 1 处'));
+      expect(hit.content, contains('src/a.dart:1:'));
+      expect(hit.content, isNot(contains('生效的排除目录')));
+    });
+
     test('缺少 pattern 是错误', () async {
       expect((await run('grep')).isError, isTrue);
     });
@@ -203,6 +252,31 @@ void main() {
       });
       expect(empty.isError, isTrue);
       expect(empty.content, contains('command 不能为空'));
+    });
+
+    test('跑得比 timeout_seconds 久也不转后台、不终止（1.1：静态时长不再是判据）', () async {
+      final TerminalHooks hooks = TerminalHooks();
+      addTearDown(hooks.close);
+      final String command = Platform.isWindows
+          ? 'ping -n 3 127.0.0.1 >nul'
+          : 'sleep 2';
+      final DateTime started = DateTime.now();
+      final ToolOutcome outcome = await BuiltinTools.run(
+        call('terminal', <String, dynamic>{
+          'command': command,
+          'timeout_seconds': 1,
+        }),
+        io,
+        hooks: hooks,
+      );
+      expect(outcome.isError, isFalse, reason: outcome.content);
+      expect(outcome.content, contains('退出码 0'));
+      expect(hooks.tasks, isEmpty, reason: '进程还活着（本地活性 = 进程存活）就不该转后台');
+      expect(
+        DateTime.now().difference(started).inMilliseconds,
+        greaterThan(1000),
+        reason: '真的等它跑完了，没有按静态时长提前返回',
+      );
     });
 
     test('timeout_seconds 越界被夹取（1~1800）', () async {
@@ -441,6 +515,52 @@ void main() {
       expect(badAction.isError, isTrue);
       expect(badAction.content, contains('未知 hook_action'));
     });
+
+    test('SSH 心跳丢失：不杀进程、不重跑，转后台任务并给出查询/续看方式（1.1）', () async {
+      final _StaleIo stale = _StaleIo(root.path);
+      final TerminalHooks hooks = TerminalHooks();
+      addTearDown(hooks.close);
+      final ToolOutcome outcome = await BuiltinTools.run(
+        call('terminal', <String, dynamic>{'command': 'sleep 999'}),
+        stale,
+        hooks: hooks,
+      );
+      expect(outcome.isError, isTrue, reason: '命令没跑完，不能算成功');
+      expect(outcome.content, contains('会话心跳丢失'));
+      expect(outcome.content, contains('没有终止远端进程，也没有重跑命令'));
+      expect(outcome.content, contains('task_id: hook_'));
+      expect(outcome.content, contains('hook_action=status'));
+      expect(stale.execCalls, 1, reason: '绝不能重跑同一条命令（会重复副作用）');
+
+      expect(hooks.tasks, hasLength(1));
+      final HookTask task = hooks.tasks.single;
+      expect(task.detached, isTrue);
+      expect(task.process, isNull, reason: '本机没有进程句柄，也就无从「杀进程」');
+
+      final ToolOutcome status = await BuiltinTools.run(
+        call('terminal', <String, dynamic>{
+          'command': 'x',
+          'hook_action': 'status',
+          'task_id': task.id,
+        }),
+        stale,
+        hooks: hooks,
+      );
+      expect(status.content, contains('已转后台'));
+      expect(status.content, contains('无法确认'));
+
+      final ToolOutcome cancel = await BuiltinTools.run(
+        call('terminal', <String, dynamic>{
+          'command': 'x',
+          'hook_action': 'cancel',
+          'task_id': task.id,
+        }),
+        stale,
+        hooks: hooks,
+      );
+      expect(cancel.isError, isTrue);
+      expect(cancel.content, contains('无法终止'));
+    });
   });
 
   group('WorkspaceToolRunner', () {
@@ -473,7 +593,43 @@ void main() {
       await runner.close();
     });
 
-    test('超长结果被截断并标注省略字符数', () async {
+    test('默认不截断：超长结果原样交给门控，门控重定向到 .self/results（Q1+Q9）', () async {
+      final WorkspaceToolRunner runner = WorkspaceToolRunner(
+        resolveWorkspaceDir: (String agentId) => root.path,
+      );
+      await io.writeFile('big.txt', 'y' * 40000);
+      final ToolOutcome outcome = await runner.run(
+        call('read', <String, dynamic>{'file_path': 'big.txt'}),
+      );
+      expect(
+        outcome.content.length,
+        greaterThan(24000),
+        reason: '工具层不再按 24000 字符先截断，否则根本走不到门控',
+      );
+      expect(outcome.content, isNot(contains('结果过长')));
+
+      // 门控：送模型的那一份换成提示 + 预览，全文落工作空间（前端/落库仍是全文）
+      final List<String> written = <String>[];
+      final ToolResultGate gate = ToolResultGate(
+        agentId: 'agt_1',
+        writer: (String agentId, String relativePath, String content) async {
+          written.add(relativePath);
+          await io.writeFile(relativePath, content);
+        },
+      );
+      final String forModel = await gate.apply('read', outcome.content);
+      expect(forModel, contains('[工具结果已重定向]'));
+      expect(forModel.length, lessThan(1600), reason: '送模型的只有提示 + 300 字符预览');
+      expect(written.single, startsWith('.self/results/'));
+      expect(written.single, endsWith('.read.result'));
+      final String saved = File(
+        p.joinAll(<String>[root.path, ...written.single.split('/')]),
+      ).readAsStringSync();
+      expect(saved, outcome.content, reason: '落盘的是全文');
+      await runner.close();
+    });
+
+    test('显式给上限时仍按上限截断（保留头 70% + 尾 30%）', () async {
       final WorkspaceToolRunner runner = WorkspaceToolRunner(
         resolveWorkspaceDir: (String agentId) => root.path,
         maxResultChars: 200,

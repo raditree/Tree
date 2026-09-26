@@ -176,7 +176,15 @@ void main() {
   late CoreServer server;
   late _Client client;
 
-  Future<void> start({bool wireRemote = true, int? maxContentBytes}) async {
+  /// [wireRemote] false = 核心没接远端后端（应给可读 400）。
+  /// [backend] 可换成任意远端后端对象（Q4 的 Git 用例注入 LocalWorkspaceIO）。
+  /// [ioFor] 显式的工作空间 IO 注入（Q4 的另一条接线，两条都要能走通）。
+  Future<void> start({
+    bool wireRemote = true,
+    int? maxContentBytes,
+    Object? backend,
+    Future<WorkspaceIO?> Function(String agentId)? ioFor,
+  }) async {
     store = MemoryStore();
     agent = store.createAgent(name: '远端用例', modelId: 'demo');
     agent.sshConfig = const SshConfig(
@@ -203,7 +211,10 @@ void main() {
       fileService: FileService(
         store: store,
         defaultWorkspaceDir: (String _) => '/mnt/space/project',
-        remoteFilesFor: wireRemote ? (String _) async => remote : null,
+        remoteFilesFor: wireRemote
+            ? (String _) async => backend ?? remote
+            : null,
+        ioFor: ioFor,
         maxContentBytes: maxContentBytes ?? 8 * 1024 * 1024,
       ),
       enableHeartbeat: false,
@@ -454,5 +465,100 @@ void main() {
       )).status,
       400,
     );
+  });
+
+  test('SSH Git：经 WorkspaceIO 的 exec 通道跑 git，返回既有 REST 形状（Q4）', () async {
+    final Directory repo = Directory.systemTemp.createTempSync('tree_ssh_git_');
+    addTearDown(() async {
+      // git 在 Windows 上可能短暂持有句柄：重试几次再放弃
+      for (int i = 0; i < 10 && repo.existsSync(); i++) {
+        try {
+          repo.deleteSync(recursive: true);
+        } catch (_) {
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+        }
+      }
+    });
+    Future<void> git(List<String> args) async {
+      final ProcessResult result = await Process.run('git', <String>[
+        '-C',
+        repo.path,
+        ...args,
+      ]);
+      expect(
+        result.exitCode,
+        0,
+        reason: 'git ${args.join(' ')}: ${result.stderr}',
+      );
+    }
+
+    await git(<String>['init', '-q']);
+    await git(<String>['config', 'user.email', 'test@example.com']);
+    await git(<String>['config', 'user.name', 'Tree Test']);
+    await git(<String>['commit', '-q', '--allow-empty', '-m', '远端初次提交']);
+
+    // 远端后端就是「同一个 SSH 连接对象」：文件面板按 WorkspaceFiles 用，Git 按
+    // WorkspaceIO 用。这里用 LocalWorkspaceIO 顶上（真机 SSH 由门控测试覆盖）。
+    await start(backend: LocalWorkspaceIO(repo.path));
+
+    final _Res log = await client.send(
+      'GET',
+      '/api/workspaces/${ws()}/git/log?limit=5',
+    );
+    expect(log.status, 200, reason: log.raw);
+    final Map<String, dynamic> commit =
+        (log.json['commits'] as List<dynamic>).first as Map<String, dynamic>;
+    expect(commit['message'], '远端初次提交');
+    expect(commit['author'], 'Tree Test');
+    expect(commit['hash'], isNotEmpty);
+    expect(commit['date'], isNotEmpty);
+
+    final _Res branches = await client.send(
+      'GET',
+      '/api/workspaces/${ws()}/git/branches',
+    );
+    expect(branches.status, 200, reason: branches.raw);
+    // REST 形状照旧：branches 是 [{name: ...}]（不是字符串数组）
+    expect(
+      (branches.json['branches'] as List<dynamic>).single['name'],
+      isNotEmpty,
+    );
+    expect(branches.json['current'], isNotEmpty);
+  });
+
+  test('SSH Git：非仓库时返回 200 空列表（不再一律 400）', () async {
+    final Directory empty = Directory.systemTemp.createTempSync(
+      'tree_ssh_nogit_',
+    );
+    addTearDown(() {
+      if (empty.existsSync()) empty.deleteSync(recursive: true);
+    });
+    // 这条走**显式 ioFor** 注入（上一条走 remoteFilesFor 的运行期窄化），两条路都覆盖
+    await start(ioFor: (String _) async => LocalWorkspaceIO(empty.path));
+
+    final _Res log = await client.send(
+      'GET',
+      '/api/workspaces/${ws()}/git/log',
+    );
+    expect(log.status, 200, reason: log.raw);
+    expect(log.json['commits'], isEmpty);
+
+    final _Res branches = await client.send(
+      'GET',
+      '/api/workspaces/${ws()}/git/branches',
+    );
+    expect(branches.status, 200, reason: branches.raw);
+    expect(branches.json['branches'], isEmpty);
+    expect(branches.json['current'], '');
+  });
+
+  test('SSH Git：核心没接远端工作空间 IO 时仍是可读 400', () async {
+    await start(wireRemote: false);
+    final _Res log = await client.send(
+      'GET',
+      '/api/workspaces/${ws()}/git/log',
+    );
+    expect(log.status, 400);
+    expect(log.json['detail'], contains('未接入远端 Git 后端'));
   });
 }
