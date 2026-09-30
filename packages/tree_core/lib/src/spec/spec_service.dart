@@ -2,7 +2,6 @@ import 'dart:async';
 
 import 'package:tree_local_exec/tree_local_exec.dart';
 
-import '../store/atomic_file.dart';
 import '../store/tree_store.dart';
 import '../store/yaml_codec.dart';
 import '../tool/tool_runner.dart';
@@ -10,9 +9,9 @@ import 'builtin_specs.dart';
 
 /// 一份 Spec（任务型规范）：元数据 + 正文。
 ///
-/// 内置模板来自内嵌常量（[kBuiltinSpecs]），自定义 Spec 是**工作空间里的**
-/// `spec/<id>.md`（front matter + 三段正文）——文件才是真源，因此用户可以手改，
-/// 也不需要额外的索引库。
+/// 内置模板来自内嵌常量（[kBuiltinSpecs]）并**播种到工作空间**（`.self/spec/<id>.md`），
+/// 自定义 Spec 同样落在这里（front matter + 三段正文）——文件才是真源，因此用户
+/// 可以手改、可以按团队/工作空间各存一份，也不需要额外的索引库。
 class SpecDocument {
   SpecDocument({
     required this.id,
@@ -81,16 +80,13 @@ class SpecDocument {
 /// - **索引不再靠工具查**：索引直接注入系统提示词（见 `workspace_prompt.dart`
 ///   的 provider），因此 `search` / `list` / `read` 三个动作被删除，
 ///   `select` **直接返回所选 Spec 全文**（模型不必先 read 一遍再挂 hook）；
-/// - 索引不是 SQLite 表，而是**扫文件**（内置模板 + 工作空间 `spec/*.md`）。单用户
+/// - 索引不是 SQLite 表，而是**扫文件**（工作空间 `.self/spec/*.md`）。单用户
 ///   桌面下文件数量是几十个量级，扫描比维护索引更简单、也不会出现"文件在、索引缺"
 ///   的不一致。
 class SpecService {
-  SpecService({required this.store, this.builtinSpecsDir = '', this.log});
+  SpecService({required this.store, this.log});
 
   final TreeStore store;
-
-  /// 内置模板的落盘目录（`<数据根>/spec/builtin`；空串 = 只读内嵌常量）。
-  final String builtinSpecsDir;
 
   final void Function(String message)? log;
 
@@ -100,25 +96,74 @@ class SpecService {
   /// 正在后台刷新的 agent（避免每轮提示词都重复发起一次全量扫描）。
   final Set<String> _indexRefreshing = <String>{};
 
+  /// Q9 ⑧ 章快照：`agentId|sessionId` → 本会话已选 Spec 的注入段（见
+  /// [selectedSpecsSnapshot]）。`selected_spec_ids` 是**会话级**的，所以键里带 session。
+  final Map<String, String> _selectedText = <String, String>{};
+
+  /// 正在后台补已选全文的会话。
+  final Set<String> _selectedRefreshing = <String>{};
+
   /// 取某 agent 工作空间 IO 的解析器（Q9 索引后台刷新用）；由核心启动时接线。
   ///
   /// 为什么需要它：系统提示词是**同步**拼装的，而索引要读工作空间文件（异步）。
   /// 没有快照时 [indexSnapshot] 只能先给内置 4 条，靠这个解析器在后台补全量。
   Future<WorkspaceIO?> Function(String agentId)? ioFor;
 
-  static const String specDir = 'spec';
+  /// 规范文件所在目录（**工作空间内的 `.self/spec/`**）。
+  ///
+  /// 与 `.self/results`、`.self/plan` 同一隐藏根：规范属于该工作空间/团队，
+  /// 不同团队各有一份、互不影响；内置模板在首次进入工作空间时播种到这里。
+  static const String specDir = '.self/spec';
 
-  /// 首次启动把内置模板写到数据根（用户可查看、复制、手改副本）。
-  Future<void> seedBuiltins() async {
-    if (builtinSpecsDir.trim().isEmpty) return;
+  /// 首次进入某工作空间时播种内置模板（**缺失才写**，不覆盖用户改动）。
+  ///
+  /// 工作空间不可用（SSH 未连上 / 目录不可读）时不抛，只记日志——内置模板始终
+  /// 有内嵌常量兜底，规范不会因此整体消失。
+  Future<void> seedInto(WorkspaceIO io) async {
+    final Set<String> existing = await _specFileNames(io);
     for (final String id in kBuiltinSpecIds) {
-      final String path = '$builtinSpecsDir/$id.md';
+      if (existing.contains('$id.md')) continue;
       try {
-        await AtomicFile.writeStringAtomic(path, kBuiltinSpecs[id] ?? '');
+        await io.writeFile('$specDir/$id.md', kBuiltinSpecs[id] ?? '');
       } catch (error) {
         log?.call('写内置 Spec 失败（$id）：$error');
       }
     }
+  }
+
+  /// 一键重置：把 `.self/spec/` 下每个规范文件备份成 `.bak.<n>`（保留旧备份）后
+  /// 删除，再播种内置模板。自定义规范一同被清理（备份里可找回）。
+  Future<Map<String, dynamic>> reset(WorkspaceIO io) async {
+    final List<String> files = await _listSpecFiles(io);
+    final int index = await _nextBackupIndex(io);
+    final List<String> backedUp = <String>[];
+    final List<String> removed = <String>[];
+    for (final String file in files) {
+      String text;
+      try {
+        text = (await io.readFile(file)).text;
+      } catch (_) {
+        continue;
+      }
+      final String backup = '$file.bak.$index';
+      await io.writeFile(backup, text);
+      backedUp.add('$file → $backup');
+      try {
+        if (await io.deleteFile(file)) removed.add(file);
+      } catch (error) {
+        log?.call('删除规范文件失败（$file）：$error');
+      }
+    }
+    await seedInto(io);
+    return <String, dynamic>{
+      'spec_dir': specDir,
+      'backup_index': index,
+      'backed_up': backedUp,
+      'removed': removed,
+      'restored': <String>[
+        for (final String id in kBuiltinSpecIds) '$specDir/$id.md',
+      ],
+    };
   }
 
   /// 工具入口（Q9：只有 select / create / update 三个动作）。
@@ -147,26 +192,40 @@ class SpecService {
     }
     if (!result.containsKey('error')) {
       await refreshIndex(invocation.agentId, io);
+      // 已选全文（⑧ 章）也要一起刷新：select 改了选择，create/update 改了正文。
+      await refreshSelectedSpecs(invocation.agentId, invocation.sessionId, io);
     }
     return result;
   }
 
   /// 索引（REST `GET /api/agents/{id}/specs` 与 memory/team 工具共用）。
+  ///
+  /// **工作空间文件是源**：先播种缺失的内置模板，再读 `.self/spec/*.md`；内置模板
+  /// 仍在内存里兜底（工作空间不可读 / 内置文件被删时补上）。顺序固定为内置在前、
+  /// 其余按 id，保证索引稳定可预测。
   Future<List<SpecDocument>> index(String agentId, WorkspaceIO? io) async {
-    final List<SpecDocument> out = <SpecDocument>[];
-    final Set<String> seen = <String>{};
-    for (final String id in kBuiltinSpecIds) {
-      final String? text = kBuiltinSpecs[id];
-      if (text == null) continue;
-      out.add(parseSpecText(text, fallbackId: id, builtin: true));
-      seen.add(id);
-    }
+    final Map<String, SpecDocument> byId = <String, SpecDocument>{};
     if (io != null) {
-      for (final SpecDocument custom in await _customSpecs(io)) {
-        if (seen.contains(custom.id)) continue; // 内置优先（与参考实现一致）
-        out.add(custom);
+      await seedInto(io);
+      for (final SpecDocument file in await _customSpecs(io)) {
+        byId.putIfAbsent(file.id, () => file); // 同名只保留第一个（文件名唯一）
       }
     }
+    for (final String id in kBuiltinSpecIds) {
+      if (byId.containsKey(id)) continue;
+      final String? text = kBuiltinSpecs[id];
+      if (text != null) {
+        byId[id] = parseSpecText(text, fallbackId: id, builtin: true);
+      }
+    }
+    final List<SpecDocument> out = <SpecDocument>[];
+    for (final String id in kBuiltinSpecIds) {
+      final SpecDocument? doc = byId.remove(id);
+      if (doc != null) out.add(doc);
+    }
+    final List<SpecDocument> rest = byId.values.toList()
+      ..sort((SpecDocument a, SpecDocument b) => a.id.compareTo(b.id));
+    out.addAll(rest);
     // 扫完顺手更新提示词快照：前端打开 Spec 面板（REST 索引）也会刷新它
     _indexText[agentId] = renderIndex(out);
     return out;
@@ -242,6 +301,68 @@ class SpecService {
     }());
   }
 
+  /// 同步快照：本会话已选 Spec 的**全文**注入段（Q9 ⑧ 章）。
+  ///
+  /// 与 [indexSnapshot] 同一套路：系统提示词是**同步**拼装的，而读规范文件是异步的。
+  /// 没有快照时先返回空串（本轮就不注入这一段），同时后台补一次；`select` /
+  /// REST 改选择、`create` / `update` 改正文之后都会**立即写热**快照，
+  /// 所以正常路径下"挂了 hook"下一轮就能在系统提示词里看到全文。
+  String selectedSpecsSnapshot(String agentId, String sessionId) {
+    if (sessionId.trim().isEmpty) return '';
+    final String key = _selectedKey(agentId, sessionId);
+    final String? cached = _selectedText[key];
+    if (cached == null) _refreshSelectedLater(agentId, sessionId);
+    return cached ?? '';
+  }
+
+  /// 重新读"本会话已选 Spec"的全文并刷新快照。
+  ///
+  /// 悬空 hook（`selected_spec_ids` 里指向已被删除的规范）会被跳过，不阻断其余的——
+  /// 与参考实现的 `_build_selected_specs_text` 同一取舍。
+  Future<void> refreshSelectedSpecs(
+    String agentId,
+    String sessionId,
+    WorkspaceIO? io,
+  ) async {
+    if (sessionId.trim().isEmpty) return;
+    final String key = _selectedKey(agentId, sessionId);
+    try {
+      final List<String> ids =
+          store.session(agentId, sessionId)?.selectedSpecIds ??
+          const <String>[];
+      final List<String> blocks = <String>[];
+      for (final String id in ids) {
+        final SpecDocument? document = await detail(agentId, io, id);
+        final String raw = document?.raw.trim() ?? '';
+        if (raw.isEmpty) continue;
+        blocks.add('### Spec: $id\n$raw');
+      }
+      _selectedText[key] = blocks.join('\n\n');
+    } catch (error) {
+      log?.call('刷新已选 Spec 全文失败（$agentId/$sessionId）：$error');
+    }
+  }
+
+  /// 后台补一次已选全文（不阻塞本轮提示词）。
+  void _refreshSelectedLater(String agentId, String sessionId) {
+    final Future<WorkspaceIO?> Function(String agentId)? resolve = ioFor;
+    if (resolve == null) return;
+    final String key = _selectedKey(agentId, sessionId);
+    if (!_selectedRefreshing.add(key)) return;
+    unawaited(() async {
+      try {
+        await refreshSelectedSpecs(agentId, sessionId, await resolve(agentId));
+      } catch (error) {
+        log?.call('后台刷新已选 Spec 全文失败（$key）：$error');
+      } finally {
+        _selectedRefreshing.remove(key);
+      }
+    }());
+  }
+
+  static String _selectedKey(String agentId, String sessionId) =>
+      '$agentId|$sessionId';
+
   /// 内置 4 条（同步，不碰工作空间）。
   static List<SpecDocument> _builtinDocuments() => <SpecDocument>[
     for (final String id in kBuiltinSpecIds)
@@ -256,12 +377,17 @@ class SpecService {
     String specId,
   ) async {
     final String id = specId.trim();
+    // 工作空间文件优先（内置模板也落了盘，用户的编辑因此生效）；
+    // 文件缺失时再用内嵌模板兜底。
+    if (io != null) {
+      final SpecDocument? file = await _readCustom(io, id);
+      if (file != null) return file;
+    }
     final String? builtinText = kBuiltinSpecs[id];
     if (builtinText != null) {
       return parseSpecText(builtinText, fallbackId: id, builtin: true);
     }
-    if (io == null) return null;
-    return _readCustom(io, id);
+    return null;
   }
 
   // ── action 实现 ──────────────────────────────────────────────────────
@@ -374,7 +500,7 @@ class SpecService {
       'action': 'create',
       'spec_id': id,
       'title': title,
-      'note': '已创建并落盘到工作空间 spec/；下一轮系统提示词的 Spec 索引里就会列出它。',
+      'note': '已创建并落盘到工作空间 .self/spec/；下一轮系统提示词的 Spec 索引里就会列出它。',
     };
   }
 
@@ -451,30 +577,80 @@ class SpecService {
 
   Future<List<SpecDocument>> _customSpecs(WorkspaceIO io) async {
     final List<SpecDocument> out = <SpecDocument>[];
+    for (final String file in await _listSpecFiles(io)) {
+      final String id = file
+          .substring(file.lastIndexOf('/') + 1)
+          .replaceAll(RegExp(r'\.md$'), '');
+      final SpecDocument? document = await _readCustom(io, id);
+      if (document != null) out.add(document);
+    }
+    return out;
+  }
+
+  /// `.self/spec/` 下的规范文件（工作空间相对路径；仅 `.md`，不含 `.bak.*`）。
+  Future<List<String>> _listSpecFiles(WorkspaceIO io) async {
     try {
       final List<String> files = await io.listFiles(
         relativePath: specDir,
         maxDepth: 1,
-        maxEntries: 200,
+        maxEntries: 500,
       );
-      for (final String file in files) {
-        if (!file.toLowerCase().endsWith('.md')) continue;
-        final String id = file
-            .substring(file.lastIndexOf('/') + 1)
-            .replaceAll(RegExp(r'\.md$'), '');
-        final SpecDocument? document = await _readCustom(io, id);
-        if (document != null) out.add(document);
+      return files
+          .where((String f) => f.toLowerCase().endsWith('.md'))
+          .toList(growable: false);
+    } catch (_) {
+      // 没有 spec 目录 / 工作空间不可读：当空目录
+      return const <String>[];
+    }
+  }
+
+  /// 目录下的**文件名集合**（播种时判断内置模板是否已存在）。
+  Future<Set<String>> _specFileNames(WorkspaceIO io) async {
+    try {
+      final List<String> files = await io.listFiles(
+        relativePath: specDir,
+        maxDepth: 1,
+        maxEntries: 500,
+      );
+      return <String>{
+        for (final String f in files) f.substring(f.lastIndexOf('/') + 1),
+      };
+    } catch (_) {
+      return <String>{};
+    }
+  }
+
+  /// 下一个可用的 `.bak.<n>` 序号（同目录已有备份时顺延，绝不覆盖旧备份）。
+  Future<int> _nextBackupIndex(WorkspaceIO io) async {
+    int max = 0;
+    try {
+      final List<String> files = await io.listFiles(
+        relativePath: specDir,
+        maxDepth: 1,
+        maxEntries: 1000,
+      );
+      final RegExp pattern = RegExp(r'\.bak\.(\d+)$');
+      for (final String f in files) {
+        final RegExpMatch? match = pattern.firstMatch(f);
+        if (match == null) continue;
+        final int value = int.tryParse(match.group(1) ?? '') ?? 0;
+        if (value > max) max = value;
       }
     } catch (_) {
-      // 没有 spec 目录 / 工作空间不可读：只返回内置模板
+      // 列目录失败：从 1 开始
     }
-    return out;
+    return max + 1;
   }
 
   Future<SpecDocument?> _readCustom(WorkspaceIO io, String id) async {
     try {
       final FileContent content = await io.readFile('$specDir/$id.md');
-      return parseSpecText(content.text, fallbackId: id, builtin: false);
+      // 内置模板也落在同一目录：按 id 判定"内置"，与是否手改过无关。
+      return parseSpecText(
+        content.text,
+        fallbackId: id,
+        builtin: kBuiltinSpecs.containsKey(id),
+      );
     } catch (_) {
       return null;
     }

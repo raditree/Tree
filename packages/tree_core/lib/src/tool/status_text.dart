@@ -49,8 +49,7 @@ String specStatusText(List<String> selectedSpecIds) {
 
 /// 内置 Spec id 的集合（判断文案用）。
 const Set<String> kBuiltinSpecIdSet = <String>{
-  'easy-task',
-  'complex-task',
+  'general-task',
   'hard-task',
   'team-meeting',
 };

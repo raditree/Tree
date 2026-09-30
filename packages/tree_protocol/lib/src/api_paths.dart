@@ -48,6 +48,9 @@ abstract final class ApiPaths {
   static const String agentSpecs = '/api/agents/{agentId}/specs';
   static const String agentSpec = '/api/agents/{agentId}/specs/{specId}';
 
+  /// 一键重置该 agent 工作空间里的系统提示词 / Spec（备份 .bak.N 后还原默认）。
+  static const String agentReset = '/api/agents/{agentId}/reset';
+
   /// 手动压缩上下文（前端「压缩」按钮）。核心尚未实现：显式 501，不静默 404。
   static const String agentCompact = '/api/agents/{agentId}/compact';
 
@@ -140,6 +143,7 @@ abstract final class ApiPaths {
     agentSessionSpecs,
     agentSpecs,
     agentSpec,
+    agentReset,
     agentCompact,
     questions,
     questionAnswer,

@@ -28,15 +28,15 @@ void main() {
       final String customOnly = specStatusText(<String>['my-spec']);
       expect(customOnly, contains('my-spec(自定义)'));
       expect(customOnly, contains('至少选择一个内置 spec'));
-      final String builtin = specStatusText(<String>['easy-task']);
-      expect(builtin, contains('easy-task(内置)'));
+      final String builtin = specStatusText(<String>['general-task']);
+      expect(builtin, contains('general-task(内置)'));
       expect(builtin, isNot(contains('至少选择')));
     });
 
     test('整体文案带时间戳页脚', () {
       final String text = sessionStatusText(
         todos: <TodoItem>[],
-        selectedSpecIds: <String>['easy-task'],
+        selectedSpecIds: <String>['general-task'],
       );
       expect(text, contains('current_todo_id'));
       expect(text, contains('selected spec'));

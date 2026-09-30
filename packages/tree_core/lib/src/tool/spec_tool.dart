@@ -19,11 +19,14 @@ abstract final class SpecTool {
     name: name,
     description:
         '[任务型规范（Spec）] 把任务经验沉淀为可复用规范，并在开工前挂上。\n'
-        'select：挂 hook 并**直接返回所选 Spec 全文**（不需要先 read；传空数组表示取消'
-        '全部选择；实际注入发生在下次重构 context）；create/update：沉淀与维护自定义'
-        'Spec（落盘到工作空间 spec/）。\n'
+        '**何时用：几乎没有例外**——开工第一步就按系统提示词里的 Spec 索引判型并 select；'
+        '会改动文件或需要多步执行的任务不允许跳过（"先探索再说"也不行，探索前就该挂好），'
+        '只有纯问答/查资料（不改任何文件）才可以不挂。\n'
+        'select：挂 hook 并**直接返回所选 Spec 全文**（不需要先 read；传空数组表示取消全部选择）；'
+        '挂上之后全文会作为「已选 Spec 全文」持续注入本会话的系统提示词，不是只在这一轮有效。\n'
+        'create/update：沉淀与维护自定义 Spec（落盘到工作空间 .self/spec/）。\n'
         '可用 Spec 的索引（id/类型/标题/适用条件）已列在系统提示词里，直接用 id 选取。'
-        '内置 Spec（easy-task / complex-task / hard-task / team-meeting）只读，不可 update。',
+        '内置 Spec（general-task / hard-task / team-meeting）只读，不可 update。',
     parameters: <String, dynamic>{
       'type': 'object',
       'properties': <String, dynamic>{

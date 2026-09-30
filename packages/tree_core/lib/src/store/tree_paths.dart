@@ -79,9 +79,6 @@ class TreePaths {
   /// 全局设置文件。
   String get settingsFile => p.join(configDir, 'settings.yaml');
 
-  /// 内置 Spec 模板目录（首次启动由核心写入，用户可查看与手改副本）。
-  String get builtinSpecsDir => p.join(root, 'spec', 'builtin');
-
   /// MCP 服务配置（可直接手改的 yaml）。
   String get mcpConfigFile => p.join(configDir, 'mcp.yaml');
 

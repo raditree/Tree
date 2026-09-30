@@ -13,6 +13,23 @@ import '../store/records.dart';
 /// 之后下一轮的索引就是新的。
 String Function(CoreAgent agent)? specIndexProvider;
 
+/// 已选 Spec 全文提供者（Q9 ⑧ 章）：按 **agent + session** 现取本会话挂 hook 的
+/// 规范全文；空串 = 不注入（没挂 / 快照还没热）。
+///
+/// 与 [specIndexProvider] 同一接线理由（提示词在会话生成与压缩估算两处拼装，
+/// 必须逐字一致），只是多一个 session 维度：`selected_spec_ids` 是**会话级**的。
+///
+/// 没有它，`spec select` 就只是"把全文塞进这一轮的工具结果"：压缩一轮之后
+/// 摘要里不会再有规范正文，也没有任何机制把它重新注入——参考实现靠的正是这一章。
+String Function(CoreAgent agent, String sessionId)? selectedSpecsProvider;
+
+/// 工作空间系统提示词提供者（`<工作空间>/.self/system_prompt.md`）。
+///
+/// 与 [specIndexProvider] 同一接线理由：提示词在**两处**被拼装（会话生成与压缩
+/// 估算），两处必须看到逐字一致的字符串。为空 = 不注入基础段（测试与无盘场景），
+/// 行为与接线前完全一致。每轮现调（内部按 agent 缓存 + 后台刷新）。
+String Function(CoreAgent agent)? systemPromptFileProvider;
+
 /// 工作空间说明（M8a）——作为**软约束**追加在 agent 自己的系统提示词之后。
 ///
 /// 三个设计决定：
@@ -54,23 +71,60 @@ String specIndexSection(String explicit) {
   final String index = explicit.trim();
   if (index.isEmpty) return '';
   return '\n\n## Spec 索引（任务型规范）\n\n$index\n\n'
-      '开工前先按上表的 id 与适用条件判断该挂哪份规范：`spec select` 会**直接返回全文**'
-      '并挂上 hook；没有合适的就不挂（不要硬凑），任务收尾可用 `spec create` 把经验沉淀成新规范。';
+      // 口径必须与 `[Warning]spec 未选择` 一致：那条 Warning 只在"该挂没挂"时成立。
+      // 原先写的"没有合适的就不挂（不要硬凑）"是一张无限期的免挂通行证，模型据此
+      // 一路"先探索再说"，把挂规范无限期推后（实测整场 143 次工具调用只挂 1 次）。
+      '**开工第一步**：按上表的 id 与适用条件判型并 `spec select`（**直接返回全文**并挂 hook）；'
+      '会改动文件或需要多步执行的任务不允许跳过这一步，"先探索再说"也不行——探索之前就该挂好。'
+      '只有"不改动任何文件、只需回答问题"的纯问答/查资料才可以不挂。'
+      '挂上的规范全文会作为「已选 Spec 全文」**持续注入本会话的系统提示词**（不是只在这一轮有效）；'
+      '任务收尾可用 `spec create` 把经验沉淀成新规范。';
 }
 
-/// agent 自己的系统提示词 + 工作空间软约束 + Spec 索引（Q9）。
+/// ⑧ 已选 Spec 全文段（Q9）：本会话 `spec select` 挂上的 hook 在这里落地。
 ///
-/// 空提示词只返回约束段；非空则保留原文，用空行分隔追加——原文一字不改，
-/// 便于用户对照自己写在 agent 配置里的内容。索引为空（没接 Spec 服务）时
-/// 输出与 M8a 完全一致。
-String systemPromptWithWorkspace(CoreAgent agent, {String specIndex = ''}) {
-  final String base = agent.systemPrompt.trimRight();
+/// 参考实现在**每次重建 system prompt** 时注入这一段（`agent/chat.py` 的第 ⑧ 章）；
+/// 这边原先只搬了第 ⑦ 章索引，于是 `spec select` 对上下文没有持续影响、
+/// 压缩后规范正文也不会回来——这一段就是补上那个缺口。
+String selectedSpecsSection(String explicit) {
+  final String text = explicit.trim();
+  if (text.isEmpty) return '';
+  return '\n\n## 已选 Spec 全文（本会话挂的 hook）\n\n$text';
+}
+
+/// 全局基础提示词（用户数据文件）+ agent 自己的系统提示词 + 工作空间软约束 +
+/// Spec 索引（Q9）+ 已选 Spec 全文（Q9 ⑧）。
+///
+/// 空段直接跳过、非空段原样保留并用空行分隔——原文一字不改，便于用户对照自己
+/// 写在文件 / agent 配置里的内容。索引为空（没接 Spec 服务）时输出与 M8a 一致；
+/// 全局基础段为空（没接文件）时输出与接线前一致。
+String systemPromptWithWorkspace(
+  CoreAgent agent, {
+  String sessionId = '',
+  String specIndex = '',
+  String selectedSpecs = '',
+}) {
+  // 基础段（用户数据文件 config/system_prompt.md）+ 该 agent 自己的提示词。
+  // 基础段在前、个人段在后：用户文件是"所有 agent 的通用约定"，agent 自己的
+  // system_prompt 是可以覆盖/补充它的更具体指令。两者都为空时不产生空段。
+  final String global = (systemPromptFileProvider?.call(agent) ?? '')
+      .trimRight();
+  final String own = agent.systemPrompt.trimRight();
+  final String base = global.isEmpty
+      ? own
+      : (own.isEmpty ? global : '$global\n\n$own');
   final String suffix = workspacePromptSuffix(agent);
   final String index = specIndexSection(
     specIndex.trim().isEmpty
         ? (specIndexProvider?.call(agent) ?? '')
         : specIndex,
   );
-  final String tail = '$suffix$index';
+  // ⑧ 已选 Spec 全文：会话级，所以要 sessionId 才取得到（见 [selectedSpecsProvider]）
+  final String hook = selectedSpecsSection(
+    selectedSpecs.trim().isEmpty
+        ? (selectedSpecsProvider?.call(agent, sessionId) ?? '')
+        : selectedSpecs,
+  );
+  final String tail = '$suffix$index$hook';
   return base.isEmpty ? tail : '$base\n\n$tail';
 }
