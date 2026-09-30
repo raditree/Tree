@@ -207,14 +207,21 @@ class PluginHost {
   ///
   /// **无静态总时长上限**（M9 §1.1）：插件跑多久都等；只有插件进程退出 / 输出流
   /// 关闭（[_failPending]）才会让在途调用以可读错误显式失败。
+  /// [scope] 非空时随 `tools/call` 一起下发（单实例插件据此知道"这一次是谁在问"）。
+  /// 形状与 station/request 的 scope 同源：{team_id, agent_id, session_id, mode_key}。
   Future<PluginCallResult> callTool(
     String toolName,
-    Map<String, dynamic> arguments,
-  ) async {
+    Map<String, dynamic> arguments, {
+    Map<String, dynamic>? scope,
+  }) async {
     try {
       final Map<String, dynamic> result = await _request(
         'tools/call',
-        <String, dynamic>{'name': toolName, 'arguments': arguments},
+        <String, dynamic>{
+          'name': toolName,
+          'arguments': arguments,
+          'scope': ?scope,
+        },
       );
       final List<String> parts = <String>[];
       final Object? content = result['content'];

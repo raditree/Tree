@@ -20,6 +20,8 @@ import 'dart:io';
 ///   原样 JSON 作为 tools/call 结果返回（验证「插件 → 核心」的请求通道）。
 /// - --station-client-int-id：主动请求复用**正在处理的那条核心请求的 int id**
 ///   （故意与核心在途请求撞号，验证"带 method 的 int id"仍判为请求而非回包）。
+/// - --scope-probe：额外申报 scope_probe 工具，回显整条 tools/call 报文
+///   （验证「核心 → 插件」是否带调用点身份）。
 void main(List<String> args) {
   String eventsFile = '';
   String pingGateFile = '';
@@ -28,6 +30,9 @@ void main(List<String> args) {
   final bool stationTools = args.contains('--station-tools');
   final bool stationClient = args.contains('--station-client');
   final bool stationClientIntId = args.contains('--station-client-int-id');
+  // 只在使用方显式要求时申报 scope_probe：默认工具清单保持 echo + slow，
+  // 既有用例对工具条数的断言不受影响。
+  final bool scopeProbe = args.contains('--scope-probe');
   for (int i = 0; i < args.length - 1; i++) {
     if (args[i] == '--events-file') eventsFile = args[i + 1];
     if (args[i] == '--ignore-ping-until') pingGateFile = args[i + 1];
@@ -149,6 +154,15 @@ void main(List<String> args) {
                 'required': <String>['text'],
               },
             },
+            if (scopeProbe)
+              <String, dynamic>{
+                'name': 'scope_probe',
+                'description': '回显收到的一次 tools/call 报文（含 scope 身份）',
+                'inputSchema': <String, dynamic>{
+                  'type': 'object',
+                  'properties': <String, dynamic>{},
+                },
+              },
             <String, dynamic>{
               'name': 'slow',
               'description': '故意不回应（测进程退出时的显式失败）',
@@ -238,6 +252,16 @@ void main(List<String> args) {
                 'type': 'text',
                 'text': 'plugin-echo: ${callArgs['text']}',
               },
+            ],
+            'isError': false,
+          });
+          return;
+        }
+        if (name == 'scope_probe') {
+          // 把整条 tools/call 报文回显出来：测试据此断言"核心 → 插件"是否带身份。
+          reply(<String, dynamic>{
+            'content': <Map<String, dynamic>>[
+              <String, dynamic>{'type': 'text', 'text': jsonEncode(params)},
             ],
             'isError': false,
           });

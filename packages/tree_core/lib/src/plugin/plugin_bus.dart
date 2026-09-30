@@ -474,10 +474,14 @@ class PluginBus {
   /// **按来源 plugin_id 路由**：先查动态工具表（收集站注册的定义），命中则用定义里的
   /// 来源插件与执行名（唯一权威）；否则退回既有的命名空间解析。
   /// **无静态超时**：插件跑多久都等（判活靠心跳，见 [watchdog]）。
+  /// [agentId] / [sessionId] = **调用点**身份：随 `tools/call` 下发给插件
+  /// （单实例插件据此做归属判断）。留空 = 不带 scope（老调用方行为不变）。
   Future<PluginCallResult> callTool(
     String toolName,
     Map<String, dynamic> arguments, {
     String pluginId = '',
+    String agentId = '',
+    String sessionId = '',
   }) async {
     load();
     String targetPlugin = pluginId;
@@ -515,7 +519,11 @@ class PluginBus {
         isError: true,
       );
     }
-    final PluginCallResult result = await host.callTool(targetTool, arguments);
+    final PluginCallResult result = await host.callTool(
+      targetTool,
+      arguments,
+      scope: _callIdentity(agentId, sessionId),
+    );
     if (result.isError) {
       _errors[targetPlugin] = result.text;
     } else {
@@ -523,6 +531,27 @@ class PluginBus {
       host.liveness.recordBeat();
     }
     return result;
+  }
+
+  /// 核心 → 插件 `tools/call` 的身份四元组（Q2）。
+  ///
+  /// 与 `station/command` 同一口径：team 取调用点 agent 的团队归属、mode 取目标
+  /// agent 的工作空间模式；两者都解析不出来时退化为只带 agent/session（插件侧
+  /// 自己决定是否要求更完整的身份）。agent 与 session 都为空 = 不带 scope。
+  Map<String, dynamic>? _callIdentity(String agentId, String sessionId) {
+    final String agent = agentId.trim();
+    final String session = sessionId.trim();
+    if (agent.isEmpty && session.isEmpty) return null;
+    final StationScopeContext context =
+        callSiteContext?.call(agent, session) ??
+        StationScopeContext(agentId: agent, sessionId: session);
+    final String mode = (agentModeKeyResolver?.call(agent) ?? '').trim();
+    return <String, dynamic>{
+      'team_id': context.teamId.trim(),
+      'agent_id': agent,
+      'session_id': session,
+      if (StationModeKey.isValid(mode)) 'mode_key': mode,
+    };
   }
 
   /// 停止心跳巡检定时器（关停 / 测试用；显式 [watchdog] 仍可手动跑一拍）。
@@ -1102,15 +1131,21 @@ class PluginBus {
     }
   }
 
-  /// **执行站命令（插件 → 核心）**：参数 `{command: string, arguments: object?}`。
+  /// **执行站命令（插件 → 核心）**：参数 {command, arguments, team_id?, agent_id?, session_id?, mode_key?}。
   ///
-  /// **scope 只取插件自己的声明**（[_scopeOf]，与订阅 / 收集站同一套解析）：
-  /// 插件在 `arguments` 里塞 `team_id` / `agent_id` / `session_id` / `mode_key`
-  /// **不会改变作用域**——本方法根本不读这几个键（命令参数只用来指名“目标”），
-  /// 站点实例与挂载位置再按插件声明的四元组做隔离判定（fail-closed，不得放大）。
+  /// **单实例 + 每条消息带身份（Q2）**：插件进程只有一个，身份**按这一次请求**解析：
+  /// - 目标 agent 取请求里的 agent_id（params 顶层或 arguments 均可），缺省才回退
+  ///   到 plugins.yaml 的 scope.agent_id；
+  /// - team / mode 由核心按**目标 agent 的真实归属**解析（团队 + 工作空间模式），
+  ///   而不是信任插件声明；
+  /// - plugins.yaml 的 scope 从此是**作用域上限**：声明了 team 的插件只能在自己的
+  ///   team 内活动；未声明的插件可服务任意 team，但每条命令都必须能证明归属
+  ///   （fail-closed：agent 缺失 / 不存在 / 归属解析不出 / 请求里带的 team_id 与
+  ///   真实归属不一致，一律拒绝）；
+  /// - 不带 agent 的团队级命令（如 ui.push）：team 取请求或声明，agent 留空。
   ///
-  /// 执行站的结论（含**可读错误**）原样放进 `result` 回给插件：命令被拒 / 挂载位置
-  /// 失败不是 JSON-RPC 错误，而是 `{ok: false, error: ...}`——插件据此自查原因，
+  /// 执行站的结论（含**可读错误**）原样放进 result 回给插件：命令被拒 / 挂载位置
+  /// 失败不是 JSON-RPC 错误，而是 {ok: false, error: ...}——插件据此自查原因，
   /// 不会被吞成一句“调用失败”。
   Future<Map<String, dynamic>> _handleStationCommand(
     PluginConfig config,
@@ -1133,25 +1168,15 @@ class PluginBus {
     final Map<String, dynamic> arguments = rawArguments is Map
         ? rawArguments.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
         : <String, dynamic>{};
-    // scope：插件实例**自己的声明**（团队归属 + 它自己声明的更细粒度）。
-    // 上下文同样由声明派生（不含插件的请求参数）：声明了 agent 的插件因此能按
-    // 该 agent 的工作空间模式（local | ssh）落到正确的执行站。
+    // scope = 这一次命令的**运行期四元组**（Q2：单实例 + 每条消息带身份）。
+    // 声明只作上限；team / mode 由核心按目标 agent 的真实归属解析。
     final StationScope declared = StationScope.parse(config.scope);
-    final StationScope scope = _scopeOf(
+    final StationScope scope = _resolveCommandScope(
       config,
-      StationScopeContext(
-        teamId: declared.teamId,
-        agentId: declared.agentId,
-        sessionId: declared.sessionId,
-      ),
+      declared,
+      params,
+      arguments,
     );
-    if (!scope.isValid) {
-      throw PluginRequestException(
-        PluginRpcErrorCode.scopeDenied,
-        '插件 ${config.id} 未声明 team，不能使用执行站'
-        '（plugins.yaml 的 scope.team_id 必须非空）',
-      );
-    }
     final ExecuteStation? station = stations.executeFor(scope);
     if (station == null) {
       throw PluginRequestException(
@@ -1174,6 +1199,147 @@ class PluginBus {
       'error': result.error,
     };
   }
+
+  /// 解析一次 station/command 的**运行期四元组**（Q2：单实例 + 每消息带身份）。
+  ///
+  /// 规则（fail-closed）：
+  /// 1. 目标 agent = 请求里的 agent_id（params 顶层或 arguments）→ 声明里的
+  ///    scope.agent_id；两者都空时才走"团队级命令"分支（如 ui.push）；
+  /// 2. team / mode = 核心按目标 agent 的**真实归属**解析（callSiteContext /
+  ///    agentModeKeyResolver）；解析器未接线（测试 / 嵌入式宿主）才回退到声明，
+  ///    与改造前行为一致；
+  /// 3. 插件声明是**作用域上限**：声明了非空 team / agent / session 时真实值必须一致；
+  /// 4. 请求里显式带的 team_id / mode_key 必须与真实归属一致（带了就得对，
+  ///    不允许"声明一套、请求另一套"）。
+  StationScope _resolveCommandScope(
+    PluginConfig config,
+    StationScope declared,
+    Map<String, dynamic> params,
+    Map<String, dynamic> arguments,
+  ) {
+    String pick(String key) {
+      for (final Object? source in <Object?>[params, arguments]) {
+        if (source is! Map) continue;
+        final Object? value = source[key];
+        if (value != null && value.toString().trim().isNotEmpty) {
+          return value.toString().trim();
+        }
+      }
+      return '';
+    }
+
+    final String requestedTeam = pick('team_id');
+    final String requestedMode = pick('mode_key');
+    final String requestedSession = pick('session_id');
+    final String requestedAgent = pick('agent_id');
+
+    // ── 团队级命令（无目标 agent，如 ui.push）：team 必须能确定 ──────────
+    if (requestedAgent.isEmpty && declared.agentId.isEmpty) {
+      final String team = requestedTeam.isNotEmpty
+          ? requestedTeam
+          : declared.teamId.trim();
+      if (team.isEmpty) {
+        throw PluginRequestException(
+          PluginRpcErrorCode.scopeDenied,
+          '插件 ${config.id} 的命令既没有 agent_id 也没有可用 team：'
+          '无法确定作用域（团队级命令请带 team_id，或在 plugins.yaml 声明 scope.team_id）',
+        );
+      }
+      if (declared.teamId.trim().isNotEmpty && declared.teamId.trim() != team) {
+        throw PluginRequestException(
+          PluginRpcErrorCode.scopeDenied,
+          '插件 ${config.id} 声明 team=${declared.teamId}，'
+          '但命令要作用于 team=$team：跨 team 拒绝（声明是作用域上限）',
+        );
+      }
+      return StationScope(
+        teamId: team,
+        sessionId: requestedSession.isNotEmpty
+            ? requestedSession
+            : declared.sessionId,
+        modeKey: StationModeKey.isValid(requestedMode)
+            ? requestedMode
+            : declared.modeKey,
+      );
+    }
+
+    // ── agent 级命令：按目标 agent 的真实归属解析 ────────────────────────
+    final String agentId = requestedAgent.isNotEmpty
+        ? requestedAgent
+        : declared.agentId;
+    final String sessionId = requestedSession.isNotEmpty
+        ? requestedSession
+        : declared.sessionId;
+    final StationScopeContext? context = callSiteContext?.call(
+      agentId,
+      sessionId,
+    );
+    final String resolvedTeam = (context?.teamId ?? '').trim().isNotEmpty
+        ? context!.teamId.trim()
+        : declared.teamId.trim();
+    final String resolvedMode = (agentModeKeyResolver?.call(agentId) ?? '')
+        .trim();
+    final String mode = StationModeKey.isValid(resolvedMode)
+        ? resolvedMode
+        : (StationModeKey.isValid(requestedMode)
+              ? requestedMode
+              : declared.modeKey);
+
+    if (declared.teamId.trim().isNotEmpty &&
+        declared.teamId.trim() != resolvedTeam) {
+      throw PluginRequestException(
+        PluginRpcErrorCode.scopeDenied,
+        '插件 ${config.id} 声明 team=${declared.teamId}，但目标 agent $agentId '
+        '真实归属 team=${_scopeOr(resolvedTeam)}：跨 team 拒绝（声明是作用域上限）',
+      );
+    }
+    if (declared.agentId.isNotEmpty && declared.agentId != agentId) {
+      throw PluginRequestException(
+        PluginRpcErrorCode.scopeDenied,
+        '插件 ${config.id} 绑定了 agent=${declared.agentId}，不能对 $agentId 下命令',
+      );
+    }
+    if (declared.sessionId.isNotEmpty &&
+        sessionId.isNotEmpty &&
+        declared.sessionId != sessionId) {
+      throw PluginRequestException(
+        PluginRpcErrorCode.scopeDenied,
+        '插件 ${config.id} 绑定了 session=${declared.sessionId}，'
+        '与命令的 session=$sessionId 不一致',
+      );
+    }
+    if (requestedTeam.isNotEmpty && requestedTeam != resolvedTeam) {
+      throw PluginRequestException(
+        PluginRpcErrorCode.scopeDenied,
+        '命令请求的 team_id=$requestedTeam 与目标 agent $agentId 的真实归属 '
+        'team=${_scopeOr(resolvedTeam)} 不一致：跨 team 拒绝',
+      );
+    }
+    if (StationModeKey.isValid(requestedMode) && requestedMode != mode) {
+      throw PluginRequestException(
+        PluginRpcErrorCode.scopeDenied,
+        '命令请求的 mode_key=$requestedMode 与目标 agent $agentId 的真实工作面 '
+        'mode=$mode 不一致：拒绝',
+      );
+    }
+    if (resolvedTeam.isEmpty) {
+      throw PluginRequestException(
+        PluginRpcErrorCode.scopeDenied,
+        '插件 ${config.id} 未声明 team，且目标 agent $agentId 没有可解析的团队归属，'
+        '不能使用执行站（单实例插件请带 agent_id 并确保该 agent 存在；'
+        '或在 plugins.yaml 的 scope.team_id 里声明团队）',
+      );
+    }
+    return StationScope(
+      teamId: resolvedTeam,
+      agentId: agentId,
+      sessionId: sessionId,
+      modeKey: mode,
+    );
+  }
+
+  /// 可读错误里把空归属显示成 "?"。
+  static String _scopeOr(String value) => value.isEmpty ? '?' : value;
 
   void _scheduleToolTableRefresh(StationScope? scope) {
     if (_toolTableRefreshing) return;

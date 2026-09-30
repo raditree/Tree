@@ -103,6 +103,9 @@ abstract final class PluginTool {
       final PluginCallResult result = await bus.callTool(
         invocation.name,
         invocation.arguments,
+        // 调用点身份随 tools/call 下发：单实例插件据此知道"这一次是谁在问"
+        agentId: invocation.agentId,
+        sessionId: invocation.sessionId,
       );
       return ToolOutcome(
         result.text.isEmpty ? '（插件工具没有返回内容）' : result.text,
@@ -178,7 +181,12 @@ abstract final class PluginTool {
         final Map<String, dynamic> args = raw is Map<dynamic, dynamic>
             ? raw.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
             : <String, dynamic>{};
-        final PluginCallResult result = await bus.callTool(toolName, args);
+        final PluginCallResult result = await bus.callTool(
+          toolName,
+          args,
+          agentId: invocation.agentId,
+          sessionId: invocation.sessionId,
+        );
         return ToolOutcome(
           result.text.isEmpty ? '（插件工具没有返回内容）' : result.text,
           isError: result.isError,

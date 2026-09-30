@@ -97,7 +97,15 @@ class ExecuteStationMounts {
     void Function(String message)? log,
   }) => ExecuteStationMounts(
     ioFor: ioFor,
-    agentTeamOf: (String agentId) => store.agent(agentId)?.teamId ?? '',
+    // 与 TeamService.teamIdOf / 站点 keying **同口径**：顶层 agent（team_id 为空）
+    // 自成一队，否则用它的 team_id。此前这里只读 team_id，导致针对顶层 agent 的
+    // 执行站命令一律被判"没有团队归属"（站点却是按 agent.id 预建的）。
+    agentTeamOf: (String agentId) {
+      final CoreAgent? agent = store.agent(agentId);
+      if (agent == null) return '';
+      final String team = agent.teamId.trim();
+      return team.isEmpty ? agent.id : team;
+    },
     agentModeOf: (String agentId) => store.agent(agentId)?.sshConfig != null
         ? StationModeKey.ssh
         : StationModeKey.local,
@@ -425,6 +433,8 @@ class ExecuteStationMounts {
         maxDepth: _int(context.arguments['max_depth']) ?? 0,
         maxResults: _int(context.arguments['max_results']) ?? 200,
         exclude: _strings(context.arguments['exclude']),
+        // 与内置 grep 工具同一默认口径：隐藏路径（`.[!.]*`）默认不搜。
+        includeHidden: context.arguments['include_hidden'] == true,
       ),
     );
     return StationCommandOutcome.ok(<String, dynamic>{

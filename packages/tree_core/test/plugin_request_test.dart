@@ -52,17 +52,23 @@ void main() {
   String slash(String path) => path.replaceAll(Platform.pathSeparator, '/');
 
   /// 执行站首命令集的挂载位置：agt_1 ∈ team-1、agt_2 ∈ team-2（都走本地工作空间）。
-  ExecuteStationMounts mounts(String workspaceDir) => ExecuteStationMounts(
-    ioFor: (String agentId) async =>
-        agentId == 'agt_1' ? LocalWorkspaceIO(workspaceDir) : null,
-    agentTeamOf: (String agentId) => switch (agentId) {
-      'agt_1' => 'team-1',
-      'agt_2' => 'team-2',
-      _ => '',
-    },
-    agentModeOf: (String agentId) =>
-        (agentId == 'agt_1' || agentId == 'agt_2') ? StationModeKey.local : '',
-  );
+  ExecuteStationMounts mounts(String workspaceDir, {bool bothAgents = false}) =>
+      ExecuteStationMounts(
+        ioFor: (String agentId) async => switch (agentId) {
+          'agt_1' => LocalWorkspaceIO(workspaceDir),
+          'agt_2' => bothAgents ? LocalWorkspaceIO(workspaceDir) : null,
+          _ => null,
+        },
+        agentTeamOf: (String agentId) => switch (agentId) {
+          'agt_1' => 'team-1',
+          'agt_2' => 'team-2',
+          _ => '',
+        },
+        agentModeOf: (String agentId) =>
+            (agentId == 'agt_1' || agentId == 'agt_2')
+            ? StationModeKey.local
+            : '',
+      );
 
   /// 声明了 team 的插件（能进站点体系 ⇒ 能使用执行站）。
   String teamPluginYaml() =>
@@ -87,6 +93,27 @@ void main() {
       '    granularity: team\n'
       '    scope: {team_id: $team}\n';
 
+  /// 单实例全局插件：**不声明 scope**，身份完全由每条命令的 agent_id 提供。
+  String globalPluginYaml() =>
+      'enabled: true\n'
+      'plugins:\n'
+      '  - id: global\n'
+      '    name: 全局插件\n'
+      '    command: "${slash(Platform.resolvedExecutable)}"\n'
+      '    args: ["${slash(script)}", "--station-client"]\n'
+      '    granularity: team\n';
+
+  /// 额外申报 scope_probe 的插件（验证核心 → 插件的 tools/call 带身份）。
+  String scopeProbePluginYaml() =>
+      'enabled: true\n'
+      'plugins:\n'
+      '  - id: sample\n'
+      '    name: 样例插件\n'
+      '    command: "${slash(Platform.resolvedExecutable)}"\n'
+      '    args: ["${slash(script)}", "--station-client", "--scope-probe"]\n'
+      '    granularity: team\n'
+      '    scope: {team_id: $team}\n';
+
   /// 没声明 team 的插件：站点四元组不成立 ⇒ 执行站必须显式拒绝（不静默）。
   String noTeamPluginYaml() =>
       'enabled: true\n'
@@ -99,6 +126,8 @@ void main() {
   Future<PluginBus> startBus(
     String yaml, {
     void Function(Map<String, dynamic> frame)? broadcast,
+    bool wireRuntimeScope = false,
+    bool bothAgents = false,
   }) async {
     final File file = File(p.join(temp.path, 'config', 'plugins.yaml'));
     file.createSync(recursive: true);
@@ -111,7 +140,28 @@ void main() {
     );
     addTearDown(bus.close);
     // 执行站的挂载位置：与核心接线一致（八条命令都接到真实现上）。
-    expect(bus.mountExecuteStations(mounts(workspace)), isNull);
+    expect(
+      bus.mountExecuteStations(mounts(workspace, bothAgents: bothAgents)),
+      isNull,
+    );
+    if (wireRuntimeScope) {
+      // 复刻生产接线（CoreServer._wirePluginStations）：按目标 agent 的**真实归属**
+      // 解析 team / mode —— 单实例插件因此能服务多个 team。
+      bus.callSiteContext = (String agentId, String sessionId) =>
+          StationScopeContext(
+            teamId: switch (agentId) {
+              'agt_1' => 'team-1',
+              'agt_2' => 'team-2',
+              _ => '',
+            },
+            agentId: agentId,
+            sessionId: sessionId,
+          );
+      bus.agentModeKeyResolver = (String agentId) =>
+          (agentId == 'agt_1' || agentId == 'agt_2')
+          ? StationModeKey.local
+          : '';
+    }
     await bus.start();
     return bus;
   }
@@ -204,7 +254,7 @@ void main() {
     expect(error['message'], contains('不能使用执行站'));
   });
 
-  test('arguments 里的 team_id/agent_id/mode_key 不改变作用域（跨 team 仍被拒）', () async {
+  test('请求里带的身份必须与目标 agent 的真实归属一致（不一致则拒）', () async {
     final PluginBus bus = await startBus(teamPluginYaml());
     final Map<String, dynamic> response = await pluginRequest(
       bus,
@@ -212,7 +262,8 @@ void main() {
       params: <String, dynamic>{
         'command': 'fs.read',
         'arguments': <String, dynamic>{
-          // 插件试图用参数给自己"换 scope"：这些键一律不参与作用域解析
+          // 请求里带的 team_id 与目标 agent 的真实归属不一致 ⇒ 显式拒绝
+          // （身份要被**校验**，不是被忽略，也不能拿来给自己"换 scope"）
           'team_id': 'team-2',
           'agent_id': 'agt_2',
           'session_id': 'ses-2',
@@ -221,26 +272,136 @@ void main() {
         },
       },
     );
-    final Map<String, dynamic> result =
-        response['result'] as Map<String, dynamic>;
-    expect(result['ok'], isFalse, reason: '跨 team 目标必须被拒');
-    expect(result['error'], contains('跨 team'));
-    expect(result['error'], contains('agt_2'));
     expect(
-      result['error'],
+      response['result'],
+      isNull,
+      reason: 'scope 不一致走 -32001，不是站点级 ok=false',
+    );
+    final Map<String, dynamic> error =
+        response['error'] as Map<String, dynamic>;
+    expect(error['code'], PluginRpcErrorCode.scopeDenied);
+    expect(error['message'], contains('跨 team'));
+    expect(error['message'], contains('agt_2'));
+    expect(
+      error['message'],
       contains('team=$team'),
-      reason: '命令 scope 仍是插件声明的 team（不受参数里的 team_id 影响）',
+      reason: '真实归属（或未接线时回退的声明）是 team-1，请求里的 team-2 对不上',
     );
 
-    // 站点侧旁证：只为插件声明的 team-1@local 建了执行站（没被参数带去 team-2 / ssh）
+    // 站点侧旁证：身份不一致在**选站之前**就被拒，没有为 team-2 / ssh 建执行站
     final List<ExecuteStation> executes = bus.stations
         .stationList()
         .whereType<ExecuteStation>()
         .toList();
-    expect(executes, hasLength(1));
-    expect(executes.single.scope.teamId, team);
-    expect(executes.single.scope.modeKey, StationModeKey.local);
+    expect(executes, isEmpty);
     expect(File(p.join(workspace, 'secret.txt')).existsSync(), isFalse);
+  });
+
+  test('单实例插件（不声明 scope）用每条命令的 agent_id 服务多个 team', () async {
+    final PluginBus bus = await startBus(
+      globalPluginYaml(),
+      wireRuntimeScope: true,
+      bothAgents: true,
+    );
+    final Map<String, dynamic> one = await pluginRequest(
+      bus,
+      pluginId: 'global',
+      method: 'station/command',
+      params: <String, dynamic>{
+        'command': 'fs.write',
+        'arguments': <String, dynamic>{
+          'agent_id': 'agt_1',
+          'path': 't1.txt',
+          'content': 'team-1',
+        },
+      },
+    );
+    expect(
+      (one['result'] as Map<String, dynamic>)['ok'],
+      isTrue,
+      reason: '${one['error']}',
+    );
+    final Map<String, dynamic> two = await pluginRequest(
+      bus,
+      pluginId: 'global',
+      method: 'station/command',
+      params: <String, dynamic>{
+        'command': 'fs.write',
+        'arguments': <String, dynamic>{
+          'agent_id': 'agt_2',
+          'path': 't2.txt',
+          'content': 'team-2',
+        },
+      },
+    );
+    expect(
+      (two['result'] as Map<String, dynamic>)['ok'],
+      isTrue,
+      reason: '${two['error']}',
+    );
+    expect(File(p.join(workspace, 't1.txt')).readAsStringSync(), 'team-1');
+    expect(File(p.join(workspace, 't2.txt')).readAsStringSync(), 'team-2');
+    expect(
+      bus.stations
+          .stationList()
+          .whereType<ExecuteStation>()
+          .map((ExecuteStation s) => s.scope.teamId)
+          .toSet(),
+      <String>{'team-1', 'team-2'},
+      reason: '两个团队的执行站都按真实归属建出来了（同一个插件实例）',
+    );
+  });
+
+  test('声明了 team 的插件在运行期解析下仍被限制在自己 team（声明是上限）', () async {
+    final PluginBus bus = await startBus(
+      teamPluginYaml(),
+      wireRuntimeScope: true,
+      bothAgents: true,
+    );
+    final Map<String, dynamic> response = await pluginRequest(
+      bus,
+      method: 'station/command',
+      params: <String, dynamic>{
+        'command': 'fs.write',
+        'arguments': <String, dynamic>{
+          'agent_id': 'agt_2',
+          'path': 'nope.txt',
+          'content': 'x',
+        },
+      },
+    );
+    expect(response['result'], isNull);
+    final Map<String, dynamic> error =
+        response['error'] as Map<String, dynamic>;
+    expect(error['code'], PluginRpcErrorCode.scopeDenied);
+    expect(
+      error['message'],
+      contains('跨 team'),
+      reason: '声明 team-1 的插件不能碰 team-2 的 agent（声明是作用域上限）',
+    );
+    expect(File(p.join(workspace, 'nope.txt')).existsSync(), isFalse);
+  });
+
+  test('核心 → 插件的 tools/call 带调用点 team/agent/session/mode', () async {
+    final PluginBus bus = await startBus(
+      scopeProbePluginYaml(),
+      wireRuntimeScope: true,
+    );
+    final PluginCallResult probe = await bus.callTool(
+      'plugin__sample__scope_probe',
+      <String, dynamic>{},
+      agentId: 'agt_1',
+      sessionId: 'ses-1',
+    );
+    expect(probe.isError, isFalse, reason: probe.text);
+    final Map<String, dynamic> params =
+        jsonDecode(probe.text) as Map<String, dynamic>;
+    expect(params['name'], 'scope_probe');
+    final Map<String, dynamic> scope = params['scope'] as Map<String, dynamic>;
+    expect(scope['team_id'], 'team-1');
+    expect(scope['agent_id'], 'agt_1');
+    expect(scope['session_id'], 'ses-1');
+    expect(scope['mode_key'], StationModeKey.local);
   });
 
   test('插件用与核心在途请求撞号的 int id 发请求：仍判为请求（不被当回包吞掉）', () async {

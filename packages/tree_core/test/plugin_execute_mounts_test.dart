@@ -231,6 +231,38 @@ void main() {
         (grepPayload['matches'] as List<dynamic>).first,
         containsPair('path', 'docs/a.txt'),
       );
+
+      // 隐藏路径默认不搜（与内置 grep 同一默认口径）：include_hidden 才放行
+      final StationCommandResult hiddenWrite = await run(
+        station,
+        'fs.write',
+        arguments: <String, dynamic>{
+          'path': '.hidden/secret.txt',
+          'content': 'tree hidden',
+        },
+      );
+      expect(hiddenWrite.ok, isTrue, reason: hiddenWrite.error);
+      final StationCommandResult defaultGrep = await run(
+        station,
+        'fs.grep',
+        arguments: <String, dynamic>{'pattern': 'tree'},
+      );
+      expect(
+        (defaultGrep.payload! as Map<String, dynamic>)['count'],
+        grepPayload['count'],
+        reason: '隐藏目录里的命中不该出现在默认结果里',
+      );
+      final StationCommandResult hiddenGrep = await run(
+        station,
+        'fs.grep',
+        arguments: <String, dynamic>{'pattern': 'tree', 'include_hidden': true},
+      );
+      expect(
+        ((hiddenGrep.payload! as Map<String, dynamic>)['matches']
+                as List<dynamic>)
+            .map((dynamic m) => (m as Map<String, dynamic>)['path']),
+        contains('.hidden/secret.txt'),
+      );
     },
   );
 
