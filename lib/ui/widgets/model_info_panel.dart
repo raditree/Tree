@@ -73,6 +73,14 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
   /// 上下文压缩阈值覆盖（null = 不覆盖 = 用模型默认，通常 0.8）
   double? _compressThreshold;
 
+  /// 是否回传历史思考的本 Agent 覆盖：'' = 不覆盖（跟随模型），'true' / 'false' = 覆盖。
+  ///
+  /// 用三态（而不是 bool）是因为"不设置"与"显式关掉模型默认开启"必须能区分；
+  /// [_thinkingInitial] 记录进入面板时的值，用来判断用户是否改动过这一项——
+  /// 没动就不下发（后端保持原值），改成"不覆盖"则显式下发 null 清除。
+  String _thinkingOverride = '';
+  String _thinkingInitial = '';
+
   @override
   void initState() {
     super.initState();
@@ -120,8 +128,9 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
   /// 加载模型池与当前模型信息
   Future<void> _load() async {
     try {
-      final Map<String, dynamic> data =
-          await ApiService.getAgentModelsInfo(widget.agentId);
+      final Map<String, dynamic> data = await ApiService.getAgentModelsInfo(
+        widget.agentId,
+      );
       final List<dynamic> rawModels =
           data['models'] as List<dynamic>? ?? <dynamic>[];
       // 后端返回结构为 {"agent": {id, model_id, system_prompt}, "models": [...]}
@@ -132,18 +141,23 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
       if (!mounted) return;
       setState(() {
         _models = rawModels
-            .map((dynamic e) =>
-                Map<String, dynamic>.from(e as Map<dynamic, dynamic>))
+            .map(
+              (dynamic e) =>
+                  Map<String, dynamic>.from(e as Map<dynamic, dynamic>),
+            )
             .toList();
         // 当前 agent 绑定的模型优先；无则回退模型池第一个
         final String? boundModelId = current?['model_id'] as String?;
-        final bool boundInPool = boundModelId != null &&
-            _models.any((m) => (m['model_id'] as String? ?? '') == boundModelId);
+        final bool boundInPool =
+            boundModelId != null &&
+            _models.any(
+              (m) => (m['model_id'] as String? ?? '') == boundModelId,
+            );
         _selectedModelId = boundInPool
             ? boundModelId
             : (_models.isNotEmpty
-                ? (_models.first['model_id'] as String?)
-                : null);
+                  ? (_models.first['model_id'] as String?)
+                  : null);
         // models-info 返回的 system_prompt 优先于初始值
         final String? serverPrompt = current?['system_prompt'] as String?;
         if (serverPrompt != null) {
@@ -151,8 +165,9 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
         }
         // 回填该 agent 的模型参数覆盖（null / 空 = 未覆盖 → 控件留空）
         final Map<String, dynamic> overrides =
-            (data['overrides'] as Map<String, dynamic>?)?.cast<String, dynamic>() ??
-                <String, dynamic>{};
+            (data['overrides'] as Map<String, dynamic>?)
+                ?.cast<String, dynamic>() ??
+            <String, dynamic>{};
         _reasoningEffort = (overrides['reasoning_effort'] as String?) ?? '';
         // 库里的覆盖值可能已不在当前模型的档位内（模型换过/档位声明改过）。
         // 这里就清掉并提示，而不是把非法值留在下拉里 —— DropdownButtonFormField
@@ -169,6 +184,8 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
         _maxOutputController.text = ovOut != null ? '$ovOut' : '';
         final num? ovThreshold = overrides['compress_threshold'] as num?;
         _compressThreshold = ovThreshold?.toDouble();
+        _thinkingInitial = (overrides['thinking'] as bool?)?.toString() ?? '';
+        _thinkingOverride = _thinkingInitial;
         _loading = false;
         _loadError = null;
       });
@@ -191,16 +208,26 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
       _saving = true;
     });
     try {
+      // 思考回传是三态：没改就不下发；改成"跟随模型"要显式清除覆盖
+      final bool thinkingChanged = _thinkingOverride != _thinkingInitial;
       await ApiService.updateAgent(
         widget.agentId,
         modelId: _selectedModelId,
         systemPrompt: _promptController.text.trim(),
         reasoningEffort: _reasoningEffort.isEmpty ? null : _reasoningEffort,
-        maxSeqlen:
-            clearOverrides ? null : int.tryParse(_maxSeqlenController.text.trim()),
-        maxOutputTokens:
-            clearOverrides ? null : int.tryParse(_maxOutputController.text.trim()),
+        maxSeqlen: clearOverrides
+            ? null
+            : int.tryParse(_maxSeqlenController.text.trim()),
+        maxOutputTokens: clearOverrides
+            ? null
+            : int.tryParse(_maxOutputController.text.trim()),
         compressThreshold: clearOverrides ? null : _compressThreshold,
+        thinking:
+            clearOverrides || !thinkingChanged || _thinkingOverride.isEmpty
+            ? null
+            : _thinkingOverride == 'true',
+        clearThinking:
+            !clearOverrides && thinkingChanged && _thinkingOverride.isEmpty,
         clearOverrides: clearOverrides,
       );
       if (!mounted) return;
@@ -296,13 +323,18 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
       padding: const EdgeInsets.all(10),
       children: <Widget>[
         // 模型下拉
-        const Text('模型', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+        const Text(
+          '模型',
+          style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+        ),
         const SizedBox(height: 6),
         _buildModelDropdown(),
         const SizedBox(height: 14),
         // 系统提示词编辑
-        const Text('系统提示词',
-            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+        const Text(
+          '系统提示词',
+          style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+        ),
         const SizedBox(height: 6),
         TextField(
           controller: _promptController,
@@ -319,8 +351,10 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
         Row(
           children: <Widget>[
             const Expanded(
-              child: Text('模型参数（本 Agent）',
-                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+              child: Text(
+                '模型参数（本 Agent）',
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+              ),
             ),
             TextButton(
               onPressed: _saving ? null : () => _save(clearOverrides: true),
@@ -336,8 +370,10 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
         _buildOverridesSection(cs),
         const SizedBox(height: 14),
         // 当前模型信息卡片
-        const Text('模型详情',
-            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+        const Text(
+          '模型详情',
+          style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+        ),
         const SizedBox(height: 6),
         _buildInfoCard(cs),
       ],
@@ -356,24 +392,25 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
     final num? rawSeq = mod['max_seqlen'] as num?;
     final String defaultSeq = rawSeq == null ? '—' : '${rawSeq.toInt()}';
     final num? rawOut = mod['max_output_tokens'] as num?;
-    final String defaultOut =
-        rawOut == null ? '未设置' : '${rawOut.toInt()}';
+    final String defaultOut = rawOut == null ? '未设置' : '${rawOut.toInt()}';
     final num? defaultThreshold = mod['compress_threshold'] as num?;
     final String defaultThresholdText = defaultThreshold != null
         ? '${(defaultThreshold * 100).toStringAsFixed(0)}%'
         : '80%';
     final String defaultEffort =
         ((mod['reasoning_effort'] as String?) ?? '').trim().isEmpty
-            ? '不设置'
-            : (mod['reasoning_effort'] as String).trim();
+        ? '不设置'
+        : (mod['reasoning_effort'] as String).trim();
     // 思考强度可选档位（由当前模型声明；切模型后随之变化）
     final List<String> effortOptions = _reasoningEffortOptions();
+    // 回传思考：不覆盖（跟随模型）/ 开启 / 关闭
+    final bool defaultThinking = (mod['thinking'] as bool?) ?? false;
 
     InputDecoration deco(String hint) => InputDecoration(
-          hintText: hint,
-          isDense: true,
-          border: const OutlineInputBorder(),
-        );
+      hintText: hint,
+      isDense: true,
+      border: const OutlineInputBorder(),
+    );
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -392,10 +429,7 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
           items: <DropdownMenuItem<String>>[
             const DropdownMenuItem<String>(value: '', child: Text('不覆盖')),
             ...effortOptions.map(
-              (String e) => DropdownMenuItem<String>(
-                value: e,
-                child: Text(e),
-              ),
+              (String e) => DropdownMenuItem<String>(value: e, child: Text(e)),
             ),
           ],
           onChanged: (String? value) {
@@ -414,18 +448,55 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
             ),
           ),
         const SizedBox(height: 10),
-        // 最大输入（上下文预算）
+        // 总上下文上限（max_seqlen：输入 + 输出共享的窗口总预算）
         TextField(
           controller: _maxSeqlenController,
           keyboardType: TextInputType.number,
-          decoration: deco('最大输入 tokens（模型默认 $defaultSeq）'),
+          decoration: deco('总上下文上限 max_seqlen（模型默认 $defaultSeq）'),
         ),
         const SizedBox(height: 10),
-        // 最大输出
+        // 最大输出（只限生成侧；总窗口仍是上面的 max_seqlen）
         TextField(
           controller: _maxOutputController,
           keyboardType: TextInputType.number,
           decoration: deco('最大输出 tokens（模型默认 $defaultOut）'),
+        ),
+        const SizedBox(height: 10),
+        // 是否回传历史思考（DeepSeek 的 reasoning_content）
+        DropdownButtonFormField<String>(
+          initialValue: _thinkingOverride,
+          isExpanded: true,
+          decoration: InputDecoration(
+            labelText:
+                '回传思考 reasoning_content（模型默认：${defaultThinking ? '开启' : '关闭'}）',
+            isDense: true,
+            border: const OutlineInputBorder(),
+          ),
+          items: <DropdownMenuItem<String>>[
+            DropdownMenuItem<String>(
+              value: '',
+              child: Text('跟随模型（${defaultThinking ? '开启' : '关闭'}）'),
+            ),
+            const DropdownMenuItem<String>(
+              value: 'true',
+              child: Text('开启：思考随历史回传（DeepSeek 带 tools 时要求）'),
+            ),
+            const DropdownMenuItem<String>(
+              value: 'false',
+              child: Text('关闭：不回传（省输入 token）'),
+            ),
+          ],
+          onChanged: (String? value) {
+            setState(() {
+              _thinkingOverride = value ?? '';
+            });
+          },
+        ),
+        const SizedBox(height: 2),
+        Text(
+          '开启后历史思考会作为 reasoning_content 回传端点：复用思考链能让后续思考更短、'
+          '成功率更高，代价是输入 token 增加（上下文估算与压缩阈值按同一开关计口径）。',
+          style: TextStyle(fontSize: 11, color: cs.outline),
         ),
         const SizedBox(height: 10),
         // 上下文压缩阈值
@@ -553,10 +624,17 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
     final int? maxSeqLen = (model['max_seqlen'] as num?)?.toInt();
     final bool thinking = model['thinking'] as bool? ?? false;
     final bool ifVision = model['if_vision'] as bool? ?? false;
-    final String reasoningEffort =
-        model['reasoning_effort'] as String? ?? '';
+    final String reasoningEffort = model['reasoning_effort'] as String? ?? '';
     final int? maxOutputTokens = (model['max_output_tokens'] as num?)?.toInt();
     final num? compressThreshold = model['compress_threshold'] as num?;
+
+    // **本 Agent 的生效总上下文上限**：本 Agent 覆盖优先，否则模型默认；
+    // 两者都没有时运行时按 128000 兜底（与压缩/进度条同一口径，显式标注而不是显示 —）。
+    final int? overrideSeq = int.tryParse(_maxSeqlenController.text.trim());
+    final int? effectiveSeq = (overrideSeq != null && overrideSeq > 0)
+        ? overrideSeq
+        : maxSeqLen;
+    final bool seqFromOverride = overrideSeq != null && overrideSeq > 0;
 
     Widget row(String label, String value, {Color? valueColor}) {
       return Padding(
@@ -599,8 +677,23 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
         children: <Widget>[
           row('名称', name),
           row('Model ID', modelId.isEmpty ? '—' : modelId),
-          row('最大上下文', maxSeqLen != null ? '$maxSeqLen tokens' : '—'),
+          // 用户要的「总上下文上限」：本 Agent 真正生效的那个值（覆盖优先）
+          row(
+            '总上下文上限',
+            effectiveSeq != null
+                ? '$effectiveSeq tokens${seqFromOverride ? '（本 Agent 覆盖）' : '（模型默认）'}'
+                : '未配置（运行时按 128000 兜底）',
+            valueColor: effectiveSeq == null ? cs.error : null,
+          ),
+          row('模型默认上下文', maxSeqLen != null ? '$maxSeqLen tokens' : '未配置'),
           row('思考模型', thinking ? '是' : '否'),
+          // 本 Agent 真正生效的「是否回传思考」：覆盖优先
+          row(
+            '回传思考',
+            _thinkingOverride.isNotEmpty
+                ? '${_thinkingOverride == 'true' ? '开启' : '关闭'}（本 Agent 覆盖）'
+                : '${thinking ? '开启' : '关闭'}（模型默认）',
+          ),
           row('支持视觉', ifVision ? '是' : '否'),
           row('思考强度', reasoningEffort.isEmpty ? '默认' : reasoningEffort),
           row(

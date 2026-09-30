@@ -479,12 +479,13 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
   /// 成员级模型参数覆盖（留空 = 未设置 → 沿用 TOP / 模型默认）
   ///
   /// 键与后端覆盖列一致：``reasoning_effort`` / ``max_seqlen`` /
-  /// ``max_output_tokens`` / ``compress_threshold``。
+  /// ``max_output_tokens`` / ``compress_threshold`` / ``thinking``。
   final Map<String, String> _overrideText = <String, String>{
     'reasoning_effort': '',
     'max_seqlen': '',
     'max_output_tokens': '',
     'compress_threshold': '',
+    'thinking': '',
   };
 
   /// 进入本页时各覆盖项的原始文本，用于判断"用户是否改过这一项"
@@ -747,6 +748,13 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
         if (now == (_overrideInitial[key] ?? '')) continue;
         if (now.isEmpty) {
           overridePatch[key] = null; // 清除该覆盖
+        } else if (key == 'thinking') {
+          if (now != 'true' && now != 'false') {
+            _showSnack('回传思考只能是 true / false（当前输入：$now）');
+            setState(() => _saving = false);
+            return;
+          }
+          overridePatch[key] = now == 'true';
         } else if (key == 'compress_threshold') {
           final double? parsed = double.tryParse(now);
           if (parsed == null || parsed < 0.1 || parsed > 0.95) {
@@ -981,7 +989,7 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
         _overrideField(
           cs,
           key: 'max_seqlen',
-          label: '最大输入 tokens',
+          label: '总上下文上限 tokens',
           hint: '如 65536',
           numeric: true,
         ),
@@ -1001,6 +1009,8 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
           hint: '0.1~0.95，如 0.8',
           numeric: true,
         ),
+        const SizedBox(height: 10),
+        _buildThinkingField(cs),
         const SizedBox(height: 16),
         Wrap(
           spacing: 8,
@@ -1061,6 +1071,28 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
         border: const OutlineInputBorder(),
       ),
       onChanged: (String text) => _overrideText[key] = text,
+    );
+  }
+
+  /// 回传思考（reasoning_content）：三态 —— 不单独设置 / 开启 / 关闭
+  Widget _buildThinkingField(ColorScheme cs) {
+    final String value = _overrideText['thinking'] ?? '';
+    return DropdownButtonFormField<String>(
+      initialValue: value,
+      isExpanded: true,
+      decoration: InputDecoration(
+        labelText: '回传思考（reasoning_content）',
+        helperText: '生效值：${_effectiveHint('thinking')}',
+        isDense: true,
+        border: const OutlineInputBorder(),
+      ),
+      items: const <DropdownMenuItem<String>>[
+        DropdownMenuItem<String>(value: '', child: Text('（不单独设置）')),
+        DropdownMenuItem<String>(value: 'true', child: Text('开启：思考随历史回传')),
+        DropdownMenuItem<String>(value: 'false', child: Text('关闭：不回传')),
+      ],
+      onChanged: (String? v) =>
+          setState(() => _overrideText['thinking'] = v ?? ''),
     );
   }
 

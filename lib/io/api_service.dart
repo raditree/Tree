@@ -565,6 +565,8 @@ class ApiService {
     int? maxSeqlen,
     int? maxOutputTokens,
     double? compressThreshold,
+    bool? thinking,
+    bool clearThinking = false,
     bool clearOverrides = false,
     String? workspaceDir,
     Map<String, dynamic>? ssh,
@@ -580,6 +582,10 @@ class ApiService {
         'max_seqlen': ?maxSeqlen,
         'max_output_tokens': ?maxOutputTokens,
         'compress_threshold': ?compressThreshold,
+        // 三态覆盖：下 true/false = 覆盖；[clearThinking] = 显式清除（回退模型默认）。
+        // 不能只靠 'thinking': ?thinking —— null 会被省略，等于"不修改"。
+        if (clearThinking) 'thinking': null,
+        'thinking': ?thinking,
         if (clearOverrides) 'clear_model_overrides': true,
         'workspace_dir': ?workspaceDir,
         'ssh': ?ssh,
@@ -1188,14 +1194,15 @@ class ApiService {
     await _postJson('/api/questions/$qid/answer', body: {'answer': answer});
   }
 
-  /// 设置数据收集开关
+  /// 一键重置 agent 工作空间里的系统提示词 / Spec。
   ///
-  /// 调用 `POST /api/settings/data-collection`，请求体为 `{"enabled": true/false}`。
-  static Future<void> setDataCollection(bool enabled) async {
-    await _postJson(
-      '/api/settings/data-collection',
-      body: {'enabled': enabled},
-    );
+  /// 调用 `POST /api/agents/{id}/reset`，请求体 `{"target": "system_prompt"|"spec"|"all"}`。
+  /// 核心会先备份现有文件为 `.bak.<n>`，再写回默认内容；工作空间不可用时回可读错误。
+  static Future<Map<String, dynamic>> resetAgentWorkspace(
+    String agentId, {
+    String target = 'all',
+  }) async {
+    return _postJson('/api/agents/$agentId/reset', body: {'target': target});
   }
 
   /// 设置消息切入模式

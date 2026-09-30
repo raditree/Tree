@@ -91,7 +91,8 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
   List<PluginUiSlot> _pluginPanels = <PluginUiSlot>[];
 
   /// 槽位注册表（默认全局单例）
-  PluginUiRegistry get _registry => widget.registry ?? PluginUiRegistry.instance;
+  PluginUiRegistry get _registry =>
+      widget.registry ?? PluginUiRegistry.instance;
 
   /// 文件子 Tab 控制器（0=文件浏览，1=Git 历史，2=Todo）
   late final TabController _fileTabController;
@@ -116,6 +117,31 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
     setState(() {
       _fileRefreshTrigger++;
     });
+  }
+
+  /// 一键重置工作空间里的系统提示词 / Spec。
+  ///
+  /// 核心侧语义：现有文件先备份成 `.bak.<n>`，再写回默认内容（Spec 的自定义文件
+  /// 一并清理，备份里可找回）。这里不弹二次确认——"一键"就是它的用法，且备份保证可逆。
+  Future<void> _resetWorkspace(String target) async {
+    final String agentId = widget.teamId ?? '';
+    if (agentId.isEmpty) {
+      _showSnackBar('未选中 agent，无法重置');
+      return;
+    }
+    try {
+      await ApiService.resetAgentWorkspace(agentId, target: target);
+      if (!mounted) return;
+      _showSnackBar(
+        target == 'spec'
+            ? '已重置 Spec（旧文件已备份为 .bak.<n>）'
+            : '已重置系统提示词（旧文件已备份为 .bak.<n>）',
+      );
+      if (target != 'system_prompt') _refreshFileTree();
+    } catch (error) {
+      if (!mounted) return;
+      _showSnackBar('重置失败：$error');
+    }
   }
 
   @override
@@ -159,8 +185,9 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
   /// 让用户正在填的表单被重建。
   void _onPluginSlotsChanged() {
     if (!mounted) return;
-    final List<PluginUiSlot> slots =
-        _registry.slotsOfKind(PluginUiSlotKind.panel);
+    final List<PluginUiSlot> slots = _registry.slotsOfKind(
+      PluginUiSlotKind.panel,
+    );
     if (_samePanelKeys(slots)) {
       return;
     }
@@ -401,6 +428,19 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
                   Tab(text: pluginSlotLabel(slot)),
               ],
             ),
+          ),
+          // 一键重置（备份 .bak.<n> 后还原默认）：系统提示词 / Spec
+          IconButton(
+            tooltip: '重置系统提示词（备份 .bak.<n>）',
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.assignment_return_outlined, size: 18),
+            onPressed: () => _resetWorkspace('system_prompt'),
+          ),
+          IconButton(
+            tooltip: '重置 Spec（备份 .bak.<n>）',
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.rule_folder_outlined, size: 18),
+            onPressed: () => _resetWorkspace('spec'),
           ),
           // 折叠右侧栏
           IconButton(

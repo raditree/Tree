@@ -7,7 +7,6 @@ import '../theme_service.dart';
 /// 设置页面（desktop 分支：账号/等级/密码/后端地址/注销 五组设置已删除）
 ///
 /// 保留的设置项：
-/// - 数据收集：仅保留开关以兼容历史配置（桌面单用户形态没有收集方，M7 移除）
 /// - token 获取帧率 / 推送刷新帧率 / 消息切入模式：agent 运行节奏控制
 /// - 心跳判活参数（I=心跳间隔秒 / N=连续丢失阈值次）：核心判"链路失活"的唯一判据
 ///   （M9 规约 1.1 取消了静态时间超时）；判活窗口 I×N 必须大于前端固定的 10s 心跳
@@ -21,9 +20,6 @@ class SettingsPage extends StatefulWidget {
 }
 
 class _SettingsPageState extends State<SettingsPage> {
-  // --- 数据收集 ---
-  bool _dataCollectionEnabled = false;
-
   // --- 消息切入模式（false=串行排队，true=直接切入） ---
   bool _directCutin = false;
 
@@ -32,10 +28,17 @@ class _SettingsPageState extends State<SettingsPage> {
   int _tokenRateMin = 20;
   int _tokenRateMax = 1000;
 
+  /// 后端 token 帧率是否已加载。加载前不渲染滑块：_tokenRate 的初值是上限
+  /// （1000，滑块最右端），加载完成后会左移到真实值，视觉上会先跳到最右再回来。
+  bool _tokenRateLoaded = false;
+
   // --- 推送刷新帧率（把流式增量攒帧后合并下发的频率，帧/秒，20~1000） ---
   int _frameRate = 20;
   int _frameRateMin = 20;
   int _frameRateMax = 1000;
+
+  /// 后端推送帧率是否已加载（同 [_tokenRateLoaded]，加载前不渲染滑块）。
+  bool _frameRateLoaded = false;
 
   /// token 获取帧率输入框（允许直接键入，提交时按范围夹取）
   final TextEditingController _tokenRateController = TextEditingController();
@@ -80,7 +83,6 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   void initState() {
     super.initState();
-    _loadDataCollectionSetting();
     _loadMessageCutinSetting();
     _loadTokenRateSetting();
     _loadFrameRateSetting();
@@ -95,15 +97,6 @@ class _SettingsPageState extends State<SettingsPage> {
     _heartbeatIntervalController.dispose();
     _missedHeartbeatLimitController.dispose();
     super.dispose();
-  }
-
-  /// 加载数据收集设置
-  Future<void> _loadDataCollectionSetting() async {
-    final prefs = await SharedPreferences.getInstance();
-    final enabled = prefs.getBool('data_collection_enabled') ?? false;
-    if (mounted) {
-      setState(() => _dataCollectionEnabled = enabled);
-    }
   }
 
   /// 加载消息切入模式设置
@@ -149,11 +142,15 @@ class _SettingsPageState extends State<SettingsPage> {
         _tokenRateMin = min;
         _tokenRateMax = max;
         _tokenRateController.text = '$rate';
+        _tokenRateLoaded = true;
       });
     } catch (_) {
       // 后端不可达：保留默认值，控件仍可编辑（提交时后端会夹取范围）
       if (mounted) {
-        setState(() => _tokenRateController.text = '$_tokenRate');
+        setState(() {
+          _tokenRateController.text = '$_tokenRate';
+          _tokenRateLoaded = true;
+        });
       }
     }
   }
@@ -195,11 +192,15 @@ class _SettingsPageState extends State<SettingsPage> {
         _frameRateMin = min;
         _frameRateMax = max;
         _frameRateController.text = '$rate';
+        _frameRateLoaded = true;
       });
     } catch (_) {
       // 后端不可达：保留默认值，控件仍可编辑（提交时后端会夹取范围）
       if (mounted) {
-        setState(() => _frameRateController.text = '$_frameRate');
+        setState(() {
+          _frameRateController.text = '$_frameRate';
+          _frameRateLoaded = true;
+        });
       }
     }
   }
@@ -376,20 +377,6 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
-  /// 切换数据收集开关
-  Future<void> _toggleDataCollection(bool value) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('data_collection_enabled', value);
-    try {
-      await ApiService.setDataCollection(value);
-    } catch (_) {
-      // 后端设置失败不阻塞本地持久化
-    }
-    if (mounted) {
-      setState(() => _dataCollectionEnabled = value);
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -397,10 +384,6 @@ class _SettingsPageState extends State<SettingsPage> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          _buildSectionTitle('数据收集'),
-          const SizedBox(height: 8),
-          _buildDataCollectionCard(),
-          const SizedBox(height: 24),
           _buildSectionTitle('流式帧率'),
           const SizedBox(height: 8),
           _buildTokenRateCard(),
@@ -423,55 +406,6 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 8),
           _buildThemeCard(),
         ],
-      ),
-    );
-  }
-
-  /// 数据收集卡片
-  Widget _buildDataCollectionCard() {
-    final cs = Theme.of(context).colorScheme;
-    return Card(
-      margin: EdgeInsets.zero,
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text(
-                        '允许收集使用数据',
-                        style: TextStyle(
-                          fontSize: 15,
-                          fontWeight: FontWeight.w500,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        _dataCollectionEnabled
-                            ? '已开启，仅保存开启期间的使用数据快照'
-                            : '关闭状态，不会收集任何使用数据',
-                        style: const TextStyle(
-                          fontSize: 12,
-                          color: Color(0xFF94A3B8),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                Switch(
-                  value: _dataCollectionEnabled,
-                  onChanged: _toggleDataCollection,
-                  activeThumbColor: cs.primary,
-                ),
-              ],
-            ),
-          ],
-        ),
       ),
     );
   }
@@ -548,20 +482,25 @@ class _SettingsPageState extends State<SettingsPage> {
               ],
             ),
             const SizedBox(height: 4),
-            Slider(
-              value: _tokenRate.toDouble().clamp(
-                _tokenRateMin.toDouble(),
-                _tokenRateMax.toDouble(),
-              ),
-              min: _tokenRateMin.toDouble(),
-              max: _tokenRateMax.toDouble(),
-              divisions: 49,
-              label: '$_tokenRate fps',
-              onChanged: (double value) {
-                setState(() => _tokenRate = value.round());
-              },
-              onChangeEnd: (double value) => _applyTokenRate(value.round()),
-            ),
+            // 后端值返回前不渲染滑块：初值 1000 会让滑块先出现在最右端，加载
+            // 完成后再左移，视觉上是明显的"跳一下"。用等高占位消除这段位移。
+            if (_tokenRateLoaded)
+              Slider(
+                value: _tokenRate.toDouble().clamp(
+                  _tokenRateMin.toDouble(),
+                  _tokenRateMax.toDouble(),
+                ),
+                min: _tokenRateMin.toDouble(),
+                max: _tokenRateMax.toDouble(),
+                divisions: 49,
+                label: '$_tokenRate fps',
+                onChanged: (double value) {
+                  setState(() => _tokenRate = value.round());
+                },
+                onChangeEnd: (double value) => _applyTokenRate(value.round()),
+              )
+            else
+              const SizedBox(height: 48),
           ],
         ),
       ),
@@ -642,20 +581,24 @@ class _SettingsPageState extends State<SettingsPage> {
               ],
             ),
             const SizedBox(height: 4),
-            Slider(
-              value: _frameRate.toDouble().clamp(
-                _frameRateMin.toDouble(),
-                _frameRateMax.toDouble(),
-              ),
-              min: _frameRateMin.toDouble(),
-              max: _frameRateMax.toDouble(),
-              divisions: 49,
-              label: '$_frameRate fps',
-              onChanged: (double value) {
-                setState(() => _frameRate = value.round());
-              },
-              onChangeEnd: (double value) => _applyFrameRate(value.round()),
-            ),
+            // 同 token 帧率：加载完成前用等高占位，避免滑块先跳到默认值再回位。
+            if (_frameRateLoaded)
+              Slider(
+                value: _frameRate.toDouble().clamp(
+                  _frameRateMin.toDouble(),
+                  _frameRateMax.toDouble(),
+                ),
+                min: _frameRateMin.toDouble(),
+                max: _frameRateMax.toDouble(),
+                divisions: 49,
+                label: '$_frameRate fps',
+                onChanged: (double value) {
+                  setState(() => _frameRate = value.round());
+                },
+                onChangeEnd: (double value) => _applyFrameRate(value.round()),
+              )
+            else
+              const SizedBox(height: 48),
           ],
         ),
       ),
@@ -1397,7 +1340,7 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
                       controller: _maxSeqlen,
                       keyboardType: TextInputType.number,
                       decoration: const InputDecoration(
-                        labelText: '最大输入 tokens',
+                        labelText: '总上下文上限 tokens',
                         hintText: '如 65536',
                         isDense: true,
                       ),
@@ -1427,6 +1370,12 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
                 title: const Text(
                   '思考模型（thinking）',
                   style: TextStyle(fontSize: 13),
+                ),
+                subtitle: const Text(
+                  '开启后历史思考会按 DeepSeek 规则作为 reasoning_content 回传端点'
+                  '（带 tools 时官方要求回传，缺失会 400）；'
+                  '复用思考链能让后续思考更短、成功率更高，代价是输入 token 增加。',
+                  style: TextStyle(fontSize: 11),
                 ),
               ),
               SwitchListTile(
