@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:math';
 
+import '../llm/llm_result_gate.dart';
 import '../settings/core_settings.dart';
 import '../store/tree_store.dart';
 import '../util/tokens.dart';
@@ -170,19 +171,44 @@ class CompactionService {
   double tokenScaleFor(CoreAgent agent) =>
       settings.model(agent.modelId)?.tokenScale ?? defaultTokenScale;
 
+  /// 是否把历史思考（DeepSeek 的 `reasoning_content`）回传端点：与引擎同一判据
+  /// —— **agent 级覆盖优先，否则模型的 `thinking`**（见 [LlmAgentEngine._buildMessages]
+  /// 与 `agentOverrides` 的接线）。
+  ///
+  /// 它决定思考**算不算上下文**：开启回传就要计入估算与总结输入，关闭（默认）就必须
+  /// 排除。实测教训：一个会话里思考正文 456,747 字符（≈173k token）被算进估算，
+  /// 而引擎压根不发它——估算 411k 触发压缩时，真实上下文只有约 1/3。
+  bool passBackReasoningFor(CoreAgent agent) =>
+      agent.thinkingOverride ??
+      settings.model(agent.modelId)?.thinking ??
+      false;
+
   /// 估算"引擎实际会看到"的上下文 token 数（系统提示词 + 摘要 + 未压缩历史）。
   ///
   /// 比例用该模型的 token_scale（Q1-①）：全系统只有 util/tokens.dart 一个换算
   /// 函数，压缩阈值与进度条才不会各说各话。
   int estimateContextTokens(CoreAgent agent, CoreSession session) {
     final double scale = tokenScaleFor(agent);
+    final bool passBack = passBackReasoningFor(agent);
+    // 估算必须按"引擎真正发给模型的那一份"算：两处口径一分叉，就会出现
+    // "估算说超了、端点说没超"（或反向），压缩时机整个错位。
+    // 这里用的门控只为了判定阈值，不落盘也不需要 writer。
+    final ToolResultGate gate = ToolResultGate(
+      agentId: agent.id,
+      tokenScale: scale,
+    );
     final List<CoreMessage> all = store.messages(agent.id, session.sessionId);
     final int frozen = session.compactedMessageCount.clamp(0, all.length);
     int total =
-        estimateTokens(systemPromptWithWorkspace(agent), scale: scale) +
+        estimateTokens(
+          // 与 ConversationService._contextOf 逐字同口径：⑧ 已选 Spec 全文
+          // 同样是会话级的，估算漏掉它，压缩阈值就会偏小
+          systemPromptWithWorkspace(agent, sessionId: session.sessionId),
+          scale: scale,
+        ) +
         estimateTokens(session.compactedSummary, scale: scale);
     for (final CoreMessage message in all.sublist(frozen)) {
-      total += _messageTokens(message, scale);
+      total += _messageTokens(message, scale, gate, passBack);
     }
     return total;
   }
@@ -247,8 +273,10 @@ class CompactionService {
       summary: summarized.text,
       sessionId: session.sessionId,
       // 总结模型调用失败、退化成截断摘要：压缩本身成功了，但要点可能不全，
-      // 调用方要把这件事显示给用户（Q1-③：压缩失败必须可见）
+      // 调用方要把这件事显示给用户（Q1-③：压缩失败必须可见）。
+      // 失败原因一并带出：只报"总结失败"用户无从判断是密钥、限流还是网络。
       degraded: summarized.degraded,
+      degradedReason: summarized.degradedReason,
     );
   }
 
@@ -305,7 +333,10 @@ class CompactionService {
       raw.writeln(session.compactedSummary);
       raw.writeln();
     }
+    final bool passBack = passBackReasoningFor(agent);
     for (final CoreMessage message in messages) {
+      // 关闭回传时思考不在上下文里：把它写进摘要等于把 CoT 从后门塞回去
+      if (message.isThinking && !passBack) continue;
       raw.writeln('- ${_line(message)}');
     }
     String body = raw.toString();
@@ -321,8 +352,9 @@ class CompactionService {
     } catch (error) {
       log?.call('LLM 总结失败，回退到截断摘要：$error');
       return SummaryText(
-        '$fallbackHeader\n${_digest(messages)}',
+        '$fallbackHeader\n${_digest(messages, passBackReasoning: passBack)}',
         degraded: true,
+        degradedReason: '$error',
       );
     }
   }
@@ -352,17 +384,41 @@ class CompactionService {
     return '[$role] ${_clip(message.content, 400)}';
   }
 
-  static String _digest(List<CoreMessage> messages) =>
-      _clip(messages.map(_line).join('\n'), 2000);
+  static String _digest(
+    List<CoreMessage> messages, {
+    required bool passBackReasoning,
+  }) => _clip(
+    messages
+        .where((CoreMessage m) => !m.isThinking || passBackReasoning)
+        .map(_line)
+        .join('\n'),
+    2000,
+  );
 
   static String _clip(String text, int max) =>
       text.length <= max ? text : '${text.substring(0, max)}…';
 
-  /// 单条消息的 token 估算（与 LlmMessage.estimatedTokens 同口径）。
-  static int _messageTokens(CoreMessage message, double scale) {
+  /// 单条消息的 token 估算：口径必须与 [LlmAgentEngine] **实际发出的那一份**一致。
+  ///
+  /// - 思考：只有开启回传时才算（关闭时引擎根本不发它）；
+  /// - 工具结果：按**门控后**的字符数算（超长结果送模型的只有预览 + 提示那一份）。
+  static int _messageTokens(
+    CoreMessage message,
+    double scale,
+    ToolResultGate gate,
+    bool passBackReasoning,
+  ) {
+    if (message.isThinking) {
+      return passBackReasoning
+          ? estimateTokens(message.content, scale: scale)
+          : 0;
+    }
     int tokens = estimateTokens(message.content, scale: scale);
     if (message.isTool) {
-      tokens += estimateTokens(message.toolResult, scale: scale);
+      tokens += estimateTokensFromChars(
+        gate.forModelChars(message.toolResult),
+        scale: scale,
+      );
       tokens += estimateTokens(message.toolName ?? '', scale: scale);
       tokens += estimateTokens(
         jsonEncode(message.toolArguments ?? const <String, dynamic>{}),
@@ -398,6 +454,7 @@ class CompactionResult {
     this.error = '',
     this.status = 200,
     this.degraded = false,
+    this.degradedReason = '',
   });
 
   /// 是否真的执行了压缩。
@@ -424,6 +481,12 @@ class CompactionResult {
   /// 可见提示，而不是让"压过了"这件事掩盖掉总结失败。
   final bool degraded;
 
+  /// 降级的**可读原因**（总结失败时的异常文本；未降级时为空串）。
+  ///
+  /// 只报"总结失败"用户无从判断到底是密钥、限流、端点错误还是网络中断——
+  /// 把端点原文带进提示，下一次失败用户与日志就能直接定位。
+  final String degradedReason;
+
   /// 出错原因（非空时 REST 返回非 200）。
   final String error;
 
@@ -440,15 +503,24 @@ class CompactionResult {
           'summarized_messages': summarizedMessages,
           if (sessionId.isNotEmpty) 'session_id': sessionId,
           if (degraded) 'degraded': true,
+          if (degraded && degradedReason.isNotEmpty)
+            'degraded_reason': degradedReason,
         };
 }
 
 /// 一次总结的产物：正文 + 是否降级（见 [CompactionResult.degraded]）。
 class SummaryText {
-  const SummaryText(this.text, {this.degraded = false});
+  const SummaryText(
+    this.text, {
+    this.degraded = false,
+    this.degradedReason = '',
+  });
 
   final String text;
   final bool degraded;
+
+  /// 降级的可读原因（见 [CompactionResult.degradedReason]）。
+  final String degradedReason;
 }
 
 /// 上下文长度预算（[CompactionService.maxSeqlenFor] 的返回值）。

@@ -100,6 +100,97 @@ void main() {
       ]);
     });
 
+    test('回传思考（thinking 开关开启）：历史思考挂到对应 assistant 消息上', () async {
+      final CoreModelConfig thinkingModel = CoreModelConfig(
+        modelId: 'demo',
+        name: '思考模型',
+        baseUrl: 'https://api.example.com/v1',
+        apiKey: 'sk-test',
+        maxSeqlen: 64000,
+        thinking: true,
+      );
+      final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+        textScript('ok'),
+      ]);
+      await engine(transport, model: thinkingModel)
+          .run(
+            context(
+              history: const <CoreMessageRef>[
+                CoreMessageRef(
+                  role: 'agent',
+                  content: '先想一步',
+                  kind: 'thinking',
+                ),
+                CoreMessageRef(role: 'agent', content: '上轮回答'),
+                CoreMessageRef(
+                  role: 'agent',
+                  content: '再想一步',
+                  kind: 'thinking',
+                ),
+                CoreMessageRef(
+                  role: 'agent',
+                  content: '',
+                  kind: 'tool',
+                  toolName: 'read_file',
+                  toolArguments: <String, dynamic>{'path': 'a.txt'},
+                  toolResult: 'A 的内容',
+                  toolCallId: 'call_a',
+                ),
+              ],
+            ),
+            isCancelled: () => false,
+          )
+          .toList();
+      final List<LlmMessage> sent = transport.requests.single.messages;
+      // 普通 assistant 消息：reasoning_content 与 content 同级挂在它身上
+      final LlmMessage answer = sent.firstWhere(
+        (LlmMessage m) => m.content == '上轮回答',
+      );
+      expect(answer.reasoningContent, '先想一步');
+      expect(answer.toWire()['reasoning_content'], '先想一步');
+      expect(answer.toWire()['content'], '上轮回答');
+      // 带 tool_calls 的那条 assistant 消息是引擎现拼的，也必须有它的思考
+      final LlmMessage toolTurn = sent.firstWhere(
+        (LlmMessage m) => m.toolCalls.isNotEmpty,
+      );
+      expect(
+        toolTurn.reasoningContent,
+        '再想一步',
+        reason: 'DeepSeek 要求带 tools 的轮次原样回传 reasoning_content，缺失会 400',
+      );
+      expect(toolTurn.toWire()['reasoning_content'], '再想一步');
+    });
+
+    test('回传思考默认关闭：历史思考不出现在请求里', () async {
+      final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+        textScript('ok'),
+      ]);
+      await engine(transport)
+          .run(
+            context(
+              history: const <CoreMessageRef>[
+                CoreMessageRef(
+                  role: 'agent',
+                  content: '先想一步',
+                  kind: 'thinking',
+                ),
+                CoreMessageRef(role: 'agent', content: '上轮回答'),
+              ],
+            ),
+            isCancelled: () => false,
+          )
+          .toList();
+      final List<LlmMessage> sent = transport.requests.single.messages;
+      expect(sent.map((LlmMessage m) => m.reasoningContent), everyElement(''));
+      expect(
+        sent.every(
+          (LlmMessage m) => !m.toWire().containsKey('reasoning_content'),
+        ),
+        isTrue,
+        reason: '开关关闭时请求体里不该出现 reasoning_content',
+      );
+    });
+
     test('连续 tool 消息合并成一条 assistant(tool_calls) + 多条 tool 结果', () async {
       final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
         textScript('ok'),

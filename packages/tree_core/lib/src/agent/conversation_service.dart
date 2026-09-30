@@ -343,10 +343,15 @@ class ConversationService {
     };
     // Q13：token 管道（思考 / 正文 / 工具参数**共用一条**）。本轮内复用同一个
     // 节拍器，三者的时间轴因此连续，速率口径也完全一致。
+    //
+    // 速率**现读**（rateProvider）而不是在开始时快照：设置页点「应用」后，正在
+    // 生成中的这一轮下一批 token 就按新速率走，不必等下一次发消息。设置本身仍然
+    // 由 core 持久化（POST /api/settings/token-rate），这里只解决"何时生效"。
     final TokenPacer roundPacer =
         pacer ??
         TokenPacer(
           tokensPerSecond: settings.tokenAcquisitionRate.toDouble(),
+          rateProvider: () => settings.tokenAcquisitionRate.toDouble(),
           enabled: pacingEnabled ?? _pacingByDefault,
         );
     // 逐模型的字符 → token 比例（Q1-①）：工具参数与思考/正文必须同口径。
@@ -779,7 +784,11 @@ class ConversationService {
       agentId: agent.id,
       sessionId: fresh.sessionId,
       modelId: agent.modelId,
-      systemPrompt: systemPromptWithWorkspace(agent),
+      systemPrompt: systemPromptWithWorkspace(
+        agent,
+        // ⑧ 已选 Spec 全文是会话级的：带 sessionId 才能取到本会话挂的 hook
+        sessionId: fresh.sessionId,
+      ),
       userContent: userContent,
       contextSummary: fresh.compactedSummary,
       compactedMessageCount: fresh.compactedMessageCount,
@@ -829,14 +838,17 @@ class ConversationService {
         force: force,
       );
       if (result != null && result.compressed && result.degraded) {
-        // 总结模型没跑成功、退化成截断摘要：压缩是压了，但要点可能不全，必须说
+        // 总结模型没跑成功、退化成截断摘要：压缩是压了，但要点可能不全，必须说。
+        // 失败原因一并带出：只报"总结失败"，用户与日志都无从判断是密钥 / 限流 / 网络。
+        final String reason = result.degradedReason.trim();
         _notifyOnce(
           'compact-degraded|${agent.id}',
           () => _sendAdvisory(
             agent,
             session,
             '上下文已压缩，但总结模型调用失败，本次用的是截断摘要（要点可能不全）；'
-            '下一次压缩会重新尝试完整总结。',
+            '下一次压缩会重新尝试完整总结。'
+            '${reason.isEmpty ? '' : '\n失败原因：$reason'}',
           ),
         );
       }
@@ -1042,14 +1054,23 @@ class _ChunkPump {
 class TokenPacer {
   TokenPacer({
     required this.tokensPerSecond,
+    this.rateProvider,
     this.enabled = true,
     DateTime Function()? clock,
     Future<void> Function(Duration delay)? wait,
   }) : _clock = clock ?? DateTime.now,
        _wait = wait ?? Future<void>.delayed;
 
-  /// 速率（token/秒）；<= 0 视为不限速。
+  /// 起始速率（token/秒）；<= 0 视为不限速。[rateProvider] 非空时它只作兜底。
   final double tokensPerSecond;
+
+  /// 速率**现读**入口（可空）：设置页改速率后，正在进行的这一轮下一批 token 就
+  /// 生效，而不必等下一次发消息。为空 = 用构造时的 [tokensPerSecond] 固定不变
+  /// （测试与不关心热更新的调用方）。
+  final double Function()? rateProvider;
+
+  /// 当前速率（token/秒）：优先现读，否则取构造时的固定值。
+  double get currentTokensPerSecond => rateProvider?.call() ?? tokensPerSecond;
 
   /// 总开关：false 时 [consume] 直接放行（关闭节奏控制，见 [pacingEnabled]）。
   final bool enabled;
@@ -1070,13 +1091,12 @@ class TokenPacer {
   ///
   /// 返回时保证"应到达时刻"已到（或本来就已经落后于它）。
   Future<void> consume(int tokens) async {
-    if (!enabled || tokensPerSecond <= 0 || tokens <= 0) return;
+    final double rate = currentTokensPerSecond;
+    if (!enabled || rate <= 0 || tokens <= 0) return;
     final DateTime origin = _origin ??= _clock();
     _consumed += tokens;
     final Duration target = Duration(
-      microseconds:
-          (_consumed / tokensPerSecond * Duration.microsecondsPerSecond)
-              .round(),
+      microseconds: (_consumed / rate * Duration.microsecondsPerSecond).round(),
     );
     final Duration lag = target - _clock().difference(origin);
     if (lag <= Duration.zero) return; // 落后：欠账直接补掉（可突发）

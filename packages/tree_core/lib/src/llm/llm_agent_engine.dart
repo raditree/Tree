@@ -123,7 +123,11 @@ class LlmAgentEngine implements AgentEngine {
       writer: resultRedirectWriter ?? _workspaceWriter(),
       log: log,
     );
-    final List<LlmMessage> messages = await _buildMessages(context, gate);
+    final List<LlmMessage> messages = await _buildMessages(
+      context,
+      gate,
+      passBackReasoning: config.thinking,
+    );
     final LlmSession session = LlmSession(
       transport: _transportFor(config),
       model: config.modelId,
@@ -142,8 +146,13 @@ class LlmAgentEngine implements AgentEngine {
       statusText: sessionStatusText == null
           ? null
           : () => sessionStatusText!(context.agentId, context.sessionId),
-      compactContext: ({required bool force}) =>
-          _rebuiltContext(context, gate, force: force),
+      compactContext: ({required bool force}) => _rebuiltContext(
+        context,
+        gate,
+        force: force,
+        // 重建上下文必须与首轮同口径：否则压一次之后思考就"消失"了
+        passBackReasoning: config.thinking,
+      ),
       log: log,
     );
     // usage 事件要**过一手**：真实 usage 里夹带着"本次上下文字符数"，学习完之后
@@ -191,6 +200,7 @@ class LlmAgentEngine implements AgentEngine {
     AgentRunContext context,
     ToolResultGate gate, {
     required bool force,
+    bool passBackReasoning = false,
   }) async {
     final ToolTurnCompactor? compact = toolTurnCompactor;
     if (compact == null) return null;
@@ -200,7 +210,11 @@ class LlmAgentEngine implements AgentEngine {
       force: force,
     );
     if (refreshed == null) return null;
-    return _buildMessages(refreshed, gate);
+    return _buildMessages(
+      refreshed,
+      gate,
+      passBackReasoning: passBackReasoning,
+    );
   }
 
   /// 学习令牌比例 + 记录水位线（Q1-①）；失败只记日志，绝不影响本轮生成。
@@ -252,10 +266,15 @@ class LlmAgentEngine implements AgentEngine {
   ///
   /// [gate] 只替换工具结果**送给模型的那一份**：历史里的超长结果同样要过门控
   /// （Q1-②：每次构造上下文都要过一遍，历史重载同样生效）。
+  ///
+  /// [passBackReasoning] = 模型配置里的 `thinking` 开关：开启时把历史思考挂回
+  /// 对应的 assistant 消息（DeepSeek 的 `reasoning_content`，带 tools 时必须回传，
+  /// 否则同会话后续请求持续 400）；关闭时维持原行为（思考不回灌）。
   Future<List<LlmMessage>> _buildMessages(
     AgentRunContext context,
-    ToolResultGate gate,
-  ) async {
+    ToolResultGate gate, {
+    bool passBackReasoning = false,
+  }) async {
     final List<LlmMessage> out = <LlmMessage>[];
     if (context.systemPrompt.trim().isNotEmpty) {
       out.add(LlmMessage.system(context.systemPrompt));
@@ -265,6 +284,10 @@ class LlmAgentEngine implements AgentEngine {
       out.add(LlmMessage.system(context.contextSummary));
     }
     final List<CoreMessageRef> toolBatch = <CoreMessageRef>[];
+    // 待挂到"下一条 assistant 消息"上的思考。DeepSeek 要求 reasoning_content
+    // 与 content 同级挂在 assistant 消息上，而带工具调用的那条 assistant 消息是
+    // 这里现拼的（见 flushTools），所以必须先攒着、拼的时候一起挂出去。
+    final List<String> pendingReasoning = <String>[];
 
     Future<void> flushTools() async {
       if (toolBatch.isEmpty) return;
@@ -298,8 +321,17 @@ class LlmAgentEngine implements AgentEngine {
         );
       }
       out.add(
-        LlmMessage(role: LlmRole.assistant, content: '', toolCalls: calls),
+        LlmMessage(
+          role: LlmRole.assistant,
+          content: '',
+          toolCalls: calls,
+          reasoningContent: passBackReasoning
+              ? pendingReasoning.join('\n\n')
+              : '',
+        ),
       );
+      // 思考只属于它所在的那一条 assistant 消息（已经挂出去了）
+      pendingReasoning.clear();
       out.addAll(results);
       toolBatch.clear();
     }
@@ -316,13 +348,23 @@ class LlmAgentEngine implements AgentEngine {
         continue;
       }
       await flushTools();
-      // 推理内容不回灌：思考过程不是对话上下文
-      if (ref.isThinking) continue;
+      // 推理内容：默认不回灌（思考过程不是对话上下文）；开启"回传思考"时攒起来，
+      // 挂到紧随其后的那条 assistant 消息上（DeepSeek 带 tools 时的硬要求）。
+      if (ref.isThinking) {
+        if (passBackReasoning && ref.content.trim().isNotEmpty) {
+          pendingReasoning.add(ref.content.trim());
+        }
+        continue;
+      }
       if (ref.content.trim().isEmpty) continue;
+      final String reasoning = passBackReasoning
+          ? pendingReasoning.join('\n\n')
+          : '';
+      pendingReasoning.clear();
       out.add(
         ref.isUser
             ? LlmMessage.user(ref.content)
-            : LlmMessage.assistant(ref.content),
+            : LlmMessage.assistant(ref.content, reasoningContent: reasoning),
       );
     }
     await flushTools();

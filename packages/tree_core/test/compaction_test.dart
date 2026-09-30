@@ -278,6 +278,13 @@ void main() {
       expect(store.session(agent.id, session.sessionId)!.compacted, isTrue);
       expect(result.degraded, isTrue, reason: '总结失败必须对调用方可见（Q1-③：压缩失败必须前端可见）');
       expect(result.toJson()['degraded'], isTrue);
+      // 失败原因必须带出来：只报"总结失败"用户无法判断是密钥 / 限流 / 网络
+      expect(result.degradedReason, contains('端点 500'));
+      expect(
+        result.toJson()['degraded_reason'],
+        contains('端点 500'),
+        reason: '降级原因要随 REST 响应一起回给前端',
+      );
     });
 
     test('总结成功不标记降级', () async {
@@ -343,6 +350,61 @@ void main() {
                 (int sum, CoreMessage m) => sum + estimateTokens(m.content),
               );
       expect(service.estimateContextTokens(agent, after), expected);
+    });
+
+    test('估算口径 = 实际发送：思考只在"回传思考"开启时计入', () async {
+      final String thinking = repeated('思考内容', 300); // 2400 字符
+      add('agent', thinking, kind: 'thinking');
+      add('user', '需求');
+      add('agent', '回答');
+      final int off = service.estimateContextTokens(agent, session);
+      expect(
+        off,
+        lessThan(estimateTokens(thinking)),
+        reason: '关闭回传时引擎根本不发思考，估算不能把它算进上下文（曾因此提前压缩）',
+      );
+
+      settings.model('demo')!.thinking = true; // 与引擎同一判据
+      final int on = service.estimateContextTokens(agent, session);
+      expect(
+        on - off,
+        estimateTokens(thinking),
+        reason: '开启回传后思考就是上下文的一部分，必须计入',
+      );
+
+      // agent 级覆盖优先于模型默认（右栏「回传思考」三态）
+      agent.thinkingOverride = false;
+      expect(
+        service.estimateContextTokens(agent, session),
+        off,
+        reason: '本 Agent 显式关掉时，即使模型默认开启也不能把思考算进上下文',
+      );
+      agent.thinkingOverride = null;
+      expect(service.estimateContextTokens(agent, session), on);
+    });
+
+    test('估算口径 = 实际发送：超长工具结果按门控后的预览计，不按全文', () async {
+      final String huge = repeated('日志行', 20000); // 60000 字符，远超 8000 token 阈值
+      final double scale = service.tokenScaleFor(agent);
+      final ToolResultGate gate = ToolResultGate(
+        agentId: agent.id,
+        tokenScale: scale,
+      );
+      add('user', '跑一下');
+      final int before = service.estimateContextTokens(agent, session);
+      add('agent', '', kind: 'tool', toolName: 'terminal', toolResult: huge);
+      final int after = service.estimateContextTokens(agent, session);
+      final int expected =
+          estimateTokensFromChars(gate.forModelChars(huge), scale: scale) +
+          estimateTokens('terminal', scale: scale) +
+          estimateTokens('{}', scale: scale) +
+          8;
+      expect(after - before, expected, reason: '估算必须与引擎送出的那一份（预览 + 提示）同口径');
+      expect(
+        after - before,
+        lessThan(estimateTokens(huge) ~/ 10),
+        reason: '按全文估算会让压缩阈值提前触发（实测一个会话多算了 11 万 token）',
+      );
     });
 
     test('dispose 转交总结器', () async {
