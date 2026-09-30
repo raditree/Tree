@@ -228,13 +228,16 @@ Tree 桌面端（Windows 便携版）
 
 数据放在哪里
   %APPDATA%\\Tree（C:\\Users\\<你>\\AppData\\Roaming\\Tree）。
-  目录结构（都可以直接用记事本改，改完重启应用生效）：
+  目录结构（都可以直接用记事本改；工作空间里的提示词/规范改完下一轮生效，
+  其余在重启核心后生效）：
     config/settings.yaml        全局设置（token 帧率 / 推送帧率 / 消息切入…）
     config/models/<id>.yaml     每个模型一个文件（含明文 api_key，只在本机）
     config/mcp.yaml             MCP 服务（stdio 命令 + 环境变量）
     config/plugins.yaml         插件清单（内置与自定义插件各有一个开关）
     agents/<id>.yaml            agent 配置（system prompt / 模型 / ssh / workspace_dir）
-    spec/builtin/*.md           内置 Spec 模板
+    workspaces/<agent>/.self/   该工作空间/团队的私有状态（按团队分隔）：
+        system_prompt.md        系统提示词基础段（改完保存，下一轮对话即生效）
+        spec/*.md               内置 + 自定义 Spec（右栏可一键重置，旧文件备份 .bak.N）
     data/<agent>/<session>/     会话数据：session.json + messages.jsonl（一行一条消息）
 
 内置插件

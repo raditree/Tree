@@ -61,7 +61,7 @@ plugins:
 | `env` | 键值表 | 额外环境变量（与父进程环境合并），用于免改 args 调参 |
 | `enabled`（单插件） | true / false | 单个插件开关（关掉后不启动、工具下线） |
 | `granularity` | team / agent / session | 实例粒度（前端展示与订阅身份的默认口径） |
-| `scope.team_id` | 字符串 | **插件归属团队**。为空 = 不进站点体系（见第 6 节注意事项） |
+| `scope.team_id` | 字符串 | **作用域上限（插件归属团队）**。为空 = 不限团队、可服务多队（执行站命令按每条命令的 `agent_id` 解析真实归属，见第 6 节） |
 | `scope.agent_id` | 字符串，可空 | 声明更细的粒度：只收该 agent 的事件 / 只在该 agent 的工作面下命令 |
 | `scope.session_id` | 字符串，可空 | 再细一层（一般留空） |
 | `scope.mode_key` | local / ssh，可空 | 工作面声明（缺省 local）；运行期由核心按目标 agent 的 SSH 配置解析 |
@@ -125,7 +125,7 @@ where.exe python
 | `--threshold N` | `SAMPLE_PLUGIN_TOOL_ROUND_LIMIT` | `200` | **(agent, session) 的工具调用次数超过 N 次**即发 `agent.stop` |
 | `--agent-id ID` | `SAMPLE_PLUGIN_AGENT_ID` | 空 | 执行站命令的目标 agent（空则用事件里见过的第一个 agent） |
 | `--read-path PATH` | `SAMPLE_PLUGIN_READ_PATH` | `README.md` | 启动自检要读的**工作空间相对路径** |
-| `--team-id TEAM` | `SAMPLE_PLUGIN_TEAM_ID` | 空 | **仅用于日志/卡片文案**；作用域以 plugins.yaml 为准 |
+| `--team-id TEAM` | `SAMPLE_PLUGIN_TEAM_ID` | 空 | **仅用于日志/卡片文案**；执行站命令的作用域按每条命令的 `agent_id` 解析 |
 | `--slot-key KEY` | `SAMPLE_PLUGIN_SLOT_KEY` | `sample.card.tool_rounds` | 前端卡片槽位键（全局唯一） |
 | `--card-interval SEC` | `SAMPLE_PLUGIN_CARD_INTERVAL` | `5` | 卡片周期刷新秒数（有事件时另按 1s 节流刷新） |
 | `--stop-cascade` | `SAMPLE_PLUGIN_STOP_CASCADE=1` | 关 | `agent.stop` 是否级联停整棵团队树（默认只停该 agent 的当前生成） |
@@ -204,11 +204,14 @@ cmd /c "type %TEMP%\hello.jsonl | D:\app\python\python.exe E:\programs\Tree\desk
 
 ## 7. 注意事项（都是踩过的坑）
 
-- **scope 只认 plugins.yaml 的声明**：插件在 `station/command` 的 `arguments` 里塞
-  `team_id` / `agent_id` / `session_id` / `mode_key` **不会**改变作用域，跨 team 的
-  目标会被执行站 fail-closed 拒绝（错误信息里能看到原因）。
-- **没声明 `scope.team_id` 的插件进不了站点体系**：核心退回 `tools/list` 申报（工具
-  仍可用），但 `station/command` 一律返回 `-32001`（本插件只记日志、不崩）。
+- **单实例 + 每条消息带身份**：`plugins.yaml` 的 `scope` 是作用域**上限**。不声明
+  `team_id` 的插件可以服务任意 team —— 但每条 `station/command` 都要带 `agent_id`，
+  核心按该 agent 的**真实归属**解析 team / mode，并在选站前做 fail-closed 校验
+  （agent 不存在 / 归属解析不出 / 请求里带的 `team_id` 与真实归属不一致 ⇒ `-32001`，
+  错误信息里能看到原因）。声明了 `team_id` 的插件仍只能在自己 team 内活动。
+- **没声明 `scope.team_id` 的插件不进站点订阅体系**：核心退回 `tools/list` 申报工具
+  （工具仍可用），也不收按 team 过滤的事件；但**执行站命令仍可用**（见上一条）。
+  不带 `agent_id` 的团队级命令（`ui.push`）需要带 `team_id` 或在声明里给 team。
 - **stdout 只允许 JSON-RPC**：日志走 stderr；本插件把 stdout/stderr 都按 UTF-8 字节
   写，避免 Windows 上 Python 默认 ANSI 代码页（cp936）把中文写成非法 UTF-8。
 - **插件主动请求必须带 `method` + `id`**：核心按"有没有 method"区分「响应」与

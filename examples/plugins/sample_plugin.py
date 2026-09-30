@@ -31,11 +31,12 @@
 插件 → 核心（宿主按**报文形状**分三类，顺序即优先级）：
   - 响应：有 id 且**没有 method** ⇒ 回填核心的在途请求；
   - 请求：**method + id** ⇒ 核心必回一条响应（M9 的「插件主动下命令」通道）。
-    目前支持 station/command：入参 {command, arguments}，result 形如
-    {command, ok, mount_id, payload, error}；错误码
-    -32601 未知方法 / -32602 参数 / -32603 处理器异常 / -32001 scope 不满足；
-    **scope 只取插件在 plugins.yaml 的声明**——请求里塞 team_id / agent_id /
-    session_id / mode_key **不会**改变作用域（插件不得放大自己的作用域）。
+    目前支持 station/command：入参 {command, arguments, team_id?, agent_id?,
+    session_id?, mode_key?}，result 形如 {command, ok, mount_id, payload, error}；
+    错误码 -32601 未知方法 / -32602 参数 / -32603 处理器异常 / -32001 scope 不满足；
+    **单实例 + 每条消息带身份**：目标 agent 取请求里的 agent_id，team / mode 由核心按
+    该 agent 的真实归属解析；plugins.yaml 的 scope 是**作用域上限**（声明了 team 就
+    只能在自己 team 内活动）。
   - 通知：无 id（log / event）⇒ 核心转成前端 plugin_event。
 
 ── 边界情况（踩过的坑，务必保留） ───────────────────────────────────────
@@ -55,8 +56,9 @@
 * **收集站 schema 是严格校验**：根对象只允许 tools 一个键（多一个键即报「未声明的
   字段」）；每个工具定义含 tool_name / description / parameters / execution。
 * **阈值触发后重置计数**：否则每一次后续调用都会再发一次 agent.stop（反复停）。
-* **未声明 team 的插件**进不了站点体系：核心退回 tools/list 申报（工具仍可用），但
-  station/command 一律 -32001——本插件只记日志、不崩（fail-visible，不静默）。
+* **未声明 team 的插件**不进站点订阅体系（核心退回 tools/list 申报工具），但
+  station/command 仍可用——只要每条命令带 agent_id；不带 agent 的团队级命令
+  （ui.push）需要能确定 team。失败一律可读（fail-visible，不静默）。
 * **本文件的 30s 等待**只为示例日志不永久挂住：核心侧对插件请求**没有静态超时**
   （plan §1.1：判活靠心跳），所以插件不该自己设"任务总时长"上限。
 
@@ -474,8 +476,8 @@ class SamplePlugin(object):
         """下一条 fs.read，把结果打进日志；返回可读摘要（失败返回 None）。
 
         agent_id 的取法：--agent-id / 环境变量优先；没配就用事件里见过的第一个 agent。
-        执行站会按**插件声明的作用域**（team / mode）做 fail-closed 校验，跨 team 的
-        目标会被拒（错误信息里能看出原因）。
+        核心按该 agent 的**真实归属**（team / mode）解析作用域，并与插件声明的上限做
+        fail-closed 校验（跨 team / 身份对不上都会被拒，错误信息里能看出原因）。
         """
         target = self.options.agent_id or self.first_agent_seen
         target_path = path or self.options.read_path

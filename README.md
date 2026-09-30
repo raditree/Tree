@@ -180,11 +180,12 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
   - **Q6** 输入框草稿按 **team+session** 缓存（文本与附件一起、**纯内存**），切换即恢复，发送成功后清空该键
   - **Q7** 下载列表「打开文件所在位置」：Windows `explorer /select,"<path>"`；**文件夹任务定位到 tar.gz 压缩包本身**；文件已被移动/删除给提示而非静默失败
   - **Q8** 删除工具轮次上限：终止条件只剩 取消 / 出错 / 模型给出最终文本；限额交给插件（插件监视轮次，超限经执行站 `agent.stop` 发停止信号）
-  - **Q9** `spec` 工具瘦身：只留 `select` / `create` / `update`；`select` **直接返回所选 Spec 全文**（删除 `search` / `list` 与"先 read 再 select"约束）；索引**注入系统提示词**（默认全列、>50 条截断）；内置 4 条只读
-  - **Q10** `grep` 无匹配时返回**扫描文件清单**（≤200，超出注明总数）+ **生效的排除目录** + 扫描根，帮模型区分"真没有"与"被误排除"
+  - **Q9** `spec` 工具瘦身：只留 `select` / `create` / `update`；`select` **直接返回所选 Spec 全文**（删除 `search` / `list` 与"先 read 再 select"约束）；索引**注入系统提示词**（默认全列、>50 条截断）；内置 3 条只读（`general-task` / `hard-task` / `team-meeting`，落工作空间 `.self/spec/`；`easy-task` 已按使用数据移除、`complex-task` 更名 `general-task`）
+  - **Q10** `grep` 无匹配时返回**扫描文件清单**（≤200，超出注明总数）+ **生效的排除目录** + 扫描根，帮模型区分"真没有"与"被误排除"；默认口径 = 不扫描**隐藏路径**（`.[!.]*`，如 `.git` / `.dart_tool` / `.self`）+ 依赖/构建目录，要搜隐藏路径显式传 `include_hidden=true`（依赖/构建目录是硬黑名单，不受该开关影响）
   - **Q11** 站点体系（三站 + 收集站）：执行站首命令集 `fs.read` / `fs.write` / `fs.list` / `fs.grep` / `terminal.exec` / `agent.message` / `agent.stop` / `agent.compact` / `ui.push`；中转站"站 × scope 键位唯一"（先到先得）；收集站由**站点定义输入格式**、多订阅者各回目标数据、站点汇总后交后续处理（如注册工具）；订阅者未响应 ⇒ **返回部分结果 + 显式列出未响应者**（不整体失败、不静默）
   - **Q12** 插件布局：声明式槽位（左侧活动栏项 / 右栏 Tab / 状态栏 / 消息流内联卡片，**不做 webview/iframe**），槽位走独立通道（manifest 声明 + `plugin_ui_manifest` / `plugin_ui_update` / `plugin_ui_action` 三帧，**不经三站**）；受限控件集 text / list / table / form / progress / actions，未知控件渲染成「不支持的控件」占位；槽位带 `team_id`，只呈现当前 team；插件可经 `ui.push` 注入消息流卡片
   - **Q13** token rate 管道统一：**思考 / 正文 / 工具调用参数**共用同一条节拍器（参数按 `字符数 / token_scale` 折算 token ⇒ `write` 这类大参数自然排队、`read` 几乎不等），工具结果**直推不延迟** ⇒ UI 只有一条速率曲线
+  - **Q14** 思考回传与估算口径：`thinking` 开关（**模型默认 + 每个 agent 可覆盖**：右栏「模型信息」/成员「模型配置」的「回传思考」三态下拉，存 `agents/<id>.yaml` 的 `thinking_override`，PATCH 键 `thinking`）决定历史思考是否作为 `reasoning_content` **回传**（DeepSeek 带 `tools` 的请求必须原样回传，缺失会让同会话后续请求持续 400；默认关闭 = 不回传、省输入 token）。**上下文估算与压缩阈值按同一开关计口径**：关闭时不把思考算进上下文，工具结果按**门控后**的那一份（预览 + 提示）计——否则估算会比实际发送大出几十万 token，压缩在真实上下文只有 1/3 时就触发
   - **降级与补发**：插件 / MCP / 站点均无静态超时；插件连续 N 拍无心跳 ⇒ `degraded`（status 仍 `registered`，**不是停用**）；MCP 在途请求抛错但不杀进程 / 不关连接；WS 断链期间广播帧进**待补发队列**（上限 + 计数丢弃），重连后按拍原样重播（帧**无 TTL**），前端按**消息 id** 去重防重复渲染
 
 ---
@@ -198,7 +199,7 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 
   | 工具 | 说明 |
   | --- | --- |
-  | `read` / `write` / `edit` / `grep` | 工作空间读写、精确替换（唯一匹配）、检索（自动排除依赖/构建目录） |
+  | `read` / `write` / `edit` / `grep` | 工作空间读写、精确替换（唯一匹配）、检索（默认排除隐藏路径与依赖/构建目录，`include_hidden=true` 可放行隐藏路径） |
   | `terminal` | 本机 / 远端命令执行；**hook 模式**后台长任务（输出重定向到文件，结束后推送提示唤醒 agent 续跑） |
   | `set_todo_list` | 任务分解与增量进度汇报 |
   | `ask_user_question` | 向用户提问并等待作答（落盘、跨重启用） |
@@ -261,14 +262,17 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 ```jsonc
 // 插件 → 核心
 {"jsonrpc":"2.0","id":7,"method":"station/command",
- "params":{"command":"fs.read","arguments":{"agent_id":"agt_1","path":"README.md"}}}
+ "params":{"command":"fs.read",
+           "agent_id":"agt_1","session_id":"session_default",   // 身份（可选，见下）
+           "arguments":{"agent_id":"agt_1","path":"README.md"}}}
 ```
 
-- **入参** `{command, arguments}`：`command` 取执行站白名单——`fs.read` / `fs.write` / `fs.list` / `fs.grep` / `terminal.exec` / `agent.message` / `agent.stop` / `agent.compact` / `ui.push`；`arguments` 是该命令自己的参数对象（可省略）。
+- **入参** `{command, arguments, team_id?, agent_id?, session_id?, mode_key?}`：`command` 取执行站白名单——`fs.read` / `fs.write` / `fs.list` / `fs.grep` / `terminal.exec` / `agent.message` / `agent.stop` / `agent.compact` / `ui.push`；`arguments` 是该命令自己的参数对象（可省略）。身份字段放 `params` 顶层或 `arguments` 里等价。`fs.grep` 与内置 `grep` 同一默认口径（不扫描 `.[!.]*` 隐藏路径），`arguments.include_hidden=true` 放行。
 - **result 形状** `{command, ok, mount_id, payload, error}`：`ok=false` 时**可读失败原因在 `error`**（跨 team / 跨模式 / 参数缺失 / 挂载位置未接线…），**不是 JSON-RPC 错误**——插件据此自查原因，不会只看到一句「调用失败」；`mount_id` 是实际执行命令的挂载位置（如 `core.execute.fs.read`），空串 = 未挂载。
 - **错误码**（JSON-RPC `error.code`）：`-32601` 未知方法 · `-32602` 参数非法 · `-32603` 处理器异常 · `-32001` scope 不满足。
-- **scope 只来自插件自己在 `plugins.yaml` 的声明**（`scope.team_id` / `agent_id` / `session_id`）；**请求参数里的 `team_id` / `agent_id` / `session_id` / `mode_key` 一律被忽略**——插件不得放大作用域，也放大不了。**未声明 `team` 的插件不能用执行站**（回 `-32001`），这类插件仍可照旧用 `tools/list` 申报工具。
-- 命令参数里的 `agent_id` 只用来**指名目标**：仍要与插件声明的 scope、以及目标 agent 的真实归属（team + `local|ssh` 工作面）精确匹配，任一不符即 `ok=false` 明确拒绝（fail-closed，跨 scope 的命令不会打到别的工作空间）。
+- **单实例 + 每条消息带身份（Q2）**：插件进程只有一个，身份按**这一次请求**解析——目标 agent 取请求里的 `agent_id`（缺省才回退到 `plugins.yaml` 的 `scope.agent_id`）；`team` / `mode` 由核心按**目标 agent 的真实归属**（团队 + `local|ssh` 工作面）解析，**不信任插件声明**。
+- **`plugins.yaml` 的 `scope` 是作用域上限**：声明了 `team` 的插件只能在自己 team 内活动（跨 team 回 `-32001`）；**不声明 scope 的插件可服务任意 team**（一个实例同时服务多队），但每条命令都要带 `agent_id` 且必须能证明归属（agent 不存在 / 归属解析不出 / 请求里带的 `team_id` 与真实归属不一致，一律 `-32001`）。不带 agent 的团队级命令（如 `ui.push`）只要求能确定 `team_id`。
+- 命令执行前仍会按四元组做隔离校验，任一不符即**明确拒绝**（fail-closed，跨 scope 的命令不会打到别的工作空间）。
 
 ```yaml
 # <数据根>/config/plugins.yaml（片段）
@@ -277,14 +281,14 @@ plugins:
     command: node
     args: ["sample-plugin.js"]
     granularity: team
-    scope: {team_id: team-1}   # 执行站命令的作用域就取自这里
+    scope: {team_id: team-1}   # 作用域**上限**：不写 = 单实例服务任意 team（身份按每条命令解析）
 ```
 
 ### 核心 → 插件：请求与通知
 
 | 报文 | 形态 | 说明 |
 | --- | --- | --- |
-| `hello` / `tools/list` / `tools/call` / `ping` / `shutdown` | 请求（核心等回包） | 握手、工具申报、工具调用、心跳探测、优雅关闭 |
+| `hello` / `tools/list` / `tools/call` / `ping` / `shutdown` | 请求（核心等回包） | 握手、工具申报、工具调用、心跳探测、优雅关闭。**`tools/call` 除 `{name, arguments}` 外还带调用点身份 `scope: {team_id, agent_id, session_id, mode_key}`**（单实例插件据此知道"这一次是谁在问"） |
 | `station/request` | 请求（核心等回包） | **收集站请求**：站点把请求投给订阅的插件，`params` = `{request_id, station_id, kind, scope, payload, meta?, schema?}`；插件按站点 schema 回 `{"reply": {"payload": ...}}`（失败回 `{"reply": {"error": "可读原因"}}`）。回包可回带 `scope`，带了就必须与请求四元组精确相等 |
 | `event` | **通知（不等回包）** | 插件订阅到的总线事件（按四元组过滤），`params` 即事件体 |
 
@@ -334,18 +338,20 @@ desktop/                       # desktop 分支（独立 git worktree）
 ```
 ~/.tree/
 ├── config/
-│   ├── settings.yaml          # 全局设置（token 帧率 / 推送帧率 / 消息切入 / 数据收集）
+│   ├── settings.yaml          # 全局设置（token 帧率 / 推送帧率 / 消息切入）
 │   ├── models/<id>.yaml       # 模型（含明文 api_key；用户私有文件）
 │   ├── mcp.yaml               # MCP 服务
 │   └── plugins.yaml           # 插件
 ├── agents/<id>.yaml           # agent / 团队成员（含 ssh、workspace_dir、system_prompt）
-├── spec/builtin/*.md          # 内置 Spec（首次启动写入，可查看 / 手改副本）
 ├── data/
 │   ├── questions.json         # 提问记录（跨会话）
 │   └── <agent>/<session>/
 │       ├── session.json       # 会话元数据（原子快照）
 │       └── messages.jsonl     # 消息追加日志（一行一条）
-└── workspaces/<agent_id>/     # 默认工作空间（可在 agent yaml 里改）
+└── workspaces/<agent_id>/     # 默认工作空间（可在 agent yaml 里改；SSH 则是对端工作空间）
+    └── .self/                 # 该工作空间/团队的私有状态（提示词与规范按团队分隔）
+        ├── system_prompt.md   # 系统提示词基础段（首启播种；改完下一轮生效）
+        └── spec/*.md          # 内置（general-task/hard-task/team-meeting）+ 自定义 Spec
 ```
 
 Windows 上是 `%APPDATA%\Tree`；`TREE_HOME` 环境变量或 `--data-dir` 可覆盖。
@@ -360,7 +366,9 @@ Windows 上是 `%APPDATA%\Tree`；`TREE_HOME` 环境变量或 `--data-dir` 可�
 - **插件 / MCP 没生效**：看对应 yaml 的 `command` 是否可执行；`GET /api/plugin/snapshot` 与 `GET /api/mcp/services` 会给出 `disabled_reason` / `errors`。坏服务只影响自己。
 - **插件面板出现橙色「心跳降级」角标**：表示连续 3 拍（≈30s）没收到该插件的心跳——**不是停用**（`status` 仍是 `registered`，进程还活着，只是不回应心跳）。先查插件是否卡在某个长任务上；确认无救再显式重启（核心**不会**因为它降级而杀进程）。
 - **模型不可用**：`~/.tree/config/models/<id>.yaml` 的 `base_url` / `api_key`，以及 agent 的 `model_id` 是否指向它。
-- **改配置何时生效**：`agents/*.yaml` 与 `config/*.yaml` 在核心启动时读取；MCP / 插件也可经 REST 即时注册。
+- **改配置何时生效**：`agents/*.yaml` 与 `config/*.yaml` 在核心启动时读取；MCP / 插件也可经 REST 即时注册；工作空间里的 `.self/system_prompt.md` 下一轮对话即生效（按 agent 缓存，后台刷新）。
+- **系统提示词从哪来**（Q6）：每个工作空间 = `.self/system_prompt.md`（基础段，按团队/工作空间分隔）→ agent 自己的 `system_prompt` → 工作空间软约束 → Spec 索引。首次用到该工作空间（或文件被删）时核心会写入一份默认内容；之后**只读用户的版本**，清空文件即等于不要基础段。
+- **系统提示词 / Spec 被改坏了**：右侧活动栏（右栏顶部）有两个一键重置按钮——现有文件先备份成 `.bak.<n>`（保留旧备份、序号顺延），再写回默认内容；Spec 的自定义文件会一并清理，备份里可找回。等价接口：`POST /api/agents/{id}/reset`（body `{target: system_prompt|spec|all}`）。
 
 ---
 
