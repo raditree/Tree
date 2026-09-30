@@ -43,6 +43,32 @@ void main() {
       }
     });
 
+    test('成员级覆盖（含 thinking 三态）落盘并重开可读回', () async {
+      final FileTreeStore store = newStore();
+      final CoreAgent agent = store.createAgent(name: '覆盖', modelId: 'm1');
+      agent
+        ..reasoningEffort = 'high'
+        ..maxSeqlenOverride = 32000
+        ..maxOutputTokens = 4096
+        ..compressThreshold = 0.7
+        ..thinkingOverride = true;
+      store.putAgent(agent);
+      await store.flush();
+
+      final CoreAgent reopened = newStore().agent(agent.id)!;
+      expect(reopened.reasoningEffort, 'high');
+      expect(reopened.maxSeqlenOverride, 32000);
+      expect(reopened.maxOutputTokens, 4096);
+      expect(reopened.compressThreshold, 0.7);
+      expect(reopened.thinkingOverride, isTrue);
+
+      // 三态：清除覆盖后重开必须是 null（"不设置"），不能变成 false
+      agent.thinkingOverride = null;
+      store.putAgent(agent);
+      await store.flush();
+      expect(newStore().agent(agent.id)!.thinkingOverride, isNull);
+    });
+
     test('文件布局与方案一致：agent yaml + 会话 json + 消息 jsonl', () async {
       final FileTreeStore store = newStore();
       final CoreAgent agent = store.createAgent(

@@ -37,6 +37,28 @@ void main() {
     expect(base.withOverrides(<String, Object?>{}), same(base));
   });
 
+  test('thinking 覆盖：withOverrides 生效，未覆盖时保留模型默认', () {
+    final CoreSettings settings = settingsWithModel();
+    final CoreModelConfig base = settings.model('demo')!;
+    expect(base.thinking, isFalse, reason: 'settingsWithModel 的模型默认');
+
+    final CoreModelConfig on = base.withOverrides(<String, Object?>{
+      'thinking': true,
+    });
+    expect(on.thinking, isTrue);
+    expect(base.thinking, isFalse, reason: '原对象不被改');
+
+    final CoreModelConfig off = settings.model('demo')!.withOverrides(
+      <String, Object?>{'thinking': false},
+    );
+    expect(off.thinking, isFalse);
+    // 下发 null / 缺键 = 不覆盖
+    expect(
+      base.withOverrides(<String, Object?>{'thinking': null}).thinking,
+      isFalse,
+    );
+  });
+
   test('引擎把成员覆盖作用到实际请求（reasoning_effort / max_output_tokens）', () async {
     final CoreSettings settings = settingsWithModel();
     final MemoryStore store = MemoryStore();

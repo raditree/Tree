@@ -48,4 +48,6 @@ Map<String, Object?> memberOverrides(CoreAgent member) => <String, Object?>{
     MemberOverrideKeys.maxOutputTokens: member.maxOutputTokens,
   if (member.compressThreshold > 0)
     MemberOverrideKeys.compressThreshold: member.compressThreshold,
+  if (member.thinkingOverride != null)
+    MemberOverrideKeys.thinking: member.thinkingOverride,
 };

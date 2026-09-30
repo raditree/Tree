@@ -40,6 +40,7 @@ class CoreAgent {
     this.maxSeqlenOverride = 0,
     this.maxOutputTokens = 0,
     this.compressThreshold = 0,
+    this.thinkingOverride,
   }) : scores = scores ?? <String, double>{};
 
   final String id;
@@ -101,6 +102,13 @@ class CoreAgent {
   int maxOutputTokens;
   double compressThreshold;
 
+  /// 是否把历史思考（`reasoning_content`）回传端点的**本 Agent 覆盖**。
+  ///
+  /// null = 不覆盖（跟随模型的 `thinking`）；true/false = 覆盖。
+  /// 用三态而不是 bool，是因为"不设置"与"显式关掉模型默认开启"必须能区分——
+  /// 与 [maxSeqlenOverride] 等覆盖项同一语义（0/空串 = 未覆盖）。
+  bool? thinkingOverride;
+
   final int createdAt;
   int updatedAt;
 
@@ -135,6 +143,7 @@ class CoreAgent {
     'max_seqlen_override': maxSeqlenOverride,
     'max_output_tokens': maxOutputTokens,
     'compress_threshold': compressThreshold,
+    'thinking_override': thinkingOverride,
     'created_at': JsonTime.encode(createdAt),
     'updated_at': JsonTime.encode(updatedAt),
   };
@@ -169,6 +178,7 @@ class CoreAgent {
       maxSeqlenOverride: (json['max_seqlen_override'] as num?)?.toInt() ?? 0,
       maxOutputTokens: (json['max_output_tokens'] as num?)?.toInt() ?? 0,
       compressThreshold: (json['compress_threshold'] as num?)?.toDouble() ?? 0,
+      thinkingOverride: json['thinking_override'] as bool?,
       createdAt: JsonTime.decode(json['created_at']) ?? now,
       updatedAt: JsonTime.decode(json['updated_at']) ?? now,
     );
@@ -390,6 +400,10 @@ class CoreMessage {
   /// 是否为工具调用卡片（不计入"有效消息数"）。
   bool get isTool => kind == 'tool';
 
+  /// 是否为思考（推理）卡片：默认**不进**上下文（引擎不回灌），
+  /// 只有模型开了"回传思考"（`thinking`）时才作为 `reasoning_content` 回传。
+  bool get isThinking => kind == 'thinking';
+
   Map<String, dynamic> toJson() => <String, dynamic>{
     'id': id,
     'agent_id': agentId,
@@ -481,10 +495,14 @@ abstract final class MemberOverrideKeys {
   static const String maxOutputTokens = 'max_output_tokens';
   static const String compressThreshold = 'compress_threshold';
 
+  /// 是否回传历史思考（`reasoning_content`）：DeepSeek 带 `tools` 的请求要求回传。
+  static const String thinking = 'thinking';
+
   static const List<String> all = <String>[
     reasoningEffort,
     maxSeqlen,
     maxOutputTokens,
     compressThreshold,
+    thinking,
   ];
 }

@@ -228,6 +228,9 @@ class CoreModelConfig {
     if (output is num && output.toInt() > 0) {
       copy.maxOutputTokens = output.toInt();
     }
+    // 成员/agent 级「是否回传历史思考」：与模型默认同键名，显式 null 视为不覆盖
+    final Object? reasoning = overrides['thinking'];
+    if (reasoning is bool) copy.thinking = reasoning;
     return copy;
   }
 

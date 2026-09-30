@@ -677,6 +677,13 @@ class TeamService {
             return _error('compress_threshold 必须在 0.1~0.95 之间');
           }
           member.compressThreshold = parsed ?? 0;
+        case MemberOverrideKeys.thinking:
+          // 三态：null = 清除覆盖（跟随模型），true/false = 覆盖
+          final bool? parsed = value == null ? null : _boolValue(value);
+          if (value != null && parsed == null) {
+            return _error('thinking 必须是 true / false，或 null 清除该项覆盖');
+          }
+          member.thinkingOverride = parsed;
       }
     }
     member.updatedAt = DateTime.now().millisecondsSinceEpoch;
@@ -744,6 +751,22 @@ class TeamService {
     return value;
   }
 
+  /// 宽容读 bool：真 bool、以及 'true'/'false'/'1'/'0'/'yes'/'no' 都认。
+  static bool? _boolValue(Object? raw) {
+    if (raw is bool) return raw;
+    switch (raw?.toString().trim().toLowerCase()) {
+      case 'true':
+      case '1':
+      case 'yes':
+        return true;
+      case 'false':
+      case '0':
+      case 'no':
+        return false;
+    }
+    return null;
+  }
+
   Map<String, dynamic> _error(String message, {String hint = ''}) =>
       <String, dynamic>{'error': message, if (hint.isNotEmpty) 'hint': hint};
 
@@ -786,6 +809,9 @@ class TeamService {
       MemberOverrideKeys.maxOutputTokens: member.maxOutputTokens > 0
           ? member.maxOutputTokens
           : (model?.maxOutputTokens ?? 0),
+      // 三态覆盖：没设就是模型的 thinking
+      MemberOverrideKeys.thinking:
+          member.thinkingOverride ?? model?.thinking ?? false,
     };
   }
 
