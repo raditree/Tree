@@ -60,6 +60,7 @@ class LlmMessage {
     this.toolCalls = const <LlmToolCall>[],
     this.toolCallId,
     this.name,
+    this.reasoningContent = '',
   });
 
   /// 便捷构造。
@@ -67,17 +68,19 @@ class LlmMessage {
     : role = LlmRole.system,
       toolCalls = const <LlmToolCall>[],
       toolCallId = null,
-      name = null;
+      name = null,
+      reasoningContent = '';
 
   /// 便捷构造。
   const LlmMessage.user(this.content)
     : role = LlmRole.user,
       toolCalls = const <LlmToolCall>[],
       toolCallId = null,
-      name = null;
+      name = null,
+      reasoningContent = '';
 
-  /// 便捷构造。
-  const LlmMessage.assistant(this.content)
+  /// 便捷构造（[reasoningContent] 只在"回传思考"开启时才有值，见 [toWire]）。
+  const LlmMessage.assistant(this.content, {this.reasoningContent = ''})
     : role = LlmRole.assistant,
       toolCalls = const <LlmToolCall>[],
       toolCallId = null,
@@ -89,13 +92,23 @@ class LlmMessage {
     required String this.toolCallId,
   }) : role = LlmRole.tool,
        toolCalls = const <LlmToolCall>[],
-       name = null;
+       name = null,
+       reasoningContent = '';
 
   final LlmRole role;
   final String content;
   final List<LlmToolCall> toolCalls;
   final String? toolCallId;
   final String? name;
+
+  /// 思考（推理）正文：DeepSeek 的 `reasoning_content`，与 `content` **同级**
+  /// 放在 assistant 消息上。
+  ///
+  /// **只有"回传思考"开启（模型配置的 `thinking`）时才有值**：官方文档与实测都表明
+  /// 请求带 `tools` 时历史中的 `reasoning_content` 必须原样回传，否则同会话后续请求
+  /// 会持续 400；参考实现（`server/llm/llm.py`）也是这么写的。关闭时留空 = 不回传
+  /// （部分网关容忍缺失，且能显著省输入 token）。
+  final String reasoningContent;
 
   /// 是否为工具结果消息。
   bool get isToolResult => role == LlmRole.tool;
@@ -111,6 +124,11 @@ class LlmMessage {
       case LlmRole.assistant:
         // 纯工具调用轮次里 content 可能为空串，端点要求显式给 null 或空串
         out['content'] = content.isEmpty ? null : content;
+        // DeepSeek 思考模式：带 tools 的请求必须回传历史 reasoning_content，
+        // 且字段就在 assistant 消息顶层、与 content 同级（不能嵌套）
+        if (reasoningContent.isNotEmpty) {
+          out['reasoning_content'] = reasoningContent;
+        }
         if (toolCalls.isNotEmpty) {
           out['tool_calls'] = toolCalls
               .map((LlmToolCall c) => c.toWire())
@@ -131,6 +149,7 @@ class LlmMessage {
   /// 本地估算刻意不去模拟它们（真要精确就该以端点 usage 为准）。
   int get charCount =>
       content.length +
+      reasoningContent.length +
       toolCalls.fold<int>(
         0,
         (int sum, LlmToolCall call) =>
@@ -142,7 +161,9 @@ class LlmMessage {
   /// 工具调用额外加 8 token 的协议外壳（id/type/function 这些字段本身要约 20~30
   /// 字符，按 2.0 的比例折算即可）。
   int estimatedTokens({double scale = defaultTokenScale}) {
-    int tokens = estimateTokens(content, scale: scale);
+    int tokens =
+        estimateTokens(content, scale: scale) +
+        estimateTokens(reasoningContent, scale: scale);
     for (final LlmToolCall call in toolCalls) {
       tokens += 8 + estimateTokens(call.name + call.arguments, scale: scale);
     }

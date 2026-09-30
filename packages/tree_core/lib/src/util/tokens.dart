@@ -25,8 +25,13 @@ const double defaultTokenScale = 2.0;
 /// 一致），这样估算点与提示文案里的"字符数"是同一个量。
 ///
 /// [scale] 是逐模型的 token_scale；<= 0 视为无效值，回退到 [defaultTokenScale]。
-int estimateTokens(String text, {double scale = defaultTokenScale}) {
-  if (text.isEmpty) return 0;
+int estimateTokens(String text, {double scale = defaultTokenScale}) =>
+    estimateTokensFromChars(text.length, scale: scale);
+
+/// 只给**字符数**时的同一换算（上下文估算里有些项拿不到原文，只能拿到长度，
+/// 例如被工具结果门控替换掉的那一份）。
+int estimateTokensFromChars(int chars, {double scale = defaultTokenScale}) {
+  if (chars <= 0) return 0;
   final double effective = scale > 0 ? scale : defaultTokenScale;
-  return (text.length / effective).ceil();
+  return (chars / effective).ceil();
 }

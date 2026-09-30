@@ -84,6 +84,23 @@ class ToolResultGate {
   bool exceeds(String text) =>
       estimateTokens(text, scale: tokenScale) > thresholdTokens;
 
+  /// 门控后**送模型的那一份**的字符数（同步、不落盘）。
+  ///
+  /// 上下文估算必须用它而不是 [text].length：历史里的超大结果**store 存全文、
+  /// 送模型只有预览**，按全文估算会让压缩阈值提前触发（估算里凭空多出几十万字符）。
+  /// 未超阈值时就是原文长度；超了则落点提示 + 预览，长度基本恒定。
+  int forModelChars(String text) {
+    if (!exceeds(text)) return text.length;
+    final int preview = text.length < previewChars ? text.length : previewChars;
+    return noticeChars + preview;
+  }
+
+  /// 重定向提示本身的字符数（模板 + 时间戳路径 + 工具名，量级恒定）。
+  ///
+  /// 估算只需要量级正确：这里刻意不复刻路径与 token 数字的每一位，
+  /// 真要逐字一致就该以端点 usage 为准。
+  static const int noticeChars = 480;
+
   /// 把工具结果换算成"送模型的那一份"。
   ///
   /// **同一个结果重复过门控是允许的**（历史重载、每轮重建上下文都会再走一遍）：
