@@ -42,11 +42,16 @@ void main() {
     expect(request.messages.single.role, LlmRole.user);
     expect(request.messages.single.content, '请总结');
     expect(request.tools, isEmpty, reason: '总结请求带工具就可能递归触发工具循环');
-    expect(request.maxOutputTokens, 2048);
+    expect(
+      request.maxOutputTokens,
+      isNull,
+      reason: '复用模型输出长度：模型没配 max_output_tokens 就不发送（与对话引擎同口径）',
+    );
     expect(request.temperature, 0.2);
+    expect(request.reasoningEffort, isNull, reason: '模型/成员都没声明思考档位时不额外发送');
   });
 
-  test('成员级 max_output_tokens 作为上限生效，成员覆盖回调被调用', () async {
+  test('成员级 max_output_tokens 直接复用（总结不再另设上限），成员覆盖回调被调用', () async {
     final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
       textScript('ok'),
     ]);
@@ -61,7 +66,35 @@ void main() {
     );
     await summarizer.summarize(agent(maxOutputTokens: 111), '请总结');
     expect(overrideCalls, <String>['agt_1']);
-    expect(transport.requests.single.maxOutputTokens, 111);
+    expect(
+      transport.requests.single.maxOutputTokens,
+      111,
+      reason: '成员配置的输出长度原样复用，不被"总结该短"之类的独立口径改写',
+    );
+  });
+
+  test('模型配置了 max_output_tokens 时同样原样复用（与对话引擎同口径）', () async {
+    final CoreModelConfig capped = CoreModelConfig(
+      modelId: 'demo',
+      name: '演示',
+      baseUrl: 'https://api.example.com/v1',
+      apiKey: 'sk-test',
+      maxSeqlen: 65536,
+      maxOutputTokens: 65536,
+    );
+    final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+      textScript('ok'),
+    ]);
+    final LlmSummarizer summarizer = LlmSummarizer(
+      resolveModel: (String id) => id == 'demo' ? capped : null,
+      transportFactory: (CoreModelConfig _) => transport,
+    );
+    await summarizer.summarize(agent(), '请总结');
+    expect(
+      transport.requests.single.maxOutputTokens,
+      65536,
+      reason: '思考 + 正文都要落在这个预算里；2048 那种"总结该短"的口径会被思考吃满',
+    );
   });
 
   test('同一端点复用传输（两次总结只建一次连接池）', () async {
@@ -145,6 +178,81 @@ void main() {
         ),
       ),
     );
+  });
+
+  test('只有思考、没有正文：不降档也不重试，错误里带 finish_reason 与思考字数', () async {
+    final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+      // 实测形态：finish_reason=length（预算被思考吃满）、正文 0 字
+      <LlmStreamEvent>[
+        LlmThinkingDelta('想' * 40),
+        const LlmFinishEvent('length'),
+      ],
+      textScript('不该被用到'),
+    ]);
+    final LlmSummarizer summarizer = LlmSummarizer(
+      resolveModel: (String id) => id == 'demo' ? config : null,
+      transportFactory: (CoreModelConfig _) => transport,
+    );
+    await expectLater(
+      summarizer.summarize(agent(), '请总结'),
+      throwsA(
+        isA<StateError>().having(
+          (StateError e) => e.message,
+          'message',
+          allOf(
+            contains('没有返回总结内容'),
+            contains('finish_reason=length'),
+            contains('思考 40 字'),
+          ),
+        ),
+      ),
+    );
+    expect(
+      transport.requests,
+      hasLength(1),
+      reason: '总结保持 agent 的思考档位：压低思考换来的是更弱的总结器，不靠降档补救',
+    );
+  });
+
+  test('总结沿用 agent 的思考档位（含成员级覆盖），不自行降档', () async {
+    final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+      textScript('ok'),
+    ]);
+    final LlmSummarizer summarizer = LlmSummarizer(
+      resolveModel: (String id) => id == 'demo' ? config : null,
+      transportFactory: (CoreModelConfig _) => transport,
+      agentOverrides: (String _) => <String, Object?>{
+        'reasoning_effort': 'high',
+      },
+    );
+    await summarizer.summarize(agent(), '请总结');
+    expect(
+      transport.requests.single.reasoningEffort,
+      'high',
+      reason: '与对话引擎同档位，否则摘要质量与对话时不一致',
+    );
+  });
+
+  test('传输层失败不重试：原样上报端点错误', () async {
+    final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+      <LlmStreamEvent>[const LlmFailureEvent('端点 503')],
+      textScript('不该被用到'),
+    ]);
+    final LlmSummarizer summarizer = LlmSummarizer(
+      resolveModel: (String id) => id == 'demo' ? config : null,
+      transportFactory: (CoreModelConfig _) => transport,
+    );
+    await expectLater(
+      summarizer.summarize(agent(), '请总结'),
+      throwsA(
+        isA<StateError>().having(
+          (StateError e) => e.message,
+          'message',
+          contains('端点 503'),
+        ),
+      ),
+    );
+    expect(transport.requests, hasLength(1), reason: '端点不通时重试只会浪费一次调用');
   });
 
   test('close() 关闭自己建的传输', () async {
