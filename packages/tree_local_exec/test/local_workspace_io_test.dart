@@ -379,6 +379,46 @@ void main() {
       ]);
     });
 
+    test('隐藏路径（.[!.]*）默认不搜；include_hidden=true 才放行', () async {
+      writeFile('src/a.txt', 'needle');
+      writeFile('.env', 'needle');
+      writeFile('.self/spec/note.md', 'needle');
+      writeFile('.github/workflows/ci.yml', 'needle');
+      writeFile('.git/config', 'needle');
+
+      final GrepOutcome hidden = await io.grep(
+        const GrepQuery(pattern: 'needle'),
+      );
+      expect(hidden.matches.map((GrepMatch m) => m.path).toList(), <String>[
+        'src/a.txt',
+      ], reason: '隐藏文件与隐藏目录下的文件都不该进结果');
+      expect(hidden.scannedFileCount, 1);
+      expect(
+        hidden.excludedDirs,
+        containsAll(<String>['.self', '.github']),
+        reason: '被跳过的隐藏目录要进排除清单，模型才能区分"真没有"',
+      );
+
+      final GrepOutcome all = await io.grep(
+        const GrepQuery(pattern: 'needle', includeHidden: true),
+      );
+      expect(all.matches.map((GrepMatch m) => m.path).toSet(), <String>{
+        'src/a.txt',
+        '.env',
+        '.self/spec/note.md',
+        '.github/workflows/ci.yml',
+      }, reason: '.git 是硬黑名单，开关管不着');
+    });
+
+    test('显式把 path 指到隐藏目录：指向哪里搜哪里', () async {
+      writeFile('.self/spec/note.md', 'needle');
+      writeFile('src/a.txt', 'needle');
+      final GrepOutcome out = await io.grep(
+        const GrepQuery(pattern: 'needle', relativePath: '.self/spec'),
+      );
+      expect(out.matches.single.path, '.self/spec/note.md');
+    });
+
     test('exclude glob 按 basename 追加排除；max_results 截断', () async {
       writeFile('src/a.dart', 'x1\nx2\nx3');
       writeFile('src/a.g.dart', 'x4');

@@ -53,6 +53,10 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   };
 
   /// grep / list 默认排除的目录名（依赖与构建产物）。
+  ///
+  /// 这是**硬黑名单**：即便 [GrepQuery.includeHidden] 打开（grep 去搜隐藏路径），
+  /// 名单里的目录仍然会被跳过——`.git` 这类默认永不检索是有意的。
+  /// 其余隐藏路径（不在名单里的）由 [isHiddenPathName] 那套默认口径处理。
   static const Set<String> defaultExcludedDirs = <String>{
     '.git',
     '.venv',
@@ -202,6 +206,18 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     return bytes.length;
   }
 
+  @override
+  Future<bool> deleteFile(String relativePath) async {
+    final String absolute = resolve(relativePath);
+    final FileSystemEntityType type = await FileSystemEntity.type(absolute);
+    if (type == FileSystemEntityType.notFound) return false;
+    if (type != FileSystemEntityType.file) {
+      throw WorkspaceIoException('目标不是文件（拒绝删除目录）：$relativePath');
+    }
+    await File(absolute).delete();
+    return true;
+  }
+
   /// 覆盖写时尽量沿用**已有文件的编码**（[PlatformTextDecoder.encodeLike]）。
   ///
   /// - 文件不存在 / 空文件 / 超过 [_encodingSniffMaxBytes]：按 UTF-8 写（write 的默认语义）；
@@ -331,6 +347,7 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
         excludedDirs: defaultExcludedDirs,
         extraExcludes: extras,
         respectExclusion: true,
+        skipHidden: !query.includeHidden,
         onExcludedDir: (Directory dir) {
           if (excludedDirs.length >= GrepOutcome.maxExcludedDirs) return;
           excludedDirs.add(relativize(dir.path));
@@ -782,6 +799,10 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   ///
   /// [onExcludedDir] 只在**目录**被排除规则真的跳过时回调（Q10 的排除清单）；
   /// 名字撞上排除规则的普通文件不算"被排除的目录"。
+  ///
+  /// [skipHidden] 打开时，[isHiddenPathName] 命中的文件/目录与 [excludedDirs]
+  /// 同等对待（目录同样进排除清单），列表层因此不需要各自再判一次。
+  /// 注意：只判**子项**，起点目录本身不判——调用方显式指到 `.self` 就该搜 `.self`。
   static void _walk(
     Directory dir,
     int maxDepth,
@@ -789,6 +810,7 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     required Set<String> excludedDirs,
     required List<String> extraExcludes,
     required bool respectExclusion,
+    bool skipHidden = false,
     void Function(Directory dir)? onExcludedDir,
     bool onDirectory = false,
     int depth = 0,
@@ -804,6 +826,7 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
       final String name = p.basename(entity.path);
       if (respectExclusion) {
         final bool excluded =
+            (skipHidden && isHiddenPathName(name)) ||
             excludedDirs.contains(name) ||
             extraExcludes.any((String glob) => _matchesGlob(name, glob));
         if (excluded) {
@@ -820,6 +843,7 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
           excludedDirs: excludedDirs,
           extraExcludes: extraExcludes,
           respectExclusion: respectExclusion,
+          skipHidden: skipHidden,
           onExcludedDir: onExcludedDir,
           onDirectory: onDirectory,
           depth: depth + 1,

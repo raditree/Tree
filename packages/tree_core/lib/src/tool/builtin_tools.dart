@@ -190,8 +190,9 @@ abstract final class BuiltinTools {
       name: grep,
       description:
           '在工作空间内按模式搜索文件内容，返回"路径:行号: 行内容"。'
-          '先用 grep 缩小范围再 read 精读。默认排除 .git 与依赖/构建目录；'
-          'regex=true 时 pattern 按正则解释。',
+          '先用 grep 缩小范围再 read 精读。默认不扫描隐藏路径（以 . 开头，'
+          '如 .git/.dart_tool/.self）与依赖/构建目录；需要搜隐藏路径时传 '
+          'include_hidden=true。regex=true 时 pattern 按正则解释。',
       parameters: <String, dynamic>{
         'type': 'object',
         'properties': <String, dynamic>{
@@ -214,6 +215,12 @@ abstract final class BuiltinTools {
             'type': 'array',
             'items': <String, dynamic>{'type': 'string'},
             'description': '追加排除的 glob（按文件名匹配，如 *.g.dart）',
+          },
+          'include_hidden': <String, dynamic>{
+            'type': 'boolean',
+            'description':
+                'true = 连隐藏路径（以 . 开头的文件/目录）一起搜（缺省 false）；'
+                '依赖/构建目录（.git/node_modules/build 等）仍会被跳过',
           },
         },
         'required': <String>['pattern'],
@@ -481,6 +488,7 @@ abstract final class BuiltinTools {
       return const ToolOutcome('pattern 不能为空', isError: true);
     }
     final String path = _string(invocation, 'path');
+    final bool includeHidden = _bool(invocation, 'include_hidden');
     final GrepOutcome outcome = await io.grep(
       GrepQuery(
         pattern: pattern,
@@ -490,6 +498,7 @@ abstract final class BuiltinTools {
         maxDepth: _int(invocation, 'max_depth') ?? 0,
         maxResults: _int(invocation, 'max_results') ?? 200,
         exclude: _stringList(invocation, 'exclude'),
+        includeHidden: includeHidden,
       ),
     );
     final StringBuffer buffer = StringBuffer()
@@ -521,12 +530,21 @@ abstract final class BuiltinTools {
           );
         }
       }
-      buffer.writeln(
-        outcome.excludedDirs.isEmpty
-            ? '- 生效的排除目录：无（.git 与依赖/构建目录若存在会被默认排除）'
-            : '- 生效的排除目录（${outcome.excludedDirs.length} 个）：'
-                  '${outcome.excludedDirs.join('、')}',
-      );
+      // 排除规则本身也要说清：否则模型看到"扫描了 0 个文件"会以为是空目录，
+      // 而真相是隐藏路径被默认挡掉了——这时它会知道该加 include_hidden。
+      final String defaultRules = includeHidden
+          ? '依赖/构建目录（.git/node_modules/build 等）默认排除；'
+                '隐藏路径已按 include_hidden=true 放行'
+          : '隐藏路径（. 开头，如 .git/.dart_tool）与依赖/构建目录默认排除；'
+                '要搜隐藏路径请传 include_hidden=true';
+      buffer
+        ..writeln(
+          outcome.excludedDirs.isEmpty
+              ? '- 生效的排除目录：无'
+              : '- 生效的排除目录（${outcome.excludedDirs.length} 个）：'
+                    '${outcome.excludedDirs.join('、')}',
+        )
+        ..writeln('- 默认排除规则：$defaultRules');
     }
     return ToolOutcome(buffer.toString().trimRight());
   }

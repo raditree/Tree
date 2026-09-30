@@ -221,6 +221,43 @@ void main() {
       expect(hit.content, isNot(contains('生效的排除目录')));
     });
 
+    test('隐藏路径（.[!.]*）默认不搜；include_hidden=true 才放行', () async {
+      await io.writeFile('src/a.dart', 'final needle = 1;');
+      await io.writeFile('.env', 'SECRET=needle');
+
+      final ToolSpec spec = BuiltinTools.specs().firstWhere(
+        (ToolSpec s) => s.name == 'grep',
+      );
+      final Map<String, dynamic> props =
+          spec.parameters['properties'] as Map<String, dynamic>;
+      expect(props.keys, contains('include_hidden'));
+      expect(spec.description, contains('隐藏'));
+      expect(
+        spec.description,
+        contains('include_hidden'),
+        reason: '模型得知道有放行开关，否则会以为工作空间里真的没有',
+      );
+
+      final ToolOutcome hidden = await run('grep', <String, dynamic>{
+        'pattern': 'needle',
+      });
+      expect(hidden.content, contains('src/a.dart:1:'));
+      expect(hidden.content, isNot(contains('.env')));
+
+      final ToolOutcome hinted = await run('grep', <String, dynamic>{
+        'pattern': 'SECRET',
+      });
+      expect(hinted.content, contains('命中 0 处'));
+      expect(hinted.content, contains('默认排除规则'));
+      expect(hinted.content, contains('include_hidden=true'));
+
+      final ToolOutcome all = await run('grep', <String, dynamic>{
+        'pattern': 'SECRET',
+        'include_hidden': true,
+      });
+      expect(all.content, contains('.env:1:'));
+    });
+
     test('缺少 pattern 是错误', () async {
       expect((await run('grep')).isError, isTrue);
     });

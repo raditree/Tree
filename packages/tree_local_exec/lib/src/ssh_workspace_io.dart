@@ -48,6 +48,9 @@ abstract interface class SshTransport {
   /// 路径是否存在且是文件/目录。
   Future<bool> exists(String absolutePath);
 
+  /// 删除一个远端**文件**（不存在不报错）。
+  Future<void> delete(String absolutePath);
+
   /// 执行命令，返回退出码与解码后的输出。
   ///
   /// [timeout] 是 M9 之前的**静态总时长**硬超时；1.1 修正后**不再按时间终止**
@@ -233,6 +236,15 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     return bytes.length;
   }
 
+  @override
+  Future<bool> deleteFile(String relativePath) async {
+    final String absolute = resolve(relativePath);
+    final bool present = await _link.guard(() => _transport.exists(absolute));
+    if (!present) return false;
+    await _link.guard(() => _transport.delete(absolute));
+    return true;
+  }
+
   /// 覆盖写时尽量沿用**远端已有文件的编码**（与本地 [LocalWorkspaceIO.writeFile] 同一套取舍）。
   ///
   /// 注意：按系统代码页解码用的是**本机**的 ANSI 代码页（远端可能是 Linux）。这里要的性质
@@ -328,6 +340,9 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   Future<GrepOutcome> grep(GrepQuery query) async {
     final String start = resolve(query.relativePath);
     final RegExp pattern = _buildPattern(query);
+    // 隐藏路径（`.[!.]*`）默认不搜：远端只给"文件相对路径"，没有目录事件，
+    // 所以判据必须同时落在"路径段"（_excludedAncestor）与"文件 basename"上。
+    final bool skipHidden = !query.includeHidden;
     final List<String> relativeFiles = await _link.guard(
       () => _transport.listFiles(start, maxDepth: query.maxDepth),
     );
@@ -353,6 +368,7 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
       final String? excludedDir = _excludedAncestor(
         rel,
         extraExcludes: query.exclude,
+        skipHidden: skipHidden,
       );
       if (excludedDir != null) {
         final String dir = relPath(excludedDir);
@@ -363,7 +379,10 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
         continue;
       }
       final String name = p.posix.basename(rel);
-      if (defaultExcludedDirs.contains(name)) continue;
+      if ((skipHidden && isHiddenPathName(name)) ||
+          defaultExcludedDirs.contains(name)) {
+        continue;
+      }
       if (query.exclude.any((String glob) => _matchesGlob(name, glob))) {
         continue;
       }
@@ -414,15 +433,20 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   ///
   /// 远端给的是"文件相对路径"，排除目录只能从前缀反推：
   /// node_modules/pkg/a.js 的 node_modules 就是被剪掉的目录。
+  ///
+  /// [skipHidden] 打开时隐藏目录段（`.git` …）也算命中——与本地 `_walk` 的剪枝
+  /// 对齐，否则远端会读进整棵被本地跳过的子树。
   static String? _excludedAncestor(
     String rel, {
     required List<String> extraExcludes,
+    required bool skipHidden,
   }) {
     final List<String> parts = rel.split('/');
     // 最后一段是文件名，只判它前面的目录段
     for (int i = 0; i < parts.length - 1; i++) {
       final String name = parts[i];
-      if (defaultExcludedDirs.contains(name) ||
+      if ((skipHidden && isHiddenPathName(name)) ||
+          defaultExcludedDirs.contains(name) ||
           extraExcludes.any((String glob) => _matchesGlob(name, glob))) {
         return parts.sublist(0, i + 1).join('/');
       }

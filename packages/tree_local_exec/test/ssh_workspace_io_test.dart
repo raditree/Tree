@@ -135,6 +135,11 @@ class FakeSshTransport implements SshTransport {
       files.keys.any((String k) => k.startsWith('$absolutePath/'));
 
   @override
+  Future<void> delete(String absolutePath) async {
+    files.remove(absolutePath);
+  }
+
+  @override
   Future<SshExecResult> run(
     String command, {
     Duration timeout = const Duration(seconds: 120),
@@ -384,6 +389,30 @@ void main() {
       expect(out.matches.map((GrepMatch m) => m.path).toList(), <String>[
         'src/keep.txt',
       ]);
+    });
+
+    test('隐藏路径（.[!.]*）默认不搜；include_hidden=true 才放行', () async {
+      t.seed('/ws/src/a.txt', 'needle');
+      t.seed('/ws/.env', 'needle');
+      t.seed('/ws/.self/spec/note.md', 'needle');
+      t.seed('/ws/.git/config', 'needle');
+
+      final GrepOutcome hidden = await io.grep(
+        const GrepQuery(pattern: 'needle'),
+      );
+      expect(hidden.matches.map((GrepMatch m) => m.path).toList(), <String>[
+        'src/a.txt',
+      ]);
+      expect(hidden.excludedDirs, contains('.self'));
+
+      final GrepOutcome all = await io.grep(
+        const GrepQuery(pattern: 'needle', includeHidden: true),
+      );
+      expect(all.matches.map((GrepMatch m) => m.path).toSet(), <String>{
+        'src/a.txt',
+        '.env',
+        '.self/spec/note.md',
+      }, reason: '.git 是硬黑名单，开关管不着');
     });
 
     test('无匹配时给出扫描清单与生效的排除目录（Q10）', () async {

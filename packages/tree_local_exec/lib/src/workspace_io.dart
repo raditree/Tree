@@ -86,6 +86,7 @@ class GrepQuery {
     this.maxDepth = 0,
     this.maxResults = 200,
     this.exclude = const <String>[],
+    this.includeHidden = false,
   });
 
   final String pattern;
@@ -106,7 +107,26 @@ class GrepQuery {
 
   /// 追加排除的 glob（按 basename 匹配，如 `*.g.dart`）。
   final List<String> exclude;
+
+  /// 是否连隐藏路径（以 `.` 开头，`.[!.]*` 那类，见 [isHiddenPathName]）一起搜。
+  ///
+  /// 缺省 false：绝大多数检索都不需要 `.git`/`.dart_tool`/`.self/results` 这类
+  /// 机器目录，把它们排除掉既省一次全树读盘、也让命中不被噪声淹没。
+  /// **可见的**依赖/构建目录（`node_modules` / `build` / `dist` …）仍然默认排除
+  /// ——它们是硬黑名单，与这个开关无关。
+  ///
+  /// 显式把 [relativePath] 指到隐藏目录上时不受此开关影响（指向哪里搜哪里，
+  /// 与既有的"path 指过去则不再排除"一致）。
+  final bool includeHidden;
 }
+
+/// 是否是应当默认跳过的"隐藏"名字：以 `.` 开头，`.` 与 `..` 除外
+/// （`.[!.]*` 想表达的那类隐藏名；`..foo` 这种怪名也一并算隐藏）。
+///
+/// 本地与 SSH 两套遍历共用这一份判据，保证"同一个工作空间、同一份默认口径"。
+/// 只判**单个路径段**（basename / 目录名），不判整条路径。
+bool isHiddenPathName(String name) =>
+    name.length > 1 && name.startsWith('.') && name != '..';
 
 /// grep 单条命中。
 class GrepMatch {
@@ -304,6 +324,12 @@ abstract interface class WorkspaceIO {
 
   /// 写入文件（自动创建父目录），返回写入字节数。
   Future<int> writeFile(String relativePath, String content);
+
+  /// 删除一个**文件**（返回是否真的删除了；不存在返回 false）。
+  ///
+  /// 只服务「重置到默认」这类维护动作（备份后清掉旧文件 / 重新播种），
+  /// 不是通用工具能力——工具层仍没有 delete 工具。目录一律拒绝（显式报错）。
+  Future<bool> deleteFile(String relativePath);
 
   /// 精确字符串替换；[oldText] 必须唯一匹配（除非 [replaceAll]）。
   Future<EditOutcome> editFile(

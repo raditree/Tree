@@ -136,6 +136,12 @@ class DartSshTransport implements SshTransport {
   Future<void> write(String absolutePath, List<int> bytes) =>
       writeStream(absolutePath, Stream<List<int>>.value(bytes));
 
+  /// 删除远端文件（rm -f：不存在也不报错，与 SFTP remove 语义一致但更宽容）。
+  @override
+  Future<void> delete(String absolutePath) async {
+    await run('rm -f ${_quote(absolutePath)}');
+  }
+
   /// 远端文件大小（M8c：大文件预览/下载先问大小，不再先整读再判上限）。
   @override
   Future<int> size(String absolutePath) async {
