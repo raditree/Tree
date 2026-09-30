@@ -193,6 +193,7 @@ void main() {
         'max_seqlen': 32000,
         'max_output_tokens': 2048,
         'reasoning_effort': 'high',
+        'thinking': true,
       },
     );
     expect(res.status, 200);
@@ -204,5 +205,47 @@ void main() {
       2048,
     );
     expect(store.agent(member)!.reasoningEffort, 'high');
+    // 回传思考：三态覆盖（true / false / null=清除），effective 给出生效值
+    expect((member0['overrides'] as Map<String, dynamic>)['thinking'], isTrue);
+    expect((member0['effective'] as Map<String, dynamic>)['thinking'], isTrue);
+    expect(store.agent(member)!.thinkingOverride, isTrue);
+
+    final _Res off = await client.send(
+      'PATCH',
+      '/api/agents/${top.id}/teammate/$member',
+      body: <String, dynamic>{'thinking': false},
+    );
+    expect(off.status, 200);
+    expect(
+      ((off.json['member'] as Map<String, dynamic>)['effective']
+          as Map<String, dynamic>)['thinking'],
+      isFalse,
+      reason: '显式关掉要能压过模型的 thinking',
+    );
+
+    final _Res cleared = await client.send(
+      'PATCH',
+      '/api/agents/${top.id}/teammate/$member',
+      body: <String, dynamic>{'thinking': null},
+    );
+    expect(cleared.status, 200);
+    expect(
+      ((cleared.json['member'] as Map<String, dynamic>)['overrides']
+              as Map<String, dynamic>)
+          .containsKey('thinking'),
+      isFalse,
+      reason: 'null = 清除覆盖，不是"关掉"',
+    );
+    expect(store.agent(member)!.thinkingOverride, isNull);
+
+    expect(
+      (await client.send(
+        'PATCH',
+        '/api/agents/${top.id}/teammate/$member',
+        body: <String, dynamic>{'thinking': 'maybe'},
+      )).status,
+      400,
+      reason: '非法取值显式拒绝',
+    );
   });
 }

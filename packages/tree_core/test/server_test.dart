@@ -495,6 +495,120 @@ void main() {
       expect(res.json['overrides'], isEmpty);
     });
 
+    test('PATCH agent 的模型参数覆盖会落库并回传给 models-info', () async {
+      final String agentId = await seedAgent('覆盖');
+      final _Res patched = await client.send(
+        'PATCH',
+        '/api/agents/$agentId',
+        body: <String, dynamic>{
+          'reasoning_effort': 'high',
+          'max_seqlen': 32000,
+          'max_output_tokens': 4096,
+          'compress_threshold': 0.7,
+          'thinking': true,
+        },
+      );
+      expect(patched.status, 200, reason: '$patched');
+      final _Res info = await client.send(
+        'GET',
+        '/api/agents/$agentId/models-info',
+      );
+      final Map<String, dynamic> overrides =
+          info.json['overrides'] as Map<String, dynamic>;
+      expect(overrides['reasoning_effort'], 'high');
+      expect(overrides['max_seqlen'], 32000);
+      expect(overrides['max_output_tokens'], 4096);
+      expect(overrides['compress_threshold'], 0.7);
+      expect(overrides['thinking'], isTrue, reason: '右栏「回传思考」覆盖');
+
+      // 三态：显式 null = 清除该项覆盖（回退模型默认），不是"关掉"
+      final _Res resetThinking = await client.send(
+        'PATCH',
+        '/api/agents/$agentId',
+        body: <String, dynamic>{'thinking': null},
+      );
+      expect(resetThinking.status, 200, reason: '$resetThinking');
+      final _Res infoAfterReset = await client.send(
+        'GET',
+        '/api/agents/$agentId/models-info',
+      );
+      expect(
+        (infoAfterReset.json['overrides'] as Map<String, dynamic>).containsKey(
+          'thinking',
+        ),
+        isFalse,
+      );
+      // 再设回 true，供后面的"一次性清除"断言
+      await client.send(
+        'PATCH',
+        '/api/agents/$agentId',
+        body: <String, dynamic>{'thinking': true},
+      );
+
+      // 非法值显式 400，绝不静默丢弃
+      expect(
+        (await client.send(
+          'PATCH',
+          '/api/agents/$agentId',
+          body: <String, dynamic>{'max_seqlen': 0},
+        )).status,
+        400,
+      );
+      expect(
+        (await client.send(
+          'PATCH',
+          '/api/agents/$agentId',
+          body: <String, dynamic>{'compress_threshold': 1.5},
+        )).status,
+        400,
+      );
+      expect(
+        (await client.send(
+          'PATCH',
+          '/api/agents/$agentId',
+          body: <String, dynamic>{'thinking': 'yes'},
+        )).status,
+        400,
+        reason: 'thinking 只接受 bool 或 null，字符串要显式拒绝',
+      );
+
+      // 一次性清除全部覆盖（右栏「恢复默认」按钮）
+      final _Res cleared = await client.send(
+        'PATCH',
+        '/api/agents/$agentId',
+        body: <String, dynamic>{'clear_model_overrides': true},
+      );
+      expect(cleared.status, 200, reason: '$cleared');
+      final _Res after = await client.send(
+        'GET',
+        '/api/agents/$agentId/models-info',
+      );
+      expect(after.json['overrides'], isEmpty);
+    });
+
+    test('PATCH system_prompt 落库并进入系统提示词装配（右栏输入框确实生效）', () async {
+      final String agentId = await seedAgent('提示词');
+      final _Res patched = await client.send(
+        'PATCH',
+        '/api/agents/$agentId',
+        body: <String, dynamic>{'system_prompt': '你是测试助手。'},
+      );
+      expect(patched.status, 200, reason: '$patched');
+      final _Res info = await client.send(
+        'GET',
+        '/api/agents/$agentId/models-info',
+      );
+      expect(
+        (info.json['agent'] as Map<String, dynamic>)['system_prompt'],
+        '你是测试助手。',
+        reason: '保存后 models-info 回填，右栏输入框重载可见',
+      );
+      // 落库 + 装配函数确实带上它（未接工作空间基础段时即整段提示词）
+      final CoreAgent agent = server.store.agent(agentId)!;
+      expect(agent.systemPrompt, '你是测试助手。', reason: '落库到 agents/<id>.yaml');
+      expect(systemPromptWithWorkspace(agent), contains('你是测试助手。'));
+    });
+
     test('todos / teammates / questions 返回空集（M4/M5 前）', () async {
       final String agentId = await seedAgent('空集');
       expect(

@@ -12,6 +12,7 @@ import '../agent/conversation_service.dart';
 import '../agent/question_broker.dart';
 import '../agent/question_store.dart';
 import '../agent/scripted_agent.dart';
+import '../agent/system_prompt_file.dart';
 import '../agent/workspace_prompt.dart';
 import '../files/file_service.dart';
 import '../mcp/mcp_client.dart';
@@ -28,6 +29,7 @@ import '../store/atomic_file.dart';
 import '../store/memory_store.dart';
 import '../store/tree_store.dart';
 import '../team/message_dispatcher.dart';
+import '../team/team_model.dart';
 import '../team/team_service.dart';
 import '../tool/terminal_hooks.dart';
 import '../tool/todo_store.dart';
@@ -66,6 +68,7 @@ class CoreServer {
     required this.messageDispatcher,
     required this.specService,
     required this.specIoFor,
+    required this.systemPromptStore,
     required this.mcpService,
     required this.pluginBus,
     required this.builtinPlugins,
@@ -148,6 +151,9 @@ class CoreServer {
   /// 取某 agent 的工作空间 IO（Spec 的自定义文件在工作空间里）。
   final Future<WorkspaceIO?> Function(String agentId)? specIoFor;
 
+  /// 系统提示词存储（工作空间 `.self/system_prompt.md`）；为 null 时重置路由 503。
+  final SystemPromptStore? systemPromptStore;
+
   /// MCP 服务（M6a）；为 null 时返回空服务列表。
   final McpService? mcpService;
 
@@ -195,6 +201,9 @@ class CoreServer {
   /// 本实例绑定的 Spec 索引 provider（Q9）：close 时按身份解绑，
   /// 免得已关闭的核心把过期索引留在全局 provider 上。
   String Function(CoreAgent)? _specIndexBinding;
+
+  /// 本实例绑定的「已选 Spec 全文」provider（Q9 ⑧）：同样在 close 时按身份解绑。
+  String Function(CoreAgent, String)? _selectedSpecsBinding;
 
   /// 版本号。
   final String version;
@@ -270,6 +279,7 @@ class CoreServer {
     TeamMessageDispatcher? messageDispatcher,
     SpecService? specService,
     Future<WorkspaceIO?> Function(String agentId)? specIoFor,
+    SystemPromptStore? systemPromptStore,
     McpService? mcpService,
     PluginBus? pluginBus,
     BuiltinPluginCatalog? builtinPlugins,
@@ -312,6 +322,7 @@ class CoreServer {
       messageDispatcher: messageDispatcher,
       specService: specService,
       specIoFor: specIoFor,
+      systemPromptStore: systemPromptStore,
       mcpService: mcpService,
       pluginBus: pluginBus,
       builtinPlugins: builtinPlugins ?? BuiltinPluginCatalog(),
@@ -356,6 +367,15 @@ class CoreServer {
           : specs.indexSnapshot(agent.id);
       server._specIndexBinding = binding;
       specIndexProvider = binding;
+      // Q9 ⑧：已选 Spec 全文（本会话挂的 hook）。`selected_spec_ids` 是**会话级**的，
+      // 所以这个 binding 多带一个 sessionId；没有它，`spec select` 对上下文就没有
+      // 持续影响（压缩一轮后规范正文再也回不来）。
+      String selectedBinding(CoreAgent agent, String sessionId) =>
+          specs.store.agent(agent.id) == null
+          ? ''
+          : specs.selectedSpecsSnapshot(agent.id, sessionId);
+      server._selectedSpecsBinding = selectedBinding;
+      selectedSpecsProvider = selectedBinding;
     }
     // 判死与恢复都要**可见**、要能触发补发（不静默）：
     // - 判死：写错误日志 + 关连接（前端会自动重连，这就是"触发重连"）；
@@ -410,6 +430,9 @@ class CoreServer {
     if (identical(specIndexProvider, _specIndexBinding)) {
       specIndexProvider = null;
     }
+    if (identical(selectedSpecsProvider, _selectedSpecsBinding)) {
+      selectedSpecsProvider = null;
+    }
     await _http.close(force: force);
   }
 
@@ -437,8 +460,13 @@ class CoreServer {
     // 调用点上下文：team 取 agent 的团队归属（agent / session 由调用点给）
     bus.callSiteContext ??= (String agentId, String sessionId) {
       final CoreAgent? agent = store.agent(agentId);
+      // 顶层 agent 的 team_id 为空 ⇒ **它自己就是团队**（与 TeamService.teamIdOf
+      // 和站点预建的 keying 同口径）；成员则用它的 team_id。
+      final String team = agent == null
+          ? ''
+          : (agent.teamId.trim().isEmpty ? agent.id : agent.teamId.trim());
       return StationScopeContext(
-        teamId: agent?.teamId ?? '',
+        teamId: team,
         agentId: agentId,
         sessionId: sessionId,
       );
@@ -853,6 +881,7 @@ class CoreServer {
     router.add('POST', ApiPaths.agentSessionSpecs, _setSessionSpecs);
     router.add('GET', ApiPaths.agentSpecs, _listSpecs);
     router.add('GET', ApiPaths.agentSpec, _getSpec);
+    router.add('POST', ApiPaths.agentReset, _resetWorkspace);
     router.add('POST', ApiPaths.agentCompact, _compactAgent);
     router.add('GET', ApiPaths.questions, _listQuestions);
     router.add('POST', ApiPaths.questionAnswer, _answerQuestion);
@@ -1136,6 +1165,95 @@ class CoreServer {
         return;
       }
     }
+    // ── 模型参数覆盖（右栏「模型信息」页，M5b 语义）──
+    // 语义与团队成员的「模型配置」一致：键缺省 = 不修改；显式 null = 清除该项；
+    // clear_model_overrides = 一次性清空全部覆盖（回退模型默认，供「恢复默认」按钮）。
+    if (body['clear_model_overrides'] == true) {
+      agent.reasoningEffort = '';
+      agent.maxSeqlenOverride = 0;
+      agent.maxOutputTokens = 0;
+      agent.compressThreshold = 0;
+      agent.thinkingOverride = null;
+      touched = true;
+    } else {
+      if (body.containsKey('reasoning_effort')) {
+        agent.reasoningEffort = (body['reasoning_effort'] as String? ?? '')
+            .trim();
+        touched = true;
+      }
+      if (body.containsKey('max_seqlen')) {
+        final Object? raw = body['max_seqlen'];
+        if (raw == null) {
+          agent.maxSeqlenOverride = 0;
+        } else {
+          final int? parsed = raw is num ? raw.toInt() : int.tryParse('$raw');
+          if (parsed == null || parsed <= 0) {
+            await writeJson(
+              request,
+              400,
+              errorBody('max_seqlen 必须为正整数，或 null 清除该项覆盖'),
+            );
+            return;
+          }
+          agent.maxSeqlenOverride = parsed;
+        }
+        touched = true;
+      }
+      if (body.containsKey('max_output_tokens')) {
+        final Object? raw = body['max_output_tokens'];
+        if (raw == null) {
+          agent.maxOutputTokens = 0;
+        } else {
+          final int? parsed = raw is num ? raw.toInt() : int.tryParse('$raw');
+          if (parsed == null || parsed <= 0) {
+            await writeJson(
+              request,
+              400,
+              errorBody('max_output_tokens 必须为正整数，或 null 清除该项覆盖'),
+            );
+            return;
+          }
+          agent.maxOutputTokens = parsed;
+        }
+        touched = true;
+      }
+      if (body.containsKey('compress_threshold')) {
+        final Object? raw = body['compress_threshold'];
+        if (raw == null) {
+          agent.compressThreshold = 0;
+        } else {
+          final double? parsed = raw is num
+              ? raw.toDouble()
+              : double.tryParse('$raw');
+          if (parsed == null || parsed < 0.1 || parsed > 0.95) {
+            await writeJson(
+              request,
+              400,
+              errorBody('compress_threshold 必须在 0.1~0.95 之间，或 null 清除该项覆盖'),
+            );
+            return;
+          }
+          agent.compressThreshold = parsed;
+        }
+        touched = true;
+      }
+      if (body.containsKey('thinking')) {
+        final Object? raw = body['thinking'];
+        if (raw == null) {
+          agent.thinkingOverride = null;
+        } else if (raw is bool) {
+          agent.thinkingOverride = raw;
+        } else {
+          await writeJson(
+            request,
+            400,
+            errorBody('thinking 必须是 true / false，或 null 清除该项覆盖'),
+          );
+          return;
+        }
+        touched = true;
+      }
+    }
     if (touched) {
       agent.updatedAt = DateTime.now().millisecondsSinceEpoch;
       store.putAgent(agent);
@@ -1192,8 +1310,9 @@ class CoreServer {
           .models()
           .map((CoreModelConfig m) => m.toApiJson())
           .toList(),
-      // agent 级模型参数覆盖（M5 成员/覆盖特性落地）
-      'overrides': <String, dynamic>{},
+      // agent 级模型参数覆盖（M5 成员/覆盖特性落地）：只含**真正设置过**的键，
+      // 前端据此回填「模型参数（本 Agent）」的四个控件（缺省 = 不覆盖）。
+      'overrides': memberOverrides(agent),
     });
   }
 
@@ -1660,6 +1779,15 @@ class CoreServer {
             .map((dynamic e) => e.toString())
             .toList();
     store.setSelectedSpecs(agentId, sessionId, specIds);
+    // 改了 hook 就立刻刷新 ⑧ 章快照，否则要等下一次后台补扫才进系统提示词
+    final SpecService? specs = specService;
+    if (specs != null) {
+      await specs.refreshSelectedSpecs(
+        agentId,
+        sessionId,
+        await specIoFor?.call(agentId),
+      );
+    }
     await writeJson(request, 200, <String, dynamic>{
       'success': true,
       'selected_spec_ids': specIds,
@@ -1713,6 +1841,57 @@ class CoreServer {
       'meta': document.toMetaJson(),
       'content': document.raw,
     });
+  }
+
+  /// `POST /api/agents/{agentId}/reset`：一键重置工作空间里的
+  /// 系统提示词 / Spec（body: `{target}`，target ∈ system_prompt | spec | all）。
+  ///
+  /// 语义：现有文件先备份成 `.bak.<n>`（保留旧备份），再写回默认内容；Spec 的
+  /// 自定义文件会一并清理（备份里可找回）。工作空间不可用时给**可读 400**，
+  /// 而不是静默成功。
+  Future<void> _resetWorkspace(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final String agentId = params['agentId'] ?? '';
+    final Map<String, dynamic> body = await readJsonBody(request);
+    final String target = (body['target'] as String? ?? 'all')
+        .trim()
+        .toLowerCase();
+    if (target != 'system_prompt' && target != 'spec' && target != 'all') {
+      await writeJson(
+        request,
+        400,
+        errorBody('target 只能是 system_prompt / spec / all'),
+      );
+      return;
+    }
+    if (store.agent(agentId) == null) {
+      await writeJson(request, 404, errorBody('agent 不存在'));
+      return;
+    }
+    final WorkspaceIO? io = await specIoFor?.call(agentId);
+    if (io == null) {
+      await writeJson(request, 400, errorBody('工作空间不可用（未接线 / SSH 配置不完整），无法重置'));
+      return;
+    }
+    final Map<String, dynamic> result = <String, dynamic>{'success': true};
+    if (target == 'system_prompt' || target == 'all') {
+      final SystemPromptStore? prompts = systemPromptStore;
+      if (prompts != null) {
+        final PromptResetResult reset = await prompts.reset(agentId, io);
+        await prompts.refresh(agentId);
+        result['system_prompt'] = reset.toJson();
+      }
+    }
+    if (target == 'spec' || target == 'all') {
+      final SpecService? specs = specService;
+      if (specs != null) {
+        result['spec'] = await specs.reset(io);
+        await specs.refreshIndex(agentId, io);
+      }
+    }
+    await writeJson(request, 200, result);
   }
 
   Future<void> _listQuestions(

@@ -65,10 +65,7 @@ void main() {
     settings = CoreSettings();
     temp = Directory.systemTemp.createTempSync('tree_spec_api_');
     io = LocalWorkspaceIO(temp.path);
-    specs = SpecService(
-      store: store,
-      builtinSpecsDir: temp.path, // 测试里不需要落盘内置模板
-    );
+    specs = SpecService(store: store);
     server = await CoreServer.start(
       store: store,
       settings: settings,
@@ -113,7 +110,7 @@ void main() {
     return created['spec_id'] as String;
   }
 
-  test('GET specs：内置 4 个在前 + 自定义 spec；selected_spec_ids 与 store 一致', () async {
+  test('GET specs：内置 3 个在前 + 自定义 spec；selected_spec_ids 与 store 一致', () async {
     final String custom = await createCustom();
     final _Res res = await client.send(
       'GET',
@@ -121,8 +118,8 @@ void main() {
     );
     expect(res.status, 200);
     final List<dynamic> list = res.json['specs'] as List<dynamic>;
-    expect(list, hasLength(5));
-    expect((list.first as Map<String, dynamic>)['id'], 'easy-task');
+    expect(list, hasLength(4));
+    expect((list.first as Map<String, dynamic>)['id'], 'general-task');
     expect((list.first as Map<String, dynamic>)['builtin'], isTrue);
     final Map<String, dynamic> customView = list.last as Map<String, dynamic>;
     expect(customView['id'], custom);
@@ -135,7 +132,7 @@ void main() {
       'POST',
       '/api/agents/${agent.id}/sessions/$sessionId/specs',
       body: <String, dynamic>{
-        'spec_ids': <String>['easy-task', custom],
+        'spec_ids': <String>['general-task', custom],
       },
     );
     expect(saved.status, 200);
@@ -143,18 +140,18 @@ void main() {
       'GET',
       '/api/agents/${agent.id}/specs?session_id=$sessionId',
     );
-    expect(after.json['selected_spec_ids'], <String>['easy-task', custom]);
+    expect(after.json['selected_spec_ids'], <String>['general-task', custom]);
   });
 
   test('GET spec 详情：内置与自定义都给 meta+全文；不存在 404', () async {
     final String custom = await createCustom();
     final _Res builtin = await client.send(
       'GET',
-      '/api/agents/${agent.id}/specs/easy-task',
+      '/api/agents/${agent.id}/specs/general-task',
     );
     expect(builtin.status, 200);
     expect((builtin.json['meta'] as Map<String, dynamic>)['builtin'], isTrue);
-    expect(builtin.json['content'], kBuiltinSpecs['easy-task']);
+    expect(builtin.json['content'], kBuiltinSpecs['general-task']);
 
     final _Res mine = await client.send(
       'GET',
@@ -170,5 +167,45 @@ void main() {
     );
     expect(ghost.status, 404);
     expect(jsonEncode(ghost.json), contains('Spec 不存在'));
+  });
+
+  test('POST reset：备份 .bak.<n> 后清空自定义并还原内置 Spec', () async {
+    final String custom = await createCustom();
+    final _Res before = await client.send(
+      'GET',
+      '/api/agents/${agent.id}/specs?session_id=$sessionId',
+    );
+    expect((before.json['specs'] as List<dynamic>), hasLength(4));
+
+    final _Res reset = await client.send(
+      'POST',
+      '/api/agents/${agent.id}/reset',
+      body: <String, dynamic>{'target': 'spec'},
+    );
+    expect(reset.status, 200, reason: '${reset.status} ${reset.json}');
+    final Map<String, dynamic> spec =
+        reset.json['spec'] as Map<String, dynamic>;
+    expect(spec['backup_index'], 1);
+    expect(
+      (spec['removed'] as List<dynamic>),
+      contains('.self/spec/$custom.md'),
+      reason: '自定义规范被清理',
+    );
+    // 旧文件可从备份找回
+    expect(
+      File('${temp.path}/.self/spec/$custom.md.bak.1').existsSync(),
+      isTrue,
+    );
+    // 重置后只剩内置 3 个
+    final _Res after = await client.send(
+      'GET',
+      '/api/agents/${agent.id}/specs?session_id=$sessionId',
+    );
+    final List<dynamic> specsAfter = after.json['specs'] as List<dynamic>;
+    expect(specsAfter, hasLength(3));
+    expect(
+      specsAfter.map((dynamic e) => (e as Map<String, dynamic>)['id']).toSet(),
+      kBuiltinSpecIds.toSet(),
+    );
   });
 }

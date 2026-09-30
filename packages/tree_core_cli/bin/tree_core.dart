@@ -61,14 +61,12 @@ Future<void> main(List<String> args) async {
   // <数据根>/workspaces/<agent_id>（首次使用时自动创建）。
   final FileTodoStore todos = FileTodoStore(paths);
 
-  // Spec 体系：内置模板内嵌在核心包里，首次启动写到 <数据根>/spec/builtin/
-  // （用户可查看与手改副本）；自定义 Spec 落在各 agent 工作空间的 spec/。
+  // Spec 体系：内置模板内嵌在核心包里，**播种到每个工作空间的 .self/spec/**；
+  // 自定义 Spec 同样落在那里——规范属于工作空间/团队，各存一份、互不影响。
   final SpecService specs = SpecService(
     store: store,
-    builtinSpecsDir: paths.builtinSpecsDir,
     log: (String message) => stderr.writeln('[core:spec] $message'),
   );
-  await specs.seedBuiltins();
 
   // MCP 服务（M6a）：配置在 <数据根>/config/mcp.yaml；启动时尝试连接一次，
   // 失败只在日志里说明（坏插件不该拦住核心启动）。
@@ -194,6 +192,16 @@ Future<void> main(List<String> args) async {
     log: (String message) => stderr.writeln('[core:tool] $message'),
   );
 
+  // 系统提示词（Q6）：落在**每个工作空间**的 .self/system_prompt.md（团队分隔）。
+  // 首次用到某工作空间时播种默认内容，之后只读用户版本；运行期每轮按 agent 缓存
+  // 快照，改文件保存即下一轮生效。右侧活动栏的「重置」按钮走同一条读写路径。
+  final SystemPromptStore systemPrompts = SystemPromptStore(
+    ioFor: tools.ioFor,
+    log: (String message) => stderr.writeln('[core:prompt] $message'),
+  );
+  systemPromptFileProvider = (CoreAgent agent) =>
+      systemPrompts.snapshot(agent.id);
+
   // 工作空间文件服务（M7d/M7g）：文件面板 / 查看器 / Git 面板的数据源。
   // 前端仍只经 REST 读写，路径安全边界都在 FileService 里；配了 ssh 的 agent
   // 走同一份 SshWorkspaceIO（与工具层共用连接，避免文件面板再连一条）。
@@ -224,6 +232,8 @@ Future<void> main(List<String> args) async {
         'reasoning_effort': agent.reasoningEffort,
       if (agent.maxSeqlenOverride > 0) 'max_seqlen': agent.maxSeqlenOverride,
       if (agent.maxOutputTokens > 0) 'max_output_tokens': agent.maxOutputTokens,
+      // 三态：没覆盖就不下发，交给模型自己的 thinking
+      if (agent.thinkingOverride != null) 'thinking': agent.thinkingOverride,
     };
   }
 
@@ -269,6 +279,7 @@ Future<void> main(List<String> args) async {
     messageDispatcher: messages,
     specService: specs,
     specIoFor: tools.ioFor,
+    systemPromptStore: systemPrompts,
     mcpService: mcp,
     pluginBus: plugins,
     fileService: files,
