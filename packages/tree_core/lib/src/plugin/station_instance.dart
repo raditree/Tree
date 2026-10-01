@@ -946,7 +946,9 @@ final class RelayStation extends StationInstance {
         reason: '订阅者选择不改动数据',
       );
     }
-    if (payload is String) {
+    if (payload is String || payload is Map || payload is List) {
+      // 回填 = **整体替换**原数据：字符串用于文本流（工具结果），
+      // 映射 / 数组用于结构化流（工具调用报文本身就是 Map）。
       return StationRelayResult(
         data: payload,
         handled: true,
@@ -959,7 +961,7 @@ final class RelayStation extends StationInstance {
       handled: false,
       pluginId: subscriber.pluginId,
       reason:
-          '回填类型非法（只接受 string 替换 / 空表示不改动），'
+          '回填类型非法（只接受 string / 对象 / 数组替换，空表示不改动），'
           '实际是 ${payload.runtimeType}（原数据放行）',
     );
   }

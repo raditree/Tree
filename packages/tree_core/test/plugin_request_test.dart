@@ -181,6 +181,77 @@ void main() {
     return jsonDecode(called.text) as Map<String, dynamic>;
   }
 
+  test('插件发 station/subscribe ⇒ 订阅成立并可退订（中转站 / 广播站）', () async {
+    final PluginBus bus = await startBus(teamPluginYaml());
+
+    final Map<String, dynamic> subscribed = await pluginRequest(
+      bus,
+      method: 'station/subscribe',
+      params: <String, dynamic>{'station': 'relay'},
+    );
+    expect(subscribed['error'], isNull, reason: '${subscribed['error']}');
+    final Map<String, dynamic> sub = subscribed['result'] as Map<String, dynamic>;
+    expect(sub['ok'], isTrue, reason: '${sub['error']}');
+    expect(sub['kind'], 'relay');
+    expect(sub['station_id'], 'system.relay@$team@local');
+
+    final RelayStation relay =
+        bus.stations.station('system.relay@$team@local')! as RelayStation;
+    expect(relay.subscribers.single.pluginId, 'sample');
+    expect(relay.subscribers.single.scope.teamId, team);
+
+    // 重复订阅同键位 = 幂等更新（不报"键位冲突"）
+    final Map<String, dynamic> again = await pluginRequest(
+      bus,
+      method: 'station/subscribe',
+      params: <String, dynamic>{'station': 'relay'},
+    );
+    expect((again['result'] as Map<String, dynamic>)['ok'], isTrue);
+    expect(relay.subscribers.length, 1);
+
+    // 广播站同样可订阅（collect 之外的站过去没有任何订阅入口）
+    final Map<String, dynamic> broadcast = await pluginRequest(
+      bus,
+      method: 'station/subscribe',
+      params: <String, dynamic>{'station': 'broadcast'},
+    );
+    expect((broadcast['result'] as Map<String, dynamic>)['ok'], isTrue);
+    expect(bus.stations.station('system.broadcast@$team@local'), isNotNull);
+
+    // 非可订阅站 / 未知站点类型 ⇒ 参数错误（显式，不静默）
+    final Map<String, dynamic> execute = await pluginRequest(
+      bus,
+      method: 'station/subscribe',
+      params: <String, dynamic>{'station': 'execute'},
+    );
+    expect((execute['error'] as Map<String, dynamic>)['code'], -32602);
+
+    // 退订：幂等
+    final Map<String, dynamic> removed = await pluginRequest(
+      bus,
+      method: 'station/unsubscribe',
+      params: <String, dynamic>{'station': 'relay'},
+    );
+    final Map<String, dynamic> unsub =
+        removed['result'] as Map<String, dynamic>;
+    expect(unsub['ok'], isTrue);
+    expect(unsub['removed'], 1);
+    expect(relay.subscribers, isEmpty);
+  });
+
+  test('未声明 team 的插件订阅站点 ⇒ 显式拒绝（站点隔离要求四元组）', () async {
+    final PluginBus bus = await startBus(noTeamPluginYaml());
+    final Map<String, dynamic> response = await pluginRequest(
+      bus,
+      pluginId: 'noteam',
+      method: 'station/subscribe',
+      params: <String, dynamic>{'station': 'relay'},
+    );
+    final Map<String, dynamic> error = response['error'] as Map<String, dynamic>;
+    expect(error['code'], -32001, reason: '${response['error']}');
+    expect(error['message'], contains('team'));
+  });
+
   test('插件发 station/command ⇒ 核心的响应原样回到插件，命令真的执行', () async {
     final PluginBus bus = await startBus(teamPluginYaml());
 

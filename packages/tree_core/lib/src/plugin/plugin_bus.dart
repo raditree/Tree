@@ -8,6 +8,7 @@ import 'plugin_host.dart';
 import 'plugin_tool_definition.dart';
 import 'station_instance.dart';
 import 'station_runtime.dart';
+import 'station_schema.dart';
 import 'station_scope.dart';
 import 'station_store.dart';
 import 'stations.dart';
@@ -1108,12 +1109,121 @@ class PluginBus {
     return failed.join('；');
   }
 
+  /// **工具调用的中转站触发点**（工具层唯一入口调用；`phase` = pre | post）。
+  ///
+  /// 「把完整 tool_call 交给插件，改什么甚至不改由插件内部决定」——因此 payload 是
+  /// **整条调用报文**（工具名 / 调用 id / 轮次 / 参数或结果），回填可以是对象
+  /// （整体替换报文）或字符串（只替换结果文本）。
+  ///
+  /// **fail-open 红线**：未接线 / 无订阅者 / 订阅者未回 / 回包非法 / 任何异常，
+  /// 一律返回原报文并给可读原因，绝不抛出、绝不阻塞工具执行。
+  ///
+  /// 返回 null = 与输入完全相同（**未改动**，调用方零开销走原路径）。
+  Future<Map<String, dynamic>?> relayToolCall({
+    required String phase,
+    required String tool,
+    required String callId,
+    required int round,
+    required String agentId,
+    required String sessionId,
+    Map<String, dynamic>? arguments,
+    String result = '',
+    bool isError = false,
+  }) async {
+    load();
+    if (!enabled) return null;
+    // 无运行期四元组（测试 / 嵌入式宿主未接线）⇒ 站点隔离证明不了归属，直接放行。
+    final StationScope scope = runtimeScopeFor(
+      agentId: agentId,
+      sessionId: sessionId,
+    );
+    if (!scope.isValid) return null;
+    final RelayStation? station = stations.relayFor(scope);
+    if (station == null) return null;
+    if (station.subscribers.isEmpty) return null; // 快路径：没人订阅，零等待
+    final Map<String, dynamic> payload = <String, dynamic>{
+      'phase': phase,
+      'tool': tool,
+      'call_id': callId,
+      'round': round,
+      'arguments': ?arguments,
+      if (phase == 'post') 'result': result,
+      if (phase == 'post') 'is_error': isError,
+    };
+    try {
+      final StationRelayResult relayed = await station.relay(
+        data: payload,
+        scope: scope,
+        meta: <String, dynamic>{'tool': tool, 'call_id': callId},
+      );
+      if (!relayed.handled) {
+        if (relayed.reason.isNotEmpty) {
+          log?.call('工具中转（$phase $tool）未处理：${relayed.reason}');
+        }
+        return null;
+      }
+      final Object? data = relayed.data;
+      if (data is Map) {
+        final Map<String, dynamic> next = data.map(
+          (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+        );
+        // 未改动（内容相等）⇒ 返回 null，走原路径（避免无谓的对象替换）
+        if (_sameMap(next, payload)) return null;
+        return next;
+      }
+      if (data is String) {
+        // 字符串回填 = 只替换结果文本（pre 阶段没有可替换的文本 ⇒ 视为未改动）
+        if (phase != 'post' || data == result) return null;
+        return <String, dynamic>{...payload, 'result': data};
+      }
+      log?.call(
+        '工具中转（$phase $tool）：回填类型 ${data.runtimeType} 无法并入报文，'
+        '按原样放行',
+      );
+      return null;
+    } catch (error) {
+      log?.call('工具中转（$phase $tool）异常（已放行原报文）：$error');
+      return null;
+    }
+  }
+
+  /// 浅比较两个报文（回填 = 整体替换，键集与值都相同才算"未改动"）。
+  static bool _sameMap(
+    Map<String, dynamic> a,
+    Map<String, dynamic> b,
+  ) {
+    if (a.length != b.length) return false;
+    for (final MapEntry<String, dynamic> e in a.entries) {
+      if (!b.containsKey(e.key)) return false;
+      if (!_sameValue(e.value, b[e.key])) return false;
+    }
+    return true;
+  }
+
+  static bool _sameValue(Object? a, Object? b) {
+    if (a is Map && b is Map) {
+      return _sameMap(
+        a.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
+        b.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
+      );
+    }
+    if (a is List && b is List) {
+      if (a.length != b.length) return false;
+      for (int i = 0; i < a.length; i++) {
+        if (!_sameValue(a[i], b[i])) return false;
+      }
+      return true;
+    }
+    return a == b;
+  }
+
   // ── 插件 → 核心的请求通道（M9 §3「插件主动下命令」） ────────────────────
 
   /// 插件主动发起的请求（JSON-RPC `method` + `id`）的总入口（宿主
   /// [PluginHost.onPluginRequest] 的接线实现）。
   ///
-  /// 当前实现执行站的 `station/command`；未知 method ⇒ `-32601`（不静默）。
+  /// 实现执行站的 `station/command`（插件主动下命令）与站点订阅
+  /// `station/subscribe` / `station/unsubscribe`；未知 method ⇒ `-32601`（不静默）。
   /// 失败一律抛 [PluginRequestException]，由宿主变成 `{jsonrpc, id, error}` 响应。
   Future<Map<String, dynamic>> _handlePluginRequest(
     PluginConfig config,
@@ -1123,12 +1233,226 @@ class PluginBus {
     switch (method) {
       case 'station/command':
         return _handleStationCommand(config, params);
+      case 'station/subscribe':
+        return _handleStationSubscribe(config, params);
+      case 'station/unsubscribe':
+        return _handleStationUnsubscribe(config, params);
       default:
         throw PluginRequestException(
           PluginRpcErrorCode.methodNotFound,
           'method not found: $method',
         );
     }
+  }
+
+  /// **站点订阅（插件 → 核心）**：参数 `{station, scope?, replace?}`。
+  ///
+  /// - `station`：`relay`（工具调用前/后拦截-回填）或 `broadcast`（发布-订阅读）；
+  ///   执行站不可订阅（站点实例本身会显式拒绝），收集站由核心按工具表刷新代订阅；
+  /// - `scope`：订阅粒度（`team_id/agent_id/session_id/mode_key`）。**它是作用域
+  ///   上限**：team 无法由插件自己认领——核心按目标 agent 的真实归属解析后校验，
+  ///   解析不出来或与声明冲突一律拒绝（与 `station/command` 同一 fail-closed 口径）；
+  /// - `replace`：中转站「站 × scope 键位唯一」，同键位第二人默认被拒（先到先得），
+  ///   显式 `replace: true` 才接管并回报被替换者。
+  ///
+  /// 回包是结果而非 JSON-RPC 错误：`{ok, station_id, kind, scope, replaced, error}`
+  /// ——订阅被业务规则拒绝（键位冲突 / 上限 / 粒度不符）时插件能读到可读原因。
+  Future<Map<String, dynamic>> _handleStationSubscribe(
+    PluginConfig config,
+    Map<String, dynamic> params,
+  ) async {
+    final String kindRaw = (params['station'] ?? '').toString().trim();
+    if (kindRaw.isEmpty) {
+      throw const PluginRequestException(
+        PluginRpcErrorCode.invalidParams,
+        'station/subscribe 需要 station（relay 或 broadcast）',
+      );
+    }
+    final StationKind? kind = StationKind.fromWire(kindRaw);
+    if (kind == null || !kind.subscribable) {
+      throw PluginRequestException(
+        PluginRpcErrorCode.invalidParams,
+        'station/subscribe 的 station 只支持 relay / broadcast，'
+        '收到「$kindRaw」（执行站由插件主动下命令，不可订阅）',
+      );
+    }
+    final StationScope scope = _resolveSubscriptionScope(config, params);
+    final StationInstance? station = switch (kind) {
+      StationKind.relay => stations.relayFor(scope),
+      StationKind.broadcast => stations.broadcastFor(scope),
+      _ => null,
+    };
+    if (station == null) {
+      throw PluginRequestException(
+        PluginRpcErrorCode.scopeDenied,
+        '插件 ${config.id} 的 scope（${scope.describe()}）没有可用的'
+        '${kind.label}：请检查 team_id / mode_key',
+      );
+    }
+    final StationSubResult result = stations.subscribe(
+      station.id,
+      StationSubscriber(
+        pluginId: config.id,
+        scope: scope,
+        subscribedAt: _nowSeconds(),
+      ),
+      // 站点 → 插件的回包通道与收集站同一条（`station/request`），不发明新协议。
+      //
+      // **回包函数延迟解析宿主**（不在订阅时固定 host 实例）：插件可以在
+      // `hello` 握手期间就发订阅请求（此时 `_hosts` 还没登记），若在此刻取
+      // `_hosts[config.id]` 会把「启动即订阅」的插件误判成"实例不在运行"。
+      (StationRequest request) async {
+        final PluginHost? host = _hosts[config.id];
+        if (host == null || host.isClosed) {
+          return StationReply.failed('插件 ${config.id} 未运行，无法处理站点请求');
+        }
+        return host.requestStation(request);
+      },
+      replace: params['replace'] == true,
+    );
+    if (!result.ok) {
+      log?.call(
+        '插件 ${config.id} 订阅 ${kind.label} 被拒（${station.id}）：${result.error}',
+      );
+    } else {
+      log?.call(
+        '插件 ${config.id} 订阅 ${kind.label}（${station.id}，'
+        'scope=${scope.key}${result.replacedPluginId.isEmpty ? '' : '，接管自 ${result.replacedPluginId}'}）',
+      );
+    }
+    return <String, dynamic>{
+      'ok': result.ok,
+      'station_id': station.id,
+      'kind': kind.wire,
+      'scope': scope.toJson(),
+      'replaced': result.replacedPluginId,
+      'error': result.error,
+    };
+  }
+
+  /// **站点退订（插件 → 核心）**：参数 `{station}`；幂等（未订阅也返回 ok）。
+  Future<Map<String, dynamic>> _handleStationUnsubscribe(
+    PluginConfig config,
+    Map<String, dynamic> params,
+  ) async {
+    final String kindRaw = (params['station'] ?? '').toString().trim();
+    final StationKind? kind = StationKind.fromWire(kindRaw);
+    if (kind == null || !kind.subscribable) {
+      throw PluginRequestException(
+        PluginRpcErrorCode.invalidParams,
+        'station/unsubscribe 的 station 只支持 relay / broadcast，收到「$kindRaw」',
+      );
+    }
+    final StationScope scope = _resolveSubscriptionScope(config, params);
+    final StationInstance? station = switch (kind) {
+      StationKind.relay => stations.relayFor(scope),
+      StationKind.broadcast => stations.broadcastFor(scope),
+      _ => null,
+    };
+    if (station == null) {
+      return <String, dynamic>{
+        'ok': false,
+        'station_id': '',
+        'kind': kind.wire,
+        'removed': 0,
+        'error': '插件 ${config.id} 的 scope（${scope.describe()}）没有可用的${kind.label}',
+      };
+    }
+    final int removed = stations.unsubscribe(station.id, config.id);
+    return <String, dynamic>{
+      'ok': true,
+      'station_id': station.id,
+      'kind': kind.wire,
+      'removed': removed,
+      'error': '',
+    };
+  }
+
+  /// 解析一次订阅的**运行期四元组**（与 `station/command` 同口径，fail-closed）。
+  ///
+  /// 与命令的区别：订阅是**长期**行为，因此必须有可证明的归属——
+  /// - 有 agent ⇒ 按该 agent 的真实 team / mode 解析；
+  /// - 无 agent（团队级订阅）⇒ team 取自请求或声明，且声明非空时必须一致；
+  /// - mode 缺省按声明 / local 兜底（站点只在 local / ssh 两档上存在）。
+  StationScope _resolveSubscriptionScope(
+    PluginConfig config,
+    Map<String, dynamic> params,
+  ) {
+    final StationScope declared = StationScope.parse(config.scope);
+    final Object? rawScope = params['scope'];
+    final StationScope requested = rawScope is Map
+        ? StationScope.parse(
+            rawScope.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
+          )
+        : declared;
+    // 声明与请求都是作用域上限：请求不得放大到声明之外。
+    if (declared.teamId.trim().isNotEmpty &&
+        requested.teamId.trim().isNotEmpty &&
+        declared.teamId.trim() != requested.teamId.trim()) {
+      throw PluginRequestException(
+        PluginRpcErrorCode.scopeDenied,
+        '插件 ${config.id} 声明 team=${declared.teamId}，'
+        '但订阅请求 team=${requested.teamId}：跨 team 拒绝（声明是作用域上限）',
+      );
+    }
+    final String agentId = requested.agentId.trim().isNotEmpty
+        ? requested.agentId.trim()
+        : declared.agentId.trim();
+    final String sessionId = requested.sessionId.trim().isNotEmpty
+        ? requested.sessionId.trim()
+        : declared.sessionId.trim();
+    String teamId = requested.teamId.trim().isNotEmpty
+        ? requested.teamId.trim()
+        : declared.teamId.trim();
+    String modeKey = StationModeKey.isValid(requested.modeKey)
+        ? requested.modeKey
+        : (StationModeKey.isValid(declared.modeKey)
+              ? declared.modeKey
+              : StationModeKey.local);
+    if (agentId.isNotEmpty) {
+      // 有目标 agent：team / mode 一律按**真实归属**解析，不信任请求里的自述。
+      final StationScopeContext? context = callSiteContext?.call(
+        agentId,
+        sessionId,
+      );
+      final String resolvedTeam = (context?.teamId ?? '').trim();
+      if (resolvedTeam.isNotEmpty) {
+        if (teamId.isNotEmpty && teamId != resolvedTeam) {
+          throw PluginRequestException(
+            PluginRpcErrorCode.scopeDenied,
+            '插件 ${config.id} 订阅 team=$teamId，但 agent $agentId '
+            '真实归属 team=$resolvedTeam：跨 team 拒绝',
+          );
+        }
+        teamId = resolvedTeam;
+      }
+      final String resolvedMode = (agentModeKeyResolver?.call(agentId) ?? '')
+          .trim();
+      if (StationModeKey.isValid(resolvedMode)) {
+        if (StationModeKey.isValid(requested.modeKey) &&
+            requested.modeKey != resolvedMode) {
+          throw PluginRequestException(
+            PluginRpcErrorCode.scopeDenied,
+            '插件 ${config.id} 订阅 mode=${requested.modeKey}，但 agent $agentId '
+            '真实模式=$resolvedMode：跨模式拒绝',
+          );
+        }
+        modeKey = resolvedMode;
+      }
+    }
+    if (teamId.isEmpty) {
+      throw PluginRequestException(
+        PluginRpcErrorCode.scopeDenied,
+        '插件 ${config.id} 订阅站点缺少 team：请在请求里带 scope.team_id，'
+        '或在 plugins.yaml 声明 scope.team_id（站点隔离要求四元组，fail-closed）',
+      );
+    }
+    return StationScope(
+      teamId: teamId,
+      agentId: agentId,
+      sessionId: sessionId,
+      modeKey: modeKey,
+    );
   }
 
   /// **执行站命令（插件 → 核心）**：参数 {command, arguments, team_id?, agent_id?, session_id?, mode_key?}。

@@ -344,6 +344,40 @@ void main() {
     expect(invalid.data, '原数据');
     expect(invalid.reason, contains('非法'));
 
+    // 结构化回填（对象 / 数组）**整体替换**：工具调用报文本身就是 Map，
+    // 只支持 string 会让「改写工具参数」无路可走（本次扩展的用途）。
+    h.subscribe(
+      relay.id,
+      StationSubscriber(pluginId: 'p2', scope: scope),
+      (StationRequest request) async => StationReply.ok(<String, dynamic>{
+        'phase': 'post',
+        'result': '被插件改写',
+      }),
+      replace: true,
+    );
+    final StationRelayResult structured = await relay.relay(
+      data: <String, dynamic>{'phase': 'pre', 'result': '原结果'},
+      scope: scope,
+    );
+    expect(structured.handled, isTrue);
+    expect(structured.data, <String, dynamic>{
+      'phase': 'post',
+      'result': '被插件改写',
+    });
+
+    h.subscribe(
+      relay.id,
+      StationSubscriber(pluginId: 'p2', scope: scope),
+      (StationRequest request) async => StationReply.ok(<Object?>['a', 'b']),
+      replace: true,
+    );
+    final StationRelayResult array = await relay.relay(
+      data: <Object?>['原'],
+      scope: scope,
+    );
+    expect(array.handled, isTrue);
+    expect(array.data, <Object?>['a', 'b']);
+
     final StationHub other = hub(path: p.join(temp.path, 'other.yaml'));
     final RelayStation empty = other.relayFor(scope)!;
     final StationRelayResult noSubscriber = await empty.relay(

@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
@@ -140,31 +141,49 @@ class WorkspaceToolRunner implements ToolRunner {
     ToolInvocation invocation, {
     bool Function()? isCancelled,
   }) async {
+    // **工具调用前**：把整条调用报文交给中转站（插件可改参数，也可什么都不改）。
+    // 未接线 / 无订阅者 / 任何异常 ⇒ 原样返回 null，走与原实现完全一致的路径。
+    final ({ToolInvocation invocation, int round}) before = await _relayBefore(
+      invocation,
+    );
+    final ToolInvocation effective = before.invocation;
     // MCP 工具（含命名空间工具）不经 BuiltinTools 的 switch：它们的名字是
     // 动态的，且同样不依赖工作空间。
     final McpService? mcp = mcpService;
-    if (mcp != null && McpTool.handles(invocation.name)) {
-      return _truncate(await McpTool.run(invocation, mcp));
+    if (mcp != null && McpTool.handles(effective.name)) {
+      return _relayAfter(
+        effective,
+        _truncate(await McpTool.run(effective, mcp)),
+        round: before.round,
+      );
     }
     final PluginBus? plugins = pluginBus;
-    if (plugins != null && PluginTool.handles(invocation.name)) {
-      return _truncate(await PluginTool.run(invocation, plugins));
+    if (plugins != null && PluginTool.handles(effective.name)) {
+      return _relayAfter(
+        effective,
+        _truncate(await PluginTool.run(effective, plugins)),
+        round: before.round,
+      );
     }
     // 不依赖工作空间的工具（set_todo_list / ask_user_question）先走：工作空间
     // 不可用（SSH 配置不全等）不该连带它们一起失败。
     WorkspaceIO? io;
-    if (BuiltinTools.needsWorkspace(invocation.name)) {
-      io = await _ioFor(invocation.agentId);
+    if (BuiltinTools.needsWorkspace(effective.name)) {
+      io = await _ioFor(effective.agentId);
       if (io == null) {
-        return ToolOutcome(
-          '无法准备工作空间：${invocation.agentId} 的工作目录不可用，'
-          '或 SSH 配置不完整/尚未接入（详见核心日志）',
-          isError: true,
+        return _relayAfter(
+          effective,
+          ToolOutcome(
+            '无法准备工作空间：${effective.agentId} 的工作目录不可用，'
+            '或 SSH 配置不完整/尚未接入（详见核心日志）',
+            isError: true,
+          ),
+          round: before.round,
         );
       }
     }
     final ToolOutcome outcome = await BuiltinTools.run(
-      invocation,
+      effective,
       io,
       isCancelled: isCancelled,
       todos: todoStore,
@@ -179,7 +198,117 @@ class WorkspaceToolRunner implements ToolRunner {
       withMessage: messageDispatcher != null,
       withSpec: specService != null,
     );
-    return _truncate(outcome);
+    return _relayAfter(effective, _truncate(outcome), round: before.round);
+  }
+
+  /// **工具调用前**的中转：插件回填的报文里 `arguments` 即生效参数。
+  ///
+  /// 只有「回填报文里的 arguments 与进来时不同」才替换——插件回填整个报文但没动
+  /// 参数时，调用方零改动。参数回填不是 Map 时忽略（工具参数必须是对象）。
+  ///
+  /// 返回的 `round` 是这次调用的序号（同一次 `run` 的 pre / post 同值）；
+  /// **按调用分配**（不是实例字段）——同名工具可能被多路并行调用，用共享字段会串号。
+  Future<({ToolInvocation invocation, int round})> _relayBefore(
+    ToolInvocation invocation,
+  ) async {
+    final int round = ++_relaySeq;
+    final PluginBus? plugins = pluginBus;
+    if (plugins == null) return (invocation: invocation, round: round);
+    final Map<String, dynamic>? relayed = await plugins.relayToolCall(
+      phase: 'pre',
+      tool: invocation.name,
+      callId: invocation.id,
+      round: round,
+      agentId: invocation.agentId,
+      sessionId: invocation.sessionId,
+      arguments: invocation.arguments,
+    );
+    if (relayed == null) return (invocation: invocation, round: round);
+    final Object? rawArguments = relayed['arguments'];
+    if (rawArguments is! Map) return (invocation: invocation, round: round);
+    final Map<String, dynamic> next = rawArguments.map(
+      (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+    );
+    if (_sameArguments(next, invocation.arguments)) {
+      return (invocation: invocation, round: round);
+    }
+    log?.call(
+      '工具 ${invocation.name} 的参数被中转站改写（${invocation.arguments.keys.length} → ${next.keys.length} 个键）',
+    );
+    return (
+      invocation: ToolInvocation(
+        id: invocation.id,
+        name: invocation.name,
+        arguments: next,
+        // 原始文本已过时（参数被改写），置空避免回灌给模型的是旧 JSON。
+        rawArguments: '',
+        agentId: invocation.agentId,
+        sessionId: invocation.sessionId,
+      ),
+      round: round,
+    );
+  }
+
+  /// **工具调用后**的中转：插件回填的报文里 `result` 即生效结果。
+  Future<ToolOutcome> _relayAfter(
+    ToolInvocation invocation,
+    ToolOutcome outcome, {
+    required int round,
+  }) async {
+    final PluginBus? plugins = pluginBus;
+    if (plugins == null) return outcome;
+    final Map<String, dynamic>? relayed = await plugins.relayToolCall(
+      phase: 'post',
+      tool: invocation.name,
+      callId: invocation.id,
+      round: round,
+      agentId: invocation.agentId,
+      sessionId: invocation.sessionId,
+      arguments: invocation.arguments,
+      result: outcome.content,
+      isError: outcome.isError,
+    );
+    if (relayed == null) return outcome;
+    final Object? rawResult = relayed['result'];
+    final String content = rawResult is String
+        ? rawResult
+        : (rawResult == null ? outcome.content : jsonEncode(rawResult));
+    if (content == outcome.content) return outcome;
+    return ToolOutcome(content, isError: relayed['is_error'] == true);
+  }
+
+  /// 本进程内的工具调用序号（同一次 `run` 的 pre / post 同值）。
+  ///
+  /// 工具层本身不认识"第几轮"（那是 LLM 会话的概念），这里只保证一对调用可配对；
+  /// 真正的轮次口径见 ConversationService 的 `round`（agent.tool_call 事件）。
+  int _relaySeq = 0;
+
+  static bool _sameArguments(
+    Map<String, dynamic> a,
+    Map<String, dynamic> b,
+  ) {
+    if (a.length != b.length) return false;
+    for (final MapEntry<String, dynamic> e in a.entries) {
+      if (!b.containsKey(e.key)) return false;
+      final Object? other = b[e.key];
+      if (e.value is Map && other is Map) {
+        if (!_sameArguments(
+          (e.value as Map).map(
+            (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+          ),
+          other.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
+        )) {
+          return false;
+        }
+        continue;
+      }
+      if (e.value is List && other is List) {
+        if (jsonEncode(e.value) != jsonEncode(other)) return false;
+        continue;
+      }
+      if (e.value != other) return false;
+    }
+    return true;
   }
 
   @override

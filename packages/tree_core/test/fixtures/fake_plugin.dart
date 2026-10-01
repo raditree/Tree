@@ -22,6 +22,12 @@ import 'dart:io';
 ///   （故意与核心在途请求撞号，验证"带 method 的 int id"仍判为请求而非回包）。
 /// - --scope-probe：额外申报 scope_probe 工具，回显整条 tools/call 报文
 ///   （验证「核心 → 插件」是否带调用点身份）。
+/// - --relay-subscribe：进程起来后**主动订阅中转站**（`station/subscribe`），
+///   并在 `station/request` 里对工具调用的 pre / post 两个阶段分别改写：
+///   `pre` ⇒ 把 arguments 里的 `text` 改成 `--relay-rewrite` 指定的值；
+///   `post` ⇒ 在结果文本前加 `[改写]` 前缀。用于验证「工具调用前后各一次中转」。
+/// - --relay-rewrite VALUE：上面 pre 阶段写进去的值。
+/// - --relay-station relay|broadcast：订阅哪类站（默认 relay）。
 void main(List<String> args) {
   String eventsFile = '';
   String pingGateFile = '';
@@ -33,9 +39,16 @@ void main(List<String> args) {
   // 只在使用方显式要求时申报 scope_probe：默认工具清单保持 echo + slow，
   // 既有用例对工具条数的断言不受影响。
   final bool scopeProbe = args.contains('--scope-probe');
+  final bool relaySubscribe = args.contains('--relay-subscribe');
+  String relayRewrite = 'REWRITTEN';
+  String relayKey = 'content';
+  String relayStation = 'relay';
   for (int i = 0; i < args.length - 1; i++) {
     if (args[i] == '--events-file') eventsFile = args[i + 1];
     if (args[i] == '--ignore-ping-until') pingGateFile = args[i + 1];
+    if (args[i] == '--relay-rewrite') relayRewrite = args[i + 1];
+    if (args[i] == '--relay-key') relayKey = args[i + 1];
+    if (args[i] == '--relay-station') relayStation = args[i + 1];
   }
 
   /// 插件**主动**发起的请求：id → 等待核心响应的 completer。
@@ -77,6 +90,44 @@ void main(List<String> args) {
     if (ignorePing) return false;
     if (pingGateFile.isEmpty) return true;
     return File(pingGateFile).existsSync();
+  }
+
+  /// 起进程后主动订阅中转站（`station/subscribe`），把结果写成一行 log 通知，
+  /// 测试可从核心日志 / 站点快照观察订阅是否成立。
+  Future<void> subscribeRelay() async {
+    try {
+      final Map<String, dynamic> response = await requestCore(
+        'station/subscribe',
+        <String, dynamic>{'station': relayStation, 'replace': true},
+      );
+      final Object? result = response['result'];
+      stdout.writeln(
+        jsonEncode(<String, dynamic>{
+          'jsonrpc': '2.0',
+          'method': 'log',
+          'params': <String, dynamic>{
+            'level': 'info',
+            'message': 'relay-subscribe: ${jsonEncode(result ?? response)}',
+          },
+        }),
+      );
+    } catch (error) {
+      stdout.writeln(
+        jsonEncode(<String, dynamic>{
+          'jsonrpc': '2.0',
+          'method': 'log',
+          'params': <String, dynamic>{
+            'level': 'error',
+            'message': 'relay-subscribe 失败：$error',
+          },
+        }),
+      );
+    }
+  }
+
+  if (relaySubscribe) {
+    // hello 握手后核心已能处理请求；用 microtask 让读循环先跑起来。
+    scheduleMicrotask(subscribeRelay);
   }
 
   stdin.transform(utf8.decoder).transform(const LineSplitter()).listen((
@@ -186,6 +237,40 @@ void main(List<String> args) {
           ],
         });
       case 'station/request':
+        // 中转站订阅者：只处理**中转**请求（payload 里带 phase）；
+        // 收集站的采集请求（payload 里是 schema/采集信息）走下面的申报分支。
+        final Object? rawPayload = params['payload'];
+        final Map<String, dynamic> payloadMap = rawPayload is Map
+            ? rawPayload.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
+            : <String, dynamic>{};
+        if (relaySubscribe && payloadMap.containsKey('phase')) {
+          final String phase = (payloadMap['phase'] ?? '').toString();
+          Map<String, dynamic>? rewritten;
+          if (phase == 'pre') {
+            final Object? rawArgs = payloadMap['arguments'];
+            final Map<String, dynamic> args = rawArgs is Map
+                ? rawArgs.map(
+                    (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+                  )
+                : <String, dynamic>{};
+            // 只改 `--relay-key` 指定的那个参数（默认 content）：工具层不认识
+            // 改写逻辑，插件改什么就是什么——这正是"改不改由插件决定"的演示。
+            final Map<String, dynamic> next = <String, dynamic>{
+              ...args,
+              relayKey: relayRewrite,
+            };
+            rewritten = <String, dynamic>{...payloadMap, 'arguments': next};
+          } else if (phase == 'post') {
+            rewritten = <String, dynamic>{
+              ...payloadMap,
+              'result': '[改写]${payloadMap['result']}',
+            };
+          }
+          reply(<String, dynamic>{
+            'reply': <String, dynamic>{'payload': rewritten},
+          });
+          return;
+        }
         if (!stationTools) {
           stdout.writeln(
             jsonEncode(<String, dynamic>{
