@@ -9,6 +9,7 @@
 | **广播 / 事件订阅**：收 `agent.tool_call`，按 (agent_id, session_id) 计数，**超过阈值就发停止信号** | 事件通知 + 执行站 `agent.stop` | `_on_event` / `_do_stop` |
 | **执行站**：插件**主动**下命令（`fs.read` 读工作空间小文件） | `station/command`（插件 → 核心） | `fs_read` / `_do_startup` |
 | **中转站**：订阅后**每次工具调用的前/后各来一次**——核心把完整 tool_call 报文交过来，插件决定改什么（甚至不改） | `station/subscribe` + `station/request`（kind=relay） | `subscribe_station` / `_handle_station_request` 的 relay 分支 |
+| **自建站点**（`--self-station`）：插件自己建一个广播站并订阅它。站点全局唯一、**每个点位只有一个订阅者**，所以要按 team / agent 分流时，正解是插件自己建站分发（转发型订阅者） | `station/register` → `station/subscribe`（按 `station_id`） | `register_own_station` / `subscribe_station` |
 | **插件布局 A**：声明左侧活动栏面板 + 右栏 Tab（声明式控件集，**不跑 JS**） | `ui/manifest` / `ui/update` 通知 → `plugin_ui_manifest` / `plugin_ui_update` 帧 | `declare_panel` / `update_panel` / `_on_ui_action` |
 | **插件布局 B**：推一个 card 槽位帧到前端，显示当前计数与阈值 | `ui.push` → `plugin_ui_update` | `push_card` / `card_view` |
 

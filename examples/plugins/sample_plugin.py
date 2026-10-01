@@ -121,6 +121,10 @@ class Options(object):
         self.relay = True
         # 声明左侧活动栏 / 右栏面板槽位（ui/manifest）
         self.panel = True
+        # 自建站点演示（station/register + 按 station_id 订阅）：
+        # 站点全局唯一、每个点位只有一个订阅者，插件要按 team / agent 分开处理时，
+        # 正解是"自己建站再分发"——这个开关把那条路走一遍。
+        self.self_station = False
 
 
 def _env(name):
@@ -147,6 +151,9 @@ def _print_help():
         "  --stop-cascade       agent.stop 级联停整棵团队树（默认只停该 agent）\n"
         "                       （%s=1）\n"
         "  --no-relay           不订阅中转站（默认订阅：工具调用前/后各一次）\n"
+        "  --self-station       自建一个广播站并订阅它（演示插件自建站点：\n"
+        "                       站点全局唯一 + 每个点位只有一个订阅者，\n"
+        "                       需按 team 分流时由插件自己建站分发）\n"
         "  --no-panel           不声明插件面板槽位（默认声明 activity + panel）\n"
         "  --no-fs-demo         不做启动 fs.read 自检\n"
         "  -h, --help           本帮助（打到 stderr）\n"
@@ -207,6 +214,10 @@ def parse_options(argv):
             continue
         if token == "--no-panel":
             options.panel = False
+            index += 1
+            continue
+        if token == "--self-station":
+            options.self_station = True
             index += 1
             continue
         if token == "--stop-cascade":
@@ -339,30 +350,64 @@ class SamplePlugin(object):
         result = response.get("result")
         return result if isinstance(result, dict) else {"ok": False, "error": "空结果"}
 
-    def subscribe_station(self, station, replace=False):
-        """**订阅站点**（本轮新增的协议方法）：`station/subscribe`。
+    def subscribe_station(self, station, replace=False, station_id=""):
+        """**订阅站点**（协议方法）：`station/subscribe`。
 
-        中转站（relay）用于「工具调用前/后各一次」——核心把**完整 tool_call**
-        报文交过来，插件改什么、甚至不改，都由插件内部决定；广播站（broadcast）
-        则是"发布-订阅读"。订阅被业务规则拒绝（键位被占 / 超上限 / 缺 team）时
-        返回里带可读 `error`，不会变成一句"调用失败"。
+        两种寻址方式（二选一）：
+        - `station`：按**类型**订内置站——`relay`（工具调用前/后各一次，核心把完整
+          tool_call 报文交过来，插件改什么、甚至不改，都由插件内部决定）或
+          `broadcast`（发布-订阅读）；
+        - `station_id`：按**实例 id** 订某个具体站点（自建站的消费入口）。
+
+        订阅被业务规则拒绝（已被占 / 超上限 / 缺 team / 不是自己的自建站）时返回里带
+        可读 `error`，不会变成一句"调用失败"。
         """
-        response = self.request_core("station/subscribe", {
-            "station": station,
-            "replace": replace,
-        })
+        params = {"station_id": station_id} if station_id else {"station": station}
+        params["replace"] = replace
+        label = station_id or station
+        response = self.request_core("station/subscribe", params)
         if response.get("timeout") or isinstance(response.get("error"), dict):
             error = response.get("error") or {}
-            self.log("订阅 %s 站点失败：%s" % (station, error.get("message") or "超时"),
+            self.log("订阅 %s 站点失败：%s" % (label, error.get("message") or "超时"),
                      notify=True)
             return {}
         result = response.get("result") or {}
         if result.get("ok"):
             self.log("已订阅 %s 站点：station_id=%s scope=%s"
-                     % (station, result.get("station_id"), result.get("scope")))
+                     % (label, result.get("station_id"), result.get("scope")))
         else:
-            self.log("订阅 %s 站点被拒：%s" % (station, result.get("error")), notify=True)
+            self.log("订阅 %s 站点被拒：%s" % (label, result.get("error")), notify=True)
         return result
+
+    def register_own_station(self, kind="broadcast", name="team_fanout"):
+        """**自建站点并订阅**（协议方法）：`station/register` → `station/subscribe`。
+
+        为什么需要它（用户定稿语义）：站点全局唯一、**每个点位只有一个订阅者**。
+        插件要按 team / agent 分开处理时，不能"每个 team 订一份"，而应由一个
+        转发型订阅者接管内置站，再**自己建站**做分发——建站必须经核心，否则下游
+        没有回包通道与等待链。
+
+        要点：**id 由核心拼**（`plugin.<插件id>.<类型>.<name>`），插件不能自选 id；
+        所以这里只给 `kind` + `name`，并用返回的 `station_id` 去订阅。
+        """
+        response = self.request_core("station/register", {
+            "kind": kind,
+            "name": name,
+            "description": "示例插件自建站：按 team 再分发",
+        })
+        if response.get("timeout") or isinstance(response.get("error"), dict):
+            error = response.get("error") or {}
+            self.log("自建站点失败：%s" % (error.get("message") or "超时"), notify=True)
+            return ""
+        result = response.get("result") or {}
+        if not result.get("ok"):
+            self.log("自建站点被拒：%s" % result.get("error"), notify=True)
+            return ""
+        station_id = result.get("station_id") or ""
+        self.log("已自建站点：%s（id 由核心按插件身份拼装）" % station_id)
+        # 建完就订阅自己（转发型订阅者的第一步）；别的插件订不到别人的站
+        self.subscribe_station("", station_id=station_id)
+        return station_id
 
     # ── 工具定义（收集站申报 + tools/list 共用一份，避免两处写歪） ─────────
 
@@ -594,6 +639,10 @@ class SamplePlugin(object):
         # 发过来（station/request，kind=relay），本插件决定改什么 / 不改。
         if self.options.relay:
             self.subscribe_station("relay", replace=True)
+        # **自建站点**：站点全局唯一、每个点位只有一个订阅者；插件要按 team / agent
+        # 分开处理时，正解是自己建站再分发（这里是那条路的最小演示）。
+        if self.options.self_station:
+            self.register_own_station()
         # **声明插件面板**：ui/manifest → 核心转成 plugin_ui_manifest 帧 →
         # 前端把它挂到左侧活动栏（activity 槽位）与右栏 Tab（panel 槽位）。
         if self.options.panel:
