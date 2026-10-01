@@ -237,10 +237,27 @@ Future<void> main(List<String> args) async {
     };
   }
 
+  // 图像附件上传（`if_vision`）：把工作空间里的图片上传到**该模型配置的**端点
+  // 拿 file_id，再在请求里引用（见 llm/vision_files.dart）。
+  //
+  // 两个容易搞错的点：
+  // - 读字节只经 tools.ioFor(agentId)：SSH 成员的图片在**远端**，本机没有这个
+  //   文件（拼本机路径必然读不到）；这也是与文件面板、工具层**同一份** IO；
+  // - 上传从**本机核心**发出（用模型配置的 base_url / api_key），因此远端机器
+  //   有没有外网都不影响。
+  final WorkspaceVisionFileResolver visionFiles = WorkspaceVisionFileResolver(
+    ioFor: tools.ioFor,
+    cache: VisionFileCache(file: paths.visionFilesFile),
+    log: (String message) => stderr.writeln('[core:vision] $message'),
+  );
+
   final LlmAgentEngine engine = LlmAgentEngine(
     resolveModel: settings.model,
     toolRunner: tools,
     agentOverrides: agentOverrides,
+    // 图像视觉链路：只有模型配了 `if_vision` 才会用上（引擎内判），关着时请求体
+    // 与从前逐字一致。
+    visionResolver: visionFiles,
     // 每次工具结果前告诉模型当下的 todo 与已选 Spec。不接这个，用户在 UI 里
     // 勾选的 Spec 与 set_todo_list 的进度对模型来说就是装饰。
     sessionStatusText: (String agentId, String sessionId) => sessionStatusText(

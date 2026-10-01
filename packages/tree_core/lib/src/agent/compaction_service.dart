@@ -381,10 +381,14 @@ class CompactionService {
       return '[工具 $name] 参数 ${_clip(args, 200)} '
           '结果 ${_clip(message.toolResult, 300)}';
     }
-    final String role = message.role == 'user' ? '用户' : '助手';
+    // hook/系统提示（`kind == 'notice'`）在引擎里按 **user** 消息发出，摘要口径必须
+    // 一致：否则"摘要说是助手说的"和"请求里是用户说的"两处对不上，模型读摘要时会误判
+    // 谁提了这件事。
+    final bool asUser = message.role == 'user' || message.isNotice;
+    final String role = asUser ? '用户' : '助手';
     // 附件路径要进摘要：压掉之后模型仍得知道"用户当时发过哪些文件"，
     // 否则长会话里附件信息随摘要一起消失。
-    final List<String> paths = message.role == 'user'
+    final List<String> paths = asUser
         ? attachmentPaths(message.attachments)
         : const <String>[];
     final String suffix = paths.isEmpty ? '' : '（附件：${paths.join('、')}）';

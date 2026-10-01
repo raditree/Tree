@@ -10,6 +10,7 @@ import '../tool/workspace_tool_runner.dart';
 import 'llm_session.dart';
 import 'llm_transport.dart';
 import 'llm_types.dart';
+import 'vision_files.dart';
 
 /// 按 model_id 解析模型配置（由调用方提供：设置/模型池）。
 typedef ModelResolver = CoreModelConfig? Function(String modelId);
@@ -52,6 +53,7 @@ class LlmAgentEngine implements AgentEngine {
     this.agentOverrides,
     this.sessionStatusText,
     this.resultRedirectWriter,
+    this.visionResolver,
     this.log,
   });
 
@@ -63,6 +65,12 @@ class LlmAgentEngine implements AgentEngine {
 
   /// 传输层工厂；为空时用 [HttpSseTransport] 并按 (base_url, api_key) 缓存。
   final TransportFactory? transportFactory;
+
+  /// 图像附件的 `file_id` 解析器（`if_vision` 的**唯一**实现入口）。
+  ///
+  /// 为空时永不外发图片字节：即便模型配了 `if_vision=true`，请求里也只有附件的
+  /// 路径文本（安全默认——没接线就不上传）。生产接线见 `tree_core_cli`。
+  final VisionFileResolver? visionResolver;
 
   /// 成员级模型参数覆盖（M5b）：按 agentId 取覆盖并叠加到解析出的模型配置上。
   ///
@@ -127,6 +135,10 @@ class LlmAgentEngine implements AgentEngine {
     final List<LlmMessage> messages = await _buildMessages(
       context,
       gate,
+      config: config,
+      // 视觉链路只在模型配了 `if_vision` 时启用；关着的时候连"要不要上传"都不
+      // 判断，请求体与改动前**逐字一致**（见 llm_types.dart 的 LlmMessage.toWire）
+      vision: config.ifVision ? visionResolver : null,
       passBackReasoning: config.thinking,
     );
     final LlmSession session = LlmSession(
@@ -150,6 +162,8 @@ class LlmAgentEngine implements AgentEngine {
       compactContext: ({required bool force}) => _rebuiltContext(
         context,
         gate,
+        config: config,
+        vision: config.ifVision ? visionResolver : null,
         force: force,
         // 重建上下文必须与首轮同口径：否则压一次之后思考就"消失"了
         passBackReasoning: config.thinking,
@@ -179,6 +193,8 @@ class LlmAgentEngine implements AgentEngine {
       await transport.close();
     }
     _transports.clear();
+    // 视觉上传器持有自己的连接池，同样要关（幂等）
+    await visionResolver?.close();
   }
 
   LlmTransport _transportFor(CoreModelConfig config) {
@@ -201,6 +217,8 @@ class LlmAgentEngine implements AgentEngine {
     AgentRunContext context,
     ToolResultGate gate, {
     required bool force,
+    required CoreModelConfig config,
+    VisionFileResolver? vision,
     bool passBackReasoning = false,
   }) async {
     final ToolTurnCompactor? compact = toolTurnCompactor;
@@ -214,6 +232,8 @@ class LlmAgentEngine implements AgentEngine {
     return _buildMessages(
       refreshed,
       gate,
+      config: config,
+      vision: vision,
       passBackReasoning: passBackReasoning,
     );
   }
@@ -274,6 +294,8 @@ class LlmAgentEngine implements AgentEngine {
   Future<List<LlmMessage>> _buildMessages(
     AgentRunContext context,
     ToolResultGate gate, {
+    required CoreModelConfig config,
+    VisionFileResolver? vision,
     bool passBackReasoning = false,
   }) async {
     final List<LlmMessage> out = <LlmMessage>[];
@@ -366,17 +388,79 @@ class LlmAgentEngine implements AgentEngine {
       // 空内容跳过：**只有附件、没有正文**的消息不能算空——它带着附件路径，
       // 整条丢掉等于用户什么都没发（修复前的行为）。
       if (content.trim().isEmpty) continue;
+      // 图像附件的**像素**：`if_vision` 打开时先在端点上传拿到 file_id，再把
+      // 引用作为内容块挂在同一条 user 消息上（模型才真的"看得见"图）。解析失败
+      // 只是少一个块——正文里的路径说明段还在，模型仍知道去哪读。
+      final List<LlmContentPart> parts = ref.isUser
+          ? await _visionParts(vision, config, context.agentId, ref.attachments)
+          : const <LlmContentPart>[];
       final String reasoning = passBackReasoning
           ? pendingReasoning.join('\n\n')
           : '';
       pendingReasoning.clear();
+      // hook/系统提示（`kind == 'notice'`）按 **user** 发出，而不是 assistant：
+      // 它既不是模型说的话，也不该装成模型说的话；而且实测（recon.md）表明带 tools
+      // 的思考模式端点不允许请求**以"没有 reasoning_content 的 assistant 消息"收尾**，
+      // 而这类提示恰恰总是被追加到历史末尾（`wake`）——之前正是它导致连续 400。
+      final bool asUser = ref.isUser || ref.isNotice;
       out.add(
-        ref.isUser
-            ? LlmMessage.user(content)
+        asUser
+            ? LlmMessage(
+                role: LlmRole.user,
+                content: content,
+                contentParts: parts,
+              )
             : LlmMessage.assistant(content, reasoningContent: reasoning),
       );
     }
     await flushTools();
+    _warnIfTrailingAssistant(out);
     return out;
+  }
+
+  /// 组好的请求若**以没有 reasoning_content 的 assistant 消息收尾**，留一条日志。
+  ///
+  /// 为什么不直接改请求：这是"不该发生"的形态（正常情况下最后一条要么是用户消息，
+  /// 要么是带 reasoning 的 assistant 消息）。真发生了说明有别的路径往历史末尾塞了
+  /// assistant 消息——记下来比悄悄修掉更有助于定位（实测证据见 recon.md：
+  /// 带 tools 的思考模式端点对这种形态直接 400）。
+  void _warnIfTrailingAssistant(List<LlmMessage> messages) {
+    if (messages.length < 2) return;
+    final LlmMessage last = messages.last;
+    if (last.role != LlmRole.assistant) return;
+    if (last.reasoningContent.isNotEmpty) return;
+    log?.call(
+      '请求以没有 reasoning_content 的 assistant 消息收尾：'
+      '带 tools 的思考模式端点（如 DeepSeek）会返回 400。'
+      '请检查是否有"非用户消息被追加到历史末尾"的路径。',
+    );
+  }
+
+  /// 把该条用户消息里的**图像附件**逐个解析成端点的 file 内容块。
+  ///
+  /// [vision] 为空（`if_vision` 关闭或未接线）时**直接返回空**：这条链路对
+  /// "没开视觉的模型"完全无感，连字节都不读。非图片附件（pdf/txt…）同样跳过：
+  /// DeepSeek 的 file 内容块口径就是图像。
+  Future<List<LlmContentPart>> _visionParts(
+    VisionFileResolver? vision,
+    CoreModelConfig config,
+    String agentId,
+    List<Map<String, dynamic>>? attachments,
+  ) async {
+    if (vision == null || attachments == null || attachments.isEmpty) {
+      return const <LlmContentPart>[];
+    }
+    final List<LlmContentPart> parts = <LlmContentPart>[];
+    for (final Map<String, dynamic> attachment in attachments) {
+      if (!isVisionImageAttachment(attachment)) continue;
+      final String? fileId = await vision.resolve(
+        config: config,
+        agentId: agentId,
+        attachment: attachment,
+      );
+      if (fileId == null || fileId.isEmpty) continue;
+      parts.add(LlmContentPart.file(fileId));
+    }
+    return parts;
   }
 }

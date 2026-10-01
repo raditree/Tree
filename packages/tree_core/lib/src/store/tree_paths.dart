@@ -85,6 +85,14 @@ class TreePaths {
   /// 插件配置（可直接手改的 yaml）。
   String get pluginsConfigFile => p.join(configDir, 'plugins.yaml');
 
+  /// 图像附件的 `file_id` 缓存（`if_vision` 用）。
+  ///
+  /// 为什么放在配置目录而不是工作空间：它是**模型服务侧**的状态（同一张图在
+  /// 同一端点只传一次），跟"图片存在哪个工作空间"无关；键里已经带了工作空间
+  /// 身份（见 `llm/vision_files.dart` 的 `visionCacheKey`），所以不同 agent、
+  /// 不同 SSH 主机不会互相串味。删掉它只意味着下次重新上传。
+  String get visionFilesFile => p.join(configDir, 'vision_files.json');
+
   /// 全部提问的原子快照（跨会话，右侧「问题回复」页用）。
   ///
   /// 为什么不像消息那样按会话拆文件：提问是**跨会话**查询的队列（`GET /api/questions`），

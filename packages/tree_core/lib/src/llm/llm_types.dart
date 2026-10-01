@@ -52,6 +52,38 @@ class LlmToolCall {
   };
 }
 
+/// 一条消息里的**内容块**（OpenAI 兼容 `content` 数组的元素）。
+///
+/// 为什么需要它：图像这类二进制内容塞不进 `content: String`。本仓库采用
+/// DeepSeek 的口径——**先把文件上传到端点拿到 `file_id`，再在请求里引用**
+/// （见 `vision_files.dart`）：base64 内联会把编码后的图片直接放进请求体，
+/// 受 48 MiB 请求体 / 32 MiB 单图限制；Files API 单文件可到 64 MiB。
+///
+/// 目前只用到两型：`text`（正文）与 `file`（端点文件引用）。
+class LlmContentPart {
+  /// 正文块。
+  const LlmContentPart.text(this.text) : type = 'text', fileId = '';
+
+  /// 端点文件引用块（`file_id` 来自 Files API 上传响应）。
+  const LlmContentPart.file(this.fileId) : type = 'file', text = '';
+
+  /// 线协议类型：`text` / `file`。
+  final String type;
+
+  /// 正文（[type] == `text` 时有值）。
+  final String text;
+
+  /// 端点文件 id（[type] == `file` 时有值）。
+  final String fileId;
+
+  Map<String, dynamic> toWire() => type == 'file'
+      ? <String, dynamic>{
+          'type': 'file',
+          'file': <String, dynamic>{'file_id': fileId},
+        }
+      : <String, dynamic>{'type': 'text', 'text': text};
+}
+
 /// 一条对话消息。
 class LlmMessage {
   const LlmMessage({
@@ -61,6 +93,7 @@ class LlmMessage {
     this.toolCallId,
     this.name,
     this.reasoningContent = '',
+    this.contentParts = const <LlmContentPart>[],
   });
 
   /// 便捷构造。
@@ -69,7 +102,8 @@ class LlmMessage {
       toolCalls = const <LlmToolCall>[],
       toolCallId = null,
       name = null,
-      reasoningContent = '';
+      reasoningContent = '',
+      contentParts = const <LlmContentPart>[];
 
   /// 便捷构造。
   const LlmMessage.user(this.content)
@@ -77,14 +111,16 @@ class LlmMessage {
       toolCalls = const <LlmToolCall>[],
       toolCallId = null,
       name = null,
-      reasoningContent = '';
+      reasoningContent = '',
+      contentParts = const <LlmContentPart>[];
 
   /// 便捷构造（[reasoningContent] 只在"回传思考"开启时才有值，见 [toWire]）。
   const LlmMessage.assistant(this.content, {this.reasoningContent = ''})
     : role = LlmRole.assistant,
       toolCalls = const <LlmToolCall>[],
       toolCallId = null,
-      name = null;
+      name = null,
+      contentParts = const <LlmContentPart>[];
 
   /// 便捷构造（工具执行结果）。
   const LlmMessage.toolResult({
@@ -93,13 +129,25 @@ class LlmMessage {
   }) : role = LlmRole.tool,
        toolCalls = const <LlmToolCall>[],
        name = null,
-       reasoningContent = '';
+       reasoningContent = '',
+       contentParts = const <LlmContentPart>[];
 
   final LlmRole role;
   final String content;
   final List<LlmToolCall> toolCalls;
   final String? toolCallId;
   final String? name;
+
+  /// 正文之外的**内容块**（当前只有"已上传到端点的文件引用"）。
+  ///
+  /// 非空时 [toWire] 把 `content` 输出成**数组**（`[{type:text},{type:file}...]`），
+  /// 这是 OpenAI 兼容端点表达多模态内容的方式；空（默认）时仍是字符串，与改动前
+  /// 逐字一致。**只对 user / system 生效**（两者共用同一条线形态）：assistant 与
+  /// tool 恒为字符串——assistant 回灌的是历史正文，tool 回灌的是工具结果文本。
+  ///
+  /// 这些块**不计入** [charCount] / [estimatedTokens]：图片占多少 token 没有官方
+  /// 口径（DeepSeek 未公布），凭空加一个常数只会让"本地估算"与真实 usage 打架。
+  final List<LlmContentPart> contentParts;
 
   /// 思考（推理）正文：DeepSeek 的 `reasoning_content`，与 `content` **同级**
   /// 放在 assistant 消息上。
@@ -137,7 +185,18 @@ class LlmMessage {
         return out;
       case LlmRole.system:
       case LlmRole.user:
-        out['content'] = content;
+        // 有内容块时 `content` 变成数组（多模态表达）；没有时保持字符串——
+        // 这是"不开启视觉时请求体与改动前逐字一致"的关键。
+        // 首块固定是正文（若有），其后按附件顺序排列，端点是按顺序解释的。
+        out['content'] = contentParts.isEmpty
+            ? content
+            : <Map<String, dynamic>>[
+                if (content.isNotEmpty)
+                  <String, dynamic>{'type': 'text', 'text': content},
+                ...contentParts.map(
+                  (LlmContentPart part) => part.toWire(),
+                ),
+              ];
         if (name != null) out['name'] = name;
         return out;
     }

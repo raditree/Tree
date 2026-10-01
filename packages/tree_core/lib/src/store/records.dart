@@ -404,6 +404,13 @@ class CoreMessage {
   /// 只有模型开了"回传思考"（`thinking`）时才作为 `reasoning_content` 回传。
   bool get isThinking => kind == 'thinking';
 
+  /// 是否为"系统/hook 提示"（`kind == 'notice'`）。
+  ///
+  /// 这类消息**落库为 agent 角色**（UI 照旧渲染成 agent 气泡），但引擎翻译历史时
+  /// 按 **user** 消息处理：它既不是模型说的、也不是用户说的，而是"新的输入"。
+  /// 详见 `ConversationService.wake` 与 `.self/plan/20261001-thinking-400-and-interrupt/`。
+  bool get isNotice => kind == 'notice';
+
   Map<String, dynamic> toJson() => <String, dynamic>{
     'id': id,
     'agent_id': agentId,

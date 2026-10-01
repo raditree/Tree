@@ -15,6 +15,9 @@ const Map<String, String> nonProtocolTypeLiterals = <String, String>{
   // OpenAI 协议内部类型（请求/响应体，经 HTTP 而非 WS）
   'function': 'OpenAI tool definition 的 type',
   'image_url': 'OpenAI vision content 的 type',
+  // 图像走 Files API：chat 请求里 user 消息的 content 数组块
+  //（`{"type":"file","file":{"file_id":...}}`，见 tree_core 的 LlmContentPart）
+  'file': 'OpenAI/DeepSeek file 引用内容块的 type',
   // 业务枚举值（出现在 payload 的 "type" 键上，不是帧类型）
   'normal': '成员类型枚举（normal/...）',
   'leader': '团队角色枚举',

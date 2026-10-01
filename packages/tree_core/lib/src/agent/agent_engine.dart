@@ -136,6 +136,9 @@ class CoreMessageRef {
 
   bool get isThinking => kind == 'thinking';
 
+  /// 是否是"系统/hook 提示"（`kind == 'notice'`）：翻译时按 **user** 消息发出。
+  bool get isNotice => kind == 'notice';
+
   bool get isUser => role == 'user';
 }
 

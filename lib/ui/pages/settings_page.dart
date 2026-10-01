@@ -1388,6 +1388,12 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
                   '支持图像输入（if_vision）',
                   style: TextStyle(fontSize: 13),
                 ),
+                subtitle: const Text(
+                  '开启后：对话里的图片会先上传到该模型的 Files API，'
+                  '再以 file_id 引用发送（需端点支持 file 内容块，如 DeepSeek）；'
+                  '关闭时模型只会拿到图片在工作空间里的路径。',
+                  style: TextStyle(fontSize: 11),
+                ),
               ),
             ],
           ),

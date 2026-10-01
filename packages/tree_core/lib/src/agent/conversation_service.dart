@@ -19,6 +19,13 @@ import 'workspace_prompt.dart';
 /// 一次生成任务的取消令牌。
 class _RunToken {
   bool cancelled = false;
+
+  /// 是否因"**收到新消息**"而被打断（与用户按 `stop` 区分）。
+  ///
+  /// 为什么要区分：用户按 stop 时应当看到"已停止本轮生成。"这条可见提示；
+  /// 而"我发新消息 → 旧那轮自动让位"是打断/插话（interjection）语义，
+  /// 再刷一条"已停止"只会造成噪声（用户根本没按停止）。
+  bool interrupted = false;
 }
 
 /// 本轮正在生成的一条消息（与前端消息一一对应：先立 start，再追加 chunk）。
@@ -137,6 +144,9 @@ class ConversationService {
   /// 因 `stop` 被丢弃的排队任务数（自检/测试用）。
   int droppedQueuedCount = 0;
 
+  /// 因"收到新消息"而被打断的在途轮次数（测试与排障用，见 [_interruptForNewMessage]）。
+  int interruptedRunCount = 0;
+
   /// 已提示过的"压缩失败 / 模型没配 max_seqlen"（同一件事只打扰用户一次）。
   final Set<String> _notified = <String>{};
 
@@ -172,6 +182,9 @@ class ConversationService {
         attachments: _attachments(frame['attachments']),
       ),
     );
+    // 新消息到达 = 插话：把在途那一轮立刻打断（工具循环就此收敛），
+    // 让这条新消息的下一轮紧接着跑起来（顺序与代次见 [_interruptForNewMessage]）。
+    _interruptForNewMessage(agent.id);
     return _enqueue(agent.id, () => _runReply(agent, session, content));
   }
 
@@ -233,6 +246,8 @@ class ConversationService {
         timestamp: DateTime.now().millisecondsSinceEpoch,
       ),
     );
+    // 团队消息也是"有人对它说话"：同样打断在途那一轮（见 [_interruptForNewMessage]）
+    _interruptForNewMessage(agent.id);
     return _enqueue(agent.id, () => _runReply(agent, session, text));
   }
 
@@ -281,8 +296,34 @@ class ConversationService {
     final CoreAgent? agent = store.agent(agentId);
     final CoreSession? session = store.session(agentId, sessionId);
     if (agent == null || session == null) return Future<void>.value();
-    _sendNotice(agent, session, notice);
+    // 按 `kind='notice'` 落库（UI 仍渲染成 agent 消息），但**引擎翻译时按 user 处理**：
+    // 实测（见 `.self/plan/20261001-thinking-400-and-interrupt/recon.md`）表明，
+    // 带 tools 的思考模式端点（DeepSeek）不允许请求以"没有 reasoning_content 的
+    // assistant 消息"收尾，而 hook 提示恰恰是追加到历史末尾的那条 —— 之前正是它
+    // 让唤醒轮次连续 400。按 user 翻译同时也纠正了"模型以为那句是自己说的"。
+    _sendNotice(agent, session, notice, kind: 'notice');
+    _interruptForNewMessage(agentId);
     return _enqueue(agentId, () => _runReply(agent, session, notice));
+  }
+
+  /// 新消息到达时的"插话"：打断该 agent 在途的那一轮生成。
+  ///
+  /// 语义：
+  /// - **不 bump epoch**（`stop` 才 bump）：打断的目的恰恰是"让刚入队的新消息
+  ///   赶紧跑起来"，把代次往前推会让新任务被当旧任务丢掉；
+  /// - 顺带作废在途提问（`ask_user_question`）：等答案的工具会立刻拿到取消结果，
+  ///   工具循环才能收敛——否则用户发了新消息，agent 还卡在等一个没人回答的问题上；
+  /// - 打断**只在"流式生成中"与"两次工具之间"生效**：正在执行的工具跑完才收敛
+  ///   （`WorkspaceIO.exec` 没有取消参数，且 M9 规定本地执行活着就永不超时、
+  ///   不按时间杀进程）；
+  /// - 有在途任务时计数 [interruptedRunCount]，便于测试与排障。
+  void _interruptForNewMessage(String agentId) {
+    final _RunToken? token = _running[agentId];
+    if (token == null) return;
+    questions?.cancelForAgent(agentId);
+    token.interrupted = true;
+    token.cancelled = true; // 复用既有取消通道：流式循环每帧检查，工具之间也检查
+    interruptedRunCount++;
   }
 
   /// 中止全部在途生成（服务器关闭时）。
@@ -630,7 +671,11 @@ class ConversationService {
       _sendNotice(agent, session, failure);
     }
     if (cancelled) {
-      _sendNotice(agent, session, '已停止本轮生成。');
+      // 用户按 stop → 给一条可见提示；被"新消息"打断（interjection）则**不提示**：
+      // 用户刚发的话就是它的上下文，再刷"已停止本轮生成。"纯属噪声。
+      if (!token.interrupted) {
+        _sendNotice(agent, session, '已停止本轮生成。');
+      }
     }
     hub.broadcast(<String, dynamic>{
       'type': WsOutboundType.agentStatus,
@@ -679,14 +724,23 @@ class ConversationService {
   ///
   /// 现状 server 的 `_send_text_as_agent` 走的就是这条路径：错误提示、停止提示
   /// 等"系统发言"必须出现在会话里，用户才看得到。
-  void _sendNotice(CoreAgent agent, CoreSession session, String content) {
+  ///
+  /// [kind] 默认 `text`（错误/停止提示都用它）；**hook 唤醒提示用 `notice`**：
+  /// UI 渲染不变（前端按 kind 分派，未知 kind 落到普通文本气泡），但引擎翻译历史时
+  /// 会把它当 **user** 消息——原因见 [wake] 的注释与 recon 实测。
+  void _sendNotice(
+    CoreAgent agent,
+    CoreSession session,
+    String content, {
+    String kind = 'text',
+  }) {
     final String id = CoreIds.message();
     hub.broadcast(<String, dynamic>{
       'type': WsOutboundType.message,
       'id': id,
       'role': 'agent',
       'content': content,
-      'kind': 'text',
+      'kind': kind,
       'agent_id': agent.id,
       'session_id': session.sessionId,
     });
@@ -697,6 +751,7 @@ class ConversationService {
         sessionId: session.sessionId,
         role: 'agent',
         content: content,
+        kind: kind,
         timestamp: DateTime.now().millisecondsSinceEpoch,
       ),
     );

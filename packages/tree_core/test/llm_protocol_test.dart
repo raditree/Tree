@@ -123,6 +123,62 @@ void main() {
       expect(body.containsKey('temperature'), isFalse);
     });
 
+    test('内容块（图像 file_id 引用）：content 输出成数组，正文块在前', () {
+      final Map<String, dynamic> body = OpenAiCodec.requestBody(
+        LlmRequest(
+          model: 'deepseek-flash',
+          messages: <LlmMessage>[
+            LlmMessage(
+              role: LlmRole.user,
+              content: '这张图片里有什么？',
+              contentParts: const <LlmContentPart>[
+                LlmContentPart.file('file-api-xxxx'),
+              ],
+            ),
+            // 没有内容块的消息必须仍是**字符串**（非视觉路径逐字不变）
+            LlmMessage.user('普通消息'),
+          ],
+        ),
+        stream: true,
+      );
+      final List<dynamic> messages = body['messages'] as List<dynamic>;
+      expect(
+        (messages[0] as Map<String, dynamic>)['content'],
+        <Map<String, dynamic>>[
+          <String, dynamic>{'type': 'text', 'text': '这张图片里有什么？'},
+          <String, dynamic>{
+            'type': 'file',
+            'file': <String, dynamic>{'file_id': 'file-api-xxxx'},
+          },
+        ],
+      );
+      expect((messages[1] as Map<String, dynamic>)['content'], '普通消息');
+    });
+
+    test('内容块：正文为空时不塞空文本块；文本块构造同形', () {
+      const LlmMessage onlyFile = LlmMessage(
+        role: LlmRole.user,
+        content: '',
+        contentParts: <LlmContentPart>[LlmContentPart.file('f1')],
+      );
+      expect(onlyFile.toWire()['content'], <Map<String, dynamic>>[
+        <String, dynamic>{
+          'type': 'file',
+          'file': <String, dynamic>{'file_id': 'f1'},
+        },
+      ]);
+      // system 与 user 共用同一条线形态（正文块在前）
+      const LlmMessage withText = LlmMessage(
+        role: LlmRole.system,
+        content: '你是助手',
+        contentParts: <LlmContentPart>[LlmContentPart.text('附加')],
+      );
+      expect(withText.toWire()['content'], <Map<String, dynamic>>[
+        <String, dynamic>{'type': 'text', 'text': '你是助手'},
+        <String, dynamic>{'type': 'text', 'text': '附加'},
+      ]);
+    });
+
     test('assistant 工具调用轮与 tool 结果的消息形态', () {
       final LlmMessage assistant = LlmMessage(
         role: LlmRole.assistant,
