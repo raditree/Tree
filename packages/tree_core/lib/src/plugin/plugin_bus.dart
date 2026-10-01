@@ -961,8 +961,14 @@ class PluginBus {
       final PluginHost? host = _hosts[config.id];
       if (host == null || host.isClosed) continue;
       final StationScope pluginScope = _scopeOf(config, context);
-      // 无 team 归属 ⇒ 不进站点体系（走既有 tools/list 申报路径，行为不变）
-      if (!pluginScope.isValid) continue;
+      // mode 填错（不是 local/ssh）⇒ 该插件不参与站点收集（可读原因进 skipped）
+      if (!pluginScope.isValidSubscriber) {
+        skipped.add(
+          '插件 ${config.id} 的 scope.mode_key=${pluginScope.modeKey} 非法'
+          '（只能是 local | ssh，或留空）',
+        );
+        continue;
+      }
       // 跨 scope 只记原因、不再拦（全局收集站要能看到所有 team 的订阅者）
       final String? crossScope = _crossScopeReason(
         config.id,
@@ -982,21 +988,42 @@ class PluginBus {
         (StationRequest request) =>
             _respondToToolDefinition(config, host, request),
       );
-      // 采集的**消息 scope**：优先调用方指定（决定这一趟投给谁），
-      // 其次调用点运行期四元组，最后退回该订阅者自己的声明 scope。
+      // 采集的**消息 scope**：优先调用方指定（决定这一趟投给谁），其次插件声明，
+      // 再次调用点运行期四元组。**消息侧必须能证明 team**（fail-closed）——
+      // 通配订阅（team 为空）因此必须借调用点的 team，借不到就这一趟不收集
+      // （该插件的工具已由 tools/list 旧路径注册，不是静默丢功能）。
       final StationScope? explicit = scope;
       final StationScope messageScope;
       if (explicit != null) {
         messageScope = explicit;
-      } else if (context.teamId.trim().isEmpty) {
+      } else if (pluginScope.teamId.trim().isNotEmpty) {
         messageScope = pluginScope;
-      } else {
+      } else if (context.teamId.trim().isNotEmpty) {
+        // 消息的 mode 必须有合法值（站点消息自校验）：插件没声明时按调用点 / 本地兜底
+        final String mode = StationModeKey.isValid(pluginScope.modeKey)
+            ? pluginScope.modeKey
+            : (StationModeKey.isValid(context.modeKey)
+                  ? context.modeKey
+                  : StationModeKey.local);
         messageScope = StationScope(
-          teamId: pluginScope.teamId,
+          teamId: context.teamId.trim(),
           agentId: context.agentId.trim(),
           sessionId: context.sessionId.trim(),
-          modeKey: pluginScope.modeKey,
+          modeKey: mode,
         );
+      } else {
+        skipped.add(
+          '插件 ${config.id} 是通配订阅（无 team），这一趟收集没有调用点团队上下文：'
+          '跳过站点采集（工具仍走 tools/list 路径）',
+        );
+        continue;
+      }
+      if (!messageScope.isValid) {
+        skipped.add(
+          '插件 ${config.id} 这一趟收集的消息 scope 不完整'
+          '（${messageScope.describe()}）：跳过站点采集（消息必须能证明归属）',
+        );
+        continue;
       }
       if (!messageScopes.any(
         (StationScope s) => s.exactEquals(messageScope),
@@ -1783,11 +1810,11 @@ class PluginBus {
     String teamId = requested.teamId.trim().isNotEmpty
         ? requested.teamId.trim()
         : declared.teamId.trim();
+    // mode：请求 / 声明里有合法值就用它；**都没有则留空 = 两种工作面都收**
+    // （不再兜底成 local：那会把 SSH 团队的订阅悄悄锁在本地模式上，永远收不到）
     String modeKey = StationModeKey.isValid(requested.modeKey)
         ? requested.modeKey
-        : (StationModeKey.isValid(declared.modeKey)
-              ? declared.modeKey
-              : StationModeKey.local);
+        : (StationModeKey.isValid(declared.modeKey) ? declared.modeKey : '');
     if (agentId.isNotEmpty) {
       // 有目标 agent：team / mode 一律按**真实归属**解析，不信任请求里的自述。
       final StationScopeContext? context = callSiteContext?.call(
@@ -1808,6 +1835,8 @@ class PluginBus {
       final String resolvedMode = (agentModeKeyResolver?.call(agentId) ?? '')
           .trim();
       if (StationModeKey.isValid(resolvedMode)) {
+        // 请求里**显式**声明了模式才做冲突校验（声明是上限）；没声明时按真实模式收窄，
+        // 免得一份 map 订阅把 local / ssh 两个工作面混在一起。
         if (StationModeKey.isValid(requested.modeKey) &&
             requested.modeKey != resolvedMode) {
           throw PluginRequestException(
@@ -1816,16 +1845,13 @@ class PluginBus {
             '真实模式=$resolvedMode：跨模式拒绝',
           );
         }
-        modeKey = resolvedMode;
+        modeKey = StationModeKey.isValid(requested.modeKey)
+            ? requested.modeKey
+            : resolvedMode;
       }
     }
-    if (teamId.isEmpty) {
-      throw PluginRequestException(
-        PluginRpcErrorCode.scopeDenied,
-        '插件 ${config.id} 订阅站点缺少 team：请在请求里带 scope.team_id，'
-        '或在 plugins.yaml 声明 scope.team_id（站点隔离要求四元组，fail-closed）',
-      );
-    }
+    // team 为空 = **通配所有 team**（用户定稿：为空默认作用于所有 team），
+    // 不再 fail-closed 拒绝——订阅侧的空维度一律是"这一维不设条件"。
     return StationScope(
       teamId: teamId,
       agentId: agentId,
@@ -1938,19 +1964,18 @@ class PluginBus {
     final String requestedSession = pick('session_id');
     final String requestedAgent = pick('agent_id');
 
-    // ── 团队级命令（无目标 agent，如 ui.push）：team 必须能确定 ──────────
+    // ── 团队级命令（无目标 agent，如 ui.push）：team 可以留空 = 通配所有 team ──
+    //
+    // 用户定稿：**为空默认作用于所有 team**。所以这里不再 fail-closed 拒绝；
+    // 真正需要"证明归属"的是**执行类命令**（fs.* / terminal.exec / agent.*）——
+    // 它们在自己的挂载位置里按目标 agent 解析工作空间，解析不出来就拒绝执行
+    // （见 execute_mounts 的 _resolveTarget），闸门放在该放的地方。
     if (requestedAgent.isEmpty && declared.agentId.isEmpty) {
       final String team = requestedTeam.isNotEmpty
           ? requestedTeam
           : declared.teamId.trim();
-      if (team.isEmpty) {
-        throw PluginRequestException(
-          PluginRpcErrorCode.scopeDenied,
-          '插件 ${config.id} 的命令既没有 agent_id 也没有可用 team：'
-          '无法确定作用域（团队级命令请带 team_id，或在 plugins.yaml 声明 scope.team_id）',
-        );
-      }
-      if (declared.teamId.trim().isNotEmpty && declared.teamId.trim() != team) {
+      if (declared.teamId.trim().isNotEmpty && team.isNotEmpty &&
+          declared.teamId.trim() != team) {
         throw PluginRequestException(
           PluginRpcErrorCode.scopeDenied,
           '插件 ${config.id} 声明 team=${declared.teamId}，'
@@ -1962,9 +1987,13 @@ class PluginBus {
         sessionId: requestedSession.isNotEmpty
             ? requestedSession
             : declared.sessionId,
+        // 命令是**消息**：站点侧自校验要求 mode 合法（空 = 不可证明 ⇒ 拒），
+        // 所以这里保留 local 兜底（订阅侧才允许留空 = 两种工作面都收）。
         modeKey: StationModeKey.isValid(requestedMode)
             ? requestedMode
-            : declared.modeKey,
+            : (StationModeKey.isValid(declared.modeKey)
+                  ? declared.modeKey
+                  : StationModeKey.local),
       );
     }
 
@@ -1984,11 +2013,17 @@ class PluginBus {
         : declared.teamId.trim();
     final String resolvedMode = (agentModeKeyResolver?.call(agentId) ?? '')
         .trim();
+    // 命令的 mode 必须**有合法值**（它决定打本地还是 SSH 工作空间，见
+    // execute_mounts 的 _resolveTarget），所以这里保留 local 兜底——与订阅侧
+    // 「留空 = 通配」不同：命令要真的落到某个工作面上，猜不出来就是 local + 之后
+    // 与目标 agent 的真实模式做精确比对（对不上会被拒绝执行，fail-closed）。
     final String mode = StationModeKey.isValid(resolvedMode)
         ? resolvedMode
         : (StationModeKey.isValid(requestedMode)
               ? requestedMode
-              : declared.modeKey);
+              : (StationModeKey.isValid(declared.modeKey)
+                    ? declared.modeKey
+                    : StationModeKey.local));
 
     if (declared.teamId.trim().isNotEmpty &&
         declared.teamId.trim() != resolvedTeam) {
@@ -2076,13 +2111,18 @@ class PluginBus {
   static String _toolTableKey(StationScope? scope) => scope?.key ?? '';
 
   /// 调用点上下文与插件声明不一致 ⇒ **不收集**并给出可读原因（fail-closed）。
+  ///
+  /// 订阅侧的空维度是**通配**（空 team = 所有 team），所以只在插件**声明了**该维度
+  /// 且与调用点不一致时才算冲突。
   static String? _crossScopeReason(
     String pluginId,
     StationScope pluginScope,
     StationScopeContext context,
   ) {
     final String team = context.teamId.trim();
-    if (team.isNotEmpty && pluginScope.teamId != team) {
+    if (team.isNotEmpty &&
+        pluginScope.teamId.trim().isNotEmpty &&
+        pluginScope.teamId != team) {
       return '插件 $pluginId 归属 team=${pluginScope.teamId}，与调用点 team=$team 不一致（跨 team 不收集）';
     }
     final String agent = context.agentId.trim();
@@ -2165,8 +2205,10 @@ class PluginBus {
     final RuntimeStationScopeResolver? resolver = stationScopeResolver;
     if (resolver != null) return resolver(config, context);
     final StationScope declared = StationScope.parse(config.scope);
-    if (!declared.isValid) return declared;
-    // mode_key：调用点 agent 的工作空间模式（解析不出来才退回上下文 / 声明）
+    // 声明里连 team 都没有 ⇒ 通配订阅（空维度不设条件），只有 mode 填错才算出错。
+    if (!declared.isValidSubscriber) return declared;
+    // mode_key：调用点 agent 的工作空间模式（解析不出来才退回上下文 / 声明，
+    // **都解析不出来就留空 = 两种工作面都收**，不再兜底成 local）
     final String callAgent = context.agentId.trim();
     final String fromAgent = callAgent.isEmpty
         ? ''

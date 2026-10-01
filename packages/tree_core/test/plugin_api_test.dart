@@ -138,17 +138,22 @@ void main() {
         as Map<String, dynamic>;
     expect(collectStation['station_id'], StationHubIds.collect);
     expect(collectStation['kind'], 'collect');
-    // 该插件声明里没有 scope（无 team 归属）⇒ 按既有口径走 tools/list 旧路径，
-    // **不进站点体系**（这是刻意的 fail-closed，不是本次收敛的改动）。
+    // 该插件声明里没有 scope ⇒ **通配订阅**（空 team = 作用于所有 team）：
+    // 空 scope 也是合法订阅声明，不再被 fail-closed 拒绝（用户定稿）。
     expect(
       collectStation['subscriber_count'],
-      0,
-      reason: '无 team 归属的插件不订阅站点',
+      1,
+      reason: '空 scope = 通配订阅：挂上收集站（工具仍走 tools/list 路径注册）',
     );
     expect(
       collectStation['subscribers_by_team'],
-      isEmpty,
-      reason: '没有订阅者 ⇒ 面板没有团队分组',
+      <String, dynamic>{
+        '': <String, dynamic>{
+          'count': 1,
+          'plugin_ids': <String>['sample'],
+        },
+      },
+      reason: '空 team 归到空串键（前端渲染成「全部 team（未限定）」= 作用于所有 team）',
     );
     final Map<String, dynamic> config =
         res.json['config'] as Map<String, dynamic>;

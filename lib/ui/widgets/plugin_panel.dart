@@ -1204,7 +1204,7 @@ class _PluginPanelState extends State<PluginPanel> {
     final String teamSummary = s.subscribersByTeam.entries
         .map(
           (MapEntry<String, int> e) =>
-              '${e.key.isEmpty ? '未标团队' : e.key}（${e.value}）',
+              '${e.key.isEmpty ? '全部 team（未限定）' : e.key}（${e.value}）',
         )
         .join('、');
     const List<String> countKeys = <String>[

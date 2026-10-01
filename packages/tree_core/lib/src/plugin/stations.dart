@@ -376,9 +376,11 @@ class StationHub {
     if (station == null) {
       return StationSubResult.rejected('站点不存在：$stationId', code: 'no_station');
     }
-    if (!subscriber.scope.isValid) {
+    // 订阅声明：**空维度 = 通配**（空 team 作用于所有 team、空 mode 两种工作面都收），
+    // 只有 mode 填了非法值才算错（拼错要报出来，不静默空转）。
+    if (!subscriber.scope.isValidSubscriber) {
       return StationSubResult.rejected(
-        '订阅者 scope 非法：team_id 必须非空、mode_key 只能是 local | ssh',
+        '订阅者 scope 非法：mode_key 只能是 local | ssh，或留空表示通配',
         code: 'invalid_scope',
       );
     }

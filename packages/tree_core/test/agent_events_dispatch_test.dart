@@ -278,4 +278,68 @@ void main() {
     expect(received[1]['phase'], 'end');
     expect(received[1]['round'], 1);
   });
+
+  test('顶层 agent（team_id 为空）：事件 team 回退到 agent.id，声明同 team 的插件收得到', () async {
+    final String eventsFile = p.join(temp.path, 'top.jsonl');
+    // 先起一个**通配**插件（此时还不知道 agent id），拿到 agent 之后再把 scope 改成
+    // 该 agent 的"自我团队 id"——这正是用户 plugins.yaml 的形态（顶层 agent 自成一队）。
+    final PluginBus bus = await startBus(
+      yaml:
+          'enabled: true\n'
+          'plugins:\n'
+          '${pluginEntry(id: 'sample', eventsFile: eventsFile)}',
+    );
+    final CoreServer server = await CoreServer.start(
+      streamChunkDelay: Duration.zero,
+      enableHeartbeat: false,
+      pluginBus: bus,
+      engine: _ToolEngine(<AgentEvent>[
+        AgentToolStart(
+          id: 'tool_a',
+          callId: 'call_a',
+          name: 'read',
+          arguments: const <String, dynamic>{'file_path': 'a.txt'},
+        ),
+        const AgentToolEnd(id: 'tool_a', name: 'read', result: 'A 的内容'),
+        const AgentDone(finishReason: 'stop'),
+      ]),
+    );
+    addTearDown(server.close);
+    server.conversation.agentEvents.sink = bus.dispatchAgentEvent;
+
+    // **刻意不设 teamId**：顶层 agent 的 team_id 本来就是空的（team = 它自己）
+    final String agentId = server.store.createAgent(name: '顶层用例').id;
+    expect(server.store.agent(agentId)!.teamId, isEmpty);
+
+    // 按真实 team 声明 scope（订阅站点的前提），并让总线按磁盘对账重启插件
+    File(p.join(temp.path, 'config', 'plugins.yaml')).writeAsStringSync(
+      'enabled: true\n'
+      'plugins:\n'
+      '${pluginEntry(id: 'sample', eventsFile: eventsFile, scopeLine: '    scope: {team_id: $agentId}')}',
+    );
+    await bus.applyConfigs();
+
+    final TestWs ws = await TestWs.connect(server);
+    addTearDown(ws.close);
+    ws.record();
+    ws.send(<String, dynamic>{
+      'type': WsInboundType.userMessage,
+      'agent_id': agentId,
+      'content': '跑一个工具',
+      'session_id': TreeStore.defaultSessionId,
+    });
+    await waitIdle(ws);
+
+    final List<Map<String, dynamic>> received = await waitEvents(eventsFile, 2);
+    expect(
+      received[0]['team_id'],
+      agentId,
+      reason:
+          '顶层 agent 自成一队：事件的 team 必须回退到 agent.id（与 TeamService.teamIdOf / '
+          '站点 keying 同口径）。带空 team 的话，"按真实 team 声明 scope 的插件"永远收不到'
+          '自己 agent 的事件——而声明 team 正是订阅站点的前提，两条要求会互相打架',
+    );
+    expect(received[0]['agent_id'], agentId);
+    expect(received[1]['team_id'], agentId);
+  });
 }

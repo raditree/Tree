@@ -48,7 +48,7 @@ plugins:
     enabled: true                 # 单个插件开关
     granularity: team             # 实例粒度：team / agent / session（订阅时声明的粒度）
     scope:                        # 作用域上限（四元组）：**空键 = 不限定该维度**
-      team_id: team-1             # ⚠ 想订阅站点就必须非空；本机没有 team 时留空（见下方「常见坑」）
+      team_id: team-1             # 作用域上限：空 = 作用于所有 team（就不必写这一行）
       mode_key: local             # local | ssh（**一般不用填**：运行期由核心按目标 agent 的工作面解析）
 ```
 
@@ -64,42 +64,58 @@ plugins:
 | `env` | 键值表 | 额外环境变量（与父进程环境合并），用于免改 args 调参 |
 | `enabled`（单插件） | true / false | 单个插件开关（关掉后不启动、工具下线） |
 | `granularity` | team / agent / session | **订阅时声明的粒度**（不再决定站点实例——站点全局各一个） |
-| `scope.team_id` | 字符串 | **作用域上限**。空 = 不限定团队（可服务多队；执行站命令按每条命令的 `agent_id` 解析真实归属，见第 6 节）。⚠ **但订阅站点必须非空**（见「常见坑」） |
+| `scope.team_id` | 字符串 | **作用域上限**。**空 = 作用于所有 team**（订阅与事件都收全部 team；执行站命令按每条命令的 `agent_id` 解析真实归属，见第 6 节）。想只服务一个 team 就填它 |
 | `scope.agent_id` | 字符串，可空 | 声明更细的粒度：只收该 agent 的事件 / 只在该 agent 的工作面下命令 |
 | `scope.session_id` | 字符串，可空 | 再细一层（一般留空） |
-| `scope.mode_key` | local / ssh，可空 | **只作校验**：请求与订阅的 mode 一律由核心按目标 agent 的工作空间解析（local / ssh），声明与真实值冲突时报错，留空即可 |
+| `scope.mode_key` | local / ssh，可空 | **空 = local 与 ssh 都收**（订阅侧）；填了就必须与真实值一致，冲突时报错。命令的 mode 一律由核心按目标 agent 的工作空间解析（声明只作上限校验），所以一般留空 |
 
 **scope 的匹配口径**（事件派发与站点投递一致，不发明新语法）：
 `scope` 里某个键**为空 = 不限定该维度**（不是"匹配空值"，而是"这一维不设条件"）；
 非空则要求事件的同名字段**精确相等**。所以 `team_id: team-1` 的插件只收 team-1
-的事件；`scope: {}` 的插件收全部事件。
+的事件；`scope: {}` 的插件收全部 team 的事件与消息（**作用于所有 team**）。
 
-**两个维度各自独立**（最常见的懵点）：
+**空字段的两套语义（最容易混的一点）**：
 
-| | 用在哪 | 空 `team_id` 时 |
-|---|---|---|
-| **事件派发 / 订阅**（`dispatch` / `dispatchAgentEvent`） | 插件收 `agent.tool_call` 这类事件 | 收全部 team 的事件（可用） |
-| **站点订阅**（`station/subscribe`：中转站 / 广播站） | 每次工具调用前后各一次拦截-回填等 | **被拒**：站点隔离要求四元组，fail-closed |
+| 方向 | 空 team / 空 mode 的含义 |
+|---|---|
+| **订阅声明**（`plugins.yaml` 的 scope、`station/subscribe` 的 scope） | **不设条件（通配）**：空 team = 所有 team，空 mode = local / ssh 都收 |
+| **消息信封**（中转 / 广播 / 收集的数据面） | **不可证明归属 ⇒ 拒绝投递**（fail-closed） |
+| **执行站命令**（`fs.*` / `terminal.exec` / `agent.*`） | 挂载位置仍 fail-closed：必须能解析出目标 agent 的 team 与工作面，否则拒绝执行 |
+| **前端推送**（`ui.push`） | 空 team 合法 = 推给**所有 team**（帧的 `team_id` 为空，前端在任何 team 下都呈现） |
 
-### ⚠ 常见坑：没有 team 的机器上，订阅站点会失败
+### ⚠ 历史坑（已修）：没有 team 的机器上，订阅站点会失败
 
-"我的 agent 没有 team"（`agents/<id>.yaml` 的 `team_id` 为空）时，核心解析出的真实
-team 是空的，而站点订阅**要求 team 非空**：
+旧版核心要求"订阅站点必须声明 team"，于是 `scope: {}`（= 界面开关内置插件写出的默认
+形态）会得到：
 
 ```
 插件 sample 订阅站点缺少 team：请在请求里带 scope.team_id，
 或在 plugins.yaml 声明 scope.team_id（站点隔离要求四元组，fail-closed）
 ```
 
-**怎么办**（两选一）：
+**现在的口径（用户定稿）**：**为空默认作用于所有 team**——空 scope 是合法订阅声明，
+落成一条四维全通配的订阅（`team_id` / `mode_key` 都为空），中转站 / 收集站 / 广播站
+一律订得上，计数卡片也推得出去。所以：
 
-1. 在 `plugins.yaml` 里声明 `scope: {team_id: <真实 team id>}`——注意它必须是**目标
-   agent 的真实归属**，核心会按 agent 解析后校验，声明一个不存在的 team 只会被拒；
-2. 先给 agent 定一个 team（`agents/<id>.yaml` 的 `team_id`），再把插件声明到同一个
-   team 上。
+- **不需要**为了订阅去声明 `scope.team_id`（想只服务某个 team 时才填）；
+- 顶层 agent（`agents/<id>.yaml` 的 `team_id` 为空，自成一队）也不用做任何特殊处理；
+- 反过来，**填了 `team_id` 就是作用域上限**：只收该 team 的事件与消息，跨 team 一律
+  拒绝（声明不得被放大）。
 
-也就是说：**事件订阅可以不声明 team，站点订阅不行**。示例插件默认**订阅中转站**，
-所以它的配置里必须有匹配的 `team_id`。
+**没声明 `scope.team_id` 时会发生什么**（= 界面开关内置插件后的默认形态）：
+**什么都不会被拒**——空 scope 是一条四维全通配的合法声明，启动时就能订上中转站、
+推得出卡片、参与收集站申报：
+
+| 能力 | 空 scope（`{}`）下的行为 |
+|---|---|
+| `station/subscribe`（中转站） | 订上（通配订阅：所有 team 的工具调用前后各一次） |
+| `ui.push`（计数卡片） | 推得出（帧的 `team_id` 为空 ⇒ 前端在**任何 team** 下都呈现） |
+| 收集站申报（`plugin.tool.define`） | 挂上收集站；有调用点团队上下文时按站点申报，否则工具走 `tools/list` 路径（两条路径产出同一张定义表） |
+| `agent.tool_call` 计数 | 一直正常（与 team 声明无关） |
+
+示例插件另有一层**防御性兜底**（对旧核心 / 被拒的订阅仍有效）：启动时订中转站失败就
+`_relay_lazy_pending`，等第一个事件给出 `agent_id` 后在 worker 线程按身份补订，`ui.push`
+也带上该身份。新核心里这条路径不会被触发——**空 scope 启动即成立**。
 
 **开关方式**（已经做好了，不必手改文件）：前端**插件面板**里每个插件（内置与自定义
 同一分组）各有自己的开关，改完立即热应用、失败时重启核心生效；面板同时显示实例状态
@@ -111,9 +127,10 @@ team 是空的，而站点订阅**要求 team 非空**：
 
 插件同时用**两条路径**申报工具，两边内容一致：
 
-- **收集站路径**（声明了 `scope.team_id` 时走这条）：核心按站点 schema 发
+- **收集站路径**（有调用点团队上下文时走这条）：核心按站点 schema 发
   `station/request`，插件回 `{reply: {payload: {tools: [...]}}}`；
-- **`tools/list` 路径**（没声明 team 的老插件走这条）：回 `{tools: [...]}`。
+- **`tools/list` 路径**（插件上线时的即时申报，任何 scope 都走一遍）：回
+  `{tools: [...]}`。
 
 申报的三个工具（模型看到的名字带 `plugin__sample__` 前缀）：
 
@@ -160,7 +177,7 @@ where.exe python
 | `--slot-key KEY` | `SAMPLE_PLUGIN_SLOT_KEY` | `sample.card.tool_rounds` | 前端卡片槽位键（全局唯一） |
 | `--card-interval SEC` | `SAMPLE_PLUGIN_CARD_INTERVAL` | `5` | 卡片周期刷新秒数（有事件时另按 1s 节流刷新） |
 | `--stop-cascade` | `SAMPLE_PLUGIN_STOP_CASCADE=1` | 关 | `agent.stop` 是否级联停整棵团队树（默认只停该 agent 的当前生成） |
-| `--no-relay` | — | **默认订阅** | 不订阅中转站。默认订阅后，**每次工具调用的前/后各来一次** `station/request`（kind=relay）；本插件 pre 阶段给参数加 `_relay_seen` 标记、post 阶段给结果追加一行统计（演示"改不改由插件决定"） |
+| `--no-relay` | — | **默认订阅** | 不订阅中转站。默认订阅后，**每次工具调用的前/后各来一次** `station/request`（kind=relay）；本插件 pre 阶段给参数加 `_relay_seen` 标记、post 阶段给结果追加一行统计（演示"改不改由插件决定"）。空 scope 下启动即订上（通配）；只有当核心**拒绝**这次订阅时（旧核心 / 被占用），才推迟到第一个事件之后按 `agent_id` 补订 |
 | `--no-panel` | — | **默认声明** | 不声明插件面板槽位。默认会发 `ui/manifest` 声明一个 **activity**（左侧活动栏面板）与一个 **panel**（右栏 Tab）槽位；按钮 `refresh` / `push_card` 经 `plugin_ui_action` 回到 `_on_ui_action` |
 | `--no-fs-demo` | — | 关 | 不做启动时的 `fs.read` 自检 |
 
@@ -205,7 +222,10 @@ where.exe python
    结果应为 `plugin-echo: hi`；`plugin__sample__rounds` 返回当前统计。
 3. **计数卡片更新**：消息流里出现槽位卡片「示例插件 · 工具轮次监视」，含阈值、
    已计数次数、进度条与 (agent, session) 计数表；每 `--card-interval` 秒刷新一次，
-   工具调用密集时按 1s 节流刷新。
+   工具调用密集时按 1s 节流刷新。左栏活动面板与右栏 Tab 同步刷新（三处数据同源）。
+   ⚠ 卡片槽位（`--slot-key`，默认 `sample.card.tool_rounds`）**必须先在
+   `ui/manifest` 里申报**：`ui.push` 只发 update 帧、不建槽位，没申报过的 slot_key
+   会被前端静默忽略——卡片永远不出现，且**没有任何报错**（第 8 节）。
 4. **超阈值后被停止**：把阈值改成 3（第 4 节），让 agent 连续做几次工具调用：
    - 插件 stderr：`⚠ 工具轮次超限：agent=… session=… 本任务已调用 4 次 > 阈值 3 ⇒
      经执行站发 agent.stop，计数已重置`；
@@ -238,15 +258,16 @@ cmd /c "type %TEMP%\hello.jsonl | D:\app\python\python.exe E:\programs\Tree\desk
 
 ## 7. 注意事项（都是踩过的坑）
 
-- **单实例 + 每条消息带身份**：`plugins.yaml` 的 `scope` 是作用域**上限**。不声明
-  `team_id` 的插件可以服务任意 team —— 但每条 `station/command` 都要带 `agent_id`，
-  核心按该 agent 的**真实归属**解析 team / mode，并在选站前做 fail-closed 校验
-  （agent 不存在 / 归属解析不出 / 请求里带的 `team_id` 与真实归属不一致 ⇒ `-32001`，
-  错误信息里能看到原因）。声明了 `team_id` 的插件仍只能在自己 team 内活动。
-- **没声明 `scope.team_id` 的插件进不了站点订阅体系**：核心退回 `tools/list` 申报工具
-  （工具仍可用）、**事件照收**（`scope` 里没限定的维度不设条件），但 `station/subscribe`
-  会被 fail-closed 拒绝（原因与两条出路见第 1 节「常见坑」）。
-  不带 `agent_id` 的团队级命令（`ui.push`）需要带 `team_id` 或在声明里给 team。
+- **单实例 + 每条消息带身份**：`plugins.yaml` 的 `scope` 是作用域**上限**。空 scope
+  的插件可服务任意 team（= 作用于所有 team），但每条 `station/command` 都要带
+  `agent_id`，核心按该 agent 的**真实归属**解析 team / mode，并在选站前做 fail-closed
+  校验（agent 不存在 / 归属解析不出 / 请求里带的 `team_id` 与真实归属不一致 ⇒ `-32001`，
+  错误信息里能看到原因）。声明了 `team_id` 的插件只能在自己 team 内活动。
+- **空 scope = 通配（作用于所有 team）**：`station/subscribe` 不再要求声明 team——
+  空 team 收所有 team 的消息、空 `mode_key` 收 local 与 ssh；`ui.push` 的帧带空
+  `team_id`，前端在任何 team 下都呈现。**只有消息信封**（中转 / 广播 / 收集的数据面）
+  和**执行类命令的落地**（`fs.*` / `terminal.exec` / `agent.*` 解析不出目标 agent 的
+  team 与工作面）仍然 fail-closed。
 - **stdout 只允许 JSON-RPC**：日志走 stderr；本插件把 stdout/stderr 都按 UTF-8 字节
   写，避免 Windows 上 Python 默认 ANSI 代码页（cp936）把中文写成非法 UTF-8。
 - **插件主动请求必须带 `method` + `id`**：核心按"有没有 method"区分「响应」与

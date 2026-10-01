@@ -15,10 +15,14 @@
 2. **广播 / 事件订阅**（_on_event + _do_stop）：接收 agent.tool_call 事件，按
    (agent_id, session_id) 计数；**超过阈值（默认 200）** 就经 station/command 发
    agent.stop；发完**重置计数**并打一条可见日志（避免反复停）。
+   事件派发只看 scope 里限定的维度，空 scope = 收全部事件，所以计数与 team 声明无关。
 3. **执行站**（fs_read / _do_startup）：插件**主动**下 fs.read 命令读工作空间里的小
    文件，把结果打进日志（关键结论另发 log 通知，前端可见）。
-4. **插件布局**（push_card）：经 ui.push 推一个 card 槽位帧到前端（复用
-   plugin_ui_update 的 card 槽位形状，带 team_id），内容 = 当前计数 / 阈值 / 进度。
+4. **插件布局**（declare_panel / push_card）：`ui/manifest` 申报三个槽位
+   （activity 左侧活动栏 + panel 右栏 Tab + **card 消息流卡片**），之后用 ui/update
+   与 ui.push 刷新它们，内容 = 当前计数 / 阈值 / 进度。
+   ⚠ card 槽位必须先在 manifest 里申报：`ui.push` 只发 update 帧、不建槽位，
+   没申报过的 slot_key 会被前端静默忽略（卡片永远不出现，且没有任何报错）。
 
 ── 协议（行分隔 JSON-RPC 2.0，与 packages/tree_core/test/fixtures/fake_plugin.dart
    完全同构；那份 Dart 实现是本文件的对照物） ──────────────────────────────
@@ -56,9 +60,13 @@
 * **收集站 schema 是严格校验**：根对象只允许 tools 一个键（多一个键即报「未声明的
   字段」）；每个工具定义含 tool_name / description / parameters / execution。
 * **阈值触发后重置计数**：否则每一次后续调用都会再发一次 agent.stop（反复停）。
-* **未声明 team 的插件**不进站点订阅体系（核心退回 tools/list 申报工具），但
-  station/command 仍可用——只要每条命令带 agent_id；不带 agent 的团队级命令
-  （ui.push）需要能确定 team。失败一律可读（fail-visible，不静默）。
+* **空 scope = 通配（作用于所有 team）**：`plugins.yaml` 不写 `scope.team_id` 也能
+  `station/subscribe`（空 team 收所有 team 的消息、空 mode 收 local 与 ssh），
+  `ui.push` 的帧带空 team_id（前端在任何 team 下都呈现）。仍然 fail-closed 的只有
+  **消息信封**（中转 / 广播 / 收集的数据面必须能证明 team）与**执行类命令的落地**
+  （挂载位置解析不出目标 agent 的 team / 工作面就拒绝执行）。
+  本插件对"订阅被拒"仍留了一层防御性兜底（旧核心）：等第一个事件给出 `agent_id` 后
+  在 worker 线程补订、`ui.push` 带上该身份。新核心里这条路径不会被触发。
 * **本文件的 30s 等待**只为示例日志不永久挂住：核心侧对插件请求**没有静态超时**
   （plan §1.1：判活靠心跳），所以插件不该自己设"任务总时长"上限。
 
@@ -119,7 +127,7 @@ class Options(object):
         self.fs_demo = True
         # 中转站订阅：工具调用前/后各来一次（pre / post），插件决定改不改
         self.relay = True
-        # 声明左侧活动栏 / 右栏面板槽位（ui/manifest）
+        # 声明左侧活动栏 / 右栏面板 / 消息流卡片槽位（ui/manifest；card 必须先申报）
         self.panel = True
         # 自建站点演示（station/register + 按 station_id 订阅）：
         # 站点全局唯一、每个点位只有一个订阅者，插件要按 team / agent 分开处理时，
@@ -154,7 +162,7 @@ def _print_help():
         "  --self-station       自建一个广播站并订阅它（演示插件自建站点：\n"
         "                       站点全局唯一 + 每个点位只有一个订阅者，\n"
         "                       需按 team 分流时由插件自己建站分发）\n"
-        "  --no-panel           不声明插件面板槽位（默认声明 activity + panel）\n"
+        "  --no-panel           不声明插件面板槽位（默认声明 activity + panel + card）\n"
         "  --no-fs-demo         不做启动 fs.read 自检\n"
         "  -h, --help           本帮助（打到 stderr）\n"
         % (
@@ -260,6 +268,12 @@ class SamplePlugin(object):
         self.stop_count = 0
         self.last_duration_ms = None
         self.first_agent_seen = ""
+        # 事件里见过的第一个 session（懒订阅中转站 / 卡片按 agent 下发时补全身份用）
+        self.first_session_seen = ""
+        # 中转站是否已订阅成功（懒订阅：没声明 team 时只能等事件告诉我们 agent）
+        self._relay_subscribed = False
+        # 启动时订中转站被拒（多半缺 team）⇒ 等第一个事件给出 agent 后再试一次
+        self._relay_lazy_pending = False
         # 中转站：本插件处理过的中转请求数（pre / post 各算一次）
         self.relay_handled = 0
         self._state_lock = threading.Lock()
@@ -332,12 +346,19 @@ class SamplePlugin(object):
             return {"timeout": True, "method": method}
         return holder
 
-    def command(self, command, arguments):
-        """经**执行站**下一条命令；scope 只取 plugins.yaml 的声明。"""
-        response = self.request_core(METHOD_STATION_COMMAND, {
-            "command": command,
-            "arguments": arguments,
-        })
+    def command(self, command, arguments, scope=None):
+        """经**执行站**下一条命令。
+
+        [scope] 是**这一次命令的身份**（`{agent_id / session_id / team_id}`）：
+        单实例插件的正解——不带 agent 的团队级命令（ui.push）在没声明
+        `scope.team_id` 时定不出作用域会被 fail-closed 拒绝，带上 agent_id 后核心
+        按该 agent 的真实归属解析，因此**空 scope 的配置也能推卡片**。
+        留空 = 只按 plugins.yaml 的声明。
+        """
+        params = {"command": command, "arguments": arguments}
+        if scope:
+            params.update({key: value for key, value in scope.items() if value})
+        response = self.request_core(METHOD_STATION_COMMAND, params)
         if response.get("timeout"):
             self.log("station/command %s 等不到核心响应（示例兜底超时）" % command)
             return {"ok": False, "error": "等待核心响应超时", "command": command}
@@ -350,7 +371,7 @@ class SamplePlugin(object):
         result = response.get("result")
         return result if isinstance(result, dict) else {"ok": False, "error": "空结果"}
 
-    def subscribe_station(self, station, replace=False, station_id=""):
+    def subscribe_station(self, station, replace=False, station_id="", scope=None):
         """**订阅站点**（协议方法）：`station/subscribe`。
 
         两种寻址方式（二选一）：
@@ -359,18 +380,25 @@ class SamplePlugin(object):
           `broadcast`（发布-订阅读）；
         - `station_id`：按**实例 id** 订某个具体站点（自建站的消费入口）。
 
+        [scope] 是**订阅声明的身份**（如 `{agent_id: ...}`）：plugins.yaml 的 scope 是
+        作用域上限，请求里带 agent 时核心按该 agent 的真实归属解析出 team ——
+        **没声明 `scope.team_id` 的插件因此在学到 agent 后仍能订上中转站**。
+
         订阅被业务规则拒绝（已被占 / 超上限 / 缺 team / 不是自己的自建站）时返回里带
         可读 `error`，不会变成一句"调用失败"。
         """
         params = {"station_id": station_id} if station_id else {"station": station}
         params["replace"] = replace
+        if scope:
+            params["scope"] = {key: value for key, value in scope.items() if value}
         label = station_id or station
         response = self.request_core("station/subscribe", params)
         if response.get("timeout") or isinstance(response.get("error"), dict):
             error = response.get("error") or {}
-            self.log("订阅 %s 站点失败：%s" % (label, error.get("message") or "超时"),
-                     notify=True)
-            return {}
+            message = error.get("message") or "超时"
+            self.log("订阅 %s 站点失败：%s" % (label, message), notify=True)
+            # 一律回"可判定的结果"（含传输层失败）：调用方据此决定要不要推迟重订
+            return {"ok": False, "error": message}
         result = response.get("result") or {}
         if result.get("ok"):
             self.log("已订阅 %s 站点：station_id=%s scope=%s"
@@ -550,8 +578,23 @@ class SamplePlugin(object):
         session_id = str(params.get("session_id", ""))
         call_id = str(params.get("call_id", ""))
         phase = params.get("phase")
-        if agent_id and not self.first_agent_seen:
-            self.first_agent_seen = agent_id
+        with self._state_lock:
+            if agent_id and not self.first_agent_seen:
+                self.first_agent_seen = agent_id
+            if session_id and not self.first_session_seen:
+                self.first_session_seen = session_id
+            # 懒订阅中转站：启动时没订上（多半是没声明 scope.team_id ⇒ 缺 team），
+            # 现在事件把 agent 告诉我们了 —— 只入队，绝不在读循环里等回包。
+            lazy_relay = (
+                self.options.relay
+                and not self._relay_subscribed
+                and self._relay_lazy_pending
+                and bool(agent_id)
+            )
+            if lazy_relay:
+                self._relay_lazy_pending = False  # 只试一次，失败也不再重排
+        if lazy_relay:
+            self._jobs.put(("subscribe_relay", agent_id, session_id))
         if phase == PHASE_END:
             # 结束事件：统计耗时（插件契约里 end 就是为了这个）
             with self._state_lock:
@@ -631,14 +674,25 @@ class SamplePlugin(object):
 
     def _do_startup(self):
         """hello 之后的开工动作（在独立线程里：这里面要等核心回包）。"""
-        self.log("已就绪：插件 id=%s 阈值=%d 槽位=%s（team 声明见 plugins.yaml，"
+        self.log("已就绪：插件 id=%s 阈值=%d 槽位=%s（作用域见 plugins.yaml，"
                  "请求参数改不了作用域）"
                  % (self.plugin_id, self.options.threshold, self.options.slot_key),
                  notify=True)
         # **订阅中转站**：此后每次工具调用的前/后，核心都会把完整 tool_call 报文
         # 发过来（station/request，kind=relay），本插件决定改什么 / 不改。
+        #
+        # 空 scope 也是合法声明（通配：作用于所有 team），所以正常情况下这里一次就成。
+        # 只在**被拒**时（旧核心的 fail-closed / 点位已被别的插件占用）才退到兜底：
+        # 推迟到第一个事件之后按事件里的 agent_id 补订（单实例 + 每条消息带身份），
+        # 代价是这一轮任务的**第一次工具调用**漏掉。
         if self.options.relay:
-            self.subscribe_station("relay", replace=True)
+            result = self.subscribe_station("relay", replace=True)
+            if result.get("ok"):
+                self._relay_subscribed = True
+            else:
+                self._relay_lazy_pending = True
+                self.log("中转站订阅推迟到第一个事件之后（本次被拒：%s）"
+                         % (result.get("error") or "见上一条日志"), notify=True)
         # **自建站点**：站点全局唯一、每个点位只有一个订阅者；插件要按 team / agent
         # 分开处理时，正解是自己建站再分发（这里是那条路的最小演示）。
         if self.options.self_station:
@@ -658,10 +712,15 @@ class SamplePlugin(object):
 
         - `activity` = 左侧活动栏项（和「Agent 列表 / 插件 / 下载」并列）；
         - `panel` = 右栏 Tab；
+        - `card` = **消息流内联卡片**（push_card 的落点，见下）；
         - 视图是**声明式受限控件集**（text / list / table / form / progress /
           actions 与 row / column 容器）——**没有 webview、不执行插件 JS**；
         - `plugin_id` / `team_id` 一律由**核心按实例与 plugins.yaml 声明**填充，
           插件自述的这两个字段不会被采信（防越权）。
+
+        ⚠ **card 槽位必须在这里申报一次**：`ui.push` 只发 `plugin_ui_update` 帧、
+        **不建槽位**——前端的注册表要求「槽位先由 manifest 存在，update 才生效」，
+        没申报过的 slot_key 会被直接忽略（表现为"卡片永远不出现"，且没有任何报错）。
         """
         slots = [
             {
@@ -692,34 +751,54 @@ class SamplePlugin(object):
                 "title": "示例插件",
                 "view": self.card_view(),
             },
+            {
+                # 消息流内联卡片：**必须在这里申报**，push_card 的 ui.push 才能生效
+                "slot_key": self.options.slot_key,
+                "slot": "card",
+                "title": "示例插件 · 工具轮次监视",
+                "order": 10,
+                "view": self.card_view(),
+            },
         ]
         self._notify("ui/manifest", {"slots": slots})
-        self.log("已声明插件面板槽位 %d 个（activity + panel）" % len(slots))
+        self.log("已声明插件面板槽位 %d 个（activity + panel + card）" % len(slots))
+
+    def _activity_view(self):
+        """左侧活动栏视图：中转计数 + 工具轮次进度。"""
+        return {
+            "type": "column",
+            "gap": 6,
+            "children": [
+                {"type": "text", "text": "示例插件 · 面板", "style": "title"},
+                {"type": "text",
+                 "text": "已处理中转 %d 次" % self.relay_handled, "style": "body"},
+                {"type": "progress",
+                 "value": min(1.0, float(self.total_started)
+                              / float(max(1, self.options.threshold))),
+                 "label": "工具轮次 / 阈值",
+                 "detail": "%d / %d" % (self.total_started, self.options.threshold)},
+                {"type": "actions", "buttons": [
+                    {"action_id": "refresh", "label": "刷新"},
+                ]},
+            ],
+        }
 
     def update_panel(self):
         """发 `ui/update`：按 slot_key **整块替换**某槽位视图（不做 diff）。
 
         `view` 缺省 / 为 null = 注销该槽位。
+
+        **两个槽位一起刷**（activity + panel）：manifest 只在 hello 时发一次，之后的
+        每一次刷新都走 ui/update。只刷 activity 会让右栏 Tab 永远停在启动那一刻的
+        「已计数 0 次」——看起来像插件没生效，实际是那个视图从来没被更新过。
         """
         self._notify("ui/update", {
             "slot_key": "%s.activity.1" % self.plugin_id,
-            "view": {
-                "type": "column",
-                "gap": 6,
-                "children": [
-                    {"type": "text", "text": "示例插件 · 面板", "style": "title"},
-                    {"type": "text",
-                     "text": "已处理中转 %d 次" % self.relay_handled, "style": "body"},
-                    {"type": "progress",
-                     "value": min(1.0, float(self.total_started)
-                                  / float(max(1, self.options.threshold))),
-                     "label": "工具轮次 / 阈值",
-                     "detail": "%d / %d" % (self.total_started, self.options.threshold)},
-                    {"type": "actions", "buttons": [
-                        {"action_id": "refresh", "label": "刷新"},
-                    ]},
-                ],
-            },
+            "view": self._activity_view(),
+        })
+        self._notify("ui/update", {
+            "slot_key": "%s.panel.1" % self.plugin_id,
+            "view": self.card_view(),
         })
 
     def _notify(self, method, params):
@@ -771,17 +850,39 @@ class SamplePlugin(object):
 
     def push_card(self, force=False):
         """ui.push：**复用 4.1 的 card 槽位帧**（核心内置挂载位置 core.frontend.card，
-        帧类型 plugin_ui_update，带 team_id）。"""
+        帧类型 plugin_ui_update，带 team_id）。
+
+        槽位本身由 declare_panel 的 `ui/manifest` 申报（`ui.push` 只更新、不建槽位）。
+        刷新时**顺带把面板也刷一遍**：三个视图同源，只刷一个会出现"卡片在跳、面板
+        停在 0"的错位观感。
+
+        命令身份：见过事件之后一律带 `agent_id` / `session_id`（`--agent-id` 显式指定
+        时以它为准），这样**没声明 `scope.team_id` 的配置也能把卡片推出去**。
+        """
         now = time.monotonic()
         if not force and (now - self._last_card_at) < self.options.card_min_interval:
             return  # 事件密集时节流，避免刷屏
         self._last_card_at = now
+        if self.options.panel:
+            self.update_panel()
+        # **带上事件里学到的身份**：ui.push 是不带 agent 的团队级命令，没声明
+        # `scope.team_id` 时定不出作用域会被拒；带 agent_id 后核心按该 agent 的真实
+        # 归属解析 —— 空 scope 的配置因此也能推卡片（启动时还没有 agent，则只按声明）。
+        scope = {}
+        if not self.options.agent_id and self.first_agent_seen:
+            scope = {"agent_id": self.first_agent_seen,
+                     "session_id": self.first_session_seen}
         result = self.command(CMD_UI_PUSH, {
             "slot_key": self.options.slot_key,
             "view": self.card_view(),
-        })
+        }, scope=scope)
         if result.get("ok"):
             self.log("卡片已推送：slot_key=%s" % self.options.slot_key)
+        elif not self.first_agent_seen and not self.options.agent_id:
+            # 启动那一刻还没见过任何事件 ⇒ 既没有声明 team 也借不到 agent 身份：
+            # 这次推不出去是**预期内**的，等第一个事件到了就会带上 agent 重推。
+            self.log("卡片暂未推送（还没有身份可用）：等第一个工具调用事件之后会带 "
+                     "agent_id 重推；若一直失败，检查 plugins.yaml 的 scope.team_id")
         else:
             self.log("卡片推送失败（检查 plugins.yaml 是否声明了 scope.team_id，"
                      "以及前端通道是否可用）：%s" % (result.get("error") or ""), notify=True)
@@ -927,8 +1028,33 @@ class SamplePlugin(object):
                     self.push_card()
                 elif job[0] == "fs":
                     self.fs_read(reason=job[1])
+                elif job[0] == "subscribe_relay":
+                    self._do_subscribe_relay(job[1], job[2])
             except Exception as error:  # noqa: BLE001 - 后台任务异常不影响协议循环
                 self.log("后台任务 %s 异常（已忽略）：%r" % (job[0], error))
+
+    def _do_subscribe_relay(self, agent_id, session_id):
+        """（worker 线程）懒订阅中转站：用事件里的 agent 身份订。
+
+        为什么能成：plugins.yaml 的 scope 是**作用域上限**，请求里带 agent 时核心按该
+        agent 的**真实归属**解析 team —— 所以 `scope: {}` 的插件同样订得上。
+
+        为什么只订一次：**每个点位只有一个订阅者**（中转站尤其）。订第二个 team 要用
+        `replace=True` 抢点位，那会把前一个 team 的拦截丢掉；要按 team 分流，正解是
+        自建站点再分发（见 `--self-station`）。
+        """
+        result = self.subscribe_station(
+            "relay",
+            replace=True,
+            scope={"agent_id": agent_id, "session_id": session_id},
+        )
+        if result.get("ok"):
+            self._relay_subscribed = True
+            self.log("中转站已按事件身份订上：agent=%s session=%s（此后工具调用前/后各一次）"
+                     % (agent_id, session_id), notify=True)
+        else:
+            self.log("中转站懒订阅仍失败（不重试）：%s" % (result.get("error") or "未知原因"),
+                     notify=True)
 
     def _timer_loop(self):
         while not self._closed:

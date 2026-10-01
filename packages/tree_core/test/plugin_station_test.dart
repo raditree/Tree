@@ -587,13 +587,23 @@ void main() {
     );
     expect(relayedScope['team'], 'team-1');
 
-    // 消息信封本身不完整（缺 team）⇒ 站点层启动就拒（fail-closed）
+    // 命令的 team 允许为空 = **通配所有 team**（用户定稿：为空默认作用于所有 team）。
+    // 站点层只透传 scope；需要落到实处的命令由挂载位置自己拒绝
+    // （execute_mounts._resolveTarget：缺 team / agent 解析不出 / 模式对不上都拒）。
     final StationCommandResult noTeam = await execute.execute(
       command: 'fs.read',
       scope: const StationScope(modeKey: StationModeKey.local),
     );
-    expect(noTeam.ok, isFalse);
-    expect(noTeam.error, contains('team_id'));
+    expect(noTeam.ok, isTrue, reason: '站点层不再替挂载位置兜底：空 team = 通配');
+    expect((noTeam.payload! as Map<String, dynamic>)['team'], '');
+
+    // mode 非法（拼错）⇒ 站点层就拒：命令必须能落到某个工作面上才谈得上执行
+    final StationCommandResult badMode = await execute.execute(
+      command: 'fs.read',
+      scope: const StationScope(teamId: 'team-1', modeKey: 'local-typo'),
+    );
+    expect(badMode.ok, isFalse);
+    expect(badMode.error, contains('mode_key'));
 
     // 执行站不支持订阅
     final StationSubResult sub = h.subscribe(

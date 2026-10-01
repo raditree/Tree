@@ -256,7 +256,7 @@ void main() {
     expect(relay.subscribers, isEmpty);
   });
 
-  test('未声明 team 的插件订阅站点 ⇒ 显式拒绝（站点隔离要求四元组）', () async {
+  test('未声明 team 的插件订阅站点 ⇒ 成立但为**通配**（作用于所有 team）', () async {
     final PluginBus bus = await startBus(noTeamPluginYaml());
     final Map<String, dynamic> response = await pluginRequest(
       bus,
@@ -264,9 +264,20 @@ void main() {
       method: 'station/subscribe',
       params: <String, dynamic>{'station': 'relay'},
     );
-    final Map<String, dynamic> error = response['error'] as Map<String, dynamic>;
-    expect(error['code'], -32001, reason: '${response['error']}');
-    expect(error['message'], contains('team'));
+    expect(response['error'], isNull, reason: '${response['error']}');
+    final Map<String, dynamic> result =
+        response['result'] as Map<String, dynamic>;
+    expect(result['ok'], isTrue, reason: '${result['error']}');
+    // 空 scope 落成一条**四维全通配**的订阅：team 空 = 所有 team，
+    // mode 空 = local / ssh 都收（用户定稿：为空默认作用于所有 team）
+    final Map<String, dynamic> scope = result['scope'] as Map<String, dynamic>;
+    expect(scope['team_id'], '');
+    expect(scope['mode_key'], '');
+    final RelayStation relay = bus.stations.station(StationHubIds.relay)!
+        as RelayStation;
+    expect(relay.subscribers.single.pluginId, 'noteam');
+    expect(relay.subscribers.single.scope.teamIsWildcard, isTrue);
+    expect(relay.subscribers.single.scope.modeIsWildcard, isTrue);
   });
 
   test('插件发 station/command ⇒ 核心的响应原样回到插件，命令真的执行', () async {
@@ -656,7 +667,11 @@ void main() {
         },
       },
     );
-    expect((response['result'] as Map<String, dynamic>)['ok'], isTrue);
+    expect(
+      (response['result'] as Map<String, dynamic>)['ok'],
+      isTrue,
+      reason: '${(response['result'] as Map<String, dynamic>)['error']}',
+    );
     final Map<String, dynamic> frame = frames.singleWhere(
       (Map<String, dynamic> f) => f['type'] == PluginUiFrameType.update,
     );
@@ -665,6 +680,41 @@ void main() {
     expect(data['team_id'], team, reason: '槽位帧一律带 team_id（1.2 隔离）');
     expect(data['slot_key'], 'sample.card.1');
     expect((data['view'] as Map<String, dynamic>)['text'], '插件卡片');
+  });
+
+  test('未声明 team 的插件 ui.push ⇒ 照推，帧的 team 为空 = 所有 team 都呈现', () async {
+    final List<Map<String, dynamic>> frames = <Map<String, dynamic>>[];
+    final PluginBus bus = await startBus(
+      noTeamPluginYaml(),
+      broadcast: frames.add,
+    );
+    final Map<String, dynamic> response = await pluginRequest(
+      bus,
+      pluginId: 'noteam',
+      method: 'station/command',
+      params: <String, dynamic>{
+        'command': 'ui.push',
+        'arguments': <String, dynamic>{
+          'slot_key': 'noteam.card.1',
+          'view': <String, dynamic>{'type': 'text', 'text': '通配卡片'},
+        },
+      },
+    );
+    final Map<String, dynamic> result =
+        response['result'] as Map<String, dynamic>;
+    expect(result['ok'], isTrue, reason: '${result['error']}');
+    final Map<String, dynamic> data =
+        frames
+                .singleWhere(
+                  (Map<String, dynamic> f) =>
+                      f['type'] == PluginUiFrameType.update,
+                )['data']
+            as Map<String, dynamic>;
+    expect(
+      data['team_id'],
+      '',
+      reason: '空 team 的槽位帧在前端对**所有 team** 可见（_visible 把空 team 当通配）',
+    );
   });
 
   // ── 插件自建站（station/register）：转发型订阅者的出路 ──────────────────

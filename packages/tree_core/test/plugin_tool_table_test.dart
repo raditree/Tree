@@ -232,7 +232,7 @@ void main() {
     );
   });
 
-  test('无 team 归属的插件仍走旧 tools/list 路径（不破坏既有行为）', () async {
+  test('无 team 归属的插件：订阅收集站（通配），工具走旧 tools/list 路径', () async {
     final PluginBus bus = PluginBus(
       configFile: configFile(withScope: false).path,
       coreVersion: 'test',
@@ -240,9 +240,21 @@ void main() {
     );
     addTearDown(bus.close);
     await bus.start();
-    // 没有 team 上下文：不做站点收集，但工具照旧可用
+    // 没有 team 上下文：收集站上会挂一条**通配**订阅（空 team = 所有 team），
+    // 但这一趟没有调用点团队上下文 ⇒ 消息侧证明不了归属，不发采集请求；
+    // 工具早已由 tools/list 路径注册，功能不受影响。
     final ToolDefinitionRefresh refresh = await bus.refreshToolDefinitions();
-    expect(refresh.stationIds, isEmpty, reason: '无 team 归属 ⇒ 不进站点体系');
+    expect(
+      refresh.stationIds,
+      <String>[StationHubIds.collect],
+      reason: '空 scope = 通配订阅：挂上收集站，但这一趟没有可用的消息 team',
+    );
+    expect(refresh.collected, isEmpty, reason: '没有调用点团队上下文 ⇒ 这一趟不采集');
+    expect(
+      refresh.skipped.any((String s) => s.contains('通配订阅')),
+      isTrue,
+      reason: '跳过采集要给出可读原因，不静默',
+    );
     expect(bus.toolsOf('sample').map((PluginToolInfo t) => t.name), <String>[
       'echo',
       'slow',
@@ -253,5 +265,47 @@ void main() {
     );
     addTearDown(runner.close);
     expect(specNames(runner), contains('plugin__sample__echo'));
+  });
+
+  test('无 team 归属的插件：带上调用点团队上下文时，工具改用收集站申报', () async {
+    final PluginBus bus = PluginBus(
+      configFile: configFile(withScope: false).path,
+      coreVersion: 'test',
+      heartbeatInterval: const Duration(seconds: 30),
+    );
+    addTearDown(bus.close);
+    await bus.start();
+    final ToolDefinitionRefresh refresh = await bus.refreshToolDefinitions(
+      context: const StationScopeContext(
+        teamId: 'team-9',
+        agentId: 'agt_9',
+        sessionId: 'ses_9',
+        modeKey: StationModeKey.ssh,
+      ),
+    );
+    expect(refresh.stationIds, <String>[StationHubIds.collect]);
+    expect(
+      refresh.collected.map((StationCollectedItem i) => i.pluginId),
+      contains('sample'),
+      reason: '通配订阅借调用点的 team 拿到一条可证明归属的消息 ⇒ 采集成立',
+    );
+    expect(
+      refresh.registered,
+      contains('plugin__sample__echo'),
+      reason: '收集站申报与 tools/list 走同一张定义表',
+    );
+    // 声明里没有 team 的定义 = 对所有 team 可见（调用点 scope 不过滤它）
+    expect(
+      PluginTool.dynamicSpecs(
+        bus,
+        scope: const StationScope(
+          teamId: 'team-9',
+          agentId: 'agt_9',
+          sessionId: 'ses_9',
+          modeKey: StationModeKey.ssh,
+        ),
+      ).map((ToolSpec s) => s.name),
+      contains('plugin__sample__echo'),
+    );
   });
 }

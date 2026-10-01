@@ -686,7 +686,12 @@ class ConversationService {
 
   /// 发布一条工具调用事件（`agent.tool_call`；字段口径见 [AgentEvents.toolCall]）。
   ///
-  /// - `team_id` 取 agent 的团队归属（空串 = 无归属，插件按 scope 通配/不匹配自行裁定）；
+  /// - `team_id` 取 agent 的**有效团队归属**（与 `TeamService.teamIdOf` / 站点 keying /
+  ///   `StationScopeContext` 同口径）：顶层 agent（`team_id` 为空）**自成一队**，
+  ///   取它自己的 id。只读 `agent.teamId` 会让顶层 agent 的事件永远带空 team，而
+  ///   插件**要订阅站点就必须声明 `scope.team_id`**（站点隔离要求四元组）——两条
+  ///   要求会互相打架：声明了 team 的插件反而收不到自己 agent 的事件（计数静默归零）。
+  ///   执行站早已踩过同一个坑并改成同口径（见 `execute_mounts.dart` 的 agentTeamOf）。
   /// - `round` 取卡片里记的本任务轮次（start / end 同值），插件因此能把一对事件配上；
   /// - 未接线（[AgentEventPublisher.sink] 为空）时是**纯 no-op**，不影响既有行为。
   void _publishToolCall(
@@ -696,10 +701,11 @@ class ConversationService {
     String phase, {
     String tool = '',
   }) {
+    final String teamId = agent.teamId.trim();
     agentEvents.toolCall(
       agentId: agent.id,
       sessionId: session.sessionId,
-      teamId: agent.teamId,
+      teamId: teamId.isEmpty ? agent.id : teamId,
       tool: tool.isEmpty ? (message.toolName ?? '') : tool,
       callId: message.toolCallId,
       round: message.round,

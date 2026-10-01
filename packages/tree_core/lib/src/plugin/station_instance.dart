@@ -120,16 +120,14 @@ sealed class StationInstance {
         code: 'not_subscribable',
       );
     }
-    // 订阅者自身的归属必须可证明：team 非空 + mode 合法。
-    //
-    // 站点全局化后不再有「站点 scope 相容」这道闸，而投递判定比的是
-    // 「消息 ↔ 订阅者」，所以归属校验必须落在订阅声明这一侧——
-    // 否则一个无 team 的订阅者会挂上来，却永远匹配不到任何消息（静默空转）。
-    if (!subscriber.scope.isValid) {
+    // 订阅者自身的声明必须是可用的：**空维度 = 通配**（空 team 作用于所有 team、
+    // 空 mode 两种工作面都收），只有 mode 填了非法值才算错（拼错要报出来）。
+    if (!subscriber.scope.isValidSubscriber) {
       counters.bump('skipped_scope');
       return StationSubResult.rejected(
         '订阅者 ${subscriber.pluginId} 的 scope（${subscriber.scope.describe()}）'
-        '不可证明归属：team_id 必须非空、mode_key 只能是 local | ssh',
+        '不可用：mode_key 只能是 local | ssh，或留空表示两种工作面都收'
+        '（team_id / agent_id / session_id 留空 = 该维不设条件）',
         code: 'scope_mismatch',
       );
     }
@@ -792,7 +790,8 @@ final class ExecuteStation extends StationInstance {
     Map<String, dynamic> arguments = const <String, dynamic>{},
     String sourcePluginId = '',
   }) async {
-    final StationIsolationVerdict verdict = checkScope(scope);
+    final StationIsolationVerdict verdict =
+        StationIsolation.checkCommandScope(scope);
     if (!verdict.ok) {
       counters.bump('skipped_scope');
       return StationCommandResult(
