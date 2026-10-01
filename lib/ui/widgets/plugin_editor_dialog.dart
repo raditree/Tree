@@ -7,7 +7,7 @@ import 'package:flutter/material.dart';
 ///
 /// 三条硬要求落在本文件里：
 /// 1. **表单字段齐全**：id / 名称 / 命令 / 参数（每行一个）/ 环境变量（KEY=VALUE
-///    每行一个）/ granularity / scope（四项，留空 = 通配）/ 启用；
+///    每行一个）/ granularity / scope（四元组）/ 启用；
 /// 2. **校验与可读错误**：id 字符集、命令非空、环境变量格式、scope.mode_key 取值
 ///    都在客户端先拦一遍（核心还会再校验一次，两端口径一致）；
 /// 3. **安全提示 + 保存前二次确认**：命令字段 = 可以用界面拉起任意进程——这是
@@ -325,7 +325,7 @@ class _PluginEditorDialogState extends State<PluginEditorDialog> {
                         isExpanded: true,
                         decoration: const InputDecoration(
                           labelText: '实例粒度',
-                          helperText: 'team / agent / session',
+                          helperText: '订阅时声明的粒度：team / agent / session',
                           isDense: true,
                         ),
                         items: const <DropdownMenuItem<String>>[
@@ -378,7 +378,7 @@ class _PluginEditorDialogState extends State<PluginEditorDialog> {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'scope（留空 = 通配；四元组是站点隔离的判据）',
+                  'scope（四元组：team_id / agent_id / session_id / mode_key）',
                   style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
                 ),
                 Row(
@@ -401,6 +401,16 @@ class _PluginEditorDialogState extends State<PluginEditorDialog> {
                   ],
                 ),
                 _scopeField('plugin-editor-session', _sessionId, 'session_id'),
+                _hint(
+                  cs,
+                  'team_id 留空 = 不进站点体系（工具走旧的 tools/list 申报路径，'
+                  '对所有 team 的调用点都可见）；填了就是归属上限，插件的命令与'
+                  '订阅都不得跨出该 team。\n'
+                  'agent_id / session_id 留空 = 不限定：它只影响「哪些消息投给这个'
+                  '插件」（订阅匹配），不影响工具表可见性（那只看 team）。\n'
+                  'mode_key 现由核心按目标 agent 的工作空间自动解析（local / ssh），'
+                  '这里填了只用于校验——与事实不符会被拒；留空即可。',
+                ),
                 SwitchListTile(
                   key: const Key('plugin-editor-enabled'),
                   contentPadding: EdgeInsets.zero,

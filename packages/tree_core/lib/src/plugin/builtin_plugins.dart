@@ -47,7 +47,8 @@ class BuiltinPluginSpec {
   /// 默认实例粒度（team / agent / session）。
   final String granularity;
 
-  /// 默认 scope（空 Map = 通配：不进站点体系，工具走 tools/list 申报路径）。
+  /// 默认 scope（空 Map = 不限定归属：不进站点体系，工具走 tools/list 申报路径，
+  /// 因此对所有 team 的调用点都可见）。
   final Map<String, dynamic> scope;
 
   /// 给前端的内置插件说明（config / enabled / resolution 由核心在响应里补）。

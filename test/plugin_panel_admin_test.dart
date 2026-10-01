@@ -265,6 +265,25 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('添加插件'), findsWidgets);
 
+    // 0) scope 的说明文案必须与核心真实行为一致：
+    //    team_id 留空 = **不进站点体系**（旧 tools/list 路径、对所有 team 可见），
+    //    而不是"通配到站点里"；mode_key 由核心按目标 agent 工作空间自动解析。
+    //    这几句是对用户的口径承诺，措辞漂移会让用户按错的方式配 scope。
+    expect(
+      find.textContaining('team_id 留空 = 不进站点体系'),
+      findsOneWidget,
+      reason: '旧的「留空 = 通配；四元组是站点隔离的判据」是错的（站点已全局化）',
+    );
+    expect(
+      find.textContaining('mode_key 现由核心按目标 agent 的工作空间自动解析'),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining('留空 = 通配'),
+      findsNothing,
+      reason: '这句已不成立，不得回潮',
+    );
+
     // 1) 什么都不填：id / 命令都报可读错误
     await tester.tap(find.byKey(const Key('plugin-editor-save')));
     await tester.pumpAndSettle();
@@ -285,7 +304,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.textContaining('环境变量必须是 KEY=VALUE'), findsOneWidget);
 
-    // 3) 填齐（参数每行一个 / 环境变量每行一个 / scope 留空 = 通配）→ 保存 → 二次确认
+    // 3) 填齐（参数每行一个 / 环境变量每行一个 / scope 只填 session）→ 保存 → 二次确认
     await tester.enterText(
       find.byKey(const Key('plugin-editor-args')),
       'demo.py\n--flag',

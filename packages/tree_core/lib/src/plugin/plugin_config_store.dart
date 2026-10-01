@@ -254,14 +254,14 @@ class PluginConfigStore {
     final Object? scope = entry['scope'];
     if (scope != null) {
       if (scope is! Map) {
-        return '插件 $id 的 scope 必须是映射（留空表示通配）';
+        return '插件 $id 的 scope 必须是映射（空映射 = 不限定归属）';
       }
       final String allowed = scopeKeys.join(' / ');
       for (final MapEntry<Object?, Object?> e in scope.entries) {
         final String key = e.key.toString();
         if (!scopeKeys.contains(key)) {
           return '插件 $id 的 scope 含未知键「$key」：'
-              '只允许 $allowed（留空 = 通配）';
+              '只允许 $allowed（各键留空 = 不限定）';
         }
         final Object? rawValue = e.value;
         final String value = rawValue?.toString() ?? '';
