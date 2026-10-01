@@ -370,6 +370,7 @@ class StationRelayResult {
     required this.handled,
     this.pluginId = '',
     this.reason = '',
+    this.requestId = '',
   });
 
   /// 最终数据：回填成功 = 订阅者给的新数据；其余情况 = **原数据放行**。
@@ -383,6 +384,11 @@ class StationRelayResult {
 
   /// 未处理原因（可读中文；成功时为空串）。
   final String reason;
+
+  /// 这次投递的请求 id（插件在 `station/stream` 里用它关联**流式回填**）。
+  ///
+  /// 只有真的投出去过（有订阅者、走到了请求构造）才非空。
+  final String requestId;
 
   /// 可读摘要。
   String describe() => handled ? '中转 $pluginId 已回填' : '中转未处理（原数据放行）：$reason';

@@ -121,15 +121,69 @@ void main() {
       );
     });
 
-    test('candidatePaths 只含 README 且不重复', () {
+    test('candidatePaths 覆盖指南与简版两个文件名且不重复', () {
       final List<String> candidates = PluginDocs.candidatePaths(
         executablePath: fakeExeIn(temp),
       );
       expect(candidates, isNotEmpty);
       expect(candidates.toSet().length, candidates.length, reason: '候选不得重复');
       for (final String c in candidates) {
-        expect(p.basename(c), PluginDocs.readmeName);
+        expect(PluginDocs.docNames, contains(p.basename(c)));
       }
+      expect(
+        candidates.any((String c) => p.basename(c) == PluginDocs.guideName),
+        isTrue,
+        reason: '系统性指南必须在候选里（首选）',
+      );
+    });
+
+    test('同一目录里指南与 README 都在 ⇒ 选系统性指南', () {
+      final Directory bundled = Directory(
+        p.join(temp.path, PluginDocs.bundledDirName),
+      )..createSync(recursive: true);
+      File(p.join(bundled.path, PluginDocs.readmeName))
+        .writeAsStringSync('# 示例索引\n');
+      final File guide = File(p.join(bundled.path, PluginDocs.guideName))
+        ..writeAsStringSync('# 插件开发指南\n');
+      expect(
+        PluginDocs.resolvePath(executablePath: fakeExeIn(temp)),
+        guide.path,
+        reason: '入口要送人去**系统性指南**；简版 README 只是兜底',
+      );
+    });
+
+    test('源码布局：仓库 docs/ 下的指南也被找到', () {
+      final Directory deep = Directory(
+        p.join(temp.path, 'build', 'windows', 'x64', 'runner', 'Debug'),
+      )..createSync(recursive: true);
+      final Directory docs = Directory(
+        p.join(temp.path, PluginDocs.repoDocDirName),
+      )..createSync(recursive: true);
+      final File guide = File(p.join(docs.path, PluginDocs.guideName))
+        ..writeAsStringSync('# 插件开发指南\n');
+      expect(
+        PluginDocs.resolvePath(executablePath: fakeExeIn(deep)),
+        guide.path,
+      );
+    });
+
+    test('祖先目录里的 docs/README.md 不算插件文档（泛化文件名会认错文档）', () {
+      // 实测来源：`flutter test` 的 flutter_tester.exe 在 Flutter SDK 里，
+      // 逐级向上会命中 SDK 自带的 `flutter/docs/README.md`——若认它，用户点
+      // 「打开插件开发说明」会被送到一份与插件无关的文档上。
+      final Directory deep = Directory(
+        p.join(temp.path, 'build', 'windows', 'x64', 'runner', 'Debug'),
+      )..createSync(recursive: true);
+      final Directory docs = Directory(
+        p.join(temp.path, PluginDocs.repoDocDirName),
+      )..createSync(recursive: true);
+      File(p.join(docs.path, PluginDocs.readmeName))
+          .writeAsStringSync('# 这是别的项目的文档\n');
+      expect(
+        PluginDocs.resolvePath(executablePath: fakeExeIn(deep)),
+        isNull,
+        reason: 'docs/ 下只认 plugin-development.md 这个专有文件名',
+      );
     });
 
     test('openReadme：找不到文档时给可读原因（含查找位置）', () async {

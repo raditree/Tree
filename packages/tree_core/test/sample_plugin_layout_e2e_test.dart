@@ -180,18 +180,31 @@ void main() {
       reason: '必须"先 manifest 后 update"',
     );
 
-    // ④ 中转站订阅成立（声明了 team 才进得了站点体系）
+    // ④ 中转站订阅成立（声明了 team 才进得了站点体系）。
+    //    点位化：插件写 `station: 'relay'`（不带 point）= 一次订**工具前 + 工具后
+    //    两个点位**（点位化之前是一个实例收两段）——两处都必须订上，
+    //    否则"工具调用前后各一次拦截"就少了一半。
     final DateTime deadline = DateTime.now().add(const Duration(seconds: 20));
-    StationInstance? relay;
+    StationInstance? relayPre;
+    StationInstance? relayPost;
     while (DateTime.now().isBefore(deadline)) {
-      relay = started.bus.stations.station(StationHubIds.relay);
-      if (relay != null && relay.subscribers.isNotEmpty) break;
+      relayPre = started.bus.stations.station(StationHubIds.relayToolPre);
+      relayPost = started.bus.stations.station(StationHubIds.relayToolPost);
+      if ((relayPre?.subscribers.isNotEmpty ?? false) &&
+          (relayPost?.subscribers.isNotEmpty ?? false)) {
+        break;
+      }
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
     expect(
-      relay?.subscribers.map((StationSubscriber s) => s.pluginId),
+      relayPre?.subscribers.map((StationSubscriber s) => s.pluginId),
       contains('sample'),
-      reason: '声明 team 后中转站订阅必须成立（工具调用前后各一次拦截）',
+      reason: '声明 team 后「工具调用前」点位订阅必须成立',
+    );
+    expect(
+      relayPost?.subscribers.map((StationSubscriber s) => s.pluginId),
+      contains('sample'),
+      reason: '声明 team 后「工具调用后」点位订阅同样成立（两个点位一起订）',
     );
   }, timeout: const Timeout(Duration(seconds: 120)));
 
@@ -212,16 +225,19 @@ void main() {
     expect(started.bus.toolTable(), isNotEmpty, reason: '工具走 tools/list 路径仍然可用');
 
     // 站点订阅：**空 scope = 通配**（用户定稿：为空默认作用于所有 team），
-    // 所以启动时就能订上中转站，且订阅 scope 的 team / mode 都为空
+    // 所以启动时就能订上中转站的两个工具点位，且订阅 scope 的 team / mode 都为空
     final DateTime deadline = DateTime.now().add(const Duration(seconds: 20));
     StationSubscriber? sample;
     while (DateTime.now().isBefore(deadline)) {
-      final StationInstance? relay = started.bus.stations.station(
-        StationHubIds.relay,
-      );
-      for (final StationSubscriber sub
-          in relay?.subscribers ?? const <StationSubscriber>[]) {
-        if (sub.pluginId == 'sample') sample = sub;
+      for (final String pointId in <String>[
+        StationHubIds.relayToolPre,
+        StationHubIds.relayToolPost,
+      ]) {
+        final StationInstance? relay = started.bus.stations.station(pointId);
+        for (final StationSubscriber sub
+            in relay?.subscribers ?? const <StationSubscriber>[]) {
+          if (sub.pluginId == 'sample') sample = sub;
+        }
       }
       if (sample != null) break;
       await Future<void>.delayed(const Duration(milliseconds: 100));
@@ -229,6 +245,14 @@ void main() {
     expect(sample, isNotNull, reason: '空 scope 是合法订阅声明：不再 fail-closed 拒绝');
     expect(sample!.scope.teamIsWildcard, isTrue, reason: '空 team = 所有 team');
     expect(sample.scope.modeIsWildcard, isTrue, reason: '空 mode = local / ssh 都收');
+    expect(
+      started.bus.stations
+          .station(StationHubIds.relayToolPost)
+          ?.subscribers
+          .map((StationSubscriber s) => s.pluginId),
+      contains('sample'),
+      reason: '一次 relay 订阅落在两个工具点位上（工具前 + 工具后）',
+    );
 
     // 事件：scope 里没限定的维度不设条件 ⇒ 照收（计数与 team 声明无关）
     expect(
@@ -310,17 +334,19 @@ void main() {
       reason: '通配卡片的 team 为空 = 前端在任何 team 下都呈现',
     );
 
-    // ② 中转站订阅在**启动时**就成立（不是靠懒订阅补的）
+    // ② 中转站订阅在**启动时**就成立（不是靠懒订阅补的）：两个工具点位都有
     final DateTime deadline = DateTime.now().add(const Duration(seconds: 20));
     Iterable<String> subscribers = const <String>[];
     while (DateTime.now().isBefore(deadline)) {
-      final StationInstance? relay = started.bus.stations.station(
-        StationHubIds.relay,
-      );
-      subscribers =
-          (relay?.subscribers ?? const <StationSubscriber>[]).map(
-            (StationSubscriber s) => s.pluginId,
-          );
+      subscribers = <String>[
+        for (final String pointId in <String>[
+          StationHubIds.relayToolPre,
+          StationHubIds.relayToolPost,
+        ])
+          ...(started.bus.stations.station(pointId)?.subscribers ??
+                  const <StationSubscriber>[])
+              .map((StationSubscriber s) => s.pluginId),
+      ];
       if (subscribers.contains('sample')) break;
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }

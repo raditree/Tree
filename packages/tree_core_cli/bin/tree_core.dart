@@ -283,8 +283,16 @@ Future<void> main(List<String> args) async {
     log: (String message) => stderr.writeln('[core:compact] $message'),
   );
 
-  final CoreServer server = await CoreServer.start(
-    port: port,
+  // 执行站 `llm.call`（点位化新增）：插件可让核心用**目标 agent 的模型**发一次
+  // 硬设 `response_format=json_object` 的调用，拿结构化结果做高级处理。
+  // 与对话引擎共用同一份模型解析与成员级覆盖（`agentOverrides`）。
+  final LlmJsonCaller llmJsonCaller = LlmJsonCaller(
+    resolveModel: settings.model,
+    agentOverrides: agentOverrides,
+    log: (String message) => stderr.writeln('[core:llm-call] $message'),
+  );
+
+  final CoreServer server = await CoreServer.start(    port: port,
     streamChunkDelay: Duration(milliseconds: chunkDelayMs),
     enableHeartbeat: enableHeartbeat,
     store: store,
@@ -307,6 +315,9 @@ Future<void> main(List<String> args) async {
     // 完成回调走 tools.onHookFinished（下面接到 conversation.wake），
     // 释放由 tools.close() 负责，核心 close 不会重复关它。
     stationHooks: tools.hooks,
+    // 执行站命令 `llm.call` 的落点（点位化）：**站点处硬设 JSON 返回形式**，
+    // 模型复用目标 agent 的模型（与对话同一份解析 + 成员级覆盖）。
+    llmJsonCaller: llmJsonCaller,
   );
   // 起监听后才存在的三个依赖一次性接上：广播、在途状态、消息投递
   hubSink = server.hub.broadcast;

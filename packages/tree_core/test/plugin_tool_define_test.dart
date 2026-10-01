@@ -106,9 +106,10 @@ void main() {
     );
     expect(direct.text, 'plugin-echo: D');
 
-    // 5) 站点快照里能看到收集站、schema 与订阅者（站点全局唯一，快照恒四类站）
+    // 5) 站点快照里能看到收集站、schema 与订阅者
+    //    （点位化：快照恒为**全部 16 个内置点位** + 接入点现建的收集站）
     final List<dynamic> stations = bus.snapshot()['stations'] as List<dynamic>;
-    expect(stations, hasLength(4), reason: '三站内置 + 收集站');
+    expect(stations, hasLength(17), reason: '16 个内置点位 + 收集站');
     final Map<String, dynamic> station = stations.firstWhere(
       (dynamic s) => (s as Map<String, dynamic>)['kind'] == 'collect',
     ) as Map<String, dynamic>;

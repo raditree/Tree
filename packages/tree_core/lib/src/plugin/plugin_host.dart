@@ -264,6 +264,29 @@ class PluginHost {
     }
   }
 
+  /// **核心 → 插件：`station/cancel` 通知**（流式回填的中断信号）。
+  ///
+  /// 单向通知、不等应答：插件收到后应停止推流并以 `done`（或直接停发）收尾。
+  /// 核心侧在收到取消后**丢弃**该 request_id 迟到的增量（迟到无害，不报错）。
+  ///
+  /// 为什么需要它：`station/request` 是"一问一答"，插件接管 LLM 后可能长时间推流；
+  /// 用户按下停止时，只有这条下行通知能让插件**立刻**知道别再烧算力了。
+  void cancelStation({required String requestId, String reason = ''}) {
+    if (isClosed) return;
+    try {
+      _write(<String, dynamic>{
+        'jsonrpc': '2.0',
+        'method': 'station/cancel',
+        'params': <String, dynamic>{
+          'request_id': requestId,
+          if (reason.isNotEmpty) 'reason': reason,
+        },
+      });
+    } catch (_) {
+      // 插件已死：由心跳 / 调用路径感知并标记不可用
+    }
+  }
+
   /// 心跳探测：返回**这一拍**是否活着。
   ///
   /// 窗口 = 一个心跳间隔 I（默认 10s）——这是「这一拍有没有心跳」的窗口，

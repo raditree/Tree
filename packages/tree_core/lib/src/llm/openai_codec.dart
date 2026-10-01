@@ -133,6 +133,82 @@ abstract final class OpenAiCodec {
     return events;
   }
 
+  /// 解码一条**非流式响应**（`{choices:[{message:{…}, finish_reason}], usage}`）——
+  /// 也接受裸 message（`{content, reasoning_content, tool_calls}`）。
+  ///
+  /// 为什么需要它：中转站「LLM 处理」的插件可以**一次性回填整条响应**（而不是推流），
+  /// 核心把它展开成与流式**同一套事件**——工具调用草稿拼接、`reasoning_content`
+  /// 回挂、usage 统计因此只有一份实现，两条路径不会各自漂移。
+  ///
+  /// 认不出形状返回空列表（调用方按"未接管"处理，走系统 LLM）。
+  static List<LlmStreamEvent> decodeMessage(Object? response) {
+    if (response is! Map) return const <LlmStreamEvent>[];
+    final List<LlmStreamEvent> events = <LlmStreamEvent>[];
+    final Object? usage = response['usage'];
+    if (usage is Map) {
+      final LlmUsage parsed = decodeUsage(usage);
+      if (!parsed.isEmpty) events.add(LlmUsageEvent(parsed));
+    }
+    Object? message = response;
+    String finishReason = (response['finish_reason'] ?? '').toString();
+    final Object? choices = response['choices'];
+    if (choices is List) {
+      if (choices.isEmpty) return const <LlmStreamEvent>[];
+      final Object? first = choices.first;
+      if (first is! Map) return const <LlmStreamEvent>[];
+      final Object? inner = first['message'];
+      if (inner is Map) {
+        message = inner;
+      } else {
+        // 传进来的其实是流式分片（choices[0].delta）：交给 decodeChunk 更稳
+        return decodeChunk(jsonEncode(response));
+      }
+      if (finishReason.isEmpty) {
+        finishReason = (first['finish_reason'] ?? '').toString();
+      }
+    }
+    if (message is! Map) return const <LlmStreamEvent>[];
+    final Object? content = message['content'];
+    if (content is String && content.isNotEmpty) {
+      events.add(LlmTextDelta(content));
+    }
+    for (final String key in <String>['reasoning_content', 'reasoning']) {
+      final Object? thinking = message[key];
+      if (thinking is String && thinking.isNotEmpty) {
+        events.add(LlmThinkingDelta(thinking));
+        break;
+      }
+    }
+    final Object? toolCalls = message['tool_calls'];
+    if (toolCalls is List) {
+      for (int index = 0; index < toolCalls.length; index++) {
+        final Object? raw = toolCalls[index];
+        if (raw is! Map) continue;
+        final int at = (raw['index'] as num?)?.toInt() ?? index;
+        final Object? function = raw['function'];
+        final String? name = function is Map
+            ? function['name'] as String?
+            : null;
+        final String args = function is Map
+            ? (function['arguments'] as String? ?? '')
+            : '';
+        if ((name == null || name.isEmpty) && args.isEmpty) continue;
+        events.add(
+          LlmToolCallDelta(
+            index: at,
+            id: raw['id'] as String?,
+            name: (name != null && name.isNotEmpty) ? name : null,
+            argumentsDelta: args,
+          ),
+        );
+      }
+    }
+    // 只有"什么内容都没有、也没有 finish"时才判为认不出（空响应）
+    if (events.isEmpty && finishReason.isEmpty) return const <LlmStreamEvent>[];
+    if (finishReason.isNotEmpty) events.add(LlmFinishEvent(finishReason));
+    return events;
+  }
+
   /// 解码 usage 字段。
   static LlmUsage decodeUsage(Map<dynamic, dynamic> usage) {
     int pick(List<String> keys) {

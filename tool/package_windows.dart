@@ -271,6 +271,11 @@ Future<Never> _fail(String message, int code) async {
 ///
 /// 目录不存在返回 -1（"没有可拷的"与"拷了 0 个文件"是两件事，调用方要能区分）。
 /// 递归复制、保留子目录结构：插件常带自己的模块与数据文件。
+///
+/// **另外**把 `docs/plugin-development.md`（系统性插件开发指南）也拷进 `plugins/`：
+/// 应用内「打开插件开发说明」首先找的就是 `plugins/plugin-development.md`
+/// （见 `lib/app_version.dart` 的 `PluginDocs`），发行版因此不必带整个 `docs/`。
+/// 指南缺失不算失败（会退回 `plugins/README.md`），所以这里静默跳过。
 int _copyPlugins(Directory root, Directory releaseDir) {
   final Directory source = Directory(_join(root.path, 'examples/plugins'));
   if (!source.existsSync()) return -1;
@@ -286,6 +291,13 @@ int _copyPlugins(Directory root, Directory releaseDir) {
     final File destination = File(_join(target.path, relative));
     destination.parent.createSync(recursive: true);
     entity.copySync(destination.path);
+    copied++;
+  }
+  final File guide = File(
+    _join(root.path, _join('docs', 'plugin-development.md')),
+  );
+  if (guide.existsSync()) {
+    guide.copySync(_join(target.path, 'plugin-development.md'));
     copied++;
   }
   return copied;

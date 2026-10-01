@@ -8,6 +8,23 @@ import '../util/tokens.dart';
 import 'attachment_prompt.dart';
 import 'workspace_prompt.dart';
 
+/// 「上下文压缩过程」的中转点钩子（中转站点位 `system.relay.context.compact`）。
+///
+/// 返回**摘要正文**（不含 header）表示插件接管了这次压缩；返回 null = 不接管，
+/// 回退内置摘要器（[CompactionService.summarizer]）。抛异常同样回退（fail-open）。
+///
+/// 入参给足原料（内置拼好的提示词 + 待压缩条目 + 指令/表头常量），插件既可以
+/// 直接用提示词去问自己的模型，也可以完全自己重做摘要。
+typedef CompactionRelayHook =
+    Future<String?> Function({
+      required CoreAgent agent,
+      required CoreSession session,
+      required String prompt,
+      required List<CoreMessage> messages,
+      required String instruction,
+      required String header,
+    });
+
 /// 上下文压缩（M7d-4）。
 ///
 /// 问题：桌面端每轮请求都要把**整段会话历史**发给端点，长程任务必然撞上上下文
@@ -37,6 +54,7 @@ class CompactionService {
     required this.store,
     required this.settings,
     this.summarizer,
+    this.relayHook,
     this.keepRecentUserMessages = 3,
     this.keepTailLength = 8,
     this.minSummarizeMessages = 4,
@@ -50,6 +68,19 @@ class CompactionService {
 
   /// 总结器（生产用 LlmSummarizer，测试注入假实现）；null = 不具备压缩能力。
   final ContextSummarizer? summarizer;
+
+  /// 压缩过程的中转点（插件可以先接管）；null = 未接线（回退 [summarizer]）。
+  ///
+  /// 接线后**即使 [summarizer] 为 null 也算具备压缩能力**——否则"把压缩交给插件"
+  /// 这件事会被 `no_summarizer` 挡在门外（插件接管时根本不需要内置总结器）。
+  ///
+  /// **为什么是可写字段而不是构造参数**：压缩服务由核心进程构造，插件总线在稍后
+  /// 才起来（`CoreServer._wirePluginRelayPoints`），两边在构造期互不可见——与
+  /// `LlmAgentEngine.toolTurnCompactor` 同一个理由。
+  CompactionRelayHook? relayHook;
+
+  /// 是否具备压缩能力（内置总结器或插件中转点任一生效）。
+  bool get canCompact => summarizer != null || relayHook != null;
 
   /// 保留最近多少条用户消息原文。
   final int keepRecentUserMessages;
@@ -97,7 +128,7 @@ class CompactionService {
     if (session == null) {
       return const CompactionResult(reason: 'no_active_session');
     }
-    if (summarizer == null) {
+    if (!canCompact) {
       return const CompactionResult(reason: 'no_summarizer');
     }
     if (isCompacting(agentId, session.sessionId)) {
@@ -127,7 +158,7 @@ class CompactionService {
     CoreSession session, {
     bool force = false,
   }) async {
-    if (summarizer == null || isCompacting(agent.id, session.sessionId)) {
+    if (!canCompact || isCompacting(agent.id, session.sessionId)) {
       return null;
     }
     final MaxSeqlenBudget budget = maxSeqlenFor(agent);
@@ -344,11 +375,40 @@ class CompactionService {
     if (body.length > summarizeCharLimit) {
       body = '${body.substring(0, summarizeCharLimit)}\n…[截断]';
     }
-    try {
-      final String text = await summarizer!.summarize(
-        agent,
-        '$summarizeInstruction\n\n$body',
+    final String prompt = '$summarizeInstruction\n\n$body';
+    // 中转站点位「上下文压缩过程」：插件可以先接管（无订阅者 / 未回填 ⇒ 内置摘要器）。
+    // 重入保护在调用方（`_compacting`）：插件在自己的压缩处理里再调 `agent.compact`
+    // 会被显式拒绝，这里不额外加锁。
+    final CompactionRelayHook? relay = relayHook;
+    if (relay != null) {
+      try {
+        final String? fromPlugin = await relay(
+          agent: agent,
+          session: session,
+          prompt: prompt,
+          messages: messages,
+          instruction: summarizeInstruction,
+          header: summaryHeader,
+        );
+        if (fromPlugin != null && fromPlugin.trim().isNotEmpty) {
+          return SummaryText('$summaryHeader\n${fromPlugin.trim()}');
+        }
+      } catch (error) {
+        log?.call('压缩中转点异常（回退内置摘要器）：$error');
+      }
+    }
+    final ContextSummarizer? inner = summarizer;
+    if (inner == null) {
+      // 只有中转点、而它没接管也没回填：如实退到截断摘要（不假装成功）
+      log?.call('压缩中转点未接管，且未配置内置摘要器：回退截断摘要');
+      return SummaryText(
+        '$fallbackHeader\n${_digest(messages, passBackReasoning: passBack)}',
+        degraded: true,
+        degradedReason: '压缩中转点未接管且无内置摘要器',
       );
+    }
+    try {
+      final String text = await inner.summarize(agent, prompt);
       return SummaryText('$summaryHeader\n$text');
     } catch (error) {
       log?.call('LLM 总结失败，回退到截断摘要：$error');

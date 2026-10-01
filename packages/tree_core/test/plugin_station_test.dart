@@ -313,10 +313,10 @@ void main() {
     expect(result.unresponsive.single.reason, contains('活性窗口'));
   });
 
-  test('中转站：**全站唯一订阅者**（先到先得 + 显式 replace），且 fail-open 放行原数据', () async {
+  test('中转站·工具前点位：**全站唯一订阅者**（先到先得 + 显式 replace），且 fail-open 放行原数据', () async {
     final StationHub h = hub();
     final StationScope scope = team('team-1');
-    final RelayStation relay = h.relayFor()!;
+    final RelayStation relay = h.relayPointFor(StationHubIds.relayToolPre)!;
     expect(relay.scopeKeyUnique, isTrue);
 
     final StationSubResult first = h.subscribe(
@@ -326,14 +326,14 @@ void main() {
           StationReply.ok('p1 改写：${request.payload}'),
     );
     expect(first.ok, isTrue);
-    // **另一个 team 也不能再订**（旧口径是"站 × scope 键位唯一"，那会按 team 各放一个；
-    // 新口径是"一个拦截点一个处理者"——要分流由转发型订阅者自己分发）。
+    // 另一个 team 也不能再订**同一个点位**（旧口径是"站 × scope 键位唯一"，那会按 team
+    // 各放一个；新口径是"一个拦截点一个处理者"——要分流由转发型订阅者自己分发）。
     final StationSubResult second = h.subscribe(
       relay.id,
       StationSubscriber(pluginId: 'p2', scope: team('team-2')),
       (StationRequest request) async => const StationReply.ok('p2 改写'),
     );
-    expect(second.ok, isFalse, reason: '中转站只允许一个订阅者（与 scope 无关）');
+    expect(second.ok, isFalse, reason: '中转站点位只允许一个订阅者（与 scope 无关）');
     expect(second.code, 'key_conflict');
     expect(second.error, contains('p1'));
     expect(
@@ -454,7 +454,9 @@ void main() {
     expect(array.data, <Object?>['a', 'b']);
 
     final StationHub other = hub(path: p.join(temp.path, 'other.yaml'));
-    final RelayStation empty = other.relayFor()!;
+    final RelayStation empty = other.relayPointFor(
+      StationHubIds.relayToolPre,
+    )!;
     final StationRelayResult noSubscriber = await empty.relay(
       data: '原数据',
       scope: scope,
@@ -471,6 +473,53 @@ void main() {
     expect(cross.handled, isFalse);
     expect(cross.data, '原数据');
     expect(cross.reason, contains('无匹配订阅者'));
+  });
+
+  test('中转站点位化：**两个不同点位各自可以有订阅者，互不干扰**（点位化的核心收益）', () async {
+    final StationHub h = hub();
+    final StationScope scope = team('team-1');
+    final RelayStation pre = h.relayPointFor(StationHubIds.relayToolPre)!;
+    final RelayStation post = h.relayPointFor(StationHubIds.relayToolPost)!;
+    expect(pre.id, isNot(post.id), reason: '工具前 / 工具后是两个独立实例');
+
+    // 「接管某一段」不再顺带垄断另一段：两个**不同**插件各订一个点位，都成立。
+    // （同一个点位仍然只有一个订阅者——那是上一条用例锁住的语义。）
+    final StationSubResult preSub = h.subscribe(
+      pre.id,
+      StationSubscriber(pluginId: 'pre-plugin', scope: scope),
+      (StationRequest request) async => StationReply.ok('pre 改写'),
+    );
+    expect(preSub.ok, isTrue, reason: preSub.error);
+    final StationSubResult postSub = h.subscribe(
+      post.id,
+      StationSubscriber(pluginId: 'post-plugin', scope: scope),
+      (StationRequest request) async => StationReply.ok('post 改写'),
+    );
+    expect(
+      postSub.ok,
+      isTrue,
+      reason:
+          '另一个点位的订阅者与工具前点位无关：'
+          '点位化之前这个插件会被"已在别处有订阅者"顶掉——'
+          '「职责交给插件、无订阅者才回退系统默认」因此退化成"只能有一个插件"，'
+          '这正是本次点位化要修的问题。${postSub.error}',
+    );
+    expect(pre.subscribers.single.pluginId, 'pre-plugin');
+    expect(post.subscribers.single.pluginId, 'post-plugin');
+
+    // 各自回填自己的那段，互不串台
+    expect((await pre.relay(data: '原数据', scope: scope)).data, 'pre 改写');
+    expect((await post.relay(data: '原数据', scope: scope)).data, 'post 改写');
+
+    // 同一个点位的第二个订阅者仍被拒（唯一订阅者语义没有被点位化削弱）
+    final StationSubResult conflict = h.subscribe(
+      pre.id,
+      StationSubscriber(pluginId: 'third', scope: scope),
+      (StationRequest request) async => const StationReply.ok('third'),
+    );
+    expect(conflict.ok, isFalse);
+    expect(conflict.code, 'key_conflict');
+    expect(pre.subscribers.single.pluginId, 'pre-plugin');
   });
 
   test('广播站：持久公告板按容量裁剪，可回看最近若干条', () async {
@@ -511,10 +560,13 @@ void main() {
     expect(restored.boardLimit, 2);
   });
 
-  test('执行站：白名单 + 隔离 + 挂载位置；不订阅、不触发插件', () async {
+  test('执行站·文件操作点位：白名单 + 隔离 + 挂载位置；不订阅、不触发插件', () async {
     final StationHub h = hub();
     final StationScope scope = team('team-1');
-    final ExecuteStation execute = h.executeFor()!;
+    final ExecuteStation execute = h.executePointFor(StationHubIds.executeFs)!;
+    // 白名单由**点位**决定：本点位只有 fs.* 一族；全命令并集仍可从 builtinCommands 取
+    expect(execute.commands, contains('fs.read'));
+    expect(execute.commands, isNot(contains('ui.push')), reason: 'ui.push 属于前端推送点位');
     expect(ExecuteStation.builtinCommands, contains('fs.read'));
     expect(ExecuteStation.builtinCommands, contains('ui.push'));
     expect(execute.kind.subscribable, isFalse);
@@ -553,7 +605,7 @@ void main() {
     expect(payload['team'], 'team-1');
     expect(payload['mode'], 'local');
 
-    // 白名单外：挂载被拒 + 执行被拒
+    // 白名单外：挂载被拒 + 执行被拒（错误里要能读出"本点位允许什么"）
     expect(
       execute.mount(
         command: 'shell.rm',
@@ -561,14 +613,24 @@ void main() {
         handler: (StationCommandContext context) async =>
             const StationCommandOutcome.ok(),
       ),
-      contains('首命令集'),
+      contains('不属于点位'),
+    );
+    // 别的点位的命令也挂不上（命令族之间互不干扰：这是点位化的直接收益）
+    expect(
+      execute.mount(
+        command: 'terminal.exec',
+        mountId: 'x',
+        handler: (StationCommandContext context) async =>
+            const StationCommandOutcome.ok(),
+      ),
+      contains(StationHubIds.executeFs),
     );
     final StationCommandResult denied = await execute.execute(
       command: 'shell.rm',
       scope: scope,
     );
     expect(denied.ok, isFalse);
-    expect(denied.error, contains('首命令集'));
+    expect(denied.error, contains('不属于点位'));
 
     // 站点不再持有 scope（全局唯一），因此**站点层不做隔离拒绝**：scope 原样交给
     // 挂载位置。真正的跨 team / 跨模式 fail-closed 落点在两处（都另有专项测试）：
@@ -615,11 +677,11 @@ void main() {
     expect(sub.code, 'not_subscribable');
   });
 
-  test('执行站：ui.push 复用 4.1 的 card 槽位帧（带 team_id，发到广播）', () async {
+  test('执行站·前端推送点位：ui.push 复用 4.1 的 card 槽位帧（带 team_id，发到广播）', () async {
     final List<Map<String, dynamic>> frames = <Map<String, dynamic>>[];
     final StationHub h = hub(frameSink: frames.add);
     final StationScope scope = team('team-1');
-    final ExecuteStation execute = h.executeFor()!;
+    final ExecuteStation execute = h.executePointFor(StationHubIds.executeUi)!;
     final StationCommandResult pushed = await execute.execute(
       command: 'ui.push',
       scope: scope,

@@ -115,16 +115,22 @@ class VersionInfo {
   }
 }
 
-/// 打开**插件开发说明**（发行目录的 `plugins/README.md` / 仓库的 `examples/plugins/README.md`）。
+/// 打开**插件开发指南**（发行目录 `plugins/plugin-development.md` / 仓库 `docs/plugin-development.md`）。
 ///
-/// 为什么打开文件而不是在应用内重写一份：插件的协议面（五个 RPC、四类站、
-/// `ui/manifest`、`plugins.yaml` 全字段）**已经在 README 里写全了**，再造一份
+/// 为什么打开文件而不是在应用内重写一份：插件的协议面（RPC 清单、17 个点位、
+/// `ui/manifest`、`plugins.yaml` 全字段、流式回填）**已经在指南里写全了**，再造一份
 /// 应用内文档就是第二份真相源，必然与代码漂移。入口的职责只是"把人送到那份文档"。
 class PluginDocs {
   PluginDocs._();
 
-  /// 插件开发说明文件名。
+  /// 系统性指南文件名（**首选**）。
+  static const String guideName = 'plugin-development.md';
+
+  /// 简版说明文件名（指南缺失时的兜底；`examples/plugins/README.md` 是示例索引）。
   static const String readmeName = 'README.md';
+
+  /// 候选文件名（**顺序即优先级**：系统性指南优先，简版说明兜底）。
+  static const List<String> docNames = <String>[guideName, readmeName];
 
   /// 发行目录下的插件目录名（安装包与 Release 目录都是这个名字）。
   static const String bundledDirName = 'plugins';
@@ -132,34 +138,52 @@ class PluginDocs {
   /// 仓库里的插件目录相对路径（开发态）。
   static const String repoDirName = 'examples/plugins';
 
-  /// 解析插件开发说明的**候选路径**（按优先级）。
+  /// 仓库里的文档目录（开发态；`docs/plugin-development.md` 在这里）。
+  static const String repoDocDirName = 'docs';
+
+  /// 解析插件开发指南的**候选路径**（按优先级）。
   ///
   /// 顺序即优先级，且**只列可能存在的路径**——调用方按顺序取第一个存在的：
-  /// 1. [overrideDir]：调用方显式指定（测试 / 将来加设置项）；
-  /// 2. **应用目录**下的 `plugins/README.md`：发行版布局（安装包与 Tree.exe 同级
-  ///    拷贝 `examples/plugins/` 的内容，见 `tool/package_windows.dart`）；
-  /// 3. 从可执行文件目录**逐级向上**找 `examples/plugins/README.md`：`flutter run`
-  ///    的产物在 `build/windows/x64/runner/Debug/`，仓库根在好几层之上；
-  ///    同时覆盖"树内任意深度启动"的情形（与核心找内置插件脚本同一思路）。
+  /// 1. [overrideDir]：调用方显式指定（测试 / 将来加设置项）——两个文件名都认；
+  /// 2. **应用目录**下的 `plugins/<name>`：发行版布局（安装包与 Tree.exe 同级
+  ///    拷贝 `examples/plugins/` 的内容与 `docs/plugin-development.md`，
+  ///    见 `tool/package_windows.dart`）——两个文件名都认；
+  /// 3. 从可执行文件目录**逐级向上**找仓库布局：
+  ///    - `docs/plugin-development.md`：**只认指南这个专有文件名**。泛化的
+  ///      `README.md` 在任意祖先目录里都可能存在（实测：Flutter SDK 自带
+  ///      `flutter/docs/README.md`），认它会把用户送到一份**无关文档**上；
+  ///    - `examples/plugins/<name>`：两个文件名都认（仓库里的示例目录是专有路径）。
+  ///
+  /// `flutter run` 的产物在 `build/windows/x64/runner/Debug/`，仓库根在好几层之上；
+  /// 逐级向上同时覆盖"树内任意深度启动"的情形（与核心找内置插件脚本同一思路）。
   static List<String> candidatePaths({
     String? overrideDir,
     String? executablePath,
   }) {
     final List<String> candidates = <String>[];
-    void add(String dir) {
-      final String path = p.join(dir, readmeName);
-      if (!candidates.contains(path)) candidates.add(path);
+    void add(String dir, List<String> names) {
+      for (final String name in names) {
+        final String path = p.join(dir, name);
+        if (!candidates.contains(path)) candidates.add(path);
+      }
     }
 
     if (overrideDir != null && overrideDir.trim().isNotEmpty) {
-      add(overrideDir.trim());
+      add(overrideDir.trim(), docNames);
     }
     final String exePath = executablePath ?? Platform.resolvedExecutable;
     final Directory appDir = File(exePath).parent;
-    add(p.join(appDir.path, bundledDirName));
+    add(p.join(appDir.path, bundledDirName), docNames);
     Directory? dir = appDir;
     for (int depth = 0; depth < 8 && dir != null; depth++) {
-      add(p.join(dir.path, p.joinAll(repoDirName.split('/'))));
+      add(
+        p.join(dir.path, p.joinAll(repoDocDirName.split('/'))),
+        <String>[guideName],
+      );
+      add(
+        p.join(dir.path, p.joinAll(repoDirName.split('/'))),
+        docNames,
+      );
       dir = dir.parent;
     }
     return candidates;
@@ -177,10 +201,10 @@ class PluginDocs {
     return null;
   }
 
-  /// 用系统默认程序打开插件开发说明；成功返回 null，失败返回可读中文原因。
+  /// 用系统默认程序打开插件开发指南；成功返回 null，失败返回可读中文原因。
   ///
   /// 与「用资源管理器定位文件」（`FileReveal`）是两件事：这里要**打开内容**
-  /// （README 是给人读的），所以交给系统默认关联程序——用户拿什么看 markdown
+  /// （指南是给人读的），所以交给系统默认关联程序——用户拿什么看 markdown
   /// 由他自己决定，应用不挑编辑器。
   static Future<String?> openReadme({
     String? overrideDir,
@@ -191,8 +215,9 @@ class PluginDocs {
       executablePath: executablePath,
     );
     if (path == null) {
-      return '未找到插件开发说明（$readmeName）。\n'
-          '查找位置：应用目录下的 $bundledDirName/ 与仓库的 $repoDirName/。\n'
+      return '未找到插件开发指南（${docNames.join(' 或 ')}）。\n'
+          '查找位置：应用目录下的 $bundledDirName/、仓库的 $repoDocDirName/ 与 '
+          '$repoDirName/。\n'
           '发行版请确认安装完整（$bundledDirName 目录与主程序同级）；'
           '源码仓库请确认在仓库内运行。';
     }

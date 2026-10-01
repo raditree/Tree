@@ -166,9 +166,10 @@ void main() {
     expect(jsonDecode(lines.single), containsPair('type', 'task'));
 
     // 站点体系：插件启动 = 工具表刷新点 ⇒ 插件挂到**全局唯一的收集站**上。
-    // 快照恒看到四类站（三站内置 + 收集站）；收集站是唯一有订阅者的那个。
+    // 快照恒看到全部内置点位（广播 3 + 执行 7 + 中转 6 = 16）+ 收集站；
+    // 收集站是唯一有订阅者的那个。
     final List<dynamic> stations = bus.snapshot()['stations'] as List<dynamic>;
-    expect(stations, hasLength(4));
+    expect(stations, hasLength(17), reason: '16 个内置点位 + 收集站');
     final Map<String, dynamic> station = stations.firstWhere(
       (dynamic s) => (s as Map<String, dynamic>)['kind'] == 'collect',
     ) as Map<String, dynamic>;
@@ -223,19 +224,19 @@ void main() {
 
     final Map<String, dynamic> snapshot = bus.snapshot();
     expect(snapshot['enabled'], isTrue);
-    // 站点全局唯一：快照恒看到四类站（三站内置 + 接入点现建的收集站），
+    // 站点全局唯一：快照恒看到**全部内置点位**（16 个）+ 接入点现建的收集站，
     // 与"有没有插件成功启动"无关（坏插件不该让站点段时有时无）。
+    final List<String> prebuiltPoints = StationPoints.all
+        .where((StationPointSpec spec) => spec.kind != StationKind.collect)
+        .map((StationPointSpec spec) => spec.id)
+        .toList()
+      ..sort();
     expect(
       (snapshot['stations'] as List<dynamic>)
           .map((dynamic s) => (s as Map<String, dynamic>)['station_id'])
           .toList(),
-      <String>[
-        StationHubIds.collect,
-        StationHubIds.broadcast,
-        StationHubIds.execute,
-        StationHubIds.relay,
-      ],
-      reason: '按 id 字典序：plugin.* < system.*',
+      <String>[StationHubIds.collect, ...prebuiltPoints],
+      reason: '按 id 字典序：plugin.* < system.*；收集站不预建但接入点会现建',
     );
     expect(
       (snapshot['stations'] as List<dynamic>).every(

@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'station_points.dart';
 import 'station_runtime.dart';
 import 'station_schema.dart';
 import 'station_scope.dart';
@@ -284,6 +285,9 @@ sealed class StationInstance {
   /// 当前时间（epoch 秒）。
   static int nowSeconds() => DateTime.now().millisecondsSinceEpoch ~/ 1000;
 
+  /// 站点请求 id 的自增序号（**同一秒内并发多路时也不会撞号**，见 [RelayStation.relay]）。
+  static int _requestSeq = 0;
+
   /// 隔离校验（子类 trigger 的第一道闸）：**校验消息信封自身**。
   ///
   /// 站点已全局化（每类站一个实例，不绑 team / 不绑 mode），所以这里没有
@@ -407,6 +411,8 @@ sealed class StationInstance {
           builtin: builtin,
           createdAt: createdAt,
           subscribers: subscribers,
+          // 白名单由**点位表**决定，不从盘上读：点位新增命令后旧文件也能立刻生效
+          commands: StationPoints.byId(id)?.commands,
         );
       case StationKind.relay:
         return RelayStation(
@@ -706,7 +712,8 @@ class StationCommandMount {
 
 /// **执行站**：插件**主动下命令**，由挂载位置执行；**不订阅、不触发插件**。
 ///
-/// - 首命令集 = [builtinCommands]（白名单；白名单外的命令一律显式拒绝）；
+/// - 命令白名单 = [commands]（**点位决定**：执行站按命令族拆成多个实例，见
+///   `station_points.dart`；白名单外的命令一律显式拒绝）；
 /// - 「执行器只是站点的一种挂载位置」：前端执行器 / 插件 / 系统内置都可以
 ///   [mount] 自己的处理器；
 /// - 触发 = [execute]（实例的一个方法）。
@@ -719,20 +726,23 @@ final class ExecuteStation extends StationInstance {
     super.builtin,
     super.createdAt,
     super.subscribers,
-  });
+    List<String>? commands,
+  }) : commands = List<String>.unmodifiable(
+         commands ?? _commandsOf(id),
+       );
 
-  /// 首命令集（白名单）：插件只能下这些命令。
-  static const Set<String> builtinCommands = <String>{
-    'fs.read',
-    'fs.write',
-    'fs.list',
-    'fs.grep',
-    'terminal.exec',
-    'agent.message',
-    'agent.stop',
-    'agent.compact',
-    'ui.push',
-  };
+  /// **本点位**的命令白名单（点位表决定；未知点位 = 空表 ⇒ 什么命令都拒绝）。
+  final List<String> commands;
+
+  /// 从点位表取某执行站点的命令（落盘恢复时也用这条，避免白名单丢失）。
+  static List<String> _commandsOf(String id) =>
+      StationPoints.byId(id)?.commands ?? const <String>[];
+
+  /// 首命令集（**全部执行站命令的并集**；挂载位置复核与快照兜底用）。
+  ///
+  /// 单条命令属于哪个点位由 `StationPoints.ownerOfCommand` 决定；实例自己的白名单
+  /// 见 [commands]。
+  static Set<String> get builtinCommands => StationPoints.allCommands;
 
   final List<StationCommandMount> _mounts = <StationCommandMount>[];
 
@@ -753,9 +763,9 @@ final class ExecuteStation extends StationInstance {
     required StationCommandHandler handler,
     int priority = 0,
   }) {
-    if (!builtinCommands.contains(command)) {
-      final List<String> allowed = builtinCommands.toList()..sort();
-      return '命令 $command 不在首命令集内（允许：${allowed.join('、')}）';
+    if (!commands.contains(command)) {
+      final List<String> allowed = commands.toList()..sort();
+      return '命令 $command 不属于点位 $id（本点位允许：${allowed.join('、')}）';
     }
     if (mountId.trim().isEmpty) return '挂载位置 id 不能为空';
     _mounts.removeWhere(
@@ -800,13 +810,13 @@ final class ExecuteStation extends StationInstance {
         error: '命令被拒（隔离）：${verdict.reason}',
       );
     }
-    if (!builtinCommands.contains(command)) {
+    if (!commands.contains(command)) {
       counters.bump('invalid_response');
-      final List<String> allowed = builtinCommands.toList()..sort();
+      final List<String> allowed = commands.toList()..sort();
       return StationCommandResult(
         command: command,
         ok: false,
-        error: '命令 $command 不在首命令集内（允许：${allowed.join('、')}）',
+        error: '命令 $command 不属于点位 $id（本点位允许：${allowed.join('、')}）',
       );
     }
     final List<StationCommandMount> candidates =
@@ -868,7 +878,7 @@ final class ExecuteStation extends StationInstance {
 
   @override
   Map<String, dynamic> extraDescribe() => <String, dynamic>{
-    'commands': (builtinCommands.toList()..sort()),
+    'commands': (commands.toList()..sort()),
     'mounts': _mounts.map((StationCommandMount m) => m.describe()).toList(),
   };
 }
@@ -946,8 +956,10 @@ final class RelayStation extends StationInstance {
     }
     counters.bump('requests');
     final StationRequest request = StationRequest(
+      // **请求 id 必须唯一**：插件用它关联流式回填（`station/stream`），
+      // 同一秒内并发多路（多 agent / 并行工具调用）时"秒 + 订阅者下标"会撞号。
       requestId:
-          'relay-${StationInstance.nowSeconds()}-${subscribers.indexOf(subscriber)}',
+          'relay-${StationInstance.nowSeconds()}-${++StationInstance._requestSeq}',
       stationId: id,
       kind: StationKind.relay,
       scope: scope,
@@ -964,6 +976,7 @@ final class RelayStation extends StationInstance {
         data: data,
         handled: false,
         pluginId: subscriber.pluginId,
+        requestId: request.requestId,
         reason: '订阅者未回填：${reply.error}（原数据放行）',
       );
     }
@@ -975,6 +988,7 @@ final class RelayStation extends StationInstance {
         data: data,
         handled: true,
         pluginId: subscriber.pluginId,
+        requestId: request.requestId,
         reason: '订阅者选择不改动数据',
       );
     }
@@ -985,6 +999,7 @@ final class RelayStation extends StationInstance {
         data: payload,
         handled: true,
         pluginId: subscriber.pluginId,
+        requestId: request.requestId,
       );
     }
     counters.bump('invalid_response');
@@ -992,6 +1007,7 @@ final class RelayStation extends StationInstance {
       data: data,
       handled: false,
       pluginId: subscriber.pluginId,
+      requestId: request.requestId,
       reason:
           '回填类型非法（只接受 string / 对象 / 数组替换，空表示不改动），'
           '实际是 ${payload.runtimeType}（原数据放行）',

@@ -17,6 +17,7 @@ import '../../io/websocket_service.dart';
 import '../../io/workspace_refresh_service.dart';
 import '../services/message_replay_guard.dart';
 import '../services/plugin_ui_registry.dart';
+import '../services/session_rename.dart';
 import 'message_input.dart';
 import 'message_list.dart';
 import 'plugin_ui_slots.dart';
@@ -403,6 +404,31 @@ class _MessagePanelState extends State<MessagePanel> {
       );
     });
     _webSocket.registerKnownSessions(<String>[sessionId]);
+  }
+
+  /// 处理后端 `session_renamed` 推送（点位化新增）：
+  /// 执行站命令 `session.rename` 由**插件**发起，前端没有"自己 setState"这条路径，
+  /// 只能靠这条帧把会话列表里的标题改过来（否则要切走再切回才看得到新标题）。
+  ///
+  /// 变换逻辑在 [SessionRename]（纯函数，可直接单测）；这里只做 widget 侧的
+  /// 取参、判空与 `setState`。
+  void _handleSessionRenamed(Map<String, dynamic> data) {
+    if (!mounted) return;
+    final ({String agentId, String sessionId, String title}) payload =
+        SessionRename.parse(data);
+    final Agent? agent = widget.selectedAgent;
+    if (agent == null) return;
+    final List<ChatSession>? next = SessionRename.apply(
+      _sessions,
+      currentAgentId: agent.id,
+      agentId: payload.agentId,
+      sessionId: payload.sessionId,
+      title: payload.title,
+    );
+    if (next == null) return;
+    setState(() {
+      _sessions = next;
+    });
   }
 
   /// 拉取当前 agent 的会话列表；切换会话时清空消息并重新加载历史
@@ -801,6 +827,9 @@ class _MessagePanelState extends State<MessagePanel> {
     } else if (type == 'session_created') {
       // 接收方会话保障（Task 7.2）：后端为接收 agent 新建会话后即时入列
       _handleSessionCreated(data);
+    } else if (type == 'session_renamed') {
+      // 点位化：插件经执行站 `session.rename` 改名后，标题要即时更新
+      _handleSessionRenamed(data);
     }
     // 其余控制消息（file_sync_progress / heartbeat / error 等）忽略
   }

@@ -141,29 +141,72 @@ class WorkspaceToolRunner implements ToolRunner {
     ToolInvocation invocation, {
     bool Function()? isCancelled,
   }) async {
-    // **工具调用前**：把整条调用报文交给中转站（插件可改参数，也可什么都不改）。
+    // **工具调用前**：把整条调用报文交给中转站点位「工具调用前」（插件可改参数，
+    // 也可什么都不改）+ 广播站点位「工具调用前」（单向通知，不等回包）。
     // 未接线 / 无订阅者 / 任何异常 ⇒ 原样返回 null，走与原实现完全一致的路径。
     final ({ToolInvocation invocation, int round}) before = await _relayBefore(
       invocation,
     );
-    final ToolInvocation effective = before.invocation;
+    final ToolOutcome outcome = await _execute(
+      before.invocation,
+      isCancelled: isCancelled,
+    );
+    return _relayAfter(before.invocation, outcome, round: before.round);
+  }
+
+  /// **插件经执行站发起的工具调用**（执行站命令 `tool.call` 的落点）。
+  ///
+  /// [relay] = false（默认）⇒ **绕开**工具中转与工具广播，直接执行。
+  /// 为什么默认绕开：中转站是"一问一答 + 等回包"的，若插件既是 `tool.call` 的发起方、
+  /// 又是该点位的唯一订阅者，单线程插件会在"等命令回包"与"处理自己引发的站点请求"
+  /// 之间自锁。要审计自己的调用就显式 `relay: true`（代价自负：必须能并发处理）。
+  ///
+  /// 无论走不走中转，**隔离与权限口径不变**：仍走同一个 [ToolRunner] 实现、同一份
+  /// 工作空间解析（命令层的四元组校验在 `execute_mounts._resolveTarget`）。
+  Future<ToolOutcome> runFromPlugin(
+    ToolInvocation invocation, {
+    required String sourcePluginId,
+    bool relay = false,
+    bool Function()? isCancelled,
+  }) async {
+    if (relay) {
+      final ({ToolInvocation invocation, int round}) before = await _relayBefore(
+        invocation,
+        origin: 'plugin',
+        sourcePluginId: sourcePluginId,
+      );
+      final ToolOutcome outcome = await _execute(
+        before.invocation,
+        isCancelled: isCancelled,
+      );
+      return _relayAfter(
+        before.invocation,
+        outcome,
+        round: before.round,
+        origin: 'plugin',
+        sourcePluginId: sourcePluginId,
+      );
+    }
+    return _execute(invocation, isCancelled: isCancelled);
+  }
+
+  /// 工具执行的**核心分派**（不含站点中转 / 广播）：MCP / 插件 / 内置工具。
+  ///
+  /// 抽出来是为了让"插件发起的调用"能走同一条执行路径而**不触发站点**——绕开站点
+  /// 绝不该绕开执行本身（否则两个入口的行为会各自漂移）。
+  Future<ToolOutcome> _execute(
+    ToolInvocation effective, {
+    bool Function()? isCancelled,
+  }) async {
     // MCP 工具（含命名空间工具）不经 BuiltinTools 的 switch：它们的名字是
     // 动态的，且同样不依赖工作空间。
     final McpService? mcp = mcpService;
     if (mcp != null && McpTool.handles(effective.name)) {
-      return _relayAfter(
-        effective,
-        _truncate(await McpTool.run(effective, mcp)),
-        round: before.round,
-      );
+      return _truncate(await McpTool.run(effective, mcp));
     }
     final PluginBus? plugins = pluginBus;
     if (plugins != null && PluginTool.handles(effective.name)) {
-      return _relayAfter(
-        effective,
-        _truncate(await PluginTool.run(effective, plugins)),
-        round: before.round,
-      );
+      return _truncate(await PluginTool.run(effective, plugins));
     }
     // 不依赖工作空间的工具（set_todo_list / ask_user_question）先走：工作空间
     // 不可用（SSH 配置不全等）不该连带它们一起失败。
@@ -171,14 +214,10 @@ class WorkspaceToolRunner implements ToolRunner {
     if (BuiltinTools.needsWorkspace(effective.name)) {
       io = await _ioFor(effective.agentId);
       if (io == null) {
-        return _relayAfter(
-          effective,
-          ToolOutcome(
-            '无法准备工作空间：${effective.agentId} 的工作目录不可用，'
-            '或 SSH 配置不完整/尚未接入（详见核心日志）',
-            isError: true,
-          ),
-          round: before.round,
+        return ToolOutcome(
+          '无法准备工作空间：${effective.agentId} 的工作目录不可用，'
+          '或 SSH 配置不完整/尚未接入（详见核心日志）',
+          isError: true,
         );
       }
     }
@@ -198,7 +237,7 @@ class WorkspaceToolRunner implements ToolRunner {
       withMessage: messageDispatcher != null,
       withSpec: specService != null,
     );
-    return _relayAfter(effective, _truncate(outcome), round: before.round);
+    return _truncate(outcome);
   }
 
   /// **工具调用前**的中转：插件回填的报文里 `arguments` 即生效参数。
@@ -209,11 +248,26 @@ class WorkspaceToolRunner implements ToolRunner {
   /// 返回的 `round` 是这次调用的序号（同一次 `run` 的 pre / post 同值）；
   /// **按调用分配**（不是实例字段）——同名工具可能被多路并行调用，用共享字段会串号。
   Future<({ToolInvocation invocation, int round})> _relayBefore(
-    ToolInvocation invocation,
-  ) async {
+    ToolInvocation invocation, {
+    String origin = 'agent',
+    String sourcePluginId = '',
+  }) async {
     final int round = ++_relaySeq;
     final PluginBus? plugins = pluginBus;
     if (plugins == null) return (invocation: invocation, round: round);
+    // 广播站点位（**单向通知，不等回包**）：与中转站同一位置、同一份报文。
+    // 先广播再中转：广播的 pre 语义是"这次调用即将发生"（不该等改写结果）。
+    plugins.announceToolCall(
+      phase: 'pre',
+      tool: invocation.name,
+      callId: invocation.id,
+      round: round,
+      agentId: invocation.agentId,
+      sessionId: invocation.sessionId,
+      arguments: invocation.arguments,
+      origin: origin,
+      sourcePluginId: sourcePluginId,
+    );
     final Map<String, dynamic>? relayed = await plugins.relayToolCall(
       phase: 'pre',
       tool: invocation.name,
@@ -222,6 +276,8 @@ class WorkspaceToolRunner implements ToolRunner {
       agentId: invocation.agentId,
       sessionId: invocation.sessionId,
       arguments: invocation.arguments,
+      origin: origin,
+      sourcePluginId: sourcePluginId,
     );
     if (relayed == null) return (invocation: invocation, round: round);
     final Object? rawArguments = relayed['arguments'];
@@ -254,9 +310,25 @@ class WorkspaceToolRunner implements ToolRunner {
     ToolInvocation invocation,
     ToolOutcome outcome, {
     required int round,
+    String origin = 'agent',
+    String sourcePluginId = '',
   }) async {
     final PluginBus? plugins = pluginBus;
     if (plugins == null) return outcome;
+    // 广播站点位（单向通知）：这次调用的结果（含错误）
+    plugins.announceToolCall(
+      phase: 'post',
+      tool: invocation.name,
+      callId: invocation.id,
+      round: round,
+      agentId: invocation.agentId,
+      sessionId: invocation.sessionId,
+      arguments: invocation.arguments,
+      result: outcome.content,
+      isError: outcome.isError,
+      origin: origin,
+      sourcePluginId: sourcePluginId,
+    );
     final Map<String, dynamic>? relayed = await plugins.relayToolCall(
       phase: 'post',
       tool: invocation.name,
@@ -267,6 +339,8 @@ class WorkspaceToolRunner implements ToolRunner {
       arguments: invocation.arguments,
       result: outcome.content,
       isError: outcome.isError,
+      origin: origin,
+      sourcePluginId: sourcePluginId,
     );
     if (relayed == null) return outcome;
     final Object? rawResult = relayed['result'];

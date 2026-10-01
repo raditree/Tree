@@ -4,6 +4,7 @@ import '../store/atomic_file.dart';
 import '../store/yaml_codec.dart';
 import 'station_ids.dart';
 import 'station_instance.dart';
+import 'station_points.dart';
 import 'station_runtime.dart';
 import 'station_schema.dart';
 
@@ -40,9 +41,13 @@ class StationStore {
 
   /// 落盘格式版本（将来结构变更时用于迁移；未知版本按当前结构宽容解析）。
   ///
-  /// 站点全局化**没有**升版本号：结构未变（仍是 id/kind/.../subscribers），
-  /// 变的只是 id 的取值口径，因此用**读侧迁移**把旧 `base@team@mode` 归并到常量 id，
-  /// 旧文件仍可被旧代码与人工阅读。
+  /// **没有升版本号**（两次口径变更都只动 id 取值，结构未变：仍是
+  /// id/kind/…/subscribers），因此用**读侧迁移**接住旧文件：
+  /// - 第一代 `baseId@team@mode` ⇒ 按 base 归并成一个点位；
+  /// - 第二代全局 id（`system.relay` / `system.execute`）⇒ [migrateLegacy] 的
+  ///   **退役映射**：`system.relay` 拆成工具前/后两个点位（订阅复制过去），
+  ///   `system.execute` 丢弃（执行站不可订阅）。
+  /// 旧文件仍可被人工阅读；新文件给旧核心时"未知 kind 丢该条、已知 kind 原样保留"。
   static const int version = 1;
 
   /// 由插件配置文件路径推导（保持 <数据根>/config/ 同目录，风格一致）。
@@ -77,13 +82,20 @@ class StationStore {
     return migrateLegacy(parsed);
   }
 
-  /// 把旧 `baseId@team@mode` 站点归并到全局常量 id（幂等；纯函数，便于测试）。
+  /// 把旧格式（`baseId@team@mode`）与**已退役点位**归并到当前点位 id（幂等；纯函数）。
   ///
   /// 归并规则：
-  /// - **按基础 id 分组**（`system.relay` / `system.broadcast` / `system.execute` /
-  ///   `plugin.tool.define`），每组只留**一个**实例，id 换成常量；
-  /// - 组的类型以**基础 id 对应的类型**为准（`system.*` 与 `plugin.tool.define`）；
-  ///   `plugin.` 开头的自建站 id 不含 `@` 语义，原样保留、不参与归并；
+  /// - **退役 id 迁移**（点位化，2026-10-01）：
+  ///   - `system.relay`（旧：工具前/后共用一个实例、靠 payload.phase 区分）⇒ 拆成
+  ///     [StationHubIds.relayToolPre] 与 [StationHubIds.relayToolPost] **两个点位**，
+  ///     旧订阅**复制**到两处（原订阅者行为等价：照样 pre / post 都收到，想只收
+  ///     一个的自己退订另一个）；
+  ///   - `system.execute`（旧：九条命令共用一个实例）⇒ **直接丢弃**：执行站不可订阅，
+  ///     没有订阅需要迁移；
+  /// - **按基础 id 分组**（含 `@` 的旧 `baseId@team@mode`）：每组只留**一个**实例，
+  ///   id 换成点位常量；
+  /// - 组的类型以**基础 id 对应的点位**为准；`plugin.` 开头的自建站 id 不含 `@`
+  ///   语义，原样保留、不参与归并；
   /// - **订阅者合并去重**（键 = `pluginId|scope.key`），保留最早 `subscribed_at`；
   /// - `created_at` 取最小（站的"资历"跨迁移保留）；
   /// - 广播站公告板按 `(ts, seq)` 合并排序、去掉重复 seq、按 `board_limit` 截尾；
@@ -94,10 +106,9 @@ class StationStore {
   ) {
     bool migrated = false;
     final List<StationInstance> out = <StationInstance>[];
-    // 分组：常量 id → 该组已收集的旧实例
+    // 分组：点位 id → 该组已收集的旧实例（同组会被 [_mergeGroup] 合成一个实例）
     final Map<String, List<StationInstance>> groups =
         <String, List<StationInstance>>{};
-    final Map<String, String> groupBase = <String, String>{};
 
     String baseOf(String id) {
       final int at = id.indexOf('@');
@@ -106,19 +117,28 @@ class StationStore {
 
     for (final StationInstance station in parsed) {
       final String id = station.id.trim();
+      final String base = baseOf(id);
+      // **退役 id 映射**（含更早一代的 `system.relay@team@mode`：base 一样是
+      // `system.relay`，绝不能因为"点位表里查不到它"就把订阅丢掉）。
+      final List<String>? retired = _retiredTargets(base);
+      if (retired != null) {
+        migrated = true;
+        for (final String target in retired) {
+          groups.putIfAbsent(target, () => <StationInstance>[]).add(station);
+        }
+        continue;
+      }
       if (!id.contains('@')) {
-        // 已是全局常量 id（或插件自建 id）：原样保留
+        // 已是点位常量 id（或插件自建 id）：原样保留
         out.add(station);
         continue;
       }
-      final String base = baseOf(id);
       if (base.isEmpty) {
         out.add(station);
         continue;
       }
       migrated = true;
       groups.putIfAbsent(base, () => <StationInstance>[]).add(station);
-      groupBase[base] = base;
     }
 
     for (final MapEntry<String, List<StationInstance>> entry in groups.entries) {
@@ -128,6 +148,22 @@ class StationStore {
       if (merged != null) out.add(merged);
     }
     return (stations: out, migrated: migrated);
+  }
+
+  /// 退役 id → 现在的点位 id（null = 不是退役 id）。
+  ///
+  /// - `system.relay` ⇒ 工具前 / 工具后**两个点位**（旧订阅复制到两处，行为等价：
+  ///   原订阅者照样 pre / post 都收到，想只收一个的自己退订另一个）；
+  /// - `system.execute` ⇒ **空列表 = 丢弃**（执行站不可订阅，没有订阅需要迁移）。
+  static List<String>? _retiredTargets(String base) {
+    if (base == StationHubIds.legacyRelay) {
+      return <String>[
+        StationHubIds.relayToolPre,
+        StationHubIds.relayToolPost,
+      ];
+    }
+    if (base == StationHubIds.legacyExecute) return const <String>[];
+    return null;
   }
 
   /// 归并同基础 id 的一组旧实例（类型由基础 id 决定；未知基础 id 返回 null = 丢弃）。
@@ -165,8 +201,14 @@ class StationStore {
     }
     final int? created = createdAt == 0 ? null : createdAt;
 
-    switch (base) {
-      case StationHubIds.broadcast:
+    // 类型与说明由**点位表**决定（不再写死四个 base id 的 switch）。
+    final StationPointSpec? spec = StationPoints.byId(base);
+    if (spec == null) {
+      // 未知基础 id 的旧格式条目：无法判定类型，丢弃（不猜）
+      return null;
+    }
+    switch (spec.kind) {
+      case StationKind.broadcast:
         final List<StationBoardEntry> board = <StationBoardEntry>[];
         final Set<int> seqs = <int>{};
         int boardSeq = 0;
@@ -187,8 +229,9 @@ class StationStore {
             ? board.sublist(board.length - boardLimit)
             : board;
         return BroadcastStation(
-          id: StationHubIds.broadcast,
-          description: _descriptionOf(members, '广播站'),
+          id: spec.id,
+          description: _descriptionOf(members, spec.label),
+          maxSubscriptions: spec.maxSubscriptions,
           builtin: true,
           createdAt: created,
           subscribers: subscribers,
@@ -196,24 +239,26 @@ class StationStore {
           boardSeq: boardSeq,
           board: trimmed,
         );
-      case StationHubIds.execute:
+      case StationKind.execute:
         return ExecuteStation(
-          id: StationHubIds.execute,
-          description: _descriptionOf(members, '执行站'),
+          id: spec.id,
+          description: _descriptionOf(members, spec.label),
+          maxSubscriptions: spec.maxSubscriptions,
           builtin: true,
           createdAt: created,
           subscribers: subscribers,
+          commands: spec.commands,
         );
-      case StationHubIds.relay:
+      case StationKind.relay:
         return RelayStation(
-          id: StationHubIds.relay,
-          description: _descriptionOf(members, '中转站'),
-          maxSubscriptions: 16,
+          id: spec.id,
+          description: _descriptionOf(members, spec.label),
+          maxSubscriptions: spec.maxSubscriptions,
           builtin: true,
           createdAt: created,
           subscribers: subscribers,
         );
-      case StationHubIds.collect:
+      case StationKind.collect:
         final StationSchema? schema = members
             .whereType<CollectStation>()
             .map((CollectStation s) => s.schema)
@@ -224,16 +269,14 @@ class StationStore {
             );
         if (schema == null) return null;
         return CollectStation(
-          id: StationHubIds.collect,
-          description: _descriptionOf(members, '收集站'),
+          id: spec.id,
+          description: _descriptionOf(members, spec.label),
           schema: schema,
+          maxSubscriptions: spec.maxSubscriptions,
           builtin: true,
           createdAt: created,
           subscribers: subscribers,
         );
-      default:
-        // 未知基础 id 的旧格式条目：无法判定类型，丢弃（不猜）
-        return null;
     }
   }
 
@@ -258,10 +301,15 @@ class StationStore {
       YamlCodec.encode(
         data,
         header:
-            'Tree 站点实例（M9 站点体系）\n'
-            '站点 = 持久化实例，**每类站全局一个**：id 就是类型常量'
-            '（system.broadcast / system.execute / system.relay / plugin.tool.define），\n'
-            '不含 team / mode——team / agent / session / mode 是每次交互携带的消息 scope，'
+            'Tree 站点实例（M9 站点体系；2026-10-01 点位化）\n'
+            '站点类型四种（广播 / 执行 / 中转 / 收集），每类下有若干**点位**，'
+            '每个点位是一个独立实例：\n'
+            '  广播 system.broadcast[.tool.pre|.tool.post]\n'
+            '  执行 system.execute.fs|terminal|agent|ui|llm|tool|session\n'
+            '  中转 system.relay.tool.pre|tool.post|llm.handle|llm.request|'
+            'context.compact|prompt.system\n'
+            '  收集 plugin.tool.define\n'
+            'id 不含 team / mode——team / agent / session / mode 是每次交互携带的消息 scope，'
             '只用于匹配订阅者。\n'
             '字段：id / 类型 / 订阅上限 / 订阅者列表（+ 收集站 schema、广播站公告板）。\n'
             '本文件可手工编辑；改动在核心下次启动时生效。',

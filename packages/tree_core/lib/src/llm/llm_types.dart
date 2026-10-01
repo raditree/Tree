@@ -50,6 +50,22 @@ class LlmToolCall {
     'type': 'function',
     'function': <String, dynamic>{'name': name, 'arguments': arguments},
   };
+
+  /// 从线协议恢复（**有损单向的逆**：插件改写请求体时用，见 [LlmRequest.tryFromWire]）。
+  ///
+  /// 结构不对返回 null——调用方一律**放行原请求**（fail-open），绝不拿半成品投 LLM。
+  static LlmToolCall? tryFromWire(Object? raw) {
+    if (raw is! Map) return null;
+    final Object? fn = raw['function'];
+    final Map<dynamic, dynamic> body = fn is Map ? fn : raw;
+    final String name = (body['name'] ?? '').toString();
+    if (name.trim().isEmpty) return null;
+    return LlmToolCall(
+      id: (raw['id'] ?? '').toString(),
+      name: name,
+      arguments: (body['arguments'] ?? '').toString(),
+    );
+  }
 }
 
 /// 一条消息里的**内容块**（OpenAI 兼容 `content` 数组的元素）。
@@ -89,6 +105,17 @@ class LlmContentPart {
   Map<String, dynamic> toWire() => type == 'file'
       ? <String, dynamic>{'type': 'file', 'file_id': fileId}
       : <String, dynamic>{'type': 'text', 'text': text};
+
+  /// 从线协议恢复；未知类型返回 null（调用方放行原请求）。
+  static LlmContentPart? tryFromWire(Object? raw) {
+    if (raw is! Map) return null;
+    final String type = (raw['type'] ?? 'text').toString();
+    return switch (type) {
+      'file' => LlmContentPart.file((raw['file_id'] ?? '').toString()),
+      'text' => LlmContentPart.text((raw['text'] ?? '').toString()),
+      _ => null,
+    };
+  }
 }
 
 /// 一条对话消息。
@@ -235,6 +262,64 @@ class LlmMessage {
     }
     return tokens;
   }
+
+  /// 从线协议恢复一条消息（**有损单向的逆**；插件改写请求体时用）。
+  ///
+  /// **有损之处（必须知道）**：
+  /// - `content` 在线协议里可能是数组（多模态）：这里把文本块拼回 [content]、
+  ///   文件块还原成 [contentParts]——与 [toWire] 的分块顺序一致，往返不丢信息；
+  /// - `role` 认不出返回 null（调用方放行原请求）；
+  /// - assistant 的 `content: null` 还原成空串（与 [toWire] 的"空串 ⇄ null"对称）。
+  static LlmMessage? tryFromWire(Object? raw) {
+    if (raw is! Map) return null;
+    final String role = (raw['role'] ?? '').toString();
+    final LlmRole? parsed = switch (role) {
+      'system' => LlmRole.system,
+      'user' => LlmRole.user,
+      'assistant' => LlmRole.assistant,
+      'tool' => LlmRole.tool,
+      _ => null,
+    };
+    if (parsed == null) return null;
+    String content = '';
+    final List<LlmContentPart> parts = <LlmContentPart>[];
+    final Object? rawContent = raw['content'];
+    if (rawContent is String) {
+      content = rawContent;
+    } else if (rawContent is List) {
+      final StringBuffer text = StringBuffer();
+      for (final Object? item in rawContent) {
+        final LlmContentPart? part = LlmContentPart.tryFromWire(item);
+        if (part == null) return null;
+        if (part.type == 'file') {
+          parts.add(part);
+        } else {
+          text.write(part.text);
+        }
+      }
+      content = text.toString();
+    } else if (rawContent != null) {
+      return null;
+    }
+    final List<LlmToolCall> calls = <LlmToolCall>[];
+    final Object? rawCalls = raw['tool_calls'];
+    if (rawCalls is List) {
+      for (final Object? item in rawCalls) {
+        final LlmToolCall? call = LlmToolCall.tryFromWire(item);
+        if (call == null) return null;
+        calls.add(call);
+      }
+    }
+    return LlmMessage(
+      role: parsed,
+      content: content,
+      toolCalls: calls,
+      toolCallId: raw['tool_call_id']?.toString(),
+      name: raw['name']?.toString(),
+      reasoningContent: (raw['reasoning_content'] ?? '').toString(),
+      contentParts: parts,
+    );
+  }
 }
 
 /// 工具声明（M4 提供具体工具；M3 只负责把它发给端点并回灌结果）。
@@ -262,6 +347,25 @@ class LlmToolSpec {
       'parameters': parameters,
     },
   };
+
+  /// 从线协议恢复（插件改写请求体时用）；结构不对返回 null（调用方放行原请求）。
+  static LlmToolSpec? tryFromWire(Object? raw) {
+    if (raw is! Map) return null;
+    final Object? fn = raw['function'];
+    final Map<dynamic, dynamic> body = fn is Map ? fn : raw;
+    final String name = (body['name'] ?? '').toString();
+    if (name.trim().isEmpty) return null;
+    final Object? parameters = body['parameters'];
+    return LlmToolSpec(
+      name: name,
+      description: (body['description'] ?? '').toString(),
+      parameters: parameters is Map
+          ? parameters.map(
+              (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+            )
+          : const <String, dynamic>{},
+    );
+  }
 }
 
 /// 一次补全请求（与厂商无关；由 codec 转成具体请求体）。
@@ -300,6 +404,83 @@ class LlmRequest {
   /// 分母是端点回的真实 prompt_tokens）。
   int contextChars() =>
       messages.fold<int>(0, (int sum, LlmMessage m) => sum + m.charCount);
+
+  /// 发往端点的**请求体形状**（`extra` 平铺，与 [OpenAiCodec.requestBody] 同口径）。
+  ///
+  /// 中转站「投入 LLM 前」把这个交给插件改写；`extra` 也一并给出（插件能改
+  /// `response_format` 这类厂商专用字段）。
+  Map<String, dynamic> toWire({bool stream = false}) => <String, dynamic>{
+    'model': model,
+    'messages': messages.map((LlmMessage m) => m.toWire()).toList(),
+    if (tools.isNotEmpty)
+      'tools': tools.map((LlmToolSpec t) => t.toWire()).toList(),
+    if (maxOutputTokens != null) 'max_tokens': maxOutputTokens,
+    if (reasoningEffort != null) 'reasoning_effort': reasoningEffort,
+    if (temperature != null) 'temperature': temperature,
+    ...extra,
+    'stream': stream,
+  };
+
+  /// 从线协议恢复一个请求（**有损单向的逆**；插件改写请求体后重建用）。
+  ///
+  /// 解析规则（任何一处结构不对就返回 null ⇒ 调用方**放行原请求**）：
+  /// - `model` 必须非空（它决定打哪个端点模型）；
+  /// - `messages` 必须是数组且每条都能还原（见 [LlmMessage.tryFromWire]）；
+  /// - `tools` 可选；`max_tokens` / `reasoning_effort` / `temperature` 可选；
+  /// - **未识别的字段进 [extra]**（例如插件加的 `response_format`）——不静默丢弃，
+  ///   否则"插件改了但没生效"会变成最难查的一类问题。
+  static LlmRequest? tryFromWire(Object? raw) {
+    if (raw is! Map) return null;
+    final String model = (raw['model'] ?? '').toString().trim();
+    if (model.isEmpty) return null;
+    final Object? rawMessages = raw['messages'];
+    if (rawMessages is! List) return null;
+    final List<LlmMessage> messages = <LlmMessage>[];
+    for (final Object? item in rawMessages) {
+      final LlmMessage? message = LlmMessage.tryFromWire(item);
+      if (message == null) return null;
+      messages.add(message);
+    }
+    if (messages.isEmpty) return null;
+    final List<LlmToolSpec> tools = <LlmToolSpec>[];
+    final Object? rawTools = raw['tools'];
+    if (rawTools is List) {
+      for (final Object? item in rawTools) {
+        final LlmToolSpec? spec = LlmToolSpec.tryFromWire(item);
+        if (spec == null) return null;
+        tools.add(spec);
+      }
+    }
+    num? number(Object? value) =>
+        value is num ? value : num.tryParse(value?.toString() ?? '');
+    final num? maxTokens = number(raw['max_tokens']);
+    final num? temperature = number(raw['temperature']);
+    final String reasoning = (raw['reasoning_effort'] ?? '').toString().trim();
+    const Set<String> known = <String>{
+      'model',
+      'messages',
+      'tools',
+      'max_tokens',
+      'temperature',
+      'reasoning_effort',
+      'stream',
+      'stream_options',
+    };
+    final Map<String, dynamic> extra = <String, dynamic>{
+      for (final MapEntry<dynamic, dynamic> entry in raw.entries)
+        if (!known.contains(entry.key.toString()))
+          entry.key.toString(): entry.value,
+    };
+    return LlmRequest(
+      model: model,
+      messages: messages,
+      tools: tools,
+      maxOutputTokens: maxTokens?.toInt(),
+      reasoningEffort: reasoning.isEmpty ? null : reasoning,
+      temperature: temperature?.toDouble(),
+      extra: extra,
+    );
+  }
 }
 
 /// token 用量（端点返回；缺失时上层用估算值兜底）。

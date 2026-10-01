@@ -456,16 +456,17 @@ class _SettingsPageState extends State<SettingsPage> {
 
   /// 插件开发卡片（M9 §4.2 的开发面）。
   ///
-  /// 为什么要一个"入口"而不是把文档抄进设置页：插件协议面（五个 RPC、四类站、
-  /// `ui/manifest`、`plugins.yaml` 全字段）已经写在 `plugins/README.md` 里，抄一份
-  /// 就是第二份真相源，必然与代码漂移。这里只负责**把人送到那份文档**，并把
-  /// 文档的真实路径摆在界面上（路径找不到时给可读原因，不静默）。
+  /// 为什么要一个"入口"而不是把文档抄进设置页：插件协议面（RPC 清单、17 个点位、
+  /// `ui/manifest`、流式回填、`plugins.yaml` 全字段）已经写在**系统性开发指南**
+  /// （`docs/plugin-development.md`，发行版在 `plugins/` 下）里，抄一份就是第二份
+  /// 真相源，必然与代码漂移。这里只负责**把人送到那份文档**，并把文档的真实路径
+  /// 摆在界面上（路径找不到时给可读原因，不静默）。
   Widget _buildPluginDevCard() {
     final cs = Theme.of(context).colorScheme;
     final String? path = PluginDocs.resolvePath();
-    const String dirHintFallback =
-        '未找到 ${PluginDocs.readmeName}（发行版看应用目录下的 '
-        '${PluginDocs.bundledDirName}/，源码仓库看 ${PluginDocs.repoDirName}/）';
+    final String dirHintFallback =
+        '未找到 ${PluginDocs.guideName}（发行版看应用目录下的 '
+        '${PluginDocs.bundledDirName}/，源码仓库看 ${PluginDocs.repoDocDirName}/）';
     return Card(
       margin: EdgeInsets.zero,
       child: Padding(
@@ -480,8 +481,9 @@ class _SettingsPageState extends State<SettingsPage> {
             const SizedBox(height: 4),
             const Text(
               '插件是独立进程，走 stdio JSON-RPC 与核心通信：可申报工具（收集站）、'
-              '订阅事件与中转站（每次工具调用前后各一次）、主动下命令（执行站）、'
-              '自建站点、声明前端面板。参考实现与协议细节都在 plugins/README.md。',
+              '订阅 17 个站点接入点（中转/广播/执行/收集）、主动下命令（执行站，'
+              '含 LLM 调用与任意工具调用）、接管 LLM 生成、自建站点、声明前端面板。'
+              '完整协议与可运行示例见 plugin-development.md。',
               style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
             ),
             const SizedBox(height: 10),

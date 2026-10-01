@@ -14,6 +14,35 @@ import 'llm_types.dart';
 // （引擎 / 测试）从本文件即可拿到它，不必额外认识一个内部文件。
 export 'llm_result_gate.dart';
 
+/// 「LLM 处理」**接管钩子**（中转站点位 `system.relay.llm.handle`）。
+///
+/// 返回非 null = 这一跳交给插件：会话消费这条流而**不调用** [LlmSession.transport]；
+/// 返回 null = 不接管（走系统 LLM）。插件侧的错误/取消用 [LlmFailureEvent] 表达，
+/// 与传输层同一个出口——超限重试、取消、报错的路径因此完全一致。
+///
+/// [isCancelled] 交给钩子实现：插件流可能是"长时间无事件"的，只有它能决定何时
+/// 停流（并顺手向插件下发取消通知）；会话本身只会在收到事件后检查取消。
+typedef LlmTurnHandler =
+    Future<Stream<LlmStreamEvent>?> Function({
+      required LlmRequest request,
+      required String agentId,
+      required String sessionId,
+      required int turn,
+      required bool Function() isCancelled,
+    });
+
+/// 「投入 LLM 前」**请求改写钩子**（中转站点位 `system.relay.llm.request`）。
+///
+/// 返回 null = 不改（走原请求）；返回新请求 = 用它的报文投给模型。
+/// **只在未被接管时调用**（不投 LLM 就没有"投入前"可言）。
+typedef LlmRequestRewriter =
+    Future<LlmRequest?> Function({
+      required LlmRequest request,
+      required String agentId,
+      required String sessionId,
+      required int turn,
+    });
+
 /// 一轮**完整的 LLM 会话**：上下文 → 流式生成 → 工具执行 → 回灌 → 继续，
 /// 直到模型给出最终文本（或出错/被取消）。
 ///
@@ -31,6 +60,11 @@ export 'llm_result_gate.dart';
 /// 工具循环内还会做两件与上下文有关的事（Q1-③）：
 /// - 每轮 API 调用前调用 [compactContext]（长任务里上下文是一轮轮长起来的）；
 /// - 端点报上下文超限时，强制压缩一次并重试该轮（仅一次）。
+///
+/// **站点接入点（2026-10-01 点位化）**：本类不认识插件总线，只暴露两个可设钩子
+/// （[llmHandler] / [llmRequestRewriter]），由核心在接线处注入——与 [compactContext]
+/// 同一个范式。**红线**：所有钩子的 await 都在 SSE 消费循环**之外**；流内 await
+/// 会阻塞读取、把传输层的活性看门狗（默认 30s）假触发成"心跳丢失"。
 class LlmSession {
   LlmSession({
     required this.transport,
@@ -45,6 +79,8 @@ class LlmSession {
     this.resultGate,
     this.statusText,
     this.compactContext,
+    this.llmHandler,
+    this.llmRequestRewriter,
     this.log,
   });
 
@@ -97,6 +133,12 @@ class LlmSession {
   /// [force] 为真表示端点已经报上下文超限，此时必须压（本地估算可能偏小）。
   final Future<List<LlmMessage>?> Function({required bool force})?
   compactContext;
+
+  /// 「LLM 处理」接管钩子（中转站点位 `system.relay.llm.handle`）；null = 未接线。
+  final LlmTurnHandler? llmHandler;
+
+  /// 「投入 LLM 前」请求改写钩子（中转站点位 `system.relay.llm.request`）；null = 未接线。
+  final LlmRequestRewriter? llmRequestRewriter;
 
   /// 可读日志（上下文裁剪、工具异常等）。
   final void Function(String message)? log;
@@ -166,7 +208,7 @@ class LlmSession {
         force: false,
       );
       if (compacted != null) base = compacted;
-      final LlmRequest request = LlmRequest(
+      LlmRequest request = LlmRequest(
         model: model,
         messages: List<LlmMessage>.unmodifiable(current()),
         tools: toolSpecs,
@@ -174,6 +216,42 @@ class LlmSession {
         reasoningEffort: reasoningEffort,
         temperature: temperature,
       );
+      // 中转站点位「LLM 处理」：插件可以**整体接管**这一跳（无订阅者 / 未回填 ⇒
+      // 走系统 LLM）。请求已经是最终形态（含本轮工具轨迹），插件回什么就消费什么。
+      Stream<LlmStreamEvent>? pluginStream;
+      final LlmTurnHandler? handler = llmHandler;
+      if (handler != null) {
+        try {
+          pluginStream = await handler(
+            request: request,
+            agentId: agentId,
+            sessionId: sessionId,
+            turn: turn,
+            isCancelled: isCancelled,
+          );
+        } catch (error) {
+          // 接管点自身异常绝不打断生成：如实记日志，走系统 LLM（fail-open）
+          log?.call('LLM 处理接管点异常（已回退系统 LLM）：$error');
+          pluginStream = null;
+        }
+      }
+      if (pluginStream == null) {
+        // 中转站点位「投入 LLM 前」：**只在未被接管时**才谈得上"投入前"。
+        final LlmRequestRewriter? rewriter = llmRequestRewriter;
+        if (rewriter != null) {
+          try {
+            final LlmRequest? rewritten = await rewriter(
+              request: request,
+              agentId: agentId,
+              sessionId: sessionId,
+              turn: turn,
+            );
+            if (rewritten != null) request = rewritten;
+          } catch (error) {
+            log?.call('投入 LLM 前改写点异常（已放行原请求）：$error');
+          }
+        }
+      }
       final SplayTreeMap<int, _ToolCallDraft> drafts =
           SplayTreeMap<int, _ToolCallDraft>();
       final StringBuffer text = StringBuffer();
@@ -184,10 +262,10 @@ class LlmSession {
       bool overflow = false;
       String failure = '';
 
-      await for (final LlmStreamEvent event in transport.stream(
-        request,
-        isCancelled: isCancelled,
-      )) {
+      final Stream<LlmStreamEvent> events =
+          pluginStream ??
+          transport.stream(request, isCancelled: isCancelled);
+      await for (final LlmStreamEvent event in events) {
         if (event is LlmTextDelta) {
           text.write(event.text);
           yield AgentText(event.text);

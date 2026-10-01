@@ -7,6 +7,7 @@ import '../tool/builtin_tools.dart';
 import '../tool/terminal_hooks.dart';
 import '../tool/tool_runner.dart';
 import 'station_instance.dart';
+import 'station_points.dart';
 import 'station_runtime.dart';
 import 'station_scope.dart';
 
@@ -41,6 +42,48 @@ typedef StationAgentCompactor = Future<Map<String, dynamic>> Function(
   String agentId,
   String sessionId,
 );
+
+/// `llm.call` 的**一次 LLM 调用**入口（点位化新增）。
+///
+/// 语义（用户定稿）：**站点处硬设 API 返回形式为 JSON**（`response_format =
+/// {"type":"json_object"}`），模型**复用目标 agent 解析出的模型**（成员级覆盖也
+/// 生效）；用于"让插件对数据做高级处理"。
+///
+/// [model] 非空 = 显式覆盖该 agent 的模型（默认不给）。
+/// 返回 `{ok, json, text, model, usage}` 或 `{error}`（端点不支持 JSON 形式时
+/// **如实失败**，不静默去掉 response_format 重试）。
+typedef StationLlmCaller =
+    Future<Map<String, dynamic>> Function({
+      required String agentId,
+      List<Object?>? messages,
+      String? prompt,
+      String? system,
+      String? model,
+      double? temperature,
+      int? maxTokens,
+    });
+
+/// `tool.call` 的**执行任意工具**入口（点位化新增）。
+///
+/// 走工具层的唯一入口（内置 / MCP / 插件工具统一分派），因此与模型调用工具**同一条
+/// 路径、同一份权限**（本仓库没有工具审批层，插件与 agent 同权）。
+typedef StationToolCaller =
+    Future<ToolOutcome> Function({
+      required String agentId,
+      required String sessionId,
+      required String tool,
+      required Map<String, dynamic> arguments,
+      required String sourcePluginId,
+      required bool relay,
+    });
+
+/// `session.rename` 的会话重命名入口（与 REST `PATCH …/sessions/{id}` 同一实现）。
+typedef StationSessionRenamer =
+    Future<Map<String, dynamic>> Function({
+      required String agentId,
+      required String sessionId,
+      required String title,
+    });
 
 /// 执行站命令的挂载位置集合（M9 Wave 3-I）。
 ///
@@ -78,6 +121,9 @@ class ExecuteStationMounts {
     this.messageSender,
     this.agentStopper,
     this.compactor,
+    this.llmCaller,
+    this.toolCaller,
+    this.sessionRenamer,
     this.log,
   }) : _injectedHooks = hooks;
 
@@ -94,6 +140,9 @@ class ExecuteStationMounts {
     StationAgentMessageSender? messageSender,
     StationAgentStopper? agentStopper,
     StationAgentCompactor? compactor,
+    StationLlmCaller? llmCaller,
+    StationToolCaller? toolCaller,
+    StationSessionRenamer? sessionRenamer,
     void Function(String message)? log,
   }) => ExecuteStationMounts(
     ioFor: ioFor,
@@ -114,6 +163,9 @@ class ExecuteStationMounts {
     messageSender: messageSender,
     agentStopper: agentStopper,
     compactor: compactor,
+    llmCaller: llmCaller,
+    toolCaller: toolCaller,
+    sessionRenamer: sessionRenamer,
     log: log,
   );
 
@@ -142,6 +194,15 @@ class ExecuteStationMounts {
   /// `agent.compact` 的手动压缩入口；null = 该命令显式报「未接线」。
   final StationAgentCompactor? compactor;
 
+  /// `llm.call`（硬设 JSON 返回形式的 LLM 调用）入口；null = 该命令显式报「未接线」。
+  final StationLlmCaller? llmCaller;
+
+  /// `tool.call`（执行任意工具）入口；null = 该命令显式报「未接线」。
+  final StationToolCaller? toolCaller;
+
+  /// `session.rename`（会话重命名）入口；null = 该命令显式报「未接线」。
+  final StationSessionRenamer? sessionRenamer;
+
   final void Function(String message)? log;
 
   final TerminalHooks? _injectedHooks;
@@ -168,12 +229,16 @@ class ExecuteStationMounts {
     return created;
   }
 
-  /// 把八条命令挂到某执行站；返回 null = 全部成功，否则是可读原因（不静默）。
+  /// 把本点位拥有的命令挂到该执行站；返回 null = 全部成功，否则是可读原因（不静默）。
   ///
   /// 幂等：同 mountId + 同命令会被站点替换（重复调用不会叠加挂载项）。
+  ///
+  /// **点位化（2026-10-01）**：执行站按命令族拆成多个实例，所以这里只挂
+  /// `station.commands`（点位表给出的白名单子集）——给一个点位挂上不属于它的命令
+  /// 会被站点自己拒绝，这里不制造那种噪音。
   String? mountInto(ExecuteStation station) {
     final List<String> failed = <String>[];
-    for (final String command in ExecuteStation.builtinCommands) {
+    for (final String command in station.commands) {
       // ui.push 由站点中枢挂载（复用 4.1 card 槽位帧），不在这里重复挂
       if (command == 'ui.push') continue;
       final String? error = station.mount(
@@ -199,8 +264,10 @@ class ExecuteStationMounts {
   Future<StationCommandOutcome> _handle(StationCommandContext context) async {
     final String command = context.command;
     // 白名单复核（站点已校验过一次；挂载位置不假设调用方一定校验过）
-    if (!ExecuteStation.builtinCommands.contains(command)) {
-      return StationCommandOutcome.failed('命令 $command 不在首命令集内，拒绝执行（挂载位置复核）');
+    if (StationPoints.ownerOfCommand(command) == null) {
+      return StationCommandOutcome.failed(
+        '命令 $command 不在执行站命令白名单内，拒绝执行（挂载位置复核）',
+      );
     }
     // **四元组解析目标**：证明不了归属一律拒绝
     final _StationTarget target = _resolveTarget(context);
@@ -226,6 +293,12 @@ class ExecuteStationMounts {
           return await _agentStop(context, target);
         case 'agent.compact':
           return await _agentCompact(context, target);
+        case 'llm.call':
+          return await _llmCall(context, target);
+        case 'tool.call':
+          return await _toolCall(context, target);
+        case 'session.rename':
+          return await _sessionRename(context, target);
         default:
           return StationCommandOutcome.failed('命令 $command 尚无挂载实现');
       }
@@ -606,12 +679,160 @@ class ExecuteStationMounts {
     return TreeStore.defaultSessionId;
   }
 
+  /// `llm.call`：用目标 agent 的模型发一次**硬设 JSON 返回形式**的调用。
+  ///
+  /// 参数：`messages`（OpenAI 形状的数组）**或** `prompt`（字符串），可选
+  /// `system` / `model` / `temperature` / `max_tokens`。
+  /// 语义要点（用户定稿）：`response_format` 由**站点处**强制为 `json_object`；
+  /// 模型复用该 agent 解析出的模型（含成员级覆盖），`model` 只作显式覆盖；
+  /// **不进**任何中转点位（它不是对话的 LLM 处理）；端点点不支持时如实失败。
+  Future<StationCommandOutcome> _llmCall(
+    StationCommandContext context,
+    _StationTarget target,
+  ) async {
+    final StationLlmCaller? caller = llmCaller;
+    if (caller == null) {
+      return const StationCommandOutcome.failed(
+        'llm.call 未接线：核心未注入 LLM 调用器',
+      );
+    }
+    final Object? rawMessages = context.arguments['messages'];
+    final String prompt = _string(
+      context.arguments['prompt'] ?? context.arguments['content'],
+    );
+    if (rawMessages == null && prompt.isEmpty) {
+      return const StationCommandOutcome.failed(
+        'llm.call 需要 messages（OpenAI 形状的数组）或 prompt（字符串）',
+      );
+    }
+    if (rawMessages != null && rawMessages is! List) {
+      return const StationCommandOutcome.failed('llm.call 的 messages 必须是数组');
+    }
+    final Map<String, dynamic> result = await caller(
+      agentId: target.agentId,
+      messages: rawMessages is List ? rawMessages : null,
+      prompt: prompt.isEmpty ? null : prompt,
+      system: _string(context.arguments['system']),
+      model: _string(context.arguments['model']),
+      temperature: _double(context.arguments['temperature']),
+      maxTokens: _int(context.arguments['max_tokens']),
+    );
+    final Object? error = result['error'];
+    if (error != null && error.toString().isNotEmpty) {
+      return StationCommandOutcome.failed(error.toString());
+    }
+    return StationCommandOutcome.ok(<String, dynamic>{
+      ...result,
+      'agent_id': target.agentId,
+      'response_format': 'json_object',
+    });
+  }
+
+  /// `tool.call`：执行**任意工具**（内置 / MCP / 插件工具同一入口）。
+  ///
+  /// 参数：`tool`（工具名，含 `plugin__` / `mcp__` 命名空间）、`arguments`（对象）、
+  /// 可选 `relay`（true = 这次调用**也**走工具中转与广播；默认绕开，防插件自锁）。
+  ///
+  /// 结果口径：命令**本身**成功即 `ok: true`，工具自身失败体现在 `is_error: true`
+  /// 与 `result` 文本里（与工具层 [ToolOutcome] 同一口径）——把"命令没跑起来"与
+  /// "工具返回了错误"分开，插件才好判断。
+  Future<StationCommandOutcome> _toolCall(
+    StationCommandContext context,
+    _StationTarget target,
+  ) async {
+    final StationToolCaller? caller = toolCaller;
+    if (caller == null) {
+      return const StationCommandOutcome.failed(
+        'tool.call 未接线：核心未注入工具执行器',
+      );
+    }
+    final String tool = _string(
+      context.arguments['tool'] ?? context.arguments['name'],
+    );
+    if (tool.isEmpty) {
+      return const StationCommandOutcome.failed(
+        'tool.call 需要 tool（工具名，含 plugin__ / mcp__ 命名空间）',
+      );
+    }
+    final Object? rawArguments =
+        context.arguments['arguments'] ?? context.arguments['args'];
+    if (rawArguments != null && rawArguments is! Map) {
+      return const StationCommandOutcome.failed('tool.call 的 arguments 必须是对象');
+    }
+    final Map<String, dynamic> arguments = rawArguments is Map
+        ? rawArguments.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
+        : <String, dynamic>{};
+    final bool relay = context.arguments['relay'] == true;
+    final String sessionId = _sessionOf(context);
+    final ToolOutcome outcome = await caller(
+      agentId: target.agentId,
+      sessionId: sessionId,
+      tool: tool,
+      arguments: arguments,
+      sourcePluginId: context.sourcePluginId,
+      relay: relay,
+    );
+    return StationCommandOutcome.ok(<String, dynamic>{
+      'tool': tool,
+      'result': outcome.content,
+      'is_error': outcome.isError,
+      'relayed': relay,
+      'agent_id': target.agentId,
+      'session_id': sessionId,
+    });
+  }
+
+  /// `session.rename`：会话重命名（与 REST `PATCH …/sessions/{id}` 同一 store 实现）。
+  ///
+  /// 参数：`title`（新标题，**空标题显式失败**——store 层"空标题 = 不改名"不能
+  /// 在命令层静默返回成功）。
+  Future<StationCommandOutcome> _sessionRename(
+    StationCommandContext context,
+    _StationTarget target,
+  ) async {
+    final StationSessionRenamer? renamer = sessionRenamer;
+    if (renamer == null) {
+      return const StationCommandOutcome.failed(
+        'session.rename 未接线：核心未注入会话改名器',
+      );
+    }
+    final String title = _string(
+      context.arguments['title'] ?? context.arguments['name'],
+    );
+    if (title.isEmpty) {
+      return const StationCommandOutcome.failed(
+        'session.rename 需要 title（新标题，不能为空）',
+      );
+    }
+    final String sessionId = _sessionOf(context);
+    final Map<String, dynamic> result = await renamer(
+      agentId: target.agentId,
+      sessionId: sessionId,
+      title: title,
+    );
+    final Object? error = result['error'];
+    if (error != null && error.toString().isNotEmpty) {
+      return StationCommandOutcome.failed(error.toString());
+    }
+    return StationCommandOutcome.ok(<String, dynamic>{
+      ...result,
+      'agent_id': target.agentId,
+      'session_id': sessionId,
+      'title': title,
+    });
+  }
+
   static String _string(Object? value) =>
       value == null ? '' : value.toString().trim();
 
   static int? _int(Object? value) {
     if (value is num) return value.toInt();
     return int.tryParse(value?.toString() ?? '');
+  }
+
+  static double? _double(Object? value) {
+    if (value is num) return value.toDouble();
+    return double.tryParse(value?.toString() ?? '');
   }
 
   static List<String> _strings(Object? value) {

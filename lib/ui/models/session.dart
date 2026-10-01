@@ -37,6 +37,19 @@ class ChatSession {
   /// 是否为默认会话
   bool get isDefault => sessionId == 'session_default';
 
+  /// 复制并替换部分字段。
+  ///
+  /// 目前只有**改名**用到（`session_renamed` 帧：插件经执行站改标题后同步到列表）。
+  ChatSession copyWith({String? title}) => ChatSession(
+    sessionId: sessionId,
+    title: title ?? this.title,
+    status: status,
+    createdAt: createdAt,
+    updatedAt: updatedAt,
+    selectedSpecIds: selectedSpecIds,
+    messageCount: messageCount,
+  );
+
   factory ChatSession.fromJson(Map<String, dynamic> json) {
     final List<dynamic>? rawSpecs =
         json['selected_spec_ids'] as List<dynamic>?;

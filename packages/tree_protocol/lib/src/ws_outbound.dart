@@ -39,6 +39,12 @@ abstract final class WsOutboundType {
   /// 会话被创建（成员自动建会话时通知前端刷新）。
   static const String sessionCreated = 'session_created';
 
+  /// 会话被**重命名**（点位化新增：执行站命令 `session.rename` 与将来的其它入口）。
+  ///
+  /// 帧形状：`{type, data: {agent_id, session_id, title}}`。前端收到后更新会话列表里
+  /// 的标题——REST 改名路径是前端自己 `setState`，插件改名没有这条路径，必须靠帧。
+  static const String sessionRenamed = 'session_renamed';
+
   /// todo 列表更新。
   static const String todoUpdate = 'todo_update';
 
@@ -91,6 +97,7 @@ abstract final class WsOutboundType {
     toolEnd,
     agentStatus,
     sessionCreated,
+    sessionRenamed,
     todoUpdate,
     askUserQuestion,
     askUserQuestionResolved,

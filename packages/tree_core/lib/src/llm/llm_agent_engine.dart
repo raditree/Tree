@@ -29,6 +29,21 @@ typedef ToolTurnCompactor = Future<AgentRunContext?> Function(
   required bool force,
 });
 
+/// 「系统提示词构造过程」的中转点钩子（中转站点位 `system.relay.prompt.system`）。
+///
+/// [defaultPrompt] = 内置拼装结果（`workspace_prompt.systemPromptWithWorkspace`）。
+/// 返回 null = 用默认；返回字符串 = **整体替换**（空串 = 明确要求不带系统提示词）；
+/// 抛异常 = 用默认（fail-open）。
+///
+/// 为什么在这里拦而不是改 `systemPromptWithWorkspace`：那是**同步**函数，改成
+/// `Future` 会牵连同步的 token 估算（`CompactionService.estimateContextTokens`）；
+/// 而 `_buildMessages` 本来就是异步的，且"每轮生成"与"压缩后重建"两条路径都经过它。
+typedef SystemPromptRelayHook =
+    Future<String?> Function({
+      required AgentRunContext context,
+      required String defaultPrompt,
+    });
+
 /// 真实 LLM 引擎：把"存储里的会话历史 + agent 配置"翻译成 LLM 请求，
 /// 交给 [LlmSession] 跑工具循环，产出 [AgentEvent]。
 ///
@@ -91,6 +106,18 @@ class LlmAgentEngine implements AgentEngine {
   /// 为什么是可写字段而不是构造参数：会话服务由核心进程构造、引擎由调用方（CLI）
   /// 构造，两边在构造期互不可见；留一个显式接线点，谁先建好谁接上。
   ToolTurnCompactor? toolTurnCompactor;
+
+  /// **「LLM 处理」接管钩子**（中转站点位 `system.relay.llm.handle`）；null = 未接线。
+  ///
+  /// 与 [toolTurnCompactor] 同范式：可写字段，由接线方（`CoreServer._wirePluginStations`）
+  /// 在拿到 PluginBus 之后赋值——引擎与 [LlmSession] 都不认识插件总线。
+  LlmTurnHandler? llmTurnHandler;
+
+  /// **「投入 LLM 前」请求改写钩子**（中转站点位 `system.relay.llm.request`）。
+  LlmRequestRewriter? llmRequestRewriter;
+
+  /// **「系统提示词构造过程」钩子**（中转站点位 `system.relay.prompt.system`）。
+  SystemPromptRelayHook? systemPromptRelay;
 
   /// 可读日志。
   final void Function(String message)? log;
@@ -168,6 +195,8 @@ class LlmAgentEngine implements AgentEngine {
         // 重建上下文必须与首轮同口径：否则压一次之后思考就"消失"了
         passBackReasoning: config.thinking,
       ),
+      llmHandler: llmTurnHandler,
+      llmRequestRewriter: llmRequestRewriter,
       log: log,
     );
     // usage 事件要**过一手**：真实 usage 里夹带着"本次上下文字符数"，学习完之后
@@ -283,6 +312,30 @@ class LlmAgentEngine implements AgentEngine {
     };
   }
 
+  /// **系统提示词构造过程的中转点**（`system.relay.prompt.system`）。
+  ///
+  /// 无订阅者 / 未回填 / 异常 ⇒ 返回内置构造结果（fail-open，逐字与接线前一致）。
+  /// 注意副作用：压缩阈值估算读的是**未改写**的提示词（`CompactionService` 直接调
+  /// `systemPromptWithWorkspace`），插件改写后压缩口径会有偏差——这是刻意的取舍
+  /// （要一致就得在 (agent, session) 上缓存改写结果，多一层状态）。
+  Future<String> _relayedSystemPrompt(AgentRunContext context) async {
+    final String builtin = context.systemPrompt;
+    if (builtin.trim().isEmpty) return builtin;
+    final SystemPromptRelayHook? relay = systemPromptRelay;
+    if (relay == null) return builtin;
+    try {
+      final String? replaced = await relay(
+        context: context,
+        defaultPrompt: builtin,
+      );
+      // null = 不改动；空串 = 插件明确要求"不带系统提示词"（不是"没改"）
+      return replaced ?? builtin;
+    } catch (error) {
+      log?.call('系统提示词中转点异常（已用内置构造结果）：$error');
+      return builtin;
+    }
+  }
+
   /// 把会话历史翻译成端点消息序列。
   ///
   /// [gate] 只替换工具结果**送给模型的那一份**：历史里的超长结果同样要过门控
@@ -299,8 +352,9 @@ class LlmAgentEngine implements AgentEngine {
     bool passBackReasoning = false,
   }) async {
     final List<LlmMessage> out = <LlmMessage>[];
-    if (context.systemPrompt.trim().isNotEmpty) {
-      out.add(LlmMessage.system(context.systemPrompt));
+    final String systemPrompt = await _relayedSystemPrompt(context);
+    if (systemPrompt.trim().isNotEmpty) {
+      out.add(LlmMessage.system(systemPrompt));
     }
     // 上下文压缩摘要（M7d-4）：紧跟系统提示词，替代已被总结的历史前缀
     if (context.contextSummary.trim().isNotEmpty) {

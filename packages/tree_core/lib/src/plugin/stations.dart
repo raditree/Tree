@@ -3,15 +3,26 @@ import 'package:tree_protocol/tree_protocol.dart';
 import '../util/liveness.dart';
 import 'station_ids.dart';
 import 'station_instance.dart';
+import 'station_points.dart';
 import 'station_runtime.dart';
 import 'station_schema.dart';
 import 'station_store.dart';
 
-/// 站点中枢（M9 §3）：内置四站、插件自建站、订阅、插件下线注销、快照与落盘。
+/// 站点中枢（M9 §3）：内置点位、插件自建站、订阅、插件下线注销、快照与落盘。
 ///
-/// 站点 = **全局唯一的持久化实例**：每类站点只有一个实例，id 就是类型常量
-/// （`system.broadcast` / `system.execute` / `system.relay` / `plugin.tool.define`），
-/// **不带 team、不带 mode**。
+/// **站点类型四种，每类下有若干点位（point），每个点位是一个独立的全局实例**
+/// （点位化，2026-10-01）：
+///
+/// - 广播站 3 个：`system.broadcast`（通用主题）/ `.tool.pre` / `.tool.post`
+/// - 执行站 7 个（按命令族）：`system.execute.fs` / `.terminal` / `.agent` / `.ui` /
+///   `.llm` / `.tool` / `.session`
+/// - 中转站 6 个（每个各自唯一订阅者）：`system.relay.tool.pre` / `.tool.post` /
+///   `.llm.handle` / `.llm.request` / `.context.compact` / `.prompt.system`
+/// - 收集站 1 个：`plugin.tool.define`（**不预建**，见 [ensureBuiltinStations]）
+///
+/// 点位的类型 / 说明 / 命令 / 别名表在 `station_points.dart`（加点位只改那张表）。
+/// **id 不含 team / mode**：team / agent / session / mode 是**每次交互携带的信封**
+/// （消息 scope）与订阅声明，只在投递时用于匹配订阅者。
 ///
 /// 为什么这样定（用户定稿语义）：
 /// - 站点是**拦截点 / 触发点**，不是「某个 team 的站点」——team / agent / session /
@@ -36,14 +47,8 @@ class StationHub {
     this.livenessProbeInterval = const Duration(milliseconds: 500),
   }) : _store = store ?? StationStore(storePath);
 
-  /// 广播站基础 id（**全局唯一实例的 id 本身就是它**）。
+  /// 广播站·通用主题点位 id（`system.broadcast`）。
   static const String broadcastBaseId = StationHubIds.broadcast;
-
-  /// 执行站基础 id。
-  static const String executeBaseId = StationHubIds.execute;
-
-  /// 中转站基础 id。
-  static const String relayBaseId = StationHubIds.relay;
 
   /// 收集站（插件定义 tool，首个接入点）基础 id。
   static const String toolDefineBaseId = StationHubIds.collect;
@@ -153,20 +158,26 @@ class StationHub {
   void load() {
     if (_loaded) return;
     _loaded = true;
-    // 读侧迁移：旧格式（baseId@team@mode）在这里被归并到全局常量 id。
+    // 读侧迁移：旧格式（baseId@team@mode）与退役 id 在这里被归并到现役点位。
     // [log] 只报告"发生了什么"，不阻塞启动；归并结果立刻写回一次，此后幂等。
     final ({List<StationInstance> stations, bool migrated}) loaded = _store.load();
+    int rebuilt = 0;
     for (final StationInstance station in loaded.stations) {
-      _attach(station);
-      _stations[station.id] = station;
+      // 内置 id 的类型以**点位表**为准：落盘写错了类型就按表重建（并记可读日志），
+      // 否则该点位会静默失效（见 [_normalizeBuiltinPoint]）。
+      final StationInstance normalized = _normalizeBuiltinPoint(station);
+      if (!identical(normalized, station)) rebuilt++;
+      _attach(normalized);
+      _stations[normalized.id] = normalized;
     }
     if (loaded.migrated) {
       log?.call(
-        '站点存储已迁移到全局 id：${_stations.length} 个实例'
-        '（${_stations.keys.join('、')}）——每类站全局唯一，不再按 team×mode 复制',
+        '站点存储已迁移到点位 id：${_stations.length} 个实例'
+        '（${_stations.keys.join('、')}）——每个接入点一个实例，不再按 team×mode 复制',
       );
-      save();
     }
+    // 迁移结果与"类型纠正"都要写回（此后幂等：文件里没有旧 id / 没有错类型就不会再触发）
+    if (loaded.migrated || rebuilt > 0) save();
   }
 
   /// 全部站点实例（按 id 字典序，输出稳定）。
@@ -183,71 +194,148 @@ class StationHub {
     return _stations[id];
   }
 
-  /// 广播站（系统自带；**全局唯一实例**，不存在则创建）。
-  BroadcastStation? broadcastFor() {
-    load();
-    const String id = broadcastBaseId;
-    final StationInstance? existing = _stations[id];
-    if (existing is BroadcastStation) return existing;
-    if (existing != null) return null;
-    final BroadcastStation station = BroadcastStation(
-      id: id,
-      description: '广播站（系统自带）：插件发布 topic → 多订阅者接收 + 持久公告板',
-      builtin: true,
-    );
-    _register(station);
-    return station;
+  /// 广播站·通用主题点位（系统自带；懒创建）。
+  BroadcastStation? broadcastFor() =>
+      broadcastPointFor(StationHubIds.broadcast);
+
+  /// 按 id 取广播站点位（懒创建）。
+  BroadcastStation? broadcastPointFor(String id) {
+    final StationInstance? station = pointFor(id);
+    return station is BroadcastStation ? station : null;
   }
 
-  /// 执行站（系统自带；**全局唯一实例**，插件主动下命令的落点 + 内置 ui.push 挂载位置）。
-  ExecuteStation? executeFor() {
-    load();
-    const String id = executeBaseId;
-    final StationInstance? existing = _stations[id];
-    if (existing is ExecuteStation) return existing;
-    if (existing != null) return null;
-    final ExecuteStation station = ExecuteStation(
-      id: id,
-      description:
-          '执行站（系统自带）：插件主动下命令，由挂载位置执行；首命令集 = '
-          'fs.read/fs.write/fs.list/fs.grep/terminal.exec/agent.message/'
-          'agent.stop/agent.compact/ui.push',
-      builtin: true,
-    );
-    _register(station);
-    return station;
+  /// 按 id 取执行站点位（懒创建）。
+  ExecuteStation? executePointFor(String id) {
+    final StationInstance? station = pointFor(id);
+    return station is ExecuteStation ? station : null;
   }
 
-  /// 中转站（系统自带；**全局唯一实例**，全站只允许一个订阅者）。
-  RelayStation? relayFor() {
-    load();
-    const String id = relayBaseId;
-    final StationInstance? existing = _stations[id];
-    if (existing is RelayStation) return existing;
-    if (existing != null) return null;
-    final RelayStation station = RelayStation(
-      id: id,
-      description: '中转站（系统自带）：数据流拦截-回填；全站唯一订阅者（先到先得）',
-      maxSubscriptions: 16,
-      builtin: true,
-    );
-    _register(station);
-    return station;
-  }
-
-  /// **确保内置三站存在**（M9 §3「三站系统自带」）。
+  /// **命令 → 所属执行站点位**（`station/command` 的分发依据；懒创建）。
   ///
-  /// 为什么需要这一步：[broadcastFor] / [executeFor] / [relayFor] 都是**懒创建**
-  /// （首次使用时才实例化）。按需开销为零是好事，代价却是"没配插件 / 没人用过"时
-  /// 一个内置站都没有——面板上就是「站点（0）」，与用户「三站默认设在系统中」的
-  /// 预期不符。核心在**站点接线处**（`CoreServer._wirePluginStations`）调用一次，
-  /// 三站因此启动即就位。
+  /// 命令不在任何点位里返回 null（白名单外，由调用方给可读错误）。
+  ExecuteStation? executeForCommand(String command) {
+    final StationPointSpec? spec = StationPoints.ownerOfCommand(command);
+    if (spec == null) return null;
+    return executePointFor(spec.id);
+  }
+
+  /// 按 id 取中转站点位（懒创建）。
+  RelayStation? relayPointFor(String id) {
+    final StationInstance? station = pointFor(id);
+    return station is RelayStation ? station : null;
+  }
+
+  /// **按 id 取内置点位**（不存在则按点位表懒创建）。
   ///
-  /// **与 team / agent 无关**（用户定稿语义）：站点全局唯一，不随团队产生新实例。
+  /// - 已在表中（落盘恢复的、或之前建过的）直接返回——包括**插件自建站**；
+  /// - 内置点位 id 且尚未建 ⇒ 按 `StationPoints` 的定义创建并落盘；
+  /// - 其它（未知 id）⇒ null，调用方给可读错误。
+  ///
+  /// 站点不按 team / agent 复制：**点位是全局唯一实例**，team / agent / session /
+  /// mode 只在投递时用于匹配订阅者（见 `station_scope.dart`）。
+  StationInstance? pointFor(String id) {
+    load();
+    final String key = id.trim();
+    if (key.isEmpty) return null;
+    final StationInstance? existing = _stations[key];
+    if (existing != null) return existing;
+    final StationPointSpec? spec = StationPoints.byId(key);
+    if (spec == null) return null;
+    final StationInstance created = _createPoint(spec);
+    _register(created);
+    return created;
+  }
+
+  /// 按点位定义创建一个内置实例。
+  ///
+  /// [subscribers] / [createdAt] 只在"纠正类型不符的落盘实例"时传入（见
+  /// [_normalizeBuiltinPoint]）：正常创建是空的、`createdAt` 由构造器取当前时间。
+  StationInstance _createPoint(
+    StationPointSpec spec, {
+    List<StationSubscriber> subscribers = const <StationSubscriber>[],
+    int? createdAt,
+  }) => switch (spec.kind) {
+    StationKind.broadcast => BroadcastStation(
+      id: spec.id,
+      description: spec.description,
+      maxSubscriptions: spec.maxSubscriptions,
+      builtin: true,
+      subscribers: List<StationSubscriber>.of(subscribers),
+      createdAt: createdAt,
+    ),
+    StationKind.execute => ExecuteStation(
+      id: spec.id,
+      description: spec.description,
+      maxSubscriptions: spec.maxSubscriptions,
+      builtin: true,
+      subscribers: List<StationSubscriber>.of(subscribers),
+      createdAt: createdAt,
+      commands: spec.commands,
+    ),
+    StationKind.relay => RelayStation(
+      id: spec.id,
+      description: spec.description,
+      maxSubscriptions: spec.maxSubscriptions,
+      builtin: true,
+      subscribers: List<StationSubscriber>.of(subscribers),
+      createdAt: createdAt,
+    ),
+    StationKind.collect => CollectStation(
+      id: spec.id,
+      description: spec.description,
+      schema: toolDefinitionSchema,
+      builtin: true,
+      subscribers: List<StationSubscriber>.of(subscribers),
+      createdAt: createdAt,
+    ),
+  };
+
+  /// **内置点位的类型以点位表为准**：落盘实例的类型与表不符时按表重建。
+  ///
+  /// 为什么必须纠正：内置 id 是**权威**的（`system.relay.llm.handle` 就是一个中转
+  /// 点位）。stations.yaml 被手改、旧文件残留、半截写入都可能让同一个 id 落成别的
+  /// 类型；那时 [relayPointFor] 会返回 null ⇒ 四个 LLM 中转点位**全部静默回退系统
+  /// 默认**，而插件用 `station_id` 订阅它还会拿到 `ok:true`（对方恰好可订阅）却永远
+  /// 收不到请求——全程**零日志**，属于最难查的一类问题。
+  ///
+  /// 订阅的处理：类型不符时旧订阅本来就没投递过（订阅的是"另一个站"），这里**尽力
+  /// 保留**——中转站只允许一个订阅者，多出来的显式丢弃并在日志里写明。
+  StationInstance _normalizeBuiltinPoint(StationInstance station) {
+    final StationPointSpec? spec = StationPoints.byId(station.id);
+    if (spec == null || spec.kind == station.kind) return station;
+    final List<StationSubscriber> all = List<StationSubscriber>.of(
+      station.subscribers,
+    );
+    final bool uniqueSubscriber = spec.kind == StationKind.relay;
+    final List<StationSubscriber> kept = uniqueSubscriber && all.length > 1
+        ? all.sublist(0, 1)
+        : all;
+    log?.call(
+      '内置点位 ${station.id} 的落盘类型是 ${station.kind.wire}，'
+      '与点位表（${spec.kind.wire}）不符：按点位表重建为${spec.kind.label}；'
+      '原订阅 ${all.length} 条'
+      '${kept.length == all.length ? '已保留' : '保留 ${kept.length} 条（该点位只允许一个订阅者）'}'
+      '——插件下次上线会重新声明订阅',
+    );
+    return _createPoint(
+      spec,
+      subscribers: kept,
+      createdAt: station.createdAt > 0 ? station.createdAt : null,
+    );
+  }
+
+  /// **确保全部内置点位存在**（16 个：广播 3 + 执行 7 + 中转 6；收集站除外）。
+  ///
+  /// 为什么需要这一步：[pointFor] 是**懒创建**（首次使用时才实例化）。按需开销为零
+  /// 是好事，代价却是"没配插件 / 没人用过"时一个点位都没有——面板上就是
+  /// 「站点（已建 0/4 类）」，与用户「站点默认设在系统中」的预期不符。核心在
+  /// **站点接线处**（`CoreServer._wirePluginStations`）调用一次，点位因此启动即就位。
+  ///
+  /// **与 team / agent 无关**（用户定稿语义）：点位全局唯一，不随团队产生新实例。
   /// 新建 agent、新增 team 都不会、也不该让站点数变化。
   ///
   /// 幂等（重复启动的安全边界）：
-  /// - 已存在的站点（本次启动从 stations.yaml **恢复**的，或之前调用已建的）直接跳过，
+  /// - 已存在的点位（本次启动从 stations.yaml **恢复**的，或之前调用已建的）直接跳过，
   ///   既不新建也不覆盖——所以重复调用不产生重复实例；
   /// - 没有新建就**不落盘**（[_saveSuspend] 合并成一次写），
   ///   所以重复启动既不改文件内容也不刷新文件时间。
@@ -258,16 +346,19 @@ class StationHub {
   /// 也不会有任何订阅者按它产出。收集站一律由接入点在需要时用
   /// [toolDefineStationFor] 现建。
   ///
-  /// 返回**本次新建**的站点 id（已存在的不在内）；空列表 = 纯幂等命中，什么都没做。
+  /// 返回**本次新建**的点位 id（已存在的不在内；顺序 = `StationPoints.all` 的表顺序，
+  /// 而 [stationList] 是**字典序**——别把两者当成同一个顺序）；空列表 = 纯幂等命中。
   List<String> ensureBuiltinStations() {
     load();
     final List<String> created = <String>[];
-    // 一批预建只落一次盘（每个内置站的懒创建都会 save 一次，不合并就是 3 次写）
+    // 一批预建只落一次盘（每个点位的懒创建都会 save 一次，不合并就是 16 次写）
     _saveSuspend++;
     try {
-      _ensureOneBuiltin(broadcastFor, created);
-      _ensureOneBuiltin(executeFor, created);
-      _ensureOneBuiltin(relayFor, created);
+      // 全部内置点位（广播 3 + 执行 7 + 中转 6）预建；**收集站不预建**（见下）。
+      for (final StationPointSpec spec in StationPoints.all) {
+        if (spec.kind == StationKind.collect) continue;
+        _ensureOneBuiltin(() => pointFor(spec.id), created);
+      }
     } finally {
       _saveSuspend--;
       if (_saveDirtyWhileSuspended) {
@@ -346,13 +437,10 @@ class StationHub {
 
   /// 插件自建站 id 的命名空间校验（返回 null = 合法）。
   ///
-  /// 规则：必须是 `plugin.` 开头（内置四站的保留 id 一律不得冒用）。
+  /// 规则：必须是 `plugin.` 开头（全部内置点位 id 与 `system.` 保留前缀一律不得冒用）。
   /// 用独立静态方法是为了让「创建时校验」与「从盘上恢复时校验」共用同一口径。
   static String? checkSelfBuiltId(String id) {
-    if (id == broadcastBaseId ||
-        id == executeBaseId ||
-        id == relayBaseId ||
-        id == toolDefineBaseId) {
+    if (StationHubIds.all.contains(id)) {
       return '站点 id「$id」是内置保留 id，插件不得注册';
     }
     if (id.startsWith('system.')) {
@@ -515,11 +603,13 @@ class StationHub {
     }
   }
 
-  /// 内置 ui.push 挂载位置：**复用 4.1 的 card 槽位帧**（不发明新帧）。
+  /// 内置 ui.push 挂载位置（**只挂在 `system.execute.ui` 点位上**）：复用 4.1 的
+  /// card 槽位帧（不发明新帧）。
   ///
   /// 帧发到主 WS 广播（前端只在主连接上消费插件 UI 帧）；team_id 取自命令
   /// scope（1.2 隔离：槽位一律带 team_id）。
   void _ensureUiPushMount(ExecuteStation station) {
+    if (station.id != StationHubIds.executeUi) return;
     station.mount(
       command: 'ui.push',
       mountId: 'core.frontend.card',

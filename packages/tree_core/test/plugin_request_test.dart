@@ -210,12 +210,34 @@ void main() {
     final Map<String, dynamic> sub = subscribed['result'] as Map<String, dynamic>;
     expect(sub['ok'], isTrue, reason: '${sub['error']}');
     expect(sub['kind'], 'relay');
-    expect(sub['station_id'], StationHubIds.relay, reason: '站点 id 是全局常量');
+    // 点位化：`station: 'relay'` 不带 point = **一次订阅工具前 + 工具后两个点位**
+    // （点位化之前就是一个实例收两段，老插件因此零改动）；station_id 取第一条。
+    expect(
+      sub['station_ids'],
+      <String>[
+        StationHubIds.relayToolPre,
+        StationHubIds.relayToolPost,
+      ],
+      reason: '一次订阅两个点位，回包逐条给出',
+    );
+    expect(
+      sub['station_id'],
+      StationHubIds.relayToolPre,
+      reason: 'station_id = station_ids 的第一条（站点 id 是全局常量）',
+    );
 
     final RelayStation relay =
-        bus.stations.station(StationHubIds.relay)! as RelayStation;
+        bus.stations.station(StationHubIds.relayToolPre)! as RelayStation;
     expect(relay.subscribers.single.pluginId, 'sample');
     expect(relay.subscribers.single.scope.teamId, team);
+    expect(
+      (bus.stations.station(StationHubIds.relayToolPost)! as RelayStation)
+          .subscribers
+          .single
+          .pluginId,
+      'sample',
+      reason: '工具后点位同样订上了（两个点位各自唯一订阅者，互不干扰）',
+    );
 
     // 重复订阅 = 幂等更新（同一插件同 scope；不报"键位冲突"）
     final Map<String, dynamic> again = await pluginRequest(
@@ -225,6 +247,12 @@ void main() {
     );
     expect((again['result'] as Map<String, dynamic>)['ok'], isTrue);
     expect(relay.subscribers.length, 1);
+    expect(
+      (bus.stations.station(StationHubIds.relayToolPost)! as RelayStation)
+          .subscribers
+          .length,
+      1,
+    );
 
     // 广播站同样可订阅（collect 之外的站过去没有任何订阅入口）
     final Map<String, dynamic> broadcast = await pluginRequest(
@@ -243,7 +271,7 @@ void main() {
     );
     expect((execute['error'] as Map<String, dynamic>)['code'], -32602);
 
-    // 退订：幂等
+    // 退订：幂等。`station: 'relay'` 与订阅对称 —— 两个点位一起退 ⇒ removed = 2
     final Map<String, dynamic> removed = await pluginRequest(
       bus,
       method: 'station/unsubscribe',
@@ -252,8 +280,17 @@ void main() {
     final Map<String, dynamic> unsub =
         removed['result'] as Map<String, dynamic>;
     expect(unsub['ok'], isTrue);
-    expect(unsub['removed'], 1);
+    expect(
+      unsub['removed'],
+      2,
+      reason: '一个 relay 订阅声明落在两个点位上，逐条退订共 2 条',
+    );
     expect(relay.subscribers, isEmpty);
+    expect(
+      (bus.stations.station(StationHubIds.relayToolPost)! as RelayStation)
+          .subscribers,
+      isEmpty,
+    );
   });
 
   test('未声明 team 的插件订阅站点 ⇒ 成立但为**通配**（作用于所有 team）', () async {
@@ -273,11 +310,21 @@ void main() {
     final Map<String, dynamic> scope = result['scope'] as Map<String, dynamic>;
     expect(scope['team_id'], '');
     expect(scope['mode_key'], '');
-    final RelayStation relay = bus.stations.station(StationHubIds.relay)!
-        as RelayStation;
+    final RelayStation relay =
+        bus.stations.station(StationHubIds.relayToolPre)! as RelayStation;
     expect(relay.subscribers.single.pluginId, 'noteam');
     expect(relay.subscribers.single.scope.teamIsWildcard, isTrue);
     expect(relay.subscribers.single.scope.modeIsWildcard, isTrue);
+    // 不带 point 的 relay 一次订两个点位：工具后点位同样拿到通配订阅
+    expect(
+      (bus.stations.station(StationHubIds.relayToolPost)! as RelayStation)
+          .subscribers
+          .single
+          .scope
+          .teamIsWildcard,
+      isTrue,
+      reason: '两个工具点位都落成通配订阅',
+    );
   });
 
   test('插件发 station/command ⇒ 核心的响应原样回到插件，命令真的执行', () async {
@@ -444,11 +491,11 @@ void main() {
       bus.stations.stationList().whereType<ExecuteStation>().map(
         (ExecuteStation s) => s.id,
       ),
-      <String>[StationHubIds.execute],
-      reason: '执行站全局唯一：一个实例按每条命令的 agent_id 服务多个 team',
+      <String>[StationHubIds.executeFs],
+      reason: '两条 fs 命令同属**文件操作点位**：该点位按每条命令的 agent_id 服务多个 team',
     );
     expect(
-      bus.stations.station(StationHubIds.execute)!.scope.teamId,
+      bus.stations.station(StationHubIds.executeFs)!.scope.teamId,
       isEmpty,
       reason: '站点不绑 team——归属在每次命令的 scope 上',
     );
@@ -916,19 +963,19 @@ void main() {
       reason: '同名不会撞车：id 里带插件 id',
     );
 
-    // ② 内置站不得注销（先让内置站就位：站点是懒创建的，核心启动时会预建）
+    // ② 内置站不得注销（先让内置点位就位：站点是懒创建的，核心启动时会预建）
     expect(bus.stations.ensureBuiltinStations(), isNotEmpty);
     final Map<String, dynamic> builtin = await pluginRequest(
       bus,
       method: 'station/unregister',
-      params: <String, dynamic>{'station_id': StationHubIds.relay},
+      params: <String, dynamic>{'station_id': StationHubIds.relayToolPre},
     );
     expect((builtin['result'] as Map<String, dynamic>)['ok'], isFalse);
     expect(
       (builtin['result'] as Map<String, dynamic>)['error'],
       contains('内置'),
     );
-    expect(bus.stations.station(StationHubIds.relay), isNotNull);
+    expect(bus.stations.station(StationHubIds.relayToolPre), isNotNull);
 
     // ③ 自己注销自己的：成功，且站点表里消失
     final Map<String, dynamic> gone = await pluginRequest(

@@ -119,20 +119,20 @@ void main() {
     expect(instance['disabled_reason'], '');
     expect(instance['granularity'], 'team');
     expect(instance['last_heartbeat'], isA<int>());
-    // 站点段**不再按 team 过滤**（站点全局唯一，过滤恒真）：快照恒看到四类站
-    // （三站内置 + 该插件申报时现建的收集站）。
+    // 站点段**不再按 team 过滤**（站点全局唯一，过滤恒真）：快照恒看到**全部内置点位**
+    // （广播 3 + 执行 7 + 中转 6 = 16；收集站不预建）+ 该插件申报时现建的收集站。
     final List<dynamic> stations = res.json['stations'] as List<dynamic>;
+    final List<String> prebuiltPoints = StationPoints.all
+        .where((StationPointSpec spec) => spec.kind != StationKind.collect)
+        .map((StationPointSpec spec) => spec.id)
+        .toList()
+      ..sort();
     expect(
       stations
           .map((dynamic s) => (s as Map<String, dynamic>)['station_id'])
           .toList(),
-      <String>[
-        StationHubIds.collect,
-        StationHubIds.broadcast,
-        StationHubIds.execute,
-        StationHubIds.relay,
-      ],
-      reason: '收集站全局唯一，不再带 @team@mode 后缀；按 id 字典序',
+      <String>[StationHubIds.collect, ...prebuiltPoints],
+      reason: '每个接入点（point）是一个独立站点实例，id 不含 team / mode；按 id 字典序',
     );
     final Map<String, dynamic> collectStation = stations.first
         as Map<String, dynamic>;

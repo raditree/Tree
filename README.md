@@ -182,7 +182,8 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
   - **Q8** 删除工具轮次上限：终止条件只剩 取消 / 出错 / 模型给出最终文本；限额交给插件（插件监视轮次，超限经执行站 `agent.stop` 发停止信号）
   - **Q9** `spec` 工具瘦身：只留 `select` / `create` / `update`；`select` **直接返回所选 Spec 全文**（删除 `search` / `list` 与"先 read 再 select"约束）；索引**注入系统提示词**（默认全列、>50 条截断）；内置 3 条只读（`general-task` / `hard-task` / `team-meeting`，落工作空间 `.self/spec/`；`easy-task` 已按使用数据移除、`complex-task` 更名 `general-task`）
   - **Q10** `grep` 无匹配时返回**扫描文件清单**（≤200，超出注明总数）+ **生效的排除目录** + 扫描根，帮模型区分"真没有"与"被误排除"；默认口径 = 不扫描**隐藏路径**（`.[!.]*`，如 `.git` / `.dart_tool` / `.self`）+ 依赖/构建目录，要搜隐藏路径显式传 `include_hidden=true`（依赖/构建目录是硬黑名单，不受该开关影响）
-  - **Q11** 站点体系（三站 + 收集站）：执行站首命令集 `fs.read` / `fs.write` / `fs.list` / `fs.grep` / `terminal.exec` / `agent.message` / `agent.stop` / `agent.compact` / `ui.push`；**站点全局唯一**（每类站一个实例，id 是类型常量，不按 team / mode 复制）；中转站"**每个点位全局唯一订阅者**"（先到先得 / 显式 `replace` 接管，需分流由订阅者自行转发）；收集站由**站点定义输入格式**、多订阅者各回目标数据、站点汇总后交后续处理（如注册工具）；订阅者未响应 ⇒ **返回部分结果 + 显式列出未响应者**（不整体失败、不静默）。**插件可订阅站点**：JSON-RPC `station/subscribe` / `station/unsubscribe`（`relay` / `broadcast`，或 `station_id` 指定具体实例；scope 按目标 agent 的真实归属解析，声明是作用域上限）；**插件可自建站点**：`station/register` / `station/unregister`（id 由核心拼 `plugin.<插件id>.<类型>.<name>`，别人的自建站不能订、不能注销）；**每次工具调用的前/后各触发一次中转站**（工具层唯一入口 `WorkspaceToolRunner.run` 的入/出口），核心把**完整 tool_call 报文**交给插件——改参数、改结果、或什么都不改由插件内部决定；回填支持 string / 对象 / 数组（整体替换），未接线 / 无订阅者 / 插件未回 / 回包非法一律 **fail-open 放行原始报文**
+  - **Q11** 站点体系（三站 + 收集站）：执行站首命令集 `fs.read` / `fs.write` / `fs.list` / `fs.grep` / `terminal.exec` / `agent.message` / `agent.stop` / `agent.compact` / `ui.push`；**站点全局唯一**（每类站一个实例，id 是类型常量，不按 team / mode 复制）；中转站"**每个点位全局唯一订阅者**"（先到先得 / 显式 `replace` 接管，需分流由订阅者自行转发）；收集站由**站点定义输入格式**、多订阅者各回目标数据、站点汇总后交后续处理（如注册工具）；订阅者未响应 ⇒ **返回部分结果 + 显式列出未响应者**（不整体失败、不静默）。**（**2026-10-01 点位化**：中转站按接入点拆成 6 个点位、执行站按命令族拆成 7 个点位、广播站加工具前/后两个点位，`system.relay` / `system.execute` 两个旧 id 退役并由读侧迁移接住；见上文「站点体系」与 `docs/plugin-development.md`。）
+  - 插件可订阅站点**：JSON-RPC `station/subscribe` / `station/unsubscribe`（`relay` / `broadcast`，或 `station_id` 指定具体实例；scope 按目标 agent 的真实归属解析，声明是作用域上限）；**插件可自建站点**：`station/register` / `station/unregister`（id 由核心拼 `plugin.<插件id>.<类型>.<name>`，别人的自建站不能订、不能注销）；**每次工具调用的前/后各触发一次中转站**（工具层唯一入口 `WorkspaceToolRunner.run` 的入/出口），核心把**完整 tool_call 报文**交给插件——改参数、改结果、或什么都不改由插件内部决定；回填支持 string / 对象 / 数组（整体替换），未接线 / 无订阅者 / 插件未回 / 回包非法一律 **fail-open 放行原始报文**
   - **Q12** 插件布局：声明式槽位（左侧活动栏项 / 右栏 Tab / 状态栏 / 消息流内联卡片，**不做 webview/iframe，不执行插件 JS**），槽位走独立通道（manifest 声明 + `plugin_ui_manifest` / `plugin_ui_update` / `plugin_ui_action` 三帧，**不经三站**）；受限控件集 text / list / table / form / progress / actions，未知控件渲染成「不支持的控件」占位；槽位带 `team_id`：**非空 = 限定团队**（只呈现当前 team），**空 = 不限定归属**（任何 team 下都呈现，与插件配置「空映射 = 不限定归属」同义）；插件可经 `ui.push` 注入消息流卡片。**生产端**：插件发 `ui/manifest` / `ui/update` **通知**即被核心转成上述帧（`plugin_id` 一律取实例 id、`team_id` 以 `plugins.yaml` 声明为准 ⇒ 不可自述越权；槽位数与视图体积有上限，非法声明整帧拒绝并记可读原因）。**面板补发**：声明只在插件启动时发一次，而广播只发给当下在听的连接、前端注册表是内存态 ⇒ 核心缓存每个插件最后一个生效的 UI 帧，**新连接（前端刷新 / 重连 / 启动晚于插件）注册时只重放给那一条连接**，插件下线即作废缓存
   - **Q13** token rate 管道统一：**思考 / 正文 / 工具调用参数**共用同一条节拍器（参数按 `字符数 / token_scale` 折算 token ⇒ `write` 这类大参数自然排队、`read` 几乎不等），工具结果**直推不延迟** ⇒ UI 只有一条速率曲线
   - **Q14** 思考回传与估算口径：`thinking` 开关（**模型默认 + 每个 agent 可覆盖**：右栏「模型信息」/成员「模型配置」的「回传思考」三态下拉，存 `agents/<id>.yaml` 的 `thinking_override`，PATCH 键 `thinking`）决定历史思考是否作为 `reasoning_content` **回传**（DeepSeek 带 `tools` 的请求必须原样回传，缺失会让同会话后续请求持续 400；默认关闭 = 不回传、省输入 token）。**上下文估算与压缩阈值按同一开关计口径**：关闭时不把思考算进上下文，工具结果按**门控后**的那一份（预览 + 提示）计——否则估算会比实际发送大出几十万 token，压缩在真实上下文只有 1/3 时就触发
@@ -212,7 +213,7 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 - **Spec 与会话状态**：Spec **索引注入系统提示词**（行格式 `- <id> [task_type] 标题（内置）（适用: when 摘要）`，id 用反引号包裹；默认全列、>50 条截断并注明「其余可用 `spec select` 直取」），模型直接 `spec select` 拿全文——M9 Q9 删除了 `search` / `list` / `read` 与"先 read 再 select"约束；每次工具结果前注入"当前 in_progress todo + 已选 Spec"，模型不会忘记约定。
 - **MCP**：`config/mcp.yaml` 注册 stdio 服务，工具以 `mcp__<服务>__<工具>` 原生注入模型工具列表；服务不可用只影响自己（可读错误 + 重连一次）。
 - **插件**：`config/plugins.yaml` 注册进程外插件，工具以 `plugin__<插件>__<工具>` 注入；事件总线（按 scope 四元组过滤）+ 心跳巡检 + `plugin_status` / `plugin_event` 增量；心跳连续丢失只标 **degraded**（插件面板橙色「心跳降级」角标 + 丢失拍数/判活窗口），**不杀进程**，恢复即自动清除。插件可经声明式槽位（活动栏 / 右栏 Tab / 状态栏 / 消息流卡片）出界面，也可经**收集站**申报自己的工具定义。
-- **站点体系（M9 Q11）**：广播站 / 执行站 / 中转站 + **收集站**（一对多收集、不回填）；站点是**持久化实例**（类型 / schema / 订阅上限 / 订阅者，跨重启保留），触发即调用实例方法。**站点全局唯一**：每类站一个实例，id 就是类型常量（`system.broadcast` / `system.execute` / `system.relay` / `plugin.tool.define`），**不按 team / mode 复制**；team / agent / session / mode 是**每次交互携带的四元组 scope** `(team_id, agent_id, session_id, mode_key)`，投递时按「消息 ↔ 订阅者」精确匹配，跨 scope 不投递（fail-closed）。**每个点位全局只允许一个订阅者**：需要按团队分开处理时，由该订阅者自己转发（在插件内再建站点分发），而不是重复订阅。
+- **站点体系（M9 Q11 + 点位化）**：四种类型——广播站 / 执行站 / 中转站 / **收集站**（一对多收集、不回填）。**每个接入点（点位）是一个独立的持久化实例**：广播 3（通用主题 + 工具前/后）、执行 7（按命令族：fs / terminal / agent / ui / llm / tool / session）、中转 6（工具前 / 工具后 / **LLM 处理接管** / **投入 LLM 前改写** / **上下文压缩** / **系统提示词构造**）、收集 1，共 17 个 id（`system.broadcast[.tool.pre|.tool.post]`、`system.execute.<族>`、`system.relay.<点位>`、`plugin.tool.define`）。**id 不含 team / mode**（不按 team / mode 复制）：team / agent / session / mode 是**每次交互携带的四元组 scope** `(team_id, agent_id, session_id, mode_key)`，投递时按「消息 ↔ 订阅者」匹配——**订阅侧空 = 通配**（空 team 作用于所有 team、空 mode 两种工作面都收），**消息侧空 = 不可证明归属 ⇒ 不投递**（fail-closed）。**每个中转点位全局只允许一个订阅者**：需要按团队分开处理时，由该订阅者自己转发（在插件内再建站点分发），而不是重复订阅。无订阅者 / 未回填 / 回包非法一律 **fail-open 回退系统默认**（LLM 处理 / 压缩 / 提示词构造都因此"不装插件时行为逐字不变"）。
 - **数据都在用户能直接看的地方**：`~/.tree` 下的 yaml / jsonl / 快照，可手改。
 
 ---
@@ -258,14 +259,17 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 判别只看报文形状（**有 `method` + 有 `id` ⇒ 请求**），因此插件用自增 int id 发请求，不会与核心在途请求撞号而被当成回包吞掉。
 
 核心支持的方法：**`station/command`**（执行站命令）、**`station/subscribe`** /
-**`station/unsubscribe`**（订阅 / 退订站点）、**`station/register`** /
-**`station/unregister`**（自建 / 注销站点）。
+**`station/unsubscribe`**（订阅 / 退订站点，支持 `point` 点位寻址）、**`station/register`** /
+**`station/unregister`**（自建 / 注销站点）；插件还可用**通知**推流式回填
+（`station/stream`，配合核心下发的 `station/cancel`）。
 
-> 写插件的完整教程（配置全字段、五个 RPC 的入参与回包、四类站语义、`ui/manifest`
-> 声明式布局、调试与自测、踩过的坑）在 **[`examples/plugins/README.md`](examples/plugins/README.md)**，
-> 并附一份**纯标准库的 Python 参考实现** `examples/plugins/sample_plugin.py`。
-> 应用内入口：**设置 → 插件开发 → 打开插件开发说明**（发行版打开的是应用目录下
-> `plugins/README.md`，与主程序同级）。下面只记协议要点。
+> 写插件的**系统性指南**（一分钟上手、生命周期与 RPC 清单、17 个点位表、scope 两套含义、
+> 中转回包与**流式接管**、12 条执行站命令、广播与 UI 槽位、收集站、配置、调试、旧核心迁移）
+> 在 **[`docs/plugin-development.md`](docs/plugin-development.md)**；
+> 可运行示例在 [`examples/plugins/`](examples/plugins/)（`minimal_plugin.py` 最小骨架 +
+> `sample_plugin.py` 全功能参考实现，纯标准库 Python）。
+> 应用内入口：**设置 → 插件开发 → 打开插件开发说明**（发行版打开应用目录下的
+> `plugins/plugin-development.md`，与主程序同级）。下面只记协议要点。
 
 先看 `station/command`：
 
@@ -277,22 +281,25 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
            "arguments":{"agent_id":"agt_1","path":"README.md"}}}
 ```
 
-- **入参** `{command, arguments, team_id?, agent_id?, session_id?, mode_key?}`：`command` 取执行站白名单——`fs.read` / `fs.write` / `fs.list` / `fs.grep` / `terminal.exec` / `agent.message` / `agent.stop` / `agent.compact` / `ui.push`；`arguments` 是该命令自己的参数对象（可省略）。身份字段放 `params` 顶层或 `arguments` 里等价。`fs.grep` 与内置 `grep` 同一默认口径（不扫描 `.[!.]*` 隐藏路径），`arguments.include_hidden=true` 放行。
+- **入参** `{command, arguments, team_id?, agent_id?, session_id?, mode_key?}`：`command` 取执行站命令集——文件族 `fs.read` / `fs.write` / `fs.list` / `fs.grep`、终端族 `terminal.exec`、Agent 族 `agent.message` / `agent.stop` / **`agent.compact`（发起上下文压缩）**、前端族 `ui.push`、**LLM 族 `llm.call`（站点处硬设 `response_format=json_object`、复用目标 agent 的模型）**、**工具族 `tool.call`（执行任意工具：内置 / MCP / 插件同一入口）**、**会话族 `session.rename`（会话重命名，前端即时刷新标题）**（命令按**命令族**分属不同执行站点位，插件侧仍只带 `command`）；`arguments` 是该命令自己的参数对象（可省略）。身份字段放 `params` 顶层或 `arguments` 里等价。`fs.grep` 与内置 `grep` 同一默认口径（不扫描 `.[!.]*` 隐藏路径），`arguments.include_hidden=true` 放行。
 - **result 形状** `{command, ok, mount_id, payload, error}`：`ok=false` 时**可读失败原因在 `error`**（跨 team / 跨模式 / 参数缺失 / 挂载位置未接线…），**不是 JSON-RPC 错误**——插件据此自查原因，不会只看到一句「调用失败」；`mount_id` 是实际执行命令的挂载位置（如 `core.execute.fs.read`），空串 = 未挂载。
 - **错误码**（JSON-RPC `error.code`）：`-32601` 未知方法 · `-32602` 参数非法 · `-32603` 处理器异常 · `-32001` scope 不满足。
 - **单实例 + 每条消息带身份（Q2）**：插件进程只有一个，身份按**这一次请求**解析——目标 agent 取请求里的 `agent_id`（缺省才回退到 `plugins.yaml` 的 `scope.agent_id`）；`team` / `mode` 由核心按**目标 agent 的真实归属**（团队 + `local|ssh` 工作面）解析，**不信任插件声明**。
 - **`plugins.yaml` 的 `scope` 是作用域上限**：声明了 `team` 的插件只能在自己 team 内活动（跨 team 回 `-32001`）；**不声明 scope 的插件可服务任意 team**（一个实例同时服务多队），但每条命令都要带 `agent_id` 且必须能证明归属（agent 不存在 / 归属解析不出 / 请求里带的 `team_id` 与真实归属不一致，一律 `-32001`）。不带 agent 的团队级命令（如 `ui.push`）只要求能确定 `team_id`。
-- **事件订阅与站点订阅对空 `team_id` 的口径不同**：事件派发里"某个键为空 = 该维度不设条件"（不声明 team 也照收事件）；而**站点订阅要求 team 非空**（站点隔离要四元组，fail-closed）——所以 agent 没有 team 的机器上，插件必须显式声明 `scope.team_id` 才能订阅中转站 / 广播站。
+- **事件订阅与站点订阅对空 `team_id` 的口径一致（订阅侧空 = 通配）**：事件派发里"某个键为空 = 该维度不设条件"；**站点订阅同理**——空 team = 作用于**所有 team**、空 mode = local / ssh 都收。**消息侧相反**：核心投给插件的请求里 `team_id` 必然非空（不可证明归属的消息一律不投）。所以 `scope: {}` 的插件订得上中转站 / 广播站，且服务全部 team。
 - 命令执行前仍会按四元组做隔离校验，任一不符即**明确拒绝**（fail-closed，跨 scope 的命令不会打到别的工作空间）。
 
-**站点订阅 / 自建**（站点全局唯一，见上文「站点体系」）：
+**站点订阅 / 自建**（点位化：每个接入点一个实例，见上文「站点体系」）：
 
 ```jsonc
-// 订阅内置站（按类型）或某个具体站点（按 id）
+// 按类型 + 点位别名订阅（等价于直接给 station_id）
 {"jsonrpc":"2.0","id":8,"method":"station/subscribe",
  "params":{"station":"relay",                      // relay | broadcast
-           "scope":{"team_id":"team-1"},           // 订阅声明（作用域上限）
-           "replace":false}}                        // 中转站被占时是否接管
+           "point":"llm.handle",                   // tool.pre | tool.post | llm.handle |
+                                                   // llm.request | context.compact | prompt.system
+           "scope":{"team_id":"team-1"},           // 订阅声明（作用域上限；空 = 通配所有 team）
+           "replace":false}}                        // 该点位被占时是否接管
+// 不带 point 的 relay = 一次订阅「工具调用前 + 工具调用后」两个点位（回包含 station_ids）
 {"jsonrpc":"2.0","id":9,"method":"station/subscribe",
  "params":{"station_id":"plugin.forwarder.relay.audit"}}   // 订自己的自建站
 
@@ -302,7 +309,7 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
            "schema":{"fields":[{"name":"value","type":"string","required":true}]}}}
 ```
 
-- **`station/subscribe`** 回包 `{ok, station_id, kind, scope, replaced, error}`；`station/unsubscribe` 回包 `{ok, station_id, kind, removed, error}`（幂等）。
+- **`station/subscribe`** 回包 `{ok, station_id, station_ids, kind, scope, replaced, error, subscriptions}`（多点位订阅时 `subscriptions` 逐条给结果）；`station/unsubscribe` 回包 `{ok, station_id, station_ids, kind, removed, error}`（幂等；`relay` 不带 point 时 `removed` 为两条之和）。
 - **`station/register`** 回包 `{ok, station_id, kind, error}`；`station/unregister` 回包 `{ok, station_id, removed_subscriptions, error}`（幂等）。业务规则拒绝（已被占 / 缺 schema / 不属于自己）都是 **result 里的 `ok:false` + 可读 `error`**，不是 JSON-RPC 错误。
 - **自建站规则**：只能建既有四种类型；**执行站不能自建**（它由插件主动下命令，要下命令用 `station/command`）；收集站**必须带非空 schema**；同名重复注册**幂等**（插件重启后照旧注册一遍即可）；`name` 只允许字母 / 数字 / 下划线 / 连字符。
 - **归属隔离**：自建站的 id 一定带 `plugin.<自己>.` 前缀，**别人的自建站不能订阅、不能注销**；内置站不得注销。需要按 team / agent 分开处理时，正解是"由一个转发型订阅者接管内置站，再在插件内自建站点分发"。
@@ -322,11 +329,13 @@ plugins:
 
 | 报文 | 形态 | 说明 |
 | --- | --- | --- |
-| `hello` / `tools/list` / `tools/call` / `ping` / `shutdown` | 请求（核心等回包） | 握手、工具申报、工具调用、心跳探测、优雅关闭。**`tools/call` 除 `{name, arguments}` 外还带调用点身份 `scope: {team_id, agent_id, session_id, mode_key}`**（单实例插件据此知道"这一次是谁在问"） |
-| `station/request` | 请求（核心等回包） | **收集站请求**：站点把请求投给订阅的插件，`params` = `{request_id, station_id, kind, scope, payload, meta?, schema?}`；插件按站点 schema 回 `{"reply": {"payload": ...}}`（失败回 `{"reply": {"error": "可读原因"}}`）。回包可回带 `scope`，带了就必须与请求四元组精确相等 |
+| `hello` / `tools/list` / `tools/call` / `ping` / `shutdown` | 请求（核心等回包） | 握手、工具申报、工具调用、心跳探测、优雅关闭。**`tools/call` 除 `{name, arguments}` 外还带调用点身份 `agent_id` / `session_id`**（单实例插件据此知道"这一次是谁在问"） |
+| `station/request` | 请求（核心等回包） | **站点请求**：站点把请求投给订阅的插件，`params` = `{request_id, station_id, kind, scope, payload, meta?, schema?}`。中转站回 `{"reply": {"payload": ...}}`（`null` = 不改动 / 不接管；字符串 / 对象 / 数组 = 整体替换）；收集站按 schema 回工具定义；**LLM 接管**回 `{"reply":{"payload":{"stream": true}}}` 开流。回包可回带 `scope`，带了就必须与请求四元组精确相等 |
+| `station/stream` | **通知（插件 → 核心）** | **流式接管 LLM 时**推增量：`{request_id, delta: {kind: text\|thinking\|tool_call, ...}}` 可多次；`{request_id, done:true, finish_reason?, usage?}` 或 `{request_id, error:{message}}` 收尾。`request_id` 取 `station/request` 里的那个；**开流后不可回退系统 LLM** |
+| `station/cancel` | **通知（核心 → 插件）** | 用户停止生成时下发 `{request_id, reason}`：插件应停止推流；之后迟到的 `delta` 会被丢弃（不报错） |
 | `event` | **通知（不等回包）** | 插件订阅到的总线事件（按四元组过滤），`params` 即事件体 |
 
-插件也可主动发**通知**（如 `log` / `event`，不带 `id`），核心收集后转成前端 `plugin_event`。站点体系（广播 / 执行 / 中转 / 收集）与订阅、schema、部分结果语义见上文「站点体系」。
+插件也可主动发**通知**（如 `log` / `event` / `ui/manifest` / `ui/update` / `station/stream`，不带 `id`），核心收集后转成前端帧（`plugin_event` / UI 帧）或喂给在途的 LLM 接管流。站点体系（广播 / 执行 / 中转 / 收集）、17 个点位、订阅语义与各点位回包契约见上文「站点体系」与 [`docs/plugin-development.md`](docs/plugin-development.md)。
 
 ---
 

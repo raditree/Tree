@@ -15,6 +15,8 @@ import '../agent/scripted_agent.dart';
 import '../agent/system_prompt_file.dart';
 import '../agent/workspace_prompt.dart';
 import '../files/file_service.dart';
+import '../llm/llm_agent_engine.dart';
+import '../llm/llm_json_caller.dart';
 import '../mcp/mcp_client.dart';
 import '../mcp/mcp_service.dart';
 import '../plugin/builtin_plugins.dart';
@@ -33,6 +35,9 @@ import '../team/team_model.dart';
 import '../team/team_service.dart';
 import '../tool/terminal_hooks.dart';
 import '../tool/todo_store.dart';
+import '../tool/tool_runner.dart';
+import '../tool/workspace_tool_runner.dart';
+import '../util/ids.dart';
 import '../util/liveness.dart';
 import '../util/token.dart';
 import '../version.dart';
@@ -82,6 +87,7 @@ class CoreServer {
     required this.stubRouter,
     required this.reassembler,
     required this.version,
+    this.llmJsonCaller,
   });
 
   /// WS 端点路径（前端 `WebSocketService.connect` 固定拼接 `/ws?token=`）。
@@ -186,6 +192,12 @@ class CoreServer {
   /// 上下文压缩（M7d-4）；为 null 时 `agentCompact` 返回 501。
   final CompactionService? compaction;
 
+  /// 执行站命令 `llm.call` 的落点（**硬设 JSON 返回形式**的 LLM 调用）；null = 未接线。
+  ///
+  /// 由核心进程（CLI）构造并注入：它需要"按 modelId 解析模型 + 成员级覆盖"这两件
+  /// 只有 CLI 手上的东西（与 [AgentEngine] / [CompactionService] 同一个理由）。
+  final LlmJsonCaller? llmJsonCaller;
+
   /// 会话服务（用户消息 → 流式回复）。
   final ConversationService conversation;
 
@@ -287,6 +299,7 @@ class CoreServer {
     FileService? fileService,
     CompactionService? compaction,
     TerminalHooks? stationHooks,
+    LlmJsonCaller? llmJsonCaller,
   }) async {
     final HttpServer http = await HttpServer.bind(
       address ?? InternetAddress.loopbackIPv4,
@@ -332,6 +345,7 @@ class CoreServer {
           (pluginBus == null ? null : BusPluginHotApplier(pluginBus)),
       fileService: fileService,
       compaction: compaction,
+      llmJsonCaller: llmJsonCaller,
       hub: hub,
       questions: questions,
       conversation: ConversationService(
@@ -423,6 +437,8 @@ class CoreServer {
     await pluginBus?.close();
     // 总结器可能持有自己的 HTTP 连接池（与引擎的池分开）：随服务一起释放
     await compaction?.dispose();
+    // 执行站 `llm.call` 的调用器同样自带连接池（与引擎的池分开）
+    await llmJsonCaller?.close();
     // 先把在途落盘任务写完再关闭监听（write-behind 的收尾）
     await questions?.questions.flush();
     await store.flush();
@@ -515,6 +531,12 @@ class CoreServer {
       agentStopper: (String agentId, {required bool cascade}) async =>
           _stopAgentTree(agentId, cascade: cascade),
       compactor: _stationCompact,
+      // 点位化新增的三条命令（llm.call / tool.call / session.rename）：
+      // 工具执行器优先取引擎手上那一份（与模型调用工具**同一条路径**）；
+      // 没接线时命令以「未接线」显式失败，不做静默降级。
+      llmCaller: _stationLlmCall,
+      toolCaller: _stationToolCall,
+      sessionRenamer: _stationRenameSession,
       log: (String message) => errorLog?.call('[core:station] $message'),
     );
     _stationMounts = mounts;
@@ -543,6 +565,133 @@ class CoreServer {
     if (mountError != null) {
       errorLog?.call('执行站挂载位置接线不完整：$mountError');
     }
+    _wirePluginRelayPoints(bus);
+  }
+
+  /// **点位化（2026-10-01）：把 LLM 侧的中转点接上插件总线**。
+  ///
+  /// 引擎（LLM 会话 / 系统提示词构造）与压缩服务都**不认识插件总线**，插件总线也
+  /// 拿不到它们；核心是唯一同时够得着两边的地方，所以接线放在这里——与
+  /// [LlmAgentEngine.toolTurnCompactor] 同一个范式（可写字段 + 显式接线点）。
+  ///
+  /// 接上之后的行为：
+  /// - `system.relay.llm.handle`：插件可接管某一跳的 LLM 响应（含流式回填）；
+  /// - `system.relay.llm.request`：插件可改写即将投出的请求体；
+  /// - `system.relay.prompt.system`：插件可改写本轮系统提示词；
+  /// - `system.relay.context.compact`：插件可产出摘要（替代内置摘要器）。
+  ///
+  /// 全部 fail-open：无订阅者 / 未回填 / 异常 ⇒ 与接线前**逐字一致**的行为。
+  void _wirePluginRelayPoints(PluginBus bus) {
+    final AgentEngine engine = conversation.engine;
+    if (engine is LlmAgentEngine) {
+      engine.llmTurnHandler = bus.relayLlmHandle;
+      engine.llmRequestRewriter = bus.relayLlmRequest;
+      engine.systemPromptRelay = bus.relaySystemPrompt;
+    }
+    conversation.compaction?.relayHook = bus.relayCompaction;
+  }
+
+  /// 执行站 `llm.call`：用目标 agent 的模型发一次**硬设 JSON 返回形式**的调用。
+  ///
+  /// agent 的 modelId 在核心侧解析（`store.agent(...).modelId`），模型池与成员级
+  /// 覆盖由注入的 [llmJsonCaller] 负责——**与对话完全同一条解析路径**。
+  Future<Map<String, dynamic>> _stationLlmCall({
+    required String agentId,
+    List<Object?>? messages,
+    String? prompt,
+    String? system,
+    String? model,
+    double? temperature,
+    int? maxTokens,
+  }) async {
+    final LlmJsonCaller? caller = llmJsonCaller;
+    if (caller == null) {
+      return const <String, dynamic>{'error': 'llm.call 未接线：核心未注入 LLM 调用器'};
+    }
+    final CoreAgent? agent = store.agent(agentId);
+    if (agent == null) {
+      return <String, dynamic>{'error': 'agent 不存在：$agentId'};
+    }
+    return caller.call(
+      agentId: agentId,
+      modelId: agent.modelId,
+      messages: messages,
+      prompt: prompt,
+      system: system,
+      model: model,
+      temperature: temperature,
+      maxTokens: maxTokens,
+    );
+  }
+
+  /// 执行站 `tool.call`：执行**任意工具**（内置 / MCP / 插件工具同一入口）。
+  ///
+  /// 默认 `relay: false`（绕开工具中转与广播）——理由见
+  /// [WorkspaceToolRunner.runFromPlugin] 的自锁说明；要审计自己的调用就显式
+  /// `relay: true`。**权限口径不变**：与模型调用工具同一条路径、同一份工作空间解析。
+  Future<ToolOutcome> _stationToolCall({
+    required String agentId,
+    required String sessionId,
+    required String tool,
+    required Map<String, dynamic> arguments,
+    required String sourcePluginId,
+    required bool relay,
+  }) async {
+    final WorkspaceToolRunner? runner = _runnerFromEngine();
+    if (runner == null) {
+      return const ToolOutcome(
+        'tool.call 未接线：核心未接入工具执行器（真实 LLM 引擎不可用）',
+        isError: true,
+      );
+    }
+    return runner.runFromPlugin(
+      ToolInvocation(
+        id: CoreIds.next('call'),
+        name: tool,
+        arguments: arguments,
+        agentId: agentId,
+        sessionId: sessionId,
+      ),
+      sourcePluginId: sourcePluginId,
+      relay: relay,
+    );
+  }
+
+  /// 引擎手上的工具执行器（`tool.call` 的落点）；不是真实运行器时返回 null。
+  ///
+  /// 为什么不给 CoreServer 直接注入工具运行器：引擎已经持有它，而"模型的工具调用"
+  /// 与"插件经执行站的工具调用"必须是**同一个实例**（工作空间解析、MCP/插件工具
+  /// 分派、后台任务表都在它身上），多注一份就有两个真相。
+  WorkspaceToolRunner? _runnerFromEngine() {
+    final AgentEngine engine = conversation.engine;
+    if (engine is LlmAgentEngine && engine.toolRunner is WorkspaceToolRunner) {
+      return engine.toolRunner as WorkspaceToolRunner;
+    }
+    return null;
+  }
+
+  /// 执行站 `session.rename`：与 REST `PATCH …/sessions/{id}` **同一 store 实现**。
+  ///
+  /// 改名成功后向前端发一条下行帧，让界面上的会话标题即时更新（REST 路径是前端
+  /// 自己 setState，插件改名没有这条路径）。
+  Future<Map<String, dynamic>> _stationRenameSession({
+    required String agentId,
+    required String sessionId,
+    required String title,
+  }) async {
+    final bool renamed = store.renameSession(agentId, sessionId, title);
+    if (!renamed) {
+      return <String, dynamic>{'error': '会话不存在或未改名：$agentId/$sessionId'};
+    }
+    hub.broadcast(<String, dynamic>{
+      'type': WsOutboundType.sessionRenamed,
+      'data': <String, dynamic>{
+        'agent_id': agentId,
+        'session_id': sessionId,
+        'title': title,
+      },
+    });
+    return <String, dynamic>{'renamed': true};
   }
 
   /// 执行站 `agent.message`：插件 → 目标 agent 的会话。
