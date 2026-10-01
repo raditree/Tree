@@ -11,6 +11,16 @@ import 'package:tree_core/tree_core.dart';
 /// - 服务很慢但**照常回 ping** ⇒ 跑多久都不打断（"总时长"不再是判据）；
 /// - 心跳恢复 ⇒ 失活标记自动清除，同一连接继续可用；
 /// - 服务端不实现 ping（回 method-not-found）⇒ 错误回包也算心跳，不误判。
+///
+/// **判活窗口（I × N）的取值约束（2026-10-01 排障结论）**：本文件的假服务是
+/// `dart <fixture>.dart` —— 一个**冷启动**的子进程（起 VM + 加载脚本）。整套用例
+/// 并发跑时实测冷启动会明显超过 450ms，此时窗口太窄会把"还没起来"判成"心跳丢了"，
+/// `McpClient.start` 的握手直接失败（这正是它此前在核心全量里偶发 -2/-4 的原因）。
+/// 因此窗口必须同时满足：
+///   ① **> 并发负载下的冷启动**（实测留到 1.5s 才稳）；
+///   ② **< 假服务的沉默时长**（否则沉默结束、心跳回来了，就永远等不到判死）。
+/// 下面统一用 `300ms × 5 = 1.5s`，沉默时长给到 4s（比值留 2.5s 余量）。
+/// 另外：**等状态一律轮询，别固定睡**——固定睡在负载下会因计时器延后假失败。
 void main() {
   late String script;
 
@@ -32,13 +42,13 @@ void main() {
       );
 
   test('心跳窗口内无响应：在途请求以「心跳丢失」显式结束（不挂起、不静默）', () async {
-    // 握手正常，随后服务沉默 1500ms（远大于判活窗口 I×N = 450ms）：连 ping 都不回。
-    // 参数留足余量是刻意的：进程冷启动（dart 脚本约 250ms）也落在心跳窗口内，
-    // 窗口太窄会把"还没起来"误判成"心跳丢了"。
+    // 握手正常，随后服务沉默 4s（远大于判活窗口 I×N = 1.5s）：连 ping 都不回。
+    // 窗口留足余量是刻意的：并发跑时假服务（dart 脚本）冷启动可能超过 1s，
+    // 窗口太窄会把"还没起来"误判成"心跳丢了"（见文件头的取值约束）。
     final McpClient client = await McpClient.start(
-      config(extra: <String>['--deaf-for=1500']),
-      heartbeatInterval: const Duration(milliseconds: 150),
-      missedHeartbeatLimit: 3,
+      config(extra: <String>['--deaf-for=4000']),
+      heartbeatInterval: const Duration(milliseconds: 300),
+      missedHeartbeatLimit: 5,
     );
     addTearDown(client.close);
     expect(client.isDegraded, isFalse, reason: '握手期间心跳是好的');
@@ -60,12 +70,12 @@ void main() {
     watch.stop();
     expect(
       watch.elapsedMilliseconds,
-      lessThan(1200),
-      reason: '沉默窗口还没结束就该按心跳判死（不是等某个静态超时）',
+      lessThan(4000),
+      reason: '沉默窗口（4s）还没结束就该按心跳判死：判据是心跳丢失，不是任何静态超时',
     );
     expect(client.isDegraded, isTrue, reason: '连续 N 次丢失要标记 degraded');
     expect(client.degradeCount, greaterThan(0));
-    expect(client.liveness.missedCount, greaterThanOrEqualTo(3));
+    expect(client.liveness.missedCount, greaterThanOrEqualTo(5));
     expect(client.isClosed, isFalse, reason: '判失活不杀进程：恢复后还能用');
 
     // 失活期间的新请求**立刻**显式失败：不再往一条判死的链路上发东西
@@ -75,29 +85,33 @@ void main() {
       throwsA(isA<McpLivenessException>()),
     );
     immediate.stop();
-    expect(immediate.elapsedMilliseconds, lessThan(200));
+    expect(
+      immediate.elapsedMilliseconds,
+      lessThan(1000),
+      reason: '远小于判活窗口（1.5s）：失活后不再等下一拍',
+    );
   });
 
   test('心跳正常的长请求：远超判活窗口也不被总时长打断', () async {
     final McpClient client = await McpClient.start(
       config(),
-      heartbeatInterval: const Duration(milliseconds: 150),
-      missedHeartbeatLimit: 3, // 判活窗口 = 450ms
+      heartbeatInterval: const Duration(milliseconds: 300),
+      missedHeartbeatLimit: 5, // 判活窗口 = 1.5s
     );
     addTearDown(client.close);
 
     final Stopwatch watch = Stopwatch()..start();
-    // 服务端跑 900ms（= 3 个判活窗口）才回包，期间照常回 ping
+    // 服务端跑 4s（≈2.7 个判活窗口）才回包，期间照常回 ping
     final McpCallResult slow = await client
-        .callTool('slow-alive', <String, dynamic>{'ms': 900})
-        .timeout(const Duration(seconds: 10));
+        .callTool('slow-alive', <String, dynamic>{'ms': 4000})
+        .timeout(const Duration(seconds: 20));
     watch.stop();
 
     expect(slow.isError, isFalse);
     expect(slow.text, contains('慢慢做完'));
     expect(
       watch.elapsedMilliseconds,
-      greaterThan(450),
+      greaterThan(1500),
       reason: '确实跑过了判活窗口——若还有静态超时，这里必失败',
     );
     expect(client.isDegraded, isFalse);
@@ -106,41 +120,45 @@ void main() {
 
   test('心跳恢复后自动清除失活标记：同一连接继续可用（不重连）', () async {
     final McpClient client = await McpClient.start(
-      config(extra: <String>['--deaf-for=1500']),
-      heartbeatInterval: const Duration(milliseconds: 150),
-      missedHeartbeatLimit: 3, // 判活窗口 = 450ms（要容得下进程冷启动）
+      config(extra: <String>['--deaf-for=4000']),
+      heartbeatInterval: const Duration(milliseconds: 300),
+      missedHeartbeatLimit: 5, // 判活窗口 = 1.5s（要容得下并发负载下的冷启动）
     );
     addTearDown(client.close);
 
     await expectLater(
       client
           .callTool('echo', <String, dynamic>{'text': '第一次'})
-          .timeout(const Duration(seconds: 10)),
+          .timeout(const Duration(seconds: 20)),
       throwsA(isA<McpLivenessException>()),
     );
     expect(client.isDegraded, isTrue);
 
-    // 沉默窗口过去 + 若干拍心跳（等得宽裕些，避免机器慢导致抖动）
-    await Future<void>.delayed(const Duration(milliseconds: 2400));
+    // 等"失活标记自动清除"：**轮询，不固定睡**——固定睡在并发负载下会因心跳计时器
+    // 延后而假失败（本文件此前就是这么 flaky 的）。
+    final DateTime deadline = DateTime.now().add(const Duration(seconds: 20));
+    while (client.isDegraded && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
     expect(client.isDegraded, isFalse, reason: '收到回包（心跳）后自动清除');
     expect(client.isClosed, isFalse);
 
     final McpCallResult ok = await client
         .callTool('echo', <String, dynamic>{'text': '第二次'})
-        .timeout(const Duration(seconds: 10));
+        .timeout(const Duration(seconds: 20));
     expect(ok.text, 'echo: 第二次');
   });
 
   test('服务端不实现 ping（回 method-not-found）也算心跳：不误判失活', () async {
     final McpClient client = await McpClient.start(
       config(extra: <String>['--no-ping']),
-      heartbeatInterval: const Duration(milliseconds: 250),
-      missedHeartbeatLimit: 3, // 判活窗口 = 750ms（容得下冷启动）
+      heartbeatInterval: const Duration(milliseconds: 300),
+      missedHeartbeatLimit: 5, // 判活窗口 = 1.5s（容得下冷启动）
     );
     addTearDown(client.close);
 
-    // 5 拍以上（1500ms > 判活窗口 750ms）：ping 的错误回包必须被算作心跳
-    await Future<void>.delayed(const Duration(milliseconds: 1500));
+    // 5 拍以上（2500ms > 判活窗口 1500ms）：ping 的错误回包必须被算作心跳
+    await Future<void>.delayed(const Duration(milliseconds: 2500));
     expect(client.isDegraded, isFalse, reason: '回包（哪怕是错误回包）就是链路活着的证据');
 
     final McpCallResult echo = await client.callTool('echo', <String, dynamic>{
