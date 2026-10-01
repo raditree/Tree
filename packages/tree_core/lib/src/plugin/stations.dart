@@ -382,6 +382,26 @@ class StationHub {
     return station.subscribe(subscriber, responder, replace: replace);
   }
 
+  /// 注销一个站点（连带其订阅）；返回是否真的移除了。
+  ///
+  /// 只有**插件自建站**会被注销（内置站不允许——它们系统自带、随核心恒在）。
+  /// 调用方负责先做归属校验（见 `PluginBus._selfBuiltOwnershipError`）。
+  bool unregister(String stationId) {
+    load();
+    final StationInstance? station = _stations[stationId];
+    if (station == null) return false;
+    if (station.builtin) {
+      log?.call('拒绝注销内置站点：$stationId（系统自带，随核心恒在）');
+      return false;
+    }
+    _stations.remove(stationId);
+    save();
+    log?.call(
+      '站点已注销：$stationId（连带 ${station.subscribers.length} 条订阅）',
+    );
+    return true;
+  }
+
   /// **插件下线**：注销该插件在所有站点的订阅（总线在插件退出 / 停用时调用）。
   int unsubscribePlugin(String pluginId) {
     load();

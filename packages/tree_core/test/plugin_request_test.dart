@@ -114,6 +114,23 @@ void main() {
       '    granularity: team\n'
       '    scope: {team_id: $team}\n';
 
+  /// **两个**插件：用来验证自建站的归属隔离（别人的站不能订、不能注销）。
+  String twoPluginsYaml() =>
+      'enabled: true\n'
+      'plugins:\n'
+      '  - id: sample\n'
+      '    name: 样例插件\n'
+      '    command: "${slash(Platform.resolvedExecutable)}"\n'
+      '    args: ["${slash(script)}", "--station-client"]\n'
+      '    granularity: team\n'
+      '    scope: {team_id: $team}\n'
+      '  - id: other\n'
+      '    name: 另一个插件\n'
+      '    command: "${slash(Platform.resolvedExecutable)}"\n'
+      '    args: ["${slash(script)}", "--station-client"]\n'
+      '    granularity: team\n'
+      '    scope: {team_id: $team}\n';
+
   /// 没声明 team 的插件：站点四元组不成立 ⇒ 执行站必须显式拒绝（不静默）。
   String noTeamPluginYaml() =>
       'enabled: true\n'
@@ -648,5 +665,289 @@ void main() {
     expect(data['team_id'], team, reason: '槽位帧一律带 team_id（1.2 隔离）');
     expect(data['slot_key'], 'sample.card.1');
     expect((data['view'] as Map<String, dynamic>)['text'], '插件卡片');
+  });
+
+  // ── 插件自建站（station/register）：转发型订阅者的出路 ──────────────────
+  //
+  // 为什么有这组：站点全局化后**每个点位只有一个订阅者**，插件要按 team / agent
+  // 分开处理时，正解是"由一个转发型订阅者接管内置站，再在插件内建站点分发"——
+  // 而"建站点"必须经核心，否则下游没有回包通道与等待链。
+
+  test('station/register：自建广播站 ⇒ id 由核心拼装（plugin.<自己>.<kind>.<name>）', () async {
+    final PluginBus bus = await startBus(teamPluginYaml());
+
+    final Map<String, dynamic> response = await pluginRequest(
+      bus,
+      method: 'station/register',
+      params: <String, dynamic>{
+        'kind': 'broadcast',
+        'name': 'fanout',
+        'description': '转发站：按 team 再分发',
+      },
+    );
+    final Map<String, dynamic> result =
+        response['result'] as Map<String, dynamic>;
+    expect(result['ok'], isTrue, reason: '${result['error']}');
+    expect(
+      result['station_id'],
+      'plugin.sample.broadcast.fanout',
+      reason: 'id 由**核心**按插件身份拼：插件不能自选 id（归属强制点）',
+    );
+    // 真的落在站点中枢里，且是持久化实例（非内置）
+    final StationInstance? station = bus.stations.station(
+      'plugin.sample.broadcast.fanout',
+    );
+    expect(station, isA<BroadcastStation>());
+    expect(station!.builtin, isFalse);
+    expect(station.description, '转发站：按 team 再分发');
+
+    // 同名重复注册 = 幂等（插件重启后会再注册一遍，不能报错也不能覆盖）
+    final Map<String, dynamic> again = await pluginRequest(
+      bus,
+      method: 'station/register',
+      params: <String, dynamic>{'kind': 'broadcast', 'name': 'fanout'},
+    );
+    expect((again['result'] as Map<String, dynamic>)['ok'], isTrue);
+    expect(
+      (again['result'] as Map<String, dynamic>)['station_id'],
+      result['station_id'],
+    );
+    expect(
+      bus.stations
+          .stationList()
+          .where((StationInstance s) => !s.builtin)
+          .length,
+      1,
+      reason: '没有建出第二条',
+    );
+  });
+
+  test('station/register：name 非法 / 执行站 / 收集站缺 schema 都是可读拒绝', () async {
+    final PluginBus bus = await startBus(teamPluginYaml());
+
+    // ① 缺 name
+    final Map<String, dynamic> noName = await pluginRequest(
+      bus,
+      method: 'station/register',
+      params: <String, dynamic>{'kind': 'relay'},
+    );
+    expect((noName['result'] as Map<String, dynamic>)['ok'], isFalse);
+    expect(
+      (noName['result'] as Map<String, dynamic>)['error'],
+      contains('name'),
+    );
+
+    // ② name 里带点号：会与归属前缀判定冲突（插件 a 建 b.relay.x 顶掉 a.b 的站）
+    final Map<String, dynamic> dotted = await pluginRequest(
+      bus,
+      method: 'station/register',
+      params: <String, dynamic>{'kind': 'relay', 'name': 'a.b'},
+    );
+    expect((dotted['result'] as Map<String, dynamic>)['ok'], isFalse);
+    expect(
+      (dotted['result'] as Map<String, dynamic>)['error'],
+      contains('只允许'),
+    );
+
+    // ③ 执行站不能自建（没有消费方：它由插件主动下命令）
+    final Map<String, dynamic> execute = await pluginRequest(
+      bus,
+      method: 'station/register',
+      params: <String, dynamic>{'kind': 'execute', 'name': 'x'},
+    );
+    expect((execute['result'] as Map<String, dynamic>)['ok'], isFalse);
+    expect(
+      (execute['result'] as Map<String, dynamic>)['error'],
+      contains('station/command'),
+      reason: '拒绝理由要指向正解',
+    );
+
+    // ④ 收集站必须带非空 schema（输入格式由站点定义）
+    final Map<String, dynamic> collect = await pluginRequest(
+      bus,
+      method: 'station/register',
+      params: <String, dynamic>{'kind': 'collect', 'name': 'probe'},
+    );
+    expect((collect['result'] as Map<String, dynamic>)['ok'], isFalse);
+    expect(
+      (collect['result'] as Map<String, dynamic>)['error'],
+      contains('schema'),
+    );
+
+    // ⑤ 类型未知 ⇒ 参数错误（JSON-RPC 层，不静默）
+    final Map<String, dynamic> badKind = await pluginRequest(
+      bus,
+      method: 'station/register',
+      params: <String, dynamic>{'kind': 'teleport', 'name': 'x'},
+    );
+    expect(badKind['result'], isNull);
+    expect(
+      (badKind['error'] as Map<String, dynamic>)['code'],
+      PluginRpcErrorCode.invalidParams,
+    );
+
+    // 一个都不该留下
+    expect(
+      bus.stations.stationList().where((StationInstance s) => !s.builtin),
+      isEmpty,
+    );
+  });
+
+  test('station/register：自建收集站带 schema ⇒ 可建，且订阅上限可自报', () async {
+    final PluginBus bus = await startBus(teamPluginYaml());
+
+    final Map<String, dynamic> response = await pluginRequest(
+      bus,
+      method: 'station/register',
+      params: <String, dynamic>{
+        'kind': 'collect',
+        'name': 'probe',
+        'max_subscriptions': 3,
+        'schema': <String, dynamic>{
+          'description': '探针产出',
+          'fields': <dynamic>[
+            <String, dynamic>{'name': 'value', 'type': 'string', 'required': true},
+          ],
+        },
+      },
+    );
+    final Map<String, dynamic> result =
+        response['result'] as Map<String, dynamic>;
+    expect(result['ok'], isTrue, reason: '${result['error']}');
+    final StationInstance station = bus.stations.station(
+      result['station_id'] as String,
+    )!;
+    expect(station, isA<CollectStation>());
+    expect(station.maxSubscriptions, 3);
+    expect(
+      (station as CollectStation).schema.fields.map((dynamic f) => f.name),
+      <String>['value'],
+      reason: 'schema 跨注册保留（订阅者要按它产出）',
+    );
+  });
+
+  test('station/register：不能冒用内置 id / 别人的命名空间；注销只能注销自己的', () async {
+    final PluginBus bus = await startBus(twoPluginsYaml());
+
+    // 先让 sample 建一个站
+    final Map<String, dynamic> mine = await pluginRequest(
+      bus,
+      method: 'station/register',
+      params: <String, dynamic>{'kind': 'broadcast', 'name': 'mine'},
+    );
+    final String myId = (mine['result'] as Map<String, dynamic>)['station_id']
+        as String;
+
+    // ① 别的插件注销我的站 ⇒ 拒绝（归属校验）
+    final Map<String, dynamic> steal = await pluginRequest(
+      bus,
+      pluginId: 'other',
+      method: 'station/unregister',
+      params: <String, dynamic>{'station_id': myId},
+    );
+    expect((steal['result'] as Map<String, dynamic>)['ok'], isFalse);
+    expect(
+      (steal['result'] as Map<String, dynamic>)['error'],
+      contains('不属于插件 other'),
+    );
+    expect(bus.stations.station(myId), isNotNull, reason: '站还在');
+
+    // ①b 另一个插件用自己的名字建站：**各自成站**（命名空间按插件隔离）
+    final Map<String, dynamic> otherOwn = await pluginRequest(
+      bus,
+      pluginId: 'other',
+      method: 'station/register',
+      params: <String, dynamic>{'kind': 'broadcast', 'name': 'mine'},
+    );
+    expect((otherOwn['result'] as Map<String, dynamic>)['ok'], isTrue);
+    expect(
+      (otherOwn['result'] as Map<String, dynamic>)['station_id'],
+      'plugin.other.broadcast.mine',
+      reason: '同名不会撞车：id 里带插件 id',
+    );
+
+    // ② 内置站不得注销（先让内置站就位：站点是懒创建的，核心启动时会预建）
+    expect(bus.stations.ensureBuiltinStations(), isNotEmpty);
+    final Map<String, dynamic> builtin = await pluginRequest(
+      bus,
+      method: 'station/unregister',
+      params: <String, dynamic>{'station_id': StationHubIds.relay},
+    );
+    expect((builtin['result'] as Map<String, dynamic>)['ok'], isFalse);
+    expect(
+      (builtin['result'] as Map<String, dynamic>)['error'],
+      contains('内置'),
+    );
+    expect(bus.stations.station(StationHubIds.relay), isNotNull);
+
+    // ③ 自己注销自己的：成功，且站点表里消失
+    final Map<String, dynamic> gone = await pluginRequest(
+      bus,
+      method: 'station/unregister',
+      params: <String, dynamic>{'kind': 'broadcast', 'name': 'mine'},
+    );
+    expect((gone['result'] as Map<String, dynamic>)['ok'], isTrue);
+    expect(bus.stations.station(myId), isNull);
+
+    // ④ 幂等：再注销一次不报错
+    final Map<String, dynamic> again = await pluginRequest(
+      bus,
+      method: 'station/unregister',
+      params: <String, dynamic>{'kind': 'broadcast', 'name': 'mine'},
+    );
+    expect((again['result'] as Map<String, dynamic>)['ok'], isTrue);
+    expect(
+      (again['result'] as Map<String, dynamic>)['notice'],
+      contains('不存在'),
+    );
+  });
+
+  test('station/register：自建站可被自己的插件订阅（station_id 寻址），别人订不到', () async {
+    final PluginBus bus = await startBus(twoPluginsYaml());
+    final Map<String, dynamic> created = await pluginRequest(
+      bus,
+      method: 'station/register',
+      params: <String, dynamic>{'kind': 'relay', 'name': 'forwarder'},
+    );
+    final String id =
+        (created['result'] as Map<String, dynamic>)['station_id'] as String;
+
+    // ① 自己订自己的自建站：成功（转发型订阅者的第一步）
+    final Map<String, dynamic> sub = await pluginRequest(
+      bus,
+      method: 'station/subscribe',
+      params: <String, dynamic>{'station_id': id},
+    );
+    final Map<String, dynamic> subResult =
+        sub['result'] as Map<String, dynamic>;
+    expect(subResult['ok'], isTrue, reason: '${subResult['error']}');
+    expect(subResult['station_id'], id);
+    expect(subResult['kind'], 'relay');
+    expect(
+      (bus.stations.station(id)! as RelayStation).subscribers.single.pluginId,
+      'sample',
+    );
+
+    // ② 别的插件订它 ⇒ 拒绝（否则任何插件都能挂上别人的拦截点）
+    final Map<String, dynamic> other = await pluginRequest(
+      bus,
+      pluginId: 'other',
+      method: 'station/subscribe',
+      params: <String, dynamic>{'station_id': id},
+    );
+    expect((other['result'] as Map<String, dynamic>)['ok'], isFalse);
+    expect(
+      (other['result'] as Map<String, dynamic>)['error'],
+      contains('不属于插件 other'),
+    );
+
+    // ③ 按 station_id 退订：幂等
+    final Map<String, dynamic> unsub = await pluginRequest(
+      bus,
+      method: 'station/unsubscribe',
+      params: <String, dynamic>{'station_id': id},
+    );
+    expect((unsub['result'] as Map<String, dynamic>)['removed'], 1);
+    expect(bus.stations.station(id)!.subscribers, isEmpty);
   });
 }

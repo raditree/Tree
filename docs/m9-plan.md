@@ -164,6 +164,15 @@
   **既有四种类型**下的站点实例（不允许发明新类型），注册后供其他插件订阅/调用。
   **自建站 id 必须带命名空间**：内置保留 id 与 `system.` 前缀不得冒用，
   插件自建一律 `plugin.{plugin_id}.…`（如 `plugin.sample.relay.audit`）。
+  - **协议面**（本轮补齐）：`station/register` / `station/unregister`（插件 → 核心）。
+    **id 由核心拼装**（`plugin.{插件id}.{kind}.{name}`），插件不能自选 id——这是
+    "我的站点只能是我的"的强制点；执行站不可自建（没有消费方，下命令用
+    `station/command`）；收集站必须带非空 schema；同名重复注册**幂等**。
+    `station/subscribe` / `station/unsubscribe` 增加可选 `station_id`，
+    用于订阅/退订**某个具体实例**（自建站的消费入口）。
+  - **归属隔离**：别人的自建站不能订阅、不能注销；内置站不得注销。
+  - **插件下线不自动注销自建站**（站点是持久化资源，跨重启保留），
+    由插件显式 `station/unregister`。
 - **站点 = 持久化实例**（用户定稿）：实例自带 id / 类型（广播 | 执行 | 中转 | 收集）/
   **schema**（收集站必填）/ **订阅上限** / 订阅者列表，落盘跨重启保留；
   **id 不含 team / mode**（旧格式 `baseId@team@mode` 由读侧迁移自动归并）。
@@ -412,6 +421,8 @@ _paceToken 现为每增量 Future.delayed(1ms)（11e1376 引入，常开无开�
 | 3-N | **心跳参数 I/N 设置页可调**：区间 1..600s / 1..60 次，默认 10/3；I×N ≤ 10s 时抬高 I 并给可读原因（永不拒绝）；WS 侧 PATCH 后立即生效、插件/MCP 下次启动、SSH 下次建连；跨仓测试锁住「前端固定 10s 心跳 == minLivenessWindowSeconds」 |
 | 3-O | **中文乱码统一治理**：新增 ansi_code_page.dart 作为唯一解码入口（严格 UTF-8 → CP_ACP(FFI) → latin1，永不抛；编码对称、编不回去显式拒绝）；shell 换 PowerShell（UTF-8 输出 + 退出码透传）；文件读走解码链、**写/编辑保编码往返**；hook 日志/配置/MCP·插件 stdio 全部容错解码 |
 | 3-P | PowerShell 5.1 的 && / || 引号感知翻译（保守回退、绝不半翻译）、terminal 描述补 shell 说明、AtomicFile 两处严格解码改容错 |
+| 3-Q | **站点全局化**（用户定稿语义）：每类站一个实例，id 是类型常量（`system.*` / `plugin.tool.define`），**不按 team×mode 复制**；team / agent / session / mode 降为交互信封；**每个点位全局唯一订阅者**（需分流由转发型订阅者自行分发）；读侧迁移自动归并旧 `baseId@team@mode`；收集站不再按 team 建实例（跨 team 整合）；面板改为按订阅者 team 分组 |
+| 3-R | **插件自建站协议面**：`station/register` / `station/unregister`（id 由核心拼 `plugin.{插件id}.{kind}.{name}`，执行站不可自建、收集站必须带 schema、同名幂等）；`station/subscribe` / `station/unsubscribe` 增加 `station_id` 寻址；归属隔离（别人的自建站不能订、不能注销；内置站不得注销） |
 
 ### 事故与教训（务必留档）
 1. **外部覆盖（21:56:32）**：另一套 SDK（D:\app\flutter\flutter）的 **VS Code Dart language-server**（client-id=VS-Code）等 3 个进程自该秒起存活；工作区里被写回旧版本的文件集与那个编辑器会话打开的文件一致 ⇒ 判定为**陈旧编辑器缓冲区被保存**覆盖了已提交内容。

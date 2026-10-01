@@ -1264,8 +1264,9 @@ class PluginBus {
   /// 插件主动发起的请求（JSON-RPC `method` + `id`）的总入口（宿主
   /// [PluginHost.onPluginRequest] 的接线实现）。
   ///
-  /// 实现执行站的 `station/command`（插件主动下命令）与站点订阅
-  /// `station/subscribe` / `station/unsubscribe`；未知 method ⇒ `-32601`（不静默）。
+  /// 实现执行站的 `station/command`、站点订阅 `station/subscribe` /
+  /// `station/unsubscribe`，以及**插件自建站**的 `station/register` /
+  /// `station/unregister`；未知 method ⇒ `-32601`（不静默）。
   /// 失败一律抛 [PluginRequestException]，由宿主变成 `{jsonrpc, id, error}` 响应。
   Future<Map<String, dynamic>> _handlePluginRequest(
     PluginConfig config,
@@ -1275,6 +1276,10 @@ class PluginBus {
     switch (method) {
       case 'station/command':
         return _handleStationCommand(config, params);
+      case 'station/register':
+        return _handleStationRegister(config, params);
+      case 'station/unregister':
+        return _handleStationUnregister(config, params);
       case 'station/subscribe':
         return _handleStationSubscribe(config, params);
       case 'station/unsubscribe':
@@ -1287,27 +1292,277 @@ class PluginBus {
     }
   }
 
-  /// **站点订阅（插件 → 核心）**：参数 `{station, scope?, replace?}`。
+  /// **插件自建站点（插件 → 核心）**：参数
+  /// `{kind, name, description?, schema?, max_subscriptions?}`。
+  ///
+  /// 为什么需要它（用户定稿语义）：站点全局化后，**每个点位只有一个订阅者**，
+  /// 插件要按 team / agent 分开处理时，正解是"由一个转发型订阅者接管，再在插件内
+  /// 建站点分发"——而"建站点"必须走核心，否则下游没有回包通道与等待链。
+  ///
+  /// 归属与安全：
+  /// - **站点 id 由核心拼**（`plugin.{plugin_id}.{kind}.{name}`），插件**不能**自选 id
+  ///   ——这正是"我的站点只能是我的"的强制点（[StationHub.checkSelfBuiltId] 是同一
+  ///   口径的第二道校验）；
+  /// - 只能建**既有四种类型**（不允许发明新类型）；
+  /// - 执行站不可订阅，建它没有意义 ⇒ 拒绝（可读原因）；
+  /// - 收集站**必须**带非空 schema（输入格式由站点定义）；
+  /// - 同名重复注册 = 幂等返回既有站点（不报错、不覆盖）。
+  ///
+  /// 回包形状与 `station/command` 同风格：`{ok, station_id, kind, error}` ——
+  /// 业务规则拒绝（类型非法 / 缺 schema / id 被占）是**结果**而非 JSON-RPC 错误。
+  Future<Map<String, dynamic>> _handleStationRegister(
+    PluginConfig config,
+    Map<String, dynamic> params,
+  ) async {
+    final String kindRaw = (params['kind'] ?? '').toString().trim();
+    final StationKind? kind = StationKind.fromWire(kindRaw);
+    if (kind == null) {
+      throw PluginRequestException(
+        PluginRpcErrorCode.invalidParams,
+        'station/register 需要 kind ∈ '
+        '${StationKind.values.map((StationKind k) => k.wire).join(' | ')}'
+        '（收到「$kindRaw」）',
+      );
+    }
+    // 执行站不能自建（没有消费方），所以只有非执行站才拼 id
+    String stationId = '';
+    if (kind != StationKind.execute) {
+      final String name = (params['name'] ?? '').toString().trim();
+      final String? nameError = _checkSelfBuiltName(name);
+      if (nameError != null) {
+        return <String, dynamic>{
+          'ok': false,
+          'station_id': '',
+          'kind': kind.wire,
+          'error': nameError,
+        };
+      }
+      stationId = selfBuiltStationId(config.id, kind, name);
+    }
+    // 幂等：同名重复注册拿到既有站点（插件重启后会再注册一遍）
+    final StationInstance? existing = stationId.isEmpty
+        ? null
+        : stations.station(stationId);
+    if (existing != null) {
+      return <String, dynamic>{
+        'ok': true,
+        'station_id': existing.id,
+        'kind': existing.kind.wire,
+        'error': '',
+      };
+    }
+    // 执行站不支持订阅，建它没有任何消费方（插件自己下发命令走内置执行站）
+    if (kind == StationKind.execute) {
+      return <String, dynamic>{
+        'ok': false,
+        'station_id': '',
+        'kind': kind.wire,
+        'error':
+            '执行站不支持订阅（它由插件主动下命令），无需自建；'
+            '要下命令请用 station/command',
+      };
+    }
+    final Object? rawSchema = params['schema'];
+    final StationSchema schema = StationSchema.fromJson(rawSchema);
+    if (kind == StationKind.collect && schema.fields.isEmpty) {
+      return <String, dynamic>{
+        'ok': false,
+        'station_id': '',
+        'kind': kind.wire,
+        'error': '收集站必须定义 schema（输入格式：fields 非空），当前为空',
+      };
+    }
+    final int maxSubscriptions = _selfBuiltMaxSubscriptions(
+      params['max_subscriptions'],
+      kind,
+    );
+    final String description = (params['description'] ?? '').toString().trim();
+    final String id = stationId;
+    final StationInstance station = switch (kind) {
+      StationKind.broadcast => BroadcastStation(
+        id: id,
+        description: description.isEmpty ? '插件 ${config.id} 自建广播站' : description,
+        maxSubscriptions: maxSubscriptions,
+      ),
+      StationKind.relay => RelayStation(
+        id: id,
+        description: description.isEmpty ? '插件 ${config.id} 自建中转站' : description,
+        maxSubscriptions: maxSubscriptions,
+      ),
+      StationKind.collect => CollectStation(
+        id: id,
+        description: description.isEmpty ? '插件 ${config.id} 自建收集站' : description,
+        schema: schema,
+        maxSubscriptions: maxSubscriptions,
+      ),
+      StationKind.execute => throw PluginRequestException(
+        PluginRpcErrorCode.invalidParams,
+        'station/register 不支持自建执行站',
+      ),
+    };
+    final String? error = stations.register(station);
+    if (error != null) {
+      return <String, dynamic>{
+        'ok': false,
+        'station_id': '',
+        'kind': kind.wire,
+        'error': error,
+      };
+    }
+    log?.call(
+      '插件 ${config.id} 自建${kind.label} ${station.id}'
+      '（订阅上限 $maxSubscriptions）',
+    );
+    return <String, dynamic>{
+      'ok': true,
+      'station_id': station.id,
+      'kind': kind.wire,
+      'error': '',
+    };
+  }
+
+  /// **插件注销自建站点（插件 → 核心）**：参数 `{kind, name}`（或 `{station_id}`）。
+  ///
+  /// 只能注销**自己的**站点（id 前缀 `plugin.{自己}.`）；注销时同时清掉该站上的
+  /// 订阅。**插件下线不会自动注销自建站**：站点是持久化资源（跨重启保留），
+  /// 插件重启后按同名幂等重新注册即可；不想要了就显式注销。
+  Future<Map<String, dynamic>> _handleStationUnregister(
+    PluginConfig config,
+    Map<String, dynamic> params,
+  ) async {
+    String id = (params['station_id'] ?? '').toString().trim();
+    if (id.isEmpty) {
+      final StationKind? kind = StationKind.fromWire(
+        (params['kind'] ?? '').toString().trim(),
+      );
+      final String name = (params['name'] ?? '').toString().trim();
+      if (kind == null || name.isEmpty) {
+        throw const PluginRequestException(
+          PluginRpcErrorCode.invalidParams,
+          'station/unregister 需要 station_id，或 kind + name',
+        );
+      }
+      id = selfBuiltStationId(config.id, kind, name);
+    }
+    // **先查归属、再查存在**（fail-closed）：内置站可能是懒创建的（此刻还没实例），
+    // 但"插件不得动内置站"这条判断不依赖它存在——否则一个插件在内置站建出来之前
+    // 请求注销它，就会拿到"不存在（可能已注销）"这种误导性的成功回包。
+    final String? ownerError = _selfBuiltOwnershipError(config.id, id);
+    if (ownerError != null) {
+      return <String, dynamic>{
+        'ok': false,
+        'station_id': id,
+        'removed_subscriptions': 0,
+        'error': ownerError,
+      };
+    }
+    final StationInstance? station = stations.station(id);
+    if (station == null) {
+      return <String, dynamic>{
+        'ok': true,
+        'station_id': id,
+        'removed_subscriptions': 0,
+        'error': '',
+        'notice': '站点不存在（可能已注销）',
+      };
+    }
+    final int subscriptions = station.subscribers.length;
+    stations.unregister(id);
+    log?.call('插件 ${config.id} 注销自建站点 $id（连带 $subscriptions 条订阅）');
+    return <String, dynamic>{
+      'ok': true,
+      'station_id': id,
+      'removed_subscriptions': subscriptions,
+      'error': '',
+    };
+  }
+
+  /// 自建站 id（核心拼装：插件不能自选，这是"我的站点只能是我的"的强制点）。
+  static String selfBuiltStationId(
+    String pluginId,
+    StationKind kind,
+    String name,
+  ) => 'plugin.$pluginId.${kind.wire}.$name';
+
+  /// 自建站名段校验（返回 null = 合法）。
+  ///
+  /// 名段只允许 `[A-Za-z0-9_-]`：它是 id 的一部分，混入 `.` / `@` / 空白会让
+  /// 归属前缀判定（`plugin.{id}.`）产生歧义——例如插件 `a` 建 `b.relay.x`
+  /// 就能顶掉插件 `a.b` 的站点。
+  static String? _checkSelfBuiltName(String name) {
+    if (name.isEmpty) {
+      return '自建站点需要 name（站点 id 为 plugin.<插件id>.<类型>.<name>）';
+    }
+    if (!RegExp(r'^[A-Za-z0-9_-]+$').hasMatch(name)) {
+      return '自建站点的 name 只允许字母 / 数字 / 下划线 / 连字符，收到「$name」';
+    }
+    return null;
+  }
+
+  /// 自建站归属校验（返回 null = 属于该插件）。
+  static String? _selfBuiltOwnershipError(String pluginId, String stationId) {
+    if (stationId.startsWith('plugin.$pluginId.')) return null;
+    if (StationHubIds.all.contains(stationId)) {
+      return '「$stationId」是内置站点，插件不得注销或改写';
+    }
+    return '站点「$stationId」不属于插件 $pluginId（自建站 id 必须是 '
+        'plugin.$pluginId.…）';
+  }
+
+  /// 自建站订阅上限：缺省按类型给默认值，列表型站点允许插件自报。
+  static int _selfBuiltMaxSubscriptions(Object? raw, StationKind kind) {
+    final int fallback = switch (kind) {
+      StationKind.relay => 16,
+      _ => StationInstance.defaultMaxSubscriptions,
+    };
+    if (raw is num) {
+      final int value = raw.toInt();
+      return value < 0 ? fallback : value;
+    }
+    return fallback;
+  }
+
+  /// **站点订阅（插件 → 核心）**：参数 `{station, scope?, replace?, station_id?}`。
   ///
   /// - `station`：`relay`（工具调用前/后拦截-回填）或 `broadcast`（发布-订阅读）；
   ///   执行站不可订阅（站点实例本身会显式拒绝），收集站由核心按工具表刷新代订阅；
+  /// - `station_id`：**可选**，订阅某个具体站点实例（插件自建站的消费入口，
+  ///   如 `plugin.forwarder.relay.audit`）。给了它就按 id 取站点——但**必须由
+  ///   核心校验归属**：自建站只有它是自己的、或它是内置站时才允许订阅；
   /// - `scope`：订阅粒度（`team_id/agent_id/session_id/mode_key`）。**它是作用域
   ///   上限**：team 无法由插件自己认领——核心按目标 agent 的真实归属解析后校验，
   ///   解析不出来或与声明冲突一律拒绝（与 `station/command` 同一 fail-closed 口径）；
-  /// - `replace`：中转站「站 × scope 键位唯一」，同键位第二人默认被拒（先到先得），
+  /// - `replace`：中转站**全站唯一订阅者**，第二人默认被拒（先到先得），
   ///   显式 `replace: true` 才接管并回报被替换者。
   ///
   /// 回包是结果而非 JSON-RPC 错误：`{ok, station_id, kind, scope, replaced, error}`
-  /// ——订阅被业务规则拒绝（键位冲突 / 上限 / 粒度不符）时插件能读到可读原因。
+  /// ——订阅被业务规则拒绝（已被占 / 上限 / 粒度不符）时插件能读到可读原因。
   Future<Map<String, dynamic>> _handleStationSubscribe(
     PluginConfig config,
     Map<String, dynamic> params,
   ) async {
+    // 插件可显式指定要订阅的站点实例（自建站的消费入口）
+    final String explicitId = (params['station_id'] ?? '').toString().trim();
+    if (explicitId.isNotEmpty) {
+      final StationScope scope = _resolveSubscriptionScope(config, params);
+      final StationInstance? station = stations.station(explicitId);
+      if (station == null) {
+        return <String, dynamic>{
+          'ok': false,
+          'station_id': explicitId,
+          'kind': '',
+          'scope': scope.toJson(),
+          'replaced': '',
+          'error': '站点不存在：$explicitId',
+        };
+      }
+      return _subscribeToStation(config, params, station, scope);
+    }
     final String kindRaw = (params['station'] ?? '').toString().trim();
     if (kindRaw.isEmpty) {
       throw const PluginRequestException(
         PluginRpcErrorCode.invalidParams,
-        'station/subscribe 需要 station（relay 或 broadcast）',
+        'station/subscribe 需要 station（relay 或 broadcast），或 station_id',
       );
     }
     final StationKind? kind = StationKind.fromWire(kindRaw);
@@ -1332,6 +1587,36 @@ class PluginBus {
         '${kind.label}：站点未接线（核心未启动站点中枢）',
       );
     }
+    return _subscribeToStation(config, params, station, scope);
+  }
+
+  /// 订阅一个**已解析出来的**站点实例（内置类型寻址与 `station_id` 寻址共用）。
+  ///
+  /// 归属校验在这里做：插件只能订阅**内置站**或**自己的自建站**——别人的自建站
+  /// 只有对方显式邀请（把 id 给它）才谈得上，所以这里不做"邀请"机制，
+  /// 一律要求 `plugin.{自己}.` 前缀，避免插件之间互相挂订阅造成越权拦截。
+  Future<Map<String, dynamic>> _subscribeToStation(
+    PluginConfig config,
+    Map<String, dynamic> params,
+    StationInstance station,
+    StationScope scope,
+  ) async {
+    final bool builtin = StationHubIds.all.contains(station.id);
+    final String? ownerError = builtin
+        ? null
+        : _selfBuiltOwnershipError(config.id, station.id);
+    if (ownerError != null) {
+      log?.call('插件 ${config.id} 订阅 ${station.id} 被拒：$ownerError');
+      return <String, dynamic>{
+        'ok': false,
+        'station_id': station.id,
+        'kind': station.kind.wire,
+        'scope': scope.toJson(),
+        'replaced': '',
+        'error': ownerError,
+      };
+    }
+    final StationKind kind = station.kind;
     final StationSubResult result = stations.subscribe(
       station.id,
       StationSubscriber(
@@ -1373,17 +1658,39 @@ class PluginBus {
     };
   }
 
-  /// **站点退订（插件 → 核心）**：参数 `{station}`；幂等（未订阅也返回 ok）。
+  /// **站点退订（插件 → 核心）**：参数 `{station, station_id?}`；幂等（未订阅也返回 ok）。
   Future<Map<String, dynamic>> _handleStationUnsubscribe(
     PluginConfig config,
     Map<String, dynamic> params,
   ) async {
+    // 显式 id：退订某个具体站点（自建站的消费方退订走这条路）
+    final String explicitId = (params['station_id'] ?? '').toString().trim();
+    if (explicitId.isNotEmpty) {
+      final StationInstance? station = stations.station(explicitId);
+      if (station == null) {
+        return <String, dynamic>{
+          'ok': true,
+          'station_id': explicitId,
+          'kind': '',
+          'removed': 0,
+          'error': '',
+        };
+      }
+      return <String, dynamic>{
+        'ok': true,
+        'station_id': station.id,
+        'kind': station.kind.wire,
+        'removed': stations.unsubscribe(station.id, config.id),
+        'error': '',
+      };
+    }
     final String kindRaw = (params['station'] ?? '').toString().trim();
     final StationKind? kind = StationKind.fromWire(kindRaw);
     if (kind == null || !kind.subscribable) {
       throw PluginRequestException(
         PluginRpcErrorCode.invalidParams,
-        'station/unsubscribe 的 station 只支持 relay / broadcast，收到「$kindRaw」',
+        'station/unsubscribe 的 station 只支持 relay / broadcast，'
+        '收到「$kindRaw」（或改用 station_id）',
       );
     }
     final StationScope scope = _resolveSubscriptionScope(config, params);
