@@ -119,7 +119,37 @@ void main() {
     expect(instance['disabled_reason'], '');
     expect(instance['granularity'], 'team');
     expect(instance['last_heartbeat'], isA<int>());
-    expect(res.json['stations'], isEmpty);
+    // 站点段**不再按 team 过滤**（站点全局唯一，过滤恒真）：快照恒看到四类站
+    // （三站内置 + 该插件申报时现建的收集站）。
+    final List<dynamic> stations = res.json['stations'] as List<dynamic>;
+    expect(
+      stations
+          .map((dynamic s) => (s as Map<String, dynamic>)['station_id'])
+          .toList(),
+      <String>[
+        StationHubIds.collect,
+        StationHubIds.broadcast,
+        StationHubIds.execute,
+        StationHubIds.relay,
+      ],
+      reason: '收集站全局唯一，不再带 @team@mode 后缀；按 id 字典序',
+    );
+    final Map<String, dynamic> collectStation = stations.first
+        as Map<String, dynamic>;
+    expect(collectStation['station_id'], StationHubIds.collect);
+    expect(collectStation['kind'], 'collect');
+    // 该插件声明里没有 scope（无 team 归属）⇒ 按既有口径走 tools/list 旧路径，
+    // **不进站点体系**（这是刻意的 fail-closed，不是本次收敛的改动）。
+    expect(
+      collectStation['subscriber_count'],
+      0,
+      reason: '无 team 归属的插件不订阅站点',
+    );
+    expect(
+      collectStation['subscribers_by_team'],
+      isEmpty,
+      reason: '没有订阅者 ⇒ 面板没有团队分组',
+    );
     final Map<String, dynamic> config =
         res.json['config'] as Map<String, dynamic>;
     expect((config['plugins'] as List<dynamic>).single['plugin_id'], 'sample');

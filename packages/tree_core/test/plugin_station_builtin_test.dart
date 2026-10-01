@@ -4,23 +4,26 @@ import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
 
-/// 内置站「**启动即存在**」（M9 §3「三站系统自带」+ 用户实机反馈）。
+/// 内置站「**全局唯一 + 启动即存在**」（M9 §3「三站系统自带」，用户定稿语义）。
 ///
-/// 背景：广播站 / 执行站 / 中转站原本是**懒创建**的（首次使用时才实例化），
-/// 于是"没配插件、没人用过"时一个内置站都没有 —— 面板上就是「站点（0）」，
-/// 与「三站默认设在系统中」的预期不符。核心现在在站点接线处按存储里已有的
-/// (team, 工作空间模式) 组合预建一遍，这个文件锁住四条语义：
+/// 语义（本次收敛）：站点是**拦截点 / 触发点**，每类站全局只有一个实例，
+/// id 就是类型常量（`system.broadcast` / `system.execute` / `system.relay`）、
+/// **不含 team、不含 mode**。team / agent / session / mode 是**每次交互携带的
+/// 信封**（消息 scope）与**订阅声明**，只在投递时用于匹配订阅者。
 ///
-/// 1. **就位**：每个组合上三类内置站齐全，id = `system.<kind>@<team>@<mode>`；
-/// 2. **幂等**：重复调用不产生重复实例，也不重复落盘；
-/// 3. **持久化**：第二次启动从 stations.yaml 恢复，数量与 id 不变、不再新建；
-/// 4. **取舍**：**不预建收集站**（schema 属于具体接入点，空 schema 的收集站没有意义）。
+/// 这个文件锁住六条语义：
+/// 1. **就位**：三站一次建齐，id = 类型常量；
+/// 2. **与 team / agent 无关**：站点数不随团队或 agent 数量变化；
+/// 3. **幂等**：重复调用不产生重复实例，也不重复落盘；
+/// 4. **持久化**：第二次启动从 stations.yaml 恢复，数量与 id 不变、不再新建；
+/// 5. **迁移**：旧 `baseId@team@mode` 条目归并到常量 id（幂等，只写回一次）；
+/// 6. **取舍**：**不预建收集站**（schema 属于具体接入点，空 schema 没有意义）。
 void main() {
   late Directory temp;
   late String storePath;
 
   setUp(() {
-    temp = Directory.systemTemp.createTempSync('tree_station_builtin_');
+    temp = Directory.systemTemp.createTempSync('tree_station_global_');
     storePath = p.join(temp.path, 'config', 'stations.yaml');
   });
 
@@ -41,60 +44,61 @@ void main() {
   List<String> idsOf(StationHub hub) =>
       hub.stationList().map((StationInstance s) => s.id).toList();
 
-  test('空存储：每个 (team, 工作空间模式) 上三类内置站各就位', () {
+  test('空存储：三站一次建齐，id 是类型常量（不含 team / mode）', () {
     final StationHub hub = StationHub(storePath: storePath);
     expect(hub.stationList(), isEmpty, reason: '预建之前确实是空的（懒创建的世界）');
 
-    final List<String> created = hub.ensureBuiltinStations(<StationScope>[
-      team('team-1'),
-      team('team-1', mode: StationModeKey.ssh),
-      team('team-2'),
-    ]);
+    final List<String> created = hub.ensureBuiltinStations();
 
-    expect(created, hasLength(9), reason: '3 个组合 × 广播/执行/中转 3 类');
-    // stationList() 按 id 字典序（输出稳定）：broadcast < execute < relay，
-    // team-1@local < team-1@ssh < team-2@local
+    expect(created, hasLength(3), reason: '广播 / 执行 / 中转 各一个');
+    // stationList() 按 id 字典序（输出稳定）：broadcast < execute < relay
     expect(idsOf(hub), <String>[
-      'system.broadcast@team-1@local',
-      'system.broadcast@team-1@ssh',
-      'system.broadcast@team-2@local',
-      'system.execute@team-1@local',
-      'system.execute@team-1@ssh',
-      'system.execute@team-2@local',
-      'system.relay@team-1@local',
-      'system.relay@team-1@ssh',
-      'system.relay@team-2@local',
+      StationHubIds.broadcast,
+      StationHubIds.execute,
+      StationHubIds.relay,
     ]);
     for (final StationInstance station in hub.stationList()) {
       expect(station.builtin, isTrue, reason: '预建的都是系统自带站');
-      expect(station.scope.teamId, isNotEmpty);
-      expect(station.scope.agentId, isEmpty, reason: '内置站只绑 team×mode');
-      expect(station.scope.sessionId, isEmpty);
+      expect(
+        station.id.contains('@'),
+        isFalse,
+        reason: '全局 id 不含 team×mode 后缀（这是本次收敛的核心）',
+      );
     }
-    expect(hub.stationList().whereType<BroadcastStation>(), hasLength(3));
-    expect(hub.stationList().whereType<ExecuteStation>(), hasLength(3));
-    expect(hub.stationList().whereType<RelayStation>(), hasLength(3));
+    expect(hub.stationList().whereType<BroadcastStation>(), hasLength(1));
+    expect(hub.stationList().whereType<ExecuteStation>(), hasLength(1));
+    expect(hub.stationList().whereType<RelayStation>(), hasLength(1));
 
-    // 面板快照口径（前端卡片直接渲染这几个字段）：中文名 / 内置 / 订阅数 / mode
+    // 面板快照口径（前端卡片直接渲染这几个字段）：中文名 / 内置 / 订阅数 / 分组
     final Map<String, dynamic> described = hub
-        .snapshot(teamId: 'team-1')
+        .snapshot()
         .firstWhere(
-          (Map<String, dynamic> s) =>
-              s['station_id'] == 'system.broadcast@team-1@ssh',
+          (Map<String, dynamic> s) => s['station_id'] == StationHubIds.broadcast,
         );
     expect(described['kind'], 'broadcast');
     expect(described['kind_label'], '广播站');
     expect(described['builtin'], isTrue);
     expect(described['subscriber_count'], 0);
-    expect(
-      (described['scope'] as Map<String, dynamic>)['mode_key'],
-      StationModeKey.ssh,
-    );
+    expect(described['subscribers_by_team'], isEmpty);
   });
 
-  test('取舍：不预建收集站（schema 属于接入点）', () {
+  test('站点数与 team / agent 的数量无关（新建 agent 不产生新站点）', () {
     final StationHub hub = StationHub(storePath: storePath);
-    hub.ensureBuiltinStations(<StationScope>[team('team-1')]);
+    hub.ensureBuiltinStations();
+    final List<String> baseline = idsOf(hub);
+    expect(baseline, hasLength(3));
+
+    // 模拟"团队变多 / 新 agent 出现"：这些在收敛后**不再**是站点的输入。
+    // 反复调用预建（核心在启动接线处与任何补建点都可能调）必须一字不变。
+    for (int i = 0; i < 3; i++) {
+      expect(hub.ensureBuiltinStations(), isEmpty);
+    }
+    expect(idsOf(hub), baseline, reason: '站点表与团队/agent 解耦');
+  });
+
+  test('取舍：不预建收集站（schema 属于接入点），需要时现建且全局唯一', () {
+    final StationHub hub = StationHub(storePath: storePath);
+    hub.ensureBuiltinStations();
 
     expect(
       hub.stationList().whereType<CollectStation>(),
@@ -104,10 +108,12 @@ void main() {
     expect(idsOf(hub), hasLength(3));
 
     // 接入点需要时现建（「插件定义 tool」的首个接入点），预建不会碰它
-    final CollectStation collect = hub.toolDefineStationFor(team('team-1'))!;
-    expect(collect.id, 'plugin.tool.define@team-1@local');
+    final CollectStation collect = hub.toolDefineStationFor()!;
+    expect(collect.id, StationHubIds.collect);
     expect(collect.schema.fieldNames, contains('tools'));
-    expect(hub.ensureBuiltinStations(<StationScope>[team('team-1')]), isEmpty);
+    // 再来一次拿到的必须是同一个实例（全局唯一），而不是又建一个
+    expect(hub.toolDefineStationFor(), same(collect));
+    expect(hub.ensureBuiltinStations(), isEmpty);
     expect(idsOf(hub), hasLength(4));
     expect(hub.stationList().whereType<CollectStation>().single.id, collect.id);
   });
@@ -115,50 +121,45 @@ void main() {
   test('幂等：重复调用不重复创建、不重复落盘', () {
     final _CountingStationStore counting = _CountingStationStore(storePath);
     final StationHub hub = StationHub(storePath: storePath, store: counting);
-    final List<StationScope> scopes = <StationScope>[team('team-1')];
 
-    expect(hub.ensureBuiltinStations(scopes), hasLength(3));
+    expect(hub.ensureBuiltinStations(), hasLength(3));
     expect(counting.saves, 1, reason: '一批预建合并成一次落盘（不是每站一次）');
     final String after = File(storePath).readAsStringSync();
 
     // 第二次 / 第三次：全部已存在 ⇒ 不新建、不落盘（文件内容与写盘次数都不变）
-    expect(hub.ensureBuiltinStations(scopes), isEmpty);
-    expect(hub.ensureBuiltinStations(scopes), isEmpty);
+    expect(hub.ensureBuiltinStations(), isEmpty);
+    expect(hub.ensureBuiltinStations(), isEmpty);
     expect(counting.saves, 1);
     expect(idsOf(hub), hasLength(3), reason: '不产生重复实例');
     expect(File(storePath).readAsStringSync(), after, reason: '磁盘内容一字不差');
   });
 
-  test('幂等边界：已存在的站点（含订阅/公告板）原样保留，只补缺的那类', () {
+  test('幂等边界：已存在的站点（含订阅）原样保留，只补缺的那类', () {
     final StationHub hub = StationHub(storePath: storePath);
     final StationScope scope = team('team-1');
-    final BroadcastStation broadcast = hub.broadcastFor(scope)!;
+    final BroadcastStation broadcast = hub.broadcastFor()!;
     hub.subscribe(
       broadcast.id,
       StationSubscriber(pluginId: 'p1', scope: scope, subscribedAt: 1),
       (StationRequest request) async => StationReply.ok(),
     );
 
-    final List<String> created = hub.ensureBuiltinStations(<StationScope>[
-      scope,
-    ]);
+    final List<String> created = hub.ensureBuiltinStations();
     expect(created, <String>[
-      'system.execute@team-1@local',
-      'system.relay@team-1@local',
+      StationHubIds.execute,
+      StationHubIds.relay,
     ], reason: '广播站已存在 ⇒ 只补执行站与中转站');
     expect(hub.station(broadcast.id), same(broadcast));
     expect(hub.station(broadcast.id)!.subscribers, hasLength(1));
+    // 订阅者的 team 视角由一个全局站承载（面板据此分组）
+    expect(hub.station(broadcast.id)!.subscribersByTeam().keys, <String>[
+      'team-1',
+    ]);
   });
 
   test('持久化：第二次启动从 stations.yaml 恢复，数量与 id 不变且不再新建', () {
     final StationHub first = StationHub(storePath: storePath);
-    expect(
-      first.ensureBuiltinStations(<StationScope>[
-        team('team-1'),
-        team('team-1', mode: StationModeKey.ssh),
-      ]),
-      hasLength(6),
-    );
+    expect(first.ensureBuiltinStations(), hasLength(3));
     final List<String> baseline = idsOf(first);
     expect(File(storePath).existsSync(), isTrue, reason: '内置站必须落盘');
 
@@ -169,10 +170,7 @@ void main() {
     expect(idsOf(second), baseline, reason: '从盘恢复的实例一字不差');
 
     expect(
-      second.ensureBuiltinStations(<StationScope>[
-        team('team-1'),
-        team('team-1', mode: StationModeKey.ssh),
-      ]),
+      second.ensureBuiltinStations(),
       isEmpty,
       reason: '恢复完就没有可建的了',
     );
@@ -181,31 +179,130 @@ void main() {
     expect(second.stationList().whereType<CollectStation>(), isEmpty);
   });
 
-  test('非法组合直接跳过：team 为空或 mode 非法都不建、也不产生空文件', () {
-    final StationHub hub = StationHub(storePath: storePath);
+  test('迁移：旧 baseId@team@mode 条目归并到常量 id，订阅去重合并', () {
+    // 手写一份"收敛前"的存储：3 个 team×mode 组合 × 3 类站 = 9 条，
+    // 其中广播站在两个组合上各有一条订阅（同一插件在两个 team 上各订一次）。
+    File(storePath).parent.createSync(recursive: true);
+    File(storePath).writeAsStringSync('''
+version: 1
+stations:
+  - id: system.broadcast@team-1@local
+    kind: broadcast
+    description: 广播站（系统自带）
+    scope: {team_id: team-1, agent_id: "", session_id: "", mode_key: local}
+    builtin: true
+    created_at: 100
+    subscribers:
+      - {plugin_id: sample, scope: {team_id: team-1, mode_key: local}, subscribed_at: 5}
+    board_limit: 50
+    board_seq: 1
+    board:
+      - {seq: 1, topic: t1, source_plugin_id: sample, ts: 10, scope: {team_id: team-1, mode_key: local}}
+  - id: system.broadcast@team-1@ssh
+    kind: broadcast
+    description: 广播站（系统自带）
+    builtin: true
+    created_at: 90
+    subscribers:
+      - {plugin_id: sample, scope: {team_id: team-1, mode_key: ssh}, subscribed_at: 7}
+    board_limit: 50
+    board_seq: 2
+  - id: system.execute@team-1@local
+    kind: execute
+    description: 执行站（系统自带）
+    builtin: true
+    created_at: 80
+  - id: system.relay@team-1@local
+    kind: relay
+    description: 中转站（系统自带）
+    builtin: true
+    created_at: 70
+  - id: system.relay@team-2@ssh
+    kind: relay
+    description: 中转站（系统自带）
+    builtin: true
+    created_at: 60
+  - id: plugin.tool.define@team-1@local
+    kind: collect
+    description: 收集站（系统自带）
+    builtin: true
+    created_at: 50
+    schema:
+      description: 插件工具定义清单
+      fields:
+        - {name: tools, type: array, required: true}
+''');
+
+    final _CountingStationStore counting = _CountingStationStore(storePath);
+    final StationHub hub = StationHub(storePath: storePath, store: counting);
+    hub.load();
+
     expect(
-      hub.ensureBuiltinStations(<StationScope>[
-        const StationScope(),
-        const StationScope(teamId: 'team-1', modeKey: 'cloud'),
-        const StationScope(teamId: '   ', modeKey: StationModeKey.local),
-      ]),
-      isEmpty,
+      idsOf(hub),
+      <String>[
+        // 字典序：plugin.* < system.*
+        StationHubIds.collect,
+        StationHubIds.broadcast,
+        StationHubIds.execute,
+        StationHubIds.relay,
+      ],
+      reason: '9 条旧实例归并成 4 条全局站（去重 + 常量 id）',
     );
-    expect(hub.stationList(), isEmpty);
+    expect(counting.saves, 1, reason: '迁移结果立刻写回一次');
+
+    // 广播站：两处订阅都保留（team-1 的 local 与 ssh 各一条，scope 不同 ⇒ 两条）
+    final BroadcastStation broadcast =
+        hub.station(StationHubIds.broadcast)! as BroadcastStation;
+    expect(broadcast.subscribers, hasLength(2));
+    expect(broadcast.subscribersByTeam().keys, <String>['team-1']);
     expect(
-      File(storePath).existsSync(),
-      isFalse,
-      reason: '什么都没建 ⇒ 不该留下一个空 stations.yaml',
+      broadcast.subscribersByTeam()['team-1']!['plugin_ids'],
+      <String>['sample'],
+      reason: '同期同插件的订阅者按 team 归到一处',
     );
+    // created_at 取最小（跨迁移保留"资历"）
+    expect(broadcast.createdAt, 90);
+    // 公告板：合并后 board_seq 取最大水位
+    expect(broadcast.boardSeq, 2);
+    expect(broadcast.board, hasLength(1), reason: '两处只有一条真实公告');
+
+    // 中转站：两个 team 各有一条旧实例 ⇒ 归并成一条，订阅者都在上面
+    final RelayStation relay = hub.station(StationHubIds.relay)! as RelayStation;
+    expect(relay.createdAt, 60, reason: '取最小 created_at');
+    expect(relay.subscribers, isEmpty);
+
+    // 收集站：schema 跨迁移保留（迁移后仍是可用的收集站）
+    final CollectStation collect =
+        hub.station(StationHubIds.collect)! as CollectStation;
+    expect(collect.schema.fieldNames, contains('tools'));
+
+    // 迁移是幂等的：再起一次不该再写盘（文件里已经没有 @ 条目了）
+    final _CountingStationStore again = _CountingStationStore(storePath);
+    final StationHub restarted = StationHub(storePath: storePath, store: again);
+    restarted.load();
+    expect(again.saves, 0, reason: '第二次启动不再迁移、不再写盘');
+    expect(idsOf(restarted), idsOf(hub));
+
+    // 写回后的文件必须是新口径（可人工阅读，不含 @team@mode）
+    final String text = File(storePath).readAsStringSync();
+    expect(text.contains('@team-1@local'), isFalse);
+    expect(text.contains('system.broadcast'), isTrue);
   });
 
-  test('重复的 (team, mode) 组合不会建两遍（靠站点 id 幂等，不靠调用方去重）', () {
+  test('迁移：无法判定类型的旧条目被丢弃，不产生半截站点', () {
+    File(storePath).parent.createSync(recursive: true);
+    File(storePath).writeAsStringSync('''
+version: 1
+stations:
+  - id: mystery.thing@team-1@local
+    kind: relay
+    description: 来历不明
+    builtin: false
+''');
+
     final StationHub hub = StationHub(storePath: storePath);
-    expect(
-      hub.ensureBuiltinStations(<StationScope>[team('team-1'), team('team-1')]),
-      hasLength(3),
-    );
-    expect(idsOf(hub), hasLength(3));
+    hub.load();
+    expect(hub.stationList(), isEmpty, reason: '未知基础 id 不猜类型，直接丢弃');
   });
 }
 

@@ -46,10 +46,10 @@ LLM 驱动的 **agent 团队桌面效率工具**：根据任务难度动态组�
 
 ```powershell
 # 1. 编译核心进程（首次，或核心代码改动后）
-dart compile exe packages/tree_core_cli/bin/tree_core.dart -o .output/tree_core.exe
+D:\app\flutter-sdk-3.47.5\flutter\bin\cache\dart-sdk\bin\dart.exe compile exe packages/tree_core_cli/bin/tree_core.dart -o build/windows/x64/runner/Debug/tree_core.exe
 
 # 2. 运行应用（自动定位 .output/tree_core.exe 并拉起）
-flutter run -d windows
+D:\app\flutter-sdk-3.47.5\flutter\bin\flutter.bat run -d windows
 ```
 
 核心可执行文件的查找顺序：`TREE_CORE_EXE` 环境变量 → **应用同目录**（发行版布局：
@@ -182,7 +182,7 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
   - **Q8** 删除工具轮次上限：终止条件只剩 取消 / 出错 / 模型给出最终文本；限额交给插件（插件监视轮次，超限经执行站 `agent.stop` 发停止信号）
   - **Q9** `spec` 工具瘦身：只留 `select` / `create` / `update`；`select` **直接返回所选 Spec 全文**（删除 `search` / `list` 与"先 read 再 select"约束）；索引**注入系统提示词**（默认全列、>50 条截断）；内置 3 条只读（`general-task` / `hard-task` / `team-meeting`，落工作空间 `.self/spec/`；`easy-task` 已按使用数据移除、`complex-task` 更名 `general-task`）
   - **Q10** `grep` 无匹配时返回**扫描文件清单**（≤200，超出注明总数）+ **生效的排除目录** + 扫描根，帮模型区分"真没有"与"被误排除"；默认口径 = 不扫描**隐藏路径**（`.[!.]*`，如 `.git` / `.dart_tool` / `.self`）+ 依赖/构建目录，要搜隐藏路径显式传 `include_hidden=true`（依赖/构建目录是硬黑名单，不受该开关影响）
-  - **Q11** 站点体系（三站 + 收集站）：执行站首命令集 `fs.read` / `fs.write` / `fs.list` / `fs.grep` / `terminal.exec` / `agent.message` / `agent.stop` / `agent.compact` / `ui.push`；中转站"站 × scope 键位唯一"（先到先得）；收集站由**站点定义输入格式**、多订阅者各回目标数据、站点汇总后交后续处理（如注册工具）；订阅者未响应 ⇒ **返回部分结果 + 显式列出未响应者**（不整体失败、不静默）。**插件可订阅站点**：JSON-RPC `station/subscribe` / `station/unsubscribe`（`relay` / `broadcast`；scope 按目标 agent 的真实归属解析，声明是作用域上限）；**每次工具调用的前/后各触发一次中转站**（工具层唯一入口 `WorkspaceToolRunner.run` 的入/出口），核心把**完整 tool_call 报文**交给插件——改参数、改结果、或什么都不改由插件内部决定；回填支持 string / 对象 / 数组（整体替换），未接线 / 无订阅者 / 插件未回 / 回包非法一律 **fail-open 放行原始报文**
+  - **Q11** 站点体系（三站 + 收集站）：执行站首命令集 `fs.read` / `fs.write` / `fs.list` / `fs.grep` / `terminal.exec` / `agent.message` / `agent.stop` / `agent.compact` / `ui.push`；**站点全局唯一**（每类站一个实例，id 是类型常量，不按 team / mode 复制）；中转站"**每个点位全局唯一订阅者**"（先到先得 / 显式 `replace` 接管，需分流由订阅者自行转发）；收集站由**站点定义输入格式**、多订阅者各回目标数据、站点汇总后交后续处理（如注册工具）；订阅者未响应 ⇒ **返回部分结果 + 显式列出未响应者**（不整体失败、不静默）。**插件可订阅站点**：JSON-RPC `station/subscribe` / `station/unsubscribe`（`relay` / `broadcast`；scope 按目标 agent 的真实归属解析，声明是作用域上限）；**每次工具调用的前/后各触发一次中转站**（工具层唯一入口 `WorkspaceToolRunner.run` 的入/出口），核心把**完整 tool_call 报文**交给插件——改参数、改结果、或什么都不改由插件内部决定；回填支持 string / 对象 / 数组（整体替换），未接线 / 无订阅者 / 插件未回 / 回包非法一律 **fail-open 放行原始报文**
   - **Q12** 插件布局：声明式槽位（左侧活动栏项 / 右栏 Tab / 状态栏 / 消息流内联卡片，**不做 webview/iframe，不执行插件 JS**），槽位走独立通道（manifest 声明 + `plugin_ui_manifest` / `plugin_ui_update` / `plugin_ui_action` 三帧，**不经三站**）；受限控件集 text / list / table / form / progress / actions，未知控件渲染成「不支持的控件」占位；槽位带 `team_id`，只呈现当前 team；插件可经 `ui.push` 注入消息流卡片。**生产端**：插件发 `ui/manifest` / `ui/update` **通知**即被核心转成上述帧（`plugin_id` 一律取实例 id、`team_id` 以 `plugins.yaml` 声明为准 ⇒ 不可自述越权；槽位数与视图体积有上限，非法声明整帧拒绝并记可读原因）
   - **Q13** token rate 管道统一：**思考 / 正文 / 工具调用参数**共用同一条节拍器（参数按 `字符数 / token_scale` 折算 token ⇒ `write` 这类大参数自然排队、`read` 几乎不等），工具结果**直推不延迟** ⇒ UI 只有一条速率曲线
   - **Q14** 思考回传与估算口径：`thinking` 开关（**模型默认 + 每个 agent 可覆盖**：右栏「模型信息」/成员「模型配置」的「回传思考」三态下拉，存 `agents/<id>.yaml` 的 `thinking_override`，PATCH 键 `thinking`）决定历史思考是否作为 `reasoning_content` **回传**（DeepSeek 带 `tools` 的请求必须原样回传，缺失会让同会话后续请求持续 400；默认关闭 = 不回传、省输入 token）。**上下文估算与压缩阈值按同一开关计口径**：关闭时不把思考算进上下文，工具结果按**门控后**的那一份（预览 + 提示）计——否则估算会比实际发送大出几十万 token，压缩在真实上下文只有 1/3 时就触发
@@ -212,7 +212,7 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 - **Spec 与会话状态**：Spec **索引注入系统提示词**（行格式 `- <id> [task_type] 标题（内置）（适用: when 摘要）`，id 用反引号包裹；默认全列、>50 条截断并注明「其余可用 `spec select` 直取」），模型直接 `spec select` 拿全文——M9 Q9 删除了 `search` / `list` / `read` 与"先 read 再 select"约束；每次工具结果前注入"当前 in_progress todo + 已选 Spec"，模型不会忘记约定。
 - **MCP**：`config/mcp.yaml` 注册 stdio 服务，工具以 `mcp__<服务>__<工具>` 原生注入模型工具列表；服务不可用只影响自己（可读错误 + 重连一次）。
 - **插件**：`config/plugins.yaml` 注册进程外插件，工具以 `plugin__<插件>__<工具>` 注入；事件总线（按 scope 四元组过滤）+ 心跳巡检 + `plugin_status` / `plugin_event` 增量；心跳连续丢失只标 **degraded**（插件面板橙色「心跳降级」角标 + 丢失拍数/判活窗口），**不杀进程**，恢复即自动清除。插件可经声明式槽位（活动栏 / 右栏 Tab / 状态栏 / 消息流卡片）出界面，也可经**收集站**申报自己的工具定义。
-- **站点体系（M9 Q11）**：广播站 / 执行站 / 中转站 + **收集站**（一对多收集、不回填）；站点是**持久化实例**（类型 / schema / 订阅上限 / scope / 订阅者，跨重启保留），触发即调用实例方法；所有站点消息带并校验**四元组 scope** `(team_id, agent_id, session_id, mode_key)`，跨 scope 不投递（fail-closed）。
+- **站点体系（M9 Q11）**：广播站 / 执行站 / 中转站 + **收集站**（一对多收集、不回填）；站点是**持久化实例**（类型 / schema / 订阅上限 / 订阅者，跨重启保留），触发即调用实例方法。**站点全局唯一**：每类站一个实例，id 就是类型常量（`system.broadcast` / `system.execute` / `system.relay` / `plugin.tool.define`），**不按 team / mode 复制**；team / agent / session / mode 是**每次交互携带的四元组 scope** `(team_id, agent_id, session_id, mode_key)`，投递时按「消息 ↔ 订阅者」精确匹配，跨 scope 不投递（fail-closed）。**每个点位全局只允许一个订阅者**：需要按团队分开处理时，由该订阅者自己转发（在插件内再建站点分发），而不是重复订阅。
 - **数据都在用户能直接看的地方**：`~/.tree` 下的 yaml / jsonl / 快照，可手改。
 
 ---

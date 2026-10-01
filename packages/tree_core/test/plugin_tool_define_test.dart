@@ -106,11 +106,13 @@ void main() {
     );
     expect(direct.text, 'plugin-echo: D');
 
-    // 5) 站点快照里能看到收集站、schema 与订阅者
+    // 5) 站点快照里能看到收集站、schema 与订阅者（站点全局唯一，快照恒四类站）
     final List<dynamic> stations = bus.snapshot()['stations'] as List<dynamic>;
-    final Map<String, dynamic> station =
-        stations.single as Map<String, dynamic>;
-    expect(station['station_id'], contains('plugin.tool.define'));
+    expect(stations, hasLength(4), reason: '三站内置 + 收集站');
+    final Map<String, dynamic> station = stations.firstWhere(
+      (dynamic s) => (s as Map<String, dynamic>)['kind'] == 'collect',
+    ) as Map<String, dynamic>;
+    expect(station['station_id'], StationHubIds.collect);
     expect(station['kind'], 'collect');
     expect(station['builtin'], isTrue);
     final Map<String, dynamic> schema =
@@ -154,10 +156,18 @@ void main() {
     await bus.close();
     expect(bus.toolsOf('sample'), isEmpty, reason: '下线插件的工具定义一并移除');
     final List<dynamic> stations = bus.snapshot()['stations'] as List<dynamic>;
+    final Map<String, dynamic> collectStation = stations.firstWhere(
+      (dynamic s) => (s as Map<String, dynamic>)['kind'] == 'collect',
+    ) as Map<String, dynamic>;
     expect(
-      (stations.single as Map<String, dynamic>)['subscriptions'],
+      collectStation['subscriptions'],
       isEmpty,
       reason: '插件下线由总线注销其订阅',
+    );
+    expect(
+      collectStation['subscribers_by_team'],
+      isEmpty,
+      reason: '订阅没了 ⇒ 面板的团队分组也空',
     );
     // 站点实例本身仍在（站点 = 持久化实例，重启后照旧可用）
     expect(

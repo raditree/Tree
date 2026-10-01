@@ -267,7 +267,7 @@ class ExecuteStationMounts {
     final String agentId = explicit.isNotEmpty ? explicit : scoped;
     if (agentId.isEmpty) {
       return _StationTarget.rejected(
-        '命令 ${context.command} 需要 agent_id（或站点 scope 绑定 agent）：'
+        '命令 ${context.command} 需要 agent_id（或本次命令的 scope 里带 agent）：'
         '无法确定目标 agent，拒绝执行',
       );
     }

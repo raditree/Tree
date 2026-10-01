@@ -193,14 +193,14 @@ void main() {
     final Map<String, dynamic> sub = subscribed['result'] as Map<String, dynamic>;
     expect(sub['ok'], isTrue, reason: '${sub['error']}');
     expect(sub['kind'], 'relay');
-    expect(sub['station_id'], 'system.relay@$team@local');
+    expect(sub['station_id'], StationHubIds.relay, reason: '站点 id 是全局常量');
 
     final RelayStation relay =
-        bus.stations.station('system.relay@$team@local')! as RelayStation;
+        bus.stations.station(StationHubIds.relay)! as RelayStation;
     expect(relay.subscribers.single.pluginId, 'sample');
     expect(relay.subscribers.single.scope.teamId, team);
 
-    // 重复订阅同键位 = 幂等更新（不报"键位冲突"）
+    // 重复订阅 = 幂等更新（同一插件同 scope；不报"键位冲突"）
     final Map<String, dynamic> again = await pluginRequest(
       bus,
       method: 'station/subscribe',
@@ -216,7 +216,7 @@ void main() {
       params: <String, dynamic>{'station': 'broadcast'},
     );
     expect((broadcast['result'] as Map<String, dynamic>)['ok'], isTrue);
-    expect(bus.stations.station('system.broadcast@$team@local'), isNotNull);
+    expect(bus.stations.station(StationHubIds.broadcast), isNotNull);
 
     // 非可订阅站 / 未知站点类型 ⇒ 参数错误（显式，不静默）
     final Map<String, dynamic> execute = await pluginRequest(
@@ -413,13 +413,16 @@ void main() {
     expect(File(p.join(workspace, 't1.txt')).readAsStringSync(), 'team-1');
     expect(File(p.join(workspace, 't2.txt')).readAsStringSync(), 'team-2');
     expect(
-      bus.stations
-          .stationList()
-          .whereType<ExecuteStation>()
-          .map((ExecuteStation s) => s.scope.teamId)
-          .toSet(),
-      <String>{'team-1', 'team-2'},
-      reason: '两个团队的执行站都按真实归属建出来了（同一个插件实例）',
+      bus.stations.stationList().whereType<ExecuteStation>().map(
+        (ExecuteStation s) => s.id,
+      ),
+      <String>[StationHubIds.execute],
+      reason: '执行站全局唯一：一个实例按每条命令的 agent_id 服务多个 team',
+    );
+    expect(
+      bus.stations.station(StationHubIds.execute)!.scope.teamId,
+      isEmpty,
+      reason: '站点不绑 team——归属在每次命令的 scope 上',
     );
   });
 

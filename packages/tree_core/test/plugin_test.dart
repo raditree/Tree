@@ -165,16 +165,31 @@ void main() {
     expect(lines, hasLength(1));
     expect(jsonDecode(lines.single), containsPair('type', 'task'));
 
-    // 站点体系：插件启动 = 工具表刷新点 ⇒ 自动建立该 team 的收集站并挂上插件
+    // 站点体系：插件启动 = 工具表刷新点 ⇒ 插件挂到**全局唯一的收集站**上。
+    // 快照恒看到四类站（三站内置 + 收集站）；收集站是唯一有订阅者的那个。
     final List<dynamic> stations = bus.snapshot()['stations'] as List<dynamic>;
-    expect(stations, hasLength(1));
-    final Map<String, dynamic> station =
-        stations.single as Map<String, dynamic>;
-    expect(station['station_id'], contains('plugin.tool.define'));
-    expect(station['kind'], 'collect');
+    expect(stations, hasLength(4));
+    final Map<String, dynamic> station = stations.firstWhere(
+      (dynamic s) => (s as Map<String, dynamic>)['kind'] == 'collect',
+    ) as Map<String, dynamic>;
+    expect(
+      station['station_id'],
+      StationHubIds.collect,
+      reason: '收集站全局唯一：id 不再带 @team@mode',
+    );
     expect(
       (station['subscriptions'] as List<dynamic>).single['plugin_id'],
       'sample',
+    );
+    expect(
+      station['subscribers_by_team'],
+      <String, dynamic>{
+        'team-1': <String, dynamic>{
+          'count': 1,
+          'plugin_ids': <String>['sample'],
+        },
+      },
+      reason: 'team 视角落在订阅者 scope 上（面板据此分组）',
     );
 
     // 工具调用（命名空间名）
@@ -208,7 +223,29 @@ void main() {
 
     final Map<String, dynamic> snapshot = bus.snapshot();
     expect(snapshot['enabled'], isTrue);
-    expect(snapshot['stations'], isEmpty);
+    // 站点全局唯一：快照恒看到四类站（三站内置 + 接入点现建的收集站），
+    // 与"有没有插件成功启动"无关（坏插件不该让站点段时有时无）。
+    expect(
+      (snapshot['stations'] as List<dynamic>)
+          .map((dynamic s) => (s as Map<String, dynamic>)['station_id'])
+          .toList(),
+      <String>[
+        StationHubIds.collect,
+        StationHubIds.broadcast,
+        StationHubIds.execute,
+        StationHubIds.relay,
+      ],
+      reason: '按 id 字典序：plugin.* < system.*',
+    );
+    expect(
+      (snapshot['stations'] as List<dynamic>).every(
+        (dynamic s) =>
+            ((s as Map<String, dynamic>)['subscribers_by_team'] as Map)
+                .isEmpty,
+      ),
+      isTrue,
+      reason: '没有插件成功订阅 ⇒ 没有团队分组',
+    );
     final Map<String, dynamic> watchdog =
         snapshot['watchdog'] as Map<String, dynamic>;
     expect(watchdog['interval_s'], 10, reason: '心跳间隔 I = 10s（M9 §1.1）');

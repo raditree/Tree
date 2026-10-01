@@ -144,7 +144,8 @@ void main() {
     );
 
     await bus.start();
-    // 按运行期四元组触发收集：SSH agent 的收集站是 @team-1@ssh（不是本地实例）
+    // 收集站全局唯一：stationIds 恒为它；team / mode 是**消息 scope**，
+    // 决定这一趟投给谁（不再决定"哪个站"）。
     final ToolDefinitionRefresh refresh = await bus.refreshToolDefinitions(
       scope: sshScope,
       context: StationScopeContext(
@@ -157,8 +158,8 @@ void main() {
     expect(refresh.complete, isTrue, reason: refresh.describe());
     expect(
       refresh.stationIds.single,
-      contains('@team-1@ssh'),
-      reason: 'mode_key 来自 agent 的工作空间模式',
+      StationHubIds.collect,
+      reason: '收集站全局唯一，不再按 team×mode 分实例',
     );
 
     // 工具表按 team 过滤：team-2 的调用点看不到 team-1 的插件工具
@@ -220,7 +221,11 @@ void main() {
       ),
     );
     expect(refresh.complete, isTrue, reason: refresh.describe());
-    expect(refresh.stationIds.single, contains('@team-ctx@local'));
+    expect(
+      refresh.stationIds.single,
+      StationHubIds.collect,
+      reason: '收集站全局唯一；team 来自调用点上下文（消息 scope），不再是站点 id',
+    );
     expect(
       PluginTool.dynamicSpecs(bus, scope: scope).map((ToolSpec s) => s.name),
       containsAll(<String>['plugin__sample__echo', 'plugin__sample__alias']),

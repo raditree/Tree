@@ -1087,10 +1087,13 @@ class _PluginPanelState extends State<PluginPanel> {
 
   /// 单个站点卡片（计数白名单裁剪，未知键忽略）。
   ///
-  /// 展示口径（M9 §3）：**类型用核心给的 kind / kind_label**（中文名不写死在前端，
-  /// 旧核心缺 kind_label 时按线名兜底、两者都认不出就不显示类型标签），
-  /// 内置站打「内置」标识（与插件自建站区分），订阅数用核心给的 subscriber_count，
-  /// scope 摘要带 mode_key（local / ssh 是隔离的关键维度，不能省）。
+  /// 展示口径（M9 §3，站点全局化后）：
+  /// **类型用核心给的 kind / kind_label**（中文名不写死在前端，旧核心缺 kind_label
+  /// 时按线名兜底、两者都认不出就不显示类型标签），内置站打「内置」标识，
+  /// 订阅数用核心给的 subscriber_count。
+  ///
+  /// **team 视角改看订阅者分组**（`subscribers_by_team`）：站点全局唯一、不绑 team，
+  /// 所以"哪些团队在用这个站"只能由订阅声明回答；不再显示 mode_key 摘要。
   Widget _stationCard(ColorScheme cs, PluginStationInfo s) {
     final String kindLabel = s.displayKindLabel;
     final String subscriber =
@@ -1100,6 +1103,13 @@ class _PluginPanelState extends State<PluginPanel> {
     final String subNote = s.subscriptions.length > 1
         ? '（+${s.subscriptions.length - 1}）'
         : '';
+    // 团队分组摘要：`team（n）`，多个用「、」连；没有订阅者时不显示这一行。
+    final String teamSummary = s.subscribersByTeam.entries
+        .map(
+          (MapEntry<String, int> e) =>
+              '${e.key.isEmpty ? '未标团队' : e.key}（${e.value}）',
+        )
+        .join('、');
     const List<String> countKeys = <String>[
       'requests',
       'responded',
@@ -1159,10 +1169,11 @@ class _PluginPanelState extends State<PluginPanel> {
             '订阅（${s.subscriberCount}）: $subscriber$subNote',
             style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
           ),
-          Text(
-            'scope: ${_scopeSummary(s.scope)}',
-            style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
-          ),
+          if (teamSummary.isNotEmpty)
+            Text(
+              '团队: $teamSummary',
+              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+            ),
           if (countPills.isNotEmpty) ...[
             const SizedBox(height: 4),
             Wrap(spacing: 6, runSpacing: 6, children: countPills),
@@ -1188,18 +1199,16 @@ class _PluginPanelState extends State<PluginPanel> {
 
   /// 站点段的空态说明（可直接照做的文案）。
   ///
-  /// 用户实机反馈（截图）：「处理站（0）／暂无处理站订阅」既没说清内置站是
-  /// **按需创建**的、也没说清**四类站各自什么时候出现**。现在的口径（M9 §3）：
-  /// 广播 / 执行 / 中转三站在核心启动时按「团队 × 工作空间模式」预建（团队下建有
-  /// agent 就自动就位）；收集站的输入格式由接入点定义，只在接入点需要时出现。
-  /// 真的为空只剩两种情况：存储里还没有任何 team（没有 team_id 就归不到站——
-  /// 隔离判定要求 team_id 非空），或数据来自没有预建逻辑的旧核心。
+  /// 站点全局化后的口径：**每类站全局只有一个实例**（广播 / 执行 / 中转在核心启动
+  /// 时就位，收集站由接入点需要时现建），team / agent / session / mode 是**每次交互
+  /// 携带的信封**，不再是站点维度。真的为空只剩一种情况：数据来自没有预建逻辑的
+  /// 旧核心（正常核心启动后至少有三站）。
   String _stationsEmptyText(PluginSnapshot snap) {
     final StringBuffer buffer = StringBuffer(
       '暂无站点实例。'
-      '内置四站（广播 / 执行 / 中转 / 收集）随「团队 × 工作空间模式」创建：'
-      '团队下建有 agent 后，广播站 / 执行站 / 中转站会自动就位；'
-      '收集站的输入格式由接入点定义，只在接入点需要时出现。',
+      '内置四站（广播 / 执行 / 中转 / 收集）**全局各一个**：前三站在核心启动时'
+      '自动就位，收集站由接入点（如插件申报工具）需要时现建；'
+      'team / session / agent 随每次交互携带，不再把站点按团队拆开。',
     );
     final String path = snap.pluginConfigPath;
     if (path.isNotEmpty) {

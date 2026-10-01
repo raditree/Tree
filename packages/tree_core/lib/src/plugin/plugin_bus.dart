@@ -7,6 +7,7 @@ import 'execute_mounts.dart';
 import 'plugin_host.dart';
 import 'plugin_tool_definition.dart';
 import 'plugin_ui_bridge.dart';
+import 'station_ids.dart';
 import 'station_instance.dart';
 import 'station_runtime.dart';
 import 'station_schema.dart';
@@ -896,7 +897,16 @@ class PluginBus {
   /// 「触发时机」由**调用方**决定（本类在 start() 后触发一次；工具表刷新处可再触发），
   /// 站点内部不做管线：注册进工具表就是这里的后续处理。
   ///
-  /// [scope] 非空时只刷新该 team×mode 的收集站。
+  /// **收集站全局唯一**（用户定稿语义）：核心内任何文件、任何时机的触发都命中同一个
+  /// 实例，不再按 team×mode 复制。因此这里不再"每插件建一条站"，而是把全部启用插件
+  /// 订阅到唯一站点上，然后用**消息 scope** 决定这一趟投给谁：
+  /// - [scope] 非空 = 就用它作消息 scope（只投给与它相容的订阅者）；
+  /// - 为空 = 用调用点四元组；再为空则退回各订阅者自己的声明 scope。
+  ///
+  /// **跨 team 不再被本方法过滤掉**（这是"方便跨 team 数据整合"的落点）：一圈收集
+  /// 能看到所有 team 的订阅者；隔离交给两处 fail-closed——投递时的
+  /// `StationIsolation.checkSubscriber`，以及工具表可见性 `_visible`（调用点看不到
+  /// 别的 team 的工具）。跨 scope 的原因仍记进 `skipped` 供观测，不静默。
   Future<ToolDefinitionRefresh> refreshToolDefinitions({
     StationScope? scope,
     StationScopeContext context = const StationScopeContext(),
@@ -910,10 +920,14 @@ class PluginBus {
     }
     final Set<String> stationIds = <String>{};
     final List<String> skipped = <String>[];
-    // 同一 scope 的订阅者合成一组：站点投递按**精确 scope** 匹配（plan §1.2），
-    // 粒度不同的插件（granularity=agent/session）因此各收各的，不互相牵连。
-    final Map<String, List<({String stationId, StationScope scope})>> groups =
-        <String, List<({String stationId, StationScope scope})>>{};
+    // 唯一收集站（不存在则现建）：全部订阅者都挂在它上面。
+    final CollectStation? station = stations.toolDefineStationFor();
+    if (station == null) {
+      // 收集站不可用（被同名非收集站占用等）：明确记录，不静默
+      skipped.add('收集站不可用：${StationHubIds.collect} 已被非收集站占用');
+    }
+    // 这一趟的**消息 scope**：决定投给哪些订阅者。
+    final List<StationScope> messageScopes = <StationScope>[];
     for (final PluginConfig config in _configs) {
       if (!config.enabled) continue;
       final PluginHost? host = _hosts[config.id];
@@ -921,24 +935,14 @@ class PluginBus {
       final StationScope pluginScope = _scopeOf(config, context);
       // 无 team 归属 ⇒ 不进站点体系（走既有 tools/list 申报路径，行为不变）
       if (!pluginScope.isValid) continue;
+      // 跨 scope 只记原因、不再拦（全局收集站要能看到所有 team 的订阅者）
       final String? crossScope = _crossScopeReason(
         config.id,
         pluginScope,
         context,
       );
-      if (crossScope != null) {
-        skipped.add(crossScope);
-        continue;
-      }
-      final CollectStation? station = stations.toolDefineStationFor(
-        pluginScope,
-      );
+      if (crossScope != null) skipped.add(crossScope);
       if (station == null) continue;
-      if (scope != null &&
-          (station.scope.teamId != scope.teamId ||
-              station.scope.modeKey != scope.modeKey)) {
-        continue;
-      }
       stationIds.add(station.id);
       stations.subscribe(
         station.id,
@@ -950,42 +954,43 @@ class PluginBus {
         (StationRequest request) =>
             _respondToToolDefinition(config, host, request),
       );
-      // 采集的**消息 scope** = 调用点运行期四元组（team / agent / session / mode）：
-      // 订阅者是插件实例（team 级或它自己声明的更细粒度），消息比订阅更细是允许的；
-      // 反过来（消息比订阅粗）会被站点 fail-closed 拒绝。因此这里用调用点自己的
-      // 四元组，而不是订阅者的声明 scope（那会把 team 级插件改写成某个 agent 的订阅）。
-      final StationScope messageScope = context.teamId.trim().isEmpty
-          ? station.scope
-          : StationScope(
-              teamId: pluginScope.teamId,
-              agentId: context.agentId.trim(),
-              sessionId: context.sessionId.trim(),
-              modeKey: pluginScope.modeKey,
-            );
-      groups
-          .putIfAbsent(
-            pluginScope.key,
-            () => <({String stationId, StationScope scope})>[],
-          )
-          .add((stationId: station.id, scope: messageScope));
+      // 采集的**消息 scope**：优先调用方指定（决定这一趟投给谁），
+      // 其次调用点运行期四元组，最后退回该订阅者自己的声明 scope。
+      final StationScope? explicit = scope;
+      final StationScope messageScope;
+      if (explicit != null) {
+        messageScope = explicit;
+      } else if (context.teamId.trim().isEmpty) {
+        messageScope = pluginScope;
+      } else {
+        messageScope = StationScope(
+          teamId: pluginScope.teamId,
+          agentId: context.agentId.trim(),
+          sessionId: context.sessionId.trim(),
+          modeKey: pluginScope.modeKey,
+        );
+      }
+      if (!messageScopes.any(
+        (StationScope s) => s.exactEquals(messageScope),
+      )) {
+        messageScopes.add(messageScope);
+      }
     }
     final List<StationCollectedItem> collected = <StationCollectedItem>[];
     final List<StationUnresponsive> unresponsive = <StationUnresponsive>[];
-    for (final List<({String stationId, StationScope scope})> group
-        in groups.values) {
-      final StationInstance? instance = stations.station(group.first.stationId);
-      if (instance is! CollectStation) continue;
-      // 消息 scope = 调用点四元组（订阅者是插件实例，消息更细才允许）
-      final StationCollectResult result = await instance.collect(
-        scope: group.first.scope,
-        meta: <String, dynamic>{
-          'purpose': 'tool_definition',
-          'plugin_config': configFile,
-        },
-      );
-      collected.addAll(result.items);
-      unresponsive.addAll(result.unresponsive);
-      skipped.addAll(result.skipped);
+    if (station != null) {
+      for (final StationScope messageScope in messageScopes) {
+        final StationCollectResult result = await station.collect(
+          scope: messageScope,
+          meta: <String, dynamic>{
+            'purpose': 'tool_definition',
+            'plugin_config': configFile,
+          },
+        );
+        collected.addAll(result.items);
+        unresponsive.addAll(result.unresponsive);
+        skipped.addAll(result.skipped);
+      }
     }
     // 后续处理（触发方职责）：按来源 plugin_id 注册成动态工具。
     final List<String> registered = <String>[];
@@ -1175,7 +1180,7 @@ class PluginBus {
       sessionId: sessionId,
     );
     if (!scope.isValid) return null;
-    final RelayStation? station = stations.relayFor(scope);
+    final RelayStation? station = stations.relayFor();
     if (station == null) return null;
     if (station.subscribers.isEmpty) return null; // 快路径：没人订阅，零等待
     final Map<String, dynamic> payload = <String, dynamic>{
@@ -1314,16 +1319,17 @@ class PluginBus {
       );
     }
     final StationScope scope = _resolveSubscriptionScope(config, params);
+    // 站点全局唯一：只按类型取实例，**不看 scope**（scope 只决定这条订阅能接哪些消息）。
     final StationInstance? station = switch (kind) {
-      StationKind.relay => stations.relayFor(scope),
-      StationKind.broadcast => stations.broadcastFor(scope),
+      StationKind.relay => stations.relayFor(),
+      StationKind.broadcast => stations.broadcastFor(),
       _ => null,
     };
     if (station == null) {
       throw PluginRequestException(
         PluginRpcErrorCode.scopeDenied,
         '插件 ${config.id} 的 scope（${scope.describe()}）没有可用的'
-        '${kind.label}：请检查 team_id / mode_key',
+        '${kind.label}：站点未接线（核心未启动站点中枢）',
       );
     }
     final StationSubResult result = stations.subscribe(
@@ -1381,9 +1387,10 @@ class PluginBus {
       );
     }
     final StationScope scope = _resolveSubscriptionScope(config, params);
+    // 退订同样按类型取全局实例：退订身份 = plugin_id（站内该插件的全部订阅）。
     final StationInstance? station = switch (kind) {
-      StationKind.relay => stations.relayFor(scope),
-      StationKind.broadcast => stations.broadcastFor(scope),
+      StationKind.relay => stations.relayFor(),
+      StationKind.broadcast => stations.broadcastFor(),
       _ => null,
     };
     if (station == null) {
@@ -1538,11 +1545,13 @@ class PluginBus {
       params,
       arguments,
     );
-    final ExecuteStation? station = stations.executeFor(scope);
+    // 执行站全局唯一：只按类型取实例，scope 决定这次命令的归属与目标 agent。
+    final ExecuteStation? station = stations.executeFor();
     if (station == null) {
       throw PluginRequestException(
         PluginRpcErrorCode.scopeDenied,
-        '插件 ${config.id} 的 scope（${scope.describe()}）没有可用的执行站',
+        '插件 ${config.id} 的 scope（${scope.describe()}）没有可用的执行站'
+        '（站点未接线：核心未启动站点中枢）',
       );
     }
     final StationCommandResult result = await station.execute(

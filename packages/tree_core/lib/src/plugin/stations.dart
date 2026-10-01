@@ -1,17 +1,26 @@
 import 'package:tree_protocol/tree_protocol.dart';
 
 import '../util/liveness.dart';
+import 'station_ids.dart';
 import 'station_instance.dart';
 import 'station_runtime.dart';
 import 'station_schema.dart';
-import 'station_scope.dart';
 import 'station_store.dart';
 
 /// 站点中枢（M9 §3）：内置四站、插件自建站、订阅、插件下线注销、快照与落盘。
 ///
-/// 站点 = **持久化实例**：同一类型在每个 team×mode 上是一个独立实例
-/// （id = 基础 id@team@mode），因此隔离四元组天然成立：跨 team / 跨 local-ssh 的
-/// 消息根本找不到站点（fail-closed）。
+/// 站点 = **全局唯一的持久化实例**：每类站点只有一个实例，id 就是类型常量
+/// （`system.broadcast` / `system.execute` / `system.relay` / `plugin.tool.define`），
+/// **不带 team、不带 mode**。
+///
+/// 为什么这样定（用户定稿语义）：
+/// - 站点是**拦截点 / 触发点**，不是「某个 team 的站点」——team / agent / session /
+///   mode 是**每次交互携带的信封**（消息 scope），只在投递时用于匹配订阅者；
+/// - 站点按 team 复制会让站点数随团队数膨胀（一堆没人用的空壳），核心内部也更啰嗦；
+/// - 全局化后**跨 team 的数据整合**天然可行（一趟收集能看到所有 team 的订阅者），
+///   而隔离仍然成立：投递判定在 `StationIsolation.checkSubscriber`，
+///   工具表可见性在 `PluginBus._visible`，两处都按 team fail-closed。
+/// - 插件需要细粒度分隔时，正解是**插件自建站点**（[register]），不是让核心复制站点。
 ///
 /// 「触发 = 实例的一个方法」：中枢只负责**找到实例**并把方法调用转过去；
 /// 不做触发时机编排（时机由调用方 = 挂载位置的具体逻辑决定）。
@@ -27,17 +36,17 @@ class StationHub {
     this.livenessProbeInterval = const Duration(milliseconds: 500),
   }) : _store = store ?? StationStore(storePath);
 
-  /// 广播站基础 id。
-  static const String broadcastBaseId = 'system.broadcast';
+  /// 广播站基础 id（**全局唯一实例的 id 本身就是它**）。
+  static const String broadcastBaseId = StationHubIds.broadcast;
 
   /// 执行站基础 id。
-  static const String executeBaseId = 'system.execute';
+  static const String executeBaseId = StationHubIds.execute;
 
   /// 中转站基础 id。
-  static const String relayBaseId = 'system.relay';
+  static const String relayBaseId = StationHubIds.relay;
 
   /// 收集站（插件定义 tool，首个接入点）基础 id。
-  static const String toolDefineBaseId = 'plugin.tool.define';
+  static const String toolDefineBaseId = StationHubIds.collect;
 
   /// 工具定义收集站的 schema（**站点定义输入格式**：插件必须按它产出）。
   ///
@@ -141,9 +150,19 @@ class StationHub {
   void load() {
     if (_loaded) return;
     _loaded = true;
-    for (final StationInstance station in _store.load()) {
+    // 读侧迁移：旧格式（baseId@team@mode）在这里被归并到全局常量 id。
+    // [log] 只报告"发生了什么"，不阻塞启动；归并结果立刻写回一次，此后幂等。
+    final ({List<StationInstance> stations, bool migrated}) loaded = _store.load();
+    for (final StationInstance station in loaded.stations) {
       _attach(station);
       _stations[station.id] = station;
+    }
+    if (loaded.migrated) {
+      log?.call(
+        '站点存储已迁移到全局 id：${_stations.length} 个实例'
+        '（${_stations.keys.join('、')}）——每类站全局唯一，不再按 team×mode 复制',
+      );
+      save();
     }
   }
 
@@ -161,33 +180,26 @@ class StationHub {
     return _stations[id];
   }
 
-  /// 某插件在某 team×mode 上的内置站 id。
-  static String teamStationId(String baseId, StationScope scope) =>
-      '$baseId@${scope.teamId}@${scope.modeKey}';
-
-  /// 广播站（系统自带；按 team×mode 落一个实例，不存在则创建）。
-  BroadcastStation? broadcastFor(StationScope scope) {
+  /// 广播站（系统自带；**全局唯一实例**，不存在则创建）。
+  BroadcastStation? broadcastFor() {
     load();
-    if (!scope.isValid) return null;
-    final String id = teamStationId(broadcastBaseId, scope);
+    const String id = broadcastBaseId;
     final StationInstance? existing = _stations[id];
     if (existing is BroadcastStation) return existing;
     if (existing != null) return null;
     final BroadcastStation station = BroadcastStation(
       id: id,
       description: '广播站（系统自带）：插件发布 topic → 多订阅者接收 + 持久公告板',
-      scope: teamScope(scope),
       builtin: true,
     );
     _register(station);
     return station;
   }
 
-  /// 执行站（系统自带；插件主动下命令的落点，内置 ui.push 挂载位置）。
-  ExecuteStation? executeFor(StationScope scope) {
+  /// 执行站（系统自带；**全局唯一实例**，插件主动下命令的落点 + 内置 ui.push 挂载位置）。
+  ExecuteStation? executeFor() {
     load();
-    if (!scope.isValid) return null;
-    final String id = teamStationId(executeBaseId, scope);
+    const String id = executeBaseId;
     final StationInstance? existing = _stations[id];
     if (existing is ExecuteStation) return existing;
     if (existing != null) return null;
@@ -197,25 +209,22 @@ class StationHub {
           '执行站（系统自带）：插件主动下命令，由挂载位置执行；首命令集 = '
           'fs.read/fs.write/fs.list/fs.grep/terminal.exec/agent.message/'
           'agent.stop/agent.compact/ui.push',
-      scope: teamScope(scope),
       builtin: true,
     );
     _register(station);
     return station;
   }
 
-  /// 中转站（系统自带；站 × scope 键位唯一）。
-  RelayStation? relayFor(StationScope scope) {
+  /// 中转站（系统自带；**全局唯一实例**，全站只允许一个订阅者）。
+  RelayStation? relayFor() {
     load();
-    if (!scope.isValid) return null;
-    final String id = teamStationId(relayBaseId, scope);
+    const String id = relayBaseId;
     final StationInstance? existing = _stations[id];
     if (existing is RelayStation) return existing;
     if (existing != null) return null;
     final RelayStation station = RelayStation(
       id: id,
-      description: '中转站（系统自带）：数据流拦截-回填；站 × scope 键位唯一（先到先得）',
-      scope: teamScope(scope),
+      description: '中转站（系统自带）：数据流拦截-回填；全站唯一订阅者（先到先得）',
       maxSubscriptions: 16,
       builtin: true,
     );
@@ -223,45 +232,39 @@ class StationHub {
     return station;
   }
 
-  /// **确保内置三站在给定的 (team, 工作空间模式) 组合上存在**（M9 §3「三站系统自带」）。
+  /// **确保内置三站存在**（M9 §3「三站系统自带」）。
   ///
   /// 为什么需要这一步：[broadcastFor] / [executeFor] / [relayFor] 都是**懒创建**
   /// （首次使用时才实例化）。按需开销为零是好事，代价却是"没配插件 / 没人用过"时
   /// 一个内置站都没有——面板上就是「站点（0）」，与用户「三站默认设在系统中」的
-  /// 预期不符。核心在**站点接线处**（`CoreServer._wirePluginStations`）按存储里
-  /// 已有的 (team, mode) 组合各预建一遍，三站因此随 agent 一起就位。
+  /// 预期不符。核心在**站点接线处**（`CoreServer._wirePluginStations`）调用一次，
+  /// 三站因此启动即就位。
+  ///
+  /// **与 team / agent 无关**（用户定稿语义）：站点全局唯一，不随团队产生新实例。
+  /// 新建 agent、新增 team 都不会、也不该让站点数变化。
   ///
   /// 幂等（重复启动的安全边界）：
   /// - 已存在的站点（本次启动从 stations.yaml **恢复**的，或之前调用已建的）直接跳过，
   ///   既不新建也不覆盖——所以重复调用不产生重复实例；
-  /// - 没有新建就**不落盘**，一批新建也只写一次（[_saveSuspend] 合并），
+  /// - 没有新建就**不落盘**（[_saveSuspend] 合并成一次写），
   ///   所以重复启动既不改文件内容也不刷新文件时间。
   ///
   /// **为什么不预建收集站**（本波次的取舍，用户裁定）：收集站的 schema 就是
   /// **接入点定义的输入格式**（如 [toolDefinitionSchema]）。没有接入点就没有格式，
   /// 预建一个"空 schema"的收集站毫无意义——既过不了 [register] 的空 schema 校验，
   /// 也不会有任何订阅者按它产出。收集站一律由接入点在需要时用
-  /// [toolDefineStationFor] / [register] 现建。
+  /// [toolDefineStationFor] 现建。
   ///
   /// 返回**本次新建**的站点 id（已存在的不在内）；空列表 = 纯幂等命中，什么都没做。
-  List<String> ensureBuiltinStations(Iterable<StationScope> scopes) {
+  List<String> ensureBuiltinStations() {
     load();
     final List<String> created = <String>[];
-    // 一批预建只落一次盘（每个内置站的懒创建都会 save 一次，不合并就是 3×N 次写）
+    // 一批预建只落一次盘（每个内置站的懒创建都会 save 一次，不合并就是 3 次写）
     _saveSuspend++;
     try {
-      for (final StationScope raw in scopes) {
-        if (!raw.isValid) continue;
-        // 内置站只绑 team×mode（agent/session 留空 = 不限定），与懒创建同口径；
-        // team_id 顺带 trim，避免空格混进站点 id（隔离判定按精确相等）。
-        final StationScope scope = StationScope(
-          teamId: raw.teamId.trim(),
-          modeKey: raw.modeKey,
-        );
-        _ensureOneBuiltin(() => broadcastFor(scope), created);
-        _ensureOneBuiltin(() => executeFor(scope), created);
-        _ensureOneBuiltin(() => relayFor(scope), created);
-      }
+      _ensureOneBuiltin(broadcastFor, created);
+      _ensureOneBuiltin(executeFor, created);
+      _ensureOneBuiltin(relayFor, created);
     } finally {
       _saveSuspend--;
       if (_saveDirtyWhileSuspended) {
@@ -287,18 +290,19 @@ class StationHub {
     }
   }
 
-  /// 收集站「插件定义 tool」（系统自带；收集站的首个接入点）。
-  CollectStation? toolDefineStationFor(StationScope scope) {
+  /// 收集站「插件定义 tool」（系统自带；收集站的首个接入点；**全局唯一实例**）。
+  ///
+  /// 站点不分 team：核心内任何文件、任何时机的触发都命中这一个实例，
+  /// 采集时携带 team / agent / session（消息 scope），由订阅者各自匹配。
+  CollectStation? toolDefineStationFor() {
     load();
-    if (!scope.isValid) return null;
-    final String id = teamStationId(toolDefineBaseId, scope);
+    const String id = toolDefineBaseId;
     final StationInstance? existing = _stations[id];
     if (existing is CollectStation) return existing;
     if (existing != null) return null;
     final CollectStation station = CollectStation(
       id: id,
       description: '收集站（系统自带）：插件按 schema 申报工具定义（名称/描述/参数/执行方式）',
-      scope: teamScope(scope),
       schema: toolDefinitionSchema,
       builtin: true,
     );
@@ -306,25 +310,54 @@ class StationHub {
     return station;
   }
 
-  /// 站点 scope：内置站绑定到 team×mode（agent/session 留空 = 不限定）。
-  static StationScope teamScope(StationScope scope) =>
-      StationScope(teamId: scope.teamId, modeKey: scope.modeKey);
-
   /// 插件自建站点（**只能注册既有四种类型**，不允许发明新类型）。
+  ///
+  /// id **必须带命名空间**：内置保留 id（`system.*` 与 `plugin.tool.define`）不得冒用，
+  /// 插件自建站一律用 `plugin.{plugin_id}.` 前缀（如 `plugin.sample.relay.audit`）。
+  /// 这条校验是**为插件自建站铺路**：站点全局化后，插件要按 team / agent 细分
+  /// 处理只能自己建站，所以 id 归属必须可证明，否则任何插件都能顶掉别人的站点。
+  ///
+  /// 站点不再绑 scope（team / mode 是消息信封属性，不是站点属性），因此这里不再
+  /// 校验 `station.scope`。
   ///
   /// 返回 null = 成功；否则返回可读中文原因。
   String? register(StationInstance station) {
     load();
-    if (_stations.containsKey(station.id)) {
-      return '站点 id 已存在：${station.id}';
+    final String id = station.id.trim();
+    if (id.isEmpty) {
+      return '站点 id 不能为空';
     }
-    if (!station.scope.isValid) {
-      return '站点 scope 非法：team_id 必须非空、mode_key 只能是 local | ssh';
+    if (_stations.containsKey(id)) {
+      return '站点 id 已存在：$id';
+    }
+    final String? idError = checkSelfBuiltId(id);
+    if (idError != null) {
+      return idError;
     }
     if (station is CollectStation && station.schema.fields.isEmpty) {
       return '收集站必须定义 schema（输入格式），当前为空';
     }
     _register(station);
+    return null;
+  }
+
+  /// 插件自建站 id 的命名空间校验（返回 null = 合法）。
+  ///
+  /// 规则：必须是 `plugin.` 开头（内置四站的保留 id 一律不得冒用）。
+  /// 用独立静态方法是为了让「创建时校验」与「从盘上恢复时校验」共用同一口径。
+  static String? checkSelfBuiltId(String id) {
+    if (id == broadcastBaseId ||
+        id == executeBaseId ||
+        id == relayBaseId ||
+        id == toolDefineBaseId) {
+      return '站点 id「$id」是内置保留 id，插件不得注册';
+    }
+    if (id.startsWith('system.')) {
+      return '站点 id「$id」占用系统保留前缀 system.（内置站专用）';
+    }
+    if (!id.startsWith('plugin.')) {
+      return '插件自建站 id 必须以 plugin. 开头（如 plugin.sample.relay.audit），收到「$id」';
+    }
     return null;
   }
 
@@ -390,13 +423,18 @@ class StationHub {
   }
 
   /// 前端快照（stations 段；形状与既有 PluginStationInfo 的宽容解析对齐）。
+  ///
+  /// **站点段不再按 team 过滤**（站点全局唯一，过滤恒真且会误导）：
+  /// `teamId` 只用于实例段（插件实例的 scope），站点段的 team 视角由每条订阅者
+  /// 的 `scope` + `subscribers_by_team` 承担——面板据此分组展示。
+  ///
+  /// 快照前先 [ensureBuiltinStations]：否则面板显示几条取决于"之前有没有人触发过
+  /// 站点"（懒创建残留），同一个系统会时多时少。这里幂等、且只有新建才落盘，
+  /// 所以不会因为"看一眼面板"而反复写文件。
   List<Map<String, dynamic>> snapshot({String? teamId}) {
     load();
+    ensureBuiltinStations();
     return stationList()
-        .where((StationInstance station) {
-          if (teamId == null || teamId.isEmpty) return true;
-          return station.scope.teamId.isEmpty || station.scope.teamId == teamId;
-        })
         .map((StationInstance station) => station.describe())
         .toList(growable: false);
   }

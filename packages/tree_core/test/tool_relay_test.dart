@@ -3,8 +3,6 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
-import 'package:tree_local_exec/tree_local_exec.dart';
-import 'package:tree_protocol/tree_protocol.dart';
 
 /// **工具调用前/后各一次中转站**（本轮新增）：
 ///
@@ -136,8 +134,10 @@ void main() {
       isNotNull,
       reason: '插件必须订阅上中转站；日志：${logs.join(' | ')}',
     );
-    expect(relayStation!.scope.teamId, team);
+    // 站点全局唯一、不绑 team：team 视角在**订阅声明的 scope** 上
+    expect(relayStation!.id, StationHubIds.relay);
     expect(relayStation.subscribers.single.pluginId, 'relay');
+    expect(relayStation.subscribers.single.scope.teamId, team);
 
     final ToolOutcome outcome = await runner.run(
       writeInvocation('模型原始内容'),

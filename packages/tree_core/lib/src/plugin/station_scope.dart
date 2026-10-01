@@ -5,11 +5,19 @@
 /// ${''}(team_id, agent_id, session_id, mode_key)   // mode_key ∈ {local, ssh}
 ///
 /// 判定方向一律 **fail-closed**（不能证明归属即拒绝）：
-/// 1. 「team + mode」三方（站点实例 / 消息 / 订阅者）必须**精确相等**且非空——
+/// 1. 「消息 ↔ 订阅者」的 **team + mode 必须精确相等**且消息侧非空——
 ///    跨 team、跨 local/ssh 一律不投递（否则 SSH 团队的插件命令会打到本地工作空间）；
 /// 2. agent_id / session_id 允许**订阅者更细**（订阅可声明「只订阅某 agent」），
 ///    但非空值必须与消息一致，**不得放大**；
-/// 3. 消息字段为空（未知）而订阅者/站点要求该字段 ⇒ 不投递。
+/// 3. 消息字段为空（未知）而订阅者要求该字段 ⇒ 不投递。
+///
+/// **站点实例不再参与 team/mode 判定**（站点已全局化：每类站一个实例，
+/// 本身不绑 team、不绑 mode）。scope 只存在于两处：
+/// - **消息**：每次交互携带的信封（由运行期解析得出，见 `StationScopeContext`）；
+/// - **订阅声明**：订阅者自述的作用范围上限。
+///
+/// 因此 `checkMessageScope` 只自校验消息信封是否**可证明归属**（team 非空 +
+/// mode 合法），不做任何比对；真正的投递判定在 `checkSubscriber`。
 library;
 
 /// mode_key 取值（与 plan §1.2 一致）。
@@ -113,9 +121,9 @@ class StationScope {
 /// **调用点上下文**（M9 Wave 3-I）：站点四元组里 team / agent / session 的
 /// **运行期**来源。
 ///
-/// 站点 scope 是「站点/订阅者归属哪个 team×mode」的声明；调用点上下文是
-/// 「这一次是谁在问」——工具表刷新、执行站下命令这类调用点把当前 agent / 会话
-/// 带进来，四元组才有运行期含义（而不是只认 plugins.yaml 里写死的 scope）。
+/// 站点全局化后，这里是 scope 的**唯一来源**：站点实例不再持有 team/mode，
+/// 「这一次是谁在问」全部由调用点带进来——工具表刷新、执行站下命令、中转拦截
+/// 都先经这里解析出消息信封，再交给订阅者匹配。
 ///
 /// - [modeKey] 一般情况下**留空**：mode 由 `PluginBus.agentModeKeyResolver` 从
 ///   **目标 agent 的工作空间模式**解析（local | ssh），否则 SSH 团队的命令会打到
@@ -148,11 +156,15 @@ class StationScopeContext {
       modeKey.trim().isEmpty;
 
   /// 转四元组（空字段保留为空串 = 不限定，交由调用方按方向校验）。
+  ///
+  /// `modeKey` **不再兜底为 local**：调用点没给出模式时保留空串，让解析器
+  /// （`agentModeKeyResolver`）按目标 agent 的工作空间定；硬塞 local 会把
+  /// 「模式未知」伪装成「本地模式」。
   StationScope toScope() => StationScope(
     teamId: teamId,
     agentId: agentId,
     sessionId: sessionId,
-    modeKey: StationModeKey.isValid(modeKey) ? modeKey : StationModeKey.local,
+    modeKey: StationModeKey.isValid(modeKey) ? modeKey : '',
   );
 
   @override
@@ -176,36 +188,32 @@ class StationIsolationVerdict {
 
 /// 隔离校验规则（唯一定义处；站点的所有投递路径都必须过这里）。
 abstract final class StationIsolation {
-  /// 校验「消息 → 站点实例」：站点绑定 scope 与消息 scope 必须相容。
+  /// 自校验**消息信封**：这次交互是否具备可证明的归属。
   ///
-  /// - team + mode 精确相等（站点未绑定 team ⇒ 拒绝一切消息，不静默放行）；
-  /// - 站点非空的 agent/session 必须与消息一致（站点为空 = 不限定）。
-  static StationIsolationVerdict checkMessage({
-    required StationScope station,
-    required StationScope message,
-  }) {
-    final StationIsolationVerdict base = _checkTeamAndMode(
-      owner: station,
-      other: message,
-      ownerLabel: '站点实例',
-      otherLabel: '消息',
-    );
-    if (!base.ok) return base;
-    if (station.agentId.isNotEmpty && station.agentId != message.agentId) {
-      return StationIsolationVerdict.rejected(
-        '站点绑定 agent=${station.agentId}，消息 agent=${_or(message.agentId)} 不一致（跨 scope 不投递）',
+  /// 站点全局化后不再有「站点绑定 scope」可比，所以站点实例的第一道闸从
+  /// 「站点与消息相容」变成「消息自身是否完整」：
+  /// - `team_id` 必须非空：解析不出归属的消息谁都投不进去（fail-closed）；
+  /// - `mode_key` 必须合法（local | ssh）：它决定这次操作打本地还是 SSH 工作空间。
+  ///
+  /// 这里**不比对**任何订阅者：投递判定统一在 [checkSubscriber]。
+  static StationIsolationVerdict checkMessageScope(StationScope message) {
+    if (message.teamId.trim().isEmpty) {
+      return const StationIsolationVerdict.rejected(
+        '消息缺少 team_id，拒绝投递（fail-closed：无法证明归属）',
       );
     }
-    if (station.sessionId.isNotEmpty &&
-        station.sessionId != message.sessionId) {
+    if (!StationModeKey.isValid(message.modeKey)) {
       return StationIsolationVerdict.rejected(
-        '站点绑定 session=${station.sessionId}，消息 session=${_or(message.sessionId)} 不一致（跨 scope 不投递）',
+        '消息的 mode_key=${message.modeKey} 非法（只能是 local | ssh），拒绝投递',
       );
     }
     return const StationIsolationVerdict.ok();
   }
 
   /// 校验「消息 → 订阅者」：订阅者可比消息更细，但不得放大。
+  ///
+  /// **这是唯一的投递门禁**（站点不再参与判定）：team + mode 必须精确相等，
+  /// agent / session 允许订阅者更细。
   static StationIsolationVerdict checkSubscriber({
     required StationScope message,
     required StationScope subscriber,
@@ -235,24 +243,23 @@ abstract final class StationIsolation {
     return const StationIsolationVerdict.ok();
   }
 
-  /// 完整投递判定：站点绑定 + 订阅者粒度（两条都过才投递）。
+  /// 完整投递判定：消息信封自校验 + 订阅者粒度。
+  ///
+  /// 站点实例已全局唯一、不带 scope，故等价于 [checkMessageScope] +
+  /// [checkSubscriber]；保留本方法作为调用方的一处入口（语义自证）。
   static StationIsolationVerdict deliver({
-    required StationScope station,
     required StationScope message,
     required StationScope subscriber,
   }) {
-    final StationIsolationVerdict onStation = checkMessage(
-      station: station,
-      message: message,
-    );
-    if (!onStation.ok) return onStation;
+    final StationIsolationVerdict onMessage = checkMessageScope(message);
+    if (!onMessage.ok) return onMessage;
     return checkSubscriber(message: message, subscriber: subscriber);
   }
 
   /// 空串占位（可读错误里用 ? 表示「未知/缺失」）。
   static String _or(String value) => value.isEmpty ? '?' : value;
 
-  /// team + mode 的精确匹配（三方共同前提）。
+  /// team + mode 的精确匹配（消息 ↔ 订阅者，站点全局化后唯一的比对方向）。
   static StationIsolationVerdict _checkTeamAndMode({
     required StationScope owner,
     required StationScope other,
@@ -286,7 +293,8 @@ abstract final class StationIsolation {
     }
     if (owner.modeKey != other.modeKey) {
       return StationIsolationVerdict.rejected(
-        '跨模式不投递：$ownerLabel mode=${owner.modeKey}，$otherLabel mode=${other.modeKey}',
+        '跨模式不投递：$ownerLabel mode=${owner.modeKey}，$otherLabel mode=${other.modeKey}'
+        '（SSH 团队的命令不得打到本地工作空间）',
       );
     }
     return const StationIsolationVerdict.ok();

@@ -213,7 +213,10 @@ class PluginStationSub {
   }
 }
 
-/// 站点信息（M9 §3 站点体系：类型 + scope 绑定 + 订阅 + 分类计数 + 在飞等待）。
+/// 站点信息（M9 §3 站点体系：类型 + 订阅 + 分类计数 + 在飞等待）。
+///
+/// 站点**全局唯一**（id 是类型常量，不绑 team / mode）；team 视角看
+/// [subscribersByTeam]（订阅声明里的归属），不再看站点自身。
 ///
 /// 站点 = **持久化实例**，四类：广播站 / 执行站 / 中转站 / 收集站。核心的
 /// `StationInstance.describe()` 已给出展示需要的全部字段，前端不再自己猜类型：
@@ -223,7 +226,8 @@ class PluginStationSub {
 /// 宽容解析：旧核心没有这些字段时全部按"未知"处理（空串 / false / 回退订阅列表
 /// 长度），展示层不臆测、不崩。
 class PluginStationInfo {
-  /// 站 ID（含 scope 归属，如 `system.broadcast@team-1@local`）
+  /// 站 ID（**全局常量**，如 `system.broadcast` / `plugin.tool.define`；
+  /// 旧核心可能给带归属后缀的 `system.broadcast@team-1@local`——两者都按字符串显示）
   final String stationId;
 
   /// 站点类型线名：broadcast / execute / relay / collect（缺失为空串 = 未知）
@@ -244,8 +248,16 @@ class PluginStationInfo {
   /// 订阅者数量（核心给的 `subscriber_count`；缺失回退订阅列表长度）
   final int subscriberCount;
 
-  /// 订阅列表（站 × scope 键位唯一；当前通常 1 项）
+  /// 订阅列表（订阅者身份 = plugin_id + 声明 scope；全局站点上通常只有 1 项，
+  /// 广播站 / 收集站可多条）
   final List<PluginStationSub> subscriptions;
+
+  /// 订阅者按 **team** 分组（站点全局化后的 team 视角）。
+  ///
+  /// 站点只有一个、不绑 team，所以"这个团队有哪些订阅者"必须由订阅声明回答：
+  /// 形状 `{team_id: {count, plugin_ids: [...]}}`。旧核心没有该字段 ⇒ 空表，
+  /// 面板退回只显示订阅总数（不臆测）。
+  final Map<String, int> subscribersByTeam;
 
   /// 分类计数（仅保留数值型；未知键宽容保留、展示层裁剪）
   final Map<String, int> counts;
@@ -262,6 +274,7 @@ class PluginStationInfo {
     this.builtin = false,
     this.subscriberCount = 0,
     this.subscriptions = const <PluginStationSub>[],
+    this.subscribersByTeam = const <String, int>{},
     this.counts = const <String, int>{},
     this.waitsInFlight,
   });
@@ -330,6 +343,21 @@ class PluginStationInfo {
     final int subscriberCount = rawSubscriberCount is num
         ? rawSubscriberCount.toInt()
         : subs.length;
+    // 团队分组：宽容解析（只认数值 count；未知键保留）
+    final Map<String, int> byTeam = <String, int>{};
+    final Object? rawByTeam = m['subscribers_by_team'];
+    if (rawByTeam is Map) {
+      rawByTeam.forEach((Object? team, Object? rawEntry) {
+        if (team is! String || rawEntry is! Map) return;
+        final Object? rawCount = rawEntry['count'];
+        final int count = rawCount is num
+            ? rawCount.toInt()
+            : (rawEntry['plugin_ids'] is List
+                  ? (rawEntry['plugin_ids'] as List).length
+                  : 0);
+        byTeam[team] = count;
+      });
+    }
     return PluginStationInfo(
       stationId: stationId,
       kind: (m['kind'] ?? '').toString(),
@@ -339,6 +367,7 @@ class PluginStationInfo {
       builtin: m['builtin'] == true,
       subscriberCount: subscriberCount,
       subscriptions: subs,
+      subscribersByTeam: byTeam,
       counts: counts,
       waitsInFlight: waits,
     );

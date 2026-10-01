@@ -169,7 +169,8 @@ where.exe python
    `Authorization: Bearer <token>`），`instances` 里应有
    `plugin_id=sample / status=registered / health=ok`，名字是插件自报的
    "示例插件（Python）"。心跳由核心 `ping` 驱动，本插件固定回 `{ok: true}`。
-2. **工具表出现该工具**：收集站 `plugin.tool.define@<team>@<mode>` 的计数里
+2. **工具表出现该工具**：收集站 `plugin.tool.define`（**全局唯一**，不再带
+   `@<team>@<mode>` 后缀；团队归属看 `subscribers_by_team`）的计数里
    `requests / responded` 各 +1（说明插件按 schema 申报成功）。随后让模型调用
    `plugin__sample__echo`（例如："请调用 plugin__sample__echo 回显 hi"），
    结果应为 `plugin-echo: hi`；`plugin__sample__rounds` 返回当前统计。

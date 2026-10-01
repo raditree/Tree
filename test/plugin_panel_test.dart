@@ -46,33 +46,39 @@ Map<String, dynamic> _station(
   String label, {
   bool builtin = true,
   int subscriberCount = 0,
+  Map<String, dynamic> subscribersByTeam = const <String, dynamic>{},
 }) => <String, dynamic>{
   'station_id': id,
   'kind': kind,
   'kind_label': label,
   'description': '$label（系统自带）：职责说明',
+  // 站点全局化后仍带 scope 字段（兼容旧核心），但它不再参与展示；
+  // team 视角走 subscribers_by_team。
   'scope': <String, dynamic>{
-    'team_id': 'team-1',
+    'team_id': '',
     'agent_id': '',
     'session_id': '',
-    'mode_key': 'local',
+    'mode_key': '',
   },
   'builtin': builtin,
   'subscriber_count': subscriberCount,
   'subscriptions': <dynamic>[],
+  'subscribers_by_team': subscribersByTeam,
   'counts': <String, dynamic>{'requests': 2},
   'gauges': <String, dynamic>{'waits_in_flight': 1},
 };
 
 void main() {
-  testWidgets('站点段用新名字「站点（N）」，不再写旧名「处理站」', (WidgetTester tester) async {
+  testWidgets('站点段用新名字「站点（N）」，subscriber 与团队分组随核心字段变化', (
+    WidgetTester tester,
+  ) async {
     final PluginMonitorService svc = await _serviceWith(<String, dynamic>{
       'enabled': true,
       'instances': <dynamic>[],
       'stations': <dynamic>[
-        _station('system.broadcast@team-1@local', 'broadcast', '广播站'),
-        _station('system.execute@team-1@local', 'execute', '执行站'),
-        _station('system.relay@team-1@local', 'relay', '中转站'),
+        _station('system.broadcast', 'broadcast', '广播站'),
+        _station('system.execute', 'execute', '执行站'),
+        _station('system.relay', 'relay', '中转站'),
       ],
       'config': <String, dynamic>{'path': 'C:/data/config/plugins.yaml'},
     });
@@ -85,11 +91,41 @@ void main() {
     expect(find.text('执行站'), findsOneWidget);
     expect(find.text('中转站'), findsOneWidget);
     expect(find.text('内置'), findsNWidgets(3));
-    expect(find.text('system.broadcast@team-1@local'), findsOneWidget);
-    // 订阅数用核心给的 subscriber_count；scope 摘要必须带 mode_key
+    // 站点 id 是全局常量（不再带 @team@mode 后缀）
+    expect(find.text('system.broadcast'), findsOneWidget);
+    expect(find.textContaining('@team-1@local'), findsNothing);
+    // 订阅数用核心给的 subscriber_count；计数 pill 照旧
     expect(find.textContaining('订阅（0）'), findsNWidgets(3));
-    expect(find.textContaining('mode_key=local'), findsNWidgets(3));
     expect(find.textContaining('requests: 2'), findsNWidgets(3));
+    // 没有订阅者 ⇒ 不显示团队分组行
+    expect(find.textContaining('团队:'), findsNothing);
+  });
+
+  testWidgets('站点卡片：订阅者按 team 分组显示（team 视角落在订阅声明上）', (
+    WidgetTester tester,
+  ) async {
+    final PluginMonitorService svc = await _serviceWith(<String, dynamic>{
+      'enabled': true,
+      'instances': <dynamic>[],
+      'stations': <dynamic>[
+        _station(
+          'system.relay',
+          'relay',
+          '中转站',
+          subscriberCount: 1,
+          subscribersByTeam: <String, dynamic>{
+            'team-1': <String, dynamic>{
+              'count': 1,
+              'plugin_ids': <String>['sample'],
+            },
+          },
+        ),
+      ],
+      'config': <String, dynamic>{'path': 'C:/data/config/plugins.yaml'},
+    });
+    await _pumpPanel(tester, svc);
+
+    expect(find.text('团队: team-1（1）'), findsOneWidget);
   });
 
   testWidgets('站点卡片：订阅数与类型标签随核心字段变化（执行站不订阅）', (WidgetTester tester) async {
@@ -119,7 +155,7 @@ void main() {
     expect(find.text('内置'), findsNWidgets(2));
   });
 
-  testWidgets('站点段空态：说清内置四站随团队×工作空间模式创建 + 插件配置路径', (WidgetTester tester) async {
+  testWidgets('站点段空态：说清四站全局各一个 + 插件配置路径', (WidgetTester tester) async {
     final PluginMonitorService svc = await _serviceWith(<String, dynamic>{
       'enabled': true,
       'instances': <dynamic>[],
@@ -130,11 +166,12 @@ void main() {
 
     expect(find.text('站点（0）'), findsOneWidget);
     expect(find.textContaining('内置四站（广播 / 执行 / 中转 / 收集）'), findsOneWidget);
+    expect(find.textContaining('全局各一个'), findsOneWidget);
     expect(
-      find.textContaining('团队下建有 agent 后，广播站 / 执行站 / 中转站会自动就位'),
+      find.textContaining('team / session / agent 随每次交互携带'),
       findsOneWidget,
+      reason: '口径改为"站点不分 team"',
     );
-    expect(find.textContaining('收集站的输入格式由接入点定义'), findsOneWidget);
     expect(
       find.textContaining('插件配置：C:/data/config/plugins.yaml'),
       findsOneWidget,

@@ -520,14 +520,16 @@ class CoreServer {
     _stationMounts = mounts;
     // M9 §3「三站系统自带」+ 用户预期：内置三站原本是**懒创建**的（首次使用时才
     // 实例化），于是"没配插件 / 没人用过"时面板上就是「站点（0）」，与「三站默认
-    // 设在系统中」不符。这里按存储里已有的 (team, 工作空间模式) 组合预建一遍。
+    // 设在系统中」不符。这里在站点接线处确保三站存在。
+    //
+    // **站点全局唯一**（用户定稿语义）：每类站一个实例，id 是类型常量，与 team /
+    // agent / mode 无关——所以这里不再需要（也不该）读存储里的 team 组合去预建。
+    // 新建 agent 不会、也不该产生新站点。
     //
     // 幂等 + 持久化由 StationHub.ensureBuiltinStations 保证：已从 stations.yaml
     // 恢复的不再新建、也不重复落盘；只有真的新建了才写一次盘。
     // **收集站不预建**：它的 schema 是接入点定义的输入格式（见该方法的 dartdoc）。
-    final List<String> prebuiltStations = bus.stations.ensureBuiltinStations(
-      _storedTeamScopes(),
-    );
+    final List<String> prebuiltStations = bus.stations.ensureBuiltinStations();
     if (prebuiltStations.isNotEmpty) {
       errorLog?.call(
         '[core:station] 预建内置站 '
@@ -541,35 +543,6 @@ class CoreServer {
     if (mountError != null) {
       errorLog?.call('执行站挂载位置接线不完整：$mountError');
     }
-  }
-
-  /// 存储里已存在的 **(team, 工作空间模式)** 组合（内置三站预建的输入）。
-  ///
-  /// - **team**：agent 的团队归属；**顶层 agent（teamId 为空）拿它自己的 id 当团队
-  ///   id**——与既有口径一致（`TreeStore.teams()` 返回的正是这些顶层 agent，成员用
-  ///   teamId 指回它们，前端插件面板也是拿"选中的 agent id"当 team 过滤）。没有归属
-  ///   的 agent 归不到任何站：站点消息的隔离判定要求 team_id 非空（fail-closed），
-  ///   拿空串凑一个站只会得到一个谁都投不进去的空壳。
-  /// - **mode**：该 agent 的工作空间模式，`sshConfig != null` → ssh，否则 local，
-  ///   与运行期 `PluginBus.agentModeKeyResolver` 同口径；同一 team 两种模式都有
-  ///   agent 就两种都建（SSH 团队的命令不能落到本地工作空间）。
-  ///
-  /// 同一组合去重（`scope.key`）：预建本身幂等，重复喂同一个组合没有意义。
-  List<StationScope> _storedTeamScopes() {
-    final Map<String, StationScope> combos = <String, StationScope>{};
-    for (final CoreAgent agent in store.agents()) {
-      final String declaredTeam = agent.teamId.trim();
-      final String teamId = declaredTeam.isEmpty ? agent.id : declaredTeam;
-      if (teamId.isEmpty) continue;
-      final StationScope scope = StationScope(
-        teamId: teamId,
-        modeKey: agent.sshConfig != null
-            ? StationModeKey.ssh
-            : StationModeKey.local,
-      );
-      combos[scope.key] = scope;
-    }
-    return combos.values.toList(growable: false);
   }
 
   /// 执行站 `agent.message`：插件 → 目标 agent 的会话。
@@ -1051,14 +1024,8 @@ class CoreServer {
       maxLevel: TeamLimits.level(body['max_level']),
       maxMembersPerLevel: TeamLimits.members(body['max_members_per_level']),
     );
-    // 新 agent 的团队平面刚出现：立刻给它所在的 (team, mode) 预建内置站，
-    // 免得"新建完就去看面板却是站点（0）"要到下次重启核心才补上。
-    pluginBus?.stations.ensureBuiltinStations(<StationScope>[
-      StationScope(
-        teamId: agent.teamId.isEmpty ? agent.id : agent.teamId,
-        modeKey: agent.sshConfig != null ? 'ssh' : 'local',
-      ),
-    ]);
+    // 站点已全局唯一（每类站一个实例，与 team / agent 无关），所以新建 agent
+    // **不需要**也不再触发任何站点预建：站点在核心启动的接线处就位，此后恒定。
     await writeJson(request, 200, <String, dynamic>{
       'success': true,
       'agent': agent.toApiJson(),
@@ -2463,7 +2430,10 @@ class CoreServer {
     }
     // team_id 参数按"团队"解释，但调用方可能传的是**成员 agent 的 id**（前端在
     // 成员上下文里就是这样）。这里做一次反查：传进来的 id 若是成员，用它回指的
-    // 团队 id——与 _storedTeamScopes 的"顶层 agent 用自身 id 当团队"口径一致。
+    // 团队 id——与"顶层 agent 用自身 id 当团队"口径一致（前端插件面板就是这么
+    // 取当前团队的）。
+    // **站点段不受此过滤**：站点全局唯一，过滤恒真；team 视角由每条订阅者的
+    // scope 与 subscribers_by_team 承担（见 StationHub.snapshot）。
     final String requested =
         request.uri.queryParameters['team_id']?.trim() ?? '';
     final CoreAgent? named = requested.isEmpty ? null : store.agent(requested);

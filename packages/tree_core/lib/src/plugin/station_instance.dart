@@ -6,20 +6,23 @@ import 'station_scope.dart';
 
 /// 站点实例（M9 §3，用户定稿）：
 ///
-/// - **站点 = 持久化实例**：实例自带 id / 类型 / schema（收集站必填）/ 订阅上限 /
-///   scope 绑定 / 订阅者列表，落盘跨重启保留（station_store.dart）；
+/// - **站点 = 全局唯一的持久化实例**：每类站只有一个，实例自带 id / 类型 /
+///   schema（收集站必填）/ 订阅上限 / 订阅者列表，落盘跨重启保留（station_store.dart）。
+///   **id 不含 team / mode**：team / agent / session / mode 是**每次交互携带的信封**
+///   （消息 scope），只在投递时用于匹配订阅者；
 /// - **触发 = 实例的一个方法**：可在任意位置、任意时机被调用；「触发时机」不由
 ///   站点类型决定，而由**挂载位置的具体逻辑**决定（例如收集站的触发方是工具表
 ///   刷新处，收集站的「后续处理」也由触发方负责——站点内部不做管线）；
 /// - 四类站：广播站 / 执行站 / 中转站 / 收集站（sealed 子类各带自己的 trigger）。
 ///
-/// 隔离：所有 trigger 的第一件事都是四元组校验（StationIsolation，fail-closed），
-/// 校验不过的消息**不投递**并给出可读原因。
+/// 隔离：所有 trigger 的第一件事都是**消息信封自校验**（归属可证明），随后逐订阅者
+/// 过 [StationIsolation.checkSubscriber]（fail-closed），不匹配的订阅者不投递并给出
+/// 可读原因。
 sealed class StationInstance {
   StationInstance({
     required this.id,
     required this.description,
-    required this.scope,
+    this.scope = const StationScope(),
     this.maxSubscriptions = defaultMaxSubscriptions,
     this.builtin = false,
     int? createdAt,
@@ -30,7 +33,7 @@ sealed class StationInstance {
   /// 默认订阅上限（实例自带；<= 0 表示不限制）。
   static const int defaultMaxSubscriptions = 32;
 
-  /// 站点 id（**含 scope 归属**：同一类型在每个 team×mode 上是不同实例）。
+  /// 站点 id（**全局唯一常量**：每类站一个实例，不含 team / mode）。
   final String id;
 
   /// 展示说明（人可读；会出现在前端「站点」面板）。
@@ -39,7 +42,11 @@ sealed class StationInstance {
   /// 广播站、执行站、收集站，面板按 kind 分组显示。
   final String description;
 
-  /// scope 绑定（站点实例归属的四元组；消息必须与它相容才投递）。
+  /// 站点 scope（**已废弃的占位**：站点全局化后不绑 team / mode）。
+  ///
+  /// 保留字段只为两件事：(a) 旧 `stations.yaml` 的宽容解析（迁移时会归并到常量 id），
+  /// (b) 插件自建站的自我描述。**不再参与任何投递判定**——投递只看「消息 ↔ 订阅者」
+  /// （[StationIsolation.checkSubscriber]）。
   final StationScope scope;
 
   /// 订阅上限（**实例自带**，不是全局值；超限拒绝订阅并显式报错）。
@@ -79,7 +86,7 @@ sealed class StationInstance {
   /// 站点类型。
   StationKind get kind;
 
-  /// 是否强制「站 × scope 键位唯一」（只有中转站是：先到先得）。
+  /// 是否强制**全站唯一订阅者**（只有中转站是：先到先得）。
   bool get scopeKeyUnique => false;
 
   /// 子类附加持久化字段。
@@ -95,10 +102,13 @@ sealed class StationInstance {
   /// 订阅本站点。
   ///
   /// - 执行站不支持订阅（显式拒绝）；
-  /// - 订阅声明 scope 必须与站点绑定相容（不得放大到其它 team / mode）；
+  /// - 订阅声明 scope 必须与**消息**相容（由投递时 [StationIsolation.checkSubscriber]
+  ///   判定；订阅本身不再受站点 scope 约束——站点不绑 scope）；
   /// - 超订阅上限 ⇒ 拒绝并显式报错（code = subscription_limit）；
-  /// - 中转站（[scopeKeyUnique]）同键位第二人 ⇒ 先到先得拒绝（code = key_conflict），
-  ///   显式 replace = true 时替换并回报被替换者。
+  /// - **中转站（[scopeKeyUnique]）全站只允许一个订阅者**（与 scope 无关）：
+  ///   先到先得，第二人一律拒绝（code = key_conflict），显式 `replace = true`
+  ///   才接管并回报被替换者。需要按 team / agent 分开处理时，正解是**由这个
+  ///   订阅者自己转发**（它在插件内再建站点分发），而不是让多个插件各订一份。
   StationSubResult subscribe(
     StationSubscriber subscriber,
     StationResponder responder, {
@@ -110,15 +120,20 @@ sealed class StationInstance {
         code: 'not_subscribable',
       );
     }
-    final StationIsolationVerdict verdict = StationIsolation.checkMessage(
-      station: scope,
-      message: subscriber.scope,
-    );
-    if (!verdict.ok) {
+    // 订阅者自身的归属必须可证明：team 非空 + mode 合法。
+    //
+    // 站点全局化后不再有「站点 scope 相容」这道闸，而投递判定比的是
+    // 「消息 ↔ 订阅者」，所以归属校验必须落在订阅声明这一侧——
+    // 否则一个无 team 的订阅者会挂上来，却永远匹配不到任何消息（静默空转）。
+    if (!subscriber.scope.isValid) {
       counters.bump('skipped_scope');
-      return StationSubResult.rejected(verdict.reason, code: 'scope_mismatch');
+      return StationSubResult.rejected(
+        '订阅者 ${subscriber.pluginId} 的 scope（${subscriber.scope.describe()}）'
+        '不可证明归属：team_id 必须非空、mode_key 只能是 local | ssh',
+        code: 'scope_mismatch',
+      );
     }
-    // 身份 = plugin_id + scope：同插件同 scope 重复订阅 = 幂等更新回包函数。
+    // 订阅者身份 = plugin_id + scope：同插件同 scope 重复订阅 = 幂等更新回包函数。
     final int sameIdentity = subscribers.indexWhere(
       (StationSubscriber s) => s.key == subscriber.key,
     );
@@ -128,26 +143,24 @@ sealed class StationInstance {
       onMutated?.call();
       return const StationSubResult.accepted();
     }
-    // 中转站：**站 × scope 键位唯一**（先到先得 / 显式 replace）。
+    // 中转站：**全站唯一订阅者**（先到先得 / 显式 replace）。
     String replaced = '';
-    if (scopeKeyUnique) {
-      final int sameScope = subscribers.indexWhere(
-        (StationSubscriber s) => s.scope.key == subscriber.scope.key,
-      );
-      if (sameScope >= 0) {
-        final StationSubscriber existing = subscribers[sameScope];
-        if (!replace) {
-          counters.bump('rejected_conflict');
-          return StationSubResult.rejected(
-            '$id 的键位（${subscriber.scope.key}）已被 ${existing.pluginId} 占用'
-            '（先到先得）；如需接管请显式 replace',
-            code: 'key_conflict',
-          );
-        }
-        _responders.remove(existing.key);
-        subscribers.removeAt(sameScope);
-        replaced = existing.pluginId;
+    if (scopeKeyUnique && subscribers.isNotEmpty) {
+      final StationSubscriber existing = subscribers.first;
+      if (!replace) {
+        counters.bump('rejected_conflict');
+        return StationSubResult.rejected(
+          '$id 是${kind.label}：只允许一个订阅者，'
+          '已被 ${existing.pluginId} 占用（先到先得）；'
+          '如需接管请显式 replace；'
+          '如需按 team / agent 分开处理，请由该订阅者自行转发（在插件内再建站点分发），'
+          '不要重复订阅本站',
+          code: 'key_conflict',
+        );
       }
+      _responders.remove(existing.key);
+      subscribers.clear();
+      replaced = existing.pluginId;
     }
     if (maxSubscriptions > 0 && subscribers.length >= maxSubscriptions) {
       counters.bump('overflow');
@@ -273,9 +286,13 @@ sealed class StationInstance {
   /// 当前时间（epoch 秒）。
   static int nowSeconds() => DateTime.now().millisecondsSinceEpoch ~/ 1000;
 
-  /// 隔离校验（子类 trigger 的第一道闸）。
+  /// 隔离校验（子类 trigger 的第一道闸）：**校验消息信封自身**。
+  ///
+  /// 站点已全局化（每类站一个实例，不绑 team / 不绑 mode），所以这里没有
+  /// 「站点 scope」可比——只证明「这条消息有没有可证明的归属」。
+  /// 真正的投递判定在 [StationIsolation.checkSubscriber]（消息 ↔ 订阅者）。
   StationIsolationVerdict checkScope(StationScope message) =>
-      StationIsolation.checkMessage(station: scope, message: message);
+      StationIsolation.checkMessageScope(message);
 
   // ------------------------------------------------------------------
   // 持久化 / 快照
@@ -297,6 +314,9 @@ sealed class StationInstance {
   };
 
   /// 前端快照形状（与既有 PluginStationInfo 的宽容解析对齐）。
+  ///
+  /// 站点全局化后，面板的 team 视角改由 [subscribersByTeam] 承担：站点不再按 team
+  /// 过滤（过滤恒真），而是把「哪些 team 有订阅者、分别是谁」交给前端分组展示。
   Map<String, dynamic> describe() => <String, dynamic>{
     'station_id': id,
     'kind': kind.wire,
@@ -309,10 +329,36 @@ sealed class StationInstance {
     'subscriptions': subscribers
         .map((StationSubscriber s) => s.describe())
         .toList(),
+    'subscribers_by_team': subscribersByTeam(),
     'counts': counters.describe(),
     'gauges': <String, dynamic>{'waits_in_flight': waitsInFlight},
     ...extraDescribe(),
   };
+
+  /// 订阅者按 **team** 分组（面板分组展示用；空 team 归到空串键）。
+  ///
+  /// 形状：`{team_id: {count, plugin_ids: [...]}}`——team 顺序按首次出现（订阅顺序），
+  /// 插件 id 去重且保持稳定顺序，便于前端直接渲染。
+  Map<String, Map<String, dynamic>> subscribersByTeam() {
+    final Map<String, List<String>> byTeam = <String, List<String>>{};
+    for (final StationSubscriber subscriber in subscribers) {
+      final String team = subscriber.scope.teamId.trim();
+      final List<String> plugins = byTeam.putIfAbsent(
+        team,
+        () => <String>[],
+      );
+      if (!plugins.contains(subscriber.pluginId)) {
+        plugins.add(subscriber.pluginId);
+      }
+    }
+    return <String, Map<String, dynamic>>{
+      for (final MapEntry<String, List<String>> entry in byTeam.entries)
+        entry.key: <String, dynamic>{
+          'count': entry.value.length,
+          'plugin_ids': entry.value,
+        },
+    };
+  }
 
   /// 从持久化 JSON 恢复；kind 未知 / id 缺失返回 null（跳过该条而不是整库失败）。
   static StationInstance? tryParse(Object? raw) {
@@ -466,7 +512,7 @@ final class BroadcastStation extends StationInstance {
   BroadcastStation({
     required super.id,
     required super.description,
-    required super.scope,
+    super.scope,
     super.maxSubscriptions,
     super.builtin,
     super.createdAt,
@@ -670,7 +716,7 @@ final class ExecuteStation extends StationInstance {
   ExecuteStation({
     required super.id,
     required super.description,
-    required super.scope,
+    super.scope,
     super.maxSubscriptions,
     super.builtin,
     super.createdAt,
@@ -839,7 +885,7 @@ final class RelayStation extends StationInstance {
   RelayStation({
     required super.id,
     required super.description,
-    required super.scope,
+    super.scope,
     super.maxSubscriptions,
     super.builtin,
     super.createdAt,
@@ -849,39 +895,26 @@ final class RelayStation extends StationInstance {
   @override
   StationKind get kind => StationKind.relay;
 
-  /// 中转站强制键位唯一（一个接入点只能有一个处理者）。
+  /// 中转站强制**全站唯一订阅者**（一个拦截点只能有一个处理者）。
   @override
   bool get scopeKeyUnique => true;
 
-  /// 触发解析：scope 匹配 + **最细粒度优先**（照旧后端 resolve 语义）。
+  /// 触发解析：**唯一订阅者**是否接这条消息。
   ///
-  /// 匹配方向 fail-closed：订阅者声明的非空字段必须与消息一致；
-  /// 消息字段为空而订阅者要求该字段 ⇒ 不匹配。
+  /// 全局化后中转站最多一个订阅者，原先的「最细粒度优先（session > agent > team）」
+  /// 排序已无选择对象，故删除排序；保留**订阅者声明的粒度过滤**：
+  /// 订阅者若声明了 agent / session，只有匹配的消息才投给它（fail-closed，
+  /// 消息字段为空而订阅者要求该字段 ⇒ 不匹配）。
   StationSubscriber? resolve(StationScope message) {
-    StationSubscriber? best;
-    int bestRank = -1;
-    int bestSpecificity = -1;
-    for (final StationSubscriber subscriber in subscribers) {
-      if (!StationIsolation.checkSubscriber(
-        message: message,
-        subscriber: subscriber.scope,
-      ).ok) {
-        continue;
-      }
-      final int rank = subscriber.scope.sessionId.isNotEmpty
-          ? 3
-          : subscriber.scope.agentId.isNotEmpty
-          ? 2
-          : 1;
-      final int specificity = subscriber.scope.specificity;
-      if (rank > bestRank ||
-          (rank == bestRank && specificity > bestSpecificity)) {
-        bestRank = rank;
-        bestSpecificity = specificity;
-        best = subscriber;
-      }
+    if (subscribers.isEmpty) return null;
+    final StationSubscriber only = subscribers.first;
+    if (!StationIsolation.checkSubscriber(
+      message: message,
+      subscriber: only.scope,
+    ).ok) {
+      return null;
     }
-    return best;
+    return only;
   }
 
   /// **触发**：拦截数据并等待回填。
@@ -980,8 +1013,8 @@ final class CollectStation extends StationInstance {
   CollectStation({
     required super.id,
     required super.description,
-    required super.scope,
     required this.schema,
+    super.scope,
     super.maxSubscriptions,
     super.builtin,
     super.createdAt,

@@ -24,6 +24,7 @@ import 'package:tree_protocol/tree_protocol.dart';
 import 'src/version.dart';
 
 export 'src/agent/agent_engine.dart';
+export 'src/agent/attachment_prompt.dart';
 export 'src/agent/compaction_service.dart';
 export 'src/agent/conversation_service.dart';
 export 'src/agent/question_broker.dart';
@@ -53,6 +54,7 @@ export 'src/plugin/plugin_config_store.dart';
 export 'src/plugin/plugin_host.dart';
 export 'src/plugin/plugin_tool_definition.dart';
 export 'src/plugin/plugin_ui_bridge.dart';
+export 'src/plugin/station_ids.dart';
 export 'src/plugin/station_instance.dart';
 export 'src/plugin/station_runtime.dart';
 export 'src/plugin/station_schema.dart';

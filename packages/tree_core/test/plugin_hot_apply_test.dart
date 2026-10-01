@@ -259,18 +259,32 @@ void main() {
     );
     expect(instanceIds(bus), <String>['alpha']);
 
-    // ② 改 scope（团队归属）：同样是启动参数 ⇒ 重启，订阅挪到新团队的收集站
+    // ② 改 scope（团队归属）：同样是启动参数 ⇒ 重启，订阅挪到**同一个全局收集站**上，
+    // 只是订阅声明的 team 变了（站点不再随 team 复制）。
     writeConfigs(pluginEntry('alpha', marker: 'v2', teamId: 'team-2'));
     final PluginReconcileResult byScope = await bus.applyConfigs();
     expect(ids(byScope.restarted), <String>['alpha']);
     expect(byScope.actionOf('alpha')!.reason, contains('scope'));
     expect(startCount('alpha'), 3);
-    expect(subscribedStations(bus, 'alpha'), hasLength(1));
-    expect(subscribedStations(bus, 'alpha').single, contains('team-2'));
+    expect(subscribedStations(bus, 'alpha'), <String>[StationHubIds.collect]);
+    final Map<String, dynamic> collectStation = (bus.snapshot()['stations'] as List<dynamic>)
+        .firstWhere(
+          (dynamic s) => (s as Map<String, dynamic>)['kind'] == 'collect',
+        ) as Map<String, dynamic>;
+    expect(
+      collectStation['subscribers_by_team'],
+      <String, dynamic>{
+        'team-2': <String, dynamic>{
+          'count': 1,
+          'plugin_ids': <String>['alpha'],
+        },
+      },
+      reason: '团队归属在订阅声明上：重启后只剩 team-2 这一条（旧订阅已注销）',
+    );
     expect(
       bus.snapshot()['stations'],
-      hasLength(2),
-      reason: 'team-1 与 team-2 各有自己的收集站（老站留着，不再有订阅）',
+      hasLength(4),
+      reason: '收集站全局唯一：换团队不产生新站，快照恒为四类站',
     );
   });
 

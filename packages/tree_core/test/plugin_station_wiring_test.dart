@@ -66,9 +66,8 @@ void main() {
     }
   });
 
-  ExecuteStation station(String modeKey) => bus.stations.executeFor(
-    StationScope(teamId: 'team-1', modeKey: modeKey),
-  )!;
+  /// 执行站（**全局唯一**：mode 不再产生不同实例，只影响命令 scope）。
+  ExecuteStation station(String modeKey) => bus.stations.executeFor()!;
 
   test('核心启动即挂载八条命令（不再返回「暂无挂载位置」）', () {
     expect(
@@ -186,15 +185,15 @@ void main() {
 
   // ── 内置三站「启动即存在」（懒创建 ⇒ 用户实机看到「站点（0）」） ──
 
-  test('核心启动即为存储里的 (team, 工作空间模式) 预建三类内置站', () {
+  test('核心启动即建齐三类内置站（**全局唯一，与 team / mode 无关**）', () {
     expect(
       bus.stations.stationList().map((StationInstance s) => s.id).toList(),
       <String>[
-        'system.broadcast@team-1@local',
-        'system.execute@team-1@local',
-        'system.relay@team-1@local',
+        StationHubIds.broadcast,
+        StationHubIds.execute,
+        StationHubIds.relay,
       ],
-      reason: 'agent 归属 team-1、工作空间是本地 ⇒ 该组合上三站各就位',
+      reason: '站点是拦截点：每类一个全局实例，id 就是类型常量',
     );
     expect(
       bus.stations.stationList().whereType<CollectStation>(),
@@ -202,37 +201,33 @@ void main() {
       reason: '收集站的 schema 属于接入点，预建空 schema 的收集站没有意义',
     );
 
-    // 面板快照口径：前端卡片直接渲染 kind / kind_label / builtin / subscriber_count / scope
-    final Map<String, dynamic> described = bus.stations
-        .snapshot(teamId: 'team-1')
-        .first;
-    expect(described['station_id'], 'system.broadcast@team-1@local');
+    // 面板快照口径：前端卡片直接渲染 kind / kind_label / builtin / subscriber_count
+    final Map<String, dynamic> described = bus.stations.snapshot().first;
+    expect(described['station_id'], StationHubIds.broadcast);
     expect(described['kind'], 'broadcast');
     expect(described['kind_label'], '广播站');
     expect(described['builtin'], isTrue);
     expect(described['subscriber_count'], 0);
     expect(
-      (described['scope'] as Map<String, dynamic>)['mode_key'],
-      StationModeKey.local,
+      described['subscribers_by_team'],
+      isEmpty,
+      reason: '还没有订阅者 ⇒ 面板没有团队分组可显示',
     );
   });
 
-  test('两种工作空间模式都建；重启从 stations.yaml 恢复，数量不变不重复建', () async {
+  test('站点数不随工作空间模式 / 重启变化（team×mode 不再产生新实例）', () async {
     expect(bus.stations.stationList(), hasLength(3));
 
-    // 同一团队里出现 SSH 工作面的 agent ⇒ ssh 的三站随之就位（local 保持不变）
+    // 同一团队里出现 SSH 工作面的 agent：**不再**多出三站（这是本次收敛的核心）。
+    // mode 仍是有意义的隔离维度，但它属于消息 scope，不属于站点身份。
     agent.sshConfig = SshConfig(host: 'example.com', username: 'open');
     store.putAgent(agent);
     final CoreServer second = await boot();
     addTearDown(second.close);
     expect(
       bus.stations.stationList(),
-      hasLength(6),
-      reason: 'local 三站 + ssh 三站，不重复',
-    );
-    expect(
-      bus.stations.stationList().map((StationInstance s) => s.id),
-      contains('system.broadcast@team-1@ssh'),
+      hasLength(3),
+      reason: 'local / ssh 是同一个站点的两种工作面，不各自建站',
     );
 
     // 「重启」：换一条总线 + 再起一个核心，读同一个 stations.yaml

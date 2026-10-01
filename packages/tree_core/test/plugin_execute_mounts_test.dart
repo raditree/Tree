@@ -122,9 +122,8 @@ void main() {
     String teamId = team,
     String modeKey = StationModeKey.local,
   }) {
-    final ExecuteStation station = hub.executeFor(
-      StationScope(teamId: teamId, modeKey: modeKey),
-    )!;
+    // 执行站全局唯一（不再按 team×mode 复制）：team / mode 只进命令的 scope。
+    final ExecuteStation station = hub.executeFor()!;
     expect(mounts.mountInto(station), isNull, reason: '八条命令都应挂载成功');
     return station;
   }
@@ -167,7 +166,7 @@ void main() {
   });
 
   test('未挂载 / 白名单外都显式报错（不静默）', () async {
-    final ExecuteStation bare = hub.executeFor(scope())!;
+    final ExecuteStation bare = hub.executeFor()!;
     final StationCommandResult noMount = await run(bare, 'fs.read');
     expect(noMount.ok, isFalse);
     expect(noMount.error, contains('暂无挂载位置'));
@@ -340,13 +339,13 @@ void main() {
       modeKey: StationModeKey.ssh,
     );
 
-    // ① scope 绑定了某个 agent，而命令点名了另一个 agent（跨 scope）
+    // ① scope 里带了某个 agent，而命令点名了另一个 agent（跨 scope）
     final StationScope boundScope = StationScope(
       teamId: team,
       agentId: 'agt_2',
       modeKey: StationModeKey.local,
     );
-    final ExecuteStation boundStation = hub.executeFor(boundScope)!;
+    final ExecuteStation boundStation = hub.executeFor()!;
     expect(mounts().mountInto(boundStation), isNull);
     final StationCommandResult crossAgent = await run(
       boundStation,
