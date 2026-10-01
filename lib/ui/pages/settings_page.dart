@@ -1,6 +1,10 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../app_version.dart';
 import '../../io/api_service.dart';
 import '../theme_service.dart';
 
@@ -12,8 +16,13 @@ import '../theme_service.dart';
 ///   （M9 规约 1.1 取消了静态时间超时）；判活窗口 I×N 必须大于前端固定的 10s 心跳
 /// - 自定义模型：模型池 CRUD（M2 起落 `~/.tree/config/models/*.yaml`）
 /// - 主题管理：浅色 / 深色 / 跟随系统三种模式
+/// - 插件开发：文档入口（打开 `plugins/README.md`）+ 插件目录定位
+/// - 版本信息：应用 / 核心 / 接口契约 / 核心进程与产物（含"核心比界面旧"告警）
 class SettingsPage extends StatefulWidget {
-  const SettingsPage({super.key});
+  const SettingsPage({super.key, this.versionInfo});
+
+  /// 版本信息数据源（**测试注入用**；null = 从核心启动器读当前运行态）。
+  final VersionInfo? versionInfo;
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -80,6 +89,14 @@ class _SettingsPageState extends State<SettingsPage> {
   bool _modelsLoading = false;
   String? _modelsError;
 
+  // --- 插件开发入口（M9 §4.2 的开发面） ---
+
+  /// 插件清单的**真实路径**（从插件快照拿；拿不到则为 null）。
+  ///
+  /// 为什么不写死 `<数据根>/config/plugins.yaml`：数据根可被环境变量改，猜出来的
+  /// 路径会把用户送到一个不存在的地方。拿不到就退回"去插件面板看"的指引。
+  String? _pluginConfigPath;
+
   @override
   void initState() {
     super.initState();
@@ -88,6 +105,25 @@ class _SettingsPageState extends State<SettingsPage> {
     _loadFrameRateSetting();
     _loadHeartbeatSetting();
     _loadModelList();
+    _loadPluginConfigPath();
+  }
+
+  /// 读插件快照，只为拿 `config.path`（插件清单的真实路径）。
+  ///
+  /// 失败**不报错也不阻塞**：这只是设置页的一个提示行，拿不到就退回"去插件面板看"
+  /// ——版本 / 开发信息本身不依赖核心可用（应用与核心都起来时才有快照）。
+  Future<void> _loadPluginConfigPath() async {
+    try {
+      final Map<String, dynamic> snap = await ApiService.getPluginSnapshot();
+      final Object? config = snap['config'];
+      final String path = config is Map
+          ? (config['path'] ?? '').toString()
+          : '';
+      if (!mounted || path.isEmpty) return;
+      setState(() => _pluginConfigPath = path);
+    } catch (_) {
+      // 核心不可达 / 未接入插件总线：保留指引文案
+    }
   }
 
   @override
@@ -405,8 +441,204 @@ class _SettingsPageState extends State<SettingsPage> {
           _buildSectionTitle('主题管理'),
           const SizedBox(height: 8),
           _buildThemeCard(),
+          const SizedBox(height: 24),
+          _buildSectionTitle('插件开发'),
+          const SizedBox(height: 8),
+          _buildPluginDevCard(),
+          const SizedBox(height: 24),
+          _buildSectionTitle('版本信息'),
+          const SizedBox(height: 8),
+          _buildVersionCard(),
         ],
       ),
+    );
+  }
+
+  /// 插件开发卡片（M9 §4.2 的开发面）。
+  ///
+  /// 为什么要一个"入口"而不是把文档抄进设置页：插件协议面（五个 RPC、四类站、
+  /// `ui/manifest`、`plugins.yaml` 全字段）已经写在 `plugins/README.md` 里，抄一份
+  /// 就是第二份真相源，必然与代码漂移。这里只负责**把人送到那份文档**，并把
+  /// 文档的真实路径摆在界面上（路径找不到时给可读原因，不静默）。
+  Widget _buildPluginDevCard() {
+    final cs = Theme.of(context).colorScheme;
+    final String? path = PluginDocs.resolvePath();
+    const String dirHintFallback =
+        '未找到 ${PluginDocs.readmeName}（发行版看应用目录下的 '
+        '${PluginDocs.bundledDirName}/，源码仓库看 ${PluginDocs.repoDirName}/）';
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              '开发一个插件',
+              style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              '插件是独立进程，走 stdio JSON-RPC 与核心通信：可申报工具（收集站）、'
+              '订阅事件与中转站（每次工具调用前后各一次）、主动下命令（执行站）、'
+              '自建站点、声明前端面板。参考实现与协议细节都在 plugins/README.md。',
+              style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+            ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                FilledButton.icon(
+                  key: const Key('plugin-docs-open'),
+                  onPressed: () => _openPluginDocs(),
+                  icon: const Icon(Icons.menu_book_outlined, size: 16),
+                  label: const Text('打开插件开发说明'),
+                  style: FilledButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  key: const Key('plugin-docs-reveal'),
+                  onPressed: path == null ? null : () => _revealPluginDir(path),
+                  icon: const Icon(Icons.folder_open_outlined, size: 16),
+                  label: const Text('打开所在目录'),
+                  style: OutlinedButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            SelectableText(
+              path ?? dirHintFallback,
+              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              '插件配置：${_pluginConfigPathHint()}'
+              '（可直接编辑，保存后立即热应用；热应用失败时重启核心生效）',
+              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 插件清单路径提示：从插件快照拿（拿了才知道真实数据根在哪，不臆测）。
+  ///
+  /// 快照还没到手时给出"打开插件面板可见"的指引，而不是留空或编一个路径。
+  String _pluginConfigPathHint() =>
+      _pluginConfigPath ?? '见「插件」面板（面板里显示真实路径）';
+
+  /// 打开插件开发说明（失败给可读原因）。
+  Future<void> _openPluginDocs() async {
+    final String? error = await PluginDocs.openReadme();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(error ?? '已用系统默认程序打开插件开发说明'),
+        duration: Duration(seconds: error == null ? 2 : 6),
+      ),
+    );
+  }
+
+  /// 在资源管理器里定位插件文档所在目录。
+  Future<void> _revealPluginDir(String path) async {
+    final String? error = await PluginDocs.openPath(File(path).parent.path);
+    if (!mounted) return;
+    if (error != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error), duration: const Duration(seconds: 4)),
+      );
+    }
+  }
+
+  /// 版本信息卡片。
+  ///
+  /// 三个常被问到的"我到底跑的是哪一版"在这里一次答完：应用版本、核心版本、
+  /// 核心进程（pid / 端口 / 是否附着）。另外把启动期算好的**产物陈旧告警**摆在
+  /// 这里——核心是独立进程，产物可能比界面旧，此时新功能会"看起来没生效"，
+  /// 这是真机上最难自证的一类问题。
+  Widget _buildVersionCard() {
+    final cs = Theme.of(context).colorScheme;
+    final VersionInfo info =
+        widget.versionInfo ?? VersionInfo.fromLauncher();
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    '版本',
+                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+                  ),
+                ),
+                OutlinedButton.icon(
+                  key: const Key('version-copy'),
+                  onPressed: () => _copyVersionInfo(info),
+                  icon: const Icon(Icons.copy_all_outlined, size: 16),
+                  label: const Text('复制版本信息'),
+                  style: OutlinedButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            for (final InfoRow row in info.rows)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SizedBox(
+                      width: 76,
+                      child: Text(
+                        row.label,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: cs.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: SelectableText(
+                        row.value,
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            if (info.buildWarning != null) ...[
+              const SizedBox(height: 6),
+              Text(
+                info.buildWarning!,
+                key: const Key('version-build-warning'),
+                style: const TextStyle(fontSize: 12, color: Colors.orange),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 复制版本信息（整块文本，便于贴到 issue / 对话里）。
+  Future<void> _copyVersionInfo(VersionInfo info) async {
+    await Clipboard.setData(ClipboardData(text: info.toReportText()));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('版本信息已复制'), duration: Duration(seconds: 2)),
     );
   }
 
