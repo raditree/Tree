@@ -168,7 +168,7 @@ void main() {
       });
       expect(content[1], <String, dynamic>{
         'type': 'file',
-        'file': <String, dynamic>{'file_id': 'file-api-9'},
+        'file_id': 'file-api-9',
       });
       expect(sent.content, contains('.input/20261001/图1.png'));
     });

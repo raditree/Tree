@@ -17,7 +17,7 @@ import 'ws_harness.dart';
 ///
 /// 第二组（`if_vision`）再加两段真实链路：**真的从工作空间读图片字节**（真文件）、
 /// **真的发 multipart 到 Files API**（本机假服务），最后断言请求体里出现
-/// `{"type":"file","file":{"file_id":...}}` —— 这才是"图片真正送到模型"。
+/// `{"type":"file","file_id":...}` —— 这才是"图片真正送到模型"。
 void main() {
   late CoreServer server;
   late String agentId;
@@ -252,7 +252,7 @@ void main() {
       final List<dynamic> content = user['content'] as List<dynamic>;
       expect(content.last, <String, dynamic>{
         'type': 'file',
-        'file': <String, dynamic>{'file_id': 'file-api-xyz'},
+        'file_id': 'file-api-xyz',
       });
       expect(
         (content.first as Map<String, dynamic>)['text'],

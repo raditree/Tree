@@ -76,11 +76,18 @@ class LlmContentPart {
   /// 端点文件 id（[type] == `file` 时有值）。
   final String fileId;
 
+  /// 线协议形状：**`file_id` 是内容块的同级字段，不再套一层 `file` 对象**。
+  ///
+  /// 实测（2026-10-01，真实端点 + 真图，逐形状探针）：
+  /// - `{"type":"file","file":{"file_id":…}}` ⇒ **400**：
+  ///   `file must have a file_id or file_data`（外层 `file` 对象被判成"没有 file_id"）；
+  /// - `{"type":"file","file_id":…}` ⇒ **200**，且模型**真的看得见图**
+  ///   （让它转写图中文字，逐字正确）。
+  ///
+  /// 也就是说 OpenAI 那套「`file` 里再放 `file_id`」的嵌套在 DeepSeek 端点是**错的**；
+  /// 之前"upload 成功但 chat 一直 400"的根因就在这里——与密钥、上传、缓存都无关。
   Map<String, dynamic> toWire() => type == 'file'
-      ? <String, dynamic>{
-          'type': 'file',
-          'file': <String, dynamic>{'file_id': fileId},
-        }
+      ? <String, dynamic>{'type': 'file', 'file_id': fileId}
       : <String, dynamic>{'type': 'text', 'text': text};
 }
 

@@ -3,8 +3,13 @@
 /// 背景：`if_vision` 曾经只是个来回序列化的死字段——用户勾了它，请求体里
 /// 依然只有"图片在工作空间的路径"，模型看不到任何像素（只能说"我拿不到图"）。
 /// 本文件补上这条路：**先把图片上传到端点拿到 `file_id`，再在 chat 请求的
-/// user 消息里用 `{"type":"file","file":{"file_id":...}}` 引用**（见
+/// user 消息里用 `{"type":"file","file_id":...}` 引用**（见
 /// `llm/llm_types.dart` 的 [LlmContentPart]）。
+///
+/// **`file_id` 是内容块的同级字段**（不是 OpenAI 那种 `{"file":{"file_id":…}}`
+/// 嵌套）——真端点实测：嵌套形状一律 400
+/// `file must have a file_id or file_data`，扁平形状 200 且模型看得见图。
+/// 上传成功却一直 400 的根因就在这里，与密钥 / multipart / 缓存都无关。
 ///
 /// 为什么走 Files API 而不是 base64 内联：
 /// - 内联受 **48 MiB 请求体 / 32 MiB 单图** 限制，且每轮都要重新编码一遍；

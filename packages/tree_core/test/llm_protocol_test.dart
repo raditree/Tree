@@ -146,13 +146,29 @@ void main() {
         (messages[0] as Map<String, dynamic>)['content'],
         <Map<String, dynamic>>[
           <String, dynamic>{'type': 'text', 'text': '这张图片里有什么？'},
-          <String, dynamic>{
-            'type': 'file',
-            'file': <String, dynamic>{'file_id': 'file-api-xxxx'},
-          },
+          // **file_id 是块的同级字段**（不再套一层 file 对象）——实测真端点：
+          // 嵌套形状一律 400「file must have a file_id or file_data」，
+          // 扁平形状 200 且模型真的看得见图。
+          <String, dynamic>{'type': 'file', 'file_id': 'file-api-xxxx'},
         ],
       );
       expect((messages[1] as Map<String, dynamic>)['content'], '普通消息');
+    });
+
+    test('file 块**不得**套一层 file 对象（真端点会 400，别改回去）', () {
+      // 这条是"防回潮"：OpenAI 那套 {"type":"file","file":{"file_id":…}} 看起来更
+      // 眼熟，很容易被误"修正"回去。真端点实测（2026-10-01，真图逐形状探针）：
+      //   {"type":"file","file":{"file_id":…}} ⇒ 400 file must have a file_id or file_data
+      //   {"type":"file","file_id":…}         ⇒ 200，模型真的看得见图
+      final Map<String, dynamic> wire =
+          const LlmContentPart.file('file-api-1').toWire();
+      expect(wire['file_id'], 'file-api-1');
+      expect(
+        wire.containsKey('file'),
+        isFalse,
+        reason: '嵌套 file 对象是错的形状：端点会说它"没有 file_id"，整轮请求 400',
+      );
+      expect(wire.keys.toSet(), <String>{'type', 'file_id'});
     });
 
     test('内容块：正文为空时不塞空文本块；文本块构造同形', () {
@@ -162,10 +178,7 @@ void main() {
         contentParts: <LlmContentPart>[LlmContentPart.file('f1')],
       );
       expect(onlyFile.toWire()['content'], <Map<String, dynamic>>[
-        <String, dynamic>{
-          'type': 'file',
-          'file': <String, dynamic>{'file_id': 'f1'},
-        },
+        <String, dynamic>{'type': 'file', 'file_id': 'f1'},
       ]);
       // system 与 user 共用同一条线形态（正文块在前）
       const LlmMessage withText = LlmMessage(
