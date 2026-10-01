@@ -34,7 +34,9 @@ class _ToolCallCardState extends State<ToolCallCard> {
     return Align(
       alignment: Alignment.centerLeft,
       child: Container(
-        constraints: const BoxConstraints(maxWidth: 560),
+        // 不再写死 560px：中栏被拖宽时工具输出（命令、文件差异、表格）应当
+        // 跟着铺满可用宽度，只留 Align 自带的一点点余量
+        constraints: const BoxConstraints(maxWidth: double.infinity),
         margin: const EdgeInsets.only(bottom: 8),
         decoration: BoxDecoration(
           color: cs.surface,

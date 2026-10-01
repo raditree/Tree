@@ -22,9 +22,9 @@ import 'settings_page.dart';
 
 /// 主页面 - 三栏布局
 ///
-/// 左栏：Agent 列表（初始 260px，可调 200~400px）
-/// 中栏：消息交互（弹性宽度，占据剩余空间）
-/// 右栏：文件管理（初始 340px，可调 240~500px）
+/// 左栏：Agent 列表（初始 260px，最小 200px，**上限随窗口宽度变化**）
+/// 中栏：消息交互（弹性宽度，占据剩余空间，最小 360px）
+/// 右栏：文件管理（初始 340px，最小 240px，**上限随窗口宽度变化**）
 ///
 /// 支持通过拖拽分隔条调整左栏和右栏宽度；
 /// 窗口尺寸过小时显示提示页面。
@@ -57,6 +57,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   /// `AnimatedContainer` 内部，折叠左栏时它会被压到 [_collapsedWidth]，
   /// 图标显示不全。
   static const double _activityBarWidth = 48;
+
+  /// 两个拖拽分隔条的宽度（展开时每个 6px，收起时为 0）
+  static const double _dividerWidth = 6;
 
   /// 左侧活动栏当前选中的功能面板：0=Agent 列表，1=插件面板
   int _leftPanel = 0;
@@ -98,12 +101,28 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   // 当前选中 Agent 的列表（默认空，通过"创建 Agent"新增）
   List<Agent> _agents = <Agent>[];
 
-  // 左栏宽度限制
+  // 左右栏宽度限制：两侧都**只有下限是固定值**，上限不写死——统一取
+  // "当前可用宽度 - 中栏最小宽度"（见 [_sideBudgetFor]），这样阅读文件
+  // （长行 / 宽表格 / 宽 PDF）或编辑长提示词时，任一侧都能拖到接近整窗宽。
   static const double _leftMinWidth = 200;
-  static const double _leftMaxWidth = 400;
-  // 右栏宽度限制
   static const double _rightMinWidth = 240;
-  static const double _rightMaxWidth = 500;
+
+  /// 侧栏宽度下限的**通用**值：上限判定用它，保证"上限 ≥ 下限"不会翻转。
+  static const double _minSideWidth =
+      _leftMinWidth < _rightMinWidth ? _leftMinWidth : _rightMinWidth;
+
+  /// 中栏（消息交互）最小宽度：左右栏变宽时给中栏留出的底线，防止中栏被压没。
+  static const double _centerMinWidth = 360;
+
+  /// 当前 build 时整页可用宽度（由 [_buildThreeColumnLayout] 的 LayoutBuilder 写入）。
+  /// 拖拽侧栏分隔条时用它算上限；为 null 表示尚未完成首帧布局。
+  double? _layoutAvailableWidth;
+
+  /// 本帧是否已安排"帧后收敛侧栏宽度"的回调（防止重复安排）
+  bool _sideNormalizeScheduled = false;
+
+  /// 是否正在拖拽侧栏分隔条（拖拽期间帧后收敛让位给拖拽本身）
+  bool _sideDragging = false;
 
   // 窗口最小尺寸
   static const double _minWindowWidth = 1024;
@@ -386,7 +405,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                     constraints.maxHeight < _minWindowHeight) {
                   return _buildSmallSizePrompt();
                 }
-                return _buildThreeColumnLayout();
+                return _buildThreeColumnLayout(constraints.maxWidth);
               },
             ),
           ),
@@ -561,15 +580,30 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   }
 
   /// 构建三栏布局
-  Widget _buildThreeColumnLayout() {
+  Widget _buildThreeColumnLayout(double availableWidth) {
+    // 记录本帧可用宽度：左右栏宽度上限由它推出（见 [_sideBudgetFor]）。
+    // 这里**只记录、不改状态**——布局期间 setState 会被框架判为非法；
+    // 窗口尺寸变化导致的宽度收敛交给 [_scheduleSideNormalize]（帧后执行）。
+    _layoutAvailableWidth = availableWidth;
+    _scheduleSideNormalize();
+    // 本帧就按预算夹一次**渲染宽度**（不动状态）：状态收敛要等帧后回调，而
+    // 窗口缩小的那一帧布局已经发生——不夹就会把中栏挤到 0，渲染层直接报
+    // RenderFlex overflow。**拖拽期间不夹**：此时宽度由 [_dragCouple] 现场
+    // 决定（它已按预算把对侧让出去），再夹一次会把对侧的让位又吐回来，
+    // 表现成"拖不过某个位置"。
+    final double? budget = _sideBudgetFor(availableWidth);
+    final (double renderLeft, double renderRight) = budget == null || _sideDragging
+        ? (_leftWidth, _rightWidth)
+        : _fitSideWidths(budget, _leftWidth, _rightWidth);
     return Row(
       children: [
         // 左侧活动栏：切换左栏功能面板（Agent 列表 / 插件），常驻显示
         _buildActivityBar(),
-        // 左栏面板区（Agent 列表或插件；折叠时宽度平滑过渡，内容淡入淡出）
-        _buildAnimatedSidebar(
+        // 左栏面板区（Agent 列表或插件；收起时只留窄条）
+        _buildSidebar(
+          key: const ValueKey<String>('main-left-sidebar'),
           collapsed: _leftCollapsed,
-          expandedWidth: _leftWidth,
+          expandedWidth: renderLeft,
           collapsedBar: _buildCollapsedLeftBar(),
           expandedBar: _buildLeftPanel(),
         ),
@@ -577,11 +611,20 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         _buildAnimatedDivider(
           collapsed: _leftCollapsed,
           divider: DraggableDivider(
+            onDragStart: () => _beginSideDrag(),
+            onDragEnd: _endSideDrag,
             onDrag: (delta) {
               setState(() {
-                _leftWidth = (_leftWidth + delta)
-                    .clamp(_leftMinWidth, _leftMaxWidth)
-                    .toDouble();
+                // 向右拖拽（delta 为正）时左栏变宽；不设固定像素上限，
+                // 空间不够时右栏主动让位
+                final (double l, double r) = _dragCouple(
+                  availableWidth,
+                  _leftWidth + delta,
+                  _rightCollapsed ? 0 : _rightWidth,
+                  true,
+                );
+                _leftWidth = l;
+                if (!_rightCollapsed) _rightWidth = r;
               });
             },
           ),
@@ -607,20 +650,29 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         _buildAnimatedDivider(
           collapsed: _rightCollapsed,
           divider: DraggableDivider(
+            onDragStart: () => _beginSideDrag(),
+            onDragEnd: _endSideDrag,
             onDrag: (delta) {
               setState(() {
-                // 右栏分隔条向右拖拽（delta 为正）时，右栏宽度减小
-                _rightWidth = (_rightWidth - delta)
-                    .clamp(_rightMinWidth, _rightMaxWidth)
-                    .toDouble();
+                // 右栏分隔条向左拖拽（delta 为负）时右栏变宽；
+                // 空间不够时左栏主动让位
+                final (double l, double r) = _dragCouple(
+                  availableWidth,
+                  _rightWidth - delta,
+                  _leftCollapsed ? 0 : _leftWidth,
+                  false,
+                );
+                _rightWidth = r;
+                if (!_leftCollapsed) _leftWidth = l;
               });
             },
           ),
         ),
-        // 右栏：文件管理（折叠时宽度平滑过渡，内容淡入淡出）
-        _buildAnimatedSidebar(
+        // 右栏：文件管理（收起时只留窄条）
+        _buildSidebar(
+          key: const ValueKey<String>('main-right-sidebar'),
           collapsed: _rightCollapsed,
-          expandedWidth: _rightWidth,
+          expandedWidth: renderRight,
           collapsedBar: _buildCollapsedRightBar(),
           expandedBar: _buildFilePanel(),
         ),
@@ -628,20 +680,186 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     );
   }
 
-  /// 折叠自适应的侧栏：宽度随折叠状态平滑过渡。
+  /// 侧栏（左/右）可用宽度预算：可用宽度扣掉固定占用与中栏最小宽度后的剩余。
+  ///
+  /// 固定占用＝活动栏 + 两个分隔条（收起时其分隔条宽度为 0）。**必须**扣掉它们，
+  /// 否则按预算拖到极限时中栏实际只剩 `360 - 48 - 12 = 300`，内部 Row 直接溢出。
+  ///
+  /// 返回 null 表示当前无法判定（尚未完成首帧布局 / 窗口过窄）。
+  ///
+  /// 注意：**没有固定像素上限**——两侧共用这一份预算，所以文件阅读（长行 /
+  /// 宽表格 / 宽 PDF）或长提示词编辑都能把任一侧拖到接近整窗宽，上限只由
+  /// "中栏仍要留下 [_centerMinWidth]" 这一条底线决定。
+  double? _sideBudgetFor(double availableWidth) {
+    final double chrome = _activityBarWidth +
+        (_leftCollapsed ? 0 : _dividerWidth) +
+        (_rightCollapsed ? 0 : _dividerWidth);
+    final double budget = availableWidth - chrome - _centerMinWidth;
+    return budget >= _minSideWidth ? budget : null;
+  }
+
+  /// 中栏实际可用宽度（供拖拽时反解单侧上限）。
+  double _centerAvailableFor(double availableWidth) {
+    final double chrome = _activityBarWidth +
+        (_leftCollapsed ? 0 : _dividerWidth) +
+        (_rightCollapsed ? 0 : _dividerWidth);
+    return availableWidth - chrome;
+  }
+
+  /// 在预算内确定左/右栏宽度：**等比缩减**，两侧都不破下限。
+  ///
+  /// 只按"单侧上限"夹是不够的：两栏都拖得很大时各自都没超上限，合起来却会把
+  /// 中栏压到 0（布局直接溢出）。所以这里约束的是**两栏之和**；窗口变窄需要
+  /// 收回空间时按剩余可缩空间等比分配，保留用户刻意做出来的不对称
+  /// （例如"右栏很宽、左栏已在下限"）。
+  ///
+  /// 返回 (left, right)。
+  (double, double) _fitSideWidths(double budget, double left, double right) {
+    double l = left < _leftMinWidth ? _leftMinWidth : left;
+    double r = right < _rightMinWidth ? _rightMinWidth : right;
+    final double overflow = (l + r) - budget;
+    if (overflow <= 0) return (l, r);
+
+    // 两侧各自还能让出多少；按这个比例分摊 overflow，避免把某一侧先推到底
+    final double slackL = l - _leftMinWidth;
+    final double slackR = r - _rightMinWidth;
+    final double slack = slackL + slackR;
+    if (slack <= 0) {
+      // 两侧都贴在下限：只能压中栏（窗口已小于最小窗口宽度，页面会切小窗提示）
+      return (l, r);
+    }
+    l -= overflow * slackL / slack;
+    r -= overflow * slackR / slack;
+    return (l, r);
+  }
+
+  /// 把单个侧栏宽度抬到下限之上（合计约束由 [_fitSideWidths] 统一处理）。
+  double _clampSideWidth(double width, double minWidth) =>
+      width < minWidth ? minWidth : width;
+
+  /// 在 [value] 不低于 [min] 的前提下，最多能给出 [need] 中的多少。
+  static double _giveWithin(double value, double min, double need) {
+    final double slack = value - min;
+    return slack < need ? slack : need;
+  }
+
+  /// 拖拽分隔条时联动另一侧：被拖拽的一侧按请求变宽，位置不够时
+  /// **主动从对侧借空间**（对侧可一直缩到自己的下限）。
+  ///
+  /// [draggedLeft] 指明拖的是左栏那一侧；[other] 是对侧**当前**宽度。
+  /// 两栏**合计**只能占 `中栏可用宽度 - 中栏最小宽度(360)`，被拖拽侧先拿，
+  /// 对侧拿剩下的：
+  /// 1. 中栏本来有富余 → 先吃中栏，对侧不动；
+  /// 2. 中栏已到 360 → 从对侧借，借到它的下限为止；
+  /// 3. 对侧也到下限 → 被拖拽侧就此封顶（中栏不再被压）。
+  ///
+  /// 所以"右栏拖到很大"时左栏会自己让出空间，"左栏拖到很大"时右栏同理。
+  ///
+  /// 返回 (left, right)。
+  (double, double) _dragCouple(
+    double available,
+    double requested,
+    double other,
+    bool draggedLeft,
+  ) {
+    // 中栏保底之后，留给两侧的总空间
+    final double sideBudget =
+        _centerAvailableFor(available) - _centerMinWidth;
+    final double draggedMin = draggedLeft ? _leftMinWidth : _rightMinWidth;
+    final double otherMin = draggedLeft ? _rightMinWidth : _leftMinWidth;
+    // 被拖拽侧的上限：总空间扣掉对侧下限
+    final double draggedMax = sideBudget - otherMin;
+    double dragged = _clampSideWidth(requested, draggedMin);
+    if (dragged > draggedMax) dragged = draggedMax;
+
+    // 对侧吃下剩余空间，但不超过它当前宽度（只让位、不长大）
+    double otherNext = sideBudget - dragged;
+    if (otherNext > other) otherNext = other;
+    if (otherNext < otherMin) otherNext = otherMin;
+
+    // 两侧都顶到下限仍放不下：只能压缩中栏（窗口已小于最小窗口宽度）
+    final double overflow = dragged + otherNext - sideBudget;
+    if (overflow > 0) {
+      final double give = _giveWithin(dragged, draggedMin, overflow);
+      dragged -= give;
+      final double rest = overflow - give;
+      if (rest > 0) otherNext -= _giveWithin(otherNext, otherMin, rest);
+    }
+    // 返回顺序恒为 (left, right)
+    return draggedLeft ? (dragged, otherNext) : (otherNext, dragged);
+  }
+
+  /// 帧后把侧栏宽度收敛进当前预算（每帧最多安排一次）。
+  ///
+  /// 为什么不能在布局回调里直接收敛：`LayoutBuilder` 的 builder 在布局阶段
+  /// 执行，此时 `setState` 抛 "setState() called during build"。而
+  /// `didChangeMetrics` 也拿不到新尺寸——它在下一帧布局前触发，
+  /// [_layoutAvailableWidth] 还是旧值。所以在**本帧布局拿到新宽度之后**、
+  /// 下一帧之前（帧后回调）收敛，被压破的那一帧不会被绘制。
+  void _scheduleSideNormalize() {
+    // 拖拽期间不收敛：宽度由 [_dragCouple] 现场决定（它本身已经满足预算），
+    // 再让"帧后收敛"插一脚会按另一套比例把用户正在拖的一侧往回拉。
+    if (_sideNormalizeScheduled || _sideDragging) return;
+    _sideNormalizeScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _sideNormalizeScheduled = false;
+      _normalizeSideWidths();
+    });
+  }
+
+  /// 开始拖拽侧栏分隔条：暂停帧后收敛，让拖拽完全说了算。
+  void _beginSideDrag() {
+    _sideDragging = true;
+  }
+
+  /// 结束拖拽：恢复收敛（拖拽期间若窗口被改变，这里补一次校正）。
+  void _endSideDrag() {
+    _sideDragging = false;
+    _normalizeSideWidths();
+  }
+
+  /// 把左/右栏宽度收敛进当前窗口的预算内（已符合预算时什么都不做）。
+  ///
+  /// **等比收缩**而不是"谁宽谁先让"：窗口变窄时两栏按原比例缩，用户在拖拽中
+  /// 刻意做出来的不对称（例如右栏 1240 / 左栏 200）不会被重新分配。
+  void _normalizeSideWidths() {
+    if (_sideDragging) return;
+    final double? available = _layoutAvailableWidth;
+    if (available == null || !mounted) return;
+    final double? budget = _sideBudgetFor(available);
+    if (budget == null) return;
+    final double l = _leftCollapsed ? 0 : _leftWidth;
+    final double r = _rightCollapsed ? 0 : _rightWidth;
+    if (l + r <= budget) return; // 已在预算内，保持现状
+    final (double nl, double nr) = _fitSideWidths(budget, l, r);
+    final double newLeft = _leftCollapsed ? _leftWidth : nl;
+    final double newRight = _rightCollapsed ? _rightWidth : nr;
+    if (newLeft == _leftWidth && newRight == _rightWidth) return;
+    setState(() {
+      _leftWidth = newLeft;
+      _rightWidth = newRight;
+    });
+  }
+
+  /// 折叠自适应的侧栏：折叠时收成 [_collapsedWidth] 的窄条，展开时恢复给定宽度。
+  ///
+  /// **宽度不做补间动画**：改宽度必须当帧生效。若用 `AnimatedContainer` 补间，
+  /// 窗口缩小后侧栏会按旧宽度逐帧缩回，这几帧里两栏之和超过预算，中栏被挤到 0
+  /// 并直接抛 RenderFlex overflow（见 [_fitSideWidths]）。折叠/展开本身由
+  /// ClipRect + 窄条覆盖完成，观感不受影响。
   ///
   /// 展开内容始终以完整宽度挂载（折叠时超出容器部分被裁剪，并被折叠窄条
   /// 覆盖、禁用点击），从而保留其 State（滚动位置、当前 Tab、文件查看器等），
   /// 避免折叠再展开后访问位置丢失。
-  Widget _buildAnimatedSidebar({
+  Widget _buildSidebar({
+    Key? key,
     required bool collapsed,
     required double expandedWidth,
     required Widget collapsedBar,
     required Widget expandedBar,
   }) {
-    return AnimatedContainer(
-      duration: _sidebarAnimDuration,
-      curve: _sidebarAnimCurve,
+    return SizedBox(
+      key: key,
       width: collapsed ? _collapsedWidth : expandedWidth,
       child: ClipRect(
         clipBehavior: Clip.hardEdge,
@@ -668,7 +886,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     );
   }
 
-  /// 折叠自适应的分隔条：折叠时宽度平滑收为 0（不占空间）
+  /// 折叠时的分隔条：收起时宽度平滑收为 0（不占空间）
+  ///
+  /// 分隔条本身只有 6px，补间不会挤压中栏（预算按展开宽度计算，收起时更宽裕），
+  /// 所以这里保留宽度过渡；侧栏宽度则必须当帧生效（见 [_buildSidebar]）。
   Widget _buildAnimatedDivider({
     required bool collapsed,
     required Widget divider,
@@ -676,7 +897,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     return AnimatedContainer(
       duration: _sidebarAnimDuration,
       curve: _sidebarAnimCurve,
-      width: collapsed ? 0 : 6,
+      width: collapsed ? 0 : _dividerWidth,
       child: collapsed ? const SizedBox.shrink() : divider,
     );
   }
@@ -1094,10 +1315,21 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
 /// 用于在三栏布局中分隔各栏，支持鼠标拖拽调整相邻栏的宽度。
 /// 拖拽时变色提供视觉反馈，鼠标悬停时显示 resize 光标。
 class DraggableDivider extends StatefulWidget {
-  const DraggableDivider({super.key, required this.onDrag});
+  const DraggableDivider({
+    super.key,
+    required this.onDrag,
+    this.onDragStart,
+    this.onDragEnd,
+  });
 
   /// 拖拽回调，参数为水平方向的增量（dx）
   final ValueChanged<double> onDrag;
+
+  /// 开始拖拽（手指/鼠标按下并识别为水平拖拽）
+  final VoidCallback? onDragStart;
+
+  /// 结束拖拽（抬起）
+  final VoidCallback? onDragEnd;
 
   @override
   State<DraggableDivider> createState() => _DraggableDividerState();
@@ -1135,6 +1367,7 @@ class _DraggableDividerState extends State<DraggableDivider> {
           setState(() {
             _isDragging = true;
           });
+          widget.onDragStart?.call();
         },
         onHorizontalDragUpdate: (details) {
           widget.onDrag(details.delta.dx);
@@ -1143,6 +1376,13 @@ class _DraggableDividerState extends State<DraggableDivider> {
           setState(() {
             _isDragging = false;
           });
+          widget.onDragEnd?.call();
+        },
+        onHorizontalDragCancel: () {
+          setState(() {
+            _isDragging = false;
+          });
+          widget.onDragEnd?.call();
         },
         child: Container(width: 6, color: _getColor(context)),
       ),

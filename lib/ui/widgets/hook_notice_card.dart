@@ -190,11 +190,11 @@ class _HookNoticeCardState extends State<HookNoticeCard> {
     );
   }
 
-  /// 卡片外壳（统一边框/圆角/最大宽度，与思考卡片同口径）。
+  /// 卡片外壳（统一边框/圆角/宽度口径，与思考卡片一致：随中栏铺开）。
   Widget _shell({required Color accent, required Widget child}) => Align(
     alignment: Alignment.centerLeft,
     child: Container(
-      constraints: const BoxConstraints(maxWidth: 560),
+      constraints: const BoxConstraints(maxWidth: double.infinity),
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
       decoration: BoxDecoration(

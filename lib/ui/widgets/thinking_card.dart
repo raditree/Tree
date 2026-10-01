@@ -33,7 +33,8 @@ class _ThinkingCardState extends State<ThinkingCard> {
     return Align(
       alignment: Alignment.centerLeft,
       child: Container(
-        constraints: const BoxConstraints(maxWidth: 560),
+        // 不再写死 560px：思考内容随中栏宽度铺开（与工具卡片同口径）
+        constraints: const BoxConstraints(maxWidth: double.infinity),
         margin: const EdgeInsets.only(bottom: 8),
         decoration: BoxDecoration(
           color: cs.surface,

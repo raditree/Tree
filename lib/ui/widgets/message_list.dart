@@ -568,8 +568,10 @@ class _MessageBubbleState extends State<_MessageBubble> {
     final cs = Theme.of(context).colorScheme;
     return LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
-        // 气泡最大宽度为父容器 70%
-        final double maxBubbleWidth = constraints.maxWidth * 0.7;
+        // 气泡最大宽度：只留一小段内边距，不再按 70% 压缩。
+        // 中栏被拖窄时（最小 360px）70% 只剩下 ~250px，右侧会空出一大片；
+        // 留 7% 既能撑满可用宽度，又让左右气泡的对齐关系看得出来。
+        final double maxBubbleWidth = constraints.maxWidth * 0.93;
         return Align(
           alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
           child: ConstrainedBox(
