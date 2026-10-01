@@ -28,6 +28,10 @@ import 'dart:io';
 ///   `post` ⇒ 在结果文本前加 `[改写]` 前缀。用于验证「工具调用前后各一次中转」。
 /// - --relay-rewrite VALUE：上面 pre 阶段写进去的值。
 /// - --relay-station relay|broadcast：订阅哪类站（默认 relay）。
+/// - --ui-manifest：hello 后**主动发一条 `ui/manifest` 通知**声明一个 activity
+///   槽位（左侧活动栏面板）与一个 panel 槽位（右栏 Tab），用于验证 Q12 的生产端。
+/// - --ui-manifest-foreign：同上，但槽位里冒用别的 plugin_id（验证越权被拒）。
+/// - --ui-team VALUE：`ui/manifest` 通告里自带 team_id（验证声明优先）。
 void main(List<String> args) {
   String eventsFile = '';
   String pingGateFile = '';
@@ -40,15 +44,19 @@ void main(List<String> args) {
   // 既有用例对工具条数的断言不受影响。
   final bool scopeProbe = args.contains('--scope-probe');
   final bool relaySubscribe = args.contains('--relay-subscribe');
+  final bool uiManifest = args.contains('--ui-manifest');
+  final bool uiManifestForeign = args.contains('--ui-manifest-foreign');
   String relayRewrite = 'REWRITTEN';
   String relayKey = 'content';
   String relayStation = 'relay';
+  String uiTeam = '';
   for (int i = 0; i < args.length - 1; i++) {
     if (args[i] == '--events-file') eventsFile = args[i + 1];
     if (args[i] == '--ignore-ping-until') pingGateFile = args[i + 1];
     if (args[i] == '--relay-rewrite') relayRewrite = args[i + 1];
     if (args[i] == '--relay-key') relayKey = args[i + 1];
     if (args[i] == '--relay-station') relayStation = args[i + 1];
+    if (args[i] == '--ui-team') uiTeam = args[i + 1];
   }
 
   /// 插件**主动**发起的请求：id → 等待核心响应的 completer。
@@ -128,6 +136,65 @@ void main(List<String> args) {
   if (relaySubscribe) {
     // hello 握手后核心已能处理请求；用 microtask 让读循环先跑起来。
     scheduleMicrotask(subscribeRelay);
+  }
+
+  /// 声明 Q12 槽位：activity（左侧活动栏面板）+ panel（右栏 Tab）。
+  void declareUi() {
+    final List<Map<String, dynamic>> slots = <Map<String, dynamic>>[
+      <String, dynamic>{
+        'slot_key': 'fake.activity.1',
+        'slot': 'activity',
+        'title': '假插件面板',
+        'icon': 'extension',
+        'order': 10,
+        if (uiManifestForeign) 'plugin_id': 'someone-else',
+        'view': <String, dynamic>{
+          'type': 'column',
+          'children': <Map<String, dynamic>>[
+            <String, dynamic>{'type': 'text', 'text': '来自假插件', 'style': 'title'},
+            <String, dynamic>{
+              'type': 'actions',
+              'buttons': <Map<String, dynamic>>[
+                <String, dynamic>{'action_id': 'refresh', 'label': '刷新'},
+              ],
+            },
+          ],
+        },
+      },
+      <String, dynamic>{
+        'slot_key': 'fake.panel.1',
+        'slot': 'panel',
+        'title': '假插件',
+        'view': <String, dynamic>{'type': 'text', 'text': '右栏内容'},
+      },
+    ];
+    stdout.writeln(
+      jsonEncode(<String, dynamic>{
+        'jsonrpc': '2.0',
+        'method': 'ui/manifest',
+        'params': <String, dynamic>{
+          'slots': slots,
+          if (uiTeam.isNotEmpty) 'team_id': uiTeam,
+        },
+      }),
+    );
+  }
+
+  if (uiManifest || uiManifestForeign) {
+    scheduleMicrotask(() async {
+      // 等一小会儿确保 hello 已完成（插件→核心通知在握手期也可能被读循环处理，
+      // 但声明槽位要等核心把自己的 team 归属算出来）。
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      declareUi();
+      // 顺带发一条普通 log 通知：验证**非 UI 通知**仍走 plugin_event（行为不变）。
+      stdout.writeln(
+        jsonEncode(<String, dynamic>{
+          'jsonrpc': '2.0',
+          'method': 'log',
+          'params': <String, dynamic>{'level': 'info', 'message': '已声明面板'},
+        }),
+      );
+    });
   }
 
   stdin.transform(utf8.decoder).transform(const LineSplitter()).listen((

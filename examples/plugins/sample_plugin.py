@@ -117,6 +117,10 @@ class Options(object):
         self.card_min_interval = 1.0
         self.cascade = False
         self.fs_demo = True
+        # 中转站订阅：工具调用前/后各来一次（pre / post），插件决定改不改
+        self.relay = True
+        # 声明左侧活动栏 / 右栏面板槽位（ui/manifest）
+        self.panel = True
 
 
 def _env(name):
@@ -142,6 +146,8 @@ def _print_help():
         "  --card-interval SEC  卡片周期刷新秒数（默认 5）（%s）\n"
         "  --stop-cascade       agent.stop 级联停整棵团队树（默认只停该 agent）\n"
         "                       （%s=1）\n"
+        "  --no-relay           不订阅中转站（默认订阅：工具调用前/后各一次）\n"
+        "  --no-panel           不声明插件面板槽位（默认声明 activity + panel）\n"
         "  --no-fs-demo         不做启动 fs.read 自检\n"
         "  -h, --help           本帮助（打到 stderr）\n"
         % (
@@ -195,6 +201,14 @@ def parse_options(argv):
             options.fs_demo = False
             index += 1
             continue
+        if token == "--no-relay":
+            options.relay = False
+            index += 1
+            continue
+        if token == "--no-panel":
+            options.panel = False
+            index += 1
+            continue
         if token == "--stop-cascade":
             options.cascade = True
             index += 1
@@ -235,6 +249,8 @@ class SamplePlugin(object):
         self.stop_count = 0
         self.last_duration_ms = None
         self.first_agent_seen = ""
+        # 中转站：本插件处理过的中转请求数（pre / post 各算一次）
+        self.relay_handled = 0
         self._state_lock = threading.Lock()
 
         # stdout / stderr 写锁（多个线程都会写）
@@ -323,6 +339,31 @@ class SamplePlugin(object):
         result = response.get("result")
         return result if isinstance(result, dict) else {"ok": False, "error": "空结果"}
 
+    def subscribe_station(self, station, replace=False):
+        """**订阅站点**（本轮新增的协议方法）：`station/subscribe`。
+
+        中转站（relay）用于「工具调用前/后各一次」——核心把**完整 tool_call**
+        报文交过来，插件改什么、甚至不改，都由插件内部决定；广播站（broadcast）
+        则是"发布-订阅读"。订阅被业务规则拒绝（键位被占 / 超上限 / 缺 team）时
+        返回里带可读 `error`，不会变成一句"调用失败"。
+        """
+        response = self.request_core("station/subscribe", {
+            "station": station,
+            "replace": replace,
+        })
+        if response.get("timeout") or isinstance(response.get("error"), dict):
+            error = response.get("error") or {}
+            self.log("订阅 %s 站点失败：%s" % (station, error.get("message") or "超时"),
+                     notify=True)
+            return {}
+        result = response.get("result") or {}
+        if result.get("ok"):
+            self.log("已订阅 %s 站点：station_id=%s scope=%s"
+                     % (station, result.get("station_id"), result.get("scope")))
+        else:
+            self.log("订阅 %s 站点被拒：%s" % (station, result.get("error")), notify=True)
+        return result
+
     # ── 工具定义（收集站申报 + tools/list 共用一份，避免两处写歪） ─────────
 
     def tool_definitions(self):
@@ -397,12 +438,52 @@ class SamplePlugin(object):
     # ── ① 收集站：按站点 schema 申报工具定义 ──────────────────────────────
 
     def _handle_station_request(self, params):
-        """回包形状 = {reply: {payload: {...}}}；payload 必须**严格**符合站点 schema
-        （根对象只允许 tools 一个键；每个元素 = 一条工具定义）。"""
+        """站点 → 插件的请求（收集站与中转站共用这条 `station/request` 通道）。
+
+        - `kind == "collect"`（收集站）：回包 payload 必须**严格**符合站点 schema
+          （根对象只允许 tools 一个键；每个元素 = 一条工具定义）；
+        - `kind == "relay"`（中转站）：核心把**完整 tool_call 报文**放在 payload 里
+          （`phase` = pre | post）。插件返回的内容即"最终数据"：
+          返回改过的报文 = 改写生效；返回 `None` = 什么都不改（放行原数据）；
+          返回非法类型 = 核心按 fail-open 放行原数据并记原因。
+          这里演示：pre 阶段给参数补一个 `_relay_seen` 标记，post 阶段给结果加一行统计。
+        """
         kind = params.get("kind")
+        if kind == "relay":
+            payload = params.get("payload")
+            if not isinstance(payload, dict):
+                # 返回 None 表示"不改动"，但这里参数形态不对，显式说明更好排查
+                return {"reply": {"error": "中转请求的 payload 必须是对象"}}
+            phase = payload.get("phase")
+            with self._state_lock:
+                relay_count = self.relay_handled + 1
+                self.relay_handled = relay_count
+            if phase == "pre":
+                arguments = payload.get("arguments")
+                if not isinstance(arguments, dict):
+                    arguments = {}
+                # 演示"插件自己决定改不改"：只加一个标记键，不动业务参数
+                return {"reply": {"payload": {
+                    **payload,
+                    "arguments": {**arguments, "_relay_seen": relay_count},
+                }}}
+            if phase == "post":
+                result = payload.get("result")
+                text = result if isinstance(result, str) else str(result)
+                # 面板里显示"已处理中转次数"（有声明面板时才刷）
+                if self.options.panel:
+                    self.update_panel()
+                return {"reply": {"payload": {
+                    **payload,
+                    "result": "%s\n[示例插件] 本次工具调用已经过中转（第 %d 次）"
+                              % (text, relay_count),
+                }}}
+            # 未知 phase：不改动（显式返回 None = 放行原数据）
+            return {"reply": {"payload": None}}
         if kind != "collect":
-            # 本插件只订阅收集站；其余站点类型显式拒绝（不静默）
-            return {"reply": {"error": "示例插件只响应收集站（collect）请求，收到 kind=%s" % kind}}
+            # 本插件只订阅收集站与中转站；其余站点类型显式拒绝（不静默）
+            return {"reply": {"error": "示例插件只响应收集站（collect）与中转站（relay）"
+                                       "请求，收到 kind=%s" % kind}}
         schema = params.get("schema") or {}
         fields = [field.get("name") for field in (schema.get("fields") or [])]
         if fields and "tools" not in fields:
@@ -509,9 +590,92 @@ class SamplePlugin(object):
                  "请求参数改不了作用域）"
                  % (self.plugin_id, self.options.threshold, self.options.slot_key),
                  notify=True)
+        # **订阅中转站**：此后每次工具调用的前/后，核心都会把完整 tool_call 报文
+        # 发过来（station/request，kind=relay），本插件决定改什么 / 不改。
+        if self.options.relay:
+            self.subscribe_station("relay", replace=True)
+        # **声明插件面板**：ui/manifest → 核心转成 plugin_ui_manifest 帧 →
+        # 前端把它挂到左侧活动栏（activity 槽位）与右栏 Tab（panel 槽位）。
+        if self.options.panel:
+            self.declare_panel()
         if self.options.fs_demo:
             self._jobs.put(("fs", "启动自检"))
         self.push_card(force=True)
+
+    # ── ④ 插件布局 A：声明左侧活动栏 / 右栏面板槽位 ───────────────────────
+
+    def declare_panel(self):
+        """发一条 `ui/manifest` **通知**（无 id）：声明本插件在该 team 上的全部槽位。
+
+        - `activity` = 左侧活动栏项（和「Agent 列表 / 插件 / 下载」并列）；
+        - `panel` = 右栏 Tab；
+        - 视图是**声明式受限控件集**（text / list / table / form / progress /
+          actions 与 row / column 容器）——**没有 webview、不执行插件 JS**；
+        - `plugin_id` / `team_id` 一律由**核心按实例与 plugins.yaml 声明**填充，
+          插件自述的这两个字段不会被采信（防越权）。
+        """
+        slots = [
+            {
+                "slot_key": "%s.activity.1" % self.plugin_id,
+                "slot": "activity",
+                "title": "示例插件",
+                "icon": "extension",
+                "order": 10,
+                "view": {
+                    "type": "column",
+                    "gap": 6,
+                    "children": [
+                        {"type": "text", "text": "示例插件 · 面板", "style": "title"},
+                        {"type": "text",
+                         "text": "工具轮次计数与中转处理次数都在这里刷新",
+                         "style": "caption"},
+                        {"type": "actions", "buttons": [
+                            {"action_id": "refresh", "label": "刷新",
+                             "style": "primary"},
+                            {"action_id": "push_card", "label": "推一张卡片"},
+                        ]},
+                    ],
+                },
+            },
+            {
+                "slot_key": "%s.panel.1" % self.plugin_id,
+                "slot": "panel",
+                "title": "示例插件",
+                "view": self.card_view(),
+            },
+        ]
+        self._notify("ui/manifest", {"slots": slots})
+        self.log("已声明插件面板槽位 %d 个（activity + panel）" % len(slots))
+
+    def update_panel(self):
+        """发 `ui/update`：按 slot_key **整块替换**某槽位视图（不做 diff）。
+
+        `view` 缺省 / 为 null = 注销该槽位。
+        """
+        self._notify("ui/update", {
+            "slot_key": "%s.activity.1" % self.plugin_id,
+            "view": {
+                "type": "column",
+                "gap": 6,
+                "children": [
+                    {"type": "text", "text": "示例插件 · 面板", "style": "title"},
+                    {"type": "text",
+                     "text": "已处理中转 %d 次" % self.relay_handled, "style": "body"},
+                    {"type": "progress",
+                     "value": min(1.0, float(self.total_started)
+                                  / float(max(1, self.options.threshold))),
+                     "label": "工具轮次 / 阈值",
+                     "detail": "%d / %d" % (self.total_started, self.options.threshold)},
+                    {"type": "actions", "buttons": [
+                        {"action_id": "refresh", "label": "刷新"},
+                    ]},
+                ],
+            },
+        })
+
+    def _notify(self, method, params):
+        """发一条 JSON-RPC **通知**（无 id，核心不回包）。"""
+        self._send({"jsonrpc": JSONRPC_VERSION, "method": method, "params": params})
 
     # ── ④ 插件布局：推 card 槽位帧 ────────────────────────────────────────
 
@@ -635,11 +799,31 @@ class SamplePlugin(object):
         if method == "event":
             self._on_event(params)
             return
+        if method == "plugin_ui_action":
+            # 用户在插件面板上点了按钮 / 提交了表单（前端 → 核心 → 插件）。
+            # 核心只透传 slot_key / action_id / payload，语义由插件自己解释；
+            # 惯例是**再推一帧 ui/update** 把槽位刷新。
+            self._on_ui_action(params)
+            return
         if method == "shutdown":
             self.log("收到 shutdown，退出")
             self._closed = True
             sys.exit(0)
         # 其余通知（例如核心未来新增的）只记 stderr：未知类型不该让插件崩。
+
+    def _on_ui_action(self, params):
+        """面板交互回调：刷新面板 / 推卡片。"""
+        action_id = str(params.get("action_id", ""))
+        slot_key = str(params.get("slot_key", ""))
+        self.log("面板交互：slot=%s action=%s" % (slot_key, action_id))
+        if action_id == "refresh":
+            self.update_panel()
+            return
+        if action_id == "push_card":
+            self.push_card(force=True)
+            return
+        # 未知 action：显式记下来（不静默），但不算错误
+        self.log("未知的面板动作（忽略）：%s" % action_id)
 
     def serve(self):
         """读循环（主线程）：按形状分三类——响应 / 请求 / 通知。"""

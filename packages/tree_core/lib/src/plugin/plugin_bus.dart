@@ -6,6 +6,7 @@ import '../util/liveness.dart';
 import 'execute_mounts.dart';
 import 'plugin_host.dart';
 import 'plugin_tool_definition.dart';
+import 'plugin_ui_bridge.dart';
 import 'station_instance.dart';
 import 'station_runtime.dart';
 import 'station_schema.dart';
@@ -51,11 +52,13 @@ class PluginBus {
     this.coreVersion = '',
     this.broadcast,
     StationHub? stations,
+    PluginUiBridge? uiBridge,
     this.stationScopeResolver,
     this.agentModeKeyResolver,
     this.callSiteContext,
     this.toolTableRefreshHook,
-  }) : stations =
+  }) : uiBridge = uiBridge ?? PluginUiBridge(),
+       stations =
            stations ??
            StationHub(
              storePath: StationStore.pathFor(configFile),
@@ -91,6 +94,11 @@ class PluginBus {
 
   /// 站点中枢（四站、订阅、落盘；落点 = <数据根>/config/stations.yaml）。
   final StationHub stations;
+
+  /// 插件通知 → 前端 UI 帧的桥（Q12 生产端；见 [PluginUiBridge]）。
+  ///
+  /// 可注入只为测试换阈值（槽位上限 / 视图字节上限），生产用默认即可。
+  final PluginUiBridge uiBridge;
 
   /// 插件配置 → 站点四元组的**运行期接线点**（M9 Wave 3-I）。
   ///
@@ -401,13 +409,42 @@ class PluginBus {
   }
 
   /// 推一条 plugin_event（插件主动通知：log / event）。
+  ///
+  /// **Q12 插件布局的生产端**：约定 method `ui/manifest` / `ui/update` 的通知在这里
+  /// 被转成前端 UI 帧（`plugin_ui_manifest` / `plugin_ui_update`），其余 method 维持
+  /// 原样 `plugin_event`——插件因此能用同一个 stdio 通知通道声明槽位，
+  /// 不需要新协议方法（面板里不执行任何插件 JS，视图只能是受限控件集的 JSON）。
   void _emitPluginEvent(String pluginId, Map<String, dynamic> notification) {
+    final String method = (notification['method'] ?? '').toString();
+    final Object? rawParams = notification['params'];
+    final Map<String, dynamic> params = rawParams is Map
+        ? rawParams.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
+        : <String, dynamic>{};
+    if (uiBridge.handles(method)) {
+      final PluginConfig? config = this.config(pluginId);
+      final String declaredTeam = (config?.scope['team_id'] ?? '')
+          .toString()
+          .trim();
+      final Map<String, dynamic>? frame = uiBridge.frameFor(
+        pluginId: pluginId,
+        declaredTeamId: declaredTeam,
+        method: method,
+        params: params,
+        onRejected: (String reason) => log?.call('插件 $pluginId 的 UI 声明被拒：$reason'),
+      );
+      if (frame != null) {
+        broadcast?.call(frame);
+        return;
+      }
+      // 非法声明已经记过可读原因，**不再**降级成 plugin_event（避免前端收到半成品）
+      return;
+    }
     broadcast?.call(<String, dynamic>{
       'type': 'plugin_event',
       'data': <String, dynamic>{
         'plugin_id': pluginId,
-        'method': (notification['method'] ?? '').toString(),
-        'params': notification['params'] ?? <String, dynamic>{},
+        'method': method,
+        'params': params,
         'ts': _nowSeconds(),
       },
     });

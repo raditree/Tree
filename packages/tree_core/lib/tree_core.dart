@@ -52,6 +52,7 @@ export 'src/plugin/plugin_bus.dart';
 export 'src/plugin/plugin_config_store.dart';
 export 'src/plugin/plugin_host.dart';
 export 'src/plugin/plugin_tool_definition.dart';
+export 'src/plugin/plugin_ui_bridge.dart';
 export 'src/plugin/station_instance.dart';
 export 'src/plugin/station_runtime.dart';
 export 'src/plugin/station_schema.dart';

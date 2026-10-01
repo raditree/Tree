@@ -8,7 +8,9 @@
 | **收集站**：按站点 schema 申报工具定义，模型因此能调到 `plugin__<插件id>__echo` | `station/request`（收集站 → 插件） | `_handle_station_request` + `tool_definitions` |
 | **广播 / 事件订阅**：收 `agent.tool_call`，按 (agent_id, session_id) 计数，**超过阈值就发停止信号** | 事件通知 + 执行站 `agent.stop` | `_on_event` / `_do_stop` |
 | **执行站**：插件**主动**下命令（`fs.read` 读工作空间小文件） | `station/command`（插件 → 核心） | `fs_read` / `_do_startup` |
-| **插件布局**：推一个 card 槽位帧到前端，显示当前计数与阈值 | `ui.push` → `plugin_ui_update` | `push_card` / `card_view` |
+| **中转站**：订阅后**每次工具调用的前/后各来一次**——核心把完整 tool_call 报文交过来，插件决定改什么（甚至不改） | `station/subscribe` + `station/request`（kind=relay） | `subscribe_station` / `_handle_station_request` 的 relay 分支 |
+| **插件布局 A**：声明左侧活动栏面板 + 右栏 Tab（声明式控件集，**不跑 JS**） | `ui/manifest` / `ui/update` 通知 → `plugin_ui_manifest` / `plugin_ui_update` 帧 | `declare_panel` / `update_panel` / `_on_ui_action` |
+| **插件布局 B**：推一个 card 槽位帧到前端，显示当前计数与阈值 | `ui.push` → `plugin_ui_update` | `push_card` / `card_view` |
 
 > 一句话语义：**核心不设工具轮次上限（Q8），限制交给插件做**——本插件就是那个
 > "监视轮次、超限发 `agent.stop`"的参考实现（默认阈值 200 次）。
@@ -129,6 +131,8 @@ where.exe python
 | `--slot-key KEY` | `SAMPLE_PLUGIN_SLOT_KEY` | `sample.card.tool_rounds` | 前端卡片槽位键（全局唯一） |
 | `--card-interval SEC` | `SAMPLE_PLUGIN_CARD_INTERVAL` | `5` | 卡片周期刷新秒数（有事件时另按 1s 节流刷新） |
 | `--stop-cascade` | `SAMPLE_PLUGIN_STOP_CASCADE=1` | 关 | `agent.stop` 是否级联停整棵团队树（默认只停该 agent 的当前生成） |
+| `--no-relay` | — | **默认订阅** | 不订阅中转站。默认订阅后，**每次工具调用的前/后各来一次** `station/request`（kind=relay）；本插件 pre 阶段给参数加 `_relay_seen` 标记、post 阶段给结果追加一行统计（演示"改不改由插件决定"） |
+| `--no-panel` | — | **默认声明** | 不声明插件面板槽位。默认会发 `ui/manifest` 声明一个 **activity**（左侧活动栏面板）与一个 **panel**（右栏 Tab）槽位；按钮 `refresh` / `push_card` 经 `plugin_ui_action` 回到 `_on_ui_action` |
 | `--no-fs-demo` | — | 关 | 不做启动时的 `fs.read` 自检 |
 
 快速试验建议把阈值压到 **3**：`args: [..., "--threshold", "3"]`，这样几次工具调用就能
