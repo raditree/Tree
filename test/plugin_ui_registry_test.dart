@@ -223,7 +223,7 @@ void main() {
       expect(reg.slotsOfKind(PluginUiSlotKind.status), hasLength(1));
     });
 
-    test('未选 team 时只呈现 team_id 为空的全局槽位（fail-closed）', () {
+    test('未选 team 时只呈现 team_id 为空的全局槽位（限定 team 的仍隐藏）', () {
       final PluginUiRegistry reg = PluginUiRegistry.forTesting();
       reg.handleFrame(_manifest('demo.a',
           teamId: 't1',
@@ -233,6 +233,45 @@ void main() {
           teamId: '',
           slots: <Map<String, dynamic>>[_slot('g.status', PluginUiSlotKind.status)]));
       expect(reg.slotsOfKind(PluginUiSlotKind.status), hasLength(1));
+    });
+
+    // 真机回归：`plugins.yaml` 里 scope 为空的插件（示例插件默认如此）声明的面板
+    // 归属 team 为空，而活动 agent 几乎总有 team 作用域（无 team_id 的 agent 也
+    // 回退到自身 id，见 Agent.teamScopeId）。若把空 team_id 理解成"只在未选 team
+    // 时呈现"，插件面板就**永远不呈现**——表现为"插件没给前端面板"。
+    test('未限定团队的槽位在任何 team 下都呈现（agent 回退 id 作 team 作用域）', () {
+      final PluginUiRegistry reg = PluginUiRegistry.forTesting()
+        ..setTeam('agt_1790406811628_73afa9_44');
+      reg.handleFrame(_manifest('sample',
+          teamId: '',
+          slots: <Map<String, dynamic>>[
+            _slot('sample.activity.1', PluginUiSlotKind.activity, title: '示例插件'),
+            _slot('sample.panel.1', PluginUiSlotKind.panel, title: '示例插件'),
+          ]));
+
+      expect(
+        reg.slotsOfKind(PluginUiSlotKind.activity).map((PluginUiSlot s) => s.title),
+        <String>['示例插件'],
+        reason: '空 team_id = 不限定归属：不属于任何特定 team，故任何 team 下都呈现',
+      );
+      expect(reg.slotsOfKind(PluginUiSlotKind.panel), hasLength(1));
+      expect(reg.slot('sample.panel.1'), isNotNull);
+
+      // 切到别的 team 依旧呈现（全局槽位不随当前 team 变化）
+      reg.setTeam('team-2');
+      expect(reg.slotsOfKind(PluginUiSlotKind.panel), hasLength(1));
+
+      // 而限定 team 的槽位仍受精确匹配约束（隔离不入不敷出）
+      reg.handleFrame(_manifest('demo.t2',
+          teamId: 't2',
+          slots: <Map<String, dynamic>>[
+            _slot('t2.panel', PluginUiSlotKind.panel, title: '乙队'),
+          ]));
+      expect(
+        reg.slotsOfKind(PluginUiSlotKind.panel).map((PluginUiSlot s) => s.title),
+        <String>['示例插件'],
+        reason: '当前 team=team-2，限定 t2 的槽位必须隐藏',
+      );
     });
   });
 

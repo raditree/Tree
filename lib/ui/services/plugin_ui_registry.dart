@@ -7,9 +7,10 @@ import 'package:tree_protocol/tree_protocol.dart';
 /// 1. **承载帧**——[handleFrame] 消费 `plugin_ui_manifest`（登记 / 整块替换槽位）、
 ///    `plugin_ui_update`（按 `slot_key` 局部替换视图，**整块替换、不做 diff**）与
 ///    `plugin_status(destroyed)`（插件卸载 / 断连 ⇒ 注销其全部槽位）；
-/// 2. **team 过滤**——槽位一律带 `team_id`，只呈现当前 team 的槽位
+/// 2. **team 过滤**——限定团队的槽位（`team_id` 非空）只呈现当前 team 的
 ///    （[setTeam] 切换即自动过滤，fail-closed；被过滤的槽位只隐藏不删除，
-///    切回该 team 立刻恢复）；
+///    切回该 team 立刻恢复）；未限定团队的槽位（`team_id` 为空）在任何 team 下
+///    都呈现（见 [_visible]）；
 /// 3. **动作出口**——[dispatchAction] 把按钮点击 / 表单提交组装成
 ///    `plugin_ui_action` 帧，经 [actionSender]（UI 层接到 WebSocketService）发出。
 ///
@@ -40,7 +41,10 @@ class PluginUiRegistry extends ChangeNotifier {
   final Map<String, int> _arrival = <String, int>{};
   int _arrivalSeq = 0;
 
-  /// 当前 team（空串 = 未选 team：只呈现 team_id 为空的全局槽位）。
+  /// 当前 team（空串 = 未选 team）。
+  ///
+  /// 与全局槽位（`team_id` 为空）的关系见 [_visible]：全局槽位在**任何** team
+  /// 下都呈现，不随当前 team 变化。
   String _teamId = '';
 
   /// 当前 team id。
@@ -59,8 +63,20 @@ class PluginUiRegistry extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 槽位对当前 team 是否可见（fail-closed：team 必须精确匹配）。
-  bool _visible(PluginUiSlot slot) => slot.teamId == _teamId;
+  /// 槽位对当前 team 是否可见。
+  ///
+  /// 两类可见（其余 fail-closed 隐藏）：
+  /// - **限定团队的槽位**：`team_id` 与当前 team **精确匹配**才可见（跨 team 隐藏）；
+  /// - **未限定团队的槽位**（`team_id` 为空，与插件配置里的「空映射 = 不限定归属」
+  ///   同义）：**任何 team 下都可见**——它不是"只属于未选 team"，而是"不属于任何
+  ///   特定 team"，因此不该被当前选中的 team 过滤掉。
+  ///
+  /// 为什么必须这样：主机上活动 agent **几乎总有** team 作用域（无 `team_id` 的
+  /// agent 也会回退到自身 id，见 `Agent.teamScopeId`），若把空 `team_id` 理解成
+  /// "只在未选 team 时呈现"，那么未在 `plugins.yaml` 里声明 `scope.team_id` 的
+  /// 插件面板将**永远不呈现**（默认配置正是空 scope）。
+  bool _visible(PluginUiSlot slot) =>
+      slot.teamId.isEmpty || slot.teamId == _teamId;
 
   /// 当前 team 可见的某类槽位。
   ///
