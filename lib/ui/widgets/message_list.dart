@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
 import '../models/message.dart';
+import 'hook_notice_card.dart';
 import 'thinking_card.dart';
 import 'tool_call_card.dart';
 
@@ -399,6 +400,15 @@ class _MessageListViewState extends State<_MessageListView> {
                     message: message,
                     onAnswer: widget.onAskAnswer,
                   ),
+                );
+              } else if (message.kind == 'notice') {
+                // 后台任务（terminal hook）完成提示：专用卡片（默认折叠）。
+                // 核心把 hook 提示标成 `notice` 是为了**发给模型的形态**（按 user
+                // 翻译，见 conversation_service.wake）；界面上它就是一坨等宽文本，
+                // 当普通消息渲染会把关键信息（命令/退出码/最后一行日志）埋在中间。
+                child = Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: HookNoticeCard(message: message),
                 );
               } else {
                 child = Padding(
