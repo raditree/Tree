@@ -8,8 +8,10 @@ import 'package:path/path.dart' as p;
 /// id + 名称 + 说明 + 开关状态，具体要拉起什么命令、脚本在哪，全部由核心在
 /// **打开的那一刻**解析（见 [BuiltinPluginCatalog.resolve]）：
 /// - 运行时：Windows 依次探测 python / py -3；其他平台 python3 / python；
-/// - 脚本：核心可执行文件同级的 `plugins/<name>.py`（发行包里由
-///   tool/package_windows.dart 把 examples/plugins 复制到那里）。
+/// - 脚本：优先核心可执行文件同级的 `plugins/<name>.py`（发行包里由
+///   tool/package_windows.dart 把 examples/plugins 复制到那里）；开发态向上定位
+///   **仓根**后查 `examples/plugins/`（不依赖当前工作目录——桌面壳是以自己所在
+///   目录为 cwd 拉起核心的，Debug 产物目录下没有 plugins/）。
 ///
 /// 解析结果会写成一条**普通插件配置**（带 builtin: true 标记供 UI 分组），
 /// 因此内置插件与用户自己加的插件在运行时走的是同一条路（插件总线只认这一份配置）。
@@ -143,8 +145,11 @@ class BuiltinPluginCatalog {
     this._scriptRoots,
     this._probe,
     bool? isWindows,
+    String? executableDir,
     this._probeTimeout = const Duration(seconds: 5),
-  }) : _isWindows = isWindows ?? Platform.isWindows;
+  }) : _isWindows = isWindows ?? Platform.isWindows,
+       _executableDir =
+           executableDir ?? p.dirname(Platform.resolvedExecutable);
 
   /// 核心内置的插件清单（至少一项：示例插件 sample）。
   ///
@@ -172,6 +177,12 @@ class BuiltinPluginCatalog {
 
   /// 是否按 Windows 口径探测（测试注入；null = 取 Platform.isWindows）。
   final bool _isWindows;
+
+  /// 可执行文件所在目录（测试注入；null = `Platform.resolvedExecutable` 的目录）。
+  ///
+  /// 注入的意义：内置脚本的查找优先级里"可执行文件同级 plugins/"与"向上找仓根"
+  /// 都以它为起点，不注入就没法在测试里复现"核心跑在构建产物目录下"这个真实布局。
+  final String _executableDir;
 
   /// 单次探测窗口（只是"这个候选能不能用"的诊断窗口，不是插件任务的时长上限）。
   final Duration _probeTimeout;
@@ -202,7 +213,8 @@ class BuiltinPluginCatalog {
       return _cache[spec.id] = BuiltinResolution.failed(
         '找不到内置插件脚本 ${spec.script}（依次查找：${roots.join('；')}）。'
         '发行包应当把 examples/plugins 复制到可执行文件同级的 plugins/ 目录'
-        '（打包脚本 tool/package_windows.dart 已包含这一步）。',
+        '（打包脚本 tool/package_windows.dart 已包含这一步）；'
+        '开发态则会自动向上定位仓根再查 examples/plugins。',
         searchedScriptRoots: roots,
       );
     }
@@ -243,20 +255,46 @@ class BuiltinPluginCatalog {
 
   /// 脚本查找目录（按优先级）。
   ///
-  /// 1. 核心可执行文件同级的 plugins/（**发行包的正规位置**：Tree.exe / tree_core.exe
-  ///    与 plugins/ 同级）；
-  /// 2. 当前工作目录下的 plugins/、examples/plugins/（**开发态回退**：dart run 时
-  ///    可执行文件是 SDK 里的 dart.exe，同级没有 plugins/，不兜这两层就没法在仓库里试）。
+  /// 1. 核心可执行文件同级的 `plugins/`（**发行包的正规位置**：Tree.exe /
+  ///    tree_core.exe 与 plugins/ 同级）；
+  /// 2. **仓根**的 `examples/plugins/`（开发态回退，见 [repoRoot]）；
+  /// 3. 当前工作目录下的 `plugins/`、`examples/plugins/`（`dart run` 时的兜底）。
+  ///
+  /// 为什么第 2 条必须**锚定仓根**而不是相对 cwd：桌面壳是以**自己所在目录**为
+  /// 工作目录拉起核心的，所以跑 Debug 构建时 cwd 是
+  /// `build/windows/x64/runner/Debug`（该目录下没有 plugins/，Debug 产物也不复制），
+  /// 于是"相对 cwd 的回退"一个都命中不了，内置示例插件在面板上就变成
+  /// 「找不到内置插件脚本」。锚定仓根后，无论从哪个构建目录、哪个 cwd 启动都能找到。
   List<String> scriptRoots() {
     final List<String>? explicit = _scriptRoots;
     if (explicit != null) return List<String>.unmodifiable(explicit);
-    final String exeDir = p.dirname(Platform.resolvedExecutable);
+    final String exeDir = _executableDir;
     final String cwd = Directory.current.path;
+    final String? repo = repoRoot(exeDir);
     return <String>[
       p.join(exeDir, 'plugins'),
+      if (repo != null) p.join(repo, 'examples', 'plugins'),
       p.join(cwd, 'plugins'),
       p.join(cwd, 'examples', 'plugins'),
     ];
+  }
+
+  /// 从可执行文件所在目录向上找**仓根**（含 `packages/tree_core` 的那一层）。
+  ///
+  /// 找到返回绝对路径，找不到返回 null（发行包就是这种情况：可执行文件不在仓库里）。
+  /// 向上层数设上限，避免在异常路径上无限回溯（软链接 / 根目录）。
+  static String? repoRoot(String startDir) {
+    Directory dir = Directory(p.absolute(startDir));
+    for (int depth = 0; depth < 8; depth++) {
+      final bool looksLikeRepo = Directory(
+        p.join(dir.path, 'packages', 'tree_core'),
+      ).existsSync();
+      if (looksLikeRepo) return dir.path;
+      final Directory parent = dir.parent;
+      if (parent.path == dir.path) break; // 到根了
+      dir = parent;
+    }
+    return null;
   }
 
   /// 在目录里找脚本文件（返回第一个存在的绝对路径；都不存在返回 null）。
