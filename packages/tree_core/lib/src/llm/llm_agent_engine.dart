@@ -307,56 +307,80 @@ class LlmAgentEngine implements AgentEngine {
       out.add(LlmMessage.system(context.contextSummary));
     }
     final List<CoreMessageRef> toolBatch = <CoreMessageRef>[];
-    // 待挂到"下一条 assistant 消息"上的思考。DeepSeek 要求 reasoning_content
-    // 与 content 同级挂在 assistant 消息上，而带工具调用的那条 assistant 消息是
-    // 这里现拼的（见 flushTools），所以必须先攒着、拼的时候一起挂出去。
+    // 本轮的正文段（0~多条）：**延后到"轮末"再落地**——"推理挂哪条消息"取决于本轮
+    // 有没有工具调用（见 flushRound），所以不能遇到正文就立刻发出去。
+    final List<CoreMessageRef> pendingText = <CoreMessageRef>[];
+    // 本轮的思考正文：挂到本轮的**那一条** assistant 消息上（有工具调用 → 带
+    // tool_calls 的那条；没有 → 正文那条）。DeepSeek 思考模式的硬要求见 flushRound。
     final List<String> pendingReasoning = <String>[];
 
-    Future<void> flushTools() async {
-      if (toolBatch.isEmpty) return;
-      final List<LlmToolCall> calls = <LlmToolCall>[];
-      final List<LlmMessage> results = <LlmMessage>[];
-      for (int i = 0; i < toolBatch.length; i++) {
-        final CoreMessageRef ref = toolBatch[i];
-        final String name = ref.toolName ?? 'unknown_tool';
-        final String callId =
-            (ref.toolCallId != null && ref.toolCallId!.isNotEmpty)
-            ? ref.toolCallId!
-            : 'tool_result_${context.sessionId}_${i}_${ref.timestamp}';
-        calls.add(
-          LlmToolCall(
-            id: callId,
-            name: name,
-            arguments: jsonEncode(
-              ref.toolArguments ?? const <String, dynamic>{},
-            ),
-          ),
-        );
-        results.add(
-          LlmMessage.toolResult(
-            // 上一轮中途中断时可能没有结果：补占位，避免 tool_calls 悬空
-            content: await gate.apply(
-              name,
-              ref.toolResult.isEmpty ? '(该工具调用未完成，没有结果)' : ref.toolResult,
-            ),
-            toolCallId: callId,
+    /// 一轮 = (思考*) (正文?) (工具卡*)，把这一轮落地成端点消息。
+    ///
+    /// **推理挂哪一条：实测依据**（`.self/plan/20261001-thinking-400-and-interrupt/recon.md`）：
+    /// - 带 tools 的请求**以 `tool` 结果收尾**时（= 工具循环的下一跳），前一条带
+    ///   `tool_calls` 的 assistant **必须带 `reasoning_content`**，否则 400
+    ///   （G1/G3 复现；G2/G4 带上就 200）；
+    /// - 请求**以没有 reasoning 的 assistant 收尾**同样 400（D6）。
+    /// 结论：有工具调用 → 推理挂"带 tool_calls 的那条"；没有 → 挂正文那条。
+    /// 两条都挂是重复，两条都不挂就 400。
+    Future<void> flushRound() async {
+      final bool roundHasTools = toolBatch.isNotEmpty;
+      final String reasoning = pendingReasoning.join('\n\n');
+      for (final CoreMessageRef ref in pendingText) {
+        // 空正文跳过（只有附件、没有正文的消息在 asUser 分支里已带上了路径段）
+        if (ref.content.trim().isEmpty) continue;
+        out.add(
+          LlmMessage.assistant(
+            ref.content,
+            // 本轮有工具调用时，推理属于下面那条 tool_calls 消息（不能两处都挂）
+            reasoningContent: roundHasTools ? '' : reasoning,
           ),
         );
       }
-      out.add(
-        LlmMessage(
-          role: LlmRole.assistant,
-          content: '',
-          toolCalls: calls,
-          reasoningContent: passBackReasoning
-              ? pendingReasoning.join('\n\n')
-              : '',
-        ),
-      );
-      // 思考只属于它所在的那一条 assistant 消息（已经挂出去了）
-      pendingReasoning.clear();
-      out.addAll(results);
+      pendingText.clear();
+      if (roundHasTools) {
+        final List<LlmToolCall> calls = <LlmToolCall>[];
+        final List<LlmMessage> results = <LlmMessage>[];
+        for (int i = 0; i < toolBatch.length; i++) {
+          final CoreMessageRef ref = toolBatch[i];
+          final String name = ref.toolName ?? 'unknown_tool';
+          final String callId =
+              (ref.toolCallId != null && ref.toolCallId!.isNotEmpty)
+              ? ref.toolCallId!
+              : 'tool_result_${context.sessionId}_${i}_${ref.timestamp}';
+          calls.add(
+            LlmToolCall(
+              id: callId,
+              name: name,
+              arguments: jsonEncode(
+                ref.toolArguments ?? const <String, dynamic>{},
+              ),
+            ),
+          );
+          results.add(
+            LlmMessage.toolResult(
+              // 上一轮中途中断时可能没有结果：补占位，避免 tool_calls 悬空
+              content: await gate.apply(
+                name,
+                ref.toolResult.isEmpty ? '(该工具调用未完成，没有结果)' : ref.toolResult,
+              ),
+              toolCallId: callId,
+            ),
+          );
+        }
+        out.add(
+          LlmMessage(
+            role: LlmRole.assistant,
+            content: '',
+            toolCalls: calls,
+            reasoningContent: reasoning,
+          ),
+        );
+        out.addAll(results);
+      }
       toolBatch.clear();
+      // 推理只属于它所在的那一轮（已经挂出去了）
+      pendingReasoning.clear();
     }
 
     // 已压缩的前缀不再翻译：它的内容已经由摘要代表，再发一遍等于没压缩
@@ -370,15 +394,23 @@ class LlmAgentEngine implements AgentEngine {
         toolBatch.add(ref);
         continue;
       }
-      await flushTools();
-      // 推理内容：默认不回灌（思考过程不是对话上下文）；开启"回传思考"时攒起来，
-      // 挂到紧随其后的那条 assistant 消息上（DeepSeek 带 tools 时的硬要求）。
+      // 推理内容：默认不回灌（思考过程不是对话上下文）；"回传思考"开启时攒起来，
+      // 由 flushRound 挂到本轮的 assistant 消息上（DeepSeek 思考模式的硬要求）。
       if (ref.isThinking) {
+        // 新的一拍思考 = 上一轮已经结束（本轮已有正文或工具卡时先落地）
+        if (pendingText.isNotEmpty || toolBatch.isNotEmpty) await flushRound();
         if (passBackReasoning && ref.content.trim().isNotEmpty) {
           pendingReasoning.add(ref.content.trim());
         }
         continue;
       }
+      // hook/系统提示（`kind == 'notice'`）按 **user** 发出，而不是 assistant：
+      // 它既不是模型说的话，也不该装成模型说的话；而且实测（recon.md）表明带 tools
+      // 的思考模式端点不允许请求**以"没有 reasoning_content 的 assistant 消息"收尾**，
+      // 而这类提示恰恰总是被追加到历史末尾（`wake`）——之前正是它导致连续 400。
+      final bool asUser = ref.isUser || ref.isNotice;
+      // 用户消息 / hook 提示之前先把上一轮的 assistant 段落落地（顺序不能变）
+      if (asUser) await flushRound();
       // 用户上传的附件：路径必须写进提示词（附件已由前端上传到工作空间），否则
       // 模型对"用户发了图/文件"这件事一无所知 —— 只有 UI 气泡上的一张卡片。
       // 附件说明段与压缩估算共用同一个纯函数，两处口径逐字一致。
@@ -388,52 +420,68 @@ class LlmAgentEngine implements AgentEngine {
       // 空内容跳过：**只有附件、没有正文**的消息不能算空——它带着附件路径，
       // 整条丢掉等于用户什么都没发（修复前的行为）。
       if (content.trim().isEmpty) continue;
-      // 图像附件的**像素**：`if_vision` 打开时先在端点上传拿到 file_id，再把
-      // 引用作为内容块挂在同一条 user 消息上（模型才真的"看得见"图）。解析失败
-      // 只是少一个块——正文里的路径说明段还在，模型仍知道去哪读。
-      final List<LlmContentPart> parts = ref.isUser
-          ? await _visionParts(vision, config, context.agentId, ref.attachments)
-          : const <LlmContentPart>[];
-      final String reasoning = passBackReasoning
-          ? pendingReasoning.join('\n\n')
-          : '';
-      pendingReasoning.clear();
-      // hook/系统提示（`kind == 'notice'`）按 **user** 发出，而不是 assistant：
-      // 它既不是模型说的话，也不该装成模型说的话；而且实测（recon.md）表明带 tools
-      // 的思考模式端点不允许请求**以"没有 reasoning_content 的 assistant 消息"收尾**，
-      // 而这类提示恰恰总是被追加到历史末尾（`wake`）——之前正是它导致连续 400。
-      final bool asUser = ref.isUser || ref.isNotice;
-      out.add(
-        asUser
-            ? LlmMessage(
-                role: LlmRole.user,
-                content: content,
-                contentParts: parts,
+      if (asUser) {
+        // 图像附件的**像素**：`if_vision` 打开时先在端点上传拿到 file_id，再把
+        // 引用作为内容块挂在同一条 user 消息上（模型才真的"看得见"图）。解析失败
+        // 只是少一个块——正文里的路径说明段还在，模型仍知道去哪读。
+        final List<LlmContentPart> parts = ref.isUser
+            ? await _visionParts(
+                vision,
+                config,
+                context.agentId,
+                ref.attachments,
               )
-            : LlmMessage.assistant(content, reasoningContent: reasoning),
-      );
+            : const <LlmContentPart>[];
+        out.add(
+          LlmMessage(role: LlmRole.user, content: content, contentParts: parts),
+        );
+        continue;
+      }
+      // 普通 assistant 正文段：并入本轮（工具卡之后又来正文 = 新的一轮）
+      if (toolBatch.isNotEmpty) await flushRound();
+      pendingText.add(ref);
     }
-    await flushTools();
+    await flushRound();
     _warnIfTrailingAssistant(out);
     return out;
   }
 
-  /// 组好的请求若**以没有 reasoning_content 的 assistant 消息收尾**，留一条日志。
+  /// 组好的请求若命中"思考模式必 400"的两种形态，留一条日志。
   ///
-  /// 为什么不直接改请求：这是"不该发生"的形态（正常情况下最后一条要么是用户消息，
-  /// 要么是带 reasoning 的 assistant 消息）。真发生了说明有别的路径往历史末尾塞了
-  /// assistant 消息——记下来比悄悄修掉更有助于定位（实测证据见 recon.md：
-  /// 带 tools 的思考模式端点对这种形态直接 400）。
+  /// 两种形态（实测见 recon.md）：
+  /// 1. **以没有 reasoning_content 的 assistant 消息收尾**（D6）；
+  /// 2. **以 `tool` 结果收尾**，而它前面那条带 `tool_calls` 的 assistant 没有
+  ///    reasoning_content（G1/G3，工具循环的下一跳就是这形态）。
+  ///
+  /// 为什么不直接改请求：这两种都"不该发生"。真发生了说明别处往历史里塞了
+  /// assistant 消息或丢了推理——记下来比悄悄修掉更有助于定位。
   void _warnIfTrailingAssistant(List<LlmMessage> messages) {
     if (messages.length < 2) return;
     final LlmMessage last = messages.last;
-    if (last.role != LlmRole.assistant) return;
-    if (last.reasoningContent.isNotEmpty) return;
-    log?.call(
-      '请求以没有 reasoning_content 的 assistant 消息收尾：'
-      '带 tools 的思考模式端点（如 DeepSeek）会返回 400。'
-      '请检查是否有"非用户消息被追加到历史末尾"的路径。',
-    );
+    if (last.role == LlmRole.assistant && last.reasoningContent.isEmpty) {
+      log?.call(
+        '请求以没有 reasoning_content 的 assistant 消息收尾：'
+        '带 tools 的思考模式端点（如 DeepSeek）会返回 400。'
+        '请检查是否有"非用户消息被追加到历史末尾"的路径。',
+      );
+      return;
+    }
+    if (last.role != LlmRole.tool) return;
+    // 最近的那条非 tool 消息就是这次工具调用的发起者
+    for (int i = messages.length - 2; i >= 0; i--) {
+      final LlmMessage m = messages[i];
+      if (m.role == LlmRole.tool) continue;
+      if (m.role == LlmRole.assistant &&
+          m.toolCalls.isNotEmpty &&
+          m.reasoningContent.isEmpty) {
+        log?.call(
+          '请求以 tool 结果收尾，但它前面那条带 tool_calls 的 assistant 没有 '
+          'reasoning_content：带 tools 的思考模式端点（如 DeepSeek）会返回 400。'
+          '本轮的思考正文必须挂在带 tool_calls 的那条消息上。',
+        );
+      }
+      return;
+    }
   }
 
   /// 把该条用户消息里的**图像附件**逐个解析成端点的 file 内容块。

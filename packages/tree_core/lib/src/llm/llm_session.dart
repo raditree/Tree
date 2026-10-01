@@ -153,6 +153,12 @@ class LlmSession {
         yield const AgentDone(cancelled: true);
         return;
       }
+      // 本轮的思考正文：必须原样挂回"带 tool_calls 的那条 assistant 消息"上。
+      // 实测（recon.md）：带 tools 的请求**以 `tool` 结果收尾**时（= 工具循环的
+      // 下一跳），前一条带 `tool_calls` 的 assistant 缺 `reasoning_content` 会 400
+      // `The reasoning_content in the thinking mode must be passed back to the API.`
+      // ——这不是用户开关能关掉的东西：端点刚把这段推理发回来，它属于那条消息。
+      final StringBuffer turnReasoning = StringBuffer();
       // 工具循环内压缩（Q1-③，照旧后端 llm.py:976-982 在每轮 API 调用前调
       // _compress_context）：长任务里上下文是一轮轮长起来的，只在生成前检查一次
       // 的话，任务跑到一半就已经超过 max_seqlen 了。
@@ -186,6 +192,7 @@ class LlmSession {
           text.write(event.text);
           yield AgentText(event.text);
         } else if (event is LlmThinkingDelta) {
+          turnReasoning.write(event.text);
           yield AgentThinking(event.text);
         } else if (event is LlmToolCallDelta) {
           drafts.putIfAbsent(event.index, _ToolCallDraft.new).accept(event);
@@ -285,12 +292,15 @@ class LlmSession {
         return;
       }
 
-      // 把"模型的工具调用意图"追加进上下文，再逐个执行并回灌结果
+      // 把"模型的工具调用意图"追加进上下文，再逐个执行并回灌结果。
+      // 思考正文一并带上（见 turnReasoning 的注释）：漏了它，下一跳请求就会以
+      // "tool 结果收尾 + 前一条 tool_calls 消息没有 reasoning"的形态被端点 400。
       inFlight.add(
         LlmMessage(
           role: LlmRole.assistant,
           content: text.toString(),
           toolCalls: calls,
+          reasoningContent: turnReasoning.toString(),
         ),
       );
       for (final LlmToolCall call in calls) {
