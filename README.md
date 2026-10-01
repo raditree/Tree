@@ -259,7 +259,15 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 
 核心支持的方法：**`station/command`**（执行站命令）、**`station/subscribe`** /
 **`station/unsubscribe`**（订阅 / 退订站点）、**`station/register`** /
-**`station/unregister`**（自建 / 注销站点）。先看 `station/command`：
+**`station/unregister`**（自建 / 注销站点）。
+
+> 写插件的完整教程（配置全字段、五个 RPC 的入参与回包、四类站语义、`ui/manifest`
+> 声明式布局、调试与自测、踩过的坑）在 **[`examples/plugins/README.md`](examples/plugins/README.md)**，
+> 并附一份**纯标准库的 Python 参考实现** `examples/plugins/sample_plugin.py`。
+> 应用内入口：**设置 → 插件开发 → 打开插件开发说明**（发行版打开的是应用目录下
+> `plugins/README.md`，与主程序同级）。下面只记协议要点。
+
+先看 `station/command`：
 
 ```jsonc
 // 插件 → 核心
@@ -274,6 +282,7 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 - **错误码**（JSON-RPC `error.code`）：`-32601` 未知方法 · `-32602` 参数非法 · `-32603` 处理器异常 · `-32001` scope 不满足。
 - **单实例 + 每条消息带身份（Q2）**：插件进程只有一个，身份按**这一次请求**解析——目标 agent 取请求里的 `agent_id`（缺省才回退到 `plugins.yaml` 的 `scope.agent_id`）；`team` / `mode` 由核心按**目标 agent 的真实归属**（团队 + `local|ssh` 工作面）解析，**不信任插件声明**。
 - **`plugins.yaml` 的 `scope` 是作用域上限**：声明了 `team` 的插件只能在自己 team 内活动（跨 team 回 `-32001`）；**不声明 scope 的插件可服务任意 team**（一个实例同时服务多队），但每条命令都要带 `agent_id` 且必须能证明归属（agent 不存在 / 归属解析不出 / 请求里带的 `team_id` 与真实归属不一致，一律 `-32001`）。不带 agent 的团队级命令（如 `ui.push`）只要求能确定 `team_id`。
+- **事件订阅与站点订阅对空 `team_id` 的口径不同**：事件派发里"某个键为空 = 该维度不设条件"（不声明 team 也照收事件）；而**站点订阅要求 team 非空**（站点隔离要四元组，fail-closed）——所以 agent 没有 team 的机器上，插件必须显式声明 `scope.team_id` 才能订阅中转站 / 广播站。
 - 命令执行前仍会按四元组做隔离校验，任一不符即**明确拒绝**（fail-closed，跨 scope 的命令不会打到别的工作空间）。
 
 **站点订阅 / 自建**（站点全局唯一，见上文「站点体系」）：

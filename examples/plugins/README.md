@@ -11,7 +11,7 @@
 | **中转站**：订阅后**每次工具调用的前/后各来一次**——核心把完整 tool_call 报文交过来，插件决定改什么（甚至不改） | `station/subscribe` + `station/request`（kind=relay） | `subscribe_station` / `_handle_station_request` 的 relay 分支 |
 | **自建站点**（`--self-station`）：插件自己建一个广播站并订阅它。站点全局唯一、**每个点位只有一个订阅者**，所以要按 team / agent 分流时，正解是插件自己建站分发（转发型订阅者） | `station/register` → `station/subscribe`（按 `station_id`） | `register_own_station` / `subscribe_station` |
 | **插件布局 A**：声明左侧活动栏面板 + 右栏 Tab（声明式控件集，**不跑 JS**） | `ui/manifest` / `ui/update` 通知 → `plugin_ui_manifest` / `plugin_ui_update` 帧 | `declare_panel` / `update_panel` / `_on_ui_action` |
-| **插件布局 B**：推一个 card 槽位帧到前端，显示当前计数与阈值 | `ui.push` → `plugin_ui_update` | `push_card` / `card_view` |
+| **插件布局 B**：推一个 card 槽位帧到前端，显示当前计数与阈值（⚠ `ui.push` 只发 update 帧、**不建槽位**：该 `card` 槽位必须先在 `ui/manifest` 里声明，详见第 8 节） | `ui.push` → `plugin_ui_update` | `push_card` / `card_view` |
 
 > 一句话语义：**核心不设工具轮次上限（Q8），限制交给插件做**——本插件就是那个
 > "监视轮次、超限发 `agent.stop`"的参考实现（默认阈值 200 次）。
@@ -46,10 +46,10 @@ plugins:
     env:                          # 额外环境变量（与父进程环境合并）
       SAMPLE_PLUGIN_TOOL_ROUND_LIMIT: "200"
     enabled: true                 # 单个插件开关
-    granularity: team             # 实例粒度：team / agent / session（展示口径）
-    scope:                        # 站点四元组：**空 = 通配，非空 = 精确匹配**
-      team_id: team-1
-      mode_key: local             # local | ssh（声明兜底；运行期以目标 agent 的工作面为准）
+    granularity: team             # 实例粒度：team / agent / session（订阅时声明的粒度）
+    scope:                        # 作用域上限（四元组）：**空键 = 不限定该维度**
+      team_id: team-1             # ⚠ 想订阅站点就必须非空；本机没有 team 时留空（见下方「常见坑」）
+      mode_key: local             # local | ssh（**一般不用填**：运行期由核心按目标 agent 的工作面解析）
 ```
 
 字段含义（与 `PluginConfig` 一一对应）：
@@ -63,19 +63,47 @@ plugins:
 | `args` | 字符串数组 | 启动参数；第 1 项 = 插件脚本的**绝对路径**，其余是插件自己的参数 |
 | `env` | 键值表 | 额外环境变量（与父进程环境合并），用于免改 args 调参 |
 | `enabled`（单插件） | true / false | 单个插件开关（关掉后不启动、工具下线） |
-| `granularity` | team / agent / session | 实例粒度（前端展示与订阅身份的默认口径） |
-| `scope.team_id` | 字符串 | **作用域上限（插件归属团队）**。为空 = 不限团队、可服务多队（执行站命令按每条命令的 `agent_id` 解析真实归属，见第 6 节） |
+| `granularity` | team / agent / session | **订阅时声明的粒度**（不再决定站点实例——站点全局各一个） |
+| `scope.team_id` | 字符串 | **作用域上限**。空 = 不限定团队（可服务多队；执行站命令按每条命令的 `agent_id` 解析真实归属，见第 6 节）。⚠ **但订阅站点必须非空**（见「常见坑」） |
 | `scope.agent_id` | 字符串，可空 | 声明更细的粒度：只收该 agent 的事件 / 只在该 agent 的工作面下命令 |
 | `scope.session_id` | 字符串，可空 | 再细一层（一般留空） |
-| `scope.mode_key` | local / ssh，可空 | 工作面声明（缺省 local）；运行期由核心按目标 agent 的 SSH 配置解析 |
+| `scope.mode_key` | local / ssh，可空 | **只作校验**：请求与订阅的 mode 一律由核心按目标 agent 的工作空间解析（local / ssh），声明与真实值冲突时报错，留空即可 |
 
 **scope 的匹配口径**（事件派发与站点投递一致，不发明新语法）：
-`scope` 里某个键**为空即通配**；非空则要求事件的同名字段**精确相等**。
-所以 `team_id: team-1` 的插件只收 team-1 的事件；`scope: {}` 的插件收全部事件。
+`scope` 里某个键**为空 = 不限定该维度**（不是"匹配空值"，而是"这一维不设条件"）；
+非空则要求事件的同名字段**精确相等**。所以 `team_id: team-1` 的插件只收 team-1
+的事件；`scope: {}` 的插件收全部事件。
 
-**开关方式**：当前手工改 `plugins.yaml`（改完重启核心生效）。将来可在**前端插件面板
-一键开/关**（内置插件与自定义插件同一分组，面板里能看到实例状态与健康度）；
-`enabled` 字段就是那个开关的落点，语义不会再变。
+**两个维度各自独立**（最常见的懵点）：
+
+| | 用在哪 | 空 `team_id` 时 |
+|---|---|---|
+| **事件派发 / 订阅**（`dispatch` / `dispatchAgentEvent`） | 插件收 `agent.tool_call` 这类事件 | 收全部 team 的事件（可用） |
+| **站点订阅**（`station/subscribe`：中转站 / 广播站） | 每次工具调用前后各一次拦截-回填等 | **被拒**：站点隔离要求四元组，fail-closed |
+
+### ⚠ 常见坑：没有 team 的机器上，订阅站点会失败
+
+"我的 agent 没有 team"（`agents/<id>.yaml` 的 `team_id` 为空）时，核心解析出的真实
+team 是空的，而站点订阅**要求 team 非空**：
+
+```
+插件 sample 订阅站点缺少 team：请在请求里带 scope.team_id，
+或在 plugins.yaml 声明 scope.team_id（站点隔离要求四元组，fail-closed）
+```
+
+**怎么办**（两选一）：
+
+1. 在 `plugins.yaml` 里声明 `scope: {team_id: <真实 team id>}`——注意它必须是**目标
+   agent 的真实归属**，核心会按 agent 解析后校验，声明一个不存在的 team 只会被拒；
+2. 先给 agent 定一个 team（`agents/<id>.yaml` 的 `team_id`），再把插件声明到同一个
+   team 上。
+
+也就是说：**事件订阅可以不声明 team，站点订阅不行**。示例插件默认**订阅中转站**，
+所以它的配置里必须有匹配的 `team_id`。
+
+**开关方式**（已经做好了，不必手改文件）：前端**插件面板**里每个插件（内置与自定义
+同一分组）各有自己的开关，改完立即热应用、失败时重启核心生效；面板同时显示实例状态
+与心跳健康度。`plugins.yaml` 的 `enabled` 就是那个开关的落点，也可以直接手改文件。
 
 ---
 
@@ -215,8 +243,9 @@ cmd /c "type %TEMP%\hello.jsonl | D:\app\python\python.exe E:\programs\Tree\desk
   核心按该 agent 的**真实归属**解析 team / mode，并在选站前做 fail-closed 校验
   （agent 不存在 / 归属解析不出 / 请求里带的 `team_id` 与真实归属不一致 ⇒ `-32001`，
   错误信息里能看到原因）。声明了 `team_id` 的插件仍只能在自己 team 内活动。
-- **没声明 `scope.team_id` 的插件不进站点订阅体系**：核心退回 `tools/list` 申报工具
-  （工具仍可用），也不收按 team 过滤的事件；但**执行站命令仍可用**（见上一条）。
+- **没声明 `scope.team_id` 的插件进不了站点订阅体系**：核心退回 `tools/list` 申报工具
+  （工具仍可用）、**事件照收**（`scope` 里没限定的维度不设条件），但 `station/subscribe`
+  会被 fail-closed 拒绝（原因与两条出路见第 1 节「常见坑」）。
   不带 `agent_id` 的团队级命令（`ui.push`）需要带 `team_id` 或在声明里给 team。
 - **stdout 只允许 JSON-RPC**：日志走 stderr；本插件把 stdout/stderr 都按 UTF-8 字节
   写，避免 Windows 上 Python 默认 ANSI 代码页（cp936）把中文写成非法 UTF-8。
@@ -233,3 +262,100 @@ cmd /c "type %TEMP%\hello.jsonl | D:\app\python\python.exe E:\programs\Tree\desk
   时长"设上限；本示例里那个 30s 只是让日志别永久挂住的兜底。
 - **核心退出时插件自行退出**：核心关闭会关掉插件的 stdin，脚本读到 EOF 即退出
   （不用额外的关闭协议；`shutdown` 通知也会退出）。
+
+---
+
+## 8. 协议速查（RPC 与站点）
+
+插件与核心之间只有 **stdio JSON-RPC 一帧一行**（`stdout` 是协议通道，日志走 `stderr`）。
+按"有没有 `id`"区分**请求/响应**与**通知**：通知（无 `id`）被转成前端 `plugin_event`，
+`ui/manifest` / `ui/update` 两个约定 method 例外（见下）。
+
+### 核心 → 插件（请求，插件必须**且只能**回一条响应）
+
+| method | 入参 | 回参 |
+|---|---|---|
+| `hello` | `{plugin_id, ...}` | `{plugin_id, name, capabilities}`（`capabilities` 例：`["tools","events","stations"]`） |
+| `tools/list` | — | `{tools: [{name, description, parameters, ...}]}`（未声明 team 的插件走这条） |
+| `tools/call` | `{name, arguments, agent_id?, session_id?}` | 工具结果；`agent_id` / `session_id` 是**调用点身份**，单实例插件据此做归属判断 |
+| `station/request` | 见下 | `{reply: {payload: {...}}}` |
+| `ping` | — | 任意合法响应（核心只判"这一拍有没有回"，不看内容）——插件连续多拍不回会被标 `degraded`，**不是停用** |
+
+`station/request` 的两种用途（同一个 method，按 `kind` 分）：
+
+- **收集站**（`kind=collect`）：核心按站点 schema 发请求，插件回**工具定义清单**。
+  收集站 `plugin.tool.define` 的 schema 形状 = `{tools: [{tool_name, description,
+  parameters, execution}, ...]}`（payload 根对象只允许 schema 声明的键）——一次申报
+  自己的全部工具，**每条**都覆盖「名称 / 描述 / 参数 schema / 执行方式」四项；
+- **中转站**（`kind=relay`）：**每次工具调用前/后各一次**，核心把完整 tool_call
+  报文交过来，插件**决定改什么、或什么都不改**——回填支持 string / 对象 / 数组
+  （整体替换）；不接 / 无订阅者 / 不回 / 回包非法一律 **fail-open 放行原始报文**。
+
+### 插件 → 核心（请求，五个方法）
+
+| method | 入参 | 回参 |
+|---|---|---|
+| `station/command` | `{command, arguments, team_id?, agent_id?, session_id?}` | `{ok, ...}` 或 `{ok: false, error}` |
+| `station/subscribe` | `{station: relay\|broadcast \| station_id, scope?, replace?}` | `{ok, station_id, kind, scope, replaced, error}` |
+| `station/unsubscribe` | `{station \| station_id}` | `{ok, station_id, kind, removed, error}` |
+| `station/register` | `{kind, name, schema?, description?, max_subscriptions?}` | `{ok, station_id, kind, error}` |
+| `station/unregister` | `{station_id}` 或 `{kind, name}` | `{ok, station_id, removed_subscriptions, error, notice?}` |
+
+**业务规则拒绝是"结果"不是"协议错误"**：站点被占 / schema 为空 / 越权注销一律回
+`ok: false` + 可读 `error`（插件必须能读懂）；只有参数形状错才抛 JSON-RPC 错误。
+
+执行站首命令集（`station/command` 的 `command` 取值，白名单）：
+
+| command | 作用 |
+|---|---|
+| `fs.read` / `fs.write` / `fs.list` / `fs.grep` | 在目标 agent 的工作空间里操作文件 |
+| `terminal.exec` | 跑一条命令（软超时走 hook，不是静态超时） |
+| `agent.message` / `agent.stop` / `agent.compact` | 给 agent 发消息 / 停当前生成 / 触发压缩 |
+| `ui.push` | 推一个 **card** 槽位帧到前端（`{slot_key, view}`；`view` 为 null = 注销） |
+
+### 自建站点（`station/register`）的四条硬规则
+
+1. **id 由核心拼**：`plugin.<你的插件id>.<kind>.<name>`——插件不能自选 id，
+   "我的站点只能是我的"靠这个前缀结构性保证（越权注销会被拒）；
+2. **`name` 只允许 `[A-Za-z0-9_-]`**：`.` 会让归属前缀产生歧义（插件 `a` 建
+   `b.relay.x` 就能顶掉插件 `a.b` 的站点）；
+3. **执行站不能自建**（它由插件主动下命令，没有订阅消费方）；**收集站必须带非空
+   `schema`**（输入格式由站点定义）；
+4. **同名重复注册 = 幂等回既有站点**（插件重启后会再注册一遍，不能报错、更不能覆盖
+   已积累的订阅与计数）；**插件下线不会自动注销自建站**——站点是持久化资源，
+   不想要了要显式 `station/unregister`。
+
+### 站点体系的四条语义（M9 §3）
+
+- **四类站：广播 / 执行 / 中转 / 收集**，每类**全局只有一个实例**（不再按 team /
+  mode 复制），id 是类型常量：`system.broadcast` / `system.execute` /
+  `system.relay` / `plugin.tool.define`；
+- **team / agent / session / mode 是"每次交互携带的信封"**，不是站点维度：单实例
+  插件在每条消息上带身份，核心按目标 agent 的真实归属解析并做 fail-closed 校验；
+- **每个点位只能有一个订阅者**（中转站尤其）：先到先得，接管要显式 `replace: true`。
+  要按 team / agent 分开处理，正解是**自己建站再分发**（转发型订阅者）——见
+  `--self-station` 的演示；
+- **收集站由核心代订阅**：装了插件就刷新工具表，插件不自己订收集站。
+
+### 插件面板（Q12 声明式布局）
+
+**不做 webview / 不执行插件 JS**：视图只能是受限控件集的 JSON（`text` / `list` /
+`table` / `form` / `progress` / `actions` 与 `row` / `column` 容器），未知控件前端
+渲染成「不支持的控件」占位。
+
+| 通知 method | 转成的 WS 帧 | 语义 |
+|---|---|---|
+| `ui/manifest` | `plugin_ui_manifest` | **完整声明**该插件的全部槽位（`[{slot_key, slot, title?, icon?, order?, view}]`；`slot` ∈ `activity` / `panel` / `status` / `card`） |
+| `ui/update` | `plugin_ui_update` | 按 `slot_key` **整块替换**某槽位视图（`view: null` = 注销） |
+
+- `plugin_id` / `team_id` **一律由核心按实例与 `plugins.yaml` 声明填充**，插件自述的
+  这两个字段不被采信（防越权）；槽位数（默认 16）与单槽位视图体积（64KB）有上限，
+  非法声明**整帧拒绝**并记可读原因；
+- **槽位的 `team_id` 为空 = 不限定归属**（任何 team 下都呈现），非空 = 只呈现给该 team；
+- **`ui.push` 只发 update 帧、不创建槽位**：前端只在 `ui/manifest` 里建立槽位，
+  对不存在的槽位 `applyUpdate` 会**故意忽略**（防越权旁路）。所以想推 card 卡片，
+  必须先在 `ui/manifest` 里声明那个 `card` 槽位；
+- **面板补发**：声明只在插件启动时发一次，所以核心会缓存每个插件最后一个生效的
+  UI 帧，前端刷新 / 重连 / 启动晚于插件时由核心**只补发给那条新连接**——插件不需要
+  （也不应该）用定时器反复重发声明。
+
