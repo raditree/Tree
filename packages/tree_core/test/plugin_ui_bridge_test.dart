@@ -228,4 +228,158 @@ void main() {
     )!;
     expect(PluginUiManifest.fromFrame(frame)!.teamId, 'team-1');
   });
+
+  // ══════════════════════════════════════════════════════════════════════
+  // 当前态缓存（前端刷新 / 重连 / 启动竞态错过声明时的重放来源）
+  // ══════════════════════════════════════════════════════════════════════
+  group('PluginUiCache：重放的是"当前态"', () {
+    /// 造一条"桥已放行"的 manifest 帧（走真桥，不手搓帧形状）。
+    Map<String, dynamic> manifestFrame(
+      PluginUiBridge bridge,
+      String pluginId, {
+      String teamId = 'team-1',
+    }) =>
+        bridge.frameFor(
+          pluginId: pluginId,
+          declaredTeamId: teamId,
+          method: 'ui/manifest',
+          params: paramsFor(<Map<String, dynamic>>[slotJson()]),
+        )!;
+
+    /// 造一条"桥已放行"的 update 帧。
+    Map<String, dynamic> updateFrame(
+      PluginUiBridge bridge,
+      String pluginId, {
+      String teamId = 'team-1',
+      String slotKey = 'demo.panel.1',
+      Object? view = const <String, dynamic>{'type': 'text', 'text': 'v2'},
+    }) =>
+        bridge.frameFor(
+          pluginId: pluginId,
+          declaredTeamId: teamId,
+          method: 'ui/update',
+          params: <String, dynamic>{
+            'slot_key': slotKey,
+            'view': view,
+            'team_id': teamId,
+          },
+        )!;
+
+    test('无缓存 ⇒ 无重放', () {
+      expect(PluginUiCache().frames(), isEmpty);
+    });
+
+    test('重放顺序：manifest 先于 update（前端要求槽位先存在）', () {
+      final PluginUiBridge bridge = PluginUiBridge();
+      final PluginUiCache cache = PluginUiCache();
+      // 故意先记 update 再记 manifest：重放顺序必须由**帧类型**决定，不是到达顺序
+      cache.record(updateFrame(bridge, 'demo'));
+      cache.record(manifestFrame(bridge, 'demo'));
+
+      final List<Map<String, dynamic>> frames = cache.frames();
+      expect(
+        frames.map((Map<String, dynamic> f) => f['type']),
+        <String>[PluginUiFrameType.manifest, PluginUiFrameType.update],
+      );
+    });
+
+    test('同类型只留最后一个（重放的是当前态，不是历史）', () {
+      final PluginUiBridge bridge = PluginUiBridge();
+      final PluginUiCache cache = PluginUiCache();
+      cache.record(manifestFrame(bridge, 'demo'));
+      cache.record(updateFrame(bridge, 'demo', view: const <String, dynamic>{
+        'type': 'text',
+        'text': '第一次',
+      }));
+      cache.record(updateFrame(bridge, 'demo', view: const <String, dynamic>{
+        'type': 'text',
+        'text': '第二次',
+      }));
+
+      final List<Map<String, dynamic>> frames = cache.frames();
+      expect(frames, hasLength(2), reason: '一个 manifest + 一个 update，不堆历史');
+      final PluginUiUpdate update =
+          PluginUiUpdate.fromFrame(frames[1])!;
+      expect((update.view!.toJson() as Map<String, dynamic>)['text'], '第二次');
+    });
+
+    test('多插件按 plugin_id 字典序（顺序确定，不随登记顺序抖动）', () {
+      final PluginUiBridge bridge = PluginUiBridge();
+      final PluginUiCache cache = PluginUiCache();
+      cache.record(manifestFrame(bridge, 'zeta'));
+      cache.record(manifestFrame(bridge, 'alpha'));
+      expect(
+        cache.frames().map((Map<String, dynamic> f) =>
+            PluginUiManifest.fromFrame(f)!.pluginId),
+        <String>['alpha', 'zeta'],
+      );
+      expect(cache.pluginIds(), <String>['alpha', 'zeta']);
+    });
+
+    test('归属 team 变了 ⇒ 旧帧作废（不重放上一次声明的陈旧归属）', () {
+      final PluginUiBridge bridge = PluginUiBridge();
+      final PluginUiCache cache = PluginUiCache();
+      cache.record(manifestFrame(bridge, 'demo', teamId: 'team-1'));
+      cache.record(updateFrame(bridge, 'demo', teamId: 'team-1'));
+      // 插件改配到 team-2 后重新声明
+      cache.record(manifestFrame(bridge, 'demo', teamId: 'team-2'));
+
+      final List<Map<String, dynamic>> frames = cache.frames();
+      expect(frames, hasLength(1), reason: '旧 team 的 update 必须一起作废');
+      expect(PluginUiManifest.fromFrame(frames.single)!.teamId, 'team-2');
+    });
+
+    test('remove：插件下线后不再重放（前端可能正断线，收不到 destroyed）', () {
+      final PluginUiBridge bridge = PluginUiBridge();
+      final PluginUiCache cache = PluginUiCache();
+      cache.record(manifestFrame(bridge, 'demo'));
+      cache.record(manifestFrame(bridge, 'other'));
+      cache.remove('demo');
+      expect(cache.pluginIds(), <String>['other']);
+      cache.clear();
+      expect(cache.frames(), isEmpty);
+    });
+
+    test('非 UI 帧 / 畸形帧一律不进缓存（不成为绕过桥校验的旁路）', () {
+      final PluginUiCache cache = PluginUiCache();
+      cache.record(<String, dynamic>{
+        'type': 'plugin_event',
+        'data': <String, dynamic>{'plugin_id': 'demo'},
+      });
+      cache.record(<String, dynamic>{'type': PluginUiFrameType.manifest});
+      cache.record(<String, dynamic>{
+        'type': PluginUiFrameType.manifest,
+        'data': <String, dynamic>{'team_id': 'team-1'}, // 缺 plugin_id
+      });
+      cache.record(<String, dynamic>{'data': <String, dynamic>{'plugin_id': 'x'}});
+      expect(cache.frames(), isEmpty);
+      expect(cache.pluginIds(), isEmpty);
+    });
+
+    // 真机踩过的坑：`plugin_status` / `plugin_event` 不带 team_id，若让它们参与
+    // "归属是否变了"的判定，就会被当成"归属变成空"而把刚存下的声明整条作废
+    // ——缓存永远是空的，重放永远没内容。
+    test('非 UI 帧不得清掉已缓存的声明（plugin_status 不带 team_id）', () {
+      final PluginUiBridge bridge = PluginUiBridge();
+      final PluginUiCache cache = PluginUiCache();
+      cache.record(manifestFrame(bridge, 'demo', teamId: 'team-1'));
+      cache.record(<String, dynamic>{
+        'type': 'plugin_status',
+        'data': <String, dynamic>{'plugin_id': 'demo', 'status': 'registered'},
+      });
+      cache.record(<String, dynamic>{
+        'type': 'plugin_event',
+        'data': <String, dynamic>{'plugin_id': 'demo', 'method': 'log'},
+      });
+      expect(
+        cache.frames(),
+        hasLength(1),
+        reason: '非 UI 帧必须被帧类型挡在归属判定之外',
+      );
+      expect(
+        PluginUiManifest.fromFrame(cache.frames().single)!.teamId,
+        'team-1',
+      );
+    });
+  });
 }

@@ -70,7 +70,27 @@ class PluginBus {
            ) {
     // 活性探针：站点等回包时用它判「订阅者心跳还在不在」。
     this.stations.livenessProbe = _livenessOf;
+    // **所有**前端下行帧（含执行站 ui.push 的 card 槽位）都在这里过一遍再广播，
+    // 缓存因此自动收全，不需要每个发射点各自记得记一笔。
+    if (broadcast != null) {
+      final void Function(Map<String, dynamic> frame) sink = broadcast!;
+      _outbound = (Map<String, dynamic> frame) {
+        uiCache.record(frame); // 非 UI 帧由 record 自行忽略
+        sink(frame);
+      };
+      this.stations.frameSink = _outbound;
+    }
   }
+
+  /// 包了缓存记一笔的广播出口（[broadcast] 为空时也是空）。
+  void Function(Map<String, dynamic> frame)? _outbound;
+
+  /// 前端下行帧的实际出口（[broadcast] 的包装；见构造器）。
+  ///
+  /// 放在唯一的出口处（而不是每个发射点）是刻意的：发射点会随功能增加，漏一个就
+  /// 等于"那个面板重连后回不来"，而出口只有一个。
+  void Function(Map<String, dynamic> frame)? get outbound =>
+      _outbound ?? broadcast;
 
   final String configFile;
 
@@ -100,6 +120,12 @@ class PluginBus {
   ///
   /// 可注入只为测试换阈值（槽位上限 / 视图字节上限），生产用默认即可。
   final PluginUiBridge uiBridge;
+
+  /// 插件 UI 帧的当前态缓存（**前端后连 / 重连时的重放来源**；见 [PluginUiCache]）。
+  ///
+  /// 插件只在启动时声明一次槽位，而广播是"当下有谁在听就发给谁"：没有这份缓存，
+  /// 前端刷新 / 重连 / 启动竞态错过的槽位就**永远回不来**（要等插件进程重启）。
+  final PluginUiCache uiCache = PluginUiCache();
 
   /// 插件配置 → 站点四元组的**运行期接线点**（M9 Wave 3-I）。
   ///
@@ -388,7 +414,7 @@ class PluginBus {
     bool? degraded,
   }) {
     final PluginHost? host = _hosts[config.id];
-    broadcast?.call(<String, dynamic>{
+    outbound?.call(<String, dynamic>{
       'type': 'plugin_status',
       'data': <String, dynamic>{
         'plugin_id': config.id,
@@ -434,13 +460,15 @@ class PluginBus {
         onRejected: (String reason) => log?.call('插件 $pluginId 的 UI 声明被拒：$reason'),
       );
       if (frame != null) {
-        broadcast?.call(frame);
+        // 出口自带缓存记录（见构造器里的 _outbound）：重连时按缓存重放，
+        // 「前端后连」也能拿到同一份当前态
+        outbound?.call(frame);
         return;
       }
       // 非法声明已经记过可读原因，**不再**降级成 plugin_event（避免前端收到半成品）
       return;
     }
-    broadcast?.call(<String, dynamic>{
+    outbound?.call(<String, dynamic>{
       'type': 'plugin_event',
       'data': <String, dynamic>{
         'plugin_id': pluginId,
@@ -2274,6 +2302,9 @@ class PluginBus {
     _spawnedConfigs.remove(pluginId);
     _queueDepth[pluginId] = 0;
     _degraded.remove(pluginId);
+    // **UI 缓存一并作废**：插件下线后它的槽位不该再被重放给新连接（前端收不到
+    // plugin_status 时尤其重要——例如核心重启、或前端当时正断线）
+    uiCache.remove(pluginId);
     // **插件下线由总线注销其订阅**（站点订阅关系随之落盘）
     stations.unsubscribePlugin(pluginId);
     // 动态工具表：下线插件的定义一并移除（避免调用到不存在的插件）

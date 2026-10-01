@@ -112,7 +112,10 @@ class StationHub {
   final void Function(String message)? log;
 
   /// 前端下行帧出口（**主 WS 广播**；ui.push 复用 card 槽位帧）。
-  final void Function(Map<String, dynamic> frame)? frameSink;
+  ///
+  /// 非 final：[PluginBus] 构造后要把它换成"包了 UI 帧缓存"的那一层出口
+  /// （见 `PluginBus._outbound`），否则前端重连时卡片槽位回不来。
+  void Function(Map<String, dynamic> frame)? frameSink;
 
   /// 心跳间隔 I（默认 10s；测试可缩参）。
   final Duration heartbeatInterval;

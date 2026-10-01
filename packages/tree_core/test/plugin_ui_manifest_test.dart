@@ -114,6 +114,25 @@ void main() {
       isNotNull,
       reason: '插件上线后的 log 通知照旧转 plugin_event',
     );
+
+    // **当前态缓存**（前端刷新 / 重连 / 启动竞态错过的重放来源）：真插件的真声明
+    // 必须在广播的同时进缓存，且重放的就是同一份槽位。
+    expect(
+      started.bus.uiCache.pluginIds(),
+      contains('demo'),
+      reason: '广播出去的真声明必须同时入缓存，否则前端后连就永远拿不到面板',
+    );
+    final PluginUiManifest replayed = PluginUiManifest.fromFrame(
+      started.bus.uiCache.frames().firstWhere(
+            (Map<String, dynamic> f) => f['type'] == PluginUiFrameType.manifest,
+          ),
+    )!;
+    expect(replayed.slots.map((PluginUiSlot s) => s.slotKey),
+        manifest.slots.map((PluginUiSlot s) => s.slotKey));
+
+    // 插件下线 ⇒ 缓存作废（新连接不该再收到已下线插件的槽位）
+    await started.bus.close();
+    expect(started.bus.uiCache.frames(), isEmpty);
   });
 
   test('插件冒用别的 plugin_id 声明槽位 ⇒ 该条被跳过（归属不可自述）', () async {

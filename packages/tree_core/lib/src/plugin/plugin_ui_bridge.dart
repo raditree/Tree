@@ -227,3 +227,106 @@ class PluginUiBridge {
     return '槽位 ${slot.slotKey} 的声明体积 $bytes 字节超过上限 $maxViewBytes（已跳过）';
   }
 }
+
+/// **插件 UI 帧的当前态缓存**（补上「前端后连」这一环）。
+///
+/// 为什么需要：插件的槽位声明是**一次性**的——`ui/manifest` 只在插件 `hello`
+/// 之后发一次（见示例插件 `_do_startup`），而 [PluginBus] 的广播是"当下有谁在听
+/// 就发给谁"。于是下面这些时序都会让面板**永久消失**，直到插件进程重启：
+///
+/// - 前端刷新 / 重连（注册表是内存态，重连后是空的）；
+/// - 插件比前端先就绪（启动竞态：声明发出去时还没有 WS 连接）；
+/// - 前端断线期间插件重启（连 `plugin_status` 都错过了）。
+///
+/// 做法：把每个插件**最后一个生效**的帧按帧类型存下来（manifest 帧、update 帧），
+/// 新连接注册时由核心逐条重放（见 `CoreServer._handleWebSocket`）。前端注册表对
+/// 同内容的重放是幂等的（整块覆盖 + 无变化不通知），因此重放不产生副作用。
+///
+/// **只在缓存里存"桥已经放行"的帧**：越权 / 非法声明连缓存都进不去，重放不会成为
+/// 绕过 [PluginUiBridge] 校验的旁路。
+class PluginUiCache {
+  /// plugin_id → 该插件最后一个生效的帧（按帧类型）。
+  final Map<String, _PluginUiCacheEntry> _byPlugin =
+      <String, _PluginUiCacheEntry>{};
+
+  /// 本缓存只认这两类帧（[PluginUiFrameType.manifest] / [PluginUiFrameType.update]）。
+  ///
+  /// **必须先按帧类型挡在外面**，不能让别的帧参与后面的归属判定：`plugin_status` /
+  /// `plugin_event` 根本不带 `team_id`（读出来是空串），一旦被当成"归属变成空"就会
+  /// 把刚存下的声明整条作废——真机表现是缓存永远为空、重放永远没有内容。
+  static const Set<String> frameTypes = <String>{
+    PluginUiFrameType.manifest,
+    PluginUiFrameType.update,
+  };
+
+  /// 记下一条**已生效**的 UI 帧（未生效的帧不要传进来）。
+  ///
+  /// 新帧的 `team_id` 与旧的不同 ⇒ 旧帧全部作废：归属变了，旧 team 的槽位不该被
+  /// 一起重放（否则前端会拿到"上一次声明"的陈旧归属）。
+  void record(Map<String, dynamic> frame) {
+    final Object? type = frame['type'];
+    if (type is! String || !frameTypes.contains(type)) return;
+    final Object? data = frame['data'];
+    if (data is! Map) return;
+    final String pluginId = (data['plugin_id'] ?? '').toString();
+    if (pluginId.isEmpty) return;
+    final String teamId = (data['team_id'] ?? '').toString();
+    final _PluginUiCacheEntry entry = _byPlugin.putIfAbsent(
+      pluginId,
+      () => _PluginUiCacheEntry(teamId: teamId),
+    );
+    if (entry.teamId != teamId) entry.reset(teamId);
+    entry.frames[type] = Map<String, dynamic>.from(frame);
+  }
+
+  /// 要重放给**新连接**的帧：按插件 id 字典序（顺序确定），每个插件
+  /// **先 manifest 后 update**（前端要求槽位先存在才认 update，见
+  /// `PluginUiRegistry.applyUpdate`）。
+  List<Map<String, dynamic>> frames() {
+    final List<String> pluginIds = _byPlugin.keys.toList()..sort();
+    final List<Map<String, dynamic>> out = <Map<String, dynamic>>[];
+    for (final String pluginId in pluginIds) {
+      final Map<String, Map<String, dynamic>> frames = _byPlugin[pluginId]!.frames;
+      for (final String type in <String>[
+        PluginUiFrameType.manifest,
+        PluginUiFrameType.update,
+      ]) {
+        final Map<String, dynamic>? frame = frames[type];
+        if (frame != null) out.add(frame);
+      }
+    }
+    return out;
+  }
+
+  /// 当前有缓存槽位状态的插件 id（诊断 / 测试用）。
+  List<String> pluginIds() => _byPlugin.keys.toList()..sort();
+
+  /// 丢弃某插件的全部缓存（插件下线 / 卸载）。
+  ///
+  /// 同时丢弃 update 帧很关键：卡片槽位靠 `ui.push`（update 帧）刷新，若只丢
+  /// manifest，重放时会得到"该插件当前态为空"的错误结论。
+  void remove(String pluginId) {
+    _byPlugin.remove(pluginId);
+  }
+
+  /// 清空（测试复位 / 核心关闭）。
+  void clear() => _byPlugin.clear();
+}
+
+/// 单个插件的缓存条目：归属 team + 按帧类型保存的最后一个生效帧。
+class _PluginUiCacheEntry {
+  _PluginUiCacheEntry({required this.teamId});
+
+  /// 当前归属 team（帧类型之外单独记，便于判定归属是否变了）。
+  String teamId;
+
+  /// 帧类型 → 最后一个生效帧。
+  final Map<String, Map<String, dynamic>> frames =
+      <String, Map<String, dynamic>>{};
+
+  /// 归属变更：旧帧作废并接受新归属。
+  void reset(String teamId) {
+    frames.clear();
+    this.teamId = teamId;
+  }
+}

@@ -699,6 +699,11 @@ class CoreServer {
       onError: (Object _) => hub.unregister(connection.id),
       cancelOnError: true,
     );
+    // **插件面板补发**：插件的槽位声明是"启动时发一次"的，前端刷新 / 重连 / 启动
+    // 竞态错过就再也拿不到（注册表是内存态）。核心缓存了每个插件最后一个生效的 UI
+    // 帧（PluginBus.uiCache），这里在连接就绪后只发给**这一条新连接**：重放是幂等
+    // 的（前端整块覆盖），但绝不能广播——否则每次有人重连都会给其他连接重刷一遍。
+    _replayPluginUi(connection);
   }
 
   /// 建连接：核心默认用带活性观测的 [LivenessWsConnection]（M9 1.1）；
@@ -707,6 +712,18 @@ class CoreServer {
     final WsHub registry = hub;
     if (registry is LivenessWsHub) return registry.createConnection(socket);
     return WsConnection(socket: socket);
+  }
+
+  /// 把已缓存插件 UI 帧重放给**刚注册的那一条连接**。
+  ///
+  /// 只发新连接，不走 [WsHub.broadcast]：重放对前端是幂等的，但广播会让每次重连
+  /// 都扰动其他已经正确的连接。未接 [pluginBus]（或插件系统关闭）时什么都不做。
+  void _replayPluginUi(WsConnection connection) {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) return;
+    for (final Map<String, dynamic> frame in bus.uiCache.frames()) {
+      connection.send(frame);
+    }
   }
 
   void _handleWsFrame(WsConnection connection, dynamic data) {

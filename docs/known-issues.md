@@ -285,3 +285,49 @@ desktop 移植时只搬了解析（显示思考卡片），**没搬回写**：�
   （错误信息现在会指明原因），不再是总结侧的独立口径。
 - `CoreModelConfig.thinking`（模型 yaml 的 `thinking: true`）目前**没有任何请求路径消费**
   （只解析与落盘）——将来若要单独给总结关思考，这是现成的开关位。
+
+---
+
+## #5 插件面板「切到 agent 就没了 / 刷新就回不来」
+
+**状态**：已修复（2026-10-01；前端 team 过滤 + 核心态缓存重放；前端 170 通过、核心 719 通过）
+**影响**：Q12 插件布局在真机上**实际不可用**——插件声明了槽位也看不到面板；能看到的窗口只有"应用刚起来、还没选任何 agent"那一段。
+
+### 现象（用户实测）
+
+> 一开始有的，但我切到 tree 后好像就没了（我不确定是发消息前就没了还是发消息后没了）
+
+补充：刷新 / 重连 GUI 后也不会回来（要等插件进程重启）。
+
+### 根因 1：空 `team_id` 被当成"只属于未选 team"
+
+槽位的 team 归属有两条来源，前端把它们当成了同一个东西：
+
+| | 值 | 来源 |
+| --- | --- | --- |
+| 插件声明的 team | **空串** | `plugins.yaml` 的 `scope`（示例插件与默认配置都是空映射） |
+| 当前 team | **非空** | `Agent.teamScopeId`：agent 自身 `team_id` 为空时**回退到 agent 自身 id**（`lib/ui/models/agent.dart:66`） |
+
+`PluginUiRegistry._visible` 原是精确相等：`slot.teamId == _teamId`。于是"空 = 不限定归属"的槽位被拿去和"具体 team"比相等 ⇒ 永不匹配。选 agent 之前 `_teamId` 是空串、恰好相等 ⇒ 看得见；一连上 agent（`main_page.dart` 的 `_setTeamScope(targetAgent.teamScopeId)`）⇒ 全部滤掉。
+**即：没在 `plugins.yaml` 里声明 `scope.team_id` 的插件面板永远不呈现。**
+
+**修复**：空 `team_id` 与插件配置同义 = **不限定归属** ⇒ 任何 team 下都呈现（`slot.teamId.isEmpty || slot.teamId == _teamId`）；限定 team 的槽位仍要求精确匹配，跨 team 隔离不变。
+
+### 根因 2：声明只发一次，核心不缓存
+
+`ui/manifest` 只在插件 `hello` 之后发一次（示例插件 `_do_startup`），而 `PluginBus` 的广播是"当下有谁在听就发给谁"；前端 `PluginUiRegistry` 是内存态。所以下面三种时序都会让面板**永久消失**（直到插件进程重启）：前端刷新 / 重连；插件比前端先就绪（启动竞态）；前端断线期间插件重启。
+
+**修复**：核心缓存每个插件**最后一个生效**的 UI 帧（`PluginUiCache`，挂在 `PluginBus` 的**唯一广播出口**上——这样执行站 `ui.push` 的卡片也自动入缓存），新连接注册时**只重放给那一条连接**（`CoreServer._replayPluginUi`，不广播：否则每次有人重连都会让所有连接重刷面板）；插件下线（`_disconnect`）即作废缓存。
+
+### 修复途中踩到的坑（已由测试钉住）
+
+`PluginUiCache.record` 最初按"帧里读到的 team_id"判归属是否变化。`plugin_status` / `plugin_event` **不带** `team_id` ⇒ 被当成"归属变成空" ⇒ 把刚存下的 manifest 整条作废 ⇒ 缓存永远是空的、重放永远没内容（真机表现与修复前一样）。现在**先按帧类型挡在外面**，非 UI 帧不参与归属判定。
+
+### 验证
+
+- `test/plugin_ui_registry_test.dart`：新增真机回归（空 scope 插件的 activity/panel 槽位在 `agent 回退 id` 作 team 作用域时可见、跨 team 切换仍可见、而限定 `t2` 的槽位在 `team-2` 下仍隐藏）。
+- `test/plugin_ui_bridge_test.dart`：缓存 8 例（重放顺序 manifest 先于 update、同类型只留最后一个、多插件字典序、归属变化作废、下线作废、非 UI 帧不得清缓存）。
+- `test/plugin_ui_replay_test.dart`（新）：真插件 → 真核心 → 真 WS——后连客户端收到补发的 `plugin_ui_manifest` 且**既有连接一帧都不多收**；插件下线后新连接不再收到该插件槽位。
+- 全量：`tree_core` 719 通过 / 1 跳过，前端 170 通过，`tree_protocol` 29 通过，三处 analyze 零 issue。
+  （`-j 4` 并发跑时 `message_interrupt_test` / `questions_api_test` 各有 1 例假失败，单独跑与默认并发全量均通过——属并发压测下的既知抖动，非本次改动引入。）
+
