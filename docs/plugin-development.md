@@ -153,9 +153,15 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 // ③ 只写类型：中转站 = **一次订「工具调用前」+「工具调用后」两个点位**
 {"station": "relay", "scope": {}}
 
-// ④ 广播站通用主题
+// ④ 广播站通用主题（**不带 point 只订通用主题**，与 relay 的糖不对称；
+//    要收"每次工具调用"的广播就订 tool.pre / tool.post 两次）
 {"station": "broadcast", "scope": {"team_id": "agt_123"}}
+{"station": "broadcast", "point": "tool.post", "scope": {}}
 ```
+
+**部分成功要看逐条结果**：一次订阅多个点位时 `ok` 只在**全部成功**时为 true，`error` 是
+拼接串、`replaced` 是逗号拼接——"到底哪个点位没订上"只能读 `subscriptions[]`（每条含
+`station_id` / `ok` / `replaced` / `error`）。只看 `ok` 会把"一半订上"误判成"全没订上"。
 
 回包（③ 会返回两条订阅的逐项结果）：
 
@@ -225,6 +231,10 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `String` / `Map` / `List` | **整体替换**原数据（具体形状见点位表） |
 | 其它类型 | 判为非法：放宽原数据并记可读原因（fail-open，不会让你搞崩一轮生成） |
 
+> **`null` 与"空集合"不是一回事**：`reply: {payload: null}` = "我不改"（fail-open 走默认）；
+> `[]` / `""` 是**真的把数据换成了空**——在 `llm.handle` 上会解码出"零个事件"，
+> 核心只能判"回包认不出"从而不接管（还多一次往返）。要"不接管/不改动"，请回 `null`。
+
 **fail-open 红线**（全部对插件友好）：无订阅者 ⇒ 核心零等待走默认路径；你没回 /
 心跳丢失 / 回包非法 / 抛异常 ⇒ 一律回退默认路径并记日志。**你永远不会阻塞核心的
 主流程**——但"你慢了"就是"生成慢了"，见 §5.6。
@@ -239,7 +249,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 |---|---|---|
 | `system.relay.tool.pre` | `point`, `phase:"pre"`, `origin`（`agent`/`plugin`）, `source_plugin_id?`, `tool`, `call_id`, `round`, `arguments` | 改后的整条报文（改 `arguments` 即生效）或 `null` |
 | `system.relay.tool.post` | 同上 + `result`, `is_error` | 改后的报文（改 `result` / `is_error`）或**字符串**（只换结果文本） |
-| `system.relay.llm.handle` | `request:{model, messages, tools, max_tokens, temperature, reasoning_effort, stream}`, `turn`, `agent_id`, `session_id` | 见 §5.4 |
+| `system.relay.llm.handle` | `request:{model, messages, tools, max_tokens, temperature, reasoning_effort, stream}`, `turn`, `agent_id`, `session_id`（**单实例插件靠这两个字段就知道"这一次是谁在问"，不必等事件**） | 见 §5.4 |
 | `system.relay.llm.request` | 同 `request` | 改后的请求体（`{model, messages, tools, max_tokens, …}`，未识别字段会透传进请求体）或 `null` |
 | `system.relay.context.compact` | `prompt`（核心拼好的压缩提示词）, `instruction`, `header`, `message_count`, `compacted`, `existing_summary` | `"摘要正文"` 或 `{summary: "…"}`；`null` = 用内置摘要器 |
 | `system.relay.prompt.system` | `default`（核心构造的完整 system prompt） | 最终 system prompt 字符串（空串 = 明确不要系统提示词）；`null` = 用 `default` |
@@ -279,6 +289,13 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 ```
 
 `delta.kind` 也接受 OpenAI 分片写法：`{"choices":[{"delta":{"content":"…"}}]}`。
+
+**两个 id 别搞混**：`station/stream` 里的 `request_id` 要填**请求 `params` 里那个**
+（如 `relay-1790863620-1`），不是 JSON-RPC 报文的 `id`——后者是"这条请求的回包"的关联键。
+填错的后果是核心**关联不上任何流**（会记一条可读日志，但插件侧收不到任何反馈）。
+
+**"回包后立刻推流"是安全的**：核心在处理完你的回包之后才登记这条流，而同一 tick 到达的
+第一片增量会先暂存、登记后按键重放（顺序不乱）。不需要靠 sleep/节流兜底。
 
 **流式接管的规矩**（都是硬约束）：
 
@@ -327,7 +344,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `agent.stop` | `agent_id?`, `cascade?`（缺省 true） | `{any_running, reason?, …}` | 停止（级联）生成 |
 | `agent.compact` | `agent_id?`, `session_id?` | `{…}` | **发起上下文压缩** |
 | `ui.push` | `slot_key`, `view?` | `{pushed, slot, slot_key, unregistered}` | 往消息流推一张卡片（§7） |
-| `llm.call` | `messages?` 或 `prompt?`, `system?`, `model?`, `temperature?`, `max_tokens?` | `{ok, json, text, model, usage}` | **站点处硬设 JSON 返回形式**的 LLM 调用，复用目标 agent 的模型 |
+| `llm.call` | `messages?` 或 `prompt?`, `system?`, `model?`, `temperature?`, `max_tokens?` | `{ok, json, text, model, usage}`；失败 `{ok:false, error:'可读原因'}` | **站点处硬设 JSON 返回形式**的 LLM 调用，复用目标 agent 的模型 |
 | `tool.call` | `tool`, `arguments?`, `relay?`（默认 false） | `{tool, result, is_error, relayed}` | 执行**任意工具**（内置 / MCP / 插件工具同一入口） |
 | `session.rename` | `title`（必填）, `session_id?` | `{renamed, title, session_id}` | 会话重命名（前端即时刷新标题） |
 
@@ -401,7 +418,9 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 ```
 
 `origin` = `agent`（模型发起的调用）或 `plugin`（插件经 `tool.call` 发起、且显式 `relay:true`）。
-你可以回一个 `payload`（会被记录），但广播的语义是**通知**，别依赖它。
+**广播要回一条 `{"reply":{"payload":null}}`**：核心的 `publish()` 仍会对每个订阅者等回包
+（调用方不等，所以拖不慢工具调用），但**不回会被记为未响应/投递失败**并出现在计数与日志里——
+广播不是"可以不回"，而是"回了也没人用"。回 `null` 表示"收到，无内容"。
 
 ### 7.2 前端槽位（声明式，无 JS）
 
@@ -498,20 +517,28 @@ plugins:
 
 | 旧 | 新 | 迁移动作 |
 |---|---|---|
-| `system.relay`（工具前/后共用一个实例） | `system.relay.tool.pre` + `.tool.post` | 核心**自动迁移**落盘订阅（旧订阅复制到两个点位，行为等价）；插件代码不用改：`{"station":"relay"}` 现在一次订两个点位 |
+| `system.relay`（工具前/后共用一个实例） | `system.relay.tool.pre` + `.tool.post` | 核心**自动迁移**落盘订阅（旧订阅复制到两个点位、含更早一代 `system.relay@team@mode`，行为等价）；插件代码不用改：`{"station":"relay"}` 现在一次订两个点位 |
 | `system.execute`（九条命令共用一个实例） | `system.execute.fs/terminal/agent/ui/llm/tool/session` | 插件无感（命令名不变，核心按命令路由） |
 | 无流式接管 | `station/stream` + `station/cancel` | 想用就用；不用则一次 `reply` 仍可 |
 | `point` 参数不存在 | `station/subscribe` 支持 `point` | 可选：用别名代替完整 id |
+| 点位化前"广播站只有一个" | 通用主题 + `tool.pre` / `tool.post` | 广播站**没有**"不带 point = 全订"的糖（`{"station":"broadcast"}` 仍是通用主题）；要工具广播就订两个点位 |
 
 ---
 
 ## 12. 完整示例
 
-- [`examples/plugins/sample_plugin.py`](../examples/plugins/sample_plugin.py)：
-  演示工具申报、活动栏面板、消息流卡片、中转站工具前/后改写、**LLM 接管（流式）**、
-  `llm.call` / `tool.call` / `session.rename`、广播订阅、自建站点、心跳与 selftest。
-- 运行：把 `examples/plugins/` 下的脚本拷到桌面端的 `plugins/` 目录，在
-  「设置 → 插件开发」里启用，即可在面板与消息流里看到它。
+- [`examples/plugins/minimal_plugin.py`](../examples/plugins/minimal_plugin.py)：**最小骨架**
+  （hello / ping / tools/list / 一个工具 + 并发读循环），`--selftest` 用假核心自检。
+- [`examples/plugins/sample_plugin.py`](../examples/plugins/sample_plugin.py)：全功能参考实现
+  ——工具申报、活动栏面板、消息流卡片、工具前/后中转改写、**LLM 流式接管**（`--relay-llm`）、
+  `prompt.system` 改写（`--relay-prompt`）、`llm.call` / `tool.call` / `session.rename`
+  三条新命令（`--llm-call` / `--tool-call` / `--rename-session`）、工具广播订阅（`--watch-tools`）、
+  自建站点（`--self-station`）、心跳与 `--selftest`。
+- 两个脚本都**只用标准库**、都能被绝对路径启动（不依赖 cwd）。
+- 尚未提供可运行示例的点位：`system.relay.llm.request`（投入前改写）与
+  `system.relay.context.compact`（上下文压缩）——口径见 §5.3，接法与其他中转点位完全一致。
+- 运行：把 `examples/plugins/` 下的脚本拷到桌面端的 `plugins/` 目录（或直接写绝对路径），
+  在「设置 → 插件开发」里启用，即可在面板与消息流里看到它。
 
 有疑问先看两条不变量：**"空 = 通配"只适用于订阅声明**；**任何异常都 fail-open，
 绝不阻塞生成**。其余细节都能从这两条推出来。

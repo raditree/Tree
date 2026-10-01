@@ -941,10 +941,25 @@ void main() {
       reason: '未知 request_id 的增量必须被丢弃（不报错、不串进任何流）',
     );
     expect(events.whereType<LlmFinishEvent>().single.reason, 'stop');
+    // 「回包与第一片增量同 tick 到达」是**正常竞态**：早到的帧会先暂存、流一登记就
+    // 重放（所以正常路径不必记"丢弃"日志）。真正的异常是"这个 id 从头到尾没有流"——
+    // 那种帧只在流收尾 / 插件下线时被清掉，并在那一刻留下可读线索。
     expect(
-      logs.where((String l) => l.contains('关联不到在途流')).length,
+      bus.pendingStreamFrames,
       greaterThanOrEqualTo(1),
-      reason: '丢弃要记可读日志；实际日志：${logs.join(' | ')}',
+      reason: '未知 request_id 的帧先暂存（有界），不是当场静默丢弃',
+    );
+    await bus.close();
+    expect(
+      bus.pendingStreamFrames,
+      0,
+      reason: '插件下线要把没关联上的早到帧清干净（否则会漏到下一次同 id 的流）',
+    );
+    expect(
+      logs.where((String l) => l.contains('从未关联上在途流')).length,
+      greaterThanOrEqualTo(1),
+      reason: '从未关联上流要记可读线索（最常见的错因：把报文 id 当成 request_id）；'
+          '实际日志：${logs.join(' | ')}',
     );
   }, timeout: const Timeout(Duration(seconds: 60)));
 }

@@ -1332,6 +1332,129 @@ class PluginBus {
   /// 打开中的「LLM 处理」插件流（`request_id` → 流状态）。
   final Map<String, _PluginLlmStream> _llmStreams = <String, _PluginLlmStream>{};
 
+  /// **比流登记更早到达**的 `station/stream` 通知（`request_id` → 帧列表）。
+  ///
+  /// 为什么需要：核心是**处理完插件的回包之后**才把流登记进 [_llmStreams]，而插件
+  /// 常常在"发出回包"的同一瞬间就开始推第一片增量——那条通知可能先到（同一个读循环
+  /// tick）。早到的通知按 `request_id` 暂存，流一登记就**按原插件身份重放**（归属
+  /// 校验照走一遍），于是"回包后立刻推流"不必靠节流/时序兜底。
+  ///
+  /// 有界：最多 [maxPendingStreamFrames] 条、最多 [maxPendingStreamIds] 个 request_id，
+  /// 溢出丢最旧并记可读日志（绝不无界增长）。
+  final Map<String, List<_PendingStreamFrame>> _pendingStreamFrames =
+      <String, List<_PendingStreamFrame>>{};
+
+  /// 早到通知的条数上限（跨所有 request_id）。
+  static const int maxPendingStreamFrames = 128;
+
+  /// 早到通知的 request_id 上限（防止伪造 id 撑爆内存）。
+  static const int maxPendingStreamIds = 32;
+
+  int get _pendingStreamFrameCount => _pendingStreamFrames.values.fold<int>(
+    0,
+    (int sum, List<_PendingStreamFrame> frames) => sum + frames.length,
+  );
+
+  /// 暂存一条早到的 `station/stream`（有界；溢出丢最旧并记日志）。
+  void _bufferStreamFrame(
+    String pluginId,
+    String requestId,
+    Map<String, dynamic> params,
+  ) {
+    if (_pendingStreamFrames.length >= maxPendingStreamIds &&
+        !_pendingStreamFrames.containsKey(requestId)) {
+      final String oldest = _pendingStreamFrames.keys.first;
+      final int dropped = _pendingStreamFrames.remove(oldest)?.length ?? 0;
+      log?.call(
+        '插件 $pluginId 的 station/stream（$requestId）无法暂存：'
+        '待关联的 request_id 已达上限 $maxPendingStreamIds，丢弃最旧的 $oldest（$dropped 条）',
+      );
+    }
+    final List<_PendingStreamFrame> frames = _pendingStreamFrames.putIfAbsent(
+      requestId,
+      () => <_PendingStreamFrame>[],
+    );
+    frames.add(_PendingStreamFrame(pluginId: pluginId, params: params));
+    while (_pendingStreamFrameCount > maxPendingStreamFrames) {
+      final String oldest = _pendingStreamFrames.keys.first;
+      final List<_PendingStreamFrame> bucket = _pendingStreamFrames[oldest]!;
+      bucket.removeAt(0);
+      if (bucket.isEmpty) _pendingStreamFrames.remove(oldest);
+      log?.call(
+        '早到的 station/stream 超过上限 $maxPendingStreamFrames 条，'
+        '丢弃最旧的一条（request_id=$oldest）',
+      );
+    }
+  }
+
+  /// 把某 `request_id` 的早到通知按**原插件身份**重放（流登记后调用一次）。
+  void _replayStreamFrames(String requestId) {
+    final List<_PendingStreamFrame>? frames = _pendingStreamFrames.remove(
+      requestId,
+    );
+    if (frames == null || frames.isEmpty) return;
+    log?.call('LLM 接管流 $requestId：重放 ${frames.length} 条早到的 station/stream');
+    for (final _PendingStreamFrame frame in frames) {
+      // 走同一条入口 ⇒ 归属校验与"取消后丢弃"的判定都照旧生效
+      _handleStationStream(frame.pluginId, frame.params);
+    }
+  }
+
+  /// **丢弃**暂存的早到通知（流收尾 / 插件下线 / 溢出时）。
+  ///
+  /// [requestId] 非空只清那个 id；[pluginId] 非空只清该插件的帧。
+  /// 丢弃一定记可读日志：暂存本身是"正常竞态"，但**从没被重放就丢掉**意味着有插件
+  /// 在用一个不存在的 `request_id` 推流（最常见的原因：把 JSON-RPC 报文的 `id`
+  /// 当成了 `request_id`）——静默丢弃会让插件侧毫无反馈。
+  void _dropPendingStreamFrames({String? pluginId, String? requestId}) {
+    final List<String> removedIds = <String>[];
+    int dropped = 0;
+    if (requestId != null) {
+      dropped += _pendingStreamFrames.remove(requestId)?.length ?? 0;
+      if (dropped > 0) removedIds.add(requestId);
+    } else {
+      final List<String> ids = _pendingStreamFrames.keys.toList();
+      for (final String id in ids) {
+        final List<_PendingStreamFrame>? frames = _pendingStreamFrames[id];
+        if (frames == null) continue;
+        if (pluginId == null) {
+          dropped += frames.length;
+          _pendingStreamFrames.remove(id);
+          removedIds.add(id);
+          continue;
+        }
+        final int before = frames.length;
+        frames.removeWhere(
+          (_PendingStreamFrame frame) => frame.pluginId == pluginId,
+        );
+        dropped += before - frames.length;
+        if (frames.isEmpty) _pendingStreamFrames.remove(id);
+        if (before != frames.length) removedIds.add(id);
+      }
+    }
+    if (dropped == 0) return;
+    log?.call(
+      '丢弃 $dropped 条从未关联上在途流的 station/stream'
+      '${removedIds.isEmpty ? '' : '（request_id：${removedIds.join('、')}）'}'
+      '${pluginId == null ? '' : '，来源插件 $pluginId'}'
+      '——注意：station/stream 要带**请求 params 里的 request_id**，不是 JSON-RPC 报文的 id',
+    );
+  }
+
+  /// 暂存中的早到通知条数（快照 / 测试用；正常情况为 0）。
+  int get pendingStreamFrames => _pendingStreamFrameCount;
+
+  /// **刚刚收尾**的流 id（最近 [maxClosedStreamIds] 个）。
+  ///
+  /// 为什么需要：同一个 `request_id` 只有两种"当前没有流"的情形，处理方式相反——
+  /// - **从没登记过**（回包与第一片增量同 tick）⇒ 暂存待重放（[_bufferStreamFrame]）；
+  /// - **已经收尾**（done / error / 取消 / 心跳丢失）⇒ 迟到增量只能丢弃，并**当场**
+  ///   记一条可读日志（否则插件以为还在推，核心却毫无反馈）。
+  final Set<String> _closedStreamIds = <String>{};
+
+  /// 收尾流 id 的记忆条数上限（只为区分上面两种情形，不需要长期保留）。
+  static const int maxClosedStreamIds = 64;
+
   /// 打开中的插件流数量（快照 / 测试用）。
   int get openLlmStreams => _llmStreams.length;
 
@@ -1480,6 +1603,9 @@ class PluginBus {
     _llmStreams.remove(requestId)?.fail('同一 request_id 的新流已打开（旧流作废）');
     _llmStreams[requestId] = stream;
     log?.call('LLM 处理中转：插件 $pluginId 流式接管第 $turn 跳（$requestId）');
+    // **回包与第一片增量常常同 tick 到达**：早到的那几片在这里按原身份重放，
+    // 免得"插件推得比核心登记流更快"变成静默丢数据（示例插件原先只能靠节流苟住）。
+    _replayStreamFrames(requestId);
     // 收尾守护：既不设静态总超时（长任务不该被时间杀），也不放任无限等——
     // 每拍检查取消信号与订阅者心跳（与站点 awaitReply 的判活口径一致）。
     stream.timer = Timer.periodic(const Duration(milliseconds: 250), (
@@ -1527,6 +1653,14 @@ class PluginBus {
     bool cancelled = false,
   }) {
     final _PluginLlmStream? stream = _llmStreams.remove(requestId);
+    if (stream != null) {
+      _closedStreamIds.add(requestId);
+      while (_closedStreamIds.length > maxClosedStreamIds) {
+        _closedStreamIds.remove(_closedStreamIds.first);
+      }
+    }
+    // 这条流已经收尾：为它暂存的早到帧不会再有机会重放，直接清掉（并记线索）
+    _dropPendingStreamFrames(requestId: requestId);
     if (stream == null) return;
     if (cancelReason.isNotEmpty) {
       _hosts[stream.pluginId]?.cancelStation(
@@ -1562,7 +1696,16 @@ class PluginBus {
     }
     final _PluginLlmStream? stream = _llmStreams[requestId];
     if (stream == null) {
-      log?.call('插件 $pluginId 的 station/stream 关联不到在途流（$requestId），已丢弃');
+      if (_closedStreamIds.contains(requestId)) {
+        // 这条流已经收尾（done / error / 取消 / 心跳丢失）：迟到增量只能丢弃。
+        // **当场记日志**——插件以为还在推，核心必须给出反馈，否则是静默数据丢失。
+        log?.call(
+          '插件 $pluginId 的 station/stream 迟到（$requestId 已收尾），本条增量已丢弃',
+        );
+        return;
+      }
+      // 从没登记过：可能是"回包还没被处理完、插件已经推了第一片"——暂存等重放。
+      _bufferStreamFrame(pluginId, requestId, params);
       return;
     }
     if (stream.pluginId != pluginId) {
@@ -3047,6 +3190,8 @@ class PluginBus {
     // 插件下线 ⇒ 它打开着的 LLM 接管流**必须以失败收尾**：否则会话会一直等一条
     // 永远不会有数据的流（判活定时器也会在一拍内发现并收尾，这里只是更快更明确）
     _failLlmStreamsOf(pluginId, '插件已下线，LLM 接管流中断');
+    // 它"早到但从未关联上流"的帧也一并清掉（否则会留到下次同 id 的流被误放行）
+    _dropPendingStreamFrames(pluginId: pluginId);
     // 动态工具表：下线插件的定义一并移除（避免调用到不存在的插件）
     _definitions.removePlugin(pluginId);
     // 插件下线 = 工具表失效点（模型工具表必须随之变化）
@@ -3071,6 +3216,16 @@ class PluginBus {
       _closeLlmStream(requestId, failure: reason);
     }
   }
+}
+
+/// 一条**比流登记更早到达**的 `station/stream` 通知（暂存待重放）。
+///
+/// 带 [pluginId] 是为了重放时**照走归属校验**：别人冒名推的帧不会因为"早到"而被放行。
+class _PendingStreamFrame {
+  const _PendingStreamFrame({required this.pluginId, required this.params});
+
+  final String pluginId;
+  final Map<String, dynamic> params;
 }
 
 /// 一条**插件接管的 LLM 流**（`system.relay.llm.handle` 的流式回填状态）。
