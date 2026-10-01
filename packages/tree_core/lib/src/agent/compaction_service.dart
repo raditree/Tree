@@ -5,6 +5,7 @@ import '../llm/llm_result_gate.dart';
 import '../settings/core_settings.dart';
 import '../store/tree_store.dart';
 import '../util/tokens.dart';
+import 'attachment_prompt.dart';
 import 'workspace_prompt.dart';
 
 /// 上下文压缩（M7d-4）。
@@ -381,7 +382,13 @@ class CompactionService {
           '结果 ${_clip(message.toolResult, 300)}';
     }
     final String role = message.role == 'user' ? '用户' : '助手';
-    return '[$role] ${_clip(message.content, 400)}';
+    // 附件路径要进摘要：压掉之后模型仍得知道"用户当时发过哪些文件"，
+    // 否则长会话里附件信息随摘要一起消失。
+    final List<String> paths = message.role == 'user'
+        ? attachmentPaths(message.attachments)
+        : const <String>[];
+    final String suffix = paths.isEmpty ? '' : '（附件：${paths.join('、')}）';
+    return '[$role] ${_clip(message.content, 400)}$suffix';
   }
 
   static String _digest(
@@ -414,6 +421,14 @@ class CompactionService {
           : 0;
     }
     int tokens = estimateTokens(message.content, scale: scale);
+    if (message.role == 'user') {
+      // 附件说明段同样是"引擎实际发出的那一份"（见 attachmentsPromptSuffix）：
+      // 估算漏掉它，压缩阈值就会比真实上下文偏小。
+      tokens += estimateTokens(
+        attachmentsPromptSuffix(message.attachments),
+        scale: scale,
+      );
+    }
     if (message.isTool) {
       tokens += estimateTokensFromChars(
         gate.forModelChars(message.toolResult),

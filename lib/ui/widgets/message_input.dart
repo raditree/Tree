@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:desktop_drop/desktop_drop.dart';
@@ -62,8 +63,11 @@ class MessageDraftCache {
 /// - Ctrl+V 依次尝试：剪贴板文件列表（可多个）→ 剪贴板位图 → 文件路径文本 → 文本
 /// - [cacheKey] 非空时按 team+session 缓存草稿，切走再切回来内容还在
 class MessageInput extends StatefulWidget {
-  /// 发送回调，参数为文本内容与附件文件路径列表
-  final void Function(String text, List<String> filePaths) onSend;
+  /// 发送回调，参数为文本内容与附件文件路径列表。
+  ///
+  /// **返回 `false` = 没发出去**（例如附件上传失败、核心不可达）：调用方据此保留
+  /// 输入框里的文本与附件——让用户重写一遍是他最不想要的结果。返回 `true` 才清空。
+  final Future<bool> Function(String text, List<String> filePaths) onSend;
 
   /// 草稿缓存键（调用方用 team + session 拼接）。
   ///
@@ -98,6 +102,9 @@ class _MessageInputState extends State<MessageInput> {
 
   /// 是否正在拖拽文件经过输入框区域
   bool _isDragging = false;
+
+  /// 是否正在发送（含附件上传）：期间禁用发送按钮，避免重复提交导致附件重复上传
+  bool _sending = false;
 
   @override
   void initState() {
@@ -179,12 +186,28 @@ class _MessageInputState extends State<MessageInput> {
 
   /// 处理发送
   ///
-  /// 先通过回调发出消息（同步回调返回即视为发送成功），再清空输入框与附件，
-  /// 并作废该 team+session 的草稿——否则切走再切回来会看到已发出的内容又回来了。
-  void _handleSend() {
+  /// 等待 [MessageInput.onSend] 的结果：**成功才清空**输入框与附件，并作废该
+  /// team+session 的草稿（否则切走再切回来会看到已发出的内容又回来了）；失败
+  /// （例如附件上传失败）原样保留，用户改一改就能重发。
+  Future<void> _handleSend() async {
+    if (_sending) return;
     final String text = _controller.text.trim();
     if (text.isEmpty && _filePaths.isEmpty) return;
-    widget.onSend(text, List<String>.from(_filePaths));
+    setState(() {
+      _sending = true;
+    });
+    bool sent = false;
+    try {
+      sent = await widget.onSend(text, List<String>.from(_filePaths));
+    } catch (_) {
+      // 回调本身的异常不该让输入框卡在"发送中"：一律按"没发出去"处理
+      sent = false;
+    }
+    if (!mounted) return;
+    setState(() {
+      _sending = false;
+    });
+    if (!sent) return;
     _controller.clear();
     setState(() {
       _filePaths.clear();
@@ -216,7 +239,9 @@ class _MessageInputState extends State<MessageInput> {
         HardwareKeyboard.instance.logicalKeysPressed.contains(LogicalKeyboardKey.shiftRight)) {
       return KeyEventResult.ignored;
     }
-    _handleSend();
+    // 发送是异步的（附件要先上传），这里不等结果：清空与否由 _handleSend 内部按
+    // 回调返回值处理。
+    unawaited(_handleSend());
     return KeyEventResult.handled;
   }
 
@@ -511,11 +536,17 @@ class _MessageInputState extends State<MessageInput> {
                 ),
                 const SizedBox(width: 8),
                 IconButton(
-                  icon: const Icon(Icons.send),
-                  onPressed: _canSend ? _handleSend : null,
+                  icon: _sending
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.send),
+                  onPressed: _canSend && !_sending ? _handleSend : null,
                   color: cs.primary,
                   disabledColor: cs.outline,
-                  tooltip: '发送',
+                  tooltip: _sending ? '正在发送（附件上传中）…' : '发送',
                 ),
               ],
             ),

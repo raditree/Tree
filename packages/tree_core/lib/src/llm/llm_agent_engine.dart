@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:tree_local_exec/tree_local_exec.dart';
 
 import '../agent/agent_engine.dart';
+import '../agent/attachment_prompt.dart';
 import '../settings/core_settings.dart';
 import '../tool/tool_runner.dart';
 import '../tool/workspace_tool_runner.dart';
@@ -356,15 +357,23 @@ class LlmAgentEngine implements AgentEngine {
         }
         continue;
       }
-      if (ref.content.trim().isEmpty) continue;
+      // 用户上传的附件：路径必须写进提示词（附件已由前端上传到工作空间），否则
+      // 模型对"用户发了图/文件"这件事一无所知 —— 只有 UI 气泡上的一张卡片。
+      // 附件说明段与压缩估算共用同一个纯函数，两处口径逐字一致。
+      final String content = ref.isUser
+          ? '${ref.content}${attachmentsPromptSuffix(ref.attachments)}'
+          : ref.content;
+      // 空内容跳过：**只有附件、没有正文**的消息不能算空——它带着附件路径，
+      // 整条丢掉等于用户什么都没发（修复前的行为）。
+      if (content.trim().isEmpty) continue;
       final String reasoning = passBackReasoning
           ? pendingReasoning.join('\n\n')
           : '';
       pendingReasoning.clear();
       out.add(
         ref.isUser
-            ? LlmMessage.user(ref.content)
-            : LlmMessage.assistant(ref.content, reasoningContent: reasoning),
+            ? LlmMessage.user(content)
+            : LlmMessage.assistant(content, reasoningContent: reasoning),
       );
     }
     await flushTools();

@@ -15,10 +15,15 @@ void main() {
   late List<List<String>> sentFiles;
   late List<String> clipboardCalls;
 
+  /// 发送回调的返回值（true = 已发出 ⇒ 输入框清空；false = 没发出去 ⇒ 保留）。
+  /// 由用例按需切换：附件上传失败时面板就是靠这个 false 把草稿留给用户。
+  late bool sendOk;
+
   setUp(() {
     sentTexts = <String>[];
     sentFiles = <List<String>>[];
     clipboardCalls = <String>[];
+    sendOk = true;
     MessageDraftCache.instance.clearAll();
   });
 
@@ -48,9 +53,10 @@ void main() {
       home: Scaffold(
         body: MessageInput(
           cacheKey: cacheKey,
-          onSend: (String text, List<String> files) {
+          onSend: (String text, List<String> files) async {
             sentTexts.add(text);
             sentFiles.add(files);
+            return sendOk;
           },
         ),
       ),
@@ -149,6 +155,29 @@ void main() {
       await pumpInput(tester, cacheKey: 'teamA::s1');
       expect(fieldText(tester), '');
       expect(find.byType(Chip), findsNothing);
+    });
+
+    testWidgets('发送失败（回调返回 false）：文本与附件都保留，草稿不丢',
+        (WidgetTester tester) async {
+      mockClipboard(files: <String>[r'C:\tmp\x.bin']);
+      await pumpInput(tester, cacheKey: 'teamA::s1');
+      await pressCtrlV(tester);
+      await tester.enterText(find.byType(TextField), '要重发的内容');
+
+      // 模拟"附件上传失败"：面板回调返回 false，消息没有发出去
+      sendOk = false;
+      await tester.tap(find.byIcon(Icons.send));
+      await tester.pumpAndSettle();
+
+      expect(sentTexts, <String>['要重发的内容'], reason: '回调仍然被调用了一次');
+      expect(fieldText(tester), '要重发的内容', reason: '失败不该清空输入框');
+      expect(find.text('x.bin'), findsOneWidget, reason: '失败不该丢掉附件');
+
+      // 切走再切回来：草稿还在（否则用户得重写一遍）
+      await pumpInput(tester, cacheKey: 'teamA::s2');
+      await pumpInput(tester, cacheKey: 'teamA::s1');
+      expect(fieldText(tester), '要重发的内容');
+      expect(find.text('x.bin'), findsOneWidget);
     });
 
     testWidgets('未编辑过的键不会被上一个键的草稿污染',

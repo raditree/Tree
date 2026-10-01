@@ -712,6 +712,7 @@ class ConversationService {
     toolResult: message.toolResult,
     toolCallId: message.toolCallId,
     timestamp: message.timestamp,
+    attachments: message.attachments,
   );
 
   /// 按 agent 串行执行：前一个任务（含失败）结束后才启动下一个。
@@ -924,15 +925,63 @@ class ConversationService {
     });
   }
 
+  /// 规范化 `user_message` 帧里的附件列表。
+  ///
+  /// 两种形态都收（前端是唯一生产者，桌面端当前发的是 Map）：
+  /// - **Map**：`{name, path, size, type}`，其中 `path` 是**工作空间相对路径**
+  ///   （前端已把文件上传到工作空间，如 `.input/20261001/a.png`）——模型据此用
+  ///   文件工具读取；
+  /// - **String**：直接当作路径（兼容旧形态与手工调用）。
+  ///
+  /// 只保留 `path` 非空的条目：没有路径的附件对模型毫无意义，留着只会让提示词里
+  /// 多出一行空项。整条列表没有可用项时返回 null（与"没有附件"同义），避免落库
+  /// 出一堆空壳。
   static List<Map<String, dynamic>>? _attachments(Object? raw) {
     if (raw is! List<dynamic> || raw.isEmpty) return null;
-    return raw
-        .whereType<Map<dynamic, dynamic>>()
-        .map(
-          (Map<dynamic, dynamic> e) =>
-              e.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
-        )
-        .toList();
+    final List<Map<String, dynamic>> out = <Map<String, dynamic>>[];
+    for (final Object? entry in raw) {
+      final Map<String, dynamic>? item = _attachmentOf(entry);
+      if (item != null) out.add(item);
+    }
+    return out.isEmpty ? null : out;
+  }
+
+  /// 单条附件的规范化（非法/无路径返回 null）。
+  ///
+  /// 只认两种形态：`{'path': '...'}` 的 Map，或直接给路径的字符串。数字、嵌套
+  /// 结构之类一律丢弃——把 `42` 当成路径只会让模型拿到一个不存在的文件。
+  static Map<String, dynamic>? _attachmentOf(Object? entry) {
+    if (entry is Map) {
+      final Object? rawPath = entry['path'];
+      if (rawPath is! String) return null;
+      final String path = rawPath.trim();
+      if (path.isEmpty) return null;
+      final Object? rawName = entry['name'];
+      final String name = rawName is String ? rawName.trim() : '';
+      final Object? rawType = entry['type'];
+      return <String, dynamic>{
+        'name': name.isEmpty ? _baseNameOf(path) : name,
+        'path': path,
+        'size': (entry['size'] as num?)?.toInt() ?? 0,
+        'type': rawType is String ? rawType.trim() : '',
+      };
+    }
+    if (entry is! String) return null;
+    final String path = entry.trim();
+    if (path.isEmpty) return null;
+    return <String, dynamic>{
+      'name': _baseNameOf(path),
+      'path': path,
+      'size': 0,
+      'type': '',
+    };
+  }
+
+  /// 从路径取文件名（兼容 `/` 与 `\`）。
+  static String _baseNameOf(String path) {
+    final String replaced = path.replaceAll('\\', '/');
+    final int idx = replaced.lastIndexOf('/');
+    return idx >= 0 ? replaced.substring(idx + 1) : replaced;
   }
 }
 

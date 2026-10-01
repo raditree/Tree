@@ -8,6 +8,7 @@ import '../models/agent.dart';
 import '../models/message.dart';
 import '../models/session.dart';
 import '../../io/api_service.dart';
+import '../../io/attachment_upload_service.dart';
 import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
 import '../../io/question_update_service.dart';
@@ -907,25 +908,47 @@ class _MessagePanelState extends State<MessagePanel> {
 
   /// 处理发送
   ///
-  /// 先在本地追加用户消息，再通过 WebSocket 发送给后端。
-  /// 发送前对目标 team 懒激活两个执行器（幂等，fire-and-forget 不阻塞发送）。
-  void _handleSend(String text, List<String> filePaths) {
+  /// 附件先上传到该 agent 的**工作空间**（`.input/{yyyymmdd}/`），拿到工作空间
+  /// 相对路径后再把消息发出去：核心据此在提示词里告诉模型"用户上传了什么、在哪"，
+  /// 模型才能用文件工具读到它（只传本机路径等于什么都没发——本机路径既不是模型的
+  /// 工作空间口径，SSH 模式下也根本读不到）。
+  ///
+  /// 返回值 = 是否已发出：`false` 时输入框保留文本与附件（上传失败不该让用户重写），
+  /// 由 [MessageInput] 决定不清空草稿。
+  Future<bool> _handleSend(String text, List<String> filePaths) async {
     final Agent? agent = widget.selectedAgent;
-    if (agent == null) return;
+    if (agent == null) return false;
     // 发送前懒激活目标 team 的执行器配置（幂等）：未加载的从核心重新读取，
     // 已启用的走注册/写入流程。fire-and-forget + 超时兜底，绝不阻塞消息发送。
     _ensureExecutorsReady(agent.id);
 
-    final List<Attachment> attachments = filePaths
-        .map((String p) => Attachment(name: _basename(p), size: 0, type: ''))
-        .toList();
+    List<Map<String, dynamic>> attachments = const <Map<String, dynamic>>[];
+    if (filePaths.isNotEmpty) {
+      try {
+        attachments = await AttachmentUploadService.uploadAll(
+          // workspace_id 为空时退回 agent id：核心的 agentFor 两者都认
+          agent.workspaceId.isEmpty ? agent.id : agent.workspaceId,
+          filePaths,
+          teamId: agent.id,
+          onFile: (int index, int total, String name) {
+            if (total > 1) _showSnackBar('正在上传附件 $index/$total：$name');
+          },
+        );
+      } catch (error) {
+        _showSnackBar('附件上传失败，消息未发送：${_errorText(error)}');
+        return false;
+      }
+      if (!mounted) return false;
+    }
 
     final ChatMessage userMessage = ChatMessage(
       id: 'user_${DateTime.now().millisecondsSinceEpoch}',
       role: 'user',
       content: text,
       timestamp: DateTime.now(),
-      attachments: attachments.isEmpty ? null : attachments,
+      attachments: attachments.isEmpty
+          ? null
+          : attachments.map(_attachmentOf).toList(),
     );
 
     setState(() {
@@ -940,10 +963,24 @@ class _MessagePanelState extends State<MessagePanel> {
       'type': 'user_message',
       'agent_id': agent.id,
       'content': text,
-      'attachments': filePaths,
+      // 工作空间相对路径（附件已由前端上传完成），核心把它写进提示词
+      'attachments': attachments,
       'session_id': _currentSessionId,
     });
+    return true;
   }
+
+  /// 附件元数据（核心/上传服务口径）→ 前端展示模型。
+  static Attachment _attachmentOf(Map<String, dynamic> meta) => Attachment(
+    name: (meta['name'] ?? '').toString(),
+    size: (meta['size'] as num?)?.toInt() ?? 0,
+    type: (meta['type'] ?? '').toString(),
+    path: (meta['path'] ?? '').toString(),
+  );
+
+  /// 异常 → 一句可读提示（去掉 `Exception: ` 前缀）。
+  static String _errorText(Object error) =>
+      error.toString().replaceFirst('Exception: ', '');
 
   /// 发送前确保目标 team 的执行器状态就绪（幂等懒激活）。
   ///

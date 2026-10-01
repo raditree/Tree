@@ -131,10 +131,17 @@ class Attachment {
   /// 文件类型（MIME 类型或扩展名）
   final String type;
 
+  /// 附件在**工作空间**中的相对路径（如 `.input/20261001/x.png`）。
+  ///
+  /// 由输入框发送时上传得到，核心据此在提示词里告诉模型附件在哪。历史消息里可能
+  /// 为空（例如旧数据或非上传来源），UI 需要容忍空值。
+  final String path;
+
   Attachment({
     required this.name,
     required this.size,
     required this.type,
+    this.path = '',
   });
 
   factory Attachment.fromJson(Map<String, dynamic> json) {
@@ -142,6 +149,7 @@ class Attachment {
       name: json['name'] as String? ?? '',
       size: _parseInt(json['size']),
       type: json['type'] as String? ?? '',
+      path: json['path'] as String? ?? '',
     );
   }
 

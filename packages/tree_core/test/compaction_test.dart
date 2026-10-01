@@ -70,6 +70,7 @@ void main() {
     String kind = 'text',
     String? toolName,
     String toolResult = '',
+    List<Map<String, dynamic>>? attachments,
   }) {
     store.appendMessage(
       CoreMessage(
@@ -83,6 +84,7 @@ void main() {
         toolName: toolName,
         toolResult: toolResult,
         toolCallId: toolName == null ? null : 'call_$toolName',
+        attachments: attachments,
       ),
     );
   }
@@ -534,6 +536,44 @@ void main() {
         ),
         isNull,
       );
+    });
+  });
+
+  group('用户上传的附件：估算与摘要共同口径', () {
+    const List<Map<String, dynamic>> attachments = <Map<String, dynamic>>[
+      <String, dynamic>{'name': '图片.png', 'path': '.input/20261001/图片.png'},
+    ];
+
+    test('附件段计入估算（引擎实际发出的那一份）', () {
+      add('user', '看这张图', attachments: attachments);
+      final int expected =
+          estimateTokens(systemPromptWithWorkspace(agent)) +
+          estimateTokens('看这张图') +
+          estimateTokens(attachmentsPromptSuffix(attachments));
+      expect(service.estimateContextTokens(agent, session), expected);
+    });
+
+    test('没有附件的消息不凭空多算', () {
+      add('user', '看这张图');
+      final int expected =
+          estimateTokens(systemPromptWithWorkspace(agent)) +
+          estimateTokens('看这张图');
+      expect(service.estimateContextTokens(agent, session), expected);
+    });
+
+    test('摘要输入保留附件路径：压缩后模型仍知道用户发过哪些文件', () async {
+      add('user', '看这张图', attachments: attachments);
+      add('agent', '好的');
+      addTurn('二');
+      addTurn('三');
+      addTurn('四');
+      final CompactionResult result = await service.compact(
+        agent.id,
+        session.sessionId,
+      );
+      expect(result.compressed, isTrue);
+      expect(summarizer.prompts, hasLength(1));
+      expect(summarizer.prompts.single, contains('.input/20261001/图片.png'));
     });
   });
 }

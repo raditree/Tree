@@ -758,7 +758,7 @@ class _MessageBubbleState extends State<_MessageBubble> {
       spacing: 6,
       runSpacing: 6,
       children: attachments.map((Attachment a) {
-        return Container(
+        final Widget card = Container(
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
           decoration: BoxDecoration(
             color: isUser ? cs.onPrimary.withValues(alpha: 0.08) : cs.surface,
@@ -795,6 +795,10 @@ class _MessageBubbleState extends State<_MessageBubble> {
             ],
           ),
         );
+        // 附件在**工作空间**里的相对路径（发送时上传得到，核心把它写进提示词）。
+        // 只是提示，不占版面；旧数据没有该字段时不显示。
+        if (a.path.isEmpty) return card;
+        return Tooltip(message: '工作空间路径：${a.path}', child: card);
       }).toList(),
     );
   }

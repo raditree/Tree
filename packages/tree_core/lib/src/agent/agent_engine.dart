@@ -98,6 +98,7 @@ class CoreMessageRef {
     this.toolResult = '',
     this.toolCallId,
     this.timestamp = 0,
+    this.attachments,
   });
 
   /// `user` / `agent`（存储层口径）。
@@ -123,6 +124,13 @@ class CoreMessageRef {
 
   /// 消息时间戳（毫秒；引擎排序/日志用）。
   final int timestamp;
+
+  /// 用户随该消息上传的附件（工作空间相对路径等元数据）。
+  ///
+  /// 为什么放在引擎视图里：附件不是"存储层才知道的事"——引擎必须把它们的路径
+  /// 写进发给模型的提示词（用户上传的图/文件在哪、叫什么），否则模型看不到任何
+  /// 附件信息（只有 UI 上一张空壳卡片）。估算与摘要同样按这一份算，口径一致。
+  final List<Map<String, dynamic>>? attachments;
 
   bool get isTool => kind == 'tool';
 
