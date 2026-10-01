@@ -69,7 +69,7 @@ Map<String, dynamic> _station(
 };
 
 void main() {
-  testWidgets('站点段用新名字「站点（N）」，subscriber 与团队分组随核心字段变化', (
+  testWidgets('站点段按四类分组列出，标题计数是"已建 N/4 类"', (
     WidgetTester tester,
   ) async {
     final PluginMonitorService svc = await _serviceWith(<String, dynamic>{
@@ -84,12 +84,24 @@ void main() {
     });
     await _pumpPanel(tester, svc);
 
-    expect(find.text('站点（3）'), findsOneWidget);
+    // 计数不能是裸实例数：三站是实建数，体系本身是四类
+    expect(find.text('站点（已建 3/4 类）'), findsOneWidget);
+    expect(find.text('站点（3）'), findsNothing, reason: '裸实例数会被读成"只有三类站"');
     expect(find.textContaining('处理站'), findsNothing);
-    // 四类站的中文名 + 内置标识：卡片的类型标签来自核心的 kind_label
-    expect(find.text('广播站'), findsOneWidget);
-    expect(find.text('执行站'), findsOneWidget);
-    expect(find.text('中转站'), findsOneWidget);
+    // 分组头 + 卡片类型标签各出现一次（四类都要有分组头，含未创建的收集站）
+    expect(find.text('广播站'), findsNWidgets(2));
+    expect(find.text('执行站'), findsNWidgets(2));
+    expect(find.text('中转站'), findsNWidgets(2));
+    expect(
+      find.text('收集站'),
+      findsOneWidget,
+      reason: '收集站未创建也要列出该类（按需创建，不是不存在）',
+    );
+    expect(
+      find.text('未创建（该类站点按需创建）'),
+      findsOneWidget,
+      reason: '空类必须写明未创建，不能让用户以为该类站点不存在',
+    );
     expect(find.text('内置'), findsNWidgets(3));
     // 站点 id 是全局常量（不再带 @team@mode 后缀）
     expect(find.text('system.broadcast'), findsOneWidget);
@@ -99,6 +111,44 @@ void main() {
     expect(find.textContaining('requests: 2'), findsNWidgets(3));
     // 没有订阅者 ⇒ 不显示团队分组行
     expect(find.textContaining('团队:'), findsNothing);
+  });
+
+  testWidgets('四类站齐全时计数为 4/4，且没有"未创建"提示', (WidgetTester tester) async {
+    final PluginMonitorService svc = await _serviceWith(<String, dynamic>{
+      'enabled': true,
+      'instances': <dynamic>[],
+      'stations': <dynamic>[
+        _station('system.broadcast', 'broadcast', '广播站'),
+        _station('system.execute', 'execute', '执行站'),
+        _station('system.relay', 'relay', '中转站'),
+        _station('plugin.tool.define', 'collect', '收集站', builtin: false),
+      ],
+      'config': <String, dynamic>{'path': 'C:/data/config/plugins.yaml'},
+    });
+    await _pumpPanel(tester, svc);
+
+    expect(find.text('站点（已建 4/4 类）'), findsOneWidget);
+    expect(find.text('收集站'), findsNWidgets(2), reason: '分组头 + 卡片标签');
+    expect(find.text('未创建（该类站点按需创建）'), findsNothing);
+  });
+
+  testWidgets('类型认不出的站点归入「其他」，不丢站点', (WidgetTester tester) async {
+    final PluginMonitorService svc = await _serviceWith(<String, dynamic>{
+      'enabled': true,
+      'instances': <dynamic>[],
+      'stations': <dynamic>[
+        // 旧核心不给 kind（空串）/ 将来新增的类型：都必须仍然显示出来
+        _station('legacy.station', '', ''),
+        _station('future.station', 'quantum', '量子站'),
+      ],
+      'config': <String, dynamic>{'path': 'C:/data/config/plugins.yaml'},
+    });
+    await _pumpPanel(tester, svc);
+
+    expect(find.text('其他（类型未知）'), findsOneWidget);
+    expect(find.text('legacy.station'), findsOneWidget);
+    expect(find.text('future.station'), findsOneWidget);
+    expect(find.text('站点（已建 0/4 类）'), findsOneWidget, reason: '四类都没建');
   });
 
   testWidgets('站点卡片：订阅者按 team 分组显示（team 视角落在订阅声明上）', (
@@ -164,7 +214,7 @@ void main() {
     });
     await _pumpPanel(tester, svc);
 
-    expect(find.text('站点（0）'), findsOneWidget);
+    expect(find.text('站点（已建 0/4 类）'), findsOneWidget);
     expect(find.textContaining('内置四站（广播 / 执行 / 中转 / 收集）'), findsOneWidget);
     expect(find.textContaining('全局各一个'), findsOneWidget);
     expect(

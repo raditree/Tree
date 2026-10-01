@@ -506,11 +506,11 @@ class _PluginPanelState extends State<PluginPanel> {
           const SizedBox(height: 12),
           // M9 §3 的正式名字是「站点」（广播 / 执行 / 中转 / 收集四类），
           // 旧文案「处理站」是已废弃的旧名（旧「处理站」= 现在的中转站）。
-          _sectionTitle(cs, '站点（${snap.stations.length}）'),
+          _sectionTitle(cs, _stationsTitle(snap)),
           if (snap.stations.isEmpty)
             _emptyHint(cs, _stationsEmptyText(snap))
           else
-            ...snap.stations.map((PluginStationInfo s) => _stationCard(cs, s)),
+            ..._buildStationGroups(cs, snap),
           const SizedBox(height: 12),
           _sectionTitle(cs, '看门狗'),
           _buildWatchdog(cs, snap),
@@ -1085,6 +1085,103 @@ class _PluginPanelState extends State<PluginPanel> {
       ? value.toInt().toString()
       : value.toStringAsFixed(1);
 
+  /// 四类站点的展示顺序与中文名（与核心 `StationKind` 的四类一一对应）。
+  ///
+  /// **列全四类是刻意的**：站点语义是"每类站点全局唯一"，所以"面板上有几类站"
+  /// 本身就是语义的一部分。只列实例的话（收集站由接入点需要时才现建）用户看到的
+  /// 是"三站"，与文档里的"四站体系"对不上。
+  static const List<({String wire, String label})> _stationKinds =
+      <({String wire, String label})>[
+        (wire: 'broadcast', label: '广播站'),
+        (wire: 'execute', label: '执行站'),
+        (wire: 'relay', label: '中转站'),
+        (wire: 'collect', label: '收集站'),
+      ];
+
+  /// 站点段标题：计数用「已建 N/4 类」而不是裸实例数。
+  ///
+  /// 裸实例数会被读成"站点体系只有三条腿"——收集站按需创建，没接入点用工具申报时
+  /// 根本就不存在。写成"已建 N/4 类"才能同时表达"体系有四类"与"实建了几类"。
+  String _stationsTitle(PluginSnapshot snap) {
+    final int materialized = _stationKinds
+        .where(
+          (({String wire, String label}) k) =>
+              snap.stations.any((PluginStationInfo s) => s.kind == k.wire),
+        )
+        .length;
+    return '站点（已建 $materialized/${_stationKinds.length} 类）';
+  }
+
+  /// 站点分四类列出（每类一个分组头，组内是该类的具体站点）。
+  ///
+  /// 三件事：
+  /// 1. **按类型分组**（广播 / 执行 / 中转 / 收集，顺序固定），类型名取自核心给的
+  ///    `kind_label`，缺失时按线名兜底；
+  /// 2. **空类也列**，并注明"未创建"——否则用户会以为该类站点不存在（收集站正是
+  ///    按需创建的那一个）；
+  /// 3. 认不出的类型（旧核心 / 将来新增）归入「其他」，不丢站点。
+  List<Widget> _buildStationGroups(ColorScheme cs, PluginSnapshot snap) {
+    final List<Widget> out = <Widget>[];
+    final Set<String> known = <String>{
+      for (final ({String wire, String label}) k in _stationKinds) k.wire,
+    };
+    for (final ({String wire, String label}) k in _stationKinds) {
+      final List<PluginStationInfo> group = snap.stations
+          .where((PluginStationInfo s) => s.kind == k.wire)
+          .toList(growable: false);
+      out.add(_stationGroupHeader(cs, _stationKindLabel(k, group), group.length));
+      if (group.isEmpty) {
+        out.add(_emptyHint(cs, '未创建（该类站点按需创建）'));
+        continue;
+      }
+      out.addAll(group.map((PluginStationInfo s) => _stationCard(cs, s)));
+    }
+    final List<PluginStationInfo> others = snap.stations
+        .where((PluginStationInfo s) => !known.contains(s.kind))
+        .toList(growable: false);
+    if (others.isNotEmpty) {
+      out.add(_stationGroupHeader(cs, '其他（类型未知）', others.length));
+      out.addAll(others.map((PluginStationInfo s) => _stationCard(cs, s)));
+    }
+    return out;
+  }
+
+  /// 分组头：类型名 + 该类站点数（弱化样式，与区块标题区分开）。
+  Widget _stationGroupHeader(ColorScheme cs, String label, int count) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 4, bottom: 5),
+      child: Row(
+        children: <Widget>[
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+              color: cs.onSurface,
+            ),
+          ),
+          const SizedBox(width: 6),
+          Text(
+            '$count',
+            style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 分组头的类型名：核心的中文名优先（同组内取第一个非空），否则用本地常量，
+  /// 再不然回退线名（不猜）。
+  String _stationKindLabel(
+    ({String wire, String label}) kind,
+    List<PluginStationInfo> group,
+  ) {
+    for (final PluginStationInfo s in group) {
+      if (s.kindLabel.isNotEmpty) return s.kindLabel;
+    }
+    return kind.label;
+  }
+
   /// 单个站点卡片（计数白名单裁剪，未知键忽略）。
   ///
   /// 展示口径（M9 §3，站点全局化后）：
@@ -1206,9 +1303,9 @@ class _PluginPanelState extends State<PluginPanel> {
   String _stationsEmptyText(PluginSnapshot snap) {
     final StringBuffer buffer = StringBuffer(
       '暂无站点实例。'
-      '内置四站（广播 / 执行 / 中转 / 收集）**全局各一个**：前三站在核心启动时'
-      '自动就位，收集站由接入点（如插件申报工具）需要时现建；'
-      'team / session / agent 随每次交互携带，不再把站点按团队拆开。',
+      '内置四站（广播 / 执行 / 中转 / 收集）全局各一个：前三站在核心启动时'
+      '自动就位，收集站按需创建（如插件申报工具时）；'
+      'team / session / agent 随每次交互携带，不把站点按团队拆开。',
     );
     final String path = snap.pluginConfigPath;
     if (path.isNotEmpty) {
