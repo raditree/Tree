@@ -180,7 +180,7 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
   - **Q6** 输入框草稿按 **team+session** 缓存（文本与附件一起、**纯内存**），切换即恢复，发送成功后清空该键
   - **Q7** 下载列表「打开文件所在位置」：Windows `explorer /select,"<path>"`；**文件夹任务定位到 tar.gz 压缩包本身**；文件已被移动/删除给提示而非静默失败
   - **Q8** 删除工具轮次上限：终止条件只剩 取消 / 出错 / 模型给出最终文本；限额交给插件（插件监视轮次，超限经执行站 `agent.stop` 发停止信号）
-  - **Q9** `spec` 工具瘦身：只留 `select` / `create` / `update`；`select` **直接返回所选 Spec 全文**（删除 `search` / `list` 与"先 read 再 select"约束）；索引**注入系统提示词**（默认全列、>50 条截断）；内置 3 条只读（`general-task` / `hard-task` / `team-meeting`，落工作空间 `.self/spec/`；`easy-task` 已按使用数据移除、`complex-task` 更名 `general-task`）
+  - **Q9** `spec` 工具瘦身：只留 `select` / `create` / `update`；`select` **直接返回所选 Spec 全文**（删除 `search` / `list` 与"先 read 再 select"约束）；索引**注入系统提示词**（默认全列、>50 条截断）；内置 4 条只读（`general-task` / `hard-task` / `team-meeting` / `plugin-creator`，落工作空间 `.self/spec/`；`easy-task` 已按使用数据移除、`complex-task` 更名 `general-task`）
   - **Q10** `grep` 无匹配时返回**扫描文件清单**（≤200，超出注明总数）+ **生效的排除目录** + 扫描根，帮模型区分"真没有"与"被误排除"；默认口径 = 不扫描**隐藏路径**（`.[!.]*`，如 `.git` / `.dart_tool` / `.self`）+ 依赖/构建目录，要搜隐藏路径显式传 `include_hidden=true`（依赖/构建目录是硬黑名单，不受该开关影响）
   - **Q11** 站点体系（三站 + 收集站）：执行站首命令集 `fs.read` / `fs.write` / `fs.list` / `fs.grep` / `terminal.exec` / `agent.message` / `agent.stop` / `agent.compact` / `ui.push`；**站点全局唯一**（每类站一个实例，id 是类型常量，不按 team / mode 复制）；中转站"**每个点位全局唯一订阅者**"（先到先得 / 显式 `replace` 接管，需分流由订阅者自行转发）；收集站由**站点定义输入格式**、多订阅者各回目标数据、站点汇总后交后续处理（如注册工具）；订阅者未响应 ⇒ **返回部分结果 + 显式列出未响应者**（不整体失败、不静默）。**（**2026-10-01 点位化**：中转站按接入点拆成 6 个点位、执行站按命令族拆成 7 个点位、广播站加工具前/后两个点位，`system.relay` / `system.execute` 两个旧 id 退役并由读侧迁移接住；见上文「站点体系」与 `docs/plugin-development.md`。）
   - 插件可订阅站点**：JSON-RPC `station/subscribe` / `station/unsubscribe`（`relay` / `broadcast`，或 `station_id` 指定具体实例；scope 按目标 agent 的真实归属解析，声明是作用域上限）；**插件可自建站点**：`station/register` / `station/unregister`（id 由核心拼 `plugin.<插件id>.<类型>.<name>`，别人的自建站不能订、不能注销）；**每次工具调用的前/后各触发一次中转站**（工具层唯一入口 `WorkspaceToolRunner.run` 的入/出口），核心把**完整 tool_call 报文**交给插件——改参数、改结果、或什么都不改由插件内部决定；回填支持 string / 对象 / 数组（整体替换），未接线 / 无订阅者 / 插件未回 / 回包非法一律 **fail-open 放行原始报文**
@@ -205,7 +205,7 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
   | `set_todo_list` | 任务分解与增量进度汇报 |
   | `ask_user_question` | 向用户提问并等待作答（落盘、跨重启用） |
   | `team` / `message` | 建队 / 名册 / 档案 / 审核状态；派活、广播、等待完成 |
-  | `spec` | 规范**选择 / 创建 / 更新**（`select` 直接返回全文；索引注入系统提示词；4 个内置模板 + 工作空间自定义） |
+  | `spec` | 规范**选择 / 创建 / 更新**（`select` 直接返回全文；索引注入系统提示词；内置模板 + 工作空间自定义） |
   | `mcp` | 已注册 MCP 服务的工具（原生注入 + 兜底调用） |
   | `plugin` | 已加载插件的工具（同上） |
 
@@ -394,7 +394,7 @@ desktop/                       # desktop 分支（独立 git worktree）
 └── workspaces/<agent_id>/     # 默认工作空间（可在 agent yaml 里改；SSH 则是对端工作空间）
     └── .self/                 # 该工作空间/团队的私有状态（提示词与规范按团队分隔）
         ├── system_prompt.md   # 系统提示词基础段（首启播种；改完下一轮生效）
-        └── spec/*.md          # 内置（general-task/hard-task/team-meeting）+ 自定义 Spec
+        └── spec/*.md          # 内置（general-task/hard-task/team-meeting/plugin-creator）+ 自定义 Spec
 ```
 
 Windows 上是 `%APPDATA%\Tree`；`TREE_HOME` 环境变量或 `--data-dir` 可覆盖。

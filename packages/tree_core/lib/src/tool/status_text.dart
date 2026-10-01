@@ -1,3 +1,4 @@
+import '../spec/builtin_specs.dart';
 import 'todo_store.dart';
 
 /// 塞进每次工具结果前的"会话状态"提示（M5d）。
@@ -48,11 +49,10 @@ String specStatusText(List<String> selectedSpecIds) {
 }
 
 /// 内置 Spec id 的集合（判断文案用）。
-const Set<String> kBuiltinSpecIdSet = <String>{
-  'general-task',
-  'hard-task',
-  'team-meeting',
-};
+///
+/// 由 [kBuiltinSpecIds] 派生，**不再手抄一份**：新增内置 Spec 时只改 `builtin_specs.dart`，
+/// 否则这份清单会漏掉新 id，状态文案把内置读成「自定义」。
+final Set<String> kBuiltinSpecIdSet = kBuiltinSpecIds.toSet();
 
 String _timestamp() {
   final DateTime now = DateTime.now();

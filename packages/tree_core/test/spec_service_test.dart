@@ -45,7 +45,7 @@ void main() {
   List<String> selected() =>
       store.session(agent.id, sessionId)?.selectedSpecIds ?? <String>[];
 
-  test('内置模板：3 个、固定顺序、front matter 解析与原文逐字一致', () async {
+  test('内置模板：4 个、固定顺序、front matter 解析与原文逐字一致', () async {
     final List<SpecDocument> list = await service.index(agent.id, io);
     expect(list.map((SpecDocument s) => s.id), kBuiltinSpecIds);
     final SpecDocument first = list.first;
@@ -59,6 +59,15 @@ void main() {
     expect(first.tags, contains('general'));
     expect(first.body, contains('判型确认'));
     expect(first.raw, kBuiltinSpecs['general-task'], reason: '文件是源，播种后逐字返回原文');
+    // plugin-creator：同为 general 型，正文口径是"读原指南 + 本机/远端分工"
+    final SpecDocument last = list.last;
+    expect(last.id, 'plugin-creator');
+    expect(last.title, contains('插件开发'));
+    expect(last.taskType, 'general');
+    expect(last.builtin, isTrue);
+    expect(last.body, contains('唯一口径'));
+    expect(last.body, contains('docs/plugin-development.md'));
+    expect(last.raw, kBuiltinSpecs['plugin-creator']);
   });
 
   test('seedInto：内置模板播种到工作空间 .self/spec/，改动即生效（文件是源）', () async {
@@ -68,6 +77,12 @@ void main() {
     );
     expect(file.existsSync(), isTrue);
     expect(file.readAsStringSync(), kBuiltinSpecs['general-task']);
+    // 每个内置模板都要落盘（新增内置时漏播种 = 用户看不到文件，改不了）
+    for (final String id in kBuiltinSpecIds) {
+      final File seeded = File(p.join(temp.path, '.self', 'spec', '$id.md'));
+      expect(seeded.existsSync(), isTrue, reason: '内置模板未播种：$id');
+      expect(seeded.readAsStringSync(), kBuiltinSpecs[id], reason: id);
+    }
     // 手改副本后 detail 返回改后的内容（工作空间文件是源）
     file.writeAsStringSync('---\nid: general-task\ntitle: 改过的标题\n---\n\n正文\n');
     final SpecDocument? document = await service.detail(
@@ -192,11 +207,14 @@ void main() {
   });
 
   test('update：内置不可改；按段合并保留未提供段；版本与 changelog 递增', () async {
-    final Map<String, dynamic> builtin = await service.run(
-      call(<String, dynamic>{'action': 'update', 'spec_id': 'general-task'}),
-      io,
-    );
-    expect(builtin['error'], 'general-task 为内置 Spec，不可修改');
+    // 每个内置都不可 update（新增内置时不能漏出可改的口子）
+    for (final String id in kBuiltinSpecIds) {
+      final Map<String, dynamic> builtin = await service.run(
+        call(<String, dynamic>{'action': 'update', 'spec_id': id}),
+        io,
+      );
+      expect(builtin['error'], '$id 为内置 Spec，不可修改', reason: id);
+    }
 
     final Map<String, dynamic> created = await service.run(
       call(<String, dynamic>{
@@ -238,6 +256,11 @@ void main() {
     final List<SpecDocument> all = await service.index(agent.id, io);
     final String text = SpecService.renderIndex(all);
     expect(text, contains('- `general-task` [general] 通用任务（单人串行完成）（内置）'));
+    expect(
+      text,
+      contains('- `plugin-creator` [general] 插件开发（新建 / 改造 Tree 插件）（内置）'),
+      reason: '新增内置必须出现在注入提示词的索引里，且带内置标注',
+    );
     expect(text, contains('（适用: '));
 
     // when 摘要超 80 字符：截断加省略号，不整条塞进提示词
@@ -266,7 +289,7 @@ void main() {
 
     final String before = systemPromptWithWorkspace(agent);
     expect(before, contains('## Spec 索引（任务型规范）'));
-    expect(before, contains('general-task'), reason: '内置 3 条在索引里');
+    expect(before, contains('general-task'), reason: '内置 4 条在索引里');
     expect(before, isNot(contains('db-migration')));
 
     final Map<String, dynamic> created = await service.run(

@@ -163,7 +163,7 @@ void main() {
       specIndexProvider = (CoreAgent a) => specs.indexSnapshot(a.id);
 
       final String before = systemPromptWithWorkspace(agent);
-      expect(before, contains('general-task'), reason: '内置 3 条随时在');
+      expect(before, contains('general-task'), reason: '内置 4 条随时在');
       expect(before, isNot(contains('prompt-refresh')));
 
       await specs.run(

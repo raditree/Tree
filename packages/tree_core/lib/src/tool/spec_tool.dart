@@ -26,7 +26,7 @@ abstract final class SpecTool {
         '挂上之后全文会作为「已选 Spec 全文」持续注入本会话的系统提示词，不是只在这一轮有效。\n'
         'create/update：沉淀与维护自定义 Spec（落盘到工作空间 .self/spec/）。\n'
         '可用 Spec 的索引（id/类型/标题/适用条件）已列在系统提示词里，直接用 id 选取。'
-        '内置 Spec（general-task / hard-task / team-meeting）只读，不可 update。',
+        '内置 Spec（索引里标着「内置」的那些，清单以索引为准）只读，不可 update。',
     parameters: <String, dynamic>{
       'type': 'object',
       'properties': <String, dynamic>{

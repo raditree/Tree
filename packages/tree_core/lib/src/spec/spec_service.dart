@@ -106,7 +106,7 @@ class SpecService {
   /// 取某 agent 工作空间 IO 的解析器（Q9 索引后台刷新用）；由核心启动时接线。
   ///
   /// 为什么需要它：系统提示词是**同步**拼装的，而索引要读工作空间文件（异步）。
-  /// 没有快照时 [indexSnapshot] 只能先给内置 4 条，靠这个解析器在后台补全量。
+  /// 没有快照时 [indexSnapshot] 只能先给内置模板，靠这个解析器在后台补全量。
   Future<WorkspaceIO?> Function(String agentId)? ioFor;
 
   /// 规范文件所在目录（**工作空间内的 `.self/spec/`**）。
@@ -268,7 +268,7 @@ class SpecService {
 
   /// 供系统提示词用的索引快照（**同步**：提示词是同步拼装的）。
   ///
-  /// 没有快照时先只给**内置 4 条**（内嵌常量，随时算得出来），同时后台补一次全量：
+  /// 没有快照时先只给**内置模板**（内嵌常量，随时算得出来），同时后台补一次全量：
   /// 会话第一轮不会因为「还没人扫过工作空间」而整段索引缺失，也不必让每轮提示词都
   /// 去等一次目录扫描（SSH 下那是一串网络往返）。
   String indexSnapshot(String agentId) {
@@ -363,7 +363,7 @@ class SpecService {
   static String _selectedKey(String agentId, String sessionId) =>
       '$agentId|$sessionId';
 
-  /// 内置 4 条（同步，不碰工作空间）。
+  /// 内置模板（同步，不碰工作空间；清单与顺序以 [kBuiltinSpecIds] 为准）。
   static List<SpecDocument> _builtinDocuments() => <SpecDocument>[
     for (final String id in kBuiltinSpecIds)
       if (kBuiltinSpecs[id] != null)

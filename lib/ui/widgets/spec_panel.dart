@@ -5,7 +5,7 @@ import '../../io/api_service.dart';
 
 /// 任务规范（Spec）面板（P4 前端）
 ///
-/// 展示某 agent 可用的 Spec 索引（内置 4 置顶 + 自定义），支持：
+/// 展示某 agent 可用的 Spec 索引（内置置顶 + 自定义；清单由核心返回，前端不写死），支持：
 /// - 查看 Spec 元数据（task_type / description / when / tags）
 /// - 展开查看 Spec 全文
 /// - 为当前会话多选 Spec（挂 hook，重构 context 时注入全文）

@@ -110,7 +110,7 @@ void main() {
     return created['spec_id'] as String;
   }
 
-  test('GET specs：内置 3 个在前 + 自定义 spec；selected_spec_ids 与 store 一致', () async {
+  test('GET specs：内置 4 个在前 + 自定义 spec；selected_spec_ids 与 store 一致', () async {
     final String custom = await createCustom();
     final _Res res = await client.send(
       'GET',
@@ -118,7 +118,7 @@ void main() {
     );
     expect(res.status, 200);
     final List<dynamic> list = res.json['specs'] as List<dynamic>;
-    expect(list, hasLength(4));
+    expect(list, hasLength(5));
     expect((list.first as Map<String, dynamic>)['id'], 'general-task');
     expect((list.first as Map<String, dynamic>)['builtin'], isTrue);
     final Map<String, dynamic> customView = list.last as Map<String, dynamic>;
@@ -175,7 +175,7 @@ void main() {
       'GET',
       '/api/agents/${agent.id}/specs?session_id=$sessionId',
     );
-    expect((before.json['specs'] as List<dynamic>), hasLength(4));
+    expect((before.json['specs'] as List<dynamic>), hasLength(5));
 
     final _Res reset = await client.send(
       'POST',
@@ -196,13 +196,13 @@ void main() {
       File('${temp.path}/.self/spec/$custom.md.bak.1').existsSync(),
       isTrue,
     );
-    // 重置后只剩内置 3 个
+    // 重置后只剩内置 4 个
     final _Res after = await client.send(
       'GET',
       '/api/agents/${agent.id}/specs?session_id=$sessionId',
     );
     final List<dynamic> specsAfter = after.json['specs'] as List<dynamic>;
-    expect(specsAfter, hasLength(3));
+    expect(specsAfter, hasLength(4));
     expect(
       specsAfter.map((dynamic e) => (e as Map<String, dynamic>)['id']).toSet(),
       kBuiltinSpecIds.toSet(),
