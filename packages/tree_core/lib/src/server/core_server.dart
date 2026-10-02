@@ -43,6 +43,9 @@ import '../util/liveness.dart';
 import '../util/token.dart';
 import '../version.dart';
 import '../ws/inbound_frames.dart';
+import '../terminal/local_pty_starter.dart';
+import '../terminal/pty_process.dart';
+import '../terminal/terminal_service.dart';
 import '../ws/ws_hub.dart';
 import 'http_io.dart';
 import 'http_router.dart';
@@ -89,7 +92,19 @@ class CoreServer {
     required this.reassembler,
     required this.version,
     this.llmJsonCaller,
-  });
+    this.ptyStarter,
+  }) {
+    // 集成终端会话（Ctrl+J）：它要按 agent 解析工作区根，所以只在接了文件服务时可用；
+    // 伪终端实现默认用平台实现（ConPTY / script），测试可注入假的。
+    terminalService = fileService == null
+        ? null
+        : TerminalService(
+            store: store,
+            files: fileService!,
+            startPty: ptyStarter ?? LocalPtyStarter(log: errorLog).start,
+            log: errorLog,
+          );
+  }
 
   /// WS 端点路径（前端 `WebSocketService.connect` 固定拼接 `/ws?token=`）。
   static const String wsPath = '/ws';
@@ -186,6 +201,12 @@ class CoreServer {
 
   /// 工作空间文件服务（M7d）；为 null 时文件路由返回 501。
   final FileService? fileService;
+
+  /// 集成终端会话管理（Ctrl+J）；[fileService] 未接线时为 null，终端帧会给可读错误。
+  TerminalService? terminalService;
+
+  /// 伪终端工厂（测试注入假实现；生产用平台实现，见 [LocalPtyStarter]）
+  final PtyStarter? ptyStarter;
 
   /// 提问回路（M5a）；为 null 时核心不提供 `ask_user_question`（测试/最小骨架）。
   final QuestionBroker? questions;
@@ -304,6 +325,7 @@ class CoreServer {
     CompactionService? compaction,
     TerminalHooks? stationHooks,
     LlmJsonCaller? llmJsonCaller,
+    PtyStarter? ptyStarter,
   }) async {
     final HttpServer http = await HttpServer.bind(
       address ?? InternetAddress.loopbackIPv4,
@@ -350,6 +372,7 @@ class CoreServer {
       fileService: fileService,
       compaction: compaction,
       llmJsonCaller: llmJsonCaller,
+      ptyStarter: ptyStarter,
       hub: hub,
       questions: questions,
       conversation: ConversationService(
@@ -458,6 +481,8 @@ class CoreServer {
     await mcpService?.close();
     // 执行站挂载位置：只释放它**自建**的后台任务管理器（外部注入的那一份归注入方
     // 所有——CLI 里由 WorkspaceToolRunner.close() 关，这里重复关会把共用任务表清空）
+    // 终端会话先收：别把孤儿 shell 留在用户的工作区里
+    await terminalService?.closeAll();
     await _stationMounts?.close();
     await pluginBus?.close();
     // 总结器可能持有自己的 HTTP 连接池（与引擎的池分开）：随服务一起释放
@@ -875,7 +900,14 @@ class CoreServer {
     _access(request, 101);
     socket.listen(
       (dynamic data) => _handleWsFrame(connection, data),
-      onDone: () => hub.unregister(connection.id),
+      onDone: () {
+        // 连接断了就把它开的终端收掉：否则会留下孤儿 shell 占着工作区
+        unawaited(
+          terminalService?.closeForConnection(connection.id) ??
+              Future<void>.value(),
+        );
+        hub.unregister(connection.id);
+      },
       onError: (Object _) => hub.unregister(connection.id),
       cancelOnError: true,
     );
@@ -952,6 +984,32 @@ class CoreServer {
         break;
       case WsInboundType.pluginUiAction:
         _handlePluginUiAction(connection, frame);
+        break;
+      // ── 集成终端（Ctrl+J） ──────────────────────────────────────────
+      // 四条都要显式处理：静默忽略会让用户对着打不了字的终端猜（完备性门禁也拦）。
+      case WsInboundType.terminalOpen:
+        final TerminalService? terminals = terminalService;
+        if (terminals == null) {
+          connection.send(<String, dynamic>{
+            'type': WsOutboundType.terminalError,
+            TerminalFrame.terminalId:
+                (frame[TerminalFrame.terminalId] ?? '').toString(),
+            TerminalFrame.message: '核心未接线文件服务，终端不可用',
+          });
+        } else {
+          unawaited(terminals.open(connection, frame));
+        }
+        break;
+      case WsInboundType.terminalInput:
+        unawaited(terminalService?.input(frame) ?? Future<void>.value());
+        break;
+      case WsInboundType.terminalResize:
+        unawaited(terminalService?.resize(frame) ?? Future<void>.value());
+        break;
+      case WsInboundType.terminalClose:
+        unawaited(
+          terminalService?.closeFromFrame(frame) ?? Future<void>.value(),
+        );
         break;
       default:
         // 未知帧静默忽略（前向兼容：新前端配旧核心不应崩溃）

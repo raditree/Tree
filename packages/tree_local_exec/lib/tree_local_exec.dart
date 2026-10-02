@@ -12,6 +12,7 @@ export 'src/ansi_code_page.dart';
 export 'src/dartssh_transport.dart';
 export 'src/git_output.dart';
 export 'src/local_workspace_io.dart';
+export 'src/pty/pty_session.dart';
 export 'src/ssh_liveness.dart';
 export 'src/ssh_workspace_io.dart';
 export 'src/shell.dart';

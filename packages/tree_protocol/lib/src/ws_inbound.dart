@@ -1,4 +1,5 @@
 import 'plugin_ui.dart';
+import 'terminal.dart';
 
 /// WebSocket **上行**消息类型（前端 → 核心进程）。
 ///
@@ -31,6 +32,21 @@ abstract final class WsInboundType {
   /// `plugin_id` 路由给声明该槽位的插件（见 core_server 的 pluginUiAction 分支）。
   static const String pluginUiAction = PluginUiFrameType.action;
 
+  // ── 集成终端（Ctrl+J） ────────────────────────────────────────────────
+  // 值复用 [TerminalInboundType.*]（**别名**，不重复字面量），见 terminal.dart。
+
+  /// 开一个终端会话。
+  static const String terminalOpen = TerminalInboundType.open;
+
+  /// 键盘输入。
+  static const String terminalInput = TerminalInboundType.input;
+
+  /// 改窗口尺寸。
+  static const String terminalResize = TerminalInboundType.resize;
+
+  /// 结束会话。
+  static const String terminalClose = TerminalInboundType.close;
+
   /// 全部上行类型（完备性测试与文档用）。
   static const Set<String> all = <String>{
     heartbeat,
@@ -39,5 +55,9 @@ abstract final class WsInboundType {
     userAnswer,
     cancelQuestion,
     pluginUiAction,
+    terminalOpen,
+    terminalInput,
+    terminalResize,
+    terminalClose,
   };
 }

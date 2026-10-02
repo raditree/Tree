@@ -1,3 +1,5 @@
+import 'terminal.dart';
+
 /// WebSocket **下行**消息类型（核心进程 → 前端）。
 ///
 /// 与现状 server 的下行帧一一对应（`server/agent/chat.py` 流式与状态推送、
@@ -87,6 +89,21 @@ abstract final class WsOutboundType {
   /// 插件实例生命周期状态。
   static const String pluginStatus = 'plugin_status';
 
+  // ── 集成终端（Ctrl+J） ────────────────────────────────────────────────
+  // 值复用 [TerminalOutboundType.*]（**别名**，不重复字面量），见 terminal.dart。
+
+  /// 终端会话就绪（回 cwd / shell）。
+  static const String terminalReady = TerminalOutboundType.ready;
+
+  /// 终端输出（base64 原始字节）。
+  static const String terminalOutput = TerminalOutboundType.output;
+
+  /// 终端进程退出（带 exit_code）。
+  static const String terminalExit = TerminalOutboundType.exit;
+
+  /// 终端出错（可读 message）。
+  static const String terminalError = TerminalOutboundType.error;
+
   /// 全部下行类型（完备性测试与文档用）。
   static const Set<String> all = <String>{
     msgStart,
@@ -109,6 +126,10 @@ abstract final class WsOutboundType {
     frameEnd,
     pluginEvent,
     pluginStatus,
+    terminalReady,
+    terminalOutput,
+    terminalExit,
+    terminalError,
   };
 
   /// 分帧三件套（server 侧由 `ws_manager._FRAME_*` 常量产出，非字面量，
