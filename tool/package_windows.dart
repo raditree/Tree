@@ -135,11 +135,12 @@ Future<void> _package(List<String> args) async {
   // 脚本（见 packages/tree_core/lib/src/plugin/builtin_plugins.dart 的 scriptRoots）。
   // 漏了这一层，用户在界面上打开「示例插件」只会得到"找不到内置插件脚本"。
   // 目录不存在不算失败（有人可能只要核心，不带示例脚本），但要**打印一行**说明。
-  final int pluginFiles = _copyPlugins(root, releaseDir);
+  final _PluginCopy plugins = _copyPlugins(root, releaseDir);
   stdout.writeln(
-    pluginFiles < 0
+    !plugins.sourceExists
         ? '   插件脚本：跳过（没有 examples/plugins 目录）'
-        : '   插件脚本：plugins/（$pluginFiles 个文件）',
+        : '   插件脚本：plugins/（${plugins.copied} 个文件'
+              '${plugins.skipped > 0 ? '，跳过 ${plugins.skipped} 个本地产物' : ''}）',
   );
 
   // ③ 便携包说明（首次运行指引：数据在哪、怎么手改配置、出问题看哪）
@@ -267,27 +268,95 @@ Future<Never> _fail(String message, int code) async {
   exit(code);
 }
 
-/// 把 examples/plugins/ 复制到发行目录的 plugins/（返回复制的文件数）。
+/// 一次插件脚本拷贝的结果。
 ///
-/// 目录不存在返回 -1（"没有可拷的"与"拷了 0 个文件"是两件事，调用方要能区分）。
-/// 递归复制、保留子目录结构：插件常带自己的模块与数据文件。
+/// [sourceExists] 单独一个字段：`examples/plugins` 不存在（"没有可拷的"）与
+/// "拷了 0 个文件"是两件事，日志与调用方要能区分（原来用一个 -1 表达；加了
+/// "跳过几个"之后，继续挤在一个 int 里会更难读）。
+class _PluginCopy {
+  const _PluginCopy({
+    required this.sourceExists,
+    this.copied = 0,
+    this.skipped = 0,
+  });
+
+  const _PluginCopy.missing() : this(sourceExists: false);
+
+  final bool sourceExists;
+
+  /// 真正拷进去的文件数（含指南副本）。
+  final int copied;
+
+  /// 被当作"本地产物"跳过的文件数（见 [_isPluginJunkPath]）。
+  final int skipped;
+}
+
+/// **不该进发行包**的目录名：本地跑插件留下的缓存与环境。
+///
+/// 实际踩到的：在仓库里用 python 跑一次示例插件，目录里就多出 `__pycache__/*.pyc`；
+/// 而打包脚本原来是**整目录递归复制**，于是两个字节码文件一路进了 `Release/plugins/`，
+/// 再被 zip 与安装包原样带走（用户机器上纯属垃圾，也让"包里到底有什么"说不清）。
+const Set<String> _pluginJunkDirs = <String>{
+  '__pycache__',
+  '.git',
+  '.venv',
+  'venv',
+  '.mypy_cache',
+  '.pytest_cache',
+  '.ruff_cache',
+  '.idea',
+};
+
+/// 相对路径是否属于"本地产物"：任一路径段命中 [_pluginJunkDirs]，或是字节码文件。
+bool _isPluginJunkPath(String relative) {
+  final List<String> segments = relative.split(RegExp(r'[\\/]+'));
+  for (final String segment in segments) {
+    if (_pluginJunkDirs.contains(segment.toLowerCase())) return true;
+  }
+  final String name = segments.isEmpty ? relative : segments.last;
+  final String lower = name.toLowerCase();
+  return lower.endsWith('.pyc') || lower.endsWith('.pyo');
+}
+
+/// 把 examples/plugins/ 复制到发行目录的 plugins/。
+///
+/// 递归复制、保留子目录结构：插件常带自己的模块与数据文件；但**跳过本地产物**
+/// （[_pluginJunkDirs] 里的目录与 `.pyc`/`.pyo`，见 [_isPluginJunkPath]），
+/// 并顺手清掉目标目录里同类的残留（上一轮构建留下的、这一轮才发现不该在里面）。
+///
+/// 为什么不"先清空目标再拷"：`--release-dir` 可以指向任意目录（包括用户装好的
+/// 应用目录），那里的 `plugins/` 下可能有用户自己放的插件，整目录删除会把它一起抹掉；
+/// 只删自己认得出来的产物，是这里刻意的保守取舍。
 ///
 /// **另外**把 `docs/plugin-development.md`（系统性插件开发指南）也拷进 `plugins/`：
 /// 应用内「打开插件开发说明」首先找的就是 `plugins/plugin-development.md`
 /// （见 `lib/app_version.dart` 的 `PluginDocs`），发行版因此不必带整个 `docs/`。
 /// 指南缺失不算失败（会退回 `plugins/README.md`），所以这里静默跳过。
-int _copyPlugins(Directory root, Directory releaseDir) {
+_PluginCopy _copyPlugins(Directory root, Directory releaseDir) {
   final Directory source = Directory(_join(root.path, 'examples/plugins'));
-  if (!source.existsSync()) return -1;
+  if (!source.existsSync()) return const _PluginCopy.missing();
   final Directory target = Directory(_join(releaseDir.path, 'plugins'))
     ..createSync(recursive: true);
+  // 目标里的同类残留：只删认得出来的产物（保守起见不整目录重建）。
+  for (final FileSystemEntity entity in target.listSync()) {
+    final String name = _basename(entity.path).toLowerCase();
+    final bool junkDir = entity is Directory && _pluginJunkDirs.contains(name);
+    final bool junkFile =
+        entity is File && (name.endsWith('.pyc') || name.endsWith('.pyo'));
+    if (junkDir || junkFile) entity.deleteSync(recursive: true);
+  }
   int copied = 0;
+  int skipped = 0;
   for (final FileSystemEntity entity in source.listSync(recursive: true)) {
     if (entity is! File) continue;
     final String relative = entity.path
         .substring(source.path.length)
         .replaceAll(RegExp(r'^[\\/]+'), '');
     if (relative.isEmpty) continue;
+    if (_isPluginJunkPath(relative)) {
+      skipped++;
+      continue;
+    }
     final File destination = File(_join(target.path, relative));
     destination.parent.createSync(recursive: true);
     entity.copySync(destination.path);
@@ -300,7 +369,7 @@ int _copyPlugins(Directory root, Directory releaseDir) {
     guide.copySync(_join(target.path, 'plugin-development.md'));
     copied++;
   }
-  return copied;
+  return _PluginCopy(sourceExists: true, copied: copied, skipped: skipped);
 }
 
 /// 启动核心读握手（打包产物自检）。

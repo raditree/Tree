@@ -95,9 +95,12 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 1. `flutter build windows --release`；
 2. 用**同一个 SDK** 编译 `tree_core.exe` 并放进 Release 目录——发行版要求核心与 `Tree.exe` 同目录；
 3. 拷 `build/native_assets/windows/*.dll`（pdfrx 的 `pdfium.dll`）到 exe 旁边（native assets 不会自动进发行目录）；
-4. 写 `使用说明.txt`（数据目录、可手改的配置文件、常见问题）；
-5. **自检**：真启动一次打包好的核心，读到握手再让它优雅退出；
-6. 压 zip 到 `dist/`。
+4. 拷 `examples/plugins/` → 发行目录 `plugins/`（核心按**自身可执行文件同级**的 `plugins/<name>.py` 解析内置插件），
+   并**过滤本地产物**（`__pycache__` 等目录、`*.pyc`/`*.pyo`）——开发机上跑过一次示例插件就会留下它们，
+   不过滤就会被 zip 与安装包原样带走；`--release-dir` 指向用户目录时只删同类产物，不动用户自己放的插件；
+5. 写 `使用说明.txt`（数据目录、可手改的配置文件、常见问题）；
+6. **自检**：真启动一次打包好的核心，读到握手再让它优雅退出；
+7. 压 zip 到 `dist/`。
 
 安装包自检（本仓库验证过的流程）：静默装到临时目录 → 检查
 `Tree.exe` / `tree_core.exe` / `pdfium.dll` / `使用说明.txt` 是否齐 →
@@ -134,5 +137,6 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 - [ ] 5 层测试全绿（含门控真机 SSH / 编译产物冒烟，若环境具备）
 - [ ] `CHANGELOG.md` 记录本次版本的用户可见变化
 - [ ] `tool/package_windows.dart` 出的 zip 自检通过；安装包流程走一遍
+- [ ] 便携目录的 `plugins/` 里没有 `__pycache__` / `*.pyc` 等本地产物（脚本已过滤 + 清残留，再出现说明有别的路径漏了）
 - [ ] `docs/known-issues.md` 的未决项已复核（哪些已修、哪些进下个版本）
 - [ ] 新增/修改的行为在对应模块 README 的**不变量**节里有落点
