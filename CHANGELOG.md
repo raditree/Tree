@@ -58,6 +58,11 @@
   `team_repair.dart`）：上级被删的成员重挂到 TOP 且整棵子树的 `team_id`/`level` 一起平移；团队也没了就把最上层孤儿
   升为独立顶层 agent；`team_id` 悬空但父链完好按父链修正。每个被改的 `agents/<id>.yaml` 先备份 `.bak.<n>`（n 递增、
   绝不覆盖），幂等。
+- **伪终端（PTY）交付原始字节、缺口如实报、句柄不留孤儿**（[tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 8/9/10）：
+  `PtySession`（`startPtySession`）提供交互式伪终端：输出是**原始字节**（不解码、不清洗 ANSI）、键盘输入、改尺寸、
+  退出码，`close()` 幂等且收掉进程；Windows 走 **ConPTY**（`dart:ffi` 直调 kernel32，阻塞读放独立 isolate），
+  POSIX 走系统 `script`，后端或 API 缺失一律**显式抛可读错误**（`PtyUnsupportedException`），
+  **绝不静默降级**成无 TTY 的一次性 `exec`；改尺寸做不到时只记日志不抛。
 - **Ctrl+J 打开集成终端（真 PTY）**（[lib/README.md](lib/README.md) 不变量 14、[terminal/README.md](packages/tree_core/lib/src/terminal/README.md)）：
   输入框那块整体换成终端面板并**主动展开**（面板高 40%，可拖），再按一次回到输入框；终端**没有输入行**——按键逐键译成
   终端字节（回车 / 退格 / 方向键 / Ctrl+字母 / UTF-8 可打印字符），Ctrl+J 留给切换。核心开**真伪终端**
