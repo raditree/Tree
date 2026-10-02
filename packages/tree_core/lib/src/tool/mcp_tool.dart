@@ -1,6 +1,28 @@
+import 'dart:async';
+
 import '../mcp/mcp_client.dart';
 import '../mcp/mcp_service.dart';
 import 'tool_runner.dart';
+
+/// "已配置但当前不可用"的服务说明（`mcp help` 用）。
+///
+/// 为什么要有它：`help` 现在**不等待**连接（懒连接在后台跑），所以必须把"哪些服务还没连上 /
+/// 为什么没连上"如实写出来——否则模型只知道"工具少了一个"，看不出是配置问题还是服务没起来。
+String _offlineNote(McpService service) {
+  final List<String> offline = <String>[];
+  for (final McpServerConfig config in service.servers()) {
+    if (!config.enabled || service.isConnected(config.name)) continue;
+    final String? error = service.errorOf(config.name);
+    offline.add(
+      error == null
+          ? '${config.name}（连接中）'
+          : '${config.name}（不可用：$error）',
+    );
+  }
+  if (offline.isEmpty) return '';
+  return '未连接的服务（后台正在尝试；失败会带退避，可在「MCP 配置」查看原因）：'
+      '${offline.join('；')}';
+}
 
 /// `mcp` 工具（M6a）：MCP 工具的发现入口与兜底调用路径。
 ///
@@ -74,7 +96,13 @@ abstract final class McpTool {
         .trim();
     switch (action) {
       case 'help':
-        await service.refresh();
+        // **非阻塞**：不再 `await service.refresh()`（那会为连不上的服务等满 I×N=30s，
+        // 用户/模型看到的就是"点了没反应"）。这里列出已知工具 + 明确列出"已配置但未连接 /
+        // 有错误"的服务，并**后台**对未连接的服务发起一次懒连接（连上后下一轮工具表自然带上）。
+        for (final McpServerConfig config in service.servers()) {
+          if (!config.enabled || service.isConnected(config.name)) continue;
+          unawaited(service.ensureConnected(config.name));
+        }
         final List<({String service, McpToolInfo tool})> tools = service
             .allTools();
         if (tools.isEmpty) {
@@ -85,7 +113,8 @@ abstract final class McpTool {
           return ToolOutcome(
             '当前没有可用的 MCP 工具'
             '（已配置服务：${configured.isEmpty ? '无' : configured.join('、')}）。'
-            '可在右栏「MCP 配置」页注册服务，或在 <数据根>/config/mcp.yaml 手写。',
+            '可在右栏「MCP 配置」页注册服务，或在 <数据根>/config/mcp.yaml 手写。'
+            '${_offlineNote(service)}',
           );
         }
         final List<String> lines = <String>['可用 MCP 工具列表:'];
@@ -100,6 +129,8 @@ abstract final class McpTool {
                 : '- $toolName: ${entry.tool.description}',
           );
         }
+        final String note = _offlineNote(service);
+        if (note.isNotEmpty) lines.add(note);
         return ToolOutcome(lines.join('\n'));
       case 'call':
         final String toolName = (invocation.arguments['tool_name'] ?? '')

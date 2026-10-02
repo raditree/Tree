@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import '../util/liveness.dart';
+import 'mcp_http_client.dart';
 
 /// MCP（Model Context Protocol）stdio 客户端（M6a）。
 ///
@@ -31,18 +32,33 @@ import '../util/liveness.dart';
 ///   也由心跳给出（默认 I×N = 30s）：npx/node 冷启动几秒绰绰有余，真起不来就以
 ///   心跳丢失显式失败，而不是让核心一直挂着；
 ///
-/// MCP 客户端接口：真实现是 [McpClient.start]（stdio 子进程），测试可注入假实现。
+/// stdio 传输（子进程 + 逐行 JSON-RPC）。
+const String mcpTransportStdio = 'stdio';
+
+/// Streamable HTTP 传输（单端点 POST，响应可为 JSON 或 SSE 流）。
+const String mcpTransportHttp = 'http';
+
+/// MCP 客户端接口：真实现是 [McpClient.start]（按 transport 分派到子进程 / HTTP），
+/// 测试可注入假实现。
 abstract interface class McpClient {
-  /// 启动一个 MCP 服务进程并完成握手（用心跳判活，没有静态握手超时）。
+  /// 启动一个 MCP 服务并完成握手（用心跳判活，没有静态握手超时）。
+  ///
+  /// 按 [McpServerConfig.transport] 分派：`stdio`（子进程，缺省）/ `http`（Streamable HTTP）。
   static Future<McpClient> start(
     McpServerConfig config, {
     Duration heartbeatInterval = LivenessTracker.defaultInterval,
     int missedHeartbeatLimit = LivenessTracker.defaultMaxMisses,
-  }) => _StdioMcpClient.start(
-    config,
-    heartbeatInterval: heartbeatInterval,
-    missedHeartbeatLimit: missedHeartbeatLimit,
-  );
+  }) => config.isHttp
+      ? HttpMcpClient.start(
+          config,
+          heartbeatInterval: heartbeatInterval,
+          missedHeartbeatLimit: missedHeartbeatLimit,
+        )
+      : _StdioMcpClient.start(
+          config,
+          heartbeatInterval: heartbeatInterval,
+          missedHeartbeatLimit: missedHeartbeatLimit,
+        );
 
   /// 已握手的服务信息（initialize 的 result）。
   Map<String, dynamic> get serverInfo;
@@ -219,16 +235,7 @@ class _StdioMcpClient implements McpClient {
       'tools/list',
       const <String, dynamic>{},
     );
-    final Object? raw = result['tools'];
-    if (raw is! List<dynamic>) return const <McpToolInfo>[];
-    return raw
-        .whereType<Map<dynamic, dynamic>>()
-        .map(
-          (Map<dynamic, dynamic> item) => McpToolInfo.fromJson(
-            item.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
-          ),
-        )
-        .toList(growable: false);
+    return mcpToolsFromResult(result);
   }
 
   /// `tools/call`：调用一个工具，把 content 拼成文本（模型直接可读）。
@@ -241,29 +248,7 @@ class _StdioMcpClient implements McpClient {
       'tools/call',
       <String, dynamic>{'name': toolName, 'arguments': arguments},
     );
-    final List<String> parts = <String>[];
-    final Object? content = result['content'];
-    if (content is List<dynamic>) {
-      for (final dynamic item in content) {
-        if (item is Map<dynamic, dynamic>) {
-          final Map<dynamic, dynamic> map = item;
-          if (map['type'] == 'text') {
-            parts.add('${map['text'] ?? ''}');
-          } else {
-            parts.add(jsonEncode(map));
-          }
-        } else {
-          parts.add('$item');
-        }
-      }
-    } else if (content != null) {
-      parts.add('$content');
-    }
-    return McpCallResult(
-      text: parts.join('\n'),
-      isError: result['isError'] == true,
-      raw: result,
-    );
+    return mcpCallResultFrom(result);
   }
 
   Future<void> _initialize() async {
@@ -548,23 +533,45 @@ class McpLivenessException extends McpException {
   bool get livenessLost => true;
 }
 
-/// 一个 MCP 服务（stdio 外接）的配置。
+/// 一个 MCP 服务的配置（两种传输共用一份结构）。
+///
+/// - `transport = stdio`（缺省）：用 `command` / `args` / `env` 起一个子进程；
+/// - `transport = http`：用 `url` / `headers` 走 **Streamable HTTP** 单端点（`command` 等忽略）。
+///
+/// 缺省 stdio 是为了**兼容既有 `mcp.yaml`**：老配置里没有 `transport` 字段，行为逐字不变。
 class McpServerConfig {
   McpServerConfig({
     required this.name,
-    required this.command,
+    this.transport = mcpTransportStdio,
+    this.command = '',
     List<String>? args,
     Map<String, String>? env,
+    this.url = '',
+    Map<String, String>? headers,
     this.enabled = true,
     this.builtin = false,
     this.scope = '',
   }) : args = args ?? <String>[],
-       env = env ?? <String, String>{};
+       env = env ?? <String, String>{},
+       headers = headers ?? <String, String>{};
 
   final String name;
+
+  /// 传输类型：`stdio`（子进程，缺省）或 `http`（Streamable HTTP 单端点）。
+  final String transport;
+
   final String command;
   final List<String> args;
   final Map<String, String> env;
+
+  /// Streamable HTTP 端点（`transport = http` 时必填）。
+  final String url;
+
+  /// 自定义请求头（`Authorization` 等；`transport = http` 时用）。
+  ///
+  /// 只支持"请求头鉴权"这一种形态：不内置 OAuth/客户端证书流程。
+  final Map<String, String> headers;
+
   final bool enabled;
 
   /// 是否为内置服务（内置的不可删除，只可禁用）。
@@ -573,11 +580,17 @@ class McpServerConfig {
   /// 归属范围（前端"按当前会话模式自动落点"用；桌面端只做展示与持久化）。
   final String scope;
 
+  /// 是否走 HTTP 传输（其它取值一律按 stdio 处理，保持向后兼容）。
+  bool get isHttp => transport.trim().toLowerCase() == mcpTransportHttp;
+
   McpServerConfig copyWith({bool? enabled}) => McpServerConfig(
     name: name,
+    transport: transport,
     command: command,
     args: args,
     env: env,
+    url: url,
+    headers: headers,
     enabled: enabled ?? this.enabled,
     builtin: builtin,
     scope: scope,
@@ -585,19 +598,27 @@ class McpServerConfig {
 
   Map<String, dynamic> toJson() => <String, dynamic>{
     'name': name,
-    'command': command,
-    'args': args,
-    'env': env,
+    'transport': transport,
+    if (command.isNotEmpty) 'command': command,
+    if (args.isNotEmpty) 'args': args,
+    if (env.isNotEmpty) 'env': env,
+    if (url.isNotEmpty) 'url': url,
+    if (headers.isNotEmpty) 'headers': headers,
     'enabled': enabled,
     'builtin': builtin,
     'scope': scope,
   };
 
   /// 前端形态（`GET /api/mcp/services`）。
+  ///
+  /// 字段**恒定出现**（stdio 下 `url`/`headers` 为空），前端不必判 null。
   Map<String, dynamic> toApiJson() => <String, dynamic>{
     'name': name,
+    'transport': transport,
     'command': command,
     'args': args,
+    'url': url,
+    'headers': headers,
     'builtin': builtin,
     'enabled': enabled,
     'scope': scope,
@@ -605,6 +626,7 @@ class McpServerConfig {
 
   static McpServerConfig fromJson(Map<String, dynamic> json) => McpServerConfig(
     name: (json['name'] ?? '').toString(),
+    transport: (json['transport'] ?? mcpTransportStdio).toString(),
     command: (json['command'] ?? '').toString(),
     args:
         (json['args'] as List<dynamic>?)
@@ -617,9 +639,56 @@ class McpServerConfig {
               .entries)
         e.key.toString(): e.value.toString(),
     },
+    url: (json['url'] ?? '').toString(),
+    headers: <String, String>{
+      for (final MapEntry<dynamic, dynamic> e
+          in (json['headers'] as Map<dynamic, dynamic>? ?? <dynamic, dynamic>{})
+              .entries)
+        e.key.toString(): e.value.toString(),
+    },
     enabled: json['enabled'] != false,
     builtin: json['builtin'] == true,
     scope: (json['scope'] ?? '').toString(),
+  );
+}
+
+/// `tools/list` 的 result → 工具列表（stdio / HTTP 两个传输共用同一套解析）。
+List<McpToolInfo> mcpToolsFromResult(Map<String, dynamic> result) {
+  final Object? raw = result['tools'];
+  if (raw is! List<dynamic>) return const <McpToolInfo>[];
+  return raw
+      .whereType<Map<dynamic, dynamic>>()
+      .map(
+        (Map<dynamic, dynamic> item) => McpToolInfo.fromJson(
+          item.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
+        ),
+      )
+      .toList(growable: false);
+}
+
+/// `tools/call` 的 result → 文本结果（模型直接可读；两个传输共用）。
+McpCallResult mcpCallResultFrom(Map<String, dynamic> result) {
+  final List<String> parts = <String>[];
+  final Object? content = result['content'];
+  if (content is List<dynamic>) {
+    for (final dynamic item in content) {
+      if (item is Map<dynamic, dynamic>) {
+        if (item['type'] == 'text') {
+          parts.add('${item['text'] ?? ''}');
+        } else {
+          parts.add(jsonEncode(item));
+        }
+      } else {
+        parts.add('$item');
+      }
+    }
+  } else if (content != null) {
+    parts.add('$content');
+  }
+  return McpCallResult(
+    text: parts.join('\n'),
+    isError: result['isError'] == true,
+    raw: result,
   );
 }
 

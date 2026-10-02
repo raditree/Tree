@@ -73,14 +73,20 @@ void main() {
   late McpService service;
   late List<McpServerConfig> connected;
 
+  /// 本次测试期内的假客户端实例（按服务名），用于模拟"服务崩了"（closed=true）。
+  late Map<String, _FakeMcpClient> fakes;
+
   setUp(() {
     temp = Directory.systemTemp.createTempSync('tree_mcp_');
     connected = <McpServerConfig>[];
+    fakes = <String, _FakeMcpClient>{};
     service = McpService(
       configFile: '${temp.path}/config/mcp.yaml',
       clientFactory: (McpServerConfig config) async {
         connected.add(config);
-        return _FakeMcpClient(config);
+        final _FakeMcpClient client = _FakeMcpClient(config);
+        fakes[config.name] = client;
+        return client;
       },
     );
   });
@@ -314,6 +320,121 @@ void main() {
       expect(outcome.isError, isFalse);
       expect(outcome.content, 'echo: Y');
       await runner.close();
+    });
+  });
+
+  group('懒注册（真机反馈："点注册很久没反应、提示推了一次又一次"）', () {
+    test('register 只连它自己：不再把其它已连服务全量重连一遍', () async {
+      await service.register(<String, dynamic>{'name': 'a', 'command': 'node'});
+      await service.register(<String, dynamic>{'name': 'b', 'command': 'node'});
+      expect(service.isConnected('a'), isTrue);
+      expect(service.isConnected('b'), isTrue);
+      final LivenessTracker? aBefore = service.livenessOf('a');
+      final LivenessTracker? bBefore = service.livenessOf('b');
+      connected.clear();
+
+      await service.register(<String, dynamic>{'name': 'c', 'command': 'node'});
+
+      expect(
+        connected.map((McpServerConfig c) => c.name).toList(),
+        <String>['c'],
+        reason: '注册 c 的代价不该包含 a / b（旧实现 refresh(force: true) 会重连所有人）',
+      );
+      expect(
+        identical(service.livenessOf('a'), aBefore),
+        isTrue,
+        reason: 'a 的连接实例没被换掉（没被重连）',
+      );
+      expect(identical(service.livenessOf('b'), bBefore), isTrue);
+      expect(service.isConnected('c'), isTrue);
+      expect(service.toolsOf('c').map((McpToolInfo t) => t.name), <String>['echo']);
+    });
+
+    test('懒连接：连接掉了的服务在"调用它的工具"时才补连，且不惊动别的服务', () async {
+      await service.register(<String, dynamic>{'name': 'a', 'command': 'node'});
+      await service.register(<String, dynamic>{'name': 'b', 'command': 'node'});
+      // 模拟 a 的服务崩了（客户端已关闭）
+      fakes['a']!.closed = true;
+      expect(service.isConnected('a'), isFalse);
+      connected.clear();
+
+      final McpCallResult result = await service.callTool(
+        'mcp__a__echo',
+        <String, dynamic>{'text': 'x'},
+      );
+
+      expect(result.isError, isFalse, reason: '懒连接成功后正常调用');
+      expect(result.text, 'echo: x');
+      expect(
+        connected.map((McpServerConfig c) => c.name).toList(),
+        <String>['a'],
+        reason: '只补连 a：懒连接不该顺带连 b',
+      );
+      expect(service.isConnected('b'), isTrue, reason: 'b 的连接没被动过');
+    });
+
+    test('懒连接失败：给可读错误 + 记录原因，并在退避窗口内不反复重试', () async {
+      await service.register(<String, dynamic>{
+        'name': 'bad',
+        'command': 'node',
+      });
+      // 让它下次连接必失败
+      fakes.remove('bad');
+      service = McpService(
+        configFile: '${temp.path}/config/mcp.yaml',
+        clientFactory: (McpServerConfig config) async {
+          connected.add(config);
+          return _FakeMcpClient(config, failConnect: true);
+        },
+      );
+      service.load();
+      await service.refresh(force: true);
+      expect(service.isConnected('bad'), isFalse);
+      expect(service.errorOf('bad'), isNotNull);
+
+      connected.clear();
+      final McpCallResult result = await service.callTool(
+        'mcp__bad__echo',
+        <String, dynamic>{'text': 'x'},
+      );
+      expect(result.isError, isTrue);
+      expect(result.text, contains('不可用'));
+      expect(
+        connected,
+        isEmpty,
+        reason: '刚失败过（退避窗口内）不再重试：连接尝试本身就要等满心跳窗口，反复重试就是"又卡住了"',
+      );
+    });
+
+    test('transport/http 的注册校验：要 url、不要 command；stdio 仍要 command', () async {
+      expect(
+        (await service.register(<String, dynamic>{
+          'name': 'h1',
+          'transport': 'http',
+        })).toString(),
+        contains('需要合法 url'),
+      );
+      expect(
+        (await service.register(<String, dynamic>{
+          'name': 'h2',
+          'transport': 'http',
+          'url': 'ftp://example.com/mcp',
+        })).toString(),
+        contains('需要合法 url'),
+      );
+      expect(
+        (await service.register(<String, dynamic>{
+          'name': 'h3',
+          'transport': 'websocket',
+          'command': 'node',
+        })).toString(),
+        contains('transport 只支持'),
+      );
+      // 旧形态（无 transport）行为不变：仍要求 command
+      expect(
+        (await service.register(<String, dynamic>{'name': 's1'})).toString(),
+        contains('缺少 command'),
+      );
     });
   });
 }

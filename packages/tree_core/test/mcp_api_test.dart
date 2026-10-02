@@ -154,6 +154,43 @@ void main() {
     );
   });
 
+  test('POST 注册 Streamable HTTP 服务：要 url 不要 command；GET 带 transport/url/headers', () async {
+    final _Res missingUrl = await client.send(
+      'POST',
+      '/api/mcp/services',
+      body: <String, dynamic>{'name': 'h', 'transport': 'http'},
+    );
+    expect(missingUrl.status, 400);
+    expect(
+      missingUrl.json['detail'].toString(),
+      contains('需要合法 url'),
+      reason: '错误响应体的可读原因在 detail 字段（见 errorBody）',
+    );
+
+    final _Res created = await client.send(
+      'POST',
+      '/api/mcp/services',
+      body: <String, dynamic>{
+        'name': 'h',
+        'transport': 'http',
+        'url': 'https://example.com/mcp',
+        'headers': <String, String>{'Authorization': 'Bearer x'},
+        'scope': '',
+      },
+    );
+    expect(created.status, 200);
+    expect(created.json['success'], isTrue);
+
+    final _Res listed = await client.send('GET', '/api/mcp/services');
+    final Map<String, dynamic> view =
+        (listed.json['services'] as List<dynamic>).single
+            as Map<String, dynamic>;
+    expect(view['transport'], 'http');
+    expect(view['url'], 'https://example.com/mcp');
+    expect(view['headers'], <String, String>{'Authorization': 'Bearer x'});
+    expect(view['command'], '', reason: 'http 传输没有本机命令');
+  });
+
   test('非法注册 400；未知/内置服务删除有可读反馈', () async {
     expect(
       (await client.send(
