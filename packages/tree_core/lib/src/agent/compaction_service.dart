@@ -144,6 +144,13 @@ class CompactionService {
   /// 的 `CoreMessage`。由 `ConversationService` 把引擎接进来（`engine.wireRequestFor`）。
   WireRequestProvider? wireRequestProvider;
 
+  /// 压缩过程中的**过程提示**（重试进度等）出口：`(agentId, sessionId, 文案)`。
+  ///
+  /// 为什么需要它：总结器跑在传输层上、跟着同一套有限重试，但它**没有会话可渲染**
+  /// （不像生成那样有事件流给 `ConversationService`）。接线方（`ConversationService`）
+  /// 把这条提示落成一条 `llm_hidden` 的消息：用户看得到"压缩在重试"，模型看不到。
+  void Function(String agentId, String sessionId, String text)? noticeSink;
+
   /// 是否具备压缩能力（内置总结器或插件中转点任一生效）。
   bool get canCompact => summarizer != null || relayHook != null;
 
@@ -542,6 +549,8 @@ class CompactionService {
     }
     final bool passBack = passBackReasoningFor(agent);
     for (final CoreMessage message in messages) {
+      // `llm_hidden` 不是对话内容（模型从没读到过它）：写进摘要等于让它从摘要里混进来
+      if (message.llmHidden) continue;
       // 关闭回传时思考不在上下文里：把它写进摘要等于把 CoT 从后门塞回去
       if (message.isThinking && !passBack) continue;
       raw.writeln('- ${_line(message)}');
@@ -562,7 +571,12 @@ class CompactionService {
       );
     }
     try {
-      final String text = await inner.summarize(agent, prompt);
+      final String text = await inner.summarize(
+        agent,
+        prompt,
+        onNotice: (String notice) =>
+            noticeSink?.call(agent.id, session.sessionId, notice),
+      );
       return SummaryText('$summaryHeader\n$text');
     } catch (error) {
       log?.call('LLM 总结失败，回退到截断摘要：$error');
@@ -614,7 +628,10 @@ class CompactionService {
     required bool passBackReasoning,
   }) => _clip(
     messages
-        .where((CoreMessage m) => !m.isThinking || passBackReasoning)
+        .where(
+          (CoreMessage m) =>
+              !m.llmHidden && (!m.isThinking || passBackReasoning),
+        )
         .map(_line)
         .join('\n'),
     2000,
@@ -633,6 +650,8 @@ class CompactionService {
     ToolResultGate gate,
     bool passBackReasoning,
   ) {
+    // `llm_hidden` 的消息引擎根本不会发出去：算进预算会让压缩阈值凭空提前
+    if (message.llmHidden) return 0;
     if (message.isThinking) {
       return passBackReasoning
           ? estimateTokens(message.content, scale: scale)
@@ -673,7 +692,14 @@ class CompactionService {
 /// （生产实现见 llm/llm_summarizer.dart 的 LlmSummarizer）。
 abstract interface class ContextSummarizer {
   /// 用该 agent 绑定的模型总结 [prompt]；失败抛异常（调用方回退到截断摘要）。
-  Future<String> summarize(CoreAgent agent, String prompt);
+  ///
+  /// [onNotice]：过程提示（目前只有"重试进度"）——总结器在传输层重试时回调，
+  /// 由 [CompactionService.noticeSink] 接到会话层落成 `llm_hidden` 消息。
+  Future<String> summarize(
+    CoreAgent agent,
+    String prompt, {
+    void Function(String notice)? onNotice,
+  });
 
   /// 释放资源（幂等）。
   Future<void> close();

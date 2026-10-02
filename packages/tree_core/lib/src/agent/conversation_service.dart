@@ -114,6 +114,10 @@ class ConversationService {
           (CoreAgent agent, CoreSession session) =>
               target.wireRequestFor(_contextOf(agent, session));
     }
+    // 压缩的过程提示（重试进度）也走会话：落一条 llm_hidden 的消息，用户看得见、模型看不到
+    if (compaction != null) {
+      compaction!.noticeSink = _sendHiddenNotice;
+    }
   }
 
   final TreeStore store;
@@ -696,6 +700,10 @@ class ConversationService {
             'usage': event.usage,
             ...envelope,
           });
+        } else if (event is AgentNotice) {
+          // 系统发言（重试进度等）：立刻落库 + 下发，但**不进模型上下文**（llm_hidden）。
+          // 不下发的话，用户面对的就是"最长两分多钟的空白"。
+          _sendNotice(agent, session, event.text, llmHidden: true);
         } else if (event is AgentError) {
           errorMessage = event.message;
         } else if (event is AgentDone) {
@@ -732,15 +740,18 @@ class ConversationService {
 
     final String? failure = errorMessage;
     if (failure != null) {
-      // 1) error 帧（日志/遥测）；2) 一条**可见**的 agent 消息（前端只忽略 error 帧）
+      // 1) error 帧（日志/遥测）；2) 一条**可见**的 agent 消息（前端只忽略 error 帧）。
+      // 落库带 llm_hidden：**给人看，不喂模型**——否则模型下一轮读到这句错误，会把它
+      // 当成"新的排查任务"接着干活（用户实测反馈）。
       _sendError(failure);
-      _sendNotice(agent, session, failure);
+      _sendNotice(agent, session, failure, llmHidden: true);
     }
     if (cancelled) {
       // 用户按 stop → 给一条可见提示；被"新消息"打断（interjection）则**不提示**：
       // 用户刚发的话就是它的上下文，再刷"已停止本轮生成。"纯属噪声。
       if (!token.interrupted) {
-        _sendNotice(agent, session, '已停止本轮生成。');
+        // 同样是"给人看"的一句话：模型不需要知道"这一轮被用户停了"（读到只会当成新指令）
+        _sendNotice(agent, session, '已停止本轮生成。', llmHidden: true);
       }
     }
     _running.remove(runKey);
@@ -802,14 +813,18 @@ class ConversationService {
   /// 现状 server 的 `_send_text_as_agent` 走的就是这条路径：错误提示、停止提示
   /// 等"系统发言"必须出现在会话里，用户才看得到。
   ///
-  /// [kind] 默认 `text`（错误/停止提示都用它）；**hook 唤醒提示用 `notice`**：
-  /// UI 渲染不变（前端按 kind 分派，未知 kind 落到普通文本气泡），但引擎翻译历史时
-  /// 会把它当 **user** 消息——原因见 [wake] 的注释与 recon 实测。
+  /// [kind] 两选一（都是"落库 + 前端可见"）：`text`（默认：模型自己说的话，引擎按
+  /// assistant 发回去）、`notice`（**hook 唤醒提示**：引擎按 **user** 发，它是"新输入"，
+  /// 原因见 [wake] 的注释与 recon 实测）。
+  ///
+  /// [llmHidden] = **不插进模型提示词**（系统发言 / 过程提示用）：消息照常落库、照常
+  /// 下发，但引擎重建请求时整条跳过。
   void _sendNotice(
     CoreAgent agent,
     CoreSession session,
     String content, {
     String kind = 'text',
+    bool llmHidden = false,
   }) {
     final String id = CoreIds.message();
     hub.broadcast(<String, dynamic>{
@@ -818,6 +833,7 @@ class ConversationService {
       'role': 'agent',
       'content': content,
       'kind': kind,
+      if (llmHidden) 'llm_hidden': true,
       'agent_id': agent.id,
       'session_id': session.sessionId,
     });
@@ -830,6 +846,7 @@ class ConversationService {
         content: content,
         kind: kind,
         timestamp: DateTime.now().millisecondsSinceEpoch,
+        llmHidden: llmHidden,
       ),
     );
   }
@@ -839,6 +856,7 @@ class ConversationService {
     role: message.role,
     content: message.content,
     kind: message.kind,
+    llmHidden: message.llmHidden,
     toolName: message.toolName,
     toolArguments: message.toolArguments,
     toolResult: message.toolResult,
@@ -1101,6 +1119,19 @@ class ConversationService {
   void _notifyOnce(String key, void Function() notify) {
     if (!_notified.add(key)) return;
     notify();
+  }
+
+  /// 按 id 发一条 `llm_hidden` 的**过程提示**（压缩重试进度这类）。
+  ///
+  /// 与 [_sendNotice] 的关系：那个要持有对象（生成路径手上就有）；这条是给"手里只有
+  /// id"的接线方用的（例如 [CompactionService.noticeSink]——压缩发生在引擎回调里，
+  /// 谁都不知道当下是哪个对象）。对象找不到就静默丢弃：提示丢了不影响压缩本身。
+  void _sendHiddenNotice(String agentId, String sessionId, String text) {
+    final CoreAgent? agent = store.agent(agentId);
+    if (agent == null) return;
+    final CoreSession? session = store.session(agentId, sessionId);
+    if (session == null) return;
+    _sendNotice(agent, session, text, llmHidden: true);
   }
 
   /// 推一条**不落库**的 agent 提示（诊断用），前端收到 message 帧就会渲染。

@@ -73,7 +73,8 @@ abstract final class OpenAiCodec {
           (error['message'] as String?) ??
           (error['type'] as String?) ??
           '端点返回错误';
-      events.add(LlmFailureEvent(message));
+      // 端点已经明确回答（HTTP 200 + 错误对象）：不是链路问题，重试没有意义
+      events.add(LlmFailureEvent(message, retryable: false));
       return events;
     }
 

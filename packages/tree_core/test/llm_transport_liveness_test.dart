@@ -33,11 +33,15 @@ void main() {
   });
 
   /// 心跳间隔 100ms × 允许丢 3 次 = 300ms 判失活（测试要快，所以把常量压小）。
+  ///
+  /// **关掉重试**：本文件测的是"一次尝试"的心跳判活；重试口径（含"心跳丢失算
+  /// 可重试失败"）由 `http_sse_transport_test` 的『有限重试』组覆盖。
   HttpSseTransport transport() => HttpSseTransport(
     baseUrl: 'http://127.0.0.1:$port/v1',
     apiKey: 'sk-test',
     heartbeatInterval: const Duration(milliseconds: 100),
     missedHeartbeatLimit: 3,
+    retryBackoff: const <Duration>[],
   );
 
   const LlmRequest request = LlmRequest(

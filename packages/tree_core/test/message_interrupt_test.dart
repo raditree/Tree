@@ -375,9 +375,12 @@ void main() {
       await done;
 
       expect(tools.finishedAt, isNotNull);
+      // 用 `!isBefore` 而不是 `isAfter`：DateTime 只有毫秒精度，工具收尾与返回落在
+      // 同一毫秒时 isAfter 会误判（全量并行跑时实测偶发）。这仍然抓得住真 bug——
+      // "整轮提前结束"时 now 会早于 finishedAt（若工具还没收尾，上面那条 isNotNull 先失败）。
       expect(
-        DateTime.now().isAfter(tools.finishedAt!),
-        isTrue,
+        DateTime.now().isBefore(tools.finishedAt!),
+        isFalse,
         reason: '整轮在工具跑完之后才结束（"立即"的边界就在这一次工具内）',
       );
     });

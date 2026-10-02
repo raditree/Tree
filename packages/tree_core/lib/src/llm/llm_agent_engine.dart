@@ -596,6 +596,9 @@ class LlmAgentEngine implements AgentEngine {
         toolBatch.add(ref);
         continue;
       }
+      // `llm_hidden`（系统发言 / 重试进度）**不进请求**：它们是系统说给用户听的，
+      // 喂给模型只会被当成"新的排查任务"（用户实测反馈）。落库与 UI 显示不受影响。
+      if (ref.llmHidden) continue;
       // 推理内容：默认不回灌（思考过程不是对话上下文）；"回传思考"开启时攒起来，
       // 由 flushRound 挂到本轮的 assistant 消息上（DeepSeek 思考模式的硬要求）。
       if (ref.isThinking) {

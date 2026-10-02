@@ -274,6 +274,11 @@ class LlmSession {
           yield AgentThinking(event.text);
         } else if (event is LlmToolCallDelta) {
           drafts.putIfAbsent(event.index, _ToolCallDraft.new).accept(event);
+        } else if (event is LlmRetryNotice) {
+          // 重试进度是**说给用户听的**（不是对话内容，也不属于模型输出）：
+          // 日志留痕 + 交给上层落一条 llm_hidden 的消息；不打断这一轮的继续重试。
+          log?.call(event.message);
+          yield AgentNotice(event.message);
         } else if (event is LlmUsageEvent) {
           turnUsage = event.usage;
         } else if (event is LlmFinishEvent) {

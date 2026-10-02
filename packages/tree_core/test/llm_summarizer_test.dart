@@ -51,6 +51,36 @@ void main() {
     expect(request.reasoningEffort, isNull, reason: '模型/成员都没声明思考档位时不额外发送');
   });
 
+  test('重试进度转发给上层：总结器自己没有会话可渲染', () async {
+    final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+      <LlmStreamEvent>[
+        const LlmRetryNotice(
+          '模型端点调用失败（第 1/5 次重试，5s 后重试）：链路断了',
+          attempt: 1,
+          total: 5,
+        ),
+        ...textScript('要点一'),
+      ],
+    ]);
+    final List<String> logs = <String>[];
+    final LlmSummarizer summarizer = LlmSummarizer(
+      resolveModel: (String id) => id == 'demo' ? config : null,
+      transportFactory: (CoreModelConfig _) => transport,
+      log: logs.add,
+    );
+
+    final List<String> notices = <String>[];
+    final String text = await summarizer.summarize(
+      agent(),
+      '请总结',
+      onNotice: notices.add,
+    );
+
+    expect(text, '要点一', reason: '提示不占正文、也不改变总结结果');
+    expect(notices.single, contains('第 1/5 次重试'));
+    expect(logs.single, contains('第 1/5 次重试'), reason: '同时留一行日志');
+  });
+
   test('成员级 max_output_tokens 直接复用（总结不再另设上限），成员覆盖回调被调用', () async {
     final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
       textScript('ok'),

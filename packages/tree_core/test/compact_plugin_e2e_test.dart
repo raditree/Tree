@@ -608,7 +608,11 @@ void main() {
 /// 假总结器（回退路径专用）。
 class _FakeSummarizer implements ContextSummarizer {
   @override
-  Future<String> summarize(CoreAgent agent, String prompt) async => '内置摘要';
+  Future<String> summarize(
+    CoreAgent agent,
+    String prompt, {
+    void Function(String notice)? onNotice,
+  }) async => '内置摘要';
 
   @override
   Future<void> close() async {}

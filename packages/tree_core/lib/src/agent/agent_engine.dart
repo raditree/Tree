@@ -79,6 +79,16 @@ final class AgentUsage extends AgentEvent {
   final Map<String, dynamic> usage;
 }
 
+/// **系统发言**（给用户看的一句话：重试进度、失败提示等）。
+///
+/// 它不参与本轮生成内容（不拼正文、不算 usage），落库时带 `llm_hidden` ⇒
+/// 下一轮重建请求时整条跳过——模型看到的始终只有真实对话。
+final class AgentNotice extends AgentEvent {
+  const AgentNotice(this.text);
+
+  final String text;
+}
+
 /// 本轮失败（已在文案里给出可读原因）。
 final class AgentError extends AgentEvent {
   const AgentError(this.message);
@@ -114,6 +124,7 @@ class CoreMessageRef {
     this.toolResultForModel = '',
     this.timestamp = 0,
     this.attachments,
+    this.llmHidden = false,
   });
 
   /// `user` / `agent`（存储层口径）。
@@ -159,6 +170,10 @@ class CoreMessageRef {
 
   /// 是否是"系统/hook 提示"（`kind == 'notice'`）：翻译时按 **user** 消息发出。
   bool get isNotice => kind == 'notice';
+
+  /// 是否**不插进提示词**（存储层的 `llm_hidden`）：系统发言与过程提示都是这种。
+  /// 与 [isNotice] 相反——那个要按 user 进上下文。见 LlmAgentEngine 的历史翻译。
+  final bool llmHidden;
 
   bool get isUser => role == 'user';
 }

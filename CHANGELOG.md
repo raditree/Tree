@@ -8,9 +8,33 @@
 > 桌面线把后端逻辑整体迁入本机核心进程、从零重写，历史条目与新代码不逐条对应，因此不再保留；
 > 需要溯源请看 git 历史与 [docs/archive/](docs/archive/README.md)。
 
+> **条目口径（只记断言）**：条目只写**新增或修改的断言**——即各模块 `README.md` 的
+> 「不变量（assertions）」条款（包级 README 同样算：`tree_local_exec` / `tree_protocol` …），
+> 每条给出断言原文与出处文件。**实现细节、重构、修 bug 若没有改动任何断言，就不写 CHANGELOG**
+> ——溯源看 git 历史。理由：断言是"行为契约"的最小可验证单位，功能流水账既读不完、也对不上代码。
+> 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
+> 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
+
 ## [1.0.0] — 未发布（首个开源版本）
 
-### Added
+### 断言变化（新增 / 修改的 README 不变量）
+
+- **LLM 传输层有限重试**（[llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 11）：最多 5 次重试、
+  退避 `5/10/20/40/80s`（累计 155s），且**只在这一次尝试一个事件都还没交给上层时**重试——半路断流（已有增量）不重试，
+  4xx / 流中 error 帧 / 取消 / 传输层已关闭不重试，退避等待可取消；**每次重试前先产出 `LlmRetryNotice`**
+  （落成 `llm_hidden` 的进度消息），用户不会对着两分多钟的空白猜是不是卡死了；**总结器走同一条传输层**，
+  它的进度经 `CompactionService.noticeSink` 落成同一种消息。
+- **`llm_hidden`：用户看得见、模型看不见**（[llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 12、
+  [agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 3、
+  [store/README.md](packages/tree_core/lib/src/store/README.md) 不变量 10）：失败 / 停止提示与**重试进度**照常落库、
+  照常下发（前端当普通气泡），但引擎重建请求时**整条跳过**（压缩重试进度同理）；`kind` 保持 `text`——
+  不做新 kind 的理由：`system` 会被读成 system prompt，「进不进提示词」与消息类别是两件正交的事。
+- **grep 的三个数字各管一件事**（[tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 7）：
+  `scannedFileCount` 是计数、`scannedFilePaths` 只留 20 条抽样、`GrepQuery.maxResults`（默认 200）是命中行数上限。
+- **成员与 leader 共享工作目录与 SSH、私有状态按 agent 分栏**（[team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 2/3/4）：
+  成员 yaml 里的 `workspace_dir` **不生效**、`ssh:` 缺省取 TOP 的、`.self` 落在 `.tree/<agent_id>/`。
+
+### Added（首个版本总览）
 
 - **单进程桌面形态**：Flutter 界面 + 纯 Dart 核心 `tree_core`（可编译成单文件，约 10 MB）；
   核心只监听 `127.0.0.1` 随机端口，一次性 token 经 stdout 握手下发；关窗时优雅退出，不留孤儿进程。

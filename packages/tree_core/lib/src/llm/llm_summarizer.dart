@@ -31,7 +31,11 @@ class LlmSummarizer implements ContextSummarizer {
   final Map<String, LlmTransport> _transports = <String, LlmTransport>{};
 
   @override
-  Future<String> summarize(CoreAgent agent, String prompt) async {
+  Future<String> summarize(
+    CoreAgent agent,
+    String prompt, {
+    void Function(String notice)? onNotice,
+  }) async {
     final CoreModelConfig? resolved = resolveModel(agent.modelId);
     final CoreModelConfig? config = resolved?.withOverrides(
       agentOverrides?.call(agent.id) ?? const <String, Object?>{},
@@ -47,6 +51,7 @@ class LlmSummarizer implements ContextSummarizer {
       config,
       prompt,
       _summaryOutputTokens(config),
+      onNotice,
     );
     if (attempt.text.isNotEmpty) return attempt.text;
     // 传输层已经报错（HTTP 4xx/5xx、链路失活、取消）：原样如实上报。
@@ -76,6 +81,7 @@ class LlmSummarizer implements ContextSummarizer {
     CoreModelConfig config,
     String prompt,
     int? budget,
+    void Function(String notice)? onNotice,
   ) async {
     final StringBuffer text = StringBuffer();
     int thinkingChars = 0;
@@ -101,6 +107,12 @@ class LlmSummarizer implements ContextSummarizer {
         thinkingChars += event.text.length;
       } else if (event is LlmFinishEvent) {
         finishReason = event.reason;
+      } else if (event is LlmRetryNotice) {
+        // 压缩跟生成走**同一套**传输层重试；但总结器没有会话/事件流可渲染，
+        // 于是把进度交回上层（CompactionService.noticeSink → 一条 llm_hidden 消息），
+        // 否则用户只会看到"卡住了"。
+        log?.call(event.message);
+        onNotice?.call(event.message);
       } else if (event is LlmFailureEvent) {
         failure = event.cancelled ? '总结请求被取消' : event.message;
         break;

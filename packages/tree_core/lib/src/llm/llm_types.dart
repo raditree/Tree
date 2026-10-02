@@ -551,6 +551,28 @@ final class LlmFinishEvent extends LlmStreamEvent {
   final String reason;
 }
 
+/// **重试进度**：这次尝试失败了、即将退避重试（说给用户听的一句话）。
+///
+/// 它不是模型输出，也**不影响**"这一跳是否已经产出内容"的判定——传输层在它之后
+/// 照样可以重试（它被排除在"已交给上层的事件"之外，见 HttpSseTransport.stream）；
+/// 上层（LlmSession）把它翻成 `AgentNotice`，落库时带 `llm_hidden`。
+final class LlmRetryNotice extends LlmStreamEvent {
+  const LlmRetryNotice(
+    this.message, {
+    required this.attempt,
+    required this.total,
+  });
+
+  /// 可读文案（含失败原因与等待时长）。
+  final String message;
+
+  /// 这是第几次重试（从 1 起）。
+  final int attempt;
+
+  /// 一共允许几次重试。
+  final int total;
+}
+
 /// 失败（HTTP 错误、流中错误帧、网络异常、超时、取消）。
 final class LlmFailureEvent extends LlmStreamEvent {
   const LlmFailureEvent(
@@ -558,6 +580,7 @@ final class LlmFailureEvent extends LlmStreamEvent {
     this.statusCode,
     this.cancelled = false,
     this.livenessLost = false,
+    this.retryable = true,
   });
 
   final String message;
@@ -571,4 +594,11 @@ final class LlmFailureEvent extends LlmStreamEvent {
   /// 与普通端点错误区分开：这一类的正确反应是**重连 / 提示用户链路已断**，而不是
   /// 让用户去改模型配置。判据见 HttpSseTransport（连续 N 次心跳未达，与总耗时无关）。
   final bool livenessLost;
+
+  /// 是否【值得重试】（默认 true；口径见 HttpSseTransport 的「重试口径」一节）。
+  ///
+  /// 传输层按它 + [statusCode] 一起判定。显式置 false 的是【端点已经把话说完了】
+  /// 的那一类：流中 error 帧（HTTP 200 但正文是错误对象，例如余额不足、密钥无效）
+  /// ——重试只是把同一句拒绝听 5 遍，白花 5 次配额与几分钟等待。
+  final bool retryable;
 }

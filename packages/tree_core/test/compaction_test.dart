@@ -12,9 +12,17 @@ class _FakeSummarizer implements ContextSummarizer {
   final List<String> prompts = <String>[];
   bool closed = false;
 
+  /// 非空时在总结过程中回调一次 `onNotice`（模拟"压缩也在重试"）。
+  String? noticeText;
+
   @override
-  Future<String> summarize(CoreAgent agent, String prompt) async {
+  Future<String> summarize(
+    CoreAgent agent,
+    String prompt, {
+    void Function(String notice)? onNotice,
+  }) async {
     prompts.add(prompt);
+    if (noticeText != null) onNotice?.call(noticeText!);
     if (gate != null) await gate!.future;
     if (error != null) throw StateError('$error');
     return '总结正文';
@@ -567,6 +575,40 @@ void main() {
       expect(refreshed.compactedMessageCount, greaterThan(0));
       expect(refreshed.history.last.content, '回答三');
       expect(summarizer.prompts, hasLength(1));
+    });
+
+    test('压缩时的重试进度落成 llm_hidden 提示：用户看得见、模型看不到', () async {
+      addTurn('一');
+      addTurn('二');
+      addTurn('三');
+      summarizer.noticeText =
+          '模型端点调用失败（第 1/5 次重试，5s 后重试）：读取模型响应失败';
+      final LlmAgentEngine engine = LlmAgentEngine(
+        resolveModel: (String id) => null,
+      );
+      ConversationService(
+        store: store,
+        hub: WsHub(),
+        settings: settings,
+        compaction: service,
+        engine: engine,
+      );
+
+      final AgentRunContext? refreshed = await engine.toolTurnCompactor!(
+        agent.id,
+        session.sessionId,
+        force: true,
+      );
+
+      expect(refreshed, isNotNull, reason: '提示不影响压缩本身');
+      final CoreMessage notice = store
+          .messages(agent.id, session.sessionId)
+          .lastWhere(
+            (CoreMessage m) => m.content.contains('第 1/5 次重试'),
+          );
+      expect(notice.llmHidden, isTrue, reason: '压缩进度不给模型看');
+      expect(notice.kind, 'text', reason: '照常发：前端当普通气泡渲染');
+      expect(notice.role, 'agent');
     });
 
     test('没到阈值时钩子返回 null（引擎保持原上下文）', () async {

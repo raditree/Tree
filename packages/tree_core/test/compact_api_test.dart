@@ -62,7 +62,11 @@ class _Summarizer implements ContextSummarizer {
   int calls = 0;
 
   @override
-  Future<String> summarize(CoreAgent agent, String prompt) async {
+  Future<String> summarize(
+    CoreAgent agent,
+    String prompt, {
+    void Function(String notice)? onNotice,
+  }) async {
     calls++;
     if (delay > Duration.zero) await Future<void>.delayed(delay);
     return '压缩摘要：早期对话要点';

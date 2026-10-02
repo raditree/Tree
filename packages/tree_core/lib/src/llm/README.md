@@ -10,7 +10,7 @@
 | [llm_types.dart](llm_types.dart) | 与厂商无关的数据类型：`LlmMessage` / `LlmToolSpec` / `LlmRequest` / `LlmUsage` / 流式事件 |
 | [openai_codec.dart](openai_codec.dart) | OpenAI 兼容协议的编解码（请求体构造 + 流式分片解码） |
 | [sse_parser.dart](sse_parser.dart) | SSE 增量解析（严格按空行事件边界） |
-| [llm_transport.dart](llm_transport.dart) | `HttpSseTransport`：`dart:io HttpClient` + 心跳判活 + 取消即断流 |
+| [llm_transport.dart](llm_transport.dart) | `HttpSseTransport`：`dart:io HttpClient` + 心跳判活 + 取消即断流 + **有限重试（5 次退避，零增量才重试）** |
 | [llm_session.dart](llm_session.dart) | 一轮完整会话：增量拼接、usage 累计、上下文裁剪、门控、工具循环 |
 | [llm_agent_engine.dart](llm_agent_engine.dart) | `AgentEngine` 实现：模型解析、历史翻译、门控、`token_scale` 学习、传输缓存、中转点钩子 |
 | [llm_result_gate.dart](llm_result_gate.dart) | `ToolResultGate`：超长工具结果重定向到 `.self/results/` |
@@ -30,6 +30,9 @@
 8. **vision 三条硬约束**：① 只读工作空间 IO（SSH 成员的图在**远端**，绝不拼本机绝对路径）；② 失败一律降级、**绝不阻断本轮**；③ 密钥只进 `Authorization` 头，日志里只有端点与 `file_id`。`file_id` 是**内容块的同级字段**（嵌套形状真端点一律 400）；缓存键必须带**工作空间身份**，否则换主机会命中另一台机器上的旧 `file_id`（用户看到"我发的明明是另一张图，模型答的是老图"）。
 9. **总结器不带工具、复用原模型的输出长度**：`max_tokens` 是**思考 + 正文**的总预算，另立一个小值是长会话的必然失败（实测 2048 全花在思考上，`finish_reason=length`、正文一个字都没有）。
 10. `llm.call` 在**站点处硬设** `response_format = json_object`，端点不支持就**如实失败**（不静默去掉再试）；它是独立调用，不进任何中转点位、不计入对话用量、不写会话历史。
+11. **有限重试只在传输层，且只在"零增量"时发生**（[llm_transport.dart](llm_transport.dart)）：默认最多 **5 次**重试、退避 `5/10/20/40/80s`（累计 155s，覆盖"端点几分钟后恢复、任务自动接续"），**只在这一次尝试一个事件都还没交给上层时**重试——上层（会话 / 总结器 / `llm.call`）因此完全看不见重试，不存在重复输出与重复计费。**已经吐出增量的失败（半路断流）不重试**：重放会与已渲染的正文并列，那种情况如实报错。可重试 = 无 HTTP 响应（建连失败 / 等响应头超时 / 心跳丢失 / 读取中断，含 `Connection closed while receiving data`）、408、429、5xx；**不可重试** = 4xx（密钥 / 模型 / 参数错——重试只是白花 5 次配额）、流中 error 帧（`LlmFailureEvent.retryable = false`）、取消、传输层已关闭。退避等待**可取消**（250ms 一片地看取消位），用户按 stop 立刻结束而不是等满退避。**每次重试前先产出一个 `LlmRetryNotice`**（会话翻成 `AgentNotice` → 落一条 `llm_hidden` 的消息："第 2/5 次重试，10s 后"），否则用户面对的是最长两分多钟的空白。**总结器（[llm_summarizer.dart](llm_summarizer.dart)）走同一条传输层 ⇒ 同一套重试**；它没有会话/事件流可渲染，所以进度经 `ContextSummarizer.summarize(onNotice:)` 交回 `CompactionService.noticeSink`，由会话层落成一条 `llm_hidden` 的提示（用户看得见"压缩在重试"，模型看不到）。会话层另有唯一的"重试"：端点报上下文超限 → 强制压缩一次 → 重试**同一轮**（`overflowRetried`，整轮仅一次，防死循环）。
+12. **`llm_hidden` = "用户看得见、模型看不见"的唯一开关**：打了这个标记的消息**照常落库、照常下发**（前端当普通气泡渲染），但引擎重建请求时**整条跳过**——模型读到那句"读取模型响应失败：…"只会把它当成**新的排查任务**（用户实测反馈）。使用者：**系统发言**（失败提示、"已停止本轮生成。"）与**过程提示**（重试进度，见不变量 11）。压缩侧的 token 估算、摘要输入与降级摘要同样跳过它（口径必须与实发那一份一致）。与 `kind == 'notice'`（hook 唤醒）方向相反：那个是**新一轮输入**、按 user 发出去，不可一刀切。
+    **为什么是字段而不是新 `kind`**：`system` 会被读成 system prompt（协议里真有 `LlmRole.system`），而这里要表达的维度是"**进不进提示词**"——一个布尔标记，与"这条消息是正文 / 思考 / 工具卡 / 提示"是两件正交的事。标记是通用的：任何消息都能打。
 
 ## 测试
 
@@ -37,9 +40,11 @@
 cd packages/tree_core
 dart test test/llm_protocol_test.dart test/llm_session_test.dart test/llm_tool_loop_test.dart \
           test/llm_prefix_stability_test.dart test/llm_transport_liveness_test.dart \
-          test/http_sse_transport_test.dart test/llm_result_gate_test.dart \
+          test/http_sse_transport_test.dart test/llm_hidden_test.dart \
+          test/llm_result_gate_test.dart \
           test/llm_summarizer_test.dart test/vision_files_test.dart test/reasoning_toolcall_test.dart
 ```
 
 假传输夹具 `test/fake_transport.dart`、`test/fake_files_api.dart`——LLM 会话因此可以完全脱离网络单测。
-`llm_prefix_stability_test` 是"历史逐字复用"这条红线的钉子。
+`llm_prefix_stability_test` 是"历史逐字复用"这条红线的钉子；`http_sse_transport_test` 的『有限重试』组（真实 HttpServer + 裸 socket 半路掐断）钉住重试的判据与次数，
+`llm_hidden_test` 钉住"打了 `llm_hidden` 的消息不进请求、但仍落库可见"。

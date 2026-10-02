@@ -295,6 +295,7 @@ void main() {
             LlmUsageEvent(:final LlmUsage usage) =>
               'usage:${usage.promptTokens}/${usage.completionTokens}',
             LlmFinishEvent(:final String reason) => 'finish:$reason',
+            LlmRetryNotice(:final int attempt) => 'retry:$attempt',
             LlmFailureEvent(:final String message) => 'failure:$message',
           },
         )

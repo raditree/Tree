@@ -6,6 +6,21 @@ import 'llm_types.dart';
 import 'openai_codec.dart';
 import 'sse_parser.dart';
 
+/// 默认重试退避：**5 次重试**，累计等待 5+10+20+40+80 = 155s（≈2.6 分钟）。
+///
+/// 为什么是分钟级：这一层要覆盖"端点重启 / 网关抖动几分钟后自动接续任务"，
+/// 而不是"快速失败"。次数不再往上加的理由：等待期间用户可以随时取消，但每多一次
+/// 重试就把"用户按 stop 之前要看的空白"拉长一截。
+///
+/// 序列长度 = 重试次数上限；空列表 = 关闭重试（测试与"只想快速失败"的场合）。
+const List<Duration> kDefaultRetryBackoff = <Duration>[
+  Duration(seconds: 5),
+  Duration(seconds: 10),
+  Duration(seconds: 20),
+  Duration(seconds: 40),
+  Duration(seconds: 80),
+];
+
 /// LLM 传输层：把一次 [LlmRequest] 变成一串 [LlmStreamEvent]。
 ///
 /// 抽象出这一层的目的：会话逻辑（上下文装配、工具循环、用量累计）与
@@ -35,6 +50,19 @@ abstract interface class LlmTransport {
 /// - 唯一保留的短超时是 [connectTimeout]（建连 + 等响应头）：它只服务**可诊断**
 ///   ——"端点根本没起"要立刻说得清，而不是让界面一直转圈；它不限制推理时长。
 ///
+/// **重试口径（默认最多 5 次，退避 5/10/20/40/80s）**：
+/// - **只在"这一次尝试一个事件都还没交给上层"时重试**：上层因此完全看不见重试，
+///   不存在重复输出、重复计费。已经吐出增量的失败（半路断流）**不重试**——重放会与
+///   已经渲染的正文并列；那种情况如实报错，由用户决定要不要再说一句"继续"；
+/// - **可重试**：没有 HTTP 响应（建连失败 / 等响应头超时 / 心跳丢失 / 读取中断，
+///   例如 `HttpException: Connection closed while receiving data`）、408、429、5xx；
+/// - **不重试**：4xx（密钥 / 模型 / 参数错——重试只是白花 5 次配额）、流中 error 帧
+///   （[LlmFailureEvent.retryable] 为 false）、已取消、传输层已关闭；
+/// - 等待期间**可取消**：用户按 stop 立刻结束，不会等满退避；每次重试前先产出一个
+///   [LlmRetryNotice]（用户看得到"在重试第几次"，它不算"已产出的内容"）；
+/// - 为什么需要它：端点重启 / 网关抖动是**分钟级**的，一次失败就把整轮任务丢掉
+///   代价太大（用户得从头再讲一遍）。
+///
 /// 活性观测：[missedHeartbeats] / [lastHeartbeatAt] / [isAlive] 供上层做重连决策
 /// 与 UI 展示（并发多条流时，这几个值反映**最近一条**流的活性）。
 ///
@@ -51,6 +79,7 @@ class HttpSseTransport implements LlmTransport {
     this.connectTimeout = const Duration(seconds: 10),
     this.heartbeatInterval = const Duration(seconds: 10),
     this.missedHeartbeatLimit = 3,
+    this.retryBackoff = kDefaultRetryBackoff,
     Duration? idleTimeout,
   }) : _idleOverride = idleTimeout,
        _client = client ?? HttpClient() {
@@ -81,6 +110,11 @@ class HttpSseTransport implements LlmTransport {
   /// 心跳丢失。默认 10s × 3 = 30s 静默即失活；常量可配。
   final int missedHeartbeatLimit;
 
+  /// 重试退避序列：**长度就是重试次数上限**（默认 [kDefaultRetryBackoff] = 5 次）。
+  ///
+  /// 空列表 = 关闭重试。
+  final List<Duration> retryBackoff;
+
   /// 显式覆盖静默窗口（老口径 / 测试要极短窗口时使用；null = 用推导值）。
   final Duration? _idleOverride;
 
@@ -108,8 +142,61 @@ class HttpSseTransport implements LlmTransport {
   /// 最近一条流**最后一次收到数据的时间**（null = 该流一个字节都没收到过）。
   DateTime? get lastHeartbeatAt => _monitor?.lastBeatAt;
 
+  /// 一次 [LlmRequest] → 事件流（**含有限重试**）。
+  ///
+  /// 重试口径见类注释；上层（LlmSession / 总结器 / llm.call）拿到的因此只是
+  /// "一次可能稍慢的调用"，看不见重试。
   @override
   Stream<LlmStreamEvent> stream(
+    LlmRequest request, {
+    bool Function()? isCancelled,
+  }) async* {
+    for (int attempt = 0; ; attempt++) {
+      LlmFailureEvent? failure;
+      bool produced = false;
+      await for (final LlmStreamEvent event in _attemptOnce(
+        request,
+        isCancelled: isCancelled,
+      )) {
+        // 已经交给上层的事件**收不回来**：从这一刻起失败就不该重试（重放会与它并列）
+        if (event is LlmFailureEvent) {
+          failure = event;
+          break;
+        }
+        produced = true;
+        yield event;
+      }
+      if (failure == null) return;
+      final bool canRetry =
+          !produced &&
+          _retryable(failure) &&
+          attempt < retryBackoff.length &&
+          !(isCancelled?.call() ?? false);
+      if (!canRetry) {
+        yield failure;
+        return;
+      }
+      final Duration wait = retryBackoff[attempt];
+      // 先说给用户听（上层据此落一条 llm_hidden 的消息），再退避等待：最长两分多钟的
+      // 空白里，用户必须看得到"在重试"。
+      yield LlmRetryNotice(
+        '模型端点调用失败（第 ${attempt + 1}/${retryBackoff.length} 次重试，'
+        '${_formatDuration(wait)} 后重试）：${failure.message}',
+        attempt: attempt + 1,
+        total: retryBackoff.length,
+      );
+      if (!await _waitBeforeRetry(wait, isCancelled)) {
+        // 退避等待期间被停止：与"请求中途取消"同一口径
+        yield const LlmFailureEvent('已取消', cancelled: true);
+        return;
+      }
+    }
+  }
+
+  /// 单次尝试：把一次请求变成一串事件（**不含重试**）。
+  ///
+  /// 一次尝试**最多产出一个** [LlmFailureEvent] 并以它收尾；正常结束时自然结束。
+  Stream<LlmStreamEvent> _attemptOnce(
     LlmRequest request, {
     bool Function()? isCancelled,
   }) async* {
@@ -229,6 +316,39 @@ class HttpSseTransport implements LlmTransport {
     if (_closed) return;
     _closed = true;
     _client.close(force: true);
+  }
+
+  /// 这次失败是否**值得重试**（判定口径见类注释「重试口径」）。
+  bool _retryable(LlmFailureEvent event) {
+    if (_closed) return false;
+    if (event.cancelled) return false;
+    if (!event.retryable) return false;
+    final int? code = event.statusCode;
+    // 没有 HTTP 状态码 = 根本没走到"端点给了答复"那一步：建连失败 / 等响应头超时 /
+    // 心跳丢失 / 读取中断。端点恢复后这类失败最可能自愈，正是重试要覆盖的场景。
+    if (code == null || code == 0) return true;
+    if (code == 408 || code == 429) return true; // 请求超时 / 限流：等一等再来
+    return code >= 500; // 5xx：端点自己出问题了
+  }
+
+  /// 退避等待：切成 250ms 的小片，**每片都看一次取消**。
+  ///
+  /// 直接 await 一次 [Future.delayed] 会让"用户按了 stop"最多等到退避结束（80s）——
+  /// 那等于把"可取消"做成假的。返回 false = 等待期间被取消。
+  Future<bool> _waitBeforeRetry(
+    Duration total,
+    bool Function()? isCancelled,
+  ) async {
+    const int slice = 250;
+    final int totalMs = total.inMilliseconds;
+    for (int elapsed = 0; elapsed < totalMs; elapsed += slice) {
+      if (isCancelled?.call() ?? false) return false;
+      final int remain = totalMs - elapsed;
+      await Future<void>.delayed(
+        Duration(milliseconds: remain < slice ? remain : slice),
+      );
+    }
+    return !(isCancelled?.call() ?? false);
   }
 
   /// 心跳丢失的错误文案。

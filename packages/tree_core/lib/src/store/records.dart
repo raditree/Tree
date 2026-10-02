@@ -369,6 +369,7 @@ class CoreMessage {
     this.attachments,
     this.options,
     this.answered = false,
+    this.llmHidden = false,
   });
 
   factory CoreMessage.fromJson(Map<String, dynamic> json) {
@@ -403,6 +404,7 @@ class CoreMessage {
           ?.map((dynamic e) => e.toString())
           .toList(),
       answered: json['answered'] as bool? ?? false,
+      llmHidden: json['llm_hidden'] as bool? ?? false,
     );
   }
 
@@ -462,6 +464,18 @@ class CoreMessage {
   /// 详见 `ConversationService.wake` 与 `.self/plan/20261001-thinking-400-and-interrupt/`。
   bool get isNotice => kind == 'notice';
 
+  /// **不插进模型提示词**（`llm_hidden: true`）：消息照常落库、照常下发（前端当普通
+  /// 气泡渲染），但引擎重建请求时**整条跳过**。
+  ///
+  /// 用它的两类东西：
+  /// - **系统发言**——失败提示、"已停止本轮生成。"（模型读到那句错误只会把它当成
+  ///   新的排查任务；用户实测反馈）；
+  /// - **过程提示**——重试进度（"第 2/5 次重试"），给用户看的，不是对话内容。
+  ///
+  /// 与 [isNotice] 的分工一眼可辨：`notice`（hook 唤醒）是**新的输入**，要按 user 进
+  /// 上下文；本标记则相反。字段是通用的：任何消息都能打这个标签（插件/未来注入同理）。
+  final bool llmHidden;
+
   Map<String, dynamic> toJson() => <String, dynamic>{
     'id': id,
     'agent_id': agentId,
@@ -482,6 +496,8 @@ class CoreMessage {
     'attachments': attachments,
     'options': options ?? const <String>[],
     'answered': answered,
+    // 只在该隐藏时才落这个键：普通消息的 jsonl 一行不该多个 false
+    if (llmHidden) 'llm_hidden': true,
     'is_streaming': false,
   };
 }
