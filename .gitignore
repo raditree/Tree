@@ -94,3 +94,15 @@ server/data/sft/
 *.Key
 server/data/*.zip
 agentspace
+# ---- Tree desktop（DSH 会话）本地产物：一律不入库 ----
+
+# 工作空间 agent 的私有目录（记忆 / 计划 / 门控重定向结果）
+/.self/
+# 会话输入（粘贴的图片等）
+/.input/
+# 本机 DSH 插件安装目录（不属于本仓库源码）
+/.dsh-plugins/
+# 根级 Node 工具链残留（本仓库不用 npm；package.json 曾是空 {}）
+/node_modules/
+/package.json
+/package-lock.json
