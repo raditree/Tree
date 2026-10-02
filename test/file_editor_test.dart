@@ -125,8 +125,10 @@ void main() {
     bool readOnly = false,
     String reason = '',
     VoidCallback? onClose,
+    ThemeData? theme,
   }) async {
     await tester.pumpWidget(MaterialApp(
+      theme: theme,
       home: Scaffold(
         body: FileViewer(
           workspaceId: 'ws1',
@@ -153,6 +155,28 @@ void main() {
   }
 
   group('源码模式按语言渲染', () {
+    testWidgets('代码视图的文本域不画内框（主题强制边框也不画）',
+        (WidgetTester tester) async {
+      core.content = 'final int x = 1;';
+      core.size = core.content.length;
+      final ThemeData theme = ThemeData(
+        useMaterial3: false,
+        inputDecorationTheme: const InputDecorationTheme(
+          enabledBorder: OutlineInputBorder(),
+          focusedBorder: OutlineInputBorder(),
+        ),
+      );
+      await pumpViewer(tester, path: 'lib/main.dart', theme: theme);
+      final TextField field = tester.widget<TextField>(find.byType(TextField));
+      final InputDecoration effective = field.decoration!.applyDefaults(
+        theme.inputDecorationTheme,
+      );
+      // 编辑器自己的框由外层窗格画：只写 border: none 会被主题的 enabled/focused 边框盖回来
+      expect(effective.border, InputBorder.none);
+      expect(effective.enabledBorder, InputBorder.none);
+      expect(effective.focusedBorder, InputBorder.none);
+    });
+
     testWidgets('按扩展名挑语言，标题栏给出语言标签', (WidgetTester tester) async {
       core.content = 'final int x = 1;';
       core.size = core.content.length;

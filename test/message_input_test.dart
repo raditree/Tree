@@ -94,6 +94,43 @@ void main() {
   String fieldText(WidgetTester tester) =>
       tester.widget<TextField>(find.byType(TextField)).controller!.text;
 
+  testWidgets('文本域不画内框：主题强制边框时也被显式清掉（否则卡片里会多一个方框）',
+      (WidgetTester tester) async {
+    // 与真实主题同口径（main.dart 的 inputDecorationTheme：给设置页/表单用的那一圈）。
+    // 焦点：只写 border: InputBorder.none 压不住主题 —— InputDecoration 的解析顺序是
+    // focusedBorder → enabledBorder → border（用户 2026-10-03 截图就是这圈绿框）。
+    final ThemeData theme = ThemeData(
+      useMaterial3: false,
+      inputDecorationTheme: const InputDecorationTheme(
+        enabledBorder: OutlineInputBorder(),
+        focusedBorder: OutlineInputBorder(),
+      ),
+    );
+    await tester.pumpWidget(MaterialApp(
+      theme: theme,
+      home: Scaffold(
+        body: MessageInput(
+          onSend: (String text, List<String> files) async => true,
+        ),
+      ),
+    ));
+    final TextField field = tester.widget<TextField>(find.byType(TextField));
+    final InputDecoration effective = field.decoration!.applyDefaults(
+      theme.inputDecorationTheme,
+    );
+    expect(effective.border, InputBorder.none);
+    expect(
+      effective.enabledBorder,
+      InputBorder.none,
+      reason: '主题的 enabledBorder 会盖过 border：必须显式清掉，边框归外层卡片画',
+    );
+    expect(
+      effective.focusedBorder,
+      InputBorder.none,
+      reason: '聚焦时也不许冒出主题那圈绿框',
+    );
+  });
+
   testWidgets('一次粘贴多个文件：每个都成为附件，且不再尝试读位图',
       (WidgetTester tester) async {
     mockClipboard(files: <String>[

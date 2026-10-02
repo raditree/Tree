@@ -12,6 +12,7 @@ import '../models/file_content.dart';
 import '../services/code_highlight.dart';
 import '../services/download_center.dart';
 import '../services/editor_settings.dart';
+import 'input_style.dart';
 import 'pdf_preview.dart';
 
 /// 文本文件扩展名
@@ -1012,10 +1013,11 @@ class FileViewerState extends State<FileViewer> {
           textAlignVertical: TextAlignVertical.top,
           style: baseStyle,
           cursorColor: cs.primary,
-          decoration: const InputDecoration(
-            border: InputBorder.none,
+          // 编辑器自己的框由外层窗格画；这里必须显式清掉主题的 enabled/focused 边框
+          // （只写 border: none 会被 inputDecorationTheme 覆盖回来，见 input_style.dart）
+          decoration: kBorderlessInput.copyWith(
             isDense: true,
-            contentPadding: EdgeInsets.all(12),
+            contentPadding: const EdgeInsets.all(12),
           ),
           onChanged: (String _) {
             if (!_dirty) {

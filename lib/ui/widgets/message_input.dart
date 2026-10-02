@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'attachment_preview.dart';
+import 'input_style.dart';
 
 /// 一条未发送完的输入草稿（M9 Q6）。
 ///
@@ -526,11 +527,13 @@ class _MessageInputState extends State<MessageInput> {
       maxLines: _expanded ? null : 8,
       keyboardType: TextInputType.multiline,
       style: const TextStyle(fontSize: 14, height: 1.4),
-      decoration: InputDecoration(
+      // 边框由外层卡片画（见 _buildInputBody 的 Container），文本域自己不许再画一圈：
+      // 全局 inputDecorationTheme 给了 enabled/focused 边框，只写 border: none 压不住它
+      // （解析顺序 focusedBorder → enabledBorder → border，见 input_style.dart）。
+      decoration: kBorderlessInput.copyWith(
         isDense: true,
         hintText: '输入消息…',
         hintStyle: TextStyle(color: cs.onSurfaceVariant, fontSize: 14),
-        border: InputBorder.none,
         contentPadding: EdgeInsets.zero,
       ),
     );

@@ -114,7 +114,12 @@
   它**不参与运行期解析**（仍只看 TOP 那份），只为两件事：界面显示成员实际在用的目录；
   **TOP 被删后成员升为 TOP 的无损交接**（用户断言 2026-10-03：升级后**不可以**重新选择工作目录，
   配置不能留空、按 TOP 填写）。
-- **"这是远端吗"的唯一判据是「有效 SSH」**（[files/README.md](packages/tree_core/lib/src/files/README.md) 不变量 9、
+- **消息输入框的文本域自己不画边框**（[lib/README.md](lib/README.md) 不变量 10）：装饰必须把
+  `enabledBorder` / `focusedBorder` / `disabledBorder` / `errorBorder` / `focusedErrorBorder` 一并置空
+  （统一常量 [input_style.dart](lib/ui/widgets/input_style.dart)）——只写 `border: InputBorder.none` 压不住全局
+  `inputDecorationTheme`（解析顺序 focusedBorder → enabledBorder → border），表现是卡片里多出主题那圈绿框；
+  代码编辑器（源码视图）同一条口径。
+- **「这是远端吗」的唯一判据是「有效 SSH」**（[files/README.md](packages/tree_core/lib/src/files/README.md) 不变量 9、
   [team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 3）：`teamSshConfigFor`（成员自己没有 `ssh:` 时跟随团队 TOP）
   贯穿工具层、文件面板、Git 面板与集成终端；此前文件面板只看 `agent.sshConfig`，把 SSH leader 的成员判成本机
   ——面板会拿一个远端路径去本机找目录（轻则"目录不存在"，重则读到本机同名路径），集成终端更会在本机起一个 shell。
