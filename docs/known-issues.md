@@ -596,23 +596,150 @@ compact 后，发消息不引起系统提示词更新"**。据此实现：
 
 用户原话：**"system prompt 不中途重建，但 MCP 与 plugin 产生的工具至少要在每次发消息时刷新"**。
 
-- 工具表在请求体的 @BT@tools@BT@ 字段里，**不参与消息前缀** ⇒ 每次刷新不伤缓存；
+- 工具表在请求体的 `tools` 字段里，**不参与消息前缀** ⇒ 每次刷新不伤缓存；
   系统提示词在第 0 条消息里 ⇒ 一变就整条前缀作废。两者因此是不同处置：一个钉住、一个每轮现取。
-- 现状（未改代码，本来就是刷新语义）：@BT@LlmAgentEngine.run@BT@ 每次运行都调
-  @BT@toolRunner.specsFor(agentId, sessionId)@BT@；@BT@WorkspaceToolRunner.specsFor@BT@ 现取
-  @BT@McpService.allTools()@BT@ 与 @BT@PluginTool.dynamicSpecsFor(...)@BT@（后者是"缓存 + 失效点"，
+- 现状（未改代码，本来就是刷新语义）：`LlmAgentEngine.run` 每次运行都调
+  `toolRunner.specsFor(agentId, sessionId)`；`WorkspaceToolRunner.specsFor` 现取
+  `McpService.allTools()` 与 `PluginTool.dynamicSpecsFor(...)`（后者是"缓存 + 失效点"，
   插件上线 / 下线 / 重启后下一次取用即更新）。源码里那句注释就是这条口径：
   "**工具表刷新处**（模型每轮生成前都走这里）"。
-- **防回归用例**：@BT@test/tool_list_refresh_test.dart@BT@——第二轮"服务就绪"后新工具
-  （@BT@mcp__demo__ping@BT@）必须立刻出现在该轮请求的 @BT@tools@BT@ 里，**同时**系统提示词仍是第一轮那串
+- **防回归用例**：`test/tool_list_refresh_test.dart`——第二轮"服务就绪"后新工具
+  （`mcp__demo__ping`）必须立刻出现在该轮请求的 `tools` 里，**同时**系统提示词仍是第一轮那串
   字节。谁把工具表缓存进"钉住的上下文"，这条就红。既有的插件侧覆盖见
-  @BT@test/plugin_tool_table_test.dart@BT@（上线/下线 ⇒ 工具表变化 + 缓存失效点）与 @BT@plugin_hot_apply_test.dart@BT@。
-- 范围：**同一轮内**（tool loop 的后续跳）工具表在 @BT@LlmSession@BT@ 里固定——符合"每次发消息刷新"；
-  若要"每一跳都刷新"需在 @BT@LlmSession@BT@ 每跳重取（tools 不在前缀里，不影响缓存），**目前未做**。
+  `test/plugin_tool_table_test.dart`（上线/下线 ⇒ 工具表变化 + 缓存失效点）与 `plugin_hot_apply_test.dart`。
+- 范围：**同一轮内**（tool loop 的后续跳）工具表在 `LlmSession` 里固定——符合"每次发消息刷新"；
+  若要"每一跳都刷新"需在 `LlmSession` 每跳重取（tools 不在前缀里，不影响缓存），**目前未做**。
 
 ### 验证（2026-10-02）
 
-- 新增 @BT@test/tool_list_refresh_test.dart@BT@（工具表每轮现取 + 系统提示词不变）。
+- 新增 `test/tool_list_refresh_test.dart`（工具表每轮现取 + 系统提示词不变）。
 - 新增 `test/system_prompt_pin_test.dart`：① 外部来源（Spec 索引 provider）变了，第二轮**仍是同一串
   字节**；② `invalidateSystemPrompt` 之后才重建。
 - `tree_core` 全量 **823 通过 / 1 跳过**，`dart analyze lib test` 干净。
+
+---
+
+## #9 leader 在团队会话里 `wait_for` 后再无回复 + 成员干活的会话与用户所在会话不一致
+
+### 现象（用户真机，2026-10-02 14:30–14:32）
+
+Test 团队（leader `agt_1790848305616_be41c9_3`，成员 Developer `member_1790922416419_8ad203_d`）：
+
+1. 用户在 **Test 的团队会话**里说"让他写一个 hello world 的 .http"：leader 派发成功（`message send_message`
+   卡片刻着成员 id），接着 `wait_for` 卡片返回 `outcome: completed`——**然后这个会话就再没有
+   任何回复**（用户原话："wait_for 结束后 Test 竟然没被唤醒"）；
+2. teammates 窗口里 Developer 全程像"没反应"（进度页/日志 Tab 都是空的）；
+3. Developer 的交付回信出现在 **Test 的默认会话**里，而不是用户发消息的那个会话（用户原话：
+   "Developer 的回信被发到了 Test 的默认会话"）。成员自己则是在**它自己的默认会话**里干完的活。
+
+### 证据（本机数据）
+
+- `data/agt_...be41c9_3/ses_1790921516531_3927f4_3/messages.jsonl`：最后一条就是
+  `tool_name=message / action=wait_for` 的工具结果（14:31:08），其后再无任何 agent 消息。
+- `data/member_...8ad203_d/session_default/messages.jsonl`：Developer 干活全过程（派活消息 + write + read +
+  terminal + 汇报 + 最终文本）——**不在团队会话里**。
+- `data/agt_...be41c9_3/session_default/messages.jsonl`：`[来自 Developer] 【任务完成】…`（14:31:00）
+  与 Test 的回复（14:31:13）——回信落到了**默认会话**。
+- `workspaces/member_...8ad203_d/.self/activity.log`：只有两行 `[start(成员)]/[done(成员)]`，
+  证明成员**确实执行了**（不是没接单）。
+
+### 根因 1：打断只按 agent 找在途轮次，跨会话也会被掐掉
+
+- `ConversationService._interruptForNewMessage` 从 `_running[agentId]` 取在途 token，`deliver()`
+  （团队消息，`conversation_service.dart` 的"团队消息也是有人对它说话"分支）与 `user_message` 一样
+  会调用它；
+- 取消是**协作式**的：`llm_session.dart` 的轮次循环开头就是
+  `if (isCancelled()) { yield AgentDone(cancelled: true); return; }` ⇒ 被打断那一轮在**下一次 LLM 跳之前**
+  就收尾，工具结果之后不会再有正文；
+- `conversation_service.dart` 收尾时 `cancelled && token.interrupted` **刻意不推**"已停止本轮生成"
+  （插话语义：用户刚发的话就是上下文）——于是另一个会话里表现为"答复凭空消失"。
+- 本机时序完全对上：leader 14:30:42 起 `wait_for` → 14:31:00 成员回发触发 `deliver()`（落 leader 默认会话）
+  → 在途 token 被置 cancelled → 14:31:08 `wait_for` 返回并落 tool 结果 → 下一跳发现 cancelled ⇒ 直接收尾。
+
+### 根因 2：agent 侧派活的会话缺省与用户侧不一致
+
+- `message` 工具的 `session_id` 缺省是 `session_default`（`TeamMessageDispatcher._sessionOf`）；
+- 用户侧接口 `POST /api/agents/{leaderId}/teammate/{memberId}/message` 则**带当前会话**
+  （`lib/io/api_service.dart` 的注释写得很清楚："不传则落到默认会话，成员进度不会出现在当前 teammates 窗口"）；
+- `TeammateDetailPage` 的历史（`getConversationHistory(memberId, sessionId)`）与实时帧（`session_id`
+  不等于当前会话就丢弃）都按当前会话过滤 ⇒ 派活落到成员默认会话、回信落到 leader 默认会话时，
+  用户在团队会话里两头都看不到。
+
+### 修复（2026-10-02）
+
+1. **运行链改成会话级：同一 agent 的不同会话并行**（`packages/tree_core/lib/src/agent/conversation_service.dart`）：
+   运行键从 `agentId` 改成 `agentId|sessionId`（`_RunToken` 记 `agentId` + `sessionId`，`_chains` / `_running`
+   都按它索引）⇒ **跨会话的消息既不打断、也不排队**（两条链并行发言），同一会话内仍串行、仍会插话打断
+   （同一会话的流式片段交错会污染前端 `msg_chunk` 追加）。配套三处：
+   - `_interruptForNewMessage(agentId, sessionId:)` 只找本会话那条链，并且只 `questions.cancelForSession`
+     （别的会话可能也在等人回答，不能一起取消）；
+   - `cancelAgent`（`stop`）是 **agent 级**的：该 agent 的每个在途会话都要取消（epoch 仍按 agent 作废排队任务）；
+   - `agent_status` 的 `idle` 只在"该 agent 一个在途轮次都不剩"时才广播——前端 working 集合是按 agent 记的，
+     否则会话 A 先结束会给还在跑会话 B 的 agent 误报"空闲"。
+   理由：各会话历史互相独立，在途那一轮**根本看不到**别的会话的消息；跨会话打断只会白白毁掉那一轮的答复。
+2. **派活/回发继承发起会话**（`packages/tree_core/lib/src/tool/message_tool.dart`）：
+   `MessageTool.run` 在 `session_id` 缺省时补 `invocation.sessionId`（`ToolInvocation` 本来就带会话），
+   显式传 `session_id` 的调用方仍然优先；schema 描述同步改为"缺省 = 发起这一跳的会话"。
+   派活落发起会话后，成员的执行与回信都留在同一个会话里，teammates 窗口与主会话都能看到。
+3. **成员与 team leader 共享工作目录**（新增 `packages/tree_core/lib/src/team/team_workspace.dart`）：
+   `teamWorkspaceFor(agent, lookup)` 一路向上解析到团队 TOP，返回 `owner` + `owner.workspace_dir`；
+   **成员自己 yaml 里的 `workspace_dir` 不生效**（否则"共享"就成了可被旧配置悄悄覆盖的软约定）。
+   四个解析点全部改走它：CLI 的 `WorkspaceToolRunner.resolveWorkspaceDir`（**工具根**）、
+   CLI 的 `TeamMessageDispatcher.workspaceDirOf`（文件投递 / 活动日志）、`FileService.rootFor`（文件面板）、
+   以及系统提示词里的 `teamWorkspaceProvider`（接线在 `CoreServer.start`，`close` 时按身份解绑）。
+   TOP 自身 owner == 自己 ⇒ **既有 agent 的工具根与提示词字节完全不变**（不碰前缀缓存）。
+   旧成员无需迁移：它是 `workspace_dir: ""`，解析时自然跟到 TOP。
+4. **成员不再作为独立 agent 出现在左栏**（`lib/ui/pages/main_page.dart`）：列表只喂
+   `_topAgents`（`teamId` 为空的才是顶层 agent，见 `Agent.teamId` 的文档口径）；`_agents` 本身保持完整，
+   按 id 找 agent（提问导航 / 执行器注册 / 删除）仍能找到成员。成员的入口是「团队 → 成员」工作进度窗口。
+5. **移除「消息切入设置」**：`ApiPaths.settingsMessageCutin` 常量、`CoreSettings.messageCutinDirect`
+   （字段 / getter / setter / applyMap / toMap / extra 白名单）、`core_server` 的
+   `GET|POST /api/settings/message-cutin` 两个端点与 `_getMessageCutin`/`_setMessageCutin`、
+   前端的 `ApiService.set/getMessageCutinDirect` 与设置页「消息切入模式」卡片（含本地
+   `message_cutin_direct` prefs）全部删掉；三个测试里的对应用例同步清理。
+6. **私有状态按 agent 分栏：`<共享根>/.tree/<agent_id>/.self/`**（新增
+   `packages/tree_core/lib/src/agent/private_workspace_io.dart`）：规范与工具提示里写的
+   `.self/…` 是**模型口径**，由 `PrivateWorkspaceIO`（同时装饰 `WorkspaceIO` 与 `WorkspaceFiles`，
+   在 `WorkspaceToolRunner._ioFor` 包一层 ⇒ 工具、Spec、系统提示词、结果门控、插件文档播种
+   全部生效，本地与 SSH 共用一份）**单向**翻译成 `.tree/<agent_id>/.self/…`；活动日志路径
+   （`memberLogPath` / `_activityPath`）同步改到该分栏。用装饰器而不是改常量：`.self` 这条口径
+   散在规范文本、工具描述与 `SpecService.specDir` / `SystemPromptStore.promptPath` /
+   `kPluginGuideWorkspacePath` / `ToolResultGate.resultsDir` 里，装饰器让它们一个都不用改。
+   核心启动时把旧 `.self` **一次性迁移**到 TOP 的分栏（`migrateLegacySelfDir`，幂等）。
+7. **成员跟随 leader 的 SSH**（`teamSshConfigFor`）：成员自己没有 `ssh:` 配置时用团队 TOP 那份
+   （同一台远端主机、同一个根），接进 CLI 的 `resolveSshConfig`（工具后端）与系统提示词；
+   显式给自己配了 `ssh:` 的成员仍以自己那份为准。
+
+### 验证（2026-10-02）
+
+- 新增 `test/message_interrupt_test.dart`：「跨会话的新消息不打断在途那一轮：两个会话**并行**跑（不排队）」
+  （`interruptedRunCount == 0`、`activeRunCount == 2`、两轮都没有 `cancelledAtEnd`）与
+  「stop 是 agent 级的：并行在跑的每个会话都被停掉」；
+- 新增 `test/message_dispatcher_test.dart`：「默认把接收方归集到**发起会话**」、「显式 `session_id` 优先」；
+- 新增 `test/team_workspace_test.dart`：TOP 解析到自己、成员（含多级）解析到 TOP、成员自己的
+  `workspace_dir` 无效、TOP 未配置时用 TOP 的默认目录、上级不存在/成环不死循环；并钉住两个接线点
+  （`FileService.rootFor`、接线后的 `workspacePromptSuffix` 说 TOP 的目录、TOP 自己的提示词字节不变）、
+  `teamSshConfigFor`（成员继承 TOP 的 ssh / 自己配了就用自己那份 / TOP 口径不变）；
+- 新增 `test/private_workspace_io_test.dart`：`mapPrivatePath` 只翻 `.self` 一族（真实路径与普通路径
+  原样通过）、读写/编辑/搜索/列目录都落在 `.tree/<agent_id>/.self/…`、本机后端调文件面板接口显式报错、
+  `migrateLegacySelfDir` 搬得动 / 幂等 / 目标已存在不覆盖。
+
+### 已知边界（须知，非遗留缺陷）
+
+- **同一 agent 的不同会话是并行的**：会话 A 在跑时，会话 B 的消息**立刻并行启动**（既不打断 A、也不排到
+  A 后面）；同一会话内的插话（打断）与排队语义不变。`stop` 按 agent 生效（停掉它的全部在途会话与排队任务）。
+  并行不共享可变状态：工具、落库、分段推送、提问回路都按会话键（`agentId|sessionId`，提问取消已用
+  `cancelForSession`），共享的只有工作空间与全局设置。原「消息切入模式」开关已按用户要求删除。
+- **成员仍有独立的 agent 文件与 `workspace_id`**：共享的是**工作目录**（`teamWorkspaceFor`），
+  `workspace_id` 保持唯一以免 `FileService.agentFor` 把 leader 的 workspace 解析成成员（那会让
+  SSH 团队的远端文件面板错落到成员的本机目录）。`GET /api/agents` 仍返回全部 agent（提问归因、
+  提问导航要按 id 找成员），成员只在**左栏列表**里被过滤掉。
+- **私有状态按 agent 分栏**：`.self/…`（模型口径）在磁盘上是 `.tree/<agent_id>/.self/…`
+  （`PrivateWorkspaceIO` 单向翻译；**终端命令不经过翻译**，提示词里已把真实路径告诉模型）。
+  核心启动时把旧工作空间的 `.self` 一次性迁移到 `.tree/<TOP id>/.self`（`migrateLegacySelfDir`，
+  幂等、失败只记日志）；成员以前各自的工作目录（`workspaces/<member_id>`，例如 Developer 的
+  `hello.http`）留在原地不搬——要搬请手工处理。
+- **成员跟随 leader 的 SSH**：成员自己没有 `ssh:` 配置时用 TOP 那份（`teamSshConfigFor`），
+  因此成员与 leader 在同一台远端主机、同一个根下；远端工作空间不在本机 ⇒ 该成员的本地活动
+  日志 / 文件投递不适用（与"leader 自己是 SSH agent"同一口径：`workspaceDirOf` 返回空串）。
+  显式给自己配了 `ssh:` 的成员仍以自己那份为准（手工配置优先）。

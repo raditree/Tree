@@ -1,102 +1,63 @@
 # Changelog
 
-本文件记录 Agent Team Desktop 应用的所有变更。
+记录本仓库**桌面线**（单机核心进程形态）的变更，自首个开源版本 **1.0.0** 起。
+格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/)；版本号与 `pubspec.yaml` 的 `version:` 一致
+（有测试钉住两处不漂移）。
 
-格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/)。
+> **历史**：1.0.0 之前是闭源迭代期，且是另一条形态（服务端线：Flutter + Python FastAPI）。
+> 桌面线把后端逻辑整体迁入本机核心进程、从零重写，历史条目与新代码不逐条对应，因此不再保留；
+> 需要溯源请看 git 历史与 [docs/archive/](docs/archive/README.md)。
 
----
-
-## [Unreleased] - 2026-08-12
+## [1.0.0] — 未发布（首个开源版本）
 
 ### Added
 
-#### 用户体验优化
-- **Working 状态标识**：agent 工作时标题栏显示"工作中"动画与橙色标识
-- **停止按钮**：工作期间可随时点击停止按钮取消当前任务（基于 `threading.Event` 的线程安全取消机制）
-- **中间输出独立成消息**：agent 每次中间输出作为独立消息发送，不再合并为单条
-- **工具调用折叠卡片**：每次工具调用以可折叠卡片展示（默认折叠），展开可查看参数与执行结果
-- **内置工具定制卡片样式**：为每个内置工具（help/set/refresh/mcp/team/ask_user_question/read/write/edit/terminal/embed_search）配置专属图标、配色与标题
-- **工具卡片人类可读参数**：展开后按工具类型格式化展示参数（文件路径、命令、操作类型等），不再显示原始 JSON
-- **大输出可滚动容器**：terminal/read/mcp 等工具输出超过 200 字符时使用可滚动容器展示
-- **重定向输出参数**：每个内置工具增加 `redirect_output` 参数，可将工具结果保存到工作空间内指定文件，返回保存提示
-- **MCP 工具嵌套参数展示**：mcp 工具的 `tool_name` 与嵌套 `arguments`（如 `cmd`/`path`）展开为独立参数行
-- **工具结果可读化**：后端 `_stringify_tool_result` 将 dict 结果格式化为人类可读文本（提取 content/message 字段或格式化为 `标签: 值` 行），不再显示原始 JSON
-- **图片文件 base64 返回**：`get_file_content` 对图片文件（png/jpg/gif 等）返回 base64 编码内容，前端正确解码渲染
+- **单进程桌面形态**：Flutter 界面 + 纯 Dart 核心 `tree_core`（可编译成单文件，约 10 MB）；
+  核心只监听 `127.0.0.1` 随机端口，一次性 token 经 stdout 握手下发；关窗时优雅退出，不留孤儿进程。
+- **agent 团队**：leader 用 `team` 工具建成员、审核闸门（无模型 + 待审核不接活），
+  `message` 工具派活 / 广播 / `wait_for` 等交付；成员与 leader **共享同一个工作目录**（同一个项目）。
+- **Spec（规范）体系**：内置 general-task / hard-task / team-meeting / plugin-creator，自定义规范落工作空间；
+  索引与"已选全文"进系统提示词，`spec select` 直接返回全文。
+- **MCP**：stdio 与 Streamable HTTP 两种传输、懒连接、心跳判活、工具命名空间化（`mcp__<服务>__<工具>`）。
+- **插件与站点体系**：进程外插件（行分隔 JSON-RPC 2.0）+ 四类站点 / 17 个点位——广播、执行（fs / terminal /
+  agent / ui / llm / tool / session）、中转（工具前 / 工具后 / LLM 接管 / 请求改写 / 压缩 / 系统提示词）、收集（工具申报）；
+  插件可申报 UI 槽位与自己的工具。指南见 [docs/plugin-development.md](docs/plugin-development.md)，示例见 [examples/plugins/](examples/plugins/)。
+- **SSH 运行模式**：工具、文件面板、Git 面板同一套语义；**成员跟随 leader 的 SSH**（同一台远端主机、同一个根）。
+- **私有状态按 agent 分栏**：`.self/…` 真实落在 `.tree/<agent_id>/.self/…`（提示词 / 规范 / 长结果 / 活动日志）；
+  团队共享项目文件、各自保留私有状态；核心启动时一次性迁移旧 `.self`。
+- **会话并行**：同一 agent 的不同会话**并行**运行；同一会话内串行、新消息插话打断。
+- **提问回路**：`ask_user_question` 落盘 + 卡片作答 / 取消 / 重启补答；右栏「问题回复」跨会话查看。
+- **可复现的打包**：一条命令出便携 zip（构建 + 编译核心 + 拷 `pdfium.dll` + 写使用说明 + **自检** + 压缩），
+  可选 Inno Setup 安装包（每用户安装、卸载不动用户数据）。
 
-#### AskUserQuestion 内置工具
-- 新增 `ask_user_question` 内置工具（非 MCP tool），允许 agent 在任务中向用户提问
-- 支持 question/options/default_answer 参数
-- 前端弹窗展示问题与选项，用户选择/输入后回传给 agent
-- 超时自动使用默认答案或提示 agent 重新提问
-
-#### Teammates 工作进度窗口
-- 新增 teammates 拓扑可视化窗口，展示 leader 与成员的层级关系
-- 每个成员卡片显示名称、实时工作状态（工作中/空闲）、模型、层级与评价
-- 点击成员进入详情页，包含进度/日志/文件/消息四个 Tab
-  - 进度：实时消息与工具调用卡片（WS 推送 + 历史加载）
-  - 日志：成员工作空间的活动日志
-  - 文件：成员沙箱文件浏览器（支持目录导航）
-  - 消息：直接向成员发送消息
-- 成员工作状态通过 WebSocket 实时更新（working/idle）
-- 成员详情页支持 `DefaultTabController` 提供 Tab 切换
-
-#### Compact 机制重新设计
-- 保留最近 N 次用户要求原文（`KEEP_RECENT_USER_MSGS`），确保当前任务上下文完整
-- 调用 LLM 总结更早的工具调用轨迹与任务上下文，生成 summary 消息替代
-- 手动压缩按钮（compact）跳过阈值判断，强制执行压缩
-
-#### 文件同步
-- 实现 `syncToLocal` 接口：将工作空间文件打包（tar + base64）下载到本地
-- 逐个解包 tar 成员，已存在文件覆盖、目录跳过创建，不删除目标目录中的其他文件
-- 含路径穿越防护（拒绝 `../../` 之类的恶意路径）
-
-#### 工具调用轨迹持久化
-- 对话历史数据库新增 kind/tool_name/tool_arguments/tool_result 字段
-- 中间文本输出与工具调用结果实时写入历史，重启后不丢失
-- 前端加载历史时自动渲染工具调用卡片
-
-### Fixed
-
-- **`surfaceContainerHighest` 编译错误**：Flutter 3.7.12 不支持该 getter，替换为 `surfaceVariant`
-- **`Not a constant expression`**：`_toolStyle` default 分支字符串插值不能用于 `const`，去掉 `const`
-- **`No TabController for TabBar`**：teammates 详情页用 `DefaultTabController` 包裹 Scaffold
-- **team_broker 事件循环错误**：`dispatch()` 在 chat 消费线程中调用时无 running loop，改为构造时捕获主事件循环引用，使用 `run_coroutine_threadsafe` 调度
-- **服务关停时 worker 异常日志**：`_on_worker_done` 未捕获 `concurrent.futures.CancelledError`，补充捕获
-- **teammates 沙箱文件目录无法点击**：`_MemberFileBrowser` 缺少目录导航逻辑，增加 `onTap` 与面包屑导航
-- **teammate 进度页一直为空**：成员处理流程不写历史且前端不加载历史，后端补 `_store_message`、前端补 `getConversationHistory`
-- **teammate 卡住不动**：成员会话创建时缺少 `_register_tools`，LLM 无法调用任何工具
-- **消息列表频繁滑到底部**：添加 `_nearBottom` 标志，仅在用户已处于底部附近时才跟随滚动
-- **teammate 状态不实时更新**：拓扑页增加 WebSocket 连接，监听 `agent_status` 事件维护 `_workingMembers` 集合
-- **syncToLocal 重复同步报错**：改为逐个解包 tar 成员，不再清空目标目录
-- **工具卡片显示原始 JSON**：后端 `str(result)` 将 dict 转为 Python dict 字符串，前端无法可靠解析；改为后端 `_stringify_tool_result` 统一提取可读内容
-- **MCP 工具参数不显示**：mcp 工具参数为嵌套结构（`tool_name` + `arguments`），之前只取不存在的 `tool` 键，改为正确解析嵌套参数
-- **PNG 图片无法渲染**：`get_file_content` 用 `cat` 读取二进制图片导致损坏，改为对图片文件使用 `base64` 命令编码返回
-- **Dart 类型转换语法错误**：`(member['live_status'] as String? == 'working')` 括号位置错误，改为 `((member['live_status'] as String?) == 'working')`
+- **提示词资产索引**：模型看到的每一段文字（默认系统提示词 / 拼装顺序 / 内置 Spec 模板 / 插件指南副本 / 附件片段 /
+  工具描述 / 会话状态 / 压缩摘要）在 [docs/architecture.md §8.1](docs/architecture.md) 有一张「源码 ↔ 运行期落点」对照表，
+  改提示词不必再 grep 全仓；同时把「**侦察从文档开始**」（README → docs 索引 → 模块 README 的不变量 →
+  development / known-issues → 再进代码核对）写进系统提示词与 general-task / hard-task 的 Recon 阶段。
 
 ### Changed
 
-- **WebSocketManager 支持多连接**：同一用户可同时维护多个 WS 连接（主面板 + teammates 窗口）
-- **TeamMessageBroker 线程安全**：`queue.Queue` 替代 `asyncio.Queue`，worker 通过 `run_coroutine_threadsafe` 调度到主事件循环
-- **流式推送架构**：`_stream_agent_reply` 在后台线程消费 chat 生成器，通过线程安全 `asyncio.Queue` 回传事件循环逐条推送
+- **派活与回信归集到发起会话**：`message` 默认把接收方归集到"发起这一跳的会话"，
+  teammates 窗口因此能看到成员进度与回信（此前会落到成员/leader 的默认会话，界面上什么都看不到）。
+- **移除「消息切入设置」**：行为固定为"同会话插话打断 / 跨会话并行"，不再有死开关。
+- 超长工具结果改为**重定向到工作空间**并只给模型预览（省 token、保全文）。
 
----
+### Fixed
 
-## [0.1.0] - 2026-08-10
+- **前缀缓存**：重建历史改为逐字复用"实发那一份"、系统提示词按会话钉住、Spec 快照冷热形态统一
+  ⇒ 长会话不再每轮 0 命中（[known-issues #6](docs/known-issues.md) / [#8](docs/known-issues.md)）。
+- **本地执行不再被"等输入"挂死**：子进程禁用交互（`-NonInteractive` + 关闭 stdin）+ 裸 `echo` 兼容翻译
+  （[known-issues #7](docs/known-issues.md)）。
+- **团队不再"发消息后无回复"**：跨会话消息不再掐掉另一个会话在途的轮次；
+  `wait_for` 之后 leader 一定能继续发言（[known-issues #9](docs/known-issues.md)）。
+- **取消一切静态任务超时**：判活只认心跳 / 进程存活；远端成员失联以"显式错误 + 部分结果"收口，不静默丢消息。
 
-### Added
+### Docs
 
-- 账号密码注册/登录（替代微信扫码登录）
-- 注销账号（十日倒计时 + 31 天数据保留）
-- Agent 创建、列表、删除
-- Normal LLM 与 Limitless Context LLM 两种 agent 类型
-- Docker 沙箱工作空间隔离（Windows 7 本地目录模式回退）
-- MCP 工具集成（read/write/edit/terminal/embed_search）
-- 内置工具：help/set/refresh/mcp/team
-- Team 工具：成员创建、消息投递、任务分配、表格追踪
-- 文件管理：上传、浏览、内容查看、PDF 预览
-- Git 历史、分支查看
-- 对话历史持久化与上下文恢复
-- LLM 上下文压缩（compact）
-- Agent 工作空间 rule.md 初始化与注入
-- 沙箱网络白名单与 pip 单次下载限制
-- activity.log 工作空间活动日志
+- 文档收口（面向开源）：精简入口 [README.md](README.md)；新增
+  [docs/architecture.md](docs/architecture.md)（架构 + 跨模块不变量）、[docs/development.md](docs/development.md)（构建 / 测试 / 打包 / 发布）、
+  [docs/team.md](docs/team.md)（团队语义）、[CONTRIBUTING.md](CONTRIBUTING.md)（开发规则约束）与
+  [docs/README.md](docs/README.md)（索引）；每个模块 README 写清职责 / 入口 / **不变量** / 测试；
+  服务端线时代的历史文档移入 [docs/archive/](docs/archive/README.md)。
+- 新增**文档契约门禁**（`packages/tree_protocol/test/docs_contract_test.dart`）：模块 README 的不变量节、
+  入口文档、docs 索引完整性都会被测试检查。

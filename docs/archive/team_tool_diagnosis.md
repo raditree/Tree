@@ -2,6 +2,11 @@
 
 > 诊断时间：2026-08-18（第一轮）→ 2026-08-18（第二轮补充审查）
 > 诊断方式：静态代码审查 + 运行时实证（Windows + Docker Desktop）
+>
+> ⚠️ **口径更新（2026-10-02）**：本文是**参考实现（server/main.py + Docker 容器）**时代的诊断，其中
+> "每个成员各自的 `workspaces/{member_id}/.self`"已被推翻——现口径是**成员与团队 TOP 共享同一个
+> 工作目录**（`teamWorkspaceFor`），见 `docs/known-issues.md` #9。Docker/双轨制那部分描述的是旧后端，
+> 与本仓库（纯 Dart 核心 + 本机/SSH 工作空间）无关。
 
 ---
 

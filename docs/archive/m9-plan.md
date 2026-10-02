@@ -143,7 +143,7 @@
 > **读侧迁移**接住（旧 `system.relay` 的订阅复制到 `system.relay.tool.pre` / `.tool.post`）。
 > 不变的语义：id 不含 team / mode、订阅侧空 = 通配、消息侧空 = 拒投、**每个中转点位唯一订阅者**、
 > 无订阅者一律 fail-open 回退系统默认。当前口径以
-> [`docs/plugin-development.md`](plugin-development.md) 与
+> [`docs/plugin-development.md`](../plugin-development.md) 与
 > `.self/plan/20261001-station-points-expansion/plan.md` 为准。
 
 **站点 = 拦截点 / 触发点，全局唯一**。每类站只有一个实例，**id 就是类型常量**

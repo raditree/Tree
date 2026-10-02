@@ -1,0 +1,49 @@
+# agent（会话编排）
+
+把 WS 上行请求变成「落库 + 流式下行」，并把系统提示词、上下文压缩、提问回路、私有目录这些**会话级**的事收在这一层。
+生成逻辑本身在 [../llm/](../llm/)——本模块只做编排与协议适配。
+
+## 文件
+
+| 文件 | 作用 |
+| --- | --- |
+| [agent_engine.dart](agent_engine.dart) | 引擎契约：`AgentEngine` + 事件 sealed 类 + `AgentRunContext` / `CoreMessageRef` |
+| [conversation_service.dart](conversation_service.dart) | 帧映射、落库、**按 agent×会话**的串行链 / 插话 / `stop`；`deliver` / `wake` 是团队与后台 hook 的投递入口 |
+| [compaction_service.dart](compaction_service.dart) | 上下文压缩：内置 compact 与中转站接管两条互斥路径、水位线、token 估算 |
+| [workspace_prompt.dart](workspace_prompt.dart) | 系统提示词拼装（全局基础段 + agent 段 + 工作空间软约束 + Spec 索引 + 已选 Spec 全文），全部走 provider |
+| [system_prompt_file.dart](system_prompt_file.dart) | `<工作空间>/.self/system_prompt.md` 的播种 / 读取 / 重置（`.bak.<n>` 递增备份） |
+| [private_workspace_io.dart](private_workspace_io.dart) | 按 agent 分栏的 IO 装饰器：`.self/…` → `.tree/<agent_id>/.self/…` |
+| [question_broker.dart](question_broker.dart) | 提问回路：先落盘再推帧、作答幂等、取消能打断等待 |
+| [question_store.dart](question_store.dart) | 提问状态与答案的独立原子快照（跨会话列出、状态可改） |
+| [attachment_prompt.dart](attachment_prompt.dart) | 附件路径提示词片段（纯函数，生成与压缩估算共用） |
+| [scripted_agent.dart](scripted_agent.dart) | 占位引擎（测试替身；生产路径是 `LlmAgentEngine`） |
+
+## 不变量（assertions）
+
+1. **引擎不认识 WS 与存储**：只产出 `AgentEvent`；历史以 `CoreMessageRef` 传入，引擎不得反向依赖 `TreeStore`——否则引擎无法脱离存储单测，也容易出现"引擎误改历史"这类耦合。
+2. **按段下发**：正文 / 思考段各是一个 `msg_start` + `msg_chunk`… 并**独立落库**，段遇工具调用即关闭。`AgentDone` 时仍开着的正文段**就是最终回复**，usage 只挂最后一条。
+3. `AgentError` 必须**同时**发 `error` 帧**和**一条可见的 agent 文本消息：前端对 `error` 帧静默忽略，只发帧的话用户看不到任何反馈。
+4. **并发**：同一 `(agent, session)` 串行（同一会话的流式片段交错下发会让前端追加互相污染），**不同会话并行**；跨会话消息既不打断也不排队；`stop` 按 agent（代次作废排队任务）；`idle` 只在该 agent **没有在途轮次**时广播。
+5. **提示词按会话钉住**（key = `agentId|sessionId`）：只在会话初始化 / 压缩后 / 显式失效时重建；历史逐字复用 `toolArgumentsRaw` 与 `toolResultForModel`；**工具表每轮现取**（不进前缀，否则端点前缀缓存从这条起全部落空）。
+6. **压缩不删除任何消息**：只推进 `compactedMessageCount`；被总结的永远是历史的一个**前缀**；`compactedSummary` 与 `compactedContext` **互斥**（两条压缩路径的权威只能有一个）。
+7. **`.self` 只在一处翻译**（`PrivateWorkspaceIO`），且**终端命令不经过它** ⇒ 提示词必须把私有目录的**真实路径**写给模型。
+8. 提问三件事缺一不可：**先落盘再推帧**（进程被杀 / 重启后仍能列出待答）、**作答幂等**（WS 与 REST 可能同时到达，只有第一次生效）、**取消能打断**（等待中的工具立刻拿到 `cancelled`，工具循环因此收敛而不是永远挂着）。
+9. 提示词在**两处**被拼装（会话生成 + 压缩估算），两处必须看到**逐字一致**的字符串 ⇒ 一律用 provider 接线，不做参数副本。
+
+## 依赖方向
+
+`agent` → `llm` / `tool` / `store` / `plugin`（事件发布）。
+`tool` **不**反向依赖 `agent`：提问用具名契约隔开（见 [../tool/question_channel.dart](../tool/question_channel.dart)）。
+
+## 测试
+
+```bash
+cd packages/tree_core
+dart test test/conversation_segments_test.dart test/conversation_stream_seq_test.dart \
+          test/message_interrupt_test.dart test/system_prompt_pin_test.dart \
+          test/compaction_test.dart test/question_broker_test.dart \
+          test/private_workspace_io_test.dart test/workspace_prompt_test.dart
+```
+
+钉子用例：`conversation_segments_test`（分段与落库顺序）、`message_interrupt_test`（会话并行 / 插话 / stop）、
+`system_prompt_pin_test`（提示词钉住）、`private_workspace_io_test`（私有目录分栏）。
