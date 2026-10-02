@@ -710,6 +710,33 @@ Test 团队（leader `agt_1790848305616_be41c9_3`，成员 Developer `member_179
 7. **成员跟随 leader 的 SSH**（`teamSshConfigFor`）：成员自己没有 `ssh:` 配置时用团队 TOP 那份
    （同一台远端主机、同一个根），接进 CLI 的 `resolveSshConfig`（工具后端）与系统提示词；
    显式给自己配了 `ssh:` 的成员仍以自己那份为准。
+8. **删 agent 的两道闸门 + 悬空指针自愈**（同日订正，实测驱动）：
+   - **问题**：用户直接 `DELETE /api/agents/{id}` 删掉一个**中间层 leader** 时，它的下级留在库里但
+     `parent_agent_id` 悬空——实测 `directMembers` 不含它（broadcast 不达）、`cascadeIds(top)` 只返回 `[top]`
+     （级联停止/删除够不着）、`remove_member` 也报「不可移除非直属/下级成员」（`_subtree` 同样沿父链走），
+     而它**仍可被按名寻址、真的会跑**；`leader_name` 变空、relation 变 indirect。删掉 **TOP** 时更彻底：
+     `teams()` 里整队消失、成员的 `team_id` 指向幽灵、每个成员都把自己当 team leader。
+   - **修复 ①（闸门）**：`DELETE /api/agents/{id}` 有下级时回 **409 + `cascade_required`**（沿用 team 工具的字段形状），
+     必须显式 `?cascade=1` 才按叶→根连整棵子树删；**任一相关会话正在运行也回 409**（`running` + 提示先停止），
+     通过后才「停（作废排队任务 + 收尾在途提问）→ 排水 → 清提问 → 删 → 回填 TOP 的 `team_member_count`」。
+     为什么不等它收尾：`stop` 抢不动正在执行的工具（本地执行活着就永不超时），等会把 HTTP 挂住，而「删掉正在写的
+     agent」正是残留的来源（继续写共享工作目录、回一条来自幽灵成员的消息、`data/<id>` 被写回来）。
+   - **修复 ②（自愈，管历史数据）**：核心启动时 `repairTeamLinks` 修一次——上级还在 ⇒ 重挂到 TOP 且整棵子树的
+     `team_id`/`level` 一起平移；团队也没了 ⇒ 最上层孤儿**升为独立顶层 agent**；`team_id` 悬空但父链完好 ⇒ 按父链修正。
+     每个被改的 `agents/<id>.yaml` **先备份成 `.bak.<n>`**（n 递增、绝不覆盖），幂等。
+   - **修复 ③（提问回路硬化）**：删除时会摘掉该 agent 的提问记录，而 `QuestionBroker.cancel` 原来「记录没了就提前返回、
+     不完成 completer」⇒ 正在等答案的**工具永远拿不到结果**：那一轮不收敛、`isRunning` 永远为真、
+     `cancelForAgent`/`stop` 也救不回来（它们按 store 的 pending 列表遍历）。现在 `cancel` 对「记录已不在但有在途等待」
+     照样收尾，删除路径也改成**先经 broker 取消、再摘记录**。
+   - **顺带修正**：用户侧删除也回填 `team_member_count`（此前只有 team 工具回填，删除后 yaml 里停在旧值）；
+     `list_members` 由成员调用时不再把自己列两遍；`remove_member` 里「其工作空间已回收」的提示删掉
+     （工作空间与 `.tree/<id>` 分栏其实**保留**，供审计）；发送者已被删时活动日志/前缀不再回裸 id。
+   - **UI**：`ApiService.deleteAgent` 解析 409 响应体（`AgentDeleteBlocked`），有下级时摊开清单请确认后带
+     `?cascade=1` 重试，运行中则提示先停止；删**成员**不再清插件作用域（只有删 TOP 才回落）。
+   - **验证**：新增 `test/agent_delete_api_test.dart`（7 例）、`test/team_repair_test.dart`（7 例）、
+     `test/question_broker_test.dart` 两条硬化用例、`test/team_service_test.dart` 的 list_members 用例、
+     前端 `test/agent_delete_flow_test.dart`（源码钉子）。反证做过：去掉闸门 ⇒ 两条 409 用例红；
+     关掉子树平移 ⇒ 自愈用例红；去掉「先收尾提问」⇒ 删除用例红（修复前实测过）。
 
 ### 验证（2026-10-02）
 
@@ -734,7 +761,12 @@ Test 团队（leader `agt_1790848305616_be41c9_3`，成员 Developer `member_179
 - **成员仍有独立的 agent 文件与 `workspace_id`**：共享的是**工作目录**（`teamWorkspaceFor`），
   `workspace_id` 保持唯一以免 `FileService.agentFor` 把 leader 的 workspace 解析成成员（那会让
   SSH 团队的远端文件面板错落到成员的本机目录）。`GET /api/agents` 仍返回全部 agent（提问归因、
-  提问导航要按 id 找成员），成员只在**左栏列表**里被过滤掉。
+  提问导航要按 id 找成员）；**左栏也列出成员**（同日二改，见上面第 4 条），不再有「只在左栏过滤」的旧口径。
+- **运行中的 agent 删不掉（按设计）**：`stop` 停不住正在执行的工具，所以 `DELETE` 只接受空闲的 agent；
+  一个跑着长命令的成员在它跑完前删不掉，唯一逃生口是重启核心。这是「删掉正在写的 agent 会留下残留」与
+  「不按时间杀进程」两条约束的必然取舍。
+- **删除不回收工作空间**：`DELETE` 删 `agents/<id>.yaml`、`data/<id>/` 与该 agent 的提问；
+  `<共享根>/.tree/<id>/`（私有状态、活动日志）与 `workspaces/<id>` **按要求保留**供审计，要清理需手工删除。
 - **私有状态按 agent 分栏**：`.self/…`（模型口径）在磁盘上是 `.tree/<agent_id>/.self/…`
   （`PrivateWorkspaceIO` 单向翻译；**终端命令不经过翻译**，提示词里已把真实路径告诉模型）。
   核心启动时把旧工作空间的 `.self` 一次性迁移到 `.tree/<TOP id>/.self`（`migrateLegacySelfDir`，

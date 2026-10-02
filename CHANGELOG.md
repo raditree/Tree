@@ -49,6 +49,18 @@
   `scannedFileCount` 是计数、`scannedFilePaths` 只留 20 条抽样、`GrepQuery.maxResults`（默认 200）是命中行数上限。
 - **成员与 leader 共享工作目录与 SSH、私有状态按 agent 分栏**（[team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 2/3/4）：
   成员 yaml 里的 `workspace_dir` **不生效**、`ssh:` 缺省取 TOP 的、`.self` 落在 `.tree/<agent_id>/`。
+- **删 agent 有两道闸门，且删除路径与 team 工具同规则**（[server/README.md](packages/tree_core/lib/src/server/README.md) 不变量 12、
+  [team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 12、[lib/README.md](lib/README.md) 不变量 9）：
+  有下级成员必须显式 `?cascade=1`（否则 409 + `cascade_required`，避免留下"删不掉、停不了、广播够不着却还能干活"
+  的孤儿成员），**任一相关会话正在运行也拒绝**（409 + `running`，先停止并等它空闲——`stop` 抢不动正在执行的工具，
+  核心不替用户等待）；通过后按「停 → 排水 → 清提问 → 叶→根删 → 回填 `team_member_count`」执行，删完不留 `data/<id>`。
+- **悬空团队指针启动自愈**（[team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 12：
+  `team_repair.dart`）：上级被删的成员重挂到 TOP 且整棵子树的 `team_id`/`level` 一起平移；团队也没了就把最上层孤儿
+  升为独立顶层 agent；`team_id` 悬空但父链完好按父链修正。每个被改的 `agents/<id>.yaml` 先备份 `.bak.<n>`（n 递增、
+  绝不覆盖），幂等。
+- **提问 `cancel` 与"记录是否还在"解耦**（[agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 8）：
+  删除 agent 会摘掉提问记录，此时 `cancel` 也必须完成在途等待的 completer——否则等答案的工具永远拿不到结果，
+  那一轮不收敛、`isRunning` 永远为真、连 `stop` 都救不回来。
 - **左栏列出全部 agent（含团队成员）**（[lib/README.md](lib/README.md) 不变量 6、[docs/team.md](docs/team.md) §7）：
   成员也是独立 agent 文件，点开就是它自己的会话；顺序 = 顶层在前（保持接口顺序）＋ 成员紧跟各自的
   TOP，`team_id` 指向的 TOP 不在列表里时兜底列在末尾。**成员其余口径不变**：工具根 / 系统提示词 /

@@ -312,32 +312,91 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
 
   /// 删除指定 agent（连同其对话历史），并同步后端
   ///
-  /// 按 teamId 注销该 agent 的执行器（注销后端注册、关闭 SSH 连接、清理
-  /// per-team 内存状态），无论其是否为当前选中 agent——避免删除/重建后
+  /// 核心有**两道闸门**（见 `CoreServer._deleteAgent`），这里把它们变成可操作交互：
+  /// - **有下级成员** ⇒ 核心回 409 + 下级清单，这里摊开清单请用户确认，再带
+  ///   `cascade: true` 重试（"删掉组长会让组员变孤儿"不再是一次点击就发生的事）；
+  /// - **正在运行** ⇒ 提示"先停止并等它空闲"（`stop` 抢不动正在执行的工具，
+  ///   核心不替用户等待）。
+  ///
+  /// 删除成功后的收尾：按 teamId 注销该 agent 的执行器（注销后端注册、关闭 SSH
+  /// 连接、清理 per-team 内存状态），无论其是否为当前选中 agent——避免删除/重建后
   /// 旧注册残留导致新 agent 走错执行通道。
   Future<void> _handleDeleteAgent(Agent agent) async {
     try {
       await ApiService.deleteAgent(agent.id);
       if (!mounted) return;
-      setState(() {
-        _agents.removeWhere((a) => a.id == agent.id);
-        // 注销该 team 的本地执行器（后端清注册，前端移除状态）
-        LocalExecutorService.instance.deactivateTeam(agent.id);
-        // 注销该 team 的 SSH 执行器（后端清注册并删除该 agent 的 SSH 配置，
-        // 前端关闭连接并移除状态）
-        unawaited(SshExecutorService.instance.deactivateTeam(agent.id));
-        if (_selectedAgent?.id == agent.id) {
-          _selectedAgent = null;
-          // 当前 team 消失：插件槽位作用域回落为空（只呈现全局槽位）
-          _setTeamScope(null);
-        }
-      });
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('删除失败: $e')));
+      _afterAgentDeleted(agent);
+    } on AgentDeleteBlocked catch (blocked) {
+      if (!mounted) return;
+      if (!blocked.needsCascade) {
+        _toast('删除失败: $blocked');
+        return;
       }
+      final List<String> names = <String>[
+        for (final Map<String, dynamic> member in blocked.cascadeRequired)
+          '${member['name']}（L${member['level']}）',
+      ];
+      final bool? confirmed = await showDialog<bool>(
+        context: context,
+        builder: (BuildContext ctx) => AlertDialog(
+          title: const Text('连同下级成员一并删除？'),
+          content: Text(
+            '「${agent.name}」还有 ${names.length} 个下级成员：\n'
+            '${names.join('、')}\n\n'
+            '删除会连同它们一起移除（对话历史一并删除），此操作不可恢复。',
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text(
+                '一并删除',
+                style: TextStyle(color: Colors.red),
+              ),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted) return;
+      try {
+        await ApiService.deleteAgent(agent.id, cascade: true);
+        if (!mounted) return;
+        _afterAgentDeleted(agent);
+      } catch (e) {
+        if (mounted) _toast('删除失败: $e');
+      }
+    } catch (e) {
+      if (mounted) _toast('删除失败: $e');
     }
+  }
+
+  /// 删除成功后的本地收尾（列表、执行器注册、选中态与插件作用域）。
+  void _afterAgentDeleted(Agent agent) {
+    setState(() {
+      _agents.removeWhere((a) => a.id == agent.id);
+      // 注销该 team 的本地执行器（后端清注册，前端移除状态）
+      LocalExecutorService.instance.deactivateTeam(agent.id);
+      // 注销该 team 的 SSH 执行器（后端清注册并删除该 agent 的 SSH 配置，
+      // 前端关闭连接并移除状态）
+      unawaited(SshExecutorService.instance.deactivateTeam(agent.id));
+      if (_selectedAgent?.id == agent.id) {
+        _selectedAgent = null;
+        // 只有**团队 TOP 被删**时团队才真消失，插件槽位作用域才该回落为空；
+        // 删的若是成员（teamId 非空），团队还在——清作用域会把该队的站点/槽位
+        // 全滤掉，表现为"站点（0）"，重新选中 leader 才恢复。
+        if (agent.teamId.isEmpty) _setTeamScope(null);
+      }
+    });
+  }
+
+  /// 统一的轻量提示（SnackBar）。
+  void _toast(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
   }
 
   @override

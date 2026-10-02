@@ -19,6 +19,40 @@ class DownloadCancelledException implements Exception {
   String toString() => '已取消';
 }
 
+/// `DELETE /api/agents/{id}` 被核心闸门拒绝（409）时抛出。
+///
+/// 核心有两道闸门（见 `CoreServer._deleteAgent`）：
+/// - **有下级成员必须显式级联**：[cascadeRequired] 就是被拦下来的下级清单；
+/// - **正在运行就拒绝**：[running] 非空，用户要先停止并等它空闲。
+///
+/// 单独一个类型是为了让 UI 能把这两种"可操作"的拒绝和真失败分开（前者要出确认框
+/// 或提示"先停止"，后者才是错误弹窗）。
+class AgentDeleteBlocked implements Exception {
+  const AgentDeleteBlocked({
+    required this.statusCode,
+    required this.message,
+    this.hint = '',
+    this.cascadeRequired = const <Map<String, dynamic>>[],
+    this.running = const <String>[],
+  });
+
+  final int statusCode;
+  final String message;
+  final String hint;
+
+  /// 未显式级联时被拦下的下级成员（`{member_id, name, level, parent_agent_id}`）。
+  final List<Map<String, dynamic>> cascadeRequired;
+
+  /// 正在运行、导致删除被拒的 agent id。
+  final List<String> running;
+
+  bool get needsCascade => cascadeRequired.isNotEmpty;
+  bool get isRunning => running.isNotEmpty;
+
+  @override
+  String toString() => hint.isEmpty ? message : '$message（$hint）';
+}
+
 /// API 服务 - 封装对**本机核心进程**的 REST 调用。
 ///
 /// desktop 分支已取消后端与账号体系：`baseUrl` 指向核心进程在本机回环上
@@ -531,22 +565,63 @@ class ApiService {
 
   /// 删除一个 agent（连同其对话历史）
   ///
-  /// 调用 `DELETE /api/agents/{id}`。
-  static Future<void> deleteAgent(String agentId) async {
-    final Uri uri = Uri.parse('$baseUrl/api/agents/$agentId');
+  /// 调用 `DELETE /api/agents/{id}`；[cascade] = 连同下级成员一并删除（`?cascade=1`）。
+  ///
+  /// 核心的两道闸门（有下级必须显式级联 / 正在运行先停止）以 409 + 结构化响应体
+  /// 返回，这里解析成 [AgentDeleteBlocked]，UI 才能给出可操作提示——旧实现只看
+  /// 状态码，用户只会看到"删除失败（HTTP 409）"，不知道为什么、该怎么办。
+  static Future<void> deleteAgent(String agentId, {bool cascade = false}) async {
+    final Uri uri = Uri.parse(
+      '$baseUrl/api/agents/$agentId${cascade ? '?cascade=1' : ''}',
+    );
     try {
       final http.Response response = await http.delete(
         uri,
         headers: _getHeaders(),
       );
-      if (response.statusCode != 200) {
-        throw Exception('删除失败（HTTP ${response.statusCode}）');
+      if (response.statusCode == 200) return;
+      if (response.statusCode == 401) {
+        throw Exception('核心进程拒绝了本次请求（本地 token 无效）');
       }
+      final Map<String, dynamic> body = _safeBody(response);
+      if (response.statusCode == 409) {
+        throw AgentDeleteBlocked(
+          statusCode: 409,
+          message: '${body['error'] ?? body['detail'] ?? '删除被拒绝'}',
+          hint: '${body['hint'] ?? ''}',
+          cascadeRequired: <Map<String, dynamic>>[
+            for (final dynamic item
+                in (body['cascade_required'] as List<dynamic>?) ??
+                    const <dynamic>[])
+              if (item is Map)
+                item.map(
+                  (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+                ),
+          ],
+          running: <String>[
+            for (final dynamic item
+                in (body['running'] as List<dynamic>?) ?? const <dynamic>[])
+              item.toString(),
+          ],
+        );
+      }
+      throw Exception(_errorFromBody(response));
     } on Exception {
       rethrow;
     } catch (e) {
       throw Exception('核心进程不可达，请重启应用');
     }
+  }
+
+  /// 宽容解析响应体：非法 JSON 时回空表（只用于读结构化错误字段，不抛异常）。
+  static Map<String, dynamic> _safeBody(http.Response response) {
+    try {
+      final Object? decoded = jsonDecode(utf8.decode(response.bodyBytes));
+      if (decoded is Map<String, dynamic>) return decoded;
+    } catch (_) {
+      // 忽略：调用方会退回通用错误文案
+    }
+    return <String, dynamic>{};
   }
 
   /// 修改 agent 的模型、系统提示词或模型参数覆盖（右栏「模型信息」页使用）

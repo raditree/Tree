@@ -47,6 +47,13 @@
    安全底线：端口被**别的程序**占用（握手无应答 / 回的内容不对）时**照常启动**，不能因为撞了个端口
    就把用户挡在门外。
 
+9. **删除 agent 的两道闸门要在 UI 里变成可操作交互**（[io/api_service.dart](io/api_service.dart) 的
+   `AgentDeleteBlocked` + [ui/pages/main_page.dart](ui/pages/main_page.dart)）：核心对「有下级成员」回 409 +
+   `cascade_required`，UI 摊开下级清单请用户确认，再带 `?cascade=1` 重试（删掉组长会让组员变孤儿，不该一次点击就发生）；
+   对「正在运行」回 409 + `running`，UI 提示「先停止并等它空闲」（`stop` 抢不动正在执行的工具，核心不替用户等待）。
+   `deleteAgent` **必须解析响应体**：旧实现只看状态码，用户只会看到「删除失败（HTTP 409）」，不知道为什么、该怎么办。
+   删**成员**时**不清插件作用域**——只有删团队 TOP（`teamId` 为空）才回落，否则该队的站点/槽位会被滤成「站点（0）」。
+
 ## 测试
 
 ```bash
@@ -57,4 +64,5 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 钉子用例：`test/message_replay_guard_test.dart`、`test/session_rename_test.dart`、`test/plugin_panel_admin_test.dart`、
 `test/main_page_sidebar_width_test.dart`、`test/message_list_scroll_test.dart`、`test/tray_service_test.dart`（关闭决策与设置默认值）、
 `test/close_to_tray_dialog_test.dart`（首次关闭说明框的返回值）、`test/single_instance_test.dart`（锁键/端口纯函数、
-第二个实例被识别并唤起窗口、外人占端口不拦人）。
+第二个实例被识别并唤起窗口、外人占端口不拦人）、`test/agent_delete_flow_test.dart`（删除闸门的 UI 接线：结构化 409、
+级联重试、只删 TOP 才回落插件作用域）。
