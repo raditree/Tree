@@ -117,6 +117,10 @@ class VersionInfo {
 
 /// 打开**插件开发指南**（发行目录 `plugins/plugin-development.md` / 仓库 `docs/plugin-development.md`）。
 ///
+/// **核心侧同一套候选顺序**在 `packages/tree_core/lib/src/plugin/plugin_guide.dart`
+/// （它按同一顺序解析原件，再播种到 agent 工作空间 `.self/docs/plugin-development.md`）——
+/// 两端不共享代码，改一处要同步另一处。
+///
 /// 为什么打开文件而不是在应用内重写一份：插件的协议面（RPC 清单、17 个点位、
 /// `ui/manifest`、`plugins.yaml` 全字段、流式回填）**已经在指南里写全了**，再造一份
 /// 应用内文档就是第二份真相源，必然与代码漂移。入口的职责只是"把人送到那份文档"。

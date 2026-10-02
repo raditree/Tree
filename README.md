@@ -180,7 +180,7 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
   - **Q6** 输入框草稿按 **team+session** 缓存（文本与附件一起、**纯内存**），切换即恢复，发送成功后清空该键
   - **Q7** 下载列表「打开文件所在位置」：Windows `explorer /select,"<path>"`；**文件夹任务定位到 tar.gz 压缩包本身**；文件已被移动/删除给提示而非静默失败
   - **Q8** 删除工具轮次上限：终止条件只剩 取消 / 出错 / 模型给出最终文本；限额交给插件（插件监视轮次，超限经执行站 `agent.stop` 发停止信号）
-  - **Q9** `spec` 工具瘦身：只留 `select` / `create` / `update`；`select` **直接返回所选 Spec 全文**（删除 `search` / `list` 与"先 read 再 select"约束）；索引**注入系统提示词**（默认全列、>50 条截断）；内置 4 条只读（`general-task` / `hard-task` / `team-meeting` / `plugin-creator`，落工作空间 `.self/spec/`；`easy-task` 已按使用数据移除、`complex-task` 更名 `general-task`）
+  - **Q9** `spec` 工具瘦身：只留 `select` / `create` / `update`；`select` **直接返回所选 Spec 全文**（删除 `search` / `list` 与"先 read 再 select"约束）；索引**注入系统提示词**（默认全列、>50 条截断）；内置 4 条只读（`general-task` / `hard-task` / `team-meeting` / `plugin-creator`，落工作空间 `.self/spec/`；`easy-task` 已按使用数据移除、`complex-task` 更名 `general-task`）。**（**2026-10-02**：① 索引段顶部有一条**所有 Spec 共同前置**——"动手前先与用户对齐语义（复述目标/范围/验收 → 用户确认；歧义先问不猜；默认值显式），未对齐只做只读侦察"，自定义 Spec 也受它约束（它改不到用户文件，索引是唯一公共落点）；② 4 条内置规范的正文首部各有共享的「第 0 步：先对齐用户语义」（一份文本 `kSpecAlignFirstSection` 统一注入，正文不重复）；③ 内置副本语义改为**核心管理的快照**：`seedInto` 发现副本与模板不一致且**副本 version 不高于模板**时，先把旧副本备份成 `<id>.md.bak.<n>` 再刷新（手改内容进备份、不丢），副本 version **高于**模板则保留不动 + 记日志（绝不降级）；要按工作空间定制请用 `spec create`——升级因此能真正到达已有工作空间。）
   - **Q10** `grep` 无匹配时返回**扫描文件清单**（≤200，超出注明总数）+ **生效的排除目录** + 扫描根，帮模型区分"真没有"与"被误排除"；默认口径 = 不扫描**隐藏路径**（`.[!.]*`，如 `.git` / `.dart_tool` / `.self`）+ 依赖/构建目录，要搜隐藏路径显式传 `include_hidden=true`（依赖/构建目录是硬黑名单，不受该开关影响）
   - **Q11** 站点体系（三站 + 收集站）：执行站首命令集 `fs.read` / `fs.write` / `fs.list` / `fs.grep` / `terminal.exec` / `agent.message` / `agent.stop` / `agent.compact` / `ui.push`；**站点全局唯一**（每类站一个实例，id 是类型常量，不按 team / mode 复制）；中转站"**每个点位全局唯一订阅者**"（先到先得 / 显式 `replace` 接管，需分流由订阅者自行转发）；收集站由**站点定义输入格式**、多订阅者各回目标数据、站点汇总后交后续处理（如注册工具）；订阅者未响应 ⇒ **返回部分结果 + 显式列出未响应者**（不整体失败、不静默）。**（**2026-10-01 点位化**：中转站按接入点拆成 6 个点位、执行站按命令族拆成 7 个点位、广播站加工具前/后两个点位，`system.relay` / `system.execute` 两个旧 id 退役并由读侧迁移接住；见上文「站点体系」与 `docs/plugin-development.md`。）
   - 插件可订阅站点**：JSON-RPC `station/subscribe` / `station/unsubscribe`（`relay` / `broadcast`，或 `station_id` 指定具体实例；scope 按目标 agent 的真实归属解析，声明是作用域上限）；**插件可自建站点**：`station/register` / `station/unregister`（id 由核心拼 `plugin.<插件id>.<类型>.<name>`，别人的自建站不能订、不能注销）；**每次工具调用的前/后各触发一次中转站**（工具层唯一入口 `WorkspaceToolRunner.run` 的入/出口），核心把**完整 tool_call 报文**交给插件——改参数、改结果、或什么都不改由插件内部决定；回填支持 string / 对象 / 数组（整体替换），未接线 / 无订阅者 / 插件未回 / 回包非法一律 **fail-open 放行原始报文**
@@ -212,7 +212,7 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 - **提问回路**：提问落盘 `data/questions.json` → 前端卡片 → 作答幂等 → 继续生成；`stop` 取消在途提问；重启后的补答会写回会话。
 - **Spec 与会话状态**：Spec **索引注入系统提示词**（行格式 `- <id> [task_type] 标题（内置）（适用: when 摘要）`，id 用反引号包裹；默认全列、>50 条截断并注明「其余可用 `spec select` 直取」），模型直接 `spec select` 拿全文——M9 Q9 删除了 `search` / `list` / `read` 与"先 read 再 select"约束；每次工具结果前注入"当前 in_progress todo + 已选 Spec"，模型不会忘记约定。
 - **MCP**：`config/mcp.yaml` 注册 MCP 服务，工具以 `mcp__<服务>__<工具>` 原生注入模型工具列表；服务不可用只影响自己（可读错误 + 懒重连）。**（**2026-10-02**：① 两种传输——`transport: stdio`（缺省，本机子进程、行分隔 JSON-RPC）与 `transport: http`（**Streamable HTTP 单端点**：POST + `Accept: application/json, text/event-stream`，响应可为 JSON 或 SSE 流；会话走 `Mcp-Session-Id`、关闭时尽力 `DELETE`；`url` + `headers`（自定义鉴权头）配置，不做旧的双端点 HTTP+SSE、不内置 OAuth）；② **连接策略改为懒连接**——启动仍全量连一次（保工具表完整），**注册只连它自己**（旧实现每次注册都 `refresh(force: true)` 全量重连，是"点注册很久没反应"的根因），其余时刻"用到才连"（`ensureConnected`，工具调用命中未连接服务时补连），失败带 30s 退避；`mcp` 工具的 `help` 不再阻塞式重连（列已知工具 + 明确列出未连接/有错误的服务 + 后台补连）。）
-- **插件**：`config/plugins.yaml` 注册进程外插件，工具以 `plugin__<插件>__<工具>` 注入；事件总线（按 scope 四元组过滤）+ 心跳巡检 + `plugin_status` / `plugin_event` 增量；心跳连续丢失只标 **degraded**（插件面板橙色「心跳降级」角标 + 丢失拍数/判活窗口），**不杀进程**，恢复即自动清除。插件可经声明式槽位（活动栏 / 右栏 Tab / 状态栏 / 消息流卡片）出界面，也可经**收集站**申报自己的工具定义。
+- **插件**：`config/plugins.yaml` 注册进程外插件，工具以 `plugin__<插件>__<工具>` 注入；事件总线（按 scope 四元组过滤）+ 心跳巡检 + `plugin_status` / `plugin_event` 增量；心跳连续丢失只标 **degraded**（插件面板橙色「心跳降级」角标 + 丢失拍数/判活窗口），**不杀进程**，恢复即自动清除。插件可经声明式槽位（活动栏 / 右栏 Tab / 状态栏 / 消息流卡片）出界面，也可经**收集站**申报自己的工具定义。**（**2026-10-02**：声明式 UI 的**生命周期**与"插件是否在运行"对齐——插件被停用 / 条目被删除 / 启动失败 / 进程退出（`plugin_status(disabled)`）⇒ 前端**立即注销**它声明的全部槽位（消息流卡片 + 活动栏 / 右栏面板 / 状态条），重新启用后插件重新声明即恢复；前端 **WS 断连**时清空槽位注册表、重连后按核心重放（活着的插件的当前态）重建——离线期间被停用的插件因此不会留下僵尸卡片；**心跳丢失（degraded）不清**（进程还活着，清了反而回不来）。核心侧：`_disconnect` 早已作废 UI 缓存，本轮补上"进程退出 ⇒ 广播 `disabled`"——此前只在快照里体现，前端拿不到增量。）
 - **站点体系（M9 Q11 + 点位化）**：四种类型——广播站 / 执行站 / 中转站 / **收集站**（一对多收集、不回填）。**每个接入点（点位）是一个独立的持久化实例**：广播 3（通用主题 + 工具前/后）、执行 7（按命令族：fs / terminal / agent / ui / llm / tool / session）、中转 6（工具前 / 工具后 / **LLM 处理接管** / **投入 LLM 前改写** / **上下文压缩** / **系统提示词构造**）、收集 1，共 17 个 id（`system.broadcast[.tool.pre|.tool.post]`、`system.execute.<族>`、`system.relay.<点位>`、`plugin.tool.define`）。**id 不含 team / mode**（不按 team / mode 复制）：team / agent / session / mode 是**每次交互携带的四元组 scope** `(team_id, agent_id, session_id, mode_key)`，投递时按「消息 ↔ 订阅者」匹配——**订阅侧空 = 通配**（空 team 作用于所有 team、空 mode 两种工作面都收），**消息侧空 = 不可证明归属 ⇒ 不投递**（fail-closed）。**每个中转点位全局只允许一个订阅者**：需要按团队分开处理时，由该订阅者自己转发（在插件内再建站点分发），而不是重复订阅。无订阅者 / 未回填 / 回包非法一律 **fail-open 回退系统默认**（LLM 处理 / 压缩 / 提示词构造都因此"不装插件时行为逐字不变"）。
 - **数据都在用户能直接看的地方**：`~/.tree` 下的 yaml / jsonl / 快照，可手改。
 
@@ -267,9 +267,16 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 > 中转回包与**流式接管**、12 条执行站命令、广播与 UI 槽位、收集站、配置、调试、旧核心迁移）
 > 在 **[`docs/plugin-development.md`](docs/plugin-development.md)**；
 > 可运行示例在 [`examples/plugins/`](examples/plugins/)（`minimal_plugin.py` 最小骨架 +
-> `sample_plugin.py` 全功能参考实现，纯标准库 Python）。
+> `sample_plugin.py` 全功能参考实现 + `compact_plugin.py` 内置「上下文压缩」，
+> 纯标准库 Python）。
 > 应用内入口：**设置 → 插件开发 → 打开插件开发说明**（发行版打开应用目录下的
 > `plugins/plugin-development.md`，与主程序同级）。下面只记协议要点。
+>
+> **让 agent 也读得到**：agent 的工作空间类工具只认工作空间相对路径，读不到应用目录 / 仓库里的
+> 原件，所以**选中 `plugin-creator` 规范时核心把这份指南播种到工作空间**
+> `.self/docs/plugin-development.md`（`spec select spec_ids:['plugin-creator']` 的返回里带
+> `assets[]`：`action` = `created` / `updated` / `unchanged` / `missing` / `failed`；`missing` 时
+> 连"找过哪些目录"一起回报，绝不静默）。副本由核心维护（内容与原件逐字一致，改了下一次 select 会被覆盖）。
 
 先看 `station/command`：
 

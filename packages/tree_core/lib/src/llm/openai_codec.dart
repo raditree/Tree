@@ -222,7 +222,11 @@ abstract final class OpenAiCodec {
     final int prompt = pick(<String>['prompt_tokens', 'input_tokens']);
     final int completion = pick(<String>['completion_tokens', 'output_tokens']);
     final int total = pick(<String>['total_tokens']);
-    int cached = pick(<String>['cached_tokens']);
+    // 前缀缓存命中：OpenAI 系放在顶层 `cached_tokens`（或 prompt_tokens_details 里），
+    // DeepSeek 的硬盘缓存放在顶层 `prompt_cache_hit_tokens`（另一头是
+    // `prompt_cache_miss_tokens`）。三处都认，否则"缓存到底有没有生效"在界面上
+    // 恒为 0，插件也就无从判断自己拼的前缀对不对。
+    int cached = pick(<String>['cached_tokens', 'prompt_cache_hit_tokens']);
     final Object? details = usage['prompt_tokens_details'];
     if (details is Map) {
       cached = (details['cached_tokens'] as num?)?.toInt() ?? cached;

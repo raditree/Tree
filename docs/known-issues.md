@@ -363,3 +363,256 @@ desktop 移植时只搬了解析（显示思考卡片），**没搬回写**：�
    面板一键确认（新增 REST 动作或复用 POST 注册带 `trusted`）；
 4. HTTP 传输不执行本地命令 ⇒ 不参与该流程。
 
+
+---
+
+## #6 重建的历史与「实发那一份」不逐字一致 → 长会话前缀缓存只命中 system 提示词
+
+**状态**：**已修复**（2026-10-02；`tree_core` 816 通过 / 0 失败，新增回归用例钉住不变量）。
+**影响**：长会话每发一条新消息，端点（DeepSeek 上下文缓存）只命中 ~12k token —— 正好是
+system 提示词 + 压缩摘要，其余 **373k 全部按未命中价计费**；工具循环的每一跳同理。
+即"发消息启动 tool loop 会对消息产生破坏性更改"。
+
+### 现象（真机）
+
+- 同一会话连续两次请求：`373,899 / 1,027` 与 `373,857 / 1,068`，**缓存命中都只有 12,288**。
+- 数据现场：`%APPDATA%\Tree\data\agt_1790406811628_73afa9_44\ses_1790864583576_01e5cd_3`
+  （905 条消息 / 水位线 192；system 提示词 12,018 字符 + 摘要 2,293 字符 ≈ 12k token）。
+
+### 根因：`_buildMessages` 是**重新推导**，而不是复用"当初发出去的那份字节"
+
+端点前缀缓存只在**逐字相同**的公共前缀上命中。重建路径有四处与实发不同（每一处都足以
+让缓存从该条消息起整段落空）：
+
+| # | 消息 | 实发（`LlmSession`） | 重建（`LlmAgentEngine._buildMessages`） |
+| --- | --- | --- | --- |
+| 1 | assistant 的 `tool_calls[].function.arguments` | 模型**原始流式串**（`llm_session.dart:376-383`，含空格/原样转义） | `jsonEncode(解析后的 Map)` → 规范形态，字节不同 |
+| 2 | `role: tool` 的 content | `sessionStatusText`（含 `结果返回时间：<秒>`，`status_text.dart:13-18`）+ 门控结果 | 只有门控结果（状态前缀整段丢失） |
+| 3 | 超长结果的重定向文件名 | `.self/results/<DateTime.now()>_<每次 run 从 1 起的序号>.<工具名>.result`（`llm_result_gate.dart` 原 `_nextPath`） | 每轮换名字 ⇒ 每轮**重写一份内容相同的文件**，提示里的路径逐轮变化 |
+| 4 | 同一跳的"正文 + tool_calls" | **同一条** assistant（content + tool_calls） | 拆成"正文一条 + tool_calls 一条"；`reasoning_content` 还被 `trim()` 重排 |
+
+证据（各处实测）：
+
+- 消息 1：用真实数据 + 真实引擎重建请求，第 2 条消息（system/摘要之后第一条）就是那条
+  `tool_calls` assistant：实发 `{"file_path": "notes/hello.txt", "start_line": 1}`、
+  重建 `{"file_path":"notes/hello.txt","start_line":1}`。在有 373k 上下文的真机会话里，
+  这条消息正好紧跟 system+摘要 ⇒ 缓存命中停在 ~12k。
+- 消息 3：`E:\programs\Tree\desktop\.self\results\` 里 **42 个文件只有 14 份不同内容**；
+  同一份 23,081 字符的 read 结果被写成 `20261002_103401_001` … `20261002_121305_001`
+  **共 13 个文件**（`_cache` / `_seq` 是"每个 run 一个门控实例"，历史翻译每轮都会重跑一遍）。
+- 复现用例：`packages/tree_core/test/llm_prefix_stability_test.dart`（修复前两条用例分别在
+  消息 2 / 消息 3 处报"与上一轮实发不一致"；修复后全绿）。
+
+### 修复（2026-10-02）
+
+1. **落库"送模型的那一份"，重建时原样取用**（不再重新推导）：
+   - `CoreMessage.toolArgumentsRaw` / `toolResultForModel`（`records.dart`，键
+     `tool_arguments_raw` / `tool_result_for_model`，空则不写，老会话文件零变化）；
+   - 实发时定稿：`LlmSession` 把原始参数串与"状态前缀 + 门控结果"随事件带出
+     （`AgentToolStart.rawArguments` / `AgentToolEnd.modelContent`），
+     `ConversationService` 落库；重建优先取这两份，缺了才回退旧口径。
+2. **重定向落点改成内容指纹**：`.self/results/<工具名>_<FNV-1a 64 指纹>.result`
+   （`ToolResultGate.fingerprint`，纯整数运算、无新依赖）——同一份结果永远同一个路径，
+   不再每轮堆文件，提示文本逐字稳定。
+3. **同跳正文与 tool_calls 合成一条** assistant、`reasoning_content` 逐字保留（不 trim、
+   不插分隔符）：重建出来的消息序列与实发的**结构**也一致。
+
+### 遗留（须知）
+
+- **修复前落库的老消息**没有 `tool_arguments_raw` / `tool_result_for_model`，只能按旧口径
+  推导 ⇒ 老会话里那些消息所在位置仍会对不齐。等它们被压缩 / 滚出窗口（或手动压缩一次，
+  保留窗只剩新的几轮）后，缓存命中就能恢复到接近全量。
+- 若端点把 `tool_calls.arguments` 原样规范化输出（与 `jsonEncode` 同形），老消息第 1 处
+  差异不存在；第 2、3、4 处差异与端点无关，必然存在。
+
+---
+
+## #7 本地执行被「等输入」的子进程永久挂死（裸 `echo` 触发）
+
+**状态**：**已修复**（2026-10-02）。三处：① `-NonInteractive` + 关掉子进程 stdin；
+② 本地**软**超时 → hook 模式（超时不再杀进程、转后台并在结束时唤醒 agent）；
+③ terminal 提示词写明 hook 模式可以"做别的事 / 直接结束本轮等唤醒"。
+回归用例：`tree_local_exec/test/exec_no_interactive_hang_test.dart`、`exec_soft_timeout_test.dart`、
+`tree_core/test/terminal_soft_timeout_test.dart`。**需重建核心 exe 才对安装版生效**。
+
+**影响**：一次 terminal 调用就能把整轮会话卡死——**没有超时、没有取消路径**，模型只能干等，
+用户看得到「工具执行中，请稍候…」却永远不会返回。
+
+### 现象（真机）
+
+- 2026-10-02 13:01:23，会话 `ses_1790864583576_01e5cd_3` 发起
+  `echo "=== 上轮文件最近提交 ==="; git log --oneline -3 -- …; echo; echo "=== README/known-issues … ==="; …`，
+  到 13:15 仍未返回（>13 分钟），UI 一直「工具执行中」。
+- 进程现场（`Get-CimInstance Win32_Process`）：`pwsh.exe` PID 39276（父进程 `tree_core.exe`）活着、
+  CPU 0.65s、**4 秒内读写计数一个都不动**、没有任何子进程；同轮 `conhost.exe` 是它的 console。
+- 把它的 console 附上来读屏（`AttachConsole` + `ReadConsoleOutputCharacterW`）只有三行：
+
+  ```
+  cmdlet Write-Output 位于命令管道位置 1
+  请提供以下参数的值:
+  InputObject:
+  ```
+
+  —— PowerShell **正在等 stdin 输参数**（读屏时探针自己的输出正好接在 `InputObject:` 光标后，可佐证光标停在那里）。
+
+### 根因：两条各自"合理"的设计叠在一起
+
+1. `echo` 在 PowerShell 里是 `Write-Output` 的别名，而它的 `-InputObject` 是**必填**参数：
+   裸 `echo;`（无参数）⇒ PowerShell 弹参数提示并**读 stdin**。
+2. `LocalWorkspaceIO.exec` 用 `Process.start(..., runInShell: false)`，Dart 侧给子进程的 stdin 是
+   **一条永不写入、也永不关闭的管道**（没有任何一处关过它）；而本地执行的活性判据是
+   「进程还活着」（`local_workspace_io.dart:435-437`，M9 1.1 明令取消静态总时长硬超时）
+   ⇒ 没人喂输入、也不判超时 ⇒ **永久等待**。
+
+即：**只要命令里有任何一处会读 stdin 的写法（裸 `echo`、`Read-Host`、git 凭据提示、`pause`/`choice`、REPL），
+本地执行就会永久挂住。**
+
+### 证据（可复现）
+
+用包自己的 `Shell.argsFor` + `Process.start` 逐条实测（一次性探针已删，结论固化进新用例）：
+
+| 用例 | 命令 | 结果 |
+| --- | --- | --- |
+| A | `echo; echo after-bare-echo` | **10s 不返回**（超时后杀掉），stdout 空 |
+| B | `echo "hello"; echo "world"` | 593ms 退出，码 0 |
+| C | 现场那条命令（含裸 `echo;`） | **10s 不返回**，stdout 已吐出首个 `echo` 与两条 `git log` 结果 |
+| D | 同 A，但 spawn 后 `stdin.close()` | 707ms 退出，stderr `Write-Output: … 缺少一个或多个必需参数: InputObject。` |
+| E | 同 A，参数加 `-NonInteractive` | 699ms 退出，同上 stderr |
+
+### 修复（2026-10-02）
+
+1. **`Shell.argsFor` / `Shell.argsForScript` 加 `-NonInteractive`**：PowerShell 的参数提示、
+   `Read-Host` 之类**立刻变成错误**，而不是等输入（D/E 实测）。
+2. **spawn 后立刻关掉子进程 stdin**：`LocalWorkspaceIO.exec`（`await process.stdin.close()`）与
+   `TerminalHooks.start`（后台 hook 同理）——原生子进程（git 凭据、`pause`、REPL）也只拿到
+   EOF 报错，不再静默挂死。
+
+### 验证（2026-10-02）
+
+- `tree_local_exec`：**159 通过 / 1 跳过**（新增"裸 echo 不挂"与"软超时交出活着的进程"两组用例），
+  `dart analyze lib test` 干净；
+- `tree_core`：**823 通过 / 1 跳过**（新增 `test/terminal_soft_timeout_test.dart`：软超时转后台 +
+  结束回调唤醒 + 提示词断言），`dart analyze lib test` 干净。
+
+### 兼容层：裸 echo 直接补成空串（2026-10-02）
+
+`-NonInteractive` + 关 stdin 只是"让它别再挂死"，根因还在：模型照 cmd 习惯写裸 `echo;`。
+与 `&&` / `||` 的处理同一路数，现在在包装层直接兼容：
+
+- `Shell.translateBareEcho` 把**命令位置上无参**的 `echo` / `write-output` 补成 `echo ''`
+  （cmd 语义：输出一个空行）。只认命令位置，且后面必须紧跟 `;` / 换行 / `|` / `)` / `}` / 行注释 / 结尾，
+  所以 `echo hi`、`echo $x`、`function echo {}`、引号内的 `echo` 一律不动；拿不准（引号不闭合、
+  here-string、块注释）整体原样返回——与 `translateLogicalOperators` 同一条"保守回退"口径。
+- 接线顺序：**先** `translateBareEcho`（在模型原始命令上认命令位置最准）**再**折叠 `&&` / `||`。
+- 于是三层防护：① 兼容翻译（不再进入交互）；② `-NonInteractive`（其余提示立刻报错）；
+  ③ 关掉子进程 stdin（原生子进程只拿 EOF）。第 ④ 层才是 300s 软超时转后台。
+- 用例：`test/shell_translate_test.dart` 新增"裸 echo 兼容翻译"组（补空串 / 不动的情况 / 保守回退 +
+  包装层接线），`test/exec_no_interactive_hang_test.dart` 新增"裸 echo 真的输出一个空行"（真机跑）。
+
+### 遗留项：本地软超时 → hook 模式（2026-10-02 已实现）
+
+原来只有远端 `adoptDetached` 有"不终止、转后台"的兜底；本地是"进程活着就永不超时"，
+所以卡死的命令只能靠手杀。现在本地也接上了：
+
+- `LocalWorkspaceIO.exec(timeout:)` 的语义改回可用，但是**软**的：到点仍在跑就
+  **不杀进程、不丢输出**，抛 `LocalExecStillRunning`（携带 `RunningLocalExec`：pid、退出码 future、
+  输出快照）；`Duration.zero`（默认）= 永不软超时（老行为）。
+- terminal 接住它：`TerminalHooks.adoptRunning` 把**还活着的本机进程**登记成后台任务——
+  `HookTask.process` 非空 ⇒ `hook_action=cancel` 杀得掉；退出时补写"完整输出"到日志并回调
+  `onFinished` ⇒ 经 `conversation.wake` 自动唤醒 agent；返回文本写明"本轮不必继续等它：可以
+  接着做别的事，或者**直接结束本轮**，结束时自动唤醒你"。
+- 缺省软超时 **300s**（`timeout_seconds`，0 = 永不软超时）；**没接 hook 时不启用**——登记不了
+  后台任务时，老口径"一直等"反而更诚实。
+- 提示词（terminal 的工具描述）同步写明：`hook` 模式下可以接着做别的事、或者直接结束本轮
+  （结束 tool loop），任务结束会把 `[terminal hook]` 完成提示注入会话把你唤醒。
+
+仍留在桌上的：
+
+- 事故里那两次已发出的命令都是**手动杀掉**（`taskkill /PID <pid> /T /F`）才让会话继续的；
+  修复只对重建核心之后新起的命令生效。
+- SSH 失联转后台的 `detached` 任务**不会**自动唤醒（本机拿不到远端退出），返回文本现在也如实
+  写了这一点，避免模型干等。
+
+---
+
+## #8 核心重启后「冷 → 热」的 Spec 快照让 `[0]` 换字节 ⇒ 整条前缀缓存作废（0 命中）
+
+**状态**：**已修复**（2026-10-02；按用户要求把系统提示词**按会话钉住**）。
+**影响**：核心重启后的前 1~2 条消息会**整条前缀 miss**（68k 会话按全价付一次）；修复前用户连续遇到两次。
+
+### 现象（用户第三次反馈，含对我的关键更正）
+
+- 用户原话：**"压缩后是 32k，跑了一圈后再发消息变成了 68k。再发消息结果 0 命中"**。
+- 卡片：`68,049 / 1,132`（无缓存行 = 0 命中）→ `73,560 / 1,205`（缓存 72,832）→
+  `72,874 / 462`（缓存 71,936）。**同一轮内**第 2/3 跳 98.7%~99%（历史逐跳稳定），
+  只有"新消息的第一跳"整条 miss。
+- 我第一版结论（"压缩那一跳的固有代价"）**是错的**：压缩把 prompt 从 490k 压到 32k，而对不上
+  的那一跳是**压缩之后又跑完一轮**才发的（用户更正）。
+
+### 根因：⑦ 索引 / ⑧ 已选全文两处快照是**异步**补热的
+
+`SpecService` 的 `indexSnapshot()` 冷的时候返回 `renderIndex(_builtinDocuments())`（只有内置模板）
+并起一个后台全量扫描；`selectedSpecsSnapshot()` 冷的时候返回**空串**（整段不注入）再后台补扫。
+它们拼进 `systemPromptWithWorkspace()`，也就是消息序列的 `[0] system`。
+
+真机量化（本机数据 + 真实代码，2026-10-02）：
+
+| | ⑦ Spec 索引 | ⑧ 已选 Spec 全文 | 两段合计 |
+| --- | --- | --- | --- |
+| **冷**（重启后、还没扫过） | 623 字（只有 4 条内置模板） | **0 字** | 865 字 |
+| **热**（后台补扫完成） | 908 字（多出工作空间的 `desktop` / `flaky`） | **7,388 字**（`general-task` 全文） | 8,567 字 |
+
+第一处不同在第 **645** 字 ⇒ 从 `[0]` 里那一点往后**全部**是新字节；而 `[0]` 在消息最前面，
+整条前缀（含 68k 历史）因此全部对不上 ⇒ 0 命中。时间线也对得上：核心 13:34:56 重启（冷），
+第一轮用冷串（32k），后台扫完，**下一轮**用热串（68k）⇒ 0 命中。
+
+### 修复（2026-10-02，按用户要求定稿：**中间不切 system prompt**）
+
+用户原话：**"要求在中间不切 system prompt（用快照），system prompt 只在会话初始化或
+compact 后，发消息不引起系统提示词更新"**。据此实现：
+
+1. **按会话钉住**：`ConversationService._systemPrompts`（键 `agentId|sessionId`）。
+   `_contextOf` 取的是**钉住值**，不是每轮现拼。
+2. **只有三处重建**：
+   - 会话初始化（本进程第一次为该会话拼装）；
+   - **compact 之后**（每轮入口的自动压缩 + 工具循环内压缩都算）——此时前缀本来就要重写，
+     重建不额外亏；
+   - `invalidateSystemPrompt`：用户**显式**改 agent 配置（`PATCH /api/agents`）或重置工作空间
+     （`POST …/reset`）时调用。**发消息永远不调它**。
+3. **重建前先热 ⑦/⑧ 快照**：`SpecService.ensureSnapshots(agentId, sessionId)` 只在冷的时候真的扫一次，
+   由 `ConversationService.promptStatePrewarm` 在**拼 `AgentRunContext` 之前** await（必须在这里：
+   `systemPrompt` 进引擎前就拼好了）。这样重启后的第一轮直接拿到"热串"，与重启前逐字相同，
+   跨重启也不再白丢一次。
+
+### 这个决定的直接后果（须知）
+
+- 会话**中途** `spec select / create / update` 不再立即改变系统提示词：
+  `spec select` 仍会把规范全文作为**工具结果**返回（当轮模型看得到），但 ⑧ 章进 system 要等下一次
+  compact。这是"发消息不重建"的必然代价；如果希望"显式挂规范立刻生效"，可以在 `spec` 工具成功时
+  也失效一次（那属于用户/模型的显式动作，不是发消息）——**目前未做，待定夺**。
+- 每跳 usage 仍不落库（`messages.jsonl` 只记每轮最后一跳），排查只能靠卡片 + 落盘行对数字。
+
+### 配套策略：工具表**按"发消息"刷新**，不进钉住（2026-10-02 用户要求）
+
+用户原话：**"system prompt 不中途重建，但 MCP 与 plugin 产生的工具至少要在每次发消息时刷新"**。
+
+- 工具表在请求体的 @BT@tools@BT@ 字段里，**不参与消息前缀** ⇒ 每次刷新不伤缓存；
+  系统提示词在第 0 条消息里 ⇒ 一变就整条前缀作废。两者因此是不同处置：一个钉住、一个每轮现取。
+- 现状（未改代码，本来就是刷新语义）：@BT@LlmAgentEngine.run@BT@ 每次运行都调
+  @BT@toolRunner.specsFor(agentId, sessionId)@BT@；@BT@WorkspaceToolRunner.specsFor@BT@ 现取
+  @BT@McpService.allTools()@BT@ 与 @BT@PluginTool.dynamicSpecsFor(...)@BT@（后者是"缓存 + 失效点"，
+  插件上线 / 下线 / 重启后下一次取用即更新）。源码里那句注释就是这条口径：
+  "**工具表刷新处**（模型每轮生成前都走这里）"。
+- **防回归用例**：@BT@test/tool_list_refresh_test.dart@BT@——第二轮"服务就绪"后新工具
+  （@BT@mcp__demo__ping@BT@）必须立刻出现在该轮请求的 @BT@tools@BT@ 里，**同时**系统提示词仍是第一轮那串
+  字节。谁把工具表缓存进"钉住的上下文"，这条就红。既有的插件侧覆盖见
+  @BT@test/plugin_tool_table_test.dart@BT@（上线/下线 ⇒ 工具表变化 + 缓存失效点）与 @BT@plugin_hot_apply_test.dart@BT@。
+- 范围：**同一轮内**（tool loop 的后续跳）工具表在 @BT@LlmSession@BT@ 里固定——符合"每次发消息刷新"；
+  若要"每一跳都刷新"需在 @BT@LlmSession@BT@ 每跳重取（tools 不在前缀里，不影响缓存），**目前未做**。
+
+### 验证（2026-10-02）
+
+- 新增 @BT@test/tool_list_refresh_test.dart@BT@（工具表每轮现取 + 系统提示词不变）。
+- 新增 `test/system_prompt_pin_test.dart`：① 外部来源（Spec 索引 provider）变了，第二轮**仍是同一串
+  字节**；② `invalidateSystemPrompt` 之后才重建。
+- `tree_core` 全量 **823 通过 / 1 跳过**，`dart analyze lib test` 干净。

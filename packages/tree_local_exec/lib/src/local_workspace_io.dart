@@ -20,6 +20,79 @@ class WorkspaceIoException implements Exception {
   String toString() => message;
 }
 
+/// 软超时到点、命令**仍在本地运行**（没有终止、也没有重跑）。
+///
+/// 由 [LocalWorkspaceIO.exec] 抛出：调用方（terminal 的 hook 模式）拿到 [running]
+/// 后把它登记成后台任务即可——进程与输出订阅都还活着，照常收尾（退出码、输出、
+/// 取消、唤醒 agent）。**不登记就等于把这条命令的输出留在内存里**，所以要么交给
+/// hook，要么自己用 [RunningLocalExec.exitCode] 收尾。
+class LocalExecStillRunning implements Exception {
+  LocalExecStillRunning(this.command, this.running, this.elapsed);
+
+  /// 原命令。
+  final String command;
+
+  /// 仍在运行的进程句柄（含到目前为止的输出）。
+  final RunningLocalExec running;
+
+  /// 已经等了多久（≈ 软超时值）。
+  final Duration elapsed;
+
+  String get message =>
+      '命令已运行 ${elapsed.inSeconds}s 仍未结束（pid=${running.pid}）';
+
+  @override
+  String toString() => message;
+}
+
+/// 一条**仍在运行**的本机命令（软超时交接用）。
+///
+/// 进程没被杀、输出订阅也还在收字节：[exitCode] 会在它真正退出时完成，
+/// [snapshotText] 给出"到目前为止"的输出（走执行器同一条解码链）。
+///
+/// 为什么不需要持有订阅：`Stream.listen` 的订阅由流本身持有，而流由 [process]
+/// 持有（我们一直引用着它），所以订阅不会被 GC 掉，交接后照常收字节。
+class RunningLocalExec {
+  RunningLocalExec._(this.process, this.command, this._out, this._err);
+
+  /// 本机进程句柄（要主动终止用 `Shell.killProcessTree(process.pid)`）。
+  final Process process;
+
+  /// 原命令。
+  final String command;
+
+  final _OutputCollector _out;
+  final _OutputCollector _err;
+
+  int get pid => process.pid;
+
+  /// 它真正退出时的退出码（还在跑时不会完成）。
+  Future<int> get exitCode => process.exitCode;
+
+  /// 到目前为止捕获到的输出（stdout/stderr 分段标注）。
+  ///
+  /// 取的是**快照**：采纳时写一次进 hook 日志，命令结束时再写一次完整版。
+  String snapshotText() {
+    final StringBuffer buffer = StringBuffer();
+    final String stdout = _out.decoded.text;
+    final String stderr = _err.decoded.text;
+    if (stdout.trim().isNotEmpty) {
+      buffer
+        ..writeln('--- stdout ---')
+        ..writeln(stdout.trimRight());
+    }
+    if (stderr.trim().isNotEmpty) {
+      buffer
+        ..writeln('--- stderr ---')
+        ..writeln(stderr.trimRight());
+    }
+    if (stdout.trim().isEmpty && stderr.trim().isEmpty) {
+      buffer.writeln('（暂无输出）');
+    }
+    return buffer.toString().trimRight();
+  }
+}
+
 /// [WorkspaceIO] 的**本地**实现（`dart:io`）。
 ///
 /// Windows 上踩过的坑（M0b 迁移清单要求原样保留）：
@@ -429,12 +502,15 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   @override
   Future<ExecOutcome> exec(
     String command, {
-    Duration timeout = const Duration(seconds: 120),
+    Duration timeout = Duration.zero,
     int maxOutputBytes = 200 * 1024,
   }) async {
-    // [timeout]（静态总时长）已无作用：本地执行的活性判据就是**进程还活着**
-    // （OS 层）——进程活着就永不超时，进程消失就当正常退出处理，绝不因为"太久"
-    // 去杀它（M9 1.1）。参数保留只为不改调用方签名。
+    // [timeout] 的语义（2026-10-02 修订）：
+    // - `Duration.zero`（默认）= **永不软超时**：老行为——本地执行的活性判据就是
+    //   进程还活着（OS 层），进程活着就一直等，绝不因为"太久"去杀它（M9 1.1）；
+    // - `> zero` = **软超时**：到点仍在跑就**不杀进程、不丢输出**，带着活着的进程
+    //   抛 [LocalExecStillRunning]，由调用方（terminal 的 hook 模式）登记成后台
+    //   任务继续收尾。硬超时（按时间杀进程）依然**不存在**。
     final String trimmed = command.trim();
     if (trimmed.isEmpty) {
       throw WorkspaceIoException('command 不能为空');
@@ -446,6 +522,15 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
       workingDirectory: root,
       runInShell: false,
     );
+    // 子进程的 stdin 立刻关掉。
+    //
+    // 它是 Dart 侧的管道，我们**永远不会往里写**；只要它开着，任何"等输入"的子进程
+    // 就会一直等下去：PowerShell 的参数提示（例如裸 `echo` 缺 `-InputObject`）、
+    // Read-Host、git 的凭据提示、pause/choice、交互式 REPL……而下面 M9 1.1 说明的
+    // 活性判据是"进程还活着"，于是整轮会话永久卡死——2026-10-02 实机事故正是如此
+    // （agent 写了 `…; echo; echo "=== …"`，卡了十几分钟不动）。关掉之后这类等待
+    // 立刻拿到 EOF：报错/继续，而不是静默挂住。
+    await process.stdin.close();
     final _OutputCollector out = _OutputCollector(
       maxOutputBytes: maxOutputBytes,
     );
@@ -478,6 +563,30 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     // M9 1.1：本地执行的活性判据就是**进程还活着**（OS 层）——不去按静态时间杀
     // 它（本地执行，不存在服务器上"多用户无限期等待把资源耗光"的后果）。
     // Shell.killProcessTree 因此不在这里用（它仍服务于 terminal 的后台取消）。
+    //
+    // 2026-10-02：软超时（[timeout] > 0）时**到点就不再等**，把活着的进程交出去
+    // （[LocalExecStillRunning]）。这是"命令卡在等输入 / 跑得太久"时唯一能让工具
+    // 调用返回的出口，而进程本身一步都没被动过（没杀、没重跑、输出没丢）。
+    if (timeout > Duration.zero) {
+      final Stopwatch watch = Stopwatch()..start();
+      final Completer<void> reached = Completer<void>();
+      final Timer timer = Timer(timeout, () {
+        if (!reached.isCompleted) reached.complete();
+      });
+      // 谁先到：进程真的退出（照常收尾），还是软超时（交接给 hook）
+      final bool exited = await Future.any(<Future<bool>>[
+        process.exitCode.then((int _) => true),
+        reached.future.then((void _) => false),
+      ]);
+      timer.cancel();
+      if (!exited) {
+        throw LocalExecStillRunning(
+          trimmed,
+          RunningLocalExec._(process, trimmed, out, err),
+          watch.elapsed,
+        );
+      }
+    }
     final int exitCode = await process.exitCode;
     await _drainOutput(
       out,

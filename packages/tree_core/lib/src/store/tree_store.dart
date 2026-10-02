@@ -98,11 +98,28 @@ abstract interface class TreeStore {
   /// 数，[summary] 是替代它们的摘要。会话不存在返回 false。
   ///
   /// 消息本体不动——压缩只改"引擎该看多少历史"，历史全文仍可回看。
+  ///
+  /// **会清空 `compacted_context`**（中转站路径的产物）：两条压缩路径的权威只能有
+  /// 一个，否则"列表覆盖 12 条 + 摘要覆盖 6 条"会同时挂在同一个会话上。
   bool setCompacted(
     String agentId,
     String sessionId, {
     required String summary,
     required int messageCount,
+  });
+
+  /// 记录一次**由中转站产出**的压缩（点位化 `system.relay.context.compact`）。
+  ///
+  /// [context] 是整份新上下文（OpenAI 线形态的消息数组），[coveredMessageCount] 是
+  /// 这份上下文覆盖了原文的前多少条（引擎从这条之后继续追加新消息）。
+  /// 会话不存在返回 false。
+  ///
+  /// **会清空 `compacted_summary`**：权威转移到这份列表上（见 [CoreSession]）。
+  bool setCompactedContext(
+    String agentId,
+    String sessionId, {
+    required List<Map<String, dynamic>> context,
+    required int coveredMessageCount,
   });
 
   // ── 消息 ─────────────────────────────────────────────────────────────

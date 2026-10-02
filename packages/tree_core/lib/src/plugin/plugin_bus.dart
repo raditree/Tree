@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import '../agent/agent_engine.dart';
+import '../agent/compaction_service.dart';
 import '../llm/llm_types.dart';
 import '../llm/openai_codec.dart';
 import '../store/atomic_file.dart';
@@ -173,6 +174,9 @@ class PluginBus {
 
   /// 已被判 degraded 的插件（用于只在**跃迁**时通知前端）。
   final Set<String> _degraded = <String>{};
+
+  /// 已广播过 `disabled` 的"进程已退出"插件（心跳巡检每拍都跑，只在跃迁时推一次）。
+  final Set<String> _dead = <String>{};
 
   /// 动态工具表（**触发方** = 工具表刷新处；由收集站收集后注册）。
   final PluginToolDefinitionTable _definitions = PluginToolDefinitionTable();
@@ -388,6 +392,7 @@ class PluginBus {
       _spawnedConfigs[config.id] = config;
       _errors.remove(config.id);
       _queueDepth[config.id] = 0;
+      _dead.remove(config.id); // 重新起来 = 可以再次报告"进程已退出"
       host.liveness.recordBeat();
       if (!_scopeOf(config).isValid) {
         // 无 team 归属的插件进不了站点体系（隔离要求四元组）：
@@ -658,6 +663,20 @@ class PluginBus {
         if (_degraded.remove(pluginId)) {
           log?.call('插件 $pluginId 心跳恢复（degraded 已清除）');
           _emitStatus(pluginConfig, 'registered', degraded: false);
+        }
+        continue;
+      }
+      if (host.isClosed) {
+        // **进程真的退出了**（不是"心跳丢了但还活着"）：快照口径本来就把 `isClosed`
+        // 记成 `disabled`（见 snapshot 的 status 计算），这里把**增量**补上——
+        // 否则前端只能等下一次快照 / 重启，而它声明过的卡片与面板会一直留在界面上
+        // （真机反馈："关闭后卡片、面板均被保留"）。
+        _degraded.remove(pluginId);
+        if (_dead.add(pluginId)) {
+          log?.call(
+            '插件 $pluginId 进程已退出 ⇒ 广播 disabled（其声明的 UI 槽位应随之注销）',
+          );
+          _emitStatus(pluginConfig, 'disabled', reason: '插件进程已退出');
         }
         continue;
       }
@@ -1858,14 +1877,19 @@ class PluginBus {
 
   /// **中转站点位「上下文压缩过程」**（`system.relay.context.compact`）。
   ///
-  /// 返回摘要正文（不含 header）；null = 插件没接管，回退内置摘要器。
-  Future<String?> relayCompaction({
+  /// **规划也归中转站**（2026-10 定稿）：只要这个点位有订阅者，核心就**不算切点**
+  /// （`buildPlan` 完全不跑），而是把整份原料交出去；插件产出**整份新上下文**并回传
+  /// 它覆盖了多少条原文。没订阅者（或它这轮不接管）才走系统内置 compact。
+  ///
+  /// 返回 null = 插件没接管，回退内置 compact。
+  Future<CompactionRelayReply?> relayCompaction({
     required CoreAgent agent,
     required CoreSession session,
-    required String prompt,
-    required List<CoreMessage> messages,
-    required String instruction,
-    required String header,
+    required String systemPrompt,
+    required int totalMessageCount,
+    required int compactedMessageCount,
+    required String existingSummary,
+    required Map<String, dynamic>? wireRequest,
   }) async {
     load();
     if (!enabled) return null;
@@ -1883,12 +1907,22 @@ class PluginBus {
       'point': station.id,
       'agent_id': agent.id,
       'session_id': session.sessionId,
-      'prompt': prompt,
-      'instruction': instruction,
-      'header': header,
-      'message_count': messages.length,
+      // 系统提示词：放在你的列表**首条 system**（提示词槽位）里；核心每轮会用最新
+      // 的那份覆盖它，所以这里给的是"压缩那一刻的快照"。
+      'system_prompt': systemPrompt,
+      // 原文条数（`covered_message_count` 的合法上界）。
+      // **载荷不给落库全量原文**：那份既大又与真实上下文不同步（冷前缀已被压缩产物
+      // 代表）；你要的原料是下面的 `request.messages`。
+      'total_message_count': totalMessageCount,
+      // 引擎此刻从原文第几条继续（这份新上下文要覆盖到哪，由回包决定）
+      'compacted_message_count': compactedMessageCount,
+      'existing_summary': existingSummary,
       'compacted': session.compacted,
-      'existing_summary': session.compactedSummary,
+      // **预先压缩态的线形请求**（引擎口径）：`{model, messages, tools, …}`，即
+      // "对话这一轮真会发的那份"。它同时是压缩的**唯一原料**与**缓存前缀**：
+      // 整份拿去当 `llm.call` 的 messages（末尾追加一条总结指令）即可命中端点前缀
+      // 缓存；要保留的尾部也从它的 messages 里原样截取。
+      'request': ?wireRequest,
     };
     try {
       final StationRelayResult relayed = await station.relay(
@@ -1898,18 +1932,64 @@ class PluginBus {
       );
       if (!relayed.handled || relayed.data == null) return null;
       final Object? data = relayed.data;
-      final Object? rawSummary = data is Map
-          ? (data['summary'] ?? data['text'] ?? data['content'])
-          : data;
-      final String summary = (rawSummary ?? '').toString().trim();
-      if (summary.isEmpty) {
-        log?.call('压缩中转回包没有 summary 正文：按未接管处理，回退内置摘要器');
+      // 回包 `payload: null` = **不改动**：站点会把**原请求数据**原样放行
+      // （见 StationInstance.relay 的 None 分支）。这里必须用同一性判掉它——
+      // 不判就有可能把"插件没接管"误读成"插件回了一份新上下文"。
+      if (identical(data, payload)) {
+        log?.call('压缩中转：插件未接管（回 null），回退内置 compact');
         return null;
       }
-      log?.call('压缩中转：插件 ${relayed.pluginId} 接管了这次摘要');
-      return summary;
+      if (data is! Map) {
+        log?.call(
+          '压缩中转回包不是对象（回 ${data.runtimeType}）：按未接管处理，回退内置 compact。'
+          '回包形状应为 {"messages": [...], "covered_message_count": N}',
+        );
+        return null;
+      }
+      final Object? rawMessages = data['messages'];
+      if (rawMessages is! List || rawMessages.isEmpty) {
+        log?.call('压缩中转回包的 messages 不是非空数组：按未接管处理，回退内置 compact');
+        return null;
+      }
+      final List<Map<String, dynamic>> context = <Map<String, dynamic>>[];
+      for (int i = 0; i < rawMessages.length; i++) {
+        final Object? item = rawMessages[i];
+        if (LlmMessage.tryFromWire(item) == null) {
+          log?.call(
+            '压缩中转回包第 $i 条消息无法还原成 LLM 消息（角色/字段不合法）：'
+            '整包按未接管处理，回退内置 compact',
+          );
+          return null;
+        }
+        context.add(
+          (item as Map).map(
+            (dynamic k, dynamic v) => MapEntry<String, dynamic>(
+              k.toString(),
+              v,
+            ),
+          ),
+        );
+      }
+      final Object? rawCovered = data['covered_message_count'];
+      final int? covered = rawCovered is num ? rawCovered.toInt() : null;
+      if (covered == null || covered < 0 || covered > totalMessageCount) {
+        // 水位线是"下一轮从哪继续"的唯一依据：缺失/越界一律回退，绝不猜一个值
+        log?.call(
+          '压缩中转回包的 covered_message_count=${rawCovered ?? '缺失'} 非法'
+          '（合法区间 0..$totalMessageCount）：按未接管处理，回退内置 compact',
+        );
+        return null;
+      }
+      log?.call(
+        '压缩中转：插件 ${relayed.pluginId} 接管了这次压缩'
+        '（回 ${context.length} 条上下文，覆盖 $covered 条原文）',
+      );
+      return CompactionRelayReply(
+        messages: context,
+        coveredMessageCount: covered,
+      );
     } catch (error) {
-      log?.call('压缩中转异常（回退内置摘要器）：$error');
+      log?.call('压缩中转异常（回退内置 compact）：$error');
       return null;
     }
   }
@@ -3182,6 +3262,7 @@ class PluginBus {
     _spawnedConfigs.remove(pluginId);
     _queueDepth[pluginId] = 0;
     _degraded.remove(pluginId);
+    _dead.remove(pluginId);
     // **UI 缓存一并作废**：插件下线后它的槽位不该再被重放给新连接（前端收不到
     // plugin_status 时尤其重要——例如核心重启、或前端当时正断线）
     uiCache.remove(pluginId);

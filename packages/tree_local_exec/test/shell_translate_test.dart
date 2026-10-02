@@ -279,4 +279,55 @@ void main() {
       expect(outcome.stdout, isNot(contains('no')));
     });
   });
+  group('裸 echo 兼容翻译（cmd 语义：输出一个空行）', () {
+    test('命令位置上的无参 echo 补成空串参数', () {
+      expect(Shell.translateBareEcho('echo; echo done'), "echo ''; echo done");
+      expect(
+        Shell.translateBareEcho('git status; echo; git log'),
+        "git status; echo ''; git log",
+      );
+      expect(Shell.translateBareEcho('echo'), "echo ''");
+      expect(Shell.translateBareEcho('echo   '), "echo ''   ");
+      expect(Shell.translateBareEcho('echo | Out-Null'), "echo '' | Out-Null");
+      expect(
+        Shell.translateBareEcho('Write-Output; echo x'),
+        "Write-Output ''; echo x",
+      );
+      expect(Shell.translateBareEcho('a && echo'), "a && echo ''");
+      // 换行也是语句边界
+      expect(
+        Shell.translateBareEcho('echo\necho done'),
+        "echo ''\necho done",
+      );
+    });
+
+    test('有参数 / 引号内 / 注释里 / 名字更长的一律不动', () {
+      expect(Shell.translateBareEcho('echo hi'), 'echo hi');
+      expect(Shell.translateBareEcho("echo ''"), "echo ''");
+      expect(Shell.translateBareEcho(r'echo $x'), r'echo $x');
+      expect(Shell.translateBareEcho('Write-Host "echo;"'), 'Write-Host "echo;"');
+      expect(Shell.translateBareEcho('echo "a; echo"'), 'echo "a; echo"');
+      expect(Shell.translateBareEcho('function echo { }'), 'function echo { }');
+      expect(Shell.translateBareEcho('# echo;\necho done'), '# echo;\necho done');
+      expect(Shell.translateBareEcho('echoes'), 'echoes');
+      expect(Shell.translateBareEcho('echo-tree'), 'echo-tree');
+    });
+
+    test('拿不准就整体原样返回（引号不闭合 / here-string / 块注释）', () {
+      expect(
+        Shell.translateBareEcho('echo "unclosed; echo'),
+        'echo "unclosed; echo',
+      );
+      expect(Shell.translateBareEcho("@'\necho;\n'@"), "@'\necho;\n'@");
+      expect(Shell.translateBareEcho('<# echo; #>'), '<# echo; #>');
+    });
+
+    test('包装层接线：裸 echo 既补了空串、也不进交互模式', () {
+      if (!_isPowerShellWindows) return;
+      final List<String> args = Shell.argsFor('echo; echo done');
+      expect(args.last, contains("echo ''"));
+      expect(args, contains('-NonInteractive'));
+    });
+  });
+
 }

@@ -69,7 +69,7 @@ abstract final class StationHubIds {
   /// 中转站·投入 LLM 前（改写请求体；仅"未被接管"时触发）。
   static const String relayLlmRequest = 'system.relay.llm.request';
 
-  /// 中转站·上下文压缩过程（插件产出摘要；无订阅者回退内置摘要器）。
+  /// 中转站·上下文压缩过程（插件产出整份新上下文；无订阅者走系统内置 compact）。
   static const String relayContextCompact = 'system.relay.context.compact';
 
   /// 中转站·系统提示词构造过程（插件产出最终 system prompt）。

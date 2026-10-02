@@ -63,6 +63,8 @@ Future<void> main(List<String> args) async {
 
   // Spec 体系：内置模板内嵌在核心包里，**播种到每个工作空间的 .self/spec/**；
   // 自定义 Spec 同样落在那里——规范属于工作空间/团队，各存一份、互不影响。
+  // 内置副本是**核心管理的快照**：核心升级后 seedInto 会先备份旧副本（`.bak.<n>`）再刷新，
+  // 所以升级能到达已有工作空间；要按工作空间定制请用 `spec create`（内置 id 本就不可 update）。
   final SpecService specs = SpecService(
     store: store,
     log: (String message) => stderr.writeln('[core:spec] $message'),

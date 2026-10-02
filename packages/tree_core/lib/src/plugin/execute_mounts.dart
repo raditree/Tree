@@ -50,6 +50,9 @@ typedef StationAgentCompactor = Future<Map<String, dynamic>> Function(
 /// 生效）；用于"让插件对数据做高级处理"。
 ///
 /// [model] 非空 = 显式覆盖该 agent 的模型（默认不给）。
+/// [tools] = OpenAI 形状的工具声明数组，**原样透传**进请求体：压缩插件要复用
+/// "与对话同一条前缀"就必须带上同一份 tools（工具定义在聊天模板里渲染在 messages
+/// 之前，缺了它前缀从第一个 token 就对不上）。
 /// 返回 `{ok, json, text, model, usage}` 或 `{error}`（端点不支持 JSON 形式时
 /// **如实失败**，不静默去掉 response_format 重试）。
 typedef StationLlmCaller =
@@ -61,6 +64,7 @@ typedef StationLlmCaller =
       String? model,
       double? temperature,
       int? maxTokens,
+      List<Object?>? tools,
     });
 
 /// `tool.call` 的**执行任意工具**入口（点位化新增）。
@@ -708,6 +712,10 @@ class ExecuteStationMounts {
     if (rawMessages != null && rawMessages is! List) {
       return const StationCommandOutcome.failed('llm.call 的 messages 必须是数组');
     }
+    final Object? rawTools = context.arguments['tools'];
+    if (rawTools != null && rawTools is! List) {
+      return const StationCommandOutcome.failed('llm.call 的 tools 必须是数组');
+    }
     final Map<String, dynamic> result = await caller(
       agentId: target.agentId,
       messages: rawMessages is List ? rawMessages : null,
@@ -716,6 +724,7 @@ class ExecuteStationMounts {
       model: _string(context.arguments['model']),
       temperature: _double(context.arguments['temperature']),
       maxTokens: _int(context.arguments['max_tokens']),
+      tools: rawTools is List ? rawTools : null,
     );
     final Object? error = result['error'];
     if (error != null && error.toString().isNotEmpty) {

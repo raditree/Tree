@@ -13,6 +13,18 @@ class _GatedEngine implements AgentEngine {
   final List<AgentRunContext> contexts = <AgentRunContext>[];
   final List<bool> cancelledAtEnd = <bool>[];
 
+  /// **收敛闸门**：被取消后先停在这里，由测试放行才结束这一轮；null = 不拦。
+  ///
+  /// 用来消掉一个调度竞态（实测：两帧间隔 0ms 时"排队那条不启动"，间隔 30ms 时
+  /// 它就启动了）：`第二条` 会打断在途那一轮，而"排队那条到底算不算被 stop 作废"
+  /// 取决于"这一轮结束"与"stop 帧被处理"谁先发生——两者之间只隔一个 5ms 轮询，
+  /// 并行满负载时会翻。让这一轮在闸门处停住，测试就能先确认 stop 已被处理
+  /// （见 `stopping` 帧），再放行；断言于是与调度无关。
+  Completer<void>? convergeGate;
+
+  /// 这一轮已到达闸门（测试据此确知"它收敛了，但还没结束"）。
+  final Completer<void> atGate = Completer<void>();
+
   @override
   Stream<AgentEvent> run(
     AgentRunContext context, {
@@ -23,6 +35,11 @@ class _GatedEngine implements AgentEngine {
     yield const AgentText('开始');
     while (!isCancelled()) {
       await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    final Completer<void>? gate = convergeGate;
+    if (gate != null) {
+      if (!atGate.isCompleted) atGate.complete();
+      await gate.future;
     }
     cancelledAtEnd.add(true);
     yield const AgentDone(cancelled: true);
@@ -72,7 +89,9 @@ class _SlowToolRunner implements ToolRunner {
 
 Future<void> _untilTrue(
   bool Function() condition, {
-  Duration timeout = const Duration(seconds: 5),
+  // 并行满负载（16 路用例 + 起子进程）时 5s 是睡出来的假期限，实测会假失败；
+  // 这是轮询，条件一满足就返回，放宽不花时间。
+  Duration timeout = const Duration(seconds: 20),
   String reason = '',
 }) async {
   final DateTime deadline = DateTime.now().add(timeout);
@@ -218,20 +237,45 @@ void main() {
     });
 
     test('打断后紧接着 stop：新消息那轮不会启动（epoch 语义不回归）', () async {
+      final Completer<void> gate = Completer<void>();
+      engine.convergeGate = gate; // 第一轮收敛后停在闸门，等测试放行
       sendMessage('第一条');
       await _untilTrue(() => engine.started.length == 1, reason: '第一轮启动');
+
+      // 第二条 = 插话：第一轮的取消标记立刻置上。它随后停在闸门处，
+      // 所以"第二条此刻还在队列里"是确定的，不靠 5ms 轮询的先后。
       sendMessage('第二条');
+      await engine.atGate.future;
+
       ws.send(<String, dynamic>{
         'type': WsInboundType.stop,
         'data': <String, dynamic>{'agent_id': top.id, 'session_id': sessionId},
       });
-      await Future<void>.delayed(const Duration(milliseconds: 120));
+      // `stopping` 由核心在 `_stopAgentTree`（⇒ `cancelAgent` ⇒ 代次前进）**之后**
+      // 才发出：收到它就证明"排队任务已作废"生效了，与放行闸门的先后无关。
+      await ws.until(
+        (Map<String, dynamic> f) =>
+            f['type'] == WsOutboundType.agentStatus &&
+            (f['data'] as Map<String, dynamic>?)?['status'] == 'stopping',
+        reason: 'stopping 帧',
+      );
+
+      gate.complete(); // 放行第一轮 ⇒ 排队那条按旧代次被丢弃
+      await _untilTrue(
+        () => server.conversation.droppedQueuedCount == 1,
+        reason: '排队任务被丢弃',
+      );
+      await _untilTrue(
+        () => !server.conversation.isRunning(top.id),
+        reason: '收敛完成',
+      );
       expect(server.conversation.isRunning(top.id), isFalse);
       expect(
         engine.started,
         <String>[top.id],
         reason:
-            'stop 之后排队的那轮必须被丢弃（droppedQueuedCount=${server.conversation.droppedQueuedCount}）',
+            'stop 之后排队的那轮必须被丢弃（这里是确定的先后，不是调度竞态）：'
+            'droppedQueuedCount=${server.conversation.droppedQueuedCount}',
       );
     });
   });

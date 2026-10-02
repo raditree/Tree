@@ -291,34 +291,29 @@ void main() {
       expect(empty.content, contains('command 不能为空'));
     });
 
-    test('跑得比旧的 timeout_seconds 上限久也不转后台、不终止（1.1：静态时长不再是判据）', () async {
-      final TerminalHooks hooks = TerminalHooks();
-      addTearDown(hooks.close);
+    test('没接 hook 时不做软超时：命令跑完再返回（1.1：本地活性 = 进程存活）', () async {
+      // 2026-10-02：timeout_seconds 成了**软**超时（到点转后台、不杀进程）。没接 hook
+      // 就登记不了后台任务，此时保持老口径——一直等，绝不按静态时长提前返回。
       final String command = Platform.isWindows
           // Windows 现在走 PowerShell：>nul 是 cmd 语法（PS 下会报 FileOpenFailure），
           // 丢弃输出要用 | Out-Null
           ? 'ping -n 3 127.0.0.1 | Out-Null'
           : 'sleep 2';
       final DateTime started = DateTime.now();
-      final ToolOutcome outcome = await BuiltinTools.run(
-        call('terminal', <String, dynamic>{
-          'command': command,
-          'timeout_seconds': 1,
-        }),
-        io,
-        hooks: hooks,
-      );
+      final ToolOutcome outcome = await run('terminal', <String, dynamic>{
+        'command': command,
+        'timeout_seconds': 1,
+      });
       expect(outcome.isError, isFalse, reason: outcome.content);
       expect(outcome.content, contains('退出码 0'));
-      expect(hooks.tasks, isEmpty, reason: '进程还活着（本地活性 = 进程存活）就不该转后台');
       expect(
         DateTime.now().difference(started).inMilliseconds,
         greaterThan(1000),
-        reason: '真的等它跑完了，没有按静态时长提前返回',
+        reason: '真的等它跑完了：没有后台任务可登记时不做软超时',
       );
     });
 
-    test('schema 不再声明 timeout_seconds；老参数被忽略', () async {
+    test('schema 声明 timeout_seconds（软超时）；0 = 永不软超时', () async {
       final ToolSpec spec = BuiltinTools.specs().firstWhere(
         (ToolSpec s) => s.name == 'terminal',
       );
@@ -326,14 +321,14 @@ void main() {
           spec.parameters['properties'] as Map<String, dynamic>;
       expect(
         properties.containsKey('timeout_seconds'),
-        isFalse,
-        reason: 'M9 1.1：没有静态时长上限，schema 不能留可限定时长的参数',
+        isTrue,
+        reason: '2026-10-02：本地补了**软**超时（到点只转后台、不杀进程）',
       );
-      expect(spec.description, contains('没有静态超时'));
-      // 兼容：老调用方仍传该参数时直接忽略，不影响执行
+      expect(spec.description, contains('没有硬超时'));
+      // 0 = 永不软超时：老口径（命令跑多久都等）仍然可用
       final ToolOutcome outcome = await run('terminal', <String, dynamic>{
         'command': 'echo quick',
-        'timeout_seconds': 99999,
+        'timeout_seconds': 0,
       });
       expect(outcome.isError, isFalse);
       expect(outcome.content, contains('quick'));
@@ -690,7 +685,11 @@ void main() {
       expect(forModel, contains('[工具结果已重定向]'));
       expect(forModel.length, lessThan(1600), reason: '送模型的只有提示 + 300 字符预览');
       expect(written.single, startsWith('.self/results/'));
-      expect(written.single, endsWith('.read.result'));
+      expect(
+        written.single,
+        '.self/results/read_'
+        '${ToolResultGate.fingerprint('read', outcome.content)}.result',
+      );
       final String saved = File(
         p.joinAll(<String>[root.path, ...written.single.split('/')]),
       ).readAsStringSync();

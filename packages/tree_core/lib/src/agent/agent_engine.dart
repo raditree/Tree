@@ -33,6 +33,7 @@ final class AgentToolStart extends AgentEvent {
     required this.name,
     required this.arguments,
     this.callId = '',
+    this.rawArguments = '',
   });
 
   /// UI/落库用的消息 id（本地生成）。
@@ -44,6 +45,11 @@ final class AgentToolStart extends AgentEvent {
 
   final String name;
   final Map<String, dynamic> arguments;
+
+  /// **模型原始的参数串**（流式拼出来的那一份）。落库后历史回灌要逐字复用它，
+  /// 否则 `jsonEncode(arguments)` 的规范化形态会与实发的不一致（见
+  /// [CoreMessage.toolArgumentsRaw]）。空串 = 生产者没给（老路径/测试）。
+  final String rawArguments;
 }
 
 /// 工具调用结束。
@@ -52,11 +58,18 @@ final class AgentToolEnd extends AgentEvent {
     required this.id,
     required this.name,
     required this.result,
+    this.modelContent = '',
   });
 
   final String id;
   final String name;
+
+  /// 完整结果（前端卡片与落库口径，永远是全文）。
   final String result;
+
+  /// **送模型那一份**（会话状态前缀 + 超长门控之后）。落库后重建历史时原样取用，
+  /// 空串 = 与 [result] 相同（生产者没给）。
+  final String modelContent;
 }
 
 /// 用量推进（工具循环中每轮都会发一次）。
@@ -97,6 +110,8 @@ class CoreMessageRef {
     this.toolArguments,
     this.toolResult = '',
     this.toolCallId,
+    this.toolArgumentsRaw = '',
+    this.toolResultForModel = '',
     this.timestamp = 0,
     this.attachments,
   });
@@ -121,6 +136,12 @@ class CoreMessageRef {
 
   /// 工具调用 id（回灌 `role: tool` 消息时需要与 assistant 的 tool_calls 对应）。
   final String? toolCallId;
+
+  /// 模型原始参数串（空串 = 老数据，回退 `jsonEncode(toolArguments)`）。
+  final String toolArgumentsRaw;
+
+  /// 送模型那一份工具结果（空串 = 老数据，回退当场过门控）。
+  final String toolResultForModel;
 
   /// 消息时间戳（毫秒；引擎排序/日志用）。
   final int timestamp;
@@ -153,6 +174,7 @@ class AgentRunContext {
     this.modelId = '',
     this.contextSummary = '',
     this.compactedMessageCount = 0,
+    this.compactedContext = const <Map<String, dynamic>>[],
   });
 
   final String agentId;
@@ -176,6 +198,17 @@ class AgentRunContext {
 
   /// 历史开头多少条已被 [contextSummary] 覆盖（引擎翻译时跳过它们）。
   final int compactedMessageCount;
+
+  /// **中转站产出的整份上下文**（点位化 `system.relay.context.compact`），OpenAI 线
+  /// 形态的消息数组。
+  ///
+  /// 非空时它是引擎的**基底**：引擎原样使用这份列表（**不再自己拼 system / 摘要**），
+  /// 再从 [history] 第 [compactedMessageCount] 条之后继续翻译追加。为空时走内置路径
+  /// （[systemPrompt] + [contextSummary] + 跳过后缀的历史）。
+  ///
+  /// 用线形态的 Map 而不是 `LlmMessage`：这一层（agent）不认识具体 LLM 类型，
+  /// 解析由真实引擎负责（见 `LlmAgentEngine._buildMessages`）。
+  final List<Map<String, dynamic>> compactedContext;
 }
 
 /// 回复引擎：给定一次 [AgentRunContext]，流式产出 [AgentEvent]。

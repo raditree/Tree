@@ -351,11 +351,15 @@ abstract interface class WorkspaceIO {
 
   /// 执行 shell 命令（cwd = 工作空间根）。
   ///
-  /// [timeout] 是 M9 之前的**静态总时长**硬超时；1.1 修正后执行器**不再按时间
-  /// 终止命令**——判据换成活性：本地是"进程还活着"（OS 层，活着就永不超时），
-  /// SSH 是"心跳（keepalive）没丢"。只要活性在，命令跑多久都等；活性没了则让
-  /// 在途操作以显式错误结束（SSH 见 [SshLinkStaleException]），不静默、不永久挂起。
-  /// 参数保留只为不改调用方签名，已无实际作用。
+  /// [timeout] 的语义（2026-10-02 修订；参数名与默认值对调用方透明）：
+  /// - `Duration.zero`（默认）= **永不软超时**：老行为——判据是活性（本地"进程还
+  ///   活着"、SSH"心跳没丢"），命令跑多久都等，**绝不因为"太久"杀命令**；
+  /// - `> zero` = **本地软超时**：到点仍在跑就**不杀进程、不丢输出**，以
+  ///   [LocalExecStillRunning] 把活着的进程交出来，由调用方登记成后台任务
+  ///   （terminal 的 hook 模式）继续收尾并唤醒 agent；SSH 侧忽略该参数（活性判据
+  ///   是心跳，判失活时以 [SshLinkStaleException] 显式失败）。
+  ///
+  /// 硬超时（按时间杀进程）依然**不存在**。
   Future<ExecOutcome> exec(
     String command, {
     Duration timeout,

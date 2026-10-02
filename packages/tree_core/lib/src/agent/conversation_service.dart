@@ -37,7 +37,13 @@ class _PendingMessage {
   final StringBuffer content = StringBuffer();
   String? toolName;
   Map<String, dynamic>? toolArguments;
+
+  /// 模型原始参数串（回灌历史时要逐字复现的那一份）。
+  String toolArgumentsRaw = '';
   String toolResult = '';
+
+  /// 送模型那一份工具结果（状态前缀 + 门控之后）；空 = 与 [toolResult] 相同。
+  String toolResultForModel = '';
   String toolCallId = '';
 
   /// **工具调用轮次**（本任务内从 1 开始；插件生态的 `agent.tool_call` 事件带它）。
@@ -95,6 +101,11 @@ class ConversationService {
     final AgentEngine target = this.engine;
     if (target is LlmAgentEngine) {
       target.toolTurnCompactor = _compactTurnContext;
+      // 压缩插件复用前缀：把"引擎这一轮会发的那份线形请求"供给压缩服务
+      // （插件据此在自己的 llm.call 里吃端点前缀缓存；见 CompactionService.wireRequestProvider）
+      compaction?.wireRequestProvider =
+          (CoreAgent agent, CoreSession session) =>
+              target.wireRequestFor(_contextOf(agent, session));
     }
   }
 
@@ -473,6 +484,9 @@ class ConversationService {
             toolArguments: message.toolArguments,
             toolResult: message.toolResult,
             toolCallId: message.toolCallId.isEmpty ? null : message.toolCallId,
+            // 「送模型那一份」按原样落库：下一轮重建历史时直接取用（缓存前缀）
+            toolArgumentsRaw: message.toolArgumentsRaw,
+            toolResultForModel: message.toolResultForModel,
           ),
         );
         return;
@@ -539,7 +553,14 @@ class ConversationService {
     // 这只是"本轮生成前那一次"；工具循环里**每一轮 API 调用前**还会再检查
     // （Q1-③），那次由引擎经 [LlmAgentEngine.toolTurnCompactor] 回调回这里，
     // 用的是同一套阈值与水位线。
-    await _autoCompact(agent, session);
+    final bool compacted = await _autoCompact(agent, session);
+    if (compacted) {
+      // compact 之后是允许重建系统提示词的两个时机之一
+      invalidateSystemPrompt(agent.id, session.sessionId);
+    }
+    // 会话初始化（本进程第一轮）才真的拼一次并钉住；之后每轮直接复用同一串字节
+    // ⇒ 发消息不会让 `[0]` 变样（见 [promptStatePrewarm] 与 docs/known-issues.md #8）。
+    await _ensureSystemPromptPinned(agent, session.sessionId);
     final AgentRunContext context = _contextOf(agent, session, userContent);
 
     try {
@@ -577,6 +598,7 @@ class ConversationService {
               _PendingMessage(id: event.id, kind: 'tool')
                 ..toolName = event.name
                 ..toolArguments = event.arguments
+                ..toolArgumentsRaw = event.rawArguments
                 ..toolCallId = event.callId
                 // 轮次 = 本任务内第几次工具调用（插件按它判"超限"）
                 ..round = ++toolRound;
@@ -602,6 +624,7 @@ class ConversationService {
           final _PendingMessage? message = toolSegments.remove(event.id);
           if (message == null) continue;
           message.toolResult = event.result;
+          message.toolResultForModel = event.modelContent;
           // 插件生态：**工具调用结束**事件（与开始事件同 `call_id` / `round`，插件
           // 据此统计每次耗时；工具名以结束事件为准，兜底用卡片里的名字）。
           _publishToolCall(
@@ -772,6 +795,8 @@ class ConversationService {
     toolArguments: message.toolArguments,
     toolResult: message.toolResult,
     toolCallId: message.toolCallId,
+    toolArgumentsRaw: message.toolArgumentsRaw,
+    toolResultForModel: message.toolResultForModel,
     timestamp: message.timestamp,
     attachments: message.attachments,
   );
@@ -833,6 +858,14 @@ class ConversationService {
     double scale = tokens.defaultTokenScale,
   }) => tokens.estimateTokens(text, scale: scale);
 
+  /// **拼上下文之前**把提示词依赖的异步快照热起来的钩子（Q9 Spec 的 ⑦ 索引 / ⑧ 已选全文）。
+  ///
+  /// 为什么放在这里而不是引擎里：`AgentRunContext.systemPrompt` 在进入引擎**之前**就拼好
+  /// 了（见 [_contextOf]），引擎再预热已经来不及改这一轮要发的字节。
+  ///
+  /// 不接线的语义 = 不预热（测试、无 Spec 服务的场景，行为与接线前逐字一致）。
+  Future<void> Function(String agentId, String sessionId)? promptStatePrewarm;
+
   /// 构造引擎看到的运行上下文（生成前与工具循环内压缩后共用同一份装配逻辑）。
   AgentRunContext _contextOf(
     CoreAgent agent,
@@ -846,14 +879,14 @@ class ConversationService {
       agentId: agent.id,
       sessionId: fresh.sessionId,
       modelId: agent.modelId,
-      systemPrompt: systemPromptWithWorkspace(
-        agent,
-        // ⑧ 已选 Spec 全文是会话级的：带 sessionId 才能取到本会话挂的 hook
-        sessionId: fresh.sessionId,
-      ),
+      // ⑧ 已选 Spec 全文是会话级的，所以键里带 sessionId；取的是**钉住值**
+      // （没有时同步建一份并钉住——正常路径已由 _ensureSystemPromptPinned 建好）
+      systemPrompt: _systemPromptPinned(agent, fresh.sessionId),
       userContent: userContent,
       contextSummary: fresh.compactedSummary,
       compactedMessageCount: fresh.compactedMessageCount,
+      // 中转站产出的整份上下文（非空时引擎原样使用它，不再拼 system/摘要）
+      compactedContext: fresh.compactedContext,
       // 用户消息已在 handleUserMessage 里落库，因此这里取到的历史已含本次输入
       history: store
           .messages(agent.id, fresh.sessionId)
@@ -861,6 +894,59 @@ class ConversationService {
           .toList(growable: false),
     );
   }
+
+  /// **按会话钉住的系统提示词**（`agentId|sessionId` → 文本）。
+  ///
+  /// 为什么钉住：`system` 是消息序列的**第 0 条**，它一变，后面的整条前缀（含全部历史）
+  /// 在端点前缀缓存上都对不上 ⇒ 0 命中。而提示词的内容来自多变的外部状态（Spec 索引、
+  /// 已选 Spec 全文、工作空间文件、agent 配置），「发一条消息」不该改变它。
+  ///
+  /// **只有两个重建时机**：① 会话初始化（本进程第一次为该会话拼装）；② compact 之后
+  /// （此时前缀本来就要重写，重建不额外亏）。另有 [invalidateSystemPrompt] 供"用户显式
+  /// 改提示词 / 重置工作空间"这类主动操作调用——**发消息永远不调它**。
+  final Map<String, String> _systemPrompts = <String, String>{};
+
+  static String _promptKey(String agentId, String sessionId) =>
+      '$agentId|$sessionId';
+
+  /// 自检/测试读数点：本会话当前钉住的系统提示词（null = 还没建过）。
+  String? pinnedSystemPrompt(String agentId, String sessionId) =>
+      _systemPrompts[_promptKey(agentId, sessionId)];
+
+  /// 丢掉钉住的系统提示词，下一次拼装重建。
+  ///
+  /// [sessionId] 为空 = 该 agent 的**所有会话**（改 agent 自己的提示词时用）。
+  /// 调用点只有三类：compact 之后、用户显式改提示词 / 重置工作空间、测试。
+  void invalidateSystemPrompt(String agentId, [String? sessionId]) {
+    final String? id = sessionId;
+    if (id == null || id.trim().isEmpty) {
+      _systemPrompts.removeWhere(
+        (String key, String _) => key.startsWith('$agentId|'),
+      );
+      return;
+    }
+    _systemPrompts.remove(_promptKey(agentId, id));
+  }
+
+  /// 取回（必要时**建好并钉住**）本会话的系统提示词。
+  ///
+  /// 没有钉住值 = 会话初始化：先热 ⑦/⑧ 快照（[promptStatePrewarm]），再同步拼一份并钉住。
+  /// 已经钉住则**直接返回**，不看外部状态——这正是"发消息不更新系统提示词"的实现。
+  Future<void> _ensureSystemPromptPinned(
+    CoreAgent agent,
+    String sessionId,
+  ) async {
+    if (_systemPrompts.containsKey(_promptKey(agent.id, sessionId))) return;
+    await promptStatePrewarm?.call(agent.id, sessionId);
+    _systemPromptPinned(agent, sessionId);
+  }
+
+  /// 同步取（无则建并钉住）：`_contextOf` 是同步的，走这里。
+  String _systemPromptPinned(CoreAgent agent, String sessionId) =>
+      _systemPrompts.putIfAbsent(
+        _promptKey(agent.id, sessionId),
+        () => systemPromptWithWorkspace(agent, sessionId: sessionId),
+      );
 
   /// 工具循环内压缩（Q1-③）：压动了就把**新的上下文快照**交给引擎重新装配。
   ///
@@ -878,6 +964,9 @@ class ConversationService {
     if (session == null) return null;
     final bool compacted = await _autoCompact(agent, session, force: force);
     if (!compacted) return null;
+    // 轮内 compact 同样是"允许重建"的时机（前缀本来就要重写）
+    invalidateSystemPrompt(agent.id, session.sessionId);
+    await _ensureSystemPromptPinned(agent, session.sessionId);
     return _contextOf(agent, session);
   }
 

@@ -240,8 +240,10 @@ class CoreSession {
     this.status = 'active',
     this.compactedSummary = '',
     this.compactedMessageCount = 0,
+    List<Map<String, dynamic>>? compactedContext,
     List<String>? selectedSpecIds,
-  }) : selectedSpecIds = selectedSpecIds ?? <String>[];
+  }) : selectedSpecIds = selectedSpecIds ?? <String>[],
+       compactedContext = compactedContext ?? <Map<String, dynamic>>[];
 
   /// 兜底默认会话 id（与前端 `_currentSessionId` 的缺省值一致）。
   static const String defaultSessionId = 'session_default';
@@ -254,18 +256,31 @@ class CoreSession {
   int updatedAt;
   List<String> selectedSpecIds;
 
-  /// 上下文压缩后的摘要（M7d-4）：空串 = 从未压缩。
+  /// 上下文压缩后的摘要（M7d-4）：空串 = 从未压缩（或权威在中转站产出的列表上）。
   ///
   /// 压缩**不删除任何消息**（用户仍能在界面回看全文），只是告诉引擎
   /// "前 [compactedMessageCount] 条已经总结过，请带摘要替代它们"。
+  ///
+  /// 与 [compactedContext] 互斥：写这份摘要时会把列表清空（内置路径接管）。
   String compactedSummary;
 
   /// 已被摘要覆盖的历史消息条数（按写入顺序的前缀长度）。
   int compactedMessageCount;
 
-  /// 是否已经压缩过上下文。
+  /// **中转站产出的整份上下文**（点位化 `system.relay.context.compact`）：
+  /// OpenAI 线形态的消息数组（`LlmMessage.toWire()` 的形状）。
+  ///
+  /// 非空时它是权威：引擎**原样使用**这份列表，再从原文第
+  /// [compactedMessageCount] 条之后继续追加——不再自己拼 system / 摘要。
+  ///
+  /// 与 [compactedSummary] **互斥**（两条压缩路径只能有一个权威，否则"列表覆盖 12 条
+  /// + 摘要覆盖 6 条"会同时存在，引擎无从选择）：写列表时清空摘要，写摘要时清空列表。
+  List<Map<String, dynamic>> compactedContext;
+
+  /// 是否已经压缩过上下文（内置摘要路径或中转站路径任一留下过产物）。
   bool get compacted =>
-      compactedMessageCount > 0 && compactedSummary.trim().isNotEmpty;
+      compactedMessageCount > 0 &&
+      (compactedSummary.trim().isNotEmpty || compactedContext.isNotEmpty);
 
   /// 是否为兜底默认会话。
   bool get isDefault => sessionId == defaultSessionId;
@@ -279,6 +294,9 @@ class CoreSession {
     'selected_spec_ids': selectedSpecIds,
     'compacted_summary': compactedSummary,
     'compacted_message_count': compactedMessageCount,
+    // 空列表不落盘：session.json 是给人看的，没走中转站就不该多一个空键
+    if (compactedContext.isNotEmpty)
+      'compacted_context': compactedContext,
     'created_at': JsonTime.encode(createdAt),
     'updated_at': JsonTime.encode(updatedAt),
   };
@@ -293,6 +311,18 @@ class CoreSession {
       compactedSummary: json['compacted_summary'] as String? ?? '',
       compactedMessageCount:
           (json['compacted_message_count'] as num?)?.toInt() ?? 0,
+      // 宽容解析：手改坏的行直接丢掉，不让整个会话读不出来
+      compactedContext: <Map<String, dynamic>>[
+        for (final Object? item
+            in json['compacted_context'] as List<dynamic>? ?? const <dynamic>[])
+          if (item is Map)
+            item.map(
+              (dynamic k, dynamic v) => MapEntry<String, dynamic>(
+                k.toString(),
+                v,
+              ),
+            ),
+      ],
       selectedSpecIds:
           (json['selected_spec_ids'] as List<dynamic>?)
               ?.map((dynamic e) => e.toString())
@@ -333,6 +363,8 @@ class CoreMessage {
     this.toolArguments,
     this.toolResult = '',
     this.toolCallId,
+    this.toolArgumentsRaw = '',
+    this.toolResultForModel = '',
     this.usage,
     this.attachments,
     this.options,
@@ -356,6 +388,8 @@ class CoreMessage {
       ),
       toolResult: json['tool_result'] as String? ?? '',
       toolCallId: json['tool_call_id'] as String?,
+      toolArgumentsRaw: json['tool_arguments_raw'] as String? ?? '',
+      toolResultForModel: json['tool_result_for_model'] as String? ?? '',
       usage: (json['usage'] as Map<dynamic, dynamic>?)?.map(
         (dynamic k, dynamic v) => MapEntry(k.toString(), v),
       ),
@@ -392,6 +426,23 @@ class CoreMessage {
   /// 端点给的 tool_call id（回灌 `role: tool` 消息时需要原样带回）。
   /// 前端 `ChatMessage.fromJson` 不认识该字段，会安全忽略。
   final String? toolCallId;
+
+  /// **模型原始的工具参数串**（流式增量拼出来的那一份，逐字保留）。
+  ///
+  /// 为什么要存：历史回灌时 `tool_calls[].function.arguments` 必须是**当初发出去
+  /// 的同一串字节**。[toolArguments] 是解析后的 Map，重新 `jsonEncode` 得到的是
+  /// 规范形态（无空格、统一转义），与模型原文常常不同——一旦不同，下一轮重建出来
+  /// 的消息就与上一轮实发的逐字不一致，端点前缀缓存从这条消息起全部落空
+  /// （真机表现：373k 上下文只命中 ~12k，正好是 system+摘要）。
+  /// 空串 = 老数据（修复前落库的），回退到 `jsonEncode(toolArguments)`。
+  final String toolArgumentsRaw;
+
+  /// **送模型那一份工具结果**（门控 + 会话状态前缀之后的内容，逐字保留）。
+  ///
+  /// 与 [toolResult] 的分工：那个是"给人看 / 前端卡片 / 全文"的口径，这个是
+  /// "模型当初收到的字节"。重建历史时原样取用，前缀才可能命中缓存；空串 = 老数据
+  /// （回退到当场过一遍门控）。
+  final String toolResultForModel;
   final Map<String, dynamic>? usage;
   final List<Map<String, dynamic>>? attachments;
   final List<String>? options;
@@ -423,6 +474,10 @@ class CoreMessage {
     'tool_arguments': toolArguments,
     'tool_result': toolResult,
     'tool_call_id': toolCallId,
+    // 只在真的记了"送模型那一份"时才写：老会话文件不该多出一堆空键
+    if (toolArgumentsRaw.isNotEmpty) 'tool_arguments_raw': toolArgumentsRaw,
+    if (toolResultForModel.isNotEmpty)
+      'tool_result_for_model': toolResultForModel,
     'usage': usage,
     'attachments': attachments,
     'options': options ?? const <String>[],

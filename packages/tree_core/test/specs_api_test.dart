@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
 import 'package:tree_local_exec/tree_local_exec.dart';
@@ -110,6 +111,36 @@ void main() {
     return created['spec_id'] as String;
   }
 
+  test('核心启动接上"随附文档播种"：select plugin-creator → 指南进工作空间（失败也如实回报）', () async {
+    expect(
+      specs.seedAssetsFor,
+      isNotNull,
+      reason: '核心必须接线（core_server）：否则 agent 在普通工作空间里读不到插件开发指南',
+    );
+    // 走真实解析（不注入 overrideDir）：测试环境里多半找不到原件，所以断言分两支——
+    // 成功则副本必须真在工作空间里；失败则必须带原因 + "找过的目录"，不许静默。
+    final List<Map<String, dynamic>> assets = await specs.seedAssetsFor!(
+      io,
+      <String>[kPluginCreatorSpecId],
+    );
+    expect(assets, hasLength(1));
+    final Map<String, dynamic> asset = assets.single;
+    expect(asset['spec_id'], 'plugin-creator');
+    expect(asset['path'], '.self/docs/plugin-development.md');
+    if (asset['ok'] as bool) {
+      expect(
+        File(p.join(temp.path, '.self', 'docs', 'plugin-development.md'))
+            .existsSync(),
+        isTrue,
+      );
+    } else {
+      expect(asset['error'].toString(), isNotEmpty);
+      expect(asset['searched'] as List<dynamic>, isNotEmpty);
+    }
+    // 其余内置规范没有随附文档
+    expect(await specs.seedAssetsFor!(io, <String>['general-task']), isEmpty);
+  });
+
   test('GET specs：内置 4 个在前 + 自定义 spec；selected_spec_ids 与 store 一致', () async {
     final String custom = await createCustom();
     final _Res res = await client.send(
@@ -151,7 +182,7 @@ void main() {
     );
     expect(builtin.status, 200);
     expect((builtin.json['meta'] as Map<String, dynamic>)['builtin'], isTrue);
-    expect(builtin.json['content'], kBuiltinSpecs['general-task']);
+    expect(builtin.json['content'], kBuiltinSpecTexts['general-task']);
 
     final _Res mine = await client.send(
       'GET',

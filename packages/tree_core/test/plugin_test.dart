@@ -107,6 +107,39 @@ void main() {
     );
   });
 
+  test('宿主：插件刚死那一刻往 stdin 写，不得变成未捕获的异步异常', () async {
+    // 这条路径就是并行跑套件时偶发红的那一条（`plugin_ws_test` 的「进程退出 ⇒
+    // disabled」用例曾按负载随机失败）：stdout 先 EOF、宿主还不知道进程已退出
+    // （`isClosed` 仍是 false）时再写一帧，`writeln` **不会同步抛**（实测连写 200
+    // 帧 0 次同步异常），错误只在 IOSink 的 `done` 上异步冒出来——没人听就是
+    // **未捕获的异步异常**：测试里判当前用例失败，生产里直接打到 zone。
+    final PluginHost host = await PluginHost.start(
+      config(extra: <String>['--exit-on-slow']),
+    );
+    addTearDown(host.close);
+    final PluginCallResult slow = await host.callTool(
+      'slow',
+      <String, dynamic>{},
+    );
+    expect(slow.isError, isTrue, reason: '插件收到 slow 即退出，在途调用以错误收尾');
+
+    // 不 await：8 帧在同一轮里发出去，尽量落在"进程已死、退出码还没回调到"的窗口内
+    final List<bool> alive = await Future.wait(<Future<bool>>[
+      for (int i = 0; i < 8; i++)
+        host.ping(timeout: const Duration(milliseconds: 200)),
+    ]);
+    expect(alive, everyElement(isFalse), reason: '插件已死：探活只能如实回 false');
+
+    // 通道断了要**如实标出来**（而不是继续往死管道里写）
+    for (int i = 0; i < 100 && host.channelError == null; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    expect(host.isClosed, isTrue, reason: 'stdout 关闭 / stdin 写失败都算通道不可用');
+    expect(host.channelError, isNotNull, reason: '原因要可读，便于排障与前端展示');
+    // 通道断了之后请求立刻拿到可读失败：不写、不挂，也不冒未捕获异常
+    await expectLater(host.listTools(), throwsA(isA<PluginException>()));
+  });
+
   test('总线：配置加载 → 启动 → 工具聚合 → 事件分发（真插件落文件）', () async {
     final File file = File('${temp.path}/config/plugins.yaml');
     file.createSync(recursive: true);

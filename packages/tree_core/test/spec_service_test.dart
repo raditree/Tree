@@ -58,7 +58,29 @@ void main() {
     expect(first.when, isNotEmpty);
     expect(first.tags, contains('general'));
     expect(first.body, contains('判型确认'));
-    expect(first.raw, kBuiltinSpecs['general-task'], reason: '文件是源，播种后逐字返回原文');
+    expect(
+      first.raw,
+      kBuiltinSpecTexts['general-task'],
+      reason: '播种落盘、内嵌兜底、select 全文三者同源（原文 + 共享第 0 步）',
+    );
+    // 每条内置规范：正文首部就是共享的「第 0 步：先对齐用户语义」
+    for (final SpecDocument document in list) {
+      expect(
+        document.body.startsWith('## 第 0 步：先对齐用户语义'),
+        isTrue,
+        reason: '${document.id} 的正文首部应是共享第 0 步：${document.body.split('\n').first}',
+      );
+      expect(document.body, contains('不得写文件'), reason: document.id);
+      // 共享段落只有一份文本：所有规范里这一段逐字相同
+      expect(
+        document.body.contains(kSpecAlignFirstSection.trim()),
+        isTrue,
+        reason: document.id,
+      );
+    }
+    // 版本与 changelog 要跟着升级走（否则工作空间里比模板新的副本会被降级）
+    expect(first.version, greaterThan(5));
+    expect(first.changelog.first, contains('第 0 步'));
     // plugin-creator：同为 general 型，正文口径是"读原指南 + 本机/远端分工"
     final SpecDocument last = list.last;
     expect(last.id, 'plugin-creator');
@@ -67,23 +89,40 @@ void main() {
     expect(last.builtin, isTrue);
     expect(last.body, contains('唯一口径'));
     expect(last.body, contains('docs/plugin-development.md'));
-    expect(last.raw, kBuiltinSpecs['plugin-creator']);
+    // 正文要告诉 agent"指南副本在工作空间里"——它读不到应用目录/仓库里的原件
+    expect(last.body, contains('.self/docs/plugin-development.md'));
+    expect(last.raw, kBuiltinSpecTexts['plugin-creator']);
+    expect(last.changelog.first, contains('第 0 步'));
   });
 
-  test('seedInto：内置模板播种到工作空间 .self/spec/，改动即生效（文件是源）', () async {
-    await service.seedInto(io);
+  test('seedInto：内置模板播种到工作空间 .self/spec/（含共享第 0 步）', () async {
+    final List<Map<String, dynamic>> notes = await service.seedInto(io);
     final File file = File(
       p.join(temp.path, '.self', 'spec', 'general-task.md'),
     );
     expect(file.existsSync(), isTrue);
-    expect(file.readAsStringSync(), kBuiltinSpecs['general-task']);
-    // 每个内置模板都要落盘（新增内置时漏播种 = 用户看不到文件，改不了）
+    expect(file.readAsStringSync(), kBuiltinSpecTexts['general-task']);
+    // 每个内置模板都要落盘（新增内置时漏播种 = 用户看不到文件）
     for (final String id in kBuiltinSpecIds) {
       final File seeded = File(p.join(temp.path, '.self', 'spec', '$id.md'));
       expect(seeded.existsSync(), isTrue, reason: '内置模板未播种：$id');
-      expect(seeded.readAsStringSync(), kBuiltinSpecs[id], reason: id);
+      expect(
+        seeded.readAsStringSync(),
+        kBuiltinSpecTexts[id],
+        reason: '落盘内容 = 派生文本（原文 + 共享第 0 步）：$id',
+      );
     }
-    // 手改副本后 detail 返回改后的内容（工作空间文件是源）
+    expect(
+      notes.map((Map<String, dynamic> n) => n['action']),
+      everyElement('created'),
+    );
+    // 再播一次：内容一致 → 不写（不刷 mtime）
+    final List<Map<String, dynamic>> again = await service.seedInto(io);
+    expect(
+      again.map((Map<String, dynamic> n) => n['action']),
+      everyElement('unchanged'),
+    );
+    // 手改副本后 detail 返回改后的内容（工作空间文件是这一侧的读取源）
     file.writeAsStringSync('---\nid: general-task\ntitle: 改过的标题\n---\n\n正文\n');
     final SpecDocument? document = await service.detail(
       agent.id,
@@ -92,6 +131,61 @@ void main() {
     );
     expect(document, isNotNull);
     expect(document!.title, '改过的标题');
+  });
+
+  test('seedInto 升级语义：旧副本先备份再刷新；比模板新的副本保留不动；自定义不受影响', () async {
+    // 1) 先播种（当作"上一版核心播下的"），再手改成"旧模板 + 手改"
+    await service.seedInto(io);
+    final File builtin = File(
+      p.join(temp.path, '.self', 'spec', 'general-task.md'),
+    );
+    final String oldText = kBuiltinSpecTexts['general-task']!
+        .replaceFirst('version: 6', 'version: 2')
+        .replaceFirst('## 判型确认', '## 我手改的一行\n\n## 判型确认');
+    builtin.writeAsStringSync(oldText);
+
+    // 2) 副本 version 低于模板且内容不同 → 备份 + 刷新
+    final List<Map<String, dynamic>> refreshed = await service.seedInto(io);
+    final Map<String, dynamic> general = refreshed.firstWhere(
+      (Map<String, dynamic> n) => n['id'] == 'general-task',
+    );
+    expect(general['action'], 'refreshed');
+    expect(general['backup'], 'general-task.md.bak.1');
+    expect(general['file_version'], 2);
+    expect(general['template_version'], greaterThan(2));
+    expect(builtin.readAsStringSync(), kBuiltinSpecTexts['general-task']);
+    final File backup = File(
+      p.join(temp.path, '.self', 'spec', 'general-task.md.bak.1'),
+    );
+    expect(backup.readAsStringSync(), oldText, reason: '手改内容必须留在备份里，不丢');
+    // `.bak.*` 不该被当成规范文件
+    final List<SpecDocument> listed = await service.index(agent.id, io);
+    expect(listed.map((SpecDocument s) => s.id), kBuiltinSpecIds);
+
+    // 3) 副本 version 高于模板（更新的核心 / 别人手改过）→ 保留不动，绝不降级
+    final File newer = File(
+      p.join(temp.path, '.self', 'spec', 'team-meeting.md'),
+    );
+    final String newerText = kBuiltinSpecTexts['team-meeting']!
+        .replaceFirst('version: 4', 'version: 99');
+    newer.writeAsStringSync(newerText);
+    final List<String> logs = <String>[];
+    final SpecService logged = SpecService(store: store, log: logs.add);
+    final List<Map<String, dynamic>> kept = await logged.seedInto(io);
+    final Map<String, dynamic> meeting = kept.firstWhere(
+      (Map<String, dynamic> n) => n['id'] == 'team-meeting',
+    );
+    expect(meeting['action'], 'kept_newer');
+    expect(newer.readAsStringSync(), newerText, reason: '版本更高的副本保留，不静默覆盖');
+    expect(logs.join(), contains('保留不动'));
+
+    // 4) 自定义规范完全不碰
+    final File custom = File(
+      p.join(temp.path, '.self', 'spec', 'my-custom.md'),
+    );
+    custom.writeAsStringSync('---\nid: my-custom\ntitle: 我的\n---\n\n正文\n');
+    await service.seedInto(io);
+    expect(custom.readAsStringSync(), contains('我的'));
   });
 
   test('select：直接返回全文（无 read 前置）；空数组清空；不存在报可读错误', () async {
@@ -120,8 +214,8 @@ void main() {
     expect(first['id'], 'general-task');
     expect(
       first['content'],
-      kBuiltinSpecs['general-task'],
-      reason: 'select 直接回全文',
+      kBuiltinSpecTexts['general-task'],
+      reason: 'select 直接回全文（与落盘、内嵌兜底同源）',
     );
     expect(ok['note'], contains('不需要再 read'));
     expect(selected(), <String>['general-task']);
@@ -142,6 +236,73 @@ void main() {
       );
       expect(result['error'], contains('未知 spec 动作'), reason: gone);
     }
+  });
+
+  test('select：选中 plugin-creator 播种随附指南并回报路径；播种异常不阻断选择', () async {
+    // 指南原件（假）：`overrideDir` 指向它，`currentDir` 换成空目录避免真实 cwd 抢答
+    final Directory src = Directory.systemTemp.createTempSync('tree_spec_guide_');
+    addTearDown(() {
+      try {
+        if (src.existsSync()) src.deleteSync(recursive: true);
+      } catch (_) {
+        // Windows 句柄占用：不因此判失败
+      }
+    });
+    File(
+      p.join(src.path, 'plugin-development.md'),
+    ).writeAsStringSync('# 指南\n');
+    service.seedAssetsFor =
+        (WorkspaceIO callIo, List<String> ids) => seedBuiltinSpecAssets(
+          callIo,
+          ids,
+          overrideDir: src.path,
+          currentDir: temp.path,
+        );
+
+    final Map<String, dynamic> ok = await service.run(
+      call(<String, dynamic>{
+        'action': 'select',
+        'spec_ids': <String>['plugin-creator'],
+      }),
+      io,
+    );
+    expect(ok['error'], isNull);
+    final Map<String, dynamic> asset =
+        (ok['assets'] as List<dynamic>).single as Map<String, dynamic>;
+    expect(asset['spec_id'], 'plugin-creator');
+    expect(asset['path'], '.self/docs/plugin-development.md');
+    expect(asset['action'], 'created');
+    expect(ok['note'], contains('随附文档已就绪'));
+    expect(
+      File(p.join(temp.path, '.self', 'docs', 'plugin-development.md'))
+          .readAsStringSync(),
+      '# 指南\n',
+      reason: '正文让 agent 读这份副本，副本必须真的在工作空间里',
+    );
+
+    // 没有随附文档的规范：不动工作空间，结果里也不该出现 assets
+    final Map<String, dynamic> plain = await service.run(
+      call(<String, dynamic>{
+        'action': 'select',
+        'spec_ids': <String>['general-task'],
+      }),
+      io,
+    );
+    expect(plain.containsKey('assets'), isFalse);
+
+    // 播种抛错：select 本身照常成功（全文已在结果里，不因为搬文档失败而挡路）
+    service.seedAssetsFor =
+        (WorkspaceIO callIo, List<String> ids) async => throw StateError('boom');
+    final Map<String, dynamic> survived = await service.run(
+      call(<String, dynamic>{
+        'action': 'select',
+        'spec_ids': <String>['plugin-creator'],
+      }),
+      io,
+    );
+    expect(survived['error'], isNull);
+    expect(survived['count'], 1);
+    expect(selected(), <String>['plugin-creator']);
   });
 
   test('create：落盘到工作空间并可读回；重名/内置名/缺内容被拒', () async {
@@ -252,9 +413,13 @@ void main() {
     expect(ghost['error'], 'Spec 不存在: ghost');
   });
 
-  test('索引渲染：格式照旧、内置标注、when 摘要超 80 截断、>50 条注明其余', () async {
+  test('索引渲染：格式照旧、内置标注、when 摘要超 80 截断、>50 条注明其余，并带"所有 Spec 共同要求"前置', () async {
     final List<SpecDocument> all = await service.index(agent.id, io);
     final String text = SpecService.renderIndex(all);
+    // 自定义规范改不到正文 ⇒ 索引段是"所有 spec 先对齐语义"的唯一公共落点
+    expect(text.startsWith(SpecService.indexCommonNotice), isTrue);
+    expect(text, contains('动手前先与用户对齐语义'));
+    expect(text, contains('只做只读侦察'));
     expect(text, contains('- `general-task` [general] 通用任务（单人串行完成）（内置）'));
     expect(
       text,
@@ -411,4 +576,37 @@ void main() {
     ]);
     expect(properties.containsKey('query'), isFalse, reason: 'search 已删除');
   });
+  test('ensureSnapshots：拼提示词前先把 ⑦/⑧ 快照热起来（冷热不在会话中途切换）', () async {
+    service.ioFor = (String id) async => io;
+    // 工作空间里放一条自定义规范：只有全量扫描过才会出现在索引里
+    final Directory dir = Directory(p.join(temp.path, '.self', 'spec'));
+    await dir.create(recursive: true);
+    await File(p.join(dir.path, 'my-spec.md')).writeAsString(
+      '---\nid: my-spec\ntitle: 自定义规范（工作空间）\n---\n\n正文',
+      flush: true,
+    );
+    // 库里已选 general-task，但**本进程还没读过**（= 冷启动现场：核心刚重启）
+    store.session(agent.id, sessionId)!.selectedSpecIds = <String>['general-task'];
+
+    final String coldIndex = service.indexSnapshot(agent.id);
+    expect(coldIndex, isNot(contains('my-spec')), reason: '冷的时候只有内置模板');
+    expect(
+      service.selectedSpecsSnapshot(agent.id, sessionId),
+      isEmpty,
+      reason: '冷的时候 ⑧ 章整段不注入',
+    );
+
+    await service.ensureSnapshots(agent.id, sessionId);
+
+    final String warmIndex = service.indexSnapshot(agent.id);
+    expect(warmIndex, contains('my-spec'), reason: '预热后是全量索引');
+    expect(
+      service.selectedSpecsSnapshot(agent.id, sessionId),
+      contains('general-task'),
+      reason: '预热后 ⑧ 章有已选规范全文',
+    );
+    await service.ensureSnapshots(agent.id, sessionId);
+    expect(service.indexSnapshot(agent.id), warmIndex, reason: '预热是幂等的');
+  });
+
 }

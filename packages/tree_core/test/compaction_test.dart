@@ -26,6 +26,59 @@ class _FakeSummarizer implements ContextSummarizer {
   }
 }
 
+/// 中转点入参收集器：把 `system.relay.context.compact` 那一跳收到的原料原样留证。
+///
+/// 参数表必须与 [CompactionRelayHook] 逐字一致——核心改了契约这里就编译不过，
+/// 比"运行时断言字段存在"更早一步发现破约。默认"接管"，回一份两段上下文。
+class _RelayCapture {
+  _RelayCapture({
+    this.context = const <Map<String, dynamic>>[
+      <String, dynamic>{'role': 'system', 'content': '插件产出的上下文'},
+    ],
+    this.covered = -1, // -1 = 覆盖全部原文（由 hook 自己算）
+    this.error,
+  });
+
+  /// 回给核心的整份上下文。
+  final List<Map<String, dynamic>> context;
+
+  /// 回传的覆盖条数；负数 = 覆盖全部。
+  final int covered;
+
+  /// 非空则抛出（验 fail-open 回退内置）。
+  final Object? error;
+
+  int calls = 0;
+  String systemPrompt = '';
+  int frozen = -1;
+  int total = -1;
+  String existingSummary = '';
+  Map<String, dynamic>? wireRequest;
+
+  CompactionRelayHook get hook =>
+      ({
+        required CoreAgent agent,
+        required CoreSession session,
+        required String systemPrompt,
+        required int totalMessageCount,
+        required int compactedMessageCount,
+        required String existingSummary,
+        required Map<String, dynamic>? wireRequest,
+      }) async {
+        calls++;
+        this.systemPrompt = systemPrompt;
+        total = totalMessageCount;
+        frozen = compactedMessageCount;
+        this.existingSummary = existingSummary;
+        this.wireRequest = wireRequest;
+        if (error != null) throw StateError('$error');
+        return CompactionRelayReply(
+          messages: context,
+          coveredMessageCount: covered < 0 ? totalMessageCount : covered,
+        );
+      };
+}
+
 void main() {
   late MemoryStore store;
   late CoreAgent agent;
@@ -574,6 +627,256 @@ void main() {
       expect(result.compressed, isTrue);
       expect(summarizer.prompts, hasLength(1));
       expect(summarizer.prompts.single, contains('.input/20261001/图片.png'));
+    });
+  });
+
+  group('压缩中转点：原料只有"引擎真会发的那份"，回包是整份上下文', () {
+    test('接管：拿到总量/水位线/线形前缀，落库为 compactedContext，内置摘要器不参与', () async {
+      addTurn('一');
+      addTurn('二');
+      addTurn('三');
+      final _RelayCapture seen = _RelayCapture(
+        context: const <Map<String, dynamic>>[
+          <String, dynamic>{'role': 'system', 'content': '插件定的系统提示词'},
+          <String, dynamic>{'role': 'user', 'content': '插件压出来的历史'},
+        ],
+        covered: 4,
+      );
+      service.relayHook = seen.hook;
+      // 线形前缀由引擎提供（这里用假货验"服务只是转发，自己不认识线形态"）
+      service.wireRequestProvider = (CoreAgent agent, CoreSession session) async =>
+          <String, dynamic>{
+            'model': 'demo',
+            'messages': <Map<String, dynamic>>[
+              <String, dynamic>{'role': 'system', 'content': '引擎的提示词'},
+              <String, dynamic>{'role': 'user', 'content': '引擎看到的历史'},
+            ],
+            'tools': <Map<String, dynamic>>[
+              <String, dynamic>{
+                'type': 'function',
+                'function': <String, dynamic>{'name': 'read'},
+              },
+            ],
+          };
+      final CompactionResult result = await service.compact(
+        agent.id,
+        session.sessionId,
+      );
+
+      expect(result.compressed, isTrue);
+      expect(result.source, compactionSourceRelay);
+      expect(result.summary, isEmpty, reason: '中转站路径产出的是列表，不是摘要文本');
+      expect(result.summarizedMessages, 4, reason: '本次新覆盖 4 条');
+      expect(result.contextSize, 2 + (6 - 4), reason: '列表 2 条 + 水位线之后 2 条原文');
+      expect(summarizer.prompts, isEmpty, reason: '接管了就不该再调内置摘要器');
+
+      // 入参：系统提示词 + 总量 + 水位线 + 引擎口径的线形前缀
+      expect(
+        seen.systemPrompt,
+        systemPromptWithWorkspace(agent, sessionId: session.sessionId),
+      );
+      expect(seen.total, 6, reason: '原文总条数（covered 的合法上界）');
+      expect(seen.frozen, 0);
+      expect(seen.existingSummary, isEmpty);
+      expect(seen.wireRequest, isNotNull);
+      expect(
+        (seen.wireRequest!['messages'] as List<dynamic>).length,
+        2,
+        reason: '线形前缀原样转发给插件',
+      );
+
+      // 落库：列表是权威，摘要被清空；水位线按回包的 covered_message_count
+      final CoreSession after = store.session(agent.id, session.sessionId)!;
+      expect(after.compactedContext, hasLength(2));
+      expect(after.compactedContext.first['content'], '插件定的系统提示词');
+      expect(after.compactedSummary, isEmpty, reason: '两条路径互斥：列表接管即清摘要');
+      expect(after.compactedMessageCount, 4);
+      expect(after.compacted, isTrue);
+    });
+
+    test('前缀提供者缺失或抛异常 ⇒ 插件拿不到 request，但压缩流程照走（fail-open）', () async {
+      addTurn('一');
+      addTurn('二');
+      addTurn('三');
+      final _RelayCapture seen = _RelayCapture(covered: 4);
+      service.relayHook = seen.hook;
+      service.wireRequestProvider = (CoreAgent agent, CoreSession session) async =>
+          throw StateError('引擎拼不出来');
+      final CompactionResult result = await service.compact(
+        agent.id,
+        session.sessionId,
+      );
+      expect(result.compressed, isTrue);
+      expect(seen.wireRequest, isNull, reason: '拼不出来就给 null（插件据此不接管）');
+    });
+
+    test('内置规则说"没得压"时中转站照样接管（证明核心没做规划）', () async {
+      addTurn('一');
+      // 只有一轮对话：内置路径会判 nothing_to_summarize/too_few_messages
+      addTurn('二');
+      final _RelayCapture seen = _RelayCapture(covered: 4);
+      service.relayHook = seen.hook;
+      final CompactionResult result = await service.compact(
+        agent.id,
+        session.sessionId,
+      );
+      expect(seen.calls, 1, reason: '中转站先拿到整份原料，核心不预判"没得压"');
+      expect(result.compressed, isTrue);
+      expect(result.source, compactionSourceRelay);
+    });
+
+    test('回包越界 / 抛异常 / 回 null ⇒ 一律回退内置 compact，绝不猜水位线', () async {
+      // ① 越界：covered 超过原文总条数（只有一轮对话，内置也因此压不动）
+      addTurn('一');
+      final List<String> logs = <String>[];
+      final CompactionService withLog = CompactionService(
+        store: store,
+        settings: settings,
+        summarizer: summarizer,
+        keepRecentUserMessages: 2,
+        keepTailLength: 2,
+        minSummarizeMessages: 4,
+        log: logs.add,
+      );
+      withLog.relayHook = _RelayCapture(covered: 99).hook;
+      final CompactionResult overflow = await withLog.compact(
+        agent.id,
+        session.sessionId,
+      );
+      expect(
+        overflow.compressed,
+        isFalse,
+        reason: '越界 ⇒ 不接管；内置也判"没得压" ⇒ 如实返回原因',
+      );
+      expect(
+        logs.any((String l) => l.contains('covered_message_count')),
+        isTrue,
+        reason: '越界必须留下可读日志',
+      );
+      expect(
+        store.session(agent.id, session.sessionId)!.compactedContext,
+        isEmpty,
+      );
+
+      // ①b 水位线**不许倒退**：covered < 当前 compactedMessageCount 同样按不接管处理
+      //     （否则"下一轮从哪继续"会往回走，已压掉的内容被重复发送）
+      addTurn('二');
+      addTurn('三');
+      addTurn('四');
+      await service.compact(agent.id, session.sessionId); // 先内置压一次
+      final int watermark = store
+          .session(agent.id, session.sessionId)!
+          .compactedMessageCount;
+      expect(watermark, greaterThan(0));
+      final List<String> backLogs = <String>[];
+      final CompactionService backwards = CompactionService(
+        store: store,
+        settings: settings,
+        summarizer: summarizer,
+        keepRecentUserMessages: 2,
+        keepTailLength: 2,
+        minSummarizeMessages: 4,
+        log: backLogs.add,
+      )..relayHook = _RelayCapture(covered: watermark - 1).hook;
+      addTurn('五');
+      final CompactionResult regressed = await backwards.compact(
+        agent.id,
+        session.sessionId,
+      );
+      expect(
+        backLogs.any((String l) => l.contains('covered_message_count')),
+        isTrue,
+        reason: '水位线倒退必须留下可读日志',
+      );
+      expect(
+        store.session(agent.id, session.sessionId)!.compactedMessageCount,
+        greaterThanOrEqualTo(watermark),
+        reason: '无论谁接管，水位线都只能前进',
+      );
+      expect(
+        regressed.source == compactionSourceRelay,
+        isFalse,
+        reason: '倒退的回包不该被采纳（要么内置接管、要么如实说没得压）',
+      );
+
+      // ② 抛异常：同样回退内置（fail-open），不把异常抛给调用方
+      addTurn('二');
+      addTurn('三');
+      addTurn('四');
+      final CompactionService throwing = CompactionService(
+        store: store,
+        settings: settings,
+        summarizer: summarizer,
+        keepRecentUserMessages: 2,
+        keepTailLength: 2,
+        minSummarizeMessages: 4,
+      );
+      throwing.relayHook = _RelayCapture(error: '插件炸了').hook;
+      final CompactionResult afterThrow = await throwing.compact(
+        agent.id,
+        session.sessionId,
+      );
+      expect(afterThrow.compressed, isTrue);
+      expect(afterThrow.source, compactionSourceBuiltin);
+      expect(
+        store.session(agent.id, session.sessionId)!.compactedSummary,
+        isNotEmpty,
+      );
+
+      // ③ 显式不接管（回 null）：把列表清空、摘要写回（互斥的另一半）
+      addTurn('五');
+      addTurn('六');
+      addTurn('七');
+      final CompactionService declining = CompactionService(
+        store: store,
+        settings: settings,
+        summarizer: summarizer,
+        keepRecentUserMessages: 2,
+        keepTailLength: 2,
+        minSummarizeMessages: 4,
+      );
+      declining.relayHook =
+          ({
+            required CoreAgent agent,
+            required CoreSession session,
+            required String systemPrompt,
+            required int totalMessageCount,
+            required int compactedMessageCount,
+            required String existingSummary,
+            required Map<String, dynamic>? wireRequest,
+          }) async => null;
+      final CompactionResult viaBuiltin = await declining.compact(
+        agent.id,
+        session.sessionId,
+      );
+      expect(viaBuiltin.source, compactionSourceBuiltin);
+      final CoreSession afterBuiltin = store.session(
+        agent.id,
+        session.sessionId,
+      )!;
+      expect(afterBuiltin.compactedSummary, isNotEmpty);
+      expect(
+        afterBuiltin.compactedContext,
+        isEmpty,
+        reason: '互斥：内置摘要接管时清掉中转站的列表',
+      );
+    });
+
+    test('无中转点接线时行为逐字不变（canCompact 只认内置摘要器）', () async {
+      addTurn('一');
+      addTurn('二');
+      addTurn('三');
+      expect(service.relayHook, isNull);
+      final CompactionResult result = await service.compact(
+        agent.id,
+        session.sessionId,
+      );
+      expect(result.compressed, isTrue);
+      expect(result.source, compactionSourceBuiltin);
+      expect(result.summary, contains('总结正文'));
+      final CoreSession after = store.session(agent.id, session.sessionId)!;
+      expect(after.compactedContext, isEmpty);
+      expect(after.compactedSummary, contains('总结正文'));
     });
   });
 }

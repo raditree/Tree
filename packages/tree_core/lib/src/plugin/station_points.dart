@@ -181,7 +181,7 @@ abstract final class StationPoints {
       id: StationHubIds.relayContextCompact,
       kind: StationKind.relay,
       label: '上下文压缩',
-      description: '中转站·上下文压缩过程：插件产出摘要；无订阅者回退内置摘要器',
+      description: '中转站·上下文压缩过程：插件产出整份新上下文（规划也归它）；无订阅者走系统内置 compact',
       alias: 'context.compact',
       maxSubscriptions: 1,
     ),

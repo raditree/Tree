@@ -85,6 +85,42 @@ void main() {
       expect(restored.isTool, isTrue);
     });
 
+    test('CoreMessage：模型视角字段（原始参数串 / 送模型那一份）可往返，为空不写键', () {
+      // 这两个字段是"前缀缓存"的锚：落库时存下实发的那一串字节，重建历史时原样取用
+      // （见 docs/known-issues.md #6）。为空时不写键 ⇒ 老会话文件形态零变化。
+      final CoreMessage message = CoreMessage(
+        id: 'msg_2',
+        agentId: 'agt_1',
+        sessionId: 'ses_1',
+        role: 'agent',
+        content: '',
+        timestamp: 2,
+        kind: 'tool',
+        toolName: 'read',
+        toolArgumentsRaw: '{"path": "a.txt"}',
+        toolResult: '完整结果',
+        toolResultForModel: '[状态前缀]\n完整结果',
+      );
+      final Map<String, dynamic> json = message.toJson();
+      expect(json['tool_arguments_raw'], '{"path": "a.txt"}');
+      expect(json['tool_result_for_model'], '[状态前缀]\n完整结果');
+      final CoreMessage restored = CoreMessage.fromJson(json);
+      expect(restored.toolArgumentsRaw, '{"path": "a.txt"}');
+      expect(restored.toolResultForModel, '[状态前缀]\n完整结果');
+      expect(restored.toolResult, '完整结果');
+
+      final Map<String, dynamic> lean = CoreMessage(
+        id: 'msg_3',
+        agentId: 'agt_1',
+        sessionId: 'ses_1',
+        role: 'agent',
+        content: 'x',
+        timestamp: 3,
+      ).toJson();
+      expect(lean.containsKey('tool_arguments_raw'), isFalse);
+      expect(lean.containsKey('tool_result_for_model'), isFalse);
+    });
+
     test('记录可安全通过 YAML 往返（配置文件的形态）', () {
       final MemoryStore store = MemoryStore();
       final CoreAgent agent = store.createAgent(

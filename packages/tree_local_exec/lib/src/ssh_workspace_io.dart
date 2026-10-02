@@ -481,7 +481,8 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     Duration timeout = const Duration(seconds: 120),
     int maxOutputBytes = 200 * 1024,
   }) async {
-    // [timeout] 已无作用（M9 1.1 取消硬超时终止）：保留参数只为不改调用方签名。
+    // [timeout] 只有本地实现在用（软超时 → LocalExecStillRunning）；SSH 侧忽略：
+    // 活性判据是心跳，链路判失活时以 SshLinkStaleException 显式失败（M9 1.1）。
     final String trimmed = command.trim();
     if (trimmed.isEmpty) throw WorkspaceIoException('command 不能为空');
     final SshExecResult result = await _link.guard(

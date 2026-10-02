@@ -54,6 +54,23 @@ Map<String, dynamic> _update(
       },
     };
 
+/// 构造一帧 plugin_status（销毁 / 停用 / 注册）。
+Map<String, dynamic> _status(
+  String pluginId,
+  String status, {
+  String teamId = 't1',
+  bool? degraded,
+}) =>
+    <String, dynamic>{
+      'type': WsOutboundType.pluginStatus,
+      'data': <String, dynamic>{
+        'plugin_id': pluginId,
+        'scope': <String, dynamic>{'team_id': teamId},
+        'status': status,
+        if (degraded != null) 'health': degraded ? 'degraded' : 'ok',
+      },
+    };
+
 /// 构造一帧 plugin_status（销毁）。
 Map<String, dynamic> _destroyed(String pluginId, {String teamId = 't1'}) =>
     <String, dynamic>{
@@ -141,15 +158,17 @@ void main() {
       expect(reg.handleFrame(_destroyed('demo.a')), isTrue);
       // 只清 a，不动 b
       expect(reg.allSlots.map((PluginUiSlot s) => s.slotKey), <String>['b.status']);
-      // 非 destroyed 的 plugin_status 与本注册表无关
+      // `disabled`（停用 / 删条目 / 启动失败 / 进程退出）与 destroyed **同口径**：
+      // 插件不在运行 ⇒ 它声明的卡片与面板也失效（2026-10-02 真机反馈后统一；
+      // 重新启用时插件会重新发 manifest，界面自动回来）
       expect(
         reg.handleFrame(<String, dynamic>{
           'type': WsOutboundType.pluginStatus,
           'data': <String, dynamic>{'plugin_id': 'demo.b', 'status': 'disabled'},
         }),
-        isFalse,
+        isTrue,
       );
-      expect(reg.allSlots, hasLength(1));
+      expect(reg.allSlots, isEmpty);
     });
 
     test('manifest 是该插件在该 team 上的完整声明：未列出的旧槽位被注销', () {
@@ -351,6 +370,61 @@ void main() {
         reg.dispatchAction(slotKey: 'ghost', actionId: 'save'),
         isFalse,
         reason: '槽位不存在',
+      );
+    });
+  });
+
+  group('插件不再运行 ⇒ 界面随之注销（真机反馈：关闭后卡片、面板被保留）', () {
+    test('plugin_status(disabled) 注销该插件全部槽位（停用 / 删条目 / 启动失败 / 进程退出）', () {
+      final PluginUiRegistry reg = PluginUiRegistry.forTesting()..setTeam('t1');
+      reg.handleFrame(_manifest('demo.a', slots: <Map<String, dynamic>>[
+        _slot('a.card', PluginUiSlotKind.card),
+        _slot('a.panel', PluginUiSlotKind.panel),
+        _slot('a.activity', PluginUiSlotKind.activity),
+      ]));
+      reg.handleFrame(_manifest('demo.b', slots: <Map<String, dynamic>>[
+        _slot('b.card', PluginUiSlotKind.card),
+      ]));
+      expect(reg.allSlots, hasLength(4));
+
+      expect(reg.handleFrame(_status('demo.a', 'disabled')), isTrue);
+
+      expect(
+        reg.allSlots.map((PluginUiSlot s) => s.slotKey),
+        <String>['b.card'],
+        reason: '只注销被停用的那个插件，别的插件不受影响',
+      );
+      expect(reg.slotsOfKind(PluginUiSlotKind.card).single.slotKey, 'b.card');
+    });
+
+    test('plugin_status(registered)（含 degraded）**不动**槽位：心跳丢了但进程还活着', () {
+      final PluginUiRegistry reg = PluginUiRegistry.forTesting()..setTeam('t1');
+      reg.handleFrame(_manifest('demo.a', slots: <Map<String, dynamic>>[
+        _slot('a.card', PluginUiSlotKind.card),
+      ]));
+      // degraded 也是 registered：恢复时插件不会重发 manifest，清了就回不来
+      expect(
+        reg.handleFrame(_status('demo.a', 'registered', degraded: true)),
+        isFalse,
+        reason: '非 destroyed/disabled 不当成"界面失效"',
+      );
+      expect(reg.allSlots, hasLength(1));
+    });
+
+    test('onConnectionChanged：断连清空注册表，连上不清（重放可能先到）', () {
+      final PluginUiRegistry reg = PluginUiRegistry.forTesting()..setTeam('t1');
+      reg.handleFrame(_manifest('demo.a', slots: <Map<String, dynamic>>[
+        _slot('a.card', PluginUiSlotKind.card),
+      ]));
+
+      reg.onConnectionChanged(true);
+      expect(reg.allSlots, hasLength(1), reason: '连上不动：重放帧可能先于连接回调到达');
+
+      reg.onConnectionChanged(false);
+      expect(
+        reg.allSlots,
+        isEmpty,
+        reason: '离线期间核心不会重放已停用/已删除插件的帧，留着就是僵尸卡片',
       );
     });
   });

@@ -16,6 +16,7 @@ class HookTask {
     required this.startedAt,
     this.detached = false,
     this.note = '',
+    this.finalOutput,
   });
 
   final String id;
@@ -39,6 +40,9 @@ class HookTask {
 
   /// 转后台的原因（detached 时给模型看的说明）。
   final String note;
+
+  /// 结束前用来补写"完整输出"的取数回调（软超时采纳的本机进程才有；null = 没有）。
+  final String Function()? finalOutput;
 
   /// 退出码（null = 仍在运行）。
   int? exitCode;
@@ -132,6 +136,9 @@ class TerminalHooks {
       await Future<void>.delayed(const Duration(milliseconds: 200));
       process = await _spawn(io.root, scriptPath, windows);
     }
+    // 同 LocalWorkspaceIO.exec：stdin 也立刻关掉。后台任务不该跟用户要输入，而"等输入"
+    // 的命令在没有超时的前提下会一直挂着（2026-10-02 裸 echo 事故的同型问题）。
+    unawaited(process.stdin.close());
     // 输出已由 shell 重定向进文件，这里的管道只用于防止子进程写阻塞
     unawaited(process.stdout.drain<void>());
     unawaited(process.stderr.drain<void>());
@@ -164,7 +171,59 @@ class TerminalHooks {
     runInShell: false,
   );
 
-  /// 把一个**已经不在本机等待**的命令登记为后台任务（terminal 软超时 → hook 模式）。
+  /// 把一个**本机仍在运行**的命令转成后台任务（terminal 的软超时 → hook 模式）。
+  ///
+  /// 与 [start] 的区别：不新起进程、不重跑命令、也不丢输出——进程句柄在我们手上，
+  /// 输出订阅仍然活着，退出时补写完整输出并回调 [onFinished]（唤醒 agent）；
+  /// [HookTask.process] 非空 ⇒ hook_action=cancel / close 照常杀得掉。
+  /// 与 [adoptDetached] 的区别：那个没有本机句柄（远端失联），退出码与输出都拿不到；
+  /// 这个拿得到，所以 [HookTask.detached] 保持 false（状态里照常报退出码）。
+  Future<HookTask> adoptRunning({
+    required WorkspaceIO io,
+    required String agentId,
+    required String sessionId,
+    required String command,
+    required RunningLocalExec running,
+    String? outputFile,
+    String note = '',
+  }) async {
+    _seq++;
+    final String id = 'hook_${DateTime.now().millisecondsSinceEpoch}_$_seq';
+    final String relative = (outputFile == null || outputFile.trim().isEmpty)
+        ? '.output/$id.log'
+        : outputFile.trim();
+    final String absolute = io.resolve(relative);
+    final DateTime startedAt = DateTime.now();
+    final File file = File(absolute);
+    await file.parent.create(recursive: true);
+    await file.writeAsString(
+      '# [terminal hook] $command\n'
+      '# ${note.isEmpty ? '同步执行未结束' : note} ⇒ 转后台'
+      '（**没有终止进程，也没有重跑命令**）\n'
+      '# adopted ${startedAt.toIso8601String()}  pid=${running.pid}\n'
+      '# 以下是采纳时的输出快照；命令结束时会在本文件末尾补写完整输出与退出码\n\n'
+      '${running.snapshotText()}\n',
+      flush: true,
+    );
+    final HookTask task = HookTask(
+      id: id,
+      agentId: agentId,
+      sessionId: sessionId,
+      command: command,
+      logRelative: relative,
+      logAbsolute: absolute,
+      process: running.process,
+      startedAt: startedAt,
+      note: note,
+      finalOutput: running.snapshotText,
+    );
+    _tasks[id] = task;
+    unawaited(running.exitCode.then((int code) => _finish(task, code)));
+    log?.call('同步命令软超时转后台 $id（$command）→ $relative');
+    return task;
+  }
+
+  /// 把一个**已经不在本机等待**的命令登记为后台任务（SSH 会话失联）。
   ///
   /// 与 [start] 的区别：不新起进程、也不重跑命令——远端那条可能还在跑，重跑会重复
   /// 副作用。日志文件里只记录转后台的时间、命令与原因：输出抓不回来了（执行器判
@@ -253,6 +312,8 @@ class TerminalHooks {
     } else {
       buffer.writeln(
         '状态：${task.running ? '运行中' : '已结束'}'
+        // 采纳的本机进程：运行中也能看到 pid（出事了能自己去 taskkill）
+        '${task.running && task.process != null ? '（pid ${task.process!.pid}）' : ''}'
         '${task.running ? '' : '（退出码 ${task.exitCode}${task.cancelled ? '，已被取消' : ''}）'}'
         '｜耗时 ${task.elapsed.inSeconds}s',
       );
@@ -271,6 +332,15 @@ class TerminalHooks {
     task.exitCode = code;
     try {
       final File file = File(task.logAbsolute);
+      // 软超时采纳的本机进程：日志里只有"采纳时"的快照，结束前补一份完整输出
+      final String? full = task.finalOutput?.call();
+      if (full != null && full.trim().isNotEmpty) {
+        await file.writeAsString(
+          '\n# （完整输出）\n$full\n',
+          mode: FileMode.append,
+          flush: true,
+        );
+      }
       await file.writeAsString(
         '\n# [terminal hook] 结束：退出码 $code'
         '${task.cancelled ? '（已取消）' : ''}，耗时 ${task.elapsed.inSeconds}s\n',

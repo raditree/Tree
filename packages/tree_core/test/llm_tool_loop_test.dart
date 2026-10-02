@@ -244,7 +244,7 @@ void main() {
     );
     expect(forModel.content, contains('[工具结果已重定向]'));
     final RegExpMatch? match = RegExp(
-      r'\.self/results/\d{8}_\d{6}_001\.read\.result',
+      r'\.self/results/read_[0-9a-f]{16}\.result',
     ).firstMatch(forModel.content);
     expect(match, isNotNull, reason: '提示里必须带上重定向文件的相对路径');
 

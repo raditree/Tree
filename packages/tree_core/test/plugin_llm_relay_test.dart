@@ -727,7 +727,7 @@ void main() {
 
   // ── ⑦ relayCompaction / relaySystemPrompt ───────────────────────────
 
-  test('⑦relayCompaction：插件接管 ⇒ 拿到摘要正文；回 null ⇒ 回退内置摘要器', () async {
+  test('⑦relayCompaction：接管 ⇒ 整份上下文 + 覆盖条数；非法回包 ⇒ 一律不接管', () async {
     final CoreAgent coreAgent = CoreAgent(
       id: agent,
       name: '甲',
@@ -741,11 +741,40 @@ void main() {
       createdAt: 1,
       updatedAt: 1,
     );
+    final List<CoreMessage> all = <CoreMessage>[
+      CoreMessage(
+        id: 'm1',
+        agentId: agent,
+        sessionId: session,
+        role: 'user',
+        content: '你好',
+        timestamp: 1,
+      ),
+      CoreMessage(
+        id: 'm2',
+        agentId: agent,
+        sessionId: session,
+        role: 'agent',
+        content: '在',
+        timestamp: 2,
+      ),
+      CoreMessage(
+        id: 'm3',
+        agentId: agent,
+        sessionId: session,
+        role: 'user',
+        content: '继续',
+        timestamp: 3,
+      ),
+    ];
 
-    for (final (String mode, String? expected) in <(String, String?)>[
-      ('text', '插件摘要'),
-      ('map', '插件摘要（map）'),
-      ('', null),
+    // '' = 回 null（不接管）；三种非法回包必须与"不接管"同样处理（fail-open）
+    for (final String mode in <String>[
+      'list',
+      '',
+      'bad-messages',
+      'bad-count',
+      'bare-list',
     ]) {
       final List<String> logs = <String>[];
       final PluginBus bus = await startBus(<String>[
@@ -759,34 +788,161 @@ void main() {
         ),
       ], logs: logs);
       await waitForSubscription(bus, StationHubIds.relayContextCompact, logs);
-      final String? summary = await bus.relayCompaction(
+      final CompactionRelayReply? reply = await bus.relayCompaction(
         agent: coreAgent,
         session: coreSession,
-        prompt: '请压缩',
-        messages: <CoreMessage>[
-          CoreMessage(
-            id: 'm1',
-            agentId: agent,
-            sessionId: session,
-            role: 'user',
-            content: '你好',
-            timestamp: 1,
-          ),
+        systemPrompt: '系统提示词',
+        totalMessageCount: all.length,
+        compactedMessageCount: 0,
+        existingSummary: '',
+        wireRequest: <String, dynamic>{
+          'model': 'demo',
+          'messages': <Map<String, dynamic>>[
+            <String, dynamic>{'role': 'system', 'content': '引擎的提示词'},
+          ],
+          'tools': <Map<String, dynamic>>[],
+        },
+      );
+      if (mode == 'list') {
+        expect(reply, isNotNull, reason: '合法回包必须被认出来');
+        expect(reply!.coveredMessageCount, 2);
+        expect(reply.messages, hasLength(3));
+        expect(reply.messages.first['role'], 'system');
+        expect(reply.messages.first['content'], '插件压缩后的系统提示词');
+      } else {
+        expect(
+          reply,
+          isNull,
+          reason: mode.isEmpty
+              ? '回 null = 不接管，调用方回退内置 compact'
+              : '回包非法（$mode）必须按未接管处理，绝不猜水位线',
+        );
+      }
+      if (mode.isEmpty) {
+        expect(
+          logs.any((String line) => line.contains('插件未接管')),
+          isTrue,
+          reason:
+              '回 null 必须留下"未接管"日志：请求载荷里也有 messages，'
+              '不能把它误读成回包（那样会记成"回包不合法"甚至当成新上下文）',
+        );
+      }
+    }
+  }, timeout: const Timeout(Duration(seconds: 180)));
+
+  test('⑦b relayCompaction 载荷：完整原文列表 + 系统提示词 + 当前水位线', () async {
+    final CoreAgent coreAgent = CoreAgent(
+      id: agent,
+      name: '甲',
+      createdAt: 1,
+      updatedAt: 1,
+    );
+    final CoreSession coreSession = CoreSession(
+      sessionId: session,
+      agentId: agent,
+      title: '会话',
+      createdAt: 1,
+      updatedAt: 1,
+      // 已经压过一次：前 1 条由 existing_summary 代表
+      compactedMessageCount: 1,
+      compactedSummary: '旧的摘要正文',
+    );
+    CoreMessage message(String id, String role, String content) => CoreMessage(
+      id: id,
+      agentId: agent,
+      sessionId: session,
+      role: role,
+      content: content,
+      timestamp: 1,
+    );
+    // 规划归中转站：核心不做任何切分，4 条原文整份给出去
+    final List<CoreMessage> all = <CoreMessage>[
+      message('m1', 'user', '需求一'),
+      message('m2', 'agent', '回答一'),
+      message('m3', 'user', '需求二'),
+      message('m4', 'agent', '回答二'),
+    ];
+    final String compactLog = p.join(temp.path, 'compact-payload.jsonl');
+    final List<String> logs = <String>[];
+    final PluginBus bus = await startBus(<String>[
+      pluginEntry(
+        id: 'llm',
+        flags: <String>[
+          '--subscribe-point',
+          StationHubIds.relayContextCompact,
+          '--compact-mode',
+          'list',
+          // 载荷契约的取证口：插件把收到的 params 原样落盘
+          '--compact-log',
+          compactLog,
         ],
-        instruction: '保留要点',
-        header: '【历史摘要】',
-      );
-      expect(
-        summary,
-        expected,
-        reason: mode.isEmpty
-            ? '插件回 null = 不接管，调用方回退内置摘要器'
-            : '回包形态 $mode 都必须被认出来',
-      );
+      ),
+    ], logs: logs);
+    await waitForSubscription(bus, StationHubIds.relayContextCompact, logs);
+    final CompactionRelayReply? reply = await bus.relayCompaction(
+      agent: coreAgent,
+      session: coreSession,
+      systemPrompt: '内置拼装的系统提示词',
+      totalMessageCount: all.length,
+      compactedMessageCount: 1,
+      existingSummary: '旧的摘要正文',
+      wireRequest: <String, dynamic>{
+        'model': 'demo-model',
+        'messages': <Map<String, dynamic>>[
+          <String, dynamic>{'role': 'system', 'content': '引擎的提示词'},
+          <String, dynamic>{'role': 'user', 'content': '引擎看到的历史'},
+        ],
+        'tools': <Map<String, dynamic>>[
+          <String, dynamic>{
+            'type': 'function',
+            'function': <String, dynamic>{'name': 'read'},
+          },
+        ],
+      },
+    );
+    expect(reply, isNotNull);
+
+    final List<String> lines = File(compactLog).readAsLinesSync();
+    expect(lines, isNotEmpty, reason: '插件必须收到 context.compact 请求');
+    final Map<String, dynamic> params =
+        jsonDecode(lines.last) as Map<String, dynamic>;
+    final Map<String, dynamic> payload =
+        params['payload'] as Map<String, dynamic>;
+    expect(params['station_id'], StationHubIds.relayContextCompact);
+
+    // 载荷：系统提示词 + 计数 + **引擎口径的线形请求**（原料与缓存前缀）
+    expect(payload['system_prompt'], '内置拼装的系统提示词');
+    expect(payload['total_message_count'], 4);
+    expect(payload['compacted_message_count'], 1, reason: '当前水位线');
+    expect(payload['existing_summary'], '旧的摘要正文');
+    expect(payload['compacted'], isTrue);
+    final Map<String, dynamic> request =
+        payload['request'] as Map<String, dynamic>;
+    expect(request['model'], 'demo-model');
+    expect(
+      (request['messages'] as List<dynamic>)
+          .map((dynamic m) => (m as Map<String, dynamic>)['content'])
+          .toList(),
+      <String>['引擎的提示词', '引擎看到的历史'],
+      reason: '原料必须是"引擎真会发的那份"，不是落库全量',
+    );
+    expect((request['tools'] as List<dynamic>), hasLength(1));
+    // 落库全量与旧切点字段**必须都不在载荷里**
+    for (final String gone in <String>[
+      'messages',
+      'prompt',
+      'instruction',
+      'header',
+      'message_count',
+      'summarize_message_ids',
+      'keep_message_ids',
+    ]) {
+      expect(payload.containsKey(gone), isFalse, reason: '旧字段 $gone 应已下线');
     }
   }, timeout: const Timeout(Duration(seconds: 120)));
 
-  test('⑦b relaySystemPrompt：字符串接管 / 空串 = 明确不要系统提示词 / null = 不改', () async {
+
+  test('⑦c relaySystemPrompt：字符串接管 / 空串 = 明确不要系统提示词 / null = 不改', () async {
     const AgentRunContext context = AgentRunContext(
       agentId: agent,
       sessionId: session,

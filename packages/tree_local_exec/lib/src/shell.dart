@@ -17,7 +17,18 @@ import 'dart:io';
 /// 2. **退出码透传**：-Command 默认返回 0，末尾必须把真实退出码还原（$LASTEXITCODE 只管
 ///    原生命令，纯 cmdlet 的失败要靠 $? 兜，见 [_wrapPowerShell]）；
 /// 3. 进程树终止语义不变：只杀 shell 会留下真正干活的后台进程，[killProcessTree] 仍走
-///    taskkill /T /F。
+///    taskkill /T /F；
+/// 4. **绝不进入交互等待**（2026-10-02 实机事故后加）：命令行带 `-NonInteractive`。
+///    起因：agent 写了 `… ; echo; echo "=== …"`——PowerShell 里 `echo` 是
+///    `Write-Output` 的别名，而它的 `-InputObject` 是**必填**参数，于是 PowerShell 弹出
+///    「cmdlet Write-Output 位于命令管道位置 1 / 请提供以下参数的值: InputObject:」
+///    并**等 stdin**；而子进程的 stdin 是 Dart 侧的管道（我们永远不会往里写），本地执行
+///    又「进程活着就永不超时」（见 LocalWorkspaceIO.exec 的 M9 1.1 注释）——两头一凑，
+///    整轮会话十几分钟一动不动。`-NonInteractive` 让这类提示**立刻变成错误**；配合
+///    LocalWorkspaceIO.exec / TerminalHooks.start 关掉子进程 stdin，连原生子进程
+///    （git 凭据、pause/choice、REPL）也只拿到 EOF 报错，而不是静默挂死。
+///    **根因本身也已兼容**：裸 `echo` 由 [translateBareEcho] 补成 `echo ''`——三层里
+///    第一层就让这条命令不进入交互，后面两层是兜底。
 ///
 /// 已知行为差异（如实记录，不粉饰）：
 /// - **&& / ||**：PowerShell 7 支持；Windows PowerShell 5.1 **不支持**（ParserError：
@@ -27,6 +38,9 @@ import 'dart:io';
 ///   但翻译只覆盖能确定的写法，命令里优先写 ; 仍然更稳。
 /// - **1>&2**：同样只有 PS 7 支持（5.1 报 RedirectionNotSupported）；往 stderr 写请用
 ///   「[Console]::Error.WriteLine('…')」或 Write-Error。
+/// - **裸 `echo`**：PS 下 `Write-Output -InputObject` 必填，`echo;` 会弹参数提示并等 stdin
+///   （cmd/sh 里它只是输出一个空行）。包装层按 [translateBareEcho] 补成 `echo ''`，
+///   语义与 cmd 一致——模型照 cmd 习惯写就行；
 /// - **cmd 内建命令变成别名/cmdlet**：dir→Get-ChildItem、type→Get-Content，输出格式不同；
 ///   cd（Set-Location）**不再打印当前目录**，要打印用 $PWD.Path。
 /// - 非 Windows 仍是 /bin/sh -c；SSH 远端跑的是**远端自己的 shell**，与此无关。
@@ -84,7 +98,13 @@ abstract final class Shell {
       // 由解码链（decodeBytes）兜住。
       return <String>['/c', 'chcp 65001 >nul && $command'];
     }
-    return <String>['-NoProfile', '-Command', _wrapPowerShell(command)];
+    return <String>[
+      '-NoProfile',
+      // 见类文档「绝不进入交互等待」：少了它，一句裸 echo 就能把整轮会话挂死。
+      '-NonInteractive',
+      '-Command',
+      _wrapPowerShell(command),
+    ];
   }
 
   /// 后台模式的重定向后缀（把 stdout/stderr 都写进日志文件）。
@@ -127,6 +147,7 @@ abstract final class Shell {
     if (_isCmd(windowsShell)) return <String>['/c', scriptPath];
     return <String>[
       '-NoProfile',
+      '-NonInteractive',
       '-ExecutionPolicy',
       'Bypass',
       '-File',
@@ -349,6 +370,114 @@ abstract final class Shell {
     return ' \t\r\n;|({},['.contains(text[index - 1]);
   }
 
+  /// 把**无参数的** `echo` / `write-output` 补成 `echo ''`（兼容翻译，与
+  /// [translateLogicalOperators] 同一取舍）。
+  ///
+  /// 为什么需要：PowerShell 的 `Write-Output -InputObject` 是**必填**参数，裸 `echo;`
+  /// （cmd/sh 下合法、模型很爱用来做空行分隔）会弹出「请提供以下参数的值: InputObject:」
+  /// 并**等 stdin**——本地执行又没有超时，一次就能把整轮会话挂死（2026-10-02 两次实机
+  /// 事故的唯一触发点）。这里在包装层补一个空字符串，语义回到 cmd 的"输出一个空行"，
+  /// 模型不必知道这条 PowerShell 差异。
+  ///
+  /// 只认**命令位置**上的无参调用（后面紧跟 `;` / 换行 / `|` / `)` / `}` / 行注释 / 结尾），
+  /// 所以 `echo hi`、`echo ''`、`echo $x`、`function echo {…}`、引号内的 `echo` 一律不动；
+  /// 拿不准（引号不闭合、here-string、块注释）就整体原样返回——宁可让模型看到 PowerShell
+  /// 的原生报错，也不悄悄改写语义。没有可补之处时**逐字节**返回原文。
+  static String translateBareEcho(String command) {
+    final StringBuffer out = StringBuffer();
+    bool changed = false;
+    bool atCommandStart = true;
+    int i = 0;
+    while (i < command.length) {
+      final String ch = command[i];
+      if (ch == "'" || ch == '"') {
+        final int end = _skipQuoted(command, i);
+        if (end < 0) return command; // 引号不闭合：拿不准，整体回退
+        out.write(command.substring(i, end));
+        atCommandStart = false;
+        i = end;
+        continue;
+      }
+      if (ch == '`') {
+        // 反引号转义：连被转义的字符一起照抄（转义出来的 ; | 不是分隔符）
+        final int end = i + 2 <= command.length ? i + 2 : command.length;
+        out.write(command.substring(i, end));
+        atCommandStart = false;
+        i = end;
+        continue;
+      }
+      if (ch == '<' && command.startsWith('<#', i)) {
+        return command; // 块注释：内部规则另一套，不解析
+      }
+      if (ch == '@' &&
+          (command.startsWith("@'", i) || command.startsWith('@"', i))) {
+        return command; // here-string：不解析
+      }
+      if (ch == '#' && _startsComment(command, i)) {
+        // 行注释：整行原样抄走（注释里的 echo 不是命令）
+        int end = command.indexOf('\n', i);
+        if (end < 0) end = command.length;
+        out.write(command.substring(i, end));
+        i = end;
+        continue;
+      }
+      if (ch == ';' || ch == '\n' || ch == '|' || ch == '&' || ch == '{' ||
+          ch == '(') {
+        out.write(ch);
+        atCommandStart = true;
+        i++;
+        continue;
+      }
+      if (ch == ' ' || ch == '\t' || ch == '\r') {
+        out.write(ch);
+        i++;
+        continue;
+      }
+      if (atCommandStart) {
+        final int end = _bareOutputCommandEnd(command, i);
+        if (end > 0) {
+          out.write(command.substring(i, end));
+          out.write(" ''");
+          changed = true;
+          i = end;
+          atCommandStart = false;
+          continue;
+        }
+      }
+      out.write(ch);
+      atCommandStart = false;
+      i++;
+    }
+    return changed ? out.toString() : command;
+  }
+
+  /// [start] 处是不是**无参**的 `echo` / `write-output`；是则返回该名字结束的下标，
+  /// 否则返回 -1。
+  static int _bareOutputCommandEnd(String text, int start) {
+    for (final String name in const <String>['echo', 'write-output']) {
+      final int end = start + name.length;
+      if (end > text.length) continue;
+      if (text.substring(start, end).toLowerCase() != name) continue;
+      int i = end;
+      while (i < text.length &&
+          (text[i] == ' ' || text[i] == '\t' || text[i] == '\r')) {
+        i++;
+      }
+      if (i >= text.length) return end;
+      final String next = text[i];
+      if (next == ';' ||
+          next == '\n' ||
+          next == '|' ||
+          next == ')' ||
+          next == '}') {
+        return end;
+      }
+      if (next == '#' && _startsComment(text, i)) return end;
+      return -1;
+    }
+    return -1;
+  }
+
   /// PowerShell 包装器：UTF-8 输出编码 + 退出码透传。
   ///
   /// 退出码为什么要两步：$LASTEXITCODE 只在跑过**原生命令**（git/ping/gradle…）之后才有值，
@@ -362,7 +491,10 @@ abstract final class Shell {
   ///
   /// 全部用 Dart 原始字符串写 PowerShell 片段：省掉一层 $ / \ 转义，读起来就是 PS 原文。
   static String _wrapPowerShell(String command) {
-    final String translated = translateLogicalOperators(command);
+    // 顺序有意：先补裸 echo（在模型的原始命令上认命令位置最准），再翻译 && / ||
+    final String translated = translateLogicalOperators(
+      translateBareEcho(command),
+    );
     return r'[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; '
         r'$OutputEncoding=[System.Text.Encoding]::UTF8; '
         r"$PSDefaultParameterValues['Out-File:Encoding']='utf8'; "

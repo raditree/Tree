@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:math' as math;
 
 import '../util/tokens.dart';
@@ -15,7 +16,9 @@ typedef ResultRedirectWriter = Future<void> Function(
 /// 工具结果大小门控（Q1-②，照旧后端 `llm.py:_maybe_redirect_result` 的口径）。
 ///
 /// 门控只作用于**送给模型的那一份**：超过 [thresholdTokens] 估算 token 时
-/// 1. 完整结果写入工作空间 `.self/results/<yyyyMMdd_HHmmss>_<3位序号>.<工具名>.result`；
+/// 1. 完整结果写入工作空间 `.self/results/<工具名>_<内容指纹>.result`
+///    （名字**只由 (工具名, 结果原文) 决定**，见 [_nextPath]——历史翻译每轮都会重跑
+///    一遍门控，名字里带时间戳/序号会让"送模型那一份"逐轮变化、端点前缀缓存全丢）；
 /// 2. 上下文里换成一条提示（工具名 / 字符数 / 阈值 / 相对路径 / 查看建议 / 前
 ///    [previewChars] 字符预览）；
 /// 3. 没有写入器或写入失败 → 退化为**按阈值截断**：上下文必须有界，宁可让模型
@@ -35,8 +38,7 @@ class ToolResultGate {
     this.previewChars = defaultPreviewChars,
     this.writer,
     this.log,
-    DateTime Function()? clock,
-  }) : _clock = clock ?? DateTime.now;
+  });
 
   /// 默认门控阈值（token）：≈16k 字符 @ token_scale 2.00。
   static const int defaultThresholdTokens = 8000;
@@ -64,11 +66,6 @@ class ToolResultGate {
 
   /// 可读日志（写入失败、退化截断等）。
   final void Function(String message)? log;
-
-  final DateTime Function() _clock;
-
-  /// 本次运行内的重定向序号（门控实例与一次 run 同生命周期）。
-  int _seq = 0;
 
   /// 已经重定向过的结果（工具名 + 原文 → 相对路径）。
   ///
@@ -119,7 +116,7 @@ class ToolResultGate {
     final String cacheKey = '$toolName\u0000$text';
     final String? cached = _cache[cacheKey];
     if (cached != null) return _notice(toolName, text, cached);
-    final String relativePath = _nextPath(toolName);
+    final String relativePath = _nextPath(toolName, text);
     try {
       await write(agentId, relativePath, text);
     } catch (error) {
@@ -133,11 +130,27 @@ class ToolResultGate {
     return _notice(toolName, text, relativePath);
   }
 
-  /// 生成本次重定向的相对路径：`.self/results/<时间戳>_<序号>.<工具名>.result`。
-  String _nextPath(String toolName) {
-    _seq++;
-    final String seq = _seq.toString().padLeft(3, '0');
-    return '$resultsDir/${_stamp(_clock())}_$seq.${safeToolName(toolName)}.result';
+  /// 生成本次重定向的相对路径：`.self/results/<工具名>_<内容指纹>.result`。
+  ///
+  /// **名字必须只由 (工具名, 结果原文) 决定**：历史翻译每一轮都会重跑门控，用时间戳 /
+  /// 序号命名等于每次 run 换一个路径——既在 `.self/results/` 里堆出一堆内容完全相同的
+  /// 文件，又让"送模型那一份"（提示里带着这个路径）逐轮变化，端点前缀缓存从这条消息起
+  /// 整段落空。同名覆盖 = 幂等：同一份结果永远落到同一个文件。
+  static String _nextPath(String toolName, String text) =>
+      '$resultsDir/${safeToolName(toolName)}_${fingerprint(toolName, text)}.result';
+
+  /// (工具名, 结果原文) 的**稳定指纹**（16 位十六进制）。
+  ///
+  /// 用 FNV-1a 64 位纯整数运算：不引第三方依赖、跨平台跨进程一致（`String.hashCode`
+  /// 与 `Object.hash` 都不保证跨版本稳定，不能用来命名落盘文件）。撞名只会让两份
+  /// 不同结果共用同一个文件，故取满 64 位（去掉符号位后 63 位）以压到可忽略。
+  static String fingerprint(String toolName, String text) {
+    int hash = 0xcbf29ce484222325;
+    for (final int byte in utf8.encode('$toolName\u0000$text')) {
+      hash ^= byte;
+      hash *= 0x100000001b3;
+    }
+    return (hash & 0x7fffffffffffffff).toRadixString(16).padLeft(16, '0');
   }
 
   /// 写给模型的提示（照旧后端文案，补上 token 口径）。
@@ -181,12 +194,5 @@ class ToolResultGate {
   static String safeToolName(String raw) {
     final String name = raw.trim().replaceAll(RegExp(r'[^A-Za-z0-9_.-]'), '_');
     return name.isEmpty ? 'tool' : name;
-  }
-
-  /// 本地时间戳（yyyyMMdd_HHmmss，与旧后端 time.strftime 同形）。
-  static String _stamp(DateTime time) {
-    String two(int value) => value.toString().padLeft(2, '0');
-    return '${time.year}${two(time.month)}${two(time.day)}_'
-        '${two(time.hour)}${two(time.minute)}${two(time.second)}';
   }
 }

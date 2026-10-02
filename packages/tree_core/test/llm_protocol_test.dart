@@ -302,6 +302,23 @@ void main() {
       expect(usage2.promptTokens, 4);
       expect(usage2.completionTokens, 6);
       expect(usage2.totalTokens, 10, reason: '缺 total 时用 prompt+completion 兜底');
+
+      // DeepSeek 硬盘缓存：命中/未命中是两个平铺字段，不在 prompt_tokens_details 里。
+      // 不认它的话"缓存到底有没有生效"在界面上恒为 0（插件也就无从判断前缀拼对没有）。
+      final List<LlmStreamEvent> deepseek = decode(<String, dynamic>{
+        'usage': <String, dynamic>{
+          'prompt_tokens': 100,
+          'completion_tokens': 5,
+          'total_tokens': 105,
+          'prompt_cache_hit_tokens': 64,
+          'prompt_cache_miss_tokens': 36,
+        },
+      });
+      expect(
+        (deepseek.first as LlmUsageEvent).usage.cachedTokens,
+        64,
+        reason: 'DeepSeek 的 prompt_cache_hit_tokens 要归一到 cachedTokens',
+      );
     });
 
     test('流中 error 帧被识别为失败', () {

@@ -336,10 +336,110 @@ class LlmAgentEngine implements AgentEngine {
     }
   }
 
+  /// 复制一条消息、只换正文（[LlmMessage] 是不可变的；刷新提示词槽位时用）。
+  static LlmMessage _replacingContent(LlmMessage message, String content) =>
+      LlmMessage(
+        role: message.role,
+        content: content,
+        toolCalls: message.toolCalls,
+        toolCallId: message.toolCallId,
+        name: message.name,
+        reasoningContent: message.reasoningContent,
+        contentParts: message.contentParts,
+      );
+
+  /// **当前上下文的线形请求**（预先压缩态）——给压缩插件复用前缀。
+  ///
+  /// 为什么需要它：压缩插件要在自己的 `llm.call` 里吃**端点前缀缓存**，就必须交出
+  /// **与对话同一条前缀**（逐字一致才有缓存单元可命中）。而这条前缀只有引擎拼得出来
+  /// ——历史怎么翻译、工具卡怎么配对、思考要不要回灌、超长结果怎么门控，全是引擎口径。
+  ///
+  /// 口径与 [run] 即将发出的那一份一致，只有两处刻意不同：
+  /// - **不做视觉上传**（`if_vision` 开着时图片块会缺，这部分前缀因此不命中缓存；
+  ///   上传是有副作用的远端动作，不能因为"只是想拿前缀"就触发）；
+  /// - `stream` 恒为 `false`（它是报文参数，与 messages 前缀无关）。
+  ///
+  /// 取不到（模型没配 / 没密钥 / 拼接异常）时返回 null：插件据此退回"自己渲染历史"
+  /// 的模式（功能一样，只是没有缓存收益）。
+  Future<Map<String, dynamic>?> wireRequestFor(AgentRunContext context) async {
+    final CoreModelConfig? resolved = resolveModel(context.modelId);
+    final CoreModelConfig? config = resolved?.withOverrides(
+      agentOverrides?.call(context.agentId) ?? const <String, Object?>{},
+    );
+    if (config == null) return null;
+    if (config.baseUrl.trim().isEmpty || config.apiKey.trim().isEmpty) {
+      return null;
+    }
+    try {
+      final ToolResultGate gate = ToolResultGate(
+        agentId: context.agentId,
+        tokenScale: config.tokenScale,
+        writer: resultRedirectWriter ?? _workspaceWriter(),
+        log: log,
+      );
+      final List<LlmMessage> built = await _buildMessages(
+        context,
+        gate,
+        config: config,
+        vision: null,
+        passBackReasoning: config.thinking,
+      );
+      // **预算硬裁也要过一遍**（与 `LlmSession.run` 同一份 `fitContextToBudget`）：
+      // 只有"引擎会给的那份" = "真会发出去的那份"，压缩插件的前缀才与端点缓存单元
+      // 逐字一致，也才不会把已经被裁掉的内容再喂给总结模型。
+      final List<LlmMessage> messages = fitContextToBudget(
+        built,
+        maxSeqlen: config.effectiveMaxSeqlen,
+        maxOutputTokens: config.maxOutputTokens > 0
+            ? config.maxOutputTokens
+            : null,
+        tokenScale: config.tokenScale,
+        onTrimmed: (int dropped) => log?.call(
+          '压缩前缀按预算硬裁了 $dropped 条（与实发请求同口径）',
+        ),
+      );
+      final LlmRequest request = LlmRequest(
+        model: config.modelId,
+        messages: messages,
+        // 与 `LlmSession` 同一条转换（工具层 ToolSpec → 线形态 LlmToolSpec）：
+        // 前缀要逐字对齐，声明少一个字段都会整段不命中缓存。
+        tools: <LlmToolSpec>[
+          for (final ToolSpec spec in toolRunner.specsFor(
+            agentId: context.agentId,
+            sessionId: context.sessionId,
+          ))
+            LlmToolSpec(
+              name: spec.name,
+              description: spec.description,
+              parameters: spec.parameters,
+            ),
+        ],
+        maxOutputTokens: config.maxOutputTokens > 0
+            ? config.maxOutputTokens
+            : null,
+        reasoningEffort: config.reasoningEffort.trim().isEmpty
+            ? null
+            : config.reasoningEffort,
+      );
+      return request.toWire();
+    } catch (error) {
+      log?.call('拼"压缩可复用的前缀"失败（插件退回自渲染模式）：$error');
+      return null;
+    }
+  }
+
   /// 把会话历史翻译成端点消息序列。
   ///
+  /// **不变量（前缀缓存）**：这里拼出来的每一条历史消息，必须与"当初真正发给模型的
+  /// 那一份"**逐字一致**。端点的前缀缓存只在字节完全相同的公共前缀上命中——少一个
+  /// 空格（参数串被重新编码）、多一句状态前缀、换一个重定向文件名，缓存就从那条消息
+  /// 起全部落空（真机表现：373k 上下文只命中 ~12k，正好是 system + 摘要）。
+  /// 因此凡是"实发时才算得出来"的东西（模型原始参数串、状态前缀、门控后的结果），
+  /// 都由落库那份记录原样带回来，而不是在这里重新推导。
+  ///
   /// [gate] 只替换工具结果**送给模型的那一份**：历史里的超长结果同样要过门控
-  /// （Q1-②：每次构造上下文都要过一遍，历史重载同样生效）。
+  /// （Q1-②：每次构造上下文都要过一遍，历史重载同样生效）；但**有落库的
+  /// "送模型那一份"时优先用它**，门控只是老数据的回退路径。
   ///
   /// [passBackReasoning] = 模型配置里的 `thinking` 开关：开启时把历史思考挂回
   /// 对应的 assistant 消息（DeepSeek 的 `reasoning_content`，带 tools 时必须回传，
@@ -352,13 +452,50 @@ class LlmAgentEngine implements AgentEngine {
     bool passBackReasoning = false,
   }) async {
     final List<LlmMessage> out = <LlmMessage>[];
-    final String systemPrompt = await _relayedSystemPrompt(context);
-    if (systemPrompt.trim().isNotEmpty) {
-      out.add(LlmMessage.system(systemPrompt));
-    }
-    // 上下文压缩摘要（M7d-4）：紧跟系统提示词，替代已被总结的历史前缀
-    if (context.contextSummary.trim().isNotEmpty) {
-      out.add(LlmMessage.system(context.contextSummary));
+    final List<LlmMessage> seeded = <LlmMessage>[
+      for (final Map<String, dynamic> raw in context.compactedContext)
+        if (LlmMessage.tryFromWire(raw) case final LlmMessage message) message,
+    ];
+    if (seeded.isNotEmpty) {
+      // ① 中转站产出的整份上下文（点位化）：它是**基底**（摘要 / 必读文件 / todo
+      //    段原样保留），但**系统提示词槽位由核心每轮刷新**——不然列表里那条永远
+      //    是"压缩那一刻的快照"，`spec select` 挂上的规范全文、工作空间提示词、
+      //    Spec 索引这些会话级内容在两次压缩之间就再也进不了上下文了。
+      //
+      //    规则（与 `docs/plugin-development.md` §5.3 的契约一致）：
+      //    - 首条是 system ⇒ 覆盖它的正文（插件放的是槽位，不是最终值）；
+      //    - 首条不是 system ⇒ 在最前插一条；
+      //    - 最新提示词为空串（`prompt.system` 明确要求"不带系统提示词"）⇒ 删掉槽位，
+      //      而不是把过期的那份留下。
+      final String fresh = await _relayedSystemPrompt(context);
+      final bool slotAtHead = seeded.first.role == LlmRole.system;
+      if (fresh.trim().isNotEmpty) {
+        if (slotAtHead) {
+          if (seeded.first.content != fresh) {
+            log?.call(
+              '中转站上下文的系统提示词已刷新'
+              '（${seeded.first.content.length} 字 → ${fresh.length} 字）',
+            );
+          }
+          seeded[0] = _replacingContent(seeded.first, fresh);
+        } else {
+          seeded.insert(0, LlmMessage.system(fresh));
+        }
+      } else if (slotAtHead) {
+        seeded.removeAt(0);
+      }
+      out.addAll(seeded);
+    } else {
+      // ② 内置路径：系统提示词 + 压缩摘要 + 跳过后缀的历史
+      //    （也兜"中转站列表整份解析不出来"的极端情况：退化成纯提示词 + 历史）
+      final String systemPrompt = await _relayedSystemPrompt(context);
+      if (systemPrompt.trim().isNotEmpty) {
+        out.add(LlmMessage.system(systemPrompt));
+      }
+      // 上下文压缩摘要（M7d-4）：紧跟系统提示词，替代已被总结的历史前缀
+      if (context.contextSummary.trim().isNotEmpty) {
+        out.add(LlmMessage.system(context.contextSummary));
+      }
     }
     final List<CoreMessageRef> toolBatch = <CoreMessageRef>[];
     // 本轮的正文段（0~多条）：**延后到"轮末"再落地**——"推理挂哪条消息"取决于本轮
@@ -379,17 +516,15 @@ class LlmAgentEngine implements AgentEngine {
     /// 两条都挂是重复，两条都不挂就 400。
     Future<void> flushRound() async {
       final bool roundHasTools = toolBatch.isNotEmpty;
-      final String reasoning = pendingReasoning.join('\n\n');
+      // 思考**逐字保留、逐字相接**：工具循环那一跳发出去的就是"本跳 thinking 增量
+      // 直接拼起来"的那一串。这里若 trim / 插分隔符，重建出来的 assistant 就与实发
+      // 的不是同一串字节——端点前缀缓存从这条起整段落空（见 _buildMessages 顶部说明）。
+      final String reasoning = pendingReasoning.join();
+      // 本轮正文：实发时它是**与 tool_calls 同一条** assistant 的 content；
+      // 重建时必须还原成同一条（拆成"正文一条 + tool_calls 一条"会让前缀错位）。
+      final StringBuffer roundBody = StringBuffer();
       for (final CoreMessageRef ref in pendingText) {
-        // 空正文跳过（只有附件、没有正文的消息在 asUser 分支里已带上了路径段）
-        if (ref.content.trim().isEmpty) continue;
-        out.add(
-          LlmMessage.assistant(
-            ref.content,
-            // 本轮有工具调用时，推理属于下面那条 tool_calls 消息（不能两处都挂）
-            reasoningContent: roundHasTools ? '' : reasoning,
-          ),
-        );
+        roundBody.write(ref.content);
       }
       pendingText.clear();
       if (roundHasTools) {
@@ -406,18 +541,25 @@ class LlmAgentEngine implements AgentEngine {
             LlmToolCall(
               id: callId,
               name: name,
-              arguments: jsonEncode(
-                ref.toolArguments ?? const <String, dynamic>{},
-              ),
+              // 参数串优先用**模型原文**（落库时存下来的那一份）：jsonEncode 的规范
+              // 形态与原文常常不同（空格 / 转义），差一个字节就等于换了前缀。
+              arguments: ref.toolArgumentsRaw.isNotEmpty
+                  ? ref.toolArgumentsRaw
+                  : jsonEncode(ref.toolArguments ?? const <String, dynamic>{}),
             ),
           );
           results.add(
             LlmMessage.toolResult(
-              // 上一轮中途中断时可能没有结果：补占位，避免 tool_calls 悬空
-              content: await gate.apply(
-                name,
-                ref.toolResult.isEmpty ? '(该工具调用未完成，没有结果)' : ref.toolResult,
-              ),
+              // 「送模型那一份」以落库的为准（会话状态前缀 + 超长门控都已定稿）；
+              // 空串 = 老数据，当场补一次门控（上一轮中途中断时的占位同理）
+              content: ref.toolResultForModel.isNotEmpty
+                  ? ref.toolResultForModel
+                  : await gate.apply(
+                      name,
+                      ref.toolResult.isEmpty
+                          ? '(该工具调用未完成，没有结果)'
+                          : ref.toolResult,
+                    ),
               toolCallId: callId,
             ),
           );
@@ -425,12 +567,18 @@ class LlmAgentEngine implements AgentEngine {
         out.add(
           LlmMessage(
             role: LlmRole.assistant,
-            content: '',
+            content: roundBody.toString(),
             toolCalls: calls,
             reasoningContent: reasoning,
           ),
         );
         out.addAll(results);
+      } else {
+        final String body = roundBody.toString();
+        // 空正文跳过（只有附件、没有正文的消息在 asUser 分支里已带上了路径段）
+        if (body.trim().isNotEmpty) {
+          out.add(LlmMessage.assistant(body, reasoningContent: reasoning));
+        }
       }
       toolBatch.clear();
       // 推理只属于它所在的那一轮（已经挂出去了）
@@ -454,7 +602,9 @@ class LlmAgentEngine implements AgentEngine {
         // 新的一拍思考 = 上一轮已经结束（本轮已有正文或工具卡时先落地）
         if (pendingText.isNotEmpty || toolBatch.isNotEmpty) await flushRound();
         if (passBackReasoning && ref.content.trim().isNotEmpty) {
-          pendingReasoning.add(ref.content.trim());
+          // 逐字保留（**不 trim**）：实发那一跳用的是端点原样回传的 thinking，
+          // 这里动一个空白字符，重建前缀就与实发的对不上。
+          pendingReasoning.add(ref.content);
         }
         continue;
       }

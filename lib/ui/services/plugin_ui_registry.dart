@@ -6,13 +6,16 @@ import 'package:tree_protocol/tree_protocol.dart';
 /// 职责三件：
 /// 1. **承载帧**——[handleFrame] 消费 `plugin_ui_manifest`（登记 / 整块替换槽位）、
 ///    `plugin_ui_update`（按 `slot_key` 局部替换视图，**整块替换、不做 diff**）与
-///    `plugin_status(destroyed)`（插件卸载 / 断连 ⇒ 注销其全部槽位）；
+///    `plugin_status`（`destroyed` **或** `disabled`：插件卸载 / 停用 / 条目被删除 /
+///    启动失败 / 进程退出 ⇒ 注销其全部槽位——"不在运行"就不该留着它的界面）；
 /// 2. **team 过滤**——限定团队的槽位（`team_id` 非空）只呈现当前 team 的
 ///    （[setTeam] 切换即自动过滤，fail-closed；被过滤的槽位只隐藏不删除，
 ///    切回该 team 立刻恢复）；未限定团队的槽位（`team_id` 为空）在任何 team 下
 ///    都呈现（见 [_visible]）；
 /// 3. **动作出口**——[dispatchAction] 把按钮点击 / 表单提交组装成
 ///    `plugin_ui_action` 帧，经 [actionSender]（UI 层接到 WebSocketService）发出。
+///    另外 [onConnectionChanged] 负责"断连即清"：注册表是内存态，离线后它反映的
+///    已不是核心的当前态（详见该方法）。
 ///
 /// 多插件可同时挂同一槽位类型：槽位以 `slot_key` 为键独立存储，互不覆盖；
 /// 排序规则见 [slotsOfKind]。
@@ -254,7 +257,15 @@ class PluginUiRegistry extends ChangeNotifier {
         return false;
       }
       final Map<String, dynamic> data = Map<String, dynamic>.from(raw);
-      if ((data['status'] ?? '').toString() != 'destroyed') {
+      final String status = (data['status'] ?? '').toString();
+      // `destroyed`（卸载 / 核心退出）与 `disabled`（条目停用 / 条目被删除 / 启动失败 /
+      // 进程已退出）都表示「这个插件的声明式界面不再是当前态」⇒ **立即注销它的全部槽位**：
+      // 否则卡片与面板会以"还在生效"的样子留在界面上（真机反馈的原现象）。
+      // 重新启用 / 重启后插件会重新发 `ui/manifest` 与 `ui.push`，界面自动回来，
+      // 所以没有"留着以防恢复"的必要。
+      // `registered` 不动槽位；**degraded 也是 registered**（心跳丢了但进程还活着）——
+      // 那一路恢复时插件**不会**重发声明，清了就再也回不来，因此绝不能顺手清。
+      if (status != 'destroyed' && status != 'disabled') {
         return false;
       }
       final String pluginId = (data['plugin_id'] ?? '').toString();
@@ -265,6 +276,21 @@ class PluginUiRegistry extends ChangeNotifier {
       return true;
     }
     return false;
+  }
+
+  /// WS 连接态变化（UI 层在连接建立 / 断开处调用）。
+  ///
+  /// **断连即清空注册表**：离线期间核心不会重放"已停用 / 已删除"插件的帧（`_disconnect`
+  /// 早已把它的声明从缓存里删了），留着旧槽位就是僵尸卡片与面板；重连时核心按**活着的
+  /// 插件的当前态**重放，注册表随即重建。
+  ///
+  /// 为什么在"断开"清、而不是"连上"清：重放帧可能先于前端的连接回调到达，
+  /// 连上再清会把刚重建的槽位又抹掉（顺序竞态）。
+  void onConnectionChanged(bool connected) {
+    if (connected) {
+      return;
+    }
+    clear();
   }
 
   /// 派发一次插件交互（按钮点击 / 表单提交）。

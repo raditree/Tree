@@ -598,12 +598,14 @@ void main() {
       expect(outcome.stdout, contains('plain-ascii'));
     });
 
-    test('timeout 不再终止命令：慢命令跑完，输出照常可读（M9 1.1）', () async {
+    test('没有硬超时：不设软超时（Duration.zero）时慢命令跑完，输出照常可读（M9 1.1）', () async {
+      // 2026-10-02 起 timeout > 0 是**软**超时（不杀进程，把活着的句柄交出去，见
+      // exec_soft_timeout_test.dart）；「没有硬超时」这条口径由 Duration.zero 表达。
       final ExecOutcome outcome = await io.exec(
         Platform.isWindows
             ? r'ping -n 3 127.0.0.1 | Out-Null; echo done'
             : 'sleep 2; echo done',
-        timeout: const Duration(milliseconds: 200),
+        timeout: Duration.zero,
       );
       expect(outcome.timedOut, isFalse, reason: '执行器取消硬超时：不再杀进程，也不标记超时');
       expect(outcome.exitCode, 0);

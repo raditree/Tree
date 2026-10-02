@@ -3,18 +3,76 @@
 /// 为什么**内嵌**而不是随包放资源文件：核心进程要 `dart compile exe` 成单文件，
 /// 运行时按相对路径找 `assets/` 在打包后非常脆弱（工作目录、安装位置都可能变）。
 /// 内嵌字符串保证"一定读得到"；首次进入某工作空间时把它们播种到该工作空间的
-/// `.self/spec/`，用户因此能按团队/工作空间各存一份、直接查看与手改。
+/// `.self/spec/`，用户可直接查看。副本由**核心维护**（升级时先备份成 `.bak.<n>`
+/// 再刷新，见 `SpecService.seedInto`）；要按工作空间定制请 `spec create` 另存一份。
+///
+/// 四条模板的正文首部都有同一段 [kSpecAlignFirstSection]（动手前先对齐用户语义）——
+/// 用 [kBuiltinSpecTexts] 取"原文 + 共享第 0 步"，别直接用 [kBuiltinSpecs] 落盘。
 library;
+
+/// 插件开发规范的 id。
+///
+/// 单独提出来是因为它有**副作用**：选中它会由核心把插件开发指南播种到工作空间
+/// （`builtin_spec_assets.dart`）——那份指南是 agent 唯一的协议口径，而工作空间类
+/// 工具读不到应用目录/仓库里的原件。
+const String kPluginCreatorSpecId = 'plugin-creator';
+
+/// **所有内置规范共享的第 0 步**：动手之前先跟用户对齐语义。
+///
+/// 为什么做成共享常量而不是抄进每条正文：这是一条**跨规范**的要求，抄四份就会改三处
+/// 忘一处；注入点由 [withAlignFirstStep] 统一放在 front matter **之后**（`parseSpecText`
+/// 只认文件开头的 front matter，放到前面会把元数据当成正文）。
+const String kSpecAlignFirstSection = r'''
+## 第 0 步：先对齐用户语义（任何规范都不得跳过）
+
+动手之前，先把「要做什么」跟用户对齐成**同一件事**。语义没对齐就开始改，是本体系里最贵的错误：
+方向错了，后面每一步都在还债。
+
+1. **先复述，再动手**：用一两句把任务复述成「目标 + 范围（做什么 / 不做什么）+ 验收标准 + 判型结论」，
+   请用户确认。**在用户确认理解一致之前，除了只读的事（读文件、查代码/文档/配置、侦察、提问）之外，
+   不得写文件、不得改配置、不得执行有副作用的命令。**
+2. **歧义必须问，不要猜**：目标含糊、范围边界不清、验收判据缺失、约束互相冲突、存在多种合理做法
+   （尤其是"改文案 / 改数据 / 改产品"这种量级不同的选择）→ 用 `ask_user_question` 问清楚：
+   一次问一件、给出候选答案（用户也可以自由输入）。挑一个"看起来合理"的默认就往下做，
+   等于替用户做了他没做的决定。
+3. **只能自己定的取舍要显式**：确实要自己判断的默认值，写成「默认取 X，理由是 Y，你要改就说」，
+   让用户有机会否决；**禁止把默认值藏进实现里**（等做完才发现方向不对）。
+4. **对齐结果留痕**：结论写进 plan 的「待确认项」与 todo（改了什么语义、谁确认的、什么时候）；
+   用户中途改语义 → 先更新 plan 与 todo 再继续，不静默合并、不"顺手带上"。
+5. **对齐 ≠ 拖时间**：待确认项同一轮列全、一次问完；能自己查到的（代码/文档/配置/历史）先查再问。
+   用户说"你看着办"时，仍要把你的理解复述一遍、给出默认取舍，然后才动手。
+''';
+
+/// 把 [kSpecAlignFirstSection] 插进规范正文的**最前面**（front matter 之后、第一个 `##` 之前）。
+///
+/// 没有 front matter 的文本直接前置到开头（[SpecService.parseSpecText] 对缺失 front matter 有兜底）。
+String withAlignFirstStep(String specText) {
+  final String normalized = specText.replaceAll('\r\n', '\n');
+  final String section = kSpecAlignFirstSection.trim();
+  if (!normalized.startsWith('---\n')) return '$section\n\n$normalized';
+  final int fence = normalized.indexOf('\n---', 4); // front matter 的收尾 `---`
+  if (fence <= 0) return '$section\n\n$normalized';
+  final int bodyStart = normalized.indexOf('\n', fence + 1); // 收尾之后的第一行
+  if (bodyStart < 0) return '$section\n\n$normalized';
+  final String head = normalized.substring(0, bodyStart + 1);
+  final String body = normalized
+      .substring(bodyStart + 1)
+      .replaceFirst(RegExp(r'^\n+'), '');
+  return '$head\n$section\n\n$body';
+}
 
 /// 内置 Spec 的固定顺序（索引与检索都按它置顶）。
 const List<String> kBuiltinSpecIds = <String>[
   'general-task',
   'hard-task',
   'team-meeting',
-  'plugin-creator',
+  kPluginCreatorSpecId,
 ];
 
-/// 内置 Spec 模板正文（id → markdown 全文，含 front matter）。
+/// 内置 Spec 的**正文原文**（id → markdown 全文，含 front matter）——不含共享的第 0 步。
+///
+/// 别直接拿它落盘/注入：真正要用的文本是 [kBuiltinSpecTexts]（原文 + 共享第 0 步）。
+/// 保留这份原文是为了让"共享段落"只有一份、不抄进四条正文（见 [kSpecAlignFirstSection]）。
 const Map<String, String> kBuiltinSpecs = <String, String>{
   'general-task': r'''
 ---
@@ -32,13 +90,13 @@ tags: [general, 多模块, 新功能, 重构, 多步, 单人串行]
 pinned: true
 builtin: true
 created_at: 0
-updated_at: 2026-09-26
-version: 5
+updated_at: 2026-10-02
+version: 6
 classification: 内部规范
 risk: medium
 changelog:
-  - "v6(2026-09-30): easy-task 移除、complex-task 更名 general-task（使用数据驱动）；spec 文件改落工作空间 .self/spec/"
-  - "v5(2026-09-26): M9 Q9 工具瘦身：spec 只保留 select/create/update（索引改为系统提示词注入、select 直接返回全文），同步修正正文里的 spec 工具引用"
+  - "v6(2026-10-02): 新增共享「第 0 步：先对齐用户语义」（动手前复述目标/范围/验收并取得用户确认；歧义先问不猜；只能自定的取舍要显式写默认值；对齐结果留痕）——由 kSpecAlignFirstSection 统一注入，正文不重复"
+  - "v5(2026-09-26): 工具瘦身：spec 只保留 select/create/update（索引改为系统提示词注入、select 直接返回全文），同步修正正文里的 spec 工具引用。"
   - "v4(2026-09-10): complex 改为单人串行、无分工；team/分工/成员验收全部移除，需要分工即升级 hard；新增 .self/plan/xxx.md 强制计划与用户审核；新增侦察（Recon）阶段并写入 .self/recon.md 作为 plan 上下文输入；把测试、回归、关键路径核对纳入工作流闭环"
   - "v3(2026-09-10): team 工具拆分后修正工具引用：派活用 message send_message/broadcast、等待交付 wait_for；删除 assign_task/view_member_*，验收改为直接 read agentspace/{member_id}/.self/activity.log 与产物"
   - "v2(2026-08-30): 修正工具名引用（set_todo_list/read/edit/write/terminal）；新增判型确认清单、成员产出验收标准、分工与冲突处理、中断恢复、汇报模板"
@@ -64,6 +122,9 @@ changelog:
 - 判型存疑时：若涉及团队并行，宁可上调 hard；若只是多文件但单人可收敛，走 general-task。
 
 ## 工作流（workflow）
+
+> **第 0 步先做完再进流程**（正文首部）：把目标 / 范围 / 验收标准复述给用户并取得确认；
+> 歧义先问不猜。未对齐之前，除只读侦察外不动任何东西。
 
 1. **任务分解**：调用 `set_todo_list` 将任务拆成 todo 项，拆分标准：
    - 初始化：初始 todo 可仅包含基本工作流，到每个实际流程中要求**先细化再执行**。
@@ -205,14 +266,13 @@ tags: [hard, 架构, 团队, 评审, 企业级, 高危, 会议, 工作空间, �
 pinned: true
 builtin: true
 created_at: 0
-updated_at: 2026-09-26
+updated_at: 2026-10-02
 version: 6
 classification: 内部规范
 risk: high
 changelog:
-  - "v6(2026-09-26): M9 §1.1 去静态超时：wait_for 无静态时长上限（改等成员心跳，未响应者列入 unresponsive 部分结果），正文三处「长超时」表述同步改写"
-  - "v6(2026-09-30): easy-task 移除、complex-task 更名 general-task（使用数据驱动）；spec 文件改落工作空间 .self/spec/"
-  - "v5(2026-09-26): M9 Q9 工具瘦身：spec 只保留 select/create/update（索引改为系统提示词注入、select 直接返回全文），同步修正正文里的 spec 工具引用"
+  - "v6(2026-10-02): 新增共享「第 0 步：先对齐用户语义」（动手前复述目标/范围/验收并取得用户确认；歧义先问不猜；只能自定的取舍要显式写默认值）——由 kSpecAlignFirstSection 统一注入；会议前必须先对齐议题与边界"
+  - "v5(2026-09-26): 工具瘦身：spec 只保留 select/create/update（索引改为系统提示词注入、select 直接返回全文），同步修正正文里的 spec 工具引用"
   - "v4(2026-09-10): 新增侦察（Recon）阶段并写入 agentspace/.hard/{task_id}/recon.md；新增 hard 专属工作空间（goal.md/meeting/spec.md/task.md/checklist.md）；会议前必须明确上下文并确立议程；明确 top agent 不直接处理业务文件；成员派活给长时预算并允许其带子团队走企业流程；工作流阶段化、准入准出、闭环测试"
   - "v3(2026-09-10): team 工具拆分后修正工具引用：会议召集/派活改用 message send_message、broadcast，成员产出经统一工作目录日志验收"
   - "v2(2026-08-30): 修正工具名引用（set_todo_list/ask_user_question/read）；新增判型确认清单、流水线阶段准入准出标准、决策记录模板（ADR）、风险评估框架、高危确认单"
@@ -240,13 +300,17 @@ changelog:
 
 ### 阶段 0：判型与 Spec 检索
 
-1. 初始化 todo：初始 todo 可仅包含基本工作流，到每个阶段时要求**先细化再执行**。
-2. 按上方判型表确认 hard。
-3. 对照系统提示词里的「Spec 索引」：
+1. **先对齐语义（不可跳过，见正文首部「第 0 步」）**：把「目标 + 范围（做什么 / 不做什么）+
+   验收标准 + 为什么判 hard」复述给用户并取得确认；目标含糊、边界不清、存在多种合理做法
+   （尤其"改文案 / 改数据 / 改产品"这种量级不同的选择）→ `ask_user_question` 问清后再往下走。
+   **未对齐之前只做只读侦察**：不改文件、不定议程、不召集会议。
+2. 初始化 todo：初始 todo 可仅包含基本工作流，到每个阶段时要求**先细化再执行**。
+3. 按上方判型表确认 hard。
+4. 对照系统提示词里的「Spec 索引」：
    - 命中适用 Spec → `spec select`（**直接返回全文**），作为 hard 约束执行；
    - 仅模糊命中 / 无命中 → 走本企业级流水线；
    - 若发现实际只需单人、无架构影响 → 按边界降级 general-task，并保留已建文档作为输入。
-4. 用 `set_todo_list` 建立全任务计划，包含各阶段评审点。
+5. 用 `set_todo_list` 建立全任务计划，包含各阶段评审点。
 
 ### 阶段 1：侦察（Recon）
 
@@ -275,7 +339,7 @@ changelog:
    - `goal.md`：背景、目标、范围、明确不做项、约束、验收标准、初始风险、干系人。
    - `spec.md`：Spec 检索结果、选中 Spec、规范约束、参考文档。
    - `task.md`：WBS/todo、角色与成员、文件所有权、接口约定、依赖、里程碑、评审点、成员时间预算。
-   - `checklist.md`：阶段准入准出、测试/回归、高危确认、验收三问、交付检查项。
+   - `checklist.md`：阶段准入准出、测试/回归、高危确认、交付检查项（**重要**，交付检查项是验收的关键，会议后要求**逐项细化**）。
    - `meeting/`：至少一个会议文件，如 `meeting/01-kickoff.md`；后续可 `meeting/02-review.md` 等。
    - `recon.md`：阶段 1 侦察笔记（已在阶段 1 生成）。
 2. 可选但推荐：`decisions/ADR.md`、`artifacts/`、`reports/`。
@@ -450,11 +514,12 @@ tags: [会议, 团队, 方案评审, 决策, 禁止开工]
 pinned: true
 builtin: true
 created_at: 0
-updated_at: 0
-version: 3
+updated_at: 2026-10-02
+version: 4
 classification: 内部规范
 risk: review
 changelog:
+  - "v4(2026-10-02): 新增共享「第 0 步：先对齐用户语义」（开会前先把议题/范围/决策边界与用户对齐；歧义先问不猜）——由 kSpecAlignFirstSection 统一注入"
   - "v3(2026-09-10): team 工具拆分后修正工具引用：召集/执行指令改用 message send_message、广播用 message broadcast，删除已不存在的 assign_task"
   - "v2(2026-08-30): 修正工具名引用（read）；新增适用场景判型、会议召集消息模板、成员发言模板、方案比较矩阵模板、会议纪要模板、无共识收敛机制"
   - "v1(2026-08-23): 初版：纳入版本化提示词体系，补充版本与审计元数据"
@@ -470,9 +535,13 @@ changelog:
 
 **何时不开会**：信息充分、方案唯一明确、可直接执行的任务（开会属浪费——直接走对应任务 Spec 执行）。
 
+**会前先对齐**（见正文首部「第 0 步」）：议题、范围、决策边界、要产出的结论，先与用户/发起人对齐，
+再召集——议题没对齐就开会，只会产出一份没人认账的纪要。
+
 ## 工作流（workflow）
 
-1. **会议召集（leader）**：明确会议主题与目标、参会成员、需要的背景材料，
+1. **会议召集（leader）**：先把议题、范围、决策边界与用户/发起人对齐（见正文首部「第 0 步」），
+   再明确会议主题与目标、参会成员、需要的背景材料，
    用 `message send_message`（全员则 `message broadcast`）邀请相关成员参会，消息按"会议召集消息模板"撰写，
    **明确标注"本次为会议讨论，请只给方案/意见，禁止改代码、跑命令、派活"**。
 2. **成员发言（成员）**：收到会议消息后，只围绕主题按"成员发言模板"给出：
@@ -571,7 +640,7 @@ leader 汇总方案时按维度对照（维度可按议题增删）：
 id: plugin-creator
 title: 插件开发（新建 / 改造 Tree 插件）
 task_type: general
-description: 新建或改造 Tree 插件（由本机核心 spawn 的 stdio JSON-RPC 2.0 子进程）：协议与站点细节一律以 docs/plugin-development.md 与源码为唯一口径，本规范给分工（本机自建 / 远端派活给本机 team 的 agent）、流程、验收与红线，避免两份口径漂移
+description: 新建或改造 Tree 插件（由本机核心 spawn 的 stdio JSON-RPC 2.0 子进程）：协议与站点细节一律以 plugin-development.md 与源码为唯一口径（选中本规范时核心会把指南播种到工作空间 .self/docs/），本规范给分工（本机自建 / 远端派活给本机 team 的 agent）、流程、验收与红线，避免两份口径漂移
 when:
   - 新建插件（从零写一个能用的插件）
   - 改造已有插件（新增点位订阅 / 执行站命令 / 前端槽位 / 配置项）
@@ -582,11 +651,12 @@ tags: [plugin, 插件, 分工, 指南, 自测]
 pinned: true
 builtin: true
 created_at: 0
-updated_at: 2026-10-01
-version: 1
+updated_at: 2026-10-02
+version: 2
 classification: 内部规范
 risk: medium
 changelog:
+  - "v2(2026-10-02): 新增共享「第 0 步：先对齐用户语义」（动手前复述目标/范围/验收并取得用户确认；歧义先问不猜；默认值显式）——由 kSpecAlignFirstSection 统一注入"
   - "v1(2026-10-01): 初版：插件开发（新建/改造）专用规范——单一口径（指南+代码）+ 本机/远端分工 + 流程与验收红线"
 ---
 
@@ -607,26 +677,36 @@ changelog:
 
 ## 唯一口径（先记住这一条）
 
-**协议、站点、点位、命令、配置、调试手段的权威只有两处**：`docs/plugin-development.md` 与**源码**。
+**协议、站点、点位、命令、配置、调试手段的权威只有两处**：`plugin-development.md` 与**源码**。
 
+- **你要读的指南在工作空间里**：`.self/docs/plugin-development.md`——**选中本规范时核心已把原件播种进来**
+  （内容与原件逐字一致；这份副本由核心维护，别手改，改了下一次 select 会被覆盖）。开工先 `read` 它。
+  若不存在：先 `spec select spec_ids:['plugin-creator']` 触发播种；仍没有 = 核心所在机器上缺原件，走下面第 4 条的索取流程。
+- 指南**原件**在核心所在机器上（你多半看不到，知道它在哪就行）：发行布局 = 应用目录（`Tree.exe` /
+  `tree_core.exe` 同级）的 `plugins/plugin-development.md`，用户可用「设置 → 插件开发 → 打开插件开发说明」打开；
+  开发态 = 仓库 `docs/plugin-development.md`。
 - 本规范**不复制**这些细节——不抄方法清单、不抄点位表、不抄命令表、不抄骨架代码：抄一份就会有两份口径，
-  改一边忘一边。要点总结请看指南（尤其 §1 一分钟上手与三条铁律、§3 站点体系与内置点位、§4 隔离语义、
-  §5 中转站、§6 执行站、§7 广播与前端槽位、§9 配置、§10 调试与测试）；可运行样例看 `examples/plugins/`
-  （`minimal_plugin.py` 最小骨架、`sample_plugin.py` 全功能参考，两个都能 `--selftest` 用假核心自测）。
-- **id 与命令名以代码为准**（指南可能滞后一个提交，代码不会）：点位 id 看
-  `packages/tree_core/lib/src/plugin/station_points.dart`，命令名看 `execute_mounts.dart` / `station_ids.dart`。
-- 找不到指南与示例时：**不要凭记忆或猜测写协议**。先想办法拿到（见下节分工），拿不到就问用户。
+  改一边忘一边。指南里：§1 一分钟上手 + 三条铁律 + 最小骨架、§3 站点体系与内置点位、§4 隔离语义、
+  §5 中转站、§6 执行站、§7 广播与前端槽位、§9 配置、§10 调试与排错。
+- **源码口径只在工作空间恰是 Tree 源码仓库时才读得到**：点位 id 看
+  `packages/tree_core/lib/src/plugin/station_points.dart`，命令名看 `execute_mounts.dart` / `station_ids.dart`，
+  可运行样例在 `examples/plugins/`（最小骨架 + 全功能参考，都能 `--selftest` 用假核心自测）。
+  读不到源码时**以指南副本为准**，把拿不准的点列成"待确认"去问用户——**别凭记忆或猜测写协议**。
+- 指南拿不到（播种失败 / 被人删了 / 核心那台机器缺原件）时的索取流程：
+  1. 请用户把 `plugin-development.md` **拖进对话输入框**——附件会落到工作空间 `.input/<日期>/`，你就能 `read`；
+  2. 或请用户打开应用内指南（设置 → 插件开发），把相关章节贴进对话；
+  3. 拿到之前只做**不依赖协议的部分**（需求澄清、骨架规划、自测方案），别硬写报文。
 
 ## 分工与交付落点（先定这一条，再动手）
 
-插件是**由本机核心进程 spawn 的本机进程**：脚本必须落在**本机核心能看到的路径**（相对路径按核心进程的工作目录
-解析，桌面端即 `plugins/`；也可直接写绝对路径）。因此：
+插件是**由本机核心进程 spawn 的本机进程**：脚本必须落在**核心所在机器**上、且路径核心能访问——
+相对路径按核心进程的工作目录解析（桌面端即应用目录的 `plugins/`），**绝对路径最稳**。因此：
 
 | 你所在的工作空间 | 怎么做 |
 |---|---|
-| **本机**，且能看到 `docs/plugin-development.md` / `examples/plugins/`（Tree 源码工作空间） | **自己构建**：读指南 → 骨架先行 → 逐步加能力 → 自测 → 实机挂载验证（完整流程见「工作流」） |
-| **远端（SSH）** | **不要在远端落地插件**：你写下的文件在远端主机，本机核心既看不到也 spawn 不起来。<br>改为**派活**：用 `message send_message` 把需求交给**本机 team 的 agent**（其工作空间里有仓库与指南）构建，<br>你负责：写清需求与验收标准 → 提供必要上下文 → 等交付 → 验收与回传；对方按本规范（同一份口径）执行。<br>没有可派活的 agent → 与用户确认：由用户在本机执行，或把工作换到本机工作空间再做。 |
-| **本机**，但看不到指南与示例 | 先取得指南（问用户 / 请仓库工作空间的 agent 提供），确认口径后再动手；不要凭记忆写协议。 |
+| **本机**（工作空间在本机文件系统上） | **自己构建**：`read .self/docs/plugin-development.md` → 骨架先行 → 逐步加能力 → 自测（假核心）→ 给出交付说明（脚本路径 + `plugins.yaml` 条目，用**绝对路径**，由用户注册启用）。完整流程见「工作流」 |
+| **远端（SSH）** | **不要在远端落地插件**：你写下的文件在远端主机，本机核心既看不到也 spawn 不起来。<br>改为**派活**：用 `message send_message` 把需求交给**工作空间在本机**的 agent 构建（对方读同一份指南、按本规范执行），<br>你负责：写清需求与验收标准 → 提供必要上下文 → 等交付 → 验收与回传。<br>没有可派活的 agent → 与用户确认：由用户在本机执行，或把工作换到本机工作空间再做。 |
+| **工作空间恰是 Tree 源码仓库** | 额外便利：能直接读 `docs/plugin-development.md` 与 `examples/plugins/`（最小骨架 + 全功能参考，都能 `--selftest`）当参照 |
 
 派活时（远端侧）消息里必须带：插件目标与触发场景、要订的**点位**、要提供的**工具**、要不要 **UI 槽位**、
 配置需求（id / command / args / env / scope / granularity）、**验收标准**、以及"脚本要落到本机核心可见路径"这一硬约束。
@@ -634,8 +714,12 @@ changelog:
 
 ## 工作流（workflow）
 
+> **第 0 步先做完再进流程**（正文首部）：把目标 / 范围 / 验收标准复述给用户并取得确认；
+> 歧义先问不猜。未对齐之前，除只读侦察（读指南、看代码、查配置）外不动任何东西。
+
 1. **定位**：确认自己在哪一侧（本机自建 / 远端派活）；确认交付路径（本机 `plugins/` 或绝对路径）。
-2. **读指南**：按「唯一口径」读完相关章节 + 对照示例脚本；把要用的点位 id / 命令名从**代码**里确认一遍。
+2. **读指南**：`read .self/docs/plugin-development.md`（不存在就先 `spec select spec_ids:['plugin-creator']`
+   触发播种；仍没有则走「唯一口径」的索取流程），读完相关章节，照着 §1 的最小骨架起步。
 3. **计划**：多步任务先 `set_todo_list`，plan 落 `.self/plan/{YYYYMMDD}-{task_slug}/plan.md`；
    发现要改核心（宿主/协议）→ 按判型边界换规范，不顺手改宿主。
 4. **骨架先行**（本机自建）：最小骨架跑通握手与心跳，再加一个能力、验一个能力；
@@ -681,15 +765,27 @@ changelog:
 - **协议报错形状**：协议级错误与业务级失败（`ok:false` + 可读原因）是两套，别混。
 - **旧核心（点位化之前）**：迁移口径见指南 §11，别按记忆里的旧行为写。
 - **远端工作空间**：脚本不要只写远端；交付路径与派活对象先确认（见「分工与交付落点」）。
-- **拿不到指南**：不要硬写；先问用户或找有仓库的工作空间取口径。
+- **拿不到指南**（`.self/docs/plugin-development.md` 不存在）：不要硬写协议；走「唯一口径」第 4 条的索取流程
+  （请用户把文件拖进对话 / 贴章节）。核心回报 `assets[].action=missing` 时，把它给的 `searched` 目录一并报给用户。
 - **插件崩溃 / 进程退出**：核心判不可用并 fail-open；修完必须回到实机验证重跑，不靠"应该好了"。
 
 ## 注意事项
 
 - 先跑通骨架再加功能，一次一个能力；协议报文写错通常不会报"语法错误"，只表现为"没反应"，所以自测要覆盖报文形状。
+- 工作空间里的 `.self/docs/plugin-development.md` 是**核心播种的副本**（对应核心版本）：别手改（会被覆盖）；
+  怀疑过时（例如刚升级核心）就重新 `spec select` 触发一次播种，或让用户看应用目录 / 仓库里的原件。
 - 本规范与指南是**同一口径的两半**：本规范管分工/流程/验收，指南管协议与站点细节。发现两边不一致，
   以指南与代码为准，并把不一致反馈出来（该改指南就改指南）。
 - 本规范只管插件侧；核心侧改动另起任务并按判型挂 general-task / hard-task。
 - 交付汇报先结论后细节；遗留项必须给原因，不允许无声消失。
 - 踩到的坑与稳定做法及时 `spec create` 沉淀，别只留在对话里。''',
+};
+
+/// 内置 Spec 的**实际文本**（id → 原文 + 共享第 0 步），落盘、兜底、注入一律用它。
+///
+/// 派生一次、处处同源：播种到 `.self/spec/`、读不到文件时的兜底、`select` 回给模型的全文，
+/// 三者必须是同一份文本（否则"文件是源"就成了两套口径）。测试里钉了这条一致性。
+final Map<String, String> kBuiltinSpecTexts = <String, String>{
+  for (final String id in kBuiltinSpecIds)
+    if (kBuiltinSpecs[id] != null) id: withAlignFirstStep(kBuiltinSpecs[id]!),
 };

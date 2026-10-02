@@ -291,7 +291,29 @@ class FileTreeStore implements TreeStore {
     final CoreSession? session = this.session(agentId, sessionId);
     if (session == null) return false;
     session.compactedSummary = summary;
+    // 内置摘要路径接管：中转站产出的列表作废（两者互斥，见 CoreSession）
+    session.compactedContext = <Map<String, dynamic>>[];
     session.compactedMessageCount = messageCount < 0 ? 0 : messageCount;
+    session.updatedAt = DateTime.now().millisecondsSinceEpoch;
+    _writeSession(session);
+    return true;
+  }
+
+  @override
+  bool setCompactedContext(
+    String agentId,
+    String sessionId, {
+    required List<Map<String, dynamic>> context,
+    required int coveredMessageCount,
+  }) {
+    final CoreSession? session = this.session(agentId, sessionId);
+    if (session == null) return false;
+    session.compactedContext = context;
+    // 中转站路径接管：内置摘要作废（下一次内置压缩会重新总结当前前缀）
+    session.compactedSummary = '';
+    session.compactedMessageCount = coveredMessageCount < 0
+        ? 0
+        : coveredMessageCount;
     session.updatedAt = DateTime.now().millisecondsSinceEpoch;
     _writeSession(session);
     return true;

@@ -95,7 +95,7 @@ void main() {
       );
     });
 
-    test('思考 → 正文 → 工具卡：推理归 tool_calls 那条（正文那条不重复挂）', () async {
+    test('思考 → 正文 → 工具卡：正文与 tool_calls 合成同一条（= 实发那一份）', () async {
       final List<LlmMessage> sent = await build(<CoreMessageRef>[
         const CoreMessageRef(role: 'user', content: '读一下 a.txt'),
         const CoreMessageRef(role: 'agent', content: '我先看一眼', kind: 'thinking'),
@@ -112,14 +112,22 @@ void main() {
         ),
       ]);
       expectToolCallerHasReasoning(sent);
-      final LlmMessage textAssistant = sent.firstWhere(
-        (LlmMessage m) => m.role == LlmRole.assistant && m.toolCalls.isEmpty,
+      final LlmMessage caller = sent.lastWhere(
+        (LlmMessage m) =>
+            m.role == LlmRole.assistant && m.toolCalls.isNotEmpty,
       );
-      expect(textAssistant.content, '好，我读一下。', reason: '正文顺序不变');
+      // 实发那一跳里，"本轮正文"与 tool_calls 就是**同一条** assistant 的
+      // content + tool_calls；重建若把它拆成"正文一条 + tool_calls 一条"，
+      // 从这条起消息序列就与实发的不同，端点前缀缓存整段落空。
+      expect(caller.content, '好，我读一下。', reason: '本轮正文属于这条 assistant');
+      expect(caller.reasoningContent, '我先看一眼');
       expect(
-        textAssistant.reasoningContent,
+        sent.where(
+          (LlmMessage m) =>
+              m.role == LlmRole.assistant && m.toolCalls.isEmpty,
+        ),
         isEmpty,
-        reason: '推理不重复挂（同一轮的推理只属于那条 tool_calls 消息）',
+        reason: '正文不再单拆一条（拆开 = 换了一份前缀）',
       );
     });
 

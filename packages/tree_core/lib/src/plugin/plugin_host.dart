@@ -98,6 +98,15 @@ class PluginHost {
       host._exitCode = code;
       host._failPending('插件进程已退出（exit=$code）');
     });
+    // stdin 的写队列在插件死亡 / 管道被关时**以异常收尾**（实测 Windows：
+    // `SocketException: Write failed (OS Error: 管道正在被关闭。, errno = 232)`）。
+    //
+    // 关键点是它**不会同步抛**：连写 200 帧实测 0 次同步异常，错误只在 IOSink 的
+    // `done` 上异步冒出来。没人听就是**未捕获的异步异常**——测试里判当前用例失败
+    // （`plugin_ws_test` 的「进程退出 ⇒ disabled」用例被它按负载偶发打红），生产里
+    // 直接打到 zone（根 zone 会终止进程）。所以这里挂一个**常驻**处理器：它在进程
+    // 建起来时就挂上，覆盖此后任意时刻的第一笔写失败（晚挂会漏掉先到的错误）。
+    unawaited(host._process.stdin.done.catchError(host._onWriteFailure));
     try {
       final Map<String, dynamic> hello = await host._request(
         'hello',
@@ -179,7 +188,34 @@ class PluginHost {
     return text.length <= 2000 ? text : text.substring(text.length - 2000);
   }
 
-  bool get isClosed => _closed || _exitCode != null;
+  bool get isClosed => _closed || _exitCode != null || _channelError != null;
+
+  /// **通道断了**的可读原因（stdout 已关闭 / stdin 写失败）；null = 通道还在。
+  ///
+  /// 与 [_closed]（显式关停）、[_exitCode]（进程退出）并列，但表达的是另一件事：
+  /// "进程可能还活着，可我们已经听不见它、或者说不进去了"。三者都让 [isClosed]
+  /// 为真——核心 → 插件只能走 stdin、插件 → 核心只能走 stdout，通道断了它就不再
+  /// 可用，快照口径也该显示 disabled。
+  String? get channelError => _channelError;
+
+  String? _channelError;
+
+  /// 标记通道断了：**只标一次**，并让在途请求立刻拿到可读失败。
+  ///
+  /// 刻意**不置 [_closed]**：那个字段是 `close()` 的去重开关，在这里置真会让插件
+  /// 进程再也不会被 `close()` 收掉（通道断了 ≠ 进程已经结束）。
+  void _markChannelDead(String reason) {
+    if (_channelError != null) return;
+    _channelError = reason;
+    _failPending(reason);
+  }
+
+  /// stdin 写失败（插件已死 / 管道被关）。
+  ///
+  /// 这是 [start] 里 `stdin.done` 处理器的落点，也是 [_write] 同步异常的落点。
+  void _onWriteFailure(Object error) {
+    _markChannelDead('插件 ${config.id} 的 stdin 写入失败（通道已断）：$error');
+  }
 
   /// 插件当前暴露的工具。
   Future<List<PluginToolInfo>> listTools({
@@ -356,7 +392,9 @@ class PluginHost {
   }) {
     if (isClosed) {
       return Future<Map<String, dynamic>>.error(
-        PluginException('插件 ${config.id} 已关闭'),
+        // 通道断了（stdout 关闭 / stdin 写失败）时**说实话**：不是"没请求过"，
+        // 而是"这个插件已经说不上话了"，原因直接回给调用方。
+        PluginException(_channelError ?? '插件 ${config.id} 已关闭'),
       );
     }
     final int id = ++_nextId;
@@ -382,7 +420,15 @@ class PluginHost {
   }
 
   void _write(Map<String, dynamic> message) {
-    _process.stdin.writeln(jsonEncode(message));
+    // 通道已断：再写只会再喂一次未捕获的异步错误（见 [start] 里的 done 处理器）。
+    if (_channelError != null) return;
+    try {
+      _process.stdin.writeln(jsonEncode(message));
+    } catch (error) {
+      // 异步失败走 `done`（见 [start]）；这里只兜同步路径：`stdin` 被 `close()`
+      // 之后再写会同步抛 StateError。
+      _onWriteFailure(error);
+    }
   }
 
   /// 入站报文的**三类判别**（顺序即优先级）：
@@ -498,7 +544,7 @@ class PluginHost {
     }
   }
 
-  void _onDone() => _failPending('插件 ${config.id} 的输出流已关闭');
+  void _onDone() => _markChannelDead('插件 ${config.id} 的输出流已关闭');
 
   void _failPending(String message) {
     final List<Completer<Map<String, dynamic>>> waiting = _pending.values

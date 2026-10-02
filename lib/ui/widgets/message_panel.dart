@@ -186,6 +186,9 @@ class _MessagePanelState extends State<MessagePanel> {
     // 若不清空，前端会残留旧的 working（无 API 调用却显示工作中）。
     // 清空后由后端在 WS 建立时补推真实的 agent_status（仍在工作的才重新标记）。
     _webSocket.onConnectionChange = (bool connected) {
+      // 插件声明式 UI 由核心重放重建：断连时先清空注册表，避免"离线期间插件被停用 /
+      // 条目被删除"留下的僵尸卡片与面板（详见 PluginUiRegistry.onConnectionChanged）。
+      PluginUiRegistry.instance.onConnectionChanged(connected);
       if (connected && mounted) {
         setState(() {
           _workingAgents.clear();

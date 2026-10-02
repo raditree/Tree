@@ -37,6 +37,13 @@ abstract final class BuiltinTools {
   static const String edit = 'edit';
   static const String grep = 'grep';
   static const String terminal = 'terminal';
+
+  /// terminal 缺省**软**超时（秒）：超过就转后台 hook（**不杀进程**）。
+  ///
+  /// 取值权衡：本地执行没有硬超时，卡住的命令（等输入/死锁）只能靠它让工具调用
+  /// 返回；但 hook 提示会打断节奏，用户也明确不希望"前台命令动辄转后台"，所以给得
+  /// 偏宽——真长任务应该由模型显式 hook=true，或调小 timeout_seconds。
+  static const int terminalSoftTimeoutSeconds = 300;
   static const String setTodoList = 'set_todo_list';
   static const String askUserQuestion = 'ask_user_question';
 
@@ -231,11 +238,17 @@ abstract final class BuiltinTools {
       description:
           '在工作空间根目录执行 shell 命令（Windows 用 PowerShell，其他平台用 sh）。'
           '用于运行构建/测试/git/文件管理。stdout/stderr 都会被自动捕获，'
-          '无需追加 2>&1。**没有静态超时**：命令跑多久都会等（本地判据是进程还活着）；'
-          '只有 SSH 会话心跳丢失（会话失联）时才会不终止地转为后台任务，并返回 task_id'
-          '与查询方式。预计很长的命令（构建/全量测试/长脚本）请用 hook=true 后台执行：'
-          '立即拿到 task_id，输出实时写进日志文件，命令结束后会自动收到'
-          '[terminal hook] 提示，届时用 read 读取日志继续任务。'
+          '无需追加 2>&1。**没有硬超时**：不会因为"太久"就杀掉命令（本地判据是'
+          '进程还活着，SSH 判据是心跳没丢）。但有两条"不终止、转后台"的兜底：'
+          '① 本地同步命令超过 timeout_seconds（缺省 $terminalSoftTimeoutSeconds s）仍未结束；'
+          '② SSH 心跳丢失（会话失联）。两者都会返回 task_id，命令本身继续在跑。'
+          '预计很长的命令（构建/全量测试/长脚本）请直接用 hook=true 后台执行：'
+          '立即拿到 task_id，输出实时写进日志文件，命令结束后自动注入'
+          '[terminal hook] 提示（含退出码与日志尾部）。'
+          '**后台（hook）模式下的正确做法**：不要干等——可以接着做别的事（读文件、'
+          '改代码、跑别的命令），或者**直接结束本轮**（结束 tool loop，本轮不再调用'
+          '任何工具）；任务结束时会把完成提示注入会话，自动把你唤醒，那时再用 read'
+          '看完整日志继续任务。'
           // Windows shell 口径：换 PowerShell 后模型很容易照着 cmd 写法生成命令
           // （>nul、&&、2>&1），这几条是实测踩过的坑，写进描述让它少走弯路。
           'Windows 上是 PowerShell（系统自带 5.1；装了 PowerShell 7 就是 7）：'
@@ -249,11 +262,20 @@ abstract final class BuiltinTools {
         'type': 'object',
         'properties': <String, dynamic>{
           'command': <String, dynamic>{'type': 'string'},
-          // 这里**没有** timeout_seconds：M9 §1.1 起 duration 不再是判据。
-          // 兼容：老调用方仍传该参数时被忽略（命令跑多久都等，见 _terminal）。
+          // timeout_seconds（2026-10-02 恢复，语义与 M9 之前不同）：**软**超时——
+          // 到点不杀进程，只把命令转成后台 hook 任务并返回 task_id（见 _terminal）。
+          'timeout_seconds': <String, dynamic>{
+            'type': 'number',
+            'description':
+                '软超时（秒，缺省 $terminalSoftTimeoutSeconds）：超过后**不杀进程**，'
+                '命令转后台（hook 模式）并返回 task_id，结束时自动唤醒你；'
+                '0 = 永不软超时（一直等）。',
+          },
           'hook': <String, dynamic>{
             'type': 'boolean',
-            'description': 'true = 后台执行（长任务用），立即返回 task_id',
+            'description':
+                'true = 后台执行（长任务用），立即返回 task_id；'
+                '本轮不必等它，可以直接结束本轮等唤醒',
           },
           'output_file': <String, dynamic>{
             'type': 'string',
@@ -264,7 +286,9 @@ abstract final class BuiltinTools {
           'hook_action': <String, dynamic>{
             'type': 'string',
             'enum': <String>['status', 'cancel'],
-            'description': '查询/取消后台任务（需配合 task_id）',
+            'description':
+                '查询/取消后台任务（需配合 task_id）：'
+                'status = 状态 + 日志尾部，cancel = 杀整棵进程树',
           },
           'task_id': <String, dynamic>{
             'type': 'string',
@@ -627,7 +651,8 @@ abstract final class BuiltinTools {
         'task_id: ${task.id}\n'
         '日志：${task.logRelative}（可用 read 查看进度，'
         '或 hook_action=status + task_id 查询）\n'
-        '命令结束后会自动收到 [terminal hook] 完成提示。',
+        '本轮你可以接着做别的事，或者**直接结束本轮**（结束 tool loop）——'
+        '命令结束后会自动注入 [terminal hook] 完成提示把你唤醒。',
       );
     }
 
@@ -635,16 +660,24 @@ abstract final class BuiltinTools {
     if (command.isEmpty) {
       return const ToolOutcome('command 不能为空', isError: true);
     }
-    // M9 §1.1：**没有任何静态时长上限**——本地执行的活性 = 进程存活，活着就永不
+    // M9 §1.1：**没有任何硬性时长上限**——本地执行的活性 = 进程存活，活着就永不
     // 超时；SSH 只在心跳丢失（会话失联）时以 SshLinkStaleException 显式失败，
-    // 然后转 hook 后台（见 _terminalStale）。schema 里也不再声明 timeout_seconds；
-    // 老调用方仍传该参数时直接忽略，不改变行为。
+    // 然后转 hook 后台（见 _terminalStale）。
+    // 2026-10-02 补上**软**超时（LocalExecStillRunning：不杀进程、只转后台）——它是
+    // "命令卡在等输入 / 跑得太久"时唯一能让工具调用返回的出口（现场事故见
+    // docs/known-issues.md #7）。只有接了 hook 才开软超时：没 hook 就登记不了后台
+    // 任务，老行为（一直等）反而更诚实。
     if (isCancelled?.call() ?? false) {
       return const ToolOutcome('已取消：命令未执行', isError: true);
     }
+    final Duration softTimeout = hooks == null
+        ? Duration.zero
+        : _softTimeout(invocation);
     final ExecOutcome outcome;
     try {
-      outcome = await io.exec(command);
+      outcome = await io.exec(command, timeout: softTimeout);
+    } on LocalExecStillRunning catch (still) {
+      return _terminalStillRunning(invocation, io, command, still, hooks);
     } on SshLinkStaleException catch (error) {
       // M9 1.1：terminal 的「超时」判据是**活性**（心跳丢失 / 会话失联），不是静态时长。
       // 本地执行的活性 = 进程存活，所以正常运行永远走不到这里；只有 SSH 心跳连续丢失
@@ -686,6 +719,63 @@ abstract final class BuiltinTools {
     return ToolOutcome(buffer.toString().trimRight(), isError: !outcome.ok);
   }
 
+  /// terminal 的软超时：`timeout_seconds`（秒）；0/负数 = 永不软超时。
+  static Duration _softTimeout(ToolInvocation invocation) {
+    final Object? raw = invocation.arguments['timeout_seconds'];
+    final double? seconds = raw is num
+        ? raw.toDouble()
+        : (raw is String ? double.tryParse(raw.trim()) : null);
+    if (seconds == null) {
+      return const Duration(seconds: terminalSoftTimeoutSeconds);
+    }
+    if (seconds <= 0) return Duration.zero;
+    return Duration(milliseconds: (seconds * 1000).round());
+  }
+
+  /// 本地命令软超时（仍在跑）时的结果：**不终止、不重跑**，登记成后台 hook 任务。
+  ///
+  /// 与 [_terminalStale]（SSH 失联）的区别：这里是**本机**进程，句柄在我们手上——
+  /// 输出照常收、退出码拿得到、`hook_action=cancel` 杀得掉，所以能像 hook=true 一样
+  /// 收尾并唤醒 agent。
+  static Future<ToolOutcome> _terminalStillRunning(
+    ToolInvocation invocation,
+    WorkspaceIO io,
+    String command,
+    LocalExecStillRunning still,
+    TerminalHooks? hooks,
+  ) async {
+    final String reason =
+        '同步执行超过 ${still.elapsed.inSeconds}s 仍未结束（pid=${still.running.pid}）';
+    final StringBuffer buffer = StringBuffer()
+      ..writeln('[terminal hook] $reason ⇒ 已转后台（hook 模式）。')
+      ..writeln('**没有终止进程，也没有重跑命令**：那条命令仍在运行。');
+    if (hooks == null) {
+      buffer.writeln('后台任务未接入：无法登记，请改用更短的命令或 hook=true 重试。');
+      return ToolOutcome(buffer.toString().trimRight(), isError: true);
+    }
+    final HookTask task = await hooks.adoptRunning(
+      io: io,
+      agentId: invocation.agentId,
+      sessionId: invocation.sessionId,
+      command: command,
+      running: still.running,
+      outputFile: _string(invocation, 'output_file'),
+      note: reason,
+    );
+    buffer
+      ..writeln('task_id: ${task.id}')
+      ..writeln('日志：${task.logRelative}（命令结束时写入完整输出与退出码）')
+      ..writeln('本轮不必继续等它——你可以：')
+      ..writeln('1) 接着做别的事（命令在后台继续跑）；')
+      ..writeln(
+        '2) **直接结束本轮**（结束 tool loop）：任务结束时会自动注入'
+        ' [terminal hook] 完成提示把你唤醒；',
+      )
+      ..writeln('3) 想看进度：terminal hook_action=status + task_id，或 read 该日志；')
+      ..writeln('4) 想终止它：terminal hook_action=cancel + task_id。');
+    return ToolOutcome(buffer.toString().trimRight());
+  }
+
   /// SSH 会话心跳丢失（会话失联）时的软超时结果（M9 1.1）。
   ///
   /// 关键取舍：**不终止、不重跑**。执行器侧判失活只是「不再等它」，远端进程可能仍在
@@ -716,6 +806,10 @@ abstract final class BuiltinTools {
     );
     buffer
       ..writeln('已转为后台任务（hook 模式），本轮不必继续等待。')
+      ..writeln(
+        '注意：这条任务**不会自动唤醒你**（本机拿不到远端进程的退出），'
+        '链路恢复后自己回来确认。',
+      )
       ..writeln('task_id: ${task.id}')
       ..writeln('日志：${task.logRelative}')
       ..writeln('如何查询/续看：')

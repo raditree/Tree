@@ -83,6 +83,7 @@ void main() {
               String? model,
               double? temperature,
               int? maxTokens,
+              List<Object?>? tools,
             }) async {
               llmCalls.add(<String, dynamic>{
                 'agent_id': agentId,
@@ -92,6 +93,7 @@ void main() {
                 'model': model,
                 'temperature': temperature,
                 'max_tokens': maxTokens,
+                'tools': tools,
               });
               if (prompt == '端点会拒绝') {
                 return <String, dynamic>{'error': '端点不支持 json_object'};

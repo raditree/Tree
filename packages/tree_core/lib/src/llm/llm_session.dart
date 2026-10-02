@@ -396,6 +396,8 @@ class LlmSession {
           callId: call.id,
           name: call.name,
           arguments: arguments,
+          // 模型原始参数串随事件带出：落库后历史回灌要逐字复用它（缓存前缀）
+          rawArguments: call.arguments,
         );
         ToolOutcome outcome;
         try {
@@ -413,18 +415,23 @@ class LlmSession {
         } catch (error) {
           outcome = ToolOutcome('工具执行异常：$error', isError: true);
         }
-        // UI 与落库都拿**完整结果**（AgentToolEnd）；只有送模型的那一份要过门控
+        // 状态前缀与门控都属于"送模型那一份"：先算出来，再随事件一起交出去
+        // （落库要存的就是这一份——它同时是**下一轮重建历史时的唯一权威**，
+        // 逐字复现才有可能命中端点前缀缓存）。
+        final String status = statusText?.call() ?? '';
+        final String forModel = await _gateResult(call.name, outcome.content);
+        final String modelContent = status.isEmpty ? forModel : '$status$forModel';
+        // UI 与落库的"完整结果"口径不变（AgentToolEnd.result）；送模型的那一份过门控
         yield AgentToolEnd(
           id: toolId,
           name: call.name,
           result: outcome.content,
+          modelContent: modelContent,
         );
-        final String status = statusText?.call() ?? '';
-        final String forModel = await _gateResult(call.name, outcome.content);
         inFlight.add(
           LlmMessage.toolResult(
             // 状态只进模型上下文；UI 的工具卡片仍显示原始结果（AgentToolEnd）
-            content: status.isEmpty ? forModel : '$status$forModel',
+            content: modelContent,
             toolCallId: call.id,
           ),
         );
@@ -480,47 +487,17 @@ class LlmSession {
     }
   }
 
-  /// 把上下文裁到预算内。
-  ///
-  /// 预算 = max_seqlen − 期望输出 − 512 余量。裁剪**只在 user 消息边界**进行，
-  /// 因此绝不会把 assistant 的 tool_calls 与其 tool 结果拆散（那会让端点直接
-  /// 报 400）。system 与最后一轮永不裁剪。
+  /// 把上下文裁到预算内（**预算硬裁**；实现在 [fitContextToBudget]）。
   List<LlmMessage> _fitContext(
     List<LlmMessage> messages, {
     required void Function(int dropped) onTrimmed,
-  }) {
-    final int budget = maxSeqlen - (maxOutputTokens ?? 4096) - 512;
-    if (budget <= 0 || messages.isEmpty) return messages;
-    int total = messages.fold<int>(
-      0,
-      (int sum, LlmMessage m) => sum + m.estimatedTokens(scale: tokenScale),
-    );
-    if (total <= budget) return messages;
-
-    final List<LlmMessage> result = List<LlmMessage>.of(messages);
-    final int head = result.first.role == LlmRole.system && result.length > 1
-        ? 1
-        : 0;
-    int dropped = 0;
-    while (total > budget) {
-      int boundary = -1;
-      for (int i = head + 1; i < result.length; i++) {
-        if (result[i].role == LlmRole.user) {
-          boundary = i;
-          break;
-        }
-      }
-      // 找不到下一个 user 边界（只剩最后一轮）就不裁，宁可让端点去报超长
-      if (boundary < 0) break;
-      for (int i = head; i < boundary; i++) {
-        total -= result[i].estimatedTokens(scale: tokenScale);
-      }
-      dropped += boundary - head;
-      result.removeRange(head, boundary);
-    }
-    if (dropped > 0) onTrimmed(dropped);
-    return result;
-  }
+  }) => fitContextToBudget(
+    messages,
+    maxSeqlen: maxSeqlen,
+    maxOutputTokens: maxOutputTokens,
+    tokenScale: tokenScale,
+    onTrimmed: onTrimmed,
+  );
 }
 
 /// 端点报错文案是否在说"上下文超限"（Q1-③）。
@@ -568,6 +545,55 @@ bool looksLikeContextOverflow(String message) {
       text.contains('messages') ||
       text.contains('请求');
   return inputWord && text.contains('token');
+}
+
+/// 把上下文裁到预算内（**预算硬裁**）。
+///
+/// 预算 = `maxSeqlen − 期望输出 − 512` 余量。裁剪**只在 user 消息边界**进行，
+/// 因此绝不会把 assistant 的 tool_calls 与其 tool 结果拆散（那会让端点直接报 400）。
+/// system 与最后一轮永不裁剪；找不到下一个 user 边界就停手，宁可让端点去报超长。
+///
+/// **为什么是顶层函数而不是 `LlmSession` 的私有方法**：引擎拼"压缩可复用前缀"
+/// （`LlmAgentEngine.wireRequestFor`）时必须过**同一份**修剪——只有"引擎会给的那份"
+/// 与"真会发出去的那份"逐字一致，压缩插件的 `llm.call` 才可能命中端点前缀缓存、
+/// 也才不会把已经被裁掉的内容再喂给总结模型。
+List<LlmMessage> fitContextToBudget(
+  List<LlmMessage> messages, {
+  required int maxSeqlen,
+  required int? maxOutputTokens,
+  required double tokenScale,
+  void Function(int dropped)? onTrimmed,
+}) {
+  final int budget = maxSeqlen - (maxOutputTokens ?? 4096) - 512;
+  if (budget <= 0 || messages.isEmpty) return messages;
+  int total = messages.fold<int>(
+    0,
+    (int sum, LlmMessage m) => sum + m.estimatedTokens(scale: tokenScale),
+  );
+  if (total <= budget) return messages;
+
+  final List<LlmMessage> result = List<LlmMessage>.of(messages);
+  final int head = result.first.role == LlmRole.system && result.length > 1
+      ? 1
+      : 0;
+  int dropped = 0;
+  while (total > budget) {
+    int boundary = -1;
+    for (int i = head + 1; i < result.length; i++) {
+      if (result[i].role == LlmRole.user) {
+        boundary = i;
+        break;
+      }
+    }
+    if (boundary < 0) break;
+    for (int i = head; i < boundary; i++) {
+      total -= result[i].estimatedTokens(scale: tokenScale);
+    }
+    dropped += boundary - head;
+    result.removeRange(head, boundary);
+  }
+  if (dropped > 0) onTrimmed?.call(dropped);
+  return result;
 }
 
 /// 工具调用增量拼接缓冲：同一 index 的 id/name 只取首次出现的非空值，

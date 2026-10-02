@@ -168,6 +168,21 @@ class BuiltinPluginCatalog {
       granularity: 'team',
       scope: <String, dynamic>{},
     ),
+    BuiltinPluginSpec(
+      id: 'compact',
+      name: '上下文压缩',
+      description:
+          '内置压缩器（Python）：接管 `system.relay.context.compact`，把长会话压成'
+          '「摘要（背景 / 轨迹 / 改动产出文件）+ 必读文件（≤11 个，精确行范围，'
+          '以 read 工具调用的形式拼进上下文）+ todo 快照」，最近一轮原文原样保留。'
+          '任何一步失败都会退回核心内置压缩，不会让上下文丢失。'
+          '打开后会调用 Python 运行 plugins/compact_plugin.py；'
+          '自检：`python plugins/compact_plugin.py --selftest`。',
+      script: 'compact_plugin.py',
+      runtime: 'python',
+      granularity: 'team',
+      scope: <String, dynamic>{},
+    ),
   ];
 
   /// 脚本查找目录的显式覆盖（测试注入；null = 默认的"可执行文件同级 + 开发态回退"）。

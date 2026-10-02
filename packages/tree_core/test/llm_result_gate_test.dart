@@ -4,20 +4,20 @@ import 'package:tree_core/tree_core.dart';
 /// M9/Q1-②：超长工具结果门控。
 ///
 /// 口径：阈值按 **token 估算**（默认 8000），超过就把完整结果写进工作空间
-/// `.self/results/<yyyyMMdd_HHmmss>_<3位序号>.<工具名>.result`，送模型的换成提示
-/// （字符数 / 阈值 / 路径 / 查看建议 / 前 300 字符预览）；写不进去则退化为截断。
+/// `.self/results/<工具名>_<内容指纹>.result`（**名字只由工具名 + 结果原文决定**，
+/// 同一份结果永远同一个路径 → 每轮重建历史的提示逐字相同、也不会反复堆文件），
+/// 送模型的换成提示（字符数 / 阈值 / 路径 / 查看建议 / 前 300 字符预览）；
+/// 写不进去则退化为截断。
 void main() {
   ToolResultGate gate({
     ResultRedirectWriter? writer,
     double tokenScale = defaultTokenScale,
     int thresholdTokens = ToolResultGate.defaultThresholdTokens,
-    DateTime? now,
   }) => ToolResultGate(
     agentId: 'agt_1',
     thresholdTokens: thresholdTokens,
     tokenScale: tokenScale,
     writer: writer,
-    clock: () => now ?? DateTime(2026, 3, 4, 5, 6, 7),
   );
 
   group('阈值判定', () {
@@ -50,15 +50,14 @@ void main() {
         },
       );
       final String notice = await subject.apply('read', huge);
-      expect(
-        writes.single,
-        'agt_1|.self/results/20260304_050607_001.read.result|16000|true',
-      );
+      final String path =
+          '.self/results/read_${ToolResultGate.fingerprint('read', huge)}.result';
+      expect(writes.single, 'agt_1|$path|16000|true');
       expect(notice, contains('[工具结果已重定向]'));
       expect(notice, contains('read'));
       expect(notice, contains('16000 字符'));
       expect(notice, contains('> 800 阈值'));
-      expect(notice, contains('.self/results/20260304_050607_001.read.result'));
+      expect(notice, contains(path));
       expect(notice, contains('read 工具'));
       expect(notice, contains('terminal 工具'));
       expect(notice, contains(huge.substring(0, 300)));
@@ -75,18 +74,22 @@ void main() {
       expect(writes, 0);
     });
 
-    test('连续重定向的序号递增（同一次 run 内）', () async {
+    test('路径只由 (工具名, 原文) 决定：跨 run 同内容同路径', () async {
       final List<String> paths = <String>[];
-      final ToolResultGate subject = gate(
+      // 每次 run 一个门控实例（生产就是这样）：同一份历史结果重新过门控时，
+      // 必须落到**同一个**文件——否则提示里的路径逐轮变化，前缀缓存全丢。
+      ToolResultGate eachRun() => gate(
         thresholdTokens: 10,
         writer: (String a, String path, String c) async => paths.add(path),
       );
-      await subject.apply('read', 'x' * 100);
-      await subject.apply('grep', 'x' * 100);
-      expect(paths, <String>[
-        '.self/results/20260304_050607_001.read.result',
-        '.self/results/20260304_050607_002.grep.result',
-      ]);
+      await eachRun().apply('read', 'x' * 100); // 第 1 轮
+      await eachRun().apply('read', 'x' * 100); // 第 2 轮：同一份结果重新过门控
+      await eachRun().apply('grep', 'x' * 100); // 换个工具 → 换个名字
+      final String read =
+          '.self/results/read_${ToolResultGate.fingerprint('read', 'x' * 100)}.result';
+      final String grep =
+          '.self/results/grep_${ToolResultGate.fingerprint('grep', 'x' * 100)}.result';
+      expect(paths, <String>[read, read, grep]);
     });
 
     test('工具名里的不安全字符被替换（MCP 命名空间工具也能落文件）', () async {
@@ -96,7 +99,11 @@ void main() {
         writer: (String a, String path, String c) async => paths.add(path),
       );
       await subject.apply('mcp__files/read:1', 'x' * 100);
-      expect(paths.single, endsWith('.mcp__files_read_1.result'));
+      expect(
+        paths.single,
+        '.self/results/mcp__files_read_1_'
+        '${ToolResultGate.fingerprint('mcp__files/read:1', 'x' * 100)}.result',
+      );
     });
   });
 

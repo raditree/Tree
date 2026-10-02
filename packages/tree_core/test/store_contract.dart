@@ -231,6 +231,56 @@ void runStoreContract(String label, TreeStore Function() create) {
       expect(store.session(agent.id, session.sessionId)?.compacted, isFalse);
     });
 
+    test('setCompactedContext：中转站列表可落盘可读回，且与摘要互斥', () {
+      final CoreAgent agent = store.createAgent(name: 'a');
+      final CoreSession session = store.createSession(agent.id)!;
+      expect(
+        store.setCompactedContext(
+          agent.id,
+          'ses_missing',
+          context: const <Map<String, dynamic>>[],
+          coveredMessageCount: 1,
+        ),
+        isFalse,
+      );
+      // 先走内置路径留下摘要，再让中转站接管：摘要必须被清掉
+      store.setCompacted(
+        agent.id,
+        session.sessionId,
+        summary: '内置摘要',
+        messageCount: 2,
+      );
+      expect(
+        store.setCompactedContext(
+          agent.id,
+          session.sessionId,
+          context: const <Map<String, dynamic>>[
+            <String, dynamic>{'role': 'system', 'content': '中转站上下文'},
+            <String, dynamic>{'role': 'user', 'content': '最近一条'},
+          ],
+          coveredMessageCount: 5,
+        ),
+        isTrue,
+      );
+      final CoreSession? reloaded = store.session(agent.id, session.sessionId);
+      expect(reloaded?.compactedContext, hasLength(2));
+      expect(reloaded?.compactedContext.first['content'], '中转站上下文');
+      expect(reloaded?.compactedSummary, isEmpty, reason: '列表接管即清摘要');
+      expect(reloaded?.compactedMessageCount, 5);
+      expect(reloaded?.compacted, isTrue, reason: '列表非空也算已压缩');
+      // 反向：内置路径再接管时列表必须被清掉
+      store.setCompacted(
+        agent.id,
+        session.sessionId,
+        summary: '又回到内置摘要',
+        messageCount: 6,
+      );
+      final CoreSession? again = store.session(agent.id, session.sessionId);
+      expect(again?.compactedContext, isEmpty, reason: '摘要接管即清列表');
+      expect(again?.compactedSummary, '又回到内置摘要');
+      expect(again?.compactedMessageCount, 6);
+    });
+
     test('appendMessage：按写入顺序保存并推进会话/agent 的 updated_at', () async {
       final CoreAgent agent = store.createAgent(name: 'a');
       final int agentUpdated = agent.updatedAt;

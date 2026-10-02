@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:tree_local_exec/tree_local_exec.dart';
 
@@ -9,9 +10,10 @@ import 'builtin_specs.dart';
 
 /// 一份 Spec（任务型规范）：元数据 + 正文。
 ///
-/// 内置模板来自内嵌常量（[kBuiltinSpecs]）并**播种到工作空间**（`.self/spec/<id>.md`），
-/// 自定义 Spec 同样落在这里（front matter + 三段正文）——文件才是真源，因此用户
-/// 可以手改、可以按团队/工作空间各存一份，也不需要额外的索引库。
+/// 内置模板来自内嵌常量（[kBuiltinSpecTexts]）并**播种到工作空间**（`.self/spec/<id>.md`），
+/// 自定义 Spec 同样落在这里（front matter + 三段正文）——文件是这个工作空间里的读取源，
+/// 不需要额外的索引库；内置副本由核心维护（升级会被刷新，见 [SpecService.seedInto]），
+/// 想按工作空间定制请用 `spec create` 另存一份。
 class SpecDocument {
   SpecDocument({
     required this.id,
@@ -90,6 +92,18 @@ class SpecService {
 
   final void Function(String message)? log;
 
+  /// 选中规范后播种它的**随附文档**（id → 工作空间内的文件）的钩子。
+  ///
+  /// 为什么是钩子而不是直接调用：随附文档的原件在**核心所在机器**上（发行布局的
+  /// 应用目录、开发态的仓库），解析与搬运是 plugin 侧的知识（
+  /// `plugin/plugin_guide.dart`）；Spec 服务只负责"选中后把该带的文件带上"。
+  /// 由核心启动时接线（`server/core_server.dart`）；未接线 = 本服务不管这件事。
+  Future<List<Map<String, dynamic>>> Function(
+    WorkspaceIO io,
+    List<String> specIds,
+  )?
+  seedAssetsFor;
+
   /// Q9 索引快照：agentId → 已渲染的索引文本（见 [indexSnapshot]）。
   final Map<String, String> _indexText = <String, String>{};
 
@@ -115,20 +129,78 @@ class SpecService {
   /// 不同团队各有一份、互不影响；内置模板在首次进入工作空间时播种到这里。
   static const String specDir = '.self/spec';
 
-  /// 首次进入某工作空间时播种内置模板（**缺失才写**，不覆盖用户改动）。
+  /// 首次进入某工作空间时播种内置模板，并在核心升级后**刷新**它们。
   ///
-  /// 工作空间不可用（SSH 未连上 / 目录不可读）时不抛，只记日志——内置模板始终
-  /// 有内嵌常量兜底，规范不会因此整体消失。
-  Future<void> seedInto(WorkspaceIO io) async {
+  /// 语义（用户 2026-10-02 定稿）：**内置规范的工作空间副本 = 核心管理的快照**——升级要让新文案
+  /// 真正到达已有工作空间，而不是"只对新工作空间生效"（工作空间文件优先于内嵌模板，只写缺失就
+  /// 等于永远吃旧文案）。规则：
+  /// - 文件缺失 → 写入（`created`）；
+  /// - 已存在且与模板一致 → 不写（`unchanged`，不刷 mtime）；
+  /// - 已存在但不同、且副本 `version` **不高于**模板 → 先备份成 `<id>.md.bak.<n>` 再写新模板
+  ///   （`refreshed`：手改内容进备份，不丢）；
+  /// - 副本 `version` **高于**模板（来自更新的核心 / 别人手改过）→ 保留不动 + 记日志，绝不降级
+  ///   （`kept_newer`）。
+  ///
+  /// 要按工作空间自定义，请用 `spec create` 另存一份（`spec update` 本来就拒绝内置 id）。
+  /// 工作空间不可用（SSH 未连上 / 目录不可读）时不抛，只记日志——内置模板始终有内嵌常量兜底。
+  /// 返回值是逐步动作（`id` / `action` / 备份名 / 版本），供日志与测试核对。
+  Future<List<Map<String, dynamic>>> seedInto(WorkspaceIO io) async {
+    final List<Map<String, dynamic>> notes = <Map<String, dynamic>>[];
     final Set<String> existing = await _specFileNames(io);
     for (final String id in kBuiltinSpecIds) {
-      if (existing.contains('$id.md')) continue;
+      final String template = kBuiltinSpecTexts[id] ?? '';
+      if (!existing.contains('$id.md')) {
+        try {
+          await io.writeFile('$specDir/$id.md', template);
+          notes.add(<String, dynamic>{'id': id, 'action': 'created'});
+        } catch (error) {
+          log?.call('写内置 Spec 失败（$id）：$error');
+        }
+        continue;
+      }
       try {
-        await io.writeFile('$specDir/$id.md', kBuiltinSpecs[id] ?? '');
+        final String current = (await io.readFile('$specDir/$id.md')).text;
+        if (_sameSpecText(current, template)) {
+          notes.add(<String, dynamic>{'id': id, 'action': 'unchanged'});
+          continue;
+        }
+        final int fileVersion =
+            parseSpecText(current, fallbackId: id, builtin: true).version;
+        final int templateVersion =
+            parseSpecText(template, fallbackId: id, builtin: true).version;
+        if (fileVersion > templateVersion) {
+          log?.call(
+            '内置 Spec 副本比模板新，保留不动：$id（副本 v$fileVersion > 模板 v$templateVersion）',
+          );
+          notes.add(<String, dynamic>{
+            'id': id,
+            'action': 'kept_newer',
+            'file_version': fileVersion,
+            'template_version': templateVersion,
+          });
+          continue;
+        }
+        final int index = await _nextBackupIndex(io);
+        final String backup = '$id.md.bak.$index';
+        await io.writeFile('$specDir/$backup', current);
+        await io.writeFile('$specDir/$id.md', template);
+        // 同版本但内容不同也要说清楚（否则日志里"v6 → v6"看着像 bug）
+        final String versionNote = fileVersion == templateVersion
+            ? '同版本（v$fileVersion）但内容不同'
+            : 'v$fileVersion → v$templateVersion';
+        log?.call('内置 Spec 已升级：$id（$versionNote，旧副本备份为 $backup）');
+        notes.add(<String, dynamic>{
+          'id': id,
+          'action': 'refreshed',
+          'backup': backup,
+          'file_version': fileVersion,
+          'template_version': templateVersion,
+        });
       } catch (error) {
-        log?.call('写内置 Spec 失败（$id）：$error');
+        log?.call('刷新内置 Spec 失败（$id）：$error');
       }
     }
+    return notes;
   }
 
   /// 一键重置：把 `.self/spec/` 下每个规范文件备份成 `.bak.<n>`（保留旧备份）后
@@ -200,7 +272,7 @@ class SpecService {
 
   /// 索引（REST `GET /api/agents/{id}/specs` 与 memory/team 工具共用）。
   ///
-  /// **工作空间文件是源**：先播种缺失的内置模板，再读 `.self/spec/*.md`；内置模板
+  /// **工作空间文件是源**：先播种（并刷新升级过的）内置模板，再读 `.self/spec/*.md`；内置模板
   /// 仍在内存里兜底（工作空间不可读 / 内置文件被删时补上）。顺序固定为内置在前、
   /// 其余按 id，保证索引稳定可预测。
   Future<List<SpecDocument>> index(String agentId, WorkspaceIO? io) async {
@@ -213,7 +285,7 @@ class SpecService {
     }
     for (final String id in kBuiltinSpecIds) {
       if (byId.containsKey(id)) continue;
-      final String? text = kBuiltinSpecs[id];
+      final String? text = kBuiltinSpecTexts[id];
       if (text != null) {
         byId[id] = parseSpecText(text, fallbackId: id, builtin: true);
       }
@@ -239,6 +311,15 @@ class SpecService {
   /// 单条「适用条件」摘要的字符上限（照旧实现：超 80 字符截断加省略号）。
   static const int whenSummaryLimit = 80;
 
+  /// 所有 Spec 的**共同前置**（渲染进索引段，注入系统提示词）。
+  ///
+  /// 为什么放在这里：自定义规范不在我们的文件里，改不到它的正文——索引段是"所有 spec"
+  /// 唯一的公共落点。内置规范另有正文首部的「第 0 步」（`kSpecAlignFirstSection`），
+  /// 两处口径必须一致（测试钉住）。
+  static const String indexCommonNotice =
+      '所有 Spec 共同要求：**动手前先与用户对齐语义**（复述目标/范围/验收 → 用户确认；'
+      '歧义先问不猜；只能自己定的取舍要显式写默认值）。未对齐之前，只做只读侦察，不写文件、不改配置。';
+
   /// 把索引渲染成系统提示词里的列表（格式照旧实现）：
   /// 形如 `- id [task_type] 标题（内置）（适用: when 摘要）`，id 自带反引号。
   static String renderIndex(
@@ -246,9 +327,11 @@ class SpecService {
     int limit = indexLimit,
   }) {
     if (specs.isEmpty) {
-      return '（暂无 Spec；任务完成后可用 spec create 沉淀）';
+      return '$indexCommonNotice\n\n（暂无 Spec；任务完成后可用 spec create 沉淀）';
     }
-    final StringBuffer buffer = StringBuffer();
+    final StringBuffer buffer = StringBuffer()
+      ..writeln(indexCommonNotice)
+      ..writeln();
     for (final SpecDocument spec in specs.take(limit)) {
       String when = spec.when.join('；');
       if (when.length > whenSummaryLimit) {
@@ -264,6 +347,36 @@ class SpecService {
       buffer.writeln('- …其余 $rest 条可用 `spec select` 直取（需已知 id）');
     }
     return buffer.toString().trimRight();
+  }
+
+  /// 把系统提示词依赖的两处快照**先热起来**（拼 `AgentRunContext` 之前调用）。
+  ///
+  /// 为什么必须有它：⑦ 索引与 ⑧ 已选全文都是**异步**补热的——冷的时候 [indexSnapshot]
+  /// 只给内置模板、[selectedSpecsSnapshot] 给空串。若这个"冷 → 热"的切换落在会话中途，
+  /// `[0] system` 的字节就变了，而它在消息序列的最前面 ⇒ **整条前缀（含全部历史）作废**，
+  /// 端点前缀缓存直接 0 命中（2026-10-02 现场：核心重启后第一轮用冷串 32k，后台扫完
+  /// 下一轮 68k 全部 miss；两处快照实测差 7,702 字，其中 ⑧ 章 7,388 字）。详见
+  /// `docs/known-issues.md` #8。
+  ///
+  /// 只在**冷**的时候真的扫一次，热了立刻返回：热路径零成本；SSH 下是"每进程每 agent
+  /// 一次"的网络往返，换来的是会话中途前缀不再漂移。
+  ///
+  /// 失败不抛：退回冷形态（与接线前行为一致），只记日志。
+  Future<void> ensureSnapshots(String agentId, String sessionId) async {
+    final Future<WorkspaceIO?> Function(String agentId)? resolve = ioFor;
+    if (resolve == null) return;
+    try {
+      if (!_indexText.containsKey(agentId)) {
+        await refreshIndex(agentId, await resolve(agentId));
+      }
+      if (sessionId.trim().isEmpty) return;
+      final String key = _selectedKey(agentId, sessionId);
+      if (!_selectedText.containsKey(key)) {
+        await refreshSelectedSpecs(agentId, sessionId, await resolve(agentId));
+      }
+    } catch (error) {
+      log?.call('预热 Spec 快照失败（$agentId/$sessionId）：$error');
+    }
   }
 
   /// 供系统提示词用的索引快照（**同步**：提示词是同步拼装的）。
@@ -364,10 +477,13 @@ class SpecService {
       '$agentId|$sessionId';
 
   /// 内置模板（同步，不碰工作空间；清单与顺序以 [kBuiltinSpecIds] 为准）。
+  ///
+  /// 用 [kBuiltinSpecTexts]（原文 + 共享第 0 步）而不是 [kBuiltinSpecs] 原文：播种落盘、
+  /// 读不到文件时的兜底、`select` 回给模型的全文，三者必须逐字一致。
   static List<SpecDocument> _builtinDocuments() => <SpecDocument>[
     for (final String id in kBuiltinSpecIds)
-      if (kBuiltinSpecs[id] != null)
-        parseSpecText(kBuiltinSpecs[id]!, fallbackId: id, builtin: true),
+      if (kBuiltinSpecTexts[id] != null)
+        parseSpecText(kBuiltinSpecTexts[id]!, fallbackId: id, builtin: true),
   ];
 
   /// 单份详情（REST `GET /api/agents/{id}/specs/{specId}`）。
@@ -377,13 +493,13 @@ class SpecService {
     String specId,
   ) async {
     final String id = specId.trim();
-    // 工作空间文件优先（内置模板也落了盘，用户的编辑因此生效）；
-    // 文件缺失时再用内嵌模板兜底。
+    // 工作空间文件优先（内置模板也落了盘，一个工作空间的副本优先于内嵌模板；
+    // 副本与模板的一致性由 seedInto 的刷新语义维护）；文件缺失时用内嵌模板兜底。
     if (io != null) {
       final SpecDocument? file = await _readCustom(io, id);
       if (file != null) return file;
     }
-    final String? builtinText = kBuiltinSpecs[id];
+    final String? builtinText = kBuiltinSpecTexts[id];
     if (builtinText != null) {
       return parseSpecText(builtinText, fallbackId: id, builtin: true);
     }
@@ -430,15 +546,56 @@ class SpecService {
       };
     }
     store.setSelectedSpecs(invocation.agentId, invocation.sessionId, ids);
+    // 随附文档（如插件开发指南）随 select 播种：正文引用的文档必须在**工作空间里**，
+    // agent 的 read 才读得到。播种失败不阻断选择（全文已在本次结果里），如实回报。
+    final List<Map<String, dynamic>> assets = await _seedAssets(io, ids);
     return <String, dynamic>{
       'action': 'select',
       'spec_ids': ids,
       'count': selected.length,
       'specs': selected,
-      'note': ids.isEmpty
-          ? '已取消全部 Spec 选择（selected_spec_ids 已清空），后续重构 context 将不再注入任何 Spec。'
-          : '已挂 hook，且全文已在本次结果里（不需要再 read）；实际注入发生在下次重构 context（compact/新建会话）。',
+      if (assets.isNotEmpty) 'assets': assets,
+      'note': (ids.isEmpty
+              ? '已取消全部 Spec 选择（selected_spec_ids 已清空），后续重构 context 将不再注入任何 Spec。'
+              : '已挂 hook，且全文已在本次结果里（不需要再 read）；实际注入发生在下次重构 context（compact/新建会话）。') +
+          _assetsNote(assets),
     };
+  }
+
+  /// 播种选中规范的随附文档（钩子未接线 / 抛错都不影响 select 本身）。
+  Future<List<Map<String, dynamic>>> _seedAssets(
+    WorkspaceIO io,
+    List<String> ids,
+  ) async {
+    final Future<List<Map<String, dynamic>>> Function(
+      WorkspaceIO,
+      List<String>,
+    )?
+    seeder = seedAssetsFor;
+    if (seeder == null || ids.isEmpty) return const <Map<String, dynamic>>[];
+    try {
+      return await seeder(io, ids);
+    } catch (error) {
+      log?.call('播种随附文档失败：$error');
+      return const <Map<String, dynamic>>[];
+    }
+  }
+
+  /// 把随附文档的结果说成一句人能读的话（成功给路径与动作，失败给原因与兜底）。
+  String _assetsNote(List<Map<String, dynamic>> assets) {
+    final List<String> parts = <String>[];
+    for (final Map<String, dynamic> asset in assets) {
+      final String action = (asset['action'] ?? '').toString();
+      final String path = (asset['path'] ?? '').toString();
+      if (action == 'missing' || action == 'failed') {
+        parts.add(
+          '随附文档未就绪（$path）：${asset['error']}——按该规范正文的兜底流程向用户索取原件',
+        );
+      } else {
+        parts.add('随附文档已就绪：$path（$action）');
+      }
+    }
+    return parts.isEmpty ? '' : '；${parts.join('；')}';
   }
 
   Future<Map<String, dynamic>> _create(
@@ -618,6 +775,25 @@ class SpecService {
     } catch (_) {
       return <String>{};
     }
+  }
+
+  /// 两份规范文本是否**逐行相同**。
+  ///
+  /// 为什么不直接比字符串：`WorkspaceIO.readFile` 把行 `join('\n')` 返回（结尾换行被丢掉），
+  /// 直接比会永远不等——于是每次建索引都白刷一遍、还永远报不出 `unchanged`。
+  /// CRLF / LF 的差异同样不算"变了"（仓库里是 LF，Windows 上手存过的副本可能是 CRLF）。
+  static bool _sameSpecText(String a, String b) {
+    final List<String> left = const LineSplitter().convert(
+      a.replaceAll('\r\n', '\n'),
+    );
+    final List<String> right = const LineSplitter().convert(
+      b.replaceAll('\r\n', '\n'),
+    );
+    if (left.length != right.length) return false;
+    for (int i = 0; i < left.length; i++) {
+      if (left[i] != right[i]) return false;
+    }
+    return true;
   }
 
   /// 下一个可用的 `.bak.<n>` 序号（同目录已有备份时顺延，绝不覆盖旧备份）。

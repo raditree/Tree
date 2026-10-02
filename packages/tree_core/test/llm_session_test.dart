@@ -337,7 +337,6 @@ void main() {
       agentId: 'agt',
       thresholdTokens: 800,
       writer: write,
-      clock: () => DateTime(2026, 3, 4, 5, 6, 7),
     );
 
     Future<List<AgentEvent>> runWith(
@@ -375,20 +374,16 @@ void main() {
       // 界面/落库：完整结果（AgentToolEnd）
       expect(events.whereType<AgentToolEnd>().single.result, huge);
       // 文件：完整原文 + 约定路径
-      expect(
-        writes.single,
-        'agt|.self/results/20260304_050607_001.read.result|4000',
-      );
+      final String path =
+          '.self/results/read_${ToolResultGate.fingerprint('read', huge)}.result';
+      expect(writes.single, 'agt|$path|4000');
       // 模型：提示 + 前 300 字符预览
       final LlmMessage forModel = transport.requests[1].messages.firstWhere(
         (LlmMessage m) => m.isToolResult,
       );
       expect(forModel.content, contains('[工具结果已重定向]'));
       expect(forModel.content, contains('4000 字符'));
-      expect(
-        forModel.content,
-        contains('.self/results/20260304_050607_001.read.result'),
-      );
+      expect(forModel.content, contains(path));
       expect(forModel.content, contains(huge.substring(0, 300)));
       expect(forModel.content, contains('read'));
       expect(forModel.content.length, lessThan(1000));

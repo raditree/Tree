@@ -26,6 +26,7 @@ import '../plugin/plugin_config_store.dart';
 import '../plugin/station_scope.dart';
 import '../settings/core_settings.dart';
 import '../settings/ssh_config.dart';
+import '../spec/builtin_spec_assets.dart';
 import '../spec/spec_service.dart';
 import '../store/atomic_file.dart';
 import '../store/memory_store.dart';
@@ -374,6 +375,10 @@ class CoreServer {
     if (specService != null) {
       final SpecService specs = specService;
       specs.ioFor = specIoFor;
+      // 选中内置规范时要播种到工作空间的**随附文档**（插件开发指南）：原件在核心
+      // 所在机器上（发行布局的应用目录 plugins/、开发态的仓库 docs/），解析与搬运
+      // 归 plugin 侧，所以在这里接线。取不到原件时只记日志 + 如实回报，不阻断 select。
+      specs.seedAssetsFor = seedBuiltinSpecAssets;
       // agent 不属于这个 SpecService 的 store（同进程里可能有另一个核心/测试服务器）
       // 时不注入：否则会把别的 store 的索引写进当前提示词。
       String binding(CoreAgent agent) => specs.store.agent(agent.id) == null
@@ -390,6 +395,13 @@ class CoreServer {
           : specs.selectedSpecsSnapshot(agent.id, sessionId);
       server._selectedSpecsBinding = selectedBinding;
       selectedSpecsProvider = selectedBinding;
+      // 拼上下文前先把 ⑦/⑧ 快照热起来：冷热形态切换会让 `[0] system` 换字节，
+      // 而它在消息最前面 ⇒ 整条前缀缓存作废（known-issues #8）。
+      server.conversation.promptStatePrewarm =
+          (String agentId, String sessionId) async {
+            if (specs.store.agent(agentId) == null) return;
+            await specs.ensureSnapshots(agentId, sessionId);
+          };
     }
     // 判死与恢复都要**可见**、要能触发补发（不静默）：
     // - 判死：写错误日志 + 关连接（前端会自动重连，这就是"触发重连"）；
@@ -578,7 +590,8 @@ class CoreServer {
   /// - `system.relay.llm.handle`：插件可接管某一跳的 LLM 响应（含流式回填）；
   /// - `system.relay.llm.request`：插件可改写即将投出的请求体；
   /// - `system.relay.prompt.system`：插件可改写本轮系统提示词；
-  /// - `system.relay.context.compact`：插件可产出摘要（替代内置摘要器）。
+  /// - `system.relay.context.compact`：插件可产出**整份新上下文**（规划也归它，
+  ///   替代内置 compact）。
   ///
   /// 全部 fail-open：无订阅者 / 未回填 / 异常 ⇒ 与接线前**逐字一致**的行为。
   void _wirePluginRelayPoints(PluginBus bus) {
@@ -603,6 +616,7 @@ class CoreServer {
     String? model,
     double? temperature,
     int? maxTokens,
+    List<Object?>? tools,
   }) async {
     final LlmJsonCaller? caller = llmJsonCaller;
     if (caller == null) {
@@ -621,6 +635,7 @@ class CoreServer {
       model: model,
       temperature: temperature,
       maxTokens: maxTokens,
+      tools: tools,
     );
   }
 
@@ -1236,6 +1251,11 @@ class CoreServer {
       await writeJson(request, 404, errorBody('agent 不存在'));
       return;
     }
+
+    // 这是**用户显式改 agent 配置**（提示词 / 工作空间 / 模型参数都可能影响 `[0]`）：
+    // 丢掉钉住的系统提示词，下一轮重建。注意与"发消息"的区别——后者永远不重建。
+    // 本次 PATCH 若后面校验失败，重建出来的还是同一串字节，不额外损失缓存。
+    conversation.invalidateSystemPrompt(agent.id);
 
     // ── 工作空间目录与 SSH 配置（M7c）：前端「运行模式」直接改 agent 配置 ──
     // 语义与模型配置一致：字段缺失 = 不改；显式空值 = 清空。
@@ -2017,6 +2037,9 @@ class CoreServer {
         result['system_prompt'] = reset.toJson();
       }
     }
+    // 显式重置 = 等价于"重新初始化"：丢掉钉住的系统提示词，下一次拼装用新内容
+    // （区别于"发消息"——那永远不会重建提示词，见 ConversationService._systemPrompts）
+    conversation.invalidateSystemPrompt(agentId);
     if (target == 'spec' || target == 'all') {
       final SpecService? specs = specService;
       if (specs != null) {

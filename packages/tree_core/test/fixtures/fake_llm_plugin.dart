@@ -20,7 +20,12 @@ import 'dart:io';
 ///   `rewrite`（改写后的请求体）/ `invalid`（`{"model": ""}`）/
 ///   `invalid-messages`（messages 不是数组）：后两者都应被核心放行原请求。
 /// - `--compact-mode MODE`：`system.relay.context.compact` 的回包——
-///   `text`（`"插件摘要"`）/ `map`（`{"summary": "插件摘要"}`）。
+///   `list`（接管：回 `{messages:[system,user,tool], covered_message_count:2}`）/
+///   `bad-messages`（messages 里有非法元素 ⇒ 核心必须回退内置 compact）/
+///   `bad-count`（缺 covered_message_count ⇒ 同样回退）/
+///   `bare-list`（裸数组回包 ⇒ 缺水位线，回退）/ 空 = 回 null（不接管）。
+/// - `--compact-log FILE`：把每个 `context.compact` 请求的**完整 params** 逐行追加为
+///   JSON（载荷契约用例据此断言核心真的把完整原文列表 / 系统提示词发出来了）。
 /// - `--prompt-mode MODE`：`system.relay.prompt.system` 的回包——
 ///   `text`（`"插件改写后的提示词"`）/ `empty`（空串 = 明确不要系统提示词）/
 ///   `map`（`{"prompt": "..."}`）。
@@ -55,6 +60,7 @@ void main(List<String> args) {
   final String llmMode = arg('--llm-mode', 'silent');
   final String llmRequestMode = arg('--llm-request-mode');
   final String compactMode = arg('--compact-mode');
+  final String compactLogFile = arg('--compact-log');
   final String promptMode = arg('--prompt-mode');
   final String recordFile = arg('--record');
   final String requestLogFile = arg('--request-log');
@@ -479,9 +485,32 @@ void main(List<String> args) {
           return;
         }
         if (point == StationIds.relayContextCompact) {
+          appendLine(compactLogFile, jsonEncode(params));
+          // 新契约（2026-10）：接管 = 回一份**整份新上下文** + 覆盖条数
+          final Map<String, dynamic> context = <String, dynamic>{
+            'messages': <Map<String, dynamic>>[
+              <String, dynamic>{'role': 'system', 'content': '插件压缩后的系统提示词'},
+              <String, dynamic>{'role': 'user', 'content': '插件压缩后的历史要点'},
+              <String, dynamic>{'role': 'user', 'content': '最近一条原文'},
+            ],
+            'covered_message_count': 2,
+          };
+          // 按请求多少条原文决定覆盖数（契约用例据此断言水位线真的按回包落库）
+          final Object? incoming = params['payload'];
+          if (incoming is Map && incoming['messages'] is List) {
+            final int total = (incoming['messages'] as List<dynamic>).length;
+            context['covered_message_count'] = total <= 1 ? 0 : 2;
+          }
           final Object? payload = switch (compactMode) {
-            'text' => '插件摘要',
-            'map' => <String, dynamic>{'summary': '插件摘要（map）'},
+            'list' => context,
+            'bad-messages' => <String, dynamic>{
+              'messages': <dynamic>['not-a-message'],
+              'covered_message_count': 1,
+            },
+            'bad-count' => <String, dynamic>{
+              'messages': context['messages'],
+            },
+            'bare-list' => context['messages'],
             _ => null,
           };
           reply(<String, dynamic>{

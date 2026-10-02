@@ -3,6 +3,10 @@
 > 面向"从零写一个能用的插件"。协议、站点体系、隔离语义、UI 槽位、调试手段都在这里；
 > 可运行示例见 [`examples/plugins/`](../examples/plugins/)。
 >
+> 在 agent 的工作空间里读到这份时，它是**核心播种的副本**（`.self/docs/plugin-development.md`，
+> 选中 `plugin-creator` 规范时播种、由核心维护）：权威仍是应用目录 `plugins/`（发行版）与仓库
+> `docs/` 里的原件——副本与原件内容逐字一致，别手改副本（下一次播种会覆盖）。
+>
 > 版本口径：本指南对应**点位化**（2026-10-01）之后的核心。旧版核心（`system.relay`
 > 单实例、无 `station/stream`）的差异在 §11 单独列出。
 
@@ -127,7 +131,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.relay.tool.post` | 中转 | 每次工具调用**后** | 改结果文本 |
 | `system.relay.llm.handle` | 中转 | tool loop 每一跳投 LLM 前 | **接管**这一跳的响应（可流式） |
 | `system.relay.llm.request` | 中转 | 同一位置，**仅未被接管时** | 改写请求体（messages/tools/参数） |
-| `system.relay.context.compact` | 中转 | 上下文压缩要出摘要时 | 产出摘要正文 |
+| `system.relay.context.compact` | 中转 | 要压缩上下文时（规划也归你） | 产出**摘要侧上下文** + 覆盖切点下标（之后的原文由核心追加） |
 | `system.relay.prompt.system` | 中转 | 每轮构造系统提示词时 | 产出最终 system prompt |
 | `system.execute.fs` | 执行 | — | `fs.read` / `fs.write` / `fs.list` / `fs.grep` |
 | `system.execute.terminal` | 执行 | — | `terminal.exec` |
@@ -251,8 +255,77 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.relay.tool.post` | 同上 + `result`, `is_error` | 改后的报文（改 `result` / `is_error`）或**字符串**（只换结果文本） |
 | `system.relay.llm.handle` | `request:{model, messages, tools, max_tokens, temperature, reasoning_effort, stream}`, `turn`, `agent_id`, `session_id`（**单实例插件靠这两个字段就知道"这一次是谁在问"，不必等事件**） | 见 §5.4 |
 | `system.relay.llm.request` | 同 `request` | 改后的请求体（`{model, messages, tools, max_tokens, …}`，未识别字段会透传进请求体）或 `null` |
-| `system.relay.context.compact` | `prompt`（核心拼好的压缩提示词）, `instruction`, `header`, `message_count`, `compacted`, `existing_summary` | `"摘要正文"` 或 `{summary: "…"}`；`null` = 用内置摘要器 |
+| `system.relay.context.compact` | `system_prompt`（内置拼装的系统提示词，放在提示词槽位用）, `request`（**引擎这一轮真会发的那份线形请求** `{model, messages, tools, …}`——唯一的原料与缓存前缀）, `total_message_count`, `compacted_message_count`（当前水位线）, `existing_summary`, `compacted` | `{messages: [{role, content, …}, …], covered_message_count: N}`；`null` = 用内置 compact |
 | `system.relay.prompt.system` | `default`（核心构造的完整 system prompt） | 最终 system prompt 字符串（空串 = 明确不要系统提示词）；`null` = 用 `default` |
+
+> **压缩点位：原料只有"引擎真会发的那份"（2026-10 定稿）**。只要这个点位有订阅者，
+> 核心就不再算切点、也不再下发落库全量原文——它把 `request`（预压缩态的线形请求：
+> 系统提示词 + 已有压缩产物 + 水位线之后的原文 + `tools`）整份交出来，你回一份
+> **新上下文** + `covered_message_count`。
+>
+> ```jsonc
+> // 请求 payload（节选）：messages 是**引擎口径**（LlmMessage.toWire() 形状）
+> {"system_prompt": "…", "total_message_count": 12, "compacted_message_count": 2,
+>  "existing_summary": "…", "compacted": true,
+>  "request": {"model": "…", "messages": [{"role": "system", "content": "…"}, …],
+>              "tools": [{"type": "function", "function": {"name": "read", …}}],
+>              "stream": false}}
+>
+> // 回包（reply.payload）：接管
+> {"messages": [
+>    {"role":"system","content":"…"},                       // 提示词槽位（内容会被核心刷新）
+>    {"role":"system","content":"## 背景…## 轨迹…## 改动与产出文件…"},   // 摘要
+>    {"role":"assistant","content":"","tool_calls":[…]},    // 例如伪造的 read / todo 调用
+>    {"role":"tool","tool_call_id":"…","content":"…"},      // 与上面严格配对
+>    …原样抄回的尾部（见下）…],
+>  "covered_message_count": 12}
+> // 回 null / 回包不合法 = 不接管，核心回退内置 compact
+> ```
+>
+> **两种回包风格**（都合法，按你的切点在哪个坐标系里选）：
+>
+> - **只回摘要侧 + 给切点**：`covered = 保留窗口的起点`，尾部原文由核心按自己的口径
+>   翻译追加——省事、工具卡配对与门控最准，但切点要用**原文下标**表达；
+> - **把尾部也抄回来**（本仓库内置插件走这条）：切点在 **wire 坐标**里决定，尾部从
+>   `request.messages[cut:]` **原样截取**（一个字都不改写），`covered = total_message_count`
+>   ——不需要原文下标映射，助手工作与工具卡天然保真。
+>
+> 规矩与回退（全部 fail-open，越界绝不猜值）：
+>
+> - `covered_message_count` **必填**且落在 `[当前水位线, 原文总条数]`：核心据此决定下一轮
+>   从原文第几条继续追加。缺失 / 非数字 / 越界 / `messages` 为空数组 / 某条消息还原不成
+>   合法消息 ⇒ **整包按未接管处理**，回退内置 compact（会记一条可读日志）；
+> - **首条 system 是"提示词槽位"**：核心**每一轮**都用最新提示词覆盖它的正文（首条不是
+>   system 时由核心在最前补一条；`prompt.system` 明确回空串时删掉槽位）。所以不要把摘要
+>   写在首条 system 上——摘要请放在槽位**之后**；
+> - **结构硬约束**：抄回的尾部**不得以 `tool` 消息开头**（它的 `assistant(tool_calls)`
+>   若留在摘要侧，端点会因"孤儿工具结果"直接 400）；同理，喂给总结模型的前缀若以
+>   `assistant(tool_calls)` 收尾而缺配对结果也会 400——把总结指令作为**最后一条 user
+>   消息**追加在末尾，可以顺手避开"以 assistant 收尾"那类形态；
+> - 落库后你的列表就是**权威**（与内置路径互斥：你接管时清掉会话上的内置摘要，内置
+>   compact 接手时清掉你的列表）。要么稳定接管、要么干脆别订；
+> - 同一个点位**每轮压缩只问一次**，且此时这一轮生成是阻塞等你回包的（无静态超时，
+>   靠心跳续期，见 §5.1）。
+>
+> **缓存是长会话省钱的关键**：把 `request.messages` 整段当自己 `llm.call` 的 `messages`
+> 前缀，**末尾只追加一条 user 指令**（含 "json" 字样），并把 `request.tools` 原样透传
+> ——前缀与对话那一轮逐字一致，端点侧已持久化的缓存单元就能整段命中（DeepSeek 命中价
+> 约为未命中的 1/10）。`request.messages` 与引擎**真会发出去的那份**逐字一致：它走的是
+> 同一套历史翻译、工具结果门控与**预算硬裁**（`fitContextToBudget`）——这也是它必须由
+> 引擎现拼、而不是给你落库原文的原因。三条注意：
+>
+> 1. **不要**用 `llm.call` 的 `system` 参数放指令：那会在最前面插一条 system 消息，
+>    把整个前缀错位，缓存全丢；
+> 2. `tools` 必须一起带（工具定义在聊天模板里渲染在 messages **之前**）；
+> 3. 命中情况看回包 `usage.cached_tokens`（DeepSeek 的 `prompt_cache_hit_tokens` 已归一到
+>    该字段）；`response_format`（站点硬设的 json）只是请求参数，**不影响**前缀匹配。
+>
+> **参考实现**：内置插件「上下文压缩」（`plugins/compact_plugin.py`，界面里一项开关）——
+> 摘要（背景 / 轨迹 / 改动产出文件）+ 必读文件（≤11 个、精确行范围，用伪造的 `read`
+> 工具调用拼进上下文）+ todo 快照（`set_todo_list get`）；**尾部原样抄回**
+> （`covered = total_message_count`），切点保留最近 `--keep-rounds` 轮 user，且在该区域
+> 里最多保留 `--keep-tool-rounds`（默认 8）个工具轮（单轮超长工具轨迹因此压得动）。
+> 任何一步失败都回 `null`。可直接读它当模板（`python plugins/compact_plugin.py --selftest`）。
 
 ### 5.4 接管 LLM：一次性 与 流式
 
@@ -344,7 +417,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `agent.stop` | `agent_id?`, `cascade?`（缺省 true） | `{any_running, reason?, …}` | 停止（级联）生成 |
 | `agent.compact` | `agent_id?`, `session_id?` | `{…}` | **发起上下文压缩** |
 | `ui.push` | `slot_key`, `view?` | `{pushed, slot, slot_key, unregistered}` | 往消息流推一张卡片（§7） |
-| `llm.call` | `messages?` 或 `prompt?`, `system?`, `model?`, `temperature?`, `max_tokens?` | `{ok, json, text, model, usage}`；失败 `{ok:false, error:'可读原因'}` | **站点处硬设 JSON 返回形式**的 LLM 调用，复用目标 agent 的模型 |
+| `llm.call` | `messages?` 或 `prompt?`, `system?`, `model?`, `temperature?`, `max_tokens?`, `tools?`（OpenAI 工具声明**原样透传**，给压缩插件对齐对话前缀用） | `{ok, json, text, model, usage}`；失败 `{ok:false, error:'可读原因'}` | **站点处硬设 JSON 返回形式**的 LLM 调用，复用目标 agent 的模型 |
 | `tool.call` | `tool`, `arguments?`, `relay?`（默认 false） | `{tool, result, is_error, relayed}` | 执行**任意工具**（内置 / MCP / 插件工具同一入口） |
 | `session.rename` | `title`（必填）, `session_id?` | `{renamed, title, session_id}` | 会话重命名（前端即时刷新标题） |
 
@@ -458,6 +531,15 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 `ui.push`（执行站命令）适合"随对话出现"的卡片：`slot_key` 必须是已声明的 `card` 槽位；
 `view` 省略 = 注销该卡片。
 
+**槽位生命周期**（2026-10-02 起的前端口径）：槽位跟着"插件是否在运行"走——
+
+- 插件**停用 / 条目被删除 / 启动失败 / 进程退出**（核心推 `plugin_status(disabled)`）⇒ 前端**立即注销**
+  它声明的全部槽位：卡片与面板一起消失（不留在界面上当僵尸）；
+- 前端**断连**时清空槽位注册表（离线期间核心不会重放已停用插件的声明），重连后按核心缓存的**当前态**重建；
+- 因此**重新启用 / 重启后要重新发 `ui/manifest` 与 `ui.push`**——在插件启动时发一次即可（本来就是推荐做法），
+  界面会自动回来；不要指望"插件不跑了界面还留着"。
+- **心跳丢失（degraded）不算下线**：进程还活着、槽位保留（恢复后照旧），所以别把 `ping` 当负担。
+
 ---
 
 ## 8. 收集站：集中申报工具定义
@@ -534,9 +616,12 @@ plugins:
   `prompt.system` 改写（`--relay-prompt`）、`llm.call` / `tool.call` / `session.rename`
   三条新命令（`--llm-call` / `--tool-call` / `--rename-session`）、工具广播订阅（`--watch-tools`）、
   自建站点（`--self-station`）、心跳与 `--selftest`。
-- 两个脚本都**只用标准库**、都能被绝对路径启动（不依赖 cwd）。
-- 尚未提供可运行示例的点位：`system.relay.llm.request`（投入前改写）与
-  `system.relay.context.compact`（上下文压缩）——口径见 §5.3，接法与其他中转点位完全一致。
+- [`examples/plugins/compact_plugin.py`](../examples/plugins/compact_plugin.py)：**内置插件
+  「上下文压缩」**——`system.relay.context.compact` 的完整实现（摘要 + 必读文件 + todo 快照，
+  编排 `llm.call` / `fs.read` / `tool.call`），也是"压缩点位怎么接"的活文档。
+- 三个脚本都**只用标准库**、都能被绝对路径启动（不依赖 cwd）。
+- 尚未提供可运行示例的点位：`system.relay.llm.request`（投入前改写）——口径见 §5.3，
+  接法与其他中转点位完全一致。
 - 运行：把 `examples/plugins/` 下的脚本拷到桌面端的 `plugins/` 目录（或直接写绝对路径），
   在「设置 → 插件开发」里启用，即可在面板与消息流里看到它。
 

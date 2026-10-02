@@ -8,22 +8,80 @@ import '../util/tokens.dart';
 import 'attachment_prompt.dart';
 import 'workspace_prompt.dart';
 
+/// 当前上下文的**线形请求**提供者（见 [CompactionService.wireRequestProvider]）。
+typedef WireRequestProvider =
+    Future<Map<String, dynamic>?> Function(CoreAgent agent, CoreSession session);
+
 /// 「上下文压缩过程」的中转点钩子（中转站点位 `system.relay.context.compact`）。
 ///
-/// 返回**摘要正文**（不含 header）表示插件接管了这次压缩；返回 null = 不接管，
-/// 回退内置摘要器（[CompactionService.summarizer]）。抛异常同样回退（fail-open）。
+/// **职责划分（2026-10 定稿）**：只要接了中转点，**规划也归它**——核心不再算切点
+/// （`buildPlan` 完全不跑），而是把整份原料（系统提示词 + 完整原文 + 当前水位线 +
+/// 上一次的摘要）交出去，由中转站产出**整份新上下文**（[CompactionRelayReply.messages]，
+/// OpenAI 线形态，引擎原样使用）并回传它覆盖了多少条原文。
 ///
-/// 入参给足原料（内置拼好的提示词 + 待压缩条目 + 指令/表头常量），插件既可以
-/// 直接用提示词去问自己的模型，也可以完全自己重做摘要。
+/// 没接中转点（或它这轮不接管）时走系统内置 compact：`buildPlan` + 摘要器 + 水位线。
+/// 两条路径的产物互斥（见 [CoreSession.compactedContext]）。
 typedef CompactionRelayHook =
-    Future<String?> Function({
+    Future<CompactionRelayReply?> Function({
       required CoreAgent agent,
       required CoreSession session,
-      required String prompt,
-      required List<CoreMessage> messages,
-      required String instruction,
-      required String header,
+      /// 内置拼装的系统提示词（与 [CompactionService.estimateContextTokens] 同口径：
+      /// 全局基础段 + agent 自己的提示词 + 工作空间软约束 + Spec 段）。
+      ///
+      /// **不含** `system.relay.prompt.system` 的插件改写结果——那个改写只对会话生成
+      /// 那一轮生效，压缩估算刻意不跟（见 [LlmAgentEngine.systemPromptRelay] 的说明）。
+      required String systemPrompt,
+      /// **原文总条数**（落库全量）：`covered_message_count` 的合法上界。
+      ///
+      /// 注意载荷里**不再给落库全量原文**：那份东西既大（动辄几 MB）又与"模型真正
+      /// 看到的那份"不同步（冷前缀已被摘要/列表代表）。插件要的原料只有一样：
+      /// [wireRequest] 里的 messages。
+      required int totalMessageCount,
+      /// 当前水位线：引擎此刻从原文第几条继续（= 之前压缩已覆盖的条数）。
+      required int compactedMessageCount,
+      /// 内置路径上一次的摘要（空串 = 没有 / 上一次也是中转站压的）。
+      required String existingSummary,
+      /// **当前上下文的线形请求**（预先压缩态，`{model, messages, tools, …}`）：
+      /// 与对话即将发出的那一份同口径。它同时是压缩插件的**唯一原料**（拿它当
+      /// `llm.call` 的前缀就吃到端点前缀缓存）与"尾部原样保留"的来源。
+      ///
+      /// null = 提供者没接线 / 拼不出来 ⇒ 插件应**不接管**（没有同口径原料就没法
+      /// 保证前缀一致，硬压只会让缓存与内容双双失准）。
+      required Map<String, dynamic>? wireRequest,
     });
+
+/// 中转站压缩的产物（[CompactionRelayHook] 的返回值）。
+///
+/// 非 null = 这一轮由中转站接管；null = 不接管，核心回退内置 compact。
+class CompactionRelayReply {
+  const CompactionRelayReply({
+    required this.messages,
+    required this.coveredMessageCount,
+  });
+
+  /// **整份新上下文**（OpenAI 线形态的消息数组，由 `LlmMessage.toWire()` 同形状）。
+  ///
+  /// 引擎**原样使用**这份列表（只把首条 system 槽位刷成最新提示词），再从原文
+  /// [coveredMessageCount] 条之后继续追加新消息。所以两种风格都合法：
+  /// - **只回"摘要侧"**（摘要 + 必读文件 + todo），`coveredMessageCount` 给切点，
+  ///   尾部原文由引擎按自己的口径翻译追加——省事、口径最准；
+  /// - **把尾部也抄进来**（从 [CompactionRelayHook] 的 `wireRequest.messages` 里
+  ///   原样截取），`coveredMessageCount = totalMessageCount`，引擎不再追加——
+  ///   适合"切点在 wire 坐标里决定"的插件（它拿不到原文下标）。
+  final List<Map<String, dynamic>> messages;
+
+  /// 这份上下文覆盖了原文前多少条（合法区间 `[当前水位线, 原文总条数]`）。
+  ///
+  /// 越界一律按"不接管"处理并记日志——水位线是"下一轮从哪继续"的唯一依据，
+  /// 猜一个值比回退内置更危险。
+  final int coveredMessageCount;
+}
+
+/// [CompactionResult.source] 的取值：系统内置 compact。
+const String compactionSourceBuiltin = 'builtin';
+
+/// [CompactionResult.source] 的取值：中转站（`system.relay.context.compact`）压缩。
+const String compactionSourceRelay = 'relay';
 
 /// 上下文压缩（M7d-4）。
 ///
@@ -78,6 +136,13 @@ class CompactionService {
   /// 才起来（`CoreServer._wirePluginRelayPoints`），两边在构造期互不可见——与
   /// `LlmAgentEngine.toolTurnCompactor` 同一个理由。
   CompactionRelayHook? relayHook;
+
+  /// 当前上下文的**线形请求**提供者（接线方注入；null = 不提供）。
+  ///
+  /// 为什么压缩服务自己拼不出来：那条前缀是"引擎口径"的（历史翻译 / 工具卡配对 /
+  /// 思考回灌 / 超长工具结果门控 / 系统提示词改写都归引擎），压缩服务只认识落库形态
+  /// 的 `CoreMessage`。由 `ConversationService` 把引擎接进来（`engine.wireRequestFor`）。
+  WireRequestProvider? wireRequestProvider;
 
   /// 是否具备压缩能力（内置总结器或插件中转点任一生效）。
   bool get canCompact => summarizer != null || relayHook != null;
@@ -215,7 +280,13 @@ class CompactionService {
       settings.model(agent.modelId)?.thinking ??
       false;
 
-  /// 估算"引擎实际会看到"的上下文 token 数（系统提示词 + 摘要 + 未压缩历史）。
+  /// 估算"引擎实际会看到"的上下文 token 数。
+  ///
+  /// 两条压缩路径的基底不同，估算必须跟着分叉（否则压缩阈值会失真）：
+  /// - 内置路径：系统提示词 + 摘要 + 水位线之后的原文；
+  /// - 中转站路径：系统提示词**不算**（那份列表里已含插件决定的 system 消息）+
+  ///   列表本身（按 JSON 形态估算——插件给的线形态消息没有对应的 `CoreMessage`，
+  ///   按它实际会发出去的字符量算是最接近的口径）+ 水位线之后的原文。
   ///
   /// 比例用该模型的 token_scale（Q1-①）：全系统只有 util/tokens.dart 一个换算
   /// 函数，压缩阈值与进度条才不会各说各话。
@@ -231,14 +302,25 @@ class CompactionService {
     );
     final List<CoreMessage> all = store.messages(agent.id, session.sessionId);
     final int frozen = session.compactedMessageCount.clamp(0, all.length);
-    int total =
-        estimateTokens(
-          // 与 ConversationService._contextOf 逐字同口径：⑧ 已选 Spec 全文
-          // 同样是会话级的，估算漏掉它，压缩阈值就会偏小
-          systemPromptWithWorkspace(agent, sessionId: session.sessionId),
-          scale: scale,
-        ) +
-        estimateTokens(session.compactedSummary, scale: scale);
+    final bool stationContext = session.compactedContext.isNotEmpty;
+    int total;
+    if (stationContext) {
+      // 中转站给的线形态消息没有对应的 CoreMessage：按它实际会发出去的 JSON
+      // 字符量估算（最接近引擎那一份的口径）
+      total = estimateTokens(
+        jsonEncode(session.compactedContext),
+        scale: scale,
+      );
+    } else {
+      total =
+          estimateTokens(
+            // 与 ConversationService._contextOf 逐字同口径：⑧ 已选 Spec 全文
+            // 同样是会话级的，估算漏掉它，压缩阈值就会偏小
+            systemPromptWithWorkspace(agent, sessionId: session.sessionId),
+            scale: scale,
+          ) +
+          estimateTokens(session.compactedSummary, scale: scale);
+    }
     for (final CoreMessage message in all.sublist(frozen)) {
       total += _messageTokens(message, scale, gate, passBack);
     }
@@ -263,6 +345,21 @@ class CompactionService {
   ) async {
     final List<CoreMessage> all = store.messages(agent.id, session.sessionId);
     final int frozen = session.compactedMessageCount.clamp(0, all.length);
+    final String systemPrompt = systemPromptWithWorkspace(
+      agent,
+      sessionId: session.sessionId,
+    );
+    // ① **中转站优先，且规划也归它**：不算切点、不拼提示词，整份原料交出去。
+    //    它接管 ⇒ 拿到整份新上下文 + 覆盖条数，直接落库返回。
+    final CompactionResult? relayed = await _compactViaRelay(
+      agent,
+      session,
+      all: all,
+      frozen: frozen,
+      systemPrompt: systemPrompt,
+    );
+    if (relayed != null) return relayed;
+    // ② 没接中转点 / 这轮不接管 ⇒ 系统内置 compact（与接线前逐字一致）
     final List<CoreMessage> visible = all.sublist(frozen);
     if (visible.length <= 1) {
       return CompactionResult(
@@ -295,7 +392,7 @@ class CompactionService {
       messageCount: frozen + plan.summarize.length,
     );
     log?.call(
-      '上下文已压缩：总结 ${plan.summarize.length} 条，'
+      '上下文已压缩（内置）：总结 ${plan.summarize.length} 条，'
       '保留 ${plan.keep.length} 条（agent=${agent.id}）',
     );
     return CompactionResult(
@@ -304,11 +401,84 @@ class CompactionService {
       summarizedMessages: plan.summarize.length,
       summary: summarized.text,
       sessionId: session.sessionId,
+      source: compactionSourceBuiltin,
       // 总结模型调用失败、退化成截断摘要：压缩本身成功了，但要点可能不全，
       // 调用方要把这件事显示给用户（Q1-③：压缩失败必须可见）。
       // 失败原因一并带出：只报"总结失败"用户无从判断是密钥、限流还是网络。
       degraded: summarized.degraded,
       degradedReason: summarized.degradedReason,
+    );
+  }
+
+  /// 中转站路径（[CompactionRelayHook]）：接管则落库并返回结论，不接管返回 null。
+  ///
+  /// 校验口径（越界一律**不接管** + 记日志，回退内置）：
+  /// - 回包非空；
+  /// - `coveredMessageCount ∈ [当前水位线, 原文总条数]`——水位线是"下一轮从哪继续"
+  ///   的唯一依据，比内置更宽松（允许等于总条数 = 整份都覆盖了）但绝不允许倒退；
+  /// - 消息数组的形状由总线侧用 `LlmMessage.tryFromWire` 逐条验过。
+  Future<CompactionResult?> _compactViaRelay(
+    CoreAgent agent,
+    CoreSession session, {
+    required List<CoreMessage> all,
+    required int frozen,
+    required String systemPrompt,
+  }) async {
+    final CompactionRelayHook? relay = relayHook;
+    if (relay == null) return null;
+    // 前缀（引擎口径）：拿得到就给插件复用，拿不到就让它自己渲染历史
+    Map<String, dynamic>? wireRequest;
+    final WireRequestProvider? provider = wireRequestProvider;
+    if (provider != null) {
+      try {
+        wireRequest = await provider(agent, session);
+      } catch (error) {
+        log?.call('压缩前缀提供者异常（插件退回自渲染模式）：$error');
+      }
+    }
+    final CompactionRelayReply? reply;
+    try {
+      reply = await relay(
+        agent: agent,
+        session: session,
+        systemPrompt: systemPrompt,
+        totalMessageCount: all.length,
+        compactedMessageCount: frozen,
+        existingSummary: session.compactedSummary,
+        wireRequest: wireRequest,
+      );
+    } catch (error) {
+      log?.call('压缩中转点异常（回退内置 compact）：$error');
+      return null;
+    }
+    if (reply == null) return null;
+    final int covered = reply.coveredMessageCount;
+    if (covered < frozen || covered > all.length) {
+      log?.call(
+        '压缩中转回传的 covered_message_count=$covered 越界'
+        '（合法区间 $frozen..${all.length}，原文 ${all.length} 条 / 当前水位线 $frozen）：'
+        '按未接管处理，回退内置 compact',
+      );
+      return null;
+    }
+    store.setCompactedContext(
+      agent.id,
+      session.sessionId,
+      context: reply.messages,
+      coveredMessageCount: covered,
+    );
+    log?.call(
+      '上下文已由中转站压缩：覆盖 $covered 条'
+      '（本次新增 ${covered - frozen}），上下文 ${reply.messages.length} 条'
+      '（agent=${agent.id}）',
+    );
+    return CompactionResult(
+      compressed: true,
+      // 压缩后引擎会看到的条数 = 中转站给的列表 + 水位线之后的原文
+      contextSize: reply.messages.length + (all.length - covered),
+      summarizedMessages: covered - frozen,
+      sessionId: session.sessionId,
+      source: compactionSourceRelay,
     );
   }
 
@@ -352,6 +522,9 @@ class CompactionService {
 
   /// 总结：把待压缩消息（含上一次的摘要）交给模型；失败回退到截断摘要。
   ///
+  /// 这是**内置路径**（无中转点 / 中转点这轮不接管）专用的最后一步：中转点接管时
+  /// 根本走不到这里（见 [_compactViaRelay]），所以本方法不再认识插件总线。
+  ///
   /// [SummaryText.degraded] 标记"总结模型没跑成功"，由调用方决定怎么提示用户——
   /// 静默回退会让用户以为压缩过后的上下文还带着完整要点。
   Future<SummaryText> _summarize(
@@ -360,7 +533,9 @@ class CompactionService {
     List<CoreMessage> messages,
   ) async {
     final StringBuffer raw = StringBuffer();
-    if (session.compacted) {
+    // 只有**摘要文本**参与"此前已总结的内容"：中转站路径下摘要被清空（权威在列表上），
+    // 此时不该凭空插一段空标题进去
+    if (session.compactedSummary.trim().isNotEmpty) {
       raw.writeln('【此前已经总结过的内容】');
       raw.writeln(session.compactedSummary);
       raw.writeln();
@@ -376,31 +551,10 @@ class CompactionService {
       body = '${body.substring(0, summarizeCharLimit)}\n…[截断]';
     }
     final String prompt = '$summarizeInstruction\n\n$body';
-    // 中转站点位「上下文压缩过程」：插件可以先接管（无订阅者 / 未回填 ⇒ 内置摘要器）。
-    // 重入保护在调用方（`_compacting`）：插件在自己的压缩处理里再调 `agent.compact`
-    // 会被显式拒绝，这里不额外加锁。
-    final CompactionRelayHook? relay = relayHook;
-    if (relay != null) {
-      try {
-        final String? fromPlugin = await relay(
-          agent: agent,
-          session: session,
-          prompt: prompt,
-          messages: messages,
-          instruction: summarizeInstruction,
-          header: summaryHeader,
-        );
-        if (fromPlugin != null && fromPlugin.trim().isNotEmpty) {
-          return SummaryText('$summaryHeader\n${fromPlugin.trim()}');
-        }
-      } catch (error) {
-        log?.call('压缩中转点异常（回退内置摘要器）：$error');
-      }
-    }
     final ContextSummarizer? inner = summarizer;
     if (inner == null) {
-      // 只有中转点、而它没接管也没回填：如实退到截断摘要（不假装成功）
-      log?.call('压缩中转点未接管，且未配置内置摘要器：回退截断摘要');
+      // 没有内置摘要器（能力全指望中转点，它这轮没接管）：如实退到截断摘要，不假装成功
+      log?.call('中转点未接管，且未配置内置摘要器：回退截断摘要');
       return SummaryText(
         '$fallbackHeader\n${_digest(messages, passBackReasoning: passBack)}',
         degraded: true,
@@ -494,10 +648,14 @@ class CompactionService {
       );
     }
     if (message.isTool) {
-      tokens += estimateTokensFromChars(
-        gate.forModelChars(message.toolResult),
-        scale: scale,
-      );
+      // 「送模型那一份」有落库就用它（含状态前缀/门控后的原文），
+      // 没有才回退到"当场按门控算字符数"
+      tokens += message.toolResultForModel.isNotEmpty
+          ? estimateTokens(message.toolResultForModel, scale: scale)
+          : estimateTokensFromChars(
+              gate.forModelChars(message.toolResult),
+              scale: scale,
+            );
       tokens += estimateTokens(message.toolName ?? '', scale: scale);
       tokens += estimateTokens(
         jsonEncode(message.toolArguments ?? const <String, dynamic>{}),
@@ -534,6 +692,7 @@ class CompactionResult {
     this.status = 200,
     this.degraded = false,
     this.degradedReason = '',
+    this.source = '',
   });
 
   /// 是否真的执行了压缩。
@@ -543,14 +702,21 @@ class CompactionResult {
   /// nothing_to_summarize / already_compacting / no_summarizer。
   final String reason;
 
-  /// 压缩后的上下文条数（1 条摘要 + 保留的消息）。
+  /// 压缩后的上下文条数（内置路径 = 1 条摘要 + 保留的消息；中转站路径 = 它给的
+  /// 列表 + 水位线之后的原文）。
   final int contextSize;
 
   /// 本次被总结掉的消息条数。
   final int summarizedMessages;
 
-  /// 新摘要（已写回会话）。
+  /// 新摘要（已写回会话）。**中转站路径恒为空串**——那条路径产出的是一份上下文
+  /// 列表，不是摘要文本（见 [CoreSession.compactedContext]）。
   final String summary;
+
+  /// 这次压缩由谁做的：`builtin`（系统内置）/ `relay`（中转站）；未压缩时为空串。
+  ///
+  /// 只作诊断与展示用（两条路径的产物形态不同，日志里说不清就没法排查）。
+  final String source;
 
   final String sessionId;
 
@@ -580,6 +746,7 @@ class CompactionResult {
           if (reason.isNotEmpty) 'reason': reason,
           'context_size': contextSize,
           'summarized_messages': summarizedMessages,
+          if (source.isNotEmpty) 'source': source,
           if (sessionId.isNotEmpty) 'session_id': sessionId,
           if (degraded) 'degraded': true,
           if (degraded && degradedReason.isNotEmpty)

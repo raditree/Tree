@@ -21,10 +21,11 @@ void main() {
   late CoreServer server;
   late TestWs first;
   late List<Map<String, dynamic>> frames;
+  late String script;
 
   setUp(() async {
     temp = Directory.systemTemp.createTempSync('tree_ui_replay_');
-    final String script = p.join(
+    script = p.join(
       Directory.current.path,
       'test',
       'fixtures',
@@ -151,6 +152,54 @@ void main() {
       ),
       isEmpty,
       reason: '已下线插件的槽位不得被重放（那会留下点不动的僵尸面板）',
+    );
+  });
+
+  test('插件被停用（enabled: false）⇒ 推 plugin_status(disabled) + 缓存作废', () async {
+    // 这是真机上用户"关掉插件"走的那条路（对账热应用），也是本组契约的正面口径：
+    // 前端收到 disabled 就注销它的卡片与面板；核心同时丢掉缓存，重连不会把僵尸槽位带回来。
+    await bus.start();
+    await first.until(
+      (Map<String, dynamic> f) => f['type'] == PluginUiFrameType.manifest,
+      reason: '插件启动时的原始广播',
+    );
+    expect(bus.uiCache.frames(), isNotEmpty);
+
+    // 面板上的停用开关 = 落盘 enabled:false + 对账
+    File(p.join(temp.path, 'config', 'plugins.yaml')).writeAsStringSync(
+      'enabled: true\n'
+      'plugins:\n'
+      '  - id: demo\n'
+      '    name: 布局插件\n'
+      '    command: "${Platform.resolvedExecutable.replaceAll('\\', '/')}"\n'
+      '    args: ["${script.replaceAll('\\', '/')}", "--ui-manifest"]\n'
+      '    granularity: team\n'
+      '    scope: {team_id: team-1}\n'
+      '    enabled: false\n',
+    );
+    await bus.applyConfigs();
+    await first.until(
+      (Map<String, dynamic> f) =>
+          f['type'] == WsOutboundType.pluginStatus &&
+          ((f['data'] as Map<String, dynamic>)['plugin_id'] == 'demo') &&
+          ((f['data'] as Map<String, dynamic>)['status'] == 'disabled'),
+      reason: 'plugin_status(disabled)',
+    );
+    expect(
+      bus.uiCache.frames(),
+      isEmpty,
+      reason: '停用后不得再重放它的槽位（否则僵尸卡片/面板会复活）',
+    );
+
+    final TestWs late_ = await TestWs.connect(server);
+    late_.record();
+    addTearDown(late_.close);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(
+      late_.frames.where(
+        (Map<String, dynamic> f) => f['type'] == PluginUiFrameType.manifest,
+      ),
+      isEmpty,
     );
   });
 }

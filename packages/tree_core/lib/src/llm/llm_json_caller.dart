@@ -51,6 +51,7 @@ class LlmJsonCaller {
   /// 发一次调用。
   ///
   /// [model] 非空 = 显式覆盖模型名；[messages] / [prompt] 二选一（都没有则报错）。
+  /// [tools] = OpenAI 形状的工具声明数组（原样透传；压缩插件靠它对齐对话前缀）。
   /// 返回 `{ok: true, json, text, model, usage}` 或 `{error: 可读原因}`。
   Future<Map<String, dynamic>> call({
     required String agentId,
@@ -61,6 +62,7 @@ class LlmJsonCaller {
     String? model,
     double? temperature,
     int? maxTokens,
+    List<Object?>? tools,
   }) async {
     final CoreModelConfig? resolved = resolveModel(modelId);
     final CoreModelConfig? config = resolved?.withOverrides(
@@ -92,9 +94,33 @@ class LlmJsonCaller {
         'error': 'llm.call 需要 messages（数组）或 prompt（字符串）',
       };
     }
+    // 工具声明：**原样透传**，不解析成 spec 再重建——插件给自己的前缀要与对话
+    // 逐字一致，中间做一次"解析 + 重编码"就可能改变字段顺序/形态而丢掉缓存命中。
+    final List<Map<String, dynamic>> rawTools = <Map<String, dynamic>>[];
+    if (tools != null) {
+      for (final Object? item in tools) {
+        if (item is! Map) {
+          return const <String, dynamic>{
+            'error': 'llm.call 的 tools 里有非对象元素（应为 OpenAI 工具声明）',
+          };
+        }
+        rawTools.add(
+          item.map(
+            (dynamic key, dynamic value) => MapEntry<String, dynamic>(
+              key.toString(),
+              value,
+            ),
+          ),
+        );
+      }
+    }
     final LlmRequest request = LlmRequest(
       model: effectiveModel,
       messages: built,
+      tools: <LlmToolSpec>[
+        for (final Map<String, dynamic> item in rawTools)
+          if (LlmToolSpec.tryFromWire(item) case final LlmToolSpec spec) spec,
+      ],
       maxOutputTokens: maxTokens != null && maxTokens > 0 ? maxTokens : null,
       temperature: temperature,
       // **站点处硬设**：JSON 返回形式由这里统一加上，插件不需要也无法关掉它。

@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
 
@@ -35,6 +37,7 @@ void main() {
     ],
     String contextSummary = '',
     int compactedMessageCount = 0,
+    List<Map<String, dynamic>> compactedContext = const <Map<String, dynamic>>[],
   }) => AgentRunContext(
     agentId: 'agt_1',
     sessionId: 'ses_1',
@@ -44,6 +47,7 @@ void main() {
     history: history,
     contextSummary: contextSummary,
     compactedMessageCount: compactedMessageCount,
+    compactedContext: compactedContext,
   );
 
   group('模型解析的报错必须可操作', () {
@@ -297,6 +301,106 @@ void main() {
       expect(request.tools.single.description, '读文件');
     });
 
+    test('wireRequestFor：与 run 真会发的那一份逐字一致（messages / tools / 参数）', () async {
+      final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+        textScript('ok'),
+      ]);
+      final LlmAgentEngine instance = engine(
+        transport,
+        tools: FakeToolRunner(
+          specs: const <ToolSpec>[
+            ToolSpec(name: 'read_file', description: '读文件'),
+          ],
+        ),
+      );
+      final AgentRunContext ctx = context(
+        history: const <CoreMessageRef>[
+          CoreMessageRef(role: 'user', content: '第一轮要求'),
+          CoreMessageRef(role: 'agent', content: '第一轮回答'),
+          CoreMessageRef(role: 'user', content: '本轮问题'),
+        ],
+      );
+      await instance.run(ctx, isCancelled: () => false).toList();
+      final Map<String, dynamic> sent = transport.requests.single.toWire();
+      final Map<String, dynamic>? wire = await instance.wireRequestFor(ctx);
+      expect(wire, isNotNull);
+      expect(
+        wire!['messages'],
+        sent['messages'],
+        reason: '压缩前缀必须与对话那一轮逐字一致，否则端点缓存单元命中不了',
+      );
+      expect(wire['tools'], sent['tools'], reason: '工具声明是前缀对齐的另一半');
+      expect(wire['model'], sent['model']);
+      expect(wire['max_tokens'], sent['max_tokens']);
+      expect(wire['reasoning_effort'], sent['reasoning_effort']);
+    });
+
+    test('wireRequestFor：模型没配 / 没密钥时返回 null（插件据此不接管）', () async {
+      final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[]);
+      final LlmAgentEngine noModel = engine(transport, model: null);
+      expect(
+        await noModel.wireRequestFor(context(modelId: 'gone')),
+        isNull,
+      );
+      final LlmAgentEngine noKey = engine(
+        transport,
+        model: CoreModelConfig(modelId: 'demo', name: '缺密钥'),
+      );
+      expect(await noKey.wireRequestFor(context()), isNull);
+    });
+
+    test('wireRequestFor：预算硬裁后仍与实发请求逐字一致（缓存前缀必须同口径）', () async {
+      final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+        textScript('ok'),
+      ]);
+      // 窗口刻意调小，让"预算硬裁"真的动手（budget = 6000 − 256 − 512）
+      final CoreModelConfig small = CoreModelConfig(
+        modelId: 'demo',
+        name: '小窗口',
+        baseUrl: 'https://api.example.com/v1',
+        apiKey: 'sk-test',
+        maxSeqlen: 6000,
+        maxOutputTokens: 256,
+      );
+      final LlmAgentEngine instance = engine(transport, model: small);
+      // 每条 2000 字符（≈1000 token @ token_scale 2.0）⇒ 总量必然超预算 5232
+      final String filler = '冗' * 2000;
+      final List<CoreMessageRef> history = <CoreMessageRef>[
+        CoreMessageRef(role: 'user', content: '第一轮要求：$filler'),
+        CoreMessageRef(role: 'agent', content: '第一轮回答：$filler'),
+        CoreMessageRef(role: 'user', content: '第二轮要求：$filler'),
+        CoreMessageRef(role: 'agent', content: '第二轮回答：$filler'),
+        CoreMessageRef(role: 'user', content: '第三轮要求：$filler'),
+        CoreMessageRef(role: 'agent', content: '第三轮回答：$filler'),
+        CoreMessageRef(role: 'user', content: '本轮问题'),
+      ];
+      final AgentRunContext ctx = context(history: history);
+      final List<AgentEvent> events = await instance
+          .run(ctx, isCancelled: () => false)
+          .toList();
+      final AgentUsage usage = events.whereType<AgentUsage>().first;
+      expect(
+        usage.usage['trimmed_messages'],
+        greaterThan(0),
+        reason: '这个用例必须真的触发硬裁，否则断言的是"没裁也一样"',
+      );
+
+      final List<Object?> sent =
+          transport.requests.single.toWire()['messages']! as List<Object?>;
+      final Map<String, dynamic>? wire = await instance.wireRequestFor(ctx);
+      expect(wire, isNotNull);
+      expect(
+        wire!['messages'],
+        sent,
+        reason: '硬裁路径上前缀也必须与实发请求逐字一致（否则那段缓存命中不了）',
+      );
+      expect(
+        jsonEncode(sent),
+        isNot(contains('第一轮要求')),
+        reason: '最早那一轮确实被裁掉了（用例前提）',
+      );
+    });
+
     test('压缩摘要作为第二条 system 消息注入，被总结的前缀不再发送', () async {
       final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
         textScript('ok'),
@@ -321,6 +425,122 @@ void main() {
       expect(sent[1].content, contains('用户想要 X'));
       expect(sent.map((LlmMessage m) => m.content), isNot(contains('早期需求')));
       expect(sent.last.content, '本轮问题');
+    });
+
+    test('中转站上下文是基底：摘要在内、水位线之后继续追加，首条提示词被刷新', () async {
+      final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+        textScript('ok'),
+      ]);
+      await engine(transport)
+          .run(
+            context(
+              // 内置路径的两样东西即使都在，也必须被中转站的列表压过去
+              contextSummary: '内置摘要：不该出现',
+              compactedMessageCount: 2,
+              history: const <CoreMessageRef>[
+                CoreMessageRef(role: 'user', content: '早期需求'),
+                CoreMessageRef(role: 'agent', content: '早期回答'),
+                CoreMessageRef(role: 'user', content: '本轮问题'),
+              ],
+              compactedContext: const <Map<String, dynamic>>[
+                <String, dynamic>{
+                  'role': 'system',
+                  'content': '插件压缩时的旧提示词（必须被刷新掉）',
+                },
+                <String, dynamic>{'role': 'system', 'content': '插件产出的摘要'},
+                <String, dynamic>{'role': 'user', 'content': '插件保留的最近原文'},
+              ],
+            ),
+            isCancelled: () => false,
+          )
+          .toList();
+      final List<LlmMessage> sent = transport.requests.single.messages;
+      final List<String> texts = sent
+          .map((LlmMessage m) => m.content)
+          .toList(growable: false);
+      expect(
+        texts.first,
+        '系统提示',
+        reason: '首条 system 是**提示词槽位**：核心用最新那份覆盖它',
+      );
+      expect(texts, isNot(contains('插件压缩时的旧提示词（必须被刷新掉）')));
+      expect(texts[1], '插件产出的摘要', reason: '摘要段原样保留');
+      expect(texts[2], '插件保留的最近原文');
+      expect(texts, isNot(contains('内置摘要：不该出现')));
+      expect(texts, isNot(contains('早期需求')), reason: '水位线之后的原文继续追加');
+      expect(texts.last, '本轮问题');
+    });
+
+    test('中转站上下文：首条不是 system ⇒ 前置一条；prompt.system 中转照常生效', () async {
+      final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+        textScript('ok'),
+      ]);
+      final LlmAgentEngine instance = engine(transport);
+      instance.systemPromptRelay =
+          ({
+            required AgentRunContext context,
+            required String defaultPrompt,
+          }) async => '插件改写后的系统提示词';
+      await instance
+          .run(
+            context(
+              compactedMessageCount: 1,
+              history: const <CoreMessageRef>[
+                CoreMessageRef(role: 'user', content: '旧'),
+                CoreMessageRef(role: 'user', content: '本轮问题'),
+              ],
+              // 插件没放提示词槽位（列表以非 system 开头）⇒ 核心在最前补一条
+              compactedContext: const <Map<String, dynamic>>[
+                <String, dynamic>{'role': 'user', 'content': '插件保留的最近原文'},
+              ],
+            ),
+            isCancelled: () => false,
+          )
+          .toList();
+      final List<LlmMessage> sent = transport.requests.single.messages;
+      expect(sent.first.role, LlmRole.system);
+      expect(
+        sent.first.content,
+        '插件改写后的系统提示词',
+        reason: '槽位刷新走的是 prompt.system 中转（不是内置拼装结果）',
+      );
+      expect(sent[1].content, '插件保留的最近原文');
+      expect(sent.last.content, '本轮问题');
+    });
+
+    test('中转站上下文：prompt.system 回空串 ⇒ 删掉槽位（不留过期提示词）', () async {
+      final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+        textScript('ok'),
+      ]);
+      final LlmAgentEngine instance = engine(transport);
+      instance.systemPromptRelay =
+          ({
+            required AgentRunContext context,
+            required String defaultPrompt,
+          }) async => '';
+      await instance
+          .run(
+            context(
+              compactedMessageCount: 1,
+              history: const <CoreMessageRef>[
+                CoreMessageRef(role: 'user', content: '旧'),
+                CoreMessageRef(role: 'user', content: '本轮问题'),
+              ],
+              compactedContext: const <Map<String, dynamic>>[
+                <String, dynamic>{'role': 'system', 'content': '插件压缩时的旧提示词'},
+                <String, dynamic>{'role': 'system', 'content': '插件产出的摘要'},
+              ],
+            ),
+            isCancelled: () => false,
+          )
+          .toList();
+      final List<LlmMessage> sent = transport.requests.single.messages;
+      expect(
+        sent.map((LlmMessage m) => m.content),
+        isNot(contains('插件压缩时的旧提示词')),
+      );
+      expect(sent.first.content, '插件产出的摘要');
+      expect(sent.first.role, LlmRole.system);
     });
 
     test('切点落在工具卡片上时，引擎把 tool_calls 补回来（序列依然合法）', () async {
