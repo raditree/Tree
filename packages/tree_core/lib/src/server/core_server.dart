@@ -1094,6 +1094,8 @@ class CoreServer {
     router.add('POST', ApiPaths.settingsDataCollection, _setDataCollection);
     router.add('GET', ApiPaths.files, _listFiles);
     router.add('GET', ApiPaths.fileContent, _fileContent);
+    // 同路径的 PUT（M10）：源码编辑器保存（完整文本覆盖写）。
+    router.add('PUT', ApiPaths.fileContent, _fileWriteContent);
     router.add('GET', ApiPaths.filePdfInfo, _filePdfInfo);
     router.add('POST', ApiPaths.fileDownload, _downloadFile);
     router.add('POST', ApiPaths.fileDownloadFolder, _downloadFolder);
@@ -2499,6 +2501,67 @@ class CoreServer {
     );
     if (await _writeResultError(request, result)) return;
     await writeJson(request, 200, result);
+  }
+
+  /// PUT /api/files/{workspaceId}/content?path=&force= ：按完整文本覆盖写（M10）。
+  ///
+  /// 前端源码编辑器保存用：请求体 {content, if_size?}（if_size = 前端加载时看到的
+  /// 字节数）。成功 200 {success, path, size, written}；if_size 与当前字节数不符
+  /// → 409 冲突 {error: 'conflict', detail, size}（文件已不存在时省略 size、由 detail
+  /// 说明，前端据此判定 missing）；其余失败
+  /// 400 {error, detail}。team_id 与 GET 同口径：当前核心按 workspaceId 定位工作
+  /// 空间，该参数仅为前后端调用点一致而保留、不参与分派。
+  ///
+  /// 落盘与判定（路径守卫 / 二进制 / 上限 / 冲突）都在 [FileService.writeContent]，
+  /// 这里只负责解析请求与把 {error, detail, status} 翻成 HTTP 响应。
+  Future<void> _fileWriteContent(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final FileService? files = fileService;
+    if (files == null) {
+      await writeJson(request, 501, errorBody('文件服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic>? body = await _jsonBody(request);
+    if (body == null) return;
+    final Object? content = body['content'];
+    if (content is! String) {
+      await writeJson(request, 400, <String, dynamic>{
+        'error': 'invalid_body',
+        'detail': '请求体缺少 content 字段（必须是完整文本）',
+      });
+      return;
+    }
+    final Map<String, String> query = request.uri.queryParameters;
+    final Map<String, dynamic> result = await files.writeContent(
+      params['workspaceId'] ?? '',
+      path: query['path'] ?? '',
+      content: content,
+      ifSize: _optionalInt(body, 'if_size'),
+      force: _truthy(query['force']),
+    );
+    final Object? error = result['error'];
+    if (error == null) {
+      await writeJson(request, 200, result);
+      return;
+    }
+    // 写接口的错误体固定是 {error, detail}（409 冲突另带当前 size）：不再走
+    // _writeResultError 那套「error 即 detail」的口径。
+    final int status = (result['status'] as num?)?.toInt() ?? 400;
+    final Map<String, dynamic> payload = <String, dynamic>{
+      'error': error,
+      'detail': result['detail'] ?? error,
+    };
+    final Object? size = result['size'];
+    if (size != null) payload['size'] = size;
+    await writeJson(request, status, payload);
+  }
+
+  /// 查询串里的布尔开关：「1」/「true」（大小写不敏感）为真，其余为假。
+  static bool _truthy(Object? value) {
+    final String text = (value ?? '').toString().trim().toLowerCase();
+    return text == '1' || text == 'true' || text == 'yes' || text == 'on';
   }
 
   /// `POST /api/files/{workspaceId}/download`：原始字节下载（body: `{path}`）。

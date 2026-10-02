@@ -19,6 +19,8 @@ import '../team/team_workspace.dart';
 /// - 读：`list` / `content` / `readBytes` / `pdfInfo` / `gitLog` / `gitBranches`；
 /// - 写（M7d-3）：`uploadInit`/`uploadChunk`/`uploadComplete` 分片上传、
 ///   `syncToLocal`（整棵工作空间复制到本机目录）、`archive`（目录打包 tar.gz）；
+/// - 写文本（M10）：`writeContent`（`PUT /api/files/{id}/content`）：源码编辑器保存，
+///   本机与 SSH 都走工作空间 IO 抽象按 UTF-8 覆盖写，并保留换行风格；
 /// - **本机与 SSH 都要支持**（M7g）：配了 `ssh:` 的 agent 走 [remoteFilesFor] 拿到
 ///   [WorkspaceFiles]（SFTP 实现），本机走 dart:io；两条路径共用同一套安全边界与
 ///   REST 语义。远端上传仍然是"本地暂存分片 → complete 时一次 SFTP 写"（不需要
@@ -37,6 +39,7 @@ class FileService {
     this.ioFor,
     this.maxListEntries = 2000,
     this.maxContentBytes = 8 * 1024 * 1024,
+    this.maxWriteBytes = defaultMaxWriteBytes,
     this.gitTimeout = const Duration(seconds: 10),
     this.chunkSize = 4 * 1024 * 1024,
     this.maxArchiveBytes = 256 * 1024 * 1024,
@@ -55,6 +58,52 @@ class FileService {
   final void Function(String message)? log;
   final int maxListEntries;
   final int maxContentBytes;
+
+  /// 「按内容写文件」允许的**新内容**上限（UTF-8 字节数），默认 4 MB。
+  ///
+  /// 源码编辑器保存是"整段内容一次写"（内容已在内存里），必须有上限才不会
+  /// 被一个误操作的文件塞爆内存；更大的文件请走分片上传那条通道。
+  static const int defaultMaxWriteBytes = 4 * 1024 * 1024;
+  final int maxWriteBytes;
+
+  /// 拒绝按文本写回的扩展名：图片 / PDF / Office / 压缩包。
+  ///
+  /// 与前端 `lib/ui/widgets/attachment_preview.dart` 的口径一致——那些类型在
+  /// 前端本来就不当文本呈现，核心更不该把它们当文本覆盖写（保存一次就毁掉原文件）。
+  static const Set<String> nonTextExtensions = <String>{
+    // 图片
+    'png',
+    'jpg',
+    'jpeg',
+    'gif',
+    'webp',
+    'bmp',
+    'ico',
+    'tif',
+    'tiff',
+    // PDF
+    'pdf',
+    // Office
+    'doc',
+    'docx',
+    'xls',
+    'xlsx',
+    'ppt',
+    'pptx',
+    // 压缩包
+    'zip',
+    'rar',
+    '7z',
+    'tar',
+    'gz',
+    'bz2',
+    'xz',
+  };
+
+  /// 二进制探测的头部长度：与前端 `attachment_preview.dart` 的 `_looksBinary`
+  /// 同口径（前 4 KB 里出现 NUL 就当二进制）。
+  static const int binaryProbeBytes = 4096;
+
   final Duration gitTimeout;
 
   /// 服务端定标的分片大小（随 `upload_init` 返回，前端按这个值切片）。
@@ -359,6 +408,144 @@ class FileService {
       builder.add(chunk);
     }
     return builder.takeBytes();
+  }
+
+  /// 按**完整文本**覆盖写一个文件（PUT /api/files/{id}/content?path=）。
+  ///
+  /// 前端源码编辑器保存用：请求体给整段内容，这里按工作空间相对路径覆盖写。
+  /// 落盘一律走已有的**工作空间 IO 抽象**（本机 LocalWorkspaceIO、远端
+  /// remoteIoFor 拿到的 WorkspaceIO），不自己写盘、不自己起 ssh。
+  ///
+  /// 语义：
+  /// - 路径守卫与读路径同一口径（[resolve]）：空 / 绝对路径 / 盘符 / ~ / .. 逃逸一律 400；
+  /// - 新内容按 **UTF-8** 编码写；换行风格**原样保留**（不把 CRLF 规范化成 LF、不补尾换行）；
+  /// - 图片 / PDF / Office / 压缩包按扩展名拒绝；现有文件头部出现 NUL 也拒绝
+  ///   （与前端 attachment_preview.dart 同一口径：不是纯文本，写回去只会损坏它）；
+  /// - 新内容超过 [maxWriteBytes] 拒绝（整段内容一次写，更大的文件走分片上传）；
+  /// - [ifSize]（前端加载时看到的字节数）与当前字节数不符 → **409 冲突** + 当前 size，
+  ///   目标文件已不存在同样算冲突；[force] 为 true 时跳过该检查；
+  /// - 远端取不到可用的 SSH 工作空间 IO 时可读 400，**绝不假装成功**。
+  Future<Map<String, dynamic>> writeContent(
+    String workspaceId, {
+    required String path,
+    required String content,
+    int? ifSize,
+    bool force = false,
+  }) async {
+    final CoreAgent? agent = agentFor(workspaceId);
+    if (agent == null) return _error('工作空间不存在：$workspaceId');
+
+    final String root = rootFor(agent);
+
+    // 1) 路径守卫（与读路径同一口径）：越界 / 空路径一律 400
+    final String absolute;
+    try {
+      absolute = resolve(root, path);
+    } on FileServiceException catch (error) {
+      return _writeError('invalid_path', error.message);
+    }
+    final String relative = _relative(root, absolute);
+
+    // 2) 扩展名黑名单：图片 / PDF / Office / 压缩包一律不是文本
+    final String ext = p.extension(absolute).replaceFirst('.', '').toLowerCase();
+    if (nonTextExtensions.contains(ext)) {
+      return _writeError('not_text', '该文件不是纯文本（.$ext），不能作为文本保存：$path');
+    }
+
+    // 3) 新内容上限：按 UTF-8 字节数判断（写进去的就是这些字节）
+    final int newBytes = utf8.encode(content).length;
+    if (newBytes > maxWriteBytes) {
+      final String over = _mbText(newBytes);
+      final String limit = _mbText(maxWriteBytes);
+      return _writeError(
+        'too_large',
+        '内容过大（$over > 上限 $limit），请改用上传通道保存：$path',
+      );
+    }
+
+    // 4) 选后端：远端走 remoteIoFor（拿不到就如实 400），本机用本机 IO
+    final bool remote = agent.sshConfig != null;
+    final WorkspaceIO io;
+    if (remote) {
+      final WorkspaceIO? remoteIo = await remoteIoFor(agent);
+      if (remoteIo == null) {
+        return _writeError(
+          'remote_unavailable',
+          '该工作空间在远端（SSH）：核心未接入远端文件后端（工作空间 IO 不可用），无法保存',
+        );
+      }
+      io = remoteIo;
+    } else {
+      io = LocalWorkspaceIO(root);
+    }
+
+    // 5) 探测现有文件（大小 + 头部）：只为判冲突与二进制，不参与落盘。
+    //    SSH 后端同时实现 WorkspaceFiles，复用同一个连接对象，不再建第二条连接。
+    WorkspaceFiles? probe;
+    if (remote) {
+      // SSH 后端同时实现两个接口：能从 IO 对象窄化就用它，别用另一个可能
+      // 指向不同后端的 remoteFor 结果去探测。
+      final Object backend = io;
+      probe = backend is WorkspaceFiles ? backend : await remoteFor(agent);
+    }
+    final _ExistingFile existing = remote
+        ? await _probeRemote(probe, relative)
+        : _probeLocal(File(absolute));
+
+    // 6) 冲突：if_size 与当前字节数不符（目标已不存在也算）→ 409 + 当前 size
+    if (ifSize != null && !force) {
+      if (!existing.known) {
+        // 只能接 WorkspaceIO、没有 WorkspaceFiles 的远端后端：不知道就别撒谎说
+        // 冲突，但也绝不静默放过——如实 400（可读原因）。
+        return _writeError(
+          'probe_unavailable',
+          '远端文件后端不完整，无法校验文件是否被外部修改；请刷新后重试：$path',
+        );
+      }
+      if (!existing.exists) {
+        // 文件已不存在：**不带 size**——前端 FileWriteConflict 以 size 缺失
+        // （currentSize == null）判定 missing，带了 0 会被当成「存在且为空文件」。
+        return _writeError(
+          'conflict',
+          '文件已不存在，请刷新后再保存：$path',
+          status: 409,
+        );
+      }
+      if (existing.size != ifSize) {
+        return _writeError(
+          'conflict',
+          '文件已被外部修改，请刷新后再保存',
+          status: 409,
+          size: existing.size,
+        );
+      }
+    }
+
+    // 7) 现有文件头部含 NUL = 二进制，拒绝按文本覆盖
+    if (existing.exists && _hasNul(existing.head)) {
+      return _writeError('not_text', '该文件不是纯文本（含 NUL），不能作为文本保存：$path');
+    }
+
+    // 8) 落盘：工作空间 IO 抽象（本机 / 远端同一份实现），UTF-8、换行原样
+    final int written;
+    try {
+      written = await io.writeFile(relative, content);
+    } on WorkspacePathException catch (error) {
+      final String reason = error.reason;
+      return _writeError('invalid_path', '$reason：$path');
+    } on WorkspaceIoException catch (error) {
+      final String message = error.message;
+      return _writeError('write_failed', '保存失败：$message');
+    } catch (error) {
+      return _writeError('write_failed', '保存失败：$error', status: 500);
+    }
+    log?.call('保存文本文件：$relative（$written 字节）');
+    return <String, dynamic>{
+      'success': true,
+      'path': relative,
+      'size': written,
+      'written': written,
+    };
   }
 
   /// 读取文件内容：图片返回 base64，其余按文本解码（UTF-8 失败退 latin1）。
@@ -1501,6 +1688,98 @@ class FileService {
     }
   }
 
+  /// 「按内容写文件」的失败结果：error（机器码）+ detail（可直接展示的中文原因）。
+  ///
+  /// 与读路径的 [_error]（只有 error）不同：写接口的错误体要同时给机器码与中文原因，
+  /// 冲突还要带上当前 size（前端据此提示「刷新后再保存」）。
+  static Map<String, dynamic> _writeError(
+    String code,
+    String detail, {
+    int status = 400,
+    int? size,
+  }) {
+    final Map<String, dynamic> result = <String, dynamic>{
+      'error': code,
+      'detail': detail,
+      'status': status,
+    };
+    if (size != null) result['size'] = size;
+    return result;
+  }
+
+  /// 字节数的人读文本（错误提示里报上限用）。
+  static String _mbText(int bytes) {
+    final String text = (bytes / (1024 * 1024)).toStringAsFixed(1);
+    return '$text MB';
+  }
+
+  /// 头部是否含 NUL（文本里不该出现 NUL）：只看前 [binaryProbeBytes] 字节，
+  /// 与前端 attachment_preview.dart 的 _looksBinary 同一口径。
+  static bool _hasNul(List<int> bytes) {
+    final int n = bytes.length > binaryProbeBytes
+        ? binaryProbeBytes
+        : bytes.length;
+    for (int i = 0; i < n; i++) {
+      if (bytes[i] == 0) return true;
+    }
+    return false;
+  }
+
+  /// 本机探测现有文件（大小 + 头部字节）：只读，不参与落盘。
+  static _ExistingFile _probeLocal(File file) {
+    if (!file.existsSync()) return _ExistingFile.missing;
+    final RandomAccessFile raf;
+    try {
+      raf = file.openSync();
+    } catch (_) {
+      return _ExistingFile.unknown;
+    }
+    try {
+      final int size = raf.lengthSync();
+      final int count = size > binaryProbeBytes ? binaryProbeBytes : size;
+      final List<int> head = count <= 0 ? <int>[] : raf.readSync(count);
+      return _ExistingFile(known: true, exists: true, size: size, head: head);
+    } catch (_) {
+      return _ExistingFile.unknown;
+    } finally {
+      try {
+        raf.closeSync();
+      } catch (_) {
+        // 关不掉就算了：这是一次只读探测
+      }
+    }
+  }
+
+  /// 远端探测现有文件（大小 + 头部字节）：走 [WorkspaceFiles]（与文件面板同一条
+  /// SSH 连接对象）。拿不到探测后端时返回 unknown，由调用方如实报错。
+  Future<_ExistingFile> _probeRemote(WorkspaceFiles? files, String rel) async {
+    if (files == null) return _ExistingFile.unknown;
+    final int size;
+    try {
+      size = await files.sizeOf(rel);
+    } on WorkspacePathException {
+      return _ExistingFile.unknown;
+    } on WorkspaceIoException {
+      return _ExistingFile.missing;
+    } catch (_) {
+      return _ExistingFile.unknown;
+    }
+    if (size <= 0) {
+      return const _ExistingFile(known: true, exists: true);
+    }
+    try {
+      final List<int> head = await _collect(
+        files.openRead(rel, offset: 0, length: binaryProbeBytes),
+      );
+      return _ExistingFile(known: true, exists: true, size: size, head: head);
+    } on WorkspacePathException {
+      return _ExistingFile.unknown;
+    } catch (_) {
+      // 头部读不到不影响冲突判断：大小已经有了，NUL 探测退化为「没探测到」
+      return _ExistingFile(known: true, exists: true, size: size);
+    }
+  }
+
   static Map<String, dynamic> _error(String message, [int status = 404]) =>
       <String, dynamic>{'error': message, 'status': status};
 }
@@ -1583,6 +1862,37 @@ class _WalkEntry {
   final String absolutePath;
   final String relativePath;
   final int size;
+}
+
+/// 写入前对**现有文件**的只读探测结果（大小 + 头部字节）。
+///
+/// 三种状态必须分开，语义不同：
+/// - [unknown]：探测后端起不来（远端只接了 [WorkspaceIO] 而没有 [WorkspaceFiles]）——
+///   不能把「不知道」当成「没冲突」，由调用方如实报错；
+/// - [missing]：确定不存在（带了 if_size 算冲突，没带就直接创建）；
+/// - 其余：存在，带 [size] 与 [head]（head 用来探 NUL）。
+class _ExistingFile {
+  const _ExistingFile({
+    required this.known,
+    required this.exists,
+    this.size = 0,
+    this.head = const <int>[],
+  });
+
+  static const _ExistingFile unknown = _ExistingFile(
+    known: false,
+    exists: false,
+  );
+
+  static const _ExistingFile missing = _ExistingFile(
+    known: true,
+    exists: false,
+  );
+
+  final bool known;
+  final bool exists;
+  final int size;
+  final List<int> head;
 }
 
 /// 文件服务的可读错误。
