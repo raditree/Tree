@@ -17,7 +17,7 @@
 | [ui/widgets/message_panel.dart](ui/widgets/message_panel.dart) | 中栏消息流：分段渲染、工具/思考**一行式**（完整内容见右栏「详情」页）、提问卡片、断线重播去重、按 agent+会话过滤 |
 | [ui/widgets/teammates_window_page.dart](ui/widgets/teammates_window_page.dart) | 团队成员拓扑与成员工作进度窗口 |
 | [ui/widgets/](ui/widgets/) | 文件面板 / 查看器（源码高亮 + 编辑保存 + 分屏，见 [split_panes.dart](ui/widgets/split_panes.dart)）/ **集成终端（[terminal_panel.dart](ui/widgets/terminal_panel.dart)，Ctrl+J）**/ 消息输入框（[message_input.dart](ui/widgets/message_input.dart) + [attachment_preview.dart](ui/widgets/attachment_preview.dart) + 无边框输入样式 [input_style.dart](ui/widgets/input_style.dart)）/ 右栏详情（[detail_panel.dart](ui/widgets/detail_panel.dart)）、PDF 预览、Spec、待办、提问、插件、MCP、模型信息、Git 历史、设置页 |
-| [ui/services/](ui/services/) | 重播守卫、下载中心、会话重命名、插件 UI 槽位注册、主题、**代码高亮（[code_highlight.dart](ui/services/code_highlight.dart)）**、**编辑器偏好（[editor_settings.dart](ui/services/editor_settings.dart)）**、详情选中（[detail_selection.dart](ui/services/detail_selection.dart)）、**团队级模式与目录合成（[team_scope_view.dart](ui/services/team_scope_view.dart)）** |
+| [ui/services/](ui/services/) | 重播守卫、下载中心、会话重命名、插件 UI 槽位注册、主题、**共享编辑缓冲（[editor_buffer.dart](ui/services/editor_buffer.dart)）**、**代码高亮（[code_highlight.dart](ui/services/code_highlight.dart)）**、**编辑器偏好（[editor_settings.dart](ui/services/editor_settings.dart)）**、详情选中（[detail_selection.dart](ui/services/detail_selection.dart)）、**团队级模式与目录合成（[team_scope_view.dart](ui/services/team_scope_view.dart)）** |
 
 ## 不变量（assertions）
 
@@ -83,15 +83,23 @@
     着色不引第三方包，一张规则表 + 单遍扫描（关键字 / 类型 / 字符串 / 注释 / 数字 / 注解 / 函数名），
     **只在 ≤ 128 KB 时着色**（超过退回单色，保证输入不卡），记号按「文本 + 配色」缓存——按键才重算一次；
     是否文本**看字节**（前 4 KB 有 NUL 就当二进制，扩展名骗人的文件不会被渲染成乱码）。只读闸门（缺一不可）：
-    图片 / PDF / Office（复杂格式）、**被截断的大文件**（写回去等于把文件截短）、含 NUL 的二进制、分屏里被锁的副本。
+    图片 / PDF / Office（复杂格式）、**被截断的大文件**（写回去等于把文件截短）、含 NUL 的二进制、外部显式传入的
+    `readOnly`。**同文件双开不在这条闸门里**——那两个窗格共享同一份缓冲（不变量 13）。
     保存**一律走核心** `PUT /api/files/{id}/content`（本机与 SSH 同一套，前端不直接写盘），带 `if_size` 做外部改动检测：
     磁盘现值不符 → 409 → UI 给「覆盖保存（force）/ 放弃我的改动并刷新 / 取消」。自动保存只做**失焦与离开**
     （切走、关窗格、换文件、关查看器；可在设置里关掉改成纯手动 Ctrl+S），**没有定时器**——定时写入会打断正在输入的思路。
 
-13. **分屏（VS Code 型）只做二分**（[ui/widgets/split_panes.dart](ui/widgets/split_panes.dart) +`file_panel`）：左右 / 上下可切、
+13. **分屏（VS Code 型）只做二分，同一个文件的两个窗格共享一份缓冲**（[ui/widgets/split_panes.dart](ui/widgets/split_panes.dart)
+    +`file_panel` + [ui/services/editor_buffer.dart](ui/services/editor_buffer.dart)）：左右 / 上下可切、
     分隔可拖（夹在 0.2–0.8，同方向最小 120px）、每格独立打开文件与保存、可用空间太窄降级成单窗格。
-    **同一个文件**在两个窗格里打开时，非活动窗格强制只读——两份缓冲各写各的，后保存的那次会把对方写的覆盖掉。
-    换文件 / 关窗格前先 `confirmLeave()`：开着失焦保存就静默写回，关着就问「保存 / 不保存 / 取消」。
+    **同一个文件**在两个窗格里打开时两侧共用**同一个** `EditorBuffer`（一个 `CodeEditingController` + 一份
+    `dirty` / `saving` / `loadedSize`，VS Code 的 TextDocument 口径）：两边都能编辑、一边打字另一边立刻可见，
+    谁保存都只写一次盘——**没有**"两份缓冲互相覆盖"这回事，所以旧的"非活动窗格强制只读"口径**已被推翻**；
+    双开只留一条"两侧共享同一份缓冲，就地编辑即同步"的提示，不再拦编辑。
+    控制器归缓冲所有：**两个窗格都关掉之后**才释放（先关掉的那个不能把另一个正在用的控制器 dispose 掉）；
+    [FileViewer](ui/widgets/file_viewer.dart) 的 `buffer` 参数可空，没外部传时自己 new 一份并自己释放
+    （既有调用方与测试零改动）。换文件 / 关窗格前先 `confirmLeave()`：开着失焦保存就静默写回，关着就问
+    「保存 / 不保存 / 取消」——问的是**共享**的那份脏标记，同一份文档的两个窗格只问一次。
 
 14. **Ctrl+J 把输入框那块换成集成终端（真 PTY）**（[ui/widgets/terminal_panel.dart](ui/widgets/terminal_panel.dart)、
     [ui/services/vt_screen.dart](ui/services/vt_screen.dart)、[io/websocket_service.dart](io/websocket_service.dart) 的 `terminalFrames`）：
@@ -138,9 +146,11 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 派生文本纯函数、右栏页签接线源钉）、`test/message_stream_style_test.dart`（模型消息高亮块不套边框、用户消息仍是气泡）、
 `test/code_highlight_test.dart`（语言识别、各语言词法、注释与字符串的优先级、未闭合块注释、记号不重叠、控制器着色 +
 大文件退回单色 + 输入法组字交回平台）、`test/file_editor_test.dart`（真起假核心 HttpServer：改一下就进未保存态、Ctrl+S 发出
-完整内容与 `if_size`、保存失败给可见原因、409 冲突 → 覆盖保存带 force=1、截断/二进制/图片/分屏副本四种只读闸门、
-失焦保存的开与关、返回时静默写回或问一次）、`test/split_panes_test.dart`（二分几何、拖动比例、夹取、太窄降级、
-文件面板的分屏接线源钉）、`test/vt_screen_test.dart`（VT 解析器：换行 / `\r` 覆盖、SGR、CUP/ED/EL、备用屏进出、
+完整内容与 `if_size`、保存失败给可见原因、409 冲突 → 覆盖保存带 force=1、截断/二进制/图片/外部 readOnly 四种只读闸门、
+**同文件双窗格共享一份缓冲**（同一个控制器、一边打字另一边立刻可见、任一窗格保存后两边一起变成已保存且只发一次 PUT、
+真只读的文档不建控制器、窗格 dispose 不动外部传入的缓冲、缓冲只在值真变时通知）、真面板分屏的端到端接线（同一份缓冲 +
+关掉一个窗格后另一个继续可编辑）、失焦保存的开与关、返回时静默写回或问一次）、`test/split_panes_test.dart`（二分几何、拖动比例、夹取、太窄降级、
+文件面板的分屏接线源钉：同文件双开复用同一个缓冲、不再锁只读）、`test/vt_screen_test.dart`（VT 解析器：换行 / `\r` 覆盖、SGR、CUP/ED/EL、备用屏进出、
 跨块 UTF-8、宽字符两格、未知序列安全跳过、resize、DSR/DA 应答、随机含 ESC 字节流不抛）、
 `test/terminal_panel_test.dart`（终端面板：打开就发 `terminal_open` 与尺寸并抢焦点、ready 显示 shell/cwd、
 输出进缓冲、键盘译码（回车 / 方向键 / Ctrl+C）、Ctrl+J 交给外层、error 与 exit 的显示、别的会话 id 的帧被丢、

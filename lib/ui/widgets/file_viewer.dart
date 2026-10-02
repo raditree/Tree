@@ -11,6 +11,7 @@ import '../../io/platform_support.dart';
 import '../models/file_content.dart';
 import '../services/code_highlight.dart';
 import '../services/download_center.dart';
+import '../services/editor_buffer.dart';
 import '../services/editor_settings.dart';
 import 'input_style.dart';
 import 'pdf_preview.dart';
@@ -97,6 +98,10 @@ const List<String> officeExtensions = [
 /// **编辑只限纯文本**（[lib/README.md] 不变量 12）：图片 / PDF / Office 只读，
 /// 被截断的大文件（只预览了前一段）与含 NUL 的二进制也只读——把截断的内容写回去
 /// 等于把文件截短。保存统一走核心（本机与 SSH 同一套），前端不直接写盘。
+///
+/// **分屏里同一个文件的两个窗格共用一份 [EditorBuffer]**（同一个控制器 + 一份
+/// dirty / saving / loadedSize）：两边都能编辑，一边打字另一边立刻可见，谁保存都只有
+/// 一套语义（见 [lib/README.md] 不变量 13）。
 class FileViewer extends StatefulWidget {
   /// 工作空间 ID
   final String workspaceId;
@@ -113,12 +118,22 @@ class FileViewer extends StatefulWidget {
   /// 返回回调（用于关闭查看器）
   final VoidCallback? onClose;
 
-  /// 外部强制只读。分屏里**同一个文件**开了两个窗格时，非活动窗格用它锁成只读：
-  /// 两个编辑器各自持有一份缓冲，谁后保存都会把对方写的覆盖掉。
+  /// 外部强制只读（其它调用方与测试用；分屏**不再**用它锁第二个窗格）
   final bool readOnly;
 
-  /// 强制只读的原因（显示在锁图标与正文提示条上）
+  /// 外部强制只读的原因（显示在锁图标与正文提示条上）
   final String readOnlyReason;
+
+  /// 这份文档的**共享编辑缓冲**。
+  ///
+  /// 同一个路径的多个窗格传**同一个实例** ⇒ 两边共用一个控制器与一份
+  /// dirty / saving / loadedSize（见 [EditorBuffer]），这就是"一个文件一份文档、
+  /// 两个视图"。为 null 时本控件自己 new 一份并**自己负责 dispose**
+  /// （既有调用方与测试零改动）；外部传入的那份由传入者释放（文件面板按路径持有）。
+  final EditorBuffer? buffer;
+
+  /// 非阻断的窗格提示（同文件双开时说明两侧共享同一份缓冲；空串 = 不显示）
+  final String paneNotice;
 
   const FileViewer({
     super.key,
@@ -129,6 +144,8 @@ class FileViewer extends StatefulWidget {
     this.onClose,
     this.readOnly = false,
     this.readOnlyReason = '',
+    this.buffer,
+    this.paneNotice = '',
   });
 
   @override
@@ -162,20 +179,32 @@ class FileViewerState extends State<FileViewer> {
   /// PDF 总页数（来自核心的启发式 pdf_info，仅用于信息栏展示）
   int _totalPages = 0;
 
+  /// 这份文档的共享编辑缓冲：外部传入的就用它，否则自己 new 一份（见 [_bindBuffer]）
+  late EditorBuffer _buf;
+
+  /// 自己 new 的那份缓冲（widget.buffer == null 时）；外部传入的由持有者释放
+  EditorBuffer? _ownBuf;
+
   /// 编辑器控制器（可编辑时才有）。带高亮，见 code_highlight.dart。
-  CodeEditingController? _editor;
+  ///
+  /// 委托到共享缓冲：控制器归缓冲所有，换窗格 / 换文件都不在这里释放。
+  CodeEditingController? get _editor => _buf.controller;
+  set _editor(CodeEditingController? value) => _buf.controller = value;
 
   /// 文本域的焦点节点：失焦就是「切走」，触发自动保存
   final FocusNode _editorFocus = FocusNode();
 
-  /// 是否有未保存的改动
-  bool _dirty = false;
+  /// 是否有未保存的改动（共享：任一窗格改了，两边都是未保存态）
+  bool get _dirty => _buf.dirty;
+  set _dirty(bool value) => _buf.dirty = value;
 
-  /// 是否正在保存（挡住重复提交：一次保存 = 一次 HTTP + 一次落盘）
-  bool _saving = false;
+  /// 是否正在保存（共享，挡住重复提交：一次保存 = 一次 HTTP + 一次落盘）
+  bool get _saving => _buf.saving;
+  set _saving(bool value) => _buf.saving = value;
 
-  /// 加载时文件的**真实**字节数：保存时作为 if_size 做外部改动检测
-  int _loadedSize = 0;
+  /// 加载时文件的**真实**字节数：保存时作为 if_size 做外部改动检测（共享）
+  int get _loadedSize => _buf.loadedSize;
+  set _loadedSize(int value) => _buf.loadedSize = value;
 
   /// 内容被截断（大文件只回了前一段）⇒ 只读
   bool _truncated = false;
@@ -189,8 +218,25 @@ class FileViewerState extends State<FileViewer> {
   @override
   void initState() {
     super.initState();
+    _bindBuffer();
     _editorFocus.addListener(_onEditorBlur);
     _startLoad();
+  }
+
+  /// 绑定这份文档的共享缓冲：外部传入就用它（同一个文件的两个窗格就是同一个实例），
+  /// 否则自己 new 一份并自己负责 dispose。
+  void _bindBuffer() {
+    _ownBuf = widget.buffer == null ? EditorBuffer() : null;
+    _buf = widget.buffer ?? _ownBuf!;
+    _buf.addListener(_onBufferChanged);
+  }
+
+  /// 缓冲变了（另一个窗格在打字 / 保存）：本窗格跟着重建。
+  ///
+  /// 只重建，不在这里改缓冲——否则会在别的窗格的通知里再触发一轮通知。
+  void _onBufferChanged() {
+    if (!mounted) return;
+    setState(() {});
   }
 
   /// 换文件：丢掉旧缓冲与编辑态，重新加载。
@@ -200,23 +246,36 @@ class FileViewerState extends State<FileViewer> {
   void didUpdateWidget(covariant FileViewer oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.filePath == widget.filePath &&
-        oldWidget.workspaceId == widget.workspaceId) {
+        oldWidget.workspaceId == widget.workspaceId &&
+        identical(oldWidget.buffer, widget.buffer)) {
       return;
     }
-    final CodeEditingController? old = _editor;
-    _editor = null;
-    _dirty = false;
-    _saving = false;
+    // 换缓冲：旧的解绑。**自己 new 的那份**随旧文档一起作废（下一帧回收：本帧
+    // TextField 还在用它换 controller）；外部传入的那份归持有者（文件面板），
+    // 另一个窗格可能还在用，绝不能在这里 dispose。
+    _buf.removeListener(_onBufferChanged);
+    final EditorBuffer? orphan = _ownBuf;
+    if (widget.buffer != null) {
+      _ownBuf = null;
+      _buf = widget.buffer!;
+    } else {
+      _ownBuf = EditorBuffer();
+      _buf = _ownBuf!;
+    }
+    _buf.addListener(_onBufferChanged);
+    if (orphan != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => orphan.dispose());
+    }
+    // 只清**本窗格**自己的态：控制器 / dirty / saving / loadedSize 是共享缓冲的，
+    // 新文档有它自己的那份（上面刚绑好）。
     _saveError = null;
-    _loadedSize = 0;
+    _content = '';
     _truncated = false;
     _isBinary = false;
     _showPreview = true;
-    _content = '';
-    // 下一帧再回收：本帧 TextField 还在用它换 controller
-    if (old != null) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
-    }
+    // 不在这里写共享缓冲的只读理由：此刻本窗格还没加载，算出来的"可编辑"可能是错的，
+    // 而 target 缓冲对同一个路径本来就存着正确的那条（没有就等加载完成后再写，见
+    // [_publishBufferReason]）。
     _startLoad();
   }
 
@@ -227,6 +286,8 @@ class FileViewerState extends State<FileViewer> {
       setState(() {
         _isLoading = false;
       });
+      // 这里跑在 build 里（initState / didUpdateWidget 直接调过来）：帧后再写
+      _publishBufferReasonAfterFrame();
     } else if (_fileType == _FileType.pdf) {
       // PDF：核心给字节，前端用 pdfrx 渲染（M7e 方案②）
       unawaited(_loadPdf());
@@ -277,7 +338,10 @@ class FileViewerState extends State<FileViewer> {
       ));
     }
     _cleanupPdfTemp();
-    _editor?.dispose();
+    // 控制器归共享缓冲所有：外部传入的缓冲由持有者（文件面板）在没有窗格再引用它时
+    // 释放，**不能**被先关掉的那个窗格 dispose 掉；只有自己 new 的那份跟着本 State 走。
+    _buf.removeListener(_onBufferChanged);
+    _ownBuf?.dispose();
     _editorFocus.dispose();
     super.dispose();
   }
@@ -316,7 +380,11 @@ class FileViewerState extends State<FileViewer> {
   ///
   /// PDF / Office 为二进制格式，不通过文本接口获取，直接展示信息卡片。
   /// 图片文件通过 getFileContent 获取 base64 编码内容后本地解码。
-  Future<void> _loadContent() async {
+  ///
+  /// [reload] = 这份文档已经在编辑（刷新 / 409 的"放弃我的改动并刷新"）：允许用磁盘
+  /// 内容**覆盖**共享缓冲。普通加载（含同文件第二个窗格的首载）只读磁盘，
+  /// 绝不用重读到的旧内容把另一个窗格正在编辑的那份重建或清掉。
+  Future<void> _loadContent({bool reload = false}) async {
     final _FileType type = _fileType;
     // PDF 通过专用方法加载
     if (type == _FileType.pdf) {
@@ -361,15 +429,20 @@ class FileViewerState extends State<FileViewer> {
           _loadedSize = info.size;
           _isLoading = false;
         });
+        _publishBufferReason();
       } else {
+        final CodeEditingController? open = _buf.controller;
         setState(() {
-          _content = info.content;
+          // 同一份文档已在别的窗格打开：预览 / 复制看到的是**共享缓冲**里那份，
+          // 不是刚读回来的旧磁盘内容（reload 例外——那正是要回到盘上那一份）。
+          _content = (open != null && !reload) ? open.text : info.content;
           _loadedSize = info.size;
           _truncated = info.truncated;
           _isBinary = info.content.contains('\u0000');
           _isLoading = false;
         });
-        _prepareEditor();
+        _publishBufferReason();
+        _prepareEditor(reload: reload);
       }
     } on Exception catch (e) {
       if (!mounted) return;
@@ -407,6 +480,7 @@ class FileViewerState extends State<FileViewer> {
         _pdfPath = path;
         _isLoading = false;
       });
+      _publishBufferReason();
     } on Exception catch (e) {
       if (!mounted) return;
       setState(() {
@@ -488,8 +562,32 @@ class FileViewerState extends State<FileViewer> {
             thickness: 1,
             color: Theme.of(context).dividerColor,
           ),
+          // 非阻断的窗格提示（同文件双开：说明两侧共享同一份缓冲，不挡编辑）
+          if (widget.paneNotice.isNotEmpty) _buildPaneNotice(),
           // 内容区域
           Expanded(child: _buildBody()),
+        ],
+      ),
+    );
+  }
+
+  /// 窗格提示条：一条**不挡编辑**的说明（与只读提示条的区别是谁都能继续写）
+  Widget _buildPaneNotice() {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+      color: cs.primary.withValues(alpha: 0.08),
+      child: Row(
+        children: <Widget>[
+          Icon(Icons.sync_alt, size: 13, color: cs.primary),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              widget.paneNotice,
+              style: TextStyle(fontSize: 11, color: cs.primary),
+            ),
+          ),
         ],
       ),
     );
@@ -621,8 +719,9 @@ class FileViewerState extends State<FileViewer> {
             IconButton(
               icon: const Icon(Icons.refresh, size: 18),
               color: cs.onSurfaceVariant,
-              tooltip: '刷新',
-              onPressed: _isLoading ? null : _loadContent,
+              tooltip: '刷新（重新读盘，放弃未保存的改动）',
+              onPressed:
+                  _isLoading ? null : () => unawaited(_loadContent(reload: true)),
             ),
         ],
       ),
@@ -724,16 +823,24 @@ class FileViewerState extends State<FileViewer> {
 
   /// 这个文件**允许**编辑吗：只看类型与内容特征，不看控制器是否就绪。
   ///
-  /// 拒绝的四种情况（见 lib/README.md 不变量 12）：图片 / PDF / Office（复杂格式）、
-  /// 被截断的大文件（写回去会把文件截短）、含 NUL 的二进制、以及分屏里被锁成只读的副本。
+  /// 拒绝的四类情况（见 lib/README.md 不变量 12）：图片 / PDF / Office（复杂格式）、
+  /// 被截断的大文件（写回去会把文件截短）、含 NUL 的二进制、以及外部显式传入的
+  /// readOnly。**同文件双开不在其中**——那两个窗格共享同一份缓冲，两边都能编辑。
   bool get _editableFile =>
       _readOnlyReason.isEmpty && !_isLoading && _error == null;
 
-  /// 只读原因（空串 = 可编辑）
+  /// 只读原因（空串 = 可编辑）：外部强制只读优先；否则以共享缓冲里那条**跟着文件走**
+  /// 的理由为准（同一个文件的两个窗格同一条），缓冲里还没有就按当前已知信息自己算一条。
   String get _readOnlyReason {
     if (widget.readOnly) {
       return widget.readOnlyReason.isEmpty ? '只读打开' : widget.readOnlyReason;
     }
+    final String shared = _buf.readOnlyReason;
+    return shared.isNotEmpty ? shared : _documentReadOnlyReason;
+  }
+
+  /// 这份**文档自身**不能编辑的原因（空串 = 可编辑）；外部 readOnly 不在这里判
+  String get _documentReadOnlyReason {
     switch (_fileType) {
       case _FileType.image:
         return '图片不支持编辑';
@@ -753,15 +860,44 @@ class FileViewerState extends State<FileViewer> {
     }
   }
 
-  /// 造 / 更新编辑器控制器（可编辑时才有）
-  void _prepareEditor() {
+  /// 把这条**跟着文件走**的只读理由记进共享缓冲：同一个文件的两个窗格用同一条理由，
+  /// 而不是各算各的（值没变时缓冲不通知，所以不会多出一次重建）。
+  ///
+  /// 只在**异步**路径（加载完成之后）调用：写缓冲会通知另一个窗格重建，
+  /// build 期间通知会撞上"build 期间 markNeedsBuild"，那种场合走
+  /// [_publishBufferReasonAfterFrame]。
+  void _publishBufferReason() {
+    _buf.readOnlyReason = _documentReadOnlyReason;
+  }
+
+  /// 帧后再把只读理由记进共享缓冲（initState / didUpdateWidget / _startLoad 跑在 build 里）。
+  ///
+  /// 到帧后**重算**一次（此时加载结果可能已经落地），值没变时缓冲自己就不通知。
+  void _publishBufferReasonAfterFrame() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _publishBufferReason();
+    });
+  }
+
+  /// 造 / 更新编辑器控制器（可编辑时才有）。
+  ///
+  /// **控制器只建一次**：同一个文件在第二个窗格里打开时缓冲里已经有控制器了，必须复用
+  /// （另一个窗格可能已经在编辑），绝不能用刚读回来的磁盘内容把它重建或清掉。
+  /// [reload] = 刷新 /「放弃我的改动并刷新」：这时才允许用磁盘内容覆盖，
+  /// 两个窗格一起回到盘上那一份。
+  void _prepareEditor({bool reload = false}) {
     if (!_editableFile) return;
-    final CodeEditingController? old = _editor;
-    _editor = CodeEditingController(language: _language, text: _content);
-    // 下一帧再回收旧的：本帧 TextField 还在用它换 controller
-    if (old != null) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
+    final CodeEditingController? open = _editor;
+    if (open == null) {
+      // 走 _editor 的 setter：控制器归共享缓冲所有（换文件 / 换窗格都不在这里释放）
+      _editor = CodeEditingController(language: _language, text: _content);
+      return;
     }
+    if (!reload) return;
+    open.text = _content;
+    _saveError = null;
+    _buf.dirty = false;
   }
 
   /// 标题栏副标题：优先报「保存失败 / 未保存」，否则给路径
@@ -831,7 +967,7 @@ class FileViewerState extends State<FileViewer> {
       final String action = await _askConflict(conflict);
       _saving = false;
       if (action == 'overwrite') return _save(force: true);
-      if (action == 'reload') await _loadContent();
+      if (action == 'reload') await _loadContent(reload: true);
       return false;
     } catch (error) {
       _saving = false;

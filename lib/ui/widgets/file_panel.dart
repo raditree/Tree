@@ -12,6 +12,7 @@ import '../../io/platform_support.dart';
 import '../../io/workspace_refresh_service.dart';
 import '../services/detail_selection.dart';
 import '../services/download_center.dart';
+import '../services/editor_buffer.dart';
 import '../services/plugin_ui_registry.dart';
 import 'file_sync_button.dart';
 import 'file_tree.dart';
@@ -24,6 +25,9 @@ import 'plugin_ui_slots.dart';
 import 'question_panel.dart';
 import 'split_panes.dart';
 import 'todo_panel.dart';
+
+/// 同文件双开时的窗格提示：两侧**共享同一份缓冲**，不是两份各写各的。
+const String _sharedBufferNotice = '同一文件已在另一窗格打开：两侧共享同一份缓冲，就地编辑即同步';
 
 /// 文件管理面板（右栏）
 ///
@@ -42,6 +46,10 @@ import 'todo_panel.dart';
 /// TabController——避免每次 plugin_ui_update 都重置当前页签。
 ///
 /// 点击文件时以覆盖层方式弹出 [FileViewer]，点击返回按钮关闭查看器。
+///
+/// **分屏是"一个文件一份文档、两个视图"**：同一个路径的窗格共用同一个
+/// [EditorBuffer]（同一个控制器 + 一份 dirty / saving / loadedSize），两边都能编辑、
+/// 一边打字另一边立刻可见，保存只有一套语义（见 [lib/README.md] 不变量 13）。
 class FilePanel extends StatefulWidget {
   /// 工作空间 ID
   final String workspaceId;
@@ -106,9 +114,14 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
   /// 查看器窗格（1–2 个），每个是一个工作空间相对路径；空 = 不显示查看器。
   ///
   /// 分屏只做二分（用户 2026-10-02 定夺）：左右 / 上下可切、分隔可拖、各窗格独立
-  /// 打开文件与保存。**同一个文件**双开时非活动窗格强制只读——两份缓冲各写各的，
-  /// 后保存的那次会把对方写的覆盖掉。
+  /// 打开与保存。**同一个文件**双开时两侧共享同一份 [_viewerBuffers]——一个控制器 +
+  /// 一份 dirty / saving / loadedSize，所以不是"两份缓冲互相覆盖"，而是同一份文档的
+  /// 两个视图（旧口径"非活动窗格强制只读"已被推翻）。
   final List<String> _viewerPaths = <String>[];
+
+  /// 与 [_viewerPaths] 一一对应的共享编辑缓冲：同一个路径就是**同一个实例**，
+  /// 最后一个引用它的窗格关掉后才 dispose（控制器随之回收）。
+  final List<EditorBuffer> _viewerBuffers = <EditorBuffer>[];
 
   /// 每个窗格的 State key：换文件 / 关窗格前要问它「未保存的内容怎么办」
   final List<GlobalKey<FileViewerState>> _viewerKeys =
@@ -197,6 +210,12 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
     LocalExecutorService.instance.removeListener(_onLocalModeChanged);
     WorkspaceRefreshService.instance.removeListener(_onWorkspaceChanged);
     _registry.removeListener(_onPluginSlotsChanged);
+    // 面板没了，手里那些共享缓冲（及其控制器）一起收掉；
+    // 同文件双开时两格是同一个实例，去重后再 dispose。
+    for (final EditorBuffer buffer in <EditorBuffer>{..._viewerBuffers}) {
+      buffer.dispose();
+    }
+    _viewerBuffers.clear();
     _tabController.dispose();
     _fileTabController.dispose();
     super.dispose();
@@ -297,10 +316,14 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
   }
 
   /// 打开文件：没有窗格就新建，有就换**活动窗格**的内容（先处理未保存的改动）。
+  ///
+  /// 换到的路径若已在另一个窗格里开着，就取那个窗格的**同一个缓冲**：同一份文档两个
+  /// 视图，不是两份缓冲（见 [EditorBuffer]）。
   Future<void> _openViewer(String path) async {
     if (_viewerPaths.isEmpty) {
       setState(() {
         _viewerPaths.add(path);
+        _viewerBuffers.add(EditorBuffer());
         _viewerKeys.add(GlobalKey<FileViewerState>());
         _activePane = 0;
       });
@@ -310,44 +333,89 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
     if (_viewerPaths[index] == path) return;
     if (!await _confirmLeave(index)) return;
     if (!mounted) return;
+    final EditorBuffer open = _bufferFor(path);
+    final EditorBuffer previous = _viewerBuffers[index];
     setState(() {
       _viewerPaths[index] = path;
+      _viewerBuffers[index] = open;
     });
+    _releaseBuffer(previous);
   }
 
-  /// 分屏：把当前文件再开一个窗格（第二个窗格只读，见 [_isDuplicatePane]）
+  /// 某个路径的共享缓冲：已有窗格开着它就复用那一个（**同一个实例**），否则新建一份。
+  EditorBuffer _bufferFor(String path) {
+    for (int i = 0; i < _viewerPaths.length; i++) {
+      if (_viewerPaths[i] == path) return _viewerBuffers[i];
+    }
+    return EditorBuffer();
+  }
+
+  /// 没有窗格再引用这份缓冲了就释放它（控制器随 dispose 一起收掉）。
+  ///
+  /// 下一帧再释放：本帧刚被换掉的 TextField 还在拿它换 controller。
+  /// **同文件双开时先关掉的那个窗格不能把另一个窗格正在用的控制器 dispose 掉**，
+  /// 所以这里按实例判断"还有没有引用"。
+  void _releaseBuffer(EditorBuffer buffer) {
+    for (final EditorBuffer other in _viewerBuffers) {
+      if (identical(other, buffer)) return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) => buffer.dispose());
+  }
+
+  /// 分屏：把当前文件再开一个窗格（两侧共享**同一份**缓冲，见 [EditorBuffer]）
   void _splitViewer() {
     if (_viewerPaths.length >= 2 || _viewerPaths.isEmpty) return;
     setState(() {
       _viewerPaths.add(_viewerPaths[_activePane]);
+      // 同一个实例：两个窗格共用一份控制器与 dirty / saving / loadedSize
+      _viewerBuffers.add(_viewerBuffers[_activePane]);
       _viewerKeys.add(GlobalKey<FileViewerState>());
       _activePane = 1;
     });
   }
 
   /// 关闭一个窗格（未保存的内容按设置自动保存或问一次）
+  ///
+  /// 缓冲等**没有窗格再引用**它时才释放：同文件双开时先关掉的那个不能把另一个正在用
+  /// 的控制器收掉。
   Future<void> _closePane(int index) async {
     if (index < 0 || index >= _viewerPaths.length) return;
     if (!await _confirmLeave(index)) return;
     if (!mounted) return;
+    final EditorBuffer closed = _viewerBuffers[index];
     setState(() {
       _viewerPaths.removeAt(index);
       _viewerKeys.removeAt(index);
-      _activePane = _activePane.clamp(0, _viewerPaths.length - 1);
+      _viewerBuffers.removeAt(index);
+      // 关掉**最后一个**窗格时列表已空：clamp(0, -1) 会抛 ArgumentError，
+      // 这里退回 0（查看器随之关闭，缓冲照下面那条规则释放）
+      _activePane =
+          _viewerPaths.isEmpty ? 0 : _activePane.clamp(0, _viewerPaths.length - 1);
     });
+    _releaseBuffer(closed);
   }
 
-  /// 关闭整个查看器：每个窗格都要先处理未保存的改动，任何一个取消就整体不关
+  /// 关闭整个查看器：每份**文档**都要先处理未保存的改动，任何一个取消就整体不关。
+  ///
+  /// 同一份缓冲的两个窗格只问一次——它们是同一份文档，一个决定就够
+  /// （全关之后缓冲与控制器才释放）。
   Future<void> _closeViewer() async {
+    final Set<EditorBuffer> asked = <EditorBuffer>{};
     for (int i = 0; i < _viewerPaths.length; i++) {
+      if (!asked.add(_viewerBuffers[i])) continue;
       if (!await _confirmLeave(i)) return;
       if (!mounted) return;
     }
+    final Set<EditorBuffer> closing = <EditorBuffer>{..._viewerBuffers};
     setState(() {
       _viewerPaths.clear();
       _viewerKeys.clear();
+      _viewerBuffers.clear();
       _activePane = 0;
     });
+    for (final EditorBuffer buffer in closing) {
+      _releaseBuffer(buffer);
+    }
   }
 
   /// 离开某个窗格前把未保存内容处理掉（true = 可以离开）
@@ -358,7 +426,7 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
     return state.confirmLeave();
   }
 
-  /// 这个窗格里的文件是否也在别的窗格里开着（是 ⇒ 本窗格锁只读）
+  /// 这个窗格里的文件是否也在别的窗格里开着（是 ⇒ 提示两侧共享同一份缓冲）
   bool _isDuplicatePane(int index) {
     final String path = _viewerPaths[index];
     for (int i = 0; i < _viewerPaths.length; i++) {
@@ -600,7 +668,7 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
           if (!twoPanes)
             IconButton(
               icon: const Icon(Icons.vertical_split_outlined, size: 16),
-              tooltip: '分屏：同一个文件再开一个窗格（第二个窗格只读）',
+              tooltip: '分屏：同一个文件再开一个窗格（两侧共享同一份缓冲）',
               color: cs.onSurfaceVariant,
               onPressed: _splitViewer,
             ),
@@ -640,7 +708,7 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
     );
   }
 
-  /// 单个窗格：点它成为活动窗格；同文件双开时锁只读
+  /// 单个窗格：点它成为活动窗格；同文件双开时两侧共享同一份缓冲（只提示，不锁只读）
   Widget _buildPane(int index) {
     if (index < 0 || index >= _viewerPaths.length) {
       return const SizedBox.shrink();
@@ -654,10 +722,9 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
       teamId: widget.teamId,
       teamName: widget.teamName,
       filePath: _viewerPaths[index],
-      readOnly: duplicated,
-      readOnlyReason: duplicated
-          ? '同一个文件已在另一个窗格打开：这里只读，避免两份缓冲互相覆盖'
-          : '',
+      // 同一个文件的另一个窗格共用这一份缓冲：就地编辑即同步（见 EditorBuffer）
+      buffer: _viewerBuffers[index],
+      paneNotice: duplicated ? _sharedBufferNotice : '',
       onClose: () => unawaited(_closePane(index)),
     );
     if (_viewerPaths.length < 2) return viewer;

@@ -145,6 +145,7 @@ void main() {
 
     test('窗格状态、动作与 SplitPanes 都在', () {
       expect(panel.contains('final List<String> _viewerPaths'), isTrue);
+      expect(panel.contains('final List<EditorBuffer> _viewerBuffers'), isTrue);
       expect(panel.contains('void _splitViewer()'), isTrue);
       expect(panel.contains('Future<void> _closePane(int index)'), isTrue);
       expect(panel.contains('Future<void> _closeViewer()'), isTrue);
@@ -152,13 +153,25 @@ void main() {
       expect(panel.contains('return SplitPanes('), isTrue);
     });
 
-    test('换文件 / 关窗格前先处理未保存内容；同文件双开锁只读', () {
+    test('换文件 / 关窗格前先处理未保存内容；同文件双开共享同一份缓冲', () {
       expect(panel.contains('await _confirmLeave(index)'), isTrue);
-      expect(panel.contains('readOnly: duplicated'), isTrue);
+      // 同文件双开：新窗格复用**同一个** EditorBuffer 实例，而不是又开一份
       expect(
-        panel.contains('同一个文件已在另一个窗格打开'),
+        panel.contains('_viewerBuffers.add(_viewerBuffers[_activePane])'),
         isTrue,
-        reason: '只读的理由要写在界面上，不能只是不能编辑',
+      );
+      expect(panel.contains('buffer: _viewerBuffers[index]'), isTrue);
+      expect(panel.contains('readOnly: duplicated'), isFalse,
+          reason: '同文件双开不再是只读的理由（旧口径已被推翻）');
+      expect(
+        panel.contains('同一文件已在另一窗格打开：两侧共享同一份缓冲'),
+        isTrue,
+        reason: '要如实说明是共享一份缓冲，而不是不能编辑',
+      );
+      expect(
+        panel.contains('void _releaseBuffer(EditorBuffer buffer)'),
+        isTrue,
+        reason: '没有窗格再引用才释放，不能把另一个窗格在用的控制器 dispose 掉',
       );
     });
   });

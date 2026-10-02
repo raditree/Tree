@@ -8,7 +8,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:tree/io/api_service.dart';
 import 'package:tree/ui/services/code_highlight.dart';
+import 'package:tree/ui/services/editor_buffer.dart';
 import 'package:tree/ui/services/editor_settings.dart';
+import 'package:tree/ui/widgets/file_panel.dart';
 import 'package:tree/ui/widgets/file_viewer.dart';
 
 /// 假核心：只实现文件读写两个端点，并记录收到的 PUT。
@@ -25,6 +27,9 @@ class FakeCore {
   String content = '';
   int size = 0;
   bool truncated = false;
+
+  /// GET 文件列表端点（/api/files/{id}，不带 /content）返回的条目
+  List<Map<String, dynamic>> files = <Map<String, dynamic>>[];
 
   /// PUT 的响应脚本（按顺序取；用完后都按 200 成功）
   final List<({int status, Map<String, dynamic> body})> putResponses =
@@ -54,12 +59,17 @@ class FakeCore {
     Map<String, dynamic> payload;
     int status = 200;
     if (request.method == 'GET') {
-      payload = <String, dynamic>{
-        'content': content,
-        'path': request.uri.queryParameters['path'] ?? '',
-        'size': size,
-        if (truncated) 'truncated': true,
-      };
+      if (!request.uri.path.endsWith('/content')) {
+        // 文件列表端点（文件面板的端到端用例）
+        payload = <String, dynamic>{'files': files};
+      } else {
+        payload = <String, dynamic>{
+          'content': content,
+          'path': request.uri.queryParameters['path'] ?? '',
+          'size': size,
+          if (truncated) 'truncated': true,
+        };
+      }
     } else {
       puts.add((query: request.uri.query, body: body));
       final ({int status, Map<String, dynamic> body}) script =
@@ -144,6 +154,39 @@ void main() {
     // 上一个用例的控件树是在这一帧被替换掉的，它的 dispose 补写会打到刚起来的假核心上。
     // 清一次，保证每个用例只量自己这几步发出的请求。
     core.puts.clear();
+  }
+
+  /// 同一个文件的两个窗格：**共享同一份** [EditorBuffer]（file_panel 的分屏就这么接）。
+  ///
+  /// 直接摆两个 FileViewer 而不是整套 FilePanel：这里要钉的是"一份缓冲、两个视图"，
+  /// 面板那侧的接线由 split_panes_test 的源钉看着。
+  Future<EditorBuffer> pumpSharedPanes(
+    WidgetTester tester, {
+    String path = 'a.txt',
+    String notice = '',
+  }) async {
+    final EditorBuffer buffer = EditorBuffer();
+    Widget pane() => FileViewer(
+          workspaceId: 'ws1',
+          teamId: 'ws1',
+          filePath: path,
+          buffer: buffer,
+          paneNotice: notice,
+        );
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: Row(
+          children: <Widget>[
+            Expanded(child: pane()),
+            Expanded(child: pane()),
+          ],
+        ),
+      ),
+    ));
+    await settleIo(tester);
+    // 上一个用例的控件树是在这一帧被替换掉的，它的 dispose 补写会打到刚起来的假核心上
+    core.puts.clear();
+    return buffer;
   }
 
   Future<void> pressCtrlS(WidgetTester tester) async {
@@ -322,7 +365,7 @@ void main() {
       expect(find.byTooltip('图片不支持编辑'), findsOneWidget);
     });
 
-    testWidgets('分屏里被锁成只读的窗格：给出理由，不给文本域',
+    testWidgets('外部 readOnly 参数语义不变：给出理由，不给文本域',
         (WidgetTester tester) async {
       core.content = 'x';
       core.size = 1;
@@ -330,11 +373,126 @@ void main() {
         tester,
         path: 'a.txt',
         readOnly: true,
-        reason: '同一个文件已在另一个窗格打开',
+        reason: '外部调用方要求只读',
       );
 
       expect(find.byType(TextField), findsNothing);
-      expect(find.textContaining('同一个文件已在另一个窗格打开'), findsOneWidget);
+      expect(find.textContaining('外部调用方要求只读'), findsOneWidget);
+    });
+
+    testWidgets('同文件双窗格里的真只读闸门不变：两边都不给文本域，理由一致',
+        (WidgetTester tester) async {
+      core.content = 'abc\u0000def';
+      core.size = 7;
+      final EditorBuffer buffer =
+          await pumpSharedPanes(tester, path: 'weird.txt');
+
+      expect(find.byType(TextField), findsNothing);
+      expect(find.textContaining('二进制'), findsNWidgets(2));
+      expect(buffer.controller, isNull, reason: '真只读的文档不建控制器');
+    });
+  });
+
+  group('同文件双窗格共享一份缓冲（VS Code 的 TextDocument 口径）', () {
+    testWidgets('两个窗格都能编辑：两个文本域同一个控制器，一边打字另一边立刻可见',
+        (WidgetTester tester) async {
+      core.content = 'line1\n';
+      core.size = 6;
+      const String notice = '同一文件已在另一窗格打开：两侧共享同一份缓冲，就地编辑即同步';
+      final EditorBuffer buffer = await pumpSharedPanes(tester, notice: notice);
+
+      // 旧口径"同文件双开 ⇒ 第二个窗格只读"已被推翻：两边都是可编辑的文本域
+      expect(find.byType(TextField), findsNWidgets(2));
+      expect(find.text(notice), findsNWidgets(2),
+          reason: '双开只给提示，不再锁只读');
+
+      final List<TextField> fields =
+          tester.widgetList<TextField>(find.byType(TextField)).toList();
+      expect(identical(fields[0].controller, fields[1].controller), isTrue,
+          reason: '两个窗格必须共用同一个 CodeEditingController（一份缓冲）');
+      expect(identical(fields[0].controller, buffer.controller), isTrue);
+
+      await tester.enterText(find.byType(TextField).first, 'line1\nline2\n');
+      await tester.pump();
+
+      // 另一个窗格的文本域跟着变（同一个控制器 ⇒ 同一份文本、同一份脏标记）
+      expect(find.text('line1\nline2\n'), findsNWidgets(2));
+      expect(find.textContaining('未保存的改动'), findsNWidgets(2));
+    });
+
+    testWidgets('任一窗格保存成功：两边一起变成已保存，loadedSize 一起更新，只发一次 PUT',
+        (WidgetTester tester) async {
+      core.content = 'x';
+      core.size = 1;
+      final EditorBuffer buffer = await pumpSharedPanes(tester);
+
+      await tester.enterText(find.byType(TextField).first, 'two-panes');
+      await tester.pump();
+      expect(find.textContaining('未保存的改动'), findsNWidgets(2));
+      expect(find.byIcon(Icons.save), findsNWidgets(2),
+          reason: '脏标记共享：两边都显示可点的保存键');
+
+      // 在第二个窗格点保存（共享缓冲：从哪一边保存都是同一份文档）
+      await tester.tap(find.byIcon(Icons.save).last);
+      await settleIo(tester);
+
+      final List<Map<String, dynamic>> saved = putsWith(core, 'two-panes');
+      expect(saved, hasLength(1), reason: '一份缓冲一次保存只发一次 PUT');
+      expect(saved.single['if_size'], 1,
+          reason: '两个窗格看到的是同一个加载字节数');
+      expect(buffer.loadedSize, 'two-panes'.length,
+          reason: '保存成功后共享的 loadedSize 一起更新');
+      expect(find.textContaining('未保存的改动'), findsNothing,
+          reason: '保存成功后两边都不再是未保存态');
+      expect(find.byIcon(Icons.save), findsNothing);
+    });
+
+    testWidgets('FileViewer 对**外部传入**的缓冲不做 dispose：窗格关了，控制器还在',
+        (WidgetTester tester) async {
+      core.content = 'x';
+      core.size = 1;
+      final EditorBuffer buffer = await pumpSharedPanes(tester);
+      await tester.enterText(find.byType(TextField).first, 'kept');
+      await tester.pump();
+
+      // 两个窗格都拆掉（此时面板还没释放这份缓冲）：缓冲与控制器必须活着，
+      // 否则"两个窗格都关掉之后才释放"这条会被先关掉的那个窗格破坏。
+      await tester.pumpWidget(
+        const MaterialApp(home: Scaffold(body: SizedBox.shrink())),
+      );
+      await tester.pump();
+
+      expect(buffer.controller, isNotNull,
+          reason: '外部传入的缓冲归持有者释放，窗格不能把它 dispose 掉');
+      expect(buffer.controller!.text, 'kept', reason: '另一个窗格编辑的内容还在');
+      expect(buffer.dirty, isTrue);
+    });
+
+    testWidgets('EditorBuffer：值没变不通知；dispose 时把控制器一起收掉',
+        (WidgetTester tester) async {
+      final EditorBuffer buffer = EditorBuffer();
+      int notified = 0;
+      buffer.addListener(() => notified++);
+
+      buffer.dirty = true;
+      buffer.dirty = true; // 同一个值：不该再通知一次（按键不该重建另一个窗格）
+      buffer.loadedSize = 5;
+      buffer.loadedSize = 5;
+      expect(notified, 2, reason: '每个 setter 只在值真的变化时通知');
+
+      final CodeEditingController controller = CodeEditingController(
+        language: languageForPath('a.txt'),
+        text: 'x',
+      );
+      buffer.controller = controller;
+      expect(buffer.controller, same(controller));
+
+      buffer.dispose();
+      expect(buffer.controller, isNull, reason: '控制器归缓冲所有，随它一起释放');
+      // dispose 之后在途的保存 / 加载回调再写也不该抛（值照收，只是不再通知）
+      buffer.dirty = false;
+      expect(buffer.dirty, isFalse);
+      expect(notified, 3, reason: '释放之后不再通知任何人');
     });
   });
 
@@ -406,6 +564,75 @@ void main() {
 
       expect(putsWith(core, 'close-cancel'), isEmpty);
       expect(closed, isFalse);
+    });
+  });
+
+  /// 端到端：真文件面板 + 真分屏按钮（面板自己的缓冲接线，不只是源钉）
+  group('文件面板的分屏（端到端接线）', () {
+    Future<void> pumpPanel(WidgetTester tester) async {
+      core.files = <Map<String, dynamic>>[
+        <String, dynamic>{
+          'name': 'a.txt',
+          'path': 'a.txt',
+          'type': 'file',
+          'size': 6,
+          'modified': '',
+        },
+      ];
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 760,
+            height: 600,
+            child: FilePanel(workspaceId: 'ws1', teamId: 'ws1'),
+          ),
+        ),
+      ));
+      await settleIo(tester);
+      core.puts.clear();
+    }
+
+    testWidgets('分屏后两个窗格共享一份缓冲：一边打字另一边可见，关掉一个窗格缓冲还在',
+        (WidgetTester tester) async {
+      core.content = 'alpha\n';
+      core.size = 6;
+      await pumpPanel(tester);
+
+      // 文件树里点开 a.txt
+      await tester.tap(find.text('a.txt'));
+      await settleIo(tester);
+      expect(find.byType(TextField), findsOneWidget);
+
+      // 分屏按钮：第二个窗格复用**同一个**缓冲（不是又开一份）
+      await tester.tap(find.byTooltip('分屏：同一个文件再开一个窗格（两侧共享同一份缓冲）'));
+      await settleIo(tester);
+
+      expect(find.byType(TextField), findsNWidgets(2));
+      expect(
+        find.text('同一文件已在另一窗格打开：两侧共享同一份缓冲，就地编辑即同步'),
+        findsNWidgets(2),
+      );
+      final List<TextField> fields =
+          tester.widgetList<TextField>(find.byType(TextField)).toList();
+      expect(identical(fields[0].controller, fields[1].controller), isTrue,
+          reason: '同一个文件的两个窗格必须共用同一个控制器');
+
+      await tester.enterText(find.byType(TextField).first, 'alpha\nbeta\n');
+      await tester.pump();
+      expect(find.text('alpha\nbeta\n'), findsNWidgets(2));
+
+      // 关掉一个窗格：缓冲还有引用 ⇒ 不该被释放，另一个窗格继续可编辑
+      await tester.tap(find.byTooltip('关闭当前窗格'));
+      await settleIo(tester);
+      expect(find.byType(TextField), findsOneWidget);
+      expect(find.text('alpha\nbeta\n'), findsOneWidget);
+
+      // 再用窗格自己的「返回」关掉**最后一个**窗格：列表清空也要能关
+      // （曾经 clamp(0, -1) 会抛 ArgumentError）
+      await tester.tap(find.byTooltip('返回'));
+      await settleIo(tester);
+      expect(find.byType(TextField), findsNothing);
+      expect(find.text('a.txt'), findsOneWidget, reason: '查看器关掉后回到文件树');
     });
   });
 }
