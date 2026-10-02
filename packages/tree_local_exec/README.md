@@ -9,7 +9,8 @@
 | --- | --- |
 | [lib/src/workspace_io.dart](lib/src/workspace_io.dart) | 接口：`WorkspaceIO`（read/write/edit/grep/list/exec/git）、`WorkspaceFiles`（文件面板：列目录 / 原始字节 / 流）、结果类型与路径异常 |
 | [lib/src/local_workspace_io.dart](lib/src/local_workspace_io.dart) | 本机实现：进程树终止、非 UTF-8 输出标记（GBK 代码页尝试解码）、软超时交还活着的进程（`RunningLocalExec`） |
-| [lib/src/ssh_workspace_io.dart](lib/src/ssh_workspace_io.dart) | SSH 实现：SFTP + exec，心跳判活，链路失活显式失败 |
+| [lib/src/ssh_workspace_io.dart](lib/src/ssh_workspace_io.dart) | SSH 实现：SFTP + exec，心跳判活，链路失活显式失败；另含交互终端的透传口 `openShell`（远端根在这一层解决） |
+| [lib/src/ssh_shell_channel.dart](lib/src/ssh_shell_channel.dart) | **远端 shell 通道** `SshShellChannel`（交互终端用）：原始字节输出 / 键盘输入 / 改尺寸 / 退出码 / 幂等 `close`；dartssh2 实现在 [lib/src/dartssh_transport.dart](lib/src/dartssh_transport.dart) 的 `openShell`（`shell` 或 `exec + pty-req`） |
 | [lib/src/shell.dart](lib/src/shell.dart) | shell 参数：`-NonInteractive`、裸 `echo` 兼容翻译、逻辑运算符翻译（Windows/POSIX） |
 | [lib/src/ssh_liveness.dart](lib/src/ssh_liveness.dart) | SSH 心跳台账（连续 N 拍丢失 ⇒ 判失活） |
 | [lib/src/pty/pty_session.dart](lib/src/pty/pty_session.dart) | **伪终端会话**接口 `PtySession`（原始字节输出 / 键盘输入 / 改尺寸 / 退出码 / 幂等 `close`）+ 平台工厂 `startPtySession` |
@@ -41,6 +42,15 @@
     （`ClosePseudoConsole`，仍不退才 `TerminateProcess`）不留孤儿；读 isolate 的 `ReceivePort`
     **必须显式关**（否则 Dart VM 一直不退出）；ConPTY 的结构体必须**清零**分配——`LocalAlloc`
     不像 `calloc` 不清零，脏的 `STARTUPINFOW` 会让 `CreateProcessW` 在 `wcslen` 上访问违例崩掉。
+11. **远端 shell 通道（真 PTY）与一次性 `exec` 是两条路**：`SshTransport.openShell` 走 dartssh2 的
+    会话通道 + `pty-req`——`command` 为空 = 远端**登录 shell**，非空 = 远端登录 shell 以 `-c` 执行该
+    命令（`ssh -t host '<cmd>'` 的行为，退出码是**命令**的；真实 API 的 `SSHClient.shell()` 没有
+    command 参数，写进 PTY 只会拿到 shell 的退出码）。远端工作目录只由 `SshWorkspaceIO.openShell`
+    用**自己的远端根**填，核心不参与、也绝不把本机路径发给远端。`exitCode` **一定收口**（远端退出 /
+    对端关会话 / 链路断开 / 我们主动 close，拿不到退出状态给 **-1**）；`close()` **幂等**且**只关这一条
+    通道**（绝不 `SSHClient.close()`：SFTP / exec / 文件面板与它共用连接）；输出是**原始字节**。
+    边界：远端 sshd 必须允许 `shell` / `pty-req`（`PermitTTY no` 会被明确拒绝、回可读错误）；
+    本仓库**只用假通道验证过**（本机没有可连的 sshd），详见 [../../docs/known-issues.md](../../docs/known-issues.md) #12。
 
 ## 测试
 
@@ -55,4 +65,9 @@ dart test
 
 回归钉子：`exec_no_interactive_hang_test`（裸 `echo` 不再等输入）、`exec_soft_timeout_test`（软超时交还进程）、
 `shell_translate_test`（裸 echo / 逻辑运算符翻译）、`pty_session_test`（真 PTY：banner → `echo` 回读 →
-`resize` 不抛 → `close` 幂等且收掉进程 → `exit 3` 拿回 3 → ANSI/非 UTF-8 字节不被清洗也不崩 → 后端缺失给可读错误）。
+`resize` 不抛 → `close` 幂等且收掉进程 → `exit 3` 拿回 3 → ANSI/非 UTF-8 字节不被清洗也不崩 → 后端缺失给可读错误）、
+`ssh_shell_channel_test`（**远端 shell 通道的契约**，用假通道：[ssh_workspace_io_test.dart](test/ssh_workspace_io_test.dart)
+里的假传输 + [test/fake_ssh_shell_channel.dart](test/fake_ssh_shell_channel.dart)：透传尺寸与**远端根**、原始字节不受清洗、
+写入 / resize、`close` 幂等、`exitCode` 一定收口（含主动 close 给 -1）、**close 不关整条连接**、链路失活显式失败）。
+真链路的 SSH 会话通道没有在本仓库验证过（本机无 sshd），只保证编译通过与参数形状有据可依——见
+[../../docs/known-issues.md](../../docs/known-issues.md) #12。

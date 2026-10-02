@@ -14,7 +14,10 @@ import 'package:tree_protocol/tree_protocol.dart';
 /// 3. **无 stdin 也能存活**：`Start-Process`/服务化/双击等启动方式下子进程
 ///    立刻读到 stdin EOF，若把 EOF 当退出信号，核心会刚启动就消失；
 /// 4. **优雅退出**：父进程写一行 `shutdown` 后必须以 0 退出，否则应用退出
-///    会留下孤儿核心进程。
+///    会留下孤儿核心进程；
+/// 5. **外设预热不拖住握手**：MCP/插件卡住时握手仍必须立刻发出（见
+///    docs/known-issues.md #13：此前 `mcp.refresh()` 无超时 + `plugins.start()`
+///    逐家串行排在握手之前，界面只能等到 25s 握手超时）。
 void main() {
   test('CLI 启动核心：单行握手 + 鉴权 HTTP 可用 + shutdown 命令优雅退出', () async {
     // 显式隔离数据目录：绝不写真实用户的 %APPDATA%\Tree
@@ -103,6 +106,84 @@ void main() {
     );
     final (int, String) res = await core.get('/api/agents');
     expect(res.$1, 200, reason: '控制通道关闭后仍须继续服务：${res.$2}');
+  }, timeout: const Timeout(Duration(minutes: 3)));
+
+  test('外设（插件/MCP）卡住不拖住握手：握手之后才并行预热', () async {
+    final Directory tempData = Directory.systemTemp.createTempSync('tree_cli_boot_');
+    addTearDown(() {
+      if (tempData.existsSync()) tempData.deleteSync(recursive: true);
+    });
+    final String sep = Platform.pathSeparator;
+    final String dartExe = Platform.resolvedExecutable;
+    // 夹具：一个**故意不实现任何协议**的假外设（插件/MCP 握手一律不回）。
+    final File hang = File('${tempData.path}${sep}hang_peripheral.dart')
+      ..writeAsStringSync(
+        <String>[
+          "import 'dart:async';",
+          "import 'dart:io';",
+          '',
+          '/// 假外设：故意不实现任何协议（插件/MCP 握手一律不回）。',
+          '/// 只等 stdin 关闭（= 父进程死了）后退出，测试因此不会留下孤儿进程。',
+          'void main() {',
+          '  stdin.listen((_) {}, onDone: () => exit(0));',
+          '  Timer(const Duration(seconds: 60), () => exit(0));',
+          '}',
+          '',
+        ].join('\n'),
+      );
+    final Directory config = Directory('${tempData.path}${sep}config')
+      ..createSync(recursive: true);
+    File('${config.path}${sep}plugins.yaml').writeAsStringSync(
+      'enabled: true\n'
+      'plugins:\n'
+      '  - id: hang\n'
+      '    name: 挂住的假插件\n'
+      '    command: $dartExe\n'
+      "    args: ['run', '${hang.path}']\n"
+      '    enabled: true\n'
+      '    granularity: team\n'
+      '    scope: {}\n',
+    );
+    File('${config.path}${sep}mcp.yaml').writeAsStringSync(
+      'servers:\n'
+      '  - name: hang-mcp\n'
+      '    transport: stdio\n'
+      '    command: $dartExe\n'
+      "    args: ['run', '${hang.path}']\n"
+      '    enabled: true\n',
+    );
+
+    final Stopwatch boot = Stopwatch()..start();
+    final _CoreProcess core = await _CoreProcess.start(dataDir: tempData.path);
+    boot.stop();
+    addTearDown(core.dispose);
+    // 这条断言就是本次修复的判据：旧实现里握手排在 mcp.refresh()（初始连接**无超时**，
+    // 判活窗口 30s 起）与 plugins.start()（逐家串行、每家 20s）之后，必然撞上界面的
+    // 25s 握手超时。给足 `dart run` 的编译余量后，握手仍必须远早于它们。
+    print('[boot] 握手耗时 ${boot.elapsedMilliseconds}ms');
+    expect(
+      boot.elapsedMilliseconds,
+      lessThan(15000),
+      reason:
+          '握手被外设预热拖住了：${boot.elapsedMilliseconds}ms\n'
+          'stderr：${core.stderrLines.join('\n')}',
+    );
+    // 启动分段耗时日志：把「启动慢」变成可归因的数字
+    expect(
+      core.stderrLines.any((String line) => line.startsWith('[core:boot]')),
+      isTrue,
+      reason: '缺少启动分段耗时日志：${core.stderrLines.join('\n')}',
+    );
+    // 握手之后核心立刻可用
+    final (int, String) served = await core.get('/api/agents');
+    expect(served.$1, 200, reason: served.$2);
+    // 挂住的插件/MCP 不该拦住优雅退出
+    core.process.stdin.writeln('shutdown');
+    await core.process.stdin.flush();
+    final int exitCode = await core.process.exitCode.timeout(
+      const Duration(seconds: 30),
+    );
+    expect(exitCode, 0);
   }, timeout: const Timeout(Duration(minutes: 3)));
 }
 

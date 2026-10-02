@@ -11,13 +11,18 @@
 | [team_model.dart](team_model.dart) | 成员视图（字段白名单）与活动日志路径 `memberLogPath` |
 | [team_workspace.dart](team_workspace.dart) | 工作目录口径 `teamWorkspaceFor` 与 SSH 口径 `teamSshConfigFor` |
 | [message_dispatcher.dart](message_dispatcher.dart) | 消息派发：寻址 → 审核闸门 → 投递；活动日志的读写 |
-| [team_repair.dart](team_repair.dart) | 启动自愈：`parent_agent_id`/`team_id` 指向不存在的 agent 时重挂 / 升顶层（子树平移，改动前备份 `.bak.<n>`） |
+| [team_repair.dart](team_repair.dart) | 启动自愈：`parent_agent_id`/`team_id` 指向不存在的 agent 时重挂 / 升顶层（子树平移，改动前备份 `.bak.<n>`）；共享工作目录镜像 `syncWorkspaceMirrors` |
 
 ## 不变量（assertions）
 
 1. **成员就是 agent**：`team_id`（= TOP id）/ `parent_agent_id` / `level` 直接写在成员自己的 yaml 里，用户可以手改；`member_count` 一律按**实际成员数回填**，不是累加出来的计数器。
 2. **工作目录只有团队所有者（TOP）那一份**，成员一律跟随它（`teamWorkspaceFor` 沿途向上找，带深度与 seen 去重，配置成环也不会死循环）。成员自己 yaml 里的 `workspace_dir` **不生效**——否则"和 leader 共享工作目录"就变成一条能被旧配置悄悄覆盖的软约定，而"成员各自 `workspaces/<member_id>`"正是用户在界面上看不到成员进度的成因（见 [docs/known-issues.md](../../../../../docs/known-issues.md)）。
 3. **成员跟随 leader 的 SSH**：自己的 `ssh:` 优先，否则取 TOP 的（`teamSshConfigFor`）——SSH 团队里成员必须在**同一台机器**上干活。
+   `teamSshConfigFor` 是**"这是远端吗"的唯一判据**：工具层、文件面板、Git 面板、集成终端都走它，任何一处都不许
+   退回 `agent.sshConfig`（只看后者会把 SSH leader 的成员判成本机：文件面板去本机找远端路径、终端在本机起 shell——
+   两者都是真实 bug，见 [../files/README.md](../files/README.md) 不变量 9 与 [../terminal/README.md](../terminal/README.md)）。
+   **没有"成员覆盖成 local"这个概念**：TOP 配了 SSH 时成员无法单独切回本地，界面会如实拒绝并提示到 TOP 上去关
+   （见 [lib/README.md](../../../../../lib/README.md) 不变量 15）。
 4. **私有状态按 agent 分栏**：`.tree/<agent_id>/.self/`。**用 id，不用名字**（名字会变、也可能重复）；共享一份 `.self` 会把 `activity.log` 混在一起、且无法归属到具体成员。
 5. **三条硬规则**（都有自动化测试）：① **没有模型写入口**——team 工具的 create / update / review 收到 `model_id` 一律报错，模型只能由用户在界面上分配；② **新建成员恒为 `pending_model` 且 `model_id` 为空**，用户放行前不接收消息；③ **只能碰自己的子树**——不可移除自身 / 上级 / 非后代，目标有下级时必须显式 `cascade`。
 6. 派发只做**寻址、闸门、活动日志**：串行与代次由 `ConversationService` 承担；投递**不阻塞**（要等结果用 `wait_for`）。
@@ -34,6 +39,17 @@
     为什么必须修（实测）：孤儿成员的 `directMembers` / `cascadeIds` / `_subtree` 全都够不着——广播不达、
     级联停止与级联删除失效、连 team 工具都再也删不掉它们（`_subtree` 同样沿父链走），但它们**仍会被寻址、还能干活**。
     写盘口径：修好就写盘，但每个被改的 yaml 先备份 `.bak.<n>`（n 递增、绝不覆盖）；幂等（再跑一次零动作）。
+13. **成员 yaml 里的 `workspace_dir` 是"共享目录的镜像"**（`syncWorkspaceMirrors`，
+    [test/workspace_mirror_test.dart](../../../test/workspace_mirror_test.dart) 强制；**用户断言 2026-10-03**）：
+    写进去的是**有效目录**——TOP 显式配置的 `workspace_dir`；TOP 没配置时写 TOP 的**默认目录**
+    （`<数据根>/workspaces/<top_id>`，而不是成员自己的默认目录）。维护时机三处：**建成员时**、
+    **核心启动自愈时**、**TOP 改目录的 PATCH 之后**（都先备份 `.bak.<n>`，都幂等；TOP 自己的配置是用户
+    配置项，**绝不改写**）。它仍然**不参与运行期解析**（见不变量 2）——只有两个作用：
+    ① 界面能显示成员实际在用的目录（不再显示「选择目录」）；② **升级交接**：TOP 被外部删除
+    （手删 `agents/<top>.yaml`、历史遗留数据）后成员被本模块升为独立 TOP 时，
+    **不可以退回"重新选择工作目录"**（配置不能留空，按 TOP 填写）——没有这份镜像，成员会悄悄落到
+    `workspaces/<member_id>`，用户看到的是"文件不见了"。
+    口径边界：镜像不是"第二份配置"，手改它没有意义（运行期不看、下次镜像会覆盖回去）。
 
 ## 测试
 
@@ -41,5 +57,5 @@
 cd packages/tree_core
 dart test test/team_service_test.dart test/team_workspace_test.dart test/message_dispatcher_test.dart \
           test/member_overrides_test.dart test/teammates_api_test.dart test/teammate_message_api_test.dart \
-          test/team_repair_test.dart test/agent_delete_api_test.dart
+          test/team_repair_test.dart test/agent_delete_api_test.dart test/workspace_mirror_test.dart
 ```

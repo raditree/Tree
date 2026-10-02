@@ -19,6 +19,14 @@ REST 文件面板 / 查看器 / Git 面板的**唯一**数据源，也是唯一�
 7. **按内容写文件**（`PUT /api/files/{id}/content`，源码编辑器保存）与**读路径同一套守卫**：空 / 绝对路径 / 盘符 / `~` / `..` 逃逸一律 400；图片 / PDF / Office / 压缩包按扩展名拒绝，现有文件头部含 NUL 也拒绝（与前端 `attachment_preview.dart` 同一口径）；新内容按 **UTF-8** 写且**原样保留换行**（不把 CRLF 规范化成 LF、不补尾换行）；超过 `maxWriteBytes`（4 MB）拒绝（整段内容一次写，大文件走分片上传）。
 8. **写只走工作空间 IO 抽象**：本机 `LocalWorkspaceIO`、远端 `remoteIoFor` 的 `WorkspaceIO.writeFile`（与文件面板同一个 SSH 连接对象，不自己写盘、不自己起 ssh）。`if_size`（前端加载时看到的字节数）与当前字节数不符 → **409 + 当前 `size`**（前端提示刷新后重试），目标文件已不存在同样算冲突（**不带 `size`**，前端据此判定 missing），`force=1` 跳过该检查；远端取不到可用工作空间 IO 时给可读 400，**绝不假装成功**。
 
+9. **"这是远端吗"的唯一判据是「有效 SSH」**（`teamSshConfigFor`：成员自己没有 `ssh:` 时跟随团队 TOP，
+   见 [../team/README.md](../team/README.md) 不变量 3），**不是** `agent.sshConfig`：SSH leader 的成员自己那份是空的，
+   只看它会把成员的文件面板 / Git 面板判成本机——而它的工具其实在远端跑，于是面板会拿一个**远端路径**去本机
+   找目录（轻则"目录不存在"，重则读到本机同名路径）。同一判据贯穿 `list` / `content` / `readBytes` / `pdfInfo` /
+   `writeContent` / 分片上传 / `syncToLocal` / `archive` / `gitLog` / `gitBranches`，任何一处都不许退回 `agent.sshConfig`
+   （[test/ssh_files_api_test.dart](../../../test/ssh_files_api_test.dart) 强制：成员跟随 SSH leader 时读走远端、
+   写回在没接远端 IO 时回可读 400 而不是落到本机）。集成终端同判据（见 [../terminal/README.md](../terminal/README.md)）。
+
 ## 测试
 
 ```bash

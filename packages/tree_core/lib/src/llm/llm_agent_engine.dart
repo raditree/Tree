@@ -69,6 +69,7 @@ class LlmAgentEngine implements AgentEngine {
     this.sessionStatusText,
     this.resultRedirectWriter,
     this.visionResolver,
+    this.awaitReady,
     this.log,
   });
 
@@ -119,6 +120,16 @@ class LlmAgentEngine implements AgentEngine {
   /// **「系统提示词构造过程」钩子**（中转站点位 `system.relay.prompt.system`）。
   SystemPromptRelayHook? systemPromptRelay;
 
+  /// 外设就绪闸门（可选）：**每轮生成前**在这里有界地等一下 MCP/插件预热。
+  ///
+  /// 为什么要它：为了让界面秒开，核心进程把 `mcp.refresh()` / `plugins.start()`
+  /// 搬出了握手路径、改成握手之后并行预热（见 tree_core_cli 与
+  /// server/boot_warmup.dart）。但**工具表**是从插件/MCP 现取的
+  /// （`toolRunner.specsFor`），若某一轮在预热完成前就开始，那一轮就会**悄悄**
+  /// 少掉这些工具。这里等一手即可保住旧行为：正常预热在百毫秒级完成 ⇒ 等待几乎
+  /// 为零；外设真慢 ⇒ 闸门自带预算（CLI 传的是预热 future 本身），不会拖住对话。
+  final Future<void> Function()? awaitReady;
+
   /// 可读日志。
   final void Function(String message)? log;
 
@@ -150,6 +161,17 @@ class LlmAgentEngine implements AgentEngine {
       );
       yield const AgentDone();
       return;
+    }
+
+    // 外设就绪闸门：把「本轮工具表是否已包含插件/MCP 工具」的时序问题收在这里
+    // （见 [awaitReady] 的文档）。闸门自带预算，且任何异常都不该拦住这一轮。
+    final Future<void> Function()? ready = awaitReady;
+    if (ready != null) {
+      try {
+        await ready();
+      } catch (error) {
+        log?.call('外设就绪闸门异常（已忽略，照常生成）：$error');
+      }
     }
 
     // 门控实例与一次 run 同生命周期：历史翻译与工具循环共用它，重定向序号才连续。

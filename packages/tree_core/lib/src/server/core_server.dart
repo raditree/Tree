@@ -32,6 +32,7 @@ import '../store/memory_store.dart';
 import '../store/tree_store.dart';
 import '../team/message_dispatcher.dart';
 import '../team/team_model.dart';
+import '../team/team_repair.dart';
 import '../team/team_service.dart';
 import '../team/team_workspace.dart';
 import '../tool/terminal_hooks.dart';
@@ -83,6 +84,7 @@ class CoreServer {
     required this.builtinPlugins,
     required this.pluginHotApplier,
     required this.fileService,
+    this.agentBackup,
     required this.hub,
     required this.questions,
     required this.compaction,
@@ -93,6 +95,7 @@ class CoreServer {
     required this.version,
     this.llmJsonCaller,
     this.ptyStarter,
+    this.sshPtyStarter,
   }) {
     // 集成终端会话（Ctrl+J）：它要按 agent 解析工作区根，所以只在接了文件服务时可用；
     // 伪终端实现默认用平台实现（ConPTY / script），测试可注入假的。
@@ -102,6 +105,7 @@ class CoreServer {
             store: store,
             files: fileService!,
             startPty: ptyStarter ?? LocalPtyStarter(log: errorLog).start,
+            startSshPty: sshPtyStarter,
             log: errorLog,
           );
   }
@@ -202,11 +206,21 @@ class CoreServer {
   /// 工作空间文件服务（M7d）；为 null 时文件路由返回 501。
   final FileService? fileService;
 
+  /// 备份 `agents/<id>.yaml` 的回调；null = 不备份（内存 store / 测试）。
+  final Future<String> Function(CoreAgent agent)? agentBackup;
+
   /// 集成终端会话管理（Ctrl+J）；[fileService] 未接线时为 null，终端帧会给可读错误。
   TerminalService? terminalService;
 
   /// 伪终端工厂（测试注入假实现；生产用平台实现，见 [LocalPtyStarter]）
   final PtyStarter? ptyStarter;
+
+  /// 远端（SSH）伪终端工厂（生产由 CLI 注入 SshPtyAdapter.start：从缓存的那条 SSH
+  /// 工作空间 IO 上取一条 shell 通道，复用同一条已建好的连接；测试注入假的）。
+  ///
+  /// 为 null = 远端终端未接线：远端 agent 的 terminal_open 回可读错误，**不会**
+  /// 悄悄在本机给它起一个终端（判据是「有效 SSH」，见 TerminalService）。
+  final SshPtyStarter? sshPtyStarter;
 
   /// 提问回路（M5a）；为 null 时核心不提供 `ask_user_question`（测试/最小骨架）。
   final QuestionBroker? questions;
@@ -322,10 +336,16 @@ class CoreServer {
     BuiltinPluginCatalog? builtinPlugins,
     PluginHotApplier? pluginHotApplier,
     FileService? fileService,
+    /// 备份 `agents/<id>.yaml` 的回调（工作目录镜像写盘前留底）。
+    ///
+    /// 与 team 自愈同约定：核心要改某个 agent 的 yaml 就先把它备份成 `.bak.<n>`。
+    /// 由 CLI 传 `backupAgentFile`（只有它知道数据根）；null = 不备份（测试）。
+    Future<String> Function(CoreAgent agent)? agentBackup,
     CompactionService? compaction,
     TerminalHooks? stationHooks,
     LlmJsonCaller? llmJsonCaller,
     PtyStarter? ptyStarter,
+    SshPtyStarter? sshPtyStarter,
   }) async {
     final HttpServer http = await HttpServer.bind(
       address ?? InternetAddress.loopbackIPv4,
@@ -370,9 +390,11 @@ class CoreServer {
           pluginHotApplier ??
           (pluginBus == null ? null : BusPluginHotApplier(pluginBus)),
       fileService: fileService,
+      agentBackup: agentBackup,
       compaction: compaction,
       llmJsonCaller: llmJsonCaller,
       ptyStarter: ptyStarter,
+      sshPtyStarter: sshPtyStarter,
       hub: hub,
       questions: questions,
       conversation: ConversationService(
@@ -1334,6 +1356,8 @@ class CoreServer {
     // ── 工作空间目录与 SSH 配置（M7c）：前端「运行模式」直接改 agent 配置 ──
     // 语义与模型配置一致：字段缺失 = 不改；显式空值 = 清空。
     bool touched = false;
+    // 目录改动 = 团队共享目录变了 ⇒ 要立刻镜像给成员（见 _syncWorkspaceMirrors）。
+    bool workspaceDirChanged = false;
     if (body.containsKey('workspace_dir')) {
       final String dir = (body['workspace_dir'] as String? ?? '').trim();
       if (dir.isNotEmpty && !p.isAbsolute(dir)) {
@@ -1346,6 +1370,7 @@ class CoreServer {
       }
       agent.workspaceDir = dir;
       touched = true;
+      workspaceDirChanged = true;
     }
     if (body.containsKey('ssh')) {
       final Object? raw = body['ssh'];
@@ -1485,11 +1510,34 @@ class CoreServer {
       agent.updatedAt = DateTime.now().millisecondsSinceEpoch;
       store.putAgent(agent);
     }
+    // 改的是团队 TOP 的目录 ⇒ 成员的镜像要立刻跟上：成员页显示的是这份镜像，
+    // 而"TOP 被删后成员升级为 TOP"要靠它做无损交接（用户断言 2026-10-03）。
+    if (workspaceDirChanged) await _syncWorkspaceMirrors();
     await writeJson(request, 200, <String, dynamic>{
       'success': true,
       'agent': agent.toApiJson(),
       if (agent.sshConfig != null) 'ssh': _sshView(agent.sshConfig!),
     });
+  }
+
+  /// 把团队共享工作目录镜像到成员（幂等；见 syncWorkspaceMirrors）。
+  ///
+  /// 没有 [fileService] 时算不出"TOP 未配置目录时的默认目录"，直接跳过而不是写半份：
+  /// 写错比不写更糟（成员会落到一个并不存在的目录口径上）。
+  Future<void> _syncWorkspaceMirrors() async {
+    final FileService? files = fileService;
+    if (files == null) return;
+    try {
+      await syncWorkspaceMirrors(
+        store,
+        defaultDirFor: files.defaultWorkspaceDir,
+        backup: agentBackup,
+        log: errorLog,
+      );
+    } catch (error) {
+      // 镜像失败不该影响这次配置写入（用户改了目录就是改了；镜像下次启动会补上）
+      errorLog?.call('工作目录镜像失败（不影响本次写入）：$error');
+    }
   }
 
   /// SSH 配置的前端形态：在 `redacted()` 基础上补 `key_path`（表单预填需要），

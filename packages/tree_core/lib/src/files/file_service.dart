@@ -190,9 +190,19 @@ class FileService {
     return backend is WorkspaceIO ? backend : null;
   }
 
+  /// 该 agent 的文件/工具**实际**跑在远端吗？判据是**有效 SSH**（[teamSshConfigFor]：
+  /// 成员自己没有 `ssh:` 时跟随团队 TOP），不是 `agent.sshConfig`。
+  ///
+  /// 为什么不能只看 agent 自己那份：SSH leader 的成员自己那份是空的，只看它会把成员的
+  /// 文件面板判成"本机"——而它的工具其实在远端跑（成员跟随 leader 的 SSH 是团队不变量，
+  /// 见 team/README.md 不变量 3），于是面板会拿一个**远端路径**去本机找目录：要么报一个
+  /// 莫名其妙的"目录不存在"，要么读到本机同名路径（更糟）。
+  bool _isRemote(CoreAgent agent) =>
+      teamSshConfigFor(agent, store.agent) != null;
+
   /// 远端后端对象（未窄化）：[remoteFor] / [remoteIoFor] 各自按需窄化。
   Future<Object?> _remoteBackendFor(CoreAgent agent) async {
-    if (agent.sshConfig == null) return null;
+    if (!_isRemote(agent)) return null;
     final Future<Object?> Function(String agentId)? factory = remoteFilesFor;
     if (factory == null) return null;
     return factory(agent.id);
@@ -207,7 +217,7 @@ class FileService {
     if (agent == null) return _error('工作空间不存在：$workspaceId');
     final WorkspaceFiles? remote = await remoteFor(agent);
     if (remote != null) return _listRemote(remote, path);
-    if (agent.sshConfig != null) {
+    if (_isRemote(agent)) {
       return _error('该工作空间在远端（SSH）：核心未接入远端文件后端，请用终端工具查看', 400);
     }
     final String root = rootFor(agent);
@@ -464,7 +474,7 @@ class FileService {
     }
 
     // 4) 选后端：远端走 remoteIoFor（拿不到就如实 400），本机用本机 IO
-    final bool remote = agent.sshConfig != null;
+    final bool remote = _isRemote(agent);
     final WorkspaceIO io;
     if (remote) {
       final WorkspaceIO? remoteIo = await remoteIoFor(agent);
@@ -554,7 +564,7 @@ class FileService {
     if (agent == null) return _error('工作空间不存在：$workspaceId');
     final WorkspaceFiles? remote = await remoteFor(agent);
     if (remote != null) return _contentRemote(remote, path);
-    if (agent.sshConfig != null) {
+    if (_isRemote(agent)) {
       return _error('该工作空间在远端（SSH）：核心未接入远端文件后端，请用 read 工具', 400);
     }
     final String root = rootFor(agent);
@@ -602,7 +612,7 @@ class FileService {
     if (agent == null) return _error('工作空间不存在：$workspaceId');
     final WorkspaceFiles? remote = await remoteFor(agent);
     if (remote != null) return _readBytesRemote(remote, path);
-    if (agent.sshConfig != null) {
+    if (_isRemote(agent)) {
       return _error('该工作空间在远端（SSH）：核心未接入远端文件后端，请用 read 工具', 400);
     }
     final String root = rootFor(agent);
@@ -652,7 +662,7 @@ class FileService {
         return _error('读取远端文件失败：$error', 500);
       }
     }
-    if (agent.sshConfig != null) {
+    if (_isRemote(agent)) {
       return _error('该工作空间在远端（SSH）：核心未接入远端文件后端，请用 read 工具', 400);
     }
     final String root = rootFor(agent);
@@ -681,7 +691,7 @@ class FileService {
     if (agent == null) return _error('工作空间不存在：$workspaceId');
     final WorkspaceFiles? remote = await remoteFor(agent);
     if (remote != null) return _pdfInfoRemote(remote, path);
-    if (agent.sshConfig != null) {
+    if (_isRemote(agent)) {
       return _error('该工作空间在远端（SSH）：核心未接入远端文件后端', 400);
     }
     final String root = rootFor(agent);
@@ -771,7 +781,7 @@ class FileService {
   }) async {
     final CoreAgent? agent = agentFor(workspaceId);
     if (agent == null) return _error('工作空间不存在：$workspaceId');
-    if (agent.sshConfig != null) return _gitLogRemote(agent, limit);
+    if (_isRemote(agent)) return _gitLogRemote(agent, limit);
     final String root = rootFor(agent);
     if (!Directory(root).existsSync()) return _error('工作空间目录不存在：$root');
     final ProcessResult result = await _git(root, <String>[
@@ -805,7 +815,7 @@ class FileService {
   Future<Map<String, dynamic>> gitBranches(String workspaceId) async {
     final CoreAgent? agent = agentFor(workspaceId);
     if (agent == null) return _error('工作空间不存在：$workspaceId');
-    if (agent.sshConfig != null) return _gitBranchesRemote(agent);
+    if (_isRemote(agent)) return _gitBranchesRemote(agent);
     final String root = rootFor(agent);
     if (!Directory(root).existsSync()) return _error('工作空间目录不存在：$root');
     final ProcessResult branches = await _git(root, <String>[
@@ -897,7 +907,7 @@ class FileService {
     final CoreAgent? agent = agentFor(workspaceId);
     if (agent == null) return _error('工作空间不存在：$workspaceId');
     final WorkspaceFiles? remote = await remoteFor(agent);
-    if (agent.sshConfig != null && remote == null) {
+    if (_isRemote(agent) && remote == null) {
       return _error('该工作空间在远端（SSH）：核心未接入远端文件后端', 400);
     }
     if (totalSize < 0) return _error('total_size 不能为负', 400);
@@ -1078,7 +1088,7 @@ class FileService {
     final CoreAgent? agent = agentFor(workspaceId);
     if (agent == null) return _error('工作空间不存在：$workspaceId');
     final WorkspaceFiles? remote = await remoteFor(agent);
-    if (agent.sshConfig != null && remote == null) {
+    if (_isRemote(agent) && remote == null) {
       return _error('该工作空间在远端（SSH）：核心未接入远端文件后端', 400);
     }
     final String raw = localPath.trim();
@@ -1143,7 +1153,7 @@ class FileService {
     final CoreAgent? agent = agentFor(workspaceId);
     if (agent == null) return _error('工作空间不存在：$workspaceId');
     final WorkspaceFiles? remote = await remoteFor(agent);
-    if (agent.sshConfig != null && remote == null) {
+    if (_isRemote(agent) && remote == null) {
       return _error('该工作空间在远端（SSH）：核心未接入远端文件后端', 400);
     }
     if (remote != null) return _archiveRemote(remote, path);

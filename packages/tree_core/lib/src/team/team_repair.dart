@@ -4,6 +4,7 @@ import 'package:path/path.dart' as p;
 
 import '../store/tree_paths.dart';
 import '../store/tree_store.dart';
+import 'team_workspace.dart';
 
 /// 一次团队关系自愈动作（一条 = 一个 agent 的团队字段被改写）。
 class TeamLinkRepair {
@@ -374,3 +375,83 @@ Future<String> backupAgentFile(TreePaths paths, String agentId) async {
   await source.copy(target);
   return target;
 }
+/// 工作目录镜像的一次结果（日志、自检与测试用）。
+class WorkspaceMirrorReport {
+  WorkspaceMirrorReport();
+
+  /// 被改写的成员 id → 写入的目录。
+  final Map<String, String> mirrored = <String, String>{};
+
+  /// 备份路径（agent id → `.bak.<n>`）。
+  final Map<String, String> backups = <String, String>{};
+
+  bool get isEmpty => mirrored.isEmpty;
+  int get changedCount => mirrored.length;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'mirrored': mirrored.length,
+    'members': mirrored.keys.toList(),
+  };
+}
+
+/// 把团队共享工作目录**镜像**到成员自己的 `agents/<id>.yaml`（2026-10-03 用户断言）。
+///
+/// 为什么需要镜像（而不是"读的时候现算"）：TOP 被**外部删除**（手删
+/// `agents/<top>.yaml`、历史遗留数据）之后，[repairTeamLinks] 会把成员**升为独立
+/// TOP**，而那时原 TOP 的配置已经读不到了。若成员自己的 `workspace_dir` 是空的：
+/// - 升级后它的工具会落到 `<数据根>/workspaces/<member_id>`——**换了一个目录**，
+///   用户看到的是"我的文件不见了"；
+/// - 界面上还会退回「选择目录」，等于逼用户重选一个本不该重选的工作目录。
+/// 镜像在**升级之前**就把"这个团队现在用的目录"写进了成员自己的配置，升级因此无损。
+///
+/// 口径：写**有效目录** = 归属者（团队 TOP）显式配置的 `workspace_dir`；未配置时用
+/// [defaultDirFor] 的默认目录（CLI 传 `TreePaths.defaultWorkspaceDir`）。为什么连默认
+/// 目录也写：TOP 没配目录时成员实际也活在 TOP 的默认目录里，只写"已配置值"会让升级后的
+/// 成员落到**另一个**默认目录——那正是本函数要防的事。
+///
+/// 成员的 `workspace_dir` 仍然**不参与运行期解析**：工具一律用 [teamWorkspaceFor] 取
+/// 归属者的目录（见 team_workspace.dart 的不变量）。它是"归属者配置的一份派生副本"，
+/// 唯一作用是升级交接与界面展示；因此这个字段**只能由本函数写**。
+///
+/// 幂等：与目标值相同就不写（`report.isEmpty`）；TOP 自己的目录是**用户配置**，绝不改写。
+Future<WorkspaceMirrorReport> syncWorkspaceMirrors(
+  TreeStore store, {
+  required String Function(String agentId) defaultDirFor,
+  Future<String> Function(CoreAgent agent)? backup,
+  void Function(String message)? log,
+}) async {
+  final WorkspaceMirrorReport report = WorkspaceMirrorReport();
+  final List<CoreAgent> agents = store.agents().toList();
+  if (agents.isEmpty) return report;
+  final Map<String, CoreAgent> byId = <String, CoreAgent>{
+    for (final CoreAgent agent in agents) agent.id: agent,
+  };
+  for (final CoreAgent member in agents) {
+    // 只看成员：顶层 agent 的 workspace_dir 是用户配置项，不在这条链上。
+    if (member.parentAgentId.trim().isEmpty) continue;
+    final TeamWorkspace shared = teamWorkspaceFor(
+      member,
+      (String agentId) => byId[agentId],
+    );
+    final CoreAgent owner = shared.owner;
+    final String effective = shared.configuredDir.isNotEmpty
+        ? shared.configuredDir
+        : defaultDirFor(owner.id);
+    if (effective.isEmpty || member.workspaceDir.trim() == effective) continue;
+    member.workspaceDir = effective;
+    report.mirrored[member.id] = effective;
+    if (backup != null) {
+      final String path = await backup(member);
+      if (path.isNotEmpty) report.backups[member.id] = path;
+    }
+    store.putAgent(member);
+    log?.call(
+      '工作目录镜像：${member.name}(${member.id}) workspace_dir → $effective'
+      '（跟随团队 TOP ${owner.id}）'
+      '${report.backups[member.id] == null ? '' : '，备份 ${report.backups[member.id]}'}',
+    );
+  }
+  if (report.mirrored.isNotEmpty) await store.flush();
+  return report;
+}
+

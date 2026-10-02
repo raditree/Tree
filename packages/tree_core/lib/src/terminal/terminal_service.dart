@@ -6,7 +6,22 @@ import 'package:tree_protocol/tree_protocol.dart';
 import '../files/file_service.dart';
 import 'pty_process.dart';
 import '../store/tree_store.dart';
+import '../team/team_workspace.dart';
 import '../ws/ws_hub.dart';
+
+/// 起一个**远端（SSH）伪终端**会话的工厂（CLI 从缓存的 SSH 工作空间 IO 注入；测试注入
+/// 假实现）。
+///
+/// 签名**只依赖核心自己的类型**（[CoreAgent] / [PtyProcess]）：
+/// - 远端工作目录与连接复用全在注入方（`SshWorkspaceIO` 那条已经建好的连接）里解决，
+///   核心不碰 dartssh2、不碰远端路径，也不拿"本机路径"去猜；
+/// - 没有 `command`：远端分支一律登录 shell。要支持"命令终端"得先扩这个签名，
+///   **不要**为了它偷偷退回本机执行。
+typedef SshPtyStarter = Future<PtyProcess> Function({
+  required CoreAgent agent,
+  required int columns,
+  required int rows,
+});
 
 /// 集成终端（Ctrl+J）的会话管理。
 ///
@@ -14,13 +29,22 @@ import '../ws/ws_hub.dart';
 /// Ctrl+C 能打断）。输出按 base64 **原始字节**回给**开它的那条连接**——终端是本机
 /// 交互，不广播给别的窗口，也不进消息库。
 ///
-/// 边界（见 lib/README.md 不变量 14）：只支持本机 agent。远端（SSH）agent 那边只有
-/// 一次性 exec、没有伪终端与流式会话，因此明确回一帧可读错误，不假装成功。
+/// 两个后端，都是**真 PTY**：
+/// - 本机 agent：平台伪终端（Windows ConPTY / POSIX pty，见 lib/src/terminal/README.md）；
+/// - 远端（SSH）agent：SSH 会话通道 + `pty-req`（dartssh2 的 shell / exec 通道，形状见
+///   tree_local_exec 的 `SshShellChannel`），由注入的 [SshPtyStarter] 提供。
+///
+/// 判据是**有效 SSH**（[teamSshConfigFor]：成员跟随团队 TOP 的 SSH 配置），不是
+/// `agent.sshConfig`——只看后者会把"SSH leader 的成员"误判成本机，在本机给它起一个
+/// 终端（真实 bug，见 [docs/known-issues.md #12](../../../../../docs/known-issues.md)）。
+/// 远端工作空间根由远端后端解决（归 `SshWorkspaceIO`）：核心**不**解析远端路径，也不把
+/// 本机路径发给远端；远端分支的 `terminal_ready.cwd` 因此是空串（界面显示"工作区"）。
 class TerminalService {
   TerminalService({
     required this.store,
     required this.files,
     this.startPty,
+    this.startSshPty,
     this.log,
   });
 
@@ -31,6 +55,13 @@ class TerminalService {
   ///
   /// 为 null = 没接线：`terminal_open` 会回一帧可读错误，而不是假装起了个终端。
   final PtyStarter? startPty;
+
+  /// 起**远端（SSH）伪终端**的工厂：由 CLI 注入（它从缓存的 `SshWorkspaceIO` 上取一条
+  /// 远端 shell 通道，复用同一条 SSH 连接），测试注入假实现。
+  ///
+  /// 为 null = 没接线：远端 agent 的 `terminal_open` 会回一帧可读错误，而不是假装起了
+  /// 个终端，也不会悄悄在本机起一个（那正是判据用 [teamSshConfigFor] 要防的事）。
+  final SshPtyStarter? startSshPty;
 
   final void Function(String message)? log;
 
@@ -59,37 +90,46 @@ class TerminalService {
       _fail(connection, terminalId, '找不到 agent：$agentId');
       return;
     }
-    final String cwd = files.rootFor(agent);
-    // 判据是「这个 agent 配了 SSH」而不是「远端后端接线了没有」：SSH agent 的交互
-    // 终端一律不支持（那条通道只有一次性 exec，没有伪终端与流式会话），不给用户
-    // 留下「终端能开、但打不了字」的错觉。
-    if (agent.sshConfig != null) {
-      _fail(
-        connection,
-        terminalId,
-        '远端（SSH）agent 的交互终端暂不支持：SSH 通道没有伪终端与流式会话。'
-        '本地模式可以用终端；远端请用 agent 的 terminal 工具，或改用本地模式。',
-      );
-      return;
-    }
+    // 判据是**有效 SSH**（成员跟随团队 TOP 的配置，见 [teamSshConfigFor]），不是 agent
+    // 自己的 `sshConfig`：SSH leader 的成员自己那份是空的，只看它会把成员当本机、在
+    // **本机**起一个终端（真实 bug，见 docs/known-issues.md #12）。
+    final bool remote = teamSshConfigFor(agent, store.agent) != null;
+    // 本机路径**只在本地分支**求值：远端的工作空间根在远端，核心不解析也不回传
+    // （远端根归 `SshWorkspaceIO`，见 ssh_pty_adapter.dart）。
+    final String cwd = remote ? '' : files.rootFor(agent);
 
     final String command = _str(data, TerminalFrame.command);
     final int columns = _clampInt(data, TerminalFrame.columns, 80, 20, 500);
     final int rows = _clampInt(data, TerminalFrame.rows, 24, 5, 200);
 
-    final PtyStarter? starter = startPty;
-    if (starter == null) {
-      _fail(connection, terminalId, '核心没有接线伪终端实现，终端不可用（需要带 PTY 支持的核心构建）');
-      return;
-    }
     final PtyProcess pty;
     try {
-      pty = await starter(
-        command: command,
-        workingDirectory: cwd,
-        columns: columns,
-        rows: rows,
-      );
+      if (remote) {
+        final SshPtyStarter? sshStarter = startSshPty;
+        if (sshStarter == null) {
+          _fail(
+            connection,
+            terminalId,
+            '核心没有接线远端（SSH）伪终端实现，远端 agent 的终端不可用；'
+            '本机 agent 的终端不受影响。',
+          );
+          return;
+        }
+        // 远端工作目录由注入方（SshWorkspaceIO）自己解决：这里只给 agent 与尺寸。
+        pty = await sshStarter(agent: agent, columns: columns, rows: rows);
+      } else {
+        final PtyStarter? starter = startPty;
+        if (starter == null) {
+          _fail(connection, terminalId, '核心没有接线伪终端实现，终端不可用（需要带 PTY 支持的核心构建）');
+          return;
+        }
+        pty = await starter(
+          command: command,
+          workingDirectory: cwd,
+          columns: columns,
+          rows: rows,
+        );
+      }
     } catch (error) {
       _fail(connection, terminalId, '启动终端失败：$error');
       return;

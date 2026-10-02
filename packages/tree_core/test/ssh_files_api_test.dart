@@ -231,6 +231,55 @@ void main() {
 
   String ws() => agent.workspaceId;
 
+  /// 造一个"跟随团队 TOP 的 SSH"的成员：自己没有 ssh 配置。
+  CoreAgent addMemberFollower() {
+    final CoreAgent member = CoreAgent(
+      id: 'member_ssh',
+      name: '成员甲',
+      workspaceId: 'ws_member_ssh',
+      teamId: agent.id,
+      parentAgentId: agent.id,
+      level: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    );
+    store.putAgent(member);
+    return member;
+  }
+
+  test('成员跟随 SSH leader：文件面板同样走远端（判据是有效 SSH）', () async {
+    await start();
+    addMemberFollower();
+    // 列表必须来自远端后端（成员自己那份 sshConfig 是空的，只看它会落到本机目录）
+    final _Res listed = await client.send('GET', '/api/files/ws_member_ssh');
+    expect(listed.status, 200, reason: listed.raw);
+    final List<dynamic> files = listed.json['files'] as List<dynamic>;
+    expect(
+      files.map((dynamic e) => (e as Map<String, dynamic>)['name']),
+      containsAll(<String>['a.txt', 'sub']),
+      reason: '成员的文件面板必须跟随 leader 的 SSH，不许去本机目录找',
+    );
+    // 写回也必须走远端：本用例只接了远端**文件**后端（没接 WorkspaceIO），
+    // 因此必须明确回"远端 IO 不可用"——**绝不**落到本机目录去写。
+    final _Res saved = await client.send(
+      'PUT',
+      // 写内容的路径走 **query**（PUT /content?path=），请求体只有 content/if_size
+      '/api/files/ws_member_ssh/content?path=a.txt',
+      body: <String, dynamic>{'content': '改过\n'},
+    );
+    expect(saved.status, 400, reason: saved.raw);
+    expect(saved.raw, contains('远端（SSH）'));
+    expect(remote.writes, isEmpty, reason: '不该有任何本机写入');
+  });
+
+  test('成员跟随 SSH leader 且核心没接远端后端：可读 400，不落到本机', () async {
+    await start(wireRemote: false);
+    addMemberFollower();
+    final _Res res = await client.send('GET', '/api/files/ws_member_ssh');
+    expect(res.status, 400, reason: res.raw);
+    expect(res.raw, contains('远端（SSH）'));
+  });
+
   test('list：远端一层目录，字段与本地口径一致', () async {
     await start();
     final _Res res = await client.send('GET', '/api/files/${ws()}');

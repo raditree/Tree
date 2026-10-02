@@ -10,6 +10,7 @@
 | [http_router.dart](http_router.dart) | 极简路由表：精确路径 + `{name}` 占位符 |
 | [http_io.dart](http_io.dart) | UTF-8 JSON 响应助手 |
 | [ws_liveness.dart](ws_liveness.dart) | 带发送活性与**待补发队列**的 WS 连接与注册表（`LivenessWsHub`） |
+| [boot_warmup.dart](boot_warmup.dart) | 启动期外设预热：**并行 + 有界 + 绝不抛**（`warmUpPeripherals`，只在握手之后跑） |
 
 ## 不变量（assertions）
 
@@ -32,6 +33,15 @@
     回一条来自幽灵成员的消息、`data/<id>` 被写回来）。通过后的顺序：停（作废排队任务 + 收尾在途提问）→
     `store.flush()` 排水 → 清提问记录 → 叶→根删 → 回填 TOP 的 `team_member_count` → 再排水。
     409 的响应体同时带 `detail`（通用错误文案口径）与结构化字段。
+13. **外设预热不排在握手之前**（[boot_warmup.dart](boot_warmup.dart) + `tree_core_cli/bin/tree_core.dart`，
+    [test/boot_warmup_test.dart](../../../test/boot_warmup_test.dart) 与
+    `packages/tree_core_cli/test/cli_serve_test.dart` 强制）：MCP 首次连接（**没有超时参数**）与插件启动
+    （**逐家串行**、每家 20s）都只在**握手之后**预热——并行（总时长取最大而非求和）、有界（预算 3s，
+    超预算立即返回且未结束的任务继续在后台跑）、绝不抛（单家失败只记日志）。
+    理由：握手是界面判"核心可用"的**唯一**依据，被外设拖住时用户看到的是「核心进程未能启动
+    （等待核心进程握手超时 25s）」（见 [docs/known-issues.md](../../../../../docs/known-issues.md) #13）。
+    模型那一轮由 `LlmAgentEngine.awaitReady` 有界等一次预热，所以不会"悄悄少掉插件/MCP 工具"。
+    每一段都往 stderr 打 `[core:boot]` 分段耗时——"启动慢"因此是可归因的数字，不是感觉。
 
 ## 测试
 

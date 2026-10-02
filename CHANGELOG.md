@@ -102,6 +102,27 @@
   TOP，`team_id` 指向的 TOP 不在列表里时兜底列在末尾。**成员其余口径不变**：工具根 / 系统提示词 /
   文件面板仍解析到 leader 的工作目录与 SSH，插件作用域仍按 `teamScopeId` 回指团队。
 
+- **核心启动不被外设预热拖住**（[server/README.md](packages/tree_core/lib/src/server/README.md) 不变量 13、
+  [known-issues #13](docs/known-issues.md)）：MCP 首次连接（**没有超时参数**）与插件启动（**逐家串行**、每家 20s）
+  **只在握手之后**预热——并行、有界（预算 3s，超预算不再等）、绝不抛（单家失败只记日志）；
+  模型那一轮由 `LlmAgentEngine.awaitReady` 有界等一次预热，不会"悄悄少掉插件/MCP 工具"；
+  每段往 stderr 打 `[core:boot]` 分段耗时。此前两段都排在握手**之前**，任何一家外设卡住都会让界面
+  看到「核心进程未能启动（等待核心进程握手超时 25s）」。
+- **成员 yaml 里的 `workspace_dir` 是"共享目录的镜像"**（[team/README.md](packages/tree_core/lib/src/team/README.md)
+  不变量 13）：写进去的是**有效目录**——TOP 显式配置的，或 TOP 未配置时的默认目录；在建成员时、核心启动自愈时、
+  TOP 改目录的 PATCH 之后维护（写前备份 `.bak.<n>`、幂等；TOP 自己的配置**绝不改写**）。
+  它**不参与运行期解析**（仍只看 TOP 那份），只为两件事：界面显示成员实际在用的目录；
+  **TOP 被删后成员升为 TOP 的无损交接**（用户断言 2026-10-03：升级后**不可以**重新选择工作目录，
+  配置不能留空、按 TOP 填写）。
+- **"这是远端吗"的唯一判据是「有效 SSH」**（[files/README.md](packages/tree_core/lib/src/files/README.md) 不变量 9、
+  [team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 3）：`teamSshConfigFor`（成员自己没有 `ssh:` 时跟随团队 TOP）
+  贯穿工具层、文件面板、Git 面板与集成终端；此前文件面板只看 `agent.sshConfig`，把 SSH leader 的成员判成本机
+  ——面板会拿一个远端路径去本机找目录（轻则"目录不存在"，重则读到本机同名路径），集成终端更会在本机起一个 shell。
+- **运行模式与工作目录是团队级的**（[lib/README.md](lib/README.md) 不变量 15）：中栏左上角按**团队 TOP** 合成
+  ——成员自己显式配的 SSH 优先、否则跟随 TOP；目录只认 TOP 那份（TOP 未配置时退回成员自己的镜像，
+  因此永远显示真实目录而不是「选择目录」）；选目录**写入 TOP** 并提示"团队成员共用"；
+  TOP 是 SSH 时成员**切不回本地**（核心没有"成员覆盖成 local"这个概念），界面如实拒绝并说明去哪改。
+
 ### Added（首个版本总览）
 
 - **单进程桌面形态**：Flutter 界面 + 纯 Dart 核心 `tree_core`（可编译成单文件，约 10 MB）；

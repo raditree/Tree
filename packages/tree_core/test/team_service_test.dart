@@ -53,7 +53,7 @@ void main() {
       expect(service.teams().map((CoreAgent a) => a.id), <String>[top.id]);
     });
 
-    test('create_member：pending_model + 空模型 + 层级/带队权/独立工作空间', () {
+    test('create_member：pending_model + 空模型 + 层级/带队权/共享工作目录镜像', () {
       final Map<String, dynamic> result = create('成员甲');
       expect(result.containsKey('error'), isFalse);
       expect(result['review_status'], ReviewStatus.pendingModel);

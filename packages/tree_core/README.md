@@ -43,7 +43,7 @@
 | [lib/src/store/tree_store.dart](lib/src/store/tree_store.dart) · [file_store.dart](lib/src/store/file_store.dart) · [records.dart](lib/src/store/records.dart) | 数据根读写与记录模型 |
 | [lib/src/team/](lib/src/team/) | 团队服务、消息派发、工作目录口径（`team_workspace.dart`） |
 | [lib/src/spec/](lib/src/spec/) · [lib/src/mcp/](lib/src/mcp/) · [lib/src/plugin/](lib/src/plugin/) | Spec 体系 / MCP 客户端 / 插件宿主与站点 |
-| [lib/src/terminal/](lib/src/terminal/) | 集成终端（Ctrl+J）：伪终端会话管理 + 会话生命周期（平台实现由 tree_local_exec 注入） |
+| [lib/src/terminal/](lib/src/terminal/) | 集成终端（Ctrl+J）：本机与远端（SSH）**两条真 PTY** 的会话管理 + 生命周期（判据是**有效 SSH**，不是 `agent.sshConfig`；平台实现与远端 shell 通道都由 tree_local_exec 注入） |
 
 ## 不变量（assertions）
 

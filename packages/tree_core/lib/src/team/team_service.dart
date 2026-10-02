@@ -11,7 +11,9 @@ import 'team_model.dart';
 /// - 成员是**独立 agent 文件**，`team_id` 指向 TOP、`parent_agent_id` 指直属上级，
 ///   因此用户能直接手改某个成员的 yaml（与本项目"绕开 UI 改配置"的一致策略）；
 /// - `member_count` 一律按**实际成员数**回填（不是累加出来的计数器）；
-/// - 每个成员有独立工作空间（默认 `<数据根>/workspaces/<member_id>`）。
+/// - **成员与团队 TOP 共用同一个工作目录**（2026-10-02 定夺，见 team_workspace.dart）：
+///   成员自己的 `workspace_dir` 只是"TOP 那份配置的镜像"（升级交接与界面展示用），
+///   运行期一律以 TOP 的为准。
 ///
 /// 三条硬规则（都有自动化测试）：
 /// 1. **没有模型写入口**：team 工具的 create/update/review 收到 `model_id` 一律报错，
@@ -19,7 +21,13 @@ import 'team_model.dart';
 /// 2. **新建成员恒为 `pending_model` 且 `model_id` 为空**，用户放行前不接收消息；
 /// 3. **只能碰自己的子树**：不可移除自身/上级/非后代；目标有下级时必须显式 cascade。
 class TeamService {
-  TeamService({required this.store, this.settings, this.isWorking, this.log});
+  TeamService({
+    required this.store,
+    this.settings,
+    this.isWorking,
+    this.defaultWorkspaceDir,
+    this.log,
+  });
 
   final TreeStore store;
 
@@ -28,6 +36,14 @@ class TeamService {
 
   /// working 的**唯一权威**（运行期任务表）；未接入时一律 idle。
   final bool Function(String agentId)? isWorking;
+
+  /// 未配置 `workspace_dir` 时的默认目录（CLI 传 `TreePaths.defaultWorkspaceDir`）。
+  ///
+  /// 只用于**成员的共享目录镜像**（见 syncWorkspaceMirrors）：成员自己没有目录概念，
+  /// 新建时就把团队 TOP 的有效目录写进它的 `workspace_dir`——这样 TOP 被外部删除、
+  /// 成员被升为 TOP 时目录是无损交接的（用户断言 2026-10-03）。为 null 时只镜像
+  /// TOP 显式配置过的目录（测试与最小骨架）。
+  final String Function(String agentId)? defaultWorkspaceDir;
 
   final void Function(String message)? log;
 
@@ -56,6 +72,14 @@ class TeamService {
     final CoreAgent? agent = store.agent(agentId);
     if (agent == null) return '';
     return agent.teamId.isEmpty ? agent.id : agent.teamId;
+  }
+
+  /// 成员的共享工作目录 = 团队 TOP 的有效目录（配置优先，否则默认目录）。
+  String _sharedWorkspaceDir(CoreAgent? top) {
+    if (top == null) return '';
+    final String configured = top.workspaceDir.trim();
+    if (configured.isNotEmpty) return configured;
+    return defaultWorkspaceDir?.call(top.id) ?? '';
   }
 
   /// agent 的实时工作状态（working / idle）。
@@ -375,6 +399,9 @@ class TeamService {
       // 模型**绝不继承 TOP**：新建成员恒为空模型 + pending_model
       modelId: '',
       workspaceId: 'ws_$memberId',
+      // 共享目录镜像：成员跟随团队 TOP（TOP 未配置时用 TOP 的默认目录），
+      // 见 syncWorkspaceMirrors 的文档与用户断言 2026-10-03。
+      workspaceDir: _sharedWorkspaceDir(top),
       teamId: teamId,
       parentAgentId: self.id,
       level: self.level + 1,

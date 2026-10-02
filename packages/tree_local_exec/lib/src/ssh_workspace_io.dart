@@ -8,6 +8,7 @@ import 'ansi_code_page.dart';
 import 'git_output.dart';
 import 'local_workspace_io.dart';
 import 'ssh_liveness.dart';
+import 'ssh_shell_channel.dart';
 import 'workspace_io.dart';
 
 /// SSH 传输抽象：把"远端文件系统 + 远端命令执行"压成 6 个方法。
@@ -58,6 +59,25 @@ abstract interface class SshTransport {
   /// 还在回，命令跑多久都等；心跳连续丢失才由 [liveness] 判失活并以显式错误
   /// 结束在途操作。参数保留只为不改调用方签名，已无实际作用。
   Future<SshExecResult> run(String command, {Duration timeout});
+
+  /// 打开一条**远端 shell 通道**（真 PTY）：交互终端（Ctrl+J）的远端分支。
+  ///
+  /// 与 [run]（一次性 exec，命令跑完才回包、没有 TTY）是**互补的两条路**：
+  /// 这条通道持续双向、能改尺寸、能拿退出码，因此 vim / top / Ctrl+C 都能工作
+  /// （形状与语义见 [SshShellChannel]）。
+  ///
+  /// - [command] 为空 ⇒ 远端**登录 shell**；非空 ⇒ 让远端 shell 执行该命令
+  ///   （真实现走 `exec` + `pty-req`，理由见 dartssh_transport.dart）；
+  /// - [workingDirectory] 是**远端**绝对路径（空 = 远端登录 HOME）：远端只认远端
+  ///   路径，调用方绝不能把本机路径传进来（[SshWorkspaceIO.openShell] 传的就是
+  ///   本工作空间的远端根）；
+  /// - 失败抛 [WorkspaceIoException]（可读中文），不返回一个半死的通道。
+  Future<SshShellChannel> openShell({
+    required int columns,
+    required int rows,
+    String command = '',
+    String workingDirectory = '',
+  });
 
   /// 链路活性快照：最近一次心跳时间、连续丢失计数、是否失活（1.1 的心跳判据）。
   ///
@@ -628,6 +648,30 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     } catch (error) {
       throw WorkspaceIoException('写入失败（$relativePath）：$error');
     }
+  }
+
+  /// 打开一条远端 shell 通道（交互终端的 SSH 分支）。
+  ///
+  /// 透传给 [SshTransport.openShell]，**workingDirectory 用本工作空间的远端根**：
+  /// 核心那边只有"本机路径"的概念（它的 `PtyStarter` 要一个 `workingDirectory`），
+  /// 而远端根只有 [SshWorkspaceIO] 知道（`resolveRemoteRoot` 的结果存在 [root] 里）。
+  /// 因此远端工作目录在这一层解决，核心**不参与**、也不会把本机路径透给远端。
+  ///
+  /// 过一遍活性守卫（与其余传输同一口径）：链路已判失活时立刻以显式错误失败，
+  /// 不在一条判死的链路上开新会话。守卫只看"通道是否打开成功"，不管会话本身跑多久。
+  Future<SshShellChannel> openShell({
+    required int columns,
+    required int rows,
+    String command = '',
+  }) {
+    return _link.guard(
+      () => _transport.openShell(
+        columns: columns,
+        rows: rows,
+        command: command,
+        workingDirectory: root,
+      ),
+    );
   }
 
   @override

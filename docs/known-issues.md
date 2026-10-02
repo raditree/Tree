@@ -735,3 +735,94 @@ Test 团队（leader `agt_1790848305616_be41c9_3`，成员 Developer `member_179
 - **ConPTY 不是逐字节透传**：它自己维护屏幕缓冲、把子进程输出重新编码成 VT 序列再给我们（cmd.exe 能正常显示
   就是因为它）。所以"原始字节"指的是**我们这一层不解码、不清洗**——测试只断言"ESC 序列原样到达 +
   灌非法 UTF-8 不崩且会话继续可用"，没有断言非法字节逐字节重现。
+
+## #12 集成终端的远端（SSH）分支：真实边界与未验证项
+
+**状态**：SSH 分支**已接线**（tree_local_exec 的 `SshShellChannel` + tree_core 的 `SshPtyAdapter`），
+但**只用假通道验证过**——本仓库没有可连的远端 sshd，真链路仍是空白。
+**影响**：Ctrl+J 的集成终端此前对**所有** SSH agent 一律回"暂不支持"；跟随团队 TOP SSH 的**成员**更糟：
+判据只看 `agent.sshConfig`，成员自己那份是空的 ⇒ 被当成"本机"，在**本机工作目录**里起一个终端。
+
+### 先前的错误结论（已推翻）
+
+旧口径写的是"SSH 通道只有一次性 exec，没有伪终端与流式会话"（`packages/tree_core/lib/src/terminal/`
+的注释与 README、`lib/README.md` 的不变量 14、`CHANGELOG`）。**这对协议本身是错的**：SSH 的 session
+通道支持 `shell` 与 `exec`，两者都能带 `pty-req` 拿真 PTY，dartssh2 也有 `SSHClient.shell()` /
+`execute(..., pty:)`。实际缺的只是"我们没接线"，不是"远端做不到"。
+
+（本仓库此前没有 #12：这条旧结论只散在上面的几处注释/文档里，没有进本文件。这次把它**收进来并改写成真实
+边界**；`lib/README.md` 的不变量 14 属前端侧文档，按分工由协调者同步，本条目是权威口径。）
+
+### 现在的实现（判据与形状）
+
+- 判据改成**有效 SSH**：`teamSshConfigFor(agent, store.agent) != null`（成员跟随团队 TOP 的 SSH）。
+  本机 cwd 仍走 `files.rootFor(agent)`；远端分支的 cwd 由 `SshWorkspaceIO` 自己解决，核心不解析远端
+  路径、也不回传本机路径（远端分支的 `terminal_ready.cwd` 是空串）。
+- 形状：tree_local_exec 的 `SshShellChannel`（原始字节输出 / 写入 / 改尺寸 / 退出码 / 幂等 close），
+  dartssh2 实现是 `DartSshTransport.openShell`，经 `SshWorkspaceIO.openShell` 透传（**复用缓存的那条
+  连接**），再由 tree_core 的 `SshPtyAdapter` 接到 `PtyProcess`。
+- `command` 为空 ⇒ `shell(pty:)` 开远端**登录 shell**；非空 ⇒ `execute(cmd, pty:)`，即远端登录 shell 以
+  `-c` 执行（就是 `ssh -t host '<cmd>'`），退出码是**命令**的。**不用"把命令写进 shell 通道"**：真实
+  dartssh2 的 `SSHClient.shell()` 没有 command 参数，写进 PTY 后拿到的退出码属于 shell，命令跑完 shell
+  还活着，与本地 PTY（命令跑完即退出）语义不一致。
+- 远端工作目录：`SshWorkspaceIO.openShell` 把**自己的远端根**作为工作目录；`shell` 请求没有 cwd 参数，
+  因此登录 shell 分支会写一行 `cd '<远端根>'`（**这行会被远端 shell 回显**，如实标注）。
+
+### 真实边界（远端 sshd 侧）
+
+- 远端 sshd 必须允许 `shell` / `pty-req`：`PermitTTY no` / 受限的 `ForceCommand` 会被
+  `SSHChannelRequestError` 拒绝，我们把它包成可读的 `WorkspaceIoException`（终端回 `terminal_error`），
+  **不会**静默降级成无 TTY 的一次性 exec。
+- 只请求 `pty-req` 的 **term type / 行列 / 像素尺寸**（`SSHPtyConfig`），**不带 termios 模式**
+  （`sendPtyReq` 的 `terminalModes` 参数没有被 `SSHPtyConfig` 暴露）⇒ 远端拿到的是默认终端模式。
+- **没有 X11 转发、没有 ssh-agent 转发**：`SSHClient.shell()` 只在显式传 `x11:` / `agentHandler` 时才
+  请求，我们都没接（远端 `git push` 之类若依赖 agent 会失败）。
+- 输出是**原始字节**（不解码、不清洗，与本地 PTY 同口径）；PTY 模式下 stderr 通常被 sshd 并进 stdout，
+  实现仍把 stdout + stderr 两路都灌进同一个流，一块字节都不丢。
+- 判活复用既有 `SshLiveness`：终端输出有数据流动时记一次心跳（"数据在动 = 链路活着"），心跳本身仍由
+  `DartSshTransport` 的定时器负责；`close()` **只关这条会话通道**，绝不 `SSHClient.close()`
+  （SFTP / exec / 文件面板与它共用连接）。
+- `exitCode` 一定收口：远端退出 / 对端关会话 / 链路断开 / 我们主动 close，四条路径都给结果，拿不到退出
+  状态时给 **-1**（与 `DartSshTransport.run` 的 `?? -1` 同口径）；`close()` 幂等。
+
+### 还没验证的（谁要做谁看）
+
+- **没有真机 SSH 目标验证过**：`DartSshTransport.openShell` 一行都没在真 sshd 上跑过。现有覆盖是假通道
+  契约单测（`packages/tree_local_exec/test/ssh_shell_channel_test.dart`）与假 starter 的终端服务单测
+  （`packages/tree_core/test/terminal_service_test.dart`），它们证明的是形状与生命周期，不是"远端真的能
+  打字"。门控真机用例（`TREE_SSH_TEST_HOST/USER/KEY`）目前仍只覆盖 SFTP + exec，**没有** shell 通道。
+- 登录 shell 分支的 `cd '<远端根>'` 回显，以及非 POSIX 远端（Windows OpenSSH）下 `cd ... && ...` 的行为，
+  都没有验证过。
+- SSH 分支**收不到** `command`（`SshPtyStarter` 签名里没有它）⇒ 远端一律登录 shell；要"命令终端"
+  得先扩这个签名，**不要**为了它退回本机执行。
+
+## #13 核心启动被外设预热拖住（界面看到的是「核心进程未能启动」）
+
+**现象**：偶发（而且确实越来越频繁）地停在
+「核心进程启动失败：Bad state: 等待核心进程握手超时（25s）」。
+
+**根因**（不是玄学，也不是"核心整体变慢"）：核心进程的 stdout 首行握手是界面判"核心可用"的**唯一**依据，
+而 CLI 的启动序列把两件**外设预热**排在了握手之前：
+1. `mcp.refresh()` —— 逐个连 MCP 服务并 `listTools()`；MCP 客户端的**首次连接没有超时参数**
+   （`mcp_client.dart` 的类文档写着"跑多久由心跳说了算"），一家半死的服务就能把它挂住
+   （最终由判活窗口 ~30s 收口）；
+2. `plugins.start()` —— 逐个 spawn 插件再 `listTools(timeout: 20s)`，而且是**串行**的：两家不通就是 40s。
+两段相加超过界面的 25s 握手超时 ⇒ 用户看到"核心进程未能启动"，而核心其实还在老老实实连外设。
+
+**修法**（断言见 `packages/tree_core/lib/src/server/README.md` 不变量 13）：
+- 握手**不再等**外设：绑定回环端口、打印握手之后，才 `unawaited` 地开始预热；
+- 预热**并行 + 有界 + 绝不抛**（`boot_warmup.dart`，预算 3s；超预算只记日志，未结束的任务继续在后台跑）；
+- 模型真正干活那一轮由 `LlmAgentEngine.awaitReady` 有界等一次预热——否则会出现"第一轮悄悄少掉
+  插件/MCP 工具"这种更难查的回归；
+- 每一段都往 stderr 打 `[core:boot]` 分段耗时，"启动慢"从此是可归因的数字；
+- 回归测试：`packages/tree_core_cli/test/cli_serve_test.dart` 用**两个永不回协议的假外设**（插件 + MCP）
+  钉住"握手必须在 15s 内发出"（旧路径 ≥50s）。实测修复后该用例握手耗时 **3514ms**（含 `dart run` 编译在内）。
+
+**边界（须知）**：
+- 预热超预算时，那一轮对话**暂时**不带插件/MCP 工具（日志会写明），预热完成后自动补上
+  （插件上线本来就会让工具表失效重建）；
+- 预热窗口内界面拿到的插件快照可能是空的，`plugin_status` 增量到达后会自行合并；
+- MCP 首次连接的最终上限仍由**判活窗口**（心跳间隔 × 连续未响应拍数）决定，不是由这里的 3s 预算决定：
+  预算只管"界面与对话不再等它"。
+
+

@@ -48,6 +48,11 @@ Future<void> main(List<String> args) async {
   final bool enableHeartbeat = !args.contains('--no-heartbeat');
   final bool verbose = args.contains('--verbose');
 
+  // 启动分段计时：把「核心启动慢」变成可归因的数字（stderr 的 [core:boot] 行）。
+  final Stopwatch boot = Stopwatch()..start();
+  void bootLog(String phase) =>
+      stderr.writeln('[core:boot] $phase：累计 ${boot.elapsedMilliseconds}ms');
+
   // 落盘装配：存储（agents/sessions/messages）与设置/模型池。核心进程的所有
   // 状态都在 ~/.tree 下的纯文本文件里，用户可直接查看与手改。
   void logStore(String message) => stderr.writeln('[core:store] $message');
@@ -81,7 +86,10 @@ Future<void> main(List<String> args) async {
     missedHeartbeatLimit: settings.missedHeartbeatLimit,
     log: (String message) => stderr.writeln('[core:mcp] $message'),
   );
-  await mcp.refresh();
+  // 首次连接**不在这里做**：MCP 的初始连接没有超时参数（见 McpClient 的类文档），
+  // 排在握手之前时，一家半死的 MCP 服务就能把核心启动拖到 25s 握手超时。改为握手
+  // 之后并行预热，见 _warmUpPeripheralsAfterHandshake。
+  bootLog('存储 / 设置 / MCP 装配完成');
 
   // 提问回路与插件总线都要"工具层先建、核心后建 WS 广播"，因此统一用一个可后置
   // 绑定的广播槽（核心起监听后立即接上 `hub.broadcast`）。
@@ -101,7 +109,9 @@ Future<void> main(List<String> args) async {
     broadcast: (Map<String, dynamic> frame) => hubSink?.call(frame),
     log: (String message) => stderr.writeln('[core:plugin] $message'),
   );
-  await plugins.start();
+  // 同上：插件启动是**逐家串行**且每家 20s 超时（PluginBus.connectTimeout），
+  // 排在握手之前 = 坏插件直接把启动拖到超时。改为握手之后并行预热。
+  bootLog('插件总线装配完成（预热推迟到握手之后）');
 
   // 提问回路：工具层先建好、核心后建 WS 广播，因此广播目标用一个可后置绑定的
   // 槽（core 起监听后立即接上 `hub.broadcast`）。
@@ -118,6 +128,9 @@ Future<void> main(List<String> args) async {
   final TeamService teams = TeamService(
     store: store,
     settings: settings,
+    // 成员的工作目录是"团队 TOP 那份的镜像"（见 syncWorkspaceMirrors）：
+    // 建成员时要能算出 TOP 未配置目录时的默认目录。
+    defaultWorkspaceDir: paths.defaultWorkspaceDir,
     isWorking: (String agentId) => workingSink?.call(agentId) ?? false,
     log: (String message) => stderr.writeln('[core:team] $message'),
   );
@@ -190,6 +203,19 @@ Future<void> main(List<String> args) async {
       log: (String message) => stderr.writeln('[core:migrate] $message'),
     );
   }
+
+  // 工作目录镜像（2026-10-03 用户断言）：把团队共享目录写进成员自己的配置。
+  // 顺序**必须在自愈之后**：自愈可能把成员升为独立 TOP，而升级正是要保住这份目录。
+  final WorkspaceMirrorReport mirrors = await syncWorkspaceMirrors(
+    store,
+    defaultDirFor: paths.defaultWorkspaceDir,
+    backup: (CoreAgent agent) => backupAgentFile(paths, agent.id),
+    log: (String message) => stderr.writeln('[core:team] $message'),
+  );
+  if (!mirrors.isEmpty) {
+    bootLog('工作目录镜像完成：${mirrors.changedCount} 个成员');
+  }
+  bootLog('团队关系自愈与旧 .self 迁移完成');
 
   final WorkspaceToolRunner tools = WorkspaceToolRunner(
     todoStore: todos,
@@ -299,6 +325,10 @@ Future<void> main(List<String> args) async {
     log: (String message) => stderr.writeln('[core:vision] $message'),
   );
 
+  // 外设就绪闸门：句柄必须在引擎构造前就有（预热本身要等握手之后才开跑），
+  // 而它永不失败——无论预热成败都要放行，否则第一轮对话会被永久挂住。
+  final Completer<void> peripheralsReady = Completer<void>();
+
   final LlmAgentEngine engine = LlmAgentEngine(
     resolveModel: settings.model,
     toolRunner: tools,
@@ -306,6 +336,9 @@ Future<void> main(List<String> args) async {
     // 图像视觉链路：只有模型配了 `if_vision` 才会用上（引擎内判），关着时请求体
     // 与从前逐字一致。
     visionResolver: visionFiles,
+    // 外设（MCP/插件）就绪闸门：预热完成前开始的那一轮会在这里有界地等一下，
+    // 避免"悄悄少掉插件/MCP 工具"（见 LlmAgentEngine.awaitReady）。
+    awaitReady: () => peripheralsReady.future,
     // 每次工具结果前告诉模型当下的 todo 与已选 Spec。不接这个，用户在 UI 里
     // 勾选的 Spec 与 set_todo_list 的进度对模型来说就是装饰。
     sessionStatusText: (String agentId, String sessionId) => sessionStatusText(
@@ -340,6 +373,8 @@ Future<void> main(List<String> args) async {
     log: (String message) => stderr.writeln('[core:llm-call] $message'),
   );
 
+  bootLog('引擎与压缩装配完成');
+
   final CoreServer server = await CoreServer.start(    port: port,
     streamChunkDelay: Duration(milliseconds: chunkDelayMs),
     enableHeartbeat: enableHeartbeat,
@@ -356,6 +391,25 @@ Future<void> main(List<String> args) async {
     mcpService: mcp,
     pluginBus: plugins,
     fileService: files,
+    // 核心改 agent yaml（工作目录镜像）前先备份，与团队自愈同约定
+    agentBackup: (CoreAgent agent) => backupAgentFile(paths, agent.id),
+    // 远端（SSH）终端的伪终端：从**缓存的那条** SSH 工作空间 IO 上取 shell 通道
+    // （与文件面板 / 工具层同一条连接），因此 Ctrl+J 不会为每个 agent 再连一次 SSH。
+    // 没接线时远端终端只回可读错误，绝不退回本机执行。
+    sshPtyStarter: SshPtyAdapter(
+      openChannel:
+          (CoreAgent agent, {required int columns, required int rows}) async {
+            final Object? io = await tools.ioFor(agent.id);
+            // 工具层的 IO 外面包了一层 PrivateWorkspaceIO（私有状态分栏），拆开拿真身
+            final Object? raw = io is PrivateWorkspaceIO ? io.inner : io;
+            if (raw is! SshWorkspaceIO) {
+              throw StateError(
+                '该 agent 的有效工作空间不是 SSH 工作空间（${agent.id}），无法开远端终端',
+              );
+            }
+            return raw.openShell(columns: columns, rows: rows);
+          },
+    ).start,
     compaction: compaction,
     // M9 Wave 3-I 第 2 条：执行站 terminal.exec 与工具层**共用同一份 TerminalHooks**，
     // 插件下发的 hook 任务与 agent 自己起的 hook 任务因此互相看得到 task_id
@@ -388,6 +442,8 @@ Future<void> main(List<String> args) async {
     );
   };
 
+  bootLog('监听已就绪，即将发出握手');
+
   // 唯一的 stdout 输出：就绪握手（父进程按行读取并解析）
   stdout.writeln(server.handshake.encode());
   await stdout.flush();
@@ -396,6 +452,10 @@ Future<void> main(List<String> args) async {
     '127.0.0.1:${server.port} (pid ${server.processId})',
   );
   stderr.writeln('[tree_core] 数据目录：${paths.root}');
+
+  // 握手已发出 ⇒ 界面立刻可用。外设预热从这里**才开始**并行跑：慢的 MCP/插件
+  // 只影响"第一轮生成时的工具表"（那一轮由 awaitReady 闸门兜底），不再拖住核心启动。
+  unawaited(_warmUpPeripheralsAfterHandshake(mcp, plugins, peripheralsReady));
 
   final Completer<void> shutdown = Completer<void>();
   // 可靠退出通道：stdin 逐行命令（父进程写 `shutdown\n`）。
@@ -433,6 +493,33 @@ Future<void> main(List<String> args) async {
   await stderr.flush();
   // 显式退出：stdin 订阅会让事件循环保持存活，返回 main 不保证 VM 结束
   exit(0);
+}
+
+/// 握手**之后**并行预热外设（MCP / 插件），结束时放行 [ready] 闸门。
+///
+/// 原则只有两条：
+/// 1. 预热绝不排在握手之前（否则外设卡住 = 界面看到"核心进程未能启动"）；
+/// 2. 无论成败都要放行闸门（否则第一轮生成会永远等下去）。
+Future<void> _warmUpPeripheralsAfterHandshake(
+  McpService mcp,
+  PluginBus plugins,
+  Completer<void> ready,
+) async {
+  try {
+    await warmUpPeripherals(
+      <WarmUpTask>[
+        (name: 'MCP 服务', run: () => mcp.refresh()),
+        (name: '插件', run: () => plugins.start()),
+      ],
+      budget: const Duration(seconds: 3),
+      log: (String message) => stderr.writeln('[core:boot] $message'),
+    );
+  } catch (error) {
+    // warmUpPeripherals 自己绝不抛；这里只是最后一道兜底，保证闸门一定放行。
+    stderr.writeln('[core:boot] 外设预热异常（已忽略）：$error');
+  } finally {
+    if (!ready.isCompleted) ready.complete();
+  }
 }
 
 void _complete(Completer<void> completer) {

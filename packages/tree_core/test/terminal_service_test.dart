@@ -14,8 +14,10 @@ import 'package:tree_protocol/tree_protocol.dart';
 
 /// 假伪终端：记录写入与尺寸，可手动灌输出、手动结束
 class _FakePty implements PtyProcess {
+  _FakePty({this.shell = 'fake-shell'});
+
   @override
-  String get shell => 'fake-shell';
+  final String shell;
 
   final StreamController<List<int>> _out = StreamController<List<int>>();
   final Completer<int> _exit = Completer<int>();
@@ -95,6 +97,13 @@ void main() {
   late FileService files;
   late List<_FakePty> created;
 
+  /// 远端（SSH）分支起的会话（与 [created] 分开，才能断言"走的是哪条分支"）。
+  late List<_FakePty> createdSsh;
+
+  /// 远端 starter 收到的 agent id 与窗口尺寸。
+  late List<String> sshAgents;
+  late List<(int, int)> sshSizes;
+
   setUp(() {
     temp = Directory.systemTemp.createTempSync('tree_terminal_');
     store = MemoryStore();
@@ -106,16 +115,22 @@ void main() {
       defaultWorkspaceDir: (String _) => temp.path,
     );
     created = <_FakePty>[];
+    createdSsh = <_FakePty>[];
+    sshAgents = <String>[];
+    sshSizes = <(int, int)>[];
   });
 
   tearDown(() {
     if (temp.existsSync()) temp.deleteSync(recursive: true);
   });
 
-  /// 造一个带假连接的服务；[wirePty] false = 模拟「核心没接线伪终端实现」
+  /// 造一个带假连接的服务；[wirePty] / [wireSsh] false = 模拟「核心没接线该后端的
+  /// 伪终端实现」（两条是**独立**的注入点，不能互相顶替）。
   (TerminalService, WsConnection, _Wire) build({
     PtyStarter? starter,
     bool wirePty = true,
+    SshPtyStarter? sshStarter,
+    bool wireSsh = true,
   }) {
     final _FakeSocket socket = _FakeSocket();
     final WsConnection connection = WsConnection(socket: socket);
@@ -125,16 +140,30 @@ void main() {
       startPty: !wirePty
           ? null
           : starter ??
-          ({
-            required String command,
-            required String workingDirectory,
-            required int columns,
-            required int rows,
-          }) async {
-            final _FakePty pty = _FakePty();
-            created.add(pty);
-            return pty;
-          },
+                ({
+                  required String command,
+                  required String workingDirectory,
+                  required int columns,
+                  required int rows,
+                }) async {
+                  final _FakePty pty = _FakePty();
+                  created.add(pty);
+                  return pty;
+                },
+      startSshPty: !wireSsh
+          ? null
+          : sshStarter ??
+                ({
+                  required CoreAgent agent,
+                  required int columns,
+                  required int rows,
+                }) async {
+                  sshAgents.add(agent.id);
+                  sshSizes.add((columns, rows));
+                  final _FakePty pty = _FakePty(shell: 'ssh-shell');
+                  createdSsh.add(pty);
+                  return pty;
+                },
     );
     return (service, connection, _Wire(socket));
   }
@@ -274,7 +303,7 @@ void main() {
     expect(created.first.closed, isTrue, reason: '旧的必须被收掉');
   });
 
-  test('拒绝路径都给可读 terminal_error：没接线 / 未知 agent / 远端 / 缺 id', () async {
+  test('拒绝路径都给可读 terminal_error：本机没接线 / 未知 agent / 远端没接线 / 缺 id', () async {
     // 1) 核心没接线伪终端
     final (TerminalService unwired, WsConnection c1, _Wire w1) =
         build(wirePty: false);
@@ -300,11 +329,14 @@ void main() {
       contains('找不到 agent'),
     );
 
-    // 3) 远端（SSH）agent：明确说"暂不支持"
+    // 3) 远端（SSH）agent + 核心没接线远端伪终端：明确说清楚，且**不在本机起**
+    //    （"偷偷在本机起一个"正是这次判据修正要防的）
     final CoreAgent remote = store.createAgent(name: '远端');
     remote.sshConfig = const SshConfig(host: 'h', username: 'u', password: 'p');
     store.putAgent(remote);
-    final (TerminalService s3, WsConnection c3, _Wire w3) = build();
+    final (TerminalService s3, WsConnection c3, _Wire w3) = build(
+      wireSsh: false,
+    );
     await s3.open(c3, <String, dynamic>{
       TerminalFrame.terminalId: 't1',
       TerminalFrame.agentId: remote.id,
@@ -312,8 +344,9 @@ void main() {
     await settle();
     expect(
       w3.last(WsOutboundType.terminalError)![TerminalFrame.message],
-      contains('交互终端暂不支持'),
+      contains('没有接线远端（SSH）伪终端实现'),
     );
+    expect(created, isEmpty, reason: '远端分支不许退回本机 PTY');
 
     // 4) 缺 terminal_id
     final (TerminalService s4, WsConnection c4, _Wire w4) = build();
@@ -346,6 +379,158 @@ void main() {
     expect(
       wire.last(WsOutboundType.terminalError)![TerminalFrame.message],
       contains('ConPTY 不可用'),
+    );
+  });
+
+  test('SSH agent：走远端分支（起 SSH 通道、绝不起本机 PTY），cwd 不回本机路径', () async {
+    final CoreAgent remote = store.createAgent(name: 'SSH agent');
+    remote.sshConfig = const SshConfig(host: 'h', username: 'u', password: 'p');
+    store.putAgent(remote);
+    final (TerminalService service, WsConnection connection, _Wire wire) =
+        build();
+
+    await service.open(connection, <String, dynamic>{
+      TerminalFrame.terminalId: 't1',
+      TerminalFrame.agentId: remote.id,
+      TerminalFrame.columns: 100,
+      TerminalFrame.rows: 30,
+    });
+    await settle();
+
+    final Map<String, dynamic> ready = wire.last(WsOutboundType.terminalReady)!;
+    expect(ready[TerminalFrame.shell], 'ssh-shell');
+    expect(ready[TerminalFrame.cwd], '', reason: '远端根在远端，核心不回本机路径');
+    expect(ready[TerminalFrame.columns], 100);
+    expect(ready[TerminalFrame.rows], 30);
+    expect(sshAgents.single, remote.id);
+    expect(sshSizes.single, (100, 30));
+    expect(created, isEmpty, reason: 'SSH agent 绝不能在本机起一个终端');
+
+    // 输入 / 输出 / 退出 / 关闭在远端分支上同样工作（同一条通道）
+    await service.input(<String, dynamic>{
+      TerminalFrame.terminalId: 't1',
+      TerminalFrame.bytes: base64Encode(utf8.encode('top\r')),
+    });
+    createdSsh.single.emit('\u001b[2J远端屏幕');
+    await settle();
+    expect(utf8.decode(createdSsh.single.writes.single), 'top\r');
+    expect(
+      utf8.decode(
+        base64Decode(
+          wire.last(WsOutboundType.terminalOutput)![TerminalFrame.bytes]
+              as String,
+        ),
+        allowMalformed: true,
+      ),
+      '\u001b[2J远端屏幕',
+    );
+
+    createdSsh.single.finish(7);
+    await settle();
+    expect(wire.last(WsOutboundType.terminalExit)![TerminalFrame.exitCode], 7);
+    expect(service.activeCount, 0);
+    expect(createdSsh.single.closed, isTrue, reason: '退出后要收掉通道');
+  });
+
+  test('成员跟随 SSH leader：同样走远端分支（判据是有效 SSH，不是 agent.sshConfig）', () async {
+    final CoreAgent leader = store.createAgent(name: 'SSH leader');
+    leader.sshConfig = const SshConfig(
+      host: 'h',
+      username: 'u',
+      password: 'p',
+      root: '/srv/app',
+    );
+    store.putAgent(leader);
+    final CoreAgent member = store.createAgent(name: '成员');
+    member.parentAgentId = leader.id; // 成员自己没有 ssh 配置
+    store.putAgent(member);
+    expect(member.sshConfig, isNull);
+
+    final (TerminalService service, WsConnection connection, _Wire wire) =
+        build();
+    await service.open(connection, <String, dynamic>{
+      TerminalFrame.terminalId: 't1',
+      TerminalFrame.agentId: member.id,
+    });
+    await settle();
+
+    expect(sshAgents.single, member.id);
+    expect(created, isEmpty, reason: '只看 agent.sshConfig 会在这里错起本机终端');
+    expect(wire.last(WsOutboundType.terminalReady)![TerminalFrame.cwd], '');
+  });
+
+  test('本机 agent（含跟随本机 TOP 的成员）：仍走本地分支，cwd 是本机工作目录', () async {
+    final CoreAgent leader = store.createAgent(name: '本机 leader');
+    store.putAgent(leader);
+    final CoreAgent member = store.createAgent(name: '成员');
+    member.parentAgentId = leader.id;
+    store.putAgent(member);
+
+    final (TerminalService service, WsConnection connection, _Wire wire) =
+        build();
+    await service.open(connection, <String, dynamic>{
+      TerminalFrame.terminalId: 't1',
+      TerminalFrame.agentId: member.id,
+    });
+    await settle();
+
+    expect(created, hasLength(1));
+    expect(createdSsh, isEmpty, reason: '没有有效 SSH 的成员仍走本机');
+    expect(
+      wire.last(WsOutboundType.terminalReady)![TerminalFrame.cwd],
+      files.rootFor(member),
+    );
+  });
+
+  test('远端没接线（startSshPty 为 null）：可读错误，不偷偷起本机终端', () async {
+    final CoreAgent remote = store.createAgent(name: 'SSH agent');
+    remote.sshConfig = const SshConfig(host: 'h', username: 'u', password: 'p');
+    store.putAgent(remote);
+    final (TerminalService service, WsConnection connection, _Wire wire) =
+        build(wireSsh: false);
+    await service.open(connection, <String, dynamic>{
+      TerminalFrame.terminalId: 't1',
+      TerminalFrame.agentId: remote.id,
+    });
+    await settle();
+
+    expect(service.activeCount, 0);
+    expect(created, isEmpty);
+    expect(createdSsh, isEmpty);
+    expect(
+      wire.last(WsOutboundType.terminalError)![TerminalFrame.message],
+      contains('没有接线远端（SSH）伪终端实现'),
+    );
+  });
+
+  test('远端起会话失败：变成可读 terminal_error，不抛给调用方', () async {
+    final CoreAgent remote = store.createAgent(name: 'SSH agent');
+    remote.sshConfig = const SshConfig(host: 'h', username: 'u', password: 'p');
+    store.putAgent(remote);
+    final (
+      TerminalService service,
+      WsConnection connection,
+      _Wire wire,
+    ) = build(
+      sshStarter:
+          ({
+            required CoreAgent agent,
+            required int columns,
+            required int rows,
+          }) async {
+            throw StateError('远端 sshd 拒绝 pty-req');
+          },
+    );
+    await service.open(connection, <String, dynamic>{
+      TerminalFrame.terminalId: 't1',
+      TerminalFrame.agentId: remote.id,
+    });
+    await settle();
+
+    expect(service.activeCount, 0);
+    expect(
+      wire.last(WsOutboundType.terminalError)![TerminalFrame.message],
+      contains('远端 sshd 拒绝 pty-req'),
     );
   });
 }

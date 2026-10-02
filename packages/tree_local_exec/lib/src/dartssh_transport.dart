@@ -7,6 +7,7 @@ import 'package:dartssh2/dartssh2.dart';
 
 import 'local_workspace_io.dart';
 import 'ssh_liveness.dart';
+import 'ssh_shell_channel.dart';
 import 'ssh_workspace_io.dart';
 
 /// [SshTransport] 的 dartssh2 实现（M4b-2b）。
@@ -278,6 +279,67 @@ class DartSshTransport implements SshTransport {
     }
   }
 
+  /// 打开一条**远端 shell 通道**（真 PTY）：交互终端（Ctrl+J）的远端分支。
+  ///
+  /// 真实 dartssh2 API（4.1.0，已核对 pub 缓存源码，不是凭记忆）：
+  /// - `SSHClient.shell({SSHPtyConfig? pty, ...})` → `SSHSession`：**没有 command 参数**，
+  ///   起的是远端登录 shell，`pty-req` 由 `pty:` 保证；
+  /// - `SSHClient.execute(command, {SSHPtyConfig? pty, ...})` → `SSHSession`：让远端的
+  ///   **登录 shell 以 `-c` 执行该命令**（就是 `ssh -t host '<cmd>'` 的行为），PTY 同样
+  ///   由 `pty:` 保证，退出码是**命令**的退出码；
+  /// - `SSHSession`：`stdout` / `stderr`、`write(Uint8List)`、
+  ///   `resizeTerminal(int, int, [int, int])`、`exitCode`（可空）、`done`、`close()`。
+  ///
+  /// 由真实 API 决定的语义：
+  /// - [command] 为空 ⇒ `shell(pty:)`：远端登录 shell；
+  /// - [command] 非空 ⇒ `execute(command, pty:)`。**为什么不把命令写进 shell 通道**：
+  ///   写进去之后命令跑完 shell 还活着，`exitCode` 拿到的是 **shell 的**退出码，终端
+  ///   也不会像本地 PTY 那样在命令结束时退出（`startPtySession` 跑完即退出）——那会让
+  ///   "命令终端"的语义在远端与本地不一致。真实 dartssh2 的 `shell()` 也没有 command
+  ///   参数，本来就没法"用 shell 通道执行命令"。
+  /// - [workingDirectory] 非空 ⇒ 先切到该**远端**目录（与 [SshWorkspaceIO.exec] 同一套
+  ///   单引号转义）：命令分支前缀 `cd '<dir>' && `；登录 shell 分支只能把 `cd` 作为
+  ///   一行输入写进去（`shell` 请求没有 cwd 参数），代价是这一行会被远端 shell 回显。
+  /// - 会话的「exitCode 一定收口 / close 幂等 / 不关整条连接」由
+  ///   [_DartSshShellChannel] 保证，本方法只负责"把通道打开"。
+  @override
+  Future<SshShellChannel> openShell({
+    required int columns,
+    required int rows,
+    String command = '',
+    String workingDirectory = '',
+  }) async {
+    final String dir = workingDirectory.trim();
+    final String cmd = command.trim();
+    final SSHPtyConfig pty = SSHPtyConfig(width: columns, height: rows);
+    try {
+      if (cmd.isEmpty) {
+        final SSHSession session = await _client.shell(pty: pty);
+        final _DartSshShellChannel channel = _DartSshShellChannel(
+          session,
+          'ssh',
+          _liveness,
+        );
+        channel.start();
+        if (dir.isNotEmpty) {
+          await channel.write(utf8.encode('cd ${_quote(dir)}\n'));
+        }
+        return channel;
+      }
+      final String line = dir.isEmpty ? cmd : 'cd ${_quote(dir)} && $cmd';
+      final SSHSession session = await _client.execute(line, pty: pty);
+      final _DartSshShellChannel channel = _DartSshShellChannel(
+        session,
+        'ssh',
+        _liveness,
+      );
+      channel.start();
+      return channel;
+    } catch (error) {
+      throw WorkspaceIoException('远端 shell 打开失败：$error');
+    }
+  }
+
   @override
   Future<void> close() async {
     _heartbeat?.cancel();
@@ -289,4 +351,139 @@ class DartSshTransport implements SshTransport {
       "'${value.replaceAll("'", "'"
           r'\'
           "''")}'";
+}
+
+/// [SshShellChannel] 的 dartssh2 实现：包住一条 [SSHSession]（见 [SshTransport.openShell]）。
+///
+/// 关键取舍（都受真实 API 约束）：
+/// - **输出合并 stdout + stderr**：PTY 模式下 stderr 通常为空（sshd 把子进程的 stderr
+///   并进了 pty），但协议允许对端用 extended data 发 stderr；两路都原样灌进同一个
+///   `output`（原始字节、不解码），两路都结束才关 `output`——一块字节都不丢；
+/// - **exitCode 一定会完成**（绝不悬挂）：由 `session.done`（对端关会话 / 链路断开 /
+///   我们 destroy）与 [close] 两条路径收口；`SSHSession.exitCode` 为 null（对端没报
+///   退出状态、被信号杀死、或我们主动关）时给 **-1**，与 [DartSshTransport.run] 的
+///   `?? -1` 同一口径；
+/// - **close 幂等，且只关这一条通道**：调 `SSHChannel.close()`（发 EOF / CHANNEL_CLOSE），
+///   **绝不**调 `SSHClient.close()`——那会把整条连接（SFTP / exec / 其他会话）一起拆掉。
+///   同时主动摘掉本地订阅并关掉 `output`，因此不等对端回应也能立刻收口（对端可能永远
+///   不回 CLOSE，close 不能为它悬挂）；
+/// - **不另起心跳**：输出有数据流动时记一次 [SshLiveness.recordBeat]（"数据在动 = 链路
+///   活着"，与 SshWorkspaceIO 的流式读取同一口径）；心跳本身仍由 [DartSshTransport]
+///   的定时器负责，这里只是把"终端在动"这条证据也记上。
+class _DartSshShellChannel implements SshShellChannel {
+  _DartSshShellChannel(this._session, this._shell, this._liveness);
+
+  final SSHSession _session;
+
+  final String _shell;
+
+  final SshLiveness _liveness;
+
+  final StreamController<List<int>> _output = StreamController<List<int>>();
+
+  final Completer<int> _exit = Completer<int>();
+
+  StreamSubscription<Uint8List>? _stdout;
+
+  StreamSubscription<Uint8List>? _stderr;
+
+  bool _stdoutDone = false;
+
+  bool _stderrDone = false;
+
+  bool _closed = false;
+
+  /// 接上输出与退出码（构造后调用一次）。
+  void start() {
+    _stdout = _session.stdout.listen(
+      _emit,
+      onError: _emitError,
+      onDone: () => _markDone(stdout: true),
+    );
+    _stderr = _session.stderr.listen(
+      _emit,
+      onError: _emitError,
+      onDone: () => _markDone(stdout: false),
+    );
+    // 会话结束（对端关 / 链路断开 / destroy）也把退出码收口：这是"不许永久悬挂"
+    // 的主路径，不能只靠调用方主动 close。错误分支一并收口——这条链上没有别的
+    // 监听者，漏掉它就是一个没人接的异步错误。
+    unawaited(
+      _session.done.then(
+        (void _) => _settle(),
+        onError: (Object _) => _settle(),
+      ),
+    );
+  }
+
+  @override
+  Stream<List<int>> get output => _output.stream;
+
+  @override
+  String get shell => _shell;
+
+  @override
+  Future<int> get exitCode => _exit.future;
+
+  /// 远端有数据在动 = 链路活着：记一次心跳（复用既有 SshLiveness，不另起一套）。
+  void _emit(Uint8List chunk) {
+    _liveness.recordBeat();
+    if (_output.isClosed || chunk.isEmpty) return;
+    _output.add(chunk);
+  }
+
+  void _emitError(Object error) {
+    if (_output.isClosed) return;
+    _output.addError(error);
+  }
+
+  void _markDone({required bool stdout}) {
+    if (stdout) {
+      _stdoutDone = true;
+    } else {
+      _stderrDone = true;
+    }
+    if (_stdoutDone && _stderrDone && !_output.isClosed) {
+      unawaited(_output.close());
+    }
+  }
+
+  /// 退出码收口：拿不到退出状态就给 -1（见类文档）。
+  void _settle() {
+    if (_exit.isCompleted) return;
+    _exit.complete(_session.exitCode ?? -1);
+  }
+
+  @override
+  Future<void> write(List<int> data) async {
+    if (_closed || data.isEmpty) return;
+    try {
+      _session.write(Uint8List.fromList(data));
+    } catch (_) {
+      // 会话已结束（对端走了 / 通道关了）：静默丢弃。键盘输入是高频操作，为它抛
+      // 异常只会刷满日志，而且核心那边也拦不住（用户还在打字）。
+    }
+  }
+
+  @override
+  Future<void> resize(int columns, int rows) async {
+    if (_closed) return;
+    // 通道已结束时 dartssh2 会抛 SSHStateError：如实上抛，由核心的终端服务
+    // 记日志（尺寸变化是高频可覆盖的操作，不值得在这里吞掉）。
+    _session.resizeTerminal(columns, rows);
+  }
+
+  @override
+  Future<void> close() async {
+    if (_closed) return; // 幂等：已结束直接返回，不抛
+    _closed = true;
+    // 只发这条通道的 EOF / CLOSE；**不**碰 SSHClient（整条连接是 SFTP / exec 共用的）。
+    // 不 await done：对端可能永远不回 CLOSE，而 close 必须立刻返回。
+    unawaited(_session.channel.close().catchError((Object _) {}));
+    // 本地订阅直接摘掉、output 立刻收口：不等对端回应也让上层拿到结束。
+    unawaited(_stdout?.cancel() ?? Future<void>.value());
+    unawaited(_stderr?.cancel() ?? Future<void>.value());
+    if (!_output.isClosed) unawaited(_output.close());
+    _settle();
+  }
 }
