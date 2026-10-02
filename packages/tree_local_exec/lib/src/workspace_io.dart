@@ -155,8 +155,13 @@ class GrepOutcome {
     this.excludedDirs = const <String>[],
   });
 
-  /// [scannedFilePaths] 的条数上限：扫描面可能上万，给模型一份可读的抽样即可。
-  static const int maxScannedFilePaths = 200;
+  /// [scannedFilePaths] 的条数上限：扫描面可能上万，给模型一份**可读的抽样**即可。
+  ///
+  /// 2026-10-02 由 200 下调到 20：无匹配时的清单只用来回答"是不是被排除规则挡了"，
+  /// 20 条足以判断；200 条会被 `join('、')` 拼成一行塞进工具结果（3~6k 字符），白烧 token。
+  /// **与 [GrepQuery.maxResults] 不是同一个旋钮**——那个是**命中行数**上限、可由工具参数
+  /// `max_results` 覆盖；两者默认值一度都是 200，极易混淆（本次就是这么踩进来的）。
+  static const int maxScannedFilePaths = 20;
 
   /// [excludedDirs] 的条数上限。
   static const int maxExcludedDirs = 50;

@@ -23,6 +23,10 @@
 5. 启动子进程时**禁用交互**（`-NonInteractive` + 关闭 stdin），否则等输入的命令会永久挂住
    （见 [../../docs/known-issues.md](../../docs/known-issues.md) #7）。
 6. SSH 链路失活时**显式失败**（`SshLinkStaleException`），不静默挂起。
+7. grep 的三个数字各管一件事，**别混**：`scannedFileCount` 是**计数**（读过内容且非二进制的文件数，
+   不受任何上限影响）；`scannedFilePaths` 只留前 `GrepOutcome.maxScannedFilePaths`（= **20**）条抽样；
+   `GrepQuery.maxResults`（默认 **200**，可由工具参数 `max_results` 覆盖）是**命中行数**上限，
+   到顶即停止扫描——"只扫了几个文件"通常是它，而不是清单上限。
 
 ## 测试
 
