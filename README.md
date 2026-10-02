@@ -4,7 +4,7 @@
 
 **LLM 驱动的 agent 团队桌面工作台**：按任务难度动态组建 agent 团队，让多个 agent 在同一个项目目录里协作，全部逻辑跑在**本机单进程**里——无服务器、无账号、无云端。
 
-- **界面**：Flutter 桌面应用（三栏：agent 列表 ｜ 会话与工具卡片 ｜ 文件 / 模型 / 提问面板）
+- **界面**：Flutter 桌面应用（三栏：agent 列表 ｜ 会话与工具调用（一行式，完整详情见右栏）｜ 文件 / 模型 / 提问 / 详情面板）
 - **核心**：纯 Dart 进程 `tree_core`（`dart compile exe` 单文件，约 10 MB，无需运行时）
 - **平台**：Windows / Linux / macOS（维护配置：Flutter 3.47.5 + Dart 3.13.4）
 - **数据**：全部在 `%APPDATA%\Tree`（可用 `TREE_HOME` / `--data-dir` 覆盖），明文配置、可直接手改

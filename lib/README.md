@@ -14,7 +14,7 @@
 | [io/websocket_service.dart](io/websocket_service.dart) | WS 连接与重连、**10s 心跳**、帧分发 |
 | [io/local_executor_service.dart](io/local_executor_service.dart) · [io/ssh_executor_service.dart](io/ssh_executor_service.dart) | per-team 执行模式配置（local/ssh 的读写与注册）；命令本身由核心执行 |
 | [ui/pages/main_page.dart](ui/pages/main_page.dart) | 三栏骨架、agent 列表（顶层 agent + 团队成员）、会话切换、插件槽位作用域 |
-| [ui/widgets/message_panel.dart](ui/widgets/message_panel.dart) | 中栏消息流：分段渲染、工具卡片、提问卡片、断线重播去重、按 agent+会话过滤 |
+| [ui/widgets/message_panel.dart](ui/widgets/message_panel.dart) | 中栏消息流：分段渲染、工具/思考**一行式**（完整内容见右栏「详情」页）、提问卡片、断线重播去重、按 agent+会话过滤 |
 | [ui/widgets/teammates_window_page.dart](ui/widgets/teammates_window_page.dart) | 团队成员拓扑与成员工作进度窗口 |
 | [ui/widgets/](ui/widgets/) | 文件面板 / 查看器 / PDF 预览、Spec、待办、提问、插件、MCP、模型信息、Git 历史、设置页 |
 | [ui/services/](ui/services/) | 重播守卫、下载中心、会话重命名、插件 UI 槽位注册、主题 |
@@ -63,6 +63,16 @@
     **是不是文本一律看字节**（前 4 KB 出现 NUL 就当二进制，扩展名骗人的文件不会被渲染成乱码）。
     读不到就直说——「文件不存在 / 已被移动」「大小未知」，不显示 0 B、不静默、不红屏。
 
+11. **消息流是一行式：模型消息高亮、工具与思考各占一行，完整内容去右栏「详情」页**
+    （[ui/widgets/tool_call_card.dart](ui/widgets/tool_call_card.dart)、[ui/widgets/thinking_card.dart](ui/widgets/thinking_card.dart)、
+    [ui/widgets/detail_panel.dart](ui/widgets/detail_panel.dart)、[ui/services/detail_selection.dart](ui/services/detail_selection.dart)）：
+    模型消息是**高亮块**（左侧主色竖条 + 极淡同色底，**没有整圈边框**），用户消息仍是主色气泡；
+    工具调用一行 =「中文标签 + 关键参数（等宽）」+ 行尾增量（编辑 / 写入按行数给 `+N -M`）、转圈或箭头；
+    思考一行 =「思考 · 首行摘要」。**中栏不再就地展开**——一轮里工具动辄几十条，卡片会把时间线切散，
+    一行之后整轮动作像一份清单。悬停有呼应（图标提亮 + 底色），点击 → 右栏**第 5 个内置页签「详情」**摊开完整参数与结果；
+    右栏收着时自动展开。选中项走 [DetailSelection](ui/services/detail_selection.dart)（全局 ChangeNotifier，存消息**快照**，
+    帧后按 id 刷新——跑着的工具 / 思考内容是原地变更的，必须跟着长），切 agent / 整表重拉时清空。
+
 ## 测试
 
 ```bash
@@ -76,4 +86,6 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 第二个实例被识别并唤起窗口、外人占端口不拦人）、`test/agent_delete_flow_test.dart`（删除闸门的 UI 接线：结构化 409、
 级联重试、只删 TOP 才回落插件作用域）、`test/message_input_test.dart`（输入框：多文件粘贴、草稿按 team+session、
 「+」菜单展开原位变高与 Esc 收起、图片缩略图 vs 文件卡、点开预览）、`test/attachment_preview_test.dart`
-（附件预览：扩展名分类与大小文案、三档读取（文本 / 二进制 / 图片 / 缺失 / 目录 / 截断）、预览对话框）。
+（附件预览：扩展名分类与大小文案、三档读取（文本 / 二进制 / 图片 / 缺失 / 目录 / 截断）、预览对话框）、
+`test/tool_row_detail_test.dart`（一行式：中文标签 + 关键参数、行尾增量、悬停提亮、点击 → 详情页完整参数与结果、空态与关闭、
+派生文本纯函数、右栏页签接线源钉）、`test/message_stream_style_test.dart`（模型消息高亮块不套边框、用户消息仍是气泡）。

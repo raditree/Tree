@@ -8,6 +8,7 @@ import '../../io/api_service.dart';
 import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
 import '../../io/ssh_executor_service.dart';
+import '../services/detail_selection.dart';
 import '../services/plugin_ui_registry.dart';
 import '../widgets/activity_bar_item.dart';
 import '../widgets/agent_list.dart';
@@ -406,18 +407,31 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     // Q12：活动栏插件项集合变化时重建左栏（视图更新不触发整页重建）
     _pluginActivityKeys = _activitySlotKeys();
     _registry.addListener(_onPluginSlotsChanged);
+    // 中栏点了工具行 / 思考行 → 详情在右栏；右栏收着的话先展开，
+    // 否则用户点了半天什么也没发生
+    DetailSelection.instance.addListener(_onDetailSelected);
     _loadAgents();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    DetailSelection.instance.removeListener(_onDetailSelected);
     _registry.removeListener(_onPluginSlotsChanged);
     // 清理本地执行器：注销核心进程注册并释放 WebSocket 引用
     LocalExecutorService.instance.cleanup();
     // 清理 SSH 执行器：仅释放引用（不注销，SSH 配置后端持久化）
     SshExecutorService.instance.cleanup();
     super.dispose();
+  }
+
+  /// 中栏选中了详情：右栏收着就展开（选中项被清空时什么都不做）
+  void _onDetailSelected() {
+    if (DetailSelection.instance.message == null) return;
+    if (!_rightCollapsed) return;
+    setState(() {
+      _rightCollapsed = false;
+    });
   }
 
   @override

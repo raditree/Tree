@@ -10,10 +10,12 @@ import '../../io/api_service.dart';
 import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
 import '../../io/workspace_refresh_service.dart';
+import '../services/detail_selection.dart';
 import '../services/download_center.dart';
 import '../services/plugin_ui_registry.dart';
 import 'file_sync_button.dart';
 import 'file_tree.dart';
+import 'detail_panel.dart';
 import 'file_viewer.dart';
 import 'git_history.dart';
 import 'mcp_config_panel.dart';
@@ -77,10 +79,13 @@ class FilePanel extends StatefulWidget {
 }
 
 class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
-  /// 内置顶层 Tab 数量（文件 / MCP 配置 / 模型信息 / 问题回复）
-  static const int _builtinTabCount = 4;
+  /// 内置顶层 Tab 数量（文件 / MCP 配置 / 模型信息 / 问题回复 / 详情）
+  static const int _builtinTabCount = 5;
 
-  /// 顶层 Tab 控制器（0=文件，1=MCP 配置，2=模型信息，3=问题回复，
+  /// 「详情」页的固定索引（中栏点了工具行 / 思考行就切到它）
+  static const int _detailTabIndex = _builtinTabCount - 1;
+
+  /// 顶层 Tab 控制器（0=文件，1=MCP 配置，2=模型信息，3=问题回复，4=详情，
   /// 之后是插件 panel 槽位；插件槽位集合变化时重建）
   late TabController _tabController;
 
@@ -153,6 +158,8 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
       vsync: this,
     );
     _tabController.addListener(_onTopTabChanged);
+    // 中栏点了工具行 / 思考行 → 自动切到「详情」页
+    DetailSelection.instance.addListener(_onDetailSelected);
     _fileTabController = TabController(length: 3, vsync: this);
     // Q12：插件槽位（manifest / 注销 / 切 team）变化时重算插件 Tab
     _registry.addListener(_onPluginSlotsChanged);
@@ -164,12 +171,24 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
 
   @override
   void dispose() {
+    DetailSelection.instance.removeListener(_onDetailSelected);
     LocalExecutorService.instance.removeListener(_onLocalModeChanged);
     WorkspaceRefreshService.instance.removeListener(_onWorkspaceChanged);
     _registry.removeListener(_onPluginSlotsChanged);
     _tabController.dispose();
     _fileTabController.dispose();
     super.dispose();
+  }
+
+  /// 中栏选中了工具行 / 思考行：切到「详情」页。
+  ///
+  /// 只在**选中**时切（清空不动）：用户点关闭收掉详情后，不该再被拽回这一页。
+  void _onDetailSelected() {
+    if (!mounted) return;
+    if (DetailSelection.instance.message == null) return;
+    if (_tabController.index != _detailTabIndex) {
+      _tabController.animateTo(_detailTabIndex);
+    }
   }
 
   /// 顶层 Tab 选中索引跟踪（TabController 重建时保持当前页）
@@ -380,6 +399,8 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
                     sessionId: widget.sessionId,
                     onNavigateToQuestion: widget.onNavigateToQuestion,
                   ),
+                  // 详情页：中栏点中的工具调用 / 思考完整摊开（见 DetailPanel）
+                  const DetailPanel(),
                   // Q12：插件面板 Tab（追加在既有 Tab 之后）
                   for (final PluginUiSlot slot in _pluginPanels)
                     PluginPanelSlotView(
@@ -423,7 +444,8 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
                 const Tab(text: 'MCP 配置'),
                 const Tab(text: '模型信息'),
                 const Tab(text: '问题回复'),
-                // Q12 插件 Tab：追加在既有四个 Tab 之后，文案用槽位 title
+                const Tab(text: '详情'),
+                // Q12 插件 Tab：追加在既有五个 Tab 之后，文案用槽位 title
                 for (final PluginUiSlot slot in _pluginPanels)
                   Tab(text: pluginSlotLabel(slot)),
               ],

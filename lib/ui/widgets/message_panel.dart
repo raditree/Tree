@@ -15,6 +15,7 @@ import '../../io/question_update_service.dart';
 import '../../io/ssh_executor_service.dart';
 import '../../io/websocket_service.dart';
 import '../../io/workspace_refresh_service.dart';
+import '../services/detail_selection.dart';
 import '../services/message_replay_guard.dart';
 import '../services/plugin_ui_registry.dart';
 import '../services/session_rename.dart';
@@ -295,6 +296,8 @@ class _MessagePanelState extends State<MessagePanel> {
 
     // 切换 Agent 或外部触发刷新时清空消息列表并加载历史
     if (oldWidget.selectedAgent?.id != widget.selectedAgent?.id) {
+      // 详情是「某个 agent 的某条消息」：换 agent 就作废，右栏不留上一个的残留
+      DetailSelection.instance.clear();
       setState(() {
         _messages.clear();
         _sessions = <ChatSession>[];
@@ -312,6 +315,8 @@ class _MessagePanelState extends State<MessagePanel> {
       // 切换顶部 agent：加载其独立的运行模式设置（仅供显示，不注册）
       _loadModeSettings();
     } else if (oldWidget.refreshTrigger != widget.refreshTrigger) {
+      // 历史被整表重拉：旧消息对象随即作废，详情跟着清
+      DetailSelection.instance.clear();
       setState(() {
         _messages.clear();
       });
@@ -1156,6 +1161,12 @@ class _MessagePanelState extends State<MessagePanel> {
 
   @override
   Widget build(BuildContext context) {
+    // 跑着的工具 / 思考还在长：帧后把右栏详情的同一 id 快照刷新一次。
+    // 为什么放帧后：改这个 notifier 会让右栏与工具/思考行重建，在 build 期间
+    // 通知就成了「build 期间 setState」。它只读 _messages，不改中栏状态。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) DetailSelection.instance.refresh(_messages);
+    });
     final Agent? agent = widget.selectedAgent;
     return Container(
       color: Theme.of(context).scaffoldBackgroundColor,

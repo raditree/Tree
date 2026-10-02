@@ -3,16 +3,16 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 
 import '../models/message.dart';
+import '../services/detail_selection.dart';
 
-/// 工具调用卡片
+/// 一次工具调用的**一行**：图标 + 中文标签 + 关键参数（等宽），行尾给增量 / 转圈 / 箭头。
 ///
-/// 展示一次工具调用的进度与结果，默认折叠，点击可展开查看：
-/// - 工具调用参数（按工具类型格式化展示，非原始 JSON）
-/// - 工具执行结果（如果尚未完成，显示执行中的动画）
+/// 为什么从卡片改成一行：一轮任务里工具调用动辄几十条，"边框 + 两行 + 展开箭头"
+/// 会把消息流切成一大堆盒子，用户看不出这一轮到底读了哪些文件、跑了什么命令。
+/// 一行之后整轮动作像一份清单，扫一眼就知道发生了什么。
 ///
-/// 为内置工具（help / set / refresh / mcp / team / ask_user_question）与
-/// 工作空间工具（read / grep / write / edit / terminal / embed_search）定制了
-/// 图标、配色与标题，其余工具使用通用样式。
+/// 完整内容（参数表 + 完整结果）不在中栏展开，而是点这一行 → 右栏「详情」页，
+/// 中栏因此永远保持紧凑；悬停有底色与图标提亮作为"这里可以点"的呼应。
 class ToolCallCard extends StatefulWidget {
   final ChatMessage message;
 
@@ -23,83 +23,87 @@ class ToolCallCard extends StatefulWidget {
 }
 
 class _ToolCallCardState extends State<ToolCallCard> {
-  bool _expanded = false;
+  /// 鼠标是否停在这一行上（提亮用；底色由 InkWell 自己画）
+  bool _hover = false;
 
   @override
   Widget build(BuildContext context) {
-    final ToolStyle style = _toolStyle(widget.message.toolName ?? '');
-    final cs = Theme.of(context).colorScheme;
-    final bool running = widget.message.toolRunning;
+    final ChatMessage m = widget.message;
+    final ToolStyle style = toolStyleOf(m.toolName ?? '');
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final bool running = m.toolRunning;
+    final String value = toolLineValue(m);
+    final String? diff = toolDiffStat(m.toolName ?? '', m.toolArguments);
 
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: Container(
-        // 不再写死 560px：中栏被拖宽时工具输出（命令、文件差异、表格）应当
-        // 跟着铺满可用宽度，只留 Align 自带的一点点余量
-        constraints: const BoxConstraints(maxWidth: double.infinity),
-        margin: const EdgeInsets.only(bottom: 8),
-        decoration: BoxDecoration(
-          color: cs.surface,
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: style.color.withValues(alpha: 0.4)),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            InkWell(
-              onTap: () => setState(() => _expanded = !_expanded),
-              borderRadius: BorderRadius.circular(10),
+    return ListenableBuilder(
+      listenable: DetailSelection.instance,
+      builder: (BuildContext context, Widget? child) {
+        final bool isSelected = DetailSelection.instance.selectedId == m.id;
+        return MouseRegion(
+          onEnter: (_) => setState(() => _hover = true),
+          onExit: (_) => setState(() => _hover = false),
+          child: Material(
+            color: isSelected
+                ? cs.primary.withValues(alpha: 0.12)
+                : Colors.transparent,
+            borderRadius: BorderRadius.circular(6),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(6),
+              hoverColor: cs.primary.withValues(alpha: 0.07),
+              onTap: () => DetailSelection.instance.select(m),
               child: Padding(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
                 child: Row(
                   children: <Widget>[
-                    Container(
-                      width: 28,
-                      height: 28,
-                      decoration: BoxDecoration(
-                        color: style.color.withValues(alpha: 0.15),
-                        borderRadius: BorderRadius.circular(6),
-                      ),
-                      child: Icon(style.icon, size: 17, color: style.color),
+                    Icon(
+                      style.icon,
+                      size: 15,
+                      color: _hover || isSelected
+                          ? style.color
+                          : style.color.withValues(alpha: 0.75),
                     ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        mainAxisSize: MainAxisSize.min,
-                        children: <Widget>[
-                          Text(
-                            _collapsedTitle(widget.message),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              fontSize: 13,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            running
-                                ? '执行中…'
-                                : _resultPreview(widget.message.toolResult),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 11,
-                              color: running
-                                  ? style.color
-                                  : cs.onSurfaceVariant,
-                            ),
-                          ),
-                        ],
+                    const SizedBox(width: 8),
+                    Text(
+                      toolLabel(m.toolName ?? ''),
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w600,
+                        color: cs.onSurfaceVariant,
                       ),
                     ),
                     const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        value,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12.5,
+                          fontFamily: 'Consolas',
+                          fontFamilyFallback: const <String>[
+                            'Cascadia Mono',
+                            'monospace',
+                          ],
+                          color: cs.onSurface,
+                        ),
+                      ),
+                    ),
+                    if (diff != null) ...<Widget>[
+                      const SizedBox(width: 8),
+                      Text(
+                        diff,
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontFamily: 'Consolas',
+                          color: cs.tertiary,
+                        ),
+                      ),
+                    ],
+                    const SizedBox(width: 6),
                     if (running)
                       SizedBox(
-                        width: 14,
-                        height: 14,
+                        width: 12,
+                        height: 12,
                         child: CircularProgressIndicator(
                           strokeWidth: 2,
                           color: style.color,
@@ -107,229 +111,391 @@ class _ToolCallCardState extends State<ToolCallCard> {
                       )
                     else
                       Icon(
-                        _expanded
-                            ? Icons.keyboard_arrow_up
-                            : Icons.keyboard_arrow_down,
-                        size: 20,
-                        color: cs.outline,
+                        Icons.chevron_right,
+                        size: 14,
+                        color: _hover || isSelected ? cs.primary : cs.outline,
                       ),
                   ],
                 ),
               ),
             ),
-            if (_expanded) _buildBody(context),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
+}
 
-  /// 折叠态标题：工具名 + 关键参数摘要
-  String _collapsedTitle(ChatMessage m) {
-    final String name = m.toolName ?? '';
-    final Map<String, dynamic> args = m.toolArguments ?? <String, dynamic>{};
-    switch (name) {
-      case 'read':
-        return '读取 ${args['path'] ?? ''}';
-      case 'grep': {
-        final String pattern = (args['pattern'] ?? '').toString();
-        final String path = (args['path'] ?? '').toString();
-        if (pattern.isEmpty) return '内容搜索';
-        return path.isEmpty ? '搜索: $pattern' : '搜索 $path: $pattern';
+/// 工具的中文短名：一行行首的标签（也是详情页标题）
+String toolLabel(String name) {
+  switch (name) {
+    case 'read':
+      return '读取';
+    case 'grep':
+      return '搜索';
+    case 'write':
+      return '写入';
+    case 'edit':
+      return '编辑';
+    case 'terminal':
+      return '运行命令';
+    case 'set':
+      return '设置';
+    case 'set_todo_list':
+      return '待办';
+    case 'team':
+      return '团队';
+    case 'mcp':
+      return 'MCP';
+    case 'embed_search':
+      return '语义搜索';
+    case 'ask_user_question':
+      return '提问';
+    case 'help':
+      return '帮助';
+    case 'refresh':
+      return '刷新';
+    default:
+      return name.isEmpty ? '工具' : name;
+  }
+}
+
+/// 一行的正文：这条工具调用最关键的那个参数（路径 / 命令 / 查询词…）。
+///
+/// 取不到关键参数时退回结果的一句话——宁可显示"改了什么"，也别留一行空白。
+String toolLineValue(ChatMessage m) {
+  final String name = m.toolName ?? '';
+  final Map<String, dynamic> args = m.toolArguments ?? <String, dynamic>{};
+  String arg(String key) => (args[key] ?? '').toString();
+
+  switch (name) {
+    case 'read':
+    case 'write':
+    case 'edit':
+      return arg('path');
+    case 'grep': {
+      final String pattern = arg('pattern');
+      final String path = arg('path');
+      if (pattern.isEmpty) return path;
+      return path.isEmpty ? pattern : '$pattern  ·  $path';
+    }
+    case 'terminal':
+      final String cmd = arg('cmd').isEmpty ? arg('command') : arg('cmd');
+      return cmd;
+    case 'set':
+      final String key = arg('key').isEmpty ? arg('param') : arg('key');
+      return key;
+    case 'set_todo_list':
+      return arg('content').isEmpty ? arg('action') : arg('content');
+    case 'team':
+      return arg('description').isEmpty ? arg('action') : arg('description');
+    case 'mcp': {
+      final String tool = arg('tool_name').isEmpty ? arg('tool') : arg('tool_name');
+      final Map<String, dynamic> nested =
+          (args['arguments'] as Map<String, dynamic>?)?.cast<String, dynamic>() ??
+              <String, dynamic>{};
+      final String inner = (nested['cmd'] ??
+              nested['command'] ??
+              nested['path'] ??
+              nested['query'] ??
+              '')
+          .toString();
+      return inner.isEmpty ? tool : '$tool  ·  $inner';
+    }
+    case 'ask_user_question':
+      return arg('question');
+    case 'embed_search':
+      return arg('query');
+    default:
+      // 通用工具：第一个参数当正文，没有就给结果摘要
+      if (args.isNotEmpty) {
+        final dynamic first = args.values.first;
+        final String text = first?.toString() ?? '';
+        if (text.isNotEmpty) return text;
       }
-      case 'write':
-        return '写入 ${args['path'] ?? ''}';
-      case 'edit':
-        return '编辑 ${args['path'] ?? ''}';
-      case 'terminal':
-        final String cmd = (args['cmd'] ?? args['command'] ?? '').toString();
-        return cmd.isEmpty ? '终端命令' : '终端: $cmd';
-      case 'set':
-        final String? key = args['key']?.toString() ?? args['param']?.toString();
-        return key != null ? '设置 $key' : '参数配置';
-      case 'team':
-        final String? action = args['action']?.toString();
-        return action != null ? '团队: $action' : '团队管理';
-      case 'mcp':
-        final String? toolName = args['tool_name']?.toString() ?? args['tool']?.toString();
-        // mcp 嵌套参数：arguments.cmd / arguments.path 等
-        final Map<String, dynamic> nested =
-            (args['arguments'] as Map<String, dynamic>?)?.cast<String, dynamic>() ??
-                <String, dynamic>{};
-        if (toolName == 'terminal') {
-          final String cmd = (nested['cmd'] ?? nested['command'] ?? '').toString();
-          return cmd.isEmpty ? 'MCP: terminal' : '终端: $cmd';
-        }
-        if (toolName == 'read') {
-          return '读取 ${nested['path'] ?? ''}';
-        }
-        if (toolName == 'write') {
-          return '写入 ${nested['path'] ?? ''}';
-        }
-        if (toolName == 'edit') {
-          return '编辑 ${nested['path'] ?? ''}';
-        }
-        if (toolName == 'embed_search') {
-          return '搜索: ${nested['query'] ?? ''}';
-        }
-        return toolName != null ? 'MCP: $toolName' : 'MCP 调用';
-      case 'ask_user_question':
-        return '向用户提问';
-      case 'help':
-        return '工具帮助';
-      case 'refresh':
-        return '刷新工具';
-      case 'embed_search':
-        final String? query = args['query']?.toString();
-        return query != null ? '搜索: $query' : '语义搜索';
-      default:
-        return name.isEmpty ? '工具调用' : name;
+      return toolResultPreview(m.toolResult);
+  }
+}
+
+/// 编辑类工具的行尾增量（+39 -0）。
+///
+/// 按**行数**算，只为一眼看出这一笔改了多少；不是 git 那种精确 diff（工具参数里
+/// 只有整段新旧文本），所以数字跟"实际新增行"可能有出入，但足以分辨改一行还是
+/// 重写整个文件。其它工具返回 null（不占位）。
+String? toolDiffStat(String name, Map<String, dynamic>? args) {
+  final Map<String, dynamic> a = args ?? <String, dynamic>{};
+  int lines(String text) => text.isEmpty ? 0 : text.split('\n').length;
+
+  switch (name) {
+    case 'edit': {
+      final int added = lines((a['new_string'] ?? '').toString());
+      final int removed = lines((a['old_string'] ?? '').toString());
+      return '+$added -$removed';
+    }
+    case 'write': {
+      final int added = lines((a['content'] ?? '').toString());
+      return added == 0 ? null : '+$added';
+    }
+    default:
+      return null;
+  }
+}
+
+/// 结果的单行摘要（把换行压成空格）
+String toolResultPreview(String result) {
+  final String trimmed = extractReadableResult(result).trim();
+  if (trimmed.isEmpty) return '';
+  return trimmed.replaceAll(RegExp(r'\s+'), ' ');
+}
+
+/// 从工具结果字符串里提取人类可读内容。
+///
+/// 核心的 str(result) 可能是 JSON、Python dict 字符串或纯文本；提取
+/// content / output / result / message / text 之一，解析失败就原样返回。
+String extractReadableResult(String raw) {
+  final Map<String, dynamic>? parsed = tryDecodeMap(raw);
+  if (parsed == null) return raw;
+  for (final String key in <String>[
+    'content',
+    'output',
+    'result',
+    'message',
+    'text',
+  ]) {
+    final dynamic value = parsed[key];
+    if (value != null && value.toString().isNotEmpty) return value.toString();
+  }
+  final dynamic err = parsed['error'];
+  if (err != null) return '错误: $err';
+  return raw;
+}
+
+/// 把工具结果解析成 map（兼容 JSON 与 Python dict 字符串）
+Map<String, dynamic>? tryDecodeMap(String raw) {
+  try {
+    final Object? decoded = jsonDecode(raw);
+    if (decoded is Map<String, dynamic>) return decoded;
+  } catch (_) {
+    try {
+      final String fixed = raw
+          .replaceAll(RegExp(r"(?<!\\)'"), '"')
+          .replaceAll(RegExp(r'\bTrue\b'), 'true')
+          .replaceAll(RegExp(r'\bFalse\b'), 'false')
+          .replaceAll(RegExp(r'\bNone\b'), 'null');
+      final Object? decoded = jsonDecode(fixed);
+      if (decoded is Map<String, dynamic>) return decoded;
+    } catch (_) {
+      return null;
     }
   }
+  return null;
+}
 
-  /// 展开后的正文：按工具类型定制
-  Widget _buildBody(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final ChatMessage m = widget.message;
+/// 工具样式（图标 + 配色）。
+///
+/// 配色是"分类提示"而不是装饰：读取偏蓝、写入/编辑偏绿、命令偏灰、提问偏粉——
+/// 一行行扫过去时靠颜色就能分出这一轮是在读、在改还是在跑命令。
+class ToolStyle {
+  final IconData icon;
+  final Color color;
+
+  const ToolStyle(this.icon, this.color);
+}
+
+const Color _blue = Color(0xFF2563EB);
+const Color _green = Color(0xFF16A34A);
+const Color _orange = Color(0xFFEA580C);
+const Color _purple = Color(0xFF7C3AED);
+const Color _teal = Color(0xFF0D9488);
+const Color _pink = Color(0xFFDB2777);
+const Color _grey = Color(0xFF64748B);
+
+/// 按工具名返回定制样式（认不出来给通用扳手）
+ToolStyle toolStyleOf(String name) {
+  switch (name) {
+    case 'help':
+      return const ToolStyle(Icons.help_outline, _blue);
+    case 'set':
+      return const ToolStyle(Icons.tune, _orange);
+    case 'refresh':
+      return const ToolStyle(Icons.refresh, _green);
+    case 'mcp':
+      return const ToolStyle(Icons.extension, _purple);
+    case 'team':
+      return const ToolStyle(Icons.groups, _teal);
+    case 'set_todo_list':
+      return const ToolStyle(Icons.checklist, _teal);
+    case 'ask_user_question':
+      return const ToolStyle(Icons.question_answer, _pink);
+    case 'read':
+      return const ToolStyle(Icons.description_outlined, _blue);
+    case 'grep':
+      return const ToolStyle(Icons.manage_search, _teal);
+    case 'write':
+      return const ToolStyle(Icons.note_add_outlined, _green);
+    case 'edit':
+      return const ToolStyle(Icons.edit_outlined, _green);
+    case 'terminal':
+      return const ToolStyle(Icons.terminal, _grey);
+    case 'embed_search':
+      return const ToolStyle(Icons.search, _teal);
+    default:
+      return const ToolStyle(Icons.build_outlined, _grey);
+  }
+}
+
+/// 工具详情的正文：参数表 + **完整**执行结果（右栏「详情」页用）。
+///
+/// 不在这里做高度截断：详情页整体可滚动，截断是"中栏一行 + 想细看"的路由要解决的
+/// 问题，一个专门的详情页不该再把内容藏起来。
+class ToolDetail extends StatelessWidget {
+  const ToolDetail({super.key, required this.message});
+
+  final ChatMessage message;
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final ChatMessage m = message;
     final String name = m.toolName ?? '';
-    final Map<String, dynamic> args = m.toolArguments ?? <String, dynamic>{};
-    final List<Widget> params = _buildParams(name, args);
-
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-      decoration: BoxDecoration(
-        color: cs.surfaceContainerHighest.withValues(alpha: 0.35),
-        borderRadius: const BorderRadius.vertical(bottom: Radius.circular(10)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: <Widget>[
+    final List<Widget> params = _buildParams(context, name, m.toolArguments);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        if (params.isNotEmpty) ...<Widget>[
+          _sectionLabel(context, '调用参数'),
+          const SizedBox(height: 6),
           ...params,
-          if (params.isNotEmpty) const SizedBox(height: 10),
-          _sectionLabel('执行结果'),
-          const SizedBox(height: 4),
-          if (m.toolRunning)
-            Row(
-              children: <Widget>[
-                const SizedBox(
-                  width: 12,
-                  height: 12,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  '工具执行中，请稍候…',
-                  style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-                ),
-              ],
-            )
-          else
-            _buildResult(name, m.toolResult, args),
+          const SizedBox(height: 16),
         ],
-      ),
+        _sectionLabel(context, '执行结果'),
+        const SizedBox(height: 6),
+        if (m.toolRunning)
+          Row(
+            children: <Widget>[
+              const SizedBox(
+                width: 12,
+                height: 12,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                '工具执行中，请稍候…',
+                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+              ),
+            ],
+          )
+        else
+          _buildResult(context, name, m.toolResult),
+      ],
     );
   }
 
-  /// 按工具类型构建参数展示（人类可读，非 JSON）
-  List<Widget> _buildParams(String name, Map<String, dynamic> args) {
+  /// 按工具类型构建参数展示（人类可读，非原始 JSON）
+  List<Widget> _buildParams(
+    BuildContext context,
+    String name,
+    Map<String, dynamic>? rawArgs,
+  ) {
+    final Map<String, dynamic> args = rawArgs ?? <String, dynamic>{};
+    String arg(String key) => (args[key] ?? '').toString();
     switch (name) {
       case 'read':
-        return [_paramRow('文件', args['path']?.toString() ?? '')];
+        return <Widget>[_paramRow(context, '文件', arg('path'))];
       case 'write':
-        return [
-          _paramRow('文件', args['path']?.toString() ?? ''),
-          _paramRow('内容长度', '${(args['content']?.toString() ?? '').length} 字符'),
+        final int length = arg('content').length;
+        return <Widget>[
+          _paramRow(context, '文件', arg('path')),
+          _paramRow(context, '内容长度', '$length 字符'),
         ];
       case 'edit':
-        return [
-          _paramRow('文件', args['path']?.toString() ?? ''),
-          _paramRow('查找', _truncate(args['old_string']?.toString() ?? '', 80)),
-          _paramRow('替换', _truncate(args['new_string']?.toString() ?? '', 80)),
+        return <Widget>[
+          _paramRow(context, '文件', arg('path')),
+          _paramRow(context, '查找', _truncate(arg('old_string'), 400)),
+          _paramRow(context, '替换', _truncate(arg('new_string'), 400)),
         ];
       case 'terminal':
-        final String cmd = (args['cmd'] ?? args['command'] ?? '').toString();
-        return [_paramRow('命令', cmd)];
+        final String cmd = arg('cmd').isEmpty ? arg('command') : arg('cmd');
+        return <Widget>[_paramRow(context, '命令', cmd)];
       case 'set':
-        final String key = args['key']?.toString() ?? args['param']?.toString() ?? '';
-        final String value = args['value']?.toString() ?? '';
-        return [
-          _paramRow('参数', key),
-          _paramRow('值', value),
+        final String key = arg('key').isEmpty ? arg('param') : arg('key');
+        return <Widget>[
+          _paramRow(context, '参数', key),
+          _paramRow(context, '值', arg('value')),
         ];
       case 'set_todo_list':
-        final String action = args['action']?.toString() ?? '';
-        final List<Widget> widgets = <Widget>[_paramRow('操作', action)];
-        if (action == 'set') {
-          final List<dynamic>? todos = args['todos'] as List<dynamic>?;
-          if (todos != null && todos.isNotEmpty) {
-            widgets.add(_paramRow('任务项数', '${todos.length}'));
-          }
-        } else if (action == 'update') {
-          widgets.add(_paramRow('目标 id', args['todo_id']?.toString() ?? ''));
+        final List<Widget> rows = <Widget>[
+          _paramRow(context, '操作', arg('action')),
+        ];
+        final List<dynamic>? todos = args['todos'] as List<dynamic>?;
+        if (todos != null && todos.isNotEmpty) {
+          rows.add(_paramRow(context, '任务项数', todos.length.toString()));
         }
-        return widgets;
+        if (arg('action') == 'update') {
+          rows.add(_paramRow(context, '目标 id', arg('todo_id')));
+        }
+        return rows;
       case 'team':
-        final String action = args['action']?.toString() ?? '';
-        final String? memberId = args['member_id']?.toString();
-        final List<Widget> widgets = <Widget>[_paramRow('操作', action)];
-        if (memberId != null && memberId.isNotEmpty) {
-          widgets.add(_paramRow('成员', memberId));
+        final List<Widget> rows = <Widget>[
+          _paramRow(context, '操作', arg('action')),
+        ];
+        if (arg('member_id').isNotEmpty) {
+          rows.add(_paramRow(context, '成员', arg('member_id')));
         }
-        final String? desc = args['description']?.toString();
-        if (desc != null && desc.isNotEmpty) {
-          widgets.add(_paramRow('描述', _truncate(desc, 120)));
+        if (arg('description').isNotEmpty) {
+          rows.add(_paramRow(context, '描述', _truncate(arg('description'), 400)));
         }
-        return widgets;
+        return rows;
       case 'mcp':
-        final String toolName = args['tool_name']?.toString() ??
-            args['tool']?.toString() ?? '';
+        final String toolName =
+            arg('tool_name').isEmpty ? arg('tool') : arg('tool_name');
         final Map<String, dynamic> nested =
             (args['arguments'] as Map<String, dynamic>?)?.cast<String, dynamic>() ??
                 <String, dynamic>{};
-        final List<Widget> widgets = <Widget>[_paramRow('MCP 工具', toolName)];
-        // 展开嵌套参数为人类可读行
+        final List<Widget> rows = <Widget>[_paramRow(context, 'MCP 工具', toolName)];
         for (final MapEntry<String, dynamic> e in nested.entries) {
-          widgets.add(_paramRow(e.key, _truncate(e.value.toString(), 120)));
+          rows.add(_paramRow(context, e.key, _truncate(e.value.toString(), 400)));
         }
-        return widgets;
+        return rows;
       case 'ask_user_question':
-        final String question = args['question']?.toString() ?? '';
+        final List<Widget> rows = <Widget>[
+          _paramRow(context, '问题', arg('question')),
+        ];
         final List<dynamic>? options = args['options'] as List<dynamic>?;
-        final List<Widget> widgets = <Widget>[_paramRow('问题', question)];
         if (options != null && options.isNotEmpty) {
-          widgets.add(_paramRow('选项', options.join(' / ')));
+          rows.add(_paramRow(context, '选项', options.join(' / ')));
         }
-        return widgets;
+        return rows;
       case 'embed_search':
-        return [_paramRow('查询', args['query']?.toString() ?? '')];
+        return <Widget>[_paramRow(context, '查询', arg('query'))];
       default:
-        // 通用：列出所有参数
         if (args.isEmpty) return <Widget>[];
-        return args.entries.map((MapEntry<String, dynamic> e) {
-          return _paramRow(e.key, _truncate(e.value.toString(), 100));
-        }).toList();
+        return args.entries
+            .map((MapEntry<String, dynamic> e) =>
+                _paramRow(context, e.key, _truncate(e.value.toString(), 400)))
+            .toList();
     }
   }
 
   /// 按工具类型构建结果展示
-  Widget _buildResult(String name, String result, Map<String, dynamic> args) {
+  Widget _buildResult(BuildContext context, String name, String result) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
     if (result.isEmpty) {
-      return const Text('（无输出）',
-          style: TextStyle(fontSize: 12, color: Colors.grey));
+      return Text(
+        '（无输出）',
+        style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+      );
     }
 
-    // set_todo_list 特殊展示：把 todos 数组渲染成 id+内容+状态列表
+    // 待办清单：把 todos 渲染成 id + 内容 + 状态
     if (name == 'set_todo_list') {
-      final Map<String, dynamic>? parsed = _tryDecodeMap(result);
-      final List<dynamic>? todos = parsed?['todos'] as List<dynamic>?;
+      final List<dynamic>? todos =
+          tryDecodeMap(result)?['todos'] as List<dynamic>?;
       if (todos != null && todos.isNotEmpty) {
         final List<Widget> rows = <Widget>[];
         for (final dynamic t in todos) {
           if (t is! Map<String, dynamic>) continue;
-          final String id = (t['id'] ?? '').toString();
-          final String content = (t['content'] ?? '').toString();
           final String status = (t['status'] ?? '').toString();
           final String progress = (t['progress'] ?? '').toString();
           rows.add(Padding(
@@ -340,28 +506,25 @@ class _ToolCallCardState extends State<ToolCallCard> {
                 SizedBox(
                   width: 120,
                   child: Text(
-                    id,
+                    (t['id'] ?? '').toString(),
                     style: TextStyle(
                       fontSize: 11,
-                      fontFamily: 'monospace',
-                      color: Theme.of(context).colorScheme.primary,
+                      fontFamily: 'Consolas',
+                      color: cs.primary,
                     ),
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
                 Expanded(
                   child: Text(
-                    content,
+                    (t['content'] ?? '').toString(),
                     style: const TextStyle(fontSize: 12, height: 1.4),
                   ),
                 ),
                 const SizedBox(width: 8),
                 Text(
                   '$status $progress',
-                  style: TextStyle(
-                    fontSize: 11,
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                  ),
+                  style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
                 ),
               ],
             ),
@@ -373,134 +536,64 @@ class _ToolCallCardState extends State<ToolCallCard> {
         );
       }
     }
-    // 如果结果是重定向提示
+
+    // 结果被重定向到工作空间：只留一句指向文件的提示
     if (result.startsWith('工具调用结果已保存到')) {
       return Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          Icon(Icons.save_alt, size: 14, color: Theme.of(context).colorScheme.primary),
+          Icon(Icons.save_alt, size: 14, color: cs.primary),
           const SizedBox(width: 6),
           Expanded(
             child: SelectableText(
               result,
-              style: TextStyle(
-                fontSize: 12,
-                color: Theme.of(context).colorScheme.primary,
-              ),
+              style: TextStyle(fontSize: 12, color: cs.primary),
             ),
           ),
         ],
       );
     }
 
-    // 尝试从 Python dict 字符串或 JSON 中提取可读内容
-    final String displayResult = _extractReadableResult(result);
-
-    // 大输出：用可滚动容器
-    if (displayResult.length > 200) {
-      return Container(
-        constraints: const BoxConstraints(maxHeight: 240),
-        width: double.infinity,
-        padding: const EdgeInsets.all(8),
-        decoration: BoxDecoration(
-          color: Theme.of(context).colorScheme.surfaceContainerHighest,
-          borderRadius: BorderRadius.circular(6),
+    final String display = extractReadableResult(result);
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: Theme.of(context).dividerColor),
+      ),
+      child: SelectableText(
+        display,
+        style: const TextStyle(
+          fontSize: 11.5,
+          fontFamily: 'Consolas',
+          fontFamilyFallback: <String>['Cascadia Mono', 'monospace'],
+          height: 1.5,
         ),
-        child: SingleChildScrollView(
-          child: SelectableText(
-            displayResult,
-            style: const TextStyle(
-              fontSize: 11,
-              fontFamily: 'monospace',
-              height: 1.4,
-            ),
-          ),
-        ),
-      );
-    }
-    return SelectableText(
-      displayResult,
-      style: const TextStyle(fontSize: 12, height: 1.4),
+      ),
     );
   }
 
-  /// 从工具结果字符串中提取人类可读内容。
-  ///
-  /// 后端 `str(result)` 可能产生：
-  /// - JSON 字符串：`{"content": "...", "tool_name": "read", ...}`
-  /// - Python dict 字符串：`{'content': '...', 'tool_name': 'read', ...}`
-  /// - 纯文本
-  ///
-  /// 提取 `content` / `output` / `result` / `message` 等关键字段；
-  /// 若解析失败则返回原始字符串。
-  String _extractReadableResult(String raw) {
-    final Map<String, dynamic>? parsed = _tryDecodeMap(raw);
-    if (parsed == null) return raw;
-
-    // 提取可读字段
-    for (final String key in <String>['content', 'output', 'result', 'message', 'text']) {
-      final dynamic val = parsed[key];
-      if (val != null && val.toString().isNotEmpty) {
-        return val.toString();
-      }
-    }
-
-    // 有 error 字段
-    final dynamic err = parsed['error'];
-    if (err != null) {
-      return '错误: $err';
-    }
-
-    // 回退：返回原始 JSON
-    return raw;
-  }
-
-  /// 尝试把工具结果字符串解析为 map。
-  ///
-  /// 兼容 JSON 与 Python dict 字符串（单引号、True/False/None）。
-  /// 解析失败时返回 null。
-  Map<String, dynamic>? _tryDecodeMap(String raw) {
-    // 尝试 JSON 解析
-    try {
-      final Object? decoded = jsonDecode(raw);
-      if (decoded is Map<String, dynamic>) return decoded;
-    } catch (_) {
-      // 尝试修复 Python dict 字符串（单引号 -> 双引号）
-      try {
-        final String fixed = raw
-            .replaceAll(RegExp(r"(?<!\\)'"), '"')
-            .replaceAll(RegExp(r'\bTrue\b'), 'true')
-            .replaceAll(RegExp(r'\bFalse\b'), 'false')
-            .replaceAll(RegExp(r'\bNone\b'), 'null');
-        final Object? decoded = jsonDecode(fixed);
-        if (decoded is Map<String, dynamic>) return decoded;
-      } catch (_) {
-        return null;
-      }
-    }
-    return null;
-  }
-
   /// 参数行：标签 + 值
-  Widget _paramRow(String label, String value) {
+  Widget _paramRow(BuildContext context, String label, String value) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
     return Padding(
-      padding: const EdgeInsets.only(bottom: 4),
+      padding: const EdgeInsets.only(bottom: 6),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
           SizedBox(
-            width: 56,
+            width: 64,
             child: Text(
               label,
-              style: TextStyle(
-                fontSize: 11,
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-              ),
+              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
             ),
           ),
           Expanded(
             child: SelectableText(
               value.isEmpty ? '-' : value,
-              style: const TextStyle(fontSize: 12, height: 1.3),
+              style: const TextStyle(fontSize: 12, height: 1.4),
             ),
           ),
         ],
@@ -508,12 +601,10 @@ class _ToolCallCardState extends State<ToolCallCard> {
     );
   }
 
-  String _truncate(String s, int max) {
-    if (s.length <= max) return s;
-    return '${s.substring(0, max)}…';
-  }
+  String _truncate(String s, int max) =>
+      s.length <= max ? s : '${s.substring(0, max)}…';
 
-  Widget _sectionLabel(String text) {
+  Widget _sectionLabel(BuildContext context, String text) {
     return Text(
       text,
       style: TextStyle(
@@ -522,66 +613,5 @@ class _ToolCallCardState extends State<ToolCallCard> {
         color: Theme.of(context).colorScheme.onSurfaceVariant,
       ),
     );
-  }
-
-  /// 结果预览（单行截断）
-  String _resultPreview(String result) {
-    final String extracted = _extractReadableResult(result);
-    final String trimmed = extracted.trim();
-    if (trimmed.isEmpty) return '完成';
-    final String singleLine = trimmed.replaceAll(RegExp(r'\s+'), ' ');
-    return singleLine.length > 60
-        ? '${singleLine.substring(0, 60)}…'
-        : singleLine;
-  }
-}
-
-/// 工具样式描述
-class ToolStyle {
-  final IconData icon;
-  final Color color;
-  final String title;
-
-  const ToolStyle(this.icon, this.color, this.title);
-}
-
-const Color _blue = Color(0xFF2563EB);
-const Color _green = Color(0xFF16A34A);
-const Color _orange = Color(0xFFEA580C);
-const Color _purple = Color(0xFF7C3AED);
-const Color _teal = Color(0xFF0D9488);
-const Color _pink = Color(0xFFDB2777);
-const Color _grey = Color(0xFF64748B);
-
-/// 按工具名返回定制样式
-ToolStyle _toolStyle(String name) {
-  switch (name) {
-    case 'help':
-      return const ToolStyle(Icons.help_outline, _blue, 'help · 工具帮助');
-    case 'set':
-      return const ToolStyle(Icons.tune, _orange, 'set · 参数配置');
-    case 'refresh':
-      return const ToolStyle(Icons.refresh, _green, 'refresh · 刷新工具');
-    case 'mcp':
-      return const ToolStyle(Icons.extension, _purple, 'mcp · 调用 MCP 工具');
-    case 'team':
-      return const ToolStyle(Icons.groups, _teal, 'team · 团队管理');
-    case 'ask_user_question':
-      return const ToolStyle(
-          Icons.question_answer, _pink, 'ask_user_question · 向用户提问');
-    case 'read':
-      return const ToolStyle(Icons.description, _blue, 'read · 读取文件');
-    case 'grep':
-      return const ToolStyle(Icons.manage_search, _teal, 'grep · 内容搜索');
-    case 'write':
-      return const ToolStyle(Icons.note_add, _green, 'write · 写入文件');
-    case 'edit':
-      return const ToolStyle(Icons.edit, _green, 'edit · 编辑文件');
-    case 'terminal':
-      return const ToolStyle(Icons.terminal, _grey, 'terminal · 执行命令');
-    case 'embed_search':
-      return const ToolStyle(Icons.search, _teal, 'embed_search · 语义搜索');
-    default:
-      return ToolStyle(Icons.build, _grey, '$name · 工具调用');
   }
 }

@@ -577,17 +577,26 @@ class _MessageBubbleState extends State<_MessageBubble> {
           child: ConstrainedBox(
             constraints: BoxConstraints(maxWidth: maxBubbleWidth),
             child: Container(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 12,
-                vertical: 8,
-              ),
-              decoration: BoxDecoration(
-                color: isUser ? cs.primary : cs.surface,
-                borderRadius: BorderRadius.circular(_radius),
-                border: isUser
-                    ? null
-                    : Border.all(color: Theme.of(context).dividerColor),
-              ),
+              padding: isUser
+                  ? const EdgeInsets.symmetric(horizontal: 12, vertical: 8)
+                  : const EdgeInsets.fromLTRB(12, 8, 14, 8),
+              decoration: isUser
+                  ? BoxDecoration(
+                      color: cs.primary,
+                      borderRadius: BorderRadius.circular(_radius),
+                    )
+                  // 模型消息不给「边框盒子」，改成**高亮块**：左侧主色竖条 + 极淡的
+                  // 同色底。盒子会把消息流切成一格一格，去掉之后整轮对话读起来是
+                  // 连续的；竖条仍让人一眼认出「这段是模型说的」。
+                  : BoxDecoration(
+                      color: cs.primary.withValues(alpha: 0.05),
+                      border: Border(
+                        left: BorderSide(
+                          color: cs.primary.withValues(alpha: 0.6),
+                          width: 3,
+                        ),
+                      ),
+                    ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisSize: MainAxisSize.min,
@@ -681,10 +690,19 @@ class _MessageBubbleState extends State<_MessageBubble> {
         clipBehavior: Clip.none,
         children: [
           // selectable: true → 段落/代码块内可框选复制（跨段落复制用「复制全文」）
+          // 正文字重 w500 + 行距 1.55：跟工具行 / 思考行（12.5 常规体）拉开层次，
+          // 模型的话一眼就是「正文」，工具与思考是「脚注」。
           MarkdownBody(
             data: message.content,
             selectable: true,
-            styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)),
+            styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
+              p: TextStyle(
+                fontSize: 14,
+                height: 1.55,
+                fontWeight: FontWeight.w500,
+                color: textColor,
+              ),
+            ),
           ),
           // 流式输出中不显示复制按钮（内容仍在变化）
           if (_hoverCopy && !streaming)
