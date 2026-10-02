@@ -54,6 +54,15 @@
    `deleteAgent` **必须解析响应体**：旧实现只看状态码，用户只会看到「删除失败（HTTP 409）」，不知道为什么、该怎么办。
    删**成员**时**不清插件作用域**——只有删团队 TOP（`teamId` 为空）才回落，否则该队的站点/槽位会被滤成「站点（0）」。
 
+10. **输入框是卡片式，附件在发送前就能预览**（[ui/widgets/message_input.dart](ui/widgets/message_input.dart)、
+    [ui/widgets/attachment_preview.dart](ui/widgets/attachment_preview.dart)）：附件预览在上、文本域在中、
+    底部一行左边「+」（添加文件 / 展开输入框）、右边**只有**圆形发送键；「展开」只把文本域**原位变高**
+    （0.4×窗口高，夹在 140–360），Esc 收起，**不动草稿与附件**（展开/收起不换 TextField，焦点与光标不丢）。
+    附件一律可预览：图片给缩略图、其它给「图标 + 名称 + 大小」卡片，点开读**本机**文件（发送前附件还没上传，
+    所以 FileViewer 那套工作空间路径的查看器在这里用不了）。判定口径两条：是不是图片看扩展名，
+    **是不是文本一律看字节**（前 4 KB 出现 NUL 就当二进制，扩展名骗人的文件不会被渲染成乱码）。
+    读不到就直说——「文件不存在 / 已被移动」「大小未知」，不显示 0 B、不静默、不红屏。
+
 ## 测试
 
 ```bash
@@ -65,4 +74,6 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 `test/main_page_sidebar_width_test.dart`、`test/message_list_scroll_test.dart`、`test/tray_service_test.dart`（关闭决策与设置默认值）、
 `test/close_to_tray_dialog_test.dart`（首次关闭说明框的返回值）、`test/single_instance_test.dart`（锁键/端口纯函数、
 第二个实例被识别并唤起窗口、外人占端口不拦人）、`test/agent_delete_flow_test.dart`（删除闸门的 UI 接线：结构化 409、
-级联重试、只删 TOP 才回落插件作用域）。
+级联重试、只删 TOP 才回落插件作用域）、`test/message_input_test.dart`（输入框：多文件粘贴、草稿按 team+session、
+「+」菜单展开原位变高与 Esc 收起、图片缩略图 vs 文件卡、点开预览）、`test/attachment_preview_test.dart`
+（附件预览：扩展名分类与大小文案、三档读取（文本 / 二进制 / 图片 / 缺失 / 目录 / 截断）、预览对话框）。

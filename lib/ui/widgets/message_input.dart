@@ -8,6 +8,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'attachment_preview.dart';
+
 /// 一条未发送完的输入草稿（M9 Q6）。
 ///
 /// 文本与附件列表**一起**存：只恢复文本会让用户以为附件还在。
@@ -56,11 +58,15 @@ class MessageDraftCache {
 
 /// 消息输入框组件
 ///
-/// 包含多行输入框、文件上传按钮与发送按钮。
-/// - Enter 发送，Shift+Enter 换行
-/// - 输入为空且无附件时禁用发送按钮
+/// 形状是一张圆角卡片（与 DSH 的输入框同一套排布）：附件预览在最上、文本域在中间、
+/// 底部一行左边「+」（添加文件 / 展开输入框），右边**只有**圆形发送键。
+/// - Enter 发送，Shift+Enter 换行，Esc 收起展开态
+/// - 输入为空且无附件时发送键置灰不可点
 /// - 发送后清空输入框与附件列表，并作废该 team+session 的草稿缓存
 /// - Ctrl+V 依次尝试：剪贴板文件列表（可多个）→ 剪贴板位图 → 文件路径文本 → 文本
+/// - 附件以**可预览**的形态展示（见 [AttachmentTile]）：图片给缩略图、其它给图标+名称+大小，
+///   点开是本机文件的预览对话框（发送前附件还没上传，读的就是本机路径）
+/// - 「展开」只把文本域变高（长文本写起来舒服），不改草稿与附件
 /// - [cacheKey] 非空时按 team+session 缓存草稿，切走再切回来内容还在
 class MessageInput extends StatefulWidget {
   /// 发送回调，参数为文本内容与附件文件路径列表。
@@ -91,7 +97,17 @@ class _MessageInputState extends State<MessageInput> {
       MethodChannel('tree/clipboard');
 
   final TextEditingController _controller = TextEditingController();
-  final FocusNode _focusNode = FocusNode();
+
+  /// 文本域自己的焦点节点：展开/收起后要能立刻继续打字（焦点不能落在按钮上），
+  /// 边框高亮也看它。**键位拦截在 [_keyFocus] 上**——按键从主焦点向上冒泡，
+  /// 两个节点各管一件事。
+  final FocusNode _fieldFocus = FocusNode();
+
+  /// 包裹文本域的焦点节点，只用来拦 Enter / Ctrl+V / Esc
+  final FocusNode _keyFocus = FocusNode();
+
+  /// 是否处于展开态（文本域变高，方便写长文本）
+  bool _expanded = false;
 
   /// 已选择的文件路径列表
   final List<String> _filePaths = [];
@@ -116,6 +132,10 @@ class _MessageInputState extends State<MessageInput> {
       _saveDraft();
       if (mounted) setState(() {});
     });
+    // 聚焦时描边转主色（卡片式输入框的唯一焦点提示）
+    _fieldFocus.addListener(() {
+      if (mounted) setState(() {});
+    });
   }
 
   @override
@@ -132,7 +152,8 @@ class _MessageInputState extends State<MessageInput> {
   @override
   void dispose() {
     _controller.dispose();
-    _focusNode.dispose();
+    _fieldFocus.dispose();
+    _keyFocus.dispose();
     super.dispose();
   }
 
@@ -216,7 +237,7 @@ class _MessageInputState extends State<MessageInput> {
     if (key != null) MessageDraftCache.instance.clear(key);
   }
 
-  /// 处理键盘事件：Enter 发送，Shift+Enter 换行
+  /// 处理键盘事件：Enter 发送，Shift+Enter 换行，Esc 收起展开态
   ///
   /// 返回 [KeyEventResult.handled] 拦截 Enter 键，避免多行输入框插入换行；
   /// Shift+Enter 时返回 [KeyEventResult.ignored]，交由 TextField 处理换行。
@@ -230,6 +251,12 @@ class _MessageInputState extends State<MessageInput> {
             HardwareKeyboard.instance.logicalKeysPressed
                 .contains(LogicalKeyboardKey.controlRight))) {
       _handlePaste();
+      return KeyEventResult.handled;
+    }
+    // Esc 收起展开态：展开后文本域很高，得有个不用鼠标的退路
+    if (event.logicalKey == LogicalKeyboardKey.escape) {
+      if (!_expanded) return KeyEventResult.ignored;
+      _toggleExpand();
       return KeyEventResult.handled;
     }
     if (event.logicalKey != LogicalKeyboardKey.enter) {
@@ -407,13 +434,6 @@ class _MessageInputState extends State<MessageInput> {
     );
   }
 
-  /// 从路径中提取文件名（兼容 / 与 \）
-  String _basename(String path) {
-    final String replaced = path.replaceAll('\\', '/');
-    final int idx = replaced.lastIndexOf('/');
-    return idx >= 0 ? replaced.substring(idx + 1) : replaced;
-  }
-
   /// 是否桌面端（拖拽上传仅桌面支持，移动端跳过 DropTarget 避免崩溃）
   bool get _isDesktop =>
       !kIsWeb &&
@@ -436,122 +456,222 @@ class _MessageInputState extends State<MessageInput> {
   }
 
   /// 输入区主体（桌面端由 DropTarget 包裹支持文件拖拽）
+  ///
+  /// 一张圆角卡片：附件预览在上、文本域在中、底部一行左边「+」右边「展开 + 发送」。
+  /// 聚焦或拖拽进来时描边转主色——卡片式输入框没有别的焦点提示了。
   Widget _buildInputBody(ColorScheme cs) {
+    final Color divider = Theme.of(context).dividerColor;
+    final Color borderColor = _isDragging
+        ? cs.primary
+        : (_fieldFocus.hasFocus ? cs.primary.withValues(alpha: 0.55) : divider);
     return Container(
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: cs.surface,
-          border: Border(
-            top: BorderSide(
-              color: _isDragging ? cs.primary : Theme.of(context).dividerColor,
-              width: _isDragging ? 2 : 1,
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          if (_isDragging) _buildDropHint(cs),
+          Container(
+            decoration: BoxDecoration(
+              color: Theme.of(context).cardColor,
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: borderColor, width: _isDragging ? 2 : 1),
             ),
-          ),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (_isDragging)
-              Container(
-                margin: const EdgeInsets.only(bottom: 8),
-                padding: const EdgeInsets.symmetric(vertical: 12),
-                decoration: BoxDecoration(
-                  color: cs.primary.withValues(alpha: 0.08),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: cs.primary.withValues(alpha: 0.3),
-                    width: 1.5,
-                    strokeAlign: BorderSide.strokeAlignInside,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                if (_filePaths.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+                    child: _buildAttachmentStrip(),
                   ),
-                ),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.cloud_upload_outlined,
-                        size: 20, color: cs.primary),
-                    const SizedBox(width: 8),
-                    Text(
-                      '松开以上传文件',
-                      style: TextStyle(
-                        color: cs.primary,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            if (_filePaths.isNotEmpty) _buildFileList(),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
-                IconButton(
-                  icon: const Icon(Icons.attach_file),
-                  onPressed: _pickFile,
-                  color: cs.onSurfaceVariant,
-                  tooltip: '上传文件（或直接 Ctrl+V 粘贴图片/文件，支持一次粘多个）',
-                ),
-                Expanded(
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
                   child: Focus(
-                    focusNode: _focusNode,
+                    focusNode: _keyFocus,
                     onKeyEvent: _handleKeyEvent,
-                    child: TextField(
-                      controller: _controller,
-                      maxLines: 5,
-                      minLines: 1,
-                      style: const TextStyle(fontSize: 14),
-                      decoration: InputDecoration(
-                        hintText: '输入消息...',
-                        hintStyle: TextStyle(
-                          color: cs.onSurfaceVariant,
-                          fontSize: 14,
-                        ),
-                        filled: true,
-                        fillColor: cs.surface,
-                        contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 12,
-                          vertical: 8,
-                        ),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(8),
-                          borderSide: BorderSide(
-                            color: Theme.of(context).dividerColor,
-                          ),
-                        ),
-                        enabledBorder: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(8),
-                          borderSide: BorderSide(
-                            color: Theme.of(context).dividerColor,
-                          ),
-                        ),
-                        focusedBorder: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(8),
-                          borderSide: BorderSide(
-                            color: cs.primary,
-                          ),
-                        ),
-                      ),
+                    // 展开态靠一个固定高度的盒子：maxLines 置空让文本域自己滚动，
+                    // 而且盒子高度变化不会换掉 TextField 这个 widget——展开/收起时
+                    // 焦点与光标位置都不丢。
+                    child: SizedBox(
+                      height: _expanded ? _expandedFieldHeight(context) : null,
+                      child: _buildField(cs),
                     ),
                   ),
                 ),
-                const SizedBox(width: 8),
-                IconButton(
-                  icon: _sending
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.send),
-                  onPressed: _canSend && !_sending ? _handleSend : null,
-                  color: cs.primary,
-                  disabledColor: cs.outline,
-                  tooltip: _sending ? '正在发送（附件上传中）…' : '发送',
+                Row(
+                  children: <Widget>[
+                    // 发送键左边刻意留空：那里只有发送键，别的入口都收进「+」
+                    _buildAddMenu(cs),
+                    const Spacer(),
+                    _buildSendButton(cs),
+                    const SizedBox(width: 4),
+                  ],
                 ),
               ],
             ),
-          ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 文本域本体：无边框（边框由外层卡片画），随内容长高
+  Widget _buildField(ColorScheme cs) {
+    return TextField(
+      controller: _controller,
+      focusNode: _fieldFocus,
+      minLines: _expanded ? null : 1,
+      maxLines: _expanded ? null : 8,
+      keyboardType: TextInputType.multiline,
+      style: const TextStyle(fontSize: 14, height: 1.4),
+      decoration: InputDecoration(
+        isDense: true,
+        hintText: '输入消息…',
+        hintStyle: TextStyle(color: cs.onSurfaceVariant, fontSize: 14),
+        border: InputBorder.none,
+        contentPadding: EdgeInsets.zero,
+      ),
+    );
+  }
+
+  /// 展开态文本域的高度。
+  ///
+  /// 为什么按窗口高换算：输入框在面板的 Column 里是"非弹性子项"，父级给它的是
+  /// **无界**高度，拿不到"还剩下多少地方"；按窗口高取一个夹住的区间最稳。
+  double _expandedFieldHeight(BuildContext context) =>
+      (MediaQuery.sizeOf(context).height * 0.4).clamp(140.0, 360.0);
+
+  /// 展开 / 收起（只改文本域高度，不动草稿与附件）
+  void _toggleExpand() {
+    setState(() {
+      _expanded = !_expanded;
+    });
+    // 点按钮会把焦点交给按钮，这里抢回文本域：展开就是为了接着写
+    _fieldFocus.requestFocus();
+  }
+
+  /// 「+」菜单：添加文件与展开/收起输入框。
+  ///
+  /// 为什么收进菜单而不是各占一个按钮：卡片底部那行只需要一个明确的"加东西"入口，
+  /// 展开是低频操作（快捷键也行），摆成第二个按钮会让发送键不突出。
+  Widget _buildAddMenu(ColorScheme cs) {
+    return PopupMenuButton<String>(
+      tooltip: '添加附件 / 展开输入框',
+      icon: Icon(Icons.add, color: cs.onSurfaceVariant),
+      onSelected: (String value) {
+        if (value == 'file') {
+          unawaited(_pickFile());
+        } else {
+          _toggleExpand();
+        }
+      },
+      itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
+        _menuItem('file', Icons.attach_file, '添加文件…'),
+        _menuItem(
+          'expand',
+          _expanded ? Icons.close_fullscreen : Icons.open_in_full,
+          _expanded ? '收起输入框' : '展开输入框（长文本）',
         ),
+      ],
+    );
+  }
+
+  PopupMenuItem<String> _menuItem(String value, IconData icon, String label) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return PopupMenuItem<String>(
+      value: value,
+      height: 36,
+      child: Row(
+        children: <Widget>[
+          Icon(icon, size: 16, color: cs.onSurfaceVariant),
+          const SizedBox(width: 8),
+          Text(label, style: const TextStyle(fontSize: 13)),
+        ],
+      ),
+    );
+  }
+
+  /// 圆形发送键：可发送时实心主色，不可发送时置灰
+  Widget _buildSendButton(ColorScheme cs) {
+    final bool enabled = _canSend && !_sending;
+    return Tooltip(
+      message: _sending ? '正在发送（附件上传中）…' : '发送（Enter）',
+      child: Material(
+        color: enabled ? cs.primary : cs.surfaceContainerHighest,
+        shape: const CircleBorder(),
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: enabled ? _handleSend : null,
+          child: SizedBox(
+            width: 34,
+            height: 34,
+            child: Center(
+              child: _sending
+                  ? SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: cs.onSurfaceVariant,
+                      ),
+                    )
+                  : Icon(
+                      Icons.arrow_upward,
+                      size: 18,
+                      color: enabled ? cs.onPrimary : cs.onSurfaceVariant,
+                    ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 拖拽经过时的提示条
+  Widget _buildDropHint(ColorScheme cs) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      decoration: BoxDecoration(
+        color: cs.primary.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: cs.primary.withValues(alpha: 0.3),
+          width: 1.5,
+          strokeAlign: BorderSide.strokeAlignInside,
+        ),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: <Widget>[
+          Icon(Icons.cloud_upload_outlined, size: 18, color: cs.primary),
+          const SizedBox(width: 8),
+          Text(
+            '松开以添加附件',
+            style: TextStyle(
+              color: cs.primary,
+              fontSize: 13,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 已选附件：图片给缩略图、其它给图标+名称+大小，点开预览、角标移除
+  Widget _buildAttachmentStrip() {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: _filePaths
+          .map((String path) => AttachmentTile(
+                path: path,
+                onRemove: () => _removeFile(path),
+              ))
+          .toList(),
     );
   }
 
@@ -561,26 +681,5 @@ class _MessageInputState extends State<MessageInput> {
       _isDragging = false;
     });
     _addFiles(details.files.map((dynamic f) => f.path as String));
-  }
-
-  /// 构建已选文件列表（Chip 形式，可删除）
-  Widget _buildFileList() {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      child: Wrap(
-        spacing: 8,
-        runSpacing: 4,
-        children: _filePaths.map((String path) {
-          return Chip(
-            label: Text(
-              _basename(path),
-              style: const TextStyle(fontSize: 12),
-            ),
-            deleteIcon: const Icon(Icons.close, size: 16),
-            onDeleted: () => _removeFile(path),
-          );
-        }).toList(),
-      ),
-    );
   }
 }

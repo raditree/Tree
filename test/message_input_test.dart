@@ -1,13 +1,30 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:tree/ui/widgets/attachment_preview.dart';
 import 'package:tree/ui/widgets/message_input.dart';
 
 /// Q5（多文件粘贴）+ Q6（草稿按 team+session 缓存）。
 ///
 /// 原生侧 readFiles 在测试里用 mock 通道顶替：这里验证的是 Dart 侧的
 /// 「文件列表优先，且一次全部成为附件」与草稿存取语义。
+/// 清理临时目录：删不掉就算了（Windows 上可能还被别的句柄占着），
+/// 不能让清理失败把一个已经跑完的用例判成失败。
+void cleanTempDir(Directory dir) {
+  try {
+    dir.deleteSync(recursive: true);
+  } catch (_) {}
+}
+
+/// 1x1 透明 PNG（只用来证明"图片附件走缩略图这条路"，不校验像素）
+final Uint8List kTinyPng = base64Decode(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==',
+);
+
 void main() {
   const MethodChannel clipboardChannel = MethodChannel('tree/clipboard');
 
@@ -101,7 +118,7 @@ void main() {
     await pressCtrlV(tester);
 
     expect(clipboardCalls, <String>['readFiles', 'readImage']);
-    expect(find.byType(Chip), findsNothing);
+    expect(find.byType(AttachmentTile), findsNothing);
   });
 
   group('草稿缓存（Q6）', () {
@@ -118,7 +135,7 @@ void main() {
       // 切到同 team 的另一个会话：没有缓存 → 输入框与附件都空
       await pumpInput(tester, cacheKey: 'teamA::s2');
       expect(fieldText(tester), '');
-      expect(find.byType(Chip), findsNothing);
+      expect(find.byType(AttachmentTile), findsNothing);
 
       await tester.enterText(find.byType(TextField), '乙草稿');
 
@@ -142,19 +159,19 @@ void main() {
       await pressCtrlV(tester);
       await tester.enterText(find.byType(TextField), '要发的内容');
 
-      await tester.tap(find.byIcon(Icons.send));
+      await tester.tap(find.byIcon(Icons.arrow_upward));
       await tester.pumpAndSettle();
 
       expect(sentTexts, <String>['要发的内容']);
       expect(sentFiles.single, <String>[r'C:\tmp\x.bin']);
       expect(fieldText(tester), '');
-      expect(find.byType(Chip), findsNothing);
+      expect(find.byType(AttachmentTile), findsNothing);
 
       // 切走再切回来：已发送的内容不得复活
       await pumpInput(tester, cacheKey: 'teamA::s2');
       await pumpInput(tester, cacheKey: 'teamA::s1');
       expect(fieldText(tester), '');
-      expect(find.byType(Chip), findsNothing);
+      expect(find.byType(AttachmentTile), findsNothing);
     });
 
     testWidgets('发送失败（回调返回 false）：文本与附件都保留，草稿不丢',
@@ -166,7 +183,7 @@ void main() {
 
       // 模拟"附件上传失败"：面板回调返回 false，消息没有发出去
       sendOk = false;
-      await tester.tap(find.byIcon(Icons.send));
+      await tester.tap(find.byIcon(Icons.arrow_upward));
       await tester.pumpAndSettle();
 
       expect(sentTexts, <String>['要重发的内容'], reason: '回调仍然被调用了一次');
@@ -192,7 +209,7 @@ void main() {
       // 文本/附件写进新键——否则第二次切回来就会看到不属于它的草稿
       await pumpInput(tester, cacheKey: 'teamA::s2');
       expect(fieldText(tester), '');
-      expect(find.byType(Chip), findsNothing);
+      expect(find.byType(AttachmentTile), findsNothing);
 
       await pumpInput(tester, cacheKey: 'teamA::s1');
       expect(fieldText(tester), '甲');
@@ -200,7 +217,7 @@ void main() {
 
       await pumpInput(tester, cacheKey: 'teamA::s2');
       expect(fieldText(tester), '');
-      expect(find.byType(Chip), findsNothing);
+      expect(find.byType(AttachmentTile), findsNothing);
     });
 
     testWidgets('不传 cacheKey（复用方）：不写缓存，切到带缓存的键不串味',
@@ -232,6 +249,134 @@ void main() {
       cache.write('t::s', 'x', <String>['a.txt']);
       cache.write('t::s', '', <String>[]);
       expect(cache.read('t::s'), isNull);
+    });
+  });
+
+  group('卡片式输入框：展开与附件预览', () {
+    /// 放行挂在控件上的**真实文件 IO**。
+    ///
+    /// widget 测试跑在假时钟里，真实 IO 的回调躺在假队列里等着；而且一次 IO 往往
+    /// 是好几步（stat → open → length → read），每圈只能推进一步。所以必须
+    /// 「让真实事件循环转一圈 → pump 一次把回调放出来」反复来几圈——
+    /// 只转一圈的话，多步 IO 会永远停在中间（界面一直是加载态）。
+    Future<void> settleIo(WidgetTester tester, {int rounds = 10}) async {
+      for (int i = 0; i < rounds; i++) {
+        await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 15)));
+        await tester.pump();
+      }
+    }
+
+    testWidgets('「+」菜单里的展开把文本域原位变高，Esc 收起',
+        (WidgetTester tester) async {
+      await pumpInput(tester);
+      final double collapsed =
+          tester.getSize(find.byType(TextField)).height.toDouble();
+
+      await tester.tap(find.byIcon(Icons.add));
+      await tester.pumpAndSettle();
+      expect(find.text('展开输入框（长文本）'), findsOneWidget);
+      await tester.tap(find.text('展开输入框（长文本）'));
+      await tester.pumpAndSettle();
+
+      final double expanded =
+          tester.getSize(find.byType(TextField)).height.toDouble();
+      expect(expanded, greaterThan(collapsed), reason: '原位展开要真的变高');
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).focusNode?.hasFocus,
+        isTrue,
+        reason: '展开就是为了接着写，焦点不能被菜单抢走',
+      );
+
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.pumpAndSettle();
+      expect(tester.getSize(find.byType(TextField)).height, collapsed,
+          reason: 'Esc 要把展开态收回去');
+
+      // 菜单入口随状态翻转：收起后再打开应显示「展开输入框」
+      await tester.tap(find.byIcon(Icons.add));
+      await tester.pumpAndSettle();
+      expect(find.text('展开输入框（长文本）'), findsOneWidget);
+      await tester.tap(find.text('展开输入框（长文本）'));
+      await tester.pumpAndSettle();
+      expect(tester.getSize(find.byType(TextField)).height, expanded);
+    });
+
+    testWidgets('图片附件给缩略图，非图片给文件卡（含异步读到的大小）',
+        (WidgetTester tester) async {
+      // 造真实文件必须用**同步** IO：testWidgets 的测试体跑在假时钟里，
+      // `await File(...)` 永远不返回（整个用例卡死），除非包进 runAsync。
+      final Directory dir = Directory.systemTemp.createTempSync('tree_input_test');
+      addTearDown(() => cleanTempDir(dir));
+      final File image =
+          File('${dir.path}${Platform.pathSeparator}pixel.png');
+      image.writeAsBytesSync(kTinyPng, flush: true);
+      final File doc = File('${dir.path}${Platform.pathSeparator}note.txt');
+      doc.writeAsStringSync('随便写点什么');
+
+      mockClipboard(files: <String>[image.path, doc.path]);
+      await pumpInput(tester);
+      await pressCtrlV(tester);
+      await settleIo(tester);
+
+      expect(find.byType(AttachmentTile), findsNWidgets(2));
+      final Image thumb = tester.widget<Image>(find.descendant(
+        of: find.byType(AttachmentTile).first,
+        matching: find.byType(Image),
+      ));
+      // 缩略图带 cacheWidth，Image 会把 provider 包成 ResizeImage：断言要拆一层
+      final ImageProvider provider = thumb.image;
+      final FileImage file = provider is ResizeImage
+          ? provider.imageProvider as FileImage
+          : provider as FileImage;
+      expect(file.file.path, image.path,
+          reason: '图片附件要走缩略图，不是一张通用文件卡');
+      expect(find.text('note.txt'), findsOneWidget);
+      expect(find.text('读取中…'), findsNothing,
+          reason: '大小读到了就该显示出来，不能一直占位');
+    });
+
+    testWidgets('点附件打开本机文件预览对话框', (WidgetTester tester) async {
+      final Directory dir = Directory.systemTemp.createTempSync('tree_input_test');
+      addTearDown(() => cleanTempDir(dir));
+      final File doc = File('${dir.path}${Platform.pathSeparator}note.txt');
+      doc.writeAsStringSync('预览里的内容');
+
+      mockClipboard(files: <String>[doc.path]);
+      await pumpInput(tester);
+      await pressCtrlV(tester);
+      await settleIo(tester);
+
+      await tester.tap(find.byType(AttachmentTile));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 350));
+      expect(find.byType(AttachmentPreviewDialog), findsOneWidget);
+      await settleIo(tester);
+      expect(find.text('预览里的内容'), findsOneWidget);
+
+      await tester.tap(find.text('关闭'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 350));
+      expect(find.byType(AttachmentPreviewDialog), findsNothing);
+    });
+
+    testWidgets('移除键把附件从当前草稿里删掉，切走再切回来不复活',
+        (WidgetTester tester) async {
+      mockClipboard(files: <String>[r'C:\tmp\x.bin']);
+      await pumpInput(tester, cacheKey: 'teamA::s1');
+      await pressCtrlV(tester);
+      expect(find.byType(AttachmentTile), findsOneWidget);
+
+      await tester.tap(find.descendant(
+        of: find.byType(AttachmentTile),
+        matching: find.byIcon(Icons.close),
+      ));
+      await tester.pumpAndSettle();
+      expect(find.byType(AttachmentTile), findsNothing);
+
+      await pumpInput(tester, cacheKey: 'teamA::s2');
+      await pumpInput(tester, cacheKey: 'teamA::s1');
+      expect(find.byType(AttachmentTile), findsNothing);
     });
   });
 }
