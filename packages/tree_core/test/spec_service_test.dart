@@ -5,6 +5,10 @@ import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
 import 'package:tree_local_exec/tree_local_exec.dart';
 
+/// 内置模板 front matter 里的 `version:` 行——测试要改版本号时**现取**，别硬编码数字
+/// （硬编码会在模板 bump version 时误伤测试，而不是真的发现回归）。
+final RegExp _versionLine = RegExp(r'^version: \d+$', multiLine: true);
+
 /// Spec 体系（M9 Q9）：内置模板、索引前置（注入系统提示词）、select 直取全文、沉淀与维护。
 void main() {
   late Directory temp;
@@ -139,8 +143,9 @@ void main() {
     final File builtin = File(
       p.join(temp.path, '.self', 'spec', 'general-task.md'),
     );
+    // 版本号从模板现取后改小：硬编码 'version: N' 会在模板 bump 时误伤这个测试
     final String oldText = kBuiltinSpecTexts['general-task']!
-        .replaceFirst('version: 6', 'version: 2')
+        .replaceFirst(_versionLine, 'version: 2')
         .replaceFirst('## 判型确认', '## 我手改的一行\n\n## 判型确认');
     builtin.writeAsStringSync(oldText);
 
@@ -167,7 +172,7 @@ void main() {
       p.join(temp.path, '.self', 'spec', 'team-meeting.md'),
     );
     final String newerText = kBuiltinSpecTexts['team-meeting']!
-        .replaceFirst('version: 4', 'version: 99');
+        .replaceFirst(_versionLine, 'version: 99');
     newer.writeAsStringSync(newerText);
     final List<String> logs = <String>[];
     final SpecService logged = SpecService(store: store, log: logs.add);

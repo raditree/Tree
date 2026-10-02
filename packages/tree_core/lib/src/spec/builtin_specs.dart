@@ -39,7 +39,8 @@ const String kSpecAlignFirstSection = r'''
    让用户有机会否决；**禁止把默认值藏进实现里**（等做完才发现方向不对）。
 4. **对齐结果留痕**：结论写进 plan 的「待确认项」与 todo（改了什么语义、谁确认的、什么时候）；
    用户中途改语义 → 先更新 plan 与 todo 再继续，不静默合并、不"顺手带上"。
-5. **对齐 ≠ 拖时间**：待确认项同一轮列全、一次问完；能自己查到的（代码/文档/配置/历史）先查再问。
+5. **对齐 ≠ 拖时间**：待确认项同一轮列全、一次问完；能自己查到的**先查文档再查代码**
+   （`README.md` / `docs/` / 模块 README / 领域指南），带着文档结论去问，而不是把查得到的事拿去问用户。
    用户说"你看着办"时，仍要把你的理解复述一遍、给出默认取舍，然后才动手。
 ''';
 
@@ -91,10 +92,11 @@ pinned: true
 builtin: true
 created_at: 0
 updated_at: 2026-10-02
-version: 6
+version: 7
 classification: 内部规范
 risk: medium
 changelog:
+  - "v7(2026-10-02): 侦察阶段新增「文档侦察」并置于第一步——先读 README/docs 索引/模块 README 的不变量/development/known-issues/领域指南，再进代码核对；文档与代码冲突以代码为准，但偏差必须写进 recon.md；共享第 0 步同步改为「先查文档再查代码」"
   - "v6(2026-10-02): 新增共享「第 0 步：先对齐用户语义」（动手前复述目标/范围/验收并取得用户确认；歧义先问不猜；只能自定的取舍要显式写默认值；对齐结果留痕）——由 kSpecAlignFirstSection 统一注入，正文不重复"
   - "v5(2026-09-26): 工具瘦身：spec 只保留 select/create/update（索引改为系统提示词注入、select 直接返回全文），同步修正正文里的 spec 工具引用。"
   - "v4(2026-09-10): complex 改为单人串行、无分工；team/分工/成员验收全部移除，需要分工即升级 hard；新增 .self/plan/xxx.md 强制计划与用户审核；新增侦察（Recon）阶段并写入 .self/recon.md 作为 plan 上下文输入；把测试、回归、关键路径核对纳入工作流闭环"
@@ -137,13 +139,20 @@ changelog:
    - 明确命中 → `spec select`（**直接返回全文**并挂 hook），并遵循其工作流执行。
    - 未命中 → 走下方通用流程，完成后 `spec create` 沉淀新 Spec。
 
-3. **侦察（Recon）**：动手规划前先系统侦察，禁止凭想象拆解。
+3. **侦察（Recon）**：动手规划前先系统侦察，禁止凭想象拆解。**顺序固定：先文档，再代码。**
+   - **文档侦察（第一步）**：先读文档再碰代码——`README.md` 与 `docs/README.md`（文档索引：哪份文档管什么）→
+     `docs/architecture.md`（进程模型 / 模块职责 / **跨模块不变量**）→ 本次涉及的模块 README
+     （`packages/*/README.md`、`packages/tree_core/lib/src/<模块>/README.md` 的「不变量（assertions）」节）→
+     `docs/development.md`（构建 / 测试 / 打包命令）→ `docs/known-issues.md`（已踩过的坑）→
+     领域指南（如 `docs/plugin-development.md`）与相关历史 Spec。
+   - **进代码核对**：按文档给出的路径与符号名去读代码，别用半小时 `grep` 换回文档里写着的一句结论。
+     **文档与代码冲突以代码为准**，但偏差必须写进 `recon.md`（那是顺手要修的文档问题），不许把文档当权威照抄。
    - **边界侦察**：`grep` 相关入口文件、模块、接口、上下游调用链及侦察范围。
    - **代码侦察**：`read` 数据模型、配置、测试、现有模式与约定；梳理数据流与调用链。
    - **环境侦察**：`terminal` 确认构建命令、测试命令、依赖版本、运行环境（是否有虚拟环境）、git 工作区与当前分支状态。
    - **历史侦察**：用系统提示词里的 Spec 索引找历史 Spec，用 `spec select` 取全文查决策记录；查近期相关提交、历史遗留问题与已知坑。
    - **约束侦察**：明确不可改范围、外部依赖、兼容性要求、对外接口/存储格式约束。
-   - **产出**：侦察笔记写入 `.self/plan/{YYYYMMDD}-{task_slug}/recon.md`，至少含——现状、涉及面（文件/模块/接口清单）、依赖与约束、未知项、初始风险、待确认问题；构建命令、测试命令、依赖版本、运行环境、git 工作区与当前分支状态写入 .self/memory.md。
+   - **产出**：侦察笔记写入 `.self/plan/{YYYYMMDD}-{task_slug}/recon.md`，至少含——现状、涉及面（文件/模块/接口清单）、**文档侦察结论（读了哪几份文档、文档给出的关键结论、与代码的偏差）**、依赖与约束、未知项、初始风险、待确认问题；构建命令、测试命令、依赖版本、运行环境、git 工作区与当前分支状态写入 .self/memory.md。
    - 侦察发现判型有变（如需分工/架构级影响）→ 立即按边界与异常处理升级 hard。
 
 4. **生成 plan 文件（强制，除非用户明确特殊要求跳过审核）**：
@@ -194,7 +203,7 @@ changelog:
 ## 该类任务规范
 
 - **单人串行，不分工**：general-task 不调用 team/message 派活，不设成员，不做团队验收；发现需要分工协作、多角色并行、需要会议决策 → 立即升级 hard-task。
-- **先侦察再规划**：开工必须先完成 Recon 并写入 `.self/plan/{YYYYMMDD}-{task_slug}/recon.md`，禁止无侦察直接拆 todo 或写 plan。
+- **先文档后代码，先侦察再规划**：开工先按「文档侦察 → 代码/环境/历史/约束侦察」的顺序完成 Recon 并写入 `.self/plan/{YYYYMMDD}-{task_slug}/recon.md`；禁止无侦察直接拆 todo 或写 plan，也禁止跳过文档一上来就 `grep` 代码。
 - **plan 必产出且先审后做**：用户无特殊要求时，必须先生成 `.self/plan/{YYYYMMDD}-{task_slug}/plan.md` 并经用户审核；未批准不得 edit/write 业务文件。
 - **todo 必建且全程跟踪**：开工即 `set_todo_list set`；过程中每完成/阻塞一项立即 update。
 - **先查 Spec 索引再执行**：开工前先对照系统提示词里的 Spec 索引，命中就 `spec select` 取全文，不盲目直接动手。
@@ -245,7 +254,7 @@ changelog:
 ## 注意事项
 
 - general-task **无团队分工**；分工与 team 是 hard 专属能力。
-- **侦察先于规划**：先 todo ，再`.self/plan/{YYYYMMDD}-{task_slug}/recon.md`，再 plan；三者缺一不可。
+- **侦察先于规划**：先 todo ，再`.self/plan/{YYYYMMDD}-{task_slug}/recon.md`，再 plan；三者缺一不可，且侦察**从文档开始**（README / docs / 模块 README → 代码）。
 - plan 未审核通过前不得正式实施修改；用户特殊要求跳过的，必须记录原因。
 - todo 状态以 `.self/todos.md` 为准，计划以 `.self/plan/{YYYYMMDD}-{task_slug}/plan.md` 为准，勿在对话中口头跟踪。
 - 汇报先结论后细节；遗留项必须给出原因，不允许无声消失。''',
@@ -267,10 +276,11 @@ pinned: true
 builtin: true
 created_at: 0
 updated_at: 2026-10-02
-version: 6
+version: 7
 classification: 内部规范
 risk: high
 changelog:
+  - "v7(2026-10-02): 阶段 1 侦察新增「文档侦察」并置于第一步（README/docs 索引/模块 README 的不变量/development/known-issues/领域指南 → 再进代码核对）；recon.md 产出必须含文档侦察结论与文档-代码偏差；共享第 0 步同步改为「先查文档再查代码」"
   - "v6(2026-10-02): 新增共享「第 0 步：先对齐用户语义」（动手前复述目标/范围/验收并取得用户确认；歧义先问不猜；只能自定的取舍要显式写默认值）——由 kSpecAlignFirstSection 统一注入；会议前必须先对齐议题与边界"
   - "v5(2026-09-26): 工具瘦身：spec 只保留 select/create/update（索引改为系统提示词注入、select 直接返回全文），同步修正正文里的 spec 工具引用"
   - "v4(2026-09-10): 新增侦察（Recon）阶段并写入 agentspace/.hard/{task_id}/recon.md；新增 hard 专属工作空间（goal.md/meeting/spec.md/task.md/checklist.md）；会议前必须明确上下文并确立议程；明确 top agent 不直接处理业务文件；成员派活给长时预算并允许其带子团队走企业流程；工作流阶段化、准入准出、闭环测试"
@@ -317,7 +327,13 @@ changelog:
 **top agent 亲自执行**，动手开会前必须完成系统侦察，禁止凭想象立目标、定议程。
 
 1. 创建 `agentspace/.hard/{task_id}/`（`task_id` 建议为 `YYYYMMDD-{task_slug}`）。
-2. 侦察维度（至少覆盖）：
+2. 侦察维度（至少覆盖；**顺序固定：先文档，再代码**）：
+   - **文档侦察（第一步）**：先读文档再碰代码——`README.md` 与 `docs/README.md`（文档索引）→
+     `docs/architecture.md`（进程模型 / 模块职责 / **跨模块不变量** / 提示词资产索引）→ 涉及模块的 README
+     （「不变量（assertions）」节）→ `docs/development.md`（构建 / 测试 / 打包命令）→ `docs/known-issues.md`（已踩过的坑）
+     → 领域指南（如 `docs/plugin-development.md`）与历史 Spec。
+   - **进代码核对**：按文档给出的路径与符号名读代码；**文档与代码冲突以代码为准**，偏差写进 `recon.md`
+     （顺手修正文档或列入待办），不许把文档当权威照抄。
    - **边界侦察**：`grep` 相关入口文件、模块、接口、上下游调用链及侦察范围。
    - **代码侦察**：`read` 数据模型、配置、测试，梳理分层、调用链、数据流、现有模式与约定、技术债。
    - **环境侦察**：`terminal` 确认构建/测试/部署命令、依赖与版本、运行环境（是否有虚拟环境）、git 工作区与分支状态、CI/发布约束。
@@ -326,6 +342,7 @@ changelog:
    - **领域侦察**（判据 2 命中时必做）：对无经验技术域做调研，收集候选方案、参考实现、行业实践与坑。
 3. **产出**：侦察笔记写入 `agentspace/.hard/{task_id}/recon.md`，至少含：
    - 现状与架构概览；
+   - **文档侦察结论**（读了哪几份文档 / 指南 / 历史 Spec、文档给出的关键结论、与代码的偏差）；
    - 涉及面（文件/模块/接口/数据/依赖清单）；
    - 约束与不可动范围；
    - 候选方向与初步对比（如适用）；
@@ -418,7 +435,7 @@ changelog:
 ## 该类任务规范
 
 - **必须过会议讨论阶段**：hard 任务禁止直接动手实现，先开会定方案。
-- **先侦察再开会**：top agent 必须先完成 Recon 并写 `recon.md`，再初始化工作空间、写议程、召集会议。
+- **先文档后代码，先侦察再开会**：top agent 先按「文档侦察（README/docs/模块 README/指南）→ 代码/环境/历史/约束/领域侦察」完成 Recon 并写 `recon.md`，再初始化工作空间、写议程、召集会议；禁止跳过文档直接开读代码、定议程。
 - **工作空间必建**：`agentspace/.hard/{task_id}/` 至少含 `recon.md`、`goal.md`、`meeting/xx.md`、`spec.md`、`task.md`、`checklist.md`。
 - **会议前必须有上下文与议程**：top agent 先写 `meeting/01-kickoff.md` 的会前上下文与议程，再召集会议。
 - **top agent 不抢业务文件**：top agent 默认只写管理文档与协调验收；亲自处理业务文件必须记录原因并补验。
@@ -515,10 +532,11 @@ pinned: true
 builtin: true
 created_at: 0
 updated_at: 2026-10-02
-version: 4
+version: 5
 classification: 内部规范
 risk: review
 changelog:
+  - "v5(2026-10-02): 共享第 0 步改为「先查文档再查代码」（待确认项先查 README/docs/模块 README/领域指南，带着结论去问）"
   - "v4(2026-10-02): 新增共享「第 0 步：先对齐用户语义」（开会前先把议题/范围/决策边界与用户对齐；歧义先问不猜）——由 kSpecAlignFirstSection 统一注入"
   - "v3(2026-09-10): team 工具拆分后修正工具引用：召集/执行指令改用 message send_message、广播用 message broadcast，删除已不存在的 assign_task"
   - "v2(2026-08-30): 修正工具名引用（read）；新增适用场景判型、会议召集消息模板、成员发言模板、方案比较矩阵模板、会议纪要模板、无共识收敛机制"
@@ -652,10 +670,11 @@ pinned: true
 builtin: true
 created_at: 0
 updated_at: 2026-10-02
-version: 2
+version: 3
 classification: 内部规范
 risk: medium
 changelog:
+  - "v3(2026-10-02): 共享第 0 步改为「先查文档再查代码」；明确读指南（.self/docs/plugin-development.md）先于读核心源码"
   - "v2(2026-10-02): 新增共享「第 0 步：先对齐用户语义」（动手前复述目标/范围/验收并取得用户确认；歧义先问不猜；默认值显式）——由 kSpecAlignFirstSection 统一注入"
   - "v1(2026-10-01): 初版：插件开发（新建/改造）专用规范——单一口径（指南+代码）+ 本机/远端分工 + 流程与验收红线"
 ---
