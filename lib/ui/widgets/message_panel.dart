@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:tree_protocol/tree_protocol.dart';
 
 import '../models/agent.dart';
@@ -24,6 +25,7 @@ import 'message_list.dart';
 import 'plugin_ui_slots.dart';
 import 'mode_switch.dart';
 import 'session_picker.dart';
+import 'terminal_panel.dart';
 import 'spec_panel.dart';
 import 'ssh_config_dialog.dart';
 import 'teammates_window_page.dart';
@@ -87,6 +89,12 @@ class _MessagePanelState extends State<MessagePanel> {
 
   /// WebSocket 服务
   final WebSocketService _webSocket = WebSocketService();
+
+  /// 是否处于终端模式（Ctrl+J）：输入框那块整体换成集成终端
+  bool _terminalMode = false;
+
+  /// 终端高度（像素；Ctrl+J 打开时按面板高的 40% 起步，可拖）
+  double _terminalHeight = 260;
 
   /// 插件动作帧发送通道（Q12）：plugin_ui_action 经本面板的 WS 连接回核心。
   ///
@@ -298,6 +306,9 @@ class _MessagePanelState extends State<MessagePanel> {
     if (oldWidget.selectedAgent?.id != widget.selectedAgent?.id) {
       // 详情是「某个 agent 的某条消息」：换 agent 就作废，右栏不留上一个的残留
       DetailSelection.instance.clear();
+      // 终端绑在「当前 agent 的工作区」上：换 agent 就退出终端模式（面板 dispose
+      // 时会发 terminal_close，核心收掉那个 shell）
+      _terminalMode = false;
       setState(() {
         _messages.clear();
         _sessions = <ChatSession>[];
@@ -1168,10 +1179,20 @@ class _MessagePanelState extends State<MessagePanel> {
       if (mounted) DetailSelection.instance.refresh(_messages);
     });
     final Agent? agent = widget.selectedAgent;
-    return Container(
-      color: Theme.of(context).scaffoldBackgroundColor,
-      child: Column(
-        children: <Widget>[
+    // Ctrl+J：输入框那块整体换成集成终端（再按一次回来）。
+    // 用 CallbackShortcuts + autofocus 的 Focus：焦点在输入框里时按键会冒泡到这里；
+    // 终端自己拿着焦点时由 TerminalPanel 自己处理（它要拦截几乎所有按键）。
+    return CallbackShortcuts(
+      bindings: <ShortcutActivator, VoidCallback>{
+        const SingleActivator(LogicalKeyboardKey.keyJ, control: true):
+            _toggleTerminal,
+      },
+      child: Focus(
+        autofocus: true,
+        child: Container(
+          color: Theme.of(context).scaffoldBackgroundColor,
+          child: Column(
+            children: <Widget>[
           _buildTitleBar(agent),
           if (agent != null) _buildContextBar(),
           if (agent == null)
@@ -1215,14 +1236,68 @@ class _MessagePanelState extends State<MessagePanel> {
                 },
               ),
             ),
-          if (agent != null)
+          if (agent != null && _terminalMode) ...<Widget>[
+            _buildTerminalDivider(),
+            SizedBox(
+              height: _terminalHeight,
+              child: TerminalPanel(
+                agentId: agent.id,
+                webSocket: _webSocket,
+                onToggle: _toggleTerminal,
+                onClose: _toggleTerminal,
+              ),
+            ),
+          ] else if (agent != null)
             MessageInput(
               // 草稿按 team + session 隔离（M9 Q6）：切 agent/会话各自恢复
-              // 自己没发完的文本与附件，互不串味
+              // 自己没发完的文本与附件，互不串味（终端模式期间它被移出树，
+              // 草稿靠缓存活着，切回来原样还在）
               cacheKey: '${agent.id}::$_currentSessionId',
               onSend: _handleSend,
             ),
-        ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Ctrl+J：在「对话输入框」与「集成终端」之间切换。
+  ///
+  /// **主动展开**的含义：打开时按面板高的 40%（夹 160–420）给一个起步高度，
+  /// 并把焦点交给终端——用户按完 Ctrl+J 就能直接打字，不用再点一下。
+  void _toggleTerminal() {
+    if (widget.selectedAgent == null) return; // 没选 agent 就没有「对应工作区」
+    setState(() {
+      _terminalMode = !_terminalMode;
+      if (_terminalMode) {
+        _terminalHeight = (MediaQuery.sizeOf(context).height * 0.4)
+            .clamp(160.0, 420.0);
+      }
+    });
+  }
+
+  /// 终端与消息区之间的拖拽分隔条
+  Widget _buildTerminalDivider() {
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeRow,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onVerticalDragUpdate: (DragUpdateDetails d) {
+          setState(() {
+            _terminalHeight =
+                (_terminalHeight - d.delta.dy).clamp(140.0, 640.0);
+          });
+        },
+        child: SizedBox(
+          height: 7,
+          child: Center(
+            child: Container(
+              height: 1,
+              color: Theme.of(context).dividerColor,
+            ),
+          ),
+        ),
       ),
     );
   }

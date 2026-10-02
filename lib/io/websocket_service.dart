@@ -89,6 +89,17 @@ class WebSocketService {
   /// 连接状态变化回调
   void Function(bool connected)? onConnectionChange;
 
+  /// 终端帧（terminal_ready / output / exit / error）的**广播流**。
+  ///
+  /// 为什么不复用 [onMessage]：终端输出是高频字节流（一块几十到几千字节），混进
+  /// 消息分发会让消息面板为每条帧先跑一遍终端判断；而且终端天生是多实例的
+  /// （将来可能有多个终端窗格），单一回调字段不够用。终端帧**不进** [onMessage]。
+  final StreamController<Map<String, dynamic>> _terminalFrames =
+      StreamController<Map<String, dynamic>>.broadcast();
+
+  /// 订阅终端帧（面板用；广播流，可多点订阅）
+  Stream<Map<String, dynamic>> get terminalFrames => _terminalFrames.stream;
+
   /// 在途分片序列（接收侧重组缓冲）：transfer_id -> 缓冲。
   ///
   /// 断连时会被清空（见 [disconnect] / [_markDisconnected] 路径）：跨连接的
@@ -297,6 +308,11 @@ class WebSocketService {
       // 过滤心跳响应
       final String? type = json['type'] as String?;
       if (type == 'heartbeat' || type == 'pong') {
+        return;
+      }
+      // 终端帧走自己的广播流（见 terminalFrames）：不混进消息分发
+      if (type != null && TerminalOutboundType.all.contains(type)) {
+        if (!_terminalFrames.isClosed) _terminalFrames.add(json);
         return;
       }
       // 未知会话消息（Task 7 接收方会话保障）：msg_chunk / msg_end 携带

@@ -58,6 +58,13 @@
   `team_repair.dart`）：上级被删的成员重挂到 TOP 且整棵子树的 `team_id`/`level` 一起平移；团队也没了就把最上层孤儿
   升为独立顶层 agent；`team_id` 悬空但父链完好按父链修正。每个被改的 `agents/<id>.yaml` 先备份 `.bak.<n>`（n 递增、
   绝不覆盖），幂等。
+- **Ctrl+J 打开集成终端（真 PTY）**（[lib/README.md](lib/README.md) 不变量 14、[terminal/README.md](packages/tree_core/lib/src/terminal/README.md)）：
+  输入框那块整体换成终端面板并**主动展开**（面板高 40%，可拖），再按一次回到输入框；终端**没有输入行**——按键逐键译成
+  终端字节（回车 / 退格 / 方向键 / Ctrl+字母 / UTF-8 可打印字符），Ctrl+J 留给切换。核心开**真伪终端**
+  （Windows ConPTY / POSIX `script`），输出按 **base64 原始字节**走已有的那条 WS（`terminal_open/input/resize/close` 上行，
+  `terminal_ready/output/exit/error` 下行），前端用自制 VT 解析器还原成屏幕（光标定位 / SGR / 备用屏 / 宽字符）。
+  **只支持本机 agent**：agent 配了 SSH 一律回可读错误（那条通道没有伪终端）；连接断开、换 agent、关面板都会收掉 shell，
+  不留孤儿进程。协议完备性门禁要求核心逐一显式处理四种上行帧。
 - **源码模式按语言着色，且只能编辑纯文本**（[lib/README.md](lib/README.md) 不变量 12）：**不引第三方高亮包**，
   一张规则表 + 单遍扫描（关键字 / 类型 / 字符串 / 注释 / 数字 / 注解 / 函数名）；只在 ≤ 128 KB 时着色（超过退回单色，
   保证输入不卡），记号按「文本 + 配色」缓存；是否文本**看字节**（前 4 KB 有 NUL 就当二进制）。只读闸门：图片 / PDF / Office、

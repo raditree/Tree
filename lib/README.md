@@ -16,7 +16,7 @@
 | [ui/pages/main_page.dart](ui/pages/main_page.dart) | 三栏骨架、agent 列表（顶层 agent + 团队成员）、会话切换、插件槽位作用域 |
 | [ui/widgets/message_panel.dart](ui/widgets/message_panel.dart) | 中栏消息流：分段渲染、工具/思考**一行式**（完整内容见右栏「详情」页）、提问卡片、断线重播去重、按 agent+会话过滤 |
 | [ui/widgets/teammates_window_page.dart](ui/widgets/teammates_window_page.dart) | 团队成员拓扑与成员工作进度窗口 |
-| [ui/widgets/](ui/widgets/) | 文件面板 / 查看器（源码高亮 + 编辑保存 + 分屏，见 [split_panes.dart](ui/widgets/split_panes.dart)）/ 消息输入框（[message_input.dart](ui/widgets/message_input.dart) + [attachment_preview.dart](ui/widgets/attachment_preview.dart)）/ 右栏详情（[detail_panel.dart](ui/widgets/detail_panel.dart)）、PDF 预览、Spec、待办、提问、插件、MCP、模型信息、Git 历史、设置页 |
+| [ui/widgets/](ui/widgets/) | 文件面板 / 查看器（源码高亮 + 编辑保存 + 分屏，见 [split_panes.dart](ui/widgets/split_panes.dart)）/ **集成终端（[terminal_panel.dart](ui/widgets/terminal_panel.dart)，Ctrl+J）**/ 消息输入框（[message_input.dart](ui/widgets/message_input.dart) + [attachment_preview.dart](ui/widgets/attachment_preview.dart)）/ 右栏详情（[detail_panel.dart](ui/widgets/detail_panel.dart)）、PDF 预览、Spec、待办、提问、插件、MCP、模型信息、Git 历史、设置页 |
 | [ui/services/](ui/services/) | 重播守卫、下载中心、会话重命名、插件 UI 槽位注册、主题、**代码高亮（[code_highlight.dart](ui/services/code_highlight.dart)）**、**编辑器偏好（[editor_settings.dart](ui/services/editor_settings.dart)）**、详情选中（[detail_selection.dart](ui/services/detail_selection.dart)） |
 
 ## 不变量（assertions）
@@ -88,6 +88,16 @@
     **同一个文件**在两个窗格里打开时，非活动窗格强制只读——两份缓冲各写各的，后保存的那次会把对方写的覆盖掉。
     换文件 / 关窗格前先 `confirmLeave()`：开着失焦保存就静默写回，关着就问「保存 / 不保存 / 取消」。
 
+14. **Ctrl+J 把输入框那块换成集成终端（真 PTY）**（[ui/widgets/terminal_panel.dart](ui/widgets/terminal_panel.dart)、
+    [ui/services/vt_screen.dart](ui/services/vt_screen.dart)、[io/websocket_service.dart](io/websocket_service.dart) 的 `terminalFrames`）：
+    打开时**主动展开**（按面板高 40%，夹 160–420）并把焦点交给终端，再按一次回到输入框（草稿靠草稿缓存原样回来）；
+    终端**没有输入行**——所有按键经 `Focus.onKeyEvent` 译成终端字节（回车 `\r`、退格 `0x7f`、方向键 `ESC[A..D`、
+    Ctrl+字母 `0x01..0x1A`、可打印字符走 `event.character` 的 UTF-8），Ctrl+J 例外（留给切换）。
+    核心开**真伪终端**（Windows ConPTY / POSIX `script`），输出是**原始字节**（base64 过 WS），前端用自制的 VT 解析器
+    还原成屏幕（光标定位 / SGR / 备用屏都在内），再 `CustomPaint` 画格子。**只支持本机 agent**：配了 SSH 的 agent
+    一律回可读错误（那条通道没有伪终端），不假装成功；关面板 / 换 agent / 断连都会把 shell 收掉。
+    终端的边界（VT 解析器没实现的部分、没跑真机端到端）见 [docs/known-issues.md §11](../docs/known-issues.md)。
+
 ## 测试
 
 ```bash
@@ -108,4 +118,8 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 大文件退回单色 + 输入法组字交回平台）、`test/file_editor_test.dart`（真起假核心 HttpServer：改一下就进未保存态、Ctrl+S 发出
 完整内容与 `if_size`、保存失败给可见原因、409 冲突 → 覆盖保存带 force=1、截断/二进制/图片/分屏副本四种只读闸门、
 失焦保存的开与关、返回时静默写回或问一次）、`test/split_panes_test.dart`（二分几何、拖动比例、夹取、太窄降级、
-文件面板的分屏接线源钉）。
+文件面板的分屏接线源钉）、`test/vt_screen_test.dart`（VT 解析器：换行 / `\r` 覆盖、SGR、CUP/ED/EL、备用屏进出、
+跨块 UTF-8、宽字符两格、未知序列安全跳过、resize、DSR/DA 应答、随机含 ESC 字节流不抛）、
+`test/terminal_panel_test.dart`（终端面板：打开就发 `terminal_open` 与尺寸并抢焦点、ready 显示 shell/cwd、
+输出进缓冲、键盘译码（回车 / 方向键 / Ctrl+C）、Ctrl+J 交给外层、error 与 exit 的显示、别的会话 id 的帧被丢、
+dispose 发 `terminal_close`、布局变化发 `terminal_resize`）。
