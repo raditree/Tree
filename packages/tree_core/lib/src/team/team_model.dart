@@ -9,7 +9,10 @@ abstract final class MemberRelation {
 }
 
 /// 成员活动日志路径（工作空间相对路径；leader 用 read/grep 查看产出）。
-String memberLogPath(String memberId) => '.self/activity.log';
+///
+/// **按 agent 分栏**（`.tree/<agent_id>/.self/`）：团队成员与 leader 共享工作目录，
+/// 每个 agent 的私有状态各自一栏，日志不会被别人覆盖或混在一起。
+String memberLogPath(String memberId) => '.tree/$memberId/.self/activity.log';
 
 /// 对外成员视图。
 ///

@@ -1,5 +1,7 @@
 import '../settings/ssh_config.dart';
+import 'private_workspace_io.dart';
 import '../store/records.dart';
+import '../team/team_workspace.dart';
 
 /// Spec 索引提供者（M9 Q9）：返回**当前**索引文本（空串 = 不注入）；默认 null。
 ///
@@ -12,6 +14,15 @@ import '../store/records.dart';
 /// 每轮拼提示词都会重新调它（这里不做缓存），因此 `spec create` / `spec update`
 /// 之后下一轮的索引就是新的。
 String Function(CoreAgent agent)? specIndexProvider;
+
+/// 团队工作目录提供者（[TeamWorkspace]：成员与团队 TOP 共享同一个工作目录）。
+///
+/// 接线理由与 [specIndexProvider] 完全相同（提示词在会话生成与压缩估算两处拼装，
+/// 必须逐字一致），另外本文件是**纯函数**："一路向上找到 TOP" 需要查 store，这里拿不到。
+/// 返回 null = 不接管（旧口径：用 agent 自己的 `workspace_dir`）。
+/// **TOP 自身接不接线结果一致**（owner 就是它自己），因此接线不会改动既有 agent 的
+/// 系统提示词字节（前缀缓存不受影响，见 known-issues #8）。
+TeamWorkspace? Function(CoreAgent agent)? teamWorkspaceProvider;
 
 /// 已选 Spec 全文提供者（Q9 ⑧ 章）：按 **agent + session** 现取本会话挂 hook 的
 /// 规范全文；空串 = 不注入（没挂 / 快照还没热）。
@@ -41,7 +52,10 @@ String Function(CoreAgent agent)? systemPromptFileProvider;
 /// - **与压缩估算共用同一个函数**：[CompactionService.estimateContextTokens] 必须看到
 ///   与引擎完全一致的字符串，否则加了这段之后阈值会失真。
 String workspacePromptSuffix(CoreAgent agent) {
-  final SshConfig? ssh = agent.sshConfig;
+  // 团队口径（成员跟随 TOP，见 [TeamWorkspace]）：SSH 与工作目录都要取"团队那一份"，
+  // 否则成员会被告知本机目录，而它的工具其实跑在 leader 的远端主机上。
+  final TeamWorkspace? shared = teamWorkspaceProvider?.call(agent);
+  final SshConfig? ssh = agent.sshConfig ?? shared?.owner.sshConfig;
   final String location;
   if (ssh != null) {
     final String root = ssh.root.trim();
@@ -49,15 +63,19 @@ String workspacePromptSuffix(CoreAgent agent) {
         ? '远端登录用户 `${ssh.username}` 的 `HOME`（核心连接后解析成绝对路径）'
         : '远端 `$root`（`~` 与相对路径按远端 `HOME` 展开）';
   } else {
-    final String dir = agent.workspaceDir.trim();
+    // 成员共享 TOP 的工作目录（provider 已接线时）：提示词必须说**真正在用的**那一份，
+    // 否则模型会按 `workspaces/<member_id>` 拼路径，而工具根其实在 leader 的目录下。
+    final String dir = (shared?.configuredDir ?? agent.workspaceDir).trim();
+    final String ownerId = shared?.owner.id ?? agent.id;
     location = dir.isEmpty
-        ? '本机默认工作目录 `workspaces/${agent.id}`（Tree 数据根目录之下）'
+        ? '本机默认工作目录 `workspaces/$ownerId`（Tree 数据根目录之下）'
         : '本机目录 `$dir`';
   }
   return '''
 ## 工作空间（软约束）
 
 - 你的工作空间根：$location。所有文件工具（read/write/edit/grep/terminal 等）的参数都是**相对这个根**的路径。
+- **你的私有状态目录**：`${privateSelfDir(agent.id)}`。文件工具里写 `.self/xxx`（规范与工具提示里的写法）会自动落到这里，两种写法都可用；**terminal 命令不经过这层翻译**，要在终端里访问私有状态请直接用这条真实路径。
 - 根之下通常是**混合布局**：数据文件与项目文件可能分处不同子目录（例如 `data/` 与 `proj/`），也可能混着缓存与临时文件。请按用户当前的指示在正确的子目录里操作，不要假定目标文件一定在根目录下。
 - 不要自行收窄工作范围：用户没有明确限制时，你可以在根下任意位置读写；只有用户明确说"只动某个目录"时才限制。反过来，也不要把根当成只读展示区。
 - 布局不确定时先用 list/grep 看一眼，不要凭猜测拼路径。''';

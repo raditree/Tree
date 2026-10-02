@@ -28,12 +28,12 @@ import '../settings/core_settings.dart';
 import '../settings/ssh_config.dart';
 import '../spec/builtin_spec_assets.dart';
 import '../spec/spec_service.dart';
-import '../store/atomic_file.dart';
 import '../store/memory_store.dart';
 import '../store/tree_store.dart';
 import '../team/message_dispatcher.dart';
 import '../team/team_model.dart';
 import '../team/team_service.dart';
+import '../team/team_workspace.dart';
 import '../tool/terminal_hooks.dart';
 import '../tool/todo_store.dart';
 import '../tool/tool_runner.dart';
@@ -58,7 +58,7 @@ import 'ws_liveness.dart';
 ///   `lib/io` 只是把 baseUrl/token 换成核心下发的值；
 /// - **零第三方依赖**：便于 `dart compile exe` 出单文件可执行。
 ///
-/// 覆盖度不变量（由 `test/server_coverage_test.dart` 强制）：
+/// 覆盖度不变量（由 `test/server_test.dart` 的覆盖度用例强制）：
 /// **协议包 [ApiPaths.kept] 里的每一条路径，要么已在 [router] 实现，
 /// 要么显式登记在 [stubApiPaths] 并以 501 明确拒绝**——不存在"前端会调、
 /// 核心静默 404"的灰区。
@@ -217,6 +217,9 @@ class CoreServer {
 
   /// 本实例绑定的「已选 Spec 全文」provider（Q9 ⑧）：同样在 close 时按身份解绑。
   String Function(CoreAgent, String)? _selectedSpecsBinding;
+
+  /// 本实例绑定的团队工作目录 provider（成员共享 TOP 目录）：同样按身份解绑。
+  TeamWorkspace? Function(CoreAgent)? _teamWorkspaceBinding;
 
   /// 版本号。
   final String version;
@@ -403,6 +406,16 @@ class CoreServer {
             await specs.ensureSnapshots(agentId, sessionId);
           };
     }
+    // 团队工作目录（2026-10-02 用户定夺）：**成员与团队 TOP 共享同一个工作目录**，
+    // 不再是"每个成员一个 workspaces/<member_id>"。提示词在会话生成与压缩估算两处
+    // 拼装（必须逐字一致），而"一路向上找到 TOP"要查 store ⇒ 与 spec 同范式用 provider；
+    // 返回 null = 不接管（旧口径：agent 自己的 workspace_dir）。
+    // agent 不属于本实例的 store 时不接管：否则会把别的 store 的团队结构写进提示词。
+    TeamWorkspace? teamBinding(CoreAgent agent) => server.store.agent(agent.id) == null
+        ? null
+        : teamWorkspaceFor(agent, server.store.agent);
+    server._teamWorkspaceBinding = teamBinding;
+    teamWorkspaceProvider = teamBinding;
     // 判死与恢复都要**可见**、要能触发补发（不静默）：
     // - 判死：写错误日志 + 关连接（前端会自动重连，这就是"触发重连"）；
     // - 恢复：把消息派发侧在失活期间登记的待补发消息补出去；
@@ -460,6 +473,9 @@ class CoreServer {
     }
     if (identical(selectedSpecsProvider, _selectedSpecsBinding)) {
       selectedSpecsProvider = null;
+    }
+    if (identical(teamWorkspaceProvider, _teamWorkspaceBinding)) {
+      teamWorkspaceProvider = null;
     }
     await _http.close(force: force);
   }
@@ -824,7 +840,7 @@ class CoreServer {
     }
     final List<String> segments = request.uri.pathSegments;
     // 先匹配已实现路由，再匹配"显式登记为未实现"的桩路由；两者由
-    // `server_coverage_test` 保证不相交且并集覆盖 ApiPaths.kept。
+    // `server_test` 的覆盖度用例保证不相交且并集覆盖 ApiPaths.kept。
     final HttpRouteMatch? match =
         router.match(request.method, segments) ??
         stubRouter.match(request.method, segments);
@@ -1075,8 +1091,6 @@ class CoreServer {
       ApiPaths.settingsMissedHeartbeatLimit,
       _setMissedHeartbeatLimit,
     );
-    router.add('GET', ApiPaths.settingsMessageCutin, _getMessageCutin);
-    router.add('POST', ApiPaths.settingsMessageCutin, _setMessageCutin);
     router.add('POST', ApiPaths.settingsDataCollection, _setDataCollection);
     router.add('GET', ApiPaths.files, _listFiles);
     router.add('GET', ApiPaths.fileContent, _fileContent);
@@ -1642,21 +1656,16 @@ class CoreServer {
     final String memberId = params['memberId'] ?? '';
     final int lines =
         int.tryParse(request.uri.queryParameters['lines'] ?? '') ?? 60;
-    final String? path = dispatcher.activityLogPath(memberId);
-    String log = '';
-    if (path != null) {
-      final String? tail = AtomicFile.readTailOrNullSync(path, 64 * 1024);
-      if (tail != null && tail.isNotEmpty) {
-        final List<String> all = const LineSplitter().convert(tail);
-        log = all.length <= lines
-            ? all.join('\n')
-            : all.sublist(all.length - lines).join('\n');
-      }
-    }
+    // 读日志走 agent 自己的工作空间 IO ⇒ 本地与 **SSH 模式**同一个实现
+    // （`readActivityLog` 内部再退回本机绝对路径兜底）。
+    final Map<String, dynamic> read = await dispatcher.readActivityLog(
+      memberId,
+      lines: lines,
+    );
     await writeJson(request, 200, <String, dynamic>{
-      'success': true,
-      'log': log,
-      'path': path ?? '',
+      'success': read['success'] ?? true,
+      'log': read['log'] ?? '',
+      'path': read['path'] ?? '',
     });
   }
 
@@ -2151,27 +2160,6 @@ class CoreServer {
       'token_rate': settings.setTokenAcquisitionRate(requested),
       'min': CoreSettings.tokenRateMin,
       'max': CoreSettings.tokenRateMax,
-    });
-  }
-
-  Future<void> _getMessageCutin(
-    HttpRequest request,
-    Map<String, String> _,
-  ) async {
-    await writeJson(request, 200, <String, dynamic>{
-      'mode': settings.messageCutinDirect ? 'direct' : 'queue',
-    });
-  }
-
-  Future<void> _setMessageCutin(
-    HttpRequest request,
-    Map<String, String> _,
-  ) async {
-    final Map<String, dynamic> body = await readJsonBody(request);
-    settings.messageCutinDirect = (body['mode'] as String?) == 'direct';
-    await writeJson(request, 200, <String, dynamic>{
-      'success': true,
-      'mode': settings.messageCutinDirect ? 'direct' : 'queue',
     });
   }
 

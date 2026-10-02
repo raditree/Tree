@@ -338,7 +338,6 @@ class CoreSettings {
   Map<String, dynamic> extra = <String, dynamic>{};
 
   bool _dataCollectionEnabled = false;
-  bool _messageCutinDirect = false;
 
   /// 推送刷新帧率（帧/秒）：把同一轮回复内的流式增量攒帧后合并下发的频率。
   int _frameRate = frameRateMin;
@@ -363,15 +362,6 @@ class CoreSettings {
   set dataCollectionEnabled(bool value) {
     if (_dataCollectionEnabled == value) return;
     _dataCollectionEnabled = value;
-    sink?.saveSettings(this);
-  }
-
-  /// 消息切入模式：true = 直接切入，false = 串行排队。
-  bool get messageCutinDirect => _messageCutinDirect;
-
-  set messageCutinDirect(bool value) {
-    if (_messageCutinDirect == value) return;
-    _messageCutinDirect = value;
     sink?.saveSettings(this);
   }
 
@@ -412,7 +402,6 @@ class CoreSettings {
       _int(map, 'token_acquisition_rate', tokenRateMax),
     );
     _dataCollectionEnabled = _bool(map, 'data_collection_enabled', false);
-    _messageCutinDirect = _bool(map, 'message_cutin_direct', false);
     // 心跳判活参数：手写 yaml 里的越界值 / 非法组合（例如 heartbeat_interval: 1
     // 配 missed_heartbeat_limit: 1，窗口 1s ≤ 前端 10s 心跳）在这里就被修好，原因
     // 留在 [livenessNotice] 里给前端看——装载阶段**不落盘**（改文件由下一次保存做）。
@@ -433,8 +422,7 @@ class CoreSettings {
       ..remove('token_acquisition_rate')
       ..remove('heartbeat_interval')
       ..remove('missed_heartbeat_limit')
-      ..remove('data_collection_enabled')
-      ..remove('message_cutin_direct');
+      ..remove('data_collection_enabled');
   }
 
   /// 序列化为 settings.yaml 的映射（已知键 + [extra] 保留的未知键）。
@@ -445,7 +433,6 @@ class CoreSettings {
     'heartbeat_interval': _heartbeatIntervalSeconds,
     'missed_heartbeat_limit': _missedHeartbeatLimit,
     'data_collection_enabled': _dataCollectionEnabled,
-    'message_cutin_direct': _messageCutinDirect,
   };
 
   /// 模型列表（按 model_id 排序，稳定可预测）。

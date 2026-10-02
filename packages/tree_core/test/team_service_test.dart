@@ -109,7 +109,7 @@ void main() {
           (groups['team_member'] as List<dynamic>).single
               as Map<String, dynamic>;
       expect(memberView['relation'], MemberRelation.indirect);
-      expect(memberView['log_path'], '.self/activity.log');
+      expect(memberView['log_path'], '.tree/$grand/.self/activity.log');
       expect(
         memberView.containsKey('system_prompt'),
         isFalse,

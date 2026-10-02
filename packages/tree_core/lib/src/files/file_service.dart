@@ -7,6 +7,7 @@ import 'package:path/path.dart' as p;
 import 'package:tree_local_exec/tree_local_exec.dart';
 
 import '../store/tree_store.dart';
+import '../team/team_workspace.dart';
 
 /// 工作空间文件服务（M7d）：给前端文件面板 / 查看器 / Git 面板提供数据。
 ///
@@ -110,9 +111,14 @@ class FileService {
   }
 
   /// 某 agent 的工作空间根目录（本机绝对路径）。
+  ///
+  /// 成员跟随团队 TOP 的目录（[TeamWorkspace]，2026-10-02 定夺）：成员不再各自
+  /// `workspaces/<member_id>`。TOP 自身口径不变（owner == 它自己）。
   String rootFor(CoreAgent agent) {
-    final String configured = agent.workspaceDir.trim();
-    return configured.isNotEmpty ? configured : defaultWorkspaceDir(agent.id);
+    final TeamWorkspace shared = teamWorkspaceFor(agent, store.agent);
+    return shared.configuredDir.isNotEmpty
+        ? shared.configuredDir
+        : defaultWorkspaceDir(shared.owner.id);
   }
 
   /// 取该 agent 的远端文件面板后端；本机 agent 恒为 null。

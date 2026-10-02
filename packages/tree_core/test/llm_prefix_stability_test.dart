@@ -162,7 +162,10 @@ void main() {
     await Future<void>.delayed(const Duration(milliseconds: 1100));
     await sendTurn(ws, '再来一条', 4);
 
-    final Directory results = Directory(p.join(workspace.path, '.self', 'results'));
+    // 模型口径仍写 `.self/results`，磁盘上按 agent 分栏：`.tree/<agent_id>/.self/results`。
+    final Directory results = Directory(
+      p.join(workspace.path, '.tree', agentId, '.self', 'results'),
+    );
     final int files = results.existsSync() ? results.listSync().length : 0;
     expect(files, 1, reason: '同一个工具结果只应重定向一次（现在是每次 run 一份新文件）');
 

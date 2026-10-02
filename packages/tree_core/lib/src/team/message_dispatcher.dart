@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
+import 'package:tree_local_exec/tree_local_exec.dart';
 
 import '../store/atomic_file.dart';
 import '../store/tree_store.dart';
@@ -151,6 +153,7 @@ class TeamMessageDispatcher {
     required this.deliver,
     this.workspaceDirOf,
     this.activityLogPathOf,
+    this.ioFor,
     this.log,
     this.linkLiveness,
     this.startGrace = const Duration(seconds: 5),
@@ -167,8 +170,18 @@ class TeamMessageDispatcher {
   /// agent 的**本地**工作空间目录；返回空串表示该 agent 的工作空间不在本机。
   final String Function(String agentId)? workspaceDirOf;
 
-  /// 活动日志绝对路径（覆盖默认的 `<工作空间>/.self/activity.log`）。
+  /// 活动日志绝对路径（**本机**兜底；覆盖默认的
+  /// `<工作空间>/.tree/<agent_id>/.self/activity.log`）。
+  ///
+  /// 只在 [ioFor] 拿不到工作空间 IO 时才用到。
   final String Function(String agentId)? activityLogPathOf;
+
+  /// 该 agent 的**工作空间 IO**（本地与 SSH 同一入口，见 `WorkspaceToolRunner.ioFor`）。
+  ///
+  /// 活动日志走它写/读，于是 **SSH 团队成员与 leader 的日志也落在各自远端工作空间的
+  /// `.self/activity.log`**（真实路径 `.tree/<agent_id>/.self/activity.log`）——
+  /// 而不是"远端成员没有日志"。null = 退回本机绝对路径 + [AtomicFile]。
+  final Future<WorkspaceIO?> Function(String agentId)? ioFor;
 
   final void Function(String message)? log;
 
@@ -196,6 +209,19 @@ class TeamMessageDispatcher {
 
   /// 因心跳丢失而登记待补发的消息队列（重连后由 [flushPendingResends] 补发）。
   final List<_PendingDelivery> _pendingResends = <_PendingDelivery>[];
+
+  /// 活动日志的**模型口径**相对路径（真实落点由工作空间 IO 按 agent 分栏：
+  /// `.self/activity.log` ⇒ `.tree/<agent_id>/.self/activity.log`）。
+  static const String activityLogRelativePath = '.self/activity.log';
+
+  /// 每次日志写入前的读取上限；超过就只保留尾部（见 [_activityKeepLines]）。
+  static const int _maxActivityReadBytes = 512 * 1024;
+
+  /// 日志过长时保留的尾部行数（日志是过程记录，不承担事实源）。
+  static const int _activityKeepLines = 400;
+
+  /// 同一 agent 的活动日志写入链（IO 侧没有追加原语，必须串行化）。
+  final Map<String, Future<void>> _logChains = <String, Future<void>>{};
 
   /// 待补发消息条数（0 = 没有欠账）。
   int get pendingResendCount => _pendingResends.length;
@@ -756,18 +782,118 @@ class TeamMessageDispatcher {
   static String _preview(String content) =>
       content.length > 120 ? '${content.substring(0, 120)}…' : content;
 
-  /// 活动日志（本地镜像；SSH 成员的工作空间不在本机时不写）。
-  Future<void> _activity(String agentId, String line) async {
-    final String? path = _activityPath(agentId);
-    if (path == null) return;
-    try {
-      await AtomicFile.appendLine(path, line);
-    } catch (error) {
-      log?.call('写活动日志失败（$agentId）：$error');
-    }
+  /// 活动日志（**按 agent 分栏**：`.tree/<agent_id>/.self/activity.log`）。
+  ///
+  /// 写盘优先走该 agent 的**工作空间 IO** ⇒ **SSH 模式下的 agent 也写自己那份**
+  /// （远端 `.self/activity.log`），不再出现"远端成员没有日志"。IO 拿不到时退回
+  /// 本机绝对路径 + [AtomicFile]（内嵌/测试/未接线场景）。
+  ///
+  /// 同一 agent 的写入串行化（[_logChains]）：IO 侧只有"读文件/写文件"，没有追加原语，
+  /// 并发投递同时写同一个文件会互相覆盖。
+  Future<void> _activity(String agentId, String line) {
+    final Future<void> previous = _logChains[agentId] ?? Future<void>.value();
+    final Completer<void> gate = Completer<void>();
+    _logChains[agentId] = gate.future;
+    unawaited(() async {
+      try {
+        await previous;
+      } catch (_) {
+        // 前一条写失败不该卡住后续日志
+      }
+      try {
+        await _appendActivity(agentId, line);
+      } catch (error) {
+        log?.call('写活动日志失败（$agentId）：$error');
+      }
+      if (!gate.isCompleted) gate.complete();
+      if (identical(_logChains[agentId], gate.future)) {
+        _logChains.remove(agentId);
+      }
+    }());
+    return gate.future;
   }
 
-  /// 活动日志路径（`GET teammateLog` 读的也是它）。
+  /// 追加一行：IO 优先，本机绝对路径兜底。
+  Future<void> _appendActivity(String agentId, String line) async {
+    final Future<WorkspaceIO?> Function(String agentId)? lookup = ioFor;
+    if (lookup != null) {
+      final WorkspaceIO? io = await lookup(agentId);
+      if (io != null) {
+        String existing = '';
+        try {
+          final FileContent content = await io.readFile(
+            activityLogRelativePath,
+            maxBytes: _maxActivityReadBytes,
+          );
+          existing = content.text;
+          if (content.truncated) {
+            // 只留尾部：否则"读回 + 写回"会把更早的内容挤掉（日志不是事实源）
+            final List<String> all = const LineSplitter().convert(existing);
+            final String tail = all.length <= _activityKeepLines
+                ? existing
+                : '${all.sublist(all.length - _activityKeepLines).join('\n')}\n';
+            existing =
+                '[log] 早期条目已截断（只保留最近 $_activityKeepLines 行）\n$tail';
+          }
+        } catch (_) {
+          // 首次写入：文件还不存在
+        }
+        final StringBuffer next = StringBuffer(existing);
+        if (next.isNotEmpty && !existing.endsWith('\n')) next.write('\n');
+        next.writeln(line);
+        await io.writeFile(activityLogRelativePath, next.toString());
+        return;
+      }
+    }
+    final String? path = _activityPath(agentId);
+    if (path == null) return;
+    await AtomicFile.appendLine(path, line);
+  }
+
+  /// 读活动日志尾部（本地与 SSH 同一个实现；`GET teammateLog` 用它）。
+  ///
+  /// 返回 `{success, log, path}`；`path` 是**模型口径**的相对路径（leader 可以照它
+  /// 直接 `read`/`grep`），读不到时为空串。
+  Future<Map<String, dynamic>> readActivityLog(
+    String agentId, {
+    int lines = 60,
+  }) async {
+    String text = '';
+    final Future<WorkspaceIO?> Function(String agentId)? lookup = ioFor;
+    if (lookup != null) {
+      try {
+        final WorkspaceIO? io = await lookup(agentId);
+        if (io != null) {
+          text = (await io.readFile(
+            activityLogRelativePath,
+            maxBytes: _maxActivityReadBytes,
+          )).text;
+        }
+      } catch (_) {
+        text = '';
+      }
+    }
+    if (text.isEmpty) {
+      final String? path = _activityPath(agentId);
+      if (path != null) {
+        text = AtomicFile.readTailOrNullSync(path, _maxActivityReadBytes) ?? '';
+      }
+    }
+    if (text.isEmpty) {
+      return <String, dynamic>{'success': true, 'log': '', 'path': ''};
+    }
+    final List<String> all = const LineSplitter().convert(text);
+    final String log = all.length <= lines
+        ? all.join('\n')
+        : all.sublist(all.length - lines).join('\n');
+    return <String, dynamic>{
+      'success': true,
+      'log': log,
+      'path': activityLogRelativePath,
+    };
+  }
+
+  /// 活动日志的**本机绝对**路径（兜底用；`GET teammateLog` 现在走 [readActivityLog]）。
   String? activityLogPath(String agentId) => _activityPath(agentId);
 
   String? _activityPath(String agentId) {
@@ -775,7 +901,9 @@ class TeamMessageDispatcher {
     if (explicit != null && explicit.trim().isNotEmpty) return explicit;
     final String dir = workspaceDirOf?.call(agentId) ?? '';
     if (dir.trim().isEmpty) return null;
-    return p.join(dir, '.self', 'activity.log');
+    // **按 agent 分栏**：成员与 leader 共享工作目录，活动日志不能混成一个文件
+    // （否则"谁做了什么"分不清，互相还会覆盖）。
+    return p.join(dir, '.tree', agentId, '.self', 'activity.log');
   }
 
   /// 文件投递：发送方工作空间 → 接收方 `.input/<日期>/`。

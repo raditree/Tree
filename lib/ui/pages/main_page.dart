@@ -466,7 +466,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         index: _mobileTab,
         children: [
           AgentList(
-            agents: _agents,
+            agents: _topAgents,
             onAgentSelected: (Agent agent) {
               setState(() {
                 _selectedAgent = agent;
@@ -1096,6 +1096,19 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     );
   }
 
+  /// 左栏 Agent 列表的数据源：**只列顶层 agent（团队根）**。
+  ///
+  /// 团队成员也是独立 agent 文件（`parent_agent_id` 指向直属上级、`team_id` 指向 TOP），
+  /// 因此 `GET /api/agents` 会一并返回。它们**不是**用户可以直接聊的顶层 agent：入口是
+  /// 「团队 → 成员」工作进度窗口；列在这里会让人以为可以各聊各的（2026-10-02 用户定夺：
+  /// 成员不独立为 agent）。判据用 doc 化的"团队归属为空 = 顶层 agent"（见 Agent.teamId）。
+  ///
+  /// 只有**左栏列表**过滤，[_agents] 本身保持完整：按 id 找 agent（提问导航、执行器注册、
+  /// 删除）仍要能找到成员。
+  List<Agent> get _topAgents => _agents
+      .where((Agent a) => a.teamId.isEmpty)
+      .toList(growable: false);
+
   /// 构建左栏 Agent 列表面板
   ///
   /// 顶部标题栏（含创建按钮）+ Agent 列表，选中 agent 时更新中栏标题。
@@ -1109,7 +1122,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
           // Agent 列表
           Expanded(
             child: AgentList(
-              agents: _agents,
+              agents: _topAgents,
               onAgentSelected: (Agent agent) {
                 setState(() {
                   _selectedAgent = agent;

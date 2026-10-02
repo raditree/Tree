@@ -6,6 +6,7 @@ import 'package:tree_local_exec/tree_local_exec.dart';
 
 import '../settings/ssh_config.dart';
 
+import '../agent/private_workspace_io.dart';
 import '../mcp/mcp_service.dart';
 import '../plugin/plugin_bus.dart';
 import '../spec/spec_service.dart';
@@ -423,7 +424,9 @@ class WorkspaceToolRunner implements ToolRunner {
         log?.call('agent $agentId 的 SSH 配置缺少：${ssh.missingFields.join('、')}');
         return null;
       }
-      final WorkspaceIO io = await factory(ssh);
+      // 私有状态按 agent 分栏（`.self/…` → `.tree/<agent_id>/.self/…`）：
+      // 团队成员与 leader 共享工作目录，但各自的 .self 必须分开（见 PrivateWorkspaceIO）。
+      final WorkspaceIO io = PrivateWorkspaceIO(await factory(ssh), agentId);
       _ios[agentId] = io;
       return io;
     }
@@ -439,7 +442,8 @@ class WorkspaceToolRunner implements ToolRunner {
       log?.call('创建工作空间失败（$dir）：$error');
       return null;
     }
-    final WorkspaceIO io = _ioFactory(p.normalize(dir));
+    // 本机后端同样按 agent 分栏（`.self/…` → `.tree/<agent_id>/.self/…`）。
+    final WorkspaceIO io = PrivateWorkspaceIO(_ioFactory(p.normalize(dir)), agentId);
     _ios[agentId] = io;
     return io;
   }

@@ -174,6 +174,57 @@ void main() {
       );
     });
 
+    test('跨会话的新消息不打断在途那一轮：两个会话**并行**跑（不排队）', () async {
+      const String other = 'ses_other';
+      sendMessage('第一条');
+      await _untilTrue(() => engine.started.length == 1, reason: '第一轮启动');
+
+      ws.send(<String, dynamic>{
+        'type': WsInboundType.userMessage,
+        'agent_id': top.id,
+        'content': '另一个会话的消息',
+        'session_id': other,
+      });
+      await _untilTrue(
+        () => engine.started.length == 2,
+        reason: '另一会话那一轮并行启动（既不等前一轮、也不打断它）',
+      );
+
+      expect(server.conversation.interruptedRunCount, 0, reason: '跨会话不算打断');
+      expect(server.conversation.activeRunCount, 2, reason: '两个会话同时在跑');
+      expect(engine.contexts[1].sessionId, other);
+      expect(
+        engine.cancelledAtEnd,
+        isEmpty,
+        reason: '谁也没被取消：跨会话打断只会让那个会话的答复凭空消失',
+      );
+      expect(server.conversation.isRunning(top.id), isTrue);
+    });
+
+    test('stop 是 agent 级的：并行在跑的每个会话都被停掉', () async {
+      sendMessage('第一条');
+      await _untilTrue(() => engine.started.length == 1, reason: '第一轮启动');
+      ws.send(<String, dynamic>{
+        'type': WsInboundType.userMessage,
+        'agent_id': top.id,
+        'content': '另一个会话的消息',
+        'session_id': 'ses_other',
+      });
+      await _untilTrue(() => engine.started.length == 2, reason: '并行启动');
+      expect(server.conversation.activeRunCount, 2);
+
+      ws.send(<String, dynamic>{
+        'type': WsInboundType.stop,
+        'data': <String, dynamic>{'agent_id': top.id, 'session_id': sessionId},
+      });
+      await _untilTrue(
+        () => !server.conversation.isRunning(top.id),
+        reason: '两个会话都收敛',
+      );
+      expect(server.conversation.activeRunCount, 0);
+      expect(engine.cancelledAtEnd, hasLength(2));
+    });
+
     test('用户按 stop 仍然给可见提示（打断与停止不混淆）', () async {
       sendMessage('第一条');
       await _untilTrue(() => engine.started.length == 1, reason: '第一轮启动');

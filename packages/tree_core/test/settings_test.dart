@@ -126,7 +126,6 @@ void main() {
       settings.applyMap(<String, dynamic>{
         'frame_rate': 90,
         'token_acquisition_rate': 45,
-        'message_cutin_direct': true,
         'data_collection_enabled': true,
         'my_custom_key': <String, dynamic>{
           'nested': <int>[1, 2],
@@ -135,7 +134,6 @@ void main() {
       });
       expect(settings.frameRate, 90);
       expect(settings.tokenAcquisitionRate, 45);
-      expect(settings.messageCutinDirect, isTrue);
       expect(settings.dataCollectionEnabled, isTrue);
       expect(
         settings.extra.keys,
@@ -157,12 +155,10 @@ void main() {
       settings.applyMap(<String, dynamic>{
         'frame_rate': '120',
         'token_acquisition_rate': '240',
-        'message_cutin_direct': 'off',
         'data_collection_enabled': 1,
       });
       expect(settings.frameRate, 120);
       expect(settings.tokenAcquisitionRate, 240);
-      expect(settings.messageCutinDirect, isFalse);
       expect(settings.dataCollectionEnabled, isTrue);
       // 非法帧率被夹取
       settings.applyMap(<String, dynamic>{'frame_rate': 'abc'});
@@ -180,10 +176,9 @@ void main() {
 
       settings.dataCollectionEnabled = true;
       settings.dataCollectionEnabled = true; // 相同值不重复落盘
-      settings.messageCutinDirect = true;
       settings.setTokenAcquisitionRate(120);
       settings.setFrameRate(120);
-      expect(sink.settingsSaved, 4);
+      expect(sink.settingsSaved, 3);
 
       settings.createModel(<String, dynamic>{
         'model_id': 'm1',
@@ -199,7 +194,6 @@ void main() {
     test('无 sink 时全部改动只留内存（不抛错）', () {
       final CoreSettings settings = CoreSettings();
       settings.setTokenAcquisitionRate(120);
-      settings.messageCutinDirect = true;
       settings.setFrameRate(50);
       settings.createModel(<String, dynamic>{
         'model_id': 'm1',

@@ -124,6 +124,9 @@ Future<void> main(List<String> args) async {
   // 消息派发：投递实现要等核心起监听后才有（ConversationService 由核心创建），
   // 因此同样用可后置绑定的槽。
   TeamDelivery? deliverSink;
+  // 活动日志要走 agent 自己的工作空间 IO（本地与 SSH 同一口径）——但工具层在后文才建，
+  // 因此同样用可后置绑定的槽（与 deliverSink 同一范式）。
+  Future<WorkspaceIO?> Function(String agentId)? ioSink;
   final TeamMessageDispatcher messages = TeamMessageDispatcher(
     store: store,
     teams: teams,
@@ -149,14 +152,36 @@ Future<void> main(List<String> args) async {
     // 这里返回空串，投递会明确报"不支持"而不是复制到无关目录。
     workspaceDirOf: (String agentId) {
       final CoreAgent? agent = store.agent(agentId);
-      if (agent != null && agent.sshConfig != null) return '';
-      final String configured = agent?.workspaceDir ?? '';
-      return configured.trim().isNotEmpty
-          ? configured
-          : paths.defaultWorkspaceDir(agentId);
+      if (agent == null) return paths.defaultWorkspaceDir(agentId);
+      // 成员跟随团队 TOP 的 SSH（见 teamSshConfigFor）：远端工作空间不在本机 ⇒ 本地
+      // 活动日志与文件投递都不适用（与"leader 自己是 SSH agent"同一口径）。
+      if (teamSshConfigFor(agent, store.agent) != null) return '';
+      // 成员跟随团队 TOP 的工作目录（见 TeamWorkspace，2026-10-02 定夺）；TOP 口径不变。
+      final TeamWorkspace shared = teamWorkspaceFor(agent, store.agent);
+      return shared.configuredDir.isNotEmpty
+          ? shared.configuredDir
+          : paths.defaultWorkspaceDir(shared.owner.id);
+    },
+    ioFor: (String agentId) async {
+      final Future<WorkspaceIO?> Function(String agentId)? sink = ioSink;
+      if (sink == null) return null;
+      return sink(agentId);
     },
     log: (String message) => stderr.writeln('[core:msg] $message'),
   );
+  // 一次性迁移：私有状态从 `.self/` 搬到 `.tree/<agent_id>/.self/`（按 agent 分栏）。
+  // 只搬**团队 TOP** 的：成员与 leader 共享工作目录，旧 `.self` 不可能属于成员
+  // （成员以前有自己的目录，那份留在原地不动）。幂等，失败只记日志。
+  for (final CoreAgent agent in store.agents()) {
+    if (teams.teamIdOf(agent.id) != agent.id) continue;
+    final String own = agent.workspaceDir.trim();
+    migrateLegacySelfDir(
+      workspaceDir: own.isNotEmpty ? own : paths.defaultWorkspaceDir(agent.id),
+      agentId: agent.id,
+      log: (String message) => stderr.writeln('[core:migrate] $message'),
+    );
+  }
+
   final WorkspaceToolRunner tools = WorkspaceToolRunner(
     todoStore: todos,
     askQuestion: questions.ask,
@@ -165,7 +190,12 @@ Future<void> main(List<String> args) async {
     specService: specs,
     mcpService: mcp,
     pluginBus: plugins,
-    resolveSshConfig: (String agentId) => store.agent(agentId)?.sshConfig,
+    // 成员跟随团队 TOP 的 SSH：自己没有 ssh 配置时用 TOP 那份（同一台远端主机、同一个根）。
+    resolveSshConfig: (String agentId) {
+      final CoreAgent? agent = store.agent(agentId);
+      if (agent == null) return null;
+      return teamSshConfigFor(agent, store.agent);
+    },
     // SSH 后端（dartssh2 + SFTP/exec）：每个 agent 一条连接，按需建立并缓存；
     // 远端根目录取 ssh.root（空 = 远端登录用户的 HOME）。
     sshIoFactory: (SshConfig config) async {
@@ -186,13 +216,20 @@ Future<void> main(List<String> args) async {
       return SshWorkspaceIO(root, transport);
     },
     resolveWorkspaceDir: (String agentId) {
-      final String configured = store.agent(agentId)?.workspaceDir ?? '';
-      return configured.trim().isNotEmpty
-          ? configured
-          : paths.defaultWorkspaceDir(agentId);
+      final CoreAgent? agent = store.agent(agentId);
+      if (agent == null) return paths.defaultWorkspaceDir(agentId);
+      // 工具根：成员与团队 TOP **共享同一个工作目录**（见 TeamWorkspace）。
+      final TeamWorkspace shared = teamWorkspaceFor(agent, store.agent);
+      return shared.configuredDir.isNotEmpty
+          ? shared.configuredDir
+          : paths.defaultWorkspaceDir(shared.owner.id);
     },
     log: (String message) => stderr.writeln('[core:tool] $message'),
   );
+
+  // 活动日志的工作空间 IO 后置绑定：从这里起，**SSH 模式下的 agent**（含跟随 leader
+  // SSH 的成员）也会把 `[start(成员)]/…` 写进它自己远端工作空间的 .self/activity.log。
+  ioSink = tools.ioFor;
 
   // 系统提示词（Q6）：落在**每个工作空间**的 .self/system_prompt.md（团队分隔）。
   // 首次用到某工作空间时播种默认内容，之后只读用户版本；运行期每轮按 agent 缓存

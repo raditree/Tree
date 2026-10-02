@@ -1214,28 +1214,6 @@ class ApiService {
     return _postJson('/api/agents/$agentId/reset', body: {'target': target});
   }
 
-  /// 设置消息切入模式
-  ///
-  /// `direct=true` 直接切入：新消息一次性全部切入当前上下文，几乎同时到达的
-  /// 消息一起处理；`false` 串行排队（默认）。调用
-  /// `POST /api/settings/message-cutin`，请求体为 `{"mode": "direct"/"queue"}`。
-  static Future<void> setMessageCutinDirect(bool direct) async {
-    await _postJson(
-      '/api/settings/message-cutin',
-      body: {'mode': direct ? 'direct' : 'queue'},
-    );
-  }
-
-  /// 查询消息切入模式：true=直接切入，false=串行排队
-  ///
-  /// 调用 `GET /api/settings/message-cutin`，返回 `{"mode": "queue"|"direct"}`。
-  static Future<bool> getMessageCutinDirect() async {
-    final Map<String, dynamic> data = await _getJson(
-      '/api/settings/message-cutin',
-    );
-    return (data['mode'] as String?) == 'direct';
-  }
-
   // ==================== 内部工具方法 ====================
 
   /// 发送 GET 请求并解析 JSON 响应

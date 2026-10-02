@@ -65,12 +65,35 @@ abstract final class MessageTool {
         // 活性：心跳丢失 / 未响应才收口，并把未响应者显式列出来）。
         'session_id': <String, dynamic>{
           'type': 'string',
-          'description': '接收方归集的会话 id（默认 session_default）',
+          'description': '接收方归集的会话 id（缺省 = 发起这一跳的会话；'
+              '显式写 session_default 才会落进对方的默认会话）',
         },
       },
       'required': <String>['action'],
     },
   );
+
+  /// 补上"接收方归集到哪个会话"：缺省 = **发起这一跳的会话**。
+  ///
+  /// 为什么不沿用旧口径（一律 `session_default`）：用户在某个会话里让 leader 派活，
+  /// 成员却把活干在它自己的默认会话里——而「teammates 窗口」的历史与实时帧都按
+  /// **当前会话**过滤（见 `TeammateDetailPage`），于是用户全程看不到成员有任何动作；
+  /// 成员回发给 leader 的消息同样落进 leader 的默认会话，leader 当前会话里既没有
+  /// 交付回信、也等不到后续。用户侧接口（`POST .../teammate/{id}/message`）早就带上了
+  /// 当前会话，agent 侧必须同口径（见 docs/known-issues.md #9）。
+  ///
+  /// 显式传了 `session_id` 的调用方仍然说了算。
+  static Map<String, dynamic> _withCallerSession(ToolInvocation invocation) {
+    final Map<String, dynamic> args = Map<String, dynamic>.of(
+      invocation.arguments,
+    );
+    final String explicit = (args['session_id'] ?? '').toString().trim();
+    final String current = invocation.sessionId.trim();
+    if (explicit.isEmpty && current.isNotEmpty) {
+      args['session_id'] = current;
+    }
+    return args;
+  }
 
   /// 执行一次调用（异步：`wait_for` 会真的等）。
   static Future<ToolOutcome> run(
@@ -79,7 +102,7 @@ abstract final class MessageTool {
   ) async {
     final Map<String, dynamic> result = await dispatcher.run(
       invocation.agentId,
-      invocation.arguments,
+      _withCallerSession(invocation),
     );
     return ToolOutcome(
       const JsonEncoder.withIndent('  ').convert(result),

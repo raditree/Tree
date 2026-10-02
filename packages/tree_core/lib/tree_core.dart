@@ -34,6 +34,8 @@ export 'src/agent/workspace_prompt.dart';
 export 'src/team/message_dispatcher.dart';
 export 'src/team/team_model.dart';
 export 'src/team/team_service.dart';
+export 'src/team/team_workspace.dart';
+export 'src/agent/private_workspace_io.dart';
 export 'src/agent/scripted_agent.dart';
 export 'src/llm/llm_agent_engine.dart';
 export 'src/llm/llm_json_caller.dart';

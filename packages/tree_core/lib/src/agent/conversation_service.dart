@@ -18,6 +18,11 @@ import 'workspace_prompt.dart';
 
 /// 一次生成任务的取消令牌。
 class _RunToken {
+  /// 这一轮归属的 agent / 会话。运行键 = `agentId|sessionId`（见 [_runKey]）：
+  /// **同一个 agent 的不同会话是两条独立任务链**，可以并行生成。
+  String agentId = '';
+  String sessionId = '';
+
   bool cancelled = false;
 
   /// 是否因"**收到新消息**"而被打断（与用户按 `stop` 区分）。
@@ -82,8 +87,10 @@ class _PendingMessage {
 /// （[agentEvents]），插件据此统计轮次与耗时、超限时用执行站的 `agent.stop` 停下
 /// 这一轮——核心侧不再有工具轮次静态上限（plan §2 Q8）。**默认未接线 = no-op**。
 ///
-/// 并发策略：**按 agent 串行**（同一 agent 的多条消息排队执行）。同一会话的
-/// 流式片段若交错下发，前端的 `msg_chunk` 追加会互相污染。
+/// 并发策略：**按 agent×会话**——同一会话内串行（同一会话的流式片段若交错下发，
+/// 前端的 `msg_chunk` 追加会互相污染），**不同会话并行**（前端按 `session_id` 过滤
+/// 下行帧，见 `message_panel._isForCurrentSession`；跨会话的消息既不打断也不排队，
+/// 各会话各自发言）。
 class ConversationService {
   ConversationService({
     required this.store,
@@ -143,11 +150,16 @@ class ConversationService {
   /// 测试可以注入自己的记录器（或 CLI 接总线）来决定要不要发。
   final AgentEventPublisher agentEvents = AgentEventPublisher();
 
-  /// 每个 agent 的任务链尾（保证串行）。
+  /// 每个 **agent×会话** 的任务链尾（同一会话串行；不同会话各自一条链 ⇒ 并行）。
   final Map<String, Future<void>> _chains = <String, Future<void>>{};
 
-  /// 每个 agent 当前在途任务的取消令牌。
+  /// 每个 **agent×会话** 当前在途任务的取消令牌。
   final Map<String, _RunToken> _running = <String, _RunToken>{};
+
+  /// 运行键：**会话级**。用它而不是 agent id，是因为同一个 agent 的不同会话要能
+  /// **并行**跑（跨会话消息既不打断也不排队）；同一会话内仍然串行。
+  static String _runKey(String agentId, String sessionId) =>
+      '$agentId|$sessionId';
 
   /// 每个 agent 的**任务代次**：stop 时 +1，丢弃此前还在排队、尚未开始的任务。
   final Map<String, int> _epoch = <String, int>{};
@@ -156,6 +168,8 @@ class ConversationService {
   int droppedQueuedCount = 0;
 
   /// 因"收到新消息"而被打断的在途轮次数（测试与排障用，见 [_interruptForNewMessage]）。
+  ///
+  /// 只统计**同一会话**的插话；跨会话的消息不会打断任何在途轮次（各会话并行）。
   int interruptedRunCount = 0;
 
   /// 已提示过的"压缩失败 / 模型没配 max_seqlen"（同一件事只打扰用户一次）。
@@ -164,8 +178,9 @@ class ConversationService {
   /// 当前在途生成数（自检/日志用）。
   int get activeRunCount => _running.length;
 
-  /// 某 agent 是否正在生成（团队名单的 `working` 状态唯一权威）。
-  bool isRunning(String agentId) => _running.containsKey(agentId);
+  /// 某 agent 是否**有任一会话**正在生成（团队名单的 `working` 状态唯一权威）。
+  bool isRunning(String agentId) =>
+      _running.values.any((_RunToken token) => token.agentId == agentId);
 
   /// 处理 `user_message`。
   ///
@@ -193,10 +208,14 @@ class ConversationService {
         attachments: _attachments(frame['attachments']),
       ),
     );
-    // 新消息到达 = 插话：把在途那一轮立刻打断（工具循环就此收敛），
-    // 让这条新消息的下一轮紧接着跑起来（顺序与代次见 [_interruptForNewMessage]）。
-    _interruptForNewMessage(agent.id);
-    return _enqueue(agent.id, () => _runReply(agent, session, content));
+    // 新消息到达 = 插话：把**同一会话**在途的那一轮立刻打断（工具循环就此收敛），
+    // 让这条新消息的下一轮紧接着跑起来（顺序 / 代次 / 会话边界见 [_interruptForNewMessage]）。
+    _interruptForNewMessage(agent.id, sessionId: session.sessionId);
+    return _enqueue(
+      agent.id,
+      session.sessionId,
+      () => _runReply(agent, session, content),
+    );
   }
 
   /// 处理 `stop`（单个 agent；`agent_id` 为 TOP 时的**级联**由核心层展开，
@@ -221,9 +240,14 @@ class ConversationService {
     // 先取消在途提问：等待中的工具会立刻拿到 cancelled 结果，工具循环才能收敛。
     questions?.cancelForAgent(agentId);
     _epoch[agentId] = (_epoch[agentId] ?? 0) + 1;
-    final _RunToken? token = _running[agentId];
-    if (token == null) return false;
-    token.cancelled = true;
+    // stop 是 agent 级的：该 agent 的**每个在途会话**都要停（会话可以并行跑）。
+    final List<_RunToken> tokens = _running.values
+        .where((_RunToken token) => token.agentId == agentId)
+        .toList(growable: false);
+    if (tokens.isEmpty) return false;
+    for (final _RunToken token in tokens) {
+      token.cancelled = true;
+    }
     return true;
   }
 
@@ -257,9 +281,14 @@ class ConversationService {
         timestamp: DateTime.now().millisecondsSinceEpoch,
       ),
     );
-    // 团队消息也是"有人对它说话"：同样打断在途那一轮（见 [_interruptForNewMessage]）
-    _interruptForNewMessage(agent.id);
-    return _enqueue(agent.id, () => _runReply(agent, session, text));
+    // 团队消息也是"有人对它说话"：同样打断**同一会话**在途那一轮
+    // （跨会话只排队，见 [_interruptForNewMessage]）
+    _interruptForNewMessage(agent.id, sessionId: session.sessionId);
+    return _enqueue(
+      agent.id,
+      session.sessionId,
+      () => _runReply(agent, session, text),
+    );
   }
 
   /// 处理 `user_answer`（`ask_user_question` 的应答）。
@@ -313,13 +342,23 @@ class ConversationService {
     // assistant 消息"收尾，而 hook 提示恰恰是追加到历史末尾的那条 —— 之前正是它
     // 让唤醒轮次连续 400。按 user 翻译同时也纠正了"模型以为那句是自己说的"。
     _sendNotice(agent, session, notice, kind: 'notice');
-    _interruptForNewMessage(agentId);
-    return _enqueue(agentId, () => _runReply(agent, session, notice));
+    _interruptForNewMessage(agentId, sessionId: session.sessionId);
+    return _enqueue(
+      agentId,
+      session.sessionId,
+      () => _runReply(agent, session, notice),
+    );
   }
 
-  /// 新消息到达时的"插话"：打断该 agent 在途的那一轮生成。
+  /// 新消息到达时的"插话"：打断该 agent **同一会话**在途的那一轮生成。
   ///
   /// 语义：
+  /// - **会话级**：只找 `agentId|sessionId` 这条链上的在途轮次。**跨会话的消息既不
+  ///   打断也不排队**——各会话是并行的任务链，互不相干（被打断的那一轮不会再发言，
+  ///   见 [_runReply] 的 `interrupted` 分支：不推"已停止本轮生成"，也不产生最终答复，
+  ///   所以跨会话打断只会让那个会话的答复凭空消失。实测见 known-issues #9：leader 在
+  ///   团队会话里 `wait_for` 成员，成员回发落在默认会话 ⇒ 在途那一轮被自己的成员消息
+  ///   掐掉，工具结果后面再没有任何回复）；
   /// - **不 bump epoch**（`stop` 才 bump）：打断的目的恰恰是"让刚入队的新消息
   ///   赶紧跑起来"，把代次往前推会让新任务被当旧任务丢掉；
   /// - 顺带作废在途提问（`ask_user_question`）：等答案的工具会立刻拿到取消结果，
@@ -328,10 +367,11 @@ class ConversationService {
   ///   （`WorkspaceIO.exec` 没有取消参数，且 M9 规定本地执行活着就永不超时、
   ///   不按时间杀进程）；
   /// - 有在途任务时计数 [interruptedRunCount]，便于测试与排障。
-  void _interruptForNewMessage(String agentId) {
-    final _RunToken? token = _running[agentId];
+  void _interruptForNewMessage(String agentId, {required String sessionId}) {
+    final _RunToken? token = _running[_runKey(agentId, sessionId)];
     if (token == null) return;
-    questions?.cancelForAgent(agentId);
+    // 只作废**这个会话**在途的提问：别的会话可能也在跑、也在等人回答，不能一起取消。
+    questions?.cancelForSession(agentId, sessionId);
     token.interrupted = true;
     token.cancelled = true; // 复用既有取消通道：流式循环每帧检查，工具之间也检查
     interruptedRunCount++;
@@ -387,8 +427,11 @@ class ConversationService {
     CoreSession session,
     String userContent,
   ) async {
-    final _RunToken token = _RunToken();
-    _running[agent.id] = token;
+    final String runKey = _runKey(agent.id, session.sessionId);
+    final _RunToken token = _RunToken()
+      ..agentId = agent.id
+      ..sessionId = session.sessionId;
+    _running[runKey] = token;
     final Map<String, dynamic> envelope = <String, dynamic>{
       'agent_id': agent.id,
       'session_id': session.sessionId,
@@ -700,11 +743,16 @@ class ConversationService {
         _sendNotice(agent, session, '已停止本轮生成。');
       }
     }
-    hub.broadcast(<String, dynamic>{
-      'type': WsOutboundType.agentStatus,
-      'data': <String, dynamic>{'agent_id': agent.id, 'status': 'idle'},
-    });
-    _running.remove(agent.id);
+    _running.remove(runKey);
+    // 别的会话可能还在跑：只有该 agent **一个在途轮次都不剩**时才广播 idle。
+    // （前端的 working 集合是按 agent 记的，提前报 idle 会让队友窗口显示"空闲"，
+    //  而它其实还在另一个会话里干活。）
+    if (!isRunning(agent.id)) {
+      hub.broadcast(<String, dynamic>{
+        'type': WsOutboundType.agentStatus,
+        'data': <String, dynamic>{'agent_id': agent.id, 'status': 'idle'},
+      });
+    }
   }
 
   /// 发布一条工具调用事件（`agent.tool_call`；字段口径见 [AgentEvents.toolCall]）。
@@ -801,11 +849,17 @@ class ConversationService {
     attachments: message.attachments,
   );
 
-  /// 按 agent 串行执行：前一个任务（含失败）结束后才启动下一个。
-  Future<void> _enqueue(String agentId, Future<void> Function() task) {
-    final Future<void> previous = _chains[agentId] ?? Future<void>.value();
+  /// 按 **agent×会话** 串行执行：同一会话的前一个任务（含失败）结束后才启动下一个，
+  /// **不同会话各自一条链、并行启动**。
+  Future<void> _enqueue(
+    String agentId,
+    String sessionId,
+    Future<void> Function() task,
+  ) {
+    final String key = _runKey(agentId, sessionId);
+    final Future<void> previous = _chains[key] ?? Future<void>.value();
     final Completer<void> gate = Completer<void>();
-    _chains[agentId] = gate.future;
+    _chains[key] = gate.future;
     final int epoch = _epoch[agentId] ?? 0;
     unawaited(() async {
       try {
@@ -817,7 +871,7 @@ class ConversationService {
       if ((_epoch[agentId] ?? 0) != epoch) {
         droppedQueuedCount++;
         if (!gate.isCompleted) gate.complete();
-        if (identical(_chains[agentId], gate.future)) _chains.remove(agentId);
+        if (identical(_chains[key], gate.future)) _chains.remove(key);
         return;
       }
       try {
@@ -826,8 +880,8 @@ class ConversationService {
         _sendError('会话任务异常：$e');
       }
       if (!gate.isCompleted) gate.complete();
-      if (identical(_chains[agentId], gate.future)) {
-        _chains.remove(agentId);
+      if (identical(_chains[key], gate.future)) {
+        _chains.remove(key);
       }
     }());
     return gate.future;

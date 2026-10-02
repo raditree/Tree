@@ -24,7 +24,6 @@ void main() {
 # 手写注释
 frame_rate: 120
 token_acquisition_rate: "240"
-message_cutin_direct: on
 custom_extra_key: 保留我
 ''');
     File(paths.modelFile('demo')).writeAsStringSync('''
@@ -43,7 +42,6 @@ max_seqlen: 32000
 
     expect(settings.frameRate, 120);
     expect(settings.tokenAcquisitionRate, 240);
-    expect(settings.messageCutinDirect, isTrue);
     expect(settings.extra['custom_extra_key'], '保留我');
     expect(settings.model('demo')?.name, '我的手写模型');
     expect(settings.model('demo')?.apiKey, 'sk-handwritten');
@@ -112,11 +110,11 @@ max_seqlen: 32000
     final CoreSettings settings = CoreSettings();
     sink.load(settings);
     expect(settings.sink, isNotNull);
-    settings.messageCutinDirect = true;
+    settings.setFrameRate(300);
     await settings.sink!.flush();
     expect(
       File(paths.settingsFile).readAsStringSync(),
-      contains('message_cutin_direct: true'),
+      contains('frame_rate: 300'),
     );
   });
 }

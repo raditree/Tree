@@ -88,7 +88,6 @@ abstract final class ApiPaths {
   static const String settingsMissedHeartbeatLimit =
       '/api/settings/missed-heartbeat-limit';
 
-  static const String settingsMessageCutin = '/api/settings/message-cutin';
   static const String settingsDataCollection = '/api/settings/data-collection';
   static const String pluginSnapshot = '/api/plugin/snapshot';
 
@@ -162,7 +161,6 @@ abstract final class ApiPaths {
     settingsTokenRate,
     settingsHeartbeatInterval,
     settingsMissedHeartbeatLimit,
-    settingsMessageCutin,
     settingsDataCollection,
     pluginSnapshot,
     pluginConfigs,

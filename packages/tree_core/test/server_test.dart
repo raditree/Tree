@@ -664,25 +664,6 @@ void main() {
       );
       expect(tokenSet.json['token_rate'], CoreSettings.tokenRateMin);
 
-      await client.send(
-        'POST',
-        ApiPaths.settingsMessageCutin,
-        body: <String, dynamic>{'mode': 'direct'},
-      );
-      expect(
-        (await client.send('GET', ApiPaths.settingsMessageCutin)).json['mode'],
-        'direct',
-      );
-      await client.send(
-        'POST',
-        ApiPaths.settingsMessageCutin,
-        body: <String, dynamic>{'mode': 'queue'},
-      );
-      expect(
-        (await client.send('GET', ApiPaths.settingsMessageCutin)).json['mode'],
-        'queue',
-      );
-
       expect(
         (await client.send(
           'POST',

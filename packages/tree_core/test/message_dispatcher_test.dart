@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
+import 'package:tree_local_exec/tree_local_exec.dart';
 
 /// 团队消息派发（M5c）：寻址、审核闸门、非阻塞投递、广播、等待、附件与日志。
 void main() {
@@ -55,6 +56,12 @@ void main() {
             return blocker?.future ?? Future<void>.value();
           },
       workspaceDirOf: (String id) => p.join(temp.path, id),
+      // 活动日志走工作空间 IO（与 SSH 模式同一口径）：每个 agent 的私有目录是
+      // `<工作空间>/.tree/<agent_id>/.self/`。
+      ioFor: (String id) async => PrivateWorkspaceIO(
+        LocalWorkspaceIO(p.join(temp.path, id)),
+        id,
+      ),
       startGrace: const Duration(milliseconds: 40),
       pollInterval: const Duration(milliseconds: 10),
     );
@@ -108,7 +115,15 @@ void main() {
     expect(delivered.single['agentId'], top.id);
     expect(delivered.single['content'], contains('无法处理消息'));
     expect(delivered.single['content'], contains('尚未分配模型'));
-    final String logFile = p.join(temp.path, unready, '.self', 'activity.log');
+    // 私有状态按 agent 分栏：<工作空间>/.tree/<agent_id>/.self/activity.log
+    final String logFile = p.join(
+      temp.path,
+      unready,
+      '.tree',
+      unready,
+      '.self',
+      'activity.log',
+    );
     expect(File(logFile).readAsStringSync(), contains('[blocked]'));
   });
 
@@ -127,9 +142,143 @@ void main() {
     expect(delivered.single['agentId'], ready);
     expect(delivered.single['content'], '去做 A');
     expect(delivered.single['senderId'], top.id);
-    final String logFile = p.join(temp.path, ready, '.self', 'activity.log');
+    final String logFile = p.join(
+      temp.path,
+      ready,
+      '.tree',
+      ready,
+      '.self',
+      'activity.log',
+    );
     expect(File(logFile).readAsStringSync(), contains('[start(成员)]'));
     blocker!.complete();
+  });
+
+  test('message 工具：默认把接收方归集到**发起会话**（而不是 session_default）', () async {
+    final String ready = member(approved: true);
+    final ToolOutcome outcome = await MessageTool.run(
+      ToolInvocation(
+        id: 'call_1',
+        name: MessageTool.name,
+        arguments: <String, dynamic>{
+          'action': 'send_message',
+          'target_member_id': ready,
+          'message': '去做 A',
+        },
+        agentId: top.id,
+        sessionId: 'ses_team',
+      ),
+      dispatcher,
+    );
+    expect(outcome.isError, isFalse);
+    expect(
+      delivered.single['sessionId'],
+      'ses_team',
+      reason: '派活落在发起会话里，teammates 窗口（按当前会话过滤）才看得到成员进度',
+    );
+  });
+
+  test('message 工具：显式 session_id 优先于发起会话', () async {
+    final String ready = member(approved: true);
+    await MessageTool.run(
+      ToolInvocation(
+        id: 'call_2',
+        name: MessageTool.name,
+        arguments: <String, dynamic>{
+          'action': 'send_message',
+          'target_member_id': ready,
+          'message': '去做 B',
+          'session_id': TreeStore.defaultSessionId,
+        },
+        agentId: top.id,
+        sessionId: 'ses_team',
+      ),
+      dispatcher,
+    );
+    expect(delivered.single['sessionId'], TreeStore.defaultSessionId);
+  });
+
+  test('SSH 模式（本机拿不到工作目录）：日志照样写进该 agent 的 .self', () async {
+    final String ready = member(approved: true);
+    // 模拟 SSH 模式：workspaceDirOf 指不出本机目录，只有工作空间 IO 能写。
+    final TeamMessageDispatcher remote = TeamMessageDispatcher(
+      store: store,
+      teams: teams,
+      deliver:
+          ({
+            required String agentId,
+            required String sessionId,
+            required String content,
+            String senderId = '',
+            String senderName = '',
+          }) => Future<void>.value(),
+      workspaceDirOf: (String _) => '',
+      ioFor: (String id) async =>
+          PrivateWorkspaceIO(LocalWorkspaceIO(p.join(temp.path, id)), id),
+      startGrace: const Duration(milliseconds: 40),
+      pollInterval: const Duration(milliseconds: 10),
+    );
+    final Map<String, dynamic> result = await remote.run(
+      top.id,
+      <String, dynamic>{
+        'action': 'send_message',
+        'target_member_id': ready,
+        'message': '去做 C',
+      },
+    );
+    expect(result['status'], 'sent');
+    final String logFile = p.join(
+      temp.path,
+      ready,
+      '.tree',
+      ready,
+      '.self',
+      'activity.log',
+    );
+    expect(
+      File(logFile).readAsStringSync(),
+      contains('[start(成员)]'),
+      reason: '远端工作空间也要有日志（真实路径 .tree/<agent_id>/.self/activity.log）',
+    );
+    // 读日志 API 同样走 IO：远端模式与本地同一个实现
+    final Map<String, dynamic> read = await remote.readActivityLog(ready, lines: 10);
+    expect(read['log'], contains('[start(成员)]'));
+    expect(read['path'], '.self/activity.log');
+  });
+
+  test('未接工作空间 IO：退回本机绝对路径 + AtomicFile（兜底不回归）', () async {
+    final String ready = member(approved: true);
+    final TeamMessageDispatcher localFallback = TeamMessageDispatcher(
+      store: store,
+      teams: teams,
+      deliver:
+          ({
+            required String agentId,
+            required String sessionId,
+            required String content,
+            String senderId = '',
+            String senderName = '',
+          }) => Future<void>.value(),
+      workspaceDirOf: (String id) => p.join(temp.path, id),
+      startGrace: const Duration(milliseconds: 40),
+      pollInterval: const Duration(milliseconds: 10),
+    );
+    await localFallback.run(top.id, <String, dynamic>{
+      'action': 'send_message',
+      'target_member_id': ready,
+      'message': '去做 D',
+    });
+    final String logFile = p.join(
+      temp.path,
+      ready,
+      '.tree',
+      ready,
+      '.self',
+      'activity.log',
+    );
+    expect(File(logFile).readAsStringSync(), contains('[start(成员)]'));
+    final Map<String, dynamic> read = await localFallback.readActivityLog(ready);
+    expect(read['log'], contains('[start(成员)]'));
   });
 
   test('寻址：未知目标 not_found；成员跨 TOP 被拒（cross_top_denied）', () async {
@@ -490,7 +639,14 @@ void main() {
       expect(result['hint'], contains('心跳丢失'));
 
       // 不静默：目标活动日志里有 [stale] 记录（用户/排障都看得见）
-      final String logFile = p.join(temp.path, ready, '.self', 'activity.log');
+      final String logFile = p.join(
+      temp.path,
+      ready,
+      '.tree',
+      ready,
+      '.self',
+      'activity.log',
+    );
       expect(File(logFile).readAsStringSync(), contains('[stale]'));
     });
 

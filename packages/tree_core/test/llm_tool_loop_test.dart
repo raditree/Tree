@@ -248,9 +248,14 @@ void main() {
     ).firstMatch(forModel.content);
     expect(match, isNotNull, reason: '提示里必须带上重定向文件的相对路径');
 
-    // 工作空间里真的有这份文件，且内容完整
+    // 工作空间里真的有这份文件（**按 agent 分栏**：`.self/…` → `.tree/<agent_id>/.self/…`），
+    // 且内容完整。
+    final String diskRelative = match!.group(0)!.replaceFirst(
+      '.self/',
+      '.tree/$agentId/.self/',
+    );
     final File redirect = File(
-      p.joinAll(<String>[workspace.path, ...match!.group(0)!.split('/')]),
+      p.joinAll(<String>[workspace.path, ...diskRelative.split('/')]),
     );
     expect(redirect.existsSync(), isTrue, reason: '重定向文件必须真写进工作空间');
     expect(redirect.readAsStringSync(), contains(big));
