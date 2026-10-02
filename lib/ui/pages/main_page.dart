@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:tree_protocol/tree_protocol.dart';
 
 import '../models/agent.dart';
@@ -10,6 +11,7 @@ import '../../io/platform_support.dart';
 import '../../io/ssh_executor_service.dart';
 import '../services/detail_selection.dart';
 import '../services/plugin_ui_registry.dart';
+import '../services/terminal_toggle_request.dart';
 import '../widgets/activity_bar_item.dart';
 import '../widgets/agent_list.dart';
 import '../widgets/create_agent_dialog.dart';
@@ -463,7 +465,27 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    // Ctrl+J 的**全局驿站**（2026-10-03 用户要求：焦点不在输入框时也要能唤起终端）。
+    //
+    // 为什么必须挂在三栏的**共同祖先**上：按键沿当前焦点向父级冒泡，而以前 Ctrl+J 只
+    // 挂在消息面板里（焦点本地）——焦点被文件面板 / 右栏 / 消息列表里的可选文本拿走之后，
+    // 按键再也冒不到那个节点，快捷键就失效了。canRequestFocus: false ⇒ 它只当事件驿站，
+    // 绝不抢焦点；真正切换终端的逻辑仍归消息面板（只有它知道终端开给哪个 agent）。
+    //
+    // 刻意不用 MaterialApp.shortcuts / 全局 HardwareKeyboard handler：那会把**对话框与
+    // 独立窗口**也算进来（在设置对话框里按 Ctrl+J 去开背后的终端没有意义）；挂在主页这
+    // 一层天然把路由排除在外——它们不在这棵焦点树里。
+    return CallbackShortcuts(
+      key: const ValueKey<String>('main-global-shortcuts'),
+      bindings: <ShortcutActivator, VoidCallback>{
+        const SingleActivator(LogicalKeyboardKey.keyJ, control: true):
+            TerminalToggleRequest.instance.request,
+      },
+      child: Focus(
+        canRequestFocus: false,
+        skipTraversal: true,
+        includeSemantics: false,
+        child: Scaffold(
       body: Column(
         children: <Widget>[
           Expanded(
@@ -490,6 +512,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             sessionId: _currentSessionId,
           ),
         ],
+      ),
+        ),
       ),
     );
   }

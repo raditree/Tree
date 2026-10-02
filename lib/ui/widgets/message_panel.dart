@@ -21,6 +21,7 @@ import '../services/message_replay_guard.dart';
 import '../services/plugin_ui_registry.dart';
 import '../services/session_rename.dart';
 import '../services/team_scope_view.dart';
+import '../services/terminal_toggle_request.dart';
 import 'message_input.dart';
 import 'message_list.dart';
 import 'plugin_ui_slots.dart';
@@ -183,6 +184,10 @@ class _MessagePanelState extends State<MessagePanel> {
   @override
   void initState() {
     super.initState();
+    // Ctrl+J 的**全局**唤起：焦点不在中栏时由 MainPage 的「事件驿站」广播过来
+    // （见 TerminalToggleRequest 的文档）。焦点在本面板里时走下面那层
+    // CallbackShortcuts——内层先消费按键，所以两条路不会重复切换。
+    TerminalToggleRequest.instance.addListener(_onTerminalToggleRequested);
     // Q12 插件布局：本面板的 WS 连接同时承载插件 UI 帧（manifest / update /
     // plugin_status 卸载），并作为 plugin_ui_action 的发送出口。
     PluginUiRegistry.instance.actionSender = _pluginActionSink;
@@ -1221,6 +1226,7 @@ class _MessagePanelState extends State<MessagePanel> {
     if (identical(PluginUiRegistry.instance.actionSender, _pluginActionSink)) {
       PluginUiRegistry.instance.actionSender = null;
     }
+    TerminalToggleRequest.instance.removeListener(_onTerminalToggleRequested);
     _webSocket.disconnect();
     super.dispose();
   }
@@ -1235,7 +1241,10 @@ class _MessagePanelState extends State<MessagePanel> {
     });
     final Agent? agent = widget.selectedAgent;
     // Ctrl+J：输入框那块整体换成集成终端（再按一次回来）。
-    // 用 CallbackShortcuts + autofocus 的 Focus：焦点在输入框里时按键会冒泡到这里；
+    // 两条入口，互补而不是重复（内层先消费按键，不会双重切换）：
+    // 1) 本面板这层 CallbackShortcuts + autofocus 的 Focus：焦点在中栏里时的最近一跳；
+    // 2) MainPage 的全局「事件驿站」→ TerminalToggleRequest：焦点在文件面板 / 右栏 /
+    //    消息列表这些**中栏之外**的地方时用（用户 2026-10-03 要求）；
     // 终端自己拿着焦点时由 TerminalPanel 自己处理（它要拦截几乎所有按键）。
     return CallbackShortcuts(
       bindings: <ShortcutActivator, VoidCallback>{
@@ -1315,6 +1324,15 @@ class _MessagePanelState extends State<MessagePanel> {
         ),
       ),
     );
+  }
+
+  /// 全局驿站转来的切换请求（焦点不在中栏时；见 [TerminalToggleRequest]）。
+  ///
+  /// 这里再判一次 mounted / 有没有 agent：请求是**广播**，面板可能已经卸载，
+  /// 或者当前根本没有选中的 agent（那时没有「对应工作区」可开终端）。
+  void _onTerminalToggleRequested() {
+    if (!mounted || widget.selectedAgent == null) return;
+    _toggleTerminal();
   }
 
   /// Ctrl+J：在「对话输入框」与「集成终端」之间切换。
