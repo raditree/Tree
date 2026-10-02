@@ -711,8 +711,18 @@ Test 团队（leader `agt_1790848305616_be41c9_3`，成员 Developer `member_179
 
 ## #11 源码编辑器（着色 / 编辑保存 / 分屏）的边界与取舍
 
+- **只编辑纯文本**：图片 / PDF / Office 这类复杂格式一律只读（写回去等于毁文件）；含 NUL 的二进制同样只读；
+  **被截断的大文件**也只读——保存等于把文件截短。三种拒因都在标题栏如实写出来，不是灰着不给点。
+- **分屏里同一个文件的第二个窗格强制只读**：两份缓冲各写各的，后保存的那次会把对方写的覆盖掉。
+- **外部改动靠 `if_size` 检测**：保存时带上"我读到的那份大小"，磁盘现值不符 ⇒ 409 ⇒ 让用户在
+  「覆盖保存（force）/ 放弃我的改动并刷新 / 取消」里选，绝不静默覆盖别人的改动。
+- **编码跟随工作空间 IO**：UTF-8 文件写 UTF-8；原本不是 UTF-8 的按原代码页写回，**绝不静默转码**
+  （宁可失败，也不把用户的 GBK 文件变成乱码）；新内容 > 1 MiB 时按 UTF-8。
+- **自动保存只有"失焦"与"离开"两种触发**（可在设置里关掉改成纯手动 Ctrl+S），**没有定时器**：
+  定时写入会打断正在输入的思路，而"每次按键都写盘"会把编辑器变成磁盘压力源。
+- 前端把"源码"这一档叫**代码视图**（着色 + 可编辑），"文本"那一档仍是只读的 `SelectableText`。
 
-
+## #12 集成终端（Ctrl+J）：PTY 平台层与远端（SSH）分支
 ### PTY 平台层的四个反直觉现象（真机踩出来的，都反直觉且都已修）
 
 1. **`LocalAlloc` 不清零会偶发崩**：`STARTUPINFOW` 用 `LMEM_FIXED`（不清零）分配时，`lpDesktop`/`dwFlags`
@@ -736,14 +746,14 @@ Test 团队（leader `agt_1790848305616_be41c9_3`，成员 Developer `member_179
   就是因为它）。所以"原始字节"指的是**我们这一层不解码、不清洗**——测试只断言"ESC 序列原样到达 +
   灌非法 UTF-8 不崩且会话继续可用"，没有断言非法字节逐字节重现。
 
-## #12 集成终端的远端（SSH）分支：真实边界与未验证项
+### 远端（SSH）分支：真实边界与未验证项
 
 **状态**：SSH 分支**已接线**（tree_local_exec 的 `SshShellChannel` + tree_core 的 `SshPtyAdapter`），
 但**只用假通道验证过**——本仓库没有可连的远端 sshd，真链路仍是空白。
 **影响**：Ctrl+J 的集成终端此前对**所有** SSH agent 一律回"暂不支持"；跟随团队 TOP SSH 的**成员**更糟：
 判据只看 `agent.sshConfig`，成员自己那份是空的 ⇒ 被当成"本机"，在**本机工作目录**里起一个终端。
 
-### 先前的错误结论（已推翻）
+#### 先前的错误结论（已推翻）
 
 旧口径写的是"SSH 通道只有一次性 exec，没有伪终端与流式会话"（`packages/tree_core/lib/src/terminal/`
 的注释与 README、`lib/README.md` 的不变量 14、`CHANGELOG`）。**这对协议本身是错的**：SSH 的 session
@@ -753,7 +763,7 @@ Test 团队（leader `agt_1790848305616_be41c9_3`，成员 Developer `member_179
 （本仓库此前没有 #12：这条旧结论只散在上面的几处注释/文档里，没有进本文件。这次把它**收进来并改写成真实
 边界**；`lib/README.md` 的不变量 14 属前端侧文档，按分工由协调者同步，本条目是权威口径。）
 
-### 现在的实现（判据与形状）
+#### 现在的实现（判据与形状）
 
 - 判据改成**有效 SSH**：`teamSshConfigFor(agent, store.agent) != null`（成员跟随团队 TOP 的 SSH）。
   本机 cwd 仍走 `files.rootFor(agent)`；远端分支的 cwd 由 `SshWorkspaceIO` 自己解决，核心不解析远端
@@ -768,7 +778,7 @@ Test 团队（leader `agt_1790848305616_be41c9_3`，成员 Developer `member_179
 - 远端工作目录：`SshWorkspaceIO.openShell` 把**自己的远端根**作为工作目录；`shell` 请求没有 cwd 参数，
   因此登录 shell 分支会写一行 `cd '<远端根>'`（**这行会被远端 shell 回显**，如实标注）。
 
-### 真实边界（远端 sshd 侧）
+#### 真实边界（远端 sshd 侧）
 
 - 远端 sshd 必须允许 `shell` / `pty-req`：`PermitTTY no` / 受限的 `ForceCommand` 会被
   `SSHChannelRequestError` 拒绝，我们把它包成可读的 `WorkspaceIoException`（终端回 `terminal_error`），
@@ -785,7 +795,7 @@ Test 团队（leader `agt_1790848305616_be41c9_3`，成员 Developer `member_179
 - `exitCode` 一定收口：远端退出 / 对端关会话 / 链路断开 / 我们主动 close，四条路径都给结果，拿不到退出
   状态时给 **-1**（与 `DartSshTransport.run` 的 `?? -1` 同口径）；`close()` 幂等。
 
-### 还没验证的（谁要做谁看）
+#### 还没验证的（谁要做谁看）
 
 - **没有真机 SSH 目标验证过**：`DartSshTransport.openShell` 一行都没在真 sshd 上跑过。现有覆盖是假通道
   契约单测（`packages/tree_local_exec/test/ssh_shell_channel_test.dart`）与假 starter 的终端服务单测
