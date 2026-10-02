@@ -862,16 +862,22 @@ class ApiService {
         .toList();
   }
 
-  /// 注册一个 MCP 服务（stdio 外接）
+  /// 注册一个 MCP 服务（stdio 子进程 / Streamable HTTP 单端点）
   ///
-  /// 调用 `POST /api/mcp/services`，请求体为
-  /// `{"name","command","args","scope","env"}`。`scope` 取
-  /// ``""``/``server``/``local``/``ssh``，空串表示按当前会话模式自动落点。
+  /// 调用 `POST /api/mcp/services`。`transport` 取 ``stdio``（缺省，兼容旧行为）或 ``http``：
+  /// - `stdio`：`command` / `args` / `env` 生效（本机子进程，逐行 JSON-RPC）；
+  /// - `http`：`url` / `headers` 生效（Streamable HTTP 单端点；`headers` 用于 `Authorization`
+  ///   之类的鉴权，与 `env` 同为 KEY=VALUE 文本编辑）。
+  ///
+  /// `scope` 取 ``""``/``server``/``local``/``ssh``，空串表示按当前会话模式自动落点。
   /// 网络异常或核心进程返回错误时抛出中文异常。
   static Future<Map<String, dynamic>> registerMcpService({
     required String name,
-    required String command,
+    String transport = 'stdio',
+    String command = '',
     List<String> args = const [],
+    String url = '',
+    Map<String, String> headers = const <String, String>{},
     String scope = '',
     Map<String, String> env = const <String, String>{},
   }) async {
@@ -879,8 +885,11 @@ class ApiService {
       '/api/mcp/services',
       body: {
         'name': name,
+        'transport': transport,
         'command': command,
         'args': args,
+        'url': url,
+        'headers': headers,
         'scope': scope,
         'env': env,
       },

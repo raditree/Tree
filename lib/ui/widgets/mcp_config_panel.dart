@@ -34,11 +34,25 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
   /// 是否展示注册表单
   bool _showForm = false;
 
+  /// 注册是否在进行中（进行中禁用按钮：否则用户会连点，一回来就弹好几条"注册成功"）。
+  bool _registering = false;
+
   /// 注册表单控制器
   final TextEditingController _nameController = TextEditingController();
   final TextEditingController _commandController = TextEditingController();
   final TextEditingController _argsController = TextEditingController();
   final TextEditingController _envController = TextEditingController();
+  final TextEditingController _urlController = TextEditingController();
+  final TextEditingController _headersController = TextEditingController();
+
+  /// 注册表单选中的传输：``stdio``（缺省）或 ``http``（Streamable HTTP 单端点）
+  String _transport = 'stdio';
+
+  /// 传输选项（值 -> 显示名）
+  static const Map<String, String> _transportLabels = <String, String>{
+    'stdio': 'stdio（本机子进程）',
+    'http': 'Streamable HTTP（单端点）',
+  };
 
   /// 注册表单选中的执行落点（""=自动，按当前会话模式）
   String _scope = '';
@@ -69,6 +83,8 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
     _commandController.dispose();
     _argsController.dispose();
     _envController.dispose();
+    _urlController.dispose();
+    _headersController.dispose();
     super.dispose();
   }
 
@@ -112,10 +128,23 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
 
   /// 注册新的 MCP 服务（随后对需确认的服务引导首次信任）
   Future<void> _register() async {
+    // 进行中直接忽略：否则用户等不及连点，每点一次都会在返回后弹一条"注册成功"
+    // （真机反馈：成功提示推了一次又一次）。
+    if (_registering) return;
     final String name = _nameController.text.trim();
+    final bool http = _transport == 'http';
     final String command = _commandController.text.trim();
-    if (name.isEmpty || command.isEmpty) {
-      _showSnackBar('请填写服务名称与命令');
+    final String url = _urlController.text.trim();
+    if (name.isEmpty) {
+      _showSnackBar('请填写服务名称');
+      return;
+    }
+    if (!http && command.isEmpty) {
+      _showSnackBar('请填写命令（stdio 传输）');
+      return;
+    }
+    if (http && url.isEmpty) {
+      _showSnackBar('请填写 URL（Streamable HTTP 传输）');
       return;
     }
     final List<String> args = _argsController.text
@@ -123,13 +152,24 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
         .split(RegExp(r'\s+'))
         .where((String e) => e.isNotEmpty)
         .toList();
-    final Map<String, String>? env = _parseEnv();
+    final Map<String, String>? env = _parseKeyValues(_envController, '环境变量');
     if (env == null) return;
+    final Map<String, String>? headers = _parseKeyValues(
+      _headersController,
+      '请求头',
+    );
+    if (headers == null) return;
+    setState(() {
+      _registering = true;
+    });
     try {
       await ApiService.registerMcpService(
         name: name,
+        transport: _transport,
         command: command,
         args: args,
+        url: url,
+        headers: headers,
         scope: _scope,
         env: env,
       );
@@ -139,6 +179,8 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
       _commandController.clear();
       _argsController.clear();
       _envController.clear();
+      _urlController.clear();
+      _headersController.clear();
       setState(() {
         _showForm = false;
       });
@@ -147,25 +189,34 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
     } catch (e) {
       if (!mounted) return;
       _showSnackBar('注册失败：$e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _registering = false;
+        });
+      }
     }
   }
 
-  /// 解析环境变量输入：每行一条 ``KEY=VALUE``。
+  /// 解析多行 ``KEY=VALUE`` 输入（环境变量 / 请求头共用）。
   ///
-  /// 空行忽略；非空行缺少 ``KEY=VALUE`` 形态时提示并放弃注册（不静默丢输入）。
-  Map<String, String>? _parseEnv() {
-    final Map<String, String> env = <String, String>{};
-    for (final String line in _envController.text.split('\n')) {
+  /// 空行忽略；非空行缺少 ``KEY=VALUE`` 形态时提示并放弃（不静默丢输入）。
+  Map<String, String>? _parseKeyValues(
+    TextEditingController controller,
+    String label,
+  ) {
+    final Map<String, String> out = <String, String>{};
+    for (final String line in controller.text.split('\n')) {
       final String trimmed = line.trim();
       if (trimmed.isEmpty) continue;
       final int idx = trimmed.indexOf('=');
       if (idx <= 0) {
-        _showSnackBar('环境变量格式应为 KEY=VALUE：$trimmed');
+        _showSnackBar('$label格式应为 KEY=VALUE：$trimmed');
         return null;
       }
-      env[trimmed.substring(0, idx).trim()] = trimmed.substring(idx + 1);
+      out[trimmed.substring(0, idx).trim()] = trimmed.substring(idx + 1);
     }
-    return env;
+    return out;
   }
 
   /// 待确认服务（非可信启动器）注册后立即引导用户确认信任。
@@ -365,7 +416,7 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  '点击右上角「添加服务」注册 stdio 外接服务',
+                  '点击右上角「添加服务」注册 MCP 服务（stdio 子进程 / Streamable HTTP）',
                   style: TextStyle(
                     fontSize: 12,
                     color: Theme.of(context).colorScheme.outline,
@@ -395,8 +446,12 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          const Text('注册 stdio MCP 服务',
-              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+          Text(
+            _transport == 'http'
+                ? '注册 Streamable HTTP MCP 服务'
+                : '注册 stdio MCP 服务',
+            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+          ),
           const SizedBox(height: 8),
           TextField(
             controller: _nameController,
@@ -408,25 +463,81 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
             ),
           ),
           const SizedBox(height: 8),
-          TextField(
-            controller: _commandController,
+          DropdownButtonFormField<String>(
+            initialValue: _transport,
+            isDense: true,
             decoration: const InputDecoration(
-              labelText: '命令',
-              hintText: '如 npx / python',
+              labelText: '传输',
               isDense: true,
               border: OutlineInputBorder(),
             ),
+            items: _transportLabels.entries
+                .map((MapEntry<String, String> e) =>
+                    DropdownMenuItem<String>(
+                      value: e.key,
+                      child: Text(e.value, style: const TextStyle(fontSize: 13)),
+                    ))
+                .toList(),
+            onChanged: (String? value) {
+              setState(() {
+                _transport = value ?? 'stdio';
+              });
+            },
           ),
           const SizedBox(height: 8),
-          TextField(
-            controller: _argsController,
-            decoration: const InputDecoration(
-              labelText: '参数（空格分隔，可选）',
-              hintText: '如 -y @modelcontextprotocol/server-filesystem',
-              isDense: true,
-              border: OutlineInputBorder(),
+          if (_transport == 'stdio') ...<Widget>[
+            TextField(
+              controller: _commandController,
+              decoration: const InputDecoration(
+                labelText: '命令',
+                hintText: '如 npx / python',
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
             ),
-          ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _argsController,
+              decoration: const InputDecoration(
+                labelText: '参数（空格分隔，可选）',
+                hintText: '如 -y @modelcontextprotocol/server-filesystem',
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _envController,
+              maxLines: 3,
+              decoration: const InputDecoration(
+                labelText: '环境变量（每行一条 KEY=VALUE，可选）',
+                hintText: '如 API_KEY=xxx',
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ] else ...<Widget>[
+            TextField(
+              controller: _urlController,
+              decoration: const InputDecoration(
+                labelText: 'URL（Streamable HTTP 单端点）',
+                hintText: '如 https://example.com/mcp',
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _headersController,
+              maxLines: 3,
+              decoration: const InputDecoration(
+                labelText: '请求头（每行一条 KEY=VALUE，可选）',
+                hintText: '如 Authorization=Bearer xxx',
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
           const SizedBox(height: 8),
           DropdownButtonFormField<String>(
             initialValue: _scope,
@@ -450,26 +561,16 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
             },
           ),
           const SizedBox(height: 8),
-          TextField(
-            controller: _envController,
-            maxLines: 3,
-            decoration: const InputDecoration(
-              labelText: '环境变量（每行一条 KEY=VALUE，可选）',
-              hintText: '如 API_KEY=xxx',
-              isDense: true,
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 8),
           Align(
             alignment: Alignment.centerRight,
             child: FilledButton(
-              onPressed: _register,
+              // 注册中禁用：否则连点会打出多次 POST，每次都弹一条"注册成功"
+              onPressed: _registering ? null : _register,
               style: FilledButton.styleFrom(
                 visualDensity: VisualDensity.compact,
                 padding: const EdgeInsets.symmetric(horizontal: 16),
               ),
-              child: const Text('注册'),
+              child: Text(_registering ? '注册中…' : '注册'),
             ),
           ),
         ],
@@ -482,6 +583,9 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
     final cs = Theme.of(context).colorScheme;
     final String name = service['name'] as String? ?? '';
     final String command = service['command'] as String? ?? '';
+    final String transport = service['transport'] as String? ?? 'stdio';
+    final String url = service['url'] as String? ?? '';
+    final bool isHttp = transport.toLowerCase() == 'http';
     final List<dynamic> rawArgs = service['args'] as List<dynamic>? ?? [];
     final String argsText =
         rawArgs.map((dynamic a) => a.toString()).join(' ');
@@ -553,11 +657,13 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  command.isNotEmpty
-                      ? (argsText.isNotEmpty
-                          ? '$command $argsText'
-                          : command)
-                      : '（未配置命令）',
+                  isHttp
+                      ? (url.isEmpty ? '（未配置 URL）' : url)
+                      : (command.isNotEmpty
+                          ? (argsText.isNotEmpty
+                              ? '$command $argsText'
+                              : command)
+                          : '（未配置命令）'),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
@@ -565,7 +671,8 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
                 if (!builtin) ...<Widget>[
                   const SizedBox(height: 2),
                   Text(
-                    '落点：${_scopeLabels[scope] ?? scope}'
+                    '传输：${isHttp ? 'Streamable HTTP' : 'stdio'}'
+                    ' · 落点：${_scopeLabels[scope] ?? scope}'
                     '${rawEnv.isEmpty ? '' : ' · 环境变量：${rawEnv.keys.join('、')}'}',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
