@@ -27,7 +27,7 @@
 5. **提示词按会话钉住**（key = `agentId|sessionId`）：只在会话初始化 / 压缩后 / 显式失效时重建；历史逐字复用 `toolArgumentsRaw` 与 `toolResultForModel`；**工具表每轮现取**（不进前缀，否则端点前缀缓存从这条起全部落空）。
 6. **压缩不删除任何消息**：只推进 `compactedMessageCount`；被总结的永远是历史的一个**前缀**；`compactedSummary` 与 `compactedContext` **互斥**（两条压缩路径的权威只能有一个）。
 7. **`.self` 只在一处翻译**（`PrivateWorkspaceIO`），且**终端命令不经过它** ⇒ 提示词必须把私有目录的**真实路径**写给模型。
-8. 提问三件事缺一不可：**先落盘再推帧**（进程被杀 / 重启后仍能列出待答）、**作答幂等**（WS 与 REST 可能同时到达，只有第一次生效）、**取消能打断**（等待中的工具立刻拿到 `cancelled`，工具循环因此收敛而不是永远挂着）。
+8. 提问四件事缺一不可：**先落盘再推帧**（进程被杀 / 重启后仍能列出待答）、**作答幂等**（WS 与 REST 可能同时到达，只有第一次生效）、**取消能打断**（等待中的工具立刻拿到 `cancelled`，工具循环因此收敛而不是永远挂着）、**`createdAt` 严格递增**（`add` 把它抬成"全库严格递增"，与消息时间戳同一条规则、共用 `store/tree_store.dart` 的 `monotonicStamp`）：`GET /api/questions` 按 `created_at` 降序，而 Dart 的 `List.sort` **不保证稳定**——同毫秒的两条提问会在两次请求之间换位置（用户看到右栏"最新的排前面"偶发漂移）。**装载旧文件只读不改**：旧数据里的平局不去追改用户数据。
 9. 提示词在**两处**被拼装（会话生成 + 压缩估算），两处必须看到**逐字一致**的字符串 ⇒ 一律用 provider 接线，不做参数副本。
 
 ## 依赖方向
@@ -42,6 +42,7 @@ cd packages/tree_core
 dart test test/conversation_segments_test.dart test/conversation_stream_seq_test.dart \
           test/message_interrupt_test.dart test/system_prompt_pin_test.dart \
           test/compaction_test.dart test/question_broker_test.dart \
+          test/question_store_test.dart \
           test/private_workspace_io_test.dart test/workspace_prompt_test.dart
 ```
 

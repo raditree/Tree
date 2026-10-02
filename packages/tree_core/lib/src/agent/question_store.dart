@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import '../store/atomic_file.dart';
 import '../store/tree_paths.dart';
+import '../store/tree_store.dart';
 import '../store/write_queue.dart';
 import '../util/ids.dart';
 
@@ -18,6 +19,18 @@ abstract final class QuestionStatus {
 
   /// 全部取值。
   static const List<String> all = <String>[pending, answered, cancelled];
+}
+
+/// 下一条提问要用的时间戳：把 [requested] 抬成"全库严格递增"（见 [monotonicStamp]）。
+///
+/// 用**全库最大值**而不是"列表最后一条"：[removeForAgent] 会摘掉记录，尾部可能比中段
+/// 更旧；"任意排序下都不出现平局"这件事由最大值直接保证。
+int _nextQuestionStamp(List<QuestionRecord> records, int requested) {
+  int previous = 0;
+  for (final QuestionRecord record in records) {
+    if (record.createdAt > previous) previous = record.createdAt;
+  }
+  return monotonicStamp(requested, previous);
 }
 
 /// 一条提问记录（`ask_user_question` 工具产出）。
@@ -68,7 +81,12 @@ class QuestionRecord {
   /// [QuestionStatus] 之一。
   String status;
 
-  final int createdAt;
+  /// 提问时间（毫秒）。
+  ///
+  /// **不是 final**：[QuestionStore.add] 在落库时把它抬成"全库严格递增"
+  /// （见 [monotonicStamp]）——同毫秒的两条提问在按时间排序的列表里会重排，
+  /// 而 Dart 的 `List.sort` 不保证稳定。与 [CoreMessage.timestamp] 同一条规则。
+  int createdAt;
 
   /// 作答/取消时间（毫秒；未收尾为 0）。
   int answeredAt;
@@ -149,6 +167,11 @@ class QuestionRecord {
 /// 提问存储契约（内存实现与落盘实现由同一套契约测试双向约束）。
 abstract interface class QuestionStore {
   /// 新增一条提问（同时写入缓存与落盘队列）。
+  ///
+  /// **单调序号（契约）**：实现必须把 `createdAt` 抬成"全库严格递增"
+  /// （见 [monotonicStamp]）——两次提问落在同一毫秒时，`GET /api/questions` 的
+  /// "最新的排前面"就是任意的（`List.sort` 不保证稳定），用户看到右栏顺序偶发漂移。
+  /// **已装载的历史记录不改写**：`load()` 原样读入，旧文件里的平局不去追改用户数据。
   QuestionRecord add(QuestionRecord record);
 
   /// 按 id 取；不存在返回 null。
@@ -189,6 +212,7 @@ class MemoryQuestionStore implements QuestionStore {
 
   @override
   QuestionRecord add(QuestionRecord record) {
+    record.createdAt = _nextQuestionStamp(_records, record.createdAt);
     _records.add(record);
     return record;
   }
@@ -294,6 +318,7 @@ class FileQuestionStore implements QuestionStore {
 
   @override
   QuestionRecord add(QuestionRecord record) {
+    record.createdAt = _nextQuestionStamp(_records, record.createdAt);
     _records.add(record);
     _persist();
     return record;

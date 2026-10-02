@@ -41,6 +41,10 @@
   一律推迟到该批结果之后——工具结果逐条落库（远端 SSH 上的慢工具尤其容易让注入卡在两条之间），
   就地发会把批切成"后半批没有 `reasoning_content`"，请求随即变成"以 tool 结果收尾、前面那条
   `tool_calls` 没有 reasoning"⇒ 端点 400。
+- **提问的 `createdAt` 严格递增**（[agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 8）：
+  `QuestionStore.add` 把提问时间抬成"全库严格递增"（与消息时间戳同一条规则，共用 `monotonicStamp`）——
+  否则同一毫秒的两条在 `GET /api/questions` 的"最新的排前面"里顺序漂移（`List.sort` 不保证稳定）；
+  装载旧文件只读不改，不追改用户数据。
 - **grep 的三个数字各管一件事**（[tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 7）：
   `scannedFileCount` 是计数、`scannedFilePaths` 只留 20 条抽样、`GrepQuery.maxResults`（默认 200）是命中行数上限。
 - **成员与 leader 共享工作目录与 SSH、私有状态按 agent 分栏**（[team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 2/3/4）：

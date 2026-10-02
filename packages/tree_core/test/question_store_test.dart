@@ -49,6 +49,27 @@ void main() {
         ]);
       });
 
+      test('createdAt 单调递增：同毫秒的连续两条不漂移（"最新的排前面"必须确定）', () {
+        // 真机现场：`GET /api/questions` 按 `created_at` 降序，而 Dart 的 `List.sort`
+        // 不保证稳定 —— 两条提问落在同一毫秒时，"最新的一条"在两次请求之间会换位置
+        // （`questions_api_test` 全量跑约 3 次红 1 次）。
+        const int now = 1700000000000;
+        store.add(record(qid: 'q_a', createdAt: now));
+        store.add(record(qid: 'q_b', createdAt: now));
+        expect(store.byId('q_a')!.createdAt, now, reason: '第一条原样保留（绝不伪造时刻）');
+        expect(
+          store.byId('q_b')!.createdAt,
+          now + 1,
+          reason: '同毫秒的第二条抬 1ms：把落库顺序压进时间戳，顺序就与排序实现无关',
+        );
+        final List<QuestionRecord> desc = List<QuestionRecord>.of(store.list())
+          ..sort(
+            (QuestionRecord a, QuestionRecord b) =>
+                b.createdAt.compareTo(a.createdAt),
+          );
+        expect(desc.first.qid, 'q_b', reason: '按时间倒序取"最新" = 最后提出的那条');
+      });
+
       test('作答只对 pending 生效，且第二次作答不再改变状态', () {
         store.add(record());
         final QuestionRecord? first = store.markAnswered('q_1', 'A');
@@ -157,6 +178,40 @@ void main() {
     expect(second.byId('q_1')?.answer, '是');
     expect(second.byId('q_1')?.options, <String>['是', '否']);
     expect(second.byId('q_2')?.isPending, isTrue);
+  });
+
+  test('FileQuestionStore：旧文件里同毫秒的两条原样读入（不追改用户数据）', () async {
+    final TreePaths paths = TreePaths(temp.path);
+    Map<String, dynamic> legacy(String qid, String question, int at) =>
+        <String, dynamic>{
+          'qid': qid,
+          'agent_id': 'agt_1',
+          'team_id': '',
+          'session_id': 'ses_1',
+          'is_member': false,
+          'question': question,
+          'options': <String>[],
+          'answer': '',
+          'status': QuestionStatus.pending,
+          'created_at': at,
+          'answered_at': 0,
+        };
+    File(paths.questionsFile)
+      ..createSync(recursive: true)
+      ..writeAsStringSync(
+        jsonEncode(<Map<String, dynamic>>[legacy('q_a', '第一条', 500), legacy('q_b', '第二条', 500)]),
+      );
+    final FileQuestionStore store = FileQuestionStore(paths);
+    expect(
+      store.list().map((QuestionRecord r) => r.qid),
+      <String>['q_a', 'q_b'],
+      reason: '装载顺序 = 文件顺序',
+    );
+    expect(
+      store.list().map((QuestionRecord r) => r.createdAt),
+      <int>[500, 500],
+      reason: '时间戳是用户数据的真实时刻：装载只读不改（旧平局不去追改）',
+    );
   });
 
   test('FileQuestionStore：文件被手改坏时不阻止启动（按空表处理）', () async {

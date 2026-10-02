@@ -249,7 +249,7 @@ class MemoryStore implements TreeStore {
     );
     // 单调序号（Q3）：同毫秒的多条消息在"按时间戳排序"的历史接口里会重排
     // （`List.sort` 不保证稳定），把落库顺序直接压进时间戳就不会漂移。
-    message.timestamp = monotonicMessageStamp(
+    message.timestamp = monotonicStamp(
       message.timestamp,
       list.isEmpty ? 0 : list.last.timestamp,
     );

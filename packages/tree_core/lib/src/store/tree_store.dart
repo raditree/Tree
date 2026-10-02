@@ -2,11 +2,16 @@ import 'records.dart';
 
 export 'records.dart';
 
-/// 消息时间戳的**单调序号**（Q3，见 [TreeStore.appendMessage]）。
+/// 落库时间戳的**单调序号**：消息（见 [TreeStore.appendMessage]）与提问
+/// （见 `agent/question_store.dart` 的 `QuestionStore.add`）共用同一条规则。
 ///
 /// [requested] 已经晚于上一条时原样保留（绝不伪造时间）；否则取"上一条 + 1ms"。
 /// 因此它只把**同值/更旧**的抬成严格递增，不会把时间戳推离真实时刻。
-int monotonicMessageStamp(int requested, int previous) =>
+///
+/// 为什么必须有：列表接口按时间戳排序，而 Dart 的 `List.sort` **不保证稳定**——
+/// 同毫秒的两条记录会在两次请求之间换位置（真机表现：`GET /api/questions` 偶发把
+/// "最新的一条"排到后面；消息那边则是历史重载顺序漂移）。
+int monotonicStamp(int requested, int previous) =>
     requested > previous ? requested : previous + 1;
 
 /// 核心进程的存储契约（agent / 会话 / 消息）。
@@ -136,7 +141,7 @@ abstract interface class TreeStore {
   /// 追加一条消息（同时更新所属会话与 agent 的 `updated_at`）。
   ///
   /// **单调序号（Q3）**：实现必须把消息时间戳抬成"同一 (agent, session) 内严格
-  /// 递增"（见 [monotonicMessageStamp]）。理由是一轮回复里的多条消息——思考段、
+  /// 递增"（见 [monotonicStamp]）。理由是一轮回复里的多条消息——思考段、
   /// 中间正文、工具卡片、最终回复——常常落在同一毫秒，而历史接口
   /// （`GET /api/conversations`）会**按时间戳排序**，Dart 的 `List.sort` 又不
   /// 保证稳定：同值时间戳会让重载顺序漂移。让"落库顺序"直接体现在时间戳上，
