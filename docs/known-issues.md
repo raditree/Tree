@@ -331,3 +331,35 @@ desktop 移植时只搬了解析（显示思考卡片），**没搬回写**：�
 - 全量：`tree_core` 719 通过 / 1 跳过，前端 170 通过，`tree_protocol` 29 通过，三处 analyze 零 issue。
   （`-j 4` 并发跑时 `message_interrupt_test` / `questions_api_test` 各有 1 例假失败，单独跑与默认并发全量均通过——属并发压测下的既知抖动，非本次改动引入。）
 
+---
+
+## #MCP 服务「首次信任确认」是死链（`needs_confirmation` 从未下发）
+
+**状态**：**未处理**（2026-10-02 记录；用户口径：与 MCP 传输/懒连接那次改动分开，另开任务）。
+**影响**：MCP 面板上"非可信启动器注册的服务需用户确认后再启动"这条安全链路**完全不生效**——
+不会提示、不会拒绝启动，`McpTrustStore` 里存的口令也没人读。
+
+### 现象
+
+- 面板代码读取 `service['needs_confirmation']`，但核心从不返回该字段 ⇒ 恒为 `false`
+  ⇒ `_confirmTrustIfNeeded()` 直接 return，`_promptTrust()` / 徽标永不出现。
+- `McpTrustStore.checkLaunch(...)`（"宿主侧据此拒绝启动"的判定）**没有任何生产调用点**，只有单测在调。
+
+### 根因与证据
+
+- 核心全仓 grep `needs_confirmation` **0 命中**（`packages/tree_core`、`packages/tree_core_cli`）：
+  `McpServerConfig.toApiJson()` 只给 name/transport/command/args/url/headers/builtin/enabled/scope。
+- `lib/io/mcp_trust_store.dart` 只有定义与测试引用：`grep checkLaunch|isTrusted lib` 的命中全在
+  `mcp_trust_store.dart` 自身与 `mcp_config_panel.dart` 的展示态计算。
+- 信任结果存在**前端本地**（SharedPreferences），而"拒绝启动"必须发生在**核心**——两者之间没有通道：
+  这是 M6a 留下的设计缺口（不是实现 bug）。
+
+### 修复方向（待定夺）
+
+1. 判定：由核心计算 `needs_confirmation`（需先定口径：所有 stdio 服务首次都要确认 / 仅非白名单启动器 /
+   仅非面板渠道注册的服务）；
+2. 存放：确认结果落到**核心侧**（`mcp.yaml` 该条目加 `trusted`），否则核心无从"拒绝启动"；
+3. 执行：`McpService._connect` 前检查，未受信 ⇒ 拒绝连接 + 可读错误（文案沿用 `checkLaunch` 的语义），
+   面板一键确认（新增 REST 动作或复用 POST 注册带 `trusted`）；
+4. HTTP 传输不执行本地命令 ⇒ 不参与该流程。
+

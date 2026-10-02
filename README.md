@@ -155,7 +155,7 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 - **M6b**：插件总线 + 进程外插件宿主（`config/plugins.yaml`、`plugin__<id>__<tool>` 原生工具、事件分发、心跳巡检、快照 REST）
 - **M6c**：插件 WS 增量（`plugin_status` 注册/停用/健康度、`plugin_event` 插件通知）
   - 说明：当时"处理站（stations，插件间订阅路由）"未在桌面端实现，快照里的 `stations` 恒为空数组；**M9 Q11 已补齐站点体系**（广播站 / 执行站 / 中转站 + 新增收集站），`stations` 现在返回真实站点实例与订阅
-- **M6a**：MCP（stdio JSON-RPC 客户端 + `mcp` 工具 + 已就绪 MCP 工具的原生注入 + 服务注册 REST）
+- **M6a**：MCP（stdio JSON-RPC 客户端 + `mcp` 工具 + 已就绪 MCP 工具的原生注入 + 服务注册 REST；**2026-10-02 起另加 Streamable HTTP 传输 + 懒连接**，见「MCP」段）
 - **M7a**：打包（`dart run tool/build_core.dart` → 单文件 `tree_core.exe`；`TREE_CORE_EXE` 门控的真可执行文件冒烟测试：握手 → HTTP 鉴权 → shutdown 优雅退出）
 - **M7b**：删除 `server/`（服务端 Python 整体移除）；完备性门禁从"扫 Python 源码"改为"扫本仓库源码"；README 改写为桌面架构
 - **M7d-1**：工作空间文件服务（目录树 / 文件内容 / PDF 基本信息 / Git 历史与分支；路径安全边界 + 可读错误）
@@ -211,7 +211,7 @@ cd packages\tree_core_cli; dart test test/binary_smoke_test.dart
 
 - **提问回路**：提问落盘 `data/questions.json` → 前端卡片 → 作答幂等 → 继续生成；`stop` 取消在途提问；重启后的补答会写回会话。
 - **Spec 与会话状态**：Spec **索引注入系统提示词**（行格式 `- <id> [task_type] 标题（内置）（适用: when 摘要）`，id 用反引号包裹；默认全列、>50 条截断并注明「其余可用 `spec select` 直取」），模型直接 `spec select` 拿全文——M9 Q9 删除了 `search` / `list` / `read` 与"先 read 再 select"约束；每次工具结果前注入"当前 in_progress todo + 已选 Spec"，模型不会忘记约定。
-- **MCP**：`config/mcp.yaml` 注册 stdio 服务，工具以 `mcp__<服务>__<工具>` 原生注入模型工具列表；服务不可用只影响自己（可读错误 + 重连一次）。
+- **MCP**：`config/mcp.yaml` 注册 MCP 服务，工具以 `mcp__<服务>__<工具>` 原生注入模型工具列表；服务不可用只影响自己（可读错误 + 懒重连）。**（**2026-10-02**：① 两种传输——`transport: stdio`（缺省，本机子进程、行分隔 JSON-RPC）与 `transport: http`（**Streamable HTTP 单端点**：POST + `Accept: application/json, text/event-stream`，响应可为 JSON 或 SSE 流；会话走 `Mcp-Session-Id`、关闭时尽力 `DELETE`；`url` + `headers`（自定义鉴权头）配置，不做旧的双端点 HTTP+SSE、不内置 OAuth）；② **连接策略改为懒连接**——启动仍全量连一次（保工具表完整），**注册只连它自己**（旧实现每次注册都 `refresh(force: true)` 全量重连，是"点注册很久没反应"的根因），其余时刻"用到才连"（`ensureConnected`，工具调用命中未连接服务时补连），失败带 30s 退避；`mcp` 工具的 `help` 不再阻塞式重连（列已知工具 + 明确列出未连接/有错误的服务 + 后台补连）。）
 - **插件**：`config/plugins.yaml` 注册进程外插件，工具以 `plugin__<插件>__<工具>` 注入；事件总线（按 scope 四元组过滤）+ 心跳巡检 + `plugin_status` / `plugin_event` 增量；心跳连续丢失只标 **degraded**（插件面板橙色「心跳降级」角标 + 丢失拍数/判活窗口），**不杀进程**，恢复即自动清除。插件可经声明式槽位（活动栏 / 右栏 Tab / 状态栏 / 消息流卡片）出界面，也可经**收集站**申报自己的工具定义。
 - **站点体系（M9 Q11 + 点位化）**：四种类型——广播站 / 执行站 / 中转站 / **收集站**（一对多收集、不回填）。**每个接入点（点位）是一个独立的持久化实例**：广播 3（通用主题 + 工具前/后）、执行 7（按命令族：fs / terminal / agent / ui / llm / tool / session）、中转 6（工具前 / 工具后 / **LLM 处理接管** / **投入 LLM 前改写** / **上下文压缩** / **系统提示词构造**）、收集 1，共 17 个 id（`system.broadcast[.tool.pre|.tool.post]`、`system.execute.<族>`、`system.relay.<点位>`、`plugin.tool.define`）。**id 不含 team / mode**（不按 team / mode 复制）：team / agent / session / mode 是**每次交互携带的四元组 scope** `(team_id, agent_id, session_id, mode_key)`，投递时按「消息 ↔ 订阅者」匹配——**订阅侧空 = 通配**（空 team 作用于所有 team、空 mode 两种工作面都收），**消息侧空 = 不可证明归属 ⇒ 不投递**（fail-closed）。**每个中转点位全局只允许一个订阅者**：需要按团队分开处理时，由该订阅者自己转发（在插件内再建站点分发），而不是重复订阅。无订阅者 / 未回填 / 回包非法一律 **fail-open 回退系统默认**（LLM 处理 / 压缩 / 提示词构造都因此"不装插件时行为逐字不变"）。
 - **数据都在用户能直接看的地方**：`~/.tree` 下的 yaml / jsonl / 快照，可手改。
