@@ -466,7 +466,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         index: _mobileTab,
         children: [
           AgentList(
-            agents: _topAgents,
+            agents: _railAgents,
             onAgentSelected: (Agent agent) {
               setState(() {
                 _selectedAgent = agent;
@@ -1096,18 +1096,17 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     );
   }
 
-  /// 左栏 Agent 列表的数据源：**只列顶层 agent（团队根）**。
+  /// 左栏 Agent 列表的数据源：**全部 agent（顶层 + 团队成员）**。
   ///
   /// 团队成员也是独立 agent 文件（`parent_agent_id` 指向直属上级、`team_id` 指向 TOP），
-  /// 因此 `GET /api/agents` 会一并返回。它们**不是**用户可以直接聊的顶层 agent：入口是
-  /// 「团队 → 成员」工作进度窗口；列在这里会让人以为可以各聊各的（2026-10-02 用户定夺：
-  /// 成员不独立为 agent）。判据用 doc 化的"团队归属为空 = 顶层 agent"（见 Agent.teamId）。
+  /// `GET /api/agents` 会一并返回——**它们照常列在这里**（2026-10-02 定夺：先判"成员不独立
+  /// 出现在左栏"，同日二改为**允许出现**）。点开成员就是它自己的会话，与顶层 agent 同一条通路，
+  /// 顺序口径见 [railAgentsOf]。
   ///
-  /// 只有**左栏列表**过滤，[_agents] 本身保持完整：按 id 找 agent（提问导航、执行器注册、
-  /// 删除）仍要能找到成员。
-  List<Agent> get _topAgents => _agents
-      .where((Agent a) => a.teamId.isEmpty)
-      .toList(growable: false);
+  /// **其余口径不变**：成员的工具根 / 系统提示词 / 文件面板仍解析到 leader 的工作目录与 SSH
+  /// （`teamWorkspaceFor`，"复用 leader 工作区"没动），插件作用域仍按 `teamScopeId` 回指
+  /// 团队；团队拓扑与成员进度仍看 teammates 窗口（只是不再是**唯一**入口）。
+  List<Agent> get _railAgents => railAgentsOf(_agents);
 
   /// 构建左栏 Agent 列表面板
   ///
@@ -1122,7 +1121,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
           // Agent 列表
           Expanded(
             child: AgentList(
-              agents: _topAgents,
+              agents: _railAgents,
               onAgentSelected: (Agent agent) {
                 setState(() {
                   _selectedAgent = agent;
@@ -1321,6 +1320,32 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       ),
     );
   }
+}
+
+/// 左栏 Agent 列表的顺序：**顶层 agent 在前（保持接口顺序），成员紧跟各自的 TOP**。
+///
+/// 为什么这样排（而不是直接按接口顺序混排）：列表里现在同时有"团队根"和"成员"，混排
+/// 看不出谁属于谁；把成员紧跟它的 TOP，既能一眼看出团队，也不打乱顶层之间的相对顺序
+/// （接口按最近活跃倒序返回）。
+///
+/// 兜底：`team_id` 指向的 TOP 不在列表里时（TOP 被删 / 只加载到一部分），成员照样列在
+/// 末尾——**绝不因为"找不到根"就让某个 agent 从列表里消失**。
+List<Agent> railAgentsOf(List<Agent> agents) {
+  final List<Agent> ordered = <Agent>[];
+  final Set<String> placed = <String>{};
+  for (final Agent top in agents) {
+    if (top.teamId.isNotEmpty) continue;
+    ordered.add(top);
+    placed.add(top.id);
+    for (final Agent member in agents) {
+      if (member.teamId != top.id || !placed.add(member.id)) continue;
+      ordered.add(member);
+    }
+  }
+  for (final Agent agent in agents) {
+    if (placed.add(agent.id)) ordered.add(agent);
+  }
+  return ordered;
 }
 
 /// 可拖拽的分隔条组件

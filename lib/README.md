@@ -13,7 +13,7 @@
 | [io/api_service.dart](io/api_service.dart) | 全部 REST 端点的封装（唯一出网口） |
 | [io/websocket_service.dart](io/websocket_service.dart) | WS 连接与重连、**10s 心跳**、帧分发 |
 | [io/local_executor_service.dart](io/local_executor_service.dart) · [io/ssh_executor_service.dart](io/ssh_executor_service.dart) | per-team 执行模式配置（local/ssh 的读写与注册）；命令本身由核心执行 |
-| [ui/pages/main_page.dart](ui/pages/main_page.dart) | 三栏骨架、agent 列表（只列顶层 agent）、会话切换、插件槽位作用域 |
+| [ui/pages/main_page.dart](ui/pages/main_page.dart) | 三栏骨架、agent 列表（顶层 agent + 团队成员）、会话切换、插件槽位作用域 |
 | [ui/widgets/message_panel.dart](ui/widgets/message_panel.dart) | 中栏消息流：分段渲染、工具卡片、提问卡片、断线重播去重、按 agent+会话过滤 |
 | [ui/widgets/teammates_window_page.dart](ui/widgets/teammates_window_page.dart) | 团队成员拓扑与成员工作进度窗口 |
 | [ui/widgets/](ui/widgets/) | 文件面板 / 查看器 / PDF 预览、Spec、待办、提问、插件、MCP、模型信息、Git 历史、设置页 |
@@ -27,7 +27,12 @@
 3. **重播去重**：断线重连后的重播帧必须按消息 id + 流式序号判掉，不得重复渲染。
 4. 协议常量从 `package:tree_protocol` 取，不写字面量。
 5. 密钥只读不显（模型面板走字段白名单）；日志不打印 token。
-6. 左栏只列顶层 agent（`team_id` 为空）；成员入口是 teammates 窗口。
+6. 左栏列出**全部 agent（顶层 + 团队成员）**（[ui/pages/main_page.dart](ui/pages/main_page.dart) 的
+   `_railAgents` + `railAgentsOf`）：成员也是独立 agent 文件（`team_id` 指向 TOP），点开就是它自己的
+   会话，与顶层 agent 同一条通路。顺序 = 顶层在前（保持接口顺序）＋ 成员紧跟各自的 TOP，
+   `team_id` 指向的 TOP 不在列表里时兜底列在末尾——**绝不因为"找不到根"丢掉一个 agent**。
+   **成员其余口径不变**：工具根 / 系统提示词 / 文件面板仍解析到 leader 的工作目录与 SSH（`teamWorkspaceFor`），
+   插件作用域仍按 `teamScopeId` 回指团队，团队拓扑与成员进度仍看 teammates 窗口（不再是唯一入口）。
 7. **关闭按钮默认不是退出**：`window_manager.setPreventClose(true)` 拦下 WM_CLOSE，改成隐藏窗口到系统托盘
    （核心与在跑的任务继续）；真正的退出只有两条明确路径——托盘菜单「退出 Tree」与设置页的退出按钮，
    两条都走 `TrayService.quit()`（先 `CoreProcessLauncher.stop()` 让核心优雅退出，再销毁窗口；实测关窗到

@@ -49,6 +49,10 @@
   `scannedFileCount` 是计数、`scannedFilePaths` 只留 20 条抽样、`GrepQuery.maxResults`（默认 200）是命中行数上限。
 - **成员与 leader 共享工作目录与 SSH、私有状态按 agent 分栏**（[team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 2/3/4）：
   成员 yaml 里的 `workspace_dir` **不生效**、`ssh:` 缺省取 TOP 的、`.self` 落在 `.tree/<agent_id>/`。
+- **左栏列出全部 agent（含团队成员）**（[lib/README.md](lib/README.md) 不变量 6、[docs/team.md](docs/team.md) §7）：
+  成员也是独立 agent 文件，点开就是它自己的会话；顺序 = 顶层在前（保持接口顺序）＋ 成员紧跟各自的
+  TOP，`team_id` 指向的 TOP 不在列表里时兜底列在末尾。**成员其余口径不变**：工具根 / 系统提示词 /
+  文件面板仍解析到 leader 的工作目录与 SSH，插件作用域仍按 `teamScopeId` 回指团队。
 
 ### Added（首个版本总览）
 

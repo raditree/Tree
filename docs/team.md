@@ -71,13 +71,16 @@
 
 ## 7. 界面入口
 
-- **左栏 agent 列表只列顶层 agent**（`team_id` 为空）；成员不在这里，入口是
-  「选中 leader → 团队（teammates）→ 点成员」的工作进度窗口。
+- **左栏 agent 列表列出全部 agent（含成员）**：`team_id` 指向 TOP 的成员紧跟它的 TOP 之后
+  （`railAgentsOf`，找不到 TOP 的兜底列在末尾）；选中成员就是它自己的会话，与顶层 agent 同一条通路。
+  **2026-10-02 二改**：此前判"成员不独立出现在左栏"，同日改为允许出现——「选中 leader → 团队（teammates）
+  → 点成员」仍是看团队拓扑与成员进度的入口，只是不再是唯一入口。成员的**工作目录 / SSH 仍复用 leader 的**（见 §8）。
 - 未就绪成员会在 leader 上显示红点（`pending_member_count`），点击进「模型配置」赋模型并审核。
 
 ## 8. 已知取舍
 
-- `GET /api/agents` 仍返回**全部** agent（含成员）：提问归因、提问导航要按 id 找成员；过滤只发生在前端列表。
+- `GET /api/agents` 返回**全部** agent（含成员）：左栏照单全收（`railAgentsOf` 只决定顺序、不再过滤，见 §7）；
+  提问归因、提问导航也按 id 找成员。
 - 成员的 `workspace_id` 仍是独立的（避免 `FileService.agentFor` 把 leader 的 workspace 解析成成员，
   那会让 SSH 团队的远端文件面板错落到成员的本机目录）；共享的是**目录**，不是这个 id。
 - 成员继承 SSH 后，它们的**本地**活动日志 / 文件投递不适用（工作空间在远端）——日志改走远端 IO（见 §6）。

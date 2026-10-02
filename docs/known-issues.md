@@ -689,9 +689,10 @@ Test 团队（leader `agt_1790848305616_be41c9_3`，成员 Developer `member_179
    以及系统提示词里的 `teamWorkspaceProvider`（接线在 `CoreServer.start`，`close` 时按身份解绑）。
    TOP 自身 owner == 自己 ⇒ **既有 agent 的工具根与提示词字节完全不变**（不碰前缀缓存）。
    旧成员无需迁移：它是 `workspace_dir: ""`，解析时自然跟到 TOP。
-4. **成员不再作为独立 agent 出现在左栏**（`lib/ui/pages/main_page.dart`）：列表只喂
-   `_topAgents`（`teamId` 为空的才是顶层 agent，见 `Agent.teamId` 的文档口径）；`_agents` 本身保持完整，
-   按 id 找 agent（提问导航 / 执行器注册 / 删除）仍能找到成员。成员的入口是「团队 → 成员」工作进度窗口。
+4. **成员在左栏的可见性（同日二改）**：先判"成员不独立出现在左栏"（列表只喂 `teamId` 为空的顶层
+   agent），同日**二改为允许出现**——左栏列出全部 agent，`railAgentsOf` 只决定顺序（顶层在前、成员紧跟
+   它的 TOP，找不到 TOP 的兜底列在末尾），不再过滤；`_agents` 本来就完整，按 id 找 agent（提问导航 /
+   执行器注册 / 删除）不受影响。其余口径不变：成员仍复用 leader 的工作目录与 SSH（见第 3 条）。
 5. **移除「消息切入设置」**：`ApiPaths.settingsMessageCutin` 常量、`CoreSettings.messageCutinDirect`
    （字段 / getter / setter / applyMap / toMap / extra 白名单）、`core_server` 的
    `GET|POST /api/settings/message-cutin` 两个端点与 `_getMessageCutin`/`_setMessageCutin`、
