@@ -191,6 +191,11 @@ abstract interface class QuestionStore {
   });
 
   /// 删除某 agent 的全部提问（删除 agent 时调用），返回删除条数。
+  ///
+  /// **只摘记录、不负责收尾在途等待**：正在等答案的工具靠
+  /// `QuestionBroker` 的 completer 挂着，调用方必须先经 broker 取消
+  /// （`cancelForAgent`）再删记录，否则那一轮永远收不了尾（见
+  /// `QuestionBroker.cancel` 的不变量）。
   int removeForAgent(String agentId);
 
   /// 等待全部在途落盘（关停与测试必须调用）。

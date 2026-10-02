@@ -146,6 +146,29 @@ void main() {
     expect(restarted.inFlightCount, 0);
   });
 
+  test('记录被摘掉（删除 agent）后 cancel 仍收尾在途等待', () async {
+    final Future<QuestionOutcome> pending = broker.ask(request());
+    final String qid = questions.list().single.qid;
+    // 删除 agent 的动作就是把记录直接摘掉（QuestionStore.removeForAgent）
+    expect(questions.removeForAgent(agent.id), 1);
+    expect(broker.inFlightCount, 1, reason: '摘记录本身不会收尾在途等待');
+
+    // 硬化后的 cancel：记录没了也照样完成 completer（否则那一轮永远挂着）
+    expect(broker.cancel(qid, reason: 'agent 已删除'), isTrue);
+    expect((await pending).cancelled, isTrue);
+    expect(broker.inFlightCount, 0);
+    expect(broker.cancel(qid), isFalse, reason: '已经没有可收尾的了');
+  });
+
+  test('cancelForAgent 按 store 的 pending 列表遍历：记录摘掉后它救不回来', () async {
+    final Future<QuestionOutcome> pending = broker.ask(request());
+    questions.removeForAgent(agent.id);
+    expect(broker.cancelForAgent(agent.id), 0);
+    expect(broker.inFlightCount, 1, reason: '这就是删除路径必须先取消的原因');
+    broker.dispose();
+    expect((await pending).cancelled, isTrue);
+  });
+
   test('dispose：关停时全部在途等待立刻收尾（不让生成任务挂着）', () async {
     final Future<QuestionOutcome> pending = broker.ask(request());
     broker.dispose();

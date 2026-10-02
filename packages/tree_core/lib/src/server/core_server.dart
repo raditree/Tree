@@ -1439,24 +1439,128 @@ class CoreServer {
     if (config.keyPath.isNotEmpty) 'key_path': config.keyPath,
   };
 
+  /// `DELETE /api/agents/{id}?cascade=1`：删除 agent（连同对话历史、会话与提问）。
+  ///
+  /// **两道闸门，都不通过就什么都不动**（2026-10-02 定稿）：
+  /// 1. **有下级必须显式级联**：否则回 409 + `cascade_required`（字段形状沿用 team 工具
+  ///    `remove_member`）。理由实测过：直接删掉一个中间层 leader，它的下级会变成
+  ///    **孤儿**——`parent_agent_id` 悬空 ⇒ `directMembers` 够不着（广播不达）、
+  ///    `cascadeIds` 够不着（级联停止/删除失效），而且 team 工具也再也删不掉它们
+  ///    （`_subtree` 同样沿父链走）；只有用户回到左栏手删一条路。
+  /// 2. **正在运行就拒绝**：`stop` 抢不动正在执行的工具（M9：本地执行活着就永不超时、
+  ///    不按时间杀进程），所以这里**不等待、不轮询**——等待会把 HTTP 挂住，且"删掉正在
+  ///    跑的 agent"正是残留的根因（那一轮继续往共享工作目录写、还能回一条来自幽灵成员的
+  ///    消息、`data/<id>` 被写回来）。请用户先停止并等它空闲。
+  ///
+  /// 通过闸门后的顺序：停（作废排队任务 + 收尾在途提问）→ 排水 → 清提问记录 →
+  /// 叶→根删 → 回填受影响 TOP 的 `team_member_count` → 再排水。
+  ///
+  /// 为什么先排水再删：`WriteQueue` 按**路径**串行，删 `data/<id>` 与写
+  /// `data/<id>/<session>/messages.jsonl` 是两个 key、顺序不保证；不排水就可能
+  /// "删完又被写回来"。
   Future<void> _deleteAgent(
     HttpRequest request,
     Map<String, String> params,
   ) async {
     final String agentId = params['agentId'] ?? '';
-    final bool removed = store.deleteAgent(agentId);
-    if (!removed) {
+    if (store.agent(agentId) == null) {
       await writeJson(request, 404, errorBody('agent 不存在'));
       return;
     }
-    // 提问记录不随会话数据删除：agent 没了还留着提问会让右栏出现孤儿卡片
-    final int questionsRemoved =
-        questions?.questions.removeForAgent(agentId) ?? 0;
+    final bool cascade = request.uri.queryParameters['cascade'] == '1' ||
+        request.uri.queryParameters['cascade'] == 'true';
+    final List<CoreAgent> descendants =
+        teamService?.descendants(agentId) ?? const <CoreAgent>[];
+    if (descendants.isNotEmpty && !cascade) {
+      await writeJson(request, 409, <String, dynamic>{
+        'detail': '该 agent 还有 ${descendants.length} 个下级成员，未指定 cascade',
+        'error': '该 agent 还有 ${descendants.length} 个下级成员，未指定 cascade',
+        'cascade_required': <Map<String, dynamic>>[
+          for (final CoreAgent member in descendants)
+            <String, dynamic>{
+              'member_id': member.id,
+              'name': member.name,
+              'level': member.level,
+              'parent_agent_id': member.parentAgentId,
+            },
+        ],
+        'hint': '直接删除会让这些下级变成孤儿（找不到上级，广播与级联停止都够不着）；'
+            '确认后带 ?cascade=1 连同下级一并删除，或先用 team 工具逐个移除下级',
+      });
+      return;
+    }
+    final List<String> ids = <String>[
+      agentId,
+      if (cascade) ...descendants.map((CoreAgent m) => m.id),
+    ];
+    // 记下每条的团队归属：删完就取不到了，而计数回填要用。
+    final Map<String, String> teamOf = <String, String>{};
+    for (final String id in ids) {
+      final CoreAgent? agent = store.agent(id);
+      if (agent == null) continue;
+      teamOf[id] = teamOfFor(agent);
+    }
+    List<String> running() =>
+        ids.where(conversation.isRunning).toList(growable: false);
+    if (running().isNotEmpty) {
+      await writeJson(request, 409, _busyBody(running()));
+      return;
+    }
+    // 停：作废排队任务（旧代次出队即丢）+ 收尾在途提问（QuestionBroker）。
+    for (final String id in ids) {
+      _stopAgentTree(id, cascade: false);
+    }
+    // 竞态兜底：恰好在闸门之后接单的排队任务会被这次代次推进作废，但"已过代次检查、
+    // 即将登记 token"的窗口仍在；再确认一次（不等待），有就照旧拒绝。
+    final List<String> started = running();
+    if (started.isNotEmpty) {
+      await writeJson(request, 409, _busyBody(started));
+      return;
+    }
+    await store.flush();
+    // 提问记录：先取消（记录还在时立刻收尾在途等待）再摘记录——顺序反了会让
+    // 等待中的工具永远拿不到结果（见 QuestionBroker.cancel 的注释）。
+    int questionsRemoved = 0;
+    for (final String id in ids) {
+      questions?.cancelForAgent(id);
+      questionsRemoved += questions?.questions.removeForAgent(id) ?? 0;
+      await questions?.questions.flush();
+    }
+    // 叶→根删（父先于子的逆序），避免留下"父没了子还在"的中间态
+    final List<String> removed = <String>[];
+    for (final String id in ids.reversed) {
+      if (store.deleteAgent(id)) removed.add(id);
+    }
+    await store.flush();
+    // 回填存活 TOP 的成员数（用户侧删除也走 team 工具那套"按实际成员数"的回填）
+    final Set<String> touchedTopIds = <String>{
+      for (final String teamId in teamOf.values)
+        if (!ids.contains(teamId)) teamId,
+    };
+    for (final String topId in touchedTopIds) {
+      teamService?.syncMemberCount(topId);
+    }
+    await store.flush();
     await writeJson(request, 200, <String, dynamic>{
       'success': true,
+      'removed': removed,
+      'cascade': cascade,
       if (questionsRemoved > 0) 'questions_removed': questionsRemoved,
     });
   }
+
+  /// agent 的团队归属：成员取 `team_id`，顶层 agent 就是它自己。
+  static String teamOfFor(CoreAgent agent) =>
+      agent.teamId.isEmpty ? agent.id : agent.teamId;
+
+  /// "正在运行，不能删"的 409 响应体（两道闸门共用）。
+  Map<String, dynamic> _busyBody(List<String> running) => <String, dynamic>{
+    'detail': 'agent 正在运行，不能删除',
+    'error': 'agent 正在运行，不能删除',
+    'running': running,
+    'hint': '请先停止该 agent（成员可在标题栏按「停止」）并等它变为空闲后再删除；'
+        '正在执行的工具无法被抢占（本地执行活着就永不超时），所以这里不会替你等待。',
+  };
 
   Future<void> _agentModelsInfo(
     HttpRequest request,

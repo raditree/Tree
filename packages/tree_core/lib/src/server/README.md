@@ -24,11 +24,19 @@
 9. 前端心跳节奏是 30s ⇒ WS 判活窗口默认取 30s × 3 = 90s，而**不是** 10s × 3 = 30s——后者与前端心跳等长，边界抖动会把"在线但空闲"误判失活。前端心跳改成 10s 后，这里换回全局默认口径即可。
 10. **热应用如实回报**：插件配置已落盘但本次热应用失败 ⇒ `hot_applied: false` +「配置已保存，但本次热应用失败，重启核心后生效」+ 具体原因；清单读不出来（YAML 被手改坏）时运行实例**保持原样**，不因为一个拼写错误把在跑的插件全停掉。做成接缝（`PluginHotApplier`）是为了将来换实现时 REST 层与前端一个字都不用改，且测试能确定性地覆盖失败路径。
 11. provider 接线与解绑成对：`close()` 里解绑团队工作目录 provider，并 `store.flush()`。
+12. **`DELETE /api/agents/{id}` 有两道闸门，不通过就什么都不动**（[test/agent_delete_api_test.dart](../../../test/agent_delete_api_test.dart) 强制）：
+    ① **有下级成员必须显式 `?cascade=1`**，否则 409 + `cascade_required`（列出下级）——直接删中间层 leader
+    会留下「删不掉、停不了、广播够不着、却还能干活」的孤儿成员（见 [../team/README.md](../team/README.md) 不变量 12）；
+    ② **任一相关会话正在运行就拒绝**（409 + `running`），提示先停止并等它空闲——`stop` 抢不动正在执行的工具
+    （本地执行活着就永不超时），所以这里**不等待、不轮询**；删掉正在写的 agent 正是残留的来源（继续写共享工作目录、
+    回一条来自幽灵成员的消息、`data/<id>` 被写回来）。通过后的顺序：停（作废排队任务 + 收尾在途提问）→
+    `store.flush()` 排水 → 清提问记录 → 叶→根删 → 回填 TOP 的 `team_member_count` → 再排水。
+    409 的响应体同时带 `detail`（通用错误文案口径）与结构化字段。
 
 ## 测试
 
 ```bash
 cd packages/tree_core
 dart test test/server_test.dart test/ws_send_liveness_test.dart test/plugin_hot_apply_test.dart \
-          test/compact_api_test.dart test/agents_config_api_test.dart
+          test/compact_api_test.dart test/agents_config_api_test.dart test/agent_delete_api_test.dart
 ```

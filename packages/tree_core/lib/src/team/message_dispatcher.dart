@@ -777,7 +777,13 @@ class TeamMessageDispatcher {
     );
   }
 
-  String _nameOf(String agentId) => store.agent(agentId)?.name ?? agentId;
+  /// 发送者显示名：agent 已被删（用户手删成员）时不要回裸 id，标成「已删除成员」。
+  String _nameOf(String agentId) {
+    if (agentId.isEmpty) return '';
+    final CoreAgent? agent = store.agent(agentId);
+    if (agent != null) return agent.name;
+    return '已删除成员 $agentId';
+  }
 
   static String _preview(String content) =>
       content.length > 120 ? '${content.substring(0, 120)}…' : content;

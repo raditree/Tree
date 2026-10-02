@@ -200,7 +200,11 @@ class TeamService {
     if (self == null) return _error('agent 不存在: $agentId');
     final String teamId = teamIdOf(agentId);
     final CoreAgent? top = store.agent(teamId);
-    final List<CoreAgent> all = members(teamId);
+    // 调用者自己可能是成员（成员也能调 list_members）：把自己排除掉，否则它会
+    // 同时出现在 leaderView 与 rest 里（同一 id 出现两次），total 也会多算一个。
+    final List<CoreAgent> all = members(
+      teamId,
+    ).where((CoreAgent m) => m.id != self.id).toList(growable: false);
     final int? levelFilter = args['level'] is num
         ? (args['level'] as num).toInt()
         : null;
@@ -382,7 +386,7 @@ class TeamService {
       updatedAt: now,
     );
     store.putAgent(member);
-    _syncTopCount(teamId);
+    syncMemberCount(teamId);
     log?.call('创建成员 ${member.id}（$name，level=${member.level}）等待用户配置模型');
     return <String, dynamic>{
       'member_id': member.id,
@@ -416,7 +420,8 @@ class TeamService {
     if (target.id == teamId) {
       return _error(
         '不可移除团队所有者: $teamId',
-        hint: '只能移除自己的直属/下级成员；解散团队请删除该顶层 agent',
+        hint: '只能移除自己的直属/下级成员；解散团队请删除该顶层 agent'
+            '（DELETE /api/agents/{id}?cascade=1：有下级时必须显式级联）',
       );
     }
     if (target.id == self.id) {
@@ -451,7 +456,7 @@ class TeamService {
     for (final CoreAgent member in subtree.reversed) {
       if (store.deleteAgent(member.id)) removed.add(member.id);
     }
-    _syncTopCount(teamId);
+    syncMemberCount(teamId);
     log?.call('移除成员 ${target.id} 及其 ${removed.length - 1} 个下级');
     return <String, dynamic>{
       'member_id': target.id,
@@ -463,7 +468,10 @@ class TeamService {
       'persisted': true,
       'roster_pushed': removed.length,
       if (removed.length > 1)
-        'hint': '已连同 ${removed.length - 1} 个下级成员一并移除；其工作空间已回收，磁盘数据保留供审计',
+        'hint': '已连同 ${removed.length - 1} 个下级成员一并移除；'
+            'agent 配置与会话数据（data/<id>）已删除，'
+            '但工作空间与 <共享根>/.tree/<id> 私有状态分栏保留（不回收，供审计），'
+            '需要清理请手工删除',
       'generated_at': _timestamp(),
     };
   }
@@ -914,7 +922,12 @@ class TeamService {
   }
 
   /// member_count 按**实际成员数**回填（不累加）。
-  void _syncTopCount(String teamId) {
+  ///
+  /// 公开是因为**用户侧的删除路径**（`DELETE /api/agents/{id}`）也会改成员集合：
+  /// 它不走 team 工具，若不回调这里，`agents/<top>.yaml` 里的
+  /// `team_member_count` 会停在删除前的旧值（`list_teams` 实时算是对的，
+  /// 但 API/文件口径就分叉了）。TOP 已不存在时静默跳过。
+  void syncMemberCount(String teamId) {
     final CoreAgent? top = store.agent(teamId);
     if (top == null) return;
     final int count = members(teamId).length;

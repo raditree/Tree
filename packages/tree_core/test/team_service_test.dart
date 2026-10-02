@@ -123,6 +123,41 @@ void main() {
       expect(detailed['system_prompt'], '机密提示词', reason: 'query_member 才给');
     });
 
+    test('成员自己调 list_members：不把自己列两遍，total 不含自己', () {
+      final String first = create('成员甲')['member_id'] as String;
+      final String second = create('成员乙')['member_id'] as String;
+      final String grand = service.createMember(first, <String, dynamic>{
+        'action': 'create_member',
+        'member_name': '孙成员',
+      })['member_id'] as String;
+
+      final Map<String, dynamic> payload = service.listMembers(first);
+      expect(payload['total'], 2, reason: '只有乙与孙成员，不含调用者自己');
+      final List<dynamic> list = payload['members'] as List<dynamic>;
+      expect(
+        list.map((dynamic m) => (m as Map<String, dynamic>)['id']).toList(),
+        <String>[first, grand, second],
+        reason:
+            'leaderView（自己）只出现一次；rest 里是孙成员与乙（同级关系）；'
+            '旧实现会把自己同时塞进 leaderView 与 rest',
+      );
+      expect(
+        list.where((dynamic m) => (m as Map<String, dynamic>)['id'] == first),
+        hasLength(1),
+      );
+      final Map<String, dynamic> groups =
+          payload['groups'] as Map<String, dynamic>;
+      expect((groups['team_leader'] as List<dynamic>).single['id'], first);
+      expect(
+        (groups['teammates'] as List<dynamic>)
+            .map((dynamic m) => (m as Map<String, dynamic>)['id'])
+            .toSet(),
+        <String>{grand},
+        reason: '孙成员是它的直属',
+      );
+      expect((groups['team_member'] as List<dynamic>).single['id'], second);
+    });
+
     test('实时工作状态来自注入的权威表（未接入恒 idle）', () {
       final String member = create('成员甲')['member_id'] as String;
       expect(service.workStatus(member), 'idle');

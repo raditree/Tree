@@ -162,12 +162,30 @@ class QuestionBroker {
   }
 
   /// 取消：用户显式取消、`stop` 或超时都会走这里（幂等）。
+  ///
+  /// **只要还有在途等待就必须收尾**，即使提问记录已经不在——删除 agent 时
+  /// `QuestionStore.removeForAgent` 会把记录直接摘掉，若这里因为"记录没了"而
+  /// 提前返回，等答案的工具就永远拿不到结果：那一轮既不收敛、`isRunning` 永远为真，
+  /// 连 `stop`/`cancelForAgent`（它们都按 store 里的 pending 列表遍历）也救不回来
+  /// （实测见 test/question_broker_test.dart『记录被摘掉』用例）。
   bool cancel(String qid, {String reason = ''}) {
     final QuestionRecord? record = questions.markCancelled(qid);
-    if (record == null) return false;
+    final bool settled = _finish(
+      qid,
+      const QuestionOutcome(answer: '', cancelled: true),
+    );
+    if (record == null) {
+      // 记录已不在：state 没变，但**在途等待被收尾**同样是有效结果（返回 true）
+      if (settled) {
+        log?.call(
+          '提问 $qid 的记录已不存在，仍收尾在途等待'
+          '${reason.isEmpty ? '' : '（$reason）'}',
+        );
+      }
+      return settled;
+    }
     log?.call('提问 $qid 已取消${reason.isEmpty ? '' : '（$reason）'}');
     _broadcastResolved(qid, cancelled: true);
-    _finish(qid, const QuestionOutcome(answer: '', cancelled: true));
     return true;
   }
 
@@ -214,10 +232,12 @@ class QuestionBroker {
     });
   }
 
-  void _finish(String qid, QuestionOutcome outcome) {
+  /// 收尾一个在途等待；返回是否真的完成了一个（记录已消失时也照样收尾）。
+  bool _finish(String qid, QuestionOutcome outcome) {
     final _InFlight? flight = _inFlight.remove(qid);
-    if (flight == null) return;
+    if (flight == null) return false;
     flight.dispose();
     if (!flight.completer.isCompleted) flight.completer.complete(outcome);
+    return true;
   }
 }
