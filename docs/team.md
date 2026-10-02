@@ -25,7 +25,14 @@
    `team` 工具的 create/update/review **收到 `model_id` 一律报错**——模型只能由用户在
    「团队 → 成员 → 模型配置」里分配（`PATCH /api/agents/{leader}/teammate/{member}`）。
 2. 审阅通过（`approved`）后成员才会接活；未就绪成员收到消息会**明确拒绝**并回传给发送方，不静默丢。
-3. 移除/回收：只能碰自己的子树；目标有下级时必须显式 cascade。
+3. 移除/回收：只能碰自己的子树；目标有下级时必须显式 cascade。**用户侧删除同规则**：
+   `DELETE /api/agents/{id}` 有下级时回 409 + `cascade_required`（列出下级），确认后带 `?cascade=1` 才连整棵子树删
+   （叶→根）；**正在运行的 agent 一律拒绝删除**（409 + `running`）——`stop` 抢不动正在执行的工具，
+   请先停止并等它变空闲。删完按实际成员数回填 TOP 的 `team_member_count`。
+4. 悬空指针自愈：历史数据里已有「上级被删」的成员，核心启动时修一次（`team_repair.dart`）——上级还在就重挂到 TOP
+   （子树 `team_id`/`level` 整体平移），团队也没了就把最上层孤儿升为独立顶层 agent；每个被改的 `agents/<id>.yaml`
+   先备份成 `.bak.<n>`。为什么要修：孤儿成员广播够不着、级联停止与级联删除失效、team 工具也删不掉，
+   但它们仍会被寻址、还能干活（见 [known-issues.md](known-issues.md) #9 第 8 条）。
 
 ## 3. 工作目录与私有状态
 
@@ -92,4 +99,8 @@
 - `test/message_dispatcher_test.dart`：审核闸门、派活归集发起会话、`wait_for` 判活与部分结果、
   活动日志（IO 路径 + SSH 模式 + 未接线兜底）。
 - `test/team_service_test.dart` / `test/cascade_stop_test.dart` / `test/message_interrupt_test.dart`：
-  名单白名单、级联停止、会话并行与插话。
+  名单白名单（成员自己调用不会把自己列两遍）、级联停止、会话并行与插话。
+- `test/agent_delete_api_test.dart`：删除的两道闸门（有下级 409 + `cascade_required` 且什么都不动；`cascade=1`
+  叶→根删 + 计数回填；运行中 409 + `running`，停止并空闲后才删得掉；删完不留 `data/<id>`）。
+- `test/team_repair_test.dart`：上级被删→重挂 TOP + 层级平移 + `.bak.<n>` 备份 + 落盘；TOP 也没了→升为顶层；
+  `team_id` 悬空但父链完好→按父链修正；幂等（再跑一次零动作、不再加备份）。

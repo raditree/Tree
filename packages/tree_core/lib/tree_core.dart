@@ -33,6 +33,7 @@ export 'src/agent/system_prompt_file.dart';
 export 'src/agent/workspace_prompt.dart';
 export 'src/team/message_dispatcher.dart';
 export 'src/team/team_model.dart';
+export 'src/team/team_repair.dart';
 export 'src/team/team_service.dart';
 export 'src/team/team_workspace.dart';
 export 'src/agent/private_workspace_io.dart';

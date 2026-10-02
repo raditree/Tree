@@ -11,6 +11,7 @@
 | [team_model.dart](team_model.dart) | 成员视图（字段白名单）与活动日志路径 `memberLogPath` |
 | [team_workspace.dart](team_workspace.dart) | 工作目录口径 `teamWorkspaceFor` 与 SSH 口径 `teamSshConfigFor` |
 | [message_dispatcher.dart](message_dispatcher.dart) | 消息派发：寻址 → 审核闸门 → 投递；活动日志的读写 |
+| [team_repair.dart](team_repair.dart) | 启动自愈：`parent_agent_id`/`team_id` 指向不存在的 agent 时重挂 / 升顶层（子树平移，改动前备份 `.bak.<n>`） |
 
 ## 不变量（assertions）
 
@@ -25,11 +26,20 @@
 9. `wait_for` 的活性结论：`unknown`（没有活性信息）**不判死**，只有 `lost`（心跳丢失）才收口——避免把"还没开始跑"当成"已经死了"。
 10. 活动日志经 agent **自己的工作空间 IO** 读写（SSH 成员因此写在远端），写入按 agent 串行（读回 → 追加 → 写回），超 512 KB 只保留最近 400 行并记一行截断标记（日志是过程记录，不当事实源）。
 11. 名单接口返回的成员视图是**字段白名单**，绝不包含 `system_prompt`（否则提示词会泄漏给整棵树）；只有 `query_member` / `update_member` 才额外返回它。
+12. **悬空指针必须被兜住——删除 agent 的团队后果有两条规则**（[test/team_repair_test.dart](../../../test/team_repair_test.dart) 与 [test/agent_delete_api_test.dart](../../../test/agent_delete_api_test.dart) 强制）：
+    ① **删除路径与 team 工具同规则**：`DELETE /api/agents/{id}` 有下级时必须显式 `?cascade=1`（否则 409 + `cascade_required`），
+    删完按**实际成员数**回填 TOP 的 `team_member_count`（用户侧删除不走 team 工具，不回调就留旧值）；
+    ② **历史遗留的悬空指针在核心启动时自愈**（`team_repair.dart`）：上级还在 ⇒ 重挂到 TOP 并把整棵子树的
+    `team_id`/`level` 一起平移；团队也没了 ⇒ 最上层孤儿**升为独立顶层 agent**；`team_id` 悬空但父链完好 ⇒ 按父链修正。
+    为什么必须修（实测）：孤儿成员的 `directMembers` / `cascadeIds` / `_subtree` 全都够不着——广播不达、
+    级联停止与级联删除失效、连 team 工具都再也删不掉它们（`_subtree` 同样沿父链走），但它们**仍会被寻址、还能干活**。
+    写盘口径：修好就写盘，但每个被改的 yaml 先备份 `.bak.<n>`（n 递增、绝不覆盖）；幂等（再跑一次零动作）。
 
 ## 测试
 
 ```bash
 cd packages/tree_core
 dart test test/team_service_test.dart test/team_workspace_test.dart test/message_dispatcher_test.dart \
-          test/member_overrides_test.dart test/teammates_api_test.dart test/teammate_message_api_test.dart
+          test/member_overrides_test.dart test/teammates_api_test.dart test/teammate_message_api_test.dart \
+          test/team_repair_test.dart test/agent_delete_api_test.dart
 ```

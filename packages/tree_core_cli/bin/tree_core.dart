@@ -121,6 +121,15 @@ Future<void> main(List<String> args) async {
     isWorking: (String agentId) => workingSink?.call(agentId) ?? false,
     log: (String message) => stderr.writeln('[core:team] $message'),
   );
+  // 团队关系自愈：用户直接删 agent 会在下级 yaml 里留下悬空的
+  // `parent_agent_id`/`team_id`（实测后果：那些成员广播够不着、级联停止/删除失效，
+  // 却仍会被寻址、还能干活）。启动时修一次，改动前先备份成 `.bak.<n>`；幂等，
+  // 明细见 team_repair.dart 的三条规则。
+  await repairTeamLinks(
+    store,
+    backup: (CoreAgent agent) => backupAgentFile(paths, agent.id),
+    log: (String message) => stderr.writeln('[core:team] $message'),
+  );
   // 消息派发：投递实现要等核心起监听后才有（ConversationService 由核心创建），
   // 因此同样用可后置绑定的槽。
   TeamDelivery? deliverSink;
