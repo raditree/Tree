@@ -20,6 +20,7 @@ import '../services/detail_selection.dart';
 import '../services/message_replay_guard.dart';
 import '../services/plugin_ui_registry.dart';
 import '../services/session_rename.dart';
+import '../services/team_scope_view.dart';
 import 'message_input.dart';
 import 'message_list.dart';
 import 'plugin_ui_slots.dart';
@@ -239,21 +240,55 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 由 WS 连接建立后的同款 ensureTeam 兜底）。
   Future<void> _loadModeSettings() async {
     final String teamId = widget.selectedAgent?.id ?? '';
+    // 运行模式与工作目录都是**团队级**的（2026-10-03 用户断言）：成员跟随团队 TOP
+    // （核心口径见 team_workspace.dart；目录还会被核心镜像进成员自己的配置）。
+    // 因此这里两份都读——自己那份 + 团队 TOP 那份——再合成显示：
+    // - 模式：自己**显式**配了 SSH 就以自己为准（核心也是这个优先级），否则跟随 TOP；
+    // - 工作目录：**只有 TOP 那份算数**（成员那份是核心写的镜像），所以优先显示 TOP 的
+    //   目录；TOP 未配置时退回自己那份镜像——核心会把 TOP 的默认目录也镜像进来，
+    //   成员页因此永远显示一个真实目录，而不是让用户去"重新选择工作目录"。
+    final String ownerId =
+        widget.selectedAgent?.teamScopeId ?? (teamId.isEmpty ? '' : teamId);
+    final bool isMember = ownerId.isNotEmpty && ownerId != teamId;
     await Future.wait(<Future<void>>[
       LocalExecutorService.instance.loadTeamSettings(teamId),
       SshExecutorService.instance.loadTeamSettings(teamId),
+      if (isMember) LocalExecutorService.instance.loadTeamSettings(ownerId),
+      if (isMember) SshExecutorService.instance.loadTeamSettings(ownerId),
     ]);
     if (!mounted) return;
     // 竞态防护：等待期间已切换顶部 agent 时放弃本次恢复
     // （新切换会重新进入本函数，避免旧 agent 的显示状态误刷新）
     if (teamId != (widget.selectedAgent?.id ?? '')) return;
+    final bool ownSsh = SshExecutorService.instance.isTeamEnabled(teamId);
+    final bool ownerSsh =
+        isMember && SshExecutorService.instance.isTeamEnabled(ownerId);
+    final Map<String, dynamic> ownConfig =
+        SshExecutorService.instance.teamConfig(teamId);
+    final Map<String, dynamic> ownerConfig = isMember
+        ? SshExecutorService.instance.teamConfig(ownerId)
+        : ownConfig;
+    final String ownDir =
+        LocalExecutorService.instance.teamWorkingDirectory(teamId);
+    final String ownerDir = isMember
+        ? LocalExecutorService.instance.teamWorkingDirectory(ownerId)
+        : ownDir;
+    // 合成口径集中在 TeamScopeView（纯函数，可单测）：模式"自己优先、否则跟随 TOP"、
+    // 目录"只认 TOP 那份、TOP 未配置时退回成员镜像"。
+    final TeamScopeView view = TeamScopeView.combine(
+      isMember: isMember,
+      memberHasSsh: ownSsh,
+      teamHasSsh: ownerSsh,
+      memberDir: ownDir,
+      teamDir: ownerDir,
+      memberSshConfig: ownConfig,
+      teamSshConfig: ownerConfig,
+    );
     setState(() {
-      _localEnabled = LocalExecutorService.instance.isTeamEnabled(teamId);
-      _localWorkingDir = LocalExecutorService.instance.teamWorkingDirectory(
-        teamId,
-      );
-      _sshEnabled = SshExecutorService.instance.isTeamEnabled(teamId);
-      _sshConfig = SshExecutorService.instance.teamConfig(teamId);
+      _sshEnabled = view.ssh;
+      _localEnabled = view.local;
+      _sshConfig = view.sshConfig;
+      _localWorkingDir = view.workingDir;
     });
     if (teamId.isNotEmpty) {
       // 两态模型下不允许停在"无执行器"（M9 Q2）：进入页面/切换 team 后若两个
@@ -1083,6 +1118,18 @@ class _MessagePanelState extends State<MessagePanel> {
           _showSnackBar('移动端不支持本地执行模式，请使用 SSH 模式');
           return;
         }
+        // 团队 TOP 配了 SSH 时，成员**无法**单独切回本地：核心的判据是
+        // "自己配了 SSH 就用自己那份，否则跟随团队 TOP"（team_workspace.dart），
+        // 没有"成员覆盖成 local"这个概念。这里如实拒绝，而不是假装切成功。
+        final String ownerId = widget.selectedAgent?.teamScopeId ?? '';
+        final bool isMember = ownerId.isNotEmpty && ownerId != teamId;
+        if (!TeamScopeView.allowsLocalSwitch(
+          isMember: isMember,
+          teamHasSsh: SshExecutorService.instance.isTeamEnabled(ownerId),
+        )) {
+          _showSnackBar('该成员跟随团队 TOP 的 SSH 模式，无法单独切回本地：请先在团队 TOP 上关闭 SSH');
+          return;
+        }
         // 与 SSH 互斥：先注销 ssh
         if (current == 'ssh') {
           await SshExecutorService.instance.disableTeam(teamId);
@@ -1142,11 +1189,19 @@ class _MessagePanelState extends State<MessagePanel> {
       dialogTitle: '选择项目根目录（工具执行结果写入此目录）',
     );
     if (path == null || path.isEmpty) return;
-    final String? teamId = widget.selectedAgent?.id;
-    if (teamId != null && teamId.isNotEmpty) {
-      await LocalExecutorService.instance.setTeamWorkingDirectory(teamId, path);
+    final Agent? agent = widget.selectedAgent;
+    final String agentId = agent?.id ?? '';
+    // 写入目标是**团队 TOP**：工作目录是团队共享的那一份，成员自己的
+    // `workspace_dir` 只是核心写下的镜像（team_workspace.dart 的断言：成员那份不生效）。
+    // 若照着成员 id 写，用户等于改了一个没人读的字段。
+    final String ownerId = agent?.teamScopeId ?? agentId;
+    if (ownerId.isNotEmpty) {
+      await LocalExecutorService.instance.setTeamWorkingDirectory(ownerId, path);
     }
     if (!mounted) return;
+    if (ownerId.isNotEmpty && ownerId != agentId) {
+      _showSnackBar('已设为团队共享工作目录（团队成员共用这一个目录）');
+    }
     setState(() {
       _localWorkingDir = path;
     });

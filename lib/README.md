@@ -17,7 +17,7 @@
 | [ui/widgets/message_panel.dart](ui/widgets/message_panel.dart) | 中栏消息流：分段渲染、工具/思考**一行式**（完整内容见右栏「详情」页）、提问卡片、断线重播去重、按 agent+会话过滤 |
 | [ui/widgets/teammates_window_page.dart](ui/widgets/teammates_window_page.dart) | 团队成员拓扑与成员工作进度窗口 |
 | [ui/widgets/](ui/widgets/) | 文件面板 / 查看器（源码高亮 + 编辑保存 + 分屏，见 [split_panes.dart](ui/widgets/split_panes.dart)）/ **集成终端（[terminal_panel.dart](ui/widgets/terminal_panel.dart)，Ctrl+J）**/ 消息输入框（[message_input.dart](ui/widgets/message_input.dart) + [attachment_preview.dart](ui/widgets/attachment_preview.dart)）/ 右栏详情（[detail_panel.dart](ui/widgets/detail_panel.dart)）、PDF 预览、Spec、待办、提问、插件、MCP、模型信息、Git 历史、设置页 |
-| [ui/services/](ui/services/) | 重播守卫、下载中心、会话重命名、插件 UI 槽位注册、主题、**代码高亮（[code_highlight.dart](ui/services/code_highlight.dart)）**、**编辑器偏好（[editor_settings.dart](ui/services/editor_settings.dart)）**、详情选中（[detail_selection.dart](ui/services/detail_selection.dart)） |
+| [ui/services/](ui/services/) | 重播守卫、下载中心、会话重命名、插件 UI 槽位注册、主题、**代码高亮（[code_highlight.dart](ui/services/code_highlight.dart)）**、**编辑器偏好（[editor_settings.dart](ui/services/editor_settings.dart)）**、详情选中（[detail_selection.dart](ui/services/detail_selection.dart)）、**团队级模式与目录合成（[team_scope_view.dart](ui/services/team_scope_view.dart)）** |
 
 ## 不变量（assertions）
 
@@ -93,10 +93,27 @@
     打开时**主动展开**（按面板高 40%，夹 160–420）并把焦点交给终端，再按一次回到输入框（草稿靠草稿缓存原样回来）；
     终端**没有输入行**——所有按键经 `Focus.onKeyEvent` 译成终端字节（回车 `\r`、退格 `0x7f`、方向键 `ESC[A..D`、
     Ctrl+字母 `0x01..0x1A`、可打印字符走 `event.character` 的 UTF-8），Ctrl+J 例外（留给切换）。
-    核心开**真伪终端**（Windows ConPTY / POSIX `script`），输出是**原始字节**（base64 过 WS），前端用自制的 VT 解析器
-    还原成屏幕（光标定位 / SGR / 备用屏都在内），再 `CustomPaint` 画格子。**只支持本机 agent**：配了 SSH 的 agent
-    一律回可读错误（那条通道没有伪终端），不假装成功；关面板 / 换 agent / 断连都会把 shell 收掉。
-    终端的边界（VT 解析器没实现的部分、没跑真机端到端）见 [docs/known-issues.md §11](../docs/known-issues.md)。
+    核心开**真伪终端**，输出是**原始字节**（base64 过 WS），前端用自制的 VT 解析器还原成屏幕
+    （光标定位 / SGR / 备用屏都在内），再 `CustomPaint` 画格子。两个后端**都是真 PTY**：
+    本机 agent 走平台伪终端（Windows ConPTY / POSIX `script`）；远端（SSH）agent 走 SSH 会话通道 +
+    `pty-req`（dartssh2），并**复用那条已建好的 SSH 连接**（不为终端再连一次），远端的
+    `terminal_ready.cwd` 是空串——远端工作目录由 `SshWorkspaceIO` 自己解决，界面显示「工作区」。
+    判据是**有效 SSH**（成员跟随团队 TOP 的 SSH，见不变量 15）；没接线时回可读错误，**绝不**
+    悄悄在本机给远端 agent 起一个终端。关面板 / 换 agent / 断连都会把 shell 收掉。
+    终端的边界（VT 解析器没实现的部分、远端分支**没有真机 sshd 验证过**）见
+    [docs/known-issues.md](../docs/known-issues.md) #12。
+
+15. **运行模式与工作目录是团队级的：成员默认继承团队 TOP**（[ui/services/team_scope_view.dart](ui/services/team_scope_view.dart)，
+    [test/team_scope_view_test.dart](../test/team_scope_view_test.dart) 强制；核心口径见
+    [team/README.md](../packages/tree_core/lib/src/team/README.md) 不变量 2/3/13，**用户断言 2026-10-03**）：
+    中栏左上角的模式开关与目录**按团队 TOP 合成**，不再是"只看成员自己那份配置"——
+    ① **模式**：成员自己**显式**配了 SSH 就以自己为准（与核心 `teamSshConfigFor` 同优先级），否则跟随 TOP；
+    ② **工作目录**：**只有 TOP 那份算数**（成员自己那份是核心写的镜像），显示 TOP 的目录；TOP 未配置时退回
+    成员自己那份镜像——核心会把 TOP 的默认目录也镜像进来，成员页因此**永远显示一个真实目录**，
+    而不是让用户去"重新选择工作目录"；
+    ③ **选目录写入团队 TOP**（照成员 id 写等于改一个没人读的字段），并提示"团队成员共用这一个目录"；
+    ④ 团队 TOP 配了 SSH 时成员**切不回本地**：核心没有"成员覆盖成 local"这个概念，界面**如实拒绝**并说明
+    去哪改，不假装切成功。
 
 ## 测试
 
@@ -122,4 +139,6 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 跨块 UTF-8、宽字符两格、未知序列安全跳过、resize、DSR/DA 应答、随机含 ESC 字节流不抛）、
 `test/terminal_panel_test.dart`（终端面板：打开就发 `terminal_open` 与尺寸并抢焦点、ready 显示 shell/cwd、
 输出进缓冲、键盘译码（回车 / 方向键 / Ctrl+C）、Ctrl+J 交给外层、error 与 exit 的显示、别的会话 id 的帧被丢、
-dispose 发 `terminal_close`、布局变化发 `terminal_resize`）。
+dispose 发 `terminal_close`、布局变化发 `terminal_resize`）、
+`test/team_scope_view_test.dart`（团队级模式/目录合成：成员跟随 TOP 的模式与目录、自己的 SSH 优先、
+目录只认 TOP 那份、TOP 是 SSH 时成员切不回本地）。
