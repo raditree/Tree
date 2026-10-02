@@ -38,6 +38,10 @@ dependencies:
   # 注意：打 Windows 包时必须把 build/native_assets/windows/pdfium.dll 拷到 exe
   # 旁边，否则用户机器上一打开 PDF 就报找不到 pdfium——tool/package_windows.dart 已做。
   pdfrx: ^2.6.5
+  # 窗口控制：拦截关闭按钮（默认改为隐藏到系统托盘，避免误终止正在跑的任务）
+  window_manager: ^0.5.2
+  # 系统托盘图标与菜单（恢复窗口 / 退出）
+  tray_manager: ^0.7.0
 
 dev_dependencies:
   flutter_test:
@@ -49,3 +53,7 @@ dev_dependencies:
 flutter:
   # 启用 Material Icons 字体
   uses-material-design: true
+  # 托盘图标（tray_manager 需要**文件路径**，运行时由 Platform.resolvedExecutable 解析，
+  # 见 lib/io/tray_service.dart；打包脚本整目录拷贝，因此随 flutter_assets 一起进安装包）
+  assets:
+    - assets/tray_icon.ico

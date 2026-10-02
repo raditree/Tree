@@ -59,6 +59,7 @@ flutter run -d windows
 | 核心 | `cd packages/tree_core && dart test` | 存储 / LLM 循环 / 工具 / 团队 / Spec / MCP / 插件 / REST+WS 端到端 |
 | 核心真进程 | `cd packages/tree_core_cli && dart test` | 编译产物能起、握手、鉴权、优雅退出（需 `TREE_CORE_EXE`） |
 | 前端 | `flutter test`（仓库根） | 组件与 API 客户端 |
+| 托盘与关窗 | `flutter run -d windows` 手动一次 | 点关闭按钮应**只隐藏窗口**（托盘图标出现、核心进程仍在），双击托盘图标恢复窗口；退出走托盘菜单 |
 | 静态检查 | `dart analyze`（每个包）+ `flutter analyze lib test` | **必须零告警**才能提交 |
 
 **门控真机测试**（本机没有 sshd / 没有编译产物时自动跳过，设了才跑）：
@@ -128,7 +129,8 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 | 只跑核心链路测试 | `cd packages/tree_core && dart test`（含真实 HTTP + WS 端到端） |
 | 看某个 agent 的私有状态 | `<工作空间>/.tree/<agent_id>/.self/`（提示词 / 规范 / 结果 / 活动日志） |
 | 看 / 改**模型实际收到的提示词** | 真源：`agent/system_prompt_file.dart`（种子）、`spec/builtin_specs.dart`（内置规范）、`agent/workspace_prompt.dart`（拼装顺序）、各工具文件的 `ToolSpec`；运行期副本：`<工作空间>/.tree/<agent_id>/.self/{system_prompt.md, spec/}`。完整对照表见 [architecture.md §8.1](architecture.md) |
-| 数据目录换地方 | `TREE_HOME=<dir>` 或 `tree_core --data-dir <dir>` |
+| 数据目录换地方 | `TREE_HOME=<dir>` 或 `tree_core --data-dir <dir>`（换了数据根就是**另一个实例身份**：单实例锁按数据根区分） |
+| 想同时开两份（调试） | 给第二份不同的 `TREE_HOME`，或显式 `TREE_INSTANCE_KEY=<任意不同值>`；都不设则第二份会退出并把已有窗口叫到前面 |
 | 前端连不上核心 | 看 UI 错误页给出的修复指引；确认 `tree_core.exe` 位置或 `TREE_CORE_*` 环境变量 |
 
 ## 8. 发布检查单

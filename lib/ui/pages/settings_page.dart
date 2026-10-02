@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 import '../../app_version.dart';
 import '../../io/api_service.dart';
+import '../../io/tray_service.dart';
 import '../theme_service.dart';
 
 /// 设置页面（desktop 分支：账号/等级/密码/后端地址/注销 五组设置已删除）
@@ -15,6 +16,7 @@ import '../theme_service.dart';
 ///   （M9 规约 1.1 取消了静态时间超时）；判活窗口 I×N 必须大于前端固定的 10s 心跳
 /// - 自定义模型：模型池 CRUD（M2 起落 `~/.tree/config/models/*.yaml`）
 /// - 主题管理：浅色 / 深色 / 跟随系统三种模式
+/// - 窗口与托盘：关闭按钮行为的开关 + 真正的退出入口
 /// - 插件开发：文档入口（打开 `plugins/README.md`）+ 插件目录定位
 /// - 版本信息：应用 / 核心 / 接口契约 / 核心进程与产物（含"核心比界面旧"告警）
 class SettingsPage extends StatefulWidget {
@@ -402,6 +404,10 @@ class _SettingsPageState extends State<SettingsPage> {
           _buildSectionTitle('主题管理'),
           const SizedBox(height: 8),
           _buildThemeCard(),
+          const SizedBox(height: 24),
+          _buildSectionTitle('窗口与托盘'),
+          const SizedBox(height: 8),
+          _buildTrayCard(),
           const SizedBox(height: 24),
           _buildSectionTitle('插件开发'),
           const SizedBox(height: 8),
@@ -1187,6 +1193,79 @@ class _SettingsPageState extends State<SettingsPage> {
         color: Color(0xFF94A3B8),
       ),
     );
+  }
+
+  /// 窗口与托盘卡片：关闭按钮的行为 + **真正的退出入口**。
+  ///
+  /// 为什么退出入口要放在设置页：默认关闭只隐藏窗口，如果用户关掉了托盘图标（Windows
+  /// 允许隐藏托盘区图标），他就只剩"任务管理器杀进程"这一条路——那正是本功能要避免的
+  /// 误终止。这里给一条明确的、两步确认过的退出路径。
+  Widget _buildTrayCard() {
+    final TrayService tray = TrayService.instance;
+    return Card(
+      margin: EdgeInsets.zero,
+      child: AnimatedBuilder(
+        animation: tray,
+        builder: (BuildContext context, _) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              SwitchListTile(
+                key: const Key('close_to_tray_switch'),
+                value: tray.closeToTray,
+                onChanged: (bool value) => tray.setCloseToTray(value),
+                secondary: const Icon(Icons.minimize_outlined),
+                title: const Text('关闭窗口时最小化到系统托盘'),
+                subtitle: Text(
+                  tray.trayReady
+                      ? '关闭按钮只隐藏窗口：Tree 与正在跑的任务继续运行。'
+                            '双击托盘图标恢复窗口，右键托盘图标可以「退出 Tree」。'
+                      : '当前环境托盘不可用（${tray.installError ?? '原因未知'}），'
+                            '关闭窗口会直接退出。',
+                ),
+              ),
+              const Divider(height: 1),
+              ListTile(
+                leading: const Icon(Icons.power_settings_new),
+                title: const Text('退出 Tree'),
+                subtitle: const Text('请核心优雅退出并关闭窗口；正在跑的任务会被终止'),
+                trailing: OutlinedButton(
+                  key: const Key('quit_tree_button'),
+                  onPressed: _confirmQuit,
+                  child: const Text('退出'),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  /// 退出前的二次确认（这是**会终止在跑任务**的动作，必须问一次）。
+  Future<void> _confirmQuit() async {
+    final bool confirmed =
+        await showDialog<bool>(
+          context: context,
+          builder: (BuildContext context) => AlertDialog(
+            title: const Text('退出 Tree？'),
+            content: const Text('正在跑的任务会被终止。仅关闭窗口不会终止任务——那只是把窗口收进托盘。'),
+            actions: <Widget>[
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('取消'),
+              ),
+              FilledButton(
+                key: const Key('quit_tree_confirm'),
+                onPressed: () => Navigator.of(context).pop(true),
+                child: const Text('退出'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+    if (!confirmed) return;
+    await TrayService.instance.quit();
   }
 
   /// 主题管理卡片

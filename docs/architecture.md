@@ -16,7 +16,12 @@ Flutter UI 进程（lib/）                     核心进程（packages/tree_cor
 
 - 核心只监听 `127.0.0.1`，**每次启动都重新生成一次性 token**，只经 stdout 的单行 JSON
   （`CoreHandshake`：`{port, token, pid, version}`）交给父进程；stdout 不放任何其它内容（日志走 stderr）。
-- 关窗时 UI 向核心 stdin 写一行 `shutdown`，核心优雅退出；超时才强杀，不留孤儿进程。
+- **关窗 ≠ 退出**（默认）：关闭按钮被 `window_manager` 拦下，改为隐藏窗口到系统托盘，核心与在跑的
+  agent 任务继续；真正退出走托盘菜单「退出 Tree」或设置页的退出按钮——那时才向核心 stdin 写一行
+  `shutdown`，核心优雅退出，超时才强杀，不留孤儿进程。托盘装不上时关闭按钮退回"直接退出"。
+- **同一数据根只允许一个实例**：UI 在拉起核心**之前**先抢一把回环端口锁（锁键 = 数据根：
+  `TREE_HOME`，未设即 `default`），第二个实例握手确认后立刻退出，并请已有实例把窗口叫到前面；
+  端口被别的程序占着时照常启动（不因为撞端口把用户挡在门外）。见 `lib/io/single_instance.dart`。
 - 核心可执行文件查找顺序：`TREE_CORE_EXE` → 应用同目录 → 向上 8 层找 `.output/tree_core.exe`（开发期）。
   都找不到时 UI 显示**带修复指引**的错误页。
 

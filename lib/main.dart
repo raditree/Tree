@@ -1,14 +1,20 @@
+import 'dart:async';
+import 'dart:io';
 // AppExitResponse 定义在 dart:ui（material/widgets 只转引类型，不导出枚举本体）
 import 'dart:ui' show AppExitResponse;
 
 import 'package:flutter/material.dart';
 import 'package:tree_protocol/tree_protocol.dart';
+import 'package:window_manager/window_manager.dart';
 
 import 'io/api_service.dart';
 import 'io/core_process_launcher.dart';
+import 'io/single_instance.dart';
+import 'io/tray_service.dart';
 import 'io/websocket_service.dart';
 import 'ui/pages/main_page.dart';
 import 'ui/theme_service.dart';
+import 'ui/widgets/close_to_tray_dialog.dart';
 
 /// 应用入口（desktop 分支：无登录、无后端地址配置）。
 ///
@@ -21,11 +27,29 @@ Future<void> main() async {
   // shared_preferences / path_provider 等插件依赖绑定先初始化
   WidgetsFlutterBinding.ensureInitialized();
 
+  // **单实例判定必须在拉起核心之前**：否则第二个核心已经起来了，两个核心共用同一个
+  // 数据根（会话/消息互相覆盖）。
+  final SingleInstanceState instanceState =
+      await SingleInstanceLock.instance.acquire();
+  if (instanceState == SingleInstanceState.alreadyRunning) {
+    // 已经请那个实例把窗口叫到前面了（托盘里的窗口会自己出来）。这个窗口只说明
+    // 一句就自己关闭：**绝不拉起第二个核心**。
+    runApp(const AlreadyRunningApp());
+    return;
+  }
+
+  // 关闭行为与主题一样属于本地偏好：先读出来，再决定关窗怎么做
+  await TrayService.instance.load();
+
+  // 窗口控制插件先初始化（关闭拦截放到"核心起来了"之后：见下面的注释）
+  await windowManager.ensureInitialized();
+
   // 加载本地保存的主题模式
   await ThemeService.instance.load();
 
   final CoreHandshake? handshake = await CoreProcessLauncher.instance.start();
   if (handshake == null) {
+    // 错误页**不拦截关闭**：这里连托盘都没装，拦下关闭按钮就等于让用户关不掉这个窗口
     runApp(CoreStartupErrorApp(
       message: CoreProcessLauncher.instance.lastError ?? '未知错误',
     ));
@@ -36,9 +60,34 @@ Future<void> main() async {
   WebSocketService.baseUrl = handshake.wsBaseUrl;
   ApiService.setToken(handshake.token);
 
-  // 启动期诊断（例如核心产物比界面旧）随 App 一起渲染：这类问题一旦发生，
-  // 现象是"界面有新功能、核心按旧行为跑"，不主动提示几乎无法自证。
-  runApp(AgentTeamApp(startupWarning: CoreProcessLauncher.instance.buildWarning));
+  // **拦截关闭按钮**：默认只隐藏窗口（见 [TrayService]），真正的退出走托盘菜单 /
+  // 设置页的退出入口。桌面端的长任务正在跑时，误点关闭等于终止整轮工作。
+  //
+  // 放在核心就绪之后：错误页那条路没有窗口监听者，拦下关闭会让用户关不掉窗口。
+  await windowManager.setPreventClose(true);
+
+  // 托盘装不上**不致命**，但必须显式告诉用户：此时关闭按钮会直接退出（见 TrayService）
+  await TrayService.instance.install();
+
+  // 另一个实例想启动时（用户又双击了桌面图标）：把本窗口叫到前面——用户期望看到的是
+  // "窗口回来了"，而不是"点了图标什么都没发生"。托盘不可用时也要能唤起（show 与托盘无关）。
+  SingleInstanceLock.instance.onActivate = TrayService.instance.showWindow;
+
+  // 启动期诊断（例如核心产物比界面旧、托盘不可用）随 App 一起渲染：这类问题一旦
+  // 发生，现象是"界面有新功能、核心按旧行为跑"或"关窗行为与预期不符"，不主动提示
+  // 几乎无法自证。
+  runApp(AgentTeamApp(startupWarning: _startupWarning()));
+}
+
+/// 启动期诊断（合并多条；都为空时返回 null）。
+String? _startupWarning() {
+  final List<String> parts = <String>[
+    if (CoreProcessLauncher.instance.buildWarning != null)
+      CoreProcessLauncher.instance.buildWarning!,
+    if (TrayService.instance.installError != null)
+      '系统托盘不可用（${TrayService.instance.installError}）：关闭窗口会直接退出 Tree。',
+  ];
+  return parts.isEmpty ? null : parts.join('\n');
 }
 
 /// 根 Widget - Agent 团队效率工具应用
@@ -216,25 +265,31 @@ class AgentTeamApp extends StatefulWidget {
   State<AgentTeamApp> createState() => _AgentTeamAppState();
 }
 
-class _AgentTeamAppState extends State<AgentTeamApp> {
+class _AgentTeamAppState extends State<AgentTeamApp> with WindowListener {
+  /// 对话框用的导航器 key（`onWindowClose` 是插件回调，手里没有 BuildContext）。
+  final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
+
   /// 应用退出钩子：请求核心优雅关闭（stdin 写 shutdown，超时再强杀）。
   ///
   /// 用 AppLifecycleListener 而不是 dispose：dispose 在窗口关闭流程中不保证
-  /// 被调用，而 onExitRequested 是桌面端"用户要求退出"的明确信号
-  /// （Windows runner 把 WM_CLOSE 转发给引擎，见 flutter_window.cpp 的
-  /// HandleTopLevelWindowProc）。
+  /// 被调用，而 onExitRequested 是桌面端"用户要求退出"的明确信号。
   ///
   /// **必须在 initState 里立即创建**：若写成 `late final _lifecycle = ...`
   /// 惰性初始化，则该监听器直到 dispose 才被构造（那时再注册观察者已无意义），
   /// 实测表现为"关窗后应用退出、核心进程变成孤儿继续占着端口与内存"。
+  ///
+  /// 注意它与 [onWindowClose] 的分工：`setPreventClose(true)` 之后，**点关闭按钮**
+  /// 由 window_manager 拦下（走 [onWindowClose]）；`onExitRequested` 只在平台自己
+  /// 发起退出时出现（如系统注销），那时不再问"要不要进托盘"，直接优雅退出。
   AppLifecycleListener? _lifecycle;
 
   @override
   void initState() {
     super.initState();
+    windowManager.addListener(this);
     _lifecycle = AppLifecycleListener(
       onExitRequested: () async {
-        await CoreProcessLauncher.instance.stop();
+        await TrayService.instance.quit();
         return AppExitResponse.exit;
       },
     );
@@ -242,8 +297,58 @@ class _AgentTeamAppState extends State<AgentTeamApp> {
 
   @override
   void dispose() {
+    windowManager.removeListener(this);
     _lifecycle?.dispose();
     super.dispose();
+  }
+
+  /// 用户点了关闭按钮（`setPreventClose(true)` 之后由 window_manager 转发）。
+  ///
+  /// 默认**只隐藏窗口**：核心与正在跑的任务继续。首次会问一次并记住选择；
+  /// 托盘不可用时 [TrayService.decideClose] 直接给 quit（绝不把用户关在门外）。
+  @override
+  void onWindowClose() {
+    unawaited(_handleWindowClose());
+  }
+
+  Future<void> _handleWindowClose() async {
+    final TrayService tray = TrayService.instance;
+    final TrayCloseAction action = TrayService.decideClose(
+      closeToTray: tray.closeToTray,
+      trayReady: tray.trayReady,
+    );
+    if (action == TrayCloseAction.quit) {
+      await tray.quit();
+      return;
+    }
+    if (tray.askOnClose) {
+      final CloseToTrayChoice? choice = await _askCloseToTray();
+      if (choice != null && choice.remember) {
+        await tray.setAskOnClose(false);
+        await tray.setCloseToTray(choice.hideToTray);
+      }
+      if (choice != null && !choice.hideToTray) {
+        await tray.quit();
+        return;
+      }
+    }
+    await tray.hideWindow();
+    // 这条行为在界面上没有痕迹（窗口直接消失），日志是唯一的自证材料
+    debugPrint('关闭窗口：已隐藏到系统托盘，核心与任务继续运行');
+  }
+
+  /// 首次关闭的说明框；拿不到上下文（极端时机）时返回 null，调用方按默认隐藏。
+  Future<CloseToTrayChoice?> _askCloseToTray() async {
+    final BuildContext? context = _navigatorKey.currentContext;
+    if (context == null) {
+      // 这条路只该在"界面还没建起来"时出现；记一行日志，免得"没弹说明框"变成谜
+      debugPrint('关闭窗口：拿不到对话框上下文，按默认隐藏到托盘');
+      return null;
+    }
+    return showDialog<CloseToTrayChoice>(
+      context: context,
+      builder: (BuildContext context) => const CloseToTrayDialog(),
+    );
   }
 
   @override
@@ -253,6 +358,7 @@ class _AgentTeamAppState extends State<AgentTeamApp> {
       builder: (BuildContext context, _) {
         return MaterialApp(
           title: 'Agent 团队效率工具',
+          navigatorKey: _navigatorKey,
           debugShowCheckedModeBanner: false,
           theme: AgentTeamApp._buildLightTheme(),
           darkTheme: AgentTeamApp._buildDarkTheme(),
@@ -385,6 +491,99 @@ class CoreStartupErrorApp extends StatelessWidget {
                     child: SelectableText(
                       message,
                       style: const TextStyle(fontFamily: 'Consolas', fontSize: 12),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 已经有一个实例在跑时的提示窗口。
+///
+/// 为什么不静默退出：用户双击桌面图标时期望的是"窗口回来了"。锁的持有者已经被
+/// [SingleInstanceLock.onActivate] 叫到前面——这里再给一句可读的解释，免得"窗口一闪
+/// 就没了"被当成启动失败。本进程**没有**拉起核心，所以自动关闭时直接 `exit(0)`
+/// 不会留下孤儿进程。
+class AlreadyRunningApp extends StatefulWidget {
+  const AlreadyRunningApp({
+    super.key,
+    this.autoCloseAfter = const Duration(seconds: 4),
+  });
+
+  /// 自动关闭时间（用户不点也自己退，不留一个无意义的窗口）。
+  final Duration autoCloseAfter;
+
+  @override
+  State<AlreadyRunningApp> createState() => _AlreadyRunningAppState();
+}
+
+class _AlreadyRunningAppState extends State<AlreadyRunningApp> {
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer(widget.autoCloseAfter, _dismiss);
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  void _dismiss() => exit(0);
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Tree 已在运行',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        fontFamily: 'Microsoft YaHei',
+        fontFamilyFallback: const ['PingFang SC', 'Noto Sans CJK SC', 'sans-serif'],
+        colorScheme: const ColorScheme.dark(
+          primary: AgentTeamApp.brandBright,
+          surface: AgentTeamApp.brandBlack,
+          onSurface: Color(0xFFE6F3EC),
+        ),
+        scaffoldBackgroundColor: AgentTeamApp.brandBlack,
+        useMaterial3: false,
+      ),
+      home: Scaffold(
+        body: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 560),
+            child: Padding(
+              padding: const EdgeInsets.all(32),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  const Text(
+                    'Tree 已经在运行',
+                    style: TextStyle(
+                      color: AgentTeamApp.brandBright,
+                      fontSize: 20,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    '已经有一个 Tree 实例在跑（可能收在系统托盘里），已为你把它的窗口叫到前面。\n'
+                    '同一个数据根只允许一个实例，这个窗口会自动关闭。',
+                  ),
+                  const SizedBox(height: 20),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: FilledButton(
+                      onPressed: _dismiss,
+                      child: const Text('知道了'),
                     ),
                   ),
                 ],
