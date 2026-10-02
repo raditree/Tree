@@ -36,6 +36,11 @@
   [store/README.md](packages/tree_core/lib/src/store/README.md) 不变量 10）：失败 / 停止提示与**重试进度**照常落库、
   照常下发（前端当普通气泡），但引擎重建请求时**整条跳过**（压缩重试进度同理）；`kind` 保持 `text`——
   不做新 kind 的理由：`system` 会被读成 system prompt，「进不进提示词」与消息类别是两件正交的事。
+- **工具批是原子的：批中途的注入不切开它**（[llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 6）：
+  一条 assistant 的 `tool_calls` 与它的**全部** tool 结果必须相邻；落在批中途的 hook 提示 / 用户插话
+  一律推迟到该批结果之后——工具结果逐条落库（远端 SSH 上的慢工具尤其容易让注入卡在两条之间），
+  就地发会把批切成"后半批没有 `reasoning_content`"，请求随即变成"以 tool 结果收尾、前面那条
+  `tool_calls` 没有 reasoning"⇒ 端点 400。
 - **grep 的三个数字各管一件事**（[tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 7）：
   `scannedFileCount` 是计数、`scannedFilePaths` 只留 20 条抽样、`GrepQuery.maxResults`（默认 200）是命中行数上限。
 - **成员与 leader 共享工作目录与 SSH、私有状态按 agent 分栏**（[team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 2/3/4）：

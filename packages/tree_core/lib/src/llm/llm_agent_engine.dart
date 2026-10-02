@@ -441,6 +441,13 @@ class LlmAgentEngine implements AgentEngine {
   /// （Q1-②：每次构造上下文都要过一遍，历史重载同样生效）；但**有落库的
   /// "送模型那一份"时优先用它**，门控只是老数据的回退路径。
   ///
+  /// **不变量（工具批是原子的）**：一条 assistant 的 `tool_calls` 与它的**全部**
+  /// tool 结果必须相邻成一块——中间不得插进任何 user / notice 消息。落在批中途的
+  /// "有人说话"（hook 完成提示、用户插话）一律**推迟到这一批的结果之后**再发：就地发
+  /// 会把批切成两半，后半批没有可挂的 `reasoning_content`，请求随即变成"以 tool 结果
+  /// 收尾、前面那条 tool_calls 没有 reasoning"⇒ 思考模式端点 400（真机现场见
+  /// `.self/plan/20261001-thinking-400-and-interrupt/recon-addendum.md`）。
+  ///
   /// [passBackReasoning] = 模型配置里的 `thinking` 开关：开启时把历史思考挂回
   /// 对应的 assistant 消息（DeepSeek 的 `reasoning_content`，带 tools 时必须回传，
   /// 否则同会话后续请求持续 400）；关闭时维持原行为（思考不回灌）。
@@ -504,6 +511,45 @@ class LlmAgentEngine implements AgentEngine {
     // 本轮的思考正文：挂到本轮的**那一条** assistant 消息上（有工具调用 → 带
     // tool_calls 的那条；没有 → 正文那条）。DeepSeek 思考模式的硬要求见 flushRound。
     final List<String> pendingReasoning = <String>[];
+    // 落在工具批**中间**的"有人说话"（hook 提示 / 用户插话）：先攒着，等这一批的工具
+    // 结果**全部**落地之后再按顺序发出去。
+    //
+    // 为什么必须推迟（真机 400 现场，2026-10-02 18:14，member 跑在远端 SSH 上）：
+    // 一条 assistant 消息可以带多个工具调用，但它们的**结果是逐条落库**的——第 3 个
+    // write 走同一条 SSH、比前两个晚 ~20s 才回来，期间 hook 的完成提示（notice）
+    // 正好卡在第 2、3 条之间。旧实现就地把它发成 user 消息，这一批被切成两半：前半批
+    // 带着本轮的 reasoning，**后半批没有**——而 reasoning_content 只能挂在"带
+    // tool_calls 的那条"上，于是请求变成"以 tool 结果收尾、前面那条 tool_calls 没有
+    // reasoning_content"，端点直接 400
+    // `The reasoning_content in the thinking mode must be passed back to the API.`
+    // （recon-addendum.md 记着这条现场）。结构上也如此：user 消息不能插在
+    // assistant(tool_calls) 与它自己的 tool 结果之间。
+    final List<CoreMessageRef> deferredInputs = <CoreMessageRef>[];
+
+    /// 把一条"有人对模型说话"的记录发成 `user` 消息（用户消息 / hook 提示同一条路）。
+    ///
+    /// 批中途落进来的那些由 [flushRound] 在批**之后**调用它——同一条函数才能保证
+    /// "就地发"与"推迟发"出去的字面完全一致（附件说明段与像素块两段口径都在这里）。
+    Future<void> emitUser(CoreMessageRef ref) async {
+      // 用户上传的附件：路径必须写进提示词（附件已由前端上传到工作空间），否则
+      // 模型对"用户发了图/文件"这件事一无所知 —— 只有 UI 气泡上的一张卡片。
+      // 附件说明段与压缩估算共用同一个纯函数，两处口径逐字一致。
+      final String content = ref.isUser
+          ? '${ref.content}${attachmentsPromptSuffix(ref.attachments)}'
+          : ref.content;
+      // 空内容跳过：**只有附件、没有正文**的消息不能算空——它带着附件路径，
+      // 整条丢掉等于用户什么都没发（修复前的行为）。
+      if (content.trim().isEmpty) return;
+      // 图像附件的**像素**：`if_vision` 打开时先在端点上传拿到 file_id，再把
+      // 引用作为内容块挂在同一条 user 消息上（模型才真的"看得见"图）。解析失败
+      // 只是少一个块——正文里的路径说明段还在，模型仍知道去哪读。
+      final List<LlmContentPart> parts = ref.isUser
+          ? await _visionParts(vision, config, context.agentId, ref.attachments)
+          : const <LlmContentPart>[];
+      out.add(
+        LlmMessage(role: LlmRole.user, content: content, contentParts: parts),
+      );
+    }
 
     /// 一轮 = (思考*) (正文?) (工具卡*)，把这一轮落地成端点消息。
     ///
@@ -583,6 +629,11 @@ class LlmAgentEngine implements AgentEngine {
       toolBatch.clear();
       // 推理只属于它所在的那一轮（已经挂出去了）
       pendingReasoning.clear();
+      // 批（assistant + 它的**全部** tool 结果，相邻）已经落地，现在才轮到批中途
+      // 插进来的那些话——顺序与它们落库的先后一致。
+      while (deferredInputs.isNotEmpty) {
+        await emitUser(deferredInputs.removeAt(0));
+      }
     }
 
     // 已压缩的前缀不再翻译：它的内容已经由摘要代表，再发一遍等于没压缩
@@ -615,36 +666,29 @@ class LlmAgentEngine implements AgentEngine {
       // 它既不是模型说的话，也不该装成模型说的话；而且实测（recon.md）表明带 tools
       // 的思考模式端点不允许请求**以"没有 reasoning_content 的 assistant 消息"收尾**，
       // 而这类提示恰恰总是被追加到历史末尾（`wake`）——之前正是它导致连续 400。
+      // 第二批现场（recon-addendum.md）：它也可能落在**工具批中间**（批的结果是逐条
+      // 落库的），那就推迟到批之后——就地发会把批切出一个没有 reasoning 的后半批。
       final bool asUser = ref.isUser || ref.isNotice;
-      // 用户消息 / hook 提示之前先把上一轮的 assistant 段落落地（顺序不能变）
-      if (asUser) await flushRound();
-      // 用户上传的附件：路径必须写进提示词（附件已由前端上传到工作空间），否则
-      // 模型对"用户发了图/文件"这件事一无所知 —— 只有 UI 气泡上的一张卡片。
-      // 附件说明段与压缩估算共用同一个纯函数，两处口径逐字一致。
-      final String content = ref.isUser
-          ? '${ref.content}${attachmentsPromptSuffix(ref.attachments)}'
-          : ref.content;
-      // 空内容跳过：**只有附件、没有正文**的消息不能算空——它带着附件路径，
-      // 整条丢掉等于用户什么都没发（修复前的行为）。
-      if (content.trim().isEmpty) continue;
+      // 用户消息 / hook 提示之前先把上一轮的 assistant 段落落地（顺序不能变）；
+      // 但**工具批还没走完时不能落地**：就地发出去会把这一批切成两半，后半批没有
+      // 可挂的 reasoning（见 deferredInputs 的现场）。推迟到批的结果之后再说。
       if (asUser) {
-        // 图像附件的**像素**：`if_vision` 打开时先在端点上传拿到 file_id，再把
-        // 引用作为内容块挂在同一条 user 消息上（模型才真的"看得见"图）。解析失败
-        // 只是少一个块——正文里的路径说明段还在，模型仍知道去哪读。
-        final List<LlmContentPart> parts = ref.isUser
-            ? await _visionParts(
-                vision,
-                config,
-                context.agentId,
-                ref.attachments,
-              )
-            : const <LlmContentPart>[];
-        out.add(
-          LlmMessage(role: LlmRole.user, content: content, contentParts: parts),
-        );
+        if (toolBatch.isNotEmpty) {
+          deferredInputs.add(ref);
+          log?.call(
+            '工具批中途落进一条${ref.isNotice ? 'hook 提示' : '用户消息'}'
+            '（该批已有 ${toolBatch.length} 条工具结果）：推迟到这一批的结果之后'
+            '——批不能被切开，否则带 tool_calls 的 assistant 会缺 '
+            'reasoning_content（思考模式端点会 400）',
+          );
+          continue;
+        }
+        await flushRound();
+        await emitUser(ref);
         continue;
       }
       // 普通 assistant 正文段：并入本轮（工具卡之后又来正文 = 新的一轮）
+      if (ref.content.trim().isEmpty) continue;
       if (toolBatch.isNotEmpty) await flushRound();
       pendingText.add(ref);
     }
