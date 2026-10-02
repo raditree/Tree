@@ -6,6 +6,8 @@ import 'package:flutter/services.dart';
 import '../../app_version.dart';
 import '../../io/api_service.dart';
 import '../../io/tray_service.dart';
+import '../services/code_highlight.dart';
+import '../services/editor_settings.dart';
 import '../theme_service.dart';
 
 /// 设置页面（desktop 分支：账号/等级/密码/后端地址/注销 五组设置已删除）
@@ -409,6 +411,10 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 8),
           _buildTrayCard(),
           const SizedBox(height: 24),
+          _buildSectionTitle('编辑器'),
+          const SizedBox(height: 8),
+          _buildEditorCard(),
+          const SizedBox(height: 24),
           _buildSectionTitle('插件开发'),
           const SizedBox(height: 8),
           _buildPluginDevCard(),
@@ -418,6 +424,74 @@ class _SettingsPageState extends State<SettingsPage> {
           _buildVersionCard(),
         ],
       ),
+    );
+  }
+
+  /// 编辑器卡片：代码高亮 + 失焦/离开时自动保存。
+  ///
+  /// 为什么没有「定时自动保存」：定时器会在人正打到一半时写盘；真正会丢内容的
+  /// 时刻是切走 / 关窗格，所以自动保存只做那两个时机（用户 2026-10-02 定夺）。
+  Widget _buildEditorCard() {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return ListenableBuilder(
+      listenable: EditorSettings.instance,
+      builder: (BuildContext context, Widget? child) {
+        final EditorSettings settings = EditorSettings.instance;
+        return Card(
+          margin: EdgeInsets.zero,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  '源码模式',
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: cs.onSurface,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '源码按扩展名选择语言着色（Dart / Python / JS / Go / SQL / YAML …）；'
+                  '超过 ${kHighlightMaxChars ~/ 1024} KB 的文件自动退回单色，保证输入不卡。'
+                  '编辑仅限纯文本：图片 / PDF / Office / 二进制一律只读，'
+                  '被截断的大文件也只读（否则保存会把文件截短）。'
+                  '本机与 SSH 模式都由核心落盘，前端不直接写盘。',
+                  style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                ),
+                const SizedBox(height: 4),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  dense: true,
+                  value: settings.highlight,
+                  onChanged: (bool value) => settings.setHighlight(value),
+                  activeThumbColor: cs.primary,
+                  title: const Text('语法高亮', style: TextStyle(fontSize: 13)),
+                  subtitle: const Text(
+                    '关掉后退回单色等宽（大文件无论如何都不着色）。',
+                    style: TextStyle(fontSize: 11),
+                  ),
+                ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  dense: true,
+                  value: settings.saveOnBlur,
+                  onChanged: (bool value) => settings.setSaveOnBlur(value),
+                  activeThumbColor: cs.primary,
+                  title: const Text('切走 / 关闭时自动保存', style: TextStyle(fontSize: 13)),
+                  subtitle: const Text(
+                    '开启：失焦、关闭窗格、换文件时自动写回未保存的改动（不再弹确认框）；'
+                    '关闭：只认手动保存（Ctrl+S 或标题栏保存键），离开前会问一次。',
+                    style: TextStyle(fontSize: 11),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 

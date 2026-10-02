@@ -708,119 +708,33 @@ Test 团队（leader `agt_1790848305616_be41c9_3`，成员 Developer `member_179
    `kPluginGuideWorkspacePath` / `ToolResultGate.resultsDir` 里，装饰器让它们一个都不用改。
    核心启动时把旧 `.self` **一次性迁移**到 TOP 的分栏（`migrateLegacySelfDir`，幂等）。
 7. **成员跟随 leader 的 SSH**（`teamSshConfigFor`）：成员自己没有 `ssh:` 配置时用团队 TOP 那份
-   （同一台远端主机、同一个根），接进 CLI 的 `resolveSshConfig`（工具后端）与系统提示词；
-   显式给自己配了 `ssh:` 的成员仍以自己那份为准。
-8. **删 agent 的两道闸门 + 悬空指针自愈**（同日订正，实测驱动）：
-   - **问题**：用户直接 `DELETE /api/agents/{id}` 删掉一个**中间层 leader** 时，它的下级留在库里但
-     `parent_agent_id` 悬空——实测 `directMembers` 不含它（broadcast 不达）、`cascadeIds(top)` 只返回 `[top]`
-     （级联停止/删除够不着）、`remove_member` 也报「不可移除非直属/下级成员」（`_subtree` 同样沿父链走），
-     而它**仍可被按名寻址、真的会跑**；`leader_name` 变空、relation 变 indirect。删掉 **TOP** 时更彻底：
-     `teams()` 里整队消失、成员的 `team_id` 指向幽灵、每个成员都把自己当 team leader。
-   - **修复 ①（闸门）**：`DELETE /api/agents/{id}` 有下级时回 **409 + `cascade_required`**（沿用 team 工具的字段形状），
-     必须显式 `?cascade=1` 才按叶→根连整棵子树删；**任一相关会话正在运行也回 409**（`running` + 提示先停止），
-     通过后才「停（作废排队任务 + 收尾在途提问）→ 排水 → 清提问 → 删 → 回填 TOP 的 `team_member_count`」。
-     为什么不等它收尾：`stop` 抢不动正在执行的工具（本地执行活着就永不超时），等会把 HTTP 挂住，而「删掉正在写的
-     agent」正是残留的来源（继续写共享工作目录、回一条来自幽灵成员的消息、`data/<id>` 被写回来）。
-   - **修复 ②（自愈，管历史数据）**：核心启动时 `repairTeamLinks` 修一次——上级还在 ⇒ 重挂到 TOP 且整棵子树的
-     `team_id`/`level` 一起平移；团队也没了 ⇒ 最上层孤儿**升为独立顶层 agent**；`team_id` 悬空但父链完好 ⇒ 按父链修正。
-     每个被改的 `agents/<id>.yaml` **先备份成 `.bak.<n>`**（n 递增、绝不覆盖），幂等。
-   - **修复 ③（提问回路硬化）**：删除时会摘掉该 agent 的提问记录，而 `QuestionBroker.cancel` 原来「记录没了就提前返回、
-     不完成 completer」⇒ 正在等答案的**工具永远拿不到结果**：那一轮不收敛、`isRunning` 永远为真、
-     `cancelForAgent`/`stop` 也救不回来（它们按 store 的 pending 列表遍历）。现在 `cancel` 对「记录已不在但有在途等待」
-     照样收尾，删除路径也改成**先经 broker 取消、再摘记录**。
-   - **顺带修正**：用户侧删除也回填 `team_member_count`（此前只有 team 工具回填，删除后 yaml 里停在旧值）；
-     `list_members` 由成员调用时不再把自己列两遍；`remove_member` 里「其工作空间已回收」的提示删掉
-     （工作空间与 `.tree/<id>` 分栏其实**保留**，供审计）；发送者已被删时活动日志/前缀不再回裸 id。
-   - **UI**：`ApiService.deleteAgent` 解析 409 响应体（`AgentDeleteBlocked`），有下级时摊开清单请确认后带
-     `?cascade=1` 重试，运行中则提示先停止；删**成员**不再清插件作用域（只有删 TOP 才回落）。
-   - **验证**：新增 `test/agent_delete_api_test.dart`（7 例）、`test/team_repair_test.dart`（7 例）、
-     `test/question_broker_test.dart` 两条硬化用例、`test/team_service_test.dart` 的 list_members 用例、
-     前端 `test/agent_delete_flow_test.dart`（源码钉子）。反证做过：去掉闸门 ⇒ 两条 409 用例红；
-     关掉子树平移 ⇒ 自愈用例红；去掉「先收尾提问」⇒ 删除用例红（修复前实测过）。
 
-### 验证（2026-10-02）
+## #11 源码编辑器（着色 / 编辑保存 / 分屏）的边界与取舍
 
-- 新增 `test/message_interrupt_test.dart`：「跨会话的新消息不打断在途那一轮：两个会话**并行**跑（不排队）」
-  （`interruptedRunCount == 0`、`activeRunCount == 2`、两轮都没有 `cancelledAtEnd`）与
-  「stop 是 agent 级的：并行在跑的每个会话都被停掉」；
-- 新增 `test/message_dispatcher_test.dart`：「默认把接收方归集到**发起会话**」、「显式 `session_id` 优先」；
-- 新增 `test/team_workspace_test.dart`：TOP 解析到自己、成员（含多级）解析到 TOP、成员自己的
-  `workspace_dir` 无效、TOP 未配置时用 TOP 的默认目录、上级不存在/成环不死循环；并钉住两个接线点
-  （`FileService.rootFor`、接线后的 `workspacePromptSuffix` 说 TOP 的目录、TOP 自己的提示词字节不变）、
-  `teamSshConfigFor`（成员继承 TOP 的 ssh / 自己配了就用自己那份 / TOP 口径不变）；
-- 新增 `test/private_workspace_io_test.dart`：`mapPrivatePath` 只翻 `.self` 一族（真实路径与普通路径
-  原样通过）、读写/编辑/搜索/列目录都落在 `.tree/<agent_id>/.self/…`、本机后端调文件面板接口显式报错、
-  `migrateLegacySelfDir` 搬得动 / 幂等 / 目标已存在不覆盖。
+**状态**：**已知边界 + 刻意取舍**（2026-10-02 定稿）。这一版给文件查看器加了「按语言着色 + 就地编辑保存 + VS Code 型二分屏」，
+下面这些是**故意**留的口径，不是没做完：
 
-### 已知边界（须知，非遗留缺陷）
+### 只读的四类文件（不打算放开）
 
-- **同一 agent 的不同会话是并行的**：会话 A 在跑时，会话 B 的消息**立刻并行启动**（既不打断 A、也不排到
-  A 后面）；同一会话内的插话（打断）与排队语义不变。`stop` 按 agent 生效（停掉它的全部在途会话与排队任务）。
-  并行不共享可变状态：工具、落库、分段推送、提问回路都按会话键（`agentId|sessionId`，提问取消已用
-  `cancelForSession`），共享的只有工作空间与全局设置。原「消息切入模式」开关已按用户要求删除。
-- **成员仍有独立的 agent 文件与 `workspace_id`**：共享的是**工作目录**（`teamWorkspaceFor`），
-  `workspace_id` 保持唯一以免 `FileService.agentFor` 把 leader 的 workspace 解析成成员（那会让
-  SSH 团队的远端文件面板错落到成员的本机目录）。`GET /api/agents` 仍返回全部 agent（提问归因、
-  提问导航要按 id 找成员）；**左栏也列出成员**（同日二改，见上面第 4 条），不再有「只在左栏过滤」的旧口径。
-- **运行中的 agent 删不掉（按设计）**：`stop` 停不住正在执行的工具，所以 `DELETE` 只接受空闲的 agent；
-  一个跑着长命令的成员在它跑完前删不掉，唯一逃生口是重启核心。这是「删掉正在写的 agent 会留下残留」与
-  「不按时间杀进程」两条约束的必然取舍。
-- **删除不回收工作空间**：`DELETE` 删 `agents/<id>.yaml`、`data/<id>/` 与该 agent 的提问；
-  `<共享根>/.tree/<id>/`（私有状态、活动日志）与 `workspaces/<id>` **按要求保留**供审计，要清理需手工删除。
-- **私有状态按 agent 分栏**：`.self/…`（模型口径）在磁盘上是 `.tree/<agent_id>/.self/…`
-  （`PrivateWorkspaceIO` 单向翻译；**终端命令不经过翻译**，提示词里已把真实路径告诉模型）。
-  核心启动时把旧工作空间的 `.self` 一次性迁移到 `.tree/<TOP id>/.self`（`migrateLegacySelfDir`，
-  幂等、失败只记日志）；成员以前各自的工作目录（`workspaces/<member_id>`，例如 Developer 的
-  `hello.http`）留在原地不搬——要搬请手工处理。
-- **成员跟随 leader 的 SSH**：成员自己没有 `ssh:` 配置时用 TOP 那份（`teamSshConfigFor`），
-  因此成员与 leader 在同一台远端主机、同一个根下；远端工作空间不在本机 ⇒ 该成员的本地活动
-  日志 / 文件投递不适用（与"leader 自己是 SSH agent"同一口径：`workspaceDirOf` 返回空串）。
-  显式给自己配了 `ssh:` 的成员仍以自己那份为准（手工配置优先）。
+图片 / PDF / Office（复杂格式）、**被截断的大文件**（只预览了前一段，写回去等于把文件截短）、含 NUL 的二进制、
+分屏里同一个文件的第二个窗格（两份缓冲各写各的，后保存的那次会覆盖对方），以及设置里关掉自动保存时的"要不要保存"确认。
+判据里「是不是文本」**看字节不看扩展名**：前 4 KB 出现 NUL 就当二进制——扩展名骗人的文件不会被渲染成乱码。
 
----
+### 编码：沿用原代码页，编不回去就拒绝
 
-## #10 半路断流（已产出增量之后才断）不重放：需要"续写"才能自动接上
+保存走工作空间 IO 抽象（与工具层 `write` 同一条路）：既有文件是 UTF-8 就写 UTF-8；是 GBK 之类**非 UTF-8 就按同一代码页写回**；
+新内容里有原编码表示不了的字符时**显式报错**，绝不静默转成 UTF-8（那等于替用户改文件编码）。两个例外：文件为空或**超过 1 MiB**
+的既有文件按 UTF-8 写（嗅探编码要整读一遍，不值当）。因此：读得到的内容一定能写回去，写不回去的一定会说出来。
 
-**状态**：**已知边界**（2026-10-02 定稿）。有限重试只覆盖"一个事件都还没交给上层"的那一类。
-**影响**：端点**已经开始吐正文**之后连接断掉时，这一轮仍以 `AgentError` 收场（已吐出的部分保留在界面上），
-用户要重新说一句"继续"，而不是自动接续。
+### 没做端到端，也没在真机 SSH 上跑过
 
-### 现象
+- 前端：假核心 HttpServer 覆盖了"请求打到哪、body 里有什么、409 走哪个分支"；着色与只读闸门是纯单测。
+- 核心：`writeContent` 的远端分支只用了**假后端**（把本机 IO 当 SSH 后端）验证分派与落盘，**没有真机 SSH 验证**；
+  「只实现 `WorkspaceIO`、不实现 `WorkspaceFiles`」的半接入远端后端返回可读 400（真实 `SshWorkspaceIO` 不会走到）。
+- 全程**没有启动 Tree 应用**：界面是靠 golden 渲染 + 组件测试看的，安装目录/数据根未被动过。
 
-```
-读取模型响应失败：HttpException: Connection closed while receiving data,
-uri = https://api.deepseek.com/chat/completions
-```
+### 编辑器内核：够用，但不假装是 VS Code
 
-用户实测报的就是这一条。它与传输层的两个失败出口对应：建连 + 等响应头超时（`connectTimeout`）、
-或流式读取中途抛错；从文案看是后者。
-
-### 为什么不重放（取舍，不是遗漏）
-
-重试判据是**"这一次尝试一个事件都还没交给上层"**（[llm_transport.dart](../packages/tree_core/lib/src/llm/llm_transport.dart)
-`stream()` 里的 `produced` 标志）：
-
-- 重放的前提是"上层什么都没看见"。一旦已经 `yield` 过正文 / 思考增量，那些字节**收不回来**——
-  前端已经渲染、已经计入这一轮输出；重放会让同一轮出现**两段并列的正文**，并让端点**重复计费**。
-- **工具不会被执行两次**：工具只在流正常结束后才执行（`llm_session.dart` 里先判 `if (failed)` 再进工具循环），
-  所以"重复副作用"这条风险不存在。真正的代价是重复输出与重复计费。
-
-### 证据
-
-- `packages/tree_core/test/http_sse_transport_test.dart` 的『有限重试』组：
-  「已经吐出正文再断流：不重试（重放会与已渲染的正文并列）」（裸 socket 端点先发一个**完整** SSE 事件再掐断，
-  断言 `LlmRetryNotice` 为空、最后一个事件是失败）；
-- 对偶用例：「连接被掐断（零事件）→ 自动重试后成功」（同一端点先掐断、第二次正常返回，断言上层只看到一条成功流、
-  端点实收 2 次请求）。
-
-### 修复方向（未做，等定夺）：断流**续写**
-
-正确做法不是重放整轮，而是把已收到的部分当成 **assistant 前缀**，再请求"接着写"：
-
-1. 断流时保留已收到的正文 / 思考（现在也保留，只是以失败收场）；
-2. 补一次请求：`[assistant(已收到部分), user(从中断处继续，不要重复已写内容)]`（或端点原生的 continuation 形态）；
-3. 界面上把两段拼成**一条**消息，而不是两条并列气泡。
-
-要先定三件事：续写的**触发条件**（哪些失败算可续写）、**最多续几次**（建议 2）、
-以及续写轮次与 `AgentDone` / 工具轨迹的边界（避免新前缀与已落库的工具卡错位）。
-在定下来之前，保持"如实报错 + 部分内容保留"是最不容易出错的行为。
+没有行号栏、没有 Tab 键缩进 / 自动补全 / 多光标 / 代码折叠 / 诊断，也没有"保存时格式化"。这些要真编辑器内核（Monaco / CodeMirror
+那一类），而桌面线与核心都要能**离线构建**——引一个高亮包就多一条版本与许可证链，所以这一版自己做词法着色，范围到此为止。
+分屏也只做二分（1–2 个窗格），不做自由网格。

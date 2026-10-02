@@ -16,8 +16,8 @@
 | [ui/pages/main_page.dart](ui/pages/main_page.dart) | 三栏骨架、agent 列表（顶层 agent + 团队成员）、会话切换、插件槽位作用域 |
 | [ui/widgets/message_panel.dart](ui/widgets/message_panel.dart) | 中栏消息流：分段渲染、工具/思考**一行式**（完整内容见右栏「详情」页）、提问卡片、断线重播去重、按 agent+会话过滤 |
 | [ui/widgets/teammates_window_page.dart](ui/widgets/teammates_window_page.dart) | 团队成员拓扑与成员工作进度窗口 |
-| [ui/widgets/](ui/widgets/) | 文件面板 / 查看器 / PDF 预览、Spec、待办、提问、插件、MCP、模型信息、Git 历史、设置页 |
-| [ui/services/](ui/services/) | 重播守卫、下载中心、会话重命名、插件 UI 槽位注册、主题 |
+| [ui/widgets/](ui/widgets/) | 文件面板 / 查看器（源码高亮 + 编辑保存 + 分屏，见 [split_panes.dart](ui/widgets/split_panes.dart)）/ 消息输入框（[message_input.dart](ui/widgets/message_input.dart) + [attachment_preview.dart](ui/widgets/attachment_preview.dart)）/ 右栏详情（[detail_panel.dart](ui/widgets/detail_panel.dart)）、PDF 预览、Spec、待办、提问、插件、MCP、模型信息、Git 历史、设置页 |
+| [ui/services/](ui/services/) | 重播守卫、下载中心、会话重命名、插件 UI 槽位注册、主题、**代码高亮（[code_highlight.dart](ui/services/code_highlight.dart)）**、**编辑器偏好（[editor_settings.dart](ui/services/editor_settings.dart)）**、详情选中（[detail_selection.dart](ui/services/detail_selection.dart)） |
 
 ## 不变量（assertions）
 
@@ -73,6 +73,21 @@
     右栏收着时自动展开。选中项走 [DetailSelection](ui/services/detail_selection.dart)（全局 ChangeNotifier，存消息**快照**，
     帧后按 id 刷新——跑着的工具 / 思考内容是原地变更的，必须跟着长），切 agent / 整表重拉时清空。
 
+12. **源码模式按语言着色，且只能编辑纯文本**（[ui/services/code_highlight.dart](ui/services/code_highlight.dart)、
+    [ui/widgets/file_viewer.dart](ui/widgets/file_viewer.dart)、[io/api_service.dart](io/api_service.dart) 的 `saveFileContent`）：
+    着色不引第三方包，一张规则表 + 单遍扫描（关键字 / 类型 / 字符串 / 注释 / 数字 / 注解 / 函数名），
+    **只在 ≤ 128 KB 时着色**（超过退回单色，保证输入不卡），记号按「文本 + 配色」缓存——按键才重算一次；
+    是否文本**看字节**（前 4 KB 有 NUL 就当二进制，扩展名骗人的文件不会被渲染成乱码）。只读闸门（缺一不可）：
+    图片 / PDF / Office（复杂格式）、**被截断的大文件**（写回去等于把文件截短）、含 NUL 的二进制、分屏里被锁的副本。
+    保存**一律走核心** `PUT /api/files/{id}/content`（本机与 SSH 同一套，前端不直接写盘），带 `if_size` 做外部改动检测：
+    磁盘现值不符 → 409 → UI 给「覆盖保存（force）/ 放弃我的改动并刷新 / 取消」。自动保存只做**失焦与离开**
+    （切走、关窗格、换文件、关查看器；可在设置里关掉改成纯手动 Ctrl+S），**没有定时器**——定时写入会打断正在输入的思路。
+
+13. **分屏（VS Code 型）只做二分**（[ui/widgets/split_panes.dart](ui/widgets/split_panes.dart) +`file_panel`）：左右 / 上下可切、
+    分隔可拖（夹在 0.2–0.8，同方向最小 120px）、每格独立打开文件与保存、可用空间太窄降级成单窗格。
+    **同一个文件**在两个窗格里打开时，非活动窗格强制只读——两份缓冲各写各的，后保存的那次会把对方写的覆盖掉。
+    换文件 / 关窗格前先 `confirmLeave()`：开着失焦保存就静默写回，关着就问「保存 / 不保存 / 取消」。
+
 ## 测试
 
 ```bash
@@ -88,4 +103,9 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 「+」菜单展开原位变高与 Esc 收起、图片缩略图 vs 文件卡、点开预览）、`test/attachment_preview_test.dart`
 （附件预览：扩展名分类与大小文案、三档读取（文本 / 二进制 / 图片 / 缺失 / 目录 / 截断）、预览对话框）、
 `test/tool_row_detail_test.dart`（一行式：中文标签 + 关键参数、行尾增量、悬停提亮、点击 → 详情页完整参数与结果、空态与关闭、
-派生文本纯函数、右栏页签接线源钉）、`test/message_stream_style_test.dart`（模型消息高亮块不套边框、用户消息仍是气泡）。
+派生文本纯函数、右栏页签接线源钉）、`test/message_stream_style_test.dart`（模型消息高亮块不套边框、用户消息仍是气泡）、
+`test/code_highlight_test.dart`（语言识别、各语言词法、注释与字符串的优先级、未闭合块注释、记号不重叠、控制器着色 +
+大文件退回单色 + 输入法组字交回平台）、`test/file_editor_test.dart`（真起假核心 HttpServer：改一下就进未保存态、Ctrl+S 发出
+完整内容与 `if_size`、保存失败给可见原因、409 冲突 → 覆盖保存带 force=1、截断/二进制/图片/分屏副本四种只读闸门、
+失焦保存的开与关、返回时静默写回或问一次）、`test/split_panes_test.dart`（二分几何、拖动比例、夹取、太窄降级、
+文件面板的分屏接线源钉）。

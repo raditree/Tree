@@ -13,6 +13,7 @@ import 'io/single_instance.dart';
 import 'io/tray_service.dart';
 import 'io/websocket_service.dart';
 import 'ui/pages/main_page.dart';
+import 'ui/services/editor_settings.dart';
 import 'ui/theme_service.dart';
 import 'ui/widgets/close_to_tray_dialog.dart';
 
@@ -46,6 +47,8 @@ Future<void> main() async {
 
   // 加载本地保存的主题模式
   await ThemeService.instance.load();
+  // 编辑器偏好（高亮 / 失焦保存）：读了才画界面，避免先默认再跳一次
+  await EditorSettings.instance.load();
 
   final CoreHandshake? handshake = await CoreProcessLauncher.instance.start();
   if (handshake == null) {

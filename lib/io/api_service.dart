@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 
 import '../ui/models/agent.dart';
+import '../ui/models/file_content.dart';
 import '../ui/models/file_node.dart';
 import '../ui/models/session.dart';
 
@@ -51,6 +52,30 @@ class AgentDeleteBlocked implements Exception {
 
   @override
   String toString() => hint.isEmpty ? message : '$message（$hint）';
+}
+
+/// `PUT /api/files/{id}/content` 因文件被外部改动而拒绝（409）时抛出。
+///
+/// 为什么单独一个类型：这不是「保存失败」，而是「你手里的不是最新版」——UI 要能
+/// 给出可操作的三选一（覆盖保存 / 放弃我的改动并刷新 / 取消），就得把它和网络错误、
+/// 400 拒绝分开。
+class FileWriteConflict implements Exception {
+  const FileWriteConflict({
+    required this.detail,
+    this.currentSize,
+  });
+
+  /// 可直接展示的中文原因
+  final String detail;
+
+  /// 磁盘上**现在**的字节数（文件已不存在时为空）
+  final int? currentSize;
+
+  /// 文件已经不在了（被删或改名）
+  bool get missing => currentSize == null;
+
+  @override
+  String toString() => detail;
 }
 
 /// API 服务 - 封装对**本机核心进程**的 REST 调用。
@@ -143,6 +168,91 @@ class ApiService {
       query: {'path': path, if (teamId.isNotEmpty) 'team_id': teamId},
     );
     return data['content'] as String? ?? '';
+  }
+
+  /// 获取文件内容 + 元信息（编辑用）。
+  ///
+  /// 与 [getFileContent] 打同一个端点，但**不丢** `size` / `truncated`：截断的内容
+  /// 不能编辑保存，外部改动检测也依赖加载时的字节数。
+  static Future<FileContentInfo> getFileContentInfo(
+    String workspaceId,
+    String path, {
+    String teamId = '',
+  }) async {
+    final Map<String, dynamic> data = await _getJson(
+      '/api/files/$workspaceId/content',
+      query: <String, String>{
+        'path': path,
+        if (teamId.isNotEmpty) 'team_id': teamId,
+      },
+    );
+    return FileContentInfo(
+      content: data['content'] as String? ?? '',
+      size: (data['size'] as num?)?.toInt() ?? 0,
+      truncated: data['truncated'] == true,
+      path: data['path'] as String? ?? path,
+    );
+  }
+
+  /// 保存文本文件内容（`PUT /api/files/{id}/content`）。
+  ///
+  /// 只支持**纯文本**：图片 / PDF / Office / 二进制由核心按扩展名 + NUL 探测拒绝
+  /// （detail 给中文原因），前端不做也不该做第二套判定。本机与 SSH 两种模式都经
+  /// 核心落盘——前端不直接写盘（见 lib/README.md 不变量 1）。
+  ///
+  /// [ifSize] = 加载时看到的字节数：与磁盘现值不符时核心回 409
+  /// （[FileWriteConflict]），免得把外部（agent 或另一个编辑器）刚写的内容覆盖掉；
+  /// [force] = 用户确认覆盖。返回写入后的字节数。
+  static Future<int> saveFileContent(
+    String workspaceId,
+    String path,
+    String content, {
+    String teamId = '',
+    int? ifSize,
+    bool force = false,
+  }) async {
+    final Uri uri = Uri.parse('$baseUrl/api/files/$workspaceId/content')
+        .replace(
+      queryParameters: <String, String>{
+        'path': path,
+        if (teamId.isNotEmpty) 'team_id': teamId,
+        if (force) 'force': '1',
+      },
+    );
+    final http.Response response;
+    try {
+      response = await http.put(
+        uri,
+        headers: _getHeaders(),
+        body: jsonEncode(<String, dynamic>{
+          'content': content,
+          'if_size': ?ifSize,
+        }),
+      );
+    } catch (_) {
+      throw Exception('核心进程不可达，请重启应用');
+    }
+    if (response.statusCode == 409) {
+      final Map<String, dynamic> data = _tryParseJson(response);
+      final String detail = data['detail'] as String? ?? '';
+      throw FileWriteConflict(
+        detail: detail.isEmpty ? '文件已被外部修改，请刷新后再保存' : detail,
+        currentSize: (data['size'] as num?)?.toInt(),
+      );
+    }
+    final Map<String, dynamic> data = _handleResponse(response);
+    return (data['size'] as num?)?.toInt() ?? content.length;
+  }
+
+  /// 尽量把响应体解析成 Map（失败给空 Map）
+  static Map<String, dynamic> _tryParseJson(http.Response response) {
+    try {
+      final Object? decoded = jsonDecode(utf8.decode(response.bodyBytes));
+      if (decoded is Map<String, dynamic>) return decoded;
+    } catch (_) {
+      // 响应体不是 JSON：往下走，用兜底文案
+    }
+    return <String, dynamic>{};
   }
 
   /// 获取 PDF 文件信息（总页数、标题、作者）

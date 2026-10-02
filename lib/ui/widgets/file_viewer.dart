@@ -8,7 +8,10 @@ import 'package:flutter/services.dart';
 
 import '../../io/api_service.dart';
 import '../../io/platform_support.dart';
+import '../models/file_content.dart';
+import '../services/code_highlight.dart';
 import '../services/download_center.dart';
+import '../services/editor_settings.dart';
 import 'pdf_preview.dart';
 
 /// 文本文件扩展名
@@ -83,11 +86,16 @@ const List<String> officeExtensions = [
 /// 文件查看器 - 支持多种文件格式的查看与预览
 ///
 /// 根据文件扩展名自动选择合适的查看方式：
-/// - 文本文件：等宽字体显示原始内容
+/// - 文本 / 源码：**按语言着色**（见 code_highlight.dart），纯文本可直接编辑并保存
+///   （Ctrl+S 或标题栏保存键；失焦 / 关窗格 / 换文件时自动保存，可在设置里关）
 /// - Markdown：源码 / 预览切换，预览支持基础语法渲染
 /// - SVG：源码 / 预览切换（预览暂显示提示与源码）
 /// - 图片：通过 base64 解码后用 Image.memory 显示
 /// - PDF / Office：显示文件信息与提示，提供下载按钮
+///
+/// **编辑只限纯文本**（[lib/README.md] 不变量 12）：图片 / PDF / Office 只读，
+/// 被截断的大文件（只预览了前一段）与含 NUL 的二进制也只读——把截断的内容写回去
+/// 等于把文件截短。保存统一走核心（本机与 SSH 同一套），前端不直接写盘。
 class FileViewer extends StatefulWidget {
   /// 工作空间 ID
   final String workspaceId;
@@ -104,6 +112,13 @@ class FileViewer extends StatefulWidget {
   /// 返回回调（用于关闭查看器）
   final VoidCallback? onClose;
 
+  /// 外部强制只读。分屏里**同一个文件**开了两个窗格时，非活动窗格用它锁成只读：
+  /// 两个编辑器各自持有一份缓冲，谁后保存都会把对方写的覆盖掉。
+  final bool readOnly;
+
+  /// 强制只读的原因（显示在锁图标与正文提示条上）
+  final String readOnlyReason;
+
   const FileViewer({
     super.key,
     required this.workspaceId,
@@ -111,16 +126,20 @@ class FileViewer extends StatefulWidget {
     this.teamName,
     required this.filePath,
     this.onClose,
+    this.readOnly = false,
+    this.readOnlyReason = '',
   });
 
   @override
-  State<FileViewer> createState() => _FileViewerState();
+  State<FileViewer> createState() => FileViewerState();
 }
 
 /// 文件类型分类
 enum _FileType { text, markdown, svg, image, pdf, office, unknown }
 
-class _FileViewerState extends State<FileViewer> {
+/// 查看器状态。**公开**是为了让分屏（file_panel）能用 GlobalKey 在换文件 / 关窗格
+/// 前调 [confirmLeave]——未保存的内容必须先处理掉。
+class FileViewerState extends State<FileViewer> {
   /// 文件文本内容（文本 / Markdown / SVG）
   String _content = '';
 
@@ -142,18 +161,88 @@ class _FileViewerState extends State<FileViewer> {
   /// PDF 总页数（来自核心的启发式 pdf_info，仅用于信息栏展示）
   int _totalPages = 0;
 
+  /// 编辑器控制器（可编辑时才有）。带高亮，见 code_highlight.dart。
+  CodeEditingController? _editor;
+
+  /// 文本域的焦点节点：失焦就是「切走」，触发自动保存
+  final FocusNode _editorFocus = FocusNode();
+
+  /// 是否有未保存的改动
+  bool _dirty = false;
+
+  /// 是否正在保存（挡住重复提交：一次保存 = 一次 HTTP + 一次落盘）
+  bool _saving = false;
+
+  /// 加载时文件的**真实**字节数：保存时作为 if_size 做外部改动检测
+  int _loadedSize = 0;
+
+  /// 内容被截断（大文件只回了前一段）⇒ 只读
+  bool _truncated = false;
+
+  /// 内容含 NUL ⇒ 二进制 ⇒ 只读
+  bool _isBinary = false;
+
+  /// 上一次保存失败的可见原因（挂在标题栏状态行上，不指望用户看见 SnackBar）
+  String? _saveError;
+
   @override
   void initState() {
     super.initState();
+    _editorFocus.addListener(_onEditorBlur);
+    _startLoad();
+  }
+
+  /// 换文件：丢掉旧缓冲与编辑态，重新加载。
+  ///
+  /// 调用方（file_panel）在换之前已经问过 [confirmLeave]，所以这里不弹确认框。
+  @override
+  void didUpdateWidget(covariant FileViewer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.filePath == widget.filePath &&
+        oldWidget.workspaceId == widget.workspaceId) {
+      return;
+    }
+    final CodeEditingController? old = _editor;
+    _editor = null;
+    _dirty = false;
+    _saving = false;
+    _saveError = null;
+    _loadedSize = 0;
+    _truncated = false;
+    _isBinary = false;
+    _showPreview = true;
+    _content = '';
+    // 下一帧再回收：本帧 TextField 还在用它换 controller
+    if (old != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
+    }
+    _startLoad();
+  }
+
+  /// 按类型分派加载
+  void _startLoad() {
     // Office 为二进制格式，不支持预览，直接结束加载状态
     if (_fileType == _FileType.office) {
-      _isLoading = false;
+      setState(() {
+        _isLoading = false;
+      });
     } else if (_fileType == _FileType.pdf) {
       // PDF：核心给字节，前端用 pdfrx 渲染（M7e 方案②）
-      _loadPdf();
+      unawaited(_loadPdf());
     } else {
-      _loadContent();
+      unawaited(_loadContent());
     }
+  }
+
+  /// 失焦即是「切走」：开了失焦保存就把改动写回去（不做定时器，见 EditorSettings）
+  void _onEditorBlur() {
+    if (!mounted) return;
+    if (_editorFocus.hasFocus || !_dirty) return;
+    if (!EditorSettings.instance.saveOnBlur) return;
+    // 正在保存 / 正等用户决定冲突：别再加一次（弹冲突框会让焦点走掉，
+    // 不挡的话会再发一次注定 409 的写，甚至叠出第二个框）
+    if (_saving) return;
+    unawaited(_save(silent: true));
   }
 
   /// 清掉 PDF 预览留下的临时目录（M8c：预览走临时文件，退出时要删）。
@@ -173,7 +262,22 @@ class _FileViewerState extends State<FileViewer> {
 
   @override
   void dispose() {
+    _editorFocus.removeListener(_onEditorBlur);
+    // 关窗格 / 切文件时还有未保存内容：开了失焦保存就补一次静默写。
+    // 参数先取出来——这个 future 可能在 State unmount 之后才跑完，那时不许再碰 widget。
+    final CodeEditingController? editor = _editor;
+    if (_dirty && editor != null && EditorSettings.instance.saveOnBlur) {
+      unawaited(_writeQuietly(
+        workspaceId: widget.workspaceId,
+        teamId: widget.teamId ?? '',
+        path: widget.filePath,
+        content: editor.text,
+        ifSize: _loadedSize,
+      ));
+    }
     _cleanupPdfTemp();
+    _editor?.dispose();
+    _editorFocus.dispose();
     super.dispose();
   }
 
@@ -233,7 +337,8 @@ class _FileViewerState extends State<FileViewer> {
       _error = null;
     });
     try {
-      final String content = await ApiService.getFileContent(
+      // 用带元信息的接口：编辑要 size（外部改动检测）与 truncated（截断只读）
+      final FileContentInfo info = await ApiService.getFileContentInfo(
         widget.workspaceId,
         widget.filePath,
         teamId: widget.teamId ?? '',
@@ -241,7 +346,7 @@ class _FileViewerState extends State<FileViewer> {
       if (!mounted) return;
       if (type == _FileType.image) {
         // 图片内容按 base64 解码
-        final Uint8List? bytes = _decodeBase64(content);
+        final Uint8List? bytes = _decodeBase64(info.content);
         if (bytes == null) {
           setState(() {
             _error = '图片解码失败，后端可能未返回 base64 编码内容';
@@ -251,14 +356,19 @@ class _FileViewerState extends State<FileViewer> {
         }
         setState(() {
           _imageBytes = bytes;
-          _content = content;
+          _content = info.content;
+          _loadedSize = info.size;
           _isLoading = false;
         });
       } else {
         setState(() {
-          _content = content;
+          _content = info.content;
+          _loadedSize = info.size;
+          _truncated = info.truncated;
+          _isBinary = info.content.contains('\u0000');
           _isLoading = false;
         });
+        _prepareEditor();
       }
     } on Exception catch (e) {
       if (!mounted) return;
@@ -399,40 +509,91 @@ class _FileViewerState extends State<FileViewer> {
       padding: const EdgeInsets.symmetric(horizontal: 8),
       child: Row(
         children: [
-          // 返回按钮
+          // 返回按钮（先把未保存内容处理掉再关）
           if (widget.onClose != null)
             IconButton(
               icon: const Icon(Icons.arrow_back, size: 20),
               color: cs.onSurfaceVariant,
               tooltip: '返回',
-              onPressed: widget.onClose,
+              onPressed: () => unawaited(_handleClose()),
             ),
-          // 文件名与路径
+          // 文件名 + 语言标签 + 路径 / 状态
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                Text(
-                  _fileName,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w600,
-                    color: cs.onSurface,
-                  ),
+                Row(
+                  children: <Widget>[
+                    Flexible(
+                      child: Text(
+                        _fileName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          color: cs.onSurface,
+                        ),
+                      ),
+                    ),
+                    if (_showLanguageTag) ...<Widget>[
+                      const SizedBox(width: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 5,
+                          vertical: 1,
+                        ),
+                        decoration: BoxDecoration(
+                          color: cs.primary.withValues(alpha: 0.12),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          _language.label,
+                          style: TextStyle(fontSize: 10, color: cs.primary),
+                        ),
+                      ),
+                    ],
+                    if (!_editableFile && !_isLoading) ...<Widget>[
+                      const SizedBox(width: 6),
+                      Tooltip(
+                        message: _readOnlyReason,
+                        child: Icon(
+                          Icons.lock_outline,
+                          size: 13,
+                          color: cs.outline,
+                        ),
+                      ),
+                    ],
+                  ],
                 ),
                 if (widget.filePath.isNotEmpty)
                   Text(
-                    widget.filePath,
+                    _subtitle,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: TextStyle(fontSize: 11, color: cs.outline),
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: _saveError != null
+                          ? cs.error
+                          : (_dirty ? cs.primary : cs.outline),
+                    ),
                   ),
               ],
             ),
           ),
+          // 保存（有未保存改动时才可点，键位是 Ctrl+S）
+          if (_editor != null)
+            IconButton(
+              icon: Icon(
+                _dirty ? Icons.save : Icons.save_outlined,
+                size: 18,
+              ),
+              color: _dirty ? cs.primary : cs.onSurfaceVariant,
+              tooltip: _dirty ? '保存（Ctrl+S）' : '没有未保存的改动',
+              onPressed:
+                  (_dirty && !_saving) ? () => unawaited(_save()) : null,
+            ),
           // 预览 / 源码切换
           if (canToggle && !_isLoading && _error == null)
             Padding(
@@ -527,17 +688,262 @@ class _FileViewerState extends State<FileViewer> {
       case _FileType.image:
         return _buildImageView();
       case _FileType.markdown:
-        return _showPreview ? _buildMarkdownPreview() : _buildTextView();
+        return _showPreview ? _buildMarkdownPreview() : _buildCodeView();
       case _FileType.svg:
-        return _showPreview ? _buildSvgPreview() : _buildTextView();
+        return _showPreview ? _buildSvgPreview() : _buildCodeView();
       case _FileType.pdf:
         return _buildPdfView();
       case _FileType.office:
         return _buildOfficeView();
       case _FileType.text:
       case _FileType.unknown:
-        return _buildTextView();
+        return _buildCodeView();
     }
+  }
+
+  /// 着色语言（按扩展名；认不出来是纯文本语言，不着色）
+  CodeLanguage get _language => languageForPath(widget.filePath);
+
+  /// 标题栏要不要显示语言标签：认得出语言、且这个类型确实走代码视图
+  bool get _showLanguageTag {
+    if (_language.id == 'plain') return false;
+    switch (_fileType) {
+      case _FileType.image:
+      case _FileType.pdf:
+      case _FileType.office:
+        return false;
+      case _FileType.markdown:
+      case _FileType.svg:
+        return !_showPreview;
+      case _FileType.text:
+      case _FileType.unknown:
+        return true;
+    }
+  }
+
+  /// 这个文件**允许**编辑吗：只看类型与内容特征，不看控制器是否就绪。
+  ///
+  /// 拒绝的四种情况（见 lib/README.md 不变量 12）：图片 / PDF / Office（复杂格式）、
+  /// 被截断的大文件（写回去会把文件截短）、含 NUL 的二进制、以及分屏里被锁成只读的副本。
+  bool get _editableFile =>
+      _readOnlyReason.isEmpty && !_isLoading && _error == null;
+
+  /// 只读原因（空串 = 可编辑）
+  String get _readOnlyReason {
+    if (widget.readOnly) {
+      return widget.readOnlyReason.isEmpty ? '只读打开' : widget.readOnlyReason;
+    }
+    switch (_fileType) {
+      case _FileType.image:
+        return '图片不支持编辑';
+      case _FileType.pdf:
+        return 'PDF 不支持编辑（复杂格式不在编辑范围内，需要下载后用专用工具改）';
+      case _FileType.office:
+        return 'Office 文档不支持编辑（复杂格式不在编辑范围内，需要下载后用专用工具改）';
+      case _FileType.markdown:
+      case _FileType.svg:
+      case _FileType.text:
+      case _FileType.unknown:
+        if (_truncated) {
+          return '文件较大，只预览了前一段：保存会把文件截短，因此只读（完整内容请下载）';
+        }
+        if (_isBinary) return '内容含二进制字节，按只读打开';
+        return '';
+    }
+  }
+
+  /// 造 / 更新编辑器控制器（可编辑时才有）
+  void _prepareEditor() {
+    if (!_editableFile) return;
+    final CodeEditingController? old = _editor;
+    _editor = CodeEditingController(language: _language, text: _content);
+    // 下一帧再回收旧的：本帧 TextField 还在用它换 controller
+    if (old != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
+    }
+  }
+
+  /// 标题栏副标题：优先报「保存失败 / 未保存」，否则给路径
+  String get _subtitle {
+    if (_saveError != null) return '保存失败：$_saveError';
+    if (_dirty) return '未保存的改动 · ${widget.filePath}';
+    return widget.filePath;
+  }
+
+  /// Ctrl/Cmd+S 保存；其它按键一律不拦（回车、Tab、撤销都留给文本域自己）
+  KeyEventResult _handleEditorKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (event.logicalKey != LogicalKeyboardKey.keyS) {
+      return KeyEventResult.ignored;
+    }
+    final Set<LogicalKeyboardKey> pressed =
+        HardwareKeyboard.instance.logicalKeysPressed;
+    final bool modifier = pressed.contains(LogicalKeyboardKey.controlLeft) ||
+        pressed.contains(LogicalKeyboardKey.controlRight) ||
+        pressed.contains(LogicalKeyboardKey.metaLeft) ||
+        pressed.contains(LogicalKeyboardKey.metaRight);
+    if (!modifier) return KeyEventResult.ignored;
+    unawaited(_save());
+    return KeyEventResult.handled;
+  }
+
+  /// 保存当前内容；返回是否已保存。
+  ///
+  /// [force] = 覆盖保存（外部改动确认之后）；[silent] = 自动保存，成功不弹提示。
+  Future<bool> _save({bool force = false, bool silent = false}) async {
+    final CodeEditingController? editor = _editor;
+    if (editor == null || _saving) return false;
+    if (!_dirty && !force) return true;
+    final String content = editor.text;
+    _saving = true;
+    if (mounted) {
+      setState(() {
+        _saveError = null;
+      });
+    }
+    try {
+      final int written = await ApiService.saveFileContent(
+        widget.workspaceId,
+        widget.filePath,
+        content,
+        teamId: widget.teamId ?? '',
+        ifSize: force ? null : _loadedSize,
+        force: force,
+      );
+      _saving = false;
+      if (mounted) {
+        setState(() {
+          _dirty = false;
+          _loadedSize = written;
+          _truncated = false;
+        });
+      }
+      if (!silent) _toast('已保存（$written 字节）');
+      return true;
+    } on FileWriteConflict catch (conflict) {
+      if (!mounted) {
+        _saving = false;
+        return false;
+      }
+      // 冲突框挂着期间保持 _saving：用户还在决定，别让失焦保存插一次进来。
+      // 但**重试之前必须先放开**，否则覆盖保存会被自己挡掉（_saving 还是 true）。
+      final String action = await _askConflict(conflict);
+      _saving = false;
+      if (action == 'overwrite') return _save(force: true);
+      if (action == 'reload') await _loadContent();
+      return false;
+    } catch (error) {
+      _saving = false;
+      final String reason = error.toString().replaceFirst('Exception: ', '');
+      if (mounted) {
+        setState(() {
+          _saveError = reason;
+        });
+      }
+      if (!silent) _toast('保存失败：$reason');
+      return false;
+    }
+  }
+
+  /// 409 冲突问用户：返回 'overwrite' / 'reload' / 'cancel'（由调用方决定下一步）
+  Future<String> _askConflict(FileWriteConflict conflict) async {
+    final String size = conflict.missing
+        ? '文件已不存在'
+        : '${conflict.currentSize} 字节';
+    final String? choice = await showDialog<String>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        title: const Text('文件已被外部修改'),
+        content: Text(
+          '${conflict.detail}\n\n磁盘上的当前内容：$size\n你手上的改动：${_editor?.text.length ?? 0} 字符',
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(context).pop('cancel'),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop('reload'),
+            child: const Text('放弃我的改动并刷新'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop('overwrite'),
+            child: const Text('覆盖保存'),
+          ),
+        ],
+      ),
+    );
+    return choice ?? 'cancel';
+  }
+
+  /// 离开当前文件前的收尾（关窗格 / 换文件 / 关查看器都走它）。
+  ///
+  /// 开着失焦保存：静默写回，返回写成功与否；关着：问一次（保存 / 不保存 / 取消）。
+  Future<bool> confirmLeave() async {
+    if (!_dirty) return true;
+    if (EditorSettings.instance.saveOnBlur) return _save(silent: true);
+    final String? choice = await showDialog<String>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        title: const Text('还有未保存的改动'),
+        content: Text('$_fileName 有未保存的改动。'),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(context).pop('cancel'),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop('discard'),
+            child: const Text('不保存'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop('save'),
+            child: const Text('保存并继续'),
+          ),
+        ],
+      ),
+    );
+    if (choice == 'save') return _save();
+    return choice == 'discard';
+  }
+
+  /// 返回：先把未保存内容处理掉再关（开着失焦保存就静默写回）
+  Future<void> _handleClose() async {
+    final VoidCallback? onClose = widget.onClose;
+    if (onClose == null) return;
+    final bool canLeave = await confirmLeave();
+    if (canLeave && mounted) onClose();
+  }
+
+  /// dispose 里的静默补写：不能 setState、不需要回报。
+  ///
+  /// 参数全部显式传入：这个 future 可能在 State unmount 之后才跑完，那时不许再碰 widget。
+  Future<void> _writeQuietly({
+    required String workspaceId,
+    required String teamId,
+    required String path,
+    required String content,
+    required int ifSize,
+  }) async {
+    try {
+      await ApiService.saveFileContent(
+        workspaceId,
+        path,
+        content,
+        teamId: teamId,
+        ifSize: ifSize,
+      );
+    } catch (_) {
+      // 关窗格时的补写失败只能放弃：此刻已经没有界面可以提示了
+    }
+  }
+
+  /// 轻提示（保存成功 / 失败兜底）
+  void _toast(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      SnackBar(content: Text(message), duration: const Duration(seconds: 2)),
+    );
   }
 
   /// 错误视图（含重试按钮）
@@ -573,8 +979,8 @@ class _FileViewerState extends State<FileViewer> {
   }
 
   /// 文本视图（等宽字体）
-  Widget _buildTextView() {
-    if (_content.isEmpty) {
+  Widget _buildCodeView() {
+    if (_content.isEmpty && !_editableFile) {
       return Center(
         child: Text(
           '文件内容为空',
@@ -585,16 +991,84 @@ class _FileViewerState extends State<FileViewer> {
         ),
       );
     }
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(12),
-      child: SelectableText(
-        _content,
-        style: TextStyle(
-          fontSize: 13,
-          height: 1.5,
-          fontFamily: 'monospace',
-          color: Theme.of(context).colorScheme.onSurface,
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final TextStyle baseStyle = TextStyle(
+      fontSize: 13,
+      height: 1.5,
+      fontFamily: 'Consolas',
+      fontFamilyFallback: const <String>['Cascadia Mono', 'monospace'],
+      color: cs.onSurface,
+    );
+    final CodeEditingController? editor = _editor;
+    // 可编辑：文本域（带高亮控制器）。expands + maxLines:null 让它铺满窗格并自己滚动。
+    if (_editableFile && editor != null) {
+      return Focus(
+        onKeyEvent: _handleEditorKey,
+        child: TextField(
+          controller: editor,
+          focusNode: _editorFocus,
+          maxLines: null,
+          expands: true,
+          textAlignVertical: TextAlignVertical.top,
+          style: baseStyle,
+          cursorColor: cs.primary,
+          decoration: const InputDecoration(
+            border: InputBorder.none,
+            isDense: true,
+            contentPadding: EdgeInsets.all(12),
+          ),
+          onChanged: (String _) {
+            if (!_dirty) {
+              setState(() {
+                _dirty = true;
+              });
+            }
+          },
         ),
+      );
+    }
+    // 只读：同样按语言着色（着色开关关掉就退回单色），可选可复制
+    final bool highlight = EditorSettings.instance.highlight;
+    final TextSpan span = highlight
+        ? buildCodeTextSpan(
+            text: _content,
+            language: _language,
+            theme: CodeTheme.of(context),
+            baseStyle: baseStyle,
+          )
+        : TextSpan(style: baseStyle, text: _content);
+    final String reason = _readOnlyReason;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        if (reason.isNotEmpty) _buildReadOnlyBanner(cs, reason),
+        Expanded(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(12),
+            child: SelectableText.rich(span),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// 只读提示条：说清**为什么**不能编辑（不然用户只会觉得保存键坏了）
+  Widget _buildReadOnlyBanner(ColorScheme cs, String reason) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
+      child: Row(
+        children: <Widget>[
+          Icon(Icons.lock_outline, size: 13, color: cs.onSurfaceVariant),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              reason,
+              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+            ),
+          ),
+        ],
       ),
     );
   }
