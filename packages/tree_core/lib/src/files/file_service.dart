@@ -16,11 +16,16 @@ import '../team/team_workspace.dart';
 /// `..` 逃逸一律拒绝。
 ///
 /// 范围（明确写清，避免"以为都支持"）：
-/// - 读：`list` / `content` / `readBytes` / `pdfInfo` / `gitLog` / `gitBranches`；
+/// - 读：`list` / `content` / `readBytes` / `pdfInfo` / `gitLog` / `gitBranches` /
+///   `gitStatus`（M11 文件面板改动高亮）；
 /// - 写（M7d-3）：`uploadInit`/`uploadChunk`/`uploadComplete` 分片上传、
 ///   `syncToLocal`（整棵工作空间复制到本机目录）、`archive`（目录打包 tar.gz）；
 /// - 写文本（M10）：`writeContent`（`PUT /api/files/{id}/content`）：源码编辑器保存，
 ///   本机与 SSH 都走工作空间 IO 抽象按 UTF-8 覆盖写，并保留换行风格；
+/// - 结构改动（M11）：`mkdir` / `rename` / `remove`（新建文件夹 / 重命名 / 删除）。
+///   本机走 [LocalWorkspaceIO]（dart:io），SSH 走 `WorkspaceFiles` 的 SFTP 实现
+///   （mkdir / rename / remove / 递归删除），**不覆盖**目标、**不自动建父目录**、
+///   **永远拒绝删工作空间根**；远端后端没接线时给可读 400，绝不落到本机；
 /// - **本机与 SSH 都要支持**（M7g）：配了 `ssh:` 的 agent 走 [remoteFilesFor] 拿到
 ///   [WorkspaceFiles]（SFTP 实现），本机走 dart:io；两条路径共用同一套安全边界与
 ///   REST 语义。远端上传仍然是"本地暂存分片 → complete 时一次 SFTP 写"（不需要
@@ -41,6 +46,7 @@ class FileService {
     this.maxContentBytes = 8 * 1024 * 1024,
     this.maxWriteBytes = defaultMaxWriteBytes,
     this.gitTimeout = const Duration(seconds: 10),
+    this.maxGitStatusEntries = 2000,
     this.chunkSize = 4 * 1024 * 1024,
     this.maxArchiveBytes = 256 * 1024 * 1024,
     this.maxSyncFiles = 50000,
@@ -105,6 +111,12 @@ class FileService {
   static const int binaryProbeBytes = 4096;
 
   final Duration gitTimeout;
+
+  /// `git status` 返回的条目上限（超出置 `truncated: true`，M11）。
+  ///
+  /// 大仓库的 `git status` 能吐出几万条；文件面板只需要一份可读的概览，核心不能
+  /// 为了它把整份输出解析成对象再丢掉（解析函数本身也按这个上限提前停）。
+  final int maxGitStatusEntries;
 
   /// 服务端定标的分片大小（随 `upload_init` 返回，前端按这个值切片）。
   final int chunkSize;
@@ -558,6 +570,164 @@ class FileService {
     };
   }
 
+  // ── 结构改动（M11 文件面板）：新建文件夹 / 重命名 / 删除 ─────────────────
+
+  /// 新建文件夹（`POST /api/files/{id}/mkdir`，body `{path}`）。
+  ///
+  /// 语义（本机与 SSH 完全一致，差异只在后端实现）：
+  /// - `path` 是工作空间**相对目录**路径；空 / 绝对路径 / 盘符 / `~` / `..` 逃逸
+  ///   一律 400（复用 [resolve] 这一套边界，不另写一份）；
+  /// - 目标已存在（文件或目录）→ **409**；
+  /// - 父目录不存在 → 400（**不自动建父目录**：路径写错了就要显式报错）；
+  /// - 成功 → `{success: true, path}`（`path` 是归一化后的相对路径）。
+  ///
+  /// 落盘走**工作空间 IO 抽象**：[LocalWorkspaceIO]（本机）或 [remoteFor] 拿到的
+  /// `WorkspaceFiles`（SSH，SFTP）；远端后端没接线时给**可读 400**，绝不落到本机。
+  Future<Map<String, dynamic>> mkdir(
+    String workspaceId, {
+    required String path,
+  }) async {
+    final CoreAgent? agent = agentFor(workspaceId);
+    if (agent == null) return _error('工作空间不存在：$workspaceId');
+    final String root = rootFor(agent);
+    final String relative;
+    try {
+      relative = _relative(root, resolve(root, path));
+    } on FileServiceException catch (error) {
+      return _mutationError('invalid_path', error.message);
+    }
+    if (relative.isEmpty || relative == '.') {
+      return _mutationError('invalid_path', '不能把工作空间根当作新建目标：$path');
+    }
+    final WorkspaceFiles? io = await _filesBackendFor(agent);
+    if (io == null) {
+      return _mutationError(
+        'remote_unavailable',
+        '该工作空间在远端（SSH）：核心未接入远端文件后端，无法新建文件夹',
+        status: 400,
+      );
+    }
+    final WorkspaceMutationResult result;
+    try {
+      result = await io.makeDirectory(relative);
+    } catch (error) {
+      return _mutationFailure(error, action: '新建文件夹', path: relative);
+    }
+    final Map<String, dynamic>? failure = _mutationStatusError(result);
+    if (failure != null) return failure;
+    log?.call('新建文件夹：$relative');
+    return <String, dynamic>{'success': true, 'path': relative};
+  }
+
+  /// 重命名 / 移动（`POST /api/files/{id}/rename`，body `{from, to}`）。
+  ///
+  /// 语义：
+  /// - 源不存在 → **404**；
+  /// - 目标已存在 → **409**（**绝不覆盖**：SFTP 的 posix-rename 扩展本身是覆盖
+  ///   语义，所以两端都先自检）；
+  /// - 目标父目录不存在 → **400**（**不自动建父目录**——默默建目录会把写错的路径
+  ///   变成「成功」，用户还以为文件搬过去了）；
+  /// - 源或目标是工作空间根 → 400；源与目标相同 → 400（避免把一个空操作报成冲突）；
+  /// - 成功 → `{success: true, from, to}`（都是归一化后的相对路径）。
+  Future<Map<String, dynamic>> rename(
+    String workspaceId, {
+    required String from,
+    required String to,
+  }) async {
+    final CoreAgent? agent = agentFor(workspaceId);
+    if (agent == null) return _error('工作空间不存在：$workspaceId');
+    final String root = rootFor(agent);
+    final String source;
+    final String target;
+    try {
+      source = _relative(root, resolve(root, from));
+      target = _relative(root, resolve(root, to));
+    } on FileServiceException catch (error) {
+      return _mutationError('invalid_path', error.message);
+    }
+    if (source.isEmpty || source == '.' || target.isEmpty || target == '.') {
+      return _mutationError('invalid_path', '源与目标都不能是工作空间根：$from → $to');
+    }
+    if (source == target) {
+      return _mutationError('invalid_path', '源与目标相同，无需重命名：$from');
+    }
+    final WorkspaceFiles? io = await _filesBackendFor(agent);
+    if (io == null) {
+      return _mutationError(
+        'remote_unavailable',
+        '该工作空间在远端（SSH）：核心未接入远端文件后端，无法重命名',
+        status: 400,
+      );
+    }
+    final WorkspaceMutationResult result;
+    try {
+      result = await io.rename(source, target);
+    } catch (error) {
+      return _mutationFailure(error, action: '重命名', path: '$source → $target');
+    }
+    final Map<String, dynamic>? failure = _mutationStatusError(result);
+    if (failure != null) return failure;
+    log?.call('重命名：$source → $target');
+    return <String, dynamic>{'success': true, 'from': source, 'to': target};
+  }
+
+  /// 删除（`DELETE /api/files/{id}?path=[&recursive=1]`）。
+  ///
+  /// 语义：
+  /// - **永远拒绝删工作空间根**：`path` 空 / `.` / 归一化成根（`a/..`）→ 400；
+  /// - 不存在 → **404**；
+  /// - **非空目录默认拒绝**：400/409 + 可读原因（说明要带 `recursive=1`），绝不
+  ///   静默递归删掉用户一整棵树；
+  /// - `recursive=1` 才递归删整棵子树；空目录不带它也能删；
+  /// - 成功 → `{success: true, path}`。
+  Future<Map<String, dynamic>> remove(
+    String workspaceId, {
+    required String path,
+    bool recursive = false,
+  }) async {
+    final CoreAgent? agent = agentFor(workspaceId);
+    if (agent == null) return _error('工作空间不存在：$workspaceId');
+    final String root = rootFor(agent);
+    final String relative;
+    try {
+      relative = _relative(root, resolve(root, path));
+    } on FileServiceException catch (error) {
+      return _mutationError('invalid_path', error.message);
+    }
+    // 根是**结构不变量**：删掉它等于删掉整个工作空间，任何参数组合都不放行。
+    if (relative.isEmpty || relative == '.') {
+      return _mutationError('invalid_path', '拒绝对工作空间根执行删除：$path');
+    }
+    final WorkspaceFiles? io = await _filesBackendFor(agent);
+    if (io == null) {
+      return _mutationError(
+        'remote_unavailable',
+        '该工作空间在远端（SSH）：核心未接入远端文件后端，无法删除',
+        status: 400,
+      );
+    }
+    final WorkspaceMutationResult result;
+    try {
+      result = await io.remove(relative, recursive: recursive);
+    } catch (error) {
+      return _mutationFailure(error, action: '删除', path: relative);
+    }
+    final Map<String, dynamic>? failure = _mutationStatusError(result);
+    if (failure != null) return failure;
+    log?.call('删除：$relative${recursive ? '（递归）' : ''}');
+    return <String, dynamic>{'success': true, 'path': relative};
+  }
+
+  /// 文件面板**结构改动**的后端：本机 [LocalWorkspaceIO]（与 [writeContent] 同一
+  /// 口味），远端用 [remoteFor] 拿到的 `WorkspaceFiles`（同一个 SSH 连接对象）。
+  ///
+  /// 返回 null = 远端后端没接线（或不是文件面板后端）：调用方必须给可读 400，
+  /// **绝不落到本机**去动一个远端路径。
+  Future<WorkspaceFiles?> _filesBackendFor(CoreAgent agent) async {
+    if (_isRemote(agent)) return remoteFor(agent);
+    return LocalWorkspaceIO(rootFor(agent));
+  }
+
   /// 读取文件内容：图片返回 base64，其余按文本解码（UTF-8 失败退 latin1）。
   Future<Map<String, dynamic>> content(String workspaceId, String path) async {
     final CoreAgent? agent = agentFor(workspaceId);
@@ -888,6 +1058,75 @@ class FileService {
       'current': outcome.current,
     };
   }
+
+  /// Git 工作区状态（`GET /api/files/{id}/git-status`，M11 文件面板改动高亮）。
+  ///
+  /// 与 [gitLog] / [gitBranches] **同一条路**：本机直接 `git -C <root> status`
+  /// （复用 [_git] 的 [gitTimeout]），SSH 经 [WorkspaceIO.gitStatus]（exec 通道）。
+  ///
+  /// **不是仓库不是错误**：`{is_repo: false, entries: [], truncated: false}`，面板
+  /// 显示空态。条目上限 [maxGitStatusEntries]，超出置 `truncated: true`。
+  Future<Map<String, dynamic>> gitStatus(
+    String workspaceId, {
+    bool ignored = false,
+  }) async {
+    final CoreAgent? agent = agentFor(workspaceId);
+    if (agent == null) return _error('工作空间不存在：$workspaceId');
+    if (_isRemote(agent)) return _gitStatusRemote(agent, ignored: ignored);
+    final String root = rootFor(agent);
+    if (!Directory(root).existsSync()) return _error('工作空间目录不存在：$root');
+    final ProcessResult result = await _git(
+      root,
+      GitOutput.statusArgs(ignored: ignored),
+    );
+    if (result.exitCode != 0) {
+      // 不是仓库 / 本机没有 git：退出码非 0、stdout 是报错文本，**不是错误**。
+      return <String, dynamic>{
+        'is_repo': false,
+        'entries': <Map<String, dynamic>>[],
+        'truncated': false,
+      };
+    }
+    final ({List<GitStatusEntry> entries, bool truncated}) parsed =
+        GitOutput.parseStatus(
+          '${result.stdout}',
+          maxEntries: maxGitStatusEntries,
+        );
+    return <String, dynamic>{
+      'is_repo': true,
+      'entries': parsed.entries.map((GitStatusEntry e) => e.toJson()).toList(),
+      'truncated': parsed.truncated,
+    };
+  }
+
+  /// 远端（SSH）Git 工作区状态（M11）：经该 agent 的 [WorkspaceIO] exec 通道跑
+  /// git，与 [gitLog] / [gitBranches] 同一条路。
+  Future<Map<String, dynamic>> _gitStatusRemote(
+    CoreAgent agent, {
+    required bool ignored,
+  }) async {
+    final WorkspaceIO? io = await remoteIoFor(agent);
+    if (io == null) {
+      return _error('该工作空间在远端（SSH）：核心未接入远端 Git 后端（工作空间 IO 不可用）', 400);
+    }
+    final GitStatusOutcome outcome;
+    try {
+      outcome = await io.gitStatus(
+        maxEntries: maxGitStatusEntries,
+        ignored: ignored,
+      );
+    } on WorkspaceIoException catch (error) {
+      return _error('读取远端 Git 状态失败：${error.message}', 500);
+    } catch (error) {
+      return _error('读取远端 Git 状态失败：$error', 500);
+    }
+    return <String, dynamic>{
+      'is_repo': outcome.isRepo,
+      'entries': outcome.entries.map((GitStatusEntry e) => e.toJson()).toList(),
+      'truncated': outcome.truncated,
+    };
+  }
+
   // ── 写路径（M7d-3）：分片上传 / 同步到本地 / 目录打包下载 ────────────────
 
   /// 建立分片上传会话（`POST /api/files/{id}/upload_init`）。
@@ -1788,6 +2027,61 @@ class FileService {
       // 头部读不到不影响冲突判断：大小已经有了，NUL 探测退化为「没探测到」
       return _ExistingFile(known: true, exists: true, size: size);
     }
+  }
+
+  /// 结构改动失败的错误体：`error` 是机器码、`detail` 是可直接展示的中文原因。
+  static Map<String, dynamic> _mutationError(
+    String code,
+    String detail, {
+    int status = 400,
+  }) => <String, dynamic>{
+    'error': code,
+    'detail': detail,
+    'status': status,
+  };
+
+  /// 把 IO 层结果码翻成 HTTP 语义（成功返回 null）。
+  ///
+  /// 「目录非空」按**冲突**处理（409）：文件系统现在的状态与请求冲突，用户带
+  /// `recursive=1` 重试就能过；契约允许 400/409，这里统一成冲突更好排查。
+  static Map<String, dynamic>? _mutationStatusError(
+    WorkspaceMutationResult result,
+  ) {
+    switch (result.status) {
+      case WorkspaceMutationStatus.ok:
+        return null;
+      case WorkspaceMutationStatus.alreadyExists:
+        return _mutationError('already_exists', result.message, status: 409);
+      case WorkspaceMutationStatus.notFound:
+        return _mutationError('not_found', result.message, status: 404);
+      case WorkspaceMutationStatus.parentMissing:
+        return _mutationError('parent_missing', result.message, status: 400);
+      case WorkspaceMutationStatus.notEmpty:
+        return _mutationError(
+          'directory_not_empty',
+          result.message,
+          status: 409,
+        );
+    }
+  }
+
+  /// 把结构改动抛出的异常翻成可读错误体（路径越界 → 400，其余 → 500）。
+  static Map<String, dynamic> _mutationFailure(
+    Object error, {
+    required String action,
+    required String path,
+  }) {
+    if (error is WorkspacePathException) {
+      return _mutationError('invalid_path', '${error.reason}：$path');
+    }
+    if (error is WorkspaceIoException) {
+      return _mutationError(
+        'operation_failed',
+        '$action失败：${error.message}',
+        status: 500,
+      );
+    }
+    return _mutationError('operation_failed', '$action失败：$error', status: 500);
   }
 
   static Map<String, dynamic> _error(String message, [int status = 404]) =>

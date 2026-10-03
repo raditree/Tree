@@ -6,7 +6,7 @@ REST 文件面板 / 查看器 / Git 面板的**唯一**数据源，也是唯一�
 
 | 文件 | 作用 |
 | --- | --- |
-| [file_service.dart](file_service.dart) | 读（`list` / `content` / `readBytes` / `pdfInfo` / `gitLog` / `gitBranches`）与写（`writeContent` 按内容写文本 / 分片上传 / `syncToLocal` / `archive`）；本机与 SSH 共用一套语义 |
+| [file_service.dart](file_service.dart) | 读（`list` / `content` / `readBytes` / `pdfInfo` / `gitLog` / `gitBranches` / `gitStatus`）与写（`writeContent` 按内容写文本 / `mkdir` / `rename` / `remove` 结构改动 / 分片上传 / `syncToLocal` / `archive`）；本机与 SSH 共用一套语义 |
 
 ## 不变量（assertions）
 
@@ -27,11 +27,25 @@ REST 文件面板 / 查看器 / Git 面板的**唯一**数据源，也是唯一�
    （[test/ssh_files_api_test.dart](../../../test/ssh_files_api_test.dart) 强制：成员跟随 SSH leader 时读走远端、
    写回在没接远端 IO 时回可读 400 而不是落到本机）。集成终端同判据（见 [../terminal/README.md](../terminal/README.md)）。
 
+10. **结构改动（M11）只走工作空间 IO 抽象**：本机 `LocalWorkspaceIO`、远端 `WorkspaceFiles`（SFTP 的
+    `mkdir` / `rename` / `remove`；递归删除是 SFTP 自底向上走树，**不起 shell**）。三条硬不变量：
+    **绝不覆盖**（重命名目标已存在 → 409；SFTP 的 `posix-rename@openssh.com` 是覆盖语义，所以两端都先
+    自检）、**绝不自动建父目录**（目标父目录不存在 → 400，静默建目录会把写错的路径变成「成功」）、
+    **永远拒绝删工作空间根**（`path` 空 / `.` / `a/..` 归一化成根 → 400）。非空目录默认拒绝
+    （409 + 可读原因里说明要带 `recursive=1`），`recursive=1` 才递归；远端后端没接线 → 可读 400，
+    **绝不落到本机**。
+11. **git 状态与 git 日志同一条路**（M11）：本机 `git -C <root> status --porcelain=v1 -z`（复用
+    `gitTimeout`），远端经 `WorkspaceIO.gitStatus` 的 exec 通道；解析是 `tree_local_exec` 里的纯函数
+    `GitOutput.parseStatus`（`-z`、空格 / 中文 / 引号路径、重命名、暂存与工作区混合、未跟踪、被忽略、
+    非法输入都有单测）。条目上限 `maxGitStatusEntries`（默认 2000，超出 `truncated: true`）。
+    **不是仓库不是错误**：`{is_repo: false, entries: [], truncated: false}`；被忽略文件只有 `?ignored=1`
+    才去取（映射成 `I`）。
+
 ## 测试
 
 ```bash
 cd packages/tree_core
-dart test test/files_api_test.dart test/ssh_files_api_test.dart test/file_write_api_test.dart
+dart test test/files_api_test.dart test/ssh_files_api_test.dart test/file_write_api_test.dart test/file_mutation_api_test.dart
 # 真机（设 TREE_SSH_TEST_HOST / TREE_SSH_TEST_USER / TREE_SSH_TEST_KEY 才跑，否则 skip）
 dart test test/ssh_files_integration_test.dart
 ```

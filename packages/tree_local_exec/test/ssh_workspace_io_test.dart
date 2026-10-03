@@ -605,6 +605,81 @@ void main() {
         'exit_code': 0,
       });
     });
+
+    test('gitStatus：-z 输出解析成面板口径，命令带 --porcelain=v1 -z', () async {
+      t.onRun = (String _) => const SshExecResult(
+        exitCode: 0,
+        stdout:
+            ' M a.txt\u0000A  b.txt\u0000?? 未 跟踪.txt\u0000 D c.txt\u0000',
+        stderr: '',
+      );
+      final GitStatusOutcome out = await io.gitStatus();
+      expect(t.commands.single, "cd '/ws' && git status --porcelain=v1 -z");
+      expect(out.isRepo, isTrue);
+      expect(out.exitCode, 0);
+      expect(out.truncated, isFalse);
+      expect(
+        out.entries
+            .map((GitStatusEntry e) => '${e.status}:${e.path}')
+            .toList(),
+        <String>['M:a.txt', 'A:b.txt', 'U:未 跟踪.txt', 'D:c.txt'],
+      );
+    });
+
+    test('gitStatus：ignored=true 才带 --ignored，!! → I', () async {
+      t.onRun = (String _) => const SshExecResult(
+        exitCode: 0,
+        stdout: '!! build/\u0000',
+        stderr: '',
+      );
+      final GitStatusOutcome out = await io.gitStatus(ignored: true);
+      expect(
+        t.commands.single,
+        "cd '/ws' && git status --porcelain=v1 -z --ignored",
+      );
+      expect(out.entries.single.status, 'I');
+      expect(out.entries.single.path, 'build');
+    });
+
+    test('gitStatus：非仓库 → isRepo=false + 空列表，不抛异常', () async {
+      t.onRun = (String _) => const SshExecResult(
+        exitCode: 128,
+        stdout: '',
+        stderr: 'fatal: not a git repository',
+      );
+      final GitStatusOutcome out = await io.gitStatus();
+      expect(out.isRepo, isFalse);
+      expect(out.entries, isEmpty);
+      expect(out.truncated, isFalse);
+      expect(out.exitCode, 128);
+    });
+
+    test('gitStatus：条目上限触发 truncated', () async {
+      t.onRun = (String _) => const SshExecResult(
+        exitCode: 0,
+        stdout: ' M a\u0000 M b\u0000 M c\u0000',
+        stderr: '',
+      );
+      final GitStatusOutcome out = await io.gitStatus(maxEntries: 2);
+      expect(out.entries, hasLength(2));
+      expect(out.truncated, isTrue);
+    });
+
+    test('gitStatus：toJson 形状 = {is_repo, entries, truncated}', () async {
+      t.onRun = (String _) => const SshExecResult(
+        exitCode: 0,
+        stdout: ' M a.txt\u0000',
+        stderr: '',
+      );
+      final GitStatusOutcome out = await io.gitStatus();
+      expect(out.toJson(), <String, dynamic>{
+        'is_repo': true,
+        'entries': <Map<String, dynamic>>[
+          <String, dynamic>{'path': 'a.txt', 'status': 'M'},
+        ],
+        'truncated': false,
+      });
+    });
   });
 
   group('文件面板接口（M7g）', () {
@@ -686,6 +761,115 @@ void main() {
       );
       expect(t.files['/ws/out/deep/stream.bin'], <int>[7, 8, 9]);
       expect(() => io.sizeOf('../x'), throwsA(isA<WorkspacePathException>()));
+    });
+  });
+
+  group('文件面板结构改动（M11：SFTP）', () {
+    test('makeDirectory：父目录存在才建；已存在 / 父目录缺失给结果码', () async {
+      t.seed('/ws/a.txt', 'a');
+      final WorkspaceMutationResult ok = await io.makeDirectory('newdir');
+      expect(ok.ok, isTrue);
+      expect(t.dirs, contains('/ws/newdir'));
+
+      final WorkspaceMutationResult again = await io.makeDirectory('newdir');
+      expect(again.status, WorkspaceMutationStatus.alreadyExists);
+      expect(again.message, contains('已存在'));
+
+      final WorkspaceMutationResult missing = await io.makeDirectory(
+        'nope/deep',
+      );
+      expect(missing.status, WorkspaceMutationStatus.parentMissing);
+      expect(missing.message, contains('父目录不存在'));
+
+      expect(
+        () => io.makeDirectory('../escape'),
+        throwsA(isA<WorkspacePathException>()),
+      );
+    });
+
+    test('rename：源缺失 / 目标已存在 / 父目录缺失各自的码，成功后真的搬了', () async {
+      t.seed('/ws/a.txt', 'A');
+      t.seed('/ws/other.txt', 'B');
+      t.dirs.add('/ws/sub');
+
+      final WorkspaceMutationResult missing = await io.rename(
+        'nope.txt',
+        'x.txt',
+      );
+      expect(missing.status, WorkspaceMutationStatus.notFound);
+
+      final WorkspaceMutationResult exists = await io.rename(
+        'a.txt',
+        'other.txt',
+      );
+      expect(exists.status, WorkspaceMutationStatus.alreadyExists);
+      expect(exists.message, contains('不覆盖'));
+      expect(t.files['/ws/other.txt'], utf8.encode('B'), reason: '绝不覆盖');
+      expect(t.files.containsKey('/ws/a.txt'), isTrue, reason: '失败不动源');
+
+      final WorkspaceMutationResult parent = await io.rename(
+        'a.txt',
+        'no/dir/a.txt',
+      );
+      expect(parent.status, WorkspaceMutationStatus.parentMissing);
+
+      final WorkspaceMutationResult ok = await io.rename('a.txt', 'sub/a.txt');
+      expect(ok.ok, isTrue);
+      expect(t.files.containsKey('/ws/a.txt'), isFalse);
+      expect(t.files['/ws/sub/a.txt'], utf8.encode('A'));
+    });
+
+    test('remove：非空目录默认拒绝，recursive 才删整棵；空目录 / 文件 / 缺失', () async {
+      t.seed('/ws/dir/a.txt', 'a');
+      t.seed('/ws/dir/deep/b.txt', 'b');
+      t.seed('/ws/file.txt', 'f');
+      t.dirs.add('/ws/empty');
+
+      final WorkspaceMutationResult notEmpty = await io.remove('dir');
+      expect(notEmpty.status, WorkspaceMutationStatus.notEmpty);
+      expect(notEmpty.message, contains('recursive=1'));
+      expect(
+        t.files.containsKey('/ws/dir/a.txt'),
+        isTrue,
+        reason: '拒绝时一个字节都不删',
+      );
+
+      final WorkspaceMutationResult ok = await io.remove(
+        'dir',
+        recursive: true,
+      );
+      expect(ok.ok, isTrue);
+      expect(
+        t.files.keys.where((String k) => k.startsWith('/ws/dir/')),
+        isEmpty,
+      );
+
+      final WorkspaceMutationResult empty = await io.remove('empty');
+      expect(empty.ok, isTrue);
+      expect(t.dirs, isNot(contains('/ws/empty')));
+
+      final WorkspaceMutationResult file = await io.remove('file.txt');
+      expect(file.ok, isTrue);
+      expect(t.files.containsKey('/ws/file.txt'), isFalse);
+
+      final WorkspaceMutationResult missing = await io.remove('nope');
+      expect(missing.status, WorkspaceMutationStatus.notFound);
+
+      expect(
+        () => io.remove('../escape'),
+        throwsA(isA<WorkspacePathException>()),
+      );
+    });
+
+    test('结果码载体：ok() 的 message 为空，失败码带可读原因', () {
+      expect(const WorkspaceMutationResult.ok().ok, isTrue);
+      expect(const WorkspaceMutationResult.ok().message, isEmpty);
+      const WorkspaceMutationResult bad = WorkspaceMutationResult(
+        WorkspaceMutationStatus.notFound,
+        '路径不存在：x',
+      );
+      expect(bad.ok, isFalse);
+      expect(bad.message, '路径不存在：x');
     });
   });
 

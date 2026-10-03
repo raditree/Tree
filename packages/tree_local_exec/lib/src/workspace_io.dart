@@ -311,6 +311,91 @@ class GitBranchesOutcome {
   };
 }
 
+/// 一条 Git 工作区状态（M11 文件面板：改动高亮）。
+class GitStatusEntry {
+  const GitStatusEntry({required this.path, required this.status});
+
+  /// 工作空间相对路径（重命名取**新名**；未跟踪目录去掉 git 补的尾斜杠）。
+  final String path;
+
+  /// 面板口径的单字母状态：`M` 修改 / `U` 未跟踪或冲突 / `A` 新增 / `D` 删除 /
+  /// `R` 重命名或复制 / `I` 被忽略（映射规则见 `GitOutput.parseStatus`）。
+  final String status;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'path': path,
+    'status': status,
+  };
+}
+
+/// `git status` 的结果（M11）。
+///
+/// **不是仓库 / 没有 git 时不是错误**：[isRepo] 为 false、[entries] 为空，面板显示
+/// 空态而不是 400（与 [GitLogOutcome] 同一口径）。
+class GitStatusOutcome {
+  const GitStatusOutcome({
+    required this.isRepo,
+    required this.entries,
+    required this.truncated,
+    required this.exitCode,
+  });
+
+  /// 该工作空间是否是一个 git 仓库（= `git status` 退出码为 0）。
+  final bool isRepo;
+
+  final List<GitStatusEntry> entries;
+
+  /// 条目数触顶被截断（大仓库不把核心拖死）。
+  final bool truncated;
+
+  /// git 的退出码（0 = 正常）。
+  final int exitCode;
+
+  /// REST 形状（前端文件面板直接用）：`{is_repo, entries, truncated}`。
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'is_repo': isRepo,
+    'entries': entries.map((GitStatusEntry e) => e.toJson()).toList(),
+    'truncated': truncated,
+  };
+}
+
+/// 新建 / 重命名 / 删除这类**结构改动**的结果码（M11）。
+///
+/// 为什么用结果码而不是异常：三种操作各自的失败语义不同，上层要按语义映射
+/// 409（已存在 / 目录非空）/ 404（源不存在）/ 400（目标父目录不存在）。异常类型
+/// 会把这些差异藏进字符串里，结果码则把语义钉在类型上（本地与 SSH 同一套）。
+enum WorkspaceMutationStatus {
+  ok,
+
+  /// 目标已存在（新建 / 重命名时，**重命名绝不覆盖**）。
+  alreadyExists,
+
+  /// 源不存在（重命名 / 删除时）。
+  notFound,
+
+  /// 目标父目录不存在（**不自动创建**——静默建目录会把写错路径变成「成功」）。
+  parentMissing,
+
+  /// 目录非空且调用方没有要求递归（删除时）。
+  notEmpty,
+}
+
+/// [WorkspaceMutationStatus] 的载体：带回**可读原因**（上层原样展示给用户）。
+class WorkspaceMutationResult {
+  const WorkspaceMutationResult(this.status, [this.message = '']);
+
+  const WorkspaceMutationResult.ok()
+    : status = WorkspaceMutationStatus.ok,
+      message = '';
+
+  final WorkspaceMutationStatus status;
+
+  /// 可读原因（成功时为空）。UI 要能直接显示这句话，不许是英文异常文本。
+  final String message;
+
+  bool get ok => status == WorkspaceMutationStatus.ok;
+}
+
 /// 工作空间 IO。
 abstract interface class WorkspaceIO {
   /// 工作空间根目录（绝对路径）。
@@ -379,6 +464,18 @@ abstract interface class WorkspaceIO {
   /// Git 分支列表（含当前分支）；非仓库 / 没有 git 同样只回空列表 + 退出码。
   Future<GitBranchesOutcome> gitBranches();
 
+  /// Git 工作区状态（`git status --porcelain=v1 -z` 解析结果，M11）。
+  ///
+  /// 非仓库 / 没有 git **不抛异常**：返回 [GitStatusOutcome.isRepo] = false + 空
+  /// 列表，由上层显示空态。[maxEntries] 是条目上限（超出置 truncated）。
+  ///
+  /// [ignored] 为 true 时带 `--ignored`（`!!` 条目才会出现）。默认**不带**：
+  /// 大仓库里列被忽略文件既慢又吵，按需再开。
+  Future<GitStatusOutcome> gitStatus({
+    int maxEntries = 2000,
+    bool ignored = false,
+  });
+
   /// 释放资源（幂等）。
   Future<void> close();
 }
@@ -445,4 +542,33 @@ abstract interface class WorkspaceFiles {
 
   /// 把字节流写入文件（自动创建父目录）。
   Future<void> writeStream(String relativePath, Stream<List<int>> data);
+
+  /// 新建**一层**目录（M11 文件面板：新建文件夹）。
+  ///
+  /// 语义（本地与 SSH 完全一致）：
+  /// - 目标已存在（文件或目录）→ [WorkspaceMutationStatus.alreadyExists]；
+  /// - 父目录不存在 → [WorkspaceMutationStatus.parentMissing]（**不自动建父目录**）；
+  /// - 路径越界 / 非法 → [WorkspacePathException]（与读路径同一套边界）。
+  Future<WorkspaceMutationResult> makeDirectory(String relativePath);
+
+  /// 重命名 / 移动（M11 文件面板）。
+  ///
+  /// 语义：
+  /// - 源不存在 → [WorkspaceMutationStatus.notFound]；
+  /// - 目标已存在 → [WorkspaceMutationStatus.alreadyExists]（**绝不覆盖**：SFTP 的
+  ///   `posix-rename@openssh.com` 扩展本身就是覆盖语义，所以实现必须**先自检**）；
+  /// - 目标父目录不存在 → [WorkspaceMutationStatus.parentMissing]。
+  Future<WorkspaceMutationResult> rename(String from, String to);
+
+  /// 删除文件或目录（M11 文件面板）。
+  ///
+  /// 语义：
+  /// - 不存在 → [WorkspaceMutationStatus.notFound]；
+  /// - 目录非空且 [recursive] 为 false → [WorkspaceMutationStatus.notEmpty]
+  ///   （**默认拒绝**，绝不静默递归删掉一整棵树）；
+  /// - [recursive] 为 true 时递归删整棵子树。
+  Future<WorkspaceMutationResult> remove(
+    String relativePath, {
+    bool recursive = false,
+  });
 }

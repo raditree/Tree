@@ -177,6 +177,12 @@ class PrivateWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   Future<GitBranchesOutcome> gitBranches() => inner.gitBranches();
 
   @override
+  Future<GitStatusOutcome> gitStatus({
+    int maxEntries = 2000,
+    bool ignored = false,
+  }) => inner.gitStatus(maxEntries: maxEntries, ignored: ignored);
+
+  @override
   Future<void> close() => inner.close();
 
   // ── WorkspaceFiles（SSH 后端同时实现两者；文件面板按同一口径看私有目录）────
@@ -208,4 +214,18 @@ class PrivateWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   @override
   Future<void> writeStream(String relativePath, Stream<List<int>> data) =>
       _files.writeStream(_map(relativePath), data);
+
+  @override
+  Future<WorkspaceMutationResult> makeDirectory(String relativePath) =>
+      _files.makeDirectory(_map(relativePath));
+
+  @override
+  Future<WorkspaceMutationResult> rename(String from, String to) =>
+      _files.rename(_map(from), _map(to));
+
+  @override
+  Future<WorkspaceMutationResult> remove(
+    String relativePath, {
+    bool recursive = false,
+  }) => _files.remove(_map(relativePath), recursive: recursive);
 }

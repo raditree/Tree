@@ -34,6 +34,7 @@ abstract final class TreeLocalExec {
     'exec_shell',
     'git_log',
     'git_branches',
+    'git_status',
   ];
 
   /// 内置工具名（工具层声明用；team/message/spec/ask_user_question 属 M5，mcp 属 M6）。

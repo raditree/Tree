@@ -9,7 +9,8 @@
 | --- | --- |
 | [lib/src/workspace_io.dart](lib/src/workspace_io.dart) | 接口：`WorkspaceIO`（read/write/edit/grep/list/exec/git）、`WorkspaceFiles`（文件面板：列目录 / 原始字节 / 流）、结果类型与路径异常 |
 | [lib/src/local_workspace_io.dart](lib/src/local_workspace_io.dart) | 本机实现：进程树终止、非 UTF-8 输出标记（GBK 代码页尝试解码）、软超时交还活着的进程（`RunningLocalExec`） |
-| [lib/src/ssh_workspace_io.dart](lib/src/ssh_workspace_io.dart) | SSH 实现：SFTP + exec，心跳判活，链路失活显式失败；另含交互终端的透传口 `openShell`（远端根在这一层解决） |
+| [lib/src/ssh_workspace_io.dart](lib/src/ssh_workspace_io.dart) | SSH 实现：SFTP + exec，心跳判活，链路失活显式失败；文件面板的结构改动（mkdir / rename / remove）也在这一层，**全部走 SFTP**；另含交互终端的透传口 `openShell`（远端根在这一层解决） |
+| [lib/src/git_output.dart](lib/src/git_output.dart) | git 的命令与输出解析（log / branch / **status**）：本地与 SSH **共用一份**，命令形状与解析规则不可能漂移 |
 | [lib/src/ssh_shell_channel.dart](lib/src/ssh_shell_channel.dart) | **远端 shell 通道** `SshShellChannel`（交互终端用）：原始字节输出 / 键盘输入 / 改尺寸 / 退出码 / 幂等 `close`；dartssh2 实现在 [lib/src/dartssh_transport.dart](lib/src/dartssh_transport.dart) 的 `openShell`（`shell` 或 `exec + pty-req`） |
 | [lib/src/shell.dart](lib/src/shell.dart) | shell 参数：`-NonInteractive`、裸 `echo` 兼容翻译、逻辑运算符翻译（Windows/POSIX） |
 | [lib/src/ssh_liveness.dart](lib/src/ssh_liveness.dart) | SSH 心跳台账（连续 N 拍丢失 ⇒ 判失活） |
@@ -51,6 +52,15 @@
     通道**（绝不 `SSHClient.close()`：SFTP / exec / 文件面板与它共用连接）；输出是**原始字节**。
     边界：远端 sshd 必须允许 `shell` / `pty-req`（`PermitTTY no` 会被明确拒绝、回可读错误）；
     本仓库**只用假通道验证过**（本机没有可连的 sshd），详见 [../../docs/known-issues.md](../../docs/known-issues.md) #12。
+12. **远端结构改动（`makeDirectory` / `rename` / `remove`）走 SFTP，不起 shell**：`SshTransport` 上新增的
+    四个方法由 dartssh2 的 `SftpClient.mkdir` / `rename` / `remove` / `rmdir` / `stat` 实现，因此没有引号 /
+    转义 / 远端有没有 coreutils 这些问题。递归删除是**自底向上的 SFTP 遍历**（`listdir` + `remove`），
+    按**链接本身**删、不跟着符号链接删穿。**重命名绝不覆盖**：SFTP 的 `posix-rename@openssh.com` 扩展
+    本身就是覆盖语义，所以 `SshWorkspaceIO` 先自检目标是否存在再调 rename；父目录用 `stat`（O(1)）判，
+    不为了判类型把整层目录列一遍。结果码是 `WorkspaceMutationStatus`（见 [lib/src/workspace_io.dart](lib/src/workspace_io.dart)）：
+    `alreadyExists` / `notFound` / `parentMissing` / `notEmpty`（**不抛异常表达业务语义**，上层才能映射 409 / 404 / 400）。
+13. **git 状态与 git 日志共用同一套命令与解析**：`GitOutput.statusArgs` / `parseStatus`（`--porcelain=v1 -z`）
+    本地与远端都引用它；两侧都**不抛异常**，只回退出码 + 空列表（非仓库 ⇒ 面板空态，不是 400）。
 
 ## 测试
 
@@ -62,6 +72,10 @@ dart analyze lib test
 $env:TREE_SSH_TEST_HOST='...'; $env:TREE_SSH_TEST_USER='...'; $env:TREE_SSH_TEST_KEY='...'
 dart test
 ```
+
+M11 新增钉子：`git_output_test` 的 `parseStatus` 组（`-z`、空格 / 中文 / 引号路径、重命名、混合暂存、
+未跟踪、被忽略、非法输入、截断）；`local_workspace_io_test` / `ssh_workspace_io_test` 的「文件面板结构改动」组
+（新建 / 重命名 / 删除的结果码与真实行为）；`git` 组里的 `gitStatus` 用例（真仓库 M/U/A/D + 非仓库空态）。
 
 回归钉子：`exec_no_interactive_hang_test`（裸 `echo` 不再等输入）、`exec_soft_timeout_test`（软超时交还进程）、
 `shell_translate_test`（裸 echo / 逻辑运算符翻译）、`pty_session_test`（真 PTY：banner → `echo` 回读 →

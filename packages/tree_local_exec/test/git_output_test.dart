@@ -58,6 +58,123 @@ void main() {
     });
   });
 
+  group('parseStatus（M11：git status --porcelain=v1 -z）', () {
+    /// 按 -z 的真实形状拼输出：每条记录以 NUL 结尾。
+    String z(List<String> records) =>
+        records.map((String r) => '$r\u0000').join();
+
+    test('XY 映射成面板口径（M / U / A / D）', () {
+      final ({List<GitStatusEntry> entries, bool truncated}) parsed =
+          GitOutput.parseStatus(
+            z(<String>[' M a.txt', 'A  b.txt', '?? c.txt', ' D d.txt']),
+          );
+      expect(
+        parsed.entries
+            .map((GitStatusEntry e) => '${e.status}:${e.path}')
+            .toList(),
+        <String>['M:a.txt', 'A:b.txt', 'U:c.txt', 'D:d.txt'],
+      );
+      expect(parsed.truncated, isFalse);
+    });
+
+    test('空格 / 中文 / 引号路径不碎（-z 不做引号转义）', () {
+      final ({List<GitStatusEntry> entries, bool truncated}) parsed =
+          GitOutput.parseStatus(
+            z(<String>[
+              ' M my file.txt',
+              ' M 中文 目录/文件 名.txt',
+              ' M a"b.txt',
+            ]),
+          );
+      expect(
+        parsed.entries.map((GitStatusEntry e) => e.path).toList(),
+        <String>['my file.txt', '中文 目录/文件 名.txt', 'a"b.txt'],
+      );
+    });
+
+    test('重命名 / 复制：取新名，旧名字段不另成一条', () {
+      final ({List<GitStatusEntry> entries, bool truncated}) parsed =
+          GitOutput.parseStatus(
+            z(<String>['R  new name.txt', 'old name.txt', ' M after.txt']),
+          );
+      expect(parsed.entries, hasLength(2));
+      expect(parsed.entries.first.path, 'new name.txt');
+      expect(parsed.entries.first.status, 'R');
+      expect(
+        parsed.entries.map((GitStatusEntry e) => e.path),
+        isNot(contains('old name.txt')),
+        reason: '旧名是上一条的补充字段，不是独立条目',
+      );
+      expect(parsed.entries.last.path, 'after.txt');
+    });
+
+    test('暂存与工作区混合：M 优先于 A', () {
+      expect(GitOutput.reduceStatus('A', 'M'), 'M');
+      expect(GitOutput.reduceStatus('M', 'M'), 'M');
+      expect(GitOutput.reduceStatus('M', 'D'), 'M');
+      expect(GitOutput.reduceStatus('R', 'M'), 'M');
+      expect(GitOutput.reduceStatus(' ', 'M'), 'M');
+      expect(GitOutput.reduceStatus('A', ' '), 'A');
+      expect(GitOutput.reduceStatus(' ', 'D'), 'D');
+      expect(GitOutput.reduceStatus('R', ' '), 'R');
+      expect(GitOutput.reduceStatus('C', ' '), 'R');
+      expect(GitOutput.reduceStatus('U', 'U'), 'U');
+      expect(GitOutput.reduceStatus('?', '?'), 'U');
+      expect(GitOutput.reduceStatus('!', '!'), 'I');
+      expect(GitOutput.reduceStatus('X', 'Y'), isNull);
+    });
+
+    test('被忽略（!!）与未跟踪目录（去掉 git 补的尾斜杠）', () {
+      final ({List<GitStatusEntry> entries, bool truncated}) parsed =
+          GitOutput.parseStatus(z(<String>['!! build/', '?? dist/']));
+      expect(parsed.entries, hasLength(2));
+      expect(parsed.entries.first.path, 'build');
+      expect(parsed.entries.first.status, 'I');
+      expect(parsed.entries.last.path, 'dist');
+      expect(parsed.entries.last.status, 'U');
+    });
+
+    test('非法 / 不完整输入不抛（认不出的记录跳过）', () {
+      expect(GitOutput.parseStatus('').entries, isEmpty);
+      expect(
+        GitOutput.parseStatus('fatal: not a git repository').entries,
+        isEmpty,
+        reason: '非 -z 的报错文本不该被当成条目',
+      );
+      expect(GitOutput.parseStatus('\u0000\u0000').entries, isEmpty);
+      expect(GitOutput.parseStatus('AB').entries, isEmpty);
+      expect(GitOutput.parseStatus(' M ').entries, isEmpty, reason: '空路径跳过');
+      expect(
+        GitOutput.parseStatus('R  only-new.txt\u0000').entries.single.path,
+        'only-new.txt',
+        reason: '旧名缺失也不抛，取到的那条照收',
+      );
+    });
+
+    test('截断：达到 maxEntries 即停并置 truncated', () {
+      final ({List<GitStatusEntry> entries, bool truncated}) parsed =
+          GitOutput.parseStatus(
+            z(<String>[' M a', ' M b', ' M c']),
+            maxEntries: 2,
+          );
+      expect(parsed.entries, hasLength(2));
+      expect(parsed.truncated, isTrue);
+      expect(
+        GitOutput.parseStatus(z(<String>[' M a']), maxEntries: 0).truncated,
+        isTrue,
+      );
+    });
+
+    test('toJson 形状：{path, status}', () {
+      final ({List<GitStatusEntry> entries, bool truncated}) parsed =
+          GitOutput.parseStatus(z(<String>[' M a.txt']));
+      expect(parsed.entries.single.toJson(), <String, dynamic>{
+        'path': 'a.txt',
+        'status': 'M',
+      });
+    });
+  });
+
   group('命令形状（本地与 SSH 必须一字不差）', () {
     test('log：--pretty/--date=iso/-n 与旧实现一致', () {
       expect(
@@ -76,6 +193,19 @@ void main() {
     test('branch：-a 含远端分支', () {
       expect(GitOutput.branchCommand, 'git branch -a');
       expect(GitOutput.branchArgs(), <String>['branch', '-a']);
+    });
+
+    test('status：--porcelain=v1 -z，按需 --ignored（路径不碎）', () {
+      expect(GitOutput.statusArgs(), <String>[
+        'status',
+        '--porcelain=v1',
+        '-z',
+      ]);
+      expect(GitOutput.statusCommand(), 'git status --porcelain=v1 -z');
+      expect(
+        GitOutput.statusCommand(ignored: true),
+        'git status --porcelain=v1 -z --ignored',
+      );
     });
 
     test('limit 夹在 1..1000', () {

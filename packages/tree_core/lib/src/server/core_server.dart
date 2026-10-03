@@ -1173,6 +1173,8 @@ class CoreServer {
     );
     router.add('POST', ApiPaths.settingsDataCollection, _setDataCollection);
     router.add('GET', ApiPaths.files, _listFiles);
+    // 同路径的 DELETE（M11）：删除文件 / 目录（?path=&recursive=1）。
+    router.add('DELETE', ApiPaths.fileDelete, _fileDelete);
     router.add('GET', ApiPaths.fileContent, _fileContent);
     // 同路径的 PUT（M10）：源码编辑器保存（完整文本覆盖写）。
     router.add('PUT', ApiPaths.fileContent, _fileWriteContent);
@@ -1183,6 +1185,9 @@ class CoreServer {
     router.add('POST', ApiPaths.fileUploadChunk, _uploadChunk);
     router.add('POST', ApiPaths.fileUploadComplete, _uploadComplete);
     router.add('POST', ApiPaths.fileSyncToLocal, _syncToLocal);
+    router.add('POST', ApiPaths.fileMkdir, _fileMkdir);
+    router.add('POST', ApiPaths.fileRename, _fileRename);
+    router.add('GET', ApiPaths.fileGitStatus, _fileGitStatus);
     router.add('GET', ApiPaths.workspaceGitLog, _workspaceGitLog);
     router.add('GET', ApiPaths.workspaceGitBranches, _workspaceGitBranches);
     router.add('GET', ApiPaths.pluginSnapshot, _pluginSnapshot);
@@ -2647,13 +2652,24 @@ class CoreServer {
       ifSize: _optionalInt(body, 'if_size'),
       force: _truthy(query['force']),
     );
+    // 写接口的错误体固定是 {error, detail}（409 冲突另带当前 size）。
+    await _writeWriteResult(request, result);
+  }
+
+  /// 写接口（`writeContent` / 结构改动）的响应收口。
+  ///
+  /// 服务层用 `{error, detail, status}` 表达失败：`error` 是机器码、`detail` 是
+  /// 可直接展示的中文原因（前端两种字段都认）。这里不走 [_writeResultError] 那套
+  /// 「error 即 detail」的口径——那会把机器码当文案发给用户。
+  Future<void> _writeWriteResult(
+    HttpRequest request,
+    Map<String, dynamic> result,
+  ) async {
     final Object? error = result['error'];
     if (error == null) {
       await writeJson(request, 200, result);
       return;
     }
-    // 写接口的错误体固定是 {error, detail}（409 冲突另带当前 size）：不再走
-    // _writeResultError 那套「error 即 detail」的口径。
     final int status = (result['status'] as num?)?.toInt() ?? 400;
     final Map<String, dynamic> payload = <String, dynamic>{
       'error': error,
@@ -2662,6 +2678,94 @@ class CoreServer {
     final Object? size = result['size'];
     if (size != null) payload['size'] = size;
     await writeJson(request, status, payload);
+  }
+
+  /// `POST /api/files/{workspaceId}/mkdir`：新建文件夹（M11）。
+  ///
+  /// 请求体 `{path}`；成功 200 `{success, path}`，目标已存在 409，父目录不存在 400。
+  /// 判定与落盘都在 [FileService.mkdir]，这里只解析请求与收口响应。
+  Future<void> _fileMkdir(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final FileService? files = fileService;
+    if (files == null) {
+      await writeJson(request, 501, errorBody('文件服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic>? body = await _jsonBody(request);
+    if (body == null) return;
+    final Map<String, dynamic> result = await files.mkdir(
+      params['workspaceId'] ?? '',
+      path: (body['path'] ?? '').toString(),
+    );
+    await _writeWriteResult(request, result);
+  }
+
+  /// `POST /api/files/{workspaceId}/rename`：重命名 / 移动（M11）。
+  ///
+  /// 请求体 `{from, to}`；成功 200 `{success, from, to}`，目标已存在 409、源不存在
+  /// 404、目标父目录不存在 400（**不自动建目录**）。
+  Future<void> _fileRename(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final FileService? files = fileService;
+    if (files == null) {
+      await writeJson(request, 501, errorBody('文件服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic>? body = await _jsonBody(request);
+    if (body == null) return;
+    final Map<String, dynamic> result = await files.rename(
+      params['workspaceId'] ?? '',
+      from: (body['from'] ?? '').toString(),
+      to: (body['to'] ?? '').toString(),
+    );
+    await _writeWriteResult(request, result);
+  }
+
+  /// `DELETE /api/files/{workspaceId}?path=[&recursive=1]`：删除（M11）。
+  ///
+  /// 与 `GET /api/files/{workspaceId}`（列目录）**同一条路径、不同方法**。非空目录
+  /// 默认拒绝（要带 `recursive=1`）；工作空间根永远拒绝。
+  Future<void> _fileDelete(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final FileService? files = fileService;
+    if (files == null) {
+      await writeJson(request, 501, errorBody('文件服务尚未接入'));
+      return;
+    }
+    final Map<String, String> query = request.uri.queryParameters;
+    final Map<String, dynamic> result = await files.remove(
+      params['workspaceId'] ?? '',
+      path: query['path'] ?? '',
+      recursive: _truthy(query['recursive']),
+    );
+    await _writeWriteResult(request, result);
+  }
+
+  /// `GET /api/files/{workspaceId}/git-status`：Git 工作区状态（M11 文件面板）。
+  ///
+  /// `?ignored=1` 才带 `--ignored`（`!!` 条目）。**不是仓库不是错误**：200 +
+  /// `{is_repo: false, entries: [], truncated: false}`，面板显示空态。
+  Future<void> _fileGitStatus(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final FileService? files = fileService;
+    if (files == null) {
+      await writeJson(request, 501, errorBody('文件服务尚未接入'));
+      return;
+    }
+    final Map<String, dynamic> result = await files.gitStatus(
+      params['workspaceId'] ?? '',
+      ignored: _truthy(request.uri.queryParameters['ignored']),
+    );
+    if (await _writeResultError(request, result)) return;
+    await writeJson(request, 200, result);
   }
 
   /// 查询串里的布尔开关：「1」/「true」（大小写不敏感）为真，其余为假。

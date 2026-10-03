@@ -690,6 +690,173 @@ void main() {
       expect(branches.branches, contains('feature'));
       expect(branches.branches, contains(branches.current));
     });
+
+    test('gitStatus：非仓库 → isRepo=false + 空列表，不抛异常', () async {
+      final GitStatusOutcome out = await io.gitStatus();
+      expect(out.isRepo, isFalse);
+      expect(out.entries, isEmpty);
+      expect(out.truncated, isFalse);
+      expect(out.exitCode, isNot(0));
+    });
+
+    test('gitStatus：真仓库的 M / U / A / D', () async {
+      final ProcessResult probe = await Process.run('git', <String>[
+        '--version',
+      ]);
+      if (probe.exitCode != 0) {
+        markTestSkipped('本机没有 git，跳过');
+        return;
+      }
+      writeFile('a.txt', 'one');
+      writeFile('del.txt', 'gone');
+      writeFile('中文 文件.txt', 'z');
+      await git(<String>['init', '-q']);
+      await git(<String>['config', 'user.email', 'test@example.com']);
+      await git(<String>['config', 'user.name', 'Tree Test']);
+      await git(<String>['add', '-A']);
+      await git(<String>['commit', '-q', '-m', '初次提交']);
+
+      // 工作区改动（M）、删除（D）、新增并暂存（A）、未跟踪（U）
+      writeFile('a.txt', 'changed');
+      File(p.join(root.path, 'del.txt')).deleteSync();
+      writeFile('added.txt', 'new');
+      await git(<String>['add', 'added.txt']);
+      writeFile('untracked.txt', 'u');
+
+      final GitStatusOutcome out = await io.gitStatus();
+      expect(out.isRepo, isTrue);
+      expect(out.exitCode, 0);
+      final Map<String, String> byPath = <String, String>{
+        for (final GitStatusEntry e in out.entries) e.path: e.status,
+      };
+      expect(byPath['a.txt'], 'M');
+      expect(byPath['del.txt'], 'D');
+      expect(byPath['added.txt'], 'A');
+      expect(byPath['untracked.txt'], 'U');
+      expect(byPath['中文 文件.txt'], isNull, reason: '没动过的不该出现');
+
+      // 条目上限与 truncated 形状
+      final GitStatusOutcome capped = await io.gitStatus(maxEntries: 1);
+      expect(capped.entries, hasLength(1));
+      expect(capped.truncated, isTrue);
+      expect(capped.toJson().keys.toSet(), <String>{
+        'is_repo',
+        'entries',
+        'truncated',
+      });
+    });
+  });
+
+  group('文件面板结构改动（M11：本机 dart:io）', () {
+    test('makeDirectory：父目录缺失先报错，再逐层建、已存在给结果码', () async {
+      final WorkspaceMutationResult missing = await io.makeDirectory('a/b');
+      expect(missing.status, WorkspaceMutationStatus.parentMissing);
+      expect(missing.message, contains('父目录不存在'));
+
+      final WorkspaceMutationResult one = await io.makeDirectory('a');
+      expect(one.ok, isTrue);
+      expect(Directory(p.join(root.path, 'a')).existsSync(), isTrue);
+
+      final WorkspaceMutationResult deep = await io.makeDirectory('a/b');
+      expect(deep.ok, isTrue);
+      expect(Directory(p.join(root.path, 'a', 'b')).existsSync(), isTrue);
+
+      final WorkspaceMutationResult again = await io.makeDirectory('a');
+      expect(again.status, WorkspaceMutationStatus.alreadyExists);
+
+      // 目标是**文件**也算已存在（绝不把文件覆盖成目录）
+      writeFile('file.txt', 'x');
+      final WorkspaceMutationResult onFile = await io.makeDirectory(
+        'file.txt',
+      );
+      expect(onFile.status, WorkspaceMutationStatus.alreadyExists);
+      expect(File(p.join(root.path, 'file.txt')).readAsStringSync(), 'x');
+
+      expect(
+        () => io.makeDirectory('../escape'),
+        throwsA(isA<WorkspacePathException>()),
+      );
+    });
+
+    test('rename：源缺失 / 目标已存在 / 父目录缺失各自的码，成功后真的搬家', () async {
+      writeFile('a.txt', 'A');
+      writeFile('b.txt', 'B');
+      writeFile('dir/x.txt', 'X');
+      Directory(p.join(root.path, 'sub')).createSync();
+
+      expect(
+        (await io.rename('nope.txt', 'x.txt')).status,
+        WorkspaceMutationStatus.notFound,
+      );
+
+      final WorkspaceMutationResult exists = await io.rename('a.txt', 'b.txt');
+      expect(exists.status, WorkspaceMutationStatus.alreadyExists);
+      expect(exists.message, contains('不覆盖'));
+      expect(
+        File(p.join(root.path, 'b.txt')).readAsStringSync(),
+        'B',
+        reason: '绝不覆盖目标',
+      );
+      expect(File(p.join(root.path, 'a.txt')).existsSync(), isTrue);
+
+      expect(
+        (await io.rename('a.txt', 'no/dir/a.txt')).status,
+        WorkspaceMutationStatus.parentMissing,
+      );
+
+      final WorkspaceMutationResult fileOk = await io.rename(
+        'a.txt',
+        'sub/a.txt',
+      );
+      expect(fileOk.ok, isTrue);
+      expect(File(p.join(root.path, 'a.txt')).existsSync(), isFalse);
+      expect(File(p.join(root.path, 'sub', 'a.txt')).readAsStringSync(), 'A');
+
+      final WorkspaceMutationResult dirOk = await io.rename('dir', 'dir2');
+      expect(dirOk.ok, isTrue);
+      expect(File(p.join(root.path, 'dir2', 'x.txt')).readAsStringSync(), 'X');
+
+      expect(
+        () => io.rename('../escape', 'x.txt'),
+        throwsA(isA<WorkspacePathException>()),
+      );
+    });
+
+    test('remove：非空目录默认拒绝、recursive 递归删、空目录 / 文件 / 缺失', () async {
+      writeFile('dir/a.txt', 'a');
+      writeFile('dir/deep/b.txt', 'b');
+      writeFile('file.txt', 'f');
+      Directory(p.join(root.path, 'empty')).createSync();
+
+      final WorkspaceMutationResult notEmpty = await io.remove('dir');
+      expect(notEmpty.status, WorkspaceMutationStatus.notEmpty);
+      expect(notEmpty.message, contains('recursive=1'));
+      expect(
+        File(p.join(root.path, 'dir', 'a.txt')).existsSync(),
+        isTrue,
+        reason: '拒绝时一个字节都不删',
+      );
+
+      final WorkspaceMutationResult ok = await io.remove(
+        'dir',
+        recursive: true,
+      );
+      expect(ok.ok, isTrue);
+      expect(Directory(p.join(root.path, 'dir')).existsSync(), isFalse);
+
+      expect((await io.remove('empty')).ok, isTrue);
+      expect((await io.remove('file.txt')).ok, isTrue);
+      expect(File(p.join(root.path, 'file.txt')).existsSync(), isFalse);
+      expect(
+        (await io.remove('nope')).status,
+        WorkspaceMutationStatus.notFound,
+      );
+
+      expect(
+        () => io.remove('../escape'),
+        throwsA(isA<WorkspacePathException>()),
+      );
+    });
   });
 
   group('工作空间文件流（M8c）', () {

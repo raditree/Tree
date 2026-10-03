@@ -659,6 +659,42 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     );
   }
 
+  @override
+  Future<GitStatusOutcome> gitStatus({
+    int maxEntries = 2000,
+    bool ignored = false,
+  }) async {
+    final ProcessResult? result = await _runGit(
+      GitOutput.statusArgs(ignored: ignored),
+    );
+    if (result == null) {
+      return const GitStatusOutcome(
+        isRepo: false,
+        entries: <GitStatusEntry>[],
+        truncated: false,
+        exitCode: GitOutput.missingGitExitCode,
+      );
+    }
+    // 非仓库 / 没有 git：退出码非 0、stdout 是报错文本。**不是错误**——
+    // isRepo=false + 空列表，面板显示空态（绝不拿报错文本硬解析出垃圾条目）。
+    if (result.exitCode != 0) {
+      return GitStatusOutcome(
+        isRepo: false,
+        entries: const <GitStatusEntry>[],
+        truncated: false,
+        exitCode: result.exitCode,
+      );
+    }
+    final ({List<GitStatusEntry> entries, bool truncated}) parsed =
+        GitOutput.parseStatus('${result.stdout}', maxEntries: maxEntries);
+    return GitStatusOutcome(
+      isRepo: true,
+      entries: parsed.entries,
+      truncated: parsed.truncated,
+      exitCode: 0,
+    );
+  }
+
   /// 跑一次 git（cwd = 工作空间根）。
   ///
   /// 本机没有 git 可执行文件（或工作空间目录不存在）时返回 null：调用方按
@@ -763,6 +799,105 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     } finally {
       await sink.close();
     }
+  }
+
+  // ── 文件面板的结构改动（M11）：新建目录 / 重命名 / 删除 ─────────────────
+
+  @override
+  Future<WorkspaceMutationResult> makeDirectory(String relativePath) async {
+    final String absolute = resolve(relativePath);
+    final FileSystemEntityType type = await FileSystemEntity.type(absolute);
+    if (type != FileSystemEntityType.notFound) {
+      return WorkspaceMutationResult(
+        WorkspaceMutationStatus.alreadyExists,
+        '目标已存在：$relativePath',
+      );
+    }
+    final Directory parent = Directory(p.dirname(absolute));
+    if (!await parent.exists()) {
+      return WorkspaceMutationResult(
+        WorkspaceMutationStatus.parentMissing,
+        '父目录不存在（不会自动创建）：${relativize(parent.path)}',
+      );
+    }
+    try {
+      // 不 recursive：父目录已确认存在，多建层级一定是路径写错了。
+      await Directory(absolute).create();
+    } on FileSystemException catch (error) {
+      throw WorkspaceIoException('新建目录失败（$relativePath）：${error.message}');
+    }
+    return const WorkspaceMutationResult.ok();
+  }
+
+  @override
+  Future<WorkspaceMutationResult> rename(String from, String to) async {
+    final String source = resolve(from);
+    final String target = resolve(to);
+    final FileSystemEntityType sourceType = await FileSystemEntity.type(source);
+    if (sourceType == FileSystemEntityType.notFound) {
+      return WorkspaceMutationResult(
+        WorkspaceMutationStatus.notFound,
+        '源路径不存在：$from',
+      );
+    }
+    // 先自检目标：Windows 上文件改名到已存在的名字会直接抛，行为因平台而异，
+    // 这里统一成契约里的 alreadyExists（**绝不覆盖**）。
+    final FileSystemEntityType targetType = await FileSystemEntity.type(target);
+    if (targetType != FileSystemEntityType.notFound) {
+      return WorkspaceMutationResult(
+        WorkspaceMutationStatus.alreadyExists,
+        '目标已存在（重命名不覆盖）：$to',
+      );
+    }
+    final Directory parent = Directory(p.dirname(target));
+    if (!await parent.exists()) {
+      return WorkspaceMutationResult(
+        WorkspaceMutationStatus.parentMissing,
+        '目标父目录不存在（不会自动创建）：${relativize(parent.path)}',
+      );
+    }
+    try {
+      if (sourceType == FileSystemEntityType.directory) {
+        await Directory(source).rename(target);
+      } else {
+        await File(source).rename(target);
+      }
+    } on FileSystemException catch (error) {
+      throw WorkspaceIoException('重命名失败（$from → $to）：${error.message}');
+    }
+    return const WorkspaceMutationResult.ok();
+  }
+
+  @override
+  Future<WorkspaceMutationResult> remove(
+    String relativePath, {
+    bool recursive = false,
+  }) async {
+    final String absolute = resolve(relativePath);
+    final FileSystemEntityType type = await FileSystemEntity.type(absolute);
+    if (type == FileSystemEntityType.notFound) {
+      return WorkspaceMutationResult(
+        WorkspaceMutationStatus.notFound,
+        '路径不存在：$relativePath',
+      );
+    }
+    try {
+      if (type == FileSystemEntityType.directory) {
+        final Directory dir = Directory(absolute);
+        if (!recursive && dir.listSync(followLinks: false).isNotEmpty) {
+          return WorkspaceMutationResult(
+            WorkspaceMutationStatus.notEmpty,
+            '目录非空（默认不递归删除）：$relativePath；确要删除请带 recursive=1',
+          );
+        }
+        await dir.delete(recursive: recursive);
+      } else {
+        await File(absolute).delete();
+      }
+    } on FileSystemException catch (error) {
+      throw WorkspaceIoException('删除失败（$relativePath）：${error.message}');
+    }
+    return const WorkspaceMutationResult.ok();
   }
 
   /// 目录在前，各自按名字（不区分大小写）排序——与前端文件树一致。

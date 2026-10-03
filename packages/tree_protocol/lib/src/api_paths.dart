@@ -70,6 +70,23 @@ abstract final class ApiPaths {
   static const String fileDownload = '/api/files/{workspaceId}/download';
   static const String fileDownloadFolder =
       '/api/files/{workspaceId}/download_folder';
+
+  /// 新建文件夹（POST，body {path}）：目标已存在 → 409。
+  static const String fileMkdir = '/api/files/{workspaceId}/mkdir';
+
+  /// 重命名 / 移动（POST，body {from, to}）：目标已存在 → 409、源不存在 → 404、
+  /// 目标父目录不存在 → 400（**不自动建父目录**）。
+  static const String fileRename = '/api/files/{workspaceId}/rename';
+
+  /// 删除（DELETE ?path=[&recursive=1]）。
+  ///
+  /// **与 [files] 是同一条路径**：REST 按方法区分（GET = 列目录，DELETE = 删除），
+  /// 这里单独给一个常量名是因为前端调用点要能一眼看出"这是删除"。
+  static const String fileDelete = files;
+
+  /// Git 工作区状态（GET）：{is_repo, entries: [{path, status}], truncated}。
+  static const String fileGitStatus = '/api/files/{workspaceId}/git-status';
+
   static const String workspaceGitLog = '/api/workspaces/{workspaceId}/git/log';
   static const String workspaceGitBranches =
       '/api/workspaces/{workspaceId}/git/branches';
@@ -155,6 +172,11 @@ abstract final class ApiPaths {
     fileSyncToLocal,
     fileDownload,
     fileDownloadFolder,
+    fileMkdir,
+    fileRename,
+    // fileDelete 是 [files] 的**别名**（同一条路径，REST 按方法区分）：kept 是**路径集合**，
+    // 重复列同一个字符串会让 const Set 在编译期报错，因此这里只列 files 一次。
+    fileGitStatus,
     workspaceGitLog,
     workspaceGitBranches,
     settingsFrameRate,

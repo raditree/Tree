@@ -52,6 +52,29 @@ abstract interface class SshTransport {
   /// 删除一个远端**文件**（不存在不报错）。
   Future<void> delete(String absolutePath);
 
+  /// 新建一个远端目录（M11 文件面板；**父目录必须已存在**）。
+  ///
+  /// 走 SFTP 的 mkdir（dartssh2 `SftpClient.mkdir`），不起 shell——没有引号 /
+  /// 转义 / 远端有没有 coreutils 这些问题。
+  Future<void> makeDirectory(String absolutePath);
+
+  /// 重命名 / 移动远端路径（M11 文件面板；走 SFTP 的 rename）。
+  ///
+  /// **注意**：OpenSSH 的 `posix-rename@openssh.com` 扩展是**覆盖**语义，因此
+  /// 「目标已存在」必须由 [SshWorkspaceIO] 先自检，不能指望这一层报错。
+  Future<void> rename(String oldPath, String newPath);
+
+  /// 删除远端文件 / 目录（M11 文件面板）。
+  ///
+  /// 目录非空且 [recursive] 为 false 时抛 [WorkspaceIoException]（**不静默递归**）。
+  Future<void> remove(String absolutePath, {bool recursive = false});
+
+  /// 路径是否是目录（不存在 / 是文件 / 读不到都返回 false）。
+  ///
+  /// 用 SFTP 的 `stat`（O(1)）而不是「能不能列目录」：父目录可能是巨大的目录，
+  /// 为了判个类型把整层列一遍不值当。
+  Future<bool> isDirectory(String absolutePath);
+
   /// 执行命令，返回退出码与解码后的输出。
   ///
   /// [timeout] 是 M9 之前的**静态总时长**硬超时；1.1 修正后**不再按时间终止**
@@ -554,6 +577,36 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     );
   }
 
+  @override
+  Future<GitStatusOutcome> gitStatus({
+    int maxEntries = 2000,
+    bool ignored = false,
+  }) async {
+    final SshExecResult result = await _link.guard(
+      () => _transport.run(
+        'cd ${_quote(root)} && ${GitOutput.statusCommand(ignored: ignored)}',
+      ),
+    );
+    // 非仓库 / 远端没有 git：退出码非 0、stdout 是报错文本。**不是错误**——
+    // isRepo=false + 空列表，面板显示空态。
+    if (result.exitCode != 0) {
+      return GitStatusOutcome(
+        isRepo: false,
+        entries: const <GitStatusEntry>[],
+        truncated: false,
+        exitCode: result.exitCode,
+      );
+    }
+    final ({List<GitStatusEntry> entries, bool truncated}) parsed =
+        GitOutput.parseStatus(result.stdout, maxEntries: maxEntries);
+    return GitStatusOutcome(
+      isRepo: true,
+      entries: parsed.entries,
+      truncated: parsed.truncated,
+      exitCode: 0,
+    );
+  }
+
   // ── 文件面板（M7g）：列一层目录 + 原始字节读写 ─────────────────────────
 
   @override
@@ -648,6 +701,106 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     } catch (error) {
       throw WorkspaceIoException('写入失败（$relativePath）：$error');
     }
+  }
+
+  // ── 文件面板的结构改动（M11）：新建目录 / 重命名 / 删除（全部走 SFTP） ────
+
+  @override
+  Future<WorkspaceMutationResult> makeDirectory(String relativePath) async {
+    final String absolute = resolve(relativePath);
+    try {
+      if (await _link.guard(() => _transport.exists(absolute))) {
+        return WorkspaceMutationResult(
+          WorkspaceMutationStatus.alreadyExists,
+          '目标已存在：$relativePath',
+        );
+      }
+      final String parent = p.posix.dirname(absolute);
+      if (!await _link.guard(() => _transport.isDirectory(parent))) {
+        return WorkspaceMutationResult(
+          WorkspaceMutationStatus.parentMissing,
+          '父目录不存在（不会自动创建）：${relativize(parent)}',
+        );
+      }
+      await _link.guard(() => _transport.makeDirectory(absolute));
+    } on WorkspaceIoException {
+      rethrow;
+    } catch (error) {
+      throw WorkspaceIoException('新建远端目录失败（$relativePath）：$error');
+    }
+    return const WorkspaceMutationResult.ok();
+  }
+
+  @override
+  Future<WorkspaceMutationResult> rename(String from, String to) async {
+    final String source = resolve(from);
+    final String target = resolve(to);
+    try {
+      if (!await _link.guard(() => _transport.exists(source))) {
+        return WorkspaceMutationResult(
+          WorkspaceMutationStatus.notFound,
+          '源路径不存在：$from',
+        );
+      }
+      // 先自检目标：SFTP 的 posix-rename 扩展**默认覆盖**目标，契约要求「已存在 →
+      // 409 且绝不覆盖」，靠远端报错是不可靠的。
+      if (await _link.guard(() => _transport.exists(target))) {
+        return WorkspaceMutationResult(
+          WorkspaceMutationStatus.alreadyExists,
+          '目标已存在（重命名不覆盖）：$to',
+        );
+      }
+      final String parent = p.posix.dirname(target);
+      if (!await _link.guard(() => _transport.isDirectory(parent))) {
+        return WorkspaceMutationResult(
+          WorkspaceMutationStatus.parentMissing,
+          '目标父目录不存在（不会自动创建）：${relativize(parent)}',
+        );
+      }
+      await _link.guard(() => _transport.rename(source, target));
+    } on WorkspaceIoException {
+      rethrow;
+    } catch (error) {
+      throw WorkspaceIoException('远端重命名失败（$from → $to）：$error');
+    }
+    return const WorkspaceMutationResult.ok();
+  }
+
+  @override
+  Future<WorkspaceMutationResult> remove(
+    String relativePath, {
+    bool recursive = false,
+  }) async {
+    final String absolute = resolve(relativePath);
+    try {
+      if (!await _link.guard(() => _transport.exists(absolute))) {
+        return WorkspaceMutationResult(
+          WorkspaceMutationStatus.notFound,
+          '路径不存在：$relativePath',
+        );
+      }
+      if (!recursive &&
+          await _link.guard(() => _transport.isDirectory(absolute))) {
+        // 只取一条就够判断「空不空」：大目录也不怕（不列全）。
+        final List<SshFileEntry> entries = await _link.guard(
+          () => _transport.listEntries(absolute, maxEntries: 1),
+        );
+        if (entries.isNotEmpty) {
+          return WorkspaceMutationResult(
+            WorkspaceMutationStatus.notEmpty,
+            '目录非空（默认不递归删除）：$relativePath；确要删除请带 recursive=1',
+          );
+        }
+      }
+      await _link.guard(
+        () => _transport.remove(absolute, recursive: recursive),
+      );
+    } on WorkspaceIoException {
+      rethrow;
+    } catch (error) {
+      throw WorkspaceIoException('远端删除失败（$relativePath）：$error');
+    }
+    return const WorkspaceMutationResult.ok();
   }
 
   /// 打开一条远端 shell 通道（交互终端的 SSH 分支）。

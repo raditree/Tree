@@ -21,7 +21,7 @@
 | [tool](lib/src/tool/README.md) | 工具层：工具契约、工作空间执行器、内置工具集（**工具描述 / 参数 schema 就是模型读到的提示词**）、MCP / 插件工具注入与兜底 |
 | [team](lib/src/team/README.md) | 团队领域：成员即 agent、共享工作目录与 SSH 跟随、消息派发与活动日志 |
 | [store](lib/src/store/README.md) | 数据根布局、记录模型、落盘 / 内存实现、写队列与原子快照 |
-| [files](lib/src/files/README.md) | 工作空间文件服务（唯一的路径安全边界）：读 / 写 / 上传 / 打包 / Git |
+| [files](lib/src/files/README.md) | 工作空间文件服务（唯一的路径安全边界）：读 / 写 / 结构改动（新建 / 重命名 / 删除）/ 上传 / 打包 / Git |
 | [spec](lib/src/spec/README.md) | 任务型规范：**内置 Spec 模板（`kBuiltinSpecs`，改文案要 bump version）**、播种与刷新、索引注入提示词、select / create / update |
 | [mcp](lib/src/mcp/README.md) | MCP 客户端（stdio + Streamable HTTP）与服务管理 |
 | [plugin](lib/src/plugin/README.md) | 插件宿主、四类站点与点位、执行站挂载、插件工具与 UI 槽位 |

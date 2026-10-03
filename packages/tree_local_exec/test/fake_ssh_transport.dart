@@ -130,14 +130,82 @@ class FakeSshTransport implements SshTransport {
     return out.length > maxEntries ? out.sublist(0, maxEntries) : out;
   }
 
+  /// 与真实现同口径（`test -e`）：文件、**目录**、以及任何子项的祖先都算存在。
   @override
   Future<bool> exists(String absolutePath) async =>
       files.containsKey(absolutePath) ||
-      files.keys.any((String k) => k.startsWith('$absolutePath/'));
+      files.keys.any((String k) => k.startsWith('$absolutePath/')) ||
+      dirs.contains(absolutePath) ||
+      dirs.any((String d) => d.startsWith('$absolutePath/'));
 
   @override
   Future<void> delete(String absolutePath) async {
     files.remove(absolutePath);
+  }
+
+  /// 路径是否是目录：显式声明的 [dirs] 或「有子项的隐含目录」。
+  @override
+  Future<bool> isDirectory(String absolutePath) async =>
+      dirs.contains(absolutePath) ||
+      files.keys.any((String k) => k.startsWith('$absolutePath/')) ||
+      dirs.any((String d) => d.startsWith('$absolutePath/'));
+
+  @override
+  Future<void> makeDirectory(String absolutePath) async {
+    if (await exists(absolutePath) || await isDirectory(absolutePath)) {
+      throw WorkspaceIoException('目录已存在：$absolutePath');
+    }
+    dirs.add(absolutePath);
+  }
+
+  @override
+  Future<void> rename(String oldPath, String newPath) async {
+    if (!await exists(oldPath) && !await isDirectory(oldPath)) {
+      throw WorkspaceIoException('源不存在：$oldPath');
+    }
+    final Map<String, List<int>> moved = <String, List<int>>{};
+    for (final String key in files.keys.toList()) {
+      if (key == oldPath || key.startsWith('$oldPath/')) {
+        moved[newPath + key.substring(oldPath.length)] = files.remove(key)!;
+      }
+    }
+    files.addAll(moved);
+    final List<String> movedDirs = <String>[];
+    for (final String dir in dirs.toList()) {
+      if (dir == oldPath || dir.startsWith('$oldPath/')) {
+        dirs.remove(dir);
+        movedDirs.add(newPath + dir.substring(oldPath.length));
+      }
+    }
+    dirs.addAll(movedDirs);
+  }
+
+  @override
+  Future<void> remove(String absolutePath, {bool recursive = false}) async {
+    final bool present =
+        files.containsKey(absolutePath) ||
+        files.keys.any((String k) => k.startsWith('$absolutePath/')) ||
+        dirs.contains(absolutePath);
+    if (!present) throw WorkspaceIoException('路径不存在：$absolutePath');
+    if (!await isDirectory(absolutePath)) {
+      files.remove(absolutePath);
+      return;
+    }
+    final bool hasChildren =
+        files.keys.any((String k) => k.startsWith('$absolutePath/')) ||
+        dirs.any(
+          (String d) => d != absolutePath && d.startsWith('$absolutePath/'),
+        );
+    if (hasChildren && !recursive) {
+      throw WorkspaceIoException('目录非空：$absolutePath');
+    }
+    files.removeWhere(
+      (String k, List<int> _) =>
+          k == absolutePath || k.startsWith('$absolutePath/'),
+    );
+    dirs.removeWhere(
+      (String d) => d == absolutePath || d.startsWith('$absolutePath/'),
+    );
   }
 
   @override

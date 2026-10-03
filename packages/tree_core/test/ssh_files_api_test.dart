@@ -163,6 +163,121 @@ class _FakeRemote implements WorkspaceFiles {
     files[relativePath] = builder.takeBytes();
     writes.add(relativePath);
   }
+
+  // ── M11：结构改动（新建 / 重命名 / 删除） ──────────────────────────────
+
+  /// 显式目录集合（[files] 只描述文件，空目录推不出来）。
+  final Set<String> dirs = <String>{};
+
+  bool _isDir(String rel) =>
+      rel.isEmpty ||
+      dirs.contains(rel) ||
+      files.keys.any((String k) => k.startsWith('$rel/')) ||
+      dirs.any((String d) => d.startsWith('$rel/'));
+
+  bool _has(String rel) => files.containsKey(rel) || _isDir(rel);
+
+  static String _parentOf(String rel) {
+    final int slash = rel.lastIndexOf('/');
+    return slash < 0 ? '' : rel.substring(0, slash);
+  }
+
+  @override
+  Future<WorkspaceMutationResult> makeDirectory(String relativePath) async {
+    _guard(relativePath);
+    if (_has(relativePath)) {
+      return WorkspaceMutationResult(
+        WorkspaceMutationStatus.alreadyExists,
+        '目标已存在：$relativePath',
+      );
+    }
+    final String parent = _parentOf(relativePath);
+    if (!_isDir(parent)) {
+      return WorkspaceMutationResult(
+        WorkspaceMutationStatus.parentMissing,
+        '父目录不存在：$parent',
+      );
+    }
+    dirs.add(relativePath);
+    return const WorkspaceMutationResult.ok();
+  }
+
+  @override
+  Future<WorkspaceMutationResult> rename(String from, String to) async {
+    _guard(from);
+    _guard(to);
+    if (!_has(from)) {
+      return WorkspaceMutationResult(
+        WorkspaceMutationStatus.notFound,
+        '源路径不存在：$from',
+      );
+    }
+    if (_has(to)) {
+      return WorkspaceMutationResult(
+        WorkspaceMutationStatus.alreadyExists,
+        '目标已存在（不覆盖）：$to',
+      );
+    }
+    final String parent = _parentOf(to);
+    if (!_isDir(parent)) {
+      return WorkspaceMutationResult(
+        WorkspaceMutationStatus.parentMissing,
+        '目标父目录不存在：$parent',
+      );
+    }
+    final Map<String, List<int>> moved = <String, List<int>>{};
+    for (final String key in files.keys.toList()) {
+      if (key == from || key.startsWith('$from/')) {
+        moved[to + key.substring(from.length)] = files.remove(key)!;
+      }
+    }
+    files.addAll(moved);
+    final List<String> movedDirs = <String>[];
+    for (final String dir in dirs.toList()) {
+      if (dir == from || dir.startsWith('$from/')) {
+        dirs.remove(dir);
+        movedDirs.add(to + dir.substring(from.length));
+      }
+    }
+    dirs.addAll(movedDirs);
+    return const WorkspaceMutationResult.ok();
+  }
+
+  @override
+  Future<WorkspaceMutationResult> remove(
+    String relativePath, {
+    bool recursive = false,
+  }) async {
+    _guard(relativePath);
+    if (!_has(relativePath)) {
+      return WorkspaceMutationResult(
+        WorkspaceMutationStatus.notFound,
+        '路径不存在：$relativePath',
+      );
+    }
+    if (_isDir(relativePath) && !recursive) {
+      final bool hasChildren =
+          files.keys.any((String k) => k.startsWith('$relativePath/')) ||
+          dirs.any(
+            (String d) =>
+                d != relativePath && d.startsWith('$relativePath/'),
+          );
+      if (hasChildren) {
+        return WorkspaceMutationResult(
+          WorkspaceMutationStatus.notEmpty,
+          '目录非空：$relativePath；请带 recursive=1',
+        );
+      }
+    }
+    files.removeWhere(
+      (String k, List<int> _) =>
+          k == relativePath || k.startsWith('$relativePath/'),
+    );
+    dirs.removeWhere(
+      (String d) => d == relativePath || d.startsWith('$relativePath/'),
+    );
+    return const WorkspaceMutationResult.ok();
+  }
 }
 
 /// SSH 工作空间的文件面板 REST 面（M7g）：用内存远端后端验证分流与语义。
@@ -184,6 +299,7 @@ void main() {
     int? maxContentBytes,
     Object? backend,
     Future<WorkspaceIO?> Function(String agentId)? ioFor,
+    int maxGitStatusEntries = 2000,
   }) async {
     store = MemoryStore();
     agent = store.createAgent(name: '远端用例', modelId: 'demo');
@@ -216,6 +332,7 @@ void main() {
             : null,
         ioFor: ioFor,
         maxContentBytes: maxContentBytes ?? 8 * 1024 * 1024,
+        maxGitStatusEntries: maxGitStatusEntries,
       ),
       enableHeartbeat: false,
       streamChunkDelay: Duration.zero,
@@ -599,6 +716,301 @@ void main() {
     expect(branches.status, 200, reason: branches.raw);
     expect(branches.json['branches'], isEmpty);
     expect(branches.json['current'], '');
+  });
+
+  Future<void> runGit(Directory repo, List<String> args) async {
+    final ProcessResult result = await Process.run('git', <String>[
+      '-C',
+      repo.path,
+      ...args,
+    ]);
+    expect(
+      result.exitCode,
+      0,
+      reason: 'git ${args.join(' ')}: ${result.stderr}',
+    );
+  }
+
+  /// 造一个真临时 git 仓库（本机没有 git 时返回 null，调用方自己跳过）。
+  Future<Directory?> makeGitRepo() async {
+    final ProcessResult probe = await Process.run('git', <String>['--version']);
+    if (probe.exitCode != 0) return null;
+    final Directory repo = Directory.systemTemp.createTempSync('tree_ssh_git_');
+    addTearDown(() async {
+      for (int i = 0; i < 10 && repo.existsSync(); i++) {
+        try {
+          repo.deleteSync(recursive: true);
+        } catch (_) {
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+        }
+      }
+    });
+    await runGit(repo, <String>['init', '-q']);
+    await runGit(repo, <String>['config', 'user.email', 'test@example.com']);
+    await runGit(repo, <String>['config', 'user.name', 'Tree Test']);
+    return repo;
+  }
+
+  // ── M11：结构改动（远端走同一个 WorkspaceFiles 后端） ──────────────────
+
+  test('远端 mkdir：成功 / 已存在 409 / 父目录不存在 400 / 逃逸 400', () async {
+    await start();
+    final _Res one = await client.send(
+      'POST',
+      '/api/files/${ws()}/mkdir',
+      body: <String, dynamic>{'path': '新建 目录'},
+    );
+    expect(one.status, 200, reason: one.raw);
+    expect(one.json['success'], true);
+    expect(one.json['path'], '新建 目录');
+    expect(remote.dirs, contains('新建 目录'));
+
+    final _Res deep = await client.send(
+      'POST',
+      '/api/files/${ws()}/mkdir',
+      body: <String, dynamic>{'path': '新建 目录/深'},
+    );
+    expect(deep.status, 200, reason: deep.raw);
+
+    final _Res again = await client.send(
+      'POST',
+      '/api/files/${ws()}/mkdir',
+      body: <String, dynamic>{'path': '新建 目录'},
+    );
+    expect(again.status, 409, reason: again.raw);
+    expect(again.raw, contains('已存在'));
+
+    final _Res onFile = await client.send(
+      'POST',
+      '/api/files/${ws()}/mkdir',
+      body: <String, dynamic>{'path': 'a.txt'},
+    );
+    expect(onFile.status, 409, reason: onFile.raw);
+
+    final _Res parent = await client.send(
+      'POST',
+      '/api/files/${ws()}/mkdir',
+      body: <String, dynamic>{'path': 'nope/deep'},
+    );
+    expect(parent.status, 400, reason: parent.raw);
+    expect(parent.raw, contains('父目录不存在'));
+
+    for (final String bad in <String>['', '.', '../escape', 'C:/x']) {
+      final _Res res = await client.send(
+        'POST',
+        '/api/files/${ws()}/mkdir',
+        body: <String, dynamic>{'path': bad},
+      );
+      expect(res.status, 400, reason: 'path=$bad: ${res.raw}');
+    }
+  });
+
+  test('远端 rename：成功 / 源 404 / 目标 409（不覆盖）/ 父目录 400', () async {
+    await start();
+    final _Res ok = await client.send(
+      'POST',
+      '/api/files/${ws()}/rename',
+      body: <String, dynamic>{'from': 'a.txt', 'to': 'sub/a.txt'},
+    );
+    expect(ok.status, 200, reason: ok.raw);
+    expect(ok.json['from'], 'a.txt');
+    expect(ok.json['to'], 'sub/a.txt');
+    expect(remote.files.containsKey('sub/a.txt'), isTrue);
+    expect(remote.files.containsKey('a.txt'), isFalse);
+
+    final _Res missing = await client.send(
+      'POST',
+      '/api/files/${ws()}/rename',
+      body: <String, dynamic>{'from': 'nope.txt', 'to': 'x.txt'},
+    );
+    expect(missing.status, 404, reason: missing.raw);
+    expect(missing.raw, contains('不存在'));
+
+    final _Res exists = await client.send(
+      'POST',
+      '/api/files/${ws()}/rename',
+      body: <String, dynamic>{'from': 'sub/a.txt', 'to': 'doc.pdf'},
+    );
+    expect(exists.status, 409, reason: exists.raw);
+    expect(exists.raw, contains('不覆盖'));
+    expect(
+      utf8.decode(remote.files['doc.pdf']!),
+      startsWith('%PDF'),
+      reason: '绝不覆盖目标',
+    );
+
+    final _Res parent = await client.send(
+      'POST',
+      '/api/files/${ws()}/rename',
+      body: <String, dynamic>{'from': 'sub/a.txt', 'to': 'no/dir/a.txt'},
+    );
+    expect(parent.status, 400, reason: parent.raw);
+    expect(parent.raw, contains('父目录不存在'));
+    expect(remote.files.containsKey('no/dir/a.txt'), isFalse);
+
+    final _Res same = await client.send(
+      'POST',
+      '/api/files/${ws()}/rename',
+      body: <String, dynamic>{'from': 'sub/a.txt', 'to': 'sub/a.txt'},
+    );
+    expect(same.status, 400, reason: same.raw);
+  });
+
+  test('远端 delete：非空目录默认拒绝 / recursive / 空目录 / 缺失 / 根 400', () async {
+    await start();
+    final _Res notEmpty = await client.send(
+      'DELETE',
+      '/api/files/${ws()}?path=sub',
+    );
+    expect(notEmpty.status, 409, reason: notEmpty.raw);
+    expect(notEmpty.raw, contains('recursive=1'));
+    expect(
+      remote.files.containsKey('sub/b.md'),
+      isTrue,
+      reason: '拒绝时一个字节都不删',
+    );
+
+    final _Res recursive = await client.send(
+      'DELETE',
+      '/api/files/${ws()}?path=sub&recursive=1',
+    );
+    expect(recursive.status, 200, reason: recursive.raw);
+    expect(recursive.json['success'], true);
+    expect(recursive.json['path'], 'sub');
+    expect(remote.files.containsKey('sub/b.md'), isFalse);
+
+    final _Res file = await client.send(
+      'DELETE',
+      '/api/files/${ws()}?path=a.txt',
+    );
+    expect(file.status, 200, reason: file.raw);
+    expect(remote.files.containsKey('a.txt'), isFalse);
+
+    remote.dirs.add('empty');
+    final _Res empty = await client.send(
+      'DELETE',
+      '/api/files/${ws()}?path=empty',
+    );
+    expect(empty.status, 200, reason: empty.raw);
+    expect(remote.dirs, isNot(contains('empty')));
+
+    final _Res missing = await client.send(
+      'DELETE',
+      '/api/files/${ws()}?path=missing.txt',
+    );
+    expect(missing.status, 404, reason: missing.raw);
+
+    for (final String bad in <String>['', '.', 'a/..']) {
+      final _Res res = await client.send(
+        'DELETE',
+        '/api/files/${ws()}?path=$bad',
+      );
+      expect(res.status, 400, reason: 'path=$bad: ${res.raw}');
+    }
+  });
+
+  test('远端结构改动：核心没接远端文件后端时给可读 400，绝不落到本机', () async {
+    await start(wireRemote: false);
+    final _Res made = await client.send(
+      'POST',
+      '/api/files/${ws()}/mkdir',
+      body: <String, dynamic>{'path': 'x'},
+    );
+    expect(made.status, 400, reason: made.raw);
+    expect(made.raw, contains('远端（SSH）'));
+
+    final _Res renamed = await client.send(
+      'POST',
+      '/api/files/${ws()}/rename',
+      body: <String, dynamic>{'from': 'a.txt', 'to': 'b.txt'},
+    );
+    expect(renamed.status, 400, reason: renamed.raw);
+    expect(renamed.raw, contains('远端（SSH）'));
+
+    final _Res removed = await client.send(
+      'DELETE',
+      '/api/files/${ws()}?path=a.txt',
+    );
+    expect(removed.status, 400, reason: removed.raw);
+    expect(removed.raw, contains('远端（SSH）'));
+  });
+
+  // ── M11：远端 git-status ───────────────────────────────────────────────
+
+  test('远端 git-status：经 WorkspaceIO 跑 git，M/U/A/D 与形状（M11）', () async {
+    final Directory? repo = await makeGitRepo();
+    if (repo == null) {
+      markTestSkipped('本机没有 git，跳过');
+      return;
+    }
+    File('${repo.path}/a.txt').writeAsStringSync('one');
+    await runGit(repo, <String>['add', '-A']);
+    await runGit(repo, <String>['commit', '-q', '-m', '初次提交']);
+
+    File('${repo.path}/a.txt').writeAsStringSync('two');
+    File('${repo.path}/added.txt').writeAsStringSync('n');
+    await runGit(repo, <String>['add', 'added.txt']);
+    File('${repo.path}/untracked 文件.txt').writeAsStringSync('u');
+
+    await start(backend: LocalWorkspaceIO(repo.path));
+    final _Res res = await client.send('GET', '/api/files/${ws()}/git-status');
+    expect(res.status, 200, reason: res.raw);
+    expect(res.json['is_repo'], true);
+    expect(res.json['truncated'], false);
+    final Map<String, String> byPath = <String, String>{
+      for (final dynamic e in res.json['entries'] as List<dynamic>)
+        (e as Map<String, dynamic>)['path'] as String:
+            e['status'] as String,
+    };
+    expect(byPath['a.txt'], 'M');
+    expect(byPath['added.txt'], 'A');
+    expect(byPath['untracked 文件.txt'], 'U');
+  });
+
+  test('远端 git-status：条目上限触发 truncated', () async {
+    final Directory? repo = await makeGitRepo();
+    if (repo == null) {
+      markTestSkipped('本机没有 git，跳过');
+      return;
+    }
+    File('${repo.path}/a.txt').writeAsStringSync('one');
+    File('${repo.path}/b.txt').writeAsStringSync('b');
+    await runGit(repo, <String>['add', '-A']);
+    await runGit(repo, <String>['commit', '-q', '-m', '初次提交']);
+    File('${repo.path}/a.txt').writeAsStringSync('two');
+    File('${repo.path}/b.txt').writeAsStringSync('b2');
+
+    await start(
+      backend: LocalWorkspaceIO(repo.path),
+      maxGitStatusEntries: 1,
+    );
+    final _Res res = await client.send('GET', '/api/files/${ws()}/git-status');
+    expect(res.status, 200, reason: res.raw);
+    expect(res.json['is_repo'], true);
+    expect((res.json['entries'] as List<dynamic>).length, 1);
+    expect(res.json['truncated'], true);
+  });
+
+  test('远端 git-status：不是仓库 → 200 + is_repo=false 空列表（不是错误）', () async {
+    final Directory empty = Directory.systemTemp.createTempSync(
+      'tree_ssh_nostatus_',
+    );
+    addTearDown(() {
+      if (empty.existsSync()) empty.deleteSync(recursive: true);
+    });
+    await start(ioFor: (String _) async => LocalWorkspaceIO(empty.path));
+    final _Res res = await client.send('GET', '/api/files/${ws()}/git-status');
+    expect(res.status, 200, reason: res.raw);
+    expect(res.json['is_repo'], false);
+    expect(res.json['entries'], isEmpty);
+    expect(res.json['truncated'], false);
+  });
+
+  test('远端 git-status：核心没接远端工作空间 IO 时仍是可读 400', () async {
+    await start(wireRemote: false);
+    final _Res res = await client.send('GET', '/api/files/${ws()}/git-status');
+    expect(res.status, 400, reason: res.raw);
+    expect(res.json['detail'], contains('未接入远端 Git 后端'));
   });
 
   test('SSH Git：核心没接远端工作空间 IO 时仍是可读 400', () async {

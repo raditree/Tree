@@ -143,6 +143,86 @@ class DartSshTransport implements SshTransport {
     await run('rm -f ${_quote(absolutePath)}');
   }
 
+  /// 新建一个远端目录（M11）：SFTP 的 mkdir，**不建父目录**（父目录缺失时 SFTP
+  /// 直接报错，正是契约要的 parentMissing 语义）。
+  @override
+  Future<void> makeDirectory(String absolutePath) async {
+    try {
+      await _sftp.mkdir(absolutePath);
+    } catch (error) {
+      throw WorkspaceIoException('远端新建目录失败：$absolutePath（$error）');
+    }
+  }
+
+  /// 重命名 / 移动远端路径（M11）：SFTP 的 rename。
+  ///
+  /// 服务器支持 `posix-rename@openssh.com` 时 dartssh2 会走扩展请求——那是**覆盖**
+  /// 语义，因此调用方（[SshWorkspaceIO]）必须先自检目标是否存在。
+  @override
+  Future<void> rename(String oldPath, String newPath) async {
+    try {
+      await _sftp.rename(oldPath, newPath);
+    } catch (error) {
+      throw WorkspaceIoException('远端重命名失败：$oldPath → $newPath（$error）');
+    }
+  }
+
+  /// 路径是否是目录（M11）：SFTP 的 stat（O(1)），读不到一律当「不是」。
+  @override
+  Future<bool> isDirectory(String absolutePath) async {
+    try {
+      final SftpFileAttrs attrs = await _sftp.stat(absolutePath);
+      return attrs.isDirectory;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 删除远端文件 / 目录（M11）：文件走 SFTP remove，目录走 rmdir（非空报错），
+  /// [recursive] 时自底向上递归删。
+  @override
+  Future<void> remove(String absolutePath, {bool recursive = false}) async {
+    final SftpFileAttrs attrs;
+    try {
+      attrs = await _sftp.stat(absolutePath);
+    } catch (_) {
+      throw WorkspaceIoException('远端路径不存在或无法访问：$absolutePath');
+    }
+    try {
+      if (!attrs.isDirectory) {
+        await _sftp.remove(absolutePath);
+        return;
+      }
+      if (recursive) {
+        await _removeTree(absolutePath);
+        return;
+      }
+      await _sftp.rmdir(absolutePath);
+    } catch (error) {
+      throw WorkspaceIoException('远端删除失败：$absolutePath（$error）');
+    }
+  }
+
+  /// 自底向上删一整棵远端子树（M11）。
+  ///
+  /// 为什么不用 `rm -rf`：SFTP 本来没有 rmtree，而 shell 方案要处理引号 / 转义 /
+  /// 远端有没有 coreutils；SFTP 递归的代价只是往返次数，语义却完全确定——按
+  /// **链接本身**删（lstat 看到的类型），绝不跟着符号链接删穿出去。
+  Future<void> _removeTree(String absolutePath) async {
+    final List<SftpName> names = await _sftp.listdir(absolutePath);
+    for (final SftpName entry in names) {
+      final String name = entry.filename;
+      if (name == '.' || name == '..') continue;
+      final String child = '$absolutePath/$name';
+      if (entry.attr.isDirectory) {
+        await _removeTree(child);
+      } else {
+        await _sftp.remove(child);
+      }
+    }
+    await _sftp.rmdir(absolutePath);
+  }
+
   /// 远端文件大小（M8c：大文件预览/下载先问大小，不再先整读再判上限）。
   @override
   Future<int> size(String absolutePath) async {
