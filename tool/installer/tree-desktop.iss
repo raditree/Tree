@@ -71,7 +71,11 @@ Name: "{autodesktop}\Tree"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 ; 于是新装的 Tree、它的核心、它的集成终端、以及用户在终端里跑的构建命令全都跟着被污染 ——
 ; `flutter build windows` 会以 CMake `add_subdirectory … is not an existing directory` 失败
 ; （真机实测与完整证据见 docs/known-issues.md #16）。让 explorer 当父进程起 Tree，这条链是干净的。
-Filename: "explorer.exe"; Parameters: """{app}\{#AppExe}"""; Description: "启动 Tree"; Flags: nowait postinstall skipifsilent
+;
+; **必须写全路径 `{win}\explorer.exe`**：`[Run]` 里的裸名（`explorer.exe`）会被当成相对路径
+; （去 `{app}` 下找）⇒ 安装收尾弹「Unable to execute file … CreateProcess failed; code 2（找不到文件）」
+; —— 2026-10-03 真机踩过（`{win}` 是 Inno 的 Windows 目录常量）。
+Filename: "{win}\explorer.exe"; Parameters: """{app}\{#AppExe}"""; Description: "启动 Tree"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
 ; 只清理安装目录；%APPDATA%\Tree（用户配置与会话）刻意不动
