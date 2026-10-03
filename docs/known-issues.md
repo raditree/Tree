@@ -887,4 +887,51 @@ Test 团队（leader `agt_1790848305616_be41c9_3`，成员 Developer `member_179
 - MCP 首次连接的最终上限仍由**判活窗口**（心跳间隔 × 连续未响应拍数）决定，不是由这里的 3s 预算决定：
   预算只管"界面与对话不再等它"。
 
+## #14 中栏右侧「滑块乱跳」（自绘滑块旁边还活着一条原生 `Scrollbar`）
+
+**现象**（用户 2026-10-03，附 58×374 截图）：主对话框（中栏会话区）右侧的滑块乱跳；同一条窄带里能看出
+"两条短棒"，一条稳、一条跟着滚动乱动。
+
+**根因**：`571c7cd`（"中栏改成按全局下标寻址的消息窗口"）把右侧滑块**自绘**成 `MessageScrollbar`
+（按全局下标算几何；文件头还专门写明"原生 `Scrollbar` 跟随估算范围，窗口化列表里必然乱跳，故自绘"），
+但**没有关掉原生那条**：桌面 `MaterialScrollBehavior.buildScrollbar` 会给每个竖向 `Scrollable` 自动包一条
+Material `Scrollbar`，而全仓库没有任何 `ScrollConfiguration` / `ScrollBehavior` 覆写 ⇒ 中栏 `ListView` 上
+两条滑块并存。原生滑块几何来自**已构建内容**的滚动范围（窗口化列表里那是估算值，随补页/淘汰变化）
+⇒ 它必然乱跳，且与自绘那条落在同一条 14px 窄带里。
+
+**证据**：
+
+- 截图逐像素：背景 `#030705` = `brandBlack`；x=28..33 那条 6px 整条竖线 `#2B7A4B` = `brandDivider`
+  （深色 `dividerColor`）⇒ 中栏右边缘的分隔条 `DraggableDivider`（`main_page.dart`，`width: 6` + `dividerColor`）。
+  它左侧 8px 宽、颜色 = `onSurface@0.3` 的圆角短棒正是 Flutter 暗色原生 `Scrollbar` 的空闲态拇指
+  （`flutter/lib/src/material/scrollbar.dart` 的 `idleColor`，`_kScrollbarThickness = 8.0` + 2px 边距 ⇒ x∈[18,26]），
+  另一条 6px 宽、`onSurfaceVariant@0.4` 的是自绘 `MessageScrollbar` 的拇指（`right: 4, width: 6` ⇒ x∈[18,24]）
+  ——两条拇指同处一条窄带、y 不同，就是用户看到的"两条短棒"。
+- 组件测试（平台设为 windows）：中栏 `ListView` 的 `Viewport` **有** `Scrollbar` 祖先（旧代码）。
+
+**修复**：
+
+- 中栏列表上显式关掉原生滚动条：
+  `ScrollConfiguration(behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false))`
+  —— 只关滚动条（物理 / 越界指示 / 拖拽设备保留）；不做全局改造，其它面板仍用原生滑块。
+- 顺带修掉拖拽两侧不互逆（同一症状的另一半，用户同日要求一并修）：
+  `messageScrollbarIndexAt` 作为绘制几何的**严格逆**（旧口径画的分母是 `total - visible`、反解的乘数是
+  `total`，差 `total/(total-visible)` 倍）；拖拽期间把几何输入与拇指位置**钉住**（以指针为准、松手再对齐真实下标）。
+- 拖到最底下 = `total - 看得见的条数`（与"贴底"同义），中栏据此**直达底部**。
+
+**验证**：
+
+- `test/message_scrollbar_test.dart` 新增 4 条（都在旧代码上红过）：① 中栏列表子树上不许再有原生 `Scrollbar`
+  （且列表照样能滚）；② 指针走 100px、拇指必须走 100px —— 旧口径走 **132px**（= 100/75 倍，平台已设 windows、
+  镜头为鼠标指针）；③ 反解严格互逆（轨道顶 / 底 / 中间，含 6% 下限与短会话）；④ 反解单调不减。
+- 回归：`test/message_list_scroll_test.dart`、`test/message_list_viewport_stable_test.dart`、
+  `test/message_window_test.dart` 全绿；`flutter test` 全量 + `flutter analyze lib test` 零告警（见收尾汇报）。
+- 断言落点：`lib/README.md` 不变量 19③。
+
+**状态**：已修复（2026-10-03，验证方式见上）。
+
+**遗留（本次不改）**：拖拽落点仍是估算（`下标 × 占位槽高度 88px`），真消息高度与占位槽不同 ⇒ 松手后拇指
+会跳到列表的**真实**位置（一次，不是持续抖动）。要做到"拖到哪就精确到哪"得让列表按已知的真实高度反推落点
+（密度修正），属于另一处取舍，未在本次范围内。
+
 

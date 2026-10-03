@@ -298,6 +298,14 @@
     下次滑动再试；补不出东西来的段记一笔不再空转（防死循环）；
     ③ 右侧滑块**按全局下标算几何**（第一条的下标 / 全局条数，长度 = 看得见的条数 / 全局条数、有抓得住的下限），
     拖它 = 跳到该下标并补那一段（原生 `Scrollbar` 跟随"已构建内容的估算范围"，窗口化列表里必然乱跳，故自绘）；
+    **必须显式关掉原生那条**（`ScrollConfiguration(behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false))`，
+    [ui/widgets/message_list.dart](ui/widgets/message_list.dart)）——桌面 ScrollBehavior 会给每个竖向 Scrollable
+    自动包一条原生 `Scrollbar`，不关就与自绘那条叠在同一条 14px 窄带里：一条稳、一条跳（用户 2026-10-03
+    「主对话框的滑块乱跳」就是它；只关滚动条，物理/越界指示/拖拽设备保留，其它面板依赖原生滑块故不做全局改造）；
+    拖拽另有两处硬口径：**按位置反解下标必须是绘制几何的严格逆**（`messageScrollbarIndexAt`；两边各算一套会差
+    `total/(total-visible)` 倍）、**拖拽期间几何输入与拇指位置都钉住**（指针为准、松手再对齐真实下标）——
+    少了任一条，拇指都会被自己报出去的下标甩到指针前面（长会话约 1%，`total=100` 的短会话可达 33%）；
+    滑块能指到的最靠后下标是 `total - 看得见的条数`（"最后一条正好落在视口底" = 贴底），拖到最底下时列表**直达底部**；
     ④ **「回到底部」= 重载末尾一段**（`resetTail`：窗口换成"末尾页 + 比它新的实时尾巴"）＋直达底部——不再在几千条
     估算高度里做一次滚动动画（那正是"划不到底"的来源）；实时追加落在末尾，末尾那段常驻所以流式不受影响；
     ⑤ 定位一条早已被淘汰的消息用 `at=<id>`（取含它的那一段），并把那一页额外钉住不被淘汰（`evict(keepAlso:)`）；
@@ -340,7 +348,9 @@ dispose 发 `terminal_close`、布局变化发 `terminal_resize`、**输入法�
 `test/message_window_test.dart`（消息窗口：按 `offset` 放页并按 id 去重对齐、实时追加落末尾且同 id 原位替换、
 `gapsFor` 只报没加载的连续段、淘汰只留视口附近与末尾且正在流式 / 正在跑工具的不淘汰、`resetTail` 重载末尾一段）、
 `test/message_scrollbar_test.dart`（右侧滑块几何与交互：位置按**全局下标**算、长度 = 可见条数 / 全局条数并有下限、
-装得下整屏就不画、拖它按落点换算成全局下标回调出去）、
+装得下整屏就不画、拖它按落点换算成全局下标回调出去、**反解与绘制严格互逆**（抓拇指顶端/底端反解回来还是那一条）、
+反解单调不减、**拖拽时拇指跟着指针走**（面板把回填下标当真值也一样，旧口径会按 `total/(total-visible)` 领跑）、
+**桌面平台下中栏不许再有原生 `Scrollbar`**（否则它在自绘那条旁边乱跳）且列表照样能滚）、
 `test/conversation_history_api_test.dart`（真起假核心 HttpServer：末尾一段只带 `limit`、`from=` 拉那一段、
 `at=` 定位、`before=` 老口径、不带 limit 时不发 limit，且 `offset` / `total` 解析正确）、
 `test/team_scope_view_test.dart`（团队级模式/目录合成：成员跟随 TOP 的模式与目录、自己的 SSH 优先、

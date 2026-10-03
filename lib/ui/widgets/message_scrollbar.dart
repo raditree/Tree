@@ -13,6 +13,14 @@
 ///
 /// 全局总条数只随新消息增长（见 [MessageWindow]），补页/淘汰都不改变它 ⇒ 上滑时
 /// 滑块稳稳地跟着视口走。
+///
+/// **拖它的时候**（用户 2026-10-03：「滑块乱跳」）另有两处硬要求：
+/// ① 按位置反解下标（[messageScrollbarIndexAt]）必须是绘制几何的**严格逆**——两边
+///    各算一套就会差 `total/(total-visible)` 倍，抓一下拇指就被自己报出去的下标甩走；
+/// ② 拖拽期间把几何输入与拇指位置**都钉住**（[_MessageScrollbarState._dragFraction]）：
+///    列表补页/落点估算每帧都在变，让拇指跟着"实际落到哪"画，它就不在指针下了。
+///    这是**以指针为准、松手再对齐**的取舍：拖的时候手感是"抓到哪就是哪"，
+///    松手后跳一下到列表的真实位置。
 library;
 
 import 'package:flutter/material.dart';
@@ -42,6 +50,9 @@ class ScrollbarThumb {
 /// 滑块的最小占比：再长的一份历史也得留一条抓得住的滑块。
 const double kMessageScrollbarMinFraction = 0.06;
 
+/// 拇指（那条能拖的短棒）的 key：用例直接量它的位置——「拖拽时抓哪儿是哪儿」只能靠量位置钉住。
+const Key messageScrollbarThumbKey = ValueKey<String>('message-scrollbar-thumb');
+
 /// 要不要画滑块：视口里装得下整份会话就不画（没得滚）。
 bool messageScrollbarVisible({
   required int total,
@@ -50,6 +61,22 @@ bool messageScrollbarVisible({
 }) {
   if (total <= 0 || firstVisible < 0 || lastVisible < firstVisible) return false;
   return total > lastVisible - firstVisible + 1;
+}
+
+/// 滑块几何的两个中间量：**绘制与反解必须同源**。
+///
+/// 各算一次就会各差一点（旧口径画的时候分母是 `total - visible`、反解的时候乘的是
+/// `total`，差 `total/(total-visible)` 倍），拖滑块时拇指就会被自己反解出来的下标甩走。
+({int visible, int maxFirst}) _barMetrics({
+  required int total,
+  required int firstVisible,
+  required int lastVisible,
+}) {
+  final int visible = lastVisible < firstVisible
+      ? 1
+      : (lastVisible - firstVisible + 1);
+  final int maxFirst = total - visible;
+  return (visible: visible, maxFirst: maxFirst < 0 ? 0 : maxFirst);
 }
 
 /// 按全局下标算滑块几何：见文件头。
@@ -61,9 +88,12 @@ ScrollbarThumb messageScrollbarThumb({
   double minFraction = kMessageScrollbarMinFraction,
 }) {
   if (track <= 0) return const ScrollbarThumb(top: 0, length: 0);
-  final int visible = lastVisible < firstVisible
-      ? 1
-      : (lastVisible - firstVisible + 1);
+  final ({int visible, int maxFirst}) m = _barMetrics(
+    total: total,
+    firstVisible: firstVisible,
+    lastVisible: lastVisible,
+  );
+  final int visible = m.visible;
   double fraction = total <= 0 ? 1 : visible / total;
   if (fraction < minFraction) fraction = minFraction;
   if (fraction > 1) fraction = 1;
@@ -71,11 +101,45 @@ ScrollbarThumb messageScrollbarThumb({
   final double room = track - length;
   // 位置按下标比：0 = 最旧那条在视口顶，1 = **最后一条**在视口底（滑块贴底）。
   // 分母用"第一条能到的最大下标"（total - visible），这样"看到末尾"就是真的贴底。
-  final int maxFirst = total - visible;
-  final double frac = maxFirst <= 0
+  final double frac = m.maxFirst <= 0
       ? 0
-      : (firstVisible / maxFirst).clamp(0.0, 1.0);
+      : (firstVisible / m.maxFirst).clamp(0.0, 1.0);
   return ScrollbarThumb(top: room <= 0 ? 0 : room * frac, length: length);
+}
+
+/// [messageScrollbarThumb] 的**严格逆映射**：给定"拇指顶端该在的位置"[top]（已减掉抓取偏移、
+/// 已夹进轨道内），反解出它对应的全局下标。
+///
+/// 为什么必须严格互逆：拖滑块时要"抓哪儿是哪儿"——指针不动，反解出来的下标就不该变。
+/// 旧口径画的时候按下标比（分母 `total - visible`）、反解时却乘 `total`，两条几何差
+/// `total/(total-visible)` 倍：长会话约 1%，短会话（`total=100`、看得见 25 条）能到 33%
+/// ——拇指被自己反解出来的下标甩到指针前面，看起来就是「乱跳」（用户 2026-10-03）。
+int messageScrollbarIndexAt({
+  required double track,
+  required int total,
+  required int firstVisible,
+  required int lastVisible,
+  required double top,
+  double minFraction = kMessageScrollbarMinFraction,
+}) {
+  if (total <= 0 || track <= 0) return 0;
+  final ScrollbarThumb thumb = messageScrollbarThumb(
+    track: track,
+    total: total,
+    firstVisible: firstVisible,
+    lastVisible: lastVisible,
+    minFraction: minFraction,
+  );
+  final double room = track - thumb.length;
+  if (room <= 0) return 0;
+  final int maxFirst = _barMetrics(
+    total: total,
+    firstVisible: firstVisible,
+    lastVisible: lastVisible,
+  ).maxFirst;
+  if (maxFirst <= 0) return 0;
+  final double frac = (top / room).clamp(0.0, 1.0);
+  return (frac * maxFirst).round().clamp(0, total - 1);
 }
 
 /// 中栏右侧的全局下标滑块：拖到哪就请面板把那一带加载出来（[onSeek]）。
@@ -111,12 +175,63 @@ class _MessageScrollbarState extends State<MessageScrollbar> {
   /// 抓取点相对滑块顶端的偏移（拖拽时保持"抓哪儿是哪儿"）
   double _grab = 0;
 
+  /// 拖拽期间**冻结**的几何输入（null = 不在拖拽）。
+  ///
+  /// 拖的时候列表正在补页、视口每帧都在动；若每帧都拿实时输入反解，指针没动下标也在变
+  /// ⇒ 拇指从指针下滑走。按下时锁一份，松开再交回实时值。
+  int? _dragTotal;
+  int? _dragFirst;
+  int? _dragLast;
+
+  /// 拖拽期间拇指该在的位置（占比 0..1，相对"拇指顶端能走的区间"）；null = 不在拖拽。
+  ///
+  /// 拖拽期间**拇指跟着指针走、不等列表**：落点是估算的（`下标 × 占位槽高度`，见
+  /// [MessageList.onSeek]），若让拇指按"列表实际落到哪"画，一拖就滑到指针外面去。
+  /// 松手后交回真实下标（会跳一下——那是列表的真实位置，不是抖动）。
+  double? _dragFraction;
+
+  int get _total => _dragTotal ?? widget.total;
+  int get _first => _dragFirst ?? widget.firstVisible;
+  int get _last => _dragLast ?? widget.lastVisible;
+
+  ScrollbarThumb _thumb(double track) => messageScrollbarThumb(
+        track: track,
+        total: _total,
+        firstVisible: _first,
+        lastVisible: _last,
+      );
+
+  /// 指针位置 → 拇指顶端该在的位置（减掉抓取偏移、夹进轨道）。
+  double _topFor(double dy, double track, ScrollbarThumb thumb) {
+    final double room = track - thumb.length;
+    return room <= 0 ? 0 : (dy - _grab).clamp(0.0, room);
+  }
+
+  /// 按下：冻结几何输入（拖拽全程用同一份，见 [_dragTotal]）。
+  void _beginDrag() {
+    _dragTotal = widget.total;
+    _dragFirst = widget.firstVisible;
+    _dragLast = widget.lastVisible;
+    _dragFraction = null;
+  }
+
+  /// 松手 / 手势取消：解冻，拇指交回真实下标。
+  void _endDrag() {
+    setState(() {
+      _active = false;
+      _dragTotal = null;
+      _dragFirst = null;
+      _dragLast = null;
+      _dragFraction = null;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!messageScrollbarVisible(
-      total: widget.total,
-      firstVisible: widget.firstVisible,
-      lastVisible: widget.lastVisible,
+      total: _total,
+      firstVisible: _first,
+      lastVisible: _last,
     )) {
       return const SizedBox.shrink();
     }
@@ -124,12 +239,12 @@ class _MessageScrollbarState extends State<MessageScrollbar> {
     return LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
         final double track = constraints.maxHeight;
-        final ScrollbarThumb thumb = messageScrollbarThumb(
-          track: track,
-          total: widget.total,
-          firstVisible: widget.firstVisible,
-          lastVisible: widget.lastVisible,
-        );
+        final ScrollbarThumb thumb = _thumb(track);
+        final double room = track - thumb.length;
+        // 拖拽中钉在指针下（见 [_dragFraction]），否则按全局下标画。
+        final double top = _dragFraction == null
+            ? thumb.top
+            : (room <= 0 ? 0 : room * _dragFraction!);
         return MouseRegion(
           cursor: SystemMouseCursors.basic,
           onEnter: (_) => setState(() => _active = true),
@@ -137,20 +252,30 @@ class _MessageScrollbarState extends State<MessageScrollbar> {
           child: GestureDetector(
             behavior: HitTestBehavior.opaque,
             onVerticalDragStart: (DragStartDetails d) {
+              _beginDrag();
               setState(() => _active = true);
               final double dy = d.localPosition.dy;
               _grab = (dy >= thumb.top && dy <= thumb.top + thumb.length)
                   ? dy - thumb.top
                   : thumb.length / 2;
-              _seek(dy, track, thumb);
+              _seek(dy, track);
             },
             onVerticalDragUpdate: (DragUpdateDetails d) =>
-                _seek(d.localPosition.dy, track, thumb),
-            onVerticalDragEnd: (_) => setState(() => _active = false),
-            onVerticalDragCancel: () => setState(() => _active = false),
+                _seek(d.localPosition.dy, track),
+            onVerticalDragEnd: (_) => _endDrag(),
+            onVerticalDragCancel: () => _endDrag(),
             onTapDown: (TapDownDetails d) {
+              // 单击 = 直接把那一带拉出来：不做抓取保持（下一帧拇指就归位到真实下标）
               _grab = thumb.length / 2;
-              _seek(d.localPosition.dy, track, thumb);
+              widget.onSeek(
+                messageScrollbarIndexAt(
+                  track: track,
+                  total: _total,
+                  firstVisible: _first,
+                  lastVisible: _last,
+                  top: _topFor(d.localPosition.dy, track, thumb),
+                ),
+              );
             },
             child: Stack(
               children: <Widget>[
@@ -170,10 +295,11 @@ class _MessageScrollbarState extends State<MessageScrollbar> {
                   ),
                 Positioned(
                   right: 4,
-                  top: thumb.top,
+                  top: top,
                   width: 6,
                   height: thumb.length,
                   child: DecoratedBox(
+                    key: messageScrollbarThumbKey,
                     decoration: BoxDecoration(
                       color: cs.onSurfaceVariant.withValues(
                         alpha: _active ? 0.7 : 0.4,
@@ -190,14 +316,22 @@ class _MessageScrollbarState extends State<MessageScrollbar> {
     );
   }
 
-  /// 把指针位置换算成全局下标：轨道上"滑块顶端能到哪"就是下标的 0..total 区间。
-  void _seek(double dy, double track, ScrollbarThumb thumb) {
+  /// 拖动中：把指针位置反解成全局下标报出去（[onSeek]），并把拇指钉在指针下。
+  void _seek(double dy, double track) {
+    final ScrollbarThumb thumb = _thumb(track);
     final double room = track - thumb.length;
-    final double top = room <= 0 ? 0 : (dy - _grab).clamp(0.0, room);
-    final double frac = room <= 0 ? 0 : top / room;
-    final int index = frac <= 0
-        ? 0
-        : (frac * widget.total).floor().clamp(0, widget.total - 1);
-    widget.onSeek(index);
+    final double top = _topFor(dy, track, thumb);
+    setState(() {
+      _dragFraction = room <= 0 ? 0 : top / room;
+    });
+    widget.onSeek(
+      messageScrollbarIndexAt(
+        track: track,
+        total: _total,
+        firstVisible: _first,
+        lastVisible: _last,
+        top: top,
+      ),
+    );
   }
 }

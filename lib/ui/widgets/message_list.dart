@@ -486,10 +486,18 @@ class _MessageListViewState extends State<_MessageListView> {
 
   /// 拖到某个全局下标（右侧滑块）：先按"占位槽高度 × 下标"落到大致位置，
   /// 帧后报窗口时面板会补那一段；落点准不准只影响滑动的手感，不影响正确性。
+  ///
+  /// **下标的上限是"最后一条正好落在视口底"**（`total - 看得见的条数`）——滑块几何就是这么
+  /// 定的（见 [messageScrollbarThumb]：看到末尾 = 贴底）。所以拖到最底下时必须**直达底部**，
+  /// 否则会停在"最新那几条还差一屏"的地方。
   void _seekToIndex(int index) {
     if (!_controller.hasClients) return;
     final ScrollPosition pos = _controller.position;
-    if (index >= widget.slots.length - 1) {
+    final int total = widget.slots.length;
+    final int visible =
+        _reportedLast < _reportedFirst ? 1 : _reportedLast - _reportedFirst + 1;
+    final int lastFirst = (total - visible).clamp(0, total - 1);
+    if (index >= lastFirst) {
       _controller.jumpTo(pos.maxScrollExtent);
       return;
     }
@@ -643,20 +651,30 @@ class _MessageListViewState extends State<_MessageListView> {
         // 滚动通知：切换跟随/阅读模式（见 _onScrollNotification）
         NotificationListener<ScrollNotification>(
           onNotification: _onScrollNotification,
-          child: ListView.builder(
-            controller: _controller,
-            // 常规（非反转）布局：offset 0 = 顶部（最旧），maxScrollExtent = 底部。
-            // 跟随模式下由 _BottomAnchorScrollPosition 在布局阶段同步钉底；
-            // 阅读模式下不做任何补偿（零漂移）。
-            // 右侧留出滑块的宽度（它画在列表之上、不占滚动区域）。
-            padding: const EdgeInsets.only(
-              left: 16,
-              right: 24,
-              top: 12,
-              bottom: 12,
+          // **关掉桌面自动挂上的原生 Scrollbar**（用户 2026-10-03：「滑块乱跳」）：
+          // 桌面 ScrollBehavior 会给每个竖向 Scrollable 自动包一条 Material Scrollbar
+          // （`MaterialScrollBehavior.buildScrollbar`），它的几何来自**已构建内容**的
+          // 估算范围（取回来的按真实高度、占位槽按占位高度，平均值随构建到哪而变）
+          // ⇒ 窗口化列表里必然乱跳，而且就画在自绘的 MessageScrollbar 旁边（同一条窄带里
+          // 两条拇指，一条稳一条跳）。这里只关滚动条（scrollbars: false），
+          // 物理/越界指示/拖拽设备都保留。
+          child: ScrollConfiguration(
+            behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+            child: ListView.builder(
+              controller: _controller,
+              // 常规（非反转）布局：offset 0 = 顶部（最旧），maxScrollExtent = 底部。
+              // 跟随模式下由 _BottomAnchorScrollPosition 在布局阶段同步钉底；
+              // 阅读模式下不做任何补偿（零漂移）。
+              // 右侧留出滑块的宽度（它画在列表之上、不占滚动区域）。
+              padding: const EdgeInsets.only(
+                left: 16,
+                right: 24,
+                top: 12,
+                bottom: 12,
+              ),
+              itemCount: slotCount + widget.trailingCards.length,
+              itemBuilder: _buildItem,
             ),
-            itemCount: slotCount + widget.trailingCards.length,
-            itemBuilder: _buildItem,
           ),
         ),
         // 右侧滑块：**按全局下标算几何**（用户 2026-10-04）——自带 Scrollbar 的
