@@ -15,6 +15,48 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
+## [未发布] — 自 1.0.1 起
+
+### 断言变化（新增 / 修改的 README 不变量）
+
+- **运行中的工具与 LLM 请求是"可观测 + 可显式干预"的**（新增
+  [tool/README.md](packages/tree_core/lib/src/tool/README.md) 文件表 4 行与
+  [tool_run_registry.dart](packages/tree_core/lib/src/tool/tool_run_registry.dart)）：
+  ① 所有工具调用走 `WorkspaceToolRunner` 的**同一登记入口**；
+  ② 超过阈值（默认 **300 s**，与 `terminal` 缺省软超时同值）**每次运行只 warning 一次**——
+  会话一条 `llm_hidden` + `core.log` 一行；
+  ③ 广播站点位 **`system.tool.timeout`** 报"句柄 + 已执行时间 + 命令内容"；
+  ④ `GET /api/tools/running` 只读快照 + `POST /api/tools/running/{handle}/close`；
+  ⑤ 内置工具 **`tool_runs`**（`action=list` / `action=close`，作用域 = 自己 + 直属下级，越权拒绝）；
+  ⑥ **不自动杀**：超时只 warning，关闭必须显式，且用户（右栏）/ 插件（执行站 `tool.close`）/
+  agent（`tool_runs`）**走同一个实现**；句柄不跨进程重启存活（旧句柄回"已失效"）。
+- **工具软超时与"转 hook"两端一致**（[tree_local_exec/README.md](packages/tree_local_exec/README.md)、
+  [tool/README.md](packages/tree_core/lib/src/tool/README.md)）：
+  `timeout_seconds` 在**本地与 SSH 都兑现**为软超时（到点**不杀进程**、交还句柄，
+  `0`/负值 = 永不软超时）；`terminal` 到点**先返回工具结果（批收尾）+ 会话继续**，
+  命令结束经回调唤醒注入；SSH 侧为第三形态 `RunningSshExec`（不杀不重跑、结束补写输出与退出码、
+  链路失活如实失败）。
+- **工具结果"永远拿不到"时在把关处自动修复**（[agent/README.md](packages/tree_core/lib/src/agent/README.md)、
+  [tool_result_repair.dart](packages/tree_core/lib/src/agent/tool_result_repair.dart)）：
+  引擎组装工具批时发现结果永远拿不到的卡 ⇒ 写回一段**如实**的失败信息（幂等、不新增消息、
+  **不编造**退出码/输出/耗时）；未接线时退回老占位 `(该工具调用未完成，没有结果)`。
+- **批一定会收敛，但"不切开批"与"工具执行完前不接受新消息"两条语义保留**（
+  [llm/README.md](packages/tree_core/lib/src/llm/README.md)）：工具 `await` 期间按间隔**对账**——
+  存储里若已有这次调用（`callId` 命中）的**真实结果**就采用它让批收尾（**绝不注入合成结果**）；
+  没有就**继续等显式取消**。"沉默/等待/关闭/对账"全部落 `core.log`（引擎侧生命周期留痕）。
+- **运行中的 LLM 请求也可观测、可关闭**（[tool/README.md](packages/tree_core/lib/src/tool/README.md)
+  `llm_request_guard.dart`）：**连续零事件**达到阈值才登记（正常长生成不进表、不 warning）；
+  被显式关闭 ⇒ 这一跳以**取消**收尾并掐掉底层订阅（HTTP/SSH 连接释放、插件收到取消通知）——
+  插件挂住 / socket 挂住这条**无界**路径因此可关（此前它零日志、且"停止键"管不着）。
+- **`message` 的附件支持跨机投递**（[team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 15 重写、
+  [files/README.md](packages/tree_core/lib/src/files/README.md) 不变量 9 补充）：
+  local↔local（本机 `File.copy`）、local↔SSH、SSH↔SSH（含跨主机，**经本机中转**）四种组合都支持；
+  判据是**有效 SSH 接线**（`teamSshConfigFor`），不是 `agent.sshConfig`；单文件 ≤32 MB；
+  越界路径拒绝、部分失败如实回 `files_failed`；local↔local 的行为与文案逐字不变。
+- **插话只打断目标那一轮**（[agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量）：
+  给主 agent 发消息**不再连带取消**它名下的临时员工（它们继续跑、完成报告照旧注入）；
+  终止在途临时员工只有两条**显式**路径（用户 `stop` / 在它的视角里按停止）。
+
 ## [1.0.1] — 2026-10-03
 
 ### 断言变化（新增 / 修改的 README 不变量）

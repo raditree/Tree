@@ -111,7 +111,16 @@ void main() {
         const CoreMessageRef(role: 'agent', content: '思考', kind: 'thinking'),
         const CoreMessageRef(role: 'agent', content: '答一句'),
       ], logs: logs);
-      expect(logs, isEmpty);
+      // 口径是"**不告警**"，不是"一行日志都没有"：C′（2026-10-03）起会话还会记两条
+      // **生命周期**日志（`请求已发出…` / `首个事件…`，见 `LlmSession._watchRequest` 一带），
+      // 它们与"缺思考正文"无关。上一个用例（缺正文 ⇒ 含"空串"的告警）才是告警口径。
+      expect(
+        logs
+            .where((String l) => l.contains('空串') || l.contains('告警'))
+            .toList(),
+        isEmpty,
+        reason: '正常收尾形态不该有 reasoning 相关告警（生命周期日志不算告警）',
+      );
     });
   });
 
