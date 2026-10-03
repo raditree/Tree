@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:tree/ui/models/message.dart';
+import 'package:tree/ui/models/subagent_roster.dart';
 import 'package:tree/ui/services/subagent_transcript.dart';
 
 /// 临时员工的**过程分栏**（用户 2026-10-04：subagent 的输出不能跟主 agent 混杂；
@@ -28,6 +29,89 @@ void main() {
       );
 
   setUp(SubagentTranscript.instance.clear);
+
+  group(
+    '落盘名册层（用户 2026-10-03：进入临时成员的入口不许随消息窗口抖动）',
+    () {
+      SubagentRosterEntry entry(
+        String id, {
+        String name = '',
+        String parentId = '',
+        int level = 1,
+      }) => SubagentRosterEntry(
+        id: id,
+        name: name,
+        parentId: parentId,
+        level: level,
+      );
+
+      test('名册里的入口在过程消息被淘汰后仍在，且排在消息流观察到的前面', () {
+        // 消息流里只观察到 sub_1（sub_2 的过程已经被窗口淘汰掉了）
+        SubagentTranscript.instance.sync(<ChatMessage>[
+          msg('s1', subagentId: 'sub_1', subagentName: '甲', level: 1),
+        ]);
+        expect(SubagentTranscript.instance.ids, <String>['sub_1']);
+        SubagentTranscript.instance.setRoster(<SubagentRosterEntry>[
+          entry('sub_1', name: '甲'),
+          entry('sub_2', name: '乙', parentId: 'sub_1', level: 2),
+        ]);
+        expect(
+          SubagentTranscript.instance.ids,
+          <String>['sub_1', 'sub_2'],
+          reason: '名册是权威来源：它的过程消息被淘汰了，入口也不能消失',
+        );
+        expect(SubagentTranscript.instance.of('sub_2'), isEmpty);
+      });
+
+      test('名字 / 谁召来的：名册优先（消息还没加载时也要对）', () {
+        SubagentTranscript.instance.setRoster(<SubagentRosterEntry>[
+          entry('sub_1', name: '甲'),
+          entry('sub_2', name: '乙', parentId: 'sub_1', level: 2),
+        ]);
+        expect(SubagentTranscript.instance.nameOf('sub_1'), '甲');
+        expect(
+          SubagentTranscript.instance.callerNameOf(
+            'sub_2',
+            ownerAgentId: 'agt_1',
+            ownerName: '队长',
+          ),
+          '甲',
+          reason: '上级临时员工的名字来自名册，不依赖它的过程消息',
+        );
+        expect(
+          SubagentTranscript.instance.callerNameOf(
+            'sub_1',
+            ownerAgentId: 'agt_1',
+            ownerName: '队长',
+          ),
+          '队长',
+        );
+      });
+
+      test('换会话 / 切 agent：名册层与消息层一起清（不跨会话保留）', () {
+        SubagentTranscript.instance.setRoster(<SubagentRosterEntry>[
+          entry('sub_1', name: '甲'),
+        ]);
+        SubagentTranscript.instance.sync(<ChatMessage>[
+          msg('s1', subagentId: 'sub_1', subagentName: '甲', level: 1),
+        ]);
+        SubagentTranscript.instance.clear();
+        expect(SubagentTranscript.instance.ids, isEmpty);
+        expect(SubagentTranscript.instance.of('sub_1'), isEmpty);
+        expect(SubagentTranscript.instance.nameOf('sub_1'), isEmpty);
+      });
+
+      test('setRoster 幂等：重复喂同一份名册，顺序不变', () {
+        final List<SubagentRosterEntry> roster = <SubagentRosterEntry>[
+          entry('sub_1', name: '甲'),
+          entry('sub_2', name: '乙'),
+        ];
+        SubagentTranscript.instance.setRoster(roster);
+        SubagentTranscript.instance.setRoster(roster);
+        expect(SubagentTranscript.instance.ids, <String>['sub_1', 'sub_2']);
+      });
+    },
+  );
 
   test('主消息流只留主 agent 自己的消息（临时员工的不进流）', () {
     final List<ChatMessage> all = <ChatMessage>[

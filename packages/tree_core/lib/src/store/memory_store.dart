@@ -333,6 +333,31 @@ class MemoryStore implements TreeStore {
   }
 
   @override
+  bool repairToolResult(
+    String agentId,
+    String sessionId,
+    String toolCallId, {
+    required String toolResult,
+    required String toolResultForModel,
+  }) {
+    final List<CoreMessage>? list = _messages[_messagesKey(agentId, sessionId)];
+    if (list == null) return false;
+    final int index = list.indexWhere(
+      (CoreMessage m) => m.isTool && m.toolCallId == toolCallId,
+    );
+    if (index < 0) return false;
+    final CoreMessage existing = list[index];
+    // 幂等：已经有结果就不再改（自动修复每次组装请求都会问一次）
+    if (existing.toolResult.trim().isNotEmpty) return false;
+    list[index] = CoreMessage.fromJson(<String, dynamic>{
+      ...existing.toJson(),
+      'tool_result': toolResult,
+      'tool_result_for_model': toolResultForModel,
+    });
+    return true;
+  }
+
+  @override
   int clearMessages(String agentId, {String? sessionId}) {
     if (sessionId == null || sessionId.isEmpty || sessionId == 'all') {
       int deleted = 0;

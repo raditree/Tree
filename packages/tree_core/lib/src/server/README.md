@@ -52,10 +52,19 @@
     单页上限 **2000** 条（防一次手滑拼出巨型 JSON）；`before` / `at` 找不到游标时**退回末尾一段**，
     **绝不静默返回整份**（"最坏情况传几 MB" 与"悄悄多传"都是要避免的）。
 
+15. **临时员工名册接口：只读、按会话**（[core_server.dart](core_server.dart) 的 `_agentSubagents`，
+    [test/subagents_api_test.dart](../../../test/subagents_api_test.dart) 强制）：
+    `GET /api/agents/{agentId}/subagents?session_id=`（缺省会话同邻居口径）回 `{agent_id, session_id,
+    total, subagents:[{id, name, owner_agent_id, session_id, parent_id, level, scope, run_count,
+    created_at, updated_at}]}`——数据源就是那份落盘名册（`TreeStore.subagents` ⇒ `subagents.json`），
+    **不含** `agent` 运行配置快照。**跨会话不保留**照旧：只回该 `(agentId, sessionId)`，删会话即随之消失，
+    不新增任何跨会话存储；agent 不存在 ⇒ 404 + 可读原因。
+
 ## 测试
 
 ```bash
 cd packages/tree_core
 dart test test/server_test.dart test/ws_send_liveness_test.dart test/plugin_hot_apply_test.dart \
+          test/subagents_api_test.dart \
           test/compact_api_test.dart test/agents_config_api_test.dart test/agent_delete_api_test.dart
 ```

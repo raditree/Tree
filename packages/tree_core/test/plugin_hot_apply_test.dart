@@ -283,8 +283,8 @@ void main() {
     );
     expect(
       bus.snapshot()['stations'],
-      hasLength(17),
-      reason: '收集站全局唯一：换团队不产生新站；快照恒为 16 个内置点位 + 收集站',
+      hasLength(18),
+      reason: '收集站全局唯一：换团队不产生新站；快照恒为 17 个内置点位 + 收集站',
     );
   });
 

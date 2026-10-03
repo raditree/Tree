@@ -34,6 +34,70 @@ void runStoreContract(String label, TreeStore Function() create) {
       kind: kind,
     );
 
+    test('repairToolResult：把"结果拿不到"的工具卡写回失败信息（幂等、不新增消息）', () {
+      final CoreAgent agent = store.createAgent(name: 'a');
+      const String session = TreeStore.defaultSessionId;
+      store.appendMessage(
+        CoreMessage(
+          id: 'tool_1',
+          agentId: agent.id,
+          sessionId: session,
+          role: 'agent',
+          content: '',
+          timestamp: 10,
+          kind: 'tool',
+          toolName: 'grep',
+          toolCallId: 'call_1',
+          toolArguments: <String, dynamic>{'pattern': 'x'},
+        ),
+      );
+      final int before = store.sessionMessages(agent.id, session).length;
+      expect(
+        store.repairToolResult(
+          agent.id,
+          session,
+          'call_1',
+          toolResult: '【自动修复】结果没被收集',
+          toolResultForModel: '【自动修复】结果没被收集',
+        ),
+        isTrue,
+      );
+      final CoreMessage card = store.sessionMessages(agent.id, session).last;
+      expect(card.toolResult, contains('自动修复'));
+      expect(card.toolResultForModel, contains('自动修复'));
+      expect(
+        store.sessionMessages(agent.id, session).length,
+        before,
+        reason: '修复写回**同一张**卡，不许新增消息（tool_call_id 不能重复）',
+      );
+      // 幂等：已经有结果就不再改（引擎每次组装请求都会问一次）
+      expect(
+        store.repairToolResult(
+          agent.id,
+          session,
+          'call_1',
+          toolResult: 'again',
+          toolResultForModel: 'again',
+        ),
+        isFalse,
+      );
+      expect(
+        store.sessionMessages(agent.id, session).last.toolResult,
+        isNot('again'),
+      );
+      // 找不到这张卡 / 别的会话：如实回 false，不假装修过
+      expect(
+        store.repairToolResult(
+          agent.id,
+          session,
+          'call_missing',
+          toolResult: 'x',
+          toolResultForModel: 'x',
+        ),
+        isFalse,
+      );
+    });
+
     test('createAgent：可取回、自动带兜底默认会话、name 为空有兜底', () {
       final CoreAgent agent = store.createAgent(name: '', modelId: 'm1');
       expect(agent.id, isNotEmpty);

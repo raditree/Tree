@@ -6,6 +6,8 @@ import 'package:http/http.dart' as http;
 import 'package:tree_protocol/tree_protocol.dart';
 
 import '../ui/models/agent.dart';
+import '../ui/models/tool_run.dart';
+import '../ui/models/subagent_roster.dart';
 import '../ui/models/file_content.dart';
 import '../ui/models/file_listing.dart';
 import '../ui/models/file_node.dart';
@@ -1193,6 +1195,75 @@ class ApiService {
     } catch (e) {
       throw Exception('核心进程不可达，请重启应用');
     }
+  }
+
+  // ==================== 正在执行的工具接口（右栏「正在执行的 tool」）========
+
+  /// 取**运行中工具登记表**的只读快照：正在执行的工具（含已卡住的）。
+  ///
+  /// 调用 `GET /api/tools/running`（路径取协议常量 [ApiPaths.toolsRunning]），返回
+  /// `{runs: [{handle, agent_id, session_id, tool, command_preview, started_at,
+  /// elapsed_ms, over_threshold}]}`（形状见计划 `20261003-running-tools` §4 步骤 4，
+  /// 右栏「正在执行的 tool」面板据此渲染）。
+  ///
+  /// 网络异常 / 核心给非 200 时抛出**中文可读**异常（面板原样显示给用户，不静默）。
+  static Future<List<ToolRun>> getRunningTools() async {
+    final Map<String, dynamic> data = await _getJson(ApiPaths.toolsRunning);
+    final List<dynamic> runs = data['runs'] as List<dynamic>? ?? <dynamic>[];
+    return <ToolRun>[
+      for (final dynamic item in runs)
+        if (item is Map) ToolRun.fromJson(item.cast<String, dynamic>()),
+    ];
+  }
+
+  /// 关闭一个正在执行的工具（右栏每行的「关闭」按钮）。
+  ///
+  /// **与执行站命令 `tool.close`（args `{handle}`）同一个实现**（计划 §10 D5 冻结）：
+  /// 核心把这条 REST 与站命令接在同一个 `ToolRunRegistry.close` 上
+  /// （`core_server.dart` 的 `_closeRunningTool` / `_toolCloseCommand`），所以"用户点
+  /// 按钮"与"插件调站命令"效果完全一致——先尽力终止进程树（本地 `taskkill /T`、
+  /// 远端杀该会话的进程组），再把这次运行从登记表移除、让在途工具调用收敛。
+  /// 句柄失效（核心重启过 / 这次运行已结束）⇒ **404 + 可读原因**（fail-closed），
+  /// 这里原样抛出交给面板显示，不静默、不假装成功。
+  ///
+  /// 调用 `POST /api/tools/running/{handle}/close`（协议常量
+  /// [ApiPaths.toolsRunningClose]；**无请求体**，handle 在路径里，与核心路由同一口径），
+  /// 返回 `{closed, tool, elapsed_ms, note}`。
+  static Future<Map<String, dynamic>> closeToolRun(String handle) async {
+    final String path = ApiPaths.toolsRunningClose.replaceFirst(
+      '{handle}',
+      Uri.encodeComponent(handle.trim()),
+    );
+    return _postJson(path);
+  }
+
+  /// 取某会话的**临时员工名册**（**落盘那份**，只读）。
+  ///
+  /// 调用 `GET /api/agents/{agentId}/subagents?session_id=`（协议常量
+  /// [ApiPaths.agentSubagents]），返回 `{agent_id, session_id, total, subagents:[…]}`。
+  ///
+  /// 这是中栏"进入某个临时员工"入口的**权威来源**（用户 2026-10-03）：它来自落盘名册，
+  /// 不随消息窗口的加载 / 淘汰抖动。**跨会话不保留**——名册是会话级的，别把它缓存到
+  /// 跨会话的地方。
+  static Future<List<SubagentRosterEntry>> getSubagents(
+    String agentId, {
+    String? sessionId,
+  }) async {
+    final String path = ApiPaths.agentSubagents.replaceFirst(
+      '{agentId}',
+      Uri.encodeComponent(agentId),
+    );
+    final String sid = (sessionId ?? '').trim();
+    final Map<String, dynamic> data = await _getJson(
+      sid.isEmpty ? path : '$path?session_id=${Uri.encodeComponent(sid)}',
+    );
+    final List<dynamic> list =
+        data['subagents'] as List<dynamic>? ?? <dynamic>[];
+    return <SubagentRosterEntry>[
+      for (final dynamic item in list)
+        if (item is Map)
+          SubagentRosterEntry.fromJson(item.cast<String, dynamic>()),
+    ];
   }
 
   // ==================== 多会话管理接口（P2） ====================

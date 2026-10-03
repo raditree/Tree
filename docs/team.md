@@ -82,6 +82,17 @@
   `scp` / `rsync` 之类，或按约定放共享位置）。**附件（`files`）只在本机工作空间之间可用**：
   任一侧是 SSH 会明确回"未投递"（见 §8）。
 
+### 6.1 运行态与停止的作用域（用户 2026-10-03）
+
+- `agent_status` 的 `data` 里：**主 agent 自己**的帧带 `own_running`（working ⇒ true / idle ⇒ false），
+  子级帧带 `subagent_id` 等标记、不带 `own_running`；「自己收尾、名下还有临时员工在跑」时照样发一条
+  `own_running: false` + `subagent_running: true`（聚合口径靠它，主视角据此换回发送键）。
+- `stop` 传 `sub_…` ⇒ **只停它自己**（`cascade: false`）：父、兄弟、其他成员、团队都不受影响；
+  主 agent 的 `stop` 语义一个字没改（仍级联它的团队子树 + 名下临时员工）。
+- 入口列表（中栏右下那个切换器）取自**落盘名册**（`GET /api/agents/{agentId}/subagents`，
+  即 `data/<agentId>/<sessionId>/subagents.json`）⇒ 不随中栏消息窗口的加载 / 淘汰抖动；
+  名册仍然**不跨会话保留**（切 agent / 换会话一并清）。
+
 ## 7. 界面入口
 
 - **左栏 agent 列表列出全部 agent（含成员）**：`team_id` 指向 TOP 的成员紧跟它的 TOP 之后

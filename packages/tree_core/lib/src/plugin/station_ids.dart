@@ -32,6 +32,12 @@ abstract final class StationHubIds {
   /// 广播站·工具调用后（单向通知，无回填）。
   static const String broadcastToolPost = 'system.broadcast.tool.post';
 
+  /// 广播站·工具运行超时（单向通知，无回填）：一次运行**跨过阈值时广播一次**。
+  ///
+  /// 点位名由 plan §10 D4 冻结（**不带** `system.broadcast.` 前缀）；订阅同既有
+  /// `system.*` 点位：`{station: 'broadcast', point: 'tool.timeout'}`。
+  static const String broadcastToolTimeout = 'system.tool.timeout';
+
   // ── 执行站（插件主动下命令；按命令族拆点位） ────────────────────────────
 
   /// 执行站·文件操作族：`fs.read` / `fs.write` / `fs.list` / `fs.grep`。
@@ -99,6 +105,7 @@ abstract final class StationHubIds {
     broadcast,
     broadcastToolPre,
     broadcastToolPost,
+    broadcastToolTimeout,
     executeFs,
     executeTerminal,
     executeAgent,

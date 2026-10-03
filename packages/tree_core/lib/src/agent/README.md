@@ -17,6 +17,7 @@
 | [question_store.dart](question_store.dart) | 提问状态与答案的独立原子快照（跨会话列出、状态可改） |
 | [attachment_prompt.dart](attachment_prompt.dart) | 附件路径提示词片段（纯函数，生成与压缩估算共用） |
 | [scripted_agent.dart](scripted_agent.dart) | 占位引擎（测试替身；生产路径是 `LlmAgentEngine`） |
+| [tool_result_repair.dart](tool_result_repair.dart) | **自动修复**：`ToolResultRepair` 签名 + "结果永远拿不到"的失败文案（纯函数）；引擎在把关处调用，核心接到 `ConversationService.repairToolResult` |
 | [subagent_service.dart](subagent_service.dart) | **临时员工**：校验（模型 / 工作空间 / 层级）→ 名册（复用或新建）→ 阻塞或后台运行 → 记账；`SubagentTurnRunner` 由 CLI 后置绑定到 `ConversationService.runSubagent` |
 
 ## 不变量（assertions）
@@ -53,6 +54,26 @@
 
 `agent` → `llm` / `tool` / `store` / `plugin`（事件发布）。
 `tool` **不**反向依赖 `agent`：提问用具名契约隔开（见 [../tool/question_channel.dart](../tool/question_channel.dart)）。
+
+15. **结果永远拿不到的工具卡：引擎在把关处自动修复**（用户 2026-10-03 口径：「在引擎的把关处，失败时自动修复」；
+    [test/llm_agent_engine_test.dart](../../../test/llm_agent_engine_test.dart) 与 [test/store_contract.dart](../../../test/store_contract.dart) 强制）：
+    历史里 `kind=tool` 且 `tool_result` 为空的卡 = 那次调用被**停止 / 异常 / 核心重启**收尾，结果**永远拿不到**
+    （正在跑的调用根本不在历史里，不会误伤）⇒ 引擎组装工具批时把失败信息**写回同一张卡**（幂等、不新增消息：
+    `tool_call_id` 不能重复），本次请求也用它。写回走注入的 [ToolResultRepair](tool_result_repair.dart)
+    （引擎仍然不认识存储层，与 `toolTurnCompactor` 同范式），核心接到 `ConversationService.repairToolResult`：
+    存储层写回 + 补一条 `tool_end` 帧（界面把那张一直"运行中"的卡填成失败）。
+    **未接线 = 老行为**（只在送模型那份补一句占位，落库那份不动）、写回失败也不打断请求。
+
+16. **运行态帧分「它自己」与「它名下的临时员工」；`stop` 传 `sub_…` 只停它自己**
+    （用户 2026-10-03：「临时成员的运行情况不应影响主 agent 运行情况」+「仅停止对应临时成员，
+    保证对其他成员无影响」；[test/subagent_tool_test.dart](../../../test/subagent_tool_test.dart) 强制）：
+    `agent_status.data` 里，**主 agent 自己**的帧带 `own_running`（working ⇒ `true`，idle ⇒ `false`），
+    并且「它自己收尾了、但名下还有临时员工在跑」时**照样发一条** `own_running: false, subagent_running: true`
+    ——以前这种时刻什么都不发，主视角的停止键就一直亮着；**子级帧**照旧带 `subagent_id` 等标记、
+    **不带** `own_running`（不许冒充主 agent）。`isRunning(agentId)` 的**聚合**口径一个字没改
+    （含它名下的临时员工，团队名单据此显示 working）。`stop` 传 `sub_…` ⇒ `_stopAgentTree(cascade: false)`：
+    只取消它自己的在途轮次与排队，父 / 兄弟 / 其他成员 / 团队都不受影响（停止回执与补推的 `idle`
+    都带它自己的帧标记，前端只收它那一份「工作中」）。
 
 ## 测试
 

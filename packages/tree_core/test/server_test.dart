@@ -236,6 +236,28 @@ void main() {
     });
   });
 
+  group('运行中工具（GET /api/tools/running + 显式关闭）', () {
+    test('只读快照：空表也回冻结形状 {runs: []}', () async {
+      final _Res res = await client.send('GET', ApiPaths.toolsRunning);
+      expect(res.status, 200, reason: '$res');
+      expect(res.json.keys, <String>{'runs'});
+      expect(res.json['runs'], isEmpty);
+    });
+
+    test('显式关闭：句柄失效 ⇒ 404 + 可读原因（fail-closed，不假装成功）', () async {
+      final _Res missing = await client.send(
+        'POST',
+        ApiPaths.toolsRunningClose.replaceFirst('{handle}', 'toolrun_1_abcd_1'),
+      );
+      expect(missing.status, 404, reason: '$missing');
+      expect(
+        missing.json.toString(),
+        contains('已失效'),
+        reason: '登记表是纯内存的：旧句柄必须回"该句柄已失效"',
+      );
+    });
+  });
+
   group('路由覆盖度不变量', () {
     test('保留路径 = 已实现 ∪ 显式 501 桩，且两组不相交', () {
       final Set<String> implemented = server.router.patterns;

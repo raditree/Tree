@@ -42,7 +42,7 @@ class SubagentViewSwitcher extends StatelessWidget {
         }
         final bool inSubagent = currentSubagentId.isNotEmpty;
         final String label = inSubagent
-            ? '临时员工「${subagentName(SubagentTranscript.instance.of(currentSubagentId), fallback: '…')}」'
+            ? '临时员工「${_nameOf(currentSubagentId)}」'
             : '主会话';
         return PopupMenuButton<String>(
           tooltip: inSubagent
@@ -154,6 +154,12 @@ class SubagentViewSwitcher extends StatelessWidget {
   }
 
   /// 一行：名字 + **谁召来的** + 层数 + 已有多少条过程（措辞与 teammates 分开）。
+  /// 显示名：**名册优先**（消息还没加载 / 已被淘汰也有正确名字），退回到「…」。
+  String _nameOf(String id) {
+    final String name = SubagentTranscript.instance.nameOf(id);
+    return name.isEmpty ? '…' : name;
+  }
+
   String _labelOf(String id) {
     final List<ChatMessage> transcript = SubagentTranscript.instance.of(id);
     final String caller = SubagentTranscript.instance.callerNameOf(
@@ -161,7 +167,7 @@ class SubagentViewSwitcher extends StatelessWidget {
       ownerAgentId: ownerAgentId,
       ownerName: ownerName,
     );
-    return '临时员工「${subagentName(transcript)}」 · '
+    return '临时员工「${_nameOf(id)}」 · '
         '${viewSubtitle(callerName: caller, transcript: transcript)} · '
         '${transcript.length} 条过程';
   }

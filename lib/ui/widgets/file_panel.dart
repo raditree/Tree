@@ -26,17 +26,21 @@ import 'plugin_ui_slots.dart';
 import 'question_panel.dart';
 import 'split_panes.dart';
 import 'todo_panel.dart';
+import 'tool_runs_panel.dart';
 
 /// 同文件双开时的窗格提示：两侧**共享同一份缓冲**，不是两份各写各的。
 const String _sharedBufferNotice = '同一文件已在另一窗格打开：两侧共享同一份缓冲，就地编辑即同步';
 
 /// 文件管理面板（右栏）
 ///
-/// 作为右栏的主容器，以 Tab 组织四个分区：
+/// 作为右栏的主容器，以 Tab 组织六个内置分区：
 /// - 「文件」：文件浏览（[FileTree]）/ Git 历史（[GitHistory]）/ Todo（[TodoPanel]）
 /// - 「MCP 配置」：MCP 服务列表与注册（[McpConfigPanel]）
 /// - 「模型信息」：模型下拉、系统提示词与模型参数覆盖（[ModelInfoPanel]）
 /// - 「问题回复」：统一汇总并答复所有提问（[QuestionPanel]）
+/// - 「正在执行的 tool」：核心内存登记表里正在跑的工具，超阈值高亮 + 每行显式关闭
+///   （[ToolRunsPanel]；关闭与执行站 `tool.close` 同实现）
+/// - 「详情」：中栏点中的工具 / 思考行完整摊开（[DetailPanel]）
 ///
 /// 「插件」原本是这里的第 5 个页签，已迁到**左侧活动栏**（见
 /// main_page.dart 的 _buildActivityBar），与 Agent 列表并列。
@@ -111,15 +115,15 @@ class FilePanel extends StatefulWidget {
 }
 
 class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
-  /// 内置顶层 Tab 数量（文件 / MCP 配置 / 模型信息 / 问题回复 / 详情）
-  static const int _builtinTabCount = 5;
+  /// 内置顶层 Tab 数量（文件 / MCP 配置 / 模型信息 / 问题回复 / 正在执行的 tool / 详情）
+  static const int _builtinTabCount = 6;
 
 
   /// 「详情」页的固定索引（中栏点了工具行 / 思考行就切到它）
   static const int _detailTabIndex = _builtinTabCount - 1;
 
-  /// 顶层 Tab 控制器（0=文件，1=MCP 配置，2=模型信息，3=问题回复，4=详情，
-  /// 之后是插件 panel 槽位；插件槽位集合变化时重建）
+  /// 顶层 Tab 控制器（0=文件，1=MCP 配置，2=模型信息，3=问题回复，4=正在执行的 tool，
+  /// 5=详情，之后是插件 panel 槽位；插件槽位集合变化时重建）
   late TabController _tabController;
 
   /// 顶层 Tab 当前选中索引（重建控制器时保持选中页）
@@ -203,6 +207,9 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
 
   /// Todo 列表刷新触发器
   int _todoRefreshTrigger = 0;
+
+  /// 「正在执行的 tool」页刷新触发器（工具开始 / 结束时登记表变了）
+  int _toolRunsRefreshTrigger = 0;
 
   /// 刷新文件树（兼容旧调用：视为文件区域）
   void _refreshFileTree() {
@@ -348,7 +355,7 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
     _topTabIndex = index;
   }
 
-  /// 工作空间数据变更（工具写文件 / git 提交 / 更新 todo）时增量刷新右栏。
+  /// 工作空间数据变更（工具写文件 / git 提交 / 更新 todo / 工具开始结束）时增量刷新右栏。
   ///
   /// 依据变更影响的区域，只递增对应 tab 的触发器；只读工具不触发，
   /// 不再"切 Tab 再切回"也无需整表重拉。
@@ -366,6 +373,9 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
       }
       if (areas.contains(WorkspaceArea.todo)) {
         _todoRefreshTrigger++;
+      }
+      if (areas.contains(WorkspaceArea.toolRuns)) {
+        _toolRunsRefreshTrigger++;
       }
     });
   }
@@ -661,6 +671,9 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
                     sessionId: widget.sessionId,
                     onNavigateToQuestion: widget.onNavigateToQuestion,
                   ),
+                  // 正在执行的 tool：核心内存登记表的快照 + 每行一个显式「关闭」
+                  // （与执行站 tool.close 同实现）。见 ToolRunsPanel。
+                  ToolRunsPanel(refreshTrigger: _toolRunsRefreshTrigger),
                   // 详情页：中栏点中的工具调用 / 思考完整摊开（见 DetailPanel）
                   // 带上工作空间：edit 的「变更」要读一次当前文件才有上下文
                   DetailPanel(
@@ -710,8 +723,9 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
                 const Tab(text: 'MCP 配置'),
                 const Tab(text: '模型信息'),
                 const Tab(text: '问题回复'),
+                const Tab(text: '正在执行的 tool'),
                 const Tab(text: '详情'),
-                // Q12 插件 Tab：追加在既有五个 Tab 之后，文案用槽位 title
+                // Q12 插件 Tab：追加在既有六个 Tab 之后，文案用槽位 title
                 for (final PluginUiSlot slot in _pluginPanels)
                   Tab(text: pluginSlotLabel(slot)),
               ],

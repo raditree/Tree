@@ -84,6 +84,13 @@ class MessageList extends StatelessWidget {
   /// 消息流末尾追加的**插件内联卡片**（Q12）：按到达顺序排在最后一条消息之后。
   final List<Widget> trailingCards;
 
+  /// 这一份会话的历史**正在路上**（切 agent / 首载 / 切会话）。
+  ///
+  /// 期间槽位表必然还是空的，但**不许**把它当成"真的没有消息"——空态（欢迎页）只在
+  /// "确实加载完且真的没有消息"时出现（用户 2026-10-03 症状 1：切 agent 先闪一下
+  /// 空窗口再载入历史）。加载中改渲染静态骨架（见 [_MessageListViewState.build]）。
+  final bool loading;
+
   const MessageList({
     super.key,
     required this.slots,
@@ -98,6 +105,7 @@ class MessageList extends StatelessWidget {
     this.onWindowChanged,
     this.onReloadTail,
     this.trailingCards = const <Widget>[],
+    this.loading = false,
   });
 
   @override
@@ -115,6 +123,7 @@ class MessageList extends StatelessWidget {
       onWindowChanged: onWindowChanged,
       onReloadTail: onReloadTail,
       trailingCards: trailingCards,
+      loading: loading,
     );
   }
 }
@@ -133,6 +142,7 @@ class _MessageListView extends StatefulWidget {
   final void Function(int first, int last)? onWindowChanged;
   final VoidCallback? onReloadTail;
   final List<Widget> trailingCards;
+  final bool loading;
 
   const _MessageListView({
     required this.slots,
@@ -147,6 +157,7 @@ class _MessageListView extends StatefulWidget {
     this.onWindowChanged,
     this.onReloadTail,
     this.trailingCards = const <Widget>[],
+    this.loading = false,
   });
 
   @override
@@ -188,6 +199,19 @@ class _BottomAnchorScrollController extends ScrollController {
 
   /// 是否需要把 offset 钉到底部：内容变化/首帧时由 State 置位，布局时消费。
   bool pinToBottom = false;
+
+  /// **首帧即底部**（切 agent / 切会话 / 历史重载 / 回到底部 / 首次进入）。
+  ///
+  /// 与 [pinToBottom] 的分工：那个是"跟随模式"下每次内容变化都粘底的**持续**请求
+  /// （消费一次之后靠"本来就贴底"继续跟）；这个是"新一份窗口内容落地"的**一次性**
+  /// 要求，而且必须在这**同一次布局**里校到收敛——[applyContentDimensions] 返回
+  /// false 会让 RenderViewport 在同帧内重跑布局，**绘制发生在收敛之后**，于是不会
+  /// 出现"先按顶部渲染一帧、下一帧再跳到底"（用户 2026-10-03 症状 2）。
+  bool firstFrameBottom = false;
+
+  /// [firstFrameBottom] 上一轮校到的"底"（-1 = 这一轮还没校过）。
+  /// 相邻两轮目标一致 ⇒ 已经收敛，收工（避免和 RenderViewport 的布局循环打架）。
+  double firstFrameBottomTarget = -1;
 
   /// 视口**上方/视口里**刚补了页：布局阶段按**实测**高度差把 offset 挪同样多。
   bool shiftAbove = false;
@@ -241,6 +265,32 @@ class _BottomAnchorScrollPosition extends ScrollPositionWithSingleContext {
         super.applyContentDimensions(minScrollExtent, maxScrollExtent);
     final bool following = controller.shouldFollow();
     final bool requested = controller.pinToBottom;
+    // ① **首帧即底部**：新一份窗口内容落地的那一帧就落在底部（静默校正，走同一套
+    //    `correctPixels` 通路；**不**动下面那套"实测锚点补偿"的口径）。
+    //    只认跟随模式：用户在读历史时不抢他的位置。
+    if (controller.firstFrameBottom) {
+      if (!following) {
+        controller.firstFrameBottom = false;
+        controller.firstFrameBottomTarget = -1;
+      } else {
+        final double target =
+            maxScrollExtent.clamp(minScrollExtent, maxScrollExtent);
+        final bool settled = controller.firstFrameBottomTarget >= 0 &&
+            (target - controller.firstFrameBottomTarget).abs() <= 0.5;
+        if (settled) {
+          // 连着两轮的"底"一样：估算已经稳定（懒构建把真实高度补完了）⇒ 收工
+          controller.firstFrameBottom = false;
+          controller.firstFrameBottomTarget = -1;
+        } else {
+          controller.firstFrameBottomTarget = target;
+          if ((pixels - target).abs() > 0.01) {
+            correctPixels(target);
+            // 同帧重跑布局（绘制在收敛之后 ⇒ 没有"先在顶部再跳"的中间帧）
+            return false;
+          }
+        }
+      }
+    }
     // **粘底**：请求贴底（首帧 / 历史重载 / 追加），或者上一帧我们本来就贴着底。
     //
     // 为什么"本来就贴着底"也算一次：列表的滚动范围是**估算**的，随着视口周围
@@ -382,6 +432,10 @@ class _MessageListViewState extends State<_MessageListView> {
       if (mounted) _jumpToBottomSettling();
     });
     _controller.pinToBottom = true;
+    // 首帧即底部：首屏（挂载时就带着槽位表）也走同一条"同帧校到收敛"的路，
+    // 于是第一个被绘制的帧就已经在底部。
+    _controller.firstFrameBottom = true;
+    _controller.firstFrameBottomTarget = -1;
   }
 
   @override
@@ -439,6 +493,10 @@ class _MessageListViewState extends State<_MessageListView> {
     _userDetached = false;
     // **这一跳是程序发起的**：期间不管收到什么滚动通知都不许把它判成"用户上滚"。
     _jumpingToBottom = true;
+    // 首帧即底部：这一次内容落地就在**首帧**（同帧内校到收敛）落到真底部，
+    // 而不是"先渲染一帧再在下一帧跳过去"。
+    _controller.firstFrameBottom = true;
+    _controller.firstFrameBottomTarget = -1;
     _schedulePin();
     _lastMaxExtent = -1;
     _pinSettleFrames = _pinSettleLimit;
@@ -995,6 +1053,10 @@ class _MessageListViewState extends State<_MessageListView> {
   Widget build(BuildContext context) {
     final int slotCount = widget.slots.length;
     if (slotCount == 0 && widget.trailingCards.isEmpty) {
+      // **加载中**（切 agent / 首载 / 切会话）：窗口本来就是空的，但这不是"没有消息"
+      // ——渲染静态骨架，别闪空态（用户 2026-10-03 症状 1）。面板在历史真正落地
+      // （或明确失败）之后才把 [MessageList.loading] 摘掉，那时才会走到下面的欢迎页。
+      if (widget.loading) return _buildLoadingSkeleton(context);
       // 空态：居中排版，emoji 与文字分行（有插件卡片时不显示欢迎页）
       return Center(
         child: Column(
@@ -1076,6 +1138,41 @@ class _MessageListViewState extends State<_MessageListView> {
           ),
         ),
       ],
+    );
+  }
+
+  /// 加载中骨架：几条静态灰条（**不带任何动画**——加载指示器的循环动画会让
+  /// `pumpAndSettle` 永不收敛，而"闪一下"本来就是这次要修的症状）。
+  ///
+  /// 用 [SingleChildScrollView] + 不可滚动物理包一层：窗口再矮也不会溢出
+  /// （溢会在 widget 测试里直接抛错），同时不产生第二个可滚动位置。
+  Widget _buildLoadingSkeleton(BuildContext context) {
+    final Color bar = Theme.of(context).colorScheme.surfaceContainerHighest;
+    return SingleChildScrollView(
+      physics: const NeverScrollableScrollPhysics(),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 24, 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            for (final double widthFactor in <double>[0.45, 0.72, 0.55, 0.64, 0.5])
+              Align(
+                alignment: Alignment.centerLeft,
+                child: FractionallySizedBox(
+                  widthFactor: widthFactor,
+                  child: Container(
+                    height: 40,
+                    margin: const EdgeInsets.only(bottom: 12),
+                    decoration: BoxDecoration(
+                      color: bar,
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
     );
   }
 

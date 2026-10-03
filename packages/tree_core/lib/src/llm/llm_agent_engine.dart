@@ -4,6 +4,7 @@ import 'package:tree_local_exec/tree_local_exec.dart';
 
 import '../agent/agent_engine.dart';
 import '../agent/attachment_prompt.dart';
+import '../agent/tool_result_repair.dart';
 import '../settings/core_settings.dart';
 import '../store/usage_log.dart';
 import '../tool/tool_runner.dart';
@@ -109,6 +110,13 @@ class LlmAgentEngine implements AgentEngine {
   /// 为什么是可写字段而不是构造参数：会话服务由核心进程构造、引擎由调用方（CLI）
   /// 构造，两边在构造期互不可见；留一个显式接线点，谁先建好谁接上。
   ToolTurnCompactor? toolTurnCompactor;
+
+  /// **自动修复落点**（用户 2026-10-03 口径：「在引擎的把关处，失败时自动修复」）。
+  ///
+  /// 与 [toolTurnCompactor] 同范式：可写字段，由会话层（`CoreServer` 构造时）接线——
+  /// 引擎不认识存储层，只认识"把这段失败信息写回那张卡"这个签名（[ToolResultRepair]）。
+  /// 为空 = 老行为（只在**送模型那份**补一句临时占位，落库那份保持为空）。
+  ToolResultRepair? toolResultRepair;
 
   /// **「LLM 处理」接管钩子**（中转站点位 `system.relay.llm.handle`）；null = 未接线。
   ///
@@ -688,20 +696,27 @@ class LlmAgentEngine implements AgentEngine {
                   : jsonEncode(ref.toolArguments ?? const <String, dynamic>{}),
             ),
           );
+          // **把关处（用户 2026-10-03：「在引擎的把关处，失败时自动修复」）**：
+          // 这张工具卡的 `tool_result` 是空的 ⇒ 那次调用的结果**永远拿不到**了
+          // （停止 / 异常 / 核心重启收尾时的落库形态；正在跑的调用根本不在历史里，
+          // 因此不会误伤）。先自动修复（写回一段失败信息，幂等），本次请求就用它——
+          // 以前只给模型一句**临时占位**，落库那份始终为空：界面看着像"还在跑"，
+          // 模型看到的与用户看到的不是同一件事。
+          final String content;
+          if (ref.toolResult.isEmpty) {
+            content = await gate.apply(
+              name,
+              await _repairMissingToolResult(context, ref, name),
+            );
+          } else {
+            // 「送模型那一份」以落库的为准（会话状态前缀 + 超长门控都已定稿）；
+            // 空串 = 老数据，当场补一次门控
+            content = ref.toolResultForModel.isNotEmpty
+                ? ref.toolResultForModel
+                : await gate.apply(name, ref.toolResult);
+          }
           results.add(
-            LlmMessage.toolResult(
-              // 「送模型那一份」以落库的为准（会话状态前缀 + 超长门控都已定稿）；
-              // 空串 = 老数据，当场补一次门控（上一轮中途中断时的占位同理）
-              content: ref.toolResultForModel.isNotEmpty
-                  ? ref.toolResultForModel
-                  : await gate.apply(
-                      name,
-                      ref.toolResult.isEmpty
-                          ? '(该工具调用未完成，没有结果)'
-                          : ref.toolResult,
-                    ),
-              toolCallId: callId,
-            ),
+            LlmMessage.toolResult(content: content, toolCallId: callId),
           );
         }
         out.add(
@@ -804,6 +819,43 @@ class LlmAgentEngine implements AgentEngine {
     await flushRound();
     _noteTrailingAssistantWithoutReasoning(out);
     return out;
+  }
+
+  /// **自动修复**：把"结果永远拿不到"的工具卡补上一段失败信息。
+  ///
+  /// 写回通道是注入的 [toolResultRepair]（引擎不认识存储层）；未接线 / 写回失败 /
+  /// 卡片没有 call_id ⇒ 只在**送模型那份**用失败信息（老行为：临时占位）。
+  /// 修复是尽力而为：任何异常都不许打断这一轮请求（请求本身仍然是合法的）。
+  Future<String> _repairMissingToolResult(
+    AgentRunContext context,
+    CoreMessageRef ref,
+    String toolName,
+  ) async {
+    final String callId = (ref.toolCallId ?? '').trim();
+    final ToolResultRepair? repair = toolResultRepair;
+    // 未接线 / 卡片没有 call_id ⇒ **老行为**：只在送模型那份补一句占位（落库那份不动）
+    if (repair == null || callId.isEmpty) {
+      return '(该工具调用未完成，没有结果)';
+    }
+    final String text = autoRepairToolResultText(
+      toolName: toolName,
+      toolCallId: callId,
+    );
+    try {
+      final bool wrote = await repair(
+        agentId: context.agentId,
+        sessionId: context.sessionId,
+        toolCallId: callId,
+        toolName: toolName,
+        result: text,
+      );
+      if (wrote) {
+        log?.call('自动修复：工具卡 $callId（$toolName）的结果永远拿不到，已写回失败信息');
+      }
+    } catch (error) {
+      log?.call('自动修复写回失败（已忽略，本次请求仍用失败信息）：$error');
+    }
+    return text;
   }
 
   /// 请求以"**没有思考正文的 assistant**"收尾时留一条日志。

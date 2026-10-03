@@ -15,6 +15,7 @@ class HookTask {
     required this.process,
     required this.startedAt,
     this.detached = false,
+    this.remote,
     this.note = '',
     this.finalOutput,
   });
@@ -37,6 +38,12 @@ class HookTask {
   /// 这类任务：不新起进程、也没有输出重定向，远端命令可能仍在跑；本机既不能等它、
   /// 也不能杀它，只记下「何时、为什么转的后台」供模型查询/续看。
   final bool detached;
+
+  /// 「SSH 软超时转来的」远端命令句柄（[TerminalHooks.adoptRemote]）；非空 = 第三形态。
+  ///
+  /// 与 [detached] 的区别：**拿得到**结束时的退出码与完整输出（[RunningSshExec.result]）；
+  /// 与 [process] 那条路的区别：远端进程不归本机管——没有 pid，`cancel` 恒失败。
+  final RunningSshExec? remote;
 
   /// 转后台的原因（detached 时给模型看的说明）。
   final String note;
@@ -280,10 +287,69 @@ class TerminalHooks {
     return task;
   }
 
+  /// 把一个**仍在远端运行**的命令登记为后台任务（SSH 软超时交接，2026-10-03）。
+  ///
+  /// 第三种形态：既不是 [start]（不新起进程），也不是 [adoptDetached]（拿得到结果），
+  /// 也不是 [adoptRunning]（没有本机 `Process`/pid）：
+  /// - **不终止、不重跑**：远端命令照常跑完，SSH 通道也没关；
+  /// - **杀不掉**：没有 pid ⇒ `hook_action=cancel` 如实失败（[cancel] 恒 false）；
+  /// - **收得到尾**：[RunningSshExec.result] 完成时补写完整输出与退出码，并回调
+  ///   [onFinished] 唤醒 agent；链路判失活时如实写"拿不到退出码与输出"。
+  Future<HookTask> adoptRemote({
+    required WorkspaceIO io,
+    required String agentId,
+    required String sessionId,
+    required String command,
+    required RunningSshExec running,
+    String? outputFile,
+    String note = '',
+  }) async {
+    _seq++;
+    final String id = 'hook_${DateTime.now().millisecondsSinceEpoch}_$_seq';
+    final String relative = (outputFile == null || outputFile.trim().isEmpty)
+        ? '.output/$id.log'
+        : outputFile.trim();
+    final String absolute = io.resolve(relative);
+    final DateTime startedAt = DateTime.now();
+    final File file = File(absolute);
+    await file.parent.create(recursive: true);
+    await file.writeAsString(
+      '# [terminal hook] $command\n'
+      '# ${note.isEmpty ? '远端命令软超时' : note} ⇒ 转后台（hook 模式）\n'
+      '# **没有终止远端进程，也没有重跑命令**（SSH 通道也没关）\n'
+      '# adopted ${startedAt.toIso8601String()}（远端进程不归本机管：没有 pid、杀不掉）\n'
+      '# 以下是采纳时的输出快照；远端命令结束时会在本文件末尾补写完整输出与退出码\n\n'
+      '${running.snapshotText()}\n',
+      flush: true,
+    );
+    final HookTask task = HookTask(
+      id: id,
+      agentId: agentId,
+      sessionId: sessionId,
+      command: command,
+      logRelative: relative,
+      logAbsolute: absolute,
+      process: null,
+      startedAt: startedAt,
+      note: note,
+      remote: running,
+    );
+    _tasks[id] = task;
+    unawaited(
+      running.result.then<void>(
+        (SshExecResult result) => _finishRemote(task, result),
+        onError: (Object error) => _failRemote(task, error),
+      ),
+    );
+    log?.call('远端命令软超时转后台 $id（$command）→ $relative');
+    return task;
+  }
+
   /// 取消任务（杀整棵进程树）。返回是否真的发出了终止。
   ///
   /// detached 任务没有本机进程句柄（会话失联时转的），这里**只能返回 false**：
-  /// 远端进程不归本机管，别假装杀成功了。
+  /// 远端进程不归本机管，别假装杀成功了。远端软超时转来的任务（[HookTask.remote]）
+  /// 同理——它连句柄都没有。
   Future<bool> cancel(String id) async {
     final HookTask? task = _tasks[id];
     if (task == null) return false;
@@ -310,7 +376,14 @@ class TerminalHooks {
   /// status 动作的回传文本：状态 + 退出码 + 耗时 + 日志尾部。
   String renderStatus(HookTask task) {
     final StringBuffer buffer = StringBuffer()..writeln('task_id: ${task.id}');
-    if (task.detached) {
+    if (task.remote != null) {
+      // SSH 软超时转来的：远端进程不归本机管——没有 pid、杀不掉，退出码要等远端收工
+      buffer.writeln(
+        '状态：远端仍在运行（SSH 软超时转后台；**没有终止远端进程**，本机无法终止它）'
+        '${task.running ? '' : '（退出码 ${task.exitCode}）'}'
+        '｜耗时 ${task.elapsed.inSeconds}s',
+      );
+    } else if (task.detached) {
       // 会话失联转来的任务：远端状态本机看不到，如实说清楚，不要假装知道退出码
       buffer
         ..writeln('状态：已转后台（会话失联；远端命令可能仍在运行，本机无法确认也无法终止）')
@@ -364,8 +437,65 @@ class TerminalHooks {
     onFinished?.call(task, code);
   }
 
-  String? _tail(String path) {
-    final String? text = readTailSync(path, maxTailChars);
+  /// 远端命令结束：把完整输出与退出码补写进日志，并回调唤醒 agent。
+  ///
+  /// 与 [_finish] 的区别只在取数来源：那条路的本机进程句柄能同步给出 `finalOutput`；
+  /// 远端是**一次性回包**，输出只在 [RunningSshExec.result] 里。
+  Future<void> _finishRemote(HookTask task, SshExecResult result) async {
+    task.exitCode = result.exitCode;
+    try {
+      final File file = File(task.logAbsolute);
+      final StringBuffer buffer = StringBuffer()
+        ..writeln('\n# （远端命令结束：退出码 ${result.exitCode}）');
+      if (result.stdout.trim().isNotEmpty) {
+        buffer
+          ..writeln('--- stdout ---')
+          ..writeln(result.stdout.trimRight());
+      }
+      if (result.stderr.trim().isNotEmpty) {
+        buffer
+          ..writeln('--- stderr ---')
+          ..writeln(result.stderr.trimRight());
+      }
+      await file.writeAsString(buffer.toString(), mode: FileMode.append, flush: true);
+      await file.writeAsString(
+        '\n# [terminal hook] 结束：退出码 ${result.exitCode}，'
+        '耗时 ${task.elapsed.inSeconds}s\n',
+        mode: FileMode.append,
+        flush: true,
+      );
+    } catch (error) {
+      log?.call('写 hook 结束标记失败：$error');
+    }
+    log?.call(
+      '远端后台任务结束 ${task.id}：exit=${result.exitCode} '
+      'elapsed=${task.elapsed.inSeconds}s',
+    );
+    onFinished?.call(task, result.exitCode);
+  }
+
+  /// 远端链路判失活（心跳连续丢失）：拿不到退出码与输出，**如实**写进日志并唤醒。
+  ///
+  /// 不假装知道远端状态：退出码记 [remoteFailureExitCode]（负值，与真实退出码区分开）。
+  Future<void> _failRemote(HookTask task, Object error) async {
+    task.exitCode = remoteFailureExitCode;
+    try {
+      await File(task.logAbsolute).writeAsString(
+        '\n# [terminal hook] 远端链路判失活，拿不到退出码与输出：$error\n',
+        mode: FileMode.append,
+        flush: true,
+      );
+    } catch (writeError) {
+      log?.call('写 hook 失败标记失败：$writeError');
+    }
+    log?.call('远端后台任务失联 ${task.id}：$error');
+    onFinished?.call(task, remoteFailureExitCode);
+  }
+
+  /// 远端链路失活时的"退出码"（负值：真实退出码不会是它）。
+  static const int remoteFailureExitCode = -1;
+
+  String? _tail(String path) {    final String? text = readTailSync(path, maxTailChars);
     return text;
   }
 

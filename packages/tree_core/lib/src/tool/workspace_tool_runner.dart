@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -21,6 +22,7 @@ import 'subagent_tool.dart';
 import 'team_tool.dart';
 import 'terminal_hooks.dart';
 import 'todo_store.dart';
+import 'tool_run_registry.dart';
 import 'tool_runner.dart';
 
 /// 按 agent 解析其工作空间目录（绝对路径）。
@@ -50,9 +52,13 @@ class WorkspaceToolRunner implements ToolRunner {
     this.subagentService,
     this.mcpService,
     this.pluginBus,
+    ToolRunRegistry? toolRuns,
     WorkspaceIO Function(String dir)? ioFactory,
     this.log,
-  }) : _ioFactory = ioFactory ?? LocalWorkspaceIO.new {
+  }) : _ioFactory = ioFactory ?? LocalWorkspaceIO.new,
+       // 默认 = 进程级唯一那一份（REST 快照 / `query_status.stuck_tools` / 执行站
+       // `tool.close` 都读同一份真值）；测试显式注入自己的实例与阈值。
+       toolRuns = toolRuns ?? ToolRunRegistry.instance {
     hooks = TerminalHooks(log: log);
     hooks.onFinished = _finished;
   }
@@ -119,6 +125,14 @@ class WorkspaceToolRunner implements ToolRunner {
 
   /// 插件总线（为 null 时不声明 `plugin` 与各插件工具）。
   final PluginBus? pluginBus;
+
+  /// **运行中工具登记表**（默认 = [ToolRunRegistry.instance]）。
+  ///
+  /// 挂载点就在下面的 [_execute]——内置工具、`plugin__*`、`mcp__*` 与站内
+  /// `tool.call`（[runFromPlugin]）**都走这一个入口**，所以一处挂载全覆盖。
+  /// 它把"正在跑什么、跑了多久、怎么收手"变成可观测（REST 快照 / warning / 广播
+  /// `system.tool.timeout` / `query_status.stuck_tools`）+ 可显式干预（`tool.close`）。
+  final ToolRunRegistry toolRuns;
 
   final WorkspaceIO Function(String dir) _ioFactory;
 
@@ -229,7 +243,90 @@ class WorkspaceToolRunner implements ToolRunner {
   ///
   /// 抽出来是为了让"插件发起的调用"能走同一条执行路径而**不触发站点**——绕开站点
   /// 绝不该绕开执行本身（否则两个入口的行为会各自漂移）。
+  ///
+  /// **登记表挂载点**（见 [toolRuns] 的文档）：每次工具调用都在这里登记 / 收尾，并在
+  /// "收到显式关闭请求"时**立刻收敛**（回一段可读结果，而不是让这一批永不结束）。
   Future<ToolOutcome> _execute(
+    ToolInvocation effective, {
+    bool Function()? isCancelled,
+  }) async {
+    final ToolRun run = toolRuns.start(
+      tool: effective.name,
+      arguments: effective.arguments,
+      agentId: effective.agentId,
+      sessionId: effective.sessionId,
+    );
+    try {
+      return await _raceClose(
+        run,
+        _dispatch(effective, isCancelled: isCancelled),
+      );
+    } finally {
+      // 收尾必须走 finally：工具抛异常、被取消、被关闭，登记项都不能留下来
+      // （留下的就是一个假的"正在执行的工具"）。
+      toolRuns.finish(run);
+    }
+  }
+
+  /// 显式关闭竞速：`tool.close`（执行站命令）/ 右栏"关闭"按钮 ⇒ 这次工具调用
+  /// **立刻**带着可读结果返回。
+  ///
+  /// 为什么必须有这一步：工具执行没有静态上限，一条不返回的命令会让整批工具永不结束，
+  /// 而引擎把"批中途到来的用户消息"推迟到批结束之后 ⇒ teammate 永久失联（见
+  /// `.self/recon-arch-stability.md` §2.7）。关闭的语义因此是"**让这次调用收敛**"
+  /// （尽力终止进程树 + 交回控制权），而不是偷偷改掉停止/打断的语义——停止键与打断
+  /// 一个字都没动，终止在途工具**只能**走这个显式句柄（plan §2.1）。
+  ///
+  /// 被放弃的那条执行 future 始终挂着错误处理器：它晚些时候结束（或抛
+  /// `LocalExecStillRunning`）时不会变成"未捕获异常"。
+  Future<ToolOutcome> _raceClose(ToolRun run, Future<ToolOutcome> work) {
+    final Completer<ToolOutcome> done = Completer<ToolOutcome>();
+    unawaited(
+      run.closeRequested.then((String _) {
+        if (!done.isCompleted) {
+          done.complete(ToolOutcome(run.closedOutcomeText, isError: true));
+        }
+      }),
+    );
+    work.then(
+      (ToolOutcome outcome) {
+        if (!done.isCompleted) done.complete(outcome);
+      },
+      onError: (Object error, StackTrace stack) {
+        if (!done.isCompleted) {
+          done.completeError(error, stack);
+        } else {
+          log?.call('工具 ${run.tool} 被关闭后仍以异常收场（已忽略）：$error');
+        }
+      },
+    );
+    return done.future;
+  }
+
+  /// **终止一次登记中的工具运行**（执行站 `tool.close` / REST 关闭入口的落点）。
+  ///
+  /// 现状（如实，不假装杀成功）：本机**同步执行中**的命令，进程句柄由执行器
+  /// （`LocalWorkspaceIO.exec`）持有，核心这一层拿不到 pid；远端命令更不在本机。
+  /// 所以这里能真正 `taskkill /T` 的只有"进程句柄已在手"的运行（[ToolRun.pid] 非空
+  /// ——本地执行器把 pid 交出来时的接缝）；其余情况返回可读说明，**真正的收敛**由
+  /// [_raceClose] 保证（这次调用立刻返回、批可以收尾）。
+  Future<String> terminateToolRun(ToolRun run) async {
+    final int? pid = run.pid;
+    if (pid != null) {
+      await Shell.killProcessTree(pid);
+      return '已终止本机进程树（pid=$pid，taskkill /T）；这次调用已按关闭请求收敛';
+    }
+    if (run.tool != BuiltinTools.terminal) {
+      return '该工具（${run.tool}）不是命令执行类：没有可终止的进程；'
+          '这次调用已按关闭请求收敛（工具若已结束，登记项同时移除）';
+    }
+    return '未拿到本机进程句柄（命令仍在同步执行中，pid 由执行器持有）：'
+        '没有可供 taskkill /T 的目标；这次调用已按关闭请求收敛，命令可能仍在跑'
+        '（远端命令本机无法终止）——请用 terminal 复查进程与产物，不要直接重跑';
+  }
+
+  /// MCP / 插件 / 内置工具的实际分派（不含登记表与关闭竞速，见 [_execute]）。
+  Future<ToolOutcome> _dispatch(
     ToolInvocation effective, {
     bool Function()? isCancelled,
   }) async {

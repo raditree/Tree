@@ -13,7 +13,7 @@ import 'package:tree_core/tree_core.dart';
 /// **每次交互携带的信封**（消息 scope）与**订阅声明**，只在投递时用于匹配订阅者。
 ///
 /// 这个文件锁住六条语义：
-/// 1. **就位**：16 个内置点位一次建齐（广播 3 + 执行 7 + 中转 6），id = 点位常量；
+/// 1. **就位**：17 个内置点位一次建齐（广播 4 + 执行 7 + 中转 6），id = 点位常量；
 /// 2. **与 team / agent 无关**：站点数不随团队或 agent 数量变化；
 /// 3. **幂等**：重复调用不产生重复实例，也不重复落盘；
 /// 4. **持久化**：第二次启动从 stations.yaml 恢复，数量与 id 不变、不再新建；
@@ -53,7 +53,7 @@ void main() {
       .toList()
     ..sort();
 
-  test('空存储：16 个内置点位一次建齐，id 是点位常量（不含 team / mode）', () {
+  test('空存储：17 个内置点位一次建齐，id 是点位常量（不含 team / mode）', () {
     final StationHub hub = StationHub(storePath: storePath);
     expect(hub.stationList(), isEmpty, reason: '预建之前确实是空的（懒创建的世界）');
 
@@ -61,8 +61,8 @@ void main() {
 
     expect(
       created,
-      hasLength(16),
-      reason: '广播 3 + 执行 7 + 中转 6；每个点位是一个独立实例',
+      hasLength(17),
+      reason: '广播 4 + 执行 7 + 中转 6；每个点位是一个独立实例',
     );
     // stationList() 按 id 字典序（输出稳定）
     expect(idsOf(hub), expectedPrebuilt());
@@ -75,7 +75,7 @@ void main() {
       );
     }
     // 每个**点位**都是一条独立实例：按类型数是 3 / 7 / 6（不是四种类型各一个）
-    expect(hub.stationList().whereType<BroadcastStation>(), hasLength(3));
+    expect(hub.stationList().whereType<BroadcastStation>(), hasLength(4));
     expect(hub.stationList().whereType<ExecuteStation>(), hasLength(7));
     expect(hub.stationList().whereType<RelayStation>(), hasLength(6));
 
@@ -96,7 +96,7 @@ void main() {
     final StationHub hub = StationHub(storePath: storePath);
     hub.ensureBuiltinStations();
     final List<String> baseline = idsOf(hub);
-    expect(baseline, hasLength(16));
+    expect(baseline, hasLength(17));
 
     // 模拟"团队变多 / 新 agent 出现"：这些在收敛后**不再**是站点的输入。
     // 反复调用预建（核心在启动接线处与任何补建点都可能调）必须一字不变。
@@ -115,7 +115,7 @@ void main() {
       isEmpty,
       reason: '没有接入点就没有输入格式，空 schema 的收集站没有意义',
     );
-    expect(idsOf(hub), hasLength(16));
+    expect(idsOf(hub), hasLength(17));
 
     // 接入点需要时现建（「插件定义 tool」的首个接入点），预建不会碰它
     final CollectStation collect = hub.toolDefineStationFor()!;
@@ -124,7 +124,7 @@ void main() {
     // 再来一次拿到的必须是同一个实例（全局唯一），而不是又建一个
     expect(hub.toolDefineStationFor(), same(collect));
     expect(hub.ensureBuiltinStations(), isEmpty);
-    expect(idsOf(hub), hasLength(17));
+    expect(idsOf(hub), hasLength(18));
     expect(hub.stationList().whereType<CollectStation>().single.id, collect.id);
   });
 
@@ -132,7 +132,7 @@ void main() {
     final _CountingStationStore counting = _CountingStationStore(storePath);
     final StationHub hub = StationHub(storePath: storePath, store: counting);
 
-    expect(hub.ensureBuiltinStations(), hasLength(16));
+    expect(hub.ensureBuiltinStations(), hasLength(17));
     expect(counting.saves, 1, reason: '一批预建合并成一次落盘（不是每站一次）');
     final String after = File(storePath).readAsStringSync();
 
@@ -140,7 +140,7 @@ void main() {
     expect(hub.ensureBuiltinStations(), isEmpty);
     expect(hub.ensureBuiltinStations(), isEmpty);
     expect(counting.saves, 1);
-    expect(idsOf(hub), hasLength(16), reason: '不产生重复实例');
+    expect(idsOf(hub), hasLength(17), reason: '不产生重复实例');
     expect(File(storePath).readAsStringSync(), after, reason: '磁盘内容一字不差');
   });
 
@@ -155,8 +155,8 @@ void main() {
     );
 
     final List<String> created = hub.ensureBuiltinStations();
-    // 预建按**点位表顺序**（广播 3 → 执行 7 → 中转 6）：通用主题点位已存在 ⇒
-    // 本轮只新建其余 15 个点位（已存在的既不新建也不覆盖）
+    // 预建按**点位表顺序**（广播 4 → 执行 7 → 中转 6）：通用主题点位已存在 ⇒
+    // 本轮只新建其余 16 个点位（已存在的既不新建也不覆盖）
     expect(
       created,
       StationPoints.all
@@ -167,9 +167,9 @@ void main() {
           )
           .map((StationPointSpec spec) => spec.id)
           .toList(),
-      reason: '广播站·通用主题已存在 ⇒ 只补其余 15 个点位',
+      reason: '广播站·通用主题已存在 ⇒ 只补其余 16 个点位',
     );
-    expect(created, hasLength(15));
+    expect(created, hasLength(16));
     expect(hub.station(broadcast.id), same(broadcast));
     expect(hub.station(broadcast.id)!.subscribers, hasLength(1));
     // 订阅者的 team 视角由一个全局站承载（面板据此分组）
@@ -180,7 +180,7 @@ void main() {
 
   test('持久化：第二次启动从 stations.yaml 恢复，数量与 id 不变且不再新建', () {
     final StationHub first = StationHub(storePath: storePath);
-    expect(first.ensureBuiltinStations(), hasLength(16));
+    expect(first.ensureBuiltinStations(), hasLength(17));
     final List<String> baseline = idsOf(first);
     expect(File(storePath).existsSync(), isTrue, reason: '内置站必须落盘');
 

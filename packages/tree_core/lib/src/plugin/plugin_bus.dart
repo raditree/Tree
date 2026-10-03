@@ -2314,6 +2314,59 @@ class PluginBus {
     );
   }
 
+  /// **广播站点位「工具运行超时」**（`system.tool.timeout`，M9 点位化新增）。
+  ///
+  /// 由 `ToolRunRegistry` 在**一次运行跨过阈值时**调用（warning 与广播共用同一个
+  /// "每次运行只发一次"闸门，见 `ToolRunRegistry._warnIfNeeded`）。
+  ///
+  /// [run] = 登记表给的载荷（冻结键：`handle` / `agent_id` / `session_id` / `tool` /
+  /// `command` / `elapsed_ms` / `started_at`）；这里只补 `point`（与其它广播载荷同口径）。
+  /// 订阅方式与既有 `system.*` 点位一致：`{station: 'broadcast', point: 'tool.timeout'}`
+  /// （别名见 `StationPoints.broadcasts`）。
+  ///
+  /// 与 [announceToolCall] 同口径：**单向通知**（`unawaited`，不等回包、失败只记日志）。
+  void announceToolTimeout(Map<String, dynamic> run) {
+    load();
+    if (!enabled) return;
+    final String agentId = (run['agent_id'] ?? '').toString();
+    final String sessionId = (run['session_id'] ?? '').toString();
+    final StationScope scope = runtimeScopeFor(
+      agentId: agentId,
+      sessionId: sessionId,
+    );
+    if (!scope.isValid) return;
+    final BroadcastStation? station = stations.broadcastPointFor(
+      StationHubIds.broadcastToolTimeout,
+    );
+    if (station == null) return;
+    if (station.subscribers.isEmpty) return; // 快路径：没人订阅，零开销
+    final Map<String, dynamic> payload = <String, dynamic>{
+      'point': station.id,
+      ...run,
+    };
+    // 单向通知：不 await、失败只记日志（工具运行的超时判定不受广播影响）
+    unawaited(
+      station
+          .publish(
+            topic: 'tool.timeout',
+            scope: scope,
+            payload: payload,
+            meta: <String, dynamic>{
+              'tool': (run['tool'] ?? '').toString(),
+              'handle': (run['handle'] ?? '').toString(),
+            },
+          )
+          .then((StationPublishResult result) {
+            if (result.deliveries.any((StationDelivery d) => !d.ok)) {
+              log?.call('工具超时广播 ${result.describe()}');
+            }
+          })
+          .catchError((Object error) {
+            log?.call('工具超时广播异常（已忽略）：$error');
+          }),
+    );
+  }
+
   /// 浅比较两个报文（回填 = 整体替换，键集与值都相同才算"未改动"）。
   static bool _sameMap(
     Map<String, dynamic> a,

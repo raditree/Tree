@@ -204,6 +204,12 @@ void main() {
       );
 
       // 切到插件 Tab：内容为槽位视图
+      //
+      // 右栏 2026-10-03 起有 **6 个内置页签**（新增「正在执行的 tool」），而 TabBar 是
+      // `isScrollable`：760px 宽下最后一个插件页签落在**滚动区之外**，直接 tap 会点在
+      // 视口外的坐标上（hit test 落空 ⇒ 点不动）。先滚到可见再点，断言口径不变。
+      await tester.ensureVisible(find.text('演示面板'));
+      await tester.pumpAndSettle();
       await tester.tap(find.text('演示面板'));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));

@@ -440,6 +440,56 @@ class FileTreeStore implements TreeStore {
   }
 
   @override
+  bool repairToolResult(
+    String agentId,
+    String sessionId,
+    String toolCallId, {
+    required String toolResult,
+    required String toolResultForModel,
+  }) {
+    _loadMessages(agentId, sessionId);
+    final List<CoreMessage>? list = _messages[_key(agentId, sessionId)];
+    if (list == null) return false;
+    final int index = list.indexWhere(
+      (CoreMessage m) => m.isTool && m.toolCallId == toolCallId,
+    );
+    if (index < 0) return false;
+    final CoreMessage existing = list[index];
+    // 幂等：已经有结果就不再改（自动修复每次组装请求都会问一次）
+    if (existing.toolResult.trim().isNotEmpty) return false;
+    list[index] = CoreMessage.fromJson(<String, dynamic>{
+      ...existing.toJson(),
+      'tool_result': toolResult,
+      'tool_result_for_model': toolResultForModel,
+    });
+    _writeMessages(agentId, sessionId, list);
+    return true;
+  }
+
+  /// 重写某会话的 `messages.jsonl`（**自动修复**专用：结果要写回**同一张**卡）。
+  ///
+  /// 只在"修理历史"这类罕见路径上调用：整份重写比 append 贵，但 append 一条同 id 的
+  /// 卡会出现两张卡、`tool_call_id` 重复。列表本身来自 [_loadMessages]（整份已加载），
+  /// 因此重写不会丢行。
+  void _writeMessages(
+    String agentId,
+    String sessionId,
+    List<CoreMessage> messages,
+  ) {
+    final String file = paths.messagesFile(agentId, sessionId);
+    final String content = messages
+        .map((CoreMessage m) => jsonEncode(m.toJson()))
+        .join('\n');
+    _queue.enqueue(
+      paths.sessionDir(agentId, sessionId),
+      () => AtomicFile.writeStringAtomic(
+        file,
+        content.isEmpty ? '' : '$content\n',
+      ),
+    );
+  }
+
+  @override
   int clearMessages(String agentId, {String? sessionId}) {
     _loadAgent(agentId);
     final bool all =

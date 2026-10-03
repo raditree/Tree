@@ -40,6 +40,7 @@ import '../team/team_service.dart';
 import '../team/team_workspace.dart';
 import '../tool/terminal_hooks.dart';
 import '../tool/todo_store.dart';
+import '../tool/tool_run_registry.dart';
 import '../tool/tool_runner.dart';
 import '../tool/workspace_tool_runner.dart';
 import '../util/ids.dart';
@@ -443,6 +444,13 @@ class CoreServer {
     server._heartbeatEnabled = enableHeartbeat;
     server._liveHeartbeatInterval = resolvedHeartbeatInterval;
     server._liveHeartbeatMissLimit = resolvedHeartbeatMissLimit;
+    // **自动修复**（用户 2026-10-03：「在引擎的把关处，失败时自动修复」）：引擎在
+    // 组装工具批时发现"结果永远拿不到"的工具卡 ⇒ 写回失败信息 + 补一条 `tool_end` 帧。
+    // 与插件接线无关（`_wirePluginRelayPoints` 只在接了插件时走），必须**无条件**接上。
+    final AgentEngine wiredEngine = server.conversation.engine;
+    if (wiredEngine is LlmAgentEngine) {
+      wiredEngine.toolResultRepair = server.conversation.repairToolResult;
+    }
     // Q9：Spec 索引注入系统提示词。做成**可设置的 provider**（而不是给
     // `systemPromptWithWorkspace` 加参数）是因为提示词在会话生成与压缩估算两处
     // 拼装，两处必须逐字一致；provider 让它们自动同口径，也不需要改会话服务。
@@ -510,6 +518,9 @@ class CoreServer {
     // M9 Wave 3-I：执行站挂载位置 + 运行期四元组（站点隔离的运行期依据）。
     // Wave 3-I 第 2 条：工具层把它的 hooks 传进来 ⇒ 插件与 agent 共用一张任务表。
     server._wirePluginStations(stationHooks: stationHooks);
+    // 运行中工具登记表：warning（会话 llm_hidden + core.log）、超时广播（点位
+    // `system.tool.timeout`）与显式关闭的进程终止落点都在这里接线。
+    server._wireToolRuns();
     server._registerRoutes();
     server._registerStubRoutes();
     if (enableHeartbeat) {
@@ -521,6 +532,9 @@ class CoreServer {
 
   /// 关闭服务并释放全部连接（幂等）。
   Future<void> close({bool force = true}) async {
+    // 运行中工具登记表：取消待发 warning 的计时器并清空登记项——别让一个 120s 的
+    // 计时器把核心进程吊在退出门口（进程终止是工具层自己的事，见 TerminalHooks.close）。
+    _toolRunsOf().shutdown();
     conversation.dispose();
     questions?.dispose();
     // 引擎可能持有 HTTP 连接池（真实 LLM 传输层）：随服务一起释放
@@ -633,11 +647,13 @@ class CoreServer {
       agentStopper: (String agentId, {required bool cascade}) async =>
           _stopAgentTree(agentId, cascade: cascade),
       compactor: _stationCompact,
-      // 点位化新增的三条命令（llm.call / tool.call / session.rename）：
+      // 点位化新增的命令（llm.call / tool.call / tool.close / session.rename）：
       // 工具执行器优先取引擎手上那一份（与模型调用工具**同一条路径**）；
-      // 没接线时命令以「未接线」显式失败，不做静默降级。
+      // 没接线时命令以「未接线」显式失败，不做静默降级。`tool.close` 的关闭实现
+      // 与右栏"关闭"按钮、REST 共用同一个（`ToolRunRegistry.close`）。
       llmCaller: _stationLlmCall,
       toolCaller: _stationToolCall,
+      toolCloser: _stationToolClose,
       sessionRenamer: _stationRenameSession,
       log: (String message) => errorLog?.call('[core:station] $message'),
     );
@@ -763,6 +779,49 @@ class CoreServer {
       usageSink: usageLog?.sinkFor(sessionId),
     );
   }
+
+  /// **运行中工具登记表**的接线（warning / 超时广播 / 关闭的进程终止落点）。
+  ///
+  /// 三条落点各管一段（plan §4 步骤 3/4/5）：
+  /// - `notice`：会话一条 `llm_hidden` 提示（复用 `ConversationService.sendHiddenNotice`
+  ///   ——`messages.jsonl` 键集因此**不变**）+ `core.log` 一行（`log`）；
+  /// - `onTimeout`：广播站点位 `system.tool.timeout`（超阈值**只广播一次**）；
+  /// - `terminate`：`tool.close` / REST 关闭的"先终止进程树"那一步，落到工具层
+  ///   （见 `WorkspaceToolRunner.terminateToolRun`：有 pid 才 `taskkill /T`，没有就如实说）。
+  ///
+  /// 登记表是**进程级唯一一份**（[ToolRunRegistry.instance]）——REST、`query_status`、
+  /// 执行站与工具层必须读同一份真值，所以这里只 attach 落点，不新建实例。
+  void _wireToolRuns() {
+    final WorkspaceToolRunner? runner = _runnerFromEngine();
+    final ToolRunRegistry registry = runner?.toolRuns ?? ToolRunRegistry.instance;
+    final void Function(String message)? sink = errorLog;
+    registry.attach(
+      // core.log 一行（前缀与 [core:station] / [core:llm] 同口径）
+      log: sink == null ? null : (String message) => sink('[core:tool] $message'),
+      notice: conversation.sendHiddenNotice,
+      onTimeout: (Map<String, dynamic> payload) =>
+          pluginBus?.announceToolTimeout(payload),
+      terminate: runner == null
+          ? null
+          : (ToolRun run) => runner.terminateToolRun(run),
+    );
+  }
+
+  /// 执行站 `tool.close`：**显式关闭**一次正在执行的工具运行。
+  ///
+  /// 与右栏"关闭"按钮（REST `POST /api/tools/running/{handle}/close`）走**同一个**
+  /// 实现（[ToolRunRegistry.close]）：先尽力终止进程树，再把这次运行从登记表移除，
+  /// 并让在途工具调用**收敛**（回一段可读结果，批因此不再永不结束）。
+  /// 失败一律给可读原因（fail-closed），不假装成功。
+  Future<Map<String, dynamic>> _stationToolClose(String handle) async {
+    final ToolCloseOutcome outcome = await _toolRunsOf().close(handle);
+    if (!outcome.closed) return <String, dynamic>{'error': outcome.note};
+    return outcome.toJson();
+  }
+
+  /// 关闭入口用的登记表实例（与工具层同一份；引擎不可用时回落进程级唯一那一个）。
+  ToolRunRegistry _toolRunsOf() =>
+      _runnerFromEngine()?.toolRuns ?? ToolRunRegistry.instance;
 
   /// 执行站 `tool.call`：执行**任意工具**（内置 / MCP / 插件工具同一入口）。
   ///
@@ -1198,6 +1257,7 @@ class CoreServer {
     router.add('DELETE', ApiPaths.agent, _deleteAgent);
     router.add('GET', ApiPaths.agentModelsInfo, _agentModelsInfo);
     router.add('GET', ApiPaths.agentTodos, _agentTodos);
+    router.add('GET', ApiPaths.agentSubagents, _agentSubagents);
     router.add('GET', ApiPaths.agentTeammates, _agentTeammates);
     router.add('PATCH', ApiPaths.teammate, _updateTeammate);
     router.add('GET', ApiPaths.teammateLog, _teammateLog);
@@ -1288,6 +1348,43 @@ class CoreServer {
     router.add('GET', ApiPaths.mcpServices, _mcpServices);
     router.add('POST', ApiPaths.mcpServices, _registerMcpService);
     router.add('DELETE', ApiPaths.mcpService, _deleteMcpService);
+    // 运行中工具（"工具卡住"的可见面）：只读快照 + 显式关闭。关闭走与执行站
+    // `tool.close` **同一个**实现（`ToolRunRegistry.close`），fail-closed 给可读原因。
+    router.add('GET', ApiPaths.toolsRunning, _listRunningTools);
+    router.add('POST', ApiPaths.toolsRunningClose, _closeRunningTool);
+  }
+
+  /// `GET /api/tools/running`：正在执行的工具**只读快照**（不触发任何副作用）。
+  ///
+  /// 形状（冻结）：`{runs:[{handle, agent_id, session_id, tool, command_preview,
+  /// started_at, elapsed_ms, over_threshold}]}`。数据源是核心的内存登记表：只登记
+  /// "正在跑的"、重启即清空、不做历史运行记录。
+  Future<void> _listRunningTools(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    await writeJson(request, 200, _toolRunsOf().snapshot());
+  }
+
+  /// `POST /api/tools/running/{handle}/close`：**显式关闭**一次运行中的工具。
+  ///
+  /// 语义与执行站 `tool.close` 完全一致（同一个 `close` 实现）；句柄失效
+  /// （核心重启过 / 这次运行已结束）⇒ **404 + 可读原因**，不假装成功。
+  Future<void> _closeRunningTool(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final String handle = (params['handle'] ?? '').trim();
+    if (handle.isEmpty) {
+      await writeJson(request, 400, errorBody('缺少 handle（形如 toolrun_…）'));
+      return;
+    }
+    final ToolCloseOutcome outcome = await _toolRunsOf().close(handle);
+    if (!outcome.closed) {
+      await writeJson(request, 404, errorBody(outcome.note));
+      return;
+    }
+    await writeJson(request, 200, outcome.toJson());
   }
 
   // ── agent ────────────────────────────────────────────────────────────
@@ -1811,6 +1908,36 @@ class CoreServer {
     });
   }
 
+  /// `GET /api/agents/{agentId}/subagents?session_id=`：该会话的**临时员工名册**。
+  ///
+  /// **只读**那份落盘名册（[TreeStore.subagents] ⇒ `subagents.json`）：中栏"进入某个
+  /// 临时员工"的入口用它当权威来源，因此不会随消息窗口的加载 / 淘汰抖动
+  /// （用户 2026-10-03：「进入某个临时成员的选项经常会无端变化」）。
+  ///
+  /// **跨会话不保留**：只回该 `(agentId, sessionId)` 的名册——查别的会话只会得到它
+  /// 自己那一份（通常是空表），删会话即随之消失；不新增任何跨会话存储。
+  Future<void> _agentSubagents(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final String agentId = params['agentId'] ?? '';
+    if (store.agent(agentId) == null) {
+      await writeJson(request, 404, errorBody('agent 不存在'));
+      return;
+    }
+    final String sessionId =
+        request.uri.queryParameters['session_id'] ?? TreeStore.defaultSessionId;
+    final List<CoreSubagent> roster = store.subagents(agentId, sessionId);
+    await writeJson(request, 200, <String, dynamic>{
+      'agent_id': agentId,
+      'session_id': sessionId,
+      'total': roster.length,
+      'subagents': <Map<String, dynamic>>[
+        for (final CoreSubagent s in roster) s.toRosterJson(),
+      ],
+    });
+  }
+
   Future<void> _agentTeammates(
     HttpRequest request,
     Map<String, String> params,
@@ -1872,6 +1999,7 @@ class CoreServer {
     String agentId, {
     bool cascade = true,
     String sessionId = '',
+    Map<String, dynamic> extraFields = const <String, dynamic>{},
   }) {
     final List<String> ids = cascade
         ? (teamService?.cascadeIds(agentId) ?? <String>[agentId])
@@ -1891,6 +2019,10 @@ class CoreServer {
           'agent_id': id,
           'status': 'idle',
           if (sessionId.isNotEmpty) 'session_id': sessionId,
+          // 停的是**临时员工**：带上它自己的标记，前端只收它那一份「工作中」；
+          // 停的是主 agent：显式声明「它自己不再跑了」（`own_running` 口径）。
+          if (extraFields.isNotEmpty) ...extraFields,
+          if (extraFields.isEmpty) 'own_running': false,
         },
       });
     }
@@ -1926,9 +2058,17 @@ class CoreServer {
       });
       return;
     }
+    // **临时员工 id：只停它自己**（用户 2026-10-03：「仅停止对应临时成员，保证对
+    // 其他成员无影响」）：它不在团队树里，`cascadeIds` 那套（TOP ⇒ 子树）对它没有
+    // 意义——显式关掉级联，别让「停一个临时员工」顺手扫到别的成员。
+    final bool stoppingSubagent = subagents?.isSubagent(agentId) ?? false;
     final Map<String, dynamic> summary = _stopAgentTree(
       agentId,
+      cascade: !stoppingSubagent,
       sessionId: sessionId,
+      extraFields: stoppingSubagent
+          ? _subagentFrameFields(agentId)
+          : const <String, dynamic>{},
     );
     final bool anyRunning = summary['any_running'] == true;
     final List<dynamic> ids = summary['cascade_ids'] as List<dynamic>;
@@ -1946,8 +2086,25 @@ class CoreServer {
         'agent_id': agentId,
         'status': 'stopping',
         if (sessionId.isNotEmpty) 'session_id': sessionId,
+        if (stoppingSubagent) ..._subagentFrameFields(agentId),
       },
     });
+  }
+
+  /// 临时员工的**帧标记**（与 `SubagentTag.frameFields` 同口径）。
+  ///
+  /// 用途：停止回执与补推的 `idle` 也要带——前端据此只收掉**它自己**那一份
+  /// 「工作中」，而不是把主视角（或别的成员）也一起改掉（用户 2026-10-03）。
+  /// 名册里查不到（没加载 / 已删除）时至少给 `subagent_id`，别让帧失去归属。
+  Map<String, dynamic> _subagentFrameFields(String id) {
+    final CoreSubagent? record = subagents?.handle(id);
+    if (record == null) return <String, dynamic>{'subagent_id': id};
+    return <String, dynamic>{
+      'subagent_id': record.id,
+      if (record.name.isNotEmpty) 'subagent_name': record.name,
+      if (record.parentId.isNotEmpty) 'subagent_parent_id': record.parentId,
+      'subagent_level': record.level,
+    };
   }
 
   /// `GET /api/agents/{memberId}/teammate/{memberId}/log?lines=60`：成员活动日志尾部。

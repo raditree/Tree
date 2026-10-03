@@ -74,7 +74,7 @@ void main() {
       bus.stations.station(StationPoints.ownerOfCommand(command)!.id)!
           as ExecuteStation;
 
-  test('核心启动即把九条命令挂到各自的点位（不再返回「暂无挂载位置」）', () {
+  test('核心启动即把十条命令挂到各自的点位（不再返回「暂无挂载位置」）', () {
     for (final StationPointSpec spec in StationPoints.executes) {
       expect(
         bus.stations
@@ -86,10 +86,10 @@ void main() {
         reason: '点位 ${spec.id} 只挂自己那族的命令（命令族之间互不干扰）',
       );
     }
-    // 全命令并集 = 十二条（fs 4 + terminal 1 + agent 3 + ui 1 + llm 1 + tool 1 +
-    // session 1）；`llm.call` / `tool.call` / `session.rename` 也被各自点位接管，
-    // 只是落到「尚无挂载实现」的显式失败（不是「暂无挂载位置」）。
-    expect(ExecuteStation.builtinCommands, hasLength(12));
+    // 全命令并集 = 十三条（fs 4 + terminal 1 + agent 3 + ui 1 + llm 1 + tool 2 +
+    // session 1）；`llm.call` / `tool.call` / `tool.close` / `session.rename` 也被各自
+    // 点位接管，只是落到「尚无挂载实现」的显式失败（不是「暂无挂载位置」）。
+    expect(ExecuteStation.builtinCommands, hasLength(13));
   });
 
   test('运行期四元组：team 取 agent 归属、mode_key 取工作空间模式', () {
@@ -200,7 +200,7 @@ void main() {
 
   // ── 内置点位「启动即存在」（懒创建 ⇒ 用户实机看到「站点（0）」） ──
 
-  test('核心启动即建齐 16 个内置点位（**每个接入点一个实例，与 team / mode 无关**）', () {
+  test('核心启动即建齐 17 个内置点位（**每个接入点一个实例，与 team / mode 无关**）', () {
     final List<String> expected = StationPoints.all
         .where((StationPointSpec spec) => spec.kind != StationKind.collect)
         .map((StationPointSpec spec) => spec.id)
@@ -209,9 +209,9 @@ void main() {
     expect(
       bus.stations.stationList().map((StationInstance s) => s.id).toList(),
       expected,
-      reason: '广播 3 + 执行 7 + 中转 6 = 16：每个点位一个独立实例，id 不含 team / mode',
+      reason: '广播 4 + 执行 7 + 中转 6 = 17：每个点位一个独立实例，id 不含 team / mode',
     );
-    expect(bus.stations.stationList(), hasLength(16));
+    expect(bus.stations.stationList(), hasLength(17));
     expect(
       bus.stations.stationList().whereType<CollectStation>(),
       isEmpty,
@@ -233,7 +233,7 @@ void main() {
   });
 
   test('站点数不随工作空间模式 / 重启变化（team×mode 不再产生新实例）', () async {
-    expect(bus.stations.stationList(), hasLength(16));
+    expect(bus.stations.stationList(), hasLength(17));
 
     // 同一团队里出现 SSH 工作面的 agent：**不再**多出站点（点位化的核心）。
     // mode 仍是有意义的隔离维度，但它属于消息 scope，不属于站点身份。
@@ -243,7 +243,7 @@ void main() {
     addTearDown(second.close);
     expect(
       bus.stations.stationList(),
-      hasLength(16),
+      hasLength(17),
       reason: 'local / ssh 是同一个点位的两种工作面，不各自建站',
     );
 
@@ -276,7 +276,7 @@ void main() {
           .map((StationInstance s) => s.id)
           .toList(),
       builtinIds,
-      reason: '第二次启动从盘恢复：数量与 id 都不变（16 个内置点位不重复建）',
+      reason: '第二次启动从盘恢复：数量与 id 都不变（17 个内置点位不重复建）',
     );
   });
 

@@ -257,6 +257,23 @@ class SubagentStore implements TreeStore {
   @override
   CoreMessage appendMessage(CoreMessage message) => inner.appendMessage(message);
 
+  /// 自动修复一律转发给真 store：临时员工的工具卡与主 agent 的卡都在同一份
+  /// `messages.jsonl` 里（`tool_call_id` 全局唯一），没有"按 agent 分栏"的问题。
+  @override
+  bool repairToolResult(
+    String agentId,
+    String sessionId,
+    String toolCallId, {
+    required String toolResult,
+    required String toolResultForModel,
+  }) => inner.repairToolResult(
+    agentId,
+    sessionId,
+    toolCallId,
+    toolResult: toolResult,
+    toolResultForModel: toolResultForModel,
+  );
+
   @override
   int clearMessages(String agentId, {String? sessionId}) =>
       inner.clearMessages(agentId, sessionId: sessionId);

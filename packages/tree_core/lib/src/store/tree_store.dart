@@ -183,6 +183,23 @@ abstract interface class TreeStore {
   /// 追加顺序 = 读回顺序就与任何排序实现无关。
   CoreMessage appendMessage(CoreMessage message);
 
+  /// **自动修复落点**：按 `toolCallId` 找到那张工具卡，把"结果永远拿不到"的失败信息
+  /// 写进去（`tool_result` 与 `tool_result_for_model` **一起**——它们分别是"给人看"
+  /// 与"送模型"两个口径，见 [CoreMessage]）。
+  ///
+  /// 返回是否真的改了：卡片的 `tool_result` 已有内容 / 找不到这张卡 ⇒ `false`
+  /// （**幂等**：引擎每次组装请求都可以调用，见 [ToolResultRepair]）。
+  ///
+  /// 为什么不新增一条消息：工具卡必须是**一条**（再 append 会出现两张卡，历史里
+  /// `tool_call_id` 重复 ⇒ 端点严格配对校验过不去）。
+  bool repairToolResult(
+    String agentId,
+    String sessionId,
+    String toolCallId, {
+    required String toolResult,
+    required String toolResultForModel,
+  });
+
   /// 清空消息；`sessionId` 为 null/空/`all` 时清空该 agent 全部会话。
   /// 返回被删除的消息条数。
   int clearMessages(String agentId, {String? sessionId});

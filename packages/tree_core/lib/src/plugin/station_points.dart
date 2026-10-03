@@ -81,6 +81,16 @@ abstract final class StationPoints {
       description: '广播站·工具调用后：每次工具调用**结束**时广播一条（含结果，单向通知）',
       alias: 'tool.post',
     ),
+    StationPointSpec(
+      id: StationHubIds.broadcastToolTimeout,
+      kind: StationKind.broadcast,
+      label: '工具运行超时',
+      description:
+          '广播站·工具运行超时：一次工具运行**跨过阈值（默认 120s）时广播一次**'
+          '（单向通知；载荷含 handle / tool / command / elapsed_ms，可用执行站 '
+          'tool.close 显式关闭）',
+      alias: 'tool.timeout',
+    ),
   ];
 
   /// 执行站点位（按命令族）。
@@ -129,9 +139,11 @@ abstract final class StationPoints {
       id: StationHubIds.executeTool,
       kind: StationKind.execute,
       label: '工具调用',
-      description: '执行站·工具族：tool.call（执行任意工具：内置 / MCP / 插件工具同一入口）',
+      description:
+          '执行站·工具族：tool.call（执行任意工具：内置 / MCP / 插件工具同一入口）、'
+          'tool.close（显式关闭一次正在执行的工具运行，args {handle}）',
       alias: 'tool',
-      commands: <String>['tool.call'],
+      commands: <String>['tool.call', 'tool.close'],
     ),
     StationPointSpec(
       id: StationHubIds.executeSession,

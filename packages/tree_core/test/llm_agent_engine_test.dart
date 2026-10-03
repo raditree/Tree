@@ -76,6 +76,157 @@ void main() {
     });
   });
 
+  group('自动修复：结果永远拿不到的工具卡（把关处）', () {
+    const String agentId = 'agt_1';
+    const String sessionId = 'ses_1';
+
+    /// 造一张"结果永远拿不到"的工具卡（取消 / 异常 / 重启时就是这种落库形态）。
+    MemoryStore storeWithFailedTool({
+      String toolResult = '',
+      String toolCallId = 'call_x',
+    }) {
+      final MemoryStore store = MemoryStore();
+      store.appendMessage(
+        CoreMessage(
+          id: 'tool_failed',
+          agentId: agentId,
+          sessionId: sessionId,
+          role: 'agent',
+          content: '',
+          timestamp: 10,
+          kind: 'tool',
+          toolName: 'grep',
+          toolCallId: toolCallId,
+          toolArguments: <String, dynamic>{'pattern': 'x'},
+          toolResult: toolResult,
+          toolResultForModel: toolResult,
+        ),
+      );
+      return store;
+    }
+
+    List<CoreMessageRef> historyWithFailedTool() => <CoreMessageRef>[
+      const CoreMessageRef(role: 'user', content: '做点事'),
+      const CoreMessageRef(
+        role: 'agent',
+        content: '',
+        kind: 'tool',
+        toolName: 'grep',
+        toolCallId: 'call_x',
+        toolArguments: <String, dynamic>{'pattern': 'x'},
+      ),
+      const CoreMessageRef(role: 'user', content: '本轮问题'),
+    ];
+
+    test('空结果 ⇒ 写回落库那份，并且本次请求用的就是失败信息', () async {
+      final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+        textScript('ok'),
+      ]);
+      final MemoryStore store = storeWithFailedTool();
+      final List<String> asked = <String>[];
+      final LlmAgentEngine e = engine(transport)
+        ..toolResultRepair =
+            ({
+              required String agentId,
+              required String sessionId,
+              required String toolCallId,
+              required String toolName,
+              required String result,
+            }) async {
+              asked.add('$toolCallId|$toolName');
+              return store.repairToolResult(
+                agentId,
+                sessionId,
+                toolCallId,
+                toolResult: result,
+                toolResultForModel: result,
+              );
+            };
+
+      await e
+          .run(
+            context(userContent: '本轮问题', history: historyWithFailedTool()),
+            isCancelled: () => false,
+          )
+          .toList();
+
+      expect(asked, <String>['call_x|grep']);
+      expect(
+        store.sessionMessages(agentId, sessionId).last.toolResult,
+        contains('【自动修复】'),
+        reason: '落库那份要真的被修好（不是只在送模型那份补一句）',
+      );
+      final LlmMessage tool = transport.requests.single.messages.firstWhere(
+        (LlmMessage m) => m.role == LlmRole.tool,
+      );
+      expect(tool.content, contains('【自动修复】'));
+      expect(
+        tool.content,
+        isNot(contains('(该工具调用未完成')),
+        reason: '不再是以前那句临时占位',
+      );
+    });
+
+    test('已有结果的卡不动；未接线时退回老占位（落库那份不动）', () async {
+      // 已有结果：不该麻烦修复落点
+      final FakeTransport withResult = FakeTransport(<List<LlmStreamEvent>>[
+        textScript('ok'),
+      ]);
+      int calls = 0;
+      final LlmAgentEngine e1 = engine(withResult)
+        ..toolResultRepair =
+            ({
+              required String agentId,
+              required String sessionId,
+              required String toolCallId,
+              required String toolName,
+              required String result,
+            }) async {
+              calls++;
+              return true;
+            };
+      await e1
+          .run(
+            context(
+              userContent: '本轮问题',
+              history: <CoreMessageRef>[
+                const CoreMessageRef(
+                  role: 'agent',
+                  content: '',
+                  kind: 'tool',
+                  toolName: 'grep',
+                  toolCallId: 'call_ok',
+                  toolResult: '工具结果在此',
+                  toolResultForModel: '工具结果在此',
+                ),
+                const CoreMessageRef(role: 'user', content: '本轮问题'),
+              ],
+            ),
+            isCancelled: () => false,
+          )
+          .toList();
+      expect(calls, 0);
+      final LlmMessage ok = withResult.requests.single.messages.firstWhere(
+        (LlmMessage m) => m.role == LlmRole.tool,
+      );
+      expect(ok.content, '工具结果在此');
+
+      // 未接线：老行为——送模型那份给占位（落库那份没人改）
+      final FakeTransport unwired = FakeTransport(<List<LlmStreamEvent>>[
+        textScript('ok'),
+      ]);
+      await engine(unwired)
+          .run(
+            context(userContent: '本轮问题', history: historyWithFailedTool()),
+            isCancelled: () => false,
+          )
+          .toList();
+      final LlmMessage placeholder = unwired.requests.single.messages
+          .firstWhere((LlmMessage m) => m.role == LlmRole.tool);
+      expect(placeholder.content, contains('(该工具调用未完成'));
+    });
+  });
+
   group('历史翻译', () {
     test('system 在最前，thinking 不回灌，空内容跳过', () async {
       final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[

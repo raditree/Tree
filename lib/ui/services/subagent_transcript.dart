@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 
 import '../models/message.dart';
+import '../models/subagent_roster.dart';
 
 /// 中栏消息流的**可见性口径**：临时员工（subagent）的消息**不进主消息流**。
 ///
@@ -29,12 +30,59 @@ class SubagentTranscript extends ChangeNotifier {
   /// 已经收进来的消息 id（合并语义的去重依据，见 [sync]）。
   final Set<String> _seen = <String>{};
 
+  /// **落盘名册**（id → 身份）：入口列表的**权威来源**（用户 2026-10-03
+  /// 「进入某个临时成员的选项经常会无端变化」）。
+  ///
+  /// 为什么要有它：`_byId` 是从**当前已加载的消息窗口**建的索引，而中栏窗口化只热
+  /// 视口附近（`lib/README.md` 不变量 19）——消息被淘汰，那个临时员工的入口就凭空
+  /// 消失。名册本身**早就落盘**（`data/<agentId>/<sessionId>/subagents.json`，
+  /// `store/README.md` 不变量 11），[setRoster] 把它接进来当权威来源。
+  ///
+  /// **跨会话不保留**：切 agent / 换会话时 [clear] 把名册层与消息层**一起**清掉。
+  final Map<String, SubagentRosterEntry> _roster = <String, SubagentRosterEntry>{};
+
   /// 某个临时员工的消息（**按时间顺序**；没有就是空表）。
   List<ChatMessage> of(String subagentId) =>
       List<ChatMessage>.unmodifiable(_byId[subagentId] ?? const <ChatMessage>[]);
 
-  /// 已知的临时员工 id（按第一次出现排序）。
-  List<String> get ids => List<String>.unmodifiable(_byId.keys);
+  /// 已知的临时员工 id：**名册里的（权威、稳定）在前**，消息流里观察到的补充在后
+  /// （同一 id 不重复；两段各自保持稳定顺序 ⇒ 下拉里的条目不会自己换位置）。
+  List<String> get ids => List<String>.unmodifiable(<String>[
+    ..._roster.keys,
+    for (final String id in _byId.keys)
+      if (!_roster.containsKey(id)) id,
+  ]);
+
+  /// 用**落盘名册**替换名册层（幂等）。
+  ///
+  /// 拉取失败时调用方**不要**调用它——保留上一次名册比清空更好（清空会让入口
+  /// 凭空变少，正是这次要修的症状）；消息流那条路仍然兜着观察到的 id。
+  void setRoster(Iterable<SubagentRosterEntry> entries) {
+    _roster
+      ..clear()
+      ..addEntries(
+        entries.map(
+          (SubagentRosterEntry e) => MapEntry<String, SubagentRosterEntry>(
+            e.id,
+            e,
+          ),
+        ),
+      );
+    notifyListeners();
+  }
+
+  /// 显示名：**名册优先**（消息还没加载 / 已被淘汰时也有正确名字），
+  /// 退回消息流里那条标记，最后退回空串（调用方自己给兜底文案）。
+  String nameOf(String subagentId) {
+    final String fromRoster = _roster[subagentId]?.name.trim() ?? '';
+    if (fromRoster.isNotEmpty) return fromRoster;
+    for (final ChatMessage message in of(subagentId)) {
+      if (message.subagentName.trim().isNotEmpty) {
+        return message.subagentName.trim();
+      }
+    }
+    return '';
+  }
 
   /// 用当前消息流**补全**分栏（幂等：同一批消息重复调用结果一致）。
   ///
@@ -72,23 +120,25 @@ class SubagentTranscript extends ChangeNotifier {
     required String ownerAgentId,
     required String ownerName,
   }) {
+    final SubagentRosterEntry? entry = _roster[subagentId];
     final List<ChatMessage> transcript = of(subagentId);
-    if (transcript.isEmpty) return '';
-    final String parentId = transcript.first.subagentParentId;
+    // 名册优先：消息还没加载（或已被淘汰）时也能说清"谁召来的"
+    final String parentId = entry != null
+        ? entry.parentId
+        : (transcript.isEmpty ? '' : transcript.first.subagentParentId);
     if (parentId.isEmpty) return '';
     if (parentId == ownerAgentId) return ownerName;
-    final List<ChatMessage> parent = of(parentId);
-    if (parent.isNotEmpty && parent.first.subagentName.isNotEmpty) {
-      return parent.first.subagentName;
-    }
-    return '';
+    return nameOf(parentId);
   }
 
   /// 清空（切 agent / 换会话 / 整表重拉时调用）。
   void clear() {
-    if (_byId.isEmpty && _seen.isEmpty) return;
+    if (_byId.isEmpty && _seen.isEmpty && _roster.isEmpty) return;
     _byId.clear();
     _seen.clear();
+    // 名册层与消息层**一起**清：名册是会话级的，「不跨会话保留」这条断言不能因为
+    // "多缓存了一份落盘数据"而破（切 agent / 换会话必须看到新会话自己的入口）。
+    _roster.clear();
     notifyListeners();
   }
 }

@@ -110,7 +110,10 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
             status == 'compacting') {
           _workingMembers.add(agentId);
         } else if (status == 'idle' || status == 'stopping') {
-          _workingMembers.remove(agentId);
+          // 主 agent 自己这一轮结束、名下的临时员工还在跑 ⇒ 成员仍算「工作中」：
+          // 聚合口径没变（用户 2026-10-03 的「主 agent 按钮不该变停止」只改**主视角**，
+          // 见 message_panel 的 `own_running` 口径）。
+          if (d['subagent_running'] != true) _workingMembers.remove(agentId);
         }
       });
     }
@@ -725,7 +728,9 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
             _working =
                 status == 'working' ||
                 status == 'updating_memory' ||
-                status == 'compacting';
+                status == 'compacting' ||
+                // 自己停了但名下的临时员工还在跑：这一行仍算「工作中」（聚合口径）
+                d['subagent_running'] == true;
           });
         }
         _refreshMember();

@@ -1,5 +1,6 @@
 import '../settings/core_settings.dart';
 import '../store/tree_store.dart';
+import '../tool/tool_run_registry.dart';
 import '../util/ids.dart';
 import 'team_model.dart';
 
@@ -27,6 +28,7 @@ class TeamService {
     this.isWorking,
     this.defaultWorkspaceDir,
     this.log,
+    this.toolRuns,
   });
 
   final TreeStore store;
@@ -46,6 +48,18 @@ class TeamService {
   final String Function(String agentId)? defaultWorkspaceDir;
 
   final void Function(String message)? log;
+
+  /// **运行中工具登记表**（`query_status.stuck_tools` 的数据源）。
+  ///
+  /// - **全局一份**：生产里 `TeamService` 由 CLI 组合根创建
+  ///   （`packages/tree_core_cli/bin/tree_core.dart`），那里不传本参数 ⇒ 默认回落到
+  ///   [ToolRunRegistry.instance]（进程级唯一、纯内存、**不跨核心重启存活**）；
+  /// - **可注入**：测试显式传入自己的实例（可注入小阈值与假时钟），
+  ///   断言"只有超阈值的在途工具才算卡住"。
+  final ToolRunRegistry? toolRuns;
+
+  /// 本服务实际使用的登记表：显式注入优先，否则进程级全局那一份。
+  ToolRunRegistry get _toolRuns => toolRuns ?? ToolRunRegistry.instance;
 
   /// team 工具支持的 action（未知 action 的错误文案用）。
   static const List<String> actions = <String>[
@@ -324,6 +338,19 @@ class TeamService {
     };
   }
 
+  /// 成员的实时状态（含**"卡在哪个工具上、怎么收手"**）。
+  ///
+  /// `stuck_tools` 只含**已超阈值**（[ToolRunRegistry.threshold]，默认 120 s）的**在途**
+  /// 工具，且**按被查成员过滤**（不是全库）；每项字段冻结为
+  /// `{handle, tool, elapsed_ms, command, hint}`：
+  /// - `handle`（`toolrun_…`）是显式收手的唯一凭据——右栏「正在执行的 tool」的关闭按钮
+  ///   与执行站 `tool.close` 走同一个实现；
+  /// - `stuck_tools[].hint` 是**防呆风险提示**（这条命令为什么会卡、怎么收手），
+  ///   与顶层 `hint`（成员日志路径，另一层口径）**不是一回事，别混**。
+  ///
+  /// 为什么需要它：工具执行没有静态上限，一条不返回的命令会让整批工具永不结束
+  /// （leader 眼中的"下级永久失联、且无日志"）——有了这个字段，leader 一眼就能看到
+  /// 下级卡在哪个工具上并给出关闭建议。
   Map<String, dynamic> queryStatus(String agentId, Map<String, dynamic> args) {
     final _Target? found = _resolve(agentId, args, action: 'query_status');
     if (found == null) return _lastError!;
@@ -335,6 +362,9 @@ class TeamService {
       'last_active_at': member.updatedAt,
       'log_path': memberLogPath(member.id),
       'hint': '日志路径相对该成员自己的工作空间；leader 可直接 read/grep 共享目录。',
+      'stuck_tools': <Map<String, dynamic>>[
+        for (final ToolRun run in _toolRuns.stuckFor(member.id)) run.stuckJson(),
+      ],
       'generated_at': _timestamp(),
     };
   }

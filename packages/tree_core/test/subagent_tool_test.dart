@@ -687,6 +687,148 @@ void main() {
     expect(roster(), isEmpty);
   });
 
+  group('停止临时员工：只停它自己（用户 2026-10-03）', () {
+    test('传 sub_… 只取消它自己那一轮：兄弟照跑，且不向发起者注入结束提示', () async {
+      // 复刻 CLI 接线：后台完成 ⇒ 报告注入父会话（onFinished → wake）
+      service.onFinished = (
+        String ownerAgentId,
+        String sessionId,
+        String notice,
+        SubagentTag tag,
+      ) {
+        unawaited(
+          conversation.wake(
+            agentId: ownerAgentId,
+            sessionId: sessionId,
+            notice: notice,
+            subagent: tag,
+          ),
+        );
+      };
+      engine.hold = true;
+      await callTool(<String, dynamic>{'task': '甲：干活', 'name': '甲', 'background': true});
+      await callTool(<String, dynamic>{'task': '乙：干活', 'name': '乙', 'background': true});
+      await waitUntil(() => engine.started.length == 2, description: '两个后台都开跑');
+      final String subA = roster().firstWhere((CoreSubagent s) => s.name == '甲').id;
+      final String subB = roster().firstWhere((CoreSubagent s) => s.name == '乙').id;
+      expect(conversation.activeRunCount, 2);
+
+      expect(conversation.cancelAgent(subA), isTrue, reason: '命中的是它自己那一轮');
+      expect(
+        conversation.isRunning(subB),
+        isTrue,
+        reason: '兄弟不受影响（运行键 = (subagentId, sessionId)，两两不同）',
+      );
+      engine.release(subA);
+      await waitUntil(
+        () => conversation.activeRunCount == 1,
+        description: '只有乙还在跑',
+      );
+      expect(roster(), hasLength(2), reason: '停止不移除名册条目（还能复用接着做）');
+
+      engine.releaseAll();
+      // 乙的完成报告会**唤醒父**再跑一轮（wake）：那一轮别再卡在闸门上
+      engine.hold = false;
+      await waitUntil(
+        () => store
+            .sessionMessages(owner.id, TreeStore.defaultSessionId)
+            .any(
+              (CoreMessage m) =>
+                  m.kind == MessageKinds.subagentReport &&
+                  m.subagentId == subB,
+            ),
+        description: '乙的完成报告已注入父会话',
+      );
+      await waitUntil(() => conversation.activeRunCount == 0, description: '都收干净');
+      final List<CoreMessage> all = store.sessionMessages(
+        owner.id,
+        TreeStore.defaultSessionId,
+      );
+      expect(
+        all.where(
+          (CoreMessage m) =>
+              m.kind == MessageKinds.subagentReport && m.subagentId == subA,
+        ),
+        isEmpty,
+        reason: '人叫停的不向发起者注入结束提示（用户自己会说原因）',
+      );
+      expect(
+        all.where(
+          (CoreMessage m) =>
+              m.kind == MessageKinds.subagentReport && m.subagentId == subB,
+        ),
+        hasLength(1),
+        reason: '乙是自然结束：报告照旧回发起者',
+      );
+    });
+
+    test('agent_status：子级帧不冒充主 agent；主 agent 自己收尾时单独说清', () async {
+      // 两个轮次都停在闸门上：父自己的轮次结束时，乙**仍然在跑**（聚合口径才成立）
+      engine.hold = true;
+      engine.holdFor.add(owner.id);
+      final Future<void> parentTurn = conversation.handleUserMessage(
+        <String, dynamic>{
+          'agent_id': owner.id,
+          'session_id': TreeStore.defaultSessionId,
+          'content': '父自己在跑',
+        },
+      );
+      await waitUntil(
+        () => engine.started.contains(owner.id),
+        description: '父那一轮已开始',
+      );
+      await callTool(<String, dynamic>{'task': '乙：干活', 'name': '乙', 'background': true});
+      await waitUntil(() => engine.started.length == 2, description: '临时员工也开跑');
+
+      Map<String, dynamic>? dataOf(Map<String, dynamic> frame) =>
+          (frame['data'] as Map<String, dynamic>?)?.cast<String, dynamic>();
+
+      // 主 agent 自己的 working 帧：带 own_running（主视角据此显示停止键）
+      expect(
+        hub.frames.any((Map<String, dynamic> f) {
+          final Map<String, dynamic>? d = dataOf(f);
+          if (f['type'] != 'agent_status' || d == null) return false;
+          return d['status'] == 'working' &&
+              d['agent_id'] == owner.id &&
+              d['own_running'] == true;
+        }),
+        isTrue,
+        reason: '主 agent 自己的轮次能被认出来（主视角据此显示停止键）',
+      );
+      // 子级帧：带 subagent_id、**不带** own_running（别让主视角跟着变）
+      expect(
+        hub.frames.any((Map<String, dynamic> f) {
+          final Map<String, dynamic>? d = dataOf(f);
+          if (f['type'] != 'agent_status' || d == null) return false;
+          return d['status'] == 'working' &&
+              d['subagent_id'] != null &&
+              !d.containsKey('own_running');
+        }),
+        isTrue,
+        reason: '临时成员的运行情况不应影响主 agent（用户 2026-10-03）',
+      );
+
+      engine.release(owner.id);
+      await parentTurn.timeout(const Duration(seconds: 10));
+      expect(
+        hub.frames.any((Map<String, dynamic> f) {
+          final Map<String, dynamic>? d = dataOf(f);
+          if (f['type'] != 'agent_status' || d == null) return false;
+          return d['status'] == 'idle' &&
+              d['agent_id'] == owner.id &&
+              d['own_running'] == false &&
+              d['subagent_running'] == true &&
+              d['subagent_id'] == null;
+        }),
+        isTrue,
+        reason: '主 agent 自己收尾必须单独说清（聚合口径：乙还在跑）',
+      );
+
+      engine.releaseAll();
+      await waitUntil(() => conversation.activeRunCount == 0, description: '收干净');
+    });
+  });
+
   test('没有文本产出 / 运行报错：都要可读，且运行态收干净', () async {
     engine.emptyReply = true;
     final ToolOutcome empty = await callTool(<String, dynamic>{'task': '只调工具'});

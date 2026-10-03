@@ -19,6 +19,29 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **临时员工的入口列表落盘；运行态与停止只作用在「当前视角那个人」身上**（[lib/README.md](lib/README.md) 不变量 20/21、
+  [agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 16、
+  [server/README.md](packages/tree_core/lib/src/server/README.md) 不变量 15，**用户断言 2026-10-03**：
+  「进入某个临时成员的选项经常会无端变化」+「临时成员的运行情况不应影响主 agent 运行情况……只有切到对应视角后才改停止按钮，
+  且仅停止对应临时成员」）：① 新增只读 `GET /api/agents/{agentId}/subagents?session_id=`（`ApiPaths.agentSubagents`）：
+  数据源就是那份落盘名册（`data/<agentId>/<sessionId>/subagents.json`，[store/README.md](packages/tree_core/lib/src/store/README.md) 不变量 11），
+  **不含** `agent` 运行配置快照；跨会话不保留照旧（只回该会话、删会话即随之消失，不新增任何跨会话存储）。
+  前端 `SubagentTranscript` 多一层名册：入口 = 名册（权威、稳定）∪ 消息流观察到的，名字与「谁召来的」名册优先；
+  拉取失败**不清空**（保留上一次）；切 agent / 换会话时名册层与消息层**一起**清。
+  ② `agent_status` 的加法键 `own_running` / `subagent_running`：只有**主 agent 自己**的帧带 `own_running`，
+  子级帧靠 `subagent_id` 区分（不冒充主 agent）；「自己收尾了、名下临时员工还在跑」时**照样发一条**
+  （`own_running: false` + `subagent_running: true`）——以前这种时刻什么都不发，主视角的停止键就一直亮着。
+  ③ `stop` 传 `sub_…` ⇒ `cascade: false`：只停它自己（父 / 兄弟 / 其他成员 / 团队都不受影响），
+  停止回执与补推的 `idle` 都带它自己的帧标记（前端只收它那一份「工作中」）。
+- **结果永远拿不到的工具卡：引擎在把关处自动修复**（[agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 15、
+  [llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 6、[store/README.md](packages/tree_core/lib/src/store/README.md) 消息口径，
+  **用户口径 2026-10-03**：「在引擎的把关处，失败时自动修复」）：历史里 `kind=tool` 且 `tool_result` 为空的卡
+  = 那次调用被停止 / 异常 / 核心重启收尾（结果**永远拿不到**；正在跑的调用不在历史里，不会误伤）⇒
+  引擎组装工具批时把失败信息**写回同一张卡**（幂等、不新增消息：`tool_call_id` 不能重复）并把这份失败信息
+  用于本次请求；写回走注入的 `ToolResultRepair`（引擎不认识存储层），核心接到 `ConversationService.repairToolResult`：
+  存储层写回 + 补一条 `tool_end` 帧（界面把那张一直"运行中"的卡填成失败）。未接线 = 老行为（只在送模型那份补一句占位）。
+  顺带：`ToolRunRegistry` 的 warning / `stuck_tools` 阈值 **120 s → 300 s**（与 terminal 的缺省软超时同值——
+  "warning / stuck_tools / 转后台 hook"三件事在同一秒数上一起发生）。
 - **核心日志有唯一出口，且永不抛、永不阻塞**（新增
   [util/README.md](packages/tree_core/lib/src/util/README.md) 不变量 8、
   [tree_core_cli/README.md](packages/tree_core_cli/README.md) 不变量 1 补充）：

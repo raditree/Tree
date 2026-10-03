@@ -636,8 +636,9 @@ void main() {
         File('lib/ui/widgets/file_panel.dart').readAsStringSync();
     final String page = File('lib/ui/pages/main_page.dart').readAsStringSync();
 
-    test('FilePanel 多出第 5 个内置页签「详情」', () {
-      expect(panel.contains('static const int _builtinTabCount = 5;'), isTrue);
+    test('FilePanel 多出第 6 个内置页签「详情」（新增「正在执行的 tool」后仍是最后一页）', () {
+      expect(panel.contains('static const int _builtinTabCount = 6;'), isTrue);
+      expect(panel.contains("const Tab(text: '正在执行的 tool')"), isTrue);
       expect(panel.contains("const Tab(text: '详情')"), isTrue);
       // 详情页要带上工作空间：edit 的「变更」得读一次当前文件才有上下文（用户 2026-10-04）
       expect(panel.contains('DetailPanel('), isTrue);

@@ -92,6 +92,10 @@ typedef StationSessionRenamer =
       required String title,
     });
 
+/// `tool.close` 的**关闭一次运行中的工具**入口（核心注入；与右栏"关闭"按钮、
+/// ToolRunRegistry.close 是同一个实现）。
+typedef StationToolCloser = Future<Map<String, dynamic>> Function(String handle);
+
 /// 执行站命令的挂载位置集合（M9 Wave 3-I）。
 ///
 /// 站点体系里「执行器只是执行站的一种挂载位置」：本类就是**系统内置挂载位置**，
@@ -131,6 +135,7 @@ class ExecuteStationMounts {
     this.llmCaller,
     this.toolCaller,
     this.sessionRenamer,
+    this.toolCloser,
     this.log,
   }) : _injectedHooks = hooks;
 
@@ -150,6 +155,7 @@ class ExecuteStationMounts {
     StationLlmCaller? llmCaller,
     StationToolCaller? toolCaller,
     StationSessionRenamer? sessionRenamer,
+    StationToolCloser? toolCloser,
     void Function(String message)? log,
   }) => ExecuteStationMounts(
     ioFor: ioFor,
@@ -173,6 +179,7 @@ class ExecuteStationMounts {
     llmCaller: llmCaller,
     toolCaller: toolCaller,
     sessionRenamer: sessionRenamer,
+    toolCloser: toolCloser,
     log: log,
   );
 
@@ -209,6 +216,10 @@ class ExecuteStationMounts {
 
   /// `session.rename`（会话重命名）入口；null = 该命令显式报「未接线」。
   final StationSessionRenamer? sessionRenamer;
+
+  /// `tool.close`（**显式**关闭一次运行中的工具）入口；null = 该命令显式报
+  /// 「未接线」——**不做静默降级**（不假装"已经关掉了"）。
+  final StationToolCloser? toolCloser;
 
   final void Function(String message)? log;
 
@@ -306,6 +317,8 @@ class ExecuteStationMounts {
           return await _toolCall(context, target);
         case 'session.rename':
           return await _sessionRename(context, target);
+        case 'tool.close':
+          return await _toolClose(context, target);
         default:
           return StationCommandOutcome.failed('命令 $command 尚无挂载实现');
       }
@@ -793,6 +806,49 @@ class ExecuteStationMounts {
       'relayed': relay,
       'agent_id': target.agentId,
       'session_id': sessionId,
+    });
+  }
+
+  /// `tool.close`：**显式**关闭一次正在运行的"工具"。
+  ///
+  /// 参数：`handle`（工具运行句柄，形如 `toolrun_…`；当前在跑的可用
+  /// `GET /api/tools/running` 取）。
+  ///
+  /// 语义要点（用户定稿，plan §10 D2/D3/D5）：
+  /// - **显式干预**：工具超过阈值（默认 120 s）只发 warning，**核心不自动杀**——
+  ///   关闭必须由调用方显式发起（右栏"关闭"按钮 / 本命令 / `ToolRunRegistry.close`
+  ///   是**同一个**实现），避免误杀长任务；
+  /// - 关闭的含义 = **尽力终止该次运行的进程树**（本地 `taskkill /T`、远端杀该会话
+  ///   的进程组）+ **把这次运行从登记表移除** + **让在途工具调用收敛**（回一段可读
+  ///   结果，不再等它返回）；进程是否真被终止由关闭器如实写在 `note` 里；
+  /// - **fail-closed**：句柄缺失 / 失效（纯内存登记表，核心重启即清空）一律是
+  ///   **命令失败 + 可读原因**，绝不假装成功；未接线同样显式报「未接线」。
+  Future<StationCommandOutcome> _toolClose(
+    StationCommandContext context,
+    _StationTarget target,
+  ) async {
+    final StationToolCloser? closer = toolCloser;
+    if (closer == null) {
+      return const StationCommandOutcome.failed(
+        'tool.close 未接线：核心未注入工具运行关闭器',
+      );
+    }
+    final String handle = _string(context.arguments['handle']);
+    if (handle.isEmpty) {
+      return const StationCommandOutcome.failed(
+        'tool.close 需要 handle（工具运行句柄，形如 toolrun_…；'
+        '可用 GET /api/tools/running 取当前在跑的）',
+      );
+    }
+    final Map<String, dynamic> result = await closer(handle);
+    final Object? error = result['error'];
+    if (error != null && error.toString().isNotEmpty) {
+      // 句柄失效等一律是**命令失败** + 可读原因（不静默降级成"关掉了"）
+      return StationCommandOutcome.failed(error.toString());
+    }
+    return StationCommandOutcome.ok(<String, dynamic>{
+      ...result,
+      'agent_id': target.agentId,
     });
   }
 

@@ -633,6 +633,23 @@ class CoreSubagent {
     'updated_at': JsonTime.encode(updatedAt),
   };
 
+  /// **前端名册视图**（\`GET /api/agents/{agentId}/subagents\` 的一项）。
+  ///
+  /// 只带"入口列表 + 身份标注"需要的字段，键名与 [toJson] 一致；**不含** \`agent\`
+  /// ——那是一整份运行配置快照，名册接口没理由把它发给前端。
+  Map<String, dynamic> toRosterJson() => <String, dynamic>{
+    'id': id,
+    'name': name,
+    'owner_agent_id': ownerAgentId,
+    'session_id': sessionId,
+    'parent_id': parentId,
+    'level': level,
+    'scope': scope,
+    'run_count': runCount,
+    'created_at': JsonTime.encode(createdAt),
+    'updated_at': JsonTime.encode(updatedAt),
+  };
+
   static CoreSubagent fromJson(Map<String, dynamic> json) {
     final int now = DateTime.now().millisecondsSinceEpoch;
     final Object? rawAgent = json['agent'];

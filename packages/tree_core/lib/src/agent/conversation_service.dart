@@ -162,7 +162,7 @@ class ConversationService {
     }
     // 压缩的过程提示（重试进度）也走会话：落一条 llm_hidden 的消息，用户看得见、模型看不到
     if (compaction != null) {
-      compaction!.noticeSink = _sendHiddenNotice;
+      compaction!.noticeSink = sendHiddenNotice;
     }
   }
 
@@ -485,6 +485,56 @@ class ConversationService {
     interruptedRunCount++;
   }
 
+  /// **自动修复落点**（引擎在把关处发现"结果永远拿不到"的工具卡时调用；
+  /// 见 [ToolResultRepair] 与 `LlmAgentEngine._repairMissingToolResult`）。
+  ///
+  /// 做两件事：① 把失败信息写回**同一张**卡（存储层幂等：已有结果 / 找不到卡 ⇒ 不写）；
+  /// ② 播一条 `tool_end` 帧——正在看这个会话的界面会把那张一直显示"运行中"的卡
+  /// 填成失败（不播就得等下次重载历史才看得到）。返回是否真的改了。
+  Future<bool> repairToolResult({
+    required String agentId,
+    required String sessionId,
+    required String toolCallId,
+    required String toolName,
+    required String result,
+  }) async {
+    final bool wrote = store.repairToolResult(
+      agentId,
+      sessionId,
+      toolCallId,
+      toolResult: result,
+      toolResultForModel: result,
+    );
+    if (!wrote) return false;
+    CoreMessage? card;
+    for (final CoreMessage message in store.sessionMessages(
+      agentId,
+      sessionId,
+    )) {
+      if (message.isTool && message.toolCallId == toolCallId) {
+        card = message;
+        break;
+      }
+    }
+    if (card != null) {
+      hub.broadcast(<String, dynamic>{
+        'type': WsOutboundType.toolEnd,
+        'id': card.id,
+        'name': card.toolName ?? toolName,
+        'result': result,
+        'agent_id': agentId,
+        'session_id': sessionId,
+        // 临时员工的卡：标记照旧带上（前端据此归组，别让它冒充主 agent）
+        if (card.subagentId.isNotEmpty) 'subagent_id': card.subagentId,
+        if (card.subagentName.isNotEmpty) 'subagent_name': card.subagentName,
+        if (card.subagentParentId.isNotEmpty)
+          'subagent_parent_id': card.subagentParentId,
+        if (card.subagentLevel > 0) 'subagent_level': card.subagentLevel,
+      });
+    }
+    return true;
+  }
+
   /// 中止全部在途生成（服务器关闭时）。
   void dispose() {
     for (final _RunToken token in _running.values) {
@@ -608,6 +658,11 @@ class ConversationService {
         'agent_id': ownerId,
         'status': 'working',
         if (subagent != null) ...subagent.frameFields,
+        // `own_running` 只出现在**主 agent 自己**的帧上（子级帧靠 `subagent_id`
+        // 区分）：true = 这个 agent 自己在跑。界面据此决定主视角的发送/停止键——
+        // 临时员工在跑不该把主视角变成停止键（用户 2026-10-03）。**加法**新键，
+        // 既有键的语义一个字没改。
+        if (subagent == null) 'own_running': true,
       },
     });
 
@@ -961,6 +1016,25 @@ class ConversationService {
           'agent_id': ownerId,
           'status': 'idle',
           if (subagent != null) ...subagent.frameFields,
+          // 「这个 agent 自己不再跑了」——与 working 帧同口径的加法键。
+          // 子级帧不带它（那不是关于它自己的结论）。
+          if (subagent == null) 'own_running': false,
+          if (subagent == null) 'subagent_running': false,
+        },
+      });
+    } else {
+      // **主 agent 自己的这一轮结束了，但它名下的临时员工还在跑**：以前这里什么都
+      // 不发（聚合口径靠 [isRunning] 继续算 working），于是主视角的停止键一直亮着
+      // ——用户 2026-10-03：「主 agent 的消息按钮不应变为停止按钮」。按 `own_running`
+      // 口径补一条：主 agent 自己不再跑（主视角换回发送键），而「还在干活」由
+      // `subagent_running: true` 表达（团队名单那类消费者据此继续显示 working）。
+      hub.broadcast(<String, dynamic>{
+        'type': WsOutboundType.agentStatus,
+        'data': <String, dynamic>{
+          'agent_id': ownerId,
+          'status': 'idle',
+          'own_running': false,
+          'subagent_running': true,
         },
       });
     }
@@ -1621,12 +1695,12 @@ class ConversationService {
     notify();
   }
 
-  /// 按 id 发一条 `llm_hidden` 的**过程提示**（压缩重试进度这类）。
+  /// 按 id 发一条 `llm_hidden` 的**过程提示**（压缩重试进度、工具运行超阈值这类）。
   ///
   /// 与 [_sendNotice] 的关系：那个要持有对象（生成路径手上就有）；这条是给"手里只有
-  /// id"的接线方用的（例如 [CompactionService.noticeSink]——压缩发生在引擎回调里，
-  /// 谁都不知道当下是哪个对象）。对象找不到就静默丢弃：提示丢了不影响压缩本身。
-  void _sendHiddenNotice(String agentId, String sessionId, String text) {
+  /// id"的接线方用的（例如 [CompactionService.noticeSink]、工具运行登记表的 warning
+  /// 落点——`ToolRunRegistry.notice`）。对象找不到就静默丢弃：提示丢了不影响它本身。
+  void sendHiddenNotice(String agentId, String sessionId, String text) {
     final CoreAgent? agent = store.agent(agentId);
     if (agent == null) return;
     final CoreSession? session = store.session(agentId, sessionId);
