@@ -368,15 +368,28 @@ void main() {
     test('低于阈值不动，超过阈值才压', () async {
       addTurn('一');
       addTurn('二');
+      // 估算里含**系统提示词**（它随产品演进变长）⇒ 预算按"当前估算"给，别假设提示词有多小：
+      // 先给 4 倍（阈值 0.5 ⇒ 上限 = 当前估算 × 2），"低于阈值"这一前提才是自证的。
+      final int base = service.estimateContextTokens(agent, session);
+      agent.maxSeqlenOverride = base * 4;
+      store.putAgent(agent);
+      final int limit =
+          (service.maxSeqlenFor(agent).value * service.thresholdFor(agent))
+              .round();
+      expect(service.estimateContextTokens(agent, session), lessThan(limit));
       expect(await service.autoCompact(agent, session), isNull);
-      // 填到明显超过 0.5 × 1000 token
-      for (int i = 0; i < 40; i++) {
+
+      // 自适应填到明显超过阈值（不再写死条数：写死的条数会在提示词变长时失真）
+      int i = 0;
+      while (service.estimateContextTokens(agent, session) <= limit &&
+          i < 500) {
         add('user', '需求$i ${repeated('内容', 30)}');
         add('agent', '回答$i ${repeated('内容', 30)}');
+        i++;
       }
       expect(
         service.estimateContextTokens(agent, session),
-        greaterThan((1000 * service.thresholdFor(agent)).round()),
+        greaterThan(limit),
       );
       final CompactionResult? result = await service.autoCompact(
         agent,
@@ -502,6 +515,9 @@ void main() {
       addTurn('一');
       addTurn('二');
       addTurn('三');
+      // 估算含系统提示词 ⇒ 预算按当前估算给足，"远低于阈值"这一前提才成立
+      agent.maxSeqlenOverride = service.estimateContextTokens(agent, session) * 4;
+      store.putAgent(agent);
       expect(
         await service.autoCompact(agent, session),
         isNull,

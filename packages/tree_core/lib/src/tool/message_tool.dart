@@ -26,7 +26,8 @@ abstract final class MessageTool {
         '系统不会替你回传任何总结：需要对方知道结果，必须让对方自行 send_message 回发；'
         '禁止仅为确认收到/寒暄/复述而互发。\n'
         'files 为本 agent 工作空间内的相对路径，会复制到接收方 .input/<日期>/'
-        '（可用 dest_dir 指定目录）。',
+        '（可用 dest_dir 指定目录）；**只在本机工作空间之间可用**——发送方或接收方的工作空间在远端（SSH）'
+        '时不投递，结果里会明确回一句"未投递"（跨机请改用共享位置，或让工作空间在本机的那条线帮你推过去）。',
     parameters: <String, dynamic>{
       'type': 'object',
       'properties': <String, dynamic>{
@@ -55,7 +56,7 @@ abstract final class MessageTool {
         'files': <String, dynamic>{
           'type': 'array',
           'items': <String, dynamic>{'type': 'string'},
-          'description': 'send_message 可选：本 agent 工作空间内的相对路径',
+          'description': 'send_message 可选：本 agent 工作空间内的相对路径（**仅本机工作空间之间可用**：任一侧是 SSH 就不投递，会明确回一句"未投递"）',
         },
         'dest_dir': <String, dynamic>{
           'type': 'string',

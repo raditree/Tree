@@ -19,6 +19,16 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **SSH 那条线怎么拿到完整记录：找本机那条线代查；`message` 的附件只在本机工作空间之间可用**
+  （[team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 10 补充与 15、
+  [workspace_prompt.dart](packages/tree_core/lib/src/agent/workspace_prompt.dart)、[docs/team.md](docs/team.md) §6）：
+  ① 系统提示词的工作空间软约束**按模式**写明：`activity.log` **不是完整记录**（只有
+  `[start]/[done]/[error]/[blocked]/[stale]` 这类生命周期行，写回时还会截断——够判断"谁在动、卡在哪"，
+  不够复盘"到底做了什么"）；**SSH 那条线**（工作空间在远端）看不到本机、日志也在远端，要完整查询就用
+  `message send_message` 找**工作空间在本机**的团队代查，并可请它用**自己的终端**（`scp` / `rsync` 之类）
+  把**原文件推到远端**；**本机那条线**照做，并把结论或落地的远端路径回给对方。
+  ② `message` 的 `files` 附件**只在本机工作空间之间可用**：任一侧是 SSH 就不投递、
+  明确回一句"未投递"，消息本身照常送达（工具描述里的 `files` 参数同步写清这条边界，免得模型以为跨机能带附件）。
 - **Tree 在"带着 RedirectionGuard"启动时会自愈重启；安装器改经 shell 启动**
   （[docs/architecture.md](docs/architecture.md) §13 不变量 11、`docs/known-issues.md` #16，
   **用户断言 2026-10-03**：「这是 known-issue 好像，上一轮修复没修好吗」）：

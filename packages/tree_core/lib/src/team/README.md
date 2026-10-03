@@ -30,6 +30,7 @@
 8. **派发没有任何静态超时**；判活点是链路心跳台账。失活期间 **fail-closed**：不落库、不触发生成、直接以**显式错误**拒绝（原因含「心跳丢失」），同时把这条消息登记进**待补发队列**，重连 / 心跳恢复后补发——所以不静默丢消息。为什么不是"先投递再补发"：`deliver` 会**先**把消息写进成员会话再触发生成，补发会产生重复消息；fail-closed 同时避免了"落了库但成员永远看不到"的静默假成功。
 9. `wait_for` 的活性结论：`unknown`（没有活性信息）**不判死**，只有 `lost`（心跳丢失）才收口——避免把"还没开始跑"当成"已经死了"。
 10. 活动日志经 agent **自己的工作空间 IO** 读写（SSH 成员因此写在远端），写入按 agent 串行（读回 → 追加 → 写回），超 512 KB 只保留最近 400 行并记一行截断标记（日志是过程记录，不当事实源）。
+    **SSH 模式下日志在远端，而完整记录仍在本机**（数据根里的会话消息日志 `data/<agent>/<session>/messages.jsonl`）⇒ 系统提示词按模式写明"要完整查询 / 要原文件就发消息找**工作空间在本机**的团队代查、代推"（[../agent/workspace_prompt.dart](../agent/workspace_prompt.dart)）。
 11. 名单接口返回的成员视图是**字段白名单**，绝不包含 `system_prompt`（否则提示词会泄漏给整棵树）；只有 `query_member` / `update_member` 才额外返回它。
 12. **悬空指针必须被兜住——删除 agent 的团队后果有两条规则**（[test/team_repair_test.dart](../../../test/team_repair_test.dart) 与 [test/agent_delete_api_test.dart](../../../test/agent_delete_api_test.dart) 强制）：
     ① **删除路径与 team 工具同规则**：`DELETE /api/agents/{id}` 有下级时必须显式 `?cascade=1`（否则 409 + `cascade_required`），
@@ -63,6 +64,13 @@
     （左栏红点 / teammates 入口角标）——TOP 数整队、成员只数自己的下属。此前这个参数**从没被赋值**（恒 0），
     `docs/team.md` 却写着「未就绪成员会在 leader 上显示红点」，于是那排红点永远不会亮；现在面板与徽章由
     同一个 `_rosterOf` 决定，不会出现「面板是空的、红点却亮着」。
+
+15. **`message` 的附件只在本机工作空间之间可用**（[test/message_dispatcher_test.dart](../../../test/message_dispatcher_test.dart) 强制）：
+    投递走的是本机 `File.copy`（发送方工作空间 → 接收方 `.input/<日期>/`，越界路径 / 超过 32 MB 不复制并如实回 `files_failed`）；
+    **任一侧的工作空间在远端（SSH）时不投递**——结果里回一句「未投递：文件投递仅支持本机工作空间的成员，SSH 成员请改用其远端路径」，
+    消息本身照常送达（不静默、也**不**复制到本机某个无关目录）。跨机搬原文件目前只能靠**工作空间在本机的那条线**
+    用自己的终端（`scp` / `rsync` 之类）推过去；底层其实已有 SFTP 的二进制通路
+    （`WorkspaceFiles.readBytes` / `writeBytes`），只是 `_copyFiles` 还没接上它。
 
 ## 测试
 

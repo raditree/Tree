@@ -60,6 +60,29 @@ void main() {
       expect(text, contains('不要自行收窄'));
     });
 
+    test('activity.log 不是事实源；SSH 那条线要完整查询就找本机团队（附件只在本机可用）', () {
+      final String local = workspacePromptSuffix(makeAgent());
+      expect(local, contains('activity.log'));
+      expect(local, contains('不是完整记录'));
+      expect(local, contains('本机数据根'));
+      expect(local, contains('代查'));
+      expect(local, isNot(contains('你这条线在远端')), reason: '本机那条线不谈"远端看不到本机"');
+
+      final CoreAgent remote = makeAgent();
+      remote.sshConfig = const SshConfig(
+        host: '192.168.0.208',
+        username: 'open',
+        keyPath: '/home/me/.ssh/id_ed25519',
+      );
+      final String text = workspacePromptSuffix(remote);
+      expect(text, contains('你这条线在远端'));
+      expect(text, contains('完整记录在本机'));
+      expect(text, contains('message send_message'));
+      expect(text, contains('本地团队'));
+      expect(text, contains('只在本机工作空间之间可用'), reason: '别让模型以为附件能跨 SSH');
+      expect(text, contains('scp'));
+    });
+
     test('追加不覆盖用户自己的提示词；空/空白提示词只留约束段', () {
       final CoreAgent agent = makeAgent()..systemPrompt = '你是助手。';
       final String appended = systemPromptWithWorkspace(agent);

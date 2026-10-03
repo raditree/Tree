@@ -246,6 +246,53 @@ void main() {
     expect(read['path'], '.self/activity.log');
   });
 
+  test('SSH 模式：附件不投递（明确回一句"未投递"，消息照常送达、不复制到无关目录）', () async {
+    final String ready = member(approved: true);
+    final List<Map<String, String>> got = <Map<String, String>>[];
+    final TeamMessageDispatcher remote = TeamMessageDispatcher(
+      store: store,
+      teams: teams,
+      deliver:
+          ({
+            required String agentId,
+            required String sessionId,
+            required String content,
+            String senderId = '',
+            String senderName = '',
+          }) {
+            got.add(<String, String>{'agentId': agentId, 'content': content});
+            return Future<void>.value();
+          },
+      // 与 CLI 接线同口径：teamSshConfigFor 非空 ⇒ workspaceDirOf 给空串（远端拿不到本机目录）
+      workspaceDirOf: (String _) => '',
+      ioFor: (String id) async =>
+          PrivateWorkspaceIO(LocalWorkspaceIO(p.join(temp.path, id)), id),
+      startGrace: const Duration(milliseconds: 40),
+      pollInterval: const Duration(milliseconds: 10),
+    );
+    Directory(p.join(temp.path, top.id, 'docs')).createSync(recursive: true);
+    File(p.join(temp.path, top.id, 'docs', 'a.txt')).writeAsStringSync('hello');
+
+    final Map<String, dynamic> result = await remote.run(
+      top.id,
+      <String, dynamic>{
+        'action': 'send_message',
+        'target_member_id': ready,
+        'message': '看附件',
+        'files': <String>['docs/a.txt'],
+      },
+    );
+
+    expect(result['status'], 'sent', reason: '附件投不进去，消息本身照样要送到');
+    expect(got.single['agentId'], ready);
+    expect(got.single['content'], contains('未投递'), reason: '必须如实说清附件没送到');
+    expect(
+      Directory(p.join(temp.path, ready, '.input')).existsSync(),
+      isFalse,
+      reason: '不许悄悄复制到本机某个无关目录',
+    );
+  });
+
   test('未接工作空间 IO：退回本机绝对路径 + AtomicFile（兜底不回归）', () async {
     final String ready = member(approved: true);
     final TeamMessageDispatcher localFallback = TeamMessageDispatcher(

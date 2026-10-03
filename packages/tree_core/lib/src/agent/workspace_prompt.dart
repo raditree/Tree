@@ -71,6 +71,26 @@ String workspacePromptSuffix(CoreAgent agent) {
         ? '本机默认工作目录 `workspaces/$ownerId`（Tree 数据根目录之下）'
         : '本机目录 `$dir`';
   }
+  // 活动日志的边界与"跨 SSH 找本机那条线"的路径**按模式**给（用户 2026-10-03 指示）：
+  // 本机 agent 的 terminal 跑在本机，能读本机数据根（完整记录）与绝对路径 ⇒ 它是 SSH
+  // 那条线的代查/转发入口；反过来 SSH agent 看不到本机，只能发消息请它代查。
+  final String remoteNote = ssh != null
+      ? '- **你这条线在远端，看不到本机**：`.self/activity.log` 也写在远端那台机器上；'
+            '**完整记录在本机**（本机数据根默认 `%APPDATA%\\Tree`，可由 `TREE_HOME` / `--data-dir` 改；'
+            '会话消息日志是 `data/<agent>/<session>/messages.jsonl`）——你够不着。\n'
+            '- **要完整查询就借本机那条线**：用 `message send_message` 把要查的东西'
+            '（agent id / 会话 / 时间范围 / 关键词）发给**工作空间在本机的 team**（"本地团队"，'
+            '它的 terminal 跑在本机），请它代查，并在消息里明确要它把结论回给你。\n'
+            '- **要原文件也直接在消息里要**：写明哪几份、放到你这台主机的哪个目录，'
+            '请本地团队用**它自己的终端**推过来（`scp` / `rsync` 之类，或按你们约定的共享位置）。'
+            '注意 `message` 的 `files` 附件**只在本机工作空间之间可用**——任一侧在远端会明确回一句'
+            '"未投递"，别指望它。'
+      : '- **本机这条线能代查、也能转发文件**：你的 terminal 跑在本机，能读本机数据根'
+            '（默认 `%APPDATA%\\Tree`，可由 `TREE_HOME` / `--data-dir` 改）、会话消息日志'
+            '`data/<agent>/<session>/messages.jsonl` 与本机绝对路径。SSH 那边的同事需要完整记录或要原文件时，'
+            '会发消息请你**代查**、或把**原文件推到远端**（用 `scp` / `rsync` 之类，或按约定放共享位置）；'
+            '照做，并把结论或落地的远端路径回给对方。';
+
   return '''
 ## 工作空间（软约束）
 
@@ -78,7 +98,9 @@ String workspacePromptSuffix(CoreAgent agent) {
 - **你的私有状态目录**：`${privateSelfDir(agent.id)}`。文件工具里写 `.self/xxx`（规范与工具提示里的写法）会自动落到这里，两种写法都可用；**terminal 命令不经过这层翻译**，要在终端里访问私有状态请直接用这条真实路径。
 - 根之下通常是**混合布局**：数据文件与项目文件可能分处不同子目录（例如 `data/` 与 `proj/`），也可能混着缓存与临时文件。请按用户当前的指示在正确的子目录里操作，不要假定目标文件一定在根目录下。
 - 不要自行收窄工作范围：用户没有明确限制时，你可以在根下任意位置读写；只有用户明确说"只动某个目录"时才限制。反过来，也不要把根当成只读展示区。
-- 布局不确定时先用 list/grep 看一眼，不要凭猜测拼路径。''';
+- 布局不确定时先用 list/grep 看一眼，不要凭猜测拼路径。
+- **`activity.log` 不是完整记录**：每个 agent 的 `.self/activity.log`（真实路径 `.tree/<agent_id>/.self/activity.log`）只有生命周期摘要（`[start]/[done]/[error]/[blocked]/[stale]`），写回时**还会截断**（更早的条目并成一行提示）——它够判断"谁在动、卡在哪"，不够复盘"到底做了什么"；要复盘得查完整记录。
+$remoteNote''';
 }
 
 /// Spec 索引段（Q9）：索引文本来自 [specIndexProvider] 或调用方显式传入的 [explicit]。
