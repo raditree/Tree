@@ -19,7 +19,10 @@ import 'package:tree/ui/widgets/tool_call_card.dart';
 ChatMessage toolMessage({
   String id = 't1',
   String name = 'read',
-  Map<String, dynamic> args = const <String, dynamic>{'path': 'lib/main.dart'},
+  // 参数键名按核心工具 schema 写（builtin_tools.dart 的 read/write/edit 都用
+  // file_path，不是 path）——臆想的键名取不到参数，行正文与行尾增量都会是空的。
+  Map<String, dynamic> args =
+      const <String, dynamic>{'file_path': 'lib/main.dart'},
   String result = '',
   bool running = false,
 }) =>
@@ -95,21 +98,82 @@ void main() {
       expect(find.byType(SelectableText), findsNothing);
     });
 
-    testWidgets('编辑类工具行尾给行数增量', (WidgetTester tester) async {
+    testWidgets('编辑类工具行尾给行数增量（键名按核心 schema）',
+        (WidgetTester tester) async {
       await pumpRow(
         tester,
         toolMessage(
           name: 'edit',
           args: const <String, dynamic>{
-            'path': 'a.dart',
-            'old_string': 'old1\nold2',
-            'new_string': 'new1\nnew2\nnew3',
+            'file_path': 'a.dart',
+            'old_text': 'old1\nold2',
+            'new_text': 'new1\nnew2\nnew3',
           },
         ),
       );
 
       expect(find.text('编辑'), findsOneWidget);
+      expect(find.text('a.dart'), findsOneWidget, reason: '行正文取 file_path');
       expect(find.text('+3 -2'), findsOneWidget);
+    });
+
+    testWidgets('edit 单行替换 ⇒ +1 -1', (WidgetTester tester) async {
+      await pumpRow(
+        tester,
+        toolMessage(
+          name: 'edit',
+          args: const <String, dynamic>{
+            'file_path': '.self/memory.md',
+            'old_text': '旧的一行',
+            'new_text': '新的一行',
+          },
+        ),
+      );
+
+      expect(find.text('+1 -1'), findsOneWidget);
+    });
+
+    testWidgets('write ⇒ +N（整段内容行数），行尾没有 - 一侧',
+        (WidgetTester tester) async {
+      await pumpRow(
+        tester,
+        toolMessage(
+          name: 'write',
+          args: const <String, dynamic>{
+            'file_path': 'notes/todo.md',
+            'content': '第一行\n第二行\n',
+          },
+        ),
+      );
+
+      expect(find.text('+2'), findsOneWidget);
+      expect(find.textContaining('-'), findsNothing, reason: 'write 没有减号一侧');
+    });
+
+    testWidgets('取不到参数时行尾不显示 +0 -0（只显示能确定的一侧或什么都不显示）',
+        (WidgetTester tester) async {
+      // 参数缺失（老键名 / 被截断）：宁可什么都不显示
+      await pumpRow(
+        tester,
+        toolMessage(
+          name: 'edit',
+          args: const <String, dynamic>{'file_path': 'a.dart'},
+        ),
+      );
+      expect(find.text('+0 -0'), findsNothing);
+      expect(find.textContaining('+0'), findsNothing);
+      expect(find.textContaining('-0'), findsNothing);
+
+      // 只拿到旧文本：只显示 -N
+      await pumpRow(
+        tester,
+        toolMessage(
+          name: 'edit',
+          args: const <String, dynamic>{'old_text': 'l1\nl2\nl3'},
+        ),
+      );
+      expect(find.text('-3'), findsOneWidget);
+      expect(find.textContaining('+'), findsNothing);
     });
 
     testWidgets('运行中的工具行给进度圈', (WidgetTester tester) async {
@@ -170,9 +234,9 @@ void main() {
         toolMessage(
           name: 'edit',
           args: const <String, dynamic>{
-            'path': 'lib/team/team_service.dart',
-            'old_string': '旧的一段',
-            'new_string': '新的一段',
+            'file_path': 'lib/team/team_service.dart',
+            'old_text': '旧的一段',
+            'new_text': '新的一段',
           },
           result: '{"content": "改完了，共 1 处"}',
         ),
@@ -187,8 +251,12 @@ void main() {
 
       expect(find.text('调用参数'), findsOneWidget);
       expect(find.text('执行结果'), findsOneWidget);
-      expect(hasSelectableText(tester, 'lib/team/team_service.dart'), isTrue);
-      expect(hasSelectableText(tester, '新的一段'), isTrue);
+      expect(hasSelectableText(tester, 'lib/team/team_service.dart'), isTrue,
+          reason: '「文件」取 file_path');
+      expect(hasSelectableText(tester, '旧的一段'), isTrue,
+          reason: '「查找」取 old_text');
+      expect(hasSelectableText(tester, '新的一段'), isTrue,
+          reason: '「替换」取 new_text');
       expect(hasSelectableText(tester, '改完了，共 1 处'), isTrue,
           reason: '结果要走可读字段，不是原始 JSON');
       expect(DetailSelection.instance.selectedId, 't1');
@@ -249,7 +317,15 @@ void main() {
       expect(toolLabel(''), '工具');
     });
 
-    test('一行正文取最关键参数，grep 把搜索词与路径都带上', () {
+    test('一行正文取最关键参数（read/write/edit 用核心的 file_path），grep 带搜索词与路径',
+        () {
+      expect(
+        toolLineValue(toolMessage(
+          name: 'read',
+          args: const <String, dynamic>{'file_path': 'lib/main.dart'},
+        )),
+        'lib/main.dart',
+      );
       expect(
         toolLineValue(toolMessage(
           name: 'grep',
@@ -271,14 +347,94 @@ void main() {
       );
     });
 
-    test('增量只给编辑/写入，且按行数算', () {
+    test('增量只给编辑/写入，并直接吃真实核心 schema 的键名', () {
+      // 下面两个 map 就是核心 builtin_tools.dart 里 edit / write 的 invocation JSON：
+      // edit 在 176-194 行（file_path / old_text / new_text / replace_all），
+      // write 在 162-169 行（file_path / content）。
+      const Map<String, dynamic> editInvocation = <String, dynamic>{
+        'file_path': '.self/memory.md',
+        'old_text': '第一行\n第二行',
+        'new_text': '换成一行',
+        'replace_all': false,
+      };
+      expect(toolDiffStat('edit', editInvocation), '+1 -2');
+
+      const Map<String, dynamic> writeInvocation = <String, dynamic>{
+        'file_path': 'notes/todo.md',
+        'content': '第一行\n第二行\n',
+      };
+      expect(toolDiffStat('write', writeInvocation), '+2');
+
+      // 臆想的键名（别的生态的 path/old_string/new_string）不是数据来源
       expect(
-        toolDiffStat('edit', <String, dynamic>{'old_string': 'a', 'new_string': 'b\nc'}),
-        '+2 -1',
+        toolDiffStat('edit', <String, dynamic>{
+          'path': 'a.dart',
+          'old_string': 'a',
+          'new_string': 'b\nc',
+        }),
+        isNull,
       );
-      expect(toolDiffStat('write', <String, dynamic>{'content': 'a\nb'}), '+2');
+      expect(toolDiffStat('write', <String, dynamic>{'path': 'a'}), isNull);
+      expect(toolDiffStat('read', <String, dynamic>{'file_path': 'x'}), isNull);
       expect(toolDiffStat('write', <String, dynamic>{'content': ''}), isNull);
-      expect(toolDiffStat('read', <String, dynamic>{'path': 'x'}), isNull);
+    });
+
+    test('edit 的加减两侧：单行 +1 -1，三行换两行 +2 -3', () {
+      expect(
+        toolDiffStat('edit', <String, dynamic>{
+          'old_text': '同一行',
+          'new_text': '也是同一行',
+        }),
+        '+1 -1',
+      );
+      expect(
+        toolDiffStat('edit', <String, dynamic>{
+          'old_text': 'l1\nl2\nl3',
+          'new_text': 'n1\nn2',
+        }),
+        '+2 -3',
+      );
+      // 三行删成空串 = 有效编辑：+0 -3（两侧都给参数时保持 +A -B 格式）
+      expect(
+        toolDiffStat('edit', <String, dynamic>{
+          'old_text': 'l1\nl2\nl3',
+          'new_text': '',
+        }),
+        '+0 -3',
+      );
+    });
+
+    test('缺参数时不给增量（不显示 +0 -0），只给一侧时只显示那一侧', () {
+      expect(toolDiffStat('edit', null), isNull);
+      expect(toolDiffStat('edit', const <String, dynamic>{}), isNull);
+      expect(toolDiffStat('edit', const <String, dynamic>{'file_path': 'a.dart'}),
+          isNull);
+      expect(
+        toolDiffStat('edit', const <String, dynamic>{'old_text': 'l1\nl2'}),
+        '-2',
+      );
+      expect(toolDiffStat('edit', const <String, dynamic>{'new_text': 'n1'}), '+1');
+      expect(
+        toolDiffStat('edit',
+            const <String, dynamic>{'old_text': '', 'new_text': ''}),
+        isNull,
+      );
+      expect(toolDiffStat('write', const <String, dynamic>{'file_path': 'x'}), isNull);
+      expect(toolDiffStat('write', null), isNull);
+      expect(toolDiffStat('terminal', const <String, dynamic>{'cmd': 'ls'}), isNull);
+    });
+
+    test('行数口径与核心 LineSplitter 一致：末尾换行不多算、空行照算', () {
+      expect(countTextLines(''), 0);
+      expect(countTextLines('a'), 1);
+      expect(countTextLines('a\n'), 1);
+      expect(countTextLines('a\nb'), 2);
+      expect(countTextLines('a\n\nb'), 3);
+      expect(countTextLines('a\n\n'), 2);
+      expect(countTextLines('\n'), 1);
+      expect(countTextLines('a\r\nb\r\n'), 2);
+      expect(countTextLines('a\rb'), 2);
+      expect(countTextLines('a\r'), 1);
     });
 
     test('思考摘要：去 markdown 标记、压空白、超长截断', () {

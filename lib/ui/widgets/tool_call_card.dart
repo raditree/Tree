@@ -172,7 +172,8 @@ String toolLineValue(ChatMessage m) {
     case 'read':
     case 'write':
     case 'edit':
-      return arg('path');
+      // 核心 schema 的键名是 file_path（不是 path），见 builtin_tools.dart 的 read/write/edit
+      return arg('file_path');
     case 'grep': {
       final String pattern = arg('pattern');
       final String path = arg('path');
@@ -219,26 +220,81 @@ String toolLineValue(ChatMessage m) {
 
 /// 编辑类工具的行尾增量（+39 -0）。
 ///
-/// 按**行数**算，只为一眼看出这一笔改了多少；不是 git 那种精确 diff（工具参数里
-/// 只有整段新旧文本），所以数字跟"实际新增行"可能有出入，但足以分辨改一行还是
-/// 重写整个文件。其它工具返回 null（不占位）。
+/// 数据来源只有一个：**assistant 这次工具调用的参数**里的新旧两段文本。核心 `edit`
+/// 的结果只有「已替换 N 处」，没有行数，不能当行数来源（也不必去解析结果文本）。
+///
+/// 参数键名以核心工具 schema 为准（packages/tree_core/lib/src/tool/builtin_tools.dart：
+/// write 在 162-169 行、edit 在 176-194 行）：
+/// - `edit`：`file_path` / `old_text`（详情页标签「查找」）/ `new_text`（「替换」）
+/// - `write`：`file_path` / `content`
+/// 这里曾经写成 `path` / `old_string` / `new_string`（别的生态的键名），于是每次
+/// 编辑都取不到参数、行尾恒显示 `+0 -0`——键名必须与核心对齐。
+///
+/// 行数口径见 [countTextLines]（与核心 `_write` 用的 `LineSplitter` 一致）。
+///
+/// 取不到必要参数（历史消息里的旧格式、非编辑类工具、参数被模型截断）时返回 null：
+/// 行尾宁可什么都不显示，也不显示误导的 `+0 -0`。只拿到一侧时只报告能确定的
+/// 那一侧——只有 `old_text` ⇒ `-3`、只有 `new_text` ⇒ `+2`。
 String? toolDiffStat(String name, Map<String, dynamic>? args) {
   final Map<String, dynamic> a = args ?? <String, dynamic>{};
-  int lines(String text) => text.isEmpty ? 0 : text.split('\n').length;
 
   switch (name) {
     case 'edit': {
-      final int added = lines((a['new_string'] ?? '').toString());
-      final int removed = lines((a['old_string'] ?? '').toString());
+      final String oldText = _argText(a, 'old_text');
+      final String newText = _argText(a, 'new_text');
+      // 空 old_text 不可能是真的「查找」（核心要求唯一匹配），按"没给"处理；
+      // new_text 故意允许空串——那是删除整段，是有效的一次编辑。
+      final bool hasOld = oldText.isNotEmpty;
+      final bool hasNew = a.containsKey('new_text');
+      if (!hasOld && !hasNew) return null;
+      final int removed = hasOld ? countTextLines(oldText) : 0;
+      final int added = hasNew ? countTextLines(newText) : 0;
+      if (added == 0 && removed == 0) return null;
+      if (!hasNew) return '-$removed';
+      if (!hasOld) return '+$added';
       return '+$added -$removed';
     }
     case 'write': {
-      final int added = lines((a['content'] ?? '').toString());
+      if (!a.containsKey('content')) return null;
+      final int added = countTextLines(_argText(a, 'content'));
       return added == 0 ? null : '+$added';
     }
     default:
       return null;
   }
+}
+
+/// 文本的行数口径——与核心 `_write` 的 `LineSplitter` 完全一致。
+///
+/// - 空串 = 0 行；
+/// - **末尾换行符不算多一行**：`"a"` 与 `"a\n"` 都是 1 行；
+/// - 空行照算：`"a\n\nb"` = 3 行；
+/// - LF / CRLF / CR 同权：`"a\r\nb\r\n"` = 2 行。
+///
+/// 为什么不用 `split('\n').length`：那会把末尾的 `\n` 算成多一个空行，于是"写入
+/// 3 行文本（末尾带换行）"会显示 `+4`，与核心结果里的「已写入 …（N 字节，3 行）」
+/// 对不上。
+int countTextLines(String text) {
+  if (text.isEmpty) return 0;
+  int lines = 1;
+  for (int i = 0; i < text.length; i++) {
+    final int c = text.codeUnitAt(i);
+    if (c == 0x0A) {
+      lines++;
+    } else if (c == 0x0D) {
+      lines++;
+      if (i + 1 < text.length && text.codeUnitAt(i + 1) == 0x0A) i++;
+    }
+  }
+  final int last = text.codeUnitAt(text.length - 1);
+  if (last == 0x0A || last == 0x0D) lines--;
+  return lines;
+}
+
+/// 参数里的字符串值；键不存在时给空串（"没给"要另外判 `containsKey`）。
+String _argText(Map<String, dynamic> args, String key) {
+  final dynamic value = args[key];
+  return value == null ? '' : value.toString();
 }
 
 /// 结果的单行摘要（把换行压成空格）
@@ -402,18 +458,19 @@ class ToolDetail extends StatelessWidget {
     String arg(String key) => (args[key] ?? '').toString();
     switch (name) {
       case 'read':
-        return <Widget>[_paramRow(context, '文件', arg('path'))];
+        return <Widget>[_paramRow(context, '文件', arg('file_path'))];
       case 'write':
         final int length = arg('content').length;
         return <Widget>[
-          _paramRow(context, '文件', arg('path')),
+          _paramRow(context, '文件', arg('file_path')),
           _paramRow(context, '内容长度', '$length 字符'),
         ];
       case 'edit':
+        // 键名与核心 edit schema 对齐（builtin_tools.dart:176-194）
         return <Widget>[
-          _paramRow(context, '文件', arg('path')),
-          _paramRow(context, '查找', _truncate(arg('old_string'), 400)),
-          _paramRow(context, '替换', _truncate(arg('new_string'), 400)),
+          _paramRow(context, '文件', arg('file_path')),
+          _paramRow(context, '查找', _truncate(arg('old_text'), 400)),
+          _paramRow(context, '替换', _truncate(arg('new_text'), 400)),
         ];
       case 'terminal':
         final String cmd = arg('cmd').isEmpty ? arg('command') : arg('cmd');
