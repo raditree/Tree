@@ -63,6 +63,20 @@ class CoreProcessLauncher {
   /// 本次连接的核心握手信息；未启动成功时为 null。
   CoreHandshake? get handshake => _handshake;
 
+  /// 核心进程的**数据根目录**（握手里的可选字段；拿不到时为空串）。
+  ///
+  /// 为什么应用侧要这个：核心把日志落在 `<数据根>/logs/core.log`，而应用侧
+  /// **没有**别的权威来源——拉起核心时不传 `--data-dir`，环境变量也可能没设。
+  /// 老核心不给该字段（或附着模式下连的是外部核心）时返回空串，调用方据此
+  /// 退回"没有日志入口"而**不是**猜一个 `%APPDATA%\Tree`。
+  String get coreDataRoot => _handshake?.dataRoot ?? '';
+
+  /// 核心日志文件路径（`<数据根>/logs/core.log`）；拿不到数据根时为空串。
+  String get coreLogFile {
+    final String root = coreDataRoot;
+    return root.isEmpty ? '' : p.join(root, 'logs', 'core.log');
+  }
+
   /// 是否为附着模式（复用外部已启动的核心）。
   bool get isAttached => _attached;
 

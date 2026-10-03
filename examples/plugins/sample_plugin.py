@@ -53,7 +53,9 @@
 核心 → 插件：
   - 请求（带 id）：hello（握手，params 里带 plugin_id）/ tools/list / tools/call /
     station/request（站点请求：收集站采集 / 中转站拦截 / 广播站通知）/ ping（心跳）；
-  - 通知（无 id）：event（总线事件，本插件关心 agent.tool_call）/
+  - 通知（无 id）：event（总线事件：本插件关心 agent.tool_call；**面板动作也走它**——
+    `{"method":"event","params":{"event":"plugin_ui_action", slot_key, action_id,
+    payload}}`，判据在 `params.event` 上，别判 `method`）/
     station/cancel（**下行**：我接管的 LLM 流该收了）/ shutdown（退出）。
 
 插件 → 核心（宿主按**报文形状**分三类，顺序即优先级）：
@@ -115,6 +117,9 @@ METHOD_STATION_STREAM = "station/stream"
 METHOD_UI_MANIFEST = "ui/manifest"
 METHOD_UI_UPDATE = "ui/update"
 EVENT_TOOL_CALL = "agent.tool_call"
+#: **面板按钮回调的事件名**。判据在 `params.event` 上（核心把前端动作包成
+#: `method:"event"` 的通知，与 `agent.tool_call` 同一范式）——判 `method` 会永远不命中。
+EVENT_UI_ACTION = "plugin_ui_action"
 PHASE_START = "start"
 PHASE_END = "end"
 
@@ -1580,13 +1585,22 @@ class SamplePlugin(object):
 
     def _on_notification(self, method, params):
         if method == "event":
+            # ⚠ **先判 `params.event`**：核心把 UI 动作也包成 `event` 通知
+            # （`{"method":"event","params":{"event":"plugin_ui_action",…}}`，
+            #  与 `agent.tool_call` 同一范式）。先转 `_on_event` 会被它当"非
+            #  tool_call 事件"丢掉，面板按钮就成了"点了没反应"。
+            if params.get("event") == EVENT_UI_ACTION:
+                self._on_ui_action(params)
+                return
             self._on_event(params)
             return
         if method == "station/cancel":
             # **下行通知**（无 id）：我接管的 LLM 流该收了 —— 只标状态，推流线程自己停
             self._on_station_cancel(params)
             return
-        if method == "plugin_ui_action":
+        if method == EVENT_UI_ACTION:
+            # 裸 `method == "plugin_ui_action"` 的形态（老核心 / 直连测试）：
+            # 兼容留着——否则老核心配新插件时按钮依然是"点了没反应"。
             # 用户在插件面板上点了按钮 / 提交了表单（前端 → 核心 → 插件）。
             # 核心只透传 slot_key / action_id / payload，语义由插件自己解释；
             # 惯例是**再推一帧 ui/update** 把槽位刷新。
@@ -1609,8 +1623,9 @@ class SamplePlugin(object):
         if action_id == "push_card":
             self.push_card(force=True)
             return
-        # 未知 action：显式记下来（不静默），但不算错误
-        self.log("未知的面板动作（忽略）：%s" % action_id)
+        # 未知 action：显式记下来（不静默），但不算错误。**走 log 通知**：
+        # 前端能看见——否则用户点了没反应、日志也没人看（这条链路以前就是这么"静默"的）。
+        self.log("未知的面板动作（忽略）：%s" % action_id, notify=True)
 
     def serve(self):
         """读循环（主线程）：按形状分三类——响应 / 请求 / 通知。"""
@@ -2095,6 +2110,20 @@ class SelftestCase(object):
         reply = (response.get("result") or {}).get("reply") or {}
         return reply.get("payload")
 
+    def wait_notification(self, core, method, since=0, timeout=3.0):
+        """等插件**发出**的一条通知（method 匹配），返回报文；超时返回 None。
+
+        [since] 传"动作发送前的 `len(core.inbound)`"：旧报文不该被算成本次的结果，
+        否则用例会在"插件其实没反应"时假通过（这正是这条链路以前的样子）。
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for message in core.inbound[since:]:
+                if message.get("method") == method:
+                    return message
+            time.sleep(0.01)
+        return None
+
     # ── 用例实现 ─────────────────────────────────────────────────────────
 
     def body(self, core, plugin):
@@ -2117,6 +2146,8 @@ class SelftestCase(object):
             self.case_prompt_system(core, plugin)
         elif name == "tool 广播订阅":
             self.case_broadcast(core, plugin)
+        elif name == "面板动作回传":
+            self.case_ui_action(core, plugin)
         else:
             self.failures.append("未知用例 %s" % name)
 
@@ -2424,6 +2455,69 @@ class SelftestCase(object):
         self.note("广播点位：%s；计数 total=%d pre=%d post=%d"
                   % (sorted(points), total, pre, post))
 
+    def case_ui_action(self, core, plugin):
+        """面板按钮回传：**核心发的是 `event` 通知**（判据在 `params.event` 上）。
+
+        这条链路以前是断的：本插件当时判 `method == "plugin_ui_action"`，而核心实际发
+        `{"method":"event","params":{"event":"plugin_ui_action",…}}` ⇒ 面板按钮"点了没
+        反应"（而它的兄弟分支 `_on_event` 还会把这个事件当"非 tool_call 事件"丢掉）。
+        所以这里把两种形态都喂一遍，断言插件**发出了一帧 `ui/update`**——那是"处理过"
+        的唯一证据（动作是单向通知，核心不解释语义、也没有回执）。
+        """
+        if not self.handshake(core, plugin):
+            return
+        core.settle(timeout=0.5)
+        slot_key = "%s.activity.1" % plugin.plugin_id
+
+        # ① 线上真实形状：event 通知 + params.event == "plugin_ui_action"
+        before = len(core.inbound)
+        core.notify("event", {
+            "event": EVENT_UI_ACTION,
+            "plugin_id": plugin.plugin_id,
+            "team_id": "team-1",
+            "agent_id": "agt_demo",
+            "session_id": "ses_demo",
+            "slot_key": slot_key,
+            "action_id": "refresh",
+            "payload": {},
+        })
+        update = self.wait_notification(core, METHOD_UI_UPDATE, before)
+        self.check(update is not None,
+                   "event 形态的面板动作没被处理（判据必须是 params.event，不是 method）")
+        if update is not None:
+            params = update.get("params") or {}
+            self.check(params.get("slot_key") == slot_key,
+                       "刷新的不是面板槽位：%r" % params.get("slot_key"))
+            self.check(isinstance(params.get("view"), dict),
+                       "ui/update 没带 view（整块替换必须有视图）：%r" % params)
+            self.note("面板动作回传（event 形态）：刷新了 %s" % params.get("slot_key"))
+
+        # ② 老核心 / 直连测试的形态：裸 method=plugin_ui_action 同样要处理
+        before2 = len(core.inbound)
+        core.notify(EVENT_UI_ACTION, {"action_id": "refresh", "slot_key": ""})
+        self.check(self.wait_notification(core, METHOD_UI_UPDATE, before2) is not None,
+                   "裸 method=plugin_ui_action 的形态没兼容（老核心点按钮会没反应）")
+
+        # ③ 无关事件不该被误当成面板动作（判据放宽不能宽到把 tool_call 也吃进去）
+        before3 = len(core.inbound)
+        core.notify("event", {"event": EVENT_TOOL_CALL, "agent_id": "agt_demo",
+                              "session_id": "ses_demo", "call_id": "call_x",
+                              "tool": "read", "phase": PHASE_END, "round": 1})
+        self.check(self.wait_notification(core, METHOD_UI_UPDATE, before3, timeout=0.5)
+                   is None, "非面板事件不该触发面板刷新")
+        # 未知 action 不刷面板、但要留在日志里（不静默）
+        before4 = len(core.inbound)
+        core.notify("event", {"event": EVENT_UI_ACTION, "action_id": "不存在的动作",
+                              "slot_key": slot_key, "payload": {}})
+        self.check(self.wait_notification(core, METHOD_UI_UPDATE, before4, timeout=0.5)
+                   is None, "未知 action 不该刷新面板")
+        self.check(any("不存在的动作" in line for line in core.logs),
+                   "未知 action 必须留日志（不静默）：%s" % core.logs[-3:])
+        # 按钮回调是**单向**的：全程不该冒出响应报文（核心没发请求过来）
+        self.check(not [m for m in core.inbound[before:]
+                        if m.get("id") is not None and m.get("method") is None],
+                   "面板动作是通知：插件不该回响应")
+
 
 def _selftest(argv, out=None):
     """跑全部自测用例；返回进程退出码（0 = 全通）。"""
@@ -2454,6 +2548,8 @@ def _selftest(argv, out=None):
         SelftestCase("session.rename 构造", shared + agent + ["--rename-session"]),
         SelftestCase("prompt.system 改写", shared + ["--relay-prompt"], agent_id="agt_demo"),
         SelftestCase("tool 广播订阅", shared + ["--watch-tools"], agent_id="agt_demo"),
+        # 面板动作回传：**不带 --no-panel**（本用例要的就是面板槽位 + 它的刷新帧）
+        SelftestCase("面板动作回传", ["--no-fs-demo"], agent_id="agt_demo"),
     ]
     failed = 0
     for case in cases:

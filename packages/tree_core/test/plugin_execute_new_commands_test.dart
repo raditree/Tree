@@ -77,6 +77,7 @@ void main() {
           ? null
           : ({
               required String agentId,
+              required String sessionId,
               List<Object?>? messages,
               String? prompt,
               String? system,

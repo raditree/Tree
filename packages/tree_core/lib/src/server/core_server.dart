@@ -30,7 +30,9 @@ import '../spec/builtin_spec_assets.dart';
 import '../spec/spec_service.dart';
 import '../store/memory_store.dart';
 import '../store/subagent_registry.dart';
+import '../store/tree_paths.dart';
 import '../store/tree_store.dart';
+import '../store/usage_log.dart';
 import '../team/message_dispatcher.dart';
 import '../team/team_model.dart';
 import '../team/team_repair.dart';
@@ -96,6 +98,7 @@ class CoreServer {
     required this.reassembler,
     required this.version,
     this.llmJsonCaller,
+    this.usageLog,
     this.ptyStarter,
     this.sshPtyStarter,
   }) {
@@ -242,6 +245,14 @@ class CoreServer {
   /// 只有 CLI 手上的东西（与 [AgentEngine] / [CompactionService] 同一个理由）。
   final LlmJsonCaller? llmJsonCaller;
 
+  /// **逐调用用量账本**（`<会话目录>/usage.jsonl`）；null = 不落账。
+  ///
+  /// 这里只负责 `source=llm.call` 那一类：核心替插件发出去的调用，账要落在**核心的
+  /// 会话目录**里才"事后可核对"。绑定按**每次调用**做（`usageLog.sinkFor(sessionId)`）
+  /// ——站点调用是并发的，共享可变状态会让 A 的账落到 B 的会话上。
+  /// 对话跳（`turn`）/ 压缩（`compact`）各有自己的落账口（引擎 / `CompactionService`）。
+  final UsageLog? usageLog;
+
   /// 会话级**临时员工**名册；为 null 时本实例不认临时员工（测试/最小骨架）。
   final SubagentRegistry? subagents;
 
@@ -356,6 +367,7 @@ class CoreServer {
     SubagentRegistry? subagents,
     TerminalHooks? stationHooks,
     LlmJsonCaller? llmJsonCaller,
+    UsageLog? usageLog,
     PtyStarter? ptyStarter,
     SshPtyStarter? sshPtyStarter,
   }) async {
@@ -405,6 +417,7 @@ class CoreServer {
       agentBackup: agentBackup,
       compaction: compaction,
       llmJsonCaller: llmJsonCaller,
+      usageLog: usageLog,
       ptyStarter: ptyStarter,
       sshPtyStarter: sshPtyStarter,
       hub: hub,
@@ -678,15 +691,49 @@ class CoreServer {
       engine.llmRequestRewriter = bus.relayLlmRequest;
       engine.systemPromptRelay = bus.relaySystemPrompt;
     }
-    conversation.compaction?.relayHook = bus.relayCompaction;
+    final CompactionService? compactionService = conversation.compaction;
+    if (compactionService != null) {
+      compactionService.relayHook = bus.relayCompaction;
+      // 「中转站为什么没接管」的回程：总线每处"不接管"分支 → 压缩结论
+      // （REST 可选键 `relay_skip_reason` / 会话里的压缩提示），不再只进 stderr。
+      bus.compactionSkipSink = compactionService.noteRelaySkip;
+    }
+    // **逐调用用量**（`<会话目录>/usage.jsonl`）：插件读不到数据根（它的 `fs.read`
+    // 只在工作空间作用域内），而"这次压缩花了多少 token / 内置兜底那次花了多少"
+    // 只有这份账本知道 ⇒ 核心在压缩中转载荷里捎上**最近 N 行**（`usage_file` +
+    // `recent_usage`）。读不到 / 未接线 ⇒ 载荷里不带这两个键（用量是遥测，绝不
+    // 阻塞或干扰压缩；`relayCompaction` 那边也会再兜一层异常）。
+    final UsageLog? ledger = usageLog;
+    if (ledger != null) {
+      final TreePaths paths = ledger.paths;
+      bus.usageRecentProvider = (String agentId, String sessionId) async {
+        final UsageHistory history = await UsageLog.read(
+          paths,
+          agentId,
+          sessionId,
+        );
+        return PluginUsageRecent(
+          path: paths.usageFile(agentId, sessionId),
+          // `UsageCall.toJson()` 就是 `usage.jsonl` 的行形状（字段表的唯一出处），
+          // 不要在别处另拼一份键——插件面板照它消费。
+          calls: <Map<String, dynamic>>[
+            for (final UsageCall call in history.calls) call.toJson(),
+          ],
+        );
+      };
+    }
   }
 
   /// 执行站 `llm.call`：用目标 agent 的模型发一次**硬设 JSON 返回形式**的调用。
   ///
   /// agent 的 modelId 在核心侧解析（`store.agent(...).modelId`），模型池与成员级
   /// 覆盖由注入的 [llmJsonCaller] 负责——**与对话完全同一条解析路径**。
+  ///
+  /// [sessionId] 只用于**逐调用用量账本**的分文件（[usageLog]）。按调用绑定 sink：
+  /// 站点调用是并发的，共享可变状态会串账。
   Future<Map<String, dynamic>> _stationLlmCall({
     required String agentId,
+    required String sessionId,
     List<Object?>? messages,
     String? prompt,
     String? system,
@@ -713,6 +760,7 @@ class CoreServer {
       temperature: temperature,
       maxTokens: maxTokens,
       tools: tools,
+      usageSink: usageLog?.sinkFor(sessionId),
     );
   }
 
@@ -855,6 +903,7 @@ class CoreServer {
           'status': result.status,
         };
       }
+      _notifyManualCompact(agentId, sessionId, result);
       return result.toJson();
     } finally {
       _broadcastCompactStatus(
@@ -863,6 +912,28 @@ class CoreServer {
         conversation.isRunning(agentId) ? 'working' : 'idle',
       );
     }
+  }
+
+  /// **手动压缩的结论通知**（REST `/compact` 与执行站 `agent.compact` 共用一条口径）。
+  ///
+  /// 压动了就落一条 `llm_hidden` 的会话消息（用户看得见、模型看不到、刷新后仍在）：
+  /// 手动压缩的 SnackBar 一刷新就没了，而"这次压缩走了哪条路 / 插件为什么没接管"
+  /// 恰恰是事后才想核对的东西。文案口径只有一处——[ConversationService.notifyCompactionResult]。
+  ///
+  /// 没压动（`too_few_messages` 等）不落库：那是"无事发生"，SnackBar 已经说清。
+  void _notifyManualCompact(
+    String agentId,
+    String sessionId,
+    CompactionResult result,
+  ) {
+    if (!result.compressed) return;
+    // 结果里的 sessionId 是压缩服务**实际用的**那个（body 没给 session_id 时它兜底到
+    // 默认会话），优先用它，避免通知落到别的会话里。
+    conversation.notifyCompactionResult(
+      agentId,
+      result.sessionId.isNotEmpty ? result.sessionId : sessionId,
+      result,
+    );
   }
 
   // ── 请求分发 ─────────────────────────────────────────────────────────
@@ -1256,6 +1327,7 @@ class CoreServer {
         await writeJson(request, result.status, errorBody(result.error));
         return;
       }
+      _notifyManualCompact(agentId, sessionId, result);
       await writeJson(request, 200, result.toJson());
     } finally {
       _broadcastCompactStatus(

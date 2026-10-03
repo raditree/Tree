@@ -66,6 +66,7 @@ class _Summarizer implements ContextSummarizer {
     CoreAgent agent,
     String prompt, {
     void Function(String notice)? onNotice,
+    UsageSink? usageSink,
   }) async {
     calls++;
     if (delay > Duration.zero) await Future<void>.delayed(delay);

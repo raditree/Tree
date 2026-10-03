@@ -10,6 +10,7 @@ import '../../io/tray_service.dart';
 import '../services/code_highlight.dart';
 import '../services/editor_settings.dart';
 import '../theme_service.dart';
+import '../widgets/core_log_card.dart';
 
 /// 设置页面（desktop 分支：账号/等级/密码/后端地址/注销 五组设置已删除）
 ///
@@ -449,6 +450,10 @@ class _SettingsPageState extends State<SettingsPage> {
           _buildSectionTitle('插件开发'),
           const SizedBox(height: 8),
           _buildPluginDevCard(),
+          const SizedBox(height: 24),
+          _buildSectionTitle('核心日志'),
+          const SizedBox(height: 8),
+          const CoreLogCard(),
           const SizedBox(height: 24),
           _buildSectionTitle('新手引导'),
           const SizedBox(height: 8),

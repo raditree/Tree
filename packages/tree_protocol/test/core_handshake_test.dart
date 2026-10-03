@@ -64,6 +64,42 @@ void main() {
       expect(restored!.host, '127.0.0.1');
       expect(restored.port, 8080);
     });
+
+    test('可选 data_root：带上时往返一致（前端据此给出日志入口）', () {
+      final CoreHandshake withRoot = handshake.withDataRoot(
+        r'C:\Users\someone\AppData\Roaming\Tree',
+      );
+      expect(withRoot.dataRoot, r'C:\Users\someone\AppData\Roaming\Tree');
+      expect(withRoot.toJson()['data_root'], withRoot.dataRoot);
+      // withDataRoot 只补数据根，其余字段逐字不变（含 host）
+      expect(withRoot.port, handshake.port);
+      expect(withRoot.token, handshake.token);
+      expect(withRoot.pid, handshake.pid);
+      expect(withRoot.version, handshake.version);
+      expect(withRoot.host, handshake.host);
+
+      final CoreHandshake? restored = CoreHandshake.decode(withRoot.encode());
+      expect(restored, isNotNull);
+      expect(restored!.dataRoot, withRoot.dataRoot);
+    });
+
+    test('可选 data_root：老核心不给 ⇒ 空串且不报错（新前端退回"没有日志入口"）', () {
+      // 老核心的原始行（没有 data_root 键）
+      final CoreHandshake? old = CoreHandshake.decode(
+        '{"event":"ready","host":"127.0.0.1","port":1234,"token":"t",'
+        '"pid":9,"version":"0.0.0"}',
+      );
+      expect(old, isNotNull);
+      expect(old!.dataRoot, isEmpty);
+      // 空数据根不写该键：新核心在拿不到数据根时的输出与旧形状逐字一致
+      expect(old.toJson().containsKey('data_root'), isFalse);
+      // 非字符串的脏值也不许炸（只当没有）
+      final CoreHandshake? dirty = CoreHandshake.decode(
+        '{"event":"ready","port":1234,"token":"t","data_root":42}',
+      );
+      expect(dirty, isNotNull);
+      expect(dirty!.dataRoot, isEmpty);
+    });
   });
 
   group('分帧参数', () {

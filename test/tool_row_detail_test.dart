@@ -87,6 +87,49 @@ void main() {
   setUp(DetailSelection.instance.clear);
 
   group('临时员工（subagent）工具行', () {
+    testWidgets('详情页摊开**完整 task**：长任务不再打省略号（右侧详情就是看全文的地方）',
+        (WidgetTester tester) async {
+      // 撑到 400 字以上（旧口径正好在那里截断加「…」），并保留真实 subagent 任务书里常见的换行
+      final String longTask = List<String>.generate(
+        12,
+        (int i) =>
+            '第 ${i + 1} 段：这一段是为了把 task 撑到 400 字以上，并保留真实任务书里常见的换行与分点，'
+            '以便验证详情页确实摊开了全文而不是截断。',
+      ).join('\n');
+      expect(longTask.length, greaterThan(400),
+          reason: '必须超过旧的截断线（400 字），否则这条用例测不到东西');
+      await pumpRowWithDetail(
+        tester,
+        toolMessage(
+          id: 'sub1',
+          name: 'subagent',
+          args: <String, dynamic>{
+            'task': longTask,
+            'subagent_id': 'sub_1791018557990_6bdd4c_6da',
+          },
+          // 注意：不能给 running: true —— 卡片在转圈，`pumpAndSettle` 永远不会 settle。
+        ),
+      );
+
+      await tester.tap(find.byType(ToolCallCard));
+      await tester.pumpAndSettle();
+
+      expect(find.text('调用参数'), findsOneWidget);
+      expect(hasSelectableText(tester, longTask), isTrue,
+          reason: '详情页要给全文（用户 2026-10-03：「subagent 的工具调用详情的 task 过长会打省略号'
+              '（在现在的右侧查看详情的设计下，没必要省略了）」）');
+      expect(
+        hasSelectableText(tester, '${longTask.substring(0, 400)}…'),
+        isFalse,
+        reason: '旧的"400 字 + 省略号"截断必须消失',
+      );
+      expect(
+        hasSelectableText(tester, 'sub_1791018557990_6bdd4c_6da'),
+        isTrue,
+        reason: '复用的 subagent_id 照旧给出来',
+      );
+    });
+
     testWidgets('中文标签是「临时员工」，正文给 task；行尾不给增量',
         (WidgetTester tester) async {
       await pumpRow(

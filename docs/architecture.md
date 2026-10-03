@@ -166,6 +166,7 @@ Flutter UI 进程（lib/）                     核心进程（packages/tree_cor
 <数据根>/                          # %APPDATA%\Tree；TREE_HOME / --data-dir 覆盖
 ├── config/{settings,models/*,mcp,plugins,stations}.yaml
 ├── agents/<agent_id>.yaml         # agent / 成员；system_prompt 可多行
+├── logs/core.log(+core.1..4.log)  # 核心日志落盘：stderr 之外的第二份，8 MiB × 5 轮转，行带 pid=
 ├── data/questions.json            # 提问（跨会话队列）
 └── data/<agent>/<session>/
     ├── session.json               # 会话元数据（原子快照；含 selected_spec_ids / 压缩摘要）
@@ -174,6 +175,12 @@ Flutter UI 进程（lib/）                     核心进程（packages/tree_cor
 
 yaml 里**不属于已知键**的内容会被原样保留并写回（用户手写的注释/键不会丢）。
 写入统一走 `store/write_queue.dart` 的 write-behind 队列，`flush()` 保证落盘。
+
+**核心日志**（`util/core_log_sink.dart`）：所有 `[core:*]` 日志的唯一出口 = stderr（发布版看不到）**加**一份
+落盘 `<数据根>/logs/core.log`；写文件失败只提示一次并降级为纯 stderr，**永不抛、永不阻塞生成**。
+核心在握手（`core_handshake.dart`）里带上 `data_root`（**可选字段**，为空时不写键 ⇒ 老前端零感知），
+应用据此在「设置 → 核心日志」提供"查看最近 N 行 / 打开日志目录"。核心库内仍有 3 处直写 stderr 未纳入
+（见 `docs/known-issues.md`）。
 
 ## 11. 活性与超时口径（M9 规约 1.1）
 

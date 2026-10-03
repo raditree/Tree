@@ -139,6 +139,7 @@ void main() {
         llmCaller:
             ({
               required String agentId,
+              required String sessionId,
               List<Object?>? messages,
               String? prompt,
               String? system,
@@ -612,6 +613,7 @@ class _FakeSummarizer implements ContextSummarizer {
     CoreAgent agent,
     String prompt, {
     void Function(String notice)? onNotice,
+    UsageSink? usageSink,
   }) async => '内置摘要';
 
   @override

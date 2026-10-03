@@ -1,6 +1,6 @@
 # util（跨模块小工具）
 
-没有业务语义、却被多个模块共同依赖的四件事：**token 口径、id、时间编解码、心跳活性台账**。
+没有业务语义、却被多个模块共同依赖的五件事：**token 口径、id、时间编解码、心跳活性台账、核心日志出口**。
 
 ## 文件
 
@@ -11,6 +11,7 @@
 | [ids.dart](ids.dart) | id 生成 `<prefix>_<epoch_ms>_<rand6>_<seq>` |
 | [json_time.dart](json_time.dart) | 毫秒 ↔ ISO-8601（两种写法都收） |
 | [liveness.dart](liveness.dart) | 通用心跳台账 `LivenessTracker` + `LivenessLostException` |
+| [core_log_sink.dart](core_log_sink.dart) | 核心日志出口 `CoreLogSink`：stderr + `<数据根>/logs/core.log` 双写、按大小轮转、失败降级 |
 
 ## 不变量（assertions）
 
@@ -21,10 +22,15 @@
 5. `LivenessLostException` 的文案必须**同时**含「心跳丢失」与「链路失活」——日志、UI 与测试都靠这两句话识别，不依赖具体实现。
 6. id 不用 UUID 包：核心进程零第三方依赖，便于 `dart compile exe` 产单文件。
 7. 回环 token 32 字节熵、base64url 无填充，**只经 stdout 握手行**交给父进程：不落盘、不复用。
+8. **核心日志只有一个出口**（[core_log_sink.dart](core_log_sink.dart)）：新日志一律 `coreLog.forPrefix('core:xxx')`，
+   不要自己 `stderr.writeln`（那条永远不落盘）；出口本身**永不抛异常、永不阻塞调用方**——磁盘满、目录只读、
+   stderr 已关闭都不得影响核心功能（失败只提示一次并降级为纯 stderr）。文件行带 `pid=` 前缀：
+   同一数据根可能同时有"App 拉起的核心"与"开发期自起的核心"在写。
 
 ## 测试
 
 ```bash
 cd packages/tree_core
 dart test test/tokens_test.dart test/liveness_tracker_test.dart test/util_test.dart test/token_pacer_test.dart
+dart test test/core_log_sink_test.dart     # 日志出口：双写 / 轮转 / 失败降级
 ```

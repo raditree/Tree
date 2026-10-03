@@ -53,11 +53,14 @@ typedef StationAgentCompactor = Future<Map<String, dynamic>> Function(
 /// [tools] = OpenAI 形状的工具声明数组，**原样透传**进请求体：压缩插件要复用
 /// "与对话同一条前缀"就必须带上同一份 tools（工具定义在聊天模板里渲染在 messages
 /// 之前，缺了它前缀从第一个 token 就对不上）。
+/// [sessionId] = 这次调用**记在哪个会话名下**（逐调用用量账本按会话分文件；压缩插件
+/// 的 `llm.call` 就是在给某个会话做压缩）。与 [StationToolCaller] 的口径一致。
 /// 返回 `{ok, json, text, model, usage}` 或 `{error}`（端点不支持 JSON 形式时
 /// **如实失败**，不静默去掉 response_format 重试）。
 typedef StationLlmCaller =
     Future<Map<String, dynamic>> Function({
       required String agentId,
+      required String sessionId,
       List<Object?>? messages,
       String? prompt,
       String? system,
@@ -718,6 +721,8 @@ class ExecuteStationMounts {
     }
     final Map<String, dynamic> result = await caller(
       agentId: target.agentId,
+      // 会话口径与 `tool.call` 一致：命令参数 → 站点 scope → 默认会话
+      sessionId: _sessionOf(context),
       messages: rawMessages is List ? rawMessages : null,
       prompt: prompt.isEmpty ? null : prompt,
       system: _string(context.arguments['system']),

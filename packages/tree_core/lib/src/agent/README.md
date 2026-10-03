@@ -9,7 +9,7 @@
 | --- | --- |
 | [agent_engine.dart](agent_engine.dart) | 引擎契约：`AgentEngine` + 事件 sealed 类 + `AgentRunContext` / `CoreMessageRef` |
 | [conversation_service.dart](conversation_service.dart) | 帧映射、落库、**按 agent×会话**的串行链 / 插话 / `stop`；`deliver` / `wake` 是团队与后台 hook 的投递入口 |
-| [compaction_service.dart](compaction_service.dart) | 上下文压缩：内置 compact 与中转站接管两条互斥路径、水位线、token 估算；压缩过程提示（重试进度）经 `noticeSink` 落成 `llm_hidden` 消息 |
+| [compaction_service.dart](compaction_service.dart) | 上下文压缩：内置 compact 与中转站接管两条互斥路径、水位线、token 估算；**「插件为什么没接管」经 `relaySkipSink` 上行**（总线接 `noteRelaySkip`）到 `CompactionResult.relaySkipReason`（REST 可选键 `relay_skip_reason`，**全量**）与 `relaySkipHasSubscriber`（分级位）；压缩过程提示（重试进度）与「压缩已发生 / 降级 / 插件没接管」经 `noticeSink`（自动）与 `notifyCompactionResult`（手动）落成 `llm_hidden` 消息 |
 | [workspace_prompt.dart](workspace_prompt.dart) | 系统提示词拼装（全局基础段 + agent 段 + 工作空间软约束 + Spec 索引 + 已选 Spec 全文），全部走 provider |
 | [system_prompt_file.dart](system_prompt_file.dart) | `<工作空间>/.self/system_prompt.md` 的播种 / 读取 / 重置（`.bak.<n>` 递增备份） |
 | [private_workspace_io.dart](private_workspace_io.dart) | 按 agent 分栏的 IO 装饰器：`.self/…` → `.tree/<agent_id>/.self/…` |
@@ -23,7 +23,7 @@
 
 1. **引擎不认识 WS 与存储**：只产出 `AgentEvent`；历史以 `CoreMessageRef` 传入，引擎不得反向依赖 `TreeStore`——否则引擎无法脱离存储单测，也容易出现"引擎误改历史"这类耦合。
 2. **按段下发**：正文 / 思考段各是一个 `msg_start` + `msg_chunk`… 并**独立落库**，段遇工具调用即关闭。`AgentDone` 时仍开着的正文段**就是最终回复**，usage 只挂最后一条。
-3. `AgentError` 必须**同时**发 `error` 帧**和**一条可见的 agent 文本消息：前端对 `error` 帧静默忽略，只发帧的话用户看不到任何反馈。这条消息（以及"已停止本轮生成。"、重试进度）一律落库带 **`llm_hidden`**——**给人看、不喂模型**：喂进上下文，模型会把"上一条失败"当成新的排查任务接着干（实测）。`kind` 保持 `text`，前端渲染与历史形态都不变；与 `kind == 'notice'`（hook 唤醒，是**新输入**、按 user 进上下文）方向相反。
+3. `AgentError` 必须**同时**发 `error` 帧**和**一条可见的 agent 文本消息：前端对 `error` 帧静默忽略，只发帧的话用户看不到任何反馈。这条消息（以及"已停止本轮生成。"、重试进度、**压缩已发生 / 降级 / 插件没接管**）一律落库带 **`llm_hidden`**——**给人看、不喂模型**：喂进上下文，模型会把"上一条失败"当成新的排查任务接着干（实测）。`kind` 保持 `text`，前端渲染与历史形态都不变；与 `kind == 'notice'`（hook 唤醒，是**新输入**、按 user 进上下文）方向相反。
 4. **并发**：同一 `(agent, session)` 串行（同一会话的流式片段交错下发会让前端追加互相污染），**不同会话并行**；跨会话消息既不打断也不排队；`stop` 按 agent（代次作废排队任务）；`idle` 只在该 agent **没有在途轮次**时广播。
 5. **提示词按会话钉住**（key = `agentId|sessionId`）：只在会话初始化 / 压缩后 / 显式失效时重建；历史逐字复用 `toolArgumentsRaw` 与 `toolResultForModel`；**工具表每轮现取**（不进前缀，否则端点前缀缓存从这条起全部落空）。
 6. **压缩不删除任何消息**：只推进 `compactedMessageCount`；被总结的永远是历史的一个**前缀**；`compactedSummary` 与 `compactedContext` **互斥**（两条压缩路径的权威只能有一个）。
@@ -45,6 +45,7 @@
     （用户自己会说原因，而且他往往马上又发一条让它接着干），**出错导致的中止照旧注入**（否则发起者以为活还在干）；
     临时员工这一轮结束时**总是**报自己的 `idle`（带 `subagent_id`），否则父还在跑时它的"工作中"会一直亮着。
 13. **`stop` / 插话要连带它名下的临时员工**：`_RunToken.ownerAgentId` 记归属轮次，`cancelAgent` 与"新消息插话"都会把同一会话里正在跑的临时员工一起收敛（否则父那轮一直卡在等一个没人管的子任务上）；`isRunning` 把"它名下的临时员工"也算在内，因此后台临时员工在跑时它的发起者显示 working、最后一个跑完才报 idle。
+14. **「为什么没接管」分两档，别合并**：`relay_skip_reason`（REST）永远是**全量**（排障面，含"总开关关 / 作用域不匹配 / 无点位 / 无订阅者"这类**早退**）；会话历史里的通知**只写"有订阅者却没交出可用结果"**那一档（`relaySkipHasSubscriber`，没回包 / 原数据放行 / 回包非法 / 越界 / 异常）。合并的后果是：没装压缩插件的用户，每条压缩通知都多一句"没有插件订阅该点位"的废话，看两次就学会忽略整条通知了。手动压缩（REST `/compact`、执行站 `agent.compact`）与自动压缩共用 `_notifyCompacted` 这一条文案口径，别在别处复制第二套。
 
 ## 依赖方向
 
@@ -59,7 +60,8 @@
 cd packages/tree_core
 dart test test/conversation_segments_test.dart test/conversation_stream_seq_test.dart \
           test/message_interrupt_test.dart test/system_prompt_pin_test.dart \
-          test/compaction_test.dart test/question_broker_test.dart \
+          test/compaction_test.dart test/compaction_relay_skip_test.dart \
+          test/question_broker_test.dart \
           test/question_store_test.dart \
           test/private_workspace_io_test.dart test/workspace_prompt_test.dart \
           test/subagent_tool_test.dart

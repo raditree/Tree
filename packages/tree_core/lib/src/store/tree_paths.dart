@@ -11,9 +11,11 @@ import 'package:path/path.dart' as p;
 /// │   ├── settings.yaml          # 全局设置（token 帧率/推送帧率/消息切入/数据收集…）
 /// │   └── models/<model_id>.yaml # 每个模型一个文件（含明文 api_key）
 /// ├── agents/<agent_id>.yaml     # 每个顶部 agent 一个文件（含 system_prompt）
+/// ├── logs/core.log               # 核心进程日志（stderr 的落盘副本，按大小轮转）
 /// └── data/<agent_id>/<session_id>/
 ///     ├── session.json           # 会话元数据（原子快照：写临时文件再改名）
-///     └── messages.jsonl         # 消息追加日志（一行一条，崩溃最多丢最后一行）
+///     ├── messages.jsonl         # 消息追加日志（一行一条，崩溃最多丢最后一行）
+///     └── usage.jsonl            # 逐调用用量账本（一行一次 LLM 调用；遥测，非对话）
 /// ```
 ///
 /// 为什么不是"每会话一个大 JSON"：单个会话实测已达 2433 条消息 / 2.9 MB，
@@ -93,6 +95,21 @@ class TreePaths {
   /// 不同 SSH 主机不会互相串味。删掉它只意味着下次重新上传。
   String get visionFilesFile => p.join(configDir, 'vision_files.json');
 
+  /// 核心进程日志目录（`<root>/logs`）。
+  ///
+  /// 为什么核心要落盘：发布版没有调试器时，stderr 只有"父进程转发 + 开发者看得到"，
+  /// 用户报"压缩没生效 / 插件没接管"时无迹可查。日志出口见
+  /// `CoreLogSink`（`lib/src/util/core_log_sink.dart`）：**stderr 与这个目录双写**。
+  String get logsDir => p.join(root, 'logs');
+
+  /// 核心日志的**当前**那一份（`<root>/logs/core.log`）。
+  ///
+  /// 轮转后的历史份额见 [coreLogFileAt]（`core.1.log` 最新，编号越大越旧）。
+  String get coreLogFile => p.join(logsDir, 'core.log');
+
+  /// 轮转后的历史日志份（[index] 从 1 开始；越大越旧）。
+  String coreLogFileAt(int index) => p.join(logsDir, 'core.$index.log');
+
   /// 全部提问的原子快照（跨会话，右侧「问题回复」页用）。
   ///
   /// 为什么不像消息那样按会话拆文件：提问是**跨会话**查询的队列（`GET /api/questions`），
@@ -124,6 +141,15 @@ class TreePaths {
   String messagesFile(String agentId, String sessionId) =>
       p.join(sessionDir(agentId, sessionId), 'messages.jsonl');
 
+  /// 某会话的**逐调用用量账本**（`data/<agent_id>/<session_id>/usage.jsonl`）。
+  ///
+  /// 一行一次 LLM 调用（对话跳 / 内置压缩 / `llm.call` / 插件接管跳），
+  /// 字段表见 `UsageCall.toJson()`。为什么与消息分开一个文件：用量是**遥测**不是
+  /// 对话——混进 `messages.jsonl` 会改变既有行形状的兼容面，而单独一份既能让
+  /// 插件面板独立读，也能让"删会话"（递归删目录）天然把它收干净。
+  String usageFile(String agentId, String sessionId) =>
+      p.join(sessionDir(agentId, sessionId), 'usage.jsonl');
+
   /// **临时员工（subagent）名册**：`data/<agentId>/<sessionId>/subagents.json`。
   ///
   /// 为什么与会话数据同目录（而不是某种全局名册）：临时员工**只活在它被召来的
@@ -147,6 +173,7 @@ class TreePaths {
       modelsDir,
       agentsDir,
       sessionsDataDir,
+      logsDir,
     ]) {
       await Directory(dir).create(recursive: true);
     }
@@ -160,6 +187,7 @@ class TreePaths {
       modelsDir,
       agentsDir,
       sessionsDataDir,
+      logsDir,
     ]) {
       Directory(dir).createSync(recursive: true);
     }

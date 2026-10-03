@@ -666,6 +666,18 @@ class _ToolDetailState extends State<ToolDetail> {
           rows.add(_paramRow(context, '描述', _truncate(arg('description'), 400)));
         }
         return rows;
+      case 'subagent':
+        // 详情里**不截断** `task`（用户 2026-10-03：「subagent 的工具调用详情的 task 过长会打省略号
+        // （在现在的右侧查看详情的设计下，没必要省略了）」）：右侧详情视图本来就是"看全文"的地方，
+        // `_paramRow` 用 `SelectableText` 会自己换行，长任务（含换行/分点的那种）能读全。
+        // 折叠态的**摘要行**仍是另一回事：它靠整行省略号收尾（见 :219 一带的注释），不改。
+        final List<Widget> rows = <Widget>[
+          _paramRow(context, '任务', arg('task')),
+        ];
+        if (arg('subagent_id').isNotEmpty) {
+          rows.add(_paramRow(context, '复用', arg('subagent_id')));
+        }
+        return rows;
       case 'mcp':
         final String toolName =
             arg('tool_name').isEmpty ? arg('tool') : arg('tool_name');

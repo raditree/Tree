@@ -158,6 +158,15 @@ class LlmSession {
   /// 用下划线前缀标明它是**内部字段**：引擎读完即剥掉，不会流到前端帧或落库。
   static const String contextCharsKey = '_context_chars';
 
+  /// usage 里夹带"**本次调用**读数"（逐调用口径）的内部键（见 [run]）。
+  ///
+  /// 为什么不直接在既有 usage map 上加**公开**键：那份 map 是**已入帧、已落库**的
+  /// 契约（`messages.jsonl` 的 `usage` 字段），加键就改变了行形状。逐调用账目改由
+  /// 本键承载（`{prompt_tokens, cached_tokens?, completion_tokens, estimated,
+  /// duration_ms}`）：引擎读完即剥掉（`LlmAgentEngine._publicUsage`）、落进
+  /// `<会话目录>/usage.jsonl`（见 `store/usage_log.dart`）⇒ 对外契约逐字不变。
+  static const String callUsageKey = '_call';
+
   /// 跑完一轮会话。
   ///
   /// [messages] 必须**已包含 system 与本次用户消息**（顺序即发送顺序）。
@@ -197,7 +206,6 @@ class LlmSession {
     int lastPromptTokens = 0;
     int completionTokens = 0;
     int cachedTokens = 0;
-    bool sawEndpointUsage = false;
 
     // **无轮次上限**（Q8）：只有取消 / 出错 / 模型给出最终文本才会结束。
     for (int turn = 0; ; turn++) {
@@ -272,6 +280,8 @@ class LlmSession {
       bool overflow = false;
       String failure = '';
 
+      // 这一跳的耗时（逐调用账目用它）：从发出请求到收流结束。
+      final Stopwatch hopClock = Stopwatch()..start();
       final Stream<LlmStreamEvent> events =
           pluginStream ??
           transport.stream(request, isCancelled: isCancelled);
@@ -309,12 +319,15 @@ class LlmSession {
           break;
         }
       }
+      hopClock.stop();
 
-      if (turnUsage != null && !turnUsage.isEmpty) {
-        sawEndpointUsage = true;
-        lastPromptTokens = turnUsage.promptTokens;
-        completionTokens += turnUsage.completionTokens;
-        cachedTokens = turnUsage.cachedTokens;
+      final LlmUsage? endpointUsage = turnUsage != null && !turnUsage.isEmpty
+          ? turnUsage
+          : null;
+      if (endpointUsage != null) {
+        lastPromptTokens = endpointUsage.promptTokens;
+        completionTokens += endpointUsage.completionTokens;
+        cachedTokens = endpointUsage.cachedTokens;
         final Map<String, dynamic> usage = _usage(
           promptTokens: lastPromptTokens,
           completionTokens: completionTokens,
@@ -325,6 +338,16 @@ class LlmSession {
         // usage 里上行，引擎据此决定要不要刷新该模型的 token_scale 记录。端点没给
         // usage 的分支不会带这个键——"无 usage 的端点只读不写"。
         usage[contextCharsKey] = request.contextChars();
+        // 逐调用账目（**内部键**，引擎读完剥掉；见 [callUsageKey]）：这一跳用
+        // **本次调用的真值**，而不是上面那份"全轮累计"的前端口径。
+        usage[callUsageKey] = _callUsage(
+          promptTokens: endpointUsage.promptTokens,
+          cachedTokens: endpointUsage.cachedTokens,
+          completionTokens: endpointUsage.completionTokens,
+          estimated: false,
+          durationMs: hopClock.elapsedMilliseconds,
+          pluginHandled: pluginStream != null,
+        );
         yield AgentUsage(usage);
       }
 
@@ -366,21 +389,46 @@ class LlmSession {
               arguments: draft.arguments.toString(),
             ),
       ];
+      if (endpointUsage == null) {
+        // 端点这一跳没给 usage：本地估算兜底，并显式标注 estimated。
+        //
+        // **每一跳都发**（不再像旧实现那样嵌在 `calls.isEmpty` 里、还要看"整轮有没有
+        // 见过端点 usage"）：工具循环里"带工具调用 + 端点不回 usage"的跳以前一条账
+        // 都没有，而它恰恰是最常见的形态——"每次 LLM 调用都有账"必须每跳一条。
+        final int estimatedPrompt = request.estimatedPromptTokens(
+          scale: tokenScale,
+        );
+        // completion 要把**这一跳生成的工具调用参数**算进去：工具跳通常一个字正文
+        // 都没有（scenario：模型直接给 tool_calls），只看正文会得出 0——那不是"没有
+        // 用量"，而是"用量都在 tool_calls 里"。
+        final int estimatedCompletion =
+            estimateTokens(text.toString(), scale: tokenScale) +
+            calls.fold<int>(
+              0,
+              (int sum, LlmToolCall call) =>
+                  sum +
+                  estimateTokens('${call.name}${call.arguments}', scale: tokenScale),
+            );
+        yield AgentUsage(
+          _usage(
+            promptTokens: estimatedPrompt,
+            // 与"全轮累计"的前端契约一致（端点分支也是累计口径）：这一跳没真值，
+            // 就把本跳的估算**加到累计上**，而不是把累计清零成"本跳"。
+            // 注意 `completionTokens` 这个累加器只吃**端点真值**（既有语义不动）：
+            // 估算不进累计，否则一条估算会把后面每一跳的公开读数都带偏。
+            completionTokens: completionTokens + estimatedCompletion,
+            estimated: true,
+            trimmed: trimmed,
+          )..[callUsageKey] = _callUsage(
+            promptTokens: estimatedPrompt,
+            completionTokens: estimatedCompletion,
+            estimated: true,
+            durationMs: hopClock.elapsedMilliseconds,
+            pluginHandled: pluginStream != null,
+          ),
+        );
+      }
       if (calls.isEmpty) {
-        if (!sawEndpointUsage) {
-          // 端点没给 usage：用本地估算兜底，并显式标注 estimated
-          yield AgentUsage(
-            _usage(
-              promptTokens: request.estimatedPromptTokens(scale: tokenScale),
-              completionTokens: estimateTokens(
-                text.toString(),
-                scale: tokenScale,
-              ),
-              estimated: true,
-              trimmed: trimmed,
-            ),
-          );
-        }
         yield AgentDone(finishReason: finishReason);
         return;
       }
@@ -471,6 +519,30 @@ class LlmSession {
     estimated: estimated,
     trimmedMessages: trimmed,
   );
+
+  /// **逐调用**读数的内部载体（见 [callUsageKey]）：只用来落 `usage.jsonl`。
+  ///
+  /// 口径与 [_usage]（前端进度条口径）刻意不同：这里是"这一次调用花了多少"，
+  /// 不累计、不带 `max_tokens`（那是模型属性不是本次用量）。
+  /// [cachedTokens] 为 0 或缺省 ⇒ **不写键**（端点没给这个字段，绝不编造 0）。
+  /// [pluginHandled] = 这一跳是被插件**整体接管**的（`llm.handle`）：引擎据此把
+  /// 账目归到 `source=plugin`，而不是 `turn`。**只有会话知道这件事**（接管是它这
+  /// 一层发生的），所以标记必须由这里随读数一起交出去。
+  Map<String, dynamic> _callUsage({
+    required int promptTokens,
+    required int completionTokens,
+    required bool estimated,
+    required int durationMs,
+    int? cachedTokens,
+    bool pluginHandled = false,
+  }) => <String, dynamic>{
+    'prompt_tokens': promptTokens,
+    if (cachedTokens != null && cachedTokens > 0) 'cached_tokens': cachedTokens,
+    'completion_tokens': completionTokens,
+    'estimated': estimated,
+    'duration_ms': durationMs,
+    if (pluginHandled) 'plugin': true,
+  };
 
   /// 工具循环内压缩（Q1-③）：把重建后的基础上下文取回来。
   ///

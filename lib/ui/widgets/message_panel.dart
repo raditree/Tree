@@ -26,6 +26,7 @@ import '../services/session_rename.dart';
 import '../services/subagent_transcript.dart';
 import '../services/team_scope_view.dart';
 import '../services/terminal_toggle_request.dart';
+import '../services/usage_log_files.dart';
 import 'message_input.dart';
 import 'message_list.dart';
 import 'plugin_ui_slots.dart';
@@ -37,6 +38,7 @@ import 'terminal_panel.dart';
 import 'spec_panel.dart';
 import 'ssh_config_dialog.dart';
 import 'teammates_window_page.dart';
+import 'usage_calls_panel.dart';
 
 /// 消息交互面板（中栏）
 ///
@@ -68,6 +70,16 @@ class MessagePanel extends StatefulWidget {
 
   /// 成员配置变更后的回调（父页面重新拉取 agent 列表，刷新待处理成员红点）
   final VoidCallback? onAgentsChanged;
+
+  /// 仅供测试：覆盖 `usage.jsonl` 的路径（`null` = 走正式入口，原样透传给
+  /// [UsageLogFiles.readRecent] 的 `override`）。
+  ///
+  /// 为什么需要这个口子：账本路径来自握手的**数据根**
+  /// （`CoreProcessLauncher.instance.coreDataRoot`），而握手只在真启动核心时发生——
+  /// 组件测试里拿不到"读历史成功"的那条路，本字段把它补上（与该服务自带的
+  /// `override`（"仅测试注入用"）是同一个用途，这里只是透传）。
+  @visibleForTesting
+  static String? debugUsageFileOverride;
 
   const MessagePanel({
     super.key,
@@ -175,6 +187,29 @@ class _MessagePanelState extends State<MessagePanel> {
   final Map<String, Map<String, dynamic>> _usageByAgent =
       <String, Map<String, dynamic>>{};
 
+  /// **逐调用**用量列表（当前 agent + 会话）：每一次调用留一行，喂给上下文条下面的
+  /// 「本轮调用列表」（`UsageCallsPanel`）。
+  ///
+  /// 与 [_usageByAgent] 是**两份口径、互不影响**：那份"按 (agent, 会话) 只留最新"，
+  /// 是「上下文长度」读数的依赖（一个字都不改）；这份"每一条都留一行"，回答的是
+  /// "这一轮到底跑了几次、每次花了多少"。实时帧与账本（`usage.jsonl`）都能喂进来。
+  final List<UsageCallView> _callUsages = <UsageCallView>[];
+
+  /// 这份列表当前的归属（`agentId::sessionId`）与"账本读过没有"的记账：
+  /// 同一个会话只读一次 `usage.jsonl`；换会话 / 换 agent 时连同列表一起清
+  /// （见 [_clearWindow] / [_scheduleCallUsagesHistory]）。
+  String _callUsagesKey = '';
+
+  /// 账本读不到时的**可读原因**（空串 = 没出问题）。
+  ///
+  /// 只在"一条调用都没有"时作为空态显示——"读不到账本"（核心没给数据根 / 文件不存在 /
+  /// IO 失败）与"这个会话还没调用过"必须分得开（见 [UsageHistoryRead.reason]）。
+  String _callUsagesNote = '';
+
+  /// 「本轮调用列表」最多展示**最近**多少次调用：长会话里"最近几次"才是有用的读数，
+  /// 面板会把截断写进标题（`maxRows <= 0` 表示全显示，这里取一个有界的上限）。
+  static const int _usageCallsMaxRows = 20;
+
   /// 当前 agent 的会话列表（多会话并行）
   List<ChatSession> _sessions = <ChatSession>[];
 
@@ -226,6 +261,11 @@ class _MessagePanelState extends State<MessagePanel> {
 
   /// 视口**上方**补过页的次数：列表据此在布局阶段补一次滚动位置。
   int _padAboveStamp = 0;
+
+  /// **本帧内容高度在"视口里/视口下方"变了**的标记（递增）：
+  /// 补页落在视口里（横跨视口顶的那一份）或淘汰掉远处槽位时递增，
+  /// 传给 [MessageList.contentShiftStamp] 让列表补一次滚动位置（A3/A2）。
+  int _contentShiftStamp = 0;
 
   /// 刚定位过的那一页（淘汰时额外留着：它可能离视口很远，但用户正看着它）。
   MessageRange? _locateKeep;
@@ -320,13 +360,14 @@ class _MessagePanelState extends State<MessagePanel> {
     final bool ownSsh = SshExecutorService.instance.isTeamEnabled(teamId);
     final bool ownerSsh =
         isMember && SshExecutorService.instance.isTeamEnabled(ownerId);
-    final Map<String, dynamic> ownConfig =
-        SshExecutorService.instance.teamConfig(teamId);
+    final Map<String, dynamic> ownConfig = SshExecutorService.instance
+        .teamConfig(teamId);
     final Map<String, dynamic> ownerConfig = isMember
         ? SshExecutorService.instance.teamConfig(ownerId)
         : ownConfig;
-    final String ownDir =
-        LocalExecutorService.instance.teamWorkingDirectory(teamId);
+    final String ownDir = LocalExecutorService.instance.teamWorkingDirectory(
+      teamId,
+    );
     final String ownerDir = isMember
         ? LocalExecutorService.instance.teamWorkingDirectory(ownerId)
         : ownDir;
@@ -626,6 +667,11 @@ class _MessagePanelState extends State<MessagePanel> {
     _pendingWindow = null;
     _visibleFrom = -1;
     _visibleTo = -1;
+    // 逐调用用量列表是**会话粒度**的：换了会话 / 换了 agent 就不是同一份账了，
+    // 连同"读过账本没有"的记账一起清（历史由下一次 _loadHistory 重新读）。
+    _callUsages.clear();
+    _callUsagesKey = '';
+    _callUsagesNote = '';
   }
 
   /// 从后端拉取当前 agent/会话的**末尾一段**历史，作为窗口的起点。
@@ -637,6 +683,9 @@ class _MessagePanelState extends State<MessagePanel> {
     final Agent? agent = widget.selectedAgent;
     if (agent == null) return;
     final String sessionId = _currentSessionId;
+    // 逐调用用量列表：历史消息与用量账本同属"这个会话的过去"，顺手在这里补一次
+    // （同一个 (agent, 会话) 只读一次，见 [_scheduleCallUsagesHistory]）
+    _scheduleCallUsagesHistory(agent.id, sessionId);
     try {
       final HistoryPage page = await ApiService.getConversationHistoryPage(
         agent.id,
@@ -756,6 +805,11 @@ class _MessagePanelState extends State<MessagePanel> {
   bool _windowWorkRunning = false;
 
   /// 一趟 = 按坐标补缺口 + 淘汰离得远的槽位；跑完再看有没有更新的坐标。
+  ///
+  /// **淘汰不与补页背靠背同帧**（A2）：两者都会改内容高度（补页让视口上方/视口里
+  /// 长高，淘汰把远处的真消息换回 88px 占位槽），挤在同一帧里列表侧只能看到
+  /// "净变化"，一次补偿里混进两种信号；而且淘汰可能把补偿锚点那一格换走，
+  /// 让实测退化成估算。所以淘汰推到**补页之后的下一帧**（见 [_scheduleEvictAfterFrame]）。
   Future<void> _pumpWindowWork() async {
     if (_windowWorkRunning) return;
     _windowWorkRunning = true;
@@ -768,11 +822,31 @@ class _MessagePanelState extends State<MessagePanel> {
         _visibleTo = work.last;
         await _fillWindow(work.first, work.last);
         if (!mounted) return;
-        _evictFarSlots();
+        _scheduleEvictAfterFrame();
       }
     } finally {
       _windowWorkRunning = false;
     }
+  }
+
+  /// 这一个补页趟次是否已经把"淘汰"排到下一帧（同帧去重）。
+  bool _evictScheduled = false;
+
+  /// 把"淘汰"排到**补页之后的下一帧**（A2）。
+  ///
+  /// 为什么必须是**下一帧**：补页的 `setState` 会排一帧，postFrame 回调在那帧末执行 ⇒
+  /// 淘汰的 `setState` 触发的是**再下一帧**，于是"这一帧只有补页"成为可断言的形状。
+  /// 另外还要 `scheduleFrame()`：补页没放置任何东西时不会有帧，回调就永远不执行
+  /// （淘汰会被无限推迟 ⇒ 缓存越攒越长）。
+  void _scheduleEvictAfterFrame() {
+    if (_evictScheduled) return;
+    _evictScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _evictScheduled = false;
+      if (!mounted) return;
+      _evictFarSlots();
+    });
+    WidgetsBinding.instance.scheduleFrame();
   }
 
   /// 把视口附近（[MessageWindow.gapsFor] 按 margin 外扩）缺的段补回来。
@@ -809,7 +883,15 @@ class _MessagePanelState extends State<MessagePanel> {
               messages: messages,
             );
             // 视口**上方**补的页：占位槽换成真消息会改变上面的高度，让列表补一次
-            if (page.offset + messages.length <= first) _padAboveStamp++;
+            if (page.offset + messages.length <= first) {
+              _padAboveStamp++;
+            } else {
+              // 这一份**落在视口里**（面板故意先补横跨视口顶的 `[first, gap.to)`）：
+              // 紧贴视口顶的那一格往往**自身就是**被换掉的那一格 ⇒ 它下面
+              // 已经加载的内容会被整段推走。发 contentShiftStamp 让列表按实测
+              // 锚点补回来（A3；列表侧口径见 MessageList.contentShiftStamp）。
+              _contentShiftStamp++;
+            }
             _replayGuard.sealAll(messages.map((ChatMessage m) => m.id));
             // 这一段补不出东西（对齐有偏差 / 服务端说没有）：记一笔，别再空转
             if (placed == 0) _barrenGaps.add(request.from);
@@ -840,11 +922,16 @@ class _MessagePanelState extends State<MessagePanel> {
         _visibleFrom - _cacheMargin,
         _visibleTo + 1 + _cacheMargin,
       ),
-      keepAlso: locate == null ? const <MessageRange>[] : <MessageRange>[locate],
+      keepAlso: locate == null
+          ? const <MessageRange>[]
+          : <MessageRange>[locate],
     );
     if (removed == 0) return;
     setState(() {
       _bottomJump = false;
+      // 淘汰同样改了内容高度（远处的真消息换回 88px 占位槽）：发一次补偿信号，
+      // 让列表按实测锚点把"用户正在读的那一段"钉住（A2：淘汰独占这一帧）。
+      _contentShiftStamp++;
       _scrollRevision++;
     });
     SubagentTranscript.instance.sync(_window.loadedList);
@@ -873,7 +960,10 @@ class _MessagePanelState extends State<MessagePanel> {
           // 定位是"一次性跳转"：窗口直接换成目标那一段（+ 末尾实时尾巴），
           // 免得刚放进去就被淘汰、目标又没了
           _window.resetTail(offset: page.offset, messages: messages);
-          _locateKeep = MessageRange(page.offset, page.offset + messages.length);
+          _locateKeep = MessageRange(
+            page.offset,
+            page.offset + messages.length,
+          );
           _replayGuard.sealAll(messages.map((ChatMessage m) => m.id));
           // 定位不是"回到底部"：窗口换了，但别贴底
           _bottomJump = false;
@@ -995,11 +1085,7 @@ class _MessagePanelState extends State<MessagePanel> {
       // 重播去重：已封口的 id（历史终稿 / 已 msg_end）不再追加；序号不大于已消费
       // 水位的增量 = 已经渲染过的同一片段被重播（断线补发重播的主要形态）；
       // 没有对应消息的孤立增量同样丢弃（既有行为）。
-      if (!_replayGuard.shouldAppendChunk(
-        id: id,
-        exists: idx >= 0,
-        seq: seq,
-      )) {
+      if (!_replayGuard.shouldAppendChunk(id: id, exists: idx >= 0, seq: seq)) {
         debugPrint(
           '[消息] 丢弃增量（'
           '${_replayGuard.describe(id: id, exists: idx >= 0, seq: seq)}）: $id',
@@ -1044,6 +1130,8 @@ class _MessagePanelState extends State<MessagePanel> {
           _bottomJump = false;
           if (usage != null) {
             _recordUsage(data, usage);
+            // 逐调用列表是另一份口径（每次一行），与上面"只留最新"互不影响
+            _appendUsageCall(UsageCallView.fromUsage(usage));
           }
         });
       }
@@ -1058,12 +1146,16 @@ class _MessagePanelState extends State<MessagePanel> {
           _window.at(idx)!.usage = usage;
           if (usage != null) {
             _recordUsage(data, usage);
+            // 逐调用列表：每次调用留一行（缓存的文字消息也照收）
+            _appendUsageCall(UsageCallView.fromUsage(usage));
           }
         });
       } else if (usage != null) {
         // 会话粒度推进：工具循环中推送的 usage 没有对应文本消息（id 是工具卡片），
         // 仍要记录，使上下文统计持续更新
         _recordUsage(data, usage);
+        // 同上：这份读数也要在「本轮调用列表」里占一行
+        _appendUsageCall(UsageCallView.fromUsage(usage));
         if (mounted) setState(() {});
       }
     } else if (type == 'tool_start') {
@@ -1191,8 +1283,7 @@ class _MessagePanelState extends State<MessagePanel> {
   }
 
   /// 消息在列表中的下标（-1 = 不存在；空 id 一律视为不存在）。
-  int _indexOfMessage(String id) =>
-      id.isEmpty ? -1 : _window.indexOfId(id);
+  int _indexOfMessage(String id) => id.isEmpty ? -1 : _window.indexOfId(id);
 
   /// 本端是不是**已经有**这条消息，或者**认得**它（历史里出现过、但槽位早被淘汰）。
   ///
@@ -1231,6 +1322,145 @@ class _MessagePanelState extends State<MessagePanel> {
     _usageByAgent['$agentId::$sessionId'] = usage;
   }
 
+  /// 追加一条**实时帧**的用量（`msg_usage` / `msg_end` 的 `usage` map）。
+  ///
+  /// 与 [_recordUsage] 是并行的两条路，而不是复用它：后者"只留最新"（上下文长度读数），
+  /// 这里每一次调用都要留一行。**弱去重**（见 [_usageCallKey] / [_indexOfTwin]）：
+  /// - 同一次调用先推 `msg_usage`、再在 `msg_end` 里带一份字段完全相同的 `usage` ⇒ 只留一条；
+  /// - 断线补发把同一帧重播回来、而这次调用**已经落进账本**（列表里已有带 `at` 的那一行）
+  ///   ⇒ 就地补全既有行，不新增一行（否则"这一轮"会被数成两次）。
+  ///
+  /// **临时员工（subagent）的帧也照收**：它的 `agent_id` 虽然是会话主人，但这是一次
+  /// 真实的 LLM 调用、真实的花费，属于"这一轮花了多少"的一部分；而 [_recordUsage] 不收
+  /// 它是因为那份 `prompt_tokens` 描述的是它自己的上下文，混进去会把上下文长度带偏——
+  /// 两者是不同的问题（若要改成同口径，在这里加一行 `subagent_id` 判断即可）。
+  void _appendUsageCall(UsageCallView call) {
+    // ① 同键 = 同一次调用的两份读数（at 与来源/输入/输出都一样）
+    if (_indexOfUsageCall(call) >= 0) return;
+    // ② 孪生 = 一边有 at、一边没有（实时帧没有 at，账本行有）：合成一行，别数两次
+    final int twin = _indexOfTwin(call);
+    if (twin >= 0) {
+      _callUsages[twin] = _fillMissing(_callUsages[twin], call);
+      return;
+    }
+    _callUsages.add(call);
+  }
+
+  /// 弱去重键：`(at, source, prompt_tokens, completion_tokens)`。
+  ///
+  /// 口径取 `at + source + prompt_tokens`，**并列**带上 `completion_tokens`：实时帧没有
+  /// `at`（键里恒为空串），同来源、输入相同但输出不同的两次调用是**两次真实调用**，
+  /// 不该被合成一行；而真正重复的帧（同一次调用的两份读数）四个字段完全一致，照样只剩一条。
+  static String _usageCallKey(UsageCallView call) =>
+      '${call.at?.toUtc().toIso8601String() ?? ''}|${call.source}|'
+      '${call.promptTokens}|${call.completionTokens}';
+
+  /// 列表里同键条目的下标（-1 = 没有）。
+  int _indexOfUsageCall(UsageCallView call) {
+    final String key = _usageCallKey(call);
+    for (int i = 0; i < _callUsages.length; i++) {
+      if (_usageCallKey(_callUsages[i]) == key) return i;
+    }
+    return -1;
+  }
+
+  /// 列表里的"孪生"行：来源 + 输入 + 输出都对得上，且**两边只有一边**有时间戳。
+  ///
+  /// 为什么要认这一对：实时帧不带 `at` / `duration_ms`，账本行带——它们描述的是同一次
+  /// 调用（实时帧可能被断线补发重播，也可能这次调用已经落进账本）。认出来就**合成一行**
+  /// （见 [_fillMissing]）而不是让"这一轮"多算一次；两边都有时间戳的是账本里两次真调用，
+  /// 不算孪生。
+  int _indexOfTwin(UsageCallView call) {
+    for (int i = 0; i < _callUsages.length; i++) {
+      final UsageCallView row = _callUsages[i];
+      if (row.source != call.source) continue;
+      if (row.promptTokens != call.promptTokens) continue;
+      if (row.completionTokens != call.completionTokens) continue;
+      if (row.at != null && call.at != null) continue;
+      return i;
+    }
+    return -1;
+  }
+
+  /// 把 [extra] 有的、[base] 缺的字段补上（`at` / `duration_ms` / `cached_tokens` / 模型名）。
+  ///
+  /// `null ≠ 0` 的字段（`cached_tokens` / `duration_ms` / `at`）只补 `null` 的那些；
+  /// 计数与来源以 [base] 为准（孪生的两边本来就相同）。
+  UsageCallView _fillMissing(UsageCallView base, UsageCallView extra) {
+    return UsageCallView(
+      source: base.source,
+      model: base.model.isEmpty ? extra.model : base.model,
+      promptTokens: base.promptTokens,
+      cachedTokens: base.cachedTokens ?? extra.cachedTokens,
+      completionTokens: base.completionTokens,
+      // 两边只要有一边标了"估算"，这一行就是估算值
+      estimated: base.estimated || extra.estimated,
+      durationMs: base.durationMs ?? extra.durationMs,
+      at: base.at ?? extra.at,
+    );
+  }
+
+  /// 按 `(agent, 会话)` 读一次 `usage.jsonl`，把**历史**调用补进逐调用列表。
+  ///
+  /// 触发点：[_loadHistory] 开头——首次进入 / 换 agent（经 [_loadSessions]）/ 换会话 /
+  /// 整表重拉都汇合在那里，且那一刻 `(agent, 会话)` 已经确定。组件本身没有"展开回调"
+  /// （不改 `UsageCallsPanel`），所以不去等用户点展开：账本只读尾巴一段，代价很小。
+  ///
+  /// 同一个 `(agent, 会话)` 只读一次（[_callUsagesKey] 记账）；换会话 / 换 agent 会清掉
+  /// 这个记账（见 [_clearWindow]），下一次 [_loadHistory] 再读一遍。
+  void _scheduleCallUsagesHistory(String agentId, String sessionId) {
+    final String key = '$agentId::$sessionId';
+    if (key == _callUsagesKey) return;
+    _callUsagesKey = key;
+    unawaited(
+      _loadCallUsagesHistory(agentId: agentId, sessionId: sessionId, key: key),
+    );
+  }
+
+  /// 读账本并合并（**绝不抛**：读不到只留一句可读原因，已经拿到的实时行照旧显示）。
+  Future<void> _loadCallUsagesHistory({
+    required String agentId,
+    required String sessionId,
+    required String key,
+  }) async {
+    final UsageHistoryRead read = await UsageLogFiles.readRecent(
+      agentId: agentId,
+      sessionId: sessionId,
+      lines: UsageLogFiles.defaultLines,
+      // 测试注入（见 [MessagePanel.debugUsageFileOverride]）；生产恒为 null。
+      override: MessagePanel.debugUsageFileOverride,
+    );
+    // 竞态防护：等待期间切了会话 / 换了 agent ⇒ 这份读数作废（不许写进新会话的列表）
+    if (!mounted || _callUsagesKey != key) return;
+    setState(() {
+      _callUsagesNote = read.ok ? '' : read.reason;
+      _mergeUsageHistory(read.calls);
+    });
+  }
+
+  /// 把账本行（文件顺序：早 → 晚）合进列表。
+  ///
+  /// 三条口径：
+  /// - 与列表里某条**同键**（同 `at` + 来源 + 输入 + 输出）⇒ 不重复添加（账本被读了两遍
+  ///   时不该长出第二行）；
+  /// - 与某条**实时行是孪生**（来源 + 输入 + 输出都对得上，且实时那条没有 `at`）⇒ 就地
+  ///   补全它的 `at` / `duration_ms`，**不**新增一行——两者描述的是同一次调用；
+  /// - 其余（更早的调用）整体插在实时行**之前**，列表保持"早 → 晚"。
+  void _mergeUsageHistory(List<UsageCallView> history) {
+    if (history.isEmpty) return;
+    final List<UsageCallView> older = <UsageCallView>[];
+    for (final UsageCallView row in history) {
+      if (_indexOfUsageCall(row) >= 0) continue;
+      final int twin = _indexOfTwin(row);
+      if (twin >= 0) {
+        _callUsages[twin] = _fillMissing(_callUsages[twin], row);
+        continue;
+      }
+      older.add(row);
+    }
+    if (older.isNotEmpty) _callUsages.insertAll(0, older);
+  }
+
   /// 处理 agent 的提问（AskUserQuestion 工具）：以非阻塞内联卡片插入消息流。
   ///
   /// 不再弹全屏遮罩对话框，避免挡住模型最近输出与右侧信息；用户可先浏览
@@ -1241,10 +1471,7 @@ class _MessagePanelState extends State<MessagePanel> {
     if (qid.isEmpty) return;
     // 重播去重：卡片本身落库（历史里会有），断线期间重播的提问帧不得再插一张
     // （否则已作答的旧问题会重新冒出来抢答）。
-    if (!_replayGuard.shouldCreateMessage(
-      id: qid,
-      exists: _hasMessage(qid),
-    )) {
+    if (!_replayGuard.shouldCreateMessage(id: qid, exists: _hasMessage(qid))) {
       debugPrint('[消息] 忽略重播的提问卡片（同 id 已存在）: $qid');
       return;
     }
@@ -1542,7 +1769,10 @@ class _MessagePanelState extends State<MessagePanel> {
     // 若照着成员 id 写，用户等于改了一个没人读的字段。
     final String ownerId = agent?.teamScopeId ?? agentId;
     if (ownerId.isNotEmpty) {
-      await LocalExecutorService.instance.setTeamWorkingDirectory(ownerId, path);
+      await LocalExecutorService.instance.setTeamWorkingDirectory(
+        ownerId,
+        path,
+      );
     }
     if (!mounted) return;
     if (ownerId.isNotEmpty && ownerId != agentId) {
@@ -1599,105 +1829,109 @@ class _MessagePanelState extends State<MessagePanel> {
           color: Theme.of(context).scaffoldBackgroundColor,
           child: Column(
             children: <Widget>[
-          _buildTitleBar(agent),
-          if (agent != null) _buildContextBar(),
-          if (agent == null)
-            Expanded(
-              child: Center(
-                child: Text(
-                  '请选择一个 Agent 开始对话',
-                  style: TextStyle(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                    fontSize: 14,
+              _buildTitleBar(agent),
+              if (agent != null) _buildContextBar(),
+              if (agent != null) _buildUsageCallsSection(),
+              if (agent == null)
+                Expanded(
+                  child: Center(
+                    child: Text(
+                      '请选择一个 Agent 开始对话',
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        fontSize: 14,
+                      ),
+                    ),
+                  ),
+                )
+              else
+                Expanded(
+                  // Q12 消息流内联卡片：有插件卡片槽位时，在消息列表末尾追加卡片区
+                  // （无卡片时传空列表，列表项数不变，不占位）。
+                  child: ListenableBuilder(
+                    listenable: PluginUiRegistry.instance,
+                    builder: (BuildContext context, Widget? child) {
+                      // 临时员工视角：**同一个窗口**换成它自己的过程（不新开页面）
+                      final String viewId = _effectiveViewId;
+                      if (viewId.isNotEmpty) {
+                        return _buildSubagentView(viewId);
+                      }
+                      final bool hasCards = PluginUiRegistry.instance.hasKind(
+                        PluginUiSlotKind.card,
+                      );
+                      // 临时员工的消息**不进主消息流**（用户 2026-10-04：「subagent 的输出跟主 agent
+                      // 的输出混杂，根本没法分辨，subagent 的工具调用就在 subagent 的调用工具详情里看」）：
+                      // 它们按 subagent_id 收进 [SubagentTranscript]，在"那次 subagent 工具调用的详情页"里看。
+                      return MessageList(
+                        // **槽位表**：全局下标 → 消息（null = 还没加载）。面板原地放置/
+                        // 淘汰，列表据此画占位槽、按全局下标画右侧滑块。
+                        slots: _window.slots,
+                        // 临时员工的消息**不进主消息流**（用户 2026-10-04）：零高度槽位，
+                        // 既不占版面、也不打断下标连续性；它们按 subagent_id 收在
+                        // SubagentTranscript 里，在"那次 subagent 工具调用的详情页"看。
+                        visible: (ChatMessage m) => !m.isSubagentMessage,
+                        revision: _scrollRevision,
+                        // 视口附近补过页：列表在布局阶段补一次滚动位置
+                        padAboveStamp: _padAboveStamp,
+                        // 本帧内容高度在"视口里/视口下方"变了（补页横跨视口顶 / 淘汰）：
+                        // 同样要补偿一次（A3）
+                        contentShiftStamp: _contentShiftStamp,
+                        // 滑到哪加载哪 + 淘汰离得远的槽位（限制缓存长度）
+                        onWindowChanged: _onWindowChanged,
+                        // 「回到底部」= 重载末尾一段（用户 2026-10-04）
+                        onReloadTail: _reloadTail,
+                        onAskAnswer: _handleAskAnswer,
+                        scrollToMessageId: _scrollToMessageId,
+                        scrollToRevision: _scrollToRevision,
+                        bottomJump: _bottomJump,
+                        trailingCards: hasCards
+                            ? <Widget>[
+                                PluginInlineCards(
+                                  agentId: agent.id,
+                                  sessionId: _currentSessionId,
+                                ),
+                              ]
+                            : const <Widget>[],
+                      );
+                    },
                   ),
                 ),
-              ),
-            )
-          else
-            Expanded(
-              // Q12 消息流内联卡片：有插件卡片槽位时，在消息列表末尾追加卡片区
-              // （无卡片时传空列表，列表项数不变，不占位）。
-              child: ListenableBuilder(
-                listenable: PluginUiRegistry.instance,
-                builder: (BuildContext context, Widget? child) {
-                  // 临时员工视角：**同一个窗口**换成它自己的过程（不新开页面）
-                  final String viewId = _effectiveViewId;
-                  if (viewId.isNotEmpty) {
-                    return _buildSubagentView(viewId);
-                  }
-                  final bool hasCards = PluginUiRegistry.instance.hasKind(
-                    PluginUiSlotKind.card,
-                  );
-                  // 临时员工的消息**不进主消息流**（用户 2026-10-04：「subagent 的输出跟主 agent
-                  // 的输出混杂，根本没法分辨，subagent 的工具调用就在 subagent 的调用工具详情里看」）：
-                  // 它们按 subagent_id 收进 [SubagentTranscript]，在"那次 subagent 工具调用的详情页"里看。
-                  return MessageList(
-                    // **槽位表**：全局下标 → 消息（null = 还没加载）。面板原地放置/
-                    // 淘汰，列表据此画占位槽、按全局下标画右侧滑块。
-                    slots: _window.slots,
-                    // 临时员工的消息**不进主消息流**（用户 2026-10-04）：零高度槽位，
-                    // 既不占版面、也不打断下标连续性；它们按 subagent_id 收在
-                    // SubagentTranscript 里，在"那次 subagent 工具调用的详情页"看。
-                    visible: (ChatMessage m) => !m.isSubagentMessage,
-                    revision: _scrollRevision,
-                    // 视口附近补过页：列表在布局阶段补一次滚动位置
-                    padAboveStamp: _padAboveStamp,
-                    // 滑到哪加载哪 + 淘汰离得远的槽位（限制缓存长度）
-                    onWindowChanged: _onWindowChanged,
-                    // 「回到底部」= 重载末尾一段（用户 2026-10-04）
-                    onReloadTail: _reloadTail,
-                    onAskAnswer: _handleAskAnswer,
-                    scrollToMessageId: _scrollToMessageId,
-                    scrollToRevision: _scrollToRevision,
-                    bottomJump: _bottomJump,
-                    trailingCards: hasCards
-                        ? <Widget>[
-                            PluginInlineCards(
-                              agentId: agent.id,
-                              sessionId: _currentSessionId,
-                            ),
-                          ]
-                        : const <Widget>[],
-                  );
-                },
-              ),
-            ),
-          if (agent != null && _terminalMode) ...<Widget>[
-            _buildTerminalDivider(),
-            SizedBox(
-              height: _terminalHeight,
-              child: TerminalPanel(
-                agentId: agent.id,
-                webSocket: _webSocket,
-                onToggle: _toggleTerminal,
-                onClose: _toggleTerminal,
-                // 终端里的 `#TSend` 与手打一条消息走**同一个发送口**（上传附件、
-                // 上屏、WS 帧全一样），不另立一条容易跑偏的旁路
-                onSend: _handleSend,
-              ),
-            ),
-          ] else if (agent != null)
-            MessageInput(
-              // 草稿按 team + session 隔离（M9 Q6）：切 agent/会话各自恢复
-              // 自己没发完的文本与附件，互不串味（终端模式期间它被移出树，
-              // 草稿靠缓存活着，切回来原样还在）
-              cacheKey: '${agent.id}::$_currentSessionId',
-              // 新手引导最后一步把 demo 那句话预填进来（只填不发）
-              prefill: ComposerPrefillRequest.instance,
-              onSend: _handleSend,
-              // 视角切换器：发送键左侧（用户 2026-10-04 要求的落点）
-              bottomTrailing: SubagentViewSwitcher(
-                ownerAgentId: agent.id,
-                ownerName: agent.name,
-                currentSubagentId: _effectiveViewId,
-                onSelect: _switchView,
-              ),
-              // 生成中且没输入内容时，右下角那个位置变成**停止键**（用户 2026-10-04；
-              // 开始打字就换回发送键——发送本身就会中止在途那一轮）。
-              // 看临时员工视角时看的是**它自己**的状态：停止/发消息都只作用在它身上。
-              busy: _viewTargetIsWorking(agent.id),
-              onStop: _handleStop,
-            ),
+              if (agent != null && _terminalMode) ...<Widget>[
+                _buildTerminalDivider(),
+                SizedBox(
+                  height: _terminalHeight,
+                  child: TerminalPanel(
+                    agentId: agent.id,
+                    webSocket: _webSocket,
+                    onToggle: _toggleTerminal,
+                    onClose: _toggleTerminal,
+                    // 终端里的 `#TSend` 与手打一条消息走**同一个发送口**（上传附件、
+                    // 上屏、WS 帧全一样），不另立一条容易跑偏的旁路
+                    onSend: _handleSend,
+                  ),
+                ),
+              ] else if (agent != null)
+                MessageInput(
+                  // 草稿按 team + session 隔离（M9 Q6）：切 agent/会话各自恢复
+                  // 自己没发完的文本与附件，互不串味（终端模式期间它被移出树，
+                  // 草稿靠缓存活着，切回来原样还在）
+                  cacheKey: '${agent.id}::$_currentSessionId',
+                  // 新手引导最后一步把 demo 那句话预填进来（只填不发）
+                  prefill: ComposerPrefillRequest.instance,
+                  onSend: _handleSend,
+                  // 视角切换器：发送键左侧（用户 2026-10-04 要求的落点）
+                  bottomTrailing: SubagentViewSwitcher(
+                    ownerAgentId: agent.id,
+                    ownerName: agent.name,
+                    currentSubagentId: _effectiveViewId,
+                    onSelect: _switchView,
+                  ),
+                  // 生成中且没输入内容时，右下角那个位置变成**停止键**（用户 2026-10-04；
+                  // 开始打字就换回发送键——发送本身就会中止在途那一轮）。
+                  // 看临时员工视角时看的是**它自己**的状态：停止/发消息都只作用在它身上。
+                  busy: _viewTargetIsWorking(agent.id),
+                  onStop: _handleStop,
+                ),
             ],
           ),
         ),
@@ -1729,8 +1963,10 @@ class _MessagePanelState extends State<MessagePanel> {
     setState(() {
       _terminalMode = !_terminalMode;
       if (_terminalMode) {
-        _terminalHeight = (MediaQuery.sizeOf(context).height * 0.4)
-            .clamp(160.0, 420.0);
+        _terminalHeight = (MediaQuery.sizeOf(context).height * 0.4).clamp(
+          160.0,
+          420.0,
+        );
       }
     });
   }
@@ -1743,17 +1979,16 @@ class _MessagePanelState extends State<MessagePanel> {
         behavior: HitTestBehavior.opaque,
         onVerticalDragUpdate: (DragUpdateDetails d) {
           setState(() {
-            _terminalHeight =
-                (_terminalHeight - d.delta.dy).clamp(140.0, 640.0);
+            _terminalHeight = (_terminalHeight - d.delta.dy).clamp(
+              140.0,
+              640.0,
+            );
           });
         },
         child: SizedBox(
           height: 7,
           child: Center(
-            child: Container(
-              height: 1,
-              color: Theme.of(context).dividerColor,
-            ),
+            child: Container(height: 1, color: Theme.of(context).dividerColor),
           ),
         ),
       ),
@@ -1820,6 +2055,57 @@ class _MessagePanelState extends State<MessagePanel> {
             style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
           ),
         ],
+      ),
+    );
+  }
+
+  /// 构建「本轮调用列表」折叠区：挂在上下文长度条下面一带。
+  ///
+  /// 两件事必须成立：
+  /// 1. **有界宽度**：面板内部是一个 `Row`（里面有 `Spacer`），父级必须给出确定的
+  ///    最大宽度——这里用 `Column(crossAxisAlignment: stretch)` 把中栏的宽度摊开传给
+  ///    卡片；不塞进任何宽度未约束的 `Row`；
+  /// 2. **默认收起 + 最多 20 行**：用量是"需要才查"的信息，折叠态只占一行标题，不把
+  ///    中栏的竖向空间挤变形（展开与截断都由面板自己处理）。
+  Widget _buildUsageCallsSection() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 6, 8, 0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          // 说明行占**固定槽位**（没有原因时放零高度占位）：这样下面的
+          // UsageCallsPanel 在元素树里位置恒定，展开状态不会因为一行说明的出现 /
+          // 消失而被重建（折叠状态是面板自己的 State）。
+          _buildCallUsagesNote(),
+          UsageCallsPanel(
+            calls: _callUsages,
+            initiallyExpanded: false,
+            maxRows: _usageCallsMaxRows,
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 账本读不到时的空态说明（**只在一条调用都没有时**出现）。
+  ///
+  /// "读不到账本"（核心没给数据根 / 还没有这个文件 / IO 失败）与"这个会话还没调用过"
+  /// 是两件事，不该都显示成"暂无调用记录"——读不到时给一句人话，并且不抛、不红。
+  Widget _buildCallUsagesNote() {
+    final String note = _callUsages.isEmpty ? _callUsagesNote : '';
+    if (note.isEmpty) return const SizedBox.shrink();
+    final Color color = Theme.of(context).colorScheme.onSurfaceVariant;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Tooltip(
+        message: note,
+        child: Text(
+          note,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(fontSize: 11, height: 1.3, color: color),
+        ),
       ),
     );
   }
@@ -1902,7 +2188,10 @@ class _MessagePanelState extends State<MessagePanel> {
                         ),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: cs.onSurfaceVariant,
+                        ),
                       ),
                     ),
                   ],
@@ -1955,7 +2244,8 @@ class _MessagePanelState extends State<MessagePanel> {
                 // 看临时员工的过程时**锁住会话切换**（用户 2026-10-04 要求）：
                 // 那条过程属于当前会话，切走会话这一屏就没有意义了
                 locked: inSubagentView,
-                lockedHint: '正在看临时员工的过程：先切回主会话再换会话'
+                lockedHint:
+                    '正在看临时员工的过程：先切回主会话再换会话'
                     '（切换器在输入框右下）',
               ),
             ),
@@ -2286,7 +2576,8 @@ class _MessagePanelState extends State<MessagePanel> {
             const SizedBox(height: 12),
             SubagentProcessList(
               messages: transcript,
-              emptyHint: '还没有收到它的过程消息：它可能刚被召来（正在准备），'
+              emptyHint:
+                  '还没有收到它的过程消息：它可能刚被召来（正在准备），'
                   '也可能这一轮只有报告。',
             ),
           ],
@@ -2507,7 +2798,23 @@ class _MessagePanelState extends State<MessagePanel> {
       final String reason = (result['reason'] ?? '') as String;
       final String message;
       if (compressed) {
-        message = '已压缩上下文（当前 ${result['context_size']} 条）';
+        // 压缩**走了哪条路**（内置 / 插件中转站）+ 插件**为什么没接管**：两个键都是
+        // 核心新加的可选键（旧核心不返回），缺键时文案与以前逐字一致。
+        final String source = (result['source'] ?? '') as String;
+        final String via = source == 'relay'
+            ? '插件中转站压缩'
+            : source == 'builtin'
+            ? '内置压缩'
+            : '';
+        final String skip = ((result['relay_skip_reason'] ?? '') as String)
+            .trim();
+        final StringBuffer text = StringBuffer(
+          '已压缩上下文（当前 ${result['context_size']} 条',
+        );
+        if (via.isNotEmpty) text.write('，来源：$via');
+        if (skip.isNotEmpty) text.write('；插件未接管：$skip');
+        text.write('）');
+        message = text.toString();
       } else if (reason == 'no_active_session') {
         message = '该 agent 当前没有活跃的会话上下文';
       } else if (reason == 'too_few_messages') {

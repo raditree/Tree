@@ -1500,37 +1500,97 @@ class ConversationService {
         session,
         force: force,
       );
-      if (result != null && result.compressed && result.degraded) {
-        // 总结模型没跑成功、退化成截断摘要：压缩是压了，但要点可能不全，必须说。
-        // 失败原因一并带出：只报"总结失败"，用户与日志都无从判断是密钥 / 限流 / 网络。
-        final String reason = result.degradedReason.trim();
-        _notifyOnce(
-          'compact-degraded|${agent.id}',
-          () => _sendAdvisory(
-            agent,
-            session,
-            '上下文已压缩，但总结模型调用失败，本次用的是截断摘要（要点可能不全）；'
-            '下一次压缩会重新尝试完整总结。'
-            '${reason.isEmpty ? '' : '\n失败原因：$reason'}',
-          ),
-        );
+      if (result != null && result.compressed) {
+        // 压缩已发生 / 降级 / 插件为什么没接管：统一走**落库**通路，刷新后仍在
+        _notifyCompacted(agent, session, result);
       }
       return result?.compressed ?? false;
     } catch (error) {
       // CompactionService 内部已对"总结失败"做了回退；这里兜的是存储层等
-      // 非预期异常。宁可这轮上下文大一点，也不能因此拒绝回复——但要让用户看见。
+      // 非预期异常。宁可这轮上下文大一点，也不能因此拒绝回复——但要让用户看见，
+      // 且刷新后仍在（落库，见 [_notifyCompacted] 的说明）。
       _notifyOnce(
         'compact-failed|${agent.id}|$error',
-        () => _sendAdvisory(
+        () => _sendNotice(
           agent,
           session,
           '上下文压缩失败：$error\n'
           '本轮会按未压缩的上下文继续（更可能撞上模型上限）；'
           '可在会话里手动压缩重试。',
+          llmHidden: true,
         ),
       );
       return false;
     }
+  }
+
+  /// 「压缩已发生 / 降级 / 插件没接管」的可见提示——**落库**（`llm_hidden` 消息）。
+  ///
+  /// 为什么必须落库：这几条以前走 [_sendAdvisory]（只 broadcast、不落库），刷新或
+  /// 重连后历史里就没有了，用户事后想核对"这次压缩走的是哪条路、插件为什么没接管"
+  /// 只剩服务端账单可猜——而"压缩到底跑了几次、走的哪条路"正是本次要查的东西。
+  /// 落成 `llm_hidden` 消息后：用户看得到、模型看不到（不插进下一轮提示词）、
+  /// 刷新后仍在。
+  ///
+  /// **每次压缩记一条**（不做进程内去重）：压缩是真实发生过的上下文事件，去重会
+  /// 把"跑了几次"这件事重新藏起来。降级信息并进同一条，避免两次压缩之间刷两条。
+  ///
+  /// **自动压缩与手动压缩（REST / 执行站 `agent.compact`）共用这一条文案口径**：
+  /// 手动那条由 [notifyCompactionResult] 进来，别在别处复制第二套文案。
+  void _notifyCompacted(
+    CoreAgent agent,
+    CoreSession session,
+    CompactionResult result,
+  ) {
+    final String via = switch (result.source) {
+      compactionSourceRelay => '插件中转站压缩',
+      compactionSourceBuiltin => '内置压缩',
+      _ => '',
+    };
+    final StringBuffer text = StringBuffer('上下文已压缩')
+      ..write(via.isEmpty ? '' : '（来源：$via）')
+      ..write('，当前 ${result.contextSize} 条');
+    // 只有"没走中转站"时才谈"插件为什么没接管"（接管成功了就没有这回事）；
+    // 而且**只写"有订阅者却没接管"**那类：早退（没装插件 / 总开关关 / 作用域不匹配 /
+    // 无点位）写进历史只会让没装压缩插件的用户每条通知都多一句废话。
+    // REST 响应不受此过滤影响（那里要全量，见 CompactionResult.relaySkipReason）。
+    final String skip = result.relaySkipReason.trim();
+    if (result.source != compactionSourceRelay &&
+        result.relaySkipHasSubscriber &&
+        skip.isNotEmpty) {
+      text.write('\n这次插件没有接管：$skip');
+    }
+    if (result.degraded) {
+      final String reason = result.degradedReason.trim();
+      text.write(
+        '\n但总结模型调用失败，本次用的是截断摘要（要点可能不全）；'
+        '下一次压缩会重新尝试完整总结。',
+      );
+      if (reason.isNotEmpty) text.write('\n失败原因：$reason');
+    }
+    _sendNotice(agent, session, text.toString(), llmHidden: true);
+  }
+
+  /// **手动压缩**（REST `POST /api/agents/{id}/compact`、执行站 `agent.compact`）
+  /// 的结论通知：压动了就落一条 `llm_hidden` 会话消息。
+  ///
+  /// 为什么要有这个公开入口：手动压缩发生在 [CoreServer] 里，它手上没有 agent/session
+  /// 对象、也不该复制一套文案——文案口径只有一处（[_notifyCompacted]），自动压缩与
+  /// 手动压缩因此**形状完全一致**（同一个 `llm_hidden` 机制、同一条文案）。
+  /// 用户在界面上点「压缩」后刷新页面，历史里仍能看到"压缩已发生（来源：…）"。
+  ///
+  /// 没压动（`reason` 那几种）不落库：那是"无事发生"，前端 SnackBar 已经说清了。
+  void notifyCompactionResult(
+    String agentId,
+    String sessionId,
+    CompactionResult result,
+  ) {
+    if (!result.compressed) return;
+    final CoreAgent? agent = store.agent(agentId);
+    if (agent == null) return;
+    final CoreSession? session = store.session(agentId, sessionId);
+    if (session == null) return;
+    _notifyCompacted(agent, session, result);
   }
 
   /// 模型没配 max_seqlen 时的可见提示（Q1-③：不再默默兜 128000）。
@@ -1574,11 +1634,12 @@ class ConversationService {
     _sendNotice(agent, session, text, llmHidden: true);
   }
 
-  /// 推一条**不落库**的 agent 提示（诊断用），前端收到 message 帧就会渲染。
+  /// 推一条**不落库**的 agent 提示（只 broadcast），前端收到 message 帧就会渲染。
   ///
-  /// 为什么不复用 [_sendNotice]：那些诊断（压缩失败 / 模型没配 max_seqlen / 压缩
-  /// 降级）往往发生在"用户消息已落库、模型还没回答"之间，落库会让它插进上下文里，
-  /// 模型下一轮会拿这条系统提示当对话内容来回。前端可见即可，历史里不留噪声。
+  /// **什么时候才该用它**：提示只在"当下"有意义、且每一轮都可能重复时（目前只剩
+  /// "模型没配 max_seqlen"这一条：它每次都成立，落库会把历史刷满）。凡是"事后还要
+  /// 能查"的（压缩已发生 / 降级 / 插件没接管 / 压缩失败），一律走 [_sendNotice]
+  /// 的 `llmHidden: true` 落库通路——刷新后仍在，见 [_notifyCompacted]。
   ///
   /// 注：协议里没有独立的"状态栏"帧，message 帧是当前唯一前端可见的通道。
   void _sendAdvisory(CoreAgent agent, CoreSession session, String content) {

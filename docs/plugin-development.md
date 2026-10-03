@@ -255,7 +255,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.relay.tool.post` | 同上 + `result`, `is_error` | 改后的报文（改 `result` / `is_error`）或**字符串**（只换结果文本） |
 | `system.relay.llm.handle` | `request:{model, messages, tools, max_tokens, temperature, reasoning_effort, stream}`, `turn`, `agent_id`, `session_id`（**单实例插件靠这两个字段就知道"这一次是谁在问"，不必等事件**） | 见 §5.4 |
 | `system.relay.llm.request` | 同 `request` | 改后的请求体（`{model, messages, tools, max_tokens, …}`，未识别字段会透传进请求体）或 `null` |
-| `system.relay.context.compact` | `system_prompt`（内置拼装的系统提示词，放在提示词槽位用）, `request`（**引擎这一轮真会发的那份线形请求** `{model, messages, tools, …}`——唯一的原料与缓存前缀）, `total_message_count`, `compacted_message_count`（当前水位线）, `existing_summary`, `compacted` | `{messages: [{role, content, …}, …], covered_message_count: N}`；`null` = 用内置 compact |
+| `system.relay.context.compact` | `system_prompt`（内置拼装的系统提示词，放在提示词槽位用）, `request`（**引擎这一轮真会发的那份线形请求** `{model, messages, tools, …}`——唯一的原料与缓存前缀）, `total_message_count`, `compacted_message_count`（当前水位线）, `existing_summary`, `compacted`, **`usage_file` + `recent_usage`**（可选：该会话用量账本的路径与最近 50 行，见下） | `{messages: [{role, content, …}, …], covered_message_count: N}`；`null` = 用内置 compact |
 | `system.relay.prompt.system` | `default`（核心构造的完整 system prompt） | 最终 system prompt 字符串（空串 = 明确不要系统提示词）；`null` = 用 `default` |
 
 > **压缩点位：原料只有"引擎真会发的那份"（2026-10 定稿）**。只要这个点位有订阅者，
@@ -306,6 +306,30 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 >   compact 接手时清掉你的列表）。要么稳定接管、要么干脆别订；
 > - 同一个点位**每轮压缩只问一次**，且此时这一轮生成是阻塞等你回包的（无静态超时，
 >   靠心跳续期，见 §5.1）。
+>
+> **可选字段：`usage_file` + `recent_usage`（逐调用用量，2026-10-03）**
+>
+> 逐调用用量账本在**数据根**下的会话目录里（`data/<agent>/<session>/usage.jsonl`），
+> 而插件**读不到数据根**（`fs.read` 只在你的工作空间作用域内）——所以核心在压缩载荷里
+> 捎上"最近一批"：`usage_file` 是该会话账本的绝对路径（**只作排障**，你打不开它），
+> `recent_usage` 是**解析后的行对象**（早 → 晚，最多 50 行；形状与 `usage.jsonl` 的行
+> 完全一致）。它是个**滚动窗口**：每次压缩请求都重发同一批行，按行去重后再展示。
+>
+> ```jsonc
+> // usage.jsonl 的一行（recent_usage 的元素同形）
+> {"at": "2026-10-03T16:31:55.000000",   // ISO-8601 本机时区字符串
+>  "source": "compact",                   // turn | compact | llm.call | plugin
+>  "model": "…", "prompt_tokens": 1200, "cached_tokens": 900,  // cached 可为 null
+>  "completion_tokens": 120, "estimated": false, "duration_ms": 1800}
+> ```
+>
+> - `source` 四类：`turn` = 对话自己的跳；**`compact` = 内置压缩的那次总结**；
+>   `llm.call` = 执行站一次性调用（你的总结调用就在其中）；`plugin` = `llm.handle`
+>   被插件整体接管的一跳。
+> - **未接线 / 账本还不存在 ⇒ 载荷里干脆没有这两个键**（"没有这条通路"与"确实还没
+>   调用过"是两件事，别把缺键当成空数组）；读失败也只记一句日志，**不影响这次压缩**
+>   （遥测 fail-open）。
+> - 用量**不参与压缩决策**：它是给面板/日志看的账，不是水位线的依据。
 >
 > **缓存是长会话省钱的关键**：把 `request.messages` 整段当自己 `llm.call` 的 `messages`
 > 前缀，**末尾只追加一条 user 指令**（含 "json" 字样），并把 `request.tools` 原样透传
@@ -519,17 +543,42 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 
 | `slot` | 位置 | 备注 |
 |---|---|---|
-| `activity` | 左侧活动栏条目 | 点击回调走 `plugin_ui_action` 上行帧 |
+| `activity` | **左栏整页**：左侧活动栏的一个图标项 + 左栏里的一整页内容（同一个槽位两处呈现） | 点击回调走 `plugin_ui_action` 上行帧 |
 | `panel` | 右栏 Tab | 声明后才出现 |
 | `status` | 状态条 | 单行 |
 | `card` | 消息流内联卡片 | **必须先声明**；未声明的 `slot_key` 会被前端静默丢弃（这是最常见的"我推了但看不到"） |
 
 视图是**受限控件集的 JSON**（`column` / `row` / `text` / `button` / `divider` / `image` /
-`list` 等，风格 `body|title|caption|mono`）：不执行任何插件 JS。按钮点击会以
-`plugin_ui_action` 上行帧回到你的进程（含 `slot_key` / `action` / 参数）。
+`list` 等，风格 `body|title|caption|mono`）：不执行任何插件 JS。
 
 `ui.push`（执行站命令）适合"随对话出现"的卡片：`slot_key` 必须是已声明的 `card` 槽位；
 `view` 省略 = 注销该卡片。
+
+**面板交互的线上形状**（前端 → 核心 → 插件）—— 两段形状**不一样**，判错就是"按钮点了没反应"：
+
+```jsonc
+// ① 前端 → 核心（WS 上行帧）
+{"type":"plugin_ui_action","data":{
+  "plugin_id":"demo","team_id":"team_1","agent_id":"agent_1","session_id":"session_default",
+  "slot_key":"demo.activity.1","action_id":"refresh","payload":{}}}
+
+// ② 核心 → 插件（**event 通知**，与 agent.tool_call 同一范式）
+{"jsonrpc":"2.0","method":"event","params":{
+  "event":"plugin_ui_action",          // ← 判据在这个键上，不是 method
+  "plugin_id":"demo","team_id":"team_1","agent_id":"agent_1","session_id":"session_default",
+  "slot_key":"demo.activity.1","action_id":"refresh","payload":{}}}
+```
+
+- **判据必须写在 `params["event"]` 上**：`if params.get("event") == "plugin_ui_action"`。
+  写成 `if method == "plugin_ui_action"` 永远不命中（核心的 `method` 一律是 `event`），
+  表现就是"面板按钮点了没反应"，且**没有任何报错**——最容易浪费半天的坑。
+- `payload` 的语义由**插件**解释（核心只透传）：按钮点击 = 按钮声明的 `payload`；
+  表单提交 = `submit.payload` 与各字段值合并（**字段值覆盖同名键**）。
+- 动作是**单向通知**：核心不解释语义、也不回执。插件要"反馈"只能自己再推一帧
+  `ui/update`（或 `log`）；操作失败**务必**写进 `log` 通知，否则用户在界面上看不到任何反应。
+- 插件不在线时核心会**显式回一帧 `error` 并记日志**（不静默丢弃）；未知 `action_id`
+  由插件自己决定怎么处理（示例插件记一条 `log` 通知 + 忽略）。
+
 
 **槽位生命周期**（2026-10-02 起的前端口径）：槽位跟着"插件是否在运行"走——
 
@@ -591,7 +640,7 @@ plugins:
 | 面板 | 设置 → 插件开发：「插件」段看实例状态与订阅，**「站点」段看每个点位**的订阅者/计数（`requests` / `responded` / `timeout` / `no_subscriber` 等） |
 | 骨架探针 | 先用 §1 的最小骨架跑通 `hello` / `ping` / `tools/list`，再加站点订阅；不要一上来就写全功能 |
 | 不用真核心自测 | 写一个假核心：按 §2 的报文往你的 stdin 写，读你的 stdout 断言（示例仓库里的 `sample_plugin.py --selftest` 就是这么做的） |
-| 常见坑 | ① stdout 混入日志 ⇒ 解析失败；② 单线程顺序处理 ⇒ 自锁 + 心跳丢失；③ 忘了 `ui/manifest` 声明 `card` 槽位 ⇒ 推了看不到；④ 订阅写了错的 `mode_key` ⇒ 收不到消息；⑤ 流式接管忘了 `done` ⇒ 该轮一直等（最终被取消/心跳判死） |
+| 常见坑 | ① stdout 混入日志 ⇒ 解析失败；② 单线程顺序处理 ⇒ 自锁 + 心跳丢失；③ 忘了 `ui/manifest` 声明 `card` 槽位 ⇒ 推了看不到；④ 订阅写了错的 `mode_key` ⇒ 收不到消息；⑤ 流式接管忘了 `done` ⇒ 该轮一直等（最终被取消/心跳判死）；⑥ **面板按钮判据写成 `method == "plugin_ui_action"`** ⇒ 永远不命中，表现为"点了没反应"（真实形状见 §7.2，判据在 `params.event` 上） |
 
 ---
 
@@ -618,7 +667,10 @@ plugins:
   自建站点（`--self-station`）、心跳与 `--selftest`。
 - [`examples/plugins/compact_plugin.py`](../examples/plugins/compact_plugin.py)：**内置插件
   「上下文压缩」**——`system.relay.context.compact` 的完整实现（摘要 + 必读文件 + todo 快照，
-  编排 `llm.call` / `fs.read` / `tool.call`），也是"压缩点位怎么接"的活文档。
+  编排 `llm.call` / `fs.read` / `tool.call`），也是"压缩点位怎么接"的活文档。它还带一个
+  **左栏面板**（`activity` 槽位 = 活动栏图标 + 左栏整页）：最近 N 次压缩的时间 / 来源 /
+  覆盖条数 / 耗时 / 降级与未接管原因，加一个「立即压缩一次」按钮（执行站 `agent.compact`）
+  ——"面板 + 面板动作回传"这份契约的可运行答案（`--no-panel` 可关掉面板）。
 - 三个脚本都**只用标准库**、都能被绝对路径启动（不依赖 cwd）。
 - 尚未提供可运行示例的点位：`system.relay.llm.request`（投入前改写）——口径见 §5.3，
   接法与其他中转点位完全一致。

@@ -17,6 +17,7 @@ class CoreHandshake {
     required this.pid,
     required this.version,
     this.host = '127.0.0.1',
+    this.dataRoot = '',
   });
 
   /// `event` 字段固定值：核心已就绪。
@@ -37,6 +38,30 @@ class CoreHandshake {
   /// 核心版本号。
   final String version;
 
+  /// 核心进程的**数据根目录**（`TreePaths.root`；老核心不给时为**空串**）。
+  ///
+  /// 为什么握手要带上它：父进程（Flutter 应用）**没有**数据根的任何权威来源——
+  /// 拉起核心时不传 `--data-dir`（[CoreHandshake] 本就是唯一的进程间启动契约），
+  /// 环境变量也可能没设。而"打开日志目录 / 看最近 N 行"这类入口必须知道核心把
+  /// `<数据根>/logs/core.log` 写到哪了，否则只能猜 `%APPDATA%\Tree`。
+  ///
+  /// **可选字段**（2026-10-03 新增）：老前端收到多余键必须不报错（[decode] 本就
+  /// 容忍未知键）；新前端拿不到时按空串处理，退回"没有日志入口"而不是报错。
+  final String dataRoot;
+
+  /// 带数据根的一份拷贝。
+  ///
+  /// 为什么需要它：握手信封由 `CoreServer.handshake` 产出（核心库不知道数据根，
+  /// 那是**入口**的知识），入口拿到后据此补上，避免把数据根塞进核心库的构造链。
+  CoreHandshake withDataRoot(String dataRoot) => CoreHandshake(
+    host: host,
+    port: port,
+    token: token,
+    pid: pid,
+    version: version,
+    dataRoot: dataRoot,
+  );
+
   /// HTTP 基址，形如 `http://127.0.0.1:54321`。
   String get httpBaseUrl => 'http://$host:$port';
 
@@ -44,6 +69,9 @@ class CoreHandshake {
   String get wsBaseUrl => 'ws://$host:$port';
 
   /// 序列化为信封 Map。
+  ///
+  /// [dataRoot] 为空（老核心 / 附着模式）时**不写该键**：省得让"没这个信息"看起来
+  /// 像"数据根是空串"，也让新核心在没配数据根时的输出与旧形状逐字一致。
   Map<String, dynamic> toJson() => <String, dynamic>{
     'event': readyEvent,
     'host': host,
@@ -51,6 +79,7 @@ class CoreHandshake {
     'token': token,
     'pid': pid,
     'version': version,
+    if (dataRoot.isNotEmpty) 'data_root': dataRoot,
   };
 
   /// 序列化为**单行** JSON（stdout 一行，父进程逐行读取）。
@@ -76,12 +105,17 @@ class CoreHandshake {
     if (port == null || port <= 0 || token == null || token.isEmpty) {
       return null;
     }
+    // 可选字段取"宽容读法"：类型不对（老/坏核心写了非字符串）当没有，
+    // 绝不让父进程在解析握手时抛异常——那会表现成"核心进程未能启动"。
+    final Object? rawRoot = decoded['data_root'];
     return CoreHandshake(
       host: decoded['host'] as String? ?? '127.0.0.1',
       port: port,
       token: token,
       pid: (decoded['pid'] as num?)?.toInt() ?? 0,
       version: decoded['version'] as String? ?? '',
+      // 老核心不给 ⇒ 空串（前端据此退回"没有日志入口"，不报错）
+      dataRoot: rawRoot is String ? rawRoot : '',
     );
   }
 }

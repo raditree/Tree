@@ -15,6 +15,38 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
+## [1.0.1] — 2026-10-03
+
+### 断言变化（新增 / 修改的 README 不变量）
+
+- **核心日志有唯一出口，且永不抛、永不阻塞**（新增
+  [util/README.md](packages/tree_core/lib/src/util/README.md) 不变量 8、
+  [tree_core_cli/README.md](packages/tree_core_cli/README.md) 不变量 1 补充）：
+  所有 `[core:*]` 日志 = stderr（逐字不变）**加**落盘 `<数据根>/logs/core.log`
+  （8 MiB × 5 轮转、行带 pid）；写文件失败只提示一次并降级为纯 stderr；关停 `flush()`。
+  应用侧据此在「设置 → 核心日志」提供"查看最近 N 行 / 打开日志目录"（经握手 `data_root`）。
+- **握手新增可选字段 `data_root`，且可选字段必须向后兼容**（
+  [tree_protocol/README.md](packages/tree_protocol/README.md) 握手字段表 `data_root?`、不变量 4 补充）：
+  为空时不写键 ⇒ 老前端零感知；缺失/脏值一律宽容读成空串、不抛。
+- **逐调用用量账本（`usage.jsonl`）的契约与落账口**（新增
+  [store/README.md](packages/tree_core/lib/src/store/README.md) 不变量 12）：
+  一行一次 LLM 调用（`at` / `source` / `model` / `prompt_tokens` / `cached_tokens` /
+  `completion_tokens` / `estimated` / `duration_ms`）；**每一跳都记**（端点不回 usage 时用本地估算并标
+  `estimated`），插件接管跳记 `source=plugin`、内置压缩记 `source=compact`、执行站 `llm.call` 记
+  `source=llm.call`；`cached_tokens` 缺失写 `null`（不编造 0）；**`messages.jsonl` 的 `usage` 键集逐键不变**（有断言钉住）。
+  压缩的"来源 / 是否降级 / 插件为什么没接管"随一条**落库**的通知可见（刷新后仍在，手动压缩同样留痕）。
+- **中栏消息流的补页补偿必须取"实测高度差"，不得取"滚动范围差"**（
+  [lib/README.md](lib/README.md) 不变量 19 补充）：懒构建列表未到底时 `maxScrollExtent` 是外推值
+  （误差 ∝ 剩余条数），用它做补偿会在补页帧产生上千像素跳变；补偿量取自视口内锚点的**实测顶边差**，
+  并以"视口高 × 2"限幅兜底；补页与淘汰不同帧；视口内「占位槽 → 真消息」须预补偿。
+- **插件面板的动作回传判据是 `params.event`，不是 `method`**（
+  [docs/plugin-development.md](docs/plugin-development.md) §7.2 补线上形状）：
+  核心发的是 `{"method":"event","params":{"event":"plugin_ui_action", …}}`；
+  `activity` 槽位 = 活动栏图标 + 左栏整页；压缩中转 payload 另带**可选**键
+  `usage_file` / `recent_usage`（最近 50 行逐调用用量，总线侧限幅、缺键 = "没有这条通路"、
+  fail-open 绝不影响压缩）——compact 面板据此把"来源"列显示出 `builtin` / `llm.call` / `plugin`
+  与每次调用的耗时、token（`cached_tokens` 缺失时留白、不编造 0）。
+
 ## [1.0.0] — 未发布（首个开源版本）
 
 ### 断言变化（新增 / 修改的 README 不变量）

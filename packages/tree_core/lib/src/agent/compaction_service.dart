@@ -4,6 +4,7 @@ import 'dart:math';
 import '../llm/llm_result_gate.dart';
 import '../settings/core_settings.dart';
 import '../store/tree_store.dart';
+import '../store/usage_log.dart';
 import '../util/tokens.dart';
 import 'attachment_prompt.dart';
 import 'workspace_prompt.dart';
@@ -127,6 +128,17 @@ class CompactionService {
   /// 总结器（生产用 LlmSummarizer，测试注入假实现）；null = 不具备压缩能力。
   final ContextSummarizer? summarizer;
 
+  /// **逐调用用量账本**（`source=compact` 那一类账）；null = 不落账。
+  ///
+  /// 为什么是**可写字段**：压缩服务由核心进程（CLI）构造、`UsageLog` 要数据根，
+  /// 两边都在 CLI 手上，接线就一行（`compaction.usageLog = usageLog`）——与
+  /// [relayHook] / [noticeSink] 同一个范式。
+  ///
+  /// 为什么账目**按次**交给总结器（`summarize(..., usageSink:)`）而不是在这里设一个
+  /// 共享字段：不同会话可以**同时**压缩（见 [_compacting] 的键），共享字段会让 A 这次
+  /// 压缩的账落到 B 的会话上。
+  UsageLog? usageLog;
+
   /// 压缩过程的中转点（插件可以先接管）；null = 未接线（回退 [summarizer]）。
   ///
   /// 接线后**即使 [summarizer] 为 null 也算具备压缩能力**——否则"把压缩交给插件"
@@ -151,6 +163,30 @@ class CompactionService {
   /// 把这条提示落成一条 `llm_hidden` 的消息：用户看得到"压缩在重试"，模型看不到。
   void Function(String agentId, String sessionId, String text)? noticeSink;
 
+  /// 中转站「**为什么没接管**」的原因出口（可写字段，与 [noticeSink] 同范式）：
+  /// `(agentId, sessionId, 人话原因, hasSubscriber:)`。
+  ///
+  /// [hasSubscriber] 是**分级位**：`false` = 早退（总开关关 / 作用域不匹配 / 无点位 /
+  /// 无订阅者，压根没插件在这条路上）；`true` = 有插件订阅却没交出可用结果。REST
+  /// 响应要全量（排障），会话历史里的通知只写后者（见
+  /// [CompactionResult.relaySkipHasSubscriber]）。
+  ///
+  /// 两个来源都经它上报：
+  /// - 压缩服务自己判出来的（中转点抛异常 / 回传的水位线越界）；
+  /// - 插件总线判出来的，由接线方把 `PluginBus.compactionSkipSink` 接到
+  ///   [noteRelaySkip]——总线与压缩服务在构造期互不可见，与 [relayHook] 同一个理由。
+  ///
+  /// **生产不接它也是完整的**：原因随 [CompactionResult.relaySkipReason] 上行
+  /// （REST 可选键 `relay_skip_reason`）并落成会话提示。接上它 = 让第三方（日志 /
+  /// 面板）也能实时看到每一条"没接管"的原因。
+  void Function(
+    String agentId,
+    String sessionId,
+    String reason, {
+    required bool hasSubscriber,
+  })?
+  relaySkipSink;
+
   /// 是否具备压缩能力（内置总结器或插件中转点任一生效）。
   bool get canCompact => summarizer != null || relayHook != null;
 
@@ -174,6 +210,45 @@ class CompactionService {
 
   /// 正在压缩的「agent::session」（防双击 + 自动/手动互斥）。
   final Set<String> _compacting = <String>{};
+
+  /// 最近一次"中转站没接管"的原因 + 分级，按 `agent::session` 记（见 [relaySkipSink]）。
+  ///
+  /// 为什么不是一个标量：不同会话可以同时压缩（[_compacting] 只挡同一个
+  /// `agent::session`），标量会被并发写串。
+  final Map<String, _RelaySkip> _relaySkips = <String, _RelaySkip>{};
+
+  /// 记录一条"中转站没接管"的原因：总线经 `PluginBus.compactionSkipSink` 接到这里。
+  ///
+  /// 公开是为了**接线**（总线与压缩服务在构造期互不可见，与 [relayHook] 同一个理由）；
+  /// 原因与分级同时转发给 [relaySkipSink]，并被本次压缩的结论
+  /// （[CompactionResult.relaySkipReason] / [CompactionResult.relaySkipHasSubscriber]）
+  /// 带走。
+  void noteRelaySkip(
+    String agentId,
+    String sessionId,
+    String reason, {
+    required bool hasSubscriber,
+  }) {
+    if (reason.isEmpty) return;
+    _relaySkips[_key(agentId, sessionId)] = _RelaySkip(
+      reason,
+      hasSubscriber: hasSubscriber,
+    );
+    relaySkipSink?.call(
+      agentId,
+      sessionId,
+      reason,
+      hasSubscriber: hasSubscriber,
+    );
+  }
+
+  /// 本会话"中转站没接管"的原因（空串 = 接管成功 / 根本没接中转点）。
+  String _relaySkipOf(String agentId, String sessionId) =>
+      _relaySkips[_key(agentId, sessionId)]?.reason ?? '';
+
+  /// 这次没接管是不是"有订阅者但没接管"（见 [_RelaySkip.hasSubscriber]）。
+  bool _relaySkipHasSubscriberOf(String agentId, String sessionId) =>
+      _relaySkips[_key(agentId, sessionId)]?.hasSubscriber ?? false;
 
   static String _key(String agentId, String sessionId) =>
       '$agentId::$sessionId';
@@ -356,6 +431,9 @@ class CompactionService {
       agent,
       sessionId: session.sessionId,
     );
+    // 本轮重新收集"中转站为什么没接管"：上一次的结论不能留到这一次（否则会拿着
+    // 上一轮的原因解释这一轮的降级）
+    _relaySkips.remove(_key(agent.id, session.sessionId));
     // ① **中转站优先，且规划也归它**：不算切点、不拼提示词，整份原料交出去。
     //    它接管 ⇒ 拿到整份新上下文 + 覆盖条数，直接落库返回。
     final CompactionResult? relayed = await _compactViaRelay(
@@ -367,12 +445,21 @@ class CompactionService {
     );
     if (relayed != null) return relayed;
     // ② 没接中转点 / 这轮不接管 ⇒ 系统内置 compact（与接线前逐字一致）
+    //    "为什么没接管"随结论上行（未接中转点时为空 = JSON 里不出现该键），
+    //    外加一个分级位：会话通知只写"插件在场却没接管"那类（见 [CompactionResult]）
+    final String relaySkip = _relaySkipOf(agent.id, session.sessionId);
+    final bool relaySkipHasSubscriber = _relaySkipHasSubscriberOf(
+      agent.id,
+      session.sessionId,
+    );
     final List<CoreMessage> visible = all.sublist(frozen);
     if (visible.length <= 1) {
       return CompactionResult(
         reason: 'too_few_messages',
         contextSize: visible.length + (frozen > 0 ? 1 : 0),
         sessionId: session.sessionId,
+        relaySkipReason: relaySkip,
+        relaySkipHasSubscriber: relaySkipHasSubscriber,
       );
     }
     final KeepPlan plan = buildPlan(visible);
@@ -384,6 +471,8 @@ class CompactionService {
         reason: tooFew ? 'too_few_messages' : 'nothing_to_summarize',
         contextSize: 1 + plan.keep.length,
         sessionId: session.sessionId,
+        relaySkipReason: relaySkip,
+        relaySkipHasSubscriber: relaySkipHasSubscriber,
       );
     }
     final SummaryText summarized = await _summarize(
@@ -409,6 +498,10 @@ class CompactionService {
       summary: summarized.text,
       sessionId: session.sessionId,
       source: compactionSourceBuiltin,
+      // 中转站这轮没接管的原因（未接中转点时为空的 ⇒ JSON 里不出现该键）：
+      // 用户最常问的正是"我装了压缩插件，为什么这次是内置压的"。
+      relaySkipReason: relaySkip,
+      relaySkipHasSubscriber: relaySkipHasSubscriber,
       // 总结模型调用失败、退化成截断摘要：压缩本身成功了，但要点可能不全，
       // 调用方要把这件事显示给用户（Q1-③：压缩失败必须可见）。
       // 失败原因一并带出：只报"总结失败"用户无从判断是密钥、限流还是网络。
@@ -424,6 +517,11 @@ class CompactionService {
   /// - `coveredMessageCount ∈ [当前水位线, 原文总条数]`——水位线是"下一轮从哪继续"
   ///   的唯一依据，比内置更宽松（允许等于总条数 = 整份都覆盖了）但绝不允许倒退；
   /// - 消息数组的形状由总线侧用 `LlmMessage.tryFromWire` 逐条验过。
+  ///
+  /// **每一处"不接管"都会带一句人话原因**（[noteRelaySkip]）：总线侧的那些由
+  /// `PluginBus.compactionSkipSink` 在 `relay(...)` 内同步上报，这里补自己判出来的
+  /// （异常 / 水位线越界）与"hook 没给原因"的兜底；结论由调用方
+  /// （[_compact]）带进 [CompactionResult.relaySkipReason]。
   Future<CompactionResult?> _compactViaRelay(
     CoreAgent agent,
     CoreSession session, {
@@ -456,15 +554,40 @@ class CompactionService {
       );
     } catch (error) {
       log?.call('压缩中转点异常（回退内置 compact）：$error');
+      noteRelaySkip(
+        agent.id,
+        session.sessionId,
+        '压缩中转点异常：$error',
+        hasSubscriber: true,
+      );
       return null;
     }
-    if (reply == null) return null;
+    if (reply == null) {
+      // 总线侧在每处"不接管"分支都上报过原因（见 PluginBus.compactionSkipSink）；
+      // 换成别的 hook 实现时可能没有任何上报——那就明说"没给原因"，别让用户猜。
+      if (_relaySkipOf(agent.id, session.sessionId).isEmpty) {
+        noteRelaySkip(
+          agent.id,
+          session.sessionId,
+          '未给出具体原因',
+          hasSubscriber: true,
+        );
+      }
+      return null;
+    }
     final int covered = reply.coveredMessageCount;
     if (covered < frozen || covered > all.length) {
       log?.call(
         '压缩中转回传的 covered_message_count=$covered 越界'
         '（合法区间 $frozen..${all.length}，原文 ${all.length} 条 / 当前水位线 $frozen）：'
         '按未接管处理，回退内置 compact',
+      );
+      noteRelaySkip(
+        agent.id,
+        session.sessionId,
+        '插件回传的 covered_message_count=$covered 越界'
+        '（须在 $frozen..${all.length} 内）',
+        hasSubscriber: true,
       );
       return null;
     }
@@ -479,6 +602,8 @@ class CompactionService {
       '（本次新增 ${covered - frozen}），上下文 ${reply.messages.length} 条'
       '（agent=${agent.id}）',
     );
+    // 接管成功 ⇒ 这一轮没有"没接管"的原因（原因已在 _compact 开头清过）
+    _relaySkips.remove(_key(agent.id, session.sessionId));
     return CompactionResult(
       compressed: true,
       // 压缩后引擎会看到的条数 = 中转站给的列表 + 水位线之后的原文
@@ -576,6 +701,8 @@ class CompactionService {
         prompt,
         onNotice: (String notice) =>
             noticeSink?.call(agent.id, session.sessionId, notice),
+        // 逐调用账目：绑定**本会话**的 sink（每次压缩现绑，避免并发压缩串账）
+        usageSink: usageLog?.sinkFor(session.sessionId),
       );
       return SummaryText('$summaryHeader\n$text');
     } catch (error) {
@@ -695,10 +822,15 @@ abstract interface class ContextSummarizer {
   ///
   /// [onNotice]：过程提示（目前只有"重试进度"）——总结器在传输层重试时回调，
   /// 由 [CompactionService.noticeSink] 接到会话层落成 `llm_hidden` 消息。
+  ///
+  /// [usageSink]：**这一次压缩**的逐调用用量出口（可注入；[CompactionService.usageLog]
+  /// 非空时由它给出，[UsageLog.sinkFor] 绑定会话）。为什么按次传：不同会话可以同时
+  /// 压缩，总结器实例是共享的，用可变字段会串账。
   Future<String> summarize(
     CoreAgent agent,
     String prompt, {
     void Function(String notice)? onNotice,
+    UsageSink? usageSink,
   });
 
   /// 释放资源（幂等）。
@@ -719,6 +851,8 @@ class CompactionResult {
     this.degraded = false,
     this.degradedReason = '',
     this.source = '',
+    this.relaySkipReason = '',
+    this.relaySkipHasSubscriber = false,
   });
 
   /// 是否真的执行了压缩。
@@ -764,6 +898,26 @@ class CompactionResult {
   /// 出错时的 HTTP 状态码。
   final int status;
 
+  /// **中转站为什么没接管**这回压缩（人话原因；接管成功 / 没接中转点时为空的）。
+  ///
+  /// 这是"我装了压缩插件，为什么这次还是内置压的"的唯一答案：以前这个原因只进
+  /// stderr，用户在界面上永远看不到。它随 REST 响应上行（可选键
+  /// `relay_skip_reason`，空时不出现 ⇒ 老前端零感知）。
+  ///
+  /// **REST 要全量，会话通知只要"插件在场却没接管"**：后者由
+  /// [relaySkipHasSubscriber] 分级决定（见那里的说明）。
+  final String relaySkipReason;
+
+  /// 上面那条原因是不是发生在"**有插件订阅**这个点位"之后。
+  ///
+  /// - `true`：插件在场却没交出可用结果（没回包 / 原数据放行 / 回包非法 / 越界 /
+  ///   异常）⇒ **值得写进会话历史**，用户查得到"为什么这次没走插件"；
+  /// - `false`：早退（插件总开关关 / 作用域不匹配 / 无点位 / 无订阅者）⇒ 只是
+  ///   "没人干这事"，写进历史只会让没装压缩插件的用户每条通知都多一句废话。
+  ///
+  /// **不随 REST 响应输出**（那是排障面，只要有 [relaySkipReason]）。
+  final bool relaySkipHasSubscriber;
+
   Map<String, dynamic> toJson() => error.isNotEmpty
       ? <String, dynamic>{'error': error, 'status': status}
       : <String, dynamic>{
@@ -777,7 +931,21 @@ class CompactionResult {
           if (degraded) 'degraded': true,
           if (degraded && degradedReason.isNotEmpty)
             'degraded_reason': degradedReason,
+          // **可选键**：只在真的"没接管"时出现（旧的响应形状逐字不变）
+          if (relaySkipReason.isNotEmpty) 'relay_skip_reason': relaySkipReason,
         };
+}
+
+/// 一条"中转站没接管"的记账（[CompactionService._relaySkips] 的值）。
+class _RelaySkip {
+  const _RelaySkip(this.reason, {required this.hasSubscriber});
+
+  /// 人话原因（进 REST 响应与会话通知的正文）。
+  final String reason;
+
+  /// 这次没接管是不是发生在"**这个点位有订阅者**"之后（见
+  /// [CompactionResult.relaySkipHasSubscriber]）。
+  final bool hasSubscriber;
 }
 
 /// 一次总结的产物：正文 + 是否降级（见 [CompactionResult.degraded]）。

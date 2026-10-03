@@ -789,6 +789,13 @@ void main() {
         ),
       ], logs: logs);
       await waitForSubscription(bus, StationHubIds.relayContextCompact, logs);
+      // "为什么没接管"的回程（真插件进程 ⇒ 走的是**回包类**分支，不是早退）：
+      // 这些原因要能被 REST/会话通知拿到，且分级位必须是 true（插件在场却没接管）
+      final List<({String reason, bool hasSubscriber})> skips =
+          <({String reason, bool hasSubscriber})>[];
+      bus.compactionSkipSink =
+          (String a, String s, String r, {required bool hasSubscriber}) =>
+              skips.add((reason: r, hasSubscriber: hasSubscriber));
       final CompactionRelayReply? reply = await bus.relayCompaction(
         agent: coreAgent,
         session: coreSession,
@@ -810,6 +817,7 @@ void main() {
         expect(reply.messages, hasLength(3));
         expect(reply.messages.first['role'], 'system');
         expect(reply.messages.first['content'], '插件压缩后的系统提示词');
+        expect(skips, isEmpty, reason: '接管成功不该上报"没接管"的原因');
       } else {
         expect(
           reply,
@@ -817,6 +825,17 @@ void main() {
           reason: mode.isEmpty
               ? '回 null = 不接管，调用方回退内置 compact'
               : '回包非法（$mode）必须按未接管处理，绝不猜水位线',
+        );
+        expect(
+          skips,
+          hasLength(1),
+          reason: '每处"不接管"都该上报一次原因（模式：$mode）',
+        );
+        expect(skips.single.reason, isNotEmpty);
+        expect(
+          skips.single.hasSubscriber,
+          isTrue,
+          reason: '有订阅者却没交出可用结果 ⇒ 该写进会话历史（与"早退"区分开）',
         );
       }
       if (mode.isEmpty) {

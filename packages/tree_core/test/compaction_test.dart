@@ -20,6 +20,7 @@ class _FakeSummarizer implements ContextSummarizer {
     CoreAgent agent,
     String prompt, {
     void Function(String notice)? onNotice,
+    UsageSink? usageSink,
   }) async {
     prompts.add(prompt);
     if (noticeText != null) onNotice?.call(noticeText!);
@@ -589,7 +590,12 @@ void main() {
         reason: '摘要必须刷新进上下文，否则"压了等于没压"',
       );
       expect(refreshed.compactedMessageCount, greaterThan(0));
-      expect(refreshed.history.last.content, '回答三');
+      // 压缩通知（落库的 llm_hidden 消息）紧跟其后，所以要看的是**对话尾巴**：
+      // 引擎重建请求时会把 llm_hidden 整条跳过（见 LlmAgentEngine 的 llmHidden 过滤）。
+      expect(
+        refreshed.history.lastWhere((m) => !m.llmHidden).content,
+        '回答三',
+      );
       expect(summarizer.prompts, hasLength(1));
     });
 

@@ -12,7 +12,8 @@
 
 ## 不变量（assertions）
 
-1. **stdout 只允许握手行**（单行 JSON）；日志一律 stderr。
+1. **stdout 只允许握手行**（单行 JSON）；日志一律 stderr，并由 `CoreLogSink` **同时**落一份到
+   `<数据根>/logs/core.log`（带 `pid=` 前缀、按大小轮转、写失败只提示一次后降级为纯 stderr）；关停前必须 `flush()`。
 2. 端口默认随机、只监听 `127.0.0.1`；token 每次启动重新生成。
 3. `shutdown`（stdin 一行）必须优雅退出并 `store.flush()`。
 4. provider 接线必须成对：`CoreServer.close()` 时按身份解绑，避免旧实例把过期数据留在全局 provider 上。

@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 
 import '../settings/core_settings.dart';
+import '../store/usage_log.dart';
+import '../util/tokens.dart';
 import 'llm_agent_engine.dart' show TransportFactory;
 import 'llm_transport.dart';
 import 'llm_types.dart';
@@ -28,6 +30,7 @@ class LlmJsonCaller {
     this.transportFactory,
     this.timeout = const Duration(seconds: 120),
     this.log,
+    this.usageSink,
   });
 
   /// 按 modelId 解析模型配置。
@@ -45,6 +48,25 @@ class LlmJsonCaller {
 
   final void Function(String message)? log;
 
+  /// **逐调用用量回调**（可注入、**可写字段**）：一次 `llm.call` = 一次 LLM 调用，
+  /// 落 `source=llm.call`（压缩插件走的就是这条路，以前它**完全不计账**）。
+  ///
+  /// 与回包里给插件的 `usage` 是**两件事**：回包只给插件看，这个回调才让核心侧
+  /// 有机会落一份"事后可核对"的账。
+  ///
+  /// 为什么是**可写字段**而不是 final：[call] 原来的签名里**只有 agentId、没有会话**
+  /// （`StationLlmCaller` 的既有契约），所以"这笔账落到哪个会话"只有站点调用点
+  /// （`execute_mounts` 里有 `scope.sessionId`）知道。范式同
+  /// `LlmAgentEngine.toolTurnCompactor`：谁先建好谁接上。
+  ///
+  /// **生产走的是 [call] 的 `usageSink` 参数**（按调用传入、零共享状态，理由见那里的
+  /// 说明：两个插件可以并发 `llm.call`，共享字段会让账落到别人的会话上）；
+  /// 这个字段只是兜底与单测用的默认值。
+  ///
+  /// 端点没给 usage 时用**本地估算**并标 `estimated: true`，估算与对话共用
+  /// `util/tokens.dart` 的同一个函数。
+  UsageSink? usageSink;
+
   final Map<String, LlmTransport> _transports = <String, LlmTransport>{};
   int _seq = 0;
 
@@ -52,6 +74,12 @@ class LlmJsonCaller {
   ///
   /// [model] 非空 = 显式覆盖模型名；[messages] / [prompt] 二选一（都没有则报错）。
   /// [tools] = OpenAI 形状的工具声明数组（原样透传；压缩插件靠它对齐对话前缀）。
+  /// [usageSink] = **这一次调用**的用量回调；给了就优先于构造期/可写字段的那个。
+  ///
+  /// 为什么要"按调用传"而不是只靠共享的可写字段：站点调用点是**并发**的（两个插件
+  /// 可以同时 `llm.call`），而可写字段是**一个实例一份状态**——A 设置了 sink 之后、
+  /// 它的回包回来之前，B 又设置一次，A 的账就会落到 B 的会话上。按调用传入 ⇒ 每次
+  /// 绑定自己的会话，零共享状态。
   /// 返回 `{ok: true, json, text, model, usage}` 或 `{error: 可读原因}`。
   Future<Map<String, dynamic>> call({
     required String agentId,
@@ -63,6 +91,7 @@ class LlmJsonCaller {
     double? temperature,
     int? maxTokens,
     List<Object?>? tools,
+    UsageSink? usageSink,
   }) async {
     final CoreModelConfig? resolved = resolveModel(modelId);
     final CoreModelConfig? config = resolved?.withOverrides(
@@ -131,6 +160,7 @@ class LlmJsonCaller {
     final StringBuffer text = StringBuffer();
     LlmUsage usage = const LlmUsage();
     String failure = '';
+    final Stopwatch clock = Stopwatch()..start();
     try {
       final LlmTransport transport = _transportFor(config);
       await for (final LlmStreamEvent event in transport
@@ -156,6 +186,18 @@ class LlmJsonCaller {
     } catch (error) {
       failure = 'llm.call 调用异常：$error';
     }
+    clock.stop();
+    // 逐调用账目（**每次 `llm.call` 一笔**，成败都算：请求确实发出去了）。
+    _recordUsage(
+      agentId: agentId,
+      config: config,
+      model: effectiveModel,
+      request: request,
+      text: text.toString(),
+      usage: usage,
+      durationMs: clock.elapsedMilliseconds,
+      sink: usageSink,
+    );
     if (failure.isNotEmpty) {
       log?.call('llm.call 失败（agent=$agentId model=$effectiveModel）：$failure');
       return <String, dynamic>{'error': failure, 'model': effectiveModel};
@@ -183,6 +225,48 @@ class LlmJsonCaller {
         'cached_tokens': usage.cachedTokens,
       },
     };
+  }
+
+  /// 记一笔 `source=llm.call` 的逐调用用量（未接线时什么都不做）。
+  ///
+  /// [sink] = **本次调用**专有的回调（优先）；为空才退到可写字段 [usageSink]。
+  ///
+  /// 口径：端点给了 usage 用**真值**（`estimated: false`）；没给（或这次失败没有
+  /// 回包）用**本地估算**并标 `estimated: true`——prompt 按本次请求的
+  /// `estimatedPromptTokens`、completion 按返回正文的 `estimateTokens`，与对话
+  /// **共用** `util/tokens.dart` 的唯一口径。`cached_tokens` 拿不到就留空（不编造 0）。
+  void _recordUsage({
+    required String agentId,
+    required CoreModelConfig config,
+    required String model,
+    required LlmRequest request,
+    required String text,
+    required LlmUsage usage,
+    required int durationMs,
+    UsageSink? sink,
+  }) {
+    final UsageSink? target = sink ?? usageSink;
+    if (target == null) return;
+    final bool estimated = usage.isEmpty;
+    target(
+      agentId,
+      UsageCall(
+        at: DateTime.now(),
+        source: UsageSource.llmCall,
+        model: model,
+        promptTokens: estimated
+            ? request.estimatedPromptTokens(scale: config.tokenScale)
+            : usage.promptTokens,
+        cachedTokens: estimated || usage.cachedTokens <= 0
+            ? null
+            : usage.cachedTokens,
+        completionTokens: estimated
+            ? estimateTokens(text, scale: config.tokenScale)
+            : usage.completionTokens,
+        estimated: estimated,
+        durationMs: durationMs,
+      ),
+    );
   }
 
   /// 组装消息：`messages`（OpenAI 形状）优先，否则用 `prompt` 拼一条 user 消息。

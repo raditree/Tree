@@ -14,12 +14,13 @@
 | [file_store.dart](file_store.dart) | 落盘实现：YAML 配置 + 缩进 JSON 会话元数据 + jsonl 消息；懒加载 + 进程内缓存 + write-behind |
 | [memory_store.dart](memory_store.dart) | 纯内存实现（测试与"无落盘"场景） |
 | [write_queue.dart](write_queue.dart) | 每文件串行的后台写队列 |
+| [usage_log.dart](usage_log.dart) | **逐调用用量账本**：`<会话目录>/usage.jsonl`（一行一次 LLM 调用）+ 可注入的 `UsageSink` |
 | [atomic_file.dart](atomic_file.dart) | 原子快照（临时文件 + 改名）与 jsonl 读取（坏行跳过并计数） |
 | [yaml_codec.dart](yaml_codec.dart) | 读取用 `package:yaml`（宽容手写），写入自己实现（稳定键序 / 文件头注释 / 块标量） |
 
 ## 不变量（assertions）
 
-1. **布局固定**：`config/settings.yaml`、`config/models/<id>.yaml`、`agents/<id>.yaml`、`data/<agent_id>/<session_id>/{session.json,messages.jsonl}`。
+1. **布局固定**：`config/settings.yaml`、`config/models/<id>.yaml`、`agents/<id>.yaml`、`logs/core.log`、`data/<agent_id>/<session_id>/{session.json,messages.jsonl,usage.jsonl}`。
    消息为什么用 jsonl：单个会话实测已达 2433 条 / 2.9 MB，全量重写会让每次追加变成 O(n) 写放大并放大崩溃损坏面；追加日志天然只影响一行。
 2. **写语义是 write-behind**：写操作先改内存缓存并立即返回，落盘任务排进 `WriteQueue`（同路径串行、不同路径并行）。`flush()` **必须**在关停与测试里调用；进程被硬杀时未 flush 的任务会丢失——这是明确接受的代价。
 3. **原子性**：会话元数据与其它快照一律"临时文件 + 改名"，任何时刻磁盘上要么旧、要么新，不会是半截。
@@ -41,15 +42,27 @@
     - **消息口径**：`messages(agent, session)` 是"该 agent 自己"的对话，**排掉**临时员工的消息（父 agent 的模型上下文必须保持工具批原子：assistant 的 `tool_calls` 与它的 tool 结果之间不能插进别的消息，带 tools 的思考模式端点会 400）；用户要看的完整消息流走 `sessionMessages`。唯一例外是**后台完成报告**（`kind=subagent_report`）：它带 subagent 标记，却是**发起者**的"新输入"，因此进父上下文、不进临时员工自己的历史。
     - **会话内是一棵树**：临时员工可以再召临时员工（`parent_id` + `level`，层级上限 `SubagentLimits.maxDepth`）；删一个按**树**收（它召出来的一起走），避免悬空 `parent_id`——与团队自愈要解决的悬空 `parent_agent_id` 是同一类问题。
 
+12. **`usage.jsonl` 是"逐调用用量"的唯一落点，`messages.jsonl` 的行形状不动。** 一行一次 LLM 调用，字段表固定为
+    `at` / `source` / `model` / `prompt_tokens` / `cached_tokens` / `completion_tokens` / `estimated` / `duration_ms`
+    （`source ∈ turn | compact | llm.call | plugin`；`cached_tokens` 为 `null` = **端点没给这个字段**，不编造 0）。
+    为什么另起一份：用量是**遥测**不是对话——混进消息日志会改变既有行形状的兼容面（老前端/老会话/`CoreMessage` 契约）。
+    读取与消息日志同一容错口径（坏行跳过并计数；文件不存在 = 空账本，不是错误），写入复用
+    `WriteQueue` + `AtomicFile.appendLine`。落账口：**对话跳**在引擎（`LlmAgentEngine(usageLog:)`；逐调用读数由
+    `LlmSession.callUsageKey` 夹带、引擎读完即剥掉 ⇒ 帧与 `messages.jsonl` 的 `usage` 逐字不变）、**内置压缩**与
+    **`llm.call`** 走各自可注入的 `UsageSink`。
+
 ## 测试
 
 ```bash
 cd packages/tree_core
-dart test test/store_contract.dart test/file_store_test.dart test/memory_store_test.dart \
+dart test test/file_store_test.dart test/memory_store_test.dart \
           test/atomic_file_test.dart test/records_test.dart test/tree_paths_test.dart \
           test/yaml_codec_test.dart test/subagent_registry_test.dart \
-          test/subagent_isolation_test.dart
+          test/subagent_isolation_test.dart test/usage_log_test.dart \
+          test/messages_jsonl_shape_test.dart
 ```
+
+（`store_contract.dart` 是共享契约库、没有 `main()`，由上面几个测试文件 `import` 使用，不能单独 `dart test`。）
 
 - `store_contract.dart` 是**共享契约**：两个实现跑同一份断言，业务代码因此不会依赖内存实现特有的行为；临时员工的会话级读写、按树收、`messages()` / `sessionMessages()` 的分工也在这里双向钉住。
 - `subagent_registry_test.dart`：名册索引、跨会话隔离、`agents()/teams()/members()` 不列它、`messages(sub_…)` 是它自己那一段、按树收、`forgetSession` 只摘内存索引。

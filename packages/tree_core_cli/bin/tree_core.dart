@@ -48,20 +48,29 @@ Future<void> main(List<String> args) async {
   final bool enableHeartbeat = !args.contains('--no-heartbeat');
   final bool verbose = args.contains('--verbose');
 
-  // 启动分段计时：把「核心启动慢」变成可归因的数字（stderr 的 [core:boot] 行）。
+  // 日志出口（核心唯一的一处）：**同时**写 stderr（保持原样）与
+  // `<数据根>/logs/core.log`（8 MiB × 5 份轮转）。放在这里是为了让后面**所有**
+  // 日志（含启动计时）都走同一个出口——发布版没有调试器，落盘是唯一的取证手段。
+  // 构造零副作用（懒打开），所以 --print-paths / -h / -v 那些早退分支不受影响。
+  final CoreLogSink coreLog = CoreLogSink(paths);
+
+  // 启动分段计时：把「核心启动慢」变成可归因的数字（日志的 [core:boot] 行）。
   final Stopwatch boot = Stopwatch()..start();
   void bootLog(String phase) =>
-      stderr.writeln('[core:boot] $phase：累计 ${boot.elapsedMilliseconds}ms');
+      coreLog.write('[core:boot] $phase：累计 ${boot.elapsedMilliseconds}ms');
 
   // 落盘装配：存储（agents/sessions/messages）与设置/模型池。核心进程的所有
   // 状态都在 ~/.tree 下的纯文本文件里，用户可直接查看与手改。
-  void logStore(String message) => stderr.writeln('[core:store] $message');
+  final void Function(String message) logStore = coreLog.forPrefix('core:store');
   final FileTreeStore fileStore = FileTreeStore(paths, log: logStore);
   // 临时员工（subagent）的**会话级名册**：记录只落
   // `data/<agentId>/<sessionId>/subagents.json`（随会话删除一起消失），不进 agents/。
+  final void Function(String message) logSubagent = coreLog.forPrefix(
+    'core:subagent',
+  );
   final SubagentRegistry subagents = SubagentRegistry(
     persistence: fileStore,
-    log: (String message) => stderr.writeln('[core:subagent] $message'),
+    log: logSubagent,
   );
   // 工具层 / 文件服务 / 会话服务统一用这一层：`store.agent(sub_…)` 要能查到临时员工
   // （工作空间、SSH、系统提示词、结果门控这些既有路径因此一处都不用改）。
@@ -84,7 +93,7 @@ Future<void> main(List<String> args) async {
   // 所以升级能到达已有工作空间；要按工作空间定制请用 `spec create`（内置 id 本就不可 update）。
   final SpecService specs = SpecService(
     store: store,
-    log: (String message) => stderr.writeln('[core:spec] $message'),
+    log: coreLog.forPrefix('core:spec'),
   );
 
   // MCP 服务（M6a）：配置在 <数据根>/config/mcp.yaml；启动时尝试连接一次，
@@ -96,7 +105,7 @@ Future<void> main(List<String> args) async {
     configFile: paths.mcpConfigFile,
     heartbeatInterval: settings.heartbeatInterval,
     missedHeartbeatLimit: settings.missedHeartbeatLimit,
-    log: (String message) => stderr.writeln('[core:mcp] $message'),
+    log: coreLog.forPrefix('core:mcp'),
   );
   // 首次连接**不在这里做**：MCP 的初始连接没有超时参数（见 McpClient 的类文档），
   // 排在握手之前时，一家半死的 MCP 服务就能把核心启动拖到 25s 握手超时。改为握手
@@ -119,7 +128,7 @@ Future<void> main(List<String> args) async {
     missThreshold: settings.missedHeartbeatLimit,
     // plugin_status / plugin_event 广播到前端（起监听后 hubSink 会被接上）
     broadcast: (Map<String, dynamic> frame) => hubSink?.call(frame),
-    log: (String message) => stderr.writeln('[core:plugin] $message'),
+    log: coreLog.forPrefix('core:plugin'),
   );
   // 同上：插件启动是**逐家串行**且每家 20s 超时（PluginBus.connectTimeout），
   // 排在握手之前 = 坏插件直接把启动拖到超时。改为握手之后并行预热。
@@ -132,7 +141,7 @@ Future<void> main(List<String> args) async {
     questions: questionStore,
     transcript: store,
     broadcast: (Map<String, dynamic> frame) => hubSink?.call(frame),
-    log: (String message) => stderr.writeln('[core:ask] $message'),
+    log: coreLog.forPrefix('core:ask'),
   );
   // 团队服务：成员就是 agent（`agents/<id>.yaml`）。working 状态同样后置绑定到
   // 会话服务的在途任务表，避免"服务先于核心构造"的顺序环。
@@ -144,7 +153,7 @@ Future<void> main(List<String> args) async {
     // 建成员时要能算出 TOP 未配置目录时的默认目录。
     defaultWorkspaceDir: paths.defaultWorkspaceDir,
     isWorking: (String agentId) => workingSink?.call(agentId) ?? false,
-    log: (String message) => stderr.writeln('[core:team] $message'),
+    log: coreLog.forPrefix('core:team'),
   );
   // 团队关系自愈：用户直接删 agent 会在下级 yaml 里留下悬空的
   // `parent_agent_id`/`team_id`（实测后果：那些成员广播够不着、级联停止/删除失效，
@@ -153,7 +162,7 @@ Future<void> main(List<String> args) async {
   await repairTeamLinks(
     store,
     backup: (CoreAgent agent) => backupAgentFile(paths, agent.id),
-    log: (String message) => stderr.writeln('[core:team] $message'),
+    log: coreLog.forPrefix('core:team'),
   );
   // 消息派发：投递实现要等核心起监听后才有（ConversationService 由核心创建），
   // 因此同样用可后置绑定的槽。
@@ -201,7 +210,7 @@ Future<void> main(List<String> args) async {
       if (sink == null) return null;
       return sink(agentId);
     },
-    log: (String message) => stderr.writeln('[core:msg] $message'),
+    log: coreLog.forPrefix('core:msg'),
   );
   // 一次性迁移：私有状态从 `.self/` 搬到 `.tree/<agent_id>/.self/`（按 agent 分栏）。
   // 只搬**团队 TOP** 的：成员与 leader 共享工作目录，旧 `.self` 不可能属于成员
@@ -212,7 +221,7 @@ Future<void> main(List<String> args) async {
     migrateLegacySelfDir(
       workspaceDir: own.isNotEmpty ? own : paths.defaultWorkspaceDir(agent.id),
       agentId: agent.id,
-      log: (String message) => stderr.writeln('[core:migrate] $message'),
+      log: coreLog.forPrefix('core:migrate'),
     );
   }
 
@@ -222,7 +231,7 @@ Future<void> main(List<String> args) async {
     store,
     defaultDirFor: paths.defaultWorkspaceDir,
     backup: (CoreAgent agent) => backupAgentFile(paths, agent.id),
-    log: (String message) => stderr.writeln('[core:team] $message'),
+    log: coreLog.forPrefix('core:team'),
   );
   if (!mirrors.isEmpty) {
     bootLog('工作目录镜像完成：${mirrors.changedCount} 个成员');
@@ -235,7 +244,7 @@ Future<void> main(List<String> args) async {
     store: store,
     registry: subagents,
     settings: settings,
-    log: (String message) => stderr.writeln('[core:subagent] $message'),
+    log: coreLog.forPrefix('core:subagent'),
   );
   final WorkspaceToolRunner tools = WorkspaceToolRunner(
     todoStore: todos,
@@ -272,10 +281,10 @@ Future<void> main(List<String> args) async {
         // 不套就看不到用户 ssh 进来时有的工具（nvcc / conda 那类 profile PATH）。
         // agent yaml 里 `ssh.login_shell` 可换模板或写空串关掉。
         loginShell: config.loginShell,
-        log: (String message) => stderr.writeln('[core:tool] $message'),
+        log: coreLog.forPrefix('core:tool'),
       );
       final String root = await resolveRemoteRoot(transport, config.root);
-      stderr.writeln('[core:tool] SSH 已连接 ${config.redacted()} root=$root');
+      coreLog.write('[core:tool] SSH 已连接 ${config.redacted()} root=$root');
       return SshWorkspaceIO(root, transport);
     },
     resolveWorkspaceDir: (String agentId) {
@@ -294,7 +303,7 @@ Future<void> main(List<String> args) async {
           ? shared.configuredDir
           : paths.defaultWorkspaceDir(shared.owner.id);
     },
-    log: (String message) => stderr.writeln('[core:tool] $message'),
+    log: coreLog.forPrefix('core:tool'),
   );
 
   // 活动日志的工作空间 IO 后置绑定：从这里起，**SSH 模式下的 agent**（含跟随 leader
@@ -329,7 +338,7 @@ Future<void> main(List<String> args) async {
   // 快照，改文件保存即下一轮生效。右侧活动栏的「重置」按钮走同一条读写路径。
   final SystemPromptStore systemPrompts = SystemPromptStore(
     ioFor: tools.ioFor,
-    log: (String message) => stderr.writeln('[core:prompt] $message'),
+    log: coreLog.forPrefix('core:prompt'),
   );
   systemPromptFileProvider = (CoreAgent agent) =>
       systemPrompts.snapshot(agent.id);
@@ -347,7 +356,7 @@ Future<void> main(List<String> args) async {
       final Object? io = await tools.ioFor(agentId);
       return io is WorkspaceFiles ? io : null;
     },
-    log: (String message) => stderr.writeln('[core:files] $message'),
+    log: coreLog.forPrefix('core:files'),
   );
 
   /// 成员级模型参数覆盖（M5b）：用户在「团队成员 → 模型配置」页设置的
@@ -380,17 +389,25 @@ Future<void> main(List<String> args) async {
   final WorkspaceVisionFileResolver visionFiles = WorkspaceVisionFileResolver(
     ioFor: tools.ioFor,
     cache: VisionFileCache(file: paths.visionFilesFile),
-    log: (String message) => stderr.writeln('[core:vision] $message'),
+    log: coreLog.forPrefix('core:vision'),
   );
 
   // 外设就绪闸门：句柄必须在引擎构造前就有（预热本身要等握手之后才开跑），
   // 而它永不失败——无论预热成败都要放行，否则第一轮对话会被永久挂住。
   final Completer<void> peripheralsReady = Completer<void>();
 
+  // 逐调用用量账本（③）：<数据根>/data/<agent>/<session>/usage.jsonl，一行一次
+  // LLM 调用。一路共用同一个实例（每文件串行 + write-behind），关停时 flush。
+  // 四类来源各有落账口：对话跳=引擎、内置压缩=CompactionService、执行站 llm.call=
+  // CoreServer、插件接管跳=引擎（会话在读数里标了 plugin）。
+  final UsageLog usageLog = UsageLog(paths, log: coreLog.forPrefix('core:usage'));
+
   final LlmAgentEngine engine = LlmAgentEngine(
     resolveModel: settings.model,
     toolRunner: tools,
     agentOverrides: agentOverrides,
+    // 对话本身每一跳的逐调用账（含"端点不回 usage"的跳，那种标 estimated）
+    usageLog: usageLog,
     // 图像视觉链路：只有模型配了 `if_vision` 才会用上（引擎内判），关着时请求体
     // 与从前逐字一致。
     visionResolver: visionFiles,
@@ -405,7 +422,7 @@ Future<void> main(List<String> args) async {
           store.session(agentId, sessionId)?.selectedSpecIds ??
           const <String>[],
     ),
-    log: (String message) => stderr.writeln('[core:llm] $message'),
+    log: coreLog.forPrefix('core:llm'),
   );
 
   // 上下文压缩（M7d-4）：总结走独立传输（不带工具，避免递归触发工具循环），
@@ -417,10 +434,13 @@ Future<void> main(List<String> args) async {
     summarizer: LlmSummarizer(
       resolveModel: settings.model,
       agentOverrides: agentOverrides,
-      log: (String message) => stderr.writeln('[core:compact] $message'),
+      log: coreLog.forPrefix('core:compact'),
     ),
-    log: (String message) => stderr.writeln('[core:compact] $message'),
+    log: coreLog.forPrefix('core:compact'),
   );
+  // 内置压缩那一次总结也是 LLM 调用：把账本接上（压缩时按会话绑定 sink；
+  // 为什么不在构造参数里：UsageLog 与 CompactionService 都在这里才同时可见）。
+  compaction.usageLog = usageLog;
 
   // 执行站 `llm.call`（点位化新增）：插件可让核心用**目标 agent 的模型**发一次
   // 硬设 `response_format=json_object` 的调用，拿结构化结果做高级处理。
@@ -428,7 +448,7 @@ Future<void> main(List<String> args) async {
   final LlmJsonCaller llmJsonCaller = LlmJsonCaller(
     resolveModel: settings.model,
     agentOverrides: agentOverrides,
-    log: (String message) => stderr.writeln('[core:llm-call] $message'),
+    log: coreLog.forPrefix('core:llm-call'),
   );
 
   bootLog('引擎与压缩装配完成');
@@ -452,6 +472,8 @@ Future<void> main(List<String> args) async {
     fileService: files,
     // 核心改 agent yaml（工作目录镜像）前先备份，与团队自愈同约定
     agentBackup: (CoreAgent agent) => backupAgentFile(paths, agent.id),
+    // 执行站 llm.call 的逐调用账（source=llm.call；按会话绑定，见 _stationLlmCall）
+    usageLog: usageLog,
     // 远端（SSH）终端的伪终端：从**缓存的那条** SSH 工作空间 IO 上取 shell 通道
     // （与文件面板 / 工具层同一条连接），因此 Ctrl+J 不会为每个 agent 再连一次 SSH。
     // 没接线时远端终端只回可读错误，绝不退回本机执行。
@@ -485,11 +507,11 @@ Future<void> main(List<String> args) async {
   workingSink = server.conversation.isRunning;
   deliverSink = server.conversation.deliver;
   if (verbose) {
-    // 访问日志走 stderr（stdout 是进程间协议，绝不能混入日志）
-    server.accessLog = (String message) => stderr.writeln('[core] $message');
+    // 访问日志同样走唯一出口（`--verbose` 是显式打开，量由轮转兜住）
+    server.accessLog = coreLog.forPrefix('core');
   }
   // 未捕获异常始终记下来：此时 500 回包往往也写不出去，客户端只能看到连接断开
-  server.errorLog = (String message) => stderr.writeln('[core:error] $message');
+  server.errorLog = coreLog.forPrefix('core:error');
   // 后台长任务结束后唤醒 agent（把完成提示注入会话并继续生成）。
   // `subagent` 非空 = 这条通知来自一个**后台临时员工**：标记随消息一起落库与下发。
   // 多个后台临时员工并发完成时，每一次调用都是独立的一条消息 + 独立的一轮，互不覆盖。
@@ -513,18 +535,31 @@ Future<void> main(List<String> args) async {
 
   bootLog('监听已就绪，即将发出握手');
 
-  // 唯一的 stdout 输出：就绪握手（父进程按行读取并解析）
-  stdout.writeln(server.handshake.encode());
+  // 本进程自己的报告（`[tree_core]` 前缀）：与原先的 stderr 行逐字一致，只是同时落盘
+  final void Function(String line) logCore = coreLog.forPrefix('tree_core');
+
+  // 唯一的 stdout 输出：就绪握手（父进程按行读取并解析）。
+  // 带上数据根（可选字段）：应用侧据此才能给出"打开日志目录 / 看最近 N 行"入口——
+  // 它没有任何别的权威来源（拉起核心时不传 --data-dir）。
+  stdout.writeln(server.handshake.withDataRoot(paths.root).encode());
   await stdout.flush();
-  stderr.writeln(
-    '[tree_core] v${TreeCore.version} listening on '
+  logCore(
+    'v${TreeCore.version} listening on '
     '127.0.0.1:${server.port} (pid ${server.processId})',
   );
-  stderr.writeln('[tree_core] 数据目录：${paths.root}');
+  logCore('数据目录：${paths.root}');
+  logCore('核心日志落盘：${coreLog.logFile}');
 
   // 握手已发出 ⇒ 界面立刻可用。外设预热从这里**才开始**并行跑：慢的 MCP/插件
   // 只影响"第一轮生成时的工具表"（那一轮由 awaitReady 闸门兜底），不再拖住核心启动。
-  unawaited(_warmUpPeripheralsAfterHandshake(mcp, plugins, peripheralsReady));
+  unawaited(
+    _warmUpPeripheralsAfterHandshake(
+      mcp,
+      plugins,
+      peripheralsReady,
+      coreLog.forPrefix('core:boot'),
+    ),
+  );
 
   final Completer<void> shutdown = Completer<void>();
   // 可靠退出通道：stdin 逐行命令（父进程写 `shutdown\n`）。
@@ -555,9 +590,15 @@ Future<void> main(List<String> args) async {
 
   await shutdown.future;
   await control.cancel();
-  stderr.writeln('[tree_core] shutting down');
+  logCore('shutting down');
   await server.close();
   await tools.close();
+  // 关停是唯一能保证日志尾部完整的时机：WriteQueue 在硬杀时会丢掉在途任务
+  // （见 core_log_sink.dart / write_queue.dart 的说明），故必须在 exit 之前 flush。
+  await coreLog.flush();
+  // 逐调用用量账本同样走 WriteQueue：不 flush 就可能在 exit 时丢掉最后几笔账，
+  // 而那些恰好是"用户刚看完的那几轮"。
+  await usageLog.flush();
   await stdout.flush();
   await stderr.flush();
   // 显式退出：stdin 订阅会让事件循环保持存活，返回 main 不保证 VM 结束
@@ -573,6 +614,7 @@ Future<void> _warmUpPeripheralsAfterHandshake(
   McpService mcp,
   PluginBus plugins,
   Completer<void> ready,
+  void Function(String message) log,
 ) async {
   try {
     await warmUpPeripherals(
@@ -581,11 +623,11 @@ Future<void> _warmUpPeripheralsAfterHandshake(
         (name: '插件', run: () => plugins.start()),
       ],
       budget: const Duration(seconds: 3),
-      log: (String message) => stderr.writeln('[core:boot] $message'),
+      log: log,
     );
   } catch (error) {
     // warmUpPeripherals 自己绝不抛；这里只是最后一道兜底，保证闸门一定放行。
-    stderr.writeln('[core:boot] 外设预热异常（已忽略）：$error');
+    log('外设预热异常（已忽略）：$error');
   } finally {
     if (!ready.isCompleted) ready.complete();
   }

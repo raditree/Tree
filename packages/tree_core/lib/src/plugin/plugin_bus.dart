@@ -30,6 +30,34 @@ typedef RuntimeStationScopeResolver = StationScope Function(
   StationScopeContext context,
 );
 
+/// 一次压缩请求里捎给插件的**最近用量行**（`<会话目录>/usage.jsonl`）。
+///
+/// 为什么需要这条路：逐调用用量落在**数据根**下的会话目录里，而插件（`fs.read`
+/// 只在工作空间作用域内）**读不到数据根**——于是"这次压缩花了多少 token""内置
+/// 兜底那次花了多少"在插件面板上永远是空白。核心能同时够到账本与插件，所以在
+/// 压缩中转 payload 里捎上"最近 N 行"，插件不必也不该去猜文件在哪。
+///
+/// [path] 只作排障用（插件拿到的只是一个字符串）；[calls] 是**解析后的对象**，
+/// 形状 = `UsageCall.toJson()`（即 `usage.jsonl` 的行）。
+class PluginUsageRecent {
+  const PluginUsageRecent({required this.path, required this.calls});
+
+  /// 账本文件路径（`<数据根>/data/<agent>/<session>/usage.jsonl`）。
+  final String path;
+
+  /// 最近的调用（**早 → 晚**，最多 [PluginBus.maxRecentUsageLines] 行）。
+  final List<Map<String, dynamic>> calls;
+}
+
+/// 「最近用量行」提供者（**接线注入**，与 [PluginBus.log] /
+/// [PluginBus.compactionSkipSink] 同范式）。
+///
+/// 返回 null = 这条通路没接（payload 里就不会出现 `recent_usage`）；
+/// 抛异常 / 读不到文件 ⇒ 由 [PluginBus.relayCompaction] 收敛成"不带这个键"——
+/// 用量是**遥测**，它出问题绝不该影响一次压缩（fail-open）。
+typedef PluginUsageRecentProvider =
+    Future<PluginUsageRecent?> Function(String agentId, String sessionId);
+
 /// 插件总线（M6b + M9 Wave 3-F）：配置、实例生命周期、事件分发、工具聚合、
 /// **站点体系**与**心跳判活**。
 ///
@@ -157,6 +185,37 @@ class PluginBus {
 
   /// 工具表刷新时的**观测钩子**（测试 / 日志用：记录收集站真的被触发了几次）。
   void Function(StationScope? scope)? toolTableRefreshHook;
+
+  /// 压缩中转点「**为什么没接管**」的原因出口（可写字段，与 [log] 同范式）。
+  ///
+  /// [relayCompaction] 的**每一处**"不接管"分支都回调一次，带一句给用户看的人话、
+  /// 外加 [hasSubscriber] 这个**分级位**：
+  /// - `false` = **早退**（总开关关 / 作用域不匹配 / 无点位 / 无订阅者）：压根没有
+  ///   插件在这条路上，只是"没人干这事"；
+  /// - `true` = **有订阅者但没接管**（没回包 / 原数据放行 / 回包非法 / 越界 / 异常）：
+  ///   插件在场却没交出可用结果，这才是用户真正要追的。
+  ///
+  /// 为什么必须分级：REST 响应要**全量**（排障），而会话历史里的通知只该写"插件在场
+  /// 却没接管"——否则没装压缩插件的用户，每条压缩通知都多一句"没有插件订阅该点位"。
+  ///
+  /// 为什么需要它：这些原因以前**只进 stderr**（有几条连日志都没有），于是"我装了
+  /// 压缩插件，为什么没生效"只能靠猜。接线方（`CoreServer._wirePluginRelayPoints`）
+  /// 把它接到 `CompactionService.noteRelaySkip` ⇒ 原因随压缩结论上行（REST 可选键
+  /// `relay_skip_reason`）并按分级决定要不要落成会话提示。
+  void Function(
+    String agentId,
+    String sessionId,
+    String reason, {
+    required bool hasSubscriber,
+  })?
+  compactionSkipSink;
+
+  /// 一次压缩请求里捎给插件的**最近用量行**（见 [PluginUsageRecent]）：
+  /// 接线注入，未接线时压缩载荷里不会出现 `recent_usage` / `usage_file`。
+  PluginUsageRecentProvider? usageRecentProvider;
+
+  /// 压缩载荷里最多捎多少行用量（滚动的"最近一批"；账本本身会随会话一直长）。
+  static const int maxRecentUsageLines = 50;
 
   bool enabled = true;
 
@@ -1747,6 +1806,11 @@ class PluginBus {
         final LlmUsage parsed = OpenAiCodec.decodeUsage(usage);
         if (!parsed.isEmpty) stream.add(LlmUsageEvent(parsed));
       }
+      // 逐调用用量账本（`usage.jsonl`）**不在这里写**：这一跳的账由引擎落
+      // （`LlmAgentEngine`），并因为"会话知道这一跳被插件接管"而归到 `source=plugin`
+      // ——插件回包带 usage 就用这份真值、不带就在会话里本地估算（标 `estimated`）。
+      // 总线在这里**唯一**要做的就是上面那行"把 usage 交给流"，别在这里补一次落账
+      // （那会与引擎那份重复记一行）。见 store/usage_log.dart 的 `UsageSource`。
       final String finish = (params['finish_reason'] ?? '').toString();
       if (finish.isNotEmpty) stream.add(LlmFinishEvent(finish));
       _closeLlmStream(requestId);
@@ -1892,17 +1956,56 @@ class PluginBus {
     required Map<String, dynamic>? wireRequest,
   }) async {
     load();
-    if (!enabled) return null;
+    if (!enabled) {
+      _reportCompactionSkip(
+        agent,
+        session,
+        '插件总开关已关闭（plugins.yaml）',
+        hasSubscriber: false,
+      );
+      return null;
+    }
     final StationScope scope = runtimeScopeFor(
       agentId: agent.id,
       sessionId: session.sessionId,
     );
-    if (!scope.isValid) return null;
+    if (!scope.isValid) {
+      _reportCompactionSkip(
+        agent,
+        session,
+        '该会话不在插件的运行范围内（挂载点不匹配）',
+        hasSubscriber: false,
+      );
+      return null;
+    }
     final RelayStation? station = stations.relayPointFor(
       StationHubIds.relayContextCompact,
     );
-    if (station == null) return null;
-    if (station.subscribers.isEmpty) return null;
+    if (station == null) {
+      _reportCompactionSkip(
+        agent,
+        session,
+        '核心未注册「上下文压缩过程」这个中转点位',
+        hasSubscriber: false,
+      );
+      return null;
+    }
+    if (station.subscribers.isEmpty) {
+      _reportCompactionSkip(
+        agent,
+        session,
+        '没有插件订阅该点位（未声明 system.relay.context.compact）',
+        hasSubscriber: false,
+      );
+      return null;
+    }
+    // 这份会话的用量账本：插件读不到数据根（它的 fs.read 只在工作空间作用域内），
+    // 所以由核心把"最近 N 行"捎过去（只作展示/排障；**不参与压缩决策**）。
+    // 未接线 / 读失败 / 异常 ⇒ null ⇒ payload 里干脆不带这两个键（fail-open）。
+    final PluginUsageRecent? recentUsage = await _recentUsageFor(
+      agent.id,
+      session.sessionId,
+    );
     final Map<String, dynamic> payload = <String, dynamic>{
       'point': station.id,
       'agent_id': agent.id,
@@ -1923,6 +2026,10 @@ class PluginBus {
       // 整份拿去当 `llm.call` 的 messages（末尾追加一条总结指令）即可命中端点前缀
       // 缓存；要保留的尾部也从它的 messages 里原样截取。
       'request': ?wireRequest,
+      // 用量账本（`<会话目录>/usage.jsonl`）：路径只作排障，内容供面板展示
+      // （这一轮花了多少 token / 内置兜底那次花了多少）。可选键，缺了照样工作。
+      if (recentUsage != null) 'usage_file': recentUsage.path,
+      if (recentUsage != null) 'recent_usage': recentUsage.calls,
     };
     try {
       final StationRelayResult relayed = await station.relay(
@@ -1930,13 +2037,27 @@ class PluginBus {
         scope: scope,
         meta: <String, dynamic>{'purpose': 'context.compact'},
       );
-      if (!relayed.handled || relayed.data == null) return null;
+      if (!relayed.handled || relayed.data == null) {
+        _reportCompactionSkip(
+          agent,
+          session,
+          '插件没有回包（未接管这次压缩）',
+          hasSubscriber: true,
+        );
+        return null;
+      }
       final Object? data = relayed.data;
       // 回包 `payload: null` = **不改动**：站点会把**原请求数据**原样放行
       // （见 StationInstance.relay 的 None 分支）。这里必须用同一性判掉它——
       // 不判就有可能把"插件没接管"误读成"插件回了一份新上下文"。
       if (identical(data, payload)) {
         log?.call('压缩中转：插件未接管（回 null），回退内置 compact');
+        _reportCompactionSkip(
+          agent,
+          session,
+          '插件回 null（原数据放行 = 不改动，未接管）',
+          hasSubscriber: true,
+        );
         return null;
       }
       if (data is! Map) {
@@ -1944,11 +2065,23 @@ class PluginBus {
           '压缩中转回包不是对象（回 ${data.runtimeType}）：按未接管处理，回退内置 compact。'
           '回包形状应为 {"messages": [...], "covered_message_count": N}',
         );
+        _reportCompactionSkip(
+          agent,
+          session,
+          '插件回包不是对象（回 ${data.runtimeType}），无法当上下文用',
+          hasSubscriber: true,
+        );
         return null;
       }
       final Object? rawMessages = data['messages'];
       if (rawMessages is! List || rawMessages.isEmpty) {
         log?.call('压缩中转回包的 messages 不是非空数组：按未接管处理，回退内置 compact');
+        _reportCompactionSkip(
+          agent,
+          session,
+          '插件回包的 messages 不是非空数组',
+          hasSubscriber: true,
+        );
         return null;
       }
       final List<Map<String, dynamic>> context = <Map<String, dynamic>>[];
@@ -1958,6 +2091,12 @@ class PluginBus {
           log?.call(
             '压缩中转回包第 $i 条消息无法还原成 LLM 消息（角色/字段不合法）：'
             '整包按未接管处理，回退内置 compact',
+          );
+          _reportCompactionSkip(
+            agent,
+            session,
+            '插件回包第 $i 条消息角色/字段不合法（无法还原成 LLM 消息）',
+            hasSubscriber: true,
           );
           return null;
         }
@@ -1978,6 +2117,13 @@ class PluginBus {
           '压缩中转回包的 covered_message_count=${rawCovered ?? '缺失'} 非法'
           '（合法区间 0..$totalMessageCount）：按未接管处理，回退内置 compact',
         );
+        _reportCompactionSkip(
+          agent,
+          session,
+          '插件回包的 covered_message_count=${rawCovered ?? '缺失'} 非法'
+          '（须在 0..$totalMessageCount 内）',
+          hasSubscriber: true,
+        );
         return null;
       }
       log?.call(
@@ -1990,6 +2136,60 @@ class PluginBus {
       );
     } catch (error) {
       log?.call('压缩中转异常（回退内置 compact）：$error');
+      _reportCompactionSkip(
+        agent,
+        session,
+        '压缩中转点异常（插件侧报错）：$error',
+        hasSubscriber: true,
+      );
+      return null;
+    }
+  }
+
+  /// 上报"压缩中转点为什么没接管"（每处"不接管"分支各一次，文案与同处的 `log` 同源）。
+  ///
+  /// 出口是 [compactionSkipSink]（接线方接到 `CompactionService.noteRelaySkip`）；
+  /// [hasSubscriber] 见字段说明（决定该不该写进会话历史）。
+  /// 未接线时它什么都不做——**不改任何行为**（fail-open 与接线前逐字一致）。
+  void _reportCompactionSkip(
+    CoreAgent agent,
+    CoreSession session,
+    String reason, {
+    required bool hasSubscriber,
+  }) {
+    compactionSkipSink?.call(
+      agent.id,
+      session.sessionId,
+      reason,
+      hasSubscriber: hasSubscriber,
+    );
+  }
+
+  /// 取该会话的**最近用量行**（[usageRecentProvider] 的包装）。
+  ///
+  /// 三条口径，缺一不可：
+  /// - **未接线 ⇒ null**（payload 里不带 `recent_usage`，"没有这条通路"与"没有用量"
+  ///   是两件事，插件据此区分"暂不支持"与"确实还没调用过"）；
+  /// - **条数上限** [maxRecentUsageLines]：账本随会话一直长，压缩载荷必须是有界的
+  ///   （取**最后** N 行 = 最近的那些）；
+  /// - **异常/读失败 ⇒ null + 一句日志**：用量是遥测，绝不影响这次压缩（fail-open）。
+  Future<PluginUsageRecent?> _recentUsageFor(
+    String agentId,
+    String sessionId,
+  ) async {
+    final PluginUsageRecentProvider? provider = usageRecentProvider;
+    if (provider == null) return null;
+    try {
+      final PluginUsageRecent? recent = await provider(agentId, sessionId);
+      if (recent == null) return null;
+      final List<Map<String, dynamic>> calls = recent.calls;
+      if (calls.length <= maxRecentUsageLines) return recent;
+      return PluginUsageRecent(
+        path: recent.path,
+        calls: calls.sublist(calls.length - maxRecentUsageLines),
+      );
+    } catch (error) {
+      log?.call('读取最近用量行失败（本次压缩照常，只是不带用量）：$error');
       return null;
     }
   }

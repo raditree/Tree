@@ -65,6 +65,16 @@ class MessageList extends StatelessWidget {
   /// 免得"上面那一段由占位变实体"把正在看的内容推走。
   final int padAboveStamp;
 
+  /// **本帧内容高度在"别处"变了**（递增的标记）：补页落在视口里/视口下方
+  /// （横跨视口顶的那一份），或者淘汰掉了远处的槽位（真消息 → 88px 占位槽）。
+  ///
+  /// 为什么单独一个信号：这类变化**不是**"整段都在视口上方"（那走 [padAboveStamp]），
+  /// 但也一样会让用户正在读的那一段整段下移/上移。列表侧用**实测锚点**
+  /// （视口顶那条真消息的底边，见 [_MessageListViewState._resolveShiftAbove]）
+  /// 把它补回来 —— 补的量在两个信号下是同一套口径，分开只是为了面板能表达
+  /// "这一帧变的是哪一类"，也让测试能分别钉住（回归用例 N5/N6/N7）。
+  final int contentShiftStamp;
+
   /// 本帧构建到的下标区间（帧后回调；面板据此补页 + 淘汰）。
   final void Function(int first, int last)? onWindowChanged;
 
@@ -84,6 +94,7 @@ class MessageList extends StatelessWidget {
     this.scrollToRevision = 0,
     this.bottomJump = false,
     this.padAboveStamp = 0,
+    this.contentShiftStamp = 0,
     this.onWindowChanged,
     this.onReloadTail,
     this.trailingCards = const <Widget>[],
@@ -100,6 +111,7 @@ class MessageList extends StatelessWidget {
       scrollToRevision: scrollToRevision,
       bottomJump: bottomJump,
       padAboveStamp: padAboveStamp,
+      contentShiftStamp: contentShiftStamp,
       onWindowChanged: onWindowChanged,
       onReloadTail: onReloadTail,
       trailingCards: trailingCards,
@@ -117,6 +129,7 @@ class _MessageListView extends StatefulWidget {
   final int scrollToRevision;
   final bool bottomJump;
   final int padAboveStamp;
+  final int contentShiftStamp;
   final void Function(int first, int last)? onWindowChanged;
   final VoidCallback? onReloadTail;
   final List<Widget> trailingCards;
@@ -130,6 +143,7 @@ class _MessageListView extends StatefulWidget {
     this.scrollToRevision = 0,
     this.bottomJump = false,
     this.padAboveStamp = 0,
+    this.contentShiftStamp = 0,
     this.onWindowChanged,
     this.onReloadTail,
     this.trailingCards = const <Widget>[],
@@ -142,6 +156,20 @@ class _MessageListView extends StatefulWidget {
 /// 占位槽的高度（px）。**固定值**：滑块的下标换算、以及"拖到某个下标"的落点估算
 /// 都建立在"没加载的那一段每格一样高"这个前提上（见 [MessageScrollbar]）。
 const double kMessagePlaceholderExtent = 88;
+
+/// 「刚补了页」时的**布局前快照**：视口顶 + 已布局子项的顶边（下标 → 内容坐标）。
+///
+/// 与布局后再扫一遍配成对，用来量**实测**位移（见
+/// [_MessageListViewState._resolveShiftAbove]）。
+class _BuiltTopsSnapshot {
+  const _BuiltTopsSnapshot({required this.viewportTop, required this.tops});
+
+  /// 布局前的视口顶（sliver 自己的坐标系；已扣掉列表内边距）
+  final double viewportTop;
+
+  /// 布局前：这一趟真被布局过的子项 → 顶边
+  final Map<int, double> tops;
+}
 
 /// 底部锚定滚动控制器：把「钉在底部」做成**布局同帧**的同步操作。
 ///
@@ -161,10 +189,24 @@ class _BottomAnchorScrollController extends ScrollController {
   /// 是否需要把 offset 钉到底部：内容变化/首帧时由 State 置位，布局时消费。
   bool pinToBottom = false;
 
-  /// 视口**上方**刚补了页：布局阶段按内容高度差把 offset 往下挪同样多。
+  /// 视口**上方/视口里**刚补了页：布局阶段按**实测**高度差把 offset 挪同样多。
   bool shiftAbove = false;
 
-  /// 上一帧内容的总高度（-1 = 还不知道）。用来判断"刚才是不是贴着底"。
+  /// [shiftAbove] 的**实测解析器**：返回"用户正在读的那一段**实际**被顶下去了多少"
+  /// （null = 实测拿不到 → 退回估算 + 限幅）。
+  ///
+  /// 为什么不能用 `maxScrollExtent` 的帧间差：长列表里它是**外推值**，
+  /// 误差 ∝ 剩余条数（详见 [_BottomAnchorScrollPosition.applyContentDimensions]）。
+  /// 由 [_MessageListViewState] 注入——它拿着列表的 [GlobalKey]，可以在布局前后
+  /// 各读一遍渲染树（只有它知道"用户当时在看哪一条"）。
+  double? Function()? resolveShiftAbove;
+
+  /// 从渲染树读「某个子项**此刻**的顶边」（内容坐标；拿不到 = null）。
+  /// 由 [_MessageListViewState] 注入（它拿着列表的 [GlobalKey]）。
+  double? Function(int index)? readChildTop;
+
+  /// 上一帧内容的总高度（-1 = 还不知道）。用来判断"刚才是不是贴着底"，
+  /// 并作为补页补偿的**兜底**估算值（实测拿不到时才用，且有限幅）。
   double lastMaxExtent = -1;
 
   @override
@@ -207,21 +249,41 @@ class _BottomAnchorScrollPosition extends ScrollPositionWithSingleContext {
     final bool glued =
         controller.lastMaxExtent >= 0 &&
         (pixels - controller.lastMaxExtent).abs() <= 1.0;
-    // 上方刚补过页：**标记一定要消费掉**（跟随模式下由贴底接管，不能留到以后
+    // 刚补过页：**标记一定要消费掉**（跟随模式下由贴底接管，不能留到以后
     // 阅读模式下突然生效）；只有"不在跟随"时才需要自己补偿。
     final bool shiftAbove = controller.shiftAbove;
     controller.shiftAbove = false;
-    final double delta = controller.lastMaxExtent >= 0
+    final double? Function()? resolveShift = controller.resolveShiftAbove;
+    controller.resolveShiftAbove = null;
+    // 兜底口径：上一帧"内容总高"的差。**只在实测拿不到时用**，而且要限幅——
+    // 长列表里它是外推值（见下面 shiftAbove 分支的注释）。
+    final double estimatedDelta = controller.lastMaxExtent >= 0
         ? maxScrollExtent - controller.lastMaxExtent
         : 0;
     controller.lastMaxExtent = maxScrollExtent;
     if (shiftAbove && !following) {
-      if (delta.abs() > 0.01) {
-        // 上方补页只会让"上面的高度"变多：把 offset 加同样多，正在看的那一段
-        // 就还在原地。返回 false 请求同帧重跑布局（绘制前就已补偿，不闪）。
-        correctPixels(
-          (pixels + delta).clamp(minScrollExtent, maxScrollExtent),
-        );
+      // 补页会让内容高度变（占位槽 88px ↔ 真消息），把 offset 加同样多，
+      // 正在看的那一段就还在原地。返回 false 请求同帧重跑布局（绘制前就已补偿，不闪）。
+      //
+      // **补偿量取"实测位移"，不能取 maxScrollExtent 的差**：
+      // 列表是懒构建的、没到底时 `maxScrollExtent` 是**外推值**
+      // （SDK `RenderSliverList.estimateMaxScrollOffset` =
+      // `末尾已布局偏移 + 已建子项平均高 × 剩余条数`），误差 **∝ 剩余条数**：
+      // 真机会话几千条、视口在中段 ⇒ 单帧可差上千像素，而"真正长高的高度"
+      // 最多几百像素（只有 cache extent 内那几行会被布局）⇒ 补偿量被噪声主导，
+      // 视口被随机搬走（用户 2026-10-03：「触发一次懒加载后抖动非常厉害」）。
+      //
+      // 实测口径见 [_MessageListViewState._resolveShiftAbove]：
+      // 锚点 = "用户**当时**正在看的第一条真消息"（跳过这一帧刚换过的格子），
+      // 补偿量 = 锚点**底边**的实测位移（`layoutOffset` 是实测子项高度逐个累加的真值）。
+      double? shift = resolveShift?.call();
+      if (shift == null && estimatedDelta.abs() <= viewportDimension * 2) {
+        // 实测拿不到（还没布局过 / 锚点不在这一趟布局里）：退回估算值，
+        // 且**只在不超过两屏时采信**——宁可不补，也不要错补上千像素。
+        shift = estimatedDelta;
+      }
+      if (shift != null && shift.abs() > 0.01) {
+        correctPixels((pixels + shift).clamp(minScrollExtent, maxScrollExtent));
         return false;
       }
       return ok;
@@ -325,9 +387,15 @@ class _MessageListViewState extends State<_MessageListView> {
   @override
   void didUpdateWidget(covariant _MessageListView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // 面板在**视口上方**补了页：占位槽换成真消息会改变上面的高度，布局阶段补回来
-    if (oldWidget.padAboveStamp != widget.padAboveStamp) {
-      _controller.shiftAbove = true;
+    // 面板补了页：占位槽换成真消息会改变内容高度，布局阶段补回来。
+    // - [padAboveStamp]：整段都在视口上方的那一份；
+    // - [contentShiftStamp]：横跨视口顶 / 落在视口里的那一份（视口顶那条真消息**以下**
+    //   那一段必须由它来保住）。
+    // 补偿量必须在本帧布局**之前**量（此刻渲染树里是上一帧的 layoutOffset）——
+    // 见 [_snapshotShiftAnchor] 与 [_BottomAnchorScrollPosition]。
+    if (oldWidget.padAboveStamp != widget.padAboveStamp ||
+        oldWidget.contentShiftStamp != widget.contentShiftStamp) {
+      _beginShiftCompensation();
     }
     if (oldWidget.revision != widget.revision) {
       // 槽位表变了：刷新一次视口坐标（面板可能还要按它补页 / 淘汰）
@@ -459,28 +527,7 @@ class _MessageListViewState extends State<_MessageListView> {
   ///
   /// 找不到（结构变了 / 还没布局）时返回 null，调用方退回兜底口径。
   MessageRange? _builtRangeFromRenderTree() {
-    final BuildContext? context = _listKey.currentContext;
-    if (context == null) return null;
-    final RenderObject? root = context.findRenderObject();
-    if (root == null) return null;
-    // 注意：ListView 的 renderObject **不是** Viewport（外面还裹着 Scrollable 的
-    // Listener/Semantics/IgnorePointer…），所以在子树里找 `RenderSliverList`。
-    RenderSliverList? list;
-    void find(RenderObject node) {
-      if (list != null) return;
-      if (node is RenderSliverList) {
-        list = node;
-        return;
-      }
-      node.visitChildren(find);
-    }
-
-    if (root is RenderSliverList) {
-      list = root;
-    } else {
-      root.visitChildren(find);
-    }
-    final RenderSliverList? target = list;
+    final RenderSliverList? target = _sliverListFromRenderTree();
     if (target == null) return null;
     int? first;
     int? last;
@@ -508,6 +555,139 @@ class _MessageListViewState extends State<_MessageListView> {
       first.clamp(0, slotCount - 1),
       (last + 1).clamp(1, slotCount),
     );
+  }
+
+  /// 列表内部那个 [RenderSliverList]（懒构建子项都挂在它下面；null = 还没布局）。
+  ///
+  /// 注意：ListView 的 renderObject **不是** Viewport（外面还裹着 Scrollable 的
+  /// Listener/Semantics/IgnorePointer…），所以在子树里找 `RenderSliverList`。
+  RenderSliverList? _sliverListFromRenderTree() {
+    final BuildContext? context = _listKey.currentContext;
+    if (context == null) return null;
+    final RenderObject? root = context.findRenderObject();
+    if (root == null) return null;
+    RenderSliverList? list;
+    void find(RenderObject node) {
+      if (list != null) return;
+      if (node is RenderSliverList) {
+        list = node;
+        return;
+      }
+      node.visitChildren(find);
+    }
+
+    if (root is RenderSliverList) {
+      list = root;
+    } else {
+      root.visitChildren(find);
+    }
+    return list;
+  }
+
+  /// 扫一遍渲染树：这一趟**真被布局过**的子项 → 顶边（下标 → 内容坐标）。
+  ///
+  /// 这个值来自 `SliverMultiBoxAdaptorParentData.layoutOffset`：由**实测**子项高度
+  /// 逐个累加而来，不是 `maxScrollExtent` 那种外推估算——所以它才是
+  /// "上面真正长高了多少"的真值。
+  ///
+  /// 注意**不要读子项的 `.size`**：那超出了 `RenderBox.size` 的许可范围
+  /// （布局期间只有"声明了 parentUsesSize 的父对象"能读），会在布局断言里炸。
+  /// 需要"某格的底边"时取它**下一条**子项的顶边（渲染树里子项是连续排布的）。
+  /// `childScrollOffset == null` 的是被 `AutomaticKeepAlive` 留在树里的屏外子项。
+  Map<int, double> _builtTopsFromRenderTree([RenderSliverList? target]) {
+    final RenderSliverList? list = target ?? _sliverListFromRenderTree();
+    final Map<int, double> out = <int, double>{};
+    if (list == null) return out;
+    RenderBox? item = list.firstChild;
+    while (item != null) {
+      final double? top = list.childScrollOffset(item);
+      final ParentData? data = item.parentData;
+      if (top != null &&
+          data is SliverMultiBoxAdaptorParentData &&
+          data.index != null) {
+        out[data.index!] = top;
+      }
+      item = list.childAfter(item);
+    }
+    return out;
+  }
+
+  /// 布局**前**的快照：记下视口顶与已布局子项的顶边。
+  ///
+  /// 为什么必须在布局**之前**取：决定"用户**当时**在看哪一条"要按变化之前的位置判
+  /// ——内容一长高，"视口顶之下的第一条真消息"就变成刚补进来的那几格了。
+  /// 此刻渲染树里还是**上一帧**的 `layoutOffset`，正是"布局前"的真值。
+  ///
+  /// `!attached` 时不取（极端首帧路径下 `constraints` 会踩调试断言）：返回 null
+  /// 即"实测拿不到"，调用方退回估算 + 限幅——不会抛异常。
+  _BuiltTopsSnapshot? _snapshotBuiltTops() {
+    final RenderSliverList? list = _sliverListFromRenderTree();
+    if (list == null || !list.attached) return null;
+    return _BuiltTopsSnapshot(
+      viewportTop: list.constraints.scrollOffset,
+      tops: _builtTopsFromRenderTree(list),
+    );
+  }
+
+  /// 布局**后**再扫一遍 → 算出补偿量（null = 实测拿不到，调用方退回估算 + 限幅）。
+  ///
+  /// 锚点 = "用户**当时**正在看的第一条真消息"，两条口径缺一不可：
+  /// - **按布局前的位置挑**（`top >= 布局前视口顶`），否则内容一长高就挑到新补的格子；
+  /// - **跳过这一帧刚换过高度的子项**（占位槽 → 真消息 / 流式增长）：它们属于
+  ///   "刚出现的新内容"，不是用户正在读的那一段。真机补页**先补横跨视口顶的那一份**，
+  ///   紧贴视口顶的那一格往往**自身就是**被换掉的那一格；锚在它身上会漏补
+  ///   它下面已经加载的内容（回归用例 N5：漏补 104px，用户看到的就是"整段下移"）。
+  /// - 视口顶之下没有稳定真消息时，退而取视口顶之上最后一条稳定真消息。
+  ///
+  /// 补偿量 = 锚点**底边**的实测位移（= 它下一条子项顶边的差）：于是锚点**以下整段**
+  /// 在屏幕上的位置也不动（N5 断言 ②）。
+  double? _resolveShiftAbove(_BuiltTopsSnapshot before) {
+    final Map<int, double> after = _builtTopsFromRenderTree();
+    if (before.tops.isEmpty || after.isEmpty) return null;
+    bool isReal(int index) =>
+        index >= 0 && index < widget.slots.length && widget.slots[index] != null;
+    // "这一帧高度没变" = 它与其**下一条**顶边差不变（只用 childScrollOffset，不读 .size）
+    bool stable(int index) {
+      final double? t0 = before.tops[index];
+      final double? t1 = after[index];
+      if (t0 == null || t1 == null) return false;
+      final double? n0 = before.tops[index + 1];
+      final double? n1 = after[index + 1];
+      // 下一条读不到（视口末尾那一格）：量不到高度变化，按"稳定"处理（它的顶边即锚点底边）
+      if (n0 == null || n1 == null) return true;
+      return ((n1 - t1) - (n0 - t0)).abs() <= 0.01;
+    }
+
+    int? below;
+    int? above;
+    before.tops.forEach((int index, double top) {
+      if (!isReal(index) || !stable(index)) return;
+      if (top >= before.viewportTop - _bottomEpsilon) {
+        if (below == null || top < before.tops[below]!) below = index;
+      } else if (above == null || top > before.tops[above]!) {
+        above = index;
+      }
+    });
+    final int? anchor = below ?? above;
+    if (anchor == null) return null;
+    // 量锚点的**底边**：它下一条子项（读不到就退回锚点自己的顶边）
+    final int probe = after.containsKey(anchor + 1) ? anchor + 1 : anchor;
+    final double? now = after[probe];
+    final double? was = before.tops[probe];
+    if (now == null || was == null) return null;
+    return now - was;
+  }
+
+  /// 开始一次"补页补偿"：布局前拍照 + 把解析器挂到控制器上（布局时消费一次）。
+  ///
+  /// 两个信号都走这里：[padAboveStamp]（整段在视口上方）与 [contentShiftStamp]
+  /// （横跨视口顶 / 落在视口里）——补偿口径是同一套，锚点由
+  /// [_resolveShiftAbove] 按"用户当时在看哪一条"现场判定。
+  void _beginShiftCompensation() {
+    final _BuiltTopsSnapshot? snapshot = _snapshotBuiltTops();
+    _controller.resolveShiftAbove =
+        snapshot == null ? null : () => _resolveShiftAbove(snapshot);
+    _controller.shiftAbove = true;
   }
 
   /// 滚动定位到指定消息并短暂高亮。

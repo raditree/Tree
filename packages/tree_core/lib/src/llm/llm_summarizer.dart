@@ -1,6 +1,8 @@
 import '../agent/compaction_service.dart';
 import '../settings/core_settings.dart';
 import '../store/records.dart';
+import '../store/usage_log.dart';
+import '../util/tokens.dart';
 import 'llm_agent_engine.dart';
 import 'llm_transport.dart';
 import 'llm_types.dart';
@@ -15,6 +17,7 @@ class LlmSummarizer implements ContextSummarizer {
     this.transportFactory,
     this.agentOverrides,
     this.log,
+    this.usageSink,
   });
 
   /// 按 model_id 解析模型配置（与 [LlmAgentEngine] 共用同一解析器）。
@@ -28,6 +31,22 @@ class LlmSummarizer implements ContextSummarizer {
 
   final void Function(String message)? log;
 
+  /// **逐调用用量回调**（可注入、**可写字段**）：一次总结补全 = 一次 LLM 调用，
+  /// 落 `source=compact`。
+  ///
+  /// 为什么是可注入回调而不是自己写文件：总结器不认识数据根，也不该认识。
+  /// 为什么是**可写字段**：[summarize] 的签名里只有 agent、会话由调用点
+  /// （`CompactionService` 拿到 `CoreSession` 之后）知道。范式同
+  /// `LlmAgentEngine.toolTurnCompactor`：谁先建好谁接上。
+  ///
+  /// **生产走的是 [summarize] 的 `usageSink` 参数**（按次传入，理由见
+  /// [ContextSummarizer.summarize] 的说明：不同会话可以同时压缩，共享字段会串账）；
+  /// 这个字段是兜底与单测用的默认值。
+  ///
+  /// 端点没给 usage 时用**本地估算**并标 `estimated: true`（估算与对话共用
+  /// `util/tokens.dart` 的同一个函数，不另造一套口径）。
+  UsageSink? usageSink;
+
   final Map<String, LlmTransport> _transports = <String, LlmTransport>{};
 
   @override
@@ -35,6 +54,7 @@ class LlmSummarizer implements ContextSummarizer {
     CoreAgent agent,
     String prompt, {
     void Function(String notice)? onNotice,
+    UsageSink? usageSink,
   }) async {
     final CoreModelConfig? resolved = resolveModel(agent.modelId);
     final CoreModelConfig? config = resolved?.withOverrides(
@@ -53,6 +73,10 @@ class LlmSummarizer implements ContextSummarizer {
       _summaryOutputTokens(config),
       onNotice,
     );
+    // 一次总结 = 一次 LLM 调用：**成败都记账**（请求确实发出去了）。放在这里而不是
+    // 返回处，是因为下面几条分支都会 return/throw，而账要在所有分支上都落。
+    // [usageSink]（按次传入，优先于可写字段）由压缩服务绑定本会话。
+    _recordUsage(agent, config, prompt, attempt, usageSink: usageSink);
     if (attempt.text.isNotEmpty) return attempt.text;
     // 传输层已经报错（HTTP 4xx/5xx、链路失活、取消）：原样如实上报。
     if (attempt.failure != null) throw StateError(attempt.failure!);
@@ -87,6 +111,10 @@ class LlmSummarizer implements ContextSummarizer {
     int thinkingChars = 0;
     String finishReason = '';
     String? failure;
+    // 端点可能不返回 usage（本地 llama.cpp / vLLM 常常没有）——那时由 [_recordUsage]
+    // 用本地估算兜底，所以这里"收得到就收、收不到也不影响调用本身"。
+    LlmUsage? usage;
+    final Stopwatch clock = Stopwatch()..start();
     await for (final LlmStreamEvent event in _transportFor(config).stream(
       LlmRequest(
         model: config.modelId,
@@ -105,6 +133,9 @@ class LlmSummarizer implements ContextSummarizer {
         text.write(event.text);
       } else if (event is LlmThinkingDelta) {
         thinkingChars += event.text.length;
+      } else if (event is LlmUsageEvent) {
+        // 以前这里没有这一支：端点回的 usage 被直接丢掉 ⇒ 内置压缩"永远没有账"。
+        usage = event.usage;
       } else if (event is LlmFinishEvent) {
         finishReason = event.reason;
       } else if (event is LlmRetryNotice) {
@@ -118,12 +149,55 @@ class LlmSummarizer implements ContextSummarizer {
         break;
       }
     }
+    clock.stop();
     return _SummaryAttempt(
       text: text.toString().trim(),
       thinkingChars: thinkingChars,
       finishReason: finishReason,
       budget: budget,
       failure: failure,
+      usage: usage,
+      durationMs: clock.elapsedMilliseconds,
+    );
+  }
+
+  /// 记一笔 `source=compact` 的逐调用用量。
+  ///
+  /// 口径（与 [LlmSession] 的逐调用账目一致）：
+  /// - 端点给了 usage ⇒ 用**本次总结**的真值，`estimated: false`；
+  /// - 端点没给（或这次失败没有回包）⇒ 本地估算并标 `estimated: true`：
+  ///   prompt = 总结提示词的 `estimateTokens`，completion = 摘要正文的同一个换算
+  ///   （**共用** `util/tokens.dart` 的唯一口径，不另造一套）；
+  /// - `cached_tokens` 拿不到就留空（null），不编造 0。
+  void _recordUsage(
+    CoreAgent agent,
+    CoreModelConfig config,
+    String prompt,
+    _SummaryAttempt attempt, {
+    UsageSink? usageSink,
+  }) {
+    final UsageSink? sink = usageSink ?? this.usageSink;
+    if (sink == null) return;
+    final LlmUsage? real = attempt.usage;
+    final bool estimated = real == null || real.isEmpty;
+    sink(
+      agent.id,
+      UsageCall(
+        at: DateTime.now(),
+        source: UsageSource.compact,
+        model: config.modelId,
+        promptTokens: estimated
+            ? estimateTokens(prompt, scale: config.tokenScale)
+            : real.promptTokens,
+        cachedTokens: estimated || real.cachedTokens <= 0
+            ? null
+            : real.cachedTokens,
+        completionTokens: estimated
+            ? estimateTokens(attempt.text, scale: config.tokenScale)
+            : real.completionTokens,
+        estimated: estimated,
+        durationMs: attempt.durationMs,
+      ),
     );
   }
 
@@ -164,6 +238,8 @@ class _SummaryAttempt {
     required this.finishReason,
     required this.budget,
     this.failure,
+    this.usage,
+    this.durationMs = 0,
   });
 
   final String text;
@@ -179,6 +255,12 @@ class _SummaryAttempt {
 
   /// 传输层失败原因（空 = 调用本身是成功的）。
   final String? failure;
+
+  /// 端点回的真实 usage；null = 端点没给（逐调用账目据此改用本地估算）。
+  final LlmUsage? usage;
+
+  /// 这一跳从发出请求到收流的耗时（毫秒）。
+  final int durationMs;
 
   /// 一句话说清这一轮的结果，可直接进错误文案。
   String describe() {

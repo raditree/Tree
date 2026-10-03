@@ -5,6 +5,7 @@ import 'package:tree_local_exec/tree_local_exec.dart';
 import '../agent/agent_engine.dart';
 import '../agent/attachment_prompt.dart';
 import '../settings/core_settings.dart';
+import '../store/usage_log.dart';
 import '../tool/tool_runner.dart';
 import '../tool/workspace_tool_runner.dart';
 import 'llm_session.dart';
@@ -70,6 +71,7 @@ class LlmAgentEngine implements AgentEngine {
     this.resultRedirectWriter,
     this.visionResolver,
     this.awaitReady,
+    this.usageLog,
     this.log,
   });
 
@@ -132,6 +134,16 @@ class LlmAgentEngine implements AgentEngine {
 
   /// 可读日志。
   final void Function(String message)? log;
+
+  /// **逐调用用量账本**（`<会话目录>/usage.jsonl`）；null = 不落账。
+  ///
+  /// 为什么落在这里而不是会话层：引擎是**唯一**同时知道"这是这一轮的第几跳、
+  /// 耗时多少、端点给没给 usage"的地方（工具循环在 [LlmSession] 里），而会话层
+  /// 只收到剥好内部键的公开 usage（那是"全轮累计"的前端口径，做不了逐调用账）。
+  /// 写失败只落在 [UsageLog.lastError]，绝不打断生成。
+  ///
+  /// 接线一行：`LlmAgentEngine(..., usageLog: UsageLog(paths))`。
+  final UsageLog? usageLog;
 
   final Map<String, LlmTransport> _transports = <String, LlmTransport>{};
 
@@ -243,6 +255,7 @@ class LlmAgentEngine implements AgentEngine {
     )) {
       if (event is AgentUsage) {
         _learnTokenScale(resolved, event.usage);
+        _recordCallUsage(context, config, event.usage);
         yield AgentUsage(_publicUsage(event.usage));
         continue;
       }
@@ -303,6 +316,33 @@ class LlmAgentEngine implements AgentEngine {
     );
   }
 
+  /// 把这一跳的**逐调用读数**落进 `usage.jsonl`（未接线时什么都不做）。
+  ///
+  /// 读数取自 [LlmSession.callUsageKey]（内部键，见那里的说明）；落完这一笔它就会被
+  /// [_publicUsage] 剥掉，所以前端帧与 `messages.jsonl` 的 `usage` **逐字不变**。
+  ///
+  /// 来源（`source`）在这一层定：会话在读数里标了"这一跳被插件整体接管"
+  /// （`llm.handle`）⇒ `plugin`，否则是对话本身的一跳 ⇒ `turn`。压缩 / `llm.call`
+  /// 那两类各有自己的落账口（`LlmSummarizer` / `LlmJsonCaller` 的用量回调）。
+  void _recordCallUsage(
+    AgentRunContext context,
+    CoreModelConfig config,
+    Map<String, dynamic> usage,
+  ) {
+    final UsageLog? sink = usageLog;
+    if (sink == null) return;
+    final Object? raw = usage[LlmSession.callUsageKey];
+    final bool pluginHandled = raw is Map && raw['plugin'] == true;
+    final UsageCall? call = UsageCall.tryFromCallUsage(
+      raw,
+      source: pluginHandled ? UsageSource.plugin : UsageSource.turn,
+      // 落的是**实际请求**的模型 id（成员级覆盖之后解析出来的那一个）
+      model: config.modelId,
+    );
+    if (call == null) return;
+    sink.record(context.agentId, context.sessionId, call);
+  }
+
   /// 学习令牌比例 + 记录水位线（Q1-①）；失败只记日志，绝不影响本轮生成。
   ///
   /// 学在**解析出来的原对象**上（不是成员覆盖后的副本）：token_scale 是模型的
@@ -324,10 +364,24 @@ class LlmAgentEngine implements AgentEngine {
     }
   }
 
-  /// 剥掉内部学习字段，保证上行 usage 与既有前端契约一字不差。
+  /// **内部键**集合：夹带"学习用的上下文字符数"与"逐调用读数"，两类都不许上行。
+  static const Set<String> _internalUsageKeys = <String>{
+    LlmSession.contextCharsKey,
+    LlmSession.callUsageKey,
+  };
+
+  /// 剥掉内部字段，保证上行 usage 与既有前端契约**逐字**一致。
+  ///
+  /// 吃这一份的是：`msg_usage` / `msg_end` 帧与 `messages.jsonl` 的 `usage` 字段
+  /// （`endSegment(usage: …)` 落的就是它）——所以"逐调用用量"绝不能走公开键。
   static Map<String, dynamic> _publicUsage(Map<String, dynamic> usage) {
-    if (!usage.containsKey(LlmSession.contextCharsKey)) return usage;
-    return Map<String, dynamic>.of(usage)..remove(LlmSession.contextCharsKey);
+    if (!_internalUsageKeys.any((String key) => usage.containsKey(key))) {
+      return usage;
+    }
+    return Map<String, dynamic>.of(usage)
+      ..removeWhere(
+        (String key, Object? value) => _internalUsageKeys.contains(key),
+      );
   }
 
   /// 没显式注入写入器时，从工具执行器取**同一份**工作空间 IO。

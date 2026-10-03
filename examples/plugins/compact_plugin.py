@@ -36,13 +36,34 @@
 
 失败一律回 `null`（不接管）⇒ 核心回退内置 compact，上下文不会丢。
 
+**左栏面板**（2026-10-03）：插件用 `ui/manifest` 申报一个 `activity` 槽位（左侧活动
+栏的一个图标 + 左栏里的一整页内容），之后用 `ui/update` 推内容——最近 N 次压缩
+（时间 / 来源 / 覆盖条数 / 耗时 / 降级或未接管原因、**用量**），外加一个「立即压缩
+一次」按钮（经执行站 `agent.compact`，走核心既有的手动压缩入口）。
+
+- 来源列：`relay`（本插件接管）、`builtin`（**核心内置** compact 的那次总结）、
+  `llm.call`（经执行站的一次性调用——压缩插件的总结调用走的就是它）、`plugin`
+  （`llm.handle` 被插件整体接管的一跳）；拿不到就显示 `未知`，**不猜**。
+- **用量从哪来**：逐调用账本落在数据根下的会话目录里（`data/<agent>/<session>/
+  usage.jsonl`），而本插件（`fs.read` 只在工作空间作用域内）**读不到数据根**——
+  所以核心在压缩中转 payload 里捎上**最近 50 行**（`recent_usage`）+ 账本路径
+  （`usage_file`，排障用）。它是个滚动窗口、**每次请求都重发**，这里按"整行内容"
+  去重后并入面板。
+- `--usage-jsonl PATH` 是**离线回放**旁路（不给核心时把一份账本文件喂给面板看）。
+- 视图只能是**受限控件集**（text / list / table / form / progress / actions 与
+  row / column 容器）：没有 webview、不执行插件 JS。
+- `--no-panel` = 完全不申报面板（只在后台跑压缩时用）。
+
 自检（**不需要真核心**）：
 
     python examples/plugins/compact_plugin.py --selftest
 """
 
+import datetime
 import json
+import os
 import sys
+import tempfile
 import threading
 import time
 
@@ -55,6 +76,51 @@ STATION_RELAY_CONTEXT_COMPACT = "system.relay.context.compact"
 
 ERR_METHOD_NOT_FOUND = -32601
 ERR_INTERNAL = -32603
+
+# ── 插件布局（左栏面板）与面板交互 ──────────────────────────────────────────
+METHOD_UI_MANIFEST = "ui/manifest"
+METHOD_UI_UPDATE = "ui/update"
+
+#: **面板按钮回调的事件名**。注意判据在 `params.event` 上：核心把前端动作包成
+#: `{"jsonrpc":"2.0","method":"event","params":{"event":"plugin_ui_action",
+#:   "slot_key":…,"action_id":…,"payload":…}}`（与 `agent.tool_call` 同一范式）。
+#: 判 `method == "plugin_ui_action"` 会**永远不命中**（表现为"按钮点了没反应"）。
+EVENT_UI_ACTION = "plugin_ui_action"
+
+#: 执行站命令：手动压一次（`system.execute.agent` 点位，核心映射到 CompactionService）。
+CMD_AGENT_COMPACT = "agent.compact"
+
+#: 左栏槽位键：`activity` = 活动栏图标项 + 左栏整页内容（两侧是同一个槽位）。
+SLOT_ACTIVITY = "compact.activity.1"
+PANEL_TITLE = "上下文压缩"
+#: 活动栏图标名走前端白名单（未知名回退扩展图标，见 lib/ui/widgets/plugin_ui_slots.dart）。
+PANEL_ICON = "chart"
+#: 面板里显示多少条记录（内部最多留 100 条，够翻不必刷）。
+DEFAULT_PANEL_RECORDS = 10
+#: 面板刷新节流（秒）：压缩可能连续触发，左栏页会整块重建，刷太勤只是闪。
+PANEL_MIN_INTERVAL = 0.5
+#: 受限控件集（协议 PluginUiViewType.all）：超出的类型前端渲染成"不支持的控件"占位。
+VIEW_TYPES = ("text", "list", "table", "form", "progress", "actions", "row", "column")
+#: 来源列的人话（核心给的 source 只有 relay / builtin；拿不到就"未知"）。
+SOURCE_LABELS = {"relay": "relay", "builtin": "builtin"}
+
+#: `usage.jsonl` 的 `source` → 面板"来源"列（**照核心 `UsageSource` 的口径**）。
+#: `turn` 故意不在表里：那是对话自己的跳，不属于这个面板（会被跳过）。
+USAGE_SOURCE_LABELS = {
+    # 内置压缩（核心 `LlmSummarizer` 的一次总结补全）——核心的内置兜底就记这个来源，
+    # 于是"内置压了几次、每次多少 token"在这里第一次可见。
+    "compact": "builtin",
+    # 执行站 `llm.call`：**压缩插件的总结调用走的就是它**（前缀复用那一跳）。
+    "llm.call": "llm.call",
+    # `llm.handle` 被插件**整体接管**的一跳（用量由插件回填，无则本地估算）。
+    "plugin": "plugin",
+}
+
+#: 面板内部最多留多少条用量记录（面板只显示 panel_records 条，这里留余量即可）。
+MAX_USAGE_RECORDS = 200
+#: 面板表格的列名（顺序即展示顺序；面板与自检共用一份，防止两边漂移）。
+#: 用 list 而不是 tuple：视图最终是 JSON，且自检的列名/单元格数一致性检查按数组看。
+PANEL_COLUMNS = ["时间", "来源", "覆盖条数", "耗时", "降级 / 未接管原因"]
 
 #: 固定的"伪推理"文案（Q6 定稿）：让伪造的这条 assistant 在带 tools 的思考模式端点上
 #: 满足"历史 assistant 必须带 reasoning_content"的口径（见 recon.md 的 G1/G3 实测）。
@@ -134,6 +200,14 @@ class Options(object):
         self.command_timeout = 180.0
         self.reasoning_text = REASONING_TEXT
         self.dry_run = False
+        # 左栏面板：默认申报（内置插件面板启用时就是这个形态）
+        self.no_panel = False
+        self.panel_records = DEFAULT_PANEL_RECORDS
+        # 「立即压缩一次」没有上下文时（动作帧缺 agent_id）的兜底目标
+        self.agent_id = ""
+        # ③ 逐调用用量（`<会话目录>/usage.jsonl`）的**可选**路径：
+        # 填了就把里面的压缩行并进面板（见 [_collect_records]）。留空 = 不读。
+        self.usage_jsonl = ""
 
     def parse(self, argv):
         index = 0
@@ -176,6 +250,22 @@ class Options(object):
                 self.dry_run = True
                 index += 1
                 continue
+            if name == "--no-panel":
+                self.no_panel = True
+                index += 1
+                continue
+            if name == "--panel-records":
+                self.panel_records = _positive_int(value, self.panel_records)
+                index += 2
+                continue
+            if name == "--agent-id":
+                self.agent_id = value
+                index += 2
+                continue
+            if name == "--usage-jsonl":
+                self.usage_jsonl = value
+                index += 2
+                continue
             index += 1
 
 
@@ -193,6 +283,194 @@ def _non_negative_int(raw):
     except (TypeError, ValueError):
         return 0
     return value if value > 0 else 0
+
+
+def _elapsed_ms(started):
+    """从 `started`（time.time()）到现在的毫秒数；没给就返回 None（面板显示"—"）。"""
+    if started is None:
+        return None
+    return int(max(0.0, time.time() - started) * 1000)
+
+
+def _duration_text(value):
+    """耗时的人话（面板单元格）：None = "—"。"""
+    if not isinstance(value, (int, float)):
+        return "—"
+    if value < 1000:
+        return "%d ms" % int(value)
+    return "%.1f s" % (float(value) / 1000.0)
+
+
+def _epoch_of(raw):
+    """`usage.jsonl` 的 `at`（**ISO-8601 本机时区字符串**）→ epoch 秒；认不出返回 0。
+
+    容忍三种写法（都来自"用户手改文件"这一既有前提）：ISO 字符串（正路）、
+    epoch 秒、epoch 毫秒。核心侧 `JsonTime.encode` 写的是
+    `datetime.toIso8601String()`（形如 `2026-10-03T16:31:55.000000`，无偏移 = 本机时区）。
+    """
+    if isinstance(raw, bool):  # bool 是 int 的子类，先挡掉
+        return 0.0
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+        return value / 1000.0 if value > 100000000000 else value
+    text = str(raw or "").strip()
+    if not text:
+        return 0.0
+    if text.endswith("Z"):  # 3.10 及以前的 fromisoformat 不认 Z
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _token_text(value):
+    """token 数的人话：>= 1000 用 k（面板列窄，别铺一串数字）。"""
+    value = _non_negative_int(value)
+    if value >= 1000:
+        return "%.1fk" % (value / 1000.0)
+    return str(value)
+
+
+def _usage_note(item):
+    """用量行在面板"说明"列里的样子：模型 + 输入/缓存/输出（+ 估算）。
+
+    `cached_tokens = null` **不显示成 0**（核心的口径就是"null = 端点没给这个字段"），
+    `estimated = true` 必须看得见（那是本地估算，不能当计费依据）。
+    """
+    parts = []
+    model = str(item.get("model") or "").strip()
+    if model:
+        parts.append(clip(model, 24))
+    parts.append("输入 %s" % _token_text(item.get("prompt_tokens")))
+    cached = item.get("cached_tokens")
+    if isinstance(cached, int) and not isinstance(cached, bool) and cached > 0:
+        parts.append("缓存 %s" % _token_text(cached))
+    parts.append("输出 %s" % _token_text(item.get("completion_tokens")))
+    text = "用量 " + " · ".join(parts)
+    if item.get("estimated") is True:
+        text += "（估算）"
+    return text
+
+
+def _record_from_usage_line(item, agent_id="", session_id=""):
+    """把 `usage.jsonl` 的一行归一成面板记录；与压缩无关的行返回 None。
+
+    **字段表就是契约**（核心 `store/usage_log.dart` 的 `UsageCall.toJson()`）：
+
+        at                ISO-8601 本机时区字符串（`JsonTime.encode`）
+        source            turn | compact | llm.call | plugin
+        model             实际请求的模型 id
+        prompt_tokens     这一跳的输入 token（端点真值优先，缺失则本地估算）
+        cached_tokens     命中前缀缓存的输入 token；**null = 端点没给这个字段**
+        completion_tokens 这一跳生成的 token
+        estimated         数值里是否含本地估算（true = 别当计费依据）
+        duration_ms       这一跳从发出请求到收流的耗时（毫秒）
+
+    映射到面板（只认"压缩相关"的三类，见 [USAGE_SOURCE_LABELS]）：
+    `compact`（内置压缩的总结）→ 来源 `builtin`；`llm.call`（压缩插件的总结调用
+    走的就是它）→ `llm.call`；`plugin`（`llm.handle` 被整体接管的一跳）→ `plugin`。
+    `turn`（对话自己的跳）与形状不认识的行 → None，由调用方跳过。
+
+    **拿不到就留白、不猜**：账本里没有"覆盖条数"这一说（那是压缩的产物，不是调用的
+    账），所以 `covered` 恒为 None（面板显示"—"），缺的字段一律不编造。
+    """
+    if not isinstance(item, dict):
+        return None
+    label = USAGE_SOURCE_LABELS.get(str(item.get("source") or "").strip().lower())
+    if label is None:
+        return None
+    at = _epoch_of(item.get("at"))
+    if at <= 0:
+        # 连时间都读不出来的行不显示：面板按时间排序，它会沉到最底下且时间列是"—"，
+        # 除了让人怀疑面板坏了没有任何价值。
+        return None
+    duration = item.get("duration_ms")
+    return {
+        "at": at,
+        "source": label,
+        "covered": None,
+        "duration_ms": duration if isinstance(duration, (int, float)) else None,
+        "note": _usage_note(item),
+        "agent_id": str(agent_id or item.get("agent_id") or ""),
+        "session_id": str(session_id or item.get("session_id") or ""),
+        "model": str(item.get("model") or ""),
+        # 这一行是"用量的账"而不是"本插件的一次压缩"（概览里的"最近原因"只看后者）
+        "kind": "usage",
+    }
+
+
+def _usage_lines(path):
+    """读一份 `usage.jsonl`（**离线回放**旁路，`--usage-jsonl`）：返回原始行对象。
+
+    运行时那条正路是核心在压缩载荷里捎来的 `recent_usage`（插件读不到数据根，
+    见 [CompactPlugin._ingest_recent_usage]）；这个入口只是开发期"把一份账本喂给
+    面板看"的替代品。
+
+    文件不存在 / 读不了 / 行坏了 ⇒ 一律跳过：那是一条**可选**数据源，它的问题不该
+    让面板变空（面板的首要职责是"为什么没接管"，不是替别的模块报错）。
+    """
+    if not path:
+        return []
+    lines = []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    lines.append(json.loads(line))
+                except ValueError:
+                    continue
+    except (OSError, UnicodeDecodeError):
+        return []
+    return lines
+
+
+def _view_problems(node, path="view"):
+    """面板视图只能用**受限控件集**，且字段形状要对（返回可读问题列表）。
+
+    核心侧只校验"能不能解析成节点"：字段写错（按钮没 label、表格列名与单元格数不符）
+    会渲染成空控件而**不报错**，所以自检在这里把"看着像坏了"的情形也钉住。
+    """
+    problems = []
+    if not isinstance(node, dict):
+        return ["%s 不是对象" % path]
+    kind = node.get("type")
+    if kind not in VIEW_TYPES:
+        return ["%s 的类型 %r 不在受限控件集内" % (path, kind)]
+    if kind == "text" and not str(node.get("text") or "").strip():
+        problems.append("%s 是空文本" % path)
+    if kind == "table":
+        columns = node.get("columns")
+        rows = node.get("rows")
+        if not isinstance(columns, (list, tuple)) or not columns:
+            problems.append("%s 表格缺列名" % path)
+        if not isinstance(rows, (list, tuple)):
+            problems.append("%s 表格缺 rows" % path)
+        elif isinstance(columns, (list, tuple)):
+            for index, row in enumerate(rows):
+                if not isinstance(row, (list, tuple)) or len(row) != len(columns):
+                    problems.append("%s 第 %d 行的单元格数与本列表不符" % (path, index + 1))
+    if kind == "progress":
+        value = node.get("value")
+        if not isinstance(value, (int, float)) or not 0.0 <= float(value) <= 1.0:
+            problems.append("%s 的 progress.value 必须在 0~1：%r" % (path, value))
+    if kind == "actions":
+        buttons = node.get("buttons")
+        if not isinstance(buttons, list) or not buttons:
+            problems.append("%s 的 actions 没有按钮" % path)
+        else:
+            for index, button in enumerate(buttons):
+                if (not isinstance(button, dict) or not button.get("action_id")
+                        or not button.get("label")):
+                    problems.append("%s 第 %d 个按钮缺 action_id / label" % (path, index + 1))
+    children = node.get("children")
+    if isinstance(children, list):
+        for index, child in enumerate(children):
+            problems.extend(_view_problems(child, "%s.children[%d]" % (path, index)))
+    return problems
 
 
 # ── wire 形态的小工具（只认 LlmMessage 的线形状） ────────────────────────────
@@ -228,12 +506,31 @@ class CompactPlugin(object):
         self._request_seq = 0
         self._hello = threading.Event()
         self._counters = {"requests": 0, "taken": 0, "declined": 0}
+        # ── 左栏面板的状态 ──────────────────────────────────────────────
+        # 面板是**只读展示**（它不给插件任何额外权限）：记录来自 ① 插件自己经手的
+        # 压缩 ② 「立即压缩一次」的核心回执 ③（可选）逐调用用量文件。
+        self._ui_panel = not options.no_panel
+        self._ui_lock = threading.Lock()
+        self._ui_last_push = 0.0
+        self._ui_slot_key = SLOT_ACTIVITY
+        self._ui_status = {"subscribed": False, "detail": "等待核心握手"}
+        self._identity = {"agent_id": options.agent_id, "session_id": ""}
+        self._watermark = None  # (已覆盖条数, 原文总条数)：核心报的水位线
+        self._records = []      # 面板记录（最新在**后**；展示时倒序）
+        # 逐调用用量（核心捎来的 `recent_usage` / `--usage-jsonl` 回放）：
+        # 按"整行内容"去重后按 **canonical 行 → 归一后的记录** 存（dict 保序）。
+        self._usage_records = {}
+        self._usage_file = ""   # 账本路径（排障用；插件自己读不到它）
 
     # ── 协议通道 ────────────────────────────────────────────────────────
 
+    def emit(self, message):
+        """写出一条报文（默认走 stdout）。自检时替换成内存收集器（见 selftest）。"""
+        send(message)
+
     def _send(self, message):
         with self._send_lock:
-            send(message)
+            self.emit(message)
 
     def _reply(self, request_id, result=None, error=None):
         message = {"jsonrpc": JSONRPC_VERSION, "id": request_id}
@@ -314,6 +611,9 @@ class CompactPlugin(object):
                     "capabilities": ["stations"],
                 })
                 self._hello.set()
+                # 先申报左栏面板（`hello` 应答后 `plugin_id` 才是实例 id），
+                # 再起订阅线程（订阅要重试，别拖住握手后的第一条报文）。
+                self.declare_panel()
                 threading.Thread(target=self._subscribe_loop, name="subscribe",
                                  daemon=True).start()
                 return
@@ -338,16 +638,26 @@ class CompactPlugin(object):
             })
 
     def _subscribe_loop(self):
-        """握手后订阅点位；失败就有限重试（核心可能还没把站点挂好）。"""
+        """握手后订阅点位；失败就有限重试（核心可能还没把站点挂好）。
+
+        订阅结果**如实投到面板上**：没订上就等于这个插件永远不会被叫到，
+        "为什么没接管"的答案就在这一行里（最常见的是已有别的插件占着这个点位）。
+        """
+        last_error = ""
+        self._set_status(False, "正在订阅 %s…" % STATION_RELAY_CONTEXT_COMPACT)
         for attempt in range(1, 6):
             result = self.subscribe_compact_point()
             if result.get("ok"):
                 log("已订阅 %s（第 %d 次尝试）" % (STATION_RELAY_CONTEXT_COMPACT, attempt))
+                self._set_status(True, "已订阅 %s" % STATION_RELAY_CONTEXT_COMPACT)
                 return
-            log("订阅失败（第 %d 次）：%s" % (attempt, result.get("error")))
+            last_error = str(result.get("error") or "未知原因")
+            log("订阅失败（第 %d 次）：%s" % (attempt, last_error))
             time.sleep(1.0)
         log("订阅 %s 连续失败：本插件不会接管压缩（"
             "若已有别的插件占着这个点位，先停用它）" % STATION_RELAY_CONTEXT_COMPACT)
+        self._set_status(False, "未订上点位：%s（最后错误：%s）"
+                         % (STATION_RELAY_CONTEXT_COMPACT, last_error))
 
     def handle_station_request(self, params):
         """站点 → 插件的请求。只认真实订阅的那个点位，其余一律"不改动"。"""
@@ -355,6 +665,344 @@ class CompactPlugin(object):
         if station_id != STATION_RELAY_CONTEXT_COMPACT:
             return {"reply": {"payload": None}}
         return {"reply": {"payload": self.handle_compact(params)}}
+
+    # ── 左栏面板（activity 槽位：活动栏图标 + 左栏整页） ─────────────────────
+
+    def declare_panel(self):
+        """发 `ui/manifest` 通知：声明**一条** `activity` 槽位（左栏整页）。
+
+        `activity` 在前端是**一个槽位两处呈现**：左侧活动栏的一个图标项 + 左栏里的
+        一整页内容（页内容就是这里的 `view`）。视图只能是**受限控件集**（text / list /
+        table / form / progress / actions 与 row / column 容器）——没有 webview、
+        不执行插件 JS，所以别指望放图表或交互式 HTML。
+
+        声明**发一次就够**：前端断连重连时核心按缓存补发（`PluginUiCache`），
+        之后的每次刷新走 `ui/update`。`--no-panel` 时整个方法什么都不做。
+        """
+        if not self._ui_panel:
+            log("--no-panel：不申报左栏面板")
+            return
+        # 槽位键带实例 id：同一个脚本配成两个插件实例时互不覆盖。
+        self._ui_slot_key = "%s.activity.1" % self.plugin_id
+        self.notify(METHOD_UI_MANIFEST, {"slots": [{
+            "slot_key": self._ui_slot_key,
+            "slot": "activity",
+            "title": PANEL_TITLE,
+            "icon": PANEL_ICON,
+            "order": 20,
+            "view": self._panel_view(),
+        }]})
+        log("已声明左栏面板槽位 %s（activity：活动栏图标 + 左栏整页）"
+            % self._ui_slot_key)
+
+    def update_panel(self, force=False):
+        """发 `ui/update`：按 slot_key **整块替换**面板视图（不做 diff）。
+
+        节流 [PANEL_MIN_INTERVAL]：压缩可能连续触发，而前端收到 update 会重建左栏
+        那一页（表单状态会重置），刷太勤只是闪。`force=True` 绕过节流（按钮回调、
+        订阅结果这类"用户等着看"的刷新）。
+        """
+        if not self._ui_panel:
+            return
+        now = time.monotonic()
+        with self._ui_lock:
+            if not force and now - self._ui_last_push < PANEL_MIN_INTERVAL:
+                return
+            self._ui_last_push = now
+        self.notify(METHOD_UI_UPDATE, {
+            "slot_key": self._ui_slot_key,
+            "view": self._panel_view(),
+        })
+
+    def _set_status(self, subscribed, detail):
+        """更新"点位订阅"这一行的状态并刷面板（订阅没订上必须看得见）。"""
+        with self._ui_lock:
+            # 按键更新而不是整体替换：同一时刻可能有别的提示挂在状态里（如"正在压缩…"）
+            self._ui_status["subscribed"] = bool(subscribed)
+            self._ui_status["detail"] = str(detail)
+        self.update_panel(force=True)
+
+    def _remember_identity(self, agent_id, session_id):
+        """记住最近一次见到的会话：动作帧没带 `agent_id` 时按钮靠它找到目标。"""
+        with self._ui_lock:
+            if agent_id:
+                self._identity["agent_id"] = str(agent_id)
+            if session_id:
+                self._identity["session_id"] = str(session_id)
+
+    def _record(self, source, covered=None, duration_ms=None, note="",
+                agent_id="", session_id=""):
+        """追加一条面板记录（**唯一**的写入点；字段表见 [_collect_records]）。"""
+        with self._ui_lock:
+            self._records.append({
+                "at": time.time(),
+                "source": str(source or ""),
+                "covered": covered if isinstance(covered, int) else None,
+                "duration_ms": duration_ms,
+                "note": str(note or ""),
+                "agent_id": str(agent_id or ""),
+                "session_id": str(session_id or ""),
+                "kind": "own",
+            })
+            if len(self._records) > 100:  # 内部留一点余量即可
+                del self._records[:-100]
+
+    def _collect_records(self):
+        """**面板的数据源（可替换点）**：返回按时间**倒序**（最新在前）的记录列表。
+
+        每条记录的字段（缺项用 None / 空串，视图只认这 9 个键）：
+
+            at           epoch 秒（面板只显示 HH:MM:SS）
+            source       'relay'（本插件接管）/ 'builtin'（核心内置压缩）/ 'llm.call' /
+                         'plugin' / '' = 未知
+            covered      覆盖条数（原文条数，int 或 None）
+            duration_ms  本次耗时（毫秒，int 或 None）
+            note         降级 / 未接管 / 失败的可读原因；用量行的这里是 token 账
+            agent_id / session_id  这一次属于哪个会话（拿不到就是空串）
+            model        用量行的模型 id（本插件自己的记录没有这个信息，空串）
+            kind         'own' = 本插件经手的一次压缩；'usage' = 逐调用账本的一行
+                         （概览里的"最近原因"只看 'own'：账目不是原因）
+
+        当前口径：两类记录并成一张表（都按时间倒序）——
+        ① 这个插件**自己经手**的东西：中转点位的接管 / 不接管（含原因与耗时），
+           以及用户点「立即压缩一次」后核心回的 `CompactionResult`（来源 / 覆盖条数 /
+           降级原因 / 未压缩原因）；
+        ② 核心在压缩载荷里捎来的**逐调用用量**（`recent_usage`，见
+           [_ingest_recent_usage]）：内置压缩（`builtin`）、`llm.call`、
+           `plugin` 接管的调用，含模型 / 输入 / 缓存 / 输出 / 耗时。
+
+        ⚠ "拿不到就留白"仍是硬口径：没有 `recent_usage`（核心没接线 / 账本还不存在）
+        时这里就只有①，来源列不会凭空多出 `builtin`；账本里没有"覆盖条数"，
+        用量行的那一列就是"—"（那是压缩的产物，不是调用的账）。
+        字段表变动只需要改 [_record_from_usage_line] 一处。
+        """
+        # 离线回放旁路（`--usage-jsonl`）：读一份账本文件喂进来。同一条行会被去重，
+        # 所以这里重复读是幂等的（只在没有核心捎数据时才有意义）。
+        if self.options.usage_jsonl:
+            self._ingest_recent_usage(_usage_lines(self.options.usage_jsonl))
+        with self._ui_lock:
+            records = list(self._records)
+            records.extend(self._usage_records.values())
+        records.sort(key=lambda item: item.get("at") or 0, reverse=True)
+        return records
+
+    def _ingest_recent_usage(self, lines, path="", agent_id="", session_id=""):
+        """把核心捎来的"最近用量行"并进面板数据源；返回本次新增的条数。
+
+        为什么必须**去重**：`recent_usage` 是个**滚动窗口**——每次压缩请求核心都带
+        最近 N 行，同一行会被反复送来。不去重的话，面板几轮之后就被同一批记录刷屏。
+        去重键 = 整行内容的 canonical JSON（同一行 → 同一个键；手改过的一行自然算新行）。
+        """
+        if not isinstance(lines, list):
+            return 0
+        added = 0
+        with self._ui_lock:
+            if path:
+                self._usage_file = str(path)
+            for line in lines:
+                if not isinstance(line, dict):
+                    continue
+                key = json.dumps(line, sort_keys=True, ensure_ascii=False)
+                if key in self._usage_records:
+                    continue
+                record = _record_from_usage_line(line, agent_id, session_id)
+                if record is None:  # `turn` 行 / 形状不认识：不是本面板的事
+                    continue
+                self._usage_records[key] = record
+                added += 1
+            if len(self._usage_records) > MAX_USAGE_RECORDS:
+                for key in list(self._usage_records)[:len(self._usage_records)
+                                                    - MAX_USAGE_RECORDS]:
+                    del self._usage_records[key]
+        return added
+
+    def _panel_view(self):
+        """左栏面板视图（受限控件集）：概览 + 水位 + 最近 N 次表格 + 动作按钮。"""
+        records = self._collect_records()
+        limit = max(1, self.options.panel_records)
+        shown = records[:limit]
+        with self._ui_lock:
+            status = dict(self._ui_status)
+            identity = dict(self._identity)
+            counters = dict(self._counters)
+            watermark = self._watermark
+            usage_count = len(self._usage_records)
+        children = [
+            {"type": "text", "text": PANEL_TITLE, "style": "title"},
+            {"type": "text",
+             "text": self._panel_summary(status, identity, counters, records,
+                                         usage_count),
+             "style": "caption"},
+        ]
+        if watermark is not None:
+            covered, total = watermark
+            value = (float(covered) / float(total)) if total > 0 else 0.0
+            children.append({
+                "type": "progress",
+                "value": min(1.0, max(0.0, value)),
+                "label": "已覆盖原文条数（核心报的水位线）",
+                "detail": "%d / %d" % (covered, total),
+            })
+        if not shown:
+            children.append({
+                "type": "text",
+                "text": "还没有压缩记录：点下面「立即压缩一次」，或者等上下文到阈值时"
+                        "自动压一次（核心内置兜底的那几次也会记在下面，来源显示 "
+                        "`builtin`）。",
+                "style": "body",
+            })
+        # 表格**一直渲染**（没记录时给一行占位）：列名先亮出来，用户一眼知道这里会
+        # 记什么；空表格配一句指引，比整块消失更不像"插件坏了"。
+        children.append({
+            "type": "table",
+            "columns": PANEL_COLUMNS,
+            "rows": [self._panel_row(record) for record in shown] or [
+                ["—", "—", "—", "—", "（还没有压缩记录）"],
+            ],
+            "caption": "最近 %d 次（最新在最上面；来源未知 = 本插件没经手；"
+                       "带「用量」的行来自核心捎来的 usage.jsonl）" % len(shown),
+        })
+        children.append({
+            "type": "actions",
+            "buttons": [
+                {"action_id": "compact_now", "label": "立即压缩一次", "style": "primary"},
+                {"action_id": "refresh", "label": "刷新"},
+            ],
+        })
+        return {"type": "column", "gap": 6, "children": children}
+
+    def _panel_summary(self, status, identity, counters, records, usage_count=0):
+        """面板头部那行概览：订阅状态 + 经手统计 + 用量条数 + 最近一次没接管的原因。"""
+        parts = ["点位订阅：%s" % (status.get("detail") or "未知")]
+        parts.append("经手 %d 次（接管 %d / 未接管 %d）"
+                     % (counters.get("requests", 0), counters.get("taken", 0),
+                        counters.get("declined", 0)))
+        if usage_count:
+            parts.append("用量记录 %d 条" % usage_count)
+        agent_id = identity.get("agent_id") or ""
+        session_id = identity.get("session_id") or ""
+        if agent_id or session_id:
+            parts.append("最近会话：%s%s" % (agent_id or "(无 agent)",
+                                            ("/" + session_id) if session_id else ""))
+        else:
+            parts.append("最近会话：未知（等一次压缩 / 工具事件）")
+        for record in records:
+            # 只要"本插件这一次为什么没成"（用量行的说明不是原因：里面是 token 账）
+            if record.get("kind") != "usage" and record.get("note"):
+                parts.append("最近原因：%s" % clip(record["note"], 160))
+                break
+        manual = status.get("manual")
+        if manual:
+            parts.append(manual)
+        return " · ".join(parts)
+
+    @staticmethod
+    def _panel_row(record):
+        """一条记录 → 表格的一行（单元格只放标量文本，表格渲染器只认标量）。"""
+        at = record.get("at") or 0
+        # 时间读不出来的行不会进面板（见 [_record_from_usage_line]），这里只兜一手
+        when = time.strftime("%H:%M:%S", time.localtime(at)) if at > 0 else "—"
+        covered = record.get("covered")
+        return [
+            when,
+            SOURCE_LABELS.get(record.get("source") or "",
+                              record.get("source") or "未知"),
+            "—" if covered is None else str(covered),
+            _duration_text(record.get("duration_ms")),
+            record.get("note") or "—",
+        ]
+
+    # ── 面板交互（前端按钮 → 核心 → 插件） ─────────────────────────────────
+
+    def on_ui_action(self, params):
+        """面板交互回调（核心 → 插件）。
+
+        **判据在 `params.event` 上**：核心把它包成
+        `{"method":"event","params":{"event":"plugin_ui_action", slot_key, action_id,
+        payload}}`（与 `agent.tool_call` 同一范式）。老核心 / 直连测试发裸
+        `method == "plugin_ui_action"` 的形态，[on_notification] 两种都收。
+        """
+        action_id = str(params.get("action_id") or "")
+        slot_key = str(params.get("slot_key") or "")
+        log("面板交互：slot=%s action=%s" % (slot_key, action_id))
+        if action_id == "compact_now":
+            self.start_manual_compact(params)
+            return
+        if action_id == "refresh":
+            self.update_panel(force=True)
+            return
+        # 未知 action：显式记下来（不静默），但不算错误
+        log("未知的面板动作（忽略）：%s" % action_id)
+
+    def start_manual_compact(self, params):
+        """「立即压缩一次」：**不在读循环里等回包**（回包也从同一条 stdin 进来）。
+
+        动作帧自带 `agent_id` / `session_id`（前端按当前上下文填的），优先用它；没有就
+        用站点请求 / 事件里学到的"最近一次见到的"；再没有就如实写进面板（不猜目标）。
+        """
+        payload = params.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        agent_id = str(params.get("agent_id") or payload.get("agent_id") or "").strip()
+        session_id = str(
+            params.get("session_id") or payload.get("session_id") or "").strip()
+        self._remember_identity(agent_id, session_id)
+        with self._ui_lock:
+            agent_id = agent_id or self._identity.get("agent_id") or ""
+            session_id = session_id or self._identity.get("session_id") or ""
+        if not agent_id:
+            self._record("", note="立即压缩未发出：不知道目标 agent（先让它发生一次"
+                                  "压缩 / 工具调用，或用 --agent-id 指定）")
+            self.update_panel(force=True)
+            return
+        with self._ui_lock:
+            self._ui_status["manual"] = "正在压缩…"
+        self.update_panel(force=True)
+        threading.Thread(target=self._do_compact_now, args=(agent_id, session_id),
+                         name="compact-now", daemon=True).start()
+
+    def _do_compact_now(self, agent_id, session_id):
+        """（worker 线程）经执行站 `agent.compact` 手动压一次，并把回执记进面板。
+
+        核心侧这条命令与 REST `/compact` 是**同一个入口**：它会拒绝"正在生成"的
+        agent（压缩改写上下文，与生成并发读写不安全），所以失败信息要原样留痕。
+        """
+        started = time.time()
+        identity = {"agent_id": agent_id, "session_id": session_id}
+        result = self.command(CMD_AGENT_COMPACT, dict(identity), scope=identity)
+        duration_ms = _elapsed_ms(started)
+        if not result.get("ok"):
+            note = "立即压缩失败：%s" % (result.get("error") or "未知原因")
+            log("agent.compact 失败：%s" % note)
+            self._record("", duration_ms=duration_ms, note=note,
+                         agent_id=agent_id, session_id=session_id)
+            self._finish_manual(agent_id, session_id)
+            return
+        payload = result.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        record_source = str(payload.get("source") or "").strip().lower()
+        covered = payload.get("summarized_messages")
+        note = ""
+        if payload.get("compressed") is not True:
+            note = "未压缩：%s" % (payload.get("reason") or "未知原因")
+        elif payload.get("degraded"):
+            note = "降级：%s" % (payload.get("degraded_reason") or "总结失败")
+        elif payload.get("relay_skip_reason"):
+            # ② 落地后的可选键：中转站没接管的可读原因（没有它就只剩"降级/成功"两种观感）
+            note = "中转未接管：%s" % payload.get("relay_skip_reason")
+        log("手动压缩：compressed=%s source=%s 覆盖=%s 耗时=%s note=%s"
+            % (payload.get("compressed"), record_source or "(未知)", covered,
+               _duration_text(duration_ms), note or "-"))
+        self._record(record_source, covered=covered if isinstance(covered, int) else None,
+                     duration_ms=duration_ms, note=note,
+                     agent_id=agent_id, session_id=session_id)
+        self._finish_manual(agent_id, session_id)
+
+    def _finish_manual(self, agent_id, session_id):
+        """手动压缩收尾：清掉"正在压缩…"并把结果推到面板上。"""
+        with self._ui_lock:
+            self._ui_status.pop("manual", None)
+        self._remember_identity(agent_id, session_id)
+        self.update_panel(force=True)
 
     # ── 压缩主体 ────────────────────────────────────────────────────────
 
@@ -365,25 +1013,44 @@ class CompactPlugin(object):
         payload = params.get("payload")
         if not isinstance(payload, dict):
             log("压缩请求缺少 payload 对象：不接管")
-            return self._decline()
+            return self._decline("请求缺少 payload 对象", started)
         scope = params.get("scope")
         scope = scope if isinstance(scope, dict) else {}
         agent_id = str(payload.get("agent_id") or scope.get("agent_id") or "")
         session_id = str(payload.get("session_id") or scope.get("session_id") or "")
         identity = {"agent_id": agent_id, "session_id": session_id}
+        # 记住"最近一次见到的会话"：面板上的「立即压缩一次」按钮靠它找到目标 agent
+        self._remember_identity(agent_id, session_id)
+        # **逐调用用量**：核心在载荷里捎来最近 N 行（插件读不到数据根）。放在这里
+        # （早于下面每一处"不接管"）——不接管时面板也要能看到"这次为什么没压"和
+        # "最近的调用都花了多少"。喂不进来（键不存在）就什么都不发生。
+        added_usage = self._ingest_recent_usage(
+            payload.get("recent_usage"),
+            path=str(payload.get("usage_file") or ""),
+            agent_id=agent_id,
+            session_id=session_id,
+        )
+        if added_usage:
+            log("已并入 %d 条用量记录（账本：%s）"
+                % (added_usage, self._usage_file or "未提供路径"))
         system_prompt = str(payload.get("system_prompt") or "")
         total = _non_negative_int(payload.get("total_message_count"))
         frozen = _non_negative_int(payload.get("compacted_message_count"))
+        if total > 0:
+            # 核心报的水位线（原文总条数 / 之前已覆盖条数）：面板拿它画进度
+            self._watermark = (frozen, total)
 
         # 原料：引擎这一轮真会发的那份请求（没有它就不接管——不同口径的前缀没有意义）
         request = payload.get("request")
         if not isinstance(request, dict):
             log("载荷没有 request（引擎口径的线形请求）：不接管")
-            return self._decline()
+            return self._decline("载荷没有 request（引擎口径的线形请求）",
+                                 started, agent_id, session_id)
         wire = request.get("messages")
         if not isinstance(wire, list) or not wire:
             log("request.messages 不是非空数组：不接管")
-            return self._decline()
+            return self._decline("request.messages 不是非空数组",
+                                 started, agent_id, session_id)
         tools = request.get("tools")
         tools = tools if isinstance(tools, list) else None
 
@@ -395,7 +1062,8 @@ class CompactPlugin(object):
         cut = self.wire_cut(wire, self.options.keep_rounds)
         if cut <= 0:
             log("没有可压的内容（切点 %d：整段都要保留）：不接管" % cut)
-            return self._decline()
+            return self._decline("没有可压的内容（整段都要保留）",
+                                 started, agent_id, session_id)
 
         # 总结调用：**前缀 = request.messages[:cut]**（与对话逐字一致 ⇒ 命中缓存），
         # 末尾只追加一条 user 指令；tools 原样透传（前缀对齐的另一半）。
@@ -415,14 +1083,16 @@ class CompactPlugin(object):
         summary_result = self.command("llm.call", arguments, scope=identity)
         if not summary_result.get("ok"):
             log("llm.call 失败：%s（不接管）" % summary_result.get("error"))
-            return self._decline()
+            return self._decline("总结调用 llm.call 失败：%s" % (summary_result.get("error") or "未知原因"),
+                                 started, agent_id, session_id)
         summary_payload = summary_result.get("payload")
         summary_payload = summary_payload if isinstance(summary_payload, dict) else {}
         parsed = summary_payload.get("json")
         if not isinstance(parsed, dict):
             log("总结模型没有回 json 对象（text 前 120 字：%s）：不接管"
                 % clip(str(summary_payload.get("text") or ""), 120))
-            return self._decline()
+            return self._decline("总结模型没有回 json 对象",
+                                 started, agent_id, session_id)
         usage = summary_payload.get("usage") or {}
         log("摘要完成：模型=%s 前缀 %d 条 prompt_tokens=%s cached_tokens=%s"
             % (summary_payload.get("model"), cut, usage.get("prompt_tokens"),
@@ -483,15 +1153,31 @@ class CompactPlugin(object):
                len(out_messages), time.time() - started))
         if self.options.dry_run:
             log("--dry-run：拼好了但按「不接管」返回（核心会走内置 compact）")
-            return self._decline()
+            return self._decline("--dry-run：拼好了但按不接管返回",
+                                 started, agent_id, session_id)
+        covered = total if total > 0 else frozen
+        # 面板记录：**接管成功**也要留痕（来源 relay + 覆盖条数 + 耗时），
+        # 否则"压了几次、每次多大"就只能靠翻服务端账单猜——那正是这次要修的。
+        self._record("relay", covered=covered, duration_ms=_elapsed_ms(started),
+                     agent_id=agent_id, session_id=session_id)
+        self.update_panel()
         return {
             "messages": out_messages,
             # 尾部已抄进列表 ⇒ 原文全部覆盖（上界就是 total_message_count）
-            "covered_message_count": total if total > 0 else frozen,
+            "covered_message_count": covered,
         }
 
-    def _decline(self):
+    def _decline(self, reason="", started=None, agent_id="", session_id=""):
+        """不接管：计数 + 记一条面板记录。
+
+        **原因必须可见**：用户真正踩到的坑几乎都是"插件白跑一次、核心悄悄兜底了"，
+        而"为什么没接管"以前在类型上就丢了（回一个 null 就没了）。现在它进日志 + 面板。
+        """
         self._counters["declined"] += 1
+        self._record("", duration_ms=_elapsed_ms(started),
+                     note="未接管：%s" % (reason or "未知原因"),
+                     agent_id=agent_id, session_id=session_id)
+        self.update_panel()
         return None
 
     # ── 切点（wire 坐标） ───────────────────────────────────────────────
@@ -653,7 +1339,21 @@ class CompactPlugin(object):
         if method == "shutdown":
             log("收到 shutdown，退出")
             sys.exit(0)
-        # station/cancel（我们没接流式）与 event 等通知：忽略即可
+        if method == "event":
+            # **核心把面板动作也包成 `event` 通知**：判据在 `params.event` 上
+            # （见 [EVENT_UI_ACTION]）。别的 agent 事件只用来学"最近见到的会话"。
+            event = str(params.get("event") or "")
+            if event == EVENT_UI_ACTION:
+                self.on_ui_action(params)
+                return
+            self._remember_identity(params.get("agent_id"), params.get("session_id"))
+            return
+        if method == EVENT_UI_ACTION:
+            # 裸 `method == "plugin_ui_action"` 形态（老核心 / 直连测试）：
+            # 兼容收下——否则老核心配新插件时按钮依然是"点了没反应"。
+            self.on_ui_action(params)
+            return
+        # station/cancel（我们没接流式）与其它通知：忽略即可
 
     def serve(self):
         """读循环（主线程）：响应唤醒等待者；请求**另开线程**；通知就地处理。"""
@@ -770,7 +1470,7 @@ def _summary_fixture():
     }
 
 
-def _fixture_command(summary_json, fail_commands=()):
+def _fixture_command(summary_json, fail_commands=(), compact_result=None):
     """假命令通道：记录调用，按命令返回与核心同形状的结果。"""
     calls = []
 
@@ -802,6 +1502,15 @@ def _fixture_command(summary_json, fail_commands=()):
                     "tool": "set_todo_list", "is_error": False,
                     "result": "- [~] t1 | status=in_progress progress=50 | 改 JWT",
                 }}
+            if command == "agent.compact":
+                # 核心 `_stationCompact` 的回执形状 = CompactionResult.toJson()
+                # （+ agent_id / session_id），见 core_server.dart
+                payload = compact_result if compact_result is not None else {
+                    "success": True, "compressed": True, "context_size": 9,
+                    "summarized_messages": 6, "source": "builtin",
+                    "session_id": "ses_1",
+                }
+                return {"ok": True, "command": command, "payload": payload}
             return {"ok": False, "error": "未知命令 %s" % command}
 
     return _Fake(), calls
@@ -841,11 +1550,81 @@ def _payload_of(reply):
     return body.get("payload")
 
 
-def _plugin(summary=None, fail_commands=()):
-    plugin = CompactPlugin(Options())
-    fake, calls = _fixture_command(summary or _summary_fixture(), fail_commands)
+def _plugin(summary=None, fail_commands=(), compact_result=None, options=None):
+    """造一个走假命令通道的插件，并把**发出的报文收进内存**（`plugin.sent`）。
+
+    自检不该往 stdout 写协议帧（那是给真核心的通道，混进自检报告里只会碍眼）——
+    面板相关的用例因此都读 `plugin.sent`，而不是去劫持全局 `send`。
+    """
+    plugin = CompactPlugin(options or Options())
+    fake, calls = _fixture_command(summary or _summary_fixture(), fail_commands,
+                                   compact_result)
     plugin.command = fake
+    plugin.sent = []
+    plugin.emit = plugin.sent.append
     return plugin, calls
+
+
+def _notifications(sent, method):
+    """从收集到的报文里挑出某个 method 的通知。"""
+    return [message for message in sent if message.get("method") == method]
+
+
+def _last_view(sent, method):
+    """最后一个某 method 通知的 params.view（没有就是空 dict）。"""
+    hits = _notifications(sent, method)
+    if not hits:
+        return {}
+    params = hits[-1].get("params")
+    view = params.get("view") if isinstance(params, dict) else None
+    return view if isinstance(view, dict) else {}
+
+
+def _declared_slot(sent):
+    """最后一条 `ui/manifest` 声明里的第一个槽位（没有就是空 dict）。"""
+    hits = _notifications(sent, "ui/manifest")
+    if not hits:
+        return {}
+    params = hits[-1].get("params")
+    slots = params.get("slots") if isinstance(params, dict) else None
+    if isinstance(slots, list) and slots and isinstance(slots[0], dict):
+        return slots[0]
+    return {}
+
+
+def _usage_fixture():
+    """`usage.jsonl` 的样本行（**字段表 = 核心 `UsageCall.toJson()`**，逐个用它们）。
+
+    四行覆盖三种要显示的来源 + 一种**必须被跳过**的（`turn` = 对话自己的跳），
+    外加三类边界：`cached_tokens = null`（端点没给）、`estimated = true`（本地估算）、
+    以及"耗时超过 1 秒"（面板要显示成人话的秒）。
+    """
+    return [
+        # 内置压缩的一次总结：面板来源列要显示 builtin
+        {"at": "2026-10-03T16:31:55.000000", "source": "compact",
+         "model": "demo-model", "prompt_tokens": 1200, "cached_tokens": 900,
+         "completion_tokens": 120, "estimated": False, "duration_ms": 1800},
+        # 执行站 llm.call（压缩插件的总结调用走这条）：端点没给 cached_tokens + 估算值
+        {"at": "2026-10-03T16:38:02.500000", "source": "llm.call",
+         "model": "demo-model", "prompt_tokens": 800, "cached_tokens": None,
+         "completion_tokens": 60, "estimated": True, "duration_ms": 700},
+        # llm.handle 被插件整体接管的一跳
+        {"at": "2026-10-03T16:39:10.000000", "source": "plugin",
+         "model": "demo-model", "prompt_tokens": 300, "cached_tokens": 0,
+         "completion_tokens": 30, "estimated": False, "duration_ms": 260},
+        # 对话自己的跳：**不属于压缩面板**，必须被跳过
+        {"at": "2026-10-03T16:40:00.000000", "source": "turn",
+         "model": "demo-model", "prompt_tokens": 10, "cached_tokens": None,
+         "completion_tokens": 5, "estimated": False, "duration_ms": 90},
+    ]
+
+
+def _panel_table(view):
+    """从面板视图里取出那张表格节点（没有就是空 dict）。"""
+    for child in (view or {}).get("children") or []:
+        if isinstance(child, dict) and child.get("type") == "table":
+            return child
+    return {}
 
 
 def _roles(messages):
@@ -1078,6 +1857,275 @@ def selftest():
         {"station_id": "system.relay.prompt.system"}))
     if other is not None:
         failures.append("非本点位请求不该回填充")
+
+    # ⑩ 左栏面板声明：`ui/manifest` 只发一次、只有一条 **activity** 槽位
+    #    （activity = 活动栏图标 + 左栏整页），视图只能用受限控件集
+    panel_plugin, _ = _plugin()
+    panel_plugin.declare_panel()
+    manifests = _notifications(panel_plugin.sent, "ui/manifest")
+    if len(manifests) != 1:
+        failures.append("ui/manifest 应恰好发 1 次，实际 %d" % len(manifests))
+    else:
+        params = manifests[0].get("params") or {}
+        slots = params.get("slots")
+        if not isinstance(slots, list) or len(slots) != 1:
+            failures.append("ui/manifest 应声明 1 条槽位，实际 %r" % (slots,))
+        else:
+            slot = slots[0]
+            if slot.get("slot") != "activity":
+                failures.append("槽位类型应是 activity（左栏整页），实际 %r"
+                                % slot.get("slot"))
+            if slot.get("slot_key") != SLOT_ACTIVITY:
+                failures.append("slot_key 不对：%r" % slot.get("slot_key"))
+            if not slot.get("title") or not slot.get("icon"):
+                failures.append("槽位缺 title / icon：%r" % slot)
+            view = slot.get("view")
+            problems = _view_problems(view)
+            if problems:
+                failures.append("面板声明视图不合法：%s" % problems)
+            rendered = json.dumps(view, ensure_ascii=False)
+            if '"compact_now"' not in rendered:
+                failures.append("面板缺「立即压缩一次」按钮（action_id=compact_now）")
+            size = len(json.dumps(slot, ensure_ascii=False).encode("utf-8"))
+            if size > 64 * 1024:
+                failures.append("面板声明 %d 字节，超过核心 64 KB 上限（会被整帧拒）"
+                                % size)
+    if panel_plugin._collect_records():
+        failures.append("刚起来的插件不该有压缩记录：%r"
+                        % (panel_plugin._collect_records()[:1],))
+    # 空态也要说清"接下来怎么办"（否则用户对着空表格只会以为插件坏了）
+    empty_view = _declared_slot(panel_plugin.sent).get("view")
+    if "还没有压缩记录" not in json.dumps(empty_view, ensure_ascii=False):
+        failures.append("面板空态缺一句可操作的话（点按钮 / 等自动压缩）")
+
+    # ⑩b `--no-panel`：一帧 UI 都不发（只想后台跑压缩时用）
+    silent_options = Options()
+    silent_options.no_panel = True
+    silent_plugin, _ = _plugin(options=silent_options)
+    silent_plugin.declare_panel()
+    silent_plugin.update_panel(force=True)
+    if silent_plugin.sent:
+        failures.append("--no-panel 时不该发任何 UI 帧：%r" % (silent_plugin.sent[:1],))
+
+    # ⑪ 压缩之后面板要如实刷新（来源 / 覆盖条数 / 耗时都要出现在表里）
+    taken_panel, _ = _plugin()
+    taken_panel.handle_station_request(_params(wire))  # 走真编排（假命令通道）
+    updates = _notifications(taken_panel.sent, "ui/update")
+    if not updates:
+        failures.append("接管一次压缩后应发一帧 ui/update 刷新面板")
+    else:
+        params = updates[-1].get("params") or {}
+        if params.get("slot_key") != SLOT_ACTIVITY:
+            failures.append("ui/update 的 slot_key 不对：%r" % params.get("slot_key"))
+        view = params.get("view") or {}
+        problems = _view_problems(view)
+        if problems:
+            failures.append("刷新后的面板视图不合法：%s" % problems)
+        rendered = json.dumps(view, ensure_ascii=False)
+        for must in ["relay", '"12"', "ms"]:
+            if must not in rendered:
+                failures.append("面板表里看不到 %r：%s" % (must, rendered[:300]))
+
+    # ⑪b **不接管也要留痕**：面板的重点是"为什么没接管"（用户踩到的正是这个）
+    decline_panel, _ = _plugin()
+    without_request = _params(wire)
+    without_request["payload"].pop("request")
+    decline_panel.handle_station_request(without_request)
+    decline_records = decline_panel._collect_records()
+    if not decline_records or "未接管" not in str(decline_records[0].get("note") or ""):
+        failures.append("不接管必须记进面板（note 里要能看到原因）：%r"
+                        % (decline_records[:1],))
+    if _view_problems(_last_view(decline_panel.sent, "ui/update")):
+        failures.append("不接管后的面板视图不合法")
+
+    # ⑫ 面板动作回传：核心发的是 **event 通知**（判据在 params.event 上），
+    #    同时兼容裸 method 形态（老核心 / 直连测试）
+    action_plugin, _ = _plugin()
+    action_plugin.on_notification("event", {
+        "event": EVENT_UI_ACTION,
+        "slot_key": SLOT_ACTIVITY,
+        "action_id": "refresh",
+        "agent_id": "agt_1",
+        "session_id": "ses_1",
+        "payload": {},
+    })
+    if not _notifications(action_plugin.sent, "ui/update"):
+        failures.append("event 形态的面板动作没被处理（判据必须看 params.event）")
+    legacy_plugin, _ = _plugin()
+    legacy_plugin.on_notification(EVENT_UI_ACTION, {"action_id": "refresh"})
+    if not _notifications(legacy_plugin.sent, "ui/update"):
+        failures.append("裸 method=plugin_ui_action 形态没兼容（老核心点按钮会没反应）")
+    noise_plugin, _ = _plugin()
+    noise_plugin.on_notification("event", {
+        "event": "agent.tool_call", "agent_id": "agt_9", "session_id": "ses_9",
+    })
+    if noise_plugin.sent:
+        failures.append("非 UI 事件不该触发面板帧：%r" % (noise_plugin.sent[:1],))
+    if noise_plugin._collect_records():
+        failures.append("非 UI 事件不该产生面板记录")
+    if noise_plugin._identity.get("agent_id") != "agt_9":
+        failures.append("agent 事件应当被用来学习「最近见到的会话」")
+
+    # ⑬ 「立即压缩一次」：经执行站 `agent.compact`，回执要落进面板
+    manual_plugin, manual_calls = _plugin()
+    manual_plugin._do_compact_now("agt_1", "ses_1")
+    compact_calls = [c for c in manual_calls if c["command"] == CMD_AGENT_COMPACT]
+    if len(compact_calls) != 1:
+        failures.append("agent.compact 应恰好调 1 次，实际 %d" % len(compact_calls))
+    elif compact_calls[0]["arguments"].get("agent_id") != "agt_1" \
+            or compact_calls[0]["scope"].get("session_id") != "ses_1":
+        failures.append("agent.compact 没带身份：%r" % (compact_calls[0],))
+    manual_records = manual_plugin._collect_records()
+    if not manual_records or manual_records[0].get("source") != "builtin" \
+            or manual_records[0].get("covered") != 6:
+        failures.append("手动压缩的回执没记进面板：%r" % (manual_records[:1],))
+    if "builtin" not in json.dumps(_last_view(manual_plugin.sent, "ui/update"),
+                                   ensure_ascii=False):
+        failures.append("手动压缩后面板没刷新出 builtin 来源")
+
+    # ⑬b 降级 / 未压缩 / 中转未接管 / 命令失败：四种"不顺利"都必须在面板上有原因
+    for label, kwargs, must in [
+        ("降级", {"compact_result": {
+            "success": True, "compressed": True, "degraded": True,
+            "degraded_reason": "端点 429：限流", "summarized_messages": 30,
+            "source": "builtin"}}, "限流"),
+        ("未压缩", {"compact_result": {
+            "success": True, "compressed": False, "reason": "too_few_messages"}},
+         "too_few_messages"),
+        ("中转未接管（② 的可选键）", {"compact_result": {
+            "success": True, "compressed": True, "source": "builtin",
+            "summarized_messages": 8,
+            "relay_skip_reason": "中转站没订上 compact 点位"}}, "没订上"),
+        ("命令失败", {"fail_commands": ("agent.compact",)}, "失败"),
+    ]:
+        probe_plugin, _ = _plugin(**kwargs)
+        probe_plugin._do_compact_now("agt_1", "ses_1")
+        records = probe_plugin._collect_records()
+        if not records or must not in str(records[0].get("note") or ""):
+            failures.append("%s 的原因没出现在面板记录里（%r 不在 %r）"
+                            % (label, must, records[:1]))
+
+    # ⑬c 按钮走"没有 agent 就不猜"的路径：如实写进面板，不静默
+    blind_plugin, blind_calls = _plugin()
+    blind_plugin.on_notification("event", {
+        "event": EVENT_UI_ACTION, "action_id": "compact_now", "payload": {},
+    })
+    if [c for c in blind_calls if c["command"] == CMD_AGENT_COMPACT]:
+        failures.append("没有 agent 时不该猜一个目标去压缩")
+    blind_records = blind_plugin._collect_records()
+    if not blind_records or "不知道目标 agent" not in str(
+            blind_records[0].get("note") or ""):
+        failures.append("没有 agent 时必须如实写进面板：%r" % (blind_records[:1],))
+    # 但动作帧带了身份时（前端按当前上下文填的）就该照做——这里用线程外的同步路径验
+    identified_plugin, identified_calls = _plugin()
+    identified_plugin.start_manual_compact({
+        "agent_id": "agt_7", "session_id": "ses_7", "payload": {},
+    })
+    deadline = time.time() + 5.0
+    while time.time() < deadline and not [
+            c for c in identified_calls if c["command"] == CMD_AGENT_COMPACT]:
+        time.sleep(0.02)
+    if not [c for c in identified_calls if c["command"] == CMD_AGENT_COMPACT]:
+        failures.append("动作帧带身份时「立即压缩一次」应真的发出命令")
+
+    # ⑭ **核心捎来的用量**（`recent_usage`）：喂进面板后来源 / 耗时 / token 都要对，
+    #    且重复喂同一批（滚动窗口每次请求都会重发）不能刷屏（去重）
+    usage_plugin, _ = _plugin()
+    with_usage = _params(wire)
+    with_usage["payload"]["usage_file"] = "E:/data/agt_1/ses_1/usage.jsonl"
+    with_usage["payload"]["recent_usage"] = _usage_fixture()
+    usage_plugin.handle_station_request(with_usage)
+    usage_records = usage_plugin._collect_records()
+    labels = [record.get("source") for record in usage_records]
+    for expected in ("relay", "builtin", "llm.call", "plugin"):
+        if labels.count(expected) != 1:
+            failures.append("面板来源列少了 / 多了 %r：%r" % (expected, labels))
+    if "turn" in labels:
+        failures.append("对话自己的跳（source=turn）不该进压缩面板：%r" % labels)
+    if not usage_plugin._usage_file.endswith("usage.jsonl"):
+        failures.append("载荷里的 usage_file 没被记住（排障要用）：%r"
+                        % usage_plugin._usage_file)
+    usage_view = json.dumps(usage_plugin._panel_view(), ensure_ascii=False)
+    for must in ["builtin", "llm.call", '"plugin"', "1.2k", "缓存 900",
+                 "输出 120", "1.8 s", "16:31:55", "（估算）"]:
+        if must not in usage_view:
+            failures.append("面板视图里看不到 %r：%s" % (must, usage_view[:400]))
+    if "缓存 0" in usage_view:
+        failures.append("cached_tokens=null 不该显示成 0（拿不到就留白）")
+    if "最近原因：用量" in usage_view:
+        failures.append("概览的「最近原因」不该拿用量行的说明充当原因")
+    # 滚动窗口：同一批行会被反复送来 ⇒ 去重后用量条数不变（否则面板会被刷屏）
+    before_dedup = len(usage_plugin._usage_records)
+    again = usage_plugin._ingest_recent_usage(_usage_fixture())
+    if again != 0 or len(usage_plugin._usage_records) != before_dedup:
+        failures.append("重复喂同一批用量行应全部去重（新增 %d 条，共 %d 条）"
+                        % (again, len(usage_plugin._usage_records)))
+
+    # ⑭b 核心没捎用量（未接线 / 账本还不存在）：面板照常工作，**不凭空造记录**
+    plain_plugin, _ = _plugin()
+    plain_plugin.handle_station_request(_params(wire))
+    plain_labels = [record.get("source") for record in plain_plugin._collect_records()]
+    if plain_labels != ["relay"]:
+        failures.append("没有 recent_usage 时不该多出记录：%r" % plain_labels)
+    if "用量记录" in json.dumps(plain_plugin._panel_view(), ensure_ascii=False):
+        failures.append("没有用量时概览里不该提用量条数")
+
+    # ⑭c 上限：账本可能很长 ⇒ 插件内部要有界，面板只显示 panel_records 条
+    bulk_plugin, _ = _plugin()
+    bulk = _params(wire)
+    bulk["payload"]["recent_usage"] = [
+        {"at": "2026-10-03T%02d:%02d:00.000000" % (4 + index // 60, index % 60),
+         "source": "compact", "model": "demo-model", "prompt_tokens": index,
+         "cached_tokens": None, "completion_tokens": 1, "estimated": False,
+         "duration_ms": 10}
+        for index in range(300)
+    ]
+    bulk_plugin.handle_station_request(bulk)
+    if len(bulk_plugin._usage_records) > MAX_USAGE_RECORDS:
+        failures.append("内部用量记录没有上限：%d 条"
+                        % len(bulk_plugin._usage_records))
+    bulk_table = _panel_table(bulk_plugin._panel_view())
+    if len(bulk_table.get("rows") or []) != bulk_plugin.options.panel_records:
+        failures.append("面板应只显示 %d 条，实际 %d"
+                        % (bulk_plugin.options.panel_records,
+                           len(bulk_table.get("rows") or [])))
+
+    # ⑭d 离线回放旁路（`--usage-jsonl`）：读一份账本文件，按同一张字段表归一，
+    #     坏行 / 不存在的文件都不能把面板弄空或弄崩
+    try:
+        with tempfile.TemporaryDirectory(prefix="compact_selftest_") as folder:
+            usage_path = os.path.join(folder, "usage.jsonl")
+            with open(usage_path, "w", encoding="utf-8") as handle:
+                for item in _usage_fixture():
+                    handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+                handle.write("这不是 JSON\n")
+                handle.write(json.dumps({"source": "compact"}) + "\n")  # 缺 at
+            usage_options = Options()
+            usage_options.usage_jsonl = usage_path
+            file_plugin, _ = _plugin(options=usage_options)
+            file_records = file_plugin._collect_records()
+            file_labels = sorted(record.get("source") for record in file_records)
+            if file_labels != ["builtin", "llm.call", "plugin"]:
+                failures.append("离线回放的来源列不对：%r" % (file_labels,))
+            file_view = json.dumps(file_plugin._panel_view(), ensure_ascii=False)
+            if '"42"' in file_view or "这不是 JSON" in file_view:
+                failures.append("坏行 / 缺时间字段的行漏进了面板")
+    except OSError as error:
+        failures.append("usage.jsonl 用例建不了临时文件：%r" % error)
+    missing_path, _ = _plugin()
+    missing_path.options.usage_jsonl = "不存在的目录/usage.jsonl"
+    if missing_path._collect_records():
+        failures.append("usage.jsonl 不存在时应静默返回空（面板不该报错）")
+
+    # ⑮ 订阅结果如实上面板（"为什么没接管"的答案常常就在这一行）
+    status_plugin, _ = _plugin()
+    status_plugin._set_status(False, "未订上点位：system.relay.context.compact")
+    status_text = json.dumps(_last_view(status_plugin.sent, "ui/update"),
+                             ensure_ascii=False)
+    if "未订上点位" not in status_text:
+        failures.append("订阅失败没显示到面板上：%s" % status_text[:200])
+    if status_plugin._collect_records():
+        failures.append("状态刷新不该凭空造出一条压缩记录")
 
     return _report(failures, calls, plugin)
 
