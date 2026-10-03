@@ -550,6 +550,14 @@ class _MessageListViewState extends State<_MessageListView> {
 
   void _flushCoordinate() {
     if (!mounted) return;
+    // **空槽位表没有坐标可报**：这一刻 `_builtFirst/_builtLast` 里是上一份内容的残留，
+    // 报上去只会让面板为"还不存在的窗口"发一串补页请求（切 agent 时实测：
+    // 新 agent 的窗口刚被清空，就照着旧坐标发了 from=… 的请求）。
+    if (widget.slots.isEmpty) {
+      _builtFirst = -1;
+      _builtLast = -1;
+      return;
+    }
     final MessageRange? authoritative = _builtRangeFromRenderTree();
     final int first;
     final int last;

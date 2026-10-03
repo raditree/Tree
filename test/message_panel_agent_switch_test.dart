@@ -242,17 +242,17 @@ void main() {
   }
 
   ScrollPosition? positionOf(WidgetTester tester) {
-    final Finder list = find
-        .descendant(
-          of: find.byType(MessageList),
-          matching: find.byType(ListView),
-        )
-        .first;
+    // 注意：**不能**先挂 `.first` 再判空——`_FirstFinderMixin` 在 evaluate() 时就取
+    // 第一个，空集合会直接抛 StateError（加载态里本来就没有 ListView）。
+    final Finder list = find.descendant(
+      of: find.byType(MessageList),
+      matching: find.byType(ListView),
+    );
     if (list.evaluate().isEmpty) return null;
     final Finder scrollable =
-        find.descendant(of: list, matching: find.byType(Scrollable)).first;
+        find.descendant(of: list, matching: find.byType(Scrollable));
     if (scrollable.evaluate().isEmpty) return null;
-    return tester.state<ScrollableState>(scrollable).position;
+    return tester.state<ScrollableState>(scrollable.first).position;
   }
 
   /// 这一趟**真被布局过**的子项下标区间（渲染树里的权威口径）
@@ -403,17 +403,18 @@ void main() {
     expect(core.log.any((String e) => e == 'req history a2'), isTrue,
         reason: '历史请求应当就是新 agent 的：${core.log}');
 
-    // 放开后内容正常到位（并且**没有**多余的重复历史请求）
+    // 放开后内容正常到位（并且**没有**多余的重复末尾页请求）
     core.openSessionsGate();
     await flyIO(tester, rounds: 12);
     expect(loadedOf(tester).length, greaterThanOrEqualTo(core.pageSize),
         reason: '放开闸门后历史没到位：${core.log}');
-    expect(
-      core.historyQueries.length,
-      1,
-      reason: '同一份末尾页只该拉一次（并发预取到位的会话不该被重复拉）：'
-          '${core.historyQueries}',
-    );
+    final List<String> tailQueries = core.historyQueries
+        .where((String q) => !q.contains('from=') && !q.contains('at='))
+        .toList();
+    expect(tailQueries.length, 1,
+        reason: '同一份末尾页只该拉一次（并发预取到位的会话不该被重复拉；'
+            '视口上方那条 from=… 的补页是正常的懒加载，不算重复）：'
+            '${core.historyQueries}');
     await closePanel(tester);
   });
 

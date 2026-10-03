@@ -149,8 +149,14 @@ void main() {
         home: Scaffold(body: MessagePanel(selectedAgent: agent())),
       ),
     );
-    // 会话列表 + 一页历史 + 一次账本读取：多飞几轮再断言
-    await flyIO(tester, rounds: 10);
+    // 会话列表 + 一页历史 + 一次账本读取：多飞几轮再断言。
+    //
+    // 轮数从 10 加到 18 的原因（2026-10-03，中栏切 agent 修复）：账本读数**延后**到
+    // 末尾页落地之后才发出（它是"需要才查"的旁路读数，不许抢在切换的关键路径前面），
+    // 而它自己要走 5 次真文件 I/O（exists / length / open / read / close）——在
+    // fake-async 的测试里每次 I/O 都要一个 runAsync 窗口，于是比原先多花几轮。
+    // 语义没变：这里只是等它飞完。
+    await flyIO(tester, rounds: 18);
   }
 
   /// 收尾：烧掉面板里 5s 兜底 / 心跳之类的定时器，再摘掉组件（不留 pending timer）。
