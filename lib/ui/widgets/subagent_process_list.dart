@@ -95,20 +95,5 @@ class SubagentProcessList extends StatelessWidget {
   }
 }
 
-/// 临时员工过程里"最后一条带 usage 的消息"给的**它自己的上下文用量**（没有则 null）。
-///
-/// 用户 2026-10-04：「临时员工的 LLM 调用上下文长度统计不能污染主 agent 的」——所以这个数字
-/// 只在临时员工自己的视图里显示，绝不并进主 agent 那条读数。
-String? subagentUsageLine(List<ChatMessage> transcript) {
-  for (final ChatMessage message in transcript.reversed) {
-    final Map<String, dynamic>? usage = message.usage;
-    if (usage == null || usage.isEmpty) continue;
-    final int prompt = (usage['prompt_tokens'] as num?)?.toInt() ?? 0;
-    final int max = (usage['max_tokens'] as num?)?.toInt() ?? 0;
-    if (prompt <= 0 && max <= 0) continue;
-    return max > 0
-        ? '它的上下文：$prompt / $max tokens（不并进主 agent 的统计）'
-        : '它的上下文：$prompt tokens（不并进主 agent 的统计）';
-  }
-  return null;
-}
+// 上下文读数的口径（含 subagentUsageLine）统一在 services/conversation_view.dart：
+// 中栏的上下文长度条与这里的详情页**必须同源**，否则两处会漂。

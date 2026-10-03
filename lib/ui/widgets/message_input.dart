@@ -87,11 +87,30 @@ class MessageInput extends StatefulWidget {
   /// 只改文本与焦点，**绝不自动发送**：发不发是用户按发送键决定的。
   final ComposerPrefillRequest? prefill;
 
+  /// 底部一行、**发送键左侧**的额外组件（中栏拿它放"视角切换器"：主会话 ⇄ 临时员工）。
+  ///
+  /// 为什么留这个插槽而不是让调用方另摆一个：它会跟着输入框的圆角卡片一起排布，
+  /// 换主题/换宽度都不用两边各调一次（用户 2026-10-04：「把切换的 UI 组件放输入框
+  /// 右下部分（发送按钮左侧）」）。
+  final Widget? bottomTrailing;
+
+  /// **只读锁定**：正在看临时员工的过程时锁住输入（那条过程不是你在对话）。
+  ///
+  /// 锁定时文本域换成一行的说明（[lockedHint]），附件与发送键一并禁用——但
+  /// [bottomTrailing]（切换器）照常可用，否则用户出不去这一屏。
+  final bool locked;
+
+  /// 锁定时显示的说明。
+  final String lockedHint;
+
   const MessageInput({
     super.key,
     required this.onSend,
     this.cacheKey,
     this.prefill,
+    this.bottomTrailing,
+    this.locked = false,
+    this.lockedHint = '',
   });
 
   @override
@@ -238,7 +257,7 @@ class _MessageInputState extends State<MessageInput> {
   /// team+session 的草稿（否则切走再切回来会看到已发出的内容又回来了）；失败
   /// （例如附件上传失败）原样保留，用户改一改就能重发。
   Future<void> _handleSend() async {
-    if (_sending) return;
+    if (_sending || widget.locked) return;
     final String text = _controller.text.trim();
     if (text.isEmpty && _filePaths.isEmpty) return;
     setState(() {
@@ -515,23 +534,30 @@ class _MessageInputState extends State<MessageInput> {
                   ),
                 Padding(
                   padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
-                  child: Focus(
-                    focusNode: _keyFocus,
-                    onKeyEvent: _handleKeyEvent,
-                    // 展开态靠一个固定高度的盒子：maxLines 置空让文本域自己滚动，
-                    // 而且盒子高度变化不会换掉 TextField 这个 widget——展开/收起时
-                    // 焦点与光标位置都不丢。
-                    child: SizedBox(
-                      height: _expanded ? _expandedFieldHeight(context) : null,
-                      child: _buildField(cs),
-                    ),
-                  ),
+                  child: widget.locked
+                      ? _buildLockedHint(cs)
+                      : Focus(
+                          focusNode: _keyFocus,
+                          onKeyEvent: _handleKeyEvent,
+                          // 展开态靠一个固定高度的盒子：maxLines 置空让文本域自己滚动，
+                          // 而且盒子高度变化不会换掉 TextField 这个 widget——展开/收起时
+                          // 焦点与光标位置都不丢。
+                          child: SizedBox(
+                            height: _expanded
+                                ? _expandedFieldHeight(context)
+                                : null,
+                            child: _buildField(cs),
+                          ),
+                        ),
                 ),
                 Row(
                   children: <Widget>[
                     // 发送键左边刻意留空：那里只有发送键，别的入口都收进「+」
-                    _buildAddMenu(cs),
+                    if (!widget.locked) _buildAddMenu(cs),
                     const Spacer(),
+                    // 视角切换器（中栏放"主会话 ⇄ 临时员工"）就在发送键左侧
+                    if (widget.bottomTrailing case final Widget trailing)
+                      trailing,
                     _buildSendButton(cs),
                     const SizedBox(width: 4),
                   ],
@@ -541,6 +567,26 @@ class _MessageInputState extends State<MessageInput> {
           ),
         ],
       ),
+    );
+  }
+
+  /// 只读锁定时的说明行：告诉用户"为什么打不了字"，以及怎么出去。
+  Widget _buildLockedHint(ColorScheme cs) {
+    return Row(
+      children: <Widget>[
+        Icon(Icons.visibility_outlined, size: 14, color: cs.onSurfaceVariant),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(
+            widget.lockedHint.isEmpty ? '当前是只读视角' : widget.lockedHint,
+            style: TextStyle(
+              fontSize: 12.5,
+              color: cs.onSurfaceVariant,
+              height: 1.3,
+            ),
+          ),
+        ),
+      ],
     );
   }
 

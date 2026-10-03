@@ -93,7 +93,11 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 
 脚本替你做的、**必须由脚本做**的事（漏一个用户就会踩坑）：
 
-1. `flutter build windows --release`；
+1. `flutter build windows --release --no-tree-shake-icons`：**不做图标字体子集化**。子集化会静默丢掉
+   一批明明在用的图标（实测 2026-10-04：`badge_outlined` / `chat_bubble` / `folder` / `visibility(_off)` /
+   `keyboard_double_arrow_left/right` 都不在子集里），后果是**按钮一片空白**——而且只有发布版会犯（Debug 不子集化）；
+   脚本随后还会**逐个人 `lib/` 里用到的 `Icons.*` 对一遍字体 cmap**，缺一个直接打包失败并点名，
+   不把空白按钮发给用户（代价：字体 18 KB → 1.6 MB，安装包约 +0.5 MB）；
 2. 用**同一个 SDK** 编译 `tree_core.exe` 并放进 Release 目录——发行版要求核心与 `Tree.exe` 同目录；
 3. 拷 `build/native_assets/windows/*.dll`（pdfrx 的 `pdfium.dll`）到 exe 旁边（native assets 不会自动进发行目录）；
 4. 拷 `examples/plugins/` → 发行目录 `plugins/`（核心按**自身可执行文件同级**的 `plugins/<name>.py` 解析内置插件），

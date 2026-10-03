@@ -10,6 +10,7 @@ import '../services/code_highlight_lines.dart';
 import '../services/detail_selection.dart';
 import '../services/subagent_transcript.dart';
 import '../services/tool_change_view.dart';
+import '../services/conversation_view.dart';
 import 'subagent_process_list.dart';
 
 /// 一次工具调用的**一行**：图标 + 中文标签 + 关键参数（等宽），行尾给增量 / 转圈 / 箭头。

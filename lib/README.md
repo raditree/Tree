@@ -146,6 +146,15 @@
     `terminal_ready.cwd` 是空串——远端工作目录由 `SshWorkspaceIO` 自己解决，界面显示「工作区」。
     判据是**有效 SSH**（成员跟随团队 TOP 的 SSH，见不变量 15）；没接线时回可读错误，**绝不**
     悄悄在本机给远端 agent 起一个终端。关面板 / 换 agent / 断连都会把 shell 收掉。
+    **回滚缓冲**：主屏整屏滚动时被顶出去的行进历史（上限 2000 行；备用屏与滚动区域内部的滚动不进——
+    xterm 口径），鼠标滚轮往上翻、**滚到底自动恢复跟随**，翻上去时工具条上出现「已回滚 N 行」胶囊（点它回到最新）；
+    新输出不会把正在回看的视野拽走（视图钉在同一段内容上，靠 `historyPushed` 计数）。`ED3`（`CSI 3 J`）与 RIS 清空历史。
+    **`#TSend`：在终端里直接给当前会话发消息**（[ui/services/terminal_send_command.dart](ui/services/terminal_send_command.dart)）——
+    `#TSend "一段话"`、`#TSend @<文件路径>`，也能混写（`#TSend "看这个" @C:\x\a.md`；路径带空格写 `@"C:\a b.md"`）；
+    它走 composer 的**同一个发送口**（附件上传 / 上屏 / WS 帧完全一致），因此终端里发的和手打的等价。
+    实现是**按键层拦截**：以 `#` 开头且仍是 `#TSend` 前缀的那一行只在本地缓存、一个字节都不给 shell，一旦不是它
+    （如 `#Tx`）就把缓存**原样补发**——对 shell 与用户而言等于从来没拦过（退格吃本地缓存、方向键 / Ctrl+C / Tab 前
+    先补发缓存）；`#TSend` 单独一行会提示"后面要跟内容"，而不是静默吞掉用户那一行。
     终端的边界（VT 解析器没实现的部分、远端分支**没有真机 sshd 验证过**）见
     [docs/known-issues.md](../docs/known-issues.md) #12。
 
@@ -239,17 +248,24 @@
     ⑤ 偏好读不到（平台不支持 / 测试环境）时**静默不弹**，绝不因为引导把启动搞出未捕获异常。
 
 18. **临时员工的产出不混杂进主消息流，去它自己的视角看**（[ui/services/subagent_transcript.dart](ui/services/subagent_transcript.dart)、
-    [ui/widgets/subagent_view_page.dart](ui/widgets/subagent_view_page.dart)、[ui/widgets/subagent_process_list.dart](ui/widgets/subagent_process_list.dart)，
+    [ui/widgets/subagent_view_switcher.dart](ui/widgets/subagent_view_switcher.dart)、[ui/widgets/subagent_process_list.dart](ui/widgets/subagent_process_list.dart)，
     **用户断言 2026-10-04**）：
     ① **中栏只渲染主 agent 自己的消息**（`visibleStreamMessages` 滤掉带 `subagent_id` 的消息）：临时员工的文本 / 思考 /
     工具调用不再与主 agent 的混在一起；
     ② 两处能看它的过程，且**共用同一份渲染**（[SubagentProcessList]）：**调用它的那次 `subagent` 工具调用的详情页**
-    （就地看，里面的工具行还能再点进去看那条工具的详情），以及**它自己的工作进度页**（独立一页：头部 + 完整过程 +
-    它自己的上下文用量 + 实时 working/idle，实时状态由该页自己的 WS 按 `subagent_id` 过滤 `agent_status` 得到）；
-    ③ **语义对齐——它与「发出这次调用的那个 agent」同级**（用户更正：**不是**与 teammates 同级）：入口挂在那个 agent 的
+    （就地看，里面的工具行还能再点进去看那条工具的详情），以及**中栏就地切换的「临时员工视角」**；
+    ③ **进它的视角不新开窗口**（**用户断言 2026-10-04**）：借父 agent 那个窗口，只把**对话数据**与**上下文长度条**
+    换成它的（[ui/services/conversation_view.dart](ui/services/conversation_view.dart) 的 `viewMessages` / `viewContext` 是
+    这条口径的唯一落点，面板只做接线）：消息区换成它的完整过程（顶部一行身份条：由「X」召来 · 第 N 层 · sub_… + 它自己的
+    上下文读数），标题栏写「临时员工「名字」」，输入框**锁成只读**（那条过程不是你与这个 agent 的对话）；
+    切 session / 换 agent / 整表重拉一律回到主会话，过程分栏里不存在的 id 也回主会话（`_effectiveViewId`）；
+    ④ **切换的 UI 在输入框右下、发送键左侧**（[ui/widgets/subagent_view_switcher.dart](ui/widgets/subagent_view_switcher.dart)，
+    与会话切换同族的胶囊 + 下拉，列出「主会话」与每一个临时员工）；**进入视角后锁定会话切换**
+    （[SessionPicker](ui/widgets/session_picker.dart) 的 `locked`：图标变锁、点它只说原因、右键重命名/删除一并关掉）；
+    ⑤ **语义对齐——它与「发出这次调用的那个 agent」同级**（用户更正：**不是**与 teammates 同级）：入口挂在那个 agent 的
     会话头上（「「凌川」召来的临时员工（N 名）」→ 选一个进它的视角），措辞一律「由「X」召来 · 第 N 层」，**不复用团队的
     「层级」一词**；父级名字从过程消息的 `subagent_parent_id` 认（认不出就写「（未知调用方）」——**不编名字**）；
-    ④ **它的上下文长度不计入主 agent 的读数**：中栏的「上下文」实时帧**不认**带 `subagent_id` 的（`_recordUsage` 直接返回），
+    ⑥ **它的上下文长度不计入主 agent 的读数**：中栏的「上下文」实时帧**不认**带 `subagent_id` 的（`_recordUsage` 直接返回），
     历史恢复用量也跳过带标记的消息；这个数字只在它自己的视图里显示（「它的上下文：1200 / 64000 tokens（不并进主 agent
     的统计）」）——临时员工是**另一个 LLM 上下文**，混进来会把主 agent 的读数带偏。
 
@@ -277,6 +293,9 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 关掉一个窗格后另一个继续可编辑）、失焦保存的开与关、返回时静默写回或问一次、**源码模式的行号槽**（左侧出现 1..N、加行删行跟着变、软换行时续行不编号且行号与正文逐行对齐、滚动后跟着 offset 平移且仍然对齐、只读视图同样有、图片 / Markdown 预览没有））、`test/split_panes_test.dart`（二分几何、拖动比例、夹取、太窄降级、
 文件面板的分屏接线源钉：同文件双开复用同一个缓冲、不再锁只读）、`test/vt_screen_test.dart`（VT 解析器：换行 / `\r` 覆盖、SGR、CUP/ED/EL、备用屏进出、
 跨块 UTF-8、宽字符两格、未知序列安全跳过、resize、DSR/DA 应答、随机含 ESC 字节流不抛）、
+`test/vt_scrollback_test.dart`（回滚缓冲：主屏整屏滚动才进历史、备用屏与滚动区域内部不进、上限丢最老的、
+`historyPushed` 只增、`ED3` 清历史而 `ED2` 不动、resize 后历史行跟着换宽度、RIS 复位）、
+`test/terminal_send_command_test.dart`（`#TSend`：引号 / 裸文本 / `@路径` / 混写 / 带空格路径的解析，以及按键拦截的吞与补发：整行扣住、发现不是指令时原样补发、退格只吃本地缓存、其它按键前先补发、`#TSend` 单独一行 = 空指令）、
 `test/terminal_panel_test.dart`（终端面板：打开就发 `terminal_open` 与尺寸并抢焦点、ready 显示 shell/cwd、
 输出进缓冲、键盘译码（回车 / 方向键 / Ctrl+C）、Ctrl+J 交给外层、error 与 exit 的显示、别的会话 id 的帧被丢、
 dispose 发 `terminal_close`、布局变化发 `terminal_resize`）、

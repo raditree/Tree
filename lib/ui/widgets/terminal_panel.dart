@@ -1,11 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:tree_protocol/tree_protocol.dart';
 
 import '../../io/websocket_service.dart';
+import '../services/terminal_send_command.dart';
 import '../services/vt_screen.dart';
 
 /// 集成终端（Ctrl+J）：真伪终端会话的渲染 + 键盘转发。
@@ -23,10 +25,18 @@ class TerminalPanel extends StatefulWidget {
     required this.webSocket,
     required this.onToggle,
     this.onClose,
+    this.onSend,
   });
 
   /// 在哪个 agent 的工作区里起 shell（核心按它解析工作区根）
   final String agentId;
+
+  /// `#TSend` 的落点：把一段文本（与可选的本机文件路径附件）发给**当前会话**。
+  ///
+  /// 与 composer 的发送口是同一个（[MessagePanelState._handleSend]）——终端里发出去的
+  /// 消息因此和手打一条完全等价（上传附件、上屏、WS 帧都一样）。为 null 时
+  /// `#TSend` 不可用（如实提示，不静默吞掉用户那一行）。
+  final Future<bool> Function(String text, List<String> filePaths)? onSend;
 
   /// 与核心通信的 WS（终端帧走它自己的广播流，不混进消息分发）
   final WebSocketService webSocket;
@@ -54,6 +64,9 @@ class TerminalPanelState extends State<TerminalPanel> {
 
   /// 屏幕缓冲（cols/rows 随面板尺寸变）
   VtScreen _screen = VtScreen(columns: 80, rows: 24);
+
+  /// `#TSend` 的按键拦截（以 `#` 开头、还可能是 `#TSend` 的那一行不发 shell）
+  final TerminalSendInterceptor _send = TerminalSendInterceptor();
   bool _opened = false;
   int _columns = 80;
   int _rows = 24;
@@ -66,6 +79,14 @@ class TerminalPanelState extends State<TerminalPanel> {
   String _shell = '';
   String? _error;
   int? _exitCode;
+
+  /// 回滚偏移：0 = 跟最新（画 [VtScreen.lines]），>0 = 往上翻了多少行
+  /// （画"历史尾部 + 当前屏"的那一段）。
+  int _scrollOffset = 0;
+
+  /// 已经同步过的 [VtScreen.historyPushed]：正在回滚时把视图**钉在同一段内容**上
+  /// （新输出继续往下长，视野不动）——否则每来一帧用户就被拽回底部。
+  int _historyPushedSeen = 0;
 
   @override
   void initState() {
@@ -108,6 +129,7 @@ class TerminalPanelState extends State<TerminalPanel> {
         if (bytes.isEmpty) break;
         _screen.write(base64Decode(bytes));
         _flushResponses();
+        _followHistory();
         setState(() {}); // 一帧一次重绘：同一帧里的多次 setState 会被合并
         break;
       case TerminalOutboundType.exit:
@@ -125,6 +147,18 @@ class TerminalPanelState extends State<TerminalPanel> {
       default:
         break;
     }
+  }
+
+  /// 新输出滚掉了若干行时，把"正在回滚"的视图往前顶同样多的行。
+  ///
+  /// 语义：用户翻上去看历史时，新输出**不该**把他拽回底部（与真终端一致）——
+  /// 视野固定在**同一段内容**上；他一直滚到底（`_scrollOffset == 0`）时才继续跟随。
+  void _followHistory() {
+    final int pushed = _screen.historyPushed;
+    final int grew = pushed - _historyPushedSeen;
+    _historyPushedSeen = pushed;
+    if (grew <= 0 || _scrollOffset <= 0) return;
+    _scrollOffset = (_scrollOffset + grew).clamp(0, _screen.historyLength);
   }
 
   /// VT 解析器要回写给 PTY 的应答（DSR / DA 之类）
@@ -173,6 +207,10 @@ class TerminalPanelState extends State<TerminalPanel> {
       _cwd = '';
       _shell = '';
       _opened = false;
+      // 新会话 = 新屏幕：回滚偏移与"历史水位"一起归零，否则会指到不存在的行
+      _scrollOffset = 0;
+      _historyPushedSeen = 0;
+      _send.clear(); // 旧会话里扣住的那半截 `#T` 不带进新会话
     });
     _open();
   }
@@ -224,10 +262,83 @@ class TerminalPanelState extends State<TerminalPanel> {
       return KeyEventResult.handled;
     }
 
+    // ── `#TSend`：这几行**只有本地知道**（见 [TerminalSendInterceptor]）────────
+    // 1) 退格：缓存里的字符从没进过 shell，先吃本地缓存
+    if (!ctrl &&
+        event.logicalKey == LogicalKeyboardKey.backspace &&
+        _send.backspace()) {
+      return KeyEventResult.handled;
+    }
+    // 2) Enter：整行是 `#TSend …` 就发给会话（**不给 shell**）；否则把缓存补发 + 回车
+    if (event.logicalKey == LogicalKeyboardKey.enter ||
+        event.logicalKey == LogicalKeyboardKey.numpadEnter) {
+      final TerminalSendCommand? command = _send.commit();
+      if (command != null) {
+        unawaited(_dispatchSend(command));
+        return KeyEventResult.handled;
+      }
+      final List<int> pending = _send.release();
+      if (pending.isNotEmpty) _sendInput(pending);
+      _sendInput(<int>[0x0d]);
+      return KeyEventResult.handled;
+    }
+    // 3) 可打印字符：还可能是 `#TSend` 前缀就先扣住（返回 null = 吞掉）
+    final String? character = event.character;
+    final bool printable = !ctrl &&
+        character != null &&
+        character.isNotEmpty &&
+        character.codeUnitAt(0) >= 0x20 &&
+        character.codeUnitAt(0) != 0x7f;
+    if (printable) {
+      final List<int>? forward = _send.accept(character);
+      if (forward == null) return KeyEventResult.handled;
+      if (forward.isNotEmpty) _sendInput(forward);
+      return KeyEventResult.handled;
+    }
+
+    // 4) 其它按键（方向键 / Tab / Esc / Ctrl+C…）：先把缓存交还 shell，再照常转发
+    //    （半截的 `#T` 因此不会消失，用户看到的与"从来没拦过"一致）
+    final List<int> released = _send.release();
     final List<int>? bytes = _translateKey(event, ctrl: ctrl);
-    if (bytes == null) return KeyEventResult.ignored;
-    _sendInput(bytes);
+    if (released.isEmpty && bytes == null) return KeyEventResult.ignored;
+    if (released.isNotEmpty) _sendInput(released);
+    if (bytes != null) _sendInput(bytes);
     return KeyEventResult.handled;
+  }
+
+  /// `#TSend` 落到会话上：与 composer 的发送口同一个（上传附件、上屏、WS 帧）。
+  ///
+  /// 反馈只走 SnackBar：那一行**没进过 shell**，屏幕上的提示位置不属于它；
+  /// 真要写进终端屏幕就得跟 shell 抢光标，得不偿失。
+  Future<void> _dispatchSend(TerminalSendCommand command) async {
+    final Future<bool> Function(String text, List<String> filePaths)? send =
+        widget.onSend;
+    if (send == null) {
+      _notify('这条终端没有接到会话发送口，#TSend 不可用');
+      return;
+    }
+    if (command.isEmpty) {
+      _notify('#TSend 后面要跟一段话（可加引号）或 @文件路径');
+      return;
+    }
+    final bool ok = await send(command.text, command.filePaths);
+    if (!mounted) return;
+    if (!ok) {
+      _notify('终端发送失败：消息没有发出去（附件路径或核心状态有问题）');
+      return;
+    }
+    final String what = command.text.trim().isEmpty
+        ? '${command.filePaths.length} 个文件'
+        : (command.text.length > 40
+              ? '${command.text.substring(0, 40)}…'
+              : command.text);
+    _notify('已从终端发给会话：$what');
+  }
+
+  void _notify(String message) {
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      SnackBar(content: Text(message), duration: const Duration(seconds: 3)),
+    );
   }
 
   /// 单个按键 → 终端字节（含 xterm 的转义序列）
@@ -314,12 +425,17 @@ class TerminalPanelState extends State<TerminalPanel> {
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
                 onTap: _focus.requestFocus,
-                child: LayoutBuilder(
-                  builder: (BuildContext context, BoxConstraints constraints) {
-                    _measureText(cs);
-                    _applySize(constraints);
-                    return _buildScreen(cs, constraints);
-                  },
+                // 滚轮翻回滚缓冲（终端里没有"滚动条"，鼠标滚轮是唯一入口）；
+                // 键盘一律转发给 PTY（PageUp/方向键在 vim/less 里有用），不劫持。
+                child: Listener(
+                  onPointerSignal: _handlePointerSignal,
+                  child: LayoutBuilder(
+                    builder: (BuildContext context, BoxConstraints constraints) {
+                      _measureText(cs);
+                      _applySize(constraints);
+                      return _buildScreen(cs, constraints);
+                    },
+                  ),
                 ),
               ),
             ),
@@ -327,6 +443,40 @@ class TerminalPanelState extends State<TerminalPanel> {
         ],
       ),
     );
+  }
+
+  /// 鼠标滚轮 → 回滚偏移（向下滚 = 看更新的内容）。
+  ///
+  /// 步长 3 行：与大多数终端一致；到顶 / 到底就夹住，并且**滚到底自动恢复跟随**。
+  void _handlePointerSignal(PointerSignalEvent event) {
+    if (event is! PointerScrollEvent) return;
+    if (_screen.historyLength == 0 && _scrollOffset == 0) return;
+    final int steps = event.scrollDelta.dy > 0 ? -3 : 3;
+    _scrollTo(_scrollOffset + steps);
+  }
+
+  void _scrollTo(int offset) {
+    final int next = offset.clamp(0, _screen.historyLength);
+    if (next == _scrollOffset) return;
+    setState(() => _scrollOffset = next);
+  }
+
+  /// 当前该画的 rows 行：`_scrollOffset == 0` 时就是屏幕本身，
+  /// 否则是"历史尾部 + 当前屏顶部"的一段窗口。
+  List<List<VtCell>> _visibleRows() {
+    final List<List<VtCell>> live = _screen.lines;
+    final List<List<VtCell>> history = _screen.history;
+    if (_scrollOffset <= 0 || history.isEmpty) return live;
+    final int rows = live.length;
+    final int total = history.length + rows;
+    final int start = (total - rows - _scrollOffset).clamp(0, history.length);
+    return <List<VtCell>>[
+      for (int i = 0; i < rows; i++)
+        if (start + i < history.length)
+          history[start + i]
+        else
+          live[start + i - history.length],
+    ];
   }
 
   /// 工具条：shell / cwd + 重开 / 清屏 / 关闭
@@ -350,6 +500,7 @@ class TerminalPanelState extends State<TerminalPanel> {
               ),
             ),
           ),
+          if (_scrollOffset > 0) _buildScrollChip(cs),
           if (_exitCode != null && _error == null)
             Padding(
               padding: const EdgeInsets.only(right: 6),
@@ -389,6 +540,30 @@ class TerminalPanelState extends State<TerminalPanel> {
     );
   }
 
+  /// 「已回滚 N 行」的小胶囊：点一下回到最新（滚轮翻上去之后唯一的可见状态）。
+  Widget _buildScrollChip(ColorScheme cs) {
+    return Tooltip(
+      message: '已往上翻 $_scrollOffset 行（鼠标滚轮继续翻）· 点这里回到最新',
+      child: InkWell(
+        onTap: () => _scrollTo(0),
+        borderRadius: BorderRadius.circular(10),
+        child: Container(
+          margin: const EdgeInsets.only(right: 6),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+          decoration: BoxDecoration(
+            color: cs.primary.withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: cs.primary.withValues(alpha: 0.35)),
+          ),
+          child: Text(
+            '已回滚 $_scrollOffset 行',
+            style: TextStyle(fontSize: 11, color: cs.primary),
+          ),
+        ),
+      ),
+    );
+  }
+
   /// 实测等宽字体的单元格尺寸（列数=宽/字宽，行数=高/行高）
   void _measureText(ColorScheme cs) {
     final TextPainter painter = TextPainter(
@@ -411,7 +586,11 @@ class TerminalPanelState extends State<TerminalPanel> {
       child: CustomPaint(
         size: Size(constraints.maxWidth, constraints.maxHeight),
         painter: _TerminalPainter(
-          screen: _screen,
+          rows: _visibleRows(),
+          // 回滚时不画光标：它属于"当前屏"，画在历史行上会误导
+          cursorColumn: _screen.cursorColumn,
+          cursorRow: _screen.cursorRow,
+          showCursor: _screen.cursorVisible && _scrollOffset == 0,
           cellWidth: _cellWidth,
           cellHeight: _cellHeight,
           baseStyle: _baseStyle,
@@ -430,7 +609,10 @@ class TerminalPanelState extends State<TerminalPanel> {
 /// 上千次文本布局，滚动时会卡；合成之后一行通常只有几个 run。
 class _TerminalPainter extends CustomPainter {
   _TerminalPainter({
-    required this.screen,
+    required this.rows,
+    required this.cursorColumn,
+    required this.cursorRow,
+    required this.showCursor,
     required this.cellWidth,
     required this.cellHeight,
     required this.baseStyle,
@@ -439,7 +621,13 @@ class _TerminalPainter extends CustomPainter {
     required this.cursorColor,
   });
 
-  final VtScreen screen;
+  /// 要画的行：跟随时是屏幕本身，回滚时是"历史尾部 + 当前屏"的一段窗口
+  /// （由 [TerminalPanelState._visibleRows] 算好——画笔只管画）。
+  final List<List<VtCell>> rows;
+
+  final int cursorColumn;
+  final int cursorRow;
+  final bool showCursor;
   final double cellWidth;
   final double cellHeight;
   final TextStyle baseStyle;
@@ -470,7 +658,7 @@ class _TerminalPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     canvas.drawRect(Offset.zero & size, Paint()..color = defaultBackground);
-    final List<List<VtCell>> lines = screen.lines;
+    final List<List<VtCell>> lines = rows;
     final Paint fill = Paint();
     for (int row = 0; row < lines.length; row++) {
       final double top = row * cellHeight;
@@ -521,9 +709,9 @@ class _TerminalPainter extends CustomPainter {
         col = end;
       }
     }
-    if (screen.cursorVisible) {
-      final double left = screen.cursorColumn * cellWidth;
-      final double top = screen.cursorRow * cellHeight;
+    if (showCursor) {
+      final double left = cursorColumn * cellWidth;
+      final double top = cursorRow * cellHeight;
       if (left < size.width && top < size.height) {
         canvas.drawRect(
           Rect.fromLTWH(left, top, cellWidth, cellHeight),

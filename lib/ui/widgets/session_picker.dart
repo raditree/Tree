@@ -35,6 +35,15 @@ class SessionPicker extends StatefulWidget {
   /// 删除会话
   final ValueChanged<ChatSession> onDelete;
 
+  /// **锁定**：正在看某个临时员工的过程时不许切会话（用户 2026-10-04 要求）。
+  ///
+  /// 锁定不是"点了没反应"——点它会说明原因（临时员工的"过程"属于**当前会话**，
+  /// 切走会话这一屏就没有意义了；要换会话先切回主会话）。
+  final bool locked;
+
+  /// 锁定时的说明（默认给一句通用解释）。
+  final String lockedHint;
+
   const SessionPicker({
     super.key,
     required this.sessions,
@@ -43,6 +52,8 @@ class SessionPicker extends StatefulWidget {
     required this.onCreate,
     required this.onRename,
     required this.onDelete,
+    this.locked = false,
+    this.lockedHint = '',
   });
 
   @override
@@ -75,8 +86,26 @@ class _SessionPickerState extends State<SessionPicker> {
     super.dispose();
   }
 
+  /// 锁定态下点击：只说原因，不弹列表
+  void _showLockedHint() {
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      SnackBar(
+        content: Text(
+          widget.lockedHint.isEmpty
+              ? '正在看临时员工的过程：先切回主会话再换会话'
+              : widget.lockedHint,
+        ),
+        duration: const Duration(seconds: 3),
+      ),
+    );
+  }
+
   /// 切换下拉开关
   void _toggleDropdown() {
+    if (widget.locked) {
+      _showLockedHint();
+      return;
+    }
     if (_dropdownOpen) {
       _closeDropdown();
     } else {
@@ -347,10 +376,13 @@ class _SessionPickerState extends State<SessionPicker> {
 
     final Widget anchor = GestureDetector(
       onTap: _toggleDropdown,
-      onSecondaryTapDown: (details) =>
-          _handleSecondary(context, details.globalPosition),
-      onLongPressStart: (details) =>
-          _handleSecondary(context, details.globalPosition),
+      // 锁定态：连右键重命名/删除也关掉（那些操作都属于"当前会话"的切换/管理）
+      onSecondaryTapDown: widget.locked
+          ? null
+          : (details) => _handleSecondary(context, details.globalPosition),
+      onLongPressStart: widget.locked
+          ? null
+          : (details) => _handleSecondary(context, details.globalPosition),
       child: Container(
         height: 28,
         padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -362,7 +394,11 @@ class _SessionPickerState extends State<SessionPicker> {
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
-            Icon(Icons.forum_outlined, size: 14, color: cs.primary),
+            Icon(
+              widget.locked ? Icons.lock_outline : Icons.forum_outlined,
+              size: 14,
+              color: widget.locked ? cs.onSurfaceVariant : cs.primary,
+            ),
             const SizedBox(width: 4),
             ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 120),
@@ -374,7 +410,11 @@ class _SessionPickerState extends State<SessionPicker> {
               ),
             ),
             const SizedBox(width: 2),
-            Icon(Icons.arrow_drop_down, size: 16, color: cs.onSurfaceVariant),
+            Icon(
+              widget.locked ? Icons.lock : Icons.arrow_drop_down,
+              size: 16,
+              color: cs.onSurfaceVariant,
+            ),
           ],
         ),
       ),

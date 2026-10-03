@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:tree_protocol/tree_protocol.dart';
 
@@ -73,10 +74,22 @@ Future<void> _package(List<String> args) async {
       );
     }
     stdout.writeln('== 构建 Windows 发行版（$flutter）==');
+    // `--no-tree-shake-icons`：**不要**让构建去子集化图标字体。
+    //
+    // 实测（2026-10-04，用户报"这个按钮为什么是黑的"）：子集化会**静默丢掉**
+    // 明明在用的图标——同一批代码里 `Icons.auto_awesome` / `Icons.hub`（老代码）
+    // 在子集里，而 `Icons.badge_outlined`（临时员工入口）、`Icons.difference`、
+    // `Icons.keyboard_double_arrow_left/right`（文件树开关）、`Icons.chat_bubble`、
+    // `Icons.folder`（移动端 tab 的 selectedIcon）、`Icons.visibility(_off)`
+    // （三元表达式里选的图标）**全都不在**。字形缺失时 Icon 画不出任何东西：
+    // 按钮还在、tooltip 还在，但看上去就是**一片空白/黑**——这是最难查的一类
+    // "发布版才有、开发机没有"的毛病（Debug 不做子集化）。
+    // 代价只是字体从 18 KB 变 1.6 MB（安装包 +~0.5 MB），换来"图标永远画得出来"。
     final int code = await _runLive(flutter, <String>[
       'build',
       'windows',
       '--release',
+      '--no-tree-shake-icons',
     ], root.path);
     if (code != 0) {
       await _fail('flutter build windows 失败（exit=$code）', code);
@@ -104,6 +117,10 @@ Future<void> _package(List<String> args) async {
   stdout.writeln(
     '   核心：$coreExe（${(coreSize / 1024 / 1024).toStringAsFixed(1)} MB）',
   );
+
+  // ②a 图标字体门禁：`lib/` 里用到的每个 Icons.* 都必须真在字体里
+  // （见 §① 的说明：子集化/字体缺失 = 按钮一片空白，且只有发布版才看得见）
+  await _checkIconFont(root, flutterRoot, releaseDir);
 
   // ②b 原生资源（Dart native assets）拷进发行目录
   //
@@ -469,6 +486,167 @@ String _binaryName(Directory root) {
   }
   final Map<String, String> pubspec = _readPubspec(root);
   return pubspec['name'] ?? 'tree';
+}
+
+/// 图标字体门禁（发布前必须过）：`lib/` 里用到的每个 `Icons.*` 都要真在字体里。
+///
+/// 为什么这是**打包脚本**的活而不是测试的活：字体只有在 `flutter build windows
+/// --release` 之后才存在，而"图标画不出来"这件事**只有发布版会犯**（Debug 不子集化
+/// 字体）。真机现场（2026-10-04）：临时员工入口是个**空白按钮**——tooltip 有、点击有
+/// 反应，就是画不出字形，因为发布版的字体子集里没有 `badge_outlined`。
+///
+/// 两道防线，这里是第二道（第一道是构建参数 `--no-tree-shake-icons`）：
+/// 万一有人把第一道去掉，这里会立刻点名"哪几个图标在用、但字体里没有"，
+/// 而不是把一堆空白按钮发给用户。
+Future<void> _checkIconFont(
+  Directory root,
+  String flutterRoot,
+  Directory releaseDir,
+) async {
+  final File font = File(
+    _join(
+      releaseDir.path,
+      'data/flutter_assets/fonts/MaterialIcons-Regular.otf',
+    ),
+  );
+  if (!font.existsSync()) {
+    await _fail('图标字体不存在：${font.path}（flutter_assets 不完整？）', 4);
+  }
+  final Set<int> available = _fontCodepoints(font.readAsBytesSync());
+  final Map<String, List<String>> used = _iconsUsedInLib(root);
+  final Map<String, int> codepoints = _iconCodepoints(flutterRoot);
+  final List<String> missing = <String>[];
+  final List<String> unknown = <String>[];
+  used.forEach((String name, List<String> where) {
+    final int? code = codepoints[name];
+    if (code == null) {
+      unknown.add(name);
+      return;
+    }
+    if (!available.contains(code)) {
+      missing.add('$name（0x${code.toRadixString(16)}，用在 ${where.join('、')}）');
+    }
+  });
+  if (missing.isNotEmpty) {
+    await _fail(
+      '图标字体缺 ${missing.length} 个"代码里在用的"图标 —— '
+      '这些按钮会渲染成**一片空白**（字形没有，画不出东西）：\n'
+      '  - ${missing.join('\n  - ')}\n'
+      '修法：确认构建带了 --no-tree-shake-icons（见本文件 §①），或删掉 '
+      'build/flutter_assets 重新构建。',
+      4,
+    );
+  }
+  stdout.writeln(
+    '   图标字体：${used.length} 个 Icons.* 全覆盖'
+    '（字体覆盖 ${available.length} 个码点${unknown.isEmpty ? '' : '，'
+        '${unknown.length} 个别名没解析：${unknown.join('、')}'}）',
+  );
+}
+
+/// `lib/**/*.dart` 里出现过的 `Icons.<名字>`（值 = 出现在哪些文件里，报错时点名）。
+///
+/// `Icons.adaptive` 是命名空间（`Icons.adaptive.more` 之类），不是图标本身，跳过。
+Map<String, List<String>> _iconsUsedInLib(Directory root) {
+  final RegExp pattern = RegExp(r'Icons\.(\w+)');
+  final Map<String, List<String>> out = <String, List<String>>{};
+  final Directory lib = Directory(_join(root.path, 'lib'));
+  for (final FileSystemEntity entity in lib.listSync(recursive: true)) {
+    if (entity is! File || !entity.path.endsWith('.dart')) continue;
+    final String source = entity.readAsStringSync();
+    for (final RegExpMatch match in pattern.allMatches(source)) {
+      final String name = match.group(1)!;
+      if (name == 'adaptive') continue;
+      final String where = entity.path
+          .substring(root.path.length + 1)
+          .replaceAll('\\', '/');
+      (out[name] ??= <String>[]).add(where);
+    }
+  }
+  return out;
+}
+
+/// Flutter SDK 的 `icons.dart` → 图标名到码点。别名（`static const IconData a = b;`）
+/// 也解开，免得把"用了别名"误报成"字体里没有"。
+Map<String, int> _iconCodepoints(String flutterRoot) {
+  final File file = File(
+    _join(flutterRoot, 'packages/flutter/lib/src/material/icons.dart'),
+  );
+  final Map<String, int> out = <String, int>{};
+  if (!file.existsSync()) return out;
+  final String source = file.readAsStringSync();
+  final Map<String, String> alias = <String, String>{};
+  // 定义可能跨行（`IconData(\n  0xe5c4,`），所以用 dotAll + \s*
+  final RegExp direct = RegExp(
+    r'static const IconData (\w+)\s*=\s*IconData\(\s*0x([0-9a-fA-F]+)',
+    dotAll: true,
+  );
+  for (final RegExpMatch match in direct.allMatches(source)) {
+    out[match.group(1)!] = int.parse(match.group(2)!, radix: 16);
+  }
+  for (final RegExpMatch match in RegExp(
+    r'static const IconData (\w+)\s*=\s*(\w+)\s*;',
+  ).allMatches(source)) {
+    alias[match.group(1)!] = match.group(2)!;
+  }
+  alias.forEach((String name, String target) {
+    final int? code = out[target];
+    if (code != null) out[name] = code;
+  });
+  return out;
+}
+
+/// 解析 TrueType/OpenType 的 `cmap` 表，返回字体真正覆盖的码点。
+///
+/// 只认格式 4（BMP 分段映射）与格式 12（完整 Unicode 分组映射）：Material 图标
+/// 字体两种都有，覆盖到就够判断"这个字形在不在"。手写而不是引依赖——工具与核心
+/// 都保持零第三方依赖。
+Set<int> _fontCodepoints(Uint8List bytes) {
+  final ByteData data = ByteData.view(
+    bytes.buffer,
+    bytes.offsetInBytes,
+    bytes.length,
+  );
+  int u16(int offset) => data.getUint16(offset);
+  int u32(int offset) => data.getUint32(offset);
+  int? cmap;
+  final int tables = u16(4);
+  for (int i = 0; i < tables; i++) {
+    final int record = 12 + i * 16;
+    final String tag = String.fromCharCodes(bytes, record, record + 4);
+    if (tag == 'cmap') cmap = u32(record + 8);
+  }
+  final Set<int> out = <int>{};
+  if (cmap == null) return out;
+  final int subtables = u16(cmap + 2);
+  for (int i = 0; i < subtables; i++) {
+    final int record = cmap + 4 + i * 8;
+    final int sub = cmap + u32(record + 4);
+    final int format = u16(sub);
+    if (format == 4) {
+      final int segX2 = u16(sub + 6);
+      final int segments = segX2 ~/ 2;
+      for (int s = 0; s < segments; s++) {
+        final int start = u16(sub + 16 + segX2 + s * 2);
+        final int end = u16(sub + 14 + s * 2);
+        if (start == 0xFFFF) continue;
+        for (int code = start; code <= end && code != 0xFFFF; code++) {
+          out.add(code);
+        }
+      }
+    } else if (format == 12) {
+      final int groups = u32(sub + 12);
+      for (int g = 0; g < groups; g++) {
+        final int group = sub + 16 + g * 12;
+        final int start = u32(group);
+        final int end = u32(group + 4);
+        for (int code = start; code <= end; code++) {
+          out.add(code);
+        }
+      }
+    }
+  }
+  return out;
 }
 
 /// 1.0.0+1 → 1.0.0（构建号不进版本号，避免把 +1 写进文件名）。

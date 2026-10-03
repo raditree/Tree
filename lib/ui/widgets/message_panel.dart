@@ -16,6 +16,7 @@ import '../../io/question_update_service.dart';
 import '../../io/ssh_executor_service.dart';
 import '../../io/websocket_service.dart';
 import '../../io/workspace_refresh_service.dart';
+import '../services/conversation_view.dart';
 import '../services/detail_selection.dart';
 import '../services/message_replay_guard.dart';
 import '../services/onboarding_requests.dart';
@@ -29,7 +30,8 @@ import 'message_list.dart';
 import 'plugin_ui_slots.dart';
 import 'mode_switch.dart';
 import 'session_picker.dart';
-import 'subagent_view_page.dart';
+import 'subagent_process_list.dart';
+import 'subagent_view_switcher.dart';
 import 'terminal_panel.dart';
 import 'spec_panel.dart';
 import 'ssh_config_dialog.dart';
@@ -183,6 +185,15 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 当前会话 id（缺省为默认会话）
   String get _currentSessionId =>
       _currentSession?.sessionId ?? 'session_default';
+
+  /// **正在看谁的对话**（用户 2026-10-04：「进 subagent 视角不新开窗口，借父 agent 窗口，
+  /// 把对话数据与上下文长度条换成 subagent 的」）：空串 = 主会话；非空 = 那个临时员工
+  /// （`sub_…`）的视角。
+  ///
+  /// 它是**视图状态**，不是会话：底下换的只是"显示谁的消息 + 用谁的上下文读数"，会话本身
+  /// 没变——所以切会话 / 换 agent / 整表重拉时它必须清掉（见 [didUpdateWidget] 与
+  /// [_handleSelectSession]）。
+  String _viewSubagentId = '';
 
   @override
   void initState() {
@@ -362,6 +373,8 @@ class _MessagePanelState extends State<MessagePanel> {
         _sessions = <ChatSession>[];
         _currentSession = null;
         _usageByAgent.clear();
+        // 临时员工只活在会话里：换 agent 连"正在看谁"一起回到主会话
+        _viewSubagentId = '';
         // 切换顶部 agent 后解除锁定，由新 agent 的历史/首条消息重新决定
         _modeLocked = false;
         // 导航定位目标属于旧 agent，切换后作废，避免残留误用
@@ -379,6 +392,8 @@ class _MessagePanelState extends State<MessagePanel> {
       SubagentTranscript.instance.clear();
       setState(() {
         _messages.clear();
+        // 整表重拉 = 过程分栏重建：正在看的那个临时员工可能已经不在这一屏里了
+        _viewSubagentId = '';
       });
       _loadHistory();
     } else if (navTriggered) {
@@ -1319,6 +1334,11 @@ class _MessagePanelState extends State<MessagePanel> {
               child: ListenableBuilder(
                 listenable: PluginUiRegistry.instance,
                 builder: (BuildContext context, Widget? child) {
+                  // 临时员工视角：**同一个窗口**换成它自己的过程（不新开页面）
+                  final String viewId = _effectiveViewId;
+                  if (viewId.isNotEmpty) {
+                    return _buildSubagentView(viewId);
+                  }
                   final bool hasCards = PluginUiRegistry.instance.hasKind(
                     PluginUiSlotKind.card,
                   );
@@ -1353,6 +1373,9 @@ class _MessagePanelState extends State<MessagePanel> {
                 webSocket: _webSocket,
                 onToggle: _toggleTerminal,
                 onClose: _toggleTerminal,
+                // 终端里的 `#TSend` 与手打一条消息走**同一个发送口**（上传附件、
+                // 上屏、WS 帧全一样），不另立一条容易跑偏的旁路
+                onSend: _handleSend,
               ),
             ),
           ] else if (agent != null)
@@ -1364,6 +1387,16 @@ class _MessagePanelState extends State<MessagePanel> {
               // 新手引导最后一步把 demo 那句话预填进来（只填不发）
               prefill: ComposerPrefillRequest.instance,
               onSend: _handleSend,
+              // 视角切换器：发送键左侧（用户 2026-10-04 要求的落点）
+              bottomTrailing: SubagentViewSwitcher(
+                ownerAgentId: agent.id,
+                ownerName: agent.name,
+                currentSubagentId: _effectiveViewId,
+                onSelect: _switchView,
+              ),
+              // 临时员工视角是**只读**的：那条过程不是你与这个 agent 的对话
+              locked: _effectiveViewId.isNotEmpty,
+              lockedHint: _lockedComposerHint(),
             ),
             ],
           ),
@@ -1432,11 +1465,18 @@ class _MessagePanelState extends State<MessagePanel> {
   Widget _buildContextBar() {
     final cs = Theme.of(context).colorScheme;
     final Agent? agent = widget.selectedAgent;
-    final Map<String, dynamic>? usage = agent != null
-        ? _usageByAgent['${agent.id}::$_currentSessionId']
-        : null;
-    final int promptTokens = (usage?['prompt_tokens'] as num?)?.toInt() ?? 0;
-    final int maxTokens = (usage?['max_tokens'] as num?)?.toInt() ?? 0;
+    // **各看各的**：主会话看自己的 usage，临时员工视角看它自己的（用户硬要求：
+    // 临时员工的统计不并进主 agent 的读数）
+    final String viewId = _effectiveViewId;
+    final ContextReading? reading = viewContext(
+      subagentId: viewId,
+      mainUsage: agent != null
+          ? _usageByAgent['${agent.id}::$_currentSessionId']
+          : null,
+      transcript: _viewTranscript(),
+    );
+    final int promptTokens = reading?.promptTokens ?? 0;
+    final int maxTokens = reading?.maxTokens ?? 0;
 
     return Container(
       height: 32,
@@ -1452,7 +1492,7 @@ class _MessagePanelState extends State<MessagePanel> {
           Icon(Icons.data_usage, size: 14, color: cs.onSurfaceVariant),
           const SizedBox(width: 4),
           Text(
-            '上下文',
+            viewId.isEmpty ? '上下文' : '它的上下文',
             style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
           ),
           const SizedBox(width: 8),
@@ -1496,7 +1536,17 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 构建标题栏（Agent 名称 + 本地运行开关 + 状态 + 停止/teammates/压缩按钮）
   Widget _buildTitleBar(Agent? agent) {
     final cs = Theme.of(context).colorScheme;
-    final String? title = agent?.name;
+    // 看临时员工的过程时，标题就是它（**同一个窗口**，不新开页面）
+    final String viewId = _effectiveViewId;
+    final List<ChatMessage> viewTranscript = _viewTranscript();
+    final bool inSubagentView = viewId.isNotEmpty;
+    final String? title = agent == null
+        ? null
+        : viewTitle(
+            subagentId: viewId,
+            agentName: agent.name,
+            transcript: viewTranscript,
+          );
     // 当前 agent 是否在工作
     final bool working = agent != null && _workingAgents.contains(agent.id);
     // 当前 agent 是否在压缩上下文（compacting 状态，与 working 可并存：
@@ -1537,6 +1587,25 @@ class _MessagePanelState extends State<MessagePanel> {
                       ),
                     ),
                   ),
+                  // 临时员工视角：紧跟一句"谁召来的 · 第几层"（措辞与团队的层级分开）
+                  if (inSubagentView) ...<Widget>[
+                    const SizedBox(width: 8),
+                    Flexible(
+                      child: Text(
+                        viewSubtitle(
+                          callerName: SubagentTranscript.instance.callerNameOf(
+                            viewId,
+                            ownerAgentId: agent?.id ?? '',
+                            ownerName: agent?.name ?? '',
+                          ),
+                          transcript: viewTranscript,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                      ),
+                    ),
+                  ],
                   if (working) ...<Widget>[
                     const SizedBox(width: 8),
                     SizedBox(
@@ -1583,6 +1652,11 @@ class _MessagePanelState extends State<MessagePanel> {
                 onCreate: _handleCreateSession,
                 onRename: _handleRenameSession,
                 onDelete: _handleDeleteSession,
+                // 看临时员工的过程时**锁住会话切换**（用户 2026-10-04 要求）：
+                // 那条过程属于当前会话，切走会话这一屏就没有意义了
+                locked: inSubagentView,
+                lockedHint: '正在看临时员工的过程：先切回主会话再换会话'
+                    '（切换器在输入框右下）',
               ),
             ),
           if (agent != null)
@@ -1735,15 +1809,48 @@ class _MessagePanelState extends State<MessagePanel> {
       builder: (BuildContext context, Widget? child) {
         final List<String> ids = SubagentTranscript.instance.ids;
         if (ids.isEmpty) return const SizedBox.shrink();
+        final String current = _effectiveViewId;
         return PopupMenuButton<String>(
-          tooltip: '「${agent.name}」召来的临时员工（${ids.length} 名）',
+          tooltip: current.isEmpty
+              ? '「${agent.name}」召来的临时员工（${ids.length} 名）'
+              : '正在看「${agent.name}」召来的临时员工 · 点这里换一个或回主会话',
           icon: const Icon(Icons.badge_outlined, size: 20),
-          onSelected: (String id) => unawaited(_openSubagentView(agent, id)),
+          // 与切换器同一条路：**就地换视角**（不再 push 一个新页面）
+          onSelected: _switchView,
           itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
+            PopupMenuItem<String>(
+              value: '',
+              child: Row(
+                children: <Widget>[
+                  Icon(
+                    current.isEmpty ? Icons.check : Icons.chat_bubble_outline,
+                    size: 15,
+                    color: current.isEmpty
+                        ? Theme.of(context).colorScheme.primary
+                        : Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 8),
+                  const Text('主会话'),
+                ],
+              ),
+            ),
+            const PopupMenuDivider(),
             for (final String id in ids)
               PopupMenuItem<String>(
                 value: id,
-                child: Text(_subagentMenuLabel(agent, id)),
+                child: Row(
+                  children: <Widget>[
+                    Icon(
+                      id == current ? Icons.check : Icons.badge_outlined,
+                      size: 15,
+                      color: id == current
+                          ? Theme.of(context).colorScheme.primary
+                          : Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                    const SizedBox(width: 8),
+                    Flexible(child: Text(_subagentMenuLabel(agent, id))),
+                  ],
+                ),
               ),
           ],
         );
@@ -1770,19 +1877,106 @@ class _MessagePanelState extends State<MessagePanel> {
         '${transcript.length} 条过程';
   }
 
-  /// 进入某个临时员工的视角（与 teammates 窗口同一层级的独立页面）。
-  Future<void> _openSubagentView(Agent agent, String subagentId) async {
-    final List<ChatMessage> transcript = SubagentTranscript.instance.of(subagentId);
-    await Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (_) => SubagentViewPage(
-          subagentId: subagentId,
-          agentId: agent.id,
-          sessionId: _currentSession?.sessionId ?? _currentSessionId,
-          fallbackName: transcript.isEmpty ? '' : transcript.first.subagentName,
-          ownerName: agent.name,
-        ),
-      ),
+  /// 当前真正生效的视角 id（防御）：要看的临时员工必须还在这一屏的过程分栏里。
+  ///
+  /// 为什么要有它：过程分栏每帧按整份消息流重建（[SubagentTranscript.sync]），换会话 /
+  /// 整表重拉之后那个 id 可能已经不存在了——那时**回到主会话**，而不是显示一个空屏。
+  String get _effectiveViewId =>
+      _viewSubagentId.isNotEmpty &&
+          SubagentTranscript.instance.ids.contains(_viewSubagentId)
+      ? _viewSubagentId
+      : '';
+
+  List<ChatMessage> _viewTranscript() =>
+      SubagentTranscript.instance.of(_effectiveViewId);
+
+  /// 切换视角（空串 = 回主会话）：**就地换**——用户 2026-10-04 明确要求不新开窗口，
+  /// 借父 agent 的窗口把对话数据与上下文长度条换成它的。
+  void _switchView(String subagentId) {
+    if (subagentId == _viewSubagentId) return;
+    setState(() {
+      _viewSubagentId = subagentId;
+      // 换视角 = 换一份消息：滚动位置与"跳到最新"按新视角重来
+      _scrollRevision++;
+      _bottomJump = true;
+    });
+  }
+
+  /// 只读输入框上那句说明（临时员工视角下不能发消息：那条过程不是你与它的对话）。
+  String _lockedComposerHint() {
+    final List<ChatMessage> transcript = _viewTranscript();
+    final String name = subagentName(transcript);
+    return '正在看临时员工「$name」的过程（只读）：它是这个 agent 召来的，不是对话的一轮；'
+        '右下角可切回主会话';
+  }
+
+  /// 临时员工视角的正文区：一行身份条 + 它的完整过程（**同一个窗口**里换掉消息列表）。
+  Widget _buildSubagentView(String subagentId) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final Agent? agent = widget.selectedAgent;
+    return ListenableBuilder(
+      listenable: SubagentTranscript.instance,
+      builder: (BuildContext context, Widget? child) {
+        final List<ChatMessage> transcript = SubagentTranscript.instance.of(
+          subagentId,
+        );
+        final String caller = SubagentTranscript.instance.callerNameOf(
+          subagentId,
+          ownerAgentId: agent?.id ?? '',
+          ownerName: agent?.name ?? '',
+        );
+        final ContextReading? reading = subagentContext(transcript);
+        return ListView(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 20),
+          children: <Widget>[
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: cs.surfaceContainerHighest.withValues(alpha: 0.35),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: cs.primary.withValues(alpha: 0.35)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Row(
+                    children: <Widget>[
+                      Icon(Icons.badge_outlined, size: 15, color: cs.primary),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          '${viewSubtitle(callerName: caller, transcript: transcript)}'
+                          ' · $subagentId',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: cs.onSurfaceVariant,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (reading != null) ...<Widget>[
+                    const SizedBox(height: 4),
+                    Text(
+                      subagentUsageLine(transcript) ?? '',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: cs.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            SubagentProcessList(
+              messages: transcript,
+              emptyHint: '还没有收到它的过程消息：它可能刚被召来（正在准备），'
+                  '也可能这一轮只有报告。',
+            ),
+          ],
+        );
+      },
     );
   }
 
@@ -1837,6 +2031,8 @@ class _MessagePanelState extends State<MessagePanel> {
       _currentSession = session;
       _messages.clear();
       _scrollRevision++;
+      // 临时员工属于**当前会话**：换会话就回主会话视角（否则会看着上一个会话的过程）
+      _viewSubagentId = '';
     });
     _lastSessionByAgent[agent.id] = session.sessionId;
     _syncKnownSessions();
@@ -1856,6 +2052,7 @@ class _MessagePanelState extends State<MessagePanel> {
         _currentSession = session;
         _messages.clear();
         _scrollRevision++;
+        _viewSubagentId = '';
       });
       _lastSessionByAgent[agent.id] = session.sessionId;
       _syncKnownSessions();

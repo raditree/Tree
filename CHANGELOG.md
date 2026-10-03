@@ -43,6 +43,18 @@
   `tool_calls` 没有 reasoning"⇒ 端点 400。**判据是"这一轮还在飞"**：不止"批已有结果"，
   **这一跳的思考已落库、工具卡还没回来**（插话落在工具执行期间）时也要推迟——就地 flush 在
   "还没东西可发"时会清空待回传的思考，那段 CoT 丢失、紧接着的批以"没有 reasoning"收尾，同样 400。
+- **Ctrl+J 终端：回滚缓冲 + 在终端里给会话发消息**（[lib/README.md](lib/README.md) 不变量 14）：
+  主屏整屏滚动出去的行进历史（上限 2000 行，备用屏与滚动区域内部不进——xterm 口径），鼠标滚轮翻回去、
+  滚到底自动恢复跟随，翻上去时工具条给「已回滚 N 行」胶囊；**`#TSend "一段话"` / `#TSend @<文件路径>`**
+  直接在终端里给当前会话发消息（走 composer 同一个发送口），实现是**按键层拦截**：以 `#` 开头且仍是
+  `#TSend` 前缀的那一行只在本地缓存，一旦不是它就把缓存**原样补发**——对 shell 与用户而言等于没拦过。
+- **进临时员工视角不新开窗口**（[lib/README.md](lib/README.md) 不变量 18 ③④）：借父 agent 的窗口，只把
+  **对话数据**与**上下文长度条**换成它的（`ui/services/conversation_view.dart` 的 `viewMessages` / `viewContext`
+  是唯一口径），输入框锁成只读；**切换的 UI 在输入框右下、发送键左侧**（与会话切换同族的胶囊 + 下拉）；
+  **进入视角后锁定会话切换**（`SessionPicker.locked`：图标变锁、点它只说原因、右键重命名/删除一并关掉）。
+- **打包不许让图标字形静默缺失**（[tool/package_windows.dart](tool/package_windows.dart)）：构建改用
+  `--no-tree-shake-icons`，并在打包后逐个人 `lib/` 里用到的 `Icons.*` 对字体 cmap，缺一个就失败并点名
+  （真机现场：临时员工入口那颗按钮**画不出字形**，看着像"黑的"——发布版子集里没有 `badge_outlined`）。
 - **思考模型的每条 assistant 都带 `reasoning_content` 键**（[llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 13）：
   真端点实测（`deepseek-flash` @ `api.deepseek.com`，请求带 `tools`）：末尾 assistant（或末尾 tool 结果所属的
   那条 assistant）带 `reasoning_content: ""` 是 **200**，**整个键不给**才是 **400**

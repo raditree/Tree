@@ -22,7 +22,10 @@
 ///   （ESC ( ) * + 后跟一个字节）、不认识或畸形的 CSI/ESC —— 一律丢弃，不打印、不抛异常。
 ///
 /// ## 没做 / 不完整（已知取舍，给 known-issues 用）
-/// - **没有回滚缓冲（scrollback）**：ED3（CSI 3 J）视为无操作。
+/// - **回滚缓冲（scrollback）**：主屏**整屏**滚动时被顶出去的行进 [history]
+///   （上限 [historyLimit]，默认 2000 行）；备用屏（vim/top）不产生历史；滚动区域
+///   内部的滚动也不进历史。**ED3（CSI 3 J）清空历史**、RIS（`_reset`）同样清空。
+///   渲染方自己决定显示"历史尾部 + 当前屏"的哪一段（本文件只管数据）。
 /// - **没有真正的制表位表**：TAB / CSI I / CSI Z 按固定 8 列步进；HTS(ESC H)、
 ///   TBC(CSI g) 不生效。
 /// - **组合记号（零宽字符）直接丢弃**，不做「贴到前一格合成一个字素」的处理。
@@ -114,9 +117,12 @@ class VtCell {
 
 /// 终端屏幕：吃字节、吐网格 + 回写应答。
 class VtScreen {
-  VtScreen({required int columns, required int rows})
-      : _cols = columns < 1 ? 1 : columns,
-        _rows = rows < 1 ? 1 : rows {
+  VtScreen({
+    required int columns,
+    required int rows,
+    this.historyLimit = 2000,
+  }) : _cols = columns < 1 ? 1 : columns,
+       _rows = rows < 1 ? 1 : rows {
     _mainGrid = _blankGrid(_cols, _rows);
     _altGrid = _blankGrid(_cols, _rows);
     _scrollBottom = _rows - 1;
@@ -129,6 +135,18 @@ class VtScreen {
 
   late List<List<VtCell>> _mainGrid;
   late List<List<VtCell>> _altGrid;
+
+  /// 回滚缓冲上限（行）。太小用户翻不到东西，太大白占内存（一行 ≈ 列数 × 一个
+  /// VtCell；2000 行 × 200 列的可读文本量已经远超一个屏）。
+  final int historyLimit;
+
+  /// 滚出屏幕上沿的行（最老的在最前）。
+  final List<List<VtCell>> _history = <List<VtCell>>[];
+
+  /// **累计**推入过多少行（只增不减）：渲染方据此判断"这次输出又滚掉了几行"，
+  /// 从而在用户正在回滚时把视图固定在同一段内容上（历史满了 [history] 不再变长，
+  /// 只有这个计数器还准）。
+  int _historyPushed = 0;
 
   /// 当前屏幕上吃的格子（跟随备用屏切换）
   List<List<VtCell>> get _grid => _alt ? _altGrid : _mainGrid;
@@ -173,6 +191,14 @@ class VtScreen {
   /// 返回的是**内部网格本身**（不拷贝，渲染方每帧遍历不产生分配）。
   /// 调用方只读，不要改。
   List<List<VtCell>> get lines => _grid;
+
+  /// 回滚缓冲（最老的行在最前）。只读，渲染方不要改里面的行。
+  List<List<VtCell>> get history => _history;
+
+  int get historyLength => _history.length;
+
+  /// 累计滚出屏幕的行数（≥ [historyLength]；历史满了之后继续增大）。
+  int get historyPushed => _historyPushed;
 
   int get cursorColumn => _cursorX;
   int get cursorRow => _cursorY;
@@ -254,6 +280,10 @@ class VtScreen {
     if (c == _cols && r == _rows) return;
     _mainGrid = _resizeGrid(_mainGrid, c, r);
     _altGrid = _resizeGrid(_altGrid, c, r);
+    // 历史行也要跟着换成新宽度：渲染方按"当前列数"画格子，留着旧宽度的行会串行
+    for (int i = 0; i < _history.length; i++) {
+      _history[i] = _resizeGrid(<List<VtCell>>[_history[i]], c, 1).first;
+    }
     _cols = c;
     _rows = r;
     _scrollTop = 0;
@@ -858,7 +888,12 @@ class VtScreen {
         _eraseCells(_cursorY, 0, _cursorX + 1);
         return;
       case 2:
-      case 3: // 3 = 清回滚缓冲；本模块没有回滚缓冲，等同清屏
+        for (int y = 0; y < _rows; y++) {
+          _eraseCells(y, 0, _cols);
+        }
+        return;
+      case 3: // 3 = 连**回滚缓冲**一起清（xterm 口径）
+        _history.clear();
         for (int y = 0; y < _rows; y++) {
           _eraseCells(y, 0, _cols);
         }
@@ -919,11 +954,23 @@ class VtScreen {
     final int region = _scrollBottom - _scrollTop + 1;
     if (region <= 0) return;
     final int count = n.clamp(1, region);
+    // 整屏滚动（滚动区顶 = 第 0 行）且在主屏：被顶出去的行进回滚缓冲。
+    // 备用屏（vim/top）没有回滚缓冲；滚动区域内部的滚动是"区域内翻页"，同样不进
+    // ——两条都是 xterm 的口径。
+    final bool toHistory = !_alt && _scrollTop == 0;
     for (int k = 0; k < count; k++) {
-      _grid.removeAt(_scrollTop);
+      final List<VtCell> leaving = _grid.removeAt(_scrollTop);
+      if (toHistory) _pushHistory(leaving);
       _grid.insert(_scrollBottom, _blankLine());
     }
     _markDirty();
+  }
+
+  void _pushHistory(List<VtCell> line) {
+    _history.add(line);
+    _historyPushed++;
+    final int over = _history.length - historyLimit;
+    if (over > 0) _history.removeRange(0, over);
   }
 
   void _scrollDown(int n) {
@@ -1204,6 +1251,8 @@ class VtScreen {
     _savedPen.reset();
     _mainGrid = _blankGrid(_cols, _rows);
     _altGrid = _blankGrid(_cols, _rows);
+    // 全量复位（RIS）连回滚缓冲一起清：会话都重来了，旧的滚屏内容没有意义
+    _history.clear();
     _alt = false;
     _scrollTop = 0;
     _scrollBottom = _rows - 1;
