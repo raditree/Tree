@@ -567,6 +567,68 @@ void main() {
   });
 
   group('右键菜单与条目动作', () {
+    testWidgets('全部折叠：把展开的目录（含嵌套）收回去，并滚回顶部', (
+      WidgetTester tester,
+    ) async {
+      await pumpTree(tester);
+      await tester.tap(find.byKey(FileTree.rowKey('src')));
+      await settleIo(tester);
+      expect(find.text('lib'), findsOneWidget, reason: 'src 展开后应出现子目录');
+
+      await tester.tap(find.byKey(FileTree.rowKey('src/lib')));
+      await settleIo(tester);
+      expect(find.text('deep.dart'), findsOneWidget, reason: '嵌套一层也展开');
+
+      // 头部那颗「全部折叠」
+      await tester.tap(find.byTooltip('全部折叠'));
+      await tester.pumpAndSettle();
+      expect(find.text('lib'), findsNothing, reason: '嵌套的子目录也要收回去');
+      expect(find.text('deep.dart'), findsNothing);
+      expect(
+        find.byKey(FileTree.rowKey('src')),
+        findsOneWidget,
+        reason: '收的是展开状态，根层条目照旧',
+      );
+      expect(
+        tester.widget<AnimatedRotation>(
+          find.descendant(
+            of: find.byKey(FileTree.rowKey('src')),
+            matching: find.byType(AnimatedRotation),
+          ),
+        ).turns,
+        0.0,
+        reason: '箭头回到收起方向',
+      );
+    });
+
+    testWidgets('全部折叠：没有展开项时置灰并说明原因（不是"点了没反应"）', (
+      WidgetTester tester,
+    ) async {
+      await pumpTree(tester);
+      // 一棵还没展开过的树：这颗键不该可点，tooltip 也要说清为什么
+      final Finder byTooltip = find.byTooltip('没有展开的目录（都收着呢）');
+      expect(byTooltip, findsOneWidget);
+      expect(
+        tester.widget<IconButton>(
+          find.ancestor(of: byTooltip, matching: find.byType(IconButton)),
+        ).onPressed,
+        isNull,
+        reason: '没有可收的目录 ⇒ 置灰，而不是点了没反应',
+      );
+
+      // 展开一层之后就该可点了
+      await tester.tap(find.byKey(FileTree.rowKey('src')));
+      await settleIo(tester);
+      final Finder enabled = find.byTooltip('全部折叠');
+      expect(enabled, findsOneWidget);
+      expect(
+        tester.widget<IconButton>(
+          find.ancestor(of: enabled, matching: find.byType(IconButton)),
+        ).onPressed,
+        isNotNull,
+      );
+    });
+
     testWidgets('菜单项齐备：打开 / 新建 / 重命名 / 删除 / 在文件夹中显示 / 复制路径 / 下载 / 刷新', (
       WidgetTester tester,
     ) async {

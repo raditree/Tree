@@ -327,13 +327,19 @@ class _FileTreeState extends State<FileTree> {
     }
   }
 
-  /// 收起全部（展开状态清空；选中与作用域不动）
+  /// 收起全部（展开状态清空；选中与作用域不动）。
+  ///
+  /// 两处体贴（用户 2026-10-04：「全部折叠点击为啥没反应」——那一刻本来就没有展开的
+  /// 目录，所以点了个"合法但看不见效果"的按钮）：
+  /// - 没有展开项时这颗键**置灰**并改 tooltip（见 `_buildHead`），一眼看出"没东西可收"；
+  /// - 真收了就**滚回顶部**（VS Code 同款），保证每次点击都有可见反馈。
   void _collapseAll() {
     setState(() {
       _expanded.clear();
       _renamingPath = null;
       _renameError = null;
     });
+    if (_scrollController.hasClients) _scrollController.jumpTo(0);
   }
 
   void _refresh() => unawaited(_reloadAll());
@@ -611,8 +617,9 @@ class _FileTreeState extends State<FileTree> {
           _headAction(icon: Icons.refresh, tooltip: '刷新', onPressed: _refresh),
           _headAction(
             icon: Icons.unfold_less,
-            tooltip: '全部折叠',
-            onPressed: _collapseAll,
+            // 没有展开项时说清"为什么点了没反应"（用户 2026-10-04 的反馈）
+            tooltip: _expanded.isEmpty ? '没有展开的目录（都收着呢）' : '全部折叠',
+            onPressed: _expanded.isEmpty ? null : _collapseAll,
           ),
         ],
       ),
@@ -622,7 +629,9 @@ class _FileTreeState extends State<FileTree> {
   Widget _headAction({
     required IconData icon,
     required String tooltip,
-    required VoidCallback onPressed,
+    // 可空：没有可做的事时**置灰**（例如"没有展开的目录"时的「全部折叠」），
+    // 比点了没反应强——用户一眼就知道不是按钮坏了。
+    required VoidCallback? onPressed,
   }) {
     return IconButton(
       icon: Icon(icon, size: 16),
@@ -1107,6 +1116,8 @@ class _FileTreeState extends State<FileTree> {
         ),
         PopupMenuItem<String>(
           value: 'collapse_all',
+          // 没有展开项就置灰：与头部那颗键同一个口径（点了没反应最容易被当成 bug）
+          enabled: _expanded.isNotEmpty,
           child: _menuRow(Icons.unfold_less, '全部折叠'),
         ),
       ],
