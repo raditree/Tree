@@ -67,7 +67,9 @@ void main() {
     // 人类可读日志走 stderr（含数据目录提示）。
     // stderr 与 stdout 是两条独立管道，没有先后保证：必须轮询等待而不是立刻断言，
     // 否则偶发"日志还没到"就会误报失败。
-    await _waitForStderr(core, 'listening on');
+    // 等**最后一行**（`数据目录` 在 `listening on` **之后**打印，见 bin/tree_core.dart）：
+    // 等前一行再断言后一行是有竞态的——两条管道没有先后保证，实测偶发误报。
+    await _waitForStderr(core, '数据目录');
     final String stderrText = core.stderrLines.join('\n');
     expect(stderrText, contains('listening on'));
     expect(stderrText, contains('数据目录'));
