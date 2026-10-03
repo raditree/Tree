@@ -1055,10 +1055,14 @@ Material `Scrollbar`，而全仓库没有任何 `ScrollConfiguration` / `ScrollB
   - 起不来、或重启后仍带着 ⇒ 往 **stderr** 留一句可读的话（不静默）后**照常启动**（绝不把用户挡在门外）；
   - 这两个标记不会传给 Dart 层。
 - **`tool/installer/tree-desktop.iss`**：安装后的"启动 Tree"改经 `explorer.exe`（断掉污染源，配注释说明理由）。
-- **终端侧的可读防呆**（上一轮做的，保留）：命中 `不受信任的装入点` / `untrusted mount point` /
-  `无法遍历该路径` 时弹一次指引。**但它覆盖不到用户实际踩到的那种措辞**——CMake 报的是
-  `add_subdirectory given source … which is not an existing directory`（不含上述关键字），
-  所以上一轮"加了提示"在这条真实路径上并没有弹出来（记在 #21 一起修）。
+- **终端侧的可读防呆**（上一轮做的，本轮补全）：命中**两种措辞**时弹一次指引——① 系统措辞
+  `不受信任的装入点` / `untrusted mount point` / `无法遍历该路径`；② **CMake 措辞**
+  `add_subdirectory given source … which is not an existing directory` **且**同时出现 `.plugin_symlinks`
+  （单看是通用措辞，判据是"两半同时命中"）。**上一轮只认了 ①**，而用户实际踩到的正是 ② ⇒
+  那次"加了提示"在真实路径上根本没弹出来（本轮补上，用例：`test/terminal_output_notice_test.dart`
+  两条 CMake 场景 + `test/terminal_panel_test.dart` 的分帧用例；旧防呆上这些用例全红）。
+  指引文案也一并**改正**：从"先去管理员终端 `flutter pub get`"改成"退出 Tree 从开始菜单重开一次
+  （新版本启动时会自愈）／先在系统终端里跑这条命令"。
 
 ### 验证
 

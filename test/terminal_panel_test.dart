@@ -625,6 +625,32 @@ void main() {
     expect(state.debugSelection, isNull);
   });
 
+  testWidgets('CMake 形态的 #16（"add_subdirectory … 不是目录"）也弹指引——用户真机就是这条', (WidgetTester tester) async {
+    await pumpPanel(tester);
+    final String id = openedId(tester);
+    // 用户真机那次的措辞（不含"不受信任的装入点"字样，上一轮的关键字匹配不到它）：
+    // 分两帧喂，切在"两半"之间——第一半留在字节尾巴里，第二半到达时才能凑齐判据。
+    final List<int> whole = utf8.encode(
+      'CMake Error at flutter/generated_plugins.cmake:19 (add_subdirectory):\n'
+      '  add_subdirectory given source\n'
+      '  "flutter/ephemeral/.plugin_symlinks/desktop_drop/windows" which is not an\n'
+      '  existing directory.\n',
+    );
+    final int cut = whole.length ~/ 2;
+    for (final List<int> piece in <List<int>>[whole.sublist(0, cut), whole.sublist(cut)]) {
+      await emit(tester, <String, dynamic>{
+        'type': TerminalOutboundType.output,
+        TerminalFrame.terminalId: id,
+        TerminalFrame.bytes: base64Encode(piece),
+      });
+    }
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('RedirectionGuard'), findsWidgets,
+        reason: 'CMake 看不见 .plugin_symlinks 的链接 = 同一个根因，必须给指引');
+    expect(find.textContaining('known-issues.md #16'), findsWidgets);
+  });
+
   testWidgets('输出里出现"不受信任的装入点"⇒ 弹一次可读指引（不再让用户对着原文发愣）',
       (WidgetTester tester) async {
     await pumpPanel(tester);
