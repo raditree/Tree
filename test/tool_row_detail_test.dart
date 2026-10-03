@@ -377,6 +377,34 @@ void main() {
       expect(find.text('+'), findsOneWidget);
     });
 
+    testWidgets('再点一次同一条工具行 = 取消选中（不用去详情页点「关闭详情」）', (
+      WidgetTester tester,
+    ) async {
+      await pumpRowWithDetail(tester, toolMessage(result: '结果'));
+
+      await tester.tap(find.byType(ToolCallCard));
+      await tester.pumpAndSettle();
+      expect(DetailSelection.instance.selectedId, 't1');
+      expect(find.text('调用参数'), findsOneWidget);
+
+      // 再点一次同一条：取消（详情页回到空态，右键「关闭详情」那颗键都不用碰）
+      await tester.tap(find.byType(ToolCallCard));
+      await tester.pumpAndSettle();
+      expect(DetailSelection.instance.message, isNull);
+      expect(find.text('点中栏的工具调用或思考'), findsOneWidget);
+      expect(find.text('调用参数'), findsNothing);
+    });
+
+    testWidgets('思考行同一口径：再点一次也取消', (WidgetTester tester) async {
+      await pumpRowWithDetail(tester, thinkingMessage(text: '理由'));
+      await tester.tap(find.byType(ThinkingCard));
+      await tester.pumpAndSettle();
+      expect(DetailSelection.instance.selectedId, 'k1');
+      await tester.tap(find.byType(ThinkingCard));
+      await tester.pumpAndSettle();
+      expect(DetailSelection.instance.message, isNull);
+    });
+
     testWidgets('思考：详情页给完整推理内容', (WidgetTester tester) async {
       await pumpRowWithDetail(
         tester,

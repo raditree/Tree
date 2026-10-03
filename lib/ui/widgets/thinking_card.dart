@@ -45,7 +45,8 @@ class _ThinkingCardState extends State<ThinkingCard> {
             child: InkWell(
               borderRadius: BorderRadius.circular(6),
               hoverColor: cs.primary.withValues(alpha: 0.07),
-              onTap: () => DetailSelection.instance.select(m),
+              // 与工具行同一口径：点一下选中、再点一下取消
+      onTap: () => DetailSelection.instance.toggle(m),
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
                 child: Row(

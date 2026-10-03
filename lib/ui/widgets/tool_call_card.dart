@@ -57,7 +57,8 @@ class _ToolCallCardState extends State<ToolCallCard> {
             child: InkWell(
               borderRadius: BorderRadius.circular(6),
               hoverColor: cs.primary.withValues(alpha: 0.07),
-              onTap: () => DetailSelection.instance.select(m),
+              // 点一下选中、再点一下取消（见 DetailSelection.toggle）
+        onTap: () => DetailSelection.instance.toggle(m),
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
                 child: Row(

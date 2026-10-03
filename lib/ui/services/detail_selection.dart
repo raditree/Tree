@@ -33,6 +33,19 @@ class DetailSelection extends ChangeNotifier {
   }
 
   /// 清空选中（详情页的关闭按钮、切 agent / 会话时调用）
+  /// 点一下卡片：选中它；**再点一次同一条就取消选中**。
+  ///
+  /// 用户 2026-10-04：「点击工具卡片后详情页显示对应工具详情，再点击一次工具卡片就取消
+  /// （省的还要把鼠标移到详情页点「关闭详情」）」——工具行与思考行共用这一条，
+  /// 两边的行为必须一致（一个能取消、一个不能会很别扭）。
+  void toggle(ChatMessage message) {
+    if (selectedId == message.id) {
+      clear();
+      return;
+    }
+    select(message);
+  }
+
   void clear() {
     if (_message == null) return;
     _message = null;
