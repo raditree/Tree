@@ -173,6 +173,93 @@ void main() {
     );
     await sub.cancel();
   }, timeout: const Timeout(Duration(seconds: 30)));
+
+  test('③ 请求侧：零事件沉默 ⇒ 登记；被显式关闭 ⇒ 这一跳以取消收尾（插件挂住也能收手）', () async {
+    final List<String> logs = <String>[];
+    final _FakeGuard guard = _FakeGuard();
+    int registered = 0;
+    final List<AgentEvent> events = <AgentEvent>[];
+    final StreamSubscription<AgentEvent> sub = run(
+      LlmSession(
+        transport: _SilentTransport(),
+        model: 'demo',
+        maxSeqlen: 128000,
+        requestSilenceTimeout: const Duration(milliseconds: 60),
+        llmRequestRegistrar:
+            ({
+              required String agentId,
+              required String sessionId,
+              required String model,
+              required int turn,
+            }) {
+              registered++;
+              return guard;
+            },
+        log: logs.add,
+      ),
+    ).listen(events.add);
+
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    expect(
+      registered,
+      1,
+      reason: '零事件到达沉默阈值 ⇒ 登记成"可关闭的运行"（事件一直在流的正常长生成不会登记）',
+    );
+    expect(
+      logs.any((String l) => l.contains('沉默')),
+      isTrue,
+      reason: 'C′：沉默要留痕（这正是"请求发出去了、然后什么都没有"此前查不到的那一行）',
+    );
+    expect(
+      events.whereType<AgentDone>(),
+      isEmpty,
+      reason: '还没被关闭 ⇒ 继续等（不自动失败、不注入合成结果）',
+    );
+
+    // 显式关闭（用户右栏 / 插件 tool.close / agent tool_runs action=close，同一实现）
+    guard.isClosed = true;
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    expect(events.whereType<AgentDone>(), isNotEmpty, reason: '关闭 ⇒ 这一跳收尾');
+    expect(
+      events.whereType<AgentDone>().last.cancelled,
+      isTrue,
+      reason: '按"取消"收尾（这一轮作废）——插件挂住 / socket 挂住这条无界路径因此可关',
+    );
+    expect(guard.finished, isTrue, reason: '登记项要收尾（不留在表里冒充"还在跑"）');
+    expect(
+      logs.any((String l) => l.contains('已被显式关闭')),
+      isTrue,
+      reason: 'C′：关闭要留痕',
+    );
+    await sub.cancel();
+  }, timeout: const Timeout(Duration(seconds: 30)));
+}
+
+/// 一个**永不产出、永不结束**的传输（模拟"插件挂住 / socket 挂住"的零事件现场）。
+class _SilentTransport implements LlmTransport {
+  @override
+  Stream<LlmStreamEvent> stream(
+    LlmRequest request, {
+    bool Function()? isCancelled,
+  }) => Stream<LlmStreamEvent>.multi((MultiStreamController<LlmStreamEvent> _) {});
+
+  @override
+  Future<void> close() async {}
+}
+
+/// 假的可关闭句柄（登记表那一项的替身）。
+class _FakeGuard implements LlmRequestGuard {
+  bool isClosed = false;
+  bool finished = false;
+
+  @override
+  String get handle => 'req_test_1';
+
+  @override
+  bool get closed => isClosed;
+
+  @override
+  void finish() => finished = true;
 }
 
 extension<T> on T {

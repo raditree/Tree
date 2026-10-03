@@ -39,6 +39,7 @@ import '../team/team_repair.dart';
 import '../team/team_service.dart';
 import '../team/team_workspace.dart';
 import '../tool/terminal_hooks.dart';
+import '../tool/llm_request_guard.dart';
 import '../tool/todo_store.dart';
 import '../tool/tool_run_registry.dart';
 import '../tool/tool_runner.dart';
@@ -452,6 +453,15 @@ class CoreServer {
       wiredEngine.toolResultRepair = server.conversation.repairToolResult;
     // 工具久不返回时的对账探针（同一个注入范式）：存储里已有真实结果 ⇒ 采用它让批收尾。
     wiredEngine.toolResultProbe = server.conversation.probeToolResult;
+    // 「运行中的 LLM 请求」也进**同一张表**（用户 2026-10-03）：只有**连续沉默**（零事件）
+    // 达到阈值才登记（正常的长生成不进表、不 warning）；登记后被显式关闭 ⇒ 会话立刻以
+    // 取消收尾并掐掉底层订阅（插件挂住 / socket 挂住这条**无界**路径因此可关）。
+    // 见 `LlmSession._watchRequest` 与 `tool/llm_request_guard.dart`。
+    // 这里用进程级唯一那一个（`ToolRunRegistry.instance`）：生产路径下工具层的
+    // `WorkspaceToolRunner.toolRuns` 默认就是它，两边**是同一份表**。
+    wiredEngine.llmRequestRegistrar = llmRequestRegistrarOf(
+      ToolRunRegistry.instance,
+    );
     }
     // Q9：Spec 索引注入系统提示词。做成**可设置的 provider**（而不是给
     // `systemPromptWithWorkspace` 加参数）是因为提示词在会话生成与压缩估算两处

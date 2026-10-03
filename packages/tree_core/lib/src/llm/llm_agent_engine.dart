@@ -122,6 +122,10 @@ class LlmAgentEngine implements AgentEngine {
   /// 让"工具久不返回但结果其实已经在存储里"的批收尾。null = 只留痕、继续等显式取消。
   ToolResultProbe? toolResultProbe;
 
+  /// 「运行中的 LLM 请求」的登记落点（见 `LlmRequestRegistrar`）：
+  /// 沉默 N 秒（零事件）后登记成可关闭的运行；被显式关闭 ⇒ 这一跳以取消收尾。
+  LlmRequestRegistrar? llmRequestRegistrar;
+
   /// **「LLM 处理」接管钩子**（中转站点位 `system.relay.llm.handle`）；null = 未接线。
   ///
   /// 与 [toolTurnCompactor] 同范式：可写字段，由接线方（`CoreServer._wirePluginStations`）
@@ -235,6 +239,8 @@ class LlmAgentEngine implements AgentEngine {
       // 工具久不返回时的**对账探针**（见 ToolResultProbe）：存储里已有真实结果就采用它，
       // 让批能收尾；没有就继续等显式取消（用户 / 插件 / agent 的 tool_runs）。
       toolResultProbe: toolResultProbe,
+      // 「运行中的 LLM 请求」登记（沉默才登记；关闭即取消这一跳）。
+      llmRequestRegistrar: llmRequestRegistrar,
       maxSeqlen: config.effectiveMaxSeqlen,
       maxOutputTokens: config.maxOutputTokens > 0
           ? config.maxOutputTokens

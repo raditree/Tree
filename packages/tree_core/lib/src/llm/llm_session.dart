@@ -62,6 +62,44 @@ typedef ToolResultProbe =
 /// 这样"卡住"这件事在会话出事之前就已经在 `core.log` 里。
 const Duration defaultToolWatchdogInterval = Duration(seconds: 60);
 
+/// 「一个**运行中的 LLM 请求**」在登记表里的句柄（见 [LlmRequestRegistrar]）。
+///
+/// 为什么要它：传输层的重试**有界**（5 次退避），但**插件接管的流没有上限**——而会话
+/// "只会在收到事件后检查取消"（见类文档），插件挂了 / 不返回时就是**零事件** ⇒
+/// 既无日志、也无从取消。把它登记进**与工具同一张表**，"看得见 + 关得掉"就都有了。
+abstract interface class LlmRequestGuard {
+  /// 登记表里的句柄（UI / 日志用）。
+  String get handle;
+
+  /// 是否**已被显式关闭**（用户右栏 / 插件 / agent `tool_runs action=close`）。
+  /// 实现口径：登记项已从表里消失（`close` 会移除它）⇒ 视为已关闭。
+  bool get closed;
+
+  /// 收尾（幂等）。
+  void finish();
+}
+
+/// 把"运行中的 LLM 请求"登记进登记表（**可选注入**；null = 不登记，行为与从前完全一致）。
+typedef LlmRequestRegistrar =
+    LlmRequestGuard Function({
+      required String agentId,
+      required String sessionId,
+      required String model,
+      required int turn,
+    });
+
+/// **沉默多久**才把这次请求登记成"可关闭的运行"（默认 300 s，与全仓阈值同值）。
+///
+/// 口径刻意是"**连续多久没有事件**"而不是"总共跑了多久"：推理模型正常跑十分钟
+/// 也不该被登记成异常；只有**零事件**才是"卡住"的证据。
+const Duration defaultRequestSilenceTimeout = Duration(seconds: 300);
+
+/// 沉默检查的轮询间隔（便宜：只比时间戳）。
+const Duration _requestSilenceTick = Duration(seconds: 5);
+
+/// 关闭检查的轮询间隔（比沉默检查更密：关闭要**尽快**生效）。
+const Duration _requestClosePollInterval = Duration(seconds: 2);
+
 /// 一轮**完整的 LLM 会话**：上下文 → 流式生成 → 工具执行 → 回灌 → 继续，
 /// 直到模型给出最终文本（或出错/被取消）。
 ///
@@ -103,6 +141,8 @@ class LlmSession {
     this.llmRequestRewriter,
     this.toolResultProbe,
     this.toolWatchdogInterval = defaultToolWatchdogInterval,
+    this.llmRequestRegistrar,
+    this.requestSilenceTimeout = defaultRequestSilenceTimeout,
     this.log,
   });
 
@@ -163,6 +203,15 @@ class LlmSession {
 
   /// 工具调用看门狗的检查间隔（测试可注入更短的值）。
   final Duration toolWatchdogInterval;
+
+  /// 「运行中的 LLM 请求」的登记落点（见 [LlmRequestRegistrar]）；null = 不登记。
+  ///
+  /// 登记口径：**连续 [requestSilenceTimeout] 无任何事件**才登记（正常长生成不登记、
+  /// 不 warning）；登记后被显式关闭 ⇒ 这一跳立刻以取消收尾，并掐掉底层订阅。
+  final LlmRequestRegistrar? llmRequestRegistrar;
+
+  /// 连续多久无事件就把请求登记成可关闭的运行（测试可注入更短的值）。
+  final Duration requestSilenceTimeout;
 
   /// 工具循环内压缩钩子（Q1-③）；由引擎接线到会话层的 CompactionService。
   ///
@@ -316,9 +365,12 @@ class LlmSession {
         '请求已发出：turn=$turn model=$model 上下文消息=${request.messages.length}'
         ' 工具=${toolSpecs.length}${pluginStream != null ? '（插件接管）' : ''}',
       );
-      final Stream<LlmStreamEvent> events =
-          pluginStream ??
-          transport.stream(request, isCancelled: isCancelled);
+      final Stream<LlmStreamEvent> events = _watchRequest(
+        pluginStream ?? transport.stream(request, isCancelled: isCancelled),
+        turn: turn,
+        agentId: agentId,
+        sessionId: sessionId,
+      );
       bool firstEventLogged = false;
       await for (final LlmStreamEvent event in events) {
         if (!firstEventLogged) {
@@ -539,6 +591,117 @@ class LlmSession {
         );
       }
     }
+  }
+
+  /// 把"这一跳 LLM 请求"包一层**可关闭的活性看护**（用户 2026-10-03：「沉默就登记、关闭即取消」）。
+  ///
+  /// 为什么必须**主动轮询**：传输层的重试有界（5 次退避 + 30s 心跳判死），但**插件接管的流
+  /// 没有上限**，而会话"只会在收到事件后检查取消"（见类文档）⇒ 插件挂了 / 不返回时是**零事件**，
+  /// 于是既没有日志、也无从取消（凌川那份现场）。这里补两件事，都不改既有语义：
+  ///
+  /// 1. **沉默登记**：连续 [requestSilenceTimeout] **无任何事件** ⇒ 把这次请求登记进登记表
+  ///    （`tool: 'llm.request'`）⇒ 右栏「正在执行的 tool」/ `query_status.stuck_tools` /
+  ///    广播站都能看见它。**正常的长生成不会被登记**（事件一直在流 ⇒ 永不登记、永不 warning）；
+  /// 2. **关闭穿透**：登记后被**显式关闭**（用户右栏 / 插件 `tool.close` / agent
+  ///    `tool_runs action=close`，同一实现）⇒ 立刻以 [LlmFailureEvent]（`cancelled: true`）
+  ///    结束这一跳，并 `cancel()` 底层订阅（HTTP/SSH 连接随之释放、插件侧据此收到取消通知）。
+  ///
+  /// 未接线（[llmRequestRegistrar] 为 null）⇒ **原样返回**，行为与从前完全一致。
+  Stream<LlmStreamEvent> _watchRequest(
+    Stream<LlmStreamEvent> source, {
+    required int turn,
+    required String agentId,
+    required String sessionId,
+  }) {
+    final LlmRequestRegistrar? registrar = llmRequestRegistrar;
+    if (registrar == null) return source;
+    // 轮询间隔**由沉默阈值派生**（带上限）：生产仍是 5s / 2s；测试注入很短的阈值时
+    // 自动跟着变短，不必再暴露第二个"测试专用"开关。
+    final int quarter = requestSilenceTimeout.inMilliseconds ~/ 4;
+    final Duration tickEvery = Duration(
+      milliseconds: quarter.clamp(10, _requestSilenceTick.inMilliseconds),
+    );
+    final Duration pollEvery = Duration(
+      milliseconds: quarter.clamp(10, _requestClosePollInterval.inMilliseconds),
+    );
+    final StreamController<LlmStreamEvent> out =
+        StreamController<LlmStreamEvent>();
+    StreamSubscription<LlmStreamEvent>? sub;
+    Timer? silenceTick;
+    Timer? closeTick;
+    LlmRequestGuard? guard;
+    bool done = false;
+    int lastEventMs = DateTime.now().millisecondsSinceEpoch;
+    void settle() {
+      silenceTick?.cancel();
+      closeTick?.cancel();
+      guard?.finish();
+    }
+
+    void register() {
+      guard ??= registrar(
+        agentId: agentId,
+        sessionId: sessionId,
+        model: model,
+        turn: turn,
+      );
+      log?.call(
+        'LLM 请求已沉默 ${requestSilenceTimeout.inSeconds} 秒（零事件）'
+        '⇒ 登记为可关闭运行 ${guard!.handle}（右栏 / tool_runs 可见，关闭即取消这一跳）',
+      );
+      closeTick ??= Timer.periodic(pollEvery, (Timer _) {
+        if (done) return;
+        final LlmRequestGuard? current = guard;
+        if (current == null || !current.closed) return;
+        done = true;
+        log?.call('LLM 请求 ${current.handle} 已被显式关闭 ⇒ 结束这一跳（取消）');
+        if (!out.isClosed) {
+          out.add(
+            const LlmFailureEvent(
+              '这一轮 LLM 请求已被显式关闭（用户 / 插件 / agent）',
+              cancelled: true,
+            ),
+          );
+        }
+        unawaited(sub?.cancel());
+        settle();
+        if (!out.isClosed) unawaited(out.close());
+      });
+    }
+
+    out.onListen = () {
+      silenceTick = Timer.periodic(tickEvery, (Timer _) {
+        if (done || guard != null) return;
+        final int now = DateTime.now().millisecondsSinceEpoch;
+        if (now - lastEventMs >= requestSilenceTimeout.inMilliseconds) {
+          register();
+        }
+      });
+      sub = source.listen(
+        (LlmStreamEvent event) {
+          if (done) return;
+          lastEventMs = DateTime.now().millisecondsSinceEpoch;
+          if (!out.isClosed) out.add(event);
+        },
+        onError: (Object error, StackTrace stack) {
+          if (done || out.isClosed) return;
+          out.addError(error, stack);
+        },
+        onDone: () {
+          if (done) return;
+          done = true;
+          settle();
+          if (!out.isClosed) unawaited(out.close());
+        },
+        cancelOnError: false,
+      );
+    };
+    out.onCancel = () async {
+      done = true;
+      settle();
+      await sub?.cancel();
+    };
+    return out.stream;
   }
 
   /// 执行一次工具调用，带**看门狗**（用户 2026-10-03：「批收敛兜底」那一条）。
