@@ -1284,6 +1284,10 @@ class CoreServer {
         agent.toApiJson(
           lastMessage: last?.content ?? '',
           lastMessageTime: last?.timestamp,
+          // 待处理成员红点/角标：数**它自己的下属**里未分配模型 / 待审核的成员
+          // （与成员面板同口径，见 TeamService.pendingMemberCountFor）。
+          // 此前这个参数从没传过 ⇒ 恒为 0 ⇒ 红点永远不亮（docs/team.md 却写着会亮）。
+          pendingMemberCount: teamService?.pendingMemberCountFor(agent.id) ?? 0,
         ),
       );
     }

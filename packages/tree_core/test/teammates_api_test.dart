@@ -337,5 +337,40 @@ void main() {
         isEmpty,
       );
     });
+
+    test('左栏红点接上真实计数：TOP 数整队、成员只数自己的下属', () async {
+      final String leader = createMember('甲');
+      teams.createMember(leader, <String, dynamic>{
+        'action': 'create_member',
+        'member_name': '丙',
+      });
+      Map<String, dynamic> item(Map<String, dynamic> list, String id) =>
+          (list['agents'] as List<dynamic>)
+              .cast<Map<String, dynamic>>()
+              .firstWhere((Map<String, dynamic> a) => a['id'] == id);
+
+      final _Res list = await client.send('GET', '/api/agents');
+      expect(
+        item(list.json, top.id)['pending_member_count'],
+        2,
+        reason: 'TOP 数整队（甲 + 丙）',
+      );
+      expect(
+        item(list.json, leader)['pending_member_count'],
+        1,
+        reason: '成员只数自己的下属（丙）——不能把整队的待办算在自己头上',
+      );
+      expect(item(list.json, other.id)['pending_member_count'], 0);
+
+      // 放行一个：计数跟着掉（此前这个字段从没被赋值 ⇒ 那个红点永远不会亮）
+      await client.send(
+        'PATCH',
+        '/api/agents/${top.id}/teammate/$leader',
+        body: <String, dynamic>{'model_id': 'demo'},
+      );
+      final _Res after = await client.send('GET', '/api/agents');
+      expect(item(after.json, top.id)['pending_member_count'], 1);
+      expect(item(after.json, leader)['pending_member_count'], 1);
+    });
   });
 }

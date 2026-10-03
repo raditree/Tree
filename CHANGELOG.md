@@ -215,6 +215,11 @@
   工具只在第一行顶一次，换人重新标）；`subagent` 工具卡片是普通工具卡片（中文标签「临时员工」，行正文给 `task`，
   复用与后台在行里带出来）。按 `subagent_id` 分组 / 按 `subagent_parent_id` 树形展示是后续渲染——字段已经全在
   帧与历史接口里。
+- **待处理成员红点接上真实计数**（[team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 14、
+  [docs/team.md](docs/team.md) §7）：`GET /api/agents` 的 `pending_member_count` 此前**从不被赋值**（恒 0），
+  而 `docs/team.md` 写着「未就绪成员会在 leader 上显示红点」——左栏那排红点与角标因此**永远不亮**。
+  现在按**与成员面板同一个名册口径**数：TOP 数整队、成员只数自己那棵子树里未分配模型 / 待审核的成员
+  （成员不把整队的待办算在自己头上）；面板与徽章由同一个 `_rosterOf` 决定，不会出现「面板空、红点亮」。
 ### Added（首个版本总览）
 
 - **单进程桌面形态**：Flutter 界面 + 纯 Dart 核心 `tree_core`（可编译成单文件，约 10 MB）；

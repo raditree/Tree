@@ -59,6 +59,10 @@
     `is_member` / `top_agent_id` / `top_agent_name`），界面据此如实标注根节点——成员**不是** Level 0、
     也不是「团队负责人」。为什么以前会错：`teamIdOf(id)` 对成员回指团队，于是整队（含它自己）都成了
     「它的成员」；`team` 工具的 `list_members` 早就把自己排除掉了（同一类口径的前一半），这里是后一半。
+    **同口径的徽章**：`GET /api/agents` 的 `pending_member_count` = 这份名册里 `ReviewStatus.needsUser` 的成员数
+    （左栏红点 / teammates 入口角标）——TOP 数整队、成员只数自己的下属。此前这个参数**从没被赋值**（恒 0），
+    `docs/team.md` 却写着「未就绪成员会在 leader 上显示红点」，于是那排红点永远不会亮；现在面板与徽章由
+    同一个 `_rosterOf` 决定，不会出现「面板是空的、红点却亮着」。
 
 ## 测试
 

@@ -758,10 +758,7 @@ class TeamService {
       };
     }
     final String teamId = teamIdOf(agentId);
-    // TOP：整队（顺序照旧，别顺手改成 BFS）；成员：只列自己的下属子树（不含自己）。
-    final List<CoreAgent> all = self.teamId.isEmpty
-        ? members(teamId)
-        : descendants(agentId);
+    final List<CoreAgent> all = _rosterOf(self);
     int pending = 0;
     final List<Map<String, dynamic>> views = <Map<String, dynamic>>[];
     for (final CoreAgent member in all) {
@@ -795,6 +792,28 @@ class TeamService {
             : (store.agent(teamId)?.name ?? ''),
       },
     };
+  }
+
+  /// 面板与徽章**共用**的名册口径：这个 agent 的「成员」= 它**自己的下属**。
+  ///
+  /// TOP（`team_id` 空）⇒ 整队（沿用 `members()` 的取值与顺序）；成员 ⇒ `descendants()`。
+  /// `teammatesPayload`（面板）与 `pendingMemberCountFor`（左栏红点）必须同口径，
+  /// 否则会出现「面板是空的、红点却亮着」这种自相矛盾。
+  List<CoreAgent> _rosterOf(CoreAgent self) => self.teamId.isEmpty
+      ? members(teamIdOf(self.id))
+      : descendants(self.id);
+
+  /// 该 agent 名册里**等待用户处理**的成员数（未分配模型 / 待审核）。
+  ///
+  /// 左栏列表的红点与 teammates 入口角标用它；此前 `/api/agents` 从不给它赋值，
+  /// 于是那个红点**永远不会亮**（`docs/team.md` 却写着它会亮）。口径与成员面板一致：
+  /// 数的是**自己的下属**，成员不把整队的待办算在自己头上。
+  int pendingMemberCountFor(String agentId) {
+    final CoreAgent? self = store.agent(agentId);
+    if (self == null) return 0;
+    return _rosterOf(self)
+        .where((CoreAgent m) => ReviewStatus.needsUser(m.reviewStatus))
+        .length;
   }
 
   // ── 内部 ─────────────────────────────────────────────────────────────
