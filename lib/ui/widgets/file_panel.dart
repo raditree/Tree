@@ -140,14 +140,26 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
   /// 窗格分隔条宽度（查看器内部两格 + 树/查看器上下分栏共用）
   static const double _paneDividerWidth = 7;
 
-  /// 树与查看器**同屏分栏**时树占的比例（默认 0.4：树少一点、查看器多一点）
-  double _treeSplitRatio = 0.4;
+  /// 树与查看器**同屏分栏**时树占的比例（默认 0.3：目录当侧栏、查看器拿大头）。
+  ///
+  /// 左右分栏下这个比例会随面板宽度伸缩（400px ⇒ 树 200px；1000px ⇒ 树 300px），
+  /// 拖过就记在面板状态里；夹取与最小宽度交给 [SplitPanes]。
+  double _treeSplitRatio = 0.3;
 
-  /// 同屏分栏每一侧的最小高度
-  static const double _treeSplitMinExtent = 120;
+  /// 同屏分栏每一侧的最小**宽度**（目录这边至少要放得下头部那排动作键与 Tab）
+  static const double _treeSplitMinExtent = 200;
 
-  /// 可用高度低于它就降级成"一次只显示一个"：再矮下去两格都不到 100px，谁都不可用
-  static const double _treeSplitDegradeBelow = 200;
+  /// 可用**宽度**低于它就降级成"只显示查看器"：再窄下去两侧都不够用（用户 2026-10-04：
+  /// 与其把查看器压成一条，不如让它占满，目录用工具条上的按钮随时叫回来）
+  static const double _treeSplitDegradeBelow = 400;
+
+  /// 用户是否要显示目录（工具条按钮切换）。**意愿与"这一刻能不能显示"分开**：
+  /// 面板太窄时 [SplitPanes] 会降级成只看查看器，但这里不清掉用户的意愿——
+  /// 拖宽之后目录自己回来，不用再点一次。
+  bool _treeWanted = true;
+
+  /// 最近一次布局给树/查看器区域的可用宽度（只用来把"面板太窄"如实说给用户听）
+  double _lastTreeAreaWidth = 0;
 
   /// 文件子 Tab 区（文件浏览 / Git 历史 / Todo）的 key。
   ///
@@ -692,10 +704,14 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
     );
   }
 
-  /// 查看器工具条：分屏 / 切方向 / 关窗格 / 关查看器。
+  /// 查看器工具条：收起/显示目录 / 分屏 / 切方向 / 关窗格 / 关查看器。
   ///
   /// 为什么控件放顶栏而不是塞进每个窗格的标题栏：窗格可能被拖得很窄，标题栏还要
   /// 放文件名、语言标签、保存键；而分屏是「整个查看器」的动作，独立一条更稳。
+  ///
+  /// 「目录」这颗键（用户 2026-10-04）：目录在左时一键收起、收起后一键叫回来；
+  /// 面板窄到放不下并排两栏时，这里**如实写出原因**（而不是让用户对着一个看起来
+  /// 没反应的按钮猜）。
   Widget _buildViewerToolbar() {
     final ColorScheme cs = Theme.of(context).colorScheme;
     final bool twoPanes = _viewerPaths.length == 2;
@@ -709,15 +725,40 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
             twoPanes ? '2 个窗格' : '1 个窗格',
             style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
           ),
-          const Spacer(),
-          if (twoPanes)
-            IconButton(
-              icon: Icon(
-                _splitAxis == Axis.horizontal
-                    ? Icons.splitscreen_outlined
-                    : Icons.view_agenda_outlined,
-                size: 16,
+          // 目录在左但**这一刻显示不出来**（面板太窄被 SplitPanes 降级）：如实说原因，
+          // 否则用户会觉得这颗按钮点了没反应。
+          if (_treeWanted && _treeAreaTooNarrow) ...<Widget>[
+            const SizedBox(width: 6),
+            Flexible(
+              child: Text(
+                '面板太窄 · 目录已收起（拖宽右栏恢复）',
+                key: const ValueKey<String>('tree-too-narrow-hint'),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
               ),
+            ),
+          ],
+          const Spacer(),
+          _toolbarAction(
+            // 目录在左：收起 = 箭头朝左、显示 = 箭头朝右（`left_panel_*` 这套图标
+            // 在当前的 Flutter 版本里不存在，别用）
+            icon: _treeWanted
+                ? Icons.keyboard_double_arrow_left
+                : Icons.keyboard_double_arrow_right,
+            tooltip: _treeWanted ? '收起文件树（查看器占满）' : '显示文件树（目录在左）',
+            color: cs.onSurfaceVariant,
+            onPressed: () {
+              setState(() {
+                _treeWanted = !_treeWanted;
+              });
+            },
+          ),
+          if (twoPanes)
+            _toolbarAction(
+              icon: _splitAxis == Axis.horizontal
+                  ? Icons.splitscreen_outlined
+                  : Icons.view_agenda_outlined,
               tooltip: _splitAxis == Axis.horizontal ? '切成上下分屏' : '切成左右分屏',
               color: cs.onSurfaceVariant,
               onPressed: () {
@@ -729,21 +770,21 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
               },
             ),
           if (!twoPanes)
-            IconButton(
-              icon: const Icon(Icons.vertical_split_outlined, size: 16),
+            _toolbarAction(
+              icon: Icons.vertical_split_outlined,
               tooltip: '分屏：同一个文件再开一个窗格（两侧共享同一份缓冲）',
               color: cs.onSurfaceVariant,
               onPressed: _splitViewer,
             ),
           if (twoPanes)
-            IconButton(
-              icon: const Icon(Icons.close_fullscreen, size: 16),
+            _toolbarAction(
+              icon: Icons.close_fullscreen,
               tooltip: '关闭当前窗格',
               color: cs.onSurfaceVariant,
               onPressed: () => unawaited(_closePane(_activePane)),
             ),
-          IconButton(
-            icon: const Icon(Icons.close, size: 16),
+          _toolbarAction(
+            icon: Icons.close,
             tooltip: '关闭查看器',
             color: cs.onSurfaceVariant,
             onPressed: () => unawaited(_closeViewer()),
@@ -752,6 +793,30 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
       ),
     );
   }
+
+  /// 面板太窄、目录**这一刻**显示不出来（[SplitPanes] 会把并排两栏降级成只显示查看器）。
+  ///
+  /// 判据与 [SplitPanes] 逐字对齐：可用宽度 = 面板宽度 − 分隔条宽度。
+  bool get _treeAreaTooNarrow =>
+      _lastTreeAreaWidth > 0 &&
+      (_lastTreeAreaWidth - _paneDividerWidth) < _treeSplitDegradeBelow;
+
+  /// 工具条上的紧凑图标键：默认 IconButton 是 48×48，五颗键在 240px 的面板里会溢出
+  /// （黄条警告）；这里与文件树头部同一种口径（26×26、内边距 4）。
+  Widget _toolbarAction({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback onPressed,
+    Color? color,
+  }) => IconButton(
+    icon: Icon(icon, size: 16),
+    tooltip: tooltip,
+    color: color,
+    visualDensity: VisualDensity.compact,
+    padding: const EdgeInsets.all(4),
+    constraints: const BoxConstraints(minWidth: 26, minHeight: 26),
+    onPressed: onPressed,
+  );
 
   /// 窗格区：1 个铺满；2 个交给 [SplitPanes]（方向 / 比例 / 太窄降级都在那里，可单测）
   Widget _buildPanes() {
@@ -864,31 +929,40 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
           ),
         ),
         Divider(height: 1, thickness: 1, color: Theme.of(context).dividerColor),
-        // 内容区域：**树与查看器同屏**（打开文件时上下分栏；没打开文件时树独占）
+        // 内容区域：**目录在左、查看器在右**（用户 2026-10-04 二改）。
         //
         // 为什么不再用覆盖层：覆盖层让"打开文件后树就点不到"——新建 / 重命名 / 删除
         // 这些树里的动作在开着文件时根本用不上（用户 2026-10-03 定夺改同屏）。
-        // 为什么是上下而不是左右：本面板在右栏（240–500px），左右分栏两边都会挤成
-        // 不可用；比例默认 0.4（树少、查看器多），降级交给 [SplitPanes] 的既有口径。
+        // 为什么从上下改成左右（口径变化，2026-10-04）：上下分栏把查看器**压扁**
+        // （代码是按行看的，高度比宽度更吃紧），而面板宽度是用户能拖的；目录当左侧栏
+        // 更接近 VS Code，也允许一键收起把整格让给查看器。
+        // 面板太窄（< [_treeSplitDegradeBelow]）时按 [SplitPanes] 的既有口径降级成
+        // **只显示查看器**——此时工具条上写着原因，拖宽右栏目录自己回来。
         Expanded(
-          child: _viewerOpen
-              ? SplitPanes(
-                  axis: Axis.vertical,
-                  ratio: _treeSplitRatio,
-                  minExtent: _treeSplitMinExtent,
-                  degradeBelow: _treeSplitDegradeBelow,
-                  dividerWidth: _paneDividerWidth,
-                  onRatioChanged: (double next) {
-                    setState(() {
-                      _treeSplitRatio = next;
-                    });
-                  },
-                  first: _buildFileTabs(),
-                  second: _buildViewerPane(),
-                  // 太矮时只留查看器：工具条上的「关闭查看器」一键回到树独占
-                  degraded: _buildViewerPane(),
-                )
-              : _buildFileTabs(),
+          child: LayoutBuilder(
+            builder: (BuildContext context, BoxConstraints constraints) {
+              _lastTreeAreaWidth = constraints.maxWidth;
+              if (!_viewerOpen) return _buildFileTabs();
+              if (!_treeWanted) return _buildViewerPane();
+              return SplitPanes(
+                axis: Axis.horizontal,
+                ratio: _treeSplitRatio,
+                minExtent: _treeSplitMinExtent,
+                degradeBelow: _treeSplitDegradeBelow,
+                dividerWidth: _paneDividerWidth,
+                onRatioChanged: (double next) {
+                  setState(() {
+                    _treeSplitRatio = next;
+                  });
+                },
+                first: _buildFileTabs(),
+                second: _buildViewerPane(),
+                // 太窄时只留查看器：工具条上的「显示文件树」把目录叫回来
+                // （用户的意愿不被清掉，拖宽右栏目录自己回来）
+                degraded: _buildViewerPane(),
+              );
+            },
+          ),
         ),
       ],
     );

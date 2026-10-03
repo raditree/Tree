@@ -580,23 +580,30 @@ class FileViewerState extends State<FileViewer> {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      color: Theme.of(context).colorScheme.surface,
-      child: Column(
-        children: [
-          // 顶部标题栏
-          _buildHeader(),
-          Divider(
-            height: 1,
-            thickness: 1,
-            color: Theme.of(context).dividerColor,
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        // 窗格可能被左右分栏与窄面板压到 ~240px：头部动作键要据此收进「更多」菜单。
+        // 这是"这一刻的布局事实"，不是状态（不需要 setState，下一次布局重新算）。
+        _narrowHeader = constraints.maxWidth < 360;
+        return Container(
+          color: Theme.of(context).colorScheme.surface,
+          child: Column(
+            children: [
+              // 顶部标题栏
+              _buildHeader(),
+              Divider(
+                height: 1,
+                thickness: 1,
+                color: Theme.of(context).dividerColor,
+              ),
+              // 非阻断的窗格提示（同文件双开：说明两侧共享同一份缓冲，不挡编辑）
+              if (widget.paneNotice.isNotEmpty) _buildPaneNotice(),
+              // 内容区域
+              Expanded(child: _buildBody()),
+            ],
           ),
-          // 非阻断的窗格提示（同文件双开：说明两侧共享同一份缓冲，不挡编辑）
-          if (widget.paneNotice.isNotEmpty) _buildPaneNotice(),
-          // 内容区域
-          Expanded(child: _buildBody()),
-        ],
-      ),
+        );
+      },
     );
   }
 
@@ -622,6 +629,12 @@ class FileViewerState extends State<FileViewer> {
     );
   }
 
+  /// 这一刻窗格有多窄（< 360px ⇒ 头部动作键收进「更多」菜单）。
+  ///
+  /// 由 [build] 里的 `LayoutBuilder` 在布局时写入：左右分栏 + 窄面板会把单个窗格压到
+  /// ~240px，头部全摆出来必然溢出（黄黑条）。它是布局事实、不是状态，所以不走 setState。
+  bool _narrowHeader = false;
+
   /// 构建顶部标题栏
   ///
   /// 左侧：返回按钮 + 文件名（下行显示路径）；
@@ -639,8 +652,8 @@ class FileViewerState extends State<FileViewer> {
         children: [
           // 返回按钮（先把未保存内容处理掉再关）
           if (widget.onClose != null)
-            IconButton(
-              icon: const Icon(Icons.arrow_back, size: 20),
+            _headerAction(
+              icon: Icons.arrow_back,
               color: cs.onSurfaceVariant,
               tooltip: '返回',
               onPressed: () => unawaited(_handleClose()),
@@ -712,50 +725,104 @@ class FileViewerState extends State<FileViewer> {
           ),
           // 保存（有未保存改动时才可点，键位是 Ctrl+S）
           if (_editor != null)
-            IconButton(
-              icon: Icon(
-                _dirty ? Icons.save : Icons.save_outlined,
-                size: 18,
-              ),
+            _headerAction(
+              icon: _dirty ? Icons.save : Icons.save_outlined,
               color: _dirty ? cs.primary : cs.onSurfaceVariant,
               tooltip: _dirty ? '保存（Ctrl+S）' : '没有未保存的改动',
               onPressed:
                   (_dirty && !_saving) ? () => unawaited(_save()) : null,
             ),
-          // 预览 / 源码切换
-          if (canToggle && !_isLoading && _error == null)
+          // 预览 / 源码切换（窄窗格收进「更多」菜单）
+          if (canToggle && !_isLoading && _error == null && !_narrowHeader)
             Padding(
               padding: const EdgeInsets.only(right: 4),
               child: _buildToggleButtons(),
             ),
-          // 复制按钮
-          if (canCopy)
-            IconButton(
-              icon: const Icon(Icons.copy, size: 18),
+          // 复制按钮（窄窗格收进「更多」菜单）
+          if (canCopy && !_narrowHeader)
+            _headerAction(
+              icon: Icons.copy,
               color: cs.primary,
               tooltip: '复制',
               onPressed: _copyContent,
             ),
-          // 下载按钮
-          IconButton(
-            icon: const Icon(Icons.download, size: 18),
-            color: cs.onSurfaceVariant,
-            tooltip: '下载',
-            onPressed: _downloadFile,
-          ),
+          // 下载按钮（窄窗格收进「更多」菜单）
+          if (!_narrowHeader)
+            _headerAction(
+              icon: Icons.download,
+              color: cs.onSurfaceVariant,
+              tooltip: '下载',
+              onPressed: _downloadFile,
+            ),
           // 刷新按钮
           if (canRefresh)
-            IconButton(
-              icon: const Icon(Icons.refresh, size: 18),
+            _headerAction(
+              icon: Icons.refresh,
               color: cs.onSurfaceVariant,
               tooltip: '刷新（重新读盘，放弃未保存的改动）',
               onPressed:
                   _isLoading ? null : () => unawaited(_loadContent(reload: true)),
             ),
+          // 窄窗格：把刚才收起来的动作放进「更多」，一个都不丢
+          if (_narrowHeader)
+            PopupMenuButton<String>(
+              tooltip: '更多操作',
+              padding: EdgeInsets.zero,
+              icon: Icon(
+                Icons.more_vert,
+                size: 18,
+                color: cs.onSurfaceVariant,
+              ),
+              itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
+                if (canToggle && !_isLoading && _error == null)
+                  PopupMenuItem<String>(
+                    value: 'toggle',
+                    child: Text(_showPreview ? '切到源码' : '切到预览'),
+                  ),
+                if (canCopy)
+                  const PopupMenuItem<String>(
+                    value: 'copy',
+                    child: Text('复制'),
+                  ),
+                const PopupMenuItem<String>(
+                  value: 'download',
+                  child: Text('下载'),
+                ),
+              ],
+              onSelected: (String value) {
+                switch (value) {
+                  case 'toggle':
+                    setState(() => _showPreview = !_showPreview);
+                  case 'copy':
+                    _copyContent();
+                  case 'download':
+                    _downloadFile();
+                }
+              },
+            ),
         ],
       ),
     );
   }
+
+  /// 头部动作键：统一压成紧凑尺寸。
+  ///
+  /// 为什么：默认 `IconButton` 是 48×48，头部最多会摆 6 颗（返回 / 保存 / 复制 / 下载 /
+  /// 刷新 + 切换组）——窗格被左右分栏与窄面板压到 ~240px 时必然溢出（黄黑条）。
+  Widget _headerAction({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback? onPressed,
+    Color? color,
+  }) => IconButton(
+    icon: Icon(icon, size: 18),
+    tooltip: tooltip,
+    color: color,
+    visualDensity: VisualDensity.compact,
+    padding: const EdgeInsets.all(4),
+    constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+    onPressed: onPressed,
+  );
 
   /// 构建预览 / 源码切换按钮组
   Widget _buildToggleButtons() {

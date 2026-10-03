@@ -33,7 +33,8 @@ const double kFileTreeEdgePadding = 6;
 /// 与旧实现（单层列表 + 面包屑进入子目录）的口径变化，见 lib/README.md 不变量 16：
 /// 1. **惰性加载的嵌套树**：目录就地展开 / 折叠，展开时按需拉取该层（不预拉整棵）；
 /// 2. **只显示名字 + 类型图标**（没有"大小 / 修改时间"两列）：那两条信息进悬停 tooltip；
-/// 3. **彩色类型图标**（[fileTreeVisualFor] 纯函数，暖黄文件夹 / 青色 Dart / 蓝色 md …）；
+/// 3. **中性类型图标**（[fileTreeVisualFor] 纯函数给形状、[fileTreeIconColor] 给色）：
+///    图标跟主题走、只有 git 状态上色（用户 2026-10-04 看图定稿，推翻旧的写死色板）；
 /// 4. **缩进引导线 + 箭头（只在目录上，展开顺时针转 90°）**，文件行留等宽空槽；
 /// 5. **整行悬停 / 选中高亮**，键盘 ↑/↓ 在树里移动选中；
 /// 6. **git 状态着色**（整行名字 + 行尾字母，目录聚合子项状态）：核心没有这个端点时静默不着色；
@@ -555,21 +556,27 @@ class _FileTreeState extends State<FileTree> {
       padding: const EdgeInsets.only(left: 8, right: 2),
       child: Row(
         children: <Widget>[
-          const Icon(
-            Icons.folder_open,
+          Icon(
+            Icons.folder_outlined,
             size: 15,
-            color: FileTreePalette.folder,
+            color: fileTreeIconColor(cs),
           ),
           const SizedBox(width: 6),
           Expanded(
             child: Row(
               children: <Widget>[
-                Text(
-                  '根目录',
-                  style: TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    color: cs.onSurface,
+                // 目录在左、这一栏可能被拖得很窄：标题自己也要能缩（否则整行溢出，
+                // 黄黑条会出现在资源管理器头部）。
+                Flexible(
+                  child: Text(
+                    '根目录',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: cs.onSurface,
+                    ),
                   ),
                 ),
                 if (scope.isNotEmpty) ...<Widget>[
@@ -822,7 +829,12 @@ class _FileTreeState extends State<FileTree> {
                             )
                           : null,
                     ),
-                    Icon(visual.icon, size: 14, color: visual.color),
+                    Icon(
+                      visual.icon,
+                      size: 14,
+                      // 图标一律中性（跟主题走）：颜色只留给 git 状态（名字染色 + 行尾字母）
+                      color: fileTreeIconColor(cs),
+                    ),
                     const SizedBox(width: 6),
                     if (renaming)
                       _buildRenameField(node, path)

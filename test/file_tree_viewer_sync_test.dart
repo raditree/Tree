@@ -120,19 +120,23 @@ void main() {
     expect(find.byType(SplitPanes), findsNothing, reason: '没打开文件：树独占，不留空分栏');
 
     await openFile(tester, 'a.txt');
-    expect(find.byType(SplitPanes), findsOneWidget, reason: '打开文件 ⇒ 上下同屏分栏');
-    expect(find.byType(FileTree), findsOneWidget, reason: '查看器打开着，树也必须还在');
+    expect(
+      find.byType(SplitPanes),
+      findsOneWidget,
+      reason: '打开文件 ⇒ 目录在左、查看器在右',
+    );
+    expect(find.byType(FileTree), findsOneWidget, reason: '查看器打开着，目录也必须还在');
     expect(find.byType(FileViewer), findsOneWidget);
     expect(find.text('hello'), findsWidgets, reason: '内容真加载');
 
-    // 分栏方向是上下（树在上、查看器在下）
+    // 分栏方向是左右（目录在左、查看器在右）——用户 2026-10-04：上下分栏把查看器压扁了
     final Rect treeRect = tester.getRect(find.byType(FileTree));
     final Rect viewerRect = tester.getRect(find.byType(FileViewer));
-    expect(treeRect.bottom, lessThanOrEqualTo(viewerRect.top));
+    expect(treeRect.right, lessThanOrEqualTo(viewerRect.left));
     expect(
-      treeRect.height,
-      lessThan(viewerRect.height),
-      reason: '默认比例 0.4：树那一格比查看器小',
+      treeRect.width,
+      lessThan(viewerRect.width),
+      reason: '默认比例 0.3：目录那一栏比查看器窄',
     );
 
     // 查看器工具条上的「关闭查看器」⇒ 回到树独占
@@ -155,7 +159,7 @@ void main() {
     await settleIo(tester);
     expect(panePaths(tester), <String>['a.txt', 'a.txt']);
 
-    // 树在上半格且可点：换的是活动窗格（第二个），第一个不动
+    // 目录在左边且可点：换的是活动窗格（第二个），第一个不动
     await openFile(tester, 'b.md');
     expect(panePaths(tester), <String>['a.txt', 'b.md']);
   });
@@ -226,7 +230,7 @@ void main() {
     expect(
       find.text('inner.txt'),
       findsWidgets,
-      reason: '开着文件时树还展开着（上半格）',
+      reason: '开着文件时目录还展开着（左栏）',
     );
 
     await tester.tap(find.byTooltip('关闭查看器'));
@@ -238,45 +242,74 @@ void main() {
     await pumpPanel(tester);
     await openFile(tester, 'a.txt');
 
-    final double before = tester.getSize(find.byType(FileTree)).height;
-    final double dividerY = tester.getRect(find.byType(FileTree)).bottom + 3;
+    final double before = tester.getSize(find.byType(FileTree)).width;
+    final double dividerX = tester.getRect(find.byType(FileTree)).right + 3;
     await tester.dragFrom(
-      Offset(tester.getRect(find.byType(FileTree)).center.dx, dividerY),
-      const Offset(0, 60),
+      Offset(dividerX, tester.getRect(find.byType(FileTree)).center.dy),
+      const Offset(80, 0),
     );
     await tester.pumpAndSettle();
 
-    final double after = tester.getSize(find.byType(FileTree)).height;
-    expect(after, greaterThan(before), reason: '往下拖 ⇒ 树那一格变高');
-    // 比例记在面板状态：关掉查看器再打开，仍是刚才的比例（不是回到 0.4）
+    final double after = tester.getSize(find.byType(FileTree)).width;
+    expect(after, greaterThan(before), reason: '往右拖 ⇒ 目录那一栏变宽');
+    // 比例记在面板状态：关掉查看器再打开，仍是刚才的比例（不是回到 0.3）
     await tester.tap(find.byTooltip('关闭查看器'));
     await settleIo(tester);
     await openFile(tester, 'a.txt');
     expect(
-      tester.getSize(find.byType(FileTree)).height,
+      tester.getSize(find.byType(FileTree)).width,
       closeTo(after, 1),
       reason: '比例存在面板状态里',
     );
   });
 
-  testWidgets('面板太矮（可用高度 < 200）降级成一次只显示一个：只留查看器', (
+  testWidgets('面板太窄（可用宽度 < 400）降级成只显示查看器，并如实说明原因', (
     WidgetTester tester,
   ) async {
-    await pumpPanel(tester, height: 250);
-    expect(find.byType(FileTree), findsOneWidget);
+    await pumpPanel(tester, width: 300);
+    expect(find.byType(FileTree), findsOneWidget, reason: '没开文件：目录独占');
 
     await openFile(tester, 'a.txt');
     expect(
       find.byType(FileTree),
       findsNothing,
-      reason: '太矮 ⇒ 不挤两格，只显示查看器',
+      reason: '太窄 ⇒ 不挤两栏，只显示查看器',
     );
     expect(find.byType(FileViewer), findsOneWidget);
-    expect(find.byTooltip('关闭查看器'), findsOneWidget, reason: '一键回到树独占');
+    expect(
+      find.byKey(const ValueKey<String>('tree-too-narrow-hint')),
+      findsOneWidget,
+      reason: '如实写出原因，别让用户对着按钮猜',
+    );
 
     await tester.tap(find.byTooltip('关闭查看器'));
     await settleIo(tester);
     expect(find.byType(FileTree), findsOneWidget);
     expect(find.byType(FileViewer), findsNothing);
+  });
+
+  testWidgets('工具条上的收起 / 显示目录：收起后查看器占满，再点回来', (
+    WidgetTester tester,
+  ) async {
+    await pumpPanel(tester);
+    await openFile(tester, 'a.txt');
+    expect(find.byType(FileTree), findsOneWidget);
+    expect(find.byType(SplitPanes), findsOneWidget);
+
+    await tester.tap(find.byTooltip('收起文件树（查看器占满）'));
+    await settleIo(tester);
+    expect(find.byType(FileTree), findsNothing, reason: '收起 = 目录不参与构建');
+    expect(find.byType(SplitPanes), findsNothing, reason: '只剩查看器，不留空分栏');
+    expect(find.byType(FileViewer), findsOneWidget);
+
+    await tester.tap(find.byTooltip('显示文件树（目录在左）'));
+    await settleIo(tester);
+    expect(find.byType(FileTree), findsOneWidget, reason: '一键叫回来');
+    expect(find.byType(SplitPanes), findsOneWidget);
+    expect(
+      find.text('hello'),
+      findsWidgets,
+      reason: '收起再显示不该把查看器内容弄丢',
+    );
   });
 }

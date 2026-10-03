@@ -198,25 +198,26 @@ void main() {
   });
 
   group('类型图标 / 箭头 / 缩进引导线', () {
-    testWidgets('目录暖黄 folder，文件按类型彩色（不是一坨同色）', (
+    testWidgets('目录与文件都用中性图标（跟主题走）：类型靠形状、颜色只留给 git 状态', (
       WidgetTester tester,
     ) async {
       await pumpTree(tester);
+      final Color neutral = schemeAt(tester, 'a.txt').onSurfaceVariant;
       final Icon dirIcon = tester.widget<Icon>(
         find.descendant(
           of: find.byKey(FileTree.rowKey('src')),
-          matching: find.byIcon(Icons.folder),
+          matching: find.byIcon(Icons.folder_outlined),
         ),
       );
-      expect(dirIcon.color, const Color(0xFFDCB67A));
+      expect(dirIcon.color, neutral, reason: '描边文件夹 + 主题中性色（用户看图定稿）');
 
       final Icon mdIcon = tester.widget<Icon>(
         find.descendant(
           of: find.byKey(FileTree.rowKey('b.md')),
-          matching: find.byIcon(Icons.description),
+          matching: find.byIcon(Icons.description_outlined),
         ),
       );
-      expect(mdIcon.color, const Color(0xFF42A5F5));
+      expect(mdIcon.color, neutral, reason: '类型不再有自己的颜色');
 
       final Icon txtIcon = tester.widget<Icon>(
         find.descendant(
@@ -224,10 +225,10 @@ void main() {
           matching: find.byIcon(Icons.text_snippet_outlined),
         ),
       );
-      expect(txtIcon.color, const Color(0xFFB0BEC5));
+      expect(txtIcon.color, neutral);
     });
 
-    testWidgets('箭头只在目录上；展开时顺时针转 90° 且换成 folder_open', (
+    testWidgets('箭头只在目录上；展开时顺时针转 90°（图标形状不变，与 VS Code 一致）', (
       WidgetTester tester,
     ) async {
       await pumpTree(tester);
@@ -252,9 +253,10 @@ void main() {
       expect(
         find.descendant(
           of: find.byKey(FileTree.rowKey('src')),
-          matching: find.byIcon(Icons.folder_open),
+          matching: find.byIcon(Icons.folder_outlined),
         ),
         findsOneWidget,
+        reason: '展开只转箭头，文件夹图标形状不变（VS Code 口径；用户 2026-10-04）',
       );
     });
 
