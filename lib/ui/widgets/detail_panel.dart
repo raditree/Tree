@@ -11,7 +11,16 @@ import 'tool_call_card.dart';
 /// 顶散；右栏本来就是详情区（文件 / MCP 配置 / 模型信息 / 问题回复），完整内容放
 /// 这里既不打断阅读，又能跟消息流并排对照着看。
 class DetailPanel extends StatelessWidget {
-  const DetailPanel({super.key});
+  const DetailPanel({
+    super.key,
+    this.workspaceId = '',
+    this.teamId = '',
+  });
+
+  /// 工作空间 id / 团队 id：透传给 [ToolDetail]，`edit` 要读一次当前文件才能给出
+  /// **带上下文**的变更块（空 = 不去读，退回参数视图）。
+  final String workspaceId;
+  final String teamId;
 
   @override
   Widget build(BuildContext context) {
@@ -41,7 +50,11 @@ class DetailPanel extends StatelessWidget {
   Widget _buildBody(ChatMessage message) {
     switch (message.kind) {
       case 'tool':
-        return ToolDetail(message: message);
+        return ToolDetail(
+          message: message,
+          workspaceId: workspaceId,
+          teamId: teamId,
+        );
       case 'thinking':
         return ThinkingDetail(message: message);
       default:

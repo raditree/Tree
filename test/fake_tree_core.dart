@@ -54,6 +54,9 @@ class FakeTreeCore {
   int contentSize = 5;
   bool contentTruncated = false;
 
+  /// 脚本化"读文件失败"（详情页的变更块读不到文件时给可读原因）
+  bool failContent = false;
+
   static Future<FakeTreeCore> start() async {
     final HttpServer http = await HttpServer.bind(
       InternetAddress.loopbackIPv4,
@@ -136,12 +139,17 @@ class FakeTreeCore {
           payload = gitStatus;
         }
       } else if (path.endsWith('/content')) {
+        if (failContent) {
+          status = 500;
+          payload = <String, dynamic>{'detail': '读文件失败（脚本化）'};
+        } else {
         payload = <String, dynamic>{
           'content': content,
           'path': request.uri.queryParameters['path'] ?? '',
           'size': contentSize,
           if (contentTruncated) 'truncated': true,
         };
+        }
       } else {
         final String dirPath = request.uri.queryParameters['path'] ?? '';
         if (failingDirs.contains(dirPath)) {

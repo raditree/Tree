@@ -317,6 +317,61 @@ void main() {
       expect(DetailSelection.instance.selectedId, 't1');
     });
 
+    testWidgets('写入：详情页摊开**内容本身**（不再只给"内容长度"）', (
+      WidgetTester tester,
+    ) async {
+      await pumpRowWithDetail(
+        tester,
+        toolMessage(
+          name: 'write',
+          args: const <String, dynamic>{
+            'file_path': 'lib/a.dart',
+            'content': 'class A {\n  int x = 1;\n}\n',
+          },
+          result: '已写入 lib/a.dart（24 字节，3 行）',
+        ),
+      );
+
+      await tester.tap(find.byType(ToolCallCard));
+      await tester.pumpAndSettle();
+
+      expect(find.text('变更'), findsOneWidget);
+      expect(
+        hasSelectableText(tester, 'class A {\n  int x = 1;\n}\n'),
+        isTrue,
+        reason: '写入的内容必须能看到（用户 2026-10-04：「写入的具体内容呢？」）',
+      );
+      expect(find.textContaining('3 行'), findsWidgets, reason: '行数摘要照旧给');
+    });
+
+    testWidgets('编辑：拿不到文件时如实说明，并退回「查找 / 替换」参数视图', (
+      WidgetTester tester,
+    ) async {
+      // 这个夹具的 DetailPanel 没有工作空间 ⇒ 读不到文件 ⇒ 不许编一份像 diff 的东西
+      await pumpRowWithDetail(
+        tester,
+        toolMessage(
+          name: 'edit',
+          args: const <String, dynamic>{
+            'file_path': 'lib/a.dart',
+            'old_text': 'old();',
+            'new_text': 'new();',
+          },
+        ),
+      );
+
+      await tester.tap(find.byType(ToolCallCard));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.textContaining('下面只显示调用参数'),
+        findsOneWidget,
+        reason: '拿不到就直说，别让用户以为看到的是 diff',
+      );
+      expect(hasSelectableText(tester, 'old();'), isTrue, reason: '退回参数视图');
+      expect(hasSelectableText(tester, 'new();'), isTrue);
+    });
+
     testWidgets('思考：详情页给完整推理内容', (WidgetTester tester) async {
       await pumpRowWithDetail(
         tester,
@@ -508,7 +563,9 @@ void main() {
     test('FilePanel 多出第 5 个内置页签「详情」', () {
       expect(panel.contains('static const int _builtinTabCount = 5;'), isTrue);
       expect(panel.contains("const Tab(text: '详情')"), isTrue);
-      expect(panel.contains('const DetailPanel()'), isTrue);
+      // 详情页要带上工作空间：edit 的「变更」得读一次当前文件才有上下文（用户 2026-10-04）
+      expect(panel.contains('DetailPanel('), isTrue);
+      expect(panel.contains('workspaceId: widget.workspaceId'), isTrue);
     });
 
     test('选中详情时自动切到该页签，并让右栏收着就展开', () {

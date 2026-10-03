@@ -1,9 +1,12 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
 
+import '../../io/api_service.dart';
 import '../models/message.dart';
 import '../services/detail_selection.dart';
+import '../services/tool_change_view.dart';
 
 /// 一次工具调用的**一行**：图标 + 中文标签 + 关键参数（等宽），行尾给增量 / 转圈 / 箭头。
 ///
@@ -380,6 +383,14 @@ const Color _teal = Color(0xFF0D9488);
 const Color _pink = Color(0xFFDB2777);
 const Color _grey = Color(0xFF64748B);
 
+/// 详情页里"内容 / diff"那几段的等宽样式（与源码视图同一套字体回退）。
+const TextStyle _codeStyle = TextStyle(
+  fontFamily: 'Consolas',
+  fontFamilyFallback: <String>['Cascadia Mono', 'monospace'],
+  fontSize: 11.5,
+  height: 1.35,
+);
+
 /// 按工具名返回定制样式（认不出来给通用扳手）
 ToolStyle toolStyleOf(String name) {
   switch (name) {
@@ -414,21 +425,117 @@ ToolStyle toolStyleOf(String name) {
   }
 }
 
-/// 工具详情的正文：参数表 + **完整**执行结果（右栏「详情」页用）。
+/// 工具详情的正文：参数表 + **变更**（write 的内容 / edit 的 diff）+ **完整**执行结果
+/// （右栏「详情」页用）。
 ///
 /// 不在这里做高度截断：详情页整体可滚动，截断是"中栏一行 + 想细看"的路由要解决的
 /// 问题，一个专门的详情页不该再把内容藏起来。
-class ToolDetail extends StatelessWidget {
-  const ToolDetail({super.key, required this.message});
+///
+/// 「变更」这一段（用户 2026-10-04：「写入的具体内容呢？编辑做成 diff 的输出格式（最好带少量
+/// 几行上下文方便用户阅读）」）：
+/// - `write`：内容直接摊开（[buildWriteContent]，太长时截断并如实标注）；
+/// - `edit`：**带上下文的变更块**（[buildEditDiff]）——`-` 旧行 / `+` 新行 / 无前缀是上下文，
+///   上下文是去**当前磁盘内容**里按这次调用的 `new_text` 定位后取的（所以是"这次改动在文件里
+///   长什么样"，不是把两段原文并排贴出来）；定位不到就如实说明并退回参数视图。
+class ToolDetail extends StatefulWidget {
+  const ToolDetail({
+    super.key,
+    required this.message,
+    this.workspaceId = '',
+    this.teamId = '',
+  });
 
   final ChatMessage message;
+
+  /// 工作空间 id / 团队 id：`edit` 要读一次当前文件才能给出带上下文的 diff。
+  /// 空 = 不去读（直接走参数视图；测试与无上下文场景用）。
+  final String workspaceId;
+  final String teamId;
+
+  @override
+  State<ToolDetail> createState() => _ToolDetailState();
+}
+
+class _ToolDetailState extends State<ToolDetail> {
+  /// 当前磁盘内容（只有 `edit` 会去读；null = 没读 / 还没读完）。
+  String? _fileText;
+
+  /// 正在读文件。
+  bool _loading = false;
+
+  /// 读不到文件的可读原因（读失败才非空）。
+  String? _loadError;
+
+  String get _name => widget.message.toolName ?? '';
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadFileForDiff());
+  }
+
+  @override
+  void didUpdateWidget(covariant ToolDetail oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 详情页跟着中栏的选中项走：换了一条（或同一条从"执行中"变成"完成"）就重算
+    if (oldWidget.message.id != widget.message.id) {
+      _fileText = null;
+      _loadError = null;
+      unawaited(_loadFileForDiff());
+    }
+  }
+
+  /// `edit`：读一次当前文件内容，好把这次替换放回上下文里显示。
+  Future<void> _loadFileForDiff() async {
+    if (_name != 'edit') return;
+    final Map<String, dynamic> args = widget.message.toolArguments ?? const <String, dynamic>{};
+    final String path = (args['file_path'] ?? '').toString();
+    if (widget.workspaceId.isEmpty || path.isEmpty) return;
+    setState(() => _loading = true);
+    try {
+      final String text = await ApiService.getFileContent(
+        widget.workspaceId,
+        path,
+        teamId: widget.teamId,
+      );
+      if (!mounted) return;
+      setState(() {
+        _fileText = text;
+        _loading = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _loadError = '读不到这个文件（可能已改名 / 删除，或工作空间不可用）：$error';
+        _loading = false;
+      });
+    }
+  }
+
+  /// 这次 `edit` 的变更块（拿不到就是 null：读不到、定位不到、或不是 edit）。
+  ToolDiffHunk? _hunk() {
+    if (_name != 'edit' || _fileText == null) return null;
+    final Map<String, dynamic> args = widget.message.toolArguments ?? const <String, dynamic>{};
+    return buildEditDiff(
+      fileText: _fileText!,
+      oldText: (args['old_text'] ?? '').toString(),
+      newText: (args['new_text'] ?? '').toString(),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     final ColorScheme cs = Theme.of(context).colorScheme;
-    final ChatMessage m = message;
-    final String name = m.toolName ?? '';
-    final List<Widget> params = _buildParams(context, name, m.toolArguments);
+    final ChatMessage m = widget.message;
+    final String name = _name;
+    final ToolDiffHunk? hunk = _hunk();
+    final List<Widget> params = _buildParams(
+      context,
+      name,
+      m.toolArguments,
+      hasDiff: hunk != null,
+    );
+    final Widget? change = _buildChange(context, name, hunk);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
@@ -437,6 +544,12 @@ class ToolDetail extends StatelessWidget {
           _sectionLabel(context, '调用参数'),
           const SizedBox(height: 6),
           ...params,
+          const SizedBox(height: 16),
+        ],
+        if (change != null) ...<Widget>[
+          _sectionLabel(context, '变更'),
+          const SizedBox(height: 6),
+          change,
           const SizedBox(height: 16),
         ],
         _sectionLabel(context, '执行结果'),
@@ -466,21 +579,27 @@ class ToolDetail extends StatelessWidget {
   List<Widget> _buildParams(
     BuildContext context,
     String name,
-    Map<String, dynamic>? rawArgs,
-  ) {
+    Map<String, dynamic>? rawArgs, {
+    bool hasDiff = false,
+  }) {
     final Map<String, dynamic> args = rawArgs ?? <String, dynamic>{};
     String arg(String key) => (args[key] ?? '').toString();
     switch (name) {
       case 'read':
         return <Widget>[_paramRow(context, '文件', arg('file_path'))];
       case 'write':
-        final int length = arg('content').length;
+        // 内容本身在「变更」一段里摊开了，这里只留文件与体量摘要
         return <Widget>[
           _paramRow(context, '文件', arg('file_path')),
-          _paramRow(context, '内容长度', '$length 字符'),
+          _paramRow(context, '内容长度', '${arg('content').length} 字符'),
         ];
       case 'edit':
-        // 键名与核心 edit schema 对齐（builtin_tools.dart:176-194）
+        // 键名与核心 edit schema 对齐（builtin_tools.dart:176-194）。
+        // 有变更块时**不再并列「查找 / 替换」两段原文**（那是"两段碎片"，读不出它在文件哪儿）；
+        // 定位不到（文件后来又被改过 / 读不到）才退回这两行，并如实说明。
+        if (hasDiff) {
+          return <Widget>[_paramRow(context, '文件', arg('file_path'))];
+        }
         return <Widget>[
           _paramRow(context, '文件', arg('file_path')),
           _paramRow(context, '查找', _truncate(arg('old_text'), 400)),
@@ -643,6 +762,160 @@ class ToolDetail extends StatelessWidget {
           height: 1.5,
         ),
       ),
+    );
+  }
+
+  // ── 「变更」一段：write 的内容 / edit 的带上下文 diff ─────────────────
+
+  /// 按工具类型决定要不要给「变更」一段（返回 null = 这个工具没有变更可看）。
+  Widget? _buildChange(BuildContext context, String name, ToolDiffHunk? hunk) {
+    if (name == 'write') {
+      final Map<String, dynamic> args =
+          widget.message.toolArguments ?? const <String, dynamic>{};
+      final String content = (args['content'] ?? '').toString();
+      if (content.isEmpty) return null;
+      return _buildWriteBlock(context, buildWriteContent(content));
+    }
+    if (name != 'edit') return null;
+    if (_loading) {
+      return Row(
+        children: <Widget>[
+          const SizedBox(
+            width: 12,
+            height: 12,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            '正在读文件，准备带上下文的变更块…',
+            style: TextStyle(
+              fontSize: 12,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      );
+    }
+    if (hunk != null) return _buildDiffBlock(context, hunk);
+    // 拿不到就如实说：绝不把「查找 / 替换」两段原文伪装成 diff
+    final String reason = _loadError ??
+        '文件里已找不到这段改动（可能之后又被改过），下面只显示调用参数。';
+    return Text(
+      reason,
+      style: TextStyle(
+        fontSize: 12,
+        color: Theme.of(context).colorScheme.onSurfaceVariant,
+      ),
+    );
+  }
+
+  /// write：把写进去的内容摊开（太长时截断并如实标注）。
+  Widget _buildWriteBlock(BuildContext context, WriteContentView view) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final String note = view.truncated
+        ? '（太长，下面只显示前面一段；全文去右栏「文件」页打开）'
+        : '';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          '${view.totalLines} 行 · ${view.totalChars} 字符$note',
+          style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+        ),
+        const SizedBox(height: 4),
+        _codeContainer(
+          context,
+          SelectableText(view.text, style: _codeStyle),
+        ),
+      ],
+    );
+  }
+
+  /// edit：带上下文的变更块（`-` 旧 / `+` 新 / 无前缀是上下文）。
+  Widget _buildDiffBlock(BuildContext context, ToolDiffHunk hunk) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final String note = hunk.truncated ? ' · 只显示前 ${hunk.lines.length} 行' : '';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          '${hunk.header}$note',
+          style: TextStyle(
+            fontSize: 11,
+            color: cs.onSurfaceVariant,
+            fontFamily: 'monospace',
+          ),
+        ),
+        const SizedBox(height: 4),
+        _codeContainer(
+          context,
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              for (final ToolDiffLine line in hunk.lines)
+                _buildDiffRow(context, line),
+            ],
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          '- ${hunk.removedCount} 行 · + ${hunk.addedCount} 行（上下文取自磁盘当前内容）',
+          style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+        ),
+      ],
+    );
+  }
+
+  /// diff 的一行：行首 marker + 正文；旧行红、新行绿、上下文跟随主题。
+  Widget _buildDiffRow(BuildContext context, ToolDiffLine line) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final (Color fg, Color? bg) = switch (line.kind) {
+      ToolDiffKind.removed => (
+        const Color(0xFFE05252),
+        const Color(0x14E05252),
+      ),
+      ToolDiffKind.added => (
+        const Color(0xFF3FB950),
+        const Color(0x143FB950),
+      ),
+      ToolDiffKind.context => (cs.onSurfaceVariant, null),
+    };
+    return Container(
+      color: bg,
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          SizedBox(
+            width: 10,
+            child: Text(
+              line.marker,
+              style: _codeStyle.copyWith(color: fg),
+            ),
+          ),
+          Expanded(
+            child: SelectableText(
+              line.text.isEmpty ? ' ' : line.text,
+              style: _codeStyle.copyWith(color: fg),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 等宽内容块（write 的内容 / edit 的 diff 共用一层皮）
+  Widget _codeContainer(BuildContext context, Widget child) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerLowest,
+        border: Border.all(color: cs.outlineVariant),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: child,
     );
   }
 

@@ -662,7 +662,11 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
                     onNavigateToQuestion: widget.onNavigateToQuestion,
                   ),
                   // 详情页：中栏点中的工具调用 / 思考完整摊开（见 DetailPanel）
-                  const DetailPanel(),
+                  // 带上工作空间：edit 的「变更」要读一次当前文件才有上下文
+                  DetailPanel(
+                    workspaceId: widget.workspaceId,
+                    teamId: widget.teamId ?? '',
+                  ),
                   // Q12：插件面板 Tab（追加在既有 Tab 之后）
                   for (final PluginUiSlot slot in _pluginPanels)
                     PluginPanelSlotView(
