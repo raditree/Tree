@@ -131,10 +131,10 @@ class TerminalHooks {
     // 这是进程创建的瞬时失败，不是命令本身的问题，因此不当作工具错误上报。
     Process process;
     try {
-      process = await _spawn(io.root, scriptPath, windows);
+      process = await _spawn(io.root, scriptPath, windows, log: log);
     } on ProcessException {
       await Future<void>.delayed(const Duration(milliseconds: 200));
-      process = await _spawn(io.root, scriptPath, windows);
+      process = await _spawn(io.root, scriptPath, windows, log: log);
     }
     // 同 LocalWorkspaceIO.exec：stdin 也立刻关掉。后台任务不该跟用户要输入，而"等输入"
     // 的命令在没有超时的前提下会一直挂着（2026-10-02 裸 echo 事故的同型问题）。
@@ -162,14 +162,20 @@ class TerminalHooks {
   static Future<Process> _spawn(
     String workingDirectory,
     String scriptPath,
-    bool windows,
-  ) => Process.start(
-    // 与同步执行同一个 shell（Windows 上是 PowerShell / cmd 回退），参数由 Shell 给出
-    Shell.executable,
-    Shell.argsForScript(scriptPath),
-    workingDirectory: workingDirectory,
-    runInShell: false,
-  );
+    bool windows, {
+    void Function(String message)? log,
+  }) async {
+    // 与同步执行同一个 shell（Windows 上是 PowerShell / cmd 回退），参数由 Shell 给出；
+    // 环境也用同一份**按登录口径重建**的（见 tree_local_exec 的 windows_environment.dart）——
+    // 前台 exec 与后台 hook 必须同口径，否则同一条命令前后台看到的工具不一样。
+    return Process.start(
+      Shell.executable,
+      Shell.argsForScript(scriptPath),
+      workingDirectory: workingDirectory,
+      runInShell: false,
+      environment: await cachedLoginEnvironment(log: log),
+    );
+  }
 
   /// 把一个**本机仍在运行**的命令转成后台任务（terminal 的软超时 → hook 模式）。
   ///

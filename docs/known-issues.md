@@ -1059,12 +1059,61 @@ reparse point 就是遍历不了；**预置的**（由受信任上下文造的�
 2. **构建放你自己的终端里跑**（已验证可用），或让构建进程以管理员身份起；
 3. **不要把工作区放在"用户可写位置"再指望 reparse point**（这一条是环境设计层面的取舍）。
 
-**给应用侧的提醒（用户 2026-10-03：「别忘了模拟终端啊」）**：终端**没法**绕过操作系统的安全缓解，
-但可以把这种失败**讲清楚**——真要做，合适的形式是"终端里命令失败且输出命中
-`不受信任的装入点` / `untrusted mount point` 时，补一句可读指引（去管理员终端先跑一次 / 见 #16）"。
-本轮**未实现**（它属于"防呆提示"而非功能缺陷，等用户点头再定）。
+**给应用侧的处理（用户 2026-10-03：「别忘了模拟终端啊」→ 已实现）**：终端**没法**绕过操作系统的安全缓解，
+但可以把这种失败**讲清楚**——`lib/ui/services/terminal_output_notice.dart` 认得这句
+`不受信任的装入点` / `untrusted mount point` / `无法遍历该路径`，命中的那一帧由终端弹一次可读指引
+（"先在管理员终端跑一次 flutter pub get，详见 docs/known-issues.md #16"）。跨帧稳健（留字节尾巴，
+关键字被切断、甚至切在 UTF-8 多字节字符中间也认得出）、**每会话只提示一次**、重开终端重置；
+用例见 `test/terminal_output_notice_test.dart` 与 `test/terminal_panel_test.dart`。
 
 **状态**：**环境侧、不是代码缺陷**（2026-10-03）。`flutter test` / `flutter analyze` / 真机 UI 行为都不受影响；
 受影响的只有"在 Tree 的终端里执行依赖 reparse point 的构建"这一类操作。
+
+## #17 SSH 的远端命令环境 ≠ 用户 ssh 登录环境（agent 看不到 nvcc 这类工具）
+
+**现象**（用户 2026-10-03）：「我发现 SSH 下也有类似情况（上次我有 nvcc，另一个 agent 没有）」。
+
+**根因**：工具命令走 SSH 的 **exec 通道**（`DartSshTransport.run` → `client.runWithResult(cmd)`），
+按 sshd 的语义那是**非交互、非登录** shell（`$SHELL -c '<cmd>'`）——`/etc/profile`、`~/.profile` 里
+"登录时才加载"的 PATH（CUDA / conda / 自建工具链）全都不在 ⇒ agent 看不到用户 ssh 进来时明明有的
+`nvcc`。而**交互终端**（Ctrl+J 的远端分支）走 `shell(pty:)`，本来就是**登录 shell**，所以那边看起来是对的
+——"同一个远端，两条路两个环境"，这正是用户觉得"行为有分歧"的地方。
+
+**修复**（断言见 `packages/tree_local_exec/README.md` 不变量 15）：远端命令**默认套一层登录外壳**
+`bash -lc '<cmd>'`；`bash` 不在退 `sh -lc`；都探测失败就**原样发**（与旧行为完全一致）并留日志；
+**一次连接只探测一次**并缓存；模板可用 agent yaml 的 `ssh.login_shell` 替换（必须带 `{cmd}` 占位）或写空串**关掉**，
+非法模板只跳过那一档；命令一律 **POSIX 单引号转义**。配套把 `resolveRemoteRoot` 改成**带标记**
+（`printf __TREE_HOME__%s "$HOME"`）取远端 HOME——登录外壳会读 profile，欢迎语不再污染解析。
+
+**验证**：`test/ssh_login_shell_test.dart`（9 条：单引号穿壳 / 模板渲染与非法模板跳过 /
+`bash → sh → 原样发` 的回退 / 空串关掉 / 结论缓存 / reset）；`test/ssh_workspace_io_test.dart` 的
+`resolveRemoteRoot` 组（含新命令形状）；`tree_local_exec` 全量通过；`tree_core` 1005 条通过。
+
+**遗留**：**真机 sshd 未验证**（本机没有可连的远端，与 #12 同一限制）：`bash` / `sh` 探测与登录外壳
+在真实远端上的表现需要一次真机确认（门控用例 `TREE_SSH_TEST_*` 目前只覆盖 SFTP + exec，**没有**覆盖
+这条包装）；profile 若往 stdout 打欢迎语，那些字会混进命令输出（真嫌吵就 `ssh.login_shell: ''` 关掉）。
+
+## #18 Tree 的终端/工具继承 core 的环境，与"用户自己的终端"不同口径
+
+**现象**（用户 2026-10-03，与 #16 同一句话引出来的另一半）：同一条命令在 Tree 的终端与用户自己的终端里
+行为不同。实测两份具体差异：agent 的 shell **多了**
+`C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.6.0_x64__8wekyb3d8bbwe`（连带把 shell 选成了
+**MSIX 打包版 pwsh**），**少了** `C:\Program Files\GitHub CLI\`（于是 agent 里 `gh` 不见了）。
+
+**根因**：core 进程"被谁拉起来就继承谁的环境"，而本地 exec / 本地 PTY / 后台 hook 脚本全都继承 core 的那一份；
+用户自己的终端拿的是**登录时的环境**（机器级 + 用户级注册表按 Windows 的规则合成）。
+
+**修复**（断言见 `packages/tree_local_exec/README.md` 不变量 14）：按登录口径重建环境
+（`HKLM\…\Session Manager\Environment` + `HKCU\Environment`；`Path` = 机器级 + `;` + 用户级；
+同名用户级覆盖机器级；`REG_EXPAND_SZ` 按合成后的表展开，查找表带上继承值；**注册表里没有的继承变量原样保留**；
+任何一步失败**整体退回继承**并留痕），接线四处：本地 `exec`、`git`、本地 PTY、后台 hook 脚本。
+
+**验证**：真注册表实跑对比（重建后那条 WindowsApps 消失、`GitHub CLI` 回来、无残留未展开的 `%` 段）
++ 13 条纯函数用例；`tree_core` 1005 条 / `tree_local_exec` 全量通过。
+
+**遗留**：本条只覆盖"环境变量"这一半；**reparse point 那条**（#16）是操作系统的安全缓解，
+环境重建管不了（实测换 5.1、换 cmd、换不继承任何上下文的 WMI 进程都一样跟随不了）。
+另外 MCP 服务与插件宿主仍继承 core 的环境——它们是"工具进程"不是"用户的终端"，本次没动
+（避免顺手改坏既有配置），若也要对齐，按同一处 builder 接上即可。
 
 

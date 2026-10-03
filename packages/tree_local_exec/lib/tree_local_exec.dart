@@ -14,9 +14,11 @@ export 'src/git_output.dart';
 export 'src/local_workspace_io.dart';
 export 'src/pty/pty_session.dart';
 export 'src/ssh_liveness.dart';
+export 'src/ssh_login_shell.dart';
 export 'src/ssh_shell_channel.dart';
 export 'src/ssh_workspace_io.dart';
 export 'src/shell.dart';
+export 'src/windows_environment.dart';
 export 'src/workspace_io.dart';
 
 /// 本机执行后端分组（本地 / SSH 均已实现：SSH 走 dartssh2 + SFTP/exec）。

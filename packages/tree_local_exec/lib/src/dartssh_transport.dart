@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:dartssh2/dartssh2.dart';
 
 import 'local_workspace_io.dart';
+import 'ssh_login_shell.dart';
 import 'ssh_liveness.dart';
 import 'ssh_shell_channel.dart';
 import 'ssh_workspace_io.dart';
@@ -29,7 +30,39 @@ import 'ssh_workspace_io.dart';
 ///   一个间隔**——窗口内没等到回包（成功/失败回包都算回）就记一次丢失，连续
 ///   [SshLiveness.maxMisses] 次判失活。丢的只是"判据"，不是时间本身。
 class DartSshTransport implements SshTransport {
-  DartSshTransport._(this._client, this._sftp, this._liveness);
+  DartSshTransport._(
+    this._client,
+    this._sftp,
+    this._liveness,
+    this._loginShellTemplate,
+    this._log,
+  );
+
+  /// 用户配的登录外壳模板（null = 内置候选；`''` = 关；非空 = 自定义）。
+  final String? _loginShellTemplate;
+
+  final void Function(String message)? _log;
+
+  /// 登录外壳包装器（**懒**：探测要借 [_client] 跑一条远端命令，而它在构造之后才可用）。
+  ///
+  /// 见 `ssh_login_shell.dart`：工具命令走的是 exec 通道（非登录 shell），
+  /// 不包一层登录外壳就看不到 `/etc/profile`、`~/.profile` 里的 PATH（用户实测：`nvcc`）。
+  late final SshLoginShell _loginShell = SshLoginShell(
+    template: _loginShellTemplate,
+    log: _log,
+    prober: _probeLoginShell,
+  );
+
+  /// 探测一次"远端跑不跑得动这个登录外壳"（走原始 exec，不能自套娃）。
+  Future<bool> _probeLoginShell(String command) async {
+    try {
+      final SSHRunResult result = await _client.runWithResult(command);
+      return (result.exitCode ?? -1) == 0;
+    } catch (error) {
+      _log?.call('探测登录外壳失败：$error');
+      return false;
+    }
+  }
 
   /// 建立连接。
   ///
@@ -46,6 +79,8 @@ class DartSshTransport implements SshTransport {
     String keyPassphrase = '',
     Duration heartbeatInterval = SshLiveness.defaultInterval,
     int maxMissedHeartbeats = SshLiveness.defaultMaxMisses,
+    String? loginShell,
+    void Function(String message)? log,
   }) async {
     List<SSHKeyPair>? identities;
     if (keyPath.isNotEmpty) {
@@ -80,6 +115,8 @@ class DartSshTransport implements SshTransport {
       client,
       sftp,
       SshLiveness(interval: heartbeatInterval, maxMisses: maxMissedHeartbeats),
+      loginShell,
+      log,
     );
     transport._startHeartbeat();
     return transport;
@@ -347,8 +384,13 @@ class DartSshTransport implements SshTransport {
     // M9 1.1：[timeout] 不再用于终止命令——远端命令跑多久就等多久（没有静态总时长
     // 上限）。真正会打断它的是心跳判据：连续丢心跳由 SshWorkspaceIO 的活性守卫
     // 让在途操作显式失败；链路断开时 runWithResult 自己也会抛错。
+    //
+    // 默认再包一层**登录外壳**（见 ssh_login_shell.dart）：exec 通道是非登录 shell，
+    // 不包就看得到用户 ssh 进来时有的工具（`nvcc` 那类 profile PATH）。探测失败会逐级
+    // 回退到"原样发"，所以这里不需要 try/catch 兜底。
+    final String wire = await _loginShell.wrap(command);
     try {
-      final SSHRunResult result = await _client.runWithResult(command);
+      final SSHRunResult result = await _client.runWithResult(wire);
       return SshExecResult(
         exitCode: result.exitCode ?? -1,
         stdout: LocalWorkspaceIO.decodeBytes(result.stdout),

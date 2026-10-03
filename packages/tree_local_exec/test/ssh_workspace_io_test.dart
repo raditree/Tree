@@ -381,7 +381,7 @@ void main() {
       expect(await resolveRemoteRoot(t, '~'), '/home/u');
       expect(await resolveRemoteRoot(t, '~/proj/'), '/home/u/proj');
       expect(await resolveRemoteRoot(t, 'proj'), '/home/u/proj');
-      expect(t.commands.first, r'printf %s "$HOME"');
+      expect(t.commands.first, r'printf __TREE_HOME__%s "$HOME"');
       expect(
         t.commands.first,
         isNot(contains('~')),

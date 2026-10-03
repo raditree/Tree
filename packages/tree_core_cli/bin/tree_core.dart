@@ -268,6 +268,11 @@ Future<void> main(List<String> args) async {
         keyPassphrase: config.keyPassphrase,
         heartbeatInterval: settings.heartbeatInterval,
         maxMissedHeartbeats: settings.missedHeartbeatLimit,
+        // 远端命令默认套一层**登录外壳**（`bash -lc`）：exec 通道是非登录 shell，
+        // 不套就看不到用户 ssh 进来时有的工具（nvcc / conda 那类 profile PATH）。
+        // agent yaml 里 `ssh.login_shell` 可换模板或写空串关掉。
+        loginShell: config.loginShell,
+        log: (String message) => stderr.writeln('[core:tool] $message'),
       );
       final String root = await resolveRemoteRoot(transport, config.root);
       stderr.writeln('[core:tool] SSH 已连接 ${config.redacted()} root=$root');

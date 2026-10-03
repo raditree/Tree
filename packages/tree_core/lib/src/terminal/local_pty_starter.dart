@@ -25,6 +25,10 @@ class LocalPtyStarter {
       workingDirectory: workingDirectory,
       columns: columns,
       rows: rows,
+      // 环境按**登录口径**重建（Windows：注册表机器级+用户级；失败整体退回继承）：
+      // 用户自己的终端就是这么来的，Tree 的终端不该继承 core 被谁拉起时的那一份
+      // （实测会少用户在系统里配的 PATH 项、多启动方注入的项）。
+      environment: await cachedLoginEnvironment(log: log),
       log: log,
     );
     return _LocalPtyProcess(session);

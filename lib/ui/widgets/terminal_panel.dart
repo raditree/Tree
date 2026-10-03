@@ -8,6 +8,7 @@ import 'package:tree_protocol/tree_protocol.dart';
 
 import '../../io/websocket_service.dart';
 import '../services/terminal_ime_input.dart';
+import '../services/terminal_output_notice.dart';
 import '../services/terminal_selection.dart';
 import '../services/terminal_send_command.dart';
 import '../services/vt_screen.dart';
@@ -69,6 +70,10 @@ class TerminalPanelState extends State<TerminalPanel> {
 
   /// `#TSend` 的按键拦截（以 `#` 开头、还可能是 `#TSend` 的那一行不发 shell）
   final TerminalSendInterceptor _send = TerminalSendInterceptor();
+
+  /// 输出里的**可读防呆**（"不受信任的装入点"→ 一句能照做的指引，见
+  /// [TerminalNoticeWatcher] 与 docs/known-issues.md #16）。跨帧、每会话只提示一次。
+  final TerminalNoticeWatcher _notice = TerminalNoticeWatcher();
 
   /// **输入法通道**（中文 / 日文靠它；真机现象：终端里打不出中文，见
   /// [TerminalTextInputClient]）。它只在终端有焦点时打开连接。
@@ -157,9 +162,13 @@ class TerminalPanelState extends State<TerminalPanel> {
       case TerminalOutboundType.output:
         final String bytes = (frame[TerminalFrame.bytes] ?? '').toString();
         if (bytes.isEmpty) break;
-        _screen.write(base64Decode(bytes));
+        final List<int> chunk = base64Decode(bytes);
+        _screen.write(chunk);
         _flushResponses();
         _followHistory();
+        // 顺手看一眼有没有"不受信任的装入点"这类用户看不懂的失败（命中就弹一次指引）
+        final String? notice = _notice.accept(chunk);
+        if (notice != null) _notify(notice);
         setState(() {}); // 一帧一次重绘：同一帧里的多次 setState 会被合并
         break;
       case TerminalOutboundType.exit:
@@ -391,6 +400,7 @@ class TerminalPanelState extends State<TerminalPanel> {
       _scrollOffset = 0;
       _historyPushedSeen = 0;
       _selection = null; // 选区锚在旧屏幕上，换会话就作废
+      _notice.reset(); // 新会话重新允许提示一次（同一个 shell 反复出现同一句）
       _send.clear(); // 旧会话里扣住的那半截 `#T` 不带进新会话
     });
     _open();

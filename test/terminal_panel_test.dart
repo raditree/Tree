@@ -552,6 +552,41 @@ void main() {
     expect(state.debugSelection, isNull);
   });
 
+  testWidgets('输出里出现"不受信任的装入点"⇒ 弹一次可读指引（不再让用户对着原文发愣）',
+      (WidgetTester tester) async {
+    await pumpPanel(tester);
+    final String id = openedId(tester);
+    // 分两帧喂，且切在中文多字节字符中间：跨帧也必须认出来
+    final List<int> whole = utf8.encode(
+      'CMake Error: 无法遍历该路径，因为它包含不受信任的装入点 : x',
+    );
+    for (final List<int> piece in <List<int>>[whole.sublist(0, 5), whole.sublist(5)]) {
+      await emit(tester, <String, dynamic>{
+        'type': TerminalOutboundType.output,
+        TerminalFrame.terminalId: id,
+        TerminalFrame.bytes: base64Encode(piece),
+      });
+    }
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('不受信任的装入点'), findsWidgets);
+    expect(find.textContaining('known-issues.md #16'), findsWidgets);
+
+    // 等第一条 SnackBar 自己消失（3s），再喂一次同样的输出：不该再弹（每会话一次）
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('known-issues.md #16'), findsNothing,
+        reason: '前一条提示该自己消失了，否则下面的断言没有意义');
+    await emit(tester, <String, dynamic>{
+      'type': TerminalOutboundType.output,
+      TerminalFrame.terminalId: id,
+      TerminalFrame.bytes: base64Encode(whole),
+    });
+    await tester.pumpAndSettle();
+    expect(find.textContaining('known-issues.md #16'), findsNothing,
+        reason: '同一个会话里第二次出现不该再弹');
+  });
+
   testWidgets('把光标那一格报给平台（IME 候选窗才贴着光标，不再用别处的陈旧矩形）',
       (WidgetTester tester) async {
     final List<MethodCall> calls = <MethodCall>[];

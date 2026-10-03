@@ -8,6 +8,7 @@ import 'package:path/path.dart' as p;
 import 'ansi_code_page.dart';
 import 'git_output.dart';
 import 'shell.dart';
+import 'windows_environment.dart';
 import 'workspace_io.dart';
 
 /// 工具层把 IO 失败翻成"模型可读的错误结果"时使用的异常。
@@ -108,7 +109,12 @@ class RunningLocalExec {
 /// 以及 `..` 越界。注意符号链接可以绕过（本机单用户场景接受该风险，已在文档中
 /// 记录；真要防需要 O_NOFOLLOW 级别的处理，Dart 标准库不提供）。
 class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
-  LocalWorkspaceIO(this.root, {this.maxReadBytes = 512 * 1024});
+  LocalWorkspaceIO(this.root, {this.maxReadBytes = 512 * 1024, this.log});
+
+  /// 可选日志（例如"按登录口径重建环境失败、退回继承"这类回退原因）。
+  ///
+  /// 不强制传：调用方不关心就别传，但**回退原因要留痕**——传了才写。
+  final void Function(String message)? log;
 
   @override
   final String root;
@@ -521,6 +527,9 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
       Shell.argsFor(trimmed),
       workingDirectory: root,
       runInShell: false,
+      // 环境按**登录口径**重建（见 windows_environment.dart）：纯继承 core 的环境会让
+      // agent 的 shell 与用户自己的终端对不上（少用户在系统里配的 PATH 项、多启动方注入的项）。
+      environment: await cachedLoginEnvironment(log: log),
     );
     // 子进程的 stdin 立刻关掉。
     //
@@ -707,6 +716,8 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
         workingDirectory: root,
         stdoutEncoding: utf8,
         stderrEncoding: utf8,
+        // 与 exec 同一份登录环境（git 的 hooks / 凭据助手也吃 PATH 与环境变量）
+        environment: await cachedLoginEnvironment(log: log),
       );
     } on ProcessException {
       return null;

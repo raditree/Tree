@@ -186,6 +186,13 @@
     先补发缓存）；`#TSend` 单独一行会提示"后面要跟内容"，而不是静默吞掉用户那一行。
     终端的边界（VT 解析器没实现的部分、远端分支**没有真机 sshd 验证过**）见
     [docs/known-issues.md](../docs/known-issues.md) #12。
+    终端还会把操作系统那句"用户没法照做"的话翻成指引（用户 2026-10-03：「别忘了模拟终端啊」）：
+    输出命中 `不受信任的装入点` / `untrusted mount point` / `无法遍历该路径` 时弹一次可读提示
+    （"先去管理员终端跑一次 flutter pub get，见 [docs/known-issues.md](../docs/known-issues.md) #16"）——
+    跨帧稳健（留**字节尾巴**，关键字被切断、甚至切在 UTF-8 多字节字符中间也认得出）、
+    **每会话只提示一次**、重开终端重置（[ui/services/terminal_output_notice.dart](ui/services/terminal_output_notice.dart)）。
+    本地终端与本地工具命令的**环境**由核心按"登录口径"重建（见 [tree_local_exec 不变量 14](../packages/tree_local_exec/README.md)）：
+    Tree 的终端不该继承 core 被谁拉起时的那一份。
 
 15. **运行模式与工作目录是团队级的：成员默认继承团队 TOP**（[ui/services/team_scope_view.dart](ui/services/team_scope_view.dart)，
     [test/team_scope_view_test.dart](../test/team_scope_view_test.dart) 强制；核心口径见

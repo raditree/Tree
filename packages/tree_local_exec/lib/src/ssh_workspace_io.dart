@@ -159,11 +159,30 @@ Future<String> resolveRemoteRoot(
   final String candidate = raw.isEmpty ? fallback : raw;
   if (candidate.startsWith('/')) return p.posix.normalize(candidate);
   final SshExecResult result = await transport.liveness.guard(
-    () => transport.run(r'printf %s "$HOME"'),
+    // 带**标记**取 $HOME：登录外壳（见 ssh_login_shell.dart）会读远端 profile，
+    // profile 里若往 stdout 打欢迎语，整段 trim 出来的 home 就被污染了。
+    () => transport.run(r'printf __TREE_HOME__%s "$HOME"'),
   );
-  final String home = result.stdout.trim();
+  final int markerAt = result.stdout.lastIndexOf('__TREE_HOME__');
+  final String home;
+  if (markerAt >= 0) {
+    home = result.stdout
+        .substring(markerAt + '__TREE_HOME__'.length)
+        .split(RegExp(r'\s'))
+        .first
+        .trim();
+  } else {
+    // 没有标记（老实现 / 假实现直接给 HOME）时退回"最后一行非空"：
+    // profile 的欢迎语一般各占一行，最后一行仍是 HOME。
+    final List<String> lines = result.stdout
+        .split('\n')
+        .map((String line) => line.trim())
+        .where((String line) => line.isNotEmpty)
+        .toList();
+    home = lines.isEmpty ? '' : lines.last;
+  }
   if (result.exitCode != 0 || !home.startsWith('/')) {
-    throw WorkspaceIoException('无法解析远端 HOME（exit=${result.exitCode}，输出：$home）');
+    throw WorkspaceIoException('无法解析远端 HOME（exit=${result.exitCode}，输出：${result.stdout.trim()}）');
   }
   final String joined = candidate == '~'
       ? home

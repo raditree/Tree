@@ -338,6 +338,17 @@
   resize 清选区）；`Ctrl+Shift+C` / `Ctrl+Insert` / **有选中时的 `Ctrl+C`**（没选中时仍是 `0x03` = SIGINT）复制；
   `Ctrl+V` / `Shift+Insert` / 右键菜单粘贴（`\n` → `\r`，应用开了 `?2004` 时包 `ESC[200~ … ESC[201~`）；
   粘贴**不过** `#TSend` 拦截层。
+- **本地/远端执行环境对齐"用户自己的终端"；终端会翻译"不受信任的装入点"**
+  （[tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 14/15、[lib/README.md](lib/README.md) 不变量 14、
+  `docs/known-issues.md` #16/#17/#18，**用户断言 2026-10-03**：「Tree 的 terminal 和我（用户）直接在本机使用的 terminal
+  在行为上有分歧」「SSH 下也有类似情况（上次我有 nvcc，另一个 agent 没有）」）：① **本地**执行 / 本地 PTY / 后台 hook
+  的环境按**登录口径重建**（机器级 `HKLM\…\Session Manager\Environment` + 用户级 `HKCU\Environment`；`Path` 机器级在前，
+  其余同名用户级覆盖；`REG_EXPAND_SZ` 按合成后的表展开；**注册表没有的继承变量原样保留**；任一步失败**整体退回继承**）
+  ——纯继承会让 agent 少用户配的 PATH 项、多启动方注入的项（实测连带把 shell 选成 MSIX 打包版 pwsh）；② **SSH 远端命令
+  默认套登录外壳**（`bash -lc '<cmd>'` → `sh -lc` → 原样发的三级回退，一次连接只探测一次，`ssh.login_shell` 可换模板 / 写空串关掉，
+  命令走 POSIX 单引号转义），因为 exec 通道是非登录 shell ⇒ agent 看不到 `nvcc` 这类 profile PATH；`resolveRemoteRoot`
+  随之改用**带标记**取远端 HOME（profile 欢迎语不再污染解析）；③ 终端把操作系统那句没法照做的话翻成指引
+  （`不受信任的装入点` / `untrusted mount point` ⇒ "先去管理员终端跑一次 flutter pub get，见 #16"），跨帧稳健、每会话一次。
 - **终端文字输入必须带视图 id**（[lib/README.md](lib/README.md) 不变量 14、
   [docs/known-issues.md](docs/known-issues.md) #12，**用户断言 2026-10-04**：「模拟终端现在中英文都无法输入」）：
   可打印字符**只**从平台的文本输入通道来——键事件那条路对它们一律判 `ignored`（引擎在键事件被判 `handled` 时

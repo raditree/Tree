@@ -20,6 +20,7 @@ class SshConfig {
     this.keyPath = '',
     this.keyPassphrase = '',
     this.root = '',
+    this.loginShell,
   });
 
   /// 从 agent yaml 的 `ssh:` 映射解析；缺少 host 时返回 null。
@@ -55,6 +56,10 @@ class SshConfig {
               '')
           .toString()
           .trim(),
+      // 远端命令是否套一层**登录外壳**（用户 2026-10-03：agent 看不到用户 ssh 里有的 nvcc）：
+      // 缺省/null/true = 默认开（bash -lc → sh -lc 自动探测）；false/空串 = 显式关；
+      // 字符串 = 自定义模板（必须带 {cmd} 占位，例如 `zsh -lc {cmd}`）。
+      loginShell: _loginShell(map['login_shell'] ?? map['loginShell']),
     );
   }
 
@@ -75,6 +80,14 @@ class SshConfig {
   /// 绝不直接用字符串拼命令：`~` 与相对路径要先问远端 `$HOME` 再展开
   /// （见 tree_local_exec 的 `resolveRemoteRoot`），SFTP 自己不会展开。
   final String root;
+
+  /// 远端命令的登录外壳模板：**null = 用内置候选**（默认开），`''` = 显式关掉，
+  /// 非空 = 自定义模板（必须带 `{cmd}`）。
+  ///
+  /// 为什么默认开：工具命令走 SSH 的 exec 通道 = **非登录 shell**，看不到
+  /// `/etc/profile`、`~/.profile` 里的 PATH ⇒ agent 会缺 `nvcc` / conda 这类工具
+  /// （用户 2026-10-03 实测）。包一层 `bash -lc` 就与"用户自己 ssh 登进去"一致。
+  final String? loginShell;
 
   /// 是否具备建立连接的最小信息。
   bool get isComplete =>
@@ -98,6 +111,7 @@ class SshConfig {
         ? 'password'
         : (keyPath.isNotEmpty ? 'key' : 'none'),
     if (root.isNotEmpty) 'root': root,
+    if (loginShell != null) 'login_shell': loginShell,
   };
 
   /// 持久化形态（**含凭据**，写进 agent yaml；与模型 api_key 同一策略）。
@@ -109,6 +123,7 @@ class SshConfig {
     if (keyPath.isNotEmpty) 'key_path': keyPath,
     if (keyPassphrase.isNotEmpty) 'key_passphrase': keyPassphrase,
     if (root.isNotEmpty) 'root': root,
+    if (loginShell != null) 'login_shell': loginShell,
   };
 
   /// 展开 `~` 为用户目录（dartssh2 不做这个展开）。
@@ -129,6 +144,14 @@ class SshConfig {
 
   @override
   String toString() => 'SshConfig(${redacted()})';
+
+  /// 解析 `login_shell`：缺省 / `true` = 用内置默认（null）；`false` / 空串 = 显式关（`''`）；
+  /// 其它字符串 = 自定义模板（必须带 `{cmd}`，非法模板由 core 侧跳过并记日志）。
+  static String? _loginShell(Object? raw) {
+    if (raw == null) return null;
+    if (raw is bool) return raw ? null : '';
+    return raw.toString().trim();
+  }
 
   static int _port(Object? raw) {
     if (raw is num) return raw.toInt();
