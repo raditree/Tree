@@ -83,6 +83,8 @@ export 'src/tool/terminal_hooks.dart';
 export 'src/tool/todo_store.dart';
 export 'src/tool/tool_run_registry.dart';
 export 'src/tool/tool_runner.dart';
+export 'src/tool/tool_runs_scope.dart';
+export 'src/tool/tool_runs_tool.dart';
 export 'src/tool/workspace_tool_runner.dart';
 export 'src/server/boot_warmup.dart';
 export 'src/terminal/ssh_pty_adapter.dart';

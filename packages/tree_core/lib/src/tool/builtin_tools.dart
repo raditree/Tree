@@ -13,6 +13,7 @@ import 'terminal_hooks.dart';
 import 'team_tool.dart';
 import 'todo_store.dart';
 import 'tool_runner.dart';
+import 'tool_runs_tool.dart';
 
 /// 内置工具集：**工作空间类** 5 个（read / write / edit / grep / terminal）、
 /// `set_todo_list`（接 todo 存储时声明）、`ask_user_question`（接提问通道时声明），
@@ -59,10 +60,14 @@ abstract final class BuiltinTools {
     bool withMessage = false,
     bool withSpec = false,
     bool withSubagent = false,
+    bool withToolRuns = false,
   }) => <ToolSpec>[
     if (withTeam) TeamTool.spec(),
     if (withMessage) MessageTool.spec(),
     if (withSubagent) SubagentTool.spec(),
+    // 运行中工具（plan §11.3）：与 subagent 同级的"看自己 + 看下级"入口，
+    // 由 `WorkspaceToolRunner` 在接入工具执行器时声明（登记表恒在）。
+    if (withToolRuns) ToolRunsTool.spec(),
     if (withSpec) SpecTool.spec(),
     if (withTodos)
       ToolSpec(
@@ -339,12 +344,14 @@ abstract final class BuiltinTools {
     TeamMessageDispatcher? messageDispatcher,
     SpecService? specService,
     SubagentChannel? subagentChannel,
+    ToolRunsChannel? toolRunsChannel,
     bool withTodos = false,
     bool withQuestions = false,
     bool withTeam = false,
     bool withMessage = false,
     bool withSpec = false,
     bool withSubagent = false,
+    bool withToolRuns = false,
   }) async {
     try {
       if (io == null && needsWorkspace(invocation.name)) {
@@ -366,6 +373,9 @@ abstract final class BuiltinTools {
             return const ToolOutcome('临时员工通道未接入：无法使用该工具', isError: true);
           }
           return await SubagentTool.run(invocation, subagentChannel);
+        case ToolRunsTool.name:
+          // 未接线（没有登记表落点）⇒ 可读原因，不静默降级。
+          return await ToolRunsTool.run(invocation, toolRunsChannel);
         case SpecTool.name:
           if (specService == null) {
             return const ToolOutcome('Spec 服务未接入：无法使用该工具', isError: true);
@@ -400,7 +410,7 @@ abstract final class BuiltinTools {
         default:
           return ToolOutcome(
             '未知工具：${invocation.name}'
-            '（可用：${specs(withTodos: withTodos, withQuestions: withQuestions, withTeam: withTeam, withMessage: withMessage, withSpec: withSpec, withSubagent: withSubagent).map((ToolSpec s) => s.name).join('、')}）',
+            '（可用：${specs(withTodos: withTodos, withQuestions: withQuestions, withTeam: withTeam, withMessage: withMessage, withSpec: withSpec, withSubagent: withSubagent, withToolRuns: withToolRuns).map((ToolSpec s) => s.name).join('、')}）',
             isError: true,
           );
       }

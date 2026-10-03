@@ -143,6 +143,27 @@ class SubagentService implements SubagentChannel {
   @override
   String privateOwnerOf(String agentId) => registry.privateOwnerOf(agentId);
 
+  @override
+  List<SubagentTag> directSubagentsOf(String agentId, String sessionId) {
+    final String sid = sessionId.trim();
+    if (sid.isEmpty) return const <SubagentTag>[];
+    // 名册按 (会话主人, sessionId) 分栏：先沿 parentId 找到树根（会话主人），
+    // 再在**本会话**的名册里挑 parentId == 自己 的那些（既有关系，不新造判据）。
+    final String owner = registry.privateOwnerOf(agentId);
+    return registry
+        .records(owner, sid)
+        .where((CoreSubagent s) => s.parentId == agentId)
+        .map(
+          (CoreSubagent s) => SubagentTag(
+            id: s.id,
+            name: s.name,
+            parentId: s.parentId,
+            level: s.level,
+          ),
+        )
+        .toList(growable: false);
+  }
+
   // ── 入口 ─────────────────────────────────────────────────────────────
 
   @override

@@ -81,6 +81,16 @@ abstract interface class SubagentChannel {
   ///
   /// 用途：`.tree/<agent>/.self` 分栏 + 复用发起者那条工作空间/SSH 连接。
   String privateOwnerOf(String agentId);
+
+  /// 本会话里**由 [agentId] 直接召来**的临时员工（按创建顺序；只认直属）。
+  ///
+  /// 判据复用名册里既有的 `parentId` 关系（与 [privateOwnerOf] / 复用解析同一份）：
+  /// 它的下级的下级**不算**它的直属下级。会话维度不可省——名册按
+  /// `(会话主人, sessionId)` 分栏（跨会话不保留是硬不变量），所以只回答**本会话**。
+  ///
+  /// 用途：`tool_runs`（内置工具）解析"本 agent 自己 + 其直属下级"的作用域——
+  /// 上级要能看见并显式收手下级卡住的工具（plan §11.1/§11.3）。
+  List<SubagentTag> directSubagentsOf(String agentId, String sessionId);
 }
 
 /// `subagent` 工具（本能力核心侧入口）：**现场召一个临时员工干活**。

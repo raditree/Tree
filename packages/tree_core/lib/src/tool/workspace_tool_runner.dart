@@ -24,6 +24,7 @@ import 'terminal_hooks.dart';
 import 'todo_store.dart';
 import 'tool_run_registry.dart';
 import 'tool_runner.dart';
+import 'tool_runs_scope.dart';
 
 /// 按 agent 解析其工作空间目录（绝对路径）。
 typedef WorkspaceDirResolver = String Function(String agentId);
@@ -134,6 +135,16 @@ class WorkspaceToolRunner implements ToolRunner {
   /// `system.tool.timeout` / `query_status.stuck_tools`）+ 可显式干预（`tool.close`）。
   final ToolRunRegistry toolRuns;
 
+  /// `tool_runs`（内置工具）的落点：作用域 = 本 agent + 其直属下级（团队关系 +
+  /// 临时员工名册，**既有判据**），关闭 = 同一个 [ToolRunRegistry.close]。
+  ///
+  /// 懒建（第一次用到才建）：它只是把已有的三个对象拼在一起，没有代价也没有副作用。
+  late final ToolRunsScope _toolRunsScope = ToolRunsScope(
+    registry: toolRuns,
+    teamService: teamService,
+    subagents: subagentService,
+  );
+
   final WorkspaceIO Function(String dir) _ioFactory;
 
   /// 可读日志（工具报错、结果截断等）。
@@ -167,6 +178,9 @@ class WorkspaceToolRunner implements ToolRunner {
         withMessage: messageDispatcher != null && !isSubagent,
         withSpec: specService != null,
         withSubagent: subs != null,
+        // 运行中工具（plan §11.3）：登记表恒在（默认进程级唯一那一份），
+        // 作用域解析用下面那份 team + 临时员工名册（缺谁就少看一路，不算未接线）。
+        withToolRuns: true,
       ),
       if (mcpService != null) ...<ToolSpec>[
         McpTool.spec(),
@@ -402,12 +416,14 @@ class WorkspaceToolRunner implements ToolRunner {
       messageDispatcher: messageDispatcher,
       specService: specService,
       subagentChannel: subs,
+      toolRunsChannel: _toolRunsScope,
       withTodos: todoStore != null,
       withQuestions: ask != null,
       withTeam: teamService != null,
       withMessage: messageDispatcher != null,
       withSpec: specService != null,
       withSubagent: subs != null,
+      withToolRuns: true,
     );
     return _truncate(outcome);
   }
@@ -575,7 +591,18 @@ class WorkspaceToolRunner implements ToolRunner {
     })?
     callback = onHookFinished;
     if (callback == null) return;
-    callback(task.agentId, task.sessionId, hookNotice(task, exitCode));
+    // **临时员工起的 hook**：把它的标记带上（`subagentService.tagOf`）。`wake` 因此
+    // 能把完成提示归到**会话主人**的会话流（临时员工没有自己的会话）并带 `subagent_id`，
+    // 同时以**它自己**的身份唤醒它。旧实现不带标记 ⇒ 提示会冒充主 agent 的消息，且
+    // `wake` 用 `sub_…` 取会话取到 null 直接 return：不落库、不唤醒、父白等
+    // （用户 2026-10-03 现场）。
+    final SubagentTag? tag = subagentService?.tagOf(task.agentId);
+    callback(
+      task.agentId,
+      task.sessionId,
+      hookNotice(task, exitCode),
+      subagent: tag,
+    );
   }
 
   /// 供核心层（Spec 索引、待办读取等）复用同一份工作空间缓存：

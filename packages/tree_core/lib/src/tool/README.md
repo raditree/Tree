@@ -19,6 +19,10 @@
 | [status_text.dart](status_text.dart) | 每次工具结果前拼的"会话状态"（todo + 已选 Spec） |
 | [todo_store.dart](todo_store.dart) | 待办存储（markdown 勾选清单 + 内存实现） |
 | [terminal_hooks.dart](terminal_hooks.dart) | 后台长任务管理器（terminal 的 hook 模式） |
+| [tool_run_registry.dart](tool_run_registry.dart) | **运行中工具/请求登记表**（内存）：挂载点在 `WorkspaceToolRunner` 一次入口；超阈值 warning（默认 300s，会话 + `core.log`）、广播站 `system.tool.timeout`、REST 快照、**显式关闭**（同一实现，绝不自动杀） |
+| [tool_runs_tool.dart](tool_runs_tool.dart) | 内置工具 **`tool_runs`**：`action=list`（自己 + 直属下级正在执行的运行）/ `action=close`（按 handle 关闭，与右栏按钮 / 执行站 `tool.close` 同一实现） |
+| [tool_runs_scope.dart](tool_runs_scope.dart) | `tool_runs` 的**作用域**（自己 + 直属团队成员 + 直属临时员工）与越权拒绝（`ToolCloseOutcome.denied`） |
+| [llm_request_guard.dart](llm_request_guard.dart) | 把「运行中的 **LLM 请求**」登记进同一张表的现成实现（沉默才登记；关闭即取消这一跳） |
 
 ## 不变量（assertions）
 

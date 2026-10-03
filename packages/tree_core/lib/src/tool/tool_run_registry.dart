@@ -271,6 +271,15 @@ class ToolCloseOutcome {
         '当前在跑的运行请用 GET /api/tools/running 重新取 handle。',
   );
 
+  /// **越权拒绝**（fail-closed）：句柄不属于调用方或它的直属下级 ⇒ 如实回原因，
+  /// **一个字都不动登记表**（`tool_runs action=close` 的归属校验走这一条）。
+  factory ToolCloseOutcome.denied(String note) => ToolCloseOutcome._(
+    closed: false,
+    tool: '',
+    elapsedMs: 0,
+    note: note,
+  );
+
   /// 是否真的收到了关闭请求并已从登记表移除。
   final bool closed;
 
