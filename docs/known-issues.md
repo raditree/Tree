@@ -985,4 +985,51 @@ Material `Scrollbar`，而全仓库没有任何 `ScrollConfiguration` / `ScrollB
 依据取自已核对版本的 GitHub 源），需要在真机上确认候选窗贴住了终端光标；若仍偏移，下一步是按 `caret_rect_`
 的坐标系（`SetCaretPos` 用客户区像素）再校一次缩放。
 
+## #16 Tree 的集成终端里"新建的 reparse point 跟随不了"⇒ `flutter build windows` 在那里必然失败
+
+**现象**（用户 2026-10-03）：同一个命令、同一个仓库——
+`dart run tool/package_windows.dart --installer --flutter <flutter.bat>`——
+**在 Tree 的集成终端里失败**（CMake：`add_subdirectory given source
+"flutter/ephemeral/.plugin_symlinks/<插件>/windows" which is not an existing directory`），
+**在用户自己的终端里成功**（59.1s 出 `Tree.exe`，随后 zip 与安装包都出来了）。
+用户的原话是「Tree 的 terminal 和我（用户）直接在本机使用的 terminal 在行为上有分歧」。
+
+**不是前端代码，也不是"链接坏了"**：那条命令要在 `.plugin_symlinks/<插件>/windows` 上做 CMake
+`add_subdirectory`，而这些目录是 **reparse point（目录符号链接 / junction）**。关键证据（都在 Tree 的终端这一侧取）：
+
+| 观测 | 结果 |
+| --- | --- |
+| 用户那次构建**新建并使用**了同一批链接 | 成功 ⇒ 链接数据本身是有效的 |
+| 同一条链接在 Tree 的终端里 `Test-Path <链接>\windows` / `cmd dir` | `False` / `File Not Found` |
+| 现场**自己造**链接（`mklink /J`、`mklink /D`），同一目录内（C:→C:、E:→E:） | 创建"成功"，但**同样跟随不了** |
+| 系统预置链接（`C:\Documents and Settings` → `C:\Users`、`C:\Users\All Users` → `C:\ProgramData`） | 正常：`LinkType=Junction/SymbolicLink`、目标读得出、能跟随 |
+| `E:\BaiduSyncdisk` | **自相矛盾**：属性里有 `ReparsePoint`，但 `Get-Item` 的 `LinkType`/`Target` 是空的 |
+| `fsutil fsinfo volumeinfo E:` | `Error 5: Access is denied`（正常本地卷不会这样） |
+| 我们这个 shell 的来路 | `Tree.exe` → `tree_core.exe`（`D:\app\Tree Desktop\`）→ `pwsh.exe`，**Session 1、Medium 完整性**、`cwd=E:\programs\Tree\desktop` |
+
+**结论（事实 + 推断分开写）**：事实是——**Tree 的集成终端所在的进程/文件系统上下文里，"这个会话里新建的
+reparse point"不能被跟随**（连同一目录内自造的都不行），而系统预置的能跟随；那个上下文看到的文件系统是被
+**虚拟化 / 重定向过的视图**（`E:` 上 `BaiduSyncdisk` 的矛盾状态与 `fsutil` 的 Access denied 都指向这点）。
+推断是——这会命中机器策略里 `fsutil behavior query SymlinkEvaluation` 的
+**`Remote-to-local symbolic link evaluation: DISABLED`**（重定向卷上的链接指向本地目标时不予求值）；
+用户本机终端里的 `E:` 是**真正本地**卷 ⇒ Local-to-local（ENABLED）⇒ 一切正常。**差异因此出在"终端所在的
+上下文"，与前端终端代码无关**（把 Tree 的终端换成你自己的终端，命令就过）。
+
+**绕过方式**（按代价排序）：
+
+1. **构建放到你自己的终端里跑**（已验证可用）——出 `dist/tree-desktop-<版本>-windows-x64.zip` 与
+   `dist/installer/tree-desktop-<版本>-windows-x64-setup.exe`；
+2. 让构建进程**脱离 Tree 的进程树**（例如用计划任务以当前用户启动一次），以避开这层虚拟化 —— 需要动系统
+   计划任务，属于要用户点头的操作；
+3. 若确认是"重定向卷上的链接指向本地目标"：由管理员 `fsutil behavior set SymlinkEvaluation R2L:1`
+   **打开 Remote-to-local**（机器级策略，本仓库不擅自改；改之前先确认这层重定向是环境设计还是意外）。
+
+**踩过的弯路（别再走）**：第一反应是"链接是昨天环境准备好的、失效了"，于是删掉 `.plugin_symlinks` 让
+`flutter pub get` / `flutter build` 重建 —— 没用（重建出来的在我这个上下文里**照样跟随不了**），
+而用户那次构建重建 + 使用同一条链接却完全正常。**判据是"同一份链接，两个终端里结果不同"**，
+不要只盯着链接本身。
+
+**状态**：环境侧、**不是代码缺陷**，不做代码改动（2026-10-03 记录）。`flutter test` / `flutter analyze` /
+真机 UI 行为都不受影响；受影响的只有"在 Tree 的终端里执行依赖 reparse point 的构建"这一类操作。
+
 
