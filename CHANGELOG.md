@@ -35,6 +35,11 @@
   不起 Flutter）；重启失败或重启后仍非零 ⇒ 往 **stderr** 留一句可读的话再照常启动（不静默、不把用户挡在门外）。
   安装器里"启动 Tree"改成经 `explorer.exe`（`Filename: "explorer.exe"; Parameters: """{app}\{#AppExe}"""`），
   否则新装的实例一出生就带着这条缓解。
+  终端侧的防呆也**补全并改正**了：除原来的系统措辞（`不受信任的装入点` / `untrusted mount point` /
+  `无法遍历该路径`）外，**CMake 措辞**（`add_subdirectory given source … which is not an existing
+  directory` **且**同时出现 `.plugin_symlinks`——单看是通用措辞，故判据是"两半同时命中"）也认；
+  指引文案从"先去管理员终端 `flutter pub get`"改成"**退出 Tree 从开始菜单重开一次**（新版本启动时会自愈）
+  ／先在系统终端里跑这条命令"——用户实际踩到的正是 CMake 那种措辞，而上一轮的关键字里没有它。
 - **`subagent`（临时员工）的使用策略写进三处提示词资产：工具描述 / 系统提示词 / 内置 Spec**
   （[tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 12、[docs/architecture.md](docs/architecture.md) §8.1）：
   口径统一为——**什么时候用**（边界清晰、可独立完成的子任务：多份文件的同类改动、独立检索与调研、各自可验收的
