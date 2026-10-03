@@ -65,12 +65,22 @@
     `docs/team.md` 却写着「未就绪成员会在 leader 上显示红点」，于是那排红点永远不会亮；现在面板与徽章由
     同一个 `_rosterOf` 决定，不会出现「面板是空的、红点却亮着」。
 
-15. **`message` 的附件只在本机工作空间之间可用**（[test/message_dispatcher_test.dart](../../../test/message_dispatcher_test.dart) 强制）：
-    投递走的是本机 `File.copy`（发送方工作空间 → 接收方 `.input/<日期>/`，越界路径 / 超过 32 MB 不复制并如实回 `files_failed`）；
-    **任一侧的工作空间在远端（SSH）时不投递**——结果里回一句「未投递：文件投递仅支持本机工作空间的成员，SSH 成员请改用其远端路径」，
-    消息本身照常送达（不静默、也**不**复制到本机某个无关目录）。跨机搬原文件目前只能靠**工作空间在本机的那条线**
-    用自己的终端（`scp` / `rsync` 之类）推过去；底层其实已有 SFTP 的二进制通路
-    （`WorkspaceFiles.readBytes` / `writeBytes`），只是 `_copyFiles` 还没接上它。
+15. **`message` 的附件（`files`）四种组合都投递**（[test/message_dispatcher_test.dart](../../../test/message_dispatcher_test.dart) 强制；
+    **用户口径 2026-10-03**：SSH↔local、SSH↔SSH 都要能传）：
+    发送方工作空间 → 接收方 `.input/<日期>/`（或 `dest_dir`），组合 = local→local / local→remote / remote→local /
+    remote→remote（含**两台不同远端主机**）。两侧各自解析成一个**端点**：本机目录（`workspaceDirOf` 非空）或
+    **工作空间 IO**（`ioFor` 非空，本地与 SSH 同一入口）；判据是**「有效 SSH」**（`teamSshConfigFor`——SSH agent 的
+    `workspaceDirOf` 因此恒为空串），**不许**退回 `agent.sshConfig`（见 [../files/README.md](../files/README.md) 不变量 9）。
+    **两侧都解析不到**才整单不投递，回一句**可读原因**（说清是哪一侧、并提示可改用它的远端路径）——消息本身照常送达。
+    **跨机经本机中转**（SFTP 没有 server-side copy，只能"读 → 写"）：源本机 `File.readAsBytes`、源远端
+    `WorkspaceFiles.readBytes`（**先 `sizeOf` 再决定读多少**；后端没有二进制接口时退回 `readFile` 的 base64 / 文本），
+    目标本机 `Directory.create(recursive: true)` + `writeAsBytes`、目标远端**逐级** `makeDirectory` 后再 `writeBytes`
+    （同名**覆盖**，与既有本机语义一致，不新增判据）。每份附件都要过一次本机内存 ⇒ 沿用**单文件上限
+    `maxFileBytes`（默认 32 MB）**，超限**拒绝并如实计入 `files_failed`**（不静默截断、不静默跳过）。
+    失败是**单文件**粒度（一份失败不影响其余，note 照旧"已投递 N 个 / 失败：…"）；路径与 `dest_dir` 口径两侧一致：
+    空 / 绝对路径 / 盘符 / `~` / `..` 逃逸一律拒绝并计入失败。**绝不复制到无关目录**：端点解析不到就是"未投递"，
+    不会退化成写进本机某个默认目录、也不会写回发送方那侧。跨机成功时 note 追加"；跨机经本机中转"；
+    **local↔local 的行为与文案逐字不变**（回归用例守着）。
 
 ## 测试
 

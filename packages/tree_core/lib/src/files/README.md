@@ -23,7 +23,10 @@ REST 文件面板 / 查看器 / Git 面板的**唯一**数据源，也是唯一�
    见 [../team/README.md](../team/README.md) 不变量 3），**不是** `agent.sshConfig`：SSH leader 的成员自己那份是空的，
    只看它会把成员的文件面板 / Git 面板判成本机——而它的工具其实在远端跑，于是面板会拿一个**远端路径**去本机
    找目录（轻则"目录不存在"，重则读到本机同名路径）。同一判据贯穿 `list` / `content` / `readBytes` / `pdfInfo` /
-   `writeContent` / 分片上传 / `syncToLocal` / `archive` / `gitLog` / `gitBranches`，任何一处都不许退回 `agent.sshConfig`
+   `writeContent` / 分片上传 / `syncToLocal` / `archive` / `gitLog` / `gitBranches` 与**团队附件投递**
+   （`message` 的 `files`：SSH agent 的 `workspaceDirOf` 因此恒为空串，投递改走它的工作空间 IO，用
+   `WorkspaceFiles.readBytes` / `writeBytes` 读→写，见 [../team/README.md](../team/README.md) 不变量 15），
+   任何一处都不许退回 `agent.sshConfig`
    （[test/ssh_files_api_test.dart](../../../test/ssh_files_api_test.dart) 强制：成员跟随 SSH leader 时读走远端、
    写回在没接远端 IO 时回可读 400 而不是落到本机）。集成终端同判据（见 [../terminal/README.md](../terminal/README.md)）。
 

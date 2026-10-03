@@ -26,8 +26,9 @@ abstract final class MessageTool {
         '系统不会替你回传任何总结：需要对方知道结果，必须让对方自行 send_message 回发；'
         '禁止仅为确认收到/寒暄/复述而互发。\n'
         'files 为本 agent 工作空间内的相对路径，会复制到接收方 .input/<日期>/'
-        '（可用 dest_dir 指定目录）；**只在本机工作空间之间可用**——发送方或接收方的工作空间在远端（SSH）'
-        '时不投递，结果里会明确回一句"未投递"（跨机请改用共享位置，或让工作空间在本机的那条线帮你推过去）。',
+        '（可用 dest_dir 指定目录）；**本机与 SSH 成员之间都能投递**（local↔SSH、SSH↔SSH 都行），'
+        '跨机时经**本机进程中转**、单文件上限 32 MB——超限或路径越界只记该文件失败，其余照投，'
+        '结果里会如实回"已投递 N 个 / 失败：…"（两侧的工作空间都解析不到才整单回"未投递"）。',
     parameters: <String, dynamic>{
       'type': 'object',
       'properties': <String, dynamic>{
@@ -56,11 +57,12 @@ abstract final class MessageTool {
         'files': <String, dynamic>{
           'type': 'array',
           'items': <String, dynamic>{'type': 'string'},
-          'description': 'send_message 可选：本 agent 工作空间内的相对路径（**仅本机工作空间之间可用**：任一侧是 SSH 就不投递，会明确回一句"未投递"）',
+          'description': 'send_message 可选：本 agent 工作空间内的相对路径（**本机与 SSH 成员之间都能投递**：'
+              '跨机经本机中转、单文件上限 32 MB；越界 / 超限只失败该文件，其余照投）',
         },
         'dest_dir': <String, dynamic>{
           'type': 'string',
-          'description': 'files 的目标目录（默认 .input/<日期>）',
+          'description': 'files 的目标目录（默认 .input/<日期>）；须是**接收方工作空间内**的相对路径（空 / 绝对路径 / 盘符 / ~ / .. 逃逸一律拒绝）',
         },
         // 这里**没有** timeout：M9 §1.1 起等待不再有静态时长上限（判据换成成员
         // 活性：心跳丢失 / 未响应才收口，并把未响应者显式列出来）。

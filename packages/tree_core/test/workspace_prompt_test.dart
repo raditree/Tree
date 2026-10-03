@@ -60,7 +60,7 @@ void main() {
       expect(text, contains('不要自行收窄'));
     });
 
-    test('activity.log 不是事实源；SSH 那条线要完整查询就找本机团队（附件只在本机可用）', () {
+    test('activity.log 不是事实源；SSH 那条线要完整查询就找本机团队（附件跨机可用）', () {
       final String local = workspacePromptSuffix(makeAgent());
       expect(local, contains('activity.log'));
       expect(local, contains('不是完整记录'));
@@ -79,7 +79,11 @@ void main() {
       expect(text, contains('完整记录在本机'));
       expect(text, contains('message send_message'));
       expect(text, contains('本地团队'));
-      expect(text, contains('只在本机工作空间之间可用'), reason: '别让模型以为附件能跨 SSH');
+      expect(
+        text,
+        contains('本机与远端之间都能投递'),
+        reason: '跨机附件经本机中转可用（2026-10-03 口径），别让模型还按"远端带不了附件"绕路',
+      );
       expect(text, contains('scp'));
     });
 

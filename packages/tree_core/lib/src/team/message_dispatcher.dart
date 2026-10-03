@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 import 'package:tree_local_exec/tree_local_exec.dart';
@@ -125,6 +126,23 @@ class _PendingDelivery {
     'session_id': sessionId,
     'reason': reason,
   };
+}
+
+/// 附件投递的**端点**：该 agent 的工作空间要么在**本机目录**（[localRoot] 非空），
+/// 要么走**工作空间 IO**（[io] 非空，本地与 SSH 同一抽象，见 [TeamMessageDispatcher.ioFor]）。
+///
+/// 两者互斥、且**不许都空**：都解析不到时调用方回一句可读原因，绝不当成功
+/// （[TeamMessageDispatcher._copyFiles]）。
+class _AttachmentEndpoint {
+  _AttachmentEndpoint({this.localRoot = '', this.io});
+
+  /// 本机工作空间根（绝对路径；空串 = 不在本机）。
+  final String localRoot;
+
+  /// 工作空间 IO（null = 该 agent 没接线 IO，或链路建立失败）。
+  final WorkspaceIO? io;
+
+  bool get isLocal => localRoot.isNotEmpty;
 }
 
 /// 团队消息派发（M5c）：把 leader/成员的消息投给队友，并在**派发前**过审核闸门。
@@ -912,58 +930,212 @@ class TeamMessageDispatcher {
     return p.join(dir, '.tree', agentId, '.self', 'activity.log');
   }
 
-  /// 文件投递：发送方工作空间 → 接收方 `.input/<日期>/`。
+  /// 文件投递：发送方工作空间 → 接收方 `.input/<日期>/`（或 `dest_dir`）。
   ///
-  /// 只支持**本机**工作空间：SSH 成员的工作空间在远端，复制必须走其 WorkspaceIO；
-  /// 那种情况明确报错而不是悄悄复制到本机某个无关目录。
+  /// **四种组合都支持**（local→local / local→remote / remote→local / remote→remote，
+  /// 含两台不同远端主机）：两侧各自解析成一个 [_AttachmentEndpoint]——本机目录
+  /// （[workspaceDirOf] 非空）或工作空间 IO（[ioFor] 非空，本地与 SSH 同一入口）。
+  /// SSH 侧因此不再"整单不投递"；SSH↔SSH 只能经**本机进程**读→写中转（SFTP 没有
+  /// server-side copy），所以保留**单文件上限** [maxFileBytes]（默认 32 MB）。
+  ///
+  /// 失败口径：**单文件**失败只计入 `files_failed`，其余照投；两侧的工作空间都解析不到
+  /// （既不在本机、也没接线工作空间 IO）时整单不投递，只回一句**可读原因**——绝不假装
+  /// 成功，也绝不把附件悄悄复制到某个无关目录（同 files 模块不变量 6）。
   Future<Map<String, dynamic>> _copyFiles({
     required String from,
     required String to,
     required List<String> files,
     required String destDir,
   }) async {
-    final String fromDir = workspaceDirOf?.call(from) ?? '';
-    final String toDir = workspaceDirOf?.call(to) ?? '';
-    if (fromDir.trim().isEmpty || toDir.trim().isEmpty) {
+    final _AttachmentEndpoint? source = await _endpointOf(from);
+    final _AttachmentEndpoint? target = await _endpointOf(to);
+    if (source == null || target == null) {
       return <String, dynamic>{
-        'note': '（附件未投递：文件投递仅支持本机工作空间的成员，SSH 成员请改用其远端路径）',
+        'note':
+            '（附件未投递：${source == null ? '发送方' : '接收方'}的工作空间解析不到'
+            '（既不在本机，也没有接线工作空间 IO），SSH 成员请改用其远端路径）',
       };
     }
-    final String target = p.join(
-      toDir,
-      destDir.trim().isEmpty ? p.join('.input', _dateStamp()) : destDir.trim(),
-    );
+    final String rawDest = destDir.trim();
+    // 目标目录：本机沿用既有口径（`p.join`，文案逐字不变）；远端统一成 `/` 分隔的
+    // 工作空间相对路径（交给 WorkspaceIO 的边界），非法就整单不投递。
+    final String dest = target.isLocal
+        ? (rawDest.isEmpty ? p.join('.input', _dateStamp()) : rawDest)
+        : (rawDest.isEmpty
+              ? '.input/${_dateStamp()}'
+              : _workspaceRelative(rawDest) ?? '');
+    if (dest.isEmpty) {
+      return <String, dynamic>{
+        'note': '（附件未投递：dest_dir 不是合法的工作空间相对路径：$rawDest）',
+        'files_copied': 0,
+        'files_failed': files
+            .map((String f) => f.trim())
+            .where((String f) => f.isNotEmpty)
+            .toList(growable: false),
+      };
+    }
+    final String display = target.isLocal
+        ? p.relative(p.join(target.localRoot, dest), from: target.localRoot)
+        : dest;
+    final bool crossMachine = !(source.isLocal && target.isLocal);
     int copiedCount = 0;
     final List<String> failed = <String>[];
-    for (final String relative in files) {
+    for (final String file in files) {
+      final String raw = file.trim();
+      if (raw.isEmpty) continue;
+      final String? relative = _workspaceRelative(raw);
+      if (relative == null) {
+        failed.add(raw);
+        continue;
+      }
       try {
-        final String raw = relative.trim();
-        if (raw.isEmpty) continue;
-        final String absolute = p.normalize(p.join(fromDir, raw));
-        if (!p.isWithin(fromDir, absolute) && absolute != fromDir) {
-          failed.add(raw);
-          continue;
-        }
-        final File source = File(absolute);
-        if (!source.existsSync() || source.lengthSync() > maxFileBytes) {
-          failed.add(raw);
-          continue;
-        }
-        await Directory(target).create(recursive: true);
-        await source.copy(p.join(target, p.basename(absolute)));
+        final Uint8List bytes = await _readAttachment(source, relative);
+        await _writeAttachment(target, dest, relative, bytes);
         copiedCount++;
-      } catch (_) {
-        failed.add(relative);
+      } catch (error) {
+        log?.call('附件投递失败（$raw）：$error');
+        failed.add(raw);
       }
     }
+    final String via = crossMachine ? '；跨机经本机中转' : '';
     return <String, dynamic>{
       'note':
-          '（附件已投递 $copiedCount 个到 ${p.relative(target, from: toDir)}'
+          '（附件已投递 $copiedCount 个到 $display$via'
           '${failed.isEmpty ? '）' : '；失败：${failed.join('、')}）'}',
       'files_copied': copiedCount,
       'files_failed': failed,
     };
   }
+
+  /// 解析一个附件投递**端点**：本机目录优先（[workspaceDirOf] 非空），否则取工作空间 IO。
+  ///
+  /// 判据与 files 模块不变量 9 同一口径：远端 = `teamSshConfigFor` 非空（CLI 因此给
+  /// [workspaceDirOf] 空串），这里**只认这个接线结果**，不看 `agent.sshConfig`。
+  Future<_AttachmentEndpoint?> _endpointOf(String agentId) async {
+    final String dir = (workspaceDirOf?.call(agentId) ?? '').trim();
+    if (dir.isNotEmpty) return _AttachmentEndpoint(localRoot: dir);
+    final Future<WorkspaceIO?> Function(String agentId)? lookup = ioFor;
+    if (lookup == null) return null;
+    try {
+      final WorkspaceIO? io = await lookup(agentId);
+      if (io != null) return _AttachmentEndpoint(io: io);
+    } catch (error) {
+      log?.call('解析工作空间 IO 失败（$agentId）：$error');
+    }
+    return null;
+  }
+
+  /// 读源文件字节：本机走 `dart:io`，远端走工作空间 IO。
+  ///
+  /// 远端优先 [WorkspaceFiles.readBytes]（**先问 `sizeOf` 再决定读多少**，同 M8c 口径）；
+  /// 没有二进制接口时退回 `readFile` 的 base64 / 文本，口径同
+  /// `vision_files._readBytes`（超限一律**拒绝并给可读原因**，不静默截断）。
+  Future<Uint8List> _readAttachment(
+    _AttachmentEndpoint source,
+    String relative,
+  ) async {
+    if (source.isLocal) {
+      final File file = File(p.join(source.localRoot, relative));
+      if (!file.existsSync()) {
+        throw FileSystemException('附件不存在', file.path);
+      }
+      if (file.lengthSync() > maxFileBytes) {
+        throw FileSystemException(
+          '附件超过单文件上限（$maxFileBytes 字节）',
+          file.path,
+        );
+      }
+      return file.readAsBytes();
+    }
+    final WorkspaceIO io = source.io!;
+    final Object backend = io;
+    if (backend is WorkspaceFiles) {
+      if (await backend.sizeOf(relative) > maxFileBytes) {
+        throw WorkspaceIoException('附件超过单文件上限（$maxFileBytes 字节）：$relative');
+      }
+      return backend.readBytes(relative);
+    }
+    final FileContent content = await io.readFile(
+      relative,
+      maxBytes: maxFileBytes + 1,
+    );
+    if (content.truncated) {
+      throw WorkspaceIoException('附件超过单文件上限（$maxFileBytes 字节）：$relative');
+    }
+    final String? base64 = content.base64;
+    if (base64 != null && base64.isNotEmpty) return base64Decode(base64);
+    return Uint8List.fromList(utf8.encode(content.text));
+  }
+
+  /// 写目标文件：本机 `Directory.create(recursive: true)` + `File.writeAsBytes`；
+  /// 远端先确保目录（见 [_ensureRemoteDirectory]）再 `writeBytes`（同名**覆盖**，
+  /// 与既有本机语义一致，不新增判据）。
+  Future<void> _writeAttachment(
+    _AttachmentEndpoint target,
+    String dest,
+    String relative,
+    Uint8List bytes,
+  ) async {
+    final String name = p.basename(relative);
+    if (target.isLocal) {
+      final Directory dir = Directory(p.join(target.localRoot, dest));
+      await dir.create(recursive: true);
+      await File(p.join(dir.path, name)).writeAsBytes(bytes, flush: true);
+      return;
+    }
+    final WorkspaceIO io = target.io!;
+    final Object backend = io;
+    if (backend is! WorkspaceFiles) {
+      throw WorkspaceIoException('该工作空间 IO 不支持写入原始字节（附件投递需要 WorkspaceFiles）');
+    }
+    await _ensureRemoteDirectory(backend, dest);
+    await backend.writeBytes('$dest/$name', bytes);
+  }
+
+  /// 远端目录：`makeDirectory` **只建一层**、父目录不存在直接返回 parentMissing，
+  /// 所以按层级从浅到深逐个建（已存在的忽略）；失败留给随后的 `writeBytes` 判定
+  /// （它自己也会补父目录，这是双保险，不在这里吞掉结论）。
+  Future<void> _ensureRemoteDirectory(
+    WorkspaceFiles files,
+    String relativeDir,
+  ) async {
+    String current = '';
+    for (final String segment in relativeDir.split('/')) {
+      if (segment.isEmpty) continue;
+      current = current.isEmpty ? segment : '$current/$segment';
+      try {
+        await files.makeDirectory(current);
+      } catch (_) {
+        // 已存在 / 后端不支持：交给 writeBytes 决定成败
+      }
+    }
+  }
+
+  /// 附件相对路径的准入：**空 / 绝对路径 / 盘符 / `~` / `..` 逃逸一律拒绝**
+  /// （口径同 files 模块不变量 1 与 `file_service.dart`）。
+  ///
+  /// 返回 `/` 分隔的工作空间相对路径；null = 拒绝。本机与远端共用这一份判定：
+  /// 远端虽由 WorkspaceIO 自带边界，但"拒绝要发生在读之前"，且两侧口径必须一致。
+  static String? _workspaceRelative(String raw) {
+    final String path = raw.trim();
+    if (path.isEmpty || path.startsWith('~')) return null;
+    if (_driveLetterPattern.hasMatch(path)) return null;
+    final String posix = path.replaceAll('\\', '/');
+    if (posix.startsWith('/')) return null;
+    final List<String> segments = <String>[];
+    for (final String segment in posix.split('/')) {
+      if (segment.isEmpty || segment == '.') continue;
+      if (segment == '..') {
+        if (segments.isEmpty) return null; // 逃逸出工作空间根
+        segments.removeLast();
+        continue;
+      }
+      segments.add(segment);
+    }
+    return segments.isEmpty ? null : segments.join('/');
+  }
+
+  static final RegExp _driveLetterPattern = RegExp(r'^[a-zA-Z]:');
 
   static List<String> _targets(Map<String, dynamic> args) {
     final Object? single = args['target_member_id'];
