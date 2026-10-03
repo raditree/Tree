@@ -144,6 +144,24 @@
     时**就不再派发文字**，两条路因此天然互斥、不会重复输入。这条连接**必须带本视图的 `viewId`**
     （`View.of(context).viewId`，与 `EditableText` 同口径）：缺了平台侧 `setClient` 直接报错、文字被静默丢掉
     ⇒ **中英文一个字都打不出来**（真机踩过）。Ctrl+J 例外（留给切换）。
+    **输入法通道的两条硬口径**（用户 2026-10-03：「中文输入下模拟终端出 bug」——截图里提示符后面是
+    `…>nninini1hn。hni。hani。h…`，拼音原文进了 shell）：① **只补差额**——平台送来的永远是
+    `TextInputModel` 的**整段文本**（`SendStateUpdate`），提交那一刻不发状态、随后 `ComposeEndHook` 发的是
+    "整段文本 + composing 无效"，所以必须自己记住"已经交给 PTY 的前缀"、只补新定下来的那一截；组字尾巴
+    （`composing` 覆盖的那段）一个字都不发，尾巴被引擎连在提交结果前一起送回来时也要剥掉；
+    ② **原样回显**——一个字都不改地 `setEditingState` 回去。旧实现为了"不回显"把模型截断成"只剩尾巴"、把选区
+    强制折到末尾、还重标组字区，而引擎的 `AddText` 在**选区折叠**时是"追加"而不是"替换组字区"
+    （`text_input_model.h` 原文）⇒ 提交退化成追加，残留拼音跟着结果一起被整段送回来、被我们当成已定字转发。
+    **改写平台侧模型 = 拼音漏进 shell**，这条线不要再碰。同一链路还要报一次**光标那一格在哪**
+    （`setEditableSizeAndTransform` + `setMarkedTextRect`，Windows 用它们摆 IME 窗口）：不报的话候选窗会用
+    **上一个可编辑控件**（被 Ctrl+J 顶掉的 composer）的陈旧矩形。
+    **选中 / 复制粘贴**（用户 2026-10-03：「没法选中文字，没法复制粘贴」）：左键拖拽在格子上取选区
+    （[ui/services/terminal_selection.dart](ui/services/terminal_selection.dart) 是纯逻辑；坐标用**绝对行号** = 历史 + 屏幕拼成
+    一条线，所以输出把内容顶上去、用户往上翻历史，选区都还锚在同一段文字上；**resize 会重排行 ⇒ 那里清选区**）；
+    `Ctrl+Shift+C` / `Ctrl+Insert` / **有选中时的 `Ctrl+C`**（没选中时 `Ctrl+C` 照旧发 `0x03` = SIGINT）复制，
+    `Ctrl+V` / `Shift+Insert` / 右键菜单（没选中时"复制"置灰并说明）粘贴；复制按行取文本、**裁掉行尾空格**、
+    多行用 `\n` 连接（末尾不补换行，粘贴时 `\n` 会被换回 `\r`）；应用开了括号粘贴（`?2004`）时按 xterm 口径包
+    `ESC[200~ … ESC[201~`；**粘贴不过 `#TSend` 拦截层**（那层只拦手打的一行）。
     核心开**真伪终端**，输出是**原始字节**（base64 过 WS），前端用自制的 VT 解析器还原成屏幕
     （光标定位 / SGR / 备用屏都在内），再 `CustomPaint` 画格子。两个后端**都是真 PTY**：
     本机 agent 走平台伪终端（Windows ConPTY / POSIX `script`）；远端（SSH）agent 走 SSH 会话通道 +
@@ -338,13 +356,19 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 跨块 UTF-8、宽字符两格、未知序列安全跳过、resize、DSR/DA 应答、随机含 ESC 字节流不抛）、
 `test/vt_scrollback_test.dart`（回滚缓冲：主屏整屏滚动才进历史、备用屏与滚动区域内部不进、上限丢最老的、
 `historyPushed` 只增、`ED3` 清历史而 `ED2` 不动、resize 后历史行跟着换宽度、RIS 复位）、
-`test/terminal_ime_input_test.dart`（输入法通道：定字整段交出去、组字中一个字都不交、组字前半截已定字只交前缀、删到空安全、没 attach 也不炸）、
+`test/terminal_ime_input_test.dart`（输入法通道：定字整段交出去、组字中一个字都不交、组字前半截已定字只交前缀、删到空安全、没 attach 也不炸、
+**平台重发整段只补差额**、**收缩（退格）不重发**、**引擎把"残留组字 + 提交结果"整段送回来时只发新定字**（真机拼音漏进 shell 的钉子）、
+直接定原文（结果 == 组字）不误剥、追加形态只交一份、连着两轮组字不串、**原样回显不许改写平台模型**）、
+`test/terminal_selection_test.dart`（终端选区纯逻辑：反向拖拽规范化、单行 / 多行 / 跨历史与当前屏、行尾空格裁掉、宽字符两半合一个字、
+越界与空表夹住不抛、`columnsIn` 的首行 / 中间行 / 末行区间）、
 `test/composer_primary_action_test.dart`（右下角那个键两态：生成中且空 = 停止键并回调、一开始打字换回发送键、删空转回、不在生成中始终是发送键、没接停止回调就不显示）、
 `test/terminal_send_command_test.dart`（`#TSend`：引号 / 裸文本 / `@路径` / 混写 / 带空格路径的解析，以及按键拦截的吞与补发：整行扣住、发现不是指令时原样补发、退格只吃本地缓存、其它按键前先补发、`#TSend` 单独一行 = 空指令）、
 `test/terminal_panel_test.dart`（终端面板：打开就发 `terminal_open` 与尺寸并抢焦点、ready 显示 shell/cwd、
 输出进缓冲、键盘译码（回车 / 方向键 / Ctrl+C）、Ctrl+J 交给外层、error 与 exit 的显示、别的会话 id 的帧被丢、
 dispose 发 `terminal_close`、布局变化发 `terminal_resize`、**输入法连接必须带 `viewId`**——缺了平台不认这个 client，
-中英文一个字都打不出来）、
+中英文一个字都打不出来、**左键拖拽选中 + Ctrl+C 复制（有选区时不再发 0x03）**、Ctrl+Shift+C / Ctrl+Insert 复制、
+没选中时 Ctrl+C 仍发 0x03、Ctrl+V / Shift+Insert 粘贴（`\n` → `\r`）、**开了 `?2004` 就包 `ESC[200~…ESC[201~`**、
+右键菜单（没选中时"复制"置灰）、单击清选区、**光标那一格报给平台**（IME 候选窗定位））、
 `test/message_window_test.dart`（消息窗口：按 `offset` 放页并按 id 去重对齐、实时追加落末尾且同 id 原位替换、
 `gapsFor` 只报没加载的连续段、淘汰只留视口附近与末尾且正在流式 / 正在跑工具的不淘汰、`resetTail` 重载末尾一段）、
 `test/message_scrollbar_test.dart`（右侧滑块几何与交互：位置按**全局下标**算、长度 = 可见条数 / 全局条数并有下限、

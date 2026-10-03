@@ -328,6 +328,16 @@
   `MessageScrollbar` 的按位置反解必须是绘制几何的**严格逆**（`messageScrollbarIndexAt`），且**拖拽期间几何输入与
   拇指位置都钉住**（指针为准、松手再对齐真实下标），滑块能指到的最靠后下标是 `total - 看得见的条数`（贴底同义），
   拖到最底下 = 直达底部。
+- **集成终端：输入法只补差额 + 原样回显；能选、能复制粘贴**（[lib/README.md](lib/README.md) 不变量 14，
+  `docs/known-issues.md` #15，**用户断言 2026-10-03**：「中文输入下模拟终端出 bug。还有没法选中文字，没法复制粘贴」）：
+  输入法通道**只补差额**（平台送来的永远是 `TextInputModel` 的整段文本；组字尾巴一个字都不发，尾巴被引擎连在
+  提交结果前一起送回来也要剥掉）且**原样回显**（一个字都不改 `setEditingState`）——旧实现截断模型 + 强制折叠
+  选区，会让引擎的 `AddText` 从"替换组字区"退化成"追加"，拼音原文于是漏进 shell（真机截图已实证）；
+  同一链路报一次**光标那一格**（`setEditableSizeAndTransform` + `setMarkedTextRect`）供 IME 候选窗定位。
+  终端新增**选中 / 复制 / 粘贴**：左键拖拽取选区（坐标是"历史 + 屏幕"拼成的绝对行号，输出与回滚都不丢锚点，
+  resize 清选区）；`Ctrl+Shift+C` / `Ctrl+Insert` / **有选中时的 `Ctrl+C`**（没选中时仍是 `0x03` = SIGINT）复制；
+  `Ctrl+V` / `Shift+Insert` / 右键菜单粘贴（`\n` → `\r`，应用开了 `?2004` 时包 `ESC[200~ … ESC[201~`）；
+  粘贴**不过** `#TSend` 拦截层。
 - **终端文字输入必须带视图 id**（[lib/README.md](lib/README.md) 不变量 14、
   [docs/known-issues.md](docs/known-issues.md) #12，**用户断言 2026-10-04**：「模拟终端现在中英文都无法输入」）：
   可打印字符**只**从平台的文本输入通道来——键事件那条路对它们一律判 `ignored`（引擎在键事件被判 `handled` 时

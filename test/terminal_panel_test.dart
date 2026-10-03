@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -211,10 +212,12 @@ void main() {
         selection: TextSelection.collapsed(offset: 2),
       ),
     );
+    // 平台送来的永远是**模型整段文本**（见 terminal_ime_input 的文件头）：
+    // 第二段是在"你好"后面接着敲的，所以文本是"你好ls"而不是"ls"
     state.debugImeClient.updateEditingValue(
       const TextEditingValue(
-        text: 'ls',
-        selection: TextSelection.collapsed(offset: 2),
+        text: '你好ls',
+        selection: TextSelection.collapsed(offset: 4),
       ),
     );
     await tester.pump();
@@ -353,5 +356,231 @@ void main() {
     final Map<String, dynamic>? resize = ws.lastOf(TerminalInboundType.resize);
     expect(resize, isNotNull, reason: '窗口变大要告诉 PTY 新的列行数');
     expect(resize![TerminalFrame.terminalId], id);
+  });
+
+  // ── 选中 / 复制粘贴（用户 2026-10-03：「没法选中文字，没法复制粘贴」）──────────
+
+  late List<String> clipboardWrites;
+  String? clipboardRead;
+
+  /// 剪贴板走平台通道：这里捕获写入、给读出备好内容。
+  void mockClipboard(WidgetTester tester) {
+    clipboardWrites = <String>[];
+    clipboardRead = null;
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (MethodCall call) async {
+        if (call.method == 'Clipboard.setData') {
+          clipboardWrites
+              .add((call.arguments as Map<dynamic, dynamic>)['text'] as String);
+        } else if (call.method == 'Clipboard.getData') {
+          return clipboardRead == null
+              ? null
+              : <String, dynamic>{'text': clipboardRead};
+        }
+        return null;
+      },
+    );
+    addTearDown(() {
+      tester.binding.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform, null);
+    });
+  }
+
+  Future<void> pressWithCtrl(
+    WidgetTester tester,
+    LogicalKeyboardKey key, {
+    bool shift = false,
+  }) async {
+    if (shift) await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+    await tester.sendKeyEvent(key);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+    if (shift) await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.pump();
+  }
+
+  /// 画两行字并等它上屏（屏幕区从 y=31 开始：工具条 30 + 分割线 1）。
+  Future<void> emitTwoLines(WidgetTester tester, String id) async {
+    await emit(tester, <String, dynamic>{
+      'type': TerminalOutboundType.output,
+      TerminalFrame.terminalId: id,
+      TerminalFrame.bytes: base64Encode(utf8.encode('hello\r\nworld')),
+    });
+  }
+
+  testWidgets('左键拖拽选中文字 + Ctrl+C 复制到剪贴板（不再发 0x03）',
+      (WidgetTester tester) async {
+    await pumpPanel(tester);
+    final String id = openedId(tester);
+    await emitTwoLines(tester, id);
+    mockClipboard(tester);
+
+    await tester.dragFrom(const Offset(4, 35), const Offset(300, 24));
+    await tester.pump();
+
+    final TerminalPanelState state =
+        tester.state<TerminalPanelState>(find.byType(TerminalPanel));
+    expect(state.debugSelection, isNotNull, reason: '左键拖拽必须落下选区');
+    expect(state.debugSelection!.isCollapsed, isFalse,
+        reason: '拖了就该是跨格选区，不是一格');
+
+    await pressWithCtrl(tester, LogicalKeyboardKey.keyC);
+
+    expect(clipboardWrites, hasLength(1), reason: 'Ctrl+C 有选区时是复制');
+    expect(clipboardWrites.single, contains('hello'));
+    expect(clipboardWrites.single, contains('world'));
+    expect(
+      ws.inputTexts(id),
+      isNot(contains('\u0003')),
+      reason: '有选区时 Ctrl+C 不该再把 SIGINT 打给 shell',
+    );
+  });
+
+  testWidgets('Ctrl+Shift+C / Ctrl+Insert 也是复制（不依赖 Ctrl+C 的两义）',
+      (WidgetTester tester) async {
+    await pumpPanel(tester);
+    final String id = openedId(tester);
+    await emitTwoLines(tester, id);
+    mockClipboard(tester);
+
+    await tester.dragFrom(const Offset(4, 35), const Offset(300, 24));
+    await tester.pump();
+    await pressWithCtrl(tester, LogicalKeyboardKey.keyC, shift: true);
+    expect(clipboardWrites, hasLength(1));
+
+    await pressWithCtrl(tester, LogicalKeyboardKey.insert);
+    expect(clipboardWrites, hasLength(2), reason: 'Ctrl+Insert 是 Windows 上的老习惯');
+  });
+
+  testWidgets('没选中时 Ctrl+C 仍然发 0x03（SIGINT 语义不丢）',
+      (WidgetTester tester) async {
+    await pumpPanel(tester);
+    final String id = openedId(tester);
+    await emitTwoLines(tester, id);
+    mockClipboard(tester);
+
+    await pressWithCtrl(tester, LogicalKeyboardKey.keyC);
+    expect(clipboardWrites, isEmpty);
+    expect(
+      ws.inputTexts(id).join(''),
+      contains('\u0003'),
+      reason: '没有选区时 Ctrl+C 必须照旧是中断信号',
+    );
+  });
+
+  testWidgets('Ctrl+V 粘贴：换行归一成 \\r（PTY 认回车不认换行）',
+      (WidgetTester tester) async {
+    await pumpPanel(tester);
+    final String id = openedId(tester);
+    mockClipboard(tester);
+    clipboardRead = 'ls\necho hi\r\npwd';
+
+    await pressWithCtrl(tester, LogicalKeyboardKey.keyV);
+
+    expect(ws.inputTexts(id).join(''), 'ls\recho hi\rpwd');
+  });
+
+  testWidgets('Shift+Insert 也是粘贴', (WidgetTester tester) async {
+    await pumpPanel(tester);
+    final String id = openedId(tester);
+    mockClipboard(tester);
+    clipboardRead = 'whoami';
+
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.insert);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.pump();
+
+    expect(ws.inputTexts(id).join(''), 'whoami');
+  });
+
+  testWidgets('括号粘贴：应用开了 ?2004 就按 xterm 口径包 ESC[200~ … ESC[201~',
+      (WidgetTester tester) async {
+    await pumpPanel(tester);
+    final String id = openedId(tester);
+    mockClipboard(tester);
+    await emit(tester, <String, dynamic>{
+      'type': TerminalOutboundType.output,
+      TerminalFrame.terminalId: id,
+      TerminalFrame.bytes: base64Encode(utf8.encode('\u001b[?2004h')),
+    });
+    clipboardRead = 'ls\necho hi';
+
+    await pressWithCtrl(tester, LogicalKeyboardKey.keyV);
+
+    expect(ws.inputTexts(id).join(''), '\u001b[200~ls\recho hi\u001b[201~');
+  });
+
+  testWidgets('右键菜单：没选中时"复制"置灰并说明，粘贴可用',
+      (WidgetTester tester) async {
+    await pumpPanel(tester);
+    final String id = openedId(tester);
+    mockClipboard(tester);
+    clipboardRead = 'dir';
+
+    await tester.tap(find.byType(TerminalPanel), buttons: kSecondaryButton);
+    await tester.pumpAndSettle();
+
+    expect(find.text('复制（先按住左键拖选一段）'), findsOneWidget);
+    final PopupMenuItem<String> copyItem = tester.widget<PopupMenuItem<String>>(
+      find.ancestor(
+        of: find.text('复制（先按住左键拖选一段）'),
+        matching: find.byType(PopupMenuItem<String>),
+      ),
+    );
+    expect(copyItem.enabled, isFalse, reason: '没选区时"复制"应该点不动');
+
+    await tester.tap(find.text('粘贴'));
+    await tester.pumpAndSettle();
+    expect(ws.inputTexts(id).join(''), 'dir');
+  });
+
+  testWidgets('单击清掉选区（新的一拖才是新选区）', (WidgetTester tester) async {
+    await pumpPanel(tester);
+    final String id = openedId(tester);
+    await emitTwoLines(tester, id);
+
+    await tester.dragFrom(const Offset(4, 35), const Offset(300, 24));
+    await tester.pump();
+    final TerminalPanelState state =
+        tester.state<TerminalPanelState>(find.byType(TerminalPanel));
+    expect(state.debugSelection, isNotNull);
+
+    await tester.tapAt(const Offset(200, 100));
+    await tester.pump();
+    expect(state.debugSelection, isNull);
+  });
+
+  testWidgets('把光标那一格报给平台（IME 候选窗才贴着光标，不再用别处的陈旧矩形）',
+      (WidgetTester tester) async {
+    final List<MethodCall> calls = <MethodCall>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.textInput,
+      (MethodCall call) async {
+        calls.add(call);
+        return null;
+      },
+    );
+    addTearDown(() {
+      tester.binding.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.textInput, null);
+    });
+
+    await pumpPanel(tester);
+    await tester.pump();
+
+    final Iterable<MethodCall> geometry = calls.where((MethodCall c) =>
+        c.method == 'TextInput.setEditableSizeAndTransform' ||
+        c.method == 'TextInput.setMarkedTextRect');
+    expect(geometry, isNotEmpty,
+        reason: 'Windows 就是用这两条消息摆 IME 窗口的（text_input_manager 的 caret_rect）');
+    final MethodCall caret = calls.lastWhere(
+      (MethodCall c) => c.method == 'TextInput.setMarkedTextRect',
+    );
+    final Map<String, dynamic> rect =
+        (caret.arguments as Map<dynamic, dynamic>).cast<String, dynamic>();
+    expect(rect['width'], greaterThan(0));
+    expect(rect['height'], greaterThan(0));
   });
 }

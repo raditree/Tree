@@ -934,4 +934,55 @@ Material `Scrollbar`，而全仓库没有任何 `ScrollConfiguration` / `ScrollB
 会跳到列表的**真实**位置（一次，不是持续抖动）。要做到"拖到哪就精确到哪"得让列表按已知的真实高度反推落点
 （密度修正），属于另一处取舍，未在本次范围内。
 
+## #15 集成终端：中文输入的**拼音原文**漏进 shell（+ 同批补上选中 / 复制粘贴）
+
+**现象**（用户 2026-10-03，附截图）：中文输入下模拟终端出 bug。截图里提示符后面是
+`E:\programs\Tree\desktop>nninini1hn。hni。hani。h已亻尔晗《尔台和2《尔晗nnin《`
+——拼音字母、中文标点（`。` `《`）、选字用的数字与若干已定字**混在一起被当成命令打给了 shell**；
+同屏还能看到 IME 候选窗（`3 呢 / 4 拟 / …`），说明输入法本身是工作的。
+
+**取证方式**：截图逐像素看不出字形，改用 **Windows 自带 OCR**（`Windows.Media.Ocr`，PowerShell 5.1 + WinRT，
+无第三方依赖）读出上句原文；再按本机 SDK 的引擎版本（`bin/internal/engine.version` = `af7e796e…`）取
+**同版本**引擎源码（`shell/platform/windows/text_input_plugin.cc`、`shell/platform/common/text_input_model.h`、
+`shell/platform/windows/text_input_manager.cc`）核对机制。
+
+**根因**：前端输入法通道（`lib/ui/services/terminal_ime_input.dart`）为了"不回显"**改写了平台侧模型**——
+每次收到值后把 `TextInputModel` 置成"只剩未转发的尾巴 + **把选区强制折到末尾** + 重新标 `composing` 为
+`[0, len)`"。而引擎侧的事实是：
+
+- 平台送来的永远是**模型整段文本** + `composingBase/Extent`（`SendStateUpdate(*active_model_)`）；
+  **提交那一刻不发状态**，随后的"结束组字"事件（`ComposeEndHook`）发的是"整段文本 + composing 无效"；
+- `TextInputModel::AddText`：**选区折叠时是"在光标处追加"，选区非折叠时才"替换选区"**
+  （`text_input_model.h` 原文）——IME 提交正是靠"组字区被选中"来完成替换。
+
+于是提交退化成**追加**：残留拼音留在模型里，跟提交结果一起被整段送回来；我们按 `composing` 无效把它当成
+已定字**整段转发** ⇒ 截图那一串。同一处还有第二半：模型里已经有交出去的内容时，整段回流会被**重复**转发。
+
+**修复**（断言见 `lib/README.md` 不变量 14）：
+
+- 输入法通道改成两条硬口径：**只补差额**（自己记住"已交给 PTY 的前缀"，只发新定下来的那一截；组字尾巴一个字不发，
+  尾巴若被引擎连在结果前一起送回来也剥掉；结果 == 组字时按长度判据不误剥）+ **原样回显**（一个字都不改地
+  `setEditingState`，模型与 IME 的认知才一致）。**改写平台侧模型 = 拼音漏进 shell**，这条线不要再碰。
+- 顺带把"光标那一格在哪"报给平台（`setEditableSizeAndTransform` + `setMarkedTextRect`）：Windows 的
+  `TextInputManager::MoveImeWindow` 就是拿 `caret_rect_` 摆 `ImmSetCandidateWindow` / `ImmSetCompositionWindow`
+  的；不报就用**上一个可编辑控件**（被 Ctrl+J 顶掉的 composer）的陈旧矩形 —— 截图里候选窗出现在终端底部、
+  而提示符在顶部，正是这个。
+- **同批补齐两项缺能力**（用户同一句里一起提的"没法选中文字，没法复制粘贴"，属"没实现"而非 bug）：
+  左键拖拽选区（绝对行号锚定，输出/回滚都不丢锚点，resize 清选区）+ 复制（Ctrl+Shift+C / Ctrl+Insert /
+  有选区时的 Ctrl+C）+ 粘贴（Ctrl+V / Shift+Insert / 右键菜单，`\n`→`\r`，`?2004` 时包 `ESC[200~…ESC[201~`）。
+
+**验证**：
+
+- `test/terminal_ime_input_test.dart`（15 条，其中"引擎把残留组字 + 结果整段送回来 ⇒ 只发新定字"这条在旧实现上红过：
+  旧实现发的是 `['ni你']`，正确是 `['你']`；另有"平台重发整段只补差额""收缩不重发""原样回显"三条防回归）。
+- `test/terminal_selection_test.dart`（7 条纯逻辑）+ `test/terminal_panel_test.dart`（新增 9 条；把面板接线临时拆掉后
+  其中 6 条红：拖拽选中、两条复制键路、三条粘贴路、单击清选区）。
+- 全量 `flutter test` + `flutter analyze lib test` 零告警（见收尾汇报）。
+
+**状态**：已修复（2026-10-03）。
+
+**遗留（如实记录，我无法在本环境肉眼验收）**：候选窗定位这条是**按引擎源码推的**（本机 SDK 不带 C++ 源码，
+依据取自已核对版本的 GitHub 源），需要在真机上确认候选窗贴住了终端光标；若仍偏移，下一步是按 `caret_rect_`
+的坐标系（`SetCaretPos` 用客户区像素）再校一次缩放。
+
 

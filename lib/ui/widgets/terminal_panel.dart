@@ -8,6 +8,7 @@ import 'package:tree_protocol/tree_protocol.dart';
 
 import '../../io/websocket_service.dart';
 import '../services/terminal_ime_input.dart';
+import '../services/terminal_selection.dart';
 import '../services/terminal_send_command.dart';
 import '../services/vt_screen.dart';
 
@@ -100,6 +101,17 @@ class TerminalPanelState extends State<TerminalPanel> {
   /// 已经同步过的 [VtScreen.historyPushed]：正在回滚时把视图**钉在同一段内容**上
   /// （新输出继续往下长，视野不动）——否则每来一帧用户就被拽回底部。
   int _historyPushedSeen = 0;
+
+  /// 当前选区（null = 没选）。坐标是**绝对行号**（历史 + 屏幕拼成一条线），
+  /// 所以输出把内容顶上去、用户往上翻历史，选区都还锚在同一段文本上（见
+  /// [TerminalSelection] 的文件头）。尺寸变化会重排行 ⇒ 那里清掉它。
+  TerminalSelection? _selection;
+
+  /// 上一次报给平台的"光标几何"指纹（列/行/滚动/尺寸/焦点）：变了才发消息。
+  int? _imeCaretStamp;
+
+  /// 终端**屏幕区**（不含工具条）的 key：给 IME 定位与坐标换算提供同一个坐标系。
+  final GlobalKey _screenKey = GlobalKey();
 
   @override
   void initState() {
@@ -194,6 +206,156 @@ class TerminalPanelState extends State<TerminalPanel> {
     });
   }
 
+  // ── 选区 / 复制粘贴（用户 2026-10-03：「没法选中文字，没法复制粘贴」）────────
+
+  /// 可见区第一行的**绝对行号**（历史 + 屏幕拼成一条线）。
+  ///
+  /// 与 [_visibleRows] 的窗口算法同源：`_scrollOffset` 就是"从底部往上翻了多少行"，
+  /// 所以第一可见行 = 历史尾部再往上 `_scrollOffset` 行（历史不够就夹到 0）。
+  int get _firstVisibleAbsolute =>
+      (_screen.historyLength - _scrollOffset).clamp(0, _screen.historyLength);
+
+  /// 指针位置 → 网格坐标（绝对行号 + 列，越界夹住）。
+  (int row, int column) _cellAt(Offset local) {
+    final int rowIndex = _screen.rows <= 0
+        ? 0
+        : (local.dy / _cellHeight).floor().clamp(0, _screen.rows - 1);
+    final int column = _columns <= 0
+        ? 0
+        : (local.dx / _cellWidth).floor().clamp(0, _columns - 1);
+    return (_firstVisibleAbsolute + rowIndex, column);
+  }
+
+  /// 按下：落锚点（并清掉上一次的选区——新的一拖就是新选区，与真终端一致）。
+  void _beginSelection(Offset local) {
+    final (int row, int column) = _cellAt(local);
+    setState(() {
+      _selection = TerminalSelection(
+        anchorRow: row,
+        anchorColumn: column,
+        focusRow: row,
+        focusColumn: column,
+      );
+    });
+  }
+
+  /// 拖拽中：换终点（起点不动）。
+  void _extendSelection(Offset local) {
+    final TerminalSelection? current = _selection;
+    if (current == null) return;
+    final (int row, int column) = _cellAt(local);
+    setState(() => _selection = current.withFocus(row, column));
+  }
+
+  /// 选中的文本（没选 / 只剩空白时给空串）。
+  String _selectedText() {
+    final TerminalSelection? selection = _selection;
+    if (selection == null) return '';
+    return terminalSelectionText(
+      history: _screen.history,
+      screen: _screen.lines,
+      selection: selection,
+    );
+  }
+
+  /// 复制到剪贴板（Ctrl+Shift+C / Ctrl+Insert / 有选区时的 Ctrl+C / 右键菜单）。
+  Future<void> _copySelection() async {
+    final String text = _selectedText();
+    if (text.isEmpty) {
+      _notify('没有选中内容：按住左键拖一下要复制的文字');
+      return;
+    }
+    await Clipboard.setData(ClipboardData(text: text));
+    if (!mounted) return;
+    // 选区**留着**（真终端也是选完还能再复制一次），下一次点击 / 新拖拽才清。
+    _notify('已复制 ${text.split('\n').length} 行');
+  }
+
+  /// 粘贴（Ctrl+V / Shift+Insert / 右键菜单）。
+  ///
+  /// - 换行归一成 `\r`（PTY 认回车不认换行）；
+  /// - 应用开了括号粘贴（`?2004`）时按 xterm 口径包 `ESC[200~ … ESC[201~`：
+  ///   否则多行文本会被 shell 当场逐行执行（readline / vim 都认这对标记）；
+  /// - **不过 `#TSend` 拦截层**：粘贴是"把剪贴板原样交给 shell"，拦截只针对手打的一行。
+  Future<void> _paste() async {
+    final ClipboardData? data = await Clipboard.getData(Clipboard.kTextPlain);
+    final String? raw = data?.text;
+    if (raw == null || raw.isEmpty) {
+      _notify('剪贴板里没有文字');
+      return;
+    }
+    final String text = raw.replaceAll('\r\n', '\n').replaceAll('\n', '\r');
+    final bool bracketed = _screen.bracketedPaste;
+    final String payload = bracketed ? '\u001b[200~$text\u001b[201~' : text;
+    _sendInput(utf8.encode(payload));
+    _notify(bracketed ? '已粘贴（括号粘贴）' : '已粘贴');
+  }
+
+  /// 右键菜单：复制 / 粘贴（没有选中内容时"复制"置灰并说明原因）。
+  Future<void> _showContextMenu(Offset globalPosition) async {
+    final bool hasSelection = _selectedText().isNotEmpty;
+    final RenderBox overlay =
+        Overlay.of(context).context.findRenderObject()! as RenderBox;
+    final String? choice = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        globalPosition & const Size(1, 1),
+        Offset.zero & overlay.size,
+      ),
+      items: <PopupMenuEntry<String>>[
+        PopupMenuItem<String>(
+          value: 'copy',
+          enabled: hasSelection,
+          child: Text(hasSelection ? '复制' : '复制（先按住左键拖选一段）'),
+        ),
+        const PopupMenuItem<String>(value: 'paste', child: Text('粘贴')),
+      ],
+    );
+    if (!mounted || choice == null) return;
+    if (choice == 'copy') {
+      await _copySelection();
+    } else if (choice == 'paste') {
+      await _paste();
+    }
+  }
+
+  /// 把暂扣在 `#TSend` 拦截器里的半截内容交还 shell（与"其它按键"同一口径：
+  /// 对 shell 与用户而言等于从来没拦过）。复制 / 粘贴前也走一遍，免得缓存被悄悄吃掉。
+  void _releaseSendBuffer() {
+    final List<int> pending = _send.release();
+    if (pending.isNotEmpty) _sendInput(pending);
+  }
+
+  /// 把"光标那一格在哪"报给平台：IME 候选窗 / 组字窗按它定位
+  /// （见 [TerminalTextInputClient.reportCaretGeometry]）。几何没变就什么都不发。
+  ///
+  /// 坐标系用**屏幕区**（不含工具条的 [GlobalKey] 那个盒子）：画笔画光标也是用它，
+  /// 两处口径必须同一个，否则候选窗会整体偏一个工具条的高度。
+  void _syncImeCaret() {
+    if (!mounted || !_focus.hasFocus || !_ime.attached) return;
+    final RenderObject? renderObject =
+        _screenKey.currentContext?.findRenderObject();
+    if (renderObject is! RenderBox || !renderObject.hasSize) return;
+    final int stamp = Object.hash(_screen.cursorColumn, _screen.cursorRow,
+        _scrollOffset, _columns, _rows, _cellWidth, _cellHeight);
+    if (stamp == _imeCaretStamp) return;
+    _imeCaretStamp = stamp;
+    _ime.reportCaretGeometry(
+      editableSize: renderObject.size,
+      caretRect: Rect.fromLTWH(
+        _screen.cursorColumn * _cellWidth,
+        _screen.cursorRow * _cellHeight,
+        _cellWidth,
+        _cellHeight,
+      ),
+      transform: renderObject.getTransformTo(null),
+    );
+  }
+
+  /// 仅供测试：当前选区（画笔高亮的输入）。
+  @visibleForTesting
+  TerminalSelection? get debugSelection => _selection;
+
   /// 开一个会话（尺寸取自当前布局）
   void _open() {
     widget.webSocket.send(<String, dynamic>{
@@ -228,6 +390,7 @@ class TerminalPanelState extends State<TerminalPanel> {
       // 新会话 = 新屏幕：回滚偏移与"历史水位"一起归零，否则会指到不存在的行
       _scrollOffset = 0;
       _historyPushedSeen = 0;
+      _selection = null; // 选区锚在旧屏幕上，换会话就作废
       _send.clear(); // 旧会话里扣住的那半截 `#T` 不带进新会话
     });
     _open();
@@ -254,6 +417,8 @@ class TerminalPanelState extends State<TerminalPanel> {
         return;
       }
       if (sizeChanged) {
+        // 尺寸一变，VtScreen 会**重排行**（历史也跟着换宽度）⇒ 选区的绝对行号失效
+        _selection = null;
         widget.webSocket.send(<String, dynamic>{
           'type': TerminalInboundType.resize,
           TerminalFrame.terminalId: _terminalId,
@@ -284,6 +449,8 @@ class TerminalPanelState extends State<TerminalPanel> {
     final int? viewId = _viewId;
     if (_focus.hasFocus && viewId != null) {
       _ime.attach(viewId: viewId);
+      // 刚挂上连接就报一次光标几何：IME 候选窗按它定位（几何没变时内部会跳过）
+      WidgetsBinding.instance.addPostFrameCallback((_) => _syncImeCaret());
     } else {
       _ime.detach();
     }
@@ -339,7 +506,29 @@ class TerminalPanelState extends State<TerminalPanel> {
       _sendInput(<int>[0x0d]);
       return KeyEventResult.handled;
     }
-    // 3) 其它按键（方向键 / Tab / Esc / Ctrl+C…）：先把缓存交还 shell，再照常转发
+    // 3) 复制 / 粘贴（Windows 终端的习惯口径）：
+    //    Ctrl+Shift+C / Ctrl+Insert 复制；Ctrl+V / Shift+Insert 粘贴；
+    //    **有选中内容时 Ctrl+C 也是复制**（与 Windows Terminal 一致——没选区时它才
+    //    照旧发 0x03 给 PTY，见下面的 _translateKey）。
+    final bool shift = pressed.contains(LogicalKeyboardKey.shiftLeft) ||
+        pressed.contains(LogicalKeyboardKey.shiftRight);
+    final bool copyKey = ctrl &&
+        (event.logicalKey == LogicalKeyboardKey.keyC ||
+            event.logicalKey == LogicalKeyboardKey.insert);
+    final bool pasteKey = (ctrl && event.logicalKey == LogicalKeyboardKey.keyV) ||
+        (shift && event.logicalKey == LogicalKeyboardKey.insert);
+    if (copyKey && (shift || _selectedText().isNotEmpty)) {
+      _releaseSendBuffer();
+      unawaited(_copySelection());
+      return KeyEventResult.handled;
+    }
+    if (pasteKey) {
+      _releaseSendBuffer();
+      unawaited(_paste());
+      return KeyEventResult.handled;
+    }
+
+    // 4) 其它按键（方向键 / Tab / Esc / 没选区时的 Ctrl+C…）：先把缓存交还 shell，再照常转发
     //    （半截的 `#T` 因此不会消失，用户看到的与"从来没拦过"一致）
     final List<int> released = _send.release();
     final List<int>? bytes = _translateKey(event, ctrl: ctrl);
@@ -469,19 +658,39 @@ class TerminalPanelState extends State<TerminalPanel> {
             child: Focus(
               focusNode: _focus,
               onKeyEvent: _handleKey,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: _focus.requestFocus,
-                // 滚轮翻回滚缓冲（终端里没有"滚动条"，鼠标滚轮是唯一入口）；
-                // 键盘一律转发给 PTY（PageUp/方向键在 vim/less 里有用），不劫持。
-                child: Listener(
-                  onPointerSignal: _handlePointerSignal,
-                  child: LayoutBuilder(
-                    builder: (BuildContext context, BoxConstraints constraints) {
-                      _measureText(cs);
-                      _applySize(constraints);
-                      return _buildScreen(cs, constraints);
-                    },
+              child: MouseRegion(
+                // 可选文本的观感：光标变成 I 形（这一片能拖选）
+                cursor: SystemMouseCursors.text,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  // 左键按下 = 落选区锚点，拖动 = 扩选；单击（没拖动）= 取焦点 + 清选区。
+                  onPanDown: (DragDownDetails d) => _beginSelection(d.localPosition),
+                  onPanUpdate: (DragUpdateDetails d) =>
+                      _extendSelection(d.localPosition),
+                  onPanCancel: () {},
+                  onTap: () {
+                    setState(() => _selection = null);
+                    _focus.requestFocus();
+                  },
+                  // 右键 = 复制 / 粘贴菜单（不能只靠快捷键：终端里 Ctrl+C 还有 SIGINT 语义）
+                  onSecondaryTapDown: (TapDownDetails d) {
+                    unawaited(_showContextMenu(d.globalPosition));
+                  },
+                  // 滚轮翻回滚缓冲（终端里没有"滚动条"，鼠标滚轮是唯一入口）；
+                  // 键盘一律转发给 PTY（PageUp/方向键在 vim/less 里有用），不劫持。
+                  child: Listener(
+                    key: _screenKey,
+                    onPointerSignal: _handlePointerSignal,
+                    child: LayoutBuilder(
+                      builder: (BuildContext context, BoxConstraints constraints) {
+                        _measureText(cs);
+                        _applySize(constraints);
+                        // 光标那一格报给平台（IME 候选窗定位），几何变了才真发
+                        WidgetsBinding.instance
+                            .addPostFrameCallback((_) => _syncImeCaret());
+                        return _buildScreen(cs, constraints);
+                      },
+                    ),
                   ),
                 ),
               ),
@@ -644,6 +853,12 @@ class TerminalPanelState extends State<TerminalPanel> {
           defaultForeground: cs.onSurface,
           defaultBackground: cs.surface,
           cursorColor: cs.primary,
+          // 选区：绝对行号锚定，画笔按"可见区第一行的绝对行号"换成可见行
+          selection: _selection,
+          firstVisibleAbsolute: _firstVisibleAbsolute,
+          selectionColor:
+              (Theme.of(context).textSelectionTheme.selectionColor ?? cs.primary)
+                  .withValues(alpha: 0.35),
         ),
       ),
     );
@@ -666,6 +881,9 @@ class _TerminalPainter extends CustomPainter {
     required this.defaultForeground,
     required this.defaultBackground,
     required this.cursorColor,
+    required this.selection,
+    required this.firstVisibleAbsolute,
+    required this.selectionColor,
   });
 
   /// 要画的行：跟随时是屏幕本身，回滚时是"历史尾部 + 当前屏"的一段窗口
@@ -681,6 +899,16 @@ class _TerminalPainter extends CustomPainter {
   final Color defaultForeground;
   final Color defaultBackground;
   final Color cursorColor;
+
+  /// 选区（null = 没选）；行号是**绝对行号**，配 [firstVisibleAbsolute] 换成可见行。
+  final TerminalSelection? selection;
+
+  /// 可见区第一行的绝对行号（见 [_firstVisibleAbsolute]）。
+  final int firstVisibleAbsolute;
+
+  /// 选区高亮色（主题的选中色压一层透明度——终端文字颜色五花八门，
+  /// 不透明的高亮会把文字压住）。
+  final Color selectionColor;
 
   /// 标准 16 色（暗色主题下可读的那一套）
   static const List<Color> _basic = <Color>[
@@ -706,6 +934,28 @@ class _TerminalPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     canvas.drawRect(Offset.zero & size, Paint()..color = defaultBackground);
     final List<List<VtCell>> lines = rows;
+    // 选区高亮：铺在**文字下面**（格子的自带底色会盖住它——正常输出里很少见，
+    // 比"高亮盖住文字"稳妥）。一个可见行最多一个矩形。
+    final TerminalSelection? selected = selection;
+    if (selected != null) {
+      final Paint highlight = Paint()..color = selectionColor;
+      for (int row = 0; row < lines.length; row++) {
+        final (int from, int to) = selected.columnsIn(
+          firstVisibleAbsolute + row,
+          lines[row].length,
+        );
+        if (from < 0) continue;
+        canvas.drawRect(
+          Rect.fromLTWH(
+            from * cellWidth,
+            row * cellHeight,
+            (to - from) * cellWidth,
+            cellHeight,
+          ),
+          highlight,
+        );
+      }
+    }
     final Paint fill = Paint();
     for (int row = 0; row < lines.length; row++) {
       final double top = row * cellHeight;
