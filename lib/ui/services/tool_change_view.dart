@@ -20,10 +20,21 @@ enum ToolDiffKind { context, removed, added }
 
 /// 变更块里的一行。
 class ToolDiffLine {
-  const ToolDiffLine(this.kind, this.text);
+  const ToolDiffLine(
+    this.kind,
+    this.text, {
+    this.sourceStart = -1,
+    this.sourceEnd = -1,
+  });
 
   final ToolDiffKind kind;
   final String text;
+
+  /// 这一行在**对应源码段**里的 `[start, end)`：`removed` 用 [ToolDiffHunk.beforeText]，
+  /// 其余用 [ToolDiffHunk.fileText]。界面据此切片上色（按整段词法结果，见
+  /// [codeColorRuns]）——`-1` = 没有区间（调用方只按纯文本渲染）。
+  final int sourceStart;
+  final int sourceEnd;
 
   /// 行首那一个字符（上下文是空格，与 unified diff 一致）。
   String get marker => switch (kind) {
@@ -39,9 +50,22 @@ class ToolDiffHunk {
     required this.lines,
     required this.truncated,
     required this.startLine,
+    this.fileText = '',
+    this.beforeText = '',
+    this.hasContext = true,
   });
 
   final List<ToolDiffLine> lines;
+
+  /// 上下文行与新增行来自它（**磁盘当前内容**）。
+  final String fileText;
+
+  /// 被替换前的那一整段（`prefix + old_text + suffix`）：`-` 行来自它。
+  final String beforeText;
+
+  /// 有没有上下文行。"翻历史、只拿得到调用参数"时是 false——界面要如实标注，
+  /// 不能假装这是一份完整 diff（用户 2026-10-04：「翻历史的 edit 怎么全都找不到原始变更」）。
+  final bool hasContext;
 
   /// 行数超过上限（只显示前面这些行）——界面要如实标出来。
   final bool truncated;
@@ -140,30 +164,39 @@ ToolDiffHunk? buildEditDiff({
   // before 版本 = 把这一段换回 oldText（其余一模一样）
   final String beforeRegion = '$prefix$oldText$suffix';
   final String afterRegion = '$prefix$newText$suffix';
-  final List<String> removed = _splitLines(beforeRegion);
-  final List<String> added = _splitLines(afterRegion);
 
   // 上下文行：变更块之前的 context 行 + 之后的 context 行（都来自当前文件）
-  final List<String> fileLines = _splitLines(fileText);
+  final List<_SourceLine> fileLines = _linesWithOffsets(fileText);
   final int startLineIndex = _lineIndexAt(fileText, lineStart);
   final int endLineIndex = _lineIndexAt(fileText, lineEnd);
   final int from = (startLineIndex - context) < 0 ? 0 : startLineIndex - context;
   final List<ToolDiffLine> out = <ToolDiffLine>[];
   for (int i = from; i < startLineIndex; i++) {
-    out.add(ToolDiffLine(ToolDiffKind.context, fileLines[i]));
+    out.add(_of(fileLines[i], ToolDiffKind.context));
   }
-  for (final String line in removed) {
-    out.add(ToolDiffLine(ToolDiffKind.removed, line));
+  // 被替换的那几行整行标出来；两段源码各自带上区间，界面因此能按整段着色切片
+  final List<_SourceLine> beforeLines = _linesWithOffsets(beforeRegion);
+  for (final _SourceLine line in beforeLines) {
+    out.add(_of(line, ToolDiffKind.removed));
   }
-  for (final String line in added) {
-    out.add(ToolDiffLine(ToolDiffKind.added, line));
+  final int afterFromLine = endLineIndex + 1;
+  final List<_SourceLine> afterLines = _linesWithOffsets(afterRegion);
+  for (final _SourceLine line in afterLines) {
+    // afterRegion == fileText.substring(lineStart, lineEnd) ⇒ 文件里的偏移 = 段内偏移 + lineStart
+    out.add(
+      ToolDiffLine(
+        ToolDiffKind.added,
+        line.text,
+        sourceStart: lineStart + line.start,
+        sourceEnd: lineStart + line.end,
+      ),
+    );
   }
-  final int afterFrom = endLineIndex + 1;
-  final int afterTo = afterFrom + context > fileLines.length
+  final int afterTo = afterFromLine + context > fileLines.length
       ? fileLines.length
-      : afterFrom + context;
-  for (int i = afterFrom; i < afterTo; i++) {
-    out.add(ToolDiffLine(ToolDiffKind.context, fileLines[i]));
+      : afterFromLine + context;
+  for (int i = afterFromLine; i < afterTo; i++) {
+    out.add(_of(fileLines[i], ToolDiffKind.context));
   }
 
   final bool truncated = out.length > maxLines;
@@ -171,7 +204,79 @@ ToolDiffHunk? buildEditDiff({
     lines: truncated ? out.sublist(0, maxLines) : out,
     truncated: truncated,
     startLine: from + 1,
+    fileText: fileText,
+    beforeText: beforeRegion,
   );
+}
+
+/// 只有参数、没有源文件时（翻历史：文件之后又被改过）的**退化变更块**：
+/// `-` 是这次替换掉的整段、`+` 是替换进去的整段，**没有上下文**（那份上下文没被存下来）。
+///
+/// 返回 null = 两段都空（没有可展示的改动）。界面把 [ToolDiffHunk.hasContext] 为假的情况
+/// 如实标注出来——不假装这是完整的 diff。
+ToolDiffHunk? buildEditDiffFromArgs({
+  required String oldText,
+  required String newText,
+  int maxLines = 400,
+}) {
+  if (oldText.isEmpty && newText.isEmpty) return null;
+  final List<ToolDiffLine> out = <ToolDiffLine>[];
+  for (final _SourceLine line in _linesWithOffsets(oldText)) {
+    out.add(_of(line, ToolDiffKind.removed));
+  }
+  for (final _SourceLine line in _linesWithOffsets(newText)) {
+    out.add(
+      ToolDiffLine(
+        ToolDiffKind.added,
+        line.text,
+        sourceStart: line.start,
+        sourceEnd: line.end,
+      ),
+    );
+  }
+  final bool truncated = out.length > maxLines;
+  return ToolDiffHunk(
+    lines: truncated ? out.sublist(0, maxLines) : out,
+    truncated: truncated,
+    startLine: 0,
+    fileText: newText,
+    beforeText: oldText,
+    hasContext: false,
+  );
+}
+
+/// 一行 + 它在**自己那段源码**里的区间。
+class _SourceLine {
+  const _SourceLine(this.text, this.start, this.end);
+  final String text;
+  final int start;
+  final int end;
+}
+
+ToolDiffLine _of(_SourceLine line, ToolDiffKind kind) => ToolDiffLine(
+  kind,
+  line.text,
+  sourceStart: line.start,
+  sourceEnd: line.end,
+);
+
+/// 文本 → 行（含各自在文本里的 `[start, end)`）：末尾换行不额外算一行，与 `LineSplitter` 同口径。
+List<_SourceLine> _linesWithOffsets(String text) {
+  final List<_SourceLine> out = <_SourceLine>[];
+  if (text.isEmpty) return out;
+  int lineStart = 0;
+  while (lineStart <= text.length) {
+    final int nl = text.indexOf('\n', lineStart);
+    if (nl < 0) {
+      if (lineStart < text.length) {
+        out.add(_SourceLine(text.substring(lineStart), lineStart, text.length));
+      }
+      break;
+    }
+    out.add(_SourceLine(text.substring(lineStart, nl), lineStart, nl));
+    lineStart = nl + 1;
+  }
+  return out;
 }
 
 /// 与核心 `LineSplitter` 同口径：空串 = 0 行；末尾换行不额外算一行；空行照算。

@@ -21,6 +21,7 @@ import '../services/message_replay_guard.dart';
 import '../services/onboarding_requests.dart';
 import '../services/plugin_ui_registry.dart';
 import '../services/session_rename.dart';
+import '../services/subagent_transcript.dart';
 import '../services/team_scope_view.dart';
 import '../services/terminal_toggle_request.dart';
 import 'message_input.dart';
@@ -28,6 +29,7 @@ import 'message_list.dart';
 import 'plugin_ui_slots.dart';
 import 'mode_switch.dart';
 import 'session_picker.dart';
+import 'subagent_view_page.dart';
 import 'terminal_panel.dart';
 import 'spec_panel.dart';
 import 'ssh_config_dialog.dart';
@@ -350,6 +352,8 @@ class _MessagePanelState extends State<MessagePanel> {
     if (oldWidget.selectedAgent?.id != widget.selectedAgent?.id) {
       // 详情是「某个 agent 的某条消息」：换 agent 就作废，右栏不留上一个的残留
       DetailSelection.instance.clear();
+      // 临时员工只活在会话里：换 agent 时它们的"过程分栏"也一起清掉
+      SubagentTranscript.instance.clear();
       // 终端绑在「当前 agent 的工作区」上：换 agent 就退出终端模式（面板 dispose
       // 时会发 terminal_close，核心收掉那个 shell）
       _terminalMode = false;
@@ -372,6 +376,7 @@ class _MessagePanelState extends State<MessagePanel> {
     } else if (oldWidget.refreshTrigger != widget.refreshTrigger) {
       // 历史被整表重拉：旧消息对象随即作废，详情跟着清
       DetailSelection.instance.clear();
+      SubagentTranscript.instance.clear();
       setState(() {
         _messages.clear();
       });
@@ -605,14 +610,19 @@ class _MessagePanelState extends State<MessagePanel> {
           _scrollRevision++;
         }
         // 从历史中恢复 token 用量：取最后一条带 usage 的 agent 消息，
-        // 使重启后「上下文长度」统计不丢失（usage 随消息已持久化）
+        // 使重启后「上下文长度」统计不丢失（usage 随消息已持久化）。
+        // **只认主 agent 自己的消息**：临时员工的 usage 是它自己的上下文，
+        // 混进来就把主 agent 的上下文长度统计带偏（用户 2026-10-04）。
         for (final ChatMessage m in _messages.reversed) {
+          if (m.isSubagentMessage) continue;
           final Map<String, dynamic>? usage = m.usage;
           if (usage != null && usage.isNotEmpty) {
             _usageByAgent['${agent.id}::$sessionId'] = usage;
             break;
           }
         }
+        // 临时员工的"过程分栏"跟着整批历史重建（它们就混在这份完整流里）
+        SubagentTranscript.instance.sync(_messages);
       });
     } catch (e) {
       // 拉取失败时静默处理（保持空列表）
@@ -905,6 +915,11 @@ class _MessagePanelState extends State<MessagePanel> {
       _handleSessionRenamed(data);
     }
     // 其余控制消息（file_sync_progress / heartbeat / error 等）忽略
+    //
+    // 每处理完一帧就把"临时员工的过程"重算一次：它们的消息不进主消息流，而是按
+    // subagent_id 收在 [SubagentTranscript] 里，正在看某个临时员工详情的界面据此实时跟进
+    // （消息对象是共享引用，流式增量原地改内容，所以这里重算索引就够）。
+    SubagentTranscript.instance.sync(_messages);
   }
 
   /// 消息在列表中的下标（-1 = 不存在；空 id 一律视为不存在）。
@@ -926,8 +941,14 @@ class _MessagePanelState extends State<MessagePanel> {
     return sessionId == _currentSessionId;
   }
 
-  /// 记录 token 用量：按 (agent, 会话) 粒度存储，切换会话后互不影响
+  /// 记录 token 用量：按 (agent, 会话) 粒度存储，切换会话后互不影响。
+  ///
+  /// **临时员工（subagent）的帧不记账**：它的 `agent_id` 是会话主人（帧归属口径如此），
+  /// 但那份 `prompt_tokens` 描述的是**它自己**的上下文——记到主人头上会让
+  /// 「上下文长度」这条读数被临时员工来回污染（用户 2026-10-04）。
   void _recordUsage(Map<String, dynamic> data, Map<String, dynamic> usage) {
+    final String subagentId = (data['subagent_id'] as String?) ?? '';
+    if (subagentId.isNotEmpty) return;
     final String agentId = (data['agent_id'] as String?) ?? '';
     final String sessionId =
         (data['session_id'] as String?) ?? _currentSessionId;
@@ -1301,8 +1322,11 @@ class _MessagePanelState extends State<MessagePanel> {
                   final bool hasCards = PluginUiRegistry.instance.hasKind(
                     PluginUiSlotKind.card,
                   );
+                  // 临时员工的消息**不进主消息流**（用户 2026-10-04：「subagent 的输出跟主 agent
+                  // 的输出混杂，根本没法分辨，subagent 的工具调用就在 subagent 的调用工具详情里看」）：
+                  // 它们按 subagent_id 收进 [SubagentTranscript]，在"那次 subagent 工具调用的详情页"里看。
                   return MessageList(
-                    messages: _messages,
+                    messages: visibleStreamMessages(_messages),
                     revision: _scrollRevision,
                     onAskAnswer: _handleAskAnswer,
                     scrollToMessageId: _scrollToMessageId,
@@ -1576,6 +1600,9 @@ class _MessagePanelState extends State<MessagePanel> {
               icon: _buildTeammatesIcon(agent),
               onPressed: () => _openTeammatesWindow(agent),
             ),
+          // 临时员工：与 teammates 入口**平级**（用户 2026-10-04：「应该做和 teammates 同级的热
+          // 工作显示，在对话框支持选择进入 subagent 视角」）——本会话有才出现，点开选一个进去。
+          if (agent != null) _buildSubagentEntry(agent),
           if (working)
             IconButton(
               tooltip: '停止',
@@ -1697,6 +1724,66 @@ class _MessagePanelState extends State<MessagePanel> {
     if (!mounted) return;
     // 关闭窗口兜底刷新（成员可能被其它入口改动过）
     widget.onAgentsChanged?.call();
+  }
+
+  /// 临时员工入口：**与"发出这次调用的 agent"同级**（用户 2026-10-04 的更正：不是与
+  /// teammates 同级）——它是这个 agent 自己召来的临时员工，入口就挂在它的会话头上，
+  /// 列的是"谁召来的"，深度叫「临时员工层数」而不是团队的「层级」。
+  Widget _buildSubagentEntry(Agent agent) {
+    return ListenableBuilder(
+      listenable: SubagentTranscript.instance,
+      builder: (BuildContext context, Widget? child) {
+        final List<String> ids = SubagentTranscript.instance.ids;
+        if (ids.isEmpty) return const SizedBox.shrink();
+        return PopupMenuButton<String>(
+          tooltip: '「${agent.name}」召来的临时员工（${ids.length} 名）',
+          icon: const Icon(Icons.badge_outlined, size: 20),
+          onSelected: (String id) => unawaited(_openSubagentView(agent, id)),
+          itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
+            for (final String id in ids)
+              PopupMenuItem<String>(
+                value: id,
+                child: Text(_subagentMenuLabel(agent, id)),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  /// 选择列表里的一行：**谁召来的** + 名字 + 深度 + 已有多少条过程。
+  ///
+  /// 措辞与 teammates 刻意分开（对齐语义）：这里是"某个 agent 召来的临时员工"，
+  /// 深度是**临时员工套娃层数**，不是团队成员的 `level`。
+  String _subagentMenuLabel(Agent agent, String id) {
+    final List<ChatMessage> transcript = SubagentTranscript.instance.of(id);
+    if (transcript.isEmpty) return id;
+    final ChatMessage first = transcript.first;
+    final String name = first.subagentName.isEmpty ? '未命名' : first.subagentName;
+    final String caller = SubagentTranscript.instance.callerNameOf(
+      id,
+      ownerAgentId: agent.id,
+      ownerName: agent.name,
+    );
+    final String who = caller.isEmpty ? '（未知调用方）' : '由「$caller」召来';
+    return '临时员工「$name」 · $who · 第 ${first.subagentLevel} 层 · '
+        '${transcript.length} 条过程';
+  }
+
+  /// 进入某个临时员工的视角（与 teammates 窗口同一层级的独立页面）。
+  Future<void> _openSubagentView(Agent agent, String subagentId) async {
+    final List<ChatMessage> transcript = SubagentTranscript.instance.of(subagentId);
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SubagentViewPage(
+          subagentId: subagentId,
+          agentId: agent.id,
+          sessionId: _currentSession?.sessionId ?? _currentSessionId,
+          fallbackName: transcript.isEmpty ? '' : transcript.first.subagentName,
+          ownerName: agent.name,
+        ),
+      ),
+    );
   }
 
   /// teammates 入口图标：有待处理成员时叠一个红色小圆点。

@@ -76,9 +76,12 @@ Future<void> pumpRowWithDetail(WidgetTester tester, ChatMessage m) async {
 }
 
 /// 详情页里出现过的某段可选文本
+/// 某段文本出现在可选文本里（纯文本与富文本都要认：详情页的变更块着色后走 textSpan）。
 bool hasSelectableText(WidgetTester tester, String expected) => tester
     .widgetList<SelectableText>(find.byType(SelectableText))
-    .any((SelectableText t) => t.data == expected);
+    .any(
+      (SelectableText t) => (t.data ?? t.textSpan?.toPlainText()) == expected,
+    );
 
 void main() {
   setUp(DetailSelection.instance.clear);
@@ -364,12 +367,14 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(
-        find.textContaining('下面只显示调用参数'),
+        find.textContaining('上下文不可得'),
         findsOneWidget,
-        reason: '拿不到就直说，别让用户以为看到的是 diff',
+        reason: '拿不到就直说，别让用户以为看到的是完整 diff',
       );
-      expect(hasSelectableText(tester, 'old();'), isTrue, reason: '退回参数视图');
-      expect(hasSelectableText(tester, 'new();'), isTrue);
+      expect(hasSelectableText(tester, 'old();'), isTrue, reason: '旧行（-）');
+      expect(hasSelectableText(tester, 'new();'), isTrue, reason: '新行（+）');
+      expect(find.text('-'), findsOneWidget);
+      expect(find.text('+'), findsOneWidget);
     });
 
     testWidgets('思考：详情页给完整推理内容', (WidgetTester tester) async {

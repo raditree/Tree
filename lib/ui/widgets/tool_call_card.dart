@@ -5,8 +5,12 @@ import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
 import '../models/message.dart';
+import '../services/code_highlight.dart';
+import '../services/code_highlight_lines.dart';
 import '../services/detail_selection.dart';
+import '../services/subagent_transcript.dart';
 import '../services/tool_change_view.dart';
+import 'subagent_process_list.dart';
 
 /// 一次工具调用的**一行**：图标 + 中文标签 + 关键参数（等宽），行尾给增量 / 转圈 / 箭头。
 ///
@@ -528,14 +532,25 @@ class _ToolDetailState extends State<ToolDetail> {
     final ColorScheme cs = Theme.of(context).colorScheme;
     final ChatMessage m = widget.message;
     final String name = _name;
-    final ToolDiffHunk? hunk = _hunk();
+    final ToolDiffHunk? fileHunk = _hunk();
+    // 翻历史：文件之后又被改过 ⇒ 读出来的当前内容里定位不到，退回"只用调用参数"的退化变更块
+    ToolDiffHunk? argsHunk;
+    if (name == 'edit' && fileHunk == null && !_loading) {
+      final Map<String, dynamic> args =
+          m.toolArguments ?? const <String, dynamic>{};
+      argsHunk = buildEditDiffFromArgs(
+        oldText: (args['old_text'] ?? '').toString(),
+        newText: (args['new_text'] ?? '').toString(),
+      );
+    }
+    final bool hasChange = fileHunk != null || argsHunk != null;
     final List<Widget> params = _buildParams(
       context,
       name,
       m.toolArguments,
-      hasDiff: hunk != null,
+      hasDiff: hasChange,
     );
-    final Widget? change = _buildChange(context, name, hunk);
+    final Widget? change = _buildChange(context, name, fileHunk, argsHunk);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
@@ -550,6 +565,18 @@ class _ToolDetailState extends State<ToolDetail> {
           _sectionLabel(context, '变更'),
           const SizedBox(height: 6),
           change,
+          const SizedBox(height: 16),
+        ],
+        // 临时员工：它的过程**不进主消息流**，就在这里看（用户 2026-10-04：
+        // 「subagent 的工具调用就在 subagent 的调用工具详情里看」）
+        if (name == 'subagent') ...<Widget>[
+          _sectionLabel(context, '这次调用召来的临时员工'),
+          const SizedBox(height: 6),
+          ListenableBuilder(
+            listenable: SubagentTranscript.instance,
+            builder: (BuildContext context, Widget? child) =>
+                _buildSubagentTranscript(context, m),
+          ),
           const SizedBox(height: 16),
         ],
         _sectionLabel(context, '执行结果'),
@@ -765,16 +792,100 @@ class _ToolDetailState extends State<ToolDetail> {
     );
   }
 
+  // ── 临时员工（subagent）：这次调用召来的员工干了什么 ─────────────────
+
+  /// 这条 `subagent` 调用对应的**临时员工过程**（它自己的文本 / 思考 / 工具调用）。
+  ///
+  /// 这些消息带着 `subagent_id` 混在会话流里，但**中栏不显示它们**（不跟主 agent 混）；
+  /// 这里按 id 取出来（[SubagentTranscript]），按发生顺序摊开——点其中一个工具行会切到
+  /// 那条工具自己的详情（drill-down），回主视角点中栏那一行即可。
+  Widget _buildSubagentTranscript(BuildContext context, ChatMessage call) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final Map<String, dynamic> args =
+        call.toolArguments ?? const <String, dynamic>{};
+    final String? id = _resolveSubagentId(call, args);
+    if (id == null) {
+      return Text(
+        '没找到它的过程记录：这次调用可能还没跑完（后台运行时报告会随后回来），'
+        '或者这条历史来自旧版本（那时过程消息不带标记）。',
+        style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant, height: 1.4),
+      );
+    }
+    final List<ChatMessage> transcript = SubagentTranscript.instance.of(id);
+    if (transcript.isEmpty) {
+      return Text(
+        '还没有收到它的过程消息（正在跑或已结束但只有报告）。',
+        style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+      );
+    }
+    final ChatMessage first = transcript.first;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Row(
+          children: <Widget>[
+            Icon(Icons.person_outline, size: 13, color: cs.onSurfaceVariant),
+            const SizedBox(width: 4),
+            Flexible(
+              child: Text(
+                '临时员工「${first.subagentName.isEmpty ? '未命名' : first.subagentName}」 · '
+                '第 ${first.subagentLevel} 层 · ${transcript.length} 条过程（它是这次调用召来的）',
+                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+        ),
+        if (subagentUsageLine(transcript) != null) ...<Widget>[
+          const SizedBox(height: 2),
+          Text(
+            subagentUsageLine(transcript)!,
+            style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+          ),
+        ],
+        const SizedBox(height: 8),
+        // 与"临时员工工作进度页"共用同一份过程渲染（不重复实现）
+        SubagentProcessList(
+          messages: transcript,
+          emptyHint: '还没有收到它的过程消息（正在跑或已结束但只有报告）。',
+        ),
+      ],
+    );
+  }
+
+  /// 这条调用对应哪个临时员工：优先从**工具结果**里那个 `id=sub_…` 认（核心在结果头里回传），
+  /// 认不出来再按 `name` 在已有过程里唯一匹配；都不行返回 null（界面如实说明）。
+  String? _resolveSubagentId(ChatMessage call, Map<String, dynamic> args) {
+    final RegExp match = RegExp(r'id=(sub_[A-Za-z0-9_]+)');
+    final RegExpMatch? found = match.firstMatch(call.toolResult);
+    if (found != null) return found.group(1);
+    final String name = (args['name'] ?? '').toString().trim();
+    if (name.isEmpty) return null;
+    final List<String> hits = SubagentTranscript.instance.ids
+        .where(
+          (String id) =>
+              SubagentTranscript.instance.of(id).first.subagentName == name,
+        )
+        .toList(growable: false);
+    return hits.length == 1 ? hits.single : null;
+  }
+
   // ── 「变更」一段：write 的内容 / edit 的带上下文 diff ─────────────────
 
   /// 按工具类型决定要不要给「变更」一段（返回 null = 这个工具没有变更可看）。
-  Widget? _buildChange(BuildContext context, String name, ToolDiffHunk? hunk) {
+  Widget? _buildChange(
+    BuildContext context,
+    String name,
+    ToolDiffHunk? fileHunk,
+    ToolDiffHunk? argsHunk,
+  ) {
+    final Map<String, dynamic> args =
+        widget.message.toolArguments ?? const <String, dynamic>{};
+    final String path = (args['file_path'] ?? '').toString();
     if (name == 'write') {
-      final Map<String, dynamic> args =
-          widget.message.toolArguments ?? const <String, dynamic>{};
       final String content = (args['content'] ?? '').toString();
       if (content.isEmpty) return null;
-      return _buildWriteBlock(context, buildWriteContent(content));
+      return _buildWriteBlock(context, buildWriteContent(content), path);
     }
     if (name != 'edit') return null;
     if (_loading) {
@@ -796,21 +907,43 @@ class _ToolDetailState extends State<ToolDetail> {
         ],
       );
     }
-    if (hunk != null) return _buildDiffBlock(context, hunk);
-    // 拿不到就如实说：绝不把「查找 / 替换」两段原文伪装成 diff
+    if (fileHunk != null) return _buildDiffBlock(context, fileHunk, path);
+    // 翻历史（文件之后又被改过 ⇒ 定位不到）时**也不能什么都不给**：退回"只用调用参数"的
+    // 退化变更块（- 旧 / + 新，没有上下文），并如实标注——用户 2026-10-04：
+    // 「翻历史的 edit 怎么全都找不到原始变更」。
     final String reason = _loadError ??
-        '文件里已找不到这段改动（可能之后又被改过），下面只显示调用参数。';
-    return Text(
-      reason,
-      style: TextStyle(
-        fontSize: 12,
-        color: Theme.of(context).colorScheme.onSurfaceVariant,
-      ),
+        '这份改动已不在当前文件里（之后又被改过）：上下文不可得，下面只按调用参数给出这次替换。';
+    if (argsHunk == null) {
+      return Text(
+        reason,
+        style: TextStyle(
+          fontSize: 12,
+          color: Theme.of(context).colorScheme.onSurfaceVariant,
+        ),
+      );
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          reason,
+          style: TextStyle(
+            fontSize: 12,
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 6),
+        _buildDiffBlock(context, argsHunk, path),
+      ],
     );
   }
 
-  /// write：把写进去的内容摊开（太长时截断并如实标注）。
-  Widget _buildWriteBlock(BuildContext context, WriteContentView view) {
+  /// write：把写进去的内容摊开（**按源码着色**；太长时截断并如实标注）。
+  Widget _buildWriteBlock(
+    BuildContext context,
+    WriteContentView view,
+    String path,
+  ) {
     final ColorScheme cs = Theme.of(context).colorScheme;
     final String note = view.truncated
         ? '（太长，下面只显示前面一段；全文去右栏「文件」页打开）'
@@ -825,21 +958,51 @@ class _ToolDetailState extends State<ToolDetail> {
         const SizedBox(height: 4),
         _codeContainer(
           context,
-          SelectableText(view.text, style: _codeStyle),
+          SelectableText.rich(
+            // 与源码视图同一套着色（同一门语言表、同一份配色）
+            buildCodeTextSpan(
+              text: view.text,
+              language: languageForPath(path),
+              theme: CodeTheme.of(context),
+              baseStyle: _codeStyle,
+            ),
+          ),
         ),
       ],
     );
   }
 
-  /// edit：带上下文的变更块（`-` 旧 / `+` 新 / 无前缀是上下文）。
-  Widget _buildDiffBlock(BuildContext context, ToolDiffHunk hunk) {
+  /// edit：带上下文的变更块（`-` 旧 / `+` 新 / 无前缀是上下文），**按源码着色**。
+  ///
+  /// 着色来自**整段**源码的词法结果（[codeColorRuns]）再按行切片：块注释与多行字符串是
+  /// 跨行的，逐行着色会在第二行起就掉色（用户 2026-10-04：「为什么没按源码渲染」）。
+  Widget _buildDiffBlock(
+    BuildContext context,
+    ToolDiffHunk hunk,
+    String path,
+  ) {
     final ColorScheme cs = Theme.of(context).colorScheme;
+    final CodeLanguage language = languageForPath(path);
+    final CodeTheme theme = CodeTheme.of(context);
+    final List<CodeColorRun> fileRuns = codeColorRuns(
+      text: hunk.fileText,
+      language: language,
+      theme: theme,
+    );
+    final List<CodeColorRun> beforeRuns = codeColorRuns(
+      text: hunk.beforeText,
+      language: language,
+      theme: theme,
+    );
     final String note = hunk.truncated ? ' · 只显示前 ${hunk.lines.length} 行' : '';
+    final String head = hunk.hasContext
+        ? '${hunk.header}$note'
+        : '这次替换（无上下文：文件之后又被改过，当时的上下文没有存下来）';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
         Text(
-          '${hunk.header}$note',
+          head,
           style: TextStyle(
             fontSize: 11,
             color: cs.onSurfaceVariant,
@@ -853,21 +1016,29 @@ class _ToolDetailState extends State<ToolDetail> {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: <Widget>[
               for (final ToolDiffLine line in hunk.lines)
-                _buildDiffRow(context, line),
+                _buildDiffRow(context, line, hunk, fileRuns, beforeRuns),
             ],
           ),
         ),
         const SizedBox(height: 4),
         Text(
-          '- ${hunk.removedCount} 行 · + ${hunk.addedCount} 行（上下文取自磁盘当前内容）',
+          hunk.hasContext
+              ? '- ${hunk.removedCount} 行 · + ${hunk.addedCount} 行（上下文取自磁盘当前内容）'
+              : '- ${hunk.removedCount} 行 · + ${hunk.addedCount} 行（来自这次调用的参数）',
           style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
         ),
       ],
     );
   }
 
-  /// diff 的一行：行首 marker + 正文；旧行红、新行绿、上下文跟随主题。
-  Widget _buildDiffRow(BuildContext context, ToolDiffLine line) {
+  /// diff 的一行：行首 marker + **按源码着色**的正文；旧行红底、新行绿底、上下文跟随主题。
+  Widget _buildDiffRow(
+    BuildContext context,
+    ToolDiffLine line,
+    ToolDiffHunk hunk,
+    List<CodeColorRun> fileRuns,
+    List<CodeColorRun> beforeRuns,
+  ) {
     final ColorScheme cs = Theme.of(context).colorScheme;
     final (Color fg, Color? bg) = switch (line.kind) {
       ToolDiffKind.removed => (
@@ -894,10 +1065,26 @@ class _ToolDetailState extends State<ToolDetail> {
             ),
           ),
           Expanded(
-            child: SelectableText(
-              line.text.isEmpty ? ' ' : line.text,
-              style: _codeStyle.copyWith(color: fg),
-            ),
+            child: line.sourceStart < 0 || line.sourceEnd < 0
+                ? SelectableText(
+                    line.text.isEmpty ? ' ' : line.text,
+                    style: _codeStyle.copyWith(color: fg),
+                  )
+                : SelectableText.rich(
+                    // 着色来自整段词法结果、按这一行的区间切片（块注释 / 多行字符串不断色）
+                    codeSpanForRange(
+                      text: line.kind == ToolDiffKind.removed
+                          ? hunk.beforeText
+                          : hunk.fileText,
+                      runs: line.kind == ToolDiffKind.removed
+                          ? beforeRuns
+                          : fileRuns,
+                      start: line.sourceStart,
+                      end: line.sourceEnd,
+                      // 基础色 = 该行的语义色（红 / 绿 / 灰），记号色覆盖在它上面
+                      baseStyle: _codeStyle.copyWith(color: fg),
+                    ),
+                  ),
           ),
         ],
       ),

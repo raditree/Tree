@@ -41,9 +41,13 @@ void main() {
   }
 
   /// 详情页里出现过的某段可选文本（与工具行用例同一口径）
+  /// 某段文本出现在可选文本里（**纯文本与富文本都要认**：着色之后正文走 textSpan）。
   bool hasSelectableText(WidgetTester tester, String expected) => tester
       .widgetList<SelectableText>(find.byType(SelectableText))
-      .any((SelectableText t) => t.data == expected);
+      .any(
+        (SelectableText t) =>
+            (t.data ?? t.textSpan?.toPlainText()) == expected,
+      );
 
   ChatMessage editMessage({
     String oldText = '旧的一行',
@@ -119,7 +123,7 @@ void main() {
     );
   });
 
-  testWidgets('edit：文件里找不到这段（又被改过）⇒ 如实说明并退回参数视图', (
+  testWidgets('edit：文件里找不到这段（翻历史）⇒ 仍给 -/+ 变更块，并如实标"无上下文"', (
     WidgetTester tester,
   ) async {
     core.content = '完全另一份内容';
@@ -128,12 +132,60 @@ void main() {
     await pumpDetail(tester, editMessage());
 
     expect(
-      find.textContaining('下面只显示调用参数'),
+      find.textContaining('上下文不可得'),
       findsOneWidget,
-      reason: '不许把两段原文伪装成 diff',
+      reason: '如实说明：上下文没被存下来（用户 2026-10-04 的追问）',
     );
-    expect(hasSelectableText(tester, '旧的一行'), isTrue, reason: '退回「查找」');
-    expect(hasSelectableText(tester, '新的一行'), isTrue, reason: '退回「替换」');
+    expect(
+      find.textContaining('无上下文'),
+      findsOneWidget,
+      reason: '变更块头部也要写明',
+    );
+    expect(hasSelectableText(tester, '旧的一行'), isTrue, reason: '旧行（-）');
+    expect(hasSelectableText(tester, '新的一行'), isTrue, reason: '新行（+）');
+    expect(find.text('-'), findsOneWidget);
+    expect(find.text('+'), findsOneWidget);
+  });
+
+  testWidgets('diff 与写入内容都**按源码着色**（不是一色到底）', (
+    WidgetTester tester,
+  ) async {
+    core.content = <String>[
+      '// 说明',
+      'final int x = 1;',
+      'final int y = 2;',
+    ].join('\n');
+    core.contentSize = core.content.length;
+
+    await pumpDetail(
+      tester,
+      editMessage(oldText: 'final int x = 1;', newText: 'final int y = 2;'),
+    );
+
+    // 走 [SelectableText.rich]：正文被切成若干带色 span，而不是一整块单色
+    final SelectableText line = tester
+        .widgetList<SelectableText>(find.byType(SelectableText))
+        .firstWhere(
+          (SelectableText t) =>
+              t.textSpan != null && t.textSpan!.toPlainText() == 'final int y = 2;',
+        );
+    final Set<Color> colors = <Color>{};
+    void walk(InlineSpan span) {
+      final Color? color = span.style?.color;
+      if (color != null) colors.add(color);
+      if (span is TextSpan && span.children != null) {
+        for (final InlineSpan child in span.children!) {
+          walk(child);
+        }
+      }
+    }
+
+    walk(line.textSpan!);
+    expect(
+      colors.length,
+      greaterThan(1),
+      reason: '关键字 / 数字 / 普通文本应当有不同颜色（用户：为什么没按源码渲染）',
+    );
   });
 
   testWidgets('edit：读不到文件（核心报错）⇒ 可读原因，不是空白', (

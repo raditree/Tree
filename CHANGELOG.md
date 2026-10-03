@@ -254,6 +254,16 @@
   [tool_change_view.dart](lib/ui/services/tool_change_view.dart)（可单测），读文件要工作空间 id：`DetailPanel` 从
   FilePanel 拿到 `workspaceId` / `teamId` 后透传给 `ToolDetail`。
 
+- **详情页变更按源码渲染 + 翻历史也给 -/+ + 临时员工独立视角 + 上下文用量隔离**（[lib/README.md](lib/README.md)
+  不变量 11 / 18，**用户断言 2026-10-04**）：① `write` 的内容与 `edit` 的变更块**按源码着色**（整段词法结果按行切片：
+  块注释 / 多行字符串跨行不断色，见 [code_highlight_lines.dart](lib/ui/services/code_highlight_lines.dart)）；
+  ② `edit` 定位不到（文件之后又被改过）时**不再什么都不给**：退回「只用调用参数」的 `-` / `+` 变更块，并如实标注
+  「上下文不可得」（那份上下文当时没存下来——要带上下文地翻历史需要核心在编辑时就把它记下来，见下条待办）；
+  ③ 临时员工的输出**不进中栏主消息流**，在「调用它的那次 `subagent` 工具调用的详情页」与「它自己的工作进度页」里看，
+  两处共用同一份过程渲染；④ 语义对齐：它与**发出这次调用的那个 agent** 同级（**不是**与 teammates 同级），入口挂在那个
+  agent 的会话头上，措辞「由「X」召来 · 第 N 层」，不复用团队的「层级」一词；⑤ **它的上下文长度不计入主 agent 的读数**
+  （实时帧带 `subagent_id` 不记账、历史恢复跳过带标记消息），只在它自己的视图里显示。
+
 ### Added（首个版本总览）
 
 - **单进程桌面形态**：Flutter 界面 + 纯 Dart 核心 `tree_core`（可编译成单文件，约 10 MB）；

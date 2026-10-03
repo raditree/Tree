@@ -144,6 +144,51 @@ void main() {
       );
     });
 
+    test('每行都带着"它在哪段源码的哪一段"（界面据此按整段着色切片）', () {
+      final ToolDiffHunk? hunk = buildEditDiff(
+        fileText: fileWith('新的一行'),
+        oldText: '旧的一行',
+        newText: '新的一行',
+      );
+      expect(hunk, isNotNull);
+      expect(hunk!.hasContext, isTrue);
+      for (final ToolDiffLine line in hunk.lines) {
+        final String source = line.kind == ToolDiffKind.removed
+            ? hunk.beforeText
+            : hunk.fileText;
+        expect(line.sourceStart, greaterThanOrEqualTo(0));
+        expect(
+          source.substring(line.sourceStart, line.sourceEnd),
+          line.text,
+          reason: '区间必须正好圈住这一行：${line.kind.name}',
+        );
+      }
+    });
+
+    test('翻历史（只有调用参数）：退化成 -旧/+新，且**如实标没有上下文**', () {
+      final ToolDiffHunk? hunk = buildEditDiffFromArgs(
+        oldText: 'old1\nold2',
+        newText: 'new1',
+      );
+      expect(hunk, isNotNull);
+      expect(hunk!.hasContext, isFalse, reason: '不能假装这是完整 diff');
+      expect(
+        hunk.lines.map((ToolDiffLine l) => '${l.marker}${l.text}').toList(),
+        <String>['-old1', '-old2', '+new1'],
+      );
+      expect(hunk.removedCount, 2);
+      expect(hunk.addedCount, 1);
+      // 两段源码各自给出，界面照样能按源码着色
+      expect(hunk.beforeText, 'old1\nold2');
+      expect(hunk.fileText, 'new1');
+      final ToolDiffLine removed = hunk.lines.first;
+      expect(
+        hunk.beforeText.substring(removed.sourceStart, removed.sourceEnd),
+        'old1',
+      );
+      expect(buildEditDiffFromArgs(oldText: '', newText: ''), isNull);
+    });
+
     test('上下文可调；行数超上限时标 truncated 且只留前 N 行', () {
       final ToolDiffHunk? hunk = buildEditDiff(
         fileText: fileWith('x'),
