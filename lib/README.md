@@ -377,6 +377,23 @@
     （宁可不补，也不错补上千像素）。
     跟随模式下依旧"粘底"（贴住就一直跟着长高走，用户一上滚立刻停手）。
 
+20. **「用量」与「核心日志」两块读数都直接读本机文件，路径只能来自握手**（
+    [ui/services/usage_log_files.dart](ui/services/usage_log_files.dart)、
+    [ui/services/core_log_files.dart](ui/services/core_log_files.dart)、
+    [ui/widgets/usage_calls_panel.dart](ui/widgets/usage_calls_panel.dart)、
+    [ui/widgets/core_log_card.dart](ui/widgets/core_log_card.dart)）：
+    ① 数据根只有一个来源 —— 握手可选字段 `data_root`（[io/core_process_launcher.dart](io/core_process_launcher.dart)）；
+    拿不到就说"没有入口"（老核心 / 附着模式 / 核心未起），**绝不猜** `%APPDATA%\Tree` 之类的替代路径；
+    ② 目录名按核心口径拼（`data/<agent_id>/<session_id>/…`）并做**路径穿越校验**（只允许 `[A-Za-z0-9_.-]`，
+    拒绝 `.` / `..` / 空串），非法 id 只是"这一条读不了"，不是崩溃；
+    ③ **只读尾部**（日志 200 行 ≤512 KiB、账本 50 行 ≤256 KiB）、坏行跳过并计数、任何 IO 异常都转成
+    一句可读原因（"读不到"与"还没调用过"必须分得开）——这两块都是旁路读数，**永不抛、永不红**；
+    ④ **账本会在"没有对话帧"的时刻增长**：压缩那两路（内置 `compact`、插件中转经执行站 `llm.call`）
+    只写 `usage.jsonl`、不发对话帧，实时行入口永远收不到它们 ⇒ 「本轮调用列表」在挂载读一次之外，
+    还必须**在 `llm_hidden` 系统提示帧到达时**（自动/手动压缩都会来）**以及离开 `compacting` 状态时**
+    重读账本尾部（重读走同键去重 + 孪生合并，重复读不会长出第二行）——
+    少了这一步，用户点了压缩、账本明明多了一行，界面却永远显示「0 次」（用户 2026-10-03 真机报告）。
+
 ## 测试
 
 ```bash

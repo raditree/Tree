@@ -421,4 +421,99 @@ void main() {
 
     await closePanel(tester);
   });
+
+  testWidgets('⑧ 无对话帧的用量落账（压缩/执行站）⇒ 收到 llm_hidden 通知帧必须重读账本', (
+    WidgetTester tester,
+  ) async {
+    // 用户 2026-10-03 真机报告：「点了一次压缩，LLM 调用列表没计入压缩使用的 LLM」。
+    // 压缩那笔账是插件经执行站 `llm.call` 打的 —— 它**不产生任何对话帧**，
+    // 所以面板若只在挂载时读一次账本，就永远看不到它（用户看到的 0 次）。
+    final String path = '${tempDir.path}${Platform.pathSeparator}usage.jsonl';
+    MessagePanel.debugUsageFileOverride = path;
+
+    await pumpPanel(tester);
+    // 挂载那一刻账本还不存在（核心还没写过这一笔）⇒ 0 次
+    expect(find.text('本轮调用列表（0 次）'), findsOneWidget);
+
+    // 压缩完成：账本多一行（llm.call，就是真机那一笔），核心同时下发 llm_hidden 通知
+    // （② 的落库通路，自动与手动压缩都会来）
+    File(path).writeAsStringSync(
+      '${usageLine(
+        at: '2026-10-03T18:21:58.975',
+        source: 'llm.call',
+        model: 'deepseek-v4.1-flash',
+        prompt: 360269,
+        cached: 360192,
+        completion: 7607,
+        durationMs: 49511,
+      )}\n',
+    );
+    core.push(<String, dynamic>{
+      'type': 'msg_end',
+      'agent_id': 'a1',
+      'session_id': 'session_default',
+      // 通知的 id 不在窗口里（历史里没有这条消息）——它照样要能触发重读
+      'id': 'notice_compact_1',
+      'llm_hidden': true,
+      'content': '上下文已压缩（来源：插件中转站压缩），当前 28 条',
+    });
+    await flyIO(tester);
+
+    expect(
+      find.text('本轮调用列表（1 次）'),
+      findsOneWidget,
+      reason: 'llm_hidden 通知 = "发生了帧之外的事"，此时必须重读账本尾部',
+    );
+    await expand(tester);
+    expect(find.text('插件 llm.call'), findsOneWidget);
+    expect(find.text('360,269'), findsOneWidget);
+    expect(find.text('360,192'), findsOneWidget);
+    expect(find.text('7,607'), findsOneWidget);
+    expect(
+      find.textContaining('还没有 usage.jsonl'),
+      findsNothing,
+      reason: '账本已经在了，挂载时那句空态不该继续显示',
+    );
+
+    await closePanel(tester);
+  });
+
+  testWidgets('⑨ 压缩状态结束（compacting → working）也重读一次账本', (WidgetTester tester) async {
+    final String path = '${tempDir.path}${Platform.pathSeparator}usage.jsonl';
+    MessagePanel.debugUsageFileOverride = path;
+
+    await pumpPanel(tester);
+    expect(find.text('本轮调用列表（0 次）'), findsOneWidget);
+
+    // 压缩开始（核心会发这条状态）
+    core.push(<String, dynamic>{
+      'type': 'agent_status',
+      'data': <String, dynamic>{'agent_id': 'a1', 'status': 'compacting'},
+    });
+    await flyIO(tester);
+
+    // 压缩结束：账本多一行（内置压缩这笔），状态回到 working
+    File(path).writeAsStringSync(
+      '${usageLine(
+        at: '2026-10-03T18:21:58.975',
+        source: 'compact',
+        prompt: 12000,
+        completion: 800,
+        durationMs: 1830,
+      )}\n',
+    );
+    core.push(<String, dynamic>{
+      'type': 'agent_status',
+      'data': <String, dynamic>{'agent_id': 'a1', 'status': 'working'},
+    });
+    await flyIO(tester);
+
+    expect(
+      find.text('本轮调用列表（1 次）'),
+      findsOneWidget,
+      reason: '离开 compacting 状态 = 压缩那一刻的用量已经落账',
+    );
+
+    await closePanel(tester);
+  });
 }

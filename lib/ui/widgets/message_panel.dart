@@ -1043,6 +1043,14 @@ class _MessagePanelState extends State<MessagePanel> {
     if (PluginUiRegistry.instance.handleFrame(data)) return;
     final String? type = data['type'] as String?;
 
+    // 账本会在**没有对话帧**的时刻增长：压缩那两路（内置 `compact` / 插件中转经执行站
+    // `llm.call`）都是核心内部或**插件进程**发起的调用，只写 `usage.jsonl`、不发对话帧
+    // ⇒ 实时行入口（[_appendCallUsage] 那条路）永远收不到它们。
+    // `llm_hidden` 系统提示帧（"上下文已压缩（来源：…）"这类，自动与手动压缩都会来）
+    // 就是"发生了帧之外的事"的权威信号 ⇒ 重读一次账本尾部
+    // （见 [_refreshCallUsagesHistory]；用户 2026-10-03 报告「压缩用的 LLM 没计进列表」）。
+    if (_isLlmHiddenFrame(data)) _refreshCallUsagesHistory();
+
     if (type == 'msg_start') {
       if (!_isForCurrentAgent(data) || !_isForCurrentSession(data)) return;
       final ChatMessage message = ChatMessage(
@@ -1221,6 +1229,9 @@ class _MessagePanelState extends State<MessagePanel> {
       // 临时员工的帧带它自己的标记（agent_id 仍是会话主人）：单独记一份，中栏的
       // "临时员工视角"据此决定右下角是停止键还是发送键（用户 2026-10-04）
       final String subagentId = (d['subagent_id'] as String?) ?? '';
+      // 离开 compacting = 这一轮压缩结束（内置与中转站都算）：用量此刻已落账。
+      // 提示帧是主信号，这里只是兜底（旧核心 / 通知被吞时），见 [_refreshCallUsagesHistory]。
+      final bool wasCompacting = _compactingAgents.contains(agentId);
       setState(() {
         if (status == 'working') {
           _workingAgents.add(agentId);
@@ -1235,6 +1246,7 @@ class _MessagePanelState extends State<MessagePanel> {
           if (subagentId.isNotEmpty) _workingSubagents.remove(subagentId);
         }
       });
+      if (wasCompacting && status != 'compacting') _refreshCallUsagesHistory();
     } else if (type == 'ask_user_question') {
       _handleAskUserQuestion(data);
     } else if (type == 'ask_user_question_resolved') {
@@ -1398,6 +1410,39 @@ class _MessagePanelState extends State<MessagePanel> {
       durationMs: base.durationMs ?? extra.durationMs,
       at: base.at ?? extra.at,
     );
+  }
+
+  /// 作废"这个会话只读过一次账本"的记账，并立刻重读一次（账本尾部 50 行）。
+  ///
+  /// 为什么必须有它：账本会在**没有对话帧**的时刻增长 —— 压缩的内置 `compact` 走核心自己的
+  /// 总结器、插件中转经执行站 `llm.call`，两者都只写账本、不发对话帧，所以
+  /// [_appendUsageCall]（实时行入口）永远看不到它们。若只在挂载时读一次，用户点了压缩、
+  /// 账本明明多了一行，界面上却永远是「本轮调用列表（0 次）」——用户 2026-10-03 的真机报告。
+  ///
+  /// 两个触发信号（都在既有帧里，不新增协议）：
+  /// - `llm_hidden` 系统提示帧（[_isLlmHiddenFrame]）：`_notifyCompacted` 落库的那条
+  ///   "上下文已压缩（来源：…）"，**自动与手动压缩都会来** ⇒ 主信号；
+  /// - `agent_status` 离开 `compacting` 那一刻（[_handleIncomingMessage] 里）⇒ 兜底。
+  ///
+  /// 重读走 [_mergeUsageHistory]：同键去重 + 实时行孪生合并都在里面 ⇒ 重复读不会长出第二行，
+  /// 读不到也只是留一句可读原因（不抛、不红）。
+  void _refreshCallUsagesHistory() {
+    final Agent? agent = widget.selectedAgent;
+    if (agent == null) return;
+    // 还没读过（这个会话压根没加载）⇒ 交给 [_loadHistory] 那次读，别提前开跑。
+    if (_callUsagesKey.isEmpty) return;
+    _callUsagesKey = '';
+    _scheduleCallUsagesHistory(agent.id, _currentSessionId);
+  }
+
+  /// 这一帧是不是"给人看、不喂模型"的系统提示（`llm_hidden`）。
+  ///
+  /// 两种承载形态都认：提示消息的字段直接铺在帧上（`msg_end` / `msg_chunk` 这类），
+  /// 或包在 `data` 里（事件帧的统一外壳）。
+  static bool _isLlmHiddenFrame(Map<String, dynamic> data) {
+    if (data['llm_hidden'] == true) return true;
+    final Object? inner = data['data'];
+    return inner is Map && inner['llm_hidden'] == true;
   }
 
   /// 按 `(agent, 会话)` 读一次 `usage.jsonl`，把**历史**调用补进逐调用列表。
