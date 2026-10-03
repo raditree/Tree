@@ -248,4 +248,94 @@ void main() {
       reason: '非法取值显式拒绝',
     );
   });
+
+  group('成员面板只列「自己的下属」：不列自己、不列兄弟、不列上级', () {
+    test('成员看自己的面板：名单为空 + pending 0 + self 如实标注', () async {
+      final String leader = createMember('甲');
+      createMember('乙');
+      final _Res res = await client.send(
+        'GET',
+        '/api/agents/$leader/teammates',
+      );
+      expect(res.status, 200);
+      expect(
+        res.json['members'],
+        isEmpty,
+        reason: '成员不是「自己的成员」；以前这里回的是整队（含它自己，用户 2026-10-03 报的）',
+      );
+      expect(res.json['pending_member_count'], 0);
+      final Map<String, dynamic> self =
+          res.json['self'] as Map<String, dynamic>;
+      expect(self['id'], leader);
+      expect(self['name'], '甲');
+      expect(self['is_member'], isTrue, reason: '根卡片要能如实说「这是成员」');
+      expect(self['level'], 1);
+      expect(self['top_agent_id'], top.id);
+      expect(self['top_agent_name'], '队长');
+    });
+
+    test('成员带自己的下级：只列那个下级（不含自己、兄弟、上级）', () async {
+      final String leader = createMember('甲');
+      createMember('乙');
+      final String grand =
+          teams.createMember(leader, <String, dynamic>{
+                'action': 'create_member',
+                'member_name': '丙',
+              })['member_id']
+              as String;
+      final _Res res = await client.send(
+        'GET',
+        '/api/agents/$leader/teammates',
+      );
+      final List<dynamic> members = res.json['members'] as List<dynamic>;
+      expect(members, hasLength(1), reason: '只有它自己的下属');
+      expect((members.single as Map<String, dynamic>)['id'], grand);
+    });
+
+    test('TOP 视角逐字不变：整队 + self 是 Level 0（顺序不断言，见下）', () async {
+      final String a = createMember('甲');
+      final String b = createMember('乙');
+      final _Res res = await client.send(
+        'GET',
+        '/api/agents/${top.id}/teammates',
+      );
+      // 顺序不断言：同一毫秒创建的两个成员在 `members()` 里本来就是平局
+      // （谁在前按 id 决定），这里只钉「TOP 拿到的是整队」这半句。
+      final List<String> ids = (res.json['members'] as List<dynamic>)
+          .map((dynamic e) => (e as Map<String, dynamic>)['id'] as String)
+          .toList();
+      expect(ids, hasLength(2));
+      expect(ids, containsAll(<String>[a, b]));
+      final Map<String, dynamic> self =
+          res.json['self'] as Map<String, dynamic>;
+      expect(self['is_member'], isFalse);
+      expect(self['level'], 0);
+      expect(self['top_agent_id'], '');
+      expect(self['top_agent_name'], '');
+    });
+
+    test('两个入口同口径：list_members 里自己只有 team_leader 一行，teammates 里根本不出现',
+        () async {
+      final String leader = createMember('甲');
+      final List<dynamic> toolMembers =
+          teams.listMembers(leader)['members'] as List<dynamic>;
+      expect(
+        toolMembers.where(
+          (dynamic e) => (e as Map<String, dynamic>)['id'] == leader,
+        ),
+        hasLength(1),
+        reason: '自己是 team_leader 那一行，且只有一行（重复出现是旧 bug）',
+      );
+      final _Res res = await client.send(
+        'GET',
+        '/api/agents/$leader/teammates',
+      );
+      expect(
+        (res.json['members'] as List<dynamic>).where(
+          (dynamic e) => (e as Map<String, dynamic>)['id'] == leader,
+        ),
+        isEmpty,
+      );
+    });
+  });
 }

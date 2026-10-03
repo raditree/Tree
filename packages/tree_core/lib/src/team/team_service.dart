@@ -737,6 +737,16 @@ class TeamService {
   }
 
   /// `GET /api/agents/{id}/teammates` 的响应体。
+  ///
+  /// **成员名单 = 这个 agent 自己的下属**，不是「它所属的团队」：根是它自己（`self`），
+  /// 下面按层级列**它自己的**子树。TOP 的子树就是整队，取值与顺序跟以前逐字一致；
+  /// 成员的子树通常为空——**绝不把自己、自己的兄弟、自己的上级列成「它的成员」**。
+  ///
+  /// 为什么（用户 2026-10-03 报的）：以前一律取 `members(teamIdOf(id))`，而成员回指
+  /// 团队 ⇒「凌川」的成员面板里出现了「凌川」自己（同队兄弟也被算成它的下属），
+  /// 根卡片还写着「Level 0 · 团队负责人」。`team` 工具的 `list_members` 早就把自己
+  /// 排除掉了（同一类 bug 的前一半），这里补齐，并额外回一份 `self` 描述符，
+  /// 让界面能如实标注根节点是什么。
   Map<String, dynamic> teammatesPayload(String agentId) {
     final CoreAgent? self = store.agent(agentId);
     if (self == null) {
@@ -744,10 +754,14 @@ class TeamService {
         'agent_id': agentId,
         'members': <Map<String, dynamic>>[],
         'pending_member_count': 0,
+        'self': null,
       };
     }
     final String teamId = teamIdOf(agentId);
-    final List<CoreAgent> all = members(teamId);
+    // TOP：整队（顺序照旧，别顺手改成 BFS）；成员：只列自己的下属子树（不含自己）。
+    final List<CoreAgent> all = self.teamId.isEmpty
+        ? members(teamId)
+        : descendants(agentId);
     int pending = 0;
     final List<Map<String, dynamic>> views = <Map<String, dynamic>>[];
     for (final CoreAgent member in all) {
@@ -769,6 +783,17 @@ class TeamService {
       'agent_id': agentId,
       'members': views,
       'pending_member_count': pending,
+      // 根卡片的数据源：成员**不是** Level 0、也不是团队负责人，界面据此如实标注。
+      'self': <String, dynamic>{
+        'id': self.id,
+        'name': self.name,
+        'level': self.level,
+        'is_member': self.teamId.isNotEmpty,
+        'top_agent_id': self.teamId.isEmpty ? '' : teamId,
+        'top_agent_name': self.teamId.isEmpty
+            ? ''
+            : (store.agent(teamId)?.name ?? ''),
+      },
     };
   }
 

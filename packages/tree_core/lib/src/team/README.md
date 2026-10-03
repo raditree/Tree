@@ -50,6 +50,15 @@
     **不可以退回"重新选择工作目录"**（配置不能留空，按 TOP 填写）——没有这份镜像，成员会悄悄落到
     `workspaces/<member_id>`，用户看到的是"文件不见了"。
     口径边界：镜像不是"第二份配置"，手改它没有意义（运行期不看、下次镜像会覆盖回去）。
+14. **成员面板列的是「这个 agent 自己的下属」，不是「它所属的团队」**
+    （[test/teammates_api_test.dart](../../../test/teammates_api_test.dart) 强制；**用户断言 2026-10-03**：
+    成员「凌川」的成员面板里出现了「凌川」自己）：`GET /api/agents/{id}/teammates` 的成员名单 = 以该 agent
+    为根的**下属子树**——TOP（`team_id` 为空）取 `members(teamId)`（就是整队，取值与顺序照旧），
+    成员取 `descendants(id)`；**绝不把自己、自己的兄弟、自己的上级列成「它的成员」**，
+    `pending_member_count` 只数这份名单。响应体额外回一份 `self` 描述符（`id` / `name` / `level` /
+    `is_member` / `top_agent_id` / `top_agent_name`），界面据此如实标注根节点——成员**不是** Level 0、
+    也不是「团队负责人」。为什么以前会错：`teamIdOf(id)` 对成员回指团队，于是整队（含它自己）都成了
+    「它的成员」；`team` 工具的 `list_members` 早就把自己排除掉了（同一类口径的前一半），这里是后一半。
 
 ## 测试
 

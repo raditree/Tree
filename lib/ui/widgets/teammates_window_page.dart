@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../models/agent.dart';
 import '../models/message.dart';
+import '../services/teammates_view.dart';
 import '../../io/api_service.dart';
 import '../../io/websocket_service.dart';
 import 'message_list.dart';
@@ -9,7 +10,11 @@ import 'message_list.dart';
 /// teammates 工作进度窗口
 ///
 /// 进入时展示该 agent 的团队成员拓扑：根节点为当前 agent，下面按层级
-/// （Level 1/2/…）分组展示各成员。每个成员卡片显示名称、状态
+/// （Level 1/2/…）分组展示各成员。
+///
+/// **「成员」= 这个 agent 自己的下属**，不是「它所属的团队」：成员的窗口里
+/// 不会出现它自己、它的兄弟或它的上级（用户 2026-10-03 报的「凌川的成员里有凌川」；
+/// 规则与判据见 [teammates_view.dart] 与 team/README.md 不变量 14）。每个成员卡片显示名称、状态
 /// （working/idle）、模型、层级与评价。点击成员可进入其工作进度详情页
 /// （进度消息与工具卡片、活动日志、直接发消息）。
 /// 团队成员与 leader 共享工作目录 base，故不提供单独的文件浏览。
@@ -36,6 +41,9 @@ class TeammatesWindowPage extends StatefulWidget {
 
 class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
   List<Map<String, dynamic>> _members = <Map<String, dynamic>>[];
+
+  /// 根卡片（顶部那张）的数据源；`_load` 前用前端已有的 teamId 兜底。
+  TeammatesRoot? _root;
   bool _loading = true;
   String? _error;
 
@@ -115,14 +123,20 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
     try {
       final Map<String, dynamic> data =
           await ApiService.getTeammatesPayload(widget.agent.id);
-      final List<dynamic> raw = data['members'] as List<dynamic>? ?? <dynamic>[];
-      final List<Map<String, dynamic>> members = raw
-          .map((dynamic e) =>
-              (e as Map<dynamic, dynamic>).cast<String, dynamic>())
-          .toList();
+      // 「成员」= 这个 agent 自己的下属：核心已按此口径下发，前端再滤掉自己一道。
+      final List<Map<String, dynamic>> members = teammatesMembers(
+        payload: data,
+        selfId: widget.agent.id,
+      );
+      final TeammatesRoot root = teammatesRoot(
+        payload: data,
+        fallbackName: widget.agent.name,
+        fallbackIsMember: widget.agent.teamId.isNotEmpty,
+      );
       if (!mounted) return;
       setState(() {
         _members = members;
+        _root = root;
         _pendingCount = (data['pending_member_count'] as num?)?.toInt() ??
             members
                 .where((Map<String, dynamic> m) =>
@@ -182,12 +196,18 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
             textAlign: TextAlign.center),
       );
     }
-    // 拓扑：根为 leader，成员按层级（Level 1/2/…）分组展示
+    // 拓扑：根为当前 agent，成员按层级（Level 1/2/…）分组展示
+    final TeammatesRoot root = _root ??
+        teammatesRoot(
+          payload: null,
+          fallbackName: widget.agent.name,
+          fallbackIsMember: widget.agent.teamId.isNotEmpty,
+        );
     return ListView(
       padding: const EdgeInsets.all(16),
       children: <Widget>[
         if (_pendingCount > 0) _buildPendingBanner(),
-        _buildLeaderCard(),
+        _buildLeaderCard(root),
         const SizedBox(height: 16),
         ..._buildLevelGroups(),
       ],
@@ -246,7 +266,9 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
     return children;
   }
 
-  Widget _buildLeaderCard() {
+  /// 根卡片：**如实标注这个 agent 在团队里的位置**——成员不是 Level 0、不是团队负责人，
+  /// 副标题由 [TeammatesRoot.subtitle] 按核心给的 `self` 描述符决定。
+  Widget _buildLeaderCard(TeammatesRoot root) {
     final cs = Theme.of(context).colorScheme;
     return Container(
       padding: const EdgeInsets.all(12),
@@ -261,7 +283,7 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
             radius: 18,
             backgroundColor: cs.primary,
             child: Text(
-              widget.agent.name.isNotEmpty ? widget.agent.name[0] : 'L',
+              root.name.isNotEmpty ? root.name[0] : 'L',
               style: TextStyle(color: cs.onPrimary, fontSize: 14),
             ),
           ),
@@ -271,13 +293,13 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
                 Text(
-                  widget.agent.name,
+                  root.name,
                   style: const TextStyle(
                       fontSize: 14, fontWeight: FontWeight.w600),
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  'Level 0 · 团队负责人',
+                  root.subtitle,
                   style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
                 ),
               ],

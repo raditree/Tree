@@ -73,6 +73,10 @@
     [ui/widgets/detail_panel.dart](ui/widgets/detail_panel.dart)、[ui/services/detail_selection.dart](ui/services/detail_selection.dart)）：
     模型消息是**高亮块**（左侧主色竖条 + 极淡同色底，**没有整圈边框**），用户消息仍是主色气泡；
     工具调用一行 =「中文标签 + 关键参数（等宽）」+ 行尾增量（编辑 / 写入按行数给 `+N -M`）、转圈或箭头；
+    增量**只从这次调用的参数算**：`edit` 取 `old_text` / `new_text`、`write` 取 `content`——**核心 schema 的键名**
+    （不是 `path` / `old_string` / `new_string`；对错了就是恒 `+0 -0`）；编辑工具的**结果**只有「已替换 N 处」这类话、
+    **不带 diff**，所以不许去解析结果文本；参数不全 / 不是编辑写入类工具 ⇒ 行尾**不给数字**（`+0 -0` 是假信息，宁缺勿假）；
+    行数与核心的 `LineSplitter` 同口径（末尾换行不额外算一行）。
     思考一行 =「思考 · 首行摘要」。**中栏不再就地展开**——一轮里工具动辄几十条，卡片会把时间线切散，
     一行之后整轮动作像一份清单。悬停有呼应（图标提亮 + 底色），点击 → 右栏**第 5 个内置页签「详情」**摊开完整参数与结果；
     右栏收着时自动展开。选中项走 [DetailSelection](ui/services/detail_selection.dart)（全局 ChangeNotifier，存消息**快照**，
@@ -111,6 +115,9 @@
 14. **Ctrl+J 把输入框那块换成集成终端（真 PTY）**（[ui/widgets/terminal_panel.dart](ui/widgets/terminal_panel.dart)、
     [ui/services/vt_screen.dart](ui/services/vt_screen.dart)、[io/websocket_service.dart](io/websocket_service.dart) 的 `terminalFrames`）：
     打开时**主动展开**（按面板高 40%，夹 160–420）并把焦点交给终端，再按一次回到输入框（草稿靠草稿缓存原样回来）；
+    快捷键**与焦点无关**：绑在 MainPage 顶层的 `CallbackShortcuts`（`main-global-shortcuts`）上，经全局
+    [TerminalToggleRequest](ui/services/terminal_toggle_request.dart) 广播——焦点在文件树 / 代码编辑器 / 详情页 / 终端自身时
+    照样唤起（挂在输入框上的局部快捷键只在输入框有焦点时收得到）；**没有任何主焦点时**冒泡到顶层这一路也成立。
     终端**没有输入行**——所有按键经 `Focus.onKeyEvent` 译成终端字节（回车 `\r`、退格 `0x7f`、方向键 `ESC[A..D`、
     Ctrl+字母 `0x01..0x1A`、可打印字符走 `event.character` 的 UTF-8），Ctrl+J 例外（留给切换）。
     核心开**真伪终端**，输出是**原始字节**（base64 过 WS），前端用自制的 VT 解析器还原成屏幕

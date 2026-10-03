@@ -63,13 +63,18 @@
   退出码，`close()` 幂等且收掉进程；Windows 走 **ConPTY**（`dart:ffi` 直调 kernel32，阻塞读放独立 isolate），
   POSIX 走系统 `script`，后端或 API 缺失一律**显式抛可读错误**（`PtyUnsupportedException`），
   **绝不静默降级**成无 TTY 的一次性 `exec`；改尺寸做不到时只记日志不抛。
-- **Ctrl+J 打开集成终端（真 PTY）**（[lib/README.md](lib/README.md) 不变量 14、[terminal/README.md](packages/tree_core/lib/src/terminal/README.md)）：
-  输入框那块整体换成终端面板并**主动展开**（面板高 40%，可拖），再按一次回到输入框；终端**没有输入行**——按键逐键译成
-  终端字节（回车 / 退格 / 方向键 / Ctrl+字母 / UTF-8 可打印字符），Ctrl+J 留给切换。核心开**真伪终端**
+- **Ctrl+J 打开集成终端（真 PTY），且与焦点无关**（[lib/README.md](lib/README.md) 不变量 14、
+  [terminal/README.md](packages/tree_core/lib/src/terminal/README.md)）：输入框那块整体换成终端面板并**主动展开**
+  （面板高 40%，可拖），再按一次回到输入框；终端**没有输入行**——按键逐键译成终端字节（回车 / 退格 / 方向键 /
+  Ctrl+字母 / UTF-8 可打印字符），Ctrl+J 留给切换。快捷键绑在 MainPage 顶层的 `CallbackShortcuts` + 全局
+  `TerminalToggleRequest` 上：**焦点在文件树 / 代码编辑器 / 详情页 / 终端自身时照样唤起**，连「没有任何主焦点」
+  那种情况也冒泡得到——此前挂在输入框上的局部快捷键只在输入框有焦点时才收得到。核心开**真伪终端**
   （Windows ConPTY / POSIX `script`），输出按 **base64 原始字节**走已有的那条 WS（`terminal_open/input/resize/close` 上行，
   `terminal_ready/output/exit/error` 下行），前端用自制 VT 解析器还原成屏幕（光标定位 / SGR / 备用屏 / 宽字符）。
-  **只支持本机 agent**：agent 配了 SSH 一律回可读错误（那条通道没有伪终端）；连接断开、换 agent、关面板都会收掉 shell，
-  不留孤儿进程。协议完备性门禁要求核心逐一显式处理四种上行帧。
+  **两个后端都是真 PTY**：远端（SSH）agent 走 SSH 会话通道 + `pty-req`（dartssh2），并**复用那条已建好的 SSH 连接**
+  （不为终端再连一次），远端的 `terminal_ready.cwd` 是空串——远端工作目录由 `SshWorkspaceIO` 自己解决，界面显示「工作区」；
+  判据是**有效 SSH**（成员跟随团队 TOP，见不变量 15）。没接线时回可读错误，**绝不**悄悄在本机给远端 agent 起一个终端；
+  连接断开 / 换 agent / 关面板都会收掉 shell，不留孤儿进程。协议完备性门禁要求核心逐一显式处理四种上行帧。
 - **源码模式按语言着色，且只能编辑纯文本**（[lib/README.md](lib/README.md) 不变量 12）：**不引第三方高亮包**，
   一张规则表 + 单遍扫描（关键字 / 类型 / 字符串 / 注释 / 数字 / 注解 / 函数名）；只在 ≤ 128 KB 时着色（超过退回单色，
   保证输入不卡），记号按「文本 + 配色」缓存；是否文本**看字节**（前 4 KB 有 NUL 就当二进制）。只读闸门：图片 / PDF / Office、
@@ -89,7 +94,10 @@
   远端取不到可用工作空间 IO 时不假装成功。
 - **消息流改一行式：模型消息高亮，工具 / 思考各占一行，完整内容去右栏「详情」页**
   （[lib/README.md](lib/README.md) 不变量 11）：模型消息去掉整圈边框，改成左侧主色竖条 + 极淡同色底的**高亮块**；
-  工具调用压成一行「中文标签 + 关键参数（等宽）」并在行尾给增量（编辑 / 写入按行数 `+N -M`）、转圈或箭头，
+  工具调用压成一行「中文标签 + 关键参数（等宽）」并在行尾给增量（编辑 / 写入按行数 `+N -M`）、转圈或箭头；
+  增量**只从这次调用的参数算**（`edit` 取 `old_text` / `new_text`、`write` 取 `content`，即**核心 schema 的键名**；
+  对错了键就是恒 `+0 -0`），编辑工具的**结果**只有「已替换 N 处」这类话、**不带 diff**，不许解析结果文本；
+  参数不全 / 不是编辑写入类工具 ⇒ 行尾**不给数字**（`+0 -0` 是假信息，宁缺勿假），行数与核心 `LineSplitter` 同口径。
   思考压成一行「思考 · 首行摘要」；悬停图标提亮 + 底色，点击在中栏选中并自动切到右栏第 5 个内置页签「详情」
   （右栏收着就先展开），在那里摊开**完整**参数与结果。选中项用 `DetailSelection` 保存快照并按 id 帧后刷新——
   跑着的工具 / 思考内容是原地变更的；切 agent 或整表重拉时清空。中栏**不再就地展开**：一轮里工具几十条，
@@ -132,6 +140,53 @@
   ——成员自己显式配的 SSH 优先、否则跟随 TOP；目录只认 TOP 那份（TOP 未配置时退回成员自己的镜像，
   因此永远显示真实目录而不是「选择目录」）；选目录**写入 TOP** 并提示"团队成员共用"；
   TOP 是 SSH 时成员**切不回本地**（核心没有"成员覆盖成 local"这个概念），界面如实拒绝并说明去哪改。
+- **源码视图左侧有行号槽，且软换行感知**（[lib/README.md](lib/README.md) 不变量 12、
+  [code_gutter_layout.dart](lib/ui/services/code_gutter_layout.dart)、[file_viewer.dart](lib/ui/widgets/file_viewer.dart)、
+  [file_editor_test.dart](test/file_editor_test.dart)）：源码模式的**可编辑与只读两条分支**都画行号
+  （图片 / PDF / Office 与 Markdown / SVG **预览**没有）；一条逻辑行软换行成多个视觉行时**只给首行编号**
+  （续行不画数字），行号与正文必须用**同一套度量**——同一 TextStyle、同一 textScaler、同一内容宽度
+  （窗格宽 − 槽宽 − 正文 contentPadding 左右 − 光标留白），否则折行点不同、从折行处开始数字整体错位；
+  行号槽跟着正文**同一条滚动控制器**平移（不挂第二个 Scrollable）、把正文顶部 contentPadding 算进偏移；
+  布局只在文本 / 可用宽度变化时重算，数字不参与命中与选择。
+- **右栏文件面板是 VS Code 型资源管理器**（[lib/README.md](lib/README.md) 不变量 16，用户 2026-10-03：
+  「现在太简陋了，对标 VS Code」）：① **口径变化（不是漏改）**：旧的「单层列表 + 面包屑进子目录」换成
+  **惰性加载的嵌套树**（展开时才拉那一层）——面包屑取消，头部显示「根目录 + 同步作用域」，**同步作用域改由选中项推导**
+  （选中目录 = 它自己，选中文件 = 其父目录），**展开状态跨刷新保持**（工具写文件、上传、切执行模式重拉之后不塌）；
+  ② **行只有名字 + 类型图标**（行高 22 / 字号 13，行内左右 padding 6）：大小与修改时间两列**下到悬停 tooltip**
+  （目录给「N 项 · 时间」，没加载过子项时只给时间、**不编数字**），超长名 `ellipsis`、tooltip 第一行永远是全名；
+  ③ 图标与颜色是纯函数 `fileTreeVisualFor`（路径 / 是否目录 / 是否展开），**色板写死不跟主题色**（跟主色走整棵树会变成
+  一坨同色），源码家族取自 `code_highlight` 的 `languageForPath`（不抄第二张扩展名表）；④ 箭头只在目录上（另有等宽空槽
+  保证同级对齐）+ 每层 1px 缩进引导线 + 整行悬停 / 选中（左侧 2px 主色条）+ ↑/↓/←/→/Enter/F2/Delete 键盘导航；
+  ⑤ **git 状态染色**：`GET .../git-status` **只拉一次**缓存在面板状态，整行名字染色 + 行尾 M/U/A/D/R/I
+  （VS Code gitDecoration 口径，被忽略更淡），**目录聚合子项状态**（删除 > 修改 > 未跟踪 > 新增 > 重命名 > 忽略）；
+  `is_repo=false` / 端点还没有 / 断网**一律静默不着色**（状态色是锦上添花，不能把它变成错误页），增删改后失效重拉；
+  ⑥ **新建 / 重命名 / 删除**：名字校验（空 / 路径分隔符 / 非法字符 / Windows 保留名 / 同名）**前端先挡一道**，
+  且创建前**重新列一次目录**复查——核心的写文本端点**没有「仅新建」语义**，重名会被静默覆盖；重名给**行内红字**，
+  删除要确认（目录**显式** `recursive=1` 并在确认框里写明「里面的内容会一起删除」），**工作空间根永远不许删**（前后端各一道）；
+  超大目录被核心截断时给一行「仅显示前 N 项」（`getFilesWithMeta` 保留 `truncated`，旧的 `getFiles` 会丢掉它）；
+  ⑦ **树与查看器同屏（上下分栏）**：覆盖层口径**已被推翻**——它会让「打开文件后新建 / 改名 / 删除」根本点不到，
+  `onPathRenamed` / `onPathDeleted` 接线也永远点不到；改成上下分栏（比例默认 0.4 且**记在面板状态**里），
+  **没打开文件时树独占**（不留空分栏）；可用高度 < 200px 降级成**只显示查看器**；开 / 关查看器时文件子 Tab 区用
+  `GlobalKey` **搬**进 / 搬出分栏而不是重建（展开状态、选中项、已加载的目录都不丢）。
+- **文件面板的增删改与 git 状态端点**（[files/README.md](packages/tree_core/lib/src/files/README.md) 不变量 10/11、
+  [tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 12/13）：新增 `POST .../mkdir`、`POST .../rename`、
+  `DELETE ...?path=[&recursive=1]`、`GET .../git-status`（路径常量取自协议包 `ApiPaths`，不写字面量）。结构改动
+  **只走工作空间 IO 抽象**（本机 `LocalWorkspaceIO`、远端 SFTP 的 `mkdir` / `rename` / `remove`，**不起 shell**，
+  因此没有引号 / 转义 / 远端有没有 coreutils 这些问题），三条硬口径：**绝不覆盖**（重命名目标已存在 → 409；SFTP 的
+  `posix-rename@openssh.com` 本身就是覆盖语义，所以两端都先自检）、**绝不自动建父目录**（父目录不存在 → 400，
+  静默建目录会把写错的路径变成「成功」）、**永远拒绝删工作空间根**（`path` 空 / `.` / `a/..` 归一化成根 → 400）；
+  非空目录默认拒绝（409 + 可读原因里说明要带 `recursive=1`），远端后端没接线 → 可读 400，**绝不落到本机**。
+  git 状态与 git 日志**共用** `GitOutput.statusArgs` / `parseStatus`（`--porcelain=v1 -z`，空格 / 中文 / 引号路径、
+  重命名、暂存与工作区混合、未跟踪、被忽略、非法输入都有单测；条目上限 2000，超出即 `truncated: true`）；
+  两侧都**不抛异常**：不是仓库 ⇒ `is_repo: false` + 空列表（面板空态，**不是** 400）。
+- **成员面板列的是「自己的下属」，且根卡片如实标注**（[team/README.md](packages/tree_core/lib/src/team/README.md)
+  不变量 14、[lib/ui/services/teammates_view.dart](lib/ui/services/teammates_view.dart)，**用户断言 2026-10-03**：
+  「凌川的成员里有凌川」）：`GET /api/agents/{id}/teammates` 的名单改成**以该 agent 为根的下属子树**——
+  TOP 仍是整队（取值与顺序照旧），成员的子树通常为空；**绝不把自己 / 自己的兄弟 / 自己的上级列成「它的成员」**，
+  `pending_member_count` 只数这份名单。以前一律取 `members(teamIdOf(id))`，而成员 `team_id` 回指团队 ⇒
+  整队（含它自己）都成了「它的成员」，根卡片还硬写着「Level 0 · 团队负责人」。响应体新增 `self` 描述符
+  （`level` / `is_member` / `top_agent_name`……），界面据此显示「Level N 成员 · 隶属「TOP」」；前端再
+  **滤掉自己**一道（旧核心 / 中间态兜底），拿不到描述符时用 `agent.teamId` 兜底，**不编「我是负责人」**。
 
 ### Added（首个版本总览）
 
