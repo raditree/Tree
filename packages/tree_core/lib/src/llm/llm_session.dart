@@ -76,6 +76,7 @@ class LlmSession {
     this.reasoningEffort,
     this.temperature,
     this.tokenScale = defaultTokenScale,
+    this.thinkingTurn = false,
     this.resultGate,
     this.statusText,
     this.compactContext,
@@ -114,6 +115,15 @@ class LlmSession {
   /// 逐模型 token_scale（见 util/tokens.dart）：裁剪预算、usage 兜底与
   /// token_scale 学习口径都必须用它，否则估算点之间会互相打架。
   final double tokenScale;
+
+  /// **这个模型是思考模型**：在途拼出来的 assistant 消息必须带
+  /// `reasoning_content` 键（没有思考正文时给空串）。
+  ///
+  /// 与 [LlmMessage.thinkingTurn] 同一件事，只是这里管的是"工具循环里现拼的那条"
+  /// （历史那批由引擎翻译时打标）。少了它，模型某一跳**没产出思考**时下一跳请求就是
+  /// "以 tool 结果收尾、前一条 tool_calls 没有 reasoning"⇒ 端点 400
+  /// （真机现场 2026-10-03，见 docs/known-issues.md #4）。
+  final bool thinkingTurn;
 
   /// 超长工具结果门控（Q1-②）；null = 不做门控（无工作空间的测试场景）。
   ///
@@ -384,6 +394,9 @@ class LlmSession {
           content: text.toString(),
           toolCalls: calls,
           reasoningContent: turnReasoning.toString(),
+          // 这一跳**没有**思考正文时也必须给键（空串）——端点只查键在不在，
+          // 而"模型这一跳没思考"真会发生（真机现场）。
+          thinkingTurn: thinkingTurn,
         ),
       );
       for (final LlmToolCall call in calls) {

@@ -41,6 +41,14 @@
   一律推迟到该批结果之后——工具结果逐条落库（远端 SSH 上的慢工具尤其容易让注入卡在两条之间），
   就地发会把批切成"后半批没有 `reasoning_content`"，请求随即变成"以 tool 结果收尾、前面那条
   `tool_calls` 没有 reasoning"⇒ 端点 400。
+- **思考模型的每条 assistant 都带 `reasoning_content` 键**（[llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 13）：
+  真端点实测（`deepseek-flash` @ `api.deepseek.com`，请求带 `tools`）：末尾 assistant（或末尾 tool 结果所属的
+  那条 assistant）带 `reasoning_content: ""` 是 **200**，**整个键不给**才是 **400**
+  `The reasoning_content in the thinking mode must be passed back to the API.`——端点只查**键在不在**，
+  不查内容。于是"这一跳没有思考可回传"的正确表达是**空串**：模型某一跳没产出思考时（真机现场
+  2026-10-03 10:10:41 契门会话，收尾正文没有思考卡、队友插话正好落在它前面）省略键会把整个会话打成 400。
+  历史翻译（`LlmMessage.thinkingTurn`）与工具循环在途那一跳（`LlmSession.thinkingTurn`）**同口径**，
+  字节一致才不丢前缀缓存；非思考模型（`thinking: false`）**一个键都不发**（OpenAI 系端点拒绝不认识的字段）。
 - **提问的 `createdAt` 严格递增**（[agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 8）：
   `QuestionStore.add` 把提问时间抬成"全库严格递增"（与消息时间戳同一条规则，共用 `monotonicStamp`）——
   否则同一毫秒的两条在 `GET /api/questions` 的"最新的排前面"里顺序漂移（`List.sort` 不保证稳定）；

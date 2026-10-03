@@ -127,6 +127,7 @@ class LlmMessage {
     this.toolCallId,
     this.name,
     this.reasoningContent = '',
+    this.thinkingTurn = false,
     this.contentParts = const <LlmContentPart>[],
   });
 
@@ -137,6 +138,7 @@ class LlmMessage {
       toolCallId = null,
       name = null,
       reasoningContent = '',
+      thinkingTurn = false,
       contentParts = const <LlmContentPart>[];
 
   /// 便捷构造。
@@ -146,15 +148,19 @@ class LlmMessage {
       toolCallId = null,
       name = null,
       reasoningContent = '',
+      thinkingTurn = false,
       contentParts = const <LlmContentPart>[];
 
   /// 便捷构造（[reasoningContent] 只在"回传思考"开启时才有值，见 [toWire]）。
-  const LlmMessage.assistant(this.content, {this.reasoningContent = ''})
-    : role = LlmRole.assistant,
-      toolCalls = const <LlmToolCall>[],
-      toolCallId = null,
-      name = null,
-      contentParts = const <LlmContentPart>[];
+  const LlmMessage.assistant(
+    this.content, {
+    this.reasoningContent = '',
+    this.thinkingTurn = false,
+  }) : role = LlmRole.assistant,
+       toolCalls = const <LlmToolCall>[],
+       toolCallId = null,
+       name = null,
+       contentParts = const <LlmContentPart>[];
 
   /// 便捷构造（工具执行结果）。
   const LlmMessage.toolResult({
@@ -164,6 +170,7 @@ class LlmMessage {
        toolCalls = const <LlmToolCall>[],
        name = null,
        reasoningContent = '',
+       thinkingTurn = false,
        contentParts = const <LlmContentPart>[];
 
   final LlmRole role;
@@ -189,8 +196,28 @@ class LlmMessage {
   /// **只有"回传思考"开启（模型配置的 `thinking`）时才有值**：官方文档与实测都表明
   /// 请求带 `tools` 时历史中的 `reasoning_content` 必须原样回传，否则同会话后续请求
   /// 会持续 400；参考实现（`server/llm/llm.py`）也是这么写的。关闭时留空 = 不回传
-  /// （部分网关容忍缺失，且能显著省输入 token）。
+  /// 思考**正文**（能显著省输入 token）——但**键本身仍要发**，见 [thinkingTurn]。
   final String reasoningContent;
+
+  /// 这条 assistant 属于**思考回合**：线形态**必须带** `reasoning_content` 这个键，
+  /// 哪怕它没有思考正文（那就是**空串**）。
+  ///
+  /// 真端点对照实验（2026-10-03，`.output/probe_thinking_empty.ps1`，模型
+  /// `deepseek-flash` @ `api.deepseek.com`，请求带 `tools`）：
+  ///
+  /// | 形状 | `reasoning_content` | 结果 |
+  /// | --- | --- | --- |
+  /// | 末尾 assistant(text) | `""` | **200**（H1） |
+  /// | 末尾 assistant(tool_calls) + tool | `""` | **200**（H2） |
+  /// | 末尾 assistant(text) | **整个键不给** | **400**（H3，与现场报错逐字一致） |
+  /// | 末尾 assistant(tool_calls) + tool | `"先读文件"` | 200（H4） |
+  ///
+  /// ⇒ 端点只检查**键在不在**，不检查内容。所以"这一跳没有思考可回传"的正确表达是
+  /// **空串**，而不是省略键：省略会在"模型这一跳没产出思考"时把整轮打成 400
+  /// （真机现场：2026-10-03 10:10:41 契门会话，模型最后一段正文没有思考卡，正好落在
+  /// 请求末尾）。由引擎在**翻译历史时统一打标**（模型是思考模型就打），会话在途那一跳
+  /// （[LlmSession]）同样打——两处的字节必须一致，否则前缀缓存从这条起落空。
+  final bool thinkingTurn;
 
   /// 是否为工具结果消息。
   bool get isToolResult => role == LlmRole.tool;
@@ -207,8 +234,10 @@ class LlmMessage {
         // 纯工具调用轮次里 content 可能为空串，端点要求显式给 null 或空串
         out['content'] = content.isEmpty ? null : content;
         // DeepSeek 思考模式：带 tools 的请求必须回传历史 reasoning_content，
-        // 且字段就在 assistant 消息顶层、与 content 同级（不能嵌套）
-        if (reasoningContent.isNotEmpty) {
+        // 且字段就在 assistant 消息顶层、与 content 同级（不能嵌套）。
+        // **键必须出现**（[thinkingTurn]）：没有思考正文时给空串——省略键会被端点
+        // 当成"没回传"而 400（实测见 [thinkingTurn] 的表）。
+        if (reasoningContent.isNotEmpty || thinkingTurn) {
           out['reasoning_content'] = reasoningContent;
         }
         if (toolCalls.isNotEmpty) {
@@ -317,6 +346,9 @@ class LlmMessage {
       toolCallId: raw['tool_call_id']?.toString(),
       name: raw['name']?.toString(),
       reasoningContent: (raw['reasoning_content'] ?? '').toString(),
+      // 键在 = 它是一条思考回合的消息（哪怕是空串）：往返必须保住这个事实，
+      // 否则插件改写一次请求体就把"必须带键"的标记丢了。
+      thinkingTurn: raw.containsKey('reasoning_content'),
       contentParts: parts,
     );
   }

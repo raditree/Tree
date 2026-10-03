@@ -34,6 +34,8 @@
 12. **`llm_hidden` = "用户看得见、模型看不见"的唯一开关**：打了这个标记的消息**照常落库、照常下发**（前端当普通气泡渲染），但引擎重建请求时**整条跳过**——模型读到那句"读取模型响应失败：…"只会把它当成**新的排查任务**（用户实测反馈）。使用者：**系统发言**（失败提示、"已停止本轮生成。"）与**过程提示**（重试进度，见不变量 11）。压缩侧的 token 估算、摘要输入与降级摘要同样跳过它（口径必须与实发那一份一致）。与 `kind == 'notice'`（hook 唤醒）方向相反：那个是**新一轮输入**、按 user 发出去，不可一刀切。
     **为什么是字段而不是新 `kind`**：`system` 会被读成 system prompt（协议里真有 `LlmRole.system`），而这里要表达的维度是"**进不进提示词**"——一个布尔标记，与"这条消息是正文 / 思考 / 工具卡 / 提示"是两件正交的事。标记是通用的：任何消息都能打。
 
+13. **思考模型的每条 assistant 都带 `reasoning_content` 键**（`LlmMessage.thinkingTurn`）：真端点实测（`deepseek-flash` @ `api.deepseek.com`，请求带 `tools`）——末尾 assistant（或末尾 tool 结果所属的那条 assistant）带 `reasoning_content: ""` 是 **200**，**整个键不给**才是 **400** `The reasoning_content in the thinking mode must be passed back to the API.`（对照实验：H1 空串 = 200 / H2 空串 + tool 结果 = 200 / H3 缺键 = 400 / H4 有正文 = 200）。端点只查**键在不在**，所以"这一跳没有思考可回传"必须表达成**空串**而不是省略键：模型某一跳没产出思考是真会发生的（真机现场 2026-10-03 10:10:41 契门会话——收尾正文那一跳没有思考卡，而队友的插话正好落在它前面，重建出来的请求以这条 assistant 收尾 ⇒ 整个会话卡在 400）。**打标与位置无关**（每条 assistant 都打，不管它在末尾还是中间），前缀缓存才不会因为"同一条消息这次在末尾、下次在中间"而变字节；**历史翻译**（引擎按 `config.thinking` 打标）与**工具循环在途那一跳**（`LlmSession.thinkingTurn`）两处同口径。非思考模型（`thinking: false`）**一个键都不发**：OpenAI 系端点会拒绝不认识的字段（报文与改动前逐字一致）。
+
 ## 测试
 
 ```bash
@@ -42,7 +44,8 @@ dart test test/llm_protocol_test.dart test/llm_session_test.dart test/llm_tool_l
           test/llm_prefix_stability_test.dart test/llm_transport_liveness_test.dart \
           test/http_sse_transport_test.dart test/llm_hidden_test.dart \
           test/llm_result_gate_test.dart \
-          test/llm_summarizer_test.dart test/vision_files_test.dart test/reasoning_toolcall_test.dart
+          test/llm_summarizer_test.dart test/vision_files_test.dart test/reasoning_toolcall_test.dart \
+          test/reasoning_key_test.dart test/notice_translation_test.dart
 ```
 
 假传输夹具 `test/fake_transport.dart`、`test/fake_files_api.dart`——LLM 会话因此可以完全脱离网络单测。

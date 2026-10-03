@@ -163,6 +163,12 @@ class LlmAgentEngine implements AgentEngine {
       return;
     }
 
+    /// 「这个模型是思考模型吗」：**模型级**配置（agent 覆盖只决定"要不要回传思考
+    /// 正文"）。思考模型的端点在带 tools 的请求里要求每条 assistant 带
+    /// `reasoning_content` 键——没有正文时给**空串**（实测见
+    /// [LlmMessage.thinkingTurn]）。
+    final bool thinkingModel = resolved?.thinking ?? config.thinking;
+
     // 外设就绪闸门：把「本轮工具表是否已包含插件/MCP 工具」的时序问题收在这里
     // （见 [awaitReady] 的文档）。闸门自带预算，且任何异常都不该拦住这一轮。
     final Future<void> Function()? ready = awaitReady;
@@ -189,6 +195,10 @@ class LlmAgentEngine implements AgentEngine {
       // 判断，请求体与改动前**逐字一致**（见 llm_types.dart 的 LlmMessage.toWire）
       vision: config.ifVision ? visionResolver : null,
       passBackReasoning: config.thinking,
+      // 「思考模型」是**模型自己的属性**（不受 agent 级「回传思考」覆盖影响）：
+      // 端点要的是"这条 assistant 带 reasoning_content 键"，与"要不要重发思考正文"
+      // 是两件事（实测表见 LlmMessage.thinkingTurn）。
+      thinkingTurn: thinkingModel,
     );
     final LlmSession session = LlmSession(
       transport: _transportFor(config),
@@ -204,6 +214,7 @@ class LlmAgentEngine implements AgentEngine {
           : null,
       reasoningEffort: config.reasoningEffort,
       tokenScale: config.tokenScale,
+      thinkingTurn: thinkingModel,
       resultGate: gate,
       statusText: sessionStatusText == null
           ? null
@@ -216,6 +227,7 @@ class LlmAgentEngine implements AgentEngine {
         force: force,
         // 重建上下文必须与首轮同口径：否则压一次之后思考就"消失"了
         passBackReasoning: config.thinking,
+        thinkingTurn: thinkingModel,
       ),
       llmHandler: llmTurnHandler,
       llmRequestRewriter: llmRequestRewriter,
@@ -271,6 +283,7 @@ class LlmAgentEngine implements AgentEngine {
     required CoreModelConfig config,
     VisionFileResolver? vision,
     bool passBackReasoning = false,
+    bool thinkingTurn = false,
   }) async {
     final ToolTurnCompactor? compact = toolTurnCompactor;
     if (compact == null) return null;
@@ -286,6 +299,7 @@ class LlmAgentEngine implements AgentEngine {
       config: config,
       vision: vision,
       passBackReasoning: passBackReasoning,
+      thinkingTurn: thinkingTurn,
     );
   }
 
@@ -367,6 +381,7 @@ class LlmAgentEngine implements AgentEngine {
         toolCallId: message.toolCallId,
         name: message.name,
         reasoningContent: message.reasoningContent,
+        thinkingTurn: message.thinkingTurn,
         contentParts: message.contentParts,
       );
 
@@ -405,6 +420,8 @@ class LlmAgentEngine implements AgentEngine {
         config: config,
         vision: null,
         passBackReasoning: config.thinking,
+        // 与实发同一份前缀：少一个"必须带的键"就是整段不命中缓存
+        thinkingTurn: resolved?.thinking ?? config.thinking,
       );
       // **预算硬裁也要过一遍**（与 `LlmSession.run` 同一份 `fitContextToBudget`）：
       // 只有"引擎会给的那份" = "真会发出去的那份"，压缩插件的前缀才与端点缓存单元
@@ -479,6 +496,7 @@ class LlmAgentEngine implements AgentEngine {
     required CoreModelConfig config,
     VisionFileResolver? vision,
     bool passBackReasoning = false,
+    bool thinkingTurn = false,
   }) async {
     final List<LlmMessage> out = <LlmMessage>[];
     final List<LlmMessage> seeded = <LlmMessage>[
@@ -638,6 +656,7 @@ class LlmAgentEngine implements AgentEngine {
             content: roundBody.toString(),
             toolCalls: calls,
             reasoningContent: reasoning,
+            thinkingTurn: thinkingTurn,
           ),
         );
         out.addAll(results);
@@ -645,7 +664,13 @@ class LlmAgentEngine implements AgentEngine {
         final String body = roundBody.toString();
         // 空正文跳过（只有附件、没有正文的消息在 asUser 分支里已带上了路径段）
         if (body.trim().isNotEmpty) {
-          out.add(LlmMessage.assistant(body, reasoningContent: reasoning));
+          out.add(
+            LlmMessage.assistant(
+              body,
+              reasoningContent: reasoning,
+              thinkingTurn: thinkingTurn,
+            ),
+          );
         }
       }
       toolBatch.clear();
@@ -715,46 +740,25 @@ class LlmAgentEngine implements AgentEngine {
       pendingText.add(ref);
     }
     await flushRound();
-    _warnIfTrailingAssistant(out);
+    _noteTrailingAssistantWithoutReasoning(out);
     return out;
   }
 
-  /// 组好的请求若命中"思考模式必 400"的两种形态，留一条日志。
+  /// 请求以"**没有思考正文的 assistant**"收尾时留一条日志。
   ///
-  /// 两种形态（实测见 recon.md）：
-  /// 1. **以没有 reasoning_content 的 assistant 消息收尾**（D6）；
-  /// 2. **以 `tool` 结果收尾**，而它前面那条带 `tool_calls` 的 assistant 没有
-  ///    reasoning_content（G1/G3，工具循环的下一跳就是这形态）。
-  ///
-  /// 为什么不直接改请求：这两种都"不该发生"。真发生了说明别处往历史里塞了
-  /// assistant 消息或丢了推理——记下来比悄悄修掉更有助于定位。
-  void _warnIfTrailingAssistant(List<LlmMessage> messages) {
+  /// 这不再是错误：端点只查 `reasoning_content` **键在不在**，空串照样 200
+  /// （真端点实测见 [LlmMessage.thinkingTurn]）——引擎给思考模型的每条 assistant
+  /// 都打了这个键。留日志是因为"模型这一跳没产出思考"是排查 400 与前缀缓存时
+  /// 最值得知道的一件事。
+  void _noteTrailingAssistantWithoutReasoning(List<LlmMessage> messages) {
     if (messages.length < 2) return;
     final LlmMessage last = messages.last;
-    if (last.role == LlmRole.assistant && last.reasoningContent.isEmpty) {
-      log?.call(
-        '请求以没有 reasoning_content 的 assistant 消息收尾：'
-        '带 tools 的思考模式端点（如 DeepSeek）会返回 400。'
-        '请检查是否有"非用户消息被追加到历史末尾"的路径。',
-      );
-      return;
-    }
-    if (last.role != LlmRole.tool) return;
-    // 最近的那条非 tool 消息就是这次工具调用的发起者
-    for (int i = messages.length - 2; i >= 0; i--) {
-      final LlmMessage m = messages[i];
-      if (m.role == LlmRole.tool) continue;
-      if (m.role == LlmRole.assistant &&
-          m.toolCalls.isNotEmpty &&
-          m.reasoningContent.isEmpty) {
-        log?.call(
-          '请求以 tool 结果收尾，但它前面那条带 tool_calls 的 assistant 没有 '
-          'reasoning_content：带 tools 的思考模式端点（如 DeepSeek）会返回 400。'
-          '本轮的思考正文必须挂在带 tool_calls 的那条消息上。',
-        );
-      }
-      return;
-    }
+    if (last.role != LlmRole.assistant) return;
+    if (last.reasoningContent.isNotEmpty || !last.thinkingTurn) return;
+    log?.call(
+      '请求以没有思考正文的 assistant 收尾：已按实测带上 reasoning_content 空串'
+      '（端点只查键在不在；省略整个键才会 400）。',
+    );
   }
 
   /// 把该条用户消息里的**图像附件**逐个解析成端点的 file 内容块。

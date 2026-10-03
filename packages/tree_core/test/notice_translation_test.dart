@@ -7,9 +7,13 @@ import 'fake_transport.dart';
 ///
 /// 实测证据（`.self/plan/20261001-thinking-400-and-interrupt/recon.md`，对
 /// `https://api.deepseek.com` 的对照实验）：
-/// - 带 `tools` 的请求：末尾是 assistant 且无 `reasoning_content` → **HTTP 400**
-///   `The reasoning_content in the thinking mode must be passed back to the API.`
+/// - 带 `tools` 的请求：末尾是 assistant 且**没有 `reasoning_content` 这个键** →
+///   **HTTP 400** `The reasoning_content in the thinking mode must be passed back to the API.`
 /// - 中间消息缺 reasoning、末尾是 user、末尾 assistant 带 reasoning → 全部 200
+///
+/// 2026-10-03 补测（`.output/probe_thinking_empty.ps1`）：端点只查**键在不在**——
+/// `reasoning_content: ""` 同样 200，只有整个键不给才 400。因此思考模型的每条
+/// assistant 都带这个键（没有思考正文就空串，见 `test/reasoning_key_test.dart`）。
 ///
 /// 触发过线上 400 的形态就是 hook 提示（`kind == 'notice'`，落库为 agent 角色）
 /// 被追加到历史末尾 —— 因此引擎必须把它按 **user** 消息发出。
@@ -84,16 +88,20 @@ void main() {
       expect(sent.last.content, isNot(contains('用户上传的附件')));
     });
 
-    test('防御哨兵：真以"无 reasoning 的 assistant"收尾时留日志（不改请求）', () async {
+    test('末尾 assistant 没有思考正文：按实测带上 reasoning_content 空串', () async {
       final List<String> logs = <String>[];
       final List<LlmMessage> sent = await build(<CoreMessageRef>[
         const CoreMessageRef(role: 'user', content: '问一句'),
         const CoreMessageRef(role: 'agent', content: '答一句'),
       ], logs: logs);
 
-      expect(sent.last.role, LlmRole.assistant, reason: '这是不该出现的形态');
-      expect(logs.join('\n'), contains('没有 reasoning_content'));
-      expect(logs.join('\n'), contains('400'));
+      final LlmMessage last = sent.last;
+      expect(last.role, LlmRole.assistant);
+      expect(last.reasoningContent, isEmpty, reason: '这一跳确实没有思考正文');
+      // 键必须在：省略它才是 400（真端点实测 H1 = 200 / H3 = 400）
+      expect(last.toWire().containsKey('reasoning_content'), isTrue);
+      expect(last.toWire()['reasoning_content'], '');
+      expect(logs.join('\n'), contains('空串'));
     });
 
     test('末尾 assistant 带 reasoning 时不告警（正常收尾形态）', () async {
