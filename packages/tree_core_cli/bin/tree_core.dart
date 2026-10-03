@@ -452,6 +452,12 @@ Future<void> main(List<String> args) async {
   final LlmJsonCaller llmJsonCaller = LlmJsonCaller(
     resolveModel: settings.model,
     agentOverrides: agentOverrides,
+    // 软超时到点才登记（正常快调用不进表）；登记后可由右栏 / 插件 tool.close /
+    // agent 的 `tool_runs action=close` **显式关闭**（关闭即取消本流、释放连接）。
+    requestRegistrar: llmRequestRegistrarOf(
+      ToolRunRegistry.instance,
+      tool: 'llm.call',
+    ),
     log: coreLog.forPrefix('core:llm-call'),
   );
 

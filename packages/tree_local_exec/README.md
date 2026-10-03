@@ -24,6 +24,10 @@
 
 1. 只接受**工作空间相对路径**；`resolve` 拒绝绝对路径 / 盘符 / `..` 逃逸（`WorkspacePathException`）。
 2. **没有静态任务超时**：本地判活 = 进程存活；SSH 判活 = 心跳。`exec(timeout:)` 是**两端同口径的软超时**
+   ——到点**不杀进程、不重跑**：本地把仍活着的进程交出去（`LocalExecStillRunning`），
+   SSH 交还 `RunningSshExec` 句柄（`SshExecStillRunning`，结束补写输出与退出码、链路失活如实失败）；
+   `0` / 负值 = **永不软超时**。**软超时之后只允许显式关闭**（`close()` / 关闭句柄 / 上层 `tool.close`），
+   **没有任何"到点自动杀"**——全仓同一条口径见 [../tree_core/lib/src/llm/README.md](../tree_core/lib/src/llm/README.md) 不变量 2。
    （2026-10-03 起 SSH 也兑现；此前 SSH 侧忽略它——现场事故见 [../../docs/known-issues.md](../../docs/known-issues.md)），
    到点**不杀进程、不重跑、不关通道**，把仍在跑的**命令**交出来：本地是 `LocalExecStillRunning`
    + `RunningLocalExec`（输出订阅还活着、进程杀得掉），SSH 是 `SshExecStillRunning` + `RunningSshExec`

@@ -5,6 +5,7 @@ import '../settings/core_settings.dart';
 import '../store/usage_log.dart';
 import '../util/tokens.dart';
 import 'llm_agent_engine.dart' show TransportFactory;
+import 'llm_session.dart';
 import 'llm_transport.dart';
 import 'llm_types.dart';
 
@@ -29,6 +30,7 @@ class LlmJsonCaller {
     this.agentOverrides,
     this.transportFactory,
     this.timeout = const Duration(seconds: 120),
+    this.requestRegistrar,
     this.log,
     this.usageSink,
   });
@@ -42,9 +44,24 @@ class LlmJsonCaller {
   /// 传输层工厂；为空时按 (base_url, api_key) 建 [HttpSseTransport] 并缓存。
   final TransportFactory? transportFactory;
 
-  /// 静态超时：这是插件的一次**工具性调用**（不是对话），必须有界——插件等不到
-  /// 回包会拿到可读错误，而不是永远悬着。
+  /// **软超时**（用户 2026-10-03 定夺）：到点**不中止**这次调用，只记一行日志说明
+  /// "已运行 N 秒仍未结束"，回包照旧等下去（**结果不丢**）。`Duration.zero` / 负值 = **永不软超时**。
+  ///
+  /// 为什么是软的：全仓断言是"**没有任何硬超时**；限制只有两类——①心跳丢失 ②软超时；
+  /// **软超时后只允许显式关闭**"。此前这里是 `.timeout(120s, onTimeout: 已中止)`——
+  /// 一刀切中止插件的一次性调用（压缩插件走的就是它），与断言直接冲突。
+  /// 悬挂的调用该由显式入口收手（`tool_runs action=close` / 右栏「正在执行的 tool」），
+  /// 而不是被定时器杀掉。
   final Duration timeout;
+
+  /// 「运行中的 `llm.call`」的登记落点（见 `LlmRequestRegistrar`，可选注入）：
+  /// **软超时到点才登记**（正常快调用不进表，不打扰右栏与 `query_status`）；
+  /// 登记后**可被显式关闭**（用户右栏 / 插件 `tool.close` / agent `tool_runs action=close`
+  /// —— 与工具那套**同一个实现**）⇒ 关闭即取消本流并释放连接。
+  ///
+  /// 为什么要它：`timeout` 现在是**软的**（不中止），若没有这条兜底，一个真挂住的
+  /// `llm.call` 就是"无界等待且无人能收手"——正是全仓断言要避免的形态。
+  LlmRequestRegistrar? requestRegistrar;
 
   final void Function(String message)? log;
 
@@ -163,25 +180,112 @@ class LlmJsonCaller {
     final Stopwatch clock = Stopwatch()..start();
     try {
       final LlmTransport transport = _transportFor(config);
-      await for (final LlmStreamEvent event in transport
-          .stream(request, isCancelled: () => false)
-          .timeout(timeout, onTimeout: (EventSink<LlmStreamEvent> sink) {
-            sink.add(
-              LlmFailureEvent('llm.call 超过 ${timeout.inSeconds}s 未完成，已中止'),
+      // **软超时 + 显式取消兜底**（用户 2026-10-03 定夺 (a)，与全仓断言同口径）：
+      // - 到点**不中止**：只留痕 + （有登记落点时）把这次调用登记成"可关闭的运行"；
+      // - 登记后被**显式关闭**（用户右栏 / 插件 `tool.close` / agent `tool_runs action=close`）
+      //   ⇒ 立刻以取消收尾，并 `cancel()` 底层订阅（HTTP/SSE 连接随之释放）。
+      //   为什么不能只靠 `isCancelled`：零事件时没人去问它（挂住的 socket 恰恰没有事件）。
+      bool closed = false;
+      final Duration limit = timeout;
+      final StreamController<LlmStreamEvent> watched =
+          StreamController<LlmStreamEvent>();
+      StreamSubscription<LlmStreamEvent>? sub;
+      LlmRequestGuard? guard;
+      Timer? softClock;
+      Timer? closeClock;
+      bool done = false;
+      void settle() {
+        softClock?.cancel();
+        closeClock?.cancel();
+        guard?.finish();
+      }
+
+      watched.onListen = () {
+        if (limit > Duration.zero) {
+          softClock = Timer(limit, () {
+            if (done) return;
+            guard ??= requestRegistrar?.call(
+              agentId: agentId,
+              // `llm.call` 的既有契约里没有会话（只有 agentId）——空串如实表达"不归属某会话"。
+              sessionId: '',
+              model: effectiveModel,
+              turn: 0,
             );
-            sink.close();
-          })) {
-        if (event is LlmTextDelta) {
-          text.write(event.text);
-        } else if (event is LlmThinkingDelta) {
-          // 思考正文不进 JSON 结果：它是过程，不是产出
-          continue;
-        } else if (event is LlmUsageEvent) {
-          usage = event.usage;
-        } else if (event is LlmFailureEvent) {
-          failure = event.message;
-          break;
+            log?.call(
+              'llm.call 已运行 ${limit.inSeconds} 秒仍未结束（软超时：**不中止**，继续等回包）'
+              '${guard == null ? '' : '；已登记为可关闭运行 ${guard!.handle}'
+                  '（tool_runs / 右栏可显式关闭）'}',
+            );
+          });
         }
+        // 关闭探测间隔**由软超时派生**（带上限）：生产 2s；测试用很短的阈值时自动变快。
+        final Duration closeEvery = Duration(
+          milliseconds: limit.inMilliseconds <= 0
+              ? 2000
+              : (limit.inMilliseconds ~/ 4).clamp(10, 2000),
+        );
+        closeClock = Timer.periodic(closeEvery, (Timer _) {
+          final LlmRequestGuard? current = guard;
+          if (done || current == null || !current.closed) return;
+          done = true;
+          closed = true;
+          log?.call('llm.call ${current.handle} 已被显式关闭 ⇒ 取消这次调用');
+          if (!watched.isClosed) {
+            watched.add(
+              const LlmFailureEvent(
+                '这次 llm.call 已被显式关闭（用户 / 插件 / agent）',
+                cancelled: true,
+              ),
+            );
+          }
+          unawaited(sub?.cancel());
+          settle();
+          if (!watched.isClosed) unawaited(watched.close());
+        });
+        sub = transport
+            .stream(request, isCancelled: () => closed)
+            .listen(
+              (LlmStreamEvent event) {
+                if (done || watched.isClosed) return;
+                watched.add(event);
+              },
+              onError: (Object error, StackTrace stack) {
+                if (done || watched.isClosed) return;
+                watched.addError(error, stack);
+              },
+              onDone: () {
+                if (!done) {
+                  done = true;
+                  settle();
+                }
+                if (!watched.isClosed) unawaited(watched.close());
+              },
+              cancelOnError: false,
+            );
+      };
+      watched.onCancel = () async {
+        done = true;
+        settle();
+        await sub?.cancel();
+      };
+      try {
+        await for (final LlmStreamEvent event in watched.stream) {
+          if (event is LlmTextDelta) {
+            text.write(event.text);
+          } else if (event is LlmThinkingDelta) {
+            // 思考正文不进 JSON 结果：它是过程，不是产出
+            continue;
+          } else if (event is LlmUsageEvent) {
+            usage = event.usage;
+          } else if (event is LlmFailureEvent) {
+            failure = event.message;
+            break;
+          }
+        }
+      } finally {
+        // 计时器只负责留痕与关闭探测：无论正常结束还是异常，都要收掉它们。
+        done = true;
+        settle();
       }
     } catch (error) {
       failure = 'llm.call 调用异常：$error';

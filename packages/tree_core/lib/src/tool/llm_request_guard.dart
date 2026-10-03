@@ -12,7 +12,10 @@ import 'tool_run_registry.dart';
 /// - 只有**连续沉默**（零事件）达到阈值时才会被登记 ⇒ 正常的长生成不进表、不 warning；
 /// - 登记后**可被显式关闭**（右栏 / 插件 `tool.close` / agent `tool_runs action=close`）；
 /// - `closed` 的判据是"这一项已从表里消失"——`close` 会移除它，**绝不自动关闭**。
-LlmRequestRegistrar llmRequestRegistrarOf(ToolRunRegistry registry) {
+LlmRequestRegistrar llmRequestRegistrarOf(
+  ToolRunRegistry registry, {
+  String tool = 'llm.request',
+}) {
   return ({
     required String agentId,
     required String sessionId,
@@ -20,7 +23,7 @@ LlmRequestRegistrar llmRequestRegistrarOf(ToolRunRegistry registry) {
     required int turn,
   }) {
     final ToolRun run = registry.start(
-      tool: 'llm.request',
+      tool: tool,
       arguments: <String, dynamic>{'model': model, 'turn': turn},
       agentId: agentId,
       sessionId: sessionId,

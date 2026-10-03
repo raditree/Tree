@@ -15,7 +15,7 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
-## [未发布] — 自 1.0.1 起
+## [1.0.2] — 2026-10-03
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
@@ -63,6 +63,20 @@
 - **插话只打断目标那一轮**（[agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量）：
   给主 agent 发消息**不再连带取消**它名下的临时员工（它们继续跑、完成报告照旧注入）；
   终止在途临时员工只有两条**显式**路径（用户 `stop` / 在它的视角里按停止）。
+
+- **没有任何硬超时：限制只有两类（心跳丢失 / 软超时），且软超时之后只允许显式关闭**（
+  [llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 2 加强、
+  [tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 2 加强、
+  [plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 8 加强，
+  **用户断言 2026-10-03**：「仍旧无任何硬超时，所有超时限制仅限于心跳丢失或软超时（超时后仅允许显式关闭）」）：
+  工具侧 `exec(timeout:)` 到点**不杀进程**（转后台 / 交还句柄）；**`llm.call` 的 `timeout` 到点不再中止**
+  （只留痕 + 登记成"可关闭的运行"，回包照旧送达、**结果不丢**，`0` = 永不软超时）；
+  会话请求悬挂（**零事件**，插件挂住 / socket 挂住那条无界路径）同样登记进同一张表；
+  **显式关闭只有一个实现**——用户右栏「正在执行的 tool」/ 插件执行站 `tool.close` /
+  agent 内置工具 `tool_runs action=close` / REST，四者等价，关闭即让在途调用收敛并释放连接。
+  边界情形（建连握手、vision 上传 / 取响应、`file_service` 的 `archive`/`git` 超时、启动预热预算、
+  进程关停宽限、单实例握手、插件启动探测、传输层 5 次重试上限）在文档里**逐条归名**，
+  不与"运行的超时"混淆。
 
 ## [1.0.1] — 2026-10-03
 
