@@ -82,9 +82,19 @@ void main() {
         reason: document.id,
       );
     }
-    // 版本与 changelog 要跟着升级走（否则工作空间里比模板新的副本会被降级）
+    // 版本与 changelog 要跟着升级走（否则工作空间里比模板新的副本会被降级）：
+    // 最新一条必须对应当前 version（第 0 步 那几版已经沉到历史里，不该继续钉"第一条"）
     expect(first.version, greaterThan(5));
-    expect(first.changelog.first, contains('第 0 步'));
+    expect(
+      first.changelog.first,
+      startsWith('v${first.version}('),
+      reason: '最新一条 changelog 必须对应当前 version：${first.changelog.first}',
+    );
+    expect(
+      first.changelog.any((String c) => c.contains('第 0 步')),
+      isTrue,
+      reason: '「第 0 步」的引入记录要留在 changelog 里',
+    );
     // plugin-creator：同为 general 型，正文口径是"读原指南 + 本机/远端分工"
     final SpecDocument last = list.last;
     expect(last.id, 'plugin-creator');

@@ -19,6 +19,34 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **Tree 在"带着 RedirectionGuard"启动时会自愈重启；安装器改经 shell 启动**
+  （[docs/architecture.md](docs/architecture.md) §13 不变量 11、`docs/known-issues.md` #16，
+  **用户断言 2026-10-03**：「这是 known-issue 好像，上一轮修复没修好吗」）：
+  Windows 11 的 RedirectionGuard（`EnforceRedirectionTrust` = 0x1）让进程**拒绝跟随"非管理员创建的"重定向点**，
+  而它**沿调用链传播**（实测：`Tree.exe` → `tree_core.exe` → 集成终端里的 shell → 用户在那个 shell 里跑的命令
+  全是 0x1，而 `explorer.exe` 及其派生的一切是 0x0）；**安装器是提权进程**，它在安装末尾拉起 Tree ⇒
+  整棵 Tree 进程树都拒绝跟随 `windows/flutter/ephemeral/.plugin_symlinks/*` ⇒ Tree 终端里的
+  `flutter build windows` 必然失败（CMake `add_subdirectory … is not an existing directory`），
+  而同一个命令在用户自己开的终端里能成功——**这就是 #16 的真相**（旧结论"环境侧、代码改不了"只对了一半：
+  链接是"不受信任的装入点"这半改不了，但"谁被这条策略约束"这半是我们自己的）。这条策略**清不掉**
+  （`SetProcessMitigationPolicy(id, 0)` → `ERROR_ACCESS_DENIED`）、**也没有创建期开关**，所以：
+  runner 启动时读一次 `GetProcessMitigationPolicy(ProcessRedirectionTrustPolicy)`，非零就**经 explorer
+  重新拉起自己**（explorer 那条链实测 0x0）后退出；`--tree-rt-selfcheck` 只报状态与决定（打包自检 / 用例用，
+  不起 Flutter）；重启失败或重启后仍非零 ⇒ 往 **stderr** 留一句可读的话再照常启动（不静默、不把用户挡在门外）。
+  安装器里"启动 Tree"改成经 `explorer.exe`（`Filename: "explorer.exe"; Parameters: """{app}\{#AppExe}"""`），
+  否则新装的实例一出生就带着这条缓解。
+- **`subagent`（临时员工）的使用策略写进三处提示词资产：工具描述 / 系统提示词 / 内置 Spec**
+  （[tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 12、[docs/architecture.md](docs/architecture.md) §8.1）：
+  口径统一为——**什么时候用**（边界清晰、可独立完成的子任务：多份文件的同类改动、独立检索与调研、各自可验收的
+  验证；要同时推进就用 `background` 一次开几个）、**什么时候不用**（单文件小改、顺手就能干完的活、验收标准
+  还说不清的事、为绕开工具/权限/上下文限制的套娃、原样转包）、**`task` 必须自包含**、**只有职责/范围一致才复用**
+  `subagent_id`、**并行按文件/目录划分**（共享同一工作空间）、**套娃只用于把同一个大任务拆细**（层级有上限）、
+  **与 `team` 的边界**（跨会话长期协作 / 需要正式团队流程才用 team）。落点：`SubagentTool.spec()` 的
+  `description`；`defaultSystemPromptSeed` 新增「临时员工（subagent）使用策略」章
+  （[system_prompt_file.dart](packages/tree_core/lib/src/agent/system_prompt_file.dart)）；内置规范 general-task（v8）/ hard-task（v8）
+  新增「成员 vs 临时员工（轻量并行）」判据、team-meeting（v6）把临时员工纳入"会议不许开工"的禁止面
+  （[builtin_specs.dart](packages/tree_core/lib/src/spec/builtin_specs.dart)）。注意：已有工作空间的 `.self/system_prompt.md`
+  是用户文件，要拿到新种子需「重置」（[known-issues.md](docs/known-issues.md) #5）。
 - **中栏的窗口坐标实时化：拇指跟手、落点到位、只缓存坐标附近**（[lib/README.md](lib/README.md) 不变量 19②③、
   `docs/known-issues.md` #19，**用户断言 2026-10-03**：「页面上滚，拇指不动」「可以拖动拇指上滑，但很怪，
   且有些部分未渲染」「松开后拇指回落到底部或顶部，但中间页面不会随其回落」与「计算当前窗口在整个历史中的坐标，

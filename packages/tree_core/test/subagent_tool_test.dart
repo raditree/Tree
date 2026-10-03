@@ -182,6 +182,34 @@ void main() {
     expect(spec.description, contains('共享同一个工作空间'));
   });
 
+  test('使用策略写在三处提示词资产里（工具描述 / 系统提示词 / 内置 Spec），口径一致', () {
+    // ① 工具描述：模型决定"要不要调"时看到的那段
+    final String tool = SubagentTool.spec().description;
+    expect(tool, contains('什么时候用'));
+    expect(tool, contains('什么时候不用'));
+    expect(tool, contains('职责/范围一致'));
+    expect(tool, contains('共享同一个工作空间'));
+    expect(tool, contains('请用 team'));
+
+    // ② 系统提示词种子：动手之前就该知道"什么时候派活、边界在哪"
+    expect(defaultSystemPromptSeed, contains('## 临时员工（subagent）使用策略'));
+    expect(defaultSystemPromptSeed, contains('task 必须自包含'));
+    expect(defaultSystemPromptSeed, contains('subagent_id'));
+    expect(defaultSystemPromptSeed, contains('共享同一个工作空间'));
+
+    // ③ 内置 Spec：挂规范干活时的分工口径（三份都要写明临时员工的位置与禁令）
+    for (final String id in <String>['general-task', 'hard-task', 'team-meeting']) {
+      expect(
+        kBuiltinSpecTexts[id],
+        contains('subagent'),
+        reason: '$id 要写清临时员工的使用边界（挂上规范后不许把它当成员用）',
+      );
+    }
+    expect(kBuiltinSpecTexts['general-task'], contains('不算"分工"'));
+    expect(kBuiltinSpecTexts['hard-task'], contains('成员 vs 临时员工'));
+    expect(kBuiltinSpecTexts['team-meeting'], contains('不许召临时员工去干活'));
+  });
+
   test('缺 task / 空 task：可读错误（明说它看不到你的会话历史）', () async {
     final ToolOutcome missing = await callTool(<String, dynamic>{});
     expect(missing.isError, isTrue);

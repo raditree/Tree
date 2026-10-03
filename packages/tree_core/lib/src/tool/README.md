@@ -40,6 +40,15 @@
     - 声明即能力：`specsFor` 在接了 `subagentService` 时**包含** `subagent`，未接线时**不包含**；`BuiltinTools.needsWorkspace('subagent')` 恒为 **false**（工具本身不读文件，子 agent 的工作空间由它自己在运行时解析，缺工作空间给**可读错误**）。
     - 唯一的口径差异（**权限，不是绕站**）：临时员工的工具表**没有** `team` / `message`（不能被派活、不能建队/管队），但**有** `subagent`（可以再召，把同一个大任务拆细；层级上限 `SubagentLimits.maxDepth`）。
 
+12. **`subagent` 的使用策略写在三处提示词资产里，口径一致**（[test/subagent_tool_test.dart](../../../test/subagent_tool_test.dart) 强制）：
+    工具描述（[subagent_tool.dart](subagent_tool.dart) 的 `ToolSpec.description`，模型决定要不要调时看到的那段）、
+    系统提示词种子（[system_prompt_file.dart](../agent/system_prompt_file.dart) 的「临时员工（subagent）使用策略」章）、
+    内置规范（[builtin_specs.dart](../spec/builtin_specs.dart) 的 general-task / hard-task / team-meeting）。
+    三处必须同口径：什么时候用 / 什么时候不用、`task` 必须自包含、同职责范围才复用 `subagent_id`、
+    并行按文件划分（共享同一工作空间）、套娃只用于把同一个大任务拆细、与 `team` 的边界（跨会话/正式流程才用 team）。
+    理由是"知道"与"被允许"发生在三个时刻：系统提示词在**动手之前**，工具描述在**决定调用的当下**，
+    内置 Spec 在**按规范分工的当下**——缺任何一处，模型都可能在错误的场景派出临时员工。
+
 ## 测试
 
 ```bash
@@ -53,6 +62,7 @@ dart test test/builtin_tools_test.dart test/terminal_hooks_test.dart test/termin
 
 - `subagent_tool_test.dart`：工具形状与校验（缺/空 `task`）、阻塞模式把最终报告作为工具结果返回、
   复用（同 id 续活、历史延续、不新建实体）、层级上限的可读错误、**并行后台**（同一轮 3 个真的同时跑、
-  三份结果各注入一次且不串）、父 agent 在途轮次不与之撞键、工具表裁剪（临时员工没有 team/message、有 subagent）。
+  三份结果各注入一次且不串）、父 agent 在途轮次不与之撞键、工具表裁剪（临时员工没有 team/message、有 subagent），
+  以及**使用策略写在三处提示词资产**的口径钉子（不变量 12：工具描述 / 系统提示词种子 / 内置 Spec）。
 - `tool_relay_test.dart` / `plugin_broadcast_tool_test.dart` 里的 `subagent` 用例钉住不变量 11 的三站口径
   （pre 改写真正生效、post 改写结果、嵌套调用各有轮次、`tool.call` 默认绕开 / `relay:true` 触发）。
