@@ -362,6 +362,40 @@ void main() {
       );
     });
 
+    test('插话落在**工具执行期间**：本跳思考不许丢，插话排到批的结果之后', () async {
+      // 现场（真机可达）：思考已经落库，工具还在跑（远端 SSH 上能跑几十秒），
+      // 用户这时插话 —— 历史顺序是 [思考, 插话, 工具卡]。旧实现在这里调用了一次
+      // **什么也不发**的 flushRound，把 pendingReasoning 清空：那段思考丢了，紧接着
+      // 的工具卡批以"没有 reasoning"收尾 ⇒ 端点 400（G1/G3 形态）。
+      final List<LlmMessage> sent = await build(<CoreMessageRef>[
+        const CoreMessageRef(role: 'user', content: '跑一条命令'),
+        const CoreMessageRef(role: 'agent', content: '先跑这条长命令', kind: 'thinking'),
+        const CoreMessageRef(role: 'user', content: '等一下，我改个主意'),
+        tool('terminal', 'call_x', '命令结果', ts: 1),
+      ]);
+
+      final LlmMessage caller = sent.lastWhere(
+        (LlmMessage m) => m.role == LlmRole.assistant && m.toolCalls.isNotEmpty,
+      );
+      expect(
+        caller.reasoningContent,
+        '先跑这条长命令',
+        reason: '这一跳的思考必须留在它自己那条 assistant 上（旧实现会被丢弃）',
+      );
+      expect(caller.toWire()['reasoning_content'], '先跑这条长命令');
+      expectEveryToolCallerHasReasoning(sent);
+
+      // 批（assistant(tool_calls) + 它的结果）仍然相邻，插话排在批之后 ⇒
+      // 请求以 **user** 收尾（比"以 tool 结果收尾"更保守的形态）
+      final int callerAt = sent.indexOf(caller);
+      expect(sent[callerAt + 1].role, LlmRole.tool, reason: '结果紧跟它的调用');
+      final int interjectionAt = sent.indexWhere(
+        (LlmMessage m) => m.role == LlmRole.user && m.content.contains('我改个主意'),
+      );
+      expect(interjectionAt, callerAt + 2, reason: '插话排在批的结果之后');
+      expect(sent.last.role, LlmRole.user, reason: '插话是这条请求的最后一条');
+    });
+
     test('两个批：落在第一批中间的提示排在第一批之后、第二批之前', () async {
       final List<LlmMessage> sent = await build(<CoreMessageRef>[
         const CoreMessageRef(role: 'user', content: '两轮工具'),

@@ -40,7 +40,9 @@
   一条 assistant 的 `tool_calls` 与它的**全部** tool 结果必须相邻；落在批中途的 hook 提示 / 用户插话
   一律推迟到该批结果之后——工具结果逐条落库（远端 SSH 上的慢工具尤其容易让注入卡在两条之间），
   就地发会把批切成"后半批没有 `reasoning_content`"，请求随即变成"以 tool 结果收尾、前面那条
-  `tool_calls` 没有 reasoning"⇒ 端点 400。
+  `tool_calls` 没有 reasoning"⇒ 端点 400。**判据是"这一轮还在飞"**：不止"批已有结果"，
+  **这一跳的思考已落库、工具卡还没回来**（插话落在工具执行期间）时也要推迟——就地 flush 在
+  "还没东西可发"时会清空待回传的思考，那段 CoT 丢失、紧接着的批以"没有 reasoning"收尾，同样 400。
 - **思考模型的每条 assistant 都带 `reasoning_content` 键**（[llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 13）：
   真端点实测（`deepseek-flash` @ `api.deepseek.com`，请求带 `tools`）：末尾 assistant（或末尾 tool 结果所属的
   那条 assistant）带 `reasoning_content: ""` 是 **200**，**整个键不给**才是 **400**

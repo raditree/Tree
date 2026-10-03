@@ -720,12 +720,20 @@ class LlmAgentEngine implements AgentEngine {
       // 但**工具批还没走完时不能落地**：就地发出去会把这一批切成两半，后半批没有
       // 可挂的 reasoning（见 deferredInputs 的现场）。推迟到批的结果之后再说。
       if (asUser) {
-        if (toolBatch.isNotEmpty) {
+        // 这一轮**还在飞**时的插话必须排在它之后。两种"在飞"都要拦：
+        // - 已有工具结果：批不能被切开（否则后半批没有可挂的 reasoning）；
+        // - **只有思考**（这一跳的 assistant 还没落地：工具卡 / 正文还在后面）：
+        //   就地 `flushRound()` 会**什么也不发**却把 `pendingReasoning` 清空 ——
+        //   那段 CoT 就此丢失，紧接着的工具卡批会以"没有 reasoning"的形态收尾
+        //   ⇒ 端点 400。真机可达：插话落在**工具执行期间**（思考已落库、工具卡还没回来，
+        //   远端 SSH 上的慢工具窗口尤其大）。
+        if (toolBatch.isNotEmpty || pendingReasoning.isNotEmpty) {
           deferredInputs.add(ref);
           log?.call(
             '工具批中途落进一条${ref.isNotice ? 'hook 提示' : '用户消息'}'
-            '（该批已有 ${toolBatch.length} 条工具结果）：推迟到这一批的结果之后'
-            '——批不能被切开，否则带 tool_calls 的 assistant 会缺 '
+            '（该批已有 ${toolBatch.length} 条工具结果'
+            '${pendingReasoning.isNotEmpty ? '、本跳思考已落库' : ''}）：推迟到这一批的'
+            '结果之后——批不能被切开，否则带 tool_calls 的 assistant 会缺 '
             'reasoning_content（思考模式端点会 400）',
           );
           continue;
