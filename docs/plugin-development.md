@@ -138,11 +138,12 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.execute.agent` | 执行 | — | `agent.message` / `agent.stop` / `agent.compact` |
 | `system.execute.ui` | 执行 | — | `ui.push` |
 | `system.execute.llm` | 执行 | — | `llm.call`（硬设 JSON 返回形式） |
-| `system.execute.tool` | 执行 | — | `tool.call`（执行任意工具） |
+| `system.execute.tool` | 执行 | — | `tool.call`（执行任意工具）、`tool.close`（按 `handle` **显式关闭**一次运行中的工具/请求：先尽力终止进程树、再让在途调用收敛；句柄失效或不归你管 ⇒ 可读拒绝，**绝不自动关**） |
 | `system.execute.session` | 执行 | — | `session.rename`（会话重命名） |
 | `system.broadcast` | 广播 | 通用主题（自定 topic） | 通知 |
 | `system.broadcast.tool.pre` | 广播 | 工具调用前 | 通知 |
 | `system.broadcast.tool.post` | 广播 | 工具调用后 | 通知 |
+| `system.tool.timeout` | 广播 | 某次**工具运行/LLM 请求**超过阈值（默认 **300 s**）时，**每个运行只广播一次** | 通知：载荷 `{handle, agent_id, session_id, tool, command, elapsed_ms, started_at, point}`——拿到 `handle` 后可经执行站 `tool.close` 显式关闭这次运行（见下行）；别名 `tool.timeout`（`{station: 'broadcast', point: 'tool.timeout'}`） |
 | `plugin.tool.define` | 收集 | 工具表刷新 | 申报工具定义 |
 
 ### 3.2 怎么订阅

@@ -135,7 +135,7 @@
   fail-open 绝不影响压缩）——compact 面板据此把"来源"列显示出 `builtin` / `llm.call` / `plugin`
   与每次调用的耗时、token（`cached_tokens` 缺失时留白、不编造 0）。
 
-## [1.0.0] — 未发布（首个开源版本）
+## [1.0.0] — 2026-10-03（首个开源版本）
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
@@ -147,7 +147,8 @@
   不够复盘"到底做了什么"）；**SSH 那条线**（工作空间在远端）看不到本机、日志也在远端，要完整查询就用
   `message send_message` 找**工作空间在本机**的团队代查，并可请它用**自己的终端**（`scp` / `rsync` 之类）
   把**原文件推到远端**；**本机那条线**照做，并把结论或落地的远端路径回给对方。
-  ② `message` 的 `files` 附件**只在本机工作空间之间可用**：任一侧是 SSH 就不投递、
+  ② `message` 的 `files` 附件**只在本机工作空间之间可用**（⇒ **1.0.1 起已扩展为跨机投递**，
+  见上方 `## [未发布]` 与 [team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 15）：任一侧是 SSH 就不投递、
   明确回一句"未投递"，消息本身照常送达（工具描述里的 `files` 参数同步写清这条边界，免得模型以为跨机能带附件）。
 - **Tree 在"带着 RedirectionGuard"启动时会自愈重启；安装器改经 shell 启动**
   （[docs/architecture.md](docs/architecture.md) §13 不变量 11、`docs/known-issues.md` #16，

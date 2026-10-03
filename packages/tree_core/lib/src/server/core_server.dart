@@ -544,7 +544,7 @@ class CoreServer {
 
   /// 关闭服务并释放全部连接（幂等）。
   Future<void> close({bool force = true}) async {
-    // 运行中工具登记表：取消待发 warning 的计时器并清空登记项——别让一个 120s 的
+    // 运行中工具登记表：取消待发 warning 的计时器并清空登记项——别让一个 300s 的
     // 计时器把核心进程吊在退出门口（进程终止是工具层自己的事，见 TerminalHooks.close）。
     _toolRunsOf().shutdown();
     conversation.dispose();

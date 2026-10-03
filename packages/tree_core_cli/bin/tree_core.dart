@@ -191,8 +191,12 @@ Future<void> main(List<String> args) async {
             senderName: senderName,
           );
         },
-    // 活动日志与文件投递只走**本机**工作空间：SSH 成员的工作空间在远端，
-    // 这里返回空串，投递会明确报"不支持"而不是复制到无关目录。
+    // 这里给出的是**本机目录**（`workspaceDirOf` 的语义就是"本机绝对路径"）：
+    // - **文件投递**已不再依赖它——投递按 `ioFor` 解析两侧端点，SSH 两端也能投（见
+    //   `TeamMessageDispatcher._copyFiles` 与 team/README 不变量 15），本机目录只在
+    //   "两侧都是本机"时走 `File.copy` 那条快路；
+    // - **活动日志**同样优先走工作空间 IO；本机目录只是无 IO 时的兜底。
+    // ⇒ SSH agent 在这里返回空串不会让投递/日志失效，只是别拿它当"本机路径"用。
     workspaceDirOf: (String agentId) {
       final CoreAgent? agent = store.agent(agentId);
       if (agent == null) return paths.defaultWorkspaceDir(agentId);

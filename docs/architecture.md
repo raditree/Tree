@@ -96,7 +96,9 @@ Flutter UI 进程（lib/）                     核心进程（packages/tree_cor
   **终端命令不经过翻译**，所以系统提示词里写明真实路径。
 - **成员跟随 leader 的 SSH**：成员没有自己的 `ssh:` 就用 TOP 那份（同一台远端主机、同一个根）。
 - 旧工作空间的 `.self` 由核心启动时一次性迁移到 `.tree/<TOP id>/.self`（幂等）。
-- 文件投递（`message send_message files:`）落到接收方 `.input/<日期>/`，只支持本机工作空间。
+- 文件投递（`message send_message files:`）落到接收方 `.input/<日期>/`：**四种组合都支持**——local↔local（本机 `File.copy`）、
+  local↔SSH、SSH↔SSH（含跨主机，**经本机中转**）；判据是**有效 SSH 接线**（`teamSshConfigFor`），不是 `agent.sshConfig`；
+  单文件 ≤32 MB、越界路径拒绝、部分失败如实回 `files_failed`（见 [team/README.md](../packages/tree_core/lib/src/team/README.md) 不变量 15）。
 
 ## 7. 团队与消息
 
