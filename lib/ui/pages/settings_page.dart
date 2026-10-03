@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -22,10 +23,17 @@ import '../theme_service.dart';
 /// - 插件开发：文档入口（打开 `plugins/README.md`）+ 插件目录定位
 /// - 版本信息：应用 / 核心 / 接口契约 / 核心进程与产物（含"核心比界面旧"告警）
 class SettingsPage extends StatefulWidget {
-  const SettingsPage({super.key, this.versionInfo});
+  const SettingsPage({
+    super.key,
+    this.versionInfo,
+    this.focusModels = false,
+  });
 
   /// 版本信息数据源（**测试注入用**；null = 从核心启动器读当前运行态）。
   final VersionInfo? versionInfo;
+
+  /// 打开时**滚到「自定义模型」一节**（新手引导第 1 步：先配模型）。
+  final bool focusModels;
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -97,6 +105,11 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 路径会把用户送到一个不存在的地方。拿不到就退回"去插件面板看"的指引。
   String? _pluginConfigPath;
 
+  /// 「自定义模型」一节的锚点（引导第 1 步要滚到它）。
+  final GlobalKey _modelsSectionKey = GlobalKey(
+    debugLabel: 'settings_models_section',
+  );
+
   @override
   void initState() {
     super.initState();
@@ -105,6 +118,21 @@ class _SettingsPageState extends State<SettingsPage> {
     _loadHeartbeatSetting();
     _loadModelList();
     _loadPluginConfigPath();
+    // 引导带过来的（focusModels）：首帧之后滚到「自定义模型」——此时 ListView
+    // 还没布局完，ensureVisible 拿不到位置。
+    if (widget.focusModels) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final BuildContext? target = _modelsSectionKey.currentContext;
+        if (target == null) return;
+        unawaited(
+          Scrollable.ensureVisible(
+            target,
+            duration: const Duration(milliseconds: 300),
+            alignment: 0.1,
+          ),
+        );
+      });
+    }
   }
 
   /// 读插件快照，只为拿 `config.path`（插件清单的真实路径）。
@@ -399,7 +427,10 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 8),
           _buildHeartbeatCard(),
           const SizedBox(height: 24),
-          _buildSectionTitle('自定义模型'),
+          KeyedSubtree(
+            key: _modelsSectionKey,
+            child: _buildSectionTitle('自定义模型'),
+          ),
           const SizedBox(height: 8),
           _buildCustomModelCard(),
           const SizedBox(height: 24),
@@ -419,10 +450,45 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 8),
           _buildPluginDevCard(),
           const SizedBox(height: 24),
+          _buildSectionTitle('新手引导'),
+          const SizedBox(height: 8),
+          _buildOnboardingCard(),
+          const SizedBox(height: 24),
           _buildSectionTitle('版本信息'),
           const SizedBox(height: 8),
           _buildVersionCard(),
         ],
+      ),
+    );
+  }
+
+  /// 新手引导卡片：让用户随时把**首次使用的八步引导**再叫出来（用户 2026-10-04）。
+  ///
+  /// 为什么要在设置里给一个入口：引导第一次弹过 / 被跳过后就不再自动出现，
+  /// 没有这个入口用户就只能删配置才能再看一遍——那既不友好，也没法验证。
+  /// 口径：点一下返回 `true` 给 MainPage，由它清掉"看过"记录并**从头**弹一次。
+  Widget _buildOnboardingCard() {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(
+              '首次使用的八步引导（模型 → 建 agent → 模型信息 → 工作目录 → 插件 → 文件 → Ctrl+J → demo）',
+              style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant, height: 1.35),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              key: const ValueKey<String>('settings-replay-onboarding'),
+              onPressed: () => Navigator.of(context).pop(true),
+              icon: const Icon(Icons.tips_and_updates_outlined, size: 16),
+              label: const Text('重新显示新手引导'),
+            ),
+          ],
+        ),
       ),
     );
   }

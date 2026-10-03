@@ -10,6 +10,9 @@ import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
 import '../../io/ssh_executor_service.dart';
 import '../services/detail_selection.dart';
+import '../services/onboarding_requests.dart';
+import '../services/onboarding_state.dart';
+import '../services/onboarding_steps.dart';
 import '../services/plugin_ui_registry.dart';
 import '../services/terminal_toggle_request.dart';
 import '../widgets/activity_bar_item.dart';
@@ -18,6 +21,7 @@ import '../widgets/create_agent_dialog.dart';
 import '../widgets/download_panel.dart';
 import '../widgets/file_panel.dart';
 import '../widgets/message_panel.dart';
+import '../widgets/onboarding_guide.dart';
 import '../widgets/plugin_panel.dart';
 import '../widgets/plugin_ui_slots.dart';
 import '../widgets/teammates_window_page.dart';
@@ -402,6 +406,21 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     );
   }
 
+  // ── 新手引导（首次使用；每一步都能跳过） ─────────────────────────────
+
+  /// 引导浮层是否可见。
+  bool _guideVisible = false;
+
+  /// 当前第几步（0 基，见 [kOnboardingSteps]）。
+  int _guideIndex = 0;
+
+  /// 右栏顶层页签的外部选中请求（引导第 3/6 步用）：索引 + 请求序号。
+  int? _filePanelTab;
+  int _filePanelTabRevision = 0;
+
+  /// 活动栏里「插件管理」的位置（引导第 5 步）。
+  static const int _pluginPanelIndex = 1;
+
   @override
   void initState() {
     super.initState();
@@ -413,6 +432,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     // 否则用户点了半天什么也没发生
     DetailSelection.instance.addListener(_onDetailSelected);
     _loadAgents();
+    unawaited(_maybeShowGuide());
   }
 
   @override
@@ -500,7 +520,22 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                     constraints.maxHeight < _minWindowHeight) {
                   return _buildSmallSizePrompt();
                 }
-                return _buildThreeColumnLayout(constraints.maxWidth);
+                // 新手引导浮层：非模态地盖在中栏上方（下面的界面照样能点——
+                // 每一步的「带我过去」都要打开真实界面）。
+                return Stack(
+                  children: <Widget>[
+                    Positioned.fill(
+                      child: _buildThreeColumnLayout(constraints.maxWidth),
+                    ),
+                    if (_guideVisible)
+                      Positioned(
+                        top: 16,
+                        left: 0,
+                        right: 0,
+                        child: Center(child: _buildGuide()),
+                      ),
+                  ],
+                );
               },
             ),
           ),
@@ -598,6 +633,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                   teamName: _selectedAgent?.name ?? '',
                   sessionId: _currentSessionId,
                   onNavigateToQuestion: _handleNavigateToQuestion,
+                  selectTab: _filePanelTab,
+                  selectTabRevision: _filePanelTabRevision,
                 ),
         ],
       ),
@@ -1077,13 +1114,105 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     });
   }
 
-  /// 打开设置页（活动栏底部全局入口）
-  void _openSettings() {
-    Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (BuildContext context) => const SettingsPage(),
+  // ── 新手引导 ─────────────────────────────────────────────────────────
+
+  /// 第一次使用（没有任何"看过"记录）时弹一次引导；跳过或走完都不再自动弹。
+  Future<void> _maybeShowGuide() async {
+    bool show;
+    try {
+      show = await OnboardingState.instance.shouldShow();
+    } catch (_) {
+      // 读不到偏好（平台不支持 / 测试环境没装插件）就**不打扰**：引导是锦上添花，
+      // 不能因为它把启动流程搞出未捕获异常。
+      return;
+    }
+    if (!mounted || !show) return;
+    setState(() {
+      _guideVisible = true;
+      _guideIndex = 0;
+    });
+  }
+
+  /// 引导浮层（**非模态**：只盖中栏上方一小块，后面的界面照样能点——每一步都要
+  /// 打开真实界面，模态对话框会把那些界面挡在外面）。
+  Widget _buildGuide() {
+    final int index = _guideIndex.clamp(0, kOnboardingSteps.length - 1);
+    final OnboardingStep step = kOnboardingSteps[index];
+    return OnboardingGuide(
+      step: step,
+      index: index,
+      total: kOnboardingSteps.length,
+      onAction: () => _runGuideAction(step),
+      onBack: () => setState(() => _guideIndex = index - 1),
+      onNext: () => setState(() => _guideIndex = index + 1),
+      onSkipAll: () => unawaited(_closeGuide()),
+      onFinish: () => unawaited(_closeGuide()),
+    );
+  }
+
+  /// 收工（走完「完成」或按「跳过引导」）：记下来，之后不再自动弹。
+  Future<void> _closeGuide() async {
+    setState(() {
+      _guideVisible = false;
+    });
+    try {
+      await OnboardingState.instance.markDone();
+    } catch (_) {
+      // 写不进去（平台不支持）也不该打断用户：这次会话内它确实关掉了。
+    }
+  }
+
+  /// 「带我过去」：**只做导航**（打开真实界面 / 唤起终端 / 预填输入框），
+  /// 不替用户做决定、不自动提交任何东西。
+  void _runGuideAction(OnboardingStep step) {
+    switch (step.id) {
+      case OnboardingStepId.models:
+        unawaited(_openSettings(focusModels: true));
+      case OnboardingStepId.createAgent:
+        unawaited(_handleCreateAgent());
+      case OnboardingStepId.agentModel:
+        _requestFilePanelTab(FilePanel.modelInfoTabIndex);
+      case OnboardingStepId.workspace:
+        WorkspacePickRequest.instance.request();
+      case OnboardingStepId.plugins:
+        _selectBuiltinPanel(_pluginPanelIndex);
+      case OnboardingStepId.files:
+        _requestFilePanelTab(FilePanel.filesTabIndex);
+      case OnboardingStepId.terminal:
+        TerminalToggleRequest.instance.request();
+      case OnboardingStepId.demo:
+        // 只填进输入框，不自动发送（用户看清了再按发送）
+        ComposerPrefillRequest.instance.request(kOnboardingDemoText);
+    }
+  }
+
+  /// 展开右栏并请求切到某个顶层页签（序号自增 ⇒ 同一个页签点第二次也生效）。
+  void _requestFilePanelTab(int tab) {
+    setState(() {
+      _rightCollapsed = false;
+      _filePanelTab = tab;
+      _filePanelTabRevision++;
+    });
+  }
+
+  /// 打开设置页（活动栏底部全局入口）。
+  ///
+  /// [focusModels] 为真时滚到「自定义模型」一节（新手引导第 1 步）。
+  /// 设置页返回 `true` = 用户在那里点了「重新显示新手引导」⇒ 清记录再弹一次。
+  Future<void> _openSettings({bool focusModels = false}) async {
+    final bool? replay = await Navigator.of(context).push<bool>(
+      MaterialPageRoute<bool>(
+        builder: (BuildContext context) =>
+            SettingsPage(focusModels: focusModels),
       ),
     );
+    if (replay != true) return;
+    await OnboardingState.instance.reset();
+    if (!mounted) return;
+    setState(() {
+      _guideVisible = true;
+      _guideIndex = 0;
+    });
   }
 
   /// 构建左栏当前选中的功能面板
@@ -1190,6 +1319,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         });
       },
       onNavigateToQuestion: _handleNavigateToQuestion,
+      // 引导「带我过去」的页签请求（按序号触发，见 _requestFilePanelTab）
+      selectTab: _filePanelTab,
+      selectTabRevision: _filePanelTabRevision,
     );
   }
 

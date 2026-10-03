@@ -18,6 +18,7 @@ import '../../io/websocket_service.dart';
 import '../../io/workspace_refresh_service.dart';
 import '../services/detail_selection.dart';
 import '../services/message_replay_guard.dart';
+import '../services/onboarding_requests.dart';
 import '../services/plugin_ui_registry.dart';
 import '../services/session_rename.dart';
 import '../services/team_scope_view.dart';
@@ -188,6 +189,9 @@ class _MessagePanelState extends State<MessagePanel> {
     // （见 TerminalToggleRequest 的文档）。焦点在本面板里时走下面那层
     // CallbackShortcuts——内层先消费按键，所以两条路不会重复切换。
     TerminalToggleRequest.instance.addListener(_onTerminalToggleRequested);
+    // 新手引导第 4 步「选择工作目录」：与左上角那颗目录按钮**同一条路径**（同一条校验、
+    // 同一套"成员写团队 TOP"的口径），不另开一个选择器。
+    WorkspacePickRequest.instance.addListener(_onWorkspacePickRequested);
     // Q12 插件布局：本面板的 WS 连接同时承载插件 UI 帧（manifest / update /
     // plugin_status 卸载），并作为 plugin_ui_action 的发送出口。
     PluginUiRegistry.instance.actionSender = _pluginActionSink;
@@ -1242,6 +1246,7 @@ class _MessagePanelState extends State<MessagePanel> {
       PluginUiRegistry.instance.actionSender = null;
     }
     TerminalToggleRequest.instance.removeListener(_onTerminalToggleRequested);
+    WorkspacePickRequest.instance.removeListener(_onWorkspacePickRequested);
     _webSocket.disconnect();
     super.dispose();
   }
@@ -1332,6 +1337,8 @@ class _MessagePanelState extends State<MessagePanel> {
               // 自己没发完的文本与附件，互不串味（终端模式期间它被移出树，
               // 草稿靠缓存活着，切回来原样还在）
               cacheKey: '${agent.id}::$_currentSessionId',
+              // 新手引导最后一步把 demo 那句话预填进来（只填不发）
+              prefill: ComposerPrefillRequest.instance,
               onSend: _handleSend,
             ),
             ],
@@ -1345,6 +1352,12 @@ class _MessagePanelState extends State<MessagePanel> {
   ///
   /// 这里再判一次 mounted / 有没有 agent：请求是**广播**，面板可能已经卸载，
   /// 或者当前根本没有选中的 agent（那时没有「对应工作区」可开终端）。
+  /// 引导请求「选择工作目录」：转交给既有的目录选择流程（含团队 TOP / SSH 那套规则）。
+  void _onWorkspacePickRequested() {
+    if (widget.selectedAgent == null) return;
+    unawaited(_pickWorkingDirectory());
+  }
+
   void _onTerminalToggleRequested() {
     if (!mounted || widget.selectedAgent == null) return;
     _toggleTerminal();

@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../services/onboarding_requests.dart';
 import 'attachment_preview.dart';
 import 'input_style.dart';
 
@@ -81,10 +82,16 @@ class MessageInput extends StatefulWidget {
   /// 为 null 表示不缓存——复用方（如 teammates 窗口）不传时行为与旧版一致。
   final String? cacheKey;
 
+  /// 「把这段文字预填进来」的全局请求（新手引导最后一步用；null = 不监听）。
+  ///
+  /// 只改文本与焦点，**绝不自动发送**：发不发是用户按发送键决定的。
+  final ComposerPrefillRequest? prefill;
+
   const MessageInput({
     super.key,
     required this.onSend,
     this.cacheKey,
+    this.prefill,
   });
 
   @override
@@ -137,6 +144,24 @@ class _MessageInputState extends State<MessageInput> {
     _fieldFocus.addListener(() {
       if (mounted) setState(() {});
     });
+    widget.prefill?.addListener(_onPrefillRequested);
+  }
+
+  /// 外部请求把一段文字填进来（新手引导的 demo 步）：只写文本 + 给焦点，不发送。
+  ///
+  /// 写入会经 [_saveDraft] 落成当前 agent+会话的草稿——用户切走再回来那句话还在，
+  /// 与"自己手打的"完全是同一条路径。
+  void _onPrefillRequested() {
+    final ComposerPrefillRequest? request = widget.prefill;
+    if (request == null || !mounted) return;
+    final String text = request.text;
+    setState(() {
+      _controller.value = TextEditingValue(
+        text: text,
+        selection: TextSelection.collapsed(offset: text.length),
+      );
+    });
+    _fieldFocus.requestFocus();
   }
 
   @override
@@ -152,6 +177,7 @@ class _MessageInputState extends State<MessageInput> {
 
   @override
   void dispose() {
+    widget.prefill?.removeListener(_onPrefillRequested);
     _controller.dispose();
     _fieldFocus.dispose();
     _keyFocus.dispose();

@@ -202,6 +202,28 @@
     **搬**进 / 搬出分栏而不是重建：展开状态、选中项、已加载的目录都不丢。树里的改名 / 删除对已打开文件的联动经
     `FileTree.onPathRenamed` / `onPathDeleted` → FilePanel 更新窗格路径（缓冲实例不动）或关掉窗格并提示。
 
+17. **首次使用有八步新手引导，处处可跳过**（[ui/services/onboarding_steps.dart](ui/services/onboarding_steps.dart)、
+    [ui/services/onboarding_state.dart](ui/services/onboarding_state.dart)、
+    [ui/widgets/onboarding_guide.dart](ui/widgets/onboarding_guide.dart)、
+    [ui/services/onboarding_requests.dart](ui/services/onboarding_requests.dart)，**用户断言 2026-10-04**）：
+    顺序**就是用户定的顺序**（不要顺手重排）：模型配置（设置页）→ 创建 agent → 配置模型信息 →
+    配置工作目录 → 启用插件 → 文件浏览 → Ctrl+J → demo 输入（「创建一名成员，负责插件开发」）。
+    ① **浮层是非模态的**（盖在中栏上方一小块）：每一步的「带我过去」都要打开**真实界面**——设置页的
+    「自定义模型」一节、建 agent 对话框、右栏「模型信息」/「文件」页、插件管理面板、集成终端、
+    工作目录选择器；模态对话框会把那些界面挡在外面，用户只能对着引导发愣；
+    ② **只做导航、不替用户决定**：除最后一步外「带我过去」只是把人带到地方；最后一步把 demo 那句话
+    **填进输入框**（光标就位、**不自动发送**，用户看清了自己按发送）；
+    ③ **处处可跳过**：「下一步（跳过这步）」= 不做这一步直接走，「跳过引导」= 整段收工，两者都记进
+    [OnboardingState](ui/services/onboarding_state.dart)（SharedPreferences `tree.onboarding.v1`，**UI 级偏好**，
+    不占核心配置）⇒ 之后不再自动弹；设置页的「新手引导」卡片可以**重新显示**（清记录再从头弹一次），
+    否则用户只能删配置才能再看一遍、也没法验证；
+    ④ 跨面板的动作走**全局广播**（`ComposerPrefillRequest` / `WorkspacePickRequest`，与
+    [TerminalToggleRequest](ui/services/terminal_toggle_request.dart) 同一范式）：引导在 MainPage 里、
+    要落地的动作在消息面板里（只有它知道当前 agent / 会话、手里有那份工作目录配置），所以只广播
+    「要做这件事」；右栏页签用「索引 + 请求序号」表达（用户自己翻页后再点一次「带我过去」也要生效，
+    不能被「值没变」吞掉）；
+    ⑤ 偏好读不到（平台不支持 / 测试环境）时**静默不弹**，绝不因为引导把启动搞出未捕获异常。
+
 ## 测试
 
 ```bash

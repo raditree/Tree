@@ -54,6 +54,12 @@ const String _sharedBufferNotice = '同一文件已在另一窗格打开：两�
 /// [EditorBuffer]（同一个控制器 + 一份 dirty / saving / loadedSize），两边都能编辑、
 /// 一边打字另一边立刻可见，保存只有一套语义（见 [lib/README.md] 不变量 13）。
 class FilePanel extends StatefulWidget {
+  /// 顶层页签里「文件」的索引（新手引导第 6 步要切到它；与内部 Tab 顺序同源）。
+  static const int filesTabIndex = 0;
+
+  /// 顶层页签里「模型信息」的索引（新手引导第 3 步要切到它）。
+  static const int modelInfoTabIndex = 2;
+
   /// 工作空间 ID
   final String workspaceId;
 
@@ -75,6 +81,18 @@ class FilePanel extends StatefulWidget {
   /// 插件槽位注册表（默认全局单例；测试注入独立实例，避免污染单例）
   final PluginUiRegistry? registry;
 
+  /// 顶层页签的外部选中请求（索引：0=文件，2=模型信息，…；null = 不动）。
+  ///
+  /// 新手引导用它把用户直接带到「模型信息」/「文件」页；只在**值变化**时生效——
+  /// 用户自己翻页后不该被下一次重建拽回去。
+  final int? selectTab;
+
+  /// [selectTab] 的**请求序号**：每次外部请求自增。
+  ///
+  /// 为什么不能只看索引有没有变：用户可能自己翻走再点一次引导的「带我过去」——
+  /// 索引没变、但用户确实要回到那一页。按序号判"这是一次新请求"才没有死按钮。
+  final int selectTabRevision;
+
   const FilePanel({
     super.key,
     required this.workspaceId,
@@ -84,6 +102,8 @@ class FilePanel extends StatefulWidget {
     this.onCollapse,
     this.onNavigateToQuestion,
     this.registry,
+    this.selectTab,
+    this.selectTabRevision = 0,
   });
 
   @override
@@ -93,6 +113,7 @@ class FilePanel extends StatefulWidget {
 class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
   /// 内置顶层 Tab 数量（文件 / MCP 配置 / 模型信息 / 问题回复 / 详情）
   static const int _builtinTabCount = 5;
+
 
   /// 「详情」页的固定索引（中栏点了工具行 / 思考行就切到它）
   static const int _detailTabIndex = _builtinTabCount - 1;
@@ -250,6 +271,18 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
     _tabController.dispose();
     _fileTabController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant FilePanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 外部页签请求（新手引导）：按**请求序号**判"这是一次新请求"（见 selectTabRevision）
+    final int? requested = widget.selectTab;
+    if (requested != null &&
+        widget.selectTabRevision != oldWidget.selectTabRevision) {
+      final int index = requested.clamp(0, _tabController.length - 1);
+      if (_tabController.index != index) _tabController.animateTo(index);
+    }
   }
 
   /// 中栏选中了工具行 / 思考行：切到「详情」页。

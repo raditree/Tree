@@ -288,9 +288,11 @@ void main() {
 
     testWidgets('插件开发卡：文档入口 + 找不到时的可读提示', (WidgetTester tester) async {
       await pumpSettings(tester, full);
-      await scrollTo(tester, find.byKey(const Key('plugin-docs-open')));
-
+      // 分区标题先看一眼：ListView 会回收滚出视口的那一项，滚到卡片之后标题就不在了
+      // （设置页又多了一节「新手引导」，同一个视口里装不下标题 + 卡片）。
+      await scrollTo(tester, find.text('插件开发'));
       expect(find.text('插件开发'), findsOneWidget, reason: '分区标题');
+      await scrollTo(tester, find.byKey(const Key('plugin-docs-open')));
       expect(find.text('打开插件开发说明'), findsOneWidget);
       expect(
         find.textContaining('stdio JSON-RPC'),
