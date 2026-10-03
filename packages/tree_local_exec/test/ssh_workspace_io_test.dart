@@ -341,7 +341,7 @@ void main() {
       expect(t.commands.single, 'cd \'/ws/it\'\\\'\'s\' && pwd');
     });
 
-    test('timeout 只透传、不再据此终止命令（M9 1.1）', () async {
+    test('timeout 透传给传输层（本层不据此终止命令；软超时见 ssh_exec_soft_timeout_test）', () async {
       t.onRun = (String _) =>
           const SshExecResult(exitCode: 0, stdout: 'done', stderr: '');
       final ExecOutcome r = await io.exec(

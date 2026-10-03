@@ -141,6 +141,32 @@ abstract final class ApiPaths {
   static const String mcpServices = '/api/mcp/services';
   static const String mcpService = '/api/mcp/services/{name}';
 
+  // ── 运行中工具（"工具卡住"的可见面）────────────────────────────────────
+
+  /// 正在执行的工具快照（GET，**只读**）：`{runs:[{handle, agent_id, session_id,
+  /// tool, command_preview, started_at, elapsed_ms, over_threshold}]}`。
+  ///
+  /// 数据源是核心的**内存登记表**（`ToolRunRegistry`）：只登记"正在跑的"，重启即清空，
+  /// 不做历史运行记录。前端右栏「正在执行的 tool」页签的数据源。
+  static const String toolsRunning = '/api/tools/running';
+
+  /// 显式关闭一次运行中的工具（POST，body 无；`handle` 取自 [toolsRunning] 的列表）。
+  ///
+  /// 语义与执行站命令 `tool.close` **同一个实现**（先尽力终止进程树，再把这次运行从
+  /// 登记表移除，并让在途工具调用收敛）；句柄失效 ⇒ 404 + 可读原因（fail-closed）。
+  /// **不自动杀**：超阈值只 warning，关闭必须显式。
+  static const String toolsRunningClose = '/api/tools/running/{handle}/close';
+
+  // ── 临时员工名册（会话级，只读）──────────────────────────────────────
+
+  /// 某个会话的**临时员工名册**（GET `?session_id=`，**只读**）。
+  ///
+  /// 数据源就是那份落盘名册（`data/<agentId>/<sessionId>/subagents.json`，见
+  /// `store/README.md` 不变量 11）——前端"进入某个临时员工的入口"拿它当**权威来源**，
+  /// 因此不会随中栏消息窗口的加载/淘汰而抖动（用户 2026-10-03）。
+  /// **跨会话不保留**：只读该 `(agentId, sessionId)`，删会话即随之消失。
+  static const String agentSubagents = '/api/agents/{agentId}/subagents';
+
   /// 桌面分支保留的全部路径。
   static const Set<String> kept = <String>{
     agents,
@@ -193,6 +219,9 @@ abstract final class ApiPaths {
     pluginBuiltinDisable,
     mcpServices,
     mcpService,
+    toolsRunning,
+    toolsRunningClose,
+    agentSubagents,
   };
 
   /// 全部路径（保留 + 账号组）。

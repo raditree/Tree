@@ -9,7 +9,7 @@
 | --- | --- |
 | [lib/src/workspace_io.dart](lib/src/workspace_io.dart) | 接口：`WorkspaceIO`（read/write/edit/grep/list/exec/git）、`WorkspaceFiles`（文件面板：列目录 / 原始字节 / 流）、结果类型与路径异常 |
 | [lib/src/local_workspace_io.dart](lib/src/local_workspace_io.dart) | 本机实现：进程树终止、非 UTF-8 输出标记（GBK 代码页尝试解码）、软超时交还活着的进程（`RunningLocalExec`） |
-| [lib/src/ssh_workspace_io.dart](lib/src/ssh_workspace_io.dart) | SSH 实现：SFTP + exec，心跳判活，链路失活显式失败；文件面板的结构改动（mkdir / rename / remove）也在这一层，**全部走 SFTP**；另含交互终端的透传口 `openShell`（远端根在这一层解决） |
+| [lib/src/ssh_workspace_io.dart](lib/src/ssh_workspace_io.dart) | SSH 实现：SFTP + exec，心跳判活，链路失活显式失败；**软超时交还仍在运行的远端命令**（`RunningSshExec`）；文件面板的结构改动（mkdir / rename / remove）也在这一层，**全部走 SFTP**；另含交互终端的透传口 `openShell`（远端根在这一层解决） |
 | [lib/src/git_output.dart](lib/src/git_output.dart) | git 的命令与输出解析（log / branch / **status**）：本地与 SSH **共用一份**，命令形状与解析规则不可能漂移 |
 | [lib/src/ssh_shell_channel.dart](lib/src/ssh_shell_channel.dart) | **远端 shell 通道** `SshShellChannel`（交互终端用）：原始字节输出 / 键盘输入 / 改尺寸 / 退出码 / 幂等 `close`；dartssh2 实现在 [lib/src/dartssh_transport.dart](lib/src/dartssh_transport.dart) 的 `openShell`（`shell` 或 `exec + pty-req`） |
 | [lib/src/shell.dart](lib/src/shell.dart) | shell 参数：`-NonInteractive`、裸 `echo` 兼容翻译、逻辑运算符翻译（Windows/POSIX） |
@@ -23,8 +23,12 @@
 ## 不变量（assertions）
 
 1. 只接受**工作空间相对路径**；`resolve` 拒绝绝对路径 / 盘符 / `..` 逃逸（`WorkspacePathException`）。
-2. **没有静态任务超时**：本地判活 = 进程存活；SSH 判活 = 心跳。`exec(timeout:)` 是**本地软超时**，
-   到点**不杀进程**，以 `LocalExecStillRunning` 交出活着的进程；SSH 侧忽略该参数。
+2. **没有静态任务超时**：本地判活 = 进程存活；SSH 判活 = 心跳。`exec(timeout:)` 是**两端同口径的软超时**
+   （2026-10-03 起 SSH 也兑现；此前 SSH 侧忽略它——现场事故见 [../../docs/known-issues.md](../../docs/known-issues.md)），
+   到点**不杀进程、不重跑、不关通道**，把仍在跑的**命令**交出来：本地是 `LocalExecStillRunning`
+   + `RunningLocalExec`（输出订阅还活着、进程杀得掉），SSH 是 `SshExecStillRunning` + `RunningSshExec`
+   （远端进程不归本机管：退出码与完整输出要等它自己结束才回来）。`timeout <= 0`（含缺省 `Duration.zero`）
+   = **永不软超时**（老行为）。硬超时（按时间杀）**不存在**。
 3. 输出**字节不丢**：非 UTF-8 先尝试系统代码页；解不开时 latin1 兜底并标 `garbledOutput`。
 4. 隐藏路径默认不扫（`.[!.]*`）；显式指向隐藏目录时按用户意图搜索。
 5. 启动子进程时**禁用交互**（`-NonInteractive` + 关闭 stdin），否则等输入的命令会永久挂住
@@ -98,7 +102,8 @@ M11 新增钉子：`git_output_test` 的 `parseStatus` 组（`-z`、空格 / 中
 未跟踪、被忽略、非法输入、截断）；`local_workspace_io_test` / `ssh_workspace_io_test` 的「文件面板结构改动」组
 （新建 / 重命名 / 删除的结果码与真实行为）；`git` 组里的 `gitStatus` 用例（真仓库 M/U/A/D + 非仓库空态）。
 
-回归钉子：`exec_no_interactive_hang_test`（裸 `echo` 不再等输入）、`exec_soft_timeout_test`（软超时交还进程）、
+回归钉子：`exec_no_interactive_hang_test`（裸 `echo` 不再等输入）、`exec_soft_timeout_test`（本地软超时交还进程）、
+`ssh_exec_soft_timeout_test`（**SSH 软超时**：到点交出仍在运行的远端命令、`0`/缺省 = 永不、到点后心跳仍判活）、
 `shell_translate_test`（裸 echo / 逻辑运算符翻译）、`windows_environment_test`（**按登录口径重建**：`reg query`
 输出解析、`Path` 机器级+用户级、用户级覆盖、注册表缺项时保留继承值、`%VAR%` 展开与变量环、任一步失败整体退回）、
 `ssh_login_shell_test`（**登录外壳**：单引号穿壳、模板渲染与非法模板跳过、bash → sh → 原样发的回退、关得掉、结论缓存）、

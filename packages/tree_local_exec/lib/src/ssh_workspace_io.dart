@@ -77,10 +77,12 @@ abstract interface class SshTransport {
 
   /// 执行命令，返回退出码与解码后的输出。
   ///
-  /// [timeout] 是 M9 之前的**静态总时长**硬超时；1.1 修正后**不再按时间终止**
-  /// 远端命令（本地执行，没有多服务器争抢资源的后果）——判据换成心跳：只要心跳
-  /// 还在回，命令跑多久都等；心跳连续丢失才由 [liveness] 判失活并以显式错误
-  /// 结束在途操作。参数保留只为不改调用方签名，已无实际作用。
+  /// [timeout] 是 **2026-10-03 恢复的软超时**：由 [SshWorkspaceIO.exec] 兑现
+  /// （到点**不再等**，以 [SshExecStillRunning] 交出仍在跑的远端命令）。
+  /// 本层仍然**不按时间终止**任何命令：M9 1.1 的判据是活性——只要心跳还在回，
+  /// 远端命令跑多久都等；心跳连续丢失才由 [liveness] 判失活，让在途操作以显式错误
+  /// （[SshLinkStaleException]）结束，而不是静默挂起。因此这个参数只是**透传**给
+  /// 实现层做记录，本层不拿它切时间。
   Future<SshExecResult> run(String command, {Duration timeout});
 
   /// 打开一条**远端 shell 通道**（真 PTY）：交互终端（Ctrl+J）的远端分支。
@@ -141,6 +143,98 @@ class SshExecResult {
 
   /// 是否因超时被终止；M9 1.1 起恒为 false（字段留着不改调用方）。
   final bool timedOut;
+}
+
+/// 软超时到点、远端命令**仍在运行**（没有终止、也没有重跑）。
+///
+/// 由 [SshWorkspaceIO.exec] 抛出：调用方（terminal 的 hook 模式）拿到 [running] 后
+/// 把它登记成后台任务即可——SSH 通道仍然开着，远端那条命令照常跑完，
+/// [RunningSshExec.result] 会在它真正结束时给出退出码与完整输出。
+///
+/// 与本地 [LocalExecStillRunning] 是**同一套语义、同一套命名**（`command` /
+/// `running` / `elapsed` / `message`），差别只在句柄（[RunningSshExec]）：远端进程不
+/// 归本机管——没有 pid、也没有可以杀的进程树。
+class SshExecStillRunning implements Exception {
+  SshExecStillRunning(this.command, this.running, this.elapsed);
+
+  /// 原命令。
+  final String command;
+
+  /// 仍在运行的远端命令句柄。
+  final RunningSshExec running;
+
+  /// 已经等了多久（≈ 软超时值）。
+  final Duration elapsed;
+
+  String get message =>
+      '远端命令已运行 ${elapsed.inSeconds}s 仍未结束'
+      '（**没有终止它**：远端进程未被杀，SSH 通道也没关）';
+
+  @override
+  String toString() => message;
+}
+
+/// 一条**仍在运行**的远端命令（软超时交接用）。
+///
+/// 与本地 [RunningLocalExec] 对齐的成员：原命令 [command]、退出码 [exitCode]、
+/// 输出快照 [snapshotText]；差别只有一处——远端 exec 是**一次性回包**（命令跑完才把
+/// 输出交回来），所以命令结束前没有输出快照可给；远端进程也不在本机手上，杀不掉。
+///
+/// 命令**没有被终止**、SSH 通道也**没有关**：[result] 会在它真正结束时完成；
+/// 链路被判失活（心跳连续丢失）时以 [SshLinkStaleException] 显式失败——与既有口径
+/// 一致，既不静默挂起，也不假装知道远端的状态。
+class RunningSshExec {
+  RunningSshExec._(this.command, this.result) {
+    // 记下结束时的结果供 [snapshotText] 用。失活错误由 [result] 自己如实上抛，
+    // 这里只是登记（不是第二个错误出口）。
+    unawaited(
+      result.then<void>(
+        (SshExecResult value) => _done = value,
+        onError: (Object _) {},
+      ),
+    );
+  }
+
+  /// 原命令。
+  final String command;
+
+  /// 远端命令**真正结束**时的结果（退出码 + 完整输出，未截断）。
+  final Future<SshExecResult> result;
+
+  SshExecResult? _done;
+
+  /// 它真正退出时的退出码（还在跑时不会完成；链路判失活时以
+  /// [SshLinkStaleException] 失败）。
+  Future<int> get exitCode => result.then((SshExecResult r) => r.exitCode);
+
+  /// 到目前为止捕获到的输出（stdout/stderr 分段标注）。
+  ///
+  /// 远端 exec 是**一次性回包**：命令结束前拿不到任何输出，这里如实说明；
+  /// 结束之后给出完整输出（与 [result] 同源，不另存一份字节）。
+  String snapshotText() {
+    final SshExecResult? done = _done;
+    final StringBuffer buffer = StringBuffer();
+    if (done == null) {
+      buffer.writeln('（远端命令仍在运行：输出要等它结束才一次性回来）');
+      return buffer.toString().trimRight();
+    }
+    final String stdout = done.stdout;
+    final String stderr = done.stderr;
+    if (stdout.trim().isNotEmpty) {
+      buffer
+        ..writeln('--- stdout ---')
+        ..writeln(stdout.trimRight());
+    }
+    if (stderr.trim().isNotEmpty) {
+      buffer
+        ..writeln('--- stderr ---')
+        ..writeln(stderr.trimRight());
+    }
+    if (stdout.trim().isEmpty && stderr.trim().isEmpty) {
+      buffer.writeln('（暂无输出）');
+    }
+    return buffer.toString().trimRight();
+  }
 }
 
 /// 把用户填写的远端工作空间根目录解析成**绝对路径**。
@@ -540,25 +634,56 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
   @override
   Future<ExecOutcome> exec(
     String command, {
-    Duration timeout = const Duration(seconds: 120),
+    Duration timeout = Duration.zero,
     int maxOutputBytes = 200 * 1024,
   }) async {
-    // [timeout] 只有本地实现在用（软超时 → LocalExecStillRunning）；SSH 侧忽略：
-    // 活性判据是心跳，链路判失活时以 SshLinkStaleException 显式失败（M9 1.1）。
+    // [timeout] 的语义（2026-10-03 修订；与本地实现同一套，见 workspace_io.dart）：
+    // - `Duration.zero`（默认，或任何 ≤ zero 的值）= **永不软超时**：老行为——远端
+    //   命令跑多久就等多久，活性判据是心跳，链路判失活时以 [SshLinkStaleException]
+    //   显式失败（M9 1.1）；
+    // - `> zero` = **软超时**：到点仍在跑就**不杀远端进程、不重跑、不关通道、不丢
+    //   输出**，以 [SshExecStillRunning] 把仍在跑的远端命令交出来，由调用方
+    //   （terminal 的 hook 模式）登记成后台任务继续收尾。
+    // 硬超时（按时间杀命令）依然**不存在**：这里到点只是"不再等"，那条命令在远端照常
+    // 跑完——它的输出与退出码只能由接手方（[RunningSshExec]）收，所以交接方必须接手。
     final String trimmed = command.trim();
     if (trimmed.isEmpty) throw WorkspaceIoException('command 不能为空');
-    final SshExecResult result = await _link.guard(
+    final Future<SshExecResult> pending = _link.guard(
       () => _transport.run('cd ${_quote(root)} && $trimmed', timeout: timeout),
     );
-    return ExecOutcome(
-      exitCode: result.exitCode,
-      stdout: _truncate(result.stdout, maxOutputBytes),
-      stderr: _truncate(result.stderr, maxOutputBytes),
-      timedOut: result.timedOut,
-      truncated: result.stdout.length + result.stderr.length > maxOutputBytes,
-      shell: 'ssh',
-    );
+    if (timeout <= Duration.zero) {
+      return _outcome(await pending, maxOutputBytes);
+    }
+    final Stopwatch watch = Stopwatch()..start();
+    final Completer<void> reached = Completer<void>();
+    final Timer timer = Timer(timeout, () {
+      if (!reached.isCompleted) reached.complete();
+    });
+    // 谁先到：远端命令真的结束（照常收尾），还是软超时（把命令交出去）
+    final bool finished = await Future.any(<Future<bool>>[
+      pending.then((SshExecResult _) => true),
+      reached.future.then((void _) => false),
+    ]);
+    timer.cancel();
+    if (!finished) {
+      throw SshExecStillRunning(
+        trimmed,
+        RunningSshExec._(trimmed, pending),
+        watch.elapsed,
+      );
+    }
+    return _outcome(await pending, maxOutputBytes);
   }
+
+  /// 把一次远端 exec 的原始结果翻成 [ExecOutcome]（截断与 shell 标注沿用既有口径）。
+  ExecOutcome _outcome(SshExecResult result, int maxOutputBytes) => ExecOutcome(
+    exitCode: result.exitCode,
+    stdout: _truncate(result.stdout, maxOutputBytes),
+    stderr: _truncate(result.stderr, maxOutputBytes),
+    timedOut: result.timedOut,
+    truncated: result.stdout.length + result.stderr.length > maxOutputBytes,
+    shell: 'ssh',
+  );
 
   // ── Git（M9 Q4）：走 exec 通道跑 git，命令与解析与本地共用 git_output.dart ─
 

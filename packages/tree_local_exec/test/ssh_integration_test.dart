@@ -65,4 +65,52 @@ void main() {
     expect(cat.exitCode, 0);
     expect(cat.stdout, contains('远端'));
   }, timeout: const Timeout(Duration(minutes: 2)));
+
+  test('真 SSH：软超时交出仍在运行的远端命令（不杀进程，随后自然跑完）', () async {
+    if (host.isEmpty) {
+      markTestSkipped('未设置 TREE_SSH_TEST_HOST，跳过真 SSH 集成测试');
+      return;
+    }
+    final DartSshTransport transport = await DartSshTransport.connect(
+      host: host,
+      port: int.tryParse(env['TREE_SSH_TEST_PORT'] ?? '') ?? 22,
+      username: env['TREE_SSH_TEST_USER'] ?? '',
+      password: env['TREE_SSH_TEST_PASSWORD'] ?? '',
+      keyPath: env['TREE_SSH_TEST_KEY'] ?? '',
+      keyPassphrase: env['TREE_SSH_TEST_KEY_PASSPHRASE'] ?? '',
+    );
+    final String remoteRoot = await resolveRemoteRoot(
+      transport,
+      env['TREE_SSH_TEST_ROOT'] ?? '',
+    );
+    final SshWorkspaceIO io = SshWorkspaceIO(remoteRoot, transport);
+    addTearDown(io.close);
+
+    // 1) `sleep 5` 的命令 + 1s 软超时 ⇒ 约 1s 就返回"仍在运行"（不是超时错误、不是杀进程）
+    SshExecStillRunning? still;
+    final Stopwatch watch = Stopwatch()..start();
+    try {
+      await io.exec(
+        'sleep 5; echo remote-done',
+        timeout: const Duration(seconds: 1),
+      );
+    } on SshExecStillRunning catch (error) {
+      still = error;
+    }
+    watch.stop();
+    expect(still, isNotNull, reason: '到点仍在跑应当抛 SshExecStillRunning');
+    expect(
+      watch.elapsed.inSeconds,
+      lessThan(4),
+      reason: '约 1s 返回，不是等命令跑完（5s）',
+    );
+    expect(still!.elapsed.inSeconds, lessThan(4));
+
+    // 2) 远端进程**没被杀**：它照常跑完，句柄拿得到退出码与完整输出
+    final SshExecResult done = await still.running.result.timeout(
+      const Duration(seconds: 60),
+    );
+    expect(done.exitCode, 0, reason: '没杀进程：命令照常跑完');
+    expect(done.stdout, contains('remote-done'));
+  }, timeout: const Timeout(Duration(minutes: 3)));
 }

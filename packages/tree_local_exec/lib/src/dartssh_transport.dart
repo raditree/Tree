@@ -23,7 +23,9 @@ import 'ssh_workspace_io.dart';
 /// - 建连 / 认证：原先各有 15s 硬超时，**已取消**（见 [connect]）——连接慢不等于
 ///   连接坏，判它坏不坏看心跳；
 /// - 命令执行：原先 [_client.runWithResult] 外挂 120s 硬超时，**已取消**（见 [run]）；
-///   命令跑多久都行，心跳丢了才由 [liveness] 判失活；
+///   命令跑多久都行，心跳丢了才由 [liveness] 判失活。**软超时**（`exec(timeout:)`）
+///   不在这里兑现：那一层语义在 [SshWorkspaceIO.exec]（到点只是"不再等"、以
+///   [SshExecStillRunning] 交出仍在跑的远端命令），本层永远不按时间终止命令。
 /// - SFTP 读写：本来就没有挂超时（分块流式推进），只在外面套活性守卫；
 /// - 重试等待：本层没有重试循环，也就没有等待超时；
 /// - 心跳：见 [_beat]，每 [SshLiveness.interval] 一次 keepalive，**窗口同样是
@@ -381,9 +383,13 @@ class DartSshTransport implements SshTransport {
     String command, {
     Duration timeout = const Duration(seconds: 120),
   }) async {
-    // M9 1.1：[timeout] 不再用于终止命令——远端命令跑多久就等多久（没有静态总时长
+    // M9 1.1：[timeout] 不用于**终止**命令——远端命令跑多久就等多久（没有静态总时长
     // 上限）。真正会打断它的是心跳判据：连续丢心跳由 SshWorkspaceIO 的活性守卫
     // 让在途操作显式失败；链路断开时 runWithResult 自己也会抛错。
+    //
+    // 2026-10-03：**软超时**由 [SshWorkspaceIO.exec] 自己兑现（到点不再等、以
+    // [SshExecStillRunning] 交出仍在跑的远端命令），本层照旧不拿 [timeout] 切时间，
+    // 也不关连接、不杀进程——那条命令在远端照常跑完。
     //
     // 默认再包一层**登录外壳**（见 ssh_login_shell.dart）：exec 通道是非登录 shell，
     // 不包就看得到用户 ssh 进来时有的工具（`nvcc` 那类 profile PATH）。探测失败会逐级

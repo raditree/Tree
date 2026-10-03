@@ -212,8 +212,10 @@ class ExecOutcome {
   /// M9 1.1 起执行器**取消的是"静态总时长"判据**（不是取消超时本身）：只要活性
   /// 还在就永不判超时——本地看进程是否存活（OS 层），SSH 看心跳有没有丢——因此
   /// 这个字段**恒为 false**（留着是为了不改动调用方：tree_core 的 terminal 工具
-  /// 仍按它拼提示）。SSH 侧心跳连续丢失时，在途操作会以 [SshLinkStaleException]
-  /// 显式失败，而不是靠静默丢弃。
+  /// 仍按它拼提示）。**软超时也不算"超时被终止"**：本地/SSH 到点都只是"不再等"
+  /// （见 [exec] 与 [LocalExecStillRunning] / [SshExecStillRunning]），命令本身一步
+  /// 都没被动过，所以这里照样是 false。SSH 侧心跳连续丢失时，在途操作会以
+  /// [SshLinkStaleException] 显式失败，而不是靠静默丢弃。
   final bool timedOut;
 
   /// 输出是否被截断（保留头尾）。
@@ -441,15 +443,20 @@ abstract interface class WorkspaceIO {
 
   /// 执行 shell 命令（cwd = 工作空间根）。
   ///
-  /// [timeout] 的语义（2026-10-02 修订；参数名与默认值对调用方透明）：
-  /// - `Duration.zero`（默认）= **永不软超时**：老行为——判据是活性（本地"进程还
-  ///   活着"、SSH"心跳没丢"），命令跑多久都等，**绝不因为"太久"杀命令**；
-  /// - `> zero` = **本地软超时**：到点仍在跑就**不杀进程、不丢输出**，以
-  ///   [LocalExecStillRunning] 把活着的进程交出来，由调用方登记成后台任务
-  ///   （terminal 的 hook 模式）继续收尾并唤醒 agent；SSH 侧忽略该参数（活性判据
-  ///   是心跳，判失活时以 [SshLinkStaleException] 显式失败）。
+  /// [timeout] 的语义（2026-10-02 起本地可用、2026-10-03 起 SSH 同样兑现；参数名与
+  /// 默认值对调用方透明）：
+  /// - `Duration.zero`（默认，或任何 ≤ zero 的值）= **永不软超时**：老行为——判据是
+  ///   活性（本地"进程还活着"、SSH"心跳没丢"），命令跑多久都等，**绝不因为"太久"
+  ///   杀命令**；
+  /// - `> zero` = **软超时（两端同口径）**：到点仍在跑就**不杀进程、不重跑、不丢
+  ///   输出**，把仍活着的命令交出来——本地抛 [LocalExecStillRunning]（句柄
+  ///   [RunningLocalExec]，输出订阅还活着、进程杀得掉）、SSH 抛
+  ///   [SshExecStillRunning]（句柄 [RunningSshExec]，远端进程不归本机管，退出码与
+  ///   输出要等命令自己结束才回来）；由调用方登记成后台任务（terminal 的 hook 模式）
+  ///   继续收尾并唤醒 agent。
   ///
-  /// 硬超时（按时间杀进程）依然**不存在**。
+  /// 硬超时（按时间杀进程）依然**不存在**；SSH 判失活仍走心跳
+  /// （[SshLinkStaleException] 显式失败，不是按时间杀）。
   Future<ExecOutcome> exec(
     String command, {
     Duration timeout,

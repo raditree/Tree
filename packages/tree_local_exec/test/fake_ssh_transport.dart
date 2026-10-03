@@ -214,8 +214,8 @@ class FakeSshTransport implements SshTransport {
     Duration timeout = const Duration(seconds: 120),
   }) async {
     commands.add(command);
-    // timeout 只记录下来：M9 1.1 的判据是心跳不是总时长，测试据此确认
-    // "签名还在、按时间终止没了"。
+    // timeout 只记录下来（软超时由 SshWorkspaceIO 兑现：到点就不再等这条 pendingRun，
+    // 见 ssh_exec_soft_timeout_test）；本层照旧不按时间终止任何命令。
     timeouts.add(timeout);
     if (pendingRun != null) return pendingRun!.future; // 在途命令：由测试决定何时结束
     return onRun?.call(command) ??
