@@ -410,8 +410,57 @@ class ConversationService {
     SubagentTag? subagent,
   }) {
     final CoreAgent? agent = store.agent(agentId);
-    final CoreSession? session = store.session(agentId, sessionId);
+    // **临时员工被唤醒**（terminal hook 完成 / 后台任务完成）：临时员工没有自己的会话
+    // （会话只属于真实 agent；`SubagentStore.session` 是纯转发），所以会话、历史与
+    // 落库归属都要走它名册里的**会话主人**；那一轮仍以**它自己**的身份跑（运行键
+    // `(sub_…, session)`，绝不与"正阻塞等它的父"撞键，多个后台临时员工各占各的槽）。
+    //
+    // 旧实现直接用 `sub_…` 取会话 ⇒ 拿到 null 就 return：完成提示不落库、子也永远
+    // 不被唤醒、父在 `wait_for` / 阻塞 `subagent` 上白等（用户 2026-10-03 现场）。
+    final CoreSubagent? record = subagents?.handle(agentId);
+    final String ownerId = record?.ownerAgentId ?? agentId;
+    final CoreSession? session = store.session(ownerId, sessionId);
     if (agent == null || session == null) return Future<void>.value();
+    if (record != null) {
+      // 完成提示是**它自己的输入**（不是给发起者的"完成报告"）：用 `notice` 而不是
+      // `subagent_report`——后者会被它自己的历史排掉（`SubagentStore.messages` 按标记
+      // 取且排除报告类），于是它这一轮读不到"任务干完了"。
+      final SubagentTag tag =
+          subagent ??
+          SubagentTag(
+            id: record.id,
+            name: record.name,
+            parentId: record.parentId,
+            level: record.level,
+          );
+      _sendNotice(
+        agent,
+        session,
+        notice,
+        kind: MessageKinds.notice,
+        subagent: tag,
+        transcriptAgentId: ownerId,
+      );
+      _interruptForNewMessage(agentId, sessionId: session.sessionId);
+      // 它自己的历史（历史延续）：`store.messages(sub_…)` = 会话主人流里**它那一段**。
+      final List<CoreMessageRef> history = store
+          .messages(agentId, session.sessionId)
+          .map(_toRef)
+          .toList(growable: false);
+      return _enqueue(
+        agentId,
+        session.sessionId,
+        () => _runTurn(
+          agent,
+          session,
+          notice,
+          subagent: tag,
+          transcriptAgentId: ownerId,
+          history: history,
+          freshContext: true,
+        ),
+      );
+    }
     // 按 `kind='notice'` 落库（UI 仍渲染成 agent 消息），但**引擎翻译时按 user 处理**：
     // 实测（见 `.self/plan/20261001-thinking-400-and-interrupt/recon.md`）表明，
     // 带 tools 的思考模式端点（DeepSeek）不允许请求以"没有 reasoning_content 的

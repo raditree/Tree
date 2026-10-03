@@ -19,6 +19,13 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **临时员工起的 `terminal hook` 完成之后：提示归到会话主人、唤醒的是它自己**（[agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 17、
+  [test/subagent_hook_wake_test.dart](packages/tree_core/test/subagent_hook_wake_test.dart) 强制；用户 2026-10-03 现场：子 agent 的 hook 干完没人收尾）：
+  `WorkspaceToolRunner._finished` 把 `tagOf(task.agentId)` 的标记透传给 `onHookFinished`；`ConversationService.wake` 用
+  `subagents.handle(agentId)?.ownerAgentId` 解析**会话主人**再取会话（临时员工没有自己的会话；旧实现拿 `sub_…` 取到 `null`
+  就 `return` ⇒ 完成提示不落库、子永远不被唤醒、父在 `wait_for` / 阻塞 `subagent` 上白等）。完成提示按 `kind='notice'`
+  + 它的标记落在**会话主人的会话流**（不能用 `subagent_report`：会被它自己的历史排掉），那一轮仍以**它自己**的身份跑并带
+  **它自己的历史**；**hook 日志与超长结果重定向仍落在会话主人那一份**（刻意口径不变）。
 - **运行中的工具与 LLM 请求是"可观测 + 可显式干预"的**（新增
   [tool/README.md](packages/tree_core/lib/src/tool/README.md) 文件表 4 行与
   [tool_run_registry.dart](packages/tree_core/lib/src/tool/tool_run_registry.dart)）：

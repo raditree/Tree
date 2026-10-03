@@ -79,6 +79,17 @@
     只取消它自己的在途轮次与排队，父 / 兄弟 / 其他成员 / 团队都不受影响（停止回执与补推的 `idle`
     都带它自己的帧标记，前端只收它那一份「工作中」）。
 
+17. **临时员工起的 `terminal hook` 完成之后：提示归到会话主人、唤醒它自己**（用户 2026-10-03 现场：
+    子 agent 的 hook 干完没人收尾；[test/subagent_hook_wake_test.dart](../../../test/subagent_hook_wake_test.dart) 强制）：
+    `WorkspaceToolRunner._finished` 必须把 `subagentService.tagOf(task.agentId)` 的标记**透传**给
+    `onHookFinished`；`ConversationService.wake` 用 `subagents?.handle(agentId)?.ownerAgentId` 解析出
+    **会话主人**再去取会话（临时员工没有自己的会话——`SubagentStore.session` 是纯转发；旧实现拿 `sub_…`
+    取到 `null` 就 `return`：提示不落库、子永远不被唤醒、父在 `wait_for` / 阻塞 `subagent` 上白等）。
+    完成提示按 `kind='notice'`+ 它的标记落在**会话主人的会话流**（不能用 `subagent_report`：那个会被它
+    自己的历史排掉 ⇒ 它读不到"任务干完了"）；那一轮仍以**它自己**的身份跑（运行键 `(sub_…, session)`）、
+    带**它自己的历史**（`freshContext: true`，不并父会话的压缩水位）。**hook 日志与超长结果重定向仍落在
+    会话主人那一份**（刻意口径：工作空间里不会留下 `sub_*` 目录，[test/subagent_tool_test.dart](../../../test/subagent_tool_test.dart) 钉着）。
+
 ## 测试
 
 ```bash
@@ -89,8 +100,9 @@ dart test test/conversation_segments_test.dart test/conversation_stream_seq_test
           test/question_broker_test.dart \
           test/question_store_test.dart \
           test/private_workspace_io_test.dart test/workspace_prompt_test.dart \
-          test/subagent_tool_test.dart
+          test/subagent_tool_test.dart test/subagent_hook_wake_test.dart
 ```
 
 钉子用例：`conversation_segments_test`（分段与落库顺序）、`message_interrupt_test`（会话并行 / 插话 / stop）、
+`subagent_hook_wake_test`（临时员工 hook 完成后：提示归会话主人 + 只唤醒它自己 + 用它自己的历史）、
 `system_prompt_pin_test`（提示词钉住）、`private_workspace_io_test`（私有目录分栏）。
