@@ -27,7 +27,7 @@ void main() {
             width: 400,
             height: 600,
             child: MessageList(
-              messages: messages,
+              slots: messages,
               revision: revision,
             ),
           ),

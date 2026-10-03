@@ -219,7 +219,7 @@ void main() {
           width: narrow,
           height: 600,
           child: MessageList(
-            messages: <ChatMessage>[
+            slots: <ChatMessage>[
               ChatMessage(
                 id: 'm1',
                 role: 'user',

@@ -93,6 +93,7 @@ class HistoryPage {
     required this.messages,
     this.hasMore = false,
     this.total = 0,
+    this.offset = 0,
   });
 
   final List<Map<String, dynamic>> messages;
@@ -102,6 +103,12 @@ class HistoryPage {
 
   /// 这个会话一共有多少条（给人看的计数 / 排障）。
   final int total;
+
+  /// 这一页第一条的**全局下标**（0 = 最旧那条）。
+  ///
+  /// 窗口（[MessageWindow]）靠它把这一页放进槽位表；滑块的"全局长度"口径也来自
+  /// 同一套下标（用户 2026-10-04：「右侧滑块位置按全局长度算」）。
+  final int offset;
 }
 
 class ApiService {
@@ -600,13 +607,19 @@ class ApiService {
   /// 末尾一段」）。
   ///
   /// [limit] > 0 时只取**末尾**这么多条（长会话导入因此是常量级开销）；
-  /// [beforeId] 非空时只取比它更早的（前端拿"当前最老那条 id"往回翻页）。
-  /// [hasMore] = 还有更早的消息没取回来（据此显示"加载更早"的入口）。
+  /// [beforeId] 非空时只取比它更早的（前端拿"当前最老那条 id"往回翻页）；
+  /// [from] 非空时**按下标取一段**（窗口"滑到哪加载哪"：窗口只缓存视口附近的槽位，
+  /// 用户滑到哪就按全局下标补哪一段）；
+  /// [atId] 非空时取**含这条消息**的那一段（定位一条早已被窗口淘汰的消息）。
+  ///
+  /// 响应里的 [HistoryPage.offset] = 这一页第一条的全局下标（窗口据此放置）。
   static Future<HistoryPage> getConversationHistoryPage(
     String agentId, {
     String sessionId = 'session_default',
     int limit = 0,
     String beforeId = '',
+    int? from,
+    String atId = '',
   }) async {
     final Map<String, dynamic> data = await _getJson(
       '/api/conversations/$agentId',
@@ -614,6 +627,8 @@ class ApiService {
         'session_id': sessionId,
         if (limit > 0) 'limit': '$limit',
         if (beforeId.isNotEmpty) 'before': beforeId,
+        if (from != null) 'from': '$from',
+        if (atId.isNotEmpty) 'at': atId,
       },
     );
     final List<dynamic> messages = data['messages'] as List<dynamic>? ?? [];
@@ -625,6 +640,7 @@ class ApiService {
           .toList(),
       hasMore: data['has_more'] == true,
       total: (data['total'] as num?)?.toInt() ?? messages.length,
+      offset: (data['offset'] as num?)?.toInt() ?? 0,
     );
   }
 

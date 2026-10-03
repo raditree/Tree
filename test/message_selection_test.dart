@@ -113,7 +113,7 @@ void main() {
 
   Widget listOf(List<ChatMessage> msgs) => MaterialApp(
         home: Scaffold(
-          body: MessageList(messages: msgs, revision: 0),
+          body: MessageList(slots: msgs, revision: 0),
         ),
       );
 

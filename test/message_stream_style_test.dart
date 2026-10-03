@@ -23,7 +23,7 @@ ChatMessage textMessage({
 
 Future<void> pumpList(WidgetTester tester, List<ChatMessage> messages) async {
   await tester.pumpWidget(MaterialApp(
-    home: Scaffold(body: MessageList(messages: messages)),
+    home: Scaffold(body: MessageList(slots: messages)),
   ));
   await tester.pump();
 }

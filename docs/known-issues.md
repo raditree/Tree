@@ -764,7 +764,7 @@ Test 团队（leader `agt_1790848305616_be41c9_3`，成员 Developer `member_179
 - 前端把"源码"这一档叫**代码视图**（着色 + 可编辑），"文本"那一档仍是只读的 `SelectableText`。
 
 ## #12 集成终端（Ctrl+J）：PTY 平台层与远端（SSH）分支
-### PTY 平台层的四个反直觉现象（真机踩出来的，都反直觉且都已修）
+### PTY 平台层的五个反直觉现象（真机踩出来的，都反直觉且都已修）
 
 1. **`LocalAlloc` 不清零会偶发崩**：`STARTUPINFOW` 用 `LMEM_FIXED`（不清零）分配时，`lpDesktop`/`dwFlags`
    是垃圾值，`CreateProcessW` 会在 `wcslen(垃圾指针)` 上访问违例（0xC0000005）——首次调用拿到新页（全零）
@@ -775,6 +775,17 @@ Test 团队（leader `agt_1790848305616_be41c9_3`，成员 Developer `member_179
    等于白设，子进程会挂到**调用方自己的控制台**上——cmd.exe 把横幅打到宿主控制台、随即以 0 退出，
    而伪控制台那头只收到一串开关模式的空序列。
 4. **读 isolate 的 `ReceivePort` 必须显式关**：不关的话 Dart VM 认为还有待处理事件，`dart run`/测试进程不退出。
+5. **自定义文本输入连接必须带 `viewId`，否则文字被静默丢掉**（用户 2026-10-04：「模拟终端现在中英文都无法输入」；
+   本条属**前端**踩的引擎坑，与 PTY 同一条"终端能打字"的链）。Windows 端 `TextInput.setClient` 会校验
+   `client_config` 里的 `viewId`，缺了直接回错误（`Could not set client, view ID is null.`，见
+   `shell/platform/windows/text_input_plugin.cc`）⇒ 平台侧 `active_model_` 一直是空的，而
+   `FlutterWindowsView::SendText` → `TextInputPlugin::TextHook` 在 `active_model_ == nullptr` 时**直接 return**
+   ⇒ 键盘交出来的 WM_CHAR 全被丢掉。Dart 侧 `TextInput.attach` 是 fire-and-forget，错误不会冒到界面上，
+   现象就是"终端一个字都打不出来"。修法：`attach(viewId: View.of(context).viewId)`，并由
+   `test/terminal_panel_test.dart` 钉住发给平台的配置。
+   同一链路上还有第二个反直觉点：**键事件被判 `handled` 就不再派发文字**（`keyboard_manager.cc` 的
+   `HandleOnKeyResult`：`if (handled) { return; }` 之后才 `DispatchText`）——所以终端对可打印字符必须判
+   `ignored`、让平台把 WM_CHAR 交给输入法通道；两条合起来才是"终端能打字"的完整契约。
 
 ### PTY 的其余取舍
 

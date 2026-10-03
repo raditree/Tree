@@ -74,6 +74,12 @@ class TerminalPanelState extends State<TerminalPanel> {
   late final TerminalTextInputClient _ime = TerminalTextInputClient(
     onText: _handleImeText,
   );
+
+  /// 本视图的 id：`TextInput.setClient` **必须**带上它，否则 Windows 端直接拒绝
+  /// 这个 client（"Could not set client, view ID is null."），键盘交出来的文字会被
+  /// 平台静默丢掉——终端就一个字都打不出来（用户 2026-10-04 真机现象）。
+  /// 与 `EditableText` 同口径：`View.of(context).viewId`。
+  int? _viewId;
   bool _opened = false;
   int _columns = 80;
   int _rows = 24;
@@ -259,10 +265,25 @@ class TerminalPanelState extends State<TerminalPanel> {
     });
   }
 
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // viewId 是依赖（挂在哪个视图上），拿到手才能挂输入法连接
+    final int viewId = View.of(context).viewId;
+    if (_viewId != viewId) {
+      _viewId = viewId;
+      _syncImeConnection();
+    }
+  }
+
   /// 焦点变化 → 开关输入法连接（中文 / 日文要靠一条活着的文本输入连接才收得到）。
+  ///
+  /// 连接不是"有焦点就够"：还得带上本视图的 viewId（见 [_viewId]），否则平台侧
+  /// 根本没认下这个 client，文字会被静默丢掉。
   void _syncImeConnection() {
-    if (_focus.hasFocus) {
-      _ime.attach();
+    final int? viewId = _viewId;
+    if (_focus.hasFocus && viewId != null) {
+      _ime.attach(viewId: viewId);
     } else {
       _ime.detach();
     }

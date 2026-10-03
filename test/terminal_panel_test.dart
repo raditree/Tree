@@ -103,6 +103,48 @@ void main() {
         reason: '进终端就该能直接打字（焦点在终端自己身上）');
   });
 
+  testWidgets('输入法连接必须带 viewId（缺了平台不认这个 client，键盘文字全丢）',
+      (WidgetTester tester) async {
+    // 真机 bug（用户 2026-10-04）：attach 时没给 viewId ⇒ Windows 端
+    // TextInput.setClient 直接报错（"Could not set client, view ID is null."），
+    // 平台侧 active_model_ 一直是空的 ⇒ 键盘交出来的文字被 TextHook 静默丢掉，
+    // 终端里中英文**一个字都打不出来**。这里把真正发给平台的配置钉住。
+    final List<MethodCall> calls = <MethodCall>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.textInput,
+      (MethodCall call) async {
+        calls.add(call);
+        return null;
+      },
+    );
+    addTearDown(() {
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.textInput,
+        null,
+      );
+    });
+
+    await pumpPanel(tester);
+    await tester.pump();
+
+    final Iterable<MethodCall> setClient = calls.where(
+      (MethodCall c) => c.method == 'TextInput.setClient',
+    );
+    expect(setClient, isNotEmpty, reason: '终端有焦点却没挂输入法连接：文字没有来路');
+    final List<dynamic> args = setClient.first.arguments as List<dynamic>;
+    final Map<String, dynamic> config =
+        (args[1] as Map<dynamic, dynamic>).cast<String, dynamic>();
+    expect(config['viewId'], isNotNull,
+        reason: '缺 viewId 平台就不认这个 client（引擎 side 直接回错误）');
+    expect(
+      config['viewId'],
+      View.of(tester.element(find.byType(TerminalPanel))).viewId,
+      reason: '要和本视图同一个 id（与 EditableText 同口径）',
+    );
+    expect(config['enableDeltaModel'], isFalse,
+        reason: '没开 delta 通道：本 client 只实现 updateEditingValue');
+  });
+
   testWidgets('ready 帧把 shell 与工作目录显示在工具条上', (WidgetTester tester) async {
     await pumpPanel(tester);
     final String id = openedId(tester);
@@ -147,7 +189,9 @@ void main() {
     expect(
       inputs,
       isNot(contains('a')),
-      reason: '键盘事件那条路不再转发字符：再发一遍会让每个字母进 shell 两次',
+      reason: '键盘那一路必须把可打印字符判成 ignored（引擎 keyboard_manager 的'
+          ' HandleOnKeyResult：键事件被判 handled 就不再派发文字）——在这里再发一次'
+          ' 不但会重复，还会把文字那条路彻底挡死',
     );
     expect(inputs, contains('\r'));
     expect(inputs, contains('\u001b[A'), reason: '方向键是 xterm 转义序列');

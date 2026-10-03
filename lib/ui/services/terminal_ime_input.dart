@@ -10,8 +10,14 @@ import 'package:flutter/services.dart';
 /// 按键处理（回车换行、退格删字、方向键移动光标）跑在**我们的 Focus 之前**，会把控制键
 /// 吃掉——而终端要的是"除了文字，其它键一律原样送 PTY"。独立 attach 一个 client 则与
 /// 焦点链无关：**文字走这条路、控制键走 [Focus.onKeyEvent]**，两条路互不打架。
-/// （同理：开了连接以后，可打印字符**只**从这条路来——Flutter 自己的文本控件也是
-/// 这么取的，键盘事件里的 `character` 再取一次就会把每个字母发两遍。）
+///
+/// **两条路为什么不会重复输入**（读 Flutter 引擎源码得出的结论，不是推测）：
+/// `shell/platform/windows/keyboard_manager.cc` 的 `HandleOnKeyResult` 里，
+/// **键事件被判 handled 就不再派发文字**（"only dispatch OnText if the key down
+/// event is not handled"）。所以终端对可打印字符一律 `KeyEventResult.ignored`
+/// （见 terminal_panel 的 _translateKey）——平台于是把 WM_CHAR 交给 `TextHook`，
+/// 由这条输入法通道交给我们；反过来，一旦我们在键盘那一路 handled，文字就再也
+/// 到不了这里。**这就是为什么 attach 必须成功**（见 [attach] 的 viewId）。
 class TerminalTextInputClient with TextInputClient {
   TerminalTextInputClient({required this.onText});
 
@@ -20,18 +26,32 @@ class TerminalTextInputClient with TextInputClient {
 
   TextInputConnection? _connection;
   TextEditingValue _value = TextEditingValue.empty;
+  int? _viewId;
 
   bool get attached => _connection?.attached ?? false;
+
+  /// 当前挂着的视图 id（排障 / 测试用）。
+  int? get viewId => _viewId;
 
   /// 当前平台侧的值（我们只留"正在组字的尾巴"，其余一律清空）。
   TextEditingValue get value => _value;
 
-  /// 打开连接（终端拿到焦点时调；重复调用是幂等的）。
-  void attach() {
-    if (attached) return;
+  /// 打开连接（终端拿到焦点时调；同一个视图下重复调用是幂等的）。
+  ///
+  /// **[viewId] 不能省**：Windows 端 `TextInput.setClient` 会校验它，缺了就直接
+  /// 回一个错误（引擎源码 `shell/platform/windows/text_input_plugin.cc`：
+  /// 「Could not set client, view ID is null.」），于是平台侧的 `active_model_`
+  /// **一直是空的**——键盘交出来的文字被 `TextHook` 静默丢掉。真机现象就是
+  /// **终端里中英文一个字都打不出来**（用户 2026-10-04）。Flutter 自己的
+  /// `EditableText` 也得给（`viewId: View.of(context).viewId`）。
+  void attach({required int viewId}) {
+    if (attached && _viewId == viewId) return;
+    detach();
+    _viewId = viewId;
     _connection = TextInput.attach(
       this,
-      const TextInputConfiguration(
+      TextInputConfiguration(
+        viewId: viewId,
         inputType: TextInputType.text,
         inputAction: TextInputAction.none,
         autocorrect: false,
@@ -46,6 +66,7 @@ class TerminalTextInputClient with TextInputClient {
   void detach() {
     _connection?.close();
     _connection = null;
+    _viewId = null;
     _value = TextEditingValue.empty;
   }
 

@@ -19,6 +19,7 @@ import '../../io/workspace_refresh_service.dart';
 import '../services/conversation_view.dart';
 import '../services/detail_selection.dart';
 import '../services/message_replay_guard.dart';
+import '../services/message_window.dart';
 import '../services/onboarding_requests.dart';
 import '../services/plugin_ui_registry.dart';
 import '../services/session_rename.dart';
@@ -85,7 +86,9 @@ class MessagePanel extends StatefulWidget {
 
 class _MessagePanelState extends State<MessagePanel> {
   /// 消息列表
-  final List<ChatMessage> _messages = <ChatMessage>[];
+  /// 消息窗口：整份会话流按**全局下标**寻址，只有视口附近与末尾一段是热的
+  /// （用户 2026-10-04：「滑到哪加载哪，限制缓存长度，仅缓存窗口附近的消息」）。
+  final MessageWindow _window = MessageWindow(pageSize: 200);
 
   /// 断线补发帧的「重播去重」闸（M9 §1.1 / Wave 3-H 待办 3）。
   ///
@@ -202,14 +205,28 @@ class _MessagePanelState extends State<MessagePanel> {
   final Set<String> _workingSubagents = <String>{};
 
   /// 一次拉多少条历史（**长会话只加载末尾一段**：用户 2026-10-04「会话太长时导入不能
-  /// 直接划到底部；懒加载，长会话仅加载末尾一段」）。200 条足够铺满几屏，滚到顶再往回翻。
+  /// 直接划到底部；懒加载，长会话仅加载末尾一段」）。它就是窗口的页大小。
   static const int _historyPageSize = 200;
 
-  /// 还有**更早**的消息没取回来（据此在列表顶部显示"加载更早"的入口）。
-  bool _hasEarlierHistory = false;
+  /// 已加载的槽位离视口多远就淘汰（比窗口自己的外扩 margin 大一截：刚补回来的那一段
+  /// 不能被下一帧淘汰掉）。
+  static const int _cacheMargin = 400;
 
-  /// 正在往回翻页（防重复触发）。
-  bool _loadingEarlier = false;
+  /// 正在补的下标段（防同一段被并发拉两次）。
+  final Set<String> _loadingGaps = <String>{};
+
+  /// 补过但没补出东西来的段起点（服务端说"这里没有"）：不再反复要，免得空转。
+  final Set<int> _barrenGaps = <int>{};
+
+  /// 最近一次窗口回调报上来的视口区间（补页 / 淘汰的基准；-1 = 还没量出来）。
+  int _visibleFrom = -1;
+  int _visibleTo = -1;
+
+  /// 视口**上方**补过页的次数：列表据此在布局阶段补一次滚动位置。
+  int _padAboveStamp = 0;
+
+  /// 刚定位过的那一页（淘汰时额外留着：它可能离视口很远，但用户正看着它）。
+  MessageRange? _locateKeep;
 
   @override
   void initState() {
@@ -385,7 +402,7 @@ class _MessagePanelState extends State<MessagePanel> {
       // 时会发 terminal_close，核心收掉那个 shell）
       _terminalMode = false;
       setState(() {
-        _messages.clear();
+        _clearWindow();
         _sessions = <ChatSession>[];
         _currentSession = null;
         _usageByAgent.clear();
@@ -407,7 +424,7 @@ class _MessagePanelState extends State<MessagePanel> {
       DetailSelection.instance.clear();
       SubagentTranscript.instance.clear();
       setState(() {
-        _messages.clear();
+        _clearWindow();
         // 整表重拉 = 过程分栏重建：正在看的那个临时员工可能已经不在这一屏里了
         _viewSubagentId = '';
       });
@@ -424,11 +441,11 @@ class _MessagePanelState extends State<MessagePanel> {
             .firstWhere((ChatSession? s) => s != null, orElse: () => null);
         setState(() {
           _currentSession = ts;
-          _messages.clear();
+          _clearWindow();
         });
         widget.onSessionChanged?.call(targetSession);
         _loadHistory();
-      } else if (_messages.isEmpty) {
+      } else if (_window.isEmpty) {
         _loadHistory();
       } else {
         _consumePendingScroll();
@@ -436,15 +453,13 @@ class _MessagePanelState extends State<MessagePanel> {
     }
   }
 
-  /// 消费定位目标：递增 MessageList 定位触发号，驱动滚动到目标消息。
+  /// 消费定位目标：先在窗口里把目标那一段补回来（见 [_locateMessage]），
+  /// 再递增 MessageList 的定位触发号驱动滚动。
   void _consumePendingScroll() {
     final String? id = _pendingScrollId;
     if (id == null || id.isEmpty) return;
     _pendingScrollId = null;
-    setState(() {
-      _scrollToMessageId = id;
-      _scrollToRevision++;
-    });
+    unawaited(_locateMessage(id));
   }
 
   /// 同步当前 agent 的已知会话 id 到 WebSocketService（未知会话判定基线）。
@@ -570,7 +585,7 @@ class _MessagePanelState extends State<MessagePanel> {
         target ??= _firstActiveSession(sessions);
         _currentSession =
             target ?? (sessions.isNotEmpty ? sessions.first : null);
-        _messages.clear();
+        _clearWindow();
       });
       // 记录该 agent 本次实际生效的会话，供下次切换回来恢复
       _lastSessionByAgent[agentId] = _currentSessionId;
@@ -600,116 +615,237 @@ class _MessagePanelState extends State<MessagePanel> {
     return null;
   }
 
-  /// 从后端拉取当前 agent/会话的对话历史
+  /// 整表作废（换 agent / 换会话 / 清空历史）：窗口 + 封口闸 + 补页记账一起清。
+  void _clearWindow() {
+    _window.clear();
+    _replayGuard.clear();
+    _barrenGaps.clear();
+    _loadingGaps.clear();
+    _visibleFrom = -1;
+    _visibleTo = -1;
+  }
+
+  /// 从后端拉取当前 agent/会话的**末尾一段**历史，作为窗口的起点。
+  ///
+  /// 只取末尾 N 条（[MessageWindow.pageSize]）：长会话（几 MB 的 jsonl / 几千条消息）
+  /// 导入不再是"全量读盘 + 全量建 widget + 再想办法滚到底"；用户滑到哪，再由
+  /// [_onWindowChanged] 按**全局下标**补哪一段（滑到哪加载哪）。
   Future<void> _loadHistory() async {
     final Agent? agent = widget.selectedAgent;
     if (agent == null) return;
     final String sessionId = _currentSessionId;
     try {
-      // 只取**末尾一段**：长会话（几 MB 的 jsonl / 几千条消息）导入不再是
-      // "全量读盘 + 全量建 widget + 再想办法滚到底"——那正是长会话"划不到底"的根因
-      // （懒构建的列表里 maxScrollExtent 一开始只是估算值）。
       final HistoryPage page = await ApiService.getConversationHistoryPage(
         agent.id,
         sessionId: sessionId,
         limit: _historyPageSize,
       );
-      final List<Map<String, dynamic>> raw = page.messages;
       if (!mounted) return;
       // 会话可能在等待期间被切换，丢弃过期的历史
       if (sessionId != _currentSessionId) return;
-      // 定位目标：历史加载完成后直接消费，驱动 MessageList 定位滚动
-      // （而非滚到底部，避免「先滚底再跳位」的闪烁）
+      final List<ChatMessage> tail = page.messages
+          .map(ChatMessage.fromJson)
+          .toList(growable: false);
       final String? pendingScroll = _pendingScrollId;
-      setState(() {
-        _messages.clear();
-        for (final Map<String, dynamic> item in raw) {
-          _messages.add(ChatMessage.fromJson(item));
-        }
-        // 历史整批重建 = 这批消息都是**已关闭的段**（核心"段关闭即落库"），
-        // 正文即终稿 ⇒ 全部封口：此后重播的 msg_chunk 不再往它们身上追加
-        // （M9 重播去重，替代"靠时序碰运气"）。序号水位随之作废（同生命周期，
-        // 见 MessageReplayGuard.resetToHistory）。
-        _replayGuard.resetToHistory(_messages.map((ChatMessage m) => m.id));
-        // 历史整批重载：驱动 MessageList 无动画直达底部（避免下滑动画）
-        _bottomJump = true;
-        // 还有更早的：列表顶部给一个"加载更早的消息"入口
-        _hasEarlierHistory = page.hasMore;
-        _loadingEarlier = false;
-        // 注意：不再按「当前会话历史是否为空」重置 _modeLocked——
-        // 运行模式是顶部 agent 级共享的，锁定状态由 _loadSessions
-        // 依据「该 agent 是否已有任一历史会话」统一决定，切换会话
-        // （含新建空会话）不得解除锁定。
-        if (pendingScroll != null && pendingScroll.isNotEmpty) {
-          _scrollToMessageId = pendingScroll;
-          _scrollToRevision++;
-          _pendingScrollId = null;
-        } else {
-          _scrollRevision++;
-        }
-        // 从历史中恢复 token 用量：取最后一条带 usage 的 agent 消息，
-        // 使重启后「上下文长度」统计不丢失（usage 随消息已持久化）。
-        // **只认主 agent 自己的消息**：临时员工的 usage 是它自己的上下文，
-        // 混进来就把主 agent 的上下文长度统计带偏（用户 2026-10-04）。
-        for (final ChatMessage m in _messages.reversed) {
-          if (m.isSubagentMessage) continue;
-          final Map<String, dynamic>? usage = m.usage;
-          if (usage != null && usage.isNotEmpty) {
-            _usageByAgent['${agent.id}::$sessionId'] = usage;
-            break;
-          }
-        }
-        // 临时员工的"过程分栏"跟着整批历史重建（它们就混在这份完整流里）
-        SubagentTranscript.instance.sync(_messages);
-      });
+      _applyTailPage(page, tail, sessionId: sessionId, agent: agent);
+      // 定位目标：历史加载完成后直接消费（面板会先把目标那一段拉回来）
+      if (pendingScroll != null && pendingScroll.isNotEmpty) {
+        _pendingScrollId = null;
+        unawaited(_locateMessage(pendingScroll));
+      }
     } catch (e) {
       // 拉取失败时静默处理（保持空列表）
     }
   }
 
-  /// **往回翻一页**：拿当前最老那条消息的 id 当游标，把更早的一页插到列表前面。
+  /// 把一份**末尾页**装进窗口（首屏 / 重载末尾一段共用）。
   ///
-  /// 滚动位置由 [MessageList] 自己补偿（前面插进来的高度不能让视口跳走）。
-  Future<void> _loadEarlierHistory() async {
+  /// 窗口里只留这一页 + 比它新的实时尾巴（见 [MessageWindow.resetTail]）：于是
+  /// "回到最新"是确定性的——落点必然是最新消息，不靠估算高度。
+  void _applyTailPage(
+    HistoryPage page,
+    List<ChatMessage> tail, {
+    required String sessionId,
+    required Agent agent,
+  }) {
+    setState(() {
+      _window.resetTail(offset: page.offset, messages: tail);
+      _window.ensureTotal(page.total);
+      _loadingGaps.clear();
+      _barrenGaps.clear();
+      _locateKeep = null;
+      _visibleFrom = -1;
+      _visibleTo = -1;
+      // 这批是**已关闭的段**（核心"段关闭即落库"）：全部封口——重播的
+      // msg_start / msg_chunk 不许再长出第二条气泡。**累加**封口而不是替换：
+      // 窗口只热视口附近，被淘汰的那些 id 也要认得出来（见 _hasMessage）。
+      _replayGuard.sealAll(tail.map((ChatMessage m) => m.id));
+      // 历史整批重建：驱动 MessageList 无动画直达底部（避免下滑动画）
+      _bottomJump = true;
+      _scrollRevision++;
+      // 从历史中恢复 token 用量：取最后一条带 usage 的 agent 消息。
+      // **只认主 agent 自己的消息**：临时员工的 usage 是它自己的上下文，
+      // 混进来就把主 agent 的上下文长度统计带偏（用户 2026-10-04）。
+      for (final ChatMessage m in _window.loadedList.reversed) {
+        if (m.isSubagentMessage) continue;
+        final Map<String, dynamic>? usage = m.usage;
+        if (usage != null && usage.isNotEmpty) {
+          _usageByAgent['${agent.id}::$sessionId'] = usage;
+          break;
+        }
+      }
+      // 临时员工的"过程分栏"跟着补全（合并语义：被淘汰的老过程也留着）
+      SubagentTranscript.instance.sync(_window.loadedList);
+    });
+  }
+
+  /// 「回到底部」= **重载末尾一段**（用户 2026-10-04：「回到底部按钮直接重载入历史」）。
+  ///
+  /// 为什么不滚到"估算的底部"：窗口里没加载的那一段每格都是占位高度，底在哪本来就
+  /// 只是估算；重载末尾一页 = 把窗口换成一份**确定**的内容，落点必然是最新消息。
+  Future<void> _reloadTail() async {
     final Agent? agent = widget.selectedAgent;
-    if (agent == null || _loadingEarlier || !_hasEarlierHistory) return;
-    if (_messages.isEmpty) return;
+    if (agent == null) return;
     final String sessionId = _currentSessionId;
-    final String beforeId = _messages.first.id;
-    setState(() => _loadingEarlier = true);
     try {
       final HistoryPage page = await ApiService.getConversationHistoryPage(
         agent.id,
         sessionId: sessionId,
         limit: _historyPageSize,
-        beforeId: beforeId,
       );
-      if (!mounted) return;
-      // 会话在等待期间被切走：丢弃这一页
-      if (sessionId != _currentSessionId) return;
-      final List<ChatMessage> older = page.messages
-          .map(ChatMessage.fromJson)
-          .toList(growable: false);
-      setState(() {
-        // 按 id 去重后前插（同一批历史不许出现两条）
-        final Set<String> known = _messages
-            .map((ChatMessage m) => m.id)
-            .toSet();
-        final List<ChatMessage> fresh = older
-            .where((ChatMessage m) => !known.contains(m.id))
-            .toList(growable: false);
-        _messages.insertAll(0, fresh);
-        _hasEarlierHistory = page.hasMore;
-        _loadingEarlier = false;
-        // 这批是**已关闭的段**：同样封口（重播帧不许再往它们身上追加）
-        _replayGuard.resetToHistory(_messages.map((ChatMessage m) => m.id));
-        SubagentTranscript.instance.sync(_messages);
-      });
+      if (!mounted || sessionId != _currentSessionId) return;
+      _applyTailPage(
+        page,
+        page.messages.map(ChatMessage.fromJson).toList(growable: false),
+        sessionId: sessionId,
+        agent: agent,
+      );
     } catch (e) {
+      // 拉不到也让列表退回"贴底"：总比把用户按在一个不动的地方强
       if (!mounted) return;
-      setState(() => _loadingEarlier = false);
-      _showSnackBar('加载更早的消息失败：${_errorText(e)}');
+      setState(() {
+        _bottomJump = true;
+        _scrollRevision++;
+      });
     }
+  }
+
+  /// 列表把**本帧构建到的下标区间**报过来：滑到哪加载哪 + 淘汰离得远的槽位。
+  void _onWindowChanged(int first, int last) {
+    if (first < 0 || last < first) return;
+    _visibleFrom = first;
+    _visibleTo = last;
+    unawaited(_fillWindow(first, last));
+    _evictFarSlots();
+  }
+
+  /// 把视口附近（[MessageWindow.gapsFor] 按 margin 外扩）缺的段补回来。
+  Future<void> _fillWindow(int first, int last) async {
+    final Agent? agent = widget.selectedAgent;
+    if (agent == null) return;
+    final String sessionId = _currentSessionId;
+    for (final MessageRange gap in _window.gapsFor(first, last)) {
+      if (sessionId != _currentSessionId) return;
+      if (_barrenGaps.contains(gap.from)) continue;
+      final String key = '${gap.from}-${gap.to}';
+      if (!_loadingGaps.add(key)) continue;
+      try {
+        final HistoryPage page = await ApiService.getConversationHistoryPage(
+          agent.id,
+          sessionId: sessionId,
+          from: gap.from,
+          limit: _window.pageSizeFor(gap),
+        );
+        if (!mounted || sessionId != _currentSessionId) return;
+        final List<ChatMessage> messages = page.messages
+            .map(ChatMessage.fromJson)
+            .toList(growable: false);
+        setState(() {
+          _window.ensureTotal(page.total);
+          final int placed = _window.place(
+            offset: page.offset,
+            messages: messages,
+          );
+          // 视口**上方**补的页：占位槽换成真消息会改变上面的高度，让列表补一次
+          if (page.offset + messages.length <= first) _padAboveStamp++;
+          _replayGuard.sealAll(messages.map((ChatMessage m) => m.id));
+          // 这一段补不出东西（对齐有偏差 / 服务端说没有）：记一笔，别再空转
+          if (placed == 0) _barrenGaps.add(gap.from);
+          // 补页不是"整批重载"：别把 bottomJump 留在 true（否则用户正在读历史时
+          // 一次补页会把他拽回底部）
+          _bottomJump = false;
+          _scrollRevision++;
+        });
+        SubagentTranscript.instance.sync(_window.loadedList);
+      } catch (e) {
+        // 补页失败：占位槽留着，用户再滑一下会重试（不当成"这里没有"）
+      } finally {
+        _loadingGaps.remove(key);
+      }
+    }
+  }
+
+  /// 淘汰离视口太远的槽位（**限制缓存长度，仅缓存窗口附近的消息**）。
+  ///
+  /// 末尾一段与"正在流式 / 正在跑工具"的消息由 [MessageWindow.evict] 自己保；
+  /// [_locateKeep]（刚定位过的那一页）也留着——它可能离视口很远，但用户正看着它。
+  void _evictFarSlots() {
+    if (_visibleFrom < 0) return;
+    final MessageRange? locate = _locateKeep;
+    final int removed = _window.evict(
+      keep: MessageRange(
+        _visibleFrom - _cacheMargin,
+        _visibleTo + 1 + _cacheMargin,
+      ),
+      keepAlso: locate == null ? const <MessageRange>[] : <MessageRange>[locate],
+    );
+    if (removed == 0) return;
+    setState(() {
+      _bottomJump = false;
+      _scrollRevision++;
+    });
+    SubagentTranscript.instance.sync(_window.loadedList);
+  }
+
+  /// 定位到某条消息：它不在窗口里（早被淘汰 / 还没加载过）就先把它那一页拉回来
+  /// （核心的 `at=` 寻址），再驱动列表滚动定位。
+  Future<void> _locateMessage(String id) async {
+    final Agent? agent = widget.selectedAgent;
+    if (agent == null) return;
+    final String sessionId = _currentSessionId;
+    if (!_window.containsId(id)) {
+      try {
+        final HistoryPage page = await ApiService.getConversationHistoryPage(
+          agent.id,
+          sessionId: sessionId,
+          atId: id,
+          limit: _historyPageSize,
+        );
+        if (!mounted || sessionId != _currentSessionId) return;
+        final List<ChatMessage> messages = page.messages
+            .map(ChatMessage.fromJson)
+            .toList(growable: false);
+        setState(() {
+          _window.ensureTotal(page.total);
+          // 定位是"一次性跳转"：窗口直接换成目标那一段（+ 末尾实时尾巴），
+          // 免得刚放进去就被淘汰、目标又没了
+          _window.resetTail(offset: page.offset, messages: messages);
+          _locateKeep = MessageRange(page.offset, page.offset + messages.length);
+          _replayGuard.sealAll(messages.map((ChatMessage m) => m.id));
+          // 定位不是"回到底部"：窗口换了，但别贴底
+          _bottomJump = false;
+          _scrollRevision++;
+        });
+        SubagentTranscript.instance.sync(_window.loadedList);
+      } catch (e) {
+        return;
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _scrollToMessageId = id;
+      _scrollToRevision++;
+    });
   }
 
   /// 按工具名判定其影响的工作空间区域，决定右栏哪些 tab 需要增量刷新。
@@ -794,13 +930,13 @@ class _MessagePanelState extends State<MessagePanel> {
       // 否则同一个 id 会出现两个气泡，后续增量只打进第一条，第二条永久空转。
       if (!_replayGuard.shouldCreateMessage(
         id: message.id,
-        exists: _indexOfMessage(message.id) >= 0,
+        exists: _hasMessage(message.id),
       )) {
         debugPrint('[消息] 忽略重播的 msg_start（同 id 已存在）: ${message.id}');
         return;
       }
       setState(() {
-        _messages.add(message);
+        _window.appendTail(message);
         _scrollRevision++;
         // 流式新增：平滑滚动跟随（历史整批重载才走直达底部）
         _bottomJump = false;
@@ -828,7 +964,7 @@ class _MessagePanelState extends State<MessagePanel> {
         return;
       }
       setState(() {
-        _messages[idx].content += chunk;
+        _window.at(idx)!.content += chunk;
       });
       // 判据与记账成对：**放行的这一帧**就是"已消费到的高水位"。放在真正写入
       // 之后，保证水位只描述"正文里确实有的内容"。
@@ -859,8 +995,8 @@ class _MessagePanelState extends State<MessagePanel> {
         final Map<String, dynamic>? usage =
             (data['usage'] as Map<String, dynamic>?)?.cast<String, dynamic>();
         setState(() {
-          _messages[idx].isStreaming = false;
-          _messages[idx].usage = usage;
+          _window.at(idx)!.isStreaming = false;
+          _window.at(idx)!.usage = usage;
           _scrollRevision++;
           _bottomJump = false;
           if (usage != null) {
@@ -876,7 +1012,7 @@ class _MessagePanelState extends State<MessagePanel> {
       final int idx = _indexOfMessage(id);
       if (idx >= 0) {
         setState(() {
-          _messages[idx].usage = usage;
+          _window.at(idx)!.usage = usage;
           if (usage != null) {
             _recordUsage(data, usage);
           }
@@ -918,7 +1054,7 @@ class _MessagePanelState extends State<MessagePanel> {
         subagentLevel: (data['subagent_level'] as num?)?.toInt() ?? 0,
       );
       setState(() {
-        _messages.add(toolMsg);
+        _window.appendTail(toolMsg);
         _scrollRevision++;
         _bottomJump = false;
       });
@@ -928,8 +1064,8 @@ class _MessagePanelState extends State<MessagePanel> {
       final int idx = _indexOfMessage(id);
       if (idx >= 0) {
         setState(() {
-          _messages[idx].toolRunning = false;
-          _messages[idx].toolResult = (data['result'] as String?) ?? '';
+          _window.at(idx)!.toolRunning = false;
+          _window.at(idx)!.toolResult = (data['result'] as String?) ?? '';
         });
       }
       // 工具执行结束：按工具类型增量通知右栏刷新对应区域（文件/Git/Todo）。
@@ -973,7 +1109,7 @@ class _MessagePanelState extends State<MessagePanel> {
         final int idx = _indexOfMessage(qid);
         if (idx >= 0) {
           setState(() {
-            _messages[idx].answered = true;
+            _window.at(idx)!.answered = true;
           });
         }
       }
@@ -986,13 +1122,13 @@ class _MessagePanelState extends State<MessagePanel> {
       if (message.id.isNotEmpty &&
           !_replayGuard.shouldCreateMessage(
             id: message.id,
-            exists: _indexOfMessage(message.id) >= 0,
+            exists: _hasMessage(message.id),
           )) {
         debugPrint('[消息] 忽略重播的 message 帧（同 id 已存在）: ${message.id}');
         return;
       }
       setState(() {
-        _messages.add(message);
+        _window.appendTail(message);
         _scrollRevision++;
         _bottomJump = false;
       });
@@ -1008,12 +1144,20 @@ class _MessagePanelState extends State<MessagePanel> {
     // 每处理完一帧就把"临时员工的过程"重算一次：它们的消息不进主消息流，而是按
     // subagent_id 收在 [SubagentTranscript] 里，正在看某个临时员工详情的界面据此实时跟进
     // （消息对象是共享引用，流式增量原地改内容，所以这里重算索引就够）。
-    SubagentTranscript.instance.sync(_messages);
+    SubagentTranscript.instance.sync(_window.loadedList);
   }
 
   /// 消息在列表中的下标（-1 = 不存在；空 id 一律视为不存在）。
   int _indexOfMessage(String id) =>
-      id.isEmpty ? -1 : _messages.indexWhere((ChatMessage m) => m.id == id);
+      id.isEmpty ? -1 : _window.indexOfId(id);
+
+  /// 本端是不是**已经有**这条消息，或者**认得**它（历史里出现过、但槽位早被淘汰）。
+  ///
+  /// 为什么要认得：窗口只热视口附近（"限制缓存长度"），被淘汰的 id 上重播
+  /// `msg_start` / `tool_start` 会凭空多出一条气泡——正文却在历史里。封口集合是
+  /// **累加**的（见 _applyTailPage / _fillWindow 的 sealAll），正好能认出它们。
+  bool _hasMessage(String id) =>
+      _indexOfMessage(id) >= 0 || _replayGuard.isSealed(id);
 
   /// 判断消息是否属于当前选中的 agent（避免工作中的成员消息污染主面板）
   bool _isForCurrentAgent(Map<String, dynamic> data) {
@@ -1056,7 +1200,7 @@ class _MessagePanelState extends State<MessagePanel> {
     // （否则已作答的旧问题会重新冒出来抢答）。
     if (!_replayGuard.shouldCreateMessage(
       id: qid,
-      exists: _indexOfMessage(qid) >= 0,
+      exists: _hasMessage(qid),
     )) {
       debugPrint('[消息] 忽略重播的提问卡片（同 id 已存在）: $qid');
       return;
@@ -1067,7 +1211,7 @@ class _MessagePanelState extends State<MessagePanel> {
         (data['options'] as List?)?.map((e) => e.toString()).toList() ??
         <String>[];
     setState(() {
-      _messages.add(
+      _window.appendTail(
         ChatMessage(
           id: qid,
           role: 'agent',
@@ -1092,10 +1236,10 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 处理内联提问卡片的选项点选：发送 user_answer 并标记该问题已作答。
   void _handleAskAnswer(String messageId, String answer) {
     _asking = false;
-    final int idx = _messages.indexWhere((ChatMessage m) => m.id == messageId);
+    final int idx = _window.indexOfId(messageId);
     if (idx >= 0) {
       setState(() {
-        _messages[idx].answered = true;
+        _window.at(idx)!.answered = true;
       });
     }
     // 作答会驱动 agent 继续（resume 后可能立刻发起工具调用）：若前端曾重启/
@@ -1193,7 +1337,7 @@ class _MessagePanelState extends State<MessagePanel> {
     );
 
     setState(() {
-      _messages.add(userMessage);
+      _window.appendTail(userMessage);
       _scrollRevision++;
       _bottomJump = false;
       // 发送首条消息后锁定运行模式（后端会话自此绑定该模式的工具执行位置）
@@ -1390,9 +1534,9 @@ class _MessagePanelState extends State<MessagePanel> {
   Widget build(BuildContext context) {
     // 跑着的工具 / 思考还在长：帧后把右栏详情的同一 id 快照刷新一次。
     // 为什么放帧后：改这个 notifier 会让右栏与工具/思考行重建，在 build 期间
-    // 通知就成了「build 期间 setState」。它只读 _messages，不改中栏状态。
+    // 通知就成了「build 期间 setState」。它只读窗口里已加载的消息，不改中栏状态。
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) DetailSelection.instance.refresh(_messages);
+      if (mounted) DetailSelection.instance.refresh(_window.loadedList);
     });
     final Agent? agent = widget.selectedAgent;
     // Ctrl+J：输入框那块整体换成集成终端（再按一次回来）。
@@ -1445,12 +1589,20 @@ class _MessagePanelState extends State<MessagePanel> {
                   // 的输出混杂，根本没法分辨，subagent 的工具调用就在 subagent 的调用工具详情里看」）：
                   // 它们按 subagent_id 收进 [SubagentTranscript]，在"那次 subagent 工具调用的详情页"里看。
                   return MessageList(
-                    messages: visibleStreamMessages(_messages),
+                    // **槽位表**：全局下标 → 消息（null = 还没加载）。面板原地放置/
+                    // 淘汰，列表据此画占位槽、按全局下标画右侧滑块。
+                    slots: _window.slots,
+                    // 临时员工的消息**不进主消息流**（用户 2026-10-04）：零高度槽位，
+                    // 既不占版面、也不打断下标连续性；它们按 subagent_id 收在
+                    // SubagentTranscript 里，在"那次 subagent 工具调用的详情页"看。
+                    visible: (ChatMessage m) => !m.isSubagentMessage,
                     revision: _scrollRevision,
-                    // 懒加载：还有更早的一页时，列表顶部给入口；滚到顶自动拉
-                    hasEarlier: _hasEarlierHistory,
-                    loadingEarlier: _loadingEarlier,
-                    onLoadEarlier: _loadEarlierHistory,
+                    // 视口附近补过页：列表在布局阶段补一次滚动位置
+                    padAboveStamp: _padAboveStamp,
+                    // 滑到哪加载哪 + 淘汰离得远的槽位（限制缓存长度）
+                    onWindowChanged: _onWindowChanged,
+                    // 「回到底部」= 重载末尾一段（用户 2026-10-04）
+                    onReloadTail: _reloadTail,
                     onAskAnswer: _handleAskAnswer,
                     scrollToMessageId: _scrollToMessageId,
                     scrollToRevision: _scrollToRevision,
@@ -2149,7 +2301,7 @@ class _MessagePanelState extends State<MessagePanel> {
     if (session.sessionId == _currentSessionId) return;
     setState(() {
       _currentSession = session;
-      _messages.clear();
+      _clearWindow();
       _scrollRevision++;
       // 临时员工属于**当前会话**：换会话就回主会话视角（否则会看着上一个会话的过程）
       _viewSubagentId = '';
@@ -2170,7 +2322,7 @@ class _MessagePanelState extends State<MessagePanel> {
       setState(() {
         _sessions.add(session);
         _currentSession = session;
-        _messages.clear();
+        _clearWindow();
         _scrollRevision++;
         _viewSubagentId = '';
       });
@@ -2275,7 +2427,7 @@ class _MessagePanelState extends State<MessagePanel> {
         // 若删除的是当前会话，切到剩余首个会话
         if (_currentSessionId == session.sessionId) {
           _currentSession = _sessions.isNotEmpty ? _sessions.first : null;
-          _messages.clear();
+          _clearWindow();
           _scrollRevision++;
           if (mounted) {
             widget.onSessionChanged?.call(_currentSessionId);

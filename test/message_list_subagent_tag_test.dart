@@ -36,7 +36,7 @@ void main() {
         body: SizedBox(
           width: 500,
           height: 700,
-          child: MessageList(messages: messages),
+          child: MessageList(slots: messages),
         ),
       ),
     ));

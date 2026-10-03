@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:tree/ui/models/message.dart';
 import 'package:tree/ui/widgets/message_list.dart';
+import 'package:tree/ui/widgets/message_scrollbar.dart';
 
 /// MessageList 跟随/阅读模式行为测试
 ///
@@ -41,9 +42,12 @@ void main() {
     return tester.widget<AnimatedOpacity>(f).opacity;
   }
 
-  Future<GlobalKey<_HarnessState>> pumpList(WidgetTester tester) async {
+  Future<GlobalKey<_HarnessState>> pumpList(
+    WidgetTester tester, {
+    VoidCallback? reloadTail,
+  }) async {
     final GlobalKey<_HarnessState> k = GlobalKey<_HarnessState>();
-    await tester.pumpWidget(_Harness(key: k));
+    await tester.pumpWidget(_Harness(key: k, reloadTail: reloadTail));
     await tester.pumpAndSettle();
     return k;
   }
@@ -259,75 +263,126 @@ void main() {
     expect(find.text('消息内容 5'), findsWidgets); // 目标消息已构建
   });
 
-  group('懒加载分页（长会话只加载末尾一段）', () {
-    testWidgets('还有更早的一页：顶部给入口，点它就往回翻', (WidgetTester tester) async {
+  group('窗口化懒加载（滑到哪加载哪、限制缓存长度）', () {
+    testWidgets('没加载的那一段画成占位槽，并把视口区间帧后报给面板',
+        (WidgetTester tester) async {
       final GlobalKey<_HarnessState> key = await pumpList(tester);
-      expect(find.text('加载更早的消息'), findsNothing, reason: '默认没有更早的');
-
-      // 先滚到顶（此时还没有更早的一页 ⇒ 不会触发自动翻页），再打开分页：
-      // 贴底时列表顶部不在视口内（懒构建不会建它），入口必须滚到顶才看得见
-      final ScrollPosition pos = positionOf(tester);
-      pos.jumpTo(pos.minScrollExtent);
+      key.currentState!.trimToTail(10);
       await tester.pumpAndSettle();
 
-      key.currentState!.setPaging(hasEarlier: true);
-      await tester.pumpAndSettle();
-      expect(find.text('加载更早的消息'), findsOneWidget);
-
-      await tester.tap(find.text('加载更早的消息'));
-      await tester.pumpAndSettle();
-      expect(key.currentState!.loadEarlierCalls, 1, reason: '点入口要真的去翻页');
+      expect(find.text('消息内容 0'), findsNothing,
+          reason: '没加载的槽位不画真消息（画的是等高占位槽）');
+      // 报上来的是"构建到哪"（含视口上下各一段缓存），贴着末尾那几条
+      expect(key.currentState!.windowFirst, greaterThanOrEqualTo(25),
+          reason: '帧后要把构建到的下标区间报给面板（补页 / 淘汰都以它为准）');
     });
 
-    testWidgets('正在加载：入口禁用并显示进度', (WidgetTester tester) async {
+    testWidgets('滚到顶：把顶部的下标区间报上去（滑到哪加载哪）',
+        (WidgetTester tester) async {
       final GlobalKey<_HarnessState> key = await pumpList(tester);
+      key.currentState!.trimToTail(10);
+      await tester.pumpAndSettle();
+
       final ScrollPosition pos = positionOf(tester);
       pos.jumpTo(pos.minScrollExtent);
-      await tester.pumpAndSettle();
-      key.currentState!.setPaging(hasEarlier: true, loadingEarlier: true);
-      // 入口里的进度圈是**无限动画**：pumpAndSettle 会一直等下去，这里按帧泵
       await tester.pump();
-      await tester.pump(const Duration(milliseconds: 16));
-      expect(find.text('正在加载更早的消息…'), findsOneWidget);
-      await tester.tap(find.text('正在加载更早的消息…'));
       await tester.pump();
-      await tester.pump(const Duration(milliseconds: 16));
-      expect(key.currentState!.loadEarlierCalls, 0, reason: '加载中不许重复触发');
+
+      // 滚到顶 = 把顶部那一段报上去（补页就以它为准）。允许差几条：懒构建列表在
+      // 大跨度跳转后，RenderSliverList 会按已建子项的估算位置校正一次 offset
+      expect(key.currentState!.windowFirst, lessThan(5),
+          reason: '滚到顶却没把顶部区间报上来');
+      expect(key.currentState!.windowLast, lessThan(20),
+          reason: '报上来的是顶部那一段，不是原来贴底时的 28..39');
     });
 
-    testWidgets('前插补偿：往前面插内容后，原本看的那一段不会被推走', (WidgetTester tester) async {
+    testWidgets('面板在视口上方补页：视口钉在同一段内容上（不会被推走）',
+        (WidgetTester tester) async {
       final GlobalKey<_HarnessState> key = await pumpList(tester);
+      key.currentState!.trimToTail(10);
+      await tester.pumpAndSettle();
+
+      // 停在已加载那一段里：先找一条可见的锚点消息
+      final ScrollPosition pos = positionOf(tester);
+      pos.jumpTo(pos.maxScrollExtent - 240);
+      await tester.pumpAndSettle();
+      String? anchor;
+      double? anchorDy;
+      for (int i = 39; i >= 0; i--) {
+        final Finder f = find.text('消息内容 $i');
+        if (f.evaluate().isEmpty) continue;
+        final double dy = tester.getTopLeft(f.first).dy;
+        if (dy > 40 && dy < 500) {
+          anchor = '消息内容 $i';
+          anchorDy = dy;
+          break;
+        }
+      }
+      expect(anchor, isNotNull, reason: '测试前提：视口里有已加载的消息');
+      final double before = pos.pixels;
+
+      // 面板在**视口上方**补了几条（占位槽 → 真消息，高度变了）
+      key.currentState!.fillAbove(4);
+      await tester.pumpAndSettle();
+
+      expect(pos.pixels, greaterThan(before),
+          reason: '上方补页长高了，offset 要跟着走才钉得住');
+      final double afterDy = tester.getTopLeft(find.text(anchor!).first).dy;
+      expect((afterDy - anchorDy!).abs(), lessThan(1.0),
+          reason: '视口被推走了：before=$anchorDy after=$afterDy');
+    });
+
+    testWidgets('拖右侧滑块：按落点把那一带的下标报上去（滑到哪加载哪）',
+        (WidgetTester tester) async {
+      final GlobalKey<_HarnessState> key = await pumpList(tester);
+      key.currentState!.setTotal(600);
+      await tester.pumpAndSettle();
+
+      final Finder bar = find.byType(MessageScrollbar);
+      expect(bar, findsOneWidget, reason: '槽位表比视口长得多，就该有滑块');
+      final Rect rect = tester.getRect(bar);
+      // 往上拖：滑块 → 更早的下标
+      await tester.dragFrom(
+        rect.center.translate(0, -rect.height * 0.25),
+        const Offset(0, -220),
+      );
+      await tester.pump();
+      await tester.pump();
+
+      expect(key.currentState!.windowFirst, lessThan(400),
+          reason: '拖到中段就该把中段的下标报上来');
+    });
+
+    testWidgets('「回到底部」= 重载末尾一段（不在估算高度里自己滚）',
+        (WidgetTester tester) async {
+      final GlobalKey<_HarnessState> key = GlobalKey<_HarnessState>();
+      int reloads = 0;
+      await tester.pumpWidget(_Harness(
+        key: key,
+        reloadTail: () {
+          reloads++;
+          key.currentState!.reloadTail();
+        },
+      ));
+      await tester.pumpAndSettle();
+
+      key.currentState!.setTotal(600);
+      await tester.pumpAndSettle();
       final ScrollPosition pos = positionOf(tester);
       pos.jumpTo(pos.maxScrollExtent / 2);
       await tester.pumpAndSettle();
-      final double before = pos.pixels;
-      final double beforeMax = pos.maxScrollExtent;
+      expect(buttonOpacity(tester), 1);
 
-      key.currentState!.prepend(5);
+      await tester.tap(find.byIcon(Icons.arrow_downward));
       await tester.pumpAndSettle();
 
-      final double delta = pos.maxScrollExtent - beforeMax;
-      expect(delta, greaterThan(0), reason: '前面插了内容，总高度必须变大');
-      expect(
-        pos.pixels - before,
-        closeTo(delta, 1),
-        reason: 'offset 要跟着长高的那一段走，视口才钉在同一段内容上',
-      );
+      expect(reloads, 1, reason: '点回底 = 请面板重载末尾一段');
+      expect(key.currentState!.total, 40, reason: '重载后窗口就是那一份末尾页');
+      expect(buttonOpacity(tester), 0, reason: '重载后回到最新（恢复跟随）');
     });
 
-    testWidgets('滚到顶：自动往回翻一页', (WidgetTester tester) async {
-      final GlobalKey<_HarnessState> key = await pumpList(tester);
-      key.currentState!.setPaging(hasEarlier: true);
-      await tester.pumpAndSettle();
-
-      final ScrollPosition pos = positionOf(tester);
-      pos.jumpTo(pos.minScrollExtent);
-      await tester.pump();
-      await tester.pumpAndSettle();
-      expect(key.currentState!.loadEarlierCalls, greaterThanOrEqualTo(1));
-    });
-
-    testWidgets('长列表 + 无动画直达底部：真的贴到最底（不是估算位置）', (WidgetTester tester) async {
+    testWidgets('长列表 + 无动画直达底部：真的贴到最底（不是估算位置）',
+        (WidgetTester tester) async {
       await tester.pumpWidget(const _LongHarness());
       await tester.pumpAndSettle();
       // "连续贴底"是靠逐帧复查收敛的：多泵几帧把懒构建补齐的高度贴完
@@ -340,16 +395,19 @@ void main() {
       expect(
         pos.maxScrollExtent - pos.pixels,
         lessThanOrEqualTo(1),
-        reason: '历史整批重载要直达底部：懒构建列表的 maxScrollExtent 是估算值，'
+        reason: '历史整批重载要直达底部：列表的 maxScrollExtent 是估算值，'
             '只贴一帧会停在半路',
       );
     });
   });
 }
 
-/// 测试用宿主：持有消息列表并驱动 MessageList 的 revision/bottomJump 更新
+/// 测试用宿主：持有消息槽位表并驱动 MessageList 的 revision / 窗口回调
 class _Harness extends StatefulWidget {
-  const _Harness({super.key});
+  const _Harness({super.key, this.reloadTail});
+
+  /// 面板的「重载末尾一段」（null = 不接：列表退回旧的平滑回底行为）
+  final VoidCallback? reloadTail;
 
   @override
   State<_Harness> createState() => _HarnessState();
@@ -371,35 +429,67 @@ class _HarnessState extends State<_Harness> {
   int _locateRevision = 0;
   int _live = 0;
 
-  /// 懒加载分页（用户 2026-10-04）：还有更早的一页 / 正在拉 / 拉过几次
-  bool hasEarlier = false;
-  bool loadingEarlier = false;
-  int loadEarlierCalls = 0;
+  /// 槽位表长度（= 整份会话多少条；> 已加载条数时，其余是**占位槽**）
+  int total = 40;
 
-  /// 打开/关闭分页入口的状态（测试从外面驱动；`setState` 是受保护成员，只能在
-  /// State 内部调，所以在宿主里留一个方法）。
-  void setPaging({bool? hasEarlier, bool? loadingEarlier}) {
+  /// 已加载那一段在全局下标里的起点
+  int offset = 0;
+
+  /// 视口上方补过页的次数（列表据此补偿滚动位置）
+  int padAboveStamp = 0;
+
+  /// 帧后报上来的视口区间（-1 = 还没报过）
+  int windowFirst = -1;
+  int windowLast = -1;
+
+  /// 只热末尾 [n] 条：前面全是占位槽（模拟长会话"仅加载末尾一段"）
+  void trimToTail(int n) {
     setState(() {
-      if (hasEarlier != null) this.hasEarlier = hasEarlier;
-      if (loadingEarlier != null) this.loadingEarlier = loadingEarlier;
+      offset = total - n;
+      if (_messages.length > n) {
+        _messages.removeRange(0, _messages.length - n);
+      }
     });
   }
 
-  /// 模拟"往回翻一页"拿到更早的消息：前插进列表
-  void prepend(int count) {
+  /// 造一个长会话：[n] 条，只有末尾那几十条是热的
+  void setTotal(int n) {
     setState(() {
-      for (int i = 0; i < count; i++) {
+      total = n;
+      offset = n - _messages.length;
+    });
+  }
+
+  /// 面板在**视口上方**补页：占位槽换成真消息（高度变了）+ 递增补偿标记
+  void fillAbove(int n) {
+    setState(() {
+      for (int i = 0; i < n; i++) {
         _messages.insert(
           0,
           ChatMessage(
-            id: 'old$i',
+            id: 'fill$i',
             role: 'user',
-            content: '更早的消息 $i ' * 3,
-            timestamp: DateTime(2026, 1, 1, 11, i % 60),
+            content: '补页消息 $i ' * 20,
+            timestamp: DateTime(2026, 1, 1, 10, i % 60),
           ),
         );
       }
-      hasEarlier = false;
+      offset -= n;
+      if (offset < 0) offset = 0;
+      padAboveStamp++;
+    });
+  }
+
+  /// 模拟面板的「重载末尾一段」：窗口换成一份末尾页并直达底部
+  void reloadTail() {
+    setState(() {
+      total = 40;
+      offset = 0;
+      if (_messages.length > 40) {
+        _messages.removeRange(0, _messages.length - 40);
+      }
+      _revision++;
+      _bottomJump = true;
     });
   }
 
@@ -413,6 +503,7 @@ class _HarnessState extends State<_Harness> {
         content: '新消息 $n',
         timestamp: DateTime(2026, 1, 1, 13, 0),
       ));
+      total += 1;
       _revision++;
       _bottomJump = false;
     });
@@ -442,22 +533,34 @@ class _HarnessState extends State<_Harness> {
     });
   }
 
+  /// 槽位表：长度 [total]，已加载的那一段在 [offset] 起
+  List<ChatMessage?> _slots() {
+    final List<ChatMessage?> out = List<ChatMessage?>.filled(total, null);
+    for (int i = 0; i < _messages.length; i++) {
+      final int at = offset + i;
+      if (at >= 0 && at < total) out[at] = _messages[i];
+    }
+    return out;
+  }
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       home: Scaffold(
         body: MessageList(
-          // 与生产同口径：面板每次 build 都传一份**新的**列表（visibleStreamMessages），
-          // 前插补偿靠"新旧两份列表内容不同"来判定
-          messages: List<ChatMessage>.of(_messages),
+          // 槽位表：null = 还没加载（占位槽）
+          slots: _slots(),
           revision: _revision,
           scrollToMessageId: _locateId,
           scrollToRevision: _locateRevision,
           bottomJump: _bottomJump,
-          hasEarlier: hasEarlier,
-          loadingEarlier: loadingEarlier,
-          // 只记账，不真的前插：不然"点了就翻页"的用例还没断言，入口就自己消失了
-          onLoadEarlier: () => loadEarlierCalls++,
+          padAboveStamp: padAboveStamp,
+          // 只记账：真面板会按这个区间去核心补页 / 淘汰离得远的槽位
+          onWindowChanged: (int first, int last) {
+            windowFirst = first;
+            windowLast = last;
+          },
+          onReloadTail: widget.reloadTail,
         ),
       ),
     );
@@ -488,7 +591,7 @@ class _LongHarnessState extends State<_LongHarness> {
   Widget build(BuildContext context) {
     return MaterialApp(
       home: Scaffold(
-        body: MessageList(messages: _messages, revision: 1, bottomJump: true),
+        body: MessageList(slots: _messages, revision: 1, bottomJump: true),
       ),
     );
   }

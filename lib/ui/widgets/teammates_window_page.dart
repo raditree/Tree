@@ -918,7 +918,8 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
       case 'progress':
       default:
         return MessageList(
-          messages: _liveMessages,
+          // 成员窗口是"实时流"（不是可翻页的历史窗口）：全部槽位都已加载
+          slots: _liveMessages,
           revision: _scrollRevision,
           scrollToMessageId: _scrollToMessageId,
           scrollToRevision: _scrollToRevision,

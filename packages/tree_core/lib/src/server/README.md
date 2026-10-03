@@ -43,6 +43,15 @@
     模型那一轮由 `LlmAgentEngine.awaitReady` 有界等一次预热，所以不会"悄悄少掉插件/MCP 工具"。
     每一段都往 stderr 打 `[core:boot]` 分段耗时——"启动慢"因此是可归因的数字，不是感觉。
 
+14. **会话历史接口按"全局下标"寻址**（[core_server.dart](core_server.dart) 的 `_conversationHistory`，
+    [test/conversation_history_paging_test.dart](../../../test/conversation_history_paging_test.dart) 强制；前端口径见
+    [lib/README.md](../../../../../lib/README.md) 不变量 19）：不传参数 = 老行为（整份）；`limit=N` = **末尾** N 条；
+    `before=<id>` = 只要更早的（游标 = 消息 id）；**`from=<下标>` = 从第几条起**（前端窗口"滑到哪加载哪"）；
+    **`at=<id>` = 含这条消息的那一段**（定位一条早被窗口淘汰的消息）。任何一条路径都回 **`offset` = 这一页第一条的
+    全局下标**——窗口据此把这一页放进槽位表，"滑块的全局长度口径"也来自同一套下标；`total` 如实给全量条数；
+    单页上限 **2000** 条（防一次手滑拼出巨型 JSON）；`before` / `at` 找不到游标时**退回末尾一段**，
+    **绝不静默返回整份**（"最坏情况传几 MB" 与"悄悄多传"都是要避免的）。
+
 ## 测试
 
 ```bash

@@ -115,6 +115,12 @@ class CoreServer {
   /// WS 端点路径（前端 `WebSocketService.connect` 固定拼接 `/ws?token=`）。
   static const String wsPath = '/ws';
 
+  /// 历史接口一次最多回多少条（[from] / [at] / 末尾分页共用同一上限）。
+  ///
+  /// 前端窗口只缓存视口附近（用户 2026-10-04：「滑到哪加载哪，限制缓存长度」），
+  /// 正常一页 = 200 条；上限只是防一次手滑的 limit 拼出巨型 JSON。
+  static const int _historyPageMax = 2000;
+
   /// 尚未实现、但前端会调用的路径（以 501 明确拒绝，而非静默 404）。
   ///
   /// **M7 已清空**：PDF 预览改成前端渲染（M7e 方案②，核心只给字节，见
@@ -2128,20 +2134,60 @@ class CoreServer {
     final int limit =
         int.tryParse(request.uri.queryParameters['limit'] ?? '') ?? 0;
     final String before = (request.uri.queryParameters['before'] ?? '').trim();
-    int end = ordered.length;
-    if (before.isNotEmpty) {
-      final int at = ordered.indexWhere((CoreMessage m) => m.id == before);
-      // 找不到游标（消息被清掉 / 会话换了）：当"从头开始"，别默默返回整份
-      if (at >= 0) end = at;
+    // **按下标寻址**（用户 2026-10-04：「滑到哪加载哪」）：
+    // - from = 从第几条开始（全局下标，0 = 最旧那条）；
+    // - at   = "含这条消息的那一段"（前端要定位一条**不在窗口里**的消息时用它，
+    //          窗口只缓存视口附近，定位目标很可能早就被淘汰了）。
+    // 不管走哪条路，响应都带 offset = 这一页第一条的**全局下标**：前端据此把这一页
+    // 放进窗口的槽位表（滑块的"全局长度"口径也来自它）。
+    final int? from = int.tryParse(request.uri.queryParameters['from'] ?? '');
+    final String at = (request.uri.queryParameters['at'] ?? '').trim();
+    // 单页上限：本地回环上也不为一次手滑的 limit 拼一份巨型 JSON
+    final int pageSize = limit <= 0
+        ? 0
+        : (limit > _historyPageMax ? _historyPageMax : limit);
+    final int total = ordered.length;
+    int start;
+    int end;
+    if (at.isNotEmpty) {
+      final int found = ordered.indexWhere((CoreMessage m) => m.id == at);
+      if (found < 0) {
+        // 找不到（被清掉 / 换了会话）：退回末尾一段 —— 与 before 找不到同口径，
+        // 绝不静默返回整份
+        end = total;
+        start = (pageSize > 0 && end > pageSize) ? end - pageSize : 0;
+      } else {
+        // 以目标为中心取一段，再夹一次保证**目标一定在页内**
+        final int span = pageSize > 0 ? pageSize : total;
+        start = (found - span ~/ 2).clamp(0, total);
+        end = (start + span).clamp(0, total);
+        // 贴边（目标是头几条 / 末尾几条）时整段回推，尽量回一份**整页**：
+        // 窗口填页时页头页尾都有内容，滑到边界也不会只剩两条
+        if (end - start < span) start = (end - span).clamp(0, total);
+        if (found < start) start = found;
+        if (found >= end) end = found + 1;
+      }
+    } else if (from != null) {
+      start = from.clamp(0, total);
+      end = pageSize > 0 ? (start + pageSize).clamp(0, total) : total;
+    } else {
+      end = total;
+      if (before.isNotEmpty) {
+        final int idx = ordered.indexWhere((CoreMessage m) => m.id == before);
+        // 找不到游标（消息被清掉 / 会话换了）：当"从头开始"，别默默返回整份
+        if (idx >= 0) end = idx;
+      }
+      start = (pageSize > 0 && end > pageSize) ? end - pageSize : 0;
     }
-    final int start = (limit > 0 && end > limit) ? end - limit : 0;
     final List<CoreMessage> page = ordered.sublist(start, end);
     await writeJson(request, 200, <String, dynamic>{
       'agent_id': agentId,
       'session_id': sessionId,
       'messages': page.map((CoreMessage m) => _messageJson(m)).toList(),
       // 分页元信息（老前端忽略它们，行为不变）
-      'total': ordered.length,
+      'total': total,
+      // 这一页第一条的全局下标（按下标寻址的唯一真值）
+      'offset': start,
       'has_more': start > 0,
     });
   }

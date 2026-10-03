@@ -137,8 +137,13 @@
     快捷键**与焦点无关**：绑在 MainPage 顶层的 `CallbackShortcuts`（`main-global-shortcuts`）上，经全局
     [TerminalToggleRequest](ui/services/terminal_toggle_request.dart) 广播——焦点在文件树 / 代码编辑器 / 详情页 / 终端自身时
     照样唤起（挂在输入框上的局部快捷键只在输入框有焦点时收得到）；**没有任何主焦点时**冒泡到顶层这一路也成立。
-    终端**没有输入行**——所有按键经 `Focus.onKeyEvent` 译成终端字节（回车 `\r`、退格 `0x7f`、方向键 `ESC[A..D`、
-    Ctrl+字母 `0x01..0x1A`、可打印字符走 `event.character` 的 UTF-8），Ctrl+J 例外（留给切换）。
+    终端**没有输入行**，按键走**两条路**（这是引擎契约，改之前先看 [docs/known-issues.md](../docs/known-issues.md) #12）：
+    **控制键**（回车 `\r`、退格 `0x7f`、方向键 `ESC[A..D`、Ctrl+字母 `0x01..0x1A`）经 `Focus.onKeyEvent` 译成终端字节；
+    **可打印字符一律判 `ignored`、交给平台的文本输入**（[ui/services/terminal_ime_input.dart](ui/services/terminal_ime_input.dart)
+    的 `TerminalTextInputClient`——只有它收得到中文 / 日文这类要"组字"的输入法）——引擎在键事件被判 `handled`
+    时**就不再派发文字**，两条路因此天然互斥、不会重复输入。这条连接**必须带本视图的 `viewId`**
+    （`View.of(context).viewId`，与 `EditableText` 同口径）：缺了平台侧 `setClient` 直接报错、文字被静默丢掉
+    ⇒ **中英文一个字都打不出来**（真机踩过）。Ctrl+J 例外（留给切换）。
     核心开**真伪终端**，输出是**原始字节**（base64 过 WS），前端用自制的 VT 解析器还原成屏幕
     （光标定位 / SGR / 备用屏都在内），再 `CustomPaint` 画格子。两个后端**都是真 PTY**：
     本机 agent 走平台伪终端（Windows ConPTY / POSIX `script`）；远端（SSH）agent 走 SSH 会话通道 +
@@ -150,12 +155,8 @@
     **停止键**（实心圆 + 白色圆角方块，[ui/widgets/stop_button.dart](ui/widgets/stop_button.dart)），
     一开始打字就换回发送键——发送本身就意味着"中止在途那一轮并另起一轮"，没必要先停再发；
     成员面板的输入行同一个口径（在那里顺手暂停 teammates）。
-    **会话历史懒加载**（用户 2026-10-04：「会话太长时导入不能直接划到底部；懒加载，长会话仅加载
-    末尾一段」）：历史接口支持 `limit`（取**末尾** N 条）与 `before`（只要更早的，游标 = 当前最老
-    那条 id），返回 `has_more`/`total`；面板一次只拉 200 条并在列表顶部给「加载更早的消息」入口
-    （滚到顶自动拉，前插时按高度差补偿滚动位置，视口钉在同一段内容上）。**直达底部**也一并修硬：
-    懒构建列表的 `maxScrollExtent` 是**估算值**，"贴一帧"会停在中途，现在跟随模式下**粘底**
-    （贴住就一直跟着长高走，用户一上滚立刻停手）＋程序化跳底期间不把滚动通知判成"用户上滚"。
+    （会话历史的**窗口化加载**——滑到哪加载哪、限制缓存长度、滑块按全局下标算、"回到底部"直接重载——
+    见不变量 19。）
     **回滚缓冲**：主屏整屏滚动时被顶出去的行进历史（上限 2000 行；备用屏与滚动区域内部的滚动不进——
     xterm 口径），鼠标滚轮往上翻、**滚到底自动恢复跟随**，翻上去时工具条上出现「已回滚 N 行」胶囊（点它回到最新）；
     新输出不会把正在回看的视野拽走（视图钉在同一段内容上，靠 `historyPushed` 计数）。`ED3`（`CSI 3 J`）与 RIS 清空历史。
@@ -260,7 +261,8 @@
 18. **临时员工的产出不混杂进主消息流，去它自己的视角看**（[ui/services/subagent_transcript.dart](ui/services/subagent_transcript.dart)、
     [ui/widgets/subagent_view_switcher.dart](ui/widgets/subagent_view_switcher.dart)、[ui/widgets/subagent_process_list.dart](ui/widgets/subagent_process_list.dart)，
     **用户断言 2026-10-04**）：
-    ① **中栏只渲染主 agent 自己的消息**（`visibleStreamMessages` 滤掉带 `subagent_id` 的消息）：临时员工的文本 / 思考 /
+    ① **中栏只渲染主 agent 自己的消息**（列表的 `visible` 谓词 = `!isSubagentMessage`，命中者渲染成**零高度槽位**；
+    `visibleStreamMessages` 仍是这条口径的纯函数落点，见不变量 19）：临时员工的文本 / 思考 /
     工具调用不再与主 agent 的混在一起；
     ② 两处能看它的过程，且**共用同一份渲染**（[SubagentProcessList]）：**调用它的那次 `subagent` 工具调用的详情页**
     （就地看，里面的工具行还能再点进去看那条工具的详情），以及**中栏就地切换的「临时员工视角」**；
@@ -282,6 +284,25 @@
     ⑥ **它的上下文长度不计入主 agent 的读数**：中栏的「上下文」实时帧**不认**带 `subagent_id` 的（`_recordUsage` 直接返回），
     历史恢复用量也跳过带标记的消息；这个数字只在它自己的视图里显示（「它的上下文：1200 / 64000 tokens（不并进主 agent
     的统计）」）——临时员工是**另一个 LLM 上下文**，混进来会把主 agent 的读数带偏。
+
+19. **中栏消息流是"按全局下标寻址的窗口"**（[ui/services/message_window.dart](ui/services/message_window.dart)、
+    [ui/widgets/message_list.dart](ui/widgets/message_list.dart)、[ui/widgets/message_scrollbar.dart](ui/widgets/message_scrollbar.dart)，
+    **用户断言 2026-10-04**：「右侧滑块位置按全局长度算，滑到哪加载哪，限制缓存长度，仅缓存窗口附近的消息」
+    「回到底部按钮直接重载入历史」）：
+    ① 整份会话流是一张**槽位表**（下标 0 = 最旧那条），元素为 `null` 表示这一段还没取回来——列表里画成**等高占位槽**
+    （[MessageWindow](ui/services/message_window.dart) 只做放置 / 去重 / 淘汰，纯 Dart 可单测）；表长**只随新消息增长**
+    （加载、淘汰都不改变它）= 滑块不乱跳的根基；
+    ② 列表把**本帧构建到的下标区间**帧后报给面板，面板按 `GET /api/conversations/{id}?from=<下标>&limit=N` 只补那一段
+    （核心回 `offset` = 这一页第一条的全局下标，见 [server/README.md](../packages/tree_core/lib/src/server/README.md) 不变量 14），
+    并淘汰离视口超过 400 条的槽位——**正在流式 / 正在跑工具的消息永不被淘汰**，末尾 200 条常驻；补页失败只留着占位槽，
+    下次滑动再试；补不出东西来的段记一笔不再空转（防死循环）；
+    ③ 右侧滑块**按全局下标算几何**（第一条的下标 / 全局条数，长度 = 看得见的条数 / 全局条数、有抓得住的下限），
+    拖它 = 跳到该下标并补那一段（原生 `Scrollbar` 跟随"已构建内容的估算范围"，窗口化列表里必然乱跳，故自绘）；
+    ④ **「回到底部」= 重载末尾一段**（`resetTail`：窗口换成"末尾页 + 比它新的实时尾巴"）＋直达底部——不再在几千条
+    估算高度里做一次滚动动画（那正是"划不到底"的来源）；实时追加落在末尾，末尾那段常驻所以流式不受影响；
+    ⑤ 定位一条早已被淘汰的消息用 `at=<id>`（取含它的那一段），并把那一页额外钉住不被淘汰（`evict(keepAlso:)`）；
+    ⑥ 面板**上方**补页时按高度差补偿滚动位置（[padAboveStamp] → 布局阶段 `correctPixels`，视口钉在同一段内容上）；
+    跟随模式下依旧"粘底"（贴住就一直跟着长高走，用户一上滚立刻停手）。
 
 ## 测试
 
@@ -314,7 +335,14 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 `test/terminal_send_command_test.dart`（`#TSend`：引号 / 裸文本 / `@路径` / 混写 / 带空格路径的解析，以及按键拦截的吞与补发：整行扣住、发现不是指令时原样补发、退格只吃本地缓存、其它按键前先补发、`#TSend` 单独一行 = 空指令）、
 `test/terminal_panel_test.dart`（终端面板：打开就发 `terminal_open` 与尺寸并抢焦点、ready 显示 shell/cwd、
 输出进缓冲、键盘译码（回车 / 方向键 / Ctrl+C）、Ctrl+J 交给外层、error 与 exit 的显示、别的会话 id 的帧被丢、
-dispose 发 `terminal_close`、布局变化发 `terminal_resize`）、
+dispose 发 `terminal_close`、布局变化发 `terminal_resize`、**输入法连接必须带 `viewId`**——缺了平台不认这个 client，
+中英文一个字都打不出来）、
+`test/message_window_test.dart`（消息窗口：按 `offset` 放页并按 id 去重对齐、实时追加落末尾且同 id 原位替换、
+`gapsFor` 只报没加载的连续段、淘汰只留视口附近与末尾且正在流式 / 正在跑工具的不淘汰、`resetTail` 重载末尾一段）、
+`test/message_scrollbar_test.dart`（右侧滑块几何与交互：位置按**全局下标**算、长度 = 可见条数 / 全局条数并有下限、
+装得下整屏就不画、拖它按落点换算成全局下标回调出去）、
+`test/conversation_history_api_test.dart`（真起假核心 HttpServer：末尾一段只带 `limit`、`from=` 拉那一段、
+`at=` 定位、`before=` 老口径、不带 limit 时不发 limit，且 `offset` / `total` 解析正确）、
 `test/team_scope_view_test.dart`（团队级模式/目录合成：成员跟随 TOP 的模式与目录、自己的 SSH 优先、
 目录只认 TOP 那份、TOP 是 SSH 时成员切不回本地）。
 `test/file_tree_icon_test.dart`（文件树视觉映射纯函数：目录收起 / 展开的图标与暖黄、一张"扩展名 → 类型 + 固定色"表、

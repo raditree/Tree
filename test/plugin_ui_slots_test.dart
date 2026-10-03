@@ -311,7 +311,7 @@ void main() {
     Widget host(PluginUiRegistry reg) => MaterialApp(
           home: Scaffold(
             body: MessageList(
-              messages: <ChatMessage>[
+              slots: <ChatMessage>[
                 ChatMessage(
                   id: 'm1',
                   role: 'user',
