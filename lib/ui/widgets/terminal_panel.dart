@@ -207,6 +207,28 @@ class TerminalPanelState extends State<TerminalPanel> {
     _sendInput(responses);
   }
 
+  /// 清屏（工具条的按钮与 Ctrl+L 都走这里）：**本地立刻清**（屏 + 回滚历史），
+  /// 然后把 `Ctrl+L`(0x0c) 照旧送给 shell。
+  ///
+  /// 为什么不能只发 0x0c：那是"交给 shell 办"的路子，而 shell 未必有这个绑定——
+  /// 本机默认 shell 是 `cmd.exe`（**没有** Ctrl+L）⇒ 按下去什么都不发生
+  /// （用户 2026-10-03：「清屏键无效」）。本地清屏是**确定**的，谁也拦不住。
+  /// 反过来，bash / PSReadLine 拿到 0x0c 后自己会重画提示符，两者叠加不冲突。
+  ///
+  /// 清屏序列用标准的 `ED2`（清屏）+ `ED3`（清历史）+ `CUP`（游标归位），直接喂给
+  /// [VtScreen]（它本来就实现了这三条）——不新增一条"屏幕之外"的清屏 API，
+  /// 屏幕模型与真实终端语义保持一致。
+  void _clearScreen() {
+    _screen.write(utf8.encode('\x1b[2J\x1b[3J\x1b[H'));
+    _flushResponses();
+    setState(() {
+      _scrollOffset = 0;
+      _historyPushedSeen = 0;
+      _selection = null;
+    });
+    _sendInput(<int>[0x0c]);
+  }
+
   void _sendInput(List<int> bytes) {
     widget.webSocket.send(<String, dynamic>{
       'type': TerminalInboundType.input,
@@ -496,6 +518,15 @@ class TerminalPanelState extends State<TerminalPanel> {
       return KeyEventResult.handled;
     }
 
+    // 清屏（Ctrl+L）：**本地清 + 仍把 0x0c 送给 shell**（见 [_clearScreen]——
+    // cmd 这类没有 Ctrl+L 绑定的 shell 上，只发 0x0c 等于什么都没做）。
+    if (ctrl && event.logicalKey == LogicalKeyboardKey.keyL) {
+      final List<int> held = _send.release();
+      if (held.isNotEmpty) _sendInput(held);
+      _clearScreen();
+      return KeyEventResult.handled;
+    }
+
     // ── `#TSend`：这几行**只有本地知道**（见 [TerminalSendInterceptor]）────────
     // 1) 退格：缓存里的字符从没进过 shell，先吃本地缓存
     if (!ctrl &&
@@ -655,6 +686,10 @@ class TerminalPanelState extends State<TerminalPanel> {
   @visibleForTesting
   TerminalTextInputClient get debugImeClient => _ime;
 
+  /// 仅供测试：屏幕缓冲（清屏 / 回滚历史这类断言要看真实状态，不看画出来的像素）。
+  @visibleForTesting
+  VtScreen get debugScreen => _screen;
+
   @override
   Widget build(BuildContext context) {
     final ColorScheme cs = Theme.of(context).colorScheme;
@@ -790,10 +825,10 @@ class TerminalPanelState extends State<TerminalPanel> {
             onPressed: _restart,
           ),
           IconButton(
-            tooltip: '清屏（Ctrl+L）',
+            tooltip: '清屏（Ctrl+L）：本地清掉屏幕与回滚历史，并把 Ctrl+L 送给 shell',
             icon: const Icon(Icons.cleaning_services_outlined, size: 15),
             color: cs.onSurfaceVariant,
-            onPressed: () => _sendInput(<int>[0x0c]),
+            onPressed: _clearScreen,
           ),
           IconButton(
             tooltip: '收起终端（Ctrl+J）',

@@ -23,7 +23,10 @@
 ///    松手后跳一下到列表的真实位置。
 library;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+
+import '../services/message_window.dart';
 
 /// 滑块几何（纯函数，单测直接钉它）。
 @immutable
@@ -143,26 +146,28 @@ int messageScrollbarIndexAt({
 }
 
 /// 中栏右侧的全局下标滑块：拖到哪就请面板把那一带加载出来（[onSeek]）。
+///
+/// **几何输入是"视口坐标"**（[MessageWindowCoordinate]，列表帧后刷新）：拇指直接监听它，
+/// 所以滚动时只重绘拇指、不重建列表（丝滑）。
 class MessageScrollbar extends StatefulWidget {
   const MessageScrollbar({
     super.key,
-    required this.total,
-    required this.firstVisible,
-    required this.lastVisible,
+    required this.coordinate,
     required this.onSeek,
+    this.onSeekSettled,
   });
 
-  /// 全局总条数（=[MessageWindow.total]，只随新消息增长）。
-  final int total;
+  /// 视口在整份历史里的坐标（=-1/-1 表示还没量出来）。
+  final ValueListenable<MessageWindowCoordinate> coordinate;
 
-  /// 视口内第一条的全局下标（-1 = 还没量出来）。
-  final int firstVisible;
-
-  /// 视口内最后一条的全局下标。
-  final int lastVisible;
-
-  /// 拖到某个全局下标（面板据此补页；列表自己也会跳到那一带的估算位置）。
+  /// 拖到 / 点到某个全局下标（列表据此跳到那一带；那一带的补页由面板按坐标做）。
   final void Function(int index) onSeek;
+
+  /// 松手（或点击）之后：请列表把落点**校正**到该下标（null = 不校正）。
+  ///
+  /// 落点是估算的（占位槽 88px/条 vs 已加载消息的真实高度），松手后由列表用实测
+  /// 落点反馈两三次收口——否则拇指停在指针那儿、内容却停在别处，拇指只好"回落"。
+  final void Function(int index)? onSeekSettled;
 
   @override
   State<MessageScrollbar> createState() => _MessageScrollbarState();
@@ -190,9 +195,12 @@ class _MessageScrollbarState extends State<MessageScrollbar> {
   /// 松手后交回真实下标（会跳一下——那是列表的真实位置，不是抖动）。
   double? _dragFraction;
 
-  int get _total => _dragTotal ?? widget.total;
-  int get _first => _dragFirst ?? widget.firstVisible;
-  int get _last => _dragLast ?? widget.lastVisible;
+  int get _total => _dragTotal ?? widget.coordinate.value.total;
+  int get _first => _dragFirst ?? widget.coordinate.value.first;
+  int get _last => _dragLast ?? widget.coordinate.value.last;
+
+  /// 拖拽 / 点击最后报出去的下标（松手时用它请求落点校正）。
+  int _lastSeekIndex = 0;
 
   ScrollbarThumb _thumb(double track) => messageScrollbarThumb(
         track: track,
@@ -209,14 +217,15 @@ class _MessageScrollbarState extends State<MessageScrollbar> {
 
   /// 按下：冻结几何输入（拖拽全程用同一份，见 [_dragTotal]）。
   void _beginDrag() {
-    _dragTotal = widget.total;
-    _dragFirst = widget.firstVisible;
-    _dragLast = widget.lastVisible;
+    _dragTotal = widget.coordinate.value.total;
+    _dragFirst = widget.coordinate.value.first;
+    _dragLast = widget.coordinate.value.last;
     _dragFraction = null;
   }
 
-  /// 松手 / 手势取消：解冻，拇指交回真实下标。
+  /// 松手 / 手势取消：解冻，拇指交回**实时坐标**，并请列表把落点收口到目标下标。
   void _endDrag() {
+    final int settled = _lastSeekIndex;
     setState(() {
       _active = false;
       _dragTotal = null;
@@ -224,10 +233,21 @@ class _MessageScrollbarState extends State<MessageScrollbar> {
       _dragLast = null;
       _dragFraction = null;
     });
+    widget.onSeekSettled?.call(settled);
   }
 
   @override
   Widget build(BuildContext context) {
+    // 坐标变了就重建拇指：**只重绘拇指**（列表不重建），滚动才跟手且不卡
+    return ValueListenableBuilder<MessageWindowCoordinate>(
+      valueListenable: widget.coordinate,
+      builder: (BuildContext context, MessageWindowCoordinate _, Widget? child) {
+        return _buildBar(context);
+      },
+    );
+  }
+
+  Widget _buildBar(BuildContext context) {
     if (!messageScrollbarVisible(
       total: _total,
       firstVisible: _first,
@@ -267,15 +287,17 @@ class _MessageScrollbarState extends State<MessageScrollbar> {
             onTapDown: (TapDownDetails d) {
               // 单击 = 直接把那一带拉出来：不做抓取保持（下一帧拇指就归位到真实下标）
               _grab = thumb.length / 2;
-              widget.onSeek(
-                messageScrollbarIndexAt(
-                  track: track,
-                  total: _total,
-                  firstVisible: _first,
-                  lastVisible: _last,
-                  top: _topFor(d.localPosition.dy, track, thumb),
-                ),
+              final int index = messageScrollbarIndexAt(
+                track: track,
+                total: _total,
+                firstVisible: _first,
+                lastVisible: _last,
+                top: _topFor(d.localPosition.dy, track, thumb),
               );
+              _lastSeekIndex = index;
+              widget.onSeek(index);
+              // 点的落点也是估算的：请列表校正一次，落点才真的到得了
+              widget.onSeekSettled?.call(index);
             },
             child: Stack(
               children: <Widget>[
@@ -324,14 +346,14 @@ class _MessageScrollbarState extends State<MessageScrollbar> {
     setState(() {
       _dragFraction = room <= 0 ? 0 : top / room;
     });
-    widget.onSeek(
-      messageScrollbarIndexAt(
-        track: track,
-        total: _total,
-        firstVisible: _first,
-        lastVisible: _last,
-        top: top,
-      ),
+    final int index = messageScrollbarIndexAt(
+      track: track,
+      total: _total,
+      firstVisible: _first,
+      lastVisible: _last,
+      top: top,
     );
+    _lastSeekIndex = index;
+    widget.onSeek(index);
   }
 }

@@ -21,8 +21,24 @@ import 'package:flutter/services.dart';
 /// 而我们按 composing 无效把它当成已定字**整段转发** ⇒ 拼音进 shell。
 /// 回显原样之后，模型与 IME 的认知一致，"选字 = 替换组字区"这条正常路径才成立。
 ///
-/// **为什么还要"只补差额"**：既然送来的总是整段文本，就得自己记住"已经交给 PTY 多少"
-/// （[_forwarded]），否则每次状态回流都会把老内容重复灌进 shell（同一个 bug 的另一半）。
+/// **为什么不许回推 `setEditingState`**（2026-10-03 真机回归，引擎源码坐实）：
+/// 平台每次状态回流都回推一次，等于每次都调引擎的 `TextInputModel::SetText(text)`
+/// ——那个重载的签名是 `SetText(text, selection = TextRange(0), composing_range = TextRange(0))`
+/// （`text_input_model.h`），默认的**折叠组字区**会让 `composing_ = !composing_range.collapsed()`
+/// 变成 **false**；紧接着插件再调 `SetComposingRange(...)` 也救不回来——它开头就是
+/// `if (!composing_) return false;`。组字态被抹掉之后，IME 下一轮的
+/// `AddText`（`text_input_model.cc`：**只有 `composing_` 为真才"删掉当前组字文本再插入"**）
+/// 就退化成**追加**：拼音不断堆在模型里，每一轮"."又把"。"追加进去，而我们按"只补差额"
+/// 把多出来的部分当**新定字**发给 PTY ⇒ shell 里出现一长串拼音（用户截图
+/// `E:\...>nninini…。hani。…`，且没有换行）。
+///
+/// 所以这里只做两件事：**读**（把已定字交给 [onText]）与**在 attach 时清一次模型**
+/// （[attach] 里那一次 `setEditingState(empty)`：刚接上时模型里可能还留着上一次的残渣，
+/// 清掉它才是干净起点）。**组字过程中的任何回推都是 bug**——`test/terminal_ime_input_test.dart`
+/// 里有一条用例专门钉住"组字期间不许出现 TextInput.setEditingState"。
+///
+/// **为什么还要"只补差额"**：平台送来的永远是整段文本，就得自己记住"已经交给 PTY 多少"
+/// （[_forwarded]），否则每次状态回流都会把老内容重复灌进 shell。
 ///
 /// **为什么不用隐藏的 `TextField`**（那样代码更少）：焦点链上 `EditableText` 自己的
 /// 按键处理（回车换行、退格删字、方向键移动光标）跑在**我们的 Focus 之前**，会把控制键
@@ -93,7 +109,7 @@ class TerminalTextInputClient with TextInputClient {
         enableIMEPersonalizedLearning: false,
       ),
     )..show();
-    _setValue(TextEditingValue.empty);
+    _resetPlatformValue(TextEditingValue.empty);
   }
 
   /// 关掉连接（失焦 / 面板 dispose 时调）。
@@ -128,7 +144,10 @@ class TerminalTextInputClient with TextInputClient {
     connection.setComposingRect(caretRect);
   }
 
-  void _setValue(TextEditingValue value) {
+  /// **只**在 [attach] 时用一次：把平台侧模型清成空（干净起点）。
+  ///
+  /// 除此之外**任何**时候都不要调它（见文头"为什么不许回推"）。
+  void _resetPlatformValue(TextEditingValue value) {
     _value = value;
     _connection?.setEditingState(value);
   }
@@ -171,9 +190,8 @@ class TerminalTextInputClient with TextInputClient {
       _forwarded = text.length;
       _preedit = '';
     }
-    // **原样回显**：见文头——改写模型（截断 / 折叠选区 / 重标组字区）会让引擎的
-    // `AddText` 从"替换组字区"退化成"追加"，拼音就跟着提交结果一起漏进 shell。
-    _setValue(value);
+    // **绝不回推编辑状态**（见文头的"为什么不许 setEditingState"）。
+    _value = value;
   }
 
   /// 回车 / 换行这类动作**不在这里处理**：它们由键盘那一路（[Focus.onKeyEvent]）

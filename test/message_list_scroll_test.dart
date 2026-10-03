@@ -400,6 +400,94 @@ void main() {
       );
     });
   });
+
+  group('窗口坐标实时上报（用户 2026-10-03：上滚拇指不动 / 拖完松手跳回旧位置）', () {
+    testWidgets('父组件不重建也上报：滚到别处时窗口坐标跟着走',
+        (WidgetTester tester) async {
+      final GlobalKey<_HarnessState> key = await pumpList(tester);
+      key.currentState!.setTotal(600);
+      await tester.pumpAndSettle();
+
+      final ScrollPosition pos = positionOf(tester);
+      // 先在阅读模式里停一处（这一步会因"离开底部"重建一次，旧代码也报得上）
+      pos.jumpTo(pos.maxScrollExtent / 2);
+      await tester.pumpAndSettle();
+      final int midFirst = key.currentState!.windowFirst;
+      expect(midFirst, greaterThan(50), reason: '前提：已经滚到中段');
+
+      // 再滚到别处：仍在阅读模式 ⇒ 没有任何 setState，**只有滚动**
+      pos.jumpTo(pos.maxScrollExtent / 8);
+      await tester.pump();
+      await tester.pump();
+
+      expect(
+        (key.currentState!.windowFirst - midFirst).abs(),
+        greaterThan(50),
+        reason: '滚动期间也要刷新窗口坐标——滚动不重建父组件，'
+            '早先只在 build 里注册帧后回调 ⇒ 一次都不上报（拇指死在原地）',
+      );
+    });
+
+    testWidgets('已在阅读模式时拖滑块：松手拇指不回跳，视口也真的跟过去',
+        (WidgetTester tester) async {
+      final GlobalKey<_HarnessState> key = await pumpList(tester);
+      key.currentState!.setTotal(600);
+      await tester.pumpAndSettle();
+
+      // 先进阅读模式（这一步会重建一次，两版代码都能报上坐标）
+      final ScrollPosition pos = positionOf(tester);
+      pos.jumpTo(pos.maxScrollExtent / 2);
+      await tester.pumpAndSettle();
+      final int midFirst = key.currentState!.windowFirst;
+      expect(midFirst, greaterThan(100), reason: '前提：已经在阅读模式的中段');
+
+      // 抓住拇指往上拖：此后全程没有重建 ⇒ 旧代码不会再刷新坐标
+      final Rect thumb = tester.getRect(find.byKey(messageScrollbarThumbKey));
+      final TestGesture gesture = await tester.startGesture(thumb.center);
+      await tester.pump();
+      await gesture.moveBy(const Offset(0, -180));
+      await tester.pump();
+      final double draggedTop =
+          tester.getRect(find.byKey(messageScrollbarThumbKey)).top;
+      await gesture.up();
+      await tester.pumpAndSettle();
+      final double settledTop =
+          tester.getRect(find.byKey(messageScrollbarThumbKey)).top;
+
+      expect(
+        (settledTop - draggedTop).abs(),
+        lessThan(30),
+        reason: '松手后拇指该停在拖到的位置（旧代码：交回旧坐标 ⇒ 弹回原处）',
+      );
+      expect(
+        key.currentState!.windowFirst,
+        lessThan(midFirst - 50),
+        reason: '视口也要跟着拖拽走到更早那一段（旧代码：坐标不刷新 ⇒ 内容停在原地）',
+      );
+    });
+
+    testWidgets('已在阅读模式时点滑块：视口落到点到的那一段附近（落点校验收口）',
+        (WidgetTester tester) async {
+      final GlobalKey<_HarnessState> key = await pumpList(tester);
+      key.currentState!.setTotal(600);
+      await tester.pumpAndSettle();
+
+      final ScrollPosition pos = positionOf(tester);
+      pos.jumpTo(pos.maxScrollExtent / 2);
+      await tester.pumpAndSettle();
+
+      final Rect rect = tester.getRect(find.byType(MessageScrollbar));
+      await tester.tapAt(Offset(rect.center.dx, rect.top + rect.height * 0.15));
+      await tester.pumpAndSettle();
+
+      // 点轨道 15% 处 ⇒ 目标下标 ≈ 0.15 × (600 - 可见) ≈ 85 上下
+      expect(
+        key.currentState!.windowFirst,
+        inInclusiveRange(20, 200),
+        reason: '点哪儿去哪儿（误差只是"像素↔下标"估算的量级，不是停在原处）',
+      );
+    });
+  });
 }
 
 /// 测试用宿主：持有消息槽位表并驱动 MessageList 的 revision / 窗口回调

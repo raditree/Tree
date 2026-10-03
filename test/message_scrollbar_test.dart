@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:tree/ui/models/message.dart';
 import 'package:tree/ui/widgets/message_list.dart';
+import 'package:tree/ui/services/message_window.dart';
 import 'package:tree/ui/widgets/message_scrollbar.dart';
 
 /// 右侧那条滑块的**几何与交互**（用户 2026-10-04：「右侧滑块位置按全局长度算，
@@ -84,15 +85,19 @@ void main() {
   testWidgets('拖滑块：按落点换算成全局下标回调出去（面板据此补那一段）',
       (WidgetTester tester) async {
     final List<int> seeks = <int>[];
+    // 几何口径没变，只是输入从"三个数"变成一个**坐标**（用户 2026-10-03）
+    final ValueNotifier<MessageWindowCoordinate> coord =
+        ValueNotifier<MessageWindowCoordinate>(
+      const MessageWindowCoordinate(first: 0, last: 9, total: 100),
+    );
+    addTearDown(coord.dispose);
     await tester.pumpWidget(MaterialApp(
       home: Scaffold(
         body: SizedBox(
           height: 1000,
           width: 14,
           child: MessageScrollbar(
-            total: 100,
-            firstVisible: 0,
-            lastVisible: 9,
+            coordinate: coord,
             onSeek: seeks.add,
           ),
         ),
@@ -116,15 +121,18 @@ void main() {
   testWidgets('不画的时候不拦手势（内容装得下时右侧那一竖条不该吃掉点击）',
       (WidgetTester tester) async {
     final List<int> seeks = <int>[];
+    final ValueNotifier<MessageWindowCoordinate> coord =
+        ValueNotifier<MessageWindowCoordinate>(
+      const MessageWindowCoordinate(first: 0, last: 7, total: 8),
+    );
+    addTearDown(coord.dispose);
     await tester.pumpWidget(MaterialApp(
       home: Scaffold(
         body: SizedBox(
           height: 400,
           width: 14,
           child: MessageScrollbar(
-            total: 8,
-            firstVisible: 0,
-            lastVisible: 7,
+            coordinate: coord,
             onSeek: seeks.add,
           ),
         ),
@@ -315,14 +323,29 @@ class _MirrorBar extends StatefulWidget {
 class _MirrorBarState extends State<_MirrorBar> {
   int _first = _MirrorBar.first;
 
+  late final ValueNotifier<MessageWindowCoordinate> _coordinate =
+      ValueNotifier<MessageWindowCoordinate>(_coordinateFor(_first));
+
+  static MessageWindowCoordinate _coordinateFor(int first) =>
+      MessageWindowCoordinate(
+        first: first,
+        last: first + _MirrorBar.visible - 1,
+        total: _MirrorBar.total,
+      );
+
+  @override
+  void dispose() {
+    _coordinate.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     return MessageScrollbar(
-      total: _MirrorBar.total,
-      firstVisible: _first,
-      lastVisible: _first + _MirrorBar.visible - 1,
+      coordinate: _coordinate,
       onSeek: (int index) => setState(() {
         _first = index.clamp(0, _MirrorBar.total - _MirrorBar.visible);
+        _coordinate.value = _coordinateFor(_first);
       }),
     );
   }

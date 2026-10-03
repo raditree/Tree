@@ -7,8 +7,19 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:tree/io/websocket_service.dart';
+import 'package:tree/ui/services/vt_screen.dart';
 import 'package:tree/ui/widgets/terminal_panel.dart';
 import 'package:tree_protocol/tree_protocol.dart';
+
+/// 屏上还有没有任何非空白字符（清屏断言用：看**真实屏幕状态**，不看画出来的像素）。
+bool screenHasText(TerminalPanelState state) {
+  for (final List<VtCell> line in state.debugScreen.lines) {
+    for (final VtCell cell in line) {
+      if (cell.text.trim().isNotEmpty) return true;
+    }
+  }
+  return false;
+}
 
 /// 假 WS：只把终端那条广播流交出来，并记录前端发出去的帧。
 ///
@@ -174,6 +185,68 @@ void main() {
 
     expect(tester.takeException(), isNull);
     expect(find.byType(CustomPaint), findsWidgets);
+  });
+
+  testWidgets('清屏键：本地立刻清掉屏幕与回滚历史，并把 Ctrl+L 送给 shell',
+      (WidgetTester tester) async {
+    await pumpPanel(tester);
+    final String id = openedId(tester);
+    final TerminalPanelState state = tester.state<TerminalPanelState>(
+      find.byType(TerminalPanel),
+    );
+
+    // 先灌出内容与回滚历史（80 行 ⇒ 整屏滚出去，历史里有一堆行）
+    await emit(tester, <String, dynamic>{
+      'type': TerminalOutboundType.output,
+      TerminalFrame.terminalId: id,
+      TerminalFrame.bytes: base64Encode(utf8.encode(
+        '${List<String>.generate(80, (int i) => 'line $i').join('\r\n')}\r\n',
+      )),
+    });
+    expect(screenHasText(state), isTrue, reason: '前提：屏上有字');
+    expect(state.debugScreen.historyLength, greaterThan(0),
+        reason: '前提：已经滚出了回滚历史');
+
+    await tester.tap(find.byIcon(Icons.cleaning_services_outlined));
+    await tester.pump();
+
+    expect(screenHasText(state), isFalse,
+        reason: '清屏要真的把屏幕清空——只把 0x0c 丢给 shell 的话，'
+            'cmd（本机默认 shell，没有 Ctrl+L 绑定）上按下去毫无反应');
+    expect(state.debugScreen.historyLength, 0, reason: '回滚历史一起清（ED3）');
+    expect(
+      ws.inputTexts(id).last,
+      '\x0c',
+      reason: 'Ctrl+L 仍然要送给 shell（bash / PSReadLine 会自己重画提示符）',
+    );
+  });
+
+  testWidgets('Ctrl+L 与工具条那颗清屏按钮同口径（本地清 + 送 0x0c）',
+      (WidgetTester tester) async {
+    await pumpPanel(tester);
+    final String id = openedId(tester);
+    final TerminalPanelState state = tester.state<TerminalPanelState>(
+      find.byType(TerminalPanel),
+    );
+    await emit(tester, <String, dynamic>{
+      'type': TerminalOutboundType.output,
+      TerminalFrame.terminalId: id,
+      TerminalFrame.bytes: base64Encode(utf8.encode('hello\r\nworld')),
+    });
+    expect(screenHasText(state), isTrue);
+
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyL);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+    await tester.pump();
+
+    expect(screenHasText(state), isFalse,
+        reason: 'Ctrl+L 也要本地清屏（工具提示写的就是这条）');
+    expect(
+      ws.inputTexts(id).last,
+      '\x0c',
+      reason: '并且照样把 Ctrl+L 送给 shell',
+    );
   });
 
   testWidgets('键盘：回车发 \\r、方向键发 CSI；可打印字符**只**走输入法通道',

@@ -208,9 +208,11 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 直接划到底部；懒加载，长会话仅加载末尾一段」）。它就是窗口的页大小。
   static const int _historyPageSize = 200;
 
-  /// 已加载的槽位离视口多远就淘汰（比窗口自己的外扩 margin 大一截：刚补回来的那一段
-  /// 不能被下一帧淘汰掉）。
-  static const int _cacheMargin = 400;
+  /// 已加载的槽位离视口多远就淘汰（"仅缓存坐标附近的历史，其余均丢弃"：用户 2026-10-03）。
+  ///
+  /// 为什么从 400 收到 200：口径就是"只留窗口附近"，而且**已加载条目越少，
+  /// "像素 ↔ 全局下标"的估算越准**（占位槽恒定 88px，已加载消息的真实高度才是误差来源）。
+  static const int _cacheMargin = 200;
 
   /// 正在补的下标段（防同一段被并发拉两次）。
   final Set<String> _loadingGaps = <String>{};
@@ -621,6 +623,7 @@ class _MessagePanelState extends State<MessagePanel> {
     _replayGuard.clear();
     _barrenGaps.clear();
     _loadingGaps.clear();
+    _pendingWindow = null;
     _visibleFrom = -1;
     _visibleTo = -1;
   }
@@ -674,6 +677,7 @@ class _MessagePanelState extends State<MessagePanel> {
       _loadingGaps.clear();
       _barrenGaps.clear();
       _locateKeep = null;
+      _pendingWindow = null;
       _visibleFrom = -1;
       _visibleTo = -1;
       // 这批是**已关闭的段**（核心"段关闭即落库"）：全部封口——重播的
@@ -730,57 +734,96 @@ class _MessagePanelState extends State<MessagePanel> {
     }
   }
 
-  /// 列表把**本帧构建到的下标区间**报过来：滑到哪加载哪 + 淘汰离得远的槽位。
+  /// 列表把**视口坐标**报过来（每帧都可能报，见 `MessageList.onWindowChanged`）。
+  ///
+  /// 这里只记下"最新坐标"，真正干活的是 [_pumpWindowWork]：**同一时刻只跑一趟**，
+  /// 滚动中反复触发只会不断覆盖待办。滚动丝滑靠两条：
+  /// ① 视口附近已经加载好时，补页在 `MessageWindow.gapsFor` 那一步就是空
+  ///    （零网络、零 setState）；
+  /// ② 一趟里的请求是**串行**的（`await`），不会堆出一串并发请求。
   void _onWindowChanged(int first, int last) {
     if (first < 0 || last < first) return;
     _visibleFrom = first;
     _visibleTo = last;
-    unawaited(_fillWindow(first, last));
-    _evictFarSlots();
+    _pendingWindow = (first: first, last: last);
+    unawaited(_pumpWindowWork());
+  }
+
+  /// 最新一次报上来的视口坐标（null = 没有待办）。
+  ({int first, int last})? _pendingWindow;
+
+  /// 有没有一趟正在跑。
+  bool _windowWorkRunning = false;
+
+  /// 一趟 = 按坐标补缺口 + 淘汰离得远的槽位；跑完再看有没有更新的坐标。
+  Future<void> _pumpWindowWork() async {
+    if (_windowWorkRunning) return;
+    _windowWorkRunning = true;
+    try {
+      while (mounted) {
+        final ({int first, int last})? work = _pendingWindow;
+        if (work == null) return;
+        _pendingWindow = null;
+        _visibleFrom = work.first;
+        _visibleTo = work.last;
+        await _fillWindow(work.first, work.last);
+        if (!mounted) return;
+        _evictFarSlots();
+      }
+    } finally {
+      _windowWorkRunning = false;
+    }
   }
 
   /// 把视口附近（[MessageWindow.gapsFor] 按 margin 外扩）缺的段补回来。
+  ///
+  /// **缺口在视口顶切开**（[splitGapAtViewportTop]）：横跨视口的缺口先补"视口及以下"
+  /// （不改变视口上方高度 ⇒ 正在看的内容不动），再补"整段在视口上方"那份
+  /// （走既有的 `padAboveStamp` 高度补偿）。否则视口上方由占位变实会长高，把用户
+  /// 正在读的那一段整体推下去（用户 2026-10-03：「中间页的懒加载好像没做好」）。
   Future<void> _fillWindow(int first, int last) async {
     final Agent? agent = widget.selectedAgent;
     if (agent == null) return;
     final String sessionId = _currentSessionId;
     for (final MessageRange gap in _window.gapsFor(first, last)) {
-      if (sessionId != _currentSessionId) return;
-      if (_barrenGaps.contains(gap.from)) continue;
-      final String key = '${gap.from}-${gap.to}';
-      if (!_loadingGaps.add(key)) continue;
-      try {
-        final HistoryPage page = await ApiService.getConversationHistoryPage(
-          agent.id,
-          sessionId: sessionId,
-          from: gap.from,
-          limit: _window.pageSizeFor(gap),
-        );
-        if (!mounted || sessionId != _currentSessionId) return;
-        final List<ChatMessage> messages = page.messages
-            .map(ChatMessage.fromJson)
-            .toList(growable: false);
-        setState(() {
-          _window.ensureTotal(page.total);
-          final int placed = _window.place(
-            offset: page.offset,
-            messages: messages,
+      for (final MessageRange request in splitGapAtViewportTop(gap, first)) {
+        if (sessionId != _currentSessionId) return;
+        if (_barrenGaps.contains(request.from)) continue;
+        final String key = '${request.from}-${request.to}';
+        if (!_loadingGaps.add(key)) continue;
+        try {
+          final HistoryPage page = await ApiService.getConversationHistoryPage(
+            agent.id,
+            sessionId: sessionId,
+            from: request.from,
+            limit: _window.pageSizeFor(request),
           );
-          // 视口**上方**补的页：占位槽换成真消息会改变上面的高度，让列表补一次
-          if (page.offset + messages.length <= first) _padAboveStamp++;
-          _replayGuard.sealAll(messages.map((ChatMessage m) => m.id));
-          // 这一段补不出东西（对齐有偏差 / 服务端说没有）：记一笔，别再空转
-          if (placed == 0) _barrenGaps.add(gap.from);
-          // 补页不是"整批重载"：别把 bottomJump 留在 true（否则用户正在读历史时
-          // 一次补页会把他拽回底部）
-          _bottomJump = false;
-          _scrollRevision++;
-        });
-        SubagentTranscript.instance.sync(_window.loadedList);
-      } catch (e) {
-        // 补页失败：占位槽留着，用户再滑一下会重试（不当成"这里没有"）
-      } finally {
-        _loadingGaps.remove(key);
+          if (!mounted || sessionId != _currentSessionId) return;
+          final List<ChatMessage> messages = page.messages
+              .map(ChatMessage.fromJson)
+              .toList(growable: false);
+          setState(() {
+            _window.ensureTotal(page.total);
+            final int placed = _window.place(
+              offset: page.offset,
+              messages: messages,
+            );
+            // 视口**上方**补的页：占位槽换成真消息会改变上面的高度，让列表补一次
+            if (page.offset + messages.length <= first) _padAboveStamp++;
+            _replayGuard.sealAll(messages.map((ChatMessage m) => m.id));
+            // 这一段补不出东西（对齐有偏差 / 服务端说没有）：记一笔，别再空转
+            if (placed == 0) _barrenGaps.add(request.from);
+            // 补页不是"整批重载"：别把 bottomJump 留在 true（否则用户正在读历史时
+            // 一次补页会把他拽回底部）
+            _bottomJump = false;
+            _scrollRevision++;
+          });
+          SubagentTranscript.instance.sync(_window.loadedList);
+        } catch (e) {
+          // 补页失败：占位槽留着，用户再滑一下会重试（不当成"这里没有"）
+        } finally {
+          _loadingGaps.remove(key);
+        }
       }
     }
   }

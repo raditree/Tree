@@ -144,15 +144,20 @@
     时**就不再派发文字**，两条路因此天然互斥、不会重复输入。这条连接**必须带本视图的 `viewId`**
     （`View.of(context).viewId`，与 `EditableText` 同口径）：缺了平台侧 `setClient` 直接报错、文字被静默丢掉
     ⇒ **中英文一个字都打不出来**（真机踩过）。Ctrl+J 例外（留给切换）。
-    **输入法通道的两条硬口径**（用户 2026-10-03：「中文输入下模拟终端出 bug」——截图里提示符后面是
-    `…>nninini1hn。hni。hani。h…`，拼音原文进了 shell）：① **只补差额**——平台送来的永远是
-    `TextInputModel` 的**整段文本**（`SendStateUpdate`），提交那一刻不发状态、随后 `ComposeEndHook` 发的是
-    "整段文本 + composing 无效"，所以必须自己记住"已经交给 PTY 的前缀"、只补新定下来的那一截；组字尾巴
-    （`composing` 覆盖的那段）一个字都不发，尾巴被引擎连在提交结果前一起送回来时也要剥掉；
-    ② **原样回显**——一个字都不改地 `setEditingState` 回去。旧实现为了"不回显"把模型截断成"只剩尾巴"、把选区
-    强制折到末尾、还重标组字区，而引擎的 `AddText` 在**选区折叠**时是"追加"而不是"替换组字区"
-    （`text_input_model.h` 原文）⇒ 提交退化成追加，残留拼音跟着结果一起被整段送回来、被我们当成已定字转发。
-    **改写平台侧模型 = 拼音漏进 shell**，这条线不要再碰。同一链路还要报一次**光标那一格在哪**
+    **输入法通道的两条硬口径**（用户 2026-10-03：「中文输入下模拟终端出 bug」；同一天又回归了一次
+    ——「模拟终端又出问题」，见 [docs/known-issues.md](../docs/known-issues.md) #20）：
+    ① **只补差额**——平台送来的永远是 `TextInputModel` 的**整段文本**（`SendStateUpdate`），提交那一刻不发状态、
+    随后 `ComposeEndHook` 发的是"整段文本 + composing 无效"，所以必须自己记住"已经交给 PTY 的前缀"、
+    只补新定下来的那一截；组字尾巴（`composing` 覆盖的那段）一个字都不发，尾巴被引擎连在提交结果前
+    一起送回来时也要剥掉；
+    ② **绝不回推 `setEditingState`**（唯一一次是 `attach` 时把模型清空）：回推会走引擎
+    `TextInputModel::SetText(text)` 的**默认参数**路径（`composing_range = TextRange(0)`，折叠 ⇒
+    `composing_ = false`），而紧接着的 `SetComposingRange` 开头就是 `if (!composing_) return false;`，
+    救不回来；组字态一没，`AddText`（只有 `composing_` 为真才"删掉组字文本再插入"）就从
+    **"替换组字区"退化成"追加"** ⇒ 拼音越堆越多，被"只补差额"当成新定字转发给 PTY，shell 里就是一串
+    拼音（真机截图 `E:\…>nninini…。hani。…`，且没有换行）。**这条线不要再碰**：
+    `test/terminal_ime_input_test.dart` 有一条用例专门钉住"组字期间 `TextInput.setEditingState` 出现 0 次"。
+    同一链路还要报一次**光标那一格在哪**
     （`setEditableSizeAndTransform` + `setMarkedTextRect`，Windows 用它们摆 IME 窗口）：不报的话候选窗会用
     **上一个可编辑控件**（被 Ctrl+J 顶掉的 composer）的陈旧矩形。
     **选中 / 复制粘贴**（用户 2026-10-03：「没法选中文字，没法复制粘贴」）：左键拖拽在格子上取选区
@@ -178,6 +183,11 @@
     **回滚缓冲**：主屏整屏滚动时被顶出去的行进历史（上限 2000 行；备用屏与滚动区域内部的滚动不进——
     xterm 口径），鼠标滚轮往上翻、**滚到底自动恢复跟随**，翻上去时工具条上出现「已回滚 N 行」胶囊（点它回到最新）；
     新输出不会把正在回看的视野拽走（视图钉在同一段内容上，靠 `historyPushed` 计数）。`ED3`（`CSI 3 J`）与 RIS 清空历史。
+    **清屏**（工具条那颗按钮与 `Ctrl+L`，用户 2026-10-03：「清屏键无效」）＝**本地立刻清**（往 [VtScreen](ui/services/vt_screen.dart)
+    喂标准序列 `ESC[2J` + `ESC[3J` + `ESC[H`：清屏 + 清历史 + 游标归位，并复位回滚视图）
+    **＋ 仍然把 `Ctrl+L`(`0x0c`) 送给 shell**：只发 `0x0c` 是"交给 shell 办"，而 shell 未必有这个绑定——
+    本机默认 shell 是 `cmd.exe`（没有 `Ctrl+L`）⇒ 按下去什么都不发生。反过来 bash / PSReadLine 拿到 `0x0c`
+    会自己重画提示符，两者叠加不冲突（先空屏、各自再画）。
     **`#TSend`：在终端里直接给当前会话发消息**（[ui/services/terminal_send_command.dart](ui/services/terminal_send_command.dart)）——
     `#TSend "一段话"`、`#TSend @<文件路径>`，也能混写（`#TSend "看这个" @C:\x\a.md`；路径带空格写 `@"C:\a b.md"`）；
     它走 composer 的**同一个发送口**（附件上传 / 上屏 / WS 帧完全一致），因此终端里发的和手打的等价。
@@ -317,10 +327,19 @@
     ① 整份会话流是一张**槽位表**（下标 0 = 最旧那条），元素为 `null` 表示这一段还没取回来——列表里画成**等高占位槽**
     （[MessageWindow](ui/services/message_window.dart) 只做放置 / 去重 / 淘汰，纯 Dart 可单测）；表长**只随新消息增长**
     （加载、淘汰都不改变它）= 滑块不乱跳的根基；
-    ② 列表把**本帧构建到的下标区间**帧后报给面板，面板按 `GET /api/conversations/{id}?from=<下标>&limit=N` 只补那一段
-    （核心回 `offset` = 这一页第一条的全局下标，见 [server/README.md](../packages/tree_core/lib/src/server/README.md) 不变量 14），
-    并淘汰离视口超过 400 条的槽位——**正在流式 / 正在跑工具的消息永不被淘汰**，末尾 200 条常驻；补页失败只留着占位槽，
-    下次滑动再试；补不出东西来的段记一笔不再空转（防死循环）；
+    ② 列表把**视口坐标**（[MessageWindowCoordinate](ui/services/message_window.dart)：本帧构建到的下标区间 + 全局条数）
+    **每帧**刷给面板与滑块——刷新由**滚动通知**与 itemBuilder 两侧驱动，因为**滚动不重建父组件**（早先只在
+    `build` 里注册一次帧后回调 ⇒ 滚动期间一次都不上报，拇指死在原地；用户 2026-10-03「页面上滚，拇指不动」）；
+    权威区间取自渲染树里 SliverList **这一趟真的布局过**的子项（`childScrollOffset != null`，
+    被 `AutomaticKeepAlive` 留在树里的屏外子项不算），itemBuilder 收集的区间只作兜底；
+    面板按 `GET /api/conversations/{id}?from=<下标>&limit=N` 只补那一段
+    （核心回 `offset` = 这一页第一条的全局下标，见 [server/README.md](../packages/tree_core/lib/src/server/README.md) 不变量 14）——
+    **缺口在视口顶切开**（`splitGapAtViewportTop`：先补"视口及以下"，再补"整段在视口上方"那份）：
+    横跨视口的缺口若整段补下来，视口上方由占位变实会长高、把用户正在读的一段整体推下去；
+    补页 + 淘汰**同一时刻只跑一趟**（反复触发只覆盖"最新坐标"，一趟内的请求串行），视口附近已加载好时
+    第一道 `gapsFor` 就是空 ⇒ 滚动零网络、零 `setState`；淘汰离视口超过 **200** 条的槽位
+    （"仅缓存坐标附近的历史，其余均丢弃"）——**正在流式 / 正在跑工具的消息永不被淘汰**，末尾 200 条常驻；
+    补页失败只留着占位槽，下次滑动再试；补不出东西来的段记一笔不再空转（防死循环）；
     ③ 右侧滑块**按全局下标算几何**（第一条的下标 / 全局条数，长度 = 看得见的条数 / 全局条数、有抓得住的下限），
     拖它 = 跳到该下标并补那一段（原生 `Scrollbar` 跟随"已构建内容的估算范围"，窗口化列表里必然乱跳，故自绘）；
     **必须显式关掉原生那条**（`ScrollConfiguration(behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false))`，
@@ -328,8 +347,14 @@
     自动包一条原生 `Scrollbar`，不关就与自绘那条叠在同一条 14px 窄带里：一条稳、一条跳（用户 2026-10-03
     「主对话框的滑块乱跳」就是它；只关滚动条，物理/越界指示/拖拽设备保留，其它面板依赖原生滑块故不做全局改造）；
     拖拽另有两处硬口径：**按位置反解下标必须是绘制几何的严格逆**（`messageScrollbarIndexAt`；两边各算一套会差
-    `total/(total-visible)` 倍）、**拖拽期间几何输入与拇指位置都钉住**（指针为准、松手再对齐真实下标）——
+    `total/(total-visible)` 倍）、**拖拽期间几何输入与拇指位置都钉住**（指针为准、松手再对齐真实坐标）——
     少了任一条，拇指都会被自己报出去的下标甩到指针前面（长会话约 1%，`total=100` 的短会话可达 33%）；
+    **拇指直接监听坐标**（`ValueListenableBuilder`）：滚动只重绘拇指、不重建列表（"鼠标滚动丝滑"）；
+    落点按**坐标**算（`pixelOffsetForIndex`：以视口第一条为锚点、占位区 88px/条）而不是"下标 × 占位高度"
+    （已加载消息的真实高度各不相同，从 0 开始算会把误差一路累积），松手/点击后再用实测落点
+    **反馈校正 ≤3 次**（`MessageSeekCorrection`，两点割线反推这一带的真实步长；用户一动就放弃，绝不与用户抢）——
+    没有这一步，拇指停在指针那儿、内容却停在别处，松手后拇指只好"回落"
+    （用户 2026-10-03：「松开后拇指回落到底部或顶部，但中间页面不会随其回落」）；
     滑块能指到的最靠后下标是 `total - 看得见的条数`（"最后一条正好落在视口底" = 贴底），拖到最底下时列表**直达底部**；
     ④ **「回到底部」= 重载末尾一段**（`resetTail`：窗口换成"末尾页 + 比它新的实时尾巴"）＋直达底部——不再在几千条
     估算高度里做一次滚动动画（那正是"划不到底"的来源）；实时追加落在末尾，末尾那段常驻所以流式不受影响；
@@ -345,7 +370,8 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 ```
 
 钉子用例：`test/message_replay_guard_test.dart`、`test/session_rename_test.dart`、`test/plugin_panel_admin_test.dart`、
-`test/main_page_sidebar_width_test.dart`、`test/message_list_scroll_test.dart`、`test/tray_service_test.dart`（关闭决策与设置默认值）、
+`test/main_page_sidebar_width_test.dart`、`test/message_list_scroll_test.dart`、`test/message_window_coordinate_test.dart`
+（窗口坐标 / 落点 / 反馈校正 / 缺口切分四条纯函数）、`test/message_scrollbar_test.dart`、`test/tray_service_test.dart`（关闭决策与设置默认值）、
 `test/close_to_tray_dialog_test.dart`（首次关闭说明框的返回值）、`test/single_instance_test.dart`（锁键/端口纯函数、
 第二个实例被识别并唤起窗口、外人占端口不拦人）、`test/agent_delete_flow_test.dart`（删除闸门的 UI 接线：结构化 409、
 级联重试、只删 TOP 才回落插件作用域）、`test/message_input_test.dart`（输入框：多文件粘贴、草稿按 team+session、

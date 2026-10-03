@@ -1117,3 +1117,147 @@ reparse point 就是遍历不了；**预置的**（由受信任上下文造的�
 （避免顺手改坏既有配置），若也要对齐，按同一处 builder 接上即可。
 
 
+
+## #19 中栏：右侧拇指不上滑跟手 / 拖到中段落点很怪且那一段不渲染 / 松手拇指"回落"
+
+**现象**（用户 2026-10-03，push 新 Tree 之后）：① 页面上滚，右侧拇指不动；② 可以拖动拇指上滑，但很怪，
+且有些部分不渲染；③ 拖动松手后拇指回落到底部或顶部，中间页面却不跟着回落。
+
+**根因（三条同源，已用探针实测坐实，脚本在 `.self/probe/`）**：
+
+1. **窗口区间只在"父组件重建"时才上报**。`_MessageListViewState` 只在 `build` 里注册一次帧后回调
+   （`_flushWindow`），而**滚动不重建父组件**（`ListView` 的懒构建只重建子项）⇒ 滚动期间**一次都不上报**：
+
+   ```
+   P2 阅读模式下滚到中段 pixels=219512 reports=[[2496,4999],[2496,2508]]   ← 只有重建那一下补了一次
+   P2 滚轮/拖拽 120px：pixels 219512 → 219632，reports=[]                    ← 滚动期间零上报
+   ```
+
+   拇指的几何输入就是这个上报值 ⇒ 症状①（不动）与症状③（松手交回"旧坐标"⇒ 弹回旧位置，而内容其实已经动了）。
+   附带缺陷：`_builtFirst/_builtLast` 只在 `build` 里重置，两次重建之间是**并集**（上例报了 [2496,4999]，
+   真值 [2496,2508]）⇒ 面板会去补一片根本不在视口附近的段。
+2. **落点是"下标 × 占位槽高度(88)"**，而已加载消息的真实高度各不相同（实测 user 单行 ≈ 68px、长回答几百 px），
+   从 0 开始算误差会一路累积 ⇒ 拖到哪都不太准；且拖拽期间同样不上报（同根因 1）⇒ 拖过去的那一段
+   **永远停在占位槽**（"有些部分未渲染"）。
+3. **缺口横跨视口时不做高度补偿**：补页把占位槽换成真消息会改变高度；面板只在"整页都在视口上方"时
+   `padAboveStamp++`，而视口本身就在缺口里是常态 ⇒ 视口上方长高把用户正在读的一段整体推下去。
+
+**探针给出的关键事实**（`sliver_seek_probe_test.dart`）：`jumpTo` 的像素落点由我们算的值直接决定
+（sliver 不校正），但 `maxScrollExtent` 是估算值（实测同一次会话内 437424 / 439424 / 435424 来回变）；
+占位区里 `pixels / 88` **就是**全局下标（实测 2495.8 vs 上报的 first=2496）。
+
+**修复**（断言见 [lib/README.md](../lib/README.md) 不变量 19②③）：
+
+- **窗口坐标变成一等公民**（`MessageWindowCoordinate`）：每帧刷新，由**滚动通知**与 itemBuilder 两侧驱动；
+  权威区间取自渲染树里 SliverList **这一趟真的布局过**的子项（`childScrollOffset != null`——被
+  `AutomaticKeepAlive` 留在树里的屏外子项不算，itemBuilder 收集的区间只作兜底）。
+- **拇指直接监听坐标**（`ValueListenableBuilder`）：滚动只重绘拇指、不重建列表（丝滑）。
+- **落点按坐标算**（`pixelOffsetForIndex`：以视口第一条为锚点、占位区 88px/条）+ 松手/点击后
+  **反馈校正 ≤3 次**（`MessageSeekCorrection`：两点割线反推真实步长；用户一动就放弃）。
+- **缺口在视口顶切开**（`splitGapAtViewportTop`）：先补"视口及以下"（不改变视口上方高度），
+  再补"整段在视口上方"那份（走既有高度补偿）。
+- **补页 + 淘汰同一时刻只跑一趟**（反复触发只覆盖"最新坐标"，一趟内请求串行；视口附近已加载好时
+  第一道 `gapsFor` 就是空 ⇒ 滚动零网络、零 `setState`）；淘汰口径 400 → **200**（"仅缓存坐标附近"）。
+- 顺带：`_itemKeys` 超过 2000 条时按"还在槽位表里"清一次（长会话里它只增不减）。
+
+**验证**：`test/message_window_coordinate_test.dart`（14 条纯函数：坐标 / 落点 / 校正 / 切分）、
+`test/message_list_scroll_test.dart` 新增 3 条（**在旧代码上全部红过**：滚动不上报、松手不回跳、点哪到哪）、
+`test/message_scrollbar_test.dart` 跟着改成"坐标输入"。
+
+**状态**：已修复（2026-10-03）。
+
+**遗留（如实记录）**：① 补页把**视口内**的占位槽换成真消息时，那一段自身的高度会变（视口顶锚得住，
+顶以下的内容仍会往下让一点）——占位高度本来就不是真高度，这一条改不掉，要彻底解决得给占位槽
+一个"按已见消息平均高度"的估计值（未做，属于另一处取舍）；② 面板的补页流程没有端到端用例
+（需要假核心 HTTP），本次只验证到"坐标上报 / 切分逻辑 / 列表侧补偿"三层，真机核对清单见
+`docs/development.md` 的手工核对项。
+
+## #20 终端：拼音原文又漏进 shell（我们自己的 `setEditingState` 回推打掉了引擎的组字态）
+
+**现象**（用户 2026-10-03：「模拟终端又出问题」，与 #15 同一症状）。截图（`.input/20261003/`）用
+Windows 自带 OCR（`Windows.Media.Ocr`，无第三方依赖）读出：
+
+```
+E:\programs\Tree\desktop>nninininfizZfit09i。hani。ha。hni。hinil
+3 呢  4 拟  5 倪  6 妮  7 泥  8 腻  9 谫
+```
+
+= 拼音原文进了 shell，且**没有换行**（正说明它不是"回车执行的命令"，而是被当成**定字**发出去的文本）。
+
+**先排除"旧构建"**：`D:\app\Tree Desktop\Tree.exe` 是 10-02 的，但 Flutter Windows 的 Dart 代码在
+`data/app.so` —— 它是 **10-03 13:57** 的，晚于 #15 的修复提交（13:12）⇒ 跑的就是含修复的构建，
+**这是真回归**。
+
+**根因（同版本引擎源码坐实）**：引擎版本 `af7e796e…`（`bin/internal/engine.version`），取同版本源码
+（`engine/src/flutter/shell/platform/{common/text_input_model.{h,cc}, windows/text_input_plugin.cc}`，
+落地在 `.self/probe/engine/`）：
+
+```cc
+// text_input_plugin.cc（kSetEditingStateMethod 分支）
+active_model_->SetText(text->value.GetString());   // ← 只传 text，其余走默认参数
+...
+active_model_->SetComposingRange(TextRange(composing_base, composing_extent), cursor_offset);
+
+// text_input_model.h
+bool SetText(const std::string& text,
+             const TextRange& selection = TextRange(0),
+             const TextRange& composing_range = TextRange(0));   // ← 默认：折叠在 0
+// text_input_model.cc
+bool TextInputModel::SetText(...) {
+  ...
+  composing_range_ = composing_range;
+  composing_ = !composing_range.collapsed();     // ← 折叠 ⇒ composing_ = false
+}
+bool TextInputModel::SetComposingRange(const TextRange& range, size_t cursor_offset) {
+  if (!composing_) return false;                 // ← 组字态已没，救不回来
+  ...
+}
+void TextInputModel::AddText(const std::u16string& text) {
+  DeleteSelected();
+  if (composing_) { text_.erase(composing_range_.start(), composing_range_.length()); ... }
+  text_.insert(...);                             // ← composing_ 为假 = **追加**
+}
+```
+
+#15 的修复把输入法通道改成了"**原样回显**"（每次 `updateEditingValue` 都 `setEditingState(value)`）。
+而 `setEditingState` 走的是上面那条**默认参数**路径 ⇒ 每一次状态回流都把引擎的 `composing_` 打成 `false`，
+随后的 `SetComposingRange` 因 `!composing_` 直接返回 false ⇒ **组字态被抹掉**。于是 IME 下一轮的
+`AddText`/`UpdateComposingText` 从"替换组字区"**退化成"追加"**：拼音不断堆在模型里、每一轮"."又把"。"追加进去；
+我们的"只补差额"（`_forwarded`）把多出来的部分当**新定字**转发给 PTY ⇒ 截图那一串（连 `ComposeCommitHook`
+里的 `CommitComposing()` 也因组字区已被重置为折叠而成了 no-op）。
+
+**修复**：输入法通道**绝不回推**（唯一一次是 `attach()` 时发一次空状态把模型清干净）；
+"只补差额"与"残留组字前缀剥除"保留。断言见 [lib/README.md](../lib/README.md) 不变量 14。
+
+**验证**：`test/terminal_ime_input_test.dart` 新增「组字期间**不许**回推 `setEditingState`」
+（用 mock platform messenger 数 `TextInput.setEditingState` 的出现次数；**旧代码上必红**：Expected 0 / Actual 1）
+与「attach 只发一次"清空"」；原有 15 条时序用例继续绿。
+
+**状态**：已修复（2026-10-03）。
+
+**遗留（如实记录）**：这条的最终确认要真机跑一次中文输入（本地无自动化手段驱动真 IME）：
+在终端里打拼音 → 选字 → 按回车，shell 里应只出现选中的字。若仍有残留，下一步是在 `updateEditingValue`
+里加一条**可开关的诊断流水**（记录 text/composing/forwarded/preedit），拿真机序列再定位。
+
+## #21 终端：清屏键无效（只把 `Ctrl+L` 发给 shell，而 cmd 没有这个绑定）
+
+**现象**（用户 2026-10-03：「清屏键无效」，与 #20 同一条消息里报的）。
+
+**根因**：工具条那颗「清屏（Ctrl+L）」只做 `_sendInput(<int>[0x0c])`——把 `Ctrl+L` 送给 shell 就完事了。
+但那是"交给 shell 办"的路子，而 **shell 未必有这个绑定**：本机默认 shell 是 `cmd.exe`
+（#15/#16 的截图里提示符就是 `E:\programs\Tree\desktop>`），cmd 没有 Ctrl+L ⇒ 按下去什么都不发生。
+（顺带：终端自己的 `VtScreen` 完全有能力清屏——`ED2`/`ED3` 都实现了，回滚历史上限 2000 行。）
+
+**修复**：`_clearScreen()` = **本地立刻清**（往 `VtScreen` 喂标准序列 `ESC[2J` + `ESC[3J` + `ESC[H`：
+清屏 + 清历史 + 游标归位，并复位回滚视图与选区）**＋ 仍然把 `0x0c` 送给 shell**
+（bash / PSReadLine 会自己重画提示符，两者叠加不冲突）。工具条按钮与 `Ctrl+L` 走同一条路。
+断言见 [lib/README.md](../lib/README.md) 不变量 14。
+
+**验证**：`test/terminal_panel_test.dart` 新增 2 条（按钮 / Ctrl+L 各一条：屏上不许再有非空白字符、
+`historyLength == 0`、且 `0x0c` 确实发出去了）——把 `_clearScreen` 临时退回"只发 0x0c"时**两条都红**
+（Expected false / Actual true）。
+
+**状态**：已修复（2026-10-03）。
+
+**遗留**：cmd 这类"自己不重画提示符"的 shell 上，清屏后提示符要等下一次输出才回来（本地清屏是确定的，
+提示符是否立刻回来取决于 shell 自己）——如实记录，不做"替 shell 补画提示符"这种越界的事。

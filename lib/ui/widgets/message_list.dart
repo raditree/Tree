@@ -1,10 +1,12 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
 import '../models/message.dart';
+import '../services/message_window.dart';
 import 'hook_notice_card.dart';
 import 'message_scrollbar.dart';
 import 'thinking_card.dart';
@@ -268,13 +270,33 @@ class _MessageListViewState extends State<_MessageListView> {
 
   /// **本帧构建到的下标区间**（-1 = 本帧还没构建任何槽位）。
   ///
-  /// 面板的"滑到哪加载哪"与"限制缓存长度"都以此为视口口径（见 [MessageList.onWindowChanged]）。
+  /// 只是**兜底**口径：权威口径是渲染树里 SliverList 实际持有的子项区间
+  /// （见 [_builtRangeFromRenderTree]）——滚动时只有"新进视口的"子项会被重建，
+  /// itemBuilder 收集不到整段可见区间。
   int _builtFirst = -1;
   int _builtLast = -1;
 
-  /// 上一次报给面板（同时也是滑块几何的输入）的下标区间。
-  int _reportedFirst = -1;
-  int _reportedLast = -1;
+  /// 视口在整份历史里的坐标（帧后刷新）。
+  ///
+  /// **拇指直接监听它**：滚动时只重绘拇指，不重建列表（"鼠标滚动丝滑"的关键）；
+  /// 面板的补页 / 淘汰也以它为准（见 [MessageList.onWindowChanged]）。
+  final ValueNotifier<MessageWindowCoordinate> _coordinate =
+      ValueNotifier<MessageWindowCoordinate>(MessageWindowCoordinate.unknown);
+
+  /// 这一帧已经安排过帧后刷新（同帧去重）。
+  bool _flushScheduled = false;
+
+  /// 正在做"我们自己发起的跳转"（滚动通知里据此区分用户滚动，见 [_handleScrollNotification]）。
+  bool _programmaticJump = false;
+
+  /// 正在做的落点校正（null = 没有）。用户一动就丢掉，绝不和用户抢。
+  MessageSeekCorrection? _seekCorrection;
+
+  /// 列表自己的 key：从渲染树读"权威构建区间"要用它（见 [_builtRangeFromRenderTree]）。
+  final GlobalKey _listKey = GlobalKey(debugLabel: 'message-list');
+
+  /// `_itemKeys` 的上限：超了就按"还在槽位表里"清一次（长会话里它只增不减会漏）。
+  static const int _itemKeysLimit = 2000;
 
   /// 直达底部的"收尾"帧数上限（见 [_jumpToBottomSettling]）。
   static const int _pinSettleLimit = 120;
@@ -308,9 +330,9 @@ class _MessageListViewState extends State<_MessageListView> {
       _controller.shiftAbove = true;
     }
     if (oldWidget.revision != widget.revision) {
-      // 槽位表变了：强制再报一次窗口（面板可能还要补页 / 淘汰）
-      _reportedFirst = -1;
-      _reportedLast = -1;
+      // 槽位表变了：刷新一次视口坐标（面板可能还要按它补页 / 淘汰）
+      _scheduleCoordinateFlush();
+      _pruneItemKeys();
       if (widget.bottomJump) {
         // 重载（切会话 / 切 agent / 回到底部 / 清空重拉）：恢复跟随并直达底部
         _jumpToBottomSettling();
@@ -386,16 +408,106 @@ class _MessageListViewState extends State<_MessageListView> {
     });
   }
 
-  /// 帧后把**本帧构建到的下标区间**报给面板（补页 / 淘汰的视口口径），
-  /// 同时刷新右侧滑块的几何。
-  void _flushWindow() {
-    if (!mounted || _builtFirst < 0) return;
-    if (_builtFirst == _reportedFirst && _builtLast == _reportedLast) return;
-    setState(() {
-      _reportedFirst = _builtFirst;
-      _reportedLast = _builtLast;
+  /// 帧后把**视口坐标**算出来（[MessageWindowCoordinate]）并通知出去。
+  ///
+  /// 为什么要"帧后 + 每帧"：视口区间是靠**布局**才定下来的（渲染树里的子项区间），
+  /// 而**滚动不重建父组件**——早先只在 `build` 里注册一次帧后回调，于是滚动时一次都
+  /// 不上报，右侧拇指就死在原地（用户 2026-10-03：「页面上滚，拇指不动」）。
+  void _scheduleCoordinateFlush() {
+    if (_flushScheduled) return;
+    _flushScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _flushScheduled = false;
+      _flushCoordinate();
     });
-    widget.onWindowChanged?.call(_builtFirst, _builtLast);
+  }
+
+  void _flushCoordinate() {
+    if (!mounted) return;
+    final MessageRange? authoritative = _builtRangeFromRenderTree();
+    final int first;
+    final int last;
+    if (authoritative != null) {
+      first = authoritative.from;
+      last = authoritative.to - 1;
+    } else {
+      // 兜底：itemBuilder 收集到的并集（比真值宽，但至少会更新，不会静默冻住）
+      first = _builtFirst;
+      last = _builtLast;
+    }
+    _builtFirst = -1;
+    _builtLast = -1;
+    if (first < 0 || last < first) return;
+    final MessageWindowCoordinate next = MessageWindowCoordinate(
+      first: first,
+      last: last.clamp(first, widget.slots.length - 1),
+      total: widget.slots.length,
+    );
+    if (next == _coordinate.value) return;
+    _coordinate.value = next;
+    // 面板据它补页 / 淘汰（"滑到哪加载哪、只缓存坐标附近"）
+    widget.onWindowChanged?.call(next.first, next.last);
+    // 有落点校正在进行：拿这次实测的落点反馈下一步（见 [_pumpSeekCorrection]）
+    _pumpSeekCorrection();
+  }
+
+  /// 从渲染树读**权威**的"构建到哪"：SliverList 实际持有的子项区间。
+  ///
+  /// 为什么不靠 itemBuilder 收集：滚动时 SliverList 只**创建**新进视口的子项，
+  /// 留在原地的那些不会重建 ⇒ 收集到的区间是残缺的（早先的实现在滚动期间干脆
+  /// 一次都不上报）。渲染树里的 `SliverMultiBoxAdaptorParentData.index` 才是真值。
+  ///
+  /// 找不到（结构变了 / 还没布局）时返回 null，调用方退回兜底口径。
+  MessageRange? _builtRangeFromRenderTree() {
+    final BuildContext? context = _listKey.currentContext;
+    if (context == null) return null;
+    final RenderObject? root = context.findRenderObject();
+    if (root == null) return null;
+    // 注意：ListView 的 renderObject **不是** Viewport（外面还裹着 Scrollable 的
+    // Listener/Semantics/IgnorePointer…），所以在子树里找 `RenderSliverList`。
+    RenderSliverList? list;
+    void find(RenderObject node) {
+      if (list != null) return;
+      if (node is RenderSliverList) {
+        list = node;
+        return;
+      }
+      node.visitChildren(find);
+    }
+
+    if (root is RenderSliverList) {
+      list = root;
+    } else {
+      root.visitChildren(find);
+    }
+    final RenderSliverList? target = list;
+    if (target == null) return null;
+    int? first;
+    int? last;
+    RenderBox? item = target.firstChild;
+    while (item != null) {
+      // **只认这一趟真的被布局过的子项**：`layoutOffset == null` 的是被
+      // `AutomaticKeepAlive` 留在树里的屏外子项（滚动过的历史），它们不是"视口里看得到的"。
+      if (target.childScrollOffset(item) != null) {
+        final ParentData? data = item.parentData;
+        if (data is SliverMultiBoxAdaptorParentData) {
+          final int? index = data.index;
+          if (index != null) {
+            first ??= index;
+            last = index;
+          }
+        }
+      }
+      item = target.childAfter(item);
+    }
+    if (first == null || last == null) return null;
+    final int slotCount = widget.slots.length;
+    if (slotCount <= 0) return null;
+    // 末尾的插件内联卡片也在这张表里：夹进槽位范围
+    return MessageRange(
+      first.clamp(0, slotCount - 1),
+      (last + 1).clamp(1, slotCount),
+    );
   }
 
   /// 滚动定位到指定消息并短暂高亮。
@@ -448,7 +560,17 @@ class _MessageListViewState extends State<_MessageListView> {
 
   /// 滚动通知：在「跟随 / 阅读」两种模式间切换（完全贴底 → 跟随）。
   bool _onScrollNotification(ScrollNotification notification) {
+    if (notification is ScrollMetricsNotification) {
+      // 内容尺寸变了（补页 / 流式增长）：视口区间可能跟着变，刷新一次坐标
+      _scheduleCoordinateFlush();
+      return false;
+    }
     if (notification is! ScrollUpdateNotification) return false;
+    // **滚动也要刷坐标**：滚动不重建父组件，只有这条路上能拿到新的视口区间
+    // （用户 2026-10-03：「页面上滚，拇指不动」就是漏了这一步）。
+    _scheduleCoordinateFlush();
+    // 用户自己滚了 ⇒ 正在做的落点校正作废（不跟用户抢）
+    if (!_programmaticJump) _cancelSeekCorrection();
     // 回底动画 / 程序化直达底部的中间帧不算用户上滚
     if (_returningToBottom) return false;
     if (_jumpingToBottom) return false;
@@ -484,28 +606,94 @@ class _MessageListViewState extends State<_MessageListView> {
     });
   }
 
-  /// 拖到某个全局下标（右侧滑块）：先按"占位槽高度 × 下标"落到大致位置，
-  /// 帧后报窗口时面板会补那一段；落点准不准只影响滑动的手感，不影响正确性。
+  /// 拖到某个全局下标（右侧滑块）：按**坐标**算落点，帧后按实测落点校正。
+  ///
+  /// 落点为什么不能只算一次：`pixels ↔ 全局下标` 只是估算——占位槽恒定 88px
+  /// （[kMessagePlaceholderExtent]），已加载消息的真实高度各不相同。所以：
+  /// 先按 [pixelOffsetForIndex]（以视口第一条为锚点）跳过去，再由
+  /// [MessageSeekCorrection] 用"实际落在哪"反馈修正（拖拽期间只粗跟，
+  /// 松手时 [onSeekSettled] 收口，见 [_beginSeekCorrection]）。
   ///
   /// **下标的上限是"最后一条正好落在视口底"**（`total - 看得见的条数`）——滑块几何就是这么
   /// 定的（见 [messageScrollbarThumb]：看到末尾 = 贴底）。所以拖到最底下时必须**直达底部**，
   /// 否则会停在"最新那几条还差一屏"的地方。
   void _seekToIndex(int index) {
     if (!_controller.hasClients) return;
+    // 新的落点请求作废上一次校正：别让两次校正互相甩
+    _cancelSeekCorrection();
     final ScrollPosition pos = _controller.position;
-    final int total = widget.slots.length;
-    final int visible =
-        _reportedLast < _reportedFirst ? 1 : _reportedLast - _reportedFirst + 1;
-    final int lastFirst = (total - visible).clamp(0, total - 1);
-    if (index >= lastFirst) {
-      _controller.jumpTo(pos.maxScrollExtent);
+    final MessageWindowCoordinate at = _coordinate.value;
+    if (at.total > 0 && index >= at.lastSeekable) {
+      _jumpTo(pos.maxScrollExtent);
       return;
     }
-    final double target = (index * kMessagePlaceholderExtent).clamp(
-      pos.minScrollExtent,
-      pos.maxScrollExtent,
+    _jumpTo(
+      pixelOffsetForIndex(
+        index: index,
+        at: at,
+        anchorPixels: pos.pixels,
+        step: kMessagePlaceholderExtent,
+      ).clamp(pos.minScrollExtent, pos.maxScrollExtent),
     );
-    _controller.jumpTo(target);
+  }
+
+  /// 我们自己发起的跳转：置标记，让滚动通知别把它当成"用户上滚"，也用来作废校正。
+  void _jumpTo(double pixels) {
+    if (!_controller.hasClients) return;
+    _programmaticJump = true;
+    _controller.jumpTo(pixels);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _programmaticJump = false);
+  }
+
+  /// 松手/点击之后：把落点校正到目标下标（≤[MessageSeekCorrection.maxAttempts] 次）。
+  ///
+  /// 用户的直觉是"拖到哪就停在哪"：拇指松手后画的是**真实坐标**，所以内容必须真的
+  /// 落到那个下标附近——否则拇指会"回落"到内容真正所在的地方（用户 2026-10-03 报的
+  /// 第 3 条：「松开后拇指回落到底部或顶部，但中间页面不会随其回落」）。
+  void _beginSeekCorrection(int index) {
+    if (!_controller.hasClients) return;
+    if (!_coordinate.value.known) return;
+    _seekCorrection = MessageSeekCorrection(
+      target: index,
+      step: kMessagePlaceholderExtent,
+    );
+    _pumpSeekCorrection();
+  }
+
+  /// 用**实测落点**推进校正：拿当前坐标（帧后刷新）当反馈，决定要不要再跳一次。
+  void _pumpSeekCorrection() {
+    final MessageSeekCorrection? correction = _seekCorrection;
+    if (correction == null) return;
+    if (correction.finished || !mounted || !_controller.hasClients) {
+      _cancelSeekCorrection();
+      return;
+    }
+    final MessageWindowCoordinate at = _coordinate.value;
+    if (!at.known) return; // 还没量出来：等下一次坐标刷新
+    final ScrollPosition pos = _controller.position;
+    final double? next = correction.observe(
+      landed: at.first,
+      pixels: pos.pixels,
+    );
+    if (next == null) {
+      _cancelSeekCorrection();
+      return;
+    }
+    _jumpTo(next.clamp(pos.minScrollExtent, pos.maxScrollExtent));
+  }
+
+  void _cancelSeekCorrection() => _seekCorrection = null;
+
+  /// 清掉已经不在槽位表里的 GlobalKey（只增不减的话，长会话里是一份隐性内存）。
+  ///
+  /// 阈值触发 + 整表扫一次：平时的开销是零，扫的时候是一次 O(条数)（稀有事件）。
+  void _pruneItemKeys() {
+    if (_itemKeys.length <= _itemKeysLimit) return;
+    final Set<String> alive = <String>{
+      for (final ChatMessage? m in widget.slots)
+        if (m != null) m.id,
+    };
+    _itemKeys.removeWhere((String id, GlobalKey _) => !alive.contains(id));
   }
 
   /// 占位槽：**还没加载**的那一段（等高，见 [kMessagePlaceholderExtent]）。
@@ -540,6 +728,8 @@ class _MessageListViewState extends State<_MessageListView> {
     }
     if (_builtFirst < 0 || index < _builtFirst) _builtFirst = index;
     if (index > _builtLast) _builtLast = index;
+    // 本帧有子项被构建 ⇒ 帧后刷新一次视口坐标（滚动时只有"新进视口"的子项会走到这里）
+    _scheduleCoordinateFlush();
     final ChatMessage? message = widget.slots[index];
     if (message == null) return _buildPlaceholder(context);
     // 不进主消息流的那种（临时员工的消息）：零高度 —— 不占版面、也不打断下标连续性
@@ -616,6 +806,7 @@ class _MessageListViewState extends State<_MessageListView> {
   @override
   void dispose() {
     _highlightTimer?.cancel();
+    _coordinate.dispose();
     _controller.dispose();
     super.dispose();
   }
@@ -642,10 +833,9 @@ class _MessageListViewState extends State<_MessageListView> {
         ),
       );
     }
-    // 本帧构建到哪（见 _flushWindow）：每帧重置，itemBuilder 里重新量
-    _builtFirst = -1;
-    _builtLast = -1;
-    WidgetsBinding.instance.addPostFrameCallback((_) => _flushWindow());
+    // 本帧构建到哪由 _buildItem 收集（只是兜底）+ 渲染树读取（权威），见 [_flushCoordinate]。
+    // 首帧也要安排一次：否则空表 / 全占位时坐标一直是 unknown（拇指不画）。
+    _scheduleCoordinateFlush();
     return Stack(
       children: <Widget>[
         // 滚动通知：切换跟随/阅读模式（见 _onScrollNotification）
@@ -661,6 +851,7 @@ class _MessageListViewState extends State<_MessageListView> {
           child: ScrollConfiguration(
             behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
             child: ListView.builder(
+              key: _listKey,
               controller: _controller,
               // 常规（非反转）布局：offset 0 = 顶部（最旧），maxScrollExtent = 底部。
               // 跟随模式下由 _BottomAnchorScrollPosition 在布局阶段同步钉底；
@@ -685,10 +876,9 @@ class _MessageListViewState extends State<_MessageListView> {
           bottom: 0,
           width: 14,
           child: MessageScrollbar(
-            total: slotCount,
-            firstVisible: _reportedFirst,
-            lastVisible: _reportedLast,
+            coordinate: _coordinate,
             onSeek: _seekToIndex,
+            onSeekSettled: _beginSeekCorrection,
           ),
         ),
         // 「回到底部」按钮：用户脱离跟随（向上查看历史）时显示，点击后**重载末尾

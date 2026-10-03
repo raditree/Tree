@@ -42,6 +42,181 @@ class MessageRange {
   String toString() => '[$from, $to)';
 }
 
+/// 视口（当前窗口）在**整份历史**里的坐标。
+///
+/// **用户口径（2026-10-03）**：「计算当前窗口在整个历史中的坐标，右侧拇指位置按坐标计算」。
+/// 它是右侧滑块几何的唯一输入，也是面板"滑到哪加载哪 / 只缓存坐标附近"的唯一口径：
+/// 列表每帧把**本帧构建到的下标区间**算成它（见 [MessageList.onWindowChanged]），
+/// 拇指监听它（滚动时只重绘拇指，不重建列表）。
+@immutable
+class MessageWindowCoordinate {
+  const MessageWindowCoordinate({
+    required this.first,
+    required this.last,
+    required this.total,
+  });
+
+  /// 视口内第一条的全局下标（-1 = 还没量出来）。
+  final int first;
+
+  /// 视口内最后一条的全局下标。
+  final int last;
+
+  /// 整份会话的条数（= [MessageWindow.total]，只随新消息增长）。
+  final int total;
+
+  /// 还没量出来（首帧之前）。
+  static const MessageWindowCoordinate unknown = MessageWindowCoordinate(
+    first: -1,
+    last: -1,
+    total: 0,
+  );
+
+  /// 量出来了没有。
+  bool get known => first >= 0 && last >= first;
+
+  /// 视口里看得见几条（未知时 0）。
+  int get visible => known ? last - first + 1 : 0;
+
+  /// 滑块能指到的**最靠后下标**：`total - 看得见的条数`（"最后一条正好落在视口底" = 贴底），
+  /// 与 [messageScrollbarThumb] 的分母同源。
+  int get lastSeekable {
+    if (total <= 0) return 0;
+    final int v = visible <= 0 ? 1 : visible;
+    return (total - v).clamp(0, total - 1);
+  }
+
+  /// 这个全局下标在不在视口内。
+  bool containsIndex(int index) => known && index >= first && index <= last;
+
+  @override
+  bool operator ==(Object other) =>
+      other is MessageWindowCoordinate &&
+      other.first == first &&
+      other.last == last &&
+      other.total == total;
+
+  @override
+  int get hashCode => Object.hash(first, last, total);
+
+  @override
+  String toString() =>
+      'MessageWindowCoordinate([$first,$last] of $total)';
+}
+
+/// 全局下标 → **滚动像素**：以坐标里的第一条为锚点，按 [step] 像素/条线性外推。
+///
+/// 为什么以视口第一条为锚点、而不是 `下标 × 占位高度`：占位槽恒定 88px（[kMessagePlaceholderExtent]），
+/// 但**已加载消息的真实高度各不相同**，从 0 开始算会把误差一路累积（"拖到中段落点很怪"）。
+/// 锚点法在占位区是精确的（88/格），在已加载区只差"这一段平均高度 vs 88"——而
+/// "仅缓存坐标附近"这条口径本身就让这两段离视口不远，剩下的误差由
+/// [MessageSeekCorrection] 的反馈校正收掉。
+///
+/// [at] 未知（还没量出来）时退回朴素的 `index × step`。
+double pixelOffsetForIndex({
+  required int index,
+  required MessageWindowCoordinate at,
+  required double anchorPixels,
+  required double step,
+}) {
+  final bool known = at.known;
+  final int anchor = known ? at.first : 0;
+  final double base = known ? anchorPixels : 0;
+  return base + (index - anchor) * step;
+}
+
+/// 拖拽/点击落点的**反馈校正器**（纯逻辑，单测直接钉）。
+///
+/// 为什么需要：`jumpTo` 的像素落点由我们算的值直接决定（实测 sliver 不校正），
+/// 但"像素 ↔ 全局下标"的换算只是估算（占位区精确、已加载区看平均高度）。与其把估算
+/// 做得多准，不如**看实际落在哪再修**：每次观测到 `(实际下标, 实际像素)` 就用它反推
+/// 这一带的真实步长（割线法），下一次跳得更准；最多 [maxAttempts] 次、落在
+/// [tolerance] 条之内就收手。
+///
+/// **不和用户抢**：调用方在用户一有新的滚动/拖拽/按键时就把它丢掉（见
+/// `MessageListView._cancelSeekCorrection`）。
+class MessageSeekCorrection {
+  MessageSeekCorrection({
+    required this.target,
+    required double step,
+    this.maxAttempts = 3,
+    this.tolerance = 3,
+  }) : _step = step > 0 ? step : 1;
+
+  /// 目标全局下标。
+  final int target;
+
+  /// 最多校正几次。
+  final int maxAttempts;
+
+  /// 落点与目标的容差（条）：进了这个范围就算到位。
+  final int tolerance;
+
+  double _step;
+  int _attempts = 0;
+  bool _finished = false;
+  int? _lastLanded;
+  double? _lastPixels;
+
+  /// 已经收工（到位 / 放弃）。
+  bool get finished => _finished;
+
+  /// 已经校正了几次。
+  int get attempts => _attempts;
+
+  /// 当前用的步长（像素/条）：一次观测之后会被真实值替换。
+  double get step => _step;
+
+  /// 观测一次落点：返回**下一次该跳到的像素**；null = 到位了、放弃了，或没有新信息。
+  double? observe({required int landed, required double pixels}) {
+    if (_finished) return null;
+    if ((landed - target).abs() <= tolerance) {
+      _finished = true;
+      return null;
+    }
+    final int? prevLanded = _lastLanded;
+    final double? prevPixels = _lastPixels;
+    // 落点与上次一模一样 = 跳不动了（贴到边界 / 目标在那一段外）：收手，别空转。
+    if (prevLanded == landed &&
+        prevPixels != null &&
+        (prevPixels - pixels).abs() < 0.5) {
+      _finished = true;
+      return null;
+    }
+    // 两点反推这一带的真实步长（占位区 ≈ 88，已加载区 ≈ 真实平均高度）。
+    if (prevLanded != null && prevPixels != null && landed != prevLanded) {
+      final double observed = (pixels - prevPixels) / (landed - prevLanded);
+      if (observed.isFinite && observed.abs() > 1) _step = observed.abs();
+    }
+    _lastLanded = landed;
+    _lastPixels = pixels;
+    if (_attempts >= maxAttempts) {
+      _finished = true;
+      return null;
+    }
+    _attempts++;
+    return pixels + (target - landed) * _step;
+  }
+}
+
+/// 把一段**缺口**按"视口顶"切成两次请求（用户 2026-10-03：「中间页的懒加载好像没做好」）。
+///
+/// 为什么必须切：补页会把占位槽换成真消息，**高度会变**。整页都在视口上方时列表有现成的
+/// 高度补偿（`padAboveStamp`），但缺口**横跨视口顶**是常态（视口自己就在缺口里）——
+/// 这时上方会长高、视口被整体推下去。切两刀之后：
+/// - `[first, gap.to)`：视口及以下，**不改变视口上方的高度** ⇒ 正在看的内容不动；
+/// - `[gap.from, first)`：整段在视口上方 ⇒ 走既有的高度补偿路径。
+///
+/// 顺序也是刻意的：先补视口那一侧，用户马上看到内容；上方那份稍后到达时由补偿接管。
+List<MessageRange> splitGapAtViewportTop(MessageRange gap, int first) {
+  if (gap.isEmpty) return const <MessageRange>[];
+  if (gap.from >= first || gap.to <= first) return <MessageRange>[gap];
+  return <MessageRange>[
+    MessageRange(first, gap.to),
+    MessageRange(gap.from, first),
+  ];
+}
+
 /// 见文件头：按全局下标寻址的消息窗口。
 class MessageWindow {
   MessageWindow({

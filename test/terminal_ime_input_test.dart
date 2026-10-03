@@ -10,11 +10,12 @@ import 'package:tree/ui/services/terminal_ime_input.dart';
 /// - 平台每次送来的都是 **TextInputModel 的整段文本** + `composingBase/Extent`
 ///   （`SendStateUpdate(*active_model_)`；提交那一刻不发，`ComposeEndHook` 发的是
 ///   "整段文本 + composing 无效"）⇒ **只补差额**才不会把老内容重复灌进 shell；
-/// - 我们**不改写**平台侧的值（旧实现在这里截断文本 + 把选区折到末尾 + 标组字区）：
-///   引擎 `TextInputModel.AddText` 在"选区折叠"时是**追加**而不是替换组字区
-///   （`text_input_model.h` 原文：either appends after the cursor … or deletes the
-///   selected text），于是残留的拼音会被"提交结果"一起带回框架，而我们当成已定字
-///   整段转发 ⇒ 拼音进 shell。**回显必须原样**，模型与 IME 的认知才一致。
+/// - 我们**绝不回推** `setEditingState`（唯一一次是 attach 时把模型清空）：回推会走引擎
+///   `TextInputModel::SetText(text)` 的**默认参数**路径（`composing_range = TextRange(0)`），
+///   把 `composing_` 打成 false；紧接着的 `SetComposingRange` 因 `if (!composing_) return false;`
+///   也救不回来。组字态一没，`AddText`（只有 `composing_` 为真才"删掉组字文本再插入"）
+///   就从"替换组字区"退化成"追加"——拼音越堆越多，被我们当"新定字"转发 ⇒ 拼音进 shell
+///   （用户 2026-10-03 真机回归，与 #15 同一症状）。
 void main() {
   late List<String> forwarded;
   late TerminalTextInputClient client;
@@ -41,6 +42,11 @@ void main() {
           .setMockMethodCallHandler(SystemChannels.textInput, null);
     });
   }
+
+  /// 平台侧收到过几次 `TextInput.setEditingState`（= 我们改写了引擎的模型几次）。
+  int editingStateCalls() => platformCalls
+      .where((MethodCall c) => c.method == 'TextInput.setEditingState')
+      .length;
 
   Map<String, dynamic> lastEditingState(WidgetTester tester) {
     final MethodCall call = platformCalls.lastWhere(
@@ -272,30 +278,29 @@ void main() {
     expect(forwarded, <String>['你', '好']);
   });
 
-  testWidgets('原样回显：平台侧模型一个字都不许被改写（改了拼音就会漏）',
+  testWidgets('组字期间**不许**回推 setEditingState（回推会让引擎的组字态失效）',
       (WidgetTester tester) async {
     capturePlatform(tester);
     client.attach(viewId: 0);
     platformCalls.clear();
 
-    const TextEditingValue value = TextEditingValue(
-      text: 'ni',
-      selection: TextSelection.collapsed(offset: 2),
-      composing: TextRange(start: 0, end: 2),
+    // ① 组字中：拼音一个字都不进 shell，也不许回推状态
+    client.updateEditingValue(
+      const TextEditingValue(
+        text: 'ni',
+        selection: TextSelection.collapsed(offset: 2),
+        composing: TextRange(start: 0, end: 2),
+      ),
     );
-    client.updateEditingValue(value);
+    expect(forwarded, isEmpty, reason: '组字中的拼音绝不能进 shell');
+    expect(
+      editingStateCalls(),
+      0,
+      reason: '回推 → 引擎 SetText(text) 的默认参数把 composing_ 打成 false ⇒ '
+          'IME 的"替换组字区"退化成"追加" ⇒ 拼音累积后被当成新定字发出去（真机回归）',
+    );
 
-    final Map<String, dynamic> args = lastEditingState(tester);
-    expect(args['text'], 'ni', reason: '文本不许被截断');
-    expect(args['selectionBase'], 2);
-    expect(args['selectionExtent'], 2,
-        reason: '选区不许被强制折叠或搬家（引擎的 AddText 靠它决定"追加还是替换组字区"）');
-    expect(args['composingBase'], 0);
-    expect(args['composingExtent'], 2, reason: '组字区不许被改写');
-    expect(forwarded, isEmpty);
-
-    // 已定字 + 组字尾巴：旧实现会把文本截成只剩尾巴（'你'），引擎于是失去"替换组字区"
-    // 的能力（AddText 在选区折叠时是追加）——这里钉住"整段原样回显"。
+    // ② 已定字 + 组字尾巴：只交已定字，仍然不回推
     client.updateEditingValue(
       const TextEditingValue(
         text: 'a你',
@@ -303,12 +308,31 @@ void main() {
         composing: TextRange(start: 1, end: 2),
       ),
     );
-    final Map<String, dynamic> args2 = lastEditingState(tester);
-    expect(args2['text'], 'a你', reason: '文本不许被截断成"只剩组字尾巴"');
-    expect(args2['composingBase'], 1);
-    expect(args2['composingExtent'], 2);
-    expect(args2['selectionBase'], 2);
     expect(forwarded, <String>['a']);
+    expect(editingStateCalls(), 0);
+
+    // ③ 提交（composing 无效）：只交结果，仍然不回推
+    client.updateEditingValue(
+      const TextEditingValue(
+        text: 'a你',
+        selection: TextSelection.collapsed(offset: 2),
+      ),
+    );
+    expect(forwarded, <String>['a', '你']);
+    expect(editingStateCalls(), 0);
+  });
+
+  testWidgets('attach 只发一次"清空"（干净起点），此后不再碰平台侧模型',
+      (WidgetTester tester) async {
+    capturePlatform(tester);
+    client.attach(viewId: 0);
+    expect(editingStateCalls(), 1, reason: '接上时把模型清空一次');
+    final Map<String, dynamic> args = lastEditingState(tester);
+    expect(args['text'], '', reason: '起点是空的：MP 的状态残渣不许留给下一次输入');
+
+    // 同一个视图重复 attach 是幂等的（不该再发一次）
+    client.attach(viewId: 0);
+    expect(editingStateCalls(), 1);
   });
 
   testWidgets('value 暴露的是平台侧原值（排障用）', (WidgetTester tester) async {
