@@ -145,6 +145,9 @@ String toolLabel(String name) {
       return '待办';
     case 'team':
       return '团队';
+    case 'subagent':
+      // 用户定稿口径：召一个**临时员工**（会话内、继承配置、可复用、可再派发）
+      return '临时员工';
     case 'mcp':
       return 'MCP';
     case 'embed_search':
@@ -202,6 +205,17 @@ String toolLineValue(ChatMessage m) {
               '')
           .toString();
       return inner.isEmpty ? tool : '$tool  ·  $inner';
+    }
+    case 'subagent': {
+      // 一行要能看出"谁在干、是不是复用、是不是后台"；task 太长时由行本身省略号收尾。
+      final String task = arg('task');
+      final String reuse = arg('subagent_id');
+      final String head = <String>[
+        if (reuse.isNotEmpty) '复用 $reuse',
+        if (args['background'] == true) '后台',
+      ].join(' · ');
+      if (task.isEmpty) return head;
+      return head.isEmpty ? task : '$head · $task';
     }
     case 'ask_user_question':
       return arg('question');

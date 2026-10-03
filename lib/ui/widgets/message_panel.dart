@@ -686,6 +686,11 @@ class _MessagePanelState extends State<MessagePanel> {
         timestamp: DateTime.now(),
         isStreaming: true,
         kind: data['kind'] as String? ?? 'text',
+        // 临时员工的话：打标显示在它名下（agent_id 仍是会话主人，过滤口径不变）
+        subagentId: data['subagent_id'] as String? ?? '',
+        subagentName: data['subagent_name'] as String? ?? '',
+        subagentParentId: data['subagent_parent_id'] as String? ?? '',
+        subagentLevel: (data['subagent_level'] as num?)?.toInt() ?? 0,
       );
       if (message.id.isEmpty) return;
       // 重播去重：同 id 已经在列表里（历史终稿 / 本端已在流式）⇒ 不再建第二条。
@@ -809,6 +814,11 @@ class _MessagePanelState extends State<MessagePanel> {
         toolName: (data['name'] as String?) ?? '',
         toolArguments: args,
         toolRunning: true,
+        // 临时员工调的工具也打标：一行式消息流里能看出这一步是谁干的
+        subagentId: data['subagent_id'] as String? ?? '',
+        subagentName: data['subagent_name'] as String? ?? '',
+        subagentParentId: data['subagent_parent_id'] as String? ?? '',
+        subagentLevel: (data['subagent_level'] as num?)?.toInt() ?? 0,
       );
       setState(() {
         _messages.add(toolMsg);
@@ -951,6 +961,11 @@ class _MessagePanelState extends State<MessagePanel> {
           timestamp: DateTime.now(),
           kind: 'ask_user_question',
           options: options,
+          // 临时员工提问：问题正文里已有它的名字，这里再带上标记供界面打标
+          subagentId: data['subagent_id'] as String? ?? '',
+          subagentName: data['subagent_name'] as String? ?? '',
+          subagentParentId: data['subagent_parent_id'] as String? ?? '',
+          subagentLevel: (data['subagent_level'] as num?)?.toInt() ?? 0,
         ),
       );
       _scrollRevision++;

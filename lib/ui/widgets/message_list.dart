@@ -379,6 +379,13 @@ class _MessageListViewState extends State<_MessageListView> {
               }
               // 常规布局：index 递增 = 由旧到新，最新消息在底部
               final ChatMessage message = widget.messages[index];
+              // 临时员工的消息：在他的那一段**开头**标一次（同一个人的连续消息/工具
+              // 只在第一行顶标签，避免每条都占一行）。核心把临时员工的一切都写进
+              // 会话主人的消息流，不打标就会看起来像主 agent 在说话。
+              final bool showSubagentTag =
+                  message.isSubagentMessage &&
+                  (index == 0 ||
+                      widget.messages[index - 1].subagentId != message.subagentId);
               // 工具调用卡片：默认折叠，独立渲染
               Widget child;
               if (message.kind == 'tool') {
@@ -414,6 +421,18 @@ class _MessageListViewState extends State<_MessageListView> {
                 child = Padding(
                   padding: const EdgeInsets.only(bottom: 12),
                   child: _MessageBubble(message: message),
+                );
+              }
+              if (showSubagentTag) {
+                child = Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: <Widget>[
+                    _SubagentTagBar(
+                      name: message.subagentName,
+                      level: message.subagentLevel,
+                    ),
+                    child,
+                  ],
                 );
               }
               // 定位目标：为每条消息挂 GlobalKey，命中定位时短暂高亮
@@ -482,6 +501,41 @@ class _MessageListViewState extends State<_MessageListView> {
   /// 点击「回到底部」：恢复跟随并平滑滚到底
   void _scrollToBottomFromButton() {
     _returnToBottom();
+  }
+}
+
+/// 临时员工标记条（一行式消息流里「这一段是谁在说」）。
+///
+/// 为什么需要它：临时员工没有自己的会话，它的话与工具调用都写进**会话主人**的消息流
+/// （`agent_id` 仍是主人，前端过滤口径不变），不打标就会看起来像主 agent 在说话。
+/// 只在同一个临时员工的**那一段开头**画一次（见调用处的 `showSubagentTag`）。
+class _SubagentTagBar extends StatelessWidget {
+  const _SubagentTagBar({required this.name, required this.level});
+
+  final String name;
+  final int level;
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final String label = name.trim().isEmpty ? '未命名' : name.trim();
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4, left: 2),
+      child: Row(
+        children: <Widget>[
+          Icon(Icons.person_outline, size: 12, color: cs.onSurfaceVariant),
+          const SizedBox(width: 4),
+          Flexible(
+            child: Text(
+              '临时员工「$label」 · 层级 $level',
+              key: const ValueKey<String>('subagent-tag-bar'),
+              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 

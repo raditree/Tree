@@ -73,6 +73,13 @@
     [ui/widgets/detail_panel.dart](ui/widgets/detail_panel.dart)、[ui/services/detail_selection.dart](ui/services/detail_selection.dart)）：
     模型消息是**高亮块**（左侧主色竖条 + 极淡同色底，**没有整圈边框**），用户消息仍是主色气泡；
     工具调用一行 =「中文标签 + 关键参数（等宽）」+ 行尾增量（编辑 / 写入按行数给 `+N -M`）、转圈或箭头；
+    **临时员工**（`subagent`）的消息与工具行在**这一段开头**画一条标记「临时员工「名」 · 层级 N」
+    （[ui/models/message.dart](ui/models/message.dart) 的 `subagentId` / `subagentName` / `subagentParentId` /
+    `subagentLevel`，[ui/widgets/message_list.dart](ui/widgets/message_list.dart) 的 `_SubagentTagBar`）：临时员工
+    没有自己的会话，它的话与工具调用都写进**会话主人**的消息流（`agent_id` 仍是主人，帧过滤口径不变），
+    不打标就会看起来像主 agent 在说话；同一个临时员工的连续消息 / 工具**只在第一行顶一次**标签（避免每条都占一行），
+    换人或换回主 agent 再出现时重新标；`subagent` 工具卡片本身就是普通工具卡片（中文标签「临时员工」，
+    行正文给 `task`，复用与后台在行里带出来）——**不认工具名的特例渲染**这条口径不变。
     增量**只从这次调用的参数算**：`edit` 取 `old_text` / `new_text`、`write` 取 `content`——**核心 schema 的键名**
     （不是 `path` / `old_string` / `new_string`；对错了就是恒 `+0 -0`）；编辑工具的**结果**只有「已替换 N 处」这类话、
     **不带 diff**，所以不许去解析结果文本；参数不全 / 不是编辑写入类工具 ⇒ 行尾**不给数字**（`+0 -0` 是假信息，宁缺勿假）；

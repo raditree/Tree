@@ -43,6 +43,20 @@ class ChatMessage {
   /// 工具是否仍在执行中（kind == "tool" 时有效）
   bool toolRunning;
 
+  /// 临时员工（subagent）标记：非空 = 这条消息属于这名临时员工。
+  ///
+  /// 核心把临时员工的一切都写进"召它的那个 agent 的会话"消息流里（`agent_id` 仍是
+  /// 会话主人，过滤口径不变），靠这四个字段让前端把它显示在这名临时员工名下
+  /// （字段清单见 packages/tree_core/README.md）。
+  final String subagentId;
+  final String subagentName;
+
+  /// 召它的那个 agent（真实 agent id 或上级临时员工 id）。
+  final String subagentParentId;
+
+  /// 会话内层级（真实 agent 的直属临时员工 = 1）。
+  final int subagentLevel;
+
   /// 提问选项（kind == "ask_user_question" 时有效）
   final List<String> options;
 
@@ -62,12 +76,19 @@ class ChatMessage {
     this.toolArguments,
     this.toolResult = '',
     this.toolRunning = false,
+    this.subagentId = '',
+    this.subagentName = '',
+    this.subagentParentId = '',
+    this.subagentLevel = 0,
     this.options = const <String>[],
     this.answered = false,
   });
 
   /// 是否为用户消息
   bool get isUser => role == 'user';
+
+  /// 这条消息是不是**临时员工**说的 / 它在干活（界面据此打标，不冒充主 agent）。
+  bool get isSubagentMessage => subagentId.isNotEmpty;
 
   /// 从 JSON 构造 ChatMessage 实例
   ///
@@ -98,6 +119,10 @@ class ChatMessage {
       toolName: json['tool_name'] as String?,
       toolArguments: toolArgs,
       toolResult: json['tool_result'] as String? ?? '',
+      subagentId: json['subagent_id'] as String? ?? '',
+      subagentName: json['subagent_name'] as String? ?? '',
+      subagentParentId: json['subagent_parent_id'] as String? ?? '',
+      subagentLevel: (json['subagent_level'] as num?)?.toInt() ?? 0,
       options:
           (json['options'] as List<dynamic>?)?.map((e) => e.toString()).toList() ??
               <String>[],

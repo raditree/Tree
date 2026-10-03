@@ -83,6 +83,61 @@ bool hasSelectableText(WidgetTester tester, String expected) => tester
 void main() {
   setUp(DetailSelection.instance.clear);
 
+  group('临时员工（subagent）工具行', () {
+    testWidgets('中文标签是「临时员工」，正文给 task；行尾不给增量',
+        (WidgetTester tester) async {
+      await pumpRow(
+        tester,
+        toolMessage(
+          name: 'subagent',
+          args: const <String, dynamic>{
+            'task': '把 a.dart 里的旧 API 全部换成新 API',
+          },
+        ),
+      );
+
+      expect(find.text('临时员工'), findsOneWidget);
+      expect(find.text('把 a.dart 里的旧 API 全部换成新 API'), findsOneWidget);
+      expect(
+        toolDiffStat('subagent', const <String, dynamic>{'task': 'x'}),
+        isNull,
+        reason: '不是编辑/写入类工具，行尾宁缺勿假（不给 +0 -0）',
+      );
+    });
+
+    testWidgets('复用与后台在行里能一眼看出来', (WidgetTester tester) async {
+      await pumpRow(
+        tester,
+        toolMessage(
+          name: 'subagent',
+          args: const <String, dynamic>{
+            'subagent_id': 'sub_1790_ab_1',
+            'background': true,
+            'task': '接着把剩下的两个文件改完',
+          },
+        ),
+      );
+
+      expect(
+        find.text('复用 sub_1790_ab_1 · 后台 · 接着把剩下的两个文件改完'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('只有复用入口没有 task：行里只写复用入口，不留空行',
+        (WidgetTester tester) async {
+      await pumpRow(
+        tester,
+        toolMessage(
+          name: 'subagent',
+          args: const <String, dynamic>{'subagent_id': 'sub_9'},
+        ),
+      );
+
+      expect(find.text('复用 sub_9'), findsOneWidget);
+    });
+  });
+
   group('工具行只占一行', () {
     testWidgets('中文标签 + 关键参数，不把参数表和结果铺开',
         (WidgetTester tester) async {
