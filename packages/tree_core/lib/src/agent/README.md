@@ -45,7 +45,11 @@
     `SubagentTurnResult.cancelled`/`error` 一路带出来，**人为中止（用户停止 / 插话）不注入结束提示**
     （用户自己会说原因，而且他往往马上又发一条让它接着干），**出错导致的中止照旧注入**（否则发起者以为活还在干）；
     临时员工这一轮结束时**总是**报自己的 `idle`（带 `subagent_id`），否则父还在跑时它的"工作中"会一直亮着。
-13. **`stop` / 插话要连带它名下的临时员工**：`_RunToken.ownerAgentId` 记归属轮次，`cancelAgent` 与"新消息插话"都会把同一会话里正在跑的临时员工一起收敛（否则父那轮一直卡在等一个没人管的子任务上）；`isRunning` 把"它名下的临时员工"也算在内，因此后台临时员工在跑时它的发起者显示 working、最后一个跑完才报 idle。
+13. **插话只打断目标那一轮；`stop` 才连带**（用户 2026-10-03 硬断言：「发消息给主 agent，其子 agent 不受影响（和『发消息给子 agent，父 agent 及其他子 agent 不受影响』一致）」）：
+    `_interruptForNewMessage` **只**标记目标 `(agentId, sessionId)` 那一轮（`interrupted` + `cancelled`；用户插话另标 `userStopped`）——
+    同一会话里它名下的临时员工**继续跑**、完成报告照旧注入发起者；父那轮若正卡在 `subagent` / `wait_for` 上，按"正在执行的工具跑完才收敛"把新消息排队等它返回。
+    终止在途临时员工只有两条**显式**路径：**用户 `stop`**（按 agent，仍连带它名下的临时员工，[test/cascade_stop_test.dart](../../../test/cascade_stop_test.dart)）与**在某个临时成员视角里按停止**（`sub_…` ⇒ `_stopAgentTree(cascade:false)`，只停它自己，[test/subagent_tool_test.dart](../../../test/subagent_tool_test.dart)）。
+    `_RunToken.ownerAgentId` 记归属轮次；`isRunning` 仍把"它名下的临时员工"算在内（后台临时员工在跑时发起者显示 working、最后一个跑完才报 idle——团队名单口径不变）。
 14. **「为什么没接管」分两档，别合并**：`relay_skip_reason`（REST）永远是**全量**（排障面，含"总开关关 / 作用域不匹配 / 无点位 / 无订阅者"这类**早退**）；会话历史里的通知**只写"有订阅者却没交出可用结果"**那一档（`relaySkipHasSubscriber`，没回包 / 原数据放行 / 回包非法 / 越界 / 异常）。合并的后果是：没装压缩插件的用户，每条压缩通知都多一句"没有插件订阅该点位"的废话，看两次就学会忽略整条通知了。手动压缩（REST `/compact`、执行站 `agent.compact`）与自动压缩共用 `_notifyCompacted` 这一条文案口径，别在别处复制第二套。
 
 ## 依赖方向

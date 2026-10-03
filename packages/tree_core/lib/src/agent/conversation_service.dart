@@ -457,6 +457,11 @@ class ConversationService {
   /// - 打断**只在"流式生成中"与"两次工具之间"生效**：正在执行的工具跑完才收敛
   ///   （`WorkspaceIO.exec` 没有取消参数，且 M9 规定本地执行活着就永不超时、
   ///   不按时间杀进程）；
+  /// - **只打断它自己那一轮**（用户 2026-10-03 硬断言：「发消息给主 agent，其子 agent
+  ///   不受影响（和"发消息给子 agent，父 agent 及其他子 agent 不受影响"一致）」）：
+  ///   同一会话里它名下的临时员工**不连带取消**——它们继续跑、完成报告照旧注入发起者；
+  ///   父那轮若正卡在 `subagent` / `wait_for` 这类阻塞工具上，按"正在执行的工具跑完才
+  ///   收敛"把这条新消息排队等它返回（"工具执行完前不接受新消息"是期望语义，不是 bug）。
   /// - 有在途任务时计数 [interruptedRunCount]，便于测试与排障。
   void _interruptForNewMessage(
     String agentId, {
@@ -470,18 +475,11 @@ class ConversationService {
     token.interrupted = true;
     token.cancelled = true; // 复用既有取消通道：流式循环每帧检查，工具之间也检查
     if (byUser) token.userStopped = true;
-    // 父那轮被打断时，它在**同一个会话**里派出去、正在跑的临时员工也要收敛：
-    // 否则父的工具调用要一直等它们跑完，用户看到的"插话"就是假的。
-    for (final _RunToken child in _running.values) {
-      if (child.ownerAgentId != agentId) continue;
-      if (child.sessionId != sessionId) continue;
-      if (identical(child, token)) continue;
-      child.interrupted = true;
-      child.cancelled = true;
-      // 连带收敛的那些：**只有用户插话**才算"人叫停"；hook 提示唤醒 / 别的临时员工
-      // 完成报告导致的收敛都算系统内部，被中止的活照样要回报给发起者
-      if (byUser) child.userStopped = true;
-    }
+    // **只打断它自己那一轮**（用户 2026-10-03 硬断言：「发消息给主 agent，其子 agent
+    // 不受影响（和"发消息给子 agent，父 agent 及其他子 agent 不受影响"一致）」）：
+    // 不再连带取消同一会话里它名下的临时员工——它们继续跑，完成报告照旧注入发起者。
+    // 终止在途临时员工只有两条**显式**路径：用户 `stop`（按 agent，仍连带它名下的）、
+    // 以及在"某个临时成员的视角"里按停止（`sub_…` ⇒ _stopAgentTree(cascade:false)）。
     interruptedRunCount++;
   }
 

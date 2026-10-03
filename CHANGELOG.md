@@ -19,6 +19,12 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **插话只打断目标那一轮：发给主 agent 不影响它名下的临时员工**（[agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 13、
+  [docs/team.md](docs/team.md) §4，**用户 2026-10-03 硬断言**：「发消息给主 agent，其子 agent 不受影响（和『发消息给子 agent，
+  父 agent 及其他子 agent 不受影响』一致）」）：`_interruptForNewMessage` **只**标记目标 `(agentId, sessionId)` 那一轮，
+  不再连带取消同一会话里它名下的临时员工——它们继续跑、完成报告照旧注入发起者；父那轮若正卡在 `subagent` / `wait_for`
+  上，按"正在执行的工具跑完才收敛"把新消息排队等它返回。终止在途临时员工仍只有两条**显式**路径：用户 `stop`（按 agent，
+  仍连带它名下的）与"在某个临时成员视角里按停止"（`sub_…` ⇒ 只停它自己）。
 - **临时员工的入口列表落盘；运行态与停止只作用在「当前视角那个人」身上**（[lib/README.md](lib/README.md) 不变量 20/21、
   [agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 16、
   [server/README.md](packages/tree_core/lib/src/server/README.md) 不变量 15，**用户断言 2026-10-03**：

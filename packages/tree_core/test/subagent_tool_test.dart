@@ -762,6 +762,80 @@ void main() {
       );
     });
 
+    test('插话：给主 agent 发消息不打断它名下的临时员工（用户 2026-10-03 断言）', () async {
+      // 复刻 CLI 接线：后台完成 ⇒ 报告注入父会话（onFinished → wake）
+      service.onFinished = (
+        String ownerAgentId,
+        String sessionId,
+        String notice,
+        SubagentTag tag,
+      ) {
+        unawaited(
+          conversation.wake(
+            agentId: ownerAgentId,
+            sessionId: sessionId,
+            notice: notice,
+            subagent: tag,
+          ),
+        );
+      };
+      engine.hold = true;
+      // 父 agent 自己那一轮先跑起来（有在途轮次，插话才有的可打断）
+      final Future<void> parentTurn = conversation.handleUserMessage(
+        <String, dynamic>{
+          'agent_id': owner.id,
+          'session_id': TreeStore.defaultSessionId,
+          'content': '父自己在跑',
+        },
+      );
+      await waitUntil(
+        () => engine.started.contains(owner.id),
+        description: '父那轮已开始',
+      );
+      // 它名下的后台临时员工也开跑（也卡在闸门上）
+      await callTool(<String, dynamic>{
+        'task': '长活',
+        'name': '甲',
+        'background': true,
+      });
+      await waitUntil(() => engine.started.length == 2, description: '临时员工也开跑');
+      final String sub = roster().single.id;
+
+      // 用户给**主 agent** 发消息 = 插话
+      final Future<void> interjection = conversation.handleUserMessage(
+        <String, dynamic>{
+          'agent_id': owner.id,
+          'session_id': TreeStore.defaultSessionId,
+          'content': '插话一句',
+        },
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(
+        conversation.isRunning(sub),
+        isTrue,
+        reason: '子 agent 不受影响（用户 2026-10-03 硬断言：发给主 agent 不打断它的子 agent）',
+      );
+
+      // 放闸：父那轮收尾、临时员工自然跑完
+      engine.hold = false;
+      engine.releaseAll();
+      await parentTurn.timeout(const Duration(seconds: 10));
+      await interjection.timeout(const Duration(seconds: 10));
+      await waitUntil(
+        () => store
+            .sessionMessages(owner.id, TreeStore.defaultSessionId)
+            .any(
+              (CoreMessage m) =>
+                  m.kind == MessageKinds.subagentReport && m.subagentId == sub,
+            ),
+        description: '临时员工的完成报告照旧注入发起者（没被当成"人叫停"）',
+      );
+      await waitUntil(
+        () => conversation.activeRunCount == 0,
+        description: '都收干净',
+      );
+    });
+
     test('agent_status：子级帧不冒充主 agent；主 agent 自己收尾时单独说清', () async {
       // 两个轮次都停在闸门上：父自己的轮次结束时，乙**仍然在跑**（聚合口径才成立）
       engine.hold = true;
