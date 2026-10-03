@@ -87,6 +87,23 @@ class FileWriteConflict implements Exception {
 /// 监听的随机端口（由 [CoreProcessLauncher] 通过握手下发），并且每个请求都
 /// 必须携带核心下发的一次性本地 token。协议形状（路径/字段/状态码）与既有
 /// 后端保持一致，因此上层 UI 无需改动。
+/// 一次历史拉取的结果：消息 + 分页元信息（见 [ApiService.getConversationHistoryPage]）。
+class HistoryPage {
+  const HistoryPage({
+    required this.messages,
+    this.hasMore = false,
+    this.total = 0,
+  });
+
+  final List<Map<String, dynamic>> messages;
+
+  /// 还有**更早**的消息没取回来。
+  final bool hasMore;
+
+  /// 这个会话一共有多少条（给人看的计数 / 排障）。
+  final int total;
+}
+
 class ApiService {
   /// 核心进程基址（形如 `http://127.0.0.1:54321`）。
   ///
@@ -572,16 +589,43 @@ class ApiService {
     String agentId, {
     String sessionId = 'session_default',
   }) async {
+    final HistoryPage page = await getConversationHistoryPage(
+      agentId,
+      sessionId: sessionId,
+    );
+    return page.messages;
+  }
+
+  /// **分页**拉取历史（用户 2026-10-04：「会话太长时导入不能直接划到底部；长会话仅加载
+  /// 末尾一段」）。
+  ///
+  /// [limit] > 0 时只取**末尾**这么多条（长会话导入因此是常量级开销）；
+  /// [beforeId] 非空时只取比它更早的（前端拿"当前最老那条 id"往回翻页）。
+  /// [hasMore] = 还有更早的消息没取回来（据此显示"加载更早"的入口）。
+  static Future<HistoryPage> getConversationHistoryPage(
+    String agentId, {
+    String sessionId = 'session_default',
+    int limit = 0,
+    String beforeId = '',
+  }) async {
     final Map<String, dynamic> data = await _getJson(
       '/api/conversations/$agentId',
-      query: {'session_id': sessionId},
+      query: <String, String>{
+        'session_id': sessionId,
+        if (limit > 0) 'limit': '$limit',
+        if (beforeId.isNotEmpty) 'before': beforeId,
+      },
     );
     final List<dynamic> messages = data['messages'] as List<dynamic>? ?? [];
-    return messages
-        .map(
-          (dynamic e) => Map<String, dynamic>.from(e as Map<dynamic, dynamic>),
-        )
-        .toList();
+    return HistoryPage(
+      messages: messages
+          .map(
+            (dynamic e) => Map<String, dynamic>.from(e as Map<dynamic, dynamic>),
+          )
+          .toList(),
+      hasMore: data['has_more'] == true,
+      total: (data['total'] as num?)?.toInt() ?? messages.length,
+    );
   }
 
   /// 清空指定 agent/会话的对话历史

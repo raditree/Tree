@@ -14,6 +14,7 @@ class SubagentTurnRequest {
     required this.ownerAgentId,
     required this.sessionId,
     required this.task,
+    this.fromUser = false,
   });
 
   /// 它是谁（id / 显示名 / 树上父节点 / 层级）。
@@ -28,17 +29,39 @@ class SubagentTurnRequest {
 
   /// 本次下达的自包含指令。
   final String task;
+
+  /// 这条输入是不是**用户（界面）直接说的**。
+  ///
+  /// 区别只在落库形态：工具下达的任务落 `kind='subagent_task'` 的 agent 消息（它的输入，
+  /// 但发起者的上下文里没有它）；用户说的话落 **`role='user'` 的普通消息 + 它的标记**
+  /// （用户直接对临时员工说话，见 [ConversationService.sendToSubagent]）。
+  final bool fromUser;
 }
 
 /// 一次临时员工运行的结果。
 class SubagentTurnResult {
-  const SubagentTurnResult({this.report = '', this.error = ''});
+  const SubagentTurnResult({
+    this.report = '',
+    this.error = '',
+    this.cancelled = false,
+    this.userStopped = false,
+  });
 
   /// 它的最终报告（最后一轮正文；没有文本产出时为空串）。
   final String report;
 
   /// 可读失败原因（空串 = 没失败）。
   final String error;
+
+  /// 这一轮是不是被人为中止的（**任何**原因：用户叫停 / hook 唤醒 / 别的临时员工完成）。
+  final bool cancelled;
+
+  /// 这一轮是不是**人叫停**的（用户按停止 / 用户插话）。
+  ///
+  /// 人为中止**不向发起者注入结束提示**：用户自己会说原因，而且他很可能马上又给这个
+  /// 临时员工发一条让它接着干——那时自然结束的报告才是发起者该看到的那一条。
+  /// 系统内部的收敛（hook 唤醒、别的临时员工完成报告）**不算**：那类中止要报。
+  final bool userStopped;
 
   bool get ok => error.isEmpty && report.trim().isNotEmpty;
 }
@@ -266,6 +289,12 @@ class SubagentService implements SubagentChannel {
       result = SubagentTurnResult(error: '临时员工运行异常：$error');
     }
     final SubagentTag tag = turn.tag;
+    // **人为中止不注入**（用户 2026-10-04：停止后不用向父 agent 发结束提示，用户自己说
+    // 原因；出错导致的中止照样要说）——与界面直接发消息那条路同一口径。
+    if (result.userStopped && result.error.isEmpty) {
+      log?.call('临时员工 ${tag.id} 这一轮被用户叫停：不注入结束提示');
+      return;
+    }
     // **每个后台临时员工各注入一次**：不做"只留最后一个"的单槽位（并发完成不丢）
     final SubagentFinished? finished = onFinished;
     if (finished == null) {
@@ -448,6 +477,13 @@ class SubagentService implements SubagentChannel {
     }
     return ToolOutcome('${_header(s, reused: reused)}\n$report');
   }
+
+  /// 后台完成时要注入发起者会话的那段话（[SubagentFinished] 的内容）。
+  ///
+  /// 公开而不是私有：界面直接给临时员工发的消息（[ConversationService.sendToSubagent]）
+  /// 也走同一段话——同一件事不该有两种措辞。
+  static String noticeText(CoreSubagent s, SubagentTurnResult result) =>
+      _noticeText(s, result);
 
   static String _noticeText(CoreSubagent s, SubagentTurnResult result) {
     if (result.error.isNotEmpty) {

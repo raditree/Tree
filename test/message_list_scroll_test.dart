@@ -258,6 +258,93 @@ void main() {
     expect(buttonOpacity(tester), 1); // 进入阅读模式
     expect(find.text('消息内容 5'), findsWidgets); // 目标消息已构建
   });
+
+  group('懒加载分页（长会话只加载末尾一段）', () {
+    testWidgets('还有更早的一页：顶部给入口，点它就往回翻', (WidgetTester tester) async {
+      final GlobalKey<_HarnessState> key = await pumpList(tester);
+      expect(find.text('加载更早的消息'), findsNothing, reason: '默认没有更早的');
+
+      // 先滚到顶（此时还没有更早的一页 ⇒ 不会触发自动翻页），再打开分页：
+      // 贴底时列表顶部不在视口内（懒构建不会建它），入口必须滚到顶才看得见
+      final ScrollPosition pos = positionOf(tester);
+      pos.jumpTo(pos.minScrollExtent);
+      await tester.pumpAndSettle();
+
+      key.currentState!.setPaging(hasEarlier: true);
+      await tester.pumpAndSettle();
+      expect(find.text('加载更早的消息'), findsOneWidget);
+
+      await tester.tap(find.text('加载更早的消息'));
+      await tester.pumpAndSettle();
+      expect(key.currentState!.loadEarlierCalls, 1, reason: '点入口要真的去翻页');
+    });
+
+    testWidgets('正在加载：入口禁用并显示进度', (WidgetTester tester) async {
+      final GlobalKey<_HarnessState> key = await pumpList(tester);
+      final ScrollPosition pos = positionOf(tester);
+      pos.jumpTo(pos.minScrollExtent);
+      await tester.pumpAndSettle();
+      key.currentState!.setPaging(hasEarlier: true, loadingEarlier: true);
+      // 入口里的进度圈是**无限动画**：pumpAndSettle 会一直等下去，这里按帧泵
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 16));
+      expect(find.text('正在加载更早的消息…'), findsOneWidget);
+      await tester.tap(find.text('正在加载更早的消息…'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 16));
+      expect(key.currentState!.loadEarlierCalls, 0, reason: '加载中不许重复触发');
+    });
+
+    testWidgets('前插补偿：往前面插内容后，原本看的那一段不会被推走', (WidgetTester tester) async {
+      final GlobalKey<_HarnessState> key = await pumpList(tester);
+      final ScrollPosition pos = positionOf(tester);
+      pos.jumpTo(pos.maxScrollExtent / 2);
+      await tester.pumpAndSettle();
+      final double before = pos.pixels;
+      final double beforeMax = pos.maxScrollExtent;
+
+      key.currentState!.prepend(5);
+      await tester.pumpAndSettle();
+
+      final double delta = pos.maxScrollExtent - beforeMax;
+      expect(delta, greaterThan(0), reason: '前面插了内容，总高度必须变大');
+      expect(
+        pos.pixels - before,
+        closeTo(delta, 1),
+        reason: 'offset 要跟着长高的那一段走，视口才钉在同一段内容上',
+      );
+    });
+
+    testWidgets('滚到顶：自动往回翻一页', (WidgetTester tester) async {
+      final GlobalKey<_HarnessState> key = await pumpList(tester);
+      key.currentState!.setPaging(hasEarlier: true);
+      await tester.pumpAndSettle();
+
+      final ScrollPosition pos = positionOf(tester);
+      pos.jumpTo(pos.minScrollExtent);
+      await tester.pump();
+      await tester.pumpAndSettle();
+      expect(key.currentState!.loadEarlierCalls, greaterThanOrEqualTo(1));
+    });
+
+    testWidgets('长列表 + 无动画直达底部：真的贴到最底（不是估算位置）', (WidgetTester tester) async {
+      await tester.pumpWidget(const _LongHarness());
+      await tester.pumpAndSettle();
+      // "连续贴底"是靠逐帧复查收敛的：多泵几帧把懒构建补齐的高度贴完
+      for (int i = 0; i < 40; i++) {
+        await tester.pump(const Duration(milliseconds: 16));
+      }
+      final ScrollPosition pos = tester
+          .state<ScrollableState>(find.byType(Scrollable).first)
+          .position;
+      expect(
+        pos.maxScrollExtent - pos.pixels,
+        lessThanOrEqualTo(1),
+        reason: '历史整批重载要直达底部：懒构建列表的 maxScrollExtent 是估算值，'
+            '只贴一帧会停在半路',
+      );
+    });
+  });
 }
 
 /// 测试用宿主：持有消息列表并驱动 MessageList 的 revision/bottomJump 更新
@@ -283,6 +370,38 @@ class _HarnessState extends State<_Harness> {
   String? _locateId;
   int _locateRevision = 0;
   int _live = 0;
+
+  /// 懒加载分页（用户 2026-10-04）：还有更早的一页 / 正在拉 / 拉过几次
+  bool hasEarlier = false;
+  bool loadingEarlier = false;
+  int loadEarlierCalls = 0;
+
+  /// 打开/关闭分页入口的状态（测试从外面驱动；`setState` 是受保护成员，只能在
+  /// State 内部调，所以在宿主里留一个方法）。
+  void setPaging({bool? hasEarlier, bool? loadingEarlier}) {
+    setState(() {
+      if (hasEarlier != null) this.hasEarlier = hasEarlier;
+      if (loadingEarlier != null) this.loadingEarlier = loadingEarlier;
+    });
+  }
+
+  /// 模拟"往回翻一页"拿到更早的消息：前插进列表
+  void prepend(int count) {
+    setState(() {
+      for (int i = 0; i < count; i++) {
+        _messages.insert(
+          0,
+          ChatMessage(
+            id: 'old$i',
+            role: 'user',
+            content: '更早的消息 $i ' * 3,
+            timestamp: DateTime(2026, 1, 1, 11, i % 60),
+          ),
+        );
+      }
+      hasEarlier = false;
+    });
+  }
 
   /// 模拟新增消息（流式 msg_start / 新消息到达）
   void addMessage() {
@@ -328,12 +447,48 @@ class _HarnessState extends State<_Harness> {
     return MaterialApp(
       home: Scaffold(
         body: MessageList(
-          messages: _messages,
+          // 与生产同口径：面板每次 build 都传一份**新的**列表（visibleStreamMessages），
+          // 前插补偿靠"新旧两份列表内容不同"来判定
+          messages: List<ChatMessage>.of(_messages),
           revision: _revision,
           scrollToMessageId: _locateId,
           scrollToRevision: _locateRevision,
           bottomJump: _bottomJump,
+          hasEarlier: hasEarlier,
+          loadingEarlier: loadingEarlier,
+          // 只记账，不真的前插：不然"点了就翻页"的用例还没断言，入口就自己消失了
+          onLoadEarlier: () => loadEarlierCalls++,
         ),
+      ),
+    );
+  }
+}
+
+/// 长会话（几百条、长短不一）整批重载：验证"直达底部"真的到最底。
+class _LongHarness extends StatefulWidget {
+  const _LongHarness();
+
+  @override
+  State<_LongHarness> createState() => _LongHarnessState();
+}
+
+class _LongHarnessState extends State<_LongHarness> {
+  final List<ChatMessage> _messages = <ChatMessage>[
+    for (int i = 0; i < 400; i++)
+      ChatMessage(
+        id: 'long$i',
+        role: i.isEven ? 'agent' : 'user',
+        // 长短不一：让懒构建的高度估算与实际不符（真机就是这样）
+        content: '消息 $i ' * (i % 40 + 1),
+        timestamp: DateTime(2026, 1, 1, 12, i % 60),
+      ),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      home: Scaffold(
+        body: MessageList(messages: _messages, revision: 1, bottomJump: true),
       ),
     );
   }

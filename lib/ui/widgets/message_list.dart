@@ -42,6 +42,16 @@ class MessageList extends StatelessWidget {
   /// 钉底；阅读模式下不做任何补偿（视口保持不动）。
   final bool bottomJump;
 
+  /// 还有**更早**的消息没加载（懒加载分页）：列表顶部显示一个入口，
+  /// 滚到顶也会自动拉一页（用户 2026-10-04：「长会话仅加载末尾一段」）。
+  final bool hasEarlier;
+
+  /// 正在拉更早的那一页（入口显示"加载中"并防重复触发）。
+  final bool loadingEarlier;
+
+  /// 请求加载更早的一页（由面板去核心翻页，拿到后前插进 [messages]）。
+  final VoidCallback? onLoadEarlier;
+
   /// 消息流末尾追加的**插件内联卡片**（Q12）：按到达顺序排在最后一条消息之后。
   ///
   /// 单独用 Widget 列表而不是协议模型：消息列表只负责"在流里让出一段位置"，
@@ -57,6 +67,9 @@ class MessageList extends StatelessWidget {
     this.scrollToRevision = 0,
     this.bottomJump = false,
     this.trailingCards = const <Widget>[],
+    this.hasEarlier = false,
+    this.loadingEarlier = false,
+    this.onLoadEarlier,
   });
 
   @override
@@ -69,6 +82,9 @@ class MessageList extends StatelessWidget {
       scrollToRevision: scrollToRevision,
       bottomJump: bottomJump,
       trailingCards: trailingCards,
+      hasEarlier: hasEarlier,
+      loadingEarlier: loadingEarlier,
+      onLoadEarlier: onLoadEarlier,
     );
   }
 }
@@ -85,6 +101,9 @@ class _MessageListView extends StatefulWidget {
   final int scrollToRevision;
   final bool bottomJump;
   final List<Widget> trailingCards;
+  final bool hasEarlier;
+  final bool loadingEarlier;
+  final VoidCallback? onLoadEarlier;
 
   const _MessageListView({
     required this.messages,
@@ -94,6 +113,9 @@ class _MessageListView extends StatefulWidget {
     this.scrollToRevision = 0,
     this.bottomJump = false,
     this.trailingCards = const <Widget>[],
+    this.hasEarlier = false,
+    this.loadingEarlier = false,
+    this.onLoadEarlier,
   });
 
   @override
@@ -115,6 +137,9 @@ class _BottomAnchorScrollController extends ScrollController {
 
   /// 是否需要把 offset 钉到底部：内容变化/首帧时由 State 置位，布局时消费。
   bool pinToBottom = false;
+
+  /// 上一帧内容的总高度（-1 = 还不知道）。用来判断"刚才是不是贴着底"。
+  double lastMaxExtent = -1;
 
   @override
   ScrollPosition createScrollPosition(
@@ -146,14 +171,25 @@ class _BottomAnchorScrollPosition extends ScrollPositionWithSingleContext {
   bool applyContentDimensions(double minScrollExtent, double maxScrollExtent) {
     final bool ok =
         super.applyContentDimensions(minScrollExtent, maxScrollExtent);
-    if (ok && controller.pinToBottom && controller.shouldFollow()) {
-      controller.pinToBottom = false; // 消费一次
-      if ((pixels - maxScrollExtent).abs() > 0.01) {
-        correctPixels(maxScrollExtent.clamp(minScrollExtent, maxScrollExtent));
-        // 返回 false 请求 RenderViewport 用校正后的 offset 同帧重跑布局：
-        // 绘制前即已贴底（下一次迭代残差归零 → 返回 true 收敛）。
-        return false;
-      }
+    if (!ok || !controller.shouldFollow()) return ok;
+    // **粘底**：请求贴底（首帧 / 历史重载 / 追加），或者上一帧我们本来就贴着底。
+    //
+    // 为什么"本来就贴着底"也算一次：懒构建列表的高度是**估算**的，随着视口周围
+    // 构建出真实内容，maxScrollExtent 还会再长——只认一次性的请求就会停在半路
+    // （用户报的「长会话导入不能直接划到底部」）。用户一旦上滚，pixels 立刻离开 max，
+    // 这里就不再校正（阅读模式零漂移的既有保证不变）。
+    final bool requested = controller.pinToBottom;
+    final bool glued =
+        controller.lastMaxExtent >= 0 &&
+        (pixels - controller.lastMaxExtent).abs() <= 1.0;
+    controller.lastMaxExtent = maxScrollExtent;
+    if (!requested && !glued) return ok;
+    controller.pinToBottom = false; // 消费一次
+    if ((pixels - maxScrollExtent).abs() > 0.01) {
+      correctPixels(maxScrollExtent.clamp(minScrollExtent, maxScrollExtent));
+      // 返回 false 请求 RenderViewport 用校正后的 offset 同帧重跑布局：
+      // 绘制前即已贴底（下一次迭代残差归零 → 返回 true 收敛）。
+      return false;
     }
     return ok;
   }
@@ -196,17 +232,55 @@ class _MessageListViewState extends State<_MessageListView> {
       shouldFollow: () => !_userDetached,
     );
     // 首帧即把视口钉到底部（最新消息），避免「顶部闪一下再落底」。
+    //
+    // **首帧也要"连续几帧贴底"**：导入长会话走的就是这条路径（不是 didUpdateWidget），
+    // 而懒构建列表首帧的 maxScrollExtent 只是估算值——只贴一帧就会停在半路，
+    // 这正是用户报的「会话太长时导入不能直接划到底部」。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _jumpToBottomSettling();
+    });
     _controller.pinToBottom = true;
   }
 
   @override
   void didUpdateWidget(covariant _MessageListView oldWidget) {
     super.didUpdateWidget(oldWidget);
+    // **前插补偿**（往回翻页）：前面插进来的内容会让"同一段内容"的 offset 变大。
+    // 常规布局下"末尾新增"天然不影响坐标，但"前面新增"会整体下移——不补偿就会
+    // 看到视口跳走（本来在看的那条被推到屏幕外）。
+    final bool prepended =
+        oldWidget.messages.isNotEmpty &&
+        widget.messages.isNotEmpty &&
+        widget.messages.length > oldWidget.messages.length &&
+        widget.messages.first.id != oldWidget.messages.first.id;
+    if (prepended) {
+      final double before = _controller.hasClients
+          ? _controller.position.maxScrollExtent
+          : 0;
+      final double beforePixels = _controller.hasClients
+          ? _controller.position.pixels
+          : 0;
+      _controller.pinToBottom = false; // 别在这儿贴底：用户在看历史
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_controller.hasClients) return;
+        final double after = _controller.position.maxScrollExtent;
+        final double delta = after - before;
+        if (delta > 0) {
+          _controller.jumpTo(
+            (beforePixels + delta).clamp(
+              _controller.position.minScrollExtent,
+              after,
+            ),
+          );
+        }
+      });
+    }
     if (oldWidget.revision != widget.revision) {
       if (widget.bottomJump) {
-        // 历史整批重载（切会话/切 agent/清空重拉）：恢复跟随并直达底部
-        _userDetached = false;
-        _schedulePin();
+        // 历史整批重载（切会话/切 agent/清空重拉）：恢复跟随并直达底部。
+        // 用"连续几帧贴底"而不是只贴一帧：长会话懒构建时 maxScrollExtent 是估算值
+        // （见 [_jumpToBottomSettling]）。
+        _jumpToBottomSettling();
       } else if (!_userDetached) {
         // 跟随模式：本帧布局阶段同步钉底
         _schedulePin();
@@ -230,6 +304,90 @@ class _MessageListViewState extends State<_MessageListView> {
   /// 请求在本次布局帧内把视口同步钉到底部（细节见 [_BottomAnchorScrollPosition]）。
   void _schedulePin() {
     _controller.pinToBottom = true;
+  }
+
+  /// 直达底部的"收尾"帧数上限（见 [_jumpToBottomSettling]）。
+  static const int _pinSettleLimit = 120;
+  int _pinSettleFrames = 0;
+  double _lastMaxExtent = -1;
+
+  /// 程序化的"直达底部"进行中：期间不把滚动通知当成用户上滚（见 [_jumpToBottomSettling]）。
+  bool _jumpingToBottom = false;
+
+  /// 历史整批重载后**连续几帧**继续贴底。
+  ///
+  /// 为什么不能只贴一帧：`ListView.builder` 是懒构建的，长会话里
+  /// `maxScrollExtent` 在首帧只是**估算值**（按已构建子项的平均高度外推）；
+  /// 贴一次底之后，随着视口周围真正构建出内容，额外高度才补上——用户看到的现象
+  /// 就是「导入长会话后没能到最底部」。这里在跟随模式下逐帧复查，直到
+  /// 位移归零或帧数用尽（用户上滚立即停手，见 [_onScrollNotification]）。
+  void _jumpToBottomSettling() {
+    _userDetached = false;
+    // **这一跳是程序发起的**：期间不管收到什么滚动通知都不许把它判成"用户上滚"。
+    // 真机根因就在这里——长会话导入时列表从 0 一跳到估算的底部，中间必然经过
+    // "离底很远"的位置；一旦被判定成阅读模式，后面的贴底就全被 [shouldFollow] 挡掉，
+    // 用户看到的就是「导入长会话没能划到底部」。
+    _jumpingToBottom = true;
+    _schedulePin();
+    _lastMaxExtent = -1;
+    _pinSettleFrames = _pinSettleLimit;
+    _settlePin();
+  }
+
+  void _settlePin() {
+    if (!mounted || _pinSettleFrames <= 0) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _pinSettleFrames <= 0 || _userDetached) {
+        _jumpingToBottom = false;
+        return;
+      }
+      if (!_controller.hasClients) {
+        _jumpingToBottom = false;
+        return;
+      }
+      _pinSettleFrames--;
+      final ScrollPosition pos = _controller.position;
+      final double max = pos.maxScrollExtent;
+      // 还没贴底，或者内容又长高了（懒构建把额外高度补上来了）⇒ 再贴一帧
+      final bool stillGrowing = max > _lastMaxExtent + 0.5;
+      _lastMaxExtent = max;
+      if ((pos.pixels - max).abs() > 0.5 || stillGrowing) {
+        _schedulePin();
+        // 重新贴底**必须再要一帧**：pinToBottom 只是个标记，没有新一帧就不会再
+        // 触发一次布局（post-frame 回调本身不排帧）。少了这一句，长列表会停在中途。
+        WidgetsBinding.instance.scheduleFrame();
+        _settlePin();
+        return;
+      }
+      // 收敛了：这一跳结束，此后才允许按滚动通知判定用户上滚
+      _jumpingToBottom = false;
+      _settlePin();
+    });
+  }
+
+  /// 顶部的"加载更早的消息"入口：点它翻一页；正在翻时显示进度。
+  Widget _buildEarlierBanner(BuildContext context) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Center(
+        child: TextButton.icon(
+          onPressed: widget.loadingEarlier ? null : widget.onLoadEarlier,
+          icon: widget.loadingEarlier
+              ? const SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.history, size: 14),
+          label: Text(
+            widget.loadingEarlier ? '正在加载更早的消息…' : '加载更早的消息',
+            style: const TextStyle(fontSize: 12),
+          ),
+          style: TextButton.styleFrom(foregroundColor: cs.onSurfaceVariant),
+        ),
+      ),
+    );
   }
 
   /// 滚动定位到指定消息并短暂高亮。
@@ -291,8 +449,19 @@ class _MessageListViewState extends State<_MessageListView> {
     if (notification is! ScrollUpdateNotification) return false;
     // 回底动画的中间帧不算用户上滚
     if (_returningToBottom) return false;
+    // 程序化的"直达底部"期间不算用户上滚（长会话导入必经"离底很远"的中间位置）
+    if (_jumpingToBottom) return false;
     final ScrollMetrics m = notification.metrics;
     _setUserDetached(m.maxScrollExtent - m.pixels > _bottomEpsilon);
+    // 滚到顶了：自动往回翻一页（懒加载分页）。放在**下一次帧后**触发，
+    // 免得在滚动通知里同步 setState + 网络请求打乱这一帧的滚动。
+    if (m.pixels <= m.minScrollExtent + 1 &&
+        widget.hasEarlier &&
+        !widget.loadingEarlier) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) widget.onLoadEarlier?.call();
+      });
+    }
     return false;
   }
 
@@ -367,25 +536,34 @@ class _MessageListViewState extends State<_MessageListView> {
             // （首帧即贴底，无「顶部闪一下再落底」）；阅读模式下不做任何补偿，
             // 末尾新增内容天然不影响已渲染内容的位置（零漂移）。
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            itemCount: widget.messages.length + widget.trailingCards.length,
+            itemCount:
+                widget.messages.length +
+                widget.trailingCards.length +
+                (widget.hasEarlier ? 1 : 0),
             itemBuilder: (BuildContext context, int index) {
+              // 顶部那一格是"加载更早的消息"（懒加载分页的入口）：
+              // 它只占列表位置，不参与消息索引
+              if (widget.hasEarlier && index == 0) {
+                return _buildEarlierBanner(context);
+              }
+              final int at = widget.hasEarlier ? index - 1 : index;
               // 消息之后的槽位让给插件内联卡片（Q12）：按到达顺序逐项渲染，
               // 位置 = 消息流末尾（最新消息之后），与流式追加同一个滚动语义。
-              if (index >= widget.messages.length) {
+              if (at >= widget.messages.length) {
                 return Padding(
                   padding: const EdgeInsets.only(bottom: 12),
-                  child: widget.trailingCards[index - widget.messages.length],
+                  child: widget.trailingCards[at - widget.messages.length],
                 );
               }
-              // 常规布局：index 递增 = 由旧到新，最新消息在底部
-              final ChatMessage message = widget.messages[index];
+              // 常规布局：索引递增 = 由旧到新，最新消息在底部（at 已扣掉顶部分页那一格）
+              final ChatMessage message = widget.messages[at];
               // 临时员工的消息：在他的那一段**开头**标一次（同一个人的连续消息/工具
               // 只在第一行顶标签，避免每条都占一行）。核心把临时员工的一切都写进
               // 会话主人的消息流，不打标就会看起来像主 agent 在说话。
               final bool showSubagentTag =
                   message.isSubagentMessage &&
-                  (index == 0 ||
-                      widget.messages[index - 1].subagentId != message.subagentId);
+                  (at == 0 ||
+                      widget.messages[at - 1].subagentId != message.subagentId);
               // 工具调用卡片：默认折叠，独立渲染
               Widget child;
               if (message.kind == 'tool') {

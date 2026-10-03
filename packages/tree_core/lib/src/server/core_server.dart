@@ -2122,10 +2122,27 @@ class CoreServer {
       ..sort(
         (CoreMessage a, CoreMessage b) => a.timestamp.compareTo(b.timestamp),
       );
+    // **懒加载分页**（用户 2026-10-04：「会话太长时导入不能直接划到底部；长会话仅加载
+    // 末尾一段」）：limit = 这次要多少条（取**末尾**），before = 只要比这条消息更早的
+    // （前端拿着"当前最老的那条 id"往回翻页）。不传 limit 就是老口径：整份都返回。
+    final int limit =
+        int.tryParse(request.uri.queryParameters['limit'] ?? '') ?? 0;
+    final String before = (request.uri.queryParameters['before'] ?? '').trim();
+    int end = ordered.length;
+    if (before.isNotEmpty) {
+      final int at = ordered.indexWhere((CoreMessage m) => m.id == before);
+      // 找不到游标（消息被清掉 / 会话换了）：当"从头开始"，别默默返回整份
+      if (at >= 0) end = at;
+    }
+    final int start = (limit > 0 && end > limit) ? end - limit : 0;
+    final List<CoreMessage> page = ordered.sublist(start, end);
     await writeJson(request, 200, <String, dynamic>{
       'agent_id': agentId,
       'session_id': sessionId,
-      'messages': ordered.map((CoreMessage m) => _messageJson(m)).toList(),
+      'messages': page.map((CoreMessage m) => _messageJson(m)).toList(),
+      // 分页元信息（老前端忽略它们，行为不变）
+      'total': ordered.length,
+      'has_more': start > 0,
     });
   }
 

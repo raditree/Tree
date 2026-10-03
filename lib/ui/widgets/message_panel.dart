@@ -195,6 +195,22 @@ class _MessagePanelState extends State<MessagePanel> {
   /// [_handleSelectSession]）。
   String _viewSubagentId = '';
 
+  /// 正在跑的**临时员工** id（帧里带 `subagent_id` 的那些）。
+  ///
+  /// 与 [_workingAgents] 分开：临时员工有独立的视角、也能被用户单独停止/追问
+  /// （用户 2026-10-04），它的"工作中"不该混进任何真 agent 的状态里。
+  final Set<String> _workingSubagents = <String>{};
+
+  /// 一次拉多少条历史（**长会话只加载末尾一段**：用户 2026-10-04「会话太长时导入不能
+  /// 直接划到底部；懒加载，长会话仅加载末尾一段」）。200 条足够铺满几屏，滚到顶再往回翻。
+  static const int _historyPageSize = 200;
+
+  /// 还有**更早**的消息没取回来（据此在列表顶部显示"加载更早"的入口）。
+  bool _hasEarlierHistory = false;
+
+  /// 正在往回翻页（防重复触发）。
+  bool _loadingEarlier = false;
+
   @override
   void initState() {
     super.initState();
@@ -590,11 +606,15 @@ class _MessagePanelState extends State<MessagePanel> {
     if (agent == null) return;
     final String sessionId = _currentSessionId;
     try {
-      final List<Map<String, dynamic>> raw =
-          await ApiService.getConversationHistory(
-            agent.id,
-            sessionId: sessionId,
-          );
+      // 只取**末尾一段**：长会话（几 MB 的 jsonl / 几千条消息）导入不再是
+      // "全量读盘 + 全量建 widget + 再想办法滚到底"——那正是长会话"划不到底"的根因
+      // （懒构建的列表里 maxScrollExtent 一开始只是估算值）。
+      final HistoryPage page = await ApiService.getConversationHistoryPage(
+        agent.id,
+        sessionId: sessionId,
+        limit: _historyPageSize,
+      );
+      final List<Map<String, dynamic>> raw = page.messages;
       if (!mounted) return;
       // 会话可能在等待期间被切换，丢弃过期的历史
       if (sessionId != _currentSessionId) return;
@@ -613,6 +633,9 @@ class _MessagePanelState extends State<MessagePanel> {
         _replayGuard.resetToHistory(_messages.map((ChatMessage m) => m.id));
         // 历史整批重载：驱动 MessageList 无动画直达底部（避免下滑动画）
         _bottomJump = true;
+        // 还有更早的：列表顶部给一个"加载更早的消息"入口
+        _hasEarlierHistory = page.hasMore;
+        _loadingEarlier = false;
         // 注意：不再按「当前会话历史是否为空」重置 _modeLocked——
         // 运行模式是顶部 agent 级共享的，锁定状态由 _loadSessions
         // 依据「该 agent 是否已有任一历史会话」统一决定，切换会话
@@ -641,6 +664,51 @@ class _MessagePanelState extends State<MessagePanel> {
       });
     } catch (e) {
       // 拉取失败时静默处理（保持空列表）
+    }
+  }
+
+  /// **往回翻一页**：拿当前最老那条消息的 id 当游标，把更早的一页插到列表前面。
+  ///
+  /// 滚动位置由 [MessageList] 自己补偿（前面插进来的高度不能让视口跳走）。
+  Future<void> _loadEarlierHistory() async {
+    final Agent? agent = widget.selectedAgent;
+    if (agent == null || _loadingEarlier || !_hasEarlierHistory) return;
+    if (_messages.isEmpty) return;
+    final String sessionId = _currentSessionId;
+    final String beforeId = _messages.first.id;
+    setState(() => _loadingEarlier = true);
+    try {
+      final HistoryPage page = await ApiService.getConversationHistoryPage(
+        agent.id,
+        sessionId: sessionId,
+        limit: _historyPageSize,
+        beforeId: beforeId,
+      );
+      if (!mounted) return;
+      // 会话在等待期间被切走：丢弃这一页
+      if (sessionId != _currentSessionId) return;
+      final List<ChatMessage> older = page.messages
+          .map(ChatMessage.fromJson)
+          .toList(growable: false);
+      setState(() {
+        // 按 id 去重后前插（同一批历史不许出现两条）
+        final Set<String> known = _messages
+            .map((ChatMessage m) => m.id)
+            .toSet();
+        final List<ChatMessage> fresh = older
+            .where((ChatMessage m) => !known.contains(m.id))
+            .toList(growable: false);
+        _messages.insertAll(0, fresh);
+        _hasEarlierHistory = page.hasMore;
+        _loadingEarlier = false;
+        // 这批是**已关闭的段**：同样封口（重播帧不许再往它们身上追加）
+        _replayGuard.resetToHistory(_messages.map((ChatMessage m) => m.id));
+        SubagentTranscript.instance.sync(_messages);
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _loadingEarlier = false);
+      _showSnackBar('加载更早的消息失败：${_errorText(e)}');
     }
   }
 
@@ -879,15 +947,21 @@ class _MessagePanelState extends State<MessagePanel> {
       final String? agentId = d['agent_id'] as String?;
       final String? status = d['status'] as String?;
       if (agentId == null) return;
+      // 临时员工的帧带它自己的标记（agent_id 仍是会话主人）：单独记一份，中栏的
+      // "临时员工视角"据此决定右下角是停止键还是发送键（用户 2026-10-04）
+      final String subagentId = (d['subagent_id'] as String?) ?? '';
       setState(() {
         if (status == 'working') {
           _workingAgents.add(agentId);
           _compactingAgents.remove(agentId);
+          if (subagentId.isNotEmpty) _workingSubagents.add(subagentId);
         } else if (status == 'compacting') {
           _compactingAgents.add(agentId);
+          if (subagentId.isNotEmpty) _workingSubagents.add(subagentId);
         } else if (status == 'idle' || status == 'stopping') {
           _workingAgents.remove(agentId);
           _compactingAgents.remove(agentId);
+          if (subagentId.isNotEmpty) _workingSubagents.remove(subagentId);
         }
       });
     } else if (type == 'ask_user_question') {
@@ -1043,10 +1117,20 @@ class _MessagePanelState extends State<MessagePanel> {
   void _handleStop() {
     final Agent? agent = widget.selectedAgent;
     if (agent == null) return;
+    // 看临时员工视角时**只停它**（用户 2026-10-04：允许用户停止 subagent 的工作）——
+    // agent 级的 stop 会级联停掉它的成员/子树，那不是这里该发生的事。
+    final String viewId = _effectiveViewId;
     _webSocket.send(<String, dynamic>{
       'type': 'stop',
-      'data': {'agent_id': agent.id, 'session_id': _currentSessionId},
+      'data': {
+        'agent_id': viewId.isEmpty ? agent.id : viewId,
+        'session_id': _currentSessionId,
+      },
     });
+    // 本地先把它的状态翻成空闲：帧回来之前别让那颗停止键卡在那里
+    if (viewId.isNotEmpty) {
+      setState(() => _workingSubagents.remove(viewId));
+    }
   }
 
   /// 处理发送
@@ -1084,6 +1168,14 @@ class _MessagePanelState extends State<MessagePanel> {
       if (!mounted) return false;
     }
 
+    // 看临时员工视角时，这条消息发给**它**（用户 2026-10-04：向其发消息）：
+    // - 收件人用它的 id（核心侧走 `sendToSubagent`：落 `role=user` + 它的标记）；
+    // - 本地那条乐观气泡**也要打它的标记**，否则会出现在主消息流里而不是它的过程里。
+    final String viewId = _effectiveViewId;
+    final bool toSubagent = viewId.isNotEmpty;
+    final List<ChatMessage> transcript = toSubagent
+        ? _viewTranscript()
+        : const <ChatMessage>[];
     final ChatMessage userMessage = ChatMessage(
       id: 'user_${DateTime.now().millisecondsSinceEpoch}',
       role: 'user',
@@ -1092,6 +1184,12 @@ class _MessagePanelState extends State<MessagePanel> {
       attachments: attachments.isEmpty
           ? null
           : attachments.map(_attachmentOf).toList(),
+      subagentId: toSubagent ? viewId : '',
+      subagentName: toSubagent ? subagentName(transcript) : '',
+      subagentParentId: toSubagent && transcript.isNotEmpty
+          ? transcript.first.subagentParentId
+          : '',
+      subagentLevel: toSubagent ? subagentLevel(transcript) : 0,
     );
 
     setState(() {
@@ -1104,9 +1202,10 @@ class _MessagePanelState extends State<MessagePanel> {
 
     _webSocket.sendMessage(<String, dynamic>{
       'type': 'user_message',
-      'agent_id': agent.id,
+      'agent_id': toSubagent ? viewId : agent.id,
       'content': text,
-      // 工作空间相对路径（附件已由前端上传完成），核心把它写进提示词
+      // 工作空间相对路径（附件已由前端上传完成），核心把它写进提示词。
+      // 临时员工与发起者**共享同一个工作空间**，所以上传目标仍是这个 agent。
       'attachments': attachments,
       'session_id': _currentSessionId,
     });
@@ -1348,6 +1447,10 @@ class _MessagePanelState extends State<MessagePanel> {
                   return MessageList(
                     messages: visibleStreamMessages(_messages),
                     revision: _scrollRevision,
+                    // 懒加载：还有更早的一页时，列表顶部给入口；滚到顶自动拉
+                    hasEarlier: _hasEarlierHistory,
+                    loadingEarlier: _loadingEarlier,
+                    onLoadEarlier: _loadEarlierHistory,
                     onAskAnswer: _handleAskAnswer,
                     scrollToMessageId: _scrollToMessageId,
                     scrollToRevision: _scrollToRevision,
@@ -1395,12 +1498,10 @@ class _MessagePanelState extends State<MessagePanel> {
                 onSelect: _switchView,
               ),
               // 生成中且没输入内容时，右下角那个位置变成**停止键**（用户 2026-10-04；
-              // 开始打字就换回发送键——发送本身就会中止在途那一轮）
-              busy: agent.id.isEmpty ? false : _workingAgents.contains(agent.id),
+              // 开始打字就换回发送键——发送本身就会中止在途那一轮）。
+              // 看临时员工视角时看的是**它自己**的状态：停止/发消息都只作用在它身上。
+              busy: _viewTargetIsWorking(agent.id),
               onStop: _handleStop,
-              // 临时员工视角是**只读**的：那条过程不是你与这个 agent 的对话
-              locked: _effectiveViewId.isNotEmpty,
-              lockedHint: _lockedComposerHint(),
             ),
             ],
           ),
@@ -1902,12 +2003,11 @@ class _MessagePanelState extends State<MessagePanel> {
     });
   }
 
-  /// 只读输入框上那句说明（临时员工视角下不能发消息：那条过程不是你与它的对话）。
-  String _lockedComposerHint() {
-    final List<ChatMessage> transcript = _viewTranscript();
-    final String name = subagentName(transcript);
-    return '正在看临时员工「$name」的过程（只读）：它是这个 agent 召来的，不是对话的一轮；'
-        '右下角可切回主会话';
+  /// 右下角那个键该看谁的"工作中"：主会话看 agent，临时员工视角看**它自己**。
+  bool _viewTargetIsWorking(String agentId) {
+    final String viewId = _effectiveViewId;
+    if (viewId.isNotEmpty) return _workingSubagents.contains(viewId);
+    return agentId.isNotEmpty && _workingAgents.contains(agentId);
   }
 
   /// 临时员工视角的正文区：一行身份条 + 它的完整过程（**同一个窗口**里换掉消息列表）。
@@ -1953,6 +2053,16 @@ class _MessagePanelState extends State<MessagePanel> {
                           ),
                         ),
                       ),
+                      // 它自己的实时状态（用户可以直接停止/追问它，所以必须看得见）
+                      Text(
+                        _workingSubagents.contains(subagentId) ? '工作中' : '空闲',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: _workingSubagents.contains(subagentId)
+                              ? Colors.orange
+                              : cs.onSurfaceVariant,
+                        ),
+                      ),
                     ],
                   ),
                   if (reading != null) ...<Widget>[
@@ -1966,6 +2076,16 @@ class _MessagePanelState extends State<MessagePanel> {
                     ),
                   ],
                 ],
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '你可以直接在这里给它发消息（它在跑时右下角那颗键是**停止**）；'
+              '它自然跑完会把报告注入发起者会话；**你停的那一轮不会**——原因由你自己说。',
+              style: TextStyle(
+                fontSize: 11,
+                color: cs.onSurfaceVariant,
+                height: 1.4,
               ),
             ),
             const SizedBox(height: 12),

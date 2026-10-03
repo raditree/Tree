@@ -40,17 +40,42 @@ class _RunToken {
   /// 而"我发新消息 → 旧那轮自动让位"是打断/插话（interjection）语义，
   /// 再刷一条"已停止"只会造成噪声（用户根本没按停止）。
   bool interrupted = false;
+
+  /// 这一轮是不是**人**叫停的（用户按停止 / 用户插话）。
+  ///
+  /// 与"系统内部收敛"刻意分开（用户 2026-10-04 的硬要求：停止后不用向父 agent 发结束
+  /// 提示，用户自己说原因；但**其它原因导致的中止必须报**）。系统内部的收敛有两类，
+  /// 都不算人叫停：hook 提示唤醒（wake）、以及别的临时员工完成报告注入时连带收敛
+  /// 同一会话里还在跑的那些——那两类被中止的活，发起者**有权知道**它没干完。
+  bool userStopped = false;
 }
 
 /// 一轮生成的产出：临时员工轮要拿它的"最终报告"回灌给发起者。
 class _TurnOutcome {
-  const _TurnOutcome({this.report = '', this.error = ''});
+  const _TurnOutcome({
+    this.report = '',
+    this.error = '',
+    this.cancelled = false,
+    this.userStopped = false,
+  });
 
   /// 本轮最后一段正文（最终回复；没有正文时为空串）。
   final String report;
 
   /// 可读失败原因（空串 = 没失败）。
   final String error;
+
+  /// 这一轮是不是**被人为中止**（任何原因）的，而不是自然结束或出错。
+  ///
+  /// 区别很重要（用户 2026-10-04）：「停止后不用向父 agent 发结束提示（用户自己说原因），
+  /// 用户可能再次向 subagent 发消息使其启动，自然结束后回父 agent 总结。但如果是其他
+  /// 错误导致的中止要向父 agent 发消息提示」——所以"人为中止"与"出错"必须分得开。
+  final bool cancelled;
+
+  /// 中止这件事是不是**人**做的（用户按停止 / 用户插话）。
+  ///
+  /// 只有"人叫停"才不向发起者注入结束提示（见 [cancelled] 与 subagent 的完成注入）。
+  final bool userStopped;
 }
 
 /// 本轮正在生成的一条消息（与前端消息一一对应：先立 start，再追加 chunk）。
@@ -224,6 +249,12 @@ class ConversationService {
     final String agentId = frame['agent_id'] as String? ?? '';
     final String content = frame['content'] as String? ?? '';
     final String sessionId = frame['session_id'] as String? ?? '';
+    // 收件人是**临时员工**（`sub_…`）：这是"用户直接对它说话"（用户 2026-10-04：
+    // 「允许用户停止 subagent 的工作、向其发消息」）——复用同一条 `user_message` 帧，
+    // 因为语义上它就是一条用户消息，只是收件人不是真 agent（见 [sendToSubagent]）。
+    if (subagents?.isSubagent(agentId) ?? false) {
+      return sendToSubagent(frame);
+    }
     final CoreAgent? agent = store.agent(agentId);
     if (agent == null) {
       _sendError('未知 agent：$agentId');
@@ -244,7 +275,11 @@ class ConversationService {
     );
     // 新消息到达 = 插话：把**同一会话**在途的那一轮立刻打断（工具循环就此收敛），
     // 让这条新消息的下一轮紧接着跑起来（顺序 / 代次 / 会话边界见 [_interruptForNewMessage]）。
-    _interruptForNewMessage(agent.id, sessionId: session.sessionId);
+    _interruptForNewMessage(
+      agent.id,
+      sessionId: session.sessionId,
+      byUser: true,
+    );
     return _enqueue(
       agent.id,
       session.sessionId,
@@ -285,6 +320,8 @@ class ConversationService {
     if (tokens.isEmpty) return false;
     for (final _RunToken token in tokens) {
       token.cancelled = true;
+      // 人按的停止：被中止的临时员工**不**向发起者注入结束提示（用户自己会说原因）
+      token.userStopped = true;
     }
     return true;
   }
@@ -421,13 +458,18 @@ class ConversationService {
   ///   （`WorkspaceIO.exec` 没有取消参数，且 M9 规定本地执行活着就永不超时、
   ///   不按时间杀进程）；
   /// - 有在途任务时计数 [interruptedRunCount]，便于测试与排障。
-  void _interruptForNewMessage(String agentId, {required String sessionId}) {
+  void _interruptForNewMessage(
+    String agentId, {
+    required String sessionId,
+    bool byUser = false,
+  }) {
     final _RunToken? token = _running[_runKey(agentId, sessionId)];
     if (token == null) return;
     // 只作废**这个会话**在途的提问：别的会话可能也在跑、也在等人回答，不能一起取消。
     questions?.cancelForSession(agentId, sessionId);
     token.interrupted = true;
     token.cancelled = true; // 复用既有取消通道：流式循环每帧检查，工具之间也检查
+    if (byUser) token.userStopped = true;
     // 父那轮被打断时，它在**同一个会话**里派出去、正在跑的临时员工也要收敛：
     // 否则父的工具调用要一直等它们跑完，用户看到的"插话"就是假的。
     for (final _RunToken child in _running.values) {
@@ -436,6 +478,9 @@ class ConversationService {
       if (identical(child, token)) continue;
       child.interrupted = true;
       child.cancelled = true;
+      // 连带收敛的那些：**只有用户插话**才算"人叫停"；hook 提示唤醒 / 别的临时员工
+      // 完成报告导致的收敛都算系统内部，被中止的活照样要回报给发起者
+      if (byUser) child.userStopped = true;
     }
     interruptedRunCount++;
   }
@@ -905,7 +950,11 @@ class ConversationService {
     _running.remove(runKey);
     // 别的会话 / 别的后台临时员工可能还在跑：只有该 agent **一个在途轮次都不剩**
     // 时才广播 idle（[isRunning] 把"它名下的临时员工"也算在内）。
-    if (!isRunning(ownerId)) {
+    //
+    // **临时员工例外**：它有自己的标记、自己的视角（用户 2026-10-04 起还能被用户直接
+    // 停止/追问），所以它这一轮结束就**总是**报自己的 idle——否则父那轮还卡着等它时
+    // （blocking 模式）它那边的"工作中"永远亮着，面板也就不会把停止键换回发送键。
+    if (subagent != null || !isRunning(ownerId)) {
       hub.broadcast(<String, dynamic>{
         'type': WsOutboundType.agentStatus,
         'data': <String, dynamic>{
@@ -915,7 +964,12 @@ class ConversationService {
         },
       });
     }
-    return _TurnOutcome(report: report, error: failure ?? '');
+    return _TurnOutcome(
+      report: report,
+      error: failure ?? '',
+      cancelled: cancelled,
+      userStopped: token.userStopped,
+    );
   }
 
   /// 跑一轮**临时员工**生成（`subagent` 工具的落点，见 [SubagentTurnRunner]）。
@@ -954,23 +1008,28 @@ class ConversationService {
             '等它这一轮结束后再复用，或新召一个（不填 subagent_id）。',
       );
     }
-    store.appendMessage(
-      CoreMessage(
-        id: CoreIds.message(),
-        agentId: owner.id,
-        sessionId: session.sessionId,
-        role: 'agent',
-        content: request.task,
-        // 它自己那一轮的输入：与 hook 提示同类（引擎按 user 翻译），但发起者的上下文
-        // 里没有它（任务已经写在发起者的 subagent 工具调用参数里了）
-        kind: MessageKinds.subagentTask,
-        timestamp: DateTime.now().millisecondsSinceEpoch,
-        subagentId: tag.id,
-        subagentName: tag.name,
-        subagentParentId: tag.parentId,
-        subagentLevel: tag.level,
-      ),
-    );
+    // 用户直接说的那句话，调用方（[sendToSubagent]）**已经落库**了：
+    // 它得是 `role='user'` 的普通消息，屏幕上就是"我对它说了一句"，
+    // 不能再补一条 `subagent_task`（那会变成两句）。
+    if (!request.fromUser) {
+      store.appendMessage(
+        CoreMessage(
+          id: CoreIds.message(),
+          agentId: owner.id,
+          sessionId: session.sessionId,
+          role: 'agent',
+          content: request.task,
+          // 它自己那一轮的输入：与 hook 提示同类（引擎按 user 翻译），但发起者的上下文
+          // 里没有它（任务已经写在发起者的 subagent 工具调用参数里了）
+          kind: MessageKinds.subagentTask,
+          timestamp: DateTime.now().millisecondsSinceEpoch,
+          subagentId: tag.id,
+          subagentName: tag.name,
+          subagentParentId: tag.parentId,
+          subagentLevel: tag.level,
+        ),
+      );
+    }
     final List<CoreMessageRef> history = store
         .messages(tag.id, session.sessionId)
         .map(_toRef)
@@ -984,7 +1043,143 @@ class ConversationService {
       history: history,
       freshContext: true,
     );
-    return SubagentTurnResult(report: outcome.report, error: outcome.error);
+    return SubagentTurnResult(
+      report: outcome.report,
+      error: outcome.error,
+      cancelled: outcome.cancelled,
+      userStopped: outcome.userStopped,
+    );
+  }
+
+  /// **用户（界面）直接给某个临时员工发消息**（用户 2026-10-04 要求）。
+  ///
+  /// 与工具那条路的区别：
+  /// - 不新建、不校验层级：只认"这个会话里真有它"；
+  /// - 落库是 `role='user'` 的普通消息 + **它的标记**（它自己的历史按标记取，见
+  ///   store 不变量；发起者的模型上下文照旧看不到它）；
+  /// - **插话语义与主 agent 一致**：它正在跑就先把那一轮打断，这条消息接着跑；
+  /// - 跑完照旧把报告注入**发起者会话**（与后台临时员工同一段话术）——发起者对
+  ///   "我的员工又干了一轮"因此是知情的。
+  Future<void> sendToSubagent(Map<String, dynamic> frame) async {
+    final String subagentId = (frame['agent_id'] as String? ?? '').trim();
+    final String content = (frame['content'] as String? ?? '').trim();
+    final String sessionId = (frame['session_id'] as String? ?? '').trim();
+    final CoreSubagent? record = subagents?.handle(subagentId);
+    if (record == null) {
+      _sendError('临时员工不存在或已被清理：$subagentId（请重新召一个）');
+      return;
+    }
+    // 它只活在它被召来的那个会话里（跨会话复用是硬错误，见 store 不变量）
+    final String targetSession = sessionId.isEmpty
+        ? record.sessionId
+        : sessionId;
+    if (targetSession != record.sessionId) {
+      _sendError(
+        '临时员工「${record.name}」只活在它被召来的那个会话里'
+        '（${record.sessionId}）：请回到那个会话里跟它说话。',
+      );
+      return;
+    }
+    if (content.isEmpty) {
+      _sendError('消息内容为空：请写一句要它做什么的话。');
+      return;
+    }
+    final SubagentTag tag = SubagentTag(
+      id: record.id,
+      name: record.name,
+      parentId: record.parentId,
+      level: record.level,
+    );
+    store.appendMessage(
+      CoreMessage(
+        id: CoreIds.message(),
+        agentId: record.ownerAgentId,
+        sessionId: record.sessionId,
+        role: 'user',
+        content: content,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+        attachments: _attachments(frame['attachments']),
+        subagentId: tag.id,
+        subagentName: tag.name,
+        subagentParentId: tag.parentId,
+        subagentLevel: tag.level,
+      ),
+    );
+    // 插话：先打断它当前那一轮（工具之间的收敛口径与主 agent 完全一致）。
+    // 这是**用户**说的 → byUser：被中止的那一轮不向发起者注入结束提示。
+    _interruptForNewMessage(
+      record.id,
+      sessionId: record.sessionId,
+      byUser: true,
+    );
+    await _enqueue(
+      record.id,
+      record.sessionId,
+      () => _runUserSubagentTurn(record, tag, content),
+    );
+  }
+
+  /// 用户那条消息触发的那一轮：等上一轮收尾 → 跑 → 把报告注入发起者会话。
+  Future<void> _runUserSubagentTurn(
+    CoreSubagent record,
+    SubagentTag tag,
+    String content,
+  ) async {
+    // 上一轮可能正在收尾（它被取消了，但工具跑完才收敛；M9 不杀工具）。
+    // 给一个有界的等待，而不是当场报"正在跑上一轮"——用户刚说过话，不该被丢掉。
+    final String runKey = _runKey(tag.id, record.sessionId);
+    final DateTime deadline = DateTime.now().add(const Duration(seconds: 10));
+    while (_running.containsKey(runKey) && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+    final CoreAgent? owner = store.agent(record.ownerAgentId);
+    final CoreSession? session = store.session(record.ownerAgentId, record.sessionId);
+    if (owner == null || session == null) return;
+    if (_running.containsKey(runKey)) {
+      _sendNotice(
+        owner,
+        session,
+        '没能把你的消息交给临时员工「${record.name}」：它还在收尾上一轮'
+        '（正在跑的工具不杀进程，跑完才收敛）。可以稍后再发，或先停止它。',
+        subagent: tag,
+        transcriptAgentId: record.ownerAgentId,
+      );
+      return;
+    }
+    final SubagentTurnResult result = await runSubagent(
+      SubagentTurnRequest(
+        tag: tag,
+        ownerAgentId: record.ownerAgentId,
+        sessionId: record.sessionId,
+        task: content,
+        fromUser: true,
+      ),
+    );
+    // 完成报告注入发起者会话（与后台临时员工同一段话术、同一条 wake 链路）。
+    //
+    // **人为中止不注入**（用户 2026-10-04）：用户按了停止，或他自己插话把这一轮打断了
+    // ——原因由用户自己向发起者说，发起者不该收到一条"我的员工结束了一轮"的噪声；
+    // 用户很可能马上又发一条让它接着干，那时**自然结束**的报告才该回去。
+    // 反过来，**出错导致的中止必须说**（发起者否则以为活还在干）。
+    if (result.userStopped && result.error.isEmpty) {
+      // 不注入 = 不 wake。这里**只留一条日志**（不是消息）：发起者的上下文因此
+      // 干干净净，用户想说什么由他自己说。
+      hub.broadcast(<String, dynamic>{
+        'type': WsOutboundType.agentStatus,
+        'data': <String, dynamic>{
+          'agent_id': record.ownerAgentId,
+          'status': 'idle',
+          ...tag.frameFields,
+        },
+      });
+      return;
+    }
+    await wake(
+      agentId: record.ownerAgentId,
+      sessionId: record.sessionId,
+      notice: SubagentService.noticeText(record, result),
+      subagent: tag,
+    );
   }
 
   /// 发布一条工具调用事件（`agent.tool_call`；字段口径见 [AgentEvents.toolCall]）。
