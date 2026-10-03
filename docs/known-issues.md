@@ -1055,6 +1055,13 @@ Material `Scrollbar`，而全仓库没有任何 `ScrollConfiguration` / `ScrollB
   - 起不来、或重启后仍带着 ⇒ 往 **stderr** 留一句可读的话（不静默）后**照常启动**（绝不把用户挡在门外）；
   - 这两个标记不会传给 Dart 层。
 - **`tool/installer/tree-desktop.iss`**：安装后的"启动 Tree"改经 `explorer.exe`（断掉污染源，配注释说明理由）。
+  **必须写全路径 `{win}\explorer.exe`**：第一版写成裸名 `explorer.exe`，`[Run]` 把它当**相对路径**
+  （去 `{app}` 下找）⇒ 安装收尾弹「Unable to execute file … CreateProcess failed; code 2（找不到文件）」
+  （用户 2026-10-03 真机截图）。改成全路径后用**小安装器**实测过 Inno 语义：安装日志显示解析为
+  `C:\Windows\explorer.exe`，`[Run]` 条目执行后目标进程 `RT=0x0000`、父链 `RT=0x0000`、能跟随那些链接 ✓。
+  两条顺手记下的经验（免得再踩）：`postinstall` 条目在**静默安装下不执行**（Finished 页不显示）；
+  `DefaultDirName={tmp}` 那种"临时安装"的目录在安装结束就被清掉，而 explorer 是**异步**拉起的
+  ⇒ 被拉起的脚本会"文件已不在"（真安装用的是 `{app}`，不受影响）。
 - **终端侧的可读防呆**（上一轮做的，本轮补全）：命中**两种措辞**时弹一次指引——① 系统措辞
   `不受信任的装入点` / `untrusted mount point` / `无法遍历该路径`；② **CMake 措辞**
   `add_subdirectory given source … which is not an existing directory` **且**同时出现 `.plugin_symlinks`
