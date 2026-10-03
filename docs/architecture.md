@@ -135,6 +135,10 @@ Flutter UI 进程（lib/）                     核心进程（packages/tree_cor
 - **改法**：改 `defaultSystemPromptSeed` 只影响**新工作空间**（已有工作空间的 `.self/system_prompt.md` 是用户文件，
   不覆盖——要让线上生效得用右侧「重置」，见 [known-issues.md](known-issues.md) #5）；改 Spec 模板要**同时 bump `version:`
   并把原因写进 `changelog:`**（刷新按内容比对，同版本内容不同也会刷新并备份；版本号是"副本比模板新就保留"与审计的依据）。
+- **工具使用策略写在哪三处**：模型"知道何时 / 如何用某个工具"靠三处文字——工具描述（每轮随工具表下发）、
+  系统提示词种子（动手之前的策略章，如「临时员工（subagent）使用策略」）、内置 Spec（按规范分工时的口径）。
+  三处必须同口径，由 [test/subagent_tool_test.dart](../packages/tree_core/test/subagent_tool_test.dart) 钉住；
+  改其中一处就要同步另两处（改法同上：工具描述随代码走、种子只影响新工作空间、内置 Spec 要 bump version）。
 - **侦察口径（已写进系统提示词与 general-task / hard-task）**：侦察**从文档开始**——`README.md` 与本索引 →
   相关模块 README 的「不变量（assertions）」→ `development.md` 的命令 / `known-issues.md` 的坑 → 领域指南 →
   **再进代码核对**。文档与代码冲突**以代码为准**，但偏差要写进侦察笔记（那是顺手要修的文档问题）。
@@ -208,6 +212,19 @@ yaml 里**不属于已知键**的内容会被原样保留并写回（用户手�
 8. 落库优先：先写 `messages.jsonl` 再行动（重启后可恢复）。
 9. 密钥与 token 不进日志、不进帧、不进仓库。
 10. 每个新能力都要有"它坏了会怎样"的显式路径（降级 / 报错 / 部分结果），而不是"希望它不出错"。
+11. **Windows runner 在"带着 RedirectionGuard"启动时会自愈重启**
+    （[../windows/runner/main.cpp](../windows/runner/main.cpp)、[../tool/installer/tree-desktop.iss](../tool/installer/tree-desktop.iss)，
+    机制与实测见 [known-issues.md](known-issues.md) #16）：Windows 11 的 RedirectionGuard
+    （`EnforceRedirectionTrust`）让进程**拒绝跟随"非管理员创建的"重定向点**，而它**沿调用链传播**；
+    安装器是提权进程 ⇒ 被它拉起的 Tree 及其整棵子树（核心 / 集成终端 / 用户在终端里跑的构建命令）
+    都拒绝跟随 `windows/flutter/ephemeral/.plugin_symlinks/*` ⇒ `flutter build windows` 在那里必然失败
+    （而用户自己开的终端里能成功）。这条策略**清不掉**（`SetProcessMitigationPolicy(id, 0)` →
+    `ERROR_ACCESS_DENIED`）、**也没有创建期开关**，所以 runner 的处置是：启动时读一次
+    `GetProcessMitigationPolicy(ProcessRedirectionTrustPolicy)`，非零就**经 explorer 重新拉起自己**
+    （explorer 那条链实测是 0x0，能跟随）后退出；`--tree-rt-selfcheck` 只报状态与决定（打包自检 /
+    回归用例用它，不起 Flutter）；重启失败、或重启后仍非零 ⇒ 往 **stderr** 留一句可读的话再照常启动
+    （**不静默、也不把用户挡在门外**）。安装器里"启动 Tree"**必须经 `explorer.exe`**（不能直接 Filename
+    指 app），否则新装的实例一出生就带着这条缓解。
 
 ## 14. M9 语义决策速查（已落地）
 

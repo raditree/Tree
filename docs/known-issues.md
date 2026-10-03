@@ -985,89 +985,115 @@ Material `Scrollbar`，而全仓库没有任何 `ScrollConfiguration` / `ScrollB
 依据取自已核对版本的 GitHub 源），需要在真机上确认候选窗贴住了终端光标；若仍偏移，下一步是按 `caret_rect_`
 的坐标系（`SetCaretPos` 用客户区像素）再校一次缩放。
 
-## #16 Tree 的集成终端里"新建的 reparse point 跟随不了"⇒ `flutter build windows` 在那里必然失败
+## #16 Tree 的终端里"新建的 reparse point 跟随不了"⇒ 那里的 `flutter build windows` 必然失败
+
+> **2026-10-03 下半场推翻过一次结论**（保留教训）：先前写成"环境侧、不是代码缺陷、代码改不了"——
+> 那只是**一半**。链接确实是"不受信任的装入点"（这一半是 OS 行为，改不了）；另一半**在我们自己的
+> 进程上下文**：Tree 那条进程链带着 RedirectionGuard 的 `Enforce`，而它来自**提权的安装器**，
+> 完全可以在我们这边修掉。下面是坐实后的机制、修法与验证。
 
 **现象**（用户 2026-10-03）：同一个命令、同一个仓库——
 `dart run tool/package_windows.dart --installer --flutter <flutter.bat>`——
 **在 Tree 的集成终端里失败**（CMake：`add_subdirectory given source
 "flutter/ephemeral/.plugin_symlinks/<插件>/windows" which is not an existing directory`），
-**在用户自己的终端里成功**（59.1s 出 `Tree.exe`，随后 zip 与安装包都出来了）。
-用户的原话是「Tree 的 terminal 和我（用户）直接在本机使用的 terminal 在行为上有分歧」。
+**在用户自己开的终端里成功**（55.1s 出 `Tree.exe`，随后 zip 与安装包都出来）。
+用户原话：「Tree 的 terminal 和我（用户）直接在本机使用的 terminal 在行为上有分歧」（后来又报「上一轮修复没修好吗」）。
 
-**不是前端代码，也不是"链接坏了"**：那条命令要在 `.plugin_symlinks/<插件>/windows` 上做 CMake
-`add_subdirectory`，而这些目录是 **reparse point（目录符号链接 / junction）**。关键证据（都在 Tree 的终端这一侧取）：
+### 真正的机制（2026-10-03 实测坐实）
 
-| 观测 | 结果 |
+**① 被拒绝的是"非管理员创建的重定向点"**：Windows 11 的 **RedirectionGuard**
+（`PROCESS_MITIGATION_REDIRECTION_TRUST_POLICY`，`winnt.h`）：
+
+| Flags | 含义 |
 | --- | --- |
-| 用户那次构建**新建并使用**了同一批链接 | 成功 ⇒ 链接数据本身是有效的 |
-| 同一条链接在 Tree 的终端里 `Test-Path <链接>\windows` / `cmd dir` | `False` / `File Not Found` |
-| 现场**自己造**链接（`mklink /J`、`mklink /D`），同一目录内（C:→C:、E:→E:） | 创建"成功"，但**同样跟随不了** |
-| 系统预置链接（`C:\Documents and Settings` → `C:\Users`、`C:\Users\All Users` → `C:\ProgramData`） | 正常：`LinkType=Junction/SymbolicLink`、目标读得出、能跟随 |
-| `E:\BaiduSyncdisk` | **自相矛盾**：属性里有 `ReparsePoint`，但 `Get-Item` 的 `LinkType`/`Target` 是空的 |
-| `fsutil fsinfo volumeinfo E:` | `Error 5: Access is denied`（正常本地卷不会这样） |
-| 我们这个 shell 的来路 | `Tree.exe` → `tree_core.exe`（`D:\app\Tree Desktop\`）→ `pwsh.exe`，**Session 1、Medium 完整性**、`cwd=E:\programs\Tree\desktop` |
+| `0x1`（`EnforceRedirectionTrust`）| **拒绝跟随**文件系统上"非管理员创建的"重定向点（并记录该尝试） |
+| `0x2`（`AuditRedirectionTrust`）| 只记录、**仍然允许** |
+| `0x0` | 不受影响 |
 
-**根因（已坐实）**：**Windows 11 24H2 的 Redirection Trust（重定向信任）**。用 .NET 看精确错误：
+`flutter pub get` 以**非提权**身份创建的 `windows/flutter/ephemeral/.plugin_symlinks/*` 正是
+"非管理员创建的重定向点"——这一半是 OS 行为，谁也改不了（本机实测：我们从零新建的链接一样是"不受信任"）。
 
-```text
-[System.IO.Directory]::GetFiles("<我现场造的 junction>\")
-  → 「无法遍历该路径，因为它包含**不受信任的装入点**。」
-    （英文：Cannot traverse the path because it contains an untrusted mount point.）
-```
+**② 拒不拒绝，取决于进程自己的策略，而策略沿调用链传播**。实测矩阵（同一个链接、
+`GetProcessMitigationPolicy(过程, 16)` 读数 + 实际跟随）：
 
-即：**非管理员（Medium 完整性）进程在用户可写位置造出来的 reparse point 被标记为"不受信任的装入点"**，
-于是**被要求遵守该缓解的进程一律拒绝遍历它**（`flutter` 生成的 `.plugin_symlinks` 正是这种链接，
-而 CMake 要 `add_subdirectory` 到 `.plugin_symlinks/<插件>/windows`）。
-
-**实验矩阵（都在 Tree 的终端这一侧做，结果全部一致）**：
-
-| 谁造 / 谁跟随 | 卷 | 结果 |
+| 进程 / 上下文 | 策略 | 跟随 `window_manager` 链接 |
 | --- | --- | --- |
-| 打包 pwsh 自己（`mklink /J`） | E:→E: | 跟随 **失败**（同一进程、同一目录内也不行） |
-| 它的子 `cmd.exe`（继承） | E:→E: | 失败 |
-| 它的子 `powershell.exe` 5.1（继承、非打包） | E:→E: | 失败 |
-| **WMI 创建**的进程（**不继承**任何上下文） | E:→E: | 失败 |
-| 我造的 junction | **C:→C:**（`C:\Windows\System32`） | 失败 |
-| 对照：系统预置链接（`C:\Documents and Settings` 等） | C:→C: | **成功**（它不是"不受信任的装入点"） |
+| `Tree.exe`（正在跑的那个，13:58:35 起） | **0x1** | — |
+| `tree_core.exe`（它的子） | 0x1 | — |
+| Tree 终端里的 `cmd` / `pwsh` | 0x1 | **FAIL**（`无法遍历该路径，因为它包含不受信任的装入点`，errno 448 / `ERROR_UNTRUSTED_MOUNT_POINT`） |
+| 经 WMI 起的 `powershell`（父 = `WmiPrvSE`） | 0x1 | FAIL ⇒ **不只是直接父子继承，调用者上下文也会传播** |
+| `explorer.exe`（4 个实例全测） | **0x0** | — |
+| **用户手开的 `cmd`（14:58 那个，父 = explorer）** | **0x0** | **OK**（那次打包成功，55.1s） |
+| 任务计划起的 `powershell`（父 = svchost） | **0x0** | OK |
+| 经 `explorer.exe <文件>` 起的命令 | **0x0** | OK |
 
-⇒ **"谁继承谁的缓解策略"不是关键**（不继承的 WMI 进程也失败）：这台机器上**新造的**（= 非受信任创建者）
-reparse point 就是遍历不了；**预置的**（由受信任上下文造的）能遍历。这也解释了为什么"同一份链接、
-两个终端里结果不同"——**你在自己终端里那次构建用的是受信任的链接**（或那个上下文不受该缓解约束），
-我这边看到的全是"不受信任"的。
+**③ 污染源是安装器**：那个 `Tree.exe` 是 **13:58:35** 启动的（正好在安装收尾之后），它的父进程
+（pid 31032）已退出 = **安装器**。安装器是**提权**进程，而 RedirectionGuard 的设计目的正是防
+"低权位置 → 高权位置的重定向提权"，所以**提权进程默认带着 Enforce**，并把它传给整棵子树
+⇒ Tree 的核心、集成终端、以及用户在终端里跑的构建命令全部被污染。
 
-**排除过的（别再重复排查）**：
+**④ 这条策略清不掉、也不能给子进程关掉**（都实测过）：
 
-- **不是**"链接失效 / 数据坏了"：`fsutil reparsepoint query` 对"能用"的系统 junction 与"用不了"的我造的
-  junction 打出的结构完全同构（tag / offset / length 都正常）；`cmd dir /AL` 也能读出目标。
-- **不是**工作区路径上有 junction：`E:\`、`E:\programs`、`E:\programs\Tree`、`E:\programs\Tree\desktop`
-  全是普通目录（`LinkType` 为空）。
-- **不是**网络盘 / 重定向卷：`Win32_Volume` / `Win32_LogicalDisk` 显示 C: 与 E: 都是 **DriveType=3、
-  NTFS 的本地卷**（`\\?\Volume{GUID}\`），`net use` 无映射、`subst` 无映射。
-- **不是**"缺管理员权限"导致的查询失败：`fltmc` / `fsutil fsinfo volumeinfo` 的 Access denied 只是**没提权**
-  的正常结果（`whoami` 显示 Medium 完整性），我一开始把它当成"被虚拟化"的证据，**这是误读**。
-- **不是**仓库代码设了缓解策略：PTY 的 `CreateProcess` 属性表里只有 `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`
-  一项（`conpty_windows.dart`），没有任何 mitigation 策略。
-- **不是**只有打包 PowerShell 才有的问题（我这条 shell 确实是 MSIX 打包版 pwsh，但换 5.1、换 cmd、
-  换不继承的 WMI 上下文都一样失败）。
+- `SetProcessMitigationPolicy(ProcessRedirectionTrustPolicy, 0)` → **`ERROR_ACCESS_DENIED`(5)**，
+  读数纹丝不动（安全缓解是"粘"的）；
+- `winnt.h` 里**没有** `PROCESS_CREATION_MITIGATION_POLICY*_REDIRECTION_TRUST_*`
+  （连 `POLICY2_*` 那一组都没有这一条）⇒ `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY` 没有创建期开关；
+- 顺带排除（免得再走一遍）：把 `.plugin_symlinks/*` 从链接**换成真实目录副本**也不行——Flutter 工具
+  每次 `flutter build windows` 都会调 `createPluginSymlinks`，它的判据是
+  `if (link.existsSync()) continue;`，而 Dart 的 `Link.existsSync()` 对**真实目录返回 false**
+  ⇒ 它会去 `createSync` 撞 `PathExistsException`（errno 183）**直接崩**（实测过一次，现场已还原）。
 
-**绕过方式**（按省事程度；都不改代码）：
+⇒ **唯一干净的办法：换一个干净的父亲**——让 explorer 重新把自己拉起来（实测 explorer 派生的一切都是 0x0）。
 
-1. **先在一个"受信任"的入口里把链接造出来**：在**管理员终端**里跑一次
-   `flutter pub get`（或 `flutter build windows --release --no-tree-shake-icons`）——
-   `flutter_plugins.dart` 的逻辑是"链接已存在就跳过重建"（`if (link.existsSync()) continue;`），
-   之后 Tree 的终端里的构建就能落在这批**受信任**的链接上；
-2. **构建放你自己的终端里跑**（已验证可用），或让构建进程以管理员身份起；
-3. **不要把工作区放在"用户可写位置"再指望 reparse point**（这一条是环境设计层面的取舍）。
+### 修法（已实现）
 
-**给应用侧的处理（用户 2026-10-03：「别忘了模拟终端啊」→ 已实现）**：终端**没法**绕过操作系统的安全缓解，
-但可以把这种失败**讲清楚**——`lib/ui/services/terminal_output_notice.dart` 认得这句
-`不受信任的装入点` / `untrusted mount point` / `无法遍历该路径`，命中的那一帧由终端弹一次可读指引
-（"先在管理员终端跑一次 flutter pub get，详见 docs/known-issues.md #16"）。跨帧稳健（留字节尾巴，
-关键字被切断、甚至切在 UTF-8 多字节字符中间也认得出）、**每会话只提示一次**、重开终端重置；
-用例见 `test/terminal_output_notice_test.dart` 与 `test/terminal_panel_test.dart`。
+- **`windows/runner/main.cpp`**：启动时自检 `GetProcessMitigationPolicy(16)`：
+  - `--tree-rt-selfcheck`：**只**打印 `tree-rt-selfcheck: flags=0x… would-relaunch=…` 后退出（不起 Flutter；
+    打包自检与回归用例用它）；
+  - 带着缓解（`flags != 0`）且不是重启来的 ⇒ `ShellExecuteW(nullptr, L"open", L"explorer.exe", "<自己的 exe 路径>")`
+    重新拉起自己并退出（**必须让 explorer 当父亲**：直接 ShellExecute 自己的 exe 仍是本进程创建，缓解照旧继承）；
+  - 起不来、或重启后仍带着 ⇒ 往 **stderr** 留一句可读的话（不静默）后**照常启动**（绝不把用户挡在门外）；
+  - 这两个标记不会传给 Dart 层。
+- **`tool/installer/tree-desktop.iss`**：安装后的"启动 Tree"改经 `explorer.exe`（断掉污染源，配注释说明理由）。
+- **终端侧的可读防呆**（上一轮做的，保留）：命中 `不受信任的装入点` / `untrusted mount point` /
+  `无法遍历该路径` 时弹一次指引。**但它覆盖不到用户实际踩到的那种措辞**——CMake 报的是
+  `add_subdirectory given source … which is not an existing directory`（不含上述关键字），
+  所以上一轮"加了提示"在这条真实路径上并没有弹出来（记在 #21 一起修）。
 
-**状态**：**环境侧、不是代码缺陷**（2026-10-03）。`flutter test` / `flutter analyze` / 真机 UI 行为都不受影响；
-受影响的只有"在 Tree 的终端里执行依赖 reparse point 的构建"这一类操作。
+### 验证
+
+- 机制：上表的策略读数 + 跟随测试 + "用户手开 cmd 成功 / Tree 终端失败"的对照；
+- 修法依据：经 `explorer.exe` 启动的进程实测 **`RT=0x0` 且跟随 OK**（即使从被污染的上下文发起）；
+- 代码：`test/redirection_guard_test.dart`（**门控**：非 Windows 或没有构建好的 `Tree.exe` 时跳过）
+  钉住自检契约。**先红证据**：旧 exe（13:57 那版）不认 `--tree-rt-selfcheck`，什么都不打印并去起界面；
+  新 exe 打印状态行且带上缓解时 `would-relaunch=1`。
+
+### 状态
+
+**已修复**（2026-10-03：runner 自愈 + 安装器改走 shell）。
+
+### 遗留（如实记录）
+
+- **已经在跑的那个 Tree 实例**仍带着缓解（它是从提权的安装器继承的）。重装/升级后由新安装器经 shell
+  启动即干净；手动办法是**退出 Tree，再从开始菜单启动**（explorer 派生 ⇒ 0x0）。
+- 若 shell 那条链本身也不干净（例如整个会话由提权进程派生），自愈重启也救不了；那时 runner 会在 stderr
+  留痕，终端侧给指引——这条链路在用户态修不掉（策略既清不掉、也没有创建期开关）。
+- **教训（保留）**：先前用"不继承上下文的 WMI 进程也失败"来说明"与继承无关"——今天实测 WMI 起的进程
+  **`RT=0x1`**（调用者上下文会传播），那个对照实验选错了对象，结论因此偏了半边。
+
+### （历史）当时的证据与排除项
+
+- 现场取证：`Test-Path <链接>\windows` = `False`、`cmd dir` = File Not Found；现场自造
+  `mklink /J`、`mklink /D`（C:→C:、E:→E:）创建"成功"但同样跟随不了；系统预置链接
+  （`C:\Documents and Settings` → `C:\Users` 等）正常；`.NET` 抛的原文是
+  「无法遍历该路径，因为它包含不受信任的装入点」。
+- 排除项（仍然有效，别再重复排查）：不是链接数据坏了（`fsutil reparsepoint query` 与能用的系统链接同构）；
+  工作区路径上没有 junction；C:/E: 都是 `DriveType=3` 的本地 NTFS；`fltmc`/`fsutil fsinfo` 的
+  Access denied 只是没提权（当初误读为"被虚拟化"，已在文档更正）；**不是**仓库代码设了缓解
+  （PTY 的 `CreateProcess` 属性表里只有 `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`）；
+  **没有**针对 `Tree.exe` 的 IFEO / AppCompat / Exploit Guard 注册表项，`runner.exe.manifest`
+  里也没有缓解声明（⇒ 不是"按映像"，是继承来的）。
+
 
 ## #17 SSH 的远端命令环境 ≠ 用户 ssh 登录环境（agent 看不到 nvcc 这类工具）
 

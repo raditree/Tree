@@ -66,7 +66,12 @@ Name: "{group}\Tree"; Filename: "{app}\{#AppExe}"
 Name: "{autodesktop}\Tree"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#AppExe}"; Description: "启动 Tree"; Flags: nowait postinstall skipifsilent
+; **必须经 explorer 启动，不能直接 Filename 指 app**：安装器是**提权**的，而那棵进程树会带上
+; Windows 的 RedirectionGuard（`EnforceRedirectionTrust`，它拒绝跟随"非管理员创建的重定向点"），
+; 于是新装的 Tree、它的核心、它的集成终端、以及用户在终端里跑的构建命令全都跟着被污染 ——
+; `flutter build windows` 会以 CMake `add_subdirectory … is not an existing directory` 失败
+; （真机实测与完整证据见 docs/known-issues.md #16）。让 explorer 当父进程起 Tree，这条链是干净的。
+Filename: "explorer.exe"; Parameters: """{app}\{#AppExe}"""; Description: "启动 Tree"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
 ; 只清理安装目录；%APPDATA%\Tree（用户配置与会话）刻意不动
