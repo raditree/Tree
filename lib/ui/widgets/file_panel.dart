@@ -14,6 +14,7 @@ import '../services/detail_selection.dart';
 import '../services/download_center.dart';
 import '../services/editor_buffer.dart';
 import '../services/plugin_ui_registry.dart';
+import '../services/workspace_paths.dart';
 import 'file_sync_button.dart';
 import 'file_tree.dart';
 import 'detail_panel.dart';
@@ -45,7 +46,9 @@ const String _sharedBufferNotice = '同一文件已在另一窗格打开：两�
 /// 槽位变化（manifest / 注销 / 切 team）时按槽位键比对，仅在集合真变化时重建
 /// TabController——避免每次 plugin_ui_update 都重置当前页签。
 ///
-/// 点击文件时以覆盖层方式弹出 [FileViewer]，点击返回按钮关闭查看器。
+/// 点击文件时在**下格**打开 [FileViewer]：树与查看器**同屏**（上下分栏，比例默认 0.4，
+/// 太矮时按 [SplitPanes] 的既有口径降级成一次只显示一个）；没打开文件时树独占整个区域。
+/// 关闭查看器（工具条 / 窗格的返回按钮）回到树独占。见 lib/README.md 不变量 16。
 ///
 /// **分屏是"一个文件一份文档、两个视图"**：同一个路径的窗格共用同一个
 /// [EditorBuffer]（同一个控制器 + 一份 dirty / saving / loadedSize），两边都能编辑、
@@ -134,8 +137,24 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
   Axis _splitAxis = Axis.horizontal;
   double _splitRatio = 0.5;
 
-  /// 窗格分隔条宽度
+  /// 窗格分隔条宽度（查看器内部两格 + 树/查看器上下分栏共用）
   static const double _paneDividerWidth = 7;
+
+  /// 树与查看器**同屏分栏**时树占的比例（默认 0.4：树少一点、查看器多一点）
+  double _treeSplitRatio = 0.4;
+
+  /// 同屏分栏每一侧的最小高度
+  static const double _treeSplitMinExtent = 120;
+
+  /// 可用高度低于它就降级成"一次只显示一个"：再矮下去两格都不到 100px，谁都不可用
+  static const double _treeSplitDegradeBelow = 200;
+
+  /// 文件子 Tab 区（文件浏览 / Git 历史 / Todo）的 key。
+  ///
+  /// 为什么需要它：打开 / 关闭查看器会把这块从「Expanded 的独子」**搬到** SplitPanes
+  /// 的上格（或反过来）。没有 GlobalKey 的话元素树会重建——展开的目录、已加载的层、
+  /// 选中项全丢（用户每开一个文件树就塌一次）；GlobalKey 让它被"搬"过去而不是重建。
+  final GlobalKey _fileTabsKey = GlobalKey(debugLabel: 'file_panel_tabs');
 
   /// 是否正显示查看器
   bool get _viewerOpen => _viewerPaths.isNotEmpty;
@@ -313,6 +332,50 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
   void _onLocalModeChanged() {
     if (!mounted) return;
     _refreshFileTree();
+  }
+
+  /// 文件树里重命名成功：查看器里指向该路径（或其后代）的窗格**跟着改名**。
+  ///
+  /// 只换路径字符串：缓冲实例不动（同一份文档换了个名字，不是两份文档），
+  /// [FileViewer] 的 didUpdateWidget 会按新路径重新加载。
+  void _onTreePathRenamed(String from, String to) {
+    bool changed = false;
+    for (int i = 0; i < _viewerPaths.length; i++) {
+      final String next = workspacePathRemap(_viewerPaths[i], from, to);
+      if (next == _viewerPaths[i]) continue;
+      _viewerPaths[i] = next;
+      changed = true;
+    }
+    if (!changed || !mounted) return;
+    setState(() {});
+  }
+
+  /// 文件树里删除了路径：指向它的窗格一起关掉。
+  ///
+  /// 不再问"未保存的改动怎么办"——删除前已经确认过一次（那时文件还在，用户选了删），
+  /// 删完再弹一次确认只会自相矛盾。缓冲按"还有没有别的窗格引用"释放。
+  void _onTreePathDeleted(String path) {
+    final List<int> closing = <int>[];
+    for (int i = 0; i < _viewerPaths.length; i++) {
+      if (workspacePathAtOrUnder(_viewerPaths[i], path)) closing.add(i);
+    }
+    if (closing.isEmpty) return;
+    final Set<EditorBuffer> released = <EditorBuffer>{};
+    setState(() {
+      for (final int index in closing.reversed) {
+        released.add(_viewerBuffers[index]);
+        _viewerPaths.removeAt(index);
+        _viewerKeys.removeAt(index);
+        _viewerBuffers.removeAt(index);
+      }
+      _activePane = _viewerPaths.isEmpty
+          ? 0
+          : _activePane.clamp(0, _viewerPaths.length - 1);
+    });
+    for (final EditorBuffer buffer in released) {
+      _releaseBuffer(buffer);
+    }
+    _showSnackBar('文件已删除，查看器已关闭：$path');
   }
 
   /// 打开文件：没有窗格就新建，有就换**活动窗格**的内容（先处理未保存的改动）。
@@ -759,7 +822,9 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
     );
   }
 
-  /// 文件分区：子 Tab 栏（文件浏览 / Git 历史 / Todo）+ 内容 + FileViewer 覆盖层
+  /// 文件分区：子 Tab 栏（文件浏览 / Git 历史 / Todo）+ 内容
+  ///
+  /// 内容区两种形态：没打开文件 = 子 Tab 独占；打开文件 = 上下分栏（上格子 Tab、下格查看器）。
   Widget _buildFileSection() {
     final cs = Theme.of(context).colorScheme;
     return Column(
@@ -799,64 +864,91 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
           ),
         ),
         Divider(height: 1, thickness: 1, color: Theme.of(context).dividerColor),
-        // 内容区域（使用 Stack 叠加 FileViewer 覆盖层）
+        // 内容区域：**树与查看器同屏**（打开文件时上下分栏；没打开文件时树独占）
+        //
+        // 为什么不再用覆盖层：覆盖层让"打开文件后树就点不到"——新建 / 重命名 / 删除
+        // 这些树里的动作在开着文件时根本用不上（用户 2026-10-03 定夺改同屏）。
+        // 为什么是上下而不是左右：本面板在右栏（240–500px），左右分栏两边都会挤成
+        // 不可用；比例默认 0.4（树少、查看器多），降级交给 [SplitPanes] 的既有口径。
         Expanded(
-          child: Stack(
-            children: [
-              // 子 Tab 内容
-              TabBarView(
-                controller: _fileTabController,
-                children: [
-                  FileTree(
-                    workspaceId: widget.workspaceId,
-                    teamId: widget.teamId,
-                    refreshTrigger: _fileRefreshTrigger,
-                    onDownload: _handleDownload,
-                    onPathChanged: (String path) {
-                      if (path == _treePath) return;
-                      setState(() {
-                        _treePath = path;
-                      });
-                    },
-                    onFileSelected: (String path) {
-                      unawaited(_openViewer(path));
-                    },
-                  ),
-                  GitHistory(
-                    workspaceId: widget.workspaceId,
-                    teamId: widget.teamId,
-                    refreshTrigger: _gitRefreshTrigger,
-                  ),
-                  TodoPanel(
-                    workspaceId: widget.workspaceId,
-                    teamId: widget.teamId,
-                    sessionId: widget.sessionId,
-                    refreshTrigger: _todoRefreshTrigger,
-                  ),
-                ],
-              ),
-              // 查看器覆盖层：顶部一条分屏工具条 + 1–2 个窗格
-              if (_viewerOpen)
-                Positioned.fill(
-                  child: Container(
-                    color: Theme.of(context).scaffoldBackgroundColor,
-                    child: Column(
-                      children: <Widget>[
-                        _buildViewerToolbar(),
-                        Divider(
-                          height: 1,
-                          thickness: 1,
-                          color: Theme.of(context).dividerColor,
-                        ),
-                        Expanded(child: _buildPanes()),
-                      ],
-                    ),
-                  ),
-                ),
-            ],
-          ),
+          child: _viewerOpen
+              ? SplitPanes(
+                  axis: Axis.vertical,
+                  ratio: _treeSplitRatio,
+                  minExtent: _treeSplitMinExtent,
+                  degradeBelow: _treeSplitDegradeBelow,
+                  dividerWidth: _paneDividerWidth,
+                  onRatioChanged: (double next) {
+                    setState(() {
+                      _treeSplitRatio = next;
+                    });
+                  },
+                  first: _buildFileTabs(),
+                  second: _buildViewerPane(),
+                  // 太矮时只留查看器：工具条上的「关闭查看器」一键回到树独占
+                  degraded: _buildViewerPane(),
+                )
+              : _buildFileTabs(),
         ),
       ],
+    );
+  }
+
+  /// 文件子 Tab 区（文件浏览 / Git 历史 / Todo）。
+  ///
+  /// 外面套 [KeyedSubtree] + [_fileTabsKey]：开 / 关查看器时这块会被搬进 / 搬出分栏，
+  /// 有 key 才不会被重建（展开状态、选中项、已加载的目录都留着）。
+  Widget _buildFileTabs() {
+    return KeyedSubtree(
+      key: _fileTabsKey,
+      child: TabBarView(
+        controller: _fileTabController,
+        children: <Widget>[
+          FileTree(
+            workspaceId: widget.workspaceId,
+            teamId: widget.teamId,
+            refreshTrigger: _fileRefreshTrigger,
+            onDownload: _handleDownload,
+            onPathChanged: (String path) {
+              if (path == _treePath) return;
+              setState(() {
+                _treePath = path;
+              });
+            },
+            onFileSelected: (String path) {
+              unawaited(_openViewer(path));
+            },
+            // 改名 / 删除之后查看器要跟着走（见 _onTreePathRenamed / _onTreePathDeleted）
+            onPathRenamed: _onTreePathRenamed,
+            onPathDeleted: _onTreePathDeleted,
+          ),
+          GitHistory(
+            workspaceId: widget.workspaceId,
+            teamId: widget.teamId,
+            refreshTrigger: _gitRefreshTrigger,
+          ),
+          TodoPanel(
+            workspaceId: widget.workspaceId,
+            teamId: widget.teamId,
+            sessionId: widget.sessionId,
+            refreshTrigger: _todoRefreshTrigger,
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 查看器那一格：分屏工具条 + 1–2 个窗格（同屏分栏时它是**下格**）
+  Widget _buildViewerPane() {
+    return Container(
+      color: Theme.of(context).scaffoldBackgroundColor,
+      child: Column(
+        children: <Widget>[
+          _buildViewerToolbar(),
+          Divider(height: 1, thickness: 1, color: Theme.of(context).dividerColor),
+          Expanded(child: _buildPanes()),
+        ],
+      ),
     );
   }
 }

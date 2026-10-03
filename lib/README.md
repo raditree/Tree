@@ -16,8 +16,8 @@
 | [ui/pages/main_page.dart](ui/pages/main_page.dart) | 三栏骨架、agent 列表（顶层 agent + 团队成员）、会话切换、插件槽位作用域 |
 | [ui/widgets/message_panel.dart](ui/widgets/message_panel.dart) | 中栏消息流：分段渲染、工具/思考**一行式**（完整内容见右栏「详情」页）、提问卡片、断线重播去重、按 agent+会话过滤 |
 | [ui/widgets/teammates_window_page.dart](ui/widgets/teammates_window_page.dart) | 团队成员拓扑与成员工作进度窗口 |
-| [ui/widgets/](ui/widgets/) | 文件面板 / 查看器（源码高亮 + 编辑保存 + 分屏，见 [split_panes.dart](ui/widgets/split_panes.dart)）/ **集成终端（[terminal_panel.dart](ui/widgets/terminal_panel.dart)，Ctrl+J）**/ 消息输入框（[message_input.dart](ui/widgets/message_input.dart) + [attachment_preview.dart](ui/widgets/attachment_preview.dart) + 无边框输入样式 [input_style.dart](ui/widgets/input_style.dart)）/ 右栏详情（[detail_panel.dart](ui/widgets/detail_panel.dart)）、PDF 预览、Spec、待办、提问、插件、MCP、模型信息、Git 历史、设置页 |
-| [ui/services/](ui/services/) | 重播守卫、下载中心、会话重命名、插件 UI 槽位注册、主题、**共享编辑缓冲（[editor_buffer.dart](ui/services/editor_buffer.dart)）**、**代码高亮（[code_highlight.dart](ui/services/code_highlight.dart)）**、**编辑器偏好（[editor_settings.dart](ui/services/editor_settings.dart)）**、详情选中（[detail_selection.dart](ui/services/detail_selection.dart)）、**团队级模式与目录合成（[team_scope_view.dart](ui/services/team_scope_view.dart)）** |
+| [ui/widgets/](ui/widgets/) | 文件面板（**VS Code 型资源管理器** [file_tree.dart](ui/widgets/file_tree.dart) + 类型图标纯函数 [file_tree_icon.dart](ui/widgets/file_tree_icon.dart)）/ 查看器（源码高亮 + 编辑保存 + 分屏，见 [split_panes.dart](ui/widgets/split_panes.dart)）/ **集成终端（[terminal_panel.dart](ui/widgets/terminal_panel.dart)，Ctrl+J）**/ 消息输入框（[message_input.dart](ui/widgets/message_input.dart) + [attachment_preview.dart](ui/widgets/attachment_preview.dart) + 无边框输入样式 [input_style.dart](ui/widgets/input_style.dart)）/ 右栏详情（[detail_panel.dart](ui/widgets/detail_panel.dart)）、PDF 预览、Spec、待办、提问、插件、MCP、模型信息、Git 历史、设置页 |
+| [ui/services/](ui/services/) | 重播守卫、下载中心、会话重命名、插件 UI 槽位注册、主题、**共享编辑缓冲（[editor_buffer.dart](ui/services/editor_buffer.dart)）**、**代码高亮（[code_highlight.dart](ui/services/code_highlight.dart)）**、**行号槽布局（[code_gutter_layout.dart](ui/services/code_gutter_layout.dart)：逐视觉行给号，软换行的续行留空）**、**编辑器偏好（[editor_settings.dart](ui/services/editor_settings.dart)）**、详情选中（[detail_selection.dart](ui/services/detail_selection.dart)）、**团队级模式与目录合成（[team_scope_view.dart](ui/services/team_scope_view.dart)）**、**工作空间相对路径纯函数与条目名校验（[workspace_paths.dart](ui/services/workspace_paths.dart)）** |
 
 ## 不变量（assertions）
 
@@ -82,6 +82,13 @@
     [ui/widgets/file_viewer.dart](ui/widgets/file_viewer.dart)、[io/api_service.dart](io/api_service.dart) 的 `saveFileContent`）：
     着色不引第三方包，一张规则表 + 单遍扫描（关键字 / 类型 / 字符串 / 注释 / 数字 / 注解 / 函数名），
     **只在 ≤ 128 KB 时着色**（超过退回单色，保证输入不卡），记号按「文本 + 配色」缓存——按键才重算一次；
+    代码视图左侧有**行号槽**（[ui/services/code_gutter_layout.dart](ui/services/code_gutter_layout.dart)），且**软换行感知**：
+    一条逻辑行折成多个视觉行时只给首行编号（续行不画数字），行号与正文用**同一套度量**——同一 TextStyle、
+    同一 textScaler、同一内容宽度（= 窗格宽 − 槽宽 − 正文 contentPadding 左右 − 光标留白），否则折行点不同、
+    从折行处开始数字就整体错位；可编辑（TextField）与只读（SelectableText.rich）两条分支都有，并且跟着正文
+    **同一条滚动控制器**平移（不挂第二个 Scrollable），正文顶部的 contentPadding 也算进偏移；行号布局只在
+    文本 / 可用宽度变化时重算（缓存在槽里，不是每帧算），数字不参与命中与选择（点它不动光标、选中正文不带行号）；
+    图片 / PDF / Office 与 Markdown / SVG **预览**这些模式没有行号槽。
     是否文本**看字节**（前 4 KB 有 NUL 就当二进制，扩展名骗人的文件不会被渲染成乱码）。只读闸门（缺一不可）：
     图片 / PDF / Office（复杂格式）、**被截断的大文件**（写回去等于把文件截短）、含 NUL 的二进制、外部显式传入的
     `readOnly`。**同文件双开不在这条闸门里**——那两个窗格共享同一份缓冲（不变量 13）。
@@ -128,6 +135,50 @@
     ④ 团队 TOP 配了 SSH 时成员**切不回本地**：核心没有"成员覆盖成 local"这个概念，界面**如实拒绝**并说明
     去哪改，不假装切成功。
 
+16. **右栏文件面板是 VS Code 型资源管理器：彩色类型图标、没有"大小 / 修改时间"两列、缩进引导线、
+    整行悬停与选中，并且能新建 / 重命名 / 删除**（[ui/widgets/file_tree.dart](ui/widgets/file_tree.dart)、
+    [ui/widgets/file_tree_icon.dart](ui/widgets/file_tree_icon.dart)、[ui/widgets/file_panel.dart](ui/widgets/file_panel.dart)、
+    [ui/services/workspace_paths.dart](ui/services/workspace_paths.dart)、[ui/models/git_status.dart](ui/models/git_status.dart)，
+    用户 2026-10-03：「现在太简陋了，对标 VS Code」）：
+    ① **口径变化（不是漏改）**：旧的"单层列表 + 面包屑进入子目录 + 当前目录"换成**惰性加载的嵌套树**——目录就地展开 / 折叠
+    （展开时才拉那一层），面包屑取消，头部显示「根目录 + 同步作用域」，而**同步作用域改由选中项推导**（选中目录 = 它自己，
+    选中文件 = 它所在目录），[FileSyncButton](ui/widgets/file_sync_button.dart) 的 `currentPath` 语义不变；
+    **展开状态跨刷新保持**（工具写文件 / 上传 / 切执行模式重拉之后不塌）；
+    ② **行只有名字 + 类型图标**（行高 22、字号 13、行内左右 padding 6）：大小与修改时间两列**下到悬停 tooltip**
+    （`3.7 KB · 2026-10-02 11:31`；目录给 `N 项 · 时间`，没加载过子项时只给时间、不编数字），超长名走
+    `TextOverflow.ellipsis`，tooltip 第一行永远是全名；
+    ③ **类型图标与颜色是纯函数**（[fileTreeVisualFor](ui/widgets/file_tree_icon.dart)：路径 / 是否目录 / 是否展开 → 图标 + 颜色）：
+    文件夹暖黄（收起 `folder` / 展开 `folder_open`）、`.dart` 青、`.md` 蓝、`.json` / `.yaml` 黄、`.py` Python 蓝
+    （"蓝黄"两色一个 IconData 表达不了，取主色蓝）、`.sh` 绿、图片紫、PDF 红、压缩包橙、纯文本灰蓝、未知类型灰；
+    **色板写死不跟主题色**（跟 `cs.primary` 走会让整棵树变成一坨同色）。源码家族取自
+    [code_highlight](ui/services/code_highlight.dart) 的 `languageForPath`（高亮认得的语言，图标也认得，不再抄第二张扩展名表）；
+    ④ **箭头只在目录上**（`AnimatedRotation` 0 → 0.25 圈 = 顺时针 90°），文件行留**等宽空槽**（同级文件与目录名字必须对齐）；
+    每层画 1px 缩进引导线（低透明度 `outlineVariant`，落在父级箭头槽中心）；
+    ⑤ **整行悬停浅底 / 选中更重的底 + 左侧 2px 主色条**；↑/↓ 在树里移动选中（→/← 展开折叠或跳父级、Enter 打开、F2 改名、
+    Delete 删除），行高固定所以选中项能精算着滚进可见区；
+    ⑥ **git 状态着色**：`GET /api/files/{id}/git-status` 拉**一次**缓存在面板状态（不塞进每一行的重建路径），整行名字染色 +
+    行尾字母 M/U/A/D/R/I（VS Code gitDecoration 口径，"被忽略"更淡），**目录聚合子项状态**
+    （删除 > 修改 > 未跟踪 > 新增 > 重命名 > 忽略）；`is_repo=false` / 核心还没有这个端点 / 断网**一律静默不着色**
+    （状态色是锦上添花，不能把它变成错误页）；新建 / 改名 / 删除后失效重拉；
+    ⑦ **新建 / 重命名 / 删除**：新建文件走既有 `PUT .../content`（空内容）、新建文件夹 `POST .../mkdir`、
+    改名 `POST .../rename`、删除 `DELETE ...?path=[&recursive=1]`（[io/api_service.dart](io/api_service.dart) 的
+    `getFilesWithMeta` / `getGitStatus` / `createDirectory` / `renamePath` / `deletePath`；路径常量取自协议包的
+    `ApiPaths`，不写字面量，见不变量 4）。名字校验（空 / 路径分隔符 / 非法字符 / Windows 保留名 / 同名，见
+    [validateEntryName](ui/services/workspace_paths.dart)）在**前端先挡一道**——核心的写文本端点**没有"仅新建"语义**，
+    重名会被它静默覆盖，所以创建前还要**重新列一次目录**复查；行内改名（回车确认 / Esc 或失焦取消），重名给**行内**红字；
+    删除前确认（目录**显式**递归：确认框里写明"里面的内容会一起删除"），**工作空间根永远不许删**（前端与核心各拦一道）。
+    超大目录被核心截断时给一行「仅显示前 N 项」（`getFilesWithMeta` 保留 `truncated`，旧的 `getFiles` 会丢它）；
+    ⑧ **树与查看器同屏（上下分栏，2026-10-03 二改：覆盖层已被推翻）**：打开文件后**不再**用覆盖层盖住树——那会让
+    "打开文件后新建 / 改名 / 删除根本点不到"，接线（`onPathRenamed` / `onPathDeleted`）也永远点不到。改成
+    [split_panes.dart](ui/widgets/split_panes.dart) 的**上下分栏**：**上格** = 文件子 Tab（树 / Git 历史 / Todo），
+    **下格** = 查看器（工具条 + 1–2 个窗格），中间可拖；比例默认 **0.4**（树少、查看器多）并**记在面板状态**里
+    （关掉再开还是刚才的比例）。**没打开文件时树独占**（不留空分栏），关闭查看器回到独占。为什么上下而不是左右：
+    面板在右栏（240–500px），左右分栏两边都会挤成不可用。**降级口径**：可用高度 < 200px（`_treeSplitDegradeBelow`，
+    每侧最小 120px）时按 SplitPanes 的既有口径退化成**一次只显示一个——只留查看器**（工具条上「关闭查看器」一键
+    回到树独占；此时树不参与构建，恢复高度后需重新展开）。开 / 关查看器时文件子 Tab 区用 `GlobalKey`（`_fileTabsKey`）
+    **搬**进 / 搬出分栏而不是重建：展开状态、选中项、已加载的目录都不丢。树里的改名 / 删除对已打开文件的联动经
+    `FileTree.onPathRenamed` / `onPathDeleted` → FilePanel 更新窗格路径（缓冲实例不动）或关掉窗格并提示。
+
 ## 测试
 
 ```bash
@@ -145,11 +196,11 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 `test/tool_row_detail_test.dart`（一行式：中文标签 + 关键参数、行尾增量、悬停提亮、点击 → 详情页完整参数与结果、空态与关闭、
 派生文本纯函数、右栏页签接线源钉）、`test/message_stream_style_test.dart`（模型消息高亮块不套边框、用户消息仍是气泡）、
 `test/code_highlight_test.dart`（语言识别、各语言词法、注释与字符串的优先级、未闭合块注释、记号不重叠、控制器着色 +
-大文件退回单色 + 输入法组字交回平台）、`test/file_editor_test.dart`（真起假核心 HttpServer：改一下就进未保存态、Ctrl+S 发出
+大文件退回单色 + 输入法组字交回平台）、`test/code_gutter_layout_test.dart`（行号槽布局：逐视觉行给号、折行的续行留空、宽度越窄折行越多、尾随换行与空文本各占一个号、纵向位置单调递增且末行底边 = totalHeight、宽度非法不抛）、`test/file_editor_test.dart`（真起假核心 HttpServer：改一下就进未保存态、Ctrl+S 发出
 完整内容与 `if_size`、保存失败给可见原因、409 冲突 → 覆盖保存带 force=1、截断/二进制/图片/外部 readOnly 四种只读闸门、
 **同文件双窗格共享一份缓冲**（同一个控制器、一边打字另一边立刻可见、任一窗格保存后两边一起变成已保存且只发一次 PUT、
 真只读的文档不建控制器、窗格 dispose 不动外部传入的缓冲、缓冲只在值真变时通知）、真面板分屏的端到端接线（同一份缓冲 +
-关掉一个窗格后另一个继续可编辑）、失焦保存的开与关、返回时静默写回或问一次）、`test/split_panes_test.dart`（二分几何、拖动比例、夹取、太窄降级、
+关掉一个窗格后另一个继续可编辑）、失焦保存的开与关、返回时静默写回或问一次、**源码模式的行号槽**（左侧出现 1..N、加行删行跟着变、软换行时续行不编号且行号与正文逐行对齐、滚动后跟着 offset 平移且仍然对齐、只读视图同样有、图片 / Markdown 预览没有））、`test/split_panes_test.dart`（二分几何、拖动比例、夹取、太窄降级、
 文件面板的分屏接线源钉：同文件双开复用同一个缓冲、不再锁只读）、`test/vt_screen_test.dart`（VT 解析器：换行 / `\r` 覆盖、SGR、CUP/ED/EL、备用屏进出、
 跨块 UTF-8、宽字符两格、未知序列安全跳过、resize、DSR/DA 应答、随机含 ESC 字节流不抛）、
 `test/terminal_panel_test.dart`（终端面板：打开就发 `terminal_open` 与尺寸并抢焦点、ready 显示 shell/cwd、
@@ -157,3 +208,26 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 dispose 发 `terminal_close`、布局变化发 `terminal_resize`）、
 `test/team_scope_view_test.dart`（团队级模式/目录合成：成员跟随 TOP 的模式与目录、自己的 SSH 优先、
 目录只认 TOP 那份、TOP 是 SSH 时成员切不回本地）。
+`test/file_tree_icon_test.dart`（文件树视觉映射纯函数：目录收起 / 展开的图标与暖黄、一张"扩展名 → 类型 + 固定色"表、
+各家族（图片 / 压缩包 / 纯文本 / 其它源码）、大小写与完整路径与反斜杠、无扩展名与点开头 → 未知类型不猜、各家族颜色互不相同，
+以及 git 状态配色与"被忽略更淡"）、
+`test/workspace_paths_test.dart`（工作空间相对路径纯函数：归一化 / 拼接 / 父目录 / 祖孙判据的前缀陷阱 / 改名整段重映射；
+名字校验的空·点·分隔符·保留字符·控制字符·结尾点空格·过长·Windows 保留名·同名（不分大小写、重命名跳过自己、没变化）、
+行内改名默认选中名字本体）、
+`test/workspace_git_status_test.dart`（git 状态：状态码解析（含 porcelain 的 `??` / `!`，**未知码不着色**）、
+字母 / 中文 / 聚合优先级严格递减、响应宽容解析（不是仓库 / 缺 is_repo / entries 非 List / 未知状态与缺 path 丢掉 / truncated）、
+目录聚合（前缀陷阱 `src2` 不算在 `src` 名下、优先级取最需要注意的、目录自身条目、根聚合全部））、
+`test/file_tree_explorer_test.dart`（真起假核心 HttpServer：行高 22 与字号 13 与省略号、**不再渲染大小 / 时间列**
+（只在悬停 tooltip 里，含全名与 `N 项`）、箭头只在目录上且展开转 90°、同级文件与目录名字对齐、缩进引导线随层级
+（1 层 1 条、2 层 2 条）且是 1px、整行悬停浅底、选中更重的底 + 2px 主色条、键盘 ↑/↓ 移动选中与 → 展开、
+点目录就地展开（惰性拉那一层）再点折叠、**展开状态跨刷新保持**、空目录 / 目录加载失败 / 根加载失败 / 截断 / 首帧加载中各档提示、
+git 着色（文件按状态 + 目录聚合 + 一次请求 + `is_repo=false` 与端点 404 都静默）与改名 / 删除后重拉、
+右键菜单项齐备（含既有"下载"回调）、空白处右键只给通用动作、复制路径写剪贴板、在文件夹中显示算不出绝对路径时如实拒绝、
+新建文件（PUT 空内容 / 重名不覆盖 / 对话框非法名不关框）、新建文件夹（核心 409 原样显示）、
+行内改名（回车确认 / 重名行内红字不提交 / Esc 取消）、删除（目录确认框警告递归且带 recursive=1 / 文件不警告 / 取消什么都不做 /
+工作空间根不发请求））、
+`test/file_tree_viewer_sync_test.dart`（树 ↔ 查看器**同屏**的端到端接线，全部真点击：没打开文件时树独占 /
+打开文件出现上下分栏且树与查看器都在 / 「关闭查看器」回到树独占、分屏后（查看器内部两格）在树里点另一个文件落到
+**活动窗格**、打开文件后**在树里右键重命名它** → 窗格路径跟着改并按新路径重拉 + 树里换成新名字、
+打开文件后**在树里删除它** → 窗格自动关掉 + 给提示 + 回到树独占、打开 / 关闭查看器不丢树的展开状态（子树被搬而不是重建）、
+拖分隔条改变比例且关掉再开仍是该比例、面板太矮（可用高度 < 200）降级成只显示查看器且一键回到树）。

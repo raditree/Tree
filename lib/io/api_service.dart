@@ -3,10 +3,13 @@ import 'dart:io' show Directory, File, IOSink, Platform, RandomAccessFile;
 import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
+import 'package:tree_protocol/tree_protocol.dart';
 
 import '../ui/models/agent.dart';
 import '../ui/models/file_content.dart';
+import '../ui/models/file_listing.dart';
 import '../ui/models/file_node.dart';
+import '../ui/models/git_status.dart';
 import '../ui/models/session.dart';
 
 /// 流式下载被调用方取消（M8d 下载列表的「取消」按钮）。
@@ -1397,6 +1400,125 @@ class ApiService {
     String target = 'all',
   }) async {
     return _postJson('/api/agents/$agentId/reset', body: {'target': target});
+  }
+
+  // ==================== 文件面板：目录树操作与 git 状态（VS Code 型资源管理器） ====================
+
+  /// 获取工作空间文件列表 **+ 是否被核心截断**（超大目录只回前一段）。
+  ///
+  /// 为什么不改 [getFiles] 的返回类型：它是既有调用方的公共签名（插件面板等），
+  /// 换成"列表 + 元信息"会打断所有调用点；要显示「已截断」提示的调用方用这一个。
+  /// 核心在条目数达到 `maxListEntries`（默认 2000）时回 `truncated: true`，
+  /// [getFiles] 会把它丢掉——所以文件面板改用这里。
+  static Future<FileListing> getFilesWithMeta(
+    String workspaceId, {
+    String path = '',
+    String teamId = '',
+  }) async {
+    final Map<String, dynamic> data = await _getJson(
+      _filesPath(workspaceId, ApiPaths.files),
+      query: {
+        if (path.isNotEmpty) 'path': path,
+        if (teamId.isNotEmpty) 'team_id': teamId,
+      },
+    );
+    final List<dynamic> files = data['files'] as List<dynamic>? ?? [];
+    return FileListing(
+      nodes: files
+          .map((dynamic e) => FileNode.fromJson(e as Map<String, dynamic>))
+          .toList(),
+      truncated: data['truncated'] == true,
+    );
+  }
+
+  /// 工作空间的 git 状态（文件面板的 VS Code 型状态着色）。
+  ///
+  /// 调用 `GET /api/files/{workspaceId}/git-status`，返回
+  /// `{is_repo, entries: [{path, status}], truncated}`（解析见 [parseGitStatus]，
+  /// 核心契约里的 `is_repo=false` ⇒ 空表 ⇒ 完全不着色）。
+  /// **核心还没实现这个端点（404/501）或网络异常时同样抛中文异常**，由调用方决定
+  /// 是否静默——文件面板会吞掉它变成"完全不着色"（状态色是锦上添花，不能因为它
+  /// 把整棵树变成错误页）。
+  ///
+  /// 路径字面量与协议包：核心那位加路由时会同步补 `ApiPaths`（packages/** 不在
+  /// 本切片范围内），落地后这里的字面量应换成协议常量。
+  static Future<GitStatusSnapshot> getGitStatus(
+    String workspaceId, {
+    String teamId = '',
+  }) async {
+    final Map<String, dynamic> data = await _getJson(
+      _filesPath(workspaceId, ApiPaths.fileGitStatus),
+      query: {if (teamId.isNotEmpty) 'team_id': teamId},
+    );
+    return parseGitStatus(data);
+  }
+
+  /// 新建目录：`POST /api/files/{workspaceId}/mkdir`，请求体 `{path}`。
+  ///
+  /// 已存在 → 核心回 409 + `detail`（[_handleResponse] 会把 detail 原样抛出，
+  /// 不吞成"操作失败"）。**新建空文件不走这里**——它是 [saveFileContent] 传空内容。
+  static Future<void> createDirectory(String workspaceId, String path) async {
+    final Map<String, dynamic> data = await _postJson(
+      _filesPath(workspaceId, ApiPaths.fileMkdir),
+      body: <String, dynamic>{'path': path},
+    );
+    _expectOperationOk(data, '新建文件夹');
+  }
+
+  /// 重命名 / 移动：`POST /api/files/{workspaceId}/rename`，请求体 `{from, to}`。
+  ///
+  /// 目标已存在 → 409；源不存在 → 404：两种都由核心给可读 `detail`。
+  static Future<void> renamePath(
+    String workspaceId,
+    String from,
+    String to,
+  ) async {
+    final Map<String, dynamic> data = await _postJson(
+      _filesPath(workspaceId, ApiPaths.fileRename),
+      body: <String, dynamic>{'from': from, 'to': to},
+    );
+    _expectOperationOk(data, '重命名');
+  }
+
+  /// 删除文件 / 目录：`DELETE /api/files/{workspaceId}?path=&recursive=`。
+  ///
+  /// [recursive] = 连目录内容一起删。**非空目录必须显式带上**（核心默认拒绝，
+  /// 前端在用户确认「连内容一起删」之后才传 1）。工作空间根不允许删：前端在调用前
+  /// 就拦住，这里再挡一次（path 为空即根，直接给可读错误、不发请求）。
+  static Future<void> deletePath(
+    String workspaceId,
+    String path, {
+    bool recursive = false,
+  }) async {
+    final String target = path.trim();
+    if (target.isEmpty) {
+      throw Exception('不能删除工作空间根目录');
+    }
+    final String query =
+        'path=${Uri.encodeQueryComponent(target)}${recursive ? '&recursive=1' : ''}';
+    final String base = _filesPath(workspaceId, ApiPaths.fileDelete);
+    final Map<String, dynamic> data = await _deleteJson('$base?$query');
+    _expectOperationOk(data, '删除');
+  }
+
+  /// 把协议里的路径模板（[ApiPaths] 用 \`{workspaceId}\` 占位）换成真实工作空间 id。
+  ///
+  /// 为什么不自己拼路径字面量：lib/README.md 不变量 4 要求协议常量从
+  /// package:tree_protocol 取；[ApiPaths] 是**模板口径**（与核心路由同一个常量），
+  /// 这里只做占位替换，不自己拼路径。
+  static String _filesPath(String workspaceId, String template) =>
+      template.replaceFirst('{workspaceId}', workspaceId);
+
+  /// mkdir / rename / delete 三个写端点共同的"别假装成功"闸门。
+  ///
+  /// 为什么还要判一次 `success`：核心对这类端点回 200 只代表"请求处理完了"，
+  /// 真正的结果在 `success` 字段；漏判会让"点了没反应"看起来像成功。
+  static void _expectOperationOk(Map<String, dynamic> data, String action) {
+    if (data['success'] == false) {
+      final String detail =
+          (data['detail'] ?? data['error'] ?? '').toString().trim();
+      throw Exception(detail.isEmpty ? '$action失败' : detail);
+    }
   }
 
   // ==================== 内部工具方法 ====================
