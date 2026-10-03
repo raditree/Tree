@@ -1007,29 +1007,64 @@ Material `Scrollbar`，而全仓库没有任何 `ScrollConfiguration` / `ScrollB
 | `fsutil fsinfo volumeinfo E:` | `Error 5: Access is denied`（正常本地卷不会这样） |
 | 我们这个 shell 的来路 | `Tree.exe` → `tree_core.exe`（`D:\app\Tree Desktop\`）→ `pwsh.exe`，**Session 1、Medium 完整性**、`cwd=E:\programs\Tree\desktop` |
 
-**结论（事实 + 推断分开写）**：事实是——**Tree 的集成终端所在的进程/文件系统上下文里，"这个会话里新建的
-reparse point"不能被跟随**（连同一目录内自造的都不行），而系统预置的能跟随；那个上下文看到的文件系统是被
-**虚拟化 / 重定向过的视图**（`E:` 上 `BaiduSyncdisk` 的矛盾状态与 `fsutil` 的 Access denied 都指向这点）。
-推断是——这会命中机器策略里 `fsutil behavior query SymlinkEvaluation` 的
-**`Remote-to-local symbolic link evaluation: DISABLED`**（重定向卷上的链接指向本地目标时不予求值）；
-用户本机终端里的 `E:` 是**真正本地**卷 ⇒ Local-to-local（ENABLED）⇒ 一切正常。**差异因此出在"终端所在的
-上下文"，与前端终端代码无关**（把 Tree 的终端换成你自己的终端，命令就过）。
+**根因（已坐实）**：**Windows 11 24H2 的 Redirection Trust（重定向信任）**。用 .NET 看精确错误：
 
-**绕过方式**（按代价排序）：
+```text
+[System.IO.Directory]::GetFiles("<我现场造的 junction>\")
+  → 「无法遍历该路径，因为它包含**不受信任的装入点**。」
+    （英文：Cannot traverse the path because it contains an untrusted mount point.）
+```
 
-1. **构建放到你自己的终端里跑**（已验证可用）——出 `dist/tree-desktop-<版本>-windows-x64.zip` 与
-   `dist/installer/tree-desktop-<版本>-windows-x64-setup.exe`；
-2. 让构建进程**脱离 Tree 的进程树**（例如用计划任务以当前用户启动一次），以避开这层虚拟化 —— 需要动系统
-   计划任务，属于要用户点头的操作；
-3. 若确认是"重定向卷上的链接指向本地目标"：由管理员 `fsutil behavior set SymlinkEvaluation R2L:1`
-   **打开 Remote-to-local**（机器级策略，本仓库不擅自改；改之前先确认这层重定向是环境设计还是意外）。
+即：**非管理员（Medium 完整性）进程在用户可写位置造出来的 reparse point 被标记为"不受信任的装入点"**，
+于是**被要求遵守该缓解的进程一律拒绝遍历它**（`flutter` 生成的 `.plugin_symlinks` 正是这种链接，
+而 CMake 要 `add_subdirectory` 到 `.plugin_symlinks/<插件>/windows`）。
 
-**踩过的弯路（别再走）**：第一反应是"链接是昨天环境准备好的、失效了"，于是删掉 `.plugin_symlinks` 让
-`flutter pub get` / `flutter build` 重建 —— 没用（重建出来的在我这个上下文里**照样跟随不了**），
-而用户那次构建重建 + 使用同一条链接却完全正常。**判据是"同一份链接，两个终端里结果不同"**，
-不要只盯着链接本身。
+**实验矩阵（都在 Tree 的终端这一侧做，结果全部一致）**：
 
-**状态**：环境侧、**不是代码缺陷**，不做代码改动（2026-10-03 记录）。`flutter test` / `flutter analyze` /
-真机 UI 行为都不受影响；受影响的只有"在 Tree 的终端里执行依赖 reparse point 的构建"这一类操作。
+| 谁造 / 谁跟随 | 卷 | 结果 |
+| --- | --- | --- |
+| 打包 pwsh 自己（`mklink /J`） | E:→E: | 跟随 **失败**（同一进程、同一目录内也不行） |
+| 它的子 `cmd.exe`（继承） | E:→E: | 失败 |
+| 它的子 `powershell.exe` 5.1（继承、非打包） | E:→E: | 失败 |
+| **WMI 创建**的进程（**不继承**任何上下文） | E:→E: | 失败 |
+| 我造的 junction | **C:→C:**（`C:\Windows\System32`） | 失败 |
+| 对照：系统预置链接（`C:\Documents and Settings` 等） | C:→C: | **成功**（它不是"不受信任的装入点"） |
+
+⇒ **"谁继承谁的缓解策略"不是关键**（不继承的 WMI 进程也失败）：这台机器上**新造的**（= 非受信任创建者）
+reparse point 就是遍历不了；**预置的**（由受信任上下文造的）能遍历。这也解释了为什么"同一份链接、
+两个终端里结果不同"——**你在自己终端里那次构建用的是受信任的链接**（或那个上下文不受该缓解约束），
+我这边看到的全是"不受信任"的。
+
+**排除过的（别再重复排查）**：
+
+- **不是**"链接失效 / 数据坏了"：`fsutil reparsepoint query` 对"能用"的系统 junction 与"用不了"的我造的
+  junction 打出的结构完全同构（tag / offset / length 都正常）；`cmd dir /AL` 也能读出目标。
+- **不是**工作区路径上有 junction：`E:\`、`E:\programs`、`E:\programs\Tree`、`E:\programs\Tree\desktop`
+  全是普通目录（`LinkType` 为空）。
+- **不是**网络盘 / 重定向卷：`Win32_Volume` / `Win32_LogicalDisk` 显示 C: 与 E: 都是 **DriveType=3、
+  NTFS 的本地卷**（`\\?\Volume{GUID}\`），`net use` 无映射、`subst` 无映射。
+- **不是**"缺管理员权限"导致的查询失败：`fltmc` / `fsutil fsinfo volumeinfo` 的 Access denied 只是**没提权**
+  的正常结果（`whoami` 显示 Medium 完整性），我一开始把它当成"被虚拟化"的证据，**这是误读**。
+- **不是**仓库代码设了缓解策略：PTY 的 `CreateProcess` 属性表里只有 `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`
+  一项（`conpty_windows.dart`），没有任何 mitigation 策略。
+- **不是**只有打包 PowerShell 才有的问题（我这条 shell 确实是 MSIX 打包版 pwsh，但换 5.1、换 cmd、
+  换不继承的 WMI 上下文都一样失败）。
+
+**绕过方式**（按省事程度；都不改代码）：
+
+1. **先在一个"受信任"的入口里把链接造出来**：在**管理员终端**里跑一次
+   `flutter pub get`（或 `flutter build windows --release --no-tree-shake-icons`）——
+   `flutter_plugins.dart` 的逻辑是"链接已存在就跳过重建"（`if (link.existsSync()) continue;`），
+   之后 Tree 的终端里的构建就能落在这批**受信任**的链接上；
+2. **构建放你自己的终端里跑**（已验证可用），或让构建进程以管理员身份起；
+3. **不要把工作区放在"用户可写位置"再指望 reparse point**（这一条是环境设计层面的取舍）。
+
+**给应用侧的提醒（用户 2026-10-03：「别忘了模拟终端啊」）**：终端**没法**绕过操作系统的安全缓解，
+但可以把这种失败**讲清楚**——真要做，合适的形式是"终端里命令失败且输出命中
+`不受信任的装入点` / `untrusted mount point` 时，补一句可读指引（去管理员终端先跑一次 / 见 #16）"。
+本轮**未实现**（它属于"防呆提示"而非功能缺陷，等用户点头再定）。
+
+**状态**：**环境侧、不是代码缺陷**（2026-10-03）。`flutter test` / `flutter analyze` / 真机 UI 行为都不受影响；
+受影响的只有"在 Tree 的终端里执行依赖 reparse point 的构建"这一类操作。
 
 
