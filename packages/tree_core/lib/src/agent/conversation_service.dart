@@ -483,6 +483,34 @@ class ConversationService {
     interruptedRunCount++;
   }
 
+  /// **对账探针**（见 `ToolResultProbe`）：这次工具调用的结果**已经落库**了吗？
+  ///
+  /// 只读、幂等、便宜（走存储里已加载的会话消息）。已有结果 ⇒ 返回**那一份原文**
+  /// （`tool_result`，给人看的完整口径）⇒ 会话据此让批收尾；
+  /// 找不到卡 / 结果为空 / 还没落库 ⇒ `null`（**绝不编造**）。
+  ///
+  /// 为什么需要它：工具**没有静态上限**，一条不返回的调用会让批永不结束，而批中途进来的
+  /// 消息一律推迟到批结果之后（保留语义）⇒ 会话"消息只能进不能出"。有了它，**结果其实已经在
+  /// 存储里**的那种情况就能自动收敛（用真值，不注入合成结果）；确实没有结果的，继续等
+  /// 用户 / 插件 / agent 的显式关闭。
+  Future<String?> probeToolResult({
+    required String agentId,
+    required String sessionId,
+    required String toolCallId,
+  }) async {
+    final String id = toolCallId.trim();
+    if (id.isEmpty) return null;
+    for (final CoreMessage message in store.sessionMessages(
+      agentId,
+      sessionId,
+    )) {
+      if (!message.isTool || message.toolCallId != id) continue;
+      final String result = message.toolResult.trim();
+      return result.isEmpty ? null : result;
+    }
+    return null;
+  }
+
   /// **自动修复落点**（引擎在把关处发现"结果永远拿不到"的工具卡时调用；
   /// 见 [ToolResultRepair] 与 `LlmAgentEngine._repairMissingToolResult`）。
   ///

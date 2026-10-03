@@ -118,6 +118,10 @@ class LlmAgentEngine implements AgentEngine {
   /// 为空 = 老行为（只在**送模型那份**补一句临时占位，落库那份保持为空）。
   ToolResultRepair? toolResultRepair;
 
+  /// 工具结果的**探针**（见 `ToolResultProbe`）：会话用它在对账时读**已落库的真实结果**，
+  /// 让"工具久不返回但结果其实已经在存储里"的批收尾。null = 只留痕、继续等显式取消。
+  ToolResultProbe? toolResultProbe;
+
   /// **「LLM 处理」接管钩子**（中转站点位 `system.relay.llm.handle`）；null = 未接线。
   ///
   /// 与 [toolTurnCompactor] 同范式：可写字段，由接线方（`CoreServer._wirePluginStations`）
@@ -228,6 +232,9 @@ class LlmAgentEngine implements AgentEngine {
         sessionId: context.sessionId,
       ),
       toolRunner: toolRunner,
+      // 工具久不返回时的**对账探针**（见 ToolResultProbe）：存储里已有真实结果就采用它，
+      // 让批能收尾；没有就继续等显式取消（用户 / 插件 / agent 的 tool_runs）。
+      toolResultProbe: toolResultProbe,
       maxSeqlen: config.effectiveMaxSeqlen,
       maxOutputTokens: config.maxOutputTokens > 0
           ? config.maxOutputTokens

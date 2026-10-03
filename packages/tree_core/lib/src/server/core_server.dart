@@ -450,6 +450,8 @@ class CoreServer {
     final AgentEngine wiredEngine = server.conversation.engine;
     if (wiredEngine is LlmAgentEngine) {
       wiredEngine.toolResultRepair = server.conversation.repairToolResult;
+    // 工具久不返回时的对账探针（同一个注入范式）：存储里已有真实结果 ⇒ 采用它让批收尾。
+    wiredEngine.toolResultProbe = server.conversation.probeToolResult;
     }
     // Q9：Spec 索引注入系统提示词。做成**可设置的 provider**（而不是给
     // `systemPromptWithWorkspace` 加参数）是因为提示词在会话生成与压缩估算两处

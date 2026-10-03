@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 
@@ -43,6 +44,24 @@ typedef LlmRequestRewriter =
       required int turn,
     });
 
+/// 「这次工具调用的结果其实**已经落库**了吗」的**探针**（会话不认识存储层，只认这个签名——
+/// 与 [LlmTurnHandler] / `LlmAgentEngine.toolResultRepair` 同一个注入范式）。
+///
+/// 用途：工具调用 `await` 长时间不返回时**对账** —— 存储里若已有这次调用（`toolCallId` 命中）
+/// 的**真实结果**，就采用它让批收尾；返回 null = 存储里还没有 ⇒ **继续等显式取消**。
+/// **绝不注入合成结果**：探针只能交出"已经存在的那一份"。
+typedef ToolResultProbe =
+    Future<String?> Function({
+      required String agentId,
+      required String sessionId,
+      required String toolCallId,
+    });
+
+/// 工具调用看门狗的默认检查间隔（探针 + 留痕）：
+/// 与登记表的 warning 阈值同量级，但更密一点——**先留痕、再等到阈值才 warning**，
+/// 这样"卡住"这件事在会话出事之前就已经在 `core.log` 里。
+const Duration defaultToolWatchdogInterval = Duration(seconds: 60);
+
 /// 一轮**完整的 LLM 会话**：上下文 → 流式生成 → 工具执行 → 回灌 → 继续，
 /// 直到模型给出最终文本（或出错/被取消）。
 ///
@@ -82,6 +101,8 @@ class LlmSession {
     this.compactContext,
     this.llmHandler,
     this.llmRequestRewriter,
+    this.toolResultProbe,
+    this.toolWatchdogInterval = defaultToolWatchdogInterval,
     this.log,
   });
 
@@ -135,6 +156,13 @@ class LlmSession {
   ///
   /// 每次调用实时取：模型可能在工具循环中途改 todo 或挂 Spec，状态必须是当下的。
   final String Function()? statusText;
+
+  /// 工具结果的**探针**（见 [ToolResultProbe]）：工具调用久不返回时用它**对账**——
+  /// 存储里已有真实结果就采用它让批收尾。null = 不对账（只留痕、继续等显式取消）。
+  final ToolResultProbe? toolResultProbe;
+
+  /// 工具调用看门狗的检查间隔（测试可注入更短的值）。
+  final Duration toolWatchdogInterval;
 
   /// 工具循环内压缩钩子（Q1-③）；由引擎接线到会话层的 CompactionService。
   ///
@@ -282,10 +310,21 @@ class LlmSession {
 
       // 这一跳的耗时（逐调用账目用它）：从发出请求到收流结束。
       final Stopwatch hopClock = Stopwatch()..start();
+      // 生命周期留痕（C′）：请求**已发出**这件事必须有日志——今天查一次"会话失声"
+      // 花了两轮，就是因为"请求发出去了、然后什么都没有"在日志里完全不可见。
+      log?.call(
+        '请求已发出：turn=$turn model=$model 上下文消息=${request.messages.length}'
+        ' 工具=${toolSpecs.length}${pluginStream != null ? '（插件接管）' : ''}',
+      );
       final Stream<LlmStreamEvent> events =
           pluginStream ??
           transport.stream(request, isCancelled: isCancelled);
+      bool firstEventLogged = false;
       await for (final LlmStreamEvent event in events) {
+        if (!firstEventLogged) {
+          firstEventLogged = true;
+          log?.call('首个事件（等待 ${hopClock.elapsedMilliseconds}ms）：${event.runtimeType}');
+        }
         if (event is LlmTextDelta) {
           text.write(event.text);
           yield AgentText(event.text);
@@ -467,15 +506,12 @@ class LlmSession {
         );
         ToolOutcome outcome;
         try {
-          outcome = await toolRunner.run(
-            ToolInvocation(
-              id: toolId,
-              name: call.name,
-              arguments: arguments,
-              rawArguments: call.arguments,
-              agentId: agentId,
-              sessionId: sessionId,
-            ),
+          outcome = await _runToolWithWatchdog(
+            call: call,
+            toolId: toolId,
+            arguments: arguments,
+            agentId: agentId,
+            sessionId: sessionId,
             isCancelled: isCancelled,
           );
         } catch (error) {
@@ -502,6 +538,96 @@ class LlmSession {
           ),
         );
       }
+    }
+  }
+
+  /// 执行一次工具调用，带**看门狗**（用户 2026-10-03：「批收敛兜底」那一条）。
+  ///
+  /// 为什么需要：工具**没有静态上限**（本地活性 = 进程存活，SSH 侧 = 心跳），一条不返回的
+  /// 调用会让整个批永不结束；而批中途进来的消息一律**推迟到批结果之后**（这是**保留**的
+  /// 语义，不切开批、不让消息插队）⇒ 会话就此"消息只能进不能出"，且此前**一行日志都没有**。
+  ///
+  /// 看门狗只做两件事，**都不改语义**：
+  /// 1. **留痕**：每 [toolWatchdogInterval] 记一行"已等待 N 秒"（连着叫它可见、可诊断）；
+  /// 2. **对账**：问一次 [toolResultProbe] —— 存储里若已有这次调用（`toolCallId` 命中）的
+  ///    **真实结果**，就采用它让批收尾（**绝不注入合成结果**）；探针为 null / 返回 null
+  ///    ⇒ **继续等**，直到工具自己返回、或被**显式取消**（用户右栏 / 插件 `tool.close` /
+  ///    agent `tool_runs action=close` —— 关闭会让在途调用收敛，本 await 随之正常返回）。
+  Future<ToolOutcome> _runToolWithWatchdog({
+    required LlmToolCall call,
+    required String toolId,
+    required Map<String, dynamic> arguments,
+    required String agentId,
+    required String sessionId,
+    required bool Function() isCancelled,
+  }) async {
+    final Future<ToolOutcome> pending = toolRunner.run(
+      ToolInvocation(
+        id: toolId,
+        name: call.name,
+        arguments: arguments,
+        rawArguments: call.arguments,
+        agentId: agentId,
+        sessionId: sessionId,
+      ),
+      isCancelled: isCancelled,
+    );
+    // 对账命中的那一份（真实结果）；非 null 即让竞速收尾。
+    String? reconciled;
+    final Completer<void> reconciledDone = Completer<void>();
+    int waitedSeconds = 0;
+    final Duration interval = toolWatchdogInterval;
+    final Timer timer = Timer.periodic(interval, (Timer _) {
+      waitedSeconds += interval.inSeconds;
+      final String waited = waitedSeconds <= 0
+          ? interval.inMilliseconds.toString()
+          : waitedSeconds.toString();
+      final ToolResultProbe? probe = toolResultProbe;
+      if (probe == null) {
+        log?.call(
+          '工具 ${call.name} 已等待 $waited 秒仍未返回'
+          '（没有对账探针；可由 tool_runs / 右栏查看并显式关闭）',
+        );
+        return;
+      }
+      unawaited(() async {
+        try {
+          final String? stored = await probe(
+            agentId: agentId,
+            sessionId: sessionId,
+            toolCallId: call.id,
+          );
+          if (stored == null) {
+            log?.call(
+              '工具 ${call.name} 已等待 $waited 秒仍未返回'
+              '（存储里还没有它的结果 ⇒ 继续等显式取消）',
+            );
+            return;
+          }
+          log?.call(
+            '工具 ${call.name} 已等待 $waited 秒仍未返回，'
+            '但存储里已有它的结果 ⇒ 对账采用（真实结果，批收尾）',
+          );
+          reconciled = stored;
+          if (!reconciledDone.isCompleted) reconciledDone.complete();
+        } catch (error) {
+          log?.call('工具结果对账失败（忽略，继续等）：$error');
+        }
+      }());
+    });
+    try {
+      return await Future.any(<Future<ToolOutcome>>[
+        pending,
+        reconciledDone.future.then(
+          (_) => ToolOutcome(reconciled ?? '', isError: false),
+        ),
+      ]);
+    } finally {
+      timer.cancel();
+      if (!reconciledDone.isCompleted) reconciledDone.complete();
+      // 工具最终返回时（多半是被显式关闭之后）结果照旧走正常路径；
+      // 这里兜住它的异常，避免变成无人处理的错误。
+      unawaited(pending.then<void>((ToolOutcome _) {}, onError: (Object _) {}));
     }
   }
 
