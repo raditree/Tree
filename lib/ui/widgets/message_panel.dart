@@ -1394,6 +1394,10 @@ class _MessagePanelState extends State<MessagePanel> {
                 currentSubagentId: _effectiveViewId,
                 onSelect: _switchView,
               ),
+              // 生成中且没输入内容时，右下角那个位置变成**停止键**（用户 2026-10-04；
+              // 开始打字就换回发送键——发送本身就会中止在途那一轮）
+              busy: agent.id.isEmpty ? false : _workingAgents.contains(agent.id),
+              onStop: _handleStop,
               // 临时员工视角是**只读**的：那条过程不是你与这个 agent 的对话
               locked: _effectiveViewId.isNotEmpty,
               lockedHint: _lockedComposerHint(),
@@ -1677,12 +1681,8 @@ class _MessagePanelState extends State<MessagePanel> {
           // 临时员工：与 teammates 入口**平级**（用户 2026-10-04：「应该做和 teammates 同级的热
           // 工作显示，在对话框支持选择进入 subagent 视角」）——本会话有才出现，点开选一个进去。
           if (agent != null) _buildSubagentEntry(agent),
-          if (working)
-            IconButton(
-              tooltip: '停止',
-              icon: Icon(Icons.stop_circle, size: 22, color: cs.error),
-              onPressed: _handleStop,
-            ),
+          // 停止键**搬到了输入框右下**（占发送键的位置：生成中且没输入内容时出现，
+          // 一开始打字就换回发送键）——用户 2026-10-04。标题栏不再重复放一个。
           if (agent != null)
             IconButton(
               tooltip: compacting ? '正在压缩中' : '压缩上下文',

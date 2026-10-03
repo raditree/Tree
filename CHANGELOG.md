@@ -43,6 +43,9 @@
   `tool_calls` 没有 reasoning"⇒ 端点 400。**判据是"这一轮还在飞"**：不止"批已有结果"，
   **这一跳的思考已落库、工具卡还没回来**（插话落在工具执行期间）时也要推迟——就地 flush 在
   "还没东西可发"时会清空待回传的思考，那段 CoT 丢失、紧接着的批以"没有 reasoning"收尾，同样 400。
+- **右下角那个圆键两态：生成中且输入为空 = 停止键**（[lib/README.md](lib/README.md) 不变量 14、
+  [lib/ui/widgets/stop_button.dart](lib/ui/widgets/stop_button.dart)）：一开始打字就换回发送键（发送本身就意味着
+  "中止在途那一轮并另起一轮"），标题栏不再重复放一颗停止键；成员面板输入行同一口径（可顺手暂停 teammates）。
 - **Ctrl+J 终端：回滚缓冲 + 在终端里给会话发消息**（[lib/README.md](lib/README.md) 不变量 14）：
   主屏整屏滚动出去的行进历史（上限 2000 行，备用屏与滚动区域内部不进——xterm 口径），鼠标滚轮翻回去、
   滚到底自动恢复跟随，翻上去时工具条给「已回滚 N 行」胶囊；**`#TSend "一段话"` / `#TSend @<文件路径>`**
@@ -52,6 +55,10 @@
   **对话数据**与**上下文长度条**换成它的（`ui/services/conversation_view.dart` 的 `viewMessages` / `viewContext`
   是唯一口径），输入框锁成只读；**切换的 UI 在输入框右下、发送键左侧**（与会话切换同族的胶囊 + 下拉）；
   **进入视角后锁定会话切换**（`SessionPicker.locked`：图标变锁、点它只说原因、右键重命名/删除一并关掉）。
+- **终端支持中文输入（输入法通道）**（[lib/ui/services/terminal_ime_input.dart](lib/ui/services/terminal_ime_input.dart)）：
+  终端没有输入行 ⇒ 必须挂一个活着的 `TextInputClient` 才收得到 IME 组字（真机现象：终端里打不出中文）；
+  组字中只交**已定字**（拼音敲到一半的 "ni" 绝不进 shell），可打印字符只从这条路来（键盘事件再取一次
+  会发两遍），控制键仍走 `Focus.onKeyEvent`。
 - **打包不许让图标字形静默缺失**（[tool/package_windows.dart](tool/package_windows.dart)）：构建改用
   `--no-tree-shake-icons`，并在打包后逐个人 `lib/` 里用到的 `Icons.*` 对字体 cmap，缺一个就失败并点名
   （真机现场：临时员工入口那颗按钮**画不出字形**，看着像"黑的"——发布版子集里没有 `badge_outlined`）。

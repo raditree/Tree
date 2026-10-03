@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:tree_protocol/tree_protocol.dart';
 
 import '../../io/websocket_service.dart';
+import '../services/terminal_ime_input.dart';
 import '../services/terminal_send_command.dart';
 import '../services/vt_screen.dart';
 
@@ -67,6 +68,12 @@ class TerminalPanelState extends State<TerminalPanel> {
 
   /// `#TSend` 的按键拦截（以 `#` 开头、还可能是 `#TSend` 的那一行不发 shell）
   final TerminalSendInterceptor _send = TerminalSendInterceptor();
+
+  /// **输入法通道**（中文 / 日文靠它；真机现象：终端里打不出中文，见
+  /// [TerminalTextInputClient]）。它只在终端有焦点时打开连接。
+  late final TerminalTextInputClient _ime = TerminalTextInputClient(
+    onText: _handleImeText,
+  );
   bool _opened = false;
   int _columns = 80;
   int _rows = 24;
@@ -92,6 +99,9 @@ class TerminalPanelState extends State<TerminalPanel> {
   void initState() {
     super.initState();
     _frames = widget.webSocket.terminalFrames.listen(_onFrame);
+    // 焦点 = 输入法通道的开关：有焦点才 attach（没有焦点的连接收不到字，
+    // 也会跟别处的文本输入抢平台连接）
+    _focus.addListener(_syncImeConnection);
     // 主动展开的含义之一：进终端就把焦点放进去，用户直接能打字
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _focus.requestFocus();
@@ -101,6 +111,8 @@ class TerminalPanelState extends State<TerminalPanel> {
   @override
   void dispose() {
     // 关面板就把 shell 收掉：不留孤儿进程占着工作区
+    _focus.removeListener(_syncImeConnection);
+    _ime.detach();
     _frames?.cancel();
     widget.webSocket.send(<String, dynamic>{
       'type': TerminalInboundType.close,
@@ -247,6 +259,30 @@ class TerminalPanelState extends State<TerminalPanel> {
     });
   }
 
+  /// 焦点变化 → 开关输入法连接（中文 / 日文要靠一条活着的文本输入连接才收得到）。
+  void _syncImeConnection() {
+    if (_focus.hasFocus) {
+      _ime.attach();
+    } else {
+      _ime.detach();
+    }
+  }
+
+  /// 输入法 / 直接键入交出来的**已定字**：逐个字符过 `#TSend` 拦截器，该吞的吞、
+  /// 该发的发（可打印字符**只**从这条路来——键盘事件里再取一次就会发两遍）。
+  void _handleImeText(String text) {
+    if (text.isEmpty) return;
+    final List<int> bytes = <int>[];
+    // 按**码点**走（不是 UTF-16 编码单元）：emoji 这类补充平面字符不会被拆成两半
+    for (final int rune in text.runes) {
+      final List<int>? forward = _send.accept(String.fromCharCode(rune));
+      if (forward == null) continue; // 还在 `#TSend` 前缀上：扣在本地
+      bytes.addAll(forward);
+    }
+    // 一次定字发一帧（一轮 IME 提交就是一串字节，不必拆成多帧）
+    if (bytes.isNotEmpty) _sendInput(bytes);
+  }
+
   /// 键盘 → 字节。顺序：先让 Ctrl+J 走（切回对话），再按真终端的笨办法逐键翻译。
   KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
@@ -282,21 +318,7 @@ class TerminalPanelState extends State<TerminalPanel> {
       _sendInput(<int>[0x0d]);
       return KeyEventResult.handled;
     }
-    // 3) 可打印字符：还可能是 `#TSend` 前缀就先扣住（返回 null = 吞掉）
-    final String? character = event.character;
-    final bool printable = !ctrl &&
-        character != null &&
-        character.isNotEmpty &&
-        character.codeUnitAt(0) >= 0x20 &&
-        character.codeUnitAt(0) != 0x7f;
-    if (printable) {
-      final List<int>? forward = _send.accept(character);
-      if (forward == null) return KeyEventResult.handled;
-      if (forward.isNotEmpty) _sendInput(forward);
-      return KeyEventResult.handled;
-    }
-
-    // 4) 其它按键（方向键 / Tab / Esc / Ctrl+C…）：先把缓存交还 shell，再照常转发
+    // 3) 其它按键（方向键 / Tab / Esc / Ctrl+C…）：先把缓存交还 shell，再照常转发
     //    （半截的 `#T` 因此不会消失，用户看到的与"从来没拦过"一致）
     final List<int> released = _send.release();
     final List<int>? bytes = _translateKey(event, ctrl: ctrl);
@@ -382,12 +404,9 @@ class TerminalPanelState extends State<TerminalPanel> {
       default:
         break;
     }
-    // 可打印字符：用 character（已按 shift/输入法解出），控制字符不转发
-    final String? character = event.character;
-    if (character == null || character.isEmpty) return null;
-    final int code = character.codeUnitAt(0);
-    if (code < 0x20 || code == 0x7f) return null;
-    return utf8.encode(character);
+    // 可打印字符**不在这里转发**：它们（含输入法组出来的中文）统一从文本输入通道来
+    // （见 [_handleImeText]）——两条路都发一遍的话每个字符会进shell两次。
+    return null;
   }
 
   /// 应用光标键模式（DECCKM）下方向键用 SS3
@@ -408,6 +427,13 @@ class TerminalPanelState extends State<TerminalPanel> {
     if (code < 0x61 || code > 0x7a) return null;
     return code - 0x60;
   }
+
+  /// 仅供测试：拿到输入法通道，直接喂 `updateEditingValue`（等价于平台回调）。
+  ///
+  /// 可打印字符**只**从这条路来（键盘事件那条路不再转发字符），所以键盘用例必须能
+  /// 驱动它，否则"终端能打字"就没被任何测试盖住。
+  @visibleForTesting
+  TerminalTextInputClient get debugImeClient => _ime;
 
   @override
   Widget build(BuildContext context) {

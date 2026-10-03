@@ -146,6 +146,10 @@
     `terminal_ready.cwd` 是空串——远端工作目录由 `SshWorkspaceIO` 自己解决，界面显示「工作区」。
     判据是**有效 SSH**（成员跟随团队 TOP 的 SSH，见不变量 15）；没接线时回可读错误，**绝不**
     悄悄在本机给远端 agent 起一个终端。关面板 / 换 agent / 断连都会把 shell 收掉。
+    **右下角那个圆键是两态的**（用户 2026-10-04）：agent **正在生成且输入框为空**时它是
+    **停止键**（实心圆 + 白色圆角方块，[ui/widgets/stop_button.dart](ui/widgets/stop_button.dart)），
+    一开始打字就换回发送键——发送本身就意味着"中止在途那一轮并另起一轮"，没必要先停再发；
+    成员面板的输入行同一个口径（在那里顺手暂停 teammates）。
     **回滚缓冲**：主屏整屏滚动时被顶出去的行进历史（上限 2000 行；备用屏与滚动区域内部的滚动不进——
     xterm 口径），鼠标滚轮往上翻、**滚到底自动恢复跟随**，翻上去时工具条上出现「已回滚 N 行」胶囊（点它回到最新）；
     新输出不会把正在回看的视野拽走（视图钉在同一段内容上，靠 `historyPushed` 计数）。`ED3`（`CSI 3 J`）与 RIS 清空历史。
@@ -295,6 +299,8 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 跨块 UTF-8、宽字符两格、未知序列安全跳过、resize、DSR/DA 应答、随机含 ESC 字节流不抛）、
 `test/vt_scrollback_test.dart`（回滚缓冲：主屏整屏滚动才进历史、备用屏与滚动区域内部不进、上限丢最老的、
 `historyPushed` 只增、`ED3` 清历史而 `ED2` 不动、resize 后历史行跟着换宽度、RIS 复位）、
+`test/terminal_ime_input_test.dart`（输入法通道：定字整段交出去、组字中一个字都不交、组字前半截已定字只交前缀、删到空安全、没 attach 也不炸）、
+`test/composer_primary_action_test.dart`（右下角那个键两态：生成中且空 = 停止键并回调、一开始打字换回发送键、删空转回、不在生成中始终是发送键、没接停止回调就不显示）、
 `test/terminal_send_command_test.dart`（`#TSend`：引号 / 裸文本 / `@路径` / 混写 / 带空格路径的解析，以及按键拦截的吞与补发：整行扣住、发现不是指令时原样补发、退格只吃本地缓存、其它按键前先补发、`#TSend` 单独一行 = 空指令）、
 `test/terminal_panel_test.dart`（终端面板：打开就发 `terminal_open` 与尺寸并抢焦点、ready 显示 shell/cwd、
 输出进缓冲、键盘译码（回车 / 方向键 / Ctrl+C）、Ctrl+J 交给外层、error 与 exit 的显示、别的会话 id 的帧被丢、

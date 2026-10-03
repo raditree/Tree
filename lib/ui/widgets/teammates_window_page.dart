@@ -6,6 +6,7 @@ import '../services/teammates_view.dart';
 import '../../io/api_service.dart';
 import '../../io/websocket_service.dart';
 import 'message_list.dart';
+import 'stop_button.dart';
 
 /// teammates 工作进度窗口
 ///
@@ -517,6 +518,16 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
   /// 是否正在提交配置
   bool _saving = false;
 
+  /// 成员面板输入行的控制器。
+  ///
+  /// 提到 State 上（原来是 build 里现 new 一个）：这样**流式帧触发的重建不会清空
+  /// 用户正在写的内容**，也让右下角的"停止 ⇄ 发送"能跟着输入内容切换
+  /// （[ValueListenableBuilder]）。
+  final TextEditingController _memberInput = TextEditingController();
+
+  /// 成员此刻是否在生成（本页自己的 WS 帧维护；见 [_memberWorking]）。
+  bool _working = false;
+
   @override
   void initState() {
     super.initState();
@@ -706,7 +717,17 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
       final String? statusSession = d['session_id'] as String?;
       if (statusSession != null && statusSession != widget.sessionId) return;
       if (d['agent_id'] == widget.memberId) {
-        // 成员状态变化（含审核放行后开始工作）：刷新名单行的实时状态
+        // 状态一变就更新右下角那个键（生成中且没输入 → 停止），
+        // 同时刷新名单行的实时状态（含审核放行后开始工作）
+        final String status = (d['status'] as String?) ?? '';
+        if (mounted) {
+          setState(() {
+            _working =
+                status == 'working' ||
+                status == 'updating_memory' ||
+                status == 'compacting';
+          });
+        }
         _refreshMember();
       }
     }
@@ -834,6 +855,7 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
   @override
   void dispose() {
     _webSocket.disconnect();
+    _memberInput.dispose();
     super.dispose();
   }
 
@@ -1218,8 +1240,27 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
   static bool _needsUserAction(String status) =>
       status == 'pending_model' || status == 'pending_review';
 
+  /// 该成员此刻是否在生成：本页自己的 `agent_status` 帧 + 名单行的实时状态。
+  ///
+  /// 两个来源都要看：帧更即时（刚点停止就能切回发送键），名单行是进页面时的兜底
+  /// （刚进来还没收到帧）。
+  bool get _memberWorking =>
+      _working || (_member['live_status'] as String?) == 'working';
+
+  /// 让这个成员停下当前这一轮（与中栏标题栏原来那颗停止键同一帧：`stop` +
+  /// agent_id/session_id）。成员面板因此可以顺手暂停 teammates（用户 2026-10-04）。
+  void _stopMember() {
+    _webSocket.send(<String, dynamic>{
+      'type': 'stop',
+      'data': <String, dynamic>{
+        'agent_id': widget.memberId,
+        'session_id': widget.sessionId,
+      },
+    });
+  }
+
   Widget _buildMessageInput() {
-    final TextEditingController controller = TextEditingController();
+    final TextEditingController controller = _memberInput;
     return Container(
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
@@ -1242,36 +1283,57 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
             ),
           ),
           const SizedBox(width: 8),
-          IconButton(
-            icon: const Icon(Icons.send),
-            onPressed: () async {
-              final String text = controller.text.trim();
-              if (text.isEmpty) return;
-              // 本地追加一条"我 -> 成员"的记录
-              setState(() {
-                _liveMessages.add(ChatMessage(
-                  id: 'user_${DateTime.now().millisecondsSinceEpoch}',
-                  role: 'user',
-                  content: text,
-                  timestamp: DateTime.now(),
-                ));
-                _scrollRevision++;
-              });
-              controller.clear();
-              try {
-                await ApiService.sendTeammateMessage(
-                    widget.leader.id, widget.memberId, text,
-                    sessionId: widget.sessionId);
-              } catch (e) {
-                if (!mounted) return;
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(content: Text('发送失败：$e')),
-                );
-              }
-            },
+          // 右下角同一个位置：**成员在生成且输入为空 → 停止**，一开始打字 → 发送
+          ValueListenableBuilder<TextEditingValue>(
+            valueListenable: controller,
+            builder:
+                (BuildContext context, TextEditingValue value, Widget? child) {
+                  if (_memberWorking && value.text.trim().isEmpty) {
+                    return StopButton(
+                      onPressed: _stopMember,
+                      tooltip: '让「${widget.memberName}」停下当前这一轮',
+                    );
+                  }
+                  return IconButton(
+                    icon: const Icon(Icons.send),
+                    onPressed: _sendToMember,
+                  );
+                },
           ),
         ],
       ),
     );
   }
+
+  /// 给这个成员发一条消息（原来内联在 IconButton 里，抽出来给"发送键"用）。
+  Future<void> _sendToMember() async {
+    final String text = _memberInput.text.trim();
+    if (text.isEmpty) return;
+    // 本地追加一条"我 -> 成员"的记录
+    setState(() {
+      _liveMessages.add(ChatMessage(
+        id: 'user_${DateTime.now().millisecondsSinceEpoch}',
+        role: 'user',
+        content: text,
+        timestamp: DateTime.now(),
+      ));
+      _scrollRevision++;
+    });
+    _memberInput.clear();
+    try {
+      await ApiService.sendTeammateMessage(
+        widget.leader.id,
+        widget.memberId,
+        text,
+        sessionId: widget.sessionId,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('发送失败：$e')),
+      );
+    }
+  }
+
+
 }

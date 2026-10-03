@@ -10,6 +10,7 @@ import 'package:path_provider/path_provider.dart';
 
 import '../services/onboarding_requests.dart';
 import 'attachment_preview.dart';
+import 'stop_button.dart';
 import 'input_style.dart';
 
 /// 一条未发送完的输入草稿（M9 Q6）。
@@ -103,6 +104,15 @@ class MessageInput extends StatefulWidget {
   /// 锁定时显示的说明。
   final String lockedHint;
 
+  /// 这个 agent 此刻是否在生成。为真且输入框**还是空的**时，右下角那个位置给
+  /// **停止键**（用户 2026-10-04：「停止键占原本的发送键；一旦输入了文字就换回发送键」
+  /// ——发送本身就意味着"中止这一轮并另起一轮"，所以两种状态共用一个位置最顺手，
+  /// 成员面板也因此能顺手暂停 teammates）。
+  final bool busy;
+
+  /// 点停止键时回调（null = 不显示停止键，照旧只显示发送键）。
+  final VoidCallback? onStop;
+
   const MessageInput({
     super.key,
     required this.onSend,
@@ -111,6 +121,8 @@ class MessageInput extends StatefulWidget {
     this.bottomTrailing,
     this.locked = false,
     this.lockedHint = '',
+    this.busy = false,
+    this.onStop,
   });
 
   @override
@@ -558,7 +570,8 @@ class _MessageInputState extends State<MessageInput> {
                     // 视角切换器（中栏放"主会话 ⇄ 临时员工"）就在发送键左侧
                     if (widget.bottomTrailing case final Widget trailing)
                       trailing,
-                    _buildSendButton(cs),
+                    // 同一个位置：生成中且没输入内容 → 停止键；一旦开始打字 → 发送键
+                    _buildPrimaryAction(cs),
                     const SizedBox(width: 4),
                   ],
                 ),
@@ -666,6 +679,22 @@ class _MessageInputState extends State<MessageInput> {
         ],
       ),
     );
+  }
+
+  /// 右下角那个圆键：**生成中且输入为空 → 停止**，否则 → 发送。
+  ///
+  /// "输入为空"才有停止键是刻意的：用户一旦开始打字，他要做的就是"说一句新的"，
+  /// 而发送本身就会中止在途那一轮（[MessagePanelState._handleSend] → 核心的
+  /// 插话语义）并另起一轮——没必要让他先点停止再点发送。
+  Widget _buildPrimaryAction(ColorScheme cs) {
+    final bool canStop =
+        widget.busy &&
+        widget.onStop != null &&
+        !widget.locked &&
+        _controller.text.trim().isEmpty &&
+        _filePaths.isEmpty &&
+        !_sending;
+    return canStop ? StopButton(onPressed: widget.onStop) : _buildSendButton(cs);
   }
 
   /// 圆形发送键：可发送时实心主色，不可发送时置灰

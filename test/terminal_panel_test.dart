@@ -133,7 +133,7 @@ void main() {
     expect(find.byType(CustomPaint), findsWidgets);
   });
 
-  testWidgets('键盘：回车发 \\r、可打印字符发 UTF-8、方向键发 CSI',
+  testWidgets('键盘：回车发 \\r、方向键发 CSI；可打印字符**只**走输入法通道',
       (WidgetTester tester) async {
     await pumpPanel(tester);
     final String id = openedId(tester);
@@ -144,9 +144,73 @@ void main() {
     await tester.pump();
 
     final List<String> inputs = ws.inputTexts(id);
-    expect(inputs, contains('a'));
+    expect(
+      inputs,
+      isNot(contains('a')),
+      reason: '键盘事件那条路不再转发字符：再发一遍会让每个字母进 shell 两次',
+    );
     expect(inputs, contains('\r'));
     expect(inputs, contains('\u001b[A'), reason: '方向键是 xterm 转义序列');
+  });
+
+  testWidgets('输入法通道：中文与 ASCII 都按 UTF-8 发给 PTY（终端能打字）',
+      (WidgetTester tester) async {
+    await pumpPanel(tester);
+    final String id = openedId(tester);
+    final TerminalPanelState state = tester.state<TerminalPanelState>(
+      find.byType(TerminalPanel),
+    );
+
+    state.debugImeClient.updateEditingValue(
+      const TextEditingValue(
+        text: '你好',
+        selection: TextSelection.collapsed(offset: 2),
+      ),
+    );
+    state.debugImeClient.updateEditingValue(
+      const TextEditingValue(
+        text: 'ls',
+        selection: TextSelection.collapsed(offset: 2),
+      ),
+    );
+    await tester.pump();
+
+    final List<String> inputs = ws.inputTexts(id);
+    expect(
+      inputs.join(''),
+      contains('你好'),
+      reason: '中文必须真发出去（真机现象就是它发不出去）',
+    );
+    expect(inputs.join(''), contains('ls'));
+  });
+
+  testWidgets('输入法组字中：只发已定字，拼音半截不进 shell', (WidgetTester tester) async {
+    await pumpPanel(tester);
+    final String id = openedId(tester);
+    final TerminalPanelState state = tester.state<TerminalPanelState>(
+      find.byType(TerminalPanel),
+    );
+
+    // 组字中（composing 覆盖整段）：一个字都不发
+    state.debugImeClient.updateEditingValue(
+      const TextEditingValue(
+        text: 'ni',
+        selection: TextSelection.collapsed(offset: 2),
+        composing: TextRange(start: 0, end: 2),
+      ),
+    );
+    await tester.pump();
+    expect(ws.inputTexts(id), isEmpty, reason: '组字中的拼音不能进 shell');
+
+    // 定字：整段发出去
+    state.debugImeClient.updateEditingValue(
+      const TextEditingValue(
+        text: '你',
+        selection: TextSelection.collapsed(offset: 1),
+      ),
+    );
+    await tester.pump();
+    expect(ws.inputTexts(id), contains('你'));
   });
 
   testWidgets('Ctrl+C 发 0x03（不是把 c 打进去）', (WidgetTester tester) async {
