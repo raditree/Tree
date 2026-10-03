@@ -32,6 +32,26 @@
 
 顶层文件 [lib/src/version.dart](lib/src/version.dart) 只有版本号常量。
 
+## 临时员工（`subagent`）给前端用的字段
+
+临时员工**没有自己的会话**：它的全部活动都写进"召它的那个 agent 的会话"消息流，靠下面这组字段打标记。
+一帧/一条消息的归属口径是 **`agent_id` = 会话主人（发起者）**（`subagent_id` 不冒充父 agent，而是额外标注"这是谁产出的"），
+所以既有前端过滤（`_isForCurrentAgent` / `_isForCurrentSession`）不需要改就能继续工作。
+
+| 位置 | 字段 | 含义 |
+| --- | --- | --- |
+| 消息（`message` / `msg_start` / `tool_start` / `tool_end` / `msg_usage` / `msg_end` 帧与历史接口） | `subagent_id` | 产出这条消息的临时员工 id（`sub_…`）；空 = 不是临时员工的消息 |
+| 同上 | `subagent_name` | 它的显示名（界面分组标题） |
+| 同上 | `subagent_parent_id` | 召它的那个 agent（真实 agent id 或上级临时员工 id）——会话内是一棵**树** |
+| 同上 | `subagent_level` | 它在树里的层级（真实 agent 的直属临时员工 = 1） |
+| `message` 帧 / 历史消息 | `kind` | `subagent_task`：交给它的任务（它的输入）；`subagent_report`：后台完成报告（**发起者**的输入）；`subagent_id` 非空且 kind 为 text/thinking/tool = 它自己的工作过程 |
+| `agent_status` 帧 | `subagent_id` 等 | 与消息同标记；`agent_id` 仍是会话主人（后台临时员工在跑时发起者显示 working） |
+| 工具结果 | 正文 | 阻塞模式的结果以 `【临时员工「名字」（id=…，层级 …；复用入口 subagent_id=…）】` 开头，紧跟它的最终报告；`subagent` 工具卡片本身是**普通工具卡片**（与 `read`/`write` 同一渲染路径，不做特例） |
+
+建议渲染口径：按 `subagent_id` 把消息分组到"临时员工「名字」"名下（`subagent_parent_id` + `subagent_level` 决定缩进/树形层级，
+与主 agent 自己的消息视觉上区分开）；`subagent_task` 渲染成"收到的任务"、`subagent_report` 渲染成"完成报告"；
+历史重载与实时帧使用**同一组字段**（历史接口走 `GET /api/conversations/{agentId}?session_id=…`，它返回会话的**完整**消息流）。
+
 ## 入口（先读这几处）
 
 | 文件 | 作用 |
@@ -42,6 +62,7 @@
 | [lib/src/tool/workspace_tool_runner.dart](lib/src/tool/workspace_tool_runner.dart) | 工具表组装与执行；工作空间 IO 缓存 + 私有目录分栏（`PrivateWorkspaceIO`） |
 | [lib/src/store/tree_store.dart](lib/src/store/tree_store.dart) · [file_store.dart](lib/src/store/file_store.dart) · [records.dart](lib/src/store/records.dart) | 数据根读写与记录模型 |
 | [lib/src/team/](lib/src/team/) | 团队服务、消息派发、工作目录口径（`team_workspace.dart`） |
+| [subagent_tool.dart](lib/src/tool/subagent_tool.dart) · [subagent_service.dart](lib/src/agent/subagent_service.dart) · [subagent_registry.dart](lib/src/store/subagent_registry.dart) · [subagent_store.dart](lib/src/store/subagent_store.dart) | **临时员工**（`subagent` 工具）：会话级名册 + 内存覆盖层 + 与普通轮同一条生成实现 |
 | [lib/src/spec/](lib/src/spec/) · [lib/src/mcp/](lib/src/mcp/) · [lib/src/plugin/](lib/src/plugin/) | Spec 体系 / MCP 客户端 / 插件宿主与站点 |
 | [lib/src/terminal/](lib/src/terminal/) | 集成终端（Ctrl+J）：本机与远端（SSH）**两条真 PTY** 的会话管理 + 生命周期（判据是**有效 SSH**，不是 `agent.sshConfig`；平台实现与远端 shell 通道都由 tree_local_exec 注入） |
 

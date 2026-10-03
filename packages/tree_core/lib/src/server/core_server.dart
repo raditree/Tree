@@ -29,6 +29,7 @@ import '../settings/ssh_config.dart';
 import '../spec/builtin_spec_assets.dart';
 import '../spec/spec_service.dart';
 import '../store/memory_store.dart';
+import '../store/subagent_registry.dart';
 import '../store/tree_store.dart';
 import '../team/message_dispatcher.dart';
 import '../team/team_model.dart';
@@ -88,6 +89,7 @@ class CoreServer {
     required this.hub,
     required this.questions,
     required this.compaction,
+    required this.subagents,
     required this.conversation,
     required this.router,
     required this.stubRouter,
@@ -234,6 +236,9 @@ class CoreServer {
   /// 只有 CLI 手上的东西（与 [AgentEngine] / [CompactionService] 同一个理由）。
   final LlmJsonCaller? llmJsonCaller;
 
+  /// 会话级**临时员工**名册；为 null 时本实例不认临时员工（测试/最小骨架）。
+  final SubagentRegistry? subagents;
+
   /// 会话服务（用户消息 → 流式回复）。
   final ConversationService conversation;
 
@@ -342,6 +347,7 @@ class CoreServer {
     /// 由 CLI 传 `backupAgentFile`（只有它知道数据根）；null = 不备份（测试）。
     Future<String> Function(CoreAgent agent)? agentBackup,
     CompactionService? compaction,
+    SubagentRegistry? subagents,
     TerminalHooks? stationHooks,
     LlmJsonCaller? llmJsonCaller,
     PtyStarter? ptyStarter,
@@ -397,12 +403,14 @@ class CoreServer {
       sshPtyStarter: sshPtyStarter,
       hub: hub,
       questions: questions,
+      subagents: subagents,
       conversation: ConversationService(
         store: resolvedStore,
         hub: hub,
         settings: resolvedSettings,
         questions: questions,
         compaction: compaction,
+        subagents: subagents,
         engine: engine ?? ScriptedAgent(chunkDelay: streamChunkDelay),
       ),
       router: CoreRouter(),
@@ -2047,7 +2055,7 @@ class CoreServer {
         messageCount: store.messageCount(agentId, sessionId),
       ),
       'messages': store
-          .messages(agentId, sessionId)
+          .sessionMessages(agentId, sessionId)
           .map((CoreMessage m) => m.toJson())
           .toList(),
     });
@@ -2074,10 +2082,12 @@ class CoreServer {
     HttpRequest request,
     Map<String, String> params,
   ) async {
-    final bool removed = store.deleteSession(
-      params['agentId'] ?? '',
-      params['sessionId'] ?? '',
-    );
+    final String agentId = params['agentId'] ?? '';
+    final String sessionId = params['sessionId'] ?? '';
+    // 临时员工只活在会话里：删会话即把它这一棵树从内存索引里摘掉
+    // （落盘名册随会话目录一起删，见 FileTreeStore.deleteSession）
+    subagents?.forgetSession(agentId, sessionId);
+    final bool removed = store.deleteSession(agentId, sessionId);
     if (!removed) {
       await writeJson(request, 404, errorBody('会话不存在'));
       return;
@@ -2096,12 +2106,14 @@ class CoreServer {
     }
     final String sessionId =
         request.uri.queryParameters['session_id'] ?? TreeStore.defaultSessionId;
+    // **会话完整消息流**（含临时员工的消息）：用户要能看到临时员工干过什么，
+    // 因此历史接口走 sessionMessages（模型上下文走 messages，两者刻意不同）。
     final List<CoreMessage> messages = (sessionId == 'all')
         ? <CoreMessage>[
             for (final CoreSession s in store.sessions(agentId))
-              ...store.messages(agentId, s.sessionId),
+              ...store.sessionMessages(agentId, s.sessionId),
           ]
-        : store.messages(agentId, sessionId);
+        : store.sessionMessages(agentId, sessionId);
     final List<CoreMessage> ordered = List<CoreMessage>.of(messages)
       ..sort(
         (CoreMessage a, CoreMessage b) => a.timestamp.compareTo(b.timestamp),

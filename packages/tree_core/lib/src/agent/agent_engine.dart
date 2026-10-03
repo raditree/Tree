@@ -168,8 +168,17 @@ class CoreMessageRef {
 
   bool get isThinking => kind == 'thinking';
 
-  /// 是否是"系统/hook 提示"（`kind == 'notice'`）：翻译时按 **user** 消息发出。
-  bool get isNotice => kind == 'notice';
+  /// 是否是"新的输入"：翻译时按 **user** 消息发出。
+  ///
+  /// 三类（与 `store/records.dart` 的 `MessageKinds` 必须同口径；本层刻意不依赖
+  /// 存储层，因此只认字面量）：
+  /// - `notice`：hook 提示 / 系统发言；
+  /// - `subagent_task`：交给临时员工的任务（它自己的输入）；
+  /// - `subagent_report`：临时员工后台完成报告（发起者的输入）。
+  bool get isNotice =>
+      kind == 'notice' ||
+      kind == 'subagent_task' ||
+      kind == 'subagent_report';
 
   /// 是否**不插进提示词**（存储层的 `llm_hidden`）：系统发言与过程提示都是这种。
   /// 与 [isNotice] 相反——那个要按 user 进上下文。见 LlmAgentEngine 的历史翻译。

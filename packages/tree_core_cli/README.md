@@ -17,6 +17,12 @@
 3. `shutdown`（stdin 一行）必须优雅退出并 `store.flush()`。
 4. provider 接线必须成对：`CoreServer.close()` 时按身份解绑，避免旧实例把过期数据留在全局 provider 上。
 5. 启动期的一次性迁移（`.self` → `.tree/<agent_id>/.self`）**幂等**，失败只记日志、不阻断启动。
+6. **临时员工（subagent）的装配只在这里**：`FileTreeStore` 外面包一层 `SubagentStore`（内存覆盖层 + 会话级名册），
+   再交给工具层 / 文件服务 / 会话服务——"临时员工是谁"因此只有一处答案，既有 `store.agent(id)` 调用点一个都不用改。
+   三个后置绑定的槽（与 `ioSink` / `deliverSink` 同一范式）：`probeWorkspace`（工具层建好后）、
+   `runner = server.conversation.runSubagent`（起监听后）、`onFinished`（后台完成 → **既有** `tools.onHookFinished → conversation.wake` 那条路，带 subagent 标记）。
+7. 未知的 `sub_*`（名册未装载 / 已被清理）在 `resolveWorkspaceDir` / `resolveSshConfig` 里**不猜**：
+   后者返回 null、前者返回空串，让上层显式失败——绝不落回 `workspaces/<id>` 那个并不存在的工作空间。
 
 ## 测试
 

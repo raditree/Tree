@@ -7,6 +7,7 @@ import '../team/message_dispatcher.dart';
 import '../team/team_service.dart';
 import 'message_tool.dart';
 import 'spec_tool.dart';
+import 'subagent_tool.dart';
 import 'question_channel.dart';
 import 'terminal_hooks.dart';
 import 'team_tool.dart';
@@ -57,9 +58,11 @@ abstract final class BuiltinTools {
     bool withTeam = false,
     bool withMessage = false,
     bool withSpec = false,
+    bool withSubagent = false,
   }) => <ToolSpec>[
     if (withTeam) TeamTool.spec(),
     if (withMessage) MessageTool.spec(),
+    if (withSubagent) SubagentTool.spec(),
     if (withSpec) SpecTool.spec(),
     if (withTodos)
       ToolSpec(
@@ -306,8 +309,12 @@ abstract final class BuiltinTools {
   /// `isError: true` 的**可读结果**，不抛异常——模型要能读到原因并自我纠正。
   /// 该工具是否需要工作空间（派发前据此决定是否准备 [WorkspaceIO]）。
   ///
-  /// `set_todo_list` / `ask_user_question` 与工作空间无关，因此即使工作空间
-  /// 不可用（SSH 配置不全等）也必须能用。
+  /// `set_todo_list` / `ask_user_question` / `subagent` 与工作空间无关，因此即使
+  /// 工作空间不可用（SSH 配置不全等）也必须能用。
+  ///
+  /// **`subagent` 显式不是工作空间类工具**（这一条有测试钉住）：召临时员工这件事本身
+  /// 不读文件；子 agent 的工作空间由它自己在运行时解析——缺工作空间时由
+  /// `SubagentService` 给出**可读错误**，而不是靠在派发前先要一个 IO。
   static bool needsWorkspace(String name) =>
       name == read ||
       name == write ||
@@ -326,11 +333,13 @@ abstract final class BuiltinTools {
     TeamService? teamService,
     TeamMessageDispatcher? messageDispatcher,
     SpecService? specService,
+    SubagentChannel? subagentChannel,
     bool withTodos = false,
     bool withQuestions = false,
     bool withTeam = false,
     bool withMessage = false,
     bool withSpec = false,
+    bool withSubagent = false,
   }) async {
     try {
       if (io == null && needsWorkspace(invocation.name)) {
@@ -347,6 +356,11 @@ abstract final class BuiltinTools {
             return const ToolOutcome('消息通道未接入：无法使用该工具', isError: true);
           }
           return await MessageTool.run(invocation, messageDispatcher);
+        case SubagentTool.name:
+          if (subagentChannel == null) {
+            return const ToolOutcome('临时员工通道未接入：无法使用该工具', isError: true);
+          }
+          return await SubagentTool.run(invocation, subagentChannel);
         case SpecTool.name:
           if (specService == null) {
             return const ToolOutcome('Spec 服务未接入：无法使用该工具', isError: true);
@@ -381,7 +395,7 @@ abstract final class BuiltinTools {
         default:
           return ToolOutcome(
             '未知工具：${invocation.name}'
-            '（可用：${specs(withTodos: withTodos, withQuestions: withQuestions, withTeam: withTeam, withMessage: withMessage, withSpec: withSpec).map((ToolSpec s) => s.name).join('、')}）',
+            '（可用：${specs(withTodos: withTodos, withQuestions: withQuestions, withTeam: withTeam, withMessage: withMessage, withSpec: withSpec, withSubagent: withSubagent).map((ToolSpec s) => s.name).join('、')}）',
             isError: true,
           );
       }

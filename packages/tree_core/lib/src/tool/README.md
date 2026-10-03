@@ -15,6 +15,7 @@
 | [mcp_tool.dart](mcp_tool.dart) | MCP 工具的发现入口（help / call）与"已配置但当前不可用"的如实说明 |
 | [plugin_tool.dart](plugin_tool.dart) | 插件工具发现入口与按定义来源路由的兜底调用 |
 | [question_channel.dart](question_channel.dart) | 提问通道契约（工具层 ↔ 编排层，避免反向依赖） |
+| [subagent_tool.dart](subagent_tool.dart) | **临时员工**工具（`subagent`）：形状/schema 校验 + 落点契约（`SubagentChannel`）与消息标记（`SubagentTag`） |
 | [status_text.dart](status_text.dart) | 每次工具结果前拼的"会话状态"（todo + 已选 Spec） |
 | [todo_store.dart](todo_store.dart) | 待办存储（markdown 勾选清单 + 内存实现） |
 | [terminal_hooks.dart](terminal_hooks.dart) | 后台长任务管理器（terminal 的 hook 模式） |
@@ -31,6 +32,13 @@
 8. 后台任务（hook 模式）：shell 把输出**直接重定向进日志文件**，核心只留一个进程句柄——核心进程重启也不丢日志，还少一层管道缓冲；任务结束（含取消）后写结束标记并回调唤醒 agent；关停时杀掉全部在途任务（进程不随应用退出存活）。
 9. 待办落盘是 markdown 勾选清单，**正文放在最后**（正文里出现任何符号都不破坏解析）；`status=` 是**权威值**，勾选框只同步人类可读性；缺元数据的行也能读出来（id 自动生成、状态按勾选框推断）。
 10. 提问通道是**具名契约**：工具层不反向依赖编排层（依赖方向 `tool` ← `agent`）。
+11. **`subagent` 与其它工具同权、同三站**（用户硬断言，不给它开后门）：
+    - **执行站**：`subagent` 一律经 `WorkspaceToolRunner._execute` → `BuiltinTools.run` 分派——和 `edit` / `write` / `team` 同一个入口。执行站命令 `tool.call`（`runFromPlugin`）因此能以 `tool: 'subagent'` 跑起来，权限口径与模型调用完全一致（**没有**特例白名单、**没有**特例拦截）；`origin` / `source_plugin_id` / `relay:false 默认绕开站点` 这些语义与普通工具逐字一致。
+    - **中转站**：`system.relay.tool.pre` / `.post` 对 `subagent` 照常生效——pre 改写的 `task` / `name` **真正生效**（子 agent 拿到的就是改写后的那份），post 可改结果文本。
+    - **广播站**：`system.broadcast.tool.pre` / `.post` 各发一条（单向、不等回包），载荷字段与普通工具完全相同（`point` / `phase` / `tool` / `call_id` / `round` / `origin` / `arguments`、post 还有 `result`）。
+    - **子 agent 自己的工具调用同样三站齐全**：临时员工跑在**同一个** `WorkspaceToolRunner` 上（同一份 relay/broadcast、同一份 `origin='agent'` 语义），绝不因为"跑在后台"就绕开站点；轮次序号按**调用**分配（`_relaySeq` 不是共享实例字段），父调用与嵌套调用、同名工具的并行调用都不会串号。
+    - 声明即能力：`specsFor` 在接了 `subagentService` 时**包含** `subagent`，未接线时**不包含**；`BuiltinTools.needsWorkspace('subagent')` 恒为 **false**（工具本身不读文件，子 agent 的工作空间由它自己在运行时解析，缺工作空间给**可读错误**）。
+    - 唯一的口径差异（**权限，不是绕站**）：临时员工的工具表**没有** `team` / `message`（不能被派活、不能建队/管队），但**有** `subagent`（可以再召，把同一个大任务拆细；层级上限 `SubagentLimits.maxDepth`）。
 
 ## 测试
 
@@ -39,5 +47,12 @@ cd packages/tree_core
 dart test test/builtin_tools_test.dart test/terminal_hooks_test.dart test/terminal_hook_wake_test.dart \
           test/terminal_soft_timeout_test.dart test/todo_store_test.dart test/tool_relay_test.dart \
           test/tool_list_refresh_test.dart test/session_status_test.dart test/team_tool_test.dart \
-          test/plugin_tool_define_test.dart test/plugin_tool_table_test.dart test/plugin_broadcast_tool_test.dart
+          test/plugin_tool_define_test.dart test/plugin_tool_table_test.dart test/plugin_broadcast_tool_test.dart \
+          test/subagent_tool_test.dart
 ```
+
+- `subagent_tool_test.dart`：工具形状与校验（缺/空 `task`）、阻塞模式把最终报告作为工具结果返回、
+  复用（同 id 续活、历史延续、不新建实体）、层级上限的可读错误、**并行后台**（同一轮 3 个真的同时跑、
+  三份结果各注入一次且不串）、父 agent 在途轮次不与之撞键、工具表裁剪（临时员工没有 team/message、有 subagent）。
+- `tool_relay_test.dart` / `plugin_broadcast_tool_test.dart` 里的 `subagent` 用例钉住不变量 11 的三站口径
+  （pre 改写真正生效、post 改写结果、嵌套调用各有轮次、`tool.call` 默认绕开 / `relay:true` 触发）。

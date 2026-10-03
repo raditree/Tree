@@ -40,14 +40,16 @@ void main() {
     bus = PluginBus(configFile: file.path, log: logs.add);
     addTearDown(bus.close);
     // 复刻生产接线：team / mode 按 agent 真实归属（站点消息必须有可证明的归属）
+    // 站点四元组按 agent 真实归属：临时员工（sub_…）与它的会话主人同队同模式
+    // （生产里 team 来自它持久化配置里的 team_id，见 SubagentService._buildAgent）。
     bus.callSiteContext = (String agentId, String sessionId) =>
         StationScopeContext(
-          teamId: agentId == agent ? team : '',
+          teamId: agentId == agent || agentId.startsWith('sub_') ? team : '',
           agentId: agentId,
           sessionId: sessionId,
         );
     bus.agentModeKeyResolver = (String agentId) =>
-        agentId == agent ? StationModeKey.local : '';
+        agentId == agent || agentId.startsWith('sub_') ? StationModeKey.local : '';
     // 进程内假订阅者不在总线实例表里：这里统一声明"心跳在"，
     // 让"永不回包"那条用例测的是**核心不等回包**，而不是"订阅者被判死"。
     bus.stations.livenessProbe = (String pluginId) =>
@@ -157,6 +159,231 @@ void main() {
 
   String written() =>
       File(p.join(workspace, 'notes', 'a.txt')).readAsStringSync();
+
+  /// 组装"临时员工在场"的工具层：真 MemoryStore + 名册 + 装饰器 + 服务。
+  ///
+  /// [inner] = 服务跑一轮时执行的"临时员工内部工具调用"（null = 内部啥也不干），
+  /// 用它证明**子 agent 自己的工具调用同样走三站**。
+  ({
+    WorkspaceToolRunner runner,
+    SubagentService service,
+    CoreAgent owner,
+    String subagentId,
+  })
+  subagentRig(
+    List<Map<String, dynamic>> pre,
+    List<Map<String, dynamic>> post, {
+    ToolInvocation? internalCall,
+  }) {
+    final MemoryStore inner = MemoryStore();
+    final SubagentRegistry registry = SubagentRegistry(persistence: inner);
+    final SubagentStore store = SubagentStore(inner: inner, registry: registry);
+    final CoreSettings settings = CoreSettings()
+      ..putModel(CoreModelConfig(modelId: 'demo'));
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    final CoreAgent owner = CoreAgent(
+      id: agent,
+      name: 'leader',
+      modelId: 'demo',
+      teamId: '',
+      createdAt: now,
+      updatedAt: now,
+    );
+    store.putAgent(owner);
+    final String subagentId = 'sub_test1';
+    registry.put(
+      CoreSubagent(
+        id: subagentId,
+        name: '临时员工',
+        ownerAgentId: agent,
+        sessionId: session,
+        parentId: agent,
+        level: 1,
+        agent: CoreAgent(
+          id: subagentId,
+          name: '临时员工',
+          modelId: 'demo',
+          teamId: agent,
+          parentAgentId: agent,
+          level: 1,
+          reviewStatus: ReviewStatus.approved,
+          createdAt: now,
+          updatedAt: now,
+        ),
+        createdAt: now,
+        updatedAt: now,
+      ),
+    );
+    final SubagentService service = SubagentService(
+      store: store,
+      registry: registry,
+      settings: settings,
+    );
+    late WorkspaceToolRunner runner;
+    service.runner = (SubagentTurnRequest request) async {
+      if (internalCall != null) {
+        // 它自己的一次工具调用：走**同一个** runner（同一份中转/广播）
+        final ToolOutcome inner = await runner.run(
+          ToolInvocation(
+            id: internalCall.id,
+            name: internalCall.name,
+            arguments: internalCall.arguments,
+            agentId: request.tag.id,
+            sessionId: request.sessionId,
+          ),
+        );
+        return SubagentTurnResult(report: '报告：${request.task}（内部=${inner.isError}）');
+      }
+      return SubagentTurnResult(report: '报告：${request.task}');
+    };
+    runner = WorkspaceToolRunner(
+      resolveWorkspaceDir: (String agentId) => workspace,
+      pluginBus: bus,
+      subagentService: service,
+      log: logs.add,
+    );
+    addTearDown(runner.close);
+    return (runner: runner, service: service, owner: owner, subagentId: subagentId);
+  }
+
+  test('广播：subagent 调用 pre / post 各一条；它内部的工具调用同样各一条（轮次不串号）', () async {
+    final List<Map<String, dynamic>> pre = <Map<String, dynamic>>[];
+    final List<Map<String, dynamic>> post = <Map<String, dynamic>>[];
+    subscribe(StationHubIds.broadcastToolPre, 'probe-pre', pre);
+    subscribe(StationHubIds.broadcastToolPost, 'probe-post', post);
+
+    final rig = subagentRig(
+      pre,
+      post,
+      internalCall: ToolInvocation(
+        id: 'inner-1',
+        name: 'write',
+        arguments: <String, dynamic>{
+          'file_path': 'notes/sub.txt',
+          'content': '临时员工写的',
+        },
+        agentId: 'ignored',
+        sessionId: 'ignored',
+      ),
+    );
+
+    final ToolOutcome outcome = await rig.runner
+        .run(
+          ToolInvocation(
+            id: 'tool-sub',
+            name: 'subagent',
+            arguments: <String, dynamic>{
+              'task': '写一个文件',
+              'name': '写字员',
+              'subagent_id': rig.subagentId,
+            },
+            agentId: rig.owner.id,
+            sessionId: session,
+          ),
+        )
+        .timeout(const Duration(seconds: 15));
+    expect(outcome.isError, isFalse, reason: outcome.content);
+    // 内层真的执行了（子 agent 的工具调用没有被吞掉）
+    expect(
+      File(p.join(workspace, 'notes', 'sub.txt')).readAsStringSync(),
+      '临时员工写的',
+    );
+
+    await waitUntil(
+      () => pre.length == 2 && post.length == 2,
+      description: '外层 subagent + 内层 write 各 pre/post 一条',
+    );
+    final Map<String, dynamic> outerPre = pre.firstWhere(
+      (Map<String, dynamic> p) => p['tool'] == 'subagent',
+    );
+    final Map<String, dynamic> outerPost = post.firstWhere(
+      (Map<String, dynamic> p) => p['tool'] == 'subagent',
+    );
+    final Map<String, dynamic> innerPre = pre.firstWhere(
+      (Map<String, dynamic> p) => p['tool'] == 'write',
+    );
+    final Map<String, dynamic> innerPost = post.firstWhere(
+      (Map<String, dynamic> p) => p['tool'] == 'write',
+    );
+
+    // 本站点：pre / post 各一条，载荷与普通工具一致
+    for (final Map<String, dynamic> payload in <Map<String, dynamic>>[
+      outerPre,
+      innerPost,
+    ]) {
+      expect(payload['origin'], 'agent');
+      expect(payload['agent_id'], isNotEmpty);
+      expect(payload['session_id'], session);
+      expect(payload['call_id'], isNotEmpty);
+    }
+    expect(outerPre['point'], StationHubIds.broadcastToolPre);
+    expect(outerPre['phase'], 'pre');
+    expect(outerPre['tool'], 'subagent');
+    expect(outerPre['arguments'], <String, dynamic>{
+      'task': '写一个文件',
+      'name': '写字员',
+      'subagent_id': rig.subagentId,
+    });
+    expect(outerPost['point'], StationHubIds.broadcastToolPost);
+    expect(outerPost['result'], outcome.content);
+    expect(innerPre['arguments'], <String, dynamic>{
+      'file_path': 'notes/sub.txt',
+      'content': '临时员工写的',
+    });
+    expect(innerPost['point'], StationHubIds.broadcastToolPost);
+    // 轮次按**调用**分配：父调用与它内部那次调用不串号（同名工具并行也不串）
+    expect(
+      outerPre['round'],
+      outerPost['round'],
+      reason: 'pre / post 必须同轮次（否则插件配不上对）',
+    );
+    expect(innerPre['round'], innerPost['round']);
+    expect(
+      outerPre['round'],
+      isNot(innerPre['round']),
+      reason: '嵌套调用各有各的轮次序号',
+    );
+  });
+
+  test('执行站 tool.call 传 subagent：默认绕开站点，relay: true 触发（与普通工具同语义）', () async {
+    final List<Map<String, dynamic>> pre = <Map<String, dynamic>>[];
+    final List<Map<String, dynamic>> post = <Map<String, dynamic>>[];
+    subscribe(StationHubIds.broadcastToolPre, 'probe-pre', pre);
+    subscribe(StationHubIds.broadcastToolPost, 'probe-post', post);
+    final rig = subagentRig(pre, post);
+
+    ToolInvocation call(String id) => ToolInvocation(
+      id: id,
+      name: 'subagent',
+      arguments: <String, dynamic>{'task': '插件派下来的活'},
+      agentId: rig.owner.id,
+      sessionId: session,
+    );
+
+    // ① 默认 relay=false：**绕开**中转与广播（防自锁），但工具照常执行
+    final ToolOutcome quiet = await rig.runner
+        .runFromPlugin(call('plugin-1'), sourcePluginId: 'plugin-1')
+        .timeout(const Duration(seconds: 15));
+    expect(quiet.isError, isFalse, reason: quiet.content);
+    expect(quiet.content, contains('报告：插件派下来的活'));
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    expect(pre, isEmpty, reason: '默认绕开广播：不该有条目');
+    expect(post, isEmpty);
+
+    // ② relay=true：与普通工具逐字同语义——pre / post 各一条，origin=plugin
+    final ToolOutcome relayed = await rig.runner
+        .runFromPlugin(call('plugin-2'), sourcePluginId: 'plugin-1', relay: true)
+        .timeout(const Duration(seconds: 15));
+    expect(relayed.isError, isFalse, reason: relayed.content);
+    await waitUntil(
+      () => pre.length == 1 && post.length == 1,
+      description: '插件发起的 subagent 调用也广播 pre / post',
+    );
+    expect(pre.single['tool'], 'subagent');
+    expect(pre.single['origin'], 'plugin');
+    expect(post.single['point'], StationHubIds.broadcastToolPost);
+    expect(post.single['round'], pre.single['round']);
+  });
 
   test('广播：一次真实工具调用 ⇒ pre / post 各一条，payload 字段齐全（origin=agent）', () async {
     final List<Map<String, dynamic>> pre = <Map<String, dynamic>>[];

@@ -14,6 +14,11 @@ class MemoryStore implements TreeStore {
   final Map<String, List<CoreMessage>> _messages =
       <String, List<CoreMessage>>{};
 
+  /// 临时员工名册（`agentId::sessionId` → 记录）。与 [FileTreeStore] 同一契约：
+  /// 只在该会话里可见，删会话/删 agent 一并清掉。
+  final Map<String, List<CoreSubagent>> _subagents =
+      <String, List<CoreSubagent>>{};
+
   // ── agent ────────────────────────────────────────────────────────────
 
   @override
@@ -94,6 +99,7 @@ class MemoryStore implements TreeStore {
     if (_agents.remove(id) == null) return false;
     _sessions.removeWhere((_, CoreSession s) => s.agentId == id);
     _messages.removeWhere((String key, _) => key.startsWith('$id::'));
+    _subagents.removeWhere((String key, _) => key.startsWith('$id::'));
     return true;
   }
 
@@ -103,11 +109,58 @@ class MemoryStore implements TreeStore {
     for (final MapEntry<String, List<CoreMessage>> entry in _messages.entries) {
       if (!entry.key.startsWith('$agentId::')) continue;
       for (final CoreMessage m in entry.value) {
-        if (m.isTool || m.role != 'agent') continue;
+        if (m.isTool || m.role != 'agent' || m.isSubagentMessage) continue;
         if (latest == null || m.timestamp > latest.timestamp) latest = m;
       }
     }
     return latest;
+  }
+
+  // ── 临时员工（subagent，会话级） ─────────────────────────────────────
+
+  static String _subagentsKey(String agentId, String sessionId) =>
+      '$agentId::$sessionId';
+
+  @override
+  List<CoreSubagent> subagents(String agentId, String sessionId) =>
+      List<CoreSubagent>.unmodifiable(
+        _subagents[_subagentsKey(agentId, sessionId)] ?? const <CoreSubagent>[],
+      );
+
+  @override
+  void putSubagent(CoreSubagent subagent) {
+    final String key = _subagentsKey(subagent.ownerAgentId, subagent.sessionId);
+    final List<CoreSubagent> list = _subagents.putIfAbsent(
+      key,
+      () => <CoreSubagent>[],
+    );
+    final int index = list.indexWhere((CoreSubagent s) => s.id == subagent.id);
+    if (index >= 0) {
+      list[index] = subagent;
+    } else {
+      list.add(subagent);
+    }
+  }
+
+  @override
+  int deleteSubagent(String agentId, String sessionId, String id) {
+    final List<CoreSubagent>? list = _subagents[_subagentsKey(agentId, sessionId)];
+    if (list == null) return 0;
+    // 按树收：目标是"这条记录 + 它的全部下级"（下级由 parent_id 链确定）
+    final Set<String> doomed = subagentTreeIds(list, id);
+    final int before = list.length;
+    list.removeWhere((CoreSubagent s) => doomed.contains(s.id));
+    final int removed = before - list.length;
+    if (list.isEmpty) _subagents.remove(_subagentsKey(agentId, sessionId));
+    return removed;
+  }
+
+  @override
+  int clearSubagents(String agentId, String sessionId) {
+    final List<CoreSubagent>? removed = _subagents.remove(
+      _subagentsKey(agentId, sessionId),
+    );
+    return removed?.length ?? 0;
   }
 
   // ── 会话 ─────────────────────────────────────────────────────────────
@@ -179,6 +232,8 @@ class MemoryStore implements TreeStore {
     if (session == null) return false;
     _sessions.remove(sessionId);
     _messages.remove(_messagesKey(agentId, sessionId));
+    // 临时员工只在会话里存在：删会话即连同整棵名册一起消失（不残留任何全局位置）
+    _subagents.remove(_subagentsKey(agentId, sessionId));
     return true;
   }
 
@@ -233,6 +288,16 @@ class MemoryStore implements TreeStore {
 
   @override
   List<CoreMessage> messages(String agentId, String sessionId) =>
+      List<CoreMessage>.unmodifiable(
+        // 自己的对话：排掉临时员工的消息——**除了**给它的完成报告
+        // （那是"新的输入"，发起者得知道活干完了）
+        sessionMessages(agentId, sessionId).where(
+          (CoreMessage m) => !m.isSubagentMessage || m.isSubagentReport,
+        ),
+      );
+
+  @override
+  List<CoreMessage> sessionMessages(String agentId, String sessionId) =>
       List<CoreMessage>.unmodifiable(
         _messages[_messagesKey(agentId, sessionId)] ?? const <CoreMessage>[],
       );

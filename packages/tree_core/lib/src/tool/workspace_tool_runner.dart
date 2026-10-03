@@ -14,8 +14,11 @@ import '../team/message_dispatcher.dart';
 import '../team/team_service.dart';
 import 'builtin_tools.dart';
 import 'mcp_tool.dart';
+import 'message_tool.dart';
 import 'plugin_tool.dart';
 import 'question_channel.dart';
+import 'subagent_tool.dart';
+import 'team_tool.dart';
 import 'terminal_hooks.dart';
 import 'todo_store.dart';
 import 'tool_runner.dart';
@@ -44,6 +47,7 @@ class WorkspaceToolRunner implements ToolRunner {
     this.teamService,
     this.messageDispatcher,
     this.specService,
+    this.subagentService,
     this.mcpService,
     this.pluginBus,
     WorkspaceIO Function(String dir)? ioFactory,
@@ -57,7 +61,16 @@ class WorkspaceToolRunner implements ToolRunner {
   late final TerminalHooks hooks;
 
   /// 后台任务完成回调（CLI 接到 `ConversationService.wake`）。
-  void Function(String agentId, String sessionId, String notice)?
+  ///
+  /// [subagent] 非空 = 这次完成属于一个**临时员工**（后台 subagent）：回调方要把
+  /// `subagent_id/name/level` 一并带进注入会话的那条消息（前端据此分组）。终端 hook
+  /// 的完成通知不带它（null）——两条路共用同一个回调，不新增第二条唤醒通道。
+  void Function(
+    String agentId,
+    String sessionId,
+    String notice, {
+    SubagentTag? subagent,
+  })?
   onHookFinished;
 
   /// 解析 agent 的工作空间目录。
@@ -86,6 +99,15 @@ class WorkspaceToolRunner implements ToolRunner {
   /// 团队服务（为 null 时不声明 `team`）。
   final TeamService? teamService;
 
+  /// **临时员工**服务（为 null 时不声明 `subagent`）。
+  ///
+  /// 除了声明与分派，它还提供两条判据（都走同一份会话级名册）：
+  /// - [SubagentChannel.isSubagent]：临时员工的工具表要裁掉 `team` / `message`
+  ///   （不能被派活、不能建队），其余照旧；
+  /// - [SubagentChannel.privateOwnerOf]：临时员工的工作空间 IO 直接**复用发起者那条**
+  ///   （同一份根、同一条 SSH 连接、同一个 `.tree/<agent>/.self` 分栏）。
+  final SubagentChannel? subagentService;
+
   /// 消息派发（为 null 时不声明 `message`）。
   final TeamMessageDispatcher? messageDispatcher;
 
@@ -113,29 +135,41 @@ class WorkspaceToolRunner implements ToolRunner {
   List<ToolSpec> specsFor({
     required String agentId,
     required String sessionId,
-  }) => <ToolSpec>[
-    ...BuiltinTools.specs(
-      withTodos: todoStore != null,
-      withQuestions: askQuestion != null,
-      withTeam: teamService != null,
-      withMessage: messageDispatcher != null,
-      withSpec: specService != null,
-    ),
-    if (mcpService != null) ...<ToolSpec>[
-      McpTool.spec(),
-      ...McpTool.dynamicSpecs(mcpService!),
-    ],
-    if (pluginBus != null) ...<ToolSpec>[
-      PluginTool.spec(),
-      // **工具表刷新处**（模型每轮生成前都走这里）：按调用点四元组取插件工具，
-      // 内部是「缓存 + 失效点」——只有插件上线/下线/重启后才后台补一次收集。
-      ...PluginTool.dynamicSpecsFor(
-        pluginBus!,
-        agentId: agentId,
-        sessionId: sessionId,
+  }) {
+    final SubagentChannel? subs = subagentService;
+    final bool isSubagent = subs?.isSubagent(agentId) ?? false;
+    // 插件工具按**站点四元组**解析，而临时员工与发起者共享工作空间/团队归属：
+    // 用发起者的 id 取表，插件的 scope 才落在真实团队上（临时员工不是独立团队）。
+    final String scopeAgentId = isSubagent
+        ? subs!.privateOwnerOf(agentId)
+        : agentId;
+    return <ToolSpec>[
+      ...BuiltinTools.specs(
+        withTodos: todoStore != null,
+        withQuestions: askQuestion != null,
+        // 临时员工：不能被派活（没有 message）、也不能建队/管队（没有 team）；
+        // **subagent 不排除**——它可以再召临时员工（把同一个大任务拆细，层级有上限）。
+        withTeam: teamService != null && !isSubagent,
+        withMessage: messageDispatcher != null && !isSubagent,
+        withSpec: specService != null,
+        withSubagent: subs != null,
       ),
-    ],
-  ];
+      if (mcpService != null) ...<ToolSpec>[
+        McpTool.spec(),
+        ...McpTool.dynamicSpecs(mcpService!),
+      ],
+      if (pluginBus != null) ...<ToolSpec>[
+        PluginTool.spec(),
+        // **工具表刷新处**（模型每轮生成前都走这里）：按调用点四元组取插件工具，
+        // 内部是「缓存 + 失效点」——只有插件上线/下线/重启后才后台补一次收集。
+        ...PluginTool.dynamicSpecsFor(
+          pluginBus!,
+          agentId: scopeAgentId,
+          sessionId: sessionId,
+        ),
+      ],
+    ];
+  }
 
   @override
   Future<ToolOutcome> run(
@@ -209,8 +243,24 @@ class WorkspaceToolRunner implements ToolRunner {
     if (plugins != null && PluginTool.handles(effective.name)) {
       return _truncate(await PluginTool.run(effective, plugins));
     }
-    // 不依赖工作空间的工具（set_todo_list / ask_user_question）先走：工作空间
-    // 不可用（SSH 配置不全等）不该连带它们一起失败。
+    // **权限（工具表）口径**：临时员工没有 team / message（不能被派活、也不能建队/
+    // 管队）。这是一条"以谁的身份能调什么"的判据，与三站无关——`subagent` 本身
+    // 与其它内置工具同权同站，**不走任何白名单/特例**。
+    final SubagentChannel? subs = subagentService;
+    if (subs != null &&
+        subs.isSubagent(effective.agentId) &&
+        (effective.name == TeamTool.name ||
+            effective.name == MessageTool.name)) {
+      return ToolOutcome(
+        '临时员工不能使用 ${effective.name} 工具：它的活由 task 下达、产出一段报告，'
+        '既不能被派活也不能派活给团队成员。',
+        isError: true,
+      );
+    }
+    // 不依赖工作空间的工具（set_todo_list / ask_user_question / subagent）先走：
+    // 工作空间不可用（SSH 配置不全等）不该连带它们一起失败。`subagent` 明确
+    // **不属于** `needsWorkspace`：工具本身不读文件，子 agent 的工作空间由它自己
+    // 在运行时解析（缺工作空间时由 SubagentService 给可读错误）。
     WorkspaceIO? io;
     if (BuiltinTools.needsWorkspace(effective.name)) {
       io = await _ioFor(effective.agentId);
@@ -222,21 +272,45 @@ class WorkspaceToolRunner implements ToolRunner {
         );
       }
     }
+    // 临时员工的提问要**带上它的名字**（用户不该以为这是主 agent 在问）：
+    // 问题归集到会话主人的会话（临时员工没有自己的会话），并打上 subagent 标记。
+    AskQuestion? ask = askQuestion;
+    final SubagentTag? tag = subs?.tagOf(effective.agentId);
+    if (ask != null && tag != null) {
+      final AskQuestion inner = ask;
+      ask = (AskQuestionRequest request) => inner(
+        AskQuestionRequest(
+          agentId: subs!.privateOwnerOf(request.agentId),
+          sessionId: request.sessionId,
+          question: '【临时员工「${tag.name}」提问】${request.question}',
+          options: request.options,
+          teamId: request.teamId,
+          isMember: request.isMember,
+          subagentId: tag.id,
+          subagentName: tag.name,
+          subagentParentId: tag.parentId,
+          subagentLevel: tag.level,
+          isCancelled: request.isCancelled,
+        ),
+      );
+    }
     final ToolOutcome outcome = await BuiltinTools.run(
       effective,
       io,
       isCancelled: isCancelled,
       todos: todoStore,
       hooks: hooks,
-      askQuestion: askQuestion,
+      askQuestion: ask,
       teamService: teamService,
       messageDispatcher: messageDispatcher,
       specService: specService,
+      subagentChannel: subs,
       withTodos: todoStore != null,
-      withQuestions: askQuestion != null,
+      withQuestions: ask != null,
       withTeam: teamService != null,
       withMessage: messageDispatcher != null,
       withSpec: specService != null,
+      withSubagent: subs != null,
     );
     return _truncate(outcome);
   }
@@ -396,7 +470,13 @@ class WorkspaceToolRunner implements ToolRunner {
   }
 
   void _finished(HookTask task, int exitCode) {
-    final void Function(String, String, String)? callback = onHookFinished;
+    final void Function(
+      String,
+      String,
+      String, {
+      SubagentTag? subagent,
+    })?
+    callback = onHookFinished;
     if (callback == null) return;
     callback(task.agentId, task.sessionId, hookNotice(task, exitCode));
   }
@@ -406,34 +486,38 @@ class WorkspaceToolRunner implements ToolRunner {
   Future<WorkspaceIO?> ioFor(String agentId) => _ioFor(agentId);
 
   Future<WorkspaceIO?> _ioFor(String agentId) async {
-    final WorkspaceIO? cached = _ios[agentId];
+    // **临时员工复用发起者那条工作空间**（同一份根、同一条 SSH 连接、同一个
+    // `.tree/<agent>/.self` 私有分栏）：私有状态归到**会话主人**，用户的工作空间里
+    // 因此不会留下 `sub_*` 目录，它读到的系统提示词文件与发起者是同一份。
+    final String ownerId = subagentService?.privateOwnerOf(agentId) ?? agentId;
+    final WorkspaceIO? cached = _ios[ownerId];
     if (cached != null) return cached;
 
-    final SshConfig? ssh = resolveSshConfig?.call(agentId);
+    final SshConfig? ssh = resolveSshConfig?.call(ownerId);
     if (ssh != null) {
       final Future<WorkspaceIO> Function(SshConfig config)? factory =
           sshIoFactory;
       if (factory == null) {
         log?.call(
-          'agent $agentId 配置了 SSH ${ssh.redacted()}，'
+          'agent $ownerId 配置了 SSH ${ssh.redacted()}，'
           '但 SSH 执行后端尚未接入（M4b-2）',
         );
         return null;
       }
       if (!ssh.isComplete) {
-        log?.call('agent $agentId 的 SSH 配置缺少：${ssh.missingFields.join('、')}');
+        log?.call('agent $ownerId 的 SSH 配置缺少：${ssh.missingFields.join('、')}');
         return null;
       }
       // 私有状态按 agent 分栏（`.self/…` → `.tree/<agent_id>/.self/…`）：
       // 团队成员与 leader 共享工作目录，但各自的 .self 必须分开（见 PrivateWorkspaceIO）。
-      final WorkspaceIO io = PrivateWorkspaceIO(await factory(ssh), agentId);
-      _ios[agentId] = io;
+      final WorkspaceIO io = PrivateWorkspaceIO(await factory(ssh), ownerId);
+      _ios[ownerId] = io;
       return io;
     }
 
-    final String dir = resolveWorkspaceDir(agentId);
+    final String dir = resolveWorkspaceDir(ownerId);
     if (dir.trim().isEmpty) {
-      log?.call('agent $agentId 的工作空间目录为空');
+      log?.call('agent $ownerId 的工作空间目录为空');
       return null;
     }
     try {
@@ -443,8 +527,8 @@ class WorkspaceToolRunner implements ToolRunner {
       return null;
     }
     // 本机后端同样按 agent 分栏（`.self/…` → `.tree/<agent_id>/.self/…`）。
-    final WorkspaceIO io = PrivateWorkspaceIO(_ioFactory(p.normalize(dir)), agentId);
-    _ios[agentId] = io;
+    final WorkspaceIO io = PrivateWorkspaceIO(_ioFactory(p.normalize(dir)), ownerId);
+    _ios[ownerId] = io;
     return io;
   }
 

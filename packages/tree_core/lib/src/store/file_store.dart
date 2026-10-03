@@ -47,6 +47,10 @@ class FileTreeStore implements TreeStore {
       <String, Map<String, CoreSession>>{};
   final Map<String, List<CoreMessage>> _messages =
       <String, List<CoreMessage>>{};
+
+  /// 临时员工名册缓存（`agentId::sessionId` → 记录；键存在 = 已从盘上装载过）。
+  final Map<String, List<CoreSubagent>> _subagents =
+      <String, List<CoreSubagent>>{};
   final Map<String, CoreMessage?> _preview = <String, CoreMessage?>{};
   final WriteQueue _queue = WriteQueue();
 
@@ -156,6 +160,7 @@ class FileTreeStore implements TreeStore {
     if (!inCache && !File(paths.agentFile(id)).existsSync()) return false;
     _sessions.remove(id);
     _messages.removeWhere((String key, _) => key.startsWith('$id::'));
+    _subagents.removeWhere((String key, _) => key.startsWith('$id::'));
     _preview.removeWhere((String key, _) => key.startsWith('$id::'));
     final String agentFile = paths.agentFile(id);
     final String dataDir = paths.agentDataDir(id);
@@ -263,6 +268,8 @@ class FileTreeStore implements TreeStore {
     _sessions[agentId]?.remove(sessionId);
     final String key = _key(agentId, sessionId);
     _messages.remove(key);
+    // 临时员工只在会话里存在：名册随会话目录一起删（subagents.json 在同一个目录里）
+    _subagents.remove(key);
     _preview.remove(key);
     final String dir = paths.sessionDir(agentId, sessionId);
     _queue.enqueue(dir, () async {
@@ -322,11 +329,70 @@ class FileTreeStore implements TreeStore {
   // ── 消息 ─────────────────────────────────────────────────────────────
 
   @override
-  List<CoreMessage> messages(String agentId, String sessionId) {
+  List<CoreMessage> messages(String agentId, String sessionId) =>
+      List<CoreMessage>.unmodifiable(
+        // 自己的对话：排掉临时员工的消息——**除了**给它的完成报告
+        // （那是"新的输入"，发起者得知道活干完了）
+        sessionMessages(agentId, sessionId).where(
+          (CoreMessage m) => !m.isSubagentMessage || m.isSubagentReport,
+        ),
+      );
+
+  @override
+  List<CoreMessage> sessionMessages(String agentId, String sessionId) {
     _loadMessages(agentId, sessionId);
     return List<CoreMessage>.unmodifiable(
       _messages[_key(agentId, sessionId)] ?? const <CoreMessage>[],
     );
+  }
+
+  // ── 临时员工（subagent，会话级） ─────────────────────────────────────
+
+  @override
+  List<CoreSubagent> subagents(String agentId, String sessionId) {
+    _loadSubagents(agentId, sessionId);
+    return List<CoreSubagent>.unmodifiable(
+      _subagents[_key(agentId, sessionId)] ?? const <CoreSubagent>[],
+    );
+  }
+
+  @override
+  void putSubagent(CoreSubagent subagent) {
+    _loadSubagents(subagent.ownerAgentId, subagent.sessionId);
+    final List<CoreSubagent> list = _subagents.putIfAbsent(
+      _key(subagent.ownerAgentId, subagent.sessionId),
+      () => <CoreSubagent>[],
+    );
+    final int index = list.indexWhere((CoreSubagent s) => s.id == subagent.id);
+    if (index >= 0) {
+      list[index] = subagent;
+    } else {
+      list.add(subagent);
+    }
+    _writeSubagents(subagent.ownerAgentId, subagent.sessionId);
+  }
+
+  @override
+  int deleteSubagent(String agentId, String sessionId, String id) {
+    _loadSubagents(agentId, sessionId);
+    final List<CoreSubagent>? list = _subagents[_key(agentId, sessionId)];
+    if (list == null) return 0;
+    final Set<String> doomed = subagentTreeIds(list, id);
+    final int before = list.length;
+    list.removeWhere((CoreSubagent s) => doomed.contains(s.id));
+    final int removed = before - list.length;
+    if (removed > 0) _writeSubagents(agentId, sessionId);
+    return removed;
+  }
+
+  @override
+  int clearSubagents(String agentId, String sessionId) {
+    _loadSubagents(agentId, sessionId);
+    final List<CoreSubagent>? list = _subagents[_key(agentId, sessionId)];
+    final int removed = list?.length ?? 0;
+    _subagents[_key(agentId, sessionId)] = <CoreSubagent>[];
+    if (removed > 0) _writeSubagents(agentId, sessionId);
+    return removed;
   }
 
   @override
@@ -349,8 +415,8 @@ class FileTreeStore implements TreeStore {
       list.isEmpty ? 0 : list.last.timestamp,
     );
     list.add(message);
-    // 预览只关心"最后一条 agent 文本消息"，工具卡片与用户消息不覆盖它
-    if (!message.isTool && message.role == 'agent') {
+    // 预览只关心"最后一条 agent 文本消息"，工具卡片、用户消息、临时员工的话都不覆盖它
+    if (!message.isTool && message.role == 'agent' && !message.isSubagentMessage) {
       _preview[key] = message;
     }
     // updated_at 只前进不后退（与 MemoryStore 同一语义，见契约测试）
@@ -504,6 +570,36 @@ class FileTreeStore implements TreeStore {
     _messages[key] = result.records.map(CoreMessage.fromJson).toList();
   }
 
+  /// 装载某会话的临时员工名册（幂等）：
+  /// `data/<agentId>/<sessionId>/subagents.json`（人类可读、原子快照）。
+  ///
+  /// 坏文件**不阻断会话**：解析失败只记日志并当成空名册（与"坏消息行跳过"同一取舍）。
+  void _loadSubagents(String agentId, String sessionId) {
+    final String key = _key(agentId, sessionId);
+    if (_subagents.containsKey(key)) return;
+    _subagents[key] = <CoreSubagent>[];
+    final String file = paths.subagentsFile(agentId, sessionId);
+    final String? text = AtomicFile.readStringOrNullSync(file);
+    if (text == null || text.trim().isEmpty) return;
+    try {
+      final Object? decoded = jsonDecode(text);
+      final Object? raw = decoded is Map ? decoded['subagents'] : decoded;
+      if (raw is! List) return;
+      final List<CoreSubagent> out = <CoreSubagent>[];
+      for (final Object? item in raw) {
+        if (item is! Map) continue;
+        final CoreSubagent subagent = CoreSubagent.fromJson(
+          item.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
+        );
+        if (subagent.id.isEmpty) continue;
+        out.add(subagent);
+      }
+      _subagents[key] = out;
+    } catch (error) {
+      log?.call('临时员工名册解析失败（当作空名册）：$file：$error');
+    }
+  }
+
   /// 会话最后一条 agent 文本消息（读文件尾部即可，避免整份历史进内存）。
   CoreMessage? _previewFor(String agentId, String sessionId) {
     final String key = _key(agentId, sessionId);
@@ -518,6 +614,8 @@ class FileTreeStore implements TreeStore {
       for (final Map<String, dynamic> record in result.records.reversed) {
         final CoreMessage message = CoreMessage.fromJson(record);
         if (message.isTool || message.role != 'agent') continue;
+        // 预览只说"这个 agent 自己"的最后一句话，不看临时员工的产出
+        if (message.isSubagentMessage) continue;
         found = message;
         break;
       }
@@ -538,6 +636,27 @@ class FileTreeStore implements TreeStore {
       header: _agentHeader,
     );
     _queue.enqueue(file, () => AtomicFile.writeStringAtomic(file, content));
+  }
+
+  /// 落盘临时员工名册（原子快照；空名册也写，保持"该会话的范围内"这条不变量）。
+  void _writeSubagents(String agentId, String sessionId) {
+    final String file = paths.subagentsFile(agentId, sessionId);
+    final String content = const JsonEncoder.withIndent('  ').convert(
+      <String, dynamic>{
+        'version': 1,
+        'agent_id': agentId,
+        'session_id': sessionId,
+        'subagents': <Map<String, dynamic>>[
+          for (final CoreSubagent s
+              in _subagents[_key(agentId, sessionId)] ?? const <CoreSubagent>[])
+            s.toJson(),
+        ],
+      },
+    );
+    _queue.enqueue(
+      paths.sessionDir(agentId, sessionId),
+      () => AtomicFile.writeStringAtomic(file, '$content\n'),
+    );
   }
 
   void _writeSession(CoreSession session) {

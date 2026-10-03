@@ -52,7 +52,12 @@ void main() {
       ),
     );
     // CLI 里的同一根接线：后台任务完成 → 唤醒 agent
-    tools.onHookFinished = (String agentId, String sessionId, String notice) {
+    tools.onHookFinished = (
+      String agentId,
+      String sessionId,
+      String notice, {
+      SubagentTag? subagent,
+    }) {
       server.conversation.wake(
         agentId: agentId,
         sessionId: sessionId,

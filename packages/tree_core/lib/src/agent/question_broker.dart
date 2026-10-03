@@ -90,6 +90,10 @@ class QuestionBroker {
       ),
     );
     // 聊天记录里的提问卡片（`answered` 由会话历史接口按提问记录覆盖）
+    //
+    // 临时员工提问：卡片归集到**会话主人**的会话（[AskQuestionRequest.agentId] 已由
+    // 工具层改写），并带上它的标记 ⇒ 前端能把这句提问显示在这名临时员工名下
+    // （问题正文里也有它的名字，右侧「问题回复」页只看提问记录，靠正文认人）。
     transcript.appendMessage(
       CoreMessage(
         id: qid,
@@ -100,6 +104,10 @@ class QuestionBroker {
         timestamp: now,
         kind: 'ask_user_question',
         options: request.options,
+        subagentId: request.subagentId,
+        subagentName: request.subagentName,
+        subagentParentId: request.subagentParentId,
+        subagentLevel: request.subagentLevel,
       ),
     );
 
@@ -114,6 +122,13 @@ class QuestionBroker {
       'session_id': request.sessionId,
       if (request.teamId.isNotEmpty) 'team_id': request.teamId,
       'is_member': request.isMember,
+      // 临时员工提问的标记（空串 = 主 agent / 团队成员在问）
+      if (request.subagentId.isNotEmpty) ...<String, dynamic>{
+        'subagent_id': request.subagentId,
+        'subagent_name': request.subagentName,
+        'subagent_parent_id': request.subagentParentId,
+        'subagent_level': request.subagentLevel,
+      },
     });
     log?.call('提问 $qid（agent=${request.agentId}）等待作答');
 

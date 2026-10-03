@@ -56,7 +56,19 @@ Future<void> main(List<String> args) async {
   // 落盘装配：存储（agents/sessions/messages）与设置/模型池。核心进程的所有
   // 状态都在 ~/.tree 下的纯文本文件里，用户可直接查看与手改。
   void logStore(String message) => stderr.writeln('[core:store] $message');
-  final FileTreeStore store = FileTreeStore(paths, log: logStore);
+  final FileTreeStore fileStore = FileTreeStore(paths, log: logStore);
+  // 临时员工（subagent）的**会话级名册**：记录只落
+  // `data/<agentId>/<sessionId>/subagents.json`（随会话删除一起消失），不进 agents/。
+  final SubagentRegistry subagents = SubagentRegistry(
+    persistence: fileStore,
+    log: (String message) => stderr.writeln('[core:subagent] $message'),
+  );
+  // 工具层 / 文件服务 / 会话服务统一用这一层：`store.agent(sub_…)` 要能查到临时员工
+  // （工作空间、SSH、系统提示词、结果门控这些既有路径因此一处都不用改）。
+  final SubagentStore store = SubagentStore(
+    inner: fileStore,
+    registry: subagents,
+  );
   final CoreSettings settings = CoreSettings();
   FileSettingsSink(paths, log: logStore).load(settings);
 
@@ -217,17 +229,28 @@ Future<void> main(List<String> args) async {
   }
   bootLog('团队关系自愈与旧 .self 迁移完成');
 
+  // 临时员工服务：校验 / 名册（复用或新建）/ 阻塞或后台运行。
+  // 真正的"跑一轮独立生成"在会话服务里，三个依赖都**后置绑定**（与 ioSink 同一范式）。
+  final SubagentService subagentService = SubagentService(
+    store: store,
+    registry: subagents,
+    settings: settings,
+    log: (String message) => stderr.writeln('[core:subagent] $message'),
+  );
   final WorkspaceToolRunner tools = WorkspaceToolRunner(
     todoStore: todos,
     askQuestion: questions.ask,
     teamService: teams,
     messageDispatcher: messages,
     specService: specs,
+    subagentService: subagentService,
     mcpService: mcp,
     pluginBus: plugins,
     // 成员跟随团队 TOP 的 SSH：自己没有 ssh 配置时用 TOP 那份（同一台远端主机、同一个根）。
     resolveSshConfig: (String agentId) {
       final CoreAgent? agent = store.agent(agentId);
+      // 未知的 `sub_*`（名册未装载 / 已被清理）**不猜**：返回 null 让上层显式失败，
+      // 绝不让它落到 `workspaces/<id>` 那个并不存在的工作空间上。
       if (agent == null) return null;
       return teamSshConfigFor(agent, store.agent);
     },
@@ -252,8 +275,15 @@ Future<void> main(List<String> args) async {
     },
     resolveWorkspaceDir: (String agentId) {
       final CoreAgent? agent = store.agent(agentId);
-      if (agent == null) return paths.defaultWorkspaceDir(agentId);
-      // 工具根：成员与团队 TOP **共享同一个工作目录**（见 TeamWorkspace）。
+      // 未知的 `sub_*` 不落到默认目录（那会凭空造一个空工作空间）：返回空串，
+      // 让 `_ioFor` 记日志并显式失败（可读错误，不静默）。
+      if (agent == null) {
+        return agentId.startsWith(SubagentLimits.idPrefix)
+            ? ''
+            : paths.defaultWorkspaceDir(agentId);
+      }
+      // 工具根：成员与团队 TOP **共享同一个工作目录**（见 TeamWorkspace）；
+      // 临时员工沿 `parent_agent_id` 找到会话主人，因此与发起者**同一份根**。
       final TeamWorkspace shared = teamWorkspaceFor(agent, store.agent);
       return shared.configuredDir.isNotEmpty
           ? shared.configuredDir
@@ -265,6 +295,29 @@ Future<void> main(List<String> args) async {
   // 活动日志的工作空间 IO 后置绑定：从这里起，**SSH 模式下的 agent**（含跟随 leader
   // SSH 的成员）也会把 `[start(成员)]/…` 写进它自己远端工作空间的 .self/activity.log。
   ioSink = tools.ioFor;
+
+  // 临时员工的两个后置依赖：
+  // - 工作空间探测（说清缺什么、去哪配）：探**会话主人**的工作空间，子 agent 与它同一份；
+  // - 后台完成注入：走**既有**的 `tools.onHookFinished → conversation.wake` 那条路
+  //   （不新开第二条唤醒通道），并带上 subagent 标记供前端分组。
+  subagentService.probeWorkspace = (String agentId) async {
+    final WorkspaceIO? io = await tools.ioFor(agentId);
+    if (io == null) {
+      return '工作空间不可用：$agentId 的工作目录解析失败，或它的 SSH 配置不完整/'
+          '尚未接入（详见核心日志 [core:tool]）。请到该 agent 的设置页检查'
+          '工作目录，或到「设置 → SSH」补全 ssh 段。';
+    }
+    return null;
+  };
+  subagentService.onFinished =
+      (String ownerAgentId, String sessionId, String notice, SubagentTag tag) {
+        tools.onHookFinished?.call(
+          ownerAgentId,
+          sessionId,
+          notice,
+          subagent: tag,
+        );
+      };
 
   // 系统提示词（Q6）：落在**每个工作空间**的 .self/system_prompt.md（团队分隔）。
   // 首次用到某工作空间时播种默认内容，之后只读用户版本；运行期每轮按 agent 缓存
@@ -383,6 +436,7 @@ Future<void> main(List<String> args) async {
     todoStore: todos,
     engine: engine,
     questions: questions,
+    subagents: subagents,
     teamService: teams,
     messageDispatcher: messages,
     specService: specs,
@@ -431,16 +485,26 @@ Future<void> main(List<String> args) async {
   }
   // 未捕获异常始终记下来：此时 500 回包往往也写不出去，客户端只能看到连接断开
   server.errorLog = (String message) => stderr.writeln('[core:error] $message');
-  // 后台长任务结束后唤醒 agent（把完成提示注入会话并继续生成）
-  tools.onHookFinished = (String agentId, String sessionId, String notice) {
+  // 后台长任务结束后唤醒 agent（把完成提示注入会话并继续生成）。
+  // `subagent` 非空 = 这条通知来自一个**后台临时员工**：标记随消息一起落库与下发。
+  // 多个后台临时员工并发完成时，每一次调用都是独立的一条消息 + 独立的一轮，互不覆盖。
+  tools.onHookFinished = (
+    String agentId,
+    String sessionId,
+    String notice, {
+    SubagentTag? subagent,
+  }) {
     unawaited(
       server.conversation.wake(
         agentId: agentId,
         sessionId: sessionId,
         notice: notice,
+        subagent: subagent,
       ),
     );
   };
+  // 临时员工的"跑一轮"落点：会话服务（它才有引擎、会话与流式下行）
+  subagentService.runner = server.conversation.runSubagent;
 
   bootLog('监听已就绪，即将发出握手');
 

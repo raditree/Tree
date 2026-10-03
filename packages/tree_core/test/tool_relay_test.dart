@@ -50,14 +50,16 @@ void main() {
   String slash(String path) => path.replaceAll(Platform.pathSeparator, '/');
 
   /// 订阅中转站、并按要求改写 pre（参数）/ post（结果）的插件。
-  String relayPluginYaml({String rewrite = 'REWRITTEN'}) =>
+  ///
+  /// [key] = pre 阶段要改写的参数名（默认 content；测 subagent 时改成 task）。
+  String relayPluginYaml({String rewrite = 'REWRITTEN', String key = 'content'}) =>
       'enabled: true\n'
       'plugins:\n'
       '  - id: relay\n'
       '    name: 中转插件\n'
       '    command: "${slash(Platform.resolvedExecutable)}"\n'
       '    args: ["${slash(script)}", "--relay-subscribe", '
-      '"--relay-rewrite", "$rewrite"]\n'
+      '"--relay-rewrite", "$rewrite", "--relay-key", "$key"]\n'
       '    granularity: team\n'
       '    scope: {team_id: $team}\n';
 
@@ -185,6 +187,74 @@ void main() {
       isEmpty,
       reason: '无订阅者走快路径，不该产生任何中转日志',
     );
+  });
+
+  test('subagent 与其它工具同权：pre 改写的 task 真正生效、post 改写结果', () async {
+    // 用户硬断言：subagent 也是**工具调用**，必须走同一条三站路径——不给它开后门，
+    // 也不给它加特例白名单/拦截。
+    final List<String> logs = <String>[];
+    final PluginBus bus = await startBus(
+      relayPluginYaml(rewrite: '被插件改写的任务', key: 'task'),
+      logs: logs,
+    );
+    final DateTime deadline = DateTime.now().add(const Duration(seconds: 10));
+    while (DateTime.now().isBefore(deadline)) {
+      final RelayStation? pre =
+          bus.stations.station(StationHubIds.relayToolPre) as RelayStation?;
+      final RelayStation? post =
+          bus.stations.station(StationHubIds.relayToolPost) as RelayStation?;
+      if ((pre?.subscribers.isNotEmpty ?? false) &&
+          (post?.subscribers.isNotEmpty ?? false)) {
+        break;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+
+    // 真落点：临时员工服务（这里用假的"跑一轮"证明**参数被改写后真的生效**）
+    final MemoryStore inner = MemoryStore();
+    final SubagentRegistry registry = SubagentRegistry(persistence: inner);
+    final SubagentStore store = SubagentStore(inner: inner, registry: registry);
+    final CoreSettings settings = CoreSettings()
+      ..putModel(CoreModelConfig(modelId: 'demo'));
+    store.putAgent(
+      CoreAgent(id: agent, name: 'leader', modelId: 'demo', createdAt: 1, updatedAt: 1),
+    );
+    final SubagentService service = SubagentService(
+      store: store,
+      registry: registry,
+      settings: settings,
+    );
+    String seenTask = '';
+    String seenName = '';
+    service.runner = (SubagentTurnRequest request) async {
+      seenTask = request.task;
+      seenName = request.tag.name;
+      return SubagentTurnResult(report: '报告：${request.task}');
+    };
+    final WorkspaceToolRunner runner = WorkspaceToolRunner(
+      resolveWorkspaceDir: (String agentId) => workspace,
+      pluginBus: bus,
+      subagentService: service,
+    );
+    addTearDown(runner.close);
+
+    final ToolOutcome outcome = await runner
+        .run(
+          ToolInvocation(
+            id: 'tool-sub',
+            name: 'subagent',
+            arguments: <String, dynamic>{'task': '模型原始任务', 'name': '甲'},
+            agentId: agent,
+            sessionId: 'sess-1',
+          ),
+        )
+        .timeout(const Duration(seconds: 15));
+
+    expect(seenTask, '被插件改写的任务', reason: 'pre 改写后的 arguments 必须真正生效');
+    expect(seenName, '甲', reason: '其它参数不受影响');
+    expect(outcome.isError, isFalse, reason: outcome.content);
+    expect(outcome.content, contains('报告：被插件改写的任务'));
+    expect(outcome.content, startsWith('[改写]'), reason: 'post 改写的结果要给到上层（模型侧）');
   });
 
   test('未接入插件总线：工具调用零改动（原路径）', () async {

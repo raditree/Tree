@@ -372,5 +372,143 @@ void runStoreContract(String label, TreeStore Function() create) {
       expect(store.session(b.id, TreeStore.defaultSessionId), isNotNull);
       expect(store.messageCount(b.id, TreeStore.defaultSessionId), 0);
     });
+
+    // ── 临时员工（subagent，会话级） ───────────────────────────────────
+
+    CoreSubagent sub(
+      String ownerAgentId,
+      String sessionId,
+      String id, {
+      String name = '临时员工',
+      String parentId = '',
+      int level = 1,
+    }) {
+      final int now = DateTime.now().millisecondsSinceEpoch;
+      return CoreSubagent(
+        id: id,
+        name: name,
+        ownerAgentId: ownerAgentId,
+        sessionId: sessionId,
+        parentId: parentId.isEmpty ? ownerAgentId : parentId,
+        level: level,
+        agent: CoreAgent(id: id, name: name, createdAt: now, updatedAt: now),
+        createdAt: now,
+        updatedAt: now,
+      );
+    }
+
+    test('subagents：只在它被召来的会话里存在（跨会话一律查不到）', () {
+      final CoreAgent agent = store.createAgent(name: 'a');
+      final CoreSession s1 = store.createSession(agent.id)!;
+      final CoreSession s2 = store.createSession(agent.id)!;
+      store.putSubagent(sub(agent.id, s1.sessionId, 'sub_x', name: '张三'));
+
+      expect(
+        store.subagents(agent.id, s1.sessionId).map((CoreSubagent s) => s.id),
+        <String>['sub_x'],
+      );
+      expect(
+        store.subagents(agent.id, s2.sessionId),
+        isEmpty,
+        reason: '临时员工只在被召来的那个会话里存在',
+      );
+      // 另一个 agent 的同名会话也看不到
+      final CoreAgent other = store.createAgent(name: 'b');
+      expect(store.subagents(other.id, s1.sessionId), isEmpty);
+      // 记录里的字段原样读回（含运行配置快照）
+      final CoreSubagent loaded = store.subagents(agent.id, s1.sessionId).single;
+      expect(loaded.name, '张三');
+      expect(loaded.ownerAgentId, agent.id);
+      expect(loaded.sessionId, s1.sessionId);
+      expect(loaded.level, 1);
+      expect(loaded.agent.id, 'sub_x');
+    });
+
+    test('deleteSubagent / clearSubagents：按树收，且不误伤别的会话', () {
+      final CoreAgent agent = store.createAgent(name: 'a');
+      final CoreSession s1 = store.createSession(agent.id)!;
+      final CoreSession s2 = store.createSession(agent.id)!;
+      store.putSubagent(sub(agent.id, s1.sessionId, 'sub_root'));
+      store.putSubagent(
+        sub(agent.id, s1.sessionId, 'sub_child', parentId: 'sub_root', level: 2),
+      );
+      store.putSubagent(
+        sub(
+          agent.id,
+          s1.sessionId,
+          'sub_grand',
+          parentId: 'sub_child',
+          level: 3,
+        ),
+      );
+      store.putSubagent(sub(agent.id, s2.sessionId, 'sub_other'));
+
+      // 删一棵树 = 它 + 全部下级（悬空的 parent_id 会像悬空的 parent_agent_id 一样
+      // 让"按树收"失效）
+      expect(store.deleteSubagent(agent.id, s1.sessionId, 'sub_root'), 3);
+      expect(store.subagents(agent.id, s1.sessionId), isEmpty);
+      expect(
+        store.subagents(agent.id, s2.sessionId).map((CoreSubagent s) => s.id),
+        <String>['sub_other'],
+        reason: '别的会话的临时员工不能被误伤',
+      );
+      expect(store.deleteSubagent(agent.id, s1.sessionId, 'sub_root'), 0);
+      expect(store.clearSubagents(agent.id, s2.sessionId), 1);
+      expect(store.subagents(agent.id, s2.sessionId), isEmpty);
+      expect(store.clearSubagents(agent.id, s2.sessionId), 0);
+    });
+
+    test('删会话 / 删 agent：临时员工一起消失（不残留）', () {
+      final CoreAgent agent = store.createAgent(name: 'a');
+      final CoreSession s1 = store.createSession(agent.id)!;
+      store.putSubagent(sub(agent.id, s1.sessionId, 'sub_a'));
+      expect(store.deleteSession(agent.id, s1.sessionId), isTrue);
+      expect(
+        store.subagents(agent.id, s1.sessionId),
+        isEmpty,
+        reason: '临时员工随会话一起消失',
+      );
+
+      final CoreSession s2 = store.createSession(agent.id)!;
+      store.putSubagent(sub(agent.id, s2.sessionId, 'sub_b'));
+      expect(store.deleteAgent(agent.id), isTrue);
+      expect(store.subagents(agent.id, s2.sessionId), isEmpty);
+    });
+
+    test('messages() 不含临时员工的消息；sessionMessages() 是完整流', () {
+      final CoreAgent agent = store.createAgent(name: 'a');
+      const String sid = TreeStore.defaultSessionId;
+      store.appendMessage(text(agent.id, sid, id: 'own', content: '自己的话'));
+      final CoreMessage fromSub = CoreMessage(
+        id: 'sub-msg',
+        agentId: agent.id,
+        sessionId: sid,
+        role: 'agent',
+        content: '临时员工的话',
+        timestamp: 2,
+        subagentId: 'sub_x',
+        subagentName: '张三',
+        subagentParentId: agent.id,
+        subagentLevel: 1,
+      );
+      store.appendMessage(fromSub);
+
+      expect(
+        store.messages(agent.id, sid).map((CoreMessage m) => m.id),
+        <String>['own'],
+        reason: '父 agent 的模型上下文必须排掉临时员工的消息（工具批要保持原子）',
+      );
+      expect(
+        store.sessionMessages(agent.id, sid).map((CoreMessage m) => m.id),
+        <String>['own', 'sub-msg'],
+        reason: '用户要能看到临时员工干过什么：完整消息流包含它',
+      );
+      expect(store.messageCount(agent.id, sid), 1);
+      expect(
+        store.sessionMessages(agent.id, sid).last.subagentName,
+        '张三',
+        reason: '标记字段要能原样读回（前端据此分组）',
+      );
+    });
   });
 }

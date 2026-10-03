@@ -188,6 +188,27 @@
   （`level` / `is_member` / `top_agent_name`……），界面据此显示「Level N 成员 · 隶属「TOP」」；前端再
   **滤掉自己**一道（旧核心 / 中间态兜底），拿不到描述符时用 `agent.teamId` 兜底，**不编「我是负责人」**。
 
+- **临时员工（`subagent`）工具：会话内的「临时员工」**（[store/README.md](packages/tree_core/lib/src/store/README.md) 不变量 11、
+  [tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 11、
+  [agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 10/11/12、
+  [tree_core_cli/README.md](packages/tree_core_cli/README.md) 不变量 6、[tree_core/README.md](packages/tree_core/README.md)「临时员工给前端用的字段」；
+  **用户断言 2026-10-04**）：模型可以现场召一个**临时员工**干活——召之即来、干完还在（同一会话内可复用）、可再派发
+  （层级上限 3，超限给可读错误）。与 `team` 的本质区别是**它只活在会话里**：记录落在
+  `data/<agentId>/<sessionId>/subagents.json`，不写 `agents/<id>.yaml`、不进 `agents()` / `teams()` / `members()`、
+  不可被 `message` 寻址、不计 `team_member_count`；**删会话或删 agent 即随之消失**，且**跨会话一律不保留**
+  （换会话查不到、拿别的会话的 id 复用给可读错误——不静默新建、也不错误命中同名条目）。它**继承发起者**：
+  同一份工作空间根（私有状态归会话主人，工作空间里不留 `sub_*` 目录）、同一个**有效 SSH**、同一个模型与成员级覆盖；
+  工具集继承读写/命令/搜索/待办/提问/规范/MCP/插件，但**没有** `team` / `message`（不能被派活、不能建队），
+  而**保留 `subagent`**（允许把同一个大任务拆细）。
+  它与其它工具**同权、同三站**，不开后门：走 `WorkspaceToolRunner._execute → BuiltinTools.run` 这条唯一入口，
+  中转站 `system.relay.tool.pre/post` 能改它的参数与结果、广播站 `system.broadcast.tool.pre/post` 各发一条、
+  执行站命令 `tool.call` 能调它（与模型调用同一路径、同一权限），`needsWorkspace('subagent')` 显式为 false。
+  消息与帧都带 `subagent_id / subagent_name / subagent_parent_id / subagent_level`（`agent_id` 仍是会话主人，
+  既有过滤口径不变），而父 agent 的**模型上下文**刻意排掉带标记的消息（工具批必须原子，否则带 tools 的思考模式
+  端点 400）——只有后台完成报告（`kind = subagent_report`）既带标记、又进发起者上下文（否则「干完了却没人知道」）。
+  运行键 = `(subagentId, sessionId)`：与「正阻塞等它的父那一轮」绝不撞键（撞了就是死锁），N 个后台临时员工各占各的槽位
+  并行跑、逐个完成逐个注入（**不做**「只留最后一个」的单槽位）；`stop` 与新消息插话会连带停掉同一会话里正在跑的
+  临时员工，否则父那轮会一直卡在等一个没人管的子任务上。
 ### Added（首个版本总览）
 
 - **单进程桌面形态**：Flutter 界面 + 纯 Dart 核心 `tree_core`（可编译成单文件，约 10 MB）；

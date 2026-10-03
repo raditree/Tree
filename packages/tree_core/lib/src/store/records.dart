@@ -370,6 +370,10 @@ class CoreMessage {
     this.options,
     this.answered = false,
     this.llmHidden = false,
+    this.subagentId = '',
+    this.subagentName = '',
+    this.subagentParentId = '',
+    this.subagentLevel = 0,
   });
 
   factory CoreMessage.fromJson(Map<String, dynamic> json) {
@@ -405,6 +409,10 @@ class CoreMessage {
           .toList(),
       answered: json['answered'] as bool? ?? false,
       llmHidden: json['llm_hidden'] as bool? ?? false,
+      subagentId: json['subagent_id'] as String? ?? '',
+      subagentName: json['subagent_name'] as String? ?? '',
+      subagentParentId: json['subagent_parent_id'] as String? ?? '',
+      subagentLevel: (json['subagent_level'] as num?)?.toInt() ?? 0,
     );
   }
 
@@ -457,12 +465,27 @@ class CoreMessage {
   /// 只有模型开了"回传思考"（`thinking`）时才作为 `reasoning_content` 回传。
   bool get isThinking => kind == 'thinking';
 
-  /// 是否为"系统/hook 提示"（`kind == 'notice'`）。
+  /// 是否为"新的输入"（引擎按 **user** 翻译的三类消息）。
   ///
   /// 这类消息**落库为 agent 角色**（UI 照旧渲染成 agent 气泡），但引擎翻译历史时
   /// 按 **user** 消息处理：它既不是模型说的、也不是用户说的，而是"新的输入"。
   /// 详见 `ConversationService.wake` 与 `.self/plan/20261001-thinking-400-and-interrupt/`。
-  bool get isNotice => kind == 'notice';
+  ///
+  /// 三类（与 `agent_engine.dart` 的 `CoreMessageRef.isNotice` 必须同口径）：
+  /// - [MessageKinds.notice]：hook 提示 / 系统发言（wake）；
+  /// - [MessageKinds.subagentTask]：交给临时员工的任务（**它自己**的输入）；
+  /// - [MessageKinds.subagentReport]：临时员工后台完成报告（**发起者**的输入，
+  ///   因此它虽然带 subagent 标记，却是唯一会进发起者模型上下文的带标记消息）。
+  bool get isNotice =>
+      kind == MessageKinds.notice ||
+      kind == MessageKinds.subagentTask ||
+      kind == MessageKinds.subagentReport;
+
+  /// 是否为**临时员工给发起者的完成报告**（后台 `subagent` 的 wake 注入）。
+  ///
+  /// 它与其它带标记的消息相反：**要进发起者的模型上下文**（发起者得知道活干完了），
+  /// 但**不进临时员工自己的历史**（那是它自己说过的话，重复一遍只会自相矛盾）。
+  bool get isSubagentReport => kind == MessageKinds.subagentReport;
 
   /// **不插进模型提示词**（`llm_hidden: true`）：消息照常落库、照常下发（前端当普通
   /// 气泡渲染），但引擎重建请求时**整条跳过**。
@@ -475,6 +498,30 @@ class CoreMessage {
   /// 与 [isNotice] 的分工一眼可辨：`notice`（hook 唤醒）是**新的输入**，要按 user 进
   /// 上下文；本标记则相反。字段是通用的：任何消息都能打这个标签（插件/未来注入同理）。
   final bool llmHidden;
+
+  // ── 临时员工（subagent，会话级）标记 ─────────────────────────────────
+  //
+  // 临时员工**没有自己的会话与消息文件**：它的全部活动都写进"召它的那个 agent 的
+  // 会话"消息流里，靠这四个字段打标记。由此得到两条硬性质（见 store/README.md）：
+  // - 用户能在会话历史里看到"这个临时员工干了什么"（`sessionMessages` 不过滤）；
+  // - 父 agent 的模型上下文里**不会**混进临时员工的话（`messages()` 过滤掉带标记的
+  //   消息）——否则工具批会被切开（assistant(tool_calls) 与它的 tool 结果之间插进
+  //   别的消息），带 tools 的思考模式端点会 400。
+
+  /// 产出这条消息的临时员工 id（`sub_…`）；空串 = 不是临时员工的消息。
+  final String subagentId;
+
+  /// 临时员工的显示名（界面分组用）。
+  final String subagentName;
+
+  /// 召它的那个 agent（真实 agent id，或上级临时员工 id）——会话内名册是一棵树。
+  final String subagentParentId;
+
+  /// 它在会话内树里的层级（真实 agent 的直属临时员工 = 1）。
+  final int subagentLevel;
+
+  /// 是否为临时员工产出的消息。
+  bool get isSubagentMessage => subagentId.isNotEmpty;
 
   Map<String, dynamic> toJson() => <String, dynamic>{
     'id': id,
@@ -498,8 +545,135 @@ class CoreMessage {
     'answered': answered,
     // 只在该隐藏时才落这个键：普通消息的 jsonl 一行不该多个 false
     if (llmHidden) 'llm_hidden': true,
+    // 临时员工标记：只有带标记的消息才落这些键，普通消息的 jsonl 一行保持不变
+    if (subagentId.isNotEmpty) ...<String, dynamic>{
+      'subagent_id': subagentId,
+      'subagent_name': subagentName,
+      'subagent_parent_id': subagentParentId,
+      'subagent_level': subagentLevel,
+    },
     'is_streaming': false,
   };
+}
+
+/// **临时员工**（subagent）记录：一个"召之即来、干完还在"的会话级成员。
+///
+/// 与 [CoreAgent] 的本质区别（用户 2026-10-04 定稿的口径）：
+/// - **只活在它被召来的那个会话里**：记录落 `data/<agentId>/<sessionId>/subagents.json`，
+///   不写 `agents/<id>.yaml`、不进 [TreeStore.agents] / `teams()` / `members()`、
+///   不可被 `message` 寻址、不计 `team_member_count`；换会话查不到，删会话一起消失；
+/// - **可复用**：同一会话内给 id 或名称就能在**同一个**临时员工上继续（历史延续、
+///   配置不变），所以它有一条自己的消息史（带 [CoreMessage.subagentId] 标记）；
+/// - **可再派发**：它自己也能召临时员工，于是会话内名册是一棵**树**（[parentId] +
+///   [level]），层级上限见 `SubagentLimits`。
+///
+/// [agent] 是它的运行配置快照：工作空间/模型/覆盖项在创建时从**召它的那个 agent**
+/// 继承（`parentAgentId` 指向召唤者，工作空间因此仍与发起者**同一份**）。
+class CoreSubagent {
+  CoreSubagent({
+    required this.id,
+    required this.name,
+    required this.ownerAgentId,
+    required this.sessionId,
+    required this.parentId,
+    required this.level,
+    required this.agent,
+    this.scope = '',
+    this.runCount = 0,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  /// 临时员工 id（`sub_…`，全局唯一：`store.agent(id)` 没有会话维度，
+  /// 两个会话各自叫 `sub_1` 会让工作空间解析串号）。
+  final String id;
+
+  /// 显示名（默认「临时员工」；同会话内不要求唯一，名称复用有歧义时报可读错误）。
+  String name;
+
+  /// **会话主人**：这个临时员工所在会话归属的真实 agent（树根）。
+  ///
+  /// 它的消息、工作空间私有分栏、`team_id`/`mode_key` 口径都按这个 id 归集。
+  final String ownerAgentId;
+
+  /// 它只在这个会话里存在（跨会话一律查不到、不可复用）。
+  final String sessionId;
+
+  /// 召它的那个 agent：真实 agent id 或**上级临时员工** id（会话内是一棵树）。
+  final String parentId;
+
+  /// 会话内树层级：真实 agent 的直属临时员工 = 1，其下级 = 2……
+  final int level;
+
+  /// 运行配置快照（继承发起者的工作空间/模型/成员级覆盖）。
+  CoreAgent agent;
+
+  /// **被召来时的职责/范围**（首个 task 的摘要）：复用判据的书面依据——
+  /// "只有当新任务与它被召来时的职责/范围一致时才复用同一个临时员工"。
+  String scope;
+
+  /// 被跑过多少轮（含复用；自检与界面用）。
+  int runCount;
+
+  final int createdAt;
+  int updatedAt;
+
+  /// 持久化形态（`data/<agentId>/<sessionId>/subagents.json` 里的一条）。
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'id': id,
+    'name': name,
+    'owner_agent_id': ownerAgentId,
+    'session_id': sessionId,
+    'parent_id': parentId,
+    'level': level,
+    'scope': scope,
+    'run_count': runCount,
+    'agent': agent.toJson(),
+    'created_at': JsonTime.encode(createdAt),
+    'updated_at': JsonTime.encode(updatedAt),
+  };
+
+  static CoreSubagent fromJson(Map<String, dynamic> json) {
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    final Object? rawAgent = json['agent'];
+    final Map<String, dynamic> agentJson = rawAgent is Map
+        ? rawAgent.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
+        : <String, dynamic>{};
+    return CoreSubagent(
+      id: json['id'] as String? ?? '',
+      name: json['name'] as String? ?? '',
+      ownerAgentId: json['owner_agent_id'] as String? ?? '',
+      sessionId: json['session_id'] as String? ?? '',
+      parentId: json['parent_id'] as String? ?? '',
+      level: (json['level'] as num?)?.toInt() ?? 1,
+      scope: json['scope'] as String? ?? '',
+      runCount: (json['run_count'] as num?)?.toInt() ?? 0,
+      agent: CoreAgent.fromJson(agentJson),
+      createdAt: JsonTime.decode(json['created_at']) ?? now,
+      updatedAt: JsonTime.decode(json['updated_at']) ?? now,
+    );
+  }
+}
+
+/// 从 [list] 里取出 [rootId] 及其**全部下级**的 id（会话内名册是一棵树）。
+///
+/// 两个存储实现（内存 / 落盘）共用同一份"按树收"的判据：删一个临时员工时，
+/// 它召出来的下级必须一起走——否则会留下悬空的 `parent_id`（与团队关系自愈
+/// 要解决的悬空 `parent_agent_id` 是同一类问题）。
+Set<String> subagentTreeIds(List<CoreSubagent> list, String rootId) {
+  final Set<String> doomed = <String>{rootId};
+  bool grew = true;
+  while (grew) {
+    grew = false;
+    for (final CoreSubagent s in list) {
+      if (doomed.contains(s.id)) continue;
+      if (doomed.contains(s.parentId)) {
+        doomed.add(s.id);
+        grew = true;
+      }
+    }
+  }
+  return doomed;
 }
 
 /// 团队规模上限（与参考实现一致：默认 3 层 / 每层 7 人，硬上限 5 / 100）。
@@ -529,6 +703,26 @@ abstract final class TeamLimits {
     if (value <= 0) return defaultMaxMembersPerLevel;
     return value > hardMaxMembers ? hardMaxMembers : value;
   }
+}
+
+/// 消息 kind 的字面量（跨层口径）。
+///
+/// 引擎侧的 `CoreMessageRef.isNotice` 只认字面量（agent 层刻意不依赖存储层），
+/// 两处必须同步：任何一类"按 user 翻译"的 kind 都要同时出现在这两个地方。
+abstract final class MessageKinds {
+  /// 普通文本 / 思考段 / 工具卡片。
+  static const String text = 'text';
+  static const String thinking = 'thinking';
+  static const String tool = 'tool';
+
+  /// hook 提示 / 系统发言：引擎按 user 翻译，且**不喂模型**（llm_hidden）。
+  static const String notice = 'notice';
+
+  /// 交给临时员工的任务（它自己那一轮的输入；发起者的上下文里**没有**它）。
+  static const String subagentTask = 'subagent_task';
+
+  /// 临时员工后台完成报告（发起者的输入；带 subagent 标记，前端按它分组）。
+  static const String subagentReport = 'subagent_report';
 }
 
 /// 成员审核状态（权威 4 态）。

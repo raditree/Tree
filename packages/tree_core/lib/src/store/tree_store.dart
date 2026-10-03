@@ -70,7 +70,29 @@ abstract interface class TreeStore {
   bool deleteAgent(String id);
 
   /// 该 agent 最近一条**文本**消息（列表页预览用）；无则 null。
+  ///
+  /// **只看该 agent 自己的对话**：临时员工的消息不算它的预览（见 [messages]）。
   CoreMessage? lastTextMessage(String agentId);
+
+  // ── 临时员工（subagent，会话级） ───────────────────────────────────────
+  //
+  // 「召之即来、干完还在、可复用、可再派发」的临时员工**随会话持久化**：记录写在
+  // `data/<agentId>/<sessionId>/subagents.json`（见 [TreePaths.subagentsFile]），
+  // 只在这个会话里可见；核心重启后打开同一会话它还在、还能复用。它**不是** agent：
+  // 不写 `agents/<id>.yaml`、不进 [agents]/[teams]/[members]、不可被 `message`
+  // 寻址、不计 `team_member_count`（见 store/README.md 不变量 9）。
+
+  /// 某会话里的临时员工名册（按创建顺序；其它会话的条目一律不出现）。
+  List<CoreSubagent> subagents(String agentId, String sessionId);
+
+  /// 写入/覆盖一个临时员工记录（id 相同则整体替换）。
+  void putSubagent(CoreSubagent subagent);
+
+  /// 删除一个临时员工**及其全部下级**（会话内的树，按树收）；返回删除条数。
+  int deleteSubagent(String agentId, String sessionId, String id);
+
+  /// 清空某会话的全部临时员工；返回删除条数。
+  int clearSubagents(String agentId, String sessionId);
 
   // ── 会话 ─────────────────────────────────────────────────────────────
 
@@ -129,8 +151,21 @@ abstract interface class TreeStore {
 
   // ── 消息 ─────────────────────────────────────────────────────────────
 
-  /// 某会话的全部消息（按写入顺序）。
+  /// 该 agent **自己**的对话消息（按写入顺序）。
+  ///
+  /// **不含临时员工的消息**（[CoreMessage.subagentId] 非空的那批）：它们是"临时员工
+  /// 在自己那一轮里说的话"，只属于那个临时员工的历史；父 agent 的模型上下文必须把
+  /// 它们排掉，否则工具批会被切开——assistant(tool_calls) 与它的 tool 结果之间插进
+  /// 别的消息，带 tools 的思考模式端点会 400（真实现场见 llm_agent_engine 的注释）。
+  /// 用户要看的**完整**会话消息流走 [sessionMessages]。
   List<CoreMessage> messages(String agentId, String sessionId);
+
+  /// 该会话的**完整消息流**（含临时员工的消息，按写入顺序）。
+  ///
+  /// 只有"给人看"的入口用它（会话历史接口）：临时员工干过什么必须留在会话历史里。
+  /// 模型上下文一律用 [messages]（排掉带标记的消息）。id 是临时员工 id 时返回
+  /// **它自己的**消息史（复用时的"历史延续"就读这一份）。
+  List<CoreMessage> sessionMessages(String agentId, String sessionId);
 
   /// 该会话的「有效消息数」：仅统计文本消息（工具卡片不计入）。
   ///

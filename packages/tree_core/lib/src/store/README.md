@@ -7,7 +7,9 @@
 | 文件 | 作用 |
 | --- | --- |
 | [tree_paths.dart](tree_paths.dart) | 数据根解析（override → `TREE_HOME` → 平台规范位置 → `~/.tree`）与布局定义 |
-| [records.dart](records.dart) | 三个记录：`CoreAgent` / `CoreSession` / `CoreMessage`；持久化形态 `toJson` 与前端形态 `toApiJson` |
+| [records.dart](records.dart) | 四个记录：`CoreAgent` / `CoreSession` / `CoreMessage` / `CoreSubagent`（临时员工）；持久化形态 `toJson` 与前端形态 `toApiJson` |
+| [subagent_registry.dart](subagent_registry.dart) | **临时员工名册**：会话级内存索引（`id → 记录`、会话键 → 列表）+ 会话内**树**（`parent_id`/`level`）+ 按需装载/按树收 |
+| [subagent_store.dart](subagent_store.dart) | **内存覆盖层**（`TreeStore` 装饰器）：`sub_…` 走名册，其余转发真 store |
 | [tree_store.dart](tree_store.dart) | 存储契约（两个实现共享同一份语义说明） |
 | [file_store.dart](file_store.dart) | 落盘实现：YAML 配置 + 缩进 JSON 会话元数据 + jsonl 消息；懒加载 + 进程内缓存 + write-behind |
 | [memory_store.dart](memory_store.dart) | 纯内存实现（测试与"无落盘"场景） |
@@ -30,13 +32,25 @@
 10. **`llm_hidden`（`llm_hidden: true` 落在 jsonl 里）是"用户看得见、模型看不见"的唯一开关**：打了标记的消息照常落库、照常下发（前端当普通气泡渲染），引擎重建请求时整条跳过。用它的是**系统发言**（失败 / 停止提示）与**过程提示**（重试进度）。
     为什么不做成新的 `kind`：`system` 会被读成 system prompt（协议里真有 `LlmRole.system`），而"进不进提示词"与"这条消息是正文 / 思考 / 工具卡 / 提示"是**两件正交的事**——`kind` 管渲染与翻译形态，这个布尔标记只管要不要喂模型。
 
+11. **一条断言：临时员工只在它被召来的那个会话里存在，跨会话一律不保留。** 逐条口径：
+    - **随会话持久化**：记录落 `data/<agentId>/<sessionId>/subagents.json`（与会话数据同目录、同一份"原子快照 + write-behind"语义）。核心重启后打开**同一会话**它还在、还能复用；换会话（哪怕同一个父 agent 的新会话）名册为空。
+    - **跨会话复用 = 可读错误**：复用入口（id 或名称）只在同一会话内有效；拿另一个会话的旧 id 来复用必须报"该临时员工属于另一个会话，不能跨会话复用"，**不许**静默新建、也不许错命中同名条目。
+    - **删会话即随之消失**：`deleteSession` 递归删会话目录，名册文件随之消失；内存索引由装饰器同步摘掉——不残留到任何全局位置。
+    - **不是全局 agent**：不写 `agents/<id>.yaml`、不进 `agents()` / `teams()` / `members()`、不可被 `message` 寻址、不计 `team_member_count`；`SubagentStore.agents()` 刻意**不**列它。
+    - **但既有查询路径认它**：`store.agent(sub_…)` 能查到它（工作空间 / SSH / 系统提示词 / 结果门控因此一处都不用改）。名册是"打开会话时装载"的，`agent(sub_…)` 未命中时会**按需扫一遍各会话名册**兜底（只扫一次并记忆），绝不静默答"不知道"。
+    - **消息口径**：`messages(agent, session)` 是"该 agent 自己"的对话，**排掉**临时员工的消息（父 agent 的模型上下文必须保持工具批原子：assistant 的 `tool_calls` 与它的 tool 结果之间不能插进别的消息，带 tools 的思考模式端点会 400）；用户要看的完整消息流走 `sessionMessages`。唯一例外是**后台完成报告**（`kind=subagent_report`）：它带 subagent 标记，却是**发起者**的"新输入"，因此进父上下文、不进临时员工自己的历史。
+    - **会话内是一棵树**：临时员工可以再召临时员工（`parent_id` + `level`，层级上限 `SubagentLimits.maxDepth`）；删一个按**树**收（它召出来的一起走），避免悬空 `parent_id`——与团队自愈要解决的悬空 `parent_agent_id` 是同一类问题。
+
 ## 测试
 
 ```bash
 cd packages/tree_core
 dart test test/store_contract.dart test/file_store_test.dart test/memory_store_test.dart \
           test/atomic_file_test.dart test/records_test.dart test/tree_paths_test.dart \
-          test/yaml_codec_test.dart
+          test/yaml_codec_test.dart test/subagent_registry_test.dart \
+          test/subagent_isolation_test.dart
 ```
 
-`store_contract.dart` 是**共享契约**：两个实现跑同一份断言，业务代码因此不会依赖内存实现特有的行为。
+- `store_contract.dart` 是**共享契约**：两个实现跑同一份断言，业务代码因此不会依赖内存实现特有的行为；临时员工的会话级读写、按树收、`messages()` / `sessionMessages()` 的分工也在这里双向钉住。
+- `subagent_registry_test.dart`：名册索引、跨会话隔离、`agents()/teams()/members()` 不列它、`messages(sub_…)` 是它自己那一段、按树收、`forgetSession` 只摘内存索引。
+- `subagent_isolation_test.dart`：**真 FileTreeStore + 真磁盘**逐条验证不变量 11 的六条（同会话可见 / 跨会话不可见、跨会话复用可读错误、重启后同会话仍可复用、删会话即消失、不落成全局 agent、存储位置只在该会话范围内）。

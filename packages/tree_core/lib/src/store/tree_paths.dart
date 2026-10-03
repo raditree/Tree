@@ -124,6 +124,14 @@ class TreePaths {
   String messagesFile(String agentId, String sessionId) =>
       p.join(sessionDir(agentId, sessionId), 'messages.jsonl');
 
+  /// **临时员工（subagent）名册**：`data/<agentId>/<sessionId>/subagents.json`。
+  ///
+  /// 为什么与会话数据同目录（而不是某种全局名册）：临时员工**只活在它被召来的
+  /// 那个会话里**——放在会话目录下，"删会话"这一条既有路径（递归删目录）就天然
+  /// 把它收干净了，不需要任何跨会话的清理钩子，也不会残留到任何全局位置。
+  String subagentsFile(String agentId, String sessionId) =>
+      p.join(sessionDir(agentId, sessionId), 'subagents.json');
+
   /// agent 的**默认工作空间目录**（`<root>/workspaces/<agent_id>`）。
   ///
   /// 仅当 agent 配置里 `workspace_dir` 为空时使用；用户可以在

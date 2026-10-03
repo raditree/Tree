@@ -14,6 +14,10 @@ class AskQuestionRequest {
     this.options = const <String>[],
     this.teamId = '',
     this.isMember = false,
+    this.subagentId = '',
+    this.subagentName = '',
+    this.subagentParentId = '',
+    this.subagentLevel = 0,
     required this.isCancelled,
   });
 
@@ -27,6 +31,15 @@ class AskQuestionRequest {
   /// 团队成员提问时带上队伍归属（前端据此标注来源）。
   final String teamId;
   final bool isMember;
+
+  /// **临时员工提问**的来源标记（空串 = 主 agent / 团队成员在问）。
+  ///
+  /// 问题文本里也会带上它的名字（"【临时员工「张三」提问】…"）：右侧「问题回复」页
+  /// 只看提问记录（那里没有这套标记），靠正文也认得出是谁在问。
+  final String subagentId;
+  final String subagentName;
+  final String subagentParentId;
+  final int subagentLevel;
 
   /// 本轮是否已被取消（`stop`）。等待作答期间要能立刻退出。
   final bool Function() isCancelled;

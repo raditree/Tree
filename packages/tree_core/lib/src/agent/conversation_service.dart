@@ -10,10 +10,13 @@ import '../util/ids.dart';
 import '../util/tokens.dart' as tokens;
 import '../llm/llm_agent_engine.dart';
 import '../ws/ws_hub.dart';
+import '../store/subagent_registry.dart';
+import '../tool/subagent_tool.dart';
 import 'agent_engine.dart';
 import 'compaction_service.dart';
 import 'question_broker.dart';
 import 'scripted_agent.dart';
+import 'subagent_service.dart';
 import 'workspace_prompt.dart';
 
 /// 一次生成任务的取消令牌。
@@ -23,6 +26,12 @@ class _RunToken {
   String agentId = '';
   String sessionId = '';
 
+  /// **归属的真实 agent**（只有临时员工轮非空 = 它的会话主人）。
+  ///
+  /// 用途：`stop` 与"新消息插话"要能连带停掉"父 agent 正在阻塞等待的那批临时员工"，
+  /// 否则父那轮会一直卡在等一个没人管的子任务上。
+  String ownerAgentId = '';
+
   bool cancelled = false;
 
   /// 是否因"**收到新消息**"而被打断（与用户按 `stop` 区分）。
@@ -31,6 +40,17 @@ class _RunToken {
   /// 而"我发新消息 → 旧那轮自动让位"是打断/插话（interjection）语义，
   /// 再刷一条"已停止"只会造成噪声（用户根本没按停止）。
   bool interrupted = false;
+}
+
+/// 一轮生成的产出：临时员工轮要拿它的"最终报告"回灌给发起者。
+class _TurnOutcome {
+  const _TurnOutcome({this.report = '', this.error = ''});
+
+  /// 本轮最后一段正文（最终回复；没有正文时为空串）。
+  final String report;
+
+  /// 可读失败原因（空串 = 没失败）。
+  final String error;
 }
 
 /// 本轮正在生成的一条消息（与前端消息一一对应：先立 start，再追加 chunk）。
@@ -98,6 +118,7 @@ class ConversationService {
     required this.settings,
     this.questions,
     this.compaction,
+    this.subagents,
     AgentEngine? engine,
     this.pacer,
     this.pacingEnabled,
@@ -129,6 +150,10 @@ class ConversationService {
 
   /// 上下文压缩（M7d-4）；为 null 时不做自动压缩（最小骨架/部分测试）。
   final CompactionService? compaction;
+
+  /// 会话级**临时员工**名册（subagent）；为 null 时本服务不认识临时员工
+  /// （`runSubagent` 仍可用，只是收尾不清理索引——生产由 CLI 注入）。
+  final SubagentRegistry? subagents;
 
   final AgentEngine engine;
 
@@ -183,8 +208,13 @@ class ConversationService {
   int get activeRunCount => _running.length;
 
   /// 某 agent 是否**有任一会话**正在生成（团队名单的 `working` 状态唯一权威）。
-  bool isRunning(String agentId) =>
-      _running.values.any((_RunToken token) => token.agentId == agentId);
+  ///
+  /// **含它名下的临时员工**：后台临时员工在跑时，它的发起者也算"working"
+  /// （这正是用户看到的语义：我派出去的活还在干）。
+  bool isRunning(String agentId) => _running.values.any(
+    (_RunToken token) =>
+        token.agentId == agentId || token.ownerAgentId == agentId,
+  );
 
   /// 处理 `user_message`。
   ///
@@ -244,9 +274,13 @@ class ConversationService {
     // 先取消在途提问：等待中的工具会立刻拿到 cancelled 结果，工具循环才能收敛。
     questions?.cancelForAgent(agentId);
     _epoch[agentId] = (_epoch[agentId] ?? 0) + 1;
-    // stop 是 agent 级的：该 agent 的**每个在途会话**都要停（会话可以并行跑）。
+    // stop 是 agent 级的：该 agent 的**每个在途会话**都要停（会话可以并行跑），
+    // **以及它名下正在跑的临时员工**（父那轮正卡在等它们）。
     final List<_RunToken> tokens = _running.values
-        .where((_RunToken token) => token.agentId == agentId)
+        .where(
+          (_RunToken token) =>
+              token.agentId == agentId || token.ownerAgentId == agentId,
+        )
         .toList(growable: false);
     if (tokens.isEmpty) return false;
     for (final _RunToken token in tokens) {
@@ -336,6 +370,7 @@ class ConversationService {
     required String agentId,
     required String sessionId,
     required String notice,
+    SubagentTag? subagent,
   }) {
     final CoreAgent? agent = store.agent(agentId);
     final CoreSession? session = store.session(agentId, sessionId);
@@ -345,7 +380,22 @@ class ConversationService {
     // 带 tools 的思考模式端点（DeepSeek）不允许请求以"没有 reasoning_content 的
     // assistant 消息"收尾，而 hook 提示恰恰是追加到历史末尾的那条 —— 之前正是它
     // 让唤醒轮次连续 400。按 user 翻译同时也纠正了"模型以为那句是自己说的"。
-    _sendNotice(agent, session, notice, kind: 'notice');
+    //
+    // [subagent] 非空 = 这条完成通知来自一个**后台临时员工**：消息与帧都要带上它的
+    // 标记（前端据此把它显示在这名临时员工名下）。多个后台临时员工并发完成时，
+    // 每次 wake 都是**独立的一条消息 + 独立的一轮**，不会互相覆盖。
+    // 后台完成报告用**独立 kind**（`subagent_report`）：它带 subagent 标记（前端按
+    // 它分组到那名临时员工名下），但又是**唯一**会进发起者模型上下文的带标记消息
+    // （发起者必须知道活干完了）；临时员工自己的历史则把它排掉（见 store/records.dart）。
+    _sendNotice(
+      agent,
+      session,
+      notice,
+      kind: subagent == null
+          ? MessageKinds.notice
+          : MessageKinds.subagentReport,
+      subagent: subagent,
+    );
     _interruptForNewMessage(agentId, sessionId: session.sessionId);
     return _enqueue(
       agentId,
@@ -378,6 +428,15 @@ class ConversationService {
     questions?.cancelForSession(agentId, sessionId);
     token.interrupted = true;
     token.cancelled = true; // 复用既有取消通道：流式循环每帧检查，工具之间也检查
+    // 父那轮被打断时，它在**同一个会话**里派出去、正在跑的临时员工也要收敛：
+    // 否则父的工具调用要一直等它们跑完，用户看到的"插话"就是假的。
+    for (final _RunToken child in _running.values) {
+      if (child.ownerAgentId != agentId) continue;
+      if (child.sessionId != sessionId) continue;
+      if (identical(child, token)) continue;
+      child.interrupted = true;
+      child.cancelled = true;
+    }
     interruptedRunCount++;
   }
 
@@ -389,6 +448,9 @@ class ConversationService {
     _running.clear();
     _chains.clear();
     _notified.clear();
+    // 临时员工只活在会话里：内存索引随进程收起（落盘名册仍在会话数据里，
+    // 下次打开同一会话原样回来）。
+    subagents?.clear();
   }
 
   // ── 内部实现 ─────────────────────────────────────────────────────────
@@ -430,15 +492,42 @@ class ConversationService {
     CoreAgent agent,
     CoreSession session,
     String userContent,
-  ) async {
+  ) => _runTurn(agent, session, userContent);
+
+  /// 跑一轮生成的**唯一实现**（普通轮与临时员工轮共用同一条路径）。
+  ///
+  /// 两条身份只差三处，全部由参数表达：
+  /// - [transcriptAgentId]：消息**归集到谁**（临时员工归集到它的会话主人，用户因此
+  ///   能在会话历史里看到它干了什么）；
+  /// - [subagent]：给每条消息/帧打上 subagent 标记（前端据此分组）；
+  /// - [history] / [freshContext]：临时员工只带**它自己**的历史（复用 = 历史延续），
+  ///   且不做上下文压缩（它的历史由复用累积，压缩水位线属于父会话）。
+  ///
+  /// **运行标识永远是 [agent] 自己的**（`(agent.id, sessionId)`）：临时员工因此
+  /// 绝不会和"正阻塞等它的父 agent"那一轮撞键（撞了就是死锁），多个后台临时员工
+  /// 也能真正并行（各占各的 `_running` 槽）。
+  Future<_TurnOutcome> _runTurn(
+    CoreAgent agent,
+    CoreSession session,
+    String userContent, {
+    SubagentTag? subagent,
+    String? transcriptAgentId,
+    List<CoreMessageRef>? history,
+    bool freshContext = false,
+  }) async {
+    final String ownerId = transcriptAgentId ?? agent.id;
     final String runKey = _runKey(agent.id, session.sessionId);
     final _RunToken token = _RunToken()
       ..agentId = agent.id
-      ..sessionId = session.sessionId;
+      ..sessionId = session.sessionId
+      // 只有临时员工轮记归属：父 agent 的 stop / 插话要能连带停掉它
+      ..ownerAgentId = subagent == null ? '' : ownerId;
     _running[runKey] = token;
+    // 一条消息/一帧的**归属与标记**：普通轮 = 自己，临时员工轮 = 会话主人 + 标记
     final Map<String, dynamic> envelope = <String, dynamic>{
-      'agent_id': agent.id,
+      'agent_id': ownerId,
       'session_id': session.sessionId,
+      if (subagent != null) ...subagent.frameFields,
     };
     // Q13：token 管道（思考 / 正文 / 工具参数**共用一条**）。本轮内复用同一个
     // 节拍器，三者的时间轴因此连续，速率口径也完全一致。
@@ -470,7 +559,11 @@ class ConversationService {
     );
     hub.broadcast(<String, dynamic>{
       'type': WsOutboundType.agentStatus,
-      'data': <String, dynamic>{'agent_id': agent.id, 'status': 'working'},
+      'data': <String, dynamic>{
+        'agent_id': ownerId,
+        'status': 'working',
+        if (subagent != null) ...subagent.frameFields,
+      },
     });
 
     // ── Q3 消息分段 ──────────────────────────────────────────────────────
@@ -492,6 +585,8 @@ class ConversationService {
     Map<String, dynamic>? usage;
     bool cancelled = false;
     String? errorMessage;
+    // 本轮**最后一段正文**：临时员工的"最终报告"取它（结束时仍开着的那段优先）
+    String lastTextBody = '';
 
     void startSegment(_PendingMessage message) {
       pump.flush(); // 先把上一批增量落地，保证界面顺序与事件顺序一致
@@ -521,7 +616,7 @@ class ConversationService {
         store.appendMessage(
           CoreMessage(
             id: message.id,
-            agentId: agent.id,
+            agentId: ownerId,
             sessionId: session.sessionId,
             role: 'agent',
             content: '',
@@ -534,22 +629,31 @@ class ConversationService {
             // 「送模型那一份」按原样落库：下一轮重建历史时直接取用（缓存前缀）
             toolArgumentsRaw: message.toolArgumentsRaw,
             toolResultForModel: message.toolResultForModel,
+            subagentId: subagent?.id ?? '',
+            subagentName: subagent?.name ?? '',
+            subagentParentId: subagent?.parentId ?? '',
+            subagentLevel: subagent?.level ?? 0,
           ),
         );
         return;
       }
       final String body = message.content.toString();
       if (body.isEmpty) return;
+      if (message.kind == 'text') lastTextBody = body;
       store.appendMessage(
         CoreMessage(
           id: message.id,
-          agentId: agent.id,
+          agentId: ownerId,
           sessionId: session.sessionId,
           role: 'agent',
           content: body,
           timestamp: DateTime.now().millisecondsSinceEpoch,
           kind: message.kind,
           usage: usage,
+          subagentId: subagent?.id ?? '',
+          subagentName: subagent?.name ?? '',
+          subagentParentId: subagent?.parentId ?? '',
+          subagentLevel: subagent?.level ?? 0,
         ),
       );
     }
@@ -600,7 +704,11 @@ class ConversationService {
     // 这只是"本轮生成前那一次"；工具循环里**每一轮 API 调用前**还会再检查
     // （Q1-③），那次由引擎经 [LlmAgentEngine.toolTurnCompactor] 回调回这里，
     // 用的是同一套阈值与水位线。
-    final bool compacted = await _autoCompact(agent, session);
+    // 临时员工轮**不做压缩**：压缩水位线（`compactedMessageCount`）是父会话的口径，
+    // 而它的历史是"自己那一段"；它的上下文上限交给端点的超限报错显式表达。
+    final bool compacted = freshContext
+        ? false
+        : await _autoCompact(agent, session);
     if (compacted) {
       // compact 之后是允许重建系统提示词的两个时机之一
       invalidateSystemPrompt(agent.id, session.sessionId);
@@ -608,7 +716,14 @@ class ConversationService {
     // 会话初始化（本进程第一轮）才真的拼一次并钉住；之后每轮直接复用同一串字节
     // ⇒ 发消息不会让 `[0]` 变样（见 [promptStatePrewarm] 与 docs/known-issues.md #8）。
     await _ensureSystemPromptPinned(agent, session.sessionId);
-    final AgentRunContext context = _contextOf(agent, session, userContent);
+    final AgentRunContext context = _contextOf(
+      agent,
+      session,
+      userContent: userContent,
+      transcriptAgentId: ownerId,
+      historyOverride: history,
+      fresh: freshContext,
+    );
 
     try {
       await for (final AgentEvent event in engine.run(
@@ -652,7 +767,13 @@ class ConversationService {
           toolSegments[event.id] = message;
           // 插件生态：**工具调用开始**事件。先发事件再等工具执行——插件因此有机会在
           // 工具真正跑起来之前（乃至下次调用之前）用 `agent.stop` 掐掉超限的轮次。
-          _publishToolCall(agent, session, message, AgentEvents.phaseStart);
+          _publishToolCall(
+            agent,
+            session,
+            message,
+            AgentEvents.phaseStart,
+            teamAgentId: ownerId,
+          );
           // Q13：工具参数按 `字符数 / token_scale` 折算 token，走**同一条** token
           // 管道排队推送 —— write 这类大参数调用自然产生等待，read 几乎不等待。
           await roundPacer.consume(
@@ -680,6 +801,7 @@ class ConversationService {
             message,
             AgentEvents.phaseEnd,
             tool: event.name,
+            teamAgentId: ownerId,
           );
           // 工具结果**直接推**、不延迟（Q13）：等待只花在参数上；推完即进入下一轮
           pump.flush();
@@ -703,7 +825,14 @@ class ConversationService {
         } else if (event is AgentNotice) {
           // 系统发言（重试进度等）：立刻落库 + 下发，但**不进模型上下文**（llm_hidden）。
           // 不下发的话，用户面对的就是"最长两分多钟的空白"。
-          _sendNotice(agent, session, event.text, llmHidden: true);
+          _sendNotice(
+            agent,
+            session,
+            event.text,
+            llmHidden: true,
+            subagent: subagent,
+            transcriptAgentId: ownerId,
+          );
         } else if (event is AgentError) {
           errorMessage = event.message;
         } else if (event is AgentDone) {
@@ -738,32 +867,124 @@ class ConversationService {
     }
     toolSegments.clear();
 
+    // 临时员工的"最终报告"：结束时仍开着的那段正文优先，否则用本轮最后一段正文
+    // （它可能以工具调用收尾——那时最后一段中间正文就是它唯一说出来的话）。
+    final String finalBody = finalText?.content.toString() ?? '';
+    final String report = finalBody.trim().isNotEmpty ? finalBody : lastTextBody;
+
     final String? failure = errorMessage;
     if (failure != null) {
       // 1) error 帧（日志/遥测）；2) 一条**可见**的 agent 消息（前端只忽略 error 帧）。
       // 落库带 llm_hidden：**给人看，不喂模型**——否则模型下一轮读到这句错误，会把它
       // 当成"新的排查任务"接着干活（用户实测反馈）。
       _sendError(failure);
-      _sendNotice(agent, session, failure, llmHidden: true);
+      _sendNotice(
+        agent,
+        session,
+        failure,
+        llmHidden: true,
+        subagent: subagent,
+        transcriptAgentId: ownerId,
+      );
     }
     if (cancelled) {
       // 用户按 stop → 给一条可见提示；被"新消息"打断（interjection）则**不提示**：
       // 用户刚发的话就是它的上下文，再刷"已停止本轮生成。"纯属噪声。
       if (!token.interrupted) {
         // 同样是"给人看"的一句话：模型不需要知道"这一轮被用户停了"（读到只会当成新指令）
-        _sendNotice(agent, session, '已停止本轮生成。', llmHidden: true);
+        _sendNotice(
+          agent,
+          session,
+          '已停止本轮生成。',
+          llmHidden: true,
+          subagent: subagent,
+          transcriptAgentId: ownerId,
+        );
       }
     }
     _running.remove(runKey);
-    // 别的会话可能还在跑：只有该 agent **一个在途轮次都不剩**时才广播 idle。
-    // （前端的 working 集合是按 agent 记的，提前报 idle 会让队友窗口显示"空闲"，
-    //  而它其实还在另一个会话里干活。）
-    if (!isRunning(agent.id)) {
+    // 别的会话 / 别的后台临时员工可能还在跑：只有该 agent **一个在途轮次都不剩**
+    // 时才广播 idle（[isRunning] 把"它名下的临时员工"也算在内）。
+    if (!isRunning(ownerId)) {
       hub.broadcast(<String, dynamic>{
         'type': WsOutboundType.agentStatus,
-        'data': <String, dynamic>{'agent_id': agent.id, 'status': 'idle'},
+        'data': <String, dynamic>{
+          'agent_id': ownerId,
+          'status': 'idle',
+          if (subagent != null) ...subagent.frameFields,
+        },
       });
     }
+    return _TurnOutcome(report: report, error: failure ?? '');
+  }
+
+  /// 跑一轮**临时员工**生成（`subagent` 工具的落点，见 [SubagentTurnRunner]）。
+  ///
+  /// 与普通轮的差别只有身份与历史：
+  /// - 运行键 = `(subagentId, sessionId)` —— 父 agent 此刻正阻塞等它，两者**绝不撞键**
+  ///   （撞了会死锁）；同时这也让 N 个后台临时员工各自独立并行（不互相顶掉轮次）；
+  /// - 消息归集到**会话主人**的会话，并带上 subagent 标记（用户看得到它干了什么，
+  ///   父 agent 的模型上下文则被 `messages()` 挡在外面）；
+  /// - 上下文 = **它自己**的历史（`store.messages(subId, sid)`）：不含父会话、
+  ///   不做压缩；复用同一个 id 时这份历史天然延续（"历史延续、配置不变"）；
+  /// - 本轮先把 task 记成一条带标记的 `notice`（引擎按 user 翻译）：它既是这次任务的
+  ///   输入，也是复用时历史延续的锚点。
+  Future<SubagentTurnResult> runSubagent(SubagentTurnRequest request) async {
+    final SubagentTag tag = request.tag;
+    final CoreAgent? sub = store.agent(tag.id);
+    if (sub == null) {
+      return const SubagentTurnResult(error: '临时员工未注册或已被清理（请重新召一个）');
+    }
+    final CoreAgent? owner = store.agent(request.ownerAgentId);
+    if (owner == null) {
+      return SubagentTurnResult(
+        error: '发起者不存在：${request.ownerAgentId}',
+      );
+    }
+    CoreSession? session = store.session(owner.id, request.sessionId);
+    session ??= store.createSession(owner.id, sessionId: request.sessionId);
+    if (session == null) {
+      return SubagentTurnResult(error: '会话不可用：${request.sessionId}');
+    }
+    final String runKey = _runKey(tag.id, request.sessionId);
+    if (_running.containsKey(runKey)) {
+      return SubagentTurnResult(
+        error:
+            '临时员工「${tag.name}」正在跑上一轮（${tag.id}）：'
+            '等它这一轮结束后再复用，或新召一个（不填 subagent_id）。',
+      );
+    }
+    store.appendMessage(
+      CoreMessage(
+        id: CoreIds.message(),
+        agentId: owner.id,
+        sessionId: session.sessionId,
+        role: 'agent',
+        content: request.task,
+        // 它自己那一轮的输入：与 hook 提示同类（引擎按 user 翻译），但发起者的上下文
+        // 里没有它（任务已经写在发起者的 subagent 工具调用参数里了）
+        kind: MessageKinds.subagentTask,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+        subagentId: tag.id,
+        subagentName: tag.name,
+        subagentParentId: tag.parentId,
+        subagentLevel: tag.level,
+      ),
+    );
+    final List<CoreMessageRef> history = store
+        .messages(tag.id, session.sessionId)
+        .map(_toRef)
+        .toList(growable: false);
+    final _TurnOutcome outcome = await _runTurn(
+      sub,
+      session,
+      request.task,
+      subagent: tag,
+      transcriptAgentId: owner.id,
+      history: history,
+      freshContext: true,
+    );
+    return SubagentTurnResult(report: outcome.report, error: outcome.error);
   }
 
   /// 发布一条工具调用事件（`agent.tool_call`；字段口径见 [AgentEvents.toolCall]）。
@@ -782,12 +1003,16 @@ class ConversationService {
     _PendingMessage message,
     String phase, {
     String tool = '',
+    String? teamAgentId,
   }) {
-    final String teamId = agent.teamId.trim();
+    // 团队归属取**会话主人**（临时员工与发起者同一个队）：临时员工不是独立团队，
+    // 否则订阅了该 team 的插件收不到它（以及它的临时员工）发出来的工具事件。
+    final CoreAgent teamAgent = store.agent(teamAgentId ?? agent.id) ?? agent;
+    final String teamId = teamAgent.teamId.trim();
     agentEvents.toolCall(
       agentId: agent.id,
       sessionId: session.sessionId,
-      teamId: teamId.isEmpty ? agent.id : teamId,
+      teamId: teamId.isEmpty ? teamAgent.id : teamId,
       tool: tool.isEmpty ? (message.toolName ?? '') : tool,
       callId: message.toolCallId,
       round: message.round,
@@ -825,8 +1050,11 @@ class ConversationService {
     String content, {
     String kind = 'text',
     bool llmHidden = false,
+    SubagentTag? subagent,
+    String? transcriptAgentId,
   }) {
     final String id = CoreIds.message();
+    final String ownerId = transcriptAgentId ?? agent.id;
     hub.broadcast(<String, dynamic>{
       'type': WsOutboundType.message,
       'id': id,
@@ -834,19 +1062,24 @@ class ConversationService {
       'content': content,
       'kind': kind,
       if (llmHidden) 'llm_hidden': true,
-      'agent_id': agent.id,
+      'agent_id': ownerId,
       'session_id': session.sessionId,
+      if (subagent != null) ...subagent.frameFields,
     });
     store.appendMessage(
       CoreMessage(
         id: id,
-        agentId: agent.id,
+        agentId: ownerId,
         sessionId: session.sessionId,
         role: 'agent',
         content: content,
         kind: kind,
         timestamp: DateTime.now().millisecondsSinceEpoch,
         llmHidden: llmHidden,
+        subagentId: subagent?.id ?? '',
+        subagentName: subagent?.name ?? '',
+        subagentParentId: subagent?.parentId ?? '',
+        subagentLevel: subagent?.level ?? 0,
       ),
     );
   }
@@ -941,29 +1174,41 @@ class ConversationService {
   /// 构造引擎看到的运行上下文（生成前与工具循环内压缩后共用同一份装配逻辑）。
   AgentRunContext _contextOf(
     CoreAgent agent,
-    CoreSession session, [
+    CoreSession session, {
     String userContent = '',
-  ]) {
-    // 压缩会把摘要与水位线写回会话对象；重新取一次避免拿到过期快照
-    final CoreSession fresh =
-        store.session(agent.id, session.sessionId) ?? session;
+    String? transcriptAgentId,
+    List<CoreMessageRef>? historyOverride,
+    bool fresh = false,
+  }) {
+    // 压缩会把摘要与水位线写回会话对象；重新取一次避免拿到过期快照。
+    // 历史与压缩状态按**归集归属**（`transcriptAgentId`）取：临时员工的消息写进
+    // 会话主人的会话里，但它的上下文用的是"它自己那一段"（[historyOverride]）。
+    final String ownerId = transcriptAgentId ?? agent.id;
+    final CoreSession currentSession =
+        store.session(ownerId, session.sessionId) ?? session;
     return AgentRunContext(
       agentId: agent.id,
-      sessionId: fresh.sessionId,
+      sessionId: currentSession.sessionId,
       modelId: agent.modelId,
       // ⑧ 已选 Spec 全文是会话级的，所以键里带 sessionId；取的是**钉住值**
       // （没有时同步建一份并钉住——正常路径已由 _ensureSystemPromptPinned 建好）
-      systemPrompt: _systemPromptPinned(agent, fresh.sessionId),
+      systemPrompt: _systemPromptPinned(agent, currentSession.sessionId),
       userContent: userContent,
-      contextSummary: fresh.compactedSummary,
-      compactedMessageCount: fresh.compactedMessageCount,
+      // 临时员工轮不带父会话的压缩摘要/水位（它的历史是自己那一段，见 freshContext）
+      contextSummary: fresh ? '' : currentSession.compactedSummary,
+      compactedMessageCount: fresh ? 0 : currentSession.compactedMessageCount,
       // 中转站产出的整份上下文（非空时引擎原样使用它，不再拼 system/摘要）
-      compactedContext: fresh.compactedContext,
-      // 用户消息已在 handleUserMessage 里落库，因此这里取到的历史已含本次输入
-      history: store
-          .messages(agent.id, fresh.sessionId)
-          .map(_toRef)
-          .toList(growable: false),
+      compactedContext: fresh
+          ? const <Map<String, dynamic>>[]
+          : currentSession.compactedContext,
+      // 用户消息已在 handleUserMessage 里落库，因此这里取到的历史已含本次输入。
+      // `messages()` 刻意排掉临时员工的消息：父 agent 的工具批必须保持原子。
+      history:
+          historyOverride ??
+          store
+              .messages(agent.id, currentSession.sessionId)
+              .map(_toRef)
+              .toList(growable: false),
     );
   }
 

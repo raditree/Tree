@@ -17,6 +17,7 @@
 | [question_store.dart](question_store.dart) | 提问状态与答案的独立原子快照（跨会话列出、状态可改） |
 | [attachment_prompt.dart](attachment_prompt.dart) | 附件路径提示词片段（纯函数，生成与压缩估算共用） |
 | [scripted_agent.dart](scripted_agent.dart) | 占位引擎（测试替身；生产路径是 `LlmAgentEngine`） |
+| [subagent_service.dart](subagent_service.dart) | **临时员工**：校验（模型 / 工作空间 / 层级）→ 名册（复用或新建）→ 阻塞或后台运行 → 记账；`SubagentTurnRunner` 由 CLI 后置绑定到 `ConversationService.runSubagent` |
 
 ## 不变量（assertions）
 
@@ -33,6 +34,11 @@
     记录摘掉后它就无能为力）；删除路径因此必须**先经 broker 取消、再摘记录**，否则那一轮永远收不到工具结果
     ——`isRunning` 永远为真、连 `stop` 都救不回来。
 9. 提示词在**两处**被拼装（会话生成 + 压缩估算），两处必须看到**逐字一致**的字符串 ⇒ 一律用 provider 接线，不做参数副本。
+10. **临时员工（subagent）轮的运行标识永远是它自己的**：运行键 = `(subagentId, sessionId)`，与"正阻塞等它的父 agent"那一轮（`(parentId, sessionId)`）**绝不撞键**——撞了就是死锁；同时 N 个后台临时员工各占各的槽位，**真的并行**，不互相顶掉轮次。它跑的是 `_runTurn`（与普通轮**同一条**实现），"消息归集到谁 / 带什么标记 / 带哪段历史"由参数表达。
+11. **临时员工的消息不进父 agent 的模型上下文**（`store.messages` 按标记排掉）：父那一轮的 `assistant(tool_calls=[subagent])` 与它的 tool 结果必须相邻，中间插进子 agent 的话会把批切开 ⇒ 带 tools 的思考模式端点 400。唯一例外是**后台完成报告**（`kind=subagent_report`）：它是发起者的"新输入"（`wake` 注入），带 subagent 标记但**要**进父上下文；同理它**不进**临时员工自己的历史。用户要看的完整消息流走 `store.sessionMessages`（会话历史接口用它）。
+12. **`stop` / 插话要连带它名下的临时员工**：`_RunToken.ownerAgentId` 记归属轮次，`cancelAgent` 与"新消息插话"都会把同一会话里正在跑的临时员工一起收敛（否则父那轮一直卡在等一个没人管的子任务上）；`isRunning` 把"它名下的临时员工"也算在内，因此后台临时员工在跑时它的发起者显示 working、最后一个跑完才报 idle。
+
+## 依赖方向
 
 ## 依赖方向
 
@@ -47,7 +53,8 @@ dart test test/conversation_segments_test.dart test/conversation_stream_seq_test
           test/message_interrupt_test.dart test/system_prompt_pin_test.dart \
           test/compaction_test.dart test/question_broker_test.dart \
           test/question_store_test.dart \
-          test/private_workspace_io_test.dart test/workspace_prompt_test.dart
+          test/private_workspace_io_test.dart test/workspace_prompt_test.dart \
+          test/subagent_tool_test.dart
 ```
 
 钉子用例：`conversation_segments_test`（分段与落库顺序）、`message_interrupt_test`（会话并行 / 插话 / stop）、
