@@ -65,7 +65,10 @@ void main() {
 
       test('名字 / 谁召来的：名册优先（消息还没加载时也要对）', () {
         SubagentTranscript.instance.setRoster(<SubagentRosterEntry>[
-          entry('sub_1', name: '甲'),
+          // level-1 的 parent_id 在**真实数据**里就是会话主人的 id（`CoreSubagent.parentId` /
+          // `SubagentTag.parentId` = 召它的那个 agent）——用例照实写，不用空串（空串只会在
+          // 老数据/坏数据里出现，那时按下面的口径如实退回"未知调用方"）。
+          entry('sub_1', name: '甲', parentId: 'agt_1'),
           entry('sub_2', name: '乙', parentId: 'sub_1', level: 2),
         ]);
         expect(SubagentTranscript.instance.nameOf('sub_1'), '甲');
@@ -85,6 +88,17 @@ void main() {
             ownerName: '队长',
           ),
           '队长',
+        );
+        // 反面：名册里没有它（父既不在名册、也不在过程里）⇒ **如实退回空串**
+        // （界面显示「（未知调用方）」），不许拿"会话主人"顶上——那是在编名字。
+        expect(
+          SubagentTranscript.instance.callerNameOf(
+            'sub_3',
+            ownerAgentId: 'agt_1',
+            ownerName: '队长',
+          ),
+          isEmpty,
+          reason: '父不在本会话的名册/过程里 ⇒ 退回空串（既有语义，不许编名字）',
         );
       });
 

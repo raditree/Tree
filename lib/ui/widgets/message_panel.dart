@@ -2133,6 +2133,10 @@ class _MessagePanelState extends State<MessagePanel> {
                     ownerName: agent.name,
                     currentSubagentId: _effectiveViewId,
                     onSelect: _switchView,
+                    // 下拉条目要看得见"它此刻在不在跑"（用户 2026-10-03）：**只读**传入
+                    // 面板已有的那份子级运行态（不带它回 SubagentTranscript，也不影响
+                    // 主视角的发送键/停止键——那条只看 own_running）。
+                    workingIds: _workingSubagents,
                   ),
                   // 生成中且没输入内容时，右下角那个位置变成**停止键**（用户 2026-10-04；
                   // 开始打字就换回发送键——发送本身就会中止在途那一轮）。

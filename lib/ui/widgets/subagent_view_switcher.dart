@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
 import '../models/message.dart';
@@ -17,6 +19,7 @@ class SubagentViewSwitcher extends StatelessWidget {
     required this.ownerName,
     required this.currentSubagentId,
     required this.onSelect,
+    this.workingIds = const <String>{},
   });
 
   /// 会话主人（判断"谁召来的"用）。
@@ -28,6 +31,15 @@ class SubagentViewSwitcher extends StatelessWidget {
 
   /// 切换视角（空串 = 回主会话）。
   final ValueChanged<String> onSelect;
+
+  /// **此刻正在跑的临时员工 id**（只读；用户 2026-10-03：「临时成员下拉里要看得见
+  /// "是否在工作中"」）。
+  ///
+  /// 数据源是面板已有的运行态（`agent_status` 里带 `subagent_id` 的子级帧分流进去的
+  /// 那一份，见 `agent/README.md` 不变量 16 / `lib/README.md` 不变量 21）——**不塞回**
+  /// [SubagentTranscript]：那是"过程 / 入口"的分栏，与"谁在跑"是两件事。
+  /// 主会话那条永远不显示它（不是临时员工，没有"工作中"这回事）。
+  final Set<String> workingIds;
 
   @override
   Widget build(BuildContext context) {
@@ -44,31 +56,48 @@ class SubagentViewSwitcher extends StatelessWidget {
         final String label = inSubagent
             ? '临时员工「${_nameOf(currentSubagentId)}」'
             : '主会话';
+        // **菜单宽度**（用户 2026-10-03：「下拉条目被截断、菜单右缘被切掉」）：
+        // ① 这里给两行排版留够地方，但**夹到"屏宽 − 两侧边距"以内**；
+        // ② 靠右放不下时，Flutter 的弹出菜单会把整块往左挪（`_PopupMenuRouteLayout`
+        //    按 padding 夹住 x）——所以"右缘被窗口切掉"由这两层一起消掉。
+        final double screenWidth = MediaQuery.sizeOf(context).width;
+        final double available = screenWidth - 24; // 两侧各留 12
+        final double menuWidth = math.min(
+          460,
+          math.max(240, available),
+        );
         return PopupMenuButton<String>(
+          // 定宽而不是"最小宽度"：两行排版的行长才是可预期的（实测窄屏也不溢出）
+          constraints: BoxConstraints.tightFor(width: menuWidth),
           tooltip: inSubagent
               ? '现在在看临时员工的过程 · 点这里切回主会话或换一个'
               : '进入某个临时员工的视角（不新开窗口：借这个窗口看它的过程）',
           itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
             PopupMenuItem<String>(
               value: '',
-              height: 38,
+              height: 56,
               child: _item(
                 context,
                 icon: Icons.chat_bubble_outline,
-                label: '主会话 · ${ownerName.isEmpty ? '当前 agent' : ownerName}',
+                title: '主会话 · ${ownerName.isEmpty ? '当前 agent' : ownerName}',
+                subtitle: '你自己的会话（临时员工的活不在这里）',
                 selected: !inSubagent,
+                // 主会话不是临时员工：永远不显示"工作中"
+                working: false,
               ),
             ),
             if (ids.isNotEmpty) const PopupMenuDivider(),
             for (final String id in ids)
               PopupMenuItem<String>(
                 value: id,
-                height: 38,
+                height: 56,
                 child: _item(
                   context,
                   icon: Icons.badge_outlined,
-                  label: _labelOf(id),
+                  title: '临时员工「${_nameOf(id)}」',
+                  subtitle: _subtitleOf(id),
                   selected: id == currentSubagentId,
+                  working: workingIds.contains(id),
                 ),
               ),
           ],
@@ -123,11 +152,18 @@ class SubagentViewSwitcher extends StatelessWidget {
     );
   }
 
+  /// 一条下拉项：**两行排版**（用户 2026-10-03：「不许中间省略」）。
+  ///
+  /// 第一行 = 名字（+ 在跑时右侧一个**克制**的小圆点与「工作中」，跟随主题色）；
+  /// 第二行小字 = 「由 X 召来 · 第 N 层 · M 条过程」。以前三者挤一行 + `maxWidth: 200`
+  /// 的省略号，用户看到的只剩第一个词。
   Widget _item(
     BuildContext context, {
     required IconData icon,
-    required String label,
+    required String title,
+    required String subtitle,
     required bool selected,
+    required bool working,
   }) {
     final ColorScheme cs = Theme.of(context).colorScheme;
     return Row(
@@ -139,36 +175,71 @@ class SubagentViewSwitcher extends StatelessWidget {
         ),
         const SizedBox(width: 8),
         Expanded(
-          child: Text(
-            label,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: 12.5,
-              color: selected ? cs.primary : cs.onSurface,
-            ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Row(
+                children: <Widget>[
+                  Flexible(
+                    child: Text(
+                      title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        color: selected ? cs.primary : cs.onSurface,
+                      ),
+                    ),
+                  ),
+                  // 状态指示（只在跑的时候出现；空闲态不加噪音）
+                  if (working) ...<Widget>[
+                    const SizedBox(width: 6),
+                    Container(
+                      width: 6,
+                      height: 6,
+                      decoration: BoxDecoration(
+                        color: cs.primary,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      '工作中',
+                      style: TextStyle(fontSize: 11, color: cs.primary),
+                    ),
+                  ],
+                ],
+              ),
+              const SizedBox(height: 2),
+              Text(
+                subtitle,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+              ),
+            ],
           ),
         ),
       ],
     );
   }
 
-  /// 一行：名字 + **谁召来的** + 层数 + 已有多少条过程（措辞与 teammates 分开）。
+  /// 第二行小字：**谁召来的** + 层数 + 已有多少条过程（措辞与 teammates 分开）。
   /// 显示名：**名册优先**（消息还没加载 / 已被淘汰也有正确名字），退回到「…」。
   String _nameOf(String id) {
     final String name = SubagentTranscript.instance.nameOf(id);
     return name.isEmpty ? '…' : name;
   }
 
-  String _labelOf(String id) {
+  String _subtitleOf(String id) {
     final List<ChatMessage> transcript = SubagentTranscript.instance.of(id);
     final String caller = SubagentTranscript.instance.callerNameOf(
       id,
       ownerAgentId: ownerAgentId,
       ownerName: ownerName,
     );
-    return '临时员工「${_nameOf(id)}」 · '
-        '${viewSubtitle(callerName: caller, transcript: transcript)} · '
-        '${transcript.length} 条过程';
+    return '${viewSubtitle(callerName: caller, transcript: transcript)}'
+        ' · ${transcript.length} 条过程';
   }
 }

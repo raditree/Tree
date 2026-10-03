@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:tree/ui/models/message.dart';
@@ -134,20 +135,26 @@ void main() {
       required List<ChatMessage> messages,
       required String current,
       required List<String> selections,
+      Set<String> workingIds = const <String>{},
     }) async {
       SubagentTranscript.instance.sync(messages);
       await tester.pumpWidget(
         MaterialApp(
           home: Scaffold(
-            body: Row(
-              children: <Widget>[
-                SubagentViewSwitcher(
+            // 贴近真实落点（输入框右下、发送键左侧）：**贴着窗口右下角**，
+            // 菜单因此有"靠右放不下、必须朝左展开"的压力。
+            body: Align(
+              alignment: Alignment.bottomRight,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: SubagentViewSwitcher(
                   ownerAgentId: 'agt_1',
                   ownerName: '契门',
                   currentSubagentId: current,
                   onSelect: selections.add,
+                  workingIds: workingIds,
                 ),
-              ],
+              ),
             ),
           ),
         ),
@@ -200,6 +207,145 @@ void main() {
       await tester.tap(find.textContaining('主会话'));
       await tester.pumpAndSettle();
       expect(selections, <String>[''], reason: '空串 = 回主会话');
+    });
+
+    testWidgets('下拉条目看得见"是否在工作中"（在跑的才有，主会话那条永不显示）', (
+      WidgetTester tester,
+    ) async {
+      await pump(
+        tester,
+        messages: <ChatMessage>[
+          mainMessage('主'),
+          sub('sub_a'),
+          sub('sub_b', name: '脚本小工'),
+        ],
+        current: '',
+        selections: <String>[],
+        // 只有 sub_a 在跑（面板那份 _workingSubagents 的只读拷贝）
+        workingIds: <String>{'sub_a'},
+      );
+      await tester.tap(find.byType(PopupMenuButton<String>));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.text('工作中'),
+        findsOneWidget,
+        reason: '只有 sub_a 在跑 ⇒ 只有一个条目带状态指示',
+      );
+      expect(
+        find.descendant(
+          of: find.ancestor(
+            of: find.textContaining('临时员工「数值复核」'),
+            matching: find.byType(PopupMenuItem<String>),
+          ),
+          matching: find.text('工作中'),
+        ),
+        findsOneWidget,
+        reason: '指示挂在在跑的那一条上',
+      );
+      expect(
+        find.descendant(
+          of: find.ancestor(
+            of: find.textContaining('临时员工「脚本小工」'),
+            matching: find.byType(PopupMenuItem<String>),
+          ),
+          matching: find.text('工作中'),
+        ),
+        findsNothing,
+        reason: '空闲的条目不加噪音',
+      );
+      expect(
+        find.descendant(
+          of: find.ancestor(
+            of: find.text('主会话 · 契门'),
+            matching: find.byType(PopupMenuItem<String>),
+          ),
+          matching: find.text('工作中'),
+        ),
+        findsNothing,
+        reason: '主会话不是临时员工：永远不显示"工作中"',
+      );
+    });
+
+    testWidgets('没人在跑：一个"工作中"都不出现（空闲态没有额外噪音）', (
+      WidgetTester tester,
+    ) async {
+      await pump(
+        tester,
+        messages: <ChatMessage>[mainMessage('主'), sub('sub_a')],
+        current: 'sub_a',
+        selections: <String>[],
+      );
+      await tester.tap(find.byType(PopupMenuButton<String>));
+      await tester.pumpAndSettle();
+      expect(find.text('工作中'), findsNothing);
+    });
+
+    testWidgets('长名字看得全 + 菜单够宽且右缘不出窗口（用户 2026-10-03）', (
+      WidgetTester tester,
+    ) async {
+      const String longName = '跨机附件投递-重开';
+      await pump(
+        tester,
+        messages: <ChatMessage>[
+          mainMessage('主'),
+          sub('sub_a', name: longName),
+        ],
+        current: 'sub_a',
+        selections: <String>[],
+        workingIds: <String>{'sub_a'},
+      );
+      await tester.tap(find.byType(PopupMenuButton<String>));
+      await tester.pumpAndSettle();
+
+      // ① 两行排版：名字与「由 X 召来 · 第 N 层 · M 条过程」都要**真能画下**
+      //    （`didExceedMaxLines == false` = 没有被省略号吃掉）
+      final Finder title = find.text('临时员工「$longName」');
+      expect(title, findsWidgets, reason: '长名字的条目在');
+      expect(
+        (tester.renderObject(title.last) as RenderParagraph).didExceedMaxLines,
+        isFalse,
+        reason: '12+ 汉字的长名字也要画得下（不许省略到看不清）',
+      );
+      final Finder subtitle = find.text('由「契门」召来 · 第 1 层 · 1 条过程');
+      expect(subtitle, findsOneWidget, reason: '完整的"谁召来的 / 层数 / 过程数"那一行');
+      expect(
+        (tester.renderObject(subtitle) as RenderParagraph).didExceedMaxLines,
+        isFalse,
+        reason: '副标题不许被中间省略',
+      );
+
+      // ② 菜单宽度与右缘：>= 340，且右缘不出视口（靠右放不下时朝左展开）
+      final Rect item = tester.getRect(
+        find.byType(PopupMenuItem<String>).first,
+      );
+      expect(item.width, greaterThanOrEqualTo(340));
+      final double viewWidth =
+          tester.view.physicalSize.width / tester.view.devicePixelRatio;
+      expect(
+        item.right,
+        lessThanOrEqualTo(viewWidth),
+        reason: '菜单右缘不许被窗口切掉',
+      );
+      final Rect pill = tester.getRect(find.byType(PopupMenuButton<String>));
+      expect(
+        item.left,
+        lessThan(pill.left),
+        reason: '贴着右缘时菜单朝左展开（不是从按钮右缘往右长）',
+      );
+
+      // ③ ② 的状态指示在同一套排版里：在跑的那条有，主会话那条永远没有
+      expect(find.text('工作中'), findsOneWidget);
+      expect(
+        find.descendant(
+          of: find.ancestor(
+            of: find.text('主会话 · 契门'),
+            matching: find.byType(PopupMenuItem<String>),
+          ),
+          matching: find.text('工作中'),
+        ),
+        findsNothing,
+      );
     });
   });
 }
