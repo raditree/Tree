@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -9,6 +10,7 @@ import 'package:flutter/services.dart';
 import '../../io/api_service.dart';
 import '../../io/platform_support.dart';
 import '../models/file_content.dart';
+import '../services/code_gutter_layout.dart';
 import '../services/code_highlight.dart';
 import '../services/download_center.dart';
 import '../services/editor_buffer.dart';
@@ -84,6 +86,25 @@ const List<String> officeExtensions = [
   '.xlsx',
   '.xls',
 ];
+
+/// 源码视图正文的 contentPadding（上下左右都是它）。
+///
+/// 行号槽要把**上面这一份**算进纵向偏移（正文第一行从 padding.top 开始），量正文宽度
+/// 时也要减掉左右两份——见 [_buildCodeArea]。
+const double kCodeViewPadding = 12;
+
+/// 文本渲染对象给光标留的宽度：_kCaretGap(1) + cursorWidth(2)。
+///
+/// 软换行按「可用宽度 − 这 3px」算（RenderEditable 的 _adjustConstraints），行号槽
+/// 量宽时必须一起减掉：差的这 3px 在长行上会挪动折行点，**只要有一行折行**，从它开始
+/// 的数字就整体错位。
+const double kCodeCaretMargin = 3;
+
+/// 行号槽左右的内边距（右边那一份就是数字与正文之间的缝）。
+const double kCodeGutterPadding = 8;
+
+/// 行号槽的 key：测试靠它找到「真正画出来的那几个数字」。
+const Key codeGutterKey = ValueKey<String>('code-gutter');
 
 /// 文件查看器 - 支持多种文件格式的查看与预览
 ///
@@ -193,6 +214,13 @@ class FileViewerState extends State<FileViewer> {
 
   /// 文本域的焦点节点：失焦就是「切走」，触发自动保存
   final FocusNode _editorFocus = FocusNode();
+
+  /// 代码视图正文（文本域 / 只读正文）的滚动控制器：**行号槽跟着它的 offset 平移**
+  /// （见 [_CodeGutter]）。
+  ///
+  /// 自己持有：传了 scrollController 的 TextField 就不再自己新建一条，行号槽与正文
+  /// 因此共用同一个滚动位置——各挂一个 Scrollable 迟早会不同步（惯性、夹取各跳各的）。
+  final ScrollController _codeScroll = ScrollController();
 
   /// 是否有未保存的改动（共享：任一窗格改了，两边都是未保存态）
   bool get _dirty => _buf.dirty;
@@ -343,6 +371,7 @@ class FileViewerState extends State<FileViewer> {
     _buf.removeListener(_onBufferChanged);
     _ownBuf?.dispose();
     _editorFocus.dispose();
+    _codeScroll.dispose();
     super.dispose();
   }
 
@@ -1115,7 +1144,14 @@ class FileViewerState extends State<FileViewer> {
     );
   }
 
-  /// 文本视图（等宽字体）
+  /// 文本视图（等宽字体）——源码模式：左侧**行号槽** + 右侧正文。
+  ///
+  /// 可编辑是带高亮的文本域，只读是**同一份**着色 span 的 SelectableText.rich；两边
+  /// 都有行号。图片 / PDF / Office 与 Markdown / SVG **预览**走各自的分支，没有行号。
+  ///
+  /// 行号必须与正文**同一套度量**（同一 TextStyle / textScaler / 内容宽度），见
+  /// [CodeGutterLayout]：正文是软换行的，一条逻辑行可能占多个视觉行，量宽差几像素就会
+  /// 挪动折行点、整块数字跟着错位（lib/README.md 不变量 12）。
   Widget _buildCodeView() {
     if (_content.isEmpty && !_editableFile) {
       return Center(
@@ -1128,6 +1164,30 @@ class FileViewerState extends State<FileViewer> {
         ),
       );
     }
+    final CodeEditingController? editor = _editor;
+    final bool editable = _editableFile && editor != null;
+    // 文本变了行号就得跟着变，而可编辑时文本变化的**唯一来源**是控制器：TextField 自己
+    // 会重建，但行号槽在文本域外面，得有人告诉它。整块代码区挂在控制器上重建即可
+    // （位置与类型不变，文本域的 Element / 状态照旧复用，光标与输入法不受影响）。
+    if (editable) {
+      return ListenableBuilder(
+        listenable: editor,
+        builder: (BuildContext context, Widget? child) =>
+            _buildCodeArea(editor: editor, editable: true),
+      );
+    }
+    return _buildCodeArea(editor: editor, editable: false);
+  }
+
+  /// 代码区：左边行号槽，右边正文（可编辑 / 只读共用这一份布局与同一条滚动控制器）。
+  ///
+  /// 正文**内容宽度** = 窗格宽 − 行号槽宽 − 正文 contentPadding 左右 − 光标留白。
+  /// 必须用 [LayoutBuilder] 拿真实窗格宽再逐项减掉，不能拿窗格宽直接量：软换行只认内容
+  /// 宽度，差一点数字就整体错位（[CodeGutterLayout.compute] 的 maxWidth）。
+  Widget _buildCodeArea({
+    CodeEditingController? editor,
+    required bool editable,
+  }) {
     final ColorScheme cs = Theme.of(context).colorScheme;
     final TextStyle baseStyle = TextStyle(
       fontSize: 13,
@@ -1136,36 +1196,110 @@ class FileViewerState extends State<FileViewer> {
       fontFamilyFallback: const <String>['Cascadia Mono', 'monospace'],
       color: cs.onSurface,
     );
-    final CodeEditingController? editor = _editor;
-    // 可编辑：文本域（带高亮控制器）。expands + maxLines:null 让它铺满窗格并自己滚动。
-    if (_editableFile && editor != null) {
-      return Focus(
-        onKeyEvent: _handleEditorKey,
-        child: TextField(
-          controller: editor,
-          focusNode: _editorFocus,
-          maxLines: null,
-          expands: true,
-          textAlignVertical: TextAlignVertical.top,
-          style: baseStyle,
-          cursorColor: cs.primary,
-          // 编辑器自己的框由外层窗格画；这里必须显式清掉主题的 enabled/focused 边框
-          // （只写 border: none 会被 inputDecorationTheme 覆盖回来，见 input_style.dart）
-          decoration: kBorderlessInput.copyWith(
-            isDense: true,
-            contentPadding: const EdgeInsets.all(12),
-          ),
-          onChanged: (String _) {
-            if (!_dirty) {
-              setState(() {
-                _dirty = true;
-              });
-            }
-          },
+    final TextScaler textScaler = MediaQuery.textScalerOf(context);
+    final String text = editable ? editor!.text : _content;
+    final String reason = _readOnlyReason;
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        final double gutterWidth = _codeGutterWidth(text, baseStyle, textScaler);
+        final double contentWidth = math.max(
+          0.0,
+          constraints.maxWidth -
+              gutterWidth -
+              2 * kCodeViewPadding -
+              kCodeCaretMargin,
+        );
+        final Widget area = Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            _CodeGutter(
+              key: codeGutterKey,
+              text: text,
+              style: baseStyle,
+              textScaler: textScaler,
+              width: gutterWidth,
+              contentWidth: contentWidth,
+              viewportHeight: constraints.maxHeight,
+              scrollController: _codeScroll,
+              color: cs.onSurfaceVariant,
+            ),
+            Expanded(
+              child: editable
+                  ? _buildEditorField(cs, baseStyle, editor!)
+                  : _buildReadOnlyText(baseStyle),
+            ),
+          ],
+        );
+        if (editable || reason.isEmpty) return area;
+        // 只读时上面还有一条「为什么不能编辑」的提示条（行号槽跟着正文一起缩进到它下面）
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            _buildReadOnlyBanner(cs, reason),
+            Expanded(child: area),
+          ],
+        );
+      },
+    );
+  }
+
+  /// 行号槽宽度：**最宽**的那个号（逻辑行数的位数）＋ 左右内边距。
+  ///
+  /// 只量一次几个字符：宽度定死之后槽宽不随滚动与文本内容抖，正文宽度也就不会跟着抖
+  /// （否则折行点会在打字时来回跳）。
+  double _codeGutterWidth(String text, TextStyle style, TextScaler textScaler) {
+    final int digits = '${text.split('\n').length}'.length;
+    final TextPainter painter = TextPainter(
+      text: TextSpan(text: '0' * digits, style: style),
+      textDirection: TextDirection.ltr,
+      textScaler: textScaler,
+    )..layout();
+    final double width = painter.width;
+    painter.dispose();
+    return width + 2 * kCodeGutterPadding;
+  }
+
+  /// 可编辑正文：文本域（高亮控制器 + **行号槽共用**的那条滚动控制器）。
+  ///
+  /// expands + maxLines:null 让它铺满窗格并自己滚动。
+  Widget _buildEditorField(
+    ColorScheme cs,
+    TextStyle baseStyle,
+    CodeEditingController editor,
+  ) {
+    return Focus(
+      onKeyEvent: _handleEditorKey,
+      child: TextField(
+        controller: editor,
+        focusNode: _editorFocus,
+        // 行号槽跟着这一条平移（见 [_CodeGutter]）：不能再挂第二个 Scrollable
+        scrollController: _codeScroll,
+        maxLines: null,
+        expands: true,
+        textAlignVertical: TextAlignVertical.top,
+        style: baseStyle,
+        cursorColor: cs.primary,
+        // 编辑器自己的框由外层窗格画；这里必须显式清掉主题的 enabled/focused 边框
+        // （只写 border: none 会被 inputDecorationTheme 覆盖回来，见 input_style.dart）
+        decoration: kBorderlessInput.copyWith(
+          isDense: true,
+          contentPadding: const EdgeInsets.all(kCodeViewPadding),
         ),
-      );
-    }
-    // 只读：同样按语言着色（着色开关关掉就退回单色），可选可复制
+        onChanged: (String _) {
+          if (!_dirty) {
+            setState(() {
+              _dirty = true;
+            });
+          }
+        },
+      ),
+    );
+  }
+
+  /// 只读正文：同样按语言着色（着色开关关掉就退回单色），可选可复制。
+  ///
+  /// 滚动控制器与行号槽共用：只读也一样要跟着滚。
+  Widget _buildReadOnlyText(TextStyle baseStyle) {
     final bool highlight = EditorSettings.instance.highlight;
     final TextSpan span = highlight
         ? buildCodeTextSpan(
@@ -1175,18 +1309,10 @@ class FileViewerState extends State<FileViewer> {
             baseStyle: baseStyle,
           )
         : TextSpan(style: baseStyle, text: _content);
-    final String reason = _readOnlyReason;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: <Widget>[
-        if (reason.isNotEmpty) _buildReadOnlyBanner(cs, reason),
-        Expanded(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(12),
-            child: SelectableText.rich(span),
-          ),
-        ),
-      ],
+    return SingleChildScrollView(
+      controller: _codeScroll,
+      padding: const EdgeInsets.all(kCodeViewPadding),
+      child: SelectableText.rich(span),
     );
   }
 
@@ -1426,6 +1552,179 @@ class FileViewerState extends State<FileViewer> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// 源码视图左侧的**行号槽**（lib/README.md 不变量 12）。
+///
+/// 数字来自 [CodeGutterLayout]：它逐**视觉行**给出「这一行该画几号」，软换行的续行是
+/// null（留空不画）。因此必须与正文用**同一套度量**排出来——同一 TextStyle、同一
+/// textScaler、同一内容宽度——只要有一行折行，后面的号就整体错位。
+///
+/// 三条口径：
+/// - **不参与命中与选择**（IgnorePointer + ExcludeSemantics）：它是贴在正文左边的标尺，
+///   点它不该移动光标，选中正文也不该把行号一起选进去；
+/// - **跟着正文那条滚动控制器平移**（不挂第二个 Scrollable：两个滚动体迟早不同步）；
+/// - 布局**只在文本或宽度变了才重算**（缓存住，不是每帧算）。
+class _CodeGutter extends StatefulWidget {
+  const _CodeGutter({
+    super.key,
+    required this.text,
+    required this.style,
+    required this.textScaler,
+    required this.width,
+    required this.contentWidth,
+    required this.viewportHeight,
+    required this.scrollController,
+    required this.color,
+  });
+
+  /// 正文文本（与正文同一个字符串：行号是按它量出来的）
+  final String text;
+
+  /// 正文的 TextStyle（行号共用它，字号与行高才对得上）
+  final TextStyle style;
+
+  /// 正文的 textScaler
+  final TextScaler textScaler;
+
+  /// 槽宽（含两侧内边距）
+  final double width;
+
+  /// 正文的**内容宽度**（[CodeGutterLayout.compute] 的 maxWidth）
+  final double contentWidth;
+
+  /// 视口高度（只建可见那一段的控件；无限高就全建）
+  final double viewportHeight;
+
+  /// 正文的滚动控制器（行号跟着它的 offset 平移）
+  final ScrollController scrollController;
+
+  /// 数字颜色（低调：cs.onSurfaceVariant）
+  final Color color;
+
+  @override
+  State<_CodeGutter> createState() => _CodeGutterState();
+}
+
+class _CodeGutterState extends State<_CodeGutter> {
+  /// 上一次量出来的布局与它的输入：**只在文本 / 宽度变了才重算**。
+  ///
+  /// 每帧重算等于每次滚动都跑一遍全篇 TextPainter（几千行就是几千次 layout）。
+  CodeGutterLayout? _layout;
+  String? _layoutText;
+  double? _layoutWidth;
+  TextScaler? _layoutScaler;
+  TextStyle? _layoutStyle;
+
+  /// 取（必要时重算）行号布局：键 = 文本 + 内容宽度 + 缩放 + 字体度量。
+  CodeGutterLayout _layoutFor() {
+    final CodeGutterLayout? cached = _layout;
+    if (cached != null &&
+        _layoutText == widget.text &&
+        _layoutWidth == widget.contentWidth &&
+        _layoutScaler == widget.textScaler &&
+        _layoutStyle == widget.style) {
+      return cached;
+    }
+    final CodeGutterLayout layout = CodeGutterLayout.compute(
+      text: widget.text,
+      style: widget.style,
+      maxWidth: widget.contentWidth,
+      textScaler: widget.textScaler,
+    );
+    _layout = layout;
+    _layoutText = widget.text;
+    _layoutWidth = widget.contentWidth;
+    _layoutScaler = widget.textScaler;
+    _layoutStyle = widget.style;
+    return layout;
+  }
+
+  /// 可见窗口：返回 [first, last) 与窗口第一行的纵向位置。
+  ///
+  /// 上下各留一屏（快速滚动时数字不会晚一帧才贴上）。行按下标递增排好序，线性扫一遍。
+  (int, int, double) _window(CodeGutterLayout layout, double offset) {
+    final int count = layout.rows.length;
+    if (count == 0) return (0, 0, 0);
+    final double height = widget.viewportHeight;
+    if (!height.isFinite || height <= 0) return (0, count, 0);
+    final double from = offset - height;
+    final double to = offset + height + height;
+    int first = 0;
+    while (first < count &&
+        layout.rows[first].top + layout.rows[first].height < from) {
+      first++;
+    }
+    int last = first;
+    while (last < count && layout.rows[last].top <= to) {
+      last++;
+    }
+    return (first, last, first < count ? layout.rows[first].top : 0);
+  }
+
+  /// 一个视觉行：高度与正文那一个视觉行一致，行首画号（续行留空）。
+  Widget _buildRow(CodeGutterRow row, TextStyle numberStyle) {
+    if (row.number == null) return SizedBox(height: row.height);
+    return SizedBox(
+      height: row.height,
+      child: Align(
+        // 顶部对齐（不是居中）：同一套度量下数字的基线才与正文那一行一致
+        alignment: Alignment.topRight,
+        child: Padding(
+          padding: const EdgeInsets.only(right: kCodeGutterPadding),
+          child: Text(
+            '${row.number}',
+            style: numberStyle,
+            textScaler: widget.textScaler,
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final CodeGutterLayout layout = _layoutFor();
+    final TextStyle numberStyle = widget.style.copyWith(color: widget.color);
+    return SizedBox(
+      width: widget.width,
+      child: ClipRect(
+        child: IgnorePointer(
+          child: ExcludeSemantics(
+            child: AnimatedBuilder(
+              // 只跟着**正文那条**控制器重画：动画值就是滚动位置
+              animation: widget.scrollController,
+              builder: (BuildContext context, Widget? child) {
+                final double offset = widget.scrollController.hasClients
+                    ? widget.scrollController.offset
+                    : 0;
+                final (int first, int last, double firstTop) =
+                    _window(layout, offset);
+                return OverflowBox(
+                  // 行号列比视口高（只裁不报溢出）：裁剪由外层 ClipRect 做
+                  alignment: Alignment.topCenter,
+                  maxHeight: double.infinity,
+                  child: Transform.translate(
+                    // 正文顶部还有 contentPadding（代码视图 = 12），行号槽没有——要一起算；
+                    // 再减去滚动偏移：正文往上滚多少，行号就往上走多少。
+                    offset: Offset(0, kCodeViewPadding - offset + firstTop),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: <Widget>[
+                        for (int i = first; i < last; i++)
+                          _buildRow(layout.rows[i], numberStyle),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
       ),
     );
   }

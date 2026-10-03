@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -106,6 +107,69 @@ Future<void> settleIo(WidgetTester tester, {int rounds = 12}) async {
         () => Future<void>.delayed(const Duration(milliseconds: 15)));
     await tester.pump();
   }
+}
+
+
+/// 行号槽里**真正画出来**的数字，按屏幕从上到下的顺序。
+///
+/// 为什么读渲染结果而不是断言「控件在」：行号错位、续行多发一个号这类 bug 恰恰是
+/// 「控件都在、数字不对」——只有把画出来的字符串收集起来才看得见。
+List<int> gutterNumbers(WidgetTester tester) {
+  final Finder gutter = find.byKey(codeGutterKey);
+  if (gutter.evaluate().isEmpty) return <int>[];
+  final Finder texts = find.descendant(of: gutter, matching: find.byType(Text));
+  final List<(double, int)> found = <(double, int)>[];
+  for (int i = 0; i < texts.evaluate().length; i++) {
+    final Text text = tester.widget<Text>(texts.at(i));
+    final int? number = int.tryParse(text.data ?? '');
+    if (number != null) found.add((tester.getTopLeft(texts.at(i)).dy, number));
+  }
+  found.sort(((double, int) a, (double, int) b) => a.$1.compareTo(b.$1));
+  return found.map(((double, int) row) => row.$2).toList();
+}
+
+/// 行号槽里 [n] 号数字的屏幕 dy（没画出来就是 null）。
+double? gutterNumberDy(WidgetTester tester, int n) {
+  final Finder gutter = find.byKey(codeGutterKey);
+  final Finder texts = find.descendant(of: gutter, matching: find.byType(Text));
+  for (int i = 0; i < texts.evaluate().length; i++) {
+    final Text text = tester.widget<Text>(texts.at(i));
+    if (text.data == '$n') return tester.getTopLeft(texts.at(i)).dy;
+  }
+  return null;
+}
+
+/// 第 [line] 条逻辑行（1 起）首字符在整个文本里的下标。
+int lineStartOffset(String text, int line) {
+  int offset = 0;
+  for (int i = 1; i < line; i++) {
+    offset = text.indexOf('\n', offset) + 1;
+  }
+  return offset;
+}
+
+/// 正文（文本域 / 只读的 SelectableText，两者都是 EditableText）里第 [line] 条
+/// **逻辑行**首字符的屏幕 dy。
+///
+/// 取的是 caret 矩形的顶边：RenderEditable 会把光标原型上抬 2px 再做亚像素吸附，所以
+/// 它与行号槽之间差一个**常数**。断言因此只用它比较「行与行之差」——常数在相减时被
+/// 抵消，剩下的差异就只能是真正的错位（折行点算错时正是这里会炸）。
+double fieldLineDy(WidgetTester tester, String text, int line) {
+  final EditableTextState state =
+      tester.state<EditableTextState>(find.byType(EditableText));
+  final RenderEditable editable = state.renderEditable;
+  final Rect local = editable.getLocalRectForCaret(
+    TextPosition(offset: lineStartOffset(text, line)),
+  );
+  return editable.localToGlobal(local.topLeft).dy;
+}
+
+/// 文本域里那条滚动位置（行号槽必须跟着它走）。
+ScrollableState editorScrollable(WidgetTester tester) {
+  return tester.state<ScrollableState>(find.descendant(
+    of: find.byType(TextField),
+    matching: find.byType(Scrollable),
+  ));
 }
 
 void main() {
@@ -249,6 +313,151 @@ void main() {
         isTrue,
         reason: '关键字要有着色，而不是一坨同色的 txt',
       );
+    });
+  });
+
+
+  group('源码模式的行号槽（软换行感知）', () {
+    testWidgets('左侧有行号槽：1..N 与逻辑行一一对应', (WidgetTester tester) async {
+      core.content = 'l1\nl2\nl3\n';
+      core.size = core.content.length;
+      await pumpViewer(tester, path: 'notes.txt');
+
+      expect(find.byKey(codeGutterKey), findsOneWidget);
+      // 末尾换行 = 第 4 条空行：编辑器也给它一个号（VS Code 同口径）
+      expect(gutterNumbers(tester), <int>[1, 2, 3, 4]);
+    });
+
+    testWidgets('加行 / 删行：行号跟着增、跟着减', (WidgetTester tester) async {
+      core.content = 'a\n';
+      core.size = 2;
+      await pumpViewer(tester, path: 'notes.txt');
+      expect(gutterNumbers(tester), <int>[1, 2]);
+
+      await tester.enterText(find.byType(TextField), 'a\nb\nc\nd\ne\n');
+      await tester.pump();
+      expect(gutterNumbers(tester), <int>[1, 2, 3, 4, 5, 6]);
+
+      await tester.enterText(find.byType(TextField), 'a\n');
+      await tester.pump();
+      expect(gutterNumbers(tester), <int>[1, 2]);
+    });
+
+    testWidgets('软换行：续行不编号，且行的位置与正文逐行一致',
+        (WidgetTester tester) async {
+      // 一行 400 个字符，远超窗格宽 ⇒ 必然折成多个视觉行
+      final String longLine = 'x' * 400;
+      core.content = '$longLine\nshort';
+      core.size = core.content.length;
+      await pumpViewer(tester, path: 'notes.txt');
+
+      // 折出来的续行没有号：画出来的仍然只有两个逻辑行号，没有重复 / 错位的号
+      expect(gutterNumbers(tester), <int>[1, 2]);
+
+      final double g1 = gutterNumberDy(tester, 1)!;
+      final double g2 = gutterNumberDy(tester, 2)!;
+      final double f1 = fieldLineDy(tester, core.content, 1);
+      final double f2 = fieldLineDy(tester, core.content, 2);
+      // 2 号必须落在**折完之后**的位置上，而不是紧跟 1 号下面（那就是没把折行算进去）
+      expect(g2 - g1, greaterThan(3 * 13 * 1.5));
+      expect(
+        g2 - g1,
+        closeTo(f2 - f1, 0.6),
+        reason: '行号槽要与正文同一套度量：行号间距 ${g2 - g1}，正文间距 ${f2 - f1}',
+      );
+    });
+
+    testWidgets('滚动文本域：行号槽跟着 offset 平移，同一行仍然对齐',
+        (WidgetTester tester) async {
+      final String content =
+          <String>[for (int i = 1; i <= 200; i++) 'line $i'].join('\n');
+      core.content = content;
+      core.size = content.length;
+      await pumpViewer(tester, path: 'notes.txt');
+      expect(gutterNumbers(tester).first, 1);
+
+      const int probe = 5;
+      final double gutterBefore = gutterNumberDy(tester, probe)!;
+      final double fieldBefore = fieldLineDy(tester, content, probe);
+
+      final ScrollableState scrollable = editorScrollable(tester);
+      scrollable.position.jumpTo(60);
+      await tester.pump();
+
+      final double gutterAfter = gutterNumberDy(tester, probe)!;
+      final double fieldAfter = fieldLineDy(tester, content, probe);
+      // 行号槽的平移量 = 文本域的滚动量（跟着同一条控制器走，不挂第二个 Scrollable）
+      expect(
+        gutterBefore - gutterAfter,
+        closeTo(60, 1.0),
+        reason: '行号槽要跟着文本域的 offset 一起平移',
+      );
+      // 正文自己也滚了同样的量：否则上一条会因为它没滚而假过
+      expect(fieldBefore - fieldAfter, closeTo(60, 1.0));
+      // 滚完还是对齐的（同一个探针行：行号与正文的差不变）
+      expect(gutterAfter - fieldAfter, closeTo(gutterBefore - fieldBefore, 1.0));
+    });
+
+    testWidgets('只读的代码视图也有行号槽，且与只读正文同一套度量',
+        (WidgetTester tester) async {
+      core.content = 'l1\nl2\nl3\n';
+      core.size = core.content.length;
+      await pumpViewer(
+        tester,
+        path: 'notes.txt',
+        readOnly: true,
+        reason: '外部调用方要求只读',
+      );
+
+      expect(find.byType(TextField), findsNothing);
+      expect(find.byKey(codeGutterKey), findsOneWidget);
+      expect(gutterNumbers(tester), <int>[1, 2, 3, 4]);
+
+      final double g1 = gutterNumberDy(tester, 1)!;
+      final double g2 = gutterNumberDy(tester, 2)!;
+      expect(
+        g2 - g1,
+        closeTo(
+          fieldLineDy(tester, core.content, 2) -
+              fieldLineDy(tester, core.content, 1),
+          0.6,
+        ),
+        reason: '只读正文（SelectableText.rich）用的是同一个 TextStyle 与宽度',
+      );
+    });
+
+testWidgets('换文件（可编辑 → 只读）后行号槽仍在，滚动控制器不炸',
+        (WidgetTester tester) async {
+      core.content = 'a\nb\n';
+      core.size = 4;
+      await pumpViewer(tester, path: 'a.txt');
+      expect(gutterNumbers(tester), <int>[1, 2, 3]);
+
+      // 同一个窗格里换成含 NUL 的二进制文件：编辑分支整条换成只读分支，而两条分支
+      // 共用同一条滚动控制器（TextField → SingleChildScrollView，旧的要到帧尾才卸）。
+      core.content = 'abc\u0000def';
+      core.size = 7;
+      await pumpViewer(tester, path: 'weird.txt');
+      expect(find.byType(TextField), findsNothing);
+      expect(gutterNumbers(tester), <int>[1]);
+    });
+
+    testWidgets('图片 / Markdown 预览没有行号槽，切到源码才有',
+        (WidgetTester tester) async {
+      core.content = base64Encode(<int>[1, 2, 3, 4]);
+      core.size = 4;
+      await pumpViewer(tester, path: 'pic.png');
+      expect(find.byKey(codeGutterKey), findsNothing);
+
+      core.content = '# 标题\n正文';
+      core.size = core.content.length;
+      await pumpViewer(tester, path: 'readme.md');
+      expect(find.byKey(codeGutterKey), findsNothing, reason: 'Markdown 默认是预览');
+
+      await tester.tap(find.text('源码'));
+      await tester.pump();
+      expect(find.byKey(codeGutterKey), findsOneWidget);
+      expect(gutterNumbers(tester), <int>[1, 2]);
     });
   });
 
