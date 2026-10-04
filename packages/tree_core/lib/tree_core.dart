@@ -71,6 +71,7 @@ export 'src/plugin/station_scope.dart';
 export 'src/plugin/station_store.dart';
 export 'src/plugin/stations.dart';
 export 'src/tool/builtin_tools.dart';
+export 'src/tool/hook_ledger.dart';
 export 'src/tool/llm_request_guard.dart';
 export 'src/tool/mcp_tool.dart';
 export 'src/tool/message_tool.dart';

@@ -9,6 +9,7 @@
 library;
 
 export 'src/ansi_code_page.dart';
+export 'src/background_exec.dart';
 export 'src/dartssh_transport.dart';
 export 'src/git_output.dart';
 export 'src/local_workspace_io.dart';

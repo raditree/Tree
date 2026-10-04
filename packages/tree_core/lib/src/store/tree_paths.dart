@@ -107,6 +107,14 @@ class TreePaths {
   /// 轮转后的历史份额见 [coreLogFileAt]（`core.1.log` 最新，编号越大越旧）。
   String get coreLogFile => p.join(logsDir, 'core.log');
 
+  /// **后台（hook）任务台账目录**（`<root>/hooks`）。
+  ///
+  /// 落在这里的是一行一条的 `<task_id>.json`（原子写）：远端后台命令跨**核心/应用
+  /// 重启**接续的凭据——重启后按它重新挂上"等它结束"，并把完成提示投递回原会话。
+  /// 为什么放数据根而不是工作空间：工作空间可能在远端，而"远端此刻可达吗"恰恰是
+  /// 重启时最不确定的事；数据根永远读得到。
+  String get hooksDir => p.join(root, 'hooks');
+
   /// 轮转后的历史日志份（[index] 从 1 开始；越大越旧）。
   String coreLogFileAt(int index) => p.join(logsDir, 'core.$index.log');
 
@@ -174,6 +182,7 @@ class TreePaths {
       agentsDir,
       sessionsDataDir,
       logsDir,
+      hooksDir,
     ]) {
       await Directory(dir).create(recursive: true);
     }
@@ -188,6 +197,7 @@ class TreePaths {
       agentsDir,
       sessionsDataDir,
       logsDir,
+      hooksDir,
     ]) {
       Directory(dir).createSync(recursive: true);
     }

@@ -39,6 +39,9 @@ class ToolRun {
     required this.command,
     required this.startedAt,
     required this.now,
+    this.watchdog = true,
+    this.crossCall = false,
+    this.closeHandler,
   });
 
   /// 命令摘要的字符上限（落进 warning / 广播 / `stuck_tools` 的那一份）。
@@ -68,6 +71,26 @@ class ToolRun {
   /// 毫秒时钟（由登记表注入：测试可以给假时钟，`elapsed_ms` 因此可确定性地断言）。
   final int Function() now;
 
+  /// 是否受**超阈值看护**（warning / 广播 / `over_threshold` 高亮）。
+  ///
+  /// `false` = 明知是长任务（terminal 的**后台 hook**）：它本来就要跑很久，按普通工具
+  /// 那样每 300s 报一次"卡住"、在右栏打「已超时」红标，都是噪声。此类运行仍会出现在
+  /// 「正在执行的 tool」里、也照样能被用户关闭 —— 只是不再被当"卡住"看护。
+  final bool watchdog;
+
+  /// 这条登记项是否**跨工具调用**存活（后台 hook：它的发起调用早已返回，任务还在跑）。
+  ///
+  /// 普通工具调用的登记项由 `WorkspaceToolRunner._execute` 在 finally 里收尾；这种
+  /// 登记项由任务自己（结束 / 取消 / 关停）收尾。
+  final bool crossCall;
+
+  /// **本运行专属**的关闭落点（优先于登记表的全局 `terminate`）。
+  ///
+  /// 为什么要它：后台 hook 任务没有"本机同步执行的进程句柄"，它的终止要走
+  /// `TerminalHooks.cancel`（本机杀进程树 / 远端尽力 kill）；用全局 `terminate`
+  /// 只会得到一句"未拿到本机进程句柄"。返回可读说明（成功与失败都如实）。
+  final Future<String> Function()? closeHandler;
+
   /// 超阈值 warning 是否已发（**每次运行只发一次**）。
   bool warned = false;
 
@@ -96,8 +119,10 @@ class ToolRun {
   int get elapsedSeconds => elapsedMs ~/ 1000;
 
   /// 是否已超过 [threshold]（REST / `stuck_tools` 的 `over_threshold` 口径）。
+  ///
+  /// [watchdog] 为 false 的运行**永不**判超时（长任务不是"卡住"）。
   bool overThreshold(Duration threshold) =>
-      elapsedMs >= threshold.inMilliseconds;
+      watchdog && elapsedMs >= threshold.inMilliseconds;
 
   /// **显式关闭请求**：完成后第一次工具调用的「收敛」路径生效（见
   /// [WorkspaceToolRunner] 的 `_execute`）——关闭 = 让这次调用交回控制权，
@@ -386,11 +411,18 @@ class ToolRunRegistry {
   ///
   /// 调用方**必须**在结束时 `finish(handle)`（工具层放在 `finally` 里）；登记项泄漏
   /// 会显示成一个假的"正在执行的工具"。
+  ///
+  /// [onClose] / [watchdog] / [crossCall] 见 [ToolRun] 上的同名字段：后台 hook 任务用
+  /// `watchdog: false`（长任务不该被判"卡住"）+ `crossCall: true`（跨调用存活）+
+  /// 专属 `onClose`（关闭路由到 `TerminalHooks.cancel`）。
   ToolRun start({
     required String tool,
     Map<String, dynamic>? arguments,
     required String agentId,
     required String sessionId,
+    Future<String> Function()? onClose,
+    bool watchdog = true,
+    bool crossCall = false,
   }) {
     _seq++;
     final int startedAt = _now();
@@ -402,10 +434,13 @@ class ToolRunRegistry {
       command: summarizeToolCommand(tool, arguments),
       startedAt: startedAt,
       now: _now,
+      watchdog: watchdog,
+      crossCall: crossCall,
+      closeHandler: onClose,
     );
     _runs[run.handle] = run;
     final Duration limit = threshold;
-    if (limit > Duration.zero) {
+    if (watchdog && limit > Duration.zero) {
       run.warnTimer = Timer(limit, () => _warnIfNeeded(run));
     }
     return run;
@@ -462,8 +497,16 @@ class ToolRunRegistry {
     if (run == null) return ToolCloseOutcome.missing(key);
     final int elapsed = run.elapsedMs;
     String note = '';
+    // ① 本运行专属的关闭落点优先（后台 hook 走这条：本机杀进程树 / 远端尽力 kill）。
+    final Future<String> Function()? own = run.closeHandler;
     final ToolRunTerminator? killer = terminate;
-    if (killer == null) {
+    if (own != null) {
+      try {
+        note = (await own()).trim();
+      } catch (error) {
+        note = '终止时异常：$error';
+      }
+    } else if (killer == null) {
       note = '未接线进程终止器：只从登记表移除了这次运行，命令可能仍在跑';
     } else {
       try {

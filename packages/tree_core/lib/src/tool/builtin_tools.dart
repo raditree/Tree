@@ -636,27 +636,20 @@ abstract final class BuiltinTools {
         );
       }
       if (hookAction == 'cancel') {
-        if (task.detached || task.remote != null) {
-          final String why = task.detached
-              ? '该任务是会话失联后转的后台任务，本机没有进程句柄，无法终止'
-                    '（远端进程可能仍在运行）。'
-              : '该任务是 SSH 软超时转的后台任务（远端命令仍在跑）：'
-                    '本机没有远端进程句柄，**无法终止它**。';
-          return ToolOutcome(
-            '$why\n${hooks.renderStatus(task)}',
-            isError: true,
-          );
+        if (!task.running) {
+          return ToolOutcome('该任务已结束。\n${await hooks.renderStatus(task)}');
         }
         final bool requested = await hooks.cancel(taskId);
+        final String status = await hooks.renderStatus(task);
         return ToolOutcome(
           requested
-              ? '已请求终止。\n${hooks.renderStatus(task)}'
-              : '该任务已结束。\n${hooks.renderStatus(task)}',
+              ? '已请求终止（本机杀进程树；远端尽力 kill，是否收干净请复查）。\n$status'
+              : '无法终止：${cancelRefusal(task)}\n$status',
           isError: !requested,
         );
       }
       if (hookAction == 'status') {
-        return ToolOutcome(hooks.renderStatus(task));
+        return ToolOutcome(await hooks.renderStatus(task));
       }
       return ToolOutcome(
         '未知 hook_action：$hookAction（可用：status / cancel）',

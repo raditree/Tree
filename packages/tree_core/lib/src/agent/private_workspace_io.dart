@@ -80,7 +80,8 @@ void migrateLegacySelfDir({
 ///
 /// 注意：**终端命令不经过这里**（`exec` 直接在根下跑 shell），所以提示词里要如实告诉模型
 /// 私有目录的真实路径。
-class PrivateWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
+class PrivateWorkspaceIO
+    implements WorkspaceIO, WorkspaceFiles, BackgroundExecHost {
   PrivateWorkspaceIO(this.inner, this.agentId);
 
   final WorkspaceIO inner;
@@ -181,6 +182,43 @@ class PrivateWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     int maxEntries = 2000,
     bool ignored = false,
   }) => inner.gitStatus(maxEntries: maxEntries, ignored: ignored);
+
+  // ── BackgroundExecHost（terminal 的 hook=true；本机与 SSH 后端都实现）──────────
+
+  /// 后台执行那一层接口（沿用 [_files] 的模式：内层不支持时显式报错，不静默假装）。
+  BackgroundExecHost get _background {
+    final WorkspaceIO target = inner;
+    if (target is BackgroundExecHost) return target as BackgroundExecHost;
+    throw WorkspaceIoException('该工作空间后端不支持后台执行（terminal 的 hook 模式）');
+  }
+
+  @override
+  Future<BackgroundExecHandle> startBackground({
+    required String command,
+    required String logRelativePath,
+  }) => _background.startBackground(
+    command: command,
+    logRelativePath: _map(logRelativePath),
+  );
+
+  @override
+  Future<BackgroundExecHandle> attachBackground({
+    required String command,
+    required String logRelativePath,
+    int? pid,
+  }) => _background.attachBackground(
+    command: command,
+    logRelativePath: _map(logRelativePath),
+    pid: pid,
+  );
+
+  @override
+  Future<void> appendLog(String relativePath, String text) =>
+      _background.appendLog(_map(relativePath), text);
+
+  @override
+  Future<String?> readTail(String relativePath, int maxChars) =>
+      _background.readTail(_map(relativePath), maxChars);
 
   @override
   Future<void> close() => inner.close();

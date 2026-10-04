@@ -68,7 +68,7 @@ void main() {
     expect(callbackTask?.id, task.id);
     expect(callbackCode, 0);
 
-    final String log = File(task.logAbsolute).readAsStringSync();
+    final String log = File(io.resolve(task.logRelative)).readAsStringSync();
     expect(log, contains('# [terminal hook] echo hook-output'));
     expect(log, contains('hook-output'));
     expect(log, contains('结束：退出码 0'));
@@ -93,7 +93,7 @@ void main() {
   test('status 渲染：运行中与已结束两种状态都带日志尾部', () async {
     final HookTask quick = await start('echo status-line');
     await waitFinished(quick);
-    final String finished = hooks.renderStatus(quick);
+    final String finished = await hooks.renderStatus(quick);
     expect(finished, contains('已结束'));
     expect(finished, contains('退出码 0'));
     expect(finished, contains('status-line'));
@@ -103,7 +103,7 @@ void main() {
       Platform.isWindows ? 'ping -n 10 127.0.0.1 | Out-Null' : 'sleep 5',
     );
     await Future<void>.delayed(const Duration(milliseconds: 300));
-    expect(hooks.renderStatus(slow), contains('运行中'));
+    expect(await hooks.renderStatus(slow), contains('运行中'));
   });
 
   test('cancel 杀整棵进程树：任务在超时前结束且标记 cancelled', () async {
@@ -116,7 +116,7 @@ void main() {
     await waitFinished(task);
     expect(task.cancelled, isTrue);
     expect(task.exitCode, isNot(0));
-    expect(hooks.renderStatus(task), contains('已被取消'));
+    expect(await hooks.renderStatus(task), contains('已被取消'));
     expect(await hooks.cancel(task.id), isFalse, reason: '已结束的任务不再可取消');
     expect(await hooks.cancel('nope'), isFalse);
   });
@@ -139,7 +139,7 @@ void main() {
   test('hookNotice 里带命令、退出码与日志路径', () async {
     final HookTask task = await start('echo notice-body');
     await waitFinished(task);
-    final String notice = hookNotice(task, 0);
+    final String notice = await hookNotice(task, 0);
     expect(notice, contains('[terminal hook]'));
     expect(notice, contains('echo notice-body'));
     expect(notice, contains('退出码 0'));

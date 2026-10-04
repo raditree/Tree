@@ -599,7 +599,7 @@ void main() {
       expect(hooks.tasks, hasLength(1));
       final HookTask task = hooks.tasks.single;
       expect(task.detached, isTrue);
-      expect(task.process, isNull, reason: '本机没有进程句柄，也就无从「杀进程」');
+      expect(task.handle, isNull, reason: '本机没有进程句柄，也就无从「杀进程」');
 
       final ToolOutcome status = await BuiltinTools.run(
         call('terminal', <String, dynamic>{

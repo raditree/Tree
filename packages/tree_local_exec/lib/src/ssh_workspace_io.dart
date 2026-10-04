@@ -5,9 +5,11 @@ import 'dart:typed_data';
 import 'package:path/path.dart' as p;
 
 import 'ansi_code_page.dart';
+import 'background_exec.dart';
 import 'git_output.dart';
 import 'local_workspace_io.dart';
 import 'ssh_liveness.dart';
+import 'ssh_login_shell.dart';
 import 'ssh_shell_channel.dart';
 import 'workspace_io.dart';
 
@@ -297,7 +299,7 @@ Future<String> resolveRemoteRoot(
 /// - **每次传输都过一遍活性守卫**（M9 1.1）：先查 [SshTransport.liveness]，在途
 ///   操作与"链路被判失活"的信号赛跑，成功则记一次心跳。因此远端半天不响应时
 ///   操作会以"心跳丢失"的显式错误结束，而不是永久挂起；正常链路上零行为变化。
-class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
+class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles, BackgroundExecHost {
   SshWorkspaceIO(this.root, this._transport);
 
   @override
@@ -971,6 +973,136 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     );
   }
 
+  // ── 后台执行（terminal 的 hook=true，远端分支）────────────────────────────
+  //
+  // 与本地实现同一套语义（见 background_exec.dart），差别都是远端固有的、且**如实**：
+  // - 命令在**远端**跑（`nohup`），日志是**远端**文件；
+  // - 退出码靠"包装子 shell 结束时把 $? 写进哨兵文件 + 本机按间隔轮询"取回；
+  // - 远端进程不归本机管：`cancel` 只能尽力（拿不到 pid 就返回 false），关停**不杀**
+  //   （关应用不该杀掉远端训练），由下次启动的 [attachBackground] 接续。
+
+  /// 退出码哨兵的工作空间相对路径：`<日志去扩展名>.exit`。
+  ///
+  /// 规则固定在这里：接续（[attachBackground]）用同一条规则重算，落盘台账因此只需记
+  /// 日志相对路径，不必另存哨兵路径。
+  String exitMarkerRelativePath(String logRelativePath) {
+    final String log = logRelativePath.trim();
+    final int slash = log.lastIndexOf('/');
+    final int dot = log.lastIndexOf('.');
+    final String base = dot > slash ? log.substring(0, dot) : log;
+    return '$base.exit';
+  }
+
+  @override
+  Future<BackgroundExecHandle> startBackground({
+    required String command,
+    required String logRelativePath,
+  }) async {
+    final String trimmed = command.trim();
+    if (trimmed.isEmpty) throw WorkspaceIoException('command 不能为空');
+    final String logAbsolute = resolve(logRelativePath);
+    final String markerAbsolute = resolve(
+      exitMarkerRelativePath(logRelativePath),
+    );
+    // 包装命令（整条再经 [SshTransport.run] 的登录外壳包装）：
+    //
+    //   mkdir -p <log 父目录> && cd <root> \
+    //     && { nohup sh -c '<cmd> ; printf %s $? > <marker>' \
+    //            > <log> 2>&1 < /dev/null ; } & echo $!
+    //
+    // - 三路重定向 + `< /dev/null` ⇒ SSH exec 通道能**立刻**收工（远端没有东西再写通道）；
+    // - `nohup` 让命令免疫会话结束时的 SIGHUP（关掉连接后照常跑完）；
+    // - `{ ... ; } &` 把整条链放到后台，`echo $!` 给出包装子 shell 的 pid；
+    // - 命令结束时由子 shell 把 `$?` 写进哨兵文件，本机因此能拿到退出码。
+    //
+    // 内层用 `sh -c`（POSIX）：远端不一定有 bash（登录外壳是**探测 + 回退**出来的，
+    // 见 ssh_login_shell.dart），所以这里只依赖 POSIX。代价如实记录：后台命令跑在
+    // `sh -c` 里，与同步执行的登录外壳（`bash -lc`）在 bash 专有语法上有差异。
+    final String shellCommand =
+        'mkdir -p ${_quote(p.posix.dirname(logAbsolute))} '
+        '&& cd ${_quote(root)} '
+        '&& { nohup sh -c '
+        '${posixSingleQuote('$trimmed ; printf %s \$? > ${posixSingleQuote(markerAbsolute)}')} '
+        '> ${_quote(logAbsolute)} 2>&1 < /dev/null ; } & echo \$!';
+    final SshExecResult started = await _runRaw(shellCommand);
+    final int? pid = _parsePid(started.stdout);
+    return _SshBackgroundExec(
+      host: this,
+      logAbsolute: logAbsolute,
+      markerAbsolute: markerAbsolute,
+      remotePid: pid,
+    );
+  }
+
+  @override
+  Future<BackgroundExecHandle> attachBackground({
+    required String command,
+    required String logRelativePath,
+    int? pid,
+  }) async {
+    // **不重跑、不新起**：远端那条命令照常在跑，这里只是重新挂上"等它结束"的那条路
+    // （哨兵轮询）。首次探测在 [BackgroundExecHandle.exitCode] 被取用时立刻发生，
+    // 因此"重启时它其实已经跑完"这种情况会马上收尾。
+    return _SshBackgroundExec(
+      host: this,
+      logAbsolute: resolve(logRelativePath),
+      markerAbsolute: resolve(exitMarkerRelativePath(logRelativePath)),
+      remotePid: pid,
+    );
+  }
+
+  @override
+  Future<void> appendLog(String relativePath, String text) async {
+    if (text.isEmpty) return;
+    try {
+      final String absolute = resolve(relativePath);
+      await _runRaw(
+        'mkdir -p ${_quote(p.posix.dirname(absolute))} '
+        '&& printf %s ${posixSingleQuote(text)} >> ${_quote(absolute)}',
+      );
+    } catch (_) {
+      // 约定：日志写不进去不抛（失败不该害死任务本身）。
+    }
+  }
+
+  @override
+  Future<String?> readTail(String relativePath, int maxChars) async {
+    try {
+      final String absolute = resolve(relativePath);
+      // 多读 1 字节以便判断"是否被截断"，然后在 Dart 侧裁到 maxChars。
+      final SshExecResult result = await _runRaw(
+        'tail -c ${maxChars + 1} ${_quote(absolute)} 2>/dev/null',
+      );
+      if (result.exitCode != 0) return null;
+      final String text = result.stdout;
+      if (text.isEmpty) return null;
+      return text.length <= maxChars
+          ? text
+          : text.substring(text.length - maxChars);
+    } catch (_) {
+      // 读不到就返回 null（调用方据此不显示日志尾部），不抛。
+      return null;
+    }
+  }
+
+  /// 后台任务用的一条远端命令（轮询 / kill / 日志读写都走它）；过活性守卫。
+  Future<SshExecResult> _runRaw(String command) =>
+      _link.guard(() => _transport.run(command, timeout: Duration.zero));
+
+  /// 从 `echo $!` 的输出里取 pid（远端 profile 可能往 stdout 打欢迎语，取最后一行数字）。
+  static int? _parsePid(String stdout) {
+    final List<String> lines = stdout
+        .split('\n')
+        .map((String line) => line.trim())
+        .where((String line) => line.isNotEmpty)
+        .toList();
+    for (final String line in lines.reversed) {
+      final int? value = int.tryParse(line);
+      if (value != null && value > 0) return value;
+    }
+    return null;
+  }
+
   @override
   Future<void> close() => _transport.close();
 
@@ -1063,5 +1195,151 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
     final int tail = maxBytes - head;
     return '${text.substring(0, head)}\n…（输出过长已截断）…\n'
         '${text.substring(text.length - tail)}';
+  }
+}
+
+/// 一条**仍在远端跑**的后台命令句柄（[SshWorkspaceIO.startBackground] /
+/// [SshWorkspaceIO.attachBackground] 的返回值）。
+///
+/// 为什么是轮询而不是"进程句柄"：远端 exec 是一次性回包，SSH 通道上没有 `Process`
+/// 这种东西。所以包装命令在**结束时**把 `$?` 写进哨兵文件，这里按
+/// [_SshBackgroundExec.pollInterval] 轮询一条远端命令把它读回来。
+///
+/// 轮询同时判 pid（`kill -0`）：进程已消失但哨兵缺失（被 `kill -9`、机器重启等）⇒
+/// 给可辨退出码 [BackgroundExecHandle.goneExitCode]，**不假装是正常退出**。
+/// 链路判失活时 [exitCode] 以显式错误结束（同 `RunningSshExec` 的口径）。
+class _SshBackgroundExec implements BackgroundExecHandle {
+  _SshBackgroundExec({
+    required this.host,
+    required this.logAbsolute,
+    required this.markerAbsolute,
+    required this.remotePid,
+  });
+
+  /// 轮询间隔：结束唤醒的最坏延迟就是它。
+  static const Duration pollInterval = Duration(seconds: 3);
+
+  static const String _runningToken = '__TREE_RUNNING__';
+  static const String _goneToken = '__TREE_GONE__';
+
+  /// 提供远端执行与本工作空间根的宿主（轮询 / kill / 日志读写都经它）。
+  final SshWorkspaceIO host;
+
+  /// 远端日志 / 哨兵的绝对路径。
+  final String logAbsolute;
+  final String markerAbsolute;
+
+  /// 包装子 shell 的远端 pid（拿不到时为 null ⇒ 只按哨兵判结束、cancel 如实失败）。
+  final int? remotePid;
+
+  final Completer<int> _exit = Completer<int>();
+  Timer? _poll;
+  bool _closed = false;
+
+  @override
+  int? get pid => remotePid;
+
+  @override
+  bool get remote => true;
+
+  @override
+  Future<int> get exitCode {
+    _startPolling();
+    return _exit.future;
+  }
+
+  @override
+  Future<bool> cancel() async {
+    final int? target = remotePid;
+    // 没有 pid ⇒ **如实**说杀不掉（远端进程不归本机管，别假装成功）。
+    if (target == null) return false;
+    try {
+      // 先按**进程组**（远端命令常有自己的子进程），再退回单进程——都是尽力而为。
+      // 返回 true 只表示"终止信号确实发出去了"，不代表远端一定收干净。
+      final SshExecResult result = await host._runRaw(
+        'kill -TERM -$target 2>/dev/null; kill -TERM $target 2>/dev/null; '
+        'echo done',
+      );
+      return result.exitCode == 0 && result.stdout.contains('done');
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  Future<void> close() async {
+    // 远端**不杀**：关掉桌面应用不该杀掉远端正在跑的训练/构建。只停本机轮询，
+    // 远端任务由下次启动的接续逻辑接管。
+    _closed = true;
+    _poll?.cancel();
+    _poll = null;
+  }
+
+  void _startPolling() {
+    if (_poll != null || _closed || _exit.isCompleted) return;
+    // 立刻查一次：接续场景下"重启时其实已经跑完"要马上收尾，不等第一个间隔。
+    unawaited(_probe());
+    _poll = Timer.periodic(pollInterval, (Timer _) => unawaited(_probe()));
+  }
+
+  String _probeCommand() {
+    final String marker = markerAbsolute.replaceAll("'", "'\\''");
+    final int? target = remotePid;
+    if (target == null) {
+      // 没有 pid：只能看哨兵；没有哨兵就当"仍在跑"（不猜）。
+      return "if [ -f '$marker' ]; then cat '$marker'; "
+          'else echo $_runningToken; fi';
+    }
+    return "if [ -f '$marker' ]; then cat '$marker'; "
+        'elif kill -0 $target 2>/dev/null; then echo $_runningToken; '
+        'else echo $_goneToken; fi';
+  }
+
+  Future<void> _probe() async {
+    if (_exit.isCompleted || _closed) return;
+    try {
+      final SshExecResult result = await host._runRaw(_probeCommand());
+      if (_exit.isCompleted || _closed) return;
+      final String out = result.stdout.trim();
+      if (out.contains(_runningToken)) return;
+      if (out.contains(_goneToken)) {
+        _finish(BackgroundExecHandle.goneExitCode);
+        return;
+      }
+      final int? code = _lastInt(out);
+      if (code != null) {
+        _finish(code);
+        return;
+      }
+      // 输出不是预期形状（远端 shell 噪声）：继续轮询，**不猜**。
+    } catch (error) {
+      // 链路判失活等：以显式错误结束（调用方据此记 remoteFailureExitCode 并如实标注）。
+      _fail(error);
+    }
+  }
+
+  void _finish(int code) {
+    _poll?.cancel();
+    _poll = null;
+    if (!_exit.isCompleted) _exit.complete(code);
+  }
+
+  void _fail(Object error) {
+    _poll?.cancel();
+    _poll = null;
+    if (!_exit.isCompleted) {
+      _exit.completeError(
+        error is Exception ? error : WorkspaceIoException('$error'),
+      );
+    }
+  }
+
+  /// 取最后一行可解析为整数的文本（远端 profile 可能往 stdout 打欢迎语）。
+  static int? _lastInt(String text) {
+    for (final String line in text.split('\n').reversed) {
+      final int? value = int.tryParse(line.trim());
+      if (value != null) return value;
+    }
+    return null;
   }
 }

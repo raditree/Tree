@@ -8,6 +8,7 @@
 | 文件 | 内容 |
 | --- | --- |
 | [lib/src/workspace_io.dart](lib/src/workspace_io.dart) | 接口：`WorkspaceIO`（read/write/edit/grep/list/exec/git）、`WorkspaceFiles`（文件面板：列目录 / 原始字节 / 流）、结果类型与路径异常 |
+| [lib/src/background_exec.dart](lib/src/background_exec.dart) | 「**后台执行**」原语（terminal 的 `hook=true`）：`BackgroundExecHost`（起后台命令 / 追加写日志 / 读日志尾部 / 重启后接管）+ `BackgroundExecHandle`。本机与远端**同一套语义**，能力差异（杀不杀得掉、能不能接续）在实现里如实区分 |
 | [lib/src/local_workspace_io.dart](lib/src/local_workspace_io.dart) | 本机实现：进程树终止、非 UTF-8 输出标记（GBK 代码页尝试解码）、软超时交还活着的进程（`RunningLocalExec`） |
 | [lib/src/ssh_workspace_io.dart](lib/src/ssh_workspace_io.dart) | SSH 实现：SFTP + exec，心跳判活，链路失活显式失败；**软超时交还仍在运行的远端命令**（`RunningSshExec`）；文件面板的结构改动（mkdir / rename / remove）也在这一层，**全部走 SFTP**；另含交互终端的透传口 `openShell`（远端根在这一层解决） |
 | [lib/src/git_output.dart](lib/src/git_output.dart) | git 的命令与输出解析（log / branch / **status**）：本地与 SSH **共用一份**，命令形状与解析规则不可能漂移 |
@@ -90,6 +91,20 @@
     命令一律 **POSIX 单引号转义**（`'` → `'\''`，`$` / 反引号 / 换行都当字面量）。
     远端**交互终端**（`openShell`）本来就是登录 shell，不受影响。`resolveRemoteRoot` 因此改用
     **带标记**的 `printf __TREE_HOME__%s "$HOME"`：profile 往 stdout 打欢迎语也照样取得准。
+16. **「后台执行」是一等原语，两端同一套语义、能力差异如实**（[lib/src/background_exec.dart](lib/src/background_exec.dart)，
+    **用户要求 2026-10-04**：「`hook=true` 那条路看不到我远端工作空间的文件……你应该修好它」）：
+    - `BackgroundExecHost.startBackground` 起后台命令、`appendLog` 追加写、`readTail` 读尾部、
+      `attachBackground` **重新接管**（**不重跑、不新起**）；
+    - **本机**：脚本文件 + shell 重定向直写日志（`>>` + `2>&1`），进程句柄在手 ⇒ 退出码实时、
+      `cancel` 杀整棵进程树、关停杀树；
+    - **远端（SSH）**：`mkdir -p` + `cd <root>` + `{ nohup sh -c '<cmd> ; printf %s $? > <哨兵>' > <日志> 2>&1 < /dev/null ; } & echo $!`
+      ⇒ 命令起在**远端**、日志落**远端工作空间**、退出码写进**哨兵文件**（本机按 **3s** 轮询：
+      `if [ -f 哨兵 ]; then cat 哨兵; elif kill -0 <pid>; then RUNNING; else GONE; fi`）；
+      远端进程**不归本机管**：`cancel` 尽力（拿不到 pid ⇒ 返回 false，**不假装**）、**关停不杀**
+      （关应用不该杀掉远端训练）；进程消失但没留哨兵 ⇒ [BackgroundExecHandle.goneExitCode]（可辨，不当正常退出）；
+      链路判失活 ⇒ `exitCode` 以 `SshLinkStaleException` 结束；
+    - 内层命令只依赖 **POSIX**（`sh -c`）：远端不一定有 bash（登录外壳是探测 + 回退出来的），
+      代价是"后台命令跑在 `sh -c` 里、与同步执行的登录外壳（`bash -lc`）在 bash 专有语法上有差异"（如实记录）。
 
 ## 测试
 
@@ -107,6 +122,8 @@ M11 新增钉子：`git_output_test` 的 `parseStatus` 组（`-z`、空格 / 中
 （新建 / 重命名 / 删除的结果码与真实行为）；`git` 组里的 `gitStatus` 用例（真仓库 M/U/A/D + 非仓库空态）。
 
 回归钉子：`exec_no_interactive_hang_test`（裸 `echo` 不再等输入）、`exec_soft_timeout_test`（本地软超时交还进程）、
+`background_exec_test`（**后台执行原语**：本机起/写日志/读尾部/杀树/越界拒绝；远端用假 transport 钉
+`nohup` 命令形状、哨兵轮询（含 `GONE`）、`attachBackground` **不重跑命令**、`cancel` 拿不到 pid 时如实 false）、
 `ssh_exec_soft_timeout_test`（**SSH 软超时**：到点交出仍在运行的远端命令、`0`/缺省 = 永不、到点后心跳仍判活）、
 `shell_translate_test`（裸 echo / 逻辑运算符翻译）、`windows_environment_test`（**按登录口径重建**：`reg query`
 输出解析、`Path` 机器级+用户级、用户级覆盖、注册表缺项时保留继承值、`%VAR%` 展开与变量环、任一步失败整体退回）、

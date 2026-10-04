@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:path/path.dart' as p;
 
 import 'ansi_code_page.dart';
+import 'background_exec.dart';
 import 'git_output.dart';
 import 'shell.dart';
 import 'windows_environment.dart';
@@ -94,6 +95,41 @@ class RunningLocalExec {
   }
 }
 
+/// 本机后台命令句柄（[BackgroundExecHost.startBackground] 的返回值）。
+///
+/// 进程句柄就在本机：退出码实时、`cancel` 杀得掉整棵进程树。日志由 shell 重定向直写
+/// 文件（不经过本类），因此核心进程重启/退出都不会丢输出。
+class _LocalBackgroundExec implements BackgroundExecHandle {
+  _LocalBackgroundExec({required this.process});
+
+  final Process process;
+  bool _closed = false;
+
+  @override
+  int? get pid => process.pid;
+
+  @override
+  bool get remote => false;
+
+  @override
+  Future<int> get exitCode => process.exitCode;
+
+  @override
+  Future<bool> cancel() async {
+    // 只杀 shell 会留下真正干活的后台进程：走 taskkill /T 那套整树终止。
+    await Shell.killProcessTree(process.pid);
+    return true;
+  }
+
+  @override
+  Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
+    // 本机后台进程不该随应用退出变成孤儿。
+    await Shell.killProcessTree(process.pid);
+  }
+}
+
 /// [WorkspaceIO] 的**本地**实现（`dart:io`）。
 ///
 /// Windows 上踩过的坑（M0b 迁移清单要求原样保留）：
@@ -108,7 +144,7 @@ class RunningLocalExec {
 /// 路径安全：一切工具参数都是工作空间相对路径，[resolve] 拒绝绝对路径/盘符/UNC
 /// 以及 `..` 越界。注意符号链接可以绕过（本机单用户场景接受该风险，已在文档中
 /// 记录；真要防需要 O_NOFOLLOW 级别的处理，Dart 标准库不提供）。
-class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
+class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles, BackgroundExecHost {
   LocalWorkspaceIO(this.root, {this.maxReadBytes = 512 * 1024, this.log});
 
   /// 可选日志（例如"按登录口径重建环境失败、退回继承"这类回退原因）。
@@ -621,6 +657,122 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles {
       // 解不开（latin1 保字节兜底）时才是真乱码，由 garbledOutput 如实区分。
       nonUtf8Output: !outDecoded.isUtf8 || !errDecoded.isUtf8,
       garbledOutput: outDecoded.isGarbled || errDecoded.isGarbled,
+    );
+  }
+
+  // ── 后台执行（terminal 的 hook=true；2026-10-04 从 tree_core 的 TerminalHooks 下沉）──
+
+  @override
+  Future<BackgroundExecHandle> startBackground({
+    required String command,
+    required String logRelativePath,
+  }) async {
+    final String trimmed = command.trim();
+    if (trimmed.isEmpty) throw WorkspaceIoException('command 不能为空');
+    final String absolute = resolve(logRelativePath);
+    final DateTime startedAt = DateTime.now();
+    final File logFile = File(absolute);
+    await logFile.parent.create(recursive: true);
+    await logFile.writeAsString(
+      '# [terminal hook] $trimmed\n'
+      '# started ${startedAt.toIso8601String()}  (cwd=$root)\n\n',
+      flush: true,
+    );
+    // **用脚本文件而不是把命令塞进 Process.start 的参数**：Windows 下 Dart 按 C 运行时
+    // 规则转义参数里的引号（\"），而 shell 的引号规则不同，带引号的命令（例如重定向路径）
+    // 会被解析坏——实测表现为命令立刻以退出码 1 失败。写成脚本由 shell 自己解析，顺带把
+    // 「到底跑了什么」留在磁盘上可复查。
+    final String scriptPath = _backgroundScriptPath(absolute);
+    // 脚本 shell 与同步执行**必须一致**（见 Shell.scriptFor）：否则同一条命令前台能跑、
+    // 后台报「不是内部或外部命令」。
+    final String script = Shell.scriptFor(
+      '$trimmed${Shell.redirectTo(absolute)}',
+    );
+    await File(scriptPath).writeAsString(script, flush: true);
+
+    // Windows 上并发创建进程偶发失败（"拒绝访问"），重试一次即可稳定；这是进程创建的
+    // 瞬时失败，不是命令本身的问题，因此不当作工具错误上报。
+    Process process;
+    try {
+      process = await _spawnBackgroundScript(scriptPath);
+    } on ProcessException {
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      process = await _spawnBackgroundScript(scriptPath);
+    }
+    // 同 exec：stdin 也立刻关掉——后台任务不该跟用户要输入，而"等输入"的命令在没有静态
+    // 超时的前提下会一直挂着。输出已由 shell 重定向进文件，这里的管道只用于防止写阻塞。
+    unawaited(process.stdin.close());
+    unawaited(process.stdout.drain<void>());
+    unawaited(process.stderr.drain<void>());
+    return _LocalBackgroundExec(process: process);
+  }
+
+  @override
+  Future<BackgroundExecHandle> attachBackground({
+    required String command,
+    required String logRelativePath,
+    int? pid,
+  }) async {
+    // 本机进程随应用退出而终止（见 TerminalHooks.close），因此本机**没有**可接续的后台
+    // 任务；落盘台账也只记远端任务。这里显式拒绝，不假装能接管。
+    throw UnsupportedError(
+      '本机后台任务不跨核心重启接续（进程已随应用退出终止）：$logRelativePath',
+    );
+  }
+
+  @override
+  Future<void> appendLog(String relativePath, String text) async {
+    if (text.isEmpty) return;
+    try {
+      final File file = File(resolve(relativePath));
+      await file.parent.create(recursive: true);
+      await file.writeAsString(text, mode: FileMode.append, flush: true);
+    } catch (error) {
+      // 日志写不进去不该害死任务本身（调用方只记日志）
+      log?.call('写后台任务日志失败（$relativePath）：$error');
+    }
+  }
+
+  @override
+  Future<String?> readTail(String relativePath, int maxChars) async {
+    try {
+      final File file = File(resolve(relativePath));
+      if (!await file.exists()) return null;
+      // 日志是 shell 重定向写出来的：多数是 UTF-8（PowerShell 已把输出编码钉成 UTF-8），
+      // 也可能是系统代码页，还可能被截断在多字节字符中间——readAsString 的严格 UTF-8
+      // 遇到非法字节会**直接抛异常**，把 status 查询整条路打挂。这里走统一解码链 +
+      // 容错顶替，永远给得出文本。
+      final String text = PlatformTextDecoder.decodeTolerant(
+        await file.readAsBytes(),
+      ).text;
+      if (text.length <= maxChars) return text;
+      return text.substring(text.length - maxChars);
+    } catch (error) {
+      log?.call('读后台任务日志失败（$relativePath）：$error');
+      return null;
+    }
+  }
+
+  /// 后台脚本路径：把日志名的扩展名换成当前 shell 的脚本扩展名
+  /// （`.log` → `.ps1` / `.cmd` / `.sh`，见 [Shell.scriptExtension]）。
+  static String _backgroundScriptPath(String logAbsolute) {
+    final int dot = logAbsolute.lastIndexOf('.');
+    final int slash = logAbsolute.lastIndexOf(Platform.pathSeparator);
+    final String base = dot > slash
+        ? logAbsolute.substring(0, dot)
+        : logAbsolute;
+    return '$base${Shell.scriptExtension}';
+  }
+
+  Future<Process> _spawnBackgroundScript(String scriptPath) async {
+    // 与同步执行同一个 shell、同一份**按登录口径重建**的环境（见 windows_environment.dart）：
+    // 前台 exec 与后台 hook 必须同口径，否则同一条命令前后台看到的工具不一样。
+    return Process.start(
+      Shell.executable,
+      Shell.argsForScript(scriptPath),
+      workingDirectory: root,
+      runInShell: false,
+      environment: await cachedLoginEnvironment(log: log),
     );
   }
 

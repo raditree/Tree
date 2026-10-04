@@ -259,6 +259,12 @@ Future<void> main(List<String> args) async {
     subagentService: subagentService,
     mcpService: mcp,
     pluginBus: plugins,
+    // **远端后台任务的落盘台账**（`<数据根>/hooks`）：核心/应用重启后据此接续
+    // （见启动末尾的 `restorePending`），完成提示投递回原会话。
+    hookLedger: HookLedger(
+      paths.hooksDir,
+      log: coreLog.forPrefix('core:tool'),
+    ),
     // 成员跟随团队 TOP 的 SSH：自己没有 ssh 配置时用 TOP 那份（同一台远端主机、同一个根）。
     resolveSshConfig: (String agentId) {
       final CoreAgent? agent = store.agent(agentId);
@@ -540,6 +546,20 @@ Future<void> main(List<String> args) async {
       ),
     );
   };
+  // **远端后台任务接续**（用户 2026-10-04）：把落盘台账里仍未完成的远端后台命令重新
+  // 挂上——**不重跑、不新起**。若它在"应用没在运行"这段时间里已经跑完，这里会立刻
+  // 收尾并把完成提示走上面那条 `tools.onHookFinished → conversation.wake` 投递回
+  // **原会话**；agent / 会话已不存在则由 `restorePending` 如实记日志（不假装投递成功）。
+  unawaited(
+    tools.hooks
+        .restorePending(ioFor: tools.ioFor)
+        .then((int count) {
+          if (count > 0) bootLog('已接续 $count 个远端后台任务');
+        })
+        .catchError((Object error) {
+          coreLog.forPrefix('core:tool')('接续远端后台任务失败：$error');
+        }),
+  );
   // 临时员工的"跑一轮"落点：会话服务（它才有引擎、会话与流式下行）
   subagentService.runner = server.conversation.runSubagent;
 

@@ -238,11 +238,11 @@ class ExecuteStationMounts {
     final TerminalHooks? existing = _ownHooks;
     if (existing != null) return existing;
     final TerminalHooks created = TerminalHooks(log: log);
-    created.onFinished = (HookTask task, int exitCode) => onHookFinished?.call(
-      task.agentId,
-      task.sessionId,
-      hookNotice(task, exitCode),
-    );
+    // `hookNotice` 是异步的（日志尾部可能要读**远端**）：先取提示文本再回调。
+    created.onFinished = (HookTask task, int exitCode) async {
+      final String notice = await hookNotice(task, exitCode);
+      onHookFinished?.call(task.agentId, task.sessionId, notice);
+    };
     _ownHooks = created;
     return created;
   }

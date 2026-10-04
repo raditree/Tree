@@ -1320,3 +1320,39 @@ void TextInputModel::AddText(const std::u16string& text) {
 
 **遗留**：cmd 这类"自己不重画提示符"的 shell 上，清屏后提示符要等下一次输出才回来（本地清屏是确定的，
 提示符是否立刻回来取决于 shell 自己）——如实记录，不做"替 shell 补画提示符"这种越界的事。
+
+## #22 SSH 下 `terminal hook=true` 把**远端路径当本机路径用**（现场报 `No such file`）
+
+**现象**（SSH 端 agent 2026-10-04 现场）：「`hook=true` 那条路看不到我远端工作空间的文件——对确实存在的
+脚本报 `No such file`，**不可用于监视远端训练**；只有『同步命令 + 小 `timeout_seconds`』能用。」
+
+**根因**：后台任务的启动实现（`TerminalHooks.start`）**只知道本机**：`io.resolve('.output/hook_x.log')` 在
+SSH 下返回的是**远端绝对路径**（`/home/u/proj/.output/…`），而它拿这个路径去 `dart:io` 的
+`File(...).parent.create()` / `File(scriptPath).writeAsString()`（写到了**本机**盘符根下），再把同一个远端
+路径当 `Process.start(workingDirectory:)` 的工作目录起**本机**进程 ⇒ 目录不存在，直接 `No such file`。
+即便侥幸建出来，跑的也是本机进程，不是远端那条命令。同一条缺陷还波及 `adoptRemote` / `adoptDetached`
+（SSH 软超时 / 失联转后台）：它们的日志写入与 `renderStatus` 的尾部读取也都走 `dart:io`，远端日志读不到。
+
+**证据**：`packages/tree_core/lib/src/tool/terminal_hooks.dart` 的 `start`（旧实现用 `File` + `Process.start`）；
+`packages/tree_local_exec/lib/src/ssh_workspace_io.dart` 的 `resolve`（POSIX 拼接、返回远端绝对路径）；
+`WorkspaceIO` / `SshTransport` 当时都**没有**"起了不等"的原语。
+
+**修复**（2026-10-04）：
+- `tree_local_exec` 新增并列原语 `BackgroundExecHost`（`background_exec.dart`）：本机 = 脚本 + 重定向直写日志；
+  远端 = `nohup` 起在远端 + 日志落**远端工作空间** + 退出码写**哨兵文件**（本机 3s 轮询，含 `GONE` 可辨退出码）；
+- `TerminalHooks` 退化为"纯台账"（执行/日志全走 io），并新增**落盘台账**（`<数据根>/hooks`）+ 重启**接续**
+  （启动即探哨兵，已结束就**投递回原会话**，未结束就重挂轮询；agent/会话不存在如实记日志）；
+- 后台 hook 登记进运行中工具表（`watchdog:false` / `crossCall:true`）：右栏「正在执行的 tool」**看得见、用户关得掉**；
+- 顺带修好 `adoptRemote` / `adoptDetached` 的同源日志缺陷。
+
+**验证**：`packages/tree_local_exec/test/background_exec_test.dart`（本机真起真杀；远端用假 transport 钉命令形状、
+哨兵轮询、`GONE`、`attachBackground` 不重跑、`cancel` 如实）、
+`packages/tree_core/test/terminal_hooks_ssh_test.dart`（唤醒 / 面板关闭路由 / 接续投递回原会话 / 工作空间不可用如实上报）、
+`hook_ledger_test.dart`（原子写与损坏容错）；既有 4 个本机 hook 测试全绿（零回归）。
+
+**状态**：已修复（2026-10-04）。
+
+**遗留（如实）**：**真 SSH 链路未端到端验证**——本机没有可连的 sshd，只保证命令形状、协议与恢复逻辑在
+假 transport 下正确；`nohup` / `tail` / `kill` 在真实远端主机上的行为需在真机上复核。另外远端 `cancel`
+是**尽力而为**（`kill -TERM` 进程组 + 单进程；拿不到 pid 时如实返回 false），且远端 pid 可能被复用 ⇒
+`GONE` 判定以**哨兵文件**为主判据。

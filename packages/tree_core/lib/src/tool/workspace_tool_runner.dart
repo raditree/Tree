@@ -14,6 +14,7 @@ import '../spec/spec_service.dart';
 import '../team/message_dispatcher.dart';
 import '../team/team_service.dart';
 import 'builtin_tools.dart';
+import 'hook_ledger.dart';
 import 'mcp_tool.dart';
 import 'message_tool.dart';
 import 'plugin_tool.dart';
@@ -54,15 +55,28 @@ class WorkspaceToolRunner implements ToolRunner {
     this.mcpService,
     this.pluginBus,
     ToolRunRegistry? toolRuns,
+    this.hookLedger,
     WorkspaceIO Function(String dir)? ioFactory,
     this.log,
   }) : _ioFactory = ioFactory ?? LocalWorkspaceIO.new,
        // 默认 = 进程级唯一那一份（REST 快照 / `query_status.stuck_tools` / 执行站
        // `tool.close` 都读同一份真值）；测试显式注入自己的实例与阈值。
        toolRuns = toolRuns ?? ToolRunRegistry.instance {
-    hooks = TerminalHooks(log: log);
+    hooks = TerminalHooks(
+      log: log,
+      // 远端后台任务的落盘台账（CLI 注入 `<data_root>/hooks`）：核心/应用重启后
+      // 由 `TerminalHooks.restorePending` 接续，完成提示投递回原会话。
+      ledger: hookLedger,
+      // 后台 hook 登记进「正在执行的 tool」：右栏因此看得见、用户关得掉。
+      toolRuns: toolRuns,
+      // 临时员工起的 hook 归到**会话主人**（与 `.self` 分栏同一口径）。
+      ownerOf: subagentService?.privateOwnerOf,
+    );
     hooks.onFinished = _finished;
   }
+
+  /// 后台任务台账（terminal hook 的落盘；null = 不落盘，测试友好）。
+  final HookLedger? hookLedger;
 
   /// 后台长任务管理器（terminal 的 hook 模式）。
   late final TerminalHooks hooks;
@@ -72,7 +86,7 @@ class WorkspaceToolRunner implements ToolRunner {
   /// [subagent] 非空 = 这次完成属于一个**临时员工**（后台 subagent）：回调方要把
   /// `subagent_id/name/level` 一并带进注入会话的那条消息（前端据此分组）。终端 hook
   /// 的完成通知不带它（null）——两条路共用同一个回调，不新增第二条唤醒通道。
-  void Function(
+  FutureOr<void> Function(
     String agentId,
     String sessionId,
     String notice, {
@@ -582,8 +596,8 @@ class WorkspaceToolRunner implements ToolRunner {
     _ios.clear();
   }
 
-  void _finished(HookTask task, int exitCode) {
-    final void Function(
+  Future<void> _finished(HookTask task, int exitCode) async {
+    final FutureOr<void> Function(
       String,
       String,
       String, {
@@ -597,12 +611,9 @@ class WorkspaceToolRunner implements ToolRunner {
     // `wake` 用 `sub_…` 取会话取到 null 直接 return：不落库、不唤醒、父白等
     // （用户 2026-10-03 现场）。
     final SubagentTag? tag = subagentService?.tagOf(task.agentId);
-    callback(
-      task.agentId,
-      task.sessionId,
-      hookNotice(task, exitCode),
-      subagent: tag,
-    );
+    // `hookNotice` 异步：日志尾部可能要从**远端**读（io.readTail 走 SFTP）。
+    final String notice = await hookNotice(task, exitCode);
+    await callback(task.agentId, task.sessionId, notice, subagent: tag);
   }
 
   /// 供核心层（Spec 索引、待办读取等）复用同一份工作空间缓存：

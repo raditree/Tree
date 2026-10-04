@@ -43,8 +43,8 @@ void main() {
 
   test('本地命令软超时 ⇒ 转后台：进程保留、可取消、结束回调唤醒', () async {
     final Completer<String> woken = Completer<String>();
-    hooks.onFinished = (HookTask task, int code) {
-      if (!woken.isCompleted) woken.complete(hookNotice(task, code));
+    hooks.onFinished = (HookTask task, int code) async {
+      if (!woken.isCompleted) woken.complete(await hookNotice(task, code));
     };
     final ToolOutcome outcome = await BuiltinTools.run(
       call(<String, dynamic>{
@@ -61,7 +61,7 @@ void main() {
 
     final HookTask task = hooks.tasks.single;
     expect(task.detached, isFalse, reason: '本机进程有句柄：不是"失联转来的"');
-    expect(task.process, isNotNull);
+    expect(task.handle, isNotNull);
     expect(task.running, isTrue);
 
     // 取消（杀整棵进程树）→ 结束回调唤醒 agent
@@ -71,7 +71,7 @@ void main() {
     );
     expect(notice, contains('[terminal hook] 后台命令已结束'));
     expect(task.exitCode, isNot(0));
-    final String log = File(task.logAbsolute).readAsStringSync();
+    final String log = File(io.resolve(task.logRelative)).readAsStringSync();
     expect(log, contains('转后台'));
     expect(log, contains('（完整输出）'));
     expect(log, contains('结束：退出码'));

@@ -169,6 +169,6 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 20));
     }
     expect(task.running, isFalse, reason: 'echo 很快结束');
-    expect(tools.hooks.renderStatus(task), contains('hook-ok'));
+    expect(await tools.hooks.renderStatus(task), contains('hook-ok'));
   });
 }
