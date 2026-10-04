@@ -32,6 +32,24 @@
   会话、消息滚动位置、输入框草稿都还在，且折叠时中栏内容仍按"折叠前的宽度"（**不低于 360**）布局，
   否则消息流会在 40px 宽的视口里重排、滚动位置被夹回去。
 
+- **消息窗口半径 200 → 51**（修改 [lib/README.md](lib/README.md) 不变量 19 ⑤、
+  [ui/services/message_window.dart](lib/ui/services/message_window.dart) 的 `kMessageWindowRadius`、
+  [ui/widgets/message_panel.dart](lib/ui/widgets/message_panel.dart) 的 `_historyPageSize` / `_cacheMargin`，
+  **用户要求 2026-10-04**：「现在中间页懒加载 +-200 条消息，有点卡，改 +-50 条」）：
+  页大小 / 视口外多留 / 末尾常驻**三个口径收敛成同一个数**（补页量 > 保留半径会让"刚补回的一页
+  立刻被淘汰、滑一点又重补"，同一段内容被网络与布局各空转两遍）；半径变小 ⇒ 每帧要维护的
+  已加载槽位更少（懒构建列表的估算与"像素 ↔ 下标"换算的误差来源都跟着变少），代价是往回滑
+  更早触发补页。取 **51** 是刻意的怪数（50 在这个仓库里到处都是），好让"窗口半径"被一次 grep 认出来。
+- **中栏空态的欢迎标识换成主题色字标**（新增 [lib/README.md](lib/README.md) 不变量 26、
+  [ui/widgets/welcome_mark.dart](lib/ui/widgets/welcome_mark.dart)、
+  [ui/widgets/message_list.dart](lib/ui/widgets/message_list.dart)，
+  **用户要求 2026-10-04**：「中间页的 hello 标识有点 out-of-date 且与本应用主题色不合」）：
+  `TREE` 大写宽字距 w800 + **主色渐变** + **HUD 三段线**（中段更粗更亮、两侧短段带缺口，
+  呼应应用图标那圈断口弧）+「你好，欢迎使用」；纯样式实现（`TextStyle`/`ShaderMask`/`Container`），
+  **不加资源、不动 pubspec**，深浅主题各自成套。原来的 `👋` 不再出现——它是平台彩色字体
+  （Windows 上是黄色），染不上主题色。「什么时候显示空态」的口径（只在确实加载完且真的没有
+  消息时，加载中渲染骨架）**一个字没改**。
+
 ## [1.0.2+2] — 2026-10-04
 
 ### 断言变化（新增 / 修改的 README 不变量）

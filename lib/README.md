@@ -342,8 +342,12 @@
     **缺口在视口顶切开**（`splitGapAtViewportTop`：先补"视口及以下"，再补"整段在视口上方"那份）：
     横跨视口的缺口若整段补下来，视口上方由占位变实会长高、把用户正在读的一段整体推下去；
     补页 + 淘汰**同一时刻只跑一趟**（反复触发只覆盖"最新坐标"，一趟内的请求串行），视口附近已加载好时
-    第一道 `gapsFor` 就是空 ⇒ 滚动零网络、零 `setState`；淘汰离视口超过 **200** 条的槽位
-    （"仅缓存坐标附近的历史，其余均丢弃"）——**正在流式 / 正在跑工具的消息永不被淘汰**，末尾 200 条常驻；
+    第一道 `gapsFor` 就是空 ⇒ 滚动零网络、零 `setState`；**窗口半径 = 51 条**（`kMessageWindowRadius`：
+    页大小 / 视口外多留 / 末尾常驻**三个口径同一个数**，见 [ui/services/message_window.dart](ui/services/message_window.dart)）
+    ——离视口超过 51 条、又不在末尾 51 条内的槽位放回占位（"仅缓存坐标附近的历史，其余均丢弃"），
+    **正在流式 / 正在跑工具的消息永不被淘汰**；**补页量必须 ≤ 保留半径**，否则"刚补回来的一页立刻被淘汰、
+    滑一点又要重补"，同一段内容被网络与布局各空转两遍（用户 2026-10-04：「现在中间页懒加载 +-200 条消息，
+    有点卡，改 +-50 条」——取 **51** 是刻意的怪数：50 在这个仓库里到处都是，51 才能被一次 `grep` 认出来）；
     补页失败只留着占位槽，下次滑动再试；补不出东西来的段记一笔不再空转（防死循环）；
     ③ 右侧滑块**按全局下标算几何**（第一条的下标 / 全局条数，长度 = 看得见的条数 / 全局条数、有抓得住的下限），
     拖它 = 跳到该下标并补那一段（原生 `Scrollbar` 跟随"已构建内容的估算范围"，窗口化列表里必然乱跳，故自绘）；
@@ -470,6 +474,19 @@
     - **三栏面板常驻、不卸载**：每栏外面那层 `Flexible` 是**常驻**的，只是 `flex` 在 0/1 之间变——
       按状态换控件类型（`SizedBox` ↔ `Flexible`）会让整棵子树重建，滚动位置与当前页签全丢。
 
+26. **中栏空态：只在"确实加载完且真的没有消息"时出现，标识是主题色的 TREE 字标**
+    （[ui/widgets/welcome_mark.dart](ui/widgets/welcome_mark.dart)、
+    [ui/widgets/message_list.dart](ui/widgets/message_list.dart)，
+    `test/welcome_mark_test.dart` 与 `test/message_panel_agent_switch_test.dart` 钉住，
+    **用户要求 2026-10-04**：「中间页的 hello 标识有点 out-of-date 且与本应用主题色不合」）：
+    - **不许闪**：切 agent / 首载 / 切会话期间窗口本来就是空的，但这不是"没有消息"——那时渲染**静态骨架**，
+      空态只在历史真正落地（或明确失败）之后出现；有插件卡片时也不显示欢迎页；
+    - **标识是纯样式的主题色字标**（`TextStyle` + `ShaderMask` + `Container`，**不加资源、不动 pubspec**）：
+      `TREE` 大写、宽字距、w800、**主色渐变**（深色 亮绿→渐变深绿；浅色 深绿→中绿），下面一条
+      **HUD 三段线**（中段更粗更亮、两侧短段带缺口，呼应应用图标那圈断口弧），再一行「你好，欢迎使用」；
+    - **不许回到底层 emoji**：`👋` 是平台彩色字体（Windows 上是黄色），染不上主题色，
+      在绿 + 近黑的品牌配色里是外来色。
+
 ## 测试
 
 ```bash
@@ -480,6 +497,7 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 钉子用例：`test/message_replay_guard_test.dart`、`test/session_rename_test.dart`、`test/plugin_panel_admin_test.dart`、
 `test/main_page_sidebar_width_test.dart`（三栏宽度：只有下限、合计预算、拖一侧对侧让位）、
 `test/main_page_center_collapse_test.dart`（中栏折叠：让位给侧栏、State 与滚动位置不丢、三栏都收着也不溢出）、
+`test/welcome_mark_test.dart`（空态字标：TREE 大写宽字距 w800、主色渐变、HUD 三段线、接进真实中栏空态、加载中不出现）、
 `test/message_list_scroll_test.dart`、`test/message_window_coordinate_test.dart`
 （窗口坐标 / 落点 / 反馈校正 / 缺口切分四条纯函数）、`test/message_scrollbar_test.dart`、`test/tray_service_test.dart`（关闭决策与设置默认值）、
 `test/close_to_tray_dialog_test.dart`（首次关闭说明框的返回值）、`test/single_instance_test.dart`（锁键/端口纯函数、
