@@ -247,11 +247,16 @@ class LlmSession {
   /// 跑完一轮会话。
   ///
   /// [messages] 必须**已包含 system 与本次用户消息**（顺序即发送顺序）。
+  ///
+  /// [isCancelled] 是**软**信号（插话也要立刻停流式、工具之间收敛）；
+  /// [isHardCancelled] 是**硬**取消，只给工具执行体看（缺省 = 与软信号同源，老行为）——
+  /// 插话不该打断正在跑的工具，更不该掐掉在途提问（见 [AgentRunContext.isHardCancelled]）。
   Stream<AgentEvent> run({
     required List<LlmMessage> messages,
     required String agentId,
     required String sessionId,
     required bool Function() isCancelled,
+    bool Function()? isHardCancelled,
   }) async* {
     int trimmed = 0;
     // 基础上下文（system + 摘要 + 未压缩历史）与本轮工具轨迹**分开持有**：
@@ -564,7 +569,8 @@ class LlmSession {
             arguments: arguments,
             agentId: agentId,
             sessionId: sessionId,
-            isCancelled: isCancelled,
+            // 工具层只认**硬**取消：插话（新消息 / hook 完成提示）不打断在途工具
+            isCancelled: isHardCancelled ?? isCancelled,
           );
         } catch (error) {
           outcome = ToolOutcome('工具执行异常：$error', isError: true);

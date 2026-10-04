@@ -78,7 +78,12 @@ class AskQuestionRequest {
   final String subagentParentId;
   final int subagentLevel;
 
-  /// 本轮是否已被取消（`stop`）。等待作答期间要能立刻退出。
+  /// 本轮是否已被**硬取消**（`stop` / 删除 agent / 关服）。等待作答期间要能立刻退出。
+  ///
+  /// **插话不算取消**（用户 2026-10-04 断言：「任何工具调用执行期间不被插话打断，
+  /// 插入消息（包括 terminal/subagent hook 完成消息）在工具调用期间必须排队等待」）：
+  /// 传进来的必须是"真取消"那条谓词（见 `AgentRunContext.isHardCancelled`），
+  /// 否则一条 hook 完成提示就能把用户正看着的提问掐掉。
   final bool Function() isCancelled;
 
   /// 第一问的正文（兼容读法；单问时就是全部）。

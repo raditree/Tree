@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:test/test.dart';
@@ -230,6 +231,72 @@ void main() {
     expect(toolMessage.toolResult, contains('第2题（要不要回滚预案？）：要'));
   });
 
+  test('插话 / hook 完成提示落在提问期间：提问不被掐掉，插入消息排队等作答', () async {
+    // 用户 2026-10-04 断言：「任何工具调用执行期间不被插话打断，插入消息（包括
+    // terminal/subagent hook 完成消息）在工具调用期间必须排队等待」。
+    // 旧实现两处都违反：_interruptForNewMessage 直接 cancelForSession，且 broker 的
+    // isCancelled 轮询拿到的是**软**信号 ⇒ 一条 hook 完成提示就把题卡掐掉。
+    ws.send(<String, dynamic>{
+      'type': WsInboundType.userMessage,
+      'agent_id': agent.id,
+      'content': '帮我选一个',
+      'session_id': sessionId,
+    });
+    await ws.until(
+      (Map<String, dynamic> f) => f['type'] == WsOutboundType.askUserQuestion,
+      reason: '提问卡片帧',
+    );
+    final String qid =
+        ws.frames.firstWhere(
+              (Map<String, dynamic> f) =>
+                  f['type'] == WsOutboundType.askUserQuestion,
+            )['id']
+            as String;
+    expect(transport.turnsUsed, 1, reason: '第一跳已发出，工具正等作答');
+
+    // 两种"有人说话"：用户又发一条 + terminal hook 完成提示
+    ws.send(<String, dynamic>{
+      'type': WsInboundType.userMessage,
+      'agent_id': agent.id,
+      'content': '顺便说一句',
+      'session_id': sessionId,
+    });
+    unawaited(
+      server.conversation.wake(
+        agentId: agent.id,
+        sessionId: sessionId,
+        notice: '[terminal hook] 后台命令已结束',
+      ),
+    );
+
+    await _untilTrue(
+      () => server.conversation.interruptedRunCount >= 1,
+      reason: '插话被记下来（软收敛标记）',
+    );
+    // 旧实现里 broker 的取消轮询 500ms 就会把它掐掉：这里等够再断言
+    await Future<void>.delayed(const Duration(milliseconds: 900));
+
+    expect(questions.byId(qid)?.isPending, isTrue, reason: '在途提问不许被插话掐掉');
+    expect(broker.pending(), hasLength(1));
+    expect(transport.turnsUsed, 1, reason: '插入的两条在排队：没开新的 LLM 跳');
+
+    // 作答 ⇒ 工具返回 ⇒ 被打断的那轮收敛 ⇒ 排队那轮才起跑
+    ws.send(<String, dynamic>{
+      'type': WsInboundType.userAnswer,
+      'data': <String, dynamic>{'question_id': qid, 'answer': 'B'},
+    });
+    await _untilTrue(
+      () => transport.turnsUsed >= 2,
+      reason: '排队的消息起跑（第二跳）',
+    );
+    await waitIdle(ws);
+    final Map<String, dynamic> toolEnd = ws.frames.firstWhere(
+      (Map<String, dynamic> f) => f['type'] == WsOutboundType.toolEnd,
+    );
+    expect(toolEnd['result'], contains('用户回答：B'), reason: '作答照常回灌工具结果');
+    expect(ws.types(), isNot(contains(WsOutboundType.error)));
+  });
+
   test('stop：在途提问被取消，本轮收敛而不是永久挂起', () async {
     ws.send(<String, dynamic>{
       'type': WsInboundType.userMessage,
@@ -252,4 +319,18 @@ void main() {
     );
     expect(toolEnd['result'], contains('取消'));
   });
+}
+
+/// 轮询等条件成立（与 message_interrupt_test 同一套路：并行满负载下别用固定 sleep）。
+Future<void> _untilTrue(
+  bool Function() condition, {
+  Duration timeout = const Duration(seconds: 20),
+  String reason = '',
+}) async {
+  final DateTime deadline = DateTime.now().add(timeout);
+  while (DateTime.now().isBefore(deadline)) {
+    if (condition()) return;
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+  }
+  fail('超时等待：' + reason);
 }

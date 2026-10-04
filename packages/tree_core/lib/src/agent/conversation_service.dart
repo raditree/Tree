@@ -34,6 +34,15 @@ class _RunToken {
 
   bool cancelled = false;
 
+  /// **工具层**认的取消：只认真取消（用户 `stop` / 删除 agent / 关服）。
+  ///
+  /// 与 [cancelled] 是两个量：[cancelled] 是**软**收敛信号——插话（新消息 / hook 提示）
+  /// 也要让流式立刻停、工具之间收敛；这一条是**硬**取消，正在执行的工具与
+  /// `ask_user_question` 的在途等待才认它（见 [AgentRunContext.isHardCancelled]）。
+  /// 用户 2026-10-04 断言：「任何工具调用执行期间不被插话打断，插入消息（包括
+  /// terminal/subagent hook 完成消息）在工具调用期间必须排队等待」。
+  bool hardCancelled = false;
+
   /// 是否因"**收到新消息**"而被打断（与用户按 `stop` 区分）。
   ///
   /// 为什么要区分：用户按 stop 时应当看到"已停止本轮生成。"这条可见提示；
@@ -320,6 +329,8 @@ class ConversationService {
     if (tokens.isEmpty) return false;
     for (final _RunToken token in tokens) {
       token.cancelled = true;
+      // **硬**取消：在途提问 / 正在跑的工具立刻收尾（工具层只认这一条）
+      token.hardCancelled = true;
       // 人按的停止：被中止的临时员工**不**向发起者注入结束提示（用户自己会说原因）
       token.userStopped = true;
     }
@@ -515,8 +526,13 @@ class ConversationService {
   ///   掐掉，工具结果后面再没有任何回复）；
   /// - **不 bump epoch**（`stop` 才 bump）：打断的目的恰恰是"让刚入队的新消息
   ///   赶紧跑起来"，把代次往前推会让新任务被当旧任务丢掉；
-  /// - 顺带作废在途提问（`ask_user_question`）：等答案的工具会立刻拿到取消结果，
-  ///   工具循环才能收敛——否则用户发了新消息，agent 还卡在等一个没人回答的问题上；
+  /// - **不碰在途工具，也不作废在途提问**（用户 2026-10-04 断言：「任何工具调用执行
+  ///   期间不被插话打断，插入消息（包括 terminal/subagent hook 完成消息）在工具调用
+  ///   期间必须排队等待」）：插话只置**软**标记（[cancelled] / [interrupted]），
+  ///   工具层认的**硬**取消（[hardCancelled]）只有 `stop` / 删除 agent / 关服会置。
+  ///   旧实现顺带 `questions.cancelForSession` ⇒ `ask_user_question` 正在等作答时，
+  ///   一条 hook 完成提示就能把它掐掉，用户面对的是一张点了没用的题卡；
+  ///   代价如实说：待答问题期间插进来的消息会**排队等到那道题被作答或显式取消**；
   /// - 打断**只在"流式生成中"与"两次工具之间"生效**：正在执行的工具跑完才收敛
   ///   （`WorkspaceIO.exec` 没有取消参数，且 M9 规定本地执行活着就永不超时、
   ///   不按时间杀进程）；
@@ -533,8 +549,7 @@ class ConversationService {
   }) {
     final _RunToken? token = _running[_runKey(agentId, sessionId)];
     if (token == null) return;
-    // 只作废**这个会话**在途的提问：别的会话可能也在跑、也在等人回答，不能一起取消。
-    questions?.cancelForSession(agentId, sessionId);
+    // **不碰在途工具，也不作废在途提问**（见方法文档最后一条）：插话只置软标记。
     token.interrupted = true;
     token.cancelled = true; // 复用既有取消通道：流式循环每帧检查，工具之间也检查
     if (byUser) token.userStopped = true;
@@ -628,6 +643,7 @@ class ConversationService {
   void dispose() {
     for (final _RunToken token in _running.values) {
       token.cancelled = true;
+      token.hardCancelled = true; // 关服 = 真取消：在途提问不能挂着
     }
     _running.clear();
     _chains.clear();
@@ -912,6 +928,8 @@ class ConversationService {
       transcriptAgentId: ownerId,
       historyOverride: history,
       fresh: freshContext,
+      // 工具层看到的取消 = **硬**取消（插话不算）："任何工具调用执行期间不被插话打断"
+      isHardCancelled: () => token.hardCancelled,
     );
 
     try {
@@ -1537,6 +1555,7 @@ class ConversationService {
     String? transcriptAgentId,
     List<CoreMessageRef>? historyOverride,
     bool fresh = false,
+    bool Function()? isHardCancelled,
   }) {
     // 压缩会把摘要与水位线写回会话对象；重新取一次避免拿到过期快照。
     // 历史与压缩状态按**归集归属**（`transcriptAgentId`）取：临时员工的消息写进
@@ -1559,6 +1578,7 @@ class ConversationService {
       compactedContext: fresh
           ? const <Map<String, dynamic>>[]
           : currentSession.compactedContext,
+      isHardCancelled: isHardCancelled,
       // 用户消息已在 handleUserMessage 里落库，因此这里取到的历史已含本次输入。
       // `messages()` 刻意排掉临时员工的消息：父 agent 的工具批必须保持原子。
       history:

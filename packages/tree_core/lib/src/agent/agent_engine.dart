@@ -199,6 +199,7 @@ class AgentRunContext {
     this.contextSummary = '',
     this.compactedMessageCount = 0,
     this.compactedContext = const <Map<String, dynamic>>[],
+    this.isHardCancelled,
   });
 
   final String agentId;
@@ -233,6 +234,17 @@ class AgentRunContext {
   /// 用线形态的 Map 而不是 `LlmMessage`：这一层（agent）不认识具体 LLM 类型，
   /// 解析由真实引擎负责（见 `LlmAgentEngine._buildMessages`）。
   final List<Map<String, dynamic>> compactedContext;
+
+  /// **工具层**认的取消：只认"真取消"（用户按 `stop` / 删除 agent / 关服）。
+  ///
+  /// 用户 2026-10-04 断言：「任何工具调用执行期间不被插话打断，插入消息（包括
+  /// terminal/subagent hook 完成消息）在工具调用期间必须排队等待」——
+  /// 与 [AgentEngine.run] 的 `isCancelled` 是**两个量**：
+  /// - `isCancelled`（软）：插话也要让流式立刻停、工具之间收敛；
+  /// - `isHardCancelled`（硬）：正在跑的工具、以及 `ask_user_question` 的在途等待才认它。
+  ///
+  /// 为 null 时工具层退化为看软信号（老行为；未接线的引擎与测试不受影响）。
+  final bool Function()? isHardCancelled;
 }
 
 /// 回复引擎：给定一次 [AgentRunContext]，流式产出 [AgentEvent]。

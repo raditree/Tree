@@ -29,7 +29,8 @@
 5. **提示词按会话钉住**（key = `agentId|sessionId`）：只在会话初始化 / 压缩后 / 显式失效时重建；历史逐字复用 `toolArgumentsRaw` 与 `toolResultForModel`；**工具表每轮现取**（不进前缀，否则端点前缀缓存从这条起全部落空）。
 6. **压缩不删除任何消息**：只推进 `compactedMessageCount`；被总结的永远是历史的一个**前缀**；`compactedSummary` 与 `compactedContext` **互斥**（两条压缩路径的权威只能有一个）。
 7. **`.self` 只在一处翻译**（`PrivateWorkspaceIO`），且**终端命令不经过它** ⇒ 提示词必须把私有目录的**真实路径**写给模型。
-8. 提问四件事缺一不可：**先落盘再推帧**（进程被杀 / 重启后仍能列出待答）、**作答幂等**（WS 与 REST 可能同时到达，只有第一次生效）、**取消能打断**（等待中的工具立刻拿到 `cancelled`，工具循环因此收敛而不是永远挂着）、**`createdAt` 严格递增**（`add` 把它抬成"全库严格递增"，与消息时间戳同一条规则、共用 `store/tree_store.dart` 的 `monotonicStamp`）：`GET /api/questions` 按 `created_at` 降序，而 Dart 的 `List.sort` **不保证稳定**——同毫秒的两条提问会在两次请求之间换位置（用户看到右栏"最新的排前面"偶发漂移）。**装载旧文件只读不改**：旧数据里的平局不去追改用户数据。第 3 件事还有一层：
+8. 提问四件事缺一不可：**先落盘再推帧**（进程被杀 / 重启后仍能列出待答）、**作答幂等**（WS 与 REST 可能同时到达，只有第一次生效）、**取消能打断，但只有"真取消"能打断**（等待中的工具立刻拿到 `cancelled`，工具循环因此收敛而不是永远挂着；
+    **插话不算取消**：`stop` / 删除 agent / 关服 / 显式 `cancel_question` 才是取消路径，见不变量 13）、**`createdAt` 严格递增**（`add` 把它抬成"全库严格递增"，与消息时间戳同一条规则、共用 `store/tree_store.dart` 的 `monotonicStamp`）：`GET /api/questions` 按 `created_at` 降序，而 Dart 的 `List.sort` **不保证稳定**——同毫秒的两条提问会在两次请求之间换位置（用户看到右栏"最新的排前面"偶发漂移）。**装载旧文件只读不改**：旧数据里的平局不去追改用户数据。第 3 件事还有一层：
     **`cancel` 与"记录是否还在"解耦**——删除 agent 会直接摘掉提问记录（`QuestionStore.removeForAgent`），
     所以 `cancel` 对「记录已不在、但有在途等待」也必须完成 completer（`cancelForAgent` 按 store 的 pending 列表遍历，
     记录摘掉后它就无能为力）；删除路径因此必须**先经 broker 取消、再摘记录**，否则那一轮永远收不到工具结果
@@ -61,6 +62,15 @@
     同一会话里它名下的临时员工**继续跑**、完成报告照旧注入发起者；父那轮若正卡在 `subagent` / `wait_for` 上，按"正在执行的工具跑完才收敛"把新消息排队等它返回。
     终止在途临时员工只有两条**显式**路径：**用户 `stop`**（按 agent，仍连带它名下的临时员工，[test/cascade_stop_test.dart](../../../test/cascade_stop_test.dart)）与**在某个临时成员视角里按停止**（`sub_…` ⇒ `_stopAgentTree(cascade:false)`，只停它自己，[test/subagent_tool_test.dart](../../../test/subagent_tool_test.dart)）。
     `_RunToken.ownerAgentId` 记归属轮次；`isRunning` 仍把"它名下的临时员工"算在内（后台临时员工在跑时发起者显示 working、最后一个跑完才报 idle——团队名单口径不变）。
+    **插话不碰在途工具，也不作废在途提问**（用户 2026-10-04 断言：「任何工具调用执行期间不被插话打断，
+    插入消息（包括 terminal/subagent hook 完成消息）在工具调用期间必须排队等待」）：
+    `_RunToken` 分**两个**标记——`cancelled` / `interrupted` 是**软**收敛（插话与 `stop` 都置：
+    流式立刻停、工具之间收敛），`hardCancelled` 是**硬**取消（只有 `stop` / 删除 agent / 关服置）。
+    工具执行体只认硬取消：`AgentRunContext.isHardCancelled` → `LlmTurnSession.run(isHardCancelled:)`
+    → `ToolRunner.run` 与 `AskQuestionRequest.isCancelled`（broker 的取消轮询用它）。
+    旧实现把软信号也给了工具层 ⇒ `ask_user_question` 正等作答时，一条 hook 完成提示就能把题卡掐掉
+    （[known-issues.md #26](../../../../../docs/known-issues.md)）；**代价如实说**：待答问题期间插进来的消息
+    **排队等到那道题被作答或显式取消**（题卡一直可答，另见不变量 8）。
 14. **「为什么没接管」分两档，别合并**：`relay_skip_reason`（REST）永远是**全量**（排障面，含"总开关关 / 作用域不匹配 / 无点位 / 无订阅者"这类**早退**）；会话历史里的通知**只写"有订阅者却没交出可用结果"**那一档（`relaySkipHasSubscriber`，没回包 / 原数据放行 / 回包非法 / 越界 / 异常）。合并的后果是：没装压缩插件的用户，每条压缩通知都多一句"没有插件订阅该点位"的废话，看两次就学会忽略整条通知了。手动压缩（REST `/compact`、执行站 `agent.compact`）与自动压缩共用 `_notifyCompacted` 这一条文案口径，别在别处复制第二套。
 
 ## 依赖方向
@@ -115,5 +125,6 @@ dart test test/conversation_segments_test.dart test/conversation_stream_seq_test
 ```
 
 钉子用例：`conversation_segments_test`（分段与落库顺序）、`message_interrupt_test`（会话并行 / 插话 / stop）、
+`llm_question_test`（提问回路端到端：作答回灌、多问题、**插话 / hook 完成提示不打断在途提问**、`stop` 取消）、
 `subagent_hook_wake_test`（临时员工 hook 完成后：提示归会话主人 + 只唤醒它自己 + 用它自己的历史）、
 `system_prompt_pin_test`（提示词钉住）、`private_workspace_io_test`（私有目录分栏）。

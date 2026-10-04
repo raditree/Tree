@@ -273,6 +273,7 @@ class LlmAgentEngine implements AgentEngine {
       agentId: context.agentId,
       sessionId: context.sessionId,
       isCancelled: isCancelled,
+      isHardCancelled: context.isHardCancelled,
     )) {
       if (event is AgentUsage) {
         _learnTokenScale(resolved, event.usage);

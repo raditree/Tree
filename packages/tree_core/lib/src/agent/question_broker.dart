@@ -146,6 +146,9 @@ class QuestionBroker {
     log?.call('提问 $qid（agent=${request.agentId}）等待作答');
 
     flight.poll = Timer.periodic(pollInterval, (Timer _) {
+      // 这个谓词是**硬**取消（`stop` / 删除 agent / 关服），插话不在其中：用户 2026-10-04
+      // 断言「任何工具调用执行期间不被插话打断」——旧实现拿到的是软信号，于是一条 hook
+      // 完成提示（或用户的新消息）就能把用户正看着的提问掐掉。
       if (request.isCancelled()) cancel(qid, reason: '本轮已停止');
     });
     final Duration? limit = timeout ?? defaultTimeout;
@@ -228,18 +231,6 @@ class QuestionBroker {
     int count = 0;
     for (final QuestionRecord record in pending(agentId: agentId)) {
       if (cancel(record.qid, reason: 'agent 已停止')) count++;
-    }
-    return count;
-  }
-
-  /// 取消某会话的全部待答提问，返回取消数。
-  int cancelForSession(String agentId, String sessionId) {
-    int count = 0;
-    for (final QuestionRecord record in pending(
-      agentId: agentId,
-      sessionId: sessionId,
-    )) {
-      if (cancel(record.qid, reason: '会话已停止')) count++;
     }
     return count;
   }

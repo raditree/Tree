@@ -65,6 +65,11 @@
       "只支持单问题"时期逐字一致** `用户回答：B`；多问逐题成行、未答写 `（未作答）`）、
       `prefixFirstQuestion`（来源标记只加第一问，别在别处再写一套）；
     - 结果交给模型前不做任何"猜"：未答项如实标注，模型据此决定追问或按假设继续。
+    - **等待作答期间不被插话打断**（用户 2026-10-04 断言：「任何工具调用执行期间不被插话打断，
+      插入消息（包括 terminal/subagent hook 完成消息）在工具调用期间必须排队等待」）：
+      `AskQuestionRequest.isCancelled` 必须是**硬取消**谓词（`stop` / 删除 agent / 关服），
+      插话（用户新消息、terminal/subagent hook 完成提示）不在其中——它只让消息**排队**等到作答或显式取消
+      （软 / 硬两条谓词的分工见 [../agent/README.md](../agent/README.md) 不变量 13）。
 11. **`subagent` 与其它工具同权、同三站**（用户硬断言，不给它开后门）：
     - **执行站**：`subagent` 一律经 `WorkspaceToolRunner._execute` → `BuiltinTools.run` 分派——和 `edit` / `write` / `team` 同一个入口。执行站命令 `tool.call`（`runFromPlugin`）因此能以 `tool: 'subagent'` 跑起来，权限口径与模型调用完全一致（**没有**特例白名单、**没有**特例拦截）；`origin` / `source_plugin_id` / `relay:false 默认绕开站点` 这些语义与普通工具逐字一致。
     - **中转站**：`system.relay.tool.pre` / `.post` 对 `subagent` 照常生效——pre 改写的 `task` / `name` **真正生效**（子 agent 拿到的就是改写后的那份），post 可改结果文本。

@@ -1413,3 +1413,44 @@ SSH 下返回的是**远端绝对路径**（`/home/u/proj/.output/…`），而�
 只取中段不凭空补）；门控真机用例转绿。
 
 **状态**：已修复（2026-10-04）。**遗留**：无。
+
+---
+
+## #26 `ask_user_question` 被其它消息打断（含 terminal hook 完成提示）
+
+**现象**（2026-10-04，用户报）：模型问一道题、用户还在看题卡时，任何"有人说话"都会把这张卡**取消**——
+用户再点作答也没用，那一轮提问等于白问。触发者是**任何**插入消息：用户又发的一条、
+`terminal hook` 后台任务的完成提示、团队成员/临时员工的投递。
+
+**断言原文**（用户 2026-10-04）：「任何工具调用执行期间不被插话打断，插入消息（包括
+terminal/subagent hook 完成消息）在工具调用期间必须排队等待」。
+
+**根因**（两条，都在"取消信号"这一个量上）：
+
+1. `_interruptForNewMessage` 顺带 `questions.cancelForSession(agentId, sessionId)`
+   （`packages/tree_core/lib/src/agent/conversation_service.dart`）——插话直接作废在途提问。
+2. broker 的取消轮询拿到的是**软**信号：`AskQuestionRequest.isCancelled` 一路来自
+   `engine.run(isCancelled: () => token.cancelled)`，而插话也置 `token.cancelled`
+   ⇒ 插话后 `pollInterval`（500ms）内提问就被取消（`question_broker.dart` 的 `flight.poll`）。
+
+即：**"这一轮该收敛"与"正在跑的工具立刻收尾"被当成了同一件事**。前者插话就该生效（流式立刻停、
+工具之间收敛），后者只该由人按的 `stop`（或删除 agent / 关服）触发。
+
+**修复**（2026-10-04）：取消信号拆成两条。
+
+- `_RunToken` 新增 `hardCancelled`：`cancelled`/`interrupted` 是**软**收敛（插话与 `stop` 都置），
+  `hardCancelled` 是**硬**取消（只有 `cancelAgent` = `stop` / 删除 agent / 关服置）。
+- `AgentRunContext.isHardCancelled` 把硬谓词带进引擎 → `LlmTurnSession.run(isHardCancelled:)`
+  → **只有工具执行体**看到它（`ToolRunner.run` 与 `AskQuestionRequest.isCancelled`）；
+  流式与工具之间的收敛检查仍用软谓词（插话语义不变）。
+- 删掉插话路径里的 `questions.cancelForSession(...)`，并删掉 broker 的 `cancelForSession`
+  （只给插话用过，留着迟早再被接回去）。
+- **代价如实记录**：待答问题期间插进来的消息**排队等到那道题被作答或显式取消**——
+  题卡一直可答，「取消提问」与 `stop` 都是显式出口；这正是"工具执行期间不被打断"的另一面。
+
+**验证**：`packages/tree_core/test/llm_question_test.dart` 新增「插话 / hook 完成提示落在提问期间：
+提问不被掐掉，插入消息排队等作答」（**修复前红**：断言 `isPending` 时提问已被取消）——
+它同时钉住：提问仍在待答、`interruptedRunCount` 已记下插话、插入的两条**没有**开出新的 LLM 跳、
+作答后工具结果照常回灌、排队那轮才起跑。配套 `test('stop：在途提问被取消…')` 仍绿
+（`stop` 走硬取消 + `cancelForAgent`，立刻收尾）。`cd packages/tree_core && dart test` 全绿、
+`dart analyze` 零告警。

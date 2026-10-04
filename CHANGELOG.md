@@ -50,6 +50,18 @@
   （Windows 上是黄色），染不上主题色。「什么时候显示空态」的口径（只在确实加载完且真的没有
   消息时，加载中渲染骨架）**一个字没改**。
 
+- **`ask_user_question` 不再被其它消息打断：任何工具调用执行期间，插入消息排队等待**（新增
+  [docs/known-issues.md](docs/known-issues.md) #26；修改 [agent/README.md](packages/tree_core/lib/src/agent/README.md)
+  不变量 8 / 13、[tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 10；
+  **用户要求 2026-10-04**：「ask_user_question 会被其他消息（包括 terminal hook 等）打断」，
+  断言原文：「任何工具调用执行期间不被插话打断，插入消息（包括 terminal/subagent hook 完成消息）
+  在工具调用期间必须排队等待」）：取消信号拆成**软 / 硬**两条——`_RunToken.cancelled`
+  （插话与 `stop` 都置：流式立刻停、工具之间收敛）与 `hardCancelled`（只有 `stop` /
+  删除 agent / 关服置），后者经 `AgentRunContext.isHardCancelled` → `LlmTurnSession.run`
+  只交给**工具执行体**（`ToolRunner.run` 与 `AskQuestionRequest.isCancelled`）⇒
+  在途提问不再被 hook 完成提示 / 用户新消息掐掉（旧实现两处都掐：插话路径的 `cancelForSession`
+  ＋ broker 轮询拿到的软信号），插进来的消息改为**排队等到作答或显式取消**；`stop` 仍立刻收尾。
+
 ## [1.0.2+2] — 2026-10-04
 
 ### 断言变化（新增 / 修改的 README 不变量）
