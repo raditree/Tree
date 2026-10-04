@@ -343,7 +343,13 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 >    把整个前缀错位，缓存全丢；
 > 2. `tools` 必须一起带（工具定义在聊天模板里渲染在 messages **之前**）；
 > 3. 命中情况看回包 `usage.cached_tokens`（DeepSeek 的 `prompt_cache_hit_tokens` 已归一到
->    该字段）；`response_format`（站点硬设的 json）只是请求参数，**不影响**前缀匹配。
+>    该字段）；**`response_format` 必须显式传 `"text"`**（`llm.call` 新增的参数，2026-10-04）
+>    ——`llm.call` 缺省是站点硬设的 `{"type":"json_object"}`，而真机实测**端点为 JSON 模式
+>    改写了提示词**（同一批 messages 恒定 **+22 token**，且改写落在 messages 区域之前/其中）
+>    ⇒ 上面那条"逐字一致"的前缀**整段丢缓存**（对照：同一 492 token 前缀 plain 重发命中
+>    `384/256`，**只加 `json_object` 掉到 `0`**；`tools` 并未被丢弃，+270 token 两种模式都在）。
+>    ⚠️ 本节旧版写的"`response_format` 只是请求参数、**不影响**前缀匹配"**已被真机证伪**；
+>    走 text 之后输出形状靠你在提示词里写死（非法 JSON 会让 `llm.call` 如实报错）。
 >
 > **参考实现**：内置插件「上下文压缩」（`plugins/compact_plugin.py`，界面里一项开关）——
 > 摘要（背景 / 轨迹 / 改动产出文件）+ 必读文件（≤11 个、精确行范围，用伪造的 `read`
@@ -442,7 +448,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `agent.stop` | `agent_id?`, `cascade?`（缺省 true） | `{any_running, reason?, …}` | 停止（级联）生成 |
 | `agent.compact` | `agent_id?`, `session_id?` | `{…}` | **发起上下文压缩** |
 | `ui.push` | `slot_key`, `view?` | `{pushed, slot, slot_key, unregistered}` | 往消息流推一张卡片（§7） |
-| `llm.call` | `messages?` 或 `prompt?`, `system?`, `model?`, `temperature?`, `max_tokens?`, `tools?`（OpenAI 工具声明**原样透传**，给压缩插件对齐对话前缀用） | `{ok, json, text, model, usage}`；失败 `{ok:false, error:'可读原因'}` | **站点处硬设 JSON 返回形式**的 LLM 调用，复用目标 agent 的模型 |
+| `llm.call` | `messages?` 或 `prompt?`, `system?`, `model?`, `temperature?`, `max_tokens?`, `tools?`（OpenAI 工具声明**原样透传**，给压缩插件对齐对话前缀用）, `response_format?`（`"json_object"` 缺省 / `"text"` = **不发**该字段，为复用对话前缀缓存；也接受 `{"type": …}`） | `{ok, json, text, model, usage}`；失败 `{ok:false, error:'可读原因'}` | **站点处缺省硬设 JSON 返回形式**的 LLM 调用，复用目标 agent 的模型（显式 `"text"` 时改用对话同形态，见 §「缓存」第 3 条） |
 | `tool.call` | `tool`, `arguments?`, `relay?`（默认 false） | `{tool, result, is_error, relayed}` | 执行**任意工具**（内置 / MCP / 插件工具同一入口） |
 | `session.rename` | `title`（必填）, `session_id?` | `{renamed, title, session_id}` | 会话重命名（前端即时刷新标题） |
 

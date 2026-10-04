@@ -71,6 +71,22 @@
   在途提问不再被 hook 完成提示 / 用户新消息掐掉（旧实现两处都掐：插话路径的 `cancelForSession`
   ＋ broker 轮询拿到的软信号），插进来的消息改为**排队等到作答或显式取消**；`stop` 仍立刻收尾。
 
+- **`llm.call` 的返回形式可以显式选 `text`：复用对话前缀的调用这才真能吃到前缀缓存**（修改
+  [packages/tree_core/lib/src/llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 10、
+  [docs/plugin-development.md](docs/plugin-development.md) 的「缓存」段与 `llm.call` 参数表；
+  场景见 [docs/known-issues.md](docs/known-issues.md) #27；**用户要求 2026-10-04**：
+  「`llm.call` 的格式是 json，怀疑这类请求即使复用原消息仍零上下文缓存」）：
+  真机实测（`api.deepseek.com` 与 `token.ai-galaxy.com/v1` 结果一致）——同一 492 token 前缀
+  plain 重发命中 **384/256**，**只加 `response_format={"type":"json_object"}` 就掉到 0**
+  （端点会为 JSON 模式改写提示词：同一批 messages 恒定 **+22 token**，且改写落在 messages
+  区域之前/其中）；`tools` **没有被丢弃**（+270 token 两种模式都在）、`max_tokens` 与显式
+  `{"type":"text"}` 都不影响命中。于是 `llm.call` 新增**可选** `response_format`
+  （`"text"` / `"json_object"`，也接受 `{"type": …}`；**缺省仍是 `json_object`**，语义与
+  改动前逐字一致；非法值在进调用器之前就**可读失败**），`"text"` 的实现是**不发**该字段；
+  压缩插件的总结调用显式传 `"text"`（输出形状改由追加指令写死），那条"逐字复用对话前缀"
+  的总结输入因此才可能整段命中。**遗留**：省钱的端到端效果要重建核心 + 重新打包插件后
+  由真机账本复核（本轮只到核心侧 + 单测）。
+
 ## [1.0.2+2] — 2026-10-04
 
 ### 断言变化（新增 / 修改的 README 不变量）

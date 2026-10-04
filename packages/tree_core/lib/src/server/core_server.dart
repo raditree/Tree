@@ -753,10 +753,14 @@ class CoreServer {
     }
   }
 
-  /// 执行站 `llm.call`：用目标 agent 的模型发一次**硬设 JSON 返回形式**的调用。
+  /// 执行站 `llm.call`：用目标 agent 的模型发一次 LLM 调用（**缺省硬设 JSON 返回形式**）。
   ///
   /// agent 的 modelId 在核心侧解析（`store.agent(...).modelId`），模型池与成员级
   /// 覆盖由注入的 [llmJsonCaller] 负责——**与对话完全同一条解析路径**。
+  ///
+  /// [responseFormat] 原样转给 [LlmJsonCaller]：`'text'` = 这次调用**不发**
+  /// `response_format`（前缀与对话逐字一致 ⇒ 可命中端点前缀缓存）；缺省/`'json_object'`
+  /// = 站点硬设的 JSON 形式（语义与改动前一致）。
   ///
   /// [sessionId] 只用于**逐调用用量账本**的分文件（[usageLog]）。按调用绑定 sink：
   /// 站点调用是并发的，共享可变状态会串账。
@@ -770,6 +774,7 @@ class CoreServer {
     double? temperature,
     int? maxTokens,
     List<Object?>? tools,
+    String? responseFormat,
   }) async {
     final LlmJsonCaller? caller = llmJsonCaller;
     if (caller == null) {
@@ -789,6 +794,7 @@ class CoreServer {
       temperature: temperature,
       maxTokens: maxTokens,
       tools: tools,
+      responseFormat: responseFormat,
       usageSink: usageLog?.sinkFor(sessionId),
     );
   }

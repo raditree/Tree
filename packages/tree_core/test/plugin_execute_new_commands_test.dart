@@ -85,6 +85,7 @@ void main() {
               double? temperature,
               int? maxTokens,
               List<Object?>? tools,
+              String? responseFormat,
             }) async {
               llmCalls.add(<String, dynamic>{
                 'agent_id': agentId,
@@ -95,6 +96,7 @@ void main() {
                 'temperature': temperature,
                 'max_tokens': maxTokens,
                 'tools': tools,
+                'response_format': responseFormat,
               });
               if (prompt == '端点会拒绝') {
                 return <String, dynamic>{'error': '端点不支持 json_object'};
@@ -227,6 +229,11 @@ void main() {
     expect(call['model'], 'm1');
     expect(call['temperature'], 0.3);
     expect(call['max_tokens'], 128);
+    expect(
+      call['response_format'],
+      isNull,
+      reason: '没给 response_format ⇒ 走站点缺省（调用器收到 null，不替插件擅自改成别的值）',
+    );
 
     final Map<String, dynamic> payload =
         result.payload! as Map<String, dynamic>;
@@ -275,6 +282,53 @@ void main() {
     );
     expect(upstream.ok, isFalse);
     expect(upstream.error, contains('端点不支持 json_object'));
+  }, timeout: const Timeout(Duration(seconds: 60)));
+
+  test('llm.call：response_format 可显式选 text（复用对话前缀的正路），非法值可读失败', () async {
+    wire(mounts());
+    final List<Object?> oneUser = <Object?>[
+      <String, dynamic>{'role': 'user', 'content': '你好'},
+    ];
+
+    // ① 显式 text：透传给调用器，并在回包里 echo **生效值**
+    final StationCommandResult text = await run(
+      'llm.call',
+      arguments: <String, dynamic>{
+        'messages': oneUser,
+        'response_format': 'text',
+      },
+    );
+    expect(text.ok, isTrue, reason: text.error);
+    expect(llmCalls.single['response_format'], 'text', reason: '原样透传给调用器');
+    expect(
+      (text.payload! as Map<String, dynamic>)['response_format'],
+      'text',
+      reason: '回包 echo 的是生效值（不再是写死的 json_object）',
+    );
+
+    // ② OpenAI 形状的对象写法等价
+    final StationCommandResult asObject = await run(
+      'llm.call',
+      arguments: <String, dynamic>{
+        'messages': oneUser,
+        'response_format': <String, dynamic>{'type': 'json_object'},
+      },
+    );
+    expect(asObject.ok, isTrue, reason: asObject.error);
+    expect(llmCalls.last['response_format'], 'json_object');
+
+    // ③ 不认识的值：**进调用器之前**就如实失败（写了错值却以为生效是最难查的一类问题）
+    final StationCommandResult bad = await run(
+      'llm.call',
+      arguments: <String, dynamic>{
+        'messages': oneUser,
+        'response_format': 'xml',
+      },
+    );
+    expect(bad.ok, isFalse);
+    expect(bad.error, contains('response_format'));
+    expect(bad.error, contains('text'));
+    expect(llmCalls, hasLength(2), reason: '非法值不得落到调用器');
   }, timeout: const Timeout(Duration(seconds: 60)));
 
   // ── tool.call ────────────────────────────────────────────────────────

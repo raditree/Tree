@@ -21,9 +21,17 @@
 
 **缓存**（长会话省钱的关键）：总结调用把 `request.messages[:cut]` 整段当 messages，
 末尾只追加一条**user 指令**——前缀与对话那一轮逐字一致，端点侧已持久化的缓存单元
-就能整段命中；同时 `request.tools` 原样透传给 `llm.call`（工具定义渲染在 messages
-之前，缺了它前缀从第一个 token 就对不上）。注意**不要**用 `llm.call` 的 `system`
-参数放指令：那会在最前面插一条 system 消息，把前缀整体错位。
+就能整段命中。**三条一起成立才行**（少一条就整段不命中；2026-10-04 真机实测）：
+
+1. `request.tools` 原样透传（工具定义在聊天模板里渲染在 messages **之前**）；
+2. **不用** `llm.call` 的 `system` 参数（那会在最前面插一条 system 消息，整体错位）；
+3. **`response_format` 显式传 `"text"`**：`llm.call` 缺省会硬设
+   `{"type":"json_object"}`，而实测**端点为 JSON 模式改写了提示词**（同一批 messages
+   恒定 +22 token，改写落在 messages 之前/其中）⇒ 上面那条"逐字一致"的前缀整段丢缓存。
+   对照实验（两端点一致）：同一 492 token 前缀 plain 重发命中 384/256，**只加
+   `json_object` 掉到 0**；`tools` 并没有被丢弃（+270 token 两种模式都在）。
+   改走 text 后，输出格式由下面的指令约束；偶发非法 JSON ⇒ `llm.call` 如实报错
+   ⇒ 本插件回 `null` ⇒ 核心回退内置压缩（兜底不变）。
 
 切点（`cut`）在 **wire 坐标**里决定，三条规则：
     1. 保留最近 `--keep-rounds` 轮 user 及其之后；
@@ -127,8 +135,10 @@ PANEL_COLUMNS = ["时间", "来源", "覆盖条数", "耗时", "降级 / 未接�
 REASONING_TEXT = "上下文压缩后，我先 read 相关文件，获取 todo 列表"
 
 #: **追加在缓存前缀之后**的总结指令（最后一条 user 消息）。
-#: 两个硬要求：必须含 "json" 字样（DeepSeek JSON 模式的硬要求）；不要太长
-#: （它紧跟在被复用的前缀后面，越短越省）。
+#: 三个硬要求：①把输出形状写死在指令里（这一步**不**靠 `response_format` 强约束——
+#: 那会让端点改写提示词、前缀缓存全丢，见模块 docstring 的"缓存"段）；
+#: ②明确"只输出一个 json 对象、不要代码块/解释"（text 形态下格式全靠指令兜住）；
+#: ③不要太长（它紧跟在被复用的前缀后面，越短越省）。
 SUMMARY_INSTRUCTION = """以上是本次任务到目前为止的完整上下文。请把它压成"继续这个任务所必需"的要点，\
 并**只输出一个 json 对象**（不要别的文字）：
 
@@ -1067,7 +1077,9 @@ class CompactPlugin(object):
 
         # 总结调用：**前缀 = request.messages[:cut]**（与对话逐字一致 ⇒ 命中缓存），
         # 末尾只追加一条 user 指令；tools 原样透传（前缀对齐的另一半）。
-        # 注意：**不用** llm.call 的 system 参数（那会在最前面插 system 消息，整体错位）。
+        # 注意：**不用** llm.call 的 system 参数（那会在最前面插 system 消息，整体错位）；
+        # **必须** response_format="text"（缺省是站点硬设的 json_object，端点会为它
+        # 改写提示词 ⇒ 前缀整段丢缓存，真机对照见模块 docstring 的"缓存"段）。
         call_messages = list(wire[:cut])
         call_messages.append({
             "role": "user",
@@ -1077,6 +1089,9 @@ class CompactPlugin(object):
             "messages": call_messages,
             "agent_id": agent_id,
             "session_id": session_id,
+            # **必须 text**：缺省是站点硬设的 `json_object`，端点会为它改写提示词
+            # ⇒ 上面辛苦对齐的前缀整段丢缓存（真机对照见模块 docstring 的"缓存"段）。
+            "response_format": "text",
         }
         if tools:
             arguments["tools"] = tools
@@ -1722,6 +1737,9 @@ def selftest():
             failures.append("不该用 llm.call 的 system 参数（会让前缀整体错位）")
         if not llm_calls[0]["arguments"].get("tools"):
             failures.append("tools 没有透传（前缀对齐的另一半）")
+        if llm_calls[0]["arguments"].get("response_format") != "text":
+            failures.append("总结调用必须显式 response_format=text"
+                            "（json_object 会让端点改写提示词、前缀缓存整段丢）")
         if "最后一轮回答" in json.dumps(sent, ensure_ascii=False):
             failures.append("keep 段不该进总结输入")
 

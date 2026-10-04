@@ -57,6 +57,12 @@ typedef StationAgentCompactor = Future<Map<String, dynamic>> Function(
 /// 的 `llm.call` 就是在给某个会话做压缩）。与 [StationToolCaller] 的口径一致。
 /// 返回 `{ok, json, text, model, usage}` 或 `{error}`（端点不支持 JSON 形式时
 /// **如实失败**，不静默去掉 response_format 重试）。
+///
+/// [responseFormat]（2026-10-04 新增）：`null` / `'json_object'` = 站点缺省的
+/// **硬设 JSON 返回形式**（语义与新增前逐字一致）；`'text'` = **不发** `response_format`
+/// ——为的是让这次调用的提示词与对话那一轮**逐字一致**从而吃到端点前缀缓存
+/// （实测：只加 `{"type":"json_object"}` 就会让端点改写提示词，同一 492 token 前缀的
+/// 命中从 384/256 掉到 **0**；见 docs/known-issues.md #27）。
 typedef StationLlmCaller =
     Future<Map<String, dynamic>> Function({
       required String agentId,
@@ -68,6 +74,7 @@ typedef StationLlmCaller =
       double? temperature,
       int? maxTokens,
       List<Object?>? tools,
+      String? responseFormat,
     });
 
 /// `tool.call` 的**执行任意工具**入口（点位化新增）。
@@ -699,13 +706,15 @@ class ExecuteStationMounts {
     return TreeStore.defaultSessionId;
   }
 
-  /// `llm.call`：用目标 agent 的模型发一次**硬设 JSON 返回形式**的调用。
+  /// `llm.call`：用目标 agent 的模型发一次 LLM 调用（**缺省硬设 JSON 返回形式**）。
   ///
   /// 参数：`messages`（OpenAI 形状的数组）**或** `prompt`（字符串），可选
-  /// `system` / `model` / `temperature` / `max_tokens`。
-  /// 语义要点（用户定稿）：`response_format` 由**站点处**强制为 `json_object`；
+  /// `system` / `model` / `temperature` / `max_tokens` / `tools` / `response_format`。
+  /// 语义要点（用户定稿）：`response_format` **缺省**由**站点处**强制为 `json_object`；
+  /// 显式给 `"text"`（或 `{"type":"text"}`）时**不发**该字段 —— 这条是给"要复用对话
+  /// 前缀缓存"的调用留的正路（实测 `json_object` 会让端点改写提示词、整段丢缓存）；
   /// 模型复用该 agent 解析出的模型（含成员级覆盖），`model` 只作显式覆盖；
-  /// **不进**任何中转点位（它不是对话的 LLM 处理）；端点点不支持时如实失败。
+  /// **不进**任何中转点位（它不是对话的 LLM 处理）；端点不支持时如实失败。
   Future<StationCommandOutcome> _llmCall(
     StationCommandContext context,
     _StationTarget target,
@@ -732,6 +741,18 @@ class ExecuteStationMounts {
     if (rawTools != null && rawTools is! List) {
       return const StationCommandOutcome.failed('llm.call 的 tools 必须是数组');
     }
+    // 返回形式：缺省 = 站点硬设 `json_object`（与本参数引入前**逐字一致**）；
+    // 显式 `"text"` = 这次调用与对话同形态（**不发** `response_format`）——要复用
+    // 端点前缀缓存的调用必须走它；给了不认识的值 ⇒ **可读失败**，不静默忽略。
+    final Object? rawFormat = context.arguments['response_format'];
+    final String? responseFormat = _normalizeResponseFormat(rawFormat);
+    if (rawFormat != null && responseFormat == null) {
+      return StationCommandOutcome.failed(
+        'llm.call 的 response_format 只支持 "json_object"（缺省）或 "text"，'
+        '也接受 {"type": "json_object"} / {"type": "text"} 形式；'
+        '收到的是：$rawFormat',
+      );
+    }
     final Map<String, dynamic> result = await caller(
       agentId: target.agentId,
       // 会话口径与 `tool.call` 一致：命令参数 → 站点 scope → 默认会话
@@ -743,6 +764,7 @@ class ExecuteStationMounts {
       temperature: _double(context.arguments['temperature']),
       maxTokens: _int(context.arguments['max_tokens']),
       tools: rawTools is List ? rawTools : null,
+      responseFormat: responseFormat,
     );
     final Object? error = result['error'];
     if (error != null && error.toString().isNotEmpty) {
@@ -751,7 +773,8 @@ class ExecuteStationMounts {
     return StationCommandOutcome.ok(<String, dynamic>{
       ...result,
       'agent_id': target.agentId,
-      'response_format': 'json_object',
+      // 回包 echo **生效值**：缺省仍写 `json_object`（老插件读到的键与值都没变）
+      'response_format': responseFormat ?? 'json_object',
     });
   }
 
@@ -894,6 +917,18 @@ class ExecuteStationMounts {
 
   static String _string(Object? value) =>
       value == null ? '' : value.toString().trim();
+
+  /// 归一化 `llm.call` 的 `response_format`（2026-10-04 新增）。
+  ///
+  /// - 入参 `null` = 调用方**没给** ⇒ 返回 `null`（用站点缺省 `json_object`）；
+  /// - `"json_object"` / `"text"`（大小写不敏感）或 `{"type": "…"}` 对象 ⇒ 归一成这两个值；
+  /// - 其它 ⇒ 返回 `null`，调用方据此**可读失败**（插件写了错值却以为生效，是最难查的一类问题）。
+  static String? _normalizeResponseFormat(Object? raw) {
+    if (raw == null) return null;
+    final Object? type = raw is Map ? raw['type'] : raw;
+    final String value = (type ?? '').toString().trim().toLowerCase();
+    return (value == 'text' || value == 'json_object') ? value : null;
+  }
 
   static int? _int(Object? value) {
     if (value is num) return value.toInt();

@@ -1180,9 +1180,11 @@ class SamplePlugin(object):
     def _do_llm_call(self):
         """（worker 线程）`llm.call`：借**目标 agent 的模型**发一次 JSON 调用。
 
-        站点处**硬设** `response_format=json_object`（插件改不了，也不用改），所以
-        回包里的 `json` 是端点已经解析好的对象；`text` 是原始文本（端点没按 JSON
-        回时 `json` 为空，插件应看 `text` 与服务端的 `ok`）。
+        站点处**缺省硬设** `response_format=json_object`，所以回包里的 `json` 是端点
+        已经解析好的对象；`text` 是原始文本（端点没按 JSON 回时 `json` 为空，插件应看
+        `text` 与服务端的 `ok`）。这个示例就用缺省形式。
+        要**复用对话前缀缓存**的调用（如压缩插件的总结调用）必须显式传
+        `"response_format": "text"`——`json_object` 会让端点改写提示词、前缀整段不命中。
         失败一律 `ok:false` + **可读 error**（例如"该 agent 尚未指定模型"）——不崩。
         """
         prompt = self.options.llm_call

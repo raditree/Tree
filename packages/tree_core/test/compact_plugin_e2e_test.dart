@@ -147,12 +147,14 @@ void main() {
               double? temperature,
               int? maxTokens,
               List<Object?>? tools,
+              String? responseFormat,
             }) async {
               llmCalls.add(<String, dynamic>{
                 'agent_id': agentId,
                 'messages': messages,
                 'system': system,
                 'tools': tools,
+                'response_format': responseFormat,
               });
               if (!llmOk) {
                 return <String, dynamic>{'error': '端点不支持 json_object'};
@@ -391,6 +393,12 @@ void main() {
       jsonEncode(call['tools']),
       contains('read'),
       reason: 'tools 是前缀对齐的另一半',
+    );
+    expect(
+      call['response_format'],
+      'text',
+      reason: '总结调用必须走 text 形态：`json_object` 会让端点改写提示词（恒定 +22 token，'
+          '落在 messages 之前）⇒ 上面这条"逐字一致"的前缀整段丢缓存（known-issues #27）',
     );
     expect(
       jsonEncode(sent),

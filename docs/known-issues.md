@@ -1500,3 +1500,48 @@ terminal/subagent hook 完成消息）在工具调用期间必须排队等待」
 作答后工具结果照常回灌、排队那轮才起跑。配套 `test('stop：在途提问被取消…')` 仍绿
 （`stop` 走硬取消 + `cancelForAgent`，立刻收尾）。`cd packages/tree_core && dart test` 全绿、
 `dart analyze` 零告警。
+
+---
+
+## #27 `llm.call` 的 `response_format=json_object` 让"复用对话前缀"的调用零缓存命中
+
+**现象**（2026-10-04，用户提出"怀疑 `llm.call` 这类请求即使复用原消息仍零上下文缓存"）：
+压缩插件的总结调用每次都把 `request.messages[:cut]` 逐字复用、`request.tools` 原样透传，
+但它在 `usage.jsonl` 里几乎从不命中前缀缓存。本机账本：`turn` 2406 次加权命中 **98.51%**，
+`llm.call` 5 次加权命中 **21.21%**；同一会话对照 99.13% vs 2.64%；现场一刻：
+21:00:38 `turn` 162094/161408（99.6%）→ 21:05:24 压缩 `llm.call` 151722/**0**。
+
+**根因**（真机实测；**不是**"json 不能带 tool"）：`response_format={"type":"json_object"}`
+会让**端点改写提示词**。两端点（`api.deepseek.com`、`token.ai-galaxy.com/v1`）结果一致：
+
+| 实验 | 观测 |
+| --- | --- |
+| 同一 messages：plain **63** → `+tools` **333** → `+tools+json` **355** → `+json` **85** | 工具定义 **+270** token 两种模式下都在（**没有被丢弃**，故"json 丢 tools"不成立）；json 模式自身恒定 **+22** token |
+| 492 token 前缀：plain(0) → plain 重发 **384/256** → 同 messages `+json`(514) **0** → json 重发 **512/380** → plain 再发 **384/256** | 控制臂命中；**只加 `json_object` 就归零**（⇒ 那 +22 token 落在 messages 区域之前/其中，不是追加在末尾）；json 请求有自己的缓存谱系；plain 谱系不受伤 |
+| 对照：改 `max_tokens`(8/16)、显式 `response_format={"type":"text"}` | 都仍命中 ⇒ **参数不进缓存键**，唯一变量是 `json_object` |
+| 174/196 token 前缀连发 3 次（间隔 6s） | 全 0 ⇒ 该尺寸端点根本不建缓存（**所以"每次 <200 token"的预算内测不出这个问题**） |
+
+官方口径（api-docs.deepseek.com/guides/kv_cache）：命中要求**完整匹配一个已持久化的缓存前缀
+单元**、**从第 0 token 起**全匹配、以 64 token 为单位、构建需数秒、best-effort。
+唯一一次 llm.call 满命中（10/03 18:21:58，360192/360269）与机制一致——那是**json 谱系内部**的命中。
+
+**为什么既有用例没兜住**：llm.call 相关用例都在断言"参数透传 / payload 形状"，没有一条在
+**真端点**上看"引用同一前缀的两条请求命中率"——缓存是端点侧行为，假传输测不出来。
+
+**修复**（2026-10-04，用户选定）：给 `llm.call` 加**可选** `response_format`
+（`"text"` / `"json_object"`，也接受 `{"type": …}`；**缺省仍是 `json_object`**，语义与改动前
+逐字一致；非法值在进调用器之前就**可读失败**）；`"text"` 的实现是**不发**该字段；压缩插件的
+总结调用显式传 `"text"`（输出形状改由追加指令写死）。落点：`execute_mounts.dart`
+（解析/透传/回包 echo 生效值）、`llm_json_caller.dart`（`call(responseFormat:)`）、
+`core_server.dart`（`_stationLlmCall` 转参）、`examples/plugins/compact_plugin.py`。
+
+**验证**：`packages/tree_core/test/llm_json_caller_test.dart`（新：缺省硬设 json；text 形态请求体
+**不含** `response_format`；text 仍解析回包 json）+ `plugin_execute_new_commands_test.dart`
+（默认 / `text` / 对象形态 / 非法值可读失败）+ `compact_plugin_e2e_test.dart`（真插件断言总结
+调用带 `response_format=text`）+ `python examples/plugins/compact_plugin.py --selftest`。
+
+**状态**：已修复（核心侧 + 插件侧 + 文档口径同步）。**遗留**：
+1. 端到端省钱效果要**重建核心 + 重新打包插件**后由真机账本复核（那笔 `source=llm.call` 的
+   `cached_tokens` 应从 0/null 变成 ≈ 前缀长度）——本轮**未验证**；
+2. text 形态下输出格式靠指令约束，偶发非法 JSON 会走"插件回 `null` ⇒ 核心回退内置压缩"；
+3. 内置总结器（`LlmSummarizer`）本就不复用对话前缀，不在本次范围。

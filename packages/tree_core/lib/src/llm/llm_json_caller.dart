@@ -12,11 +12,16 @@ import 'llm_types.dart';
 /// 模型解析器（与 [LlmAgentEngine.resolveModel] 同一口径）。
 typedef JsonCallModelResolver = CoreModelConfig? Function(String modelId);
 
-/// `llm.call`（执行站命令）的落点：**硬设 JSON 返回形式**的一次性 LLM 调用。
+/// `llm.call`（执行站命令）的落点：一次性 LLM 调用，**缺省硬设 JSON 返回形式**。
 ///
-/// 用户定稿语义（2026-10-01）：
-/// - **站点处硬设** `response_format = {"type":"json_object"}`——不是可选参数，
-///   插件拿到的就是 JSON 形式；端点不支持时**如实失败**（不静默去掉再试一次）；
+/// 用户定稿语义（2026-10-01；2026-10-04 增补 text 覆盖）：
+/// - **缺省**在站点处硬设 `response_format = {"type":"json_object"}`；插件拿到的就是
+///   JSON 形式，端点不支持时**如实失败**（不静默去掉再试一次）；
+/// - **显式 `responseFormat: 'text'`** 时**不发** `response_format`：实测
+///   `{"type":"json_object"}` 会让端点**改写提示词**（同一批 messages 恒定 +22 token，
+///   且改写落在 messages 区域之前/其中），于是"逐字复用对话前缀"的调用命中率从
+///   `384/492` 掉到 **0**；要省这笔钱（长会话压缩的输入动辄 15 万~60 万 token）就必须
+///   走 text 形态，见 `docs/known-issues.md` #27。
 /// - **复用对应 agent 的模型**：由调用方按 agent 解析 modelId（成员级覆盖照旧生效），
 ///   [model] 参数只作显式覆盖；
 /// - 这是一次**独立**的调用：不进任何中转站点位、不计入该 agent 的对话用量
@@ -98,6 +103,9 @@ class LlmJsonCaller {
   /// 它的回包回来之前，B 又设置一次，A 的账就会落到 B 的会话上。按调用传入 ⇒ 每次
   /// 绑定自己的会话，零共享状态。
   /// 返回 `{ok: true, json, text, model, usage}` 或 `{error: 可读原因}`。
+  ///
+  /// [responseFormat] = `'text'` 时**不发** `response_format`（请求体与对话那一轮同形态，
+  /// 前缀缓存才可能命中）；`null` 或其它值 = 站点缺省的 **JSON 返回形式**。
   Future<Map<String, dynamic>> call({
     required String agentId,
     required String modelId,
@@ -108,6 +116,7 @@ class LlmJsonCaller {
     double? temperature,
     int? maxTokens,
     List<Object?>? tools,
+    String? responseFormat,
     UsageSink? usageSink,
   }) async {
     final CoreModelConfig? resolved = resolveModel(modelId);
@@ -169,10 +178,16 @@ class LlmJsonCaller {
       ],
       maxOutputTokens: maxTokens != null && maxTokens > 0 ? maxTokens : null,
       temperature: temperature,
-      // **站点处硬设**：JSON 返回形式由这里统一加上，插件不需要也无法关掉它。
-      extra: const <String, dynamic>{
-        'response_format': <String, dynamic>{'type': 'json_object'},
-      },
+      // 返回形式（**站点口径**：调用方只能在 text / json 之间选，塞不进别的值）：
+      // - 缺省（含 `null`）= **硬设 JSON**，与引入 text 分支前逐字一致；
+      // - `'text'` = **不发**该字段 ⇒ 请求体与对话那一轮同形态，前缀缓存才可复用
+      //   （实测：只加 `{"type":"json_object"}` 就让同一 492 token 前缀的命中从
+      //   384/256 掉到 0；见 docs/known-issues.md #27）。
+      extra: responseFormat == 'text'
+          ? const <String, dynamic>{}
+          : const <String, dynamic>{
+              'response_format': <String, dynamic>{'type': 'json_object'},
+            },
     );
     final StringBuffer text = StringBuffer();
     LlmUsage usage = const LlmUsage();
