@@ -16,9 +16,12 @@ import '../store/write_queue.dart';
 /// - **tee 而不是替换**：stderr 逐字保持原样（开发期 `flutter run` / `--verbose`
 ///   照旧看得到，`packages/tree_core_cli/test/cli_serve_test.dart` 也按 stderr 断言），
 ///   文件是**副本**。落盘失败时 stderr 照旧 ⇒ 核心功能永不因此受损。
-/// - **行首带 pid**（`pid=1234 [core:compact] …`）：只加在**文件**行上，不动 stderr。
-///   开发期的标准姿势是"App 的核心"与"自己单独起的 `tree_core.exe --data-dir …`"
-///   同时写同一个数据根，两进程的内容混在一个文件里无法归因，pid 是唯一现成的身份。
+/// - **行首带时间戳与 pid**（`2026-10-05T07:24:31.123+08:00 pid=1234 [core:compact] …`）：
+///   只加在**文件**行上，不动 stderr。
+///   时间戳是**本地时间**（毫秒 3 位 + 显式时区偏移），回答"这件事是什么时候发生的"；
+///   pid 则回答"是哪个核心进程写的"——开发期的标准姿势是"App 的核心"与"自己单独起的
+///   `tree_core.exe --data-dir …`"同时写同一个数据根，两进程的内容混在一个文件里无法归因，
+///   pid 是唯一现成的身份。
 /// - **懒打开**：构造函数不碰磁盘（`--print-paths` / `--help` / 测试里构造都零副作用），
 ///   第一次 [write] 才入队；目录与文件由 [AtomicFile.appendLine] 按需创建。
 /// - **按大小轮转**：默认 8 MiB × 5 份（[defaultMaxBytes] / [defaultMaxFiles]）。
@@ -35,6 +38,8 @@ class CoreLogSink {
   /// [processId] 默认取当前进程 pid；
   /// [stderrSink] 默认 `stderr.writeln`（这是"保持现状"的那条出口）；
   /// [failureLog] 落盘失败时的唯一一次提示出口（默认同样走 stderr）。
+  /// [clock] 取**当前时刻**的接缝（默认 [DateTime.now]）——测试注入假时钟即可对
+  /// 落盘行首的时间戳做精确断言；它只在 [write] 里被调用，构造仍不碰磁盘。
   CoreLogSink(
     this.paths, {
     this.maxBytes = defaultMaxBytes,
@@ -42,9 +47,11 @@ class CoreLogSink {
     int? processId,
     void Function(String line)? stderrSink,
     void Function(String message)? failureLog,
+    DateTime Function()? clock,
   }) : _pid = processId ?? pid,
        _stderr = stderrSink ?? ((String line) => stderr.writeln(line)),
-       _failureLog = failureLog ?? ((String message) => stderr.writeln(message));
+       _failureLog = failureLog ?? ((String message) => stderr.writeln(message)),
+       _clock = clock ?? DateTime.now;
 
   /// 默认单份上限：8 MiB。
   static const int defaultMaxBytes = 8 * 1024 * 1024;
@@ -64,6 +71,7 @@ class CoreLogSink {
   final int _pid;
   final void Function(String line) _stderr;
   final void Function(String message) _failureLog;
+  final DateTime Function() _clock;
 
   final WriteQueue _queue = WriteQueue();
 
@@ -93,8 +101,40 @@ class CoreLogSink {
       // stderr 已关闭（父进程不接管、管道断裂）：日志无处可去，但绝不影响调用方。
     }
     if (_degraded) return;
-    // 文件行带 pid：同一数据根可能同时有"App 的核心"与"开发期自起的核心"在写。
-    _queue.enqueue(logFile, () => _append('pid=$_pid $line'));
+    // 时间戳**在调用当下取**：入队是 write-behind，等到队列里（甚至等到真正落盘）
+    // 再取就与"这件事发生的时刻"漂移了——磁盘慢、前面积压时尤其明显，
+    // 而"用户截图那一刻核心在干什么"恰恰是这行时间戳要回答的问题。
+    final String stamp = _timestamp(_clock());
+    // 文件行带时间戳与 pid：同一数据根可能同时有"App 的核心"与"开发期自起的核心"在写。
+    _queue.enqueue(logFile, () => _append('$stamp pid=$_pid $line'));
+  }
+
+  /// 落盘行的**行首时间戳**：`<本地时间 ISO8601（毫秒 3 位）><显式时区偏移>`，
+  /// 例如 `2026-10-05T07:24:31.123+08:00`；本机为 UTC 时是 `+00:00`（不写 `Z`）。
+  ///
+  /// 为什么自己拼而不直接用 `DateTime.toIso8601String()`：
+  /// 1. 本地时间的 `toIso8601String()` **不带偏移**（`2026-10-05T07:24:31.123`）——
+  ///    这份日志会被拷到别的机器/别的时区去看，没有偏移就无法换算回真实时刻；
+  /// 2. 带微秒时它输出 **6 位**小数，与"毫秒 3 位"的固定口径不符。
+  static String _timestamp(DateTime at) {
+    final DateTime local = at.toLocal();
+    final Duration offset = local.timeZoneOffset;
+    final int offsetMinutes = offset.inMinutes.abs();
+    final String sign = offset.isNegative ? '-' : '+';
+    final String date =
+        '${local.year.toString().padLeft(4, '0')}'
+        '-${local.month.toString().padLeft(2, '0')}'
+        '-${local.day.toString().padLeft(2, '0')}';
+    final String time =
+        '${local.hour.toString().padLeft(2, '0')}'
+        ':${local.minute.toString().padLeft(2, '0')}'
+        ':${local.second.toString().padLeft(2, '0')}'
+        '.${local.millisecond.toString().padLeft(3, '0')}';
+    final String zone =
+        '$sign'
+        '${(offsetMinutes ~/ 60).toString().padLeft(2, '0')}'
+        ':${(offsetMinutes % 60).toString().padLeft(2, '0')}';
+    return '$date' 'T' '$time$zone';
   }
 
   /// 取一个**固定前缀**的日志函数：`forPrefix('core:compact')` 等价于原来的
