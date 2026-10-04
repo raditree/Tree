@@ -332,5 +332,5 @@ Future<void> _untilTrue(
     if (condition()) return;
     await Future<void>.delayed(const Duration(milliseconds: 5));
   }
-  fail('超时等待：' + reason);
+  fail('超时等待：$reason');
 }
