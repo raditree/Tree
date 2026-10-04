@@ -1,7 +1,8 @@
 // 切 agent 的三个实测症状（用户 2026-10-03 口径）的回归测试：
 //
 // ① **不许闪"默认背景"空态**：切换/首载期间，历史还没回来时不许渲染欢迎空态
-//    （`👋 你好，欢迎使用 Tree`）；只有"确实加载完且真的没有消息"才显示空态。
+//    （空态的 §TREE§ 字标 +「你好，欢迎使用」，见 WelcomeMark）；只有"确实加载完
+//    且真的没有消息"才显示空态。
 //    切换期间窗口里也不许出现内容——尤其**不许把上一个 agent 的响应塞进新窗口**
 //    （各个 agent 的默认会话 id 都是 `session_default`，只比 session 是挡不住的）。
 // ② **首帧即底部**：历史到位后**第一个含内容的帧**就已经是完整的末尾一页、且已经在
@@ -33,6 +34,7 @@ import 'package:tree/ui/models/agent.dart';
 import 'package:tree/ui/models/message.dart';
 import 'package:tree/ui/widgets/message_list.dart';
 import 'package:tree/ui/widgets/message_panel.dart';
+import 'package:tree/ui/widgets/welcome_mark.dart';
 
 /// 假核心：会话列表 + 历史分页（两跳各有闸门）+ WS 升级。
 class _FakeCore {
@@ -44,7 +46,8 @@ class _FakeCore {
   int total = 3000;
 
   /// 一页多少条（= 面板的 `_historyPageSize`）
-  int pageSize = 200;
+  /// 假核心的一页大小 = 面板的窗口半径（51）：请求带的 limit 优先，这里只做兜底/上限。
+  int pageSize = 51;
 
   /// **到达顺序**的请求日志（`req sessions a2` / `resp history a2` …）
   final List<String> log = <String>[];
@@ -231,7 +234,7 @@ void main() {
       tester.widget<MessageList>(find.byType(MessageList));
 
   bool welcomeShown(WidgetTester tester) =>
-      find.text('你好，欢迎使用 Tree').evaluate().isNotEmpty;
+      find.byType(WelcomeMark).evaluate().isNotEmpty;
 
   Set<int> loadedOf(WidgetTester tester) {
     final List<ChatMessage?> slots = listOf(tester).slots;

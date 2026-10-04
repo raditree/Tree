@@ -11,6 +11,7 @@ import 'hook_notice_card.dart';
 import 'message_scrollbar.dart';
 import 'thinking_card.dart';
 import 'tool_call_card.dart';
+import 'welcome_mark.dart';
 
 /// 消息列表组件（StatelessWidget）
 ///
@@ -1065,23 +1066,10 @@ class _MessageListViewState extends State<_MessageListView> {
       // ——渲染静态骨架，别闪空态（用户 2026-10-03 症状 1）。面板在历史真正落地
       // （或明确失败）之后才把 [MessageList.loading] 摘掉，那时才会走到下面的欢迎页。
       if (widget.loading) return _buildLoadingSkeleton(context);
-      // 空态：居中排版，emoji 与文字分行（有插件卡片时不显示欢迎页）
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('👋', style: TextStyle(fontSize: 44)),
-            const SizedBox(height: 8),
-            Text(
-              '你好，欢迎使用 Tree',
-              style: TextStyle(
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-                fontSize: 14,
-              ),
-            ),
-          ],
-        ),
-      );
+      // 空态：居中排版（有插件卡片时不显示欢迎页）。标识本身见 [WelcomeMark]：
+      // 主题色的 TREE 字标 + HUD 三段线（用户 2026-10-04 定稿；原来是平台彩色的 👋，
+      // 染不上主题色，在绿 + 近黑的配色里是外来色）。
+      return const Center(child: WelcomeMark());
     }
     // 本帧构建到哪由 _buildItem 收集（只是兜底）+ 渲染树读取（权威），见 [_flushCoordinate]。
     // 首帧也要安排一次：否则空表 / 全占位时坐标一直是 unknown（拇指不画）。
