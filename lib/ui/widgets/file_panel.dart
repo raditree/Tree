@@ -82,6 +82,10 @@ class FilePanel extends StatefulWidget {
   /// 提问定位回调（透传给 [QuestionPanel]）
   final QuestionNavigateCallback? onNavigateToQuestion;
 
+  /// 「正在执行的 tool」定位回调（透传给 [ToolRunsPanel]）：点某一行切中栏到
+  /// 该运行所属的 agent / 会话。
+  final ToolRunNavigateCallback? onNavigateToToolRun;
+
   /// 插件槽位注册表（默认全局单例；测试注入独立实例，避免污染单例）
   final PluginUiRegistry? registry;
 
@@ -105,6 +109,7 @@ class FilePanel extends StatefulWidget {
     this.sessionId = 'session_default',
     this.onCollapse,
     this.onNavigateToQuestion,
+    this.onNavigateToToolRun,
     this.registry,
     this.selectTab,
     this.selectTabRevision = 0,
@@ -672,8 +677,12 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
                     onNavigateToQuestion: widget.onNavigateToQuestion,
                   ),
                   // 正在执行的 tool：核心内存登记表的快照 + 每行一个显式「关闭」
-                  // （与执行站 tool.close 同实现）。见 ToolRunsPanel。
-                  ToolRunsPanel(refreshTrigger: _toolRunsRefreshTrigger),
+                  // （与执行站 tool.close 同实现）；每行标注**来源**（agent · 会话），
+                  // 点整行切中栏到那里。见 ToolRunsPanel。
+                  ToolRunsPanel(
+                    refreshTrigger: _toolRunsRefreshTrigger,
+                    onNavigate: widget.onNavigateToToolRun,
+                  ),
                   // 详情页：中栏点中的工具调用 / 思考完整摊开（见 DetailPanel）
                   // 带上工作空间：edit 的「变更」要读一次当前文件才有上下文
                   DetailPanel(

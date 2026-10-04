@@ -463,15 +463,20 @@ class _MessagePanelState extends State<MessagePanel> {
   @override
   void didUpdateWidget(covariant MessagePanel oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // 右侧「问题回复」导航定位触发：记录待消费的定位目标
-    final bool navTriggered =
-        oldWidget.navigateTrigger != widget.navigateTrigger &&
+    // 外部导航请求（`navigateTrigger` 变化才算**新**请求）：
+    // - **定位到某条消息**（「问题回复」页点一条提问，滚动到那张卡片）；
+    // - **只切会话、不定位消息**（右栏「正在执行的 tool」点一行运行）。
+    final bool navRequested =
+        oldWidget.navigateTrigger != widget.navigateTrigger;
+    final bool locateMessage =
+        navRequested &&
         widget.navigateMessageId != null &&
         widget.navigateMessageId!.isNotEmpty;
-    if (navTriggered) {
+    if (locateMessage) {
       _pendingScrollId = widget.navigateMessageId;
       _pendingSessionId = widget.navigateSessionId;
     }
+    final bool switchSessionOnly = navRequested && !locateMessage;
 
     // 切换 Agent 或外部触发刷新时清空消息列表并加载历史
     if (oldWidget.selectedAgent?.id != widget.selectedAgent?.id) {
@@ -515,28 +520,52 @@ class _MessagePanelState extends State<MessagePanel> {
         _viewSubagentId = '';
       });
       _loadHistory();
-    } else if (navTriggered) {
+    } else if (locateMessage) {
       // 同 agent 定位：按目标会话切换（若不同）后加载历史并定位
       final String? targetSession = widget.navigateSessionId;
       if (targetSession != null &&
           targetSession.isNotEmpty &&
           targetSession != _currentSessionId) {
-        final ChatSession? ts = _sessions
-            .where((ChatSession s) => s.sessionId == targetSession)
-            .cast<ChatSession?>()
-            .firstWhere((ChatSession? s) => s != null, orElse: () => null);
-        setState(() {
-          _currentSession = ts;
-          _clearWindow();
-        });
-        widget.onSessionChanged?.call(targetSession);
-        _loadHistory();
+        _switchToRequestedSession();
       } else if (_window.isEmpty) {
         _loadHistory();
       } else {
         _consumePendingScroll();
       }
+    } else if (switchSessionOnly) {
+      // 只切会话（右栏「正在执行的 tool」点一行运行）：目标会话与当前不同才动，
+      // 相同就什么都不做（不要白重拉一次历史）。
+      if (widget.navigateSessionId != _currentSessionId) {
+        _switchToRequestedSession();
+      }
     }
+  }
+
+  /// 切到外部请求的目标会话（`widget.navigateSessionId`）并加载历史。
+  ///
+  /// 两个入口共用：定位到消息（先切会话再滚动）与**只切会话**。
+  /// 目标会话还不在本地列表里时**不猜**：记成"该 agent 上次浏览的会话"并重拉列表，
+  /// 由服务端列表（[_loadSessions]）决定选中谁——否则 `_currentSession` 会留 null，
+  /// 后续 `_loadHistory` 跑到默认会话上，表现为"点了没切过去 / 内容串了"。
+  void _switchToRequestedSession() {
+    final Agent? agent = widget.selectedAgent;
+    final String? targetSession = widget.navigateSessionId;
+    if (agent == null || targetSession == null || targetSession.isEmpty) return;
+    final ChatSession? ts = _sessions
+        .where((ChatSession s) => s.sessionId == targetSession)
+        .cast<ChatSession?>()
+        .firstWhere((ChatSession? s) => s != null, orElse: () => null);
+    _lastSessionByAgent[agent.id] = targetSession;
+    if (ts == null) {
+      _loadSessions();
+      return;
+    }
+    setState(() {
+      _currentSession = ts;
+      _clearWindow();
+    });
+    widget.onSessionChanged?.call(targetSession);
+    _loadHistory();
   }
 
   /// 消费定位目标：先在窗口里把目标那一段补回来（见 [_locateMessage]），

@@ -1,7 +1,18 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
+import '../models/agent.dart';
+import '../models/session.dart';
 import '../models/tool_run.dart';
+
+/// 「正在执行的 tool」的**定位回调**：点某一行，切中栏到这次运行所属的
+/// **agent / 会话**（与「问题回复」页的 `QuestionNavigateCallback` 同一范式）。
+///
+/// 由 `MainPage` 提供；**未接线时行不可点**（没有跳转能力就不假装能跳）。
+typedef ToolRunNavigateCallback =
+    void Function({required String agentId, required String sessionId});
 
 /// 右栏「正在执行的 tool」面板：把"哪个工具正卡着"从"只能猜"变成**看得见 + 关得掉**。
 ///
@@ -22,10 +33,17 @@ import '../models/tool_run.dart';
 /// `WorkspaceRefreshService`：那是个"取走即清空"的通知（`takeAreas()`），两个监听者会互相
 /// 抢——文件页的刷新会被面板吃掉。
 class ToolRunsPanel extends StatefulWidget {
-  const ToolRunsPanel({super.key, this.refreshTrigger = 0});
+  const ToolRunsPanel({
+    super.key,
+    this.refreshTrigger = 0,
+    this.onNavigate,
+  });
 
   /// 工作空间刷新触发计数（`WorkspaceArea.toolRuns`）：值变化即重拉登记表。
   final int refreshTrigger;
+
+  /// 点某一行时切中栏到该运行所属的 agent / 会话（null = 行不可点）。
+  final ToolRunNavigateCallback? onNavigate;
 
   @override
   State<ToolRunsPanel> createState() => _ToolRunsPanelState();
@@ -46,6 +64,17 @@ class _ToolRunsPanelState extends State<ToolRunsPanel> {
 
   /// 正在关闭中的句柄（按钮禁用，避免连点发两次关）。
   final Set<String> _closing = <String>{};
+
+  /// agent 名（id → name）。拉不到就不放进来，界面**回退显示 id**（不假装有名字）。
+  final Map<String, String> _agentNames = <String, String>{};
+
+  /// 会话标题（agentId → sessionId → title）。同上：拉不到就用 id 兜底。
+  final Map<String, Map<String, String>> _sessionTitles =
+      <String, Map<String, String>>{};
+
+  /// 已经拉过（或正在拉）的 agent：agent 列表一次、会话列表按 agent 各一次。
+  bool _agentsRequested = false;
+  final Set<String> _sessionsRequested = <String>{};
 
   @override
   void initState() {
@@ -84,6 +113,8 @@ class _ToolRunsPanelState extends State<ToolRunsPanel> {
           (String handle) => !runs.any((ToolRun r) => r.handle == handle),
         );
       });
+      // 名字是**加分项**：补不上照样显示 id，列表一次都不等它。
+      unawaited(_loadNames(runs));
     } catch (e) {
       if (!mounted) return;
       final String reason = _readable(e);
@@ -96,6 +127,66 @@ class _ToolRunsPanelState extends State<ToolRunsPanel> {
         }
       });
     }
+  }
+
+  /// 一行的来源文案：`<agent 名> · <会话标题>`。
+  ///
+  /// **名字/标题是加分项**：拉不到就回退显示 id（`session_default` 显示成「默认会话」），
+  /// 绝不编一个名字出来——面板要能一眼看出"这是谁的哪条会话"，而不是看起来像有名字。
+  String _sourceLabel(ToolRun run) {
+    final String name = _agentNames[run.agentId]?.trim() ?? '';
+    final String agent = name.isNotEmpty
+        ? name
+        : (run.agentId.isNotEmpty ? run.agentId : '未知 agent');
+    final String title = _sessionTitles[run.agentId]?[run.sessionId]?.trim() ?? '';
+    final String session = title.isNotEmpty
+        ? title
+        : (run.sessionId == 'session_default'
+              ? '默认会话'
+              : (run.sessionId.isNotEmpty ? run.sessionId : '未知会话'));
+    return '$agent · $session';
+  }
+
+  /// 补名字（agent 名 / 会话标题）：**纯装饰**，失败不提示、不阻塞列表。
+  ///
+  /// 请求量控制：agent 列表**一次**；会话列表按**快照里出现过的 agent** 各一次并缓存
+  /// （面板刷新时不重复拉）。失败时清掉"已拉过"标记，下次刷新再试。
+  Future<void> _loadNames(List<ToolRun> runs) async {
+    final Set<String> agentIds = <String>{
+      for (final ToolRun run in runs)
+        if (run.agentId.isNotEmpty) run.agentId,
+    };
+    if (agentIds.isEmpty) return;
+    bool changed = false;
+    if (!_agentsRequested) {
+      _agentsRequested = true;
+      try {
+        final List<Agent> agents = await ApiService.getAgents();
+        for (final Agent agent in agents) {
+          final String name = agent.name.trim();
+          if (name.isNotEmpty) _agentNames[agent.id] = name;
+        }
+        changed = true;
+      } catch (_) {
+        _agentsRequested = false;
+      }
+    }
+    for (final String agentId in agentIds) {
+      if (_sessionTitles.containsKey(agentId)) continue;
+      if (_sessionsRequested.contains(agentId)) continue;
+      _sessionsRequested.add(agentId);
+      try {
+        final List<ChatSession> sessions = await ApiService.getSessions(agentId);
+        _sessionTitles[agentId] = <String, String>{
+          for (final ChatSession session in sessions)
+            session.sessionId: session.title,
+        };
+        changed = true;
+      } catch (_) {
+        _sessionsRequested.remove(agentId);
+      }
+    }
+    if (changed && mounted) setState(() {});
   }
 
   /// 关闭一个运行中的工具：成功后重拉登记表（那一行该消失了）。
@@ -214,8 +305,13 @@ class _ToolRunsPanelState extends State<ToolRunsPanel> {
     return ListView.builder(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       itemCount: _runs.length,
-      itemBuilder: (BuildContext context, int index) =>
-          _ToolRunRow(run: _runs[index], closing: _closing.contains(_runs[index].handle), onClose: _close),
+      itemBuilder: (BuildContext context, int index) => _ToolRunRow(
+        run: _runs[index],
+        closing: _closing.contains(_runs[index].handle),
+        sourceLabel: _sourceLabel(_runs[index]),
+        onClose: _close,
+        onNavigate: widget.onNavigate,
+      ),
     );
   }
 
@@ -247,12 +343,17 @@ class _ToolRunsPanelState extends State<ToolRunsPanel> {
   }
 }
 
-/// 一行：工具名（+ 超时标记）/ 命令摘要 / 已执行时长 / 关闭键。
+/// 一行：工具名（+ 超时标记）/ **来源（agent · 会话）** / 命令摘要 / 已执行时长 / 关闭键。
+///
+/// **来源可点**：接了 [onNavigate] 且这一行带 agent id 时，点整行切中栏到该 agent / 会话
+/// （与「问题回复」页的定位同一范式）；没接线或没有 agent ⇒ **不可点**（不假装能跳）。
 class _ToolRunRow extends StatelessWidget {
   const _ToolRunRow({
     required this.run,
     required this.closing,
+    required this.sourceLabel,
     required this.onClose,
+    this.onNavigate,
   });
 
   final ToolRun run;
@@ -260,114 +361,166 @@ class _ToolRunRow extends StatelessWidget {
   /// 这一行正在关闭（按钮禁用，避免连点发两次）。
   final bool closing;
 
+  /// 来源文案（`<agent 名> · <会话标题/id>`；名字取不到时退化成 id）。
+  final String sourceLabel;
+
   final Future<void> Function(ToolRun run) onClose;
+
+  /// 点这一行切到该 agent / 会话（null 或空 agent ⇒ 不可点）。
+  final ToolRunNavigateCallback? onNavigate;
 
   @override
   Widget build(BuildContext context) {
     final ColorScheme cs = Theme.of(context).colorScheme;
     final bool over = run.overThreshold;
-    return Container(
-      key: Key('tool-run-row-${run.handle}'),
-      margin: const EdgeInsets.symmetric(vertical: 2),
-      padding: const EdgeInsets.fromLTRB(8, 6, 4, 6),
-      decoration: over
-          ? BoxDecoration(
-              color: cs.errorContainer.withValues(alpha: 0.25),
-              borderRadius: BorderRadius.circular(6),
-            )
-          : null,
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          Padding(
-            padding: const EdgeInsets.only(top: 2),
-            child: Icon(
-              over ? Icons.hourglass_bottom : Icons.play_circle_outline,
-              size: 16,
-              color: over ? cs.error : cs.primary,
-            ),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: <Widget>[
-                Row(
+    final bool canNavigate = onNavigate != null && run.agentId.isNotEmpty;
+    return Tooltip(
+      message: canNavigate ? '切到 $sourceLabel' : '这条运行没有可定位的 agent / 会话',
+      child: InkWell(
+        // 点击目标单独一个 key：`tool-run-row-…` 留在 Container 上（既有断言按它取
+        // decoration 判超阈值高亮），不因为"这行能不能点"而换位置。
+        key: Key('tool-run-tap-${run.handle}'),
+        onTap: canNavigate
+            ? () => onNavigate!(agentId: run.agentId, sessionId: run.sessionId)
+            : null,
+        borderRadius: BorderRadius.circular(6),
+        child: Container(
+          key: Key('tool-run-row-${run.handle}'),
+          margin: const EdgeInsets.symmetric(vertical: 2),
+          padding: const EdgeInsets.fromLTRB(8, 6, 4, 6),
+          decoration: over
+              ? BoxDecoration(
+                  color: cs.errorContainer.withValues(alpha: 0.25),
+                  borderRadius: BorderRadius.circular(6),
+                )
+              : null,
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Icon(
+                  over ? Icons.hourglass_bottom : Icons.play_circle_outline,
+                  size: 16,
+                  color: over ? cs.error : cs.primary,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
                   children: <Widget>[
-                    Flexible(
-                      child: Text(
-                        run.tool.isEmpty ? '未知工具' : run.tool,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                    if (over)
-                      Padding(
-                        padding: const EdgeInsets.only(left: 6),
-                        child: Container(
-                          key: Key('tool-run-over-${run.handle}'),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 5,
-                            vertical: 1,
-                          ),
-                          decoration: BoxDecoration(
-                            color: cs.errorContainer,
-                            borderRadius: BorderRadius.circular(4),
-                          ),
+                    Row(
+                      children: <Widget>[
+                        Flexible(
                           child: Text(
-                            '已超时',
-                            style: TextStyle(
-                              fontSize: 10,
+                            run.tool.isEmpty ? '未知工具' : run.tool,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 12,
                               fontWeight: FontWeight.w600,
-                              color: cs.onErrorContainer,
                             ),
                           ),
                         ),
+                        if (over)
+                          Padding(
+                            padding: const EdgeInsets.only(left: 6),
+                            child: Container(
+                              key: Key('tool-run-over-${run.handle}'),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 5,
+                                vertical: 1,
+                              ),
+                              decoration: BoxDecoration(
+                                color: cs.errorContainer,
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text(
+                                '已超时',
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w600,
+                                  color: cs.onErrorContainer,
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 2),
+                    // 来源：这条运行是**谁**在**哪个会话**里跑的。名字是加分项，
+                    // 拉不到就显示 id（不假装有名字），点整行切过去。
+                    Row(
+                      children: <Widget>[
+                        Icon(
+                          Icons.account_tree_outlined,
+                          size: 11,
+                          color: cs.onSurfaceVariant,
+                        ),
+                        const SizedBox(width: 4),
+                        Flexible(
+                          child: Text(
+                            sourceLabel,
+                            key: Key('tool-run-source-${run.handle}'),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: cs.onSurfaceVariant,
+                            ),
+                          ),
+                        ),
+                        if (canNavigate) ...<Widget>[
+                          const SizedBox(width: 6),
+                          Text(
+                            '切过去',
+                            key: Key('tool-run-goto-${run.handle}'),
+                            style: TextStyle(fontSize: 10, color: cs.primary),
+                          ),
+                        ],
+                      ],
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      run.commandPreview.isEmpty
+                          ? '（无命令摘要）'
+                          : toolCommandPreview(run.commandPreview),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11,
+                        height: 1.25,
+                        fontFamily: 'monospace',
+                        color: cs.onSurfaceVariant,
                       ),
+                    ),
                   ],
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  run.commandPreview.isEmpty
-                      ? '（无命令摘要）'
-                      : toolCommandPreview(run.commandPreview),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+              ),
+              const SizedBox(width: 6),
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Text(
+                  toolElapsedLabel(run.elapsedMs),
                   style: TextStyle(
                     fontSize: 11,
-                    height: 1.25,
-                    fontFamily: 'monospace',
-                    color: cs.onSurfaceVariant,
+                    color: over ? cs.error : cs.onSurfaceVariant,
+                    fontWeight: over ? FontWeight.w600 : FontWeight.normal,
                   ),
                 ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 6),
-          Padding(
-            padding: const EdgeInsets.only(top: 2),
-            child: Text(
-              toolElapsedLabel(run.elapsedMs),
-              style: TextStyle(
-                fontSize: 11,
-                color: over ? cs.error : cs.onSurfaceVariant,
-                fontWeight: over ? FontWeight.w600 : FontWeight.normal,
               ),
-            ),
+              IconButton(
+                key: Key('tool-run-close-${run.handle}'),
+                tooltip: '关闭这个工具（先终止进程树，再从登记表收尾；与执行站 tool.close 同实现）',
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.cancel_outlined, size: 18),
+                onPressed: closing ? null : () => onClose(run),
+              ),
+            ],
           ),
-          IconButton(
-            key: Key('tool-run-close-${run.handle}'),
-            tooltip: '关闭这个工具（先终止进程树，再从登记表收尾；与执行站 tool.close 同实现）',
-            visualDensity: VisualDensity.compact,
-            icon: const Icon(Icons.cancel_outlined, size: 18),
-            onPressed: closing ? null : () => onClose(run),
-          ),
-        ],
+        ),
       ),
     );
   }

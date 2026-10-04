@@ -416,6 +416,21 @@
     **克制**的指示（小圆点 + 「工作中」，跟随主题色），空闲态**不加**任何东西；**主会话那条永不显示**
     （它不是临时员工）。状态**不塞回** `SubagentTranscript`——那是"过程 / 入口"的分栏，与"谁在跑"是两件事。
 
+23. **右栏「正在执行的 tool」每行标注来源（agent · 会话）且点得动：点整行切中栏到那里**
+    （[ui/widgets/tool_runs_panel.dart](ui/widgets/tool_runs_panel.dart) 的 `ToolRunNavigateCallback`、
+    [ui/pages/main_page.dart](ui/pages/main_page.dart) 的 `_handleNavigateToToolRun`，与「问题回复」页的
+    `QuestionNavigateCallback` 同一范式；`test/tool_runs_panel_test.dart` 钉住）：
+    - 来源直接取快照里的 `agent_id` / `session_id`（核心已经给了）；**名字是加分项**——agent 名来自
+      `GET /api/agents`、会话标题来自 `GET /api/agents/{id}/sessions`，**拉不到就回退显示 id**
+      （`session_default` 显示成「默认会话」），**绝不编一个名字出来**；名字接口挂了**不影响**列表与「关闭」。
+      请求量有界：agent 列表一次、会话列表按**快照里出现过的 agent** 各一次并缓存。
+    - 定位语义是**只切上下文、不滚动到某条消息**（与「问题回复」定位的区别）：`MainPage` 切
+      `_selectedAgent` / `_currentSessionId`、递增 `navigateTrigger` 并清空 `navigateMessageId`；
+      中栏 `MessagePanel` 因此走"只切会话"那条路（`_switchToRequestedSession`，目标会话不在本地列表时
+      **不猜**：记成"该 agent 上次浏览的会话"并重拉列表，由服务端列表决定选中谁）。
+    - **未接定位回调或该行没有 agent id ⇒ 整行不可点**（`onTap == null`，不假装能跳）；
+      目标 agent 已不存在 ⇒ 可读提示并**不动**当前上下文。
+
 ## 测试
 
 ```bash

@@ -283,6 +283,40 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     });
   }
 
+  /// 处理右侧「正在执行的 tool」页的**定位导航**：点某一行 ⇒ 切中栏到该运行所属的
+  /// **agent / 会话**（与「问题回复」页同一范式；只切上下文，**不**滚动定位到某条消息）。
+  ///
+  /// agent 已不存在（被删 / 是名册未知的临时员工 id）⇒ 给可读提示并**不动**当前上下文。
+  Future<void> _handleNavigateToToolRun({
+    required String agentId,
+    required String sessionId,
+  }) async {
+    Agent? target;
+    for (final Agent a in _agents) {
+      if (a.id == agentId) {
+        target = a;
+        break;
+      }
+    }
+    if (target == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('该运行所属 Agent 不存在或已删除')),
+        );
+      }
+      return;
+    }
+    final Agent targetAgent = target;
+    setState(() {
+      _selectedAgent = targetAgent;
+      _currentSessionId = sessionId;
+      // 只切上下文：清掉上一次的消息定位目标，并递增触发号让中栏按新会话重载
+      _navigateMessageId = null;
+      _navigateTrigger++;
+      _setTeamScope(targetAgent.teamScopeId);
+    });
+  }
+
   /// 弹出创建 Agent 配置对话框，并在确认后加入列表
   ///
   /// 创建成功的 Agent 会自动持久化到后端，并自动选中，方便立即开始对话。
@@ -633,6 +667,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                   teamName: _selectedAgent?.name ?? '',
                   sessionId: _currentSessionId,
                   onNavigateToQuestion: _handleNavigateToQuestion,
+                  onNavigateToToolRun: _handleNavigateToToolRun,
                   selectTab: _filePanelTab,
                   selectTabRevision: _filePanelTabRevision,
                 ),
@@ -1319,6 +1354,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         });
       },
       onNavigateToQuestion: _handleNavigateToQuestion,
+      // 「正在执行的 tool」点一行切中栏到该运行所属的 agent / 会话
+      onNavigateToToolRun: _handleNavigateToToolRun,
       // 引导「带我过去」的页签请求（按序号触发，见 _requestFilePanelTab）
       selectTab: _filePanelTab,
       selectTabRevision: _filePanelTabRevision,

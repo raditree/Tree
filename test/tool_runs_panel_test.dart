@@ -42,6 +42,18 @@ class _FakeToolsCore {
   int closeStatus = 200;
   String closeDetail = '';
 
+  /// `GET /api/agents` 要回的 agents（面板按 id → name 映射出"这是谁"）。
+  List<Map<String, dynamic>> agents = <Map<String, dynamic>>[];
+
+  /// `GET /api/agents/{id}/sessions` 要回的 sessions（sessionId → title）。
+  List<Map<String, dynamic>> sessions = <Map<String, dynamic>>[];
+
+  /// `GET /api/agents` 的脚本化失败。
+  int agentsStatus = 200;
+
+  /// `GET /api/agents/{id}/sessions` 的脚本化失败。
+  int sessionsStatus = 200;
+
   /// 假核心收到的关闭句柄（顺序保留：钉"发的是正确的那一个"）。
   final List<String> closeCalls = <String>[];
 
@@ -74,6 +86,23 @@ class _FakeToolsCore {
         payload = <String, dynamic>{'detail': runningDetail};
       } else {
         payload = <String, dynamic>{'runs': runs};
+      }
+    } else if (request.method == 'GET' && path.endsWith('/api/agents')) {
+      // 名字是"加分项"：这里也照真核心的形状回（`{agents: [...]}`）
+      if (agentsStatus != 200) {
+        status = agentsStatus;
+        payload = <String, dynamic>{'detail': 'agents 不可用（脚本化）'};
+      } else {
+        payload = <String, dynamic>{'agents': agents};
+      }
+    } else if (request.method == 'GET' &&
+        path.contains('/api/agents/') &&
+        path.endsWith('/sessions')) {
+      if (sessionsStatus != 200) {
+        status = sessionsStatus;
+        payload = <String, dynamic>{'detail': 'sessions 不可用（脚本化）'};
+      } else {
+        payload = <String, dynamic>{'sessions': sessions};
       }
     } else if (request.method == 'POST' &&
         path.endsWith('/close') &&
@@ -160,14 +189,21 @@ void main() {
     }
   }
 
-  Future<void> pumpPanel(WidgetTester tester, {int refreshTrigger = 0}) async {
+  Future<void> pumpPanel(
+    WidgetTester tester, {
+    int refreshTrigger = 0,
+    ToolRunNavigateCallback? onNavigate,
+  }) async {
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
           body: SizedBox(
             width: 700,
             height: 600,
-            child: ToolRunsPanel(refreshTrigger: refreshTrigger),
+            child: ToolRunsPanel(
+              refreshTrigger: refreshTrigger,
+              onNavigate: onNavigate,
+            ),
           ),
         ),
       ),
@@ -380,6 +416,71 @@ void main() {
 
       expect(core.runningRequests, 2);
       expect(find.text('find'), findsOneWidget);
+    });
+
+    testWidgets('每行标注来源（agent 名 · 会话标题），点整行切到那里', (
+      WidgetTester tester,
+    ) async {
+      core.agents = <Map<String, dynamic>>[
+        <String, dynamic>{'id': 'a1', 'name': '阿岩'},
+      ];
+      core.sessions = <Map<String, dynamic>>[
+        <String, dynamic>{'session_id': 'session_default', 'title': '训练A'},
+      ];
+      core.runs = <Map<String, dynamic>>[
+        runJson('toolrun_1'),
+        runJson('toolrun_2', tool: 'find'),
+      ];
+      String? navigatedAgent;
+      String? navigatedSession;
+      await pumpPanel(
+        tester,
+        onNavigate: ({required String agentId, required String sessionId}) {
+          navigatedAgent = agentId;
+          navigatedSession = sessionId;
+        },
+      );
+
+      expect(
+        find.text('阿岩 · 训练A'),
+        findsNWidgets(2),
+        reason: '两行都标出"这是谁的哪个会话"',
+      );
+      expect(find.text('切过去'), findsNWidgets(2));
+
+      await tester.tap(find.byKey(const Key('tool-run-tap-toolrun_2')));
+      await tester.pump();
+      expect(navigatedAgent, 'a1');
+      expect(navigatedSession, 'session_default');
+    });
+
+    testWidgets('名字拉不到 ⇒ 回退显示 id / 「默认会话」，不假装有名字', (
+      WidgetTester tester,
+    ) async {
+      core.runs = <Map<String, dynamic>>[runJson('toolrun_1')];
+      await pumpPanel(tester);
+      expect(find.text('a1 · 默认会话'), findsOneWidget);
+    });
+
+    testWidgets('名字接口挂了只影响这一行文案，不影响列表与关闭；未接线时行不可点', (
+      WidgetTester tester,
+    ) async {
+      core.agentsStatus = 500;
+      core.sessionsStatus = 500;
+      core.runs = <Map<String, dynamic>>[runJson('toolrun_1')];
+      await pumpPanel(tester);
+
+      expect(find.text('a1 · 默认会话'), findsOneWidget);
+      expect(find.text('terminal'), findsOneWidget, reason: '名字拉不到也不该空列表');
+      expect(find.text('切过去'), findsNothing, reason: '没接定位回调就不显示可点提示');
+      final InkWell row = tester.widget<InkWell>(
+        find.byKey(const Key('tool-run-tap-toolrun_1')),
+      );
+      expect(row.onTap, isNull, reason: '没接定位回调 ⇒ 整行不可点（不假装能跳）');
+
+      await tester.tap(find.byKey(const Key('tool-run-close-toolrun_1')));
+      await flyIO(tester);
+      expect(core.closeCalls, <String>['toolrun_1'], reason: '关闭照常可用');
     });
   });
 
