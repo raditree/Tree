@@ -4,7 +4,7 @@ description: Tree - LLM 驱动的 agent 团队桌面效率工具
 publish_to: 'none'
 
 # 应用版本号与构建号
-version: 1.0.2+1
+version: 1.0.2+2
 
 # desktop 分支：升级到 Dart 3（Flutter 3.47.5 / Dart 3.13.4），放弃 Windows 7/8（最低 Windows 10）
 environment:

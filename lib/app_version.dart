@@ -14,7 +14,7 @@ import 'io/core_process_launcher.dart';
 const String kAppVersion = '1.0.2';
 
 /// 应用构建号（pubspec `version:` 的 `+` 后半段，同一处测试钉住）。
-const String kAppBuildNumber = '1';
+const String kAppBuildNumber = '2';
 
 /// 客户端与核心之间的**接口契约版本**（见各 REST 注释里的「契约 vX.Y」）。
 ///
