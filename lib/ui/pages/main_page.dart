@@ -33,7 +33,8 @@ import 'settings_page.dart';
 /// 中栏：消息交互（弹性宽度，占据剩余空间，最小 360px）
 /// 右栏：文件管理（初始 340px，最小 240px，**上限随窗口宽度变化**）
 ///
-/// 支持通过拖拽分隔条调整左栏和右栏宽度；
+/// 支持通过拖拽分隔条调整左栏和右栏宽度；**中栏也能折叠**（收成窄条，让出的
+/// 宽度归展开着的侧栏，右栏优先）——右栏读文件时因此能用满整窗；
 /// 窗口尺寸过小时显示提示页面。
 class MainPage extends StatefulWidget {
   /// 插件槽位注册表（默认全局单例；测试注入独立实例，避免污染单例）
@@ -54,6 +55,12 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   // 折叠状态
   bool _leftCollapsed = false;
   bool _rightCollapsed = false;
+  /// 中栏（消息交互）是否折叠成窄条
+  ///
+  /// 用户 2026-10-04：「中间页支持折叠（右侧面板文件浏览时还是不够用）」——
+  /// 折叠中栏让出的宽度交给**展开着的侧栏**（右栏优先，见 [_rightAbsorbs]），
+  /// 这时右栏一路顶到窗口最右边，读文件能用满整窗；再点窄条上的箭头就回来。
+  bool _centerCollapsed = false;
 
   // 折叠时宽度
   static const double _collapsedWidth = 40;
@@ -120,6 +127,30 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
 
   /// 中栏（消息交互）最小宽度：左右栏变宽时给中栏留出的底线，防止中栏被压没。
   static const double _centerMinWidth = 360;
+
+  /// 中栏当前要预留的宽度：折叠时它只剩一根 [_collapsedWidth] 窄条，
+  /// 展开时才要 [_centerMinWidth]。侧栏预算与拖拽上限都以它为基准，
+  /// 所以折叠中栏之后侧栏能一路拖到接近整窗宽。
+  double get _centerReserveWidth =>
+      _centerCollapsed ? _collapsedWidth : _centerMinWidth;
+
+  /// 中栏折叠时**右栏承接**它让出的宽度。
+  ///
+  /// 右栏优先是有理由的：折叠中栏的动机就是"右栏读文件要地方"。
+  bool get _rightAbsorbs => _centerCollapsed && !_rightCollapsed;
+
+  /// 右栏也收着时，由左栏承接。
+  bool get _leftAbsorbs => _centerCollapsed && _rightCollapsed && !_leftCollapsed;
+
+  /// 固定占用的横向宽度：活动栏 + 当前**可见**的分隔条。
+  ///
+  /// 收起的分隔条不占宽度（原有行为）；正在**承接**中栏空间的侧栏，它的分隔条
+  /// 也不占宽度——那一侧的宽度此刻由窗口决定，不再是用户可拖的量（拖它不会有
+  /// 任何位移，留着只会让人以为控件坏了）。
+  double get _chromeWidth =>
+      _activityBarWidth +
+      ((_leftCollapsed || _leftAbsorbs) ? 0 : _dividerWidth) +
+      ((_rightCollapsed || _rightAbsorbs) ? 0 : _dividerWidth);
 
   /// 当前 build 时整页可用宽度（由 [_buildThreeColumnLayout] 的 LayoutBuilder 写入）。
   /// 拖拽侧栏分隔条时用它算上限；为 null 表示尚未完成首帧布局。
@@ -764,21 +795,40 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     final (double renderLeft, double renderRight) = budget == null || _sideDragging
         ? (_leftWidth, _rightWidth)
         : _fitSideWidths(budget, _leftWidth, _rightWidth);
+    // 中栏折叠时它只占一根窄条，但展开内容仍要按"折叠前的宽度"布局
+    // （见 [_centerRenderWidth]：在 40px 宽的视口里重排会把消息流挤成一列）。
+    final double renderCenter = _centerRenderWidth(
+      availableWidth,
+      renderLeft,
+      renderRight,
+    );
+    // 谁承接中栏让出的宽度（右栏优先；两侧都收着则没人接）
+    final bool leftAbsorbs = _leftAbsorbs;
+    final bool rightAbsorbs = _rightAbsorbs;
     return Row(
       children: [
         // 左侧活动栏：切换左栏功能面板（Agent 列表 / 插件），常驻显示
         _buildActivityBar(),
         // 左栏面板区（Agent 列表或插件；收起时只留窄条）
-        _buildSidebar(
-          key: const ValueKey<String>('main-left-sidebar'),
-          collapsed: _leftCollapsed,
-          expandedWidth: renderLeft,
-          collapsedBar: _buildCollapsedLeftBar(),
-          expandedBar: _buildLeftPanel(),
+        //
+        // 外面这层 Flexible 是**常驻**的（只是 flex 在 0/1 之间变）：不能按状态
+        // 换控件类型——SizedBox ↔ Flexible 一变，这棵子树会被整个重建，左栏的
+        // 滚动位置与当前面板就丢了。flex 0 = 不做弹性（自己定宽度），
+        // flex 1 = 承接中栏让出的宽度（见 [_leftAbsorbs]）。
+        Flexible(
+          flex: leftAbsorbs ? 1 : 0,
+          child: _buildSidebar(
+            key: const ValueKey<String>('main-left-sidebar'),
+            collapsed: _leftCollapsed,
+            expandedWidth: renderLeft,
+            fill: leftAbsorbs,
+            collapsedBar: _buildCollapsedLeftBar(),
+            expandedBar: _buildLeftPanel(),
+          ),
         ),
         // 拖拽分隔条 1（控制左栏宽度；折叠时平滑收为 0）
         _buildAnimatedDivider(
-          collapsed: _leftCollapsed,
+          hidden: _leftCollapsed || leftAbsorbs,
           divider: DraggableDivider(
             onDragStart: () => _beginSideDrag(),
             onDragEnd: _endSideDrag,
@@ -793,31 +843,21 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                   true,
                 );
                 _leftWidth = l;
-                if (!_rightCollapsed) _rightWidth = r;
+                // 右栏正在承接中栏让出的宽度：它的宽度由窗口决定，
+                // 拖左分隔条只改左栏（否则会悄悄改掉一个看不见的量）
+                if (!_rightCollapsed && !_rightAbsorbs) _rightWidth = r;
               });
             },
           ),
         ),
-        // 中栏：消息交互（弹性宽度）
-        Expanded(
-          child: MessagePanel(
-            selectedAgent: _selectedAgent,
-            refreshTrigger: _refreshTrigger,
-            onSessionChanged: (String id) {
-              setState(() {
-                _currentSessionId = id;
-              });
-            },
-            navigateMessageId: _navigateMessageId,
-            navigateSessionId: _currentSessionId,
-            navigateTrigger: _navigateTrigger,
-            // 成员配置变更后重拉 agent 列表：刷新待处理成员红点/角标
-            onAgentsChanged: _loadAgents,
-          ),
+        // 中栏：消息交互（弹性宽度；折叠时收成窄条，宽度让给侧栏）
+        Flexible(
+          flex: _centerCollapsed ? 0 : 1,
+          child: _buildCenterPane(expandedWidth: renderCenter),
         ),
         // 拖拽分隔条 2（控制右栏宽度；折叠时平滑收为 0）
         _buildAnimatedDivider(
-          collapsed: _rightCollapsed,
+          hidden: _rightCollapsed || rightAbsorbs,
           divider: DraggableDivider(
             onDragStart: () => _beginSideDrag(),
             onDragEnd: _endSideDrag,
@@ -832,24 +872,146 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                   false,
                 );
                 _rightWidth = r;
-                if (!_leftCollapsed) _leftWidth = l;
+                // 左栏正在承接中栏让出的宽度：它的宽度由窗口决定，拖右分隔条只改右栏
+                if (!_leftCollapsed && !_leftAbsorbs) _leftWidth = l;
               });
             },
           ),
         ),
-        // 右栏：文件管理（收起时只留窄条）
-        _buildSidebar(
-          key: const ValueKey<String>('main-right-sidebar'),
-          collapsed: _rightCollapsed,
-          expandedWidth: renderRight,
-          collapsedBar: _buildCollapsedRightBar(),
-          expandedBar: _buildFilePanel(),
+        // 右栏：文件管理（收起时只留窄条；中栏折叠时由它承接让出的宽度）
+        Flexible(
+          flex: rightAbsorbs ? 1 : 0,
+          child: _buildSidebar(
+            key: const ValueKey<String>('main-right-sidebar'),
+            collapsed: _rightCollapsed,
+            expandedWidth: renderRight,
+            fill: rightAbsorbs,
+            collapsedBar: _buildCollapsedRightBar(),
+            expandedBar: _buildFilePanel(),
+          ),
         ),
+        // 中栏折叠、两侧也都收着：没人承接的宽度由空占位吃掉。
+        // 少了它，整行会在右端留一块空白（三根折叠窄条全贴在左边）。
+        if (_centerCollapsed && !leftAbsorbs && !rightAbsorbs) const Spacer(),
       ],
     );
   }
 
-  /// 侧栏（左/右）可用宽度预算：可用宽度扣掉固定占用与中栏最小宽度后的剩余。
+  /// 构建中栏（消息交互）。
+  ///
+  /// 中栏是**弹性列**，没有固定宽度：展开时吃满剩余空间，折叠时收成
+  /// [_collapsedWidth] 窄条并把宽度让给侧栏。展开内容始终以 [expandedWidth]
+  /// （= 折叠前的宽度）挂载、被 ClipRect 裁掉——与左右栏同一套机制，
+  /// 所以折叠再展开**会话、消息滚动位置、输入框草稿都不丢**。
+  Widget _buildCenterPane({required double expandedWidth}) {
+    return _buildSidebar(
+      key: const ValueKey<String>('main-center-sidebar'),
+      collapsed: _centerCollapsed,
+      expandedWidth: expandedWidth,
+      // 展开时它是唯一的弹性列，宽度由父级给（不是固定像素）
+      fill: !_centerCollapsed,
+      collapsedBar: _buildCollapsedCenterBar(),
+      expandedBar: MessagePanel(
+        selectedAgent: _selectedAgent,
+        refreshTrigger: _refreshTrigger,
+        onSessionChanged: (String id) {
+          setState(() {
+            _currentSessionId = id;
+          });
+        },
+        navigateMessageId: _navigateMessageId,
+        navigateSessionId: _currentSessionId,
+        navigateTrigger: _navigateTrigger,
+        // 成员配置变更后重拉 agent 列表：刷新待处理成员红点/角标
+        onAgentsChanged: _loadAgents,
+        // 折叠中栏：把宽度让给侧栏（标题栏最右边那颗 chevron）
+        onCollapse: () {
+          setState(() {
+            _centerCollapsed = true;
+          });
+        },
+      ),
+    );
+  }
+
+  /// 中栏"折叠前应有的宽度"：可用宽度扣掉固定占用与两侧当前宽度。
+  ///
+  /// 中栏没有固定宽度，折叠时得反算一个值给展开内容定宽（见 [_buildCenterPane]）：
+  /// 在 40px 宽的视口里重排，消息流会被挤成一列，滚动位置也会被夹回去。
+  /// 这个值不必精确——差几像素只是被裁掉的内容多/少一列。
+  double _centerRenderWidth(
+    double availableWidth,
+    double leftWidth,
+    double rightWidth,
+  ) {
+    final double leftSlot = _leftCollapsed ? _collapsedWidth : leftWidth;
+    final double rightSlot = _rightCollapsed ? _collapsedWidth : rightWidth;
+    final double width = availableWidth - _chromeWidth - leftSlot - rightSlot;
+    // 下限就是 [_centerMinWidth]：中栏的内容（标题栏 + 输入框区）本身需要这么宽，
+    // 按更窄的宽度布局会当场 RenderFlex overflow——而它反正被 40px 的窄条裁掉，
+    // 用 360 布局与用 351 布局在屏幕上一模一样，只是后者会报错。
+    return width > _centerMinWidth ? width : _centerMinWidth;
+  }
+
+  /// 构建折叠状态的中栏（窄条 + 展开按钮）。
+  ///
+  /// 与左右栏的折叠窄条同一套语言：顶部一颗展开键，其余整条可点开。
+  Widget _buildCollapsedCenterBar() {
+    final cs = Theme.of(context).colorScheme;
+    return Container(
+      width: _collapsedWidth,
+      color: Theme.of(context).scaffoldBackgroundColor,
+      child: Column(
+        children: [
+          Container(
+            height: 48,
+            decoration: BoxDecoration(
+              color: cs.surface,
+              border: Border(
+                bottom: BorderSide(
+                  color: Theme.of(context).dividerColor,
+                  width: 1,
+                ),
+              ),
+            ),
+            child: Center(
+              child: IconButton(
+                tooltip: '展开中栏',
+                icon: const Icon(Icons.chevron_right),
+                onPressed: () {
+                  setState(() {
+                    _centerCollapsed = false;
+                  });
+                },
+              ),
+            ),
+          ),
+          Expanded(
+            // 整条窄条可点击展开（不只顶部按钮）
+            child: GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onTap: () {
+                setState(() {
+                  _centerCollapsed = false;
+                });
+              },
+              child: RotatedBox(
+                quarterTurns: 1,
+                child: Center(
+                  child: Text(
+                    '消息',
+                    style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 侧栏（左/右）可用宽度预算：可用宽度扣掉固定占用与中栏保底宽度后的剩余。
   ///
   /// 固定占用＝活动栏 + 两个分隔条（收起时其分隔条宽度为 0）。**必须**扣掉它们，
   /// 否则按预算拖到极限时中栏实际只剩 `360 - 48 - 12 = 300`，内部 Row 直接溢出。
@@ -860,20 +1022,14 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   /// 宽表格 / 宽 PDF）或长提示词编辑都能把任一侧拖到接近整窗宽，上限只由
   /// "中栏仍要留下 [_centerMinWidth]" 这一条底线决定。
   double? _sideBudgetFor(double availableWidth) {
-    final double chrome = _activityBarWidth +
-        (_leftCollapsed ? 0 : _dividerWidth) +
-        (_rightCollapsed ? 0 : _dividerWidth);
-    final double budget = availableWidth - chrome - _centerMinWidth;
+    final double budget =
+        availableWidth - _chromeWidth - _centerReserveWidth;
     return budget >= _minSideWidth ? budget : null;
   }
 
   /// 中栏实际可用宽度（供拖拽时反解单侧上限）。
-  double _centerAvailableFor(double availableWidth) {
-    final double chrome = _activityBarWidth +
-        (_leftCollapsed ? 0 : _dividerWidth) +
-        (_rightCollapsed ? 0 : _dividerWidth);
-    return availableWidth - chrome;
-  }
+  double _centerAvailableFor(double availableWidth) =>
+      availableWidth - _chromeWidth;
 
   /// 在预算内确定左/右栏宽度：**等比缩减**，两侧都不破下限。
   ///
@@ -931,9 +1087,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     double other,
     bool draggedLeft,
   ) {
-    // 中栏保底之后，留给两侧的总空间
+    // 中栏保底之后，留给两侧的总空间（中栏折叠时它只保底一根窄条）
     final double sideBudget =
-        _centerAvailableFor(available) - _centerMinWidth;
+        _centerAvailableFor(available) - _centerReserveWidth;
     final double draggedMin = draggedLeft ? _leftMinWidth : _rightMinWidth;
     final double otherMin = draggedLeft ? _rightMinWidth : _leftMinWidth;
     // 被拖拽侧的上限：总空间扣掉对侧下限
@@ -1020,16 +1176,22 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   /// 展开内容始终以完整宽度挂载（折叠时超出容器部分被裁剪，并被折叠窄条
   /// 覆盖、禁用点击），从而保留其 State（滚动位置、当前 Tab、文件查看器等），
   /// 避免折叠再展开后访问位置丢失。
+  /// [fill] 为真时展开态**吃满父级给的宽度**（中栏自己、以及折叠中栏时承接
+  /// 空间的侧栏）：宽度改由父级（[Flexible]）决定，内容按实际宽度布局——
+  /// 右栏读文件时因此能用满整窗，而不是被自己的宽度状态卡住。
   Widget _buildSidebar({
     Key? key,
     required bool collapsed,
     required double expandedWidth,
+    bool fill = false,
     required Widget collapsedBar,
     required Widget expandedBar,
   }) {
     return SizedBox(
       key: key,
-      width: collapsed ? _collapsedWidth : expandedWidth,
+      width: collapsed
+          ? _collapsedWidth
+          : (fill ? double.infinity : expandedWidth),
       child: ClipRect(
         clipBehavior: Clip.hardEdge,
         child: Stack(
@@ -1041,7 +1203,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
               top: 0,
               bottom: 0,
               left: 0,
-              width: expandedWidth,
+              width: fill ? null : expandedWidth,
+              right: fill ? 0 : null,
               child: IgnorePointer(
                 ignoring: collapsed,
                 child: TickerMode(enabled: !collapsed, child: expandedBar),
@@ -1055,19 +1218,22 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     );
   }
 
-  /// 折叠时的分隔条：收起时宽度平滑收为 0（不占空间）
+  /// 收起的侧栏所带的分隔条：宽度平滑收为 0（不占空间）
   ///
   /// 分隔条本身只有 6px，补间不会挤压中栏（预算按展开宽度计算，收起时更宽裕），
   /// 所以这里保留宽度过渡；侧栏宽度则必须当帧生效（见 [_buildSidebar]）。
+  ///
+  /// [hidden] 除了"这一侧收着"，还包括"这一侧正在承接中栏让出的空间"：那种
+  /// 状态下它的宽度由窗口决定，拖这颗分隔条不会有任何位移，留着只会误导。
   Widget _buildAnimatedDivider({
-    required bool collapsed,
+    required bool hidden,
     required Widget divider,
   }) {
     return AnimatedContainer(
       duration: _sidebarAnimDuration,
       curve: _sidebarAnimCurve,
-      width: collapsed ? 0 : _dividerWidth,
-      child: collapsed ? const SizedBox.shrink() : divider,
+      width: hidden ? 0 : _dividerWidth,
+      child: hidden ? const SizedBox.shrink() : divider,
     );
   }
 

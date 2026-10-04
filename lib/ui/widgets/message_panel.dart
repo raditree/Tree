@@ -72,6 +72,12 @@ class MessagePanel extends StatefulWidget {
   /// 成员配置变更后的回调（父页面重新拉取 agent 列表，刷新待处理成员红点）
   final VoidCallback? onAgentsChanged;
 
+  /// 折叠中栏（把宽度让给侧栏）
+  ///
+  /// 与 [FilePanel.onCollapse] 同一约定：只有宿主（MainPage 的三栏布局）传了
+  /// 回调，标题栏才有这颗键——单独 pump 本组件的测试布局一字不变。
+  final VoidCallback? onCollapse;
+
   /// 仅供测试：覆盖 `usage.jsonl` 的路径（`null` = 走正式入口，原样透传给
   /// [UsageLogFiles.readRecent] 的 `override`）。
   ///
@@ -98,6 +104,7 @@ class MessagePanel extends StatefulWidget {
     this.navigateSessionId,
     this.navigateTrigger = 0,
     this.onAgentsChanged,
+    this.onCollapse,
   });
 
   @override
@@ -2548,6 +2555,16 @@ class _MessagePanelState extends State<MessagePanel> {
               // 压缩期间禁用：后端按会话粒度互斥（防双击并发压缩），
               // 工作中由后端返回 agent_working 提示，不在此拦截
               onPressed: compacting ? null : () => _compactContext(agent.id),
+            ),
+          // 折叠中栏（用户 2026-10-04：「中间页支持折叠」）：放在标题栏最右端
+          // ——它紧挨着中栏与右栏的分隔条，折叠方向（chevron 指向左边）与
+          // 右栏那颗「折叠右侧栏」的 chevron_right 是同一套方向语言。
+          // 未选 Agent 时也在：那时中栏只剩一句提示，更该让得出去。
+          if (widget.onCollapse != null)
+            IconButton(
+              tooltip: '折叠中栏',
+              icon: const Icon(Icons.chevron_left, size: 20),
+              onPressed: widget.onCollapse,
             ),
         ],
       ),

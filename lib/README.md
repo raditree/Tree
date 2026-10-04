@@ -452,6 +452,24 @@
     - **已作答**：卡片底部逐题列出答案（未答的写「（未作答）」），不再显示输入框；右栏「问题回复」页
       同样逐题渲染与作答（`ApiService.answerQuestion(qid, answers)`）。
 
+25. **三栏骨架的宽度规则：中栏可折叠，让出的宽度归展开着的侧栏**（[ui/pages/main_page.dart](ui/pages/main_page.dart)、
+    [ui/widgets/message_panel.dart](ui/widgets/message_panel.dart) 的 `onCollapse`，
+    **用户断言 2026-10-04**：「中间页支持折叠（右侧面板文件浏览时还是不够用）」，
+    `test/main_page_center_collapse_test.dart` 钉住）：
+    - **宽度只有下限，上限由"中栏保底"定**：左 200 / 右 240，两栏**合计** ≤ 可用宽度 − 固定占用
+      （活动栏 48 + 可见的分隔条 6×n）− 中栏保底；中栏保底 **展开时 360**（它的标题栏 + 输入框区本身就要这么宽，
+      按更窄的宽度布局当场 `RenderFlex overflow`）、**折叠时 40**——所以折叠中栏后侧栏能一路拖到接近整窗宽，
+      展开中栏后再用同一份预算**等比收敛**回来；
+    - **折叠 = 收成 40px 窄条，内容仍按"折叠前的宽度"挂载**（`ClipRect` 裁剪 + `IgnorePointer` +
+      `TickerMode(false)`）：会话、消息滚动位置、输入框草稿都还在。按 40px 重排会把消息流挤成一列、
+      把滚动位置夹回去，所以中栏的"折叠前宽度"是反算出来的（它是弹性列，没有固定宽度），且**永不低于 360**；
+    - **让出的宽度交给展开着的侧栏**：右栏优先（折叠中栏的动机就是"右栏读文件要地方"），右栏也收着就给左栏，
+      两侧都收着则那块空间留空。承接侧按**父级给的真实宽度**布局（`_buildSidebar(fill:)`），而不是按它自己的宽度状态；
+    - **承接侧的分隔条同时收起**：那一侧的宽度此刻由窗口决定，拖它不会有任何位移（留着一颗拖不动的分隔条只会误导）；
+      拖另一颗也不会偷偷改掉它的宽度状态（否则展开中栏后它会莫名变窄）；
+    - **三栏面板常驻、不卸载**：每栏外面那层 `Flexible` 是**常驻**的，只是 `flex` 在 0/1 之间变——
+      按状态换控件类型（`SizedBox` ↔ `Flexible`）会让整棵子树重建，滚动位置与当前页签全丢。
+
 ## 测试
 
 ```bash
@@ -460,7 +478,9 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 ```
 
 钉子用例：`test/message_replay_guard_test.dart`、`test/session_rename_test.dart`、`test/plugin_panel_admin_test.dart`、
-`test/main_page_sidebar_width_test.dart`、`test/message_list_scroll_test.dart`、`test/message_window_coordinate_test.dart`
+`test/main_page_sidebar_width_test.dart`（三栏宽度：只有下限、合计预算、拖一侧对侧让位）、
+`test/main_page_center_collapse_test.dart`（中栏折叠：让位给侧栏、State 与滚动位置不丢、三栏都收着也不溢出）、
+`test/message_list_scroll_test.dart`、`test/message_window_coordinate_test.dart`
 （窗口坐标 / 落点 / 反馈校正 / 缺口切分四条纯函数）、`test/message_scrollbar_test.dart`、`test/tray_service_test.dart`（关闭决策与设置默认值）、
 `test/close_to_tray_dialog_test.dart`（首次关闭说明框的返回值）、`test/single_instance_test.dart`（锁键/端口纯函数、
 第二个实例被识别并唤起窗口、外人占端口不拦人）、`test/agent_delete_flow_test.dart`（删除闸门的 UI 接线：结构化 409、
