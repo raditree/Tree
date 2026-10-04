@@ -121,6 +121,13 @@ abstract interface class TreeStore {
   /// 设置会话选中的 Spec 列表（M5 交付 Spec 体系前只做存取）。
   int setSelectedSpecs(String agentId, String sessionId, List<String> specIds);
 
+  /// 写入 / 清空**该会话钉住的系统提示词**（[text] 空串 = 清）。
+  ///
+  /// 为什么要落库：它是消息序列的第 0 条，重启后必须**逐字复用**同一串字节，否则
+  /// 端点前缀缓存整条谱系作废（用户 2026-10-04 断言："必须开新会话或 compact，
+  /// 否则必用缓存复用旧版快照"）。会话不存在返回 0（未改），成功返回 1。
+  int setPinnedSystemPrompt(String agentId, String sessionId, String text);
+
   /// 记录一次上下文压缩（M7d-4）：[messageCount] 是**已被摘要覆盖**的前缀消息
   /// 数，[summary] 是替代它们的摘要。会话不存在返回 false。
   ///

@@ -493,12 +493,29 @@ class CoreServer {
       selectedSpecsProvider = selectedBinding;
       // 拼上下文前先把 ⑦/⑧ 快照热起来：冷热形态切换会让 `[0] system` 换字节，
       // 而它在消息最前面 ⇒ 整条前缀缓存作废（known-issues #8）。
-      server.conversation.promptStatePrewarm =
-          (String agentId, String sessionId) async {
-            if (specs.store.agent(agentId) == null) return;
-            await specs.ensureSnapshots(agentId, sessionId);
-          };
     }
+    // **所有**冷热来源都要在拼上下文之前热完：⑦/⑧ 快照（Spec 索引 + 已选 Spec 全文）
+    // 与**工作空间提示词文件**（`<工作空间>/.self/system_prompt.md` —— 它是 `[0] system`
+    // 最前面那一段）。文件这条通路以前漏接：`SystemPromptStore.snapshot()` 在本进程
+    // 首次调用时**恒返回空串**（后台补读），于是首次拼装的提示词整整少一段、却被钉住
+    // 复用 ⇒ 重启后第一个请求（往往正是最贵的压缩）从第 0 个 token 起吃不到缓存。
+    // 真机现场见 docs/known-issues.md #28。
+    {
+      final SpecService? specs = specService;
+      final SystemPromptStore? prompts = server.systemPromptStore;
+      if (specs != null || prompts != null) {
+        server.conversation.promptStatePrewarm =
+            (String agentId, String sessionId) async {
+              if (prompts != null) await prompts.refresh(agentId);
+              if (specs == null) return;
+              if (specs.store.agent(agentId) == null) return;
+              await specs.ensureSnapshots(agentId, sessionId);
+            };
+      }
+    }
+    // 钉住 / 复用 / 兜底各留一行（`[core:agent]`）：这次有没有复用旧字节，一眼可见。
+    server.conversation.log = (String message) =>
+        server.errorLog?.call('[core:agent] $message');
     // 团队工作目录（2026-10-02 用户定夺）：**成员与团队 TOP 共享同一个工作目录**，
     // 不再是"每个成员一个 workspaces/<member_id>"。提示词在会话生成与压缩估算两处
     // 拼装（必须逐字一致），而"一路向上找到 TOP"要查 store ⇒ 与 spec 同范式用 provider；
@@ -1559,10 +1576,14 @@ class CoreServer {
       return;
     }
 
-    // 这是**用户显式改 agent 配置**（提示词 / 工作空间 / 模型参数都可能影响 `[0]`）：
-    // 丢掉钉住的系统提示词，下一轮重建。注意与"发消息"的区别——后者永远不重建。
-    // 本次 PATCH 若后面校验失败，重建出来的还是同一串字节，不额外损失缓存。
-    conversation.invalidateSystemPrompt(agent.id);
+    // 用户改了 agent 配置（提示词 / 工作空间 / 模型参数都可能影响 `[0]`）——但按
+    // 2026-10-04 的断言，**改来源不等于重建**：钉住的旧快照必须继续复用，否则一次重建
+    // 就把端点整条前缀缓存（长会话 20 万+ token）作废。要生效请**开新会话**或**压缩一次**。
+    // 老路径 `invalidateSystemPrompt` 还在（compact 之后走它），但这里**不再调**。
+    conversation.log?.call(
+      'agent 配置已改（提示词 / 工作空间 / 模型参数）：按断言继续复用钉住的系统提示词；'
+      '要生效请开新会话或压缩一次',
+    );
 
     // ── 工作空间目录与 SSH 配置（M7c）：前端「运行模式」直接改 agent 配置 ──
     // 语义与模型配置一致：字段缺失 = 不改；显式空值 = 清空。
@@ -2595,9 +2616,12 @@ class CoreServer {
         result['system_prompt'] = reset.toJson();
       }
     }
-    // 显式重置 = 等价于"重新初始化"：丢掉钉住的系统提示词，下一次拼装用新内容
-    // （区别于"发消息"——那永远不会重建提示词，见 ConversationService._systemPrompts）
-    conversation.invalidateSystemPrompt(agentId);
+    // 显式重置写回了新文件——但按断言**不重建**钉住的快照（要生效请开新会话或压缩一次）：
+    // 否则一次重置就把端点整条前缀缓存作废（见 docs/known-issues.md #28）。
+    conversation.log?.call(
+      '工作空间提示词 / 规范已重置：按断言继续复用钉住的系统提示词；'
+      '要生效请开新会话或压缩一次',
+    );
     if (target == 'spec' || target == 'all') {
       final SpecService? specs = specService;
       if (specs != null) {

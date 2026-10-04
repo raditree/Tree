@@ -242,6 +242,8 @@ class CoreSession {
     this.compactedMessageCount = 0,
     List<Map<String, dynamic>>? compactedContext,
     List<String>? selectedSpecIds,
+    this.systemPromptPinned = '',
+    this.systemPromptPinnedAt = 0,
   }) : selectedSpecIds = selectedSpecIds ?? <String>[],
        compactedContext = compactedContext ?? <Map<String, dynamic>>[];
 
@@ -277,6 +279,22 @@ class CoreSession {
   /// + 摘要覆盖 6 条"会同时存在，引擎无从选择）：写列表时清空摘要，写摘要时清空列表。
   List<Map<String, dynamic>> compactedContext;
 
+  /// **该会话钉住的系统提示词**（空串 = 还没钉过）——落库是为了**跨重启逐字复用**。
+  ///
+  /// 为什么必须落库（用户 2026-10-04 断言）：
+  /// 「系统提示词的重建必须在初次对话或 compact 后，断言：若需启用新的工作空间提示词
+  /// 文件 + agent 提示词 + 工作空间段 + Spec 索引 + 已选 Spec 全文 + 用户可编辑提示词，
+  /// 必须开新会话或 compact，否则**必用缓存复用旧版快照**」。
+  ///
+  /// 缘由：`system` 是消息序列的第 0 条，它变一个字节，端点前缀缓存的**整条谱系**
+  /// （含全部历史，长会话动辄 20 万+ token）就全部作废。以前这份钉住值只活在进程内存里
+  /// ⇒ 每次重启都重建 ⇒ 重启后第一个请求（往往正是最贵的压缩）付全价。真机现场见
+  /// `docs/known-issues.md` #28。
+  String systemPromptPinned;
+
+  /// 钉住时刻（毫秒时间戳，0 = 没钉过）：只作排障/日志用（"钉于 …"）。
+  int systemPromptPinnedAt;
+
   /// 是否已经压缩过上下文（内置摘要路径或中转站路径任一留下过产物）。
   bool get compacted =>
       compactedMessageCount > 0 &&
@@ -297,6 +315,12 @@ class CoreSession {
     // 空列表不落盘：session.json 是给人看的，没走中转站就不该多一个空键
     if (compactedContext.isNotEmpty)
       'compacted_context': compactedContext,
+    // 空串不落盘（同上）：没钉过的会话不该多一个空键
+    if (systemPromptPinned.isNotEmpty) ...<String, dynamic>{
+      'system_prompt_pinned': systemPromptPinned,
+      if (systemPromptPinnedAt > 0)
+        'system_prompt_pinned_at': JsonTime.encode(systemPromptPinnedAt),
+    },
     'created_at': JsonTime.encode(createdAt),
     'updated_at': JsonTime.encode(updatedAt),
   };
@@ -328,6 +352,9 @@ class CoreSession {
               ?.map((dynamic e) => e.toString())
               .toList() ??
           <String>[],
+      systemPromptPinned: json['system_prompt_pinned'] as String? ?? '',
+      systemPromptPinnedAt:
+          JsonTime.decode(json['system_prompt_pinned_at']) ?? 0,
       createdAt: JsonTime.decode(json['created_at']) ?? now,
       updatedAt: JsonTime.decode(json['updated_at']) ?? now,
     );

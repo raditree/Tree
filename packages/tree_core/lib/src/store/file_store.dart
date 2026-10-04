@@ -289,6 +289,17 @@ class FileTreeStore implements TreeStore {
   }
 
   @override
+  int setPinnedSystemPrompt(String agentId, String sessionId, String text) {
+    final CoreSession? session = this.session(agentId, sessionId);
+    if (session == null) return 0;
+    session.systemPromptPinned = text;
+    session.systemPromptPinnedAt =
+        text.isEmpty ? 0 : DateTime.now().millisecondsSinceEpoch;
+    _writeSession(session);
+    return 1;
+  }
+
+  @override
   bool setCompacted(
     String agentId,
     String sessionId, {

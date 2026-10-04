@@ -193,6 +193,10 @@ class SubagentStore implements TreeStore {
       inner.setSelectedSpecs(agentId, sessionId, specIds);
 
   @override
+  int setPinnedSystemPrompt(String agentId, String sessionId, String text) =>
+      inner.setPinnedSystemPrompt(agentId, sessionId, text);
+
+  @override
   bool setCompacted(
     String agentId,
     String sessionId, {

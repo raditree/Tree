@@ -165,9 +165,14 @@ class ConversationService {
       target.toolTurnCompactor = _compactTurnContext;
       // 压缩插件复用前缀：把"引擎这一轮会发的那份线形请求"供给压缩服务
       // （插件据此在自己的 llm.call 里吃端点前缀缓存；见 CompactionService.wireRequestProvider）
+      //
+      // **先 await 钉住值**（内含所有冷热来源的预热）再拼：压缩的前缀必须与这一轮
+      // 真会发的逐字一致（同步兜底路径故意不钉住，直接拼可能拿到缺段的提示词）。
       compaction?.wireRequestProvider =
-          (CoreAgent agent, CoreSession session) =>
-              target.wireRequestFor(_contextOf(agent, session));
+          (CoreAgent agent, CoreSession session) async {
+            await _ensureSystemPromptPinned(agent, session.sessionId);
+            return target.wireRequestFor(_contextOf(agent, session));
+          };
     }
     // 压缩的过程提示（重试进度）也走会话：落一条 llm_hidden 的消息，用户看得见、模型看不到
     if (compaction != null) {
@@ -911,16 +916,18 @@ class ConversationService {
     // 用的是同一套阈值与水位线。
     // 临时员工轮**不做压缩**：压缩水位线（`compactedMessageCount`）是父会话的口径，
     // 而它的历史是"自己那一段"；它的上下文上限交给端点的超限报错显式表达。
+    // 先把系统提示词钉好（内部会把所有冷热来源热完），**再**压缩：压缩用的线形前缀
+    // 必须与这一轮实发的逐字一致——否则那一次压缩从第 0 个 token 起就吃不到端点缓存
+    // （真机事故：重启后第一个请求正好是压缩，24 万 token 全价，见 known-issues #28）。
+    await _ensureSystemPromptPinned(agent, session.sessionId);
     final bool compacted = freshContext
         ? false
         : await _autoCompact(agent, session);
     if (compacted) {
-      // compact 之后是允许重建系统提示词的两个时机之一
+      // compact 之后是允许重建系统提示词的时机之一（前缀本来就要重写）
       invalidateSystemPrompt(agent.id, session.sessionId);
+      await _ensureSystemPromptPinned(agent, session.sessionId);
     }
-    // 会话初始化（本进程第一轮）才真的拼一次并钉住；之后每轮直接复用同一串字节
-    // ⇒ 发消息不会让 `[0]` 变样（见 [promptStatePrewarm] 与 docs/known-issues.md #8）。
-    await _ensureSystemPromptPinned(agent, session.sessionId);
     final AgentRunContext context = _contextOf(
       agent,
       session,
@@ -1596,10 +1603,21 @@ class ConversationService {
   /// 在端点前缀缓存上都对不上 ⇒ 0 命中。而提示词的内容来自多变的外部状态（Spec 索引、
   /// 已选 Spec 全文、工作空间文件、agent 配置），「发一条消息」不该改变它。
   ///
-  /// **只有两个重建时机**：① 会话初始化（本进程第一次为该会话拼装）；② compact 之后
-  /// （此时前缀本来就要重写，重建不额外亏）。另有 [invalidateSystemPrompt] 供"用户显式
-  /// 改提示词 / 重置工作空间"这类主动操作调用——**发消息永远不调它**。
+  /// **只有两个重建时机**（用户 2026-10-04 断言）：① 会话**初次对话**（会话里还没钉过，
+  /// 即 `session.json` 没有 `system_prompt_pinned`）；② **compact 之后**。
+  ///
+  /// 反过来说：**来源变了不等于重建**——工作空间提示词文件 / agent 提示词 / 工作空间段 /
+  /// Spec 索引 / 已选 Spec 全文在两次重建之间怎么变，都**必须继续复用**
+  /// [CoreSession.systemPromptPinned] 里那串旧字节，否则一次重建就把端点整条前缀缓存
+  /// （长会话动辄 20 万+ token）作废。要启用新来源：**开新会话，或让它压缩一次**。
+  ///
+  /// 落库的第二个理由：重启。这份值以前只活在进程内存里，重启必重建 ⇒ 重启后第一个
+  /// 请求（往往正是最贵的压缩）付全价，真机现场见 `docs/known-issues.md` #28。
   final Map<String, String> _systemPrompts = <String, String>{};
+
+  /// 诊断日志（可选、可写字段，由核心接线到 `[core:agent]`）：钉住 / 复用 / 兜底各留
+  /// 一行，"这次有没有复用旧字节"因此一眼可见。
+  void Function(String message)? log;
 
   static String _promptKey(String agentId, String sessionId) =>
       '$agentId|$sessionId';
@@ -1608,40 +1626,85 @@ class ConversationService {
   String? pinnedSystemPrompt(String agentId, String sessionId) =>
       _systemPrompts[_promptKey(agentId, sessionId)];
 
-  /// 丢掉钉住的系统提示词，下一次拼装重建。
+  /// 丢掉钉住的系统提示词（**内存 + 落库**），下一次拼装重建。
   ///
-  /// [sessionId] 为空 = 该 agent 的**所有会话**（改 agent 自己的提示词时用）。
-  /// 调用点只有三类：compact 之后、用户显式改提示词 / 重置工作空间、测试。
+  /// [sessionId] 为空 = 该 agent 的**所有会话**。
+  ///
+  /// **调用点只剩两类**（2026-10-04 断言）：① compact 之后（前缀本来就要重写，重建不
+  /// 额外亏）；② 测试与排障。用户改 agent 提示词 / 重置工作空间**不再走它**——按断言，
+  /// 那两种情况下旧快照要继续复用；要生效请**开新会话**或**压缩一次**。
   void invalidateSystemPrompt(String agentId, [String? sessionId]) {
     final String? id = sessionId;
     if (id == null || id.trim().isEmpty) {
       _systemPrompts.removeWhere(
         (String key, String _) => key.startsWith('$agentId|'),
       );
+      for (final CoreSession session in store.sessions(agentId)) {
+        store.setPinnedSystemPrompt(agentId, session.sessionId, '');
+      }
       return;
     }
     _systemPrompts.remove(_promptKey(agentId, id));
+    store.setPinnedSystemPrompt(agentId, id, '');
   }
 
   /// 取回（必要时**建好并钉住**）本会话的系统提示词。
   ///
-  /// 没有钉住值 = 会话初始化：先热 ⑦/⑧ 快照（[promptStatePrewarm]），再同步拼一份并钉住。
-  /// 已经钉住则**直接返回**，不看外部状态——这正是"发消息不更新系统提示词"的实现。
+  /// 顺序（断言「重建只在初次对话或 compact 后」）：
+  /// 1. 内存里有 ⇒ 直接返回；
+  /// 2. 先把**所有冷热来源**热完（⑦/⑧ 快照 + 工作空间提示词文件，见 [promptStatePrewarm]）
+  ///    —— 少了这一步，首次拼装会拿到"缺段"的提示词并把它永久钉住（真机事故就出在这）；
+  /// 3. 会话里钉过 ⇒ **逐字复用**（重启不改字节的那一半）；
+  /// 4. 都没钉过（新会话 / 老会话首次）⇒ 现拼一份、落库、记一行日志。
   Future<void> _ensureSystemPromptPinned(
     CoreAgent agent,
     String sessionId,
   ) async {
-    if (_systemPrompts.containsKey(_promptKey(agent.id, sessionId))) return;
+    final String key = _promptKey(agent.id, sessionId);
+    if (_systemPrompts.containsKey(key)) return;
     await promptStatePrewarm?.call(agent.id, sessionId);
-    _systemPromptPinned(agent, sessionId);
+    final String stored = _pinnedOf(agent.id, sessionId);
+    if (stored.isNotEmpty) {
+      _systemPrompts[key] = stored;
+      log?.call(
+        '系统提示词复用会话里钉住的版本（${stored.length} 字，跨重启不改字节）',
+      );
+      return;
+    }
+    final String built = systemPromptWithWorkspace(agent, sessionId: sessionId);
+    _systemPrompts[key] = built;
+    if (built.trim().isEmpty) return;
+    store.setPinnedSystemPrompt(agent.id, sessionId, built);
+    log?.call('系统提示词已钉住并落库（${built.length} 字，初次拼装）');
   }
 
-  /// 同步取（无则建并钉住）：`_contextOf` 是同步的，走这里。
-  String _systemPromptPinned(CoreAgent agent, String sessionId) =>
-      _systemPrompts.putIfAbsent(
-        _promptKey(agent.id, sessionId),
-        () => systemPromptWithWorkspace(agent, sessionId: sessionId),
-      );
+  /// 同步取（`_contextOf` 是同步的，走这里）。
+  ///
+  /// 顺序：内存 → **会话里钉住的旧字节**（逐字复用，跨重启不变）→ 兜底现拼。
+  ///
+  /// 兜底那条**既不写内存也不落库**：它可能在"来源还没热"时被调到（同步路径抢在
+  /// [_ensureSystemPromptPinned] 之前），一旦钉住就会把缺段的提示词永久固化。正常路径
+  /// 由 [_ensureSystemPromptPinned] 先建好，这里几乎不会走到；真走到了就留一行日志。
+  String _systemPromptPinned(CoreAgent agent, String sessionId) {
+    final String key = _promptKey(agent.id, sessionId);
+    final String? cached = _systemPrompts[key];
+    if (cached != null) return cached;
+    final String stored = _pinnedOf(agent.id, sessionId);
+    if (stored.isNotEmpty) {
+      _systemPrompts[key] = stored;
+      return stored;
+    }
+    final String built = systemPromptWithWorkspace(agent, sessionId: sessionId);
+    log?.call(
+      '系统提示词在预热之前被同步拼装（${built.length} 字，未钉住）：'
+      '可能与上一版不同字节 ⇒ 这一跳吃不到端点前缀缓存',
+    );
+    return built;
+  }
+
+  /// 会话里落库的钉住值（'' = 没钉过 / 会话不存在）。
+  String _pinnedOf(String agentId, String sessionId) =>
+      store.session(agentId, sessionId)?.systemPromptPinned ?? '';
 
   /// 工具循环内压缩（Q1-③）：压动了就把**新的上下文快照**交给引擎重新装配。
   ///

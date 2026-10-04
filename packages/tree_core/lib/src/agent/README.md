@@ -26,7 +26,16 @@
 2. **按段下发**：正文 / 思考段各是一个 `msg_start` + `msg_chunk`… 并**独立落库**，段遇工具调用即关闭。`AgentDone` 时仍开着的正文段**就是最终回复**，usage 只挂最后一条。
 3. `AgentError` 必须**同时**发 `error` 帧**和**一条可见的 agent 文本消息：前端对 `error` 帧静默忽略，只发帧的话用户看不到任何反馈。这条消息（以及"已停止本轮生成。"、重试进度、**压缩已发生 / 降级 / 插件没接管**）一律落库带 **`llm_hidden`**——**给人看、不喂模型**：喂进上下文，模型会把"上一条失败"当成新的排查任务接着干（实测）。`kind` 保持 `text`，前端渲染与历史形态都不变；与 `kind == 'notice'`（hook 唤醒，是**新输入**、按 user 进上下文）方向相反。
 4. **并发**：同一 `(agent, session)` 串行（同一会话的流式片段交错下发会让前端追加互相污染），**不同会话并行**；跨会话消息既不打断也不排队；`stop` 按 agent（代次作废排队任务）；`idle` 只在该 agent **没有在途轮次**时广播。
-5. **提示词按会话钉住**（key = `agentId|sessionId`）：只在会话初始化 / 压缩后 / 显式失效时重建；历史逐字复用 `toolArgumentsRaw` 与 `toolResultForModel`；**工具表每轮现取**（不进前缀，否则端点前缀缓存从这条起全部落空）。
+5. **提示词按会话钉住、并落库**（`session.json` 的 `system_prompt_pinned`，key = `agentId|sessionId`）：
+   重建**只有两个时机**——① 会话**初次对话**（会话里还没钉过）、② **compact 之后**（`invalidateSystemPrompt`
+   属于这一条，另外只留给测试与排障）。**来源变了不等于重建**：工作空间提示词文件 / agent 提示词 / 工作空间段 /
+   Spec 索引 / 已选 Spec 全文怎么变，都继续复用落库的那串旧字节——要启用新来源请**开新会话，或压缩一次**；
+   否则一次重建就把端点前缀缓存的整条谱系（长会话 20 万+ token）作废（真机事故见
+   [known-issues.md #28](../../../../../docs/known-issues.md)：重启后的第一次压缩 24 万 token 全价）。
+   落库的另一层意义就是**跨重启不改字节**。拼装前必须把**所有冷热来源**热完（⑦/⑧ 快照 + 工作空间提示词
+   文件，见 `ConversationService.promptStatePrewarm`）——`SystemPromptStore.snapshot()` 在本进程首次调用时
+   **恒返回空串**（后台才补读），漏热一段就少一段字节。历史逐字复用 `toolArgumentsRaw` 与
+   `toolResultForModel`；**工具表每轮现取**（不进前缀，否则端点前缀缓存从这条起全部落空）。
 6. **压缩不删除任何消息**：只推进 `compactedMessageCount`；被总结的永远是历史的一个**前缀**；`compactedSummary` 与 `compactedContext` **互斥**（两条压缩路径的权威只能有一个）。
 7. **`.self` 只在一处翻译**（`PrivateWorkspaceIO`），且**终端命令不经过它** ⇒ 提示词必须把私有目录的**真实路径**写给模型。
 8. 提问四件事缺一不可：**先落盘再推帧**（进程被杀 / 重启后仍能列出待答）、**作答幂等**（WS 与 REST 可能同时到达，只有第一次生效）、**取消能打断，但只有"真取消"能打断**（等待中的工具立刻拿到 `cancelled`，工具循环因此收敛而不是永远挂着；
@@ -117,6 +126,7 @@
 cd packages/tree_core
 dart test test/conversation_segments_test.dart test/conversation_stream_seq_test.dart \
           test/message_interrupt_test.dart test/system_prompt_pin_test.dart \
+          test/system_prompt_pin_persist_test.dart \
           test/compaction_test.dart test/compaction_relay_skip_test.dart \
           test/question_broker_test.dart \
           test/question_store_test.dart \
@@ -127,4 +137,5 @@ dart test test/conversation_segments_test.dart test/conversation_stream_seq_test
 钉子用例：`conversation_segments_test`（分段与落库顺序）、`message_interrupt_test`（会话并行 / 插话 / stop）、
 `llm_question_test`（提问回路端到端：作答回灌、多问题、**插话 / hook 完成提示不打断在途提问**、`stop` 取消）、
 `subagent_hook_wake_test`（临时员工 hook 完成后：提示归会话主人 + 只唤醒它自己 + 用它自己的历史）、
-`system_prompt_pin_test`（提示词钉住）、`private_workspace_io_test`（私有目录分栏）。
+`system_prompt_pin_test`（提示词钉住）、`system_prompt_pin_persist_test`（钉住值落库 / 跨重启逐字复用 /
+来源变了仍复用旧快照 / 初次对话必须先热完来源）、`private_workspace_io_test`（私有目录分栏）。

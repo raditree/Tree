@@ -87,6 +87,24 @@
   的总结输入因此才可能整段命中。**遗留**：省钱的端到端效果要重建核心 + 重新打包插件后
   由真机账本复核（本轮只到核心侧 + 单测）。
 
+- **重启不再作废系统提示词（进而不再作废整条端点前缀缓存）：钉住值落库、跨重启逐字复用**（修改
+  [packages/tree_core/lib/src/agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 5；
+  修 [conversation_service.dart](packages/tree_core/lib/src/agent/conversation_service.dart) 的钉住 / 复用、
+  [core_server.dart](packages/tree_core/lib/src/server/core_server.dart) 的预热接线与两处"改来源即重建"、
+  [records.dart](packages/tree_core/lib/src/store/records.dart) 的 `system_prompt_pinned`；
+  场景 [docs/known-issues.md](docs/known-issues.md) #28；**用户要求 2026-10-04**：
+  「系统提示词的重建必须在初次对话或 compact 后，断言：若需启用新的工作空间提示词文件 + agent 提示词 +
+  工作空间段 + Spec 索引 + 已选 Spec 全文 + 用户可编辑提示词，必须开新会话或 compact，否则**必用缓存
+  复用旧版快照**」）：修前有两个洞叠在一次重启上——① `SystemPromptStore.snapshot()` 在**本进程第一次**
+  调用时恒返回空串（后台才补读），而它（工作空间 `.self/system_prompt.md`）是提示词**最前面**那一段，
+  `promptStatePrewarm` 只热了 ⑦/⑧、漏了这条通路；② 钉住值只活在进程内存 ⇒ 重启必重建。真机现场：
+  重启后第一个请求正好是压缩，242023 prompt/**0 cached**（全价），而重启前同一会话的 turn 命中 99%。
+  新口径：钉住值落在 `session.json`（`system_prompt_pinned` + `_at`），取用顺序 = 内存 → 会话记录
+  （**逐字复用、不比对来源**）→ 兜底现拼（**不落库** + 一行日志）；**重建只在「初次对话」与「compact
+  之后」**，来源变了也复用旧快照（要生效请开新会话或压缩一次）；拼装前把**所有冷热来源**（⑦/⑧ 快照 +
+  工作空间提示词文件）热完，并且压缩的 wire 请求与这一轮实发共用同一串提示词。**遗留**：工具表仍是同类
+  头部风险（外设预热窗口内会少几份工具声明），本次未动；端到端省钱效果待重建核心后由账本复核。
+
 ## [1.0.2+2] — 2026-10-04
 
 ### 断言变化（新增 / 修改的 README 不变量）
