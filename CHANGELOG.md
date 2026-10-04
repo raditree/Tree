@@ -15,6 +15,32 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
+## [1.0.2+4] — 2026-10-05
+
+### 断言变化（新增 / 修改的 README 不变量）
+
+- **SSH 链路失活后要能重建（判据不变，动作补齐）**（修改 [packages/tree_local_exec/README.md](packages/tree_local_exec/README.md)
+  不变量 6、[packages/tree_core/lib/src/tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 3、
+  [docs/architecture.md](docs/architecture.md) §11；**用户要求 2026-10-05**：
+  「保持心跳失活判超时的断言，但判超时后重连 + 显式『重连』入口」）：判死判据**一个字没动**（连续 N 拍心跳窗口
+  内没回包 ⇒ 判失活，在途操作显式失败），补上判死**之后**的动作——传输层在判失活的那一拍起**后台重连**
+  （`SshReconnectPump`：单飞 + 退避 5s→10s→30s→60s、之后每 60s 一次，直到成功 / 关停；**退避是节奏，
+  不是时长上限**），并给它一个**显式入口**（`ReconnectableWorkspace` → 核心 `POST /api/agents/{agentId}/ssh/reconnect`
+  → 右栏文件错误块上的「重连」按钮）。重建"先建新、再换旧"：成功才换会话并清空丢失计数，失败可读上抛且
+  **保持失活态**；**判失活不淘汰 `_ios` 缓存**（缓存是"按 agent 一个 IO"的语义边界，重建是传输层的内部动作）。
+  为什么必须有它：一条已经断掉的 TCP 不会自己活回来——现场连丢 **1325 拍**（≈3h41m）、远端实测可达，
+  应用却再没恢复过，只能重启（[docs/known-issues.md](docs/known-issues.md) #29）。
+- **失活文案说真话**（同一条不变量 6）：`SshLiveness.staleMessage` 不再写「心跳恢复后自动恢复」，改为
+  「旧连接已判死、不会自行恢复（核心会按退避自动重连，也可用「重连」立即重建）」。
+- **核心日志的落盘行带时间戳**（修改 [packages/tree_core/lib/src/util/README.md](packages/tree_core/lib/src/util/README.md)
+  不变量 8，**用户要求 2026-10-05**：「给 log 加时间」）：文件行格式 = `<ISO8601 带时区> pid=<pid> <原行>`
+  （例 `2026-10-05T07:24:31.123+08:00 pid=4242 [core:tool] …`）；**stderr 那份逐字不变**（开发期习惯与
+  按 stderr 断言的测试都不受影响）。为什么：这次定位 SSH 失活只能靠"会话消息时间戳反推 core.log 行"，
+  因为文件行只有 `pid=` 没有时间。
+- **文件面板错误块上的「重连」按钮**（新增 [lib/README.md](lib/README.md) 不变量 16 ⑨）：右栏「文件 → 文件浏览」
+  根目录加载失败时，错误块上给一个显式重建远端链路的入口（调 `POST /api/agents/{agentId}/ssh/reconnect`，
+  `{agentId}` 取当前 agent 的 id——**不是** `workspaceId`，后者是 `ws_<id>`；成功后就地重拉文件树）。
+
 ## [1.0.2+3] — 2026-10-04
 
 ### 断言变化（新增 / 修改的 README 不变量）
