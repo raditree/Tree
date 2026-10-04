@@ -15,6 +15,34 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
+## [1.0.2+1] — 2026-10-04
+
+### 断言变化（新增 / 修改的 README 不变量）
+
+- **`terminal` 的 `hook=true` 在本机与远端（SSH）是同一套语义，且远端任务跨重启接续**（新增
+  [tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 16、
+  [tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 8，**用户要求 2026-10-04**：
+  「`hook=true` 那条路看不到我远端工作空间的文件……你应该修好它」；现场事故见
+  [docs/known-issues.md](docs/known-issues.md) #22）：
+  后台执行由新的 `BackgroundExecHost` 原语承担（本机 = 脚本 + shell 重定向直写日志、进程句柄在手；
+  远端 = `nohup` 起在**远端**、日志落**远端工作空间**、退出码写哨兵文件 + **3s** 轮询，含"进程消失没留哨兵"
+  的可辨退出码），日志读写一律经它 ⇒ 远端的 `read` 与 `hook_action=status` 看到的是**同一份**；
+  **远端任务落盘台账**（`<数据根>/hooks/<task_id>.json`，原子写）：核心/应用**重启后接续**——启动即探一次哨兵，
+  已结束就立刻把完成提示**投递回原会话**（台账里的 agent + 会话），未结束就重挂轮询；agent / 会话已不存在
+  则**如实记日志、台账保留**，不假装投递成功；关停语义两端不同且如实（本机杀进程树，**远端不杀**）。
+- **右栏「正在执行的 tool」每行标注来源（agent · 会话）且点得动**（新增 [lib/README.md](lib/README.md) 不变量 23、
+  [lib/ui/widgets/tool_runs_panel.dart](lib/ui/widgets/tool_runs_panel.dart)、
+  [lib/ui/pages/main_page.dart](lib/ui/pages/main_page.dart) 的 `_handleNavigateToToolRun`，**用户要求 2026-10-04**：
+  「右侧面板上正在执行的工具要加上来源（定位到 agent/session）」）：点整行切中栏到该运行所属的 agent / 会话
+  （**只切上下文、不滚动到某条消息**，与「问题回复」页的定位是同一范式）；agent 名与会话标题取不到时
+  **回退显示 id**（`session_default` → 「默认会话」），名字接口挂了不影响列表与关闭；未接定位回调或该行没有
+  agent id ⇒ **整行不可点**（不假装能跳）。后台 hook 与普通工具运行共用同一条来源字段。
+- **后台 hook 出现在右栏「正在执行的 tool」，用户可关**（[tool/README.md](packages/tree_core/lib/src/tool/README.md)
+  不变量 8、[tool_run_registry.dart](packages/tree_core/lib/src/tool/tool_run_registry.dart)）：
+  登记进运行中工具表（`watchdog: false` ⇒ 长任务**不判超时、不刷 warning**；`crossCall: true` ⇒ 跨工具调用存活），
+  用户点关闭 = 取消该 hook（本机真杀进程树；远端尽力 `kill`，拿不到 pid **如实回原因**）——
+  与右栏按钮 / 执行站 `tool.close` / agent 的 `tool_runs` 仍是**同一个实现**。**不做**"两个新站点 + leader 可杀"（暂缓）。
+
 ## [1.0.2] — 2026-10-03
 
 ### 断言变化（新增 / 修改的 README 不变量）
@@ -162,7 +190,7 @@
   `message send_message` 找**工作空间在本机**的团队代查，并可请它用**自己的终端**（`scp` / `rsync` 之类）
   把**原文件推到远端**；**本机那条线**照做，并把结论或落地的远端路径回给对方。
   ② `message` 的 `files` 附件**只在本机工作空间之间可用**（⇒ **1.0.1 起已扩展为跨机投递**，
-  见上方 `## [未发布]` 与 [team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 15）：任一侧是 SSH 就不投递、
+  见上方 `## [1.0.2]` 与 [team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 15）：任一侧是 SSH 就不投递、
   明确回一句"未投递"，消息本身照常送达（工具描述里的 `files` 参数同步写清这条边界，免得模型以为跨机能带附件）。
 - **Tree 在"带着 RedirectionGuard"启动时会自愈重启；安装器改经 shell 启动**
   （[docs/architecture.md](docs/architecture.md) §13 不变量 11、`docs/known-issues.md` #16，
