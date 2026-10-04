@@ -630,6 +630,47 @@ class WorkspaceToolRunner implements ToolRunner {
   /// 解析失败返回 null（调用方决定降级行为）。
   Future<WorkspaceIO?> ioFor(String agentId) => _ioFor(agentId);
 
+  /// **显式重建**某个 agent 的远端链路（REST `/api/agents/{agentId}/ssh/reconnect`）。
+  ///
+  /// 为什么由 runner 做这个入口：`_ios` 缓存归它管，而判失活**不淘汰**缓存
+  /// （传输层自己把底层连接换新，见 `DartSshTransport.reconnect`）——所以"重连"是
+  /// "让缓存里那条链路的底层连接重建一次"，而不是"丢掉缓存再建一个"。
+  ///
+  /// 边界：判活判据不变（判死仍只看连续 N 拍心跳丢失，重连是判死**之后**的动作）；
+  /// 本机工作空间**没有**可重连的链路 ⇒ 如实回 [SshReconnectOutcome.notSsh]（HTTP 400），
+  /// 不假装成功。
+  Future<SshReconnectOutcome> reconnectSshLink(String agentId) async {
+    // 与 [ioFor] 同一口径：临时员工复用发起者那条链路（私有状态归会话主人）。
+    final String ownerId = subagentService?.privateOwnerOf(agentId) ?? agentId;
+    if (resolveSshConfig?.call(ownerId) == null) {
+      return SshReconnectOutcome.notSsh(
+        '该 agent 未使用 SSH（本地工作空间），没有可重连的远端链路',
+      );
+    }
+    final WorkspaceIO? io;
+    try {
+      io = _ios[ownerId] ?? await _ioFor(ownerId);
+    } catch (error) {
+      return SshReconnectOutcome.failed('重建远端链路失败：$error');
+    }
+    if (io == null) {
+      return SshReconnectOutcome.failed('工作空间不可用（SSH 配置不完整或远端后端未接入），无法重连');
+    }
+    if (io is! ReconnectableWorkspace) {
+      return SshReconnectOutcome.failed('该工作空间后端不支持链路重连');
+    }
+    // 显式 `as`：`ReconnectableWorkspace` 不是 `WorkspaceIO` 的子类型，类型提升不成立。
+    final ReconnectableWorkspace link = io as ReconnectableWorkspace;
+    try {
+      await link.reconnectLink();
+    } on WorkspaceIoException catch (error) {
+      return SshReconnectOutcome.failed(error.message);
+    } catch (error) {
+      return SshReconnectOutcome.failed('重连失败：$error');
+    }
+    return SshReconnectOutcome.ok(stale: link.linkStale);
+  }
+
   Future<WorkspaceIO?> _ioFor(String agentId) async {
     // **临时员工复用发起者那条工作空间**（同一份根、同一条 SSH 连接、同一个
     // `.tree/<agent>/.self` 私有分栏）：私有状态归到**会话主人**，用户的工作空间里
@@ -695,4 +736,49 @@ class WorkspaceToolRunner implements ToolRunner {
       isError: outcome.isError,
     );
   }
+}
+
+/// 显式「重连」的结果（[WorkspaceToolRunner.reconnectSshLink]）。
+///
+/// 三种结局分开表达，是为了让 REST 层能给出**不同的状态码 + 可读原因**，而不是
+/// 一律 500：本机工作空间（[notSsh]）是"用错入口"，500 会让用户以为远端坏了。
+class SshReconnectOutcome {
+  const SshReconnectOutcome._({
+    required this.ok,
+    required this.notSsh,
+    required this.stale,
+    required this.reason,
+  });
+
+  /// 已重建（[stale] 正常情况下应为 false；仍为 true 说明重建后立刻又判死）。
+  factory SshReconnectOutcome.ok({required bool stale}) => SshReconnectOutcome._(
+    ok: true,
+    notSsh: false,
+    stale: stale,
+    reason: '',
+  );
+
+  /// 该 agent 根本没走 SSH（本地工作空间）：没有可重建的远端链路。
+  factory SshReconnectOutcome.notSsh(String reason) =>
+      SshReconnectOutcome._(ok: false, notSsh: true, stale: false, reason: reason);
+
+  /// 重建失败（[reason] 是可读原因，直接给 REST 的 `detail`）。
+  factory SshReconnectOutcome.failed(String reason) => SshReconnectOutcome._(
+    ok: false,
+    notSsh: false,
+    stale: false,
+    reason: reason,
+  );
+
+  /// 是否已重建成功。
+  final bool ok;
+
+  /// 是否"用错入口"（该 agent 不是 SSH 工作空间）。
+  final bool notSsh;
+
+  /// 重建之后链路是否仍判失活（正常为 false）。
+  final bool stale;
+
+  /// 可读原因（成功时为空串）。
+  final String reason;
 }

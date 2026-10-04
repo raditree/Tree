@@ -1314,6 +1314,7 @@ class CoreServer {
     router.add('GET', ApiPaths.agentSpec, _getSpec);
     router.add('POST', ApiPaths.agentReset, _resetWorkspace);
     router.add('POST', ApiPaths.agentCompact, _compactAgent);
+    router.add('POST', ApiPaths.agentSshReconnect, _reconnectAgentSsh);
     router.add('GET', ApiPaths.questions, _listQuestions);
     router.add('POST', ApiPaths.questionAnswer, _answerQuestion);
     router.add('GET', ApiPaths.settingsFrameRate, _getFrameRate);
@@ -1424,6 +1425,45 @@ class CoreServer {
   }
 
   // ── agent ────────────────────────────────────────────────────────────
+
+  /// `POST /api/agents/{agentId}/ssh/reconnect`：**显式**重建远端链路。
+  ///
+  /// 与传输层的**自动**重连（判失活那一瞬间起的退避循环，见 `DartSshTransport`）是
+  /// 同一份实现的两次入口——用户不想等退避（或自动重连已用尽）时点这个按钮。
+  /// **判活判据不变**：判死仍只看"连续 N 拍心跳丢失"，重连是判死**之后**的动作，
+  /// 不引入任何静态时长上限（M9 1.1）。
+  ///
+  /// 状态码：200 已重建（`stale` 复位为 false）；400 = 该 agent 不是 SSH 工作空间
+  /// （本地后端没有可重连的链路）；404 = 没有这个 agent；500 = 这次重建失败（detail 可读）。
+  Future<void> _reconnectAgentSsh(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final String agentId = (params['agentId'] ?? '').trim();
+    if (store.agent(agentId) == null) {
+      await writeJson(request, 404, errorBody('agent 不存在：$agentId'));
+      return;
+    }
+    final WorkspaceToolRunner? runner = _runnerFromEngine();
+    if (runner == null) {
+      await writeJson(request, 501, errorBody('工具执行器尚未接入，无法重连远端链路'));
+      return;
+    }
+    final SshReconnectOutcome outcome = await runner.reconnectSshLink(agentId);
+    if (outcome.ok) {
+      await writeJson(request, 200, <String, dynamic>{
+        'ok': true,
+        'agent_id': agentId,
+        'stale': outcome.stale,
+      });
+      return;
+    }
+    await writeJson(
+      request,
+      outcome.notSsh ? 400 : 500,
+      errorBody(outcome.reason),
+    );
+  }
 
   /// `POST /api/agents/{agentId}/compact`：手动压缩上下文（M7d-4）。
   ///

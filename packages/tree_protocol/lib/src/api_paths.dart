@@ -54,6 +54,20 @@ abstract final class ApiPaths {
   /// 手动压缩上下文（前端「压缩」按钮）。核心尚未实现：显式 501，不静默 404。
   static const String agentCompact = '/api/agents/{agentId}/compact';
 
+  /// 重建该 agent 的**远端链路**（POST，无 body）：SSH 心跳判失活之后的手动恢复入口。
+  ///
+  /// 为什么需要它：判失活只**标记**链路已死（不关连接、不静默挂起），而一条已经断掉的
+  /// TCP 连接不会自己活回来——传输层会按退避自动重连，但如果自动重连已用尽 / 用户不想等，
+  /// 就要有一个**显式**入口。语义：
+  /// - 200 = 已重建（响应 `{ok, agent_id, stale, missed}`，`stale` 复位为 false）；
+  /// - 400 = 该 agent 不是 SSH 工作空间（本地后端没有可重连的链路）或 SSH 配置不完整；
+  /// - 404 = 没有这个 agent；
+  /// - 500 = 这次重连失败，`error.detail` 是**可读原因**（例如认证失败 / 主机不可达）。
+  ///
+  /// 判据不变：**重连不是新的判活依据**——判死仍然只认"连续 N 拍心跳丢失"（M9 规约 1.1），
+  /// 重连是判死**之后**的动作，不引入任何静态时长上限。
+  static const String agentSshReconnect = '/api/agents/{agentId}/ssh/reconnect';
+
   // ── 提问 ──────────────────────────────────────────────────────────────
   static const String questions = '/api/questions';
   static const String questionAnswer = '/api/questions/{qid}/answer';
@@ -187,6 +201,7 @@ abstract final class ApiPaths {
     agentSpec,
     agentReset,
     agentCompact,
+    agentSshReconnect,
     questions,
     questionAnswer,
     files,

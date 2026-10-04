@@ -145,6 +145,9 @@ class _FileTreeState extends State<FileTree> {
   /// 根加载失败的原因（根错误走整块提示，不是一行）
   String? _rootError;
 
+  /// 远端重连请求是否在途（防连点：在途时按钮置灰并显示「重连中…」）
+  bool _reconnecting = false;
+
   /// 选中项（键盘上下键移动的就是它；点文件仍会打开查看器）
   String? _selectedPath;
 
@@ -343,6 +346,35 @@ class _FileTreeState extends State<FileTree> {
   }
 
   void _refresh() => unawaited(_reloadAll());
+
+  /// 手动重建远端（SSH）链路：根错误块上「重连」按钮的动作。
+  ///
+  /// **判活判据不变**：重连不是新的判活依据（见 [ApiService.reconnectAgentSsh]），
+  /// 它只是判死之后的一次显式恢复。agentId 取 [FileTree.teamId]（agent 的**真 id**），
+  /// **不是** [FileTree.workspaceId]（那是 `ws_<agentId>`，只对 `/api/files/...` 类端点正确）。
+  ///
+  /// 成功 → **就地重拉**（[_reloadAll]，已展开的目录不塌）+ 提示「已重连」；
+  /// 失败 → 只弹一句可读原因，**不动既有内容**（不清空、不白屏）。
+  Future<void> _reconnectSsh() async {
+    if (_reconnecting) return;
+    final String agentId = widget.teamId ?? '';
+    if (agentId.isEmpty) {
+      _showSnackBar('未选中 agent，无法重连');
+      return;
+    }
+    setState(() => _reconnecting = true);
+    try {
+      await ApiService.reconnectAgentSsh(agentId);
+      if (!mounted) return;
+      setState(() => _reconnecting = false);
+      _showSnackBar('已重连');
+      await _reloadAll();
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _reconnecting = false);
+      _showSnackBar('重连失败：${_reason(error)}');
+    }
+  }
 
   /// 点一行：目录 = 就地展开 / 折叠；文件 = 交给父组件打开查看器。
   ///
@@ -666,6 +698,12 @@ class _FileTreeState extends State<FileTree> {
         icon: Icons.error_outline,
         iconColor: const Color(0xFFEF4444),
         message: _rootError!,
+        // 根目录进不去多半是远端链路死了（SSH 心跳判失活的现场）：给一条显式出路
+        action: TextButton(
+          key: const Key('file-tree-reconnect'),
+          onPressed: _reconnecting ? null : () => unawaited(_reconnectSsh()),
+          child: Text(_reconnecting ? '重连中…' : '重连'),
+        ),
       );
     }
     if (_listings['']?.isEmpty ?? false) {
@@ -1012,10 +1050,14 @@ class _FileTreeState extends State<FileTree> {
   }
 
   /// 居中提示（根加载失败 / 根为空）
+  ///
+  /// [action] 是可选的行动按钮（目前只有根加载失败时挂「重连」）：根为空这类
+  /// "没坏、只是没内容"的提示不该给动作，所以默认 null。
   Widget _messageBody({
     required IconData icon,
     required Color iconColor,
     required String message,
+    Widget? action,
   }) {
     return Center(
       child: Column(
@@ -1031,6 +1073,10 @@ class _FileTreeState extends State<FileTree> {
               fontSize: kFileTreeFontSize,
             ),
           ),
+          if (action != null) ...<Widget>[
+            const SizedBox(height: 8),
+            action,
+          ],
         ],
       ),
     );

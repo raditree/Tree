@@ -1237,6 +1237,30 @@ class ApiService {
     return _postJson(path);
   }
 
+  // ==================== 远端（SSH）链路的手动恢复 ====================
+
+  /// 手动重建该 agent 的**远端链路**（文件面板根错误块上的「重连」按钮）。
+  ///
+  /// 调用 `POST /api/agents/{agentId}/ssh/reconnect`（协议常量
+  /// [ApiPaths.agentSshReconnect]；**无请求体**，agentId 在路径里）。这是 SSH 心跳
+  /// **判失活之后**的**显式恢复入口**：判失活只标记链路已死，而一条已经断掉的 TCP
+  /// 连接不会自己活回来——自动重连用尽 / 用户不想等时，靠这个显式重建。
+  ///
+  /// **判据不变**：重连**不是**新的判活依据——判死仍然只认"连续 N 拍心跳丢失"
+  /// （M9 规约 1.1），重连是判死**之后**的动作，不引入任何静态时长上限。
+  ///
+  /// [agentId] 必须是 agent 的**真 id**（不是 `ws_<agentId>` 那种工作空间 id）。
+  /// 成功 200（`{ok, agent_id, stale}`，`stale` 复位为 false）；失败（400/404/500）
+  /// 一律由 [_handleResponse] 抛成**中文可读**异常（`error.detail`），调用方原样显示即可，
+  /// 不要自己再判状态码。
+  static Future<Map<String, dynamic>> reconnectAgentSsh(String agentId) async {
+    final String path = ApiPaths.agentSshReconnect.replaceFirst(
+      '{agentId}',
+      Uri.encodeComponent(agentId.trim()),
+    );
+    return _postJson(path);
+  }
+
   /// 取某会话的**临时员工名册**（**落盘那份**，只读）。
   ///
   /// 调用 `GET /api/agents/{agentId}/subagents?session_id=`（协议常量

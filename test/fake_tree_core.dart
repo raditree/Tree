@@ -45,6 +45,13 @@ class FakeTreeCore {
   int deleteStatus = 200;
   String deleteDetail = '';
 
+  /// `POST /api/agents/{id}/ssh/reconnect` 的脚本化响应（默认 200 = 重连成功）。
+  /// 非 200 时按**真核心口径**回顶层的 `{"detail": reconnectDetail}`（核心的错误体
+  /// 统一由 `http_io.dart` 的 `errorBody` 产出，就是顶层 `detail`）。
+  int reconnectStatus = 200;
+  String reconnectDetail = '';
+  bool reconnectStale = false;
+
   /// PUT content（新建文件 / 保存）收到的写入
   final List<({String path, String content})> writes =
       <({String path, String content})>[];
@@ -181,7 +188,25 @@ class FakeTreeCore {
         'size': ((body['content'] as String?) ?? '').length,
       };
     } else if (request.method == 'POST') {
-      if (path.endsWith('/mkdir')) {
+      if (path.contains('/api/agents/') && path.endsWith('/ssh/reconnect')) {
+        // 手动重建远端链路（文件面板根错误块上的「重连」按钮）。**无请求体**，
+        // agentId 在路径里——这里照核心路由口径回，供断言"打到的是真 agentId"。
+        if (reconnectStatus != 200) {
+          status = reconnectStatus;
+          payload = <String, dynamic>{'detail': reconnectDetail};
+        } else {
+          payload = <String, dynamic>{
+            'ok': true,
+            'agent_id': Uri.decodeComponent(
+              path.substring(
+                '/api/agents/'.length,
+                path.length - '/ssh/reconnect'.length,
+              ),
+            ),
+            'stale': reconnectStale,
+          };
+        }
+      } else if (path.endsWith('/mkdir')) {
         if (mkdirStatus != 200) {
           status = mkdirStatus;
           payload = <String, dynamic>{'detail': mkdirDetail};

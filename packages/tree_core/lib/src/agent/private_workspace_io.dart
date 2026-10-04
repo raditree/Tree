@@ -81,13 +81,51 @@ void migrateLegacySelfDir({
 /// 注意：**终端命令不经过这里**（`exec` 直接在根下跑 shell），所以提示词里要如实告诉模型
 /// 私有目录的真实路径。
 class PrivateWorkspaceIO
-    implements WorkspaceIO, WorkspaceFiles, BackgroundExecHost {
+    implements
+        WorkspaceIO,
+        WorkspaceFiles,
+        BackgroundExecHost,
+        ReconnectableWorkspace {
   PrivateWorkspaceIO(this.inner, this.agentId);
 
   final WorkspaceIO inner;
   final String agentId;
 
   String _map(String relativePath) => mapPrivatePath(relativePath, agentId);
+
+  // ── 链路重建（ReconnectableWorkspace）：**透传**给内层 ──────────────────
+  //
+  // 核心的「重连」入口拿到的就是这个装饰器，所以能力必须能穿过去（否则用户点了
+  // 按钮却"该后端不支持"）。本机内层不实现该能力 ⇒ 如实回可读错误，不假装成功。
+
+  /// 内层的"可重连"能力（本机后端没有这条链路 ⇒ null）。
+  ///
+  /// 显式 `as` 而不是靠类型提升：`ReconnectableWorkspace` 不是 [WorkspaceIO] 的子类型，
+  /// 类型提升在这里不成立（与本文件 `_files` / `_background` 同一写法）。
+  ReconnectableWorkspace? get _reconnectable {
+    final WorkspaceIO target = inner;
+    if (target is ReconnectableWorkspace) {
+      return target as ReconnectableWorkspace;
+    }
+    return null;
+  }
+
+  @override
+  bool get linkStale => _reconnectable?.linkStale ?? false;
+
+  @override
+  String get linkMessage => _reconnectable?.linkMessage ?? '';
+
+  @override
+  Future<void> reconnectLink() async {
+    final ReconnectableWorkspace? link = _reconnectable;
+    if (link == null) {
+      throw WorkspaceIoException(
+        '该工作空间后端不支持链路重连（本机工作空间没有可重建的远端链路）',
+      );
+    }
+    await link.reconnectLink();
+  }
 
   /// 文件面板那一层接口（只有 SSH 后端同时实现两个接口；本机后端走 dart:io，
   /// 不经过这里）。缺支持时显式报错，不静默假装成功。
