@@ -60,6 +60,21 @@ class FileContent {
   final String language;
 }
 
+/// 取 `[from, to)` 行的文本（**本机与 SSH 共用一份**：两端语义不许漂移）。
+///
+/// **保留结尾换行**：[FileContent.text] 是"文件内容"，不是"行拼接"——选区覆盖了末行、
+/// 且原文以换行结尾时，把那个换行补回来，`write → read` 才保真。只取中段（没覆盖末行）
+/// 时不补，避免凭空多出一个空行。
+///
+/// 为什么单列出来：[LineSplitter] 会把"结尾换行"吃掉（`'a\nb\n'` ⇒ `['a','b']`），
+/// 直接 `join('\n')` 就丢了它——本机与远端各写一遍必然漂移，所以只留这一处规则。
+String sliceFileLines(String text, List<String> lines, int from, int to) {
+  final String selected = lines.sublist(from, to).join('\n');
+  if (to <= from || to != lines.length) return selected;
+  if (!text.endsWith('\n') && !text.endsWith('\r')) return selected;
+  return '$selected\n';
+}
+
 /// 编辑结果。
 class EditOutcome {
   const EditOutcome({

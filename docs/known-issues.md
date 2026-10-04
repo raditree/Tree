@@ -1356,3 +1356,60 @@ SSH 下返回的是**远端绝对路径**（`/home/u/proj/.output/…`），而�
 假 transport 下正确；`nohup` / `tail` / `kill` 在真实远端主机上的行为需在真机上复核。另外远端 `cancel`
 是**尽力而为**（`kill -TERM` 进程组 + 单进程；拿不到 pid 时如实返回 false），且远端 pid 可能被复用 ⇒
 `GONE` 判定以**哨兵文件**为主判据。
+
+**真机复核（2026-10-04 补充）**：已在真机 `open@192.168.0.208:/mnt/space`（`hostname=open`、UTC、
+`setsid` 存在）上端到端复核：命令确实在**远端**执行、日志落在远端工作空间、退出码与产物正确 ⇒ 上一条
+"未端到端验证"的遗留**已消除**；复核同时发现 #23（远端 `hook=true` 不立即返回）。
+
+## #23 SSH 下 `terminal hook=true` **不立即返回**（阻塞到命令结束，hook 退化成同步调用）
+
+**现象**（2026-10-04 真机）：`hook=true` 起的远端命令**确实在远端跑**（#22 已修），但**工具不立即返回**——
+`startBackground` 阻塞的时长 ≈ 命令时长：实测 `sleep 25` 阻塞 **25.09s**，返回时日志早已写满、产物也已生成。
+
+**根因**：远端命令形状 `mkdir -p … && cd <root> && { nohup sh -c '…' > <日志> 2>&1 < /dev/null ; } & echo $!`——
+`&` 挂在**组**上，但组内的 `nohup` 仍以前台跑完，承载组的子壳要等它结束才退出；而该子壳仍握着
+**SSH 通道的 stdout/stderr** ⇒ 通道直到命令结束才 EOF ⇒ `SshTransport.run` 直到命令结束才返回。
+（原注释里"三路重定向 ⇒ 通道立刻收工"的推断不成立：重定向加在**内层命令**上，没加在**承载它的子壳**上。）
+
+**证据**（ssh CLI，`sleep 6`，基线 `true` = 262ms）：当前形状 **6283ms**；`nohup … & echo $!` 6270ms；
+`setsid nohup … & echo $!` 6277ms；`( setsid sh -c '…' >L 2>&1 </dev/null & ) ; echo $!` 606ms（`$!` 落空）；
+**`( setsid nohup sh -c '…' >L 2>&1 </dev/null & echo $! )` 266ms ✅**。
+生产代码路径（`SshWorkspaceIO.startBackground`）修复前 `sleep 25` → `RETURN_MS=25090`；修复后 → **76ms / 74ms**。
+
+**修复**（2026-10-04）：命令形状改为
+`mkdir -p … && cd <root> && ( setsid nohup sh -c '<cmd> ; printf %s $? > <哨兵>' > <日志> 2>&1 < /dev/null & echo $! )`
+——后台化与 `echo $!` 都放进**子壳**：子壳立刻退出 ⇒ 通道立刻 EOF ⇒ `run` 立刻返回，pid 仍回到 stdout；
+`setsid` 让命令自成**进程组**（pgid == pid），`cancel` 的 `kill -TERM -<pid>` 才落在正确进程组。
+
+**验证**：`packages/tree_local_exec/test/background_exec_test.dart` 钉新形状（并断言**不含**旧形状）；
+`ssh_integration_test.dart` 新增门控真机用例「`startBackground` 立即返回」：命令跑 8s 而返回 < 4s、
+返回时命令仍在跑、随后拿得到退出码与产物（真机 `/mnt/space` 通过）。
+
+**状态**：已修复（2026-10-04）。
+
+**遗留（如实）**：命令依赖 **`setsid`**（util-linux / busybox 一般都有，纯 POSIX 远端未必）——缺失时该远端
+起不了后台命令；暂**不做**静默降级（宁可显式失败），确有需要再加"无 `setsid` 回退"。只在本例真机
+（Debian 系）核过 `setsid` 存在，未在所有目标远端逐一核。
+
+## #24 `readFile().text` 吃掉文件**结尾换行**（`write → read` 不保真）
+
+**现象**：门控真机用例 `真 SSH：连接 + SFTP 读写改 + exec + 清理` **一直失败**：写入 `'hello\n世界\n'` 后读回
+`text == 'hello\n世界'`——**结尾换行丢了**（`totalLines` 仍是 2，从返回值上看不出异常）。因为该用例门控
+（无 sshd 就跳过），这条失败此前从未在本地/CI 暴露。
+
+**根因**：`readFile` 用 `const LineSplitter().convert(text)` 再 `join('\n')` 拼回 `text`。`LineSplitter` 把结尾
+换行当**行终止符**吃掉（`'a\nb\n'` ⇒ `['a','b']`），`join('\n')` 就少一个换行。本机
+（`local_workspace_io.dart`）与远端（`ssh_workspace_io.dart`）**各写了一遍**，同样的丢失。
+
+**修复**（2026-10-04，用户裁定"改代码保真"）：取行逻辑收成**共用一处** `sliceFileLines`
+（`packages/tree_local_exec/lib/src/workspace_io.dart`）：选区覆盖**末行**且原文以换行结尾 ⇒ 补回结尾换行；
+只取中段 ⇒ 不补。本机与远端都改调它（防两端漂移）。
+
+**影响面核对**：`text` 的消费方要么是显示（`read` 工具 / 提示词 / spec 预览），要么本来就防御了缺换行
+（`message_dispatcher._appendActivity` 有 `if (!existing.endsWith('\n'))`）；**文件面板 / 编辑器**走**原始字节**
+（`FileService._contentJson` / `writeContent`），不受影响；既有单测写的内容本来就没有结尾换行，全部仍绿。
+
+**验证**：`local_workspace_io_test` / `ssh_workspace_io_test` 新增「结尾换行保真」组（`'a\nb\n'` 原样读回 /
+只取中段不凭空补）；门控真机用例转绿。
+
+**状态**：已修复（2026-10-04）。**遗留**：无。

@@ -127,7 +127,17 @@ void main() {
       expect(handle.pid, 4242, reason: '从 echo 的输出里取后台子 shell 的 pid');
 
       final String cmd = transport.commands.first;
-      expect(cmd, contains('nohup sh -c'));
+      expect(cmd, contains('( setsid nohup sh -c'));
+      expect(
+        cmd,
+        contains(r'& echo $! )'),
+        reason: r'子壳内 `& echo $!`：子壳立刻退出 ⇒ 通道立刻 EOF ⇒ run 立刻返回；pid 仍在 stdout',
+      );
+      expect(
+        cmd,
+        isNot(contains('; } & echo')),
+        reason: r'旧形状 `{ ... ; } & echo $!` 会让承载组的子壳握通道、阻塞到命令结束（known-issues #23）',
+      );
       expect(
         cmd,
         contains("> '/home/u/proj/.output/h1.log' 2>&1 < /dev/null"),

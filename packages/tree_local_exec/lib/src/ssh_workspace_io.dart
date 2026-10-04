@@ -374,7 +374,7 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles, BackgroundExecHost 
         : (from + lineCount > total ? total : from + lineCount);
     return FileContent(
       path: relativePath,
-      text: all.sublist(from, to).join('\n'),
+      text: sliceFileLines(text, all, from, to),
       totalLines: total,
       startLine: start,
       truncated: to < total,
@@ -1007,13 +1007,21 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles, BackgroundExecHost 
     // 包装命令（整条再经 [SshTransport.run] 的登录外壳包装）：
     //
     //   mkdir -p <log 父目录> && cd <root> \
-    //     && { nohup sh -c '<cmd> ; printf %s $? > <marker>' \
-    //            > <log> 2>&1 < /dev/null ; } & echo $!
+    //     && ( setsid nohup sh -c '<cmd> ; printf %s $? > <marker>' \
+    //            > <log> 2>&1 < /dev/null & echo $! )
     //
-    // - 三路重定向 + `< /dev/null` ⇒ SSH exec 通道能**立刻**收工（远端没有东西再写通道）；
+    // - 三路重定向 + `< /dev/null` ⇒ 命令不持有 SSH 通道的 fd；
     // - `nohup` 让命令免疫会话结束时的 SIGHUP（关掉连接后照常跑完）；
-    // - `{ ... ; } &` 把整条链放到后台，`echo $!` 给出包装子 shell 的 pid；
-    // - 命令结束时由子 shell 把 `$?` 写进哨兵文件，本机因此能拿到退出码。
+    // - **子壳 `( ... & echo $! )` 是关键**：命令在子壳里 `&` 后台化后子壳**立刻退出**
+    //   ⇒ 通道立刻 EOF ⇒ `run` 立刻返回；`echo $!` 写在**子壳内**，pid 仍回到 stdout
+    //   （`( ... & ) ; echo $!` 会让 `$!` 落空，拿不到 pid）；
+    // - `setsid` 让命令自成**进程组**（pgid == pid）⇒ `cancel` 的 `kill -TERM -<pid>`
+    //   落在正确进程组；命令结束时由子壳把 `$?` 写进哨兵文件，本机因此能拿到退出码。
+    //
+    // 旧形状 `{ ... ; } & echo $!` **会阻塞到命令结束**：`&` 挂在组上，组内的 `nohup`
+    // 仍以前台跑完，而承载组的子壳一直握着通道的 stdout/stderr，直到命令结束才退出
+    // ⇒ `run` 跟着等到命令结束（`hook=true` 退化成同步调用；2026-10-04 真机实测
+    // `sleep 25` 阻塞 25.09s。见 docs/known-issues.md #23）。
     //
     // 内层用 `sh -c`（POSIX）：远端不一定有 bash（登录外壳是**探测 + 回退**出来的，
     // 见 ssh_login_shell.dart），所以这里只依赖 POSIX。代价如实记录：后台命令跑在
@@ -1021,9 +1029,9 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles, BackgroundExecHost 
     final String shellCommand =
         'mkdir -p ${_quote(p.posix.dirname(logAbsolute))} '
         '&& cd ${_quote(root)} '
-        '&& { nohup sh -c '
+        '&& ( setsid nohup sh -c '
         '${posixSingleQuote('$trimmed ; printf %s \$? > ${posixSingleQuote(markerAbsolute)}')} '
-        '> ${_quote(logAbsolute)} 2>&1 < /dev/null ; } & echo \$!';
+        '> ${_quote(logAbsolute)} 2>&1 < /dev/null & echo \$! )';
     final SshExecResult started = await _runRaw(shellCommand);
     final int? pid = _parsePid(started.stdout);
     return _SshBackgroundExec(

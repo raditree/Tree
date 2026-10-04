@@ -290,7 +290,7 @@ class LocalWorkspaceIO implements WorkspaceIO, WorkspaceFiles, BackgroundExecHos
     final int to = (lineCount == null || lineCount <= 0)
         ? totalLines
         : (from + lineCount > totalLines ? totalLines : from + lineCount);
-    final String selected = allLines.sublist(from, to).join('\n');
+    final String selected = sliceFileLines(text, allLines, from, to);
     return FileContent(
       path: relativePath,
       text: selected,

@@ -63,6 +63,18 @@ void main() {
       expect(c.base64, isNull);
     });
 
+    test('结尾换行保真（远端同口径）', () async {
+      t.seed('/ws/nl.txt', 'a\nb\n');
+      final FileContent c = await io.readFile('nl.txt');
+      expect(c.text, 'a\nb\n', reason: '结尾换行不能被吃掉');
+      expect(c.totalLines, 2);
+      expect(
+        (await io.readFile('nl.txt', startLine: 1, lineCount: 1)).text,
+        'a',
+        reason: '只取中段 ⇒ 不补结尾换行',
+      );
+    });
+
     test('行范围读取标记 truncated', () async {
       t.seed('/ws/a.txt', 'l1\nl2\nl3\nl4');
       final FileContent c = await io.readFile(

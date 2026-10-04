@@ -30,6 +30,21 @@
   **远端任务落盘台账**（`<数据根>/hooks/<task_id>.json`，原子写）：核心/应用**重启后接续**——启动即探一次哨兵，
   已结束就立刻把完成提示**投递回原会话**（台账里的 agent + 会话），未结束就重挂轮询；agent / 会话已不存在
   则**如实记日志、台账保留**，不假装投递成功；关停语义两端不同且如实（本机杀进程树，**远端不杀**）。
+- **远端 `hook=true` **立即返回**（不许退化成同步调用）**（修改
+  [tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 16、
+  [tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 8、
+  [docs/architecture.md](docs/architecture.md) §11；真机实测见
+  [docs/known-issues.md](docs/known-issues.md) #23）：
+  远端命令形状改为 `( setsid nohup sh -c '<cmd> ; printf %s $? > <哨兵>' > <日志> 2>&1 < /dev/null & echo $! )`
+  ——**后台化与 `echo $!` 都放进子壳**：子壳立刻退出 ⇒ SSH 通道立刻 EOF ⇒ `startBackground` 立刻返回
+  （pid 仍回到 stdout）；`setsid` 让命令自成进程组（pgid == pid），`cancel` 的 `kill -TERM -<pid>` 才落在
+  正确进程组。旧形状 `{ … ; } & echo $!` 会把工具**阻塞到命令结束**（真机实测 `sleep 25` 阻塞 25.09s）。
+- **`readFile` 的 `text` 保留结尾换行**（新增 [tree_local_exec/README.md](packages/tree_local_exec/README.md)
+  不变量 17，[workspace_io.dart](packages/tree_local_exec/lib/src/workspace_io.dart) 的 `sliceFileLines`；
+  **用户要求 2026-10-04**）：`text` 是**文件内容**而非"行拼接"——选区覆盖**末行**且原文以换行结尾时补回
+  结尾换行（`write → read` 保真），只取中段不补；规则**只有一处**、本机与远端共用（`LineSplitter` 会吃掉
+  结尾换行，直接 `join('\n')` 就丢了它）。文件面板 / 编辑器走**原始字节**，不受影响。详见
+  [docs/known-issues.md](docs/known-issues.md) #24。
 - **右栏「正在执行的 tool」每行标注来源（agent · 会话）且点得动**（新增 [lib/README.md](lib/README.md) 不变量 23、
   [lib/ui/widgets/tool_runs_panel.dart](lib/ui/widgets/tool_runs_panel.dart)、
   [lib/ui/pages/main_page.dart](lib/ui/pages/main_page.dart) 的 `_handleNavigateToToolRun`，**用户要求 2026-10-04**：

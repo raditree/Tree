@@ -104,6 +104,23 @@ void main() {
       expect(content.truncated, isFalse);
     });
 
+    test('结尾换行保真：write → read 原样（text 是文件内容，不是行拼接）', () async {
+      writeFile('nl.txt', 'a\nb\n');
+      final FileContent content = await io.readFile('nl.txt');
+      expect(content.text, 'a\nb\n', reason: '结尾换行不能被 LineSplitter 吃掉');
+      expect(content.totalLines, 2);
+    });
+
+    test('行范围：覆盖末行保留结尾换行；只取中段不凭空补', () async {
+      writeFile('nl.txt', 'a\nb\nc\n');
+      expect((await io.readFile('nl.txt', startLine: 3)).text, 'c\n');
+      expect(
+        (await io.readFile('nl.txt', startLine: 1, lineCount: 2)).text,
+        'a\nb',
+        reason: '没覆盖末行 ⇒ 不补结尾换行',
+      );
+    });
+
     test('行范围：start_line + line_count，并标记 truncated', () async {
       writeFile('a.txt', '1\n2\n3\n4\n5');
       final FileContent content = await io.readFile(

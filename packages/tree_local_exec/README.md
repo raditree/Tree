@@ -97,14 +97,26 @@
       `attachBackground` **重新接管**（**不重跑、不新起**）；
     - **本机**：脚本文件 + shell 重定向直写日志（`>>` + `2>&1`），进程句柄在手 ⇒ 退出码实时、
       `cancel` 杀整棵进程树、关停杀树；
-    - **远端（SSH）**：`mkdir -p` + `cd <root>` + `{ nohup sh -c '<cmd> ; printf %s $? > <哨兵>' > <日志> 2>&1 < /dev/null ; } & echo $!`
+    - **远端（SSH）**：`mkdir -p` + `cd <root>` + `( setsid nohup sh -c '<cmd> ; printf %s $? > <哨兵>' > <日志> 2>&1 < /dev/null & echo $! )`
       ⇒ 命令起在**远端**、日志落**远端工作空间**、退出码写进**哨兵文件**（本机按 **3s** 轮询：
       `if [ -f 哨兵 ]; then cat 哨兵; elif kill -0 <pid>; then RUNNING; else GONE; fi`）；
+      **`startBackground` 必须立刻返回**（`hook=true` 不许退化成同步调用）：`&` 与 `echo $!` 都写在
+      **子壳**里 ⇒ 子壳立刻退出、SSH 通道立刻 EOF ⇒ `run` 立刻返回（pid 仍回到 stdout）；`setsid` 让命令
+      自成**进程组**（pgid == pid）⇒ `cancel` 的 `kill -TERM -<pid>` 落在正确进程组。旧形状
+      `{ … ; } & echo $!` 会让承载组的子壳一直握着通道、**阻塞到命令结束**（2026-10-04 真机实测
+      `sleep 25` 阻塞 25.09s，见 [../../docs/known-issues.md](../../docs/known-issues.md) #23）；
       远端进程**不归本机管**：`cancel` 尽力（拿不到 pid ⇒ 返回 false，**不假装**）、**关停不杀**
       （关应用不该杀掉远端训练）；进程消失但没留哨兵 ⇒ [BackgroundExecHandle.goneExitCode]（可辨，不当正常退出）；
       链路判失活 ⇒ `exitCode` 以 `SshLinkStaleException` 结束；
     - 内层命令只依赖 **POSIX**（`sh -c`）：远端不一定有 bash（登录外壳是探测 + 回退出来的），
       代价是"后台命令跑在 `sh -c` 里、与同步执行的登录外壳（`bash -lc`）在 bash 专有语法上有差异"（如实记录）。
+17. **`readFile` 的 `text` 保留结尾换行**（[lib/src/workspace_io.dart](lib/src/workspace_io.dart) 的
+    `sliceFileLines`，**用户要求 2026-10-04**：「readFile().text 的结尾换行语义」= 保真）：
+    `text` 是**文件内容**，不是"行拼接"——选区覆盖**末行**、且原文以换行结尾时把那个换行**补回来**，
+    `write → read` 才保真；只取中段（没覆盖末行）时**不补**，不凭空多出一个空行。
+    规则只有这一处、本机与远端共用（`LineSplitter` 会吃掉结尾换行：`'a\nb\n'` ⇒ `['a','b']`，直接
+    `join('\n')` 就丢了它；各写一遍必然漂移）。`totalLines` 是**行数**，与是否保留结尾换行无关。
+    文件面板 / 编辑器走的是**原始字节**（`FileService._contentJson` + `writeContent`），不受这条影响。
 
 ## 测试
 
@@ -123,7 +135,9 @@ M11 新增钉子：`git_output_test` 的 `parseStatus` 组（`-z`、空格 / 中
 
 回归钉子：`exec_no_interactive_hang_test`（裸 `echo` 不再等输入）、`exec_soft_timeout_test`（本地软超时交还进程）、
 `background_exec_test`（**后台执行原语**：本机起/写日志/读尾部/杀树/越界拒绝；远端用假 transport 钉
-`nohup` 命令形状、哨兵轮询（含 `GONE`）、`attachBackground` **不重跑命令**、`cancel` 拿不到 pid 时如实 false）、
+`( setsid nohup … & echo $! )` 命令形状、哨兵轮询（含 `GONE`）、`attachBackground` **不重跑命令**、`cancel` 拿不到 pid 时如实 false）、
+`local_workspace_io_test` / `ssh_workspace_io_test` 的「结尾换行保真」组（**不变量 17**：`'a\nb\n'` 原样读回、
+只取中段不凭空补）、
 `ssh_exec_soft_timeout_test`（**SSH 软超时**：到点交出仍在运行的远端命令、`0`/缺省 = 永不、到点后心跳仍判活）、
 `shell_translate_test`（裸 echo / 逻辑运算符翻译）、`windows_environment_test`（**按登录口径重建**：`reg query`
 输出解析、`Path` 机器级+用户级、用户级覆盖、注册表缺项时保留继承值、`%VAR%` 展开与变量环、任一步失败整体退回）、
@@ -134,5 +148,9 @@ M11 新增钉子：`git_output_test` 的 `parseStatus` 组（`-z`、空格 / 中
 `ssh_shell_channel_test`（**远端 shell 通道的契约**，用假通道：[ssh_workspace_io_test.dart](test/ssh_workspace_io_test.dart)
 里的假传输 + [test/fake_ssh_shell_channel.dart](test/fake_ssh_shell_channel.dart)：透传尺寸与**远端根**、原始字节不受清洗、
 写入 / resize、`close` 幂等、`exitCode` 一定收口（含主动 close 给 -1）、**close 不关整条连接**、链路失活显式失败）。
+`ssh_integration_test`（**门控真机**：连上 + SFTP 读写改 + exec + 清理（探针落在**自建目录**、grep **限定该目录**
+——否则全根 grep 在真实共享工作空间上 2 分钟都扫不完、`matches.single` 也不成立）、软超时交还远端命令、
+**`startBackground` 立即返回**（返回耗时与命令时长无关：命令跑 8s 而返回 < 4s；返回时命令仍在跑，
+随后拿得到退出码与产物））、
 真链路的 SSH 会话通道没有在本仓库验证过（本机无 sshd），只保证编译通过与参数形状有据可依——见
 [../../docs/known-issues.md](../../docs/known-issues.md) #12。
