@@ -27,6 +27,16 @@ class _FakeSsh implements SshTransport {
   @override
   final SshLiveness liveness = SshLiveness();
 
+  /// 显式重连：这组用例只关心后台 hook 的台账语义，不涉及"失活后重建"，
+  /// 所以这里只清失活标记并记账（真实现见 `dartssh_transport.dart`）。
+  int reconnects = 0;
+
+  @override
+  Future<void> reconnect() async {
+    reconnects++;
+    liveness.reset();
+  }
+
   @override
   Future<void> close() async => closed = true;
 

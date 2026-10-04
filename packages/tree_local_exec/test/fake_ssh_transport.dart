@@ -255,6 +255,16 @@ class FakeSshTransport implements SshTransport {
     return channel;
   }
 
+  /// 被动重连次数（真实现在 `dartssh_transport.dart` 里做真实的建连；假传输只记账，
+  /// 并清掉失活标记——核心侧的"显式重连"路径据此断言"确实调到了这一层"）。
+  int reconnects = 0;
+
+  @override
+  Future<void> reconnect() async {
+    reconnects++;
+    liveness.reset();
+  }
+
   @override
   Future<void> close() async => closed = true;
 }

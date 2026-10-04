@@ -129,4 +129,51 @@ void main() {
     link.recordBeat();
     expect(await link.guard(() async => 7), 7);
   });
+
+  test('onStale：跨过阈值那一拍通知一次，连续丢失不重复通知', () {
+    int notified = 0;
+    final SshLiveness link = SshLiveness(
+      maxMisses: 3,
+      onStale: () => notified++,
+    );
+    link.recordMiss();
+    link.recordMiss();
+    expect(notified, 0, reason: '还没到阈值');
+    link.recordMiss();
+    expect(notified, 1, reason: '判失活的那一拍通知（传输层据此起重连）');
+    link.recordMiss();
+    link.recordMiss();
+    expect(notified, 1, reason: '同一次失活只通知一次，否则会反复起循环');
+    link.recordBeat();
+    link.recordMiss();
+    link.recordMiss();
+    expect(notified, 1);
+    link.recordMiss();
+    expect(notified, 2, reason: '恢复之后再次跨过阈值要能再通知一次');
+  });
+
+  test('onStale 可在建好后挂载（connect() 里就是这么挂的）', () {
+    int notified = 0;
+    final SshLiveness link = SshLiveness(maxMisses: 1);
+    link.onStale = () => notified++;
+    link.recordMiss();
+    expect(notified, 1);
+  });
+
+  test('staleMessage：如实说"不会自行恢复"（旧连接不会自己活回来）', () {
+    final SshLiveness link = SshLiveness(maxMisses: 3);
+    for (int i = 0; i < 3; i++) {
+      link.recordMiss();
+    }
+    final String message = link.staleMessage;
+    expect(message, contains('心跳丢失'));
+    expect(message, contains('链路失活'));
+    expect(message, contains('不会自行恢复'));
+    expect(message, contains('重连'));
+    expect(
+      message,
+      isNot(contains('自动恢复')),
+      reason: '旧文案"心跳恢复后自动恢复"是误导：2026-10-05 现场连丢 1325 拍、远端可达却再没恢复过',
+    );
+  });
 }

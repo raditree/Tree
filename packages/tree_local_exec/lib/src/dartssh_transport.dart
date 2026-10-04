@@ -8,8 +8,24 @@ import 'package:dartssh2/dartssh2.dart';
 import 'local_workspace_io.dart';
 import 'ssh_login_shell.dart';
 import 'ssh_liveness.dart';
+import 'ssh_reconnect.dart';
 import 'ssh_shell_channel.dart';
 import 'ssh_workspace_io.dart';
+
+/// 一条 dartssh2 会话：客户端 + 它的 SFTP 通道。
+///
+/// 单独包一层是为了**重连时整体替换**（旧会话关掉、新会话顶上），而不是把每个
+/// 派生对象（SFTP / shell 通道 / 登录外壳探测结论）逐个换新。
+class SshSession {
+  SshSession(this.client, this.sftp);
+
+  final SSHClient client;
+  final SftpClient sftp;
+}
+
+/// 建一条新会话（可注入：单测用假连接器验证"判失活 → 自动重连 / 显式重连"，
+/// 否则这条路径只能靠门控真机测，等于没测）。
+typedef SshSessionConnector = Future<SshSession> Function();
 
 /// [SshTransport] 的 dartssh2 实现（M4b-2b）。
 ///
@@ -27,18 +43,41 @@ import 'ssh_workspace_io.dart';
 ///   不在这里兑现：那一层语义在 [SshWorkspaceIO.exec]（到点只是"不再等"、以
 ///   [SshExecStillRunning] 交出仍在跑的远端命令），本层永远不按时间终止命令。
 /// - SFTP 读写：本来就没有挂超时（分块流式推进），只在外面套活性守卫；
-/// - 重试等待：本层没有重试循环，也就没有等待超时；
 /// - 心跳：见 [_beat]，每 [SshLiveness.interval] 一次 keepalive，**窗口同样是
 ///   一个间隔**——窗口内没等到回包（成功/失败回包都算回）就记一次丢失，连续
-///   [SshLiveness.maxMisses] 次判失活。丢的只是"判据"，不是时间本身。
+///   [SshLiveness.maxMisses] 次判失活。丢的只是"判据"，不是时间本身；
+/// - **重连**（2026-10-05 补）：判失活的那一瞬间（[SshLiveness.onStale]）起一个
+///   **后台重连循环**（见 [_autoReconnectLoop]）：单飞 + 退避（[defaultReconnectBackoff]：
+///   5s→10s→30s→60s，之后每 60s 一次），直到成功 / [close] / 显式 [reconnect] 接手。
+///   退避是"两次尝试之间的节奏"，**不是**静态时长上限——判死仍然只看心跳丢失，
+///   单次建连照旧不设超时。为什么必须有它：一条已经断掉的 TCP 连接不会自己活回来
+///   （现场 2026-10-05：连续 1325 拍丢失、远端实测可达，应用再没恢复过，只能重启）。
 class DartSshTransport implements SshTransport {
   DartSshTransport._(
-    this._client,
-    this._sftp,
+    this._session,
+    this._connector,
     this._liveness,
     this._loginShellTemplate,
-    this._log,
-  );
+    this._log, {
+    Future<void> Function(Duration duration)? sleep,
+    List<Duration>? reconnectBackoff,
+  })  : _sleep = sleep ?? Future<void>.delayed,
+        _reconnectBackoff = reconnectBackoff ?? defaultReconnectBackoff {
+    // 判失活的那一拍 → 起后台重连（单飞 + 退避，见 [_autoReconnectLoop]）。
+    _liveness.onStale = _handleStale;
+  }
+
+  /// 自动重连的退避节奏：前四拍 5s / 10s / 30s / 60s，之后一直用最后一拍（每 60s 一次），
+  /// 直到成功、[close] 或显式 [reconnect] 接手。
+  ///
+  /// **它是节奏，不是静态时长上限**：判死判据仍然只看"连续 N 拍心跳丢失"（M9 1.1），
+  /// 重连是判死**之后**的动作，任何一次尝试本身都不设超时。
+  static const List<Duration> defaultReconnectBackoff = <Duration>[
+    Duration(seconds: 5),
+    Duration(seconds: 10),
+    Duration(seconds: 30),
+    Duration(seconds: 60),
+  ];
 
   /// 用户配的登录外壳模板（null = 内置候选；`''` = 关；非空 = 自定义）。
   final String? _loginShellTemplate;
@@ -83,6 +122,9 @@ class DartSshTransport implements SshTransport {
     int maxMissedHeartbeats = SshLiveness.defaultMaxMisses,
     String? loginShell,
     void Function(String message)? log,
+    SshSessionConnector? connector,
+    Future<void> Function(Duration duration)? sleep,
+    List<Duration>? reconnectBackoff,
   }) async {
     List<SSHKeyPair>? identities;
     if (keyPath.isNotEmpty) {
@@ -95,41 +137,80 @@ class DartSshTransport implements SshTransport {
         keyPassphrase.isEmpty ? null : keyPassphrase,
       );
     }
-    final SSHSocket socket = await SSHSocket.connect(host, port);
-    final SSHClient client = SSHClient(
-      socket,
-      username: username,
-      identities: identities,
-      onPasswordRequest: password.isEmpty ? null : () => password,
-      // 心跳改由本类自己发（见 [_beat]）：dartssh2 内置的 keepAliveInterval 也会
-      // ping，但它的 SSHKeepAlive 把结果全吞了，观测不到"这一拍到底回没回"——
-      // 而 1.1 要的正是这个。关掉内置的那份，避免重复发。
-      keepAliveInterval: null,
-    );
-    try {
-      await client.authenticated;
-    } catch (error) {
-      client.close();
-      throw WorkspaceIoException('SSH 认证失败：$error');
-    }
-    final SftpClient sftp = await client.sftp();
+
+    // 建一条会话：**首次连接与之后每次重连共用这一份**（重连就是"再调它一次"）。
+    // `connector` / `sleep` / `reconnectBackoff` 是测试接缝（生产不传）。
+    final SshSessionConnector openSession =
+        connector ??
+        () async {
+          final SSHSocket socket = await SSHSocket.connect(host, port);
+          final SSHClient client = SSHClient(
+            socket,
+            username: username,
+            identities: identities,
+            onPasswordRequest: password.isEmpty ? null : () => password,
+            // 心跳改由本类自己发（见 [_beat]）：dartssh2 内置的 keepAliveInterval 也会
+            // ping，但它的 SSHKeepAlive 把结果全吞了，观测不到"这一拍到底回没回"——
+            // 而 1.1 要的正是这个。关掉内置的那份，避免重复发。
+            keepAliveInterval: null,
+          );
+          try {
+            await client.authenticated;
+          } catch (error) {
+            client.close();
+            throw WorkspaceIoException('SSH 认证失败：$error');
+          }
+          final SftpClient sftp = await client.sftp();
+          return SshSession(client, sftp);
+        };
+
+    final SshSession session = await openSession();
     final DartSshTransport transport = DartSshTransport._(
-      client,
-      sftp,
+      session,
+      openSession,
       SshLiveness(interval: heartbeatInterval, maxMisses: maxMissedHeartbeats),
       loginShell,
       log,
+      sleep: sleep,
+      reconnectBackoff: reconnectBackoff,
     );
     transport._startHeartbeat();
     return transport;
   }
 
-  final SSHClient _client;
-  final SftpClient _sftp;
+  /// 当前会话（client + sftp）；**重连时整体替换**，因此不是 final。
+  SshSession _session;
+
+  /// 建一条新会话（首次连接与重连共用；测试可注入假连接器）。
+  final SshSessionConnector _connector;
+
   final SshLiveness _liveness;
+
+  /// 退避等待（测试注入假实现，避免真等 5s / 60s）。
+  final Future<void> Function(Duration duration) _sleep;
+
+  /// 自动重连的退避节奏（见 [defaultReconnectBackoff]）。
+  final List<Duration> _reconnectBackoff;
+
+  /// 重连节拍（单飞 + 退避 + 可停止）：**策略**在 [SshReconnectPump] 里（因此可单测），
+  /// 这里只提供"真重建一次"= [_reconnectOnce]。
+  late final SshReconnectPump _reconnectPump = SshReconnectPump(
+    attempt: _reconnectOnce,
+    backoff: _reconnectBackoff,
+    sleep: _sleep,
+    stillNeeded: () => !_closed && _liveness.isStale,
+    onEvent: (String message) => _log?.call('SSH 重连：$message'),
+  );
+
+  /// 已 [close]：不再起新的重连、不再发心跳。
+  bool _closed = false;
 
   Timer? _heartbeat;
   bool _beating = false;
+
+  SSHClient get _client => _session.client;
+
+  SftpClient get _sftp => _session.sftp;
 
   /// 开始心跳：每 [SshLiveness.interval] 一拍，单拍窗口同样是一个间隔。
   void _startHeartbeat() {
@@ -157,6 +238,56 @@ class DartSshTransport implements SshTransport {
     } finally {
       _beating = false;
     }
+  }
+
+  /// 判失活的那一瞬间（[SshLiveness.onStale]）→ 起后台重连。
+  ///
+  /// **不阻塞任何调用方**：在途 / 新来的操作仍按既有口径**立刻显式失败**
+  /// （`SshLinkStaleException`），重连只负责"之后能再用"。这样既不永久挂起，也不用把
+  /// 工具调用堵在一次（远端不可达时可能很慢的）建连上——那正是 M9 1.1 要避免的。
+  void _handleStale() {
+    if (_closed) return;
+    _log?.call('SSH 链路失活（连续 ${_liveness.missedCount} 次心跳丢失），开始后台重连…');
+    unawaited(_reconnectPump.start());
+  }
+
+  /// **重建**这条链路：显式「重连」入口与后台循环**共用同一次**实现（单飞）。
+  ///
+  /// 语义见 [SshTransport.reconnect]：**建新连接成功之后**才替换旧连接并
+  /// [SshLiveness.reset]；失败抛可读 [WorkspaceIoException] 且**保持失活态**（绝不假装恢复了）。
+  @override
+  Future<void> reconnect() => _reconnectPump.retryNow();
+
+  Future<void> _reconnectOnce() async {
+    if (_closed) {
+      throw WorkspaceIoException('SSH 传输已关闭，无法重连');
+    }
+    // 先建新的、再换：失败时原地不动（仍是"判死"状态），不会出现"标记已清但仍连不上"的假活。
+    final SshSession fresh;
+    try {
+      fresh = await _connector();
+    } catch (error) {
+      throw WorkspaceIoException('SSH 重连失败：$error');
+    }
+    if (_closed) {
+      // 建连期间被关停：别留下一条没人管的连接。
+      try {
+        fresh.client.close();
+      } catch (_) {
+        // 关旧连接失败不影响语义（进程退出时 OS 会收），但不能因此抛出去。
+      }
+      throw WorkspaceIoException('SSH 传输已关闭，无法重连');
+    }
+    final SSHClient stale = _session.client;
+    _session = fresh;
+    // 新连接 = 新链路：清空丢失计数（失活标记随之解除），在途的守卫自然放行。
+    _liveness.reset();
+    try {
+      stale.close();
+    } catch (_) {
+      // 旧连接可能已经断在半路：关它失败不影响新链路。
+    }
+    _log?.call('SSH 链路已重建（旧连接已关闭）');
   }
 
   /// 链路活性快照（1.1）：最近心跳时间 / 连续丢失计数 / 是否失活。
@@ -470,6 +601,9 @@ class DartSshTransport implements SshTransport {
 
   @override
   Future<void> close() async {
+    _closed = true;
+    _liveness.onStale = null; // 关停之后不再拉起重连
+    _reconnectPump.stop(); // 循环醒来即退出；之后显式重连也直接拒绝
     _heartbeat?.cancel();
     _heartbeat = null;
     _client.close();

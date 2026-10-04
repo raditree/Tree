@@ -22,14 +22,30 @@ class SshLinkStaleException extends WorkspaceIoException {
 /// [interval] 量级的 window，窗口内没完成就记一次丢失。这个窗口是**单次心跳的
 /// deadline**，与"任务总共跑了多久"是两回事。
 ///
-/// 只做标记与唤醒，**不关连接**：链路可能只是慢/抖动，恢复后任何一次成功心跳
-/// （或任何一次成功的读/写响应）都会 [recordBeat] 清零丢失计数、自动解除失活。
+/// 只做标记与唤醒，**不关连接、也不自己重连**：链路可能只是慢/抖动，届时任何一次成功
+/// 心跳（或任何一次成功的读/写响应）都会 [recordBeat] 清零丢失计数、自动解除失活；
+/// 但一条**已经断掉的 TCP 连接不会自己活回来**（现场 2026-10-05：连续 1325 拍丢失、
+/// 远端经过实测可达，应用却再没恢复过），所以判失活的那一瞬间通过 [onStale] 通知传输层
+/// 去**重建连接**（见 `ssh_reconnect.dart` 的 `SshReconnectPump`：单飞 + 退避，
+/// 不引入任何静态时长上限——判死判据仍然只看心跳丢失）。
 class SshLiveness {
   SshLiveness({
     this.interval = defaultInterval,
     this.maxMisses = defaultMaxMisses,
     DateTime Function()? clock,
+    this.onStale,
   }) : _clock = clock ?? DateTime.now;
+
+  /// **刚判失活**那一瞬间的通知（跨过 [maxMisses] 阈值的那一次调用）。
+  ///
+  /// 挂载点是传输层：`DartSshTransport` 用它启动**后台重连**（见 `ssh_reconnect.dart`
+  /// 的 `SshReconnectPump`，调用点 `DartSshTransport._handleStale`）。本类自己**不做**重连、
+  /// 也**不关**连接：一条已经断掉的 TCP 连接不会因为"再等一拍"活回来，重建是传输层的事，
+  /// 这里只负责"说一声"。
+  ///
+  /// 触发时机：同一次失活**只通知一次**（连续丢失不重复）；[recordBeat] / [reset]
+  /// 清零之后再次跨过阈值会再通知一次。可在建好后重新赋值（`connect()` 里挂载）。
+  void Function()? onStale;
 
   /// I：心跳间隔，同时也是**单次心跳窗口**的长度（可配）。
   static const Duration defaultInterval = Duration(seconds: 10);
@@ -62,9 +78,14 @@ class SshLiveness {
   bool get isAlive => !isStale;
 
   /// 失活原因（给上层/UI 的可读文本，错误信息里也用它）。
+  ///
+  /// 文案要说**真话**：旧实现写的是「连接未关闭，心跳恢复后自动恢复」，但一条已经断掉的
+  /// TCP 连接**不会**自己恢复（现场：连续 1325 拍丢失、远端其实可达，用户只能重启应用）。
+  /// 现在失活瞬间会触发传输层的后台重连（[onStale]），所以这里如实写"已判死 + 会重连 + 可手动"。
   String get staleMessage =>
       'SSH 链路失活：连续 $_missed 次心跳丢失（心跳间隔 ${interval.inSeconds}s，'
-      '阈值 $maxMisses 次）；连接未关闭，心跳恢复后自动恢复';
+      '阈值 $maxMisses 次）；旧连接已判死、不会自行恢复（核心会按退避自动重连，'
+      '也可用「重连」立即重建）';
 
   /// 收到一次心跳，或一次成功的读/写响应。
   ///
@@ -79,8 +100,13 @@ class SshLiveness {
   ///
   /// 返回是否已判失活（调用方只做日志/展示用）。
   bool recordMiss() {
+    final bool wasStale = isStale;
     _missed++;
-    if (isStale) _wakeWaiters();
+    if (isStale) {
+      // 「刚判失活」的那一拍通知一次（传输层据此开始重建连接）。
+      if (!wasStale) onStale?.call();
+      _wakeWaiters();
+    }
     return isStale;
   }
 

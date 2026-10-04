@@ -111,8 +111,36 @@ abstract interface class SshTransport {
   /// 给上层做重连决策与 UI 展示用；心跳丢失期间**不会**主动关连接。
   SshLiveness get liveness;
 
+  /// **重建**这条链路（判失活**之后**的动作，不是新的判活依据）。
+  ///
+  /// 两条路共用同一份实现（单飞）：
+  /// - 传输层自己的后台重连（判失活瞬间由 [SshLiveness.onStale] 触发，按退避重试）；
+  /// - 显式「重连」入口（核心 REST / 右栏按钮）——用户不想等退避时点它。
+  ///
+  /// 语义：**建新连接成功之后**才替换旧连接并 [SshLiveness.reset]（失败则保持失活态、
+  /// 抛可读 [WorkspaceIoException]）；同一时刻最多一次在途重建，并发调用复用同一次。
+  /// **不引入任何静态时长上限**：单次建连照旧不设超时，退避只是两次尝试之间的节奏。
+  Future<void> reconnect();
+
   /// 释放连接。
   Future<void> close();
+}
+
+/// **链路可重建**的工作空间（目前只有 SSH 后端实现）。
+///
+/// 为什么单独一个能力接口：核心侧（`WorkspaceToolRunner`）手里只有 `WorkspaceIO` 抽象，
+/// 而"这条链路现在死没死、能不能重建"只有远端后端知道。做成能力接口后：
+/// - 本机工作空间**不实现**它 ⇒ 核心侧用 `is` 判断后**显式**回可读错误（不静默假装成功）；
+/// - `PrivateWorkspaceIO`（`.self` 分栏装饰器）只需把它**透传**给内层。
+abstract interface class ReconnectableWorkspace {
+  /// 链路是否**已判失活**（连续 N 拍心跳丢失没回包）。
+  bool get linkStale;
+
+  /// 失活原因（可读文本，给错误面 / 日志；未失活时为空串）。
+  String get linkMessage;
+
+  /// **重建**这条链路：建新连接成功后才替换并清零丢失计数，失败抛可读异常且保持失活态。
+  Future<void> reconnectLink();
 }
 
 /// 远端一层目录条目（M7g）。
@@ -299,7 +327,12 @@ Future<String> resolveRemoteRoot(
 /// - **每次传输都过一遍活性守卫**（M9 1.1）：先查 [SshTransport.liveness]，在途
 ///   操作与"链路被判失活"的信号赛跑，成功则记一次心跳。因此远端半天不响应时
 ///   操作会以"心跳丢失"的显式错误结束，而不是永久挂起；正常链路上零行为变化。
-class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles, BackgroundExecHost {
+class SshWorkspaceIO
+    implements
+        WorkspaceIO,
+        WorkspaceFiles,
+        BackgroundExecHost,
+        ReconnectableWorkspace {
   SshWorkspaceIO(this.root, this._transport);
 
   @override
@@ -309,6 +342,19 @@ class SshWorkspaceIO implements WorkspaceIO, WorkspaceFiles, BackgroundExecHost 
 
   /// 链路活性（M9 1.1）：所有传输都从这里过一遍守卫。
   SshLiveness get _link => _transport.liveness;
+
+  // ── 链路重建（ReconnectableWorkspace）─────────────────────────────────
+  // 判失活后由传输层按退避**自动**重连；这两个成员是核心「重连」入口的手动通道。
+  // 判据不变：判死仍只看心跳丢失，重连只是判死之后的动作（M9 1.1）。
+
+  @override
+  bool get linkStale => _link.isStale;
+
+  @override
+  String get linkMessage => _link.isStale ? _link.staleMessage : '';
+
+  @override
+  Future<void> reconnectLink() => _transport.reconnect();
 
   /// 与本地实现共用同一套排除目录（依赖/构建产物）。
   static Set<String> get defaultExcludedDirs =>
