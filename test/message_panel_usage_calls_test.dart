@@ -30,6 +30,7 @@ import 'package:tree/io/websocket_service.dart';
 import 'package:tree/ui/models/agent.dart';
 import 'package:tree/ui/widgets/message_panel.dart';
 import 'package:tree/ui/widgets/session_picker.dart';
+import 'package:tree/ui/widgets/usage_calls_panel.dart';
 
 /// 假核心：会话列表 + 空的会话历史 + WS 升级（并记住连接，供测试往里推帧）。
 class _FakeCore {
@@ -518,6 +519,62 @@ void main() {
       find.text('本轮调用列表（1 次）'),
       findsOneWidget,
       reason: '离开 compacting 状态 = 压缩那一刻的用量已经落账',
+    );
+
+    await closePanel(tester);
+  });
+
+  testWidgets('⑩ 20 次调用不把中栏撑破：展开区有界可滚，且最近一次在最上面', (
+    WidgetTester tester,
+  ) async {
+    // 用户 2026-10-04 真机报告：「现在 20 条直接掉到页面外了，最近的调用反而看不到」。
+    // 这里就在真中栏（默认 800×600 的测试面）里跑满 20 行：修好之前这一块会把 Column
+    // 撑爆（RenderFlex overflow），修好之后它有界（≤ defaultMaxListHeight）且能滚。
+    final String path = writeUsageFile(<String>[
+      for (int i = 1; i <= 20; i++)
+        usageLine(
+          at: '2026-10-04T10:00:${i.toString().padLeft(2, '0')}Z',
+          source: 'turn',
+          prompt: i * 1000,
+          completion: 0,
+        ),
+    ]);
+    MessagePanel.debugUsageFileOverride = path;
+
+    await pumpPanel(tester);
+    expect(find.text('本轮调用列表（20 次）'), findsOneWidget);
+
+    await expand(tester);
+    expect(
+      tester.takeException(),
+      isNull,
+      reason: '20 条不许把中栏撑出 RenderFlex overflow',
+    );
+
+    final Finder listFinder = find.byKey(const Key('usage-calls-scroll'));
+    expect(listFinder, findsOneWidget, reason: '展开区自己是一个滚动视口');
+    final Rect listRect = tester.getRect(listFinder);
+    expect(
+      listRect.height,
+      lessThanOrEqualTo(UsageCallsPanel.defaultMaxListHeight),
+      reason: '这一块有界：再多行也只占这么多',
+    );
+
+    // 最近一次（第 20 行）就在视口第一行；最早那次（第 1 行）在视口外
+    expect(tester.getTopLeft(find.text('20,000')).dy, lessThan(listRect.bottom));
+    final double oldestBefore = tester.getTopLeft(find.text('1,000')).dy;
+    expect(oldestBefore, greaterThanOrEqualTo(listRect.bottom));
+
+    final ScrollableState scrollable = tester.state<ScrollableState>(
+      find.descendant(of: listFinder, matching: find.byType(Scrollable)),
+    );
+    expect(scrollable.position.maxScrollExtent, greaterThan(0));
+    scrollable.position.jumpTo(scrollable.position.maxScrollExtent);
+    await tester.pumpAndSettle();
+    expect(
+      tester.getTopLeft(find.text('1,000')).dy,
+      lessThan(listRect.bottom),
+      reason: '滚下去能翻到最早那次（内容都在，只是要滚）',
     );
 
     await closePanel(tester);
