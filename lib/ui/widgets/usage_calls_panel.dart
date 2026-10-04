@@ -93,12 +93,19 @@ class UsageCallView {
 ///
 /// 默认**折叠**：用量是"需要才查"的信息，不该默认把中栏占满；`maxRows > 0` 时
 /// 只展示**最后** N 条（长会话下"最近几次"才是用户要看的），截断在标题里写明。
+///
+/// 展开区有两条硬约束（用户 2026-10-04 真机报告：「展开后应该把最近一次的放顶上，最早的
+/// 放底下，并支持滚动（现在 20 条直接掉到页面外了，最近的调用反而看不到）」）：
+/// 1. **最近一次在最上面**、最早的压在最底下（[calls] 仍是旧→新，翻转只发生在渲染那一层）；
+/// 2. **有界高度 + 区内滚动**（见 [maxListHeight]）：行数涨上去只让这一块自己滚，
+///    绝不把中栏的消息流挤到页面外。
 class UsageCallsPanel extends StatefulWidget {
   const UsageCallsPanel({
     super.key,
     required this.calls,
     this.initiallyExpanded = false,
     this.maxRows = 0,
+    this.maxListHeight = defaultMaxListHeight,
   });
 
   /// 逐调用用量（按时间从旧到新）。空列表也算正常状态（还没调用过）。
@@ -110,6 +117,17 @@ class UsageCallsPanel extends StatefulWidget {
   /// `> 0` 时只显示**最后** maxRows 条；`<= 0` 表示全显示。
   final int maxRows;
 
+  /// 展开后**列表区**的高度上限（像素）。[maxRows] 限的是"几条"，这里限的是"多高"。
+  ///
+  /// 为什么两者的上限都要有：这块是"最近几次读数"，不是整段历史——真正要看的往往只有
+  /// 最上面那一两条，所以给它一个**有界高度**、超出就在区内滚（滚动条只动这一块，消息流
+  /// 一动不动），而不是让 20 行把消息流挤出屏幕（挤出去之后，最新那几条正好在页面外）。
+  /// 行数不足这个高度时按内容高度收缩（不留空白）。
+  final double maxListHeight;
+
+  /// 展开后列表区的缺省高度上限（中栏里约 6 行）。
+  static const double defaultMaxListHeight = 240;
+
   @override
   State<UsageCallsPanel> createState() => _UsageCallsPanelState();
 }
@@ -117,19 +135,39 @@ class UsageCallsPanel extends StatefulWidget {
 class _UsageCallsPanelState extends State<UsageCallsPanel> {
   bool _expanded = false;
 
+  /// 展开区**自己的**滚动控制器：不复用外层（消息流 / 页面）那个 primary 控制器
+  /// ——两层纵向滚动共用一个控制器会在滑动那一刻抛
+  /// "ScrollController attached to multiple scroll views"。
+  final ScrollController _rowsScroll = ScrollController();
+
   @override
   void initState() {
     super.initState();
     _expanded = widget.initiallyExpanded;
   }
 
-  /// 真正要渲染的那几条（maxRows 截断只取**尾部**，截断信息不进 [UsageCallView]）。
+  @override
+  void dispose() {
+    _rowsScroll.dispose();
+    super.dispose();
+  }
+
+  /// 被选中的那几条：maxRows 截断只取**尾部**（= 最近的那几次），仍然是旧→新；
+  /// 截断信息不进 [UsageCallView]（它由标题那一行自己写）。
   List<UsageCallView> get _visible {
     final List<UsageCallView> all = widget.calls;
     final int max = widget.maxRows;
     if (max <= 0 || all.length <= max) return all;
     return all.sublist(all.length - max);
   }
+
+  /// 渲染顺序：**最近一次在最上面**，最早的压在最底下。
+  ///
+  /// 只翻渲染这一层（[calls] / [_visible] 仍是旧→新）：截断取的仍是**尾部**（最近 N 次），
+  /// 翻过来只是让"最新那条"落在视线第一行——展开区上方紧挨着上下文条，视线落在最上面
+  /// 几行，而最新那次花了多少正是要看的读数（旧→新时它恰好在最底下、还常被页面切掉）。
+  List<UsageCallView> get _rowsNewestFirst =>
+      _visible.reversed.toList(growable: false);
 
   @override
   Widget build(BuildContext context) {
@@ -199,13 +237,29 @@ class _UsageCallsPanelState extends State<UsageCallsPanel> {
                       '暂无调用记录',
                       style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
                     )
-                  : Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: <Widget>[
-                        for (final UsageCallView call in visible)
-                          _UsageCallRow(call: call),
-                      ],
+                  : ConstrainedBox(
+                      // 有界高度：行数再多，这一块也就这么高（见 [UsageCallsPanel.maxListHeight]），
+                      // 中栏的消息流不会被挤到页面外。
+                      constraints: BoxConstraints(
+                        maxHeight: widget.maxListHeight,
+                      ),
+                      child: Scrollbar(
+                        controller: _rowsScroll,
+                        child: SingleChildScrollView(
+                          key: const Key('usage-calls-scroll'),
+                          controller: _rowsScroll,
+                          // 明确不吃外层的 primary 控制器（见 [_rowsScroll]）。
+                          primary: false,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: <Widget>[
+                              for (final UsageCallView call in _rowsNewestFirst)
+                                _UsageCallRow(call: call),
+                            ],
+                          ),
+                        ),
+                      ),
                     ),
             ),
           ],

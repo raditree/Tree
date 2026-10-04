@@ -42,6 +42,15 @@
   登记进运行中工具表（`watchdog: false` ⇒ 长任务**不判超时、不刷 warning**；`crossCall: true` ⇒ 跨工具调用存活），
   用户点关闭 = 取消该 hook（本机真杀进程树；远端尽力 `kill`，拿不到 pid **如实回原因**）——
   与右栏按钮 / 执行站 `tool.close` / agent 的 `tool_runs` 仍是**同一个实现**。**不做**"两个新站点 + leader 可杀"（暂缓）。
+- **「本轮调用列表」展开后"最近一次在最上面"，且整块有界可滚**（修改 [lib/README.md](lib/README.md)
+  不变量 20，新增 ⑤；[lib/ui/widgets/usage_calls_panel.dart](lib/ui/widgets/usage_calls_panel.dart)、
+  [test/usage_calls_panel_test.dart](test/usage_calls_panel_test.dart)，**用户要求 2026-10-04**：
+  「展开后应该把最近一次的放顶上，最早的放底下，并支持滚动（现在 20 条直接掉到页面外了，
+  最近的调用反而看不到）」）：截断口径一个字没改（`maxRows` 仍只取**最近** N 次），
+  但**渲染顺序翻成新→旧**（`calls` 仍是旧→新，翻转只在渲染那一层）；展开区改为**有界高度 +
+  区内滚动**（`UsageCallsPanel.maxListHeight`，缺省 240px ≈ 6 行，行数不足时按内容高度收缩，
+  用自己的 `ScrollController`、不吃外层 primary）——20 条因此只让这一块自己滚，
+  **不再把中栏的消息流挤出页面**。
 
 ## [1.0.2] — 2026-10-03
 

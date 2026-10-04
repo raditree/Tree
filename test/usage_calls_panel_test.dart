@@ -165,6 +165,7 @@ void main() {
       required List<UsageCallView> calls,
       bool initiallyExpanded = false,
       int maxRows = 0,
+      double maxListHeight = UsageCallsPanel.defaultMaxListHeight,
     }) async {
       await tester.pumpWidget(
         MaterialApp(
@@ -174,6 +175,7 @@ void main() {
                 calls: calls,
                 initiallyExpanded: initiallyExpanded,
                 maxRows: maxRows,
+                maxListHeight: maxListHeight,
               ),
             ),
           ),
@@ -356,6 +358,109 @@ void main() {
 
       expect(find.text('暂无调用记录'), findsOneWidget);
       expect(find.text('来源'), findsNothing);
+    });
+
+    // 用户 2026-10-04（真机）：「展开后应该把最近一次的放顶上，最早的放底下，并支持滚动
+    // （现在 20 条直接掉到页面外了，最近的调用反而看不到）」——下面三条钉住这三件事。
+    testWidgets('展开后最近一次在最上面、最早的压在最底下', (WidgetTester tester) async {
+      final List<UsageCallView> calls = <UsageCallView>[
+        for (int i = 1; i <= 3; i++)
+          UsageCallView(
+            promptTokens: i * 100,
+            completionTokens: i,
+            durationMs: 100 * i,
+          ),
+      ];
+      await pumpPanel(tester, calls: calls, initiallyExpanded: true);
+
+      final double newestY = tester.getTopLeft(find.text('300')).dy;
+      final double middleY = tester.getTopLeft(find.text('200')).dy;
+      final double oldestY = tester.getTopLeft(find.text('100')).dy;
+      expect(newestY, lessThan(middleY), reason: '最新那次（第 3 次）压在第 2 次上面');
+      expect(middleY, lessThan(oldestY), reason: '第 2 次压在最老那次（第 1 次）上面');
+    });
+
+    testWidgets('maxRows 截断仍然取"最近 N 次"，只是渲染翻成新→旧', (
+      WidgetTester tester,
+    ) async {
+      final List<UsageCallView> calls = <UsageCallView>[
+        for (int i = 1; i <= 5; i++)
+          UsageCallView(promptTokens: i * 100, completionTokens: i),
+      ];
+      await pumpPanel(
+        tester,
+        calls: calls,
+        maxRows: 3,
+        initiallyExpanded: true,
+      );
+
+      // 仍然只给最近 3 条（截断口径不变）
+      expect(find.text('共 5 次'), findsOneWidget);
+      expect(find.text('来源'), findsNWidgets(3));
+      expect(find.text('100'), findsNothing);
+      expect(find.text('200'), findsNothing);
+      // 而这 3 条里，最近那次（500）在最上面、最早那条（300）在最下面
+      expect(
+        tester.getTopLeft(find.text('500')).dy,
+        lessThan(tester.getTopLeft(find.text('300')).dy),
+      );
+    });
+
+    testWidgets('展开区高度有界：20 条不再把面板撑到页面外，超出部分在区内滚动', (
+      WidgetTester tester,
+    ) async {
+      final List<UsageCallView> calls = <UsageCallView>[
+        for (int i = 1; i <= 20; i++)
+          UsageCallView(
+            promptTokens: i * 1000,
+            completionTokens: i,
+            durationMs: i * 10,
+          ),
+      ];
+      await pumpPanel(
+        tester,
+        calls: calls,
+        maxRows: 20,
+        initiallyExpanded: true,
+      );
+
+      // 展开区自己就是一个滚动视口（不是整段铺开的 Column）
+      final Finder listFinder = find.byKey(const Key('usage-calls-scroll'));
+      expect(listFinder, findsOneWidget);
+      final Rect listRect = tester.getRect(listFinder);
+      expect(
+        listRect.height,
+        lessThanOrEqualTo(UsageCallsPanel.defaultMaxListHeight),
+        reason: '20 行不许把这块撑成 20 行高（撑出去之后最新那几条反而在页面外）',
+      );
+
+      // 最新一次（第 20 次）就在视口第一行 —— 用户要"最近一次放顶上"
+      final double newestY = tester.getTopLeft(find.text('20,000')).dy;
+      expect(newestY, greaterThanOrEqualTo(listRect.top));
+      expect(newestY, lessThan(listRect.bottom));
+      // 最早那次（第 1 次）此刻在视口外
+      final double oldestBefore = tester.getTopLeft(find.text('1,000')).dy;
+      expect(
+        oldestBefore,
+        greaterThanOrEqualTo(listRect.bottom),
+        reason: '20 条塞不进 240px，最早那条只可能在视口外',
+      );
+
+      // 区内能滚到底（滚动只发生在这一块里，不动上面的上下文条 / 下面的消息流）
+      final ScrollableState scrollable = tester.state<ScrollableState>(
+        find.descendant(of: listFinder, matching: find.byType(Scrollable)),
+      );
+      expect(
+        scrollable.position.maxScrollExtent,
+        greaterThan(0),
+        reason: '内容高于上限 ⇒ 必须有得滚',
+      );
+      scrollable.position.jumpTo(scrollable.position.maxScrollExtent);
+      await tester.pumpAndSettle();
+
+      final double oldestAfter = tester.getTopLeft(find.text('1,000')).dy;
+      expect(oldestAfter, lessThan(oldestBefore), reason: '滚下去之后最早那次上来了');
+      expect(oldestAfter, lessThan(listRect.bottom));
     });
   });
 }
