@@ -30,6 +30,14 @@
 1. 工具层**不认识 LLM 类型**：只声明名字 / 说明 / JSON Schema，转成 `LlmToolSpec` 是引擎的事——工具实现因此可脱离 LLM 单测。
 2. 工具参数一律**工作空间相对路径**；绝对路径 / 盘符 / `..` 由 `WorkspaceIO.resolve` 拒绝。
 3. 每个 agent 一个 IO，按需创建并缓存；`.self` 的翻译**只发生在 `PrivateWorkspaceIO(agentId)` 一处**——规范文本、系统提示词、结果门控、插件文档播种都经 `WorkspaceToolRunner.ioFor` 生效，所以它们的路径常量**一个都不用改**。**终端命令不经过翻译**（`exec` 直接在根下跑 shell）。
+   - **判失活不淘汰缓存**：SSH 链路被判失活之后，缓存里那个 IO 对象**不换**——传输层自己把底层连接重建
+     （`DartSshTransport.reconnect`，见 [../../../../tree_local_exec/README.md](../../../../tree_local_exec/README.md) 不变量 6）。
+     理由：缓存是"按 agent 一个 IO"的语义边界，而重建连接是传输层的内部动作；淘汰缓存会让"重连"变成
+     "在 `_ioFor` 里同步建一次连"，而建连不设超时 ⇒ 远端不可达时每次工具调用都会挂住（与不静默挂起冲突）。
+   - **显式「重连」入口**在 runner 上：`WorkspaceToolRunner.reconnectSshLink(agentId)`（REST
+     `POST /api/agents/{agentId}/ssh/reconnect`，右栏文件错误块上的按钮就是它），返回
+     `SshReconnectOutcome`：`ok` / `notSsh`（本机工作空间没有可重连的链路 ⇒ 400）/ `failed(可读原因)`。
+     与传输层的**自动**重连是同一份实现的两次入口；判活判据不变（判死仍只看心跳丢失）。
 4. **默认不截断工具结果**：有界性由 LLM 侧的 `ToolResultGate` 负责（超长结果写进 `.self/results/`，送模型只留提示 + 预览）。工具层若抢先按字符砍到 24000，门控的 8000 token 阈值就只覆盖 16000~24000 这一段，再长根本走不到重定向。`maxResultChars` 只给确实要硬上限的调用方。
 5. MCP 与插件工具**不在内置集里**：按"已就绪的服务"动态注入，工具名带 `mcp__<服务>__` / `plugin__<id>__` 前缀；服务列表是运行期才知道的。工具表**每轮现取**（不进系统提示词前缀）。
 6. `message` 的 `session_id` 默认取**发起会话**（`invocation.sessionId`）⇒ 派活与回信都落在发出消息的那个会话里，不会跑去默认会话。

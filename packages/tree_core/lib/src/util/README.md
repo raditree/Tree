@@ -11,7 +11,7 @@
 | [ids.dart](ids.dart) | id 生成 `<prefix>_<epoch_ms>_<rand6>_<seq>` |
 | [json_time.dart](json_time.dart) | 毫秒 ↔ ISO-8601（两种写法都收） |
 | [liveness.dart](liveness.dart) | 通用心跳台账 `LivenessTracker` + `LivenessLostException` |
-| [core_log_sink.dart](core_log_sink.dart) | 核心日志出口 `CoreLogSink`：stderr + `<数据根>/logs/core.log` 双写、按大小轮转、失败降级 |
+| [core_log_sink.dart](core_log_sink.dart) | 核心日志出口 `CoreLogSink`：stderr + `<数据根>/logs/core.log` 双写、**落盘行带时间戳与 pid**、按大小轮转、失败降级 |
 
 ## 不变量（assertions）
 
@@ -24,8 +24,11 @@
 7. 回环 token 32 字节熵、base64url 无填充，**只经 stdout 握手行**交给父进程：不落盘、不复用。
 8. **核心日志只有一个出口**（[core_log_sink.dart](core_log_sink.dart)）：新日志一律 `coreLog.forPrefix('core:xxx')`，
    不要自己 `stderr.writeln`（那条永远不落盘）；出口本身**永不抛异常、永不阻塞调用方**——磁盘满、目录只读、
-   stderr 已关闭都不得影响核心功能（失败只提示一次并降级为纯 stderr）。文件行带 `pid=` 前缀：
-   同一数据根可能同时有"App 拉起的核心"与"开发期自起的核心"在写。
+   stderr 已关闭都不得影响核心功能（失败只提示一次并降级为纯 stderr）。**落盘行带行首时间戳**：
+   `<ISO8601 带时区> pid=<pid> <原行>`（例 `2026-10-05T07:24:31.123+08:00 pid=4242 [core:tool] …`）——
+   同一数据根可能同时有"App 拉起的核心"与"开发期自起的核心"在写，`pid` 用来归因；**时间戳用来对时**
+   （曾经因为文件行只有 pid、没有时间，排查一次 SSH 链路失活只能靠会话消息的时间戳反推）。
+   时间戳**只加在文件行上**：stderr 那份逐字保持原样（`flutter run` / `--verbose` 照旧，按 stderr 断言的测试也不受影响）。
 
 ## 测试
 

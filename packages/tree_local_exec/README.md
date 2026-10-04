@@ -14,7 +14,9 @@
 | [lib/src/git_output.dart](lib/src/git_output.dart) | git 的命令与输出解析（log / branch / **status**）：本地与 SSH **共用一份**，命令形状与解析规则不可能漂移 |
 | [lib/src/ssh_shell_channel.dart](lib/src/ssh_shell_channel.dart) | **远端 shell 通道** `SshShellChannel`（交互终端用）：原始字节输出 / 键盘输入 / 改尺寸 / 退出码 / 幂等 `close`；dartssh2 实现在 [lib/src/dartssh_transport.dart](lib/src/dartssh_transport.dart) 的 `openShell`（`shell` 或 `exec + pty-req`） |
 | [lib/src/shell.dart](lib/src/shell.dart) | shell 参数：`-NonInteractive`、裸 `echo` 兼容翻译、逻辑运算符翻译（Windows/POSIX） |
-| [lib/src/ssh_liveness.dart](lib/src/ssh_liveness.dart) | SSH 心跳台账（连续 N 拍丢失 ⇒ 判失活） |
+| [lib/src/ssh_liveness.dart](lib/src/ssh_liveness.dart) | SSH 心跳台账（连续 N 拍丢失 ⇒ 判失活；判失活的那一拍**通知传输层重建连接**） |
+| [lib/src/ssh_reconnect.dart](lib/src/ssh_reconnect.dart) | **重连的节拍器** `SshReconnectPump`：单飞 + 退避 + 可停止（与 dartssh2 无关，所以能单测） |
+| [lib/src/dartssh_transport.dart](lib/src/dartssh_transport.dart) | dartssh2 传输实现：连接 / SFTP / exec / 远端 shell 通道 / **心跳与自动重连**（`reconnect()` 单飞换会话） |
 | [lib/src/windows_environment.dart](lib/src/windows_environment.dart) | **按登录口径重建环境变量**（注册表机器级 + 用户级；失败整体退回继承）——本地 exec / git / PTY / hook 共用 |
 | [lib/src/ssh_login_shell.dart](lib/src/ssh_login_shell.dart) | **远端命令的登录外壳包装**（`bash -lc` → `sh -lc` → 原样发；可配可关）+ POSIX 单引号转义 |
 | [lib/src/pty/pty_session.dart](lib/src/pty/pty_session.dart) | **伪终端会话**接口 `PtySession`（原始字节输出 / 键盘输入 / 改尺寸 / 退出码 / 幂等 `close`）+ 平台工厂 `startPtySession` |
@@ -38,7 +40,21 @@
 4. 隐藏路径默认不扫（`.[!.]*`）；显式指向隐藏目录时按用户意图搜索。
 5. 启动子进程时**禁用交互**（`-NonInteractive` + 关闭 stdin），否则等输入的命令会永久挂住
    （见 [../../docs/known-issues.md](../../docs/known-issues.md) #7）。
-6. SSH 链路失活时**显式失败**（`SshLinkStaleException`），不静默挂起。
+6. **SSH 链路失活 → 显式失败 + 重建连接**（2026-10-05 补；用户要求：「保持心跳失活判超时的断言，
+   但判超时后重连 + 显式『重连』入口」）：
+   - **判据不变**：连续 N 拍（默认 3）心跳窗口内没有回包 ⇒ 判失活；在途 / 新来的操作一律以
+     `SshLinkStaleException` **显式失败**（既不静默，也不永久挂起）。判活**只看心跳**，不看任务跑了多久；
+   - 判失活的那一拍（`SshLiveness.onStale`）立刻起一个**后台重连**（`SshReconnectPump`：单飞 + 退避
+     `5s→10s→30s→60s`、之后每 60s 一次，直到成功 / `close()`）。为什么必须有它：一条已经断掉的 TCP
+     连接**不会自己活回来**——现场 2026-10-05 连丢 **1325 拍**（≈3h41m）、远端实测可达，应用却再没恢复过，
+     只能重启。重连**不阻塞任何调用方**（在途操作照旧立刻显式失败，重连只保证"之后能再用"）；
+   - **"先建新、再换旧"**：建连成功之后才替换会话并清空丢失计数；失败抛可读 `WorkspaceIoException` 且
+     **保持失活态**（绝不假装恢复了）；同一时刻最多一次在途重建（自动循环与显式入口复用同一次）；
+   - **显式入口**与自动重连共用同一份实现：`ReconnectableWorkspace`（`linkStale` / `linkMessage` /
+     `reconnectLink()`，核心侧 = `POST /api/agents/{agentId}/ssh/reconnect`，右栏文件错误块上的「重连」按钮），
+     用户不想等退避时点它；
+   - **不引入任何静态时长上限**：退避只是"两次尝试之间的节奏"，单次建连照旧不设超时，判死判据仍然只看心跳丢失。
+   失活期间的**失败文案**如实说这件事（旧文案「心跳恢复后自动恢复」是误导，已改）。
 7. grep 的三个数字各管一件事，**别混**：`scannedFileCount` 是**计数**（读过内容且非二进制的文件数，
    不受任何上限影响）；`scannedFilePaths` 只留前 `GrepOutcome.maxScannedFilePaths`（= **20**）条抽样；
    `GrepQuery.maxResults`（默认 **200**，可由工具参数 `max_results` 覆盖）是**命中行数**上限，
@@ -134,6 +150,8 @@ M11 新增钉子：`git_output_test` 的 `parseStatus` 组（`-z`、空格 / 中
 （新建 / 重命名 / 删除的结果码与真实行为）；`git` 组里的 `gitStatus` 用例（真仓库 M/U/A/D + 非仓库空态）。
 
 回归钉子：`exec_no_interactive_hang_test`（裸 `echo` 不再等输入）、`exec_soft_timeout_test`（本地软超时交还进程）、
+`ssh_reconnect_test`（**判失活 → 重连**：节拍器单飞 / 退避走完一直用最后一拍 / 关停后不再试、
+`SshLiveness.onStale` 只在跨阈值那一拍通知一次、`ReconnectableWorkspace` 的可见面——本机后端**不**实现它），
 `background_exec_test`（**后台执行原语**：本机起/写日志/读尾部/杀树/越界拒绝；远端用假 transport 钉
 `( setsid nohup … & echo $! )` 命令形状、哨兵轮询（含 `GONE`）、`attachBackground` **不重跑命令**、`cancel` 拿不到 pid 时如实 false）、
 `local_workspace_io_test` / `ssh_workspace_io_test` 的「结尾换行保真」组（**不变量 17**：`'a\nb\n'` 原样读回、

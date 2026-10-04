@@ -168,7 +168,7 @@ Flutter UI 进程（lib/）                     核心进程（packages/tree_cor
 <数据根>/                          # %APPDATA%\Tree；TREE_HOME / --data-dir 覆盖
 ├── config/{settings,models/*,mcp,plugins,stations}.yaml
 ├── agents/<agent_id>.yaml         # agent / 成员；system_prompt 可多行
-├── logs/core.log(+core.1..4.log)  # 核心日志落盘：stderr 之外的第二份，8 MiB × 5 轮转，行带 pid=
+├── logs/core.log(+core.1..4.log)  # 核心日志落盘：stderr 之外的第二份，8 MiB × 5 轮转，行首带 <ISO8601 带时区> 与 pid=
 ├── data/questions.json            # 提问（跨会话队列）
 └── data/<agent>/<session>/
     ├── session.json               # 会话元数据（原子快照；含 selected_spec_ids / 压缩摘要）
@@ -189,7 +189,7 @@ yaml 里**不属于已知键**的内容会被原样保留并写回（用户手�
 | 通道 | 超时判据 |
 | --- | --- |
 | 消息发送（WS / 团队派发） | 无静态上限；连接心跳丢失 ⇒ 判失活并**登记补发**，重连后重播（帧无 TTL） |
-| 执行器命令（local / ssh） | 无静态上限；心跳丢失 ⇒ 显式失败并触发重连 |
+| 执行器命令（local / ssh） | 无静态上限；心跳连续丢失 N 拍 ⇒ 判失活、在途操作显式失败，**传输层随即按退避自动重建连接**（单飞，5s→10s→30s→60s 之后每 60s 一次；退避是节奏不是时长上限）。用户不想等时走**显式入口** `POST /api/agents/{agentId}/ssh/reconnect`（右栏文件错误块上的「重连」按钮），两者共用同一次实现 |
 | 本地 terminal | 无静态上限（进程活着就一直等）；可选**软超时**：到点不杀进程，转 hook 后台任务，完成后再唤醒 agent |
 | SSH terminal | 与本地同口径（软超时交还 `RunningSshExec`）；`hook=true` 在**远端** `nohup` 起、**立即返回**（命令形状 `( setsid nohup … > <日志> 2>&1 < /dev/null & echo $! )`：后台化在子壳里做，子壳立刻退出 ⇒ SSH 通道立刻 EOF）、日志落**远端工作空间**、退出码靠哨兵文件 + **3s** 轮询；远端后台任务**落盘台账**（`<数据根>/hooks`），应用重启后**接续**并把完成提示**投递回原会话**；后台任务**登记进「正在执行的 tool」**（右栏可见、用户可关）；关停**不杀**远端进程 |
 | 插件宿主（stdio） | 无静态上限；连续 N 拍无心跳 ⇒ 标 `degraded`（面板橙色角标），**不杀进程** |
@@ -243,7 +243,7 @@ M9 阶段定的 14 项语义决策已全部实现，逐项的**实现记录**归
 
 | 决策 | 现在的口径 | 落在哪 |
 | --- | --- | --- |
-| 取消静态超时，改心跳判超时 | 见 §11；本地执行体活性 = 进程存活 | `util/liveness.dart`、各通道心跳台账 |
+| 取消静态超时，改心跳判超时 | 见 §11；本地执行体活性 = 进程存活；**判失活后由传输层重建连接**（一条断掉的 TCP 不会自愈） | `util/liveness.dart`、各通道心跳台账、`tree_local_exec` 的 `SshReconnectPump` |
 | 站点隔离矩阵 | 四元组 fail-closed，订阅不得放大，`mode_key` 区分 local/ssh | §9、`plugin/station_scope.dart` |
 | token 口径统一 | `ceil(字符/scale)` 唯一换算 + 逐模型学习 | §4、`util/tokens.dart` |
 | Q1 上下文超限未压缩 / 超长工具结果 | 阈值触发压缩；超长结果重定向到 `.self/results/` 只送预览 | §4、`llm/llm_result_gate.dart` |

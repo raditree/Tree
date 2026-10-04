@@ -275,6 +275,14 @@
     开 / 关查看器时文件子 Tab 区用 `GlobalKey`（`_fileTabsKey`）
     **搬**进 / 搬出分栏而不是重建：展开状态、选中项、已加载的目录都不丢。树里的改名 / 删除对已打开文件的联动经
     `FileTree.onPathRenamed` / `onPathDeleted` → FilePanel 更新窗格路径（缓冲实例不动）或关掉窗格并提示。
+    ⑨ **根错误块上的「重连」按钮 = 显式重建远端（SSH）链路**：只在**根目录加载失败**那一支
+    （`_rootError != null && !_listings.containsKey('')`）挂一颗 `Key('file-tree-reconnect')`（文案「重连」），
+    点击走 [io/api_service.dart](io/api_service.dart) 的 `reconnectAgentSsh` → `POST /api/agents/{agentId}/ssh/reconnect`
+    （无 body；agentId 取 **`teamId`** 这个真 id，**不是** `workspaceId` 的 `ws_<agentId>`——同口径先例见
+    `FilePanel._resetWorkspace`）。这是 SSH 心跳**判失活之后**的手动恢复入口：**判活判据不变**（判死仍只认
+    "连续 N 拍心跳丢失"），重连是判死之后的一次动作、不引入静态时长上限。成功 → 就地 `_reloadAll()`
+    （展开状态不塌）+ 提示「已重连」；失败 → 只显一句可读原因（核心错误体的 `detail`，SnackBar），**不清空既有内容**；
+    请求在途时按钮置灰并显示「重连中…」（防连点）。
 
 17. **首次使用有八步新手引导，处处可跳过**（[ui/services/onboarding_steps.dart](ui/services/onboarding_steps.dart)、
     [ui/services/onboarding_state.dart](ui/services/onboarding_state.dart)、
@@ -563,3 +571,6 @@ git 着色（文件按状态 + 目录聚合 + 一次请求 + `is_repo=false` 与
 **活动窗格**、打开文件后**在树里右键重命名它** → 窗格路径跟着改并按新路径重拉 + 树里换成新名字、
 打开文件后**在树里删除它** → 窗格自动关掉 + 给提示 + 回到树独占、打开 / 关闭查看器不丢树的展开状态（子树被搬而不是重建）、
 拖分隔条改变比例且关掉再开仍是该比例、面板太矮（可用高度 < 200）降级成只显示查看器且一键回到树）。
+`test/file_tree_reconnect_test.dart`（根错误块上的「重连」按钮，真起假核心 HttpServer：根加载失败才出现按钮、
+点它打到 `POST /api/agents/<真 agentId>/ssh/reconnect`（**路径里是 agentId 而不是 `ws_…`**）且成功后文件树就地重拉、
+失败（500 + 顶层 `detail`）显示可读原因且**既有错误块不清空**）。

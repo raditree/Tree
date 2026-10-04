@@ -118,11 +118,15 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 | 项 | 当前基线 |
 | --- | --- |
 | 静态检查 | `dart analyze` × 4 包 + `flutter analyze lib test` 全干净 |
-| `tree_protocol` | 33 passed（含协议完备性 + 文档契约门禁） |
-| `tree_local_exec` | 159 passed / 1 skipped |
-| `tree_core` | 849 passed / 1 skipped |
-| 前端 `flutter test` | 217 passed |
+| `tree_protocol` | 38 passed（含协议完备性 + 文档契约门禁） |
+| `tree_local_exec` | 255 passed / 4 skipped |
+| `tree_core` | 1188 passed / 2 skipped |
+| 前端 `flutter test` | 789 passed |
 | 真机 SSH 回归（`TREE_SSH_TEST_*` 具备时） | `list` / `upload` / `download_folder` / `syncToLocal` 四项通过 |
+
+> 上表数字于 **2026-10-05 逐包重测**（此前记的 33 / 159+1 / 849+1 / 217 已经过时——那是更早里程碑的旧值，
+> 不是某次改动造成的）。基线是**下限**：只许持平或更好。**注意**：`dart test` 计时敏感的用例（例如
+> `tree_core` 的 `llm_transport_liveness_test`）在**多套测试并发跑**时可能偶发失败；复核请单独跑一遍。
 
 ## 7. 调试
 

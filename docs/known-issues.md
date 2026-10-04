@@ -1613,3 +1613,89 @@ terminal/subagent hook 完成消息）在工具调用期间必须排队等待」
    既有口径是"工具表每轮现取、不进前缀"，但端点确实把工具定义渲染进提示词（实测：同样 messages 加
    1 个工具定义，prompt_tokens +270）——"不进前缀"只在**客户端拼装**这一层成立。真要保住缓存，需要在
    "外设未就绪"时显式提示或推迟压缩，本次未动。
+
+## #29 SSH 链路判失活之后**永不恢复**（只标记、没有任何重建路径）⇒ 只能重启应用
+
+**现象**（2026-10-05，用户截图：右栏「文件 → 文件浏览」根目录报错整块红字）：
+
+> `SSH 链路失活：连续 1325 次心跳丢失（心跳间隔 10s，阈值 3 次）；连接未关闭，心跳恢复后自动恢复`
+
+同一个 agent 的**一切 ssh 能力同时失效**：`[core:msg] 写活动日志失败（agt_…）：SSH 链路失活…`（core.log 34 行）、
+远端命令与 `hook=true` 后台任务被"会话失联"转后台、`read`/`edit` 工具直接失败、文件面板根目录报错。
+**远端主机此刻完全可达**（实测 `TCP 192.168.0.208:22` 连接成功 117 ms、ping 通）——所以不是"远端挂了"，
+而是**应用自己再也回不去**；用户唯一的出路是重启应用。
+
+**根因**（两层叠加；第二层才是要害）：
+
+1. **触发**：2026-10-05 03:29:47 前后这条 TCP 被掐断（同夜 22:56 另有 `SSHSocketError(… errno = 121)` 记录）。
+   触发方**判不出来**（远端 sshd 重启 / 局域网瞬时抖动 / Windows 侧 socket 重置都符合）——这不是本条的重点。
+2. **不可恢复（代码缺陷）**：判失活之后**没有任何重建路径**，而一条已经断掉的 TCP **不会自己活回来**：
+   - `SshLiveness` 只标记 + 唤醒在途操作，明确"不关连接"；恢复只能靠**一次成功的心跳/读写**（`recordBeat`），
+     而死 socket 永远给不出；
+   - `DartSshTransport._beat()` 失败只 `recordMiss()`，**没有重连**；`_client`/`_sftp` 还是 `final`；
+   - `WorkspaceToolRunner._ioFor` 把每个 owner 的 IO **永久缓存**（`_ios[ownerId]`），只有核心关停 `close()` 才清空；
+     全仓也没有"重连 / 缓存失效"入口（`api_paths.dart` 只有心跳参数端点）。
+   ⇒ 计数每 10s +1 涨到天亮；文案里那句「心跳恢复后自动恢复」在这种情形下**永远不会发生**（误导）。
+   文档当时已经写着"心跳丢失 ⇒ 显式失败**并触发重连**"（`docs/architecture.md` §11）——**代码没做到，是文档-代码偏差**。
+
+**证据**：
+
+| 观测 | 值 |
+| --- | --- |
+| 计数轨迹（用会话消息的真实时间戳锚定） | 03:30:20 → 3；03:33:54 → 24；03:56:59 → 163；04:39:21 → 417；06:26:07 → 1057 |
+| 丢失速率 | **精确 1 次 / 10 秒**（24→163 = 9.96s/次；163→417 = 10.0s/次；417→1057 = 10.0s/次） |
+| 截图里的 1325 | 06:26:07（1057）+ 268 拍 × 10s = **07:10:47**；用户粘贴截图的 id 时间 = 07:11:34 ✔ |
+| 远端可达性（排障当时实测） | `TCP 192.168.0.208:22` 117 ms 连上、`ping` 通 |
+| 进程存活 | `tree_core` pid=17544 自 2026-10-04 22:20:31 起未重启 ⇒ 缓存里的死连接跟着进程活到底 |
+
+**修复**（2026-10-05，用户要求原话：「保持心跳失活判超时的断言，但判超时后重连 + 显式『重连』入口；
+同步把"心跳恢复后自动恢复"改成真实语义，给 log 加时间」）：
+
+- **判据一个字没动**：判死仍只看"连续 N 拍心跳窗口内没回包"；退避是**两次尝试之间的节奏**，
+  不是静态时长上限，单次建连照旧不设超时（M9 1.1 不变量 4）。
+- **自动重连**：`SshLiveness` 新增 `onStale`（**只在跨过阈值的那一拍**通知一次）→ `DartSshTransport` 起
+  `SshReconnectPump`（新文件 `packages/tree_local_exec/lib/src/ssh_reconnect.dart`：单飞 + 退避
+  `5s→10s→30s→60s`，之后每 60s 一次，直到成功 / `close()`）。**不阻塞调用方**：在途操作照旧立刻显式失败。
+  重建"**先建新、再换旧**"：成功才替换会话并清空丢失计数，失败抛可读 `WorkspaceIoException` 且保持失活态。
+- **显式「重连」入口**：`ReconnectableWorkspace`（`linkStale`/`linkMessage`/`reconnectLink()`，
+  `SshWorkspaceIO` 实现、`PrivateWorkspaceIO` 透传）→ `WorkspaceToolRunner.reconnectSshLink` →
+  `POST /api/agents/{agentId}/ssh/reconnect`（`ApiPaths.agentSshReconnect`）→ 右栏文件面板根目录**错误块上的
+  「重连」按钮**（`Key('file-tree-reconnect')`；`{agentId}` 取 `teamId`，不是 `workspaceId`= `ws_<id>`）。
+- **文案说真话**：`SshLiveness.staleMessage` 改成「…**旧连接已判死、不会自行恢复**（核心会按退避自动重连，
+  也可用「重连」立即重建）」。
+- **顺手治了排障本身**：`CoreLogSink` 的**落盘行**加行首时间戳（`<ISO8601 带时区> pid=<pid> <原行>`）——
+  这次定位只能靠"会话消息的时间戳反推 core.log 行"，因为没有时间戳；stderr 那份**逐字不变**（按 stderr 断言的测试不受影响）。
+
+落点：`tree_local_exec` 的 `ssh_liveness.dart` / `ssh_reconnect.dart`（新）/ `dartssh_transport.dart` /
+`ssh_workspace_io.dart`；`tree_core` 的 `tool/workspace_tool_runner.dart` / `agent/private_workspace_io.dart` /
+`server/core_server.dart` / `util/core_log_sink.dart`；`tree_protocol` 的 `api_paths.dart`；前端
+`lib/io/api_service.dart` / `lib/ui/widgets/file_tree.dart`。口径写进 `tree_local_exec/README.md` 不变量 6、
+`tree_core/lib/src/tool/README.md` 不变量 3、`tree_core/lib/src/util/README.md` 不变量 8、`docs/architecture.md` §11。
+
+**验证**：
+
+- `packages/tree_local_exec/test/ssh_reconnect_test.dart`（新）：节拍器单飞 / 退避走完一直用最后一拍 /
+  关停后不再试 / 失败原样抛；`SshLiveness.onStale` 只在跨阈值那一拍通知一次（恢复后可再通知）；
+  `SshWorkspaceIO` 的 `linkStale`/`reconnectLink` 可见面，**本机后端不实现该能力**（`is ReconnectableWorkspace` 为假）；
+- `packages/tree_local_exec/test/ssh_liveness_test.dart`：新增 `onStale` 两例 + 文案钉子（**不得**再出现"自动恢复"）；
+- `packages/tree_core/test/ssh_reconnect_api_test.dart`（新，7 例）：200（真的打到链路层、`stale` 复位）/
+  400（本机 agent，"用错入口"不该报 500）/ 404（无此 agent）/ 500（重建失败 + 可读原因，且**保持失活态**）/
+  501（工具执行器未接入）；路由完备性由既有 `server_test` 的覆盖度用例兜住；
+- 前端 `test/file_tree_reconnect_test.dart`（新，3 例）：错误块出现按钮 / 点击打到**真 agentId** 并重拉 /
+  失败显示 detail 且不清空内容；
+- `packages/tree_core/test/core_log_sink_test.dart`：新增"落盘行首时间戳"（假时钟精确断言 + 形状正则）与
+  "时间戳在 `write()` 当下取"两例；**stderr 逐字不变**也有断言。
+
+**状态**：已修复（自动重连 + 显式入口 + 文案 + 日志时间戳；全量测试与静态检查见本次提交的验证记录）。**遗留**：
+
+1. **真机 sshd 未复跑**：本仓库没有可连的 sshd，`DartSshTransport` 里"真建连"那几行**只能靠门控用例
+   （`TREE_SSH_TEST_*`）与手工核对**；本次单测钉的是"策略与接线"（假连接器 / 假传输），不是"远端真的能重连上"。
+   谁有真机目标，请跑 `packages/tree_local_exec` 的门控用例 + 一次"拔网线再插回"的现场验证；
+2. **远端不可达时，显式重连这次 HTTP 请求会一直等**（不设静态超时是既有口径）——前端已给"重连中…"态与禁用点击；
+   远端长时间不可达时请依赖传输层的后台退避重连，不要连点；
+3. **换会话会让旧 shell 通道失效**（旧 `SSHSession` 被关）：它们按既有口径收口（`exitCode` 给 -1 / 显式失败），
+   重连只保证"之后可用"，不承诺"在途的交互终端续命"；
+4. **触发方仍未定论**：03:29:47 那次 TCP 被谁掐断（远端重启 / 局域网抖动 / Windows socket 重置）没有本机证据；
+   同夜 22:56 的 `errno=121` 与它不是同一条连接（若是，计数本应从 22:56 起涨）；
+5. `LivenessTracker`（MCP / WS / LLM 的通用台账）**保持原语义**：那些通道的上游本来就能重建（MCP 懒连接、
+   WS 前端重连），本次不清扫它们的文案与行为。
