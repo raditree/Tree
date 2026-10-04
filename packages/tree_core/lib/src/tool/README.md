@@ -44,7 +44,7 @@
      **子壳**（`( setsid nohup … > <日志> 2>&1 < /dev/null & echo $! )`）⇒ 子壳立刻退出、SSH 通道立刻
      EOF、工具立刻返回；`setsid` 让命令自成进程组（pgid == pid），`cancel` 的 `kill -TERM -<pid>` 才落在
      正确进程组。旧形状 `{ … ; } & echo $!` 会让承载组的子壳握着通道、**阻塞到命令结束**（实测
-     `sleep 25` 阻塞 25.09s，见 [../../../../docs/known-issues.md](../../../../docs/known-issues.md) #23）；
+     `sleep 25` 阻塞 25.09s，见 [../../../../../docs/known-issues.md](../../../../../docs/known-issues.md) #23）；
    - **通知一律如实**：结束写结束标记并回调唤醒 agent；远端进程消失但没留下退出码 ⇒ 给可辨退出码；
      链路判失活 ⇒ 记 `remoteFailureExitCode` 并写明"拿不到远端状态"；
    - **远端任务落盘台账**：核心/应用**重启后接续**——启动即探一次哨兵，已结束就立刻把完成提示
