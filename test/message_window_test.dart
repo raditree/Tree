@@ -112,6 +112,43 @@ void main() {
     });
   });
 
+  group('窗口半径（用户 2026-10-04：+-200 有点卡，改 +-50 ⇒ 取 51 好 grep）', () {
+    test('默认半径 = 51：页大小 / 视口外多留 / 末尾常驻同一个数', () {
+      expect(kMessageWindowRadius, 51, reason: '刻意的怪数：50 到处都是，51 才好 grep');
+      final MessageWindow w = MessageWindow();
+      expect(w.pageSize, kMessageWindowRadius);
+      expect(w.margin, kMessageWindowRadius);
+      expect(w.tailKeep, kMessageWindowRadius);
+    });
+
+    test('gapsFor 默认只外扩 51 条', () {
+      final MessageWindow w = MessageWindow();
+      w.ensureTotal(500);
+      expect(w.gapsFor(200, 204), <MessageRange>[const MessageRange(149, 256)],
+          reason: '视口 [200,204] 外扩 51：149 .. 255（左闭右开 = 256）');
+    });
+
+    test('保留边界就是半径：视口外第 51 条还留着，第 52 条被淘汰', () {
+      final MessageWindow w = MessageWindow();
+      w.ensureTotal(400);
+      w.place(offset: 247, messages: page(247, 4)); // 247..250
+      // 视口 300..304 ⇒ keep = [300-51, 304+1+51) = [249, 356)
+      expect(w.evict(keep: const MessageRange(249, 356)), 2,
+          reason: '247、248 出界');
+      expect(w.at(249), isNotNull, reason: '正好在半径上：留着');
+      expect(w.at(250), isNotNull);
+    });
+
+    test('离视口远的一页会被整页淘汰（缓存长度真的降下来了）', () {
+      final MessageWindow w = MessageWindow();
+      w.ensureTotal(400);
+      w.place(offset: 0, messages: page(0, 200));
+      expect(w.loadedCount, 200);
+      expect(w.evict(keep: const MessageRange(300, 351)), 200);
+      expect(w.loadedCount, 0);
+    });
+  });
+
   group('限制缓存长度', () {
     test('淘汰：离开视口又离末尾太远的槽位放回占位', () {
       final MessageWindow w = MessageWindow(tailKeep: 2);

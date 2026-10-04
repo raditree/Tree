@@ -42,7 +42,8 @@ class _FakeCore {
   int total = 3000;
 
   /// 一页多少条（= 面板的 `_historyPageSize`）
-  int pageSize = 200;
+  /// 假核心的一页大小 = 面板的窗口半径（51）：请求带的 limit 优先，这里只做兜底/上限。
+  int pageSize = 51;
 
   /// 收到的历史请求查询串（按到达顺序）
   final List<String> queries = <String>[];
@@ -214,8 +215,8 @@ void main() {
     expect(loaded.length, greaterThanOrEqualTo(core.pageSize),
         reason: '首屏至少要把末尾一页拉回来，实际 ${loaded.length} 条');
     expect(loaded.contains(core.total - 1), isTrue, reason: '末尾那一条在窗口里');
-    expect(core.queries.first, contains('limit=200'),
-        reason: '首屏请求形状：只带 limit');
+    expect(core.queries.first, contains('limit=51'),
+        reason: '首屏请求形状：只带 limit（一次只拉一页 = 窗口半径 51 条）');
     expect(core.queries.first, isNot(contains('from=')),
         reason: '首屏问的是"末尾一页"（不带 from）');
     core.closeGate();

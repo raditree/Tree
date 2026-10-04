@@ -217,12 +217,24 @@ List<MessageRange> splitGapAtViewportTop(MessageRange gap, int first) {
   ];
 }
 
+/// 窗口附近保留多少条：**页大小 = 视口外多留 = 末尾常驻**，三个口径同一个数。
+///
+/// 用户 2026-10-04：「现在中间页懒加载 +-200 条消息，有点卡，改 +-50 条」。
+/// 取 **51** 是刻意的怪数：50 在这个仓库里到处都是（行数、超时、上限），
+/// 51 才能让"窗口半径"在任何一次 `grep` 里一眼认出来。
+///
+/// 为什么必须同一个数：补页量大于保留半径时，"刚补回来的一页立刻被淘汰、
+/// 滑一点又要重补"——同一段内容会被网络与布局各空转两遍。半径调小换来的是
+/// **每帧要维护的已加载槽位更少**（已加载条目越多，懒构建列表的估算与
+/// 像素↔下标换算的误差来源越多），代价是往回滑更早触发补页。
+const int kMessageWindowRadius = 51;
+
 /// 见文件头：按全局下标寻址的消息窗口。
 class MessageWindow {
   MessageWindow({
-    this.pageSize = 200,
-    this.margin = 200,
-    this.tailKeep = 200,
+    this.pageSize = kMessageWindowRadius,
+    this.margin = kMessageWindowRadius,
+    this.tailKeep = kMessageWindowRadius,
   });
 
   /// 一次补多少条（正常一页的量级）。

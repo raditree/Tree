@@ -115,7 +115,8 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 消息列表
   /// 消息窗口：整份会话流按**全局下标**寻址，只有视口附近与末尾一段是热的
   /// （用户 2026-10-04：「滑到哪加载哪，限制缓存长度，仅缓存窗口附近的消息」）。
-  final MessageWindow _window = MessageWindow(pageSize: 200);
+  /// 三个口径（页大小 / 视口外多留 / 末尾常驻）都取 [kMessageWindowRadius]。
+  final MessageWindow _window = MessageWindow();
 
   /// 断线补发帧的「重播去重」闸（M9 §1.1 / Wave 3-H 待办 3）。
   ///
@@ -281,14 +282,18 @@ class _MessagePanelState extends State<MessagePanel> {
   final Set<String> _workingSubagents = <String>{};
 
   /// 一次拉多少条历史（**长会话只加载末尾一段**：用户 2026-10-04「会话太长时导入不能
-  /// 直接划到底部；懒加载，长会话仅加载末尾一段」）。它就是窗口的页大小。
-  static const int _historyPageSize = 200;
+  /// 直接划到底部；懒加载，长会话仅加载末尾一段」）。它就是窗口的页大小（= [kMessageWindowRadius]，见那里的口径）。
+  static const int _historyPageSize = kMessageWindowRadius;
 
   /// 已加载的槽位离视口多远就淘汰（"仅缓存坐标附近的历史，其余均丢弃"：用户 2026-10-03）。
   ///
-  /// 为什么从 400 收到 200：口径就是"只留窗口附近"，而且**已加载条目越少，
+  /// 为什么从 400 → 200 → **51**：口径就是"只留窗口附近"，而且**已加载条目越少，
   /// "像素 ↔ 全局下标"的估算越准**（占位槽恒定 88px，已加载消息的真实高度才是误差来源）。
-  static const int _cacheMargin = 200;
+  /// 用户 2026-10-04：「现在中间页懒加载 +-200 条消息，有点卡，改 +-50 条」——
+  /// 取 51 是刻意的怪数（50 到处都是），好让"窗口半径"被一次 grep 认出来；
+  /// 它与 [_historyPageSize] / `MessageWindow.tailKeep` 必须是同一个数 [kMessageWindowRadius]
+  /// （补页量 > 保留半径会让"刚补回的一页立刻被淘汰、滑一点又重补"）。
+  static const int _cacheMargin = kMessageWindowRadius;
 
   /// 正在补的下标段（防同一段被并发拉两次）。
   final Set<String> _loadingGaps = <String>{};
