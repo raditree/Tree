@@ -68,7 +68,13 @@ class WorkspaceToolRunner implements ToolRunner {
       // 由 `TerminalHooks.restorePending` 接续，完成提示投递回原会话。
       ledger: hookLedger,
       // 后台 hook 登记进「正在执行的 tool」：右栏因此看得见、用户关得掉。
-      toolRuns: toolRuns,
+      //
+      // **必须写 `this.toolRuns`**：这里裸写 `toolRuns` 解析到的是**同名构造形参**
+      // （不是上面刚初始化过的字段），而生产调用方（`tree_core_cli/bin/tree_core.dart`）
+      // 不传 `toolRuns:` ⇒ 形参恒为 null ⇒ hooks 永远不登记，右栏与 `tool_runs`
+      // 都看不到后台 hook。事故见 docs/known-issues.md #25，
+      // 回归见 test/terminal_hook_registration_test.dart。
+      toolRuns: this.toolRuns,
       // 临时员工起的 hook 归到**会话主人**（与 `.self` 分栏同一口径）。
       ownerOf: subagentService?.privateOwnerOf,
     );

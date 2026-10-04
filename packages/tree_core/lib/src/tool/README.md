@@ -54,6 +54,11 @@
    - **右栏可见、用户可关**：登记进 `ToolRunRegistry`（`watchdog: false` ⇒ 长任务不判超时、不刷 warning；
      `crossCall: true` ⇒ 跨工具调用存活），用户点关闭 = 取消该 hook（本机真杀进程树；远端尽力 `kill`，
      拿不到 pid 时**如实**回原因）。**不做**"两个新站点 + leader 可杀"（用户暂缓）。
+   - **接线必须是 `this.toolRuns`**：`WorkspaceToolRunner` 构造体里裸写 `toolRuns` 会解析到**同名
+     构造形参**（生产调用方不传 ⇒ 恒 null），hook 于是**从不登记**、右栏与 `tool_runs` 都看不到它
+     （事故 2026-10-04，见 [../../../../../docs/known-issues.md](../../../../../docs/known-issues.md) #25；
+     回归 `test/terminal_hook_registration_test.dart`）。**"可见可关"必须由生产接线上的用例钉住**
+     ——直接 `TerminalHooks(toolRuns: registry)` 构造的用例绕过这处接线，钉不住它。
 9. 待办落盘是 markdown 勾选清单，**正文放在最后**（正文里出现任何符号都不破坏解析）；`status=` 是**权威值**，勾选框只同步人类可读性；缺元数据的行也能读出来（id 自动生成、状态按勾选框推断）。
 10. 提问通道是**具名契约**：工具层不反向依赖编排层（依赖方向 `tool` ← `agent`）。**多问题口径**
     （用户要求 2026-10-04：「ask_user_question 工具仅支持单个问题（改为支持多问题）」）：
@@ -64,7 +69,7 @@
       `normalizeAnswers`（答案归一成与题数等长、缺项未作答）、`formatAnswerLines`（**单问输出与
       "只支持单问题"时期逐字一致** `用户回答：B`；多问逐题成行、未答写 `（未作答）`）、
       `prefixFirstQuestion`（来源标记只加第一问，别在别处再写一套）；
-    - 结果交给模型前不做任何"猜"：未答项如实标注，模型据此决定追问或按假设继续。
+    - 结果交给模型前不做任何"猜"：未答项如实标注，模型据此决定追问或按假设继续；
     - **等待作答期间不被插话打断**（用户 2026-10-04 断言：「任何工具调用执行期间不被插话打断，
       插入消息（包括 terminal/subagent hook 完成消息）在工具调用期间必须排队等待」）：
       `AskQuestionRequest.isCancelled` 必须是**硬取消**谓词（`stop` / 删除 agent / 关服），
@@ -92,6 +97,7 @@
 ```bash
 cd packages/tree_core
 dart test test/builtin_tools_test.dart test/terminal_hooks_test.dart test/terminal_hook_wake_test.dart \
+          test/terminal_hook_registration_test.dart \
           test/terminal_soft_timeout_test.dart test/terminal_hooks_ssh_test.dart test/hook_ledger_test.dart \
           test/todo_store_test.dart test/tool_relay_test.dart \
           test/tool_list_refresh_test.dart test/session_status_test.dart test/team_tool_test.dart \
@@ -102,6 +108,10 @@ dart test test/builtin_tools_test.dart test/terminal_hooks_test.dart test/termin
 - `terminal_hooks_ssh_test.dart`（假 SSH 传输）：远端后台的**命令形状**（`nohup` / 三路重定向 /
   `< /dev/null` / 哨兵 / `echo $!`）、启动即返回、轮询到结束后的唤醒、`GONE` 与链路失活的**如实**退出码、
   远端 `cancel` 的尽力语义，以及**右栏登记 + 用户关闭 = 取消该 hook**。
+- `terminal_hook_registration_test.dart`：**生产接线**（`WorkspaceToolRunner` 且**不传** `toolRuns:`）
+  下 `hooks.toolRuns` 与 `runner.toolRuns` 是**同一份**登记表，且 `hook=true` 起的后台任务确实登记在
+  表里（`watchdog:false` + `crossCall:true`、永不进 `stuck_tools`）、能被 `ToolRunRegistry.close`
+  **真终止**（known-issues #25 的钉子）。
 - `hook_ledger_test.dart`：台账往返、原子写（不留 `.tmp`）、按开始时刻升序、损坏条目**记日志后跳过**、
   id 里的路径分隔符被清洗。
 - `terminal_hooks_ssh_test.dart` 的接续用例：**不重跑命令**（只探测）、应用不在运行期间跑完 ⇒ 启动即

@@ -1416,6 +1416,52 @@ SSH 下返回的是**远端绝对路径**（`/home/u/proj/.output/…`），而�
 
 ---
 
+## #25 后台 hook（`terminal hook=true`）从不进「正在执行的 tool」（右栏看不到、关不掉）
+
+**现象**（2026-10-04，用户报）：`hook=true` 起的后台任务在跑时，右栏「正在执行的 tool」页**看不到这一行**，
+因此**无法中止**。对照说明"只是没登记，不是 hook 坏了"：完成提示照常注入会话、
+`terminal hook_action=status/cancel` 照常可用。
+
+**证据**（本机实测，两次独立读数）：起 `Start-Sleep -Seconds 180`（`hook=true`，
+task_id=`hook_1791118115256_18`）后，20:48:44 与 20:49:53 两次 `tool_runs action=list` **都只有
+`tool_runs` 自己那一条**——hook 不在表里。⇒ 不止前端看不到，**agent 侧也看不到**，根因在核心。
+
+**根因**（`packages/tree_core/lib/src/tool/workspace_tool_runner.dart` 构造函数）：
+
+```dart
+WorkspaceToolRunner({ ... ToolRunRegistry? toolRuns, ... })
+    : toolRuns = toolRuns ?? ToolRunRegistry.instance {   // 字段本身初始化正确
+  hooks = TerminalHooks(toolRuns: toolRuns, ...);          // ← 裸写的 `toolRuns` 是**形参**
+```
+
+Dart 作用域里，构造体内的裸 `toolRuns` 解析到**同名构造形参**（不是刚初始化过的字段 `this.toolRuns`）。
+生产调用方 `packages/tree_core_cli/bin/tree_core.dart` 的 `WorkspaceToolRunner(...)` **不传** `toolRuns:`
+⇒ 形参恒 null ⇒ `TerminalHooks.toolRuns == null` ⇒ `_register` 里 `if (registry != null)` 不成立
+⇒ **hook 从不登记**（`task.run` 恒 null）。一行接线取错名字，整条"可见可关"链路空转。
+
+**修复**（2026-10-04）：`toolRuns: this.toolRuns`（并加注释说明为什么必须显式写 `this.`）。
+注意 `tree_core_cli` 不传 `toolRuns:` 是**对的**（生产就该用进程级唯一那份），错的只是搬运时取错了标识符。
+
+**为什么既有测试没兜住**：所有 hook 用例都是 `TerminalHooks(toolRuns: registry)` **直接**构造管理器
+（如 `terminal_hooks_ssh_test.dart`），绕过了 `WorkspaceToolRunner` 这条**生产接线**——它们钉住了
+"登记表能给 hook 用"，没钉住"生产把表交给了 hook"。
+
+**验证**：新增 `packages/tree_core/test/terminal_hook_registration_test.dart`——**刻意不传** `toolRuns:`
+（走生产接线），断言 `hooks.toolRuns` 与 `runner.toolRuns` 是**同一份**、`hook=true` 的后台任务确实登记
+（`watchdog:false` + `crossCall:true`、永不进 `stuck_tools`）、`ToolRunRegistry.close` **真终止**本机进程树。
+**修复前该用例两条全红**（`hooks.toolRuns == null`、起 hook 后登记表为空），修复后全绿；
+`cd packages/tree_core && dart test` 全量绿 + `dart analyze` 零告警。
+
+**影响面**：所有 `terminal hook=true`（本机与 SSH），以及执行站 `terminal.exec` 的后台任务
+（用的正是**同一份** hooks：`tree_core.dart` 的 `stationHooks: tools.hooks`）。
+**未受影响**：普通工具调用（`_execute` 用字段登记，所以 `tool_runs` 看得见自己）、
+hook 的完成唤醒（走 `onFinished`，不经登记表）。
+
+**状态**：已修复（2026-10-04）。**遗留**：UI 端到端要**重建核心 + 重启应用**后由用户复核
+（源码级修复 + 单测已过；我未在真实 UI 上亲眼验证）。
+
+---
+
 ## #26 `ask_user_question` 被其它消息打断（含 terminal hook 完成提示）
 
 **现象**（2026-10-04，用户报）：模型问一道题、用户还在看题卡时，任何"有人说话"都会把这张卡**取消**——

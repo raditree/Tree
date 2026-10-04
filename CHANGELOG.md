@@ -49,6 +49,15 @@
   **不加资源、不动 pubspec**，深浅主题各自成套。原来的 `👋` 不再出现——它是平台彩色字体
   （Windows 上是黄色），染不上主题色。「什么时候显示空态」的口径（只在确实加载完且真的没有
   消息时，加载中渲染骨架）**一个字没改**。
+- **后台 hook 的「可见可关」在生产接线上真正成立**（修改
+  [packages/tree_core/lib/src/tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 8；
+  修 [workspace_tool_runner.dart](packages/tree_core/lib/src/tool/workspace_tool_runner.dart) 的接线；
+  场景 [docs/known-issues.md](docs/known-issues.md) #25）：
+  不变量 8 早就写着"后台任务要登记进 `ToolRunRegistry`、右栏可见可关"，但生产接线里
+  `TerminalHooks(toolRuns: toolRuns)` 传的是**同名构造形参**（`tree_core_cli` 不传 ⇒ 恒 null），
+  hook 因此**从不登记**——右栏「正在执行的 tool」与 agent 的 `tool_runs` 都看不到它、也关不掉。
+  新口径：**该接线必须写 `this.toolRuns`**，且"可见可关"必须由**穿过生产接线**的用例钉住
+  （直接构造 `TerminalHooks` 的用例钉不住它）。
 
 - **`ask_user_question` 不再被其它消息打断：任何工具调用执行期间，插入消息排队等待**（新增
   [docs/known-issues.md](docs/known-issues.md) #26；修改 [agent/README.md](packages/tree_core/lib/src/agent/README.md)
