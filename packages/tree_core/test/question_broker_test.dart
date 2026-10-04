@@ -28,12 +28,14 @@ void main() {
   AskQuestionRequest request({
     String question = '选哪个方案？',
     List<String> options = const <String>['A', 'B'],
+    List<AskedQuestion>? questions,
     bool Function()? isCancelled,
   }) => AskQuestionRequest(
     agentId: agent.id,
     sessionId: sessionId,
-    question: question,
-    options: options,
+    questions:
+        questions ??
+        <AskedQuestion>[AskedQuestion(question: question, options: options)],
     isCancelled: isCancelled ?? () => false,
   );
 
@@ -69,7 +71,7 @@ void main() {
     expect(card.answered, isFalse);
 
     // 4) 作答：等待中的 future 完成，并广播 resolved
-    expect(broker.answer(record.qid, 'B'), isTrue);
+    expect(broker.answer(record.qid, <String>['B']), isTrue);
     final QuestionOutcome outcome = await pending;
     expect(outcome.cancelled, isFalse);
     expect(outcome.answer, 'B');
@@ -79,8 +81,99 @@ void main() {
     expect((frames.last['data'] as Map<String, dynamic>)['id'], record.qid);
 
     // 5) 重复作答被幂等闸门拒绝（并发 WS + REST 只生效一次）
-    expect(broker.answer(record.qid, 'C'), isFalse);
+    expect(broker.answer(record.qid, <String>['C']), isFalse);
     expect(questions.byId(record.qid)?.answer, 'B');
+  });
+
+  test('多问题：一条记录一张卡片，作答一次交齐（未答项按未作答）', () async {
+    final Future<QuestionOutcome> pending = broker.ask(
+      request(
+        questions: <AskedQuestion>[
+          AskedQuestion(question: '部署到哪台？', options: <String>['A 机', 'B 机']),
+          AskedQuestion(question: '要不要回滚预案？'),
+        ],
+      ),
+    );
+    // 1) 落盘：一条记录、两道题
+    final QuestionRecord record = questions.list().single;
+    expect(record.isMulti, isTrue);
+    expect(record.questions.length, 2);
+    expect(record.question, '部署到哪台？', reason: '兼容读法 = 第一问');
+
+    // 2) 下行帧：questions 是完整问题表；question/options 保留为第一问（老前端）
+    final Map<String, dynamic> frame = frames.single;
+    expect(frame['questions'], <Map<String, dynamic>>[
+      <String, dynamic>{
+        'question': '部署到哪台？',
+        'options': <String>['A 机', 'B 机'],
+      },
+      <String, dynamic>{'question': '要不要回滚预案？', 'options': <String>[]},
+    ]);
+    expect(frame['question'], '部署到哪台？');
+    expect(frame['options'], <String>['A 机', 'B 机']);
+
+    // 3) 会话里那张卡片同样是两道题（历史重载时按它渲染）
+    final CoreMessage card = store
+        .messages(agent.id, sessionId)
+        .singleWhere((CoreMessage m) => m.kind == 'ask_user_question');
+    expect(card.questions?.length, 2);
+
+    // 4) 只答第一题也接受（缺项按未作答），resolved 帧带逐题答案
+    expect(broker.answer(record.qid, <String>['B 机']), isTrue);
+    final QuestionOutcome outcome = await pending;
+    expect(outcome.cancelled, isFalse);
+    expect(outcome.answers, <String>['B 机', '']);
+    expect(record.answers, <String>['B 机', '']);
+    final Map<String, dynamic> resolved =
+        frames.last['data'] as Map<String, dynamic>;
+    expect(resolved['answers'], <String>['B 机', '']);
+    expect(resolved['answer'], contains('第1题（部署到哪台？）：B 机'));
+  });
+
+  test('多问题：取消同样立刻收尾（一个 Completer，与题数无关）', () async {
+    final Future<QuestionOutcome> pending = broker.ask(
+      request(
+        questions: <AskedQuestion>[
+          AskedQuestion(question: '第一问'),
+          AskedQuestion(question: '第二问'),
+        ],
+      ),
+    );
+    final String qid = questions.list().single.qid;
+    expect(broker.cancel(qid, reason: '用户取消'), isTrue);
+    final QuestionOutcome outcome = await pending;
+    expect(outcome.cancelled, isTrue);
+    expect(outcome.answers, isEmpty);
+    expect(questions.byId(qid)?.status, QuestionStatus.cancelled);
+    expect(broker.inFlightCount, 0);
+  });
+
+  test('多问题：没有在途生成时的补答消息逐题成行', () async {
+    final MemoryQuestionStore persisted = MemoryQuestionStore();
+    final QuestionBroker restarted = QuestionBroker(
+      questions: persisted,
+      transcript: store,
+      broadcast: frames.add,
+    );
+    persisted.add(
+      QuestionRecord(
+        qid: 'q_multi_old',
+        agentId: agent.id,
+        sessionId: sessionId,
+        questions: <AskedQuestion>[
+          AskedQuestion(question: '第一问'),
+          AskedQuestion(question: '第二问'),
+        ],
+        createdAt: 1,
+      ),
+    );
+    expect(restarted.answer('q_multi_old', <String>['甲', '乙']), isTrue);
+    final CoreMessage answer = store
+        .messages(agent.id, sessionId)
+        .lastWhere((CoreMessage m) => m.role == 'user');
+    expect(answer.content, startsWith('${QuestionBroker.answerPrefix}\n'));
+    expect(answer.content, contains('第1题（第一问）：甲'));
+    expect(answer.content, contains('第2题（第二问）：乙'));
   });
 
   test('cancel：等待立刻结束且记录标记为已取消', () async {
@@ -138,7 +231,7 @@ void main() {
         createdAt: 1,
       ),
     );
-    expect(restarted.answer('q_old', '继续'), isTrue);
+    expect(restarted.answer('q_old', <String>['继续']), isTrue);
     final CoreMessage answer = store
         .messages(agent.id, sessionId)
         .lastWhere((CoreMessage m) => m.role == 'user');
@@ -177,6 +270,27 @@ void main() {
   });
 
   group('工具层', () {
+    test('题面前缀只加在第一问上（临时员工提问：卡片本就显示在它名下）', () {
+      final List<AskedQuestion> tagged = prefixFirstQuestion(
+        <AskedQuestion>[
+          AskedQuestion(question: '部署到哪台？', options: <String>['A 机']),
+          AskedQuestion(question: '要不要回滚预案？'),
+        ],
+        '【临时员工「张三」提问】',
+      );
+      expect(tagged.first.question, '【临时员工「张三」提问】部署到哪台？');
+      expect(tagged.first.options, <String>['A 机'], reason: '选项原样保留');
+      expect(tagged[1].question, '要不要回滚预案？', reason: '第二问不加前缀');
+      // 单问：等价于给题面加前缀
+      expect(
+        prefixFirstQuestion(
+          <AskedQuestion>[AskedQuestion(question: '继续吗？')],
+          '【临时员工「张三」提问】',
+        ).single.question,
+        '【临时员工「张三」提问】继续吗？',
+      );
+    });
+
     test('只接入提问通道时才声明 ask_user_question；且它不需要工作空间', () {
       expect(
         BuiltinTools.specs().map((ToolSpec s) => s.name),
@@ -208,7 +322,7 @@ void main() {
         resolveWorkspaceDir: (String _) => '',
         askQuestion: (AskQuestionRequest request) async {
           requests.add(request);
-          return const QuestionOutcome(answer: 'B');
+          return const QuestionOutcome(answers: <String>['B']);
         },
       );
       final ToolOutcome outcome = await runner.run(
@@ -224,7 +338,11 @@ void main() {
         ),
       );
       expect(outcome.isError, isFalse);
-      expect(outcome.content, contains('用户回答：B'));
+      expect(
+        outcome.content,
+        '用户回答：B',
+        reason: '单问的结果文案与"只支持单问题"时期逐字一致（模型侧口径不变）',
+      );
       expect(requests.single.question, '选哪个？');
       expect(requests.single.options, <String>['A', 'B', '3']);
 
@@ -247,7 +365,7 @@ void main() {
       final WorkspaceToolRunner runner = WorkspaceToolRunner(
         resolveWorkspaceDir: (String _) => '',
         askQuestion: (AskQuestionRequest request) async =>
-            const QuestionOutcome(answer: '', cancelled: true),
+            const QuestionOutcome(cancelled: true),
       );
       ToolInvocation invocation(String question) => ToolInvocation(
         id: 'tool_1',
@@ -262,6 +380,97 @@ void main() {
       final ToolOutcome cancelled = await runner.run(invocation('继续吗？'));
       expect(cancelled.isError, isFalse);
       expect(cancelled.content, contains('不要重复提问'));
+      await runner.close();
+    });
+
+    test('多问题：questions 数组归一（题面去空白、选项去重去空），结果逐题列出', () async {
+      final List<AskQuestionRequest> requests = <AskQuestionRequest>[];
+      final WorkspaceToolRunner runner = WorkspaceToolRunner(
+        resolveWorkspaceDir: (String _) => '',
+        askQuestion: (AskQuestionRequest request) async {
+          requests.add(request);
+          return const QuestionOutcome(answers: <String>['B 机', '']);
+        },
+      );
+      final ToolOutcome outcome = await runner.run(
+        ToolInvocation(
+          id: 'tool_1',
+          name: BuiltinTools.askUserQuestion,
+          arguments: <String, dynamic>{
+            'questions': <dynamic>[
+              <String, dynamic>{
+                'question': '  部署到哪台？  ',
+                'options': <dynamic>['A 机', 'B 机', 'B 机', '  '],
+              },
+              <String, dynamic>{'question': '要不要回滚预案？'},
+            ],
+          },
+          agentId: agent.id,
+          sessionId: sessionId,
+        ),
+      );
+      expect(outcome.isError, isFalse);
+      expect(requests.single.questions.length, 2);
+      expect(requests.single.questions[0].question, '部署到哪台？');
+      expect(requests.single.questions[0].options, <String>['A 机', 'B 机']);
+      // 结果按题列出；未作答如实标注
+      expect(outcome.content, startsWith('用户回答：\n'));
+      expect(outcome.content, contains('第1题（部署到哪台？）：B 机'));
+      expect(outcome.content, contains('第2题（要不要回滚预案？）：（未作答）'));
+      await runner.close();
+    });
+
+    test('多问题：题数超上限（10）与坏形状都给可读错误', () async {
+      final WorkspaceToolRunner runner = WorkspaceToolRunner(
+        resolveWorkspaceDir: (String _) => '',
+        askQuestion: (AskQuestionRequest request) async =>
+            const QuestionOutcome(answers: <String>['x']),
+      );
+      Future<ToolOutcome> run(Map<String, dynamic> arguments) => runner.run(
+        ToolInvocation(
+          id: 'tool_1',
+          name: BuiltinTools.askUserQuestion,
+          arguments: arguments,
+          agentId: agent.id,
+          sessionId: sessionId,
+        ),
+      );
+      final ToolOutcome tooMany = await run(<String, dynamic>{
+        'questions': <dynamic>[
+          for (int i = 0; i <= BuiltinTools.maxQuestionsPerCall; i++)
+            <String, dynamic>{'question': '第 $i 题'},
+        ],
+      });
+      expect(tooMany.isError, isTrue);
+      expect(tooMany.content, contains('一次最多问 10 道题'));
+
+      final ToolOutcome badItem = await run(<String, dynamic>{
+        'questions': <dynamic>['裸字符串'],
+      });
+      expect(badItem.isError, isTrue);
+      expect(badItem.content, contains('{question, options} 对象'));
+
+      final ToolOutcome emptyQuestion = await run(<String, dynamic>{
+        'questions': <dynamic>[
+          <String, dynamic>{'question': '   '},
+        ],
+      });
+      expect(emptyQuestion.isError, isTrue);
+      expect(emptyQuestion.content, contains('question 不能为空'));
+
+      final ToolOutcome bothMissing = await run(<String, dynamic>{});
+      expect(bothMissing.isError, isTrue);
+      expect(bothMissing.content, contains('question 不能为空'));
+
+      // 简写与数组同时给时以 questions 为准（约定：数组是权威形态）
+      final ToolOutcome preferArray = await run(<String, dynamic>{
+        'question': '简写那道',
+        'questions': <dynamic>[
+          <String, dynamic>{'question': '数组那道'},
+        ],
+      });
+      expect(preferArray.isError, isFalse);
+      expect(preferArray.content, contains('用户回答：x'));
       await runner.close();
     });
   });

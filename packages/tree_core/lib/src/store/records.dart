@@ -368,6 +368,7 @@ class CoreMessage {
     this.usage,
     this.attachments,
     this.options,
+    this.questions,
     this.answered = false,
     this.llmHidden = false,
     this.subagentId = '',
@@ -406,6 +407,13 @@ class CoreMessage {
           .toList(),
       options: (json['options'] as List<dynamic>?)
           ?.map((dynamic e) => e.toString())
+          .toList(),
+      questions: (json['questions'] as List<dynamic>?)
+          ?.whereType<Map<dynamic, dynamic>>()
+          .map(
+            (Map<dynamic, dynamic> item) =>
+                item.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
+          )
           .toList(),
       answered: json['answered'] as bool? ?? false,
       llmHidden: json['llm_hidden'] as bool? ?? false,
@@ -456,6 +464,14 @@ class CoreMessage {
   final Map<String, dynamic>? usage;
   final List<Map<String, dynamic>>? attachments;
   final List<String>? options;
+
+  /// 提问卡片里的**全部问题**（`kind == 'ask_user_question'` 时有效）。
+  ///
+  /// 与提问记录（`data/questions.json`）里的 `questions` 同形——记录是真源（作答
+  /// 状态与答案在那里），这里存一份是为了"记录丢了也还看得出当时问了哪几道题"。
+  /// 老消息没有这个键 ⇒ null，前端按 `content` + `options` 合成单问。
+  final List<Map<String, dynamic>>? questions;
+
   final bool answered;
 
   /// 是否为工具调用卡片（不计入"有效消息数"）。
@@ -542,6 +558,8 @@ class CoreMessage {
     'usage': usage,
     'attachments': attachments,
     'options': options ?? const <String>[],
+    // 只在该落时才落（普通消息的 jsonl 一行不该多个空数组）
+    if (questions != null && questions!.isNotEmpty) 'questions': questions,
     'answered': answered,
     // 只在该隐藏时才落这个键：普通消息的 jsonl 一行不该多个 false
     if (llmHidden) 'llm_hidden': true,

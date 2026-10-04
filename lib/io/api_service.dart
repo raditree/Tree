@@ -1518,8 +1518,11 @@ class ApiService {
   }
 
   /// 回答某条待答提问（REST 入口，与 WS user_answer 等价）。
-  static Future<void> answerQuestion(String qid, String answer) async {
-    await _postJson('/api/questions/$qid/answer', body: {'answer': answer});
+  ///
+  /// **多问题**：[answers] 是逐题答案（与提问的 `questions` 等长，未作答项传空串）；
+  /// 单问就是长度 1 的表。
+  static Future<void> answerQuestion(String qid, List<String> answers) async {
+    await _postJson('/api/questions/$qid/answer', body: {'answers': answers});
   }
 
   /// 一键重置 agent 工作空间里的系统提示词 / Spec。

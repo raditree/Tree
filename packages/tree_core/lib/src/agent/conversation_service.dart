@@ -369,7 +369,9 @@ class ConversationService {
   /// 处理 `user_answer`（`ask_user_question` 的应答）。
   ///
   /// 帧口径（前端 `message_panel._handleAskAnswer`）：
-  /// `{type: 'user_answer', data: {question_id, answer}}`。
+  /// `{type: 'user_answer', data: {question_id, answers: [..]}}`。
+  /// **多问题**：`answers` 是逐题答案（与提问的 `questions` 等长）；
+  /// 老前端只给 `answer`（单值）= 第一问的答案，其余按"未作答"落库。
   /// 返回是否真的改变了状态（重复作答返回 false，幂等）。
   bool handleUserAnswer(Map<String, dynamic> frame) {
     final Map<String, dynamic> data = _dataOf(frame);
@@ -377,8 +379,20 @@ class ConversationService {
         (data['question_id'] ?? data['qid'] ?? frame['question_id'] ?? '')
             .toString();
     if (qid.isEmpty) return false;
-    final String answer = (data['answer'] ?? frame['answer'] ?? '').toString();
-    return questions?.answer(qid, answer) ?? false;
+    return questions?.answer(qid, _answersOf(data, frame)) ?? false;
+  }
+
+  /// 逐题答案：`answers`（数组，新前端）优先，退回 `answer`（单值，老前端）。
+  static List<String> _answersOf(
+    Map<String, dynamic> data,
+    Map<String, dynamic> frame,
+  ) {
+    final Object? raw = data['answers'] ?? frame['answers'];
+    if (raw is List) {
+      return raw.map((dynamic e) => e?.toString() ?? '').toList();
+    }
+    final Object? single = data['answer'] ?? frame['answer'];
+    return single == null ? const <String>[] : <String>[single.toString()];
   }
 
   /// 处理 `cancel_question`（用户放弃作答）。

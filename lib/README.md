@@ -14,7 +14,7 @@
 | [io/websocket_service.dart](io/websocket_service.dart) | WS 连接与重连、**10s 心跳**、帧分发 |
 | [io/local_executor_service.dart](io/local_executor_service.dart) · [io/ssh_executor_service.dart](io/ssh_executor_service.dart) | per-team 执行模式配置（local/ssh 的读写与注册）；命令本身由核心执行 |
 | [ui/pages/main_page.dart](ui/pages/main_page.dart) | 三栏骨架、agent 列表（顶层 agent + 团队成员）、会话切换、插件槽位作用域 |
-| [ui/widgets/message_panel.dart](ui/widgets/message_panel.dart) | 中栏消息流：分段渲染、工具/思考**一行式**（完整内容见右栏「详情」页）、提问卡片、断线重播去重、按 agent+会话过滤 |
+| [ui/widgets/message_panel.dart](ui/widgets/message_panel.dart) | 中栏消息流：分段渲染、工具/思考**一行式**（完整内容见右栏「详情」页）、提问卡片（**一次可问多道题**：逐题作答后一次交齐）、断线重播去重、按 agent+会话过滤 |
 | [ui/widgets/teammates_window_page.dart](ui/widgets/teammates_window_page.dart) | 团队成员拓扑与成员工作进度窗口 |
 | [ui/widgets/](ui/widgets/) | 文件面板（**VS Code 型资源管理器** [file_tree.dart](ui/widgets/file_tree.dart) + 类型图标纯函数 [file_tree_icon.dart](ui/widgets/file_tree_icon.dart)）/ 查看器（源码高亮 + 编辑保存 + 分屏，见 [split_panes.dart](ui/widgets/split_panes.dart)）/ **集成终端（[terminal_panel.dart](ui/widgets/terminal_panel.dart)，Ctrl+J）**/ 消息输入框（[message_input.dart](ui/widgets/message_input.dart) + [attachment_preview.dart](ui/widgets/attachment_preview.dart) + 无边框输入样式 [input_style.dart](ui/widgets/input_style.dart)）/ 右栏详情（[detail_panel.dart](ui/widgets/detail_panel.dart)）、PDF 预览、Spec、待办、提问、插件、MCP、模型信息、Git 历史、设置页 |
 | [ui/services/](ui/services/) | 重播守卫、下载中心、会话重命名、插件 UI 槽位注册、主题、**共享编辑缓冲（[editor_buffer.dart](ui/services/editor_buffer.dart)）**、**代码高亮（[code_highlight.dart](ui/services/code_highlight.dart)）**、**行号槽布局（[code_gutter_layout.dart](ui/services/code_gutter_layout.dart)：逐视觉行给号，软换行的续行留空）**、**编辑器偏好（[editor_settings.dart](ui/services/editor_settings.dart)）**、详情选中（[detail_selection.dart](ui/services/detail_selection.dart)）、**团队级模式与目录合成（[team_scope_view.dart](ui/services/team_scope_view.dart)）**、**工作空间相对路径纯函数与条目名校验（[workspace_paths.dart](ui/services/workspace_paths.dart)）** |
@@ -437,6 +437,20 @@
       **不猜**：记成"该 agent 上次浏览的会话"并重拉列表，由服务端列表决定选中谁）。
     - **未接定位回调或该行没有 agent id ⇒ 整行不可点**（`onTap == null`，不假装能跳）；
       目标 agent 已不存在 ⇒ 可读提示并**不动**当前上下文。
+24. **提问卡片支持一次问多道题：单问保持老行为，多问逐题作答后一次交齐**
+    （用户要求 2026-10-04：「ask_user_question 工具仅支持单个问题（改为支持多问题）」；
+    [ui/widgets/message_list.dart](ui/widgets/message_list.dart) 的 `_AskQuestionCard`、
+    [ui/widgets/question_panel.dart](ui/widgets/question_panel.dart)、
+    [ui/models/message.dart](ui/models/message.dart) 的 `ChatMessage.questions`/`answers`，
+    `test/ask_question_card_test.dart` 钉住）：
+    - **形状**：一条提问 = 一张卡片，`questions` ≥ 1（老核心只给 `question`/`options` ⇒ 前端按它们
+      合成一项）；作答回调 `onAskAnswer(id, List<String> answers)` 与 WS `user_answer` 的 `answers` 一一对应；
+    - **单问不回归**：点选项**立刻**作答、输入框回车/发送作答（与改动前逐字一致）；
+    - **多问**：每题各自"选项点选（可再点取消）/ 自由输入"（自由输入优先于点选），底部
+      「提交全部回答」一次回传，按钮旁如实标注「还有 N 题未作答」；**未答完也允许提交**，
+      未作答项传空串（核心显示为「未作答」），**不许替用户编答案**；
+    - **已作答**：卡片底部逐题列出答案（未答的写「（未作答）」），不再显示输入框；右栏「问题回复」页
+      同样逐题渲染与作答（`ApiService.answerQuestion(qid, answers)`）。
 
 ## 测试
 

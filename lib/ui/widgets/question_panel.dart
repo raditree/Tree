@@ -3,8 +3,12 @@ import 'package:flutter/material.dart';
 import '../../io/api_service.dart';
 import '../../io/question_update_service.dart';
 import '../models/agent.dart';
+import '../models/message.dart';
 
 /// 单条提问记录（右侧「问题回复」页数据模型）
+///
+/// **多问题**：一条记录 = 一次提问（一个 qid），里面有 N 道题
+/// （[questions] ≥ 1，单问是退化形态）；[answers] 是逐题答案。
 class _QuestionItem {
   final String qid;
   final String agentId;
@@ -13,6 +17,8 @@ class _QuestionItem {
   final bool isMember;
   final String question;
   final List<String> options;
+  final List<AskQuestionItem> questions;
+  final List<String> answers;
   final String answer;
   final String status;
   final int createdAt;
@@ -25,6 +31,8 @@ class _QuestionItem {
     required this.isMember,
     required this.question,
     required this.options,
+    required this.questions,
+    required this.answers,
     required this.answer,
     required this.status,
     required this.createdAt,
@@ -32,17 +40,49 @@ class _QuestionItem {
 
   bool get isPending => status == 'pending';
 
+  /// 是否一次问了多道题（界面据此决定"点选项即作答"还是"逐题作答后提交"）。
+  bool get isMulti => questions.length > 1;
+
+  static List<AskQuestionItem> _questionsFromJson(
+    Map<String, dynamic> json,
+    String question,
+    List<String> options,
+  ) {
+    final List<AskQuestionItem> parsed =
+        (json['questions'] as List<dynamic>?)
+            ?.whereType<Map<dynamic, dynamic>>()
+            .map(
+              (Map<dynamic, dynamic> item) => AskQuestionItem.fromJson(
+                item.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
+              ),
+            )
+            .toList() ??
+        const <AskQuestionItem>[];
+    // 老核心只有第一问：按 question / options 合成一项（与前端 ChatMessage 同口径）
+    if (parsed.isNotEmpty) return parsed;
+    return <AskQuestionItem>[AskQuestionItem(question: question, options: options)];
+  }
+
   factory _QuestionItem.fromJson(Map<String, dynamic> json) {
+    final String question = (json['question'] ?? '').toString();
+    final List<String> options =
+        (json['options'] as List<dynamic>? ?? const <dynamic>[])
+            .map((dynamic e) => e.toString())
+            .toList();
     return _QuestionItem(
       qid: (json['qid'] ?? '').toString(),
       agentId: (json['agent_id'] ?? '').toString(),
       teamId: (json['team_id'] ?? '').toString(),
       sessionId: (json['session_id'] ?? '').toString(),
       isMember: json['is_member'] == true,
-      question: (json['question'] ?? '').toString(),
-      options: (json['options'] as List<dynamic>? ?? const <dynamic>[])
-          .map((dynamic e) => e.toString())
-          .toList(),
+      question: question,
+      options: options,
+      questions: _questionsFromJson(json, question, options),
+      answers:
+          (json['answers'] as List<dynamic>?)
+              ?.map((dynamic e) => e.toString())
+              .toList() ??
+          const <String>[],
       answer: (json['answer'] ?? '').toString(),
       status: (json['status'] ?? 'pending').toString(),
       createdAt: int.tryParse(json['created_at']?.toString() ?? '0') ?? 0,
@@ -92,9 +132,12 @@ class _QuestionPanelState extends State<QuestionPanel> {
   /// agent id → 名称 映射（用于来源标签显示）
   Map<String, String> _agentNames = <String, String>{};
 
-  /// 每张待答卡片的输入框控制器（qid → controller）
+  /// 每张待答卡片**每题**的输入框控制器（键 = `qid#题号`，题号从 0 起）
   final Map<String, TextEditingController> _controllers =
       <String, TextEditingController>{};
+
+  /// 每题点选的选项（键 = `qid#题号`；自由输入**优先于**点选）
+  final Map<String, String> _picked = <String, String>{};
 
   /// 正在作答中的 qid 集合（防重复提交）
   final Set<String> _submitting = <String>{};
@@ -155,10 +198,21 @@ class _QuestionPanelState extends State<QuestionPanel> {
         _questions = items;
         _agentNames = names;
         _loading = false;
-        // 清理已不再展示待答输入框的控制器
+        // 清理已不再展示待答输入框的控制器（键是 `qid#题号`）
         final Set<String> pendingIds =
             items.where((i) => i.isPending).map((i) => i.qid).toSet();
-        _controllers.removeWhere((qid, _) => !pendingIds.contains(qid));
+        bool belongsToPending(String key) {
+          final int sep = key.indexOf('#');
+          return pendingIds.contains(sep < 0 ? key : key.substring(0, sep));
+        }
+        _controllers.removeWhere((String key, TextEditingController c) {
+          if (belongsToPending(key)) return false;
+          c.dispose();
+          return true;
+        });
+        _picked.removeWhere(
+          (String key, String _) => !belongsToPending(key),
+        );
       });
     } catch (e) {
       if (!mounted) return;
@@ -169,15 +223,20 @@ class _QuestionPanelState extends State<QuestionPanel> {
     }
   }
 
-  /// 提交回答：调 REST 接口，成功后本地置 answered 并通知全局刷新
-  Future<void> _submitAnswer(_QuestionItem item, String answer) async {
-    final String text = answer.trim();
-    if (text.isEmpty || _submitting.contains(item.qid)) return;
+  /// 提交回答：调 REST 接口（**逐题答案**），成功后本地置 answered 并通知全局刷新。
+  ///
+  /// 多问题：一次交齐（未作答的题传空串 ⇒ 核心记为「未作答」）。
+  Future<void> _submitAnswer(_QuestionItem item, List<String> answers) async {
+    if (_submitting.contains(item.qid)) return;
+    final List<String> normalized = <String>[
+      for (int i = 0; i < item.questions.length; i++)
+        i < answers.length ? answers[i].trim() : '',
+    ];
     setState(() {
       _submitting.add(item.qid);
     });
     try {
-      await ApiService.answerQuestion(item.qid, text);
+      await ApiService.answerQuestion(item.qid, normalized);
       if (!mounted) return;
       setState(() {
         final int idx =
@@ -191,7 +250,9 @@ class _QuestionPanelState extends State<QuestionPanel> {
             isMember: item.isMember,
             question: item.question,
             options: item.options,
-            answer: text,
+            questions: item.questions,
+            answers: normalized,
+            answer: _answersSummary(item, normalized),
             status: 'answered',
             createdAt: item.createdAt,
           );
@@ -212,6 +273,42 @@ class _QuestionPanelState extends State<QuestionPanel> {
       }
     }
   }
+
+  /// 本地展示用的答案摘要（核心也会算一份同口径的 `answer`；这里是为了提交后
+  /// **立刻**更新界面，不用等下一次列表刷新）。
+  String _answersSummary(_QuestionItem item, List<String> answers) {
+    if (!item.isMulti) return answers.isEmpty ? '' : answers.first;
+    return <String>[
+      for (int i = 0; i < item.questions.length; i++)
+        '第${i + 1}题：'
+            '${i < answers.length && answers[i].isNotEmpty ? answers[i] : '（未作答）'}',
+    ].join('\n');
+  }
+
+  /// 某题某个选项是否处于"选中/命中"（多问看点选，单问看已作答的答案）。
+  bool _isPicked(_QuestionItem item, int index, String option) {
+    if (!item.isMulti) {
+      return !item.isPending &&
+          index < item.answers.length &&
+          item.answers[index] == option;
+    }
+    return _picked['${item.qid}#$index'] == option;
+  }
+
+  /// 逐题收集答案（自由输入优先，其次点选的选项；都没有 = 空串）。
+  List<String> _collectAnswers(_QuestionItem item) {
+    final List<String> answers = <String>[];
+    for (int i = 0; i < item.questions.length; i++) {
+      final String typed = _controllerAt(item.qid, i).text.trim();
+      answers.add(
+        typed.isNotEmpty ? typed : (_picked['${item.qid}#$i'] ?? ''),
+      );
+    }
+    return answers;
+  }
+
+  TextEditingController _controllerAt(String qid, int index) =>
+      _controllers.putIfAbsent('$qid#$index', TextEditingController.new);
 
   /// 来源标签：成员提问加「成员」前缀，名称优先按 top_agent 映射
   String _sourceLabel(_QuestionItem item) {
@@ -341,40 +438,27 @@ class _QuestionPanelState extends State<QuestionPanel> {
               ],
             ),
             const SizedBox(height: 6),
-            // 提问文本
-            Text(
-              item.question.isEmpty ? '提问' : item.question,
-              style: TextStyle(fontSize: 13, color: cs.onSurface, height: 1.4),
-            ),
-            if (item.isPending) ...<Widget>[
-              if (item.options.isNotEmpty) ...<Widget>[
-                const SizedBox(height: 8),
-                for (final String option in item.options)
-                  Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 2),
-                    child: SizedBox(
-                      width: double.infinity,
-                      child: OutlinedButton(
-                        onPressed: _submitting.contains(item.qid)
-                            ? null
-                            : () => _submitAnswer(item, option),
-                        style: OutlinedButton.styleFrom(
-                          alignment: Alignment.centerLeft,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 6,
-                          ),
-                        ),
-                        child: Text(
-                          option,
-                          style: TextStyle(fontSize: 12, color: cs.onSurface),
-                        ),
-                      ),
-                    ),
+            for (int i = 0; i < item.questions.length; i++)
+              _buildQuestionBlock(context, item, i),
+            if (item.isPending && item.isMulti) ...<Widget>[
+              const SizedBox(height: 8),
+              Row(
+                children: <Widget>[
+                  FilledButton(
+                    onPressed: _submitting.contains(item.qid)
+                        ? null
+                        : () => _submitAnswer(item, _collectAnswers(item)),
+                    child: const Text('提交全部回答'),
                   ),
-              ],
-              const SizedBox(height: 6),
-              _buildAnswerInput(item),
+                  const SizedBox(width: 10),
+                  Text(
+                    _unansweredCount(item) == 0
+                        ? '已全部作答'
+                        : '还有 ${_unansweredCount(item)} 题未作答',
+                    style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                  ),
+                ],
+              ),
             ] else if (item.status == 'answered')
               Padding(
                 padding: const EdgeInsets.only(top: 6),
@@ -427,9 +511,96 @@ class _QuestionPanelState extends State<QuestionPanel> {
     );
   }
 
-  Widget _buildAnswerInput(_QuestionItem item) {
-    final TextEditingController controller =
-        _controllers.putIfAbsent(item.qid, TextEditingController.new);
+  /// 一道题：题面 + 选项 + 自由输入。
+  ///
+  /// 单问：点选项立刻作答（老行为）；多问：点选项为"选中"，逐题作答后由卡片
+  /// 底部的「提交全部回答」统一提交。
+  Widget _buildQuestionBlock(
+    BuildContext context,
+    _QuestionItem item,
+    int index,
+  ) {
+    final cs = Theme.of(context).colorScheme;
+    final AskQuestionItem question = item.questions[index];
+    final bool busy = _submitting.contains(item.qid);
+    final bool enabled = item.isPending && !busy;
+    return Padding(
+      padding: EdgeInsets.only(top: index == 0 ? 0 : 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text(
+            item.isMulti
+                ? '${index + 1}. ${question.question}'
+                : (question.question.isEmpty ? '提问' : question.question),
+            style: TextStyle(fontSize: 13, color: cs.onSurface, height: 1.4),
+          ),
+          if (item.isPending && question.options.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 6),
+            for (final String option in question.options)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 2),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton(
+                    onPressed: enabled
+                        ? () {
+                            if (!item.isMulti) {
+                              // 单问：点选项立刻作答（老行为）
+                              _submitAnswer(item, <String>[option]);
+                              return;
+                            }
+                            setState(() {
+                              final String key = '${item.qid}#$index';
+                              if (_picked[key] == option) {
+                                _picked.remove(key);
+                              } else {
+                                _picked[key] = option;
+                              }
+                            });
+                          }
+                        : null,
+                    style: OutlinedButton.styleFrom(
+                      alignment: Alignment.centerLeft,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                    ),
+                    child: Row(
+                      children: <Widget>[
+                        Icon(
+                          _isPicked(item, index, option)
+                              ? Icons.check_circle_outline
+                              : Icons.radio_button_unchecked,
+                          size: 14,
+                          color: cs.onSurfaceVariant,
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            option,
+                            style: TextStyle(fontSize: 12, color: cs.onSurface),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+          ],
+          if (item.isPending) ...<Widget>[
+            const SizedBox(height: 6),
+            _buildAnswerInput(item, index),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// 某题的输入框（单问带发送键；多问由卡片底部的「提交全部回答」统一提交）。
+  Widget _buildAnswerInput(_QuestionItem item, int index) {
+    final TextEditingController controller = _controllerAt(item.qid, index);
     final bool busy = _submitting.contains(item.qid);
     return Row(
       crossAxisAlignment: CrossAxisAlignment.end,
@@ -440,27 +611,45 @@ class _QuestionPanelState extends State<QuestionPanel> {
             enabled: !busy,
             maxLines: 2,
             minLines: 1,
-            onSubmitted: (_) => _submitAnswer(item, controller.text),
-            decoration: const InputDecoration(
-              hintText: '或直接输入回答…',
+            onChanged: (_) => setState(() {}),
+            onSubmitted: (_) => item.isMulti
+                ? _submitAnswer(item, _collectAnswers(item))
+                : _submitSingle(item, index),
+            decoration: InputDecoration(
+              hintText: item.isMulti
+                  ? '或直接输入第 ${index + 1} 题的答案…'
+                  : '或直接输入回答…',
               isDense: true,
-              border: OutlineInputBorder(),
+              border: const OutlineInputBorder(),
             ),
           ),
         ),
-        const SizedBox(width: 6),
-        IconButton(
-          onPressed: busy ? null : () => _submitAnswer(item, controller.text),
-          icon: busy
-              ? const SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-              : const Icon(Icons.send, size: 18),
-          tooltip: '发送',
-        ),
+        if (!item.isMulti) ...<Widget>[
+          const SizedBox(width: 6),
+          IconButton(
+            onPressed: busy ? null : () => _submitSingle(item, index),
+            icon: busy
+                ? const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.send, size: 18),
+            tooltip: '发送',
+          ),
+        ],
       ],
     );
   }
+
+  /// 单问：把某题输入框里的内容作为答案提交（空输入不提交）。
+  void _submitSingle(_QuestionItem item, int index) {
+    final String text = _controllerAt(item.qid, index).text.trim();
+    if (text.isEmpty) return;
+    _submitAnswer(item, <String>[text]);
+  }
+
+  /// 多问还有几题没答（底部提交按钮旁的提示）。
+  int _unansweredCount(_QuestionItem item) =>
+      _collectAnswers(item).where((String a) => a.isEmpty).length;
 }

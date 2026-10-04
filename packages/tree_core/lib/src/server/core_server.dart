@@ -38,6 +38,7 @@ import '../team/team_model.dart';
 import '../team/team_repair.dart';
 import '../team/team_service.dart';
 import '../team/team_workspace.dart';
+import '../tool/question_channel.dart';
 import '../tool/terminal_hooks.dart';
 import '../tool/llm_request_guard.dart';
 import '../tool/todo_store.dart';
@@ -2436,7 +2437,8 @@ class CoreServer {
   /// 消息的前端形态：提问卡片额外叠加提问记录里的状态与答案。
   ///
   /// 消息日志是**只追加**的，`answered` 落盘后永远是 false；真源在提问记录里，
-  /// 因此历史加载时按 `qid == message.id` 覆盖。
+  /// 因此历史加载时按 `qid == message.id` 覆盖。多问题：`questions` / `answers`
+  /// 一并叠加（老键 `question` / `options` / `answer` 保留，老前端零影响）。
   Map<String, dynamic> _messageJson(CoreMessage message) {
     final Map<String, dynamic> json = message.toJson();
     if (message.kind != 'ask_user_question') return json;
@@ -2444,6 +2446,10 @@ class CoreServer {
     if (record == null) return json;
     json['answered'] = !record.isPending;
     json['answer'] = record.answer;
+    json['questions'] = record.questions
+        .map((AskedQuestion q) => q.toJson())
+        .toList();
+    json['answers'] = record.answers;
     if (record.options.isNotEmpty) json['options'] = record.options;
     return json;
   }
@@ -2638,7 +2644,11 @@ class CoreServer {
     }
     final String qid = params['qid'] ?? '';
     final Map<String, dynamic> body = await readJsonBody(request);
-    final String answer = (body['answer'] ?? '').toString();
+    // 多问题：`answers`（逐题数组）优先；老前端只回 `answer`（单值 = 第一问）
+    final Object? rawAnswers = body['answers'];
+    final List<String> answers = rawAnswers is List
+        ? rawAnswers.map((dynamic e) => e?.toString() ?? '').toList()
+        : <String>[(body['answer'] ?? '').toString()];
     final QuestionRecord? record = broker.questions.byId(qid);
     if (record == null) {
       await writeJson(request, 404, errorBody('没有等待回答的问题'));
@@ -2649,7 +2659,7 @@ class CoreServer {
       return;
     }
     // 幂等：并发（WS + REST 同时作答）时只有第一次生效
-    if (!broker.answer(qid, answer)) {
+    if (!broker.answer(qid, answers)) {
       await writeJson(request, 400, errorBody('没有等待回答的问题'));
       return;
     }
@@ -2657,6 +2667,7 @@ class CoreServer {
       'success': true,
       'qid': qid,
       'status': QuestionStatus.answered,
+      'answers': record.answers,
     });
   }
 

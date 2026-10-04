@@ -19,6 +19,20 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **`ask_user_question` 一次可以问多道题（单问行为逐字不变）**（新增
+  [agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 8.1、
+  [tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 10、
+  [lib/README.md](lib/README.md) 不变量 24，**用户要求 2026-10-04**：
+  「ask_user_question 工具仅支持单个问题（改为支持多问题）」）：
+  工具 schema 收 `questions:[{question, options}]`（1~10 道，`question`/`options` 是"只有一道题"的简写），
+  超上限 / 题面为空 / 选项项不是对象 / 两者都缺 ⇒ **一律可读错误**；一次调用仍是**一条记录 / 一个 qid /
+  一张卡片 / 一个在途等待**（`QuestionRecord.questions` ≥ 1），作答改收**逐题答案** `List<String>`
+  （缺项按「未作答」落库与回传，`question_channel.dart` 的 `normalizeAnswers` / `formatAnswerLines` /
+  `prefixFirstQuestion` 是唯一实现）——**单问的工具结果仍是 `用户回答：B`**（模型侧口径不变）；
+  **作答兼容单值**：WS `user_answer` / REST `POST /api/questions/{qid}/answer` 同时接受 `answers`（数组）与
+  `answer`（单值 = 第一问，其余如实「未作答」），老前端因此点了有反应而不是静默丢答案；
+  **装载旧数据只读不改**：老 `data/questions.json` 记录（无 `questions` 键）按 `question`/`options` 合成单问，
+  不追改用户数据；三件事的不变量（先落盘再推帧 / 作答幂等 / 取消能打断 / `createdAt` 严格递增）一个字没改。
 - **`terminal` 的 `hook=true` 在本机与远端（SSH）是同一套语义，且远端任务跨重启接续**（新增
   [tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 16、
   [tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 8，**用户要求 2026-10-04**：

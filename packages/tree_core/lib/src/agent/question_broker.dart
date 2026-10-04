@@ -33,6 +33,10 @@ class _InFlight {
 ///    可能同时到达（中栏点选 + 右栏提交），只有第一次生效；
 /// 3. **取消能打断等待**：`stop` 会取消该 agent 的全部在途提问，工具立刻拿到
 ///    `cancelled` 结果，工具循环因此能收敛而不是永远挂着。
+///
+/// **多问题口径**（用户 2026-10-04）：一次 `ask` = 一条记录 / 一张卡片 / 一个在途等待，
+/// 里面可以有 N 道题；作答是**逐题一次交齐**（[answer] 收 `List<String>`），
+/// 缺项按"未作答"落库。等待与取消的口径一个字没变（仍然是一个 Completer）。
 class QuestionBroker {
   QuestionBroker({
     required this.questions,
@@ -84,8 +88,8 @@ class QuestionBroker {
         teamId: request.teamId,
         sessionId: request.sessionId,
         isMember: request.isMember,
-        question: request.question,
-        options: request.options,
+        // 一次提问 = 一条记录（一个 qid / 一张卡片），里面可以有 N 道题
+        questions: request.questions,
         createdAt: now,
       ),
     );
@@ -104,6 +108,10 @@ class QuestionBroker {
         timestamp: now,
         kind: 'ask_user_question',
         options: request.options,
+        // 卡片消息自带完整问题表（记录仍是作答状态与答案的真源）
+        questions: request.questions
+            .map((AskedQuestion q) => q.toJson())
+            .toList(),
         subagentId: request.subagentId,
         subagentName: request.subagentName,
         subagentParentId: request.subagentParentId,
@@ -116,6 +124,11 @@ class QuestionBroker {
     broadcast(<String, dynamic>{
       'type': WsOutboundType.askUserQuestion,
       'id': qid,
+      // 多问题：完整的问题表（新前端按它逐题渲染、逐题作答）
+      'questions': request.questions
+          .map((AskedQuestion q) => q.toJson())
+          .toList(),
+      // 兼容（老前端只认第一问）：`question` / `options` 是第一问的简写形态
       'question': request.question,
       'options': request.options,
       'agent_id': request.agentId,
@@ -139,7 +152,7 @@ class QuestionBroker {
     if (limit != null) {
       flight.timeout = Timer(limit, () {
         log?.call('提问 $qid 超时（${limit.inSeconds}s）');
-        _finish(qid, const QuestionOutcome(answer: '', cancelled: true));
+        _finish(qid, const QuestionOutcome(cancelled: true));
         questions.markCancelled(qid);
         _broadcastResolved(qid, cancelled: true);
       });
@@ -149,25 +162,31 @@ class QuestionBroker {
 
   /// 作答：只有仍处于 `pending` 的提问会被接受（幂等）。
   ///
+  /// [answers] 是**逐题**答案（与记录里的 `questions` 等长；缺项按未作答）。
   /// 返回是否真的改变了状态——调用方据此决定"重复作答"要不要提示。
-  bool answer(String qid, String answer) {
-    final QuestionRecord? record = questions.markAnswered(qid, answer);
+  bool answer(String qid, List<String> answers) {
+    final QuestionRecord? record = questions.markAnswered(qid, answers);
     if (record == null) return false;
+    // 落库那份已归一（等长、未作答项 = 空串）⇒ 后续一律用它，别拿原始入参
+    final List<String> normalized = List<String>.of(record.answers);
+    final String text = formatAnswerLines(record.questions, normalized);
     log?.call('提问 $qid 已作答');
     final bool inFlight = _inFlight.containsKey(qid);
-    _broadcastResolved(qid, answer: answer);
-    _finish(qid, QuestionOutcome(answer: answer));
+    _broadcastResolved(qid, answer: text, answers: normalized);
+    _finish(qid, QuestionOutcome(answers: normalized));
     if (!inFlight) {
       // 重启后的补答（或恢复历史卡片后作答）：没有在途生成可唤醒，就把答案按
       // 参考实现的 [AskUserQuestion 用户回答] 形态写进会话——下一轮生成读到它
-      // 就相当于"续跑"，用户不必重述。
+      // 就相当于"续跑"，用户不必重述。多问题时逐题成行。
       transcript.appendMessage(
         CoreMessage(
           id: CoreIds.message(),
           agentId: record.agentId,
           sessionId: record.sessionId,
           role: 'user',
-          content: '$answerPrefix$answer',
+          content: record.isMulti
+              ? '$answerPrefix\n$text'
+              : '$answerPrefix$text',
           timestamp: DateTime.now().millisecondsSinceEpoch,
         ),
       );
@@ -187,7 +206,7 @@ class QuestionBroker {
     final QuestionRecord? record = questions.markCancelled(qid);
     final bool settled = _finish(
       qid,
-      const QuestionOutcome(answer: '', cancelled: true),
+      const QuestionOutcome(cancelled: true),
     );
     if (record == null) {
       // 记录已不在：state 没变，但**在途等待被收尾**同样是有效结果（返回 true）
@@ -228,22 +247,26 @@ class QuestionBroker {
   /// 关停：取消全部在途等待（进程要退出，不能让生成任务挂着）。
   void dispose() {
     for (final String qid in _inFlight.keys.toList(growable: false)) {
-      _finish(qid, const QuestionOutcome(answer: '', cancelled: true));
+      _finish(qid, const QuestionOutcome(cancelled: true));
     }
   }
 
   void _broadcastResolved(
     String qid, {
     String answer = '',
+    List<String>? answers,
     bool cancelled = false,
   }) {
+    final Map<String, dynamic> data = <String, dynamic>{
+      'id': qid,
+      'answer': answer,
+      'cancelled': cancelled,
+    };
+    // 多问题：逐题答案（老前端忽略这个键，只看 answer）
+    if (answers != null) data['answers'] = answers;
     broadcast(<String, dynamic>{
       'type': WsOutboundType.askUserQuestionResolved,
-      'data': <String, dynamic>{
-        'id': qid,
-        'answer': answer,
-        'cancelled': cancelled,
-      },
+      'data': data,
     });
   }
 

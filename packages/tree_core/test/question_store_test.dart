@@ -72,14 +72,49 @@ void main() {
 
       test('作答只对 pending 生效，且第二次作答不再改变状态', () {
         store.add(record());
-        final QuestionRecord? first = store.markAnswered('q_1', 'A');
+        final QuestionRecord? first = store.markAnswered('q_1', <String>['A']);
         expect(first?.status, QuestionStatus.answered);
         expect(first?.answer, 'A');
+        expect(first?.answers, <String>['A']);
         expect(first?.answeredAt, greaterThan(0));
         expect(first?.isPending, isFalse);
-        expect(store.markAnswered('q_1', 'B'), isNull, reason: '幂等闸门');
+        expect(store.markAnswered('q_1', <String>['B']), isNull, reason: '幂等闸门');
         expect(store.byId('q_1')?.answer, 'A');
-        expect(store.markAnswered('nope', 'A'), isNull);
+        expect(store.markAnswered('nope', <String>['A']), isNull);
+      });
+
+      test('多问题：questions/answers 往返，缺项按「未作答」，兼容读法指第一问', () {
+        store.add(
+          QuestionRecord(
+            qid: 'q_m',
+            agentId: 'agt_1',
+            sessionId: 'ses_1',
+            questions: <AskedQuestion>[
+              AskedQuestion(question: '第一问', options: <String>['A', 'B']),
+              AskedQuestion(question: '第二问'),
+            ],
+            createdAt: 1000,
+          ),
+        );
+        final QuestionRecord? pending = store.byId('q_m');
+        expect(pending?.questions.length, 2);
+        expect(pending?.isMulti, isTrue);
+        expect(pending?.question, '第一问', reason: '兼容读法 = 第一问的题面');
+        expect(pending?.options, <String>['A', 'B'], reason: '兼容读法 = 第一问的选项');
+        expect(pending?.answers, <String>['', ''], reason: '逐题答案，未作答为空串');
+
+        final QuestionRecord? answered = store.markAnswered(
+          'q_m',
+          <String>['是'],
+        );
+        expect(answered?.status, QuestionStatus.answered);
+        expect(
+          answered?.answers,
+          <String>['是', ''],
+          reason: '缺项按未作答补齐（老前端只回一个答案也走这条）',
+        );
+        expect(answered?.answer, contains('第1题（第一问）：是'));
+        expect(answered?.answer, contains('（未作答）'), reason: '多问摘要逐题成行');
       });
 
       test('取消只对 pending 生效，且清空答案语义正确', () {
@@ -94,7 +129,7 @@ void main() {
         store.add(record(qid: 'q_1', agentId: 'agt_1', sessionId: 'ses_1'));
         store.add(record(qid: 'q_2', agentId: 'agt_1', sessionId: 'ses_2'));
         store.add(record(qid: 'q_3', agentId: 'agt_2', sessionId: 'ses_1'));
-        store.markAnswered('q_3', 'x');
+        store.markAnswered('q_3', <String>['x']);
         expect(store.list(agentId: 'agt_1').length, 2);
         expect(store.list(sessionId: 'ses_1').length, 2);
         expect(
@@ -143,6 +178,14 @@ void main() {
         expect(json['status'], 'answered');
         expect(json['created_at'], 1000);
         expect(json['answered_at'], 2000);
+        // 多问题字段（老前端忽略，只看上面那组）
+        expect(json['questions'], <Map<String, dynamic>>[
+          <String, dynamic>{
+            'question': '选哪个？',
+            'options': <String>['A', 'B'],
+          },
+        ]);
+        expect(json['answers'], <String>['B']);
       });
     });
   }
@@ -168,7 +211,7 @@ void main() {
         createdAt: 20,
       ),
     );
-    first.markAnswered('q_1', '是');
+    first.markAnswered('q_1', <String>['是']);
     await first.flush();
     expect(first.lastError, isNull);
 
@@ -176,8 +219,36 @@ void main() {
     expect(second.list().length, 2);
     expect(second.byId('q_1')?.status, QuestionStatus.answered);
     expect(second.byId('q_1')?.answer, '是');
+    expect(second.byId('q_1')?.answers, <String>['是']);
     expect(second.byId('q_1')?.options, <String>['是', '否']);
+    expect(second.byId('q_1')?.questions.single.question, '继续吗？');
     expect(second.byId('q_2')?.isPending, isTrue);
+  });
+
+  test('FileQuestionStore：多问题记录往返（questions 与 answers 都落盘）', () async {
+    final FileQuestionStore first = FileQuestionStore(TreePaths(temp.path));
+    first.add(
+      QuestionRecord(
+        qid: 'q_multi',
+        agentId: 'agt_1',
+        sessionId: 'ses_1',
+        questions: <AskedQuestion>[
+          AskedQuestion(question: '部署到哪台？', options: <String>['A 机', 'B 机']),
+          AskedQuestion(question: '要不要回滚预案？'),
+        ],
+        createdAt: 10,
+      ),
+    );
+    first.markAnswered('q_multi', <String>['B 机', '要']);
+    await first.flush();
+
+    final FileQuestionStore second = FileQuestionStore(TreePaths(temp.path));
+    final QuestionRecord? record = second.byId('q_multi');
+    expect(record?.isMulti, isTrue);
+    expect(record?.questions.length, 2);
+    expect(record?.questions[0].options, <String>['A 机', 'B 机']);
+    expect(record?.answers, <String>['B 机', '要']);
+    expect(record?.answer, contains('第2题'));
   });
 
   test('FileQuestionStore：旧文件里同毫秒的两条原样读入（不追改用户数据）', () async {
@@ -212,6 +283,46 @@ void main() {
       <int>[500, 500],
       reason: '时间戳是用户数据的真实时刻：装载只读不改（旧平局不去追改）',
     );
+    expect(
+      store.byId('q_a')?.questions.single.question,
+      '第一条',
+      reason: '旧记录没有 questions 键 ⇒ 由 question/options 合成单问',
+    );
+    expect(store.byId('q_a')?.isMulti, isFalse);
+    expect(store.byId('q_a')?.answers, <String>[''], reason: '未作答：逐题答案为空串');
+  });
+
+  test('FileQuestionStore：旧文件里"已作答"的单问记录合成出 answers（不追改文件）', () async {
+    final TreePaths paths = TreePaths(temp.path);
+    File(paths.questionsFile)
+      ..createSync(recursive: true)
+      ..writeAsStringSync(
+        jsonEncode(<Map<String, dynamic>>[
+          <String, dynamic>{
+            'qid': 'q_old',
+            'agent_id': 'agt_1',
+            'team_id': '',
+            'session_id': 'ses_1',
+            'is_member': false,
+            'question': '继续吗？',
+            'options': <String>['是', '否'],
+            'answer': '是',
+            'status': QuestionStatus.answered,
+            'created_at': 100,
+            'answered_at': 200,
+          },
+        ]),
+      );
+    final FileQuestionStore store = FileQuestionStore(paths);
+    final QuestionRecord? record = store.byId('q_old');
+    expect(record?.status, QuestionStatus.answered);
+    expect(record?.answer, '是', reason: '旧键原样保留');
+    expect(record?.answers, <String>['是'], reason: '单个 answer 归一成第一问的答案');
+    expect(record?.questions.single.question, '继续吗？');
+    // 装载只读不改：文件内容一个字节都没动
+    final String text = File(paths.questionsFile).readAsStringSync();
+    expect(jsonDecode(text), isA<List<dynamic>>());
+    expect(text.contains('"questions"'), isFalse, reason: '装载不写回（不追改用户数据）');
   });
 
   test('FileQuestionStore：文件被手改坏时不阻止启动（按空表处理）', () async {

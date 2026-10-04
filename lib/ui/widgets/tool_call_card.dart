@@ -226,8 +226,20 @@ String toolLineValue(ChatMessage m) {
       if (task.isEmpty) return head;
       return head.isEmpty ? task : '$head · $task';
     }
-    case 'ask_user_question':
+    case 'ask_user_question': {
+      // 多问题：行里给"共 N 题 + 第一问题面"，一眼看得出这次问了一串
+      final List<dynamic>? questions = args['questions'] as List<dynamic>?;
+      String textOf(dynamic item) => item is Map
+          ? (item['question'] ?? '').toString()
+          : (item?.toString() ?? '');
+      if (questions != null && questions.length > 1) {
+        return '共 ${questions.length} 题：${textOf(questions.first)}';
+      }
+      if (questions != null && questions.length == 1) {
+        return textOf(questions.first);
+      }
       return arg('question');
+    }
     case 'embed_search':
       return arg('query');
     default:
@@ -689,7 +701,40 @@ class _ToolDetailState extends State<ToolDetail> {
           rows.add(_paramRow(context, e.key, _truncate(e.value.toString(), 400)));
         }
         return rows;
-      case 'ask_user_question':
+      case 'ask_user_question': {
+        // 多问题：逐题列出题面与该题的选项
+        final List<dynamic>? questions = args['questions'] as List<dynamic>?;
+        if (questions != null && questions.isNotEmpty) {
+          final List<Widget> rows = <Widget>[];
+          for (int i = 0; i < questions.length; i++) {
+            final dynamic item = questions[i];
+            final Map<String, dynamic> map = item is Map
+                ? item.map(
+                    (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+                  )
+                : <String, dynamic>{};
+            final String text =
+                (map['question'] ?? item?.toString() ?? '').toString();
+            rows.add(
+              _paramRow(
+                context,
+                questions.length > 1 ? '问题 ${i + 1}' : '问题',
+                text,
+              ),
+            );
+            final List<dynamic>? options = map['options'] as List<dynamic>?;
+            if (options != null && options.isNotEmpty) {
+              rows.add(
+                _paramRow(
+                  context,
+                  questions.length > 1 ? '选项 ${i + 1}' : '选项',
+                  options.join(' / '),
+                ),
+              );
+            }
+          }
+          return rows;
+        }
         final List<Widget> rows = <Widget>[
           _paramRow(context, '问题', arg('question')),
         ];
@@ -698,6 +743,7 @@ class _ToolDetailState extends State<ToolDetail> {
           rows.add(_paramRow(context, '选项', options.join(' / ')));
         }
         return rows;
+      }
       case 'embed_search':
         return <Widget>[_paramRow(context, '查询', arg('query'))];
       default:

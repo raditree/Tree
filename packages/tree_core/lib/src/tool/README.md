@@ -8,7 +8,7 @@
 | --- | --- |
 | [tool_runner.dart](tool_runner.dart) | 工具契约（`ToolSpec` / `ToolInvocation` / `ToolOutcome`）与 `EmptyToolRunner` |
 | [workspace_tool_runner.dart](workspace_tool_runner.dart) | 工作空间执行器：IO 解析与缓存、内置 + MCP + 插件工具分派、结果（默认不）截断 |
-| [builtin_tools.dart](builtin_tools.dart) | 内置工具集：read / write / edit / grep / terminal / set_todo_list / ask_user_question（+ `with*` 开关下的团队与 Spec 工具） |
+| [builtin_tools.dart](builtin_tools.dart) | 内置工具集：read / write / edit / grep / terminal / set_todo_list / ask_user_question（**一次可问多道题**：`questions:[{question,options}]`，`question` 是单问简写；+ `with*` 开关下的团队与 Spec 工具） |
 | [message_tool.dart](message_tool.dart) | 团队通信域：`send_message` / `broadcast` / `wait_for` |
 | [team_tool.dart](team_tool.dart) | 团队管理域：建队、成员名单与档案、审核状态 |
 | [spec_tool.dart](spec_tool.dart) | 任务型规范：`select` / `create` / `update` |
@@ -55,7 +55,16 @@
      `crossCall: true` ⇒ 跨工具调用存活），用户点关闭 = 取消该 hook（本机真杀进程树；远端尽力 `kill`，
      拿不到 pid 时**如实**回原因）。**不做**"两个新站点 + leader 可杀"（用户暂缓）。
 9. 待办落盘是 markdown 勾选清单，**正文放在最后**（正文里出现任何符号都不破坏解析）；`status=` 是**权威值**，勾选框只同步人类可读性；缺元数据的行也能读出来（id 自动生成、状态按勾选框推断）。
-10. 提问通道是**具名契约**：工具层不反向依赖编排层（依赖方向 `tool` ← `agent`）。
+10. 提问通道是**具名契约**：工具层不反向依赖编排层（依赖方向 `tool` ← `agent`）。**多问题口径**
+    （用户要求 2026-10-04：「ask_user_question 工具仅支持单个问题（改为支持多问题）」）：
+    - 工具 schema 收 `questions`（数组，每项 `{question, options}`，**1~`BuiltinTools.maxQuestionsPerCall`(10) 道**）
+      与单问简写 `question`/`options`（数组优先）；都缺 / 题面为空 / 选项项不是对象 / 超过上限
+      ⇒ **一律可读错误**（不静默截断、不假装问过）；
+    - 形状与排版只有一份实现：`question_channel.dart` 的 `AskedQuestion`（形状）、
+      `normalizeAnswers`（答案归一成与题数等长、缺项未作答）、`formatAnswerLines`（**单问输出与
+      "只支持单问题"时期逐字一致** `用户回答：B`；多问逐题成行、未答写 `（未作答）`）、
+      `prefixFirstQuestion`（来源标记只加第一问，别在别处再写一套）；
+    - 结果交给模型前不做任何"猜"：未答项如实标注，模型据此决定追问或按假设继续。
 11. **`subagent` 与其它工具同权、同三站**（用户硬断言，不给它开后门）：
     - **执行站**：`subagent` 一律经 `WorkspaceToolRunner._execute` → `BuiltinTools.run` 分派——和 `edit` / `write` / `team` 同一个入口。执行站命令 `tool.call`（`runFromPlugin`）因此能以 `tool: 'subagent'` 跑起来，权限口径与模型调用完全一致（**没有**特例白名单、**没有**特例拦截）；`origin` / `source_plugin_id` / `relay:false 默认绕开站点` 这些语义与普通工具逐字一致。
     - **中转站**：`system.relay.tool.pre` / `.post` 对 `subagent` 照常生效——pre 改写的 `task` / `name` **真正生效**（子 agent 拿到的就是改写后的那份），post 可改结果文本。

@@ -49,6 +49,13 @@ abstract final class BuiltinTools {
   static const String setTodoList = 'set_todo_list';
   static const String askUserQuestion = 'ask_user_question';
 
+  /// 一次提问最多允许的题数。
+  ///
+  /// 取值权衡：多问题的目的是"把待确认的事一次问完"，不是把整轮澄清塞成一张巨卡
+  /// （卡片在聊天流里会占掉整屏，用户也很难逐题认真答）。超出给**可读错误**，
+  /// 让模型自己拆成多轮。
+  static const int maxQuestionsPerCall = 10;
+
   /// 工具声明（顺序稳定：便于提示词缓存与测试断言）。
   ///
   /// [withTodos] 为 true 时才声明 `set_todo_list`：声明了但没接存储会让模型白调
@@ -119,21 +126,44 @@ abstract final class BuiltinTools {
         description:
             '向用户提问并**等待**用户回答（本轮生成会暂停直到作答）。'
             '只在"必须由用户决定/补充信息"时使用；能从工作空间自己查到的不要问。'
-            '一次只问一件事；options 给出候选答案，用户也可以自由输入。',
+            'questions 可以一次问多道（每题各自给 options 候选答案，用户也可以自由输入），'
+            '把待确认的事一次问完，别挤牙膏式地反复打断用户；'
+            '只有一道题时可用 question/options 简写。'
+            '**问题要各自独立**（用户逐题作答后一次性提交）：别把多个决定塞进一道题里。',
         parameters: <String, dynamic>{
           'type': 'object',
           'properties': <String, dynamic>{
+            'questions': <String, dynamic>{
+              'type': 'array',
+              'description':
+                  '要问的问题（1~$maxQuestionsPerCall 道；一次问完，用户逐题作答后一次性提交）',
+              'items': <String, dynamic>{
+                'type': 'object',
+                'properties': <String, dynamic>{
+                  'question': <String, dynamic>{
+                    'type': 'string',
+                    'description': '这道题的题面',
+                  },
+                  'options': <String, dynamic>{
+                    'type': 'array',
+                    'items': <String, dynamic>{'type': 'string'},
+                    'description': '这道题的候选选项（可空；前端渲染为可点选按钮）',
+                  },
+                },
+                'required': <String>['question'],
+              },
+            },
             'question': <String, dynamic>{
               'type': 'string',
-              'description': '要问用户的问题（一次只问一件事）',
+              'description': '只有一道题时的简写（与 questions 二选一）',
             },
             'options': <String, dynamic>{
               'type': 'array',
               'items': <String, dynamic>{'type': 'string'},
-              'description': '候选选项（可空；前端渲染为可点选按钮）',
+              'description': '简写形态的候选选项（可空；前端渲染为可点选按钮）',
             },
           },
-          'required': <String>['question'],
+          'required': <String>[],
         },
       ),
     ToolSpec(
@@ -430,6 +460,13 @@ abstract final class BuiltinTools {
 
   /// `ask_user_question`：把问题交给 [AskQuestion] 通道并等待作答。
   ///
+  /// **多问题**（用户 2026-10-04）：`questions` 是数组（一次问 N 道），
+  /// `question` / `options` 是"只有一道题"的简写。两者都缺 = 可读错误；
+  /// 超过 [maxQuestionsPerCall] 道也给可读错误（让模型自己拆轮）。
+  ///
+  /// 结果文案由 [formatAnswerLines] 排版：**单问与"只支持单问题"时期逐字一致**
+  /// （`用户回答：B`），多问逐题成行（未作答写 `（未作答）`）。
+  ///
   /// 取消时给出的文案刻意包含"不要重复提问"：模型收到空答案时最自然的错误反应
   /// 就是再问一遍，那会让用户陷入"停止不了"的循环。
   static Future<ToolOutcome> _askUserQuestion(
@@ -440,24 +477,62 @@ abstract final class BuiltinTools {
     if (askQuestion == null) {
       return const ToolOutcome('提问通道未接入：无法使用该工具', isError: true);
     }
-    final String question = _string(invocation, 'question').trim();
-    if (question.isEmpty) {
-      return const ToolOutcome('question 不能为空', isError: true);
-    }
-    final List<String> options = <String>[];
-    final Object? raw = invocation.arguments['options'];
-    if (raw is List<dynamic>) {
-      for (final dynamic item in raw) {
-        final String text = item?.toString().trim() ?? '';
-        if (text.isNotEmpty && !options.contains(text)) options.add(text);
+    final Object? rawQuestions = invocation.arguments['questions'];
+    final List<AskedQuestion> questions = <AskedQuestion>[];
+    if (rawQuestions is List<dynamic>) {
+      for (final dynamic item in rawQuestions) {
+        if (item is! Map) {
+          return const ToolOutcome(
+            'questions 的每一项都必须是 {question, options} 对象',
+            isError: true,
+          );
+        }
+        final Map<String, dynamic> map = item.map(
+          (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+        );
+        final String text = (map['question'] ?? '').toString().trim();
+        if (text.isEmpty) {
+          return const ToolOutcome(
+            'question 不能为空：questions 里每一道题的题面都要写清楚',
+            isError: true,
+          );
+        }
+        questions.add(
+          AskedQuestion(question: text, options: _cleanOptions(map['options'])),
+        );
       }
+    }
+    if (questions.isEmpty) {
+      // 单问简写（多问题之前的老口径，逐字保留）
+      final String single = _string(invocation, 'question').trim();
+      if (single.isNotEmpty) {
+        questions.add(
+          AskedQuestion(
+            question: single,
+            options: _cleanOptions(invocation.arguments['options']),
+          ),
+        );
+      }
+    }
+    if (questions.isEmpty) {
+      return const ToolOutcome(
+        'question 不能为空：给 questions 数组（可一次问多道），'
+        '或用 question/options 简写问一道题',
+        isError: true,
+      );
+    }
+    if (questions.length > maxQuestionsPerCall) {
+      return ToolOutcome(
+        '一次最多问 $maxQuestionsPerCall 道题（本次 ${questions.length} 道）：'
+        '请拆成多次调用，或先问最关键的几道',
+        isError: true,
+      );
     }
     final QuestionOutcome outcome = await askQuestion(
       AskQuestionRequest(
         agentId: invocation.agentId,
         sessionId: invocation.sessionId,
-        question: question,
-        options: options,
+        questions: questions,
         isCancelled: isCancelled ?? () => false,
       ),
     );
@@ -467,7 +542,24 @@ abstract final class BuiltinTools {
         '改为说明你的假设并继续，或等待用户主动发起。',
       );
     }
-    return ToolOutcome('用户回答：${outcome.answer}');
+    final String text = formatAnswerLines(questions, outcome.answers);
+    return ToolOutcome(
+      questions.length <= 1 ? '用户回答：$text' : '用户回答：\n$text',
+    );
+  }
+
+  /// 候选选项清洗：去空白、去空串、去重，保持模型给的顺序。
+  ///
+  /// 单问与多问共用同一套（别在别处再写一遍）。
+  static List<String> _cleanOptions(Object? raw) {
+    final List<String> options = <String>[];
+    if (raw is List<dynamic>) {
+      for (final dynamic item in raw) {
+        final String text = item?.toString().trim() ?? '';
+        if (text.isNotEmpty && !options.contains(text)) options.add(text);
+      }
+    }
+    return options;
   }
 
   static Future<ToolOutcome> _read(

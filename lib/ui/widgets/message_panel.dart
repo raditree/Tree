@@ -1437,13 +1437,23 @@ class _MessagePanelState extends State<MessagePanel> {
     } else if (type == 'ask_user_question') {
       _handleAskUserQuestion(data);
     } else if (type == 'ask_user_question_resolved') {
-      // 右栏作答后，中栏对应内联卡片即时置灰
-      final String qid = (((data['data'] as Map?)?['id']) as String?) ?? '';
+      // 右栏作答后，中栏对应内联卡片即时置灰（多问题：逐题答案一并回填展示）
+      final Map<dynamic, dynamic>? payload = data['data'] as Map?;
+      final String qid = (payload?['id'] as String?) ?? '';
       if (qid.isNotEmpty) {
         final int idx = _indexOfMessage(qid);
         if (idx >= 0) {
           setState(() {
-            _window.at(idx)!.answered = true;
+            final ChatMessage message = _window.at(idx)!;
+            message.answered = true;
+            if (!(payload?['cancelled'] == true)) {
+              final List<String>? answers = (payload?['answers'] as List?)
+                  ?.map((dynamic e) => e.toString())
+                  .toList();
+              if (answers != null && answers.isNotEmpty) {
+                message.answers = answers;
+              }
+            }
           });
         }
       }
@@ -1713,6 +1723,18 @@ class _MessagePanelState extends State<MessagePanel> {
     final List<String> options =
         (data['options'] as List?)?.map((e) => e.toString()).toList() ??
         <String>[];
+    // 多问题：`questions` 是完整的问题表；老核心只有第一问（question/options）
+    // ⇒ 构造器按 content + options 合成一项。
+    final List<AskQuestionItem> questions =
+        (data['questions'] as List?)
+            ?.whereType<Map<dynamic, dynamic>>()
+            .map(
+              (Map<dynamic, dynamic> item) => AskQuestionItem.fromJson(
+                item.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
+              ),
+            )
+            .toList() ??
+        const <AskQuestionItem>[];
     setState(() {
       _window.appendTail(
         ChatMessage(
@@ -1722,6 +1744,7 @@ class _MessagePanelState extends State<MessagePanel> {
           timestamp: DateTime.now(),
           kind: 'ask_user_question',
           options: options,
+          questions: questions,
           // 临时员工提问：问题正文里已有它的名字，这里再带上标记供界面打标
           subagentId: data['subagent_id'] as String? ?? '',
           subagentName: data['subagent_name'] as String? ?? '',
@@ -1736,13 +1759,17 @@ class _MessagePanelState extends State<MessagePanel> {
     QuestionUpdateService.instance.notifyChanged();
   }
 
-  /// 处理内联提问卡片的选项点选：发送 user_answer 并标记该问题已作答。
-  void _handleAskAnswer(String messageId, String answer) {
+  /// 处理内联提问卡片的作答：发送 `user_answer`（**逐题答案**）并标记已作答。
+  ///
+  /// 单问就是长度 1 的表；多问是一次交齐（未作答项为空串，核心算「未作答」）。
+  void _handleAskAnswer(String messageId, List<String> answers) {
     _asking = false;
     final int idx = _window.indexOfId(messageId);
     if (idx >= 0) {
       setState(() {
-        _window.at(idx)!.answered = true;
+        final ChatMessage message = _window.at(idx)!;
+        message.answered = true;
+        message.answers = List<String>.of(answers);
       });
     }
     // 作答会驱动 agent 继续（resume 后可能立刻发起工具调用）：若前端曾重启/
@@ -1754,7 +1781,7 @@ class _MessagePanelState extends State<MessagePanel> {
     }
     _webSocket.send(<String, dynamic>{
       'type': 'user_answer',
-      'data': {'question_id': messageId, 'answer': answer},
+      'data': {'question_id': messageId, 'answers': answers},
     });
     // 通知右栏「问题回复」页标记该问题已回复
     QuestionUpdateService.instance.notifyChanged();

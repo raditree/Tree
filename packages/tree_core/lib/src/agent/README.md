@@ -34,6 +34,17 @@
     所以 `cancel` 对「记录已不在、但有在途等待」也必须完成 completer（`cancelForAgent` 按 store 的 pending 列表遍历，
     记录摘掉后它就无能为力）；删除路径因此必须**先经 broker 取消、再摘记录**，否则那一轮永远收不到工具结果
     ——`isRunning` 永远为真、连 `stop` 都救不回来。
+8.1 **多问题（一次调用问 N 道题）不改变上面这四件事，只把"一个问题"换成"一组问题"**（用户要求 2026-10-04：
+    「ask_user_question 工具仅支持单个问题（改为支持多问题）」）：一次 `ask` 仍是**一条记录 / 一个 qid /
+    一张卡片 / 一个在途 Completer**（`QuestionRecord.questions` ≥ 1，单问是它的退化形态），
+    只是作答改收**逐题答案** `List<String>`（缺项按未作答落库，[question_channel.dart](../tool/question_channel.dart)
+    的 `normalizeAnswers` / `formatAnswerLines` 是唯一排版实现）。三条必须守住的口径：
+    - **先落盘再推帧**照旧：记录与卡片消息都带完整 `questions`，帧里同时给 `questions`（新前端）与
+      `question`/`options`（= **第一问**，老前端只认这两个键）；
+    - **作答兼容单值**：WS/REST 同时接受 `answers`（数组）与 `answer`（单值 = 第一问），
+      老前端因此不会"点了没反应"，其余题按「未作答」如实回给模型；
+    - **未作答必须如实**：工具结果/补答消息里的未答项写 `（未作答）`，**不许**静默丢答案或假装全答了
+      （模型据此决定追问还是按假设继续）。
 9. 提示词在**两处**被拼装（会话生成 + 压缩估算），两处必须看到**逐字一致**的字符串 ⇒ 一律用 provider 接线，不做参数副本。
 10. **临时员工（subagent）轮的运行标识永远是它自己的**：运行键 = `(subagentId, sessionId)`，与"正阻塞等它的父 agent"那一轮（`(parentId, sessionId)`）**绝不撞键**——撞了就是死锁；同时 N 个后台临时员工各占各的槽位，**真的并行**，不互相顶掉轮次。它跑的是 `_runTurn`（与普通轮**同一条**实现），"消息归集到谁 / 带什么标记 / 带哪段历史"由参数表达。
 11. **临时员工的消息不进父 agent 的模型上下文**（`store.messages` 按标记排掉）：父那一轮的 `assistant(tool_calls=[subagent])` 与它的 tool 结果必须相邻，中间插进子 agent 的话会把批切开 ⇒ 带 tools 的思考模式端点 400。唯一例外是**后台完成报告**（`kind=subagent_report`）：它是发起者的"新输入"（`wake` 注入），带 subagent 标记但**要**进父上下文；同理它**不进**临时员工自己的历史。用户要看的完整消息流走 `store.sessionMessages`（会话历史接口用它）。

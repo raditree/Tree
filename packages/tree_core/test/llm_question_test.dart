@@ -18,10 +18,13 @@ void main() {
   late Directory temp;
   late TestWs ws;
 
+  /// 假 LLM 传输（脚本可在用例里改写：多问题用例需要不同的工具参数）
+  late FakeTransport transport;
+
   const String sessionId = TreeStore.defaultSessionId;
 
   setUp(() async {
-    final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+    transport = FakeTransport(<List<LlmStreamEvent>>[
       toolCallScript(
         name: BuiltinTools.askUserQuestion,
         arguments: '{"question":"选 A 还是 B？","options":["A","B"]}',
@@ -100,6 +103,12 @@ void main() {
     expect(qid, isNotEmpty);
     expect(card['question'], '选 A 还是 B？');
     expect(card['options'], <String>['A', 'B']);
+    expect(card['questions'], <Map<String, dynamic>>[
+      <String, dynamic>{
+        'question': '选 A 还是 B？',
+        'options': <String>['A', 'B'],
+      },
+    ]);
     expect(card['agent_id'], agent.id);
     expect(card['session_id'], sessionId);
     expect(questions.byId(qid)?.isPending, isTrue, reason: '提问已落盘');
@@ -150,6 +159,75 @@ void main() {
     expect(toolMessage.toolResult, contains('用户回答：B'));
     expect(questions.byId(qid)?.status, QuestionStatus.answered);
     expect(questions.byId(qid)?.answer, 'B');
+  });
+
+  test('多问题：一次问两道，作答一次交齐后按题回灌并落库', () async {
+    transport.script
+      ..clear()
+      ..addAll(<List<LlmStreamEvent>>[
+        toolCallScript(
+          name: BuiltinTools.askUserQuestion,
+          arguments:
+              '{"questions":['
+              '{"question":"部署到哪台？","options":["A 机","B 机"]},'
+              '{"question":"要不要回滚预案？"}]}',
+        ),
+        textScript('已按你的选择继续。'),
+      ]);
+    ws.send(<String, dynamic>{
+      'type': WsInboundType.userMessage,
+      'agent_id': agent.id,
+      'content': '帮我定两件事',
+      'session_id': sessionId,
+    });
+
+    // 1) 卡片帧：questions 是完整问题表，一次调用只有一个 qid（一张卡片）
+    await ws.until(
+      (Map<String, dynamic> f) => f['type'] == WsOutboundType.askUserQuestion,
+      reason: '提问卡片帧',
+    );
+    final Map<String, dynamic> card = ws.frames.firstWhere(
+      (Map<String, dynamic> f) => f['type'] == WsOutboundType.askUserQuestion,
+    );
+    final String qid = card['id'] as String;
+    expect((card['questions'] as List<dynamic>).length, 2);
+    expect((card['question'] as String), '部署到哪台？', reason: '兼容第一问');
+    expect(
+      ws.frames
+          .where(
+            (Map<String, dynamic> f) =>
+                f['type'] == WsOutboundType.askUserQuestion,
+          )
+          .length,
+      1,
+      reason: '两道题共用一张卡片',
+    );
+
+    // 2) 用户一次交齐两道题的答案
+    ws.send(<String, dynamic>{
+      'type': WsInboundType.userAnswer,
+      'data': <String, dynamic>{
+        'question_id': qid,
+        'answers': <String>['B 机', '要'],
+      },
+    });
+
+    // 3) 工具结果按题列出，本轮续跑完成
+    await waitIdle(ws);
+    final Map<String, dynamic> toolEnd = ws.frames.firstWhere(
+      (Map<String, dynamic> f) => f['type'] == WsOutboundType.toolEnd,
+    );
+    expect(toolEnd['name'], BuiltinTools.askUserQuestion);
+    expect(toolEnd['result'], contains('第1题（部署到哪台？）：B 机'));
+    expect(toolEnd['result'], contains('第2题（要不要回滚预案？）：要'));
+    expect(ws.types(), isNot(contains(WsOutboundType.error)));
+
+    // 4) 落库：提问记录与工具卡片都带逐题答案
+    expect(questions.byId(qid)?.answers, <String>['B 机', '要']);
+    final CoreMessage toolMessage = store
+        .messages(agent.id, sessionId)
+        .firstWhere((CoreMessage m) => m.kind == 'tool');
+    expect(toolMessage.toolResult, contains('第2题（要不要回滚预案？）：要'));
   });
 
   test('stop：在途提问被取消，本轮收敛而不是永久挂起', () async {

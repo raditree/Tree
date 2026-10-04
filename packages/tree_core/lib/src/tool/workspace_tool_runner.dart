@@ -407,8 +407,12 @@ class WorkspaceToolRunner implements ToolRunner {
         AskQuestionRequest(
           agentId: subs!.privateOwnerOf(request.agentId),
           sessionId: request.sessionId,
-          question: '【临时员工「${tag.name}」提问】${request.question}',
-          options: request.options,
+          // 多问题：标记只加在**第一问**的题面上（卡片本来就显示在这名临时员工名下，
+          // 每道题都重复一遍名字只会把题面撑得读不下去）
+          questions: prefixFirstQuestion(
+            request.questions,
+            '【临时员工「${tag.name}」提问】',
+          ),
           teamId: request.teamId,
           isMember: request.isMember,
           subagentId: tag.id,

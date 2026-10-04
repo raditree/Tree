@@ -229,7 +229,9 @@ void main() {
             AskQuestionRequest(
               agentId: member.id,
               sessionId: TreeStore.defaultSessionId,
-              question: '选哪个？',
+              questions: <AskedQuestion>[
+                AskedQuestion(question: '选哪个？', options: const <String>['A', 'B']),
+              ],
               isCancelled: () => false,
             ),
           )

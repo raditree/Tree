@@ -1,3 +1,26 @@
+/// 提问里的一道题（`kind == "ask_user_question"` 时有效）
+///
+/// 与核心 `packages/tree_core/lib/src/tool/question_channel.dart` 的 `AskedQuestion`
+/// 同形（`{question, options}`）——一次提问可以问多道，这是其中一道。
+class AskQuestionItem {
+  const AskQuestionItem({required this.question, this.options = const <String>[]});
+
+  /// 题面正文。
+  final String question;
+
+  /// 候选选项（可空；用户始终可以自由输入）。
+  final List<String> options;
+
+  factory AskQuestionItem.fromJson(Map<String, dynamic> json) =>
+      AskQuestionItem(
+        question: (json['question'] ?? '').toString(),
+        options: (json['options'] as List<dynamic>?)
+                ?.map((dynamic e) => e.toString())
+                .toList() ??
+            const <String>[],
+      );
+}
+
 /// 消息数据模型
 ///
 /// 描述一条聊天消息，包含角色（用户/agent）、内容、时间戳与可选附件。
@@ -57,8 +80,17 @@ class ChatMessage {
   /// 会话内层级（真实 agent 的直属临时员工 = 1）。
   final int subagentLevel;
 
-  /// 提问选项（kind == "ask_user_question" 时有效）
+  /// 提问选项（kind == "ask_user_question" 时有效；= 第一问的选项，兼容读法）
   final List<String> options;
+
+  /// 提问的**全部**问题（kind == "ask_user_question" 时有效；≥1，单问长度 1）。
+  ///
+  /// 与核心 `AskedQuestion` 同形（`{question, options}`）；老核心的帧只给
+  /// `question`/`options`（第一问）时按它们合成一项。
+  final List<AskQuestionItem> questions;
+
+  /// 逐题答案（作答后由 `ask_user_question_resolved` 帧或历史回填；未作答 = 空串）。
+  List<String> answers;
 
   /// 是否已作答（内联提问卡片被选择后置位，用于禁用其余选项）
   bool answered;
@@ -81,8 +113,19 @@ class ChatMessage {
     this.subagentParentId = '',
     this.subagentLevel = 0,
     this.options = const <String>[],
+    List<AskQuestionItem>? questions,
+    this.answers = const <String>[],
     this.answered = false,
-  });
+  }) : questions = (questions != null && questions.isNotEmpty)
+           ? questions
+           : (kind == 'ask_user_question'
+                 ? <AskQuestionItem>[
+                     AskQuestionItem(question: content, options: options),
+                   ]
+                 : const <AskQuestionItem>[]);
+
+  /// 是不是一次问了多道题（界面据此决定"点选项即作答"还是"逐题作答后提交"）。
+  bool get hasMultipleQuestions => questions.length > 1;
 
   /// 是否为用户消息
   bool get isUser => role == 'user';
@@ -126,6 +169,21 @@ class ChatMessage {
       options:
           (json['options'] as List<dynamic>?)?.map((e) => e.toString()).toList() ??
               <String>[],
+      // 多问题：`questions` 是完整的问题表；老核心只有第一问的 question/options
+      // ⇒ 构造器按 `content` + `options` 合成一项。
+      questions: (json['questions'] as List<dynamic>?)
+          ?.whereType<Map<dynamic, dynamic>>()
+          .map(
+            (Map<dynamic, dynamic> item) => AskQuestionItem.fromJson(
+              item.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
+            ),
+          )
+          .toList(),
+      answers:
+          (json['answers'] as List<dynamic>?)
+              ?.map((dynamic e) => e.toString())
+              .toList() ??
+          const <String>[],
       answered: json['answered'] as bool? ?? false,
     );
   }

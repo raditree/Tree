@@ -84,15 +84,21 @@ void main() {
     await server.close();
   });
 
-  Future<QuestionRecord> ask(String question) async {
+  Future<QuestionRecord> ask(
+    String question, {
+    List<AskedQuestion>? asked,
+  }) async {
     // 有意不 await：提问的"等待"本身就是被测行为（在途 future 由作答/关停收尾）。
     unawaited(
       broker.ask(
         AskQuestionRequest(
           agentId: agent.id,
           sessionId: sessionId,
-          question: question,
-          options: const <String>['A', 'B'],
+          questions:
+              asked ??
+              <AskedQuestion>[
+                AskedQuestion(question: question, options: const <String>['A', 'B']),
+              ],
           isCancelled: () => false,
         ),
       ),
@@ -116,6 +122,10 @@ void main() {
     expect(older['agent_id'], agent.id);
     expect(older['session_id'], sessionId);
     expect(older['options'], <String>['A', 'B']);
+    expect(older['questions'], <Map<String, dynamic>>[
+      <String, dynamic>{'question': '第一个问题', 'options': <String>['A', 'B']},
+    ]);
+    expect(older['answers'], <String>[''], reason: '待答：逐题答案为空串');
     expect(older['status'], 'pending');
     expect(older['created_at'], isA<int>());
 
@@ -136,19 +146,24 @@ void main() {
     final _Res ok = await client.send(
       'POST',
       '/api/questions/${record.qid}/answer',
-      body: <String, dynamic>{'answer': '继续'},
+      body: <String, dynamic>{
+        'answers': <String>['继续'],
+      },
     );
     expect(ok.status, 200);
     expect(ok.json['success'], isTrue);
     expect(ok.json['qid'], record.qid);
     expect(ok.json['status'], 'answered');
+    expect(ok.json['answers'], <String>['继续']);
     expect(questions.byId(record.qid)?.answer, '继续');
 
     // 第二次作答：幂等闸门，必须明确报错而不是假装成功
     final _Res twice = await client.send(
       'POST',
       '/api/questions/${record.qid}/answer',
-      body: <String, dynamic>{'answer': '再改一次'},
+      body: <String, dynamic>{
+        'answers': <String>['再改一次'],
+      },
     );
     expect(twice.status, 400);
     expect(jsonEncode(twice.json), contains('没有等待回答的问题'));
@@ -157,10 +172,53 @@ void main() {
     final _Res unknown = await client.send(
       'POST',
       '/api/questions/q_none/answer',
-      body: <String, dynamic>{'answer': 'x'},
+      body: <String, dynamic>{'answers': <String>['x']},
     );
     expect(unknown.status, 404);
     expect(jsonEncode(unknown.json), contains('没有等待回答的问题'));
+  });
+
+  test('多问题：GET 带 questions；作答一次交齐（老前端只回 answer 也接受）', () async {
+    final QuestionRecord record = await ask(
+      '占位',
+      asked: <AskedQuestion>[
+        AskedQuestion(question: '部署到哪台？', options: <String>['A 机', 'B 机']),
+        AskedQuestion(question: '要不要回滚预案？'),
+      ],
+    );
+    final _Res listed = await client.send('GET', '/api/questions');
+    final Map<String, dynamic> item =
+        (listed.json['questions'] as List<dynamic>).first
+            as Map<String, dynamic>;
+    expect((item['questions'] as List<dynamic>).length, 2);
+    expect(item['question'], '部署到哪台？', reason: '兼容读法 = 第一问');
+
+    final _Res ok = await client.send(
+      'POST',
+      '/api/questions/${record.qid}/answer',
+      body: <String, dynamic>{
+        'answers': <String>['B 机'],
+      },
+    );
+    expect(ok.status, 200);
+    expect(ok.json['answers'], <String>['B 机', ''], reason: '未答项按未作答补齐');
+    expect(questions.byId(record.qid)?.answer, contains('（未作答）'));
+
+    // 老前端（只回单个 answer）：等价于"第一问有答、其余未作答"
+    final QuestionRecord legacy = await ask(
+      '占位二',
+      asked: <AskedQuestion>[
+        AskedQuestion(question: '第一问'),
+        AskedQuestion(question: '第二问'),
+      ],
+    );
+    final _Res single = await client.send(
+      'POST',
+      '/api/questions/${legacy.qid}/answer',
+      body: <String, dynamic>{'answer': '只答第一问'},
+    );
+    expect(single.status, 200);
+    expect(questions.byId(legacy.qid)?.answers, <String>['只答第一问', '']);
   });
 
   test('会话历史：提问卡片的 answered/answer 由提问记录叠加（消息日志只追加）', () async {
@@ -177,8 +235,11 @@ void main() {
     expect(card['id'], record.qid);
     expect(card['answered'], isFalse);
     expect(card['options'], <String>['A', 'B']);
+    expect(card['questions'], <Map<String, dynamic>>[
+      <String, dynamic>{'question': '要不要继续？', 'options': <String>['A', 'B']},
+    ]);
 
-    broker.answer(record.qid, '要');
+    broker.answer(record.qid, <String>['要']);
     final _Res after = await client.send(
       'GET',
       '/api/conversations/${agent.id}?session_id=$sessionId',
@@ -190,6 +251,7 @@ void main() {
         );
     expect(card['answered'], isTrue, reason: '叠加提问记录状态');
     expect(card['answer'], '要');
+    expect(card['answers'], <String>['要']);
   });
 
   test('删除 agent 时清理其提问记录（避免右栏孤儿卡片）', () async {

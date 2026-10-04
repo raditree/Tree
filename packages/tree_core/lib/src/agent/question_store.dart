@@ -4,6 +4,7 @@ import '../store/atomic_file.dart';
 import '../store/tree_paths.dart';
 import '../store/tree_store.dart';
 import '../store/write_queue.dart';
+import '../tool/question_channel.dart';
 import '../util/ids.dart';
 
 /// 提问状态（取值与前端 `lib/ui/widgets/question_panel.dart` 一致）。
@@ -41,20 +42,50 @@ int _nextQuestionStamp(List<QuestionRecord> records, int requested) {
 ///   追加日志做不到"就地更新"，只能重写整个文件；
 /// - 因此状态与答案放在独立的小快照文件里（原子覆盖），消息日志只负责"聊天记录里
 ///   有一张提问卡片"这件事。
+///
+/// **多问题口径**：一条记录 = **一次提问**（一个 qid / 一张卡片），里面可以有 N 道题
+/// （[questions] ≥ 1，单问是它的退化形态）。[question] / [options] 是"第一问"的
+/// 兼容读法，[answer]/[answers] 是逐题答案。
 class QuestionRecord {
   QuestionRecord({
     required this.qid,
     required this.agentId,
     required this.sessionId,
-    required this.question,
     required this.createdAt,
+    List<AskedQuestion>? questions,
+    String question = '',
+    List<String>? options,
+    List<String>? answers,
+    String answer = '',
     this.teamId = '',
     this.isMember = false,
-    List<String>? options,
-    this.answer = '',
     this.status = QuestionStatus.pending,
     this.answeredAt = 0,
-  }) : options = options ?? <String>[];
+  }) : questions = (questions != null && questions.isNotEmpty)
+           ? List<AskedQuestion>.of(questions)
+           : <AskedQuestion>[
+               AskedQuestion(question: question, options: options ?? const <String>[]),
+             ],
+       answers = normalizeAnswers(
+         (questions != null && questions.isNotEmpty)
+             ? questions
+             : <AskedQuestion>[
+                 AskedQuestion(
+                   question: question,
+                   options: options ?? const <String>[],
+                 ),
+               ],
+         // 老调用方/老文件只有单个 `answer` ⇒ 它就是第一问的答案，其余未作答
+         (answers != null && answers.isNotEmpty)
+             ? answers
+             : (answer.isEmpty ? const <String>[] : <String>[answer]),
+       ) {
+    this.answer = answer;
+    if (this.answer.isEmpty && this.answers.any((String a) => a.isNotEmpty)) {
+      // 兼容展示字段：只给了逐题答案时，按逐题排版推出来（单问 = 原样）
+      this.answer = formatAnswerLines(this.questions, this.answers);
+    }
+  }
 
   /// 提问 id（同时是会话里提问卡片的消息 id）。
   final String qid;
@@ -69,14 +100,29 @@ class QuestionRecord {
   /// 提问者是否为团队成员（前端据此标注"来自成员"）。
   final bool isMember;
 
-  /// 问题正文。
-  final String question;
+  /// 一次提问里的**全部**问题（至少一项；顺序即展示与作答顺序）。
+  final List<AskedQuestion> questions;
 
-  /// 候选选项（可为空）。
-  final List<String> options;
+  /// 逐题答案（与 [questions] 等长；**未作答项为空串**）。
+  ///
+  /// 不是 final 字段但内容可变（作答时就地填充），与 [answer] 同一条口径：
+  /// 内存实现与落盘实现都只改这一份记录。
+  final List<String> answers;
+
+  /// 问题正文（= [questions] 的第一问；兼容读法，单问时就是全部）。
+  String get question => questions.first.question;
+
+  /// 候选选项（= 第一问的选项；兼容读法）。
+  List<String> get options => questions.first.options;
+
+  /// 是否一次问了多道题。
+  bool get isMulti => questions.length > 1;
 
   /// 用户回答（未作答为空串）。
-  String answer;
+  ///
+  /// 单问 = 那道题的答案；多问 = 逐题排版的摘要（见 [formatAnswerLines]），
+  /// 供右栏「问题回复」页与历史卡片显示。
+  String answer = '';
 
   /// [QuestionStatus] 之一。
   String status;
@@ -93,28 +139,37 @@ class QuestionRecord {
 
   bool get isPending => status == QuestionStatus.pending;
 
-  QuestionRecord copyWith({String? answer, String? status, int? answeredAt}) =>
-      QuestionRecord(
-        qid: qid,
-        agentId: agentId,
-        teamId: teamId,
-        sessionId: sessionId,
-        isMember: isMember,
-        question: question,
-        options: options,
-        createdAt: createdAt,
-        answer: answer ?? this.answer,
-        status: status ?? this.status,
-        answeredAt: answeredAt ?? this.answeredAt,
-      );
+  QuestionRecord copyWith({
+    List<String>? answers,
+    String? answer,
+    String? status,
+    int? answeredAt,
+  }) => QuestionRecord(
+    qid: qid,
+    agentId: agentId,
+    teamId: teamId,
+    sessionId: sessionId,
+    isMember: isMember,
+    questions: questions,
+    answers: answers ?? this.answers,
+    answer: answer ?? this.answer,
+    createdAt: createdAt,
+    status: status ?? this.status,
+    answeredAt: answeredAt ?? this.answeredAt,
+  );
 
   /// 持久化形态（`data/questions.json` 的一项）。
+  ///
+  /// `question` / `options` / `answer` 是**单问时期的键**，保留它们是为了**老前端**
+  /// （只看第一问）与老文件阅读器不会瞎；新前端读 `questions` / `answers`。
   Map<String, dynamic> toJson() => <String, dynamic>{
     'qid': qid,
     'agent_id': agentId,
     'team_id': teamId,
     'session_id': sessionId,
     'is_member': isMember,
+    'questions': questions.map((AskedQuestion q) => q.toJson()).toList(),
+    'answers': answers,
     'question': question,
     'options': options,
     'answer': answer,
@@ -129,12 +184,25 @@ class QuestionRecord {
     teamId: json['team_id'] as String? ?? '',
     sessionId: json['session_id'] as String? ?? '',
     isMember: json['is_member'] == true,
+    // 老记录（多问题之前落盘的）没有 `questions` 键 ⇒ 由 question/options 合成一项；
+    // 装载只读不改，不追改用户数据（与 createdAt 平局同一条口径）。
+    questions: (json['questions'] as List<dynamic>?)
+        ?.whereType<Map<dynamic, dynamic>>()
+        .map(
+          (Map<dynamic, dynamic> item) => AskedQuestion.fromJson(
+            item.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
+          ),
+        )
+        .toList(),
     question: json['question'] as String? ?? '',
     options:
         (json['options'] as List<dynamic>?)
             ?.map((dynamic e) => e.toString())
             .toList() ??
         const <String>[],
+    answers: (json['answers'] as List<dynamic>?)
+        ?.map((dynamic e) => e.toString())
+        .toList(),
     answer: json['answer'] as String? ?? '',
     status: json['status'] as String? ?? QuestionStatus.pending,
     createdAt: _int(json['created_at']),
@@ -150,6 +218,8 @@ class QuestionRecord {
     'team_id': teamId,
     'session_id': sessionId,
     'is_member': isMember,
+    'questions': questions.map((AskedQuestion q) => q.toJson()).toList(),
+    'answers': answers,
     'question': question,
     'options': options,
     'answer': answer,
@@ -177,8 +247,11 @@ abstract interface class QuestionStore {
   /// 按 id 取；不存在返回 null。
   QuestionRecord? byId(String qid);
 
-  /// 作答：仅当仍处于 `pending` 才生效；返回更新后的记录（无效则 null）。
-  QuestionRecord? markAnswered(String qid, String answer);
+  /// 作答：仅在**仍处于 `pending`** 时生效；返回更新后的记录（无效则 null）。
+  ///
+  /// [answers] 是**逐题**答案（与 `record.questions` 等长；缺项按"未作答"处理）：
+  /// 单问时期的老调用方只回一个答案，归一后就是"第一问有答、其余未作答"。
+  QuestionRecord? markAnswered(String qid, List<String> answers);
 
   /// 取消：仅当仍处于 `pending` 才生效；返回更新后的记录。
   QuestionRecord? markCancelled(String qid);
@@ -203,6 +276,19 @@ abstract interface class QuestionStore {
 
   /// 最近一次落盘错误（无则 null）。
   Object? get lastError;
+}
+
+/// 把逐题答案写进记录（内存实现与落盘实现共用一份语义）。
+///
+/// 归一（与 `questions` 等长、缺项未作答）→ 同步兼容展示字段 [QuestionRecord.answer]。
+void _applyAnswers(QuestionRecord record, List<String> answers) {
+  record.answers
+    ..clear()
+    ..addAll(normalizeAnswers(record.questions, answers));
+  record
+    ..answer = formatAnswerLines(record.questions, record.answers)
+    ..status = QuestionStatus.answered
+    ..answeredAt = DateTime.now().millisecondsSinceEpoch;
 }
 
 /// 内存实现（测试与无盘场景）。
@@ -231,13 +317,10 @@ class MemoryQuestionStore implements QuestionStore {
   }
 
   @override
-  QuestionRecord? markAnswered(String qid, String answer) {
+  QuestionRecord? markAnswered(String qid, List<String> answers) {
     final QuestionRecord? record = byId(qid);
     if (record == null || !record.isPending) return null;
-    record
-      ..answer = answer
-      ..status = QuestionStatus.answered
-      ..answeredAt = DateTime.now().millisecondsSinceEpoch;
+    _applyAnswers(record, answers);
     return record;
   }
 
@@ -338,16 +421,8 @@ class FileQuestionStore implements QuestionStore {
   }
 
   @override
-  QuestionRecord? markAnswered(String qid, String answer) {
-    final QuestionRecord? updated = _update(
-      qid,
-      (QuestionRecord r) => r
-        ..answer = answer
-        ..status = QuestionStatus.answered
-        ..answeredAt = DateTime.now().millisecondsSinceEpoch,
-    );
-    return updated;
-  }
+  QuestionRecord? markAnswered(String qid, List<String> answers) =>
+      _update(qid, (QuestionRecord r) => _applyAnswers(r, answers));
 
   @override
   QuestionRecord? markCancelled(String qid) => _update(

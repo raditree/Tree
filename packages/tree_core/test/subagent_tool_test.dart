@@ -567,7 +567,7 @@ void main() {
       messageDispatcher: messages,
       subagentService: service,
       askQuestion: (AskQuestionRequest request) async =>
-          const QuestionOutcome(answer: ''),
+          const QuestionOutcome(answers: <String>['']),
     );
     addTearDown(runner.close);
 

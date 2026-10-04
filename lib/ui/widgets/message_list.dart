@@ -46,8 +46,8 @@ class MessageList extends StatelessWidget {
   /// 无法通过长度/引用比较检测变化，故使用版本号信号。
   final int revision;
 
-  /// 内联提问卡片的选择回调（参数为消息 id 与答案）
-  final void Function(String messageId, String answer)? onAskAnswer;
+  /// 内联提问卡片的选择回调（参数为消息 id 与**逐题答案**；多问题时一次交齐）
+  final void Function(String messageId, List<String> answers)? onAskAnswer;
 
   /// 定位目标消息 id：非空且 [scrollToRevision] 变化时滚动定位到该消息
   final String? scrollToMessageId;
@@ -133,7 +133,7 @@ class _MessageListView extends StatefulWidget {
   final List<ChatMessage?> slots;
   final bool Function(ChatMessage message)? visible;
   final int revision;
-  final void Function(String messageId, String answer)? onAskAnswer;
+  final void Function(String messageId, List<String> answers)? onAskAnswer;
   final String? scrollToMessageId;
   final int scrollToRevision;
   final bool bottomJump;
@@ -1622,11 +1622,16 @@ class _MessageBubbleState extends State<_MessageBubble> {
 /// 内联提问卡片（AskUserQuestion 的非阻塞展示）
 ///
 /// 替代全屏遮罩对话框：提问以卡片形式插入消息流，答题者仍可滚动查看
-/// 模型最近输出与右侧信息后再做决策。点击选项或输入自由文本后回调
-/// [onAnswer]，由父级发送 user_answer 并置位 answered 禁用输入。
+/// 模型最近输出与右侧信息后再做决策。
+///
+/// **多问题**（用户 2026-10-04）：一次提问可以有 N 道题。
+/// - **单问**保持原行为：点选项 = 立即作答；输入后回车 / 点发送 = 作答。
+/// - **多问**：每题各自点选选项或自由输入，底部「提交全部回答」**一次性**回传
+///   全部答案（未作答的题按空串回传，核心/界面显示为「未作答」），按钮旁标注
+///   还有几题未答。
 class _AskQuestionCard extends StatefulWidget {
   final ChatMessage message;
-  final void Function(String messageId, String answer)? onAnswer;
+  final void Function(String messageId, List<String> answers)? onAnswer;
 
   const _AskQuestionCard({required this.message, this.onAnswer});
 
@@ -1635,28 +1640,64 @@ class _AskQuestionCard extends StatefulWidget {
 }
 
 class _AskQuestionCardState extends State<_AskQuestionCard> {
-  final TextEditingController _controller = TextEditingController();
+  /// 每题一个输入框（键 = 题号，从 0 起）。
+  final Map<int, TextEditingController> _controllers =
+      <int, TextEditingController>{};
+
+  /// 每题点选的选项（键 = 题号）；自由输入**优先于**点选。
+  final Map<int, String> _picked = <int, String>{};
+
+  int get _count => widget.message.questions.length;
+
+  TextEditingController _controllerAt(int index) =>
+      _controllers.putIfAbsent(index, TextEditingController.new);
 
   @override
   void dispose() {
-    _controller.dispose();
+    for (final TextEditingController controller in _controllers.values) {
+      controller.dispose();
+    }
     super.dispose();
   }
 
-  void _submit() {
-    final String text = _controller.text.trim();
-    if (widget.message.answered || text.isEmpty) return;
-    final void Function(String, String)? onAnswer = widget.onAnswer;
-    if (onAnswer == null) return;
-    _controller.clear();
-    onAnswer(widget.message.id, text);
+  /// 逐题收集答案：自由输入优先，其次点选的选项，都没有 = 空串（未作答）。
+  List<String> _collectAnswers() {
+    final List<String> answers = <String>[];
+    for (int i = 0; i < _count; i++) {
+      final String typed = _controllerAt(i).text.trim();
+      answers.add(typed.isNotEmpty ? typed : (_picked[i] ?? ''));
+    }
+    return answers;
+  }
+
+  bool get _enabled => !widget.message.answered && widget.onAnswer != null;
+
+  /// 单问：点选项立刻作答（与"只支持单问题"时期逐字一致）。
+  void _answerSingle(String answer) {
+    if (!_enabled || answer.isEmpty) return;
+    widget.onAnswer!(widget.message.id, <String>[answer]);
+  }
+
+  /// 单问：自由输入发送。
+  void _submitSingle(int index) {
+    if (!_enabled) return;
+    final String text = _controllerAt(index).text.trim();
+    if (text.isEmpty) return;
+    widget.onAnswer!(widget.message.id, <String>[text]);
+  }
+
+  /// 多问：一次交齐（未作答项传空串）。
+  void _submitAll() {
+    if (!_enabled) return;
+    widget.onAnswer!(widget.message.id, _collectAnswers());
   }
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final ChatMessage message = widget.message;
-    final bool enabled = !message.answered && widget.onAnswer != null;
+    final bool multi = message.hasMultipleQuestions;
+    final bool enabled = _enabled;
     return Align(
       alignment: Alignment.centerLeft,
       child: Container(
@@ -1676,7 +1717,11 @@ class _AskQuestionCardState extends State<_AskQuestionCard> {
                 Icon(Icons.help_outline, size: 16, color: cs.primary),
                 const SizedBox(width: 6),
                 Text(
-                  message.answered ? '已提交你的选择' : 'Agent 需要你的输入',
+                  message.answered
+                      ? '已提交你的选择'
+                      : multi
+                      ? 'Agent 需要你的输入（共 ${message.questions.length} 题）'
+                      : 'Agent 需要你的输入',
                   style: TextStyle(
                     fontSize: 12,
                     fontWeight: FontWeight.w600,
@@ -1686,75 +1731,180 @@ class _AskQuestionCardState extends State<_AskQuestionCard> {
               ],
             ),
             const SizedBox(height: 8),
-            Text(
-              message.content.isEmpty ? '提问' : message.content,
-              style: TextStyle(fontSize: 14, color: cs.onSurface, height: 1.4),
-            ),
-            if (message.options.isNotEmpty) ...<Widget>[
-              const SizedBox(height: 10),
-              for (final String option in message.options)
-                Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 3),
-                  child: SizedBox(
-                    width: double.infinity,
-                    child: OutlinedButton(
-                      onPressed: enabled
-                          ? () => widget.onAnswer!(message.id, option)
-                          : null,
-                      style: OutlinedButton.styleFrom(
-                        alignment: Alignment.centerLeft,
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 12,
-                          vertical: 10,
-                        ),
-                      ),
-                      child: Row(
-                        children: <Widget>[
-                          Icon(
-                            message.answered
-                                ? Icons.check_circle_outline
-                                : Icons.radio_button_unchecked,
-                            size: 16,
+            for (int i = 0; i < message.questions.length; i++)
+              _buildQuestion(context, i, multi),
+            if (message.answered &&
+                message.answers.any((String a) => a.trim().isNotEmpty))
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    for (
+                      int i = 0;
+                      i < message.questions.length;
+                      i++
+                    )
+                      Padding(
+                        padding: const EdgeInsets.only(top: 2),
+                        child: Text(
+                          multi
+                              ? '第 ${i + 1} 题：${_answerAt(message, i)}'
+                              : '已回答：${_answerAt(message, i)}',
+                          style: TextStyle(
+                            fontSize: 12,
                             color: cs.onSurfaceVariant,
                           ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              option,
-                              style: TextStyle(
-                                fontSize: 13,
-                                color: cs.onSurface,
-                              ),
-                            ),
-                          ),
-                        ],
+                        ),
                       ),
-                    ),
-                  ),
-                ),
-            ],
-            const SizedBox(height: 10),
-            // 或直接输入回答
-            TextField(
-              controller: _controller,
-              enabled: enabled,
-              maxLines: 2,
-              minLines: 1,
-              onSubmitted: (_) => _submit(),
-              decoration: InputDecoration(
-                hintText: '或直接输入回答…',
-                isDense: true,
-                border: const OutlineInputBorder(),
-                suffixIcon: IconButton(
-                  onPressed: enabled ? _submit : null,
-                  icon: const Icon(Icons.send, size: 18),
-                  tooltip: '发送',
+                  ],
                 ),
               ),
-            ),
+            if (multi && !message.answered) ...<Widget>[
+              const SizedBox(height: 8),
+              Row(
+                children: <Widget>[
+                  FilledButton(
+                    onPressed: enabled ? _submitAll : null,
+                    child: const Text('提交全部回答'),
+                  ),
+                  const SizedBox(width: 10),
+                  Text(
+                    _unansweredCount() == 0
+                        ? '已全部作答'
+                        : '还有 ${_unansweredCount()} 题未作答',
+                    style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+                  ),
+                ],
+              ),
+            ],
           ],
         ),
       ),
     );
   }
+
+  /// 一道题：题面 + 选项（单问点选即作答，多问点选为选中）+ 自由输入。
+  ///
+  /// 已作答的卡片不再显示输入框（答案在卡片底部逐题列出）。
+  Widget _buildQuestion(BuildContext context, int index, bool multi) {
+    final cs = Theme.of(context).colorScheme;
+    final ChatMessage message = widget.message;
+    final AskQuestionItem item = message.questions[index];
+    final bool enabled = _enabled;
+    return Padding(
+      padding: EdgeInsets.only(top: index == 0 ? 0 : 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text(
+            multi ? '${index + 1}. ${item.question}' : item.question,
+            style: TextStyle(fontSize: 14, color: cs.onSurface, height: 1.4),
+          ),
+          if (item.options.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 8),
+            for (final String option in item.options)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 3),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton(
+                    onPressed: !enabled
+                        ? null
+                        : () {
+                            if (!multi) {
+                              // 单问：点选项立刻作答（老行为）
+                              _answerSingle(option);
+                              return;
+                            }
+                            setState(() {
+                              if (_picked[index] == option) {
+                                _picked.remove(index);
+                              } else {
+                                _picked[index] = option;
+                              }
+                            });
+                          },
+                    style: OutlinedButton.styleFrom(
+                      alignment: Alignment.centerLeft,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 10,
+                      ),
+                    ),
+                    child: Row(
+                      children: <Widget>[
+                        Icon(
+                          _isPicked(message, index, option, multi)
+                              ? Icons.check_circle_outline
+                              : Icons.radio_button_unchecked,
+                          size: 16,
+                          color: cs.onSurfaceVariant,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            option,
+                            style: TextStyle(fontSize: 13, color: cs.onSurface),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+          ],
+          if (!message.answered) ...<Widget>[
+            const SizedBox(height: 8),
+            TextField(
+              controller: _controllerAt(index),
+              enabled: enabled,
+              maxLines: 2,
+              minLines: 1,
+              onChanged: (_) => setState(() {}),
+              onSubmitted: (_) =>
+                  multi ? _submitAll() : _submitSingle(index),
+              decoration: InputDecoration(
+                hintText: multi
+                    ? '或直接输入第 ${index + 1} 题的答案…'
+                    : '或直接输入回答…',
+                isDense: true,
+                border: const OutlineInputBorder(),
+                suffixIcon: multi
+                    ? null
+                    : IconButton(
+                        onPressed: enabled ? () => _submitSingle(index) : null,
+                        icon: const Icon(Icons.send, size: 18),
+                        tooltip: '发送',
+                      ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// 某个选项是否处于"选中/命中"状态（多问看当前点选，单问看已作答的答案）。
+  bool _isPicked(
+    ChatMessage message,
+    int index,
+    String option,
+    bool multi,
+  ) {
+    if (!multi) {
+      return message.answered && _answerAt(message, index) == option;
+    }
+    return _picked[index] == option;
+  }
+
+  String _answerAt(ChatMessage message, int index) {
+    if (index >= message.answers.length) return '（未作答）';
+    final String text = message.answers[index].trim();
+    return text.isEmpty ? '（未作答）' : text;
+  }
+
+  /// 多问还有几题没答（底部提交按钮旁的提示）。
+  int _unansweredCount() =>
+      _collectAnswers().where((String a) => a.isEmpty).length;
 }
