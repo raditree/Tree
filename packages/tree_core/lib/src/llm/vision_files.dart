@@ -11,17 +11,49 @@
 /// `file must have a file_id or file_data`，扁平形状 200 且模型看得见图。
 /// 上传成功却一直 400 的根因就在这里，与密钥 / multipart / 缓存都无关。
 ///
-/// 为什么走 Files API 而不是 base64 内联：
-/// - 内联受 **48 MiB 请求体 / 32 MiB 单图** 限制，且每轮都要重新编码一遍；
-/// - Files API 单文件可到 **64 MiB**，同一张图可跨轮复用（我们做 file_id 缓存）。
+/// **两条送达路径（优先级从高到低）**：[VisionImageRef] 就是这条约定的载体。
+/// 1. **Files API（首选）**：`POST {base}/files` 拿 `file_id` → `file` 内容块。
+///    单文件可到 **64 MiB**，同一张图可跨轮复用（我们做 `file_id` 缓存），
+///    且不占请求体；
+/// 2. **内联 base64（回退）**：端点不支持 Files API，或上传失败（非 2xx、网络错、
+///    响应里没有 `id`、缺 `base_url`/`api_key`）时，改成把图像字节**内联**进请求
+///    （`{"type":"image_url","image_url":{"url":"data:<mime>;base64,…"}}`，依据见
+///    `llm/llm_types.dart` 的 [LlmContentPart.imageUrl]）。内联受官方限制
+///    **单张 ≤ 32 MiB / 请求体 ≤ 48 MiB**（[visionMaxInlineBytes]），超限宁可
+///    退回"只给路径"，也绝不把整轮请求撑爆。
+///
+/// `model` 字段：**保留，但别把它当成那次 400 的解药**——2026-10-05 在本机真机
+/// 探针实测（探针 = 同一张 70 字节 PNG，只打 `/files`，不发 chat）：
+/// - `token.ai-galaxy.com/v1`（new-api 中转站）的 `/files` 三种带法——**不带**、
+///   **表单带 `model`**、**查询串带 `model`**——**一律 400**
+///   `Model name not specified, model name cannot be empty`（`type: new_api_error`）
+///   ⇒ **它就是不吃这个接口**，换字段位置也救不了；真实链路里图能送到模型，
+///   靠的是上面第 2 条**内联 base64 回退**（那次事故的正解）；
+/// - 官方 `api.deepseek.com`：不带 `model` 成功（基线），**带 `model` 也成功**
+///   （未知表单字段被忽略）⇒ 带上它是**无害**的（某些 new-api 变体确实要它），
+///   不引入回归。
+///
+/// **为什么会 400（new-api 侧源码，已核对其 main 分支）**：
+/// ① `router/relay-router.go` 把 `POST /v1/files`（连同 `GET /v1/files*`）登记为
+///    `controller.RelayNotImplemented`——**Files API 它压根没实现**；
+/// ② `middleware/distributor.go` 的 `getModelRequest()` 只在
+///    `!strings.Contains(Content-Type, "multipart/form-data")` 时才去解析模型，也就是
+///    **对 multipart 请求根本不读表单字段**，模型名恒为空 ⇒ 中间件报
+///    `i18n.MsgDistributorModelNameRequired`（就是我们看到的那句 400），而且这发生在
+///    进 handler **之前**（所以连"未实现"那条路都轮不到）。
+/// 两条合起来：这类中转站上**换任何字段位置都救不了**——能救场的只有内联回退。
+///
+/// 模型名取该 agent 解析出的模型配置的 `model_id`（[CoreModelConfig.modelId]），
+/// **不硬编码**。
 ///
 /// 三条硬约束（都是踩过的坑，改这里之前先读）：
 /// 1. **只读工作空间 IO，不拼本机绝对路径**：SSH 成员的图片在**远端**，本机
 ///    根本没有这个文件（见 [WorkspaceVisionFileResolver]）；
-/// 2. **失败一律降级**，绝不阻断本轮：上传失败 / 读不到 / 超限 / 非图片 →
-///    返回 null，调用方继续用"提示词里给路径"的老路径；
-/// 3. **密钥只进 Authorization 头**：日志里只出现端点与 file_id，绝不出现 api_key
-///    与文件字节。
+/// 2. **失败一律降级**，绝不阻断本轮：上传失败 → **回退内联 base64**；连字节都
+///    读不到 / 非图片 / 超内联上限 → 返回 null，调用方继续用"提示词里给路径"
+///    的老路径。**任何情况都不抛、不中断本轮对话**；
+/// 3. **密钥只进 Authorization 头**：日志里只出现端点、字节数、形状与 file_id，
+///    绝不出现 api_key 与文件字节。
 library;
 
 import 'dart:async';
@@ -37,6 +69,26 @@ import '../store/atomic_file.dart';
 
 /// 单个文件的字节上限（DeepSeek Files API 口径：64 MiB）。
 const int visionMaxFileBytes = 64 * 1024 * 1024;
+
+/// **内联 base64 图像**的字节上限（官方 Vision 口径：单张内联图 ≤ 32 MiB）。
+///
+/// 为什么单独设一个更小的上限：内联会把 base64（约为原字节的 4/3）直接放进
+/// 请求体，而端点对请求体还有 48 MiB 的硬限制。一张 32 MiB 的图编码后≈42.7 MiB，
+/// 已逼近该限制；**超过就不再内联**，退回"只给路径"——宁可模型少看一张图，
+/// 也不能把整轮请求打成 400（那会比改动前更糟）。
+const int visionMaxInlineBytes = 32 * 1024 * 1024;
+
+/// 构造内联图像的 data URL：`data:<mime>;base64,<bytes>`（形状依据见
+/// `llm/llm_types.dart` 的 [LlmContentPart.imageUrl]）。
+///
+/// 抽成纯函数的理由与 multipart 一样：让"字节 → 线上形状"这件事可单测，
+/// 且全仓只有这一处拼 data URL 前缀。
+String visionDataUrl({required String base64, required String contentType}) {
+  final String mime = contentType.trim().isEmpty
+      ? 'application/octet-stream'
+      : contentType.trim();
+  return 'data:$mime;base64,$base64';
+}
 
 /// 上传有效期（秒）。文档允许 3600 ~ 2592000，这里按需求取 7 天。
 const int visionDefaultExpiresSeconds = 7 * 24 * 60 * 60;
@@ -132,12 +184,20 @@ class VisionMultipartBody {
 
 /// 构造 Files API 的 multipart 请求体（**纯函数**）。
 ///
-/// 字段顺序按文档：`purpose` → `expires_after[anchor]` → `expires_after[seconds]`
-/// → `file`。[expiresAfterSeconds] <= 0 时不带有效期字段（文档：不传即永久有效）。
+/// 字段顺序：`purpose` → `model`（非空时才带）→ `expires_after[anchor]` →
+/// `expires_after[seconds]` → `file`。[expiresAfterSeconds] <= 0 时不带有效期字段
+/// （文档：不传即永久有效）。
+///
+/// **`model` 字段不是"不带就 400"的解药**：2026-10-05 真机探针对
+/// `token.ai-galaxy.com/v1` 的 `/files` 试了不带 / 表单带 / 查询串带三种，
+/// **全部 400** `Model name not specified`（详见文件头）；官方 `api.deepseek.com`
+/// 不带与带都成功（字段被忽略）。保留它是为了兼容"确实要求该字段"的 new-api 变体，
+/// 并对官方端点零回归；[modelId] 为空（模型名未知）时不发该字段——与改动前逐字一致。
 VisionMultipartBody visionMultipartBody({
   required List<int> bytes,
   required String filename,
   required String contentType,
+  String modelId = '',
   int expiresAfterSeconds = visionDefaultExpiresSeconds,
   String purpose = 'user_data',
   String? boundary,
@@ -156,6 +216,8 @@ VisionMultipartBody visionMultipartBody({
   }
 
   field('purpose', purpose);
+  final String model = modelId.trim();
+  if (model.isNotEmpty) field('model', model);
   if (expiresAfterSeconds > 0) {
     field('expires_after[anchor]', 'created_at');
     field('expires_after[seconds]', '$expiresAfterSeconds');
@@ -206,6 +268,7 @@ class VisionFileUploader {
   VisionFileUploader({
     required this.baseUrl,
     required this.apiKey,
+    this.modelId = '',
     HttpClient? client,
     this.log,
     this.maxBytes = visionMaxFileBytes,
@@ -219,6 +282,13 @@ class VisionFileUploader {
 
   /// 模型配置里的 `api_key`（**只进 Authorization 头，不进日志**）。
   final String apiKey;
+
+  /// 模型配置里的 `model_id`（**中转站的 `/files` 要求表单带它**，见文件头）。
+  ///
+  /// 为空时不发该字段（官方端点无需、旧行为保持）。取值来自
+  /// `CoreModelConfig.modelId`，由调用方（[WorkspaceVisionFileResolver]）注入，
+  /// **不在这里硬编码任何模型名**。
+  final String modelId;
 
   /// 可读日志（核心走 stderr）。
   final void Function(String message)? log;
@@ -267,6 +337,7 @@ class VisionFileUploader {
       bytes: bytes,
       filename: filename,
       contentType: contentType,
+      modelId: modelId,
       expiresAfterSeconds: expiresAfterSeconds,
     );
     try {
@@ -413,13 +484,61 @@ class VisionFileCache {
   }
 }
 
-/// 把"某条用户消息里的图像附件"解析成端点的 `file_id`（注入点）。
+/// 一张图像**怎样送达端点**：能用 Files API 就用 `file_id` 引用，否则内联 base64。
 ///
-/// 引擎只认这个接口：`if_vision` 打开且解析出 id 时，就把 id 变成内容块；返回
-/// null（不支持 / 失败）就照旧只发路径。这样引擎可以完全脱离 HTTP 单测。
+/// 这就是"两条送达路径"的载体（见文件头）：引擎按变体产出不同的内容块，
+/// 自己完全不需要知道上传细节，也不需要认识 HTTP。
+class VisionImageRef {
+  /// 端点文件引用（Files API 上传成功）。
+  const VisionImageRef.file(this.fileId) : base64 = '', contentType = '';
+
+  /// 内联 base64 图像（Files API 走不通时的回退）。
+  const VisionImageRef.inline({
+    required this.base64,
+    required this.contentType,
+  }) : fileId = '';
+
+  /// 端点文件 id（空 = 这条不是 file 引用）。
+  final String fileId;
+
+  /// 内联图像的原始 base64（不含 data URL 前缀）。
+  final String base64;
+
+  /// 内联图像的 MIME（`image/png` 等）。
+  final String contentType;
+
+  /// 是否走 `file_id` 引用（false 表示内联 base64）。
+  bool get isFile => fileId.isNotEmpty;
+
+  /// 内联图像的 data URL（形状依据见 `llm/llm_types.dart` 的
+  /// [LlmContentPart.imageUrl]）；file 引用时为空串。
+  String get dataUrl => isFile
+      ? ''
+      : visionDataUrl(base64: base64, contentType: contentType);
+
+  /// 这个引用**什么也送不出去**（引擎据此跳过，别产出空内容块）。
+  bool get isEmpty => fileId.isEmpty && base64.isEmpty;
+
+  @override
+  String toString() => isFile
+      ? 'VisionImageRef.file($fileId)'
+      : 'VisionImageRef.inline(${base64.length} 字节 base64, $contentType)';
+}
+
+/// 把"某条用户消息里的图像附件"解析成端点能收的**图像引用**（注入点）。
+///
+/// 引擎只认这个接口：`if_vision` 打开且解析出引用时，就把它变成内容块（`file_id`
+/// 引用或内联 base64）；返回 null（读不到字节 / 非图片 / 超限）就照旧只发路径。
+/// 这样引擎可以完全脱离 HTTP 单测。
+///
+/// **失败不抛、不阻断本轮**是这条接口的约定（见文件头硬约束 2）：解析不出来就是
+/// null，调用方降级。
 abstract interface class VisionFileResolver {
-  /// 解析该附件的 `file_id`；null = 本轮降级为"只给路径"。
-  Future<String?> resolve({
+  /// 解析该附件的图像引用。
+  ///
+  /// 返回 `VisionImageRef.file` = 已上传（首选路径）；`VisionImageRef.inline` =
+  /// 上传失败/不支持，改走内联 base64；返回 null = 本轮降级为"只给路径"。
+  Future<VisionImageRef?> resolve({
     required CoreModelConfig config,
     required String agentId,
     required Map<String, dynamic> attachment,
@@ -440,6 +559,7 @@ class WorkspaceVisionFileResolver implements VisionFileResolver {
     this.cache,
     this.log,
     this.maxBytes = visionMaxFileBytes,
+    this.maxInlineBytes = visionMaxInlineBytes,
     this.timeout = visionUploadTimeout,
     this.expiresAfterSeconds = visionDefaultExpiresSeconds,
   });
@@ -454,6 +574,12 @@ class WorkspaceVisionFileResolver implements VisionFileResolver {
   final void Function(String message)? log;
 
   final int maxBytes;
+
+  /// **内联**图像的字节上限（默认 [visionMaxInlineBytes]；0 = 不限）。
+  ///
+  /// 可注入只为单测能拿小值触发这条分支——真上限是官方口径（单张 32 MiB）。
+  final int maxInlineBytes;
+
   final Duration timeout;
   final int expiresAfterSeconds;
 
@@ -464,7 +590,7 @@ class WorkspaceVisionFileResolver implements VisionFileResolver {
   bool _closed = false;
 
   @override
-  Future<String?> resolve({
+  Future<VisionImageRef?> resolve({
     required CoreModelConfig config,
     required String agentId,
     required Map<String, dynamic> attachment,
@@ -502,7 +628,7 @@ class WorkspaceVisionFileResolver implements VisionFileResolver {
       size: size,
     );
     final String? cached = await cache?.get(key);
-    if (cached != null) return cached;
+    if (cached != null) return VisionImageRef.file(cached);
 
     final Uint8List bytes;
     try {
@@ -520,20 +646,44 @@ class WorkspaceVisionFileResolver implements VisionFileResolver {
       return null;
     }
 
+    final String extension = visionAttachmentExtension(attachment);
+    final String contentType = visionContentType(
+      extension.isEmpty ? 'png' : extension,
+    );
+
+    // ① 首选：Files API 上传 → file_id 引用（同一张图可跨轮复用，不做重复编码）。
     final VisionFileUploader? uploader = _uploaderFor(config);
     if (uploader == null) {
       _log('模型「${config.modelId}」缺少 base_url / api_key，无法上传图像');
+    } else {
+      final String? fileId = await uploader.upload(
+        bytes: bytes,
+        filename: _fileNameOf(attachment, path),
+        contentType: contentType,
+      );
+      if (fileId != null) {
+        await cache?.put(key, fileId);
+        return VisionImageRef.file(fileId);
+      }
+    }
+    _log('上传不可用（端点不支持 Files API 或本张图上传失败），回退为内联 base64');
+
+    // ② 回退：内联 base64（端点不收 file 块时，这是唯一还能让模型看见像素的形态）。
+    if (maxInlineBytes > 0 && bytes.length > maxInlineBytes) {
+      _log(
+        '附件「$path」${bytes.length} 字节超过内联上限 $maxInlineBytes'
+        '（官方口径单张 ≤ 32 MiB），本轮降级为路径提示',
+      );
       return null;
     }
-    final String extension = visionAttachmentExtension(attachment);
-    final String? fileId = await uploader.upload(
-      bytes: bytes,
-      filename: _fileNameOf(attachment, path),
-      contentType: visionContentType(extension.isEmpty ? 'png' : extension),
+    _log(
+      '内联图像「${_fileNameOf(attachment, path)}」'
+      '（${bytes.length} 字节，$contentType）随请求体送达模型',
     );
-    if (fileId == null) return null;
-    await cache?.put(key, fileId);
-    return fileId;
+    return VisionImageRef.inline(
+      base64: base64Encode(bytes),
+      contentType: contentType,
+    );
   }
 
   @override
@@ -547,16 +697,23 @@ class WorkspaceVisionFileResolver implements VisionFileResolver {
   }
 
   /// 取（或新建）该模型配置的上传器；缺 base_url / api_key 时返回 null。
+  ///
+  /// 复用键里带上 `modelId`：上传表单会发 `model`（对官方端点无害、对要求该字段的
+  /// new-api 变体可能必需），同一 `base_url|api_key` 下的不同模型因此各持一个上传器。
+  /// **file_id 缓存键不带 model**——file_id 属于"账号 + 端点"，与模型无关，
+  /// 带上它只会让所有老缓存失效。
   VisionFileUploader? _uploaderFor(CoreModelConfig config) {
     final String baseUrl = config.baseUrl.trim();
     final String apiKey = config.apiKey.trim();
     if (baseUrl.isEmpty || apiKey.isEmpty) return null;
-    final String key = '$baseUrl|$apiKey';
+    final String modelId = config.modelId.trim();
+    final String key = '$baseUrl|$apiKey|$modelId';
     return _uploaders.putIfAbsent(
       key,
       () => VisionFileUploader(
         baseUrl: baseUrl,
         apiKey: apiKey,
+        modelId: modelId,
         log: log,
         maxBytes: maxBytes,
         timeout: timeout,

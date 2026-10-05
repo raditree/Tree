@@ -889,11 +889,18 @@ class LlmAgentEngine implements AgentEngine {
     );
   }
 
-  /// 把该条用户消息里的**图像附件**逐个解析成端点的 file 内容块。
+  /// 把该条用户消息里的**图像附件**逐个解析成端点的内容块。
   ///
   /// [vision] 为空（`if_vision` 关闭或未接线）时**直接返回空**：这条链路对
   /// "没开视觉的模型"完全无感，连字节都不读。非图片附件（pdf/txt…）同样跳过：
-  /// DeepSeek 的 file 内容块口径就是图像。
+  /// DeepSeek 的 file / image 内容块口径就是图像。
+  ///
+  /// 两种块（见 `vision_files.dart` 的 [VisionImageRef]）：
+  /// - 上传成功 ⇒ `{"type":"file","file_id":…}`（首选，可跨轮复用）；
+  /// - 上传走不通 ⇒ `{"type":"image_url","image_url":{"url":"data:…;base64,…"}}`
+  ///   （回退，形状依据见 [LlmContentPart.imageUrl]）。
+  /// 解析不出来（读不到字节 / 超限 / 非图片）就少一个块——正文里的路径说明段还在，
+  /// 模型仍知道去哪读，**本轮绝不因此失败**。
   Future<List<LlmContentPart>> _visionParts(
     VisionFileResolver? vision,
     CoreModelConfig config,
@@ -906,13 +913,17 @@ class LlmAgentEngine implements AgentEngine {
     final List<LlmContentPart> parts = <LlmContentPart>[];
     for (final Map<String, dynamic> attachment in attachments) {
       if (!isVisionImageAttachment(attachment)) continue;
-      final String? fileId = await vision.resolve(
+      final VisionImageRef? image = await vision.resolve(
         config: config,
         agentId: agentId,
         attachment: attachment,
       );
-      if (fileId == null || fileId.isEmpty) continue;
-      parts.add(LlmContentPart.file(fileId));
+      if (image == null || image.isEmpty) continue;
+      parts.add(
+        image.isFile
+            ? LlmContentPart.file(image.fileId)
+            : LlmContentPart.imageUrl(image.dataUrl),
+      );
     }
     return parts;
   }

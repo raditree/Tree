@@ -241,6 +241,11 @@ void main() {
       expect(upload.path, '/v1/files');
       expect(upload.text, contains('name="purpose"\r\n\r\nuser_data'));
       expect(upload.text, contains('604800'));
+      expect(
+        upload.text,
+        contains('name="model"\r\n\r\ndemo'),
+        reason: '上传表单必须带该 agent 解析出的 model_id（中转站的硬要求）',
+      );
 
       // ② 发给模型的请求体里出现 file 引用块（图像真正生效的判据）
       final Map<String, dynamic> body = OpenAiCodec.requestBody(
@@ -271,7 +276,7 @@ void main() {
       expect(filesApi.requests, hasLength(1), reason: 'file_id 缓存应命中');
     });
 
-    test('Files API 报错（500）：本轮照常结束，只是退回纯路径', () async {
+    test('Files API 报错（500）：本轮照常结束，改为内联 base64 送达', () async {
       final int size = await seedImage();
       final FakeFilesApi brokenApi = FakeFilesApi(
         statusCode: 500,
@@ -298,10 +303,30 @@ void main() {
 
       expect(brokenApi.requests, hasLength(1), reason: '试过上传，但失败了');
       expect(ws.types(), isNot(contains('error')), reason: '上传失败不该变成对话错误');
-      final LlmMessage sent = transport.requests.single.messages.last;
-      expect(sent.contentParts, isEmpty);
-      expect(sent.content, contains('.input/20261001/图片.png'));
-      expect(sent.toWire()['content'], isA<String>());
+
+      // 上传挂了不等于"模型看不见图"：回退内联 base64（Files API 走不通时的兜底）
+      final Map<String, dynamic> body = OpenAiCodec.requestBody(
+        transport.requests.single,
+        stream: true,
+      );
+      final Map<String, dynamic> user =
+          (body['messages'] as List<dynamic>).last as Map<String, dynamic>;
+      final List<dynamic> content = user['content'] as List<dynamic>;
+      expect(
+        (content.last as Map<String, dynamic>)['type'],
+        'image_url',
+        reason: 'file 端点不通 ⇒ 内联图像块',
+      );
+      expect(
+        ((content.last as Map<String, dynamic>)['image_url']
+            as Map<String, dynamic>)['url'],
+        startsWith('data:image/png;base64,'),
+      );
+      expect(
+        (content.first as Map<String, dynamic>)['text'],
+        contains('.input/20261001/图片.png'),
+        reason: '路径说明段照旧在',
+      );
     });
 
     test('关闭 if_vision：一个 Files API 请求都不发（请求体逐字为文本）', () async {

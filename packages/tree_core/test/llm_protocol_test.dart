@@ -192,6 +192,42 @@ void main() {
       ]);
     });
 
+    test('内联图像块：image_url + data URL（Files API 走不通时的回退形态）', () {
+      // 形状依据：DeepSeek 官方 Vision 文档的 Chat Completions 口径——user 消息
+      // content 数组用 {"type":"image_url","image_url":{"url": …}} 携带 base64
+      // data URL（与 OpenAI 同形）；**不用** {"type":"file","file_data":…}
+      // （后者取值形态无文档依据，猜错会把"只给路径"升级成整轮 400）。
+      const LlmContentPart part = LlmContentPart.imageUrl(
+        'data:image/png;base64,iVBORw0KGgo=',
+      );
+      expect(part.type, 'image_url');
+      expect(part.toWire(), <String, dynamic>{
+        'type': 'image_url',
+        'image_url': <String, dynamic>{
+          'url': 'data:image/png;base64,iVBORw0KGgo=',
+        },
+      });
+    });
+
+    test('线协议往返：内联图像块与 file 块都不丢（插件改写请求体用）', () {
+      const LlmMessage original = LlmMessage(
+        role: LlmRole.user,
+        content: '看这两张',
+        contentParts: <LlmContentPart>[
+          LlmContentPart.file('file-api-1'),
+          LlmContentPart.imageUrl('data:image/png;base64,QQ=='),
+        ],
+      );
+      final LlmMessage? restored = LlmMessage.tryFromWire(original.toWire());
+      expect(restored, isNotNull);
+      expect(restored!.content, '看这两张');
+      expect(restored.contentParts, hasLength(2));
+      expect(restored.contentParts[0].fileId, 'file-api-1');
+      expect(restored.contentParts[1].imageDataUrl, 'data:image/png;base64,QQ==');
+      // 往返后的线形态逐字一致（前缀缓存的命门）
+      expect(restored.toWire()['content'], original.toWire()['content']);
+    });
+
     test('assistant 工具调用轮与 tool 结果的消息形态', () {
       final LlmMessage assistant = LlmMessage(
         role: LlmRole.assistant,

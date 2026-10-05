@@ -70,20 +70,51 @@ class LlmToolCall {
 
 /// 一条消息里的**内容块**（OpenAI 兼容 `content` 数组的元素）。
 ///
-/// 为什么需要它：图像这类二进制内容塞不进 `content: String`。本仓库采用
-/// DeepSeek 的口径——**先把文件上传到端点拿到 `file_id`，再在请求里引用**
-/// （见 `vision_files.dart`）：base64 内联会把编码后的图片直接放进请求体，
-/// 受 48 MiB 请求体 / 32 MiB 单图限制；Files API 单文件可到 64 MiB。
+/// 为什么需要它：图像这类二进制内容塞不进 `content: String`。图像有**两条**送达
+/// 路径（见 `vision_files.dart`）：
+/// 1. **首选**：先把文件上传到端点拿到 `file_id`，再在请求里引用 —— 可跨轮复用，
+///    单文件可到 64 MiB，且不占请求体；
+/// 2. **回退**：端点不支持 Files API / 上传失败时，内联 base64 图像 —— 每轮都要
+///    重新编码，且受 48 MiB 请求体 / 32 MiB 单图限制，但"端点不认 file 块"时它是
+///    唯一还能让模型看见像素的形态。
 ///
-/// 目前只用到两型：`text`（正文）与 `file`（端点文件引用）。
+/// 目前用到三型：`text`（正文）、`file`（端点文件引用）、`image_url`（内联图像）。
 class LlmContentPart {
   /// 正文块。
-  const LlmContentPart.text(this.text) : type = 'text', fileId = '';
+  const LlmContentPart.text(this.text)
+    : type = 'text',
+      fileId = '',
+      imageDataUrl = '';
 
   /// 端点文件引用块（`file_id` 来自 Files API 上传响应）。
-  const LlmContentPart.file(this.fileId) : type = 'file', text = '';
+  const LlmContentPart.file(this.fileId)
+    : type = 'file',
+      text = '',
+      imageDataUrl = '';
 
-  /// 线协议类型：`text` / `file`。
+  /// **内联图像块**：base64 data URL（`data:image/png;base64,…`）。
+  ///
+  /// 这是 Files API 走不通时的回退形态（端点不支持 / 上传非 2xx / 网络错 /
+  /// 响应里没有 `id` / 缺 `base_url`·`api_key`），由
+  /// `vision_files.dart` 的 `VisionImageRef.inline` 产出。
+  ///
+  /// **形状依据**（当时的核实，别再猜一遍）：
+  /// - DeepSeek 官方 Vision 文档口径：Chat Completions 的 user 消息 `content` 数组
+  ///   用 `{"type":"image_url","image_url":{"url": …}}` 携带 **http(s) URL 或
+  ///   base64 data URL**（`data:image/jpeg;base64,…`，与 OpenAI 同形）；
+  /// - 仓内旧 Python 后端（留档 `.output/head_llm.py`）用的就是这个形状；
+  /// - **不用** `{"type":"file","file_data":…}`：真端点 400 文案里确实提过
+  ///   `file_data`，但它的取值形态没有任何文档依据，形状猜错会把"只给路径"
+  ///   升级成"整轮请求 400"——不值得赌。
+  ///
+  /// 上限：官方内联口径是单张 ≤ 32 MiB、请求体 ≤ 48 MiB，由 `vision_files.dart` 的
+  /// `visionMaxInlineBytes` 把关（超限就退回"只发路径"，绝不把整轮请求撑爆）。
+  const LlmContentPart.imageUrl(this.imageDataUrl)
+    : type = 'image_url',
+      text = '',
+      fileId = '';
+
+  /// 线协议类型：`text` / `file` / `image_url`。
   final String type;
 
   /// 正文（[type] == `text` 时有值）。
@@ -92,7 +123,10 @@ class LlmContentPart {
   /// 端点文件 id（[type] == `file` 时有值）。
   final String fileId;
 
-  /// 线协议形状：**`file_id` 是内容块的同级字段，不再套一层 `file` 对象**。
+  /// 内联图像的 data URL（[type] == `image_url` 时有值）。
+  final String imageDataUrl;
+
+  /// 线协议形状：**`file_id` / `image_url` 都是内容块的同级字段**。
   ///
   /// 实测（2026-10-01，真实端点 + 真图，逐形状探针）：
   /// - `{"type":"file","file":{"file_id":…}}` ⇒ **400**：
@@ -102,20 +136,36 @@ class LlmContentPart {
   ///
   /// 也就是说 OpenAI 那套「`file` 里再放 `file_id`」的嵌套在 DeepSeek 端点是**错的**；
   /// 之前"upload 成功但 chat 一直 400"的根因就在这里——与密钥、上传、缓存都无关。
-  Map<String, dynamic> toWire() => type == 'file'
-      ? <String, dynamic>{'type': 'file', 'file_id': fileId}
-      : <String, dynamic>{'type': 'text', 'text': text};
+  ///
+  /// 内联图像则相反：**要**套一层 `image_url` 对象（`{"url": …}`）——那是 OpenAI /
+  /// DeepSeek 文档里 vision 内容块的标准形状（见 [LlmContentPart.imageUrl]）。
+  Map<String, dynamic> toWire() => switch (type) {
+    'file' => <String, dynamic>{'type': 'file', 'file_id': fileId},
+    'image_url' => <String, dynamic>{
+      'type': 'image_url',
+      'image_url': <String, dynamic>{'url': imageDataUrl},
+    },
+    _ => <String, dynamic>{'type': 'text', 'text': text},
+  };
 
   /// 从线协议恢复；未知类型返回 null（调用方放行原请求）。
+  ///
+  /// `image_url` 字段既可能是对象（`{"url": …}`，标准形状），也可能是裸字符串
+  /// （少数网关的宽松写法）：两种都认，免得插件改写过的请求体在这里被判成未知块。
   static LlmContentPart? tryFromWire(Object? raw) {
     if (raw is! Map) return null;
     final String type = (raw['type'] ?? 'text').toString();
     return switch (type) {
       'file' => LlmContentPart.file((raw['file_id'] ?? '').toString()),
+      'image_url' => LlmContentPart.imageUrl(_urlOf(raw['image_url'])),
       'text' => LlmContentPart.text((raw['text'] ?? '').toString()),
       _ => null,
     };
   }
+
+  /// 取 `image_url` 里的 url（对象取 `url`，字符串直接用）。
+  static String _urlOf(Object? raw) =>
+      raw is Map ? (raw['url'] ?? '').toString() : (raw ?? '').toString();
 }
 
 /// 一条对话消息。
@@ -179,7 +229,7 @@ class LlmMessage {
   final String? toolCallId;
   final String? name;
 
-  /// 正文之外的**内容块**（当前只有"已上传到端点的文件引用"）。
+  /// 正文之外的**内容块**（"已上传到端点的文件引用"或"内联 base64 图像"）。
   ///
   /// 非空时 [toWire] 把 `content` 输出成**数组**（`[{type:text},{type:file}...]`），
   /// 这是 OpenAI 兼容端点表达多模态内容的方式；空（默认）时仍是字符串，与改动前
@@ -320,10 +370,12 @@ class LlmMessage {
       for (final Object? item in rawContent) {
         final LlmContentPart? part = LlmContentPart.tryFromWire(item);
         if (part == null) return null;
-        if (part.type == 'file') {
-          parts.add(part);
-        } else {
+        // 只有 text 块拼回正文；file / image_url 都是"二进制内容"，原样收进
+        // contentParts（否则内联图像的 data URL 会被当成正文拼进去、还拼错位）。
+        if (part.type == 'text') {
           text.write(part.text);
+        } else {
+          parts.add(part);
         }
       }
       content = text.toString();

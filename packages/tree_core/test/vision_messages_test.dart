@@ -3,19 +3,27 @@ import 'package:tree_core/tree_core.dart';
 
 import 'fake_transport.dart';
 
-/// 假视觉解析器：记录被问过哪些附件，按脚本给 file_id（或一律失败）。
+/// 假视觉解析器：记录被问过哪些附件，按脚本给 file_id（或一律失败/一律内联）。
 class _FakeResolver implements VisionFileResolver {
-  _FakeResolver({this.ids = const <String>['file-api-1'], this.fail = false});
+  _FakeResolver({
+    this.ids = const <String>['file-api-1'],
+    this.fail = false,
+    this.inlineBase64,
+  });
 
   final List<String> ids;
   final bool fail;
+
+  /// 非空 = 一律回退内联（模拟"端点不支持 Files API / 上传失败"）。
+  final String? inlineBase64;
+
   final List<Map<String, dynamic>> calls = <Map<String, dynamic>>[];
   final List<CoreModelConfig> configs = <CoreModelConfig>[];
   final List<String> agents = <String>[];
   bool closed = false;
 
   @override
-  Future<String?> resolve({
+  Future<VisionImageRef?> resolve({
     required CoreModelConfig config,
     required String agentId,
     required Map<String, dynamic> attachment,
@@ -24,8 +32,12 @@ class _FakeResolver implements VisionFileResolver {
     configs.add(config);
     agents.add(agentId);
     if (fail) return null;
+    final String? inline = inlineBase64;
+    if (inline != null) {
+      return VisionImageRef.inline(base64: inline, contentType: 'image/png');
+    }
     final int index = calls.length - 1;
-    return index < ids.length ? ids[index] : ids.last;
+    return VisionImageRef.file(index < ids.length ? ids[index] : ids.last);
   }
 
   @override
@@ -173,6 +185,49 @@ void main() {
       expect(sent.content, contains('.input/20261001/图1.png'));
     });
 
+    test('上传走不通（解析器回退内联）：请求体里出现内联 base64 图像块', () async {
+      final CoreModelConfig config = modelConfig(ifVision: true);
+      // 模拟"端点不支持 Files API / 上传失败"：解析器直接给内联 base64
+      final _FakeResolver resolver = _FakeResolver(
+        inlineBase64: 'iVBORw0KGgoAAAANSUhEUg==',
+      );
+      final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+        textScript('我看到图了'),
+      ]);
+      await run(
+        build(transport, config: config, resolver: resolver),
+        transport,
+        <CoreMessageRef>[
+          CoreMessageRef(
+            role: 'user',
+            content: '看这张图',
+            attachments: <Map<String, dynamic>>[_png(1)],
+          ),
+        ],
+      );
+
+      final LlmMessage sent = transport.requests.single.messages.last;
+      expect(sent.contentParts.single.type, 'image_url');
+
+      // 真正的上线形态：正文块 + **内联图像块**（OpenAI/DeepSeek vision 口径）
+      final Map<String, dynamic> body = OpenAiCodec.requestBody(
+        transport.requests.single,
+        stream: true,
+      );
+      final Map<String, dynamic> user =
+          (body['messages'] as List<dynamic>).last as Map<String, dynamic>;
+      final List<dynamic> content = user['content'] as List<dynamic>;
+      expect(content, hasLength(2));
+      expect(content[1], <String, dynamic>{
+        'type': 'image_url',
+        'image_url': <String, dynamic>{
+          'url': 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==',
+        },
+      });
+      // 路径说明段照旧在（降级路径与内联路径不互斥）
+      expect(sent.content, contains('.input/20261001/图1.png'));
+    });
+
     test('多图：按附件顺序各给一个 file 块', () async {
       final CoreModelConfig config = modelConfig(ifVision: true);
       final _FakeResolver resolver = _FakeResolver(
@@ -231,7 +286,7 @@ void main() {
       expect(sent.content, contains('.input/20261001/报告.pdf'));
     });
 
-    test('解析失败（上传挂了）：本轮照常出结果，只是没有 file 块', () async {
+    test('解析失败（上传挂了且没字节可内联）：本轮照常出结果，只是没有块', () async {
       final CoreModelConfig config = modelConfig(ifVision: true);
       final _FakeResolver resolver = _FakeResolver(fail: true);
       final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[

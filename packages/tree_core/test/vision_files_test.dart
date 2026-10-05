@@ -182,11 +182,12 @@ void main() {
   });
 
   group('multipart 请求体（纯函数）', () {
-    test('字段齐全：purpose / expires_after 两段 / 文件字节与文件名', () {
+    test('字段齐全：purpose / model / expires_after 两段 / 文件字节与文件名', () {
       final VisionMultipartBody body = visionMultipartBody(
         bytes: _pngBytes,
         filename: 'a.png',
         contentType: 'image/png',
+        modelId: 'deepseek-v4.1-flash',
         boundary: 'BOUND',
       );
       expect(body.contentType, 'multipart/form-data; boundary=BOUND');
@@ -198,6 +199,15 @@ void main() {
         contains(
           'Content-Disposition: form-data; name="purpose"\r\n'
           '\r\nuser_data\r\n',
+        ),
+      );
+      // **中转站（new-api）的硬要求**：表单不带 model 就 400
+      // 「Model name not specified, model name cannot be empty」（真机现场）。
+      expect(
+        text,
+        contains(
+          'Content-Disposition: form-data; name="model"\r\n'
+          '\r\ndeepseek-v4.1-flash\r\n',
         ),
       );
       expect(text, contains('name="expires_after[anchor]"\r\n\r\ncreated_at'));
@@ -235,6 +245,19 @@ void main() {
       );
     });
 
+    test('modelId 为空 = 不带 model 字段（官方端点无需，与改动前逐字一致）', () {
+      final VisionMultipartBody body = visionMultipartBody(
+        bytes: _pngBytes,
+        filename: 'a.png',
+        contentType: 'image/png',
+        boundary: 'B',
+      );
+      expect(
+        utf8.decode(body.body, allowMalformed: true),
+        isNot(contains('name="model"')),
+      );
+    });
+
     test('中文文件名：ASCII 兜底 + filename* 正规编码同时在', () {
       final VisionMultipartBody body = visionMultipartBody(
         bytes: _pngBytes,
@@ -258,13 +281,14 @@ void main() {
 
     tearDown(() async => api.close());
 
-    test('成功：POST {base}/files，带 Bearer 与 multipart，返回 id', () async {
+    test('成功：POST {base}/files，带 Bearer 与 multipart（含 model），返回 id', () async {
       api = FakeFilesApi();
       await api.start();
       final List<String> logs = <String>[];
       final VisionFileUploader uploader = VisionFileUploader(
         baseUrl: api.baseUrl,
         apiKey: 'sk-test',
+        modelId: 'deepseek-flash',
         log: logs.add,
       );
       addTearDown(uploader.close);
@@ -288,6 +312,12 @@ void main() {
         startsWith('multipart/form-data; boundary='),
       );
       expect(request.text, contains('name="purpose"\r\n\r\nuser_data'));
+      // 上传请求必须带模型名：不带就被中转站 400「Model name not specified」
+      expect(
+        request.text,
+        contains('name="model"\r\n\r\ndeepseek-flash'),
+        reason: 'multipart 里必须带 model（修复 400 的关键）',
+      );
       expect(request.text, contains('name="file"'));
       expect(logs.join('\n'), contains('file-api-xyz'));
       // 日志里绝不能出现密钥
@@ -479,15 +509,21 @@ void main() {
       );
       addTearDown(resolver.close);
 
-      final String? id = await resolver.resolve(
+      final VisionImageRef? ref = await resolver.resolve(
         config: _config(api.baseUrl),
         agentId: 'agt_1',
         attachment: _imageAttachment(),
       );
 
-      expect(id, 'file-api-xyz');
+      expect(ref?.isFile, isTrue);
+      expect(ref?.fileId, 'file-api-xyz');
       expect(io.readBytesCalls, 1);
       expect(api.requests.single.path, '/v1/files');
+      expect(
+        api.requests.single.text,
+        contains('name="model"\r\n\r\ndeepseek-flash'),
+        reason: '解析器必须把模型配置里的 model_id 带进上传表单（不硬编码）',
+      );
     });
 
     test('SSH：字节取自远端 IO 的 root；两个不同 root 不共用缓存', () async {
@@ -551,19 +587,19 @@ void main() {
 
       final CoreModelConfig config = _config(api.baseUrl);
       expect(
-        await resolver.resolve(
+        (await resolver.resolve(
           config: config,
           agentId: 'agt_1',
           attachment: _imageAttachment(),
-        ),
+        ))?.fileId,
         'file-api-xyz',
       );
       expect(
-        await resolver.resolve(
+        (await resolver.resolve(
           config: config,
           agentId: 'agt_1',
           attachment: _imageAttachment(),
-        ),
+        ))?.fileId,
         'file-api-xyz',
       );
       expect(api.requests, hasLength(1), reason: '同一张图只上传一次');
@@ -663,11 +699,11 @@ void main() {
       addTearDown(resolver.close);
 
       expect(
-        await resolver.resolve(
+        (await resolver.resolve(
           config: _config(api.baseUrl),
           agentId: 'agt_1',
           attachment: _imageAttachment(),
-        ),
+        ))?.fileId,
         'file-api-xyz',
       );
       expect(api.requests, hasLength(1));
@@ -717,7 +753,7 @@ void main() {
       expect(api.requests, isEmpty);
     });
 
-    test('模型缺 base_url / api_key：降级（不上传到别的地方）', () async {
+    test('模型缺 base_url / api_key：不发请求，直接内联 base64（照样送得出去）', () async {
       final _FakeIo io = _FakeIo(
         root: '/ws',
         files: <String, List<int>>{'.input/20261001/图片.png': _pngBytes},
@@ -729,16 +765,110 @@ void main() {
       );
       addTearDown(resolver.close);
 
+      final VisionImageRef? ref = await resolver.resolve(
+        config: CoreModelConfig(modelId: 'm', ifVision: true),
+        agentId: 'agt_1',
+        attachment: _imageAttachment(),
+      );
+
+      // 没有上传端点可打 ⇒ 走内联：模型仍看得见像素（不再只剩路径）
+      expect(ref?.isFile, isFalse);
+      expect(ref?.base64, base64Encode(_pngBytes));
+      expect(api.requests, isEmpty);
+      expect(logs.join('\n'), contains('base_url'));
+      expect(logs.join('\n'), contains('回退为内联 base64'));
+    });
+
+    test('端点不支持 Files API（400）：回退内联 base64，形状与 MIME 都对', () async {
+      api = FakeFilesApi(
+        statusCode: 400,
+        body:
+            '{"error":{"code":"","message":"Model name not specified, '
+            'model name cannot be empty","type":"new_api_error"}}',
+      );
+      await api.start();
+      final _FakeIo io = _FakeIo(
+        root: '/ws',
+        files: <String, List<int>>{'.input/20261001/图片.png': _pngBytes},
+      );
+      final List<String> logs = <String>[];
+      final WorkspaceVisionFileResolver resolver = WorkspaceVisionFileResolver(
+        ioFor: (String agentId) async => io,
+        log: logs.add,
+      );
+      addTearDown(resolver.close);
+
+      final VisionImageRef? ref = await resolver.resolve(
+        config: _config(api.baseUrl),
+        agentId: 'agt_1',
+        attachment: _imageAttachment(),
+      );
+
+      expect(ref?.isFile, isFalse, reason: '上传失败 ⇒ 不是 file 引用');
+      expect(ref?.base64, base64Encode(_pngBytes));
+      expect(ref?.contentType, 'image/png');
+      expect(
+        ref?.dataUrl,
+        'data:image/png;base64,${base64Encode(_pngBytes)}',
+        reason: '内联块的 URL 就是 data URL（形状依据见 LlmContentPart.imageUrl）',
+      );
+      expect(api.requests, hasLength(1), reason: '先试上传，失败才回退');
+      expect(logs.join('\n'), contains('HTTP 400'));
+      expect(logs.join('\n'), contains('回退为内联 base64'));
+      expect(logs.join('\n'), isNot(contains('sk-test')));
+    });
+
+    test('网络错（端点连不上）：同样回退内联 base64', () async {
+      api = FakeFilesApi();
+      await api.start();
+      final String baseUrl = api.baseUrl;
+      await api.close(); // 关掉假端点 ⇒ 连接被拒（真实网络错的等价物）
+      final _FakeIo io = _FakeIo(
+        root: '/ws',
+        files: <String, List<int>>{'.input/20261001/图片.png': _pngBytes},
+      );
+      final List<String> logs = <String>[];
+      final WorkspaceVisionFileResolver resolver = WorkspaceVisionFileResolver(
+        ioFor: (String agentId) async => io,
+        log: logs.add,
+      );
+      addTearDown(resolver.close);
+
+      final VisionImageRef? ref = await resolver.resolve(
+        config: _config(baseUrl),
+        agentId: 'agt_1',
+        attachment: _imageAttachment(),
+      );
+
+      expect(ref?.isFile, isFalse);
+      expect(ref?.base64, base64Encode(_pngBytes));
+      expect(logs.join('\n'), contains('回退为内联 base64'));
+    });
+
+    test('上传失败且超过内联上限：降级为路径提示（返回 null，不发请求）', () async {
+      api = FakeFilesApi(statusCode: 400, body: '{"error":{}}');
+      await api.start();
+      final _FakeIo io = _FakeIo(
+        root: '/ws',
+        files: <String, List<int>>{'.input/20261001/图片.png': _pngBytes},
+      );
+      final List<String> logs = <String>[];
+      final WorkspaceVisionFileResolver resolver = WorkspaceVisionFileResolver(
+        ioFor: (String agentId) async => io,
+        log: logs.add,
+        maxInlineBytes: 4, // 真上限是 32 MiB，这里用小值触发这条分支
+      );
+      addTearDown(resolver.close);
+
       expect(
         await resolver.resolve(
-          config: CoreModelConfig(modelId: 'm', ifVision: true),
+          config: _config(api.baseUrl),
           agentId: 'agt_1',
           attachment: _imageAttachment(),
         ),
         isNull,
       );
-      expect(api.requests, isEmpty);
-      expect(logs.join('\n'), contains('base_url'));
+      expect(logs.join('\n'), contains('超过内联上限'));
     });
   });
 }

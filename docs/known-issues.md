@@ -1699,3 +1699,72 @@ terminal/subagent hook 完成消息）在工具调用期间必须排队等待」
    同夜 22:56 的 `errno=121` 与它不是同一条连接（若是，计数本应从 22:56 起涨）；
 5. `LivenessTracker`（MCP / WS / LLM 的通用台账）**保持原语义**：那些通道的上游本来就能重建（MCP 懒连接、
    WS 前端重连），本次不清扫它们的文案与行为。
+
+---
+
+## #30 图像上传被中转站 400 拒掉 ⇒ agent「读图片拿不到像素」（只剩路径/base64 文本）
+
+**状态**：已由「**内联 base64 回退**」修复（2026-10-05）。⚠️ 最初的判定根因（"表单缺
+`model` 字段"）**已被真机探针证伪**，见下「根因（含实测证伪）」。
+
+### 现象
+
+- 用户勾了 `if_vision` 的模型发图，模型只说"我拿不到图"；核心日志反复出现
+  `[core:vision] [vision] 上传失败：HTTP 400 {"error":{"code":"","message":"Model name not specified, model name cannot be empty (request id: …)","type":"new_api_error"}}`。
+- 现场：`%APPDATA%\Tree\logs\core.log`，pid=17544 自 2026-10-04 23:12 起、pid=39968 于 2026-10-05 13:22:24/13:24:53/13:30:25 各一条；模型 `deepseek-v4.1-flash` @ `https://token.ai-galaxy.com/v1`（new-api 中转站）。
+- 对照：同一台机器上 `deepseek-flash` @ `https://api.deepseek.com`（官方）上传是好的（`config/vision_files.json` 里有 `file-api-…` 记录）。
+
+### 根因（含实测证伪）
+
+1. **真实根因（实测确定）**：那个端点**不支持 Files API**。`packages/tree_core/tool/probe_vision_upload.dart`
+   （一次性探针，同一张 70 字节 PNG，只打 `/files`、不发 chat）实测：
+   `token.ai-galaxy.com/v1` 对 **不带 `model` / 表单带 `model` / 查询串带 `model`** 三种带法
+   **一律 400** `Model name not specified, model name cannot be empty`；同一时刻
+   `api.deepseek.com`（官方）**不带与带 `model` 都上传成功**（拿到 `file-api-…`，未知字段被忽略）。
+   ⇒ 400 与新老表单无关，**"给表单加 `model`"救不了它**（最初判定的根因被证伪）。
+2. 上传失败后 `VisionFileResolver.resolve()` 返回 null ⇒ 引擎只发路径 ⇒ 模型看不到像素
+   （`read` 工具那条路则是把 base64 当文本塞进 tool 结果，同样不是像素）。
+   ⇒ **真正让图送达的是"失败即内联 base64"这条回退**。
+
+### 修复
+
+- `visionMultipartBody()` / `VisionFileUploader` 增加 `model` 字段，值取该 agent 解析出的
+  `CoreModelConfig.modelId`（**不硬编码**；为空时不发该字段）。
+  **实测口径**：对官方端点零回归（带与不带都成功）、对那个中转站**无效**（三种带法都 400）
+  ⇒ 这一条**不是**本 issue 的解药，保留只为兼容确实要求该字段的 new-api 变体；
+  `WorkspaceVisionFileResolver` 的上传器复用键改为 `baseUrl|apiKey|modelId`。
+- **回退路径**：端点不支持 Files API / 上传失败（非 2xx、网络错、响应无 `id`、缺 `base_url`·`api_key`）时，
+  `resolve()` 返回 `VisionImageRef.inline`，引擎产出
+  `{"type":"image_url","image_url":{"url":"data:<mime>;base64,…"}}`（形状依据：DeepSeek 官方 Vision 文档的
+  Chat Completions 口径 + 仓内旧后端实现；**不用** `{"type":"file","file_data":…}`——取值形态无文档依据）。
+  内联受官方口径**单张 ≤ 32 MiB**（`visionMaxInlineBytes`）限制，超限或读不到字节才退回"提示词里给路径"。
+- 三条硬约束不变（只读工作空间 IO / 失败绝不阻断本轮 / 密钥只进 `Authorization` 头）。
+
+### 验证
+
+- `packages/tree_core/test/vision_files_test.dart`：multipart **带 `model` 字段**（纯函数 + 真 HTTP 假端点两层断言）、
+  400/网络错 ⇒ 回退内联（`base64`/`contentType`/`dataUrl` 逐项断言）、缺 api_key ⇒ 内联且零请求、
+  超内联上限 ⇒ 返回 null；
+- `packages/tree_core/test/vision_messages_test.dart`：内联回退时**请求体里出现
+  `{'type':'image_url','image_url':{'url':'data:image/png;base64,…'}}`**；
+- `packages/tree_core/test/attachments_ws_e2e_test.dart`：真 HTTP + 真 WS 端到端，上传成功断言表单带 `model`，
+  上传 500 断言改为内联块且本轮不报错；
+- `packages/tree_core/test/llm_protocol_test.dart`：内联块线协议形状 + `tryFromWire` 往返逐字一致。
+- **真机探针（2026-10-05，本机；只打 `/files`，不发 chat）**：`token.ai-galaxy.com/v1`
+  不带/表单带/查询串带 `model` **三种全 400**；`api.deepseek.com` 不带与带 `model` **均成功**
+  ⇒ 既证明"该中转站不支持 Files API"，也证明"加 `model` 对官方端点零回归"。
+  探针脚本：`packages/tree_core/tool/probe_vision_upload.dart`（可重跑；输出不含 api_key）。
+- 全量：`cd packages/tree_core && dart test` → **1195 passed / 2 skipped，All tests passed**。
+
+### 遗留
+
+1. **内联形状未对真实 chat 端点实测**（本次明确禁止发真实 chat/completions）：依据是官方文档 + 仓内旧实现 +
+   端点错误文案；中转站若不吃 `image_url`，该模型仍只拿到路径（不会比修复前更差）。
+2. **`read` 工具读图仍是 base64 文本**（tool 结果在线协议里恒为字符串，`llm_types.dart` 的 `LlmMessage.toWire`）：
+   要让 agent 用 `read` 读到像素需要改 tool 结果的线形态（多数网关只支持 user 消息含图像），本次未动。
+3. **真机探针已做**（结论见「验证」）：它只覆盖 Files API 那一步。**上传成功后的 `file` 内容块引用效果**
+   与**内联回退的实际形状**都仍未对真实 chat 端点实测（本次明确禁止发真实 chat/completions），
+   依据是官方文档 + 仓内旧实现 + 单测。中转站若连 `image_url` 内联也不吃，那个模型仍只拿到路径
+   （**不会**比修复前更差）。
+4. **中转站场景下每张图仍会白跑一次 `/files`**（必然 400）后才内联：本轮没做"该端点已知不支持 ⇒ 直接内联"
+   的短路/记忆，收益是一次无用的 HTTP 往返（无正确性影响）。
