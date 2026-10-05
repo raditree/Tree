@@ -107,10 +107,16 @@ void main() {
       '    scope: {}\n';
 
   /// 起一条真总线，并把执行站四项依赖接成假实现。
+  ///
+  /// [llmBadJson] 非空 = 总结调用**失败但带原文**（`LlmJsonCaller` 解析失败分支的
+  /// 真实形状）：插件应当据此做本地修复 / 发一次修复调用，而不是当场弃权。
+  /// [llmRepairOk] = 第二段自愈（"判断完整性 + 修 json"调用）是否成功。
   Future<PluginBus> startBus({
     required String agentId,
     required bool llmOk,
     List<String> logs = const <String>[],
+    String? llmBadJson,
+    bool llmRepairOk = true,
   }) async {
     final String dir = p.join(temp.path, 'bus-${++busSeq}');
     final File file = File(p.join(dir, 'config', 'plugins.yaml'));
@@ -149,44 +155,56 @@ void main() {
               List<Object?>? tools,
               String? responseFormat,
             }) async {
+              // 修复调用（自愈第二段）的判别：单条 user、**不带** response_format
+              // / tools —— 与插件 [repair_json] 的入参口径一一对应。
+              final bool isRepair =
+                  responseFormat == null &&
+                  messages != null &&
+                  messages.length == 1;
               llmCalls.add(<String, dynamic>{
                 'agent_id': agentId,
                 'messages': messages,
                 'system': system,
                 'tools': tools,
                 'response_format': responseFormat,
+                'max_tokens': maxTokens,
+                'is_repair': isRepair,
               });
+              if (isRepair) {
+                if (!llmRepairOk) {
+                  return <String, dynamic>{'error': '修复调用失败（假端点）'};
+                }
+                return <String, dynamic>{
+                  'ok': true,
+                  'json': <String, dynamic>{
+                    'complete': false,
+                    'reason': '正文在 required_files 中途断掉',
+                    'summary': demoSummary(),
+                  },
+                  'text': '{"complete":false}',
+                  'model': 'demo-model',
+                  'usage': <String, dynamic>{'prompt_tokens': 300},
+                };
+              }
               if (!llmOk) {
+                if (llmBadJson != null) {
+                  // 与生产实现（LlmJsonCaller 解析失败分支）同一口径：**失败但带原文**。
+                  return <String, dynamic>{
+                    'error':
+                        '模型正文不是合法 JSON（本次按 text 形态发送：'
+                        '未发 response_format…）',
+                    'error_kind': 'json_parse',
+                    'text': llmBadJson,
+                    'text_length': llmBadJson.length,
+                    'truncated_suspect': !llmBadJson.trimRight().endsWith('}'),
+                    'model': 'agent-model',
+                  };
+                }
                 return <String, dynamic>{'error': '端点不支持 json_object'};
               }
               return <String, dynamic>{
                 'ok': true,
-                'json': <String, dynamic>{
-                  'background': '用户要把登录改成 JWT。',
-                  'trajectory': '已定位 auth 模块是 session 实现。',
-                  'files_changed': <Map<String, dynamic>>[
-                    <String, dynamic>{
-                      'path': 'lib/auth.dart',
-                      'change': '修改：改成 JWT 校验',
-                    },
-                  ],
-                  'required_files': <Map<String, dynamic>>[
-                    <String, dynamic>{
-                      'path': 'lib/auth.dart',
-                      'start_line': 1,
-                      'line_count': 20,
-                      'why': '正在改的模块',
-                    },
-                    <String, dynamic>{
-                      'path': 'docs/plan.md',
-                      'why': '计划文档',
-                    },
-                    <String, dynamic>{
-                      'path': 'docs/missing.md',
-                      'why': '故意不存在：必须留下失败结果',
-                    },
-                  ],
-                },
+                'json': demoSummary(),
                 'text': '{"ok":true}',
                 'model': 'demo-model',
                 'usage': <String, dynamic>{'prompt_tokens': 1200},
@@ -612,7 +630,192 @@ void main() {
       reason: '互斥的另一半：内置摘要接管时清掉中转站的列表',
     );
   }, timeout: const Timeout(Duration(seconds: 180)), skip: noPython);
+
+  test('总结正文非法 JSON（可本地修复）⇒ 插件零额外调用仍接管（钱别白花）', () async {
+    // 真机现场（2026-10-05 18:29）：`llm.call` **成功了**（448k prompt、≈100% 命中
+    // 缓存）但正文不是合法 JSON，插件却报"原文 0 字"当场弃权 ⇒ 核心回退内置压缩，
+    // 那笔几十万 token 的钱白花。原因是 `failedWith` 的载荷在
+    // `StationInstance.execute` 的失败分支被丢掉（见 docs/known-issues.md #31
+    // 「真机复现」）。这条用例把"原文必须经执行站回到插件"钉在真进程 + 真总线上。
+    final String encoded = jsonEncode(demoSummary());
+    final String trailingComma = '${encoded.substring(0, encoded.length - 1)},}';
+    final MemoryStore store = storeWithThreeTurns();
+    final CoreAgent agent = store.agents().single;
+    final CoreSession session = store.session(
+      agent.id,
+      TreeStore.defaultSessionId,
+    )!;
+    final List<String> logs = <String>[];
+    final PluginBus bus = await startBus(
+      agentId: agent.id,
+      llmOk: false,
+      llmBadJson: trailingComma,
+      logs: logs,
+    );
+    await waitForSubscription(bus, logs);
+
+    final CompactionService service = CompactionService(
+      store: store,
+      settings: CoreSettings(),
+      summarizer: _FakeSummarizer(),
+    )..relayHook = bus.relayCompaction;
+    service.wireRequestProvider = wireProvider();
+    final CompactionResult result = await service.compact(
+      agent.id,
+      session.sessionId,
+    );
+
+    expect(
+      result.source,
+      compactionSourceRelay,
+      reason: '本地结构修复救回了摘要 ⇒ 插件接管；日志：${logs.join(' | ')}',
+    );
+    expect(result.summarizedMessages, 6);
+    expect(
+      llmCalls,
+      hasLength(1),
+      reason: '本地结构修复是免费的：不该多花一次调用',
+    );
+    final CoreSession after = store.session(agent.id, session.sessionId)!;
+    final String summary = after.compactedContext[1]['content'] as String;
+    expect(
+      summary,
+      contains('由本地结构修复得到'),
+      reason: '抢救回来的摘要必须显式标注（可能不完整）',
+    );
+    expect(summary, contains('## 背景'));
+    expect(summary, contains('lib/auth.dart'));
+  }, timeout: const Timeout(Duration(seconds: 180)), skip: noPython);
+
+  test('正文被截断 ⇒ 恰好一次修复调用（不带 tools / response_format / max_tokens）后接管', () async {
+    // 本地修不了（真截断）时的第二段自愈：一次小的"判断完整性 + 修 json"调用。
+    // 三条硬口径都要钉住：不带 tools、不发 response_format、**不设 max_tokens**
+    // （设小了就是下一次截断、钱又白花）。
+    const String truncated =
+        '{"background": "把登录改成 JWT", "trajectory": "已定位 auth 模块';
+    final MemoryStore store = storeWithThreeTurns();
+    final CoreAgent agent = store.agents().single;
+    final CoreSession session = store.session(
+      agent.id,
+      TreeStore.defaultSessionId,
+    )!;
+    final List<String> logs = <String>[];
+    final PluginBus bus = await startBus(
+      agentId: agent.id,
+      llmOk: false,
+      llmBadJson: truncated,
+      logs: logs,
+    );
+    await waitForSubscription(bus, logs);
+
+    final CompactionService service = CompactionService(
+      store: store,
+      settings: CoreSettings(),
+      summarizer: _FakeSummarizer(),
+    )..relayHook = bus.relayCompaction;
+    service.wireRequestProvider = wireProvider();
+    final CompactionResult result = await service.compact(
+      agent.id,
+      session.sessionId,
+    );
+
+    expect(
+      result.source,
+      compactionSourceRelay,
+      reason: '修复调用补全了摘要 ⇒ 插件接管；日志：${logs.join(' | ')}',
+    );
+    expect(result.summarizedMessages, 6);
+    expect(llmCalls, hasLength(2), reason: '本地修不了 ⇒ 恰好一次修复调用（硬上限）');
+    final Map<String, dynamic> repair = llmCalls[1];
+    expect(repair['is_repair'], isTrue, reason: '第二条必须是那次修复调用');
+    expect(
+      repair['response_format'],
+      isNull,
+      reason: '修复调用不发 response_format（站点缺省即 json_object）',
+    );
+    expect(repair['tools'], isNull, reason: '修复调用不带 tools');
+    expect(
+      repair['max_tokens'],
+      isNull,
+      reason: '不设小 max_tokens：设小了 = 下一次截断 = 钱又白花',
+    );
+    final CoreSession after = store.session(agent.id, session.sessionId)!;
+    final String summary = after.compactedContext[1]['content'] as String;
+    expect(summary, contains('由一次 JSON 修复调用补全'));
+    expect(summary, contains('模型判定原文被截断'));
+  }, timeout: const Timeout(Duration(seconds: 180)), skip: noPython);
+
+  test('本地修不了 + 修复调用也失败 ⇒ 不接管，且原因可读（不再是"原文 0 字"）', () async {
+    const String truncated =
+        '{"background": "把登录改成 JWT", "trajectory": "已定位 auth 模块';
+    final MemoryStore store = storeWithThreeTurns();
+    final CoreAgent agent = store.agents().single;
+    final CoreSession session = store.session(
+      agent.id,
+      TreeStore.defaultSessionId,
+    )!;
+    final List<String> logs = <String>[];
+    final PluginBus bus = await startBus(
+      agentId: agent.id,
+      llmOk: false,
+      llmBadJson: truncated,
+      llmRepairOk: false,
+      logs: logs,
+    );
+    await waitForSubscription(bus, logs);
+
+    final CompactionService service = CompactionService(
+      store: store,
+      settings: CoreSettings(),
+      summarizer: _FakeSummarizer(),
+    )..relayHook = bus.relayCompaction;
+    service.wireRequestProvider = wireProvider();
+    final CompactionResult result = await service.compact(
+      agent.id,
+      session.sessionId,
+    );
+
+    expect(result.source, compactionSourceBuiltin, reason: '三段都失败 ⇒ 回退内置');
+    expect(llmCalls, hasLength(2), reason: '硬上限：放弃前只多花一次调用');
+    final String why = logs
+        .where((String l) => l.contains('未接管'))
+        .map((String l) => l)
+        .join(' | ');
+    expect(why, contains('repair_failed'), reason: '原因要给到机读 code，别只说"回 null"');
+    expect(
+      why,
+      contains('原文'),
+      reason: '真正的原因必须能看懂（真机那次只留下"原文 0 字"）',
+    );
+    expect(
+      why,
+      isNot(contains('原文 0 字')),
+      reason: '插件拿到原文了，就不该再报 0 字',
+    );
+  }, timeout: const Timeout(Duration(seconds: 180)), skip: noPython);
 }
+
+/// 假总结器的"合法摘要"（与真插件约定的四键 schema 一致）。
+Map<String, dynamic> demoSummary() => <String, dynamic>{
+  'background': '用户要把登录改成 JWT。',
+  'trajectory': '已定位 auth 模块是 session 实现。',
+  'files_changed': <Map<String, dynamic>>[
+    <String, dynamic>{'path': 'lib/auth.dart', 'change': '修改：改成 JWT 校验'},
+  ],
+  'required_files': <Map<String, dynamic>>[
+    <String, dynamic>{
+      'path': 'lib/auth.dart',
+      'start_line': 1,
+      'line_count': 20,
+      'why': '正在改的模块',
+    },
+    <String, dynamic>{'path': 'docs/plan.md', 'why': '计划文档'},
+    <String, dynamic>{
+      'path': 'docs/missing.md',
+      'why': '故意不存在：必须留下失败结果',
+    },
+  ],
+};
 
 /// 假总结器（回退路径专用）。
 class _FakeSummarizer implements ContextSummarizer {

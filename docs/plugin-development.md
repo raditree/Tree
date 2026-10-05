@@ -459,9 +459,18 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `agent.stop` | `agent_id?`, `cascade?`（缺省 true） | `{any_running, reason?, …}` | 停止（级联）生成 |
 | `agent.compact` | `agent_id?`, `session_id?` | `{…}` | **发起上下文压缩** |
 | `ui.push` | `slot_key`, `view?` | `{pushed, slot, slot_key, unregistered}` | 往消息流推一张卡片（§7） |
-| `llm.call` | `messages?` 或 `prompt?`, `system?`, `model?`, `temperature?`, `max_tokens?`, `tools?`（OpenAI 工具声明**原样透传**，给压缩插件对齐对话前缀用）, `response_format?`（`"json_object"` 缺省 / `"text"` = **不发**该字段，为复用对话前缀缓存；也接受 `{"type": …}`） | `{ok, json, text, model, usage}`；失败 `{ok:false, error:'可读原因'}` | **站点处缺省硬设 JSON 返回形式**的 LLM 调用，复用目标 agent 的模型（显式 `"text"` 时改用对话同形态，见 §「缓存」第 3 条） |
+| `llm.call` | `messages?` 或 `prompt?`, `system?`, `model?`, `temperature?`, `max_tokens?`, `tools?`（OpenAI 工具声明**原样透传**，给压缩插件对齐对话前缀用）, `response_format?`（`"json_object"` 缺省 / `"text"` = **不发**该字段，为复用对话前缀缓存；也接受 `{"type": …}`） | 成功 `{ok, json, text, model, usage}`；失败 `{ok:false, error, error_kind?, text, text_length, truncated_suspect?}`（**失败也带模型正文原文**，见下表后说明） | **站点处缺省硬设 JSON 返回形式**的 LLM 调用，复用目标 agent 的模型（显式 `"text"` 时改用对话同形态，见 §「缓存」第 3 条） |
 | `tool.call` | `tool`, `arguments?`, `relay?`（默认 false） | `{tool, result, is_error, relayed}` | 执行**任意工具**（内置 / MCP / 插件工具同一入口） |
 | `session.rename` | `title`（必填）, `session_id?` | `{renamed, title, session_id}` | 会话重命名（前端即时刷新标题） |
+
+**失败回包也可能带 `payload`**（2026-10-05 新增，**纯增量**）：`ok:false` 只表示"这次命令
+没跑成"，不代表产出没有价值。典型是 `llm.call` 拿到了 200、模型正文却解析不出 JSON：
+这时回包是 `{"ok":false, "error":"…", "payload":{"error_kind":"json_parse","text":"<模型正文原文>",
+"text_length":9380,"truncated_suspect":false,"model":"…"}}`——**`text` 是已付费的那次产出**，
+插件应当据此自愈（本地修 JSON / 发一次小的"判断 + 修 JSON"调用），而不是当场弃权。
+> 为什么写进指南：这一跳真机踩空过——核心侧明明把原文放进了回包，插件却收到空 `payload`、
+> 报"原文 0 字"，一次 448k prompt（≈100% 命中缓存）的总结就被整包丢掉（known-issues #31）。
+> 老插件只读 `ok`/`error` 时行为**逐字不变**；写自愈逻辑时请读 `payload`。
 
 ### 6.2 身份从哪来
 

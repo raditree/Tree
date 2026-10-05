@@ -334,7 +334,10 @@ class LlmJsonCaller {
       log?.call(
         'llm.call 回包不是合法 JSON（agent=$agentId model=$effectiveModel '
         'response_format=${responseFormat ?? 'json_object'} 正文 ${raw.length} 字'
-        '${truncated ? '，疑似被截断' : ''}）：${_rawPreview(raw)}',
+        '${truncated ? '，疑似被截断' : ''}）：${_rawPreview(raw)}'
+        // 首尾预览看不出"坏在哪儿"时，解析器的原话（含 offset）是最短的线索：
+        // 真机两次事故都只留下了"正文 9380 字"这类信息，定位不到具体坏点。
+        '${_lastDecodeError.isEmpty ? '' : '；解析错误：$_lastDecodeError'}',
       );
       return <String, dynamic>{
         'error': responseFormat == 'text'
@@ -430,9 +433,16 @@ class LlmJsonCaller {
     return out;
   }
 
+  /// 最近一次解析失败的**原因原话**（`FormatException` 的 message，含 offset）。
+  ///
+  /// 只服务日志：`truncated_suspect` 只能判"像不像被截断"，判不出"坏在哪个字符"。
+  /// 每次 `_tryParseJson` 入口清空，失败分支立刻读——不给调用方新增返回值。
+  static String _lastDecodeError = '';
+
   /// 解析 JSON：模型可能包 ```json 代码块或前后带解释，这里做**最小容错**。
   static Object? _tryParseJson(String raw) {
     final String text = raw.trim();
+    _lastDecodeError = '';
     if (text.isEmpty) return null;
     Object? decoded = _decode(text);
     if (decoded != null) return decoded;
@@ -451,7 +461,8 @@ class LlmJsonCaller {
       // JSON 形式要求"一个对象"；数组 / 标量也接受（由插件决定怎么用），
       // 但 null 视为没解出来
       return value;
-    } catch (_) {
+    } catch (error) {
+      _lastDecodeError = '$error';
       return null;
     }
   }

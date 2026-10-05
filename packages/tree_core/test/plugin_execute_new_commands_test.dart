@@ -101,6 +101,17 @@ void main() {
               if (prompt == '端点会拒绝') {
                 return <String, dynamic>{'error': '端点不支持 json_object'};
               }
+              if (prompt == '正文不是 JSON') {
+                // 与生产实现（LlmJsonCaller 解析失败分支）同一口径：**失败但带原文**。
+                return <String, dynamic>{
+                  'error': '模型正文不是合法 JSON（本次按 text 形态发送：未发 response_format…）',
+                  'error_kind': 'json_parse',
+                  'text': '{"background": "半截正文',
+                  'text_length': 19,
+                  'truncated_suspect': true,
+                  'model': 'agent-model',
+                };
+              }
               // 与生产实现（LlmJsonCaller）同一口径：model 为空 = 复用目标 agent 的模型
               final String requested = (model ?? '').trim();
               return <String, dynamic>{
@@ -282,6 +293,40 @@ void main() {
     );
     expect(upstream.ok, isFalse);
     expect(upstream.error, contains('端点不支持 json_object'));
+  }, timeout: const Timeout(Duration(seconds: 60)));
+
+  test('llm.call：解析失败也必须把原文（text）经执行站回给插件', () async {
+    // 这一跳是**真机踩空过的地方**：`failedWith(error, payload)` 的载荷曾经在
+    // `StationInstance.execute` 的失败分支被丢掉 ⇒ 插件拿到 `payload=null`、
+    // 报"原文 0 字"、连本地修复的机会都没有 ⇒ 那笔已付费的总结调用整包白扔
+    // （docs/known-issues.md #31「真机复现」）。
+    wire(mounts());
+
+    final StationCommandResult result = await run(
+      'llm.call',
+      arguments: <String, dynamic>{
+        'prompt': '正文不是 JSON',
+        'response_format': 'text',
+      },
+    );
+    expect(result.ok, isFalse, reason: '调用确实是失败的');
+    expect(result.error, contains('不是合法 JSON'));
+
+    final Map<String, dynamic> payload =
+        result.payload! as Map<String, dynamic>;
+    expect(
+      payload['text'],
+      '{"background": "半截正文',
+      reason: '模型正文原文必须原样带出去：插件靠它本地修复 / 交给修复调用',
+    );
+    expect(payload['error_kind'], 'json_parse');
+    expect(payload['text_length'], 19);
+    expect(payload['truncated_suspect'], isTrue);
+    expect(
+      llmCalls.single['response_format'],
+      'text',
+      reason: '失败回包不影响入参透传（插件的 text 形态仍原样传给调用器）',
+    );
   }, timeout: const Timeout(Duration(seconds: 60)));
 
   test('llm.call：response_format 可显式选 text（复用对话前缀的正路），非法值可读失败', () async {

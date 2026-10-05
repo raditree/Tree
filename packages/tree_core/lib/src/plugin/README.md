@@ -48,6 +48,12 @@
    同理，**命令类失败若带着产出**（`llm.call` 解析不出 JSON 时的模型正文）要用
    `StationCommandOutcome.failedWith(error, payload)` 回，别只回一句 `error`——那等于把插件已付费的
    那次调用彻底丢掉（现场是 734k prompt 的总结，见 [../llm/README.md](../llm/README.md) 不变量 14）。
+   **而且这份 `payload` 必须"穿到底"**：`StationInstance.execute()` 的 `ok:false` 分支也要把
+   `outcome.payload` 放进 `StationCommandResult`（**曾经就漏在这一跳**：核心明明把原文放进了回包，
+   插件收到的 `payload` 却是 null、报"原文 0 字"当场弃权，那笔 448k prompt 的总结又整包白扔；
+   见 [../../../../../docs/known-issues.md](../../../../../docs/known-issues.md) #31「真机复现」）。
+   判据：**"写进了回包" ≠ "走到了插件"**——执行站 → 插件总线 → 插件进程每一跳都要有用例钉住
+   （`test/plugin_execute_new_commands_test.dart` 钉这一跳，`test/compact_plugin_e2e_test.dart` 钉真进程那一跳）。
 6. 中转站是 `scopeKeyUnique` **先到先得**：同键位第二人被拒（显式 `replace` 才替换并回报被替换者）——一个接入点只能有一个处理者。这也是点位各自成实例的原因：否则"接管 LLM"的插件会顺带垄断"系统提示词构造""上下文压缩"。
 7. **收集站**：schema **必填**（订阅者必须按它产出，校验失败按可读错误回报该订阅者）；**不回填**原数据流（返回值即结果，后续处理由触发方负责）；某订阅者未响应（心跳丢失 / 窗口内无回 / 校验失败 / 回包报错）⇒ 返回**已收集部分 + 显式列出未响应者**，不静默、不阻塞、不整体失败。
 8. **无静态总时间上限**（M9 §1.1）：看门狗每拍 `ping`，连续 N 拍没有心跳 ⇒ 只标记 `health: degraded` 并让前端可见，**不自动终止插件**（长任务跑多久都不因时间被杀）；心跳恢复自动清除；用户可显式 `restart`。唯一保留的短窗口是**建连握手**——没有它就诊断不出"插件根本没起来"。**站请求 / `tools/call` 同样没有静态超时**（`plugin_host.requestStation` 明写这条）；未响应只记"未响应者清单"。**软窗口之后只允许显式收手**（用户 `restart` / 关闭那一次运行）——全仓同一条口径见 [../llm/README.md](../llm/README.md) 不变量 2。

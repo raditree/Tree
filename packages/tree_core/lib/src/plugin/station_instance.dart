@@ -851,10 +851,19 @@ final class ExecuteStation extends StationInstance {
       );
       if (outcome.isFailed) {
         counters.bump('handler_error');
+        // **失败也要把载荷带出去**（`StationCommandOutcome.failedWith` 的语义）：
+        // `ok=false` 只表示"这次命令没跑成"，不代表产出没有价值——典型是
+        // `llm.call` 拿到 200、正文却解析不出 JSON：插件要靠 `payload` 里的
+        // 原文做本地修复 / 发一次小的"判断 + 修 JSON"调用。这里若把它丢掉，
+        // 插件只能立刻弃权，那笔已付费的调用又整包白扔。
+        // 真机现场：2026-10-05 18:29 一次 448k prompt（≈100% 命中缓存）的总结
+        // 解析失败后插件报"原文 0 字"直接回 null、回退内置压缩
+        // （docs/known-issues.md #31「真机复现」）。
         return StationCommandResult(
           command: command,
           ok: false,
           mountId: mount.mountId,
+          payload: outcome.payload,
           error: outcome.error,
         );
       }

@@ -369,6 +369,9 @@ class StationCommandResult {
   final String mountId;
 
   /// 挂载位置返回的结果。
+  ///
+  /// **失败时也可能非空**：`StationCommandOutcome.failedWith(error, payload)`
+  /// 的载荷会原样带到这里再回给插件（"命令没跑成 ≠ 产出没价值"）。
   final Object? payload;
 
   /// 拒绝 / 失败原因（可读中文）。

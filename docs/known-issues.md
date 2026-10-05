@@ -1798,6 +1798,24 @@ terminal/subagent hook 完成消息）在工具调用期间必须排队等待」
 2. **插件**：`compact_plugin` 只在 `not summary_result.get("ok")` 时 `_decline` 回 null，
    不做任何抢救；"为什么没接管"只进插件内存面板 + stderr，**核心侧只剩"插件回 null"**。
 
+### 真机复现（2026-10-05 18:29）：报错齐了、插件却拿不到原文
+
+上面那版修复装进安装目录（18:27）后**立刻复发**——这次的日志把"上一版漏了哪一跳"说得一清二楚：
+
+| 证据 | 位置 |
+|---|---|
+| `[core:llm-call] llm.call 回包不是合法 JSON（agent=member_…_b model=deepseek-flash response_format=text 正文 9380 字）：{"background":"任务 20261002-mamba-reuse…` | `logs/core.log` 18:29:44.634 |
+| `[core:plugin] 压缩中转：插件未接管（回 null），回退内置 compact；原因：[llm_call_failed] 总结调用 llm.call 失败：…；**原文 0 字**，前 120 字：` | 同上 18:29:44.635 |
+| `[core:compact] 上下文已压缩（内置）：总结 483 条，保留 58 条` | 同上 18:30:19.763 |
+
+- 那笔调用本身是**成功**的（界面「本轮调用列表」：插件 `llm.call` 输入 448,317 / 缓存命中 447,616 /
+  输出 5,045 / 22.3s），核心也已经把 `text`（9380 字）放进了失败回包；
+- **插件却报"原文 0 字"**：`StationCommandOutcome.failedWith(error, payload)` 的载荷在
+  `StationInstance.execute()` 的 `ok:false` 分支被丢掉（那里只搬了 `error`）⇒ `plugin_bus` 回给插件的
+  `payload` 恒为 null ⇒ 插件"本地修复 / 修复调用"两段都无从下手，当场弃权、回退内置。
+- 教训：**"把 detail 放进回包"与"detail 真走到了插件"是两件事**——中间每一跳（执行站 → 插件总线 →
+  插件进程）都得有用例钉住；上一版只测到 `ExecuteStationMounts` 的 `outcome.payload`。
+
 ### 修复
 
 - **核心：细化报错 + 把产出带回去**
@@ -1818,6 +1836,14 @@ terminal/subagent hook 完成消息）在工具调用期间必须排队等待」
   - 抢救回来的摘要**一律显式标注**"⚠️ 由本地结构修复得到 / 由一次 JSON 修复调用补全，可能不完整"。
 - **提示词收紧**（`SUMMARY_INSTRUCTION`）：只输出一个 JSON 对象 / 禁代码块与解释 / 四个键必须齐 /
   字符串禁裸换行·禁尾逗号 / **完整优先、不要求少写**（防截断靠"不设小 `max_tokens` + json 契约"，不靠少写）。
+- **失败载荷必须穿过每一跳**（2026-10-05 18:35 补，见上「真机复现」）：`StationInstance.execute()` 的
+  `ok:false` 分支改为 `payload: outcome.payload`——`failedWith` 写了却没生效的那一跳就在这里；
+  同时给 `StationCommandResult.payload` 的文档补上"失败时也可能非空"。
+- **`[core:llm-call]` 明细补上解析错误的原话**（`FormatException` 的 message，含 offset）：首尾预览
+  看不出"坏在哪个字符"时它是最短的线索（真机两次事故都只剩"正文 9380 字"这类信息）。
+- **协议口径同步到指南**：`docs/plugin-development.md` §6.1 写入"失败回包也可能带 `payload`"
+  （`llm.call` 失败形状 `{ok:false, error, error_kind, text, text_length, truncated_suspect}`）——
+  指南是协议唯一口径，插件按它写自愈。
 
 ### 验证
 
@@ -1825,6 +1851,17 @@ terminal/subagent hook 完成消息）在工具调用期间必须排队等待」
   ⑯a 本地修复成功且**零额外调用**；⑯b 截断时**恰好 1 次**修复调用，且该次不带
   `tools` / `response_format` / `max_tokens`；⑯c 都失败 ⇒ 不接管且回包带 `reason`（含 `repair_failed`）。
 - `cd packages/tree_core && dart test` 全绿、`dart analyze` 无新增错误（通过数见当次提交说明）。
+- **真机那一跳的回归用例（2026-10-05 18:35 补，先证伪再修）**：
+  - `test/plugin_execute_new_commands_test.dart` ›「llm.call：解析失败也必须把原文（text）经执行站
+    回给插件」：钉住 `StationInstance.execute()` 这一跳（**先把 `station_instance.dart` 的修复 stash 掉、
+    该用例即失败**：`payload` 为 null）；
+  - `test/compact_plugin_e2e_test.dart`（**真 Python 进程 + 真总线**）三条：
+    ① 正文只有尾逗号这类纯语法问题 ⇒ **零额外调用**（本地修复免费）就接管、摘要标注"由本地结构修复得到"；
+    ② 真截断 ⇒ **恰好 1 次**修复调用（断言该次不带 `tools` / `response_format` / `max_tokens`）后接管、
+    摘要标注"由一次 JSON 修复调用补全 + 模型判定原文被截断"；
+    ③ 三段全败 ⇒ 回退内置，且不接管原因里带 `repair_failed`（**不再是"原文 0 字"**）。
+    **同样先证伪**：把修复 stash 掉跑 ①，输出与真机一字不差——
+    `压缩中转：插件未接管（回 null）…；原因：[llm_call_failed] …；原文 0 字`、`source` 是 `builtin`。
 
 ### 遗留
 
