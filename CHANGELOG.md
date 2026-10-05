@@ -41,6 +41,36 @@
   根目录加载失败时，错误块上给一个显式重建远端链路的入口（调 `POST /api/agents/{agentId}/ssh/reconnect`，
   `{agentId}` 取当前 agent 的 id——**不是** `workspaceId`，后者是 `ws_<id>`；成功后就地重拉文件树）。
 
+### 修复补记（2026-10-05 同日；用户要求补记，**不升号**）
+
+> 为什么要补：本版要出的产物里含下面两条修复，而上面那批断言变化只覆盖 SSH 重连那一轮 ⇒
+> 不补这一段，tag 指向的代码与 CHANGELOG 的描述就对不上（用户 2026-10-05 拍板「补」）。
+
+- **图像真正送达模型：两条路径 + 一次被证伪的判定**（修改
+  [packages/tree_core/lib/src/llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 8）：
+  `if_vision` 的图先走 Files API（`file_id` 引用 + 跨轮缓存），端点不支持 / 上传失败（非 2xx、网络错、
+  响应无 `id`、缺 `base_url`·`api_key`）时**回退内联 base64**
+  （`{"type":"image_url","image_url":{"url":"data:<mime>;base64,…"}}`，载体是新类型 `VisionImageRef`），
+  超 32 MiB 或连字节都读不到才退回"只给路径"；三条硬约束不变（只读工作空间 IO / 失败绝不阻断本轮 /
+  密钥只进 `Authorization` 头）。**实测口径（别再被旧结论带走）**：那台中转站
+  （`token.ai-galaxy.com/v1`）的 `/files`——**不带 / 表单带 / 查询串带 `model` 三种一律 400**
+  `Model name not specified`（探针 `packages/tree_core/tool/probe_vision_upload.dart`，可重跑）；
+  官方 `api.deepseek.com` 不带与带都成功（未知字段被忽略）⇒ **加 `model` 字段不是那次 400 的解药**
+  （该端点就是不支持 Files API），真正让图送达模型的是**内联回退**
+  （[docs/known-issues.md](docs/known-issues.md) #30）。
+- **压缩总结解析失败不再白花钱**（新增
+  [packages/tree_core/lib/src/llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 14、
+  修改 [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 5）：
+  `llm.call` 解析不出 JSON 时，回包补齐 `error_kind='json_parse'` / `text`（模型正文**原文**）/
+  `text_length` / `truncated_suspect`，**文案按实际响应形式分支**（`text` 形态下根本没发 `response_format`，
+  不再谎称"站点硬设了 `json_object`"），并落一条 `[core:llm-call]` 明细（此前该分支**一条日志都没有**）；
+  `StationCommandOutcome.failedWith(error, payload)` 把这份 detail **原样回给插件**；站点回包新增
+  **可选键 `reason`**（纯增量）⇒ 插件"为什么没接管"能进核心日志与 `relay_skip_reason` / 会话提示。
+  插件侧三段自愈（硬上限 = **1 次额外调用**）：免费本地结构修复 → 一次"判断完整性 + 修 json"调用
+  （不发 `response_format`、不带 `tools`、**不设 `max_tokens`**）→ 才不接管；抢救回来的摘要一律显式标注
+  "可能不完整"；`SUMMARY_INSTRUCTION` 收紧为"只输出一个 JSON、四键必须齐、**完整优先**"
+  （[docs/known-issues.md](docs/known-issues.md) #31）。
+
 ## [1.0.2+3] — 2026-10-04
 
 ### 断言变化（新增 / 修改的 README 不变量）
