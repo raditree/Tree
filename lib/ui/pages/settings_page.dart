@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../app_version.dart';
+import '../text_scale_service.dart';
 import '../../io/api_service.dart';
 import '../../io/tray_service.dart';
 import '../services/code_highlight.dart';
@@ -438,6 +439,10 @@ class _SettingsPageState extends State<SettingsPage> {
           _buildSectionTitle('主题管理'),
           const SizedBox(height: 8),
           _buildThemeCard(),
+          const SizedBox(height: 24),
+          _buildSectionTitle('文字大小'),
+          const SizedBox(height: 8),
+          _buildTextScaleCard(),
           const SizedBox(height: 24),
           _buildSectionTitle('窗口与托盘'),
           const SizedBox(height: 8),
@@ -1411,6 +1416,85 @@ class _SettingsPageState extends State<SettingsPage> {
         false;
     if (!confirmed) return;
     await TrayService.instance.quit();
+  }
+
+
+  /// 文字大小卡片。
+  ///
+  /// 缩放通过 [TextScaleService] 注入 MaterialApp 的 MediaQuery，
+  /// 全局所有 Text 自动跟随。滑杆拖动时实时生效（onChanged 立即提交），
+  /// 因为字号变化是本页唯一能"所见即所得"的设置——拖动过程中看不到效果
+  /// 就等于没有预览。
+  ///
+  /// 与系统无障碍缩放的关系：本值是**在系统缩放之上**再乘一次。
+  /// 用户在 Windows 辅助功能里调过文本大小后，这里再调仍然有效。
+  Widget _buildTextScaleCard() {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return ListenableBuilder(
+      listenable: TextScaleService.instance,
+      builder: (BuildContext context, Widget? child) {
+        final double scale = TextScaleService.instance.scale;
+        return Card(
+          margin: EdgeInsets.zero,
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                const Text(
+                  '界面文字大小',
+                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  '调整界面中所有文字的大小。系统级无障碍缩放仍会叠加生效。',
+                  style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: <Widget>[
+                    Icon(
+                      Icons.text_fields,
+                      size: 14,
+                      color: cs.onSurfaceVariant,
+                    ),
+                    Expanded(
+                      child: Slider(
+                        key: const Key('text-scale-slider'),
+                        value: scale,
+                        min: TextScaleService.minScale,
+                        max: TextScaleService.maxScale,
+                        divisions: 7,
+                        label: '${(scale * 100).round()}%',
+                        onChanged: (double value) {
+                          TextScaleService.instance.setScale(value);
+                        },
+                      ),
+                    ),
+                    const Icon(Icons.text_fields, size: 22),
+                    const SizedBox(width: 8),
+                    SizedBox(
+                      width: 44,
+                      child: Text(
+                        '${(scale * 100).round()}%',
+                        textAlign: TextAlign.right,
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: cs.onSurfaceVariant,
+                          fontFeatures: const <FontFeature>[
+                            FontFeature.tabularFigures(),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
   }
 
   /// 主题管理卡片

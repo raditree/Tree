@@ -108,3 +108,5 @@ agentspace
 /node_modules/
 /package.json
 /package-lock.json
+# 私人空间
+.tree

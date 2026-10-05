@@ -15,6 +15,7 @@ import 'io/websocket_service.dart';
 import 'ui/pages/main_page.dart';
 import 'ui/services/editor_settings.dart';
 import 'ui/theme_service.dart';
+import 'ui/text_scale_service.dart';
 import 'ui/widgets/close_to_tray_dialog.dart';
 
 /// 应用入口（desktop 分支：无登录、无后端地址配置）。
@@ -49,6 +50,8 @@ Future<void> main() async {
   await ThemeService.instance.load();
   // 编辑器偏好（高亮 / 失焦保存）：读了才画界面，避免先默认再跳一次
   await EditorSettings.instance.load();
+  // 文字缩放：读了才画界面，避免先默认再跳一次
+  await TextScaleService.instance.load();
 
   final CoreHandshake? handshake = await CoreProcessLauncher.instance.start();
   if (handshake == null) {
@@ -357,7 +360,11 @@ class _AgentTeamAppState extends State<AgentTeamApp> with WindowListener {
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      animation: ThemeService.instance,
+      // 合并两个 Listenable：主题或字号任一变化都会重建
+      animation: Listenable.merge(<Listenable>[
+        ThemeService.instance,
+        TextScaleService.instance,
+      ]),
       builder: (BuildContext context, _) {
         return MaterialApp(
           title: 'Agent 团队效率工具',
@@ -366,6 +373,16 @@ class _AgentTeamAppState extends State<AgentTeamApp> with WindowListener {
           theme: AgentTeamApp._buildLightTheme(),
           darkTheme: AgentTeamApp._buildDarkTheme(),
           themeMode: ThemeService.instance.mode,
+          // 把 App 内字号缩放注入 MediaQuery，全应用 Text 自动跟随
+          builder: (BuildContext context, Widget? child) {
+            final MediaQueryData media = MediaQuery.of(context);
+            return MediaQuery(
+              data: media.copyWith(
+                textScaler: TextScaler.linear(TextScaleService.instance.scale),
+              ),
+              child: child ?? const SizedBox.shrink(),
+            );
+          },
           // 单一入口：桌面分支没有登录页
           home: _StartupWarningHost(
             warning: widget.startupWarning,
@@ -375,7 +392,6 @@ class _AgentTeamAppState extends State<AgentTeamApp> with WindowListener {
       },
     );
   }
-}
 
 /// 启动期诊断横幅的宿主：把非致命警告显示在主界面顶部，可关闭。
 ///
