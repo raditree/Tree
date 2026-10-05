@@ -983,13 +983,17 @@ final class RelayStation extends StationInstance {
     counters.bump('responded');
     final Object? payload = reply.payload;
     if (payload == null) {
-      // 照旧后端语义：None = 不改动、放行原数据（但算"已响应"）
+      // 照旧后端语义：None = 不改动、放行原数据（但算"已响应"）。
+      // **原因优先用插件自己报的**（回包可选键 `reason`）：[StationRelayResult.reason]
+      // 会一路走到日志与压缩结论（`relay_skip_reason` / 会话提示），
+      // 让"插件为什么没接管"不再只剩一句通用文案。
+      final String reason = reply.reason.trim();
       return StationRelayResult(
         data: data,
         handled: true,
         pluginId: subscriber.pluginId,
         requestId: request.requestId,
-        reason: '订阅者选择不改动数据',
+        reason: reason.isEmpty ? '订阅者选择不改动数据' : reason,
       );
     }
     if (payload is String || payload is Map || payload is List) {

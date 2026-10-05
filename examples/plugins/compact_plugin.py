@@ -70,6 +70,7 @@
 import datetime
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -135,28 +136,68 @@ PANEL_COLUMNS = ["时间", "来源", "覆盖条数", "耗时", "降级 / 未接�
 REASONING_TEXT = "上下文压缩后，我先 read 相关文件，获取 todo 列表"
 
 #: **追加在缓存前缀之后**的总结指令（最后一条 user 消息）。
-#: 三个硬要求：①把输出形状写死在指令里（这一步**不**靠 `response_format` 强约束——
+#: 四个硬要求：①把输出形状写死在指令里（这一步**不**靠 `response_format` 强约束——
 #: 那会让端点改写提示词、前缀缓存全丢，见模块 docstring 的"缓存"段）；
 #: ②明确"只输出一个 json 对象、不要代码块/解释"（text 形态下格式全靠指令兜住）；
-#: ③不要太长（它紧跟在被复用的前缀后面，越短越省）。
-SUMMARY_INSTRUCTION = """以上是本次任务到目前为止的完整上下文。请把它压成"继续这个任务所必需"的要点，\
-并**只输出一个 json 对象**（不要别的文字）：
+#: ③**完整优先，不要求少写**：这份摘要是后续唯一的背景来源，省下的字会变成后面
+#:   重复探索的成本；防截断靠"不设小 max_tokens + 下面的 json 契约"，**不靠少写**；
+#: ④键必须齐全（缺键 = 解析出的结构不完整，与"正文写得多"是两件事）。
+SUMMARY_INSTRUCTION = """以上是本次任务到目前为止的完整上下文。请把它压成"继续这个任务所必需"的要点；\
+**力求完整**（宁可写详细，也不要把还在生效的约束、结论、失败尝试丢掉）。
+
+**输出契约（违反即本次压缩作废，请严格照做）**：
+1. **只输出一个 json 对象**：第一个字符就是 `{`，最后一个字符就是 `}`；
+2. **不要** markdown 代码块（不要 ``` ），**不要**任何解释或前后缀文字；
+3. 下面这**四个键全部都要出现**，结构照抄（没有内容就给 `""` 或 `[]`，不要省略键）：
 
 {
-  "background": "任务背景与目标、用户的关键约束（一段话）",
-  "trajectory": "已经做过什么、结论是什么、哪些尝试失败或已被推翻（不要罗列无关细节）",
+  "background": "任务背景与目标、用户的关键约束（尽量完整）",
+  "trajectory": "已经做过什么、结论是什么、哪些尝试失败或已被推翻（力求完整、够继续任务）",
   "files_changed": [{"path": "工作空间相对路径", "change": "新增/修改/删除 + 一句话"}],
   "required_files": [{"path": "工作空间相对路径", "start_line": 1, "line_count": 80,
                       "why": "为什么后续必须读它"}]
 }
 
 规则：
+- **字符串里不要出现裸换行**（要换行就写 `\\n`），引号要转义，**不要尾逗号、不要注释**；
+- 内容写多没问题，**但一个字都不要落在 json 之外**：写长的代价只是 token，
+  写坏（夹解释 / 半截 json / 少引号）的代价是整次压缩作废；
 - 路径只允许**工作空间相对路径**（如 `lib/a.dart`、`docs/x.md`），不要绝对路径、不要 `..`；
 - `required_files` 不超过 %(max_files)d 个，按重要性排序，**精确到行范围**（只给真正要读的那段）；
   优先列：核心文档 / 计划文档（`.self/plan/**`）/ 正在编辑或与任务直接相关的模块；
   不要列目录、不要列日志、不要列你已完整读过且结论已写进 trajectory 的文件；
 - `files_changed` 只列**改动或产出的文件**（不是读过的文件）；
 - 拿不准的字段宁可留空，**不要编造路径**。
+"""
+
+
+#: 「抢救」契约：**只在总结回包解析失败时**用，最多一次。
+#:
+#: 为什么值得花这第二笔小钱：总结调用是一次**复用对话前缀**的付费调用（现场是
+#: 734k prompt、≈100% 命中缓存）；它成功返回、只是正文不是合法 json 时，整笔投入
+#: 都会丢（回退内置压缩）。而这一步的输入**只有那段原文**（几千 token），便宜三个数量级。
+#:
+#: 三点口径：
+#: ① 顺带完成"原文是否被截断"的**判断**——由模型判，不由插件猜（也不做本地补全）；
+#: ② 这一次**不发** `response_format`（站点缺省硬设 `json_object`，正好得到强制 JSON）；
+#: ③ **不设 `max_tokens`**：给"修 json"设一个小上限，本身就可能是下一次截断
+#:    （设 4k ⇒ 再截断 ⇒ 钱又白花），一律沿用该模型自己的输出上限。
+REPAIR_INSTRUCTION = """下面是一次模型调用的**原始输出**：它本应是一个 json 对象，但解析失败了。\
+请只做两件事，且只输出一个 json 对象（不要解释、不要 markdown 代码块）：
+
+1. 判断原文是否**完整**：被截断 / 缺尾部 / 字符串断在半截 ⇒ `complete` 给 false；
+   原文完整、只是夹了解释 / 有尾逗号 / 引号没转义这类纯语法问题 ⇒ `complete` 给 true；
+2. 把原文修成**严格合法**的 json 放进 `summary`，结构照：
+   {"background": 字符串, "trajectory": 字符串, "files_changed": 数组, "required_files": 数组}
+   **只允许**使用原文里确实出现过的信息；原文没有的键给 `""` / `[]`，**绝不编造**路径或结论；
+   **不要为了短而删要点**：原文写下的信息尽量原样保留（改写可以、省略不行）；
+   若原文被截断，就按已有内容补齐缺的键，并在 `reason` 里写明截断位置。
+
+输出形状（三个键都要有）：
+{"complete": true, "reason": "", "summary": {"background": "", "trajectory": "", "files_changed": [], "required_files": []}}
+
+以下是原始输出（原样，未做任何处理）：
+-----
 """
 
 
@@ -515,7 +556,8 @@ class CompactPlugin(object):
         self._pending = {}
         self._request_seq = 0
         self._hello = threading.Event()
-        self._counters = {"requests": 0, "taken": 0, "declined": 0}
+        self._counters = {"requests": 0, "taken": 0, "declined": 0,
+                          "salvaged": 0, "repaired": 0}
         # ── 左栏面板的状态 ──────────────────────────────────────────────
         # 面板是**只读展示**（它不给插件任何额外权限）：记录来自 ① 插件自己经手的
         # 压缩 ② 「立即压缩一次」的核心回执 ③（可选）逐调用用量文件。
@@ -527,6 +569,10 @@ class CompactPlugin(object):
         self._identity = {"agent_id": options.agent_id, "session_id": ""}
         self._watermark = None  # (已覆盖条数, 原文总条数)：核心报的水位线
         self._records = []      # 面板记录（最新在**后**；展示时倒序）
+        # **最近一次"不接管"的原因**：回包里的可选键 `reason` 就是它（见
+        # [handle_station_request]）。核心会把原因写进日志与会话提示——
+        # 没有它，"插件白跑一次、核心悄悄兜底"事后无从诊断。
+        self._last_decline_reason = ""
         # 逐调用用量（核心捎来的 `recent_usage` / `--usage-jsonl` 回放）：
         # 按"整行内容"去重后按 **canonical 行 → 归一后的记录** 存（dict 保序）。
         self._usage_records = {}
@@ -674,7 +720,16 @@ class CompactPlugin(object):
         station_id = str(params.get("station_id") or "")
         if station_id != STATION_RELAY_CONTEXT_COMPACT:
             return {"reply": {"payload": None}}
-        return {"reply": {"payload": self.handle_compact(params)}}
+        payload = self.handle_compact(params)
+        reply = {"payload": payload}
+        # **不接管时把"为什么"一起回给核心**（回包可选键 `reason`，纯增量）：
+        # 核心会把它写进日志与压缩结论（`relay_skip_reason` / 会话提示），
+        # 否则一次不接管在核心侧只剩"插件回 null"这句通用文案（现场那次
+        # 734k prompt 的总结失败就是这样丢掉全部诊断信息的）。
+        # 老核心读不到这个键也不受影响（只当普通回包）。
+        if payload is None and self._last_decline_reason:
+            reply["reason"] = self._last_decline_reason
+        return {"reply": reply}
 
     # ── 左栏面板（activity 槽位：活动栏图标 + 左栏整页） ─────────────────────
 
@@ -1020,6 +1075,8 @@ class CompactPlugin(object):
         """中转站压缩：返回回包 payload（dict）或 None（不接管）。"""
         started = time.time()
         self._counters["requests"] += 1
+        # 每次请求都先把"上次为什么不接管"清掉：回给核心的 reason 必须属于**这一次**
+        self._last_decline_reason = ""
         payload = params.get("payload")
         if not isinstance(payload, dict):
             log("压缩请求缺少 payload 对象：不接管")
@@ -1096,22 +1153,30 @@ class CompactPlugin(object):
         if tools:
             arguments["tools"] = tools
         summary_result = self.command("llm.call", arguments, scope=identity)
-        if not summary_result.get("ok"):
-            log("llm.call 失败：%s（不接管）" % summary_result.get("error"))
-            return self._decline("总结调用 llm.call 失败：%s" % (summary_result.get("error") or "未知原因"),
-                                 started, agent_id, session_id)
-        summary_payload = summary_result.get("payload")
-        summary_payload = summary_payload if isinstance(summary_payload, dict) else {}
-        parsed = summary_payload.get("json")
-        if not isinstance(parsed, dict):
-            log("总结模型没有回 json 对象（text 前 120 字：%s）：不接管"
-                % clip(str(summary_payload.get("text") or ""), 120))
-            return self._decline("总结模型没有回 json 对象",
-                                 started, agent_id, session_id)
-        usage = summary_payload.get("usage") or {}
-        log("摘要完成：模型=%s 前缀 %d 条 prompt_tokens=%s cached_tokens=%s"
-            % (summary_payload.get("model"), cut, usage.get("prompt_tokens"),
-               usage.get("cached_tokens")))
+        # **钱别白花**：这次调用可能已经跑完并付过费（现场：734k prompt、≈100% 命中
+        # 缓存、19.5s），只是正文不是合法 json。走"读 → 本地修复 → 一次判断+修 json"
+        # 三段抢救；三段都不行才不接管（并把原因说清楚）。
+        parsed, raw_text, origin = self.recover_summary(
+            summary_result, identity, agent_id, session_id)
+        if parsed is None:
+            detail = str(summary_result.get("error") or "").strip()
+            where = ("总结调用 llm.call 失败：%s" % (detail or "未知原因")
+                     if origin == "llm_call_failed" else "总结回包抢救失败：%s" % origin)
+            log("总结回包不可用（%s）：不接管" % where)
+            return self._decline(
+                "%s；原文 %d 字，前 120 字：%s"
+                % (where, len(raw_text), clip(raw_text, 120)),
+                started, agent_id, session_id, code=origin.split(":")[0])
+        result_payload = self._result_payload(summary_result)
+        usage = result_payload.get("usage") or {}
+        log("摘要完成：模型=%s 前缀 %d 条 prompt_tokens=%s cached_tokens=%s 来源=%s"
+            % (result_payload.get("model"), cut, usage.get("prompt_tokens"),
+               usage.get("cached_tokens"), origin))
+        if origin != "primary":
+            # 抢救回来的摘要**必须显式标注**（它可能不完整）——把标记留在 dict 上，
+            # 由 [summary_text] 写进上下文正文，模型与用户都看得见。
+            parsed = dict(parsed)
+            parsed["_recovered_from"] = origin
 
         # 必读文件 + todo：同一条 assistant，多个 tool_calls（一一配对）
         entries = self.required_files(parsed)
@@ -1182,18 +1247,128 @@ class CompactPlugin(object):
             "covered_message_count": covered,
         }
 
-    def _decline(self, reason="", started=None, agent_id="", session_id=""):
-        """不接管：计数 + 记一条面板记录。
+    def _decline(self, reason="", started=None, agent_id="", session_id="",
+                 code=""):
+        """不接管：计数 + 记一条面板记录 + 给核心留一份原因。
 
         **原因必须可见**：用户真正踩到的坑几乎都是"插件白跑一次、核心悄悄兜底了"，
-        而"为什么没接管"以前在类型上就丢了（回一个 null 就没了）。现在它进日志 + 面板。
+        而"为什么没接管"以前在类型上就丢了（回一个 null 就没了）。现在它有三处落点：
+        ① 面板记录；② stderr 日志；③ **回包可选键 `reason`**（[handle_station_request]
+        把它交给核心 ⇒ 核心日志 / `relay_skip_reason` / 会话提示）。
+
+        [code] = 机读的原因分类（`llm_call_failed` / `repair_failed` / `payload_missing`
+        / `nothing_to_compact` …），写进面板与回包原因的前缀，便于统计与检索。
         """
         self._counters["declined"] += 1
+        text = reason or "未知原因"
+        self._last_decline_reason = ("[%s] %s" % (code, text)) if code else text
         self._record("", duration_ms=_elapsed_ms(started),
-                     note="未接管：%s" % (reason or "未知原因"),
+                     note="未接管：%s" % self._last_decline_reason,
                      agent_id=agent_id, session_id=session_id)
         self.update_panel()
         return None
+
+    # ── 总结回包：读取 / 抢救（"钱别白花"） ─────────────────────────────
+
+    @staticmethod
+    def _result_payload(result):
+        """从一次站点命令回包里取出 `payload`（dict）；没有就给空 dict。"""
+        payload = result.get("payload") if isinstance(result, dict) else None
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def salvage_json(text):
+        """**免费**的本地修复：只清结构噪声，**不猜内容、不补字段**。
+
+        能救回的典型：模型把 json 包进 ``` 代码块 / 前后带一句解释 / 尾逗号 /
+        零宽字符 / BOM。救不回也不硬救——**是不是被截断、要不要补全，交给一次显式的
+        小调用去判断**（见 [REPAIR_INSTRUCTION]），插件自己不猜（用户口径）。
+        """
+        raw = text if isinstance(text, str) else ""
+        if not raw.strip():
+            return None
+        cleaned = raw.replace("\ufeff", "").replace("\u200b", "")
+        candidates = []
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start >= 0 and end > start:
+            candidates.append(cleaned[start:end + 1])
+        candidates.append(cleaned)
+        for candidate in candidates:
+            variants = (candidate, re.sub(r",\s*([}\]])", r"\1", candidate))
+            for variant in variants:
+                try:
+                    value = json.loads(variant)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(value, dict):
+                    return value
+        return None
+
+    def repair_json(self, text, identity, agent_id, session_id):
+        """**花小钱**的一次"判断完整性 + 修 json"调用（最多一次）。
+
+        返回 `(summary | None, 失败原因)`。要点：
+        - 输入**只有那段原文**（几千 token），与主调用那几十万 token 的前缀无关；
+        - **不发** `response_format`（站点缺省硬设 `json_object`，正好强制 JSON）；
+        - **不带** `tools`（这里没有前缀需要对齐）；
+        - **不设 `max_tokens`**：设小了就是下一次截断、钱又白花（用户明确要求）。
+        """
+        arguments = {
+            "messages": [{"role": "user",
+                          "content": REPAIR_INSTRUCTION + str(text)}],
+            "agent_id": agent_id,
+            "session_id": session_id,
+        }
+        result = self.command("llm.call", arguments, scope=identity)
+        payload = self._result_payload(result)
+        if not result.get("ok") and not payload:
+            return None, "修复调用失败：%s" % (result.get("error") or "未知原因")
+        parsed = payload.get("json")
+        if not isinstance(parsed, dict):
+            return None, "修复调用也没回 json 对象"
+        summary = parsed.get("summary")
+        if not isinstance(summary, dict):
+            return None, "修复结果里没有 summary 对象"
+        complete = parsed.get("complete")
+        if complete is False or str(complete).strip().lower() == "false":
+            summary = dict(summary)
+            summary["_incomplete_reason"] = str(
+                parsed.get("reason") or "模型判定原文不完整")
+        return summary, ""
+
+    def recover_summary(self, result, identity, agent_id, session_id):
+        """把一次"总结调用"的回包变成可用摘要：`(parsed | None, 原文, 来源)`。
+
+        三段，**总计最多一次额外调用**（用户 2026-10-05 定案）：
+        1. `primary` —— 回包本来就是合法 json（happy path，零额外成本）；
+        2. `salvage` —— 免费本地修复（去代码块 / 夹话 / 尾逗号 / 零宽字符）；
+        3. `repair` —— 一次小的"判断完整性 + 修 json"调用；
+        都不行 ⇒ `None` + 来源串（`llm_call_failed` / `repair_failed: …`），
+        供上层把原因写清楚——**不是只回一句"失败"**。
+        """
+        payload = self._result_payload(result)
+        raw = str(payload.get("text") or "")
+        parsed = payload.get("json")
+        if isinstance(parsed, dict):
+            return parsed, raw, "primary"
+        if not result.get("ok") and not raw:
+            return None, "", "llm_call_failed"
+        truncated = bool(payload.get("truncated_suspect"))
+        log("总结回包不是合法 json（error_kind=%s 正文 %d 字%s）：开始抢救"
+            % (payload.get("error_kind") or "-", len(raw),
+               "，疑似被截断" if truncated else ""))
+        salvaged = self.salvage_json(raw)
+        if isinstance(salvaged, dict):
+            self._counters["salvaged"] += 1
+            log("本地修复成功（未额外调用模型）")
+            return salvaged, raw, "salvage"
+        repaired, why = self.repair_json(raw, identity, agent_id, session_id)
+        if isinstance(repaired, dict):
+            self._counters["repaired"] += 1
+            log("修复调用成功（原文%s）"
+                % ("疑似被截断，已在摘要里标注" if truncated else "疑似纯语法问题"))
+            return repaired, raw, "repair"
+        return None, raw, ("repair_failed:%s" % why if why else "repair_failed")
 
     # ── 切点（wire 坐标） ───────────────────────────────────────────────
 
@@ -1324,7 +1499,19 @@ class CompactPlugin(object):
     def summary_text(parsed):
         background = str(parsed.get("background") or "").strip()
         trajectory = str(parsed.get("trajectory") or "").strip()
-        lines = [
+        lines = []
+        # **抢救回来的摘要必须显式标注**（见 [CompactPlugin.recover_summary]）：
+        # 花钱救回来的是"可能不完整"的摘要，绝不能让下一轮的自己以为它是完整的。
+        recovered = str(parsed.get("_recovered_from") or "")
+        if recovered:
+            how = ("由一次 JSON 修复调用补全" if recovered == "repair"
+                   else "由本地结构修复得到")
+            note = "> ⚠️ 本摘要%s，**可能不完整**" % how
+            incomplete = str(parsed.get("_incomplete_reason") or "").strip()
+            if incomplete:
+                note += "：模型判定原文被截断（%s）" % incomplete
+            lines.extend([note, ""])
+        lines.extend([
             "## 背景",
             background or "（无）",
             "",
@@ -1332,7 +1519,7 @@ class CompactPlugin(object):
             trajectory or "（无）",
             "",
             "## 改动与产出文件",
-        ]
+        ])
         files = parsed.get("files_changed")
         if isinstance(files, list) and files:
             for item in files:
@@ -1485,9 +1672,15 @@ def _summary_fixture():
     }
 
 
-def _fixture_command(summary_json, fail_commands=(), compact_result=None):
-    """假命令通道：记录调用，按命令返回与核心同形状的结果。"""
+def _fixture_command(summary_json, fail_commands=(), compact_result=None,
+                     llm_seq=None):
+    """假命令通道：记录调用，按命令返回与核心同形状的结果。
+
+    [llm_seq] = 只作用于 `llm.call` 的**逐次回包脚本**（list；元素 `None` = 用默认的
+    成功回包）——自愈用例靠它构造"第一次坏、第二次好"这种序列。
+    """
     calls = []
+    queue = list(llm_seq) if llm_seq else []
 
     class _Fake(object):
         def __call__(self, command, arguments, scope=None):
@@ -1496,6 +1689,9 @@ def _fixture_command(summary_json, fail_commands=(), compact_result=None):
             if command in fail_commands:
                 return {"ok": False, "error": "%s 被用例置为失败" % command}
             if command == "llm.call":
+                scripted = queue.pop(0) if queue else None
+                if scripted is not None:
+                    return scripted
                 return {"ok": True, "command": command, "payload": {
                     "ok": True, "json": summary_json,
                     "text": json.dumps(summary_json, ensure_ascii=False),
@@ -1565,7 +1761,8 @@ def _payload_of(reply):
     return body.get("payload")
 
 
-def _plugin(summary=None, fail_commands=(), compact_result=None, options=None):
+def _plugin(summary=None, fail_commands=(), compact_result=None, options=None,
+            llm_seq=None):
     """造一个走假命令通道的插件，并把**发出的报文收进内存**（`plugin.sent`）。
 
     自检不该往 stdout 写协议帧（那是给真核心的通道，混进自检报告里只会碍眼）——
@@ -1573,7 +1770,7 @@ def _plugin(summary=None, fail_commands=(), compact_result=None, options=None):
     """
     plugin = CompactPlugin(options or Options())
     fake, calls = _fixture_command(summary or _summary_fixture(), fail_commands,
-                                   compact_result)
+                                   compact_result, llm_seq)
     plugin.command = fake
     plugin.sent = []
     plugin.emit = plugin.sent.append
@@ -2144,6 +2341,89 @@ def selftest():
         failures.append("订阅失败没显示到面板上：%s" % status_text[:200])
     if status_plugin._collect_records():
         failures.append("状态刷新不该凭空造出一条压缩记录")
+
+    # ⑯ **钱别白花**：总结回包坏掉时的三段抢救（本地修复 → 一次修 json → 放弃）
+    # ⑯a 免费本地修复：正文夹了说明 + 尾逗号 —— 不额外调用模型也要能接管
+    bad_text = ('好的，以下是压缩结果：\n'
+                '{"background": "背景", "trajectory": "轨迹", '
+                '"files_changed": [], "required_files": [],}\n（完）')
+    salvage_plugin, salvage_calls = _plugin(llm_seq=[{
+        "ok": True, "command": "llm.call",
+        "payload": {"ok": False, "error": "模型正文不是合法 JSON（text 形态）",
+                    "error_kind": "json_parse", "text": bad_text,
+                    "text_length": len(bad_text), "truncated_suspect": False},
+    }])
+    salvage_payload = _payload_of(
+        salvage_plugin.handle_station_request(_params(_wire_fixture())))
+    salvage_llm = [c for c in salvage_calls if c["command"] == "llm.call"]
+    if not isinstance(salvage_payload, dict):
+        failures.append("⑯a 本地能修好的回包应接管，实际没接管")
+    elif "由本地结构修复得到" not in json.dumps(salvage_payload,
+                                             ensure_ascii=False):
+        failures.append("⑯a 抢救回来的摘要没有显式标注")
+    if len(salvage_llm) != 1:
+        failures.append("⑯a 本地能修好就不该再调模型：llm.call %d 次"
+                        % len(salvage_llm))
+
+    # ⑯b 本地修不了（截断）⇒ **恰好一次**"判断 + 修 json"调用
+    truncated_text = '{"background": "背景", "trajectory": "轨迹被截断在'
+    repair_summary = {"background": "背景", "trajectory": "轨迹",
+                      "files_changed": [], "required_files": []}
+    repair_plugin, repair_calls = _plugin(llm_seq=[
+        {"ok": True, "command": "llm.call",
+         "payload": {"ok": False, "error": "模型正文不是合法 JSON",
+                     "error_kind": "json_parse", "text": truncated_text,
+                     "text_length": len(truncated_text),
+                     "truncated_suspect": True}},
+        {"ok": True, "command": "llm.call",
+         "payload": {"ok": True,
+                     "json": {"complete": False,
+                              "reason": "在 trajectory 中途截断",
+                              "summary": repair_summary},
+                     "text": json.dumps(repair_summary, ensure_ascii=False),
+                     "model": "demo-model",
+                     "usage": {"prompt_tokens": 300, "cached_tokens": 0}}},
+    ])
+    repair_payload = _payload_of(
+        repair_plugin.handle_station_request(_params(_wire_fixture())))
+    repair_llm = [c for c in repair_calls if c["command"] == "llm.call"]
+    if not isinstance(repair_payload, dict):
+        failures.append("⑯b 修复调用成功后应接管，实际没接管")
+    else:
+        body = json.dumps(repair_payload, ensure_ascii=False)
+        if "由一次 JSON 修复调用补全" not in body or "不完整" not in body:
+            failures.append("⑯b 修复得到的摘要没有标注不完整：%s" % body[:200])
+        if "截断" not in body:
+            failures.append("⑯b 模型判定的截断原因没进摘要：%s" % body[:200])
+    if len(repair_llm) != 2:
+        failures.append("⑯b 应恰好 2 次 llm.call（总结 + 修复），实际 %d"
+                        % len(repair_llm))
+    else:
+        repair_args = repair_llm[1]["arguments"]
+        if "response_format" in repair_args:
+            failures.append("⑯b 修复调用不该带 response_format（站点缺省即 json_object）")
+        if "tools" in repair_args:
+            failures.append("⑯b 修复调用不该透传 tools（没有前缀要对齐）")
+        if "max_tokens" in repair_args:
+            failures.append("⑯b 修复调用**不设 max_tokens**（设小了就是下一次截断）")
+        if truncated_text not in str(repair_args["messages"][0]["content"]):
+            failures.append("⑯b 修复调用没有把原文原样带上")
+
+    # ⑯c 连修复也失败 ⇒ 不接管，且**原因要跟着回包出去**（核心据此写日志与会话提示）
+    giveup_plugin, _ = _plugin(llm_seq=[
+        {"ok": True, "command": "llm.call",
+         "payload": {"ok": False, "error": "模型正文不是合法 JSON",
+                     "error_kind": "json_parse", "text": truncated_text,
+                     "text_length": len(truncated_text),
+                     "truncated_suspect": True}},
+        {"ok": False, "error": "端点 429：限流"},
+    ])
+    giveup_reply = giveup_plugin.handle_station_request(_params(_wire_fixture()))
+    if _payload_of(giveup_reply) is not None:
+        failures.append("⑯c 抢救失败时应不接管（回 payload=None）")
+    giveup_reason = (giveup_reply.get("reply") or {}).get("reason")
+    if not isinstance(giveup_reason, str) or "repair_failed" not in giveup_reason:
+        failures.append("⑯c 不接管的回包没带可读原因：%r" % (giveup_reason,))
 
     return _report(failures, calls, plugin)
 

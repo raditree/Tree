@@ -130,9 +130,9 @@ class StationRequest {
 /// - 中转站：payload = str 时回填（替换原数据），null 时「不改动」放行原数据；
 /// - 广播站：payload 仅作为送达确认（多数订阅者回空即可）。
 class StationReply {
-  const StationReply.ok([this.payload]) : error = '';
+  const StationReply.ok([this.payload, this.reason = '']) : error = '';
 
-  const StationReply.failed(this.error) : payload = null;
+  const StationReply.failed(this.error) : payload = null, reason = '';
 
   /// 回包内容（语义随站点类型）。
   final Object? payload;
@@ -140,17 +140,24 @@ class StationReply {
   /// 失败原因（可读中文；成功时为空串）。
   final String error;
 
+  /// **"我为什么这么回"的可读原因**（可选；纯增量字段）。
+  ///
+  /// 语义：`payload == null`（= 不改动、原数据放行）时用它说明**为什么没接管**——
+  /// 核心会把它写进日志与压缩结论（`relay_skip_reason` / 会话提示）。没有它，
+  /// "插件白跑一次、核心悄悄兜底"就是事后无法诊断的黑洞。
+  final String reason;
+
   /// 是否失败。
   bool get isFailed => error.isNotEmpty;
 
-  /// 宽容解析插件回包（stdio 形状：{ok, payload} / {error}）。
+  /// 宽容解析插件回包（stdio 形状：`{ok, payload}` / `{error}` / 可选 `reason`）。
   static StationReply fromJson(Object? raw) {
     if (raw is! Map) {
       return const StationReply.failed('回包不是对象（键值映射）');
     }
     final String error = (raw['error'] ?? '').toString();
     if (error.isNotEmpty) return StationReply.failed(error);
-    return StationReply.ok(raw['payload']);
+    return StationReply.ok(raw['payload'], (raw['reason'] ?? '').toString());
   }
 }
 
@@ -322,6 +329,15 @@ class StationCommandOutcome {
   const StationCommandOutcome.ok([this.payload]) : error = '';
 
   const StationCommandOutcome.failed(this.error) : payload = null;
+
+  /// **失败，但把载荷一起带回去**：用于"命令确实跑起来了、只是产出不可用"的情形
+  /// （典型：`llm.call` 拿到 200、模型正文却解析不出 JSON）。
+  ///
+  /// [payload] 里放**诊断 + 自愈所需**的原始产出（模型正文、长度、疑似截断标记…）：
+  /// 只回一句 `error` 等于把那次**已经付过钱**的调用彻底丢掉——现场就是一次 734k
+  /// prompt（≈100% 命中缓存）的总结解析失败后整包被弃、回退内置压缩
+  /// （见 `docs/known-issues.md` #31）。
+  const StationCommandOutcome.failedWith(this.error, this.payload);
 
   /// 结果载荷（回给下命令的插件）。
   final Object? payload;

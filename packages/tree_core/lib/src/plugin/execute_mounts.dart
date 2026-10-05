@@ -768,7 +768,14 @@ class ExecuteStationMounts {
     );
     final Object? error = result['error'];
     if (error != null && error.toString().isNotEmpty) {
-      return StationCommandOutcome.failed(error.toString());
+      // **失败也要把 detail 带回去**（`text` / `text_length` / `truncated_suspect`
+      // / `error_kind`…）：这是插件自愈（本地修 JSON、或发一次小的"判断 + 修 JSON"
+      // 调用）的唯一依据。只回一句 error = 把那次已付费的调用彻底丢掉
+      // （现场见 docs/known-issues.md #31）。
+      return StationCommandOutcome.failedWith(
+        error.toString(),
+        <String, dynamic>{...result},
+      );
     }
     return StationCommandOutcome.ok(<String, dynamic>{
       ...result,

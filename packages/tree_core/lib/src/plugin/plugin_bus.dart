@@ -2051,11 +2051,21 @@ class PluginBus {
       // （见 StationInstance.relay 的 None 分支）。这里必须用同一性判掉它——
       // 不判就有可能把"插件没接管"误读成"插件回了一份新上下文"。
       if (identical(data, payload)) {
-        log?.call('压缩中转：插件未接管（回 null），回退内置 compact');
+        // **原因优先用插件自己报的**（回包可选键 `reason`，纯增量）：只写"回 null"
+        // 会把最难查的那类故障（插件白跑一次、核心悄悄兜底）变成事后黑洞——
+        // 现场那次 734k prompt 的总结调用因正文非法 JSON 被弃，日志与会话提示
+        // 都只剩"回 null"（见 docs/known-issues.md #31）。
+        final String why = relayed.reason.trim();
+        log?.call(
+          '压缩中转：插件未接管（回 null），回退内置 compact'
+          '${why.isEmpty ? '' : '；原因：$why'}',
+        );
         _reportCompactionSkip(
           agent,
           session,
-          '插件回 null（原数据放行 = 不改动，未接管）',
+          why.isEmpty
+              ? '插件回 null（原数据放行 = 不改动，未接管）'
+              : '插件回 null（原数据放行 = 不改动）：$why',
           hasSubscriber: true,
         );
         return null;

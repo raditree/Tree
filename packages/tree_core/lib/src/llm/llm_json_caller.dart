@@ -324,12 +324,32 @@ class LlmJsonCaller {
     final String raw = text.toString();
     final Object? parsed = _tryParseJson(raw);
     if (parsed == null) {
+      // **解析失败 ≠ 整笔白花**：这里必须把"能诊断 + 能自愈"的东西完整带出去。
+      // - `text` 原样带回 ⇒ 插件可做本地修复，或发一次小的"判断 + 修 JSON"调用；
+      // - `truncated_suspect` = 末尾不是 `}`/`]`，或括号/引号不配平（疑似被截断）；
+      // - 落一条核心日志：本分支此前**一条日志都没有**，事故现场只看到"插件回 null"，
+      //   事后无从诊断（现场：734k prompt ≈100% 命中的总结调用因正文非法 JSON 被整包
+      //   弃用、回退内置压缩；见 docs/known-issues.md #31）。
+      final bool truncated = _looksTruncated(raw);
+      log?.call(
+        'llm.call 回包不是合法 JSON（agent=$agentId model=$effectiveModel '
+        'response_format=${responseFormat ?? 'json_object'} 正文 ${raw.length} 字'
+        '${truncated ? '，疑似被截断' : ''}）：${_rawPreview(raw)}',
+      );
       return <String, dynamic>{
-        'error':
-            '模型没有返回合法 JSON（站点处硬设了 response_format=json_object；'
-            '若该端点不支持该参数，请换用支持的模型）',
+        'error': responseFormat == 'text'
+            // text 形态下**根本没发** response_format（为保住对话前缀缓存），
+            // 旧文案"站点处硬设了 json_object"在这条路上是错的、会把人带偏。
+            ? '模型正文不是合法 JSON（本次按 text 形态发送：未发 response_format，'
+                  '端点不会为它强制 JSON 形式 —— 模型偶发夹解释、或被输出上限截断）'
+            : '模型没有返回合法 JSON（站点处硬设了 response_format=json_object；'
+                  '若该端点不支持该参数，请换用支持的模型）',
+        'error_kind': 'json_parse',
         'text': raw,
+        'text_length': raw.length,
+        'truncated_suspect': truncated,
         'model': effectiveModel,
+        'response_format': responseFormat ?? 'json_object',
       };
     }
     return <String, dynamic>{
@@ -434,6 +454,59 @@ class LlmJsonCaller {
     } catch (_) {
       return null;
     }
+  }
+
+  /// 疑似「输出被截断」的廉价判据（**不下结论，只给插件一个提示位**）。
+  ///
+  /// 判据：末尾不是 `}` / `]`；或走一遍极简状态机后括号 / 引号不配平。
+  ///
+  /// 为什么**不在这里补齐**：补齐会产出语义残缺的摘要（钱保住了、信息丢了）。
+  /// 完整性判断交给插件那次显式的"判断 + 修 JSON"小调用，并由它如实标注
+  /// （用户 2026-10-05 定案）。
+  static bool _looksTruncated(String raw) {
+    final String text = raw.trim();
+    if (text.isEmpty) return false;
+    final String last = text[text.length - 1];
+    if (last != '}' && last != ']') return true;
+    int braces = 0;
+    int brackets = 0;
+    bool inString = false;
+    bool escaped = false;
+    for (final int unit in text.codeUnits) {
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (unit == 0x5C /* \ */) {
+          escaped = true;
+        } else if (unit == 0x22 /* " */) {
+          inString = false;
+        }
+        continue;
+      }
+      if (unit == 0x22) {
+        inString = true;
+      } else if (unit == 0x7B /* { */) {
+        braces++;
+      } else if (unit == 0x7D /* } */) {
+        braces--;
+      } else if (unit == 0x5B /* [ */) {
+        brackets++;
+      } else if (unit == 0x5D /* ] */) {
+        brackets--;
+      }
+    }
+    return braces != 0 || brackets != 0 || inString;
+  }
+
+  /// 正文预览（**首 200 + 末 100 字**）：够定位"夹了解释 / 截断在哪儿"，
+  /// 又不至于把整段模型输出灌进日志。
+  static String _rawPreview(String raw) {
+    final String text = raw.trim();
+    const int head = 200;
+    const int tail = 100;
+    if (text.length <= head + tail) return text;
+    return '${text.substring(0, head)}……[省略 ${text.length - head - tail} 字]……'
+        '${text.substring(text.length - tail)}';
   }
 
   LlmTransport _transportFor(CoreModelConfig config) {

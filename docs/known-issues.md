@@ -1768,3 +1768,67 @@ terminal/subagent hook 完成消息）在工具调用期间必须排队等待」
    （**不会**比修复前更差）。
 4. **中转站场景下每张图仍会白跑一次 `/files`**（必然 400）后才内联：本轮没做"该端点已知不支持 ⇒ 直接内联"
    的短路/记忆，收益是一次无用的 HTTP 往返（无正确性影响）。
+
+---
+
+## #31 压缩总结「正文不是合法 JSON」⇒ 整包不接管、那笔几十万 token 的钱白花
+
+**状态**：已修（2026-10-05）：报错细化 + 插件侧三段自愈 + 提示词收紧。
+
+### 现象（现场）
+
+- 契门（`agt_1790845986535_e7df51_3`）2026-10-05 13:19 的一次自动压缩**回退内置**：
+  `core.log` → `[core:plugin] 压缩中转：插件未接管（回 null），回退内置 compact`，
+  紧接着（31s 后）`[core:compact] 上下文已压缩（内置）：总结 499 条，保留 130 条`。
+- 同一时刻那笔 `llm.call` 是**成功**的（`usage.jsonl`）：
+  `{"at":"2026-10-05T13:19:49.528","source":"llm.call","model":"deepseek-flash",`
+  `"prompt_tokens":734428,"cached_tokens":734080,"completion_tokens":4274,"estimated":false,"duration_ms":19467}`
+  ⇒ 734k prompt（≈100% 命中前缀缓存）、19.5s 的总结调用**跑完了**，只因正文解析不出 JSON 被整包丢掉。
+- 为什么事后查不到真正原因：`core.log` 里 `[core:llm-call]` **一条都没有**，
+  会话提示只有一句"插件回 null（原数据放行 = 不改动，未接管）"。
+
+### 根因（两处，都在"代码看得见、日志看不见"的地方）
+
+1. **核心**：`LlmJsonCaller.call()` 解析失败时返回 `{error, text, model}`（**无 `ok`、无 `json`**），
+   而 `ExecuteStationMounts._llmCall()` 把 `error` 之外的东西**全丢掉**
+   （`StationCommandOutcome.failed(error)` ⇒ payload=null）⇒ 插件拿不到原文，**无法自愈**；
+   该分支**不落任何日志**（只有流失败 `failure` 非空才写 `[core:llm-call]`）。
+   旧文案还说"站点处硬设了 `response_format=json_object`"——而压缩插件为保前缀缓存**显式传了
+   `response_format:"text"`**（见 #27），这条路上根本没发该字段，文案把人带偏。
+2. **插件**：`compact_plugin` 只在 `not summary_result.get("ok")` 时 `_decline` 回 null，
+   不做任何抢救；"为什么没接管"只进插件内存面板 + stderr，**核心侧只剩"插件回 null"**。
+
+### 修复
+
+- **核心：细化报错 + 把产出带回去**
+  - 解析失败回包加 `error_kind='json_parse'` / `text`（原文）/ `text_length` / `truncated_suspect`
+    （末尾不是 `}`·`]`，或括号·引号不配平）；**文案按实际响应形式分支**（text 形态不再谎称硬设了 `json_object`）。
+  - 该分支**落一条 `[core:llm-call]` 日志**：agent / 模型 / 响应形式 / 正文长度 / 是否疑似截断 / 首 200 + 末 100 字。
+  - `StationCommandOutcome.failedWith(error, payload)`：命令失败但把 detail 原样回给插件
+    （旧的 `failed(error)` 行为逐字不变）。
+- **协议（纯增量，向后兼容）**：站点回包允许带可选键 `reason`
+  （`{"reply":{"payload":null,"reason":"…"}}`）——`StationReply.reason` → `StationRelayResult.reason`
+  → 核心日志 + `relay_skip_reason` / 会话提示。老插件不带该键时行为逐字不变。
+- **插件：三段自愈，硬上限 = 1 次额外 `llm.call`**
+  1. `salvage_json()`：**免费**本地修复——去 BOM/零宽字符、剥代码块与前后夹话、去尾逗号（**不猜内容、不补字段**）；
+  2. 修不了 ⇒ 一次「**判断完整性 + 修 json**」调用：输入只有那段原文，**不发 `response_format`**
+     （站点缺省即 `json_object`）、**不带 `tools`**、**不设 `max_tokens`**（设小了就是下一次截断、钱又白花）；
+     要求回 `{"complete":…, "reason":…, "summary":{…}}`，`complete=false` 时把截断原因写进摘要；
+  3. 仍不行 ⇒ `_decline(code=…)`：原因含 code + 原文长度 + 前 120 字，并经回包 `reason` 交给核心。
+  - 抢救回来的摘要**一律显式标注**"⚠️ 由本地结构修复得到 / 由一次 JSON 修复调用补全，可能不完整"。
+- **提示词收紧**（`SUMMARY_INSTRUCTION`）：只输出一个 JSON 对象 / 禁代码块与解释 / 四个键必须齐 /
+  字符串禁裸换行·禁尾逗号 / **完整优先、不要求少写**（防截断靠"不设小 `max_tokens` + json 契约"，不靠少写）。
+
+### 验证
+
+- `python examples/plugins/compact_plugin.py --selftest` → **全部通过**，含新增三例：
+  ⑯a 本地修复成功且**零额外调用**；⑯b 截断时**恰好 1 次**修复调用，且该次不带
+  `tools` / `response_format` / `max_tokens`；⑯c 都失败 ⇒ 不接管且回包带 `reason`（含 `repair_failed`）。
+- `cd packages/tree_core && dart test` 全绿、`dart analyze` 无新增错误（通过数见当次提交说明）。
+
+### 遗留
+
+1. **修复调用本身也是模型调用**：它仍可能回坏 JSON（那就只剩"不接管 + 回退内置"），只是多了一次小成本的补救；
+2. **原文只经回包传给插件、不落盘**：连插件抢救都失败时，完整原文只存在于 `[core:llm-call]` 的 300 字预览里
+   （要完整原文得再加"落盘"能力，本轮未做）；
+3. `truncated_suspect` 是**廉价启发式**（不做完整 JSON 词法分析），只用于给修复调用当提示，不作为判据。

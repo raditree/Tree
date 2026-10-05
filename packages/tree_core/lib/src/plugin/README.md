@@ -42,6 +42,12 @@
 3. **点位表是唯一定义处**：加一个点位只该改 [station_points.dart](station_points.dart)（外加 `StationHubIds` 一个常量，且**必须加进 `all`**——否则会被当成别人的自建站、被归属校验收掉），不该去动订阅 / 路由 / 预建 / 面板四段逻辑。点位是**数据**不是行为。
 4. **隔离 fail-closed**：按四元组（team / agent / session / mode）解析目标，任何归属**证明不了**就拒绝并给可读原因。执行站每条命令的第一件事就是校验：`agent_id` 与站点 scope 不一致拒、team 不一致拒、目标 agent 的**工作空间模式**（local | ssh）不一致拒（否则 SSH 团队的命令会打到本地工作空间）。
 5. **中转站 fail-open 红线**：无订阅者 / 订阅者心跳丢失 / 回包非法 / 处理异常，一律**放行原数据**并给出可读原因，绝不抛出、绝不出半成品。压缩中转点的这份原因还**经 `PluginBus.compactionSkipSink` 上报**（带 `hasSubscriber` 分级位：早退 vs 有订阅者却没接管），接线方接到 `CompactionService.noteRelaySkip` ⇒ 原因能进 REST 响应与会话通知——否则"我装了压缩插件为什么没生效"只能去翻 stderr。
+   **回包可选键 `reason`（2026-10-05 新增，纯增量）**：插件回 `payload: null`（= 不接管）时可以顺手说明
+   **为什么**（`StationReply.reason` → `StationRelayResult.reason`）——原因于是从"只活在插件自己的内存面板"
+   升级成**核心日志 + `relay_skip_reason` + 会话提示**；不带该键的老插件行为**逐字不变**。
+   同理，**命令类失败若带着产出**（`llm.call` 解析不出 JSON 时的模型正文）要用
+   `StationCommandOutcome.failedWith(error, payload)` 回，别只回一句 `error`——那等于把插件已付费的
+   那次调用彻底丢掉（现场是 734k prompt 的总结，见 [../llm/README.md](../llm/README.md) 不变量 14）。
 6. 中转站是 `scopeKeyUnique` **先到先得**：同键位第二人被拒（显式 `replace` 才替换并回报被替换者）——一个接入点只能有一个处理者。这也是点位各自成实例的原因：否则"接管 LLM"的插件会顺带垄断"系统提示词构造""上下文压缩"。
 7. **收集站**：schema **必填**（订阅者必须按它产出，校验失败按可读错误回报该订阅者）；**不回填**原数据流（返回值即结果，后续处理由触发方负责）；某订阅者未响应（心跳丢失 / 窗口内无回 / 校验失败 / 回包报错）⇒ 返回**已收集部分 + 显式列出未响应者**，不静默、不阻塞、不整体失败。
 8. **无静态总时间上限**（M9 §1.1）：看门狗每拍 `ping`，连续 N 拍没有心跳 ⇒ 只标记 `health: degraded` 并让前端可见，**不自动终止插件**（长任务跑多久都不因时间被杀）；心跳恢复自动清除；用户可显式 `restart`。唯一保留的短窗口是**建连握手**——没有它就诊断不出"插件根本没起来"。**站请求 / `tools/call` 同样没有静态超时**（`plugin_host.requestStation` 明写这条）；未响应只记"未响应者清单"。**软窗口之后只允许显式收手**（用户 `restart` / 关闭那一次运行）——全仓同一条口径见 [../llm/README.md](../llm/README.md) 不变量 2。
