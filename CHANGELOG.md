@@ -15,6 +15,36 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
+## [1.0.2+5] — 2026-10-05
+
+### 修复（真机复现后立刻补上的那一跳）
+
+- **失败载荷必须穿到插件**（修改 [packages/tree_core/lib/src/llm/README.md](packages/tree_core/lib/src/llm/README.md)
+  不变量 14、[packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 5、
+  [docs/plugin-development.md](docs/plugin-development.md) §6.1）：`llm.call` 解析不出 JSON 时，核心会把那次
+  **已付费的模型正文原文**放进失败回包（`StationCommandOutcome.failedWith(error, payload)`）——可这份载荷在
+  `StationInstance.execute()` 的 `ok:false` 分支被丢掉了，于是插件收到空 `payload`、报"原文 0 字"当场弃权
+  ⇒ 一次 **448,317 prompt（447,616 命中缓存）/ 22.3s** 的总结调用被整包丢弃、回退内置压缩
+  （真机现场 2026-10-05 18:29，证据链见 [docs/known-issues.md](docs/known-issues.md) #31「真机复现」）。
+  现在失败载荷**一路走到插件进程**，三段自愈（免费本地结构修复 → 一次"判断完整性 + 修 json"调用 → 才弃权）
+  真的能被触发；`[core:llm-call]` 明细另补**解析错误的原话（含 offset）**——首尾预览看不出"坏在哪个字符"时
+  它是唯一的线索。协议口径同步进指南：**失败回包也可能带 `payload`**
+  （`{ok:false, error, error_kind, text, text_length, truncated_suspect}`），
+  老插件只读 `ok`/`error` 时行为**逐字不变**（纯增量）。
+- 顺带把 [docs/development.md](docs/development.md) §6 的 `tree_core` 验收基线从 **1188 更新为实测 1199**
+  （只升不降；差额是下面这 4 条回归用例）。
+
+### 新增回归用例（**先证伪，再修**）
+
+- [packages/tree_core/test/plugin_execute_new_commands_test.dart](packages/tree_core/test/plugin_execute_new_commands_test.dart)
+  「llm.call：解析失败也必须把原文（text）经执行站回给插件」——钉住执行站那一跳；**把本次修复 stash 掉该用例即失败**
+  （`payload` 为 null）。
+- [packages/tree_core/test/compact_plugin_e2e_test.dart](packages/tree_core/test/compact_plugin_e2e_test.dart)
+  （**真 Python 进程 + 真总线**）三条：① 正文只有尾逗号这类纯语法问题 ⇒ **零额外调用**（本地修复免费）就接管，
+  摘要标注"由本地结构修复得到"；② 真截断 ⇒ **恰好 1 次**修复调用（断言该次不带 `tools` / `response_format` /
+  `max_tokens`）后接管，摘要标注"由一次 JSON 修复调用补全 + 模型判定原文被截断"；③ 三段全败 ⇒ 回退内置，
+  不接管原因带 `repair_failed`（**不再是"原文 0 字"**）。同样先证伪：stash 掉修复跑 ①，输出与真机一字不差。
+
 ## [1.0.2+4] — 2026-10-05
 
 ### 断言变化（新增 / 修改的 README 不变量）

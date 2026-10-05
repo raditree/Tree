@@ -120,13 +120,16 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 | 静态检查 | `dart analyze` × 4 包 + `flutter analyze lib test` 全干净 |
 | `tree_protocol` | 38 passed（含协议完备性 + 文档契约门禁） |
 | `tree_local_exec` | 255 passed / 4 skipped |
-| `tree_core` | 1188 passed / 2 skipped |
+| `tree_core` | 1199 passed / 2 skipped |
 | 前端 `flutter test` | 789 passed |
 | 真机 SSH 回归（`TREE_SSH_TEST_*` 具备时） | `list` / `upload` / `download_folder` / `syncToLocal` 四项通过 |
 
 > 上表数字于 **2026-10-05 逐包重测**（此前记的 33 / 159+1 / 849+1 / 217 已经过时——那是更早里程碑的旧值，
 > 不是某次改动造成的）。基线是**下限**：只许持平或更好。**注意**：`dart test` 计时敏感的用例（例如
 > `tree_core` 的 `llm_transport_liveness_test`）在**多套测试并发跑**时可能偶发失败；复核请单独跑一遍。
+> **2026-10-05 发布 1.0.2+5 时再次逐包重测**：38 / 255~4 / **1199~2** / 789（`tree_core` 从 1188 升到 1199，
+> 差额是本次为"失败载荷穿到插件"补的 4 条回归用例）。`tree_core_cli` **没有 `lib/`**：
+> 单独分析它要跑 `dart analyze`（整包），`dart analyze lib test` 会以 `Directory or file doesn't exist: lib` 退出（code 64）。
 
 ## 7. 调试
 
