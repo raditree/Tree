@@ -44,7 +44,7 @@ class AgentListItem extends StatelessWidget {
           // 色条**固定 4px**：不随选中变宽——一变宽会把文字往右推 2px，
           // 选中瞬间整行抖一下。选中态改用背景高亮表达。
           border: Border(left: BorderSide(color: barColor, width: 4)),
-          color: selected ? cs.primaryContainer.withOpacity(0.40) : null,
+          color: selected ? cs.primaryContainer.withValues(alpha: 0.40) : null,
         ),
         padding: const EdgeInsets.fromLTRB(12, 8, 10, 8),
         child: Column(

@@ -1,6 +1,7 @@
 /// Agent 列表外观 demo —— 不连核心、不申请单实例锁，可与正式版同时跑。
 ///
 ///   flutter run -t lib/demo/agent_list_demo.dart -d windows
+library;
 import 'package:flutter/material.dart';
 
 import '../ui/models/agent.dart';
