@@ -176,7 +176,7 @@ class _AgentListState extends State<AgentList> {
                   height: 1,
                   thickness: 1,
                   color: Theme.of(context).dividerColor,
-                  indent: 12,
+                  indent: 4,
                   endIndent: 12,
                 );
               }
