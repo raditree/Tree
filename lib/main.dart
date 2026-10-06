@@ -392,6 +392,7 @@ class _AgentTeamAppState extends State<AgentTeamApp> with WindowListener {
       },
     );
   }
+}
 
 /// 启动期诊断横幅的宿主：把非致命警告显示在主界面顶部，可关闭。
 ///
