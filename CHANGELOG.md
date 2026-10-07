@@ -15,6 +15,44 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
+## [1.0.2+6] — 2026-10-07
+
+### 断言变化（新增 / 修改的 README 不变量）
+
+- **链路级故障（服务端拒绝新通道）也要能重建**（修改 [packages/tree_local_exec/README.md](packages/tree_local_exec/README.md)
+  不变量 6、[docs/architecture.md](docs/architecture.md) §11）：判死判据**一个字没动**（仍只看"连续 N 拍心跳窗口内没有回包"），
+  补的是**触发面**——2026-10-07 现场出现过一种心跳判活覆盖不到的形态：心跳走 SSH **global request**（不占 channel），
+  一直有回包 ⇒ `isStale == false`；但服务端开始**拒绝新的 session 通道**（`SSHChannelOpenError(2: open failed)`）。
+  于是文件浏览（SFTP subsystem 通道，**建连时就已开、之后一直复用**）仍然可用，而每次**新开**通道的 git 历史 /
+  terminal 工具全挂；**只靠心跳判死就永不自愈**（现场 10-07 07:29→12:47，远端实测可达，只能重启应用）。
+  现在 `DartSshTransport.run` / `openShell` 一旦以链路级错误失败，就经新增的 `SshLinkFaultRelay`
+  （[packages/tree_local_exec/lib/src/ssh_link_fault.dart](packages/tree_local_exec/lib/src/ssh_link_fault.dart)）
+  起**同一份**后台重建（单飞 + 退避 + 可停止，与心跳失活共用同一个 `SshReconnectPump`）；
+  **换会话成功之后才清故障标记**（顺序反了就是"假活"）；本次调用仍**如实失败**、不阻塞调用方，
+  文案追加「已触发链路重建，请稍后重试」。证据链与遗留见 [docs/known-issues.md](docs/known-issues.md) #32。
+  SFTP 侧不改：那条通道是建连时开的，不受"新开被拒"影响；它真坏掉时连接整体已坏，心跳会带走它。
+- **执行站新增 `ssh.reconnect` 命令**（修改 [docs/plugin-development.md](docs/plugin-development.md) §3.1 与 §6.1）：
+  `system.execute.ssh` / 别名 `ssh`，参数 `agent_id?`；与 REST `POST /api/agents/{id}/ssh/reconnect`、
+  右栏文件面板「重连」按钮**同一份实现**（`WorkspaceToolRunner.reconnectSshLink`）。三种结局
+  （成功 / 该 agent 不是 SSH / 重建失败）如实表达，未接线时显式失败。内置点位清单随之
+  **17 → 18**（执行 7 → 8）、执行站命令 **13 → 14**（测试门禁已同步）。
+
+### 新增回归用例（**先证伪，再修**）
+
+- [packages/tree_local_exec/test/ssh_link_fault_test.dart](packages/tree_local_exec/test/ssh_link_fault_test.dart)
+  6 例（一次上报就拉起重连 / 重复上报只记数、不叠第二个 / 失败按退避继续到成功 / `clear()` 后循环退出 /
+  关停后不再试 / 日志只喊一次）；**用例自己不调 `pump.start()`**——把 `report` 里的 start 摘掉，
+  「一次上报」「重复上报」「失败重试」三例即红。
+- [packages/tree_core/test/plugin_execute_new_commands_test.dart](packages/tree_core/test/plugin_execute_new_commands_test.dart)
+  新增 `ssh.reconnect` 用例（目标透传 + 三种结局如实；未接线可读失败；四元组 fail-closed 同样管住它）。
+
+### 文档
+
+- [docs/known-issues.md](docs/known-issues.md) 新增 **#32**（现象 / 根因 / 修复 / 验证 / 遗留）。
+- [packages/tree_local_exec/README.md](packages/tree_local_exec/README.md)：不变量 6 补"链路级故障"一节，
+  文件表与测试清单同步。
+- [docs/architecture.md](docs/architecture.md) §11 补"链路级故障"触发面。
+
 ## [1.0.2+5] — 2026-10-05
 
 ### 修复（真机复现后立刻补上的那一跳）
