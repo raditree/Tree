@@ -61,6 +61,9 @@ abstract final class StationHubIds {
   /// 执行站·会话族：`session.rename`（会话重命名）。
   static const String executeSession = 'system.execute.session';
 
+  /// 执行站·SSH 族：`ssh.reconnect`（重建目标 agent 的远端链路）。
+  static const String executeSsh = 'system.execute.ssh';
+
   // ── 中转站（拦截-回填；每个点位各自唯一订阅者） ──────────────────────────
 
   /// 中转站·工具调用前（可改参数）。
@@ -113,6 +116,7 @@ abstract final class StationHubIds {
     executeLlm,
     executeTool,
     executeSession,
+    executeSsh,
     relayToolPre,
     relayToolPost,
     relayLlmHandle,

@@ -23,14 +23,14 @@ void main() {
       );
     });
 
-    test('类型分布：广播 4 / 执行 7 / 中转 6 / 收集 1', () {
+    test('类型分布：广播 4 / 执行 8 / 中转 6 / 收集 1', () {
       int count(StationKind kind) =>
           StationPoints.ofKind(kind).length;
       expect(count(StationKind.broadcast), 4);
-      expect(count(StationKind.execute), 7);
+      expect(count(StationKind.execute), 8);
       expect(count(StationKind.relay), 6);
       expect(count(StationKind.collect), 1);
-      expect(StationPoints.all.length, 18);
+      expect(StationPoints.all.length, 19);
     });
 
     test('退役 id 不在表里（它们只用于读侧迁移）', () {
@@ -85,9 +85,9 @@ void main() {
       expect(StationPoints.byId(StationHubIds.broadcast)!.suffix, StationHubIds.broadcast);
     });
 
-    test('命令 → 点位：13 条命令，每条恰好属于一个执行站点位', () {
+    test('命令 → 点位：14 条命令，每条恰好属于一个执行站点位', () {
       final Set<String> commands = StationPoints.allCommands;
-      expect(commands.length, 13, reason: '$commands');
+      expect(commands.length, 14, reason: '$commands');
       expect(
         commands,
         <String>{
@@ -104,6 +104,7 @@ void main() {
           'tool.call',
           'tool.close',
           'session.rename',
+          'ssh.reconnect',
         },
       );
       for (final String command in commands) {

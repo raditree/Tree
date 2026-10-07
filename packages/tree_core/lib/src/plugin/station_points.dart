@@ -153,6 +153,15 @@ abstract final class StationPoints {
       alias: 'session',
       commands: <String>['session.rename'],
     ),
+    StationPointSpec(
+      id: StationHubIds.executeSsh,
+      kind: StationKind.execute,
+      label: '链路重连',
+      description:
+          '执行站·SSH 族：ssh.reconnect（重建目标 agent 的远端链路；args {agent_id?}；与 REST 端点同一实现）',
+      alias: 'ssh',
+      commands: <String>['ssh.reconnect'],
+    ),
   ];
 
   /// 中转站点位（每个点位各自唯一订阅者）。

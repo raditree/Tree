@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:dartssh2/dartssh2.dart';
 
 import 'local_workspace_io.dart';
+import 'ssh_link_fault.dart';
 import 'ssh_login_shell.dart';
 import 'ssh_liveness.dart';
 import 'ssh_reconnect.dart';
@@ -198,9 +199,27 @@ class DartSshTransport implements SshTransport {
     attempt: _reconnectOnce,
     backoff: _reconnectBackoff,
     sleep: _sleep,
-    stillNeeded: () => !_closed && _liveness.isStale,
+    stillNeeded: () => !_closed && (_liveness.isStale || _linkFault.faulted),
     onEvent: (String message) => _log?.call('SSH 重连：$message'),
   );
+
+  /// 链路级故障中继（2026-10-07 补）：一次远端操作以**链路级**错误失败（例如服务端
+  /// 开始**拒绝新的 session 通道**：`SSHChannelOpenError`）也会起一次后台重建。
+  ///
+  /// 判死判据**不变**（仍只看「连续 N 拍心跳丢失」），这里只扩大「主动重建」的触发面：
+  /// 那种形态下心跳一直有回包（global request 不占 channel）、SFTP 也还能用，但每次
+  /// **新开**的 exec/shell 通道都被拒——只靠心跳判死的话永远不自愈（现场 5 小时）。
+  /// 详见 [SshLinkFaultRelay] 的类文档。
+  late final SshLinkFaultRelay _linkFault = SshLinkFaultRelay(
+    pump: _reconnectPump,
+    log: _log,
+  );
+
+  /// 上报一次链路级故障（已 [close] 则不再拉起重建、也不误报"正在重建"）。
+  void _reportLinkFault(Object error) {
+    if (_closed) return;
+    _linkFault.report(error);
+  }
 
   /// 已 [close]：不再起新的重连、不再发心跳。
   bool _closed = false;
@@ -282,6 +301,9 @@ class DartSshTransport implements SshTransport {
     _session = fresh;
     // 新连接 = 新链路：清空丢失计数（失活标记随之解除），在途的守卫自然放行。
     _liveness.reset();
+    // 链路级故障标记同理清零。顺序**必须**在「换会话成功之后」——先清标记再换会话
+    // 就成"假活"（标记说恢复了、实际操作还落在旧连接上）。
+    _linkFault.clear();
     try {
       stale.close();
     } catch (_) {
@@ -534,7 +556,12 @@ class DartSshTransport implements SshTransport {
         stderr: LocalWorkspaceIO.decodeBytes(result.stderr),
       );
     } catch (error) {
-      throw WorkspaceIoException('远端命令执行失败：$error');
+      // **链路级故障 ≠ 命令失败**：命令非 0 退出是通过 [SSHRunResult.exitCode] 正常
+      // 返回的，走到这里的一定是执行层/链路层异常（通道开不出来、client 已被关、
+      // socket 断）。所以这里补一次「链路级故障 → 后台重建」：本次调用仍**如实失败**
+      // （不假装成功），重连只保证"之后能再用"。见 [SshLinkFaultRelay]。
+      _reportLinkFault(error);
+      throw WorkspaceIoException('远端命令执行失败：$error（已触发链路重建，请稍后重试）');
     }
   }
 
@@ -595,7 +622,8 @@ class DartSshTransport implements SshTransport {
       channel.start();
       return channel;
     } catch (error) {
-      throw WorkspaceIoException('远端 shell 打开失败：$error');
+      _reportLinkFault(error);
+      throw WorkspaceIoException('远端 shell 打开失败：$error（已触发链路重建，请稍后重试）');
     }
   }
 

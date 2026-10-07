@@ -103,6 +103,15 @@ typedef StationSessionRenamer =
 /// ToolRunRegistry.close 是同一个实现）。
 typedef StationToolCloser = Future<Map<String, dynamic>> Function(String handle);
 
+/// `ssh.reconnect` 的**重建远端（SSH）链路**入口（核心注入；与 REST
+/// `POST /api/agents/{id}/ssh/reconnect`、右栏文件面板「重连」按钮同一实现）。
+///
+/// [agentId] 是**已解析好的目标 agentId**（`_resolveTarget` 四元组隔离之后的值）。
+/// 实现须**如实**表达三种结局（成功 / 该 agent 不是 SSH / 重建失败），不静默降级。
+typedef StationSshReconnector = Future<Map<String, dynamic>> Function(
+  String agentId,
+);
+
 /// 执行站命令的挂载位置集合（M9 Wave 3-I）。
 ///
 /// 站点体系里「执行器只是执行站的一种挂载位置」：本类就是**系统内置挂载位置**，
@@ -143,6 +152,7 @@ class ExecuteStationMounts {
     this.toolCaller,
     this.sessionRenamer,
     this.toolCloser,
+    this.sshReconnector,
     this.log,
   }) : _injectedHooks = hooks;
 
@@ -163,6 +173,7 @@ class ExecuteStationMounts {
     StationToolCaller? toolCaller,
     StationSessionRenamer? sessionRenamer,
     StationToolCloser? toolCloser,
+    StationSshReconnector? sshReconnector,
     void Function(String message)? log,
   }) => ExecuteStationMounts(
     ioFor: ioFor,
@@ -187,6 +198,7 @@ class ExecuteStationMounts {
     toolCaller: toolCaller,
     sessionRenamer: sessionRenamer,
     toolCloser: toolCloser,
+    sshReconnector: sshReconnector,
     log: log,
   );
 
@@ -227,6 +239,9 @@ class ExecuteStationMounts {
   /// `tool.close`（**显式**关闭一次运行中的工具）入口；null = 该命令显式报
   /// 「未接线」——**不做静默降级**（不假装"已经关掉了"）。
   final StationToolCloser? toolCloser;
+
+  /// `ssh.reconnect`（重建远端 SSH 链路）入口；null = 该命令显式报「未接线」。
+  final StationSshReconnector? sshReconnector;
 
   final void Function(String message)? log;
 
@@ -326,6 +341,8 @@ class ExecuteStationMounts {
           return await _sessionRename(context, target);
         case 'tool.close':
           return await _toolClose(context, target);
+        case 'ssh.reconnect':
+          return await _sshReconnect(context, target);
         default:
           return StationCommandOutcome.failed('命令 $command 尚无挂载实现');
       }
@@ -919,6 +936,44 @@ class ExecuteStationMounts {
       'agent_id': target.agentId,
       'session_id': sessionId,
       'title': title,
+    });
+  }
+
+  /// `ssh.reconnect`：**重建目标 agent 的远端（SSH）链路**。
+  ///
+  /// 与 REST `POST /api/agents/{id}/ssh/reconnect`、右栏文件面板「重连」按钮走
+  /// **同一份实现**（`WorkspaceToolRunner.reconnectSshLink`）：判活判据不变（只看
+  /// 连续心跳丢失），重连是判死**之后**的动作，不引入任何静态时长上限。
+  ///
+  /// 参数：`agent_id?`（缺省用站点 scope 的 agent）——四元组隔离已在
+  /// [_resolveTarget] 里做完，这里拿到的 [target] 是**已证明归属**的目标。
+  /// **三种结局如实表达**：目标不是 SSH 工作空间 ⇒ 失败 + 可读原因（**不把
+  /// notSsh 说成成功**）；重建失败 ⇒ 失败；成功 ⇒ `{ok, agent_id, stale}`。
+  Future<StationCommandOutcome> _sshReconnect(
+    StationCommandContext context,
+    _StationTarget target,
+  ) async {
+    final StationSshReconnector? connector = sshReconnector;
+    if (connector == null) {
+      return const StationCommandOutcome.failed(
+        'ssh.reconnect 未接线：核心未注入远端链路重建入口',
+      );
+    }
+    final Map<String, dynamic> result = await connector(target.agentId);
+    final Object? error = result['error'];
+    if (error != null && error.toString().isNotEmpty) {
+      // 注入方如实报的失败（含"该 agent 不是 SSH 工作空间"）：命令失败 + 可读原因
+      return StationCommandOutcome.failed(error.toString());
+    }
+    if (result['ok'] != true) {
+      // 既没成功、也没给原因 ⇒ 不假装成功
+      return StationCommandOutcome.failed(
+        'ssh.reconnect 未成功：核心未给出可读原因（payload=$result）',
+      );
+    }
+    return StationCommandOutcome.ok(<String, dynamic>{
+      ...result,
+      'agent_id': target.agentId,
     });
   }
 

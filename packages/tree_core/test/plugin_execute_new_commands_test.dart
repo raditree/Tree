@@ -32,6 +32,8 @@ void main() {
   late List<Map<String, dynamic>> llmCalls;
   late List<Map<String, dynamic>> toolCalls;
   late List<Map<String, dynamic>> renameCalls;
+  late List<String> sshReconnectCalls;
+  late Map<String, dynamic> sshReconnectResult;
 
   const String agent = 'agt_1';
   const String team = 'team-1';
@@ -50,6 +52,8 @@ void main() {
     llmCalls = <Map<String, dynamic>>[];
     toolCalls = <Map<String, dynamic>>[];
     renameCalls = <Map<String, dynamic>>[];
+    sshReconnectCalls = <String>[];
+    sshReconnectResult = <String, dynamic>{'ok': true, 'stale': false};
   });
 
   tearDown(() async {
@@ -162,6 +166,14 @@ void main() {
                 'title': title,
                 'session_id': sessionId,
               };
+            },
+      // `ssh.reconnect`：重建远端链路的入口（生产 = WorkspaceToolRunner.reconnectSshLink）。
+      // 三种结局（成功 / 该 agent 不是 SSH / 重建失败）都由这个假实现如实产出。
+      sshReconnector: !wired
+          ? null
+          : (String agentId) async {
+              sshReconnectCalls.add(agentId);
+              return sshReconnectResult;
             },
     );
     opened.add(built);
@@ -520,9 +532,45 @@ void main() {
     expect(failed.error, contains('会话不存在'));
   }, timeout: const Timeout(Duration(seconds: 60)));
 
+  // ── ssh.reconnect ────────────────────────────────────────────────────
+
+  test('ssh.reconnect：目标 agent 透传并即时回报；失败原样回到调用方（不假装成功）', () async {
+    wire(mounts());
+
+    final StationCommandResult result = await run('ssh.reconnect');
+    expect(result.ok, isTrue, reason: result.error);
+    expect(result.mountId, 'core.execute.ssh.reconnect');
+    expect(sshReconnectCalls, <String>[agent]);
+    final Map<String, dynamic> payload =
+        result.payload! as Map<String, dynamic>;
+    expect(payload['ok'], isTrue);
+    expect(payload['agent_id'], agent);
+    expect(payload['stale'], isFalse);
+
+    // 重建失败（注入方如实报 error）⇒ 命令失败，原因原样带回
+    sshReconnectResult = <String, dynamic>{
+      'ok': false,
+      'error': 'SSH 重连失败：主机不可达',
+    };
+    final StationCommandResult failed = await run('ssh.reconnect');
+    expect(failed.ok, isFalse);
+    expect(failed.error, contains('主机不可达'));
+    expect(sshReconnectCalls, hasLength(2), reason: '失败也要真的落到实现上');
+
+    // 「该 agent 不是 SSH 工作空间」也是**失败**（绝不能把它说成成功）
+    sshReconnectResult = <String, dynamic>{
+      'ok': false,
+      'not_ssh': true,
+      'error': '该 agent 未使用 SSH（本地工作空间），没有可重连的远端链路',
+    };
+    final StationCommandResult notSsh = await run('ssh.reconnect');
+    expect(notSsh.ok, isFalse);
+    expect(notSsh.error, contains('没有可重连的远端链路'));
+  }, timeout: const Timeout(Duration(seconds: 60)));
+
   // ── 未接线 ───────────────────────────────────────────────────────────
 
-  test('未接线：三条命令各自显式失败（ok:false，error 含「未接线」）', () async {
+  test('未接线：四条命令各自显式失败（ok:false，error 含「未接线」）', () async {
     wire(mounts(wired: false));
 
     final Map<String, Map<String, dynamic>> args =
@@ -530,6 +578,7 @@ void main() {
           'llm.call': <String, dynamic>{'prompt': '你好'},
           'tool.call': <String, dynamic>{'tool': 'read'},
           'session.rename': <String, dynamic>{'title': '标题'},
+          'ssh.reconnect': <String, dynamic>{},
         };
     for (final MapEntry<String, Map<String, dynamic>> entry in args.entries) {
       final StationCommandResult result = await run(
@@ -551,11 +600,12 @@ void main() {
     expect(llmCalls, isEmpty);
     expect(toolCalls, isEmpty);
     expect(renameCalls, isEmpty);
+    expect(sshReconnectCalls, isEmpty);
   }, timeout: const Timeout(Duration(seconds: 60)));
 
   // ── 四元组 fail-closed ───────────────────────────────────────────────
 
-  test('四元组 fail-closed：跨 team / 跨模式 / 缺 team / agent 不一致都拒绝这三条命令', () async {
+  test('四元组 fail-closed：跨 team / 跨模式 / 缺 team / agent 不一致都拒绝这四条命令', () async {
     wire(mounts());
 
     final Map<String, StationScope> badScopes = <String, StationScope>{
@@ -568,12 +618,14 @@ void main() {
       'llm.call',
       'tool.call',
       'session.rename',
+      'ssh.reconnect',
     ];
     final Map<String, Map<String, dynamic>> args =
         <String, Map<String, dynamic>>{
           'llm.call': <String, dynamic>{'prompt': '你好'},
           'tool.call': <String, dynamic>{'tool': 'read'},
           'session.rename': <String, dynamic>{'title': '标题'},
+          'ssh.reconnect': <String, dynamic>{},
         };
 
     for (final MapEntry<String, StationScope> entry in badScopes.entries) {
@@ -617,13 +669,15 @@ void main() {
     expect(llmCalls, isEmpty, reason: '被隔离拒绝的命令绝不能调用 LLM');
     expect(toolCalls, isEmpty, reason: '被隔离拒绝的命令绝不能执行工具');
     expect(renameCalls, isEmpty, reason: '被隔离拒绝的命令绝不能改会话名');
+    expect(sshReconnectCalls, isEmpty, reason: '被隔离拒绝的命令绝不能重建链路');
   }, timeout: const Timeout(Duration(seconds: 60)));
 
-  test('新命令与首命令集一样按命令族分点位（llm / tool / session 三个点位）', () {
+  test('新命令与首命令集一样按命令族分点位（llm / tool / session / ssh 四个点位）', () {
     wire(mounts());
     expect(point('llm.call').id, StationHubIds.executeLlm);
     expect(point('tool.call').id, StationHubIds.executeTool);
     expect(point('session.rename').id, StationHubIds.executeSession);
+    expect(point('ssh.reconnect').id, StationHubIds.executeSsh);
     expect(
       point('llm.call').mounts().map((StationCommandMount m) => m.command),
       <String>['llm.call'],

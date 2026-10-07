@@ -15,6 +15,7 @@ export 'src/git_output.dart';
 export 'src/local_workspace_io.dart';
 export 'src/pty/pty_session.dart';
 export 'src/ssh_liveness.dart';
+export 'src/ssh_link_fault.dart';
 export 'src/ssh_login_shell.dart';
 export 'src/ssh_reconnect.dart';
 export 'src/ssh_shell_channel.dart';

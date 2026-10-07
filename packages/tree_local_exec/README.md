@@ -16,6 +16,7 @@
 | [lib/src/shell.dart](lib/src/shell.dart) | shell 参数：`-NonInteractive`、裸 `echo` 兼容翻译、逻辑运算符翻译（Windows/POSIX） |
 | [lib/src/ssh_liveness.dart](lib/src/ssh_liveness.dart) | SSH 心跳台账（连续 N 拍丢失 ⇒ 判失活；判失活的那一拍**通知传输层重建连接**） |
 | [lib/src/ssh_reconnect.dart](lib/src/ssh_reconnect.dart) | **重连的节拍器** `SshReconnectPump`：单飞 + 退避 + 可停止（与 dartssh2 无关，所以能单测） |
+| [lib/src/ssh_link_fault.dart](lib/src/ssh_link_fault.dart) | **链路级故障中继** `SshLinkFaultRelay`：一次远端操作以**链路级**错误失败（如服务端开始拒绝新的 session 通道）时，也起一次后台重建——与心跳失活**共用同一个**节拍器 |
 | [lib/src/dartssh_transport.dart](lib/src/dartssh_transport.dart) | dartssh2 传输实现：连接 / SFTP / exec / 远端 shell 通道 / **心跳与自动重连**（`reconnect()` 单飞换会话） |
 | [lib/src/windows_environment.dart](lib/src/windows_environment.dart) | **按登录口径重建环境变量**（注册表机器级 + 用户级；失败整体退回继承）——本地 exec / git / PTY / hook 共用 |
 | [lib/src/ssh_login_shell.dart](lib/src/ssh_login_shell.dart) | **远端命令的登录外壳包装**（`bash -lc` → `sh -lc` → 原样发；可配可关）+ POSIX 单引号转义 |
@@ -55,6 +56,17 @@
      用户不想等退避时点它；
    - **不引入任何静态时长上限**：退避只是"两次尝试之间的节奏"，单次建连照旧不设超时，判死判据仍然只看心跳丢失。
    失活期间的**失败文案**如实说这件事（旧文案「心跳恢复后自动恢复」是误导，已改）。
+   - **链路级故障也触发重建**（2026-10-07 补；现场 5 小时不自愈）：另有一种形态——心跳走的是
+     SSH **global request**（不占 channel），一直有回包 ⇒ 判活通过、`isStale == false`；但服务端
+     开始**拒绝新的 session 通道**（`SSHChannelOpenError(2: open failed)`）。此时 SFTP 通道
+     （**建连时就已开、之后一直复用**）仍然可用 ⇒ 文件浏览好的，而每次**新开**通道的 git 历史 /
+     terminal 工具全挂——**只靠心跳判死的话永不自愈**（现场 10-07 07:29→12:47，远端实测可达）。
+     所以 `DartSshTransport` 的 `run` / `openShell` 一旦以链路级错误失败，就经 [SshLinkFaultRelay]
+     起**同一份**后台重建（单飞 + 退避 + 可停止）；**判死判据仍只看心跳丢失**，本类只是扩大
+     「主动重建」的触发面，**不引入任何静态时长上限**；**重建成功（换会话之后）才清故障标记**
+     （顺序反了就是假活）；本次调用仍**如实失败**，文案追加「已触发链路重建，请稍后重试」。
+     （SFTP 侧不改：那条通道是建连时开的，不受「新开被拒」影响；它真坏掉时连接整体已坏，
+     心跳会带走它。）
 7. grep 的三个数字各管一件事，**别混**：`scannedFileCount` 是**计数**（读过内容且非二进制的文件数，
    不受任何上限影响）；`scannedFilePaths` 只留前 `GrepOutcome.maxScannedFilePaths`（= **20**）条抽样；
    `GrepQuery.maxResults`（默认 **200**，可由工具参数 `max_results` 覆盖）是**命中行数**上限，
@@ -151,7 +163,10 @@ M11 新增钉子：`git_output_test` 的 `parseStatus` 组（`-z`、空格 / 中
 
 回归钉子：`exec_no_interactive_hang_test`（裸 `echo` 不再等输入）、`exec_soft_timeout_test`（本地软超时交还进程）、
 `ssh_reconnect_test`（**判失活 → 重连**：节拍器单飞 / 退避走完一直用最后一拍 / 关停后不再试、
-`SshLiveness.onStale` 只在跨阈值那一拍通知一次、`ReconnectableWorkspace` 的可见面——本机后端**不**实现它），
+`SshLiveness.onStale` 只在跨阈值那一拍通知一次、`ReconnectableWorkspace` 的可见面——本机后端**不**实现它）、
+`ssh_link_fault_test`（**链路级故障 → 重建**（2026-10-07）：一次上报就拉起重连 / 重复上报只记数、不叠第二个 /
+失败按退避继续到成功 / `clear()` 后循环退出 / 关停后不再试；**用例不自己调 `pump.start()`**，
+去掉 `report` 里的 start 必须变红）、
 `background_exec_test`（**后台执行原语**：本机起/写日志/读尾部/杀树/越界拒绝；远端用假 transport 钉
 `( setsid nohup … & echo $! )` 命令形状、哨兵轮询（含 `GONE`）、`attachBackground` **不重跑命令**、`cancel` 拿不到 pid 时如实 false）、
 `local_workspace_io_test` / `ssh_workspace_io_test` 的「结尾换行保真」组（**不变量 17**：`'a\nb\n'` 原样读回、

@@ -1869,3 +1869,72 @@ terminal/subagent hook 完成消息）在工具调用期间必须排队等待」
 2. **原文只经回包传给插件、不落盘**：连插件抢救都失败时，完整原文只存在于 `[core:llm-call]` 的 300 字预览里
    （要完整原文得再加"落盘"能力，本轮未做）；
 3. `truncated_suspect` 是**廉价启发式**（不做完整 JSON 词法分析），只用于给修复调用当提示，不作为判据。
+
+## #32 心跳还活、服务端却拒绝新通道 ⇒ 自动重连不触发（git 历史 / terminal 全挂，5 小时不自愈）
+
+**状态**：已修（2026-10-07）：链路级故障也拉起同一份后台重建（**判死判据不变**）+ 执行站 `ssh.reconnect`。
+
+### 现象（现场）
+
+- 契门（`agt_1790845986535_e7df51_3`）2026-10-07 **07:29 → 12:47（约 5 小时）**远端链路不可用：
+  - `core.log` 07:29:05.918 → `后台任务失联 hook_1791322445851_76：远端命令执行失败：SSHChannelOpenError(2: open failed)`；
+  - 会话 `ses_1790927742041_b5d93d_72` 07:29:15 →「Both calls failed with `SSHChannelOpenError(2: open failed)`
+    ⇒ the link is down again」；12:42:59 →「连不上（第三次同样的 `SSHChannelOpenError`）」。
+- **UI 是分裂的**：文件浏览（SFTP）**可用**；Git 历史页报「读取远端 Git 历史失败：远端命令执行失败：
+  SSHChannelOpenError(2: open failed)」。
+- **关键反证**：这 5 小时里 `core.log` **一条 `SSH 链路失活（连续 3 次心跳丢失），开始后台重连…` 都没有**
+  （上一次是 10-06 15:38，那次自愈成功）——说明**自动重连根本没被触发**。
+- 远端实测可达（`Test-NetConnection 192.168.0.208 -Port 22` → True）。
+
+### 根因
+
+1. **判活（心跳）与"通道能不能开"是两件事**：心跳走 SSH **global request**（不占 channel），
+   服务端照常回 ⇒ `SshLiveness.isStale == false`；而服务端此时开始拒绝新的 **session 通道**
+   （`SSH_MSG_CHANNEL_OPEN_FAILURE`，reason 2、描述「open failed」，dartssh2 `ssh_client.dart:1473` 抛出）。
+2. **自愈的触发面只认心跳判死**（`SshLiveness.onStale` → `SshReconnectPump`），
+   于是"心跳正常但新通道被拒"这一类**完全在触发面之外** ⇒ 一次也不重建。
+3. **为什么文件浏览活着**：SFTP subsystem 通道是**建连时就开好**的、之后一直复用；
+   git 历史 / terminal 工具**每次新开** exec 通道 ⇒ 每次都被拒。二者用的是**同一条连接**
+   （`FileService.remoteIoFor` → `WorkspaceToolRunner._ioFor`，其注释明确"避免文件面板一条连接、工具又一条"）。
+4. **UI 上还无处可点**：`file_tree.dart` 的「重连」按钮只在**根加载失败**的错误块上挂
+   （注释原话："目前只有根加载失败时挂「重连」"）；文件浏览正常 ⇒ 没有错误块 ⇒ 按钮不可见，
+   `git_history.dart` 又没有这个按钮。因此现场**没有任何手动恢复入口**（只能重启应用）。
+5. **未确证**（如实标注）：服务端为什么开始拒绝新通道——需要远端 sshd 侧（会话配额 / 资源类）才能确认；
+   TCP 层与 sshd 传输层都正常。**手动重建（新建 TCP 连接）在 10-05 / 10-06 实测都能恢复**，
+   与"新连接有新配额"一致。
+
+### 修复
+
+- **链路级故障也触发重建**：新增 `packages/tree_local_exec/lib/src/ssh_link_fault.dart` 的 `SshLinkFaultRelay`，
+  接入 `dartssh_transport.dart`——`run` / `openShell` 一旦以链路级错误失败（走到 `catch` 的一定是执行层 /
+  链路层异常：命令非 0 退出是通过 `SSHRunResult.exitCode` **正常返回**的），就置一个连接级故障标记并起一次
+  后台重建，**与心跳失活共用同一个 `SshReconnectPump`**（单飞 + 退避 + 可停止）。口径：**判死判据一个字没动**
+  （`isStale` 仍只看"连续 N 拍心跳丢失"），这里只扩大"主动重建"的触发面、**不引入任何静态时长上限**；
+  **换会话成功之后才清标记**（顺序反了就是"假活"）；本次调用仍**如实失败**（不阻塞调用方），
+  文案追加「已触发链路重建，请稍后重试」。SFTP 侧**不改**：那条通道是建连时开的，不受"新开被拒"影响；
+  它真坏掉时连接整体已坏，心跳会带走它。
+- **执行站新增 `ssh.reconnect`**（`station_ids.dart` / `station_points.dart` / `execute_mounts.dart` /
+  `core_server.dart` / `docs/plugin-development.md` §3.1 与 §6.1）：与 REST 端点、右栏「重连」按钮
+  **同一份实现**（`WorkspaceToolRunner.reconnectSshLink`），三种结局（成功 / 该 agent 不是 SSH / 重建失败）
+  如实表达，未接线时显式失败。
+
+### 验证
+
+- `packages/tree_local_exec`：`dart analyze lib test` 无 issue；`dart test` **261 passed**（4 个门控真机跳过）。
+  新增 `test/ssh_link_fault_test.dart` 6 例（一次上报就拉起重连 / 重复上报只记数不叠第二个 / 失败按退避继续到成功 /
+  `clear()` 后循环退出 / 关停后不再试 / 日志只喊一次），**先证伪**：把 `report` 里的 `pump.start()` 摘掉，
+  「一次上报」「重复上报」「失败重试」三例即红；用例**自己不调 `pump.start()`**，所以"没拉起重连"瞒不过去。
+- `packages/tree_core`：`dart analyze lib test` 无 issue；`dart test` **1200 passed / 2 skipped**（新增 `ssh.reconnect` 用例：
+  目标透传 + 三种结局如实、未接线可读失败、四元组 fail-closed；另有内置点位清单门禁 **17 → 18**
+  （执行 7 → 8）与"13 条命令 → 14 条"的**必要同步**）。
+- **未做**：真机端到端（"通道被拒 ⇒ 自动重建 ⇒ 下一次调用成功"）需要一台会拒绝新通道的 sshd 才能复现，
+  本机没有；这条只能靠现场复现观测。
+
+### 遗留
+
+1. **"自愈"的边界**：本修复保证"只要有一次操作因链路级故障失败，就一定会重建"；
+   若**完全没有调用**（心跳好、也没人用），就不会有重建——那也不构成故障。
+2. **服务端为何拒通道仍未知**：若根因是远端 sshd 会话配额被长期泄漏占满，**重建只是绕过**（新连接新配额），
+   配额泄漏本身要在远端侧查（本轮未做）。
+3. **UI 仍无手动入口**：文件浏览正常时「重连」按钮不显示（只挂在根错误块），`git_history.dart` 也没有。
+   本轮按用户圈定的范围（自动重建 + 执行站）**未改 UI**——自动重建修好后正常情况下不再需要手动点。

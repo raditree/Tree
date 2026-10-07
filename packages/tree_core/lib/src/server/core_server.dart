@@ -685,6 +685,9 @@ class CoreServer {
       toolCaller: _stationToolCall,
       toolCloser: _stationToolClose,
       sessionRenamer: _stationRenameSession,
+      // `ssh.reconnect`：与 REST 端点 / 右栏「重连」按钮同一实现（引擎手上的工具
+      // 执行器；它不在时命令以「未接线」显式失败，无从重连）。
+      sshReconnector: _stationSshReconnect,
       log: (String message) => errorLog?.call('[core:station] $message'),
     );
     _stationMounts = mounts;
@@ -853,6 +856,37 @@ class CoreServer {
     final ToolCloseOutcome outcome = await _toolRunsOf().close(handle);
     if (!outcome.closed) return <String, dynamic>{'error': outcome.note};
     return outcome.toJson();
+  }
+
+  /// 执行站 `ssh.reconnect`：**重建目标 agent 的远端（SSH）链路**。
+  ///
+  /// 与 REST `POST /api/agents/{id}/ssh/reconnect`（`_reconnectAgentSsh`）、右栏文件
+  /// 面板「重连」按钮走**同一份实现**（[WorkspaceToolRunner.reconnectSshLink]）。
+  /// **三种结局如实转成 Map**，不静默降级：
+  /// - 已重建 ⇒ `{ok: true, stale}`（`stale` 仍为 true 说明重建后立刻又判死）；
+  /// - 该 agent 不是 SSH 工作空间 ⇒ `{ok: false, not_ssh: true, error}`（**不假装成功**）；
+  /// - 重建失败 ⇒ `{ok: false, error}`；
+  /// - 工具执行器尚未接入 ⇒ `{ok: false, error}`（命令层报「未接线」，与 REST 的 501 同口径）。
+  ///
+  /// 判活判据不变：判死仍只看"连续 N 拍心跳丢失"，重连是判死**之后**的动作，
+  /// 不引入任何静态时长上限（M9 §1.1）。
+  Future<Map<String, dynamic>> _stationSshReconnect(String agentId) async {
+    final WorkspaceToolRunner? runner = _runnerFromEngine();
+    if (runner == null) {
+      return <String, dynamic>{
+        'ok': false,
+        'error': 'ssh.reconnect 未接线：核心未接入工具执行器（真实 LLM 引擎不可用）',
+      };
+    }
+    final SshReconnectOutcome outcome = await runner.reconnectSshLink(agentId);
+    if (outcome.ok) {
+      return <String, dynamic>{'ok': true, 'stale': outcome.stale};
+    }
+    return <String, dynamic>{
+      'ok': false,
+      if (outcome.notSsh) 'not_ssh': true,
+      'error': outcome.reason,
+    };
   }
 
   /// 关闭入口用的登记表实例（与工具层同一份；引擎不可用时回落进程级唯一那一个）。
