@@ -1938,3 +1938,57 @@ terminal/subagent hook 完成消息）在工具调用期间必须排队等待」
    配额泄漏本身要在远端侧查（本轮未做）。
 3. **UI 仍无手动入口**：文件浏览正常时「重连」按钮不显示（只挂在根错误块），`git_history.dart` 也没有。
    本轮按用户圈定的范围（自动重建 + 执行站）**未改 UI**——自动重建修好后正常情况下不再需要手动点。
+
+## #33 打包自检卡死：核心的 stderr 是「没人读的管道」时，收到 shutdown 也不退出
+
+**状态**：已修（2026-10-11）：自检改成**排空两条输出流**；**核心侧行为本身未查根因**（见「遗留」）。
+
+### 现象（现场）
+
+- `dart run tool/package_windows.dart --installer` 在**编译都成功之后**，卡在自检那步：
+  ```
+    握手 OK：http://127.0.0.1:62556（pid 10032）
+  打包失败：TimeoutException after 0:00:30.000000: Future not completed
+  #1  _verifyCore (tool/package_windows.dart:466)
+  ```
+  可**稳定复现**（空闲机器上也复现，不是负载抖动；重启机器/换数据根都一样）。
+- 用探针复查：核心进程在写完 `shutdown` 之后 **30s+ 仍然活着**（不是 Dart 的 future 没收口）。
+
+### 根因
+
+**触发条件就是"核心的 stderr 是一个没人读的管道"**。实测矩阵（同一份 `tree_core.exe`，临时数据根）：
+
+| 父进程的读法 | 核心收到 shutdown 后 |
+|---|---|
+| 不读 stderr（`stdout.first` 取握手行） | **不退出**（30s 超时，进程仍活着） |
+| 读 stderr | **160~220ms** 优雅退出（exit=0） |
+| stderr **重定向到文件** | **263ms** 退出（exit=0） |
+
+排除项（都实测过）：
+- **与 stdout 无关**：把 stdout 持续读满、或 `.first` 提前取消订阅，结果一样；
+- **与插件无关**：把发行目录的 `plugins/` 挪走（连 `ssh_executor` 都不存在）仍然复现；
+- **不是管道写满**：核心全程 stderr 只有 **几百字符**（实测 700~807），远低于管道缓冲；
+- **不是 Dart 父子进程的通病**：用一个极简替身（写 stderr 若干行 + 等 shutdown + `exit(0)`）做同样两格实验，
+  **两种读法都 18~19ms 退出** ⇒ 只有真实核心会卡。
+
+### 修复
+
+`tool/package_windows.dart` 的 `_verifyCore`：**排空 stdout 与 stderr 两条流**（stdout 首行当握手、
+其余行记下来；stderr 全程收进缓冲），并在超时/非零退出/握手前退出三种失败里**带上 stderr 尾部**。
+（真实启动器 `lib/io/core_process_launcher.dart` 一直在 `process.stderr.listen(...)`，所以**只有这个自检踩到**。）
+
+### 验证
+
+- 修后自检打印 `握手 OK` + **`优雅退出 OK`**，`package_windows.dart --installer` **exit=0**；
+- 产物：`dist/tree-desktop-1.0.3-windows-x64.zip`（32.4 MB）、`dist/installer/tree-desktop-1.0.3-windows-x64-setup.exe`（24.3 MB）；
+- zip 内容核对：`Release/agents/tree_agent-linux-{amd64,arm64}`、`Release/plugins/tree_ssh_executor.exe` 都在，
+  且 `plugins/` 下无 `__pycache__` / `*.pyc`。
+
+### 遗留
+
+1. **核心为什么"必须有人读 stderr 才肯退出"没查到底**：Windows 匿名管道语义上，写几百字符不该阻塞，
+   所以真正卡住的那一跳（`CoreLogSink.flush()` 的 `IOSink.flush()`？关停路径里某个 await？）**未定位**。
+   当前判定为**低影响**（任何正常父进程都会读子进程的输出；本仓的启动器也一直读），因此按"记录 + 修自检"收口。
+2. 若将来出现"无人读 stderr 的父进程"（守护进程化、纯后台启动、某些 CI 包装器），**这个坑会再出现**——
+   届时应回来把它查成"核心关停不依赖 stderr 被消费"。
+

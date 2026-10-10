@@ -443,6 +443,20 @@ String _copySshExecutorArtifacts(Directory root, Directory releaseDir) {
 }
 
 /// 启动核心读握手（打包产物自检）。
+///
+/// **必须把 stdout 与 stderr 两条流都排空** —— 这是本函数最容易写错的一处：
+/// 曾经这里是"只 `stdout.first` 取握手行、完全不管 stderr"，结果是**核心卡在关停里
+/// 永不退出**，打包在自检这步以 `TimeoutException after 0:00:30` 失败。
+///
+/// 实测（2026-10-11，`tree_core.exe` + 临时数据根）：
+/// | 父进程怎么读 | 核心收到 shutdown 后 |
+/// |---|---|
+/// | 不读 stderr | **不退出**（30s 超时，进程仍活着） |
+/// | 读 stderr | 160~220ms 优雅退出（exit=0） |
+/// | stderr 重定向到**文件** | 263ms 退出 |
+/// 与 stdout 的读法无关（`stdout.first` 提前取消订阅也一样），也与插件无关
+/// （把 `plugins/` 挪走仍然复现），stderr 总共只有几百字符 ⇒ 不是管道写满。
+/// 真实启动器 `lib/io/core_process_launcher.dart` 一直是读 stderr 的，所以只有这个自检踩到。
 Future<void> _verifyCore(String coreExe, String workdir) async {
   final Directory dataDir = Directory.systemTemp.createTempSync('tree_pkg_');
   final Process process = await Process.start(coreExe, <String>[
@@ -450,12 +464,34 @@ Future<void> _verifyCore(String coreExe, String workdir) async {
     dataDir.path,
     '--no-heartbeat',
   ], workingDirectory: workdir);
+  final StringBuffer stderrBuf = StringBuffer();
+  process.stderr.transform(utf8.decoder).listen(stderrBuf.write);
+  final Completer<String> handshakeLine = Completer<String>();
+  process.stdout
+      .transform(utf8.decoder)
+      .transform(const LineSplitter())
+      .listen((String line) {
+        if (!handshakeLine.isCompleted) {
+          handshakeLine.complete(line);
+        } else if (line.trim().isNotEmpty) {
+          // stdout 按不变量只放握手行；真出现别的，记下来（排障时这行最值钱）
+          stderrBuf.writeln('[意外 stdout] $line');
+        }
+      });
+  // 握手前就退出（编译产物坏了 / 起不来）要说清楚，而不是干等 30 秒。
+  unawaited(
+    process.exitCode.then((int code) {
+      if (!handshakeLine.isCompleted) {
+        handshakeLine.completeError(
+          StateError('核心在握手前退出（exit=$code）：${_tail(stderrBuf.toString())}'),
+        );
+      }
+    }),
+  );
   try {
-    final String firstLine = await process.stdout
-        .transform(utf8.decoder)
-        .transform(const LineSplitter())
-        .first
-        .timeout(const Duration(seconds: 30));
+    final String firstLine = await handshakeLine.future.timeout(
+      const Duration(seconds: 30),
+    );
     final CoreHandshake? handshake = CoreHandshake.decode(firstLine);
     if (handshake == null) {
       throw StateError('stdout 首行不是握手：$firstLine');
@@ -465,8 +501,13 @@ Future<void> _verifyCore(String coreExe, String workdir) async {
     await process.stdin.flush();
     final int code = await process.exitCode.timeout(
       const Duration(seconds: 30),
+      onTimeout: () => throw StateError(
+        '核心收到 shutdown 后 30s 未退出（stderr 尾部：${_tail(stderrBuf.toString())}）',
+      ),
     );
-    if (code != 0) throw StateError('核心退出码非 0：$code');
+    if (code != 0) {
+      throw StateError('核心退出码非 0：$code（stderr 尾部：${_tail(stderrBuf.toString())}）');
+    }
     stdout.writeln('   优雅退出 OK');
   } finally {
     try {
@@ -484,6 +525,11 @@ Future<void> _verifyCore(String coreExe, String workdir) async {
     }
   }
 }
+
+/// 取一段文本的尾部（错误信息里带上下文；太长只会淹没真正的原因）。
+String _tail(String text, {int max = 600}) =>
+    text.length <= max ? text : text.substring(text.length - max);
+
 
 /// 运行子进程并把输出**实时**透传（构建动辄几分钟，不能憋到结束才打印）。
 Future<int> _runLive(
