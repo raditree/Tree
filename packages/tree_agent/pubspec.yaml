@@ -1,0 +1,19 @@
+name: tree_agent
+description: 跑在目标机（Linux）上的执行体：经 stdio 行分隔 JSON-RPC 2.0 被中转站插件调用，真正执行文件读写与命令。
+# 目标机二进制，不由 pub 发布：随包（tree_ssh_plugin）交叉编译后推送。
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.13.0
+
+# 刻意**零第三方运行时依赖**：目标机二进制越小越静态越好。
+# 只允许 dart:io / dart:convert / dart:typed_data / dart:async / dart:math。
+# 协议常量与帧/RPC 助手是唯一真源，绝不在本包手写方法名字符串或错误码数字。
+dependencies:
+  tree_tunnel_protocol:
+    path: ../tree_tunnel_protocol
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.0

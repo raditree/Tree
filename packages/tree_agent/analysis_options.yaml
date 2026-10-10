@@ -1,0 +1,2 @@
+# 与 packages/tree_local_exec 同口径（纯 Dart 包，不引 flutter_lints）。
+include: package:lints/recommended.yaml
