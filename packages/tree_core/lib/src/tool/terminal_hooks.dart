@@ -587,12 +587,21 @@ class TerminalHooks {
     if (task.remote) await ledger?.remove(task.id);
   }
 
-  /// 链路判失活等"拿不到退出码"的收场：**如实**记一个可辨退出码，不假装正常结束。
+  /// 链路判失活 / 中转站判死等"拿不到退出码"的收场：**如实**记一个可辨退出码，不假装正常结束。
+  ///
+  /// 口径（用户 2026-10-11 明确）：**断连期间不该走到这里**——那时"重连退避还没耗尽"，
+  /// 我们真的不知道远端任务的死活（真相在目标机磁盘上），发了就是假装知道。
+  /// 只有退避耗尽（中转站判死）才会到这里，此时：
+  /// - 文案要说清**可能目标主机关闭**、且**不要大量重试**；
+  /// - 只发这一次，之后不再重试。
   Future<void> _fail(HookTask task, Object error) async {
     task.exitCode = remoteFailureExitCode;
     await _appendLog(
       task,
-      '\n# [terminal hook] 链路判失活，拿不到退出码与输出：$error\n',
+      '\n# [terminal hook] 后台任务失联（链路判失活 / 中转站退避耗尽），'
+      '拿不到远端退出码与输出：$error\n'
+      '# 该任务**可能**已经结束、也**可能**仍在目标机上跑；最可能是**目标主机关闭或不可达**。\n'
+      '# 请先确认目标主机与 SSH 通路，**不要大量重试**，也不要直接重跑（会重复副作用）。\n',
     );
     await _settle(task);
     log?.call('后台任务失联 ${task.id}：$error');
@@ -633,7 +642,10 @@ Future<String> hookNotice(HookTask task, int exitCode) async {
     );
   } else if (exitCode == TerminalHooks.remoteFailureExitCode) {
     buffer.writeln(
-      '（链路判失活，没拿到远端退出码与输出——请重新确认远端进程与产物，不要直接重跑）',
+      '（**失联**：链路判失活 / 中转站退避耗尽，没拿到远端退出码与输出。'
+      '该任务**可能**已经结束、也**可能**仍在目标机上跑 —— 最可能是**目标主机关闭或不可达**。'
+      '请先确认目标主机与 SSH 通路，**不要大量重试**，也不要直接重跑（会重复副作用）；'
+      '恢复后可用 read 查日志文件、用 terminal 复查远端进程与产物）',
     );
   }
   buffer.writeln(

@@ -15,6 +15,25 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
+## [未发布] — 2026-10-11
+
+### 断言变化（新增 / 修改的 README 不变量）
+
+- **断连期间不发 hook 结束通知；只有退避耗尽（判死）才发一次"失联"提醒，且不再重试**
+  （新增 [packages/tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 21、
+  [docs/architecture.md](docs/architecture.md) §11 新增一行）：
+  - **还在退避重连**（中转站按 1s→…→60s、累计 30 分钟封顶）⇒ **什么都不发**：那时我们真的不知道
+    远端任务的死活（退出码在目标机磁盘上），按"可能结束了"发通知就是**假装知道**；
+    并且**不猛戳** —— 重试是中转站的职责，核心侧按 `backgroundStalePollInterval`（默认 **30s**）慢探；
+  - **退避耗尽 / 判死**（`FallbackableWorkspace.tunnelDown`）⇒ 才以 `SshLinkStaleException` 收尾
+    ⇒ `TerminalHooks` 记 `remoteFailureExitCode = -1` 并投递**一次**提醒
+    （文案写明**可能目标主机关闭 / 不要大量重试**），**此后不再探测**。
+  - 触发前提（此前三处都不符合该口径）：`_TunnelBackgroundExec` 的探测**任意异常都会立刻收尾**
+    （断连期间可能误发通知）、**断连时仍按 3s 猛戳**、且**判死之后永远不再收尾**
+    （该发的失联提醒反而发不出去）。
+
+> 注：本节落在 `v1.0.3` **之后**（tag 指向 `6bece51`），因此 **1.0.3 的发布产物不含本改动**。
+
 ## [1.0.3] — 2026-10-11
 
 ### 断言变化（新增 / 修改的 README 不变量）

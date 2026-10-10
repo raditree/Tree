@@ -6,7 +6,8 @@ import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart';
 
 /// 假传输：实现 `SshTransport`（全部方法都给最小实现），**并按需实现** `TunnelBackgroundExec`
 /// —— 用它钉住"有托管能力走托管、没有就走 nohup"这条选路，以及托管句柄的各种收尾语义。
-class FakeTransport implements SshTransport, TunnelBackgroundExec {
+class FakeTransport
+    implements SshTransport, TunnelBackgroundExec, FallbackableWorkspace {
   FakeTransport({this.managed = true, this.root = '/ws'});
 
   final bool managed;
@@ -19,10 +20,24 @@ class FakeTransport implements SshTransport, TunnelBackgroundExec {
   int spawnCalls = 0;
   int killCalls = 0;
 
+  /// `queryBackground` 被调了几次（用来断言"断连期间不猛戳"）。
+  int queryCalls = 0;
+
+  /// 中转站是否已判死（驱动 `FallbackableWorkspace`）。
+  bool dead = false;
+
   /// 下一次 query 抛这个（一次性）。
   Object? nextQueryError;
 
-  /// 已"结束"的进程数（用于推进状态）。
+  /// **每一拍**都抛这个（模拟"链路一直断着"；置 null 恢复）。
+  Object? alwaysQueryError;
+
+  @override
+  bool get tunnelDown => dead;
+
+  @override
+  String get fallbackReason => dead ? '测试：判死' : '';
+
   @override
   SshLiveness get liveness => _liveness;
   final SshLiveness _liveness = SshLiveness();
@@ -48,11 +63,17 @@ class FakeTransport implements SshTransport, TunnelBackgroundExec {
   }
 
   @override
-  Future<List<TunnelBackgroundProc>> listBackground() async =>
-      procs.values.toList();
+  Future<List<TunnelBackgroundProc>> listBackground() async {
+    final Object? err = alwaysQueryError;
+    if (err != null) throw err;
+    return procs.values.toList();
+  }
 
   @override
   Future<TunnelBackgroundProc?> queryBackground(String id) async {
+    queryCalls++;
+    final Object? always = alwaysQueryError;
+    if (always != null) throw always;
     final Object? err = nextQueryError;
     if (err != null) {
       nextQueryError = null;
@@ -245,19 +266,29 @@ void main() {
       await handle.close();
     });
 
-    test('断链（SshLinkStale）**不**让 exitCode 失败，而是继续等 —— 这正是跨日稳定的来源', () async {
+    test('断链（还在退避重连）**不**发结束通知，链路回来后仍拿到真相', () async {
       final FakeTransport transport = FakeTransport();
-      final SshWorkspaceIO io = SshWorkspaceIO('/ws', transport);
+      // 注入短间隔：生产是 30s，用例里等不起
+      final SshWorkspaceIO io = SshWorkspaceIO(
+        '/ws',
+        transport,
+        backgroundStalePollInterval: const Duration(milliseconds: 150),
+      );
       final BackgroundExecHandle handle = await io.startBackground(
         command: 'x',
         logRelativePath: 'a.log',
       );
       final Future<int> code = handle.exitCode;
-      // 第一拍：链路判失活（真相仍在目标机磁盘上）
-      transport.nextQueryError = SshLinkStaleException('链路失活');
-      await Future<void>.delayed(const Duration(milliseconds: 30));
-      expect(code, isA<Future<int>>());
-      // 链路回来后拿到真实退出码
+      // 第一拍：链路断着（还在退避重连、**没判死**）
+      transport.alwaysQueryError = SshLinkStaleException('链路失活');
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      expect(
+        code,
+        isA<Future<int>>(),
+        reason: '断连期间**不许**收尾（收了就等于发"可能结束"的通知——那是假装知道）',
+      );
+      // 链路回来：真相（退出码）照样拿得到
+      transport.alwaysQueryError = null;
       transport.procs['bg-1'] = TunnelBackgroundProc(
         id: 'bg-1',
         logPath: '/ws/a.log',
@@ -265,6 +296,66 @@ void main() {
         exitCode: 7,
       );
       expect(await code.timeout(const Duration(seconds: 10)), 7);
+      await handle.close();
+    });
+
+    test('断连期间**不猛戳**：探测节奏交给中转站的退避，核心侧不按 3s 重试', () async {
+      final FakeTransport transport = FakeTransport();
+      final SshWorkspaceIO io = SshWorkspaceIO(
+        '/ws',
+        transport,
+        // 断连间隔故意设成 1s：若实现还在用 3s 周期或更密的节奏，下面的计数会露馅
+        backgroundStalePollInterval: const Duration(seconds: 1),
+      );
+      final BackgroundExecHandle handle = await io.startBackground(
+        command: 'x',
+        logRelativePath: 'a.log',
+      );
+      transport.alwaysQueryError = SshLinkStaleException('链路失活');
+      unawaited(handle.exitCode);
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+      expect(
+        transport.queryCalls,
+        1,
+        reason: '600ms 内只该有**首次那一拍**（断连间隔 1s）；'
+            '按 3s 周期重写这段会变成 0，按更密的重试会变成多条',
+      );
+      await handle.close();
+    });
+
+    test('退避耗尽（判死）⇒ 以显式错误收尾（一次性），此后**不再重试**', () async {
+      final FakeTransport transport = FakeTransport();
+      final SshWorkspaceIO io = SshWorkspaceIO(
+        '/ws',
+        transport,
+        backgroundStalePollInterval: const Duration(milliseconds: 150),
+      );
+      final BackgroundExecHandle handle = await io.startBackground(
+        command: 'x',
+        logRelativePath: 'a.log',
+      );
+      transport.alwaysQueryError = SshLinkStaleException('链路失活');
+      final Future<int> code = handle.exitCode;
+      // 第一拍之后中转站判死
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      transport.dead = true;
+      await expectLater(
+        code,
+        throwsA(
+          isA<SshLinkStaleException>().having(
+            (SshLinkStaleException e) => e.message,
+            'message',
+            allOf(contains('可能目标主机关闭'), contains('不要大量重试')),
+          ),
+        ),
+      );
+      final int callsAtDeath = transport.queryCalls;
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      expect(
+        transport.queryCalls,
+        callsAtDeath,
+        reason: '判死之后**不许**再探测（退避已耗尽，再戳也不会变好）',
+      );
       await handle.close();
     });
 

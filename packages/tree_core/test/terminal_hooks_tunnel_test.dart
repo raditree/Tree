@@ -20,11 +20,24 @@ import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart'
 /// 本用例覆盖：① 起任务走托管（**不起 nohup**）② 核心关不杀任务、台账保留
 /// ③ 重启后 `restorePending` 只靠日志路径认领 ④ 拿到退出码后**回 hook 结束提醒**
 /// ⑤ 接续**绝不重跑**命令。
-class _FakeTunnelSsh implements SshTransport, TunnelBackgroundExec {
+class _FakeTunnelSsh
+    implements SshTransport, TunnelBackgroundExec, FallbackableWorkspace {
   final List<String> spawnedCommands = <String>[];
   String? logPath;
   String state = BackgroundStates.running;
   int? exitCode;
+
+  /// 中转站是否已判死（退避耗尽）。
+  bool dead = false;
+
+  /// 每一拍都抛这个（模拟"链路一直断着"）。
+  Object? alwaysQueryError;
+
+  @override
+  bool get tunnelDown => dead;
+
+  @override
+  String get fallbackReason => dead ? '测试：判死' : '';
 
   @override
   Future<TunnelBackgroundStart> spawnBackground({
@@ -45,8 +58,11 @@ class _FakeTunnelSsh implements SshTransport, TunnelBackgroundExec {
       <TunnelBackgroundProc>[_proc()];
 
   @override
-  Future<TunnelBackgroundProc?> queryBackground(String id) async =>
-      id == 'bg-1' ? _proc() : null;
+  Future<TunnelBackgroundProc?> queryBackground(String id) async {
+    final Object? err = alwaysQueryError;
+    if (err != null) throw err;
+    return id == 'bg-1' ? _proc() : null;
+  }
 
   TunnelBackgroundProc _proc() => TunnelBackgroundProc(
     id: 'bg-1',
@@ -202,5 +218,63 @@ void main() {
       reason: '接续只对账，不重跑命令',
     );
     expect(await ledger.load(), isEmpty, reason: '收尾后台账删除');
+  }, timeout: const Timeout(Duration(seconds: 60)));
+
+  test('退避耗尽（判死）⇒ 回一条**失联**提醒：可能目标主机关闭、不要大量重试', () async {
+    final Directory dir = Directory.systemTemp.createTempSync('tree_hook_dead_');
+    addTearDown(() async {
+      for (int i = 0; i < 10 && dir.existsSync(); i++) {
+        try {
+          dir.deleteSync(recursive: true);
+        } catch (_) {
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        }
+      }
+    });
+    final HookLedger ledger = HookLedger(dir.path);
+    final _FakeTunnelSsh transport = _FakeTunnelSsh();
+    final SshWorkspaceIO io = SshWorkspaceIO(
+      '/ws',
+      transport,
+      // 断连间隔注短：生产 30s，用例里等不起
+      backgroundStalePollInterval: const Duration(milliseconds: 150),
+    );
+
+    final TerminalHooks hooks = TerminalHooks(ledger: ledger);
+    addTearDown(hooks.close);
+    final Completer<List<Object?>> told = Completer<List<Object?>>();
+    hooks.onFinished = (HookTask t, int code) async {
+      if (!told.isCompleted) {
+        told.complete(<Object?>[t.agentId, t.sessionId, code, await hookNotice(t, code)]);
+      }
+    };
+
+    // 起任务（第一拍成功 ⇒ running），随后链路断掉**并且**中转站判死
+    await hooks.start(
+      io: io,
+      agentId: 'agt_1',
+      sessionId: 'ses_1',
+      command: 'python train.py',
+    );
+    transport
+      ..alwaysQueryError = SshLinkStaleException('链路失活')
+      ..dead = true;
+
+    final List<Object?> delivered = await told.future.timeout(
+      const Duration(seconds: 20),
+    );
+    expect(delivered[0], 'agt_1');
+    expect(delivered[1], 'ses_1', reason: '提醒回到**原会话**');
+    expect(
+      delivered[2],
+      TerminalHooks.remoteFailureExitCode,
+      reason: '拿不到退出码 ⇒ 可辨的"失联"码，不假装正常结束',
+    );
+    final String notice = delivered[3]! as String;
+    expect(notice, contains('失联'));
+    // 文案里有 markdown 加固（`**目标主机关闭**`），所以断言取不带星号的那一段
+    expect(notice, contains('目标主机关闭'));
+    expect(notice, contains('不要大量重试'));
+    expect(await ledger.load(), isEmpty, reason: '失联也收尾、也清台账（否则重启会反复提醒）');
   }, timeout: const Timeout(Duration(seconds: 60)));
 }

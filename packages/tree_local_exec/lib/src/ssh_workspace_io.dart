@@ -14,6 +14,10 @@ import 'ssh_liveness.dart';
 import 'ssh_login_shell.dart';
 import 'ssh_shell_channel.dart';
 import 'tunnel_background.dart';
+// `FallbackableWorkspace`（"中转站已判死 ⇒ 核心撤换缓存"）与 `ReconnectableWorkspace`
+// 是同一类**并列能力接口**；它在 `tunnel_link.dart` 里定义（那边还放了 `TunnelLink` 等
+// 隧道专属形状），这里只借用一下声明，不构成循环依赖。
+import 'tunnel_link.dart';
 import 'workspace_io.dart';
 
 /// SSH 传输抽象：把"远端文件系统 + 远端命令执行"压成 6 个方法。
@@ -336,12 +340,23 @@ class SshWorkspaceIO
         WorkspaceFiles,
         BackgroundExecHost,
         ReconnectableWorkspace {
-  SshWorkspaceIO(this.root, this._transport);
+  SshWorkspaceIO(
+    this.root,
+    this._transport, {
+    this.backgroundStalePollInterval =
+        _TunnelBackgroundExec.stalePollInterval,
+  });
 
   @override
   final String root;
 
   final SshTransport _transport;
+
+  /// **断连期间**后台 hook 的探测间隔（默认 30s）。
+  ///
+  /// 生产用默认值即可；暴露出来一是给单测注入短值（否则一条用例要等 30s 才能看到下一拍），
+  /// 二是将来若要把它做成可配置项（"我就要它更勤/更懒"）时不必再改签名。
+  final Duration backgroundStalePollInterval;
 
   /// 链路活性（M9 1.1）：所有传输都从这里过一遍守卫。
   SshLiveness get _link => _transport.liveness;
@@ -1064,6 +1079,8 @@ class SshWorkspaceIO
       return _TunnelBackgroundExec(
         tunnel: managed,
         logAbsolute: started.logPath.isEmpty ? logAbsolute : started.logPath,
+        isTunnelDead: () => _tunnelDead,
+        staleInterval: backgroundStalePollInterval,
         id: started.id,
         remotePid: started.pid,
       );
@@ -1126,6 +1143,8 @@ class SshWorkspaceIO
       return _TunnelBackgroundExec(
         tunnel: managed,
         logAbsolute: logAbsolute,
+        isTunnelDead: () => _tunnelDead,
+        staleInterval: backgroundStalePollInterval,
         remotePid: pid,
       );
     }
@@ -1147,6 +1166,19 @@ class SshWorkspaceIO
       return target as TunnelBackgroundExec;
     }
     return null;
+  }
+
+  /// 这条隧道**是否已判死**（中转站退避耗尽 / 不可调和）。
+  ///
+  /// 唯一用途：后台 hook 在**断连期间**允许"什么都不发、继续等"，但**判死之后**必须收尾
+  /// —— 否则那条 hook 永远挂着，用户永远收不到"失联"提醒（这是用户 2026-10-11 明确的口径）。
+  /// 内置 dartssh2 后端不实现 `FallbackableWorkspace` ⇒ 恒为 false（它那条路靠 `SshLiveness` 失活）。
+  bool get _tunnelDead {
+    final SshTransport target = _transport;
+    if (target is FallbackableWorkspace) {
+      return (target as FallbackableWorkspace).tunnelDown;
+    }
+    return false;
   }
 
   @override
@@ -1446,24 +1478,47 @@ class _SshBackgroundExec implements BackgroundExecHandle {
 ///
 /// 与 [_SshBackgroundExec] 的关键差别 —— 都来自"这次我们**真的知道**远端状态"：
 /// - 退出码来自 agent 的**落盘台账**（`<state>/exit/<id>`），不靠本机轮询 + 猜进程死活；
-/// - **链路失活时 [exitCode] 不失败，而是继续等**：台账在目标机磁盘上，重连后一次
-///   `exec.query` 就能拿回真相。因此这里**不**套用"失活 ⇒ future 抛
-///   `SshLinkStaleException`"那条口径 —— 那条口径属于"本机确实没法知道远端状态"的场景
-///   （`dartssh2` 的一次性 exec 就是），套在这里反而是**假装**自己不知道。
-///   这是本次升级相对 dartssh2 方案的一处**语义改进**；
+/// - **断连期间 [exitCode] 不结束（继续等），也不猛戳**：台账在目标机磁盘上，
+///   重连后一次 `exec.query` 就能拿回真相 ⇒ 那时按"可能结束了"发通知就是**假装知道**
+///   （`dartssh2` 的一次性 exec 属于"本机确实没法知道"，所以它那条口径是失活即失败；
+///   套在这里反而不对）。重试节奏也交还给中转站：核心侧断连时按
+///   [stalePollInterval] 慢慢等，不替它的退避"大量重试"；
+/// - **只有退避耗尽（`tunnel_down`）才按"失联"收尾**：那时以错误结束 [exitCode]，
+///   由上层投递一次"可能目标主机关闭、不要大量重试"的提醒，**此后不再探测**；
 /// - [SshWorkspaceIO.attachBackground] 只需要日志路径：agent 按 `log_path` 对账，
 ///   本机不必记住 id/pid —— 核心重启后的接续因此不依赖本机残留多少内存态。
 class _TunnelBackgroundExec implements BackgroundExecHandle {
   _TunnelBackgroundExec({
     required this.tunnel,
     required this.logAbsolute,
+    bool Function()? isTunnelDead,
+    this.staleInterval = stalePollInterval,
     this.id = '',
     this.remotePid,
-  });
+  }) : _isTunnelDead = isTunnelDead ?? _neverDead;
 
-  /// 轮询间隔。托管路径下它只是"结束唤醒的最坏延迟"，**不影响任务本身**
+  static bool _neverDead() => false;
+
+  /// 探测间隔（**隧道活着时**）。它只是"结束唤醒的最坏延迟"，不影响任务本身
   /// （任务在目标机跑，退出码也在目标机落盘）。
   static const Duration pollInterval = Duration(seconds: 3);
+
+  /// **断连期间**的探测间隔：刻意拉长到 30s。
+  ///
+  /// 为什么：断连时"重试"是**中转站**的职责（它按 1s→…→60s 退避、累计 30 分钟封顶）。
+  /// 核心侧若还按 3s 去戳一次 `exec.query`，等于替它**大量重试**——远端此刻根本答不了，
+  /// 除了刷日志没有任何作用，还会和它的退避打架。
+  static const Duration stalePollInterval = Duration(seconds: 30);
+
+  /// 隧道是否**已判死**（中转站退避耗尽 / 不可调和）。
+  ///
+  /// 判据的**唯一用途**：决定"断连"该怎么收场 ——
+  /// 还在退避重连 ⇒ 继续等（什么都不发）；已判死 ⇒ 按失联收尾（发一次提醒，不再重试）。
+  final bool Function() _isTunnelDead;
+
+  /// 断连期间的实际探测间隔（生产 = [stalePollInterval]；测试注入短值，
+  /// 否则一条用例要等 30s 才能看到下一拍）。
+  final Duration staleInterval;
 
   final TunnelBackgroundExec tunnel;
   final String logAbsolute;
@@ -1514,7 +1569,13 @@ class _TunnelBackgroundExec implements BackgroundExecHandle {
     if (_poll != null || _closed || _exit.isCompleted) return;
     // 立刻查一次：接续场景下"重启时它其实已经跑完"要马上收尾，不等第一个间隔。
     unawaited(_probe());
-    _poll = Timer.periodic(pollInterval, (Timer _) => unawaited(_probe()));
+  }
+
+  /// 自调度下一拍（**刻意不用 `Timer.periodic`**）：断连期间要能换成更长的节奏。
+  void _schedule(Duration delay) {
+    _poll?.cancel();
+    if (_closed || _exit.isCompleted) return;
+    _poll = Timer(delay, () => unawaited(_probe()));
   }
 
   /// 按日志绝对路径从 agent 台账里认出这条任务（接续场景的唯一线索）。
@@ -1535,12 +1596,16 @@ class _TunnelBackgroundExec implements BackgroundExecHandle {
       if (id.isEmpty) {
         await _resolveId();
         // 台账里还没有（agent 刚重连 / 还没读到盘）⇒ 下一拍再试，**不猜**。
-        if (id.isEmpty) return;
+        if (id.isEmpty) {
+          _schedule(pollInterval);
+          return;
+        }
       }
       final TunnelBackgroundProc? proc = await tunnel.queryBackground(id);
       if (_exit.isCompleted || _closed) return;
       if (proc == null) {
-        // 台账里记录也查不到了：进程与记录都没了 ⇒ 可辨的 gone（不当正常退出）。
+        // 这一次请求**成功回来了** → 隧道通、agent 也应答了，台账里却确实没有这条记录
+        // ⇒ 这是**事实**（不是断连）：进程与记录都没了 ⇒ 可辨的 gone（不当正常退出）。
         _finish(BackgroundExecHandle.goneExitCode);
         return;
       }
@@ -1548,33 +1613,51 @@ class _TunnelBackgroundExec implements BackgroundExecHandle {
       switch (proc.state) {
         case BackgroundStates.exited:
           _finish(proc.exitCode ?? BackgroundExecHandle.goneExitCode);
+          return;
         case BackgroundStates.gone:
           _finish(BackgroundExecHandle.goneExitCode);
+          return;
         default:
           break; // running：继续等
       }
-    } on SshLinkStaleException {
-      // **刻意不失败**：真相（退出码 / 台账）在目标机磁盘上，并没有丢；
-      // 等隧道重连回来再问一次即可 —— 这正是"跨日稳定"要的行为。
-      return;
+      _schedule(pollInterval);
     } catch (error) {
-      _fail(error);
+      // 探测失败（链路断 / 中转站不可用 / 意外错误）。**先分清"还在退避重连"与"已判死"**：
+      //
+      // - **断连期间一律不发任何结束/失联通知**：那时我们**真的不知道**远端任务的死活
+      //   （退出码与台账都在目标机磁盘上，重连回来一次 `exec.query` 就能拿回真相），
+      //   按"可能结束"发通知就是**假装知道**；
+      // - 而且**不猛戳**：重试是中转站的职责（它按 1s→…→60s 退避、累计 30 分钟封顶），
+      //   核心侧改按 [stalePollInterval] 慢慢等；
+      // - **只有退避耗尽**（中转站自标 `tunnel_down`）之后，才把它按"失联"收尾并投递
+      //   一次提醒（文案说清"可能目标主机关闭、不要大量重试"），此后**不再重试**。
+      if (_isTunnelDead()) {
+        _failAsStale(error);
+        return;
+      }
+      _schedule(staleInterval);
     }
   }
-
   void _finish(int code) {
     _poll?.cancel();
     _poll = null;
     if (!_exit.isCompleted) _exit.complete(code);
   }
 
-  void _fail(Object error) {
+  /// 判死后的收尾：以显式错误结束。
+  ///
+  /// 上层（`TerminalHooks`）会把"`exitCode` 以错误结束"记成 `remoteFailureExitCode`
+  /// 并投递一条**失联**提醒（见 `tool/terminal_hooks.dart` 的 `_fail`/`hookNotice`）。
+  /// **此后不再探测**——退避已耗尽，再戳也不会变好。
+  void _failAsStale(Object error) {
     _poll?.cancel();
     _poll = null;
-    if (!_exit.isCompleted) {
-      _exit.completeError(
-        error is Exception ? error : WorkspaceIoException('$error'),
-      );
-    }
+    if (_exit.isCompleted) return;
+    _exit.completeError(
+      SshLinkStaleException(
+        '中转站已判死（退避耗尽），拿不到远端退出码：可能目标主机关闭或不可达；'
+        '不要大量重试，请先确认目标主机与 SSH 通路（原错误：$error）',
+      ),
+    );
   }
 }

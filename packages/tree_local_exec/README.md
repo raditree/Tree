@@ -170,7 +170,19 @@
     - 托管路径下**链路失活不让 `exitCode` 失败**，而是继续等（真相在目标机磁盘上，
       重连后一次 `exec.query` 就能拿回）——这是相对 `nohup` 方案的一处**语义改进**，
       也是"跨日级稳定性"的来源；`nohup` 方案保持原口径（失活 ⇒ 显式失败）。
+      但"继续等"**只到退避耗尽为止**，见不变量 21。
     - 两条路都**不许假装知道远端状态**：台账里没有 ⇒ 不重跑、`killed:false`、`goneExitCode`。
+21. **断连的两种收场必须分清（用户 2026-10-11 明确的口径）**："链路断了"在托管路径下有两种，
+    处置**完全不同**，混了就是错：
+    - **还在退避重连**（中转站按 1s→…→60s 退避、累计 30 分钟封顶）：**什么都不发**，继续等。
+      那时我们**真的不知道**远端任务的死活，按"可能结束了"发通知就是**假装知道**；
+      而且**不猛戳**——重试是中转站的职责，核心侧按 `SshWorkspaceIO.backgroundStalePollInterval`
+      （默认 **30s**，不是 3s）慢慢等，不替它的退避打架、不刷日志；
+    - **退避耗尽 / 判死**（中转站自标 `tunnel_down`，经 `FallbackableWorkspace.tunnelDown` 暴露）：
+      才以 `SshLinkStaleException` 收尾 ⇒ 上层 `TerminalHooks` 记 `remoteFailureExitCode = -1`
+      并投递**一次**"失联"提醒（文案写明**可能目标主机关闭 / 不要大量重试**），**此后不再探测**。
+    判据来源：`SshWorkspaceIO._tunnelDead`（内置 dartssh2 后端不实现 `FallbackableWorkspace`
+    ⇒ 恒 false，走它自己那条"失活即失败"的老口径）。
 
 ## 测试
 
