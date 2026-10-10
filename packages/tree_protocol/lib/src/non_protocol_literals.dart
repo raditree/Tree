@@ -27,6 +27,13 @@ const Map<String, String> nonProtocolTypeLiterals = <String, String>{
   'member': '团队角色枚举',
   'top': '团队角色枚举',
   'dir': '文件类型枚举（list_files 结果）',
+  // 文件类型枚举（中转站的 `fs.stat`/`fs.exists` 结果 `type`）。
+  // 说明：这条不是 WS 帧，而是**目标机 agent 的 JSON-RPC 结果字段**
+  // （`tree_local_exec` 的 `TunnelSshTransport._statOf` 用它把"远端路径不存在"
+  // 表达成 `{'type':'missing'}`，再由 `size()` 翻成可读的 `WorkspaceIoException`）。
+  // 之所以要登记：完备性门禁扫的是 `tree_local_exec/lib`，而这个字面量恰好长成
+  // `'type': 'x'` 的形状 —— 不登记就会被当成"未登记的协议帧"。
+  'missing': '文件类型枚举（fs.stat 结果：远端路径不存在）',
   'unknown': '未知值兜底枚举',
   'message_type': 'WS 上行 payload 的字段名（非帧类型）',
 };

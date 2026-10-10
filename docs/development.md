@@ -141,8 +141,15 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 7. 压 zip 到 `dist/`。
 
 安装包自检（本仓库验证过的流程）：静默装到临时目录 → 检查
-`Tree.exe` / `tree_core.exe` / `pdfium.dll` / `使用说明.txt` 是否齐 →
+`Tree.exe` / `tree_core.exe` / `pdfium.dll` / `使用说明.txt` /
+**`plugins/tree_ssh_executor.exe`（中转站插件，与 `Tree.exe` 同级）** /
+**`agents/tree_agent-linux-{amd64,arm64}`（目标机执行体，与 `plugins/` 同级）** 是否齐 →
 用装好的核心跑一遍冒烟与文件写路径测试 → 静默卸载并确认无残留。
+
+> **新目录是怎么进包的**：安装器用 `Source: "{#ReleaseDir}\*"` + `recursesubdirs createallsubdirs`
+> **整目录递归**，所以 `agents/` 与 `plugins/` 下的新文件**不需要改 `.iss`**；
+> 需要保证的只有"复制进发行目录"这一步 —— 那是 `tool/package_windows.dart` 的
+> `_copySshExecutorArtifacts`（`build/plugins/` 与 `build/agents/` → 发行目录）。
 
 ## 6. 验收基线（M9 起：不得劣化）
 
@@ -150,21 +157,34 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 
 | 项 | 当前基线 |
 | --- | --- |
-| 静态检查 | `dart analyze` × 4 包 + `flutter analyze lib test` 全干净 |
+| 静态检查 | `dart analyze`（6 个 Dart 包的 `lib test` + `tree_core_cli/bin` + `tool/`）+ `flutter analyze lib test` 全干净 |
 | `tree_protocol` | 38 passed（含协议完备性 + 文档契约门禁） |
-| `tree_local_exec` | 261 passed / 4 skipped |
-| `tree_core` | 1200 passed / 2 skipped |
-| 前端 `flutter test` | 789 passed |
-| 真机 SSH 回归（`TREE_SSH_TEST_*` 具备时） | `list` / `upload` / `download_folder` / `syncToLocal` 四项通过 |
+| `tree_tunnel_protocol` | 15 passed（帧编解码 / 路径归一化与越界判定） |
+| `tree_agent` | 89 passed / 19 skipped（skip = POSIX 专属行为，见下注） |
+| `tree_ssh_plugin` | 123 passed（含"真进程一次塞多帧"） |
+| `tree_local_exec` | 285 passed / 4 skipped |
+| `tree_core` | 1200 passed / 3 skipped |
+| `tree_core_cli` | 6 passed（需 `TREE_CORE_EXE` 指向编译产物） |
+| 前端 `flutter test` | 811 passed |
+| 真机 SSH 回归（`TREE_SSH_TEST_*` 具备时） | ① `packages/tree_local_exec` 的 SSH 用例与 `packages/tree_core/test/ssh_files_integration_test.dart`；② **中转站两条门控**：`dart run tool/tunnel_e2e.dart`（线上协议黑盒，**16 项**）与 `packages/tree_core/test/ssh_tunnel_e2e_test.dart`（核心侧链路） |
 
-> 上表数字于 **2026-10-05 逐包重测**（此前记的 33 / 159+1 / 849+1 / 217 已经过时——那是更早里程碑的旧值，
+> 上表数字于 **2026-10-11（1.0.3）逐包重测**：`tree_protocol` 38、`tree_tunnel_protocol` **15**、
+> `tree_agent` **89~19**、`tree_ssh_plugin` **123**、`tree_local_exec` **285~4**、`tree_core` **1200~3**、
+> `tree_core_cli` **6**、前端 **811**。
+> 差额来源：本版新增 SSH 执行器「中转站」链路（三个新包：协议定义 / 目标机执行体 / 中转站插件），
+> `tree_local_exec` 的 +24 是本轮隧道传输层与后台托管的用例，`tree_core` 的 +1 是核心侧真机端到端。
+> **基线数字本次已按实测更新**（上一次 1.0.2+6 时前端实测 811 高于基线 789，当时按"发现不一致要报告、不默默改"
+> 留给用户裁决；本次一并抬到 811）。
+> **真机门控本次具备并跑过**（WSL 起的真 sshd + 交叉编译出的真二进制），不再写"环境不具备"；
+> 唯一仍未跑的是 zip / 安装包的静默装卸（对外系统级动作，由用户自己装机实测）。
+> `tree_agent` 的 **19 条 skip 是 POSIX 专属行为**（`script` / `setsid` / `kill -0` / 符号链接语义）——
+> Windows 开发机上注定跑不了，它们的覆盖来自上表最后一行那两条真机门控，不是丢了断言。
+> 上表数字此前于 **2026-10-05 逐包重测**（此前记的 33 / 159+1 / 849+1 / 217 已经过时——那是更早里程碑的旧值，
 > 不是某次改动造成的）。基线是**下限**：只许持平或更好。**注意**：`dart test` 计时敏感的用例（例如
 > `tree_core` 的 `llm_transport_liveness_test`）在**多套测试并发跑**时可能偶发失败；复核请单独跑一遍。
 > **2026-10-07（1.0.2+6）逐包重测**：`tree_protocol` 38、`tree_local_exec` **261~4**（+6：新增 `ssh_link_fault_test`）、
 > `tree_core` **1200~2**（+1：执行站 `ssh.reconnect` 用例；另有内置点位清单门禁 17→18、命令 13→14 的同步）、
-> `tree_core_cli` 4~2、前端 **811**。**注意**：前端实测 811 **高于**上表基线 789（差额来自 1.0.2+5 之后的其它提交，
-> **非本次引入**）；基线数字本次**未改动**——按发布规范"发现 §6 基线与实测不一致要**报告**而非默默改"，
-> 已在发布汇报里提出，待用户裁决是否把基线抬到 811。
+> `tree_core_cli` 4~2、前端 **811**（当时高于基线 789，差额来自 1.0.2+5 之后的其它提交、**非当次引入**）。
 > **2026-10-05 发布 1.0.2+5 时再次逐包重测**：38 / 255~4 / **1199~2** / 789（`tree_core` 从 1188 升到 1199，
 > 差额是本次为"失败载荷穿到插件"补的 4 条回归用例）。`tree_core_cli` **没有 `lib/`**：
 > 单独分析它要跑 `dart analyze`（整包），`dart analyze lib test` 会以 `Directory or file doesn't exist: lib` 退出（code 64）。
@@ -184,8 +204,15 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 
 ## 8. 发布检查单
 
-- [ ] `dart analyze` × 4 包 + `flutter analyze lib test` 零告警
-- [ ] 5 层测试全绿（含门控真机 SSH / 编译产物冒烟，若环境具备）
+- [ ] `dart analyze`（6 个 Dart 包 + `tree_core_cli/bin` + `tool/`）+ `flutter analyze lib test` 零告警
+- [ ] 7 个包测试全绿（`tree_protocol` / `tree_tunnel_protocol` / `tree_agent` / `tree_ssh_plugin` /
+      `tree_local_exec` / `tree_core` / `tree_core_cli`）+ `flutter test`；数字对照 §6 基线
+- [ ] **出包前先产出两份 SSH 执行器二进制**：`dart run tool/build_ssh_plugin.dart` 与
+      `dart run tool/build_agent.dart`。`package_windows.dart` 会把 `build/plugins/`、
+      `build/agents/` 复制进发行目录 —— 但**产物缺失不会报错**（只是包内没有中转站、核心自动回退内置
+      dartssh2），所以出包后务必按下面那条核一遍必备件
+- [ ] 门控真机端到端（`TREE_SSH_TEST_*` 具备时）：`dart run tool/tunnel_e2e.dart` 与
+      `packages/tree_core/test/ssh_tunnel_e2e_test.dart`
 - [ ] `CHANGELOG.md` 记录本次版本的用户可见变化
 - [ ] `tool/package_windows.dart` 出的 zip 自检通过；安装包流程走一遍
 - [ ] 便携目录的 `plugins/` 里没有 `__pycache__` / `*.pyc` 等本地产物（脚本已过滤 + 清残留，再出现说明有别的路径漏了）
