@@ -219,6 +219,8 @@ PTY 不可用 ⇒ `PtyUnsupportedException`（不静默降级）、`shell.data`/
 `tunnel_background_test`（**后台执行的两条路**：有托管能力 ⇒ 走 `exec.spawn` 且命令里**不出现** `nohup`；
 `exitCode` 从台账收尾（`running → exited` / `gone` ⇒ 可辨码）；**断链不失败而是继续等**；
 `attachBackground` 只给日志路径就能对账且**不重跑**；`cancel` 走 `exec.kill`、台账里没有 ⇒ 如实 false；
-没有能力 ⇒ 形状仍是 `setsid nohup … echo $!`）、
+没有能力 ⇒ 形状仍是 `setsid nohup … echo $!`）—— 配套的**核心侧**接续用例在
+[../tree_core/test/terminal_hooks_tunnel_test.dart](../tree_core/test/terminal_hooks_tunnel_test.dart)
+（重启 → 认领 → 回 hook 结束提醒 → 不重跑），两条一起才覆盖"跨日稳定"这条链);
 真链路的 SSH 会话通道没有在本仓库验证过（本机无 sshd），只保证编译通过与参数形状有据可依——见
 [../../docs/known-issues.md](../../docs/known-issues.md) #12。

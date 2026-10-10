@@ -163,20 +163,24 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 | `tree_agent` | 89 passed / 19 skipped（skip = POSIX 专属行为，见下注） |
 | `tree_ssh_plugin` | 123 passed（含"真进程一次塞多帧"） |
 | `tree_local_exec` | 285 passed / 4 skipped |
-| `tree_core` | 1200 passed / 3 skipped |
+| `tree_core` | 1201 passed / 3 skipped |
 | `tree_core_cli` | 6 passed（需 `TREE_CORE_EXE` 指向编译产物） |
 | 前端 `flutter test` | 811 passed |
-| 真机 SSH 回归（`TREE_SSH_TEST_*` 具备时） | ① `packages/tree_local_exec` 的 SSH 用例与 `packages/tree_core/test/ssh_files_integration_test.dart`；② **中转站两条门控**：`dart run tool/tunnel_e2e.dart`（线上协议黑盒，**16 项**）与 `packages/tree_core/test/ssh_tunnel_e2e_test.dart`（核心侧链路） |
+| 真机 SSH 回归（`TREE_SSH_TEST_*` 具备时） | ① `packages/tree_local_exec` 的 SSH 用例与 `packages/tree_core/test/ssh_files_integration_test.dart`；② **中转站两条门控**：`dart run tool/tunnel_e2e.dart`（线上协议黑盒，**26 项**）与 `packages/tree_core/test/ssh_tunnel_e2e_test.dart`（核心侧链路） |
 
 > 上表数字于 **2026-10-11（1.0.3）逐包重测**：`tree_protocol` 38、`tree_tunnel_protocol` **15**、
-> `tree_agent` **89~19**、`tree_ssh_plugin` **123**、`tree_local_exec` **285~4**、`tree_core` **1200~3**、
+> `tree_agent` **89~19**、`tree_ssh_plugin` **123**、`tree_local_exec` **285~4**、`tree_core` **1201~3**、
 > `tree_core_cli` **6**、前端 **811**。
 > 差额来源：本版新增 SSH 执行器「中转站」链路（三个新包：协议定义 / 目标机执行体 / 中转站插件），
-> `tree_local_exec` 的 +24 是本轮隧道传输层与后台托管的用例，`tree_core` 的 +1 是核心侧真机端到端。
+> `tree_local_exec` 的 +24 是本轮隧道传输层与后台托管的用例，`tree_core` 的 +2 是核心侧真机端到端
+> 与**隧道托管路径的 hook 接续**用例（`test/terminal_hooks_tunnel_test.dart`：核心重启 → 按日志路径从
+> `exec.list` 认领 → 退出码来自台账 → 完成提示**回原会话** → **不重跑**；原先只有 `nohup` 那条路有钉子）。
 > **基线数字本次已按实测更新**（上一次 1.0.2+6 时前端实测 811 高于基线 789，当时按"发现不一致要报告、不默默改"
 > 留给用户裁决；本次一并抬到 811）。
-> **真机门控本次具备并跑过**（WSL 起的真 sshd + 交叉编译出的真二进制），不再写"环境不具备"；
-> 唯一仍未跑的是 zip / 安装包的静默装卸（对外系统级动作，由用户自己装机实测）。
+> **真机门控本次具备并跑过**（WSL 起的真 sshd + 交叉编译出的真二进制），不再写"环境不具备"：
+> `tool/tunnel_e2e.dart` **26 项**全过，其中 ⑦ 段专钉**关停/接续四条**（执行器被 kill ⇒ 旧 pid 消失 /
+> **在跑的后台进程仍然活着** / 重建后 **agent 从台账认出上一世的任务** / 跨过重建仍拿到退出码与日志 /
+> 关隧道后**执行器立即退出不留孤儿**）。唯一仍未跑的是 zip / 安装包的静默装卸（对外系统级动作，由用户自己装机实测）。
 > `tree_agent` 的 **19 条 skip 是 POSIX 专属行为**（`script` / `setsid` / `kill -0` / 符号链接语义）——
 > Windows 开发机上注定跑不了，它们的覆盖来自上表最后一行那两条真机门控，不是丢了断言。
 > 上表数字此前于 **2026-10-05 逐包重测**（此前记的 33 / 159+1 / 849+1 / 217 已经过时——那是更早里程碑的旧值，

@@ -50,6 +50,9 @@ abstract final class _AgentMethods {
 abstract final class _TunnelMethods {
   static const String ensure = 'tunnel.ensure';
   static const String request = 'tunnel.request';
+  static const String state = 'tunnel.state';
+  static const String reconnect = 'tunnel.reconnect';
+  static const String close = 'tunnel.close';
 }
 
 /// 中转站申报的能力名（核心"有没有中转站"的唯一判据）。
@@ -317,12 +320,181 @@ Future<void> _run(
     _check('PTY：要么可用、要么明确报 pty_unsupported', '$error'.contains('pty_unsupported') || '$error'.contains('伪终端'), '$error');
   }
 
-  // ⑦ 收尾：删掉本次自建目录（不污染目标机）
+  // ⑦ 关停/接续语义（用户点名的四条，也是这次改动的全部卖点）
+  //
+  // 为什么必须在这条真机 e2e 里钉：这四条里有三条**只在真链路上才成立** ——
+  // `setsid` 是否真的让托管任务脱离 agent、agent 被 kill 后插件会不会自动重拉、
+  // 重拉的 agent 能不能只靠磁盘台账认出"上一世"起的任务。单测只能钉形状。
+  //
+  // 用同一条 ssh（就是插件用的那套凭据）去动目标机，**不经过被测链路**，
+  // 这样"我杀了它"这件事不依赖被测代码自述。
+  Future<String> sshRun(String command) async {
+    final ProcessResult r = await Process.run('ssh', <String>[
+      '-i', key,
+      '-p', '$port',
+      '-o', 'StrictHostKeyChecking=no',
+      '-o', 'UserKnownHostsFile=/dev/null',
+      '-o', 'BatchMode=yes',
+      '-o', 'ConnectTimeout=10',
+      '$user@$host',
+      command,
+    ]);
+    return '${r.stdout}'.trim();
+  }
+
+  // ⑦a 起一条**长**任务：它必须活着穿过"执行器被杀 + 重建"这一整段。
+  final Map<String, dynamic> survivor = _asMap(
+    await call(_AgentMethods.execSpawn, <String, dynamic>{
+      'command': 'sleep 25; echo BG-SURVIVED',
+      'log_path': '$dir/survivor.log',
+    }),
+  );
+  final String svId = (survivor['id'] ?? '').toString();
+  final int? svPid = (survivor['pid'] as num?)?.toInt();
+  _check(
+    '起了一条长任务（拿到 pid，供存活探针用）',
+    svId.isNotEmpty && svPid != null,
+    '$survivor',
+  );
+
+  // ⑦b 杀掉**执行器本身**（真·agent 进程死亡）
+  //
+  // 两个坑（都踩过）：
+  // 1. `pgrep -f tree_agent` 会**自匹配**运行它的那条 `bash -lc` 包装 shell（cmdline 里有这个词）
+  //    ⇒ 用 `[t]ree_agent` 方括号技巧：正则能匹配 "tree_agent"，而包装 shell 的 cmdline 里
+  //    是字面量 "[t]ree_agent"，不匹配；
+  // 2. 插件**会在 1~4s 内自动重连并重拉一个新 agent**（这是好事，不是"杀不死"）⇒
+  //    断言必须是"**旧的那个 pid** 不在了"，而不是"一个 agent 都不剩"。
+  const String agentPat = '[t]ree_agent-linux';
+  final String agentPidsBefore = await sshRun('pgrep -f "$agentPat" | tr \'\\n\' \' \'');
+  final List<String> oldAgentPids = agentPidsBefore
+      .split(RegExp(r'\s+'))
+      .where((String s) => s.isNotEmpty)
+      .toList();
+  _check(
+    '杀之前目标机上确有 tree_agent 在跑',
+    oldAgentPids.isNotEmpty,
+    'pgrep -f "$agentPat" ⇒ "$agentPidsBefore"',
+  );
+  await sshRun('pkill -f "$agentPat"');
+  await Future<void>.delayed(const Duration(seconds: 2));
+  final String survivedOld = await sshRun(
+    'for p in ${oldAgentPids.join(' ')}; do '
+    'if kill -0 \$p 2>/dev/null; then echo -n "\$p "; fi; done',
+  );
+  _check(
+    '旧执行器进程都没了（用 pid 判定，避开自动重拉带来的假阴性）',
+    survivedOld.trim().isEmpty,
+    'pkill 后仍活着的旧 pid：${survivedOld.trim()}（原为 ${oldAgentPids.join(' ')}）',
+  );
+
+  // ⑦c **核心断言**：在跑的后台进程**不受影响**（`setsid` 真的让它脱离了 agent）
+  final String alive = await sshRun(
+    'if kill -0 $svPid 2>/dev/null; then echo ALIVE; else echo DEAD; fi',
+  );
+  _check(
+    '执行器死了，**在跑的后台进程仍然活着**（这条是"跨日稳定"的根）',
+    alive == 'ALIVE',
+    'kill -0 $svPid ⇒ "$alive"',
+  );
+
+  // ⑦d 重建：`tunnel.reconnect` = 重置退避 + 一次立即尝试（插件会重新推送/拉起 agent）
+  await proc.request(
+    _TunnelMethods.reconnect,
+    <String, dynamic>{'conn_id': conn},
+    timeout: const Duration(minutes: 3),
+  );
+  String state = '';
+  for (int i = 0; i < 30; i++) {
+    final Map<String, dynamic> st = await proc.request(
+      _TunnelMethods.state,
+      <String, dynamic>{'conn_id': conn},
+    );
+    final List<dynamic> tunnels = (st['tunnels'] as List<dynamic>?) ?? <dynamic>[];
+    final Map<String, dynamic> mine = tunnels
+        .whereType<Map<dynamic, dynamic>>()
+        .map((Map<dynamic, dynamic> m) => m.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)))
+        .firstWhere((Map<String, dynamic> m) => m['conn_id'] == conn, orElse: () => <String, dynamic>{});
+    state = (mine['state'] ?? '').toString();
+    if (state == 'ready') break;
+    await Future<void>.delayed(const Duration(seconds: 1));
+  }
+  _check('执行器被重建后隧道回到 ready', state == 'ready', 'state="$state"');
+
+  // ⑦e **重启后接上**：新一世的 agent 只靠磁盘台账认出上一世起的任务
+  final Map<String, dynamic> relisted = _asMap(
+    await call(_AgentMethods.execList, const <String, dynamic>{}),
+  );
+  final Map<String, dynamic> svNow = ((relisted['procs'] as List<dynamic>?) ?? <dynamic>[])
+      .whereType<Map<dynamic, dynamic>>()
+      .map((Map<dynamic, dynamic> m) => m.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)))
+      .firstWhere(
+        (Map<String, dynamic> p) => p['id'] == svId,
+        orElse: () => <String, dynamic>{},
+      );
+  _check(
+    '重建后的 agent 从台账里认出了那条任务（重启接上）',
+    svNow.isNotEmpty && svNow['command'] == 'sleep 25; echo BG-SURVIVED',
+    'exec.list 里 $svId ⇒ $svNow',
+  );
+
+  // ⑦f 跑完并收尾：退出码 + 日志都来自**落盘**（与它中途死过一次无关）
+  final Stopwatch wait = Stopwatch()..start();
+  Map<String, dynamic> svFinal = <String, dynamic>{};
+  while (wait.elapsed < const Duration(seconds: 90)) {
+    final Map<String, dynamic> q = _asMap(
+      await call(_AgentMethods.execQuery, <String, dynamic>{'id': svId}),
+    );
+    svFinal = _asMap(q['proc']);
+    if (svFinal['state'] == 'exited') break;
+    await Future<void>.delayed(const Duration(seconds: 2));
+  }
+  _check(
+    '跨过"执行器被杀+重建"仍拿到退出码 0（真相在目标机磁盘上）',
+    svFinal['state'] == 'exited' && svFinal['exit_code'] == 0,
+    '$svFinal',
+  );
+  final Map<String, dynamic> svLog = _asMap(
+    await call(_AgentMethods.fsRead, <String, dynamic>{'path': '$dir/survivor.log'}),
+  );
+  _check(
+    '它的日志也照常落盘（BG-SURVIVED）',
+    utf8
+        .decode(base64Decode((svLog['data'] ?? '').toString()), allowMalformed: true)
+        .contains('BG-SURVIVED'),
+    '${svLog['data']}',
+  );
+
+  // ⑦g 收尾：删掉本次自建目录（**必须在关隧道之前**——关掉 conn 之后就没有可用的 execut 通道了）
   await call(_AgentMethods.fsRemove, <String, dynamic>{'path': dir, 'recursive': true});
   final Map<String, dynamic> exists = _asMap(
     await call(_AgentMethods.fsExists, <String, dynamic>{'path': dir}),
   );
   _check('fs.remove 递归删干净', exists['exists'] == false, '$exists');
+
+  // ⑦h 关隧道 ⇒ **执行器立刻关**（核心关 ⇒ 插件收手 ⇒ 通道断 ⇒ agent 退）
+  //    同样按 pid 判定：先记下当时活着的 agent pid，关掉后再看它们是否还在。
+  final String agentPidsAtClose = await sshRun('pgrep -f "$agentPat" | tr \'\\n\' \' \'');
+  final List<String> liveAgentPids = agentPidsAtClose
+      .split(RegExp(r'\s+'))
+      .where((String s) => s.isNotEmpty)
+      .toList();
+  _check(
+    '关隧道前确有执行器在跑（否则这条断言没有意义）',
+    liveAgentPids.isNotEmpty,
+    'pgrep -f "$agentPat" ⇒ "$agentPidsAtClose"',
+  );
+  await proc.request(_TunnelMethods.close, <String, dynamic>{'conn_id': conn});
+  await Future<void>.delayed(const Duration(seconds: 3));
+  final String agentStill = await sshRun(
+    'for p in ${liveAgentPids.join(' ')}; do '
+    'if kill -0 \$p 2>/dev/null; then echo -n "\$p "; fi; done',
+  );
+  _check(
+    '隧道关掉后执行器立即退出（不留孤儿）',
+    agentStill.trim().isEmpty,
+    '关隧道后仍活着的 pid：${agentStill.trim()}（原为 ${liveAgentPids.join(' ')}）',
+  );
 }
 
 void _check(String name, bool ok, String detail) {
