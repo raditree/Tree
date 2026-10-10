@@ -1,0 +1,471 @@
+import 'dart:async';
+import 'dart:math';
+
+import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart';
+
+import 'agent_binary.dart';
+import 'agent_client.dart';
+import 'backoff.dart';
+import 'bootstrap.dart';
+import 'login_shell.dart';
+import 'ssh_dialer.dart';
+import 'tunnel_config.dart';
+
+/// 可注入的定时器（生产用 `dart:async` 的 `Timer`，测试用假时钟）。
+///
+/// 为什么要这层：退避的**累计上限是 30 分钟**——单测不可能真等它。
+abstract class DelayTimer {
+  /// 取消（幂等）。
+  void cancel();
+}
+
+/// 定时器工厂：`(间隔, 到点回调) → 定时器`。
+typedef TimerFactory = DelayTimer Function(
+  Duration duration,
+  void Function() callback,
+);
+
+/// 生产实现：包一层 `dart:async` 的 `Timer`。
+class RealDelayTimer implements DelayTimer {
+  RealDelayTimer(Duration duration, void Function() callback)
+      : _timer = Timer(duration, callback);
+
+  final Timer _timer;
+
+  @override
+  void cancel() => _timer.cancel();
+}
+
+/// 默认定时器工厂（生产用；测试注入假实现）。
+DelayTimer defaultTimerFactory(Duration duration, void Function() callback) =>
+    RealDelayTimer(duration, callback);
+
+/// 一条到某台主机的隧道：**SSH 连接 + agent 常驻通道 + 状态机**。
+///
+/// 状态（协议 §2）：`connecting → booting → ready ⇄ reconnecting → down`。
+/// - 首次建（`connecting`）失败 ⇒ 退避重试，直到 [Backoff.maxTotal] 用尽 ⇒ `down`；
+/// - `ready` 之后通道断 ⇒ `reconnecting`（重连 = 重跑 bootstrap ⇒ 天然完成 agent 版本对账）；
+/// - **不可调和**的失败（架构不支持 / 握手被拒 / 本机配置不全）⇒ 直接 `down`，
+///   不白白退避 30 分钟（`arch_unsupported` 再试一万次也还是不支持）。
+///
+/// **在途请求**：通道一断，[AgentClient] 就把它们全部以可读错误收口 ⇒ 本层的
+/// `request` 如实回失败（**绝不自动重放**：远端命令可能有副作用）。
+class Tunnel {
+  Tunnel({
+    required this.connId,
+    required this.config,
+    required this.agent,
+    required this.dialer,
+    required this.loadBinary,
+    Backoff? backoff,
+    this.timerFactory = defaultTimerFactory,
+    this.now = DateTime.now,
+    this.onEvent,
+    this.log,
+    this.chunkBytes = kPushChunkBytes,
+    Random? random,
+  })  : backoff = backoff ?? Backoff(),
+        _random = random ?? Random.secure() {
+    _startedAt = now();
+  }
+
+  /// 隧道 id（`conn-<递增序号>`，由 [TunnelManager] 分配）。
+  final String connId;
+  final TunnelConfig config;
+  final AgentRequest agent;
+
+  /// 退避节奏（`tunnel.reconnect` 会 `reset()`）。
+  final Backoff backoff;
+
+  /// 推送分块大小（测试可改小，用真机无关）。
+  final int chunkBytes;
+
+  /// 状态跃迁 / PTY 事件的出口（转成 L1 的 `tunnel/event` 通知）。
+  void Function(Map<String, dynamic> event)? onEvent;
+
+  /// SSH 连接工厂（可注入：单测用假 dialer）。
+  final SshDialer dialer;
+
+  /// 随包 agent 二进制的装载器（可注入：单测用假字节）。
+  final AgentBinaryLoader loadBinary;
+
+  /// 定时器工厂（可注入：单测用假时钟，退避不用真等 30 分钟）。
+  final TimerFactory timerFactory;
+
+  /// 当前时间（可注入，便于断言 `elapsed_ms`）。
+  final DateTime Function() now;
+
+  final void Function(String message)? log;
+  final Random _random;
+
+  SshConnection? _connection;
+  AgentClient? _client;
+  LoginShell? _loginShell;
+  AgentHello? _hello;
+  String _root = '';
+  String _installPath = '';
+  DelayTimer? _retryTimer;
+  Future<bool>? _attemptInFlight;
+  bool _everReady = false;
+  bool _closed = false;
+  late final DateTime _startedAt;
+
+  String _state = TunnelStates.connecting;
+  int _attempts = 0;
+  String? _lastError;
+  String? _lastErrorKind;
+
+  /// 本次尝试的握手 token（只用于**日志脱敏**：它绝不能出现在任何日志里）。
+  String? _handshakeToken;
+
+  /// 当前状态（[TunnelStates] 之一）。
+  String get state => _state;
+
+  /// 连接尝试次数（含成功与失败；`connecting`/`booting` 期间在涨）。
+  int get attempts => _attempts;
+
+  String? get lastError => _lastError;
+  String? get lastErrorKind => _lastErrorKind;
+
+  /// agent 握手信息（未就绪时为 null）。
+  AgentHello? get hello => _hello;
+
+  /// 权威的远端工作空间根（就绪后来自 `agent.hello`）。
+  String get root => _root;
+
+  bool get isClosed => _closed;
+
+  /// 权威的判活面（协议 §2）：核心每心跳拉一次 `tunnel.state`。
+  Map<String, dynamic> stateJson() => <String, dynamic>{
+    'conn_id': connId,
+    'host': config.host,
+    'port': config.port,
+    'username': config.username,
+    'root': _root,
+    'state': _state,
+    'attempt': _attempts,
+    'elapsed_ms': now().difference(_startedAt).inMilliseconds,
+    'last_error': _lastError,
+    'agent': _hello?.toJson() ?? const <String, dynamic>{},
+  };
+
+  /// 把它建起来（或复用正在跑的那次尝试）。返回是否 `ready`。
+  ///
+  /// **单飞**：并发的 `ensureReady` 复用同一个在途尝试（不会为一个 key 建两条连接）。
+  Future<bool> ensureReady() {
+    if (_closed) return Future<bool>.value(false);
+    final AgentClient? client = _client;
+    if (_state == TunnelStates.ready && client != null && !client.isClosed) {
+      return Future<bool>.value(true);
+    }
+    final Future<bool>? inFlight = _attemptInFlight;
+    if (inFlight != null) return inFlight;
+    final Future<bool> attempt = _attempt().whenComplete(() {
+      _attemptInFlight = null;
+    });
+    _attemptInFlight = attempt;
+    return attempt;
+  }
+
+  /// 转发一次 L2 请求。
+  ///
+  /// 返回 L1 `tunnel.request` 的 result 形态：
+  /// `{ok:true, result}` / `{ok:false, error}`（+**链路级失败**才带 `error_kind: 'tunnel_down'`；
+  /// agent 回的业务错误透传 `error_code` / `error_data`，由核心映射成 `not_found` 这类语义
+  /// —— 字段名与 `plugin_tunnel_link.dart` 的读法一致）。
+  Future<Map<String, dynamic>> request(
+    String method,
+    Map<String, dynamic> params,
+  ) async {
+    if (_closed) {
+      return _notReady('隧道已关闭');
+    }
+    final AgentClient? client = _client;
+    if (_state != TunnelStates.ready || client == null || client.isClosed) {
+      return _notReady(
+        '隧道未就绪（state=$_state）${_lastError == null ? '' : '：$_lastError'}',
+      );
+    }
+
+    Map<String, dynamic> forwarded = params;
+    if (method == AgentMethods.execRun) {
+      forwarded = await _wrapLoginShell(params);
+    }
+
+    try {
+      final Map<String, dynamic> result = await client.call(method, forwarded);
+      return <String, dynamic>{'ok': true, 'result': result};
+    } on AgentChannelClosed catch (error) {
+      // 链路级：本次如实失败（**不重放**），并触发重连。
+      _onLinkLost('$error');
+      return <String, dynamic>{
+        'ok': false,
+        'error': '隧道通道已断，本次操作未执行：$error',
+        'error_kind': TunnelErrorKinds.tunnelDown,
+      };
+    } on RpcException catch (error) {
+      // agent 回了错误：链路是好的 ⇒ 如实暴露（核心据 `error_code` 映射业务语义），**不回退**。
+      // 字段名与核心侧读法对齐（`plugin_tunnel_link.dart`：`error_code` / `error_data`）。
+      return <String, dynamic>{
+        'ok': false,
+        'error': '${describeRpcCode(error.code)}：${error.message}',
+        'error_code': error.code,
+        if (error.data != null) 'error_data': error.data,
+      };
+    } catch (error) {
+      return <String, dynamic>{'ok': false, 'error': '转发失败：$error'};
+    }
+  }
+
+  /// `tunnel.reconnect`：**清零退避并立即重试**（不等退避用完）。
+  Future<void> reconnect() async {
+    if (_closed) return;
+    log?.call('收到显式重连（$connId / ${config.label}）：清零退避并立即重试');
+    backoff.reset();
+    _cancelRetry();
+    final AgentClient? client = _client;
+    if (_state == TunnelStates.ready && client != null && !client.isClosed) {
+      return; // 已经好的：显式重连是"不等退避"，不是"强制重建"。
+    }
+    await ensureReady();
+  }
+
+  /// 收掉这条隧道（幂等）。
+  ///
+  /// agent 由这条通道拉起（协议 §8：通道断 = agent 退），所以这里关通道 + 关连接就是
+  /// "收掉隧道"；**没有**额外 `kill` agent 进程，**更没**碰它托管的后台任务
+  /// （`setsid` + 落盘退出码，与隧道无关）。
+  Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
+    _cancelRetry();
+    final AgentClient? client = _client;
+    _client = null;
+    _loginShell = null;
+    _hello = null;
+    if (client != null) {
+      try {
+        await client.close();
+      } catch (error) {
+        log?.call('关闭 agent 通道时出错（忽略）：$error');
+      }
+    }
+    await _teardownConnection();
+  }
+
+  // ───────────────────────── 内部 ─────────────────────────
+
+  Future<bool> _attempt() async {
+    if (_closed) return false;
+    _cancelRetry();
+    _attempts++;
+    _setState(_everReady ? TunnelStates.reconnecting : TunnelStates.connecting);
+    SshConnection? connection;
+    try {
+      connection = await dialer(config);
+      if (_closed) {
+        await connection.close();
+        return false;
+      }
+      _connection = connection;
+      _setState(TunnelStates.booting);
+      // token 在**外层**生成：这样脱敏清单里有它，任何异常文本都不会把凭据漏进日志。
+      final String token = newHandshakeToken(random: _random);
+      _handshakeToken = token;
+      final BootstrapResult result = await runBootstrap(
+        connection: connection,
+        config: config,
+        agent: agent,
+        loadBinary: loadBinary,
+        token: token,
+        log: log,
+        chunkBytes: chunkBytes,
+      );
+      if (_closed) {
+        await result.client.close();
+        await _teardownConnection();
+        return false;
+      }
+      _client = result.client
+        ..onNotification = _onAgentNotification
+        ..onClosed = _onLinkLost;
+      _hello = result.hello;
+      _root = result.root;
+      _installPath = result.installPath;
+      _loginShell = result.loginShell;
+      _everReady = true;
+      backoff.reset();
+      _lastError = null;
+      _lastErrorKind = null;
+      _setState(TunnelStates.ready);
+      return true;
+    } catch (error) {
+      final String kind = error is BootstrapException
+          ? error.kind
+          : (error is SshConfigException
+                ? TunnelErrorKinds.configIncomplete
+                : TunnelErrorKinds.agentUnreachable);
+      final String message = _sanitize(error.toString());
+      await _teardownConnection();
+      _recordFailure(kind, message);
+      log?.call('隧道建立失败（$connId / ${config.label}）：$kind —— $message');
+      if (_isFatal(kind)) {
+        backoff.reset();
+        _setState(TunnelStates.down);
+      } else {
+        _scheduleRetry();
+      }
+      return false;
+    }
+  }
+
+  void _scheduleRetry() {
+    if (_closed) return;
+    final Duration? delay = backoff.take();
+    if (delay == null) {
+      log?.call(
+        '退避累计上限（${backoff.maxTotal.inMinutes} 分钟）用尽（$connId）⇒ ${TunnelStates.down}，'
+        '核心将回退内置 SSH',
+      );
+      _setState(TunnelStates.down);
+      return;
+    }
+    log?.call(
+      '${delay.inMilliseconds}ms 后重试（$connId，${backoff.describe()}）',
+    );
+    _setState(TunnelStates.reconnecting);
+    _retryTimer = timerFactory(delay, () {
+      _retryTimer = null;
+      unawaited(ensureReady());
+    });
+  }
+
+  /// 通道断了 / 关了（[AgentClient] 的回调；也可能来自写了才发现写不进去）。
+  void _onLinkLost(String reason) {
+    if (_closed) return;
+    final String message = _sanitize(reason);
+    log?.call('隧道通道断了（$connId / ${config.label}）：$message');
+    _client = null;
+    _loginShell = null;
+    _hello = null;
+    unawaited(_teardownConnection());
+    _recordFailure(TunnelErrorKinds.tunnelDown, message);
+    _scheduleRetry();
+  }
+
+  void _onAgentNotification(String method, Map<String, dynamic> params) {
+    // PTY 的两条通知是"数据面/退出面"，必须原样转给核心（协议 §2 的 tunnel/event）。
+    if (method == AgentMethods.shellData) {
+      onEvent?.call(<String, dynamic>{
+        'conn_id': connId,
+        'kind': TunnelEventKind.shellData,
+        if (params['shell_id'] != null) 'shell_id': params['shell_id'],
+        if (params['data'] != null) 'data': params['data'],
+      });
+      return;
+    }
+    if (method == AgentMethods.shellExit) {
+      onEvent?.call(<String, dynamic>{
+        'conn_id': connId,
+        'kind': TunnelEventKind.shellExit,
+        if (params['shell_id'] != null) 'shell_id': params['shell_id'],
+        if (params['exit_code'] != null) 'exit_code': params['exit_code'],
+      });
+      return;
+    }
+    // 其余通知只记日志（**不静默**，但不污染核心的通知面）。
+    log?.call('agent 通知（未转发）：$method ${jsonSummary(params)}');
+  }
+
+  Future<Map<String, dynamic>> _wrapLoginShell(
+    Map<String, dynamic> params,
+  ) async {
+    final Object? raw = params['command'];
+    final LoginShell? shell = _loginShell;
+    if (raw is! String || shell == null) return params;
+    final String wrapped = await shell.wrap(raw);
+    if (wrapped == raw) return params;
+    return <String, dynamic>{...params, 'command': wrapped};
+  }
+
+  Map<String, dynamic> _notReady(String reason) => <String, dynamic>{
+    'ok': false,
+    'error': reason,
+    'error_kind': TunnelErrorKinds.tunnelDown,
+  };
+
+  Future<void> _teardownConnection() async {
+    final SshConnection? connection = _connection;
+    _connection = null;
+    if (connection == null) return;
+    try {
+      await connection.close();
+    } catch (error) {
+      log?.call('关闭 SSH 连接时出错（忽略）：$error');
+    }
+  }
+
+  void _cancelRetry() {
+    final DelayTimer? timer = _retryTimer;
+    _retryTimer = null;
+    timer?.cancel();
+  }
+
+  void _recordFailure(String kind, String message) {
+    _lastErrorKind = kind;
+    _lastError = message;
+  }
+
+  /// 不可调和的失败（再试也没意义 ⇒ 直接 `down`，别拿 30 分钟退避骗人）。
+  static bool _isFatal(String kind) =>
+      kind == TunnelErrorKinds.handshakeFailed ||
+      kind == TunnelErrorKinds.archUnsupported ||
+      kind == TunnelErrorKinds.configIncomplete;
+
+  void _setState(String next) {
+    if (_state == next) return;
+    _state = next;
+    log?.call('隧道状态（$connId / ${config.label}）：$next');
+    onEvent?.call(<String, dynamic>{
+      'conn_id': connId,
+      'kind': TunnelEventKind.state,
+      'state': next,
+      'attempt': _attempts,
+      if (_lastError != null) 'last_error': _lastError,
+      if (_installPath.isNotEmpty) 'agent_path': _installPath,
+    });
+  }
+
+  /// 日志脱敏：把可能出现在异常文本里的凭据片段抹掉（**绝不漏口令/握手 token**）。
+  String _sanitize(String message) => sanitizeSecrets(
+    message,
+    secrets: <String>[
+      config.password,
+      config.keyPassphrase,
+      _handshakeToken ?? '',
+    ],
+  );
+}
+
+/// 把 [secrets] 里非空的值从 [message] 里抹成 `***`（日志安全的最后一道闸）。
+String sanitizeSecrets(String message, {List<String> secrets = const <String>[]}) {
+  String out = message;
+  for (final String secret in secrets) {
+    if (secret.isEmpty) continue;
+    out = out.replaceAll(secret, '***');
+  }
+  return out;
+}
+
+/// 通知体量小、可读的摘要（避免把 base64 数据面整段写进日志）。
+String jsonSummary(Map<String, dynamic> params) {
+  final List<String> parts = <String>[];
+  params.forEach((String key, Object? value) {
+    if (value is String && value.length > 32) {
+      parts.add('$key=<${value.length} 字符>');
+    } else {
+      parts.add('$key=$value');
+    }
+  });
+  return '{${parts.join(', ')}}';
+}

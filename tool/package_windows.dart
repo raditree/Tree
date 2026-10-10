@@ -159,6 +159,12 @@ Future<void> _package(List<String> args) async {
         : '   插件脚本：plugins/（${plugins.copied} 个文件'
               '${plugins.skipped > 0 ? '，跳过 ${plugins.skipped} 个本地产物' : ''}）',
   );
+  // ②d SSH 执行器的两份二进制（2026-10-10）：
+  //   - 中转站插件 `plugins/tree_ssh_executor[.exe]`（跑在**用户本机**，与核心同级）；
+  //   - 目标机 agent `agents/tree_agent-linux-{amd64,arm64}`（由插件按目标机架构推送）。
+  // 缺了插件 ⇒ 核心回退内置 dartssh2（功能不变，只是没有中转站）；
+  // 缺了 agent ⇒ 插件在目标机推送那一步失败 ⇒ 同样回退。**不算打包失败**，但要打印出来。
+  stdout.writeln(_copySshExecutorArtifacts(root, releaseDir));
 
   // ③ 便携包说明（首次运行指引：数据在哪、怎么手改配置、出问题看哪）
   final File guide = File(_join(releaseDir.path, '使用说明.txt'));
@@ -387,6 +393,53 @@ _PluginCopy _copyPlugins(Directory root, Directory releaseDir) {
     copied++;
   }
   return _PluginCopy(sourceExists: true, copied: copied, skipped: skipped);
+}
+
+/// 把 SSH 执行器的两份二进制复制进发行目录（2026-10-10）。
+///
+/// - `build/plugins/tree_ssh_executor[.exe]` → `<release>/plugins/`
+///   （**必须**与核心可执行文件同级：`BuiltinPluginCatalog.scriptRoots()` 第一优先就是
+///   `<exeDir>/plugins`，漏了这一层，面板上"SSH 执行器中转站"会变成"找不到可执行文件"）；
+/// - `build/agents/tree_agent-linux-*` → `<release>/agents/`
+///   （中转站插件按目标机架构挑一个推过去；`agents/` 与 `plugins/` 同级是插件的查找约定）。
+///
+/// 返回一行给用户看的总结。**产物缺失不算打包失败**：没有它，核心自动回退内置
+/// dartssh2 —— 功能不变，只是少了"中转站"这条路（见 docs/ssh-tunnel-protocol.md §0）。
+String _copySshExecutorArtifacts(Directory root, Directory releaseDir) {
+  final Directory pluginSource = Directory(_join(root.path, 'build/plugins'));
+  final Directory agentsSource = Directory(_join(root.path, 'build/agents'));
+  final List<String> copied = <String>[];
+
+  if (pluginSource.existsSync()) {
+    final Directory target = Directory(_join(releaseDir.path, 'plugins'))
+      ..createSync(recursive: true);
+    for (final FileSystemEntity entity in pluginSource.listSync()) {
+      if (entity is! File) continue;
+      final String name = _basename(entity.path);
+      if (!name.startsWith('tree_ssh_executor')) continue;
+      entity.copySync(_join(target.path, name));
+      copied.add('plugins/$name');
+    }
+  }
+
+  if (agentsSource.existsSync()) {
+    final Directory target = Directory(_join(releaseDir.path, 'agents'))
+      ..createSync(recursive: true);
+    for (final FileSystemEntity entity in agentsSource.listSync()) {
+      if (entity is! File) continue;
+      final String name = _basename(entity.path);
+      if (!name.startsWith('tree_agent')) continue;
+      entity.copySync(_join(target.path, name));
+      copied.add('agents/$name');
+    }
+  }
+
+  if (copied.isEmpty) {
+    return '   SSH 执行器：跳过（build/plugins 与 build/agents 里没有产物；'
+        '用 dart run tool/build_ssh_plugin.dart 与 dart run tool/build_agent.dart 产出）'
+        '—— 缺了它核心会自动回退内置 dartssh2，功能不变';
+  }
+  return '   SSH 执行器：${copied.join('、')}';
 }
 
 /// 启动核心读握手（打包产物自检）。
