@@ -27,11 +27,14 @@ desktop/
 ├── lib/                       # Flutter 前端（ui 三栏界面；io 只做进程附着与传输）
 ├── packages/
 │   ├── tree_protocol/         # 协议单一真源（WS 帧 / REST 路径 / 握手）+ 完备性门禁
-│   ├── tree_local_exec/       # 本机与 SSH 工作空间 IO（dartssh2）
+│   ├── tree_local_exec/       # 本机与 SSH 工作空间 IO（dartssh2 与中转站两条后端）
+│   ├── tree_tunnel_protocol/  # SSH 执行器「中转站」协议的共享定义（方法名 / 错误码 / 帧 / 版本）
+│   ├── tree_agent/            # 目标机（Linux）执行体：tree_agent 二进制
+│   ├── tree_ssh_plugin/       # ssh_executor 中转站插件（binary 型内置插件）
 │   ├── tree_core/             # 核心：服务 / LLM / 工具 / 团队 / Spec / MCP / 插件
 │   └── tree_core_cli/         # tree_core.exe 入口 + 真进程端到端测试
 ├── test/                      # 前端测试（flutter test）
-├── tool/                      # 构建与打包脚本（build_core.dart / package_windows.dart / installer）
+├── tool/                      # 构建与打包脚本（build_core / build_agent / build_ssh_plugin / package_windows / installer）
 ├── docs/                      # 文档（入口 docs/README.md）
 └── examples/plugins/          # 可运行插件示例（Python 标准库）
 ```
@@ -55,7 +58,10 @@ flutter run -d windows
 | 层 | 命令 | 说明 |
 | --- | --- | --- |
 | 协议完备性 | `cd packages/tree_protocol && dart test` | 常量集合无重复 / 无遗漏；路由覆盖度；**文档契约门禁**（模块 README 的不变量节、docs 索引完整性） |
-| 工作空间 IO | `cd packages/tree_local_exec && dart test` | 本机 + SSH（dartssh2）语义；路径越界 |
+| 工作空间 IO | `cd packages/tree_local_exec && dart test` | 本机 + SSH（dartssh2 **与中转站两条后端**）语义；路径越界；后台执行的两条路 |
+| **中转站协议** | `cd packages/tree_tunnel_protocol && dart test` | 帧编解码（分片 / 多帧 / `\r` / 坏帧不断读循环 / 超长行丢弃）、路径归一化与越界判定 |
+| **目标机执行体** | `cd packages/tree_agent && dart test` | L2 全部方法；越界拒绝；分块读写；`exec.spawn` 台账对账；PTY。**POSIX 专属行为在 Windows 上 skip（19 条）**，真机归下面那条门控 |
+| **中转站插件** | `cd packages/tree_ssh_plugin && dart test` | L1 分发 / 多隧道去重 / bootstrap 命令形状 / 退避节奏与 `down` 跃迁 / 真进程多帧 |
 | 核心 | `cd packages/tree_core && dart test` | 存储 / LLM 循环 / 工具 / 团队 / Spec / MCP / 插件 / REST+WS 端到端 |
 | 核心真进程 | `cd packages/tree_core_cli && dart test` | 编译产物能起、握手、鉴权、优雅退出（需 `TREE_CORE_EXE`） |
 | 前端 | `flutter test`（仓库根） | 组件与 API 客户端 |
@@ -76,6 +82,27 @@ $env:TREE_CORE_EXE='E:\programs\Tree\desktop\dist\tree_core.exe'
 cd packages/tree_core_cli; dart test test/binary_smoke_test.dart
 ```
 
+**SSH 执行器「中转站」端到端**（2026-10-10 新增；**真 sshd + 真 Linux 二进制 + 真插件进程**）：
+
+```powershell
+# 先产出两份二进制（缺了它们核心自动回退内置 dartssh2，功能不变）
+dart run tool/build_ssh_plugin.dart     # → build/plugins/tree_ssh_executor[.exe]
+dart run tool/build_agent.dart          # → build/agents/tree_agent-linux-{amd64,arm64}
+
+# 目标机：起一个可连的 sshd（本机开发推荐 WSL；脚本见任务留痕 .self/e2e/setup_sshd.sh）
+#   wsl -d Ubuntu -u root -- bash <repo>/.self/e2e/setup_sshd.sh   # 端口 2222、密钥认证
+
+$env:TREE_SSH_TEST_HOST='127.0.0.1'; $env:TREE_SSH_TEST_PORT='2222'
+$env:TREE_SSH_TEST_USER='treee2e'; $env:TREE_SSH_TEST_KEY='<私钥的绝对路径>'
+
+# ① 线上协议黑盒（hello → ensure → 文件/命令/托管后台任务/PTY）
+dart run tool/tunnel_e2e.dart
+# ② 核心侧链路（内置目录解析 → 起真插件 → 建隧道 → 文件/命令/托管后台任务）
+cd packages/tree_core; dart test test/ssh_tunnel_e2e_test.dart
+```
+
+两条都是**门控**：不设 `TREE_SSH_TEST_HOST` 就跳过（打印可读原因），与仓库其它真机用例同口径。
+
 ## 5. 打包与安装包
 
 ```powershell
@@ -85,6 +112,12 @@ dart run tool/package_windows.dart --flutter "<flutter.bat 的路径>"
 
 # 只要核心单文件
 dart run tool/build_core.dart            # → dist/tree_core.exe（约 10 MB）
+
+# SSH 执行器的两份二进制（2026-10-10 新增；缺了它们核心自动回退内置 dartssh2，功能不变）
+dart run tool/build_ssh_plugin.dart      # → build/plugins/tree_ssh_executor[.exe]（约 10 MB，跑在用户本机）
+dart run tool/build_agent.dart           # → build/agents/tree_agent-linux-{amd64,arm64}（各约 6.5 MB）
+                                         #   交叉编译（--target-os/--target-arch，本仓 Dart 3.13.4 实测可用；
+                                         #   首次会下载目标端 AOT 产物，约 2 分钟）
 
 # 安装包（需要 Inno Setup 6；iscc 不在 PATH 时用 --iscc 指定）
 dart run tool/package_windows.dart --installer

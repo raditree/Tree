@@ -33,7 +33,9 @@ Flutter UI 进程（lib/）                     核心进程（packages/tree_cor
 | `ConversationService` | `user_message`/`stop` → 落库 + 流式下行；**按 agent×会话**串行链、插话打断、`stop` 级联、`agent_status` 广播 |
 | `LlmAgentEngine` + `LlmSession` | OpenAI 兼容 SSE 客户端 + **无轮次上限**的工具循环；用量累计、上下文压缩、取消粒度 |
 | `WorkspaceToolRunner` | 工具表组装（内置 + MCP + 插件）+ 工具执行 + 工作空间 IO 缓存与**私有目录分栏** |
-| `WorkspaceIO`（`tree_local_exec`） | 本机（`dart:io`）与 SSH（`dartssh2`）同一接口：读 / 写 / 编辑 / grep / 列目录 / exec / git |
+| `WorkspaceIO`（`tree_local_exec`） | 本机（`dart:io`）与 SSH 同一接口：读 / 写 / 编辑 / grep / 列目录 / exec / git。**SSH 后端有两条并列实现**：内置 `DartSshTransport`（dartssh2）与 `TunnelSshTransport`（经 `ssh_executor` 插件连目标机 `tree_agent`），由 `sshIoFactory` 选路 |
+| `tree_agent`（目标机执行体） | **跑在目标机 Linux 上**的单文件二进制：stdio 行分隔 JSON-RPC 2.0 承接文件读写 / 前台命令 / **托管的**后台命令 / PTY。协议见 [ssh-tunnel-protocol.md](ssh-tunnel-protocol.md) |
+| `ssh_executor`（插件，内置） | SSH 执行器的**中转站**：一次 SSH bootstrap（推 agent + 拉起 + 握手）之后，只用那一条常驻通道转发 JSON-RPC；断线按退避重连，退避耗尽自标 `tunnel_down`（核心据此回退内置） |
 | `TreeStore` | 数据根读写：`agents/*.yaml`、`config/*.yaml`、`data/<agent>/<session>/{session.json,messages.jsonl}`，写入走 write-behind 队列 |
 | `TeamService` + `MessageDispatcher` | 成员即 agent；创建/审核/移除；派活、广播、`wait_for`；活动日志；失活 fail-closed + 待补发 |
 | `SpecService` | 内置规范播种 + 自定义规范扫描 + 索引/已选全文两个快照（进系统提示词） |
@@ -190,6 +192,8 @@ yaml 里**不属于已知键**的内容会被原样保留并写回（用户手�
 | --- | --- |
 | 消息发送（WS / 团队派发） | 无静态上限；连接心跳丢失 ⇒ 判失活并**登记补发**，重连后重播（帧无 TTL） |
 | 执行器命令（local / ssh） | 无静态上限；心跳连续丢失 N 拍 ⇒ 判失活、在途操作显式失败，**传输层随即按退避自动重建连接**（单飞，5s→10s→30s→60s 之后每 60s 一次；退避是节奏不是时长上限）。**另有「链路级故障」触发面**（2026-10-07）：心跳仍活、但服务端开始**拒绝新通道**（`SSHChannelOpenError`）时，一次失败的操作即可拉起**同一份**重建——判死判据仍只看心跳，只是扩大「主动重建」的触发面。用户不想等时走**显式入口** `POST /api/agents/{agentId}/ssh/reconnect`（右栏文件错误块上的「重连」按钮；执行站另有 `ssh.reconnect` 命令），自动与显式共用同一次实现 |
+| **SSH 执行器中转站**（2026-10-10 新增） | 与上一行**同一套判据**（心跳 = 每 I 拉一次 `tunnel.state`；判死仍只看心跳丢失），只是重连由**插件**按 1s→2s→…→60s 退避做，**累计退避上限 30 分钟**⇒ 插件自标 `tunnel_down`。核心**视其为「无中转站」**：撤换缓存、下一次解析回退内置 dartssh2，并**日志明示**。红线见 [ssh-tunnel-protocol.md](ssh-tunnel-protocol.md) §0 |
+| **中转站托管的后台任务**（2026-10-10 新增） | 进程由目标机 `tree_agent` 托管（`setsid` 脱离 + 输出直写文件 + 退出码与台账**落目标机磁盘**）⇒ 通道断 / 核心崩 / 应用退**都不影响它**。判死只看目标机的事实（退出码文件 + `kill -0` 对账），**因此断链期间 `exitCode` 继续等而不失败**——这是相对 dartssh2 `nohup` + 本机轮询方案的一处语义改进（那次方案下本机确实不知道远端状态） |
 | 本地 terminal | 无静态上限（进程活着就一直等）；可选**软超时**：到点不杀进程，转 hook 后台任务，完成后再唤醒 agent |
 | SSH terminal | 与本地同口径（软超时交还 `RunningSshExec`）；`hook=true` 在**远端** `nohup` 起、**立即返回**（命令形状 `( setsid nohup … > <日志> 2>&1 < /dev/null & echo $! )`：后台化在子壳里做，子壳立刻退出 ⇒ SSH 通道立刻 EOF）、日志落**远端工作空间**、退出码靠哨兵文件 + **3s** 轮询；远端后台任务**落盘台账**（`<数据根>/hooks`），应用重启后**接续**并把完成提示**投递回原会话**；后台任务**登记进「正在执行的 tool」**（右栏可见、用户可关）；关停**不杀**远端进程 |
 | 插件宿主（stdio） | 无静态上限；连续 N 拍无心跳 ⇒ 标 `degraded`（面板橙色角标），**不杀进程** |
@@ -222,8 +226,7 @@ yaml 里**不属于已知键**的内容会被原样保留并写回（用户手�
 8. 落库优先：先写 `messages.jsonl` 再行动（重启后可恢复）。
 9. 密钥与 token 不进日志、不进帧、不进仓库。
 10. 每个新能力都要有"它坏了会怎样"的显式路径（降级 / 报错 / 部分结果），而不是"希望它不出错"。
-11. **Windows runner 在"带着 RedirectionGuard"启动时会自愈重启**
-    （[../windows/runner/main.cpp](../windows/runner/main.cpp)、[../tool/installer/tree-desktop.iss](../tool/installer/tree-desktop.iss)，
+11. **Windows runner 在"带着 RedirectionGuard"启动时会自愈重启**    （[../windows/runner/main.cpp](../windows/runner/main.cpp)、[../tool/installer/tree-desktop.iss](../tool/installer/tree-desktop.iss)，
     机制与实测见 [known-issues.md](known-issues.md) #16）：Windows 11 的 RedirectionGuard
     （`EnforceRedirectionTrust`）让进程**拒绝跟随"非管理员创建的"重定向点**，而它**沿调用链传播**；
     安装器是提权进程 ⇒ 被它拉起的 Tree 及其整棵子树（核心 / 集成终端 / 用户在终端里跑的构建命令）
@@ -235,6 +238,19 @@ yaml 里**不属于已知键**的内容会被原样保留并写回（用户手�
     回归用例用它，不起 Flutter）；重启失败、或重启后仍非零 ⇒ 往 **stderr** 留一句可读的话再照常启动
     （**不静默、也不把用户挡在门外**）。安装器里"启动 Tree"**必须经 `explorer.exe`**（不能直接 Filename
     指 app），否则新装的实例一出生就带着这条缓解。
+12. **SSH 执行器的降级只发生在「有没有中转站」这一维，且永远明示**
+    （2026-10-10 新增，红线见 [ssh-tunnel-protocol.md](ssh-tunnel-protocol.md) §0）：
+    "插件在、但这条隧道建不起来 / 退避耗尽 / 插件进程崩"⇒ **回退内置 dartssh2** 并写日志；
+    "隧道在、某次操作失败"⇒ **如实暴露**（不重放、不回退）；**任何情况都不许落到 local**。
+    选路点唯一：`WorkspaceToolRunner.sshIoFactory`（`tree_core_cli/bin/tree_core.dart`）。
+13. **中转站协议常量只从 `tree_tunnel_protocol` 取**
+    （方法名 / 错误码 / 帧编解码 / 版本）：三端（核心传输层、插件、目标机 agent）
+    各自手写字符串**必然漂移**，而这类漂移只在真机上才暴露。
+14. **后台任务的两条实现语义一致、能力差异如实**
+    （2026-10-10）：中转站路径由目标机 agent 托管（进程与退出码都不依赖本机 SSH 轮询）；
+    内置 dartssh2 路径仍是 `nohup` + 本机哨兵轮询。`SshWorkspaceIO` 按
+    `TunnelBackgroundExec` 能力接口选路，**两条路都不许"假装知道远端状态"**：
+    台账里没有 ⇒ `killed:false` / `goneExitCode`，绝不猜。
 
 ## 14. M9 语义决策速查（已落地）
 

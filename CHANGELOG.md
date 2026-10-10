@@ -15,6 +15,39 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
+## [未发布] — 2026-10-10
+
+### 断言变化（新增 / 修改的 README 不变量）
+
+- **SSH 执行器改为「中转站 + 目标机执行体」，并有唯一的选路点与明示的降级路径**（新增
+  [packages/tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 18/19/20、
+  [docs/architecture.md](docs/architecture.md) §2/§11/§13-#12~14、
+  [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 17）：
+  新增 `TunnelSshTransport`（经 `ssh_executor` 插件连目标机 `tree_agent`，协议见新增的
+  [docs/ssh-tunnel-protocol.md](docs/ssh-tunnel-protocol.md)）与 `packages/tree_tunnel_protocol`
+  （三端共用的协议常量/帧编解码）。**红线**：降级只发生在「有没有中转站」这一维且永远明示
+  ——"插件在但隧道建不起来 / 退避耗尽（累计 30 分钟）"⇒ 回退内置 `DartSshTransport` 并写日志，
+  为此 `WorkspaceToolRunner._ioFor` 会在 `FallbackableWorkspace.tunnelDown` 时**撤换 `_ios` 缓存**；
+  "隧道在、某次操作失败"⇒ 如实暴露、不重放、不回退；**任何情况都不许落到 local**。
+  `SshWorkspaceIO` 与其全部消费方（工具 / 执行站 / 文件面板 / PTY / 视觉 / 活动日志）**一行未改**。
+- **后台任务改由目标机 agent 托管（跨日稳定性）**（不变量 20）：
+  有 `TunnelBackgroundExec` 能力时，`setsid` 脱离 + 输出直写工作空间内日志 + **退出码与进程台账落目标机磁盘**，
+  重连/重启后 `exec.list` 对账；**断链期间 `exitCode` 继续等而不失败**（真相在目标机磁盘上，
+  这是相对 `nohup` + 本机哨兵轮询方案的一处语义改进）。无该能力时原样保留既有 `nohup` 路径，行为不变。
+- **PTY 接入隧道**：`shell.*` 由目标机 agent 用 `script -qec` 提供；**目标机没有 `script` 时显式抛
+  `PtyUnsupportedException`**（沿用不变量 8，**不静默降级**成无 TTY 的 exec）；`shell.resize` 做不到就如实回报
+  `supported:false`（沿用不变量 9）。
+- **协议常量只从 `tree_tunnel_protocol` 取**（§13-#13）：方法名 / 错误码 / 帧编解码 / 版本三端共用，
+  绝不允许手写字符串（手写必然漂移，而漂移只在真机上暴露）。
+
+### Added
+
+- `packages/tree_tunnel_protocol`：SSH 执行器协议的共享定义（方法名 / 错误码 / 行分隔 JSON 帧编解码 / 版本）。
+- `packages/tree_agent`：目标机 Linux 执行体（stdio 行分隔 JSON-RPC 2.0）。
+- `packages/tree_ssh_plugin`：`ssh_executor` 中转站插件（binary 型内置插件，`defaultEnabled`）。
+- `tool/build_agent.dart` / `tool/build_ssh_plugin.dart`：产出 `build/agents/tree_agent-linux-{amd64,arm64}`
+  与 `build/plugins/tree_ssh_executor[.exe]`；`tool/package_windows.dart` 把它们复制进发行包。
+
 ## [1.0.2+6] — 2026-10-07
 
 ### 断言变化（新增 / 修改的 README 不变量）
