@@ -11,10 +11,14 @@ import 'io/core_process_launcher.dart';
 /// 而为了显示一行版本号引依赖不划算），Release 目录里也没有 pubspec。
 /// 代价是两处会漂移，所以 `test/version_info_test.dart` 直接读 pubspec 比对——
 /// 漂移会让测试红，而不是让用户看到一个假版本号。
-const String kAppVersion = '1.0.2';
+const String kAppVersion = '1.0.3';
 
 /// 应用构建号（pubspec `version:` 的 `+` 后半段，同一处测试钉住）。
-const String kAppBuildNumber = '6';
+///
+/// 本次（1.0.3）**不带构建号** ⇒ 这里是 `'0'`，界面因此显示成 `1.0.3+0`
+/// （`VersionInfo.appVersionText` 是按 `'$kAppVersion+$kAppBuildNumber'` 拼的，
+/// 刻意不做"末位为 0 就省略"的特判：那就成了第二套显示规则，一改就漂）。
+const String kAppBuildNumber = '0';
 
 /// 客户端与核心之间的**接口契约版本**（见各 REST 注释里的「契约 vX.Y」）。
 ///
