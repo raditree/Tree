@@ -11,6 +11,10 @@ dependencies:
     path: ../tree_protocol
   tree_local_exec:
     path: ../tree_local_exec
+  # SSH 执行器「中转站」协议的共享定义：PluginBus 用它识别中转站插件的
+  # `tunnel/event` 通知与 `ssh-executor` 能力名，不手写字符串
+  tree_tunnel_protocol:
+    path: ../tree_tunnel_protocol
   # 以下两个是 Dart 官方包（纯 Dart、可 AOT），核心进程因此不再是"零依赖"。
   # 取舍见 lib/src/store/tree_paths.dart 与 yaml_codec.dart 的说明：
   # - path：跨平台路径拼接（Windows 盘符/分隔符由官方实现保证正确）

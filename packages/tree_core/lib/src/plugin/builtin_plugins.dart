@@ -1,13 +1,18 @@
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
+import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart';
+
+import 'plugin_config_store.dart';
 
 /// 内置插件的**静态清单**（M9 §4.2：内置插件与自定义插件都要能在前端开/关）。
 ///
 /// 为什么清单在核心而不是前端：内置插件的"身份"必须由核心认定——前端只拿到
 /// id + 名称 + 说明 + 开关状态，具体要拉起什么命令、脚本在哪，全部由核心在
 /// **打开的那一刻**解析（见 [BuiltinPluginCatalog.resolve]）：
-/// - 运行时：Windows 依次探测 python / py -3；其他平台 python3 / python；
+/// - **python 型**：Windows 依次探测 python / py -3；其他平台 python3 / python；
+/// - **binary 型**（2026-10-10 新增，用于 `ssh_executor` 中转站）：**不做运行时探测**，
+///   直接解析"可执行文件同级的 `plugins/<name>`（Windows 补 `.exe`）"；
 /// - 脚本：优先核心可执行文件同级的 `plugins/<name>.py`（发行包里由
 ///   tool/package_windows.dart 把 examples/plugins 复制到那里）；开发态向上定位
 ///   **仓根**后查 `examples/plugins/`（不依赖当前工作目录——桌面壳是以自己所在
@@ -25,9 +30,17 @@ class BuiltinPluginSpec {
     required this.description,
     required this.script,
     required this.runtime,
+    this.kind = kindPython,
     this.granularity = 'team',
     this.scope = const <String, dynamic>{},
+    this.defaultEnabled = false,
   });
+
+  /// 插件类型：需要 Python 解释器的脚本。
+  static const String kindPython = 'python';
+
+  /// 插件类型：随包分发的**可执行文件**（不探测任何运行时）。
+  static const String kindBinary = 'binary';
 
   /// 插件 id（也是落盘条目的 id；面板用它做开关）。
   final String id;
@@ -38,11 +51,17 @@ class BuiltinPluginSpec {
   /// 说明（面板上给用户看的"这是什么、怎么用"）。
   final String description;
 
-  /// 脚本文件名（相对 plugins/ 目录；不含路径分隔符）。
+  /// 文件名（相对 plugins/ 目录；不含路径分隔符）。
+  ///
+  /// - [kindPython]：脚本文件名（含 `.py`）；
+  /// - [kindBinary]：可执行文件**基本名**（**不含** `.exe`；Windows 上解析时补）。
   final String script;
 
-  /// 所需运行时的可读名字（如 python）。
+  /// 所需运行时的可读名字（如 python / binary）。
   final String runtime;
+
+  /// [kindPython] / [kindBinary]。
+  final String kind;
 
   /// 默认实例粒度（team / agent / session）。
   final String granularity;
@@ -51,6 +70,13 @@ class BuiltinPluginSpec {
   /// 因此对所有 team 的调用点都可见）。
   final Map<String, dynamic> scope;
 
+  /// 是否**首次随包出现即默认开启**（用户 2026-10-10 拍板：「默认开（升级即生效）」）。
+  ///
+  /// 语义严格限定为：`plugins.yaml` 里**根本没有这一条**时才由
+  /// [seedDefaultEnabledBuiltins] 播种一条 `enabled: true`。
+  /// 用户显式关过（条目在、`enabled: false`）**绝不再自动打开**。
+  final bool defaultEnabled;
+
   /// 给前端的内置插件说明（config / enabled / resolution 由核心在响应里补）。
   Map<String, dynamic> toJson() => <String, dynamic>{
     'id': id,
@@ -58,8 +84,10 @@ class BuiltinPluginSpec {
     'description': description,
     'script': script,
     'runtime': runtime,
+    'kind': kind,
     'granularity': granularity,
     'scope': scope,
+    'default_enabled': defaultEnabled,
   };
 }
 
@@ -183,6 +211,26 @@ class BuiltinPluginCatalog {
       granularity: 'team',
       scope: <String, dynamic>{},
     ),
+    // 2026-10-10：SSH 执行器的**中转站**（binary 型）。它不是"点位订阅者"，
+    // 而是一条常驻通道的持有者：核心的 `TunnelSshTransport` 经它把工作空间 IO
+    // 转发给目标机上的 tree_agent（协议见 docs/ssh-tunnel-protocol.md）。
+    // `defaultEnabled: true` = 首次随包出现即默认开启（用户 2026-10-10 拍板）。
+    BuiltinPluginSpec(
+      id: kSshExecutorPluginId,
+      name: 'SSH 执行器中转站',
+      description:
+          'SSH 工作空间的**执行中转站**（随包二进制，不是脚本）：核心经它维护一条常驻 '
+          'SSH 通道，把文件读写、命令执行、交互终端转发给目标机上的 `tree_agent`；'
+          '目标机上首次使用会自动推送 agent（约 6 MB，按架构选 amd64/arm64）。'
+          '隧道断开按退避重连（累计 30 分钟上限）；耗尽后核心**自动回退**内置 dartssh2 '
+          '并在日志/右栏明示。关掉它 = 完全回到内置实现（功能不变，只是没有中转站）。',
+      script: kSshExecutorBinaryName,
+      runtime: 'binary',
+      kind: BuiltinPluginSpec.kindBinary,
+      granularity: 'team',
+      scope: <String, dynamic>{},
+      defaultEnabled: true,
+    ),
   ];
 
   /// 脚本查找目录的显式覆盖（测试注入；null = 默认的"可执行文件同级 + 开发态回退"）。
@@ -224,6 +272,27 @@ class BuiltinPluginCatalog {
       if (cached != null) return cached;
     }
     final List<String> roots = scriptRoots();
+    if (spec.kind == BuiltinPluginSpec.kindBinary) {
+      // binary 型：**不做运行时探测**（没有 Python 可探的东西），只解析可执行文件。
+      // 沿用同一条"解析失败给可读错误"的口径：静默失败在界面上就是"点了开关没反应"。
+      final String? binary = findBinary(spec, roots, isWindows: _isWindows);
+      if (binary == null) {
+        return _cache[spec.id] = BuiltinResolution.failed(
+          '找不到内置插件可执行文件 ${binaryFileName(spec, isWindows: _isWindows)}'
+          '（依次查找：${roots.join('；')}）。'
+          '发行包应当把 $kSshExecutorBinaryName 放在可执行文件同级的 plugins/ 目录'
+          '（tool/package_windows.dart 已包含这一步）；开发态用 '
+          'tool/build_ssh_plugin.dart 产出到仓根 plugins/。',
+          searchedScriptRoots: roots,
+        );
+      }
+      return _cache[spec.id] = BuiltinResolution.ok(
+        command: binary,
+        prefixArgs: const <String>[],
+        scriptPath: '',
+        searchedScriptRoots: roots,
+      );
+    }
     final String? script = findScript(spec, roots);
     if (script == null) {
       return _cache[spec.id] = BuiltinResolution.failed(
@@ -260,7 +329,12 @@ class BuiltinPluginCatalog {
     'id': spec.id,
     'name': spec.name,
     'command': resolution.command,
-    'args': <String>[...resolution.prefixArgs, resolution.scriptPath],
+    // binary 型没有脚本参数（scriptPath 为空）⇒ **不要**塞一个空串进去
+    // （那样落盘就是 `args: [""]`，插件进程会拿到一个空参数）。
+    'args': <String>[
+      ...resolution.prefixArgs,
+      if (resolution.scriptPath.isNotEmpty) resolution.scriptPath,
+    ],
     'env': <String, String>{},
     'enabled': enabled,
     'granularity': spec.granularity,
@@ -273,10 +347,11 @@ class BuiltinPluginCatalog {
   ///
   /// 1. 核心可执行文件同级的 `plugins/`（**发行包的正规位置**：Tree.exe /
   ///    tree_core.exe 与 plugins/ 同级）；
-  /// 2. **仓根**的 `examples/plugins/`（开发态回退，见 [repoRoot]）；
-  /// 3. 当前工作目录下的 `plugins/`、`examples/plugins/`（`dart run` 时的兜底）。
+  /// 2. **仓根**的 `build/plugins/`（开发态的构建产物，`tool/build_ssh_plugin.dart` 的落点）;
+  /// 3. **仓根**的 `examples/plugins/`（开发态回退，见 [repoRoot]）；
+  /// 4. 当前工作目录下的 `plugins/`、`build/plugins/`、`examples/plugins/`（`dart run` 时的兜底）。
   ///
-  /// 为什么第 2 条必须**锚定仓根**而不是相对 cwd：桌面壳是以**自己所在目录**为
+  /// 为什么第 2/3 条必须**锚定仓根**而不是相对 cwd：桌面壳是以**自己所在目录**为
   /// 工作目录拉起核心的，所以跑 Debug 构建时 cwd 是
   /// `build/windows/x64/runner/Debug`（该目录下没有 plugins/，Debug 产物也不复制），
   /// 于是"相对 cwd 的回退"一个都命中不了，内置示例插件在面板上就变成
@@ -289,8 +364,13 @@ class BuiltinPluginCatalog {
     final String? repo = repoRoot(exeDir);
     return <String>[
       p.join(exeDir, 'plugins'),
+      // 开发态的**构建产物**（`tool/build_ssh_plugin.dart` / `build_agent.dart` 的落点）：
+      // 打了包就走上面那条（发行目录 plugins/），没打包时从这里读，免得开发时必须
+      // 手动把二进制搬到 exe 同级。
+      if (repo != null) p.join(repo, 'build', 'plugins'),
       if (repo != null) p.join(repo, 'examples', 'plugins'),
       p.join(cwd, 'plugins'),
+      p.join(cwd, 'build', 'plugins'),
       p.join(cwd, 'examples', 'plugins'),
     ];
   }
@@ -318,6 +398,39 @@ class BuiltinPluginCatalog {
     for (final String root in roots) {
       final String candidate = p.join(root, spec.script);
       if (File(candidate).existsSync()) return candidate;
+    }
+    return null;
+  }
+
+  /// binary 型插件的**目标文件名**（Windows 补 `.exe`）。
+  static String binaryFileName(
+    BuiltinPluginSpec spec, {
+    required bool isWindows,
+  }) {
+    final String base = spec.script.endsWith('.exe')
+        ? spec.script.substring(0, spec.script.length - 4)
+        : spec.script;
+    return isWindows ? '$base.exe' : base;
+  }
+
+  /// 在目录里找**可执行文件**（返回第一个存在的绝对路径；都不存在返回 null）。
+  ///
+  /// 为什么 Windows 上也接受"不带 `.exe`"的名字：开发态可能是无扩展名的交叉编译产物
+  /// （`dart compile exe --target-os=linux`），而 `.exe` 优先保证发行包/自机构建优先命中。
+  static String? findBinary(
+    BuiltinPluginSpec spec,
+    List<String> roots, {
+    required bool isWindows,
+  }) {
+    final List<String> names = <String>[
+      binaryFileName(spec, isWindows: isWindows),
+      if (isWindows) spec.script, // 兜底：无扩展名
+    ];
+    for (final String root in roots) {
+      for (final String name in names) {
+        final String candidate = p.join(root, name);
+        if (File(candidate).existsSync()) return candidate;
+      }
     }
     return null;
   }
@@ -392,4 +505,40 @@ class BuiltinPluginCatalog {
     return '未检测到 Python 运行时（依次尝试：$tried）。'
         '请先安装 Python 并确保它在 PATH 中，或改用「添加插件」写自定义命令。';
   }
+}
+
+/// 播种「默认开启」的内置插件条目（`defaultEnabled: true` 且**从未落盘过**的那些）。
+///
+/// 语义（用户 2026-10-10 拍板：「默认开（升级即生效）」）刻意收得很紧：
+/// - **只处理"`plugins.yaml` 里根本没有这一条"**的情况。用户显式关过（条目在、
+///   `enabled: false`）就**绝不再自动打开** —— 否则就是"帮用户改回他自己关掉的东西"；
+/// - 解析不出来（缺二进制 / 缺 Python）⇒ **只记日志、不落盘**：装不上就不该在清单里
+///   留一条永远起不来的条目（那只会让面板多一个"打开失败"）；
+/// - **幂等**：重复调用没有副作用（已存在就跳过）。
+///
+/// 返回本次真正播种的 id 列表（空列表 = 什么都没做）。
+Future<List<String>> seedDefaultEnabledBuiltins({
+  required BuiltinPluginCatalog catalog,
+  required PluginConfigStore store,
+  void Function(String message)? log,
+}) async {
+  final List<String> seeded = <String>[];
+  for (final BuiltinPluginSpec spec in BuiltinPluginCatalog.specs) {
+    if (!spec.defaultEnabled) continue;
+    if (store.readEntry(spec.id) != null) continue; // 已落盘（开或关）⇒ 尊重现状
+    final BuiltinResolution resolution = await catalog.resolve(spec);
+    if (!resolution.ok) {
+      log?.call('内置插件 ${spec.id} 默认开启但解析失败（跳过播种）：${resolution.error}');
+      continue;
+    }
+    final PluginStoreResult result = store.upsert(
+      BuiltinPluginCatalog.entryFor(spec, resolution, enabled: true),
+    );
+    if (result.ok) {
+      seeded.add(spec.id);
+    } else {
+      log?.call('内置插件 ${spec.id} 播种失败：${result.error}');
+    }
+  }
+  return seeded;
 }

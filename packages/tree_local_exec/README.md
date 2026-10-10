@@ -18,6 +18,9 @@
 | [lib/src/ssh_reconnect.dart](lib/src/ssh_reconnect.dart) | **重连的节拍器** `SshReconnectPump`：单飞 + 退避 + 可停止（与 dartssh2 无关，所以能单测） |
 | [lib/src/ssh_link_fault.dart](lib/src/ssh_link_fault.dart) | **链路级故障中继** `SshLinkFaultRelay`：一次远端操作以**链路级**错误失败（如服务端开始拒绝新的 session 通道）时，也起一次后台重建——与心跳失活**共用同一个**节拍器 |
 | [lib/src/dartssh_transport.dart](lib/src/dartssh_transport.dart) | dartssh2 传输实现：连接 / SFTP / exec / 远端 shell 通道 / **心跳与自动重连**（`reconnect()` 单飞换会话） |
+| [lib/src/tunnel_link.dart](lib/src/tunnel_link.dart) | **中转站**的连接请求（`TunnelConnectRequest`）与能力接口：`TunnelLink` / `TunnelSession`（核心侧的 `PluginTunnelLink` 实现它）、`TunnelUnavailableException`（带 `kind`，核心据此决定「回退 vs 如实暴露」）、`FallbackableWorkspace`（隧道判死 ⇒ 核心撤换缓存） |
+| [lib/src/tunnel_ssh_transport.dart](lib/src/tunnel_ssh_transport.dart) | **中转站传输实现** `TunnelSshTransport`：把 `SshTransport` 的每个方法映射成一次转给目标机 `tree_agent` 的 JSON-RPC；心跳 = 每 I 拉一次 `tunnel.state`；**完全不依赖 dartssh2** |
+| [lib/src/tunnel_background.dart](lib/src/tunnel_background.dart) | 「后台执行」的**隧道托管**能力接口 `TunnelBackgroundExec`（只有中转站后端实现；内置 dartssh2 没有它 ⇒ 自动退回 `nohup` + 哨兵轮询） |
 | [lib/src/windows_environment.dart](lib/src/windows_environment.dart) | **按登录口径重建环境变量**（注册表机器级 + 用户级；失败整体退回继承）——本地 exec / git / PTY / hook 共用 |
 | [lib/src/ssh_login_shell.dart](lib/src/ssh_login_shell.dart) | **远端命令的登录外壳包装**（`bash -lc` → `sh -lc` → 原样发；可配可关）+ POSIX 单引号转义 |
 | [lib/src/pty/pty_session.dart](lib/src/pty/pty_session.dart) | **伪终端会话**接口 `PtySession`（原始字节输出 / 键盘输入 / 改尺寸 / 退出码 / 幂等 `close`）+ 平台工厂 `startPtySession` |
@@ -145,6 +148,29 @@
     规则只有这一处、本机与远端共用（`LineSplitter` 会吃掉结尾换行：`'a\nb\n'` ⇒ `['a','b']`，直接
     `join('\n')` 就丢了它；各写一遍必然漂移）。`totalLines` 是**行数**，与是否保留结尾换行无关。
     文件面板 / 编辑器走的是**原始字节**（`FileService._contentJson` + `writeContent`），不受这条影响。
+18. **SSH 有两条并列后端，选路由核心做，本包只提供实现**（2026-10-10 新增）：
+    - 内置 `DartSshTransport`（dartssh2 + SFTP/exec）——**原样保留**，`tunnel_*` 一条都不碰它；
+    - `TunnelSshTransport`（经 `ssh_executor` 插件 → 目标机 `tree_agent`）——把 `SshTransport`
+      的每个方法映射成一次 JSON-RPC（分块读写是**拉模型**：`readStream` 循环发 `fs.read`，
+      天然有背压、重连后不需要"续流"状态机）。
+    `SshWorkspaceIO` **一行不改**：它面向 `SshTransport` 写的，因此两个后端自动同语义。
+    协议常量一律取自 `tree_tunnel_protocol`（手写方法名字符串必然漂移，而漂移只在真机上暴露）。
+19. **中转站判死 ⇒ 核心撤换缓存，绝不让死链路被一直用下去**：
+    `TunnelSshTransport` 在隧道 `tunnel_down`（退避耗尽）时把 `tunnelDown` 置真；
+    `WorkspaceToolRunner._ioFor` 看到 `FallbackableWorkspace.tunnelDown` 就**丢掉 `_ios` 缓存**
+    并重新解析（于是走内置 dartssh2）。这条是"降级只发生在有没有中转站这一维"的兑现 ——
+    少了它，缓存里那条死隧道会一直吃下所有工具调用。
+    判死判据仍只看心跳（与不变量 6 同口径）；`_SshLiveness` 的 `onStale` 挂载点与
+    `DartSshTransport` 完全一致（只是重连动作变成 `tunnel.reconnect`）。
+20. **后台执行两条实现、语义一致、能力差异如实**（见 [lib/src/tunnel_background.dart](lib/src/tunnel_background.dart)）：
+    - **有 `TunnelBackgroundExec` 能力**（中转站）⇒ 子进程由目标机 agent 托管：
+      `setsid` 脱离会话、输出直写**工作空间内**日志、退出码与台账**落目标机磁盘**，
+      重连/重启后 `exec.list` 对账；`startBackground` 因此**不再需要 `nohup` 形状**；
+    - **没有该能力**（内置 dartssh2）⇒ 原样走既有 `setsid nohup` + 本机 3s 哨兵轮询；
+    - 托管路径下**链路失活不让 `exitCode` 失败**，而是继续等（真相在目标机磁盘上，
+      重连后一次 `exec.query` 就能拿回）——这是相对 `nohup` 方案的一处**语义改进**，
+      也是"跨日级稳定性"的来源；`nohup` 方案保持原口径（失活 ⇒ 显式失败）。
+    - 两条路都**不许假装知道远端状态**：台账里没有 ⇒ 不重跑、`killed:false`、`goneExitCode`。
 
 ## 测试
 
@@ -185,5 +211,14 @@ M11 新增钉子：`git_output_test` 的 `parseStatus` 组（`-z`、空格 / 中
 ——否则全根 grep 在真实共享工作空间上 2 分钟都扫不完、`matches.single` 也不成立）、软超时交还远端命令、
 **`startBackground` 立即返回**（返回耗时与命令时长无关：命令跑 8s 而返回 < 4s；返回时命令仍在跑，
 随后拿得到退出码与产物））、
+`tunnel_ssh_transport_test`（**中转站传输层**，用假 `TunnelLink`/`TunnelSession`：16 个文件原语的映射、
+**超过一块的读写自动分块 append**、`readStream` 的 offset/length、缺失文件给可读异常、
+PTY 不可用 ⇒ `PtyUnsupportedException`（不静默降级）、`shell.data`/`shell.exit` 通知 ⇒ 通道输出与
+**退出码一定收口**、`close` 幂等给 -1、心跳一拍 ⇒ 判活、隧道 `down` ⇒ `tunnelDown` + `fallbackReason`、
+在途请求以 `SshLinkStaleException` 显式失败（**不重放**）、`reconnect` 单飞）、
+`tunnel_background_test`（**后台执行的两条路**：有托管能力 ⇒ 走 `exec.spawn` 且命令里**不出现** `nohup`；
+`exitCode` 从台账收尾（`running → exited` / `gone` ⇒ 可辨码）；**断链不失败而是继续等**；
+`attachBackground` 只给日志路径就能对账且**不重跑**；`cancel` 走 `exec.kill`、台账里没有 ⇒ 如实 false；
+没有能力 ⇒ 形状仍是 `setsid nohup … echo $!`）、
 真链路的 SSH 会话通道没有在本仓库验证过（本机无 sshd），只保证编译通过与参数形状有据可依——见
 [../../docs/known-issues.md](../../docs/known-issues.md) #12。

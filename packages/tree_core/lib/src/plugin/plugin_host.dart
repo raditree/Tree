@@ -239,6 +239,20 @@ class PluginHost {
         .toList(growable: false);
   }
 
+  /// 向插件发一次**自有方法**请求（既不是站点，也不是 `tools/call`）。
+  ///
+  /// 目前只有 SSH 中转站（`ssh_executor`）的 `tunnel.*` 走这条路 —— 执行器是一条
+  /// **通道**，不是"点位"，因此刻意不进站点体系（见 `docs/ssh-tunnel-protocol.md` §2）。
+  ///
+  /// **无静态总时长上限**（M9 §1.1 同一口径）：不开 [timeout] 就一直等，
+  /// 只有插件进程退出 / 通道断开（[_failPending]、[_markChannelDead]）才让在途请求
+  /// 以可读错误显式失败。这正是"远端命令跑多久都等"能成立的前提。
+  Future<Map<String, dynamic>> requestMethod(
+    String method,
+    Map<String, dynamic> params, {
+    Duration? timeout,
+  }) => _request(method, params, timeout: timeout);
+
   /// 调用插件工具；失败返回**可读结果**（不抛异常，工具层直接用）。
   ///
   /// **无静态总时长上限**（M9 §1.1）：插件跑多久都等；只有插件进程退出 / 输出流

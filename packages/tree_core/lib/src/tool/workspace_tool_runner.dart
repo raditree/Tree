@@ -677,7 +677,26 @@ class WorkspaceToolRunner implements ToolRunner {
     // 因此不会留下 `sub_*` 目录，它读到的系统提示词文件与发起者是同一份。
     final String ownerId = subagentService?.privateOwnerOf(agentId) ?? agentId;
     final WorkspaceIO? cached = _ios[ownerId];
-    if (cached != null) return cached;
+    if (cached != null) {
+      // **中转站判死 ⇒ 撤换缓存**（`FallbackableWorkspace`）：插件退避耗尽之后，
+      // 那条隧道不会再自愈，留着它只会让每条工具调用都撞同一面墙；撤换之后下一次
+      // 解析会走内置 dartssh2 —— 这既是"降级只发生在有没有中转站这一维"的兑现，
+      // 也保证了降级是**用户可感知的**（有日志、右栏也有错误面）。
+      //
+      // 显式 `as`：`FallbackableWorkspace` 不是 `WorkspaceIO` 的子类型，提升不成立
+      // （与 `reconnectSshLink` 里的 `ReconnectableWorkspace` 同一写法）。
+      if (cached is FallbackableWorkspace) {
+        final FallbackableWorkspace fallback = cached as FallbackableWorkspace;
+        if (!fallback.tunnelDown) return cached;
+        _ios.remove(ownerId);
+        log?.call(
+          'agent $ownerId 的中转站已判死（${fallback.fallbackReason}）'
+          '⇒ 撤换工作空间缓存，本次改用内置 SSH 后端',
+        );
+      } else {
+        return cached;
+      }
+    }
 
     final SshConfig? ssh = resolveSshConfig?.call(ownerId);
     if (ssh != null) {

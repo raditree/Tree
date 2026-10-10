@@ -15,6 +15,10 @@ dependencies:
   # 装配工作空间后端（本地 / SSH，含 dartssh2 传输）
   tree_local_exec:
     path: ../tree_local_exec
+  # SSH 执行器「中转站」协议的共享常量（`kAgentVersion`：核心告诉插件"我要哪个
+  # 版本的 tree_agent"）
+  tree_tunnel_protocol:
+    path: ../tree_tunnel_protocol
 
 dev_dependencies:
   lints: ^6.0.0

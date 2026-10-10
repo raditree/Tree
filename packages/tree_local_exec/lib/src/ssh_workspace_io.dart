@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
+import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart'
+    show BackgroundStates;
 
 import 'ansi_code_page.dart';
 import 'background_exec.dart';
@@ -11,6 +13,7 @@ import 'local_workspace_io.dart';
 import 'ssh_liveness.dart';
 import 'ssh_login_shell.dart';
 import 'ssh_shell_channel.dart';
+import 'tunnel_background.dart';
 import 'workspace_io.dart';
 
 /// SSH 传输抽象：把"远端文件系统 + 远端命令执行"压成 6 个方法。
@@ -1047,6 +1050,24 @@ class SshWorkspaceIO
     final String trimmed = command.trim();
     if (trimmed.isEmpty) throw WorkspaceIoException('command 不能为空');
     final String logAbsolute = resolve(logRelativePath);
+    // **优先后台托管**（中转站路径）：进程与退出码都不依赖本机 SSH 轮询 ——
+    // 通道断、核心崩、应用退都不影响它，重连后靠目标机落盘台账对账。
+    // 内置 dartssh2 回退路径没有这个能力（`is` 为假）⇒ 原样走下面的 nohup。
+    final TunnelBackgroundExec? managed = _tunnelBackground;
+    if (managed != null) {
+      final TunnelBackgroundStart started = await _link.guard(
+        () => managed.spawnBackground(
+          command: trimmed,
+          logAbsolutePath: logAbsolute,
+        ),
+      );
+      return _TunnelBackgroundExec(
+        tunnel: managed,
+        logAbsolute: started.logPath.isEmpty ? logAbsolute : started.logPath,
+        id: started.id,
+        remotePid: started.pid,
+      );
+    }
     final String markerAbsolute = resolve(
       exitMarkerRelativePath(logRelativePath),
     );
@@ -1097,12 +1118,35 @@ class SshWorkspaceIO
     // **不重跑、不新起**：远端那条命令照常在跑，这里只是重新挂上"等它结束"的那条路
     // （哨兵轮询）。首次探测在 [BackgroundExecHandle.exitCode] 被取用时立刻发生，
     // 因此"重启时它其实已经跑完"这种情况会马上收尾。
+    final String logAbsolute = resolve(logRelativePath);
+    final TunnelBackgroundExec? managed = _tunnelBackground;
+    if (managed != null) {
+      // 托管路径：连 `id` 都不用记 —— 台账在**目标机磁盘**上，按日志路径对账即可
+      // （这正是"跨日稳定"的关键：接续靠目标机的事实，不靠本机记得多少）。
+      return _TunnelBackgroundExec(
+        tunnel: managed,
+        logAbsolute: logAbsolute,
+        remotePid: pid,
+      );
+    }
     return _SshBackgroundExec(
       host: this,
-      logAbsolute: resolve(logRelativePath),
+      logAbsolute: logAbsolute,
       markerAbsolute: resolve(exitMarkerRelativePath(logRelativePath)),
       remotePid: pid,
     );
+  }
+
+  /// 这条链路能不能**托管**后台进程（只有中转站后端能）。
+  ///
+  /// 内置 dartssh2 后端没有这个能力 ⇒ 返回 null ⇒ 自动走既有的 `nohup` + 哨兵轮询
+  /// （行为与今天完全一致，**没有任何降级**）。
+  TunnelBackgroundExec? get _tunnelBackground {
+    final SshTransport target = _transport;
+    if (target is TunnelBackgroundExec) {
+      return target as TunnelBackgroundExec;
+    }
+    return null;
   }
 
   @override
@@ -1395,5 +1439,142 @@ class _SshBackgroundExec implements BackgroundExecHandle {
       if (value != null) return value;
     }
     return null;
+  }
+}
+
+/// 一条由**目标机 agent 托管**的后台命令句柄（中转站路径）。
+///
+/// 与 [_SshBackgroundExec] 的关键差别 —— 都来自"这次我们**真的知道**远端状态"：
+/// - 退出码来自 agent 的**落盘台账**（`<state>/exit/<id>`），不靠本机轮询 + 猜进程死活；
+/// - **链路失活时 [exitCode] 不失败，而是继续等**：台账在目标机磁盘上，重连后一次
+///   `exec.query` 就能拿回真相。因此这里**不**套用"失活 ⇒ future 抛
+///   `SshLinkStaleException`"那条口径 —— 那条口径属于"本机确实没法知道远端状态"的场景
+///   （`dartssh2` 的一次性 exec 就是），套在这里反而是**假装**自己不知道。
+///   这是本次升级相对 dartssh2 方案的一处**语义改进**；
+/// - [SshWorkspaceIO.attachBackground] 只需要日志路径：agent 按 `log_path` 对账，
+///   本机不必记住 id/pid —— 核心重启后的接续因此不依赖本机残留多少内存态。
+class _TunnelBackgroundExec implements BackgroundExecHandle {
+  _TunnelBackgroundExec({
+    required this.tunnel,
+    required this.logAbsolute,
+    this.id = '',
+    this.remotePid,
+  });
+
+  /// 轮询间隔。托管路径下它只是"结束唤醒的最坏延迟"，**不影响任务本身**
+  /// （任务在目标机跑，退出码也在目标机落盘）。
+  static const Duration pollInterval = Duration(seconds: 3);
+
+  final TunnelBackgroundExec tunnel;
+  final String logAbsolute;
+
+  /// agent 侧托管 id（接续场景下为空，靠 [logAbsolute] 从台账里认出来）。
+  String id;
+
+  int? remotePid;
+
+  final Completer<int> _exit = Completer<int>();
+  Timer? _poll;
+  bool _closed = false;
+
+  @override
+  int? get pid => remotePid;
+
+  @override
+  bool get remote => true;
+
+  @override
+  Future<int> get exitCode {
+    _startPolling();
+    return _exit.future;
+  }
+
+  @override
+  Future<bool> cancel() async {
+    if (id.isEmpty) await _resolveId();
+    // 台账里找不到 ⇒ **如实**说杀不掉（不假装）。
+    if (id.isEmpty) return false;
+    try {
+      return await tunnel.killBackground(id);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  Future<void> close() async {
+    // 托管路径下**只停本机轮询**：目标机上的任务与它的落盘台账照常在，
+    // 由下次启动的接续（按日志路径对账）接管。关应用不该杀掉远端训练/构建。
+    _closed = true;
+    _poll?.cancel();
+    _poll = null;
+  }
+
+  void _startPolling() {
+    if (_poll != null || _closed || _exit.isCompleted) return;
+    // 立刻查一次：接续场景下"重启时它其实已经跑完"要马上收尾，不等第一个间隔。
+    unawaited(_probe());
+    _poll = Timer.periodic(pollInterval, (Timer _) => unawaited(_probe()));
+  }
+
+  /// 按日志绝对路径从 agent 台账里认出这条任务（接续场景的唯一线索）。
+  Future<void> _resolveId() async {
+    if (id.isNotEmpty) return;
+    final List<TunnelBackgroundProc> procs = await tunnel.listBackground();
+    for (final TunnelBackgroundProc proc in procs) {
+      if (proc.logPath != logAbsolute) continue;
+      id = proc.id;
+      remotePid ??= proc.pid;
+      return;
+    }
+  }
+
+  Future<void> _probe() async {
+    if (_exit.isCompleted || _closed) return;
+    try {
+      if (id.isEmpty) {
+        await _resolveId();
+        // 台账里还没有（agent 刚重连 / 还没读到盘）⇒ 下一拍再试，**不猜**。
+        if (id.isEmpty) return;
+      }
+      final TunnelBackgroundProc? proc = await tunnel.queryBackground(id);
+      if (_exit.isCompleted || _closed) return;
+      if (proc == null) {
+        // 台账里记录也查不到了：进程与记录都没了 ⇒ 可辨的 gone（不当正常退出）。
+        _finish(BackgroundExecHandle.goneExitCode);
+        return;
+      }
+      remotePid ??= proc.pid;
+      switch (proc.state) {
+        case BackgroundStates.exited:
+          _finish(proc.exitCode ?? BackgroundExecHandle.goneExitCode);
+        case BackgroundStates.gone:
+          _finish(BackgroundExecHandle.goneExitCode);
+        default:
+          break; // running：继续等
+      }
+    } on SshLinkStaleException {
+      // **刻意不失败**：真相（退出码 / 台账）在目标机磁盘上，并没有丢；
+      // 等隧道重连回来再问一次即可 —— 这正是"跨日稳定"要的行为。
+      return;
+    } catch (error) {
+      _fail(error);
+    }
+  }
+
+  void _finish(int code) {
+    _poll?.cancel();
+    _poll = null;
+    if (!_exit.isCompleted) _exit.complete(code);
+  }
+
+  void _fail(Object error) {
+    _poll?.cancel();
+    _poll = null;
+    if (!_exit.isCompleted) {
+      _exit.completeError(
+        error is Exception ? error : WorkspaceIoException('$error'),
+      );
+    }
   }
 }

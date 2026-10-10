@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart';
+
 import '../agent/agent_engine.dart';
 import '../agent/compaction_service.dart';
 import '../llm/llm_types.dart';
@@ -345,6 +347,71 @@ class PluginBus {
   /// 某插件最近一次失败原因（注册失败 / 调用失败）。
   String? errorOf(String pluginId) => _errors[pluginId];
 
+  /// **SSH 中转站**的通知出口（`tunnel/event`）。
+  ///
+  /// 只有一条路：`sshIoFactory` 选路时建起来的 `PluginTunnelLink` 会挂上它。
+  /// 为 null 时通知被丢弃并记日志 —— PTY 的数据面丢一帧不该把核心搞崩。
+  ///
+  /// 为什么不做成"订阅注册表"：中转站通知的消费者**只有一个**（执行器本身），
+  /// 用一个可写字段就够（与 `log` / `broadcast` 同一范式），少一层生命周期管理。
+  void Function(String pluginId, Map<String, dynamic> params)? onTunnelEvent;
+
+  /// 找**可用的 SSH 中转站**（`ssh_executor` 插件）。
+  ///
+  /// 判据 = **能力**而不是写死 id（与 `docs/ssh-tunnel-protocol.md` §6 同口径）：
+  /// 插件系统总开关开着、该条目 enabled、进程在跑、`hello` 申报了
+  /// `ssh-executor` 能力、且心跳未 degraded。
+  ///
+  /// 返回 `(host, reason)`：`host == null` 时 [reason] 是**可读的"为什么没有"**
+  /// （直接进日志 / 右栏，用户看得懂）；`host != null` 时 reason 为空串。
+  /// 刻意**不抛异常**也不回 null-only：判空失败必须有话可说，否则就是"点了开关没反应"。
+  ({PluginHost? host, String reason}) sshExecutorLookup() {
+    load();
+    if (!enabled) {
+      return (host: null, reason: '插件系统总开关为关（plugins.yaml 顶层 enabled: false）');
+    }
+    bool sawEntry = false;
+    bool sawEnabled = false;
+    for (final PluginConfig config in _configs) {
+      if (config.id != kSshExecutorPluginId) continue;
+      sawEntry = true;
+      if (!config.enabled) continue;
+      sawEnabled = true;
+      final PluginHost? host = _hosts[config.id];
+      if (host == null) {
+        return (
+          host: null,
+          reason: '中转站插件「${config.name.isEmpty ? config.id : config.name}」'
+              '未在运行（${_errors[config.id] ?? '尚未启动'}）',
+        );
+      }
+      if (host.isClosed) {
+        return (
+          host: null,
+          reason: '中转站插件通道已断（${host.channelError ?? '进程已退出'}）',
+        );
+      }
+      if (!host.capabilities.contains(kCapabilitySshExecutor)) {
+        return (
+          host: null,
+          reason: '中转站插件未申报 ssh-executor 能力'
+              '（申报的是：${host.capabilities.isEmpty ? '无' : host.capabilities.join('、')}）',
+        );
+      }
+      if (host.liveness.isStale) {
+        return (host: null, reason: '中转站插件心跳丢失（degraded，可显式重启）');
+      }
+      return (host: host, reason: '');
+    }
+    if (!sawEntry) {
+      return (host: null, reason: '没有内置的 ssh_executor 插件条目（未随包分发？）');
+    }
+    return (
+      host: null,
+      reason: sawEnabled ? '中转站插件不可用' : '中转站插件条目已停用（enabled: false）',
+    );
+  }
+
   /// 某插件的健康度快照（心跳判活；degraded **不等于**死亡）。
   Map<String, dynamic> healthOf(String pluginId) {
     final PluginHost? host = _hosts[pluginId];
@@ -520,6 +587,13 @@ class PluginBus {
     if (method == 'station/stream') {
       // 流式回填的数据面：插件推 delta / done / error（见 [_handleStationStream]）
       _handleStationStream(pluginId, params);
+      return;
+    }
+    if (method == TunnelMethods.event) {
+      // SSH 执行器的**内部数据面**（隧道状态跃迁 / PTY 字节与退出）。
+      // 刻意**不**降级成 `plugin_event` 推给前端：这不是"插件事件"，是核心自己
+      // 选路时建起来的那条隧道的私有通道（前端看隧道状态走执行器自己的错误面）。
+      onTunnelEvent?.call(pluginId, params);
       return;
     }
     if (uiBridge.handles(method)) {

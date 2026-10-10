@@ -65,6 +65,19 @@
 14. 内置插件的"身份"由**核心**认定（前端只拿到 id / 名称 / 说明 / 开关状态）；解析不出运行时必须给可读错误（「未检测到 Python，请先安装或改用自定义命令」）——静默失败在界面上表现为"点了开关没反应"。
 15. 执行站挂载位置的依赖**没接线时不做静默降级**：以「未接线」的可读原因失败。
 16. 代理归属校验与订阅可见性**两处都按 team fail-closed**；插件要订阅站点就必须声明 `scope.team_id`，因此事件与命令的 `team_id` 一律取 agent 的**有效团队归属**（顶层 agent 自成一队，取它自己的 id），不能只读 `agent.teamId`（那会让顶层 agent 的事件永远带空 team，声明了 team 的插件反而收不到自己的事件，计数静默归零）。
+17. **SSH 执行器走的是「自有方法」而不是站点**（2026-10-10 新增）：
+    - `PluginBus.sshExecutorLookup()` 按**能力**（`hello.capabilities` 含 `ssh-executor`）而不是写死 id 找中转站，
+      并要求总开关开、条目 enabled、进程在跑、心跳未 degraded；**返回可读的 reason**（"为什么没有"必须说得出话）；
+    - 核心 → 插件用 `PluginHost.requestMethod`（新加的公开入口，包一层既有 `_request`）——
+      **不开静态超时**（不开 `timeout` 就一直等，只有进程退出 / 通道断才失败），
+      这正是"远端命令跑多久都等"能成立的前提；
+    - 插件 → 核心的 `tunnel/event` 通知**不降级成 `plugin_event`**（不是"插件事件"，是执行器的私有数据面），
+      经 `PluginBus.onTunnelEvent` 直接交给 `PluginTunnelLink` 按 `conn_id` 分发给对应会话；
+    - **不进 17 个点位**：执行器是一条**通道**，没有 `team_id/agent_id/session_id/mode_key` 这层语义，
+      也不申报工具（`tools/list` 恒为空），因此不受站点隔离矩阵约束；
+    - 内置目录加 `kind: python|binary`：binary 型**不做运行时探测**，
+      直接解析可执行文件同级的 `plugins/<name>[.exe]`（`build/plugins/` 是开发态落点）；
+    - `defaultEnabled` 的播种**只处理"从来没落盘过这一条"**：用户显式关过就绝不再自动打开。
 
 ## 测试
 
@@ -80,5 +93,10 @@ dart test test/plugin_test.dart test/plugin_request_test.dart test/plugin_statio
           test/builtin_plugin_script_roots_test.dart test/plugin_llm_relay_test.dart \
           test/compact_plugin_e2e_test.dart test/sample_plugin_layout_e2e_test.dart
 ```
+
+SSH 执行器那条路（`sshExecutorLookup` / `tunnel/event` 分流 / `kind: binary` 解析与默认播种）
+的用例在 `test/builtin_plugin_script_roots_test.dart` 与 `test/plugin_test.dart` 里；
+端到端（真 sshd）见 [docs/ssh-tunnel-protocol.md](../../../../../docs/ssh-tunnel-protocol.md) 与
+`tool/tunnel_e2e.dart`。
 
 点位清单与四类站的语义另见 [docs/plugin-development.md](../../../../../docs/plugin-development.md)。

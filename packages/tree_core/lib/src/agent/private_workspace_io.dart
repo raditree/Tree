@@ -85,7 +85,8 @@ class PrivateWorkspaceIO
         WorkspaceIO,
         WorkspaceFiles,
         BackgroundExecHost,
-        ReconnectableWorkspace {
+        ReconnectableWorkspace,
+        FallbackableWorkspace {
   PrivateWorkspaceIO(this.inner, this.agentId);
 
   final WorkspaceIO inner;
@@ -126,6 +127,27 @@ class PrivateWorkspaceIO
     }
     await link.reconnectLink();
   }
+
+  // ── 中转站判死（FallbackableWorkspace）：**透传**给内层 ──────────────────
+  //
+  // 核心 `_ioFor` 拿到的是这个装饰器，所以"中转站已判死、该换回内置实现"这件事
+  // 必须能穿过去（否则缓存里那条死隧道会被一直用下去 —— 那就等于把
+  // "降级只发生在有没有中转站这一维"这条红线悄悄破了）。
+
+  /// 内层的"可回退"能力（本机后端 / dartssh2 后端都没有 ⇒ null）。
+  FallbackableWorkspace? get _fallbackable {
+    final WorkspaceIO target = inner;
+    if (target is FallbackableWorkspace) {
+      return target as FallbackableWorkspace;
+    }
+    return null;
+  }
+
+  @override
+  bool get tunnelDown => _fallbackable?.tunnelDown ?? false;
+
+  @override
+  String get fallbackReason => _fallbackable?.fallbackReason ?? '';
 
   /// 文件面板那一层接口（只有 SSH 后端同时实现两个接口；本机后端走 dart:io，
   /// 不经过这里）。缺支持时显式报错，不静默假装成功。

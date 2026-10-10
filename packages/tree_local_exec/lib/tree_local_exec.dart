@@ -21,6 +21,9 @@ export 'src/ssh_reconnect.dart';
 export 'src/ssh_shell_channel.dart';
 export 'src/ssh_workspace_io.dart';
 export 'src/shell.dart';
+export 'src/tunnel_background.dart';
+export 'src/tunnel_link.dart';
+export 'src/tunnel_ssh_transport.dart';
 export 'src/windows_environment.dart';
 export 'src/workspace_io.dart';
 

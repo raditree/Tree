@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:tree_core/tree_core.dart';
 import 'package:tree_local_exec/tree_local_exec.dart';
+import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart';
 
 /// 核心进程入口（`dart compile exe` → `tree_core.exe`）。
 ///
@@ -250,6 +251,20 @@ Future<void> main(List<String> args) async {
     settings: settings,
     log: coreLog.forPrefix('core:subagent'),
   );
+
+  // SSH 执行器的**选路器**：优先「中转站」（`ssh_executor` 插件 → 目标机 `tree_agent`），
+  // 否则回退内置 dartssh2。红线见 docs/ssh-tunnel-protocol.md §0：
+  //  1. 降级**只发生在"有没有中转站"这一维**，且**永远明示**（日志，右栏另有错误面）；
+  //  2. **绝不静默回退再撞一遍**：同一维里"插件在"就是走它，错误如实暴露；
+  //  3. **绝不落到 local**（那会把远端工作空间悄悄变成本机目录）。
+  //
+  // 为什么接缝在这里：`WorkspaceIO` 是所有消费方（模型工具、执行站、文件面板、
+  // PTY、视觉上传、活动日志、Spec、系统提示词）的唯一入口 —— 换后端因此只需一处。
+  final PluginTunnelLink tunnelLink = PluginTunnelLink(
+    plugins,
+    coreLog.forPrefix('core:tunnel'),
+  );
+
   final WorkspaceToolRunner tools = WorkspaceToolRunner(
     todoStore: todos,
     askQuestion: questions.ask,
@@ -273,9 +288,56 @@ Future<void> main(List<String> args) async {
       if (agent == null) return null;
       return teamSshConfigFor(agent, store.agent);
     },
-    // SSH 后端（dartssh2 + SFTP/exec）：每个 agent 一条连接，按需建立并缓存；
-    // 远端根目录取 ssh.root（空 = 远端登录用户的 HOME）。
+    // SSH 后端：**优先走「中转站」**（`ssh_executor` 插件 → 目标机 `tree_agent`），
+    // 插件缺失 / 未启用 / 起不来 / 这条隧道建不起来 / 退避耗尽 ⇒ 回退内置 `dartssh2`。
+    // 每 agent 一条连接，按需建立并缓存；远端根目录取 ssh.root（空 = 远端 HOME）。
     sshIoFactory: (SshConfig config) async {
+      final ({PluginHost? host, String reason}) lookup = plugins
+          .sshExecutorLookup();
+      if (lookup.host != null) {
+        try {
+          final TunnelSshTransport transport = await TunnelSshTransport.connect(
+            tunnelLink,
+            TunnelConnectRequest(
+              host: config.host,
+              port: config.port,
+              username: config.username,
+              password: config.password,
+              keyPath: config.resolvedKeyPath(),
+              keyPassphrase: config.keyPassphrase,
+              root: config.root,
+              loginShell: config.loginShell,
+              // 版本由核心说（"我要哪个 agent"），sha256 与二进制位置归插件自解析
+              // （只有插件知道自己的随包 `agents/` 在哪）。
+              agentVersion: kAgentVersion,
+              heartbeatInterval: settings.heartbeatInterval,
+              maxMissedHeartbeats: settings.missedHeartbeatLimit,
+            ),
+            log: coreLog.forPrefix('core:tunnel'),
+          );
+          coreLog.write(
+            '[core:tool] SSH 经中转站连接 ${config.redacted()} root=${transport.root}',
+          );
+          return SshWorkspaceIO(transport.root, transport);
+        } on TunnelUnavailableException catch (error) {
+          if (!error.shouldFallback) {
+            // 例如 config_incomplete：回退内置也一样连不上 ⇒ **如实报错，不假装**。
+            coreLog.write(
+              '[core:tool] 中转站拒绝这条连接（${error.kind}：${error.message}）——'
+              '该错误回退内置也无解，已如实上抛',
+            );
+            rethrow;
+          }
+          coreLog.write(
+            '[core:tool] 中转站不可用（${error.kind}：${error.message}）'
+            '⇒ 回退内置 dartssh2（${config.redacted()}）',
+          );
+        }
+      } else {
+        coreLog.write(
+          '[core:tool] 无 SSH 中转站（${lookup.reason}）⇒ 使用内置 dartssh2',
+        );
+      }
       // 心跳判活参数（M9 1.1）在**每次建连时**从设置现读：SSH 的 SshLiveness 归
       // 这条连接所有，所以设置一改，下一条（重）建的连接就用新值——不必重启核心。
       final DartSshTransport transport = await DartSshTransport.connect(
@@ -650,7 +712,29 @@ Future<void> _warmUpPeripheralsAfterHandshake(
     await warmUpPeripherals(
       <WarmUpTask>[
         (name: 'MCP 服务', run: () => mcp.refresh()),
-        (name: '插件', run: () => plugins.start()),
+        (
+          name: '插件',
+          run: () async {
+            // 「默认开」的内置插件（目前只有 `ssh_executor` 中转站）在**首次随包出现**
+            // 时播种一条 enabled: true —— 用户显式关过就绝不再自动打开（见
+            // [seedDefaultEnabledBuiltins]）。必须排在 `plugins.start()` 之前：
+            // start 会做一次配置对账，播种晚了对账就看不到这条。
+            try {
+              final List<String> seeded = await seedDefaultEnabledBuiltins(
+                catalog: BuiltinPluginCatalog(),
+                store: PluginConfigStore(plugins.configFile),
+                log: log,
+              );
+              if (seeded.isNotEmpty) {
+                log('已播种默认开启的内置插件：${seeded.join('、')}');
+              }
+            } catch (error) {
+              // 播种失败不该拦住插件系统启动（最坏就是中转站没默认开）。
+              log('播种默认内置插件失败（已忽略）：$error');
+            }
+            await plugins.start();
+          },
+        ),
       ],
       budget: const Duration(seconds: 3),
       log: log,

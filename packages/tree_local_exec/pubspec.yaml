@@ -12,6 +12,10 @@ dependencies:
   # SSH/SFTP 客户端（纯 Dart，桌面可用）；密钥与口令都在进程内处理，
   # 因此不依赖系统 ssh 客户端，也支持口令认证
   dartssh2: ^4.1.0
+  # SSH 执行器「中转站」协议的共享定义（方法名 / 错误码 / 帧编解码 / 版本常量）：
+  # TunnelSshTransport 用它发 L1 请求，绝不手写方法名字符串（手写必然漂移）
+  tree_tunnel_protocol:
+    path: ../tree_tunnel_protocol
 
 dev_dependencies:
   lints: ^6.0.0
