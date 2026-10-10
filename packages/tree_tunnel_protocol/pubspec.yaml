@@ -1,0 +1,20 @@
+name: tree_tunnel_protocol
+description: SSH 执行器「中转站」协议的共享定义（core ⇄ 插件 ⇄ tree_agent）：方法名、错误码、帧编解码、版本常量。
+# 纯 Dart 包：不得依赖 Flutter / 不得依赖 dartssh2；
+# 它是 tree_agent（目标机二进制）、tree_ssh_plugin（中转站）、tree_local_exec（核心传输层）
+# 三方共用的唯一真源，只允许放"常量 + 纯函数"，不许放任何 IO 或平台相关代码。
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.13.0
+
+# 刻意**零运行时依赖**（连 package:path 都不要）：本包要同时被目标机二进制
+# （tree_agent，越小越静态越好）与中转站（tree_ssh_plugin）依赖，
+# 路径归一化因此手写一份最小实现（见 src/constants.dart 的 normalizePosixPath）。
+dependencies:
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.0
+
