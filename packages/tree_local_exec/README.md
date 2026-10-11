@@ -189,10 +189,14 @@
     `reset()` 时各触发一次）通知核心去 `restorePending(agentId:)` **认领回来**，
     按哨兵文件继续对账、拿到**真实**退出码后再投一次完成提醒并清台账。
     挂点经 `ReconnectableWorkspace.linkLiveness` 暴露（`PrivateWorkspaceIO` 透传）。
-22. **"判死"只有两个来源，请求级失败一律不判死（2026-10-11 修，用户口径）**：
+22. **"判死"只有两个来源，请求级失败一律不判死（2026-10-11 修，用户口径；同日精确化）**：
     - 心跳快照说 `down`（插件自标：退避耗尽 / 不可调和）；
-    - 插件**进程已不可用**（`TunnelSession.pluginAvailable` 实时查询 `PluginBus` 得 false）——
-      这是本地事实，按红线 1 判死并回退内置（明示）。
+    - **这条会话绑定的那个插件实例已不可用**（`TunnelSession.boundHostAlive == false`；兜底再查
+      `pluginAvailable`，即 `PluginBus` 的实时查询）——这是本地事实，按红线 1 判死并回退内置（明示）。
+      ⚠ 判据必须是"**我绑的那个实例**还在不在"：插件停用又启用（或崩溃后被重拉）会**换一个进程实例**，
+      旧会话绑的是旧实例（通道已关）而"当前"有新实例 ⇒ 只看 `pluginAvailable` 会判成"插件在 ⇒ 不判死"
+      ⇒ 这条死链路被 `_ioFor` 永久缓存、重建不了（2026-10-11 真机：每 10 秒一条
+      `心跳失败：插件 ssh_executor 的输出流已关闭`，而且"重启插件也没用"）。
     此外**任何**请求级失败都不许判死，尤其 `error_kind: tunnel_not_ready`（插件还没好：
     `connecting`/`booting`/`reconnecting`）：那只是"重连中"，此时**前台操作等隧道回来**
     （`TunnelSshTransport._awaitTunnelReadyElseFail`：轮询 `tunnel.state`，回到 `ready` 就**重发**

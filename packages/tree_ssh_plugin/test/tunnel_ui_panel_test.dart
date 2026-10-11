@@ -286,16 +286,58 @@ void main() {
       expiry.fire();
       expect(panel.pendingClose, isNull);
       expect(manager.byId(conn), isNotNull, reason: '过期只是取消确认，不许顺手关掉');
-      expect(jsonEncode(updateFrames().last), isNot(contains('确认关闭')));
+      // 「过期」也要在面板上有反馈（口径：动作结果一律当行显示）。
+      expect(panel.lastActionNote, contains('已过期'));
     });
 
-    test('未知 action_id / 缺 conn_id ⇒ 只记日志，不抛、不改视图（fail-open）', () async {
+    test('未知 action_id / 缺 conn_id ⇒ 不抛不崩，且**面板上看得到**（fail-open + 反馈可见）', () async {
       final int framesBefore = sent.length;
       await panel.handleAction(<String, dynamic>{'action_id': 'nope'});
+      expect(
+        sent.length,
+        greaterThan(framesBefore),
+        reason: '失败也要刷新一帧 —— 只写 stderr 等于用户什么都看不到（2026-10-11 真机反馈）',
+      );
+      expect(jsonEncode(updateFrames().last), contains('未知的面板动作'));
       await panel.handleAction(<String, dynamic>{'action_id': kUiActionClose});
+      expect(jsonEncode(updateFrames().last), contains('没带上 conn_id'));
       await panel.handleAction(<String, dynamic>{'action_id': kUiActionReconnect});
-      expect(sent.length, framesBefore);
+      expect(jsonEncode(updateFrames().last), contains('没带上 conn_id'));
       expect(logs, isNotEmpty);
+      expect(panel.pendingClose, isNull, reason: '缺 conn_id 不许进入确认态');
+    });
+
+    test('关闭成功后：面板上留一行说明（核心下次使用这个工作空间时会重建）', () async {
+      final String conn = await openTunnel();
+      await panel.handleAction(<String, dynamic>{
+        'action_id': kUiActionClose,
+        'payload': <String, dynamic>{'conn_id': conn},
+      });
+      await panel.handleAction(<String, dynamic>{
+        'action_id': kUiActionClose,
+        'payload': <String, dynamic>{'conn_id': conn},
+      });
+      final String text = jsonEncode(updateFrames().last);
+      expect(text, contains('已关闭 $conn'));
+      expect(text, contains('下次使用'));
+      expect(panel.lastActionNote, contains('已关闭'));
+    });
+
+    test('重连一条已被关闭的隧道 ⇒ 失败原因当行显示（不再"点了没反应"）', () async {
+      final String conn = await openTunnel();
+      for (int i = 0; i < 2; i++) {
+        await panel.handleAction(<String, dynamic>{
+          'action_id': kUiActionClose,
+          'payload': <String, dynamic>{'conn_id': conn},
+        });
+      }
+      await panel.handleAction(<String, dynamic>{
+        'action_id': kUiActionReconnect,
+        'payload': <String, dynamic>{'conn_id': conn},
+      });
+      final String text = jsonEncode(updateFrames().last);
+      expect(text, contains('未成功'));
+      expect(text, contains(conn));
     });
   });
 

@@ -34,6 +34,13 @@ class FakeTunnelSession implements TunnelSession {
   @override
   bool pluginAvailable = true;
 
+  /// **这条会话绑定的那个插件实例**是否还在（插件重启换了实例 ⇒ false）。
+  ///
+  /// 与 [pluginAvailable] 的分工见 `TunnelSession.boundHostAlive` 的 dartdoc
+  /// （只看 pluginAvailable 就是 2026-10-11 那个"重启插件后回不来"的 bug）。
+  @override
+  bool boundHostAlive = true;
+
   @override
   String unavailableReason = '插件已停';
 
@@ -564,6 +571,43 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 120));
       expect(t.tunnelDown, isTrue);
       expect(t.fallbackReason, contains('插件'));
+      await t.close();
+    });
+
+    test('插件**换了实例**（绑定的通道已断、但插件整体还在）⇒ 也要判死', () async {
+      // 2026-10-11 真机 bug 的正面复现：插件停用又启用 ⇒ 新实例在跑（pluginAvailable = true），
+      // 而这条会话绑的是**旧实例**（通道已关）。老判据只看 pluginAvailable ⇒ 永不判死 ⇒
+      // 核心缓存里那条死链路被永久使用（真机日志每 10 秒一条"心跳失败：输出流已关闭"，
+      // 而且"重启插件也没用"——用户原话）。
+      final FakeTunnelSession session = FakeTunnelSession()
+        ..boundHostAlive = false
+        ..pluginAvailable = true
+        ..snapshotError = WorkspaceIoException('插件 ssh_executor 的输出流已关闭');
+      final TunnelSshTransport t = await TunnelSshTransport.connect(
+        FakeTunnelLink(session),
+        request(),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      expect(
+        t.tunnelDown,
+        isTrue,
+        reason: '绑定的实例没了 ⇒ 必须判死，核心才会撤换缓存并在下次解析重建',
+      );
+      expect(t.fallbackReason, contains('实例'));
+      await t.close();
+    });
+
+    test('实例还在、只是这条隧道拉不到状态 ⇒ **不判死**（等它回来）', () async {
+      final FakeTunnelSession session = FakeTunnelSession()
+        ..boundHostAlive = true
+        ..pluginAvailable = true
+        ..snapshotError = WorkspaceIoException('网络抖动');
+      final TunnelSshTransport t = await TunnelSshTransport.connect(
+        FakeTunnelLink(session),
+        request(),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      expect(t.tunnelDown, isFalse, reason: '抖动不判死（用户 2026-10-11 口径，不许回退）');
       await t.close();
     });
 

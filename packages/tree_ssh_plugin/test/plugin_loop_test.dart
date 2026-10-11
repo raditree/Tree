@@ -33,6 +33,13 @@ class Harness {
   final List<Map<String, dynamic>> frames = <Map<String, dynamic>>[];
   final List<String> logs = <String>[];
 
+  /// 最近一次 `tunnel.ensure` 回的 `conn_id`。
+  ///
+  /// 用例**不该**硬编码 `conn-1`：`conn_id` 现在带**进程内随机前缀**
+  /// （`conn-<rand4>-<seq>`），正是为了让"插件重启后序号重来"不再撞名
+  /// （见 `TunnelManager._create` 的注释）。
+  String? lastConnId;
+
   /// 发一条**请求**并等回包落进 [frames]。
   Future<void> request(
     int id,
@@ -41,6 +48,10 @@ class Harness {
   ]) async {
     input.add(encodeFrame(rpcRequest(id, method, params)));
     await pump(10);
+    if (method == TunnelMethods.ensure) {
+      final Object? conn = resultOf(id)['conn_id'];
+      if (conn is String && conn.isNotEmpty) lastConnId = conn;
+    }
   }
 
   /// 发一条**通知**（无 id）。
@@ -124,7 +135,7 @@ void main() {
       });
       final Map<String, dynamic> result = harness.resultOf(10);
       expect(result['ok'], isTrue);
-      expect(result['conn_id'], 'conn-1');
+      expect(result['conn_id'], matches(RegExp(r'^conn-[0-9a-z]{4}-1$')));
       expect(result['root'], '/home/tester');
       expect(result['agent']['version'], '1.2.3');
       expect(harness.remote.dials, 1);
@@ -137,8 +148,8 @@ void main() {
       await harness.request(12, TunnelMethods.ensure, <String, dynamic>{
         'config': configJson(password: '另一个口令'),
       });
-      expect(harness.resultOf(11)['conn_id'], 'conn-1');
-      expect(harness.resultOf(12)['conn_id'], 'conn-1');
+      expect(harness.resultOf(11)['conn_id'], harness.lastConnId);
+      expect(harness.resultOf(12)['conn_id'], harness.lastConnId);
       expect(harness.remote.dials, 1);
       expect(harness.remote.spawned.length, 1);
     });
@@ -156,15 +167,14 @@ void main() {
       await harness.request(16, TunnelMethods.ensure, <String, dynamic>{
         'config': configJson(loginShell: ''),
       });
-      expect(
-        <Object?>[
-          harness.resultOf(13)['conn_id'],
-          harness.resultOf(14)['conn_id'],
-          harness.resultOf(15)['conn_id'],
-          harness.resultOf(16)['conn_id'],
-        ],
-        <Object?>['conn-1', 'conn-2', 'conn-3', 'conn-4'],
-      );
+      final List<String> ids = <String>[
+        for (final int id in <int>[13, 14, 15, 16])
+          harness.resultOf(id)['conn_id'].toString(),
+      ];
+      expect(ids.toSet().length, 4, reason: '不同 key ⇒ 不同 conn_id');
+      for (final String id in ids) {
+        expect(id, matches(RegExp(r'^conn-[0-9a-z]{4}-\d+$')));
+      }
       expect(harness.remote.dials, 4);
     });
 
@@ -222,7 +232,7 @@ void main() {
       expect((all.single as Map<String, dynamic>)['host'], '10.0.0.1');
 
       await harness.request(23, TunnelMethods.state, <String, dynamic>{
-        'conn_id': 'conn-1',
+        'conn_id': harness.lastConnId!,
       });
       expect((harness.resultOf(23)['tunnels'] as List<dynamic>).length, 1);
 
@@ -252,7 +262,7 @@ void main() {
           (String method, Map<String, dynamic> params) =>
               <String, dynamic>{'seen': method};
       await harness.request(31, TunnelMethods.request, <String, dynamic>{
-        'conn_id': 'conn-1',
+        'conn_id': harness.lastConnId!,
         'method': AgentMethods.fsStat,
         'params': <String, dynamic>{'path': '/a'},
       });
@@ -273,7 +283,7 @@ void main() {
 
     test('缺 method ⇒ -32602（参数非法，不静默）', () async {
       await harness.request(33, TunnelMethods.request, <String, dynamic>{
-        'conn_id': 'conn-1',
+        'conn_id': 'conn-any',
       });
       expect(harness.errorOf(33)!['code'], RpcCodes.invalidParams);
     });
@@ -287,8 +297,10 @@ void main() {
         'config': configJson(),
       });
       expect(harness.resultOf(40)['error_kind'], TunnelErrorKinds.agentUnreachable);
+      // ensure 失败时核心拿不到 conn_id，但隧道对象已经建在台账里 ⇒ 从台账取（用例只关心形状）。
+      final String conn = harness.loop.manager.tunnels.single.connId;
       await harness.request(41, TunnelMethods.reconnect, <String, dynamic>{
-        'conn_id': 'conn-1',
+        'conn_id': conn,
       });
       final Map<String, dynamic> result = harness.resultOf(41);
       expect(result['ok'], isTrue);
@@ -307,14 +319,14 @@ void main() {
         'config': configJson(),
       });
       await harness.request(44, TunnelMethods.close, <String, dynamic>{
-        'conn_id': 'conn-1',
+        'conn_id': harness.lastConnId!,
       });
       expect(harness.resultOf(44)['ok'], isTrue);
       expect(harness.remote.closed, 1);
       await harness.request(45, TunnelMethods.state);
       expect(harness.resultOf(45)['tunnels'], isEmpty);
       await harness.request(46, TunnelMethods.close, <String, dynamic>{
-        'conn_id': 'conn-1',
+        'conn_id': harness.lastConnId!,
       });
       expect(harness.resultOf(46)['ok'], isTrue);
     });
@@ -370,7 +382,7 @@ void main() {
           .toList(growable: false);
       expect(events, isNotEmpty);
       expect(events.first['params']['kind'], TunnelEventKind.state);
-      expect(events.first['params']['conn_id'], 'conn-1');
+      expect(events.first['params']['conn_id'], harness.lastConnId);
       expect(events.last['params']['state'], TunnelStates.ready);
     });
   });

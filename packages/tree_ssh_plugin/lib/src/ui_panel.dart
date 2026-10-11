@@ -104,8 +104,14 @@ class TunnelUiPanel {
   String? _pendingClose;
   DelayTimer? _confirmTimer;
 
+  /// **上一次面板动作的结果**（一行；失败与成功都要看得见 —— 只写 stderr 等于没反馈）。
+  String _lastActionNote = '';
+
   /// 待确认关闭的隧道 id（诊断 / 测试用）。
   String? get pendingClose => _pendingClose;
+
+  /// 上一次动作的结果行（诊断 / 测试用；空串 = 还没点过任何动作）。
+  String get lastActionNote => _lastActionNote;
 
   // ───────────────────────── 出帧 ─────────────────────────
 
@@ -195,6 +201,9 @@ class TunnelUiPanel {
   ///
   /// 分派只看 `action_id` + `payload['conn_id']`；未知动作 / 缺 `conn_id` 只记日志，
   /// **不抛、不崩**（fail-open）。
+  ///
+  /// **每次动作的结果都写进面板**（[lastActionNote]，渲染成一行 caption）：用户 2026-10-11
+  /// 真机反馈"点了没反应"——第一版只把结果写进 stderr，界面上什么都看不到（等于没反馈）。
   Future<void> handleAction(Map<String, dynamic> params) async {
     try {
       final String actionId = (params['action_id'] ?? '').toString();
@@ -205,50 +214,70 @@ class TunnelUiPanel {
       final String connId = (payload['conn_id'] ?? '').toString().trim();
       switch (actionId) {
         case kUiActionRefresh:
+          _note('已刷新（重新读一次隧道台账）');
           refresh(force: true);
           return;
         case kUiActionReconnect:
           if (connId.isEmpty) {
-            log?.call('面板动作 reconnect 缺少 conn_id（忽略）');
+            _note('重连失败：这一行没带上 conn_id（已忽略）');
+            refresh(force: true);
             return;
           }
           final Map<String, dynamic> result = await manager.reconnect(connId);
           if (result['ok'] != true) {
+            _note(
+              '重连 $connId 未成功：${result['error'] ?? '未知原因'}'
+              '（这条隧道可能已被关闭；核心下次使用这个工作空间时会重建）',
+            );
             log?.call('面板重连 $connId 未成功：${result['error'] ?? '未知原因'}');
           } else {
+            _note('已重连 $connId：state=${result['state']}');
             log?.call('面板重连 $connId：state=${result['state']}');
           }
           refresh(force: true);
           return;
         case kUiActionClose:
           if (connId.isEmpty) {
-            log?.call('面板动作 close 缺少 conn_id（忽略）');
-            return;
-          }
-          if (_pendingClose != connId) {
-            // 第一段：只改状态，**不真关**（受限控件集没有确认弹窗，只能两段式）。
-            _armConfirm(connId);
+            _note('关闭失败：这一行没带上 conn_id（已忽略）');
             refresh(force: true);
             return;
           }
-          // 第二段：确认关闭。
+          if (_pendingClose != connId) {
+            _armConfirm(connId);
+            _note('已按下「关闭」：再点一次「确认关闭」才会真关掉 $connId（20 秒内有效）');
+            refresh(force: true);
+            return;
+          }
           _clearConfirm();
           await manager.closeTunnel(connId);
+          _note(
+            '已关闭 $connId。核心仍持有这条连接，会在**下次使用这个工作空间时**判死并重建'
+            '（或按既有口径回退内置 dartssh2，日志与右栏会明示）；'
+            '目标机上在跑的后台任务不受影响。',
+          );
           log?.call('面板关闭隧道 $connId');
           refresh(force: true);
           return;
         case kUiActionCancelClose:
           _clearConfirm();
+          _note('已取消关闭');
           refresh(force: true);
           return;
         default:
+          _note('未知的面板动作（已忽略）：$actionId');
           log?.call('面板动作未知（忽略）：$actionId');
+          refresh(force: true);
           return;
       }
     } catch (error) {
+      _note('面板动作处理异常（已忽略，fail-open）：$error');
       log?.call('面板动作处理异常（已忽略，fail-open）：$error');
+      refresh(force: true);
     }
   }
+
+  /// 记下"上一次动作的结果"（下一帧视图会带出去）。
+  void _note(String message) => _lastActionNote = message;
 
   void _armConfirm(String connId) {
     _confirmTimer?.cancel();
@@ -257,6 +286,7 @@ class TunnelUiPanel {
       // 到点自动回到「关闭」：避免"点了一次就走开，回来又点一下"变成误关。
       _pendingClose = null;
       _confirmTimer = null;
+      _note('「确认关闭」$connId 已过期（20 秒内没确认），按钮回到「关闭」');
       log?.call('「确认关闭」$connId 已过期，按钮回到「关闭」');
       refresh(force: true);
     });
@@ -295,6 +325,15 @@ class TunnelUiPanel {
               '断开按退避重连，退避耗尽后核心自动回退内置 dartssh2 并在日志/右栏明示',
       'style': 'caption',
     });
+
+    // 上一次动作的结果（成功/失败都要看得见：只写 stderr 等于没有反馈）。
+    if (_lastActionNote.isNotEmpty) {
+      children.add(<String, dynamic>{
+        'type': 'text',
+        'text': '上次动作：$_lastActionNote',
+        'style': 'caption',
+      });
+    }
 
     if (tunnels.isEmpty) {
       children.add(<String, dynamic>{

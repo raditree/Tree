@@ -34,7 +34,7 @@ SSH 执行器新架构里的**「中转站」**（`ssh_executor`，**binary 型�
 |---|---|
 | `bin/tree_ssh_executor.dart` | 插件入口：stdin 读帧 → `PluginLoop`；stdout 写帧（每帧 flush）；日志一律 stderr |
 | [lib/src/plugin_loop.dart](lib/src/plugin_loop.dart) | **L1 服务端**：`hello` / `ping` / `shutdown` / `tools/list` + 5 个 `tunnel.*`；请求**并发**处理（读循环不 await 业务）；未知方法回 `-32601` |
-| [lib/src/tunnel_manager.dart](lib/src/tunnel_manager.dart) | 多隧道台账 `Map<conn_id, Tunnel>`；`tunnel.ensure` 按 `host\|port\|username\|root\|login_shell` **去重**；`tunnel.state` / `reconnect` / `close` |
+| [lib/src/tunnel_manager.dart](lib/src/tunnel_manager.dart) | 多隧道台账 `Map<conn_id, Tunnel>`；`tunnel.ensure` 按 `host\|port\|username\|root\|login_shell` **去重**；`tunnel.state` / `reconnect` / `close`；`conn_id` 带**进程内随机前缀**（`conn-<rand4>-<seq>`，防插件重启后序号重来 ⇒ 旧请求打到新隧道） |
 | [lib/src/tunnel.dart](lib/src/tunnel.dart) | 单隧道状态机 `connecting → booting → ready ⇄ reconnecting → down`；退避（[Backoff] + 可注入 [TimerFactory]）；在途请求显式收口；PTY 通知转 `tunnel/event`；**失败面分 `tunnel_not_ready` / `tunnel_down`**；保活与卡死强拆；重建前按 token 收上一世 agent |
 | [lib/src/keepalive.dart](lib/src/keepalive.dart) | **成组常数**：ping 间隔 20s / 单次窗口 10s / 连丢 3 拍 ⇒ 重建；agent 静默上限 90s（spawn 时总是传给 agent）——改一个必须看另一个 |
 | [lib/src/bootstrap.dart](lib/src/bootstrap.dart) | 六步 bootstrap（探架构/推送/chmod/拉起/握手）+ 六种 `error_kind`；`buildSpawnCommand`（含 `--root` 与 `--idle-timeout-ms`）/ `mapArch` / token |
@@ -147,6 +147,10 @@ SSH 执行器新架构里的**「中转站」**（`ssh_executor`，**binary 型�
   但正在进行的远端前台操作会中断，核心下次用这个工作空间会重建。
 - **动作分派**：只看 `action_id`（`refresh` / `reconnect` / `close` / `cancel_close`）+
   `payload['conn_id']`；未知动作 / 缺 `conn_id` 只记日志，**不抛、不崩**。
+- **动作结果必须看得见**（2026-10-11 用户真机反馈）：每次动作的**结果 / 失败**都渲染成视图里的一行
+  （`lastActionNote`）——"重连未成功：隧道不存在（这条隧道可能已被关闭…）"、
+  "已关闭 conn-x。核心仍持有这条连接，会在**下次使用这个工作空间时**判死并重建…"、
+  "「确认关闭」已过期"都走它。第一版只把结果写 stderr，界面上什么都看不到 ⇒ 用户会说"点了没反应"。
 - **上限**：一次最多列 8 条隧道（超出给一行"还有 N 条未显示"）——核心桥对单槽位视图有 64 KiB 上限。
 
 ## 测试

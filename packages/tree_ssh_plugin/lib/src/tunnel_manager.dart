@@ -56,6 +56,14 @@ class TunnelManager {
   final Map<String, Tunnel> _tunnels = <String, Tunnel>{};
   int _seq = 0;
 
+  /// 本进程的 `conn_id` 前缀（随机；理由见 [_create]）。
+  late final String _connPrefix = _prefixOf(random);
+
+  static String _prefixOf(Random? random) {
+    final Random r = random ?? Random.secure();
+    return r.nextInt(1 << 20).toRadixString(36).padLeft(4, '0');
+  }
+
   /// 全部隧道（按创建顺序）。
   List<Tunnel> get tunnels => List<Tunnel>.unmodifiable(_tunnels.values);
 
@@ -186,7 +194,11 @@ class TunnelManager {
 
   Tunnel _create(TunnelConfig config, AgentRequest agent) {
     final Tunnel tunnel = Tunnel(
-      connId: 'conn-${++_seq}',
+      // `conn_id` 带**进程内随机前缀**：插件重启（停用→启用 / 崩溃被重拉）后序号会从 1 重来，
+      // 而核心侧可能还留着"旧会话"（它绑的是**旧实例**）——拿旧 `conn_id` 去新实例问状态，
+      // 就可能命中新实例的**另一条**隧道（root 可能不同）⇒ 静默跨 root 操作（踩红线）。
+      // 判死口径修好之后旧会话很快会被停用，随机前缀让它**不可能发生**，而不是"很快收敛"。
+      connId: 'conn-$_connPrefix-${++_seq}',
       config: config,
       agent: agent,
       dialer: dialer,

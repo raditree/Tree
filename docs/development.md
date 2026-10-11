@@ -167,13 +167,17 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 | `tree_protocol` | 38 passed（含协议完备性 + 文档契约门禁） |
 | `tree_tunnel_protocol` | 15 passed（帧编解码 / 路径归一化与越界判定） |
 | `tree_agent` | 89 passed / 19 skipped（skip = POSIX 专属行为，见下注） |
-| `tree_ssh_plugin` | 136 passed（含"真进程一次塞多帧" + **断连完整性 13 条**：失败面分类 / 保活与卡死强拆 / 上一世 agent 清理） |
-| `tree_local_exec` | 290 passed / 4 skipped |
-| `tree_core` | 1202 passed / 3 skipped |
+| `tree_ssh_plugin` | 154 passed（含"真进程一次塞多帧" + **断连完整性 13 条** + **左栏面板 18 条**） |
+| `tree_local_exec` | 293 passed / 4 skipped |
+| `tree_core` | 1217 passed / 3 skipped（含另一会话在途的 subagent-transcript 测试；本次改动未加 tree_core 用例） |
 | `tree_core_cli` | 6 passed（需 `TREE_CORE_EXE` 指向编译产物） |
 | 前端 `flutter test` | 811 passed |
 | 真机 SSH 回归（`TREE_SSH_TEST_*` 具备时） | ① `packages/tree_local_exec` 的 SSH 用例与 `packages/tree_core/test/ssh_files_integration_test.dart`；② **中转站两条门控**：`dart run tool/tunnel_e2e.dart`（线上协议黑盒，**37 项**，含 ⑧ 断连完整性五条）与 `packages/tree_core/test/ssh_tunnel_e2e_test.dart`（核心侧链路，含 ⑨ 断连不误发 + 恢复后接续） |
 
+> **2026-10-11 11:03 复测**（判死口径精确化 + 面板动作反馈 + `conn_id` 前缀）：`tree_ssh_plugin` **154**
+> （152 + 面板侧 2 条）、`tree_local_exec` **293~4**（291 + 2 条判死钉子）、`tree_core` **1217~3**
+> （含另一会话在途的 `subagent_transcript_*` 测试文件，非本次引入）。
+>
 > 上表数字于 **2026-10-11（1.0.3+3）逐包重测**：`tree_protocol` 38、`tree_tunnel_protocol` 15、
 > `tree_agent` **89~19**、`tree_ssh_plugin` **136**、`tree_local_exec` **290~4**、`tree_core` **1202~3**、
 > `tree_core_cli` **6**、前端 **811**。

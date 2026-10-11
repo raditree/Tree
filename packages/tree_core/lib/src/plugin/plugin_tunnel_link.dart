@@ -197,6 +197,15 @@ class _PluginTunnelSession implements TunnelSession {
   @override
   bool get pluginAvailable => _link.available;
 
+  /// **这条会话绑定的那个插件实例**还在不在（通道没断、进程没退）。
+  ///
+  /// 与 [pluginAvailable] **必须一起看**（2026-10-11 真机 bug）：插件重启（停用→启用 /
+  /// 崩溃后被重拉）会换一个进程实例，这条会话的 [_host] 是**旧实例**（已 `isClosed`），
+  /// 而"当前"有新实例 ⇒ 只看 [pluginAvailable] 会判成"插件在 ⇒ 不判死"，
+  /// 于是这条绑着死实例的会话被核心永久缓存、重建不了。
+  @override
+  bool get boundHostAlive => !_host.isClosed;
+
   @override
   String get unavailableReason => _link.unavailableReason;
 
