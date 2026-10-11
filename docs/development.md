@@ -114,6 +114,7 @@ dart run tool/package_windows.dart --flutter "<flutter.bat 的路径>"
 dart run tool/build_core.dart            # → dist/tree_core.exe（约 10 MB）
 
 # SSH 执行器的两份二进制（2026-10-10 新增；缺了它们核心自动回退内置 dartssh2，功能不变）
+# ⚠ 改了 pubspec 的版本号就**必须重跑这两条**：出包脚本会校验产物里的版本串，不一致直接拒绝出包
 dart run tool/build_ssh_plugin.dart      # → build/plugins/tree_ssh_executor[.exe]（约 10 MB，跑在用户本机）
 dart run tool/build_agent.dart           # → build/agents/tree_agent-linux-{amd64,arm64}（各约 6.5 MB）
                                          #   交叉编译（--target-os/--target-arch，本仓 Dart 3.13.4 实测可用；
@@ -149,7 +150,12 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 > **新目录是怎么进包的**：安装器用 `Source: "{#ReleaseDir}\*"` + `recursesubdirs createallsubdirs`
 > **整目录递归**，所以 `agents/` 与 `plugins/` 下的新文件**不需要改 `.iss`**；
 > 需要保证的只有"复制进发行目录"这一步 —— 那是 `tool/package_windows.dart` 的
-> `_copySshExecutorArtifacts`（`build/plugins/` 与 `build/agents/` → 发行目录）。
+> `_copySshExecutorArtifacts`（`build/plugins/` 与 `build/agents/` → 发行目录），
+> 并在复制前**逐个校验产物里的版本串**（`_verifyBinaryVersion`）：与 `pubspec.yaml` 的版本
+> （`+` 之前那部分）不一致就**直接拒绝出包**并告诉你要先跑哪条构建命令。
+> 为什么加这道闸：2026-10-11 出 1.0.3+2 时**忘了重编两份二进制**，包里因此装着 1.0.2 的插件与 agent
+> （目标机上出现 `~/.tree/agent/1.0.2/`），功能上完全看不出来 —— 这种"包名与包内容版本对不上"
+> 只能靠出包失败来拦。
 
 ## 6. 验收基线（M9 起：不得劣化）
 
@@ -161,26 +167,30 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 | `tree_protocol` | 38 passed（含协议完备性 + 文档契约门禁） |
 | `tree_tunnel_protocol` | 15 passed（帧编解码 / 路径归一化与越界判定） |
 | `tree_agent` | 89 passed / 19 skipped（skip = POSIX 专属行为，见下注） |
-| `tree_ssh_plugin` | 123 passed（含"真进程一次塞多帧"） |
-| `tree_local_exec` | 287 passed / 4 skipped |
+| `tree_ssh_plugin` | 136 passed（含"真进程一次塞多帧" + **断连完整性 13 条**：失败面分类 / 保活与卡死强拆 / 上一世 agent 清理） |
+| `tree_local_exec` | 290 passed / 4 skipped |
 | `tree_core` | 1202 passed / 3 skipped |
 | `tree_core_cli` | 6 passed（需 `TREE_CORE_EXE` 指向编译产物） |
 | 前端 `flutter test` | 811 passed |
-| 真机 SSH 回归（`TREE_SSH_TEST_*` 具备时） | ① `packages/tree_local_exec` 的 SSH 用例与 `packages/tree_core/test/ssh_files_integration_test.dart`；② **中转站两条门控**：`dart run tool/tunnel_e2e.dart`（线上协议黑盒，**26 项**）与 `packages/tree_core/test/ssh_tunnel_e2e_test.dart`（核心侧链路） |
+| 真机 SSH 回归（`TREE_SSH_TEST_*` 具备时） | ① `packages/tree_local_exec` 的 SSH 用例与 `packages/tree_core/test/ssh_files_integration_test.dart`；② **中转站两条门控**：`dart run tool/tunnel_e2e.dart`（线上协议黑盒，**37 项**，含 ⑧ 断连完整性五条）与 `packages/tree_core/test/ssh_tunnel_e2e_test.dart`（核心侧链路，含 ⑨ 断连不误发 + 恢复后接续） |
 
-> 上表数字于 **2026-10-11（1.0.3）逐包重测**：`tree_protocol` 38、`tree_tunnel_protocol` **15**、
-> `tree_agent` **89~19**、`tree_ssh_plugin` **123**、`tree_local_exec` **287~4**、`tree_core` **1202~3**、
+> 上表数字于 **2026-10-11（1.0.3+3）逐包重测**：`tree_protocol` 38、`tree_tunnel_protocol` 15、
+> `tree_agent` **89~19**、`tree_ssh_plugin` **136**、`tree_local_exec` **290~4**、`tree_core` **1202~3**、
 > `tree_core_cli` **6**、前端 **811**。
-> 差额来源：本版新增 SSH 执行器「中转站」链路（三个新包：协议定义 / 目标机执行体 / 中转站插件），
-> 	ree_local_exec 的 +26 是本轮隧道传输层与后台托管的用例（含**断连两种收场**：退避中还等/判死才收尾、不猛戳），`tree_core` 的 +2 是核心侧真机端到端
-> 与**隧道托管路径的 hook 接续**用例（`test/terminal_hooks_tunnel_test.dart`：核心重启 → 按日志路径从
-> `exec.list` 认领 → 退出码来自台账 → 完成提示**回原会话** → **不重跑**；原先只有 `nohup` 那条路有钉子）。
-> **基线数字本次已按实测更新**（上一次 1.0.2+6 时前端实测 811 高于基线 789，当时按"发现不一致要报告、不默默改"
-> 留给用户裁决；本次一并抬到 811）。
+> 相对上一版（1.0.3）的差额来源：`tree_ssh_plugin` **+13** 是"断连完整性"钉子
+> （`test/tunnel_keepalive_test.dart`：失败面分类 / spawn 必带静默上限 / 保活与卡死强拆 /
+> `reconnect` 探针 / 上一世 agent 清理的 token 守卫形状）；`tree_local_exec` **+3** 是传输层的
+> "重连中等待后只重发一次 / 请求级失败不判死 / 等超预算如实失败 / 插件不可用才判死"（1 条原用例被 4 条新用例替换）。
 > **真机门控本次具备并跑过**（WSL 起的真 sshd + 交叉编译出的真二进制），不再写"环境不具备"：
-> `tool/tunnel_e2e.dart` **26 项**全过，其中 ⑦ 段专钉**关停/接续四条**（执行器被 kill ⇒ 旧 pid 消失 /
-> **在跑的后台进程仍然活着** / 重建后 **agent 从台账认出上一世的任务** / 跨过重建仍拿到退出码与日志 /
-> 关隧道后**执行器立即退出不留孤儿**）。唯一仍未跑的是 zip / 安装包的静默装卸（对外系统级动作，由用户自己装机实测）。
+> `tool/tunnel_e2e.dart` **37 项全过（0 失败）**，其中
+> ⑦ 段钉**关停/接续四条**（执行器被 kill ⇒ 旧 pid 消失 / **在跑的后台进程仍然活着** /
+> 重建后 **agent 从台账认出上一世的任务** / 跨过重建仍拿到退出码与日志 / 关隧道后**执行器立即退出不留孤儿**），
+> ⑧ 段钉**断连完整性五条**（执行器命令行带 `--root` 与 `--idle-timeout-ms 90000`（真机读 `/proc/<pid>/cmdline`）/
+> 从服务端掐断通道后插件进 `reconnecting` / **此时请求回 `tunnel_not_ready` 而不是判死的 `tunnel_down`** /
+> 自动重连后目标机上**只剩一个**执行器且上一世 pid 已退掉 / `SIGSTOP` 制造的**卡死**被保活强拆且旧的被收掉）；
+> `packages/tree_core/test/ssh_tunnel_e2e_test.dart` 一条用例全过，含 **⑨ 断连不误发 + 恢复后接续**
+> （起长任务 → 掐断通道 → 断言 hook 的 `exitCode` **没有**提前失败 → 自动重连后从落盘台账拿到**真实**退出码与日志）。
+> 唯一仍未跑的是 zip / 安装包的静默装卸（对外系统级动作，由用户自己装机实测）。
 > `tree_agent` 的 **19 条 skip 是 POSIX 专属行为**（`script` / `setsid` / `kill -0` / 符号链接语义）——
 > Windows 开发机上注定跑不了，它们的覆盖来自上表最后一行那两条真机门控，不是丢了断言。
 > 上表数字此前于 **2026-10-05 逐包重测**（此前记的 33 / 159+1 / 849+1 / 217 已经过时——那是更早里程碑的旧值，
@@ -213,8 +223,9 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
       `tree_local_exec` / `tree_core` / `tree_core_cli`）+ `flutter test`；数字对照 §6 基线
 - [ ] **出包前先产出两份 SSH 执行器二进制**：`dart run tool/build_ssh_plugin.dart` 与
       `dart run tool/build_agent.dart`。`package_windows.dart` 会把 `build/plugins/`、
-      `build/agents/` 复制进发行目录 —— 但**产物缺失不会报错**（只是包内没有中转站、核心自动回退内置
-      dartssh2），所以出包后务必按下面那条核一遍必备件
+      `build/agents/` 复制进发行目录 —— 产物**缺失**不会报错（只是包内没有中转站、核心自动回退内置
+      dartssh2）；产物**版本对不上**则会**直接拒绝出包**（`_verifyBinaryVersion`，2026-10-11 加），
+      所以**改了版本号必须重跑上面两条**。出包后按下面那条再核一遍必备件
 - [ ] 门控真机端到端（`TREE_SSH_TEST_*` 具备时）：`dart run tool/tunnel_e2e.dart` 与
       `packages/tree_core/test/ssh_tunnel_e2e_test.dart`
 - [ ] `CHANGELOG.md` 记录本次版本的用户可见变化

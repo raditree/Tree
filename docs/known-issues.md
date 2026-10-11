@@ -1992,3 +1992,99 @@ terminal/subagent hook 完成消息）在工具调用期间必须排队等待」
 2. 若将来出现"无人读 stderr 的父进程"（守护进程化、纯后台启动、某些 CI 包装器），**这个坑会再出现**——
    届时应回来把它查成"核心关停不依赖 stderr 被消费"。
 
+
+---
+
+## #34 「重连中」被当成「判死」：一次网络抖动就让 hook 立刻失败，并在目标机累积执行器
+
+**状态**：已修复（2026-10-11，`v1.0.3+3`；协议 §10 定稿）。
+**影响**：SSH 执行器（中转站）链路上，任何一次网络抖动都会让**后台 hook 立刻失败**（本该等到退避耗尽）、
+并且**提前回退内置 dartssh2**；恢复网络后在目标机上**多出一个执行器进程**（反复抖动会累积）。
+
+### 现象（用户真机 `open@open`，2026-10-11）
+
+- 物理断网模拟网络抖动 ⇒ **立刻**收到 hook 的失败。用户给的断言是：
+  **重试（退避上限 30min）用尽后**才该向 agent 返回 hook 失败。
+- 恢复网络后 `sudo lsof ~/.tree/agent/1.0.2/tree_agent-linux-amd64` 看到**两个 pid**
+  （旧的不退，又拉了一个）。用户原话："在重新恢复网络连接后直接在目标主机另起了执行器进程"。
+- 顺带发现：目标机上是 **`1.0.2`** 目录（当时已经出过 1.0.3+2 的包，见下"附带发现"）。
+
+### 根因 1：插件的"未就绪"与"判死"共用一个 `error_kind`（**主因**）
+
+链路（`v1.0.3+2` 当时的代码，逐跳都有行号）：
+
+1. `packages/tree_ssh_plugin/lib/src/tunnel.dart` 的 `request()`：`state != ready`（**含 `reconnecting`**）
+   ⇒ 回 `_notReady(...)`；
+2. 同文件 `_notReady` 里写的是 `error_kind: TunnelErrorKinds.tunnelDown` —— **重连中也报 tunnel_down**；
+3. `packages/tree_core/lib/src/plugin/plugin_tunnel_link.dart`（`_PluginTunnelSession.request`）：
+   `ok != true` 且没有数字 `error_code` ⇒ `throw TunnelUnavailableException(kind, ...)`；
+4. `packages/tree_local_exec/lib/src/tunnel_ssh_transport.dart` 的 `_call`：
+   `on TunnelUnavailableException { _markDown(...); throw SshLinkStaleException(...) }` ⇒ **立刻判死**；
+5. 后台探测 `queryBackground` 走的正是同一条 `_call` ⇒ `_TunnelBackgroundExec._probe` 的
+   `_isTunnelDead()` 已为真 ⇒ `_failAsStale` ⇒ **立刻回 hook 失败**，`_settle` 之后**不再探测**
+   —— 所以"重连后那个后台任务也没有回来"（再没人来认领它了）；
+6. `packages/tree_core/lib/src/tool/workspace_tool_runner.dart` 的 `_ioFor` 在同一瞬间看到
+   `tunnelDown` ⇒ 撤换 IO 缓存 ⇒ **提前回退内置 dartssh2**。
+
+⇒ `512a124` 加的"断连不发通知 / 30s 慢探 / 判死才收尾"**只改了核心侧的等待逻辑**，
+传输层把"重连中"提前当成了判死 ⇒ 那套忍耐**从未有机会生效**。
+
+### 根因 2：旧执行器不退出（物理断网时它收不到 EOF）
+
+`tunnel.dart` 的 `_attempt()` 每次重连都重新 `spawn`，且**从不**清理上一世 agent（`close()` 的注释
+还专门写明"没有额外 kill"）；agent 的生命周期只靠 **stdin EOF**，而**物理断网时对端 sshd 收不到 FIN**
+（会话与 stdin 管道都还在）⇒ 旧 agent 阻塞在 read 上不死；`--idle-timeout-ms` 缺省 **0 = 永不**，
+只能等 sshd 的 TCP 超时（分钟到十几分钟）。用户 `lsof` 里那两个 pid 就是这么来的。
+
+### 附带发现：1.0.3+2 的包里装着 **1.0.2** 编的插件与 agent
+
+本地实测（同一工作空间）：
+
+| 产物 | 生成时间 | 内含版本串 |
+|---|---|---|
+| `build/plugins/tree_ssh_executor.exe` | 10-11 **00:35** | `1.0.2` |
+| `build/agents/tree_agent-linux-amd64` / `arm64` | 10-11 00:21 / 00:25 | `1.0.2` |
+| `dist/tree_core.exe` | 10-11 06:12 | `0.0.0-dev` |
+| zip 内 `Release/plugins|agents/*` | 00:35 / 00:21 / 00:25 | 即上表前三个 |
+
+⇒ 升版本到 1.0.3 / 1.0.3+2 时**没有重跑** `tool/build_ssh_plugin.dart` 与 `tool/build_agent.dart`。
+再叠加"**核心只发 `config`，插件读 `request['agent']`**（两边的键从来没对上）"⇒ 目标机上的驻留目录名
+只能来自**插件自身的编译期版本**，所以显示的正是 `1.0.2`（**不是**"用户跑了旧版"，是我打包的锅；
+本轮也已把核心那句从未生效的声明删掉）。
+
+### 修复（`v1.0.3+3`；口径定稿在 [ssh-tunnel-protocol.md](../docs/ssh-tunnel-protocol.md) §10）
+
+1. **新增 `error_kind: tunnel_not_ready`**（`connecting`/`booting`/`reconnecting` ⇒ **确定未执行**），
+   核心侧**判死只来自两处**：心跳快照 `state == down`、插件进程已不可用；
+   前台请求遇到 `not_ready` ⇒ **等隧道回到 `ready` 再发一次**（兜底预算 `_maxReadyWait` = 30 min）。
+2. **插件保活 + 卡死强拆**：`ready` 期间每 20s `agent.ping`（10s 窗口，连丢 3 拍 ⇒ 拆掉重建）；
+   `tunnel.reconnect` 走同一探针 ⇒ "进程在但不回帧"也能换掉（此前是 no-op）。
+3. **执行器自觉优雅退出**：spawn 总是传 `--idle-timeout-ms 90000`（agent 收到任何帧就重置 ⇒
+   健康链路永远到不了；物理断网时靠它自救）。
+4. **重建前收掉上一世 agent**：按启动时的一次性 token 在 `/proc/<pid>/cmdline` 里核对后才 `kill`
+   （核对不上不杀，零误杀）。
+5. **版本口径与出包校验**：核心不再声明 agent 版本；`tool/package_windows.dart` 复制产物前
+   校验版本串，不一致**拒绝出包**。
+
+### 验证
+
+- 单测：`packages/tree_ssh_plugin/test/tunnel_keepalive_test.dart`（**13 条**：失败面分类 / spawn 必带静默上限 /
+  保活与卡死强拆 / `reconnect` 探针 / token 守卫形状）；
+  `packages/tree_local_exec/test/tunnel_ssh_transport_test.dart`（**+4 条**：`not_ready` 等待后**只重发一次**、
+  请求级 `tunnel_down` **不判死**、等超预算如实失败、插件不可用才判死）。
+- **出包校验负例**（真跑）：拿仍含 `1.0.2` 的产物去出 1.0.3 的包 ⇒ **exit=3**，打印
+  "`E:\...\build\plugins\tree_ssh_executor.exe` 里找不到版本串「1.0.3」…… 先跑：dart run tool/build_ssh_plugin.dart"。
+- 真机门控（WSL 真 sshd + 真二进制 + 真插件，2026-10-11 实测）：
+  - `dart run tool/tunnel_e2e.dart` ⇒ **37 项全过（0 失败）**，其中 ⑧ 段五条钉住本次修复
+    （命令行带 `--idle-timeout-ms 90000`、掐断后插件进 `reconnecting` 且请求回 `tunnel_not_ready`、
+    自动重连后只剩一个执行器、上一世 pid 已退掉、`SIGSTOP` 卡死被保活强拆并被收掉）；
+  - `packages/tree_core/test/ssh_tunnel_e2e_test.dart` ⇒ 全过，含 ⑨ 段
+    （起长任务 → 掐断通道 → **hook 的 `exitCode` 没有提前失败** → 自动重连后从落盘台账拿到真实退出码与日志）；
+  - 目标机上的实测痕迹：`ps` 里 agent 的命令行是
+    `/home/treee2e/.tree/agent/1.0.3/tree_agent-linux-amd64 --root /home/treee2e --token … --idle-timeout-ms 90000`
+    （目录名 = **插件自报的 1.0.3**，不再是请求里那个提示）。
+
+### 遗留
+
+- 目标机上的**旧版本驻留目录**（`~/.tree/agent/<旧版本>/`）**不自动清理**（协议 §8 已记）。
+  手工删是安全的，但**别删 `~/.tree/agent/state/`** —— 那是后台任务的台账与退出码。

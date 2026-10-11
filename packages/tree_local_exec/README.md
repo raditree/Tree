@@ -183,6 +183,19 @@
       并投递**一次**"失联"提醒（文案写明**可能目标主机关闭 / 不要大量重试**），**此后不再探测**。
     判据来源：`SshWorkspaceIO._tunnelDead`（内置 dartssh2 后端不实现 `FallbackableWorkspace`
     ⇒ 恒 false，走它自己那条"失活即失败"的老口径）。
+22. **"判死"只有两个来源，请求级失败一律不判死（2026-10-11 修，用户口径）**：
+    - 心跳快照说 `down`（插件自标：退避耗尽 / 不可调和）；
+    - 插件**进程已不可用**（`TunnelSession.pluginAvailable` 实时查询 `PluginBus` 得 false）——
+      这是本地事实，按红线 1 判死并回退内置（明示）。
+    此外**任何**请求级失败都不许判死，尤其 `error_kind: tunnel_not_ready`（插件还没好：
+    `connecting`/`booting`/`reconnecting`）：那只是"重连中"，此时**前台操作等隧道回来**
+    （`TunnelSshTransport._awaitTunnelReadyElseFail`：轮询 `tunnel.state`，回到 `ready` 就**重发**
+    那一次请求；看到 `down` 才以 `SshLinkStaleException` 如实失败；兜底预算 `_maxReadyWait` = 30 min
+    防"反复 ready/不 ready 抖动"把一次调用挂成永恒）。
+    **为什么允许重发**：`tunnel_not_ready` 意味着插件**根本没把请求转给 agent** ⇒ 确定未执行 ⇒
+    重发不是"重放"；而**通道中途断**（`AgentChannelClosed`）无法断言有没有执行到，**永不重发**
+    （协议 §0 红线 3）。修复前两者都报 `tunnel_down`，核心把"重连中"当判死 ⇒ 一次网络抖动就让
+    后台 hook 立刻失败、还提前回退内置——用户 2026-10-11 报的就是它。
 
 ## 测试
 
@@ -227,7 +240,9 @@ M11 新增钉子：`git_output_test` 的 `parseStatus` 组（`-z`、空格 / 中
 **超过一块的读写自动分块 append**、`readStream` 的 offset/length、缺失文件给可读异常、
 PTY 不可用 ⇒ `PtyUnsupportedException`（不静默降级）、`shell.data`/`shell.exit` 通知 ⇒ 通道输出与
 **退出码一定收口**、`close` 幂等给 -1、心跳一拍 ⇒ 判活、隧道 `down` ⇒ `tunnelDown` + `fallbackReason`、
-在途请求以 `SshLinkStaleException` 显式失败（**不重放**）、`reconnect` 单飞）、
+在途请求以 `SshLinkStaleException` 显式失败（**不重放**）、`reconnect` 单飞、
+**`tunnel_not_ready` ⇒ 等它回来再发一次（不判死、不算重放）**、请求级 `tunnel_down` ⇒ 如实失败但**不判死**、
+等超预算（`_maxReadyWait`）⇒ 如实失败、**插件不可用 ⇒ 判死**）、
 `tunnel_background_test`（**后台执行的两条路**：有托管能力 ⇒ 走 `exec.spawn` 且命令里**不出现** `nohup`；
 `exitCode` 从台账收尾（`running → exited` / `gone` ⇒ 可辨码）；**断链不失败而是继续等**；
 `attachBackground` 只给日志路径就能对账且**不重跑**；`cancel` 走 `exec.kill`、台账里没有 ⇒ 如实 false；

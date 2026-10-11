@@ -31,10 +31,14 @@ WorkspaceToolRunner.sshIoFactory（唯一解析点）
    判定口径统一为：
    - **「插件在、但这条隧道的建立/健康出问题」**（探测失败 / 推送失败 / 握手失败 / 插件进程崩 / 退避耗尽
      ⇒ `tunnel_down`）⇒ **回退内置 dartssh2**，并写明"中转站不可用，已回退内置 SSH"；
-   - **「隧道在、某次操作失败」**⇒ **如实暴露错误**（不重放、不回退、不静默）。
+   - **「隧道在、某次操作失败」**⇒ **如实暴露错误**（不重放、不回退、不静默）；
+   - **「隧道还没好」（重连退避未耗尽）不算这一维** ⇒ **不降级、不判死**：前台操作**等它回来**，
+     后台任务**什么都不发**地继续等（见 §10）。
 2. **绝不静默回退成 local**（那会把远端工作空间悄悄变成本机目录）。
 3. **在途命令失败以显式错误收尾**（与 `SshLinkStaleException` 同一语义），**不自动重放**
    （防重复副作用：远端训练 / 构建 / 写文件都不允许被偷偷跑第二遍）。
+   例外只有一处（2026-10-11 明确）：**插件明确回了"本次请求未执行"**（`tunnel_not_ready`）
+   才允许**重发**——那不是重放（重放 = 已发出去过的再发一遍）。
 
 ## 1. 三层与三类消息
 
@@ -67,11 +71,16 @@ WorkspaceToolRunner.sshIoFactory（唯一解析点）
   agents_dir?: "" }              // 缺省 ~/.tree/agent
 ```
 
-**`agent`**（插件 bootstrap 用）：`{ version: "<期望的 agent 版本>", bytes_sha256: "<随包二进制的 sha256>", binary_name?: "tree_agent-linux-amd64" }`
-——`version` + `sha256` 决定"用不用重新推送"。
+**`agent`**（插件 bootstrap 用）：**版本、sha256、二进制名一律由插件自报**（它才是随包带二进制的那一端），
+核心**不再声明**（2026-10-11 用户裁决 B：核心那句 `version` 从来就没被插件读到过——核心只发 `config`、
+插件读 `request['agent']`，两边的键从来没对上）。请求里若仍带 `version` / `bytes_sha256` / `binary_name`
+只当**可选覆盖**，且版本以插件为准（不一致时插件记一条日志）。
+`~/.tree/agent/<version>/tree_agent` 里的 `<version>` 因此 = **插件编译时注入的 `kAgentVersion`**，
+重推判据是 **sha256**（版本串只决定目录名）。
 
 **`state` 取值**：`connecting` → `booting`（推送/拉起/握手）→ `ready` ⇄ `reconnecting` → `down`。
-`down` = 退避耗尽（累计 30 min）或握手/版本不可调和 ⇒ 核心**视其为「无中转站」**（下一次 IO 解析走内置）。
+`down` = 退避耗尽（累计 30 min）或握手/版本不可调和 ⇒ 核心**视其为「无中转站」**（下一次 IO 解析走内置）；
+`reconnecting` **不是** `down` —— 它只是"还没好"，核心等它回来（§10）。
 
 **插件 → 核心通知**（沿用 stdio 通知通道，`method` 为新名，不进前端工具面）：
 
@@ -234,7 +243,12 @@ JSON-RPC 标准：`-32700` 解析错 / `-32600` 非法请求 / `-32601` 方法�
 |---|---|
 | `agent_unreachable` / `push_failed` / `spawn_failed` / `handshake_failed` / `arch_unsupported` | **回退内置** + 明示 |
 | `config_incomplete` | **不回退**：配置本身不完整，回退也一样连不上 ⇒ 如实报错 |
-| `tunnel_down`（`tunnel.state` 观察到） | **回退内置** + 明示 |
+| `tunnel_down`（隧道已判死 / 已关闭 / 通道断在请求中途） | **回退内置** + 明示；**这一次请求如实失败、不重发**（中途断无法断言有没有执行到） |
+| `tunnel_not_ready`（`connecting` / `booting` / `reconnecting`，2026-10-11 新增） | **不回退、不判死**：本次请求**确定未执行** ⇒ 核心**等隧道回到 `ready` 再发一次**（§10） |
+
+> 判死的**唯一来源**是心跳快照里的 `state == down`，以及"插件进程已不可用"（核心实时查 `PluginBus`）。
+> **请求级失败一律不判死**——把判死绑在一次请求失败上，就是 2026-10-11 那个
+> "一次网络抖动 ⇒ 后台 hook 立刻失败 + 提前回退内置"的 bug。
 
 ## 6. 版本协商
 
@@ -242,12 +256,16 @@ JSON-RPC 标准：`-32700` 解析错 / `-32600` 非法请求 / `-32601` 方法�
   `hello.capabilities` 里的 **`ssh-executor`** 声明 —— 这是核心"有没有中转站"的**唯一判据**
   （结合 `PluginBus` 现有的 enabled / running / degraded 状态）。
 - **L2**（插件 ⇄ agent）：`kAgentProtocolVersion = 1`。
-  插件随包携带**指定版本**的 agent 二进制；`~/.tree/agent/<version>/tree_agent` 的
-  sha256 与随包二进制不一致（或缺失）⇒ 重新推送。
+  插件随包携带**自己那一版**的 agent 二进制（版本由插件编译期注入，见下）；目标机上
+  `~/.tree/agent/<插件自报版本>/tree_agent` 的 sha256 与随包二进制不一致（或缺失）⇒ 重新推送。
   `agent.hello` 回 `protocol != 1` ⇒ 插件报 `handshake_failed` ⇒ 核心回退（并在日志里写清
   "agent 协议 1 不匹配：目标是 N —— 请升级随包 agent"）。
 - **版本号来源**：`tree_tunnel_protocol` 里的 `kAgentProtocolVersion` +
-  `kAgentVersion`（由 `tool/build_agent.dart` 在编译时通过 `--define` 注入）。
+  `kAgentVersion`。`kAgentVersion` **只由两个构建脚本注入**：`tool/build_ssh_plugin.dart`（插件自报它）
+  与 `tool/build_agent.dart`（agent 自报它）——**核心不参与**（2026-10-11 起，见 §10.5）。
+  两个脚本都取 `pubspec.yaml` 的版本（`+` 之前那部分），因此**升版本号必须重跑它们**；
+  `tool/package_windows.dart` 出包时会**校验**产物里的版本串与当前版本一致，不一致直接拒绝出包
+  （那次教训：1.0.3+2 的包里塞着 1.0.2 编的插件与 agent，目标机上因此出现 `~/.tree/agent/1.0.2/`）。
 
 ## 7. 一张时序图（首次用于某主机）
 
@@ -281,6 +299,11 @@ JSON-RPC 标准：`-32700` 解析错 / `-32600` 非法请求 / `-32601` 方法�
 - 隧道**不做端口转发**、不代理任意 TCP —— 它只服务工作空间 IO 这一件事。
 - **agent 进程本身不随 SSH 通道存活**（它由通道拉起）⇒ 通道断 = agent 退；但 **agent 托管的后台任务不受影响**
   （`setsid` + 落盘退出码 + 落盘台账），重连后 `exec.list` 对账。
+  插件拉起 agent 时**总是显式传 `--idle-timeout-ms`（90s）**：物理断网时对端 sshd 收不到 FIN、
+  agent 收不到 EOF，它靠"这么久没有任何帧进来"**自己优雅退出**（见 §10.3）；缺省 0 = 永不只给手工调试用。
+- **旧版本的驻留目录不会自动清理**：`~/.tree/agent/<旧版本>/` 会留着（新版本写新目录）。
+  它是只读遗留物，不影响运行；要清就手工 `rm -rf ~/.tree/agent/<旧版本>`（后台任务的状态目录在
+  `~/.tree/agent/state/`，**与版本目录无关**，别一起删）。
 
 ## 9. 实施补充（三端落地时的最终口径；与上文表格冲突处**以本节为准**）
 
@@ -314,3 +337,56 @@ JSON-RPC 标准：`-32700` 解析错 / `-32600` 非法请求 / `-32601` 方法�
     agent 会以「缺少 --root」直接退出、通道随即关闭，插件只能报 `handshake_failed`。
     所以插件侧先 `resolveRemoteRoot(config.root, $HOME)`（空 / `~` / 相对 ⇒ 相对远端 `$HOME`，绝对 ⇒ 归一化），
     **再 `mkdir -p <root>`**（目录不存在的话，之后每一条 `cd <root> && …` 都会失败）。
+
+## 10. 断连完整性（2026-10-11 定稿；用户真机反馈后的修复口径）
+
+起因：用户在生产机（`open@open`）用**物理断网**模拟抖动，看到两个症状——
+**① 一断网就立刻收到 hook 失败**（而该等到退避耗尽）；**② 恢复网络后目标机上又多出一个执行器进程**。
+两个都查实为真 bug，根因与修法如下（都是**三层一起**的口径）。
+
+### 10.1 「还没好」≠「已判死」（这三条一起才成立）
+
+1. **插件**：隧道在 `connecting` / `booting` / `reconnecting` 时，`tunnel.request` 回
+   **`error_kind = tunnel_not_ready`**（不再是 `tunnel_down`），并附 `tunnel_state` / `attempt`；
+   `down` / 已关闭 / 通道断在请求中途 ⇒ 仍回 `tunnel_down`。
+2. **核心**：**判死只来自两处** —— 心跳快照 `state == down`、以及"插件进程已不可用"
+   （`TunnelSession.pluginAvailable` 实时查 `PluginBus`）。**请求级失败一律不判死**，
+   所以旧插件（还在报 `tunnel_down`）也不会再造成"一次抖动就回退内置"。
+3. **前台请求等它回来**：收到 `tunnel_not_ready` ⇒ 不判死、不失败，**轮询 `tunnel.state`**；
+   回到 `ready` 就**重发那一次请求**（确定未执行 ⇒ 不是重放）；看到 `down` 才以
+   `SshLinkStaleException` 如实失败。兜底预算 `_maxReadyWait = 30 min`（防"反复 ready/不 ready 抖动"
+   把一次调用挂成永恒）。
+4. **后台任务（agent 托管）**：断连期间**什么都不发**（我们真的不知道远端死活），按 30s 慢探等待，
+   **只有判死**才以失联收尾并投递**一次**提醒（文案：可能目标主机关闭、不要大量重试、不要直接重跑）。
+   这一条 2026-10-11 早些时候已落（核心侧），本次修的是它**根本走不到**——因为传输层提前判死了。
+
+### 10.2 判死之后才回退
+
+`FallbackableWorkspace.tunnelDown` 仍然驱动 `WorkspaceToolRunner._ioFor` 撤换 IO 缓存并回退内置，
+但**它只会在真判死时为真**（上面 10.1 的第 2 条），因此"降级只发生在有没有中转站这一维"这条红线
+在时间轴上也成立：**抖一下不回退，耗尽才回退**。
+
+### 10.3 执行器自己察觉断连并优雅退出
+
+- 插件在 `ready` 期间**按 20s 定时 `agent.ping`**（单次 10s 响应窗口），连续 **3** 拍无响应 ⇒
+  认定通道已死（agent 卡死 / 链路黑洞）⇒ 拆掉重建（`tunnel.reconnect` 也走同一探针，
+  因此"ready 但卡死"不再是 no-op 空转）。
+- 插件 spawn 时**总是传 `--idle-timeout-ms 90000`**：agent 只要收到任何一帧就重置这个计时，
+  而插件一直在 ping ⇒ **健康链路上永远到不了**；物理断网时它靠"90s 没有任何帧进来"**自己优雅退出**
+  （关掉会话、退出码 0），不再干等 sshd 的 TCP 超时。用户口径原话："**执行器应该自觉优雅结束**"。
+- 后台任务由 `setsid` 独立跑、退出码与台账都在目标机磁盘上 ⇒ agent 换代对它零影响；
+  **新 agent 起来后从 `procs.json` 认领**（§3.4），所以"重连后那个后台任务照样能回来"。
+
+### 10.4 重建前收掉上一世 agent（双保险，零误杀）
+
+`Tunnel` 记着上一世 agent 的 `pid` + 启动时那次性 `token`；下一次 `_attempt()` 在建连之后、拉起之前
+先跑一条守卫命令：`/proc/<pid>/cmdline` 里**必须含那个 token**（32 位 hex，每次启动都换）才 `kill`；
+读不到 / 核对不上 ⇒ **不杀**，只记日志。宁可留一个（它会在 90s 内自己退），也绝不误杀别人的进程
+或**另一台机器**连到同一主机的 agent。
+
+### 10.5 版本口径与出包校验
+
+- **核心不再声明 agent 版本**（`TunnelConnectRequest` 删掉了 `agentVersion` / `agentSha256` /
+  `agentBinaryName`）：只有插件知道它随包带的是哪个二进制 ⇒ 版本**只由插件自报**。
+- **出包校验**：`tool/package_windows.dart` 复制 `build/plugins`、`build/agents` 之前会扫产物里的
+  版本串，与 `pubspec.yaml` 的版本（`+` 之前）不一致就**拒绝出包**并提示先跑哪条构建命令。

@@ -33,7 +33,11 @@ tree_agent --root <abs> --token <t> [--state-dir <abs>] [--idle-timeout-ms 0] [-
 - **日志一律 stderr**（带 `[tree_agent]` 前缀）；**stdout 只写协议帧**（一行一帧）。唯一例外是
   `--version`：那是独立模式（打印一行后立刻退出，不产生任何帧）。
 - 缺省状态目录 = `$HOME/.tree/agent/state/<sha256(root) 前 16 hex>`（多工作空间互不串扰）。
-- `--idle-timeout-ms` 缺省 **0 = 永不**（仓库口径："没有静态总时长上限"）。
+- `--idle-timeout-ms` **缺省 0 = 永不**（仓库口径："没有静态总时长上限"）——但**由插件拉起的常驻 agent
+  总是显式收到一个值**（`kAgentIdleTimeoutMs = 90s`）：插件在 `ready` 期间一直 `agent.ping`（20s 一拍），
+  所以健康链路上永远到不了这个上限；而**物理断网**时对端 sshd 收不到 FIN、通道不会 EOF，
+  agent 唯一的自救线索就是"这么久没有任何帧进来" ⇒ 到点**自己优雅退出**
+  （用户 2026-10-11 口径："执行器应该自觉优雅结束"）。缺省 0 只给手工调试用。
 
 ## 内容
 
@@ -121,6 +125,11 @@ tree_agent --root <abs> --token <t> [--state-dir <abs>] [--idle-timeout-ms 0] [-
     实现，见 `path_guard.dart`），`sha256` 也自带一份（见 `agent_config.dart`）。
 19. **`stdin` EOF = agent 退出**（协议 §8）：agent 进程本身不随 SSH 通道存活（它由通道拉起），
     但**它托管的后台任务不受影响**（不变量 14）。退出前把 shell 会话全部收口、把写队列排空。
+20. **`--idle-timeout-ms` 到点也退出 = "执行器自觉优雅结束"**（2026-10-11 用户点名）：
+    agent 只要收到**任何一帧**就重置这个计时，而插件在 `ready` 期间一直 `agent.ping`
+    ⇒ 健康链路上**永远到不了**；**物理断网**时对端 sshd 收不到 FIN、通道给不出 EOF，
+    这条就是它唯一的自救线索（缺省级 0 = 永不给手工调试用）。退出同样先收口 shell、排空写队列，
+    后台任务照旧不受影响；新 agent 起来后从落盘台账认领（不变量 14）。
 
 ## 与协议文档的偏差 / 补充决定
 

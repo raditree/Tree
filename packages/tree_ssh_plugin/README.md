@@ -17,6 +17,8 @@ SSH 执行器新架构里的**「中转站」**（`ssh_executor`，**binary 型�
    `tree_agent`，把响应/通知回传。**SFTP 不参与稳态**（它正是旧模型"服务端拒新通道 ⇒ 整条链路哑掉"的根因）。
 3. **重连**：通道断/心跳丢 ⇒ 指数退避重连（重连即**重跑 bootstrap**，所以 agent 版本对账天然完成）；
    退避**累计时长上限 30 分钟**，耗尽 ⇒ 自标 `down`（核心据此回退内置 dartssh2）。
+   `ready` 期间**定时 `agent.ping` 保活**（20s / 单次 10s 窗口 / 连丢 3 拍 ⇒ 拆掉重建）——
+   "进程还在但不回帧"的卡死也由此换得掉（`tunnel.reconnect` 走同一探针，不再是 no-op）。
 4. **申报能力**：`hello` 回 `capabilities: ["ssh-executor"]` —— 核心判断"有没有中转站"的**唯一判据**。
 
 **它不做**：不做临终回退（插件崩了就等于"没有中转站"，核心下一次 IO 解析自然走内置 —— 插件不必知道内置存在）；
@@ -29,8 +31,9 @@ SSH 执行器新架构里的**「中转站」**（`ssh_executor`，**binary 型�
 | `bin/tree_ssh_executor.dart` | 插件入口：stdin 读帧 → `PluginLoop`；stdout 写帧（每帧 flush）；日志一律 stderr |
 | [lib/src/plugin_loop.dart](lib/src/plugin_loop.dart) | **L1 服务端**：`hello` / `ping` / `shutdown` / `tools/list` + 5 个 `tunnel.*`；请求**并发**处理（读循环不 await 业务）；未知方法回 `-32601` |
 | [lib/src/tunnel_manager.dart](lib/src/tunnel_manager.dart) | 多隧道台账 `Map<conn_id, Tunnel>`；`tunnel.ensure` 按 `host\|port\|username\|root\|login_shell` **去重**；`tunnel.state` / `reconnect` / `close` |
-| [lib/src/tunnel.dart](lib/src/tunnel.dart) | 单隧道状态机 `connecting → booting → ready ⇄ reconnecting → down`；退避（[Backoff] + 可注入 [TimerFactory]）；在途请求显式收口；PTY 通知转 `tunnel/event` |
-| [lib/src/bootstrap.dart](lib/src/bootstrap.dart) | 六步 bootstrap（探架构/推送/chmod/拉起/握手）+ 六种 `error_kind`；`buildSpawnCommand` / `mapArch` / token |
+| [lib/src/tunnel.dart](lib/src/tunnel.dart) | 单隧道状态机 `connecting → booting → ready ⇄ reconnecting → down`；退避（[Backoff] + 可注入 [TimerFactory]）；在途请求显式收口；PTY 通知转 `tunnel/event`；**失败面分 `tunnel_not_ready` / `tunnel_down`**；保活与卡死强拆；重建前按 token 收上一世 agent |
+| [lib/src/keepalive.dart](lib/src/keepalive.dart) | **成组常数**：ping 间隔 20s / 单次窗口 10s / 连丢 3 拍 ⇒ 重建；agent 静默上限 90s（spawn 时总是传给 agent）——改一个必须看另一个 |
+| [lib/src/bootstrap.dart](lib/src/bootstrap.dart) | 六步 bootstrap（探架构/推送/chmod/拉起/握手）+ 六种 `error_kind`；`buildSpawnCommand`（含 `--root` 与 `--idle-timeout-ms`）/ `mapArch` / token |
 | [lib/src/agent_client.dart](lib/src/agent_client.dart) | **L2 客户端**：请求响应配对、通知外转、坏帧不致哑、通道死 ⇒ 在途全部以 `AgentChannelClosed` 收口 |
 | [lib/src/ssh_dialer.dart](lib/src/ssh_dialer.dart) | **可注入**的 SSH 面：`SshConnection` / `SshChannel` / `SshDialer` + dartssh2 实现（`DartSshDialer`） |
 | [lib/src/login_shell.dart](lib/src/login_shell.dart) | 登录外壳：三态模板、`bash -lc`→`sh -lc`→原样发、POSIX 单引号转义、一次隧道只探一次 |
@@ -53,8 +56,12 @@ SSH 执行器新架构里的**「中转站」**（`ssh_executor`，**binary 型�
 5. **`tunnel.ensure` 的失败面必须分类**（`error_kind`）：`config_incomplete`（本机配置不全，**不回退**）、
    `arch_unsupported` / `handshake_failed`（不可调和 ⇒ 直接 `down`）、`agent_unreachable` / `push_failed` /
    `spawn_failed`（可重试 ⇒ 退避）。**每一步失败都不静默**（每一步都带可读原因）。
-6. **在途请求不重放**：通道断时全部以可读错误收尾（`error_kind: tunnel_down`），远端命令可能有副作用，
-   "偷偷跑第二遍"是禁止的。
+6. **在途请求不重放，但两种失败面必须分清**（2026-10-11 修，协议 §10）：
+   - 通道**中途**断（`AgentChannelClosed`）⇒ `error_kind: tunnel_down`，文案**不承诺**"未执行"
+     （远端有没有执行到我们无从得知）⇒ 核心如实失败、**不重发**；
+   - 隧道**还没好**（`connecting` / `booting` / `reconnecting`）⇒ `error_kind: tunnel_not_ready`，
+     这意味着**请求根本没转给 agent**（确定未执行）⇒ 核心会**等隧道回来再发一次**（那不是重放）。
+   修复前两者都报 `tunnel_down` ⇒ 核心把"重连中"当判死，一次网络抖动就让后台 hook 立刻失败。
 7. **`tunnel.state` 是权威的判活面**，`tunnel/event`（`kind: state|shell.data|shell.exit`）只是**及时性补充**：
    推送丢了不致命，核心拉 `state` 永远拿得到真相。
 8. **凭据永不外泄**：`password` / `key_passphrase` / `agent --token` 不进任何日志、不进 `tunnel.state` / `tunnel/event`；
@@ -67,21 +74,28 @@ SSH 执行器新架构里的**「中转站」**（`ssh_executor`，**binary 型�
     插件**没有**额外 `kill` 它，也不碰它托管的后台任务（`setsid` + 落盘退出码）。
 12. **测试不碰真网络**：SSH 面全部通过 `SshDialer` / `SshConnection` / `SshChannel` 注入假实现；
     退避用可注入的 `TimerFactory`（**不在测试里真等 30 分钟**）。
+13. **spawn 必带静默上限**：`buildSpawnCommand` **总是**写 `--idle-timeout-ms 90000`
+    （agent 的缺省 0 = 永不只给手工调试用）。理由：物理断网时对端 sshd 收不到 FIN、agent 收不到 EOF，
+    它唯一的自救线索就是"这么久没有任何帧进来"；而插件一直在 ping ⇒ **健康链路上永远到不了这个上限**
+    （`keepalive_test` 有钉子）。这条是用户 2026-10-11 点名要的"**执行器应该自觉优雅结束**"。
+14. **重建前收掉上一世 agent（零误杀）**：`_reapPreviousAgent` 在 dial 之后、bootstrap 之前跑一条
+    `/proc/<pid>/cmdline` **必须含该次启动的一次性 token** 的守卫命令才 `kill`；读不到 / 核对不上 ⇒
+    **不杀**（只记日志）。为什么不按"同 root 的 agent 都杀"：两台机器连同一主机的同一登录用户同一 root
+    是合法场景，那样会互杀。这条是"目标机上执行器不累积"的双保险（主保险是 13 的静默自杀）。
 
 ## 与协议文档的补充决定（本插件侧）
 
-1. **`agent` 参数从哪拿二进制**：协议只说 `{version, bytes_sha256, binary_name?}`，而核心当前
-   （`plugin_tunnel_link.dart`）**只发 `config`**，不发 `agent` ⇒ 插件按**自己的编译期常量**
-   （`kAgentVersion` / 本机算出的 sha256）干活。二进制的查找顺序：`agent.binary_path` →
-   环境变量 `TREE_AGENT_BINARY` → **与插件可执行文件同级的 `plugins/` 的上一级 + `agents/`**
-   （发行包 = `<应用目录>/agents/`；开发态 = `<仓根>/build/agents/`；这正是
-   `tool/build_ssh_plugin.dart` 与 `tool/build_agent.dart` 的落点，与
-   `builtin_plugins.dart` / `tool/package_windows.dart` 里写的「`agents/` 与 `plugins/` 同级是插件的查找约定」一致）
-   → 向上找仓根 → cwd 兜底 → `<目录>/assets/`。`binary_name` 支持 `{arch}` 占位，
-   缺省 `tree_agent-linux-<arch>`。**注意**：`tool/build_ssh_plugin.dart` 目前编译插件时
-   **没有** `-DkAgentVersion=<版本>`，所以插件侧的 `kAgentVersion` 还是 `0.0.0-dev`
-   （目标机驻留目录因此会带这个串）；重推判据是 sha256，功能不受影响，但两端的版本串会对不上
-   （插件会在日志里明说这件事）。修那一处属于 `tool/`（不在本包范围内）。
+1. **版本与二进制由插件自报**（2026-10-11 用户裁决 B，协议 §2/§6/§10.5）：核心**不再声明**
+   agent 版本/sha256/二进制名（`TunnelConnectRequest` 里那几个字段已删），因为核心只发 `config`、
+   插件读 `request['agent']`——两边从来没对上，声明的值也从来没被用上。
+   现在**版本 = 插件编译期注入的 `kAgentVersion`**（`tool/build_ssh_plugin.dart` 用
+   `-DkAgentVersion=<pubspec 版本>` 注入，与 `tool/build_agent.dart` 同一规则），
+   sha256 由插件本机算；请求里若带 `version` 只用来对账并记一条日志。
+   二进制的查找顺序：`agent.binary_path` → 环境变量 `TREE_AGENT_BINARY` → **与插件可执行文件同级的
+   `plugins/` 的上一级 + `agents/`**（发行包 = `<应用目录>/agents/`；开发态 = `<仓根>/build/agents/`，
+   正是 `tool/build_agent.dart` 的落点）→ 向上找仓根 → cwd 兜底 → `<目录>/assets/`；
+   `binary_name` 支持 `{arch}` 占位，缺省 `tree_agent-linux-<arch>`。
+   **升版本号必须重跑两个构建脚本**，`tool/package_windows.dart` 出包时会校验产物里的版本串（不一致直接拒绝）。
 2. **`tunnel.request` 的失败面补 `error_code` / `error_data`**：协议表里只有 `error` / `error_kind`，但核心
    （`plugin_tunnel_link.dart`）要把 `not_found` / `parent_missing` 映射成业务语义 ⇒ agent 的业务错误
    按核心的读法透传 `error_code` / `error_data`，且**不带** `error_kind`（只有链路级失败才带
@@ -116,6 +130,11 @@ dart test
 - `agent_client_test`：请求响应配对、通知、坏帧不致哑、agent 反向请求回 `-32601`、通道死收口；
 - `tunnel_test`：状态机跃迁、退避节奏与耗尽 ⇒ `down`、不可调和 ⇒ 直接 `down`、通道断 ⇒ 在途显式失败且**不重放**、
   显式重连清退避、`exec.run` 的登录外壳包裹、PTY 通知转发、`stateJson` 不含凭据；
+- `tunnel_keepalive_test`：**断连完整性四条**——① 失败面分类（重连中 ⇒ `tunnel_not_ready`，
+  判死/已关闭 ⇒ `tunnel_down`，且 `tunnel_not_ready` **不在** `fallbackKinds` 里）；
+  ② spawn **总是**带 `--idle-timeout-ms`，且静默上限 > ping 间隔；
+  ③ 保活（健康通道永不重建 / 连丢 3 拍 ⇒ 拆掉重建 / `reconnect` 对卡死通道**真的**重建 /
+  健康时仍是 no-op）；④ 重建前按一次性 token 收上一世 agent（且**守卫命令形状**没有"无条件 kill"）；
 - `plugin_loop_test`：L1 分发（含未知方法 `-32601`）、去重（同 key 复用 `conn_id`）、错误分类、`shutdown`/stdin 关闭退出、
   慢 `ensure` 不堵 `ping`；
 - `executor_process_test`：**真起插件进程**说 L1（stdout 无杂质 / 日志走 stderr / 一次塞多帧也逐条回 / 退出码 0）。

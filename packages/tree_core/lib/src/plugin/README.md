@@ -78,6 +78,13 @@
     - 内置目录加 `kind: python|binary`：binary 型**不做运行时探测**，
       直接解析可执行文件同级的 `plugins/<name>[.exe]`（`build/plugins/` 是开发态落点）；
     - `defaultEnabled` 的播种**只处理"从来没落盘过这一条"**：用户显式关过就绝不再自动打开。
+18. **断连的两种"不可用"必须在插件边界就分清**（2026-10-11 新增，协议 §10）：
+    `PluginTunnelLink` 把插件的 `error_kind` 原样翻进 `TunnelUnavailableException`——
+    `tunnel_not_ready`（还没好）与 `tunnel_down`（判死/已关闭/通道断在中途）**不许混**。
+    核对判死的责任在 `tree_local_exec`（只看心跳快照 + 插件是否还可用），
+    但**核心这一侧**多提供一件事：`TunnelSession.pluginAvailable` / `unavailableReason`
+    实时查 `PluginBus.sshExecutorLookup()`，让"插件进程没了"能作为**本地事实**参与判死
+    （而不是靠"某次请求失败"去猜）。
 
 ## 测试
 
