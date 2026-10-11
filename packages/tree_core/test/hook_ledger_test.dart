@@ -83,6 +83,56 @@ void main() {
     expect(logs, hasLength(2), reason: '两条坏条目各留一次可读日志');
   });
 
+  test('session_id 为空 / 缺失 ⇒ **不是**坏形状（执行站起的任务就是这样），照样接得回来', () async {
+    // 写入侧来自 `invocation.sessionId`：执行站 / 无会话语境的后台任务写出来就是空串。
+    await ledger.save(
+      HookLedgerEntry(
+        id: 'hook_no_session',
+        agentId: 'agt_1',
+        sessionId: '',
+        command: 'sleep 10800',
+        logRelative: '.output/hook_no_session.log',
+        pid: 123,
+        startedAt: 5,
+      ),
+    );
+    // 更老的台账可能连 `session_id` 这个键都没有。
+    File(p.join(dir.path, 'no_field.json')).writeAsStringSync(
+      jsonEncode(<String, dynamic>{
+        'id': 'hook_no_field',
+        'agent_id': 'agt_1',
+        'command': 'sleep 10800',
+        'log_relative': '.output/hook_no_field.log',
+        'pid': 456,
+        'started_at': 6,
+      }),
+    );
+    final List<String> logs = <String>[];
+    final HookLedger tolerant = HookLedger(dir.path, log: logs.add);
+    final List<HookLedgerEntry> loaded = await tolerant.load();
+    expect(
+      loaded.map((HookLedgerEntry e) => e.id),
+      <String>['hook_no_session', 'hook_no_field'],
+      reason: '空会话的台账必须读得回来，否则"跨重启接回"对这些任务失效',
+    );
+    expect(loaded.every((HookLedgerEntry e) => e.sessionId.isEmpty), isTrue);
+    expect(loaded.last.pid, 456);
+    expect(logs, isEmpty, reason: '空会话是合法形态，不该记"形状不对"');
+  });
+
+  test('真正接续不全的形状仍然跳过（缺 agent_id / 缺 log_relative）', () async {
+    File(
+      p.join(dir.path, 'no_agent.json'),
+    ).writeAsStringSync(jsonEncode(<String, dynamic>{'id': 'x', 'log_relative': 'a.log'}));
+    File(
+      p.join(dir.path, 'no_log.json'),
+    ).writeAsStringSync(jsonEncode(<String, dynamic>{'id': 'y', 'agent_id': 'agt_1'}));
+    final List<String> logs = <String>[];
+    final HookLedger tolerant = HookLedger(dir.path, log: logs.add);
+    expect(await tolerant.load(), isEmpty);
+    expect(logs, hasLength(2), reason: '两条各自留一次可读日志');
+  });
+
   test('id 里的路径分隔符被清洗（写不出去台账目录之外）', () async {
     await ledger.save(
       HookLedgerEntry(

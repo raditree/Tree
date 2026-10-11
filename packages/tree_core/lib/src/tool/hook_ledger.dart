@@ -43,23 +43,29 @@ class HookLedgerEntry {
     'started_at': startedAt,
   };
 
-  /// 解析一条台账；形状不对返回 null（调用方如实记日志并跳过，不假装读过）。
+  /// 解析一条台账；**接续必需的字段**不全才返回 null（调用方如实记日志并跳过，不假装读过）。
+  ///
+  /// 必需的是 [id] / [agentId] / [logRelative] —— 有这三样就能"找到任务、对上哨兵、继续对账"。
+  ///
+  /// **[sessionId] 允许为空**（2026-10-11 修）：执行站 / 无会话语境起出来的后台任务，
+  /// 写出来就是空串（写入侧来自 `invocation.sessionId`）。读取侧要求非空 = **台账自己读不回来**，
+  /// 真机症状是核心启动时刷 `后台任务台账形状不对，已跳过：hook_*.json`，
+  /// 于是那些远端后台任务**永远不会被接回**（`restorePending` / 链路恢复认领都从 [load] 走）。
   static HookLedgerEntry? fromJson(Object? raw) {
     if (raw is! Map) return null;
     final Object? id = raw['id'];
     final Object? agentId = raw['agent_id'];
-    final Object? sessionId = raw['session_id'];
     final Object? log = raw['log_relative'];
     if (id is! String || id.trim().isEmpty) return null;
     if (agentId is! String || agentId.trim().isEmpty) return null;
-    if (sessionId is! String || sessionId.trim().isEmpty) return null;
     if (log is! String || log.trim().isEmpty) return null;
+    final Object? sessionId = raw['session_id'];
     final Object? pid = raw['pid'];
     final Object? startedAt = raw['started_at'];
     return HookLedgerEntry(
       id: id,
       agentId: agentId,
-      sessionId: sessionId,
+      sessionId: sessionId is String ? sessionId : '',
       command: raw['command'] is String ? raw['command'] as String : '',
       logRelative: log,
       pid: pid is int && pid > 0 ? pid : null,
