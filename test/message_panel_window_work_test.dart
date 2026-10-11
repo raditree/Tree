@@ -52,6 +52,12 @@ class _FakeCore {
   bool _gateOpen = true;
   final List<Completer<void>> _gateWaiters = <Completer<void>>[];
 
+  /// 某一页的 id 列表覆盖（`(start, count) → ids`；null / 返回 null = 按 index 生成）。
+  ///
+  /// 用途：造「页内 id 都已在窗口里」的**下标漂移**（返回窗口已有的 id 列表），
+  /// 或「服务端说这一段没有」（返回空列表）。
+  List<String>? Function(int start, int count)? idsFor;
+
   void closeGate() => _gateOpen = false;
 
   void openGate() {
@@ -83,8 +89,9 @@ class _FakeCore {
 
   Future<void> close() => _http.close(force: true);
 
-  static Map<String, dynamic> _message(int index) => <String, dynamic>{
-        'id': 'm$index',
+  static Map<String, dynamic> _messageWithId(String id, int index) =>
+      <String, dynamic>{
+        'id': id,
         'role': 'agent',
         'content': '第 $index 条',
         'timestamp': DateTime(2026, 1, 1).millisecondsSinceEpoch,
@@ -117,11 +124,16 @@ class _FakeCore {
       final int? from = int.tryParse(q['from'] ?? '');
       final int start = (from ?? (total - limit)).clamp(0, total);
       final int count = limit.clamp(0, total - start);
+      // 「下标漂移」用例要的旋钮：让某一页回**任意** id（默认按 index 生成 `m<index>`）。
+      // 传空列表 = "服务端说这一段没有"；传窗口里已有的 id = 页内 id 与本地落点错位。
+      final List<String> ids = idsFor?.call(start, count) ??
+          <String>[for (int i = 0; i < count; i++) 'm${start + i}'];
       payload = <String, dynamic>{
         'agent_id': 'a1',
         'session_id': q['session_id'] ?? 'session_default',
         'messages': <Map<String, dynamic>>[
-          for (int i = 0; i < count; i++) _message(start + i),
+          for (int i = 0; i < ids.length; i++)
+            _messageWithId(ids[i], start + i),
         ],
         'total': total,
         'offset': start,
@@ -263,4 +275,102 @@ void main() {
     await closePanel(tester);
   });
 
+  // 用户 2026-10-11 报的「中栏空行」：两段已加载消息之间夹着一条 88px 占位槽，切走再切回才好。
+  // 面板侧的那一环是 `_fillWindow` 对 `place` 返回值 `0` 的处置 —— 必须**分两种成因**：
+  //   · 页内 id 都已在窗口里（下标漂移）⇒ 不许整页跳过、**不许拉黑**（否则那个占位槽永久卡住）；
+  //   · 服务端说这一段没有（空页）⇒ 记一笔别再空转（防死循环），这条老口径不能被削掉。
+  testWidgets('下标漂移：页内 id 都已在窗口里时，要搬到权威下标且**不**拉黑（缺口真被填上）',
+      (WidgetTester tester) async {
+    await pumpPanel(tester);
+    final int tailStart = core.total - core.pageSize;
+    final List<String> tailIds = <String>[
+      for (int i = 0; i < core.pageSize; i++) 'm${tailStart + i}',
+    ];
+    // 所有"缺口页"都回**已经在窗口里**的那批 id（末尾一页）—— 这就是漂移：
+    // 页内 id 与"缺口那一段"对不上，老实现会一条都不放（`place` 返回 0 ⇒ 拉黑 ⇒ 永远留空）。
+    core.idsFor = (int start, int count) => start < tailStart ? tailIds : null;
+    core.closeGate();
+    final ScrollPosition pos = positionOf(tester);
+    pos.jumpTo(pos.maxScrollExtent * 0.6); // 视口搬到中段 ⇒ 缺口出现
+    await tester.pump();
+    await flyIO(tester, rounds: 2);
+    core.openGate();
+
+    /// 缺口请求的 `from=`（升序）。
+    List<int> gapFroms() => <int>[
+      for (final String q in core.queries)
+        if (q.contains('from='))
+          int.tryParse(q.split('from=').last.split('&').first) ?? -1,
+    ].where((int f) => f >= 0).toList();
+
+    // **逐帧**看：补页那一帧里，"被请求过的那一段"必须真的有槽位被填上。
+    // 不逐帧看会误判 —— 更靠后的帧里，离视口超过半径的槽位会被**淘汰**回占位（那是正常语义）。
+    final Set<String> tailIdSet = tailIds.toSet();
+    bool filledRequested = false;
+    int moved = 0;
+    for (int frame = 0; frame < 12; frame++) {
+      await flyIO(tester, rounds: 1);
+      final List<ChatMessage?> now = listOf(tester).slots;
+      for (final int from in gapFroms().toSet()) {
+        if (from < now.length && now[from] != null) filledRequested = true;
+      }
+      for (int i = 0; i < now.length; i++) {
+        final String? id = now[i]?.id;
+        if (id != null && tailIdSet.contains(id) && i < tailStart) moved++;
+      }
+    }
+    final List<int> asked = gapFroms();
+    // ignore: avoid_print
+    print('PANEL 漂移: 缺口请求 ${asked.toSet().toList()}（共 ${asked.length} 次）'
+        ' 被搬到权威下标的帧次=$moved 缺口被填上=$filledRequested');
+    expect(asked, isNotEmpty, reason: '测试前提：这一趟确实问过缺口');
+    expect(moved, greaterThan(0),
+        reason: '漂移的 id 必须落到权威下标上（老实现整页跳过 ⇒ 一条都不动）');
+    expect(filledRequested, isTrue,
+        reason: '被请求过的那一段必须真的被填上 —— 老实现里 place 返回 0 ⇒ 起点被拉黑 ⇒ '
+            '永远留空（用户看到的空行）');
+
+    core.idsFor = null;
+    core.closeGate();
+    await closePanel(tester);
+  });
+
+  testWidgets('空页（服务端说这里没有）⇒ 记一笔不再空转（防死循环这条不许被削掉）',
+      (WidgetTester tester) async {
+    await pumpPanel(tester);
+    core.idsFor = (int start, int count) => <String>[]; // 所有补页都回"这一段没有"
+    core.closeGate();
+    final ScrollPosition pos = positionOf(tester);
+    pos.jumpTo(pos.maxScrollExtent * 0.6);
+    await tester.pump();
+    await flyIO(tester, rounds: 2);
+    core.openGate();
+    await flyIO(tester, rounds: 8);
+
+    List<int> gapFroms() => <int>[
+      for (final String q in core.queries)
+        if (q.contains('from='))
+          int.tryParse(q.split('from=').last.split('&').first) ?? -1,
+    ].where((int f) => f >= 0).toList();
+
+    final List<int> before = gapFroms();
+    expect(before, isNotEmpty, reason: '测试前提：确实问过缺口');
+
+    // 视口**不动**，只多跑几帧：被拉黑的那几个起点不该再被问第二次
+    // （不动的视口是刻意的：不引入"移动导致缺口切分点变化"这个干扰项）。
+    await flyIO(tester, rounds: 16);
+    final List<int> after = gapFroms();
+    final List<int> repeated = <int>[
+      for (final int f in before.toSet())
+        if (after.where((int x) => x == f).length > 1) f,
+    ];
+    // ignore: avoid_print
+    print('PANEL 空页: 第一趟=$before 全部=${after.length} 次 被重复问=$repeated');
+    expect(repeated, isEmpty,
+        reason: '空页的那几个起点必须记一笔不再空转（否则每帧都在问同一个必然为空的缺口）');
+
+    core.idsFor = null;
+    core.closeGate();
+    await closePanel(tester);
+  });
 }
