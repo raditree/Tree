@@ -7,6 +7,7 @@ import 'bootstrap.dart';
 import 'ssh_dialer.dart';
 import 'tunnel.dart';
 import 'tunnel_manager.dart';
+import 'ui_panel.dart';
 
 /// 本插件在 `hello` 里自报的身份（核心只读 `plugin_id` / `name` / `capabilities`）。
 ///
@@ -28,6 +29,9 @@ abstract final class PluginMethods {
   static const String ping = 'ping';
   static const String toolsList = 'tools/list';
   static const String shutdown = 'shutdown';
+
+  /// 核心**上行**给插件的通知 method（面板动作、工具事件等都在 `params['event']` 上）。
+  static const String event = 'event';
 }
 
 /// 插件主循环（L1：核心 ⇄ 插件）。
@@ -47,6 +51,8 @@ class PluginLoop {
     required this.send,
     this.log,
     TimerFactory? timerFactory,
+    TunnelUiPanel? uiPanel,
+    TimerFactory? uiTimerFactory,
     DateTime Function()? now,
     int chunkBytes = kPushChunkBytes,
   }) {
@@ -60,12 +66,24 @@ class PluginLoop {
           log: log,
           chunkBytes: chunkBytes,
         );
+    // 左栏面板（2026-10-11 用户要求）：只读状态 + 两个动作。它**独立**于隧道自己
+    // 的那套定时器（`uiTimerFactory` 缺省不复用 `timerFactory`）——面板的 300ms
+    // 节流与退避/保活是两件事，混进同一个注入时钟会让"退避节奏"这类断言失真。
+    _panel = uiPanel ??
+        TunnelUiPanel(
+          send: send,
+          manager: _manager,
+          timerFactory: uiTimerFactory,
+          now: now,
+          log: log,
+        );
   }
 
   final void Function(Map<String, dynamic> message) send;
   final void Function(String message)? log;
 
   late final TunnelManager _manager;
+  late final TunnelUiPanel _panel;
 
   final Set<Future<void>> _inFlight = <Future<void>>{};
   Completer<int>? _done;
@@ -75,6 +93,9 @@ class PluginLoop {
   /// 隧道台账（测试用）。
   TunnelManager get manager => _manager;
 
+  /// 左栏面板（测试用）。
+  TunnelUiPanel get panel => _panel;
+
   /// 当前在途的请求处理数（诊断用）。
   int get inFlightCount => _inFlight.length;
 
@@ -82,6 +103,10 @@ class PluginLoop {
   Future<int> run(Stream<List<int>> input) {
     final Completer<int> done = Completer<int>();
     _done = done;
+    // **声明左栏面板**（`ui/manifest` 只发一次）：不依赖 `hello` 的先后顺序——
+    // 核心对通知不要求先握手，且它会把最后一个生效的 UI 帧缓存下来补发给后连的前端
+    // （`PluginUiCache`）。在这里发的好处是"插件进程一起来，面板就在了"。
+    _panel.declare();
     final LineFrameDecoder decoder = LineFrameDecoder(
       onFrame: _onFrame,
       onError: (String reason) => log?.call('核心报文的坏帧（已丢弃）：$reason'),
@@ -121,8 +146,15 @@ class PluginLoop {
     }
     if (RpcIds.isNotification(frame)) {
       final String method = frame['method'] as String;
+      final Map<String, dynamic> params = _paramsOf(frame);
       if (method == PluginMethods.shutdown) {
         unawaited(shutdown());
+      } else if (method == PluginMethods.event &&
+          params['event'] == kUiActionEvent) {
+        // 面板按钮 / 表单提交（核心上行形状见 `ui_panel.dart` 的 [kUiActionEvent]）。
+        // **判据在 `params['event']` 上**，不是 `method`：写成 `method == 'plugin_ui_action'`
+        // 永远不命中且不报错（`docs/plugin-development.md` §10 常见坑 ⑥）。
+        unawaited(_panel.handleAction(params));
       } else {
         log?.call('核心通知（本插件不消费）：$method');
       }
@@ -162,6 +194,8 @@ class PluginLoop {
           return;
         case TunnelMethods.ensure:
           _reply(id, await _manager.ensure(params));
+          // 面板跟着台账走：**建隧道 / 复用 / 建失败**都把当前态刷一遍（用户正等着看的那一次）。
+          _panel.refresh(force: true);
           return;
         case TunnelMethods.request:
           _reply(id, await _handleTunnelRequest(params));
@@ -176,6 +210,7 @@ class PluginLoop {
             return;
           }
           _reply(id, await _manager.reconnect(connId));
+          _panel.refresh(force: true);
           return;
         case TunnelMethods.close:
           final String? connId = _requiredString(params['conn_id']);
@@ -184,6 +219,7 @@ class PluginLoop {
             return;
           }
           _reply(id, await _manager.closeTunnel(connId));
+          _panel.refresh(force: true);
           return;
         default:
           // 未知方法**绝不静默**（协议级错误，不是业务级 ok:false）。
@@ -231,6 +267,10 @@ class PluginLoop {
   void _sendEvent(Map<String, dynamic> event) {
     // 及时性补充（权威面是 tunnel.state）：丢了不致命，所以这里只发不成对。
     send(rpcNotification(TunnelMethods.event, event));
+    // 面板只关心**状态跃迁**（PTY 的 shell.data / shell.exit 与面板无关，别刷它）。
+    // 刷新走 `ui/update`：核心刻意不把 `tunnel/event` 降级成 plugin_event
+    // （它是核心与插件之间的内部数据面），拿它刷面板不会生效。
+    if (event['kind'] == TunnelEventKind.state) _panel.refresh();
   }
 
   void _finish(int code, String reason) {

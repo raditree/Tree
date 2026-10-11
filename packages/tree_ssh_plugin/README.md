@@ -9,6 +9,10 @@ SSH 执行器新架构里的**「中转站」**（`ssh_executor`，**binary 型�
 
 ## 职责（只做这四件事）
 
+> 另有一个**只读的左栏面板**（`activity` 槽位，2026-10-11 加）：看每条隧道现在什么状态，
+> 需要时手动「重连」或「关闭」。它是**观察面**不是第五件事——面板不持有任何状态，
+> 每次刷新都从隧道台账现读（见「左栏面板」一节）。
+
 1. **bootstrap**：用一次 SSH（`dartssh2`）连上目标机 → `uname -m` 探架构 → 把随包 `tree_agent`
    推送到 `~/.tree/agent/<version>/tree_agent`（`sha256sum` 对账，缺/不一致才推；base64 分块写 `.part`
    → 校验 → `chmod +x` → `mv -f`）→ 以一条 **exec 通道** 拉起它（`<agent> --root <root> --token <token>`）
@@ -40,6 +44,7 @@ SSH 执行器新架构里的**「中转站」**（`ssh_executor`，**binary 型�
 | [lib/src/backoff.dart](lib/src/backoff.dart) | 退避节奏 1s→2s→…→60s 封顶；累计上限 30 分钟（**上限是累计等待，不是单次超时**） |
 | [lib/src/tunnel_config.dart](lib/src/tunnel_config.dart) | L1 `config` 解析（含 `login_shell` 三态、`agents_dir`）、去重键、`host:port/user` 安全标签 |
 | [lib/src/agent_binary.dart](lib/src/agent_binary.dart) | 随包 `tree_agent` 的本机定位（`binary_path` / `TREE_AGENT_BINARY` / **与插件同级的 `agents/`**）与 sha 校验 |
+| [lib/src/ui_panel.dart](lib/src/ui_panel.dart) | **左栏面板**（`activity` 槽位）：只读状态 + 两个动作（重连 / 关闭，关闭两段式）；视图只用受限控件集；刷新 300ms 节流 |
 | [lib/src/sha256.dart](lib/src/sha256.dart) | 最小 SHA-256（**不引 `crypto`**：本插件只允许 `dartssh2` + `tree_tunnel_protocol` 两个运行时依赖） |
 | `test/` | 假远端 / 假 dialer / 假时钟 + 各层用例（见下） |
 
@@ -82,6 +87,15 @@ SSH 执行器新架构里的**「中转站」**（`ssh_executor`，**binary 型�
     `/proc/<pid>/cmdline` **必须含该次启动的一次性 token** 的守卫命令才 `kill`；读不到 / 核对不上 ⇒
     **不杀**（只记日志）。为什么不按"同 root 的 agent 都杀"：两台机器连同一主机的同一登录用户同一 root
     是合法场景，那样会互杀。这条是"目标机上执行器不累积"的双保险（主保险是 13 的静默自杀）。
+15. **左栏面板只读、且不出现凭据**（2026-10-11 加）：视图的**唯一数据源**是隧道台账
+    （`TunnelManager.tunnels` / `Tunnel.stateJson()` / `Tunnel.installPath`）——
+    `password` / `key_passphrase` / 握手 token 从来不在那些字段里，面板也不许自己去找它们
+    （`tunnel_ui_panel_test` 有一条"视图 JSON 不含凭据"的钉子）。
+16. **面板刷新走 `ui/update`，不借 `tunnel/event`**：`tunnel/event` 是核心与插件之间的**内部数据面**
+    （核心明确不把它降级成 `plugin_event`），拿它刷面板不会生效；面板状态变化由 `_sendEvent` 就地触发
+    `TunnelUiPanel.refresh()`（300ms 节流合并）。面板动作的**判据在 `params['event']` 上**
+    （`{"method":"event","params":{"event":"plugin_ui_action"}}`）——写成 `method == 'plugin_ui_action'`
+    永远不命中且不报错（`docs/plugin-development.md` §10 常见坑 ⑥，用例里有一条钉子）。
 
 ## 与协议文档的补充决定（本插件侧）
 
@@ -107,6 +121,33 @@ SSH 执行器新架构里的**「中转站」**（`ssh_executor`，**binary 型�
    以及 dartssh2 自带 keepAlive 三处收敛；`tunnel.state` 才是权威面。
 6. **本机私钥问题归 `config_incomplete`**：`SshConfigException`（私钥文件不存在 / 无法解析）不映射成
    `agent_unreachable`——回退内置也一样连不上，如实报配置问题才对。
+
+## 左栏面板（`activity` 槽位，2026-10-11 加）
+
+用户原话是"该插件好像没有 UI 面板"——**插件侧原本一行 UI 都没申报**（`hello` 只有能力，没有槽位），
+所以界面上完全没有这个执行器的面：只能靠核心日志里的 `[core:tunnel]` 看它在不在干活。
+现在补一个**只读 + 两个动作**的左栏面板（前端与核心那套声明式槽位机制本来就有，本轮没改它们）。
+
+- **槽位**：`slot_key = ssh_executor.activity.1`（固定常量：一个插件条目 = 一个进程实例）、
+  `slot = activity`（活动栏图标项 + 左栏整页，同一个槽位两处呈现）、`icon = link`、`order = 30`；
+  槽位条目**不带** `plugin_id` / `team_id` —— 归属由核心按实例 id 与 `plugins.yaml` 的 `scope.team_id`
+  兜底，空归属 = **任何 team 下都可见**（本插件条目 `scope: {}`）。
+- **声明一次就够**：`PluginLoop.run()` 起手发一条 `ui/manifest`（带初始视图）；之后靠 `ui/update` 刷新。
+  前端后连 / 重连 / 插件比前端先就绪这三种时序由核心的 `PluginUiCache` + 补放兜住
+  （`docs/known-issues.md` 记过这条是怎么修的），插件不必自己重发。
+- **刷新时机**：`_sendEvent` 收到 `kind: state` 的隧道状态跃迁时 `refresh()`（**300ms 节流合并**，
+  连续跃迁只发一帧）；`tunnel.ensure` / `tunnel.reconnect` / `tunnel.close` 三个请求处理后
+  `refresh(force: true)`。PTY 的 `shell.data` / `shell.exit` **不刷面板**（与面板无关）。
+- **内容**：概览（共几条 / 几条就绪）+ 每条隧道一块（`host:port/user`、`conn_id`、`state`、尝试次数、
+  已连秒数、`root`、agent 版本与目标机安装路径、最近一次失败原因）+ 每条的 `[重连]`/`[关闭]` + 底部 `[刷新]`。
+  没有隧道时给指路文案（"核心第一次用 SSH 工作空间时会建一条"），不是空白。
+- **关闭是两段式**（受限控件集没有确认弹窗）：第一次点只把按钮变成 `[确认关闭]`（`danger`）+ `[取消]`，
+  **20s 不用自动过期**回到 `[关闭]`（避免"点一次就走开、回头又点一下"变成误关）；第二次点才真
+  `tunnel.close`。面板里写明后果：**在跑的后台任务不受影响**（目标机 `setsid` + 落盘退出码/台账），
+  但正在进行的远端前台操作会中断，核心下次用这个工作空间会重建。
+- **动作分派**：只看 `action_id`（`refresh` / `reconnect` / `close` / `cancel_close`）+
+  `payload['conn_id']`；未知动作 / 缺 `conn_id` 只记日志，**不抛、不崩**。
+- **上限**：一次最多列 8 条隧道（超出给一行"还有 N 条未显示"）——核心桥对单槽位视图有 64 KiB 上限。
 
 ## 测试
 
@@ -137,6 +178,11 @@ dart test
   健康时仍是 no-op）；④ 重建前按一次性 token 收上一世 agent（且**守卫命令形状**没有"无条件 kill"）；
 - `plugin_loop_test`：L1 分发（含未知方法 `-32601`）、去重（同 key 复用 `conn_id`）、错误分类、`shutdown`/stdin 关闭退出、
   慢 `ensure` 不堵 `ping`；
+- `tunnel_ui_panel_test`：**左栏面板 16 条**——`ui/manifest` 只发一条且槽位/键/空归属正确、视图只用受限控件集、
+  无隧道时有指路文案、有隧道时列出 label/state/agent 版本/安装路径/两个按钮、**视图不出现任何凭据**、
+  300ms 节流（窗口内合并 / `force` 绕过）、重连（健康通道 no-op / 断了的通道真重建）、
+  关闭**两段式**（第一下不真关 / 第二下才关 / 取消 / 20s 过期）、未知动作与缺 `conn_id` 的 fail-open、
+  以及 `PluginLoop` 接线三条（起手声明、状态跃迁自动刷、`params['event']` 判据钉子）；
 - `executor_process_test`：**真起插件进程**说 L1（stdout 无杂质 / 日志走 stderr / 一次塞多帧也逐条回 / 退出码 0）。
 
 **未覆盖**：真机 SSH（本机没有可连的 sshd，仓库也还没有 `tree_agent` 二进制）。因此

@@ -337,6 +337,21 @@ JSON-RPC 标准：`-32700` 解析错 / `-32600` 非法请求 / `-32601` 方法�
     agent 会以「缺少 --root」直接退出、通道随即关闭，插件只能报 `handshake_failed`。
     所以插件侧先 `resolveRemoteRoot(config.root, $HOME)`（空 / `~` / 相对 ⇒ 相对远端 `$HOME`，绝对 ⇒ 归一化），
     **再 `mkdir -p <root>`**（目录不存在的话，之后每一条 `cd <root> && …` 都会失败）。
+11. **插件自带一个只读左栏面板**（`activity` 槽位，2026-10-11 加；机制全部复用既有声明式槽位，
+    核心与前端都没改）：
+    - `slot_key = ssh_executor.activity.1`（固定常量：一个插件条目 = 一个进程实例）、`slot = activity`、
+      `icon = link`、`order = 30`；槽位条目**不带** `plugin_id` / `team_id`（归属由核心按实例 id 与
+      `plugins.yaml` 的 `scope.team_id` 兜底；本条目 `scope: {}` ⇒ **任何 team 下都可见**）。
+    - `ui/manifest` **只发一次**（`PluginLoop.run()` 起手），之后走 `ui/update`；前端后连 / 重连 /
+      插件先就绪这三种时序由核心的 `PluginUiCache` + 补放兜住，插件不自己重发。
+    - 视图**只用受限控件集**（`column` / `text` / `actions`）；**只读**，数据全部来自隧道台账
+      （`TunnelManager.tunnels` / `Tunnel.stateJson()` / `Tunnel.installPath`）——**不出现任何凭据**。
+    - 两个动作经 `plugin_ui_action` 回插件：`reconnect`（健康通道上是 no-op，断了才真重建）与
+      `close`（**两段式**：第一下只进确认态、20s 过期、第二下才 `tunnel.close`）；
+      **判据在 `params['event']` 上**（`{"method":"event","params":{"event":"plugin_ui_action", …}}`），
+      不是 `method` —— 写错就是"点了没反应"且不报错（`docs/plugin-development.md` §10 常见坑 ⑥）。
+    - **刷新不借 `tunnel/event`**：那是核心与插件之间的内部数据面（§9.1 的失败面/事件面），
+      核心明确不把它降级成 `plugin_event`；面板靠状态跃迁就地 `refresh()`（300ms 节流合并）。
 
 ## 10. 断连完整性（2026-10-11 定稿；用户真机反馈后的修复口径）
 

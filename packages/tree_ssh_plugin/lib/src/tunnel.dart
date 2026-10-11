@@ -147,6 +147,12 @@ class Tunnel {
   /// 权威的远端工作空间根（就绪后来自 `agent.hello`）。
   String get root => _root;
 
+  /// 目标机上这一世 agent 的安装路径（未就绪时为空串）。
+  ///
+  /// 给**左栏面板**看的（`ui_panel.dart`）：核心的判活面 [`stateJson`] 刻意不含它，
+  /// 面板要显示"推过去的二进制落在哪"就得从这里读（只读，不影响任何行为）。
+  String get installPath => _installPath;
+
   bool get isClosed => _closed;
 
   /// 权威的判活面（协议 §2）：核心每心跳拉一次 `tunnel.state`。

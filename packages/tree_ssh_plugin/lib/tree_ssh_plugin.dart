@@ -21,3 +21,4 @@ export 'src/ssh_dialer.dart';
 export 'src/tunnel.dart';
 export 'src/tunnel_config.dart';
 export 'src/tunnel_manager.dart';
+export 'src/ui_panel.dart';
