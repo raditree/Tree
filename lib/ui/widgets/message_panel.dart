@@ -791,6 +791,9 @@ class _MessagePanelState extends State<MessagePanel> {
     _callUsages.clear();
     _callUsagesKey = '';
     _callUsagesNote = '';
+    // 临时员工的**落盘复查记账**同样是会话粒度：整表作废后重新进视角要能再拉一次
+    // （跨会话不保留是硬不变量，别的会话的复查结果不该接着用）。
+    _replayedSubagentIds.clear();
     _windowKey = '';
   }
 
@@ -2885,6 +2888,16 @@ class _MessagePanelState extends State<MessagePanel> {
 
   /// 切换视角（空串 = 回主会话）：**就地换**——用户 2026-10-04 明确要求不新开窗口，
   /// 借父 agent 的窗口把对话数据与上下文长度条换成它的。
+  ///
+  /// 进入某个临时员工的视角时，顺带拉一次它的**落盘复查**（[ApiService.getSubagentTranscript]）：
+  /// 过程本来就随会话落盘，但分栏以前只能从**窗口化**的消息流里攒（不变量 19 只热视口附近），
+  /// 老过程被淘汰 / 重启后只热末尾一段时，详情页就"入口还在、点进去是空的"（用户 2026-10-11：
+  /// 「subagent 的工作数据不落盘，导致非常不稳定」）。这条通路一次取全，合并进分栏
+  /// （[SubagentTranscript.mergeTranscript]），不依赖窗口恰好加载了什么。
+  ///
+  /// **跨会话不保留**照旧是硬不变量：核心只认本会话名册，查别的会话回 404；面板因此按
+  /// `(agent, 会话, id)` 记账，换会话 / 切 agent 后重新拉。失败**不清空**已有分栏（与名册
+  /// 拉取同一降级口径：窗口里活着的实时尾巴照旧能看）。
   void _switchView(String subagentId) {
     if (subagentId == _viewSubagentId) return;
     setState(() {
@@ -2893,6 +2906,35 @@ class _MessagePanelState extends State<MessagePanel> {
       _scrollRevision++;
       _bottomJump = true;
     });
+    if (subagentId.isNotEmpty) {
+      unawaited(_replaySubagentTranscript(subagentId));
+    }
+  }
+
+  /// 本次会话里已经复查过的临时员工 id（按到达顺序，幂等判据）。
+  ///
+  /// 换会话 / 切 agent 时清掉（见 [didUpdateWidget] 与 [_handleSelectSession] 里
+  /// `SubagentTranscript.clear` 的同几处）。
+  final Set<String> _replayedSubagentIds = <String>{};
+
+  /// 拉一次某临时员工的**全部落盘工作数据**并合并进分栏（[ApiService.getSubagentTranscript]）。
+  Future<void> _replaySubagentTranscript(String subagentId) async {
+    final Agent? agent = widget.selectedAgent;
+    if (agent == null) return;
+    if (!_replayedSubagentIds.add(subagentId)) return; // 同一会话里只拉一次
+    final String sid = _currentSessionId;
+    try {
+      final List<ChatMessage> transcript =
+          await ApiService.getSubagentTranscript(agent.id, subagentId, sessionId: sid);
+      if (!mounted) return;
+      // 拉取期间换 agent / 换会话（窗口整表作废过）⇒ 这一份已属于别的会话，丢掉
+      if (sid != _currentSessionId) return;
+      if (agent.id != (widget.selectedAgent?.id ?? '')) return;
+      SubagentTranscript.instance.mergeTranscript(subagentId, transcript);
+    } catch (e) {
+      _replayedSubagentIds.remove(subagentId); // 下次进这个视角还能再试
+      debugPrint('临时员工工作数据复查失败（${agent.id}/$sid/$subagentId）：$e');
+    }
   }
 
   /// 右下角那个键该看谁的"工作中"：主会话看 agent，临时员工视角看**它自己**。

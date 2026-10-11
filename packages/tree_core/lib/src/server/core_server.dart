@@ -1328,6 +1328,7 @@ class CoreServer {
     router.add('GET', ApiPaths.agentModelsInfo, _agentModelsInfo);
     router.add('GET', ApiPaths.agentTodos, _agentTodos);
     router.add('GET', ApiPaths.agentSubagents, _agentSubagents);
+    router.add('GET', ApiPaths.agentSubagentTranscript, _agentSubagentTranscript);
     router.add('GET', ApiPaths.agentTeammates, _agentTeammates);
     router.add('PATCH', ApiPaths.teammate, _updateTeammate);
     router.add('GET', ApiPaths.teammateLog, _teammateLog);
@@ -2049,6 +2050,61 @@ class CoreServer {
       'subagents': <Map<String, dynamic>>[
         for (final CoreSubagent s in roster) s.toRosterJson(),
       ],
+    });
+  }
+
+  /// `GET /api/agents/{agentId}/subagents/{subagentId}/transcript?session_id=`：
+  /// 某临时员工的**全部落盘工作数据**（对话与工具调用，只读，方便后期复查）。
+  ///
+  /// 数据**本来就随会话落盘**（父会话 `messages.jsonl` 里带 `subagent_id` 标记的那一段，
+  /// `store/README.md` 不变量 11），这里补的是"按 id 一次取全"的**复查通路**：中栏是
+  /// 窗口化加载（只热视口附近），详情页不能再依赖"窗口恰好加载了什么"
+  /// （用户 2026-10-11：「subagent 的工作数据不落盘，导致非常不稳定」）。
+  ///
+  /// **跨会话不保留**照旧是硬不变量：先把**请求的那一会话**的名册装载（与跑一轮之前
+  /// "先打开会话"同一口径，兜住"重启后名册还没进内存"的时序），再核对记录自己的
+  /// `(ownerAgentId, sessionId)`，对不上就 404 + 可读原因，**不新增任何跨会话存储**。
+  /// 读取走 `store.messages(sub_…, session)`——装饰器按标记过滤出"它自己那一段"
+  /// （后台完成报告除外，那是发起者的输入）。
+  Future<void> _agentSubagentTranscript(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final String agentId = params['agentId'] ?? '';
+    final String subagentId = params['subagentId'] ?? '';
+    if (store.agent(agentId) == null) {
+      await writeJson(request, 404, errorBody('agent 不存在'));
+      return;
+    }
+    final String sessionId =
+        request.uri.queryParameters['session_id'] ?? TreeStore.defaultSessionId;
+    // 先装载这一会话的名册（幂等）：`handle` 只回答"已加载会话里的条目"，
+    // 不先装载就会把"重启后还没打开会话"误判成"不存在"。
+    subagents?.ensureSession(agentId, sessionId);
+    final CoreSubagent? record = subagents?.handle(subagentId);
+    if (record == null) {
+      await writeJson(request, 404, errorBody('临时员工不存在：$subagentId'));
+      return;
+    }
+    if (record.ownerAgentId != agentId || record.sessionId != sessionId) {
+      await writeJson(request, 404, errorBody(
+        '临时员工「${record.name}」属于会话 ${record.sessionId}，'
+        '不在这个会话（$sessionId）里——跨会话不保留是硬不变量。',
+      ));
+      return;
+    }
+    final List<CoreMessage> transcript =
+        List<CoreMessage>.of(store.messages(subagentId, sessionId))
+          ..sort(
+            (CoreMessage a, CoreMessage b) => a.timestamp.compareTo(b.timestamp),
+          );
+    await writeJson(request, 200, <String, dynamic>{
+      'agent_id': agentId,
+      'subagent_id': subagentId,
+      'session_id': sessionId,
+      'total': transcript.length,
+      'messages':
+          transcript.map((CoreMessage m) => _messageJson(m)).toList(),
     });
   }
 

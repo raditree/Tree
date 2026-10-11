@@ -40,6 +40,7 @@
     - **不是全局 agent**：不写 `agents/<id>.yaml`、不进 `agents()` / `teams()` / `members()`、不可被 `message` 寻址、不计 `team_member_count`；`SubagentStore.agents()` 刻意**不**列它。
     - **但既有查询路径认它**：`store.agent(sub_…)` 能查到它（工作空间 / SSH / 系统提示词 / 结果门控因此一处都不用改）。名册是"打开会话时装载"的，`agent(sub_…)` 未命中时会**按需扫一遍各会话名册**兜底（只扫一次并记忆），绝不静默答"不知道"。
     - **消息口径**：`messages(agent, session)` 是"该 agent 自己"的对话，**排掉**临时员工的消息（父 agent 的模型上下文必须保持工具批原子：assistant 的 `tool_calls` 与它的 tool 结果之间不能插进别的消息，带 tools 的思考模式端点会 400）；用户要看的完整消息流走 `sessionMessages`。唯一例外是**后台完成报告**（`kind=subagent_report`）：它带 subagent 标记，却是**发起者**的"新输入"，因此进父上下文、不进临时员工自己的历史。 **自动修复**走 `repairToolResult`：按 `tool_call_id` 把失败信息写回**同一张**工具卡（幂等、不新增消息——`tool_call_id` 重复会让端点严格配对校验过不去）。
+    - **工作数据随会话落盘、可按 id 复查**（用户 2026-10-11：「subagent 的工作数据不落盘，导致非常不稳定」）：临时员工的**对话与工具调用**与主 agent 写进**同一份**父会话 `messages.jsonl`（`agent_id` 是会话主人，靠 `subagent_id` 标记归属；不另起 `data/sub_*/` 目录），`messages(sub_…, session)` 读的就是"它自己那一段"。复查通路（`GET /api/agents/{agentId}/subagents/{subagentId}/transcript`）**直读这一份落盘**，一次取全——中栏窗口化只热视口附近（`lib/README.md` 不变量 19），详情页不许依赖"窗口恰好加载了什么"。**跨会话不保留照旧**：端点先装载**请求那一会话**的名册再核对记录的 `(ownerAgentId, sessionId)`，对不上 ⇒ 404 + 可读原因，不新增任何跨会话存储。
     - **会话内是一棵树**：临时员工可以再召临时员工（`parent_id` + `level`，层级上限 `SubagentLimits.maxDepth`）；删一个按**树**收（它召出来的一起走），避免悬空 `parent_id`——与团队自愈要解决的悬空 `parent_agent_id` 是同一类问题。
 
 12. **`usage.jsonl` 是"逐调用用量"的唯一落点，`messages.jsonl` 的行形状不动。** 一行一次 LLM 调用，字段表固定为

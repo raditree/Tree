@@ -431,6 +431,14 @@
     名字与「谁召来的」也**名册优先**（消息还没加载 / 已被淘汰时仍然正确）。中栏窗口化只热视口附近
     （不变量 19）**不再影响入口**。名册拉取失败**不清空**（保留上一次 + 留一行日志），退回消息流那一份。
     **「不跨会话保留」照旧**：切 agent / 换会话 `SubagentTranscript.clear()` 把名册层与消息层**一起**清掉。
+    - **过程数据同样不许依赖窗口**（用户 2026-10-11：「subagent 的工作数据不落盘，导致非常不稳定」——
+      断言：跨会话不保留照旧，但工作数据落盘、方便后期复查）：进入某个临时员工的视角时，面板按 id
+      拉一次它的**全部落盘工作数据**（对话与工具调用，`GET /api/agents/{agentId}/subagents/{subagentId}/transcript`
+      ⇒ 读父会话 `messages.jsonl` 里带 `subagent_id` 标记的那一段），经
+      [ui/services/subagent_transcript.dart](ui/services/subagent_transcript.dart) 的 `mergeTranscript`
+      **合并**进分栏——同一 id **保留窗口里的活对象**（流式原地长，不许被复查副本顶掉）、新 id **按时间序插回**、
+      只收本员工的、幂等。复查**按会话记账**（`_replayedSubagentIds`，整表作废即清），拉取失败**不清空**已有分栏
+      （与名册同一降级口径）。
 22. **运行态与停止只作用在「当前视角的那个人」上**（用户 2026-10-03：「临时成员的运行情况不应影响主 agent
     运行情况……只有切到对应视角后才改停止按钮，且仅停止对应临时成员」；本文件不变量 18、
     [test/subagent_view_test.dart](../test/subagent_view_test.dart)）：输入框主按钮的 busy / 停止键，主视角只看

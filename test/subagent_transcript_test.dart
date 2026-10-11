@@ -223,4 +223,122 @@ void main() {
       reason: '合并语义：老过程留着，新过程接在后头，同一 id 不重复',
     );
   });
+
+  group(
+    '落盘复查合并（用户 2026-10-11：「subagent 的工作数据不落盘，导致非常不稳定」——'
+    '断言：跨会话不保留照旧，但临时员工的工作数据落盘、方便后期复查）',
+    () {
+      ChatMessage timed(String id, {String subagentId = 'sub_1', int minute = 0}) =>
+          ChatMessage(
+            id: id,
+            role: 'agent',
+            content: id,
+            timestamp: DateTime(2026, 10, 11, 9, minute),
+            subagentId: subagentId,
+            subagentName: '甲',
+            subagentLevel: 1,
+          );
+
+      test('窗口只有活的那一段时，复查把更早的落盘过程按时间序插回前面', () {
+        SubagentTranscript.instance.sync(<ChatMessage>[
+          timed('s2', minute: 2),
+          timed('s3', minute: 3),
+        ]);
+        // 复查通路一次取全（同 id 的是另一份解析出来的对象）
+        SubagentTranscript.instance.mergeTranscript('sub_1', <ChatMessage>[
+          timed('s1', minute: 1),
+          timed('s2', minute: 2),
+          timed('s3', minute: 3),
+        ]);
+        expect(
+          SubagentTranscript.instance
+              .of('sub_1')
+              .map((ChatMessage m) => m.id)
+              .toList(),
+          <String>['s1', 's2', 's3'],
+          reason: '落盘的老过程补在前面，顺序按时间戳',
+        );
+      });
+
+      test('同一 id 已在窗口里 = 保留活对象（流式原地长，不许被复查副本顶掉）', () {
+        final ChatMessage live = timed('s2', minute: 2);
+        SubagentTranscript.instance.sync(<ChatMessage>[live]);
+        SubagentTranscript.instance.mergeTranscript('sub_1', <ChatMessage>[
+          timed('s2', minute: 2),
+          timed('s1', minute: 1),
+        ]);
+        final List<ChatMessage> merged = SubagentTranscript.instance.of('sub_1');
+        expect(
+          merged.map((ChatMessage m) => m.id).toList(),
+          <String>['s1', 's2'],
+        );
+        expect(
+          identical(merged.last, live),
+          isTrue,
+          reason: '去重按 id：已收的活对象优先（sync 的共享引用语义照旧）',
+        );
+      });
+
+      test('复查批里混了别的 id 的消息：只收本员工的（错接线不许污染分栏）', () {
+        SubagentTranscript.instance.mergeTranscript('sub_1', <ChatMessage>[
+          timed('s1'),
+          timed('x1', subagentId: 'sub_2'),
+        ]);
+        expect(
+          SubagentTranscript.instance
+              .of('sub_1')
+              .map((ChatMessage m) => m.id)
+              .toList(),
+          <String>['s1'],
+        );
+        expect(SubagentTranscript.instance.of('sub_2'), isEmpty);
+      });
+
+      test('mergeTranscript 幂等：重复喂同一份复查结果，不重不漏', () {
+        final List<ChatMessage> batch = <ChatMessage>[
+          timed('s1', minute: 1),
+          timed('s2', minute: 2),
+        ];
+        SubagentTranscript.instance.mergeTranscript('sub_1', batch);
+        SubagentTranscript.instance.mergeTranscript('sub_1', batch);
+        expect(SubagentTranscript.instance.of('sub_1'), hasLength(2));
+        // 之后再 sync 同一批活消息也不会重复收（同一去重判据）
+        SubagentTranscript.instance.sync(batch);
+        expect(SubagentTranscript.instance.of('sub_1'), hasLength(2));
+      });
+
+      test('消息流从没加载过它时，复查先补数据、入口与名字跟着立起来', () {
+        expect(SubagentTranscript.instance.ids, isEmpty);
+        SubagentTranscript.instance.mergeTranscript('sub_1', <ChatMessage>[
+          timed('s1'),
+        ]);
+        expect(SubagentTranscript.instance.ids, contains('sub_1'));
+        expect(SubagentTranscript.instance.nameOf('sub_1'), '甲');
+      });
+
+      test('换会话 / 切 agent：复查补的数据与名册层、消息层一起清（跨会话不保留照旧）', () {
+        SubagentTranscript.instance.mergeTranscript('sub_1', <ChatMessage>[
+          timed('s1'),
+        ]);
+        SubagentTranscript.instance.clear();
+        expect(SubagentTranscript.instance.ids, isEmpty);
+        expect(SubagentTranscript.instance.of('sub_1'), isEmpty);
+      });
+
+      test('面板接线源钉：进临时员工视角走复查通路，拉取失败不清空分栏', () {
+        final String panel = File('lib/ui/widgets/message_panel.dart')
+            .readAsStringSync();
+        expect(
+          panel.contains('getSubagentTranscript'),
+          isTrue,
+          reason: '进入临时员工视角要拉一次落盘复查（不能依赖窗口恰好加载了什么）',
+        );
+        expect(
+          panel.contains('mergeTranscript'),
+          isTrue,
+          reason: '复查结果合并进分栏（合并语义，不整表替换）',
+        );
+      });
+    },
+  );
 }

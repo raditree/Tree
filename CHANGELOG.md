@@ -15,6 +15,31 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
+## [Unreleased]
+
+### 断言变化（新增 / 修改的 README 不变量）
+
+- **临时员工的工作数据可按 id 复查，入口与过程都不再依赖消息窗口**（**扩展**
+  [lib/README.md](lib/README.md) 不变量 21、[packages/tree_core/lib/src/store/README.md](packages/tree_core/lib/src/store/README.md)
+  不变量 11、**新增** [packages/tree_core/lib/src/server/README.md](packages/tree_core/lib/src/server/README.md) 不变量 16）：
+  - 事实澄清：临时员工的**对话与工具调用本来就随会话落盘**（与主 agent 同一份父会话
+    `messages.jsonl`，靠 `subagent_id` 标记归属；名册 `subagents.json` 早就落盘）。用户
+    2026-10-11 断言「subagent 的工作数据不落盘，导致非常不稳定」的真实缺口是**取数通路**：
+    详情页的过程只能从**窗口化**的中栏消息流里攒（不变量 19 只热视口附近）——老过程被窗口
+    淘汰、重启后只加载末尾页时，"入口还在、点进去是空的"。
+  - **新增端点** `GET /api/agents/{agentId}/subagents/{subagentId}/transcript?session_id=`（协议常量
+    `ApiPaths.agentSubagentTranscript`）：直读那份落盘、按 id 一次取全、按时间戳排序；先装载**请求
+    那一会话**的名册再核对 `(ownerAgentId, sessionId)`（兜住"重启后名册还没进内存"的时序，不误判
+    "不存在"）；未知 id / 跨会话 / agent 不存在 ⇒ 404 + 可读原因，**不静默回空表**。
+  - **前端**：进入临时员工视角即拉一次复查，`SubagentTranscript.mergeTranscript` **合并**进分栏
+    （同 id 保留窗口里的活对象、新 id 按时间序插回、只收本员工的、幂等）；复查按会话记账（整表作废即清），
+    拉取失败**不清空**已有分栏（与名册同一降级口径）。
+  - **「跨会话不保留」照旧是硬不变量**：本次不新增任何跨会话存储，切 agent / 换会话时名册层、消息层与
+    复查记账一起清。
+  - 测试：`packages/tree_core/test/subagent_transcript_api_test.dart`（含"换装配读同一份落盘"的重启复查）、
+    `test/subagent_transcript_api_frontend_test.dart`（请求形状与解析）、
+    `test/subagent_transcript_test.dart`（合并语义 + 面板接线源钉）。
+
 ## [1.0.3+3] — 2026-10-11
 
 ### 断言变化（新增 / 修改的 README 不变量）

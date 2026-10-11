@@ -108,6 +108,39 @@ class SubagentTranscript extends ChangeNotifier {
     if (changed) notifyListeners();
   }
 
+  /// 合并一次**落盘复查**的结果（`GET …/subagents/{id}/transcript` 的那一段）。
+  ///
+  /// 为什么要有它（用户 2026-10-11：「subagent 的工作数据不落盘，导致非常不稳定」）：
+  /// 过程本来就随会话落盘（父会话 `messages.jsonl` 带 `subagent_id` 标记的那一段），
+  /// 但分栏以前只能从**窗口化**的消息流里攒（不变量 19 只热视口附近）——老过程被
+  /// 淘汰、重启后只热末尾一段时，详情页"入口还在、点进去是空的"。复查通路按 id 一次
+  /// 取全，喂进这里补全分栏，详情页因此不再依赖"窗口恰好加载了什么"。
+  ///
+  /// **合并而不是替换**，与 [sync] 同一判据：
+  /// - 同一 id 已收过 ⇒ **保留活对象**（流式增量原地改内容，复查解析出的副本不许顶掉它）；
+  /// - 新 id ⇒ 按时间戳**插回有序位置**（落盘的老过程排在前面，不是接到尾巴后面）；
+  /// - 只收 [subagentId] 自己的消息（批里混进别人的 = 错接线，如实丢弃不污染）。
+  ///
+  /// 数据来源仍是**会话级**的（核心只认本会话名册，跨会话 404）——「跨会话不保留」
+  /// 照旧是硬不变量，整表作废仍走 [clear]。
+  void mergeTranscript(String subagentId, Iterable<ChatMessage> messages) {
+    bool changed = false;
+    for (final ChatMessage message in messages) {
+      if (message.subagentId != subagentId) continue;
+      if (!_seen.add(message.id)) continue;
+      final List<ChatMessage> list =
+          _byId.putIfAbsent(subagentId, () => <ChatMessage>[]);
+      // 按时间戳插回有序位置：同刻的保持先到的排在前面（窗口里已收的那条在前）
+      int at = list.length;
+      while (at > 0 && list[at - 1].timestamp.isAfter(message.timestamp)) {
+        at--;
+      }
+      list.insert(at, message);
+      changed = true;
+    }
+    if (changed) notifyListeners();
+  }
+
   /// 某个临时员工**是谁召来的**（显示名）——语义对齐用（用户 2026-10-04：「不是跟 teammates
   /// 同级，说错了，是和发出调用的 agent 同级。对齐语义」）：
   ///

@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 import 'package:tree_protocol/tree_protocol.dart';
 
 import '../ui/models/agent.dart';
+import '../ui/models/message.dart';
 import '../ui/models/tool_run.dart';
 import '../ui/models/subagent_roster.dart';
 import '../ui/models/file_content.dart';
@@ -1287,6 +1288,38 @@ class ApiService {
       for (final dynamic item in list)
         if (item is Map)
           SubagentRosterEntry.fromJson(item.cast<String, dynamic>()),
+    ];
+  }
+
+  /// 复查某临时员工的**全部落盘工作数据**（对话与工具调用，只读）。
+  ///
+  /// 调用 `GET /api/agents/{agentId}/subagents/{subagentId}/transcript?session_id=`
+  /// （协议常量 [ApiPaths.agentSubagentTranscript]），返回它的过程消息
+  /// （`subagent_task` / 正文 / 工具卡片，按落库顺序）。
+  ///
+  /// 为什么要有它（用户 2026-10-11：「subagent 的工作数据不落盘，导致非常不稳定」）：
+  /// 过程**本来就随会话落盘**（父会话 `messages.jsonl` 里带 `subagent_id` 标记的那一段），
+  /// 但中栏是窗口化加载（只热视口附近，`lib/README.md` 不变量 19）——详情页不能再依赖
+  /// "窗口恰好加载了什么"，要点开就能拿到**全量**。
+  /// **跨会话不保留**照旧是硬不变量：查别的会话里的 id，核心回 404 + 中文可读原因
+  /// （[_handleResponse] 抛成异常，调用方兜底显示，不静默回空表）。
+  static Future<List<ChatMessage>> getSubagentTranscript(
+    String agentId,
+    String subagentId, {
+    String? sessionId,
+  }) async {
+    final String path = ApiPaths.agentSubagentTranscript
+        .replaceFirst('{agentId}', Uri.encodeComponent(agentId))
+        .replaceFirst('{subagentId}', Uri.encodeComponent(subagentId));
+    final String sid = (sessionId ?? '').trim();
+    final Map<String, dynamic> data = await _getJson(
+      sid.isEmpty ? path : '$path?session_id=${Uri.encodeComponent(sid)}',
+    );
+    final List<dynamic> list =
+        data['messages'] as List<dynamic>? ?? <dynamic>[];
+    return <ChatMessage>[
+      for (final dynamic item in list)
+        if (item is Map) ChatMessage.fromJson(item.cast<String, dynamic>()),
     ];
   }
 

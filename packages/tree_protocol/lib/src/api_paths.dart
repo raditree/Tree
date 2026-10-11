@@ -181,6 +181,17 @@ abstract final class ApiPaths {
   /// **跨会话不保留**：只读该 `(agentId, sessionId)`，删会话即随之消失。
   static const String agentSubagents = '/api/agents/{agentId}/subagents';
 
+  /// 某个临时员工的**全部落盘工作数据**（GET `?session_id=`，**只读**）。
+  ///
+  /// 对话与工具调用**本来就随会话落盘**（父会话 `messages.jsonl` 里带 `subagent_id`
+  /// 标记的那一段，`store/README.md` 不变量 11），但中栏是**窗口化**加载（`lib/README.md`
+  /// 不变量 19）——老过程被窗口淘汰、重启后只热末尾一段时，详情页"入口还在、点进去是空的"
+  /// （用户 2026-10-11：「subagent 的工作数据不落盘，导致非常不稳定」）。这条端点补的就是
+  /// **复查通路**：直读落盘、按 id 一次取全，不受窗口与历史分页影响。
+  /// **跨会话不保留**照旧是硬不变量：只认该 `(agentId, sessionId)` 名册里的条目。
+  static const String agentSubagentTranscript =
+      '/api/agents/{agentId}/subagents/{subagentId}/transcript';
+
   /// 桌面分支保留的全部路径。
   static const Set<String> kept = <String>{
     agents,
@@ -237,6 +248,7 @@ abstract final class ApiPaths {
     toolsRunning,
     toolsRunningClose,
     agentSubagents,
+    agentSubagentTranscript,
   };
 
   /// 全部路径（保留 + 账号组）。

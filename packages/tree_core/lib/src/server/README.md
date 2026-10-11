@@ -60,11 +60,21 @@
     **不含** `agent` 运行配置快照。**跨会话不保留**照旧：只回该 `(agentId, sessionId)`，删会话即随之消失，
     不新增任何跨会话存储；agent 不存在 ⇒ 404 + 可读原因。
 
+16. **临时员工工作数据复查接口：只读、按会话、直读落盘**（[core_server.dart](core_server.dart) 的
+    `_agentSubagentTranscript`，[test/subagent_transcript_api_test.dart](../../../test/subagent_transcript_api_test.dart) 强制）：
+    `GET /api/agents/{agentId}/subagents/{subagentId}/transcript?session_id=` 回 `{agent_id, subagent_id,
+    session_id, total, messages:[…]}`——**直读那份落盘**（父会话 `messages.jsonl` 里带 `subagent_id` 标记的
+    那一段，经 `TreeStore.messages(sub_…, session)` 过滤），一次取全、按时间戳排序，**不受中栏窗口化与历史分页
+    影响**（用户 2026-10-11：「subagent 的工作数据不落盘，导致非常不稳定」——数据其实一直随会话落盘，缺的
+    是这条按 id 复查的通路）。**跨会话不保留**照旧是硬不变量：先装载**请求那一会话**的名册（兜住"重启后名册
+    还没进内存"的时序，不许误判成"不存在"），再核对记录自己的 `(ownerAgentId, sessionId)`；对不上 ⇒ 404 +
+    可读原因，未知 id / agent 不存在同样 404，**一律不静默回空表**。
+
 ## 测试
 
 ```bash
 cd packages/tree_core
 dart test test/server_test.dart test/ws_send_liveness_test.dart test/plugin_hot_apply_test.dart \
-          test/subagents_api_test.dart \
+          test/subagents_api_test.dart test/subagent_transcript_api_test.dart \
           test/compact_api_test.dart test/agents_config_api_test.dart test/agent_delete_api_test.dart
 ```
