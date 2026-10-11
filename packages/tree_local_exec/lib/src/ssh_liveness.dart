@@ -47,6 +47,13 @@ class SshLiveness {
   /// 清零之后再次跨过阈值会再通知一次。可在建好后重新赋值（`connect()` 里挂载）。
   void Function()? onStale;
 
+  /// **链路恢复**（失活 → 活，或重连后 [reset]）那一次的通知，与 [onStale] 对称。
+  ///
+  /// 挂载点是核心 `WorkspaceToolRunner`：用它把"链路失活时以失败收尾、但**台账留着**的
+  /// 后台任务"**认领回来**（用户 2026-10-11 明确：内置路径"失活即失败"的文案照旧，
+  /// 但重连成功后要把任务接回来、给出真实结局）。
+  void Function()? onRecovered;
+
   /// I：心跳间隔，同时也是**单次心跳窗口**的长度（可配）。
   static const Duration defaultInterval = Duration(seconds: 10);
 
@@ -92,8 +99,10 @@ class SshLiveness {
   /// 成功响应同样算心跳：数据还在流动就说明链路活着，不该因为"恰好错过几拍
   /// keepalive"被判失活。重连成功后调它即可清除失活标记。
   void recordBeat([DateTime? at]) {
+    final bool wasStale = isStale;
     _lastBeatAt = at ?? _clock();
     _missed = 0;
+    if (wasStale) onRecovered?.call();
   }
 
   /// 一个心跳窗口内没有回包：累计丢失；达到阈值即唤醒在途操作。
@@ -112,8 +121,10 @@ class SshLiveness {
 
   /// 重连成功后清除失活标记（新连接也可以直接换一个新的 [SshLiveness] 实例）。
   void reset() {
+    final bool wasStale = isStale;
     _missed = 0;
     _lastBeatAt = null;
+    if (wasStale) onRecovered?.call();
   }
 
   /// 失活则立刻抛显式错误——不再往一条判死的链路上发新东西。

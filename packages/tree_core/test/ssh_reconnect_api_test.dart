@@ -45,7 +45,15 @@ class _FakeRemoteIo extends LocalWorkspaceIO implements ReconnectableWorkspace {
     final String? failure = failWith;
     if (failure != null) throw WorkspaceIoException(failure);
     stale = false;
+    // 链路"恢复"了：与传输层一样通知一次（核心据此认领挂账的后台任务）。
+    live?.onRecovered?.call();
   }
+
+  /// 这条假链路自己的活性台账（2026-10-11 起 `ReconnectableWorkspace` 要求暴露它）。
+  SshLiveness? live = SshLiveness(maxMisses: 1);
+
+  @override
+  SshLiveness? get linkLiveness => live;
 }
 
 void main() {

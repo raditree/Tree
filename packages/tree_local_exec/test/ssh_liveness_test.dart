@@ -160,6 +160,26 @@ void main() {
     expect(notified, 1);
   });
 
+  test('onRecovered：失活 → 活 那一次通知一次（重连后"认领挂账任务"的挂点）', () {
+    int recovered = 0;
+    final SshLiveness link = SshLiveness(maxMisses: 2);
+    link.onRecovered = () => recovered++;
+    link.recordBeat();
+    expect(recovered, 0, reason: '本来就没失活，不算"恢复"');
+    link.recordMiss();
+    link.recordMiss();
+    expect(link.isStale, isTrue);
+    link.recordBeat();
+    expect(recovered, 1, reason: '恢复的那一次通知一次');
+    link.recordBeat();
+    expect(recovered, 1, reason: '没再次失活就不该重复通知');
+    // 重连路径：传输层重建成功后调 reset()，同样算一次恢复
+    link.recordMiss();
+    link.recordMiss();
+    link.reset();
+    expect(recovered, 2, reason: 'reset（重连成功）也要通知一次，否则"接回"没有触发点');
+  });
+
   test('staleMessage：如实说"不会自行恢复"（旧连接不会自己活回来）', () {
     final SshLiveness link = SshLiveness(maxMisses: 3);
     for (int i = 0; i < 3; i++) {

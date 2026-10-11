@@ -138,6 +138,117 @@ class _FakeTunnelSsh
 }
 
 void main() {
+  /// 判死（退避耗尽）后**台账留着**，链路恢复后能**认领回来**、给出真实结局
+  /// （用户 2026-10-11 明确要求："失活即失败"照旧，但重连后该 hook 要回来）。
+  ///
+  /// "判死收尾但台账保留"这一条由本文件另一条用例（"退避耗尽（判死）⇒ 回一条**失联**提醒"）
+  /// 直接钉住；这里钉的是**接回来**这一段：挂账的条目能被 `restorePending(agentId:)` 认领，
+  /// 拿到的退出码来自**目标机落盘台账**（不是本机猜的），且认领后台账才被清掉。
+  test('挂账的任务在链路恢复后能被认领回来，并给出真实退出码', () async {
+    final Directory dir = Directory.systemTemp.createTempSync('tree_hook_adopt_');
+    addTearDown(() async {
+      for (int i = 0; i < 10 && dir.existsSync(); i++) {
+        try {
+          dir.deleteSync(recursive: true);
+        } catch (_) {
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        }
+      }
+    });
+    final HookLedger ledger = HookLedger(dir.path);
+    final _FakeTunnelSsh transport = _FakeTunnelSsh()
+      ..state = BackgroundStates.exited
+      ..exitCode = 0
+      // 认领靠"按日志路径从台账里认出那条任务"⇒ 假远端也要在同一个绝对路径上报到
+      ..logPath = '/ws/.output/hook_1791683373134_1.log';
+    final SshWorkspaceIO io = SshWorkspaceIO('/ws', transport);
+    // 挂账的那一条（判死时留下的：命令、日志相对路径、归属都要在）
+    await ledger.save(HookLedgerEntry(
+      id: 'hook_1791683373134_1',
+      agentId: 'agt_1',
+      sessionId: 'ses_1',
+      command: 'python train.py',
+      logRelative: '.output/hook_1791683373134_1.log',
+      startedAt: DateTime(2026, 1, 1).millisecondsSinceEpoch,
+    ));
+    final TerminalHooks hooks = TerminalHooks(ledger: ledger);
+    addTearDown(hooks.close);
+    final List<String> notices = <String>[];
+    hooks.onFinished = (HookTask t, int code) async {
+      notices.add('${t.id}|$code');
+    };
+
+    final List<String> spawnedBefore = List<String>.from(transport.spawnedCommands);
+    final int resumed = await hooks.restorePending(
+      ioFor: (String agentId) async => agentId == 'agt_1' ? io : null,
+      agentId: 'agt_1',
+    );
+    expect(resumed, 1, reason: '挂账的那条要被认领回来');
+
+    // 认领 = **对账**，不是重跑：等它按落盘台账收尾
+    final Stopwatch wait = Stopwatch()..start();
+    while (notices.isEmpty && wait.elapsed < const Duration(seconds: 20)) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+    expect(notices, hasLength(1), reason: '认领后要投一次结局');
+    expect(notices.single, 'hook_1791683373134_1|0', reason: '退出码来自目标机落盘台账');
+    expect(
+      transport.spawnedCommands,
+      spawnedBefore,
+      reason: '接回来只对账，**绝不重跑**命令',
+    );
+    expect(await ledger.load(), isEmpty, reason: '拿到真实结局才删台账');
+  });
+
+  test('restorePending 的 agent 过滤：别的 agent 的挂账不动', () async {
+    final Directory dir = Directory.systemTemp.createTempSync('tree_hook_filter_');
+    addTearDown(() async {
+      for (int i = 0; i < 10 && dir.existsSync(); i++) {
+        try {
+          dir.deleteSync(recursive: true);
+        } catch (_) {
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        }
+      }
+    });
+    final HookLedger ledger = HookLedger(dir.path);
+    // 两条挂账，分属两个 agent
+    for (final String agent in <String>['agt_1', 'agt_2']) {
+      await ledger.save(HookLedgerEntry(
+        id: 'hook_$agent',
+        agentId: agent,
+        sessionId: 'ses_1',
+        command: 'echo $agent',
+        logRelative: '.output/$agent.log',
+        startedAt: DateTime(2026, 1, 1).millisecondsSinceEpoch,
+      ));
+    }
+    final _FakeTunnelSsh transport = _FakeTunnelSsh()
+      ..state = BackgroundStates.exited
+      ..exitCode = 0
+      ..logPath = '/ws/.output/agt_1.log';
+    final SshWorkspaceIO io = SshWorkspaceIO('/ws', transport);
+    final TerminalHooks hooks = TerminalHooks(ledger: ledger);
+    addTearDown(hooks.close);
+    final List<String> finished = <String>[];
+    hooks.onFinished = (HookTask t, int code) async => finished.add(t.id);
+
+    final int resumed = await hooks.restorePending(
+      ioFor: (String agentId) async => io,
+      agentId: 'agt_1',
+    );
+    expect(resumed, 1, reason: '只认领 agt_1 名下的那条');
+    // 等 agt_1 那条按落盘台账收尾（收尾时才清它自己的台账）
+    final Stopwatch wait = Stopwatch()..start();
+    while (finished.isEmpty && wait.elapsed < const Duration(seconds: 20)) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+    expect(finished, <String>['hook_agt_1'], reason: '只有 agt_1 那条被认领');
+    final List<HookLedgerEntry> left = await ledger.load();
+    expect(left, hasLength(1));
+    expect(left.single.agentId, 'agt_2', reason: '别的 agent 的挂账不许被顺手认领');
+  });
+
   test('隧道托管：核心重启后接上任务，并把 hook 结束提醒回给**原会话**（且不重跑）', () async {
     final Directory dir = Directory.systemTemp.createTempSync('tree_hook_tunnel_');
     addTearDown(() async {
@@ -275,6 +386,13 @@ void main() {
     // 文案里有 markdown 加固（`**目标主机关闭**`），所以断言取不带星号的那一段
     expect(notice, contains('目标主机关闭'));
     expect(notice, contains('不要大量重试'));
-    expect(await ledger.load(), isEmpty, reason: '失联也收尾、也清台账（否则重启会反复提醒）');
+    expect(
+      await ledger.load(),
+      hasLength(1),
+      reason: '2026-10-11 改口径：失联收尾**保留台账**（远端进程可能还在跑）——'
+          '链路恢复 / 下次启动时由 `restorePending` 认领，拿到**真实**结局再删。'
+          '一次任务最多因此多收到一条"其实已结束"的提醒，不会无限重复：'
+          '真相一旦可判（exited / gone），认领即收尾并清台账。',
+    );
   }, timeout: const Timeout(Duration(seconds: 60)));
 }

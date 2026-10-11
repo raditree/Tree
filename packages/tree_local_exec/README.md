@@ -183,6 +183,12 @@
       并投递**一次**"失联"提醒（文案写明**可能目标主机关闭 / 不要大量重试**），**此后不再探测**。
     判据来源：`SshWorkspaceIO._tunnelDead`（内置 dartssh2 后端不实现 `FallbackableWorkspace`
     ⇒ 恒 false，走它自己那条"失活即失败"的老口径）。
+    **2026-10-11 用户补充**：内置 dartssh2 路径**保持"失活即失败"**（文案与上界都不改），
+    但**台账不删**（`TerminalHooks._fail` 的 `keepLedger`）——远端进程可能还在跑；
+    链路**重建成功**时由与 `onStale` 对称的 **`SshLiveness.onRecovered`**（失活→活 或
+    `reset()` 时各触发一次）通知核心去 `restorePending(agentId:)` **认领回来**，
+    按哨兵文件继续对账、拿到**真实**退出码后再投一次完成提醒并清台账。
+    挂点经 `ReconnectableWorkspace.linkLiveness` 暴露（`PrivateWorkspaceIO` 透传）。
 22. **"判死"只有两个来源，请求级失败一律不判死（2026-10-11 修，用户口径）**：
     - 心跳快照说 `down`（插件自标：退避耗尽 / 不可调和）；
     - 插件**进程已不可用**（`TunnelSession.pluginAvailable` 实时查询 `PluginBus` 得 false）——

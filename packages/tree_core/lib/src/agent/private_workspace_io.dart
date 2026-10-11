@@ -128,6 +128,9 @@ class PrivateWorkspaceIO
     await link.reconnectLink();
   }
 
+  @override
+  SshLiveness? get linkLiveness => _reconnectable?.linkLiveness;
+
   // ── 中转站判死（FallbackableWorkspace）：**透传**给内层 ──────────────────
   //
   // 核心 `_ioFor` 拿到的是这个装饰器，所以"中转站已判死、该换回内置实现"这件事

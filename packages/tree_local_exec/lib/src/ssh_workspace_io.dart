@@ -148,6 +148,12 @@ abstract interface class ReconnectableWorkspace {
 
   /// **重建**这条链路：建新连接成功后才替换并清零丢失计数，失败抛可读异常且保持失活态。
   Future<void> reconnectLink();
+
+  /// 这条链路的活性台账（核心用来挂**恢复**回调：链路失活时以失败收尾、但台账留着的
+  /// 后台任务，在链路重建成功后要能**认领回来**）。
+  ///
+  /// 可以为 null（装饰器内层不是远端后端时没有链路），所以调用方须判空。
+  SshLiveness? get linkLiveness;
 }
 
 /// 远端一层目录条目（M7g）。
@@ -373,6 +379,9 @@ class SshWorkspaceIO
 
   @override
   Future<void> reconnectLink() => _transport.reconnect();
+
+  @override
+  SshLiveness? get linkLiveness => _link;
 
   /// 与本地实现共用同一套排除目录（依赖/构建产物）。
   static Set<String> get defaultExcludedDirs =>

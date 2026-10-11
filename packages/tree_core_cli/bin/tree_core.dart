@@ -291,8 +291,15 @@ Future<void> main(List<String> args) async {
     // 插件缺失 / 未启用 / 起不来 / 这条隧道建不起来 / 退避耗尽 ⇒ 回退内置 `dartssh2`。
     // 每 agent 一条连接，按需建立并缓存；远端根目录取 ssh.root（空 = 远端 HOME）。
     sshIoFactory: (SshConfig config) async {
-      final ({PluginHost? host, String reason}) lookup = plugins
-          .sshExecutorLookup();
+      // **插件正在启动就有界地等一会儿**（2026-10-11 用户真机教训）：核心启动时插件是异步
+      // 拉起的，实测有一段几十~几百毫秒的窗口（用户机器上 SSH 解析比插件就绪只早 **53ms**）。
+      // 那时直接回退内置，这条 SSH 会**整场**跑在内置后端上（IO 会被缓存、不会自己回切），
+      // 中转站等于白装。只对"正在启动"这一种原因等 1s；已停用 / 崩了 / 没申报能力的立即回退。
+      final ({PluginHost? host, String reason}) lookup = await plugins
+          .sshExecutorLookupWaitingForStart(
+            timeout: const Duration(seconds: 1),
+            interval: const Duration(milliseconds: 100),
+          );
       if (lookup.host != null) {
         try {
           final TunnelSshTransport transport = await TunnelSshTransport.connect(

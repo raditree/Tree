@@ -172,6 +172,8 @@ class WorkspaceToolRunner implements ToolRunner {
 
   final Map<String, WorkspaceIO> _ios = <String, WorkspaceIO>{};
 
+  /// 已经试过"内置后端 → 中转站"升级的 agent（每个只给一次机会，见 [_ioFor] 里的撤换分支）。
+  final Set<String> _sshUpgradeTried = <String>{};
   /// 已创建的工作空间根目录（自检/日志用）。
   Iterable<String> get workspaceRoots =>
       _ios.values.map((WorkspaceIO io) => io.root);
@@ -694,7 +696,29 @@ class WorkspaceToolRunner implements ToolRunner {
           '⇒ 撤换工作空间缓存，本次改用内置 SSH 后端',
         );
       } else {
-        return cached;
+        // **内置后端 + 中转站插件已就绪 ⇒ 一次性撤换缓存**（2026-10-11 用户真机反馈）：
+        // 核心启动时插件是异步拉起的（实测窗口几十~几百毫秒，用户机器上只差 53ms）。
+        // 那一次 SSH 若因此走了内置 dartssh2，这条 IO 会被**缓存住**——插件就绪后它也不会
+        // 自己回切，于是整场都跑在内置后端上、中转站等于白装（日志里只有 `[core:tool] SSH 已连接`，
+        // 一条 `[core:tunnel]` 都没有）。
+        //
+        // 只给每个 agent **一次**机会（`_sshUpgradeTried`）：插件在、但隧道建不起来时，
+        // 反复撤换只会让每次解析都去撞一次 dial（插件的退避是自己掌握的，不该被我们催）。
+        final PluginBus? bus = pluginBus;
+        final bool sshConfigured = resolveSshConfig?.call(ownerId) != null;
+        if (bus != null &&
+            sshConfigured &&
+            !_sshUpgradeTried.contains(ownerId) &&
+            bus.sshExecutorLookup().host != null) {
+          _sshUpgradeTried.add(ownerId);
+          _ios.remove(ownerId);
+          log?.call(
+            'agent $ownerId 的 SSH 当前是内置后端，但中转站插件已就绪 ⇒ 撤换工作空间缓存，'
+            '下一次解析改用中转站（只尝试一次；失败则继续用内置）',
+          );
+        } else {
+          return cached;
+        }
       }
     }
 
@@ -716,6 +740,7 @@ class WorkspaceToolRunner implements ToolRunner {
       // 私有状态按 agent 分栏（`.self/…` → `.tree/<agent_id>/.self/…`）：
       // 团队成员与 leader 共享工作目录，但各自的 .self 必须分开（见 PrivateWorkspaceIO）。
       final WorkspaceIO io = PrivateWorkspaceIO(await factory(ssh), ownerId);
+      _installLinkRecoveredHook(io, ownerId);
       _ios[ownerId] = io;
       return io;
     }
@@ -737,8 +762,24 @@ class WorkspaceToolRunner implements ToolRunner {
     return io;
   }
 
-  /// 结果过长时保留头 70% + 尾 30%（尾部的错误栈/总结通常最有用）。
+  /// 链路**恢复**（失活 → 活 / 重连后 reset）时，把"挂账的后台任务"认领回来
+  /// （2026-10-11 用户真机要求）。
   ///
+  /// 内置路径的 hook 在链路失活时**照旧立即以失败收尾**（文案不变、不引入等待与上界），
+  /// 但台账**留着**（见 `TerminalHooks._fail` 的 `keepLedger`）⇒ 链路重建成功那一刻由这里
+  /// 走 [TerminalHooks.restorePending]，`attachBackground` 按哨兵文件继续对账，
+  /// 拿到**真实**退出码后再投一次完成提醒（第一次那条已经写明"可能仍在跑、不要重跑"）。
+  void _installLinkRecoveredHook(WorkspaceIO io, String ownerId) {
+    if (io is! ReconnectableWorkspace) return;
+    final SshLiveness? live = (io as ReconnectableWorkspace).linkLiveness;
+    if (live == null) return;
+    live.onRecovered = () {
+      log?.call('agent $ownerId 的 SSH 链路已重建 ⇒ 认领挂账的后台任务');
+      unawaited(hooks.restorePending(ioFor: _ioFor, agentId: ownerId));
+    };
+  }
+
+  /// 结果过长时保留头 70% + 尾 30%（尾部的错误栈/总结通常最有用）。
   /// [maxResultChars] 为 0（默认）时**不截断**：超长结果由 `ToolResultGate` 重定向到
   /// `.self/results/`（送模型的只有提示 + 预览），工具层不能抢先把它砍掉。
   ToolOutcome _truncate(ToolOutcome outcome) {

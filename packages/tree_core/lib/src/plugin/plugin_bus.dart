@@ -365,8 +365,7 @@ class PluginBus {
   /// 返回 `(host, reason)`：`host == null` 时 [reason] 是**可读的"为什么没有"**
   /// （直接进日志 / 右栏，用户看得懂）；`host != null` 时 reason 为空串。
   /// 刻意**不抛异常**也不回 null-only：判空失败必须有话可说，否则就是"点了开关没反应"。
-  ({PluginHost? host, String reason}) sshExecutorLookup() {
-    load();
+  ({PluginHost? host, String reason}) sshExecutorLookup() {    load();
     if (!enabled) {
       return (host: null, reason: '插件系统总开关为关（plugins.yaml 顶层 enabled: false）');
     }
@@ -410,6 +409,53 @@ class PluginBus {
       host: null,
       reason: sawEnabled ? '中转站插件不可用' : '中转站插件条目已停用（enabled: false）',
     );
+  }
+
+  /// 中转站插件**正在启动**（条目启用、但实例还没起来 / 还没申报能力）。
+  ///
+  /// 为什么单独问这一个问题：核心启动时插件是**异步**拉起的，实测有一段几十~几百毫秒的窗口
+  /// ——用户机器 2026-10-11 的日志就是 `09:35:00.081` 解析 SSH、`09:35:00.134` 插件就绪
+  /// （**只差 53ms**）。那时若直接回退内置 dartssh2，这条 SSH 会**整场都跑在内置后端上**
+  /// （工作空间 IO 会被缓存、不会自己回切），中转站等于白装一次。
+  ///
+  /// 与"没有中转站"的其它原因**刻意分开**：条目停用 / 启动失败（[_errors] 里有原因）/
+  /// 通道断了 —— 这些都不该让调用方空等。
+  bool sshExecutorStarting() {
+    load();
+    if (!enabled) return false;
+    for (final PluginConfig config in _configs) {
+      if (config.id != kSshExecutorPluginId) continue;
+      if (!config.enabled) return false;
+      final PluginHost? host = _hosts[config.id];
+      if (host == null) {
+        // 尚无实例：**没有错误记录**才算"还在启动"，有错误就是启动失败了。
+        return (_errors[config.id] ?? '').isEmpty;
+      }
+      if (host.isClosed) return false;
+      return !host.capabilities.contains(kCapabilitySshExecutor);
+    }
+    return false;
+  }
+
+  /// 同 [sshExecutorLookup]，但"插件正在启动"时**有界等待**它起来。
+  ///
+  /// 只用于跨越核心启动那段窗口（见 [sshExecutorStarting] 的注释）：
+  /// 非"正在启动"的原因（已停用 / 崩溃 / 能力未申报）**立即返回**，绝不空等。
+  /// 等待期间每 [interval] 探一次，总时长不超过 [timeout]。
+  Future<({PluginHost? host, String reason})> sshExecutorLookupWaitingForStart({
+    Duration timeout = const Duration(seconds: 1),
+    Duration interval = const Duration(milliseconds: 100),
+  }) async {
+    ({PluginHost? host, String reason}) lookup = sshExecutorLookup();
+    if (lookup.host != null || timeout <= Duration.zero) return lookup;
+    if (!sshExecutorStarting()) return lookup;
+    final Stopwatch elapsed = Stopwatch()..start();
+    while (elapsed.elapsed < timeout) {
+      await Future<void>.delayed(interval);
+      lookup = sshExecutorLookup();
+      if (lookup.host != null || !sshExecutorStarting()) return lookup;
+    }
+    return lookup;
   }
 
   /// 某插件的健康度快照（心跳判活；degraded **不等于**死亡）。

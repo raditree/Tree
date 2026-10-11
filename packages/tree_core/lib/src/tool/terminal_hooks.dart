@@ -319,12 +319,15 @@ class TerminalHooks {
   /// 返回"重新接上的任务数"。
   Future<int> restorePending({
     required Future<WorkspaceIO?> Function(String agentId) ioFor,
+    String? agentId,
   }) async {
     final HookLedger? led = ledger;
     if (led == null) return 0;
     final List<HookLedgerEntry> entries = await led.load();
     int resumed = 0;
     for (final HookLedgerEntry entry in entries) {
+      // 只认领该 agent 名下的（链路恢复时按 agent 触发；启动时 [agentId] 为 null = 全部）。
+      if (agentId != null && entry.agentId != agentId) continue;
       if (_tasks.containsKey(entry.id)) continue;
       WorkspaceIO? io;
       try {
@@ -580,11 +583,15 @@ class TerminalHooks {
   }
 
   /// 结束时的收尾（登记表 + 台账）。**任务本身留在 `_tasks` 里**（status 还能查到）。
-  Future<void> _settle(HookTask task) async {
+  ///
+  /// [keepLedger] = **链路失活 / 中转站判死**那种"拿不到退出码"的收尾：文案照旧（失活即失败），
+  /// 但台账**留着** —— 远端进程可能还在跑，链路恢复后由 [restorePending] 认领回来、
+  /// 拿到真实结局再收尾（用户 2026-10-11 明确要求"重连后该 hook 要回来"）。
+  Future<void> _settle(HookTask task, {bool keepLedger = false}) async {
     final ToolRun? run = task.run;
     if (run != null) toolRuns?.finish(run);
     // 已收尾的远端任务不再需要接续 ⇒ 删台账（本机任务本来就没有台账）。
-    if (task.remote) await ledger?.remove(task.id);
+    if (task.remote && !keepLedger) await ledger?.remove(task.id);
   }
 
   /// 链路判失活 / 中转站判死等"拿不到退出码"的收场：**如实**记一个可辨退出码，不假装正常结束。
@@ -603,7 +610,9 @@ class TerminalHooks {
       '# 该任务**可能**已经结束、也**可能**仍在目标机上跑；最可能是**目标主机关闭或不可达**。\n'
       '# 请先确认目标主机与 SSH 通路，**不要大量重试**，也不要直接重跑（会重复副作用）。\n',
     );
-    await _settle(task);
+    // **不删台账**（`keepLedger: true`）：这条任务是远端后台任务，远端进程可能还在跑，
+    // 台账是"链路恢复后接回来"的唯一凭据；本机任务本来就没有台账，传 true 也不会有残留。
+    await _settle(task, keepLedger: true);
     log?.call('后台任务失联 ${task.id}：$error');
     await onFinished?.call(task, remoteFailureExitCode);
   }

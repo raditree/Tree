@@ -85,6 +85,12 @@
     但**核心这一侧**多提供一件事：`TunnelSession.pluginAvailable` / `unavailableReason`
     实时查 `PluginBus.sshExecutorLookup()`，让"插件进程没了"能作为**本地事实**参与判死
     （而不是靠"某次请求失败"去猜）。
+19. **插件"正在启动"与"没有插件"必须分开，且前者要**有界等待**（2026-10-11 用户真机）**：
+    插件是异步拉起的，SSH 解析可能比它就绪只早**几十毫秒**（用户机器实测 53ms）。那时直接回退内置，
+    这条 IO 会被 `WorkspaceToolRunner._ios` 缓存住、不会自己回切 ⇒ **整场都跑在内置后端上**。
+    所以：`sshExecutorStarting()` 只对"条目启用、但实例没起来（且无错误记录）/ 未申报能力"回 true；
+    `sshExecutorLookupWaitingForStart(timeout, interval)` 只在这一种情形下有界等待（生产 1s / 100ms），
+    其它原因（条目停用 / 启动失败 / 通道断）**立即返回**，绝不空等。
 
 ## 测试
 

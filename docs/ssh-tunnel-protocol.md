@@ -390,3 +390,38 @@ JSON-RPC 标准：`-32700` 解析错 / `-32600` 非法请求 / `-32601` 方法�
   `agentBinaryName`）：只有插件知道它随包带的是哪个二进制 ⇒ 版本**只由插件自报**。
 - **出包校验**：`tool/package_windows.dart` 复制 `build/plugins`、`build/agents` 之前会扫产物里的
   版本串，与 `pubspec.yaml` 的版本（`+` 之前）不一致就**拒绝出包**并提示先跑哪条构建命令。
+
+### 10.6 核心启动竞态：插件还没起来时**别急着回退内置**（2026-10-11 用户真机）
+
+现象（用户机器日志，两行只差 **53ms**）：
+
+```
+09:35:00.081 pid=22556 [core:tool]   无 SSH 中转站（中转站插件「SSH 执行器中转站」未在运行（尚未启动））⇒ 使用内置 dartssh2
+09:35:00.134 pid=22556 [core:plugin] 插件 ssh_executor 就绪
+```
+
+插件是**异步**拉起的，而 SSH 解析可能在插件就绪**之前**发生；更糟的是那次解析一旦回退内置，
+这条 IO 会被 `WorkspaceToolRunner._ios` **缓存住**、插件就绪后也不会自己回切 ⇒
+**整场都跑在内置 dartssh2 上，中转站等于白装**（用户那一跑就是这样，一条 `[core:tunnel]` 都没有）。
+
+修法两件（都在核心侧，插件协议不变）：
+
+1. **有界等待**：`PluginBus.sshExecutorLookupWaitingForStart(timeout: 1s, interval: 100ms)` ——
+   `sshIoFactory` 在"条目启用、但实例还没起来 / 还没申报能力"时最多等 1s 再定这条 SSH 走哪条路。
+   **只对这一种原因等**：条目停用 / 启动失败（`_errors` 里有原因）/ 通道断了 ⇒ 立即回退。
+2. **一次性撤换**：`_ioFor` 发现"缓存里是内置后端（非 `FallbackableWorkspace`）而插件已经就绪"时，
+   丢掉缓存重解析（每个 agent **只试一次**，避免插件在但隧道建不起来时每次解析都去撞 dial）。
+
+### 10.7 内置 dartssh2 路径：失败文案照旧，但**台账留着、链路恢复后接回**（用户 2026-10-11）
+
+用户明确：内置路径**不引入等待与上界**（"失活即失败"照旧，文案不变），只要求
+"**重连后该 hook 要回来**"。做法（不动两端口径，只补一条接回通道）：
+
+- `TerminalHooks._fail`（链路失活 / 判死那种收尾）改成 `_settle(task, keepLedger: true)`：
+  **不删台账**（本机任务本来就没有台账条目）⇒ 远端进程可能还在跑，台账是唯一凭据；
+- `SshLiveness` 加与 `onStale` 对称的 **`onRecovered`**（失活 → 活，或重连成功的 `reset()` 时各触发一次）；
+  `ReconnectableWorkspace` 暴露 `linkLiveness` ⇒ 核心 `WorkspaceToolRunner._installLinkRecoveredHook`
+  在链路重建那一刻调 `TerminalHooks.restorePending(ioFor:…, agentId:…)`（新增按 agent 过滤）把任务认领回来；
+- 认领 = **对账**：`attachBackground` 按哨兵文件（内置路径）/ 落盘台账（托管路径）继续判，拿到
+  **真实**退出码后再投一次完成提醒（第一次那条已写明"可能仍在跑、不要重跑"），然后才删台账。
+  不会无限重复：真相一旦可判（`exited` / `gone`），认领即收尾并清台账。
