@@ -197,6 +197,11 @@
       旧会话绑的是旧实例（通道已关）而"当前"有新实例 ⇒ 只看 `pluginAvailable` 会判成"插件在 ⇒ 不判死"
       ⇒ 这条死链路被 `_ioFor` 永久缓存、重建不了（2026-10-11 真机：每 10 秒一条
       `心跳失败：插件 ssh_executor 的输出流已关闭`，而且"重启插件也没用"）。
+    - **`SshWorkspaceIO` 必须实现 `FallbackableWorkspace`**（2026-10-11 再修）：核心 `_ioFor` 的
+      撤换判据读的是**外层装饰器**的 `tunnelDown`（`PrivateWorkspaceIO` → `SshWorkspaceIO` →
+      `TunnelSshTransport`）；本层曾经没实现 ⇒ `tunnelDown` 恒 false ⇒ 撤换那条路成了死代码 ⇒
+      判死之后那个 SSH 工作空间**再也用不了**（用户原话"总不能手动关一次就不能用了"）。
+      `ssh_workspace_io_test` 有钉子（判死信息必须能穿透这一层）。
     此外**任何**请求级失败都不许判死，尤其 `error_kind: tunnel_not_ready`（插件还没好：
     `connecting`/`booting`/`reconnecting`）：那只是"重连中"，此时**前台操作等隧道回来**
     （`TunnelSshTransport._awaitTunnelReadyElseFail`：轮询 `tunnel.state`，回到 `ready` 就**重发**

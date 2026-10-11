@@ -476,6 +476,18 @@ JSON-RPC 标准：`-32700` 解析错 / `-32600` 非法请求 / `-32601` 方法�
 `SshLinkStaleException` 如实失败）。否则这条已判死的会话每 10 秒还会拉一次状态、打一行
 `心跳失败`——真机 2026-10-11 就是这样把日志刷了几百行，反而掩盖了判死那一条。
 
+**判死必须真的能被核心看到（透传链）**：`WorkspaceToolRunner._ioFor` 的撤换判据读的是
+**外层装饰器**的 `tunnelDown`，它必须一路透传：`PrivateWorkspaceIO`（`tree_core`）
+→ `SshWorkspaceIO`（`tree_local_exec`）→ `TunnelSshTransport`（真正置标志的人）。
+`SshWorkspaceIO` 一度**没有**实现 `FallbackableWorkspace` ⇒ `tunnelDown` 恒为 false ⇒
+"判死 ⇒ 撤换缓存 ⇒ 下次解析重建"这条路对 SSH 工作空间成了**死代码** ⇒ 判死之后核心一直握着
+那条死链路（用户 2026-10-11 原话："总不能手动关一次就不能用了"）。三层现在都实现该接口，
+`ssh_workspace_io_test` 有一条钉子钉住这一环。
+
+**判死文案如实**：插件自标 `down`（真·退避耗尽 / 不可调和）与"插件已不再持有这条 `conn_id`"
+（隧道被收掉 / 面板关闭 / 插件换了实例）都会让心跳快照成 `down`。文案按 `last_error` 有内容与否
+分开写 —— 不再一律硬拼"（退避耗尽）"。
+
 **顺带加固 `conn_id`**：插件侧 `conn_id` 现在带**进程内随机前缀**（`conn-<rand4>-<seq>`）。
 理由：它本来是进程内序号，插件重启后从 `conn-1` 重来；核心侧若还留着旧会话（绑的是旧实例），
 拿旧 `conn_id` 去新实例问状态，就可能**命中新实例的另一条隧道**（root 可能不同）⇒ 静默跨 root

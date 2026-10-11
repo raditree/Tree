@@ -15,6 +15,21 @@ void main() {
     io = SshWorkspaceIO('/ws', t);
   });
 
+  group('中转站判死（FallbackableWorkspace）', () {
+    test('判死信息必须能穿透这一层（否则"关一次隧道就再也不能用"）', () {
+      // 核心 `_ioFor` 的撤换判据是"外层 PrivateWorkspaceIO 的 tunnelDown"，
+      // 它透传到这一层、再透传到传输层 —— 中间断一环（本层曾经就没 implement），
+      // 那条已经判死的隧道就会被**永久缓存**：真机 2026-10-11，面板里手动关掉隧道后
+      // 那个 SSH 工作空间再也用不了，只能重启应用（用户原话"总不能手动关一次就不能用了"）。
+      expect(io.tunnelDown, isFalse);
+      t
+        ..tunnelDownFlag = true
+        ..fallbackReasonFlag = '绑定的中转站实例已不可用（插件已重启 / 停用 / 退出）';
+      expect(io.tunnelDown, isTrue);
+      expect(io.fallbackReason, contains('实例'));
+    });
+  });
+
   group('resolve', () {
     test('拼接相对路径并做 POSIX 归一化', () {
       expect(io.resolve('a/b.txt'), '/ws/a/b.txt');

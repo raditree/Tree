@@ -10,7 +10,21 @@ import 'fake_ssh_shell_channel.dart';
 /// 真 dartssh2 那一层只负责搬运字节（[dartssh_transport.dart]），语义全部落在
 /// [SshWorkspaceIO]；因此这里用假实现覆盖路径约束、行范围、唯一匹配编辑、
 /// grep 排除规则、结果截断等真正容易出错的部分。
-class FakeSshTransport implements SshTransport {
+class FakeSshTransport implements SshTransport, FallbackableWorkspace {
+  /// 「这条隧道已判死」的开关（用例直接摆；真机上由 `TunnelSshTransport` 置）。
+  ///
+  /// 它存在这里的意义：钉住 [SshWorkspaceIO] **必须**把判死信息暴露出去 ——
+  /// 核心 `_ioFor` 靠 `tunnelDown` 决定撤换缓存，内层不透传就会让"关一次隧道
+  /// 就再也不能用"（2026-10-11 用户真机）。
+  bool tunnelDownFlag = false;
+  String fallbackReasonFlag = '';
+
+  @override
+  bool get tunnelDown => tunnelDownFlag;
+
+  @override
+  String get fallbackReason => fallbackReasonFlag;
+
   final Map<String, List<int>> files = <String, List<int>>{};
   final List<String> commands = <String>[];
   final List<Duration> timeouts = <Duration>[];

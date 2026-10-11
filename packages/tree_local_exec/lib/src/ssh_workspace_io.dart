@@ -345,7 +345,13 @@ class SshWorkspaceIO
         WorkspaceIO,
         WorkspaceFiles,
         BackgroundExecHost,
-        ReconnectableWorkspace {
+        ReconnectableWorkspace,
+        // **必须暴露**（2026-10-11 修）：核心 `_ioFor` 判定"中转站判死 ⇒ 撤换这条 IO 缓存"
+        // 靠的就是它。不实现的话，外层 `PrivateWorkspaceIO._fallbackable` 取到 null ⇒
+        // `tunnelDown` 恒为 false ⇒ 那句 `if (!fallback.tunnelDown) return cached;` 永远命中
+        // ⇒ 判死的那条死隧道被**永久缓存**（真机症状：面板里手动关掉隧道之后，
+        // 那个 SSH 工作空间就再也用不了了，只能重启应用 —— 用户 2026-10-11 原话）。
+        FallbackableWorkspace {
   SshWorkspaceIO(
     this.root,
     this._transport, {
@@ -382,6 +388,23 @@ class SshWorkspaceIO
 
   @override
   SshLiveness? get linkLiveness => _link;
+
+  // ── 中转站判死（FallbackableWorkspace）：**透传**给传输层 ──────────────
+  //
+  // 核心 `_ioFor` 拿到的是外层 `PrivateWorkspaceIO`，它要一路透到这里才看得到判死；
+  // 中间任何一层漏掉，缓存里那条死隧道就会被一直用下去（真机症状："手动关一次就不能用了"）。
+
+  @override
+  bool get tunnelDown => _tunnelDead;
+
+  @override
+  String get fallbackReason {
+    final SshTransport target = _transport;
+    if (target is FallbackableWorkspace) {
+      return (target as FallbackableWorkspace).fallbackReason;
+    }
+    return '';
+  }
 
   /// 与本地实现共用同一套排除目录（依赖/构建产物）。
   static Set<String> get defaultExcludedDirs =>

@@ -497,9 +497,13 @@ class TunnelSshTransport
       final TunnelSnapshot snapshot = await _session.snapshot();
       _lastSnapshot = snapshot;
       if (snapshot.down) {
+        // 文案**如实**（用户 2026-10-11 要求）：`lastError` 有内容就用它 —— 例如
+        // "中转站已不再持有这条隧道"（那其实是"隧道已不存在"，跟退避耗尽不是一回事）；
+        // 只有它为空时才是插件自标 down（真·退避耗尽 / 不可调和）。
         _markDown(
-          '中转站已判隧道不可用（退避耗尽）：'
-          '${snapshot.lastError.isEmpty ? '未提供原因' : snapshot.lastError}',
+          snapshot.lastError.isEmpty
+              ? '中转站已判隧道不可用（退避耗尽 / 不可调和）'
+              : snapshot.lastError,
         );
         _liveness.recordMiss();
         return;
@@ -594,8 +598,9 @@ class TunnelSshTransport
       _lastSnapshot = snapshot;
       if (snapshot.down) {
         _markDown(
-          '中转站已判隧道不可用（退避耗尽）：'
-          '${snapshot.lastError.isEmpty ? '未提供原因' : snapshot.lastError}',
+          snapshot.lastError.isEmpty
+              ? '中转站已判隧道不可用（退避耗尽 / 不可调和）'
+              : snapshot.lastError,
         );
         throw SshLinkStaleException('中转站已判隧道不可用：$_fallbackReason');
       }

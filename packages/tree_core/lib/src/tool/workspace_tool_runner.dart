@@ -688,6 +688,11 @@ class WorkspaceToolRunner implements ToolRunner {
       // 显式 `as`：`FallbackableWorkspace` 不是 `WorkspaceIO` 的子类型，提升不成立
       // （与 `reconnectSshLink` 里的 `ReconnectableWorkspace` 同一写法）。
       if (cached is FallbackableWorkspace) {
+        // ⚠ 这条判据要求**内层真的实现了** `FallbackableWorkspace`、且包装层一路透传：
+        // `PrivateWorkspaceIO`（本包）→ `SshWorkspaceIO`（tree_local_exec）→ `TunnelSshTransport`
+        // （真正置标志的人）。中间断一环 ⇒ 这里的 `tunnelDown` 恒为 false ⇒ 这句永远
+        // `return cached` ⇒ 判死的隧道被**永久缓存**（2026-10-11 真机：面板里手动关掉隧道之后，
+        // 那个 SSH 工作空间再也用不了，只能重启应用 —— 用户原话"总不能手动关一次就不能用了"）。
         final FallbackableWorkspace fallback = cached as FallbackableWorkspace;
         if (!fallback.tunnelDown) return cached;
         _ios.remove(ownerId);
