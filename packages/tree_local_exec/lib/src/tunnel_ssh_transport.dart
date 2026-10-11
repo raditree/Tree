@@ -489,7 +489,10 @@ class TunnelSshTransport
 
   /// 一拍心跳：拉一次 `tunnel.state`。**这是权威的判活证据面**（插件的推送只是补充）。
   Future<void> _beat() async {
-    if (_closed) return;
+    // 判死之后**不再拉状态**（双保险：定时器也会在 `_markDown` 里被停掉）。
+    // 不停的话，已判死的会话每 I 秒继续拉一次（必然失败）并打一行"心跳失败"——
+    // 真机 2026-10-11 就是这样把日志刷了几百行，让人以为"判死没发生 / 什么都没变"。
+    if (_closed || _tunnelDown) return;
     try {
       final TunnelSnapshot snapshot = await _session.snapshot();
       _lastSnapshot = snapshot;
@@ -541,6 +544,19 @@ class TunnelSshTransport
     if (_tunnelDown) return;
     _tunnelDown = true;
     _fallbackReason = reason;
+    // **判死后停心跳**（2026-10-11 真机）：这条会话已经不再被使用（核心下次解析会撤换它），
+    // 不停的话它会每 I 秒继续拉一次 `tunnel.state`（必然失败）并打一行"心跳失败"，
+    // 把日志刷满 —— 反而让人以为"判死没发生 / 重启插件什么都没变"。
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+    // 判死 = 这条链路已经不能用 ⇒ 让活性台账**立刻**进入失活态：在途操作随即以
+    // `SshLinkStaleException` 收尾（与内置路径"失活即失败"同一语义），不会再往一条
+    // 判死的通道上发东西。为什么必须"立刻"：心跳已经在上面被停掉，靠"再等几拍凑够阈值"
+    // 那条路没了；而 `onStale` 那一次会被 [_handleStale] 的 `_tunnelDown` 守卫挡回去，
+    // 不会再启动一次对着旧 host 的无用后台重连。
+    while (!_liveness.isStale) {
+      _liveness.recordMiss();
+    }
     _log?.call(
       '中转站不可用（$reason）—— 这条连接已判死，下一次工作空间解析将回退内置 dartssh2',
     );

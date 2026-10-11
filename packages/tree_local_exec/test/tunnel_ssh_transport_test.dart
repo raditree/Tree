@@ -611,6 +611,26 @@ void main() {
       await t.close();
     });
 
+    test('判死之后**停掉心跳**（不再每 I 秒刷一条"心跳失败"）', () async {
+      final FakeTunnelSession session = FakeTunnelSession()
+        ..boundHostAlive = false
+        ..snapshotError = WorkspaceIoException('插件通道已关');
+      final TunnelSshTransport t = await TunnelSshTransport.connect(
+        FakeTunnelLink(session),
+        request(),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      expect(t.tunnelDown, isTrue);
+      final int callsAtDown = session.snapshotCalls;
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      expect(
+        session.snapshotCalls,
+        callsAtDown,
+        reason: '判死后不许再拉状态：否则日志被"心跳失败"刷满，反而掩盖真正的判死原因',
+      );
+      await t.close();
+    });
+
     test('reconnect 单飞：并发调用复用同一次', () async {
       final FakeTunnelSession session = FakeTunnelSession();
       final TunnelSshTransport t = await TunnelSshTransport.connect(
