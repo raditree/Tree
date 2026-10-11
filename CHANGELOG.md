@@ -15,7 +15,7 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
-## [Unreleased]
+## [1.0.3+4] — 2026-10-11
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
@@ -39,6 +39,28 @@
   - 测试：`packages/tree_core/test/subagent_transcript_api_test.dart`（含"换装配读同一份落盘"的重启复查）、
     `test/subagent_transcript_api_frontend_test.dart`（请求形状与解析）、
     `test/subagent_transcript_test.dart`（合并语义 + 面板接线源钉）。
+
+- **SSH 执行器：判死口径精确化、判死即静默、判死必须能穿透到核心、重建后拾回挂账任务**（**修改**
+  [packages/tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 22、**新增**
+  [packages/tree_ssh_plugin/README.md](packages/tree_ssh_plugin/README.md) 不变量 15/16、
+  **同步** [docs/ssh-tunnel-protocol.md](docs/ssh-tunnel-protocol.md) §10.1 / §10.8）：
+  - **判死 = "我这条会话绑定的那个中转站实例已不可用"**（而不是"当前有没有插件"）：插件停用→启用
+    或崩溃被重拉会换一个进程实例，旧会话绑的是旧实例；只看"当前有没有插件"会让这条绑着死实例的
+    链路被**永久缓存**（真机：每 10 秒刷一行"心跳失败：输出流已关闭"，而且"重启插件也没用"）。
+  - **判死即静默收尾**：判死那一拍**停掉心跳**、并把活性台账**立刻**置失活；否则已判死的会话会
+    一直拉状态、把日志刷满，反而掩盖判死那一条。
+  - **判死必须能穿透到核心**：`SshWorkspaceIO` 实现 `FallbackableWorkspace` 并把 `tunnelDown` /
+    `fallbackReason` 透传给传输层 —— 中间断一环，核心 `_ioFor` 的"判死 ⇒ 撤换缓存"就是**死代码**
+    （真机症状：面板里手动关掉隧道之后，那个 SSH 工作空间再也用不了，只能重启应用）。
+  - **重建即拾起 + 召回要告知**：判死重建时，**新建 SSH 工作空间的第一时刻**就调 `restorePending`
+    （认领 = 对账，**不重跑、不新起**）；认领成功后往**原会话**投一条"SSH 链路已恢复：已召回 N 个
+    挂账的后台任务…"并列出清单，拿到**真实退出码**再投一次结束提醒。
+  - **左栏面板**（`ssh_executor` 插件）：只读状态 + 两段式关闭 + 动作结果/失败**一律当行显示**；
+    `conn_id` 带**进程内随机前缀**（防插件重启后序号重来、旧请求打到新隧道）。
+  - **后台任务台账**：`session_id` 为空 / 缺失不再被判成"形状不对"跳过（执行站起的后台任务
+    以前跨重启接不回来）。
+  - 测试：`tree_local_exec` 判死钉子（换实例 ⇒ 判死 / 实例还在 ⇒ 不判死 / 判死后停心跳 / 透传）+
+    `tree_ssh_plugin` 面板 18 条与 `conn_id` 形状断言 + `tree_core` "挂账被召回时要告知"。
 
 ## [1.0.3+3] — 2026-10-11
 
