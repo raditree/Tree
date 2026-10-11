@@ -125,6 +125,26 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 追加增量，列表里已有的 id 不再新建气泡。详见 [MessageReplayGuard]。
   final MessageReplayGuard _replayGuard = MessageReplayGuard();
 
+  /// **在途段缓冲**：切走 agent / 会话时，把窗口里"还没封口"的消息（正在流式的
+  /// 思考/正文段、正在跑的工具卡）按 `agent::会话` 摘出来暂存。
+  ///
+  /// 为什么需要：核心是"段关闭即落库"（`endSegment` 里 `msg_end` 广播在前、
+  /// `persistSegment` 在后），在途段**不在 store 里**——重切 agent 后历史页自然没有
+  /// 它们（用户报告：正在执行的工具调用/思考，重切后消失），而后续 `msg_chunk`
+  /// 又因"列表里没有这条"被当孤立增量丢弃。这里在 [_clearWindow] 前把它们摘存
+  /// （消息 id 全局唯一，增量帧按 id 仍能写回缓冲对象），末尾页落地时把仍在途的
+  /// 那几条接回窗口（见 [_restoreInFlight]）。
+  final Map<String, List<ChatMessage>> _inFlightByConversation =
+      <String, List<ChatMessage>>{};
+
+  /// 当前窗口内容的归属（`agentId::sessionId`）：随 [_applyTailPage] 更新、
+  /// [_clearWindow] 摘走后置空。捕获在途段要用它——切 agent 的 `didUpdateWidget`
+  /// 里 `widget.selectedAgent` 已是**新** agent，现场拼 key 会拼错。
+  String _windowKey = '';
+
+  /// 单个会话的在途缓冲上限（异常堆积时的保险；正常一轮只有个位数条）。
+  static const int _inFlightCap = 100;
+
   /// WebSocket 服务
   final WebSocketService _webSocket = WebSocketService();
 
@@ -747,7 +767,11 @@ class _MessagePanelState extends State<MessagePanel> {
   }
 
   /// 整表作废（换 agent / 换会话 / 清空历史）：窗口 + 封口闸 + 补页记账一起清。
+  ///
+  /// 清空前先把**还没封口**的在途消息摘进 [_inFlightByConversation]：它们在核心
+  /// 那边还没落库，重切回来时历史页里没有，不摘就整段消失（用户 2026-10-11 报告）。
   void _clearWindow() {
+    _captureInFlight();
     _window.clear();
     // 窗口作废 ⇒ 代次递增：在途响应（末尾页 / 补页 / 定位页）回来一律作废。
     // 只比 session_id 挡不住（各 agent 的默认会话 id 都是 session_default）。
@@ -767,6 +791,59 @@ class _MessagePanelState extends State<MessagePanel> {
     _callUsages.clear();
     _callUsagesKey = '';
     _callUsagesNote = '';
+    _windowKey = '';
+  }
+
+  /// 摘存窗口里**还没封口**的消息（流式中 / 工具在跑），按归属会话暂存。
+  ///
+  /// 消息对象是共享引用：摘出来后增量帧仍按 id 找得到它（见 [_detachedById]），
+  /// 正文继续累积；重切回来由 [_restoreInFlight] 接回窗口。
+  void _captureInFlight() {
+    final String key = _windowKey.isNotEmpty
+        ? _windowKey
+        : '${widget.selectedAgent?.id ?? ''}::$_currentSessionId';
+    final List<ChatMessage> live = _window.loadedList
+        .where(
+          (ChatMessage m) =>
+              m.id.isNotEmpty && (m.isStreaming || m.toolRunning),
+        )
+        .toList(growable: false);
+    if (live.isEmpty) return;
+    final List<ChatMessage> merged =
+        _inFlightByConversation.putIfAbsent(key, () => <ChatMessage>[]);
+    for (final ChatMessage m in live) {
+      if (merged.any((ChatMessage e) => e.id == m.id)) continue;
+      merged.add(m);
+    }
+    while (merged.length > _inFlightCap) {
+      merged.removeAt(0);
+    }
+  }
+
+  /// 按 id 找**不在窗口里**的在途消息（id 全局唯一，跨会话查找安全）。
+  ChatMessage? _detachedById(String id) {
+    if (id.isEmpty || _inFlightByConversation.isEmpty) return null;
+    for (final List<ChatMessage> list in _inFlightByConversation.values) {
+      for (final ChatMessage m in list) {
+        if (m.id == id) return m;
+      }
+    }
+    return null;
+  }
+
+  /// 末尾页落地后：把仍然在途的缓冲消息接回窗口末尾（整键作废，不重复接）。
+  ///
+  /// 只接"还在写"的（isStreaming / toolRunning）；切换期间已收尾的那些核心已落库，
+  /// 会随历史页一起回来（同 id 由 [MessageWindow.appendTail] 的原位替换兜底）。
+  /// 若历史页里已经有同 id（封口落库赶在末尾页快照之前），同样以历史页为准。
+  void _restoreInFlight(String key) {
+    final List<ChatMessage>? pending = _inFlightByConversation.remove(key);
+    if (pending == null || pending.isEmpty) return;
+    for (final ChatMessage m in pending) {
+      if (!m.isStreaming && !m.toolRunning) continue;
+      if (_window.containsId(m.id)) continue;
+      _window.appendTail(m);
+    }
   }
 
   /// 切 agent 时**预测**要显示的会话 id（并发发末尾页用）。
@@ -884,8 +961,9 @@ class _MessagePanelState extends State<MessagePanel> {
       _window.resetTail(offset: page.offset, messages: tail);
       _window.ensureTotal(page.total);
       // 这份末尾页现在就在窗口里：记账，供"并发预取 + 会话列表随后选中同一会话"时
-      // 免掉第二次拉取（见 [_loadHistory]）
+      // 免掉第二次拉取（见 [_loadHistory]）；窗口归属一并记下（_captureInFlight 用）
       _tailApplied = '${agent.id}::$sessionId';
+      _windowKey = '${agent.id}::$sessionId';
       _loadingGaps.clear();
       _barrenGaps.clear();
       _locateKeep = null;
@@ -896,6 +974,8 @@ class _MessagePanelState extends State<MessagePanel> {
       // msg_start / msg_chunk 不许再长出第二条气泡。**累加**封口而不是替换：
       // 窗口只热视口附近，被淘汰的那些 id 也要认得出来（见 _hasMessage）。
       _replayGuard.sealAll(tail.map((ChatMessage m) => m.id));
+      // 在途段接回窗口（切走时摘下的流式思考/正文/工具卡，见 _captureInFlight）
+      _restoreInFlight('${agent.id}::$sessionId');
       // 历史整批重建：驱动 MessageList 无动画直达底部（避免下滑动画）
       _bottomJump = true;
       _scrollRevision++;
@@ -1030,6 +1110,8 @@ class _MessagePanelState extends State<MessagePanel> {
     final String sessionId = _currentSessionId;
     // 代次快照：窗口一旦被整表作废（切 agent / 切会话），在途的补页响应一律丢弃
     final int epoch = _windowEpoch;
+    // 一趟补页里最多触发**一次**自愈（多个 gap 同时对齐失败时，连发整窗重载会让列表回底/闪）
+    bool reloadRequested = false;
     for (final MessageRange gap in _window.gapsFor(first, last)) {
       for (final MessageRange request in splitGapAtViewportTop(gap, first)) {
         if (epoch != _windowEpoch) return;
@@ -1050,9 +1132,10 @@ class _MessagePanelState extends State<MessagePanel> {
           final List<ChatMessage> messages = page.messages
               .map(ChatMessage.fromJson)
               .toList(growable: false);
+          int placed = 0;
           setState(() {
             _window.ensureTotal(page.total);
-            final int placed = _window.place(
+            placed = _window.place(
               offset: page.offset,
               messages: messages,
             );
@@ -1067,14 +1150,24 @@ class _MessagePanelState extends State<MessagePanel> {
               _contentShiftStamp++;
             }
             _replayGuard.sealAll(messages.map((ChatMessage m) => m.id));
-            // 这一段补不出东西（对齐有偏差 / 服务端说没有）：记一笔，别再空转
-            if (placed == 0) _barrenGaps.add(request.from);
+            // `placed == 0` 的**两种成因必须分开**（2026-10-11 修用户报的「中栏空行」）：
+            //  - `messages` 为空 = 服务端说这一段没有 ⇒ 记一笔别再空转（防死循环）；
+            //  - `messages` 非空却一条都没落位 = **下标漂移**（页内 id 与本地落点不一致）。
+            //    拉黑会让那个 null 占位槽**永久**卡在两段已加载消息之间（用户截到的空行；
+            //    切走再切回才好，因为整表作废会清掉拉黑名单）⇒ 这里不拉黑。
+            if (placed == 0 && messages.isEmpty) _barrenGaps.add(request.from);
             // 补页不是"整批重载"：别把 bottomJump 留在 true（否则用户正在读历史时
             // 一次补页会把他拽回底部）
             _bottomJump = false;
             _scrollRevision++;
           });
           SubagentTranscript.instance.sync(_window.loadedList);
+          // 漂移 ⇒ 退回"重载末尾一段"这条**确定性**路径自愈（整表按权威下标重来）。
+          // 一趟最多一次：见上面 `reloadRequested`。
+          if (placed == 0 && messages.isNotEmpty && !reloadRequested) {
+            reloadRequested = true;
+            unawaited(_reloadTail());
+          }
         } catch (e) {
           // 补页失败：占位槽留着，用户再滑一下会重试（不当成"这里没有"）
         } finally {
@@ -1259,32 +1352,47 @@ class _MessagePanelState extends State<MessagePanel> {
         _bottomJump = false;
       });
     } else if (type == 'msg_chunk') {
-      if (!_isForCurrentSession(data)) return;
       final String id = (data['id'] as String?) ?? '';
+      // 在途段被摘在缓冲里（用户切去了别的 agent/会话）：id 全局唯一，按 id 直达，
+      // **不受会话过滤影响**——否则这段正文就永远缺这一截（重切回来只剩半截话）。
+      final ChatMessage? detached = _detachedById(id);
+      if (detached == null && !_isForCurrentSession(data)) return;
       final String chunk = (data['chunk'] as String?) ?? '';
       final int idx = _indexOfMessage(id);
       // 单调序号（M9 去重判据）：新核心给每条 msg_chunk 带同一 id 内严格递增的
       // seq（缺字段 = 老核心 ⇒ null = 未知，退回 id 级判据），见 WsStreamSeq。
       final int? seq = WsStreamSeq.of(data);
+      final bool exists = idx >= 0 || detached != null;
       // 重播去重：已封口的 id（历史终稿 / 已 msg_end）不再追加；序号不大于已消费
       // 水位的增量 = 已经渲染过的同一片段被重播（断线补发重播的主要形态）；
-      // 没有对应消息的孤立增量同样丢弃（既有行为）。
-      if (!_replayGuard.shouldAppendChunk(id: id, exists: idx >= 0, seq: seq)) {
+      // 既不在列表也不在缓冲的孤立增量同样丢弃（既有行为）。
+      if (!_replayGuard.shouldAppendChunk(
+        id: id,
+        exists: exists,
+        seq: seq,
+      )) {
         debugPrint(
           '[消息] 丢弃增量（'
-          '${_replayGuard.describe(id: id, exists: idx >= 0, seq: seq)}）: $id',
+          '${_replayGuard.describe(id: id, exists: exists, seq: seq)}）: $id',
         );
         return;
       }
       setState(() {
-        _window.at(idx)!.content += chunk;
+        if (idx >= 0) {
+          _window.at(idx)!.content += chunk;
+        } else {
+          detached!.content += chunk;
+        }
       });
       // 判据与记账成对：**放行的这一帧**就是"已消费到的高水位"。放在真正写入
       // 之后，保证水位只描述"正文里确实有的内容"。
       _replayGuard.markConsumed(id: id, seq: seq);
     } else if (type == 'msg_end') {
-      if (!_isForCurrentSession(data)) return;
       final String id = (data['id'] as String?) ?? '';
+      // 在途段在用户切走期间收尾：写回缓冲对象（收尾后不再被 [_restoreInFlight]
+      // 接回，正文以核心落库的历史页为准）。
+      final ChatMessage? detached = _detachedById(id);
+      if (detached == null && !_isForCurrentSession(data)) return;
       final int idx = _indexOfMessage(id);
       // 段关闭即封口：核心保证 msg_end 之前已 flush 全部增量（帧序有保证），
       // 此后该 id 的正文即终稿 ⇒ 再来 msg_chunk 一律是重播。
@@ -1304,12 +1412,13 @@ class _MessagePanelState extends State<MessagePanel> {
         }
         _replayGuard.markConsumed(id: id, seq: sealSeq);
       }
-      if (idx >= 0) {
+      final ChatMessage? target = idx >= 0 ? _window.at(idx) : detached;
+      if (target != null) {
         final Map<String, dynamic>? usage =
             (data['usage'] as Map<String, dynamic>?)?.cast<String, dynamic>();
         setState(() {
-          _window.at(idx)!.isStreaming = false;
-          _window.at(idx)!.usage = usage;
+          target.isStreaming = false;
+          target.usage = usage;
           _scrollRevision++;
           _bottomJump = false;
           if (usage != null) {
@@ -1350,7 +1459,7 @@ class _MessagePanelState extends State<MessagePanel> {
       // 填到既有卡片上，是幂等的）。
       if (!_replayGuard.shouldCreateMessage(
         id: id,
-        exists: _indexOfMessage(id) >= 0,
+        exists: _indexOfMessage(id) >= 0 || _detachedById(id) != null,
       )) {
         debugPrint('[消息] 忽略重播的 tool_start（同 id 已存在）: $id');
         return;
@@ -1383,13 +1492,17 @@ class _MessagePanelState extends State<MessagePanel> {
         const <WorkspaceArea>[WorkspaceArea.toolRuns],
       );
     } else if (type == 'tool_end') {
-      if (!_isForCurrentSession(data)) return;
       final String id = (data['id'] as String?) ?? '';
+      // 在跑的工具卡在用户切走期间结束：结果写回缓冲对象（重切回来时已落库，
+      // 随历史页回来，这里只是保证对象状态正确、不再挂着"运行中"）。
+      final ChatMessage? detached = _detachedById(id);
+      if (detached == null && !_isForCurrentSession(data)) return;
       final int idx = _indexOfMessage(id);
-      if (idx >= 0) {
+      final ChatMessage? target = idx >= 0 ? _window.at(idx) : detached;
+      if (target != null) {
         setState(() {
-          _window.at(idx)!.toolRunning = false;
-          _window.at(idx)!.toolResult = (data['result'] as String?) ?? '';
+          target.toolRunning = false;
+          target.toolResult = (data['result'] as String?) ?? '';
         });
       }
       // 工具执行结束：按工具类型增量通知右栏刷新对应区域（文件/Git/Todo）。
@@ -1506,13 +1619,17 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 消息在列表中的下标（-1 = 不存在；空 id 一律视为不存在）。
   int _indexOfMessage(String id) => id.isEmpty ? -1 : _window.indexOfId(id);
 
-  /// 本端是不是**已经有**这条消息，或者**认得**它（历史里出现过、但槽位早被淘汰）。
+  /// 本端是不是**已经有**这条消息，或者**认得**它（历史里出现过、但槽位早被淘汰，
+  /// 或被摘在在途缓冲里）。
   ///
   /// 为什么要认得：窗口只热视口附近（"限制缓存长度"），被淘汰的 id 上重播
   /// `msg_start` / `tool_start` 会凭空多出一条气泡——正文却在历史里。封口集合是
-  /// **累加**的（见 _applyTailPage / _fillWindow 的 sealAll），正好能认出它们。
+  /// **累加**的（见 _applyTailPage / _fillWindow 的 sealAll），正好能认出它们；
+  /// 在途缓冲里的那些同理（重播的 start 帧不许建第二条，正文正写在缓冲对象上）。
   bool _hasMessage(String id) =>
-      _indexOfMessage(id) >= 0 || _replayGuard.isSealed(id);
+      _indexOfMessage(id) >= 0 ||
+      _replayGuard.isSealed(id) ||
+      _detachedById(id) != null;
 
   /// 判断消息是否属于当前选中的 agent（避免工作中的成员消息污染主面板）
   bool _isForCurrentAgent(Map<String, dynamic> data) {

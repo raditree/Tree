@@ -316,42 +316,64 @@ class MessageWindow {
     }
   }
 
-  /// 把一页放进槽位表。[offset] = 这一页第一条的全局下标（核心给的真值）。
+  /// 把一页放进槽位表。[offset] = 这一页第一条的全局下标（核心给的**真值**）。
   ///
-  /// **按 id 对齐**：如果这一页里有本端已经放在别处的消息，就用那条消息的位置
-  /// 重算整页的基准（核心那边新落了消息 / 本地有实时消息时，下标可能差几条）。
-  /// 同一个 id 全程只允许存在一份：已在别处的直接跳过。
+  /// **基准取 `offset`，两遍搬座**（2026-10-11 修用户报的「中栏空行」）：
+  /// 1. **不再用本地已加载的 id 反推基准**（老写法的"锚点"）：实时帧 `appendTail` 会落在
+  ///    一串尾部占位槽**之后**，那个下标本身就是漂移的；拿它当锚 ⇒ 整页跟着平移 ⇒ 谁都放不进去。
+  ///    而核心对 `from=<下标>` 的请求回的 `offset` 就是那个下标（`core_server.dart` 的
+  ///    `start = from.clamp(0, total)`），对末尾页就是 `total - pageSize` —— **它才是权威**。
+  /// 2. 计划：只把"目标槽空着、或占着的是**本页另一条**（它会一起让路）"的那些搬过去；
+  ///    目标槽被**非本页**消息占着 ⇒ 宁可留空（不覆盖、不丢消息）。
+  /// 3. 摘除计划内各条的旧落点（可能在一串尾部占位槽之后），再按权威下标放置 ⇒ 本地下标
+  ///    与核心全局下标**收敛**。
   ///
-  /// 返回真正放进去的条数。
+  /// 为什么必须两遍（老写法：`if (_indexById.containsKey(id)) continue;`）：一页可能**整页**都是
+  /// 这些"已经在表里但下标漂移"的 id ⇒ 单遍把每一条都跳过 ⇒ 返回 0；面板把 0 当"这里没有"
+  /// 永久拉黑 ⇒ 一个 `null` 占位槽卡在**两段已加载消息之间**（用户截到的空行；切走再切回才好，
+  /// 因为整表作废会清掉拉黑名单）。
+  ///
+  /// 返回真正落到权威下标上的条数（**幂等重放同一页也 > 0**：它们确实在权威下标上）。
+  /// 已知极端情形：两条消息的目标槽**互相**占着时谁也搬不动 ⇒ 保持原位（没对齐，但无洞、无丢）。
   int place({required int offset, required List<ChatMessage> messages}) {
     if (messages.isEmpty) {
       // 空页也说明"这里没有更多了"：至少把长度对齐到 offset
       ensureTotal(offset);
       return 0;
     }
-    int base = offset < 0 ? 0 : offset;
-    for (int i = 0; i < messages.length; i++) {
-      final int known = _indexById[messages[i].id] ?? -1;
-      if (known >= 0) {
-        base = known - i;
-        break;
-      }
-    }
-    if (base < 0) base = 0;
+    final int base = offset < 0 ? 0 : offset;
     ensureTotal(base + messages.length);
-    int placed = 0;
+    final Set<String> pageIds = <String>{
+      for (final ChatMessage m in messages) m.id,
+    };
+    // ① 计划：只搬"搬得动"的那些。
+    final Map<int, ChatMessage> plan = <int, ChatMessage>{};
     for (int i = 0; i < messages.length; i++) {
-      final ChatMessage message = messages[i];
-      if (_indexById.containsKey(message.id)) continue;
       final int index = base + i;
-      if (index < 0 || index >= _slots.length) continue;
-      // 目标槽位被别的消息占着 = 对齐有偏差：不覆盖（宁可留空，等下一次按 id 对齐）
-      if (_slots[index] != null) continue;
-      _slots[index] = message;
-      _indexById[message.id] = index;
-      placed++;
+      if (index >= _slots.length) continue;
+      final ChatMessage? occupant = _slots[index];
+      final bool blocked =
+          occupant != null &&
+          occupant.id != messages[i].id &&
+          !pageIds.contains(occupant.id);
+      if (blocked) continue; // 别人占着：宁可留空（等下一次按 id 对齐）
+      plan[index] = messages[i];
     }
-    return placed;
+    final Set<int> targets = plan.keys.toSet();
+    // ② 摘除：计划内每条先退出旧落点（同 id 全程只允许存在一份）。
+    //    旧落点若本身也在计划里（会被别人占），留着让 ③ 统一覆盖。
+    for (final ChatMessage message in plan.values) {
+      final int known = _indexById[message.id] ?? -1;
+      if (known < 0) continue;
+      if (!targets.contains(known)) _slots[known] = null;
+      _indexById.remove(message.id);
+    }
+    // ③ 放置（覆盖目标槽里那点残留：要么是空，要么是本页另一条的旧落点）。
+    for (final MapEntry<int, ChatMessage> entry in plan.entries) {
+      _slots[entry.key] = entry.value;
+      _indexById[entry.value.id] = entry.key;
+    }
+    return plan.length;
   }
 
   /// 末尾追加一条**实时**消息（下标 = 当前长度，即紧接最新一条）。

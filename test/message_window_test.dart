@@ -44,7 +44,10 @@ void main() {
       final MessageWindow w = MessageWindow();
       w.place(offset: 0, messages: page(0, 3));
       final int again = w.place(offset: 0, messages: page(0, 3));
-      expect(again, 0);
+      // 2026-10-11 起返回值的口径是"**落到权威下标上**的条数"：幂等重放同一页时
+      // 这三条确实都在权威下标上（只是原地重放），所以是 3 不是 0 —— 面板据此判"这一段
+      // 补不出东西"才不会把一次**成功的重放**误当成"服务端说没有"而永久拉黑。
+      expect(again, 3);
       expect(w.loadedCount, 3);
     });
 
@@ -250,5 +253,61 @@ void main() {
     expect(w.isEmpty, isTrue);
     expect(w.total, 0);
     expect(w.loadedCount, 0);
+  });
+
+  // 用户 2026-10-11 报的「中栏空行」：null 占位槽卡在**两段已加载消息之间**，
+  // 切走再切回才好。根因链（逐条对过代码，见 .self/plan/20261011-midlist-placeholder-hole/recon.md）：
+  //   ① 补页响应里 `total` 更长 ⇒ `ensureTotal` 在尾部垫 `null`（只增不减）；
+  //   ② 实时帧 `appendTail` 追加在那些 `null` **之后** ⇒ 本地下标与核心全局下标错位；
+  //   ③ `place()` 对"已在别处的 id"直接跳过 ⇒ 整页都是已知 id 时 `placed == 0`；
+  //   ④ 面板把 `placed == 0` 一律当"这里没有"**永久拉黑** ⇒ 洞再也没人填。
+  group('下标漂移：place 必须把消息搬回权威下标（不许把整页都跳过）', () {
+    /// 造出漂移：窗口先按核心说的 `total` 建表并加载头部，之后两条**实时**消息被
+    /// `appendTail` 追加在那串尾部占位槽**之后**（下标 10、11）——而核心那边它们
+    /// 其实是第 3、4 条（`total` 一涨就落库了）。
+    MessageWindow drifted() {
+      final MessageWindow w = MessageWindow();
+      w.ensureTotal(10); // 0..9 占位
+      w.place(offset: 0, messages: page(0, 3)); // 0..2 已加载
+      w.appendTail(msg('m3')); // 落在 10（尾部占位槽之后）
+      w.appendTail(msg('m4')); // 落在 11
+      return w;
+    }
+
+    test('整页都是"已经在表里"的 id 时，也要落到权威下标上（不是 placed == 0）', () {
+      final MessageWindow w = drifted();
+      final int placed = w.place(offset: 3, messages: page(3, 2)); // 核心说 3、4 是它们
+      expect(
+        placed,
+        2,
+        reason: '两个 id 都在表里，但落点要按这一页的权威下标重排（老写法会返回 0 ⇒ 面板永久拉黑）',
+      );
+      expect(w.indexOfId('m3'), 3, reason: '搬回权威下标');
+      expect(w.indexOfId('m4'), 4);
+      expect(w.loadedCount, 5);
+    });
+
+    test('搬座不许在**已加载区内部**留下空洞（用户看到的空行）', () {
+      final MessageWindow w = drifted();
+      w.place(offset: 3, messages: page(3, 2));
+      expect(
+        w.loadedRanges,
+        <MessageRange>[const MessageRange(0, 5)],
+        reason: '0..4 必须连成一片：相邻区间之间的单槽缺口就是用户看到的空行',
+      );
+      expect(w.at(10), isNull, reason: '旧落点必须让出来，不许留一份漂移的副本');
+      expect(w.at(11), isNull);
+    });
+
+    test('目标槽被**非本页**消息占着时：仍旧宁可留空，不覆盖、不丢消息', () {
+      final MessageWindow w = MessageWindow();
+      w.place(offset: 0, messages: page(0, 3)); // 0..2 = m0..m2
+      // 一页想把 m9 放到下标 0 —— 那里是 m0，且 m0 不在本页 ⇒ 不许覆盖。
+      final int placed =
+          w.place(offset: 0, messages: <ChatMessage>[msg('m9')]);
+      expect(placed, 0, reason: '一条都没放进去 —— 这种 placed==0 由面板侧走自愈，而不是拉黑');
+      expect(w.at(0)!.id, 'm0', reason: '别人的槽位不许被抢');
+      expect(w.indexOfId('m9'), -1, reason: '放不进去的那条不留在外面（下次补页再来）');
+    });
   });
 }
