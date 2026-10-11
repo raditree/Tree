@@ -232,6 +232,13 @@ class ConversationService {
   /// 每个 agent 的**任务代次**：stop 时 +1，丢弃此前还在排队、尚未开始的任务。
   final Map<String, int> _epoch = <String, int>{};
 
+  /// 每个 **agent×会话** 最近一次**端点真实** `prompt_tokens`（只认 `estimated != true`）。
+  ///
+  /// 工具循环里每一跳的 [AgentUsage] 都会刷新它；轮内压缩判据把它当 `used`
+  /// （与进度条同一个真值、含工具 schema），而不是纯字符估算——后者漏算工具 schema，
+  /// 重工具成员会出现"进度条超了却没压"。压缩后下一跳的真值自然回落，故不会反复触发。
+  final Map<String, int> _livePromptTokens = <String, int>{};
+
   /// 因 `stop` 被丢弃的排队任务数（自检/测试用）。
   int droppedQueuedCount = 0;
 
@@ -1029,6 +1036,8 @@ class ConversationService {
           persistSegment(message); // 工具卡片与结果一起落库（与帧同 id）
         } else if (event is AgentUsage) {
           usage = event.usage;
+          // 记下本跳端点**真实** prompt_tokens：工具循环里的轮内压缩判据要用它与进度条同源
+          _recordLivePromptTokens(runKey, event.usage);
           pump.flush();
           hub.broadcast(<String, dynamic>{
             'type': WsOutboundType.msgUsage,
@@ -1117,6 +1126,9 @@ class ConversationService {
       }
     }
     _running.remove(runKey);
+    // 本轮结束：清掉它的实时真值（下一轮会在**自己**首跳的 AgentUsage 里重新写入；
+    // 预压缩不依赖它，故留着也不会误读，但及时回收避免跨轮脏值堆积）。
+    _livePromptTokens.remove(runKey);
     // 别的会话 / 别的后台临时员工可能还在跑：只有该 agent **一个在途轮次都不剩**
     // 时才广播 idle（[isRunning] 把"它名下的临时员工"也算在内）。
     //
@@ -1720,12 +1732,30 @@ class ConversationService {
     if (agent == null) return null;
     final CoreSession? session = store.session(agentId, sessionId);
     if (session == null) return null;
-    final bool compacted = await _autoCompact(agent, session, force: force);
+    final bool compacted = await _autoCompact(
+      agent,
+      session,
+      force: force,
+      // 工具循环里：用上一跳端点**真实** prompt_tokens 作判据（与进度条同源）；
+      // 没有真值（端点不回 usage）时自动退回估算。
+      livePromptTokens: _livePromptTokens[_runKey(agentId, sessionId)],
+    );
     if (!compacted) return null;
     // 轮内 compact 同样是"允许重建"的时机（前缀本来就要重写）
     invalidateSystemPrompt(agent.id, session.sessionId);
     await _ensureSystemPromptPinned(agent, session.sessionId);
     return _contextOf(agent, session);
+  }
+
+  /// 记下本 (agent, 会话) 最近一次端点**真实** prompt_tokens（供轮内压缩判据用）。
+  ///
+  /// 只认 `estimated != true` 的那份——估算（`estimated: true`）不含工具 schema、不是真值，
+  /// 拿它当判据等于没统一。同一会话同一取 [max] 意义不大（每跳都是最新读数），直接覆盖。
+  void _recordLivePromptTokens(String runKey, Map<String, dynamic> usage) {
+    if (usage['estimated'] == true) return;
+    final Object? p = usage['prompt_tokens'];
+    if (p is! num || p <= 0) return;
+    _livePromptTokens[runKey] = p.toInt();
   }
 
   /// 自动压缩：返回**是否真的压动了**（工具循环要靠它决定是否重新装配上下文）。
@@ -1736,6 +1766,7 @@ class ConversationService {
     CoreAgent agent,
     CoreSession session, {
     bool force = false,
+    int? livePromptTokens,
   }) async {
     final CompactionService? service = compaction;
     if (service == null) return false;
@@ -1745,6 +1776,7 @@ class ConversationService {
         agent,
         session,
         force: force,
+        livePromptTokens: livePromptTokens,
       );
       if (result != null && result.compressed) {
         // 压缩已发生 / 降级 / 插件为什么没接管：统一走**落库**通路，刷新后仍在

@@ -534,6 +534,67 @@ void main() {
       expect(summarizer.prompts, hasLength(1));
     });
 
+    test('轮内压缩统一用真实值：估算没超但真值超 ⇒ 触发压缩', () async {
+      addTurn('一');
+      addTurn('二');
+      addTurn('三');
+      // 预算放大到当前估算的 4 倍 ⇒ 阈值 0.5 ⇒ 上限 = 估算 × 2，"估算没超"这一前提自证。
+      agent.maxSeqlenOverride =
+          service.estimateContextTokens(agent, session) * 4;
+      store.putAgent(agent);
+      final int limit =
+          (service.maxSeqlenFor(agent).value * service.thresholdFor(agent))
+              .round();
+      // 旧现场：估算（不含工具 schema）低于阈值 ⇒ 只按估算判会"该压没压"。
+      expect(service.estimateContextTokens(agent, session), lessThan(limit));
+      expect(await service.autoCompact(agent, session), isNull);
+
+      // 端点回过的真实 prompt_tokens（与进度条同一个数、含工具 schema）已越过阈值 ⇒ 必须压。
+      final CompactionResult? byReal = await service.autoCompact(
+        agent,
+        session,
+        livePromptTokens: limit + 100,
+      );
+      expect(
+        byReal,
+        isNotNull,
+        reason: '真值超阈值就要压，不能只信漏算工具 schema 的估算',
+      );
+      expect(byReal!.compressed, isTrue);
+
+      // 真值优先：真值没超就不压（不用估算把它顶上去）——即便这里估算同样没超。
+      final CompactionResult? under = await service.autoCompact(
+        agent,
+        session,
+        livePromptTokens: limit - 1,
+      );
+      expect(under, isNull);
+    });
+
+    test('轮内压缩：真值 ≤ 0 或缺省 ⇒ 退回估算口径（不误当阈值信号）', () async {
+      addTurn('一');
+      addTurn('二');
+      addTurn('三');
+      agent.maxSeqlenOverride =
+          service.estimateContextTokens(agent, session) * 4;
+      store.putAgent(agent);
+      final int limit =
+          (service.maxSeqlenFor(agent).value * service.thresholdFor(agent))
+              .round();
+      // 传 0 = 没有真值（首跳之前 / 端点不回 usage）⇒ 走估算，估算没超 ⇒ 不动。
+      expect(await service.autoCompact(agent, session, livePromptTokens: 0), isNull);
+      expect(service.estimateContextTokens(agent, session), lessThan(limit));
+      // 传一个明显超阈值的正真值 ⇒ 按真值判 ⇒ 触发。
+      expect(
+        await service.autoCompact(
+          agent,
+          session,
+          livePromptTokens: limit * 3,
+        ),
+        isNotNull,
+      );
+    });
+
     test('估算口径跟随逐模型 token_scale（Q1-①）', () {
       add('user', '内容' * 500);
       final int atDefault = service.estimateContextTokens(agent, session);

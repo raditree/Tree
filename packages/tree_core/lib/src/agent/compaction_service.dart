@@ -300,22 +300,33 @@ class CompactionService {
   ///
   /// [force] 为真 = 端点已经报了上下文超限，此时**跳过阈值判断**强制压一次：
   /// 本地估算偏小（token_scale 还在学习）时，阈值判断恰恰会说"没超"。
+  ///
+  /// [livePromptTokens] = **上一跳端点回过的真实** `prompt_tokens`（工具循环里由会话
+  /// 层传下来，与进度条同一个数、含工具 schema）。传了就**按它判阈值**（统一用真实值
+  /// 口径）；没传（轮前那一次 / 新会话首轮 / 端点不回 usage）才退回 [estimateContextTokens]
+  /// 的字符估算。之所以要真值优先：估算**不含工具 schema**，重工具 agent 会系统性偏低，
+  /// 与进度条的真值一分叉，就会出现"进度条说超了、压缩却说没超"（该压没压）。真值每跳
+  /// 刷新、压缩后自然回落，因此不会反复触发。
   Future<CompactionResult?> autoCompact(
     CoreAgent agent,
     CoreSession session, {
     bool force = false,
+    int? livePromptTokens,
   }) async {
     if (!canCompact || isCompacting(agent.id, session.sessionId)) {
       return null;
     }
     final MaxSeqlenBudget budget = maxSeqlenFor(agent);
     final int limit = (budget.value * thresholdFor(agent)).round();
-    final int used = estimateContextTokens(agent, session);
+    final int? live = livePromptTokens;
+    final bool byReal = live != null && live > 0;
+    final int used = byReal ? (live ?? 0) : estimateContextTokens(agent, session);
     if (!force && used <= limit) return null;
+    final String caliber = byReal ? '真实用量' : '估算';
     log?.call(
       force
-          ? '端点报上下文超限，强制压缩：估算 $used tokens（阈值 $limit）'
-          : '上下文估算 $used tokens 超过阈值 $limit'
+          ? '端点报上下文超限，强制压缩：$caliber $used tokens（阈值 $limit）'
+          : '上下文$caliber $used tokens 超过阈值 $limit'
                 '（${thresholdFor(agent)} × ${budget.value}），先压缩再生成',
     );
     if (budget.fallback) {
