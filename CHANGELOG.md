@@ -15,6 +15,49 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
+## [1.0.3+3] — 2026-10-11
+
+### 断言变化（新增 / 修改的 README 不变量）
+
+- **"重连中"不再被当成"判死"**（新增 [packages/tree_local_exec/README.md](packages/tree_local_exec/README.md)
+  不变量 22、[packages/tree_ssh_plugin/README.md](packages/tree_ssh_plugin/README.md) 不变量 6、
+  [docs/ssh-tunnel-protocol.md](docs/ssh-tunnel-protocol.md) §0/§2/§5/§6/§8 + **新增 §10**、
+  [docs/architecture.md](docs/architecture.md) §11 新增两行 + §13 不变量 15）：
+  - 插件在 `connecting` / `booting` / `reconnecting` 时对请求回 **`error_kind: tunnel_not_ready`**
+    （**新协议值**，且**不在** `TunnelErrorKinds.fallbackKinds` 里）；`down` / 已关闭 / 通道断在
+    请求中途仍回 `tunnel_down`，且文案**不再承诺**"未执行"（中途断无从得知远端有没有执行到）；
+  - 核心**判死只有两个来源**：心跳快照 `state == down`（插件退避耗尽 / 不可调和）、
+    插件进程已不可用（`TunnelSession.pluginAvailable` 实时查 `PluginBus`）；**请求级失败一律不判死**；
+  - 前台请求遇到 `tunnel_not_ready` ⇒ **等隧道回到 `ready` 再发一次**（确定未执行 ⇒ 不是重放；
+    兜底预算 `_maxReadyWait` = 30 min），只有判死才以 `SshLinkStaleException` 如实失败。
+  - **症状与根因**（用户真机 2026-10-11）：物理断网 ⇒ 后台 hook **立刻**失败、还提前回退内置；
+    因为上一版把"重连中"也报成 `tunnel_down`，核心据此**瞬间判死**——`512a124` 加的核心侧忍耐
+    （不误发 / 30s 慢探 / 判死才收尾）**从未有机会生效**。
+- **执行器自己察觉断连后优雅退出；重建前收掉上一世 agent**
+  （新增 [packages/tree_ssh_plugin/README.md](packages/tree_ssh_plugin/README.md) 不变量 13/14、
+  [packages/tree_agent/README.md](packages/tree_agent/README.md) 不变量 20）：
+  - 插件在 `ready` 期间每 **20s** 发 `agent.ping`（单次 10s 响应窗口，连丢 **3** 拍 ⇒ 拆掉重建）；
+    `tunnel.reconnect` 走**同一探针** ⇒ **卡死（进程还在、但不回帧）也能换掉**（此前是 no-op 空转）；
+  - 拉起 agent 时**总是**传 `--idle-timeout-ms 90000`：agent 只要收到**任何一帧**就重置该计时，
+    而插件一直在 ping ⇒ **健康链路上永远到不了**；物理断网（对端 sshd 收不到 FIN、通道给不出 EOF）时
+    **执行器自己优雅退出**（用户口径："执行器应该自觉优雅结束"），新执行器起来后从落盘台账接管后台任务；
+  - 重建前按**启动时那次性 token** 在 `/proc/<pid>/cmdline` 里核对后才 `kill` 上一世 agent
+    （核对不上就**不杀**，只记日志）。
+  - **症状**（同上）：恢复网络后目标机上多出一个执行器进程（`lsof` 两个 pid），反复抖动会累积。
+- **agent 版本只由插件自报；出包校验二进制里的版本串**
+  （[docs/ssh-tunnel-protocol.md](docs/ssh-tunnel-protocol.md) §2/§6/§10.5
+  + [packages/tree_ssh_plugin/README.md](packages/tree_ssh_plugin/README.md) 补充决定 1）：
+  - 核心**不再声明** agent 版本 / sha256 / 二进制名（`TunnelConnectRequest` 删掉这三个字段）——
+    那两个值从来就没被插件读到过（核心只发 `config`、插件读 `request['agent']`，键从来没对上）；
+    版本以**插件自报**（编译期注入）为准，sha256 由插件本机算；
+  - `tool/package_windows.dart` 复制 `build/plugins`、`build/agents` 之前**校验产物里的版本串**与
+    `pubspec.yaml` 的版本（`+` 之前）一致，不一致**直接拒绝出包**并告诉你要先跑哪条构建命令。
+  - **症状**：1.0.3+2 的发行包里装着 **1.0.2** 编的插件与 agent（版本升了没重编二进制）⇒
+    目标机上出现 `~/.tree/agent/1.0.2/`、版本对账形同虚设，而功能上完全看不出来。
+
+> 注：本次改的是**产品行为**（断连处置与执行器生命周期），因此**必须重新出包**；
+> 版本按用户要求留在 1.0.3 线上加构建号为 **1.0.3+3**（"先别出 4"）。
+
 ## [1.0.3+2] — 2026-10-11
 
 ### 断言变化（新增 / 修改的 README 不变量）

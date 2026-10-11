@@ -164,7 +164,9 @@ Future<void> _package(List<String> args) async {
   //   - 目标机 agent `agents/tree_agent-linux-{amd64,arm64}`（由插件按目标机架构推送）。
   // 缺了插件 ⇒ 核心回退内置 dartssh2（功能不变，只是没有中转站）；
   // 缺了 agent ⇒ 插件在目标机推送那一步失败 ⇒ 同样回退。**不算打包失败**，但要打印出来。
-  stdout.writeln(_copySshExecutorArtifacts(root, releaseDir));
+  stdout.writeln(
+    _copySshExecutorArtifacts(root, releaseDir, _versionOf(pubspec['version'])),
+  );
 
   // ③ 便携包说明（首次运行指引：数据在哪、怎么手改配置、出问题看哪）
   final File guide = File(_join(releaseDir.path, '使用说明.txt'));
@@ -405,7 +407,11 @@ _PluginCopy _copyPlugins(Directory root, Directory releaseDir) {
 ///
 /// 返回一行给用户看的总结。**产物缺失不算打包失败**：没有它，核心自动回退内置
 /// dartssh2 —— 功能不变，只是少了"中转站"这条路（见 docs/ssh-tunnel-protocol.md §0）。
-String _copySshExecutorArtifacts(Directory root, Directory releaseDir) {
+String _copySshExecutorArtifacts(
+  Directory root,
+  Directory releaseDir,
+  String binaryVersion,
+) {
   final Directory pluginSource = Directory(_join(root.path, 'build/plugins'));
   final Directory agentsSource = Directory(_join(root.path, 'build/agents'));
   final List<String> copied = <String>[];
@@ -417,6 +423,11 @@ String _copySshExecutorArtifacts(Directory root, Directory releaseDir) {
       if (entity is! File) continue;
       final String name = _basename(entity.path);
       if (!name.startsWith('tree_ssh_executor')) continue;
+      _verifyBinaryVersion(
+        entity,
+        binaryVersion,
+        'dart run tool/build_ssh_plugin.dart',
+      );
       entity.copySync(_join(target.path, name));
       copied.add('plugins/$name');
     }
@@ -429,6 +440,11 @@ String _copySshExecutorArtifacts(Directory root, Directory releaseDir) {
       if (entity is! File) continue;
       final String name = _basename(entity.path);
       if (!name.startsWith('tree_agent')) continue;
+      _verifyBinaryVersion(
+        entity,
+        binaryVersion,
+        'dart run tool/build_agent.dart',
+      );
       entity.copySync(_join(target.path, name));
       copied.add('agents/$name');
     }
@@ -754,6 +770,42 @@ String _versionOf(String? raw) {
   if (value.isEmpty) return '0.0.0';
   final int plus = value.indexOf('+');
   return plus < 0 ? value : value.substring(0, plus);
+}
+
+/// 校验构建产物里**嵌着期望的版本串**（`kAgentVersion` 在 AOT 快照里就是字面量）。
+///
+/// 为什么必须有这一步（2026-10-11 的教训）：版本升了却忘了重跑
+/// `tool/build_ssh_plugin.dart` / `tool/build_agent.dart` 时，包里会**悄悄**塞进旧版本的
+/// 插件与 agent —— 那次把 `1.0.2` 的插件与 agent 打进了 `1.0.3+2` 的包，目标机上因此出现
+/// `~/.tree/agent/1.0.2/`，而功能上完全看不出异常。**宁可出包失败**，
+/// 也不发一个"包名与包内容版本对不上"的发行版。
+void _verifyBinaryVersion(File binary, String expected, String buildCommand) {
+  if (expected.isEmpty || expected == '0.0.0') return;
+  final List<int> bytes = binary.readAsBytesSync();
+  final List<int> needle = ascii.encode(expected);
+  if (!_containsBytes(bytes, needle)) {
+    throw _UsageError(
+      3,
+      '${binary.path} 里找不到版本串「$expected」——它多半是**别的版本**编出来的。\n'
+      '    先跑：$buildCommand',
+    );
+  }
+}
+
+/// 朴素字节搜索（产物是二进制，不能用字符串 API）。
+bool _containsBytes(List<int> haystack, List<int> needle) {
+  if (needle.isEmpty) return true;
+  for (int i = 0; i + needle.length <= haystack.length; i++) {
+    bool hit = true;
+    for (int j = 0; j < needle.length; j++) {
+      if (haystack[i + j] != needle[j]) {
+        hit = false;
+        break;
+      }
+    }
+    if (hit) return true;
+  }
+  return false;
 }
 
 String _flutterFromEnv() {
