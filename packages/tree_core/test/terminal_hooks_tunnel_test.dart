@@ -249,6 +249,55 @@ void main() {
     expect(left.single.agentId, 'agt_2', reason: '别的 agent 的挂账不许被顺手认领');
   });
 
+  test('挂账被召回时**要告知**：一条"链路已恢复 + 已召回清单"的提示（用户 2026-10-11 要求）', () async {
+    final Directory dir = Directory.systemTemp.createTempSync('tree_hook_recall_');
+    addTearDown(() async {
+      for (int i = 0; i < 10 && dir.existsSync(); i++) {
+        try {
+          dir.deleteSync(recursive: true);
+        } catch (_) {
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        }
+      }
+    });
+    final HookLedger ledger = HookLedger(dir.path);
+    // 目标机上**还在跑**（state = running）⇒ 认领后继续挂着等真实结局
+    final _FakeTunnelSsh transport = _FakeTunnelSsh()
+      ..logPath = '/ws/.output/hook_recall_1.log';
+    final SshWorkspaceIO io = SshWorkspaceIO('/ws', transport);
+    await ledger.save(
+      HookLedgerEntry(
+        id: 'hook_recall_1',
+        agentId: 'agt_1',
+        sessionId: 'ses_1',
+        command: 'sleep 10800',
+        logRelative: '.output/hook_recall_1.log',
+        startedAt: DateTime(2026, 1, 1).millisecondsSinceEpoch,
+      ),
+    );
+    final TerminalHooks hooks = TerminalHooks(ledger: ledger);
+    addTearDown(hooks.close);
+    final List<String> announced = <String>[];
+    hooks.onRecalled = (List<HookTask> group) async {
+      announced.add(recalledNotice(group));
+    };
+
+    final int resumed = await hooks.restorePending(
+      ioFor: (String agentId) async => io,
+      agentId: 'agt_1',
+    );
+    expect(resumed, 1);
+    expect(announced, hasLength(1), reason: '召回必须告知（不许静默接回来）');
+    final String text = announced.single;
+    expect(text, contains('SSH 链路已恢复'));
+    expect(text, contains('已召回 1 个'));
+    expect(text, contains('hook_recall_1'));
+    expect(text, contains('sleep 10800'));
+    expect(text, contains('.output/hook_recall_1.log'));
+    expect(text, contains('没有重跑'), reason: '文案要写明"没重跑、没新起进程"');
+    expect(await ledger.load(), hasLength(1), reason: '它还在跑 ⇒ 台账留着，等真实退出码');
+  });
+
   test('隧道托管：核心重启后接上任务，并把 hook 结束提醒回给**原会话**（且不重跑）', () async {
     final Directory dir = Directory.systemTemp.createTempSync('tree_hook_tunnel_');
     addTearDown(() async {

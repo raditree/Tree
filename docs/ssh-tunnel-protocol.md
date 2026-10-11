@@ -476,6 +476,15 @@ JSON-RPC 标准：`-32700` 解析错 / `-32600` 非法请求 / `-32601` 方法�
 `SshLinkStaleException` 如实失败）。否则这条已判死的会话每 10 秒还会拉一次状态、打一行
 `心跳失败`——真机 2026-10-11 就是这样把日志刷了几百行，反而掩盖了判死那一条。
 
+**重建即拾起 + 召回要告知**（用户 2026-10-11）：判死之后核心会撤换 IO 缓存，而那批**挂账的远端
+后台任务**（目标机 `setsid` 跑着、退出码落盘）必须在新链路可用的**第一时刻**接回来 ——
+`WorkspaceToolRunner._ioFor` 在**新建 SSH 工作空间之后**就调 `TerminalHooks.restorePending`
+（传 `restore: false` 防互相递归），认领 = **对账**（不重跑、不新起进程）；
+认领成功后由 `TerminalHooks.onRecalled` → `recalledNotice` 往**原会话**投一条
+"SSH 链路已恢复：已召回 N 个挂账的后台任务（它们一直在目标机上跑）"并列出清单
+（task_id / 命令 / 日志路径），等真实退出码再投一次结束提醒。
+同一条路覆盖三种触发：**30 分钟退避耗尽**、**面板手动关闭隧道**、**插件换了实例**。
+
 **判死必须真的能被核心看到（透传链）**：`WorkspaceToolRunner._ioFor` 的撤换判据读的是
 **外层装饰器**的 `tunnelDown`，它必须一路透传：`PrivateWorkspaceIO`（`tree_core`）
 → `SshWorkspaceIO`（`tree_local_exec`）→ `TunnelSshTransport`（真正置标志的人）。

@@ -115,6 +115,13 @@ class TerminalHooks {
   /// （远端要读一次远端日志尾部来拼提示）。
   FutureOr<void> Function(HookTask task, int exitCode)? onFinished;
 
+  /// **挂账任务被召回**时的投递口（按 `(agent, 会话)` 分组，每组一次）。
+  ///
+  /// 用户 2026-10-11 明确要求："重连后应当拾起，然后发 agent 提示，大意是之前断开的
+  /// 连接已恢复、后台任务已召回，然后列出"。它**不复用** [onFinished]：那条路的语义是
+  /// "任务结束了、这是退出码"，把"召回"混进去会让消费方（唤醒 + 前端分组）分不清。
+  FutureOr<void> Function(List<HookTask> recalled)? onRecalled;
+
   final Map<String, HookTask> _tasks = <String, HookTask>{};
   int _seq = 0;
 
@@ -325,6 +332,7 @@ class TerminalHooks {
     if (led == null) return 0;
     final List<HookLedgerEntry> entries = await led.load();
     int resumed = 0;
+    final List<HookTask> recalled = <HookTask>[];
     for (final HookLedgerEntry entry in entries) {
       // 只认领该 agent 名下的（链路恢复时按 agent 触发；启动时 [agentId] 为 null = 全部）。
       if (agentId != null && entry.agentId != agentId) continue;
@@ -374,9 +382,31 @@ class TerminalHooks {
       );
       _attach(task);
       resumed++;
+      recalled.add(task);
     }
     if (resumed > 0) log?.call('已接续 $resumed 个远端后台任务');
+    // **召回要告知**（用户 2026-10-11 要求）：链路恢复 / 隧道重建之后把挂账任务拾回来这件事
+    // 必须让用户与 agent 知道 —— 否则"任务是不是丢了"只能靠猜。按 (agent, 会话) 分组各投一次。
+    await _announceRecalled(recalled);
     return resumed;
+  }
+
+  /// 把"已召回 N 个后台任务"按 `(agent, 会话)` 分组投递（每组一次）。
+  Future<void> _announceRecalled(List<HookTask> recalled) async {
+    if (recalled.isEmpty) return;
+    final void Function(List<HookTask>)? sink = onRecalled;
+    if (sink == null) return;
+    final Map<String, List<HookTask>> groups = <String, List<HookTask>>{};
+    for (final HookTask task in recalled) {
+      groups.putIfAbsent('${task.agentId}\u0000${task.sessionId}', () => <HookTask>[]).add(task);
+    }
+    for (final List<HookTask> group in groups.values) {
+      try {
+        sink(group);
+      } catch (error) {
+        log?.call('投递「已召回」提示失败（忽略）：$error');
+      }
+    }
   }
 
   /// 取消任务（本机杀进程树 / 远端尽力 `kill`）。返回**是否确实发出了终止**。
@@ -666,6 +696,27 @@ Future<String> hookNotice(HookTask task, int exitCode) async {
     buffer
       ..writeln('--- 日志尾部 ---')
       ..write(tail.trimRight());
+  }
+  return buffer.toString().trimRight();
+}
+
+/// 组装「挂账任务已召回」提示（注入原会话并唤醒 agent）。
+///
+/// 用户 2026-10-11 要的文案大意：**之前断开的连接已恢复、后台任务已召回**，然后列出。
+String recalledNotice(List<HookTask> recalled) {
+  final StringBuffer buffer = StringBuffer()
+    ..writeln(
+      '[terminal hook] SSH 链路已恢复：已召回 ${recalled.length} 个之前挂账的后台任务',
+    )
+    ..writeln(
+      '（它们一直在目标机上跑，本机之前只是"拿不到结果" —— **没有重跑、也没有新起进程**；'
+      '等它们结束时会把**真实退出码**再投一次提醒）',
+    );
+  for (final HookTask task in recalled) {
+    buffer.writeln(
+      '- ${task.id}｜命令：${task.command}｜日志：${task.logRelative}'
+      '${task.remote ? '（在**远端工作空间**里，用 read 查看）' : ''}',
+    );
   }
   return buffer.toString().trimRight();
 }

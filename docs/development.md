@@ -169,7 +169,7 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 | `tree_agent` | 89 passed / 19 skipped（skip = POSIX 专属行为，见下注） |
 | `tree_ssh_plugin` | 154 passed（含"真进程一次塞多帧" + **断连完整性 13 条** + **左栏面板 18 条**） |
 | `tree_local_exec` | 293 passed / 4 skipped |
-| `tree_core` | 1217 passed / 3 skipped（含另一会话在途的 subagent-transcript 测试；本次改动未加 tree_core 用例） |
+| `tree_core` | 1218 passed / 3 skipped（含另一会话在途的 subagent-transcript 测试；本轮 +1 为「挂账被召回时告知」） |
 | `tree_core_cli` | 6 passed（需 `TREE_CORE_EXE` 指向编译产物） |
 | 前端 `flutter test` | 811 passed |
 | 真机 SSH 回归（`TREE_SSH_TEST_*` 具备时） | ① `packages/tree_local_exec` 的 SSH 用例与 `packages/tree_core/test/ssh_files_integration_test.dart`；② **中转站两条门控**：`dart run tool/tunnel_e2e.dart`（线上协议黑盒，**37 项**，含 ⑧ 断连完整性五条）与 `packages/tree_core/test/ssh_tunnel_e2e_test.dart`（核心侧链路，含 ⑨ 断连不误发 + 恢复后接续） |

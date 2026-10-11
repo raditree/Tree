@@ -79,6 +79,7 @@ class WorkspaceToolRunner implements ToolRunner {
       ownerOf: subagentService?.privateOwnerOf,
     );
     hooks.onFinished = _finished;
+    hooks.onRecalled = _recalled;
   }
 
   /// 后台任务台账（terminal hook 的落盘；null = 不落盘，测试友好）。
@@ -628,6 +629,28 @@ class WorkspaceToolRunner implements ToolRunner {
     await callback(task.agentId, task.sessionId, notice, subagent: tag);
   }
 
+  /// **召回告知**：链路恢复 / 隧道重建之后，"挂账任务已拾回"要投回原会话
+  /// （用户 2026-10-11 要求：大意是"之前断开的连接已恢复、后台任务已召回"，然后列出）。
+  Future<void> _recalled(List<HookTask> recalled) async {
+    final FutureOr<void> Function(
+      String,
+      String,
+      String, {
+      SubagentTag? subagent,
+    })?
+    callback = onHookFinished;
+    if (callback == null || recalled.isEmpty) return;
+    final HookTask first = recalled.first;
+    // 与 [_finished] 同一口径：临时员工起的 hook 带上它的标记，`wake` 才能归到会话主人。
+    final SubagentTag? tag = subagentService?.tagOf(first.agentId);
+    await callback(
+      first.agentId,
+      first.sessionId,
+      recalledNotice(recalled),
+      subagent: tag,
+    );
+  }
+
   /// 供核心层（Spec 索引、待办读取等）复用同一份工作空间缓存：
   /// 解析失败返回 null（调用方决定降级行为）。
   Future<WorkspaceIO?> ioFor(String agentId) => _ioFor(agentId);
@@ -673,7 +696,12 @@ class WorkspaceToolRunner implements ToolRunner {
     return SshReconnectOutcome.ok(stale: link.linkStale);
   }
 
-  Future<WorkspaceIO?> _ioFor(String agentId) async {
+  /// 解析某个 agent 的工作空间 IO（缓存 + 判死撤换）。
+  ///
+  /// [restore] = "解析成功后是否顺手拾起该 agent 的挂账后台任务"（默认 true）。
+  /// `TerminalHooks.restorePending` 内部会为每个挂账条目回调进来解析工作空间 ——
+  /// 那条路径必须传 `false`，否则会互相递归触发 restore。
+  Future<WorkspaceIO?> _ioFor(String agentId, {bool restore = true}) async {
     // **临时员工复用发起者那条工作空间**（同一份根、同一条 SSH 连接、同一个
     // `.tree/<agent>/.self` 私有分栏）：私有状态归到**会话主人**，用户的工作空间里
     // 因此不会留下 `sub_*` 目录，它读到的系统提示词文件与发起者是同一份。
@@ -747,6 +775,20 @@ class WorkspaceToolRunner implements ToolRunner {
       final WorkspaceIO io = PrivateWorkspaceIO(await factory(ssh), ownerId);
       _installLinkRecoveredHook(io, ownerId);
       _ios[ownerId] = io;
+      if (restore) {
+        // **重建成功即拾起挂账任务**（用户 2026-10-11 要求）：判死（退避耗尽 / 面板手动关闭）
+        // 之后核心会撤换缓存，这里是"下一次解析"建起来的新 IO —— 挂账的远端后台任务一直在
+        // 目标机上跑，必须在链路可用的**第一时刻**接回来（而不是等重启核心才想起来）。
+        // 接回来后由 `hooks.onRecalled` → `_recalled` 投一条"已召回"提示给原会话。
+        //
+        // `restore: false` 防重入：`restorePending` 会为每个挂账条目解析它自己的工作空间。
+        unawaited(
+          hooks.restorePending(
+            ioFor: (String id) => _ioFor(id, restore: false),
+            agentId: ownerId,
+          ),
+        );
+      }
       return io;
     }
 
@@ -780,7 +822,13 @@ class WorkspaceToolRunner implements ToolRunner {
     if (live == null) return;
     live.onRecovered = () {
       log?.call('agent $ownerId 的 SSH 链路已重建 ⇒ 认领挂账的后台任务');
-      unawaited(hooks.restorePending(ioFor: _ioFor, agentId: ownerId));
+      // `restore: false`：与 [_ioFor] 里同一条防重入理由（这条路已经在"链路恢复"里了）。
+      unawaited(
+        hooks.restorePending(
+          ioFor: (String id) => _ioFor(id, restore: false),
+          agentId: ownerId,
+        ),
+      );
     };
   }
 
