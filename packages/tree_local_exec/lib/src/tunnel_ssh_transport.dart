@@ -30,6 +30,13 @@ import 'tunnel_link.dart';
 /// - 判失活**不关**任何东西，只让在途操作以 [SshLinkStaleException] 显式失败，
 ///   并在跨阈值那一拍触发后台重连（`tunnel.reconnect`）；
 /// - **不引入静态总时长上限**：命令跑多久都等（`exec.run` 的软窗口归 `SshWorkspaceIO`）。
+///
+/// **"判死"与"暂时不可用"是两件事**（2026-10-11 修，用户口径）：
+/// - 判死（⇒ 下一次工作空间解析回退内置）**只有两个来源**：心跳快照说 `down`（插件退避耗尽，
+///   见 [_beat]）、或插件进程已不可用（本地事实）；
+/// - 请求级失败（`tunnel_not_ready`）**绝不判死**：那是"重连中"，此时前台操作**等隧道恢复**
+///   再发（`tunnel_not_ready` 的请求**确定未执行** ⇒ 重发不是重放），后台任务照旧"什么都不发"地等；
+/// - 请求级 `tunnel_down`（通道断在请求中途）**如实失败**，既不判死也不重放。
 class TunnelSshTransport
     implements SshTransport, FallbackableWorkspace, TunnelBackgroundExec {
   /// 私有构造：字段一律用 **位置参数** 初始化（这样私有字段也能走 initializing formal，
@@ -39,8 +46,10 @@ class TunnelSshTransport
     this.root,
     this._liveness,
     this._heartbeatInterval,
-    this._log,
-  );
+    this._log, [
+    this._readyPollInterval = const Duration(seconds: 1),
+    this._maxReadyWait = const Duration(minutes: 30),
+  ]);
 
   /// 经中转站建立一条隧道（**唯一入口**）。
   ///
@@ -50,6 +59,8 @@ class TunnelSshTransport
     TunnelLink link,
     TunnelConnectRequest request, {
     void Function(String message)? log,
+    Duration readyPollInterval = const Duration(seconds: 1),
+    Duration maxReadyWait = const Duration(minutes: 30),
   }) async {
     if (!link.available) {
       throw TunnelUnavailableException(
@@ -68,6 +79,8 @@ class TunnelSshTransport
       liveness,
       request.heartbeatInterval,
       log,
+      readyPollInterval,
+      maxReadyWait,
     );
     // 判失活的那一拍起一次后台重连（与 DartSshTransport 同一挂载点、同一语义）。
     liveness.onStale = transport._handleStale;
@@ -95,6 +108,17 @@ class TunnelSshTransport
   Timer? _heartbeatTimer;
   Future<void>? _reconnectInFlight;
   TunnelSnapshot? _lastSnapshot;
+
+  /// 等隧道回到 `ready` 时的轮询节奏（测试注入短值，否则一条用例要等真 1 秒）。
+  final Duration _readyPollInterval;
+
+  /// 等隧道恢复的**总预算**（默认 30 min，与中转站的退避累计上限同量级）。
+  ///
+  /// 为什么要有它：用户口径是"断连期间**等到退避耗尽**再如实失败"，而退避耗尽的权威判据
+  /// 是插件自标 `down`（心跳快照）。正常情况下插件一定会在累计上限处标 down，
+  /// 这个预算只是**兜底**——防"隧道反复 ready/不 ready 抖动（每次成功都把退避清零）"时
+  /// 一次前台调用无限期挂着。不自掐秒表地去猜远端状态，只给自己一个"别等成永恒"的上界。
+  final Duration _maxReadyWait;
 
   // ── FallbackableWorkspace ────────────────────────────────────────────
   //
@@ -444,6 +468,9 @@ class TunnelSshTransport
     _closed = true;
     _heartbeatTimer?.cancel();
     _heartbeatTimer = null;
+    // 本类自己收掉这条隧道 = 这条链路**真的**没了（本地事实，不是猜远端）：
+    // 标判死，让核心下一次工作空间解析重新建/或回退内置，别把一条已关闭的隧道留在缓存里。
+    _markDown('隧道已被显式关闭');
     try {
       await _session.close();
     } catch (error) {
@@ -477,7 +504,14 @@ class TunnelSshTransport
       _liveness.recordBeat();
     } catch (error) {
       // 插件进程崩了 / 通道断了：等价于"没有中转站"。
+      //
+      // 但**只有插件真的不在了**才判死（红线 1：插件缺失/未启用/起不来 ⇒ 回退内置且明示）——
+      // 插件还在、只是这条隧道的结果拉不到（网络抖动/隧道重连中）时**不判死**：
+      // 那属于"等它回来"，正是用户 2026-10-11 要的口径。
       _log?.call('隧道 ${_session.connId} 心跳失败：$error');
+      if (!_session.pluginAvailable) {
+        _markDown('中转站插件已不可用（${_session.unavailableReason}）');
+      }
       _liveness.recordMiss();
     }
   }
@@ -505,6 +539,47 @@ class TunnelSshTransport
     _log?.call(
       '中转站不可用（$reason）—— 这条连接已判死，下一次工作空间解析将回退内置 dartssh2',
     );
+  }
+
+  /// 等隧道回到 `ready`；期间**不判死、不回退**，只看插件的权威快照（用户 2026-10-11 口径）。
+  ///
+  /// 出口只有三个：
+  /// - 回到 `ready` ⇒ 返回，调用方重发那一次"确定未执行"的请求；
+  /// - 插件自标 `down`（退避耗尽 / 不可调和）⇒ 判死 + 如实失败；
+  /// - 状态都拉不到（插件通道坏了）⇒ 判死 + 如实失败；
+  /// 外加一个**兜底预算** [_maxReadyWait]（防"反复 ready/不 ready 抖动"把一次调用挂成永恒）。
+  Future<void> _awaitTunnelReadyElseFail() async {
+    final Stopwatch waited = Stopwatch()..start();
+    while (true) {
+      if (_closed) {
+        throw SshLinkStaleException('中转站隧道已关闭（本次操作未执行）');
+      }
+      if (_tunnelDown) {
+        throw SshLinkStaleException('中转站已判隧道不可用：$_fallbackReason');
+      }
+      if (waited.elapsed >= _maxReadyWait) {
+        throw SshLinkStaleException(
+          '中转站隧道等待超过 ${_maxReadyWait.inMinutes} 分钟仍未恢复（本次操作未执行，如实失败）',
+        );
+      }
+      await Future<void>.delayed(_readyPollInterval);
+      final TunnelSnapshot snapshot;
+      try {
+        snapshot = await _session.snapshot();
+      } catch (error) {
+        _markDown('中转站状态不可用：$error');
+        throw SshLinkStaleException('中转站不可用：$error');
+      }
+      _lastSnapshot = snapshot;
+      if (snapshot.down) {
+        _markDown(
+          '中转站已判隧道不可用（退避耗尽）：'
+          '${snapshot.lastError.isEmpty ? '未提供原因' : snapshot.lastError}',
+        );
+        throw SshLinkStaleException('中转站已判隧道不可用：$_fallbackReason');
+      }
+      if (snapshot.state == TunnelStates.ready) return;
+    }
   }
 
   /// 发一次 L2 请求（统一活性守卫与错误翻译）。
@@ -539,7 +614,25 @@ class TunnelSshTransport
         '$method${where == null || '$where'.isEmpty ? '' : '（$where）'} 失败',
       );
     } on TunnelUnavailableException catch (error) {
-      _markDown(error.message);
+      if (error.kind == TunnelErrorKinds.tunnelNotReady) {
+        // **隧道还没好**（connecting / booting / reconnecting）——不是判死。
+        //
+        // 插件在"未就绪"时**根本不转发**这条请求 ⇒ 它**确定没被执行过** ⇒ 等隧道回来
+        // **重发一次**是安全的（这不是"重放"：重放的定义是"已经发出去过的再发一遍"，
+        // 协议 §0 红线 3 禁止的是后者）。
+        //
+        // 用户 2026-10-11 明确的口径：断连期间**等到退避耗尽**再如实失败，别在抖动里就报失败。
+        _log?.call(
+          '隧道 ${_session.connId} 暂不可用（${error.message}）⇒ 等它恢复后重发这一次请求',
+        );
+        await _awaitTunnelReadyElseFail();
+        return _call(method, params, raw: raw);
+      }
+      // 其它不可用：**如实失败、不回退、不重放**。
+      //
+      // 判死**刻意不在这里**——判死只由两处触发：心跳快照 `snapshot.down`（退避耗尽，见 [_beat]）
+      // 与"插件进程已不可用"（[_beat] 的 catch）。把判死绑在"某一次请求失败"上，
+      // 正是 2026-10-11 那个"一次网络抖动就判死 + 提前回退内置"的 bug。
       throw SshLinkStaleException('中转站不可用：${error.message}');
     } finally {
       _liveness.unwatchStale(stale);

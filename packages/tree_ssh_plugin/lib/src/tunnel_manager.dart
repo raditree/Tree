@@ -82,7 +82,9 @@ class TunnelManager {
         'config 不完整：缺少 ${config.missingFields.join('、')}',
       );
     }
-    final AgentRequest agent = AgentRequest.parse(request['agent']);
+    // 版本以**插件自报**为准（协议 §2 / §6，2026-10-11 用户裁决 B）：
+    // 只有插件知道它随包带的是哪个二进制；请求里若带版本，只用来对账并留痕。
+    final AgentRequest agent = AgentRequest.parse(request['agent'], log: log);
     final String key = config.dedupeKey;
 
     Tunnel? tunnel = _existingByKey(key);

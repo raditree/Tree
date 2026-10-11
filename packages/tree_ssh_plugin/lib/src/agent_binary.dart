@@ -4,10 +4,16 @@ import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart';
 
 import 'sha256.dart';
 
-/// 核心随 `tunnel.ensure` 下发的 agent 参数（协议 §2 的 `agent`）。
+/// 核心随 `tunnel.ensure` 下发的 agent 参数（协议 §2 的 `agent` 对象里的**可选覆盖**）。
 ///
-/// `version` + `bytes_sha256` 决定"用不用重新推送"；`binary_name` 是随包二进制名
-/// （可带 `{arch}` 占位）；`binary_path` 是**本插件补的**显式覆盖（见 README 不变量）。
+/// **版本口径（2026-10-11 用户裁决 B）**：agent 版本**只由插件自报**（[kAgentVersion]，编译时注入）
+/// —— 理由很硬：**只有插件知道它自己随包带的是哪个二进制**。核心那句 `version` 曾经"声明了却
+/// 到不了插件"（核心只发 `config`、插件读 `request['agent']`，两边的键从来没对上），
+/// 现在已经**明确不再声明**（核心侧 `TunnelConnectRequest` 删掉了那几个字段）。
+/// 若请求里仍然带了版本且与插件自报不一致 ⇒ 记一条日志说明"以插件为准"，**不**照它改。
+///
+/// `bytes_sha256` / `binary_name` / `binary_path` 仍是**可选覆盖**（测试与显式指定用）；
+/// 不传时由插件自己算 sha256、按架构推二进制名。
 class AgentRequest {
   const AgentRequest({
     this.version = kAgentVersion,
@@ -16,15 +22,24 @@ class AgentRequest {
     this.binaryPath = '',
   });
 
-  /// 从 L1 的 `agent` 对象解析（缺省 = 用 [kAgentVersion]，与协议默认一致）。
-  static AgentRequest parse(Object? raw) {
+  /// 从 L1 的 `agent` 对象解析（版本一律取插件自报的 [kAgentVersion]）。
+  static AgentRequest parse(
+    Object? raw, {
+    void Function(String message)? log,
+  }) {
     if (raw is! Map) return const AgentRequest();
     final Map<String, dynamic> map = raw.map(
       (dynamic k, dynamic v) => MapEntry('$k', v),
     );
-    final String version = (map['version'] ?? '').toString().trim();
+    final String requested = (map['version'] ?? '').toString().trim();
+    if (requested.isNotEmpty && requested != kAgentVersion) {
+      log?.call(
+        '请求声明的 agent 版本（$requested）与插件自报（$kAgentVersion）不一致：'
+        '版本以**插件自报**为准（插件的随包二进制才是要推上去的那份）',
+      );
+    }
     return AgentRequest(
-      version: version.isEmpty ? kAgentVersion : version,
+      version: kAgentVersion,
       bytesSha256: (map['bytes_sha256'] ?? map['bytesSha256'] ?? '')
           .toString()
           .trim()
@@ -34,10 +49,10 @@ class AgentRequest {
     );
   }
 
-  /// 期望的 agent 版本（决定目标机上的驻留目录 `~/.tree/agent/<version>/`）。
+  /// 本插件随包 agent 的版本（决定目标机上的驻留目录 `~/.tree/agent/<version>/`）。
   final String version;
 
-  /// 随包二进制的 sha256（核心声明；空 = 插件自己算）。
+  /// 随包二进制的 sha256（显式覆盖；空 = 插件自己算）。
   final String bytesSha256;
 
   /// 随包二进制名（空 = `tree_agent-linux-<arch>`；可带 `{arch}` 占位）。

@@ -45,6 +45,7 @@ abstract final class _AgentMethods {
   static const String shellWrite = 'shell.write';
   static const String shellResize = 'shell.resize';
   static const String shellClose = 'shell.close';
+  static const String ping = 'agent.ping';
 }
 
 abstract final class _TunnelMethods {
@@ -58,11 +59,10 @@ abstract final class _TunnelMethods {
 /// 中转站申报的能力名（核心"有没有中转站"的唯一判据）。
 const String _kCapabilitySshExecutor = 'ssh-executor';
 
-/// 期望的 agent 版本（`tool/build_agent.dart` 用同一个值注入 `_kAgentVersion`）。
-const String _kAgentVersion = String.fromEnvironment(
-  '_kAgentVersion',
-  defaultValue: '1.0.2',
-);
+/// 请求里带的 agent 版本**提示**（2026-10-11 用户裁决 B 之后，核心不再声明版本，
+/// 插件一律用**自己编译期注入的那个**）。这里故意送一个不存在的版本：用来钉住
+/// "提示不决定安装目录"（见 ②b）。
+const String _kAgentVersionHint = '0.0.0-e2e-hint';
 
 int _passed = 0;
 int _failed = 0;
@@ -133,7 +133,7 @@ Future<void> _run(
         'port': port,
         'username': user,
         if (key.isNotEmpty) 'key_path': key,
-        'agent_version': _kAgentVersion,
+        'agent_version': _kAgentVersionHint,
       },
     },
     timeout: const Duration(minutes: 5),
@@ -160,6 +160,23 @@ Future<void> _run(
       throw StateError('$method 失败：${r['error']}（code=${r['error_code']}）');
     }
     return r['result'];
+  }
+
+  /// 拉一次 `tunnel.state` 并取出这条隧道的快照（断连用例里要反复看 state）。
+  Future<Map<String, dynamic>> stateOf() async {
+    final Map<String, dynamic> st = await proc.request(
+      _TunnelMethods.state,
+      <String, dynamic>{'conn_id': conn},
+      timeout: const Duration(seconds: 60),
+    );
+    final List<dynamic> tunnels = (st['tunnels'] as List<dynamic>?) ?? <dynamic>[];
+    return tunnels
+        .whereType<Map<dynamic, dynamic>>()
+        .map((Map<dynamic, dynamic> m) => m.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)))
+        .firstWhere(
+          (Map<String, dynamic> m) => m['conn_id'] == conn,
+          orElse: () => <String, dynamic>{},
+        );
   }
 
   // ③ 文件原语：写 / 读 / 大文件分块 / stat / list / 越界拒绝
@@ -342,6 +359,20 @@ Future<void> _run(
     return '${r.stdout}'.trim();
   }
 
+  // ②b agent 版本口径（2026-10-11 用户裁决 B）：请求里那个版本只是**提示**，
+  //    安装目录与推进去的都是插件**自己编进去**的那一版 ⇒ 不该在提示那个名字下留东西。
+  //    （放在这里只是因为它要用上面那条独立 ssh；语义上仍属于 ② 建隧道。）
+  final String home = (await sshRun('printf %s "\$HOME"')).trim();
+  final String hintProbe = await sshRun(
+    '[ -f "$home/.tree/agent/$_kAgentVersionHint/tree_agent-linux-amd64" ] '
+    '&& echo YES || echo NO',
+  );
+  _check(
+    '请求里的版本提示**不**决定安装目录（版本由插件自报）',
+    hintProbe.trim() == 'NO',
+    '竟然在 ~/.tree/agent/$_kAgentVersionHint/ 下找到了 agent',
+  );
+
   // ⑦a 起一条**长**任务：它必须活着穿过"执行器被杀 + 重建"这一整段。
   final Map<String, dynamic> survivor = _asMap(
     await call(_AgentMethods.execSpawn, <String, dynamic>{
@@ -471,6 +502,127 @@ Future<void> _run(
     await call(_AgentMethods.fsExists, <String, dynamic>{'path': dir}),
   );
   _check('fs.remove 递归删干净', exists['exists'] == false, '$exists');
+
+  // ⑧ **断连完整性**（2026-10-11 用户真机症状的正面复现）
+  //
+  // 用户原话："我主动物理断网模拟网络抖动时立即向 agent 返回了 hook 的失败，而且在重新恢复
+  // 网络连接后直接在目标主机另起了执行器进程"。这一节从**服务端**制造两种断连，逐条钉住修法。
+  //
+  // ⑧a 执行器的命令行必须带 `--root`（越界基线）与 `--idle-timeout-ms`（静默自救上限）。
+  final Map<String, dynamic> live = await stateOf();
+  final Map<String, dynamic> liveAgent = _asMap(live['agent']);
+  final int? livePid = (liveAgent['pid'] as num?)?.toInt();
+  final String liveCmdline = livePid == null
+      ? ''
+      : await sshRun("tr '\\0' ' ' < /proc/$livePid/cmdline 2>/dev/null");
+  _check(
+    '执行器命令行带 --root（agent 的越界基线）',
+    liveCmdline.contains('--root'),
+    'pid=$livePid cmdline="$liveCmdline"',
+  );
+  _check(
+    '执行器命令行带 --idle-timeout-ms（物理断网时它靠这条自己优雅退出）',
+    liveCmdline.contains('--idle-timeout-ms 90000'),
+    'pid=$livePid cmdline="$liveCmdline"',
+  );
+
+  // ⑧b **从服务端掐断这条常驻通道**（客户端立刻看到通道断，而在跑的后台任务不受影响）
+  //     ⇒ 插件进 `reconnecting`，此时**新发起**的请求必须回 `tunnel_not_ready`（**没执行过**）——
+  //     绝不许回 `tunnel_down`（那会让核心判死 + 回退内置，正是"一次抖动就让 hook 立刻失败"的根因）。
+  //
+  // 怎么掐：**顺着 agent 的父进程**找那条会话，杀它。
+  // 为什么不用 `pkill -f 'sshd: ...'` 按名字杀（踩过两次）：
+  //   ① 新版 OpenSSH 的会话进程叫 `sshd-session: <user>@notty`（不是 `sshd:`）；
+  //   ② `[t]` 方括号防自匹配的写法要求方括号套在**第一个**字符上，
+  //      用户名是 `treee2e` 时正确写法是 `[t]reee2e`，写成 `[t]treee2e` 会去匹配 `ttreee2e`（永不命中，
+  //      而且命令成功返回 ⇒ 失败是静默的）。
+  // 顺 agent 的父进程则与被杀进程的名字无关，稳。
+  final String cutSession = livePid == null
+      ? ''
+      : await sshRun(
+          'SES=\$(ps -o ppid= -p $livePid 2>/dev/null | tr -d " "); '
+          'if [ -n "\$SES" ]; then kill "\$SES" 2>/dev/null && echo "killed \$SES" '
+          '|| echo "kill-failed \$SES"; else echo "no-session"; fi',
+        );
+  _check(
+    '掐断动作真的打到了那条会话（否则下面两条断言毫无意义）',
+    cutSession.startsWith('killed'),
+    'agent=$livePid ⇒ $cutSession',
+  );
+  String cutState = '';
+  final Stopwatch cutWait = Stopwatch()..start();
+  while (cutWait.elapsed < const Duration(seconds: 30)) {
+    cutState = (await stateOf())['state'].toString();
+    if (cutState == 'reconnecting') break;
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+  }
+  _check('通道被掐断后插件进入 reconnecting', cutState == 'reconnecting', 'state="$cutState"');
+  final Map<String, dynamic> duringCut = _asMap(
+    await proc.request(_TunnelMethods.request, <String, dynamic>{
+      'conn_id': conn,
+      'method': _AgentMethods.ping,
+      'params': <String, dynamic>{},
+    }),
+  );
+  _check(
+    '重连中的请求回 tunnel_not_ready（**不是**判死的 tunnel_down）',
+    duringCut['ok'] == false && duringCut['error_kind'] == 'tunnel_not_ready',
+    '$duringCut',
+  );
+
+  // ⑧c 自动重连（1s 退避第一拍 + 重新 bootstrap）⇒ 回 ready，且目标机上**只剩一个**执行器。
+  String backState = '';
+  final Stopwatch backWait = Stopwatch()..start();
+  while (backWait.elapsed < const Duration(minutes: 3)) {
+    backState = (await stateOf())['state'].toString();
+    if (backState == 'ready') break;
+    await Future<void>.delayed(const Duration(seconds: 1));
+  }
+  _check('通道断后**自动**重连回 ready（不需要手动 reconnect）', backState == 'ready', 'state="$backState"');
+  final String pidsNow = await sshRun('pgrep -f "$agentPat" | tr \'\\n\' \' \'');
+  final List<String> pidsList = pidsNow.split(RegExp(r'\s+')).where((String s) => s.isNotEmpty).toList();
+  _check(
+    '重建后目标机上只有一个执行器（不累积）',
+    pidsList.length == 1,
+    'pgrep -f "$agentPat" ⇒ "$pidsNow"',
+  );
+  if (livePid != null) {
+    final String oldAlive = await sshRun(
+      'if kill -0 $livePid 2>/dev/null; then echo ALIVE; else echo GONE; fi',
+    );
+    _check('上一世执行器已经退掉', oldAlive == 'GONE', 'kill -0 $livePid ⇒ "$oldAlive"');
+  }
+
+  // ⑧d **卡死**（进程在、但不回帧）：SIGSTOP 之后插件应当靠保活把它换掉，并**收掉**它。
+  //     这条要走满 3 拍保活（20s 间隔 + 10s 窗口 ⇒ 约 90s），是本节最慢的一条。
+  final Map<String, dynamic> ready2 = await stateOf();
+  final int? hungPid = ((_asMap(ready2['agent']))['pid'] as num?)?.toInt();
+  if (hungPid != null) {
+    await sshRun('kill -STOP $hungPid');
+    int? newPid = hungPid;
+    final Stopwatch hungWait = Stopwatch()..start();
+    while (hungWait.elapsed < const Duration(minutes: 4)) {
+      final Map<String, dynamic> st = await stateOf();
+      newPid = ((_asMap(st['agent']))['pid'] as num?)?.toInt();
+      if (st['state'] == 'ready' && newPid != null && newPid != hungPid) break;
+      await Future<void>.delayed(const Duration(seconds: 2));
+    }
+    _check(
+      '卡死的执行器被换掉（新 pid 起来、状态回 ready）',
+      newPid != null && newPid != hungPid,
+      'hung=$hungPid 现在=$newPid',
+    );
+    final String hungAlive = await sshRun(
+      'if kill -0 $hungPid 2>/dev/null; then echo ALIVE; else echo GONE; fi',
+    );
+    _check(
+      '卡死的旧执行器被收掉（重建前 token 守卫的 kill 生效）',
+      hungAlive == 'GONE',
+      'kill -0 $hungPid ⇒ "$hungAlive"',
+    );
+    // 收尾：万一它还在（STOP 着的进程收不到 TERM 之外的信号），显式 KILL 掉别留垃圾。
+    await sshRun('kill -9 $hungPid 2>/dev/null || true');
+  }
 
   // ⑦h 关隧道 ⇒ **执行器立刻关**（核心关 ⇒ 插件收手 ⇒ 通道断 ⇒ agent 退）
   //    同样按 pid 判定：先记下当时活着的 agent pid，关掉后再看它们是否还在。

@@ -23,7 +23,12 @@ typedef FrameEmitter = Future<void> Function(List<int> bytes);
 /// - 坏帧（非法 UTF-8 / 非法 JSON / 超限）由 [LineFrameDecoder] 报错并**继续读**——
 ///   一条坏帧不能让整条通道哑掉；
 /// - stdin **EOF = agent 退出**（协议 §8：agent 进程本身不随 SSH 通道存活）；
-/// - `--idle-timeout-ms` 缺省 **0 = 永不**（仓库口径："没有静态总时长上限"）。
+/// - `--idle-timeout-ms` **缺省 0 = 永不**（仓库口径："没有静态总时长上限"）；
+///   但**插件拉起的常驻 agent 总是显式传一个值**（`kAgentIdleTimeoutMs`，见插件的
+///   `lib/src/keepalive.dart`）：插件在 `ready` 期间定时 `agent.ping` ⇒ 健康链路上永远到不了；
+///   而**物理断网**时对端 sshd 收不到 FIN、通道不会 EOF，agent 唯一的自救线索就是
+///   "这么久没有任何帧进来" ⇒ 到点自己优雅退出（用户 2026-10-11 口径："执行器应该自觉优雅结束"），
+///   不必等 sshd 的 TCP 超时（分钟到十几分钟），新 agent 起来后从落盘台账认领全部后台任务。
 class AgentServer {
   AgentServer({
     required this.config,
@@ -124,7 +129,11 @@ class AgentServer {
     if (idle == null) return;
     _idleTimer?.cancel();
     _idleTimer = Timer(idle, () {
-      _log('idle-timeout=${idle.inMilliseconds}ms 到点（期间没有任何帧进来）：agent 退出');
+      _log(
+        'idle-timeout=${idle.inMilliseconds}ms 到点：这段时间**没有任何帧进来**'
+        '（对端可能已断开/不可达，通道也没给我们 EOF）⇒ 自己优雅退出；'
+        '它托管的后台任务不受影响（setsid 独立进程 + 退出码与台账早已落盘）',
+      );
       _shutdown(0);
     });
   }

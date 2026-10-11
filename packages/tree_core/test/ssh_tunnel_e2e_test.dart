@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
@@ -78,7 +79,6 @@ void main() {
         port: int.tryParse(port) ?? 2222,
         username: user,
         keyPath: key,
-        agentVersion: kAgentVersion,
       ),
     );
     addTearDown(transport.close);
@@ -114,6 +114,83 @@ void main() {
     final String? tail = await io.readTail('.tree/e2e-core-bg.log', 4096);
     expect(tail, contains('CORE-BG-DONE'));
     await handle.close();
+
+    // ⑨ **断连不误发 + 恢复后接续**（用户 2026-10-11 症状 #1 的正面复现，协议 §10）：
+    //    起一条长后台任务 → 从**服务端**掐断这条通道（客户端立刻看到断，后台任务不受影响）
+    //    → 断言切断期间 hook 的 `exitCode` **没有**提前失败 → 自动重连后拿到**真实**退出码与日志。
+    //
+    // 为什么这条必须在真机上钉：修复前它会在断连瞬间以 `SshLinkStaleException` 收尾（而退避还没耗尽），
+    // 之后就再没人认领那个仍在跑的任务 —— 用户原话："即使重连后那个后台任务也没有回来"。
+    Future<String> sshRun(String command) async {
+      final ProcessResult r = await Process.run('ssh', <String>[
+        '-i', key,
+        '-p', port,
+        '-o', 'StrictHostKeyChecking=no',
+        '-o', 'UserKnownHostsFile=/dev/null',
+        '-o', 'BatchMode=yes',
+        '-o', 'ConnectTimeout=10',
+        '$user@$host',
+        command,
+      ]);
+      return '${r.stdout}'.trim();
+    }
+
+    final SshWorkspaceIO cutIo = SshWorkspaceIO(
+      transport.root,
+      transport,
+      // 断连期间的探测间隔：生产默认 30s，这里压到 500ms，免得一条用例等半分钟
+      // （实际路径上"等隧道回来"发生在传输层内部，这个值只在**探测本身失败**时才起作用）。
+      backgroundStalePollInterval: const Duration(milliseconds: 500),
+    );
+    final BackgroundExecHandle cutHandle = await cutIo.startBackground(
+      command: 'sleep 12; echo CORE-CUT-SURVIVED',
+      logRelativePath: '.tree/e2e-core-cut.log',
+    );
+    await Future<void>.delayed(const Duration(seconds: 3)); // 让它先跑起来（首拍立即探测）
+    Object? earlyFailure;
+    bool earlyDone = false;
+    unawaited(
+      cutHandle.exitCode.then(
+        (int _) => earlyDone = true,
+        onError: (Object error) => earlyFailure = error,
+      ),
+    );
+
+    // 掐断：**顺着 agent 的父进程**找那条会话并杀它（名字叫什么都无所谓；
+    // 为什么不用 `pkill -f 'sshd: …'`：新版 OpenSSH 的会话进程叫 `sshd-session: <user>@notty`，
+    // 而且方括号防自匹配要套在用户名**第一个**字符上，写错一个字符就会"静默不命中"）。
+    final int? agentPid = (transport.agentInfo['pid'] as num?)?.toInt();
+    expect(agentPid, isNotNull, reason: 'agent.hello 应当自报 pid');
+    final String cutSession = await sshRun(
+      'SES=\$(ps -o ppid= -p $agentPid 2>/dev/null | tr -d " "); '
+      'if [ -n "\$SES" ]; then kill "\$SES" 2>/dev/null && echo "killed \$SES" '
+      '|| echo "kill-failed \$SES"; else echo "no-session"; fi',
+    );
+    expect(
+      cutSession.startsWith('killed'),
+      isTrue,
+      reason: '掐断动作必须真的打到那条会话，否则下面的断言毫无意义：$cutSession',
+    );
+    await Future<void>.delayed(const Duration(seconds: 4));
+    expect(earlyFailure, isNull, reason: '断连期间**不许**以失联收尾（退避还没耗尽）');
+    expect(earlyDone, isFalse, reason: '任务还在目标机上跑，不该提前收尾');
+
+    expect(
+      await cutHandle.exitCode.timeout(const Duration(seconds: 120)),
+      0,
+      reason: '自动重连后应当从**落盘台账**拿到真实退出码',
+    );
+    expect(
+      await cutIo.readTail('.tree/e2e-core-cut.log', 4096),
+      contains('CORE-CUT-SURVIVED'),
+    );
+    expect(
+      transport.tunnelDown,
+      isFalse,
+      reason: '抖一下不该判死（判死只来自心跳快照 down / 插件不可用）',
+    );
+    await cutHandle.close();
+    await transport.delete('${transport.root}/.tree/e2e-core-cut.log');
 
     // ⑦ 越界仍由 agent 侧第二道防线拒绝
     await expectLater(

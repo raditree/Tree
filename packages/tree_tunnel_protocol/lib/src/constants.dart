@@ -174,9 +174,23 @@ abstract final class TunnelErrorKinds {
   /// **不回退**：配置本身不完整，回退也一样连不上 ⇒ 如实报错。
   static const String configIncomplete = 'config_incomplete';
 
+  /// 隧道**暂时**不可用（`connecting` / `booting` / `reconnecting`），但**没判死**。
+  ///
+  /// 关键区别（2026-10-11 修，用户口径）：这种失败**只说明"这一次请求没被转发给 agent"**，
+  /// 不等于"退避耗尽"。核心据此**等隧道回来再发**（`tunnel_not_ready` 的请求**确定未执行**，
+  /// 因此重发不是"重放"），而**不是**判死/回退内置。
+  ///
+  /// 修复前 `connecting`/`reconnecting` 也报 [tunnelDown]，核心把"重连中"当成"判死"⇒
+  /// 一次网络抖动就让后台 hook 立刻失败（还提前回退内置），用户 2026-10-11 报的就是它。
+  static const String tunnelNotReady = 'tunnel_not_ready';
+
+  /// 隧道**已判死**：退避耗尽（累计上限）或不可调和，或已被显式关闭。
   static const String tunnelDown = 'tunnel_down';
 
   /// 这些 kind ⇒ 核心**回退内置 dartssh2**（并明示）。
+  ///
+  /// [tunnelNotReady] **刻意不在**这里：它只是"还没好"，等它就是了，回退反而把
+  /// 一条正在重连的隧道白扔掉。
   static const Set<String> fallbackKinds = <String>{
     agentUnreachable,
     pushFailed,

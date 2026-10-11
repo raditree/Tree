@@ -183,7 +183,8 @@ void main() {
       final Map<String, dynamic> result = await inFlight;
       expect(result['ok'], isFalse);
       expect(result['error_kind'], TunnelErrorKinds.tunnelDown);
-      expect(result['error'], contains('未执行'));
+      // 通道**中途**断：不能承诺"未执行"（远端有没有执行到我们无从得知）⇒ 核心据此如实失败、不重发。
+      expect(result['error'], contains('结果未知'));
       // 在途请求**没有**被偷偷重发（假 agent 只收到过一次）
       expect(
         _liveChannel(remote).received
@@ -252,7 +253,7 @@ void main() {
   });
 
   group('tunnel.request 转发', () {
-    test('非 ready ⇒ 显式 tunnel_down（不静默）', () async {
+    test('非 ready ⇒ 显式 tunnel_not_ready（不静默、也不当判死）', () async {
       final Tunnel tunnel = build();
       addTearDown(tunnel.close);
       final Map<String, dynamic> result =
@@ -260,7 +261,11 @@ void main() {
       expect(result, <String, dynamic>{
         'ok': false,
         'error': contains('隧道未就绪'),
-        'error_kind': TunnelErrorKinds.tunnelDown,
+        // 2026-10-11：这一格从 `tunnel_down` 改成 `tunnel_not_ready` ——
+        // 报成 tunnel_down 会让核心把"重连中"当判死（用户真机症状的根因）。
+        'error_kind': TunnelErrorKinds.tunnelNotReady,
+        'tunnel_state': TunnelStates.connecting,
+        'attempt': 0,
       });
     });
 

@@ -189,6 +189,17 @@ class _PluginTunnelSession implements TunnelSession {
   @override
   Stream<TunnelShellEvent> get events => _events.stream;
 
+  /// 插件**此刻**还在不在（实时问 `PluginBus`，不是缓存）。
+  ///
+  /// 心跳失败时用它区分两件事（2026-10-11 用户口径）：
+  /// - 插件没了（缺失 / 未启用 / 进程不在 / 能力丢了）⇒ **判死**，核心回退内置并明示；
+  /// - 插件还在（只是这条隧道的结果拉不到：网络抖动、隧道在重连）⇒ **不判死**，等它回来。
+  @override
+  bool get pluginAvailable => _link.available;
+
+  @override
+  String get unavailableReason => _link.unavailableReason;
+
   @override
   Future<Object?> request(String method, Map<String, dynamic> params) async {
     final Map<String, dynamic> result;

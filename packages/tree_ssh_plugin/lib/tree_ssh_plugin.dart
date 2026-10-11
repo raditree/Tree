@@ -13,6 +13,7 @@ export 'src/agent_binary.dart';
 export 'src/agent_client.dart';
 export 'src/backoff.dart';
 export 'src/bootstrap.dart';
+export 'src/keepalive.dart';
 export 'src/login_shell.dart';
 export 'src/plugin_loop.dart';
 export 'src/sha256.dart';

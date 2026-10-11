@@ -70,7 +70,7 @@ void main() {
       // 所以这里钉住"永远带"，而不是"空则省略"。
       expect(
         buildSpawnCommand(agentPath: '/a/tree_agent', root: '/data x', token: 't'),
-        "'/a/tree_agent' --root '/data x' --token 't'",
+        "'/a/tree_agent' --root '/data x' --token 't' --idle-timeout-ms 90000",
       );
     });
 
@@ -129,7 +129,7 @@ void main() {
       // 常驻通道用最终路径 + **绝对 root** + token 拉起
       expect(
         remote.spawned,
-        <String>["'$path' --root '/home/tester' --token 'tok-abc'"],
+        <String>["'$path' --root '/home/tester' --token 'tok-abc' --idle-timeout-ms 90000"],
       );
       // 登录外壳探测（bash 在 ⇒ 只探 bash）
       expect(cmds[8], 'command -v bash');
@@ -146,7 +146,7 @@ void main() {
       addTearDown(result.client.close);
       expect(
         remote.spawned.single,
-        endsWith("--root '/srv/ws' --token 'tok-abc'"),
+        endsWith("--root '/srv/ws' --token 'tok-abc' --idle-timeout-ms 90000"),
       );
     });
 

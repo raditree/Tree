@@ -30,12 +30,22 @@ class FakeTunnelSession implements TunnelSession {
   int reconnectCalls = 0;
   int closeCalls = 0;
 
+  /// 插件是否还在（心跳失败时核心据此决定"判死"还是"等它回来"）。
+  @override
+  bool pluginAvailable = true;
+
+  @override
+  String unavailableReason = '插件已停';
+
   /// 被强制设定的状态（null = 一直 ready）。
   String? forcedState;
   String lastError = '';
 
   /// 下一次 `request` 抛这个（用完即清）。
   Object? nextError;
+
+  /// `snapshot()` 抛这个（模拟"插件通道也断了"）。
+  Object? snapshotError;
 
   /// `shell.open` 是否回"不支持 PTY"。
   bool ptyUnsupported = false;
@@ -184,6 +194,8 @@ class FakeTunnelSession implements TunnelSession {
   @override
   Future<TunnelSnapshot> snapshot() async {
     snapshotCalls++;
+    final Object? boom = snapshotError;
+    if (boom != null) throw boom;
     return TunnelSnapshot(
       connId: connId,
       state: forcedState ?? TunnelStates.ready,
@@ -233,8 +245,6 @@ TunnelConnectRequest request() => const TunnelConnectRequest(
   host: 'h',
   username: 'u',
   password: 'p',
-  agentVersion: '1.0.0',
-  agentSha256: 'sha',
   heartbeatInterval: Duration(milliseconds: 40),
 );
 
@@ -460,21 +470,100 @@ void main() {
       await t.close();
     });
 
-    test('隧道不可用 ⇒ 在途请求以 SshLinkStaleException 显式失败（不重放）', () async {
+    test('请求级失败**不判死**：如实失败但隧道还留着（判死只来自心跳）', () async {
       final FakeTunnelSession session = FakeTunnelSession();
       final TunnelSshTransport t = await TunnelSshTransport.connect(
         FakeTunnelLink(session),
         request(),
       );
+      // 通道断在请求中途 ⇒ 插件报 tunnel_down ⇒ 这次如实失败、**不重放**……
       session.nextError = TunnelUnavailableException(
         TunnelErrorKinds.tunnelDown,
-        '隧道断了',
+        '隧道通道已断，本次操作结果未知（不会自动重试）',
       );
       await expectLater(
         t.read('/ws/a'),
         throwsA(isA<SshLinkStaleException>()),
       );
+      // ……但**不许**据此判死回退：那正是 2026-10-11 那个"一次抖动就回退内置"的 bug。
+      expect(
+        t.tunnelDown,
+        isFalse,
+        reason: '判死只能由心跳快照 down / 插件不可用触发',
+      );
+      await t.close();
+    });
+
+    test('"还没好"（tunnel_not_ready）⇒ 等它回来再发一次（不判死、也不是重放）', () async {
+      final FakeTunnelSession session = FakeTunnelSession();
+      final TunnelSshTransport t = await TunnelSshTransport.connect(
+        FakeTunnelLink(session),
+        request(),
+        readyPollInterval: const Duration(milliseconds: 10),
+      );
+      session
+        ..files['/ws/a'] = utf8.encode('hi').toList()
+        ..forcedState = TunnelStates.reconnecting
+        ..nextError = TunnelUnavailableException(
+          TunnelErrorKinds.tunnelNotReady,
+          '隧道未就绪（state=reconnecting）',
+        );
+      final Future<List<int>> pending = t.read('/ws/a');
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      expect(
+        session.calls.where((String c) => c.startsWith('fs.read')).length,
+        1,
+        reason: '插件在"未就绪"时不会转发 ⇒ 这一次请求确定没执行过',
+      );
+      expect(t.tunnelDown, isFalse, reason: '重连期间绝不判死');
+
+      session.forcedState = null; // 隧道回来了
+      expect(utf8.decode(await pending), 'hi');
+      expect(
+        session.calls.where((String c) => c.startsWith('fs.read')).length,
+        2,
+        reason: '恢复后重发一次（"确定未执行"才允许重发）',
+      );
+      await t.close();
+    });
+
+    test('等太久（超预算）⇒ 如实失败，不无限期挂着', () async {
+      final FakeTunnelSession session = FakeTunnelSession()
+        ..forcedState = TunnelStates.reconnecting
+        ..nextError = TunnelUnavailableException(
+          TunnelErrorKinds.tunnelNotReady,
+          '隧道未就绪',
+        );
+      final TunnelSshTransport t = await TunnelSshTransport.connect(
+        FakeTunnelLink(session),
+        request(),
+        readyPollInterval: const Duration(milliseconds: 10),
+        maxReadyWait: const Duration(milliseconds: 60),
+      );
+      await expectLater(
+        t.read('/ws/a'),
+        throwsA(
+          isA<SshLinkStaleException>().having(
+            (SshLinkStaleException e) => e.message,
+            'message',
+            contains('仍未恢复'),
+          ),
+        ),
+      );
+      await t.close();
+    });
+
+    test('插件已不可用 ⇒ 判死（本地事实：没有中转站了）', () async {
+      final FakeTunnelSession session = FakeTunnelSession()
+        ..pluginAvailable = false
+        ..snapshotError = WorkspaceIoException('插件通道已断');
+      final TunnelSshTransport t = await TunnelSshTransport.connect(
+        FakeTunnelLink(session),
+        request(),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 120));
       expect(t.tunnelDown, isTrue);
+      expect(t.fallbackReason, contains('插件'));
       await t.close();
     });
 

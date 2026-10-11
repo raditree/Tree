@@ -375,7 +375,7 @@ packages:
     source: path
     version: "0.1.0"
   tree_tunnel_protocol:
-    dependency: "direct main"
+    dependency: transitive
     description:
       path: "../tree_tunnel_protocol"
       relative: true

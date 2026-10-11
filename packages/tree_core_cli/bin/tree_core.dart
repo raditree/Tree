@@ -4,7 +4,6 @@ import 'dart:io';
 
 import 'package:tree_core/tree_core.dart';
 import 'package:tree_local_exec/tree_local_exec.dart';
-import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart';
 
 /// 核心进程入口（`dart compile exe` → `tree_core.exe`）。
 ///
@@ -307,9 +306,6 @@ Future<void> main(List<String> args) async {
               keyPassphrase: config.keyPassphrase,
               root: config.root,
               loginShell: config.loginShell,
-              // 版本由核心说（"我要哪个 agent"），sha256 与二进制位置归插件自解析
-              // （只有插件知道自己的随包 `agents/` 在哪）。
-              agentVersion: kAgentVersion,
               heartbeatInterval: settings.heartbeatInterval,
               maxMissedHeartbeats: settings.missedHeartbeatLimit,
             ),

@@ -49,6 +49,12 @@ class FakeRemote {
   /// 这些方法假 agent **不回包**（用来制造"在途请求"）。
   final Set<String> silentMethods = <String>{};
 
+  /// 上一世 agent 清理命令（重建前"按 token 精确收掉"）针对过的 pid。
+  final List<int> reapedPids = <int>[];
+
+  /// 清理命令的应答覆盖（null = 按"spawn 记录里有没有这个 token"自动答 reaped / gone）。
+  String? Function(int pid, String token)? reapResponder;
+
   /// 被关掉的连接次数。
   int closed = 0;
 
@@ -181,6 +187,27 @@ class FakeRemote {
       final String shell = command.split(' ').first;
       return ExecOutcome(
         exitCode: availableCommands.contains(shell) ? 0 : 1,
+      );
+    }
+    // 上一世 agent 清理（形状见 `tunnel.dart` 的 `_reapPreviousAgent`）：
+    // 真语义是"在 /proc/<pid>/cmdline 里按一次性 token 核对，是它才 kill"。
+    // 这里只做"认得出这条命令 + 记下 pid"，应答由 [reapResponder] 或 spawn 记录推断。
+    if (command.contains('/proc/') && command.contains('grep -qF --')) {
+      final RegExpMatch pidMatch =
+          RegExp(r'/proc/(\d+)/cmdline').firstMatch(command)!;
+      final RegExpMatch tokenMatch =
+          RegExp(r"grep -qF -- '([^']*)'").firstMatch(command)!;
+      final int pid = int.parse(pidMatch.group(1)!);
+      final String token = tokenMatch.group(1)!;
+      reapedPids.add(pid);
+      final String? custom = reapResponder?.call(pid, token);
+      if (custom != null) {
+        return ExecOutcome(exitCode: 0, stdout: utf8.encode('$custom\n'));
+      }
+      final bool ours = spawned.any((String s) => s.contains(token));
+      return ExecOutcome(
+        exitCode: 0,
+        stdout: utf8.encode(ours ? 'reaped\n' : 'gone\n'),
       );
     }
     throw StateError('假远端不认识这条命令（形状漂移了？）：$command');

@@ -5,6 +5,7 @@ import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart';
 
 import 'agent_binary.dart';
 import 'agent_client.dart';
+import 'keepalive.dart';
 import 'login_shell.dart';
 import 'sha256.dart';
 import 'ssh_dialer.dart';
@@ -136,10 +137,16 @@ String? mapArch(String unameMachine) {
 /// [root] **必须是绝对路径**（调用方先过 [resolveRemoteRoot]）—— 它是 agent 的越界防护基线，
 /// 也是 `exec.run` 里 `cd` 的目标：给相对路径 / `~`，agent 的 `--root` 校验会直接拒绝启动
 /// （实测：`[tree_agent] 缺少 --root <工作空间根绝对路径>` 后通道立刻关闭 ⇒ `handshake_failed`）。
+///
+/// `--idle-timeout-ms` **总是显式传**（[idleTimeoutMs]，缺省 [kAgentIdleTimeoutMs]）：
+/// agent 的缺省是 0 = 永不，那是给"手工起一个 agent 玩"用的；由插件拉起的常驻 agent
+/// 必须能**自己察觉断连**（物理断网时它收不到 EOF）——靠"这么久没有任何帧进来"自救退出，
+/// 见 `keepalive.dart` 的成组注释（用户 2026-10-11 口径：执行器自觉优雅结束）。
 String buildSpawnCommand({
   required String agentPath,
   required String root,
   required String token,
+  int idleTimeoutMs = kAgentIdleTimeoutMs,
 }) {
   final StringBuffer buffer = StringBuffer()
     ..write(posixSingleQuote(agentPath));
@@ -149,6 +156,9 @@ String buildSpawnCommand({
   buffer
     ..write(' --token ')
     ..write(posixSingleQuote(token));
+  buffer
+    ..write(' --idle-timeout-ms ')
+    ..write(idleTimeoutMs);
   return buffer.toString();
 }
 

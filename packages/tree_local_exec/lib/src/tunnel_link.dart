@@ -17,9 +17,6 @@ class TunnelConnectRequest {
     this.keyPassphrase = '',
     this.root = '',
     this.loginShell,
-    required this.agentVersion,
-    this.agentSha256 = '',
-    this.agentBinaryName = '',
     this.heartbeatInterval = const Duration(seconds: 10),
     this.maxMissedHeartbeats = 3,
   });
@@ -37,16 +34,6 @@ class TunnelConnectRequest {
   /// 登录外壳模板三态：`null` = 内置候选（默认开）、`''` = 显式关、非空 = 自定义模板。
   final String? loginShell;
 
-  /// 期望的 tree_agent 版本（决定要不要重推）。
-  final String agentVersion;
-
-  /// 随包 agent 二进制的 sha256；**空串 = 交给插件按自己的随包目录自解析**
-  /// （插件才知道 `agents/` 在哪 —— 核心只负责说"我要哪个版本"）。
-  final String agentSha256;
-
-  /// 随包 agent 二进制的文件名（如 `tree_agent-linux-amd64`；空 = 插件按架构自行推断）。
-  final String agentBinaryName;
-
   /// 心跳间隔 I（核心侧判活窗口同时用它）。
   final Duration heartbeatInterval;
 
@@ -63,9 +50,6 @@ class TunnelConnectRequest {
     if (keyPassphrase.isNotEmpty) 'key_passphrase': keyPassphrase,
     if (root.isNotEmpty) 'root': root,
     if (loginShell != null) 'login_shell': loginShell,
-    'agent_version': agentVersion,
-    if (agentSha256.isNotEmpty) 'agent_sha256': agentSha256,
-    if (agentBinaryName.isNotEmpty) 'agent_binary_name': agentBinaryName,
     'heartbeat_interval_ms': heartbeatInterval.inMilliseconds,
     'max_missed': maxMissedHeartbeats,
   };
@@ -181,6 +165,15 @@ abstract interface class TunnelSession {
 
   /// 拉取状态（**权威判活面**：核心每心跳拉一次）。
   Future<TunnelSnapshot> snapshot();
+
+  /// 中转站插件**此刻还在不在**（核心 `PluginBus` 的实时查询，不是缓存）。
+  ///
+  /// 用途只有一个：心跳失败时区分"插件没了"（⇒ 判死、回退内置、明示）与
+  /// "插件还在、只是这条隧道的结果拉不到"（⇒ 不判死，等它回来 —— 用户 2026-10-11 口径）。
+  bool get pluginAvailable;
+
+  /// [pluginAvailable] 为 false 时的可读原因（给日志与右栏用）。
+  String get unavailableReason;
 
   /// 重置退避并立即重试（用户的「重连」/ 执行站 `ssh.reconnect`）。
   Future<void> reconnect();
