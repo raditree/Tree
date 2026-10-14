@@ -70,11 +70,23 @@
     还没进内存"的时序，不许误判成"不存在"），再核对记录自己的 `(ownerAgentId, sessionId)`；对不上 ⇒ 404 +
     可读原因，未知 id / agent 不存在同样 404，**一律不静默回空表**。
 
+17. **站点三端点成功时直接回 `StationInstance.describe()` 整块，不加 `ok` 包装**（[core_server.dart](core_server.dart)
+    的 `_stationDetail` / `_updateStationConfig` / `_setStationSubscriber`，
+    [test/plugin_api_test.dart](../../../test/plugin_api_test.dart) 强制）：
+    `GET /api/plugin/stations/{id}`、`PATCH .../config`、`POST .../subscribers/{key}` ——详情与"改完回读"
+    是**同一形状**，前端因此只需要一个解析器（`PluginStationInfo.tryParse`，不另造一套只给面板用的 DTO）。
+    失败走状态码 + `detail` 可读原因：未知站点 ⇒ 404（**不给空对象让前端渲染一张空白详情页**）、
+    非法值 ⇒ 400（`内置站点` / `整数` / `布尔`），**空 PATCH 也算 400** 而不是"成功但什么都没改"。
+    `{id}` 与订阅键位 `{key}`（形如 `plugin_id|scope`，带 `|`）由调用方 `Uri.encodeComponent`，路由侧按
+    不变量 4 只解码一次。这一面**不越权改核心定义的东西**（内置站的介绍/配置在点位表里，只能改
+    `max_subscriptions`），可改面的完整口径见 [../plugin/README.md](../plugin/README.md) 不变量 20/22。
+
 ## 测试
 
 ```bash
 cd packages/tree_core
 dart test test/server_test.dart test/ws_send_liveness_test.dart test/plugin_hot_apply_test.dart \
           test/subagents_api_test.dart test/subagent_transcript_api_test.dart \
-          test/compact_api_test.dart test/agents_config_api_test.dart test/agent_delete_api_test.dart
+          test/compact_api_test.dart test/agents_config_api_test.dart test/agent_delete_api_test.dart \
+          test/plugin_api_test.dart
 ```

@@ -94,8 +94,9 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `station/command` | 请求 | `{command, arguments, team_id?, agent_id?, session_id?, mode_key?}` | `{command, ok, mount_id, payload, error}` |
 | `station/subscribe` | 请求 | `{station, point?, scope?, replace?, station_id?}` | `{ok, station_id, station_ids, kind, scope, replaced, error, subscriptions}` |
 | `station/unsubscribe` | 请求 | 同上（`station` / `point` / `station_id`） | `{ok, station_id, station_ids, kind, removed, error}` |
-| `station/register` | 请求 | `{kind, name, description?, schema?, max_subscriptions?}` | `{ok, station_id, error}` |
+| `station/register` | 请求 | `{kind, name, readme, description?, schema?, max_subscriptions?, shared?, allowed_plugins?, config?}`（**`readme` 必填**，见 §3.3） | `{ok, station_id, kind, error}` |
 | `station/unregister` | 请求 | `{station_id}` | `{ok, removed, error}` |
+| `station/trigger` | 请求 | `{station_id, topic?, scope?, payload?, meta?}`（**必须带确定的 `mode_key`**，见 §3.3） | `{ok, station_id, kind, result, error}`；`result` 含 `summary` / `delivered` / `skipped` / `deliveries[]` |
 | `station/stream` | **通知** | `{request_id, delta?}` / `{request_id, done:true, …}` / `{request_id, error:{…}}` | 不等应答（见 §5.4） |
 | `log` | **通知** | `{level, message}` | 进核心日志缓冲 |
 | `event` | **通知** | 任意 JSON 对象 | 转成前端 `plugin_event` 帧 |
@@ -183,6 +184,72 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 `replace: true`（回包里 `replaced` 是被你顶掉的那个插件 id）。需要"按 team / agent
 分开处理"时，正解是**由这个订阅者自己转发**（在插件内再建站点分发），而不是多插件
 各订一份。
+
+### 3.3 插件自建站（`station/register`）：readme 必填、共享、自定义配置
+
+站点全局化后**每个点位只有一个订阅者**，所以上面那条"自己转发"的正解长这样：
+一个插件订阅内置点位 → **自建一个转发型站点** → 让别的插件订阅它 / 触发它。建站必须
+走核心，否则下游没有回包通道与等待链。
+
+```jsonc
+// 插件 → 核心
+{"jsonrpc":"2.0","id":3,"method":"station/register","params":{
+  "kind": "relay",                  // broadcast | relay | collect（execute 不可自建）
+  "name": "audit",                  // 只允许字母数字与 _ -，**不能带点号**
+  "readme": "收到工具公告后按 team 单向改写再投递；订阅者回 null = 不改动。",
+  "description": "审计转发站",       // 可选；卡片上那一行短说明
+  "max_subscriptions": 8,           // 可选；缺省 relay 16、其余 32
+  "shared": true,                   // 可选；缺省 false = 只有你能用
+  "allowed_plugins": ["other"],     // 可选；非空 = 只开放给列出的插件
+  "config": {"route": "team"}       // 可选；站点自定义配置（核心不解释语义）
+}}
+→ {"ok": true, "station_id": "plugin.sample.relay.audit", "kind": "relay", "error": ""}
+```
+
+**id 由核心拼**（`plugin.{你的 id}.{kind}.{name}`）：插件不能自选 id，也不能冒用内置 id
+或别人的命名空间——"我的站点只能是我的"就是在这一条上强制的。
+
+三条硬规矩（都在 `station/register` 里，业务拒绝一律回 `ok:false` + 可读 `error`，
+**不会建出半个站点**）：
+
+| 规矩 | 为什么 | 被拒时说的话 |
+|---|---|---|
+| **`readme` 必填**（非空且不全空白） | 站是你建的，"它干什么、什么时候被触发、订阅者该怎么回"只有你说得清；共享给别人时，这份 readme 是对方唯一能读到的说明书 | `station/register 需要 readme（站点介绍，必填）：这个站干什么、什么时候被触发、订阅者该怎么回。内置站点的介绍来自核心的点位表。` |
+| `name` 里不能有点号 | 会与归属前缀判定撞车（插件 `a` 建 `b.relay.x` 能顶掉 `a.b` 的站） | 点名「只允许」的字符集 |
+| 收集站必须带非空 `schema` | 输入格式由站点定义，订阅者要按它产出 | `收集站必须定义 schema（输入格式：fields 非空），当前为空` |
+
+**内置站点的介绍来自点位表**（[station_points.dart](../packages/tree_core/lib/src/plugin/station_points.dart)），
+插件与界面都**不能**改写；界面上改内置站只能改「可订阅插件数量」。
+
+**同名重复注册 = 幂等**：返回既有站点、不报错、**也不覆盖**第一次写的 `readme`（插件重启
+会再注册一遍，所以这条校验排在幂等分支之后——这次没带介绍也不该把既有站拒掉）。
+
+共享出去的站怎么用（`shared` / `allowed_plugins` 这把闸门**订阅与触发共用**）：
+
+```jsonc
+// 别的插件订阅它（成为下游）
+{"method":"station/subscribe","params":{"station_id":"plugin.sample.relay.audit"}}
+// 别的插件（或订阅方自己）触发它
+{"method":"station/trigger","params":{"station_id":"plugin.sample.relay.audit",
+  "topic":"audit","scope":{"team_id":"agt_1","mode_key":"local"},"payload":{…}}}
+```
+
+- 闸门只认**显式声明**：`shared` 为 false ⇒ 别人连门都摸不到；`allowed_plugins` 非空 ⇒
+  名单外一律拒（原因里写出当前名单）。**所有者永远能用你自己的站**——门是给别人的，
+  不是防自己的。
+- 触发时消息 `scope` **由核心按真实归属解析**，调用方自报的 team / mode 不作数（与订阅
+  同一 fail-closed 口径）；而且**必须带确定的 `mode_key`**：空 mode 在*订阅*里是通配，
+  但投递判据是"消息 ↔ 订阅者"，一条没有工作面的消息定不了投给谁（拒绝原因会指向
+  `mode_key` 这个可改的字段）。
+- **内置点位不可触发**：它们的触发时机由核心在固定接入点决定，要用内置能力请下
+  `station/command`；**执行站不可触发**（由命令驱动，没有"触发一次"的语义）。
+- 站点自定义 `config` **随 `meta` 下发给订阅者**（`meta` 里另有 `triggered_by` = 这次是谁
+  触发的）。核心**不解释**这些键的含义——那是建站方与订阅者之间的契约；但订阅者必须
+  读得到，否则界面上配的"其他参数"就是摆设。
+- **禁用订阅者 ≠ 退订**：所有者可以把某个订阅者关掉（保留订阅关系与回包通道），触发时
+  不投给它，但每条跳过都写进 `result.skipped` 并计入 `skipped_disabled`——不静默。
+- 自建站与它的 `readme` / `shared` / `allowed_plugins` / `config`、以及每个订阅者的禁用标记，
+  都**落盘 `config/stations.yaml`**：跨重启保留，插件重新上线也不会把用户关掉的东西悄悄打开。
 
 ---
 
@@ -644,6 +711,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 plugins:
   - id: sample                     # 唯一；决定插件工具命名空间 plugin__sample__xxx
     name: 示例插件
+    description: 把工具公告转发给队友   # 可选：插件介绍（「插件详情页」正文读这里）
     enabled: true
     command: python                 # 启动命令（argv[0]）
     args: ["plugins/sample_plugin.py", "--slot-key", "sample.card.rounds"]
@@ -656,6 +724,10 @@ plugins:
 - 写 `scope` 只影响**声明上限**：空 = 全部 team；填了就只能服务它。
 - `granularity` 是**声明性**的实例粒度（界面按它分组/提示）；站点与命令的隔离一律按
   运行期四元组解析（§4），不靠它兜底。
+- `description` 是**插件介绍**：界面上的「编辑」弹窗可以直接写它（落盘这份 yaml）。
+  面板的**插件详情页**正文读的就是这里——刻意**不取**协议握手里的说明：`initialize`
+  只在插件连上之后才有，而**启动失败的插件最需要介绍**。空串不写这一键（不给全表
+  添一行噪声）。
 - 界面上的「启用」开关会写这份文件；改动在核心下次启动或热应用时生效。
 - 插件脚本路径：相对路径按**核心进程的工作目录**解析（桌面端是 `plugins/`）。
 
@@ -666,7 +738,7 @@ plugins:
 | 手段 | 怎么做 |
 |---|---|
 | 插件日志 | `log` 通知（`{"method":"log","params":{"level":"info","message":"…"}}`）或直接写 stderr |
-| 面板 | 设置 → 插件开发：「插件」段看实例状态与订阅，**「站点」段看每个点位**的订阅者/计数（`requests` / `responded` / `timeout` / `no_subscriber` 等） |
+| 面板 | 设置 → 插件开发：「插件」段看实例状态与订阅，**「站点」段看每个点位**的订阅者/计数（`requests` / `responded` / `timeout` / `no_subscriber` 等）。两类卡片**都能点进详情页**：插件页全程只读（介绍 / 基本信息 / 内置运行时 / 运行态 / 提供的工具 / 它建的与它订阅的站）；站点页重新 GET 一次真值，可改「可订阅插件数量」、订阅者的**禁用开关**、以及 `config` 里的自定义项（增 / 删 / 改） |
 | 骨架探针 | 先用 §1 的最小骨架跑通 `hello` / `ping` / `tools/list`，再加站点订阅；不要一上来就写全功能 |
 | 不用真核心自测 | 写一个假核心：按 §2 的报文往你的 stdin 写，读你的 stdout 断言（示例仓库里的 `sample_plugin.py --selftest` 就是这么做的） |
 | 常见坑 | ① stdout 混入日志 ⇒ 解析失败；② 单线程顺序处理 ⇒ 自锁 + 心跳丢失；③ 忘了 `ui/manifest` 声明 `card` 槽位 ⇒ 推了看不到；④ 订阅写了错的 `mode_key` ⇒ 收不到消息；⑤ 流式接管忘了 `done` ⇒ 该轮一直等（最终被取消/心跳判死）；⑥ **面板按钮判据写成 `method == "plugin_ui_action"`** ⇒ 永远不命中，表现为"点了没反应"（真实形状见 §7.2，判据在 `params.event` 上） |

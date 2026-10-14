@@ -15,6 +15,63 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
+## [Unreleased]
+
+### 断言变化（新增 / 修改的 README 不变量）
+
+- **插件内置站点的三条定稿**（**新增**
+  [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 20/21/22、
+  **新增** [packages/tree_core/lib/src/server/README.md](packages/tree_core/lib/src/server/README.md) 不变量 17、
+  [docs/plugin-development.md](docs/plugin-development.md) 新增 §3.3）：
+  - **断言 3（`readme` 必填）原本不成立 ⇒ 现在成立**：`station/register` 缺 `readme` 回 `ok:false` + 指名
+    `readme` 的中文原因，且**不会建出半个站点**（拒绝都发生在校验阶段）。内置点位的介绍来自核心的**点位表**
+    （`readme` 空则回落 `description`），面板因此永远不留空白。`readme` / `shared` / `allowed_plugins` / `config`
+    与每个订阅者的禁用标记一起落盘 `config/stations.yaml`；**同名重复注册 = 幂等**：返回既有站点、不报错、
+    **也不覆盖**第一次写的介绍（插件重启会再注册一遍）。
+  - **断言 2（可被其他插件调用）原本不成立 ⇒ 现在要显式声明才成立**：自建站默认只有建它的插件能用；
+    `shared: true` ⇒ 别人能 `station/subscribe`（成为下游）、也能 `station/trigger`（调用它）；
+    `allowed_plugins` 非空 ⇒ 名单外一律拒（原因里写出当前名单）。**订阅与触发共用同一把闸门**
+    （`StationInstance.callableBy`），因此不存在"绕开订阅直接喊"的旁路；**所有者永远能用我自己的站**。
+    三条硬口径：**内置点位不可被插件触发**（要用内置能力请下 `station/command`）、**执行站不可触发**、
+    触发消息**必须带确定的 `mode_key`**（空 mode 在订阅里是通配，但投递判定是"消息 → 订阅者"）。站点自定义
+    `config` 随 `meta` 下发给订阅者（`meta` 里另有 `triggered_by`）——否则界面上配的"其他参数"就是摆设。
+  - **断言 1（左侧站点栏可见）原本就成立**：站点 id 不含 team / mode（plugin 不变量 2），快照不按 team 过滤，
+    自建站与内置点位因此在同一份列表里出现。本次把它**写成断言并补了钉子用例**（原来只是事实、没人钉住）。
+  - **面板对站点的写面只有三格，且禁用 ≠ 退订**：① 可订阅插件数量（内置站**唯一**可改项）；② 自建站另可改
+    `readme` / `shared` / `allowed_plugins` / `config`（PATCH = 局部更新，**没发的键不改动**）；③ 按订阅键位
+    `plugin_id|scope` 开关某个订阅者。禁用只让触发时不投给它，**订阅关系与回包通道都留着**，每条跳过写进
+    `result.skipped` 并计入 `skipped_disabled`——**不静默**；禁用标记跨重启保留，插件重新上线也**不会把用户
+    关掉的东西悄悄打开**。
+  - 三个站点端点（`GET /api/plugin/stations/{id}`、`PATCH .../config`、`POST .../subscribers/{key}`）成功时
+    **直接回 `StationInstance.describe()` 整块、不加 `ok` 包装** ⇒ 前端只需要一个解析器（不另造一套只给面板用的
+    DTO）。失败走状态码 + `detail`：未知站点 404（**不给空对象让前端渲染一张空白详情页**）、非法值 400、
+    **空 PATCH 也算 400** 而不是"成功但什么都没改"。
+
+- **插件与站点的卡片都能点进详情页；插件介绍有唯一的写入处**（**新增** [lib/README.md](lib/README.md) 不变量 27）：
+  - **插件页全程只读**（介绍 / 基本信息 / 内置运行时 / 运行态 / 提供的工具 / 它建的与它订阅的站）；改配置仍只走
+    卡片上的「编辑」弹窗——**两处都能写就会分叉**。介绍读 `plugins.yaml` 的 `description`：`initialize` 里的说明
+    **刻意不取**（启动失败的插件最需要介绍，而它恰恰没握手过）。编辑弹窗新增「介绍」一格，POST / PATCH 都写这
+    一键，**空串不写这一键**（不给全表添一行噪声）。
+  - **站点页是唯一的写面**，进页面**必定重新 GET 一次真值**（卡片那份来自 WS 节流的快照）；写成功后直接用核心回的
+    **改后详情**刷新，不再发第二次 GET（少一次往返，也不会"界面比核心新"）。内置站的介绍与自定义配置**只读**并
+    写明原因；缺东西就说什么缺（介绍为空给出「去哪儿补」的指引，详情读不出来给红条 + 重试），**不猜**。
+
+> 版本说明：本节只改行为与文档，**没有重新出包**，故先记 `Unreleased`；`pubspec.yaml` 仍是 1.0.3+4，
+> 出包时再按用户口径定构建号。
+
+### 验证
+
+- `dart analyze lib test` 零告警；`flutter test` **849 例全绿**（本节改动自身；工作区里若叠上
+  那份**未提交的在途主题色改动**（`lib/ui/theme_service.dart` / `lib/ui/widgets/welcome_mark.dart`），
+  `test/welcome_mark_test.dart` ④ 会红——它钉的是渐变尾色的字面量，与本任务无关）——
+  新增 `test/plugin_detail_page_test.dart` 12 例
+  （两类卡片进详情页、卡片开关不误跳页、站点页必定重新 GET、禁用发 `disabled: true` 而不是退订、内置站只改上限），
+  `test/plugin_admin_api_test.dart` 6 例（新增插件带 `description`、站点三端点的路径转义与 body 形状），
+  `test/plugin_panel_admin_test.dart` 钉住介绍写进 `plugins.yaml`。
+- `cd packages/tree_core && dart test` **1228 例通过 / 3 跳过**：自建站 `readme` 必填、`shared` + `allowed_plugins`
+  闸门、`station/trigger` 投递与 `config` 下发、`updateConfig` 按内置/自建分开、禁用标记落盘、三个 HTTP 端点的
+  状态码与原因。
+
 ## [1.0.3+4] — 2026-10-11
 
 ### 断言变化（新增 / 修改的 README 不变量）

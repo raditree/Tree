@@ -91,6 +91,45 @@
     所以：`sshExecutorStarting()` 只对"条目启用、但实例没起来（且无错误记录）/ 未申报能力"回 true；
     `sshExecutorLookupWaitingForStart(timeout, interval)` 只在这一种情形下有界等待（生产 1s / 100ms），
     其它原因（条目停用 / 启动失败 / 通道断）**立即返回**，绝不空等。
+20. **每个站点都必须有介绍（`readme`），且介绍的来源按「内置 / 自建」分开**（2026-10-14 用户定稿，断言 3）：
+    插件 `station/register` 时 `readme` **必填**（非空且不全空白），缺了就 `ok:false` + 指名 `readme` 的可读原因，
+    且**不会建出半个站点**（拒绝都发生在校验阶段、建实例之前；用例末尾逐条核过"一个都不该留下"）；
+    内置点位的介绍来自**点位表**
+    [station_points.dart](station_points.dart)（`readme` 空则回落 `description`），面板因此永远不留空白。
+    `readme` 与 `shared` / `allowed_plugins` / `config` / 每个订阅者的禁用标记一起**落盘**
+    `config/stations.yaml`（不变量 22）。**同名重复注册 = 幂等**：返回既有站点、不报错、
+    **也不覆盖**第一次写的 `readme`——插件重启会再注册一遍，这次没带介绍不该把既有站拒掉。
+    面板上能改的面按「内置 / 自建」分开：内置站**只**能改「可订阅插件数量」。参见
+    [test/plugin_request_test.dart](../../../test/plugin_request_test.dart)
+    （`station/register：自建广播站 ⇒ id 由核心拼装…`、`…name 非法 / 缺 readme / 执行站 / 收集站缺 schema 都是可读拒绝`）
+    与 [test/plugin_station_test.dart](../../../test/plugin_station_test.dart)
+    （`介绍与共享声明落盘…内置点位的介绍来自点位表`）。
+21. **跨插件调用只认显式声明，且订阅与触发共用同一把闸门**（2026-10-14，断言 2）：
+    自建站默认 `shared: false` ⇒ 别人的插件连门都摸不到；`shared: true` ⇒ 别人能 `station/subscribe`
+    （成为下游）、也能 `station/trigger`（调用它）；`allowed_plugins` 非空 ⇒ 名单外一律拒（原因里写出当前名单）。
+    判定只有一个入口 `StationInstance.callableBy(pluginId, isOwner:, isBuiltin:)`——**订阅与触发两条路都调它**，
+    所以不存在「绕开订阅直接喊」的旁路；**所有者永远能用我自己的站**（门是给别人的，不是防自己的）。
+    另外三条硬口径：**内置点位不可被插件触发**（触发时机由核心在固定接入点决定，要用内置能力请下
+    `station/command`）、**执行站不可触发**（由命令驱动，没有「触发一次」的语义）、触发消息**必须带确定的
+    `mode_key`**（空 mode 在订阅里是通配，但投递判定是「消息 → 订阅者」，没有工作面的消息定不了投给谁；
+    拒绝原因要指向 `mode_key` 这个可改的字段）。站点自定义 `config` 随 `meta` 下发给订阅者（`meta` 里另有
+    `triggered_by`）——核心**不解释**这些键的含义，但订阅者必须读得到，否则界面上配的「其他参数」就是摆设。
+    用例：[test/plugin_request_test.dart](../../../test/plugin_request_test.dart)
+    （`自建站声明 shared ⇒ 别的插件可订阅，也可被 station/trigger 触发（断言 2）`、
+    `shared 的 allowed_plugins ⇒ 只有名单内的插件能用（所有者不受限）`）。
+    **断言 1（左侧站点栏可见）由「快照不按 team 过滤」保证**：站点 id 里不含 team / mode（不变量 2），
+    `stationList()` / `snapshot()` 给的就是全局那一份，插件自建站因此与内置点位同栏同列表出现。
+22. **面板对站点的写面只有三格，且「禁用 ≠ 退订」**（2026-10-14，界面升级的落点）：
+    ① `updateConfig` 改 `max_subscriptions`（内置站唯一可改项，非法值显式报错且**一个键都不写**）；
+    ② 自建站另可改 `readme` / `shared` / `allowed_plugins` / `config`（PATCH = 局部更新，**没发的键不改动**）；
+    ③ `setSubscriberDisabled(stationId, key, disabled)` 按订阅键位（`plugin_id|scope`）开关某个订阅者。
+    **禁用保留订阅关系与回包通道**，只是触发时不投给它；每条跳过都写进 `result.skipped` 并计入
+    `skipped_disabled`——**不静默**。禁用标记跨重启保留，插件重新上线**也不会把用户关掉的东西悄悄打开**。
+    用例：[test/plugin_station_test.dart](../../../test/plugin_station_test.dart)
+    （`updateConfig：面板上能改什么按「内置 / 自建」分开（改完立即生效并落盘）`、
+    `订阅者的禁用标记落盘：重启后仍是关着的（不会被重新订阅悄悄打开）`）、
+    [test/plugin_request_test.dart](../../../test/plugin_request_test.dart)
+    （`站点所有者禁用订阅者 ⇒ 触发不再投递，原因写在 skipped（不静默）`）。
 
 ## 测试
 
@@ -104,7 +143,8 @@ dart test test/plugin_test.dart test/plugin_request_test.dart test/plugin_statio
           test/plugin_tool_table_test.dart test/plugin_ui_bridge_test.dart test/plugin_ui_manifest_test.dart \
           test/plugin_ui_replay_test.dart test/plugin_config_store_test.dart test/plugin_hot_apply_test.dart \
           test/builtin_plugin_script_roots_test.dart test/plugin_llm_relay_test.dart \
-          test/compact_plugin_e2e_test.dart test/sample_plugin_layout_e2e_test.dart
+          test/compact_plugin_e2e_test.dart test/sample_plugin_layout_e2e_test.dart \
+          test/plugin_api_test.dart
 ```
 
 SSH 执行器那条路（`sshExecutorLookup` / `tunnel/event` 分流 / `kind: binary` 解析与默认播种）

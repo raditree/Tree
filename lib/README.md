@@ -16,7 +16,7 @@
 | [ui/pages/main_page.dart](ui/pages/main_page.dart) | 三栏骨架、agent 列表（顶层 agent + 团队成员）、会话切换、插件槽位作用域 |
 | [ui/widgets/message_panel.dart](ui/widgets/message_panel.dart) | 中栏消息流：分段渲染、工具/思考**一行式**（完整内容见右栏「详情」页）、提问卡片（**一次可问多道题**：逐题作答后一次交齐）、断线重播去重、按 agent+会话过滤 |
 | [ui/widgets/teammates_window_page.dart](ui/widgets/teammates_window_page.dart) | 团队成员拓扑与成员工作进度窗口 |
-| [ui/widgets/](ui/widgets/) | 文件面板（**VS Code 型资源管理器** [file_tree.dart](ui/widgets/file_tree.dart) + 类型图标纯函数 [file_tree_icon.dart](ui/widgets/file_tree_icon.dart)）/ 查看器（源码高亮 + 编辑保存 + 分屏，见 [split_panes.dart](ui/widgets/split_panes.dart)）/ **集成终端（[terminal_panel.dart](ui/widgets/terminal_panel.dart)，Ctrl+J）**/ 消息输入框（[message_input.dart](ui/widgets/message_input.dart) + [attachment_preview.dart](ui/widgets/attachment_preview.dart) + 无边框输入样式 [input_style.dart](ui/widgets/input_style.dart)）/ 右栏详情（[detail_panel.dart](ui/widgets/detail_panel.dart)）、PDF 预览、Spec、待办、提问、插件、MCP、模型信息、Git 历史、设置页 |
+| [ui/widgets/](ui/widgets/) | 文件面板（**VS Code 型资源管理器** [file_tree.dart](ui/widgets/file_tree.dart) + 类型图标纯函数 [file_tree_icon.dart](ui/widgets/file_tree_icon.dart)）/ 查看器（源码高亮 + 编辑保存 + 分屏，见 [split_panes.dart](ui/widgets/split_panes.dart)）/ **集成终端（[terminal_panel.dart](ui/widgets/terminal_panel.dart)，Ctrl+J）**/ 消息输入框（[message_input.dart](ui/widgets/message_input.dart) + [attachment_preview.dart](ui/widgets/attachment_preview.dart) + 无边框输入样式 [input_style.dart](ui/widgets/input_style.dart)）/ 右栏详情（[detail_panel.dart](ui/widgets/detail_panel.dart)）、PDF 预览、Spec、待办、提问、插件（面板 + **插件/站点详情页** [plugin_detail_page.dart](ui/widgets/plugin_detail_page.dart)，见不变量 27）、MCP、模型信息、Git 历史、设置页 |
 | [ui/services/](ui/services/) | 重播守卫、下载中心、会话重命名、插件 UI 槽位注册、主题、**共享编辑缓冲（[editor_buffer.dart](ui/services/editor_buffer.dart)）**、**代码高亮（[code_highlight.dart](ui/services/code_highlight.dart)）**、**行号槽布局（[code_gutter_layout.dart](ui/services/code_gutter_layout.dart)：逐视觉行给号，软换行的续行留空）**、**编辑器偏好（[editor_settings.dart](ui/services/editor_settings.dart)）**、详情选中（[detail_selection.dart](ui/services/detail_selection.dart)）、**团队级模式与目录合成（[team_scope_view.dart](ui/services/team_scope_view.dart)）**、**工作空间相对路径纯函数与条目名校验（[workspace_paths.dart](ui/services/workspace_paths.dart)）** |
 
 ## 不变量（assertions）
@@ -512,6 +512,32 @@
     - **不许回到底层 emoji**：`👋` 是平台彩色字体（Windows 上是黄色），染不上主题色，
       在绿 + 近黑的品牌配色里是外来色。
 
+27. **插件与站点卡片都能点进详情页；两个页面共用一份版式，写在同一个文件里**
+    （[ui/widgets/plugin_detail_page.dart](ui/widgets/plugin_detail_page.dart) 的 `PluginDetailPage` +
+    `StationDetailPage`，[test/plugin_detail_page_test.dart](../test/plugin_detail_page_test.dart) 钉住，
+    **用户要求 2026-10-14**：「每个插件卡片点击后进入详情页查看插件介绍」「每个站点卡片点击后进入详情页查看
+    站点介绍与配置站点」）：
+    - **插件页全程只读**：介绍（读 `plugins.yaml` 的 `description`，**不取** `initialize` 里的说明——启动失败的
+      插件最需要介绍，而它恰恰没握手过）/ 基本信息 / 内置运行时（未就绪就把核心给的原因摊开，不显示"能跑"）/
+      运行态 / 提供的工具 / 它建的与它订阅的站点。改配置仍然只走卡片上的「编辑」弹窗（那里有字段校验与拉起进程的
+      安全二次确认），**两处都能写就会分叉**；
+    - **站点页是唯一的写面**，三格：可订阅插件数量、已订阅插件的**禁用开关**、`config` 里的自定义项（增 / 删 / 改）。
+      进页面**必定重新 GET 一次真值**（卡片那份来自 WS 节流的快照，写操作要落在当前值上）；写成功后直接用核心回的
+      **改后详情**刷新，不再发第二次 GET（少一次往返，也不会"界面比核心新"）。内置站只给「可订阅插件数量」这一格
+      可写，介绍与自定义配置**只读**并写明原因（口径在核心的点位表里）；
+    - **禁用 ≠ 退订要在界面上看出来**：被禁用的订阅者**仍留在列表里**（标「已禁用」），发出去的是
+      `{"disabled": true}` 而不是退订请求；
+    - **缺东西就说什么缺，不猜**：介绍为空就给「这个插件没有写介绍。点卡片上的「编辑」，在「介绍」里补一段」，
+      详情读不出来给红条 + 重试按钮，而不是渲染一张空白详情页；`_Kv` 的空值一律显示「—」；
+    - **可测性**：卡片与写操作控件都带 Key（`plugin-detail-custom-<id>` / `plugin-detail-builtin-<id>` /
+      `station-detail-<stationId>` / `station-detail-sub-<订阅键位>` / `station-detail-config-<键>`），测试不靠文案
+      找 widget；详情页是 push 进路由的，**旧面板仍挂在下面** ⇒ 断言必须 `find.descendant(of: find.byType(...))`
+      限定范围（同一个站点 id 在「它建的」与「它订阅的」两栏各出现一次，不限定就命中多个）。
+    协议侧：路径模板全在 `ApiPaths`，订阅键位里的 `|` 与 id 里的空格一律 `Uri.encodeComponent`
+    （[test/plugin_admin_api_test.dart](../test/plugin_admin_api_test.dart) 钉这一条）；核心口径见
+    [server/README.md](../packages/tree_core/lib/src/server/README.md) 不变量 17 与
+    [plugin/README.md](../packages/tree_core/lib/src/plugin/README.md) 不变量 20/21/22。
+
 ## 测试
 
 ```bash
@@ -520,6 +546,9 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 ```
 
 钉子用例：`test/message_replay_guard_test.dart`、`test/session_rename_test.dart`、`test/plugin_panel_admin_test.dart`、
+`test/plugin_detail_page_test.dart`（插件/站点详情页：只读页摊开介绍与工具、内置卡片没落盘条目也要讲清运行时原因、
+卡片上的开关不误跳详情页、站点页必定重新 GET、禁用发 `disabled=true` 而不是退订、改配置不把 int 写成 "8"、
+内置站只改上限）、`test/plugin_admin_api_test.dart`（真起假核心：新增插件带 `description`、站点三端点的路径转义与 body 形状）、
 `test/main_page_sidebar_width_test.dart`（三栏宽度：只有下限、合计预算、拖一侧对侧让位）、
 `test/main_page_center_collapse_test.dart`（中栏折叠：让位给侧栏、State 与滚动位置不丢、三栏都收着也不溢出）、
 `test/welcome_mark_test.dart`（空态字标：TREE 大写宽字距 w800、主色渐变、HUD 三段线、接进真实中栏空态、加载中不出现）、
