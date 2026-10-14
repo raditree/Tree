@@ -114,3 +114,5 @@ agentspace
 /package-lock.json
 # 私人空间
 .tree
+# 插件仓库（放在路径下方便开发，但不计入本仓库）
+plugins
