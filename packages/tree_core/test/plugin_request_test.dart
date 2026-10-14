@@ -140,6 +140,24 @@ void main() {
       '    command: "${slash(Platform.resolvedExecutable)}"\n'
       '    args: ["${slash(script)}", "--station-client"]\n';
 
+  /// 两个插件都当**自建站订阅者**（回显 station/request）：用于验证
+  /// 「A 建站 → B 订阅 → 触发时真的投到 B」这条跨插件调用链。
+  String echoPluginsYaml() =>
+      'enabled: true\n'
+      'plugins:\n'
+      '  - id: sample\n'
+      '    name: 样例插件\n'
+      '    command: "${slash(Platform.resolvedExecutable)}"\n'
+      '    args: ["${slash(script)}", "--station-client", "--station-echo"]\n'
+      '    granularity: team\n'
+      '    scope: {team_id: $team}\n'
+      '  - id: other\n'
+      '    name: 另一个插件\n'
+      '    command: "${slash(Platform.resolvedExecutable)}"\n'
+      '    args: ["${slash(script)}", "--station-client", "--station-echo"]\n'
+      '    granularity: team\n'
+      '    scope: {team_id: $team}\n';
+
   Future<PluginBus> startBus(
     String yaml, {
     void Function(Map<String, dynamic> frame)? broadcast,
@@ -770,6 +788,11 @@ void main() {
   // 分开处理时，正解是"由一个转发型订阅者接管内置站，再在插件内建站点分发"——
   // 而"建站点"必须经核心，否则下游没有回包通道与等待链。
 
+  /// 自建站的必填介绍（断言 3：`readme` 缺失直接拒绝注册）。
+  const String selfReadme =
+      '自建广播站：接管内置工具公告后按 team 再分发；'
+      '订阅者回 payload = 附带再分发数据，回 null = 收到不改动';
+
   test('station/register：自建广播站 ⇒ id 由核心拼装（plugin.<自己>.<kind>.<name>）', () async {
     final PluginBus bus = await startBus(teamPluginYaml());
 
@@ -780,6 +803,7 @@ void main() {
         'kind': 'broadcast',
         'name': 'fanout',
         'description': '转发站：按 team 再分发',
+        'readme': selfReadme,
       },
     );
     final Map<String, dynamic> result =
@@ -797,18 +821,30 @@ void main() {
     expect(station, isA<BroadcastStation>());
     expect(station!.builtin, isFalse);
     expect(station.description, '转发站：按 team 再分发');
+    // 断言 3：介绍落进实例（面板详情页读它）
+    expect(station.readme, selfReadme);
+    expect(station.readmeText, selfReadme);
+    // 默认不共享：别人的插件既不能用它（断言 2 的闸门只认显式声明）
+    expect(station.shared, isFalse);
+    expect(station.allowedPlugins, isEmpty);
+    expect(station.config, isEmpty);
 
     // 同名重复注册 = 幂等（插件重启后会再注册一遍，不能报错也不能覆盖）
     final Map<String, dynamic> again = await pluginRequest(
       bus,
       method: 'station/register',
-      params: <String, dynamic>{'kind': 'broadcast', 'name': 'fanout'},
+      params: <String, dynamic>{
+        'kind': 'broadcast',
+        'name': 'fanout',
+        'readme': '改写过的介绍',
+      },
     );
     expect((again['result'] as Map<String, dynamic>)['ok'], isTrue);
     expect(
       (again['result'] as Map<String, dynamic>)['station_id'],
       result['station_id'],
     );
+    expect(station.readme, selfReadme, reason: '幂等分支不覆盖既有站点：介绍也保持第一次注册的版本');
     expect(
       bus.stations
           .stationList()
@@ -819,7 +855,7 @@ void main() {
     );
   });
 
-  test('station/register：name 非法 / 执行站 / 收集站缺 schema 都是可读拒绝', () async {
+  test('station/register：name 非法 / 缺 readme / 执行站 / 收集站缺 schema 都是可读拒绝', () async {
     final PluginBus bus = await startBus(teamPluginYaml());
 
     // ① 缺 name
@@ -871,6 +907,21 @@ void main() {
       contains('schema'),
     );
 
+    // ⑥ **缺 readme ⇒ 拒绝**（断言 3：每个插件内置站点必须有介绍）。
+    // 站是插件建的，"它干什么、别人该怎么用"只有建站的插件说得清；共享时
+    // 这份介绍是别人唯一能读到的说明书，所以不能省。
+    final Map<String, dynamic> noReadme = await pluginRequest(
+      bus,
+      method: 'station/register',
+      params: <String, dynamic>{'kind': 'broadcast', 'name': 'silent'},
+    );
+    expect((noReadme['result'] as Map<String, dynamic>)['ok'], isFalse);
+    expect(
+      (noReadme['result'] as Map<String, dynamic>)['error'],
+      contains('readme'),
+      reason: '拒绝理由要点出缺的是介绍',
+    );
+
     // ⑤ 类型未知 ⇒ 参数错误（JSON-RPC 层，不静默）
     final Map<String, dynamic> badKind = await pluginRequest(
       bus,
@@ -899,6 +950,7 @@ void main() {
       params: <String, dynamic>{
         'kind': 'collect',
         'name': 'probe',
+        'readme': selfReadme,
         'max_subscriptions': 3,
         'schema': <String, dynamic>{
           'description': '探针产出',
@@ -930,7 +982,11 @@ void main() {
     final Map<String, dynamic> mine = await pluginRequest(
       bus,
       method: 'station/register',
-      params: <String, dynamic>{'kind': 'broadcast', 'name': 'mine'},
+      params: <String, dynamic>{
+        'kind': 'broadcast',
+        'name': 'mine',
+        'readme': selfReadme,
+      },
     );
     final String myId = (mine['result'] as Map<String, dynamic>)['station_id']
         as String;
@@ -954,7 +1010,11 @@ void main() {
       bus,
       pluginId: 'other',
       method: 'station/register',
-      params: <String, dynamic>{'kind': 'broadcast', 'name': 'mine'},
+      params: <String, dynamic>{
+        'kind': 'broadcast',
+        'name': 'mine',
+        'readme': selfReadme,
+      },
     );
     expect((otherOwn['result'] as Map<String, dynamic>)['ok'], isTrue);
     expect(
@@ -999,12 +1059,16 @@ void main() {
     );
   });
 
-  test('station/register：自建站可被自己的插件订阅（station_id 寻址），别人订不到', () async {
+  test('station/register：自建站默认私有 ⇒ 别人既订不到也触发不了（断言 2 的反面）', () async {
     final PluginBus bus = await startBus(twoPluginsYaml());
     final Map<String, dynamic> created = await pluginRequest(
       bus,
       method: 'station/register',
-      params: <String, dynamic>{'kind': 'relay', 'name': 'forwarder'},
+      params: <String, dynamic>{
+        'kind': 'relay',
+        'name': 'forwarder',
+        'readme': selfReadme,
+      },
     );
     final String id =
         (created['result'] as Map<String, dynamic>)['station_id'] as String;
@@ -1025,7 +1089,7 @@ void main() {
       'sample',
     );
 
-    // ② 别的插件订它 ⇒ 拒绝（否则任何插件都能挂上别人的拦截点）
+    // ② 别的插件订它 ⇒ 拒（没声明 shared：任何插件都能挂上别人的拦截点）
     final Map<String, dynamic> other = await pluginRequest(
       bus,
       pluginId: 'other',
@@ -1038,6 +1102,37 @@ void main() {
       contains('不属于插件 other'),
     );
 
+    // ②b 别的插件主动触发它 ⇒ 同样被拒（断言 2 只在建站方显式共享后才成立）
+    final Map<String, dynamic> otherTrigger = await pluginRequest(
+      bus,
+      pluginId: 'other',
+      method: 'station/trigger',
+      params: <String, dynamic>{'station_id': id, 'payload': 'x'},
+    );
+    expect((otherTrigger['result'] as Map<String, dynamic>)['ok'], isFalse);
+    expect(
+      (otherTrigger['result'] as Map<String, dynamic>)['error'],
+      contains('shared'),
+      reason: '拒绝理由要指向正解：让建站方声明 shared',
+    );
+
+    // ②c 内置点位不可触发（它的触发时机由核心在固定接入点决定）
+    expect(bus.stations.ensureBuiltinStations(), isNotEmpty);
+    final Map<String, dynamic> builtinTrigger = await pluginRequest(
+      bus,
+      method: 'station/trigger',
+      params: <String, dynamic>{
+        'station_id': StationHubIds.broadcastToolPre,
+        'topic': 'tool.pre',
+      },
+    );
+    expect((builtinTrigger['result'] as Map<String, dynamic>)['ok'], isFalse);
+    expect(
+      (builtinTrigger['result'] as Map<String, dynamic>)['error'],
+      contains('station/command'),
+      reason: '要使用内置能力时正解是下命令，这里要把正解说出来',
+    );
+
     // ③ 按 station_id 退订：幂等
     final Map<String, dynamic> unsub = await pluginRequest(
       bus,
@@ -1046,5 +1141,288 @@ void main() {
     );
     expect((unsub['result'] as Map<String, dynamic>)['removed'], 1);
     expect(bus.stations.station(id)!.subscribers, isEmpty);
+  });
+
+  // ── 跨插件调用自建站（shared + station/trigger）：断言 2 ────────────────
+  //
+  // 为什么要有这一组：自建站旧口径是「只能被自己的插件碰」（订阅都要校
+  // plugin.{自己}. 前缀），所以下游只能由建站的插件自己接。现在由**建站方显式
+  // 声明 shared** 把门推开：别人能订阅（成为加下游），也能触发（调用它）。
+
+  test('自建站声明 shared ⇒ 别的插件可订阅，也可被 station/trigger 触发（断言 2）', () async {
+    final PluginBus bus = await startBus(echoPluginsYaml());
+    final Map<String, dynamic> created = await pluginRequest(
+      bus,
+      method: 'station/register',
+      params: <String, dynamic>{
+        'kind': 'broadcast',
+        'name': 'fanout',
+        'readme': selfReadme,
+        'shared': true,
+        'config': <String, dynamic>{'route': 'team'},
+      },
+    );
+    final Map<String, dynamic> registered =
+        created['result'] as Map<String, dynamic>;
+    expect(registered['ok'], isTrue, reason: '${registered['error']}');
+    final String id = registered['station_id'] as String;
+    final StationInstance station = bus.stations.station(id)!;
+    expect(station.shared, isTrue);
+    expect(station.config, <String, dynamic>{'route': 'team'});
+
+    // 断言 1：自建站**全局可见**——快照不按 team 过滤，左侧站点栏拿到的就是这一份
+    expect(
+      bus.stations.snapshot().any(
+        (Map<String, dynamic> item) => item['station_id'] == id,
+      ),
+      isTrue,
+    );
+
+    // ① 别的插件订阅共享站：成功
+    final Map<String, dynamic> subscribed = await pluginRequest(
+      bus,
+      pluginId: 'other',
+      method: 'station/subscribe',
+      params: <String, dynamic>{'station_id': id},
+    );
+    final Map<String, dynamic> sub =
+        subscribed['result'] as Map<String, dynamic>;
+    expect(sub['ok'], isTrue, reason: '${sub['error']}');
+    expect(station.subscribers.single.pluginId, 'other');
+
+    // ② 所有者触发自己的站 ⇒ 投给别人的订阅者，站点自定义配置随 meta 下发
+    final Map<String, dynamic> fired = await pluginRequest(
+      bus,
+      method: 'station/trigger',
+      params: <String, dynamic>{
+        'station_id': id,
+        'topic': 'fanout',
+        'scope': <String, dynamic>{'mode_key': 'local'},
+        'payload': <String, dynamic>{'text': 'hello'},
+      },
+    );
+    final Map<String, dynamic> firedResult =
+        fired['result'] as Map<String, dynamic>;
+    expect(firedResult['ok'], isTrue, reason: '${firedResult['error']}');
+    final Map<String, dynamic> detail =
+        firedResult['result'] as Map<String, dynamic>;
+    expect(detail['delivered'], 1, reason: '${detail['summary']}');
+    final Map<String, dynamic> delivery =
+        (detail['deliveries'] as List).single as Map<String, dynamic>;
+    expect(delivery['plugin_id'], 'other');
+    expect(delivery['ok'], isTrue, reason: '${delivery['error']}');
+    final Map<String, dynamic> echoed =
+        (delivery['payload'] as Map<String, dynamic>);
+    expect(
+      (echoed['meta'] as Map<String, dynamic>)['route'],
+      'team',
+      reason: '面板上配的站点参数必须能传到订阅者，否则“其他配置”就是摆设',
+    );
+    expect(
+      (echoed['meta'] as Map<String, dynamic>)['triggered_by'],
+      'sample',
+      reason: '谁触发的要能让订阅者看到',
+    );
+    expect(echoed['echo'], isA<Map<String, dynamic>>(), reason: '载荷原样送到订阅者');
+
+    // ③ 订阅方自己也能触发共享站（闸门只看声明，不看谁是所有者）
+    final Map<String, dynamic> selfFired = await pluginRequest(
+      bus,
+      pluginId: 'other',
+      method: 'station/trigger',
+      params: <String, dynamic>{
+        'station_id': id,
+        'topic': 'fanout',
+        'scope': <String, dynamic>{'mode_key': 'local'},
+      },
+    );
+    expect(
+      (selfFired['result'] as Map<String, dynamic>)['ok'],
+      isTrue,
+      reason: '${(selfFired['result'] as Map<String, dynamic>)['error']}',
+    );
+
+    // ③b 不带确定的 mode ⇒ 可读拒绝（空 mode 在订阅里是通配，在消息里定不了投递对象）
+    final Map<String, dynamic> noMode = await pluginRequest(
+      bus,
+      method: 'station/trigger',
+      params: <String, dynamic>{'station_id': id, 'topic': 'fanout'},
+    );
+    expect((noMode['result'] as Map<String, dynamic>)['ok'], isFalse);
+    expect(
+      (noMode['result'] as Map<String, dynamic>)['error'],
+      contains('mode_key'),
+      reason: '拒绝理由要指向可改的字段',
+    );
+
+    // ④ 缺 station_id ⇒ JSON-RPC 参数错（不静默吞掉）
+    final Map<String, dynamic> noId = await pluginRequest(
+      bus,
+      method: 'station/trigger',
+      params: <String, dynamic>{'topic': 'x'},
+    );
+    expect(noId['result'], isNull);
+    expect(
+      (noId['error'] as Map<String, dynamic>)['code'],
+      PluginRpcErrorCode.invalidParams,
+    );
+  });
+
+  test('shared 的 allowed_plugins ⇒ 只有名单内的插件能用（所有者不受限）', () async {
+    final PluginBus bus = await startBus(echoPluginsYaml());
+    final Map<String, dynamic> created = await pluginRequest(
+      bus,
+      method: 'station/register',
+      params: <String, dynamic>{
+        'kind': 'broadcast',
+        'name': 'gated',
+        'readme': selfReadme,
+        'shared': true,
+        'allowed_plugins': <String>['other'],
+      },
+    );
+    final String id =
+        (created['result'] as Map<String, dynamic>)['station_id'] as String;
+
+    // ① 名单内的插件：能订能触发
+    final Map<String, dynamic> sub = await pluginRequest(
+      bus,
+      pluginId: 'other',
+      method: 'station/subscribe',
+      params: <String, dynamic>{'station_id': id},
+    );
+    expect(
+      (sub['result'] as Map<String, dynamic>)['ok'],
+      isTrue,
+      reason: '${(sub['result'] as Map<String, dynamic>)['error']}',
+    );
+
+    // ② 所有者不在名单里也永远能用：门是给别人的，不是防自己的
+    final Map<String, dynamic> ownerFired = await pluginRequest(
+      bus,
+      method: 'station/trigger',
+      params: <String, dynamic>{
+        'station_id': id,
+        'topic': 'gated',
+        'scope': <String, dynamic>{'mode_key': 'local'},
+      },
+    );
+    expect(
+      (ownerFired['result'] as Map<String, dynamic>)['ok'],
+      isTrue,
+      reason: '${(ownerFired['result'] as Map<String, dynamic>)['error']}',
+    );
+
+    // ③ 换一个名单里没别人的站：同一把闸门，结论必须是拒绝
+    final Map<String, dynamic> gated = await pluginRequest(
+      bus,
+      pluginId: 'other',
+      method: 'station/register',
+      params: <String, dynamic>{
+        'kind': 'broadcast',
+        'name': 'onlythem',
+        'readme': selfReadme,
+        'shared': true,
+        'allowed_plugins': <String>['someone-else'],
+      },
+    );
+    final String gatedId =
+        (gated['result'] as Map<String, dynamic>)['station_id'] as String;
+    final Map<String, dynamic> denied = await pluginRequest(
+      bus,
+      method: 'station/subscribe',
+      params: <String, dynamic>{'station_id': gatedId},
+    );
+    expect((denied['result'] as Map<String, dynamic>)['ok'], isFalse);
+    expect(
+      (denied['result'] as Map<String, dynamic>)['error'],
+      contains('白名单'),
+      reason: '已共享但名单不含它：原因要说清是名单卡的',
+    );
+    // 触发同样被名单卡住（不能绕过订阅直接喊）
+    final Map<String, dynamic> deniedFire = await pluginRequest(
+      bus,
+      method: 'station/trigger',
+      params: <String, dynamic>{
+        'station_id': gatedId,
+        'topic': 'x',
+        'scope': <String, dynamic>{'mode_key': 'local'},
+      },
+    );
+    expect((deniedFire['result'] as Map<String, dynamic>)['ok'], isFalse);
+    expect(
+      (deniedFire['result'] as Map<String, dynamic>)['error'],
+      contains('白名单'),
+    );
+  });
+
+  test('站点所有者禁用订阅者 ⇒ 触发不再投递，原因写在 skipped（不静默）', () async {
+    final PluginBus bus = await startBus(echoPluginsYaml());
+    final Map<String, dynamic> created = await pluginRequest(
+      bus,
+      method: 'station/register',
+      params: <String, dynamic>{
+        'kind': 'broadcast',
+        'name': 'fanout',
+        'readme': selfReadme,
+        'shared': true,
+      },
+    );
+    final String id =
+        (created['result'] as Map<String, dynamic>)['station_id'] as String;
+    final Map<String, dynamic> sub = await pluginRequest(
+      bus,
+      pluginId: 'other',
+      method: 'station/subscribe',
+      params: <String, dynamic>{'station_id': id},
+    );
+    expect((sub['result'] as Map<String, dynamic>)['ok'], isTrue);
+    final StationInstance station = bus.stations.station(id)!;
+    final String key = station.subscribers.single.key;
+
+    // ① 关掉：保留订阅（重启后不会被悄悄打开），但触发时不投
+    expect(bus.stations.setSubscriberDisabled(id, key, true), isNull);
+    expect(station.subscribers.single.disabled, isTrue);
+    final Map<String, dynamic> fired = await pluginRequest(
+      bus,
+      method: 'station/trigger',
+      params: <String, dynamic>{
+        'station_id': id,
+        'topic': 'fanout',
+        'scope': <String, dynamic>{'mode_key': 'local'},
+      },
+    );
+    final Map<String, dynamic> detail =
+        ((fired['result'] as Map<String, dynamic>)['result'])
+            as Map<String, dynamic>;
+    expect(detail['delivered'], 0);
+    expect(
+      (detail['skipped'] as List).cast<String>(),
+      containsAll(<String>['跳过 other：订阅者 other 已被本站所有者禁用']),
+      reason: '${detail['summary']}：面板上关了什么必须在触发结果里看得见',
+    );
+    expect(station.counters['skipped_disabled'], 1);
+
+    // ② 打开：立即恢复投递（改的是字段，不是重新订阅）
+    expect(bus.stations.setSubscriberDisabled(id, key, false), isNull);
+    final Map<String, dynamic> again = await pluginRequest(
+      bus,
+      method: 'station/trigger',
+      params: <String, dynamic>{
+        'station_id': id,
+        'topic': 'fanout',
+        'scope': <String, dynamic>{'mode_key': 'local'},
+      },
+    );
+    final Map<String, dynamic> againDetail =
+        ((again['result'] as Map<String, dynamic>)['result'])
+            as Map<String, dynamic>;
+    expect(againDetail['delivered'], 1, reason: '${againDetail['summary']}');
+
+    // ③ 未知订阅键 ⇒ 可读错误（不假装成功）
+    expect(
+      bus.stations.setSubscriberDisabled(id, 'ghost|team-1', true),
+      contains('订阅者不存在'),
+    );
   });
 }

@@ -2533,8 +2533,8 @@ class PluginBus {
   /// [PluginHost.onPluginRequest] 的接线实现）。
   ///
   /// 实现执行站的 `station/command`、站点订阅 `station/subscribe` /
-  /// `station/unsubscribe`，以及**插件自建站**的 `station/register` /
-  /// `station/unregister`；未知 method ⇒ `-32601`（不静默）。
+  /// `station/unsubscribe`，**插件自建站**的 `station/register` / `station/unregister`，
+  /// 以及跨插件调用自建站的 `station/trigger`；未知 method ⇒ `-32601`（不静默）。
   /// 失败一律抛 [PluginRequestException]，由宿主变成 `{jsonrpc, id, error}` 响应。
   Future<Map<String, dynamic>> _handlePluginRequest(
     PluginConfig config,
@@ -2552,6 +2552,8 @@ class PluginBus {
         return _handleStationSubscribe(config, params);
       case 'station/unsubscribe':
         return _handleStationUnsubscribe(config, params);
+      case 'station/trigger':
+        return _handleStationTrigger(config, params);
       default:
         throw PluginRequestException(
           PluginRpcErrorCode.methodNotFound,
@@ -2561,7 +2563,7 @@ class PluginBus {
   }
 
   /// **插件自建站点（插件 → 核心）**：参数
-  /// `{kind, name, description?, schema?, max_subscriptions?}`。
+  /// `{kind, name, readme, description?, schema?, max_subscriptions?, shared?, allowed_plugins?, config?}`。
   ///
   /// 为什么需要它（用户定稿语义）：站点全局化后，**每个点位只有一个订阅者**，
   /// 插件要按 team / agent 分开处理时，正解是"由一个转发型订阅者接管，再在插件内
@@ -2574,7 +2576,12 @@ class PluginBus {
   /// - 只能建**既有四种类型**（不允许发明新类型）；
   /// - 执行站不可订阅，建它没有意义 ⇒ 拒绝（可读原因）；
   /// - 收集站**必须**带非空 schema（输入格式由站点定义）；
-  /// - 同名重复注册 = 幂等返回既有站点（不报错、不覆盖）。
+  /// - **`readme` 必填**（用户定稿）：站是插件建的，"它是干什么的、什么时候被触发、
+  ///   订阅者该怎么回"必须由建站的插件写清楚——面板的站点详情页直接展示它，
+  ///   共享站点时它是别人唯一能读到的说明书；
+  /// - `shared` = true 时，**其它插件**可以按 `station/subscribe` / `station/trigger`
+  ///   用它（`allowed_plugins` 非空 = 只开放给列出的插件）；默认 false = 只有所有者能用；
+  /// - 同名重复注册 = 幂等返回既有站点（不报错、不覆盖，**也不改写 readme**）。
   ///
   /// 回包形状与 `station/command` 同风格：`{ok, station_id, kind, error}` ——
   /// 业务规则拒绝（类型非法 / 缺 schema / id 被占）是**结果**而非 JSON-RPC 错误。
@@ -2644,24 +2651,62 @@ class PluginBus {
       params['max_subscriptions'],
       kind,
     );
+    // **readme 必填**（用户定稿：每一个插件内置站点都必须有介绍）。
+    // 放在幂等分支之后：重启时的重复注册只拿回既有站点，不该因为这次没带介绍而失败。
+    final String readme = (params['readme'] ?? '').toString().trim();
+    if (readme.isEmpty) {
+      return <String, dynamic>{
+        'ok': false,
+        'station_id': '',
+        'kind': kind.wire,
+        'error':
+            'station/register 需要 readme（站点介绍，必填）：这个站干什么、'
+            '什么时候被触发、订阅者该怎么回。内置站点的介绍来自核心的点位表。',
+      };
+    }
+    final bool shared = params['shared'] == true;
+    final List<String> allowedPlugins = _selfBuiltAllowedPlugins(
+      params['allowed_plugins'],
+    );
+    final Map<String, dynamic> stationConfig = _selfBuiltConfig(
+      params['config'],
+    );
     final String description = (params['description'] ?? '').toString().trim();
     final String id = stationId;
     final StationInstance station = switch (kind) {
       StationKind.broadcast => BroadcastStation(
         id: id,
-        description: description.isEmpty ? '插件 ${config.id} 自建广播站' : description,
+        description: description.isEmpty
+            ? '插件 ${config.id} 自建广播站'
+            : description,
+        readme: readme,
         maxSubscriptions: maxSubscriptions,
+        shared: shared,
+        allowedPlugins: allowedPlugins,
+        config: stationConfig,
       ),
       StationKind.relay => RelayStation(
         id: id,
-        description: description.isEmpty ? '插件 ${config.id} 自建中转站' : description,
+        description: description.isEmpty
+            ? '插件 ${config.id} 自建中转站'
+            : description,
+        readme: readme,
         maxSubscriptions: maxSubscriptions,
+        shared: shared,
+        allowedPlugins: allowedPlugins,
+        config: stationConfig,
       ),
       StationKind.collect => CollectStation(
         id: id,
-        description: description.isEmpty ? '插件 ${config.id} 自建收集站' : description,
+        description: description.isEmpty
+            ? '插件 ${config.id} 自建收集站'
+            : description,
+        readme: readme,
         schema: schema,
         maxSubscriptions: maxSubscriptions,
+        shared: shared,
+        allowedPlugins: allowedPlugins,
+        config: stationConfig,
       ),
       StationKind.execute => throw PluginRequestException(
         PluginRpcErrorCode.invalidParams,
@@ -2679,13 +2724,31 @@ class PluginBus {
     }
     log?.call(
       '插件 ${config.id} 自建${kind.label} ${station.id}'
-      '（订阅上限 $maxSubscriptions）',
+      '（订阅上限 $maxSubscriptions${shared ? '，已对外共享' : ''}）',
     );
     return <String, dynamic>{
       'ok': true,
       'station_id': station.id,
       'kind': kind.wire,
       'error': '',
+    };
+  }
+
+  /// 自建站的共享白名单（宽容解析：非列表 = 空表 = 对所有插件开放）。
+  static List<String> _selfBuiltAllowedPlugins(Object? raw) {
+    if (raw is! List) return <String>[];
+    return <String>[
+      for (final Object? item in raw)
+        if ('$item'.trim().isNotEmpty) '$item'.trim(),
+    ];
+  }
+
+  /// 自建站的自定义配置（宽容解析：非映射 = 空映射）。
+  static Map<String, dynamic> _selfBuiltConfig(Object? raw) {
+    if (raw is! Map) return <String, dynamic>{};
+    return <String, dynamic>{
+      for (final MapEntry<Object?, Object?> e in raw.entries)
+        e.key.toString(): e.value,
     };
   }
 
@@ -2917,9 +2980,10 @@ class PluginBus {
 
   /// 订阅一个**已解析出来的**站点实例（内置类型寻址与 `station_id` 寻址共用）。
   ///
-  /// 归属校验在这里做：插件只能订阅**内置站**或**自己的自建站**——别人的自建站
-  /// 只有对方显式邀请（把 id 给它）才谈得上，所以这里不做"邀请"机制，
-  /// 一律要求 `plugin.{自己}.` 前缀，避免插件之间互相挂订阅造成越权拦截。
+  /// 归属校验在这里做：插件可以订阅**内置站**或**自己的自建站**；别人的自建站只在
+  /// **建站方显式共享**（`shared`，必要时再看 `allowed_plugins` 名单）时才放行——
+  /// 闸门只认写进站点实例的声明，不靠「私下把 id 传过去」（那等于任何插件都能挂上
+  /// 别人的拦截点）。
   Future<Map<String, dynamic>> _subscribeToStation(
     PluginConfig config,
     Map<String, dynamic> params,
@@ -2929,7 +2993,7 @@ class PluginBus {
     final bool builtin = StationHubIds.all.contains(station.id);
     final String? ownerError = builtin
         ? null
-        : _selfBuiltOwnershipError(config.id, station.id);
+        : _selfBuiltAccessError(config, station);
     if (ownerError != null) {
       log?.call('插件 ${config.id} 订阅 ${station.id} 被拒：$ownerError');
       return <String, dynamic>{
@@ -3060,6 +3124,212 @@ class PluginBus {
       'removed': removed,
       'error': '',
     };
+  }
+
+  /// 跨插件使用自建站的闸门（订阅与触发共用；返回 null = 放行）。
+  ///
+  /// 与 [_selfBuiltOwnershipError] 的区别：那条是「改写 / 注销」的所有权口径
+  /// （只有建站方能做），这条是「使用」口径——所有者永远可用，别人要**订阅或
+  /// 触发**必须建站方在 `station/register` 里显式声明 `shared`。
+  static String? _selfBuiltAccessError(
+    PluginConfig config,
+    StationInstance station,
+  ) {
+    if (station.id.startsWith('plugin.${config.id}.')) return null;
+    if (!station.shared) {
+      return '站点「${station.id}」不属于插件 ${config.id}，且建站方没有声明 shared：'
+          '要跨插件使用，请由建站方在 station/register 带 shared: true'
+          '（可选 allowed_plugins 限定名单，留空 = 对所有插件开放）';
+    }
+    if (station.allowedPlugins.isNotEmpty &&
+        !station.allowedPlugins.contains(config.id)) {
+      final List<String> allowed = station.allowedPlugins.toList()..sort();
+      return '站点「${station.id}」已共享，但插件白名单里没有 ${config.id}'
+          '（当前白名单：${allowed.join('、')}）';
+    }
+    return null;
+  }
+
+  /// **站点触发（插件 → 核心）**：参数 `{station_id, topic?, scope?, payload?, meta?}`。
+  ///
+  /// 为什么需要它：自建站过去连**订阅**都要校验 `plugin.{自己}.` 前缀，「插件建的
+  /// 站点被别的插件调用」根本走不通。这条路把**调用**显式化——调用方带 `station_id`，
+  /// 核心按建站方的声明（`shared` / `allowed_plugins`）放行，并把消息 scope 按
+  /// **真实归属**解析（不信任调用方自报的 team / mode，与订阅同一 fail-closed 口径）。
+  ///
+  /// 边界（一律给可读原因，不静默拒绝）：
+  /// - **内置点位不可触发**：它们的触发时机由核心在固定接入点决定，插件要用内置
+  ///   能力请下命令（`station/command`）；
+  /// - **执行站不可触发**：它由命令驱动，没有「触发一次」的语义；
+  /// - **消息必须带确定的 mode_key**：空 mode 在**订阅**里是通配（两种工作面都收），
+  ///   但投递判据是「消息 ↔ 订阅者」，一条没有工作面的消息定不了投给谁；
+  /// - 订阅者被站点所有者**禁用** ⇒ 不投递，但原因出现在 `skipped` 里（各站的 trigger 负责）。
+  ///
+  /// 站点自定义配置（[StationInstance.config]）随 meta 下发：核心**不解释**它的语义
+  /// （那是建站方与订阅者之间的契约），但订阅者必须读得到——否则面板上配的「其他」
+  /// 参数就是摆设。
+  ///
+  /// 回包 `{ok, station_id, kind, result, error}`：业务拒绝是**结果**而非 JSON-RPC 错误
+  /// （与 `station/command` 同风格）；`result.summary` 是一句可直接给人看的描述。
+  Future<Map<String, dynamic>> _handleStationTrigger(
+    PluginConfig config,
+    Map<String, dynamic> params,
+  ) async {
+    final String stationId = (params['station_id'] ?? '').toString().trim();
+    if (stationId.isEmpty) {
+      throw const PluginRequestException(
+        PluginRpcErrorCode.invalidParams,
+        'station/trigger 需要 station_id（要下命令给内置能力请用 station/command）',
+      );
+    }
+    final StationInstance? station = stations.station(stationId);
+    if (station == null) {
+      return <String, dynamic>{
+        'ok': false,
+        'station_id': stationId,
+        'kind': '',
+        'result': null,
+        'error': '站点不存在：$stationId（自建站请用 station/register 返回的 station_id）',
+      };
+    }
+    Map<String, dynamic> denied(String error) => <String, dynamic>{
+      'ok': false,
+      'station_id': station.id,
+      'kind': station.kind.wire,
+      'result': null,
+      'error': error,
+    };
+    if (station.kind == StationKind.execute) {
+      return denied('执行站由命令驱动（station/command），不支持 station/trigger');
+    }
+    final bool builtin = StationHubIds.all.contains(station.id);
+    final bool isOwner = station.id.startsWith('plugin.${config.id}.');
+    if (!station.callableBy(config.id, isOwner: isOwner, isBuiltin: builtin)) {
+      final String reason = builtin
+          ? '「${station.id}」是内置${station.kind.label}：触发时机由核心在固定接入点'
+                '决定，插件不能主动触发；要使用内置能力请下命令（station/command）'
+          : (_selfBuiltAccessError(config, station) ??
+                '插件 ${config.id} 不能触发站点 ${station.id}');
+      log?.call('插件 ${config.id} 触发 ${station.id} 被拒：$reason');
+      return denied(reason);
+    }
+    final Object? rawMeta = params['meta'];
+    if (rawMeta != null && rawMeta is! Map) {
+      throw const PluginRequestException(
+        PluginRpcErrorCode.invalidParams,
+        'station/trigger 的 meta 必须是 JSON 对象',
+      );
+    }
+    // scope = 这一次消息的**运行期四元组**（订阅同一套解析：请求不得放大声明，
+    // 有 agent 时按真实归属收窄）。
+    final StationScope scope = _resolveSubscriptionScope(config, params);
+    // 消息必须带**确定的** mode：订阅时空 mode = 通配（两种工作面都收），但投递判定
+    // 看的是「消息 ↔ 订阅者」，一条没有工作面的消息无法判定该投给谁（fail-closed）。
+    if (!StationModeKey.isValid(scope.modeKey)) {
+      return denied(
+        '触发需要确定的 scope.mode_key（local | ssh），当前解析出来是空：'
+        '空 mode 在**订阅**里是通配，在**消息**里无法判定投给谁；'
+        '请在 params.scope.mode_key 里给出，或带上 agent_id 让核心按真实归属解析',
+      );
+    }
+    final Map<String, dynamic> meta = <String, dynamic>{
+      'triggered_by': config.id,
+      ...station.config,
+      if (rawMeta is Map)
+        ...rawMeta.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
+    };
+    final Object? payload = params['payload'];
+    if (station is BroadcastStation) {
+      final String topic = (params['topic'] ?? '').toString().trim();
+      if (topic.isEmpty) {
+        return denied('广播站触发需要 topic（公告板回看与订阅者分流都按它）');
+      }
+      final StationPublishResult result = await station.publish(
+        topic: topic,
+        scope: scope,
+        payload: payload,
+        meta: meta,
+        sourcePluginId: config.id,
+      );
+      return <String, dynamic>{
+        'ok': true,
+        'station_id': station.id,
+        'kind': station.kind.wire,
+        'result': <String, dynamic>{
+          'topic': result.topic,
+          'board_seq': result.boardSeq,
+          'delivered': result.delivered,
+          'summary': result.describe(),
+          'deliveries': <Map<String, dynamic>>[
+            for (final StationDelivery delivery in result.deliveries)
+              <String, dynamic>{
+                'plugin_id': delivery.pluginId,
+                'ok': delivery.ok,
+                'error': delivery.error,
+                'payload': delivery.payload,
+              },
+          ],
+          'skipped': result.skipped,
+        },
+        'error': '',
+      };
+    }
+    if (station is RelayStation) {
+      final StationRelayResult result = await station.relay(
+        data: payload,
+        scope: scope,
+        meta: meta,
+        sourcePluginId: config.id,
+      );
+      return <String, dynamic>{
+        'ok': true,
+        'station_id': station.id,
+        'kind': station.kind.wire,
+        'result': <String, dynamic>{
+          'handled': result.handled,
+          'data': result.data,
+          'plugin_id': result.pluginId,
+          'request_id': result.requestId,
+          'reason': result.reason,
+          'summary': result.describe(),
+        },
+        'error': '',
+      };
+    }
+    if (station is CollectStation) {
+      final StationCollectResult result = await station.collect(
+        scope: scope,
+        request: payload,
+        meta: meta,
+        sourcePluginId: config.id,
+      );
+      return <String, dynamic>{
+        'ok': true,
+        'station_id': station.id,
+        'kind': station.kind.wire,
+        'result': <String, dynamic>{
+          'summary': result.describe(),
+          'complete': result.complete,
+          'items': <Map<String, dynamic>>[
+            for (final StationCollectedItem item in result.items)
+              <String, dynamic>{
+                'plugin_id': item.pluginId,
+                'payload': item.payload,
+              },
+          ],
+          'unresponsive': <Map<String, dynamic>>[
+            for (final StationUnresponsive bad in result.unresponsive)
+              <String, dynamic>{
+                'plugin_id': bad.pluginId,
+                'reason': bad.reason,
+              },
+          ],
+          'skipped': result.skipped,
+        },
+        'error': '',
+      };
+    }
+    return denied('站点 ${station.id} 的类型 ${station.kind.wire} 不支持触发');
   }
 
   /// 解析一次订阅的**运行期四元组**（与 `station/command` 同口径，fail-closed）。

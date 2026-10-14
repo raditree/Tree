@@ -258,6 +258,7 @@ class StationHub {
     StationKind.broadcast => BroadcastStation(
       id: spec.id,
       description: spec.description,
+      readme: spec.readme,
       maxSubscriptions: spec.maxSubscriptions,
       builtin: true,
       subscribers: List<StationSubscriber>.of(subscribers),
@@ -266,6 +267,7 @@ class StationHub {
     StationKind.execute => ExecuteStation(
       id: spec.id,
       description: spec.description,
+      readme: spec.readme,
       maxSubscriptions: spec.maxSubscriptions,
       builtin: true,
       subscribers: List<StationSubscriber>.of(subscribers),
@@ -275,6 +277,7 @@ class StationHub {
     StationKind.relay => RelayStation(
       id: spec.id,
       description: spec.description,
+      readme: spec.readme,
       maxSubscriptions: spec.maxSubscriptions,
       builtin: true,
       subscribers: List<StationSubscriber>.of(subscribers),
@@ -283,6 +286,7 @@ class StationHub {
     StationKind.collect => CollectStation(
       id: spec.id,
       description: spec.description,
+      readme: spec.readme,
       schema: toolDefinitionSchema,
       builtin: true,
       subscribers: List<StationSubscriber>.of(subscribers),
@@ -397,6 +401,7 @@ class StationHub {
     final CollectStation station = CollectStation(
       id: id,
       description: '收集站（系统自带）：插件按 schema 申报工具定义（名称/描述/参数/执行方式）',
+      readme: StationPoints.byId(id)?.readme ?? '',
       schema: toolDefinitionSchema,
       builtin: true,
     );
@@ -533,6 +538,111 @@ class StationHub {
     }
     if (removed.isNotEmpty) save();
     return removed.length;
+  }
+
+  /// **改站点配置**（面板「站点详情页」的写回）；返回 null = 成功，否则可读中文原因。
+  ///
+  /// 可改的字段按“内置 / 自建”分开：
+  /// - `max_subscriptions`（可订阅插件数量）：**都能改**——它是投递上限，不改变语义；
+  /// - `readme` / `config` / `shared` / `allowed_plugins`：**只有非内置能改**。
+  ///   内置点位的介绍与可配置项在点位表里（`station_points.dart`）——那才是唯一定义处，
+  ///   面板上改它等于把行为从代码里摸到盘上，下次启动就会被点位表覆盖回去。
+  ///
+  /// 只改传了的键（局部更新）；不存在的站点/订阅显式报错，不静默成功。
+  String? updateConfig(String stationId, Map<String, dynamic> patch) {
+    load();
+    final StationInstance? station = _stations[stationId];
+    if (station == null) return '站点不存在：$stationId';
+    final bool onlyBuiltinEditable = station.builtin;
+    if (onlyBuiltinEditable) {
+      const List<String> builtinForbidden = <String>[
+        'readme',
+        'config',
+        'shared',
+        'allowed_plugins',
+      ];
+      final List<String> asked = builtinForbidden
+          .where((String key) => patch.containsKey(key))
+          .toList(growable: false);
+      if (asked.isNotEmpty) {
+        return '内置站点 $stationId 不提供修改 ${asked.join(' / ')}：'
+            '内置点位的介绍与配置在核心的点位表（station_points.dart）里，'
+            '界面上可改的只有「可订阅插件数量」';
+      }
+    }
+    if (patch.containsKey('max_subscriptions')) {
+      final Object? raw = patch['max_subscriptions'];
+      if (raw is! num) return 'max_subscriptions 必须是整数（收到「$raw」）';
+      final int value = raw.toInt();
+      if (value < 0) return 'max_subscriptions 不能为负数（$value）';
+      if (station.maxSubscriptions != value) {
+        station.maxSubscriptions = value;
+      }
+    }
+    if (patch.containsKey('readme')) {
+      station.readme = (patch['readme'] ?? '').toString();
+    }
+    if (patch.containsKey('shared')) {
+      final Object? raw = patch['shared'];
+      if (raw is! bool) return 'shared 必须是布尔值（收到「$raw」）';
+      station.shared = raw;
+    }
+    if (patch.containsKey('allowed_plugins')) {
+      final Object? raw = patch['allowed_plugins'];
+      if (raw is! List) return 'allowed_plugins 必须是插件 id 列表';
+      station.allowedPlugins
+        ..clear()
+        ..addAll(<String>[
+          for (final Object? item in raw)
+            if ('$item'.trim().isNotEmpty) '$item'.trim(),
+        ]);
+    }
+    if (patch.containsKey('config')) {
+      final Object? raw = patch['config'];
+      if (raw is! Map) return 'config 必须是键值映射';
+      station.config
+        ..clear()
+        ..addEntries(<MapEntry<String, dynamic>>[
+          for (final MapEntry<Object?, Object?> e in raw.entries)
+            MapEntry<String, dynamic>(e.key.toString(), e.value),
+        ]);
+    }
+    save();
+    return null;
+  }
+
+  /// **禁用 / 启用一个订阅者**（按订阅键位 `plugin_id|scope`）。
+  ///
+  /// 保留订阅关系与回包通道，只让触发时不投递（见 [StationSubscriber.disabled]）：
+  /// 面板上的“禁用”不是退订——插件自己并不知道被关了，下次上线还会重新订阅。
+  String? setSubscriberDisabled(
+    String stationId,
+    String subscriberKey,
+    bool disabled,
+  ) {
+    load();
+    final StationInstance? station = _stations[stationId];
+    if (station == null) return '站点不存在：$stationId';
+    final int index = station.subscribers.indexWhere(
+      (StationSubscriber s) => s.key == subscriberKey,
+    );
+    if (index < 0) {
+      return '订阅者不存在于 $stationId：$subscriberKey（可能已退订或插件已下线）';
+    }
+    final StationSubscriber old = station.subscribers[index];
+    if (old.disabled == disabled) return null;
+    station.subscribers[index] = StationSubscriber(
+      pluginId: old.pluginId,
+      scope: old.scope,
+      subscribedAt: old.subscribedAt,
+      disabled: disabled,
+    );
+    save();
+    log?.call(
+      '站点 $stationId 的订阅者 ${old.pluginId} 已${disabled ? '禁用' : '启用'}'
+      '（订阅保留，触发时${disabled ? '不投递' : '恢复投递'}）',
+    );
+    return null;
   }
 
   /// 前端快照（stations 段；形状与既有 PluginStationInfo 的宽容解析对齐）。

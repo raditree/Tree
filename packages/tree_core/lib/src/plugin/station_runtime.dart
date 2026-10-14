@@ -9,15 +9,21 @@ import 'dart:async';
 import 'station_schema.dart';
 import 'station_scope.dart';
 
-/// 订阅者身份 = **plugin_id + scope 四元组**（用户定稿）。
+/// 订阅者身份 = **plugin_id + scope 四元组 + 禁用态**（用户定稿）。
 ///
-/// 同一插件在不同 scope 上是不同订阅者；持久化只存身份与时间，
+/// 同一插件在不同 scope 上是不同订阅者；持久化只存身份、时间与禁用态，
 /// 回包函数（StationResponder）是运行时的，不落盘。
+///
+/// [disabled] 是**站点所有者在面板上的「禁用」开关**（不是退订）：订阅关系与
+/// 回包通道都保留，只是触发时**不投递**，每条触发都会显式回报跳过原因。
+/// 做成布尔而不是删掉订阅，是因为「这条订阅是谁建的、什么 scope」必须留痕，
+/// 否则插件重启会重新订阅、用户在面板上关的东西被悄悄打开。
 class StationSubscriber {
   const StationSubscriber({
     required this.pluginId,
     required this.scope,
     this.subscribedAt = 0,
+    this.disabled = false,
   });
 
   /// 插件 id（下线时由总线按此注销其全部订阅）。
@@ -29,6 +35,9 @@ class StationSubscriber {
   /// 订阅时间（epoch 秒）。
   final int subscribedAt;
 
+  /// 是否被站点所有者**禁用**（true = 保留订阅但触发时不投递）。
+  final bool disabled;
+
   /// 订阅键位（同一站内唯一）。
   String get key => '$pluginId|${scope.key}';
 
@@ -37,6 +46,7 @@ class StationSubscriber {
     'plugin_id': pluginId,
     'scope': scope.toJson(),
     'subscribed_at': subscribedAt,
+    if (disabled) 'disabled': true,
   };
 
   /// 宽容解析（缺 plugin_id / 非 Map 时返回 null）。
@@ -50,6 +60,7 @@ class StationSubscriber {
       pluginId: pluginId,
       scope: scope,
       subscribedAt: at is num ? at.toInt() : 0,
+      disabled: raw['disabled'] == true,
     );
   }
 
@@ -59,6 +70,7 @@ class StationSubscriber {
     'plugin_id': pluginId,
     'granularity': _granularity,
     'scope': scope.toJson(),
+    'disabled': disabled,
   };
 
   String get _granularity {
@@ -497,6 +509,7 @@ class StationCounters {
     'rejected_conflict',
     'unsubscribed',
     'skipped_scope',
+    'skipped_disabled',
     'delivered',
   ];
 

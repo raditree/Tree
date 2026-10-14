@@ -742,4 +742,239 @@ void main() {
     reloaded.load();
     expect(reloaded.station(broadcast.id)!.subscribers.single.pluginId, 'p2');
   });
+
+  // ── 站点介绍 / 共享声明 / 面板可改的配置（M9：插件内置站点的三条定稿）──
+
+  test('介绍与共享声明落盘：readme / shared / allowed_plugins / config 跨重启保留；'
+      '内置点位的介绍来自点位表', () async {
+    final StationHub h = hub();
+    expect(
+      h.register(
+        BroadcastStation(
+          id: 'plugin.demo.broadcast.fanout',
+          description: '自建广播站',
+          readme: '这个站干什么、什么时候被触发、订阅者该怎么回',
+          shared: true,
+          allowedPlugins: <String>['p2'],
+          config: <String, dynamic>{'route': 'team'},
+        ),
+      ),
+      isNull,
+    );
+    final BroadcastStation station =
+        h.station('plugin.demo.broadcast.fanout')! as BroadcastStation;
+
+    // 内置点位：介绍取自点位表（面板上永远有介绍可读，不留空白）
+    final BroadcastStation builtin = h.broadcastFor()!;
+    expect(
+      builtin.readme,
+      isNotEmpty,
+      reason: '内置点位的介绍在 station_points.dart 里：断言 3 对内置站同样成立',
+    );
+
+    // 新中枢读同一个文件（面板与插件跨重启看到的是同一份说明书）
+    final StationHub second = hub();
+    second.load();
+    final BroadcastStation restored =
+        second.station(station.id)! as BroadcastStation;
+    expect(restored.readme, station.readme);
+    expect(restored.shared, isTrue);
+    expect(restored.allowedPlugins, <String>['p2']);
+    expect(restored.config, <String, dynamic>{'route': 'team'});
+
+    // 一把闸门的五种情形（断言 2：跨插件调用只认显式声明）
+    expect(
+      restored.callableBy('demo', isOwner: true, isBuiltin: false),
+      isTrue,
+      reason: '所有者永远能用：门是给别人的，不是防自己的',
+    );
+    expect(
+      restored.callableBy('p2', isOwner: false, isBuiltin: false),
+      isTrue,
+      reason: '已共享 + 名单里有它 ⇒ 可以订阅也可以被触发',
+    );
+    expect(
+      restored.callableBy('p3', isOwner: false, isBuiltin: false),
+      isFalse,
+      reason: '名单外一律拒',
+    );
+    expect(
+      restored.callableBy('anyone', isOwner: false, isBuiltin: true),
+      isFalse,
+      reason: '内置点位对谁都不开触发：它的触发时机由核心在固定接入点决定',
+    );
+    expect(
+      BroadcastStation(
+        id: 'plugin.demo.broadcast.private',
+        description: '私有站',
+        readme: '不外开的站',
+      ).callableBy('p2', isOwner: false, isBuiltin: false),
+      isFalse,
+      reason: '默认不共享：别人的插件连门都摸不到',
+    );
+  });
+
+  test('updateConfig：面板上能改什么按「内置 / 自建」分开（改完立即生效并落盘）', () async {
+    final StationHub h = hub();
+    expect(
+      h.register(
+        BroadcastStation(
+          id: 'plugin.demo.broadcast.cfg',
+          description: '可配置的站',
+          readme: '原始介绍',
+        ),
+      ),
+      isNull,
+    );
+    final StationInstance station = h.station('plugin.demo.broadcast.cfg')!;
+    final StationScope scope = team('team-1');
+
+    // ① 自建站：介绍 / 上限 / 共享 / 白名单 / 自定义配置都能改
+    expect(
+      h.updateConfig(station.id, <String, dynamic>{
+        'readme': '改过的介绍',
+        'max_subscriptions': 2,
+        'shared': true,
+        'allowed_plugins': <String>['p2'],
+        'config': <String, dynamic>{'limit': 10},
+      }),
+      isNull,
+    );
+    expect(station.readme, '改过的介绍');
+    expect(station.maxSubscriptions, 2);
+    expect(station.shared, isTrue);
+    expect(station.allowedPlugins, <String>['p2']);
+    expect(station.config, <String, dynamic>{'limit': 10});
+
+    // ② 上限是**这个实例**的：改完立即影响订阅判定（不需要重启核心）
+    expect(
+      h
+          .subscribe(
+            station.id,
+            StationSubscriber(pluginId: 'a', scope: scope),
+            ok(),
+          )
+          .ok,
+      isTrue,
+    );
+    final StationSubResult overflow = h.subscribe(
+      station.id,
+      StationSubscriber(pluginId: 'b', scope: team('team-2')),
+      ok(),
+    );
+    expect(overflow.ok, isTrue, reason: overflow.error);
+    expect(
+      h
+          .subscribe(
+            station.id,
+            StationSubscriber(pluginId: 'c', scope: team('team-3')),
+            ok(),
+          )
+          .ok,
+      isFalse,
+      reason: '上限改成 2 之后第三人应该被拒',
+    );
+
+    // ③ 非法值显式报错（不静默接受、不假装成功）
+    expect(
+      h.updateConfig(station.id, <String, dynamic>{'max_subscriptions': 'ten'}),
+      contains('整数'),
+    );
+    expect(
+      h.updateConfig(station.id, <String, dynamic>{'shared': 'yes'}),
+      contains('布尔'),
+    );
+    expect(
+      h.updateConfig(station.id, <String, dynamic>{
+        'config': <String>['a'],
+      }),
+      contains('映射'),
+    );
+    expect(
+      h.updateConfig('plugin.demo.broadcast.nope', <String, dynamic>{
+        'readme': 'x',
+      }),
+      contains('不存在'),
+    );
+    // 报错的那些键没被写进去
+    expect(station.shared, isTrue);
+    expect(station.maxSubscriptions, 2);
+
+    // ④ 内置点位：只有「可订阅插件数量」能改（介绍与配置在点位表里）
+    final BroadcastStation builtin = h.broadcastFor()!;
+    expect(
+      h.updateConfig(builtin.id, <String, dynamic>{'max_subscriptions': 5}),
+      isNull,
+    );
+    expect(builtin.maxSubscriptions, 5);
+    final String? forbidden = h.updateConfig(builtin.id, <String, dynamic>{
+      'readme': '界面上改内置站的介绍',
+    });
+    expect(forbidden, isNotNull);
+    expect(forbidden, contains('内置站点'));
+    expect(
+      builtin.readme,
+      isNot('界面上改内置站的介绍'),
+      reason: '内置点位的介绍以点位表为单一真源，不接受盘上覆写',
+    );
+
+    // ⑤ 落盘：新中枢读到改后的值
+    final StationHub reloaded = hub();
+    reloaded.load();
+    final StationInstance again = reloaded.station(station.id)!;
+    expect(again.readme, '改过的介绍');
+    expect(again.maxSubscriptions, 2);
+    expect(again.shared, isTrue);
+    expect(again.allowedPlugins, <String>['p2']);
+    expect(again.config, <String, dynamic>{'limit': 10});
+  });
+
+  test('订阅者的禁用标记落盘：重启后仍是关着的（不会被重新订阅悄悄打开）', () async {
+    final StationHub h = hub();
+    expect(
+      h.register(
+        BroadcastStation(
+          id: 'plugin.demo.broadcast.switch',
+          description: '带开关的站',
+          readme: '订阅者可被所有者关掉',
+          shared: true,
+        ),
+      ),
+      isNull,
+    );
+    final StationInstance station = h.station('plugin.demo.broadcast.switch')!;
+    final StationScope scope = team('team-1');
+    h.subscribe(
+      station.id,
+      StationSubscriber(pluginId: 'p1', scope: scope),
+      ok(),
+    );
+    final String key = station.subscribers.single.key;
+
+    expect(h.setSubscriberDisabled(station.id, key, true), isNull);
+    expect(station.subscribers.single.disabled, isTrue);
+    // 快照里看得见（面板的「已订阅插件管理」读它渲染开关）
+    expect(
+      (station.describe()['subscriptions'] as List).single
+          as Map<String, dynamic>,
+      containsPair('disabled', isTrue),
+    );
+
+    final StationHub reloaded = hub();
+    reloaded.load();
+    expect(
+      reloaded.station(station.id)!.subscribers.single.disabled,
+      isTrue,
+      reason: '禁用关系跨重启保留：插件重新上线也不会把用户关掉的东西悄悄打开',
+    );
+    // 未知订阅键 ⇒ 可读错误
+    expect(
+      reloaded.setSubscriberDisabled(station.id, 'ghost|team-1', true),
+      contains('不存在'),
+    );
+    expect(
+      reloaded.setSubscriberDisabled('plugin.demo.broadcast.nope', key, true),
+      contains('不存在'),
+    );
+  });
 }

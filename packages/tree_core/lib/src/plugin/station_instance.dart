@@ -23,12 +23,21 @@ sealed class StationInstance {
   StationInstance({
     required this.id,
     required this.description,
+    String? readme,
     this.scope = const StationScope(),
-    this.maxSubscriptions = defaultMaxSubscriptions,
+    int? maxSubscriptions,
     this.builtin = false,
+    bool? shared,
+    List<String>? allowedPlugins,
+    Map<String, dynamic>? config,
     int? createdAt,
     List<StationSubscriber>? subscribers,
-  }) : createdAt = createdAt ?? nowSeconds(),
+  }) : readme = readme ?? '',
+       maxSubscriptions = maxSubscriptions ?? defaultMaxSubscriptions,
+       shared = shared ?? false,
+       allowedPlugins = allowedPlugins ?? <String>[],
+       config = config ?? <String, dynamic>{},
+       createdAt = createdAt ?? nowSeconds(),
        subscribers = subscribers ?? <StationSubscriber>[];
 
   /// 默认订阅上限（实例自带；<= 0 表示不限制）。
@@ -43,6 +52,17 @@ sealed class StationInstance {
   /// 广播站、执行站、收集站，面板按 kind 分组显示。
   final String description;
 
+  /// **站点介绍**（面板详情页读它）。
+  ///
+  /// 口径（M9 §3，用户定稿）：
+  /// - **插件自建站必填**——`station/register` 缺 readme 直接拒绝：站是插件建的，
+  ///   「它是干什么的、别人该怎么用」必须由建站的插件写清楚，否则共享站点对别人
+  ///   只是一个猜不出用途的 id；
+  /// - 内置点位取自**点位表**（[StationPointSpec.readme]），没单独写时回落到
+  ///   [description]（见 [readmeText]）——面板上永远有介绍可读，不留空白；
+  /// - 可在面板的站点详情页改（改的是这一份，落盘持久化）。
+  String readme;
+
   /// 站点 scope（**已废弃的占位**：站点全局化后不绑 team / mode）。
   ///
   /// 保留字段只为两件事：(a) 旧 `stations.yaml` 的宽容解析（迁移时会归并到常量 id），
@@ -51,7 +71,28 @@ sealed class StationInstance {
   final StationScope scope;
 
   /// 订阅上限（**实例自带**，不是全局值；超限拒绝订阅并显式报错）。
-  final int maxSubscriptions;
+  ///
+  /// 可在面板的站点详情页改（「站点可订阅插件数量」）：站点全局化后上限是**这一
+  /// 个实例**的属性，改它不影响别的站点，所以不需要重启核心就能生效。
+  int maxSubscriptions;
+
+  /// 是否**对外共享**（插件自建站默认私有；true = 允许其它插件按 [allowedPlugins] 订阅与触发）。
+  ///
+  /// 为什么要有显式声明：自建站 id 里带着建站的插件 id，归属是可证明的；
+  /// 「别人能不能用」必须由建站方说，不能靠「知道 id 就能订」——那等于任何插件
+  /// 都能挂上别人的拦截点。
+  bool shared;
+
+  /// 共享白名单（**空 = 所有插件都能用**；非空 = 只有列出的插件 id 能用）。
+  ///
+  /// 只在 [shared] 为 true 时参与判定。
+  final List<String> allowedPlugins;
+
+  /// 站点自定义配置（**由建站的一方定义字段**；面板「其他」区展示与编辑）。
+  ///
+  /// 核心不解释这些键的含义，只负责**持久化 + 回推给订阅者**（随 `station/request`
+  /// 的 meta 下发）：语义由站的所有者与订阅者自己约定。
+  Map<String, dynamic> config;
 
   /// 是否系统自带（内置四站为 true；插件自建为 false）。
   final bool builtin;
@@ -89,6 +130,33 @@ sealed class StationInstance {
 
   /// 是否强制**全站唯一订阅者**（只有中转站是：先到先得）。
   bool get scopeKeyUnique => false;
+
+  /// 面板「站点介绍」读这里：自建站必填（见 `station/register`），
+  /// 内置点位没单独写 readme 时回落到 [description]——**不留空白**。
+  String get readmeText => readme.isNotEmpty ? readme : description;
+
+  /// 该插件能不能用本站（订阅 / 触发）。
+  ///
+  /// 判定只认**显式声明**：内置站对谁都不开（它的触发时机由核心在固定接入点决定，
+  /// 插件要能力请用 `station/command`）；自建站默认只有所有者能用，`shared` 之后
+  /// 再看白名单。返回 false 时调用方**必须**给出可读原因（不静默拒绝）。
+  bool callableBy(
+    String pluginId, {
+    required bool isOwner,
+    required bool isBuiltin,
+  }) {
+    if (isBuiltin) return false;
+    if (isOwner) return true;
+    if (!shared) return false;
+    return allowedPlugins.isEmpty || allowedPlugins.contains(pluginId);
+  }
+
+  /// 订阅者被禁用时的可读原因（未禁用返回 null）。
+  ///
+  /// 三种 trigger（publish / relay / collect）都走它：禁用**必须**在返回值里看得见，
+  /// 否则“面板上关了、但没人告诉过触发方”就是事后无法诊断的黑洞。
+  String? disabledReasonFor(StationSubscriber subscriber) =>
+      subscriber.disabled ? '订阅者 ${subscriber.pluginId} 已被本站所有者禁用' : null;
 
   /// 子类附加持久化字段。
   Map<String, dynamic> extraJson() => const <String, dynamic>{};
@@ -305,8 +373,12 @@ sealed class StationInstance {
     'id': id,
     'kind': kind.wire,
     'description': description,
+    if (readme.isNotEmpty) 'readme': readme,
     'scope': scope.toJson(),
     'max_subscriptions': maxSubscriptions,
+    if (shared) 'shared': true,
+    if (allowedPlugins.isNotEmpty) 'allowed_plugins': allowedPlugins,
+    if (config.isNotEmpty) 'config': config,
     if (builtin) 'builtin': true,
     'created_at': createdAt,
     'subscribers': subscribers
@@ -324,9 +396,13 @@ sealed class StationInstance {
     'kind': kind.wire,
     'kind_label': kind.label,
     'description': description,
+    'readme': readmeText,
     'scope': scope.toJson(),
     'builtin': builtin,
     'max_subscriptions': maxSubscriptions,
+    'shared': shared,
+    'allowed_plugins': allowedPlugins,
+    'config': config,
     'subscriber_count': subscribers.length,
     'subscriptions': subscribers
         .map((StationSubscriber s) => s.describe())
@@ -371,11 +447,27 @@ sealed class StationInstance {
     if (kind == null) return null;
     final StationScope scope = StationScope.parse(raw['scope']);
     final String description = (raw['description'] ?? '').toString();
+    final String readme = (raw['readme'] ?? '').toString();
     final Object? rawMax = raw['max_subscriptions'];
     final int maxSubscriptions = rawMax is num
         ? rawMax.toInt()
         : defaultMaxSubscriptions;
     final bool builtin = raw['builtin'] == true;
+    final bool shared = raw['shared'] == true;
+    final List<String> allowedPlugins = <String>[
+      for (final Object? item
+          in (raw['allowed_plugins'] is List
+              ? raw['allowed_plugins'] as List
+              : const <Object?>[]))
+        if ('$item'.trim().isNotEmpty) '$item'.trim(),
+    ];
+    final Map<String, dynamic> config = raw['config'] is Map
+        ? <String, dynamic>{
+            for (final MapEntry<Object?, Object?> e
+                in (raw['config'] as Map).entries)
+              e.key.toString(): e.value,
+          }
+        : <String, dynamic>{};
     final Object? rawCreated = raw['created_at'];
     final int createdAt = rawCreated is num ? rawCreated.toInt() : nowSeconds();
     final List<StationSubscriber> subscribers = <StationSubscriber>[];
@@ -393,8 +485,12 @@ sealed class StationInstance {
         return BroadcastStation(
           id: id,
           description: description,
+          readme: readme,
           scope: scope,
           maxSubscriptions: maxSubscriptions,
+          shared: shared,
+          allowedPlugins: allowedPlugins,
+          config: config,
           builtin: builtin,
           createdAt: createdAt,
           subscribers: subscribers,
@@ -406,6 +502,7 @@ sealed class StationInstance {
         return ExecuteStation(
           id: id,
           description: description,
+          readme: readme,
           scope: scope,
           maxSubscriptions: maxSubscriptions,
           builtin: builtin,
@@ -418,8 +515,12 @@ sealed class StationInstance {
         return RelayStation(
           id: id,
           description: description,
+          readme: readme,
           scope: scope,
           maxSubscriptions: maxSubscriptions,
+          shared: shared,
+          allowedPlugins: allowedPlugins,
+          config: config,
           builtin: builtin,
           createdAt: createdAt,
           subscribers: subscribers,
@@ -428,8 +529,12 @@ sealed class StationInstance {
         return CollectStation(
           id: id,
           description: description,
+          readme: readme,
           scope: scope,
           maxSubscriptions: maxSubscriptions,
+          shared: shared,
+          allowedPlugins: allowedPlugins,
+          config: config,
           builtin: builtin,
           createdAt: createdAt,
           subscribers: subscribers,
@@ -516,9 +621,13 @@ final class BroadcastStation extends StationInstance {
   BroadcastStation({
     required super.id,
     required super.description,
+    super.readme,
     super.scope,
     super.maxSubscriptions,
     super.builtin,
+    super.shared,
+    super.allowedPlugins,
+    super.config,
     super.createdAt,
     super.subscribers,
     this.boardLimit = 50,
@@ -586,6 +695,14 @@ final class BroadcastStation extends StationInstance {
       if (!toSubscriber.ok) {
         counters.bump('skipped_scope');
         skipped.add('跳过 ${subscriber.pluginId}：${toSubscriber.reason}');
+        continue;
+      }
+      // 被站点所有者禁用的订阅者：**不投递，但写进 skipped**（面板上关了什么
+      // 就要在触发结果里看得见，不能假装“投了但没人接”）。
+      final String? disabled = disabledReasonFor(subscriber);
+      if (disabled != null) {
+        counters.bump('skipped_disabled');
+        skipped.add('跳过 ${subscriber.pluginId}：$disabled');
         continue;
       }
       counters.bump('requests');
@@ -721,6 +838,7 @@ final class ExecuteStation extends StationInstance {
   ExecuteStation({
     required super.id,
     required super.description,
+    super.readme,
     super.scope,
     super.maxSubscriptions,
     super.builtin,
@@ -903,9 +1021,13 @@ final class RelayStation extends StationInstance {
   RelayStation({
     required super.id,
     required super.description,
+    super.readme,
     super.scope,
     super.maxSubscriptions,
     super.builtin,
+    super.shared,
+    super.allowedPlugins,
+    super.config,
     super.createdAt,
     super.subscribers,
   });
@@ -961,6 +1083,18 @@ final class RelayStation extends StationInstance {
         data: data,
         handled: false,
         reason: '无匹配订阅者（原数据放行）',
+      );
+    }
+    // 禁用的订阅者：**不投递、原数据放行**（fail-open 照旧），但原因必须写清
+    // “是谁被关了”而不是笼统的“无人处理”——否则用户以为插件拒了这次中转。
+    final String? disabled = disabledReasonFor(subscriber);
+    if (disabled != null) {
+      counters.bump('skipped_disabled');
+      return StationRelayResult(
+        data: data,
+        handled: false,
+        pluginId: subscriber.pluginId,
+        reason: '$disabled（原数据放行）',
       );
     }
     counters.bump('requests');
@@ -1042,9 +1176,13 @@ final class CollectStation extends StationInstance {
     required super.id,
     required super.description,
     required this.schema,
+    super.readme,
     super.scope,
     super.maxSubscriptions,
     super.builtin,
+    super.shared,
+    super.allowedPlugins,
+    super.config,
     super.createdAt,
     super.subscribers,
   });
@@ -1089,6 +1227,12 @@ final class CollectStation extends StationInstance {
       if (!toSubscriber.ok) {
         counters.bump('skipped_scope');
         skipped.add('跳过 ${subscriber.pluginId}：${toSubscriber.reason}');
+        continue;
+      }
+      final String? disabled = disabledReasonFor(subscriber);
+      if (disabled != null) {
+        counters.bump('skipped_disabled');
+        skipped.add('跳过 ${subscriber.pluginId}：$disabled');
         continue;
       }
       counters.bump('requests');

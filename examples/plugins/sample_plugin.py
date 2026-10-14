@@ -618,7 +618,7 @@ class SamplePlugin(object):
                      notify=True)
         return result
 
-    def register_own_station(self, kind="broadcast", name="team_fanout"):
+    def register_own_station(self, kind="broadcast", name="team_fanout", shared=False):
         """**自建站点并订阅**（协议方法）：`station/register` → `station/subscribe`。
 
         为什么需要它（用户定稿语义）：站点全局唯一、**每个点位只有一个订阅者**。
@@ -628,11 +628,25 @@ class SamplePlugin(object):
 
         要点：**id 由核心拼**（`plugin.<插件id>.<类型>.<name>`），插件不能自选 id；
         所以这里只给 `kind` + `name`，并用返回的 `station_id` 去订阅。
+
+        `readme` 是**必填**的（用户定稿：每个插件内置站点都必须有介绍）：站是插件
+        建的，"它干什么、什么时候被触发、订阅者该怎么回"只有建站的插件说得清；
+        面板的站点详情页直接展示它，共享站点时它是别人唯一能读到的说明书。
+
+        `shared=True` 时别的插件可以按 `station/subscribe` 订阅、按
+        `station/trigger` 触发本站（默认 false = 只有建站的插件能用）。
         """
         response = self.request_core("station/register", {
             "kind": kind,
             "name": name,
             "description": "示例插件自建站：按 team 再分发",
+            "readme": (
+                "示例插件的自建%s：收到内置站的公告后，按 team / agent 再分发给"
+                "本站的订阅者。触发时机由建站的插件决定（它自己调 station/trigger）；"
+                "订阅者回 {reply:{payload:null}} 表示收到不改动，带 payload 表示附带"
+                "再分发数据。"
+            ) % ("广播站" if kind == "broadcast" else kind),
+            "shared": shared,
         })
         if response.get("timeout") or isinstance(response.get("error"), dict):
             error = response.get("error") or {}

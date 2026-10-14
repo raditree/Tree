@@ -28,6 +28,9 @@ import 'dart:io';
 ///   `post` ⇒ 在结果文本前加 `[改写]` 前缀。用于验证「工具调用前后各一次中转」。
 /// - --relay-rewrite VALUE：上面 pre 阶段写进去的值。
 /// - --relay-station relay|broadcast：订阅哪类站（默认 relay）。
+/// - --station-echo：做**自建站**的订阅者——`station/request` 里不带 `phase` 的请求
+///   （广播 / 中转 / 采集）一律回显 `{echo, station_id, kind, meta}`。用于验证
+///   「跨插件订阅 + station/trigger 触发」真的投到了订阅者、且站点自定义配置随 meta 下发。
 /// - --ui-manifest：hello 后**主动发一条 `ui/manifest` 通知**声明一个 activity
 ///   槽位（左侧活动栏面板）与一个 panel 槽位（右栏 Tab），用于验证 Q12 的生产端。
 /// - --ui-manifest-foreign：同上，但槽位里冒用别的 plugin_id（验证越权被拒）。
@@ -44,6 +47,7 @@ void main(List<String> args) {
   // 既有用例对工具条数的断言不受影响。
   final bool scopeProbe = args.contains('--scope-probe');
   final bool relaySubscribe = args.contains('--relay-subscribe');
+  final bool stationEcho = args.contains('--station-echo');
   final bool uiManifest = args.contains('--ui-manifest');
   final bool uiManifestForeign = args.contains('--ui-manifest-foreign');
   String relayRewrite = 'REWRITTEN';
@@ -339,6 +343,21 @@ void main(List<String> args) {
           return;
         }
         if (!stationTools) {
+          if (stationEcho) {
+            // 自建站订阅者：把请求原样回显，让「跨插件触发」能在断言里看见
+            // 送达与载荷（包括核心随 meta 下发的站点自定义配置）。
+            reply(<String, dynamic>{
+              'reply': <String, dynamic>{
+                'payload': <String, dynamic>{
+                  'echo': params['payload'],
+                  'station_id': params['station_id'],
+                  'kind': params['kind'],
+                  'meta': params['meta'],
+                },
+              },
+            });
+            return;
+          }
           stdout.writeln(
             jsonEncode(<String, dynamic>{
               'jsonrpc': '2.0',
