@@ -55,6 +55,9 @@ class _PluginEditorDialogState extends State<PluginEditorDialog> {
   final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
   final TextEditingController _id = TextEditingController();
   final TextEditingController _name = TextEditingController();
+
+  /// 插件**介绍**（详情页的正文；落盘到 plugins.yaml 的 description）。
+  final TextEditingController _desc = TextEditingController();
   final TextEditingController _command = TextEditingController();
   final TextEditingController _args = TextEditingController();
   final TextEditingController _env = TextEditingController();
@@ -80,6 +83,7 @@ class _PluginEditorDialogState extends State<PluginEditorDialog> {
         widget.builtinSpec ?? const <String, dynamic>{};
     _id.text = (entry['id'] ?? spec['id'] ?? '').toString();
     _name.text = (entry['name'] ?? spec['name'] ?? '').toString();
+    _desc.text = (entry['description'] ?? spec['description'] ?? '').toString();
     _command.text = (entry['command'] ?? '').toString();
     final Object? rawArgs = entry['args'];
     _args.text = rawArgs is List
@@ -111,6 +115,7 @@ class _PluginEditorDialogState extends State<PluginEditorDialog> {
   void dispose() {
     _id.dispose();
     _name.dispose();
+    _desc.dispose();
     _command.dispose();
     _args.dispose();
     _env.dispose();
@@ -161,6 +166,7 @@ class _PluginEditorDialogState extends State<PluginEditorDialog> {
     return <String, dynamic>{
       'id': _id.text.trim(),
       'name': _name.text.trim(),
+      'description': _desc.text.trim(),
       'command': _command.text.trim(),
       'args': _argsList(),
       'env': _envMap(),
@@ -277,6 +283,17 @@ class _PluginEditorDialogState extends State<PluginEditorDialog> {
                   controller: _name,
                   decoration: const InputDecoration(
                     labelText: '名称（展示用）',
+                    isDense: true,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                TextFormField(
+                  key: const Key('plugin-editor-desc'),
+                  controller: _desc,
+                  maxLines: 3,
+                  decoration: const InputDecoration(
+                    labelText: '介绍',
+                    helperText: '插件卡片点进的「详情页」正文就读这里；留空则只显示占位说明',
                     isDense: true,
                   ),
                 ),

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
 import '../../io/plugin_monitor_service.dart';
+import 'plugin_detail_page.dart';
 import 'plugin_editor_dialog.dart';
 
 /// 插件管理接口（面板 → 核心）。
@@ -39,6 +40,30 @@ abstract class PluginAdminClient {
     String id, {
     required bool enabled,
   });
+
+  /// 站点详情（GET /api/plugin/stations/{id}）：`StationInstance.describe()` 一整块。
+  ///
+  /// 为什么站点页要单独读而不是直接用快照里那一份：快照是 WS 节流的，可能滞后，
+  /// 而「禁用订阅者 / 改配置」必须落在当前真值上（不这样做会出现"界面上还有个早就
+  /// 退订的订阅者"，点了核心只会回 404）。
+  Future<Map<String, dynamic>> stationDetail(String stationId);
+
+  /// 局部改站点配置（PATCH …/config）：只发要改的键。
+  ///
+  /// 内置站只能改 `max_subscriptions`，其余键核心回 400 + 原因（原样显示，不改写）。
+  Future<Map<String, dynamic>> patchStationConfig(
+    String stationId,
+    Map<String, dynamic> patch,
+  );
+
+  /// 禁用 / 启用一个订阅者（POST …/subscribers/{key}）。
+  ///
+  /// **禁用不是退订**：订阅关系与回包通道都留着，只让触发时不投递。
+  Future<Map<String, dynamic>> setSubscriberDisabled(
+    String stationId,
+    String subscriberKey, {
+    required bool disabled,
+  });
 }
 
 /// 默认实现：直接走 [ApiService]。
@@ -57,6 +82,7 @@ class ApiPluginAdminClient implements PluginAdminClient {
       ApiService.createPluginConfig(
         id: (body['id'] ?? '').toString(),
         name: (body['name'] ?? '').toString(),
+        description: (body['description'] ?? '').toString(),
         command: (body['command'] ?? '').toString(),
         args: _strings(body['args']),
         env: _stringMap(body['env']),
@@ -84,6 +110,27 @@ class ApiPluginAdminClient implements PluginAdminClient {
     String id, {
     required bool enabled,
   }) => ApiService.setBuiltinPluginEnabled(id, enabled: enabled);
+
+  @override
+  Future<Map<String, dynamic>> stationDetail(String stationId) =>
+      ApiService.getStationDetail(stationId);
+
+  @override
+  Future<Map<String, dynamic>> patchStationConfig(
+    String stationId,
+    Map<String, dynamic> patch,
+  ) => ApiService.updateStationConfig(stationId, patch);
+
+  @override
+  Future<Map<String, dynamic>> setSubscriberDisabled(
+    String stationId,
+    String subscriberKey, {
+    required bool disabled,
+  }) => ApiService.setStationSubscriberDisabled(
+    stationId,
+    subscriberKey,
+    disabled: disabled,
+  );
 
   static List<String> _strings(Object? raw) => raw is List
       ? <String>[for (final Object? e in raw) e.toString()]
@@ -296,6 +343,155 @@ class _PluginPanelState extends State<PluginPanel> {
     );
     messenger?.showSnackBar(
       SnackBar(content: Text(text), duration: const Duration(seconds: 6)),
+    );
+  }
+
+  // ── 详情页导航 ─────────────────────────────────────────────────────
+
+  /// 推一个详情页（卡片整张可点；卡片内的开关与按钮自己吃掉手势，不会误跳）。
+  void _push(Widget page) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (BuildContext ctx) => page),
+    );
+  }
+
+  /// 某个插件的运行实例（快照里同 id 可能有多条：粒度不同）。
+  ///
+  /// 工具表按**插件 id** 对账（`toolsOf(config.id)`），同一插件的多条实例共用一份，
+  /// 所以详情页取第一条不会看到"另一半工具不见了"。
+  PluginInstanceInfo? _instanceOf(String pluginId) {
+    final PluginSnapshot? snap = _svc.snapshot;
+    if (snap == null || pluginId.isEmpty) return null;
+    for (final PluginInstanceInfo e in snap.instances) {
+      if (e.pluginId == pluginId) return e;
+    }
+    return null;
+  }
+
+  /// 某条清单条目的运行态（无条目 ⇒ 空表，由详情页按"没有运行实例"显示）。
+  Map<String, dynamic> _runtimeOf(String id) {
+    final Object? raw = _runtime[id];
+    return raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
+  }
+
+  List<PluginStationInfo> get _allStations =>
+      _svc.snapshot?.stations ?? const <PluginStationInfo>[];
+
+  /// 介绍取值口径与「编辑」弹窗回填一致（先清单、再内置目录、最后快照）：
+  /// 两处优先级不同就会出现"弹窗里写着 A、详情页讲 B"。
+  String _introOf(
+    String id, {
+    Map<String, dynamic> entry = const <String, dynamic>{},
+    Map<String, dynamic> spec = const <String, dynamic>{},
+  }) {
+    final String fromEntry = (entry['description'] ?? '').toString();
+    if (fromEntry.isNotEmpty) return fromEntry;
+    final String fromSpec = (spec['description'] ?? '').toString();
+    if (fromSpec.isNotEmpty) return fromSpec;
+    return _instanceOf(id)?.description ?? '';
+  }
+
+  /// 打开插件详情页（**只读**：数据全部来自面板已有的清单 + 快照，不发新请求）。
+  void _openPluginDetail(PluginDetailPage page) => _push(page);
+
+  /// 打开站点详情页（带上快照里那一份先渲染，页面自己再去 GET 当前真值）。
+  void _openStationDetail(String stationId) {
+    PluginStationInfo? initial;
+    for (final PluginStationInfo s in _allStations) {
+      if (s.stationId == stationId) {
+        initial = s;
+        break;
+      }
+    }
+    _push(
+      StationDetailPage(
+        stationId: stationId,
+        admin: _admin,
+        initial: initial,
+      ),
+    );
+  }
+
+  /// 卡片底部的「点进来」提示：整张卡片都可点，但**看得出来**是另一回事。
+  Widget _detailAffordance(ColorScheme cs, String text) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.end,
+        children: <Widget>[
+          Text(text, style: TextStyle(fontSize: 10, color: cs.outline)),
+          Icon(Icons.chevron_right, size: 14, color: cs.outline),
+        ],
+      ),
+    );
+  }
+
+  /// 把一张卡片包成"整张可点"。
+  ///
+  /// 不加 InkWell 的水波纹：面板密度高，涟漪会和开关的反馈混在一起，改用卡片底部
+  /// 一行 chevron 提示。卡片里的开关与按钮各自吃掉自己的手势，不会误跳详情。
+  Widget _tappable({
+    required Key key,
+    required VoidCallback onTap,
+    required Widget card,
+  }) {
+    return GestureDetector(
+      key: key,
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: card,
+    );
+  }
+
+  /// 内置项详情（介绍口径与「编辑」弹窗回填一致：清单条目优先于内置目录）。
+  void _openBuiltinDetail(Map<String, dynamic> item) {
+    final String id = (item['id'] ?? '').toString();
+    final Map<String, dynamic> entry =
+        (item['config'] as Map<String, dynamic>?) ?? const <String, dynamic>{};
+    _openPluginDetail(
+      PluginDetailPage(
+        pluginId: id,
+        name: (item['name'] ?? '').toString(),
+        intro: _introOf(id, entry: entry, spec: item),
+        isBuiltin: true,
+        entry: entry,
+        runtime: _runtimeOf(id),
+        resolution: item['resolution'] as Map<String, dynamic>?,
+        instance: _instanceOf(id),
+        stations: _allStations,
+        onOpenStation: _openStationDetail,
+      ),
+    );
+  }
+
+  /// 自定义项详情。
+  void _openCustomDetail(Map<String, dynamic> entry) {
+    final String id = (entry['id'] ?? '').toString();
+    _openPluginDetail(
+      PluginDetailPage(
+        pluginId: id,
+        name: (entry['name'] ?? '').toString(),
+        intro: _introOf(id, entry: entry),
+        entry: entry,
+        runtime: _runtimeOf(id),
+        instance: _instanceOf(id),
+        stations: _allStations,
+        onOpenStation: _openStationDetail,
+      ),
+    );
+  }
+
+  /// 快照实例详情（**清单接口不可用时的兜底路径**：只有运行态，没有落盘条目）。
+  void _openInstanceDetail(PluginInstanceInfo e) {
+    _openPluginDetail(
+      PluginDetailPage(
+        pluginId: e.pluginId,
+        name: e.name,
+        intro: _introOf(e.pluginId),
+        instance: e,
+        stations: _allStations,
+        onOpenStation: _openStationDetail,
+      ),
     );
   }
 
@@ -552,7 +748,11 @@ class _PluginPanelState extends State<PluginPanel> {
           _emptyHint(cs, _instancesEmptyText(snap))
         else
           ...snap.instances.map(
-            (PluginInstanceInfo e) => _instanceCard(cs, e, snap.watchdog),
+            (PluginInstanceInfo e) => _tappable(
+              key: Key('plugin-detail-instance-${e.pluginId}'),
+              onTap: () => _openInstanceDetail(e),
+              card: _instanceCard(cs, e, snap.watchdog),
+            ),
           ),
       ];
     }
@@ -573,7 +773,13 @@ class _PluginPanelState extends State<PluginPanel> {
       if (_builtins.isEmpty)
         _emptyHint(cs, '核心没有提供内置插件目录（旧核心？）')
       else
-        ..._builtins.map((Map<String, dynamic> b) => _builtinCard(cs, b)),
+        ..._builtins.map(
+          (Map<String, dynamic> b) => _tappable(
+            key: Key('plugin-detail-builtin-${(b['id'] ?? '').toString()}'),
+            onTap: () => _openBuiltinDetail(b),
+            card: _builtinCard(cs, b),
+          ),
+        ),
       _groupHeader(
         cs,
         '自定义插件（${custom.length}）',
@@ -587,7 +793,13 @@ class _PluginPanelState extends State<PluginPanel> {
       if (custom.isEmpty)
         _emptyHint(cs, '还没有自定义插件。点「添加插件」写一个（命令 = 要拉起的进程）。')
       else
-        ...custom.map((Map<String, dynamic> e) => _configCard(cs, e)),
+        ...custom.map(
+          (Map<String, dynamic> e) => _tappable(
+            key: Key('plugin-detail-custom-${(e['id'] ?? '').toString()}'),
+            onTap: () => _openCustomDetail(e),
+            card: _configCard(cs, e),
+          ),
+        ),
     ];
   }
 
@@ -715,6 +927,7 @@ class _PluginPanelState extends State<PluginPanel> {
               ),
             ],
           ),
+          _detailAffordance(cs, '看插件介绍与工具'),
         ],
       ),
     );
@@ -725,10 +938,7 @@ class _PluginPanelState extends State<PluginPanel> {
     final String id = (entry['id'] ?? '').toString();
     final String name = (entry['name'] ?? '').toString();
     final bool enabled = entry['enabled'] != false;
-    final Object? rawRuntime = _runtime[id];
-    final Map<String, dynamic> runtime = rawRuntime is Map
-        ? Map<String, dynamic>.from(rawRuntime)
-        : <String, dynamic>{};
+    final Map<String, dynamic> runtime = _runtimeOf(id);
     final List<String> args = <String>[
       for (final Object? a in (entry['args'] as List<dynamic>? ?? <dynamic>[]))
         a.toString(),
@@ -830,6 +1040,7 @@ class _PluginPanelState extends State<PluginPanel> {
               ),
             ],
           ),
+          _detailAffordance(cs, '看插件介绍与工具'),
         ],
       ),
     );
@@ -1054,6 +1265,7 @@ class _PluginPanelState extends State<PluginPanel> {
               '停用原因: ${e.disabledReason}',
               style: TextStyle(fontSize: 11, color: cs.error),
             ),
+          _detailAffordance(cs, '看插件介绍与工具'),
         ],
       ),
     );
@@ -1134,14 +1346,30 @@ class _PluginPanelState extends State<PluginPanel> {
         out.add(_emptyHint(cs, '未创建（该类站点按需创建）'));
         continue;
       }
-      out.addAll(group.map((PluginStationInfo s) => _stationCard(cs, s)));
+      out.addAll(
+        group.map(
+          (PluginStationInfo s) => _tappable(
+            key: Key('station-detail-${s.stationId}'),
+            onTap: () => _openStationDetail(s.stationId),
+            card: _stationCard(cs, s),
+          ),
+        ),
+      );
     }
     final List<PluginStationInfo> others = snap.stations
         .where((PluginStationInfo s) => !known.contains(s.kind))
         .toList(growable: false);
     if (others.isNotEmpty) {
       out.add(_stationGroupHeader(cs, '其他（类型未知）', others.length));
-      out.addAll(others.map((PluginStationInfo s) => _stationCard(cs, s)));
+      out.addAll(
+        others.map(
+          (PluginStationInfo s) => _tappable(
+            key: Key('station-detail-${s.stationId}'),
+            onTap: () => _openStationDetail(s.stationId),
+            card: _stationCard(cs, s),
+          ),
+        ),
+      );
     }
     return out;
   }
@@ -1275,6 +1503,7 @@ class _PluginPanelState extends State<PluginPanel> {
             const SizedBox(height: 4),
             Wrap(spacing: 6, runSpacing: 6, children: countPills),
           ],
+          _detailAffordance(cs, '看站点介绍与配置'),
         ],
       ),
     );
@@ -1314,25 +1543,21 @@ class _PluginPanelState extends State<PluginPanel> {
     return buffer.toString();
   }
 
-  /// 状态文本（未知状态原样展示、不崩）。
+  /// 状态文本（未知状态原样展示、不崩；口径与详情页共用 [pluginStatusText]）。
   Widget _statusLabel(ColorScheme cs, String status) {
-    final String label;
+    final String label = pluginStatusText(status);
     final Color color;
     switch (status) {
       case 'registered':
-        label = '已注册';
         color = Colors.green;
         break;
       case 'disabled':
-        label = '已停用';
         color = cs.error;
         break;
       case 'destroyed':
-        label = '已销毁';
         color = cs.onSurfaceVariant;
         break;
       default:
-        label = status.isEmpty ? '未知' : status;
         color = cs.onSurfaceVariant;
         break;
     }

@@ -36,6 +36,15 @@ class _FakeAdmin implements PluginAdminClient {
   /// 最近一次新增的请求体（表单解析结果）。
   Map<String, dynamic>? lastCreateBody;
 
+  /// 最近一次站点配置的 PATCH 体（站点详情页的写回）。
+  Map<String, dynamic>? lastStationPatch;
+
+  /// 非空 = 站点详情读不到（模拟核心 404 / 旧核心没有这个端点）。
+  String failStationRead = '';
+
+  /// 站点详情与写操作的返回体（核心成功时回**改后的完整详情**）。
+  Map<String, dynamic> stationResponse = _defaultStation();
+
   static Map<String, dynamic> _defaultConfigs() => <String, dynamic>{
     'path': 'C:/data/config/plugins.yaml',
     'enabled': true,
@@ -85,6 +94,41 @@ class _FakeAdmin implements PluginAdminClient {
         },
       },
     ],
+  };
+
+  /// 一个典型的**插件自建站**详情（字段形状 = 核心 `StationInstance.describe()`）。
+  static Map<String, dynamic> _defaultStation() => <String, dynamic>{
+    'station_id': 'plugin.sample.relay.audit',
+    'kind': 'relay',
+    'kind_label': '中转站',
+    'description': '把工具公告按 team 再分发一次',
+    'readme': '自建中转站：收到公告后单向改写再投递，白名单内的插件都能触发。',
+    'scope': <String, dynamic>{},
+    'builtin': false,
+    'max_subscriptions': 8,
+    'shared': true,
+    'allowed_plugins': <String>['demo'],
+    'config': <String, dynamic>{'route': 'audit', 'route_limit': 8},
+    'subscriber_count': 2,
+    'subscriptions': <dynamic>[
+      <String, dynamic>{
+        'subscriber': 'sample|',
+        'plugin_id': 'sample',
+        'granularity': 'team',
+        'scope': <String, dynamic>{},
+        'disabled': false,
+      },
+      <String, dynamic>{
+        'subscriber': 'demo|t1|||local',
+        'plugin_id': 'demo',
+        'granularity': 'team',
+        'scope': <String, dynamic>{'team_id': 't1', 'mode_key': 'local'},
+        'disabled': true,
+      },
+    ],
+    'subscribers_by_team': <String, dynamic>{'t1': 1},
+    'counts': <String, dynamic>{'requests': 3, 'skipped_disabled': 1},
+    'gauges': <String, dynamic>{'waits_in_flight': 0},
   };
 
   @override
@@ -140,6 +184,37 @@ class _FakeAdmin implements PluginAdminClient {
     calls.add('builtin:$id:${enabled ? 'on' : 'off'}');
     if (failWrite.isNotEmpty) throw Exception(failWrite);
     return writeResponse;
+  }
+
+  @override
+  Future<Map<String, dynamic>> stationDetail(String stationId) async {
+    calls.add('station-detail:$stationId');
+    if (failStationRead.isNotEmpty) throw Exception(failStationRead);
+    return stationResponse;
+  }
+
+  @override
+  Future<Map<String, dynamic>> patchStationConfig(
+    String stationId,
+    Map<String, dynamic> patch,
+  ) async {
+    calls.add('station-patch:$stationId:${patch.keys.join('+')}');
+    lastStationPatch = patch;
+    if (failWrite.isNotEmpty) throw Exception(failWrite);
+    return stationResponse;
+  }
+
+  @override
+  Future<Map<String, dynamic>> setSubscriberDisabled(
+    String stationId,
+    String subscriberKey, {
+    required bool disabled,
+  }) async {
+    calls.add(
+      'station-sub:$stationId|$subscriberKey|${disabled ? 'off' : 'on'}',
+    );
+    if (failWrite.isNotEmpty) throw Exception(failWrite);
+    return stationResponse;
   }
 }
 
@@ -317,6 +392,16 @@ void main() {
       find.byKey(const Key('plugin-editor-session')),
       's1',
     );
+    // 介绍（详情页正文的唯一来源）：弹窗里必须能写，否则介绍永远只能改 yaml
+    expect(
+      find.textContaining('详情页」正文就读这里'),
+      findsOneWidget,
+      reason: '介绍输入框要写明去处，用户才知道写这儿有什么用',
+    );
+    await tester.enterText(
+      find.byKey(const Key('plugin-editor-desc')),
+      '把工具公告转发给队友  ',
+    );
     await tester.tap(find.byKey(const Key('plugin-editor-save')));
     await tester.pumpAndSettle();
     expect(find.text('确认保存并尝试启动？'), findsOneWidget);
@@ -335,6 +420,7 @@ void main() {
     expect(body['command'], 'python');
     expect(body['args'], <String>['demo.py', '--flag']);
     expect(body['env'], <String, String>{'A': '1', 'B': 'x=y'});
+    expect(body['description'], '把工具公告转发给队友');
     expect(body['scope'], <String, String>{'session_id': 's1'});
     expect(body['granularity'], 'team');
     expect(body['enabled'], isTrue);

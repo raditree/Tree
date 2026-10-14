@@ -1,0 +1,568 @@
+// 插件 / 站点**详情页**的 widget 用例：卡片点进去能看到什么、写操作发的是什么请求。
+//
+// 这一层锁的是"界面上讲的话"与"界面发出去的形状"：
+// - 插件页只读（介绍、工具、它建的/它订阅的站点），所以断言的是渲染而不是请求；
+// - 站点页有写操作，所以断言的是 **PATCH / POST 的 body 形状**（禁用订阅者发的是
+//   `disabled: true` 而不是"退订"；改配置发的类型不能把 int 变成 "8"）；
+// 核心侧的落盘与判定规则由 packages/tree_core/test/plugin_api_test.dart 锁住。
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:tree/io/plugin_monitor_service.dart';
+import 'package:tree/ui/widgets/plugin_detail_page.dart';
+import 'package:tree/ui/widgets/plugin_panel.dart';
+
+/// 假的管理接口：记录调用流水，站点详情返回可替换的 describe() 形状。
+class _FakeAdmin implements PluginAdminClient {
+  _FakeAdmin({required this.stationResponses});
+
+  /// stationId → 详情返回体；缺失的 id 表示"核心说这个站点不存在"。
+  final Map<String, Map<String, dynamic>> stationResponses;
+
+  final List<String> calls = <String>[];
+  Map<String, dynamic>? lastStationPatch;
+  String failRead = '';
+  String failWrite = '';
+
+  static Map<String, dynamic> _configs() => <String, dynamic>{
+    'path': 'C:/data/config/plugins.yaml',
+    'configs': <dynamic>[
+      <String, dynamic>{
+        'id': 'demo',
+        'name': '演示插件',
+        'description': '把工具公告转发给队友，并把执行结果收回来',
+        'command': 'python',
+        'args': <String>['demo.py'],
+        'enabled': true,
+        'granularity': 'team',
+        'scope': <String, dynamic>{'team_id': 't1'},
+      },
+    ],
+    'runtime': <String, dynamic>{
+      'demo': <String, dynamic>{'running': true, 'health': 'ok', 'known': true},
+    },
+  };
+
+  static Map<String, dynamic> _builtins() => <String, dynamic>{
+    'builtins': <dynamic>[
+      <String, dynamic>{
+        'id': 'sample',
+        'name': '示例插件',
+        'description': '核心自带的示例插件（Python）',
+        'enabled': true,
+        'configured': false,
+        'resolution': <String, dynamic>{
+          'ok': false,
+          'error': '本机没装 Python',
+        },
+      },
+    ],
+  };
+
+  @override
+  Future<Map<String, dynamic>> fetchConfigs() async => _configs();
+
+  @override
+  Future<Map<String, dynamic>> fetchBuiltins({bool refresh = false}) async =>
+      _builtins();
+
+  @override
+  Future<Map<String, dynamic>> createConfig(Map<String, dynamic> body) async =>
+      <String, dynamic>{'ok': true};
+
+  @override
+  Future<Map<String, dynamic>> updateConfig(
+    String id,
+    Map<String, dynamic> patch,
+  ) async => <String, dynamic>{'ok': true};
+
+  @override
+  Future<Map<String, dynamic>> deleteConfig(String id) async =>
+      <String, dynamic>{'ok': true};
+
+  @override
+  Future<Map<String, dynamic>> restartConfig(String id) async =>
+      <String, dynamic>{'ok': true};
+
+  @override
+  Future<Map<String, dynamic>> setBuiltinEnabled(
+    String id, {
+    required bool enabled,
+  }) async => <String, dynamic>{'ok': true};
+
+  @override
+  Future<Map<String, dynamic>> stationDetail(String stationId) async {
+    calls.add('detail:$stationId');
+    if (failRead.isNotEmpty) throw Exception(failRead);
+    final Map<String, dynamic>? body = stationResponses[stationId];
+    if (body == null) {
+      throw Exception('站点不存在：$stationId');
+    }
+    return body;
+  }
+
+  @override
+  Future<Map<String, dynamic>> patchStationConfig(
+    String stationId,
+    Map<String, dynamic> patch,
+  ) async {
+    calls.add('patch:$stationId');
+    lastStationPatch = patch;
+    if (failWrite.isNotEmpty) throw Exception(failWrite);
+    return stationResponses[stationId]!;
+  }
+
+  @override
+  Future<Map<String, dynamic>> setSubscriberDisabled(
+    String stationId,
+    String subscriberKey, {
+    required bool disabled,
+  }) async {
+    calls.add('sub:$stationId|$subscriberKey|disabled=$disabled');
+    if (failWrite.isNotEmpty) throw Exception(failWrite);
+    return stationResponses[stationId]!;
+  }
+}
+
+/// 自建站详情（字段形状 = 核心 `StationInstance.describe()`）。
+Map<String, dynamic> _selfBuiltStation() => <String, dynamic>{
+  'station_id': 'plugin.demo.relay.audit',
+  'kind': 'relay',
+  'kind_label': '中转站',
+  'description': '把公告按 team 再分发一次',
+  'readme': '自建中转站：收到公告后单向改写再投递，白名单内的插件都能触发它。',
+  'scope': <String, dynamic>{},
+  'builtin': false,
+  'max_subscriptions': 8,
+  'shared': true,
+  'allowed_plugins': <String>['sample'],
+  'config': <String, dynamic>{'route': 'audit', 'route_limit': 8},
+  'subscriber_count': 2,
+  'subscriptions': <dynamic>[
+    <String, dynamic>{
+      'subscriber': 'demo|',
+      'plugin_id': 'demo',
+      'granularity': 'team',
+      'scope': <String, dynamic>{},
+      'disabled': false,
+    },
+    <String, dynamic>{
+      'subscriber': 'sample|t1|||local',
+      'plugin_id': 'sample',
+      'granularity': 'team',
+      'scope': <String, dynamic>{'team_id': 't1', 'mode_key': 'local'},
+      'disabled': true,
+    },
+  ],
+  'subscribers_by_team': <String, dynamic>{'t1': 1},
+  'counts': <String, dynamic>{'requests': 3, 'skipped_disabled': 1},
+  'gauges': <String, dynamic>{'waits_in_flight': 0},
+};
+
+/// 内置站详情：**只有可订阅数量能改**（介绍与配置在核心的点位表里）。
+Map<String, dynamic> _builtinStation() => <String, dynamic>{
+  'station_id': 'system.broadcast',
+  'kind': 'broadcast',
+  'kind_label': '广播站',
+  'description': '把工具公告投递给订阅者',
+  'readme': '内置广播站：全局唯一一个点位。',
+  'scope': <String, dynamic>{},
+  'builtin': true,
+  'max_subscriptions': 32,
+  'config': <String, dynamic>{'fanout': 'team'},
+  'subscriber_count': 1,
+  'subscriptions': <dynamic>[
+    <String, dynamic>{
+      'subscriber': 'demo|t1',
+      'plugin_id': 'demo',
+      'granularity': 'team',
+      'scope': <String, dynamic>{'team_id': 't1'},
+      'disabled': false,
+    },
+  ],
+  'counts': <String, dynamic>{'requests': 5},
+  'gauges': <String, dynamic>{'waits_in_flight': 1},
+};
+
+Map<String, dynamic> _snapshot() => <String, dynamic>{
+  'enabled': true,
+  'instances': <dynamic>[
+    <String, dynamic>{
+      'plugin_id': 'demo',
+      'name': '演示插件',
+      'description': '把工具公告转发给队友，并把执行结果收回来',
+      'status': 'registered',
+      'granularity': 'team',
+      'health': 'ok',
+      'last_heartbeat': 0,
+      'tools': <dynamic>[
+        <String, dynamic>{'name': 'demo.echo', 'description': '回显一句话'},
+        <String, dynamic>{'name': 'demo.collect'},
+      ],
+    },
+  ],
+  'stations': <dynamic>[
+    _selfBuiltStation(),
+    _builtinStation(),
+  ],
+  'config': <String, dynamic>{'path': 'C:/data/config/plugins.yaml'},
+};
+
+Future<PluginMonitorService> _service() async {
+  final PluginMonitorService svc = PluginMonitorService.forTesting();
+  svc.snapshotFetcher = ({String? teamId}) async => _snapshot();
+  await svc.refresh();
+  return svc;
+}
+
+Future<void> _pump(
+  WidgetTester tester, {
+  required PluginMonitorService svc,
+  required _FakeAdmin admin,
+}) async {
+  tester.view.physicalSize = const Size(1000, 2200);
+  tester.view.devicePixelRatio = 1.0;
+  addTearDown(tester.view.reset);
+  await tester.pumpWidget(
+    MaterialApp(
+      home: Scaffold(
+        body: SizedBox(
+          height: 2200,
+          width: 1000,
+          child: PluginPanel(service: svc, admin: admin, showHeader: false),
+        ),
+      ),
+    ),
+  );
+  await tester.pumpAndSettle();
+}
+
+void main() {
+  testWidgets('点自定义插件卡片进详情页：介绍、工具、它建的与它订阅的站点', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{
+        'plugin.demo.relay.audit': _selfBuiltStation(),
+        'system.broadcast': _builtinStation(),
+      },
+    );
+    await _pump(tester, svc: await _service(), admin: admin);
+
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-demo')));
+    await tester.pumpAndSettle();
+
+    // 介绍（清单里那句 description，卡片上只显示一行，详情页给全文）
+    expect(
+      find.textContaining('把工具公告转发给队友，并把执行结果收回来'),
+      findsWidgets,
+    );
+    // 基本信息
+    expect(find.text('基本信息'), findsOneWidget);
+    expect(find.textContaining('python demo.py'), findsOneWidget);
+    expect(find.textContaining('team_id=t1'), findsWidgets);
+    // 详情页里不能出现"内置"归属（卡片列表在路由下方，所以按详情页范围查）
+    final Finder detail = find.byType(PluginDetailPage);
+    expect(
+      find.descendant(of: detail, matching: find.text('内置插件')),
+      findsNothing,
+      reason: '这一项是自定义插件',
+    );
+    expect(find.descendant(of: detail, matching: find.text('自定义插件')), findsOneWidget);
+    // 工具表（按插件对账的运行态，两条都在）
+    expect(find.text('提供的工具（2）'), findsOneWidget);
+    expect(find.text('demo.echo'), findsOneWidget);
+    expect(find.text('回显一句话'), findsOneWidget);
+    // 它建的站点 / 它订阅的站点：audit 这条既是 demo 建的、也被 demo 订阅 ⇒ 两个区块各列一次；
+    // demo 还订阅了内置广播站 ⇒ 订阅那一栏是 2 条。全部限定在详情页内（面板还在路由下方）。
+    expect(find.descendant(of: detail, matching: find.text('它建的站点（1）')), findsOneWidget);
+    expect(find.descendant(of: detail, matching: find.text('它订阅的站点（2）')), findsOneWidget);
+    expect(
+      find.descendant(of: detail, matching: find.text('plugin.demo.relay.audit')),
+      findsNWidgets(2),
+    );
+    expect(find.descendant(of: detail, matching: find.text('system.broadcast')), findsOneWidget);
+    expect(
+      find.text('这个插件没有写介绍。点卡片上的「编辑」，在「介绍」里补一段（落盘 plugins.yaml 的 description）。'),
+      findsNothing,
+    );
+  });
+
+  testWidgets('点内置卡片进详情页：没有落盘条目也要讲清介绍与运行时', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    );
+    await _pump(tester, svc: await _service(), admin: admin);
+
+    await tester.tap(find.byKey(const Key('plugin-detail-builtin-sample')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('核心自带的示例插件（Python）'), findsWidgets);
+    expect(find.text('归属'), findsOneWidget);
+    expect(find.text('内置插件'), findsOneWidget);
+    // 运行时没就绪：详情必须显示核心给的原因（不显示就等于骗用户"能跑"）
+    expect(find.text('内置运行时'), findsOneWidget);
+    expect(find.textContaining('运行时未就绪：本机没装 Python'), findsOneWidget);
+    // 没有运行实例 ⇒ 不假装有能力
+    expect(find.text('提供的工具（0）'), findsOneWidget);
+    expect(find.textContaining('未提供工具'), findsOneWidget);
+  });
+
+  testWidgets('卡片上的开关不会误跳详情页（点开关 = 只发开关请求）', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    );
+    await _pump(tester, svc: await _service(), admin: admin);
+
+    await tester.tap(find.byKey(const Key('plugin-switch-custom-demo')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('基本信息'), findsNothing, reason: '点开关不该跳到详情页');
+    expect(find.text('提供的工具（2）'), findsNothing);
+  });
+
+  testWidgets('点站点卡片进详情页：介绍 + 可订阅数量 + 订阅管理 + 其他', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{
+        'plugin.demo.relay.audit': _selfBuiltStation(),
+        'system.broadcast': _builtinStation(),
+      },
+    );
+    await _pump(tester, svc: await _service(), admin: admin);
+
+    await tester.tap(find.byKey(const Key('station-detail-plugin.demo.relay.audit')));
+    await tester.pumpAndSettle();
+
+    // 详情页一定去 GET 一次（卡片那份是节流的快照，写操作要落在当前真值上）
+    expect(admin.calls, contains('detail:plugin.demo.relay.audit'));
+    // 介绍 = readme（不是那一行 description）
+    expect(find.textContaining('自建中转站：收到公告后单向改写再投递'), findsOneWidget);
+    expect(find.text('站点介绍'), findsOneWidget);
+    // 可订阅插件数量
+    expect(find.text('站点可订阅插件数量'), findsOneWidget);
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const Key('station-detail-max')))
+          .controller!
+          .text,
+      '8',
+    );
+    expect(find.textContaining('2 个订阅者（其中 1 个已禁用）'), findsOneWidget);
+    // 已订阅插件管理：两条订阅都在（禁用的那条不消失）
+    expect(find.text('已订阅插件管理（2）'), findsOneWidget);
+    expect(find.text('已禁用'), findsOneWidget);
+    expect(find.text('投递中'), findsOneWidget);
+    expect(
+      find.byKey(const Key('station-detail-sub-sample|t1|||local')),
+      findsOneWidget,
+    );
+    // 其他（站点自定义配置）：两个键都能改
+    expect(find.text('其他（站点自定义配置）'), findsOneWidget);
+    expect(
+      tester
+          .widget<TextField>(
+            find.byKey(const Key('station-detail-config-route')),
+          )
+          .controller!
+          .text,
+      'audit',
+    );
+    expect(find.byKey(const Key('station-detail-save-config')), findsOneWidget);
+    // 跨插件共享（白名单）
+    expect(find.textContaining('限白名单：sample'), findsOneWidget);
+  });
+
+  testWidgets('禁用订阅者：发的是 disabled=true（禁用不是退订）', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{
+        'plugin.demo.relay.audit': _selfBuiltStation(),
+        'system.broadcast': _builtinStation(),
+      },
+    );
+    await _pump(tester, svc: await _service(), admin: admin);
+    await tester.tap(find.byKey(const Key('station-detail-plugin.demo.relay.audit')));
+    await tester.pumpAndSettle();
+
+    // 未禁用那条（demo|）：关掉 ⇒ disabled: true
+    await tester.tap(find.byKey(const Key('station-detail-sub-demo|')));
+    await tester.pumpAndSettle();
+    expect(
+      admin.calls,
+      contains('sub:plugin.demo.relay.audit|demo||disabled=true'),
+    );
+
+    // 已禁用那条（sample|t1|||local）：打开 ⇒ disabled: false（恢复投递）
+    await tester.tap(
+      find.byKey(const Key('station-detail-sub-sample|t1|||local')),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      admin.calls,
+      contains('sub:plugin.demo.relay.audit|sample|t1|||local|disabled=false'),
+    );
+    // 列表没有因为禁用而少一条
+    expect(find.text('已订阅插件管理（2）'), findsOneWidget);
+  });
+
+  testWidgets('可订阅数量：整数写回；非整数被拦住且不发请求', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{
+        'plugin.demo.relay.audit': _selfBuiltStation(),
+        'system.broadcast': _builtinStation(),
+      },
+    );
+    await _pump(tester, svc: await _service(), admin: admin);
+    await tester.tap(find.byKey(const Key('station-detail-plugin.demo.relay.audit')));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(find.byKey(const Key('station-detail-max')), 'abc');
+    await tester.tap(find.byKey(const Key('station-detail-save-max')));
+    await tester.pumpAndSettle();
+    expect(admin.calls, isNot(contains('patch:plugin.demo.relay.audit')));
+    expect(find.textContaining('要写整数'), findsOneWidget);
+
+    await tester.enterText(find.byKey(const Key('station-detail-max')), '0');
+    await tester.tap(find.byKey(const Key('station-detail-save-max')));
+    await tester.pumpAndSettle();
+    expect(admin.lastStationPatch, <String, dynamic>{'max_subscriptions': 0});
+  });
+
+  testWidgets('改站点自定义配置：没动的键保持原类型，动过的按字面量重识别', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{
+        'plugin.demo.relay.audit': _selfBuiltStation(),
+        'system.broadcast': _builtinStation(),
+      },
+    );
+    await _pump(tester, svc: await _service(), admin: admin);
+    await tester.tap(find.byKey(const Key('station-detail-plugin.demo.relay.audit')));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(find.byKey(const Key('station-detail-config-route_limit')), '12');
+    await tester.enterText(find.byKey(const Key('station-detail-config-route')), 'audit2');
+    await tester.tap(find.byKey(const Key('station-detail-save-config')));
+    await tester.pumpAndSettle();
+
+    final Map<String, dynamic> config =
+        admin.lastStationPatch!['config'] as Map<String, dynamic>;
+    expect(config['route_limit'], 12, reason: '数字不能被发成字符串（插件按 int 读它就会静默失效）');
+    expect(config['route'], 'audit2');
+  });
+
+  testWidgets('删配置项与加配置项都发**整个 config**（核心是整体替换语义）', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{
+        'plugin.demo.relay.audit': _selfBuiltStation(),
+        'system.broadcast': _builtinStation(),
+      },
+    );
+    await _pump(tester, svc: await _service(), admin: admin);
+    await tester.tap(find.byKey(const Key('station-detail-plugin.demo.relay.audit')));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('station-detail-remove-route')));
+    await tester.pumpAndSettle();
+    Map<String, dynamic> config =
+        admin.lastStationPatch!['config'] as Map<String, dynamic>;
+    expect(config.containsKey('route'), isFalse);
+    expect(config['route_limit'], 8, reason: '没动的键要原样带上（否则等于顺手删了别人的配置）');
+
+    await tester.enterText(find.byKey(const Key('station-detail-new-key')), 'topic_prefix');
+    await tester.enterText(find.byKey(const Key('station-detail-new-value')), 'audit.');
+    await tester.tap(find.byKey(const Key('station-detail-add-config')));
+    await tester.pumpAndSettle();
+    config = admin.lastStationPatch!['config'] as Map<String, dynamic>;
+    expect(config['topic_prefix'], 'audit.');
+  });
+
+  testWidgets('内置站点：只有可订阅数量能改，介绍与配置只读并写明原因', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{
+        'plugin.demo.relay.audit': _selfBuiltStation(),
+        'system.broadcast': _builtinStation(),
+      },
+    );
+    await _pump(tester, svc: await _service(), admin: admin);
+    await tester.tap(find.byKey(const Key('station-detail-system.broadcast')));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('内置广播站：全局唯一一个点位。'), findsOneWidget);
+    expect(find.text('插件自建站'), findsNothing);
+    // 上限照常能改
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const Key('station-detail-max')))
+          .controller!
+          .text,
+      '32',
+    );
+    // 配置区只读：没有保存按钮、没有输入框，且说清为什么
+    expect(find.byKey(const Key('station-detail-save-config')), findsNothing);
+    expect(find.byKey(const Key('station-detail-config-fanout')), findsNothing);
+    expect(find.textContaining('内置站点的介绍与自定义配置在核心的点位表里'), findsOneWidget);
+  });
+
+  testWidgets('站点详情读不到（有快照那份）：顶部红条写明失败，不假装是当前真值', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{
+        'plugin.demo.relay.audit': _selfBuiltStation(),
+        'system.broadcast': _builtinStation(),
+      },
+    );
+    await _pump(tester, svc: await _service(), admin: admin);
+    // 卡片来自快照，但核心这边这个站点已经不在了（例如插件注销了自建站）
+    admin.stationResponses.remove('plugin.demo.relay.audit');
+    await tester.tap(find.byKey(const Key('station-detail-plugin.demo.relay.audit')));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('站点详情刷新失败：站点不存在'), findsOneWidget);
+    expect(find.textContaining('下方为最近一次数据'), findsOneWidget);
+  });
+
+  testWidgets('站点详情完全读不到（没有快照那份）：说清原因 + 给重试，不渲染空白详情页', (WidgetTester tester) async {
+    tester.view.physicalSize = const Size(900, 900);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: StationDetailPage(
+          stationId: 'plugin.demo.relay.gone',
+          admin: admin,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(
+      find.textContaining('读不到站点 plugin.demo.relay.gone：站点不存在'),
+      findsOneWidget,
+    );
+    expect(find.byKey(const Key('station-detail-retry')), findsOneWidget);
+    expect(find.text('站点介绍'), findsNothing, reason: '不能拿空数据渲染一张空白详情页');
+
+    // 重试真的再读一次（不是把错误条藏起来）
+    admin.stationResponses['plugin.demo.relay.gone'] = _selfBuiltStation();
+    await tester.tap(find.byKey(const Key('station-detail-retry')));
+    await tester.pumpAndSettle();
+    expect(find.text('站点介绍'), findsOneWidget);
+    expect(admin.calls, contains('detail:plugin.demo.relay.gone'));
+  });
+
+  testWidgets('写操作被核心拒绝：原因原样显示（不把 400 咽掉）', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{
+        'plugin.demo.relay.audit': _selfBuiltStation(),
+        'system.broadcast': _builtinStation(),
+      },
+    );
+    await _pump(tester, svc: await _service(), admin: admin);
+    await tester.tap(find.byKey(const Key('station-detail-plugin.demo.relay.audit')));
+    await tester.pumpAndSettle();
+
+    admin.failWrite = '内置站点 system.broadcast 不提供修改 readme：界面上可改的只有「可订阅插件数量」';
+    await tester.enterText(find.byKey(const Key('station-detail-max')), '4');
+    await tester.tap(find.byKey(const Key('station-detail-save-max')));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('操作失败：内置站点'), findsOneWidget);
+  });
+}

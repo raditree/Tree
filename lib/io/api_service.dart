@@ -1015,9 +1015,13 @@ class ApiService {
   /// 正常情况下写入即生效；只有对账失败（启动失败、YAML 读不动等）才会是
   /// 「配置已保存，但本次热应用失败，重启核心后生效」——不显示就等于骗用户
   /// "已经生效了"。
+  ///
+  /// [description] = 插件**介绍**（面板详情页读它）。刻意放在清单配置而不是协议握手：
+  /// 启动失败的插件更需要有介绍，而 `initialize` 只在连上之后才有。留空 ⇒ 核心不落这一键。
   static Future<Map<String, dynamic>> createPluginConfig({
     required String id,
     required String name,
+    String description = '',
     required String command,
     List<String> args = const <String>[],
     Map<String, String> env = const <String, String>{},
@@ -1030,6 +1034,7 @@ class ApiService {
       body: <String, dynamic>{
         'id': id,
         'name': name,
+        'description': description,
         'command': command,
         'args': args,
         'env': env,
@@ -1097,7 +1102,7 @@ class ApiService {
     );
   }
 
-  /// 站点详情：GET /api/plugin/stations/{stationId}
+  /// 站点详情：GET [ApiPaths.pluginStation]
   ///
   /// 返回 `StationInstance.describe()` 一整块：`readme`（站点介绍）、`max_subscriptions`
   /// （可订阅插件数量）、`shared` / `allowed_plugins`（共享声明）、`config`（站点自定义
@@ -1105,10 +1110,12 @@ class ApiService {
   /// 站点不存在时核心回 404 + 可读原因（抛中文异常，不给空对象）。
   static Future<Map<String, dynamic>> getStationDetail(String stationId) async {
     final String encoded = Uri.encodeComponent(stationId.trim());
-    return _getJson('/api/plugin/stations/$encoded');
+    return _getJson(
+      ApiPaths.pluginStation.replaceFirst('{stationId}', encoded),
+    );
   }
 
-  /// 改站点配置（**局部**：只发要改的键）：PATCH /api/plugin/stations/{id}/config
+  /// 改站点配置（**局部**：只发要改的键）：PATCH [ApiPaths.pluginStationConfig]
   ///
   /// 能改什么按「内置 / 自建」分开：`max_subscriptions` 都能改；`readme` / `config` /
   /// `shared` / `allowed_plugins` 只有插件自建站能改。成功返回**改后的完整详情**
@@ -1118,10 +1125,13 @@ class ApiService {
     Map<String, dynamic> patch,
   ) async {
     final String encoded = Uri.encodeComponent(stationId.trim());
-    return _patchJson('/api/plugin/stations/$encoded/config', body: patch);
+    return _patchJson(
+      ApiPaths.pluginStationConfig.replaceFirst('{stationId}', encoded),
+      body: patch,
+    );
   }
 
-  /// 禁用 / 启用一个订阅者：POST /api/plugin/stations/{id}/subscribers/{key}
+  /// 禁用 / 启用一个订阅者：POST [ApiPaths.pluginStationSubscriber]
   ///
   /// [subscriberKey] 取自站点详情 `subscriptions[].subscriber`（形如 `plugin_id|scope`）。
   /// **禁用不是退订**：订阅关系保留，只让触发时不投递；返回改后的完整详情。
@@ -1133,7 +1143,9 @@ class ApiService {
     final String station = Uri.encodeComponent(stationId.trim());
     final String sub = Uri.encodeComponent(subscriberKey.trim());
     return _postJson(
-      '/api/plugin/stations/$station/subscribers/$sub',
+      ApiPaths.pluginStationSubscriber
+          .replaceFirst('{stationId}', station)
+          .replaceFirst('{subscriberKey}', sub),
       body: <String, dynamic>{'disabled': disabled},
     );
   }

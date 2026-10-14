@@ -82,6 +82,26 @@ class _FakeCore {
           <String, dynamic>{'id': 'sample', 'enabled': false},
         ],
       };
+    } else if (path.startsWith('/api/plugin/stations/')) {
+      // 站点三端点成功时**直接回 describe() 整块**（没有 ok 包装）：
+      // 前端拿它复用快照那套解析器，这里形状只要和契约一致就行。
+      payload = <String, dynamic>{
+        'station_id': 'plugin.demo.relay.audit',
+        'kind': 'relay',
+        'builtin': false,
+        'readme': '自建中转站：白名单内的插件都能触发它。',
+        'max_subscriptions': 8,
+        'shared': true,
+        'allowed_plugins': <String>['sample'],
+        'config': <String, dynamic>{'route': 'audit'},
+        'subscriptions': <dynamic>[
+          <String, dynamic>{
+            'subscriber': 'sample|t1',
+            'plugin_id': 'sample',
+            'disabled': true,
+          },
+        ],
+      };
     } else if (path.startsWith('/api/plugin')) {
       // 单条操作（PATCH / DELETE / restart / builtins 开关）统一回成功体
       payload = <String, dynamic>{
@@ -137,6 +157,7 @@ void main() {
     final Map<String, dynamic> result = await ApiService.createPluginConfig(
       id: 'demo',
       name: '演示',
+      description: '把工具公告转发给队友',
       command: 'python',
       args: <String>['demo.py', '--x'],
       env: <String, String>{'A': '1'},
@@ -156,6 +177,8 @@ void main() {
     expect(request.body, <String, dynamic>{
       'id': 'demo',
       'name': '演示',
+      // 介绍：详情页正文读的就是这里（插件自己那份 description 走 yaml，见核心用例）
+      'description': '把工具公告转发给队友',
       'command': 'python',
       'args': <String>['demo.py', '--x'],
       'env': <String, String>{'A': '1'},
@@ -212,5 +235,53 @@ void main() {
         ),
       ),
     );
+  });
+
+  test('站点详情 / 改配置 / 禁用订阅者：路径带转义，订阅者键位里的 | 必须编码', () async {
+    final Map<String, dynamic> detail = await ApiService.getStationDetail(
+      'plugin.demo.relay.audit',
+    );
+    expect(core.requests.last.method, 'GET');
+    expect(
+      core.requests.last.path,
+      ApiPaths.pluginStation.replaceAll(
+        '{stationId}',
+        'plugin.demo.relay.audit',
+      ),
+      reason: '路径模板集中在 ApiPaths，前端不得自己拼',
+    );
+    // 详情页读的就是这几块：介绍 / 可订阅数量 / 共享声明 / 自定义配置 / 订阅者
+    expect(detail['readme'], '自建中转站：白名单内的插件都能触发它。');
+    expect(detail['max_subscriptions'], 8);
+    expect(detail['shared'], isTrue);
+    expect((detail['subscriptions'] as List<dynamic>).single['disabled'], isTrue);
+
+    await ApiService.updateStationConfig('plugin.demo.relay.audit', <String, dynamic>{
+      'max_subscriptions': 12,
+      'config': <String, dynamic>{'route': 'audit', 'route_limit': 12},
+    });
+    expect(core.requests.last.method, 'PATCH');
+    expect(
+      core.requests.last.path,
+      ApiPaths.pluginStationConfig.replaceAll(
+        '{stationId}',
+        'plugin.demo.relay.audit',
+      ),
+    );
+    expect(core.requests.last.body['max_subscriptions'], 12);
+
+    // 键位形如 `plugin_id|scope`：`|` 与站点 id 里的空格都必须在 URL 层转义，
+    // 否则核心按路径段解码后比对不上（它拿到的是原样字符串）。
+    await ApiService.setStationSubscriberDisabled(
+      'a b',
+      'sample|t1',
+      disabled: false,
+    );
+    expect(core.requests.last.method, 'POST');
+    expect(
+      core.requests.last.path,
+      '/api/plugin/stations/a%20b/subscribers/sample%7Ct1',
+    );
+    expect(core.requests.last.body, <String, dynamic>{'disabled': false});
   });
 }
