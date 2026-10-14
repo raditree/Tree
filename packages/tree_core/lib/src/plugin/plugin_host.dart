@@ -640,6 +640,7 @@ class PluginConfig {
     required this.id,
     required this.command,
     this.name = '',
+    this.description = '',
     List<String>? args,
     Map<String, String>? env,
     this.enabled = true,
@@ -651,6 +652,14 @@ class PluginConfig {
 
   final String id;
   final String name;
+
+  /// 插件**介绍**（一行文本，写在 plugins.yaml）。
+  ///
+  /// 为什么要在配置里而不是在协议握手里：面板要能在插件**没启动**时也讲得出它是谁
+  /// （启动失败的卡片点开详情页更需要说明），而 `initialize` 只在连上之后才有。
+  /// 空串 = 未提供，展示层给占位文案（不拿 id 当介绍）。
+  final String description;
+
   final String command;
   final List<String> args;
   final Map<String, String> env;
@@ -665,6 +674,7 @@ class PluginConfig {
   Map<String, dynamic> toJson() => <String, dynamic>{
     'id': id,
     'name': name,
+    'description': description,
     'command': command,
     'args': args,
     'env': env,
@@ -677,6 +687,7 @@ class PluginConfig {
   Map<String, dynamic> toApiJson() => <String, dynamic>{
     'plugin_id': id,
     'name': name,
+    'description': description,
     'command': command,
     'args': args,
     'enabled': enabled,
@@ -686,6 +697,7 @@ class PluginConfig {
   static PluginConfig fromJson(Map<String, dynamic> json) => PluginConfig(
     id: (json['id'] ?? json['plugin_id'] ?? '').toString(),
     name: (json['name'] ?? '').toString(),
+    description: (json['description'] ?? '').toString(),
     command: (json['command'] ?? '').toString(),
     args:
         (json['args'] as List<dynamic>?)

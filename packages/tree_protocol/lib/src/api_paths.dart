@@ -152,6 +152,32 @@ abstract final class ApiPaths {
   /// 面板显示「已停用」而不是让这一项消失。
   static const String pluginBuiltinDisable =
       '/api/plugin/builtins/{pluginId}/disable';
+
+  /// 单个站点的**详情**（GET）：介绍 + 可订阅上限 + 共享声明 + 自定义配置 +
+  /// 订阅者列表（含禁用态）。
+  ///
+  /// 与 [pluginSnapshot] 的 `stations` 段**同一个数据源**（`StationInstance.describe()`），
+  /// 这里只是按 id 取一条——站点全局唯一，不按 team 过滤（口径见 StationHub.snapshot）。
+  static const String pluginStation = '/api/plugin/stations/{stationId}';
+
+  /// 改站点配置（PATCH，**局部更新**：只发要改的键）。
+  ///
+  /// 能改什么按「内置 / 自建」分开（实现与理由见 `StationHub.updateConfig`）：
+  /// - `max_subscriptions`（可订阅插件数量）：内置与自建都能改；
+  /// - `readme` / `config` / `shared` / `allowed_plugins`：只有插件自建站能改，
+  ///   内置点位的这些定义在核心的点位表里，改它 = 把行为从代码挪到盘上 ⇒ 400 + 可读原因。
+  static const String pluginStationConfig =
+      '/api/plugin/stations/{stationId}/config';
+
+  /// 禁用 / 启用某个订阅者（POST，body `{disabled: bool}`）。
+  ///
+  /// **不是退订**：订阅关系与回包通道都保留，只让触发时不投递，并且每条触发都在
+  /// 返回值里显式回报跳过原因（`skipped` + 计数 `skipped_disabled`），不静默。
+  /// [subscriberKey] 形如 `plugin_id|scope`，取自站点详情的 `subscriptions[].subscriber`；
+  /// 里面带 `|`，客户端必须 `Uri.encodeComponent`（核心按路径段解码后原样比对）。
+  static const String pluginStationSubscriber =
+      '/api/plugin/stations/{stationId}/subscribers/{subscriberKey}';
+
   static const String mcpServices = '/api/mcp/services';
   static const String mcpService = '/api/mcp/services/{name}';
 
@@ -243,6 +269,9 @@ abstract final class ApiPaths {
     pluginBuiltins,
     pluginBuiltinEnable,
     pluginBuiltinDisable,
+    pluginStation,
+    pluginStationConfig,
+    pluginStationSubscriber,
     mcpServices,
     mcpService,
     toolsRunning,

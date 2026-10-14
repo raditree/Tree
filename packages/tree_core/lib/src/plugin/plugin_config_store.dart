@@ -52,6 +52,7 @@ class PluginConfigStore {
   static const List<String> canonicalFields = <String>[
     'id',
     'name',
+    'description',
     'command',
     'args',
     'env',
@@ -311,6 +312,11 @@ class PluginConfigStore {
     final Map<String, dynamic> out = <String, dynamic>{};
     out['id'] = (src['id'] ?? '').toString().trim();
     out['name'] = (src['name'] ?? '').toString();
+    // 插件介绍（面板的「插件详情页」读它）：一行文本，由插件作者写在 plugins.yaml。
+    // **空串不写这一键**（而不是落一个 description: ""）：存量为空时不让全表多一行噪声，
+    // 也让「把介绍清掉」真的是把键删掉；展示层对缺失给占位文案，不拿 id 当介绍。
+    final String description = (src['description'] ?? '').toString();
+    if (description.isNotEmpty) out['description'] = description;
     out['command'] = (src['command'] ?? '').toString();
     final Object? rawArgs = src['args'];
     out['args'] = rawArgs is List

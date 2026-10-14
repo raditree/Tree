@@ -1097,6 +1097,47 @@ class ApiService {
     );
   }
 
+  /// 站点详情：GET /api/plugin/stations/{stationId}
+  ///
+  /// 返回 `StationInstance.describe()` 一整块：`readme`（站点介绍）、`max_subscriptions`
+  /// （可订阅插件数量）、`shared` / `allowed_plugins`（共享声明）、`config`（站点自定义
+  /// 配置）、`subscriptions`（订阅者，每项带 `subscriber` 键位与 `disabled`）。
+  /// 站点不存在时核心回 404 + 可读原因（抛中文异常，不给空对象）。
+  static Future<Map<String, dynamic>> getStationDetail(String stationId) async {
+    final String encoded = Uri.encodeComponent(stationId.trim());
+    return _getJson('/api/plugin/stations/$encoded');
+  }
+
+  /// 改站点配置（**局部**：只发要改的键）：PATCH /api/plugin/stations/{id}/config
+  ///
+  /// 能改什么按「内置 / 自建」分开：`max_subscriptions` 都能改；`readme` / `config` /
+  /// `shared` / `allowed_plugins` 只有插件自建站能改。成功返回**改后的完整详情**
+  /// （直接拿去刷新页面，不用再 GET 一次）；被拒时核心回 400 + 原因（抛中文异常）。
+  static Future<Map<String, dynamic>> updateStationConfig(
+    String stationId,
+    Map<String, dynamic> patch,
+  ) async {
+    final String encoded = Uri.encodeComponent(stationId.trim());
+    return _patchJson('/api/plugin/stations/$encoded/config', body: patch);
+  }
+
+  /// 禁用 / 启用一个订阅者：POST /api/plugin/stations/{id}/subscribers/{key}
+  ///
+  /// [subscriberKey] 取自站点详情 `subscriptions[].subscriber`（形如 `plugin_id|scope`）。
+  /// **禁用不是退订**：订阅关系保留，只让触发时不投递；返回改后的完整详情。
+  static Future<Map<String, dynamic>> setStationSubscriberDisabled(
+    String stationId,
+    String subscriberKey, {
+    required bool disabled,
+  }) async {
+    final String station = Uri.encodeComponent(stationId.trim());
+    final String sub = Uri.encodeComponent(subscriberKey.trim());
+    return _postJson(
+      '/api/plugin/stations/$station/subscribers/$sub',
+      body: <String, dynamic>{'disabled': disabled},
+    );
+  }
+
   // ==================== MCP 服务管理接口（右栏 MCP 配置页） ====================
 
   /// 列出已注册的 MCP 服务

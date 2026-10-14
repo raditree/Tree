@@ -7,6 +7,31 @@ import 'websocket_service.dart';
 
 // ==================== 数据模型（宽容解析：缺字段给默认值、坏条目跳过） ====================
 
+/// 插件工具简项（`instances[].tools[]` 单条：名称 + 一行说明）。
+///
+/// 插件详情页要列出“这个插件能给 agent 用什么”，而工具表是总线对账出来的**运行态**
+/// （插件没启动就是空表），所以它跟在实例上而不是配置上。
+class PluginToolBrief {
+  /// 工具名（不含 `plugin__<id>__` 前缀）
+  final String name;
+
+  /// 一行说明（核心未给时为空串，展示层只显名称）
+  final String description;
+
+  const PluginToolBrief({required this.name, this.description = ''});
+
+  /// 宽容解析单条；非 Map / 无名时返回 null（跳过）。
+  static PluginToolBrief? tryParse(Object? raw) {
+    if (raw is! Map) return null;
+    final String name = (raw['name'] ?? '').toString();
+    if (name.isEmpty) return null;
+    return PluginToolBrief(
+      name: name,
+      description: (raw['description'] ?? '').toString(),
+    );
+  }
+}
+
 /// 插件实例信息（快照条目 / `plugin_status` 增量条目）。
 ///
 /// 字段口径见契约 v1.3 §15.1（与后端对齐；M9 起补健康度）：
@@ -22,6 +47,15 @@ class PluginInstanceInfo {
 
   /// 展示名（可能为空串）
   final String name;
+
+  /// 插件**介绍**（plugins.yaml 里的 `description`；空串 = 未提供）。
+  ///
+  /// 详情页的“插件介绍”读它。它来自配置而不是握手，所以**启动失败的插件也有**——
+  /// 那正是最需要说明的时候。
+  final String description;
+
+  /// 当前注册的工具（运行态；未启动 / 旧核心 = 空表）
+  final List<PluginToolBrief> tools;
 
   /// 实例粒度：team / agent / session（未知值原样保留）
   final String granularity;
@@ -66,6 +100,8 @@ class PluginInstanceInfo {
   const PluginInstanceInfo({
     required this.pluginId,
     this.name = '',
+    this.description = '',
+    this.tools = const <PluginToolBrief>[],
     this.granularity = '',
     this.scope = const <String, dynamic>{},
     this.status = '',
@@ -108,9 +144,21 @@ class PluginInstanceInfo {
     final Object? rawHealth = m['health'];
     final Object? rawMissed = m['missed_heartbeats'];
     final Object? rawInterval = m['heartbeat_interval_s'];
+    final List<PluginToolBrief> tools = <PluginToolBrief>[];
+    final Object? rawTools = m['tools'];
+    if (rawTools is List) {
+      for (final Object? item in rawTools) {
+        final PluginToolBrief? tool = PluginToolBrief.tryParse(item);
+        if (tool != null) {
+          tools.add(tool);
+        }
+      }
+    }
     return PluginInstanceInfo(
       pluginId: pluginId,
       name: (m['name'] ?? '').toString(),
+      description: (m['description'] ?? '').toString(),
+      tools: tools,
       granularity: (m['granularity'] ?? '').toString(),
       scope: scope,
       status: (m['status'] ?? '').toString(),
@@ -152,6 +200,10 @@ class PluginInstanceInfo {
     return PluginInstanceInfo(
       pluginId: pluginId,
       name: name ?? this.name,
+      // 介绍与工具是**快照**才带的字段，增量帧里没有 ⇒ 原样保留，
+      // 不能让一次心跳增量把详情页讲空。
+      description: description,
+      tools: tools,
       granularity: granularity,
       scope: scope,
       status: status ?? this.status,
@@ -183,12 +235,18 @@ class PluginStationSub {
   /// 站级等待超时（秒；缺失为 null）
   final double? timeoutS;
 
+  /// 是否被站点所有者**禁用**（true = 订阅关系保留但触发时不投递）。
+  ///
+  /// 旧核心没这个字段 ⇒ false（按“未禁用”展示，不臆测）。
+  final bool disabled;
+
   const PluginStationSub({
     this.subscriber = '',
     this.pluginId = '',
     this.granularity = '',
     this.scope = const <String, dynamic>{},
     this.timeoutS,
+    this.disabled = false,
   });
 
   /// 宽容解析单条订阅；无法使用（非 Map）时返回 null（跳过）。
@@ -209,6 +267,7 @@ class PluginStationSub {
       granularity: (m['granularity'] ?? '').toString(),
       scope: scope,
       timeoutS: rawTimeout is num ? rawTimeout.toDouble() : null,
+      disabled: m['disabled'] == true,
     );
   }
 }
@@ -238,6 +297,22 @@ class PluginStationInfo {
 
   /// 站点说明（核心给的 `description`；缺失为空串）
   final String description;
+
+  /// 站点**详细介绍**（`readme`）：插件自建站必填，内置点位没单独写时核心已回落
+  /// 到 `description`，所以这一项永远可用。面板的「站点详情页」读它。
+  final String readme;
+
+  /// 是否**对外共享**（自建站默认私有；true = 别的插件可按 `allowed_plugins` 订阅与触发）
+  final bool shared;
+
+  /// 共享白名单（**空 = 所有插件都能用**；只在 [shared] 为 true 时参与判定）
+  final List<String> allowedPlugins;
+
+  /// 站点**自定义配置**（由建站一方定义字段；面板「其他」区展示与编辑）
+  final Map<String, dynamic> config;
+
+  /// 可订阅插件数量上限（`max_subscriptions`；旧核心缺失为 null = 未知）
+  final int? maxSubscriptions;
 
   /// 站点绑定的 scope（team_id / mode_key 是关键维度；缺失字段展示层视为空串）
   final Map<String, dynamic> scope;
@@ -270,6 +345,11 @@ class PluginStationInfo {
     this.kind = '',
     this.kindLabel = '',
     this.description = '',
+    this.readme = '',
+    this.shared = false,
+    this.allowedPlugins = const <String>[],
+    this.config = const <String, dynamic>{},
+    this.maxSubscriptions,
     this.scope = const <String, dynamic>{},
     this.builtin = false,
     this.subscriberCount = 0,
@@ -278,6 +358,16 @@ class PluginStationInfo {
     this.counts = const <String, int>{},
     this.waitsInFlight,
   });
+
+  /// 详情页的「站点介绍」：`readme` 优先，没写时回落到一行 `description`。
+  ///
+  /// 两者都空（旧核心 / 旧存量数据）时返回空串，由展示层给「未提供介绍」占位。
+  String get introText => readme.isNotEmpty ? readme : description;
+
+  /// 被禁用的订阅者（面板「已订阅插件管理」要把它们标出来，不能混在正常项里）。
+  List<PluginStationSub> get disabledSubscriptions => subscriptions
+      .where((PluginStationSub sub) => sub.disabled)
+      .toList(growable: false);
 
   /// 展示用的中文类型名：核心给的 `kind_label` 优先；旧核心没给时按线名 `kind`
   /// 兜底；两者都认不出 ⇒ 空串（**不猜**，卡片上就不显示类型标签）。
@@ -358,11 +448,33 @@ class PluginStationInfo {
         byTeam[team] = count;
       });
     }
+    // 共享白名单与自定义配置：宽容解析（类型不符视为空 = 不限制 / 无配置）
+    final List<String> allowed = <String>[];
+    final Object? rawAllowed = m['allowed_plugins'];
+    if (rawAllowed is List) {
+      for (final Object? item in rawAllowed) {
+        final String id = (item ?? '').toString().trim();
+        if (id.isNotEmpty && !allowed.contains(id)) {
+          allowed.add(id);
+        }
+      }
+    }
+    Map<String, dynamic> config = const <String, dynamic>{};
+    final Object? rawConfig = m['config'];
+    if (rawConfig is Map) {
+      config = Map<String, dynamic>.from(rawConfig);
+    }
+    final Object? rawMax = m['max_subscriptions'];
     return PluginStationInfo(
       stationId: stationId,
       kind: (m['kind'] ?? '').toString(),
       kindLabel: (m['kind_label'] ?? '').toString(),
       description: (m['description'] ?? '').toString(),
+      readme: (m['readme'] ?? '').toString(),
+      shared: m['shared'] == true,
+      allowedPlugins: allowed,
+      config: config,
+      maxSubscriptions: rawMax is num ? rawMax.toInt() : null,
       scope: scope,
       builtin: m['builtin'] == true,
       subscriberCount: subscriberCount,

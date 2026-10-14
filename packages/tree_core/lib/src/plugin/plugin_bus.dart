@@ -3837,6 +3837,16 @@ class PluginBus {
       instances.add(<String, dynamic>{
         'plugin_id': config.id,
         'name': displayName,
+        // 插件详情页的数据源：介绍（来自 plugins.yaml）+ 当前注册的工具。
+        // 工具放在实例上而不是配置上：它是对账出来的运行态（收集站收集到的定义），
+        // 插件没启动就是空表（面板据此说“未提供工具”，而不是假装它有能力）。
+        'description': config.description,
+        'tools': toolsOf(config.id)
+            .map((PluginToolInfo t) => <String, dynamic>{
+              'name': t.name,
+              'description': t.description,
+            })
+            .toList(growable: false),
         'granularity': config.granularity,
         'scope': config.scope,
         'status': error == null && host != null && !host.isClosed

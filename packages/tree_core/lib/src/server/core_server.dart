@@ -1417,6 +1417,10 @@ class CoreServer {
     router.add('GET', ApiPaths.pluginBuiltins, _listBuiltinPlugins);
     router.add('POST', ApiPaths.pluginBuiltinEnable, _enableBuiltinPlugin);
     router.add('POST', ApiPaths.pluginBuiltinDisable, _disableBuiltinPlugin);
+    // 站点详情与配置（面板「站点详情页」）：介绍 / 可订阅上限 / 自定义配置 / 订阅者禁用。
+    router.add('GET', ApiPaths.pluginStation, _stationDetail);
+    router.add('PATCH', ApiPaths.pluginStationConfig, _updateStationConfig);
+    router.add('POST', ApiPaths.pluginStationSubscriber, _setStationSubscriber);
     router.add('GET', ApiPaths.mcpServices, _mcpServices);
     router.add('POST', ApiPaths.mcpServices, _registerMcpService);
     router.add('DELETE', ApiPaths.mcpService, _deleteMcpService);
@@ -3894,6 +3898,128 @@ class CoreServer {
       enable: false,
     );
     await writeJson(request, 200, _pluginWriteBody(store, result, outcome));
+  }
+
+  // ── 站点详情与配置（面板「站点详情页」的唯一写入口）──────────────────────
+  //
+  // 三个处理器都只做「取一条 + 调 [StationHub] 的同一份实现」：能改什么（内置只
+  // 能改订阅上限）、禁用不等于退订这些判定全部在 StationHub 里，路由层不复制规则
+  // ——复制一次就会两头漂。
+
+  /// 站点详情里读不到的统一回包：404 + 可读原因（不给空对象让前端渲染空白详情页）。
+  Future<void> _writeStationMissing(HttpRequest request, String stationId) {
+    return writeJson(
+      request,
+      404,
+      errorBody(
+        '站点不存在：$stationId（内置站点 id 形如 station.…，'
+        '插件自建站形如 plugin.<插件 id>.<kind>.<name>）',
+      ),
+    );
+  }
+
+  /// `GET /api/plugin/stations/{stationId}`：站点详情。
+  ///
+  /// 形状 = `StationInstance.describe()`（与 `GET /api/plugin/snapshot` 的 `stations` 段
+  /// 各项**完全一致**）：介绍 / 可订阅上限 / 共享声明 / 自定义配置 / 订阅者（含禁用态）。
+  Future<void> _stationDetail(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    final String stationId = (params['stationId'] ?? '').trim();
+    final Map<String, dynamic>? detail = bus.stations.station(stationId)?.describe();
+    if (detail == null) {
+      await _writeStationMissing(request, stationId);
+      return;
+    }
+    await writeJson(request, 200, detail);
+  }
+
+  /// `PATCH /api/plugin/stations/{stationId}/config`：**局部**改站点配置。
+  ///
+  /// 只发要改的键。成功回**改后的完整详情**（前端直接拿它刷新页面，不再发第二次 GET）；
+  /// 内置站改介绍/配置、值类型不对 ⇒ 400 + 指路原因（不静默忽略多余的键）。
+  Future<void> _updateStationConfig(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    final String stationId = (params['stationId'] ?? '').trim();
+    final Map<String, dynamic>? body = await _jsonBody(request);
+    if (body == null) return;
+    if (bus.stations.station(stationId) == null) {
+      await _writeStationMissing(request, stationId);
+      return;
+    }
+    if (body.isEmpty) {
+      await writeJson(request, 400, errorBody('PATCH 至少要给一个要改的键'));
+      return;
+    }
+    final String? error = bus.stations.updateConfig(stationId, body);
+    if (error != null) {
+      await writeJson(request, 400, errorBody(error));
+      return;
+    }
+    await writeJson(request, 200, bus.stations.station(stationId)!.describe());
+  }
+
+  /// `POST /api/plugin/stations/{stationId}/subscribers/{subscriberKey}`：
+  /// 禁用 / 启用一个订阅者（body `{disabled: bool}`）。
+  ///
+  /// **禁用不是退订**：订阅关系与回包通道都留着，只让触发时不投递，并且每条触发
+  /// 都在返回里显式回报跳过（计数 `skipped_disabled` + `skipped` 原因）——面板上
+  /// 关掉一个订阅者必须是可诊断的，不能变成“插件那边莫名其妙收不到”。
+  /// 键位里的 `|` 由客户端 `Uri.encodeComponent`，路由层拿到的已解码。
+  Future<void> _setStationSubscriber(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    final String stationId = (params['stationId'] ?? '').trim();
+    final String subscriberKey = (params['subscriberKey'] ?? '').trim();
+    final Map<String, dynamic>? body = await _jsonBody(request);
+    if (body == null) return;
+    final Object? raw = body['disabled'];
+    if (raw is! bool) {
+      await writeJson(
+        request,
+        400,
+        errorBody('disabled 必须是布尔值（true = 禁用该订阅者，false = 恢复投递）'),
+      );
+      return;
+    }
+    if (subscriberKey.isEmpty) {
+      await writeJson(
+        request,
+        400,
+        errorBody('缺少 subscriberKey（形如 plugin_id|scope，取自站点详情的 subscriptions[].subscriber）'),
+      );
+      return;
+    }
+    final String? error = bus.stations.setSubscriberDisabled(
+      stationId,
+      subscriberKey,
+      raw,
+    );
+    if (error != null) {
+      // 站点不存在 / 订阅者不存在都是“找不到的东西”，同一个 404（原因里已说清是哪一个）。
+      await writeJson(request, 404, errorBody(error));
+      return;
+    }
+    await writeJson(request, 200, bus.stations.station(stationId)!.describe());
   }
 
   Future<void> _mcpServices(HttpRequest request, Map<String, String> _) async {
