@@ -339,11 +339,27 @@ String toolResultPreview(String result) {
   return trimmed.replaceAll(RegExp(r'\s+'), ' ');
 }
 
-/// 从工具结果字符串里提取人类可读内容。
+/// ANSI / VT 控制序列（CSI、OSC、两字符转义）。
+///
+/// pwsh / git / dart 等的彩色输出会往 stdout 里写这些字节（如 `ESC[32;1m`）；执行层
+/// **故意保留原始字节**（见 tree_local_exec 的约定），所以它们会一路带到详情页——按普通
+/// 文本渲染时 ESC(0x1B) 变成乱码方块、`[32;1m` 原样漏出来。展示前用这个正则统一剥掉，
+/// 只影响显示，不动喂给模型的文本与磁盘上的原始结果。
+final RegExp _ansiEscape = RegExp(
+  r'\x1b\[[0-9;?]*[ -/]*[@-~]' // CSI：ESC [ 参数 中间字节 终结字节
+  r'|\x1b\][^\x07]*(?:\x07|\x1b\\)' // OSC：ESC ] 文本 … BEL / ST
+  r'|\x1b[@-Z\\-_]', // 两字符转义：ESC + 单个强字符
+);
+
+/// 从工具结果字符串里提取人类可读内容（并剥掉 ANSI 控制序列，避免详情页乱码）。
 ///
 /// 核心的 str(result) 可能是 JSON、Python dict 字符串或纯文本；提取
 /// content / output / result / message / text 之一，解析失败就原样返回。
 String extractReadableResult(String raw) {
+  return _readableField(raw).replaceAll(_ansiEscape, '');
+}
+
+String _readableField(String raw) {
   final Map<String, dynamic>? parsed = tryDecodeMap(raw);
   if (parsed == null) return raw;
   for (final String key in <String>[
@@ -401,10 +417,23 @@ const Color _teal = Color(0xFF0D9488);
 const Color _pink = Color(0xFFDB2777);
 const Color _grey = Color(0xFF64748B);
 
+/// 详情页代码块（内容 / diff / 执行结果）的字体回退栈。
+///
+/// 主字体 Consolas 只覆盖拉丁/数字（等宽 ⇒ 表格、缩进照旧对齐），汉字不在其字形内，
+/// 会依次回退到 Cascadia Mono → 微软雅黑（与全局正文同一套中文字体，见 main.dart），
+/// 这样中英混排时中文不再落到某个随机系统字体、观感跟界面其它文字统一。
+const List<String> _codeFontFallback = <String>[
+  'Cascadia Mono',
+  'Microsoft YaHei',
+  'PingFang SC',
+  'Noto Sans CJK SC',
+  'monospace',
+];
+
 /// 详情页里"内容 / diff"那几段的等宽样式（与源码视图同一套字体回退）。
 const TextStyle _codeStyle = TextStyle(
   fontFamily: 'Consolas',
-  fontFamilyFallback: <String>['Cascadia Mono', 'monospace'],
+  fontFamilyFallback: _codeFontFallback,
   fontSize: 11.5,
   height: 1.35,
 );
@@ -845,7 +874,7 @@ class _ToolDetailState extends State<ToolDetail> {
         style: const TextStyle(
           fontSize: 11.5,
           fontFamily: 'Consolas',
-          fontFamilyFallback: <String>['Cascadia Mono', 'monospace'],
+          fontFamilyFallback: _codeFontFallback,
           height: 1.5,
         ),
       ),
