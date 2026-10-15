@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
@@ -1253,6 +1255,13 @@ class _SubagentTagBar extends StatelessWidget {
 /// （浅色墨绿 / 深色浅绿白），边框 dividerColor。
 /// 流式消息在内容末尾追加闪烁光标（"|" 与空格每 500ms 交替）。
 /// 附件以小卡片形式展示在内容上方，含文件图标、文件名与大小。
+///
+/// **流式平滑揭示**（用户 2026-10-15 报告：生成方一慢，界面更新帧率就跟着掉）：
+/// 增量帧到达的节奏 = 模型吐字的节奏，直接「来一帧画一次」会把显示帧率钉死在
+/// 到达帧率上。气泡内把「揭示进度」交给一只按需运行的 Ticker：账上有积压才
+/// 逐帧追赶（积压越多放得越快，指数收敛），追平即停表——没新字时绝不常驻
+/// 占帧。光标闪烁仍用 500ms Timer（不排帧、不阻塞 pumpAndSettle）。封口
+/// （msg_end）后全量交还 markdown 渲染，两个计时器都停掉。
 class _MessageBubble extends StatefulWidget {
   final ChatMessage message;
 
@@ -1262,12 +1271,29 @@ class _MessageBubble extends StatefulWidget {
   State<_MessageBubble> createState() => _MessageBubbleState();
 }
 
-class _MessageBubbleState extends State<_MessageBubble> {
-  /// 光标闪烁定时器
-  Timer? _timer;
+class _MessageBubbleState extends State<_MessageBubble>
+    with SingleTickerProviderStateMixin {
+  /// 光标闪烁定时器（只在流式期间计数；不用 Ticker：常驻时钟会把帧一直排着，
+  /// 测试里 pumpAndSettle 永不收敛，真机上白耗电）
+  Timer? _blinkTimer;
+
+  /// 揭示时钟：**只在账上有积压时活着**，追平即停表（见 _syncReveal/_onTick）
+  Ticker? _ticker;
+
+  /// 上一次 tick 的时钟读数（Duration.zero = 还没打第一拍，只记基准不出字）
+  Duration _lastElapsed = Duration.zero;
+
+  /// 已揭示的字符数（double 累加、取整渲染——慢速 trickle 时单帧不足一个字也能记账）
+  double _revealed = 0;
 
   /// 当前是否显示光标（"|" 与空格交替）
   bool _showCursor = true;
+
+  /// 上一帧读到的是否还在流式。**不能拿 oldWidget.message 比较**：
+  /// ChatMessage 是原地可变的，新旧 widget 持有同一个对象，msg_end 封口后
+  /// 两边的 isStreaming 读出来都是 false，"停表"分支永远不命中（旧实现里
+  /// 闪烁 Timer 就是这么停不下来、每 500ms 空转重建已收尾气泡的）。
+  bool _wasStreaming = false;
 
   /// 鼠标是否悬停在气泡上（用于显示「复制全文」按钮）
   bool _hoverCopy = false;
@@ -1275,49 +1301,130 @@ class _MessageBubbleState extends State<_MessageBubble> {
   /// 气泡圆角
   static const double _radius = 12;
 
+  /// 揭示保底速度（字/秒）：增量再少，正文也至少以这个速率逐帧生长
+  static const double _minRevealSpeed = 12;
+
+  /// 积压追赶系数：速度 = 保底 + 积压 × 系数 ⇒ 积压按 ~0.17s 时间常数指数收敛，
+  /// 一次性到达的大段增量会在几帧内消化完，不会形成永久滞后
+  static const double _revealCatchup = 6;
+
   @override
   void initState() {
     super.initState();
+    _wasStreaming = widget.message.isStreaming;
     if (widget.message.isStreaming) {
+      // 中途挂上（切走再切回 / 滚出视口再滚回来）：已到达的正文全量显示，
+      // 只对之后的增量做平滑追赶——不把整段话重打一遍打字机
+      _revealed = widget.message.content.length.toDouble();
       _startBlinking();
+      _syncReveal();
     }
   }
 
   @override
   void didUpdateWidget(covariant _MessageBubble oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.message.isStreaming && !oldWidget.message.isStreaming) {
+    final bool nowStreaming = widget.message.isStreaming;
+    if (nowStreaming == _wasStreaming) {
+      if (nowStreaming) {
+        if (!identical(widget.message, oldWidget.message)) {
+          // 复用 State 换跟另一段流式正文：旧内容直接给全
+          _revealed = widget.message.content.length.toDouble();
+        }
+        // 父级每截增量都会重建到这里：账上有新积压就把揭示时钟叫醒
+        _syncReveal();
+      }
+      return;
+    }
+    _wasStreaming = nowStreaming;
+    if (nowStreaming) {
+      _revealed = widget.message.content.length.toDouble();
       _startBlinking();
-    } else if (!widget.message.isStreaming &&
-        oldWidget.message.isStreaming) {
+      _syncReveal();
+    } else {
+      // 封口：停掉两个计时器，全量正文交还 markdown 渲染（本帧就是父级
+      // setState 触发的重建，停表后不再有任何常驻帧）
       _stopBlinking();
+      _stopReveal();
     }
   }
 
   /// 启动光标闪烁（每 500ms 切换一次）
   void _startBlinking() {
     _stopBlinking();
-    _timer = Timer.periodic(
-      const Duration(milliseconds: 500),
-      (_) {
-        if (mounted) {
-          setState(() {
-            _showCursor = !_showCursor;
-          });
-        }
-      },
-    );
+    _blinkTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+      if (mounted) {
+        setState(() {
+          _showCursor = !_showCursor;
+        });
+      }
+    });
   }
 
   /// 停止光标闪烁
   void _stopBlinking() {
-    _timer?.cancel();
-    _timer = null;
+    _blinkTimer?.cancel();
+    _blinkTimer = null;
+  }
+
+  /// 按需启动揭示时钟：账上有积压才活着，追平/无积压绝不占帧（幂等）
+  void _syncReveal() {
+    if (_ticker != null) {
+      if (_revealed >= widget.message.content.length) _stopReveal();
+      return;
+    }
+    if (_revealed < widget.message.content.length) {
+      // 基准直接取当前帧时间戳：时钟是-build 期间被增量帧叫醒的，下一拍
+      // 就能正常推进，不浪费一拍“只记基准”的空帧
+      final Duration frame = SchedulerBinding.instance.currentFrameTimeStamp;
+      _lastElapsed = frame;
+      _ticker = createTicker(_onTick)..start();
+    }
+  }
+
+  /// 停止揭示时钟
+  void _stopReveal() {
+    _ticker?.dispose();
+    _ticker = null;
+  }
+
+  /// 有积压时每帧一拍：向正文实际长度逐帧追赶，追平即停表；只在真变了才重画
+  void _onTick(Duration elapsed) {
+    final Duration last = _lastElapsed;
+    _lastElapsed = elapsed;
+    if (last == Duration.zero) return; // 第一拍只建立基准
+    final double dt = (elapsed - last).inMicroseconds / 1e6;
+    if (dt <= 0) return;
+    final int total = widget.message.content.length;
+    final int before = _revealed.toInt();
+    if (_revealed >= total) {
+      _stopReveal();
+      return;
+    }
+    // 积压越多放得越快：保底匀速 + 指数收敛，一次性的大段增量几帧内消化完
+    final double backlog = total - _revealed;
+    _revealed = math.min(
+      total.toDouble(),
+      _revealed + (_minRevealSpeed + backlog * _revealCatchup) * dt,
+    );
+    final bool done = _revealed >= total;
+    if (done) _stopReveal();
+    if (done || _revealed.toInt() != before) setState(() {});
+  }
+
+  /// 揭示进度 → 正文截断点：落在代理对中间时回退一格，避免表情被切出乱码
+  int _revealCut(String text) {
+    final int cut = _revealed.toInt();
+    if (cut <= 0) return 0;
+    if (cut >= text.length) return text.length;
+    final int cu = text.codeUnitAt(cut - 1);
+    return (cu >= 0xD800 && cu <= 0xDBFF) ? cut - 1 : cut;
   }
 
   @override
   void dispose() {
     _stopBlinking();
+    _stopReveal();
     super.dispose();
   }
 
@@ -1386,8 +1493,12 @@ class _MessageBubbleState extends State<_MessageBubble> {
         ? Theme.of(context).colorScheme.onPrimary
         : Theme.of(context).colorScheme.onSurface;
     final String text = message.content;
-    // 流式但尚无内容：仅显示闪烁光标
-    if (message.isStreaming && text.isEmpty) {
+    // 流式：只画「已揭示」的那一截，没揭示到的部分在账上等着逐帧放出来
+    final String shown = message.isStreaming
+        ? text.substring(0, _revealCut(text))
+        : text;
+    // 流式但尚无内容（或首字还没轮到揭示）：仅显示闪烁光标
+    if (message.isStreaming && shown.isEmpty) {
       return Text(
         _showCursor ? '|' : ' ',
         style: TextStyle(
@@ -1402,7 +1513,7 @@ class _MessageBubbleState extends State<_MessageBubble> {
         text: TextSpan(
           children: <InlineSpan>[
             TextSpan(
-              text: text,
+              text: shown,
               style: TextStyle(color: textColor, fontSize: 14, height: 1.4),
             ),
             TextSpan(
