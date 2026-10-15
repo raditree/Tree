@@ -53,6 +53,9 @@ void main(List<String> args) {
   String relayRewrite = 'REWRITTEN';
   String relayKey = 'content';
   String relayStation = 'relay';
+  // 中转站订阅的**具体点位**（别名 / 完整 id / 后缀）：留空 = 按 station 类型默认解析。
+  // 用于订 `ssh.execute` 这类需要显式点位的中转点（`station: 'relay'` 留空只订工具前/后）。
+  String relayPoint = '';
   String uiTeam = '';
   for (int i = 0; i < args.length - 1; i++) {
     if (args[i] == '--events-file') eventsFile = args[i + 1];
@@ -60,6 +63,7 @@ void main(List<String> args) {
     if (args[i] == '--relay-rewrite') relayRewrite = args[i + 1];
     if (args[i] == '--relay-key') relayKey = args[i + 1];
     if (args[i] == '--relay-station') relayStation = args[i + 1];
+    if (args[i] == '--relay-point') relayPoint = args[i + 1];
     if (args[i] == '--ui-team') uiTeam = args[i + 1];
   }
 
@@ -106,11 +110,17 @@ void main(List<String> args) {
 
   /// 起进程后主动订阅中转站（`station/subscribe`），把结果写成一行 log 通知，
   /// 测试可从核心日志 / 站点快照观察订阅是否成立。
+  ///
+  /// `--relay-point` 非空时按点位显式订阅（`ssh.execute` 这类中转点必须显式订）。
   Future<void> subscribeRelay() async {
     try {
       final Map<String, dynamic> response = await requestCore(
         'station/subscribe',
-        <String, dynamic>{'station': relayStation, 'replace': true},
+        <String, dynamic>{
+          'station': relayStation,
+          if (relayPoint.isNotEmpty) 'point': relayPoint,
+          'replace': true,
+        },
       );
       final Object? result = response['result'];
       stdout.writeln(

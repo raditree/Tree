@@ -13,11 +13,11 @@ import 'station_store.dart';
 /// **站点类型四种，每类下有若干点位（point），每个点位是一个独立的全局实例**
 /// （点位化，2026-10-01）：
 ///
-/// - 广播站 3 个：`system.broadcast`（通用主题）/ `.tool.pre` / `.tool.post`
-/// - 执行站 7 个（按命令族）：`system.execute.fs` / `.terminal` / `.agent` / `.ui` /
-///   `.llm` / `.tool` / `.session`
-/// - 中转站 6 个（每个各自唯一订阅者）：`system.relay.tool.pre` / `.tool.post` /
-///   `.llm.handle` / `.llm.request` / `.context.compact` / `.prompt.system`
+/// - 广播站 4 个：`system.broadcast`（通用主题）/ `.tool.pre` / `.tool.post` / `.tool.timeout`
+/// - 执行站 8 个（按命令族）：`system.execute.fs` / `.terminal` / `.agent` / `.ui` /
+///   `.llm` / `.tool` / `.session` / `.ssh`
+/// - 中转站 7 个（每个各自唯一订阅者）：`system.relay.tool.pre` / `.tool.post` /
+///   `.llm.handle` / `.llm.request` / `.context.compact` / `.prompt.system` / `.ssh.execute`
 /// - 收集站 1 个：`plugin.tool.define`（**不预建**，见 [ensureBuiltinStations]）
 ///
 /// 点位的类型 / 说明 / 命令 / 别名表在 `station_points.dart`（加点位只改那张表）。
@@ -328,7 +328,7 @@ class StationHub {
     );
   }
 
-  /// **确保全部内置点位存在**（16 个：广播 3 + 执行 7 + 中转 6；收集站除外）。
+  /// **确保全部内置点位存在**（19 个：广播 4 + 执行 8 + 中转 7；收集站除外）。
   ///
   /// 为什么需要这一步：[pointFor] 是**懒创建**（首次使用时才实例化）。按需开销为零
   /// 是好事，代价却是"没配插件 / 没人用过"时一个点位都没有——面板上就是
@@ -355,10 +355,10 @@ class StationHub {
   List<String> ensureBuiltinStations() {
     load();
     final List<String> created = <String>[];
-    // 一批预建只落一次盘（每个点位的懒创建都会 save 一次，不合并就是 16 次写）
+    // 一批预建只落一次盘（每个点位的懒创建都会 save 一次，不合并就是 19 次写）
     _saveSuspend++;
     try {
-      // 全部内置点位（广播 3 + 执行 7 + 中转 6）预建；**收集站不预建**（见下）。
+      // 全部内置点位（广播 4 + 执行 8 + 中转 7）预建；**收集站不预建**（见下）。
       for (final StationPointSpec spec in StationPoints.all) {
         if (spec.kind == StationKind.collect) continue;
         _ensureOneBuiltin(() => pointFor(spec.id), created);

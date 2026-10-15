@@ -23,14 +23,14 @@ void main() {
       );
     });
 
-    test('类型分布：广播 4 / 执行 8 / 中转 6 / 收集 1', () {
+    test('类型分布：广播 4 / 执行 8 / 中转 7 / 收集 1', () {
       int count(StationKind kind) =>
           StationPoints.ofKind(kind).length;
       expect(count(StationKind.broadcast), 4);
       expect(count(StationKind.execute), 8);
-      expect(count(StationKind.relay), 6);
+      expect(count(StationKind.relay), 7);
       expect(count(StationKind.collect), 1);
-      expect(StationPoints.all.length, 19);
+      expect(StationPoints.all.length, 20);
     });
 
     test('退役 id 不在表里（它们只用于读侧迁移）', () {
@@ -133,7 +133,7 @@ void main() {
     });
 
     test('订阅别名解析：类型 + 点位 / 完整 id / 后缀 / 留空', () {
-      // 留空：中转站 = 工具前 + 工具后两点位；广播站 = 通用主题
+      // 留空：中转站 = 工具前 + 工具后两点位（**不含 ssh.execute**：它需要显式订）
       expect(
         StationPoints.resolveAlias(kindWire: 'relay').map((StationPointSpec s) => s.id),
         <String>[StationHubIds.relayToolPre, StationHubIds.relayToolPost],
@@ -161,6 +161,25 @@ void main() {
             .map((StationPointSpec s) => s.id),
         <String>[StationHubIds.broadcastToolPost],
       );
+      // ssh.execute：新「处理拓展点位」必须显式订才命中（别名 / 完整 id / 后缀三种写法）
+      for (final String key in <String>[
+        'ssh.execute',
+        StationHubIds.relaySshExecute,
+        'ssh.execute',
+      ]) {
+        expect(
+          StationPoints.resolveAlias(kindWire: 'relay', point: key)
+              .map((StationPointSpec s) => s.id)
+              .toList(),
+          <String>[StationHubIds.relaySshExecute],
+          reason: key,
+        );
+      }
+      // 留空解析绝不含 ssh.execute（老插件 `station: 'relay'` 不会误吞 SSH 执行）
+      expect(
+        StationPoints.resolveAlias(kindWire: 'relay').map((StationPointSpec s) => s.id),
+        isNot(contains(StationHubIds.relaySshExecute)),
+      );
       // 执行站不可订阅 ⇒ 任何 point 都解析不出来
       expect(StationPoints.resolveAlias(kindWire: 'execute'), isEmpty);
       expect(
@@ -176,6 +195,7 @@ void main() {
       final String text = StationPoints.describeAliases(StationKind.relay);
       expect(text, contains('llm.handle'));
       expect(text, contains(StationHubIds.relayToolPre));
+      expect(text, contains('ssh.execute'), reason: '新点位要出现在可读错误里');
     });
   });
 }

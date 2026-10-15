@@ -2370,6 +2370,98 @@ class PluginBus {
     }
   }
 
+  /// **中转站点位「SSH 执行」**（`system.relay.ssh.execute`，2026-10-15 新增）。
+  ///
+  /// 定位：中转站不再只接「数据拦截-回填」，而是「**处理拓展点位**」——核心把一次
+  /// 工作交给点位、订阅者处理并回填，就是同一套语义。SSH 因此与 LLM 接管 / 工具改写
+  /// 共用中转站的 fail-open / scope / 唯一订阅者 / 无静态超时 四条不变量。
+  ///
+  /// 无订阅者 / 插件未接管 / 回包非法 ⇒ 返回 null，调用方（核心的 SSH 选路）回退
+  /// 内置 `dartssh2`；插件回包为 `Map` 时原样透传。任何异常只写日志、不冒泡。
+  ///
+  /// [action]：这次 SSH 操作的语义名（`ensure` / `request` / `state` / `reconnect` /
+  /// `close` / `shell.open` / `shell.close` …），与既有 `TunnelMethods.*` 同名同形状，
+  /// 方便插件内部直接分发到 `TunnelManager`；新体系下它们不再是顶层 JSON-RPC method，
+  /// 而统一以 `station/request` 投递。
+  /// [payload]：随 action 携带的参数（SSH 配置、conn_id、目标机 JSON-RPC 的 method/params 等）。
+  /// [agentId]、[sessionId]：站点隔离四元组的两个必选字段，mode_key 固定为 `ssh`（这个
+  /// 点位只在 SSH 工作空间上触发）。若调用方无法提供（无会话背景的早期接线），
+  /// 传空串 ⇒ 站点隔离不成立 ⇒ fail-open 回退内置（与既有口径一致）。
+  Future<Map<String, dynamic>?> relaySshExecute({
+    required String action,
+    required String agentId,
+    required String sessionId,
+    Map<String, dynamic> payload = const <String, dynamic>{},
+  }) async {
+    load();
+    if (!enabled) return null;
+    final StationScope scope = runtimeScopeFor(
+      agentId: agentId,
+      sessionId: sessionId,
+    );
+    if (!scope.isValid) return null;
+    final RelayStation? station = stations.relayPointFor(
+      StationHubIds.relaySshExecute,
+    );
+    if (station == null) {
+      log?.call(
+        'SSH 中转（action=$action）：点位 ${StationHubIds.relaySshExecute} 不可用'
+        '（未接线 / 类型不符），按未接线回退内置',
+      );
+      return null;
+    }
+    if (station.subscribers.isEmpty) return null; // 快路径：零等待回退
+    final Map<String, dynamic> wire = <String, dynamic>{
+      'point': station.id,
+      'action': action,
+      ...payload,
+    };
+    try {
+      final StationRelayResult relayed = await station.relay(
+        data: wire,
+        scope: scope,
+        meta: <String, dynamic>{'purpose': 'ssh.execute', 'action': action},
+      );
+      if (!relayed.handled) {
+        if (relayed.reason.isNotEmpty) {
+          log?.call('SSH 中转（action=$action）未处理：${relayed.reason}');
+        }
+        return null;
+      }
+      final Object? data = relayed.data;
+      if (data is! Map) {
+        log?.call(
+          'SSH 中转（action=$action）：回包类型 ${data.runtimeType} 不是对象，'
+          '按未接管处理⇒回退内置',
+        );
+        return null;
+      }
+      return data.map((dynamic k, dynamic v) => MapEntry(k.toString(), v));
+    } catch (error) {
+      log?.call('SSH 中转（action=$action）异常（已回退内置）：$error');
+      return null;
+    }
+  }
+
+  /// 中转站点位「SSH 执行」当前是否有订阅者（核心选路时用它判断“能不能走站点”）。
+  ///
+  /// 与既有 [sshExecutorLookup]（按能力 + 进程在跑）两条信号 **OR**：
+  /// - 旧插件（只报 capability、不订阅）⇒ [sshExecutorLookup] 命中，新路径自动回退到
+  ///   `tunnel.*` 方法，行为与今天一致；
+  /// - 新插件（订了站点，无论是否报 capability）⇒ 本方法命中，核心可走站点投递；
+  /// - 两者都命中 ⇒ 优先走站点（新路径为权威）。
+  ///
+  /// 插件无能力不订站点⇒ 两者都不命中⇒ 内置 dartssh2。热切换时插件重启与订阅
+  /// 自动同步注销（既有基础设施），不需额外机制。
+  bool sshExecuteStationSubscribed() {
+    load();
+    if (!enabled) return false;
+    final RelayStation? station = stations.relayPointFor(
+      StationHubIds.relaySshExecute,
+    );
+    return station != null && station.subscribers.isNotEmpty;
+  }
+
   // ── 广播站点位：工具调用（单向通知，**不等回包**） ──────────────────────
 
   /// 每次工具调用前 / 后各广播一条（点位 `system.broadcast.tool.pre|post`）。

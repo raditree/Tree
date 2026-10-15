@@ -84,6 +84,22 @@ abstract final class StationHubIds {
   /// 中转站·系统提示词构造过程（插件产出最终 system prompt）。
   static const String relayPromptSystem = 'system.relay.prompt.system';
 
+  /// 中转站·SSH 执行（2026-10-15 新增）：**SSH 工作空间的中转执行点**。
+  ///
+  /// 定位：中转站不再只是「数据拦截-回填」的拓展点位，而是「**处理拓展点位**」——
+  /// 只要核心把一次工作交给点位、订阅者接管并回填结果，就是同一套语义。SSH 执行
+  /// 因此与 LLM 接管 / 工具改写 / 上下文压缩走同一套 fail-open / scope / stream 规则：
+  /// - 无订阅者 ⇒ 核心回退内置 `dartssh2`（红线不变）；
+  /// - 有订阅者 ⇒ 核心每次 SSH 操作（ensure / request / state / reconnect / close /
+  ///   shell.* 等）都投成一次 `station/request`，插件自己完成到目标机的通信；
+  /// - 心跳丢失 / 未回填 / 回包非法 ⇒ fail-open（回退内置）并写可读原因；
+  /// - 唯一订阅者（中转站 `scopeKeyUnique`）。
+  ///
+  /// 兼容：SSH 插件仍同时保留 `hello.capabilities = ['ssh-executor']` 与既有
+  /// `tunnel.*` 方法（旧核心与新核心都能对话）；核心侧读 `available` 时任一信号成立
+  /// 即认「有中转站」，让**热切换窗口**（先订上站点 vs 先跑起 tunnel 方法）两种顺序都稳定。
+  static const String relaySshExecute = 'system.relay.ssh.execute';
+
   // ── 收集站（一对多收集 + 汇聚；不回填原数据流） ──────────────────────────
 
   /// 收集站·插件定义 tool（系统自带；收集站的接入点）。
@@ -123,6 +139,7 @@ abstract final class StationHubIds {
     relayLlmRequest,
     relayContextCompact,
     relayPromptSystem,
+    relaySshExecute,
     collect,
   };
 

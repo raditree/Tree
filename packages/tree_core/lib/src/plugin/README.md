@@ -65,19 +65,21 @@
 14. 内置插件的"身份"由**核心**认定（前端只拿到 id / 名称 / 说明 / 开关状态）；解析不出运行时必须给可读错误（「未检测到 Python，请先安装或改用自定义命令」）——静默失败在界面上表现为"点了开关没反应"。
 15. 执行站挂载位置的依赖**没接线时不做静默降级**：以「未接线」的可读原因失败。
 16. 代理归属校验与订阅可见性**两处都按 team fail-closed**；插件要订阅站点就必须声明 `scope.team_id`，因此事件与命令的 `team_id` 一律取 agent 的**有效团队归属**（顶层 agent 自成一队，取它自己的 id），不能只读 `agent.teamId`（那会让顶层 agent 的事件永远带空 team，声明了 team 的插件反而收不到自己的事件，计数静默归零）。
-17. **SSH 执行器走的是「自有方法」而不是站点**（2026-10-10 新增）：
-    - `PluginBus.sshExecutorLookup()` 按**能力**（`hello.capabilities` 含 `ssh-executor`）而不是写死 id 找中转站，
-      并要求总开关开、条目 enabled、进程在跑、心跳未 degraded；**返回可读的 reason**（"为什么没有"必须说得出话）；
-    - 核心 → 插件用 `PluginHost.requestMethod`（新加的公开入口，包一层既有 `_request`）——
-      **不开静态超时**（不开 `timeout` 就一直等，只有进程退出 / 通道断才失败），
-      这正是"远端命令跑多久都等"能成立的前提；
-    - 插件 → 核心的 `tunnel/event` 通知**不降级成 `plugin_event`**（不是"插件事件"，是执行器的私有数据面），
-      经 `PluginBus.onTunnelEvent` 直接交给 `PluginTunnelLink` 按 `conn_id` 分发给对应会话；
-    - **不进 17 个点位**：执行器是一条**通道**，没有 `team_id/agent_id/session_id/mode_key` 这层语义，
-      也不申报工具（`tools/list` 恒为空），因此不受站点隔离矩阵约束；
-    - 内置目录加 `kind: python|binary`：binary 型**不做运行时探测**，
-      直接解析可执行文件同级的 `plugins/<name>[.exe]`（`build/plugins/` 是开发态落点）；
-    - `defaultEnabled` 的播种**只处理"从来没落盘过这一条"**：用户显式关过就绝不再自动打开。
+17. **中转站 = 「处理拓展点位」（而不是只是「数据拦截-回填」），SSH 执行因此与工具改写同构**（2026-10-10 新增、**2026-10-15 定位重写**）：
+    - **新定位**：中转站不只会拦下数据让插件改写，还会把**整块处理工作**交给插件。SSH 工作空间因此新增内置点位
+      `system.relay.ssh.execute`（别名 `ssh.execute`，中转站唯一订阅者）：核心把 `ensure` / `request` / `state` /
+      `reconnect` / `close` / `shell.*` 都投成一次 `station/request`，插件自己完成到目标机的通信与回包，
+      共 20 个内置点位（广播 4 + 执行 8 + 中转 7 + 收集 1）。
+    - 选路信号：`PluginBus.sshExecuteStationSubscribed()`（新，按「中转站点位有没有订阅者」）
+      与 `PluginBus.sshExecutorLookup()`（旧，按 `hello.capabilities` + 进程在跑）**OR**：
+      旧插件只报 capability 不订站点 ⇒ 行为与今天一致（走 `tunnel.*` 顶层方法）；
+      新插件订上站点 ⇒ 核心优先走站点投递；两者都没 ⇒ 回退内置 `dartssh2`。
+      热切换（插件重启/启用/停用）由既有基础设施接住：插件下线 ⇒ 订阅自动注销 ⇒ `sshExecuteStationSubscribed()` 变 false；
+      重新上线 ⇒ 重新 subscribe，核心下一次 `_ioFor` 自动重新选路。
+    - 旧体系**不一次性删除**，`PluginTunnelLink` + `tunnel.*` 方法在新体系上量后才会逐次降级为**兼容层**（行为不变、仅写清楚“兼容旧插件”的注释）；
+    - `PluginBus.relaySshExecute()`（新）与中转站既有方法同一套 fail-open / scope 校验 / 无静态超时；回包非 `Map` ⇒ null（回退内置）。
+    - 内置目录加 `kind: python|binary`：binary 型**不做运行时探测**，直接解析可执行文件同级的 `plugins/<name>[.exe]`（`build/plugins/` 是开发态落点）；
+    - `defaultEnabled` 的播种**只处理“从来没落盘过这一条”**：用户显式关过就绝不再自动打开。
 18. **断连的两种"不可用"必须在插件边界就分清**（2026-10-11 新增，协议 §10）：
     `PluginTunnelLink` 把插件的 `error_kind` 原样翻进 `TunnelUnavailableException`——
     `tunnel_not_ready`（还没好）与 `tunnel_down`（判死/已关闭/通道断在中途）**不许混**。

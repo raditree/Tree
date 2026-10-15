@@ -302,6 +302,24 @@ abstract final class StationPoints {
           '无订阅者就用核心拼好的内置结果。只想“追一段”也要回整串：'
           '本站是替换语义，不是追加语义，回空会被当成“不改动”而不是“没要求”。',
     ),
+    StationPointSpec(
+      id: StationHubIds.relaySshExecute,
+      kind: StationKind.relay,
+      label: 'SSH 执行',
+      description:
+          '中转站·SSH 执行：核心每次将一条 SSH 工作空间操作交给插件（建隧道/读写/命令/PTY/…），'
+          '插件自己完成到目标机的通信；无订阅者回退内置 dartssh2（fail-open）',
+      alias: 'ssh.execute',
+      maxSubscriptions: 1,
+      readme:
+          'SSH 执行中转点：核心在需要读写远端文件 / 执行远端命令 / 建或销隧道 / 拉心跳 / '
+          '开 PTY 时，把一次操作投给本站。订阅者（ssh_executor 插件）自己持 dartssh2 + '
+          'tree_agent 通道，处理完毕后以同一形状的 payload 回包。\n'
+          '与同名旧体系的关系：插件同时保留 hello.capabilities 与 tunnel.* 方法（向后兼容），'
+          '核心侧任信号命中即认「有中转站」——热切换窗口两种启动顺序都稳定。\n'
+          'fail-open：无订阅者 / 心跳丢 / 回包非法 ⇒ 核心回退内置 dartssh2，写可读原因，'
+          '绝不因插件失败而“SSH 不可用”。本站只有一个订阅者（中转站 scopeKeyUnique）。',
+    ),
   ];
 
   /// 收集站点位（schema 由接入点决定，不在这里预建）。
