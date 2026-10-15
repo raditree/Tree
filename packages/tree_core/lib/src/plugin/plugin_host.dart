@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:tree_protocol/tree_protocol.dart' show PluginRpcMethods;
+
 import '../util/liveness.dart';
 import 'station_runtime.dart';
 import 'station_scope.dart';
@@ -109,7 +111,7 @@ class PluginHost {
     unawaited(host._process.stdin.done.catchError(host._onWriteFailure));
     try {
       final Map<String, dynamic> hello = await host._request(
-        'hello',
+        PluginRpcMethods.hello,
         <String, dynamic>{
           'protocol': 1,
           'core_version': coreVersion,
@@ -222,7 +224,7 @@ class PluginHost {
     Duration timeout = const Duration(seconds: 20),
   }) async {
     final Map<String, dynamic> result = await _request(
-      'tools/list',
+      PluginRpcMethods.toolsList,
       const <String, dynamic>{},
       timeout: timeout,
     );
@@ -266,7 +268,7 @@ class PluginHost {
   }) async {
     try {
       final Map<String, dynamic> result = await _request(
-        'tools/call',
+        PluginRpcMethods.toolsCall,
         <String, dynamic>{
           'name': toolName,
           'arguments': arguments,
@@ -306,7 +308,7 @@ class PluginHost {
     try {
       _write(<String, dynamic>{
         'jsonrpc': '2.0',
-        'method': 'event',
+        'method': PluginRpcMethods.event,
         'params': event,
       });
     } catch (_) {
@@ -326,7 +328,7 @@ class PluginHost {
     try {
       _write(<String, dynamic>{
         'jsonrpc': '2.0',
-        'method': 'station/cancel',
+        'method': PluginRpcMethods.stationCancel,
         'params': <String, dynamic>{
           'request_id': requestId,
           if (reason.isNotEmpty) 'reason': reason,
@@ -345,7 +347,7 @@ class PluginHost {
     if (isClosed) return false;
     try {
       await _request(
-        'ping',
+        PluginRpcMethods.ping,
         const <String, dynamic>{},
         timeout: timeout ?? liveness.interval,
       );
@@ -363,7 +365,7 @@ class PluginHost {
     if (isClosed) return StationReply.failed('插件 ${config.id} 已关闭');
     try {
       final Map<String, dynamic> result = await _request(
-        'station/request',
+        PluginRpcMethods.stationRequest,
         request.toJson(),
       );
       final Object? rawReply = result['reply'] ?? result;
@@ -578,7 +580,7 @@ class PluginHost {
     try {
       _write(<String, dynamic>{
         'jsonrpc': '2.0',
-        'method': 'shutdown',
+        'method': PluginRpcMethods.shutdown,
         'params': const <String, dynamic>{},
       });
     } catch (_) {}
@@ -634,6 +636,25 @@ class PluginRequestException implements Exception {
   String toString() => message;
 }
 
+/// 插件的**挂起声明**（写在 `plugins.yaml` 的条目级字段 `suspension`）。
+///
+/// 为什么默认是"不可挂起"（D3，向后兼容）：热重启的转储-续跑要求插件自己
+/// 肯在退出前把状态交出来，而**老插件根本不认识这一条**。把默认设为"能挂起"
+/// 就等于拿旧插件的在途工作赌一个新能力，因此反过来：显式声明才支持。
+abstract final class PluginSuspension {
+  /// 未声明（空串）= 不可挂起：热重启 = 直接重启（冷启动），转储与续跑都不做。
+  static const String none = '';
+
+  /// 显式声明可挂起：热重启时先 `suspend`、等它递回快照、再拉新实例取回。
+  static const String keep = 'keep';
+
+  /// 全部合法取值（`plugin_config_store.dart` 的校验与本表共用一个来源）。
+  static const Set<String> values = <String>{none, keep};
+
+  /// 可读的取值提示（错误信息用，不靠调用方自己拼）。
+  static String get describeValues => 'keep（留空 = 不可挂起）';
+}
+
 /// 插件配置（`<数据根>/config/plugins.yaml` 的一项）。
 class PluginConfig {
   PluginConfig({
@@ -646,6 +667,7 @@ class PluginConfig {
     this.enabled = true,
     this.granularity = 'team',
     Map<String, dynamic>? scope,
+    this.suspension = PluginSuspension.none,
   }) : args = args ?? <String>[],
        env = env ?? <String, String>{},
        scope = scope ?? <String, dynamic>{};
@@ -671,6 +693,17 @@ class PluginConfig {
   /// 实例 scope 四元组（team_id/agent_id/session_id；空串表示"不限定"）。
   final Map<String, dynamic> scope;
 
+  /// **挂起声明**（见 [PluginSuspension]）：`keep` = 支持热重启不丢在途工作；
+  /// 空串 = 默认，不可挂起。
+  ///
+  /// 为什么必须是**显式字段**而不是靠"未知键原样保留"：落盘层确实会原样保留
+  /// 未知键（见 `plugin_config_store.dart` 的类注释），但本类的 [fromJson] **会丢掉
+  /// 它们**——写在顶层却不建字段，结果就是"用户配了、核心读了个空"这种难查的错。
+  final String suspension;
+
+  /// 这个插件能不能挂起（热重启走"转储→取回"而不是直接重启）。
+  bool get canSuspend => suspension == PluginSuspension.keep;
+
   Map<String, dynamic> toJson() => <String, dynamic>{
     'id': id,
     'name': name,
@@ -681,6 +714,9 @@ class PluginConfig {
     'enabled': enabled,
     'granularity': granularity,
     'scope': scope,
+    // 只在声明了可挂起时写这一条：没声明的插件的配置文档与改动前逐字一致
+    //（未知键不写回比"多一个空键"更干净，也免得用户以为"写了 keep 之外的值也行"）。
+    if (suspension.isNotEmpty) 'suspension': suspension,
   };
 
   /// 前端形态（`GET /api/plugin/snapshot` 的 config 段）。
@@ -692,6 +728,7 @@ class PluginConfig {
     'args': args,
     'enabled': enabled,
     'granularity': granularity,
+    'suspension': suspension,
   };
 
   static PluginConfig fromJson(Map<String, dynamic> json) => PluginConfig(
@@ -717,6 +754,11 @@ class PluginConfig {
           (dynamic k, dynamic v) => MapEntry(k.toString(), v),
         ) ??
         <String, dynamic>{},
+    // 挂起声明取"宽容读法"：没写 / 写成非字符串 ⇒ 空串（不可挂起）。
+    // 绝不在此抛异常：配置读不出来时 PluginBus 要保持现状并只报一句可读原因。
+    suspension: (json['suspension'] is String)
+        ? (json['suspension'] as String).trim()
+        : PluginSuspension.none,
   );
 }
 

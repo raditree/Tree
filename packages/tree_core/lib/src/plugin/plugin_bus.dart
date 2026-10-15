@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:tree_protocol/tree_protocol.dart' show PluginRpcMethods;
 import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart';
 
 import '../agent/agent_engine.dart';
@@ -648,7 +649,7 @@ class PluginBus {
     final Map<String, dynamic> params = rawParams is Map
         ? rawParams.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
         : <String, dynamic>{};
-    if (method == 'station/stream') {
+    if (method == PluginRpcMethods.stationStream) {
       // 流式回填的数据面：插件推 delta / done / error（见 [_handleStationStream]）
       _handleStationStream(pluginId, params);
       return;
@@ -2684,17 +2685,17 @@ class PluginBus {
     Map<String, dynamic> params,
   ) async {
     switch (method) {
-      case 'station/command':
+      case PluginRpcMethods.stationCommand:
         return _handleStationCommand(config, params);
-      case 'station/register':
+      case PluginRpcMethods.stationRegister:
         return _handleStationRegister(config, params);
-      case 'station/unregister':
+      case PluginRpcMethods.stationUnregister:
         return _handleStationUnregister(config, params);
-      case 'station/subscribe':
+      case PluginRpcMethods.stationSubscribe:
         return _handleStationSubscribe(config, params);
-      case 'station/unsubscribe':
+      case PluginRpcMethods.stationUnsubscribe:
         return _handleStationUnsubscribe(config, params);
-      case 'station/trigger':
+      case PluginRpcMethods.stationTrigger:
         return _handleStationTrigger(config, params);
       default:
         throw PluginRequestException(
@@ -3890,7 +3891,7 @@ class PluginBus {
             'description': tool.description,
             'parameters': tool.inputSchema,
             'execution': <String, dynamic>{
-              'method': 'tools/call',
+              'method': PluginRpcMethods.toolsCall,
               'name': tool.name,
             },
           },
