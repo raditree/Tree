@@ -90,6 +90,20 @@ class PluginLoop {
   StreamSubscription<List<int>>? _input;
   bool _shuttingDown = false;
 
+  // ── 插件 → 核心**主动请求**通道（2026-10-15：订阅 ssh.execute 点位用） ──
+  //
+  // 旧体系里本插件从不向核心发请求（只是被动接 `tunnel.*`）。迁移到「处理拓展点位」
+  // 之后，插件要主动发一条 `station/subscribe` 把 ssh.execute 订上，因此这里补上
+  // 「请求 → 等响应」的最小机制：出帧 id 单调递增，响应帧按 id 认领 completer。
+  // **无静态超时**（同中转站其它请求）：只有进程收手（[_finish]）才把在途请求以
+  // 可读错误收尾，绝不让一次订阅挂死读循环（读循环从不 await 这条链路）。
+  final RpcIds _outIds = RpcIds();
+  final Map<Object, Completer<Map<String, dynamic>>> _pendingOut =
+      <Object, Completer<Map<String, dynamic>>>{};
+
+  /// 是否已经发过 `station/subscribe`（一次握手成功即订上；重复 hello 不再重订）。
+  bool _subscribed = false;
+
   /// 隧道台账（测试用）。
   TunnelManager get manager => _manager;
 
@@ -160,8 +174,15 @@ class PluginLoop {
       }
       return;
     }
-    // 响应：本插件从不向核心发请求 ⇒ 只可能是陈旧回包，忽略并留痕。
-    log?.call('忽略来自核心的响应帧（本插件不主动请求核心）');
+    // 响应帧（无 method、有 id）：只可能是**我方主动请求**（station/subscribe）的回包。
+    if (RpcIds.isResponse(frame)) {
+      final Object? id = frame['id'];
+      final Completer<Map<String, dynamic>>? waiting = _pendingOut.remove(id);
+      if (waiting != null && !waiting.isCompleted) waiting.complete(frame);
+      return;
+    }
+    // 既非请求/通知、又不是我方在途请求的响应 ⇒ 陈旧/未知帧，留痕不静默。
+    log?.call('忽略无法归类的帧（既非请求/通知，也不是我方在途请求的回包）');
   }
 
   Future<void> _handleRequest(
@@ -177,9 +198,16 @@ class PluginLoop {
             'name': kPluginName,
             'version': kPluginVersion,
             'protocol': kTunnelProtocolVersion,
-            // ★ 核心"有没有中转站"的**唯一判据**（协议 §6）。
+            // ★ 核心"有没有中转站"的**兼容信号**（旧路径：按能力认，走 `tunnel.*`）。
+            // 新路径（订上 ssh.execute 点位）由下面的 `_subscribeSshExecute()` 申报；
+            // 两条信号核心 **OR**，因此旧核（不认点位）/ 新核（优先点位）都能工作。
             'capabilities': <String>[kCapabilitySshExecutor],
           });
+          // 握手成功后**主动订阅** SSH 执行中转站点位（一次即可；不阻塞读循环）。
+          if (!_subscribed) {
+            _subscribed = true;
+            unawaited(_subscribeSshExecute());
+          }
           return;
         case PluginMethods.ping:
           _reply(id, <String, dynamic>{'ok': true});
@@ -221,6 +249,23 @@ class PluginLoop {
           _reply(id, await _manager.closeTunnel(connId));
           _panel.refresh(force: true);
           return;
+        case StationMethods.request:
+          // 「处理拓展点位」的新投递：核心把一次 SSH 操作投成 station/request，
+          // payload 里带 `action`（与 tunnel.* 去掉前缀同名）。回包形状必须与
+          // `tunnel.*` 一致（{ok, conn_id, ...}），核心 relaySshExecute 原样透传。
+          final Map<String, dynamic> payload = _payloadOf(params);
+          final Map<String, dynamic> result = await _runAction(payload);
+          // 面板跟着台账走（与 tunnel.* 同口径）。
+          final String action = (payload['action'] ?? '').toString();
+          if (action == SshExecuteStation.ensure ||
+              action == SshExecuteStation.reconnect ||
+              action == SshExecuteStation.close) {
+            _panel.refresh(force: true);
+          }
+          _reply(id, <String, dynamic>{
+            'reply': <String, dynamic>{'payload': result},
+          });
+          return;
         default:
           // 未知方法**绝不静默**（协议级错误，不是业务级 ok:false）。
           _replyError(
@@ -256,6 +301,102 @@ class PluginLoop {
     return _manager.request(connId, method, inner);
   }
 
+  /// 从 `station/request` 的 params 里取出核心投递的载荷（中转站把它放在 `payload`）。
+  static Map<String, dynamic> _payloadOf(Map<String, dynamic> params) {
+    final Object? raw = params['payload'];
+    if (raw is! Map) return <String, dynamic>{};
+    return raw.map((dynamic k, dynamic v) => MapEntry('$k', v));
+  }
+
+  /// **按 `action` 分发**到 [TunnelManager]（`station/request` 与旧 `tunnel.*` 共用同一套台账）。
+  ///
+  /// 回包形状与对应 `tunnel.*` 方法**完全一致**（`{ok, conn_id, ...}` / `{ok:false, error, error_kind}`），
+  /// 核心的 `relaySshExecute` 原样透传，`StationTunnelLink` 据此翻成 [TunnelUnavailableException]
+  /// 或会话数据——因此新旧两条路对目标机的行为、失败分类、回退判据都同一。
+  Future<Map<String, dynamic>> _runAction(Map<String, dynamic> payload) async {
+    final String action = (payload['action'] ?? '').toString();
+    switch (action) {
+      case SshExecuteStation.ensure:
+        return _manager.ensure(payload);
+      case SshExecuteStation.request:
+        return _handleTunnelRequest(payload);
+      case SshExecuteStation.state:
+        return _manager.state(_optionalString(payload['conn_id']));
+      case SshExecuteStation.reconnect:
+        final String? connId = _requiredString(payload['conn_id']);
+        if (connId == null) {
+          return <String, dynamic>{
+            'ok': false,
+            'error': 'ssh.execute(reconnect) 需要 conn_id',
+          };
+        }
+        return _manager.reconnect(connId);
+      case SshExecuteStation.close:
+        final String? connId = _requiredString(payload['conn_id']);
+        if (connId == null) {
+          return <String, dynamic>{'ok': false, 'error': 'ssh.execute(close) 需要 conn_id'};
+        }
+        return _manager.closeTunnel(connId);
+      default:
+        // 认不出的 action：如实报可读错误（核心据此回退内置，不静默成功）。
+        return <String, dynamic>{
+          'ok': false,
+          'error': '未知的 SSH action：$action',
+        };
+    }
+  }
+
+  /// 主动发一条 JSON-RPC 请求给核心并等它的响应帧（按 id 认领）。
+  ///
+  /// **无静态超时**：只有进程收手（[_finish]）才把在途请求以可读错误收尾。调用方
+  /// （[_subscribeSshExecute]）不 await 进读循环，因此一次订阅永不阻塞 `ping` / 其它请求。
+  Future<Map<String, dynamic>> _requestCore(
+    String method,
+    Map<String, dynamic> params,
+  ) {
+    final Object id = _outIds.next();
+    final Completer<Map<String, dynamic>> completer =
+        Completer<Map<String, dynamic>>();
+    _pendingOut[id] = completer;
+    send(rpcRequest(id as int, method, params));
+    return completer.future;
+  }
+
+  /// 握手后订阅 SSH 执行中转站点位（`station/subscribe`，`point: ssh.execute`）。
+  ///
+  /// `replace: true`：中转站唯一订阅者，插件重启后把陈旧订阅接管回来（与热切换语义一致）。
+  /// 订阅失败（核心不认这个点位 = 旧核心）只记日志——旧路径 `tunnel.*` 仍在，功能不回归。
+  Future<void> _subscribeSshExecute() async {
+    try {
+      final Map<String, dynamic> response = await _requestCore(
+        StationMethods.subscribe,
+        <String, dynamic>{
+          'station': SshExecuteStation.kind,
+          'point': SshExecuteStation.alias,
+          'replace': true,
+        },
+      );
+      final Map<String, dynamic> result = _resultOf(response);
+      final bool ok = result['ok'] == true;
+      log?.call(
+        ok
+            ? '已订阅 SSH 执行中转站点位（${SshExecuteStation.pointId}）'
+            : '订阅 SSH 执行点位未成功（旧路径 tunnel.* 继续可用）：'
+                '${result['error'] ?? '核心未回 ok'}',
+      );
+    } catch (error) {
+      log?.call('订阅 SSH 执行点位异常（旧路径 tunnel.* 继续可用）：$error');
+    }
+  }
+
+  static Map<String, dynamic> _resultOf(Map<String, dynamic> frame) {
+    final Object? result = frame['result'];
+    if (result is Map) {
+      return result.map((dynamic k, dynamic v) => MapEntry('$k', v));
+    }
+    return <String, dynamic>{};
+  }
+
   void _reply(Object? id, Map<String, dynamic> result) {
     send(rpcResult(id ?? 0, result));
   }
@@ -277,6 +418,15 @@ class PluginLoop {
     final Completer<int>? done = _done;
     if (done == null || done.isCompleted) return;
     log?.call('插件主循环结束（exit=$code）：$reason');
+    // 我方在途请求（station/subscribe）再等不到回包：以可读错误显式收尾，
+    // 不留悬空 Future（与「进程退出即在途调用显式失败」的总线口径一致）。
+    for (final Completer<Map<String, dynamic>> completer
+        in _pendingOut.values) {
+      if (!completer.isCompleted) {
+        completer.completeError(StateError('插件已收手：$reason'));
+      }
+    }
+    _pendingOut.clear();
     unawaited(_input?.cancel());
     done.complete(code);
   }

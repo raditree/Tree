@@ -74,6 +74,43 @@ abstract final class TunnelMethods {
   static const String event = 'tunnel/event';
 }
 
+/// 站点体系的 JSON-RPC method 名（核心 ⇄ 插件；中转站投递走这一条，不再用顶层 `tunnel.*`）。
+///
+/// 2026-10-15：SSH 执行迁移到「处理拓展点位」后，核心把一次 SSH 操作投成
+/// `station/request`、插件用 `station/subscribe` 订上点位。方法名在此收敛为唯一真源
+/// （核心侧历史上用字面量，此处供插件侧引用；两边字符串必须一致）。
+abstract final class StationMethods {
+  /// 插件 → 核心：订阅某个站点（`{station, point?, replace?}`）。
+  static const String subscribe = 'station/subscribe';
+
+  /// 核心 → 插件：把一次站点请求交给订阅者（`{station_id, request_id, payload, ...}`）。
+  static const String request = 'station/request';
+}
+
+/// 「SSH 执行中转站点位」的共享常量（阶段 B/C：核心与插件都引用这一份）。
+///
+/// 定位：中转站不只是「数据拦截-回填」，更是「处理拓展点位」——核心把整块 SSH 工作
+/// 交给点位，订阅者（本插件）处理并回填，与工具改写同构。`action` 取值与 [TunnelMethods]
+/// 去掉 `tunnel.` 前缀后同名（`ensure` / `request` / `state` / `reconnect` / `close`），
+/// 便于插件内部直接分发到 `TunnelManager`；`tunnel/event`（PTY 数据面）**仍是通知**，
+/// 不并进请求/回包（中转站只做一问一答）。
+abstract final class SshExecuteStation {
+  /// 点位的订阅别名（`station/subscribe` 的 `point`）。
+  static const String alias = 'ssh.execute';
+
+  /// 点位完整 id（`station/request` 的 `station_id`；与核心 `StationHubIds.relaySshExecute` 同串）。
+  static const String pointId = 'system.relay.ssh.execute';
+
+  /// 站点类型别名（`station/subscribe` 的 `station`）。
+  static const String kind = 'relay';
+
+  static const String ensure = 'ensure';
+  static const String request = 'request';
+  static const String state = 'state';
+  static const String reconnect = 'reconnect';
+  static const String close = 'close';
+}
+
 /// 插件 → 核心 `tunnel/event` 通知的 `kind`。
 abstract final class TunnelEventKind {
   static const String state = 'state';

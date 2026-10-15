@@ -332,6 +332,147 @@ void main() {
     });
   });
 
+  group('SSH 执行中转站点位（station/subscribe + station/request）', () {
+    test('hello 之后插件主动发一条 station/subscribe 订 ssh.execute', () async {
+      await harness.request(60, PluginMethods.hello, <String, dynamic>{
+        'protocol': 1,
+      });
+      // 出站订阅请求（插件 → 核心）：method=station/subscribe，point 显式指到 ssh.execute。
+      final Map<String, dynamic> sub = harness.frames.firstWhere(
+        (Map<String, dynamic> f) => f['method'] == StationMethods.subscribe,
+      );
+      expect(sub['params']['station'], SshExecuteStation.kind);
+      expect(sub['params']['point'], SshExecuteStation.alias);
+      expect(sub['params']['replace'], isTrue);
+      // 订阅请求带 id（插件自有 id 空间，从 1 起），核心按 id 回响应。
+      expect(sub['id'], isNotNull);
+    });
+
+    test('订阅成功（核心回 ok:true）⇒ 记一条已订阅日志', () async {
+      await harness.request(61, PluginMethods.hello);
+      final Map<String, dynamic> sub = harness.frames.firstWhere(
+        (Map<String, dynamic> f) => f['method'] == StationMethods.subscribe,
+      );
+      // 用**插件自己的请求 id**回一条响应（无 method、有 id ⇒ isResponse）。
+      harness.input.add(
+        encodeFrame(
+          rpcResult(sub['id'] as int, <String, dynamic>{'ok': true}),
+        ),
+      );
+      await pump(10);
+      expect(
+        harness.logs.join('\n'),
+        contains('已订阅 SSH 执行中转站点位'),
+      );
+    });
+
+    test('订阅被旧核心拒（ok:false）⇒ 只记日志，旧路径不回归', () async {
+      await harness.request(62, PluginMethods.hello);
+      final Map<String, dynamic> sub = harness.frames.firstWhere(
+        (Map<String, dynamic> f) => f['method'] == StationMethods.subscribe,
+      );
+      harness.input.add(
+        encodeFrame(
+          rpcResult(sub['id'] as int, <String, dynamic>{
+            'ok': false,
+            'error': '点位不存在',
+          }),
+        ),
+      );
+      await pump(10);
+      expect(
+        harness.logs.join('\n'),
+        contains('旧路径 tunnel.* 继续可用'),
+      );
+    });
+
+    test('station/request(action=ensure) ⇒ 建隧道并按 reply.payload 回形状', () async {
+      await harness.request(70, StationMethods.request, <String, dynamic>{
+        'station_id': SshExecuteStation.pointId,
+        'request_id': 'relay-x',
+        'payload': <String, dynamic>{
+          'action': SshExecuteStation.ensure,
+          'config': configJson(),
+          'agent': <String, dynamic>{'version': '9.9.9'},
+        },
+      });
+      final Map<String, dynamic> result = harness.resultOf(70);
+      // 外层必须是 {reply:{payload:{...}}}（核心 requestStation 读 result['reply']）。
+      expect(result.containsKey('reply'), isTrue);
+      final Map<String, dynamic> payload =
+          (result['reply']['payload'] as Map).map(
+        (dynamic k, dynamic v) => MapEntry('$k', v),
+      );
+      expect(payload['ok'], isTrue);
+      expect(payload['root'], '/home/tester');
+      // agent 版本以**目标机握手自报**为准（协议 §6），与请求里带的版本无关——
+      // 请求的 `agent` 只用于对账留痕，因此这里断言握手值而非入参值。
+      expect(payload['agent']['version'], harness.remote.agentVersion);
+      expect(harness.remote.dials, 1);
+    });
+
+    test('station/request(action=request/state/close) ⇒ 分发到同一套台账', () async {
+      // 先经站点建一条隧道（复用 ensure 分发的同一 TunnelManager）。
+      await harness.request(71, StationMethods.request, <String, dynamic>{
+        'payload': <String, dynamic>{
+          'action': SshExecuteStation.ensure,
+          'config': configJson(),
+        },
+      });
+      final String conn = harness.loop.manager.tunnels.single.connId;
+
+      harness.remote.handler =
+          (String method, Map<String, dynamic> params) =>
+              <String, dynamic>{'seen': method};
+      await harness.request(72, StationMethods.request, <String, dynamic>{
+        'payload': <String, dynamic>{
+          'action': SshExecuteStation.request,
+          'conn_id': conn,
+          'method': AgentMethods.fsStat,
+          'params': <String, dynamic>{'path': '/a'},
+        },
+      });
+      final Map<String, dynamic> reqPayload =
+          (harness.resultOf(72)['reply']['payload'] as Map).map(
+        (dynamic k, dynamic v) => MapEntry('$k', v),
+      );
+      expect(reqPayload['ok'], isTrue);
+      expect(reqPayload['result']['seen'], AgentMethods.fsStat);
+
+      await harness.request(73, StationMethods.request, <String, dynamic>{
+        'payload': <String, dynamic>{
+          'action': SshExecuteStation.state,
+          'conn_id': conn,
+        },
+      });
+      final Map<String, dynamic> statePayload =
+          (harness.resultOf(73)['reply']['payload'] as Map).map(
+        (dynamic k, dynamic v) => MapEntry('$k', v),
+      );
+      expect(statePayload['tunnels'], hasLength(1));
+
+      await harness.request(74, StationMethods.request, <String, dynamic>{
+        'payload': <String, dynamic>{
+          'action': SshExecuteStation.close,
+          'conn_id': conn,
+        },
+      });
+      expect(harness.remote.closed, 1);
+    });
+
+    test('station/request 未知 action ⇒ {ok:false} 可读失败（核心据此回退）', () async {
+      await harness.request(75, StationMethods.request, <String, dynamic>{
+        'payload': <String, dynamic>{'action': 'explode'},
+      });
+      final Map<String, dynamic> payload =
+          (harness.resultOf(75)['reply']['payload'] as Map).map(
+        (dynamic k, dynamic v) => MapEntry('$k', v),
+      );
+      expect(payload['ok'], isFalse);
+      expect(payload['error'], contains('explode'));
+    });
+  });
+
   group('生命周期与并发', () {
     test('ping **不会**被慢 ensure 堵住（读循环不 await 业务）', () async {
       harness.dialer.delay = const Duration(milliseconds: 40);
