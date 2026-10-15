@@ -1,11 +1,15 @@
 # tree_ssh_plugin
 
 SSH 执行器新架构里的**「中转站」**（`ssh_executor`，**binary 型内置插件**，由核心 spawn 的本机进程）。
-它把"核心 ⇄ 目标机"的长链路收成两段：
+2026-10-15 定位重写：中转站 =「处理拓展点位」，本插件**订阅内置点位 `ssh.execute`**，
+核心把每次 SSH 操作投成一次 `station/request`（首选路径）；旧的 `tunnel.*` 方法 + `hello.capabilities`
+**作为兼容层保留**（只服务订不上点位的旧核心）。它把"核心 ⇄ 目标机"的长链路收成两段：
 
 ```
-核心 ──stdio 行分隔 JSON-RPC 2.0（L1）──▶ 本插件 ──一条常驻 SSH exec 通道（L2）──▶ tree_agent（目标机）
+核心 ──L1：站点路径 `station/request`（首选）或旧 `tunnel.*`（兼容）──▶ 本插件 ──一条常驻 SSH exec 通道（L2）──▶ tree_agent（目标机）
 ```
+
+> 两条 L1 路径共用同一个 `TunnelManager` 台账与同一个 `TunnelSshTransport`，行为/失败分类/回退判据逐条一致。
 
 ## 职责（只做这四件事）
 
@@ -23,10 +27,13 @@ SSH 执行器新架构里的**「中转站」**（`ssh_executor`，**binary 型�
    退避**累计时长上限 30 分钟**，耗尽 ⇒ 自标 `down`（核心据此回退内置 dartssh2）。
    `ready` 期间**定时 `agent.ping` 保活**（20s / 单次 10s 窗口 / 连丢 3 拍 ⇒ 拆掉重建）——
    "进程还在但不回帧"的卡死也由此换得掉（`tunnel.reconnect` 走同一探针，不再是 no-op）。
-4. **申报能力**：`hello` 回 `capabilities: ["ssh-executor"]` —— 核心判断"有没有中转站"的**唯一判据**。
+4. **双信号上报「有中转站」**：握手后主动 `station/subscribe` 订上 `ssh.execute` 点位（首选判据）；
+   同时 `hello` 仍回 `capabilities: ["ssh-executor"]`（兼容判据，只报能力不订点位的旧核心据此走 `tunnel.*`）。
+   核心侧两信号 **OR** ⇒ 热切换窗口两种启动顺序都稳定。
 
 **它不做**：不做临终回退（插件崩了就等于"没有中转站"，核心下一次 IO 解析自然走内置 —— 插件不必知道内置存在）；
-不做端口转发；不申报任何工具、不订阅任何点位（执行器是**通道**不是点位）；不自动重放在途请求。
+不做端口转发；不申报工具；不自动重放在途请求。（注：旧文档曾写"执行器是通道不是点位、不订阅任何点位"，
+2026-10-15 迁移后已作废：本插件现在**订 `ssh.execute` 中转点位**，与工具改写同构。）
 
 ## 内容
 
@@ -57,7 +64,9 @@ SSH 执行器新架构里的**「中转站」**（`ssh_executor`，**binary 型�
 2. **读循环不 await 业务**：每个请求在独立 Future 里处理，`ping` 永远立即回（否则一次慢 `tunnel.ensure` 就会让核心判 degraded）。
 3. **方法名/错误码/帧编解码只来自 `tree_tunnel_protocol`**：插件里不出现第二份 `"fs.read"` / `-32002` 之类的字面量
    （标准插件方法 `hello`/`ping`/`tools/list`/`shutdown` 不在那个包里，因此在 `plugin_loop.dart` 里定义一次常量）。
-4. **`hello.capabilities` 必须含 `ssh-executor`**：这是核心"有没有中转站"的唯一判据。
+4. **上报「有中转站」的两信号缺一不可**：`hello.capabilities` 必须含 `ssh-executor`（兼容旧核心的判据），
+   握手后还要主动 `station/subscribe` 订上 `ssh.execute`（新核心的首选判据）——核心侧两信号 **OR**，
+   只报能力不订点位⇒旧 `tunnel.*` 路仍通，订上点位⇒首选站点投递。
 5. **`tunnel.ensure` 的失败面必须分类**（`error_kind`）：`config_incomplete`（本机配置不全，**不回退**）、
    `arch_unsupported` / `handshake_failed`（不可调和 ⇒ 直接 `down`）、`agent_unreachable` / `push_failed` /
    `spawn_failed`（可重试 ⇒ 退避）。**每一步失败都不静默**（每一步都带可读原因）。

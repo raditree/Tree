@@ -15,6 +15,15 @@ import 'plugin_host.dart';
 /// 选插件（按能力）、发请求、把插件的失败面翻成 [TunnelUnavailableException]
 /// （带 `kind`，核心据此决定"回退 vs 如实暴露"）、把 `tunnel/event` 通知按
 /// `conn_id` 分发给对应的会话。
+///
+/// **定位（2026-10-15：SSH 迁移到「处理拓展点位」）——本类降级为兼容层**：
+/// SSH 执行的首选路径改走 [StationTunnelLink]（插件订上 `ssh.execute` 点位后，
+/// 每个动作投成一次 `station/request`）。本类只为**只申报 capability、不订阅点位**
+/// 的旧插件保留：选路时「站点已订 ⇒ 走 [StationTunnelLink]，否则回退本类」。
+/// 两者**复用同一个** `TunnelSshTransport`（liveness / PTY / 回退判据逐条一致），
+/// 共享的是机制而非协议帧——故这里不删除、不改行为，仅在热切换窗口内与站点路径并存。
+/// PTY 出口同理：本类独占 [PluginBus.onTunnelEvent] 字段（单消费者、行为不变），
+/// 站点路径另用多消费者监听器列表，两条各按全局唯一 `conn_id` 认领、互不串道。
 class PluginTunnelLink implements TunnelLink {
   PluginTunnelLink(this._bus, [this._log]) {
     // 挂上唯一的通知出口（`PluginBus.onTunnelEvent`）。

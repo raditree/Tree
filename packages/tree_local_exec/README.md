@@ -18,8 +18,8 @@
 | [lib/src/ssh_reconnect.dart](lib/src/ssh_reconnect.dart) | **重连的节拍器** `SshReconnectPump`：单飞 + 退避 + 可停止（与 dartssh2 无关，所以能单测） |
 | [lib/src/ssh_link_fault.dart](lib/src/ssh_link_fault.dart) | **链路级故障中继** `SshLinkFaultRelay`：一次远端操作以**链路级**错误失败（如服务端开始拒绝新的 session 通道）时，也起一次后台重建——与心跳失活**共用同一个**节拍器 |
 | [lib/src/dartssh_transport.dart](lib/src/dartssh_transport.dart) | dartssh2 传输实现：连接 / SFTP / exec / 远端 shell 通道 / **心跳与自动重连**（`reconnect()` 单飞换会话） |
-| [lib/src/tunnel_link.dart](lib/src/tunnel_link.dart) | **中转站**的连接请求（`TunnelConnectRequest`）与能力接口：`TunnelLink` / `TunnelSession`（核心侧的 `PluginTunnelLink` 实现它）、`TunnelUnavailableException`（带 `kind`，核心据此决定「回退 vs 如实暴露」）、`FallbackableWorkspace`（隧道判死 ⇒ 核心撤换缓存） |
-| [lib/src/tunnel_ssh_transport.dart](lib/src/tunnel_ssh_transport.dart) | **中转站传输实现** `TunnelSshTransport`：把 `SshTransport` 的每个方法映射成一次转给目标机 `tree_agent` 的 JSON-RPC；心跳 = 每 I 拉一次 `tunnel.state`；**完全不依赖 dartssh2** |
+| [lib/src/tunnel_link.dart](lib/src/tunnel_link.dart) | **中转站**的连接请求（`TunnelConnectRequest`，含仅核心侧用的 `scopeAgentId`）与能力接口：`TunnelLink` / `TunnelSession`（核心侧首选由 `StationTunnelLink` 实现——走 `ssh.execute` 点位；旧 `PluginTunnelLink` 作兼容层——走 `tunnel.*`）、`TunnelUnavailableException`（带 `kind`，核心据此决定「回退 vs 如实暴露」）、`FallbackableWorkspace`（隧道判死 ⇒ 核心撤换缓存） |
+| [lib/src/tunnel_ssh_transport.dart](lib/src/tunnel_ssh_transport.dart) | **中转站传输实现** `TunnelSshTransport`：把 `SshTransport` 的每个方法映射成一次转给目标机 `tree_agent` 的 JSON-RPC；心跳 = 每 I 经 `TunnelSession.snapshot()` 拉一次状态快照（旧路 `tunnel.state`、站点路 `ssh.execute` 的 `state` 动作）；**完全不依赖 dartssh2**，与选路（站点/旧插件）无关 |
 | [lib/src/tunnel_background.dart](lib/src/tunnel_background.dart) | 「后台执行」的**隧道托管**能力接口 `TunnelBackgroundExec`（只有中转站后端实现；内置 dartssh2 没有它 ⇒ 自动退回 `nohup` + 哨兵轮询） |
 | [lib/src/windows_environment.dart](lib/src/windows_environment.dart) | **按登录口径重建环境变量**（注册表机器级 + 用户级；失败整体退回继承）——本地 exec / git / PTY / hook 共用 |
 | [lib/src/ssh_login_shell.dart](lib/src/ssh_login_shell.dart) | **远端命令的登录外壳包装**（`bash -lc` → `sh -lc` → 原样发；可配可关）+ POSIX 单引号转义 |

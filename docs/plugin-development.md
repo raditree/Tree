@@ -124,7 +124,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | 中转站 relay | 拦截-回填：核心把数据交给你，你决定改不改 | 订阅；**每个点位唯一订阅者** |
 | 收集站 collect | 一对多收集 + 汇聚，不回填原数据流 | 由核心按接入点代订阅（工具定义） |
 
-### 3.1 全部内置点位（17 个 id）
+### 3.1 全部内置点位（20 个 id：广播 4 + 执行 8 + 中转 7 + 收集 1）
 
 | 点位 id | 类型 | 触发时机 | 回填/产出 |
 |---|---|---|---|
@@ -134,6 +134,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.relay.llm.request` | 中转 | 同一位置，**仅未被接管时** | 改写请求体（messages/tools/参数） |
 | `system.relay.context.compact` | 中转 | 要压缩上下文时（规划也归你） | 产出**摘要侧上下文** + 覆盖切点下标（之后的原文由核心追加） |
 | `system.relay.prompt.system` | 中转 | 每轮构造系统提示词时 | 产出最终 system prompt |
+| `system.relay.ssh.execute` | 中转 | 每次 SSH 工作空间操作（建/销隧道、读写、命令、拉心跳、开 PTY）时 | 订阅者（`ssh_executor` 插件）自己完成到目标机的通信，以同一形状 payload 回包；**无订阅者 fail-open 回退内置 dartssh2**（别名 `ssh.execute`，详见 [ssh-tunnel-protocol.md](ssh-tunnel-protocol.md) §2） |
 | `system.execute.fs` | 执行 | — | `fs.read` / `fs.write` / `fs.list` / `fs.grep` |
 | `system.execute.terminal` | 执行 | — | `terminal.exec` |
 | `system.execute.agent` | 执行 | — | `agent.message` / `agent.stop` / `agent.compact` |

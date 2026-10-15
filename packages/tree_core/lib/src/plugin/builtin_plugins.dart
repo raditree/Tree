@@ -211,9 +211,14 @@ class BuiltinPluginCatalog {
       granularity: 'team',
       scope: <String, dynamic>{},
     ),
-    // 2026-10-10：SSH 执行器的**中转站**（binary 型）。它不是"点位订阅者"，
-    // 而是一条常驻通道的持有者：核心的 `TunnelSshTransport` 经它把工作空间 IO
-    // 转发给目标机上的 tree_agent（协议见 docs/ssh-tunnel-protocol.md）。
+    // 2026-10-10：SSH 执行器的**中转站**（binary 型）。
+    // 2026-10-15 定位重写：中转站 =「处理拓展点位」，SSH 执行因此与工具改写同构——
+    // 插件订阅内置点位 `system.relay.ssh.execute`（别名 `ssh.execute`），核心把每次 SSH
+    // 操作（建隧道 / 读写 / 命令 / PTY / 心跳）经 `PluginBus.relaySshExecute` 投成一次
+    // `station/request`（首选路径：`StationTunnelLink`）。旧的 `tunnel.*` 方法 + hello.capabilities
+    // 作为**兼容层保留**（只报能力、不订点位的旧核心仍走 `PluginTunnelLink`），两条复用
+    // 同一个 `TunnelSshTransport`，选路任信号命中即认「有中转站」⇒ 热切换两种启动顺序都稳定。
+    // 无订阅者 / 心跳丢 / 回包非法 ⇒ fail-open 回退内置 dartssh2（协议见 docs/ssh-tunnel-protocol.md）。
     // `defaultEnabled: true` = 首次随包出现即默认开启（用户 2026-10-10 拍板）。
     BuiltinPluginSpec(
       id: kSshExecutorPluginId,

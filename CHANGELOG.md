@@ -19,6 +19,23 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **SSH 执行从「平行通道协议」迁入中转站点位**（**修改**
+  [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 17（重写定位）、
+  [docs/ssh-tunnel-protocol.md](docs/ssh-tunnel-protocol.md) §0/§2、
+  [docs/plugin-development.md](docs/plugin-development.md) §3.1、[docs/architecture.md](docs/architecture.md)）：
+  - **中转站的新定位 =「处理拓展点位」**（不只「数据拦截-回填」）：新增内置点位
+    `system.relay.ssh.execute`（别名 `ssh.execute`，中转站**唯一订阅者**），SSH 执行因此与工具改写**同构**，
+    **共用中转站四条不变量**（fail-open / scope 校验 / 唯一订阅者 / 无静态超时）。内置点位总数 **17→20**
+    （中转 6→7），`station_points_test` 钉住 `StationPoints.all.length == 20`。
+  - **选路优先站点、回退旧插件、再回退内置**：核心把每个 SSH 动作（`ensure`/`request`/`state`/`reconnect`/`close`）
+    投成一次 `station/request`（`PluginBus.relaySshExecute`，`StationTunnelLink`）；旧的 `tunnel.*` 方法 +
+    `hello.capabilities` **作为兼容层保留**（`PluginTunnelLink`，只服务不订点位的旧插件）。两信号核心 **OR**
+    ⇒ 热切换窗口两种启动顺序都稳定；**两条复用同一个 `TunnelSshTransport`**（liveness / PTY / 回退判据逐条一致），
+    稳定性不回归。
+  - **降级仍只发生在「有没有中转站」这一维且永远明示**（不变量 12 不破）：可回退类失败直接落内置 dartssh2，
+    **不做「站点失败再撞一遍旧路」**（同插件同台账同结果）。**判死口径**：插件重启 ⇒ 台账清空 ⇒ `conn_id` 消失
+    ⇒ `snapshot.down` ⇒ 如实判死（与旧路径一致）。
+
 - **插件内置站点的三条定稿**（**新增**
   [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 20/21/22、
   **新增** [packages/tree_core/lib/src/server/README.md](packages/tree_core/lib/src/server/README.md) 不变量 17、

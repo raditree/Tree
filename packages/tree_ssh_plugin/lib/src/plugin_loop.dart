@@ -221,6 +221,9 @@ class PluginLoop {
           await shutdown();
           return;
         case TunnelMethods.ensure:
+          // ── `tunnel.*`（兼容层）：只服务「只报 capability、不订点位」的旧核心 ──
+          // 新路径是下面的 `StationMethods.request`（ssh.execute 点位）；两条共用同一
+          // [_manager] 台账，故行为、失败分类、回退判据完全一致（不做"两条路各一份状态"）。
           _reply(id, await _manager.ensure(params));
           // 面板跟着台账走：**建隧道 / 复用 / 建失败**都把当前态刷一遍（用户正等着看的那一次）。
           _panel.refresh(force: true);

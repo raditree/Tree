@@ -14,10 +14,14 @@
 新模型把"执行"搬到一个**常驻在目标机上的进程**（`tree_agent`）里，核心只跟它说 JSON-RPC：
 
 ```
-WorkspaceToolRunner.sshIoFactory（唯一解析点）
+WorkspaceToolRunner.sshIoFactory（唯一解析点，据 owner agentId 解析站点作用域）
  │
  ├─ 有中转站（首选）：ssh_executor 插件在、启用、隧道可用
- │    核心 TunnelSshTransport ──stdio JSON-RPC──▶ ssh_executor 插件
+ │    两条等价投递路径（复用同一个 TunnelSshTransport，liveness / PTY / 回退判据全同）：
+ │    ① 站点路径（2026-10-15 首选）：插件订上 `ssh.execute` 点位 ⇒
+ │       核心 StationTunnelLink ──station/request（relaySshExecute）──▶ ssh_executor 插件
+ │    ② 兼容路径（旧插件）：插件只报 capability、不订点位 ⇒
+ │       核心 PluginTunnelLink ──tunnel.*（stdio JSON-RPC）──▶ ssh_executor 插件
  │                                                  │
  │                                                  └──一条常驻 SSH exec 通道（stdio JSON-RPC）──▶ tree_agent
  │                                                                                                  （真正干活）
@@ -91,9 +95,22 @@ WorkspaceToolRunner.sshIoFactory（唯一解析点）
 > `tunnel.state` 是**权威的拉取面**（核心每 `heartbeat_interval` 拉一次，当作这条隧道的心跳证据）；
 > `tunnel/event` 只是**及时性**补充。核心**不依赖**推送也能正确判活 —— 推送丢了不致命。
 
-**为什么工具面不用站点体系**：执行器是一条**通道**，不是一个"点位"。
-它没有 `team_id/agent_id/session_id/mode_key` 这层语义，也不会申报工具 ⇒ **不进 17 个点位**、
-不受站点隔离矩阵约束。`plugins.yaml` 里这条的 `scope` 留空（与 sample 插件同形状）。
+**投递路径与站点体系（2026-10-15 定位重写）**：中转站 = **「处理拓展点位」**，不再只是
+「数据拦截-回填」。SSH 执行因此新增内置点位 `system.relay.ssh.execute`（别名 `ssh.execute`，
+**中转站唯一订阅者**），核心把每个动作（`ensure` / `request` / `state` / `reconnect` / `close`）
+投成一次 `station/request`，payload 带 `action`（与去掉 `tunnel.` 前缀同名）、回包形状与 `tunnel.*`
+**逐条一致**。这条路径与 §2 的 `tunnel.*` **共存**：
+
+- **选路信号（OR）**：`PluginBus.sshExecuteStationSubscribed()`（新，看点位有没有订阅者）与
+  `sshExecutorLookup()`（旧，看 capability）任一命中即认「有中转站」——热切换窗口内两种启动顺序都稳定。
+- **兼容层**：`tunnel.*` 方法 + `hello.capabilities` 保留，只服务**只报能力、不订点位**的旧插件；
+  订了点位的走 `StationTunnelLink`。两条同一个 `TunnelManager` 台账、同一个 `TunnelSshTransport`，
+  不做「站点失败再撞一遍旧路」（同插件同结果）；可回退类失败一律直接落内置。
+- **scope**：SSH 点位**有**站点作用域——核心据 owner `agentId`（`TunnelConnectRequest.scopeAgentId`）
+  解析四元组投递（team 由调用点上下文、mode 认 `ssh`）；`plugins.yaml` 里这条仍 `scope` 留空（通配订阅）。
+
+> 旧文档曾说「执行器是一条通道、不进点位」——那是迁移前的口径，现已作废：SSH 执行与工具改写
+> 同构，共用中转站四条不变量（fail-open / scope 校验 / 唯一订阅者 / 无静态超时）。
 
 ## 3. L2：插件 ⇄ tree_agent
 

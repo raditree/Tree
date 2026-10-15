@@ -52,6 +52,10 @@ void main(List<String> args) {
   // 带 `action` 的投递回**隧道形状**的回包（ensure/request/state/reconnect/close）。
   // 用于核心侧 `StationTunnelLink` 的端到端选路测试（无需真 sshd）。
   final bool sshExecute = args.contains('--ssh-execute');
+  // 与 --ssh-execute 同形，但 `state` 回**空台账**（模拟插件重启后 conn_id 消失）——
+  // 用于钉住站点路径的「快照判死」：`snapshot()` 见列表里没有本 conn_id ⇒ 如实返回 down。
+  final bool sshExecuteDown = args.contains('--ssh-execute-down');
+  final bool sshExecuteFamily = sshExecute || sshExecuteDown;
   final bool uiManifest = args.contains('--ui-manifest');
   final bool uiManifestForeign = args.contains('--ui-manifest-foreign');
   String relayRewrite = 'REWRITTEN';
@@ -71,7 +75,7 @@ void main(List<String> args) {
     if (args[i] == '--ui-team') uiTeam = args[i + 1];
   }
   // SSH 执行接管者默认显式订 `ssh.execute`（留空 relay 只订工具前/后）。
-  if (sshExecute && relayPoint.isEmpty) relayPoint = 'ssh.execute';
+  if (sshExecuteFamily && relayPoint.isEmpty) relayPoint = 'ssh.execute';
 
   /// 插件**主动**发起的请求：id → 等待核心响应的 completer。
   final Map<Object?, Completer<Map<String, dynamic>>> pendingRequests =
@@ -153,7 +157,7 @@ void main(List<String> args) {
     }
   }
 
-  if (relaySubscribe || sshExecute) {
+  if (relaySubscribe || sshExecuteFamily) {
     // hello 握手后核心已能处理请求；用 microtask 让读循环先跑起来。
     scheduleMicrotask(subscribeRelay);
   }
@@ -332,7 +336,7 @@ void main(List<String> args) {
             : <String, dynamic>{};
         // **SSH 执行接管**（--ssh-execute）：按 `action` 回隧道形状回包，与核心侧
         // `StationTunnelLink` 的解析口径一致（`{ok, conn_id, root, agent}` / `{ok, tunnels}` …）。
-        if (sshExecute && payloadMap.containsKey('action')) {
+        if (sshExecuteFamily && payloadMap.containsKey('action')) {
           final String action = (payloadMap['action'] ?? '').toString();
           final String connId = (payloadMap['conn_id'] ?? 'conn-fake-1').toString();
           late final Map<String, dynamic> out;
@@ -349,21 +353,40 @@ void main(List<String> args) {
                 },
               };
             case 'request':
+              // PTY 探针：先**主动推一帧 `tunnel/event`**（shell.data），再回包。
+              // 核心侧靠这一条同时喂旧 `onTunnelEvent` 字段与新监听器列表（fan-out）。
+              if ((payloadMap['method'] ?? '').toString() == 'ssh.pty.emit') {
+                stdout.writeln(
+                  jsonEncode(<String, dynamic>{
+                    'jsonrpc': '2.0',
+                    'method': 'tunnel/event',
+                    'params': <String, dynamic>{
+                      'conn_id': connId,
+                      'kind': 'shell.data',
+                      'shell_id': 'shell-1',
+                      'data': base64Encode(utf8.encode('PTY-BYTES')),
+                    },
+                  }),
+                );
+              }
               out = <String, dynamic>{
                 'ok': true,
                 'result': <String, dynamic>{'seen': payloadMap['method']},
               };
             case 'state':
+              // 判死变体：回**空台账**（本 conn_id 不在列 ⇒ 核心 snapshot 如实判 down）。
               out = <String, dynamic>{
                 'ok': true,
-                'tunnels': <Map<String, dynamic>>[
-                  <String, dynamic>{
-                    'conn_id': connId,
-                    'state': 'ready',
-                    'root': '/home/fake',
-                    'agent': <String, dynamic>{'version': '9.9.9'},
-                  },
-                ],
+                'tunnels': sshExecuteDown
+                    ? const <Map<String, dynamic>>[]
+                    : <Map<String, dynamic>>[
+                        <String, dynamic>{
+                          'conn_id': connId,
+                          'state': 'ready',
+                          'root': '/home/fake',
+                          'agent': <String, dynamic>{'version': '9.9.9'},
+                        },
+                      ],
               };
             case 'reconnect':
             case 'close':

@@ -35,12 +35,12 @@ Flutter UI 进程（lib/）                     核心进程（packages/tree_cor
 | `WorkspaceToolRunner` | 工具表组装（内置 + MCP + 插件）+ 工具执行 + 工作空间 IO 缓存与**私有目录分栏** |
 | `WorkspaceIO`（`tree_local_exec`） | 本机（`dart:io`）与 SSH 同一接口：读 / 写 / 编辑 / grep / 列目录 / exec / git。**SSH 后端有两条并列实现**：内置 `DartSshTransport`（dartssh2）与 `TunnelSshTransport`（经 `ssh_executor` 插件连目标机 `tree_agent`），由 `sshIoFactory` 选路 |
 | `tree_agent`（目标机执行体） | **跑在目标机 Linux 上**的单文件二进制：stdio 行分隔 JSON-RPC 2.0 承接文件读写 / 前台命令 / **托管的**后台命令 / PTY。协议见 [ssh-tunnel-protocol.md](ssh-tunnel-protocol.md) |
-| `ssh_executor`（插件，内置） | SSH 执行器的**中转站**：一次 SSH bootstrap（推 agent + 拉起 + 握手）之后，只用那一条常驻通道转发 JSON-RPC；断线按退避重连，退避耗尽自标 `down`（核心据此回退内置）；`ready` 期间定时 `agent.ping` 保活（20s/10s/3 拍）与"卡死强拆"，重建前按一次性 token 收掉上一世 agent |
+| `ssh_executor`（插件，内置） | SSH 执行器的**中转站 =「处理拓展点位」**（2026-10-15 定位重写）：插件订阅内置点位 `ssh.execute`，核心把每次 SSH 操作投成一次 `station/request`（首选路径 `StationTunnelLink`；旧 `tunnel.*` 作兼容层保留，只服务不订点位的旧插件，两条复用同一个 `TunnelSshTransport`）。一次 SSH bootstrap（推 agent + 拉起 + 握手）之后，只用那一条常驻通道转发 JSON-RPC；断线按退避重连，退避耗尽自标 `down`（核心据此回退内置）；`ready` 期间定时 `agent.ping` 保活（20s/10s/3 拍）与"卡死强拆"，重建前按一次性 token 收掉上一世 agent |
 | `TreeStore` | 数据根读写：`agents/*.yaml`、`config/*.yaml`、`data/<agent>/<session>/{session.json,messages.jsonl}`，写入走 write-behind 队列 |
 | `TeamService` + `MessageDispatcher` | 成员即 agent；创建/审核/移除；派活、广播、`wait_for`；活动日志；失活 fail-closed + 待补发 |
 | `SpecService` | 内置规范播种 + 自定义规范扫描 + 索引/已选全文两个快照（进系统提示词） |
 | `McpService` | stdio / Streamable HTTP MCP 客户端；懒连接、心跳判活、工具命名空间化 |
-| `PluginBus` + 站点体系 | 插件子进程 JSON-RPC；广播 / 执行 / 中转 / 收集四类站点、17 个点位 |
+| `PluginBus` + 站点体系 | 插件子进程 JSON-RPC；广播 / 执行 / 中转 / 收集四类站点、20 个点位（中转站含 `ssh.execute`）|
 
 ## 3. 一次会话运行的链路
 
@@ -192,7 +192,7 @@ yaml 里**不属于已知键**的内容会被原样保留并写回（用户手�
 | --- | --- |
 | 消息发送（WS / 团队派发） | 无静态上限；连接心跳丢失 ⇒ 判失活并**登记补发**，重连后重播（帧无 TTL） |
 | 执行器命令（local / ssh） | 无静态上限；心跳连续丢失 N 拍 ⇒ 判失活、在途操作显式失败，**传输层随即按退避自动重建连接**（单飞，5s→10s→30s→60s 之后每 60s 一次；退避是节奏不是时长上限）。**另有「链路级故障」触发面**（2026-10-07）：心跳仍活、但服务端开始**拒绝新通道**（`SSHChannelOpenError`）时，一次失败的操作即可拉起**同一份**重建——判死判据仍只看心跳，只是扩大「主动重建」的触发面。用户不想等时走**显式入口** `POST /api/agents/{agentId}/ssh/reconnect`（右栏文件错误块上的「重连」按钮；执行站另有 `ssh.reconnect` 命令），自动与显式共用同一次实现 |
-| **SSH 执行器中转站**（2026-10-10 新增） | 与上一行**同一套判据**（心跳 = 每 I 拉一次 `tunnel.state`；判死仍只看心跳丢失），只是重连由**插件**按 1s→2s→…→60s 退避做，**累计退避上限 30 分钟**⇒ 插件自标 `tunnel_down`。核心**视其为「无中转站」**：撤换缓存、下一次解析回退内置 dartssh2，并**日志明示**。红线见 [ssh-tunnel-protocol.md](ssh-tunnel-protocol.md) §0。**判死口径 2026-10-11 收敛**：只有"心跳快照 `down`"与"插件进程已不可用"两处能判死，**请求级失败一律不判死**（详见下面两行与 §13 不变量 15） |
+| **SSH 执行器中转站**（2026-10-10 新增；2026-10-15 迁移到 ssh.execute 点位） | 与上一行**同一套判据**（心跳 = 每 I 拉一次状态快照：站点路径投 `ssh.execute` 的 `state` 动作，兼容路径拉 `tunnel.state`；判死仍只看心跳丢失），只是重连由**插件**按 1s→2s→…→60s 退避做，**累计退避上限 30 分钟**⇒ 插件自标 `tunnel_down`。核心**视其为「无中转站」**：撤换缓存、下一次解析回退内置 dartssh2，并**日志明示**。红线见 [ssh-tunnel-protocol.md](ssh-tunnel-protocol.md) §0。**判死口径 2026-10-11 收敛**：只有"心跳快照 `down`"与"插件进程已不可用"两处能判死，**请求级失败一律不判死**（插件重启 ⇒ 台账空 ⇒ `conn_id` 消失 ⇒ 如实判死）（详见下面两行与 §13 不变量 15） |
 | **中转站托管的后台任务**（2026-10-10 新增） | 进程由目标机 `tree_agent` 托管（`setsid` 脱离 + 输出直写文件 + 退出码与台账**落目标机磁盘**）⇒ 通道断 / 核心崩 / 应用退**都不影响它**。判死只看目标机的事实（退出码文件 + `kill -0` 对账），**因此断链期间 `exitCode` 继续等而不失败**——这是相对 dartssh2 `nohup` + 本机轮询方案的一处语义改进（那次方案下本机确实不知道远端状态） |
 | **断连期间的 hook 口径**（2026-10-11 用户明确） | **还在退避重连** ⇒ 不发任何结束/失联通知、**也不猛戳**（核心侧按 30s 慢探，重试是插件的职责）；**退避耗尽（判死）** ⇒ 才以 `SshLinkStaleException` 收尾、投递**一次**提醒（"可能目标主机关闭、不要大量重试"）、此后不再探测 |
 | **断连期间的前台操作**（2026-10-11 用户明确） | 插件在 `connecting`/`booting`/`reconnecting` 时对请求回 `tunnel_not_ready`（**确定未执行**）⇒ 核心**等隧道回到 `ready` 再发一次**（不是重放；兜底预算 30 min）；只有判死才如实失败。修复前它报 `tunnel_down`，核心据此**立刻判死 + 立刻回退内置**——一次物理断网就让 hook 立即失败，正是用户报的那个症状 |
@@ -283,6 +283,6 @@ M9 阶段定的 14 项语义决策已全部实现，逐项的**实现记录**归
 | Q8 工具轮次上限 | 核心**不设上限**；要限由插件订阅 `agent.tool_call` 后 `agent.stop` | `llm/llm_session.dart`、`plugin/agent_events.dart` |
 | Q9 spec 工具瘦身 + 索引前置 | `spec` 只有 select/create/update；索引进系统提示词、`select` 直接返回全文 | `spec/spec_service.dart` |
 | Q10 grep 无匹配 | 返回**实际扫描清单**与生效的排除目录，区分"真没有"与"被排除" | `tree_local_exec` 的 `GrepOutcome` |
-| Q11 站点体系 | 四类站点 / 17 个点位 / 收集站申报工具 | §9、[plugin-development.md](plugin-development.md) |
+| Q11 站点体系 | 四类站点 / 20 个点位 / 收集站申报工具 | §9、[plugin-development.md](plugin-development.md) |
 | Q12 插件布局 | 前端与协议先行、核心侧接线；插件面板 / 编辑器 / UI 槽位 | `lib/ui/widgets/plugin_*`、`plugin/plugin_ui_bridge.dart` |
 | Q13 token rate 管道 | 思考 / 正文 / 工具参数**共用同一条节拍器**，速率现读设置 | `agent/conversation_service.dart` 的 `TokenPacer` |
