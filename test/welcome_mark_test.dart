@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:tree/ui/models/message.dart';
+import 'package:tree/ui/theme_service.dart';
 import 'package:tree/ui/widgets/message_list.dart';
 import 'package:tree/ui/widgets/welcome_mark.dart';
 
@@ -69,14 +70,17 @@ void main() {
     expect(decos[1].borderRadius, isNotNull);
   });
 
-  test('④ 渐变随主题：起点是主题主色，深 / 浅两套终点', () {
+  test('④ 渐变随主题：起点是主色，终点由主色派生（主题色可换后不再写死像素）', () {
     const ColorScheme dark = ColorScheme.dark(primary: Color(0xFF00FF8C));
     const ColorScheme light = ColorScheme.light(primary: Color(0xFF00904A));
 
     expect(WelcomeMark.gradientOf(dark).first, dark.primary);
     expect(WelcomeMark.gradientOf(light).first, light.primary);
-    expect(WelcomeMark.gradientOf(dark).last, const Color(0xFF00904A));
-    expect(WelcomeMark.gradientOf(light).last, const Color(0xFF00B45C));
+    // 终点从主色派生（选豆沙绿/薄荷绿/自定义时渐变跟着走），不再是写死的品牌字面量；
+    // 默认荧光绿下算出的尾色与原手写色板基本一致（由 theme_accent_test 单独钉）。
+    expect(WelcomeMark.gradientOf(dark).last, ThemeService.deriveDeep(dark.primary));
+    expect(
+        WelcomeMark.gradientOf(light).last, ThemeService.deriveMidGreen(light.primary));
   });
 
   testWidgets('⑤ 不许回到底层 emoji（平台彩色，染不上主题色）',

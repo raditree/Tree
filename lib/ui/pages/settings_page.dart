@@ -21,6 +21,7 @@ import '../widgets/core_log_card.dart';
 ///   （M9 规约 1.1 取消了静态时间超时）；判活窗口 I×N 必须大于前端固定的 10s 心跳
 /// - 自定义模型：模型池 CRUD（M2 起落 `~/.tree/config/models/*.yaml`）
 /// - 主题管理：浅色 / 深色 / 跟随系统三种模式
+/// - 主题色：荧光绿 / 豆沙绿 / 薄荷绿 / 自定义十六进制（晃眼可换护眼色）
 /// - 窗口与托盘：关闭按钮行为的开关 + 真正的退出入口
 /// - 插件开发：文档入口（打开 `plugins/README.md`）+ 插件目录定位
 /// - 版本信息：应用 / 核心 / 接口契约 / 核心进程与产物（含"核心比界面旧"告警）
@@ -439,6 +440,10 @@ class _SettingsPageState extends State<SettingsPage> {
           _buildSectionTitle('主题管理'),
           const SizedBox(height: 8),
           _buildThemeCard(),
+          const SizedBox(height: 24),
+          _buildSectionTitle('主题色'),
+          const SizedBox(height: 8),
+          const _AccentColorCard(),
           const SizedBox(height: 24),
           _buildSectionTitle('文字大小'),
           const SizedBox(height: 8),
@@ -1863,6 +1868,204 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
         ),
         ElevatedButton(onPressed: _submit, child: Text(_isEdit ? '保存' : '创建')),
       ],
+    );
+  }
+}
+
+/// 主题色卡片：荧光绿 / 豆沙绿 / 薄荷绿 / 自定义（十六进制颜色码）。
+///
+/// 背景是用户反馈「荧光绿色块长期使用会晃眼」：主亮色块（用户消息气泡等）
+/// 大面积铺在屏幕上，高饱和荧光绿看久了刺眼。这里选的颜色就是
+/// `colorScheme.primary` 的来源，整套派生色（容器/边线/选中态）跟着换，
+/// 实时生效并持久化（见 [ThemeService] 与 `main.dart` 的主题构建）。
+///
+/// 自定义输入框的提交时机：输入过程中只做合法性校验（实时预览色块 + 报错），
+/// 回车/失焦才真正应用并落盘——否则每敲一个字符都重建一遍全局主题。
+class _AccentColorCard extends StatefulWidget {
+  const _AccentColorCard();
+
+  @override
+  State<_AccentColorCard> createState() => _AccentColorCardState();
+}
+
+class _AccentColorCardState extends State<_AccentColorCard> {
+  final TextEditingController _hexController = TextEditingController();
+  final FocusNode _hexFocus = FocusNode();
+
+  /// 输入框是否已用服务端的当前值初始化过（只在首次同步，不打断正在编辑的草稿）
+  bool _hexSynced = false;
+
+  /// 当前输入的十六进制是否合法（只管报错展示，非法时不应用）
+  bool _hexValid = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _hexController.addListener(_onHexChanged);
+  }
+
+  @override
+  void dispose() {
+    _hexController.removeListener(_onHexChanged);
+    _hexController.dispose();
+    _hexFocus.dispose();
+    super.dispose();
+  }
+
+  /// 输入过程：只校验格式并刷新预览，不切选项、不落盘
+  void _onHexChanged() {
+    setState(() {
+      _hexValid = ThemeService.parseUserHex(_hexController.text) != null;
+    });
+  }
+
+  /// 回车/失焦提交：合法才应用（ThemeService 内部还会再挡一道非法值）
+  void _submitHex() {
+    final String text = _hexController.text.trim();
+    if (text.isEmpty) return;
+    ThemeService.instance.applyCustomAccent(text);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final ThemeService service = ThemeService.instance;
+    if (!_hexSynced) {
+      _hexSynced = true;
+      _hexController.text = service.customAccentHex;
+      _onHexChanged();
+    }
+    final bool customSelected = service.accentKey == ThemeService.customAccentKey;
+    // 预览色：输入合法用输入值；已选自定义但输入非法时回退到当前生效色
+    final Color previewColor = ThemeService.parseUserHex(_hexController.text) ??
+        service.accentColor;
+    return Card(
+      margin: EdgeInsets.zero,
+      child: AnimatedBuilder(
+        animation: service,
+        builder: (BuildContext context, Widget? child) {
+          return RadioGroup<String>(
+            groupValue: service.accentKey,
+            onChanged: (String? value) {
+              if (value != null && value != ThemeService.customAccentKey) {
+                service.setAccent(value);
+              }
+            },
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                ...ThemeService.accentPresets.map(
+                  (AccentPreset p) => _buildAccentOption(
+                    value: p.key,
+                    swatch: p.color,
+                    title: p.label,
+                    subtitle: '#${p.hex}',
+                  ),
+                ),
+                RadioListTile<String>(
+                  key: const Key('accent-custom-option'),
+                  value: ThemeService.customAccentKey,
+                  activeColor: cs.primary,
+                  title: const Text('自定义'),
+                  subtitle: const Text('输入十六进制颜色码，如 #7FD1AE'),
+                ),
+                // 自定义色号输入：所有选项下同宽展示，不必先选中才能填值
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                  child: Row(
+                    children: <Widget>[
+                      _SwatchChip(color: previewColor),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: TextField(
+                          key: const Key('accent-custom-field'),
+                          controller: _hexController,
+                          focusNode: _hexFocus,
+                          maxLength: 7,
+                          inputFormatters: <TextInputFormatter>[
+                            FilteringTextInputFormatter.allow(
+                                RegExp(r'[0-9a-fA-F#]')),
+                          ],
+                          textCapitalization: TextCapitalization.characters,
+                          style: const TextStyle(fontSize: 13),
+                          decoration: InputDecoration(
+                            isDense: true,
+                            counterText: '',
+                            hintText: '#RRGGBB',
+                            errorText: _hexValid ? null : '格式非法，应为 #RRGGBB',
+                            border: const OutlineInputBorder(),
+                          ),
+                          onSubmitted: (_) => _submitHex(),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      SizedBox(
+                        width: 92,
+                        child: FilledButton(
+                          key: const Key('accent-custom-apply'),
+                          style: FilledButton.styleFrom(
+                            backgroundColor: cs.primary,
+                            foregroundColor: cs.onPrimary,
+                          ),
+                          onPressed: _hexValid ? _submitHex : null,
+                          child: Text(customSelected ? '已应用' : '应用'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+                  child: Text(
+                    '荧光绿长期使用晃眼时，可换豆沙绿/薄荷绿等低饱和护眼色；'
+                    '选中即时生效，重启后保留。',
+                    style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  /// 单个预设选项：左侧色块预览，副标题直接标出色号
+  Widget _buildAccentOption({
+    required String value,
+    required Color swatch,
+    required String title,
+    required String subtitle,
+  }) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return RadioListTile<String>(
+      key: Key('accent-option-$value'),
+      value: value,
+      activeColor: cs.primary,
+      secondary: _SwatchChip(color: swatch),
+      title: Text(title),
+      subtitle: Text(subtitle, style: const TextStyle(fontSize: 12)),
+    );
+  }
+}
+
+/// 主题色预览色块（圆角小方块，带描边以便深色下也看得见）
+class _SwatchChip extends StatelessWidget {
+  const _SwatchChip({required this.color});
+
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return Container(
+      width: 22,
+      height: 22,
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: cs.outlineVariant),
+      ),
     );
   }
 }

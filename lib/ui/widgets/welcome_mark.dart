@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../theme_service.dart';
+
 /// 中栏空态的欢迎标识：主题色的 `TREE` 字标 + HUD 三段线。
 ///
 /// 用户 2026-10-04：「中间页的 hello 标识有点 out-of-date 且与本应用主题色不合」——
@@ -43,15 +45,17 @@ class WelcomeMark extends StatelessWidget {
 
   /// 品牌渐变的两个色停。
   ///
-  /// 起点就是**主题主色**（深色 = 亮绿 `#00FF8C`、浅色 = 深绿 `#00904A`，随主题走），
-  /// 终点按主题补一个同族色：深色 → 应用图标那头的渐变深绿，浅色 → 中绿（白底上仍可读）。
+  /// 起点就是**主题主色**（深色 = 主题色、浅色 = 派生深绿，随主题走），
+  /// 终点也从主色派生一个同族色：深色 → 渐变深绿，浅色 → 中绿（白底上仍可读）。
   ///
-  /// 为什么终点写成字面量：品牌色板是 `main.dart` 里 `AgentTeamApp` 的静态常量，
-  /// 组件反向 import `main.dart` 会绕成一圈；这里只固定两个终点，起点仍随主题。
+  /// 为什么不再写死字面量：主题色可换（荧光绿/豆沙绿/薄荷绿/自定义），
+  /// 写死会让非绿色主题下渐变跳回荧光绿；两个终点都从主色派生（
+  /// [ThemeService.deriveDeep] / [ThemeService.deriveMidGreen]），默认主题色下
+  /// 算出的与原来手写那对基本一致，观感不变。
   static List<Color> gradientOf(ColorScheme cs) =>
       cs.brightness == Brightness.dark
-          ? <Color>[cs.primary, const Color(0xFF00904A)]
-          : <Color>[cs.primary, const Color(0xFF00B45C)];
+          ? <Color>[cs.primary, ThemeService.deriveDeep(cs.primary)]
+          : <Color>[cs.primary, ThemeService.deriveMidGreen(cs.primary)];
 
   @override
   Widget build(BuildContext context) {
