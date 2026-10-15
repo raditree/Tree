@@ -299,6 +299,54 @@ void main() {
       expect(events.whereType<LlmRetryNotice>(), isEmpty);
     });
 
+    test('普通 5xx 仍重试：端点自己出问题，恢复后可能自愈', () async {
+      final HttpSseTransport t = transport(retryBackoff: fast);
+      addTearDown(t.close);
+
+      final List<LlmStreamEvent> events = await t
+          .stream(
+            const LlmRequest(
+              model: 'boom',
+              messages: <LlmMessage>[LlmMessage.user('hi')],
+            ),
+          )
+          .toList();
+
+      expect(
+        events.whereType<LlmRetryNotice>(),
+        hasLength(5),
+        reason: '5xx 属于“抖动后自愈”那一类，退避满 5 次再报',
+      );
+      expect((events.last as LlmFailureEvent).statusCode, 500);
+    });
+
+    test('工具调用被 max_tokens 截断的 500：确定性失败，不重试，带可操作提示', () async {
+      final HttpSseTransport t = transport(retryBackoff: fast);
+      addTearDown(t.close);
+
+      final List<LlmStreamEvent> events = await t
+          .stream(
+            const LlmRequest(
+              model: 'tool-truncated',
+              messages: <LlmMessage>[LlmMessage.user('hi')],
+            ),
+          )
+          .toList();
+
+      expect(
+        events.whereType<LlmRetryNotice>(),
+        isEmpty,
+        reason: '重放同一请求必然断在同一个 token，重试是白烧一整轮 GPU 生成',
+      );
+      final LlmFailureEvent failure =
+          events.whereType<LlmFailureEvent>().single;
+      expect(failure.statusCode, 500);
+      expect(failure.retryable, isFalse);
+      expect(failure.message, contains('Failed to parse tool call'));
+      expect(failure.message, contains('max_tokens'));
+      expect(failure.message, contains('max_output_tokens'));
+    });
+
     test('退避等待期间取消：立刻结束，不等满退避', () async {
       _rawRemaining = -1; // 一直掐断
       bool cancelled = false;
@@ -340,6 +388,30 @@ Future<void> _handle(HttpRequest request) async {
         jsonEncode(<String, dynamic>{
           'error': <String, dynamic>{'message': 'invalid api key'},
         }),
+      );
+      await request.response.close();
+      return;
+    case 'boom':
+      // 普通 5xx：端点自己出问题（没有“确定性”指纹），重试口径照旧
+      request.response.statusCode = 500;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode(<String, dynamic>{
+          'error': <String, dynamic>{'message': 'internal server error'},
+        }),
+      );
+      await request.response.close();
+      return;
+    case 'tool-truncated':
+      // llama.cpp 真实形态：模型往工具入参里写正文，输出在 JSON 字符串中途
+      // 撞上 max_tokens，端点解析自家吐出的 arguments 失败后直接回 500
+      request.response.statusCode = 500;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        '{"error":{"code":500,"message":"Failed to parse tool call arguments '
+        'as JSON: [json.exception.parse_error.101] parse error at line 1, '
+        'column 1751: syntax error while parsing value - invalid string: '
+        'missing closing quote; last read: \\"### 3.2 热重启的两个层次\\\\n\\""}}',
       );
       await request.response.close();
       return;

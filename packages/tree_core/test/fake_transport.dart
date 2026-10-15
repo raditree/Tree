@@ -100,6 +100,9 @@ List<LlmStreamEvent> textScript(String text, {bool withUsage = true}) {
 }
 
 /// 组装一段"分片工具调用"的脚本：arguments 被切成 [splits] 段下发。
+///
+/// [finishReason] 默认 `tool_calls`；填 `length` 即模拟 max_tokens 截断
+///（端点真实形态：200 + 半截 arguments + finish_reason=length）。
 List<LlmStreamEvent> toolCallScript({
   required String name,
   required String arguments,
@@ -107,6 +110,7 @@ List<LlmStreamEvent> toolCallScript({
   int index = 0,
   int splits = 3,
   bool withUsage = true,
+  String finishReason = 'tool_calls',
 }) {
   final List<LlmStreamEvent> events = <LlmStreamEvent>[
     LlmToolCallDelta(index: index, id: callId, name: name),
@@ -133,6 +137,6 @@ List<LlmStreamEvent> toolCallScript({
       ),
     );
   }
-  events.add(const LlmFinishEvent('tool_calls'));
+  events.add(LlmFinishEvent(finishReason));
   return events;
 }

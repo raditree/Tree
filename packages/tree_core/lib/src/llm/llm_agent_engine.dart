@@ -699,15 +699,30 @@ class LlmAgentEngine implements AgentEngine {
               (ref.toolCallId != null && ref.toolCallId!.isNotEmpty)
               ? ref.toolCallId!
               : 'tool_result_${context.sessionId}_${i}_${ref.timestamp}';
+          // 参数串优先用**模型原文**（落库时存下来的那一份）：jsonEncode 的规范
+          // 形态与原文常常不同（空格 / 转义），差一个字节就等于换了前缀。
+          // **把关处截断修复**（用户 2026-10-15：「失败时自动修复」的同一口径）：
+          // max_tokens 截断的半截 arguments 已经在历史里（rawArguments 逐字回灌），
+          // llama.cpp 渲染模板解析它会 500 —— **整个会话中毒**。这里先修：合法串
+          // 零代价放行；半截串补全（嵌截断标记）；修不出来包壳存字符串——无论哪档
+          // 都**不换字节**除非必须（前缀缓存只对真正中毒的历史生效）。
+          String rawArgs = ref.toolArgumentsRaw;
+          if (rawArgs.isEmpty) {
+            rawArgs = jsonEncode(ref.toolArguments ?? const <String, dynamic>{});
+          } else if (!isValidToolArguments(rawArgs)) {
+            final String? repaired = repairTruncatedToolArguments(rawArgs);
+            rawArgs = repaired ??
+                jsonEncode(<String, String>{'truncated_arguments': rawArgs});
+            log?.call(
+              '历史工具调用（${ref.toolName ?? '?'}）的参数是半截 JSON（max_tokens 截断），'
+              '已在回灌前自动修复——否则端点解析历史会 500（会话中毒）',
+            );
+          }
           calls.add(
             LlmToolCall(
               id: callId,
               name: name,
-              // 参数串优先用**模型原文**（落库时存下来的那一份）：jsonEncode 的规范
-              // 形态与原文常常不同（空格 / 转义），差一个字节就等于换了前缀。
-              arguments: ref.toolArgumentsRaw.isNotEmpty
-                  ? ref.toolArgumentsRaw
-                  : jsonEncode(ref.toolArguments ?? const <String, dynamic>{}),
+              arguments: rawArgs,
             ),
           );
           // **把关处（用户 2026-10-03：「在引擎的把关处，失败时自动修复」）**：

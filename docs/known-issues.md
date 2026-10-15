@@ -2123,3 +2123,41 @@ terminal/subagent hook 完成消息）在工具调用期间必须排队等待」
 
 **顺带记下**：这类"判据写在'当前状态'上、而对象是'我绑定的那个'上"的错，症状都很像"重启也没用"——
 排查时先问一句"**这条链路绑定的是哪个实例**"。
+
+## #36 max_tokens 截断的半截工具参数落库 ⇒ 下一轮历史渲染 HTTP 500，整个会话中毒（重试 5 次全白烧）
+
+**状态**：已修（2026-10-15）：三层自动修复（见 llm README 不变量 15）；传输层截断 500 快速通道保留作兜底。
+
+### 现象（用户真机，2026-10-15 20:29）
+
+- 界面上连屏四条「模型端点调用失败（第 1/5 ~ 4/5 次重试…）」，每次都是同一个 **HTTP 500**：
+  `Failed to parse tool call arguments as JSON: [json.exception.parse_error.101] parse error at
+  line 1, column 1751: ... missing closing quote; last read: "### 3.2 热重启的两个层次…"`；
+- 出事的是一个写长设计文档的工具调用：模型往 `write` 的 `content` 里塞超长正文，65536 token
+  生成到底也没写完。
+
+### 根因（实地探测推翻初判）
+
+- **初判错了**：以为 500 发生在生成阶段（截断当场报错）。探测（`192.168.0.208:8080`，qwen）：
+  非流式 `max_tokens=96` 与流式 `max_tokens=260` 都是 **HTTP 200** + `finish_reason=length`，
+  半截 `arguments` **原样透传**（流式里 delta 正常发到一半截断 + `[DONE]`）——端点对截断本身从不报错；
+- 真正的 500 在**下一轮请求**：半截串经 `AgentToolStart.rawArguments → toolArgumentsRaw →
+  messages.jsonl` 落库（它存在的理由是历史回灌逐字复现模型原文以命中前缀缓存），下一轮
+  llama.cpp 渲染 chat template 时要 `jsonDecode` 历史里每条 tool_calls 的 arguments ⇒ 炸 500；
+- ⇒ **确定性失败、会话永久中毒**：重试的是同一份中毒历史，必然断在同一个地方（截图里 5 次
+  重试秒秒 500 与时间戳吻合），不修的话这个会话再也发不出任何请求。
+
+### 修复（三层，用户口径：「补全工具调用字段（截断未生成部分用特殊标记），发回继续生成」）
+
+- **修复本体**：`repairTruncatedToolArguments`（llm_types）——状态机扫描 + 有限回退，
+  未生成部分嵌 `【⚠️TRUNCATED_BY_MAX_TOKENS⚠️】`，每个候选真过 `jsonDecode` 才放行；
+- **会话组装处**（llm_session）：`finish_reason=length` 的跳逐条修复后**照常执行**（前半段落盘，
+  marker 当"洞"），工具结果附续写指引（只进送模型那份）；thinking 与前半段都在历史里，
+  模型从标记处续写即可——**不必重烧那 60k+ token 的思考**；
+- **回灌把关处**（llm_agent_engine）：历史重建时 `toolArgumentsRaw` 先 sanitize（合法逐字放行、
+  半截修复/包壳）——**存量中毒会话（包括出事那个）下一次请求即自动救活**。
+
+### 测试钉子
+
+`packages/tree_core/test/truncated_tool_args_repair_test.dart` 15 例（含真机 500 报错里那段半截
+markdown 的还原）；`http_sse_transport_test` 『有限重试』组钉截断 500 不重试 + 可操作提示。

@@ -15,6 +15,8 @@
 /// `openai_dart`，只需再实现一个 [LlmTransport]。
 library;
 
+import 'dart:convert';
+
 import '../util/tokens.dart';
 
 /// 对话消息角色。
@@ -66,6 +68,118 @@ class LlmToolCall {
       arguments: (body['arguments'] ?? '').toString(),
     );
   }
+}
+
+/// 工具参数被 max_tokens 截断时，补全用的**特殊标记**（用户 2026-10-15：
+/// 「截断未生成部分用特殊标记，发回继续生成」）。
+///
+/// 它同时是给模型看的"洞"：续写指引会告诉模型从这里替换续写，不要重复前文。
+const String kToolArgsTruncatedMarker = '【⚠️TRUNCATED_BY_MAX_TOKENS⚠️】';
+
+/// [jsonDecode] 是否接受（宽松判定，坏串不抛异常）。空串视为非法。
+bool isValidToolArguments(String raw) {
+  if (raw.trim().isEmpty) return false;
+  try {
+    jsonDecode(raw);
+    return true;
+  } on FormatException {
+    return false;
+  } on Object {
+    return false;
+  }
+}
+
+/// 修复被 max_tokens 截断的半截 tool_call arguments，返回补全后的合法 JSON；
+/// 输入本来合法或修不出来都返回 **null**（调用方据此区分"无需修/修好了/救不了"）。
+///
+/// 为什么必须修：llama.cpp 端点在历史请求里渲染 chat template 时要 jsonDecode
+/// 每条 tool_calls 的 arguments，半截串会炸出 HTTP 500（parse_error.101）——
+/// **整个会话从此每轮都 500**（中毒）。真机现场：模型往 write 参数里塞超长正文，
+/// 65536 token 生成到底也没写完，端点 200 透传半截 arguments，下一轮就再也没起来。
+///
+/// 算法（单次状态机扫描 + 有限次回退）：
+/// 1. 逐字符扫：字符串外追踪容器栈（`{[`）与"字符串外的逗号位"；字符串内处理
+///    反斜杠转义；
+/// 2. 截断点若落在**字符串内**：去掉悬反斜杠 / 悬高代理，追加 [marker]，闭引号；
+///    截断点若落在**结构位**（悬 key、冒号、逗号等坏尾巴），或补串后仍非法 JSON，
+///    就逐个回退到最近的"串外逗号位"砍掉尾巴——每退一步都用该步记录的容器栈
+///    补全闭合括号；最多回退 8 次；一个逗号位都没有则退到串首（等价 `{}` 之外全弃）；
+/// 3. 每个候选都过 [isValidToolArguments] 才放行——修出来的串必须真的能解析。
+///
+/// [marker] 可注入（默认 [kToolArgsTruncatedMarker]；测试用短标记避免干扰长度断言）。
+String? repairTruncatedToolArguments(
+  String raw, {
+  String marker = kToolArgsTruncatedMarker,
+}) {
+  if (raw.isEmpty || isValidToolArguments(raw)) return null;
+
+  // 扫描：栈与逗号位都记录"截断点之前"的状态，回退时直接复用。
+  final List<String> stack = <String>[]; // 只装 '{' / '['
+  final List<int> commaPoints = <int>[]; // 串外逗号的下标
+  final List<List<String>> stackAtComma = <List<String>>[];
+  bool inStr = false;
+  bool esc = false;
+  for (int i = 0; i < raw.length; i++) {
+    final int c = raw.codeUnitAt(i);
+    if (inStr) {
+      if (esc) {
+        esc = false;
+      } else if (c == 0x5C) {
+        esc = true; // '\'
+      } else if (c == 0x22) {
+        inStr = false; // '"'
+      }
+      continue;
+    }
+    if (c == 0x22) {
+      inStr = true;
+    } else if (c == 0x7B || c == 0x5B) {
+      // '{' / '['
+      stack.add(c == 0x7B ? '}' : ']');
+    } else if (c == 0x7D || c == 0x5D) {
+      if (stack.isNotEmpty) stack.removeLast();
+    } else if (c == 0x2C) {
+      // ','：只有身处容器里才是"可回退的字段边界"
+      if (stack.isNotEmpty) {
+        commaPoints.add(i);
+        stackAtComma.add(List<String>.of(stack));
+      }
+    }
+  }
+
+  String closeFrom(int cut, List<String> open) {
+    String prefix = raw.substring(0, cut);
+    if (inStr && cut == raw.length) {
+      // 截断在字符串内：先清掉会把闭引号吃掉的悬尾巴
+      if (prefix.endsWith('\\')) prefix = prefix.substring(0, prefix.length - 1);
+      // 悬高代理（低半边连同 marker 一起就完整了，但砍掉更干净）
+      if (prefix.isNotEmpty &&
+          prefix.codeUnitAt(prefix.length - 1) >= 0xD800 &&
+          prefix.codeUnitAt(prefix.length - 1) <= 0xDBFF) {
+        prefix = prefix.substring(0, prefix.length - 1);
+      }
+      final String trimmed = prefix.trimRight();
+      prefix = trimmed.isEmpty || trimmed.endsWith(marker) ? trimmed : '$trimmed$marker';
+      open = <String>[...open, '"'];
+    }
+    return '$prefix${open.reversed.join()}';
+  }
+
+  // 候选 0：原位补全（截断在字符串内或恰好停在合法结构边界）
+  String candidate = closeFrom(raw.length, stack);
+  if (isValidToolArguments(candidate)) return candidate;
+
+  // 回退：砍到最近的串外逗号位，弃掉坏尾巴再闭合
+  for (int k = commaPoints.length - 1; k >= 0 && k >= commaPoints.length - 8; k--) {
+    candidate = closeFrom(commaPoints[k], stackAtComma[k]);
+    if (isValidToolArguments(candidate)) return candidate;
+  }
+  if (commaPoints.isNotEmpty) {
+    // 逗号位全部试尽：退到串首（只剩根容器的空壳）
+    candidate = closeFrom(0, const <String>[]);
+    if (isValidToolArguments(candidate)) return candidate;
+  }
+  return null;
 }
 
 /// 一条消息里的**内容块**（OpenAI 兼容 `content` 数组的元素）。

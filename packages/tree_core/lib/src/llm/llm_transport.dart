@@ -57,7 +57,9 @@ abstract interface class LlmTransport {
 /// - **可重试**：没有 HTTP 响应（建连失败 / 等响应头超时 / 心跳丢失 / 读取中断，
 ///   例如 `HttpException: Connection closed while receiving data`）、408、429、5xx；
 /// - **不重试**：4xx（密钥 / 模型 / 参数错——重试只是白花 5 次配额）、流中 error 帧
-///   （[LlmFailureEvent.retryable] 为 false）、已取消、传输层已关闭；
+///   （[LlmFailureEvent.retryable] 为 false）、已取消、传输层已关闭，以及
+///   **确定性的工具调用截断失败**（见 [_isToolCallTruncation]：同一请求重放
+///   必然在同一处再截断，重试是白烧一整轮 GPU 生成）；
 /// - 等待期间**可取消**：用户按 stop 立刻结束，不会等满退避；每次重试前先产出一个
 ///   [LlmRetryNotice]（用户看得到"在重试第几次"，它不算"已产出的内容"）；
 /// - 为什么需要它：端点重启 / 网关抖动是**分钟级**的，一次失败就把整轮任务丢掉
@@ -167,6 +169,17 @@ class HttpSseTransport implements LlmTransport {
         yield event;
       }
       if (failure == null) return;
+      // 确定性失败：端点把“被 max_tokens 截断的半截 tool call arguments”解析炸了
+      // （llama.cpp 报 500）。请求没变、截断点就在同一个 token 上，重试 5 次 =
+      // 白烧 5 轮分钟级生成；快速失败并给可操作提示（不静默改掉原始错误文案）。
+      if (_isToolCallTruncation(failure)) {
+        yield LlmFailureEvent(
+          '${failure.message}\n$_toolCallTruncationHint',
+          statusCode: failure.statusCode,
+          retryable: false,
+        );
+        return;
+      }
       final bool canRetry =
           !produced &&
           _retryable(failure) &&
@@ -323,6 +336,7 @@ class HttpSseTransport implements LlmTransport {
     if (_closed) return false;
     if (event.cancelled) return false;
     if (!event.retryable) return false;
+    if (_isToolCallTruncation(event)) return false;
     final int? code = event.statusCode;
     // 没有 HTTP 状态码 = 根本没走到"端点给了答复"那一步：建连失败 / 等响应头超时 /
     // 心跳丢失 / 读取中断。端点恢复后这类失败最可能自愈，正是重试要覆盖的场景。
@@ -350,6 +364,26 @@ class HttpSseTransport implements LlmTransport {
     }
     return !(isCancelled?.call() ?? false);
   }
+
+  /// 是否为“端点解析不了被截断的 tool call arguments”的确定性失败。
+  ///
+  /// 成因：模型往工具入参里写超长正文，输出在 JSON 字符串中途撞上
+  /// max_tokens；llama.cpp 一类端点解析自家吐出的 arguments 失败后直接回 5xx
+  /// （nlohmann json 的 parse_error），而不是降级把原文交回。重试同一请求
+  /// 必然在同一处再截断，所以它不属于“端点抖动几分钟后自愈”那一类。
+  static bool _isToolCallTruncation(LlmFailureEvent event) {
+    final int? code = event.statusCode;
+    if (code == null || code < 500) return false;
+    final String message = event.message.toLowerCase();
+    return message.contains('failed to parse tool call') ||
+        (message.contains('tool call') && message.contains('parse_error'));
+  }
+
+  /// 截断失败的可操作提示（接在端点原文后面，不替换它）。
+  static const String _toolCallTruncationHint =
+      '提示：模型往工具调用的参数里写了过长正文，输出在 max_tokens 处被截断，'
+      '端点解析不了半截 JSON——这是确定性失败，重试同一请求还会断在同一个地方。'
+      '请调大该模型的 max_output_tokens，或让模型分多次小块写入。';
 
   /// 心跳丢失的错误文案。
   ///

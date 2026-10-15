@@ -49,6 +49,13 @@
 
 14. **`llm.call` 失败要"可诊断 + 可自愈"**（解析失败 ≠ 那笔钱白花）：解析不出 JSON 时，回包除 `error` 外还带 `error_kind='json_parse'`、`text`（模型正文**原文**）、`text_length`、`truncated_suspect`（末尾不是 `}`·`]`，或括号·引号不配平）；文案**按实际响应形式分支**（`text` 形态下**没发** `response_format`，不能说"站点处硬设了 `json_object"）；并在 `[core:llm-call]` 落一条明细（agent / 模型 / 响应形式 / 正文长度 / 是否疑似截断 / 首 200 + 末 100 字 + **解析错误的原话，含 offset**——首尾预览看不出"坏在哪个字符"时这是最短的线索）——这条分支以前**一条日志都没有**，事故现场只剩"插件回 null"，事后无从诊断。`ExecuteStationMounts` 用 `StationCommandOutcome.failedWith(error, payload)` 把这份 detail **原样回给插件**（只回一句 `error` = 把已付费的调用彻底丢掉；现场是 734k prompt 的总结被整包弃用）。**这份 payload 还必须穿过执行站走到插件**：`StationInstance.execute()` 的 `ok:false` 分支也要带 `outcome.payload`——2026-10-05 18:29 真机复现就是因为漏了那一跳，插件报"原文 0 字"、自愈两段都无从下手（[../../../../../docs/known-issues.md](../../../../../docs/known-issues.md) #31）。真实现场与修法见 [../../../../../docs/known-issues.md](../../../../../docs/known-issues.md) #31。
 
+15. **max_tokens 截断的半截工具参数必须被自动修复成合法 JSON**（用户 2026-10-15：「补全工具调用字段（截断未生成部分用特殊标记），发回继续生成」）：llama.cpp 端点在 `max_tokens` 处截断工具调用的 `arguments` 时**不报错**，流式/非流式都是 **HTTP 200 + `finish_reason=length` + 半截串原样透传**（实测）；半截串经 `AgentToolStart.rawArguments → toolArgumentsRaw → messages.jsonl` 落库后，**下一轮请求**在端点渲染 chat template 时解析历史 arguments 炸出 **HTTP 500 `parse_error.101`**——历史中毒是**确定性失败**，重试同一请求必然断在同一个地方（截图现场：5 次重试全 500），**整个会话从此每轮都 500**。三层防线，落点各一：
+   - **修复本体**（[llm_types.dart](llm_types.dart) `repairTruncatedToolArguments`）：状态机扫描（串外追容器栈与"串外逗号位"、串内处理转义）→ 截断在字符串内就清悬反斜杠 / 悬高代理、补 `kToolArgsTruncatedMarker`（`【⚠️TRUNCATED_BY_MAX_TOKENS⚠️】`）、闭引号闭括号；落在结构位（悬 key 名 / 悬冒号等）就逐个回退到最近的串外逗号砍尾巴（≤ 8 次）；**每个候选必须真过 `jsonDecode` 才放行**。输入本来合法 / 修不出来都返回 **null**（调用方据此区分"无需修 / 修好了 / 救不了"）——修不出来的**包壳**成 `{"truncated_arguments": 原文}`：会话绝不带着解析不了的串落库。
+   - **会话组装处**（[llm_session.dart](llm_session.dart)）：`finishReason == 'length'` 且参数非法时逐条修复，**修复版照常执行**（前半段落盘、marker 当"洞"），工具结果回灌时追加**续写指引**（送模型那一份 `modelContent`，UI 口径 `result` 不变）：从标记处续写、**保持已生成内容不变、尤其不要重复思考**——thinking 与前半段都还在历史里，模型不必也不该重烧那几十 k token（这是"发回继续生成"省 token 的关键）。
+   - **回灌把关处**（[llm_agent_engine.dart](llm_agent_engine.dart) 历史重建）：`toolArgumentsRaw` 先 sanitize——合法串**逐字放行**（不变量 6 的前缀缓存不因修复换字节）、半截串当场修复 / 包壳——**存量已中毒的会话下一次请求即自动救活**，不必手动删记录。
+   传输层的截断 500 快速通道（`_isToolCallTruncation` → 不重试 + 可操作提示，见 [llm_transport.dart](llm_transport.dart)）保留作**兜底**：修复生效后它不该再触发，触发了就说明还有别的中毒路径。
+   钉子：`test/truncated_tool_args_repair_test.dart`（修复函数 9 档边界含真机 500 那段半截 markdown 的还原、会话 e2e 钉"落库合法 + marker 只出现一次（回灌不二次补洞）+ 指引进下一跳"、把关处钉"中毒修复 / 包壳 / 合法逐字"）。
+
 ## 测试
 
 ```bash
@@ -58,9 +65,11 @@ dart test test/llm_protocol_test.dart test/llm_session_test.dart test/llm_tool_l
           test/http_sse_transport_test.dart test/llm_hidden_test.dart \
           test/llm_result_gate_test.dart \
           test/llm_summarizer_test.dart test/vision_files_test.dart test/reasoning_toolcall_test.dart \
-          test/reasoning_key_test.dart test/notice_translation_test.dart
+          test/reasoning_key_test.dart test/notice_translation_test.dart \
+          test/truncated_tool_args_repair_test.dart
 ```
 
 假传输夹具 `test/fake_transport.dart`、`test/fake_files_api.dart`——LLM 会话因此可以完全脱离网络单测。
 `llm_prefix_stability_test` 是"历史逐字复用"这条红线的钉子；`http_sse_transport_test` 的『有限重试』组（真实 HttpServer + 裸 socket 半路掐断）钉住重试的判据与次数，
-`llm_hidden_test` 钉住"打了 `llm_hidden` 的消息不进请求、但仍落库可见"。
+`llm_hidden_test` 钉住"打了 `llm_hidden` 的消息不进请求、但仍落库可见"，
+`truncated_tool_args_repair_test` 钉住不变量 15（max_tokens 截断的三层自动修复）。

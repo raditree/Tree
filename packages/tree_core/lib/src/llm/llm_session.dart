@@ -485,6 +485,32 @@ class LlmSession {
               arguments: draft.arguments.toString(),
             ),
       ];
+      // ------ 截断自动修复（用户 2026-10-15：「补全工具调用字段用特殊标记，发回续写」）------
+      // 当 finishReason == 'length' 且参数非法 JSON 时，尝试修复并替换进 calls。
+      // 修复后的 calls 会被执行（前半段落盘，marker 当"洞"）；下一跳模型看到
+      // rawArguments 已是合法 JSON，不会再触发 llama.cpp 历史中毒 500。
+      final Set<String> truncatedIds = <String>{};
+      if (finishReason == 'length') {
+        for (int i = 0; i < calls.length; i++) {
+          final LlmToolCall c = calls[i];
+          if (!isValidToolArguments(c.arguments)) {
+            final String? repaired = repairTruncatedToolArguments(c.arguments);
+            if (repaired != null) {
+              calls[i] = LlmToolCall(id: c.id, name: c.name, arguments: repaired);
+              truncatedIds.add(c.id);
+              log?.call('工具 ${c.name} 的参数被 max_tokens 截断，已自动修复：marker 已嵌入');
+            } else {
+              // 修不出来：包壳成合法 JSON 避免历史中毒
+              final String shell = jsonEncode(<String, String>{
+                'truncated_arguments': c.arguments,
+              });
+              calls[i] = LlmToolCall(id: c.id, name: c.name, arguments: shell);
+              truncatedIds.add(c.id);
+              log?.call('工具 ${c.name} 的参数截断且无法自动修复，已包壳存盘');
+            }
+          }
+        }
+      }
       if (endpointUsage == null) {
         // 端点这一跳没给 usage：本地估算兜底，并显式标注 estimated。
         //
@@ -580,7 +606,17 @@ class LlmSession {
         // 逐字复现才有可能命中端点前缀缓存）。
         final String status = statusText?.call() ?? '';
         final String forModel = await _gateResult(call.name, outcome.content);
-        final String modelContent = status.isEmpty ? forModel : '$status$forModel';
+        String modelContent = status.isEmpty ? forModel : '$status$forModel';
+        // 被截断修复过的调用：给模型一份"从标记处续写"的指引——已生成的前半段
+        // 就在历史里（arguments 原文），thinking 也全部在场，模型不必也不应该
+        // 重新生成；只需从 marker 处把内容接完（省 token 的关键）。
+        if (truncatedIds.contains(call.id)) {
+          modelContent =
+              '$modelContent\n\n【系统】上次工具调用的参数在 $kToolArgsTruncatedMarker '
+              '处被 max_tokens 截断，系统已补全并执行了前半段。请从标记处继续写完剩余部分：'
+              '保持已生成内容不变（尤其不要重复思考或重写前半段），'
+              '只针对标记处的缺口发起新的工具调用做替换/追加，尽量把单次写入拆小以避免再次截断。';
+        }
         // UI 与落库的"完整结果"口径不变（AgentToolEnd.result）；送模型的那一份过门控
         yield AgentToolEnd(
           id: toolId,
