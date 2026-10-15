@@ -53,6 +53,46 @@ flutter run -d windows
 核心可执行文件查找顺序：`TREE_CORE_EXE` → 应用同目录（发行版布局）→ 向上 8 层找
 `.output/tree_core.exe`（开发期）。都找不到时应用显示**带修复指引**的错误页。
 
+### 3.1 SSH 相关包的构建（`tree_ssh_plugin` / `tree_agent`）
+
+SSH 执行器链路上有**两个包要单独编译成二进制**（不是 `dart test` 能覆盖的：它们是随包分发、
+目标机上没有 Dart 运行时的产物）。都走 `tool/` 下的脚本，从**仓根**执行：
+
+| 包 | 编译脚本 | 入口 | 产出（默认目录） | 跑在哪 |
+| --- | --- | --- | --- | --- |
+| `tree_ssh_plugin`（`ssh_executor` 中转站插件） | `dart run tool/build_ssh_plugin.dart` | `packages/tree_ssh_plugin/bin/tree_ssh_executor.dart` | `build/plugins/tree_ssh_executor`（Windows 补 `.exe`，约 10 MB） | **用户本机**（与 `tree_core.exe` 同级） |
+| `tree_agent`（目标机执行体） | `dart run tool/build_agent.dart` | `packages/tree_agent/bin/tree_agent.dart` | `build/agents/tree_agent-linux-{amd64,arm64}`（各约 6.5 MB） | **目标机 Linux** |
+
+**为什么是二进制而非脚本**：两者都要 `dartssh2` / 常驻通道 / base64 分块推送等能力，编译成单文件后
+目标机器上**不需要任何运行时**；核心侧按 `BuiltinPluginSpec.kind == binary` 解析插件（见
+`packages/tree_core/lib/src/plugin/builtin_plugins.dart`）。
+
+**可选参数**（`--out` 两者通用，留空即上表的默认目录）：
+
+```powershell
+# 中转站插件：只编「自机平台」那一份（Windows 出 .exe，Linux/macOS 无扩展名）
+dart run tool/build_ssh_plugin.dart [--out <dir>]
+
+# 目标机执行体：交叉编译，一次产出 amd64 + arm64 两份
+dart run tool/build_agent.dart [--out <dir>] [--version <v>] [--arch x64,arm64]
+```
+
+- `tree_agent` 靠 `dart compile exe --target-os=linux --target-arch=<x64|arm64>` 在 Windows 上直接产出
+  Linux 二进制（本仓 Dart 3.13.4 已实测可用，**无需 Linux 构建机**；首次会下载目标端 AOT 产物，约 2 分钟）；
+  `--arch` 只接受 `x64` / `arm64`（写进文件名分别是 `amd64` / `arm64`）。
+- `tree_agent` 的 `--version` 缺省取仓根 `pubspec.yaml` 的语义版本；插件那条**不接受版本参数**，
+  一律从 `pubspec.yaml` 读。
+
+> **两条必须一起重跑（版本耦合）**：脚本都会把仓根 `pubspec.yaml` 的 `version: x.y.z+n` 里
+> `+` 之前那段（语义版本）注入成 `-DkAgentVersion` —— 插件用它说「我要哪个版本的 `tree_agent`」，
+> `build_agent.dart` 用同一个值给二进制打标，两处不一致插件日志会报版本不匹配（功能仍靠 sha256 工作，
+> 但是噪音与误判源）。所以**改了 `pubspec.yaml` 版本号就必须重跑这两条**：`tool/package_windows.dart`
+> 出包前会逐个校验产物里的版本串（`_verifyBinaryVersion`），对不上**直接拒绝出包**。
+> 为什么用 `+` 之前那段：构建号每打包都变，拿它当 agent 版本会导致每次都重推 6.5 MB。
+>
+> 这两份产物**缺失不会报错**（只是包内没有中转站，核心自动回退内置 dartssh2，功能不变），
+> 只有「版本对不上」才会拦。出包流程见 §5，端到端真机验证见 §4。
+
 ## 4. 测试矩阵
 
 | 层 | 命令 | 说明 |
@@ -102,6 +142,55 @@ cd packages/tree_core; dart test test/ssh_tunnel_e2e_test.dart
 ```
 
 两条都是**门控**：不设 `TREE_SSH_TEST_HOST` 就跳过（打印可读原因），与仓库其它真机用例同口径。
+
+**用 Docker 起目标机 sshd**（本机有 Docker Desktop / Linux 容器时，比 WSL 更省事）：
+镜像里只需要 sshd + 执行体依赖的 POSIX 工具（`util-linux` 给 `script`/`setsid`，`coreutils` 给
+`base64`/`sha256sum`），**公钥走环境变量注入、镜像不落任何密钥**。在仓根建 `.self/e2e/sshd/`
+（`.self/` 已被 gitignore，属开发态脚本）两个文件：
+
+```dockerfile
+# .self/e2e/sshd/Dockerfile
+FROM debian:trixie-slim
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      openssh-server util-linux ca-certificates \
+ && rm -rf /var/lib/apt/lists/* && mkdir -p /run/sshd
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+```
+
+```sh
+# .self/e2e/sshd/entrypoint.sh
+#!/bin/sh
+set -e
+USER_NAME="${SSH_USER:-treee2e}"; PORT="${SSH_PORT:-2222}"
+id -u "$USER_NAME" >/dev/null 2>&1 || useradd -m -s /bin/bash "$USER_NAME"
+HOME_DIR="$(getent passwd "$USER_NAME" | cut -d: -f6)"
+mkdir -p "$HOME_DIR/.ssh"
+printf '%s\n' "${SSH_PUBKEY:?need SSH_PUBKEY}" > "$HOME_DIR/.ssh/authorized_keys"
+chown -R "$USER_NAME:$USER_NAME" "$HOME_DIR/.ssh"
+chmod 700 "$HOME_DIR/.ssh"; chmod 600 "$HOME_DIR/.ssh/authorized_keys"
+mkdir -p /run/sshd
+exec /usr/sbin/sshd -D -p "$PORT" -o PermitRootLogin=no \
+  -o PasswordAuthentication=no -o PubkeyAuthentication=yes -o UsePAM=yes
+```
+
+构建并拉起（发布到 `127.0.0.1:2222`，只绑回环；没有密钥对先 `ssh-keygen -t ed25519 -f .self/e2e/id_e2e`）：
+
+```powershell
+docker build -t tree-e2e-sshd .self/e2e/sshd
+$pub=(Get-Content .self/e2e/id_e2e.pub -Raw).Trim()
+docker run -d --name tree-e2e-sshd -p 127.0.0.1:2222:2222 `
+  -e SSH_USER=treee2e -e SSH_PORT=2222 -e SSH_PUBKEY="$pub" tree-e2e-sshd
+# 验一下能登录（应回 LOGIN_OK / x86_64，且 script/setsid/base64/sha256sum 齐）
+ssh -i .self/e2e/id_e2e -p 2222 -o StrictHostKeyChecking=no -o BatchMode=yes `
+  treee2e@127.0.0.1 'echo LOGIN_OK; uname -m'
+```
+
+然后照上面那段设好 `TREE_SSH_TEST_HOST=127.0.0.1` / `PORT=2222` / `USER=treee2e` /
+`KEY=<id_e2e 绝对路径>`，跑 `dart run tool/tunnel_e2e.dart` 与 `ssh_tunnel_e2e_test.dart`。用完收尾：
+`docker rm -f tree-e2e-sshd`（容器无常驻数据，删了不留痕）。
 
 ## 5. 打包与安装包
 
