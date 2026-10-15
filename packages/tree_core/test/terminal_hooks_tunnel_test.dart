@@ -431,9 +431,11 @@ void main() {
       reason: '拿不到退出码 ⇒ 可辨的"失联"码，不假装正常结束',
     );
     final String notice = delivered[3]! as String;
-    expect(notice, contains('失联'));
-    // 文案里有 markdown 加固（`**目标主机关闭**`），所以断言取不带星号的那一段
-    expect(notice, contains('目标主机关闭'));
+    expect(notice, contains('未能取回退出码'));
+    // 2026-10-15 文案降级：`-1` 不等同于"主机不可达"（健康链路读不到终态也会到 -1），
+    // 因此提示**不得**再断言"目标主机关闭/不可达"，只能说"未能取回"。
+    expect(notice, contains('不等于目标主机不可达'));
+    expect(notice, isNot(contains('最可能是目标主机关闭')));
     expect(notice, contains('不要大量重试'));
     expect(
       await ledger.load(),
@@ -443,5 +445,108 @@ void main() {
           '一次任务最多因此多收到一条"其实已结束"的提醒，不会无限重复：'
           '真相一旦可判（exited / gone），认领即收尾并清台账。',
     );
+    // 2026-10-15：失联收尾把失败计数**落盘**（+1），僵尸才能被 `restorePending` 数到上限后斩断。
+    expect(
+      (await ledger.load()).single.failStreak,
+      1,
+      reason: '本轮未能取回终态 ⇒ 台账 failStreak 记为 1（跨重启累加）',
+    );
   }, timeout: const Timeout(Duration(seconds: 60)));
+
+  test('僵尸台账：连续取不到终态达到上限 ⇒ 清台账、不再认领/唤醒（重启复现循环的根除）', () async {
+    final Directory dir = Directory.systemTemp.createTempSync('tree_hook_zombie_');
+    addTearDown(() async {
+      for (int i = 0; i < 10 && dir.existsSync(); i++) {
+        try {
+          dir.deleteSync(recursive: true);
+        } catch (_) {
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        }
+      }
+    });
+    final HookLedger ledger = HookLedger(dir.path);
+    // 目标机报 running（若不斩断就会一直挂着、每次重启都召回唤醒一遍）
+    final _FakeTunnelSsh transport = _FakeTunnelSsh()
+      ..state = BackgroundStates.running
+      ..logPath = '/ws/.output/hook_zombie.log';
+    final SshWorkspaceIO io = SshWorkspaceIO('/ws', transport);
+    await ledger.save(
+      HookLedgerEntry(
+        id: 'hook_zombie',
+        agentId: 'agt_1',
+        sessionId: 'ses_1',
+        command: 'bash run_train.sh',
+        logRelative: '.output/hook_zombie.log',
+        startedAt: DateTime(2026, 1, 1).millisecondsSinceEpoch,
+        failStreak: TerminalHooks.maxRestoreFailures,
+      ),
+    );
+    final TerminalHooks hooks = TerminalHooks(ledger: ledger);
+    addTearDown(hooks.close);
+    int announced = 0;
+    int finished = 0;
+    hooks.onRecalled = (List<HookTask> g) {
+      announced++;
+    };
+    hooks.onFinished = (HookTask t, int code) {
+      finished++;
+    };
+
+    final int resumed = await hooks.restorePending(
+      ioFor: (String agentId) async => agentId == 'agt_1' ? io : null,
+      agentId: 'agt_1',
+    );
+    expect(resumed, 0, reason: '达到上限的僵尸不再被认领');
+    expect(announced, 0, reason: '不召回、不唤醒');
+    expect(finished, 0, reason: '不起结束提醒');
+    expect(
+      await ledger.load(),
+      isEmpty,
+      reason: '僵尸台账被清掉，重启后不会再出现（斩断无限唤醒循环）',
+    );
+  });
+
+  test('召回去重护栏：曾失败过的挂账（failStreak>=1）静默重挂，不再每次重启都唤醒', () async {
+    final Directory dir = Directory.systemTemp.createTempSync('tree_hook_dedup_');
+    addTearDown(() async {
+      for (int i = 0; i < 10 && dir.existsSync(); i++) {
+        try {
+          dir.deleteSync(recursive: true);
+        } catch (_) {
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        }
+      }
+    });
+    final HookLedger ledger = HookLedger(dir.path);
+    // 还在跑：重挂是为再试一次拿真结局，但不该重复"已召回"唤醒
+    final _FakeTunnelSsh transport = _FakeTunnelSsh()
+      ..state = BackgroundStates.running
+      ..logPath = '/ws/.output/hook_dedup.log';
+    final SshWorkspaceIO io = SshWorkspaceIO('/ws', transport);
+    await ledger.save(
+      HookLedgerEntry(
+        id: 'hook_dedup',
+        agentId: 'agt_1',
+        sessionId: 'ses_1',
+        command: 'sleep 10800',
+        logRelative: '.output/hook_dedup.log',
+        startedAt: DateTime(2026, 1, 1).millisecondsSinceEpoch,
+        failStreak: 1,
+      ),
+    );
+    final TerminalHooks hooks = TerminalHooks(ledger: ledger);
+    addTearDown(hooks.close);
+    int announced = 0;
+    hooks.onRecalled = (List<HookTask> g) {
+      announced++;
+    };
+
+    final int resumed = await hooks.restorePending(
+      ioFor: (String agentId) async => agentId == 'agt_1' ? io : null,
+      agentId: 'agt_1',
+    );
+    expect(resumed, 1, reason: '仍要重挂去再试一次拿真结局');
+    expect(announced, 0, reason: '已经告知过召回的（failStreak>=1）不再重复唤醒');
+    expect(await ledger.load(), hasLength(1), reason: '它还在跑 ⇒ 台账留着');
+  });
 }

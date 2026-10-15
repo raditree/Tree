@@ -345,7 +345,13 @@ void main() {
           isA<SshLinkStaleException>().having(
             (SshLinkStaleException e) => e.message,
             'message',
-            allOf(contains('可能目标主机关闭'), contains('不要大量重试')),
+            // 2026-10-15 文案降级：判死只说明"本轮未能取回退出码"，不再断言"目标主机关闭/不可达"
+            //（健康链路读不到终态也会到这）。
+            allOf(
+              contains('未能取回'),
+              contains('不要大量重试'),
+              isNot(contains('可能目标主机关闭')),
+            ),
           ),
         ),
       );

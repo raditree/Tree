@@ -1381,6 +1381,14 @@ class _SshBackgroundExec implements BackgroundExecHandle {
   /// 轮询间隔：结束唤醒的最坏延迟就是它。
   static const Duration pollInterval = Duration(seconds: 3);
 
+  /// **连续**探测失败多少次才按"失联"收尾（2026-10-15 加）。
+  ///
+  /// 旧实现任何一次 `_runRaw` 抛错就立刻 `_fail` ⇒ 健康链路上一闪而过抓不到（通道忙 /
+  /// 重连瞬时）也会误报 `-1`（"失联 / 可能不可达"）——用户反馈的"明明可达却报失联"。
+  /// 改为容忍若干个连续错误：真连续失败 [maxConsecutiveProbeErrors] 次（≈ 一个周期 × 次数）
+  /// 才判定失联。
+  static const int maxConsecutiveProbeErrors = 3;
+
   static const String _runningToken = '__TREE_RUNNING__';
   static const String _goneToken = '__TREE_GONE__';
 
@@ -1397,6 +1405,9 @@ class _SshBackgroundExec implements BackgroundExecHandle {
   final Completer<int> _exit = Completer<int>();
   Timer? _poll;
   bool _closed = false;
+
+  /// **连续**探测失败计数（任何一次成功探测都归零）。
+  int _probeErrors = 0;
 
   @override
   int? get pid => remotePid;
@@ -1462,6 +1473,7 @@ class _SshBackgroundExec implements BackgroundExecHandle {
     try {
       final SshExecResult result = await host._runRaw(_probeCommand());
       if (_exit.isCompleted || _closed) return;
+      _probeErrors = 0;
       final String out = result.stdout.trim();
       if (out.contains(_runningToken)) return;
       if (out.contains(_goneToken)) {
@@ -1475,7 +1487,10 @@ class _SshBackgroundExec implements BackgroundExecHandle {
       }
       // 输出不是预期形状（远端 shell 噪声）：继续轮询，**不猜**。
     } catch (error) {
-      // 链路判失活等：以显式错误结束（调用方据此记 remoteFailureExitCode 并如实标注）。
+      // 单次探测失败（通道忙 / 瞬时重连）**不立刻判失联**：连续够 [maxConsecutiveProbeErrors]
+      // 次才以显式错误结束（调用方据此记 remoteFailureExitCode 并如实标注）。这样一条健康
+      // 链路偶尔抽一下，不会再误报"-1 / 可能不可达"。
+      if (++_probeErrors < maxConsecutiveProbeErrors) return;
       _fail(error);
     }
   }
@@ -1687,8 +1702,8 @@ class _TunnelBackgroundExec implements BackgroundExecHandle {
     if (_exit.isCompleted) return;
     _exit.completeError(
       SshLinkStaleException(
-        '中转站已判死（退避耗尽），拿不到远端退出码：可能目标主机关闭或不可达；'
-        '不要大量重试，请先确认目标主机与 SSH 通路（原错误：$error）',
+        '中转站已判死（退避耗尽），本轮未能取回远端退出码；这**不等于目标主机不可达**，'
+        '请先确认目标主机与 SSH 通路，不要大量重试（原错误：$error）',
       ),
     );
   }

@@ -49,6 +49,49 @@ void main() {
     await ledger.remove('hook_1');
   });
 
+  test('fail_streak 往返：缺键 ⇒ 0（向后兼容）；>0 才序列化并读回', () async {
+    // 默认 0 ⇒ 不往 json 里写这个键（旧台账本来就没这个键）。
+    await ledger.save(entry('hook_0'));
+    expect((await ledger.load()).single.failStreak, 0);
+    final Map<String, dynamic> raw0 =
+        jsonDecode(File(p.join(dir.path, 'hook_0.json')).readAsStringSync())
+            as Map<String, dynamic>;
+    expect(raw0.containsKey('fail_streak'), isFalse, reason: '0 不落盘，保持形态精简');
+
+    // >0 ⇒ 落盘且能读回。
+    await ledger.save(
+      HookLedgerEntry(
+        id: 'hook_3',
+        agentId: 'agt_1',
+        sessionId: 'ses_1',
+        command: 'c',
+        logRelative: '.output/hook_3.log',
+        startedAt: 1,
+        failStreak: 3,
+      ),
+    );
+    final HookLedgerEntry re = (await ledger.load())
+        .firstWhere((HookLedgerEntry e) => e.id == 'hook_3');
+    expect(re.failStreak, 3);
+
+    // 更老的台账没有这个键 ⇒ 解析为 0，不影响其余字段。
+    File(p.join(dir.path, 'legacy.json')).writeAsStringSync(
+      jsonEncode(<String, dynamic>{
+        'id': 'hook_legacy',
+        'agent_id': 'agt_1',
+        'session_id': 'ses_1',
+        'command': 'c',
+        'log_relative': '.output/hook_legacy.log',
+        'pid': 7,
+        'started_at': 9,
+      }),
+    );
+    final HookLedgerEntry legacy = (await ledger.load())
+        .firstWhere((HookLedgerEntry e) => e.id == 'hook_legacy');
+    expect(legacy.failStreak, 0, reason: '缺 fail_streak ⇒ 向后兼容读为 0');
+    expect(legacy.pid, 7);
+  });
+
   test('原子写：不留 .tmp；同 id 重复 save 只有一条', () async {
     await ledger.save(entry('hook_1'));
     await ledger.save(entry('hook_1', pid: null));

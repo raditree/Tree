@@ -186,6 +186,40 @@ void main() {
     expect(notice, contains('链路判失活'));
   });
 
+  test('哨兵轮询容忍瞬时探测错误：健康链路偶尔抽一下不误报失联', () async {
+    // 回归 2026-10-15：旧实现一次 `_runRaw` 抛错就立即 `_fail` ⇒ 通道忙/瞬时重连也误报
+    // "-1 / 可能不可达"（用户反馈的"明明可达却报失联"）。现在要连续够次数才判失联。
+    final TerminalHooks hooks = TerminalHooks();
+    addTearDown(hooks.close);
+    final Completer<String> woken = Completer<String>();
+    hooks.onFinished = (HookTask task, int code) async {
+      if (!woken.isCompleted) woken.complete(await hookNotice(task, code));
+    };
+    int probes = 0;
+    transport.onRun = (String command) {
+      if (command.contains('nohup')) return _reply(_pidReply);
+      probes++;
+      // 第一拍"抽一下"（模拟瞬时抓不到），之后哨兵显示退出码 5。
+      if (probes == 1) throw SshLinkStaleException('瞬时抽风');
+      return _reply('5\n');
+    };
+
+    final HookTask task = await hooks.start(
+      io: sshIo,
+      agentId: 'agt_1',
+      sessionId: 'ses_1',
+      command: 'python train.py',
+    );
+    final String notice = await woken.future.timeout(const Duration(seconds: 30));
+    expect(
+      task.exitCode,
+      5,
+      reason: '一次瞬时错误后按真退出码收尾，不能走 -1（失联）',
+    );
+    expect(notice, contains('退出码 5'));
+    expect(notice, isNot(contains('未能取回退出码')));
+  });
+
   test('cancel：拿得到远端 pid 就发 kill；拿不到时如实说明为什么杀不掉', () async {
     final TerminalHooks hooks = TerminalHooks();
     addTearDown(hooks.close);

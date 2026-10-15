@@ -17,6 +17,7 @@ class HookLedgerEntry {
     required this.logRelative,
     required this.startedAt,
     this.pid,
+    this.failStreak = 0,
   });
 
   final String id;
@@ -24,7 +25,7 @@ class HookLedgerEntry {
   final String sessionId;
   final String command;
 
-  /// 日志的工作空间相对路径（远端那份）。
+  /// 日志的**工作空间相对路径**（远端那份）。
   final String logRelative;
 
   /// 远端包装子 shell 的 pid（拿不到为 null）。
@@ -32,6 +33,13 @@ class HookLedgerEntry {
 
   /// 开始时刻（epoch 毫秒）。
   final int startedAt;
+
+  /// **连续接续失败次数**（2026-10-15 加）：这条台账每被 `restorePending` 接回来、
+  /// 又一次以「失联 / 拿不到终态」收尾，就 +1。真实结局一旦可判（exited/gone/真退出码），
+  /// `_finish` 会直接删台账、计数随之消失 —— 因此**只有"链路回来了却永远读不到结局"的僵尸**
+  /// 才会把计数堆高。核心据此给僵尸一个上界，避免每次重启都无休止地重新唤醒（用户反馈的
+  /// "hook 工具调用 + 延续声明、重启后又出现"）。老台账没有这个键 ⇒ 解析为 0（向后兼容）。
+  final int failStreak;
 
   Map<String, dynamic> toJson() => <String, dynamic>{
     'id': id,
@@ -41,6 +49,7 @@ class HookLedgerEntry {
     'log_relative': logRelative,
     'pid': pid,
     'started_at': startedAt,
+    if (failStreak > 0) 'fail_streak': failStreak,
   };
 
   /// 解析一条台账；**接续必需的字段**不全才返回 null（调用方如实记日志并跳过，不假装读过）。
@@ -62,6 +71,7 @@ class HookLedgerEntry {
     final Object? sessionId = raw['session_id'];
     final Object? pid = raw['pid'];
     final Object? startedAt = raw['started_at'];
+    final Object? failStreak = raw['fail_streak'];
     return HookLedgerEntry(
       id: id,
       agentId: agentId,
@@ -70,6 +80,7 @@ class HookLedgerEntry {
       logRelative: log,
       pid: pid is int && pid > 0 ? pid : null,
       startedAt: startedAt is int ? startedAt : 0,
+      failStreak: failStreak is int && failStreak > 0 ? failStreak : 0,
     );
   }
 }

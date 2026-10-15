@@ -62,6 +62,11 @@ class HookTask {
   /// 退出码（null = 仍在运行）。
   int? exitCode;
 
+  /// **连续接续失败次数**（来自台账 [HookLedgerEntry.failStreak]）：重启/重连把这条远端
+  /// 任务接回来、却又一次取不到终态时 +1（见 [_fail]）。达到 [maxRestoreFailures] 后，
+  /// [restorePending] 不再接它、直接清台账——斩断"僵尸台账每次重启都重新唤醒"的循环。
+  int failStreak = 0;
+
   /// 是否被用户/agent 主动取消（发出过终止请求）。
   bool cancelled = false;
 
@@ -337,6 +342,18 @@ class TerminalHooks {
       // 只认领该 agent 名下的（链路恢复时按 agent 触发；启动时 [agentId] 为 null = 全部）。
       if (agentId != null && entry.agentId != agentId) continue;
       if (_tasks.containsKey(entry.id)) continue;
+      // **僵尸斩断**（2026-10-15 修，用户反馈的"重启后又出现"）：这条台账已连续
+      // [maxRestoreFailures] 次被接回来却每次都取不到终态（链路明明可达、任务其实早就结束，
+      // 只是本机永远读不回结局）⇒ **不再接、直接清台账**，也不再唤醒。真实结局一旦可判本来
+      // 就会被 `_finish` 删台账，所以只有真正读不到的僵尸会堆到这个计数。
+      if (entry.failStreak >= maxRestoreFailures) {
+        await led.remove(entry.id);
+        log?.call(
+          '放弃接续后台任务 ${entry.id}：已连续 ${entry.failStreak} 次接回来却取不到终态'
+          '（远端多半早已结束、只是结局读不回）⇒ 清台账，不再重启唤醒',
+        );
+        continue;
+      }
       WorkspaceIO? io;
       try {
         io = await ioFor(entry.agentId);
@@ -381,8 +398,12 @@ class TerminalHooks {
             : null,
       );
       _attach(task);
+      task.failStreak = entry.failStreak;
       resumed++;
-      recalled.add(task);
+      // **召回告知去重**（2026-10-15）：只有**第一次**接回来（failStreak==0）才投"已召回"提示唤醒
+      // 一整轮生成；已经因取不到终态失败过（failStreak>=1）的，静默重挂只为再试一次拿真结局，
+      // 不再每次重启都唤醒 agent（真拿到结局时 `_finish` 仍会正常投完成提醒）。
+      if (entry.failStreak == 0) recalled.add(task);
     }
     if (resumed > 0) log?.call('已接续 $resumed 个远端后台任务');
     // **召回要告知**（用户 2026-10-11 要求）：链路恢复 / 隧道重建之后把挂账任务拾回来这件事
@@ -579,6 +600,7 @@ class TerminalHooks {
         logRelative: task.logRelative,
         pid: task.handle?.pid,
         startedAt: task.startedAt.millisecondsSinceEpoch,
+        failStreak: task.failStreak,
       ),
     );
   }
@@ -635,20 +657,35 @@ class TerminalHooks {
     task.exitCode = remoteFailureExitCode;
     await _appendLog(
       task,
-      '\n# [terminal hook] 后台任务失联（链路判失活 / 中转站退避耗尽），'
-      '拿不到远端退出码与输出：$error\n'
-      '# 该任务**可能**已经结束、也**可能**仍在目标机上跑；最可能是**目标主机关闭或不可达**。\n'
+      '\n# [terminal hook] 后台任务本轮未能取回退出码（链路判失活 / 中转站退避耗尽 /'
+      '探测一时读不回来），拿不到远端退出码与输出：$error\n'
+      '# 该任务**可能**已经结束、也**可能**仍在目标机上跑；这**不等于目标主机不可达**。\n'
       '# 请先确认目标主机与 SSH 通路，**不要大量重试**，也不要直接重跑（会重复副作用）。\n',
     );
     // **不删台账**（`keepLedger: true`）：这条任务是远端后台任务，远端进程可能还在跑，
     // 台账是"链路恢复后接回来"的唯一凭据；本机任务本来就没有台账，传 true 也不会有残留。
     await _settle(task, keepLedger: true);
+    // **记一笔失败计数并落盘**（2026-10-15）：这是"接回来却又读不到终态"的一轮。只有这种
+    // 永远读不回的僵尸会把计数堆到 [maxRestoreFailures] 而被 [restorePending] 清掉；真实
+    // 结局一旦可判会走 `_finish` 删台账、计数归零。写失败只影响下次的上界判定，不阻断本轮提醒。
+    if (task.remote) {
+      task.failStreak++;
+      await _writeLedger(task);
+    }
     log?.call('后台任务失联 ${task.id}：$error');
     await onFinished?.call(task, remoteFailureExitCode);
   }
 
   /// 远端链路失活时的"退出码"（负值：真实退出码不会是它）。
   static const int remoteFailureExitCode = -1;
+
+  /// 一条僵尸台账**最多被接回来几次**仍读不到终态就彻底放弃（清台账、不再唤醒）。
+  ///
+  /// 为什么需要：`_fail` 走"失联"时台账**留着**（重连后该拿回真结局），但如果一条任务
+  /// 其实早已结束、只是本机永远读不回结局（哨兵没写 / 目标机台账已清），就会**每次重启都
+  /// 重新唤醒一次**（用户 2026-10-15 反馈）。给一个上界把它斩断；真正在跑的任务永远不会
+  /// 堆到这个计数（它总会被 `_finish` 收尾删台账）。
+  static const int maxRestoreFailures = 3;
 }
 
 /// 为什么这条任务杀不掉（给模型/用户的可读原因）。纯函数，便于单测。
@@ -681,9 +718,10 @@ Future<String> hookNotice(HookTask task, int exitCode) async {
     );
   } else if (exitCode == TerminalHooks.remoteFailureExitCode) {
     buffer.writeln(
-      '（**失联**：链路判失活 / 中转站退避耗尽，没拿到远端退出码与输出。'
-      '该任务**可能**已经结束、也**可能**仍在目标机上跑 —— 最可能是**目标主机关闭或不可达**。'
-      '请先确认目标主机与 SSH 通路，**不要大量重试**，也不要直接重跑（会重复副作用）；'
+      '（本轮**未能取回退出码**：链路判失活 / 中转站退避耗尽 / 探测一时读不回来，'
+      '没拿到远端退出码与输出。该任务**可能**已经结束、也**可能**仍在目标机上跑 —— '
+      '这**不等于目标主机不可达**，请先用 terminal 确认链路远端是否可达。'
+      '**不要大量重试**，也不要直接重跑（会重复副作用）；'
       '恢复后可用 read 查日志文件、用 terminal 复查远端进程与产物）',
     );
   }
