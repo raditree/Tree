@@ -2,6 +2,7 @@ import 'dart:io';
 
 import '../store/atomic_file.dart';
 import '../store/yaml_codec.dart';
+import 'plugin_host.dart' show PluginSuspension;
 import 'station_scope.dart';
 
 /// 「<数据根>/config/plugins.yaml」的**读写层**（M9 §4.2 插件开关）。
@@ -25,6 +26,8 @@ import 'station_scope.dart';
 /// - granularity：team / agent / session；
 /// - scope：键白名单 team_id / agent_id / session_id / mode_key，mode_key 属于 local / ssh；
 /// - args：字符串数组；env：字符串到字符串的映射；enabled / builtin：布尔。
+/// - suspension（20261015-hot-restart 新增）：只能留空或 `keep`（值域见
+///   [PluginSuspension]）——写错要**当场拒**，不能“用户写了 keep、核心当没看见”。
 class PluginConfigStore {
   PluginConfigStore(this.path, {this.log});
 
@@ -49,6 +52,9 @@ class PluginConfigStore {
   };
 
   /// 条目的规范字段顺序（写回时的排版；未知键排在后面且原样保留）。
+  ///
+  /// `suspension` 排在末尾：它是 20261015-hot-restart 新加的**可选**声明，
+  /// 排在已有字段后面可以让“没声明”的插件写回后的文档逐字不变。
   static const List<String> canonicalFields = <String>[
     'id',
     'name',
@@ -59,6 +65,7 @@ class PluginConfigStore {
     'enabled',
     'granularity',
     'scope',
+    'suspension',
   ];
 
   /// id 允许的字符集：与 TreePaths.safeSegment 同口径（不含路径分隔符与 ..）。
@@ -276,6 +283,22 @@ class PluginConfigStore {
         }
       }
     }
+
+    // suspension（挂起声明）：只认留空与 keep。
+    // 为什么必须校值域而不只依赖“未知键原样保留”：这一条决定热重启走不走
+    // “转储→取回”，拼错了（`Keep` / `true`）会被 fromJson 当成“没声明”，
+    // 行为默默退回冷启动——用户看不出自己配错了一个字。
+    final Object? rawSuspension = entry['suspension'];
+    if (rawSuspension != null) {
+      if (rawSuspension is! String) {
+        return '插件 $id 的 suspension 必须是字符串（${PluginSuspension.describeValues}）';
+      }
+      final String value = rawSuspension.trim();
+      if (value.isNotEmpty && !PluginSuspension.values.contains(value)) {
+        return '插件 $id 的 suspension 只能是 ${PluginSuspension.describeValues}，'
+            '当前是「$value」';
+      }
+    }
     return null;
   }
 
@@ -339,6 +362,13 @@ class PluginConfigStore {
       }
     }
     out['scope'] = scope;
+    // 挂起声明（20261015-hot-restart D3）：**空串不写这一键**，与 description 同口径。
+    //
+    // ⚠ 为什么必须在这里显式写：`_normalize` 是逐字段重建的，而下面的“未知键”循环
+    // **特意跳过 canonicalFields 里的键**——把 suspension 加进规范字段表却不在此写一行，
+    // 结果就是“校验收了、落盘把它丢了”（这一条由 plugin_config_store_test 钉住）。
+    final String suspension = (src['suspension'] ?? '').toString().trim();
+    if (suspension.isNotEmpty) out['suspension'] = suspension;
     // 未知键（含 builtin 标记、用户自己加的备注）排在规范字段之后
     for (final MapEntry<String, dynamic> e in src.entries) {
       if (canonicalFields.contains(e.key)) continue;

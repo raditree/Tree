@@ -12,6 +12,8 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_core/src/plugin/plugin_config_store.dart';
+import 'package:tree_core/src/plugin/plugin_host.dart'
+    show PluginConfig, PluginSuspension;
 import 'package:tree_core/src/store/yaml_codec.dart';
 
 void main() {
@@ -248,5 +250,80 @@ plugins:
     write('plugins: [ {id: demo, command: python\n');
     expect(noisy.readEntries(), isEmpty);
     expect(logs.single, contains('解析失败'));
+  });
+
+  group('suspension（挂起声明，20261015-hot-restart D3）', () {
+    test('keep 能写入、能读回，且排到行尾（没声明的文档逐字不变）', () {
+      final PluginStoreResult result = store.upsert(<String, dynamic>{
+        'id': 'demo',
+        'command': 'python',
+        'suspension': 'keep',
+      });
+      expect(result.ok, isTrue, reason: result.error);
+      expect(store.readEntry('demo')!['suspension'], 'keep');
+      // 排版：suspension 必须排在 canonicalFields 末尾。
+      final String text = File(path).readAsStringSync();
+      expect(
+        text.indexOf('suspension'),
+        greaterThan(text.indexOf('command')),
+        reason: '新字段插在 command 前面会让 diff 变得看不出改了什么',
+      );
+    });
+
+    test('值域当场拒：非字符串、大写 Keep、别的词都进不了盘（防止“配了但读成空”）', () {
+      final List<Map<String, Object?>> bad = <Map<String, Object?>>[
+        <String, Object?>{'id': 'a', 'command': 'python', 'suspension': 'Keep'},
+        <String, Object?>{'id': 'b', 'command': 'python', 'suspension': true},
+        <String, Object?>{'id': 'c', 'command': 'python', 'suspension': 'yes'},
+      ];
+      for (final Map<String, Object?> entry in bad) {
+        final PluginStoreResult rejected = store.upsert(
+          entry.cast<String, dynamic>(),
+        );
+        expect(rejected.ok, isFalse, reason: '${entry["id"]} 应当被拒');
+        expect(rejected.error, contains('suspension'));
+        expect(rejected.error, contains('keep'), reason: '得告诉用户能填什么');
+      }
+      expect(store.readEntries(), isEmpty, reason: '校验失败不落盘');
+    });
+
+    test('空串 = 合法且按“未声明”处理：不产出一个空键（与 description 同口径）', () {
+      expect(
+        store.upsert(<String, dynamic>{
+          'id': 'demo',
+          'command': 'python',
+          'suspension': '',
+        }).ok,
+        isTrue,
+      );
+      // 落盘不写空键：“确实没声明”与“声明了一个空值”对用户是同一件事，
+      // 但写一个 `suspension: ""` 会让文件多出一种没人读的形状。
+      expect(
+        store.readEntry('demo')!.containsKey('suspension'),
+        isFalse,
+        reason: '空声明不该落成一个空键',
+      );
+      // 不声明与声明为空，进核心后是同一个结果：不可挂起。
+      expect(
+        PluginConfig.fromJson(store.readEntry('demo')!).suspension,
+        PluginSuspension.none,
+      );
+      expect(PluginConfig.fromJson(store.readEntry('demo')!).canSuspend, isFalse);
+    });
+
+    test('条目级未知键仍然原样保留（本层不得“加严”到只认已知字段）', () {
+      // 为什么单独钉这一条：suspension 的新增很容易让人顺手改成“条目只认已知字段”。
+      // 但类注释里写得很清楚：未知键必须原样保留，否则“改一个开关”会把用户的
+      // 文件改瘦。真正需要拒的只有一个拼错的 suspension 取值。
+      final PluginStoreResult result = store.upsert(<String, dynamic>{
+        'id': 'demo',
+        'command': 'python',
+        'my_note': '用户自己的备注',
+      });
+      expect(result.ok, isTrue, reason: result.error);
+      expect(store.readEntry('demo')!['my_note'], '用户自己的备注');
+      expect(store.setEnabled('demo', false).ok, isTrue);
+      expect(store.readEntry('demo')!['my_note'], '用户自己的备注');
+    });
   });
 }
