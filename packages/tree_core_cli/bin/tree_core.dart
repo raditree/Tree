@@ -263,6 +263,15 @@ Future<void> main(List<String> args) async {
     plugins,
     coreLog.forPrefix('core:tunnel'),
   );
+  // **站点路径**（2026-10-15：SSH 迁移到「处理拓展点位」）：插件订上 `ssh.execute` 后，
+  // 每个 SSH 动作都投成一次 `station/request`。它与上面的 `tunnelLink` 并存——**优先站点、
+  // 回退旧插件、再回退内置**，两条链路复用同一个 `TunnelSshTransport`（liveness / PTY /
+  // 回退判据全同），故稳定性与今天逐条对齐。一个进程一份站点链路：agent 随连接
+  // （`TunnelConnectRequest.scopeAgentId`）携带，`conn_id` 全局唯一 ⇒ PTY 不会串道。
+  final StationTunnelLink stationLink = StationTunnelLink(
+    plugins,
+    coreLog.forPrefix('core:tunnel'),
+  );
 
   final WorkspaceToolRunner tools = WorkspaceToolRunner(
     todoStore: todos,
@@ -290,7 +299,21 @@ Future<void> main(List<String> args) async {
     // SSH 后端：**优先走「中转站」**（`ssh_executor` 插件 → 目标机 `tree_agent`），
     // 插件缺失 / 未启用 / 起不来 / 这条隧道建不起来 / 退避耗尽 ⇒ 回退内置 `dartssh2`。
     // 每 agent 一条连接，按需建立并缓存；远端根目录取 ssh.root（空 = 远端 HOME）。
-    sshIoFactory: (SshConfig config) async {
+    sshIoFactory: (SshConfig config, String agentId) async {
+      // 连接描述带 agent（`scopeAgentId`）：站点路径据此派生 relay 投递的隔离四元组（team/mode）。
+      final TunnelConnectRequest connectRequest = TunnelConnectRequest(
+        host: config.host,
+        port: config.port,
+        username: config.username,
+        password: config.password,
+        keyPath: config.resolvedKeyPath(),
+        keyPassphrase: config.keyPassphrase,
+        root: config.root,
+        loginShell: config.loginShell,
+        heartbeatInterval: settings.heartbeatInterval,
+        maxMissedHeartbeats: settings.missedHeartbeatLimit,
+        scopeAgentId: agentId,
+      );
       // **插件正在启动就有界地等一会儿**（2026-10-11 用户真机教训）：核心启动时插件是异步
       // 拉起的，实测有一段几十~几百毫秒的窗口（用户机器上 SSH 解析比插件就绪只早 **53ms**）。
       // 那时直接回退内置，这条 SSH 会**整场**跑在内置后端上（IO 会被缓存、不会自己回切），
@@ -301,38 +324,37 @@ Future<void> main(List<String> args) async {
             interval: const Duration(milliseconds: 100),
           );
       if (lookup.host != null) {
+        // **选路（优先站点 / 回退旧插件）**：订上了 `ssh.execute` 点位 ⇒ 走站点投递；
+        // 只有旧插件（只报能力、不订阅）⇒ 走 `tunnel.*`（行为与今天完全一致）。
+        // 两条路同一个插件、同一个 `TunnelManager` 台账 ⇒ 不做"站点失败再撞一遍旧路"
+        // （同插件同结果，只是把一次 dial 撞两遍）；可回退类失败一律直接落到内置。
+        final bool stationSubscribed = await plugins
+            .sshExecuteStationSubscribedWithin();
+        final TunnelLink chosen = stationSubscribed ? stationLink : tunnelLink;
+        final String via = stationSubscribed
+            ? '中转站点位（ssh.execute）'
+            : '中转站（tunnel.*）';
         try {
           final TunnelSshTransport transport = await TunnelSshTransport.connect(
-            tunnelLink,
-            TunnelConnectRequest(
-              host: config.host,
-              port: config.port,
-              username: config.username,
-              password: config.password,
-              keyPath: config.resolvedKeyPath(),
-              keyPassphrase: config.keyPassphrase,
-              root: config.root,
-              loginShell: config.loginShell,
-              heartbeatInterval: settings.heartbeatInterval,
-              maxMissedHeartbeats: settings.missedHeartbeatLimit,
-            ),
+            chosen,
+            connectRequest,
             log: coreLog.forPrefix('core:tunnel'),
           );
           coreLog.write(
-            '[core:tool] SSH 经中转站连接 ${config.redacted()} root=${transport.root}',
+            '[core:tool] SSH 经$via连接 ${config.redacted()} root=${transport.root}',
           );
           return SshWorkspaceIO(transport.root, transport);
         } on TunnelUnavailableException catch (error) {
           if (!error.shouldFallback) {
             // 例如 config_incomplete：回退内置也一样连不上 ⇒ **如实报错，不假装**。
             coreLog.write(
-              '[core:tool] 中转站拒绝这条连接（${error.kind}：${error.message}）——'
+              '[core:tool] $via拒绝这条连接（${error.kind}：${error.message}）——'
               '该错误回退内置也无解，已如实上抛',
             );
             rethrow;
           }
           coreLog.write(
-            '[core:tool] 中转站不可用（${error.kind}：${error.message}）'
+            '[core:tool] $via不可用（${error.kind}：${error.message}）'
             '⇒ 回退内置 dartssh2（${config.redacted()}）',
           );
         }

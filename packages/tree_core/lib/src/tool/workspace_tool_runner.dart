@@ -110,7 +110,12 @@ class WorkspaceToolRunner implements ToolRunner {
   /// SSH 后端工厂（异步：要建连接、问远端 `$HOME`）。M4b-2 已交付真实实现
   /// （dartssh2 + SFTP/exec）；为 null 时对配置了 SSH 的 agent 明确报"尚未接入"
   /// 而不是静默回落本地——静默回落会把远端该做的活干在用户本机，是更坏的失败方式。
-  final Future<WorkspaceIO> Function(SshConfig config)? sshIoFactory;
+  ///
+  /// 第二参 [agentId] 是**会话主人**（owner）id：2026-10-15 SSH 迁移到「处理拓展点位」后，
+  /// 工厂内的站点选路要用它派生 relay 投递的隔离四元组（team 由 agent 归属解析、mode 固定 ssh）；
+  /// 内置 `dartssh2` 路径忽略它。工厂据此为**每个 agent 现读**它自己的站点作用域。
+  final Future<WorkspaceIO> Function(SshConfig config, String agentId)?
+      sshIoFactory;
 
   /// 单条工具结果的字符上限；**0（默认）= 不截断**，交给 `ToolResultGate` 门控。
   ///
@@ -739,10 +744,16 @@ class WorkspaceToolRunner implements ToolRunner {
         // 反复撤换只会让每次解析都去撞一次 dial（插件的退避是自己掌握的，不该被我们催）。
         final PluginBus? bus = pluginBus;
         final bool sshConfigured = resolveSshConfig?.call(ownerId) != null;
+        // **两条选路信号 OR**（2026-10-15）：旧路径（按能力认的 `tunnel.*` 中转站）
+        // 与新路径（订了 `ssh.execute` 点位的站点接管者）任一就绪都该撤换内置缓存，
+        // 让下一次 `_ioFor` 重新选路（工厂内部优先站点、回退插件、再回退 dartssh2）。
+        final bool relayReady = bus != null &&
+            (bus.sshExecutorLookup().host != null ||
+                bus.sshExecuteStationSubscribed());
         if (bus != null &&
             sshConfigured &&
             !_sshUpgradeTried.contains(ownerId) &&
-            bus.sshExecutorLookup().host != null) {
+            relayReady) {
           _sshUpgradeTried.add(ownerId);
           _ios.remove(ownerId);
           log?.call(
@@ -757,8 +768,8 @@ class WorkspaceToolRunner implements ToolRunner {
 
     final SshConfig? ssh = resolveSshConfig?.call(ownerId);
     if (ssh != null) {
-      final Future<WorkspaceIO> Function(SshConfig config)? factory =
-          sshIoFactory;
+      final Future<WorkspaceIO> Function(SshConfig config, String agentId)?
+          factory = sshIoFactory;
       if (factory == null) {
         log?.call(
           'agent $ownerId 配置了 SSH ${ssh.redacted()}，'
@@ -772,7 +783,10 @@ class WorkspaceToolRunner implements ToolRunner {
       }
       // 私有状态按 agent 分栏（`.self/…` → `.tree/<agent_id>/.self/…`）：
       // 团队成员与 leader 共享工作目录，但各自的 .self 必须分开（见 PrivateWorkspaceIO）。
-      final WorkspaceIO io = PrivateWorkspaceIO(await factory(ssh), ownerId);
+      final WorkspaceIO io = PrivateWorkspaceIO(
+        await factory(ssh, ownerId),
+        ownerId,
+      );
       _installLinkRecoveredHook(io, ownerId);
       _ios[ownerId] = io;
       if (restore) {

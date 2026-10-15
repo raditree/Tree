@@ -19,6 +19,7 @@ class TunnelConnectRequest {
     this.loginShell,
     this.heartbeatInterval = const Duration(seconds: 10),
     this.maxMissedHeartbeats = 3,
+    this.scopeAgentId = '',
   });
 
   final String host;
@@ -39,6 +40,14 @@ class TunnelConnectRequest {
 
   /// 连续丢失阈值 N。
   final int maxMissedHeartbeats;
+
+  /// 站点隔离四元组里的 **agent**（仅核心侧 `StationTunnelLink` 用它派生 relay 投递的
+  /// scope：team 由 agent 归属解析、mode 固定 ssh）。2026-10-15 SSH 迁移到「处理拓展点位」
+  /// 时新增：一条 per-process 的链路要按连接携带各自的 agent，因此随连接描述透传。
+  ///
+  /// **不进 [toJson]**（插件不认它，`tunnel.ensure` 的下行形态不变）、不参与插件端去重键
+  /// （去重仍按 host/port/username/root/login_shell）；内置 `DartSshTransport` 完全忽略它。
+  final String scopeAgentId;
 
   /// 给插件看的下行形态（**不含日志用途**：调用方要日志请用 [redacted]）。
   Map<String, dynamic> toJson() => <String, dynamic>{

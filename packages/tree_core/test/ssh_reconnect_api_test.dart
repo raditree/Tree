@@ -88,7 +88,7 @@ void main() {
     final WorkspaceToolRunner runner = WorkspaceToolRunner(
       resolveWorkspaceDir: (String _) => temp.path,
       resolveSshConfig: (String id) => store.agent(id)?.sshConfig,
-      sshIoFactory: (SshConfig _) async => remote,
+      sshIoFactory: (SshConfig _, String agentId) async => remote,
     );
     server = await CoreServer.start(
       store: store,

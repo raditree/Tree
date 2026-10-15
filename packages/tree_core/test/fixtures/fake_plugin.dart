@@ -48,6 +48,10 @@ void main(List<String> args) {
   final bool scopeProbe = args.contains('--scope-probe');
   final bool relaySubscribe = args.contains('--relay-subscribe');
   final bool stationEcho = args.contains('--station-echo');
+  // **SSH 执行中转站点位**的假接管者：订阅 `ssh.execute`，并对 station/request 里
+  // 带 `action` 的投递回**隧道形状**的回包（ensure/request/state/reconnect/close）。
+  // 用于核心侧 `StationTunnelLink` 的端到端选路测试（无需真 sshd）。
+  final bool sshExecute = args.contains('--ssh-execute');
   final bool uiManifest = args.contains('--ui-manifest');
   final bool uiManifestForeign = args.contains('--ui-manifest-foreign');
   String relayRewrite = 'REWRITTEN';
@@ -66,6 +70,8 @@ void main(List<String> args) {
     if (args[i] == '--relay-point') relayPoint = args[i + 1];
     if (args[i] == '--ui-team') uiTeam = args[i + 1];
   }
+  // SSH 执行接管者默认显式订 `ssh.execute`（留空 relay 只订工具前/后）。
+  if (sshExecute && relayPoint.isEmpty) relayPoint = 'ssh.execute';
 
   /// 插件**主动**发起的请求：id → 等待核心响应的 completer。
   final Map<Object?, Completer<Map<String, dynamic>>> pendingRequests =
@@ -147,7 +153,7 @@ void main(List<String> args) {
     }
   }
 
-  if (relaySubscribe) {
+  if (relaySubscribe || sshExecute) {
     // hello 握手后核心已能处理请求；用 microtask 让读循环先跑起来。
     scheduleMicrotask(subscribeRelay);
   }
@@ -324,6 +330,53 @@ void main(List<String> args) {
         final Map<String, dynamic> payloadMap = rawPayload is Map
             ? rawPayload.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
             : <String, dynamic>{};
+        // **SSH 执行接管**（--ssh-execute）：按 `action` 回隧道形状回包，与核心侧
+        // `StationTunnelLink` 的解析口径一致（`{ok, conn_id, root, agent}` / `{ok, tunnels}` …）。
+        if (sshExecute && payloadMap.containsKey('action')) {
+          final String action = (payloadMap['action'] ?? '').toString();
+          final String connId = (payloadMap['conn_id'] ?? 'conn-fake-1').toString();
+          late final Map<String, dynamic> out;
+          switch (action) {
+            case 'ensure':
+              out = <String, dynamic>{
+                'ok': true,
+                'conn_id': connId,
+                'root': '/home/fake',
+                'agent': <String, dynamic>{
+                  'version': '9.9.9',
+                  'os': 'linux',
+                  'arch': 'x86_64',
+                },
+              };
+            case 'request':
+              out = <String, dynamic>{
+                'ok': true,
+                'result': <String, dynamic>{'seen': payloadMap['method']},
+              };
+            case 'state':
+              out = <String, dynamic>{
+                'ok': true,
+                'tunnels': <Map<String, dynamic>>[
+                  <String, dynamic>{
+                    'conn_id': connId,
+                    'state': 'ready',
+                    'root': '/home/fake',
+                    'agent': <String, dynamic>{'version': '9.9.9'},
+                  },
+                ],
+              };
+            case 'reconnect':
+            case 'close':
+              out = <String, dynamic>{'ok': true};
+            default:
+              out = <String, dynamic>{
+                'ok': false,
+                'error': '未知的 SSH action：$action',
+              };
+          }
+          reply(<String, dynamic>{'reply': <String, dynamic>{'payload': out}});
+          return;
+        }
         if (relaySubscribe && payloadMap.containsKey('phase')) {
           final String phase = (payloadMap['phase'] ?? '').toString();
           Map<String, dynamic>? rewritten;

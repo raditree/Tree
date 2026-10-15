@@ -347,14 +347,32 @@ class PluginBus {
   /// 某插件最近一次失败原因（注册失败 / 调用失败）。
   String? errorOf(String pluginId) => _errors[pluginId];
 
-  /// **SSH 中转站**的通知出口（`tunnel/event`）。
+  /// **SSH 中转站**的通知出口（`tunnel/event`）——**旧 `tunnel.*` 路径**（单消费者）。
   ///
   /// 只有一条路：`sshIoFactory` 选路时建起来的 `PluginTunnelLink` 会挂上它。
   /// 为 null 时通知被丢弃并记日志 —— PTY 的数据面丢一帧不该把核心搞崩。
   ///
-  /// 为什么不做成"订阅注册表"：中转站通知的消费者**只有一个**（执行器本身），
-  /// 用一个可写字段就够（与 `log` / `broadcast` 同一范式），少一层生命周期管理。
+  /// 2026-10-15：SSH 迁移到「处理拓展点位」后，站点路径（`StationTunnelLink`）与这条
+  /// 旧路径**并存**——二者都靠 `tunnel/event` 拿 PTY 字节。故新增下面的监听器列表：
+  /// 本字段仍由 `PluginTunnelLink` 独占（**行为不变、不改它**），站点路径注册进
+  /// [_tunnelEventListeners]。派发时两条都发，各自按自己认领的 `conn_id` 分流，
+  /// 不属于自己就丢弃——`conn_id` 带进程内随机前缀全局唯一，不会串隧道。
   void Function(String pluginId, Map<String, dynamic> params)? onTunnelEvent;
+
+  /// `tunnel/event` 的**多消费者**出口（站点路径用；与 [onTunnelEvent] 并列派发）。
+  final List<void Function(String pluginId, Map<String, dynamic> params)>
+      _tunnelEventListeners =
+      <void Function(String pluginId, Map<String, dynamic> params)>[];
+
+  /// 登记一个 `tunnel/event` 消费者（`StationTunnelLink` 构造时调用）。
+  void addTunnelEventListener(
+    void Function(String pluginId, Map<String, dynamic> params) listener,
+  ) => _tunnelEventListeners.add(listener);
+
+  /// 注销一个 `tunnel/event` 消费者（链路对象回收时调用，避免监听器堆积）。
+  void removeTunnelEventListener(
+    void Function(String pluginId, Map<String, dynamic> params) listener,
+  ) => _tunnelEventListeners.remove(listener);
 
   /// 找**可用的 SSH 中转站**（`ssh_executor` 插件）。
   ///
@@ -639,7 +657,15 @@ class PluginBus {
       // SSH 执行器的**内部数据面**（隧道状态跃迁 / PTY 字节与退出）。
       // 刻意**不**降级成 `plugin_event` 推给前端：这不是"插件事件"，是核心自己
       // 选路时建起来的那条隧道的私有通道（前端看隧道状态走执行器自己的错误面）。
+      // 两条路径都靠它拿 PTY：旧 `PluginTunnelLink`（[onTunnelEvent] 字段）与新
+      // `StationTunnelLink`（监听器列表）并存；各自按 conn_id 认领，不属于自己就丢弃。
       onTunnelEvent?.call(pluginId, params);
+      for (final void Function(String, Map<String, dynamic>) listener in List<
+          void Function(String, Map<String, dynamic>)>.of(
+        _tunnelEventListeners,
+      )) {
+        listener(pluginId, params);
+      }
       return;
     }
     if (uiBridge.handles(method)) {
@@ -2460,6 +2486,30 @@ class PluginBus {
       StationHubIds.relaySshExecute,
     );
     return station != null && station.subscribers.isNotEmpty;
+  }
+
+  /// 同 [sshExecuteStationSubscribed]，但给「插件刚上线、订阅帧还在路上」留一个**有界**窗口。
+  ///
+  /// 为什么需要：capability 是在 `hello` 回包里解析的，而新插件的 `station/subscribe`
+  /// 是回完 hello **之后**才发出的（`plugin_loop.dart` 的 `unawaited(_subscribeSshExecute())`）——
+  /// 于是 [sshExecutorLookup] 命中与站点订上之间有几毫秒的竞态。选路时先订上没订上
+  /// 决定走站点还是走旧 `tunnel.*`，因此需要这个小窗口跨越它。
+  ///
+  /// **已订上立即返回 true（不等待）**；只有「当前未订」才每 [interval] 探一次、至多 [timeout]。
+  /// 旧插件（只报能力、永不订阅）因此每次最多付一个 [timeout]，而非永久等待
+  /// （超时后如实返回 false 走旧路径，行为不回归）。
+  Future<bool> sshExecuteStationSubscribedWithin({
+    Duration timeout = const Duration(milliseconds: 400),
+    Duration interval = const Duration(milliseconds: 100),
+  }) async {
+    if (sshExecuteStationSubscribed()) return true;
+    if (timeout <= Duration.zero) return false;
+    final Stopwatch elapsed = Stopwatch()..start();
+    while (elapsed.elapsed < timeout) {
+      await Future<void>.delayed(interval);
+      if (sshExecuteStationSubscribed()) return true;
+    }
+    return sshExecuteStationSubscribed();
   }
 
   // ── 广播站点位：工具调用（单向通知，**不等回包**） ──────────────────────

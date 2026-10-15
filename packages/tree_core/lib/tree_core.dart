@@ -62,6 +62,7 @@ export 'src/plugin/plugin_guide.dart';
 export 'src/plugin/plugin_host.dart';
 export 'src/plugin/plugin_tool_definition.dart';
 export 'src/plugin/plugin_tunnel_link.dart';
+export 'src/plugin/station_tunnel_link.dart';
 export 'src/plugin/plugin_ui_bridge.dart';
 export 'src/plugin/station_ids.dart';
 export 'src/plugin/station_instance.dart';

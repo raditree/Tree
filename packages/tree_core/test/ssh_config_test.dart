@@ -208,6 +208,7 @@ void main() {
 
     test('配了 SSH 且有后端工厂 → 工具落在远端后端上', () async {
       final List<SshConfig> used = <SshConfig>[];
+      final List<String> agents = <String>[];
       final WorkspaceToolRunner runner = WorkspaceToolRunner(
         resolveWorkspaceDir: (String id) => localRoot.path,
         resolveSshConfig: (String id) => const SshConfig(
@@ -215,8 +216,9 @@ void main() {
           username: 'u',
           password: 'pw',
         ),
-        sshIoFactory: (SshConfig config) async {
+        sshIoFactory: (SshConfig config, String agentId) async {
           used.add(config);
+          agents.add(agentId);
           return LocalWorkspaceIO(remoteRoot.path);
         },
       );
@@ -228,6 +230,8 @@ void main() {
       );
       expect(outcome.isError, isFalse);
       expect(used.single.host, 'remote.example.com');
+      // 站点选路需要会话主人 id 派生隔离四元组（team/mode）⇒ 工厂必须收到 owner agentId。
+      expect(agents.single, 'agt_1');
       expect(File(p.join(remoteRoot.path, 'a.txt')).readAsStringSync(), '远端内容');
       expect(
         File(p.join(localRoot.path, 'a.txt')).existsSync(),
@@ -265,7 +269,7 @@ void main() {
         resolveWorkspaceDir: (String id) => localRoot.path,
         resolveSshConfig: (String id) =>
             SshConfig.parse(<String, dynamic>{'host': 'h'}),
-        sshIoFactory: (SshConfig config) async =>
+        sshIoFactory: (SshConfig config, String agentId) async =>
             LocalWorkspaceIO(remoteRoot.path),
         log: logs.add,
       );
