@@ -73,19 +73,44 @@
     **改后详情**刷新，不再发第二次 GET（少一次往返，也不会"界面比核心新"）。内置站的介绍与自定义配置**只读**并
     写明原因；缺东西就说什么缺（介绍为空给出「去哪儿补」的指引，详情读不出来给红条 + 重试），**不猜**。
 
+- **巨型思考的渲染成本必须与总长解耦，且流式时全量历史可回滚阅读**（**修改**
+  [lib/README.md](lib/README.md) 不变量 11）：摘要只扫头部窗口 512 字（短文本与全文实现
+  逐字一致）；右栏详情页**全量在场、分块增量渲染**——每 ~6000 字定居成缓存 widget
+  实例（同实例短路），每帧只重画尾块，切块围栏感知；**尾部窗口方案被用户否决**
+  （「那我不能看生成历史吗？」）写进断言。
+  测试：`test/thinking_window_test.dart` 11 例（摘要等价对拍、分块拼接==全文、无孤立
+  代理对、`identical()` 钉定居块实例、围栏 hold/破硬顶每块自洽、封口全定居）。
+
+- **max_tokens 截断的半截工具参数必须被自动修复成合法 JSON**（**新增**
+  [packages/tree_core/lib/src/llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 15，
+  现场见 [docs/known-issues.md](docs/known-issues.md) #36）：
+  - 端点对截断本身**从不报错**（实测：流式/非流式都是 200 + `finish_reason=length` + 半截
+    `arguments` 原样透传）；500 发生在**下一轮**——半截串落库后端点渲染历史时解析失败，
+    **确定性失败、会话永久中毒**（重试同一请求必然断在同一处）；
+  - 三层防线：**修复本体**（未生成部分嵌 `【⚠️TRUNCATED_BY_MAX_TOKENS⚠️】`，每个候选真过
+    `jsonDecode` 才放行；合法/修不出来返 null 区分三档，救不了的包壳 `{"truncated_arguments": 原文}`，
+    **会话绝不带着解析不了的串落库**）→ **会话组装处**（修复版照常执行、工具结果附续写指引：
+    从标记处续写、**不重复思考**——thinking 与前半段都在历史里，模型不必重烧那几十 k token）
+    → **回灌把关处**（合法串**逐字放行**不换前缀，半截串当场修复——**存量中毒会话下一次请求即自动救活**）；
+  - 续写指引只进**送模型那一份**（`modelContent`），UI 口径 `result` 不变（不变量 5 同构）；
+    传输层截断 500 快速通道保留作兜底。
+  - 测试：`packages/tree_core/test/truncated_tool_args_repair_test.dart` 15 例（含真机 500 报错里
+    那段半截 markdown 的还原；会话 e2e 钉 marker 只出现一次——回灌不二次补洞）。
+
 > 版本说明：本节只改行为与文档，**没有重新出包**，故先记 `Unreleased`；`pubspec.yaml` 仍是 1.0.3+4，
 > 出包时再按用户口径定构建号。
 
 ### 验证
 
-- `dart analyze lib test` 零告警；`flutter test` **849 例全绿**（本节改动自身；工作区里若叠上
+- `dart analyze lib test` 零告警；`flutter test` **877 例全绿**（叠上本节与上节改动；工作区里若叠上
   那份**未提交的在途主题色改动**（`lib/ui/theme_service.dart` / `lib/ui/widgets/welcome_mark.dart`），
   `test/welcome_mark_test.dart` ④ 会红——它钉的是渐变尾色的字面量，与本任务无关）——
   新增 `test/plugin_detail_page_test.dart` 12 例
   （两类卡片进详情页、卡片开关不误跳页、站点页必定重新 GET、禁用发 `disabled: true` 而不是退订、内置站只改上限），
   `test/plugin_admin_api_test.dart` 6 例（新增插件带 `description`、站点三端点的路径转义与 body 形状），
   `test/plugin_panel_admin_test.dart` 钉住介绍写进 `plugins.yaml`。
-- `cd packages/tree_core && dart test` **1228 例通过 / 3 跳过**：自建站 `readme` 必填、`shared` + `allowed_plugins`
+- `cd packages/tree_core && dart test` **1258 例通过 / 3 跳过**（含新增
+  `truncated_tool_args_repair_test` 15 例）：自建站 `readme` 必填、`shared` + `allowed_plugins`
   闸门、`station/trigger` 投递与 `config` 下发、`updateConfig` 按内置/自建分开、禁用标记落盘、三个 HTTP 端点的
   状态码与原因。
 
