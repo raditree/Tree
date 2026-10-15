@@ -688,6 +688,9 @@ class CoreServer {
       // `ssh.reconnect`：与 REST 端点 / 右栏「重连」按钮同一实现（引擎手上的工具
       // 执行器；它不在时命令以「未接线」显式失败，无从重连）。
       sshReconnector: _stationSshReconnect,
+      // `plugin.*` 族（插件热重启控制面）：实现只能是总线——插件实例表、代际
+      // 计数、快照内存池都在它那里。没注入时这些命令以「未接线」显式失败。
+      pluginManager: bus.handlePluginCommand,
       log: (String message) => errorLog?.call('[core:station] $message'),
     );
     _stationMounts = mounts;

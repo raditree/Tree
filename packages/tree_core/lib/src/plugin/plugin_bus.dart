@@ -14,6 +14,8 @@ import '../store/yaml_codec.dart';
 import '../util/liveness.dart';
 import 'execute_mounts.dart';
 import 'plugin_host.dart';
+import 'plugin_lifecycle.dart';
+import 'plugin_state_pool.dart';
 import 'plugin_tool_definition.dart';
 import 'plugin_ui_bridge.dart';
 import 'station_ids.dart';
@@ -108,6 +110,9 @@ class PluginBus {
            ) {
     // 活性探针：站点等回包时用它判「订阅者心跳还在不在」。
     this.stations.livenessProbe = _livenessOf;
+    // 快照池的降级原因必须走同一条日志出口：超上限 / LRU 丢弃 / 归属不符都是
+    // 用户要能查到的事，不能只进 stderr（不变量 6）。
+    statePool.log = log;
     // **所有**前端下行帧（含执行站 ui.push 的 card 槽位）都在这里过一遍再广播，
     // 缓存因此自动收全，不需要每个发射点各自记得记一笔。
     if (broadcast != null) {
@@ -239,6 +244,35 @@ class PluginBus {
 
   /// 已广播过 `disabled` 的"进程已退出"插件（心跳巡检每拍都跑，只在跃迁时推一次）。
   final Set<String> _dead = <String>{};
+
+  /// **可续跑状态快照的内存池**（20261015-hot-restart 阶段 1，D4：只进内存、不落盘）。
+  ///
+  /// 为什么放在总线而不是宿主里：快照要活过**宿主实例本身**（宿主随进程一起没了，
+  /// 而快照正是为了让下一世能接着跑），所以它的持有者必须是跨实例的那一方。
+  /// 上限保守、超限按 LRU 丢最旧并写可读原因（见 [PluginStatePool]）。
+  final PluginStatePool statePool = PluginStatePool();
+
+  /// 每个插件的**代际**（每次启动 +1；没启动过 = 0）。快照的索引键就用它。
+  final Map<String, int> _generations = <String, int>{};
+
+  /// 每个插件当前的生命周期。**只能由 [_setLifecycle] 写**（映射集中一处，
+  /// 四个产出点各算各的就会让面板与 REST 对不上同一个插件）。
+  final Map<String, PluginLifecycleState> _lifecycle =
+      <String, PluginLifecycleState>{};
+
+  /// 已发起关闭、但**还没确认进程退出**的宿主（"收尸"台账）。
+  ///
+  /// 为什么需要它：[PluginHost.close] 默认不再等退出（否则一个赖着不退的插件会拖住
+  /// 整轮串行对账），但赖着不退的进程也不能无限期活着。看门狗对这里的条目
+  /// **只记丢拍、不 ping**（stdin 已关，ping 必定假），判失活后才强杀（见 [watchdog]）。
+  ///
+  /// 用 `Set<PluginHost>` 而不是按插件 id 索引：同一个插件可以在旧进程还没退时
+  /// 就被拉起新一世，按 id 存会把旧那个「忘」在台账外（句柄泄漏），而集合按实例走。
+  final Set<PluginHost> _reaping = <PluginHost>{};
+
+  /// 正在等某插件把快照递进来的等待者（热重启用，以**心跳/退出**为界，不用时长）。
+  final Map<String, Completer<String?>> _dumpWaiters =
+      <String, Completer<String?>>{};
 
   /// 动态工具表（**触发方** = 工具表刷新处；由收集站收集后注册）。
   final PluginToolDefinitionTable _definitions = PluginToolDefinitionTable();
@@ -569,10 +603,18 @@ class PluginBus {
     });
   }
 
-  Future<void> _startOne(PluginConfig config) async {
+  Future<void> _startOne(
+    PluginConfig config, {
+    String resumeDumpId = '',
+  }) async {
     if (_hosts.containsKey(config.id)) return;
+    // **代际在拉起之前**就定下来：快照的索引键靠它，而「这一世是谁」必须在进程还
+    // 没起来时就确定（否则转储与取回会各自猜一个号，两边对不上）。
+    final int generation = (_generations[config.id] ?? 0) + 1;
+    _generations[config.id] = generation;
+    _setLifecycle(config.id, PluginLifecycleState.booting);
     try {
-      final PluginHost host = await _spawn(config);
+      final PluginHost host = await _spawn(config, resumeDumpId: resumeDumpId);
       // **插件 → 核心请求通道**（M9 §3）：插件主动下命令（station/command）在这里
       // 接线。生产路径已在 _spawn 里接好（建连即生效），这里再设一次是为了覆盖
       // hostFactory 注入的宿主（测试 / 自定义宿主）。
@@ -595,12 +637,16 @@ class PluginBus {
       }
       // 插件上线 = 工具表失效点（下次工具表刷新点会重新收集它的申报）
       invalidateToolTable(reason: '插件 ${config.id} 上线');
-      log?.call('插件 ${config.id} 就绪');
+      log?.call('插件 ${config.id} 就绪（第 $generation 代）');
+      _setLifecycle(config.id, PluginLifecycleState.ready);
       _emitStatus(config, 'registered', degraded: false);
     } catch (error) {
       _errors[config.id] = '$error';
       log?.call('插件 ${config.id} 不可用：$error');
       await _disconnect(config.id);
+      // 顺序有意义：先断开（里面会记 stopped），再置 failed——
+      // 「没起来」与「被我关掉了」在面板上是两回事。
+      _setLifecycle(config.id, PluginLifecycleState.failed);
       _emitStatus(config, 'disabled', reason: '$error');
     }
   }
@@ -609,6 +655,9 @@ class PluginBus {
   ///
   /// 心跳降级时 **status 仍是 registered**（插件活着），健康度走 health 字段——
   /// 这样前端的增量合并不会把它当成"停用"。
+  ///
+  /// **D11/D3 向后兼容口径**：`lifecycle` 是**新增的可选键**（从台账读，不在此反推）；
+  /// `status` 与 `health` 的取值集合一个字没改。旧前端看不到 lifecycle 也不受影响。
   void _emitStatus(
     PluginConfig config,
     String status, {
@@ -624,6 +673,9 @@ class PluginBus {
         'granularity': config.granularity,
         'scope': config.scope,
         'status': status,
+        // 可选字段：生命周期阶段（与 status/health 是三个独立轴，见 plugin_lifecycle.dart）
+        'lifecycle': lifecycleOf(config.id).wire,
+        'generation': generationOf(config.id),
         if (reason.isNotEmpty) 'reason': reason,
         if (degraded != null) 'health': degraded ? 'degraded' : 'ok',
         if (host != null) ...<String, dynamic>{
@@ -900,17 +952,507 @@ class PluginBus {
         );
       }
     }
+    _reapStragglers();
   }
 
+  /// 累计收尸（强杀）次数——“本核心到底杀了几个赖着不退的插件”这个总数必须能看见。
+  int _straysKilled = 0;
+  int get straysKilled => _straysKilled;
+
+  /// **收尸**：把「已被要求关闭、但进程还没确认退出」的宿主按心跳判据收尾。
+  ///
+  /// 为什么这里刻意**不 ping**：stdin 已经关了，ping 写不出去 ⇒ 得到的「丢拍」是假的。
+  /// 所以只用真实入站证据（[PluginHost] 收到任意一行即 [LivenessTracker.recordBeat]）
+  /// 加每拍一次 [LivenessTracker.recordMiss]：慢转储 / 慢慢退的插件因此
+  /// **不会因为时长被杀**（D8），只有连续 N 拍彻底沉默才收尸。
+  ///
+  /// 不单独起定时器：看门狗就是节拍本身，两套时钟会打架（D8 的定型理由）。
+  void _reapStragglers() {
+    for (final PluginHost host in _reaping.toList(growable: false)) {
+      if (host.exitedConfirmed) {
+        // 退出已确认 ⇒ 从台账里销账（不管它是自己退的还是被收的）
+        _reaping.remove(host);
+        continue;
+      }
+      if (host.killReason.isNotEmpty) continue; // 已经收过尸，等它确认退出
+      host.liveness.recordMiss();
+      if (!host.liveness.isStale) continue;
+      final String reason =
+          '插件 ${host.config.id} 被要求关闭后连续 ${host.liveness.missedCount} 拍'
+          '没有心跳证据 ⇒ 收尸（强杀）。这是判失活后的收尸，'
+          '不是拿时长判定（D8）：中间只要发过东西就不会走到这一行。';
+      log?.call(reason);
+      host.killStray(reason);
+      _straysKilled++;
+      // 刻意**不立刻移出台账**：一直留到确认退出为止，否则“这个进程到底有没有被收掉”
+      // 在读数上直接消失（不变量 6：发生过的事必须看得见）。
+    }
+  }
+
+  /// **收尸台账的读数**（只给观测与用例，不能拿来驱动行为：驱动只在
+  /// [_reapStragglers] 一处）。
+  ///
+  /// 为什么需要它：被收尸的宿主已经不在 `_hosts` 里，`plugin.state` 看不见它——
+  /// 而“这个赖着不退的进程到底有没有被杀、为什么被杀”必须能被看见（不变量 6/10）。
+  List<Map<String, dynamic>> reapingReadings() => <Map<String, dynamic>>[
+    for (final PluginHost host in _reaping)
+      <String, dynamic>{
+        'plugin_id': host.config.id,
+        'missed_heartbeats': host.liveness.missedCount,
+        'stale': host.liveness.isStale,
+        'exited': host.exitedConfirmed,
+        'killed': host.killReason.isNotEmpty,
+        'kill_reason': host.killReason,
+      },
+  ];
+
   /// **显式重启**插件（心跳 degraded 之后由用户 / 上层决定，**不自动做**）。
+  ///
+  /// 这是**冷重启**：直接断开再拉起，不做转储。能挂起的插件请用
+  /// [hotRestart]（它才会把可续跑状态递下一世）。
   Future<bool> restart(String pluginId) async {
     load();
     final PluginConfig? pluginConfig = config(pluginId);
     if (pluginConfig == null) return false;
+    _setLifecycle(pluginId, PluginLifecycleState.restarting);
     await _disconnect(pluginId);
     await _startOne(pluginConfig);
     await refreshToolDefinitions();
     return _hosts.containsKey(pluginId);
+  }
+
+  // ── 生命周期映射（集中一处）─────────────────────────────────────────
+
+  /// 某插件当前的**代际**（每次 [_startOne] +1；从未启动过 = 0）。
+  int generationOf(String pluginId) => _generations[pluginId] ?? 0;
+
+  /// 某插件当前的生命周期（未记录 = [PluginLifecycleState.stopped]）。
+  ///
+  /// 这是**唯一**的读入口：面板、REST 快照、`plugin_status` 帧、执行站
+  /// `plugin.state` 全部从这里取。为什么不从 host 状态反推（isClosed / liveness /
+  /// _errors 四个源各自算）：反推会得到四个互相矛盾的结论（“heartbeat 在但进程
+  /// 退了”、“进程在但握手没成”……），而面板只能显示一个。台账显式写、只有一处写。
+  PluginLifecycleState lifecycleOf(String pluginId) =>
+      _lifecycle[pluginId] ?? PluginLifecycleState.stopped;
+
+  /// 生命周期的**唯一写入口**：只在真的跃迁时记台账 + 写日志。
+  ///
+  /// 这里**故意不推 `plugin_status` 帧**：帧的产出点仍是原有的那几个（就绪 / 下线 /
+  /// degraded），它们都改成从这里读 `lifecycle`。在同一处既写台账又发帧会造出
+  /// 重复帧（一次上线发两条），而阶段 2 的「状态广播」有自己的点位
+  ///（`plugin.state`），不该混进增量里。
+  void _setLifecycle(String pluginId, PluginLifecycleState state) {
+    final PluginLifecycleState previous =
+        _lifecycle[pluginId] ?? PluginLifecycleState.stopped;
+    if (previous == state) return;
+    _lifecycle[pluginId] = state;
+    log?.call('插件 $pluginId 生命周期：${previous.wire} → ${state.wire}');
+  }
+
+  // ── 热重启（阶段 1 的产出点）───────────────────────────────────────
+
+  /// **热重启**：优雅转储 → 退出 → 新实例取回续跑。全程无磁盘转储、无时长误杀。
+  ///
+  /// 为什么不是“另建一套生命周期”：这里只复用 [_disconnect] + [_startOne]，在它们
+  /// **之间**插入“转储/取回”两步。因此握手、工具申报、站点订阅、失败隔离与
+  /// 冷启动 / 对账走的是同一条路径（不复制一套生命周期 = 不制造第二套会漂移的语义）。
+  ///
+  /// 流程与卡点（D8 / D4 / D3）：
+  /// 1. 一进来就置 `restarting`（**早于** close：重启窗口内对外就该是这个阶段）；
+  /// 2. [PluginHost.requestSuspend] 拿 ack（它与心跳判失活赛跑，不等时长）；
+  /// 3. 等 `plugin.stateDump` 落池——与“进程确认退出”“心跳判失活”两个**事件**赛跑；
+  /// 4. [_disconnect]（默认不等退出）→ [_startOne] 并带上 `resumeDumpId`；
+  /// 5. 新实例用 `plugin.stateFetch` 取回（取回时 core 自己算“上一世”的代际）。
+  ///
+  /// 任何一步不成都**不报错**，而是降级成冷启动并带回可读原因（不变量 10）：
+  /// “没声明 suspension”的插件本来就该冷重启（D3）。
+  Future<PluginHotRestartResult> hotRestart(
+    String pluginId, {
+    bool keepState = true,
+  }) async {
+    load();
+    final PluginConfig? pluginConfig = config(pluginId);
+    if (pluginConfig == null) {
+      return PluginHotRestartResult(
+        pluginId: pluginId,
+        ok: false,
+        reason: '没有插件条目 $pluginId（plugins.yaml 里找不到 ⇒ 无从重启）',
+      );
+    }
+    _setLifecycle(pluginId, PluginLifecycleState.restarting);
+    final PluginHost? host = _hosts[pluginId];
+    String dumpId = '';
+    String reason = '';
+    if (host == null) {
+      reason = '实例本来不在跑 ⇒ 直接按冷启动拉起（无得可转储）';
+    } else if (!keepState) {
+      reason = '调用方显式不要状态（keep_state=false）⇒ 冷重启';
+    } else {
+      final ({bool ok, String reason}) ack = await host.requestSuspend();
+      if (!ack.ok) {
+        reason = ack.reason;
+      } else {
+        final String? waited = await _awaitDump(host, pluginId);
+        dumpId = waited ?? '';
+        reason = waited == null
+            ? '插件 ack 了挂起，但没有把快照递进来 ⇒ 下一世按冷启动继续'
+            : '快照已入池（$waited）';
+      }
+    }
+    await _disconnect(pluginId);
+    await _startOne(pluginConfig, resumeDumpId: dumpId);
+    await refreshToolDefinitions();
+    final bool ok = _hosts.containsKey(pluginId);
+    final int generation = generationOf(pluginId);
+    final String outcome = ok
+        ? '插件 $pluginId 已热重启至第 $generation 代'
+        : '插件 $pluginId 热重启后没能就绪（按失败隔离处理，不牵连其它插件）';
+    log?.call('$outcome：$reason');
+    return PluginHotRestartResult(
+      pluginId: pluginId,
+      ok: ok,
+      resumed: ok && dumpId.isNotEmpty,
+      dumpId: dumpId,
+      generation: generation,
+      lifecycle: lifecycleOf(pluginId).wire,
+      reason: reason.isEmpty ? outcome : '$outcome（$reason）',
+    );
+  }
+
+  /// 等一份快照落池：与「进程确认退出」「心跳判失活」赛跑，**不与时长赛跑**（D8）。
+  ///
+  /// 为什么不需要定时轮询也不用超时：三个事件里任何一个都能给出确定结论——
+  /// 快照到了（成功）、进程退了（不会有了）、心跳判死（不再等）。插件“装死”最多
+  /// 拖到连续 N 拍无入站证据，而真在忙（还在发东西）的插件永远不会被误判。
+  Future<String?> _awaitDump(PluginHost host, String pluginId) async {
+    final String? already = _dumpIdOfCurrentGeneration(pluginId);
+    if (already != null) return already;
+    final Completer<String?> waiter = Completer<String?>();
+    _dumpWaiters[pluginId] = waiter;
+    final Completer<void> stale = host.liveness.watchStale();
+    String? hit;
+    try {
+      hit = await Future.any<String?>(<Future<String?>>[
+        waiter.future,
+        host.exited.then<String?>((void _) => null),
+        stale.future.then<String?>((void _) => null),
+      ]);
+    } finally {
+      host.liveness.unwatchStale(stale);
+      if (identical(_dumpWaiters[pluginId], waiter)) {
+        _dumpWaiters.remove(pluginId);
+      }
+    }
+    // 退出 / 失活信号可能比落池动作早一个微任务：再读一次池，以事实为准。
+    return hit ?? _dumpIdOfCurrentGeneration(pluginId);
+  }
+
+  /// 当前代际里这个插件那份**未消费**的快照 id（没有 = null）。
+  String? _dumpIdOfCurrentGeneration(String pluginId) {
+    final int generation = generationOf(pluginId);
+    for (final PluginStateReading reading in statePool.readings()) {
+      if (reading.pluginId == pluginId &&
+          reading.generation == generation &&
+          !reading.consumed) {
+        return reading.dumpId;
+      }
+    }
+    return null;
+  }
+
+  /// 执行站 `plugin.*` 族的实现（由 `ExecuteStationMounts.pluginManager` 转进来）。
+  ///
+  /// 「插件只能动自己的快照」已在挂载位置层校过一道（`_pluginCommand`）；这里再钉
+  /// 一件更重的事：**键一律由核心拼**（`pluginId#generation`）。插件递来的
+  /// `dump_id` 只做一致性复核，不许直接当键用——否则 A 插件可以靠猜 id 取走 B 的快照。
+  ///
+  /// **自重启不许挂死**（D2 的核心卡点）：`plugin.restart` / `plugin.suspend` 要回头
+  /// 跟插件讲话（`suspend` 是核心→插件的请求）。如果发起者正是目标，那就成了
+  /// 「正在等回包的进程被要求先回一条别的包」——单读循环的插件会当场侸住。
+  /// 所以这两条命令在**目标 == 发起者**时先应答、后动手：用 [Timer.run] 排到
+  /// 下一个事件循环回合（而不是 microtask：回包本身就在当前回合的微任务队列里，
+  /// 抢在它前面写 suspend 就等于没修）。这是“核心代答”的最小形态；窗口内的
+  /// 暂存重放是阶段 2 的活。
+  Future<Map<String, dynamic>> handlePluginCommand({
+    required String command,
+    required String pluginId,
+    required String sourcePluginId,
+    Map<String, dynamic>? arguments,
+  }) async {
+    final Map<String, dynamic> args =
+        arguments ?? const <String, dynamic>{};
+    switch (command) {
+      case 'plugin.list':
+        return <String, dynamic>{
+          'ok': true,
+          'plugins': <Map<String, dynamic>>[
+            for (final PluginConfig cfg in configs())
+              <String, dynamic>{
+                'plugin_id': cfg.id,
+                'name': cfg.name,
+                'enabled': cfg.enabled,
+                'running': _isRunning(cfg.id),
+                'lifecycle': lifecycleOf(cfg.id).wire,
+                'generation': generationOf(cfg.id),
+                'suspendable': cfg.canSuspend,
+                'health': healthOf(cfg.id)['health'],
+              },
+          ],
+        };
+      case 'plugin.state':
+        return _pluginState(pluginId);
+      case 'plugin.restart':
+        final bool keepState = args['keep_state'] != false;
+        if (pluginId.isNotEmpty && pluginId == sourcePluginId) {
+          // 先应答，下一回合再真动手（见上面注释里为什么必须是 Timer）。
+          Timer.run(() {
+            unawaited(hotRestart(pluginId, keepState: keepState).then(
+              (PluginHotRestartResult result) =>
+                  log?.call('自重启收尾：${result.reason}'),
+            ));
+          });
+          return <String, dynamic>{
+            'ok': true,
+            'deferred': true,
+            'plugin_id': pluginId,
+            'note':
+                '重启目标就是发起者 ⇒ 核心先应答再动手（否则你会在等一条'
+                '永远不会来的回包）；结果以插件下一世取回快照时的读数为准',
+          };
+        }
+        final PluginHotRestartResult result = await hotRestart(
+          pluginId,
+          keepState: keepState,
+        );
+        return result.toJson();
+      case 'plugin.suspend':
+        return await _pluginSuspend(
+          pluginId,
+          deferred: pluginId.isNotEmpty && pluginId == sourcePluginId,
+        );
+      case 'plugin.stateDump':
+        return _pluginStateDump(pluginId, args);
+      case 'plugin.stateFetch':
+        return _pluginStateFetch(pluginId, args);
+      default:
+        return <String, dynamic>{
+          'ok': false,
+          'error': '插件命令 $command 没有实现（执行站 plugin.* 白名单内的命令才会走到这里）',
+        };
+    }
+  }
+
+  /// `plugin.state`：一个插件的完整运行态读数（只读，不改任何东西）。
+  Map<String, dynamic> _pluginState(String pluginId) {
+    final PluginConfig? cfg = config(pluginId);
+    if (cfg == null) {
+      return <String, dynamic>{
+        'ok': false,
+        'error': '没有插件条目 $pluginId（plugins.yaml 里找不到）',
+      };
+    }
+    final PluginHost? host = _hosts[pluginId];
+    final Map<String, dynamic> health = healthOf(pluginId);
+    return <String, dynamic>{
+      'ok': true,
+      'plugin_id': pluginId,
+      'name': cfg.name,
+      'enabled': cfg.enabled,
+      'running': host != null && !host.isClosed,
+      'status': host != null && !host.isClosed && cfg.enabled
+          ? 'registered'
+          : 'disabled',
+      'lifecycle': lifecycleOf(pluginId).wire,
+      'generation': generationOf(pluginId),
+      'suspendable': cfg.canSuspend,
+      'health': health['health'],
+      'missed_heartbeats': health['missed_heartbeats'],
+      'last_error': _errors[pluginId] ?? '',
+      // 池里的快照只报水位，不报内容（面板也不该拿到插件内部状态）。
+      'snapshots': <Map<String, dynamic>>[
+        for (final PluginStateReading reading in statePool.readings())
+          if (reading.pluginId == pluginId) reading.toJson(),
+      ],
+      'kill_reason': host?.killReason ?? '',
+    };
+  }
+
+  /// `plugin.suspend`：请求挂起（转储 + 记 `suspended`），**不代为退出也不拉起下一世**。
+  ///
+  /// 为什么这样切：`suspend` 是“把可续跑状态交出来”这个动作，而“换一世”是 restart
+  /// 的职责。两个强绑在一起的话，“我只想看一下快照多大”也会把插件弄掉。
+  Future<Map<String, dynamic>> _pluginSuspend(
+    String pluginId, {
+    required bool deferred,
+  }) async {
+    Future<Map<String, dynamic>> run() async {
+      final PluginHost? host = _hosts[pluginId];
+      if (host == null) {
+        return <String, dynamic>{
+          'ok': false,
+          'error': '插件 $pluginId 没有在跑 ⇒ 无得可挂起（要看它的状态请用 plugin.state）',
+        };
+      }
+      final ({bool ok, String reason}) ack = await host.requestSuspend();
+      if (!ack.ok) {
+        return <String, dynamic>{'ok': false, 'error': ack.reason};
+      }
+      final String? dumpId = await _awaitDump(host, pluginId);
+      _setLifecycle(pluginId, PluginLifecycleState.suspended);
+      return <String, dynamic>{
+        'ok': true,
+        'plugin_id': pluginId,
+        'suspended': true,
+        'dump_id': dumpId,
+        'generation': generationOf(pluginId),
+        'note': dumpId == null
+            ? '插件 ack 了挂起，但没有递快照进来（下一世按冷启动继续）'
+            : '快照已入池；本命令**不代为退出**，要换一世请用 plugin.restart',
+      };
+    }
+
+    if (!deferred) return run();
+    // 目标就是发起者：同 plugin.restart 那条路径，先应答再动手。
+    Timer.run(() {
+      unawaited(run().then((Map<String, dynamic> result) {
+        log?.call('自挂起收尾：${result['dump_id'] ?? result['error'] ?? ''}');
+      }));
+    });
+    return <String, dynamic>{
+      'ok': true,
+      'deferred': true,
+      'plugin_id': pluginId,
+      'note': '挂起目标就是发起者 ⇒ 核心先应答再发 suspend（避免自己等自己）',
+    };
+  }
+
+  /// `plugin.stateDump`：收一份快照入池（D4：只进内存，不落盘）。
+  Map<String, dynamic> _pluginStateDump(
+    String pluginId,
+    Map<String, dynamic> args,
+  ) {
+    final PluginConfig? cfg = config(pluginId);
+    if (cfg == null) {
+      return <String, dynamic>{
+        'ok': false,
+        'error': '没有插件条目 $pluginId ⇒ 快照无处归属，拒收',
+      };
+    }
+    final Object? rawPayload = args['payload'];
+    if (rawPayload is! Map) {
+      return <String, dynamic>{
+        'ok': false,
+        'error': 'plugin.stateDump 需要 arguments.payload（JSON 对象）：转储的内容就是它，'
+            '核心不猜、也不空收一条“没内容的快照”',
+      };
+    }
+    final int generation = generationOf(pluginId);
+    if (generation < 1) {
+      return <String, dynamic>{
+        'ok': false,
+        'error': '插件 $pluginId 还没有任何一世（代际 = 0）⇒ 快照无处归属，拒收',
+      };
+    }
+    final PluginStatePutResult put = statePool.put(
+      pluginId: pluginId,
+      generation: generation,
+      payload: Map<String, dynamic>.from(rawPayload),
+      // 写入归属 = **配置声明**（不是请求里带的 scope）：取回时用的是同一个推导，
+      // 两边才能逐字相等。拿请求里的值写会造出“插件自己声明什么就能取什么”。
+      scope: StationScope.parse(cfg.scope),
+    );
+    if (!put.accepted) {
+      return <String, dynamic>{'ok': false, 'error': put.error};
+    }
+    final String? dumpId = put.dumpId;
+    // 热重启那边的等待者以事件方式拿到结果（不轮询、不定时）。
+    final Completer<String?>? waiter = _dumpWaiters.remove(pluginId);
+    if (waiter != null && !waiter.isCompleted) waiter.complete(dumpId);
+    int bytes = 0;
+    for (final PluginStateReading reading in statePool.readings()) {
+      if (reading.dumpId == dumpId) bytes = reading.bytes;
+    }
+    return <String, dynamic>{
+      'ok': true,
+      'dump_id': dumpId,
+      'plugin_id': pluginId,
+      'generation': generation,
+      'bytes': bytes,
+      'pool_entries': statePool.length,
+      'pool_bytes': statePool.totalBytes,
+    };
+  }
+
+  /// `plugin.stateFetch`：取回**上一世**的快照并消费（一份快照只喂一世）。
+  ///
+  /// 代际由**核心自己算**（当前代 − 1），而不是让插件报“我要拿哪一世”：
+  /// 注入宿主（测试）与自定义宿主拿不到 `hello` 参数，靠它传 dump_id 会把
+  /// “取回续跑”这条主路卡在测试假宿主上；而“上一世是谁”本来就是核心的事实。
+  Map<String, dynamic> _pluginStateFetch(
+    String pluginId,
+    Map<String, dynamic> args,
+  ) {
+    final PluginConfig? cfg = config(pluginId);
+    if (cfg == null) {
+      return <String, dynamic>{
+        'ok': false,
+        'error': '没有插件条目 $pluginId ⇒ 无从确定快照归属',
+      };
+    }
+    final int current = generationOf(pluginId);
+    final int wanted = current - 1;
+    final String expectedDumpId = '$pluginId#$wanted';
+    // **点名核对排在“有没有上一世”之前**：插件报了一个对不上号的 dump_id，即使
+    // 这一世本来就没有可取的东西也必须当场拒——那说明它对代际的理解与核心不一致，
+    // 这句提醒比回一句“没有快照”有用得多（fail-closed 优先于客气）。
+    final Object? rawWanted = args['dump_id'];
+    if (rawWanted != null && rawWanted.toString().trim().isNotEmpty) {
+      final String given = rawWanted.toString().trim();
+      if (given != expectedDumpId) {
+        return <String, dynamic>{
+          'ok': false,
+          'error':
+              '插件 $pluginId 要求取回快照 $given，但它的上一世是 $expectedDumpId：'
+              '快照键由核心拼，不接受指定别人的键',
+        };
+      }
+    }
+    if (wanted < 1) {
+      return <String, dynamic>{
+        'ok': true,
+        'plugin_id': pluginId,
+        'has_snapshot': false,
+        'generation': current,
+        'reason': '这是第 $current 代（没有上一世）⇒ 按冷启动继续',
+      };
+    }
+    final int deniedBefore = statePool.deniedCount;
+    final PluginStateSnapshot? snapshot = statePool.take(
+      pluginId: pluginId,
+      generation: wanted,
+      scope: StationScope.parse(cfg.scope),
+    );
+    final bool denied = statePool.deniedCount > deniedBefore;
+    if (snapshot == null) {
+      return <String, dynamic>{
+        'ok': true,
+        'plugin_id': pluginId,
+        'has_snapshot': false,
+        'generation': current,
+        'reason': denied
+            ? '归属不符 ⇒ 不给取回（快照写在另一个工作面，不因为“换了进程”就放宽）'
+            : '上一世没有留下可用快照（未转储 / 已被取走 / 超过存活时长）⇒ 按冷启动继续',
+      };
+    }
+    return <String, dynamic>{
+      'ok': true,
+      'plugin_id': pluginId,
+      'has_snapshot': true,
+      'dump_id': snapshot.dumpId,
+      'generation': snapshot.generation,
+      'bytes': snapshot.bytes,
+      'payload': snapshot.payload,
+    };
   }
 
   /// **配置对账**（M9 §4.2「开关立刻有用」的核心入口）：重读磁盘配置，把运行中的
@@ -3995,6 +4537,10 @@ class PluginBus {
         'status': error == null && host != null && !host.isClosed
             ? 'registered'
             : 'disabled',
+        // **只增键**（D11）：status / health 的产出值与改动前逐字一致，lifecycle 与
+        // generation 是新增的可选读数（面板据此显示「重启中 / 已挂起」）。
+        'lifecycle': lifecycleOf(config.id).wire,
+        'generation': generationOf(config.id),
         'health': host == null ? 'unavailable' : (degraded ? 'degraded' : 'ok'),
         if (host != null) ...<String, dynamic>{
           'missed_heartbeats': host.liveness.missedCount,
@@ -4041,18 +4587,47 @@ class PluginBus {
       await _disconnect(pluginId);
       if (pluginConfig != null) _emitStatus(pluginConfig, 'destroyed');
     }
+    // **核心自己要退了 ⇒ 在这里收尸**（不留孤儿进程）。这不是时长判死：依据是
+    // “父进程即将离开”这个事实，而快照池本来就随核心内存一起消失（D4），再等它
+    // 转储毫无意义。这里也不 `await exited`：一个赖着不退的插件不该拖住整个退出。
+    for (final PluginHost host in _reaping.toList(growable: false)) {
+      host.killStray('核心退出 ⇒ 收尸（不留孤儿进程；不是时长判死）');
+      _straysKilled++;
+    }
+    _reaping.clear();
+    // 热重启的等待者必须以“拿不到快照”收尾，不能留一个永不完成的 future
+    //（不变量 6：失败要可读上报，不静默挂住）。
+    _failDumpWaiters('核心已退出 ⇒ 不再等这份快照');
+    statePool.clear();
     stations.save();
   }
 
-  Future<PluginHost> _spawn(PluginConfig config) {
+  /// 把所有在等的快照等待者以“没拿到”收尾（核心退出 / 热重启失败路径用）。
+  void _failDumpWaiters(String reason) {
+    if (_dumpWaiters.isEmpty) return;
+    for (final Completer<String?> waiter in _dumpWaiters.values) {
+      if (!waiter.isCompleted) waiter.complete(null);
+    }
+    _dumpWaiters.clear();
+    log?.call('快照等待收尾：$reason');
+  }
+
+  Future<PluginHost> _spawn(
+    PluginConfig config, {
+    String resumeDumpId = '',
+  }) {
     final Future<PluginHost> Function(PluginConfig config)? factory =
         hostFactory;
+    // 注入宿主（测试 / 自定义宿主）**拿不到 resumeDumpId**：它自己就是假定的插件，
+    // 无得可「续」。因此取回快照不依赖它知道 dump_id——见
+    // [handlePluginCommand] 的 `plugin.stateFetch`：代际由**核心自己**算。
     if (factory != null) return factory(config);
     return PluginHost.start(
       config,
       timeout: connectTimeout,
       heartbeatInterval: heartbeatInterval,
       coreVersion: coreVersion,
+      resumeDumpId: resumeDumpId,
       onNotification: (Map<String, dynamic> notification) =>
           _emitPluginEvent(config.id, notification),
       // 插件主动请求（station/command）的处理器：建连时即接线，
@@ -4062,7 +4637,7 @@ class PluginBus {
     );
   }
 
-  Future<void> _disconnect(String pluginId) async {
+  Future<void> _disconnect(String pluginId, {bool awaitExit = false}) async {
     final PluginHost? host = _hosts.remove(pluginId);
     // 实例没了 ⇒ "上次按什么参数起来的"这条记录也失效（重启会重新记）
     _spawnedConfigs.remove(pluginId);
@@ -4085,9 +4660,22 @@ class PluginBus {
     invalidateToolTable(reason: '插件 $pluginId 下线');
     if (host == null) return;
     try {
-      await host.close();
+      // 默认不等退出（D8）：“退没退”交给收尸台账按心跳判，不在这里卡住调用方。
+      // `awaitExit: true` 只给“真的必须拿到退出码”的场景（Windows 替换二进制前的
+      // 文件锁），等的也是事件而不是时长。
+      await host.close(waitForExit: awaitExit);
     } catch (error) {
       log?.call('关闭插件 $pluginId 失败：$error');
+    }
+    if (!host.exitedConfirmed) {
+      // 还没确认退出：挂上台账，由看门狗下一拍开始逐拍判。
+      _reaping.add(host);
+    }
+    // **重启窗口不降回 stopped**：`hotRestart` / `restart` 一进来就置了 restarting，
+    // 中间这段“旧进程已要求退、新进程还没就绪”对外必须是 restarting（阶段 2 的
+    // 保活与路由判据全靠它）。除此之外断开就是 stopped。
+    if (lifecycleOf(pluginId) != PluginLifecycleState.restarting) {
+      _setLifecycle(pluginId, PluginLifecycleState.stopped);
     }
   }
 
@@ -4161,6 +4749,83 @@ class _PluginLlmStream {
 
   /// 直接作废（同一 request_id 被新流顶掉时用）。
   void fail(String reason) => finish(failure: reason);
+}
+
+/// `plugin.*` 六条命令的**对外面**（20261015-hot-restart 阶段 1，D9/D2）。
+///
+/// 为什么要把这个划分写成常量而不是“等做 tool 的时候再说”：`plugin.stateDump` /
+/// `plugin.stateFetch` 是**生命周期原语**——它们该不该被模型使唤，答案不能取决于
+/// 下一个写 tool 的人忘了还是没忘。写在这里，阶段 3 的自迭代插件只能照这个表申报。
+///
+/// - [agentToolCommands]：控制面。人可以叫 agent 去“重启那个插件”“看看插件列表”，
+///   这些动作有完整的业务含义，也能以可读结果收尾；
+/// - [lifecycleOnlyCommands]：**只能由插件自己下**。它们的操作对象是“我这个进程的
+///   那一份人生”，模型没有资格代它发言：一次错路的 stateDump 会把插件的内部状态
+///   抓到一个它不该抓的名字上，而一次错路的 stateFetch 会把已消费的快照抽干。
+abstract final class PluginToolSurface {
+  /// 可以被申报成 agent tool 的 `plugin.*` 命令。
+  static const Set<String> agentToolCommands = <String>{
+    'plugin.list',
+    'plugin.restart',
+    'plugin.suspend',
+    'plugin.state',
+  };
+
+  /// **不得**被申报成 agent tool 的命令（插件生命周期原语，D9）。
+  static const Set<String> lifecycleOnlyCommands = <String>{
+    'plugin.stateDump',
+    'plugin.stateFetch',
+  };
+}
+
+/// 一次**热重启**的结论（每条都带可读结果，不“看起来成功了”）。
+///
+/// 为什么单独一个类型而不是 `bool`：[PluginBus.hotRestart] 有三种截然不同的结局，
+/// 而面板与 agent tool 必须把它们分开说：
+/// - `ok=true, resumed=true`：真的带着快照换了一世；
+/// - `ok=true, resumed=false`：换了一世，但**按冷启动**（没声明 suspension /
+///   没递快照 / ack 丢了）——对用户这是“重启成功但状态没续上”，不是失败；
+/// - `ok=false`：新一世没起来（按失败隔离处理，不牵连其它插件）。
+class PluginHotRestartResult {
+  const PluginHotRestartResult({
+    required this.pluginId,
+    required this.ok,
+    this.resumed = false,
+    this.dumpId = '',
+    this.generation = 0,
+    this.lifecycle = 'stopped',
+    this.reason = '',
+  });
+
+  final String pluginId;
+
+  /// 新一世是否就绪。
+  final bool ok;
+
+  /// 是否真的拿到了可续跑快照（= 下一世能取回它）。
+  final bool resumed;
+
+  /// 入池的快照 id（空 = 无快照）。
+  final String dumpId;
+
+  /// 重启后的**代际**。
+  final int generation;
+
+  /// 重启后的生命周期（`ready` / `failed`……）。
+  final String lifecycle;
+
+  /// 可读结论（含降级原因）。
+  final String reason;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'ok': ok,
+    'plugin_id': pluginId,
+    'resumed': resumed,
+    'dump_id': dumpId,
+    'generation': generation,
+    'lifecycle': lifecycle,
+    'reason': reason,
+  };
 }
 
 /// 对账里**单个插件**的结论：做了什么（[kind]）+ 对谁（[pluginId]）+ 为什么（[reason]）。

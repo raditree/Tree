@@ -112,6 +112,27 @@ typedef StationSshReconnector = Future<Map<String, dynamic>> Function(
   String agentId,
 );
 
+/// `plugin.*` 族的**统一入口**（2026-10-15 插件热重启）：由 `PluginBus` 实现。
+///
+/// 为什么只给一个入口而不是六条各一个槽：这一族的六条命令共享同一套归属口径
+/// （见 [_pluginCommand]），拆成六个参数只会把「谁能动谁的快照」这条判定复制六遍。
+///
+/// [command] 是命令名（`plugin.list` / `plugin.restart` / `plugin.suspend` /
+/// `plugin.state` / `plugin.stateDump` / `plugin.stateFetch`）；
+/// [pluginId] 是**已在本层归一化过**的目标插件 id（快照两条 = 发起者自己的 id）；
+/// [sourcePluginId] 是下达这条命令的插件 id（空 = 核心自己下的）——实现方据此
+/// 钉住「插件只能动自己的快照」；[arguments] 是原始参数（原样透传，不预先消化）。
+///
+/// 返回值约定与其它槽一致：`{ok: true, ...结论}` 或 `{ok: false, error: 可读中文}`。
+/// **不做静默降级**：没接线时本层直接以「未接线」失败（口径见类注释第 15 条）。
+typedef StationPluginManager =
+    Future<Map<String, dynamic>> Function({
+      required String command,
+      required String pluginId,
+      required String sourcePluginId,
+      Map<String, dynamic>? arguments,
+    });
+
 /// 执行站命令的挂载位置集合（M9 Wave 3-I）。
 ///
 /// 站点体系里「执行器只是执行站的一种挂载位置」：本类就是**系统内置挂载位置**，
@@ -153,6 +174,7 @@ class ExecuteStationMounts {
     this.sessionRenamer,
     this.toolCloser,
     this.sshReconnector,
+    this.pluginManager,
     this.log,
   }) : _injectedHooks = hooks;
 
@@ -174,6 +196,7 @@ class ExecuteStationMounts {
     StationSessionRenamer? sessionRenamer,
     StationToolCloser? toolCloser,
     StationSshReconnector? sshReconnector,
+    StationPluginManager? pluginManager,
     void Function(String message)? log,
   }) => ExecuteStationMounts(
     ioFor: ioFor,
@@ -199,6 +222,7 @@ class ExecuteStationMounts {
     sessionRenamer: sessionRenamer,
     toolCloser: toolCloser,
     sshReconnector: sshReconnector,
+    pluginManager: pluginManager,
     log: log,
   );
 
@@ -242,6 +266,12 @@ class ExecuteStationMounts {
 
   /// `ssh.reconnect`（重建远端 SSH 链路）入口；null = 该命令显式报「未接线」。
   final StationSshReconnector? sshReconnector;
+
+  /// `plugin.*` 族（插件热重启控制面）入口；null = 这些命令显式报「未接线」。
+  ///
+  /// 这一族的实现只能是 `PluginBus`：插件实例表、generation 计数、快照内存池
+  /// 都在它那里，挂载位置层因此不拿任何插件状态、只负责**归属校验 + 分派**。
+  final StationPluginManager? pluginManager;
 
   final void Function(String message)? log;
 
@@ -309,6 +339,16 @@ class ExecuteStationMounts {
         '命令 $command 不在执行站命令白名单内，拒绝执行（挂载位置复核）',
       );
     }
+    // **插件族不靠 agent 工作空间归属证明身份**，所以在 `_resolveTarget` 之前分派：
+    // 它的闸门是「发起者是谁的快照」与「能不能证明 team」（见 [_pluginCommand]）。
+    // 把它塞进四元组解析会造出一个假需求——快照本来就没有目标 agent。
+    if (command.startsWith('plugin.')) {
+      try {
+        return await _pluginCommand(context, command);
+      } catch (error) {
+        return StationCommandOutcome.failed('命令 $command 执行异常：$error');
+      }
+    }
     // **四元组解析目标**：证明不了归属一律拒绝
     final _StationTarget target = _resolveTarget(context);
     if (target.error.isNotEmpty) {
@@ -358,6 +398,77 @@ class ExecuteStationMounts {
     } catch (error) {
       return StationCommandOutcome.failed('命令 $command 执行异常：$error');
     }
+  }
+
+  /// `plugin.*` 族的归属闸门与分派（插件热重启控制面）。
+  ///
+  /// 两条不同的归属口径，刻意不合并成一条（合并就会一边假严、一边真松）：
+  /// - `plugin.stateDump` / `plugin.stateFetch`：**发起者必须是插件**，且只能对
+  ///   **自己**的快照下命令（`plugin_id` 与发起者不一致直接拒绝）。它们的闸门是
+  ///   「谁在说话」而不是「目标 agent 属于哪个 team」——快照本来就没有 agent；
+  /// - 其余四条（list / restart / suspend / state）：控制别人的插件必须有可证明的
+  ///   team 归属，`scope.team_id` 为空 ⇒ fail-closed 拒绝（与类注释第 4 条同口径）。
+  ///
+  /// 本层**不碰插件实例表**：具体做什么全部交给 [pluginManager]（= `PluginBus`），
+  /// 没接线时以「未接线」显式失败（不做静默降级，见类注释第 15 条）。
+  Future<StationCommandOutcome> _pluginCommand(
+    StationCommandContext context,
+    String command,
+  ) async {
+    final StationPluginManager? manager = pluginManager;
+    if (manager == null) {
+      return StationCommandOutcome.failed(
+        '命令 $command 尚无挂载实现（核心未给执行站注入插件管理器：未接线，'
+        '不假装已经做过）',
+      );
+    }
+    final String requested = _string(context.arguments['plugin_id']);
+    final bool selfSnapshot =
+        command == 'plugin.stateDump' || command == 'plugin.stateFetch';
+    String target = requested;
+    if (selfSnapshot) {
+      final String source = context.sourcePluginId.trim();
+      if (source.isEmpty) {
+        return StationCommandOutcome.failed(
+          '命令 $command 必须由插件身份下达（没有 source_plugin_id ⇒ 证明不了快照'
+          '归谁）：拒绝执行（fail-closed）',
+        );
+      }
+      if (requested.isNotEmpty && requested != source) {
+        return StationCommandOutcome.failed(
+          '插件 $source 不能对 $requested 下 $command：只能操作自己的快照'
+          '（跨插件读写一律拒绝）',
+        );
+      }
+      target = source;
+    } else {
+      if (context.scope.teamId.trim().isEmpty) {
+        return StationCommandOutcome.failed(
+          '命令 $command 的 scope 缺少 team_id：证明不了归属 ⇒ 拒绝执行'
+          '（fail-closed）',
+        );
+      }
+      // plugin.list 不带目标 id（它就是「看全部」），其余四条要指名插件
+      if (target.isEmpty && command != 'plugin.list') {
+        return StationCommandOutcome.failed(
+          '命令 $command 需要 arguments.plugin_id（要动哪个插件）',
+        );
+      }
+    }
+    final Map<String, dynamic> result = await manager(
+      command: command,
+      pluginId: target,
+      sourcePluginId: context.sourcePluginId,
+      arguments: context.arguments,
+    );
+    final Object? ok = result['ok'];
+    if (ok is bool && !ok) {
+      final String error = _string(result['error']);
+      return StationCommandOutcome.failed(
+        error.isEmpty ? '命令 $command 失败（未给出原因）' : error,
+      );
+    }
+    return StationCommandOutcome.ok(result);
   }
 
   /// 按站点 scope 四元组解析命令目标（fail-closed）。

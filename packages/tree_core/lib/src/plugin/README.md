@@ -69,7 +69,7 @@
     - **新定位**：中转站不只会拦下数据让插件改写，还会把**整块处理工作**交给插件。SSH 工作空间因此新增内置点位
       `system.relay.ssh.execute`（别名 `ssh.execute`，中转站唯一订阅者）：核心把 `ensure` / `request` / `state` /
       `reconnect` / `close` / `shell.*` 都投成一次 `station/request`，插件自己完成到目标机的通信与回包，
-      共 20 个内置点位（广播 4 + 执行 8 + 中转 7 + 收集 1）。
+      共 21 个内置点位（广播 4 + 执行 9 + 中转 7 + 收集 1）。
     - 选路信号：`PluginBus.sshExecuteStationSubscribed()`（新，按「中转站点位有没有订阅者」）
       与 `PluginBus.sshExecutorLookup()`（旧，按 `hello.capabilities` + 进程在跑）**OR**：
       旧插件只报 capability 不订站点 ⇒ 行为与今天一致（走 `tunnel.*` 顶层方法）；
@@ -132,6 +132,61 @@
     `订阅者的禁用标记落盘：重启后仍是关着的（不会被重新订阅悄悄打开）`）、
     [test/plugin_request_test.dart](../../../test/plugin_request_test.dart)
     （`站点所有者禁用订阅者 ⇒ 触发不再投递，原因写在 skipped（不静默）`）。
+
+23. **插件的“退出”只认事件与心跳两个判据，不认时长**（2026-10-15 插件热重启，D8）：
+    `PluginHost.close()` **没有任何 `timeout(...)`**，也**没有任何 `.kill(...)`**（由用例从
+    源码层面钉住）。拆两阶段是因为一个 bug 形状：原来 `shutdown` 之后立刻 `_failPending`，
+    会把**正在转储的在途请求自己关掉**。新口径：
+    - `requestSuspend()` → 快照入池 → **才** `close()`（所以 `_failPending` 留在转储之后是安全的）；
+    - **默认不等退出**（`waitForExit = false`）：一个赖着不退的插件绝不能拖住串行对账；
+      只有“真的必须拿到退出码”才显式 `awaitExit: true`（Windows 替换二进制前的文件锁），
+      等的也是“进程结束”这个事件而不是时长；
+    - 还没确认退出的宿主挂进**收尸台账**（`_reaping`，按实例而不是按插件 id，否则旧进程会被
+      “忘”在台账外）；看门狗对它们**只记丢拍、不 ping**（stdin 已关，ping 必定假），
+      连续 N 拍无入站证据才 `killStray()`。任何入站报文都是 `recordBeat` ⇒ “心跳在、只是慢”
+      永远走不到那一行；
+    - `killStray()` 全项目只有两个合法来源：**判失活后的收尸**与**用户显式动作**；
+      不单独起保活定时器（看门狗就是节拍本身，两套时钟会打架）。
+    用例：[test/plugin_close_no_hard_timeout_test.dart](../../../test/plugin_close_no_hard_timeout_test.dart)、
+    [test/plugin_hot_restart_test.dart](../../../test/plugin_hot_restart_test.dart)。
+
+24. **可续跑状态只进核心进程内存，且一世一份**（2026-10-15，D4）：
+    `PluginStatePool` **不落盘**（核心退出即丢快照，那正是“热重启续跑”的作用域），
+    所以会话事实**不得**只寄存在插件状态里（不变量 8：落库优先）。
+    索引键 = `(pluginId, generation)`，**generation 由核心自己推进**（每次 `_startOne` +1），
+    插件报的 `dump_id` 只做一致性核对，**不许直接当键用**（否则 A 可靠猜 id 取走 B 的快照）。
+    写入归属取 **`plugins.yaml` 的声明**而不是请求里带的 scope（两边同一个推导才比得出相等）；
+    取回是 **fail-closed 精确相等**（改了 `team_id` 就不给旧快照，且“被拒”不算消费）。
+    一份快照只喂一世；`release()` 只用于“取回后新实例未就绪就退了”那一次作废。
+    单条过大 = **整条拒收不截断**（半截状态被当成完整状态恢复比失败更糟）；条数/总字节超限按 LRU 丢最旧，
+    刚放入的那条不丢；所有降级都写可读原因。
+    用例：[test/plugin_state_pool_test.dart](../../../test/plugin_state_pool_test.dart)、
+    [test/plugin_state_pool_scope_test.dart](../../../test/plugin_state_pool_scope_test.dart)。
+
+25. **活性 / 启停 / 阶段是三个独立的轴，`lifecycle` 只能做加法**（2026-10-15，D11/D3）：
+    `health`（`ok/degraded/unavailable`，心跳判）、`status`（`registered/disabled`，启停判）、
+    `lifecycle`（`stopped/booting/ready/restarting/suspended/failed`，阶段判）**取值集合互不相交**，
+    谁也不得吃掉谁。对前端与快照只**新增可选键** `lifecycle` / `generation`，
+    `status` 与 `health` 的产出值与升级前逐字一致（旧前端看不到新键也不受影响）。
+    映射**集中在 `PluginBus` 一处**：`lifecycleOf()` 是唯一读入口、`_setLifecycle()` 是唯一写入口（台账显式
+    写，不从 `isClosed`/`liveness`/`_errors` 四个源反推）；重启窗口**不降回 stopped**，对外一直是 `restarting`。
+    挂起声明同样保守：`suspension` 缺省为空串 = **不可挂起**（热重启就冷启动，不报错）。
+    用例：[test/plugin_lifecycle_test.dart](../../../test/plugin_lifecycle_test.dart)、
+    [test/plugin_hot_apply_test.dart](../../../test/plugin_hot_apply_test.dart)（行为不得变）。
+
+26. **`plugin.*` 六条命令分两套归属口径，快照两条不进 agent tool**（2026-10-15，D10/D9）：
+    D10 定稿为「A+B 混合」：**不新增 RPC method**（本任务只新增 `suspend` 一个，由
+    [tree_protocol 的门禁](../../../../tree_protocol/lib/src/plugin_rpc_methods.dart) 钉住），
+    转储/取回走已有的 `station/command` ⇒ 再没有“method 不存在”这层天然护栏，命令表与归属
+    必须自己钉牢。两套口径**刻意不合并**（合并就会一边假严、一边真松）：
+    - 控制面四条（`list`/`restart`/`suspend`/`state`）：`scope.team_id` 证明不了就拒（fail-closed）；
+    - 快照两条（`stateDump`/`stateFetch`）：发起者**必须是插件本人**且只能动自己的键（它们的闸门是
+      “谁在说话”，而不是“目标 agent 属于哪个 team”——快照本来就没有 agent，所以它们在
+      `ExecuteStationMounts._handle` 里**绕开四元组解析**，这是写明在代码里的故意面）。
+    `PluginToolSurface` 把“哪四条可以被申报成 agent tool / 哪两条不得”定成常量（而不是“等做 tool 时再说”）。
+    自重启不许挂死：目标 == 发起者时用 `Timer.run` **先应答再动手**（microtask 不够：回包本身就在
+    当前回合的微任务队列里，抢在它前面写 `suspend` 等于没修）。
+    用例：[test/plugin_hot_restart_station_test.dart](../../../test/plugin_hot_restart_station_test.dart)。
 
 ## 测试
 

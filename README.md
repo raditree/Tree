@@ -75,7 +75,7 @@ dart run tool/package_windows.dart --flutter "<flutter.bat 的路径>"
 | [docs/development.md](docs/development.md) | 环境、构建、测试矩阵、打包与安装包、调试、发布检查单 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 开发规则约束：提交规范、测试要求、文档制度、跨模块不变量 |
 | [docs/team.md](docs/team.md) | 团队与成员语义（共享工作目录、私有分栏、SSH 跟随、会话并行、派活与回信） |
-| [docs/plugin-development.md](docs/plugin-development.md) | 写插件的系统指南（协议、20 个点位、scope、执行站命令、流式接管） |
+| [docs/plugin-development.md](docs/plugin-development.md) | 写插件的系统指南（协议、21 个点位、scope、执行站命令、流式接管） |
 | [docs/known-issues.md](docs/known-issues.md) | 已知问题台账（现象 / 根因 / 修复 / 验证） |
 | [docs/README.md](docs/README.md) | 全部文档索引（含历史与设计稿） |
 

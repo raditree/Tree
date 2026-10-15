@@ -80,12 +80,17 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 
 | method | 何时 | 参数 | 期望的 result |
 |---|---|---|---|
-| `hello` | 进程起好后第一件事 | `{core_version, plugin_id, scope, config}` | `{ok: true}`（其余字段忽略） |
+| `hello` | 进程起好后第一件事 | `{core_version, plugin_id, scope, config, resume_dump_id?}` | `{ok: true}`（其余字段忽略）。`resume_dump_id` 只在**热重启后的新一世**才出现，没快照时根本不递这个键（旧插件不受影响） |
 | `tools/list` | 握手后（工具表刷新点也会再来） | `{}` | `{tools: [见 §6]}` |
 | `tools/call` | 模型要调你的工具 | `{name, arguments, agent_id?, session_id?}` | `{text?, content?, isError?}`（见 §6.3） |
 | `ping` | 每 `heartbeat_interval`（默认 10s） | `{}` | 任意合法响应（核心只看"这一拍回了没"） |
 | `station/request` | 你订阅的点位被触发 | `{request_id, station_id, kind, scope, payload, meta, schema?}` | `{reply: {payload: …}}`（见 §5） |
 | `station/cancel` | **通知**（无 id）：你接管的 LLM 流该收了 | `{request_id, reason?}` | 不需要应答 |
+| `suspend` | **热重启前的转储请求**（只有条目声明了 `suspension: keep` 才会收到） | `{reason: "hot_restart"}` | `{ok: true}`；**先下 `plugin.stateDump`、等它回包、再回本条 ack**（见 §6.5） |
+
+> **`suspend` 是本任务（插件热重启）唯一新增的 method**，并由
+> `packages/tree_protocol/test/plugin_rpc_method_gate_test.dart` 钉住"新增 = 1"；
+> 所有方法名都必须在 `tree_protocol` 的 `PluginRpcMethods` 里登记，否则门禁红。
 
 ### 2.2 插件 → 核心
 
@@ -124,7 +129,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | 中转站 relay | 拦截-回填：核心把数据交给你，你决定改不改 | 订阅；**每个点位唯一订阅者** |
 | 收集站 collect | 一对多收集 + 汇聚，不回填原数据流 | 由核心按接入点代订阅（工具定义） |
 
-### 3.1 全部内置点位（20 个 id：广播 4 + 执行 8 + 中转 7 + 收集 1）
+### 3.1 全部内置点位（21 个 id：广播 4 + 执行 9 + 中转 7 + 收集 1）
 
 | 点位 id | 类型 | 触发时机 | 回填/产出 |
 |---|---|---|---|
@@ -143,6 +148,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.execute.tool` | 执行 | — | `tool.call`（执行任意工具）、`tool.close`（按 `handle` **显式关闭**一次运行中的工具/请求：先尽力终止进程树、再让在途调用收敛；句柄失效或不归你管 ⇒ 可读拒绝，**绝不自动关**） |
 | `system.execute.session` | 执行 | — | `session.rename`（会话重命名） |
 | `system.execute.ssh` | 执行 | — | `ssh.reconnect`（重建目标 agent 的远端链路；与 REST `POST /api/agents/{id}/ssh/reconnect`、右栏文件面板「重连」按钮同一实现） |
+| `system.execute.plugin` | 执行 | — | `plugin.list` / `plugin.restart` / `plugin.suspend` / `plugin.state` / `plugin.stateDump` / `plugin.stateFetch`（插件热重启的控制面，见 §6.5；别名 `plugin`）。**后两条不得被申报成 agent tool**：它们是生命周期原语，只能由插件自己下 |
 | `system.broadcast` | 广播 | 通用主题（自定 topic） | 通知 |
 | `system.broadcast.tool.pre` | 广播 | 工具调用前 | 通知 |
 | `system.broadcast.tool.post` | 广播 | 工具调用后 | 通知 |
@@ -532,6 +538,12 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `tool.call` | `tool`, `arguments?`, `relay?`（默认 false） | `{tool, result, is_error, relayed}` | 执行**任意工具**（内置 / MCP / 插件工具同一入口） |
 | `session.rename` | `title`（必填）, `session_id?` | `{renamed, title, session_id}` | 会话重命名（前端即时刷新标题） |
 | `ssh.reconnect` | `agent_id?` | `{ok, agent_id, stale?}` | 重建目标 agent 的远端（SSH）链路；与 REST /api/agents/{id}/ssh/reconnect、右栏文件面板「重连」按钮同一实现 |
+| `plugin.list` | — | `{ok, plugins:[{plugin_id, name, enabled, running, lifecycle, generation, suspendable, health}]}` | 看全部插件（需能证明 `team_id`） |
+| `plugin.state` | `plugin_id` | `{ok, …, lifecycle, generation, suspendable, snapshots[], kill_reason, last_error}` | 看一个插件的运行态（只读） |
+| `plugin.restart` | `plugin_id`, `keep_state?`（缺省 true） | `{ok, resumed, dump_id, generation, lifecycle, reason}` | **热重启**（见 §6.5）；目标就是自己时核心**先应答再动手**，回包带 `deferred: true` |
+| `plugin.suspend` | `plugin_id` | `{ok, suspended, dump_id, generation, note}` | 请求转储并记 `suspended`；**不代为退出**，也不拉起下一世 |
+| `plugin.stateDump` | `payload`（JSON 对象） | `{ok, dump_id, generation, bytes, pool_entries, pool_bytes}` | 递一份可续跑状态快照进核心**内存池**（不落盘） |
+| `plugin.stateFetch` | `dump_id?`（只能是自己上一世的那个） | 有：`{ok, has_snapshot:true, dump_id, payload, bytes}`；没：`{ok, has_snapshot:false, reason}` | 取回**上一世**的快照（一份只喂一世） |
 
 **失败回包也可能带 `payload`**（2026-10-05 新增，**纯增量**）：`ok:false` 只表示"这次命令
 没跑成"，不代表产出没有价值。典型是 `llm.call` 拿到了 200、模型正文却解析不出 JSON：
@@ -586,7 +598,41 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 
 本仓库**没有工具审批层**：模型调用工具、插件经执行站调用工具，都是"agent 的权限"。
 插件能做 `fs.write` / `terminal.exec`（只要 scope 能证明归属）。写插件时请把
-"能做什么"当作自己的责任，而不是指望核心拦你。
+这条当作事实，不要假装有沙箱，也不要指望核心拦你。
+
+### 6.5 插件热重启：`suspend` + `plugin.stateDump` / `stateFetch`
+
+目标很窄：**优雅转储 → 退出 → 新一世取回续跑**。全程不落磁盘、也不拿时长当判据。
+
+要能被挂起，`plugins.yaml` 的条目必须显式声明（**缺省 = 不可挂起，热重启就冷启动**）：
+
+```yaml
+plugins:
+  - id: my_plugin
+    suspension: keep        # 只认 keep；留空 = 不可挂起
+```
+
+时序（你作为插件要做的事）：
+
+1. 核心发 `suspend`（**这是本任务唯一新增的 method**）；
+2. 你用 `station/command` 下 `plugin.stateDump`，`arguments.payload` 就是你要留下的状态，
+   **等它的回包到了**再回 `suspend` 的 ack（`{ok:true, dumped:true}`）——顺序反了的话，
+   核心只能靠"等一会儿"来碰运气，而它**不等也不判时长**；
+3. 回完 ack 就可以退（核心收到 `shutdown` 后会等你，等多久都由你的心跳说话）；
+4. 新一世的 `hello` 参数里会带 `resume_dump_id`（没快照时根本没这个键）；
+5. 你下 `plugin.stateFetch` 取回它。核心只认"上一世"那一份，且一份只喂一世；
+   拿不到就按冷启动继续（`has_snapshot:false` + `reason`），**这不是错误**。
+
+三条红线：
+
+* **不落盘**：快照只在核心进程内存里，核心退了就没有。不要把会话事实唯一地寄存在
+  插件状态里（消息与工具结果由核心落库在先）。
+* **不要给 `plugin.stateDump` / `plugin.stateFetch` 申报 agent tool**：它们是生命周期
+  原语，不是给模型使唤的能力（可申报的四条见 `PluginToolSurface.agentToolCommands`）。
+* **不要指望时长**：没有任何"多少毫秒内必须转储完"的上限，也没有"慢了就杀"。反过来，
+  装死也不划算——连续 N 拍（缺省 3×I）没有任何入站报文会被判失活，那时核心会收尸。
+
+最小可运行参考实现：`examples/plugins/suspendable_plugin.py`（带 `--selftest`）。
 
 ---
 

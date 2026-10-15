@@ -44,11 +44,17 @@ class PluginHost {
       );
 
   /// 启动插件进程并完成 `hello` 握手。
+  ///
+  /// [resumeDumpId]（20261015-hot-restart 阶段 1）：热重启后交给**新一世**的可续跑快照 id。
+  /// 方向必须没提错：`hello` 是**核心→插件**的请求，所以这个信息只能出现在它的
+  /// **参数**里（而不是“hello 响应”——响应是插件自己写的，它无从得知核心池里有什么）。
+  /// **为空时不写这个键**：老插件的 hello 参数集与改动前逐字一致（D3 向后兼容）。
   static Future<PluginHost> start(
     PluginConfig config, {
     Duration timeout = const Duration(seconds: 20),
     Duration heartbeatInterval = LivenessTracker.defaultInterval,
     String coreVersion = '',
+    String resumeDumpId = '',
     void Function(Map<String, dynamic> notification)? onNotification,
     Future<Map<String, dynamic>> Function(
       String method,
@@ -99,6 +105,7 @@ class PluginHost {
     process.exitCode.then((int code) {
       host._exitCode = code;
       host._failPending('插件进程已退出（exit=$code）');
+      if (!host._exitSeen.isCompleted) host._exitSeen.complete();
     });
     // stdin 的写队列在插件死亡 / 管道被关时**以异常收尾**（实测 Windows：
     // `SocketException: Write failed (OS Error: 管道正在被关闭。, errno = 232)`）。
@@ -116,6 +123,7 @@ class PluginHost {
           'protocol': 1,
           'core_version': coreVersion,
           'plugin_id': config.id,
+          if (resumeDumpId.isNotEmpty) 'resume_dump_id': resumeDumpId,
         },
         timeout: timeout,
       );
@@ -127,7 +135,13 @@ class PluginHost {
               .toList() ??
           const <String>[];
     } catch (error) {
+      // 握手没完成就要放弃这个进程。注意这里**不等退出也不给时长宽限**：
+      // 这个 host 还没进任何表（看门狗不认识它），而调用方也已在报错路径上——
+      // 等它就是一个没人收的无底洞（旧实现靠一个 2s 静态超时堆掉这个洞，而静态时长
+      // 本身就是要消除的东西）。所以：发完 shutdown、关掉 stdin，然后直接收尸。
+      // 它本来就没有“在跑的工作”可保（连 hello 都没完成），不算丢东西。
       await host.close();
+      host.killStray('启动握手未完成 ⇒ 放弃这个进程（收尸，不等时长）');
       rethrow;
     }
     return host;
@@ -165,6 +179,7 @@ class PluginHost {
 
   final Map<int, Completer<Map<String, dynamic>>> _pending =
       <int, Completer<Map<String, dynamic>>>{};
+  final Completer<void> _exitSeen = Completer<void>();
   int _nextId = 0;
   int? _exitCode;
   bool _closed = false;
@@ -573,9 +588,25 @@ class PluginHost {
     }
   }
 
-  /// 关闭：礼貌通知 → 关 stdin → 超时后强杀。
-  Future<void> close() async {
-    if (_closed) return;
+  /// 关闭：**礼貌通知 → 关 stdin → 让在途请求以可读原因失败**。
+  ///
+  /// ⚠ **D8：这里不再有 2s 硬超时**（原实现是 `exitCode.timeout(2s)` → 超时 `kill()`，
+  /// 属于**静态时长判死**，与不变量 4 相违，也与本类上面写的「取消静态总时间上限」矛盾）。
+  /// 新口径：
+  /// - **默认不等退出**（`waitForExit = false`）：调用方不该因为某个插件赖着不退而卡住
+  ///   （[PluginBus.applyConfigs] 是逐条串行对账的，这里一卡就是整轮）。“退没退”交给
+  ///   看门狗驱动的心跳台账判，判失活后由 [killStray] 收尸；
+  /// - `waitForExit = true` 只用于“真的必须拿到退出码”的两处：替换二进制前的 Windows
+  ///   文件锁、核心自己退出。等的也不是时长，而是“进程真的结束”这个事件。
+  ///
+  /// 为什么 [_failPending] 放在这里仍然是安全的：转储阶段由调用方安排在 close **之前**
+  /// 完成（见 [PluginBus.hotRestart]：先 requestSuspend 拿 ack → 等快照入池 → 才 close），
+  /// 所以不会再把“正在转储的在途请求”自己杀死——那正是拆成两阶段的原因。
+  Future<void> close({bool waitForExit = false}) async {
+    if (_closed) {
+      if (waitForExit) await exited;
+      return;
+    }
     _closed = true;
     try {
       _write(<String, dynamic>{
@@ -588,10 +619,76 @@ class PluginHost {
     try {
       await _process.stdin.close();
     } catch (_) {}
+    if (waitForExit) await exited;
+  }
+
+  /// 观察到进程退出的信号（已退出则立即完成）。
+  ///
+  /// 它永远**不因时长而完成**：“等了很久”不是“它退了”。
+  Future<void> get exited => _exitSeen.future;
+
+  /// 是否已经确认退出（看门狗据此决定要不要收尸）。
+  bool get exitedConfirmed => _exitSeen.isCompleted;
+
+  /// **显式强杀**（收尸）。
+  ///
+  /// 全项目只有两个地方能调到它：
+  /// ① 心跳台账判失活后的收尸（见 [PluginBus] 看门狗对“已经被要求关闭”的实例的处理）；
+  /// ② 用户显式动作（面板上的“强制停止”）。
+  /// **绝不得因为“跑得太久”而调用**（D8）：心跳在、只是慢，不是杀人的理由。
+  void killStray(String reason) {
+    if (_exitSeen.isCompleted) return;
+    if (_killed) return;
+    _killed = true;
+    _process.kill();
+    _killReason = reason;
+  }
+
+  /// 强杀原因（读接口用；没杀过为空串）——让“这个进程是被收尸的”在日志里看得见。
+  String get killReason => _killReason;
+  bool _killed = false;
+  String _killReason = '';
+
+  /// **优雅挂起**（阶段 1 新增）：请求插件把可续跑状态转储出来然后退出。
+  ///
+  /// 为什么它可以“没完没了地等”而不出事：[LivenessTracker.guard] 让这个请求与
+  /// “心跳判失活”信号赛跑——插件只要还在发东西（任意入站报文即心跳）就一直等，
+  /// 完全沉默到连续 N 拍才被当作失活并抛 [LivenessLostException]。
+  /// 这同时钉住了两件事：**慢转储不会被时长误杀**，**装死也不会把热重启永远卡住**。
+  ///
+  /// 返回 `(ok: false)` 的三种原因都带可读中文文本：没声明可挂起（D3）、已经不可用、
+  /// 插件自报失败或心跳丢了。调用方据此走**冷启动重启**，而不是报错给用户。
+  Future<({bool ok, String reason})> requestSuspend() async {
+    if (!config.canSuspend) {
+      return (
+        ok: false,
+        reason: '插件 ${config.id} 没声明 suspension: keep（默认不可挂起，D3）：' '本次按冷启动重启，不做转储',
+      );
+    }
+    if (isClosed) {
+      return (
+        ok: false,
+        reason: '插件 ${config.id} 已经不可用（进程退出或通道断了），无得可转储',
+      );
+    }
     try {
-      await _process.exitCode.timeout(const Duration(seconds: 2));
-    } catch (_) {
-      _process.kill();
+      final Map<String, dynamic> result = await liveness.guard(
+        () => _request(
+          PluginRpcMethods.suspend,
+          const <String, dynamic>{'reason': 'hot_restart'},
+        ),
+      );
+      final bool acked = result['ok'] != false;
+      return (
+        ok: acked,
+        reason: acked
+            ? ''
+            : '插件 ${config.id} 自报不能挂起：${result['error'] ?? '未给原因'}',
+      );
+    } on LivenessLostException catch (error) {
+      return (ok: false, reason: '挂起请求期间心跳丢失：${error.message}');
+    } catch (error) {
+      return (ok: false, reason: '挂起请求没成：$error');
     }
   }
 }

@@ -19,6 +19,43 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **插件热重启：两阶段关闭 + 内存池续跑 + 生命周期第三个轴**（**新增**
+  [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 23/24/25/26、
+  [docs/plugin-development.md](docs/plugin-development.md) §2.1/§3.1/§6.1/§6.5）：
+  - **退出只认事件与心跳，不认时长**（D8，**修改**原有行为）：`close()` 里**没有任何 `timeout(...)`，
+    也没有任何 `.kill(...)`**（源码级用例钉住：`plugin_close_no_hard_timeout_test` “D 源码红线”）。
+    原实现是 `exitCode.timeout(2s)` → 超时 `kill()`，且 `shutdown` 后立刻 `_failPending` ⇒
+    **把正在转储的在途请求自己关掉**。默认**不等退出**（赖着不退的插件不许拖住串行对账），
+    未确认退出的宿主进**收尸台账**，看门狗对它们**只记丢拍、不 ping**（stdin 已关，ping 必定假），
+    连续 N 拍无入站证据才强杀；任何入站报文都是 `recordBeat` ⇒ “心跳在、只是慢”永不被杀。
+    钉住的可数证据：同一台账下“每 5ms 发一次心跳”跑 15 轮看门狗 `straysKilled == 0`；
+    “沉默但不退”在第 1/2 拍不杀、第 3 拍才杀，且原因写的是“收尸”而不是“超时”。
+  - **可续跑状态只进核心进程内存，一世一份**（D4）：`PluginStatePool` 不落盘；索引键
+    `(pluginId, generation)`，**generation 由核心推进**（插件报的 `dump_id` 只做核对，不许当键用）；
+    写入归属取配置声明，取回 **fail-closed 精确相等**（改了 `team_id` 就不给旧快照，且被拒不算消费）；
+    单条过大**整条拒收不截断**，超限按 LRU 丢最旧。**零磁盘转储**由用例钉住：整场热重启跑完，
+    数据根下不多一个文件。
+  - **活性 / 启停 / 阶段是三个独立的轴**（D11/D3）：`health` / `status` / `lifecycle` 取值集合互不相交
+    （`plugin_lifecycle_test` 钉住），对前端与快照只**新增可选键** `lifecycle` / `generation`；
+    `status`（`registered/disabled`）与 `health`（`ok/degraded/unavailable`）的产出值与升级前**逐字一致**。
+    映射**集中在 `PluginBus` 一处**（`lifecycleOf()` 唯一读 / `_setLifecycle()` 唯一写，不从四个源反推）；
+    重启窗口**不降回 stopped**，对外一直是 `restarting`。`suspension` 缺省为空 = **不可挂起**（热重启就冷启动）。
+  - **`suspend` 是本任务唯一新增的 method**（D10「A+B 混合」）：转储/取回走已有的
+    `station/command`，因此新增内置点位 `system.execute.plugin`（别名 `plugin`，6 条命令），
+    **内置点位总数 20→21**（`station_points_test` 钉住 `StationPoints.all.length == 21`，
+    执行站命令并集 14→20）。两套归属口径**刻意不合并**：控制面四条要求 `scope.team_id`（证明不了就拒），
+    快照两条要求“发起者就是插件本人且只能动自己的键”（快照本来就没有目标 agent）。
+    `plugin.stateDump` / `plugin.stateFetch` **不得被申报成 agent tool**（`PluginToolSurface` 定成常量，D9）。
+  - **自重启不许挂死**（D2 的卡点）：`plugin.restart` / `plugin.suspend` 的目标 == 发起者时，核心用
+    `Timer.run` **先应答再动手**（microtask 不够：回包就在当前回合的微任务队列里）。
+  - 代价与取舍（写清楚，不是“看起来完成了”）：代际**相邻才能取回**，所以一次启动失败会占掉一代，
+    来下一世就拿不到更早那份快照（保守侧：宁可冷启动也不递错状态），用例
+    `plugin_state_pool_scope_test` 把这条当契约钉下。
+  - 用例（真子进程 + 可计数证据，不靠“看起来成功”）：`plugin_hot_restart_test`（11）、
+    `plugin_hot_restart_station_test`（11）、`plugin_close_no_hard_timeout_test`（6）、
+    `plugin_state_pool_scope_test`（5）；参考实现 `examples/plugins/suspendable_plugin.py`（带 `--selftest`）。
+    本次计数：tree_core **1315 passed / 3 skipped / 0 failed**（基线 1282 + 新增 33），tree_protocol **44 passed**。
+
 - **SSH 执行从「平行通道协议」迁入中转站点位**（**修改**
   [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 17（重写定位）、
   [docs/ssh-tunnel-protocol.md](docs/ssh-tunnel-protocol.md) §0/§2、

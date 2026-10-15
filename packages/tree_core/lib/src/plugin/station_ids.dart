@@ -64,6 +64,16 @@ abstract final class StationHubIds {
   /// 执行站·SSH 族：`ssh.reconnect`（重建目标 agent 的远端链路）。
   static const String executeSsh = 'system.execute.ssh';
 
+  /// 执行站·插件族：`plugin.list` / `plugin.restart` / `plugin.suspend` /
+  /// `plugin.state` / `plugin.stateDump` / `plugin.stateFetch`。
+  ///
+  /// 2026-10-15 插件热重启（阶段 1）新增：插件管理动作从「只能由核心自己触发」
+  /// 变成「插件与 agent 可以下命令」，走的仍是执行站那套白名单 + scope 校验，
+  /// 不新增 RPC method（D10）。其中 `plugin.stateDump` / `plugin.stateFetch` 是
+  /// **插件对自己快照**的存取：归属校验只许操作以发起者 pluginId 开头的键，
+  /// 且这两条**不申报成 agent tool**（D9：它们是生命周期原语，不是给模型使唤的能力）。
+  static const String executePlugin = 'system.execute.plugin';
+
   // ── 中转站（拦截-回填；每个点位各自唯一订阅者） ──────────────────────────
 
   /// 中转站·工具调用前（可改参数）。
@@ -133,6 +143,7 @@ abstract final class StationHubIds {
     executeTool,
     executeSession,
     executeSsh,
+    executePlugin,
     relayToolPre,
     relayToolPost,
     relayLlmHandle,

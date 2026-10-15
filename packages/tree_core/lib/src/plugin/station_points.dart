@@ -222,6 +222,34 @@ abstract final class StationPoints {
           '不引入任何新的时长上限。不是 SSH 工作空间 / 配置不完整 ⇒ 直接拒并给原因。',
       commands: <String>['ssh.reconnect'],
     ),
+    StationPointSpec(
+      id: StationHubIds.executePlugin,
+      kind: StationKind.execute,
+      label: '插件管理',
+      description:
+          '执行站·插件族：plugin.list / plugin.restart / plugin.suspend / plugin.state /'
+          ' plugin.stateDump / plugin.stateFetch（插件热重启的控制面入口）',
+      alias: 'plugin',
+      readme:
+          '插件族（plugin.list / plugin.restart / plugin.suspend / plugin.state /'
+          ' plugin.stateDump / plugin.stateFetch）：这一族管的是**插件自己**。'
+          '它在插件调 `station/command` 时被触发，不在核心内部自动跑。'
+          '回包口径：成功回 `{ok:true, ...结论}`，失败回可读中文原因（不假装做过）；'
+          '`stateDump` / `stateFetch` 的回包额外带 `dump_id`，供下一次取回与消费对账。'
+          '限制：`plugin.list` / `plugin.restart` / `plugin.state` 按请求 scope 判归属，'
+          '证明不了 team 就拒；`plugin.stateDump` / `plugin.stateFetch` 是**团队级命令**'
+          '（发起者是插件本身，没有 agent 归属），因此只认「只能动以发起者 pluginId '
+          '开头的快照」这一条归属口径，且两者**不申报成 agent tool**——它们是生命周期'
+          '原语，不是给模型使唤的能力。快照只进核心进程内存，不落盘。',
+      commands: <String>[
+        'plugin.list',
+        'plugin.restart',
+        'plugin.suspend',
+        'plugin.state',
+        'plugin.stateDump',
+        'plugin.stateFetch',
+      ],
+    ),
   ];
 
   /// 中转站点位（每个点位各自唯一订阅者）。

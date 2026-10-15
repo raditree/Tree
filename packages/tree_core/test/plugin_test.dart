@@ -199,10 +199,10 @@ void main() {
     expect(jsonDecode(lines.single), containsPair('type', 'task'));
 
     // 站点体系：插件启动 = 工具表刷新点 ⇒ 插件挂到**全局唯一的收集站**上。
-    // 快照恒看到全部内置点位（广播 4 + 执行 8 + 中转 7 = 19）+ 收集站；
+    // 快照恒看到全部内置点位（广播 4 + 执行 9 + 中转 7 = 20）+ 收集站；
     // 收集站是唯一有订阅者的那个。
     final List<dynamic> stations = bus.snapshot()['stations'] as List<dynamic>;
-    expect(stations, hasLength(20), reason: '19 个内置点位 + 收集站');
+    expect(stations, hasLength(21), reason: '20 个内置点位 + 收集站');
     final Map<String, dynamic> station = stations.firstWhere(
       (dynamic s) => (s as Map<String, dynamic>)['kind'] == 'collect',
     ) as Map<String, dynamic>;
