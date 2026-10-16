@@ -730,6 +730,27 @@ class PluginBus {
           'last_heartbeat':
               (host.liveness.lastBeatAt?.millisecondsSinceEpoch ?? 0) ~/ 1000,
         },
+        // **水位（只增键，阶段 6 稳定性项）**：快照池与重启暂存队列都是“超限就丢”
+        // 的有界结构，光有“丢”这个动作不够——得让前端/审计看得见它现在多大、上限多少、
+        // 已经拒过多少次，否则“我的快照为什么不见了”又是一次靠猜的排障。
+        // 这里只报数，不报内容（池里存的是插件内部状态）。
+        'state_pool': <String, dynamic>{
+          'entries': statePool.length,
+          'bytes': statePool.totalBytes,
+          'denied': statePool.deniedCount,
+          'max_entries': statePool.maxEntries,
+          'max_total_bytes': statePool.maxTotalBytes,
+        },
+        'restart_buffer': <String, dynamic>{
+          'buffered_for_this_plugin': restartBuffer.lengthOf(config.id),
+          'max_per_plugin': restartBufferMaxPerPlugin,
+          'max_total_bytes': restartBufferMaxTotalBytes,
+          // 两种“没了”必须分开：overflow = 超限当场拒收（背压），
+          // dropped = 重启没成 / 插件下线后主动弃（调用点各自 fail-open 兜底）
+          'overflow': restartBuffer.overflowCount,
+          'dropped': restartBuffer.droppedCount,
+          'replayed': restartBuffer.replayedCount,
+        },
         'ts': _nowSeconds(),
       },
     });

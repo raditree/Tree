@@ -248,7 +248,7 @@ void main() {
     expect(recovered['degraded_reason'], '', reason: '恢复后降级文案必须清零');
   });
 
-  test('plugin_status 增量帧：只多 lifecycle / generation 两个键，取值集合不变', () async {
+  test('plugin_status 增量帧：只多 lifecycle / generation + 两处水位，取值集合不变', () async {
     final PluginBus bus = busFor(
       'enabled: true\n'
       'plugins:\n'
@@ -269,6 +269,46 @@ void main() {
     expect(ready['health'], 'ok');
     expect(ready['lifecycle'], PluginLifecycleState.ready.wire);
     expect(ready['generation'], 1);
+    // 水位（阶段 6）：与 lifecycle/generation 同一条纪律——只增键，而且增哪几个键
+    // 写在明面上。光有“超限就丢”这个动作不够：面板与审计必须看得见池与队列
+    // 现在多大、上限多少、已经拒过/弃过多少，否则“我的快照为何不见了”又是靠猜。
+    final Map<String, dynamic> pool =
+        ready['state_pool'] as Map<String, dynamic>;
+    expect(
+      pool.keys.toSet(),
+      <String>{
+        'entries',
+        'bytes',
+        'denied',
+        'max_entries',
+        'max_total_bytes',
+      },
+    );
+    expect(
+      pool['entries'],
+      0,
+      reason: '这一场没人转储 ⇒ 读数必须是 0 而不是缺键（缺键分不出“没丢”与“没读”）',
+    );
+    final Map<String, dynamic> buffer =
+        ready['restart_buffer'] as Map<String, dynamic>;
+    expect(
+      buffer.keys.toSet(),
+      <String>{
+        'buffered_for_this_plugin',
+        'max_per_plugin',
+        'max_total_bytes',
+        'overflow',
+        'dropped',
+        'replayed',
+      },
+      reason: 'overflow（当场拒）与 dropped（主动弃）必须分得开',
+    );
+    expect(buffer['buffered_for_this_plugin'], 0);
+    expect(
+      buffer['max_per_plugin'],
+      greaterThan(0),
+      reason: '上限也是水位的一部分（不报上限就看不出“快满了”）',
+    );
     for (final String legacy in <String>[
       'plugin_id',
       'name',

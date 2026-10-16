@@ -109,6 +109,18 @@ sealed class StationInstance {
   /// 正在等待回包的请求数（观测用；前端面板显示「等待中」）。
   int waitsInFlight = 0;
 
+  /// **在途等待的准入上限**（20261015-hot-restart 阶段 6 的稳定性项）。
+  ///
+  /// 为什么必须有界，而不是“排队等一会”：判活走的是心跳，一个迟迟不回包的订阅者
+  /// 会让 [awaitReply] 一直挂着（并占着一个心跳探测循环）；上游越是热点的点位挂得
+  /// 越快，等待数就随请求线性增长——**“没有时长上限”是设计意图（长任务不被时间杀），
+  /// “没有数量上限”不是**。这里给并发形状一个上界：超限**立刻**回 failed（背压），
+  /// 走的是与“心跳丢失”同一条 fail-open 路：调用方把这次当作“没接管”，不静默堆积。
+  int maxWaitsInFlight = defaultMaxWaitsInFlight;
+
+  /// 缺省上限（保守值：单站点在途 64 条；真能碰到就说明订阅者已经不出货了）。
+  static const int defaultMaxWaitsInFlight = 64;
+
   /// 运行时绑定：回包函数（pluginId|scopeKey → responder）；不落盘。
   final Map<String, StationResponder> _responders =
       <String, StationResponder>{};
@@ -299,6 +311,17 @@ sealed class StationInstance {
         const StationReply.failed('订阅者已不在本站（订阅可能已被注销）'),
       );
     }
+    // 准入（见 [maxWaitsInFlight]）：**不排队**——排队只是把无界改成延后，
+    // 热点点位上一样会堆起来。超限直接回 failed，让调用方按“未接管”走。
+    if (waitsInFlight >= maxWaitsInFlight) {
+      counters.bump('overload_skipped');
+      return Future<StationReply>.value(
+        StationReply.failed(
+          '本站在途等待已达上限 $maxWaitsInFlight（背压）：这次不投递，按“未接管”'
+          '处理（判活不看时长，所以并发形状必须有上界）',
+        ),
+      );
+    }
     waitsInFlight++;
     final Completer<StationReply> completer = Completer<StationReply>();
     Future<void>(() async {
@@ -409,7 +432,11 @@ sealed class StationInstance {
         .toList(),
     'subscribers_by_team': subscribersByTeam(),
     'counts': counters.describe(),
-    'gauges': <String, dynamic>{'waits_in_flight': waitsInFlight},
+    'gauges': <String, dynamic>{
+      'waits_in_flight': waitsInFlight,
+      // 上限也递出去：面板要能分得清“在途 64”是背压边缘而不是正常水位
+      'waits_limit': maxWaitsInFlight,
+    },
     ...extraDescribe(),
   };
 
