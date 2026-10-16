@@ -12,7 +12,7 @@
 ## 亮点
 
 - **跨团队交互**：队内 `message` 派活 / 广播 / `wait_for`；**TOP 之间可跨团队直连**（`list_teams` 寻址）。成员与 leader 共享同一工作目录，系统不替谁回传总结。
-- **插件站点体系**：广播 / 执行 / 中转 / 收集四类站点、22 个内置点位（工具前后、LLM 接管与改写、提示词、压缩、SSH 执行、工具申报、插件生命周期…），可接管 LLM 这一跳、改工具数据、接管 SSH 执行、申报工具与 UI 槽位；另接 MCP。
+- **插件站点体系**：广播 / 执行 / 中转 / 收集四类站点、29 个内置点位（工具前后、LLM 接管与改写、提示词、压缩、SSH 执行、工具申报、插件生命周期、轮次结束/取消/出错、提问暂停、对账结果、后台任务台账、站点拓扑、逐调用用量…），可接管 LLM 这一跳、改工具数据、接管 SSH 执行、申报工具与 UI 槽位；另接 MCP。
 - **Spec（规范）体系**：把"这类活怎么干"沉淀成规范，开工挂规范、长任务里全文进系统提示词；内置 general-task / hard-task / team-meeting / plugin-creator。
 - **本地与 SSH 双模式**：工具、文件面板、Git 面板同一套语义；SSH 下 agent 在远端主机 / 容器里读写，**成员跟随 leader 的 SSH**。
 - **harness 即 IDE**：不用离开应用就能改代码、跑命令——右侧文件面板直接编辑并保存（`Ctrl+S`、失焦自动保存、冲突检测），`Ctrl+J` 打开真·伪终端；改的跑的都在同一个项目目录里。
@@ -75,7 +75,7 @@ dart run tool/package_windows.dart --flutter "<flutter.bat 的路径>"
 | [docs/development.md](docs/development.md) | 环境、构建、测试矩阵、打包与安装包、调试、发布检查单 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 开发规则约束：提交规范、测试要求、文档制度、跨模块不变量 |
 | [docs/team.md](docs/team.md) | 团队与成员语义（共享工作目录、私有分栏、SSH 跟随、会话并行、派活与回信） |
-| [docs/plugin-development.md](docs/plugin-development.md) | 写插件的系统指南（协议、22 个点位、scope、执行站命令、流式接管） |
+| [docs/plugin-development.md](docs/plugin-development.md) | 写插件的系统指南（协议、29 个点位、scope、执行站命令、流式接管） |
 | [docs/known-issues.md](docs/known-issues.md) | 已知问题台账（现象 / 根因 / 修复 / 验证） |
 | [docs/README.md](docs/README.md) | 全部文档索引（含历史与设计稿） |
 

@@ -355,10 +355,10 @@ class StationHub {
   List<String> ensureBuiltinStations() {
     load();
     final List<String> created = <String>[];
-    // 一批预建只落一次盘（每个点位的懒创建都会 save 一次，不合并就是 21 次写）
+    // 一批预建只落一次盘（每个点位的懒创建都会 save 一次，不合并就是二十几次写）
     _saveSuspend++;
     try {
-      // 全部内置点位（广播 5 + 执行 9 + 中转 7）预建；**收集站不预建**（见下）。
+      // 全部内置点位（广播 10 + 执行 11 + 中转 7 = 28）预建；**收集站不预建**（见下）。
       for (final StationPointSpec spec in StationPoints.all) {
         if (spec.kind == StationKind.collect) continue;
         _ensureOneBuiltin(() => pointFor(spec.id), created);

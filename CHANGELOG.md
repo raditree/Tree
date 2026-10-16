@@ -19,6 +19,45 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **加一个点位要同时交付六件；看现场一律只读；并发形状必须有上界**（**新增**
+  [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 30、
+  [docs/plugin-development.md](docs/plugin-development.md) §3.1 / §6.9 / §7.1）（plan 阶段 6：A 级点位批 +
+  稳定性四项）：
+  - **内置点位 22 → 29**（广播 10 / 执行 11 / 中转 7 / 收集 1），执行站命令 20 → **26**：广播新增
+    `turn.done` / `turn.cancelled` / `turn.error` / `ask.paused` / `config.changed`；执行站新增
+    `system.execute.station`（`station.list/state`）与 `system.execute.usage`（`usage.query`），并把
+    `terminal` 点位从 1 条命令扩到 4 条（`listRuns/stopRun/log`）。每个点位都是**六处同时交付**
+    （表项 + 常量 + 进 `StationHubIds.all` + 核心投递口 + readme 四段式 + 派生用例计数），漏任何一处
+    都是“面板上看得见、永远没人投”。
+  - **“问”与“推”分开钉住**：轮次类广播**订了才投**，命中分流表的事件**不再走 legacy 事件流**
+    （否则一个事件两种形状同时在插件侧漂）；topic 由点位 id 去前缀**推导**，不另记表。载荷**只报
+    结论不报内容**（轮次不带正文、`ask.paused` 不带题面与选项）；`config.changed` 的 `unchanged`
+    **一律不发**；取消与错误同时发生 ⇒ **先报错误**；插话与用户按停靠 `source` 分开（不变量 5）。
+    证明不了归属就不投并记一行；投递失败只记日志，绝不拖垮生成。
+  - **控制面“只看不动”**：`station.list` 是**投影**（不递 readme / 公告板 / config）、中转点位把唯一
+    处理者写成 `handled_by` 且**不省略键**；`station.state` 认订阅时那套别名（订得到就问得到）。
+    归属只有一条：内置点位对任何 team 可见，**插件自建站只对订阅者所在 team 可见**，`team_id`
+    证明不了 ⇒ fail-closed 拒；接管权易手**仍只走 `station/subscribe`**，这一族不开第二条路。
+  - **读口的字段表只许一处出处**：后台任务行 `exit_code`/`pid` 拿不到写 `null` **不省略键**；
+    `requested=false` 必带 `reason`（**不假装杀成功**）；只看/只动目标 agent 自己的任务；上限
+    （`limit` / `tail_chars` / `tail_bytes`）**能下调不能上调**并 echo 生效值；`usage.query` 的行形状直接
+    用 `UsageCall.toJson()`，聚合只在核心算一份。
+  - **有界与水位**：`plugin_status` 帧**只增两个键**——`state_pool`{entries,bytes,denied,上限} 与
+    `restart_buffer`{本插件在队,上限,overflow,dropped,replayed}，`overflow`（超限当场拒）与 `dropped`
+    （主动弃）必须分得开；站点在途等待加**每站点缺省 64** 的准入上界，超限**当场回 failed 且不排队**
+    （排队只是把无界改成延后；判活已取消时长硬上限，没数量上界就没任何东西守着并发形状），计
+    `overload_skipped` 并把上限写进 `gauges`。旧前端看不到新键也不受影响。
+  - **压力口径**：`plugin_mass_restart_stress_test.dart` 分两层——内存层 3 条进常规闸门（50 路并发下
+    三处有界结构不越界、不静默）；真链路 1 条（**50 个真插件进程同时 hotRestart**）默认**跳过**，需
+    `$env:TREE_MASS_STRESS='1'` 才跑：一层就要 50 个 Dart VM、重启窗口两世并存使峰值翻倍，不该压垮
+    开发机。本次**实跑一次全绿（37 秒）**；取保守侧的这一点写在这里。
+  - **本阶段未接的 A 级点位（遗留项，plan 允许降级）**：中转 `tool.repair` / `tool.probe` /
+    `llm.register` / `compact.skip.reason` 与收集 `plugin.capability.define`。它们差的都不是表项而是
+    **核心侧那一个投递口**（业务时机判断，不能靠猜）；接的时候仍按上面的六件同时交付。
+  - 用例：`plugin_turn_broadcast_test.dart`（12）、`plugin_station_query_test.dart`（8）、
+    `plugin_execute_mounts_test.dart`（+5）、`plugin_station_wiring_test.dart`（+1）、
+    `plugin_mass_restart_stress_test.dart`（3 进闸门 + 1 靠环境变量）、`plugin_status_compat_test.dart`
+    （帧键集合）。派生计数 7 份同步（点位 29 / 预建 28 / 快照 29 / 命令 26）。
 - **插件管理只拉 release，不拉源码**（**新增**
   [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 29、
   [docs/plugin-development.md](docs/plugin-development.md) §6.8、插件发布仓合同

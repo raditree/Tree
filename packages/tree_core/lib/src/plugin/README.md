@@ -298,6 +298,44 @@
     面板与详情页：`test/plugin_panel_admin_test.dart`（新增 6）、`test/plugin_detail_page_test.dart`（新增 2）。
     合同原文见仓库根 [plugins/README.md](../../../../../plugins/README.md)。
 
+30. **加一个点位要同时交付六件；看现场一律只读；并发形状必须有上界**（2026-10-16 阶段 6，D6/D9/D10/D11）：
+    本阶段把内置点位从 22 接到 **29**（广播 10 + 执行 11 + 中转 7 + 收集 1），命令 26 条。
+    - **一个点位 = 六处同时交付**：表项（`station_points.dart`，含 **readme 四段式**：是什么 /
+      何时触发 / 回包形状 / 限制）+ 常量（`station_ids.dart`）+ **进 `StationHubIds.all`** +
+      **核心投递口**（只建表不接投递口就是“面板上多一个永远静默的点位”）+ 派生用例计数
+      （类型分布 / 预建数 / 快照数 / 命令并集，这四处都是派生断言，漏改一处就红）+ 面板顺序
+      （面板按表顺序排，所以新条目插在哪一行是有意决定的）。
+    - **“问”与“推”不混用**：轮次类事件（`turn.done/cancelled/error`、`ask.paused`、
+      `config.changed`）**订了才投**（分流表 `PluginBus._agentEventPoints` 命中就不再走 legacy
+      事件流，否则一个事件两种形状同时在插件侧漂）；而“某个插件现在什么阶段”请下执行站命令
+      `plugin.state`。广播 topic 由点位 id 去前缀**推导**，不另记一张表。
+    - **载荷只报结论，不报内容**：轮次广播不带正文、`ask.paused` 不带题面与选项（那些是用户与
+      agent 之间的内容）；`config.changed` 的 `unchanged` **一律不发**（没改动的对账是噪声）。
+      证明不了归属（运行期四元组拼不出合法 scope）就**不投并记一行**；投递失败**只记日志**，
+      插件侧的问题绝不能拖垮生成那一轮。
+    - **拓扑只看不动**（`station.list/state`）：内置点位对任何 team 可见（系统接口不是私产），
+      插件自建站**只对订阅者所在 team 可见**（连“它存在”都不漏），`team_id` 证明不了就整条拒；
+      接管权易手**仍只走 `station/subscribe`**，这一族里不开第二条路。`list` 是**投影**（不递
+      readme / 公告板 / config），`state` 按可见性整份递且认订阅时那套别名。
+    - **读口的字段表只许有一处出处**：后台任务行里 `exit_code`/`pid` 拿不到写 **`null` 不省略键**
+      （省略就分不出“退出码 0”与“根本没读到”）；`usage.query` 的行形状必须直接用
+      `UsageCall.toJson()`，聚合也只在核心算一份（算两份就与面板上那份漂）。
+    - **有界与水位**：上限早已可配（`PluginStatePool` 三条 cap / `PluginBus.restartBufferMax*`），
+      本阶段补上“看得见的上限”：`plugin_status` 帧只增两个键（`state_pool` / `restart_buffer`），
+      `overflow`（超限当场拒）与 `dropped`（主动弃）分开计；站点在途等待新增每站点缺省 64 的
+      准入上界，超限**当场回 failed 且不排队**（判活已取消时长硬上限，不靠数量上界就没有任何东西
+      守着并发形状），计数 `overload_skipped`、`gauges` 多一个 `waits_limit`。
+    - **本阶段未接的 A 级点位（遗留项）**：中转 `tool.repair` / `tool.probe` / `llm.register` /
+      `compact.skip.reason` 与收集 `plugin.capability.define`（收集站**必须带非空 schema**，
+      `register` 里那条校验就是为它设的）。接它们的成本全在“多一个投递口”，而投递口是
+      业务时机判断，不能靠猜。
+    用例：`plugin_turn_broadcast_test.dart`（12，广播互斥与只报结论）、
+    `plugin_station_query_test.dart`（8，拓扑可见性与只读）、
+    `plugin_execute_mounts_test.dart`（新增 5，后台任务三命令 + 用量钳制）、
+    `plugin_station_wiring_test.dart`（新增 1，`usage.query` 的生产接线）、
+    `plugin_mass_restart_stress_test.dart`（内存层 3 条进闸门；真链路 1 条靠环境变量开）、
+    `plugin_status_compat_test.dart`（帧键集合钉在明面上）。
+
 ## 测试
 
 ```bash

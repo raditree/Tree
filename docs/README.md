@@ -9,7 +9,7 @@
 | [architecture.md](architecture.md) | 进程模型、核心模块、会话与工具循环、前缀缓存策略、并发、工作空间与私有目录、存储、活性口径、安全边界、**提示词资产索引（改提示词先看 §8.1）**、**跨模块不变量** |
 | [development.md](development.md) | 环境、构建、测试矩阵（含门控真机 SSH / 编译产物冒烟）、打包与安装包、调试、发布检查单 |
 | [team.md](team.md) | 团队与成员语义：成员即 agent、审核闸门、共享工作目录与私有分栏、SSH 跟随、会话并行、派活与回信、活动日志 |
-| [plugin-development.md](plugin-development.md) | 写插件的系统指南：一分钟上手、协议与生命周期、22 个点位、scope 两套含义、执行站命令、流式接管、UI 槽位、调试 |
+| [plugin-development.md](plugin-development.md) | 写插件的系统指南：一分钟上手、协议与生命周期、29 个点位（广播 10 + 执行 11 + 中转 7 + 收集 1）、scope 两套含义、执行站命令、流式接管、UI 槽位、调试 |
 | [ssh-tunnel-protocol.md](ssh-tunnel-protocol.md) | **SSH 执行器「中转站」协议**：core ⇄ ssh_executor 插件 ⇄ tree_agent 三层的消息面、错误码、分块帧、版本协商、后台任务落盘台账与 PTY 契约（中转站 =「处理拓展点位」：首选 `ssh.execute` 点位投递、`tunnel.*` 作兼容层） |
 | [known-issues.md](known-issues.md) | 已知问题台账（现象 / 根因 / 修复 / 验证 / 遗留），按发现顺序编号 |
 | [../CHANGELOG.md](../CHANGELOG.md) | 版本变更记录（自首个开源版本 1.0.0 起） |

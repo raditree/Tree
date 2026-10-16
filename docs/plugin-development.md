@@ -129,7 +129,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | 中转站 relay | 拦截-回填：核心把数据交给你，你决定改不改 | 订阅；**每个点位唯一订阅者** |
 | 收集站 collect | 一对多收集 + 汇聚，不回填原数据流 | 由核心按接入点代订阅（工具定义） |
 
-### 3.1 全部内置点位（22 个 id：广播 5 + 执行 9 + 中转 7 + 收集 1）
+### 3.1 全部内置点位（29 个 id：广播 10 + 执行 11 + 中转 7 + 收集 1）
 
 | 点位 id | 类型 | 触发时机 | 回填/产出 |
 |---|---|---|---|
@@ -141,7 +141,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.relay.prompt.system` | 中转 | 每轮构造系统提示词时 | 产出最终 system prompt |
 | `system.relay.ssh.execute` | 中转 | 每次 SSH 工作空间操作（建/销隧道、读写、命令、拉心跳、开 PTY）时 | 订阅者（`ssh_executor` 插件）自己完成到目标机的通信，以同一形状 payload 回包；**无订阅者 fail-open 回退内置 dartssh2**（别名 `ssh.execute`，详见 [ssh-tunnel-protocol.md](ssh-tunnel-protocol.md) §2） |
 | `system.execute.fs` | 执行 | — | `fs.read` / `fs.write` / `fs.list` / `fs.grep` |
-| `system.execute.terminal` | 执行 | — | `terminal.exec` |
+| `system.execute.terminal` | 执行 | — | `terminal.exec`（含 hook 后台任务）、`terminal.listRuns` / `terminal.stopRun` / `terminal.log`（后台任务的**结构化读口与控口**：列表回行不回散文，`exit_code`/`pid` 拿不到写 `null` 不省略键，终止**不保证杀得掉**且 `requested=false` 必带 `reason`，`log` 只递尾部；只看/只动目标 agent 自己的任务） |
 | `system.execute.agent` | 执行 | — | `agent.message` / `agent.stop` / `agent.compact` |
 | `system.execute.ui` | 执行 | — | `ui.push` |
 | `system.execute.llm` | 执行 | — | `llm.call`（硬设 JSON 返回形式） |
@@ -149,11 +149,18 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.execute.session` | 执行 | — | `session.rename`（会话重命名） |
 | `system.execute.ssh` | 执行 | — | `ssh.reconnect`（重建目标 agent 的远端链路；与 REST `POST /api/agents/{id}/ssh/reconnect`、右栏文件面板「重连」按钮同一实现） |
 | `system.execute.plugin` | 执行 | — | `plugin.list` / `plugin.restart` / `plugin.suspend` / `plugin.state` / `plugin.stateDump` / `plugin.stateFetch`（插件热重启的控制面，见 §6.5；模型能使唤的那一面见 §6.7；别名 `plugin`）。**后两条不得被申报成 agent tool**：它们是生命周期原语，只能由插件自己下 |
+| `system.execute.station` | 执行 | — | `station.list` / `station.state`（**只看不动**的拓扑：谁接管了哪个点位、自建站归谁。内置点位任何 team 都可见，插件自建站只对订阅者所在 team 可见；接管权易手仍只走 `station/subscribe`，这里不开第二条路；别名 `station`，见 §6.9） |
+| `system.execute.usage` | 执行 | — | `usage.query`（按会话取**逐调用用量账本**：`{session_id, usage_file, count, skipped, calls, summary{…,by_source}}`。行形状与 `UsageCall.toJson()` 逐字一致；账本在数据根下，插件的 `fs.read` 本来够不到，这一条是它唯一的问口；只读一个会话、只读尾部；别名 `usage`） |
 | `system.broadcast` | 广播 | 通用主题（自定 topic） | 通知 |
 | `system.broadcast.tool.pre` | 广播 | 工具调用前 | 通知 |
 | `system.broadcast.tool.post` | 广播 | 工具调用后 | 通知 |
 | `system.tool.timeout` | 广播 | 某次**工具运行/LLM 请求**超过阈值（默认 **300 s**）时，**每个运行只广播一次** | 通知：载荷 `{handle, agent_id, session_id, tool, command, elapsed_ms, started_at, point}`——拿到 `handle` 后可经执行站 `tool.close` 显式关闭这次运行（见下行）；别名 `tool.timeout`（`{station: 'broadcast', point: 'tool.timeout'}`） |
-| `system.broadcast.plugin.state` | 广播 | 插件**生命周期跃迁**（booting / ready / restarting / suspended / failed / stopped）与**失活标记**（心跳连续丢失 / 恢复）| 通知：载荷 `{plugin_id, lifecycle, previous, generation, missed_heartbeats, reason, buffer}`；别名 `plugin.state`（`{station: 'broadcast', point: 'plugin.state'}`）。发布点**只有这两处**（跃迁集中在 `PluginBus._setLifecycle`，失活与 `health` 同一个判定源 `LivenessTracker`，**不另造时钟**）。要看某个插件的当前读数请下执行站命令 `plugin.state`——**那是“问”，这里是“推”**；三者各管各的轴：**活性看 `health`、启停看 `status`、阶段看 `lifecycle`** |
+| `system.broadcast.plugin.state` | 广播 | 插件**生命周期跃迁**（booting / ready / restarting / suspended / failed / stopped）与**失活标记**（心跳连续丢失 / 恢复）| 通知：载荷 `{plugin_id, lifecycle, previous, generation, missed_heartbeats, reason, buffer}`；别名 `plugin.state`（`{station: 'broadcast', point: 'plugin.state'}`）；发布点**只有这两处**（跃迁集中在 `PluginBus._setLifecycle`，失活与 `health` 同一个判定源 `LivenessTracker`，**不另造时钟**）。要看某个插件的当前读数请下执行站命令 `plugin.state`——**那是“问”，这里是“推”**；三者各管各的轴：**活性看 `health`、启停看 `status`、阶段看 `lifecycle`** |
+| `system.broadcast.turn.done` | 广播 | 本轮**正常结束**（会话收尾处） | 通知：`{agent_id, session_id, team_id, content_chars, elapsed_ms, finish_reason, tool_rounds}`；**不带正文**（正文有会话与 REST 两个正经读处）。别名 `turn.done` |
+| `system.broadcast.turn.cancelled` | 广播 | 本轮**被取消**（与 done 互斥，一轮只出一条） | 通知额外带 `source`：`interjection`（被新消息插话）/ `user_stop`（用户按停）——不变量 5 的两种取消在审计里必须分得开 |
+| `system.broadcast.turn.error` | 广播 | 本轮**错误终止** | 通知：`{…, error, failed_after_tools}`；`error` 就是核心已经发给用户那句**可读文案**（不另造一套说法）；取消与错误同时发生 ⇒ **先报错误** |
+| `system.broadcast.ask.paused` | 广播 | `AskUserQuestion` **落盘并推帧之后**、开始等作答那一刻 | 通知：`{agent_id, session_id, team_id, question_id, question_count}`；**不带题面与选项**（那是用户与 agent 之间的内容，审计只需知道“谁在等、等几道”） |
+| `system.broadcast.config.changed` | 广播 | `applyConfigs()` 逐条对账**完成后**，一条动作一个 topic | 通知：`{plugin_id, action, action_label, reason, generation}`；`action` 与 `PluginReconcileKind` 同源（`started` / `stopped` / `restarted` / `failed`）；**`unchanged` 一律不广播**（没改动的对账是噪声） |
 | `plugin.tool.define` | 收集 | 工具表刷新 | 申报工具定义 |
 
 ### 3.2 怎么订阅
@@ -530,7 +537,10 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `fs.write` | `path`, `content` | `{path, bytes_written}` | 写文件 |
 | `fs.list` | `path?`, `max_depth?`, `max_entries?` | `{entries, count, truncated}` | 列目录 |
 | `fs.grep` | `pattern`, `regex?`, `ignore_case?`, `path?`, … | `{matches:[{path,line,text}], count, truncated}` | 内容检索 |
-| `terminal.exec` | `command`，或 `hook_action`(`status`/`cancel`)+`task_id` | `{text, is_error}` | 执行命令（支持后台任务模式） |
+| `terminal.exec` | `command`，或 `hook_action`(`status`/`cancel`)+`task_id` | `{text, is_error}` | 执行命令（支持后台任务模式；`text` 是**给模型看的散文**） |
+| `terminal.listRuns` | `session_id?`, `only_running?`, `limit?`（缺省 50，上限 500） | `{total, count, truncated, runs:[{task_id, command, session_id, running, exit_code, elapsed_seconds, started_at, log_relative, remote, remote_log, detached, cancelled, pid, fail_streak}]}` | 后台（hook）任务的**结构化行**（新的在前）；只看**目标 agent 自己**的；`exit_code`/`pid` 拿不到写 `null` 不省略键 |
+| `terminal.stopRun` | `task_id` | `{task_id, requested, running, exit_code, reason?}` | 终止一条后台任务；**不保证杀得掉**（失联转的、远端没 pid 的都杀不掉），`requested=false` 必带 `reason`；命令本身仍算跑成（杀不掉 ≠ 没执行） |
+| `terminal.log` | `task_id`, `tail_chars?`（能下调不能上调） | `{task_id, log_relative, remote_log, tail:true, tail_chars, text, has_content, reason?}` | 读日志**尾部**（可能在远端工作空间，所以走 `fs.read` 不够）；文件还不存在 ⇒ `has_content:false` + `reason` |
 | `agent.message` | `message`/`content`, `session_id?` | `{…}` | 给某 agent 的会话发消息 |
 | `agent.stop` | `agent_id?`, `cascade?`（缺省 true） | `{any_running, reason?, …}` | 停止（级联）生成 |
 | `agent.compact` | `agent_id?`, `session_id?` | `{…}` | **发起上下文压缩** |
@@ -545,6 +555,9 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `plugin.suspend` | `plugin_id` | `{ok, suspended, dump_id, generation, note}` | 请求转储并记 `suspended`；**不代为退出**，也不拉起下一世 |
 | `plugin.stateDump` | `payload`（JSON 对象） | `{ok, dump_id, generation, bytes, pool_entries, pool_bytes}` | 递一份可续跑状态快照进核心**内存池**（不落盘） |
 | `plugin.stateFetch` | `dump_id?`（只能是自己上一世的那个） | 有：`{ok, has_snapshot:true, dump_id, payload, bytes}`；没：`{ok, has_snapshot:false, reason}` | 取回**上一世**的快照（一份只喂一世） |
+| `station.list` | — | `{ok, team_id, count, stations:[{station_id, kind, kind_label, builtin, description, subscriber_count, subscribers, handled_by?, commands?, counts}]}` | **拓扑只看不动**：谁接管了哪个点位（中转点位看 `handled_by`）；列表是**投影**，不递 `readme`/公告板/`config`（需那些请对单一点位下 `station.state`，见 §6.9） |
+| `station.state` | `station_id` 或 `point`（订阅时那套别名，如 `llm.handle`） | `{ok, team_id, station:{…整份 describe}}` | 看一个站点的当前读数（**订得到就问得到**）；内置点位全可见，插件自建站只对订阅者所在 team 可见 |
+| `usage.query` | `session_id?`, `tail_bytes?`（≤ 2 MiB） | `{ok, agent_id, session_id, usage_file, count, skipped, calls:[{at,source,model,prompt_tokens,cached_tokens,completion_tokens,estimated,duration_ms}], summary:{calls,prompt_tokens,completion_tokens,cached_tokens,by_source}}` | 按会话取**逐调用用量账本**（计费/预算类插件的地基）；会话口径与其他命令一致（参数 → scope → 默认会话）且回包 **echo 生效值**；`estimated=true` 的行是本地估算，**不得当计费依据** |
 
 **失败回包也可能带 `payload`**（2026-10-05 新增，**纯增量**）：`ok:false` 只表示"这次命令
 没跑成"，不代表产出没有价值。典型是 `llm.call` 拿到了 200、模型正文却解析不出 JSON：
@@ -727,6 +740,40 @@ plugins:
 一起传成 release 的资产 —— `gh release create v0.1.0 release/plugin-index.json <各资产>`。
 只传文件不改索引（或反之）会被判成“发布与索引不同版”，并给出这句原因。
 
+### 6.9 控制面的“只看”层：拓扑、后台任务、用量与水位（阶段 6）
+
+这一节把阶段 6 新增的四组读口放在一处，因为它们回答的都是同一类问题：
+**动手之前先把现场看清楚**。全部只读，全部走执行站（不可订阅）。
+
+- **`station.list` / `station.state`（拓扑）**：热重启一个插件前必须先能看见“谁接管了
+  哪个点位”——接走 `relay.llm.handle` 的那个插件一停，整条 LLM 就回退内置实现；看不见
+  就只能猜，而猜错的代价是停在正在干活的插件上。归属只有一条：**内置点位对任何 team
+  可见**（它们是系统接口，不是任何人的私有数据），**插件自建站只对订阅者所在 team 可见**
+  （别人的站里写着别人的 topic 与配置，连“它存在”都不该漏出去）；`team_id` 证明不了 ⇒
+  整条命令拒（fail-closed）。`station.state` 认订阅时那套别名（`llm.handle`）：“订得到、
+  问不到”是自相矛盾的面。接管权易手**仍然只走 `station/subscribe`**，这一族里没开第二条路。
+- **`terminal.listRuns` / `stopRun` / `log`（后台任务）**：台账与任务表早就跨重启存活，
+  `hook_action=status` 也早就存在——但那回的是**写给模型看的散文**；转发/看护类插件要的是
+  行。三条共同约束：只看/只动**目标 agent 自己**的任务（任务表是全进程一份，不按 agent
+  过滤就等于泄别人跑过什么命令）；拿不到的读数写 `null` **不省略键**；上限能下调不能上调。
+- **`usage.query`（用量账本）**：存量的读取范围问题——账本在数据根下的会话目录，插件的
+  `fs.read` 只在工作空间作用域内，永远够不到。核心只把已有的容错读取递出去：只读一个会话、
+  只读尾部、行形状与 `UsageCall.toJson()` 逐字一致（字段表只有一处出处），聚合也只在核心
+  算一份（算两份就与面板上那份漂）。
+- **水位（`plugin_status` 帧的两个新键）**：快照池与重启暂存队列都是“超限就丢”的有界结构，
+  光有“丢”这个动作不够——帧里多 `state_pool`（entries/bytes/denied + 三条上限）与
+  `restart_buffer`（本插件在队条数 + 上限 + `overflow`/`dropped`/`replayed`）。两种“没了”
+  必须分得开：`overflow` = 超限当场拒收（背压），`dropped` = 重启没成/插件下线后主动弃。
+  旧前端看不到这些键也不受影响（**只增键**与 `lifecycle` 同一条纪律）。
+- **并发形状的上界**：判活取消了时长硬上限（只认心跳丢失），所以“一个迟迟不回包的订阅者”
+  可以无限挂着等待。站点因此给在途等待加了一个数量上界（每站点缺省 64）：超限**当场**回
+  failed 并计 `overload_skipped`，**不排队**（排队只是把无界改成延后，热点点位上一样堆得
+  起来），走的仍是与“心跳丢失”同一条 fail-open 路。插件侧看到的仍是“这次没接管”。
+
+> 本阶段未接的 A 级点位（遗留项，见 CHANGELOG）：中转站 `tool.repair` / `tool.probe` /
+> `llm.register` / `compact.skip.reason`，与收集站 `plugin.capability.define`。接它们的
+> 纪律不变：表项 + 常量 + 进 `StationHubIds.all` + readme 四段式 + 投递口 + 派生用例计数。
+
 ---
 
 ## 7. 广播站与前端 UI
@@ -735,6 +782,14 @@ plugins:
 
 订阅 `system.broadcast`（通用主题）或 `system.broadcast.tool.pre|post`（工具调用事件）。
 工具广播**不等回包**：核心不等你应答，投递失败只进公告板与计数，不影响工具调用。
+
+**轮次类广播与工具广播是两套投递纪律**（阶段 6）：`turn.done` / `turn.cancelled` /
+`turn.error` / `ask.paused` / `config.changed` 这五个点位**订了才投**（没订阅者就一条都不发）；
+而 `agent.tool_call` 这类旧事件仍走“命中 scope 就推”的 legacy 事件流。分流判据只有一张表
+（`PluginBus._agentEventPoints`）：**命中点位的不再走 legacy**，否则一个事件两种形状会同时
+漂在插件侧。广播的 topic 由点位 id 去掉 `system.broadcast.` 前缀**推导**，不另记一张表。
+载荷纪律：**证明不了归属就不投**（运行期四元组拼不出合法 scope ⇒ fail-closed，只记一行日志），
+投递失败也**只记日志**——插件侧的问题绝不能拖垮生成那一轮。
 
 ```jsonc
 {"station_id":"system.broadcast.tool.post","scope":{}}
