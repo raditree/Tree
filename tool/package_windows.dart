@@ -167,6 +167,12 @@ Future<void> _package(List<String> args) async {
   stdout.writeln(
     _copySshExecutorArtifacts(root, releaseDir, _versionOf(pubspec['version'])),
   );
+  // ②e 框架自迭代插件的二进制（2026-10-15 阶段 3）：`plugins/tree_self_updater[.exe]`。
+  // 缺了它 = 装机后没有“热重启插件”这个 agent tool（面板上那一项会变“找不到可执行文件”），
+  // 而它是内置且默认开的 —— **少拷这一行 = 阶段 3 白做**（所以第 7 天的打包日志要能查到这行）。
+  stdout.writeln(
+    _copySelfUpdaterArtifacts(root, releaseDir, _versionOf(pubspec['version'])),
+  );
 
   // ③ 便携包说明（首次运行指引：数据在哪、怎么手改配置、出问题看哪）
   final File guide = File(_join(releaseDir.path, '使用说明.txt'));
@@ -456,6 +462,45 @@ String _copySshExecutorArtifacts(
         '—— 缺了它核心会自动回退内置 dartssh2，功能不变';
   }
   return '   SSH 执行器：${copied.join('、')}';
+}
+
+/// 把**框架自迭代插件**的二进制复制进发行目录（2026-10-15 阶段 3）。
+///
+/// `build/plugins/tree_self_updater[.exe]` → `<release>/plugins/`：与核心可执行文件
+/// **同级**是硬要求（`BuiltinPluginCatalog.scriptRoots()` 第一优先就是 `<exeDir>/plugins`）。
+///
+/// 与 SSH 执行器同一口径：**产物缺失不算打包失败**，但必须打印那一行——这个插件是
+/// `defaultEnabled: true` 的内置项，“没拷进去”在界面上只会变成一句“解析失败”，
+/// 而打包日志里那一行就是归因它的唯一线索。
+String _copySelfUpdaterArtifacts(
+  Directory root,
+  Directory releaseDir,
+  String binaryVersion,
+) {
+  final Directory pluginSource = Directory(_join(root.path, 'build/plugins'));
+  final List<String> copied = <String>[];
+  if (pluginSource.existsSync()) {
+    final Directory target = Directory(_join(releaseDir.path, 'plugins'))
+      ..createSync(recursive: true);
+    for (final FileSystemEntity entity in pluginSource.listSync()) {
+      if (entity is! File) continue;
+      final String name = _basename(entity.path);
+      if (!name.startsWith('tree_self_updater')) continue;
+      _verifyBinaryVersion(
+        entity,
+        binaryVersion,
+        'dart run tool/build_self_updater.dart',
+      );
+      entity.copySync(_join(target.path, name));
+      copied.add('plugins/$name');
+    }
+  }
+  if (copied.isEmpty) {
+    return '   自迭代插件：跳过（build/plugins 里没有 tree_self_updater 产物；'
+        '用 dart run tool/build_self_updater.dart 产出）'
+        '—— 缺了它装机后没有 plugin_hot_restart 这个 agent tool';
+  }
+  return '   自迭代插件：${copied.join('、')}';
 }
 
 /// 启动核心读握手（打包产物自检）。

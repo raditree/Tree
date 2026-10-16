@@ -4,6 +4,16 @@ import 'package:path/path.dart' as p;
 import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart';
 
 import 'plugin_config_store.dart';
+import 'plugin_host.dart' show PluginSuspension;
+
+/// 框架自迭代插件的**内置身份**（与 `packages/tree_self_updater` 里那一份**必须同串**）。
+///
+/// 为什么不共享常量：插件包要零核心依赖（不能反过来依赖 tree_core），因此两边各一条，
+/// 而“不同串”这个错由真子进程用例钉住：[plugin_tool_define_self_updater_test]。
+const String kSelfUpdaterPluginId = 'self_updater';
+
+/// 随包可执行文件的基本名（Windows 上解析时补 `.exe`）。
+const String kSelfUpdaterBinaryName = 'tree_self_updater';
 
 /// 内置插件的**静态清单**（M9 §4.2：内置插件与自定义插件都要能在前端开/关）。
 ///
@@ -34,6 +44,7 @@ class BuiltinPluginSpec {
     this.granularity = 'team',
     this.scope = const <String, dynamic>{},
     this.defaultEnabled = false,
+    this.suspension = '',
   });
 
   /// 插件类型：需要 Python 解释器的脚本。
@@ -77,6 +88,14 @@ class BuiltinPluginSpec {
   /// 用户显式关过（条目在、`enabled: false`）**绝不再自动打开**。
   final bool defaultEnabled;
 
+  /// 可挂起声明（'' = 不可挂起；`keep` = 热重启先转储、新一世取回续跑）。
+  ///
+  /// 为什么必须做进内置清单而不是“让用户自己改 yaml”：`PluginConfig.fromJson` **不保留
+  /// 未知键**（不变量 25），所以下面 [entryFor] 不写这一项时，落盘的条目就永远不会有
+  /// `suspension`，热重启只能冷启动 —— 而“一个声明了可挂起的内置插件被冷重启”在界面上
+  /// 表现为“状态没了”，看上去像 bug，实际是清单漏了一个字段。
+  final String suspension;
+
   /// 给前端的内置插件说明（config / enabled / resolution 由核心在响应里补）。
   Map<String, dynamic> toJson() => <String, dynamic>{
     'id': id,
@@ -88,6 +107,7 @@ class BuiltinPluginSpec {
     'granularity': granularity,
     'scope': scope,
     'default_enabled': defaultEnabled,
+    'suspension': suspension,
   };
 }
 
@@ -236,6 +256,30 @@ class BuiltinPluginCatalog {
       scope: <String, dynamic>{},
       defaultEnabled: true,
     ),
+    // 2026-10-15 阶段 3：**框架自迭代插件**（binary 型）。
+    // 为什么内置而不是“让用户自己装一个”：这条能力是“框架自己的手柄”（热重启一个插件，
+    // 含重启它自己所在的插件），缺了它，“改了插件代码必须手动重启核心”又得回来；
+    // 而它**一行核心代码也不新加**：全部能力已经在执行站点位 `system.execute.plugin` 里，
+    // 插件只是把一个 agent tool 转发到那六条命令上（其中快照两条不得做成 tool，D9）。
+    // `suspension: keep` 是这一条能“重启自己而不丢上下文”的前提：没有它就等于冷启动，
+    // 而“自重启”与“重启一下算了”的区别全在这一个字段上。
+    BuiltinPluginSpec(
+      id: kSelfUpdaterPluginId,
+      name: '框架自迭代插件',
+      description:
+          '把「热重启一个插件（含重启它自己所在的插件）」做成一个 agent tool（随包二进制）：'
+          '模型或右栏可以列出插件、看运行阶段、请求转储、热重启（默认尽量续跑）。'
+          '重启期间核心照常响应这个插件的站点请求（有界暂存后重放），会话不因此失败；'
+          '全部失败都以可读原因收尾，不会把一个插件拖成整个框架。'
+          '自检：`tree_self_updater --selftest`（退出码 0 = 七项全绿）。',
+      script: kSelfUpdaterBinaryName,
+      runtime: 'binary',
+      kind: BuiltinPluginSpec.kindBinary,
+      granularity: 'team',
+      scope: <String, dynamic>{},
+      defaultEnabled: true,
+      suspension: PluginSuspension.keep,
+    ),
   ];
 
   /// 脚本查找目录的显式覆盖（测试注入；null = 默认的"可执行文件同级 + 开发态回退"）。
@@ -285,9 +329,9 @@ class BuiltinPluginCatalog {
         return _cache[spec.id] = BuiltinResolution.failed(
           '找不到内置插件可执行文件 ${binaryFileName(spec, isWindows: _isWindows)}'
           '（依次查找：${roots.join('；')}）。'
-          '发行包应当把 $kSshExecutorBinaryName 放在可执行文件同级的 plugins/ 目录'
-          '（tool/package_windows.dart 已包含这一步）；开发态用 '
-          'tool/build_ssh_plugin.dart 产出到仓根 plugins/。',
+          '发行包应当把 ${spec.script} 放在可执行文件同级的 plugins/ 目录'
+          '（tool/package_windows.dart 已包含这一步）；开发态请先跑 tool/ 下'
+          '对应的 build_*.dart 产出到仓根 build/plugins/。',
           searchedScriptRoots: roots,
         );
       }
@@ -344,6 +388,9 @@ class BuiltinPluginCatalog {
     'enabled': enabled,
     'granularity': spec.granularity,
     'scope': spec.scope,
+    // 可挂起声明只在**非空**时写：留空也写就是给配置文件多一个无意义的键，
+    // 而「用户看到的键」应当只包含真正影响行为的声明（与不变量 10「保留未知键」同一纪律）。
+    if (spec.suspension.isNotEmpty) 'suspension': spec.suspension,
     // 标记：UI 据此把这一条分到「内置」组（内置插件不给删除，只给停用）
     'builtin': true,
   };

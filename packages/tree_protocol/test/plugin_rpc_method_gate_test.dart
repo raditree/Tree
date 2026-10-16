@@ -22,9 +22,15 @@ void main() {
   final Directory repoRoot = Directory('../..');
 
   /// 被扫描的源码面（协议**两端**都要扫，只扫核心等于没门）。
+  ///
+  /// `tree_self_updater` 也在内：它和 `tree_ssh_plugin` 一样自带一张方法名常量表
+  /// （插件包要零核心依赖，不能引本包），所以**新插件不会自动进门禁**这件事
+  /// 必须靠扫描面清单兜住 —— 漏一个目录就等于给那个目录开了一个无门区。
   final List<String> scanFaces = <String>[
     'packages/tree_core/lib/src/plugin',
     'packages/tree_ssh_plugin/lib',
+    'packages/tree_self_updater/lib',
+    'packages/tree_self_updater/bin',
     'examples/plugins',
   ];
 
