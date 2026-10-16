@@ -109,9 +109,10 @@ void main() {
     // 5) 站点快照里能看到收集站、schema 与订阅者
     //    （点位化：快照恒为**全部内置点位** + 接入点现建的收集站）
     final List<dynamic> stations = bus.snapshot()['stations'] as List<dynamic>;
-    expect(stations, hasLength(29), reason: '28 个内置点位 + 收集站');
+    expect(stations, hasLength(34), reason: '32 个内置点位 + 两个收集站');
     final Map<String, dynamic> station = stations.firstWhere(
-      (dynamic s) => (s as Map<String, dynamic>)['kind'] == 'collect',
+      (dynamic s) =>
+          (s as Map<String, dynamic>)['station_id'] == StationHubIds.collect,
     ) as Map<String, dynamic>;
     expect(station['station_id'], StationHubIds.collect);
     expect(station['kind'], 'collect');
@@ -158,7 +159,8 @@ void main() {
     expect(bus.toolsOf('sample'), isEmpty, reason: '下线插件的工具定义一并移除');
     final List<dynamic> stations = bus.snapshot()['stations'] as List<dynamic>;
     final Map<String, dynamic> collectStation = stations.firstWhere(
-      (dynamic s) => (s as Map<String, dynamic>)['kind'] == 'collect',
+      (dynamic s) =>
+          (s as Map<String, dynamic>)['station_id'] == StationHubIds.collect,
     ) as Map<String, dynamic>;
     expect(collectStation['subscriptions'], isEmpty, reason: '插件下线由总线注销其订阅');
     expect(

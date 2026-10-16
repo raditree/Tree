@@ -125,24 +125,39 @@ void main() {
     expect(instance['granularity'], 'team');
     expect(instance['last_heartbeat'], isA<int>());
     // 站点段**不再按 team 过滤**（站点全局唯一，过滤恒真）：快照恒看到**全部内置点位**
-    // （广播 5 + 执行 9 + 中转 7 = 21；收集站不预建）+ 该插件申报时现建的收集站。
+    // （广播 10 + 执行 11 + 中转 11 = 32；收集站不预建）+ 该插件申报时现建的**两个**收集站。
     final List<dynamic> stations = res.json['stations'] as List<dynamic>;
-    final List<String> prebuiltPoints = StationPoints.all
-        .where((StationPointSpec spec) => spec.kind != StationKind.collect)
-        .map((StationPointSpec spec) => spec.id)
-        .toList()
-      ..sort();
+    final List<String> prebuiltPoints =
+        StationPoints.all
+            .where((StationPointSpec spec) => spec.kind != StationKind.collect)
+            .map((StationPointSpec spec) => spec.id)
+            .toList()
+          ..sort();
     expect(
       stations
           .map((dynamic s) => (s as Map<String, dynamic>)['station_id'])
           .toList(),
-      <String>[StationHubIds.collect, ...prebuiltPoints],
+      <String>[
+        StationHubIds.collectCapability,
+        StationHubIds.collect,
+        ...prebuiltPoints,
+      ],
       reason: '每个接入点（point）是一个独立站点实例，id 不含 team / mode；按 id 字典序',
     );
-    final Map<String, dynamic> collectStation = stations.first
-        as Map<String, dynamic>;
+    final Map<String, dynamic> collectStation = stations.firstWhere(
+      (dynamic s) =>
+          (s as Map<String, dynamic>)['station_id'] == StationHubIds.collect,
+    ) as Map<String, dynamic>;
     expect(collectStation['station_id'], StationHubIds.collect);
     expect(collectStation['kind'], 'collect');
+    // 阶段 6 的点位申报收集站也在快照里（同一个插件同时挂两个收集站）
+    final Map<String, dynamic> capabilityStation = stations.firstWhere(
+      (dynamic s) =>
+          (s as Map<String, dynamic>)['station_id'] ==
+          StationHubIds.collectCapability,
+    ) as Map<String, dynamic>;
+    expect(capabilityStation['kind'], 'collect');
+    expect(capabilityStation['subscriber_count'], 1);
     // 该插件声明里没有 scope ⇒ **通配订阅**（空 team = 作用于所有 team）：
     // 空 scope 也是合法订阅声明，不再被 fail-closed 拒绝（用户定稿）。
     expect(
@@ -150,16 +165,12 @@ void main() {
       1,
       reason: '空 scope = 通配订阅：挂上收集站（工具仍走 tools/list 路径注册）',
     );
-    expect(
-      collectStation['subscribers_by_team'],
-      <String, dynamic>{
-        '': <String, dynamic>{
-          'count': 1,
-          'plugin_ids': <String>['sample'],
-        },
+    expect(collectStation['subscribers_by_team'], <String, dynamic>{
+      '': <String, dynamic>{
+        'count': 1,
+        'plugin_ids': <String>['sample'],
       },
-      reason: '空 team 归到空串键（前端渲染成「全部 team（未限定）」= 作用于所有 team）',
-    );
+    }, reason: '空 team 归到空串键（前端渲染成「全部 team（未限定）」= 作用于所有 team）');
     final Map<String, dynamic> config =
         res.json['config'] as Map<String, dynamic>;
     expect((config['plugins'] as List<dynamic>).single['plugin_id'], 'sample');
@@ -264,7 +275,10 @@ void main() {
 
     // ① 内置点位：详情页要读的字段一个都不能缺
     final String builtin = Uri.encodeComponent(StationHubIds.relayToolPre);
-    final _Res res = await ctx.client.send('GET', '/api/plugin/stations/$builtin');
+    final _Res res = await ctx.client.send(
+      'GET',
+      '/api/plugin/stations/$builtin',
+    );
     expect(res.status, 200);
     expect(res.json['station_id'], StationHubIds.relayToolPre);
     expect(
@@ -460,7 +474,7 @@ void main() {
     final _Res gone = await ctx.client.send(
       'POST',
       '/api/plugin/stations/${Uri.encodeComponent(selfId)}/subscribers'
-      '/${Uri.encodeComponent('nobody|')}',
+          '/${Uri.encodeComponent('nobody|')}',
       body: <String, dynamic>{'disabled': true},
     );
     expect(gone.status, 404);
@@ -468,17 +482,17 @@ void main() {
   });
 
   test('插件介绍与工具跟着快照与清单走（详情页的数据源）', () async {
-    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
-        await serve(
-          'enabled: true\n'
-          'plugins:\n'
-          '  - id: sample\n'
-          '    name: 样例插件\n'
-          '    description: 把工具公告按 team 再分发，并提供一个只能读文件的工具\n'
-          '    command: "${Platform.resolvedExecutable.replaceAll('\\', '/')}"\n'
-          '    args: ["${script.replaceAll('\\', '/')}", "--station-client"]\n'
-          '    granularity: team\n',
-        );
+    final ({CoreServer server, _Client client, PluginBus bus})
+    ctx = await serve(
+      'enabled: true\n'
+      'plugins:\n'
+      '  - id: sample\n'
+      '    name: 样例插件\n'
+      '    description: 把工具公告按 team 再分发，并提供一个只能读文件的工具\n'
+      '    command: "${Platform.resolvedExecutable.replaceAll('\\', '/')}"\n'
+      '    args: ["${script.replaceAll('\\', '/')}", "--station-client"]\n'
+      '    granularity: team\n',
+    );
     addTearDown(() async {
       ctx.client.close();
       await ctx.server.close();
@@ -488,11 +502,9 @@ void main() {
     final _Res snap = await ctx.client.send('GET', '/api/plugin/snapshot');
     expect(snap.status, 200);
     final Map<String, dynamic> instance =
-        (snap.json['instances'] as List<dynamic>).single as Map<String, dynamic>;
-    expect(
-      instance['description'],
-      '把工具公告按 team 再分发，并提供一个只能读文件的工具',
-    );
+        (snap.json['instances'] as List<dynamic>).single
+            as Map<String, dynamic>;
+    expect(instance['description'], '把工具公告按 team 再分发，并提供一个只能读文件的工具');
     expect(
       (instance['tools'] as List<dynamic>)
           .map((dynamic t) => (t as Map<String, dynamic>)['name'])
@@ -533,7 +545,9 @@ void main() {
     );
     final _Res cleared = await ctx.client.send('GET', '/api/plugin/configs');
     expect(
-      (cleared.json['configs'] as List<dynamic>).single.containsKey('description'),
+      (cleared.json['configs'] as List<dynamic>).single.containsKey(
+        'description',
+      ),
       isFalse,
     );
   });

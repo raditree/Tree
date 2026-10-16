@@ -319,7 +319,10 @@ void main() {
     final Map<String, dynamic> collectStation =
         (bus.snapshot()['stations'] as List<dynamic>)
             .cast<Map<String, dynamic>>()
-            .firstWhere((Map<String, dynamic> s) => s['kind'] == 'collect');
+            .firstWhere(
+              (Map<String, dynamic> s) =>
+                  s['station_id'] == StationHubIds.collect,
+            );
     expect(collectStation['station_id'], StationHubIds.collect);
     expect(
       (collectStation['subscriptions'] as List<dynamic>).map(

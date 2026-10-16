@@ -274,16 +274,13 @@ void main() {
     // 现在多大、上限多少、已经拒过/弃过多少，否则“我的快照为何不见了”又是靠猜。
     final Map<String, dynamic> pool =
         ready['state_pool'] as Map<String, dynamic>;
-    expect(
-      pool.keys.toSet(),
-      <String>{
-        'entries',
-        'bytes',
-        'denied',
-        'max_entries',
-        'max_total_bytes',
-      },
-    );
+    expect(pool.keys.toSet(), <String>{
+      'entries',
+      'bytes',
+      'denied',
+      'max_entries',
+      'max_total_bytes',
+    });
     expect(
       pool['entries'],
       0,
@@ -291,24 +288,28 @@ void main() {
     );
     final Map<String, dynamic> buffer =
         ready['restart_buffer'] as Map<String, dynamic>;
-    expect(
-      buffer.keys.toSet(),
-      <String>{
-        'buffered_for_this_plugin',
-        'max_per_plugin',
-        'max_total_bytes',
-        'overflow',
-        'dropped',
-        'replayed',
-      },
-      reason: 'overflow（当场拒）与 dropped（主动弃）必须分得开',
-    );
+    expect(buffer.keys.toSet(), <String>{
+      'buffered_for_this_plugin',
+      'max_per_plugin',
+      'max_total_bytes',
+      'overflow',
+      'dropped',
+      'replayed',
+    }, reason: 'overflow（当场拒）与 dropped（主动弃）必须分得开');
     expect(buffer['buffered_for_this_plugin'], 0);
     expect(
       buffer['max_per_plugin'],
       greaterThan(0),
       reason: '上限也是水位的一部分（不报上限就看不出“快满了”）',
     );
+    // 第三处只增键（阶段 6）：插件自己申报的点位。**没申报就递空表，不是缺键**：
+    // 面板要能区分“没人申报”与“核心本来不给看”。申报只是描述，不产生投递路。
+    expect(
+      ready['capabilities'],
+      isA<List<dynamic>>(),
+      reason: '申报读数必须是数组（面板据此分行）',
+    );
+    expect(ready['capabilities'], isEmpty, reason: '这个夹具没申报任何点位');
     for (final String legacy in <String>[
       'plugin_id',
       'name',

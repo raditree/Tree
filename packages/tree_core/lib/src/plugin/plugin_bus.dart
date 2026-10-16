@@ -14,6 +14,7 @@ import '../store/yaml_codec.dart';
 import '../util/liveness.dart';
 import 'agent_events.dart';
 import 'execute_mounts.dart';
+import 'plugin_capability.dart';
 import 'plugin_host.dart';
 import 'plugin_lifecycle.dart';
 import 'plugin_restart_buffer.dart';
@@ -66,6 +67,20 @@ typedef PluginUsageRecentProvider = Future<PluginUsageRecent?> Function(
   String agentId,
   String sessionId,
 );
+
+/// 中转点 `tool.probe` 的**三档答案**（阶段 6）。
+///
+/// 为什么不是一个 `String?`：“没接管”与“接管了、肯定没有”在调用方那里是两个
+/// 完全不同的动作（前者继续查库，后者直接停在等显式取消），一个 null 分不出这两件事。
+final class StationToolProbeVerdict {
+  const StationToolProbeVerdict({required this.found, this.text = ''});
+
+  /// 插件说这次调用**已有结果**（true 时 [text] 就是那段原文）。
+  final bool found;
+
+  /// 结果原文（[found]=false 时为空）。
+  final String text;
+}
 
 /// 插件总线（M6b + M9 Wave 3-F）：配置、实例生命周期、事件分发、工具聚合、
 /// **站点体系**与**心跳判活**。
@@ -239,6 +254,14 @@ class PluginBus {
   })?
   compactionSkipSink;
 
+  /// “这句原因能不能由插件写得更准”的**回写口**（阶段 6，中转点位
+  /// `compact.skip.reason`）：接线方接到 `CompactionService.annotateRelaySkip`。
+  ///
+  /// 只能改**文案**：内置那句已经先记账（可读性不依赖插件），分级位 `has_subscriber`
+  /// 与“到底有没有接管”那个判据都在核心里。未接线 ⇒ 插件回了也没人接（不报错）。
+  void Function(String agentId, String sessionId, String reason)?
+  compactionSkipAnnotator;
+
   /// 一次压缩请求里捎给插件的**最近用量行**（见 [PluginUsageRecent]）：
   /// 接线注入，未接线时压缩载荷里不会出现 `recent_usage` / `usage_file`。
   PluginUsageRecentProvider? usageRecentProvider;
@@ -339,6 +362,35 @@ class PluginBus {
 
   /// 最近一次收集的结论（[ensureToolTableFresh] 在不脏时返回它）。
   ToolDefinitionRefresh? _lastToolTableRefresh;
+
+  /// 插件申报的**自定义点位**（收集站 `plugin.capability.define`，阶段 6）。
+  /// 每轮工具表刷新**整表重建**（键 = plugin_id）。
+  final Map<String, List<PluginCapability>> _capabilitiesByPlugin =
+      <String, List<PluginCapability>>{};
+
+  /// 上一轮点位申报里**被丢掉的那几条**（含未响应），显式列出不静默。
+  List<String> _capabilityNotes = const <String>[];
+
+  /// 在册的插件自定义点位（只读；传 [pluginId] 只看那一个插件）。
+  ///
+  /// 注意这里只是**描述**：核心不认识的 event 不会因为被申报就开始投递（否则一个
+  /// 字符串就能骗过订阅者）。
+  List<Map<String, dynamic>> capabilityDeclarations({String pluginId = ''}) {
+    final String key = pluginId.trim();
+    final Iterable<PluginCapability> rows = key.isEmpty
+        ? <PluginCapability>[
+            for (final List<PluginCapability> list
+                in _capabilitiesByPlugin.values)
+              ...list,
+          ]
+        : (_capabilitiesByPlugin[key] ?? const <PluginCapability>[]);
+    return <Map<String, dynamic>>[
+      for (final PluginCapability row in rows) row.toJson(),
+    ];
+  }
+
+  /// 上一轮点位申报的丢弃原因（与 [capabilityDeclarations] 同轮）。
+  List<String> get capabilitySkipNotes => _capabilityNotes;
 
   int _lastWatchdogRun = 0;
   Timer? _watchdogTimer;
@@ -751,6 +803,8 @@ class PluginBus {
           'dropped': restartBuffer.droppedCount,
           'replayed': restartBuffer.replayedCount,
         },
+        // 插件自己申报的点位（阶段 6，只增键）：只是描述，不产生投递路。
+        'capabilities': capabilityDeclarations(pluginId: config.id),
         'ts': _nowSeconds(),
       },
     });
@@ -2593,6 +2647,9 @@ class PluginBus {
       // 总开关关闭：不再收集（也把脏标记清掉，免得每次工具表都排一次空刷新）
       _toolTableDirty = false;
       _toolTableCache.clear();
+      // 点位申报表跟着清：开关关了就没有人在发，留着就是假的在册
+      _capabilitiesByPlugin.clear();
+      _capabilityNotes = const <String>[];
       return const ToolDefinitionRefresh();
     }
     final Set<String> stationIds = <String>{};
@@ -2603,6 +2660,13 @@ class PluginBus {
       // 收集站不可用（被同名非收集站占用等）：明确记录，不静默
       skipped.add('收集站不可用：${StationHubIds.collect} 已被非收集站占用');
     }
+    // 点位（capability）申报收集站（阶段 6）：与工具收集**共用这一趟插件循环**。
+    // 另开一条路就会让两边的「哪些插件算活着」漂开（同一套 scope 口径、同一套销账）。
+    final CollectStation? capabilityStation = stations
+        .capabilityDefineStationFor();
+    final List<StationCollectedItem> capabilityItems = <StationCollectedItem>[];
+    final List<StationUnresponsive> capabilityUnresponsive =
+        <StationUnresponsive>[];
     // 这一趟的**消息 scope**：决定投给哪些订阅者。
     final List<StationScope> messageScopes = <StationScope>[];
     for (final PluginConfig config in _configs) {
@@ -2641,6 +2705,18 @@ class PluginBus {
         (StationRequest request) =>
             _respondToToolDefinition(config, host, request),
       );
+      // 点位申报的订阅与工具申报同一个插件、同一份 scope（少一个插件就两边都少）。
+      if (capabilityStation != null) {
+        stations.subscribe(
+          capabilityStation.id,
+          StationSubscriber(
+            pluginId: config.id,
+            scope: pluginScope,
+            subscribedAt: _nowSeconds(),
+          ),
+          (StationRequest request) => _respondToCapability(host, request),
+        );
+      }
       // 采集的**消息 scope**：优先调用方指定（决定这一趟投给谁），其次插件声明，
       // 再次调用点运行期四元组。**消息侧必须能证明 team**（fail-closed）——
       // 通配订阅（team 为空）因此必须借调用点的 team，借不到就这一趟不收集
@@ -2696,6 +2772,17 @@ class PluginBus {
         collected.addAll(result.items);
         unresponsive.addAll(result.unresponsive);
         skipped.addAll(result.skipped);
+        if (capabilityStation != null) {
+          final StationCollectResult caps = await capabilityStation.collect(
+            scope: messageScope,
+            meta: <String, dynamic>{
+              'purpose': 'capability_definition',
+              'plugin_config': configFile,
+            },
+          );
+          capabilityItems.addAll(caps.items);
+          capabilityUnresponsive.addAll(caps.unresponsive);
+        }
       }
     }
     // 后续处理（触发方职责）：按来源 plugin_id 注册成动态工具。
@@ -2741,6 +2828,21 @@ class PluginBus {
         '插件工具定义收集：注册 ${registered.length} 个；'
         '未响应 $unresponsiveCount 个；跳过 $skippedCount 条',
       );
+    }
+    // 点位申报表**每轮重建**（文件头口径 3）：插件下线 / 热重启旧世代 / 没回包
+    // ⇒ 那一份自然不在新表里（不留“声明还在但没人发”的活口）。
+    if (capabilityStation != null) {
+      final CapabilityAbsorption absorbed = absorbCapabilityRows(
+        items: capabilityItems,
+        unresponsive: capabilityUnresponsive,
+      );
+      _capabilitiesByPlugin
+        ..clear()
+        ..addAll(absorbed.byPlugin);
+      _capabilityNotes = absorbed.notes;
+      for (final String note in absorbed.notes) {
+        log?.call('点位申报：$note');
+      }
     }
     // 一次收集完成 = 工具表不再脏（缓存随即清空，下次取表按新定义重建）
     final ToolDefinitionRefresh outcome = ToolDefinitionRefresh(
@@ -2957,6 +3059,218 @@ class PluginBus {
       log?.call('工具中转（$phase $tool）异常（已放行原报文）：$error');
       return null;
     }
+  }
+
+  // ── 阶段 6 A 级：四个新中转点位（tool.repair / tool.probe / llm.register /
+  //   compact.skip.reason）───────────────────────────────────────────────
+
+  /// 这四个点位的**共同投递形状**（只写一次，否则四处 fail-open 口径一定漂）。
+  ///
+  /// 返回 null = **未接管**（点位不可用 / 无订阅者 / 没回 / 回包失败 / 异常），
+  /// 调用方一律走内置那一条；绝不抛、绝不阻塞。接管了就把回包原样递上去（Map）。
+  Future<Object?> _relayRaw(
+    String pointId, {
+    required Map<String, dynamic> payload,
+    required StationScope scope,
+    required String label,
+    Map<String, dynamic>? meta,
+  }) async {
+    final RelayStation? station = stations.relayPointFor(pointId);
+    if (station == null) {
+      log?.call('$label：点位 $pointId 不可用（未接线 / 类型不符），按内置走');
+      return null;
+    }
+    if (station.subscribers.isEmpty) return null; // 快路径：没人订阅，零等待
+    try {
+      final StationRelayResult relayed = await station.relay(
+        data: <String, dynamic>{...payload, 'point': station.id},
+        scope: scope,
+        meta: meta ?? payload,
+      );
+      if (!relayed.handled) {
+        if (relayed.reason.isNotEmpty) {
+          log?.call('$label 未处理：${relayed.reason}');
+        }
+        return null;
+      }
+      return relayed.data;
+    } catch (error) {
+      log?.call('$label 异常（按内置走）：$error');
+      return null;
+    }
+  }
+
+  /// 中转点 `tool.repair`：历史里缺工具结果时，那句**修复文案由谁写**。
+  ///
+  /// 只接管“写什么”：落库与 `tool_end` 帧仍然只走内置那一条路（不开第二条落库路）。
+  /// 返回 null ⇒ 用内置那句（`autoRepairToolResultText`），**不会因本站失败而修不了**。
+  Future<String?> relayToolRepairText({
+    required String agentId,
+    required String sessionId,
+    required String toolCallId,
+    required String toolName,
+    required String text,
+  }) async {
+    load();
+    if (!enabled) return null;
+    final StationScope scope = runtimeScopeFor(
+      agentId: agentId,
+      sessionId: sessionId,
+    );
+    if (!scope.isValid) return null;
+    final Object? data = await _relayRaw(
+      StationHubIds.relayToolRepair,
+      label: '工具结果修复文案',
+      meta: <String, dynamic>{'call_id': toolCallId},
+      payload: <String, dynamic>{
+        'agent_id': agentId,
+        'session_id': sessionId,
+        'tool_call_id': toolCallId,
+        'tool_name': toolName,
+        'text': text,
+      },
+      scope: scope,
+    );
+    if (data is! Map) return null;
+    if (data['repaired'] != true) return null;
+    final String better = '${data['text'] ?? ''}'.trim();
+    if (better.isEmpty) {
+      log?.call('工具结果修复文案：回包 repaired=true 但没带 text（用内置那句）');
+      return null;
+    }
+    return better;
+  }
+
+  /// 中转点 `tool.probe`：“这次工具调用是不是已经有结果”由谁回答。
+  ///
+  /// 三档结果缺一不可（所以下面返回一个对象而不是 String?）：
+  /// - null ⇒ **未接管**，调用方走内置探针（查库）；
+  /// - `found: true` ⇒ 插件交出结果原文；
+  /// - `found: false` ⇒ 插件**肯定地**说没有（也不再进内置探针：结果在插件那一侧，
+  ///   库里查不到本来就是预期的）。
+  Future<StationToolProbeVerdict?> relayToolProbe({
+    required String agentId,
+    required String sessionId,
+    required String toolCallId,
+  }) async {
+    load();
+    if (!enabled) return null;
+    final StationScope scope = runtimeScopeFor(
+      agentId: agentId,
+      sessionId: sessionId,
+    );
+    if (!scope.isValid) return null;
+    final Object? data = await _relayRaw(
+      StationHubIds.relayToolProbe,
+      label: '工具结果探针',
+      meta: <String, dynamic>{'call_id': toolCallId},
+      payload: <String, dynamic>{
+        'agent_id': agentId,
+        'session_id': sessionId,
+        'tool_call_id': toolCallId,
+      },
+      scope: scope,
+    );
+    if (data is! Map) return null;
+    final Object? found = data['found'];
+    if (found is! bool) {
+      log?.call(
+        '工具结果探针：回包没有布尔 found（实际 ${data['found'].runtimeType}），'
+        '按未接管走内置探针',
+      );
+      return null;
+    }
+    return StationToolProbeVerdict(
+      found: found,
+      text: '${data['text'] ?? data['result'] ?? ''}',
+    );
+  }
+
+  /// 中转点 `llm.register`：把一次运行中请求的**登记**投给插件（fire-and-forget）。
+  ///
+  /// **内置登记表永远先建立**（它是流式可关闭性的唯一执行点），所以这里不 await、
+  /// 也不允许回包影响请求本身：插件回的 `note` 只进日志（计费 / 审计拿得到
+  /// handle 与模型就够了）。取消 / 关闭 / 判死三个动作仍然只在核心里。
+  void relayLlmRegisterNotice({
+    required String handle,
+    required String agentId,
+    required String sessionId,
+    required String model,
+    required int turn,
+  }) {
+    load();
+    if (!enabled) return;
+    final StationScope scope = runtimeScopeFor(
+      agentId: agentId,
+      sessionId: sessionId,
+    );
+    if (!scope.isValid) return;
+    unawaited(
+      _relayRaw(
+        StationHubIds.relayLlmRegister,
+        label: 'LLM 请求登记',
+        meta: <String, dynamic>{'handle': handle},
+        payload: <String, dynamic>{
+          'handle': handle,
+          'agent_id': agentId,
+          'session_id': sessionId,
+          'model': model,
+          'turn': turn,
+        },
+        scope: scope,
+      ).then((Object? data) {
+        if (data is! Map) return;
+        final String note = '${data['note'] ?? ''}'.trim();
+        if (note.isEmpty) return;
+        // 回执只进日志：登记本身已经成立，这里不拿它改写任何判据。
+        log?.call('LLM 请求登记回执（$handle）：$note');
+      }),
+    );
+  }
+
+  /// 中转点 `compact.skip.reason`：把“压缩为什么没走插件”那句原因投给插件，
+  /// 插件可回一句更准的说法**覆盖那一条记录**（只改文案，不改分级位）。
+  ///
+  /// [hasSubscriber]=false（总开关关 / 作用域不匹配 / 无订阅者）时**不投**：根本没
+  /// 插件在路上，投了只会多一条没人接的帧。回得太晚（这一轮已经收尾）就自然失效：
+  /// [compactionSkipAnnotator] 只会覆盖还在账上那条，不会凭空造一条。
+  void relayCompactSkipReason({
+    required String agentId,
+    required String sessionId,
+    required String reason,
+    required bool hasSubscriber,
+  }) {
+    load();
+    if (!enabled || !hasSubscriber) return;
+    final StationScope scope = runtimeScopeFor(
+      agentId: agentId,
+      sessionId: sessionId,
+    );
+    if (!scope.isValid) return;
+    unawaited(
+      _relayRaw(
+        StationHubIds.relayCompactSkipReason,
+        label: '压缩未接管原因',
+        meta: <String, dynamic>{'session_id': sessionId},
+        payload: <String, dynamic>{
+          'agent_id': agentId,
+          'session_id': sessionId,
+          'reason': reason,
+        },
+        scope: scope,
+      ).then((Object? data) {
+        if (data is! Map) return;
+        final String better = '${data['reason'] ?? ''}'.trim();
+        if (better.isEmpty || better == reason) return;
+        final void Function(String, String, String)? annotator =
+            compactionSkipAnnotator;
+        if (annotator == null) {
+          log?.call('压缩未接管原因：插件回了更准的说法，但回写口未接线（不假装改过）');
+          return;
+        }
+        annotator(agentId, sessionId, better);
+      }),
+    );
   }
 
   // ── 中转站点位：LLM 路径（点位化，2026-10-01） ─────────────────────────────
@@ -3733,6 +4047,15 @@ class PluginBus {
       agent.id,
       session.sessionId,
       reason,
+      hasSubscriber: hasSubscriber,
+    );
+    // 阶段 6：把这句原因投给 `compact.skip.reason`（让插件写得更准）。
+    // **早退不投**（hasSubscriber=false 时根本没插件在路上）；fire-and-forget，
+    // 不卡压缩本身（内置那句已经落账了）。
+    relayCompactSkipReason(
+      agentId: agent.id,
+      sessionId: session.sessionId,
+      reason: reason,
       hasSubscriber: hasSubscriber,
     );
   }
@@ -5296,6 +5619,16 @@ class PluginBus {
           parameters: tool.inputSchema,
         ),
     ]);
+  }
+
+  /// 点位申报的回包实现：直接交给插件（没有旧路径可退）。
+  Future<StationReply> _respondToCapability(
+    PluginHost host,
+    StationRequest request,
+  ) async {
+    // 点位申报没有“旧路径兼容”（不像工具还能从 tools/list 兜一手）：
+    // 插件没实现 station/request 就是没申报，由汇聚那一步**显式列出原因**。
+    return host.requestStation(request);
   }
 
   /// 收集站订阅者的回包实现：**首选 station/request 通道**，老插件退回 tools/list。

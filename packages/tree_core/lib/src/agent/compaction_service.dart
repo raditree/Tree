@@ -10,8 +10,10 @@ import 'attachment_prompt.dart';
 import 'workspace_prompt.dart';
 
 /// 当前上下文的**线形请求**提供者（见 [CompactionService.wireRequestProvider]）。
-typedef WireRequestProvider =
-    Future<Map<String, dynamic>?> Function(CoreAgent agent, CoreSession session);
+typedef WireRequestProvider = Future<Map<String, dynamic>?> Function(
+  CoreAgent agent,
+  CoreSession session,
+);
 
 /// 「上下文压缩过程」的中转点钩子（中转站点位 `system.relay.context.compact`）。
 ///
@@ -22,34 +24,38 @@ typedef WireRequestProvider =
 ///
 /// 没接中转点（或它这轮不接管）时走系统内置 compact：`buildPlan` + 摘要器 + 水位线。
 /// 两条路径的产物互斥（见 [CoreSession.compactedContext]）。
-typedef CompactionRelayHook =
-    Future<CompactionRelayReply?> Function({
-      required CoreAgent agent,
-      required CoreSession session,
-      /// 内置拼装的系统提示词（与 [CompactionService.estimateContextTokens] 同口径：
-      /// 全局基础段 + agent 自己的提示词 + 工作空间软约束 + Spec 段）。
-      ///
-      /// **不含** `system.relay.prompt.system` 的插件改写结果——那个改写只对会话生成
-      /// 那一轮生效，压缩估算刻意不跟（见 [LlmAgentEngine.systemPromptRelay] 的说明）。
-      required String systemPrompt,
-      /// **原文总条数**（落库全量）：`covered_message_count` 的合法上界。
-      ///
-      /// 注意载荷里**不再给落库全量原文**：那份东西既大（动辄几 MB）又与"模型真正
-      /// 看到的那份"不同步（冷前缀已被摘要/列表代表）。插件要的原料只有一样：
-      /// [wireRequest] 里的 messages。
-      required int totalMessageCount,
-      /// 当前水位线：引擎此刻从原文第几条继续（= 之前压缩已覆盖的条数）。
-      required int compactedMessageCount,
-      /// 内置路径上一次的摘要（空串 = 没有 / 上一次也是中转站压的）。
-      required String existingSummary,
-      /// **当前上下文的线形请求**（预先压缩态，`{model, messages, tools, …}`）：
-      /// 与对话即将发出的那一份同口径。它同时是压缩插件的**唯一原料**（拿它当
-      /// `llm.call` 的前缀就吃到端点前缀缓存）与"尾部原样保留"的来源。
-      ///
-      /// null = 提供者没接线 / 拼不出来 ⇒ 插件应**不接管**（没有同口径原料就没法
-      /// 保证前缀一致，硬压只会让缓存与内容双双失准）。
-      required Map<String, dynamic>? wireRequest,
-    });
+typedef CompactionRelayHook = Future<CompactionRelayReply?> Function({
+  required CoreAgent agent,
+  required CoreSession session,
+
+  /// 内置拼装的系统提示词（与 [CompactionService.estimateContextTokens] 同口径：
+  /// 全局基础段 + agent 自己的提示词 + 工作空间软约束 + Spec 段）。
+  ///
+  /// **不含** `system.relay.prompt.system` 的插件改写结果——那个改写只对会话生成
+  /// 那一轮生效，压缩估算刻意不跟（见 [LlmAgentEngine.systemPromptRelay] 的说明）。
+  required String systemPrompt,
+
+  /// **原文总条数**（落库全量）：`covered_message_count` 的合法上界。
+  ///
+  /// 注意载荷里**不再给落库全量原文**：那份东西既大（动辄几 MB）又与"模型真正
+  /// 看到的那份"不同步（冷前缀已被摘要/列表代表）。插件要的原料只有一样：
+  /// [wireRequest] 里的 messages。
+  required int totalMessageCount,
+
+  /// 当前水位线：引擎此刻从原文第几条继续（= 之前压缩已覆盖的条数）。
+  required int compactedMessageCount,
+
+  /// 内置路径上一次的摘要（空串 = 没有 / 上一次也是中转站压的）。
+  required String existingSummary,
+
+  /// **当前上下文的线形请求**（预先压缩态，`{model, messages, tools, …}`）：
+  /// 与对话即将发出的那一份同口径。它同时是压缩插件的**唯一原料**（拿它当
+  /// `llm.call` 的前缀就吃到端点前缀缓存）与"尾部原样保留"的来源。
+  ///
+  /// null = 提供者没接线 / 拼不出来 ⇒ 插件应**不接管**（没有同口径原料就没法
+  /// 保证前缀一致，硬压只会让缓存与内容双双失准）。
+  required Map<String, dynamic>? wireRequest,
+});
 
 /// 中转站压缩的产物（[CompactionRelayHook] 的返回值）。
 ///
@@ -242,6 +248,43 @@ class CompactionService {
     );
   }
 
+  /// 用插件给的更准说法**覆盖**那一条“没接管”记录（中转点位 `compact.skip.reason`）。
+  ///
+  /// 只覆盖**还在账上的那一条**：账上已经没有 ⇒ 说明这一轮结论已经交付（`_compact`
+  /// 收尾时会读走并删除），那就**不凭空造一条**，也不回改已经推进会话历史的那条
+  /// 通知（那是既成事实，回改会让历史与 REST 对不上）。
+  ///
+  /// 分级位 [hasSubscriber] **原样保留**：“该不该写进历史”是核心的判据，插件只能改
+  /// 文案。（接线：`PluginBus.compactionSkipAnnotator`。）
+  void annotateRelaySkip(String agentId, String sessionId, String reason) {
+    final String text = reason.trim();
+    if (text.isEmpty) return;
+    final String key = _key(agentId, sessionId);
+    final _RelaySkip? existing = _relaySkips[key];
+    if (existing == null) {
+      log?.call(
+        '压缩未接管原因（插件补充）没有可覆盖的记录（$agentId / $sessionId）：'
+        '这一轮结论已经交付，不凭空造一条',
+      );
+      return;
+    }
+    _relaySkips[key] = _RelaySkip(text, hasSubscriber: existing.hasSubscriber);
+  }
+
+  /// **只读**：本会话当前那条"没接管"记录（null = 账上没有）。
+  ///
+  /// 存在的理由：[annotateRelaySkip] 的覆盖发生在压缩收尾**之前**，而“那句到底最
+  /// 后是什么”必须能在不跑一轮压缩的前提下看到（面板与用例都靠它）。
+  ({String reason, bool hasSubscriber})? relaySkipOf(
+    String agentId,
+    String sessionId,
+  ) {
+    final _RelaySkip? hit = _relaySkips[_key(agentId, sessionId)];
+    return hit == null
+        ? null
+        : (reason: hit.reason, hasSubscriber: hit.hasSubscriber);
+  }
+
   /// 本会话"中转站没接管"的原因（空串 = 接管成功 / 根本没接中转点）。
   String _relaySkipOf(String agentId, String sessionId) =>
       _relaySkips[_key(agentId, sessionId)]?.reason ?? '';
@@ -320,7 +363,9 @@ class CompactionService {
     final int limit = (budget.value * thresholdFor(agent)).round();
     final int? live = livePromptTokens;
     final bool byReal = live != null && live > 0;
-    final int used = byReal ? (live ?? 0) : estimateContextTokens(agent, session);
+    final int used = byReal
+        ? (live ?? 0)
+        : estimateContextTokens(agent, session);
     if (!force && used <= limit) return null;
     final String caliber = byReal ? '真实用量' : '估算';
     log?.call(

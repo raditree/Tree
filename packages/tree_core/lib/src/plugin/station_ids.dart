@@ -188,10 +188,44 @@ abstract final class StationHubIds {
   /// 即认「有中转站」，让**热切换窗口**（先订上站点 vs 先跑起 tunnel 方法）两种顺序都稳定。
   static const String relaySshExecute = 'system.relay.ssh.execute';
 
+  /// 中转站·工具结果**修复文案由谁写**（阶段 6 A 级；槽 `LlmAgentEngine.toolResultRepair`）。
+  ///
+  /// 与 `tool.post` 的分界：post 发生在工具**正常返回**时（结果本来就是插件产的），
+  /// 这一条只在核心**判出一段结果坏了之后**触发（接管的是“那句修复说明写什么”，
+  /// 不是“谁来写库”——落库与播帧永远走内置那一条路）。
+  static const String relayToolRepair = 'system.relay.tool.repair';
+
+  /// 中转站·工具结果**探针由谁回答**（阶段 6 A 级；槽 `LlmAgentEngine.toolResultProbe`）。
+  ///
+  /// 批收尾用它判断某次调用是否已有结果在库；插件接管意味着“结果在插件那一侧”，
+  /// 因此这条是真正需要被改写的判据（而不仅仅是旁路观测）。
+  static const String relayToolProbe = 'system.relay.tool.probe';
+
+  /// 中转站·LLM 运行中请求的**登记回执由谁产出**（阶段 6 A 级；槽 `llmRequestRegistrar`）。
+  ///
+  /// 注意这里的接管只能是「附加」：内置登记表**永远建立**（它是流式可关闭性的
+  /// 唯一执行点），插件收到的是登记通告 + 可回一份回执。取消 / 关闭权**不在这条上**。
+  static const String relayLlmRegister = 'system.relay.llm.register';
+
+  /// 中转站·压缩**没接管的原因文案由谁写**（阶段 6 A 级；槽 `compactionSkipSink`）。
+  ///
+  /// 核心先按内置文案立即记账（保证可读不依赖插件），再把这条投给订阅者；
+  /// 插件回一句更准的说法就**覆盖那一条记录**（同一轮压缩收尾前生效）。
+  static const String relayCompactSkipReason =
+      'system.relay.compact.skip.reason';
+
   // ── 收集站（一对多收集 + 汇聚；不回填原数据流） ──────────────────────────
 
   /// 收集站·插件定义 tool（系统自带；收集站的接入点）。
   static const String collect = 'plugin.tool.define';
+
+  /// 收集站·插件**自定义点位（capability）**的申报口（阶段 6 A 级）。
+  ///
+  /// 与 [collect] 同形态（申报 / 覆盖申报 / 撤申报、按 plugin_id 销账），申报的是
+  /// **点位**而不是工具：框架自演进时，「核心里那个 switch 不认识的新事件」应当能由
+  /// 插件自己声明出去，而不是每次都要核心加一个点位常量 + 一个投递口。
+  /// 申报**必须带 schema**（不带的直接拒），否则核心面板与插件之间必然漂。
+  static const String collectCapability = 'plugin.capability.define';
 
   // ── 退役 id（**只用于读侧迁移**，不再是实例 id） ─────────────────────────
 
@@ -237,7 +271,12 @@ abstract final class StationHubIds {
     relayContextCompact,
     relayPromptSystem,
     relaySshExecute,
+    relayToolRepair,
+    relayToolProbe,
+    relayLlmRegister,
+    relayCompactSkipReason,
     collect,
+    collectCapability,
   };
 
   /// 退役 id 集合（迁移判定用；它们不再出现在 [all] 里）。

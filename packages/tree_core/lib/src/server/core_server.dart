@@ -787,6 +787,95 @@ class CoreServer {
       // 「中转站为什么没接管」的回程：总线每处"不接管"分支 → 压缩结论
       // （REST 可选键 `relay_skip_reason` / 会话里的压缩提示），不再只进 stderr。
       bus.compactionSkipSink = compactionService.noteRelaySkip;
+      // 阶段 6（中转点位 `compact.skip.reason`）：插件可以把这句原因写得更准。
+      // 内置那句已经先记账（可读性不依赖插件），这里只给“覆盖还账上那一条”的口子。
+      bus.compactionSkipAnnotator = compactionService.annotateRelaySkip;
+    }
+    // 阶段 6 A 级：把三个「接管只能是附加 / 改写文案」的槽换成**复合实现**。
+    //
+    // 上面已经无条件接好了内置那一份（没插件时就是原行为），这里把它抢下来包一层：
+    // 先问中转点位，**没接管就逐字回内置**（fail-open）。为什么不在引擎里直接调
+    // 总线：引擎与 LlmSession 都不认识插件总线（上面那段接线的理由在这里同样成立）。
+    if (engine is LlmAgentEngine) {
+      final builtInRepair = engine.toolResultRepair;
+      final builtInProbe = engine.toolResultProbe;
+      final builtInRegistrar = engine.llmRequestRegistrar;
+      if (builtInRepair != null) {
+        // 接管的是“那句修复说明写什么”：落库与 `tool_end` 帧仍然只走内置那一条路。
+        engine.toolResultRepair =
+            ({
+              required String agentId,
+              required String sessionId,
+              required String toolCallId,
+              required String toolName,
+              required String result,
+            }) async {
+              final String? better = await bus.relayToolRepairText(
+                agentId: agentId,
+                sessionId: sessionId,
+                toolCallId: toolCallId,
+                toolName: toolName,
+                text: result,
+              );
+              return builtInRepair(
+                agentId: agentId,
+                sessionId: sessionId,
+                toolCallId: toolCallId,
+                toolName: toolName,
+                result: better ?? result,
+              );
+            };
+      }
+      if (builtInProbe != null) {
+        engine.toolResultProbe =
+            ({
+              required String agentId,
+              required String sessionId,
+              required String toolCallId,
+            }) async {
+              final verdict = await bus.relayToolProbe(
+                agentId: agentId,
+                sessionId: sessionId,
+                toolCallId: toolCallId,
+              );
+              // 没接管 ⇒ 内置探针（查库）；接管了 ⇒ 插件说“有”就用它那段，说“没有”就
+              // 回 null（与库里没查到是同一个可观测形状，但**不再查库**：结果在插件那侧）。
+              if (verdict == null) {
+                return builtInProbe(
+                  agentId: agentId,
+                  sessionId: sessionId,
+                  toolCallId: toolCallId,
+                );
+              }
+              return verdict.found ? verdict.text : null;
+            };
+      }
+      if (builtInRegistrar != null) {
+        // **内置登记表永远先建立**（它是流式可关闭性的唯一执行点），这里只是在登记
+        // 之后多递一份通告；取消 / 关闭 / 判死三个动作仍然只在核心里（不变量 4 / 15）。
+        engine.llmRequestRegistrar =
+            ({
+              required String agentId,
+              required String sessionId,
+              required String model,
+              required int turn,
+            }) {
+              final guard = builtInRegistrar(
+                agentId: agentId,
+                sessionId: sessionId,
+                model: model,
+                turn: turn,
+              );
+              bus.relayLlmRegisterNotice(
+                handle: guard.handle,
+                agentId: agentId,
+                sessionId: sessionId,
+                model: model,
+                turn: turn,
+              );
+              return guard;
+            };
+      }
     }
     // **逐调用用量**（`<会话目录>/usage.jsonl`）：插件读不到数据根（它的 `fs.read`
     // 只在工作空间作用域内），而"这次压缩花了多少 token / 内置兜底那次花了多少"

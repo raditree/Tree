@@ -13,12 +13,16 @@ import 'station_store.dart';
 /// **站点类型四种，每类下有若干点位（point），每个点位是一个独立的全局实例**
 /// （点位化，2026-10-01）：
 ///
-/// - 广播站 4 个：`system.broadcast`（通用主题）/ `.tool.pre` / `.tool.post` / `.tool.timeout`
-/// - 执行站 8 个（按命令族）：`system.execute.fs` / `.terminal` / `.agent` / `.ui` /
-///   `.llm` / `.tool` / `.session` / `.ssh`
-/// - 中转站 7 个（每个各自唯一订阅者）：`system.relay.tool.pre` / `.tool.post` /
+/// - 广播站 10 个：`system.broadcast`（通用主题）/ `.tool.pre` / `.tool.post` /
+///   `.tool.timeout` / `.plugin.state` + 阶段 6 五个：`.turn.done` / `.turn.cancelled` /
+///   `.turn.error` / `.ask.paused` / `.config.changed`
+/// - 执行站 11 个（按命令族）：`system.execute.fs` / `.terminal` / `.agent` / `.ui` /
+///   `.llm` / `.tool` / `.session` / `.ssh` + `.plugin` / `.station` / `.usage`
+/// - 中转站 11 个（每个各自唯一订阅者）：`system.relay.tool.pre` / `.tool.post` /
 ///   `.llm.handle` / `.llm.request` / `.context.compact` / `.prompt.system` / `.ssh.execute`
-/// - 收集站 1 个：`plugin.tool.define`（**不预建**，见 [ensureBuiltinStations]）
+///   + 阶段 6 四个：`.tool.repair` / `.tool.probe` / `.llm.register` / `.compact.skip.reason`
+/// - 收集站 2 个：`plugin.tool.define` 与 `plugin.capability.define`（**都不预建**，
+///   见 [ensureBuiltinStations]：schema 就是接入点定义的输入格式）
 ///
 /// 点位的类型 / 说明 / 命令 / 别名表在 `station_points.dart`（加点位只改那张表）。
 /// **id 不含 team / mode**：team / agent / session / mode 是**每次交互携带的信封**
@@ -52,6 +56,58 @@ class StationHub {
 
   /// 收集站（插件定义 tool，首个接入点）基础 id。
   static const String toolDefineBaseId = StationHubIds.collect;
+
+  /// 收集站（插件定义**点位 / capability**，阶段 6 新增）基础 id。
+  static const String capabilityDefineBaseId = StationHubIds.collectCapability;
+
+  /// 点位定义收集站的 schema（**接入点定义的输入格式**）。
+  ///
+  /// 形状 = {capabilities: [ {capability_id, direction, event, description, schema}, ... ]}：
+  /// 与工具定义同构（一次申报全部），但**每一项的 `schema` 必须非空**（那一条为空就只丢
+  /// 那一条）：没有字段表的点位，核心面板与插件之间一定漂。
+  static const StationSchema capabilityDefinitionSchema = StationSchema(
+    description: '插件点位（capability）申报清单（每项覆盖点位 id / 方向 / 事件 / 字段表）',
+    fields: <StationSchemaField>[
+      StationSchemaField(
+        name: 'capabilities',
+        type: StationFieldType.array,
+        required: true,
+        description: '本插件申报的点位列表（每项一条；没有时给空数组）',
+        fields: <StationSchemaField>[
+          StationSchemaField(
+            name: 'capability_id',
+            type: StationFieldType.string,
+            required: true,
+            description: '点位名（插件内唯一；登记时命名空间化为 plugin.插件id.点名）',
+          ),
+          StationSchemaField(
+            name: 'direction',
+            type: StationFieldType.string,
+            required: true,
+            description: '方向：push（插件往外发）| pull（核心来采集）',
+          ),
+          StationSchemaField(
+            name: 'event',
+            type: StationFieldType.string,
+            required: true,
+            description: '事件名（对方按它过滤；与核心点位同口径的一个字符串）',
+          ),
+          StationSchemaField(
+            name: 'description',
+            type: StationFieldType.string,
+            required: false,
+            description: '人话说明（进面板与拓扑读数）',
+          ),
+          StationSchemaField(
+            name: 'schema',
+            type: StationFieldType.object,
+            required: true,
+            description: '字段表（**必须非空**：不申报字段表的点位不会被登记）',
+          ),
+        ],
+      ),
+    ],
+  );
 
   /// 工具定义收集站的 schema（**站点定义输入格式**：插件必须按它产出）。
   ///
@@ -160,7 +216,8 @@ class StationHub {
     _loaded = true;
     // 读侧迁移：旧格式（baseId@team@mode）与退役 id 在这里被归并到现役点位。
     // [log] 只报告"发生了什么"，不阻塞启动；归并结果立刻写回一次，此后幂等。
-    final ({List<StationInstance> stations, bool migrated}) loaded = _store.load();
+    final ({List<StationInstance> stations, bool migrated}) loaded = _store
+        .load();
     int rebuilt = 0;
     for (final StationInstance station in loaded.stations) {
       // 内置 id 的类型以**点位表**为准：落盘写错了类型就按表重建（并记可读日志），
@@ -328,7 +385,7 @@ class StationHub {
     );
   }
 
-  /// **确保全部内置点位存在**（21 个：广播 5 + 执行 9 + 中转 7；收集站除外）。
+  /// **确保全部内置点位存在**（32 个：广播 10 + 执行 11 + 中转 11；收集站除外）。
   ///
   /// 为什么需要这一步：[pointFor] 是**懒创建**（首次使用时才实例化）。按需开销为零
   /// 是好事，代价却是"没配插件 / 没人用过"时一个点位都没有——面板上就是
@@ -358,7 +415,7 @@ class StationHub {
     // 一批预建只落一次盘（每个点位的懒创建都会 save 一次，不合并就是二十几次写）
     _saveSuspend++;
     try {
-      // 全部内置点位（广播 10 + 执行 11 + 中转 7 = 28）预建；**收集站不预建**（见下）。
+      // 全部内置点位（广播 10 + 执行 11 + 中转 11 = 32）预建；**收集站不预建**（见下）。
       for (final StationPointSpec spec in StationPoints.all) {
         if (spec.kind == StationKind.collect) continue;
         _ensureOneBuiltin(() => pointFor(spec.id), created);
@@ -403,6 +460,25 @@ class StationHub {
       description: '收集站（系统自带）：插件按 schema 申报工具定义（名称/描述/参数/执行方式）',
       readme: StationPoints.byId(id)?.readme ?? '',
       schema: toolDefinitionSchema,
+      builtin: true,
+    );
+    _register(station);
+    return station;
+  }
+
+  /// 点位定义（capability）收集站：与工具定义同形态，**由接入点现建**（schema 就是
+  /// 输入格式）。没它的时候（插件未启用 / 总线未接）调用方拿到 null 就跳过这一路。
+  CollectStation? capabilityDefineStationFor() {
+    load();
+    const String id = capabilityDefineBaseId;
+    final StationInstance? existing = _stations[id];
+    if (existing is CollectStation) return existing;
+    if (existing != null) return null;
+    final CollectStation station = CollectStation(
+      id: id,
+      description: '收集站（系统自带）：插件按 schema 申报自己认得的点位（名字/事件/字段/方向）',
+      readme: StationPoints.byId(id)?.readme ?? '',
+      schema: capabilityDefinitionSchema,
       builtin: true,
     );
     _register(station);
@@ -494,9 +570,7 @@ class StationHub {
     }
     _stations.remove(stationId);
     save();
-    log?.call(
-      '站点已注销：$stationId（连带 ${station.subscribers.length} 条订阅）',
-    );
+    log?.call('站点已注销：$stationId（连带 ${station.subscribers.length} 条订阅）');
     return true;
   }
 

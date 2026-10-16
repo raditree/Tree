@@ -196,7 +196,7 @@ void main() {
     expect(tableToolNames(bus), contains('marker'));
     expect(bus.toolTableDirty, isFalse, reason: '对账后按既有机制补了一次收集');
     // 站点订阅：插件上线 ⇒ 收集站挂上它
-    expect(subscribedStations(bus, 'alpha'), hasLength(1));
+    expect(subscribedStations(bus, 'alpha'), hasLength(2));
   });
 
   test('对账：启动参数未变 ⇒ 不重启（启动次数不增加）', () async {
@@ -266,10 +266,15 @@ void main() {
     expect(ids(byScope.restarted), <String>['alpha']);
     expect(byScope.actionOf('alpha')!.reason, contains('scope'));
     expect(startCount('alpha'), 3);
-    expect(subscribedStations(bus, 'alpha'), <String>[StationHubIds.collect]);
+    expect(subscribedStations(bus, 'alpha'), <String>[
+      StationHubIds.collectCapability,
+      StationHubIds.collect,
+    ], reason: '一个插件同时挂两个收集站（工具申报 + 点位申报）');
     final Map<String, dynamic> collectStation =
         (bus.snapshot()['stations'] as List<dynamic>).firstWhere(
-          (dynamic s) => (s as Map<String, dynamic>)['kind'] == 'collect',
+          (dynamic s) =>
+              (s as Map<String, dynamic>)['station_id'] ==
+              StationHubIds.collect,
         ) as Map<String, dynamic>;
     expect(collectStation['subscribers_by_team'], <String, dynamic>{
       'team-2': <String, dynamic>{
@@ -279,8 +284,8 @@ void main() {
     }, reason: '团队归属在订阅声明上：重启后只剩 team-2 这一条（旧订阅已注销）');
     expect(
       bus.snapshot()['stations'],
-      hasLength(29),
-      reason: '收集站全局唯一：换团队不产生新站；快照恒为 28 个内置点位 + 收集站',
+      hasLength(34),
+      reason: '收集站全局唯一：换团队不产生新站；快照恒为 32 个内置点位 + 两个收集站',
     );
   });
 
@@ -288,7 +293,7 @@ void main() {
     writeConfigs(pluginEntry('alpha'));
     final PluginBus bus = newBus();
     await bus.start();
-    expect(subscribedStations(bus, 'alpha'), hasLength(1));
+    expect(subscribedStations(bus, 'alpha'), hasLength(2));
 
     writeConfigs(pluginEntry('alpha', enabled: false));
     final PluginReconcileResult report = await bus.applyConfigs();
@@ -313,7 +318,7 @@ void main() {
     expect(ids(reopened.started), <String>['alpha']);
     expect(startCount('alpha'), 2);
     expect(bus.toolsOf('alpha'), hasLength(1));
-    expect(subscribedStations(bus, 'alpha'), hasLength(1));
+    expect(subscribedStations(bus, 'alpha'), hasLength(2));
   });
 
   test('对账：条目被删除 ⇒ 断开并忘掉（配置与实例都没了）', () async {
