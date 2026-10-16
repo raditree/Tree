@@ -80,8 +80,11 @@ class _FakeAdmin implements PluginAdminClient {
       <String, dynamic>{'ok': true};
 
   @override
-  Future<Map<String, dynamic>> restartConfig(String id) async =>
-      <String, dynamic>{'ok': true};
+  Future<Map<String, dynamic>> restartConfig(
+    String id, {
+    String mode = 'cold',
+    bool keepState = true,
+  }) async => <String, dynamic>{'ok': true};
 
   @override
   Future<Map<String, dynamic>> setBuiltinEnabled(

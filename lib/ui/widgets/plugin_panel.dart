@@ -32,8 +32,15 @@ abstract class PluginAdminClient {
   /// 删除一个自定义插件。
   Future<Map<String, dynamic>> deleteConfig(String id);
 
-  /// 显式重启一个插件实例。
-  Future<Map<String, dynamic>> restartConfig(String id);
+  /// 显式处置一个插件实例。
+  ///
+  /// [mode]：`cold`（缺省，与旧行为逐字一致）/ `hot`（热重启，尽量续跑）/
+  /// `force_stop`（**用户显式**强制停止：全框架唯一能因为界面按钮而 kill 的入口）。
+  Future<Map<String, dynamic>> restartConfig(
+    String id, {
+    String mode = 'cold',
+    bool keepState = true,
+  });
 
   /// 打开 / 关闭一个内置插件（每项各自一个开关）。
   Future<Map<String, dynamic>> setBuiltinEnabled(
@@ -102,8 +109,11 @@ class ApiPluginAdminClient implements PluginAdminClient {
       ApiService.deletePluginConfig(id);
 
   @override
-  Future<Map<String, dynamic>> restartConfig(String id) =>
-      ApiService.restartPluginConfig(id);
+  Future<Map<String, dynamic>> restartConfig(
+    String id, {
+    String mode = 'cold',
+    bool keepState = true,
+  }) => ApiService.restartPluginConfig(id, mode: mode, keepState: keepState);
 
   @override
   Future<Map<String, dynamic>> setBuiltinEnabled(
@@ -307,11 +317,17 @@ class _PluginPanelState extends State<PluginPanel> {
     String id,
     Future<Map<String, dynamic>> Function() action, {
     String successText = '',
+    String Function(Map<String, dynamic> result)? successFrom,
   }) async {
     setState(() => _busy.add(id));
     try {
       final Map<String, dynamic> result = await action();
-      _showWriteResult(result, successText: successText);
+      // 热重启的“成功”有两层意思（续上了 / 只是换了一世），必须分开说；
+      // 拿一个固定文案就等于把“状态其实没续上”报成了一件好事。
+      _showWriteResult(
+        result,
+        successText: successFrom == null ? successText : successFrom(result),
+      );
       await _loadAdmin();
       await _svc.refresh();
     } catch (error) {
@@ -516,6 +532,83 @@ class _PluginPanelState extends State<PluginPanel> {
 
   Future<void> _restart(String id) =>
       _submit(id, () => _admin.restartConfig(id), successText: '已重启插件 $id');
+
+  /// 热重启（保留状态）：文案跟着回包的 `resumed` 走 —— “换了一世”与“续上了”是两件事。
+  ///
+  /// 目标没声明 `suspension: keep` 时核心**按冷启动**完成重启（那不算失败，
+  /// D3 的定型语义）；这里如果只说“已重启”，用户会以为状态还在。
+  Future<void> _hotRestart(String id) => _submit(
+    id,
+    () => _admin.restartConfig(id, mode: 'hot'),
+    successFrom: (Map<String, dynamic> result) => result['resumed'] == true
+        ? '已热重启插件 $id，状态续到了第 ${result['generation'] ?? '?'} 代'
+        : '已重启插件 $id，但按冷启动（目标没声明 suspension: keep 或没递快照）'
+              '：这不是失败，但状态确实没续上',
+  );
+
+  /// 强制停止：**用户显式动作**，全框架唯一能因界面按钮而 `kill()` 的入口（D8）。
+  ///
+  /// 所以上面有确认对话框；而看门狗 / 心跳 / “跑得太久”都不得走到这里。
+  Future<void> _forceStop(String id) async {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext ctx) => AlertDialog(
+        title: const Text('强制停止这个插件？'),
+        content: Text(
+          '先按优雅路径要求它退出；它没走完时会被显式 kill。\n'
+          '站点订阅、工具表与 UI 槽位会一并收掉。\n'
+          '注意：条目仍是启用时，下一次对账会把它再拉起来 —— 想不再跑请关掉开关。',
+          style: const TextStyle(fontSize: 12),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            key: const Key('plugin-force-stop-confirm'),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            style: FilledButton.styleFrom(backgroundColor: cs.error),
+            child: const Text('强制停止'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    await _submit(
+      id,
+      () => _admin.restartConfig(id, mode: 'force_stop'),
+      successFrom: (Map<String, dynamic> result) =>
+          (result['killed'] as num? ?? 0).toInt() > 0
+              ? '已强制停止插件 $id（显式 kill；原因已记进日志）'
+              : '已停止插件 $id（它自己走完了，没需要强杀）',
+    );
+  }
+
+  /// 卡片的两个新动作（热重启 / 强制停止），放在既有按钮行**下面一行**。
+  ///
+  /// 为什么不挤进原来那行：五个 TextButton 在右栏那个宽度上会直接 RenderFlex 溢出
+  /// （而溢出在 widget 测试里是以异常计数的，不是一个“看得到但拖一下”的小问题）；
+  /// 用 [Wrap] 单独一行既能自适应也不丢可读性。
+  List<Widget> _lifecycleActions(String id) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return <Widget>[
+      TextButton(
+        key: Key('plugin-hot-restart-$id'),
+        onPressed: _busy.contains(id) ? null : () => _hotRestart(id),
+        child: const Text('热重启（保留状态）', style: TextStyle(fontSize: 12)),
+      ),
+      TextButton(
+        key: Key('plugin-force-stop-$id'),
+        onPressed: _busy.contains(id) ? null : () => _forceStop(id),
+        child: Text(
+          '强制停止',
+          style: TextStyle(fontSize: 12, color: cs.error),
+        ),
+      ),
+    ];
+  }
 
   Future<void> _delete(Map<String, dynamic> entry) async {
     final String id = (entry['id'] ?? '').toString();
@@ -927,6 +1020,8 @@ class _PluginPanelState extends State<PluginPanel> {
               ),
             ],
           ),
+          // 热重启 / 强制停止（阶段 3）：只对已落盘的内置项开放。
+          if (configured) Wrap(spacing: 4, children: _lifecycleActions(id)),
           _detailAffordance(cs, '看插件介绍与工具'),
         ],
       ),
@@ -1040,6 +1135,9 @@ class _PluginPanelState extends State<PluginPanel> {
               ),
             ],
           ),
+          // 热重启 / 强制停止（阶段 3）：与「重启」并列而不是替掉它 ——
+          // 三件事对用户的差别是“会不会丢状态”与“是不是必须立即停下”。
+          Wrap(spacing: 4, children: _lifecycleActions(id)),
           _detailAffordance(cs, '看插件介绍与工具'),
         ],
       ),

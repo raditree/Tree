@@ -170,8 +170,13 @@ class _FakeAdmin implements PluginAdminClient {
   }
 
   @override
-  Future<Map<String, dynamic>> restartConfig(String id) async {
-    calls.add('restart:$id');
+  Future<Map<String, dynamic>> restartConfig(
+    String id, {
+    String mode = 'cold',
+    bool keepState = true,
+  }) async {
+    // 记下的 mode 就是本文件那两条新用例的证据面：界面到底把哪三种做法发给了核心。
+    calls.add('restart:$id:$mode');
     if (failWrite.isNotEmpty) throw Exception(failWrite);
     return writeResponse;
   }
@@ -288,12 +293,71 @@ void main() {
     expect(find.byKey(const Key('plugin-edit-demo')), findsOneWidget);
     expect(find.byKey(const Key('plugin-delete-demo')), findsOneWidget);
     expect(find.byKey(const Key('plugin-restart-demo')), findsOneWidget);
+    // 阶段 3：热重启（保留状态）与强制停止与「重启」并列，不是替掉它
+    expect(find.byKey(const Key('plugin-hot-restart-demo')), findsOneWidget);
+    expect(find.byKey(const Key('plugin-force-stop-demo')), findsOneWidget);
     // 清单真实路径与生效方式必须显示
     expect(
       find.textContaining('清单文件：C:/data/config/plugins.yaml'),
       findsOneWidget,
     );
     expect(find.textContaining('保存后立即热应用；热应用失败时重启核心生效'), findsOneWidget);
+  });
+
+  testWidgets('热重启把 mode=hot 发给核心，resumed=true 时说清“续到了第几代”', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin()
+      ..writeResponse = <String, dynamic>{
+        'ok': true,
+        'resumed': true,
+        'generation': 3,
+      };
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+
+    await tester.tap(find.byKey(const Key('plugin-hot-restart-demo')));
+    await tester.pumpAndSettle();
+    expect(admin.calls, contains('restart:demo:hot'));
+    expect(find.textContaining('状态续到了第 3 代'), findsOneWidget);
+  });
+
+  testWidgets('热重启遇到 resumed=false ⇒ 说“按冷启动”，不当成功报（那确实没续上）', (WidgetTester tester) async {
+    // 单独一个用例而不是同一个里连点两次：SnackBar 是**排队**的，第二句要等第一句
+    // 自己消完才出现（而测试里的时长不会自己流逝）—— 这不是被测代码的毛病，
+    // 但把它当成“验一验能验两条”的陷阱写在一个用例里，就只能靠 pump 时长去猜。
+    final _FakeAdmin admin = _FakeAdmin()
+      ..writeResponse = <String, dynamic>{'ok': true, 'resumed': false};
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+
+    await tester.tap(find.byKey(const Key('plugin-hot-restart-demo')));
+    await tester.pumpAndSettle();
+    expect(admin.calls, contains('restart:demo:hot'));
+    expect(find.textContaining('按冷启动'), findsOneWidget);
+    expect(find.textContaining('状态确实没续上'), findsOneWidget);
+    expect(
+      find.textContaining('状态续到了'),
+      findsNothing,
+      reason: '没续上就不许说成续上了（那会把一次冷启动报成好事）',
+    );
+  });
+
+  testWidgets('强制停止要先确认，确认后才是 mode=force_stop（取消就什么都不发）', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin()
+      ..writeResponse = <String, dynamic>{'ok': true, 'killed': 1};
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+
+    await tester.tap(find.byKey(const Key('plugin-force-stop-demo')));
+    await tester.pumpAndSettle();
+    expect(find.text('强制停止这个插件？'), findsOneWidget);
+    // 取消：一个写请求也不该发出去（强杀是唯一能 kill 用户进程的按钮）。
+    await tester.tap(find.text('取消'));
+    await tester.pumpAndSettle();
+    expect(admin.calls, isNot(contains('restart:demo:force_stop')));
+
+    await tester.tap(find.byKey(const Key('plugin-force-stop-demo')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('plugin-force-stop-confirm')));
+    await tester.pumpAndSettle();
+    expect(admin.calls, contains('restart:demo:force_stop'));
+    expect(find.textContaining('显式 kill'), findsOneWidget);
   });
 
   testWidgets('每项开关各自打各自的接口', (WidgetTester tester) async {

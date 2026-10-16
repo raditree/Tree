@@ -680,8 +680,9 @@ plugins:
   时（**先转储、等回包、再 ack**）与 `hello` 完成后（问一次“有没有我的快照”）。
 * **每一次控制面动作都进审计**（谁 / 何时 / 目标 / 结论），一行一条；快照两条不记。
   自重启那一条记的是“已受理”，结论在紧随其后的“自重启收尾”行里。
-* **“强制停止”只能由用户按**：REST `POST /api/plugins/<id>/restart` 的 body `mode`
-  可取 `cold`（缺省，与旧请求逐字一致）/ `hot` / `force_stop`，第三个值是全框架
+* **“强制停止”只能由用户按**：`ApiPaths.pluginConfigRestart`
+  （`POST /api/plugin/configs/{pluginId}/restart`）的 body `mode`
+  可取 `cold`（缺省，不带 body ⇒ 与旧请求逐字一致）/ `hot` / `force_stop`，第三个值是全框架
   **唯一**能因为一个按钮而 `kill()` 的入口（核心自己从不因为时长杀插件）。
 
 写自己的插件时能拿到的两个现成好处：声明 `suspension: keep` ⇒ 面板上的“热重启（保留状态）”

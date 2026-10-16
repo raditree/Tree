@@ -1063,12 +1063,27 @@ class ApiService {
     return _deleteJson('/api/plugin/configs/$encoded');
   }
 
-  /// 显式重启一个插件实例：POST /api/plugin/configs/{id}/restart
+  /// 显式处置一个插件实例：POST /api/plugin/configs/{id}/restart。
   ///
-  /// 这是唯一真正作用到运行中总线上的操作（心跳 degraded 之后手动恢复用）。
-  static Future<Map<String, dynamic>> restartPluginConfig(String id) async {
+  /// 这是唯一真正作用到运行中总线上的操作（心跳 degraded 之后手动恢复、改完配置立刻
+  /// 按新参数拉起、以及热重启 / 强制停止）。
+  ///
+  /// [mode] 三种做法（同一个路径，不新开 API）：
+  /// - `cold`（缺省）：冷重启 —— **不带 body**，旧核心与新核心看到的请求逐字一致；
+  /// - `hot`：热重启（请插件转储、新一世取回续跑），回包带 `resumed` / `generation`；
+  /// - `force_stop`：用户显式强制停止 —— 全框架唯一能因为界面按钮而 `kill()` 的入口。
+  static Future<Map<String, dynamic>> restartPluginConfig(
+    String id, {
+    String mode = 'cold',
+    bool keepState = true,
+  }) async {
     final String encoded = Uri.encodeComponent(id);
-    return _postJson('/api/plugin/configs/$encoded/restart');
+    final String path = '/api/plugin/configs/$encoded/restart';
+    if (mode == 'cold') return _postJson(path);
+    return _postJson(path, body: <String, dynamic>{
+      'mode': mode,
+      if (mode == 'hot') 'keep_state': keepState,
+    });
   }
 
   /// 内置插件目录：GET /api/plugin/builtins

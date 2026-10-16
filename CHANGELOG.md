@@ -38,8 +38,8 @@
   - **「强制停止」是全框架唯一能因为界面按钮而 `kill()` 的入口**（`PluginBus.forceStop`）：
     D8 不许的是**时长**判死，不是用户显式动作；它同时覆盖实例表与收尸台账两处目标，停完
     逐个数退出确认，并如实说明“条目仍启用 ⇒ 下一次对账会再拉起来”。REST 仍是**同一条**
-    `POST /api/plugins/<id>/restart` 扩展 body `mode ∈ {cold, hot, force_stop}`（`cold` 缺省不带 body
-    ⇒ 旧请求逐字一致；未知值显式拒），不新开路径。
+    `ApiPaths.pluginConfigRestart`（`/api/plugin/configs/{pluginId}/restart`）扩展 body
+    `mode ∈ {cold, hot, force_stop}`（`cold` 缺省不带 body ⇒ 旧请求逐字一致；未知值显式拒），不新开路径。
   - **内置清单必须显式带 `suspension`**（**修改**不变量 25 的落点）：`PluginConfig.fromJson` 不保留
     未知键 ⇒ 清单不写这一项，落盘条目就永远没有它 ⇒ “声明了可挂起的内置插件”被冷重启，而界面上
     看上去就是“状态莫名没了”。`self_updater` = `kind: binary` + `granularity: team` + `scope: {}` +
