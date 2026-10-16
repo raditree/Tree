@@ -23,6 +23,10 @@ class _FakeAdmin implements PluginAdminClient {
   String failRead = '';
   String failWrite = '';
 
+  /// 清单响应（默认那一条**没有**来源键 = 本机自己写的条目；用例可换成带
+  /// `source` / `repo_version` 的那一条，用来钉详情页的「来源」行）。
+  Map<String, dynamic> configsResponse = _configs();
+
   static Map<String, dynamic> _configs() => <String, dynamic>{
     'path': 'C:/data/config/plugins.yaml',
     'configs': <dynamic>[
@@ -50,16 +54,13 @@ class _FakeAdmin implements PluginAdminClient {
         'description': '核心自带的示例插件（Python）',
         'enabled': true,
         'configured': false,
-        'resolution': <String, dynamic>{
-          'ok': false,
-          'error': '本机没装 Python',
-        },
+        'resolution': <String, dynamic>{'ok': false, 'error': '本机没装 Python'},
       },
     ],
   };
 
   @override
-  Future<Map<String, dynamic>> fetchConfigs() async => _configs();
+  Future<Map<String, dynamic>> fetchConfigs() async => configsResponse;
 
   @override
   Future<Map<String, dynamic>> fetchBuiltins({bool refresh = false}) async =>
@@ -123,6 +124,29 @@ class _FakeAdmin implements PluginAdminClient {
     calls.add('sub:$stationId|$subscriberKey|disabled=$disabled');
     if (failWrite.isNotEmpty) throw Exception(failWrite);
     return stationResponses[stationId]!;
+  }
+
+  // ── 发布仓库（阶段 5）：详情页不拉它，但接口要求实现 ⇒ 给最简的假面 ──────
+
+  @override
+  Future<Map<String, dynamic>> fetchRelease() async => <String, dynamic>{
+    'ok': false,
+    'error': '没有缓存',
+    'entries': <dynamic>[],
+  };
+
+  @override
+  Future<Map<String, dynamic>> refreshRelease() async => <String, dynamic>{
+    'ok': false,
+    'error': '没有缓存',
+    'entries': <dynamic>[],
+  };
+
+  @override
+  Future<Map<String, dynamic>> installRelease(String id) async {
+    calls.add('release-install:$id');
+    if (failWrite.isNotEmpty) throw Exception(failWrite);
+    return <String, dynamic>{'ok': true};
   }
 }
 
@@ -203,10 +227,7 @@ Map<String, dynamic> _snapshot() => <String, dynamic>{
       ],
     },
   ],
-  'stations': <dynamic>[
-    _selfBuiltStation(),
-    _builtinStation(),
-  ],
+  'stations': <dynamic>[_selfBuiltStation(), _builtinStation()],
   'config': <String, dynamic>{'path': 'C:/data/config/plugins.yaml'},
 };
 
@@ -253,10 +274,7 @@ void main() {
     await tester.pumpAndSettle();
 
     // 介绍（清单里那句 description，卡片上只显示一行，详情页给全文）
-    expect(
-      find.textContaining('把工具公告转发给队友，并把执行结果收回来'),
-      findsWidgets,
-    );
+    expect(find.textContaining('把工具公告转发给队友，并把执行结果收回来'), findsWidgets);
     // 基本信息
     expect(find.text('基本信息'), findsOneWidget);
     expect(find.textContaining('python demo.py'), findsOneWidget);
@@ -268,22 +286,39 @@ void main() {
       findsNothing,
       reason: '这一项是自定义插件',
     );
-    expect(find.descendant(of: detail, matching: find.text('自定义插件')), findsOneWidget);
+    expect(
+      find.descendant(of: detail, matching: find.text('自定义插件')),
+      findsOneWidget,
+    );
     // 工具表（按插件对账的运行态，两条都在）
     expect(find.text('提供的工具（2）'), findsOneWidget);
     expect(find.text('demo.echo'), findsOneWidget);
     expect(find.text('回显一句话'), findsOneWidget);
     // 它建的站点 / 它订阅的站点：audit 这条既是 demo 建的、也被 demo 订阅 ⇒ 两个区块各列一次；
     // demo 还订阅了内置广播站 ⇒ 订阅那一栏是 2 条。全部限定在详情页内（面板还在路由下方）。
-    expect(find.descendant(of: detail, matching: find.text('它建的站点（1）')), findsOneWidget);
-    expect(find.descendant(of: detail, matching: find.text('它订阅的站点（2）')), findsOneWidget);
     expect(
-      find.descendant(of: detail, matching: find.text('plugin.demo.relay.audit')),
+      find.descendant(of: detail, matching: find.text('它建的站点（1）')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: detail, matching: find.text('它订阅的站点（2）')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: detail,
+        matching: find.text('plugin.demo.relay.audit'),
+      ),
       findsNWidgets(2),
     );
-    expect(find.descendant(of: detail, matching: find.text('system.broadcast')), findsOneWidget);
     expect(
-      find.text('这个插件没有写介绍。点卡片上的「编辑」，在「介绍」里补一段（落盘 plugins.yaml 的 description）。'),
+      find.descendant(of: detail, matching: find.text('system.broadcast')),
+      findsOneWidget,
+    );
+    expect(
+      find.text(
+        '这个插件没有写介绍。点卡片上的「编辑」，在「介绍」里补一段（落盘 plugins.yaml 的 description）。',
+      ),
       findsNothing,
     );
   });
@@ -330,7 +365,9 @@ void main() {
     );
     await _pump(tester, svc: await _service(), admin: admin);
 
-    await tester.tap(find.byKey(const Key('station-detail-plugin.demo.relay.audit')));
+    await tester.tap(
+      find.byKey(const Key('station-detail-plugin.demo.relay.audit')),
+    );
     await tester.pumpAndSettle();
 
     // 详情页一定去 GET 一次（卡片那份是节流的快照，写操作要落在当前真值上）
@@ -380,7 +417,9 @@ void main() {
       },
     );
     await _pump(tester, svc: await _service(), admin: admin);
-    await tester.tap(find.byKey(const Key('station-detail-plugin.demo.relay.audit')));
+    await tester.tap(
+      find.byKey(const Key('station-detail-plugin.demo.relay.audit')),
+    );
     await tester.pumpAndSettle();
 
     // 未禁用那条（demo|）：关掉 ⇒ disabled: true
@@ -412,7 +451,9 @@ void main() {
       },
     );
     await _pump(tester, svc: await _service(), admin: admin);
-    await tester.tap(find.byKey(const Key('station-detail-plugin.demo.relay.audit')));
+    await tester.tap(
+      find.byKey(const Key('station-detail-plugin.demo.relay.audit')),
+    );
     await tester.pumpAndSettle();
 
     await tester.enterText(find.byKey(const Key('station-detail-max')), 'abc');
@@ -435,11 +476,19 @@ void main() {
       },
     );
     await _pump(tester, svc: await _service(), admin: admin);
-    await tester.tap(find.byKey(const Key('station-detail-plugin.demo.relay.audit')));
+    await tester.tap(
+      find.byKey(const Key('station-detail-plugin.demo.relay.audit')),
+    );
     await tester.pumpAndSettle();
 
-    await tester.enterText(find.byKey(const Key('station-detail-config-route_limit')), '12');
-    await tester.enterText(find.byKey(const Key('station-detail-config-route')), 'audit2');
+    await tester.enterText(
+      find.byKey(const Key('station-detail-config-route_limit')),
+      '12',
+    );
+    await tester.enterText(
+      find.byKey(const Key('station-detail-config-route')),
+      'audit2',
+    );
     await tester.tap(find.byKey(const Key('station-detail-save-config')));
     await tester.pumpAndSettle();
 
@@ -449,7 +498,9 @@ void main() {
     expect(config['route'], 'audit2');
   });
 
-  testWidgets('删配置项与加配置项都发**整个 config**（核心是整体替换语义）', (WidgetTester tester) async {
+  testWidgets('删配置项与加配置项都发**整个 config**（核心是整体替换语义）', (
+    WidgetTester tester,
+  ) async {
     final _FakeAdmin admin = _FakeAdmin(
       stationResponses: <String, Map<String, dynamic>>{
         'plugin.demo.relay.audit': _selfBuiltStation(),
@@ -457,7 +508,9 @@ void main() {
       },
     );
     await _pump(tester, svc: await _service(), admin: admin);
-    await tester.tap(find.byKey(const Key('station-detail-plugin.demo.relay.audit')));
+    await tester.tap(
+      find.byKey(const Key('station-detail-plugin.demo.relay.audit')),
+    );
     await tester.pumpAndSettle();
 
     await tester.tap(find.byKey(const Key('station-detail-remove-route')));
@@ -467,8 +520,14 @@ void main() {
     expect(config.containsKey('route'), isFalse);
     expect(config['route_limit'], 8, reason: '没动的键要原样带上（否则等于顺手删了别人的配置）');
 
-    await tester.enterText(find.byKey(const Key('station-detail-new-key')), 'topic_prefix');
-    await tester.enterText(find.byKey(const Key('station-detail-new-value')), 'audit.');
+    await tester.enterText(
+      find.byKey(const Key('station-detail-new-key')),
+      'topic_prefix',
+    );
+    await tester.enterText(
+      find.byKey(const Key('station-detail-new-value')),
+      'audit.',
+    );
     await tester.tap(find.byKey(const Key('station-detail-add-config')));
     await tester.pumpAndSettle();
     config = admin.lastStationPatch!['config'] as Map<String, dynamic>;
@@ -512,14 +571,18 @@ void main() {
     await _pump(tester, svc: await _service(), admin: admin);
     // 卡片来自快照，但核心这边这个站点已经不在了（例如插件注销了自建站）
     admin.stationResponses.remove('plugin.demo.relay.audit');
-    await tester.tap(find.byKey(const Key('station-detail-plugin.demo.relay.audit')));
+    await tester.tap(
+      find.byKey(const Key('station-detail-plugin.demo.relay.audit')),
+    );
     await tester.pumpAndSettle();
 
     expect(find.textContaining('站点详情刷新失败：站点不存在'), findsOneWidget);
     expect(find.textContaining('下方为最近一次数据'), findsOneWidget);
   });
 
-  testWidgets('站点详情完全读不到（没有快照那份）：说清原因 + 给重试，不渲染空白详情页', (WidgetTester tester) async {
+  testWidgets('站点详情完全读不到（没有快照那份）：说清原因 + 给重试，不渲染空白详情页', (
+    WidgetTester tester,
+  ) async {
     tester.view.physicalSize = const Size(900, 900);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
@@ -559,7 +622,9 @@ void main() {
       },
     );
     await _pump(tester, svc: await _service(), admin: admin);
-    await tester.tap(find.byKey(const Key('station-detail-plugin.demo.relay.audit')));
+    await tester.tap(
+      find.byKey(const Key('station-detail-plugin.demo.relay.audit')),
+    );
     await tester.pumpAndSettle();
 
     admin.failWrite = '内置站点 system.broadcast 不提供修改 readme：界面上可改的只有「可订阅插件数量」';
@@ -567,5 +632,68 @@ void main() {
     await tester.tap(find.byKey(const Key('station-detail-save-max')));
     await tester.pumpAndSettle();
     expect(find.textContaining('操作失败：内置站点'), findsOneWidget);
+  });
+
+  // ── 发布仓库来源（阶段 5）：详情页要说清“这一条是从哪里装的”──────────
+
+  /// 一条带来源标记的落盘条目（形状 = 核心 install 后写进 plugins.yaml 的那一条）。
+  Map<String, dynamic> releasedConfigs({
+    bool withSource = true,
+  }) => <String, dynamic>{
+    'path': 'C:/data/config/plugins.yaml',
+    'configs': <dynamic>[
+      <String, dynamic>{
+        'id': 'demo',
+        'name': '演示插件',
+        'description': '从发布仓库装的那一条',
+        'command': 'C:/app/plugins/tree_demo.exe',
+        'args': <String>[],
+        'enabled': true,
+        'granularity': 'team',
+        'scope': <String, dynamic>{},
+        if (withSource) 'source': 'release',
+        if (withSource) 'repo_version': '1.2.0',
+      },
+    ],
+    'runtime': <String, dynamic>{
+      'demo': <String, dynamic>{'running': true, 'health': 'ok', 'known': true},
+    },
+  };
+
+  testWidgets('来源行：发布仓库装的条目写明来源与已装版本', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    )..configsResponse = releasedConfigs();
+    await _pump(tester, svc: await _service(), admin: admin);
+
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-demo')));
+    await tester.pumpAndSettle();
+
+    final Finder detail = find.byType(PluginDetailPage);
+    expect(
+      find.descendant(
+        of: detail,
+        matching: find.textContaining('发布仓库（只拉 GitHub Release 资产） · 已装 1.2.0'),
+      ),
+      findsOneWidget,
+      reason: '“这一条是从发布仓库装的、装的是哪一版”必须看得到',
+    );
+  });
+
+  testWidgets('来源行：本机自己写的条目不渲染这一行（而不是一个空值）', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    )..configsResponse = releasedConfigs(withSource: false);
+    await _pump(tester, svc: await _service(), admin: admin);
+
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-demo')));
+    await tester.pumpAndSettle();
+
+    final Finder detail = find.byType(PluginDetailPage);
+    expect(
+      find.descendant(of: detail, matching: find.text('来源')),
+      findsNothing,
+      reason: '没有来源键就整行不渲染：显示一个空值会被当成 bug',
+    );
   });
 }

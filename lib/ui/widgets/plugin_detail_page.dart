@@ -339,6 +339,10 @@ class PluginDetailPage extends StatelessWidget {
                     ),
                   ),
                   _Kv(label: '命令', value: _commandText()),
+                  // 来源（阶段 5）：只在条目真带了那两个键时才出现。手写的自定义条目
+                  // 没它们 ⇒ 整行不渲染（而不是显示一个空值，那让人以为是 bug）。
+                  if (_sourceText().isNotEmpty)
+                    _Kv(label: '来源', value: _sourceText()),
                 ],
               ),
             ],
@@ -474,6 +478,20 @@ class PluginDetailPage extends StatelessWidget {
         a.toString(),
     ];
     return args.isEmpty ? command : '$command ${args.join(' ')}';
+  }
+
+  /// 发布仓库来源（条目上的 `source` + `repo_version`）；本机自己加的 = 空串。
+  ///
+  /// 这两个键**只是展示用**：行为（怎么拉起、能不能挂起）一律只读已知键，所以它们
+  /// 写坏了也不会让插件起不来（这也是为什么允许它们作为未知键留在盘上）。
+  String _sourceText() {
+    final String source = (entry['source'] ?? '').toString().trim();
+    final String repoVersion = (entry['repo_version'] ?? '').toString().trim();
+    if (source.isEmpty && repoVersion.isEmpty) return '';
+    final String label = source == 'release'
+        ? '发布仓库（只拉 GitHub Release 资产）'
+        : source;
+    return repoVersion.isEmpty ? label : '$label · 已装 $repoVersion';
   }
 
   String _resolutionText() {

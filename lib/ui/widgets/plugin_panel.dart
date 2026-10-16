@@ -48,6 +48,24 @@ abstract class PluginAdminClient {
     required bool enabled,
   });
 
+  /// 发布仓库清单（**只读本地缓存**，不联网）：GET /api/plugin/release。
+  ///
+  /// 为什么面板打开时用它而不是刷新：那是一个网络动作，而左栏打开不该被网络
+  /// 拖住（断网时也要能把“上次看到的那些”列出来，并标清这是缓存）。
+  Future<Map<String, dynamic>> fetchRelease();
+
+  /// 拉最新 release 的发布索引（**联网**）：POST /api/plugin/release/refresh。
+  ///
+  /// 只读 GitHub Release 资产，不 `git clone` 源码（插件仓里是给人改的源码，装机端
+  /// 要的是发布方事先备好的成品）。失败仍回 `ok:false` + 可读原因 + `cached`。
+  Future<Map<String, dynamic>> refreshRelease();
+
+  /// 从发布仓库装一条插件：POST /api/plugin/release/{id}/install。
+  ///
+  /// 旧进程没确认退出就**不换文件**（核心不为换文件而强杀插件），那种失败回
+  /// 400 + 原因；这里抛成异常，面板直接显示那句话。
+  Future<Map<String, dynamic>> installRelease(String id);
+
   /// 站点详情（GET /api/plugin/stations/{id}）：`StationInstance.describe()` 一整块。
   ///
   /// 为什么站点页要单独读而不是直接用快照里那一份：快照是 WS 节流的，可能滞后，
@@ -120,6 +138,17 @@ class ApiPluginAdminClient implements PluginAdminClient {
     String id, {
     required bool enabled,
   }) => ApiService.setBuiltinPluginEnabled(id, enabled: enabled);
+
+  @override
+  Future<Map<String, dynamic>> fetchRelease() => ApiService.getPluginRelease();
+
+  @override
+  Future<Map<String, dynamic>> refreshRelease() =>
+      ApiService.refreshPluginRelease();
+
+  @override
+  Future<Map<String, dynamic>> installRelease(String id) =>
+      ApiService.installPluginRelease(id);
 
   @override
   Future<Map<String, dynamic>> stationDetail(String stationId) =>
@@ -229,12 +258,37 @@ class _PluginPanelState extends State<PluginPanel> {
   /// 正在提交的插件 id（提交期间禁用该项的开关，避免连点）。
   final Set<String> _busy = <String>{};
 
+  // ── 发布仓库（阶段 5）的展示状态 ────────────────────────────────────
+
+  /// 索引里的条目（已校验）：plugin_id / name / version / installed_version / has_update。
+  List<Map<String, dynamic>> _releaseEntries = <Map<String, dynamic>>[];
+
+  /// 被跳过的索引条目 + 为什么（面板要能说出“这一条为什么没出现”，不静默）。
+  List<String> _releaseSkipped = <String>[];
+
+  /// 发布清单的失败原因（空 = 正常）。没缓存也是一句可读原因。
+  String _releaseError = '';
+
+  /// 这份索引来自哪个 release tag（离线读缓存时可能是空）。
+  String _releaseTag = '';
+
+  /// 当前列表是**联网取的**还是读的本地缓存（离线不许看起来像最新）。
+  bool _releaseOnline = false;
+
+  /// 索引缓存路径（诊断用：面板会说“我读的是哪一份”）。
+  String _releaseIndexPath = '';
+
+  /// 正在拉索引（拉期间禁用刷新按钮，避免连点叠成两个请求）。
+  bool _releaseLoading = false;
+
   @override
   void initState() {
     super.initState();
     _svc.addListener(_onChanged);
     _svc.start(teamId: widget.teamId ?? '');
     _loadAdmin();
+    // 发布仓库：只读本地缓存（不联网），所以面板打开不会卡在网络上。
+    _loadRelease();
   }
 
   @override
@@ -292,6 +346,93 @@ class _PluginPanelState extends State<PluginPanel> {
             if (item is Map) Map<String, dynamic>.from(item),
         ]
       : <Map<String, dynamic>>[];
+
+  // ── 发布仓库（阶段 5：只拉 GitHub Release 资产，不拉源码）─────────────
+
+  /// 读**本地缓存**的发布清单（不联网）。
+  Future<void> _loadRelease() async {
+    try {
+      _applyReleaseListing(await _admin.fetchRelease());
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _releaseError = _reasonOf(error));
+    }
+  }
+
+  /// 联网拉最新 release 的索引并缓存。
+  ///
+  /// 失败**不清空列表**：核心会把上一次那份递在 `cached` 里，面板要说的是
+  /// “这次没刷成功，下面这些是上次那份”，而不是把限流显示成“仓库里没插件”。
+  Future<void> _refreshRelease() async {
+    setState(() => _releaseLoading = true);
+    try {
+      final Map<String, dynamic> result = await _admin.refreshRelease();
+      _applyReleaseListing(result);
+      final String error = (result['error'] ?? '').toString();
+      if (error.isNotEmpty) {
+        final Object? cached = result['cached'];
+        if (cached is Map) {
+          _applyReleaseListing(
+            Map<String, dynamic>.from(cached),
+            keepError: error,
+          );
+        }
+        _snack('刷新失败：$error');
+      }
+    } catch (error) {
+      final String reason = _reasonOf(error);
+      setState(() => _releaseError = reason);
+      _snack('刷新失败：$reason');
+    } finally {
+      if (mounted) setState(() => _releaseLoading = false);
+    }
+  }
+
+  /// 把一份清单响应写进展示状态。
+  ///
+  /// `ok:false` 时**只换错误话术、不动条目**：“刷新失败但缓存里那些还能装”是
+  /// 一个常见现场，把它们从界面上抹掉只会让用户以为什么都没了。
+  void _applyReleaseListing(
+    Map<String, dynamic> listing, {
+    String keepError = '',
+  }) {
+    if (!mounted) return;
+    final bool ok = listing['ok'] != false;
+    final Object? rawSkipped = listing['skipped'];
+    setState(() {
+      if (ok) {
+        _releaseEntries = _mapList(listing['entries']);
+        _releaseSkipped = <String>[
+          if (rawSkipped is List) for (final Object? item in rawSkipped) '$item',
+        ];
+      }
+      _releaseTag = (listing['tag'] ?? '').toString();
+      _releaseOnline = listing['online'] == true;
+      _releaseIndexPath = (listing['index_path'] ?? '').toString();
+      _releaseError = keepError.isNotEmpty
+          ? keepError
+          : (ok ? '' : (listing['error'] ?? '').toString());
+    });
+  }
+
+  /// 装一条（含写盘 + 热应用）：走 [_submit] ⇒ 提交期间禁用该项、结果如实显示、
+  /// 之后重拉清单与快照（新装的那一条应该立刻出现在“自定义”组里）。
+  Future<void> _installRelease(String id) => _submit(
+    id,
+    () => _admin.installRelease(id),
+    successFrom: (Map<String, dynamic> result) {
+      final Object? install = result['install'];
+      final String version = install is Map
+          ? (install['version'] ?? '').toString()
+          : '';
+      return version.isEmpty
+          ? '已从发布仓库安装 $id'
+          : '已从发布仓库安装 $id（$version）';
+    },
+  );
+
+  static String _reasonOf(Object error) =>
+      '$error'.replaceFirst('Exception: ', '');
 
   /// 自定义插件：落盘条目里没有 builtin 标记、且**不属于内置清单**的那些。
   ///
@@ -793,6 +934,9 @@ class _PluginPanelState extends State<PluginPanel> {
           _buildConfigPathHint(cs, snap),
           ..._buildInstances(cs, snap),
           const SizedBox(height: 12),
+          _sectionTitle(cs, '从发布仓库更新'),
+          _buildReleaseSection(cs),
+          const SizedBox(height: 12),
           // M9 §3 的正式名字是「站点」（广播 / 执行 / 中转 / 收集四类），
           // 旧文案「处理站」是已废弃的旧名（旧「处理站」= 现在的中转站）。
           _sectionTitle(cs, _stationsTitle(snap)),
@@ -1285,6 +1429,135 @@ class _PluginPanelState extends State<PluginPanel> {
       }
     }
     return Wrap(spacing: 6, runSpacing: 6, children: pills);
+  }
+
+  /// 「从发布仓库更新」区块。
+  ///
+  /// 三件事必须看得见：**这不是最新**（离线/缓存要说清，不然看起来就像最新的）、
+  /// **这一条为什么没出现**（skipped 的原因逐条写出来，不静默）、**装它会怎样**
+  /// （旧进程没退就换不了文件 —— 那句话由核心的可读回包给出，面板原样显示，
+  /// 不自己编第二套说法）。
+  Widget _buildReleaseSection(ColorScheme cs) {
+    final String source = _releaseOnline
+        ? (_releaseTag.isEmpty ? '刚拉的索引' : '刚拉的索引（release $_releaseTag）')
+        : (_releaseTag.isEmpty
+              ? '本地缓存（还没拉过）'
+              : '本地缓存（release $_releaseTag，不是最新）');
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Row(
+          children: <Widget>[
+            Expanded(
+              child: Text(
+                '只读 GitHub Release 资产（不拉插件源码）。当前：$source',
+                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+              ),
+            ),
+            if (_releaseLoading)
+              const SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            else
+              TextButton(
+                key: const Key('plugin-release-refresh'),
+                onPressed: _refreshRelease,
+                child: const Text('刷新'),
+              ),
+          ],
+        ),
+        if (_releaseError.isNotEmpty)
+          Text(_releaseError, style: TextStyle(fontSize: 11, color: cs.error)),
+        if (_releaseIndexPath.isNotEmpty)
+          Text(
+            '索引：$_releaseIndexPath',
+            style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+          ),
+        if (_releaseEntries.isEmpty && _releaseError.isEmpty)
+          _emptyHint(
+            cs,
+            '索引里没有可装的条目（发布时要把 plugin-index.json 与各插件文件一起传到 release）',
+          )
+        else
+          for (final Map<String, dynamic> entry in _releaseEntries)
+            _releaseRow(cs, entry),
+        if (_releaseSkipped.isNotEmpty) ...<Widget>[
+          const SizedBox(height: 4),
+          for (final String line in _releaseSkipped)
+            Text(
+              '跳过：$line',
+              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+            ),
+        ],
+      ],
+    );
+  }
+
+  /// 一条发布条目（名字 + 版本对比 + 装它那颗按钮）。
+  ///
+  /// “已是最新”时按钮**禁用而不是隐藏**：隐藏会让人以为这一条不能装，而它其实
+  /// 只是没必要再装一次。提交期间该条目禁用（连点会叠出两次放置）。
+  Widget _releaseRow(ColorScheme cs, Map<String, dynamic> entry) {
+    final String id = (entry['plugin_id'] ?? '').toString();
+    final String name = (entry['name'] ?? '').toString();
+    final String version = (entry['version'] ?? '').toString();
+    final String installed = (entry['installed_version'] ?? '').toString();
+    final bool hasUpdate = entry['has_update'] == true;
+    final String title = name.isEmpty ? id : name;
+    final bool busy = _busy.contains(id);
+    return Container(
+      margin: const EdgeInsets.only(top: 6),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        border: Border.all(color: Theme.of(context).dividerColor),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: <Widget>[
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  title,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                if (title != id)
+                  Text(
+                    id,
+                    style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                  ),
+                Text(
+                  installed.isEmpty
+                      ? '发布 $version · 本机未装'
+                      : '发布 $version · 本机 $installed',
+                  style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                ),
+              ],
+            ),
+          ),
+          if (!hasUpdate && installed.isNotEmpty) _pill(cs, '已是最新'),
+          const SizedBox(width: 6),
+          TextButton(
+            key: Key('plugin-release-install-$id'),
+            onPressed: hasUpdate && !busy ? () => _installRelease(id) : null,
+            child: Text(
+              busy
+                  ? '安装中…'
+                  : (installed.isEmpty
+                        ? '安装'
+                        : (hasUpdate ? '更新' : '已是最新')),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   /// 看门狗概要。

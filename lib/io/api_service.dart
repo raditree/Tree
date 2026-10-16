@@ -1117,6 +1117,35 @@ class ApiService {
     );
   }
 
+  /// 发布仓库清单（**只读本地缓存**）：GET [ApiPaths.pluginRelease]
+  ///
+  /// 返回 `{ok, entries[], skipped[], tag, index_path, online, error}`。注意它**不联网**：
+  /// 面板打开时用它，才能立刻列出“上次看到的那些”；联网拉取是 [refreshPluginRelease]。
+  /// “没缓存”也回 `ok:false` + 中文原因（而不是抛异常），面板把那句话直接显示出来。
+  static Future<Map<String, dynamic>> getPluginRelease() async {
+    return _getJson(ApiPaths.pluginRelease);
+  }
+
+  /// 拉最新 release 的发布索引（**联网**）：POST [ApiPaths.pluginReleaseRefresh]
+  ///
+  /// 只读 GitHub Release 资产（核心不 clone 源码）。失败时核心仍回 200 + `ok:false`，
+  /// 并附上 `cached`（上一次那份清单）——这样“GitHub 今晚限流”不会显示成“仓库里没插件”。
+  static Future<Map<String, dynamic>> refreshPluginRelease() async {
+    return _postJson(ApiPaths.pluginReleaseRefresh);
+  }
+
+  /// 从发布仓库装一条插件：POST [ApiPaths.pluginReleaseInstall]
+  ///
+  /// 一次动作 = 资产进缓存 → 换文件闸门（旧进程没确认退出就**不换**）→ 原子改名 →
+  /// 写 plugins.yaml 并热应用。失败（闸门拦住 / 字节数不符 / 想盖内置项）核心回
+  /// 400 + 中文原因，这里抛成异常给面板直接显示；**旧文件一个都没动**。
+  static Future<Map<String, dynamic>> installPluginRelease(String pluginId) async {
+    final String encoded = Uri.encodeComponent(pluginId.trim());
+    return _postJson(
+      ApiPaths.pluginReleaseInstall.replaceFirst('{pluginId}', encoded),
+    );
+  }
+
   /// 站点详情：GET [ApiPaths.pluginStation]
   ///
   /// 返回 `StationInstance.describe()` 一整块：`readme`（站点介绍）、`max_subscriptions`

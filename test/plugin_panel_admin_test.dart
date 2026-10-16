@@ -45,6 +45,42 @@ class _FakeAdmin implements PluginAdminClient {
   /// 站点详情与写操作的返回体（核心成功时回**改后的完整详情**）。
   Map<String, dynamic> stationResponse = _defaultStation();
 
+  // ── 发布仓库（阶段 5）的假数据 ──────────────────────────────────
+
+  /// 发布清单：默认“本机还没缓存”（面板打开不该自己去联网）。
+  Map<String, dynamic> releaseResponse = <String, dynamic>{
+    'ok': false,
+    'error': '本机还没有发布索引的缓存：C:/data/plugins_release/plugin-index.json'
+        '（请先点「刷新」拉一次最新 release）',
+    'entries': <dynamic>[],
+    'skipped': <dynamic>[],
+    'tag': '',
+    'index_path': 'C:/data/plugins_release/plugin-index.json',
+    'online': false,
+  };
+
+  /// 刷新时的返回体（null = 沿用 [releaseResponse]；用例用它给出“刚拉到的一份清单”）。
+  Map<String, dynamic>? refreshResponse;
+
+  /// 刷新没成功时核心附上的“上一次那份”（面板要能列出它，而不是只剩错误）。
+  Map<String, dynamic>? refreshCached;
+
+  /// 非空 = fetchRelease / refreshRelease 抛错（模拟核心 503“没接下载器”）。
+  String failRelease = '';
+
+  /// 读缓存清单被调了几次。**read 不进 calls**（与 fetchConfigs / fetchBuiltins
+  /// 同口径）：否则“面板打开后什么都没点”的用例会被一次读取弄成“已发请求”。
+  int releaseFetches = 0;
+
+  /// 装一条的返回体（形状 = 核心 install 的回包：写盘结果 + install 段）。
+  Map<String, dynamic> installResponse = <String, dynamic>{
+    'ok': true,
+    'hot_applied': true,
+    'notice': '',
+    'hot_apply_detail': '',
+    'install': <String, dynamic>{'ok': true, 'plugin_id': 'demo2', 'version': '1.2.0'},
+  };
+
   static Map<String, dynamic> _defaultConfigs() => <String, dynamic>{
     'path': 'C:/data/config/plugins.yaml',
     'enabled': true,
@@ -221,6 +257,30 @@ class _FakeAdmin implements PluginAdminClient {
     if (failWrite.isNotEmpty) throw Exception(failWrite);
     return stationResponse;
   }
+
+  @override
+  Future<Map<String, dynamic>> fetchRelease() async {
+    releaseFetches++;
+    if (failRelease.isNotEmpty) throw Exception(failRelease);
+    return releaseResponse;
+  }
+
+  @override
+  Future<Map<String, dynamic>> refreshRelease() async {
+    calls.add('release:refresh');
+    if (failRelease.isNotEmpty) throw Exception(failRelease);
+    return <String, dynamic>{
+      ...(refreshResponse ?? releaseResponse),
+      if (refreshCached != null) 'cached': refreshCached,
+    };
+  }
+
+  @override
+  Future<Map<String, dynamic>> installRelease(String id) async {
+    calls.add('release:install:$id');
+    if (failWrite.isNotEmpty) throw Exception(failWrite);
+    return installResponse;
+  }
 }
 
 /// 注入快照的服务（不共享单例状态）。
@@ -260,6 +320,41 @@ Future<void> _pumpPanel(
   );
   await tester.pumpAndSettle();
 }
+
+/// 发布索引清单的回包（形状 = 核心 `PluginReleaseListing.toJson()`）。
+Map<String, dynamic> _releaseListing({
+  bool ok = true,
+  String error = '',
+  String tag = 'v0.1.0',
+  bool online = true,
+  List<Map<String, dynamic>> entries = const <Map<String, dynamic>>[],
+  List<String> skipped = const <String>[],
+}) => <String, dynamic>{
+  'ok': ok,
+  'error': error,
+  'tag': tag,
+  'online': online,
+  'index_path': 'C:/data/plugins_release/plugin-index.json',
+  'count': entries.length,
+  'entries': entries,
+  'skipped': skipped,
+};
+
+/// 一条索引条目（关键键与核心 `PluginRepoEntry.toJson()` 一致）。
+Map<String, dynamic> _releaseEntry({
+  String id = 'demo2',
+  String name = '发布版演示插件',
+  String version = '1.2.0',
+  String installed = '',
+  bool hasUpdate = true,
+}) => <String, dynamic>{
+  'plugin_id': id,
+  'name': name,
+  'version': version,
+  'installed_version': installed,
+  'has_update': hasUpdate,
+  'runtime': 'binary',
+};
 
 void main() {
   testWidgets('插件实例分「内置 / 自定义」两组，每一项各有自己的开关', (WidgetTester tester) async {
@@ -526,5 +621,132 @@ void main() {
     expect(find.text('插件实例（1）'), findsOneWidget);
     expect(find.text('已注册'), findsOneWidget);
     expect(find.text('样例插件'), findsOneWidget);
+  });
+
+  // ── 发布仓库（阶段 5：插件管理只拉 GitHub Release 资产，不拉源码）──────
+
+  testWidgets('发布仓库：面板打开只读本地缓存（不联网），没缓存也写明原因', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin();
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+
+    expect(admin.releaseFetches, 1, reason: '面板打开读一次本地缓存');
+    expect(
+      admin.calls,
+      isEmpty,
+      reason: '列清单不是网络动作：拉最新 release 必须用户点「刷新」',
+    );
+    expect(find.textContaining('只读 GitHub Release 资产'), findsOneWidget);
+    expect(
+      find.textContaining('本机还没有发布索引的缓存'),
+      findsOneWidget,
+      reason: '空列表必须说清为什么是空的，不让人以为“没插件”',
+    );
+    expect(find.textContaining('本地缓存（还没拉过）'), findsOneWidget);
+  });
+
+  testWidgets('发布仓库：刷新后列出条目，并把跳过的条目与原因写出来', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin()
+      ..refreshResponse = _releaseListing(
+        entries: <Map<String, dynamic>>[_releaseEntry()],
+        skipped: <String>['bad：version 必须是三段数字 x.y.z（当前：1.2）'],
+      );
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+
+    await tester.tap(find.byKey(const Key('plugin-release-refresh')));
+    await tester.pumpAndSettle();
+
+    expect(admin.calls, contains('release:refresh'));
+    expect(find.text('发布版演示插件'), findsOneWidget);
+    expect(find.textContaining('发布 1.2.0 · 本机未装'), findsOneWidget);
+    expect(find.textContaining('刚拉的索引（release v0.1.0）'), findsOneWidget);
+    expect(
+      find.textContaining('跳过：bad：version'),
+      findsOneWidget,
+      reason: '坏条目要能说“为什么没出现”，不静默也不带走整份清单',
+    );
+  });
+
+  testWidgets('发布仓库：点「安装」只把 id 发出去，成功后显示版本', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin()
+      ..refreshResponse = _releaseListing(
+        entries: <Map<String, dynamic>>[_releaseEntry()],
+      );
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await tester.tap(find.byKey(const Key('plugin-release-refresh')));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('plugin-release-install-demo2')));
+    await tester.pumpAndSettle();
+
+    expect(admin.calls, contains('release:install:demo2'));
+    expect(
+      find.text('已从发布仓库安装 demo2（1.2.0）'),
+      findsOneWidget,
+      reason: '装了哪一版要说出来，只说“成功”等于没说',
+    );
+  });
+
+  testWidgets('发布仓库：闸门拦住时原样显示核心的原因（旧文件没动）', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin()
+      ..refreshResponse = _releaseListing(
+        entries: <Map<String, dynamic>>[_releaseEntry()],
+      )
+      ..failWrite =
+          '插件 demo2 的进程还没确认退出 ⇒ 这次不替换文件，旧文件一个都没动';
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await tester.tap(find.byKey(const Key('plugin-release-refresh')));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('plugin-release-install-demo2')));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.textContaining('旧文件一个都没动'),
+      findsOneWidget,
+      reason: '“现在换不了”与“换坏了”是两回事，核心那句话得原样递到用户眼前',
+    );
+  });
+
+  testWidgets('发布仓库：刷新失败仍列出上一次那份，并标清这不是最新', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin()
+      ..refreshResponse = _releaseListing(
+        ok: false,
+        error: '取最新 release 失败：HTTP 403（GitHub API 限流）',
+        tag: '',
+      )
+      ..refreshCached = _releaseListing(
+        online: false,
+        tag: 'v0.0.9',
+        entries: <Map<String, dynamic>>[
+          _releaseEntry(id: 'cached1', name: '缓存里那条', installed: '1.0.0'),
+        ],
+      );
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+
+    await tester.tap(find.byKey(const Key('plugin-release-refresh')));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.text('缓存里那条'),
+      findsOneWidget,
+      reason: '刷新失败不等于“仓库里没插件”：缓存那份还能装就要列出来',
+    );
+    expect(find.textContaining('本地缓存（release v0.0.9，不是最新）'), findsOneWidget);
+  });
+
+  testWidgets('发布仓库：已是最新时按钮禁用而不是消失', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin()
+      ..refreshResponse = _releaseListing(
+        entries: <Map<String, dynamic>>[
+          _releaseEntry(id: 'same', installed: '1.2.0', hasUpdate: false),
+        ],
+      );
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await tester.tap(find.byKey(const Key('plugin-release-refresh')));
+    await tester.pumpAndSettle();
+
+    final Finder button = find.byKey(const Key('plugin-release-install-same'));
+    expect(button, findsOneWidget, reason: '隐藏会让人以为这一条不能装');
+    expect(tester.widget<TextButton>(button).onPressed, isNull);
   });
 }
