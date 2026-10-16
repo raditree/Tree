@@ -40,6 +40,12 @@
     （行为一律只读已知键，写坏了也不影响运行），详情页据此回答“从哪里装的、哪一版”。
   - **内置 id 不给覆盖**（取保守侧并在此记录）：`BuiltinPluginCatalog.specOf(id)` 命中就拒，
     **不看条目在不在盘上**——内置身份由静态清单认定，两边各开一个开关就会抢同一条目。
+  - **随包的插件文件名也不给盖**（与上一条是两道不同的防线）：`files[].target` 撞上
+    `BuiltinPluginCatalog.protectedFileNames()`（新增公开方法：示例/压缩脚本、SSH 执行器与
+    自迭代插件的二进制）就**整条跳过并写下原因**——担心的是“不撞内置 id 也能把
+    `sample_plugin.py` 覆盖掉”，而现象是“示例插件突然起不来”，归因要翻到一份远端 JSON 里。
+    跳过发生在**列清单**时（面板当场说得出原因），不是等用户点了安装才失败；被跳过的条目
+    一个字节也不写进 `plugins/`。
   - **REST 三条路由的失败形状写进契约**（`ApiPaths.pluginRelease` / `pluginReleaseRefresh` /
     `pluginReleaseInstall`，均已进 `kept`）：读列表不联网（一个 URL 都不碰）并把
     `online: false` 写进回包；**刷新失败也回 200 + `ok:false` + 缓存那一份**（`cached`），否则
@@ -50,8 +56,8 @@
     （命令 + 前缀参数）而非字符串（Windows 上命中的常常是 `py -3`）。
   - **缓存与放置分目录**（`TreePaths.pluginsReleaseDir` = `<数据根>/plugins_release`）：半成品
     不该出现在插件查找路径里，否则“下载了一半”会变成面板上一条起不来的插件。
-  用例：`test/plugin_downloader_test.dart`（19，整条发布链**离线**跑：假取回器注入）、
-  `test/plugin_config_api_test.dart`（+8：含“旧一世被优雅停掉后才换文件、再拉新一世”的真子进程用例）、
+  用例：`test/plugin_downloader_test.dart`（20，整条发布链**离线**跑：假取回器注入）、
+  `test/plugin_config_api_test.dart`（+9：含“旧一世被优雅停掉后才换文件、再拉新一世”的真子进程用例）、
   `test/plugin_panel_admin_test.dart`（+6）、`test/plugin_detail_page_test.dart`（+2）。
 
 - **框架自迭代插件：把「热重启一个插件（含重启它自己）」做成 agent tool**（**新增**

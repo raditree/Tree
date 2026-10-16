@@ -310,6 +310,24 @@ class BuiltinPluginCatalog {
     return null;
   }
 
+  /// 随包分发的**内置插件文件名**（脚本名与二进制的两种拼写都收进来）。
+  ///
+  /// 唯一的读者是发布仓库的校验（`PluginDownloader`）：`plugins/` 里放的是插件**源码与
+  /// 随包成品**，而插件管理只从 release 拉成品 —— 一条索引只要把 `files[].target` 写成
+  /// `sample_plugin.py`，就能把核心自带的脚本盖掉。那在界面上表现为「示例插件突然起不
+  /// 来」，而原因藏在一份远端 JSON 里，是归因最难的一类。
+  static Set<String> protectedFileNames({bool? isWindows}) {
+    final bool windows = isWindows ?? Platform.isWindows;
+    final Set<String> names = <String>{};
+    for (final BuiltinPluginSpec spec in specs) {
+      names.add(spec.script);
+      if (spec.kind == BuiltinPluginSpec.kindBinary) {
+        names.add(binaryFileName(spec, isWindows: windows));
+      }
+    }
+    return names;
+  }
+
   /// 解析某项的运行时与脚本（结果缓存；[refresh] = 强制重探）。
   Future<BuiltinResolution> resolve(
     BuiltinPluginSpec spec, {

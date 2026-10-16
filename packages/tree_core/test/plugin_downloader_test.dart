@@ -383,6 +383,48 @@ void main() {
       expect(listing.entries, isEmpty);
       expect(listing.skipped.single, contains('scope 必须是 JSON 对象'));
     });
+
+    test('目标名撞上随包的内置插件文件 ⇒ 跳过，install 也拿不到它', () async {
+      // 「plugins/ 里是插件代码」的另一面：发布仓库只能装自己的成品。
+      // 一条把 target 写成 sample_plugin.py 的索引，本来能把核心自带的脚本盖掉，
+      // 而现象是“示例插件突然起不来”——归因要翻到一份远端 JSON 里去了。
+      putAsset('sample_plugin.py');
+      repo.publish(
+        plugins: <Map<String, dynamic>>[
+          _entry(
+            id: 'overwrite_builtin',
+            command: 'sample_plugin.py',
+            files: <Map<String, dynamic>>[
+              <String, dynamic>{
+                'asset': 'sample_plugin.py',
+                'target': 'sample_plugin.py',
+                'bytes': 8,
+              },
+            ],
+          ),
+        ],
+      );
+      final PluginDownloader d = downloader();
+      final PluginReleaseListing listing = await d.refresh();
+      expect(listing.ok, isTrue, reason: listing.error);
+      expect(listing.entries, isEmpty);
+      expect(
+        listing.skipped.single,
+        contains('不盖 plugins/ 里的插件源码'),
+        reason: '列清单时就要说出来，不能“列得出、点了才失败”',
+      );
+      final PluginInstallResult result = await d.install(
+        'overwrite_builtin',
+        swapGate: allowSwap,
+      );
+      expect(result.ok, isFalse);
+      expect(result.error, contains('skipped'));
+      expect(
+        File(p.join(installDir, 'sample_plugin.py')).existsSync(),
+        isFalse,
+        reason: '被跳过的条目一个字节都不许落进 plugins/',
+      );
+    });
   });
 
   group('安装（缓存 → 闸门 → 临时名 → 原子改名）', () {

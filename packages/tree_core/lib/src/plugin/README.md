@@ -280,6 +280,11 @@
     - **内置 id 不给覆盖**（取保守侧）：`BuiltinPluginCatalog.specOf(id)` 命中就拒，而且
       **不看条目在不在盘上**——内置身份由静态清单认定，先被发布仓库写一条、再被人按内置
       开关，就会变成两个主人抢同一条目（开关一按就把 command 写回随包那一份）。
+    - **随包的文件名也不给盖**（与上一条是两道不同的防线）：`files[].target` 撞上
+      `BuiltinPluginCatalog.protectedFileNames()`（示例/压缩脚本、SSH 执行器与自迭代插件的
+      二进制）就整条跳过——不撞上内置 id 也能把 `sample_plugin.py` 覆盖掉，而现象是“示例
+      插件突然起不来”，归因要翻到一份远端 JSON 里。跳过发生在**列清单**时（面板当场说得出
+      原因），不是等用户点了安装才失败。
     - **离线不许看起来像最新**：`GET /api/plugin/release` 只读缓存（一个 URL 都不碰）并把
       `online: false` 写进回包；刷新失败也回 **200 + `ok:false` + 缓存那一份**（`cached`），
       否则"GitHub 今晚限流"会显示成"这个仓库没有插件"。只有安装失败回 400 + `detail`，
@@ -288,8 +293,8 @@
       （`BuiltinPluginCatalog.detectRuntime`）：探不到解释器就拒装，而不是写一条注定起不来的
       配置（面板上多一个永远"启动失败"的条目比不装更糟）。解释器回的是
       `BuiltinRuntime`（命令 + 前缀参数）而不是一个字符串：Windows 上命中的常常是 `py -3`。
-    用例：[test/plugin_downloader_test.dart](../../../test/plugin_downloader_test.dart)（19，整条链离线跑）、
-    [test/plugin_config_api_test.dart](../../../test/plugin_config_api_test.dart)（新增 8 条 REST）、
+    用例：[test/plugin_downloader_test.dart](../../../test/plugin_downloader_test.dart)（20，整条链离线跑）、
+    [test/plugin_config_api_test.dart](../../../test/plugin_config_api_test.dart)（新增 9 条 REST）、
     面板与详情页：`test/plugin_panel_admin_test.dart`（新增 6）、`test/plugin_detail_page_test.dart`（新增 2）。
     合同原文见仓库根 [plugins/README.md](../../../../../plugins/README.md)。
 

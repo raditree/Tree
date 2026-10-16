@@ -717,6 +717,11 @@ plugins:
   由 `PluginConfigStore` 当未知键原样保留，行为一律只读已知键；详情页据此回答
   “这一条是从哪里装的、装的是哪一版”。内置 id **不给覆盖**（内置项只走内置开关，
   否则两个开关会抢同一条目）。
+* **也不给盖掉随包的插件源码**：`files[].target` 撞上 `BuiltinPluginCatalog.protectedFileNames()`
+  （示例/压缩脚本、SSH 执行器与自迭代插件的二进制）就整条跳过 —— “撞 id”与“撞文件名”
+  是两道不同的防线：后者不需要撞上内置 id 就能把 `sample_plugin.py` 覆盖掉，而现象是
+  “示例插件突然起不来”，归因要翻到一份远端 JSON 里去。跳过发生在**列清单**时（面板当场
+  说得出原因），不是等用户点了安装才失败。
 
 发布一版（在 `tree-plugins` 仓根）：把 `plugin-index.json` 与索引里点到的每个文件
 一起传成 release 的资产 —— `gh release create v0.1.0 release/plugin-index.json <各资产>`。

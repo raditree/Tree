@@ -967,6 +967,50 @@ void main() {
     expect(diskPlugins(), isEmpty);
   });
 
+  test('索引想把 plugins/ 里的内置脚本盖掉 ⇒ 列表当场跳过，install 拿不到这一条', () async {
+    // 与上一条不同的防线：上一条管“id 撞内置”，这一条管“**文件名**撞内置”。
+    // plugins/ 里放的是插件源码与随包成品，两者靠文件名区分 ⇒ 发布仓库只能装自己的成品。
+    final _Repo repo = _Repo();
+    repo.assets['sample_plugin.py'] = File(script).readAsBytesSync();
+    repo.publish(
+      plugins: <Map<String, dynamic>>[
+        releaseEntry(id: 'overwrite', target: 'sample_plugin.py'),
+      ],
+    );
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve(
+          'enabled: true\nplugins: []\n',
+          downloader: releaseDownloader(repo),
+        );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+    final _Res refreshed = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/refresh',
+    );
+    expect(refreshed.status, 200);
+    expect(refreshed.json['ok'], isTrue, reason: '索引本身是合法的');
+    expect(refreshed.json['entries'], isEmpty);
+    expect(
+      (refreshed.json['skipped'] as List<dynamic>).cast<String>().single,
+      contains('不盖 plugins/ 里的插件源码'),
+      reason: '面板要能直接告诉用户为什么列不出来',
+    );
+    final _Res install = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/overwrite/install',
+    );
+    expect(install.status, 400);
+    expect(
+      File(p.join(pluginDir, 'sample_plugin.py')).readAsStringSync(),
+      '# 示例\n',
+      reason: '随包脚本一字未动（被跳过的条目连一个字节都不许写进 plugins/）',
+    );
+    expect(diskPlugins(), isEmpty);
+  });
+
   test('install 一个索引里没有的 id：400 + 现在能装的是哪几条', () async {
     final _Repo repo = _Repo();
     repo.assets['fake_plugin.dart'] = File(script).readAsBytesSync();

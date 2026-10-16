@@ -3,7 +3,7 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 
-import 'builtin_plugins.dart' show BuiltinRuntime;
+import 'builtin_plugins.dart' show BuiltinPluginCatalog, BuiltinRuntime;
 import 'plugin_host.dart' show PluginSuspension;
 
 /// 插件**发布**仓库（GitHub Releases）的默认坐标。
@@ -288,10 +288,12 @@ class PluginDownloader {
     HttpClient? client,
     String Function()? nonce,
     PluginInstalledEntryReader? installedEntryOf,
+    Set<String> Function()? protectedFiles,
   }) : fetcherOverride = fetcher,
        injectedClient = client,
        nonceFactory = nonce ?? _defaultNonce,
-       installedReader = installedEntryOf ?? _noInstalledEntry;
+       installedReader = installedEntryOf ?? _noInstalledEntry,
+       protected = protectedFiles ?? BuiltinPluginCatalog.protectedFileNames;
 
   /// 没注入读条目时的默认：永远当"本机没装过"（判断有没有更新就保守地回答"有"）。
   static Map<String, dynamic>? _noInstalledEntry(String pluginId) => null;
@@ -325,8 +327,15 @@ class PluginDownloader {
   /// 脚本型条目的解释器解析（null = 这台核心不接脚本 ⇒ python 条目安装时如实拒绝）。
   final PluginRuntimeResolver? runtimeResolver;
 
-  /// 读已落盘条目（看"装的是哪一版"，从而判断有没有更新）。
+  /// 读已落盘条目（看“装的是哪一版”，从而判断有没有更新）。
   final PluginInstalledEntryReader installedReader;
+
+  /// **不许被发布仓库覆盖的文件名**（缺省 = 核心随包的内置插件脚本与二进制）。
+  ///
+  /// 为什么算进索引校验而不是只堵 install：`plugins/` 里是插件源码与随包成品，一条写错
+  /// `target` 的索引就够把内置脚本盖掉；而“面板提前列出它、点了才失败”会把一个合同错误
+  /// 伪装成一个运行时故障。列清单时就当场跳过并写下原因，与其余坏条目同口径。
+  final Set<String> Function() protected;
 
   final void Function(String message)? log;
 
@@ -553,6 +562,7 @@ class PluginDownloader {
       return (entry: null, error: '$id 的 files 必须是非空数组（要放进 plugins/ 的文件）');
     }
     final List<PluginRepoFile> files = <PluginRepoFile>[];
+    final Set<String> reserved = protected();
     for (final Object? item in rawFiles) {
       if (item is! Map) {
         return (entry: null, error: '$id 的 files 里有一项不是对象（要 {asset, target}）');
@@ -568,6 +578,15 @@ class PluginDownloader {
       // 发布方给的文件名不能把 plugins/ 写到别处去 —— 与 TreePaths.safeSegment 同一条防线。
       if (target != p.basename(target) || p.isAbsolute(target)) {
         return (entry: null, error: '$id 的目标名「$target」不是纯文件名（不许含路径或绝对路径）');
+      }
+      // 也不能拿它盖住随包的插件源码与成品（它们同在一个 plugins/ 里，靠文件名区分）。
+      if (reserved.contains(target)) {
+        return (
+          entry: null,
+          error:
+              '$id 的目标名「$target」是核心内置插件随包的文件：'
+              '发布仓库只装自己的成品，不盖 plugins/ 里的插件源码',
+        );
       }
       files.add(
         PluginRepoFile(
