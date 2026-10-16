@@ -27,6 +27,14 @@ final bool _massStress =
 void main() {
   const int n = 50;
 
+  /// 真链路那一层的并发规模：**默认跟闸门一样是 50**，验收时顶到要求的量级。
+  ///
+  /// 要钉的那句话是「**100+ keep 类插件同时热重启时核心进程不崩**」：常规闸门不该
+  /// 跑 100 个 Dart VM（峰值两世并存⇒ 翻倍），但那个数必须随时能跑。
+  /// 开法（PowerShell）：`$env:TREE_MASS_STRESS='1'; $env:TREE_MASS_STRESS_N='100'`。
+  final int massN =
+      int.tryParse(Platform.environment['TREE_MASS_STRESS_N'] ?? '') ?? n;
+
   StationRequest request(int seq, String team) => StationRequest(
     requestId: 'req-$seq',
     stationId: StationHubIds.relayLlmHandle,
@@ -200,9 +208,9 @@ void main() {
     });
   });
 
-  // ── 真链路：50 个插件进程同时热重启（默认跳过，开法见文件头） ──────────────
+  // ── 真链路：50（可用 TREE_MASS_STRESS_N 顶高）个插件进程同时热重启 ────────
   test(
-    '真链路：50 个插件同时 hotRestart 全部换世成功且互不牵连',
+    '真链路：$massN 个插件同时 hotRestart 全部换世成功且互不牵连',
     () async {
       final Directory temp = Directory.systemTemp.createTempSync(
         'tree_mass_restart_',
@@ -224,7 +232,7 @@ void main() {
         <String>[
           'enabled: true',
           'plugins:',
-          for (int i = 0; i < n; i++) ...<String>[
+          for (int i = 0; i < massN; i++) ...<String>[
             '  - id: mass$i',
             '    name: 压力插件 $i',
             '    command: "${slash(Platform.resolvedExecutable)}"',
@@ -255,10 +263,12 @@ void main() {
 
       expect(
         bus.instances(),
-        hasLength(n),
-        reason: '50 家都要先起来（起不来看核心日志：${logs.join('\n')}）',
+        hasLength(massN),
+        reason: '$massN 家都要先起来（起不来看核心日志：${logs.join('\n')}）',
       );
-      final List<String> ids = <String>[for (int i = 0; i < n; i++) 'mass$i'];
+      final List<String> ids = <String>[
+        for (int i = 0; i < massN; i++) 'mass$i',
+      ];
       final List<PluginHotRestartResult> results =
           await Future.wait<PluginHotRestartResult>(
             <Future<PluginHotRestartResult>>[
@@ -267,7 +277,7 @@ void main() {
           );
 
       final List<String> failed = <String>[
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < massN; i++)
           if (!results[i].ok) '${ids[i]}: ${results[i].reason}',
       ];
       expect(failed, isEmpty, reason: '一个都不许掉（互不牵连是阶段 1 就钉住的口径）');
@@ -284,9 +294,17 @@ void main() {
         bus.restartBuffer.totalBytes,
         lessThanOrEqualTo(bus.restartBufferMaxTotalBytes),
       );
+      // 本进程（总线就跑在核心侧同一个隔离区里）的热重启风暴后 RSS：上限给得很宽，
+      // 它的目的不是卡住优化，而是让「崩」与「吃内存」在失败时能当场分得开。
+      final int rssMb = (ProcessInfo.currentRss / (1024 * 1024)).round();
+      expect(
+        rssMb,
+        lessThan(4096),
+        reason: '$massN 路热重启后核心侧 RSS ${rssMb}MB（峰值靠外部采样记录）',
+      );
     },
-    timeout: const Timeout(Duration(minutes: 8)),
-    skip: _massStress ? false : '50 个真插件进程（峰值两世并存）不该进常规闸门；开法见文件头注释',
+    timeout: const Timeout(Duration(minutes: 12)),
+    skip: _massStress ? false : '$massN 个真插件进程（峰值两世并存）不该进常规闸门；开法见文件头注释',
   );
 }
 
