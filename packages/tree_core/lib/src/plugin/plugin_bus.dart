@@ -3512,7 +3512,7 @@ class PluginBus {
     if (pipe == null) {
       log?.call(
         'tool.call 带了 run_id=$runId，但这一轮不在册（已收尾 / 从未接管 / 属于别的插件）：'
-        '这扇工具调用已被拒',
+        '这次工具调用已被拒',
       );
       return false;
     }

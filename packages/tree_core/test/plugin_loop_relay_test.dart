@@ -13,14 +13,17 @@
 // 5. 接管期间同一会话的 `agent.message` 被拒：双写历史这件事不能靠约定，得当场拦；
 // 6. 接管者报的 usage 与内置**同一形状**：`cached_tokens` 为 0 不写键、上限拿不到不写。
 //
-// 这里用**进程内订阅者**当接管者（接管判据与流的生命周期都是总线内的逻辑）；
-// `station/stream` 的帧只能由真插件进程推，所以事件正文那一段用夹具插件补一条端到端。
+// 共 **20 条，分两层**：前 15 条用**进程内订阅者**当接管者（接管判据、payload 形状与
+// 流的生命周期都是总线内的逻辑）；后 5 条跑**真插件进程**（夹具 `fake_llm_plugin.dart` 的
+// `--loop-mode`），因为 `station/stream` 的帧只能由真进程推，而“写进了回包”≠“走到了插件”。
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
 import 'package:tree_core/src/plugin/execute_mounts.dart';
 import 'package:tree_core/src/plugin/plugin_bus.dart';
+import 'package:tree_core/src/plugin/plugin_host.dart';
 import 'package:tree_core/src/plugin/station_ids.dart';
 import 'package:tree_core/src/plugin/station_instance.dart';
 import 'package:tree_core/src/plugin/station_points.dart';
@@ -311,7 +314,7 @@ void main() {
         reason: '这一轮已经收尾了',
       );
       expect(
-        logs.any((String l) => l.contains('这扇工具调用已被拒')),
+        logs.any((String l) => l.contains('这次工具调用已被拒')),
         isTrue,
         reason: '$logs',
       );
@@ -498,7 +501,7 @@ void main() {
       );
     });
 
-    test('cached=0 与拿不到上限 ⇒ **不写键**（绝不编造 0 / 假上限）', () {
+    test('cached=0 与拿不到上限 ⇒ **不写键**（绍不编造 0 / 假上限）', () {
       final Map<String, dynamic> bare = loopRunUsageMap(
         const LlmUsage(promptTokens: 5, completionTokens: 1),
         0,
@@ -511,6 +514,251 @@ void main() {
           0,
         )['cached_tokens'],
         4,
+      );
+    });
+  });
+
+  // ── 真进程端到端：`station/stream` 的帧只能由真插件进程推 ──────────────
+  //
+  // 上面那些用例钉的是总线内部的接管判定与生命周期；这一组钉的是「帧真的能从
+  // 管道里走进来」：回包形状、增量解码、工具经执行站 `tool.call` 回带 `run_id`，
+  // 以及收尾之后那个 `run_id` 再发工具会被拒（不变量 31 的三条口径各占一格）。
+  group('真进程端到端（帧与 tool.call 回带 run_id）', () {
+    final String script = p.join(
+      Directory.current.path,
+      'test',
+      'fixtures',
+      'fake_llm_plugin.dart',
+    );
+    late List<Map<String, dynamic>> toolCalls;
+
+    String slash(String path) => path.replaceAll(Platform.pathSeparator, '/');
+
+    String pluginEntry(List<String> flags) =>
+        '  - id: runner\n'
+        '    name: 假 LLM 插件\n'
+        '    command: "${slash(Platform.resolvedExecutable)}"\n'
+        '    args: [${<String>[script, ...flags].map((String f) => '"${slash(f)}"').join(', ')}]\n'
+        '    granularity: team\n'
+        '    scope: {team_id: $team}\n';
+
+    /// 等插件把 `loop.run` 的订阅建立起来（真进程：起进程 → 主动 subscribe 有延迟）。
+    ///
+    /// 拿不到就直接失败并把插件 stderr 打出来：否则“没接管”会伪装成“行为不对”。
+    Future<void> waitForRunSubscription(PluginBus bus) async {
+      final RelayStation? station = bus.stations.relayPointFor(
+        StationHubIds.relayLoopRun,
+      );
+      final DateTime deadline = DateTime.now().add(const Duration(seconds: 20));
+      while (DateTime.now().isBefore(deadline)) {
+        if (station != null && station.subscribers.isNotEmpty) return;
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      }
+      fail(
+        '插件没订阅上 ${StationHubIds.relayLoopRun}；日志：${logs.join(' | ')}；'
+        '插件 stderr：'
+        '${bus.instances().map((({String pluginId, PluginHost host}) i) => '${i.pluginId}: ${i.host.stderrTail}').join(' /// ')}',
+      );
+    }
+
+    /// 起一条带真插件与真执行站的总线（挂载口径照 `CoreServer`：`runToolNote` /
+    /// `activeLoopRunOf` 都递的是总线那两个方法，不是测试里现造的桩）。
+    Future<PluginBus> startRealBus(List<String> flags) async {
+      toolCalls = <Map<String, dynamic>>[];
+      final String dir = p.join(temp.path, 'bus-${++busSeq}');
+      final File file = File(p.join(dir, 'config', 'plugins.yaml'));
+      file.createSync(recursive: true);
+      file.writeAsStringSync('enabled: true\nplugins:\n${pluginEntry(flags)}');
+      final String workspace = p.join(dir, 'ws');
+      Directory(workspace).createSync(recursive: true);
+      final PluginBus bus = PluginBus(
+        configFile: file.path,
+        coreVersion: 'test',
+        heartbeatInterval: const Duration(seconds: 30),
+        log: logs.add,
+      );
+      bus.callSiteContext = (String agentId, String sessionId) =>
+          StationScopeContext(
+            teamId: team,
+            agentId: agentId,
+            sessionId: sessionId,
+          );
+      bus.agentModeKeyResolver = (String agentId) =>
+          agentId == agent ? StationModeKey.local : '';
+      bus.mountExecuteStations(
+        ExecuteStationMounts(
+          ioFor: (String agentId) async => LocalWorkspaceIO(workspace),
+          agentTeamOf: (String agentId) => agentId == agent ? team : '',
+          agentModeOf: (String agentId) =>
+              agentId == agent ? StationModeKey.local : '',
+          runToolNote: bus.noteRunToolActivity,
+          activeLoopRunOf: bus.activeLoopRunOf,
+          toolCaller:
+              ({
+                required String agentId,
+                required String sessionId,
+                required String tool,
+                required Map<String, dynamic> arguments,
+                required String sourcePluginId,
+                required bool relay,
+              }) async {
+                toolCalls.add(<String, dynamic>{
+                  'tool': tool,
+                  'arguments': arguments,
+                  'agent_id': agentId,
+                  'session_id': sessionId,
+                });
+                return const ToolOutcome('文件内容');
+              },
+        ),
+      );
+      addTearDown(bus.close);
+      await bus.start();
+      await waitForRunSubscription(bus);
+      return bus;
+    }
+
+    test('回 stream:true ⇒ 真帧翻成会话认的那套事件（且只一条 Done）', () async {
+      final String payloadFile = p.join(temp.path, 'payload.json');
+      final PluginBus bus = await startRealBus(<String>[
+        '--subscribe-point',
+        StationHubIds.relayLoopRun,
+        '--loop-mode',
+        'stream',
+        '--loop-payload-file',
+        payloadFile,
+      ]);
+      final Stream<AgentEvent>? stream = await run(bus);
+      expect(stream, isNotNull, reason: '插件回了 stream:true，核心必须给一条流');
+      final List<AgentEvent> got = <AgentEvent>[];
+      await stream!.timeout(const Duration(seconds: 20)).forEach(got.add);
+
+      expect(got.map((AgentEvent e) => e.runtimeType).toList(), <Type>[
+        AgentText,
+        AgentNotice,
+        AgentUsage,
+        AgentDone,
+      ], reason: '顺序也是语义：界面按到达顺序渲染（$got）');
+      expect((got[0] as AgentText).delta, '查完了');
+      expect((got[1] as AgentNotice).text, '再跑一个工具');
+      expect((got[2] as AgentUsage).usage, <String, dynamic>{
+        'prompt_tokens': 11,
+        'completion_tokens': 5,
+        'total_tokens': 16,
+        'max_tokens': 8000,
+      }, reason: '接管者只报了 prompt/completion：total 与上限都由核心补齐');
+      expect((got[3] as AgentDone).cancelled, isFalse);
+      expect(
+        bus.activeLoopRunOf(sessionId: session),
+        isNull,
+        reason: '收尾必须销账：挂着在册的 run 会让后面的 tool.call 假装还能播卡片',
+      );
+      // payload 真的走过了管道：消息表与工具表都是核心这一轮那份
+      final Map<String, dynamic> sent = jsonDecode(
+        File(payloadFile).readAsStringSync().trim(),
+      ) as Map<String, dynamic>;
+      expect(sent['point'], StationHubIds.relayLoopRun);
+      expect(sent['agent_id'], agent);
+      expect(sent['session_id'], session);
+      expect(sent['model'], 'm-test');
+      expect(sent['message_count'], 1);
+      expect((sent['messages'] as List<dynamic>).first, <String, dynamic>{
+        'role': 'user',
+        'content': '开工',
+      });
+      expect((sent['tools'] as List<dynamic>).single['name'], 'read');
+    });
+
+    test('接管者经 tool.call 回带 run_id ⇒ 卡片由核心播进这一轮', () async {
+      final String resultFile = p.join(temp.path, 'tool-result.json');
+      final PluginBus bus = await startRealBus(<String>[
+        '--subscribe-point',
+        StationHubIds.relayLoopRun,
+        '--loop-mode',
+        'tool',
+        '--loop-result-file',
+        resultFile,
+      ]);
+      final Stream<AgentEvent>? stream = await run(bus);
+      expect(stream, isNotNull);
+      final List<AgentEvent> got = <AgentEvent>[];
+      await stream!.timeout(const Duration(seconds: 20)).forEach(got.add);
+
+      expect(toolCalls, hasLength(1), reason: '工具真的过了执行站那一条唯一入口');
+      expect(toolCalls.single['tool'], 'echo_for_loop_test');
+      expect(toolCalls.single['agent_id'], agent);
+      expect(
+        got.whereType<AgentToolStart>().single.name,
+        'echo_for_loop_test',
+        reason: '卡片是**核心**从 tool.call 那条路播的，不是插件自己推的（$got）',
+      );
+      final AgentToolStart start = got.whereType<AgentToolStart>().single;
+      final AgentToolEnd end = got.whereType<AgentToolEnd>().single;
+      expect(end.id, start.id, reason: '不成对就会在面板上留一张永远转圈的卡片');
+      expect(end.result, '文件内容');
+      expect(got.whereType<AgentDone>(), hasLength(1));
+      expect(File(resultFile).readAsStringSync(), contains('文件内容'));
+    });
+
+    test('收尾之后再拿同一个 run_id 发工具 ⇒ 核心当场拒（不收孤儿）', () async {
+      final String resultFile = p.join(temp.path, 'late-result.json');
+      final PluginBus bus = await startRealBus(<String>[
+        '--subscribe-point',
+        StationHubIds.relayLoopRun,
+        '--loop-mode',
+        'late-tool',
+        '--loop-result-file',
+        resultFile,
+      ]);
+      final Stream<AgentEvent>? stream = await run(bus);
+      expect(stream, isNotNull);
+      final List<AgentEvent> got = <AgentEvent>[];
+      await stream!.timeout(const Duration(seconds: 20)).forEach(got.add);
+      expect(got.whereType<AgentDone>(), hasLength(1));
+
+      // 等插件把那次孤儿调用的响应落盘（它在 done 之后才发）
+      final DateTime deadline = DateTime.now().add(const Duration(seconds: 15));
+      while (DateTime.now().isBefore(deadline) &&
+          !File(resultFile).existsSync()) {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      }
+      expect(
+        File(resultFile).existsSync(),
+        isTrue,
+        reason: '插件真的发了那次 tool.call（不然“被拒”只是“没发生”）',
+      );
+      expect(
+        logs.where((String l) => l.contains('不在册')).join(' | '),
+        contains('这次工具调用已被拒'),
+      );
+      expect(toolCalls, isEmpty, reason: '孤儿调用不得真的跑工具（那就是改完磁盘没人知道）');
+      final String text = File(resultFile).readAsStringSync();
+      expect(text, contains('不在册'), reason: '插件侧看到的必须是被拒的理由：$text');
+    });
+
+    test('插件明确让路（taken:false）⇒ 核心返回 null，不造第二条流', () async {
+      final PluginBus bus = await startRealBus(<String>[
+        '--subscribe-point',
+        StationHubIds.relayLoopRun,
+        '--loop-mode',
+        'decline',
+      ]);
+      expect(await run(bus), isNull);
+      expect(bus.openLoopRuns, 0, reason: '没接管就一条在册的整轮也不该有');
+    });
+
+    test('只回整包（无 stream:true）⇒ null + 一行“这一条只收流式”', () async {
+      final PluginBus bus = await startRealBus(<String>[
+        '--subscribe-point',
+        StationHubIds.relayLoopRun,
+        '--loop-mode',
+        'whole',
+      ]);
+      expect(await run(bus), isNull);
+      expect(
+        logs.any((String l) => l.contains('只回了整包')),
+        isTrue,
+        reason: '真进程上也要能查出为什么没生效：$logs',
       );
     });
   });

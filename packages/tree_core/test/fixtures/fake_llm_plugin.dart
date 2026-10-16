@@ -29,6 +29,17 @@ import 'dart:io';
 /// - `--prompt-mode MODE`：`system.relay.prompt.system` 的回包——
 ///   `text`（`"插件改写后的提示词"`）/ `empty`（空串 = 明确不要系统提示词）/
 ///   `map`（`{"prompt": "..."}`）。
+/// - `--loop-mode MODE`：**整轮接管** `system.relay.loop.run`（阶段 8）——
+///   `stream`（回 `stream:true` 后推 text / notice / usage+done）/
+///   `tool`（推一条文本后经执行站 `tool.call` **回带 run_id** 发一次工具，再 done）/
+///   `late-tool`（先 done 收尾，再拿同一个 run_id 发 tool.call ⇒ 核心必须拒）/
+///   `decline`（回 `{taken:false}` 明确让路）/ `whole`（只回整包、无 stream）。
+/// - `--loop-payload-file FILE`：把 `loop.run` 收到的**完整 payload** 追成一行 JSON
+///   （载荷契约用例据此断言核心真的把这一轮的消息表与工具表递出来了）。
+/// - `--loop-result-file FILE`：把 `tool.call` 的**核心响应**追成一行 JSON
+///   （孤儿调用那条要看到“真的被拒”，而不是“插件没发出去”）。
+/// - `--loop-agent ID` / `--loop-session ID`：那次 `tool.call` 的目标归属
+///   （执行站按四元组 fail-closed，默认与接管那一轮用同一个 agent / 会话）。
 /// - `--record FILE`：把收到的**每条通知**（method + params）逐行追加为 JSON；
 ///   取消用例据此查证插件确实收到了核心下发的 `station/cancel`。
 /// - `--request-log FILE`：把每个 `llm.handle` 请求的 `request_id` 写成一行
@@ -62,6 +73,11 @@ void main(List<String> args) {
   final String compactMode = arg('--compact-mode');
   final String compactLogFile = arg('--compact-log');
   final String promptMode = arg('--prompt-mode');
+  final String loopMode = arg('--loop-mode');
+  final String loopPayloadFile = arg('--loop-payload-file');
+  final String loopResultFile = arg('--loop-result-file');
+  final String loopAgent = arg('--loop-agent', 'agt_1');
+  final String loopSession = arg('--loop-session', 'ses_default');
   final String recordFile = arg('--record');
   final String requestLogFile = arg('--request-log');
   final String finishFile = arg('--finish-file');
@@ -229,6 +245,87 @@ void main(List<String> args) {
       case 'exit-after-stream':
         break;
     }
+  }
+
+  /// **整轮接管**（`system.relay.loop.run`，阶段 8）的回包：只收流式，
+  /// 所以除了 `stream` / `tool` / `late-tool` 三种，其余都应当被核心退回内置 loop。
+  Map<String, dynamic>? loopHandlePayload() {
+    switch (loopMode) {
+      case 'stream':
+      case 'tool':
+      case 'late-tool':
+        return <String, dynamic>{'stream': true};
+      case 'decline':
+        return <String, dynamic>{'taken': false};
+      case 'whole':
+        // 只回整包（没有 stream）：核心必须按“没接管”走，并留下一行说明。
+        return <String, dynamic>{'taken': true, 'text': '我一次性把整轮说完了'};
+      default:
+        return null;
+    }
+  }
+
+  /// 经执行站发一次工具（**回带 run_id**）：这条是“写侧仍在核心”的真进程路——
+  /// 卡片由核心播，不在册则这次调用被拒。响应写进 `--loop-result-file`。
+  Future<void> callToolInRun(String runId) async {
+    final Map<String, dynamic> response = await requestCore(
+      'station/command',
+      <String, dynamic>{
+        'station_id': StationIds.executeTool,
+        'command': 'tool.call',
+        'arguments': <String, dynamic>{
+          'agent_id': loopAgent,
+          'session_id': loopSession,
+          'tool': 'echo_for_loop_test',
+          'arguments': <String, dynamic>{'path': 'a.txt'},
+          'run_id': runId,
+          'call_id': 'call_run_1',
+        },
+      },
+    );
+    appendLine(loopResultFile, jsonEncode(response));
+    log('tool.call($runId) → ${jsonEncode(response)}');
+  }
+
+  /// 整轮接管的事件正文（挂在 unawaited 上：读循环随时要能处理 ping 与 cancel）。
+  Future<void> pushRunStream(String requestId) async {
+    if (loopMode != 'stream' && loopMode != 'tool' && loopMode != 'late-tool') {
+      return;
+    }
+    await gap();
+    notify('station/stream', <String, dynamic>{
+      'request_id': requestId,
+      'delta': <String, dynamic>{'kind': 'text', 'text': '查完了'},
+    });
+    if (loopMode == 'late-tool') {
+      // 先收尾：之后那次 tool.call 拿的是**已经不在册**的 run_id。
+      await gap();
+      notify('station/stream', <String, dynamic>{
+        'request_id': requestId,
+        'done': true,
+        'finish_reason': 'stop',
+      });
+      await callToolInRun(requestId);
+      return;
+    }
+    await gap();
+    notify('station/stream', <String, dynamic>{
+      'request_id': requestId,
+      'delta': <String, dynamic>{'kind': 'notice', 'text': '再跑一个工具'},
+    });
+    if (loopMode == 'tool') {
+      await callToolInRun(requestId);
+    }
+    await gap();
+    notify('station/stream', <String, dynamic>{
+      'request_id': requestId,
+      'done': true,
+      'finish_reason': 'stop',
+      'usage': <String, dynamic>{
+        'prompt_tokens': 11,
+        'completion_tokens': 5,
+      },
+    });
   }
 
   /// 冒名往**别的插件**的 request_id 推一条增量（归属校验用）。
@@ -442,6 +539,15 @@ void main(List<String> args) {
           }
           return;
         }
+        if (point == StationIds.relayLoopRun) {
+          appendLine(loopPayloadFile, jsonEncode(params['payload'] ?? params));
+          final Map<String, dynamic>? payload = loopHandlePayload();
+          reply(<String, dynamic>{
+            'reply': <String, dynamic>{'payload': payload},
+          });
+          unawaited(pushRunStream(requestId));
+          return;
+        }
         if (point == StationIds.relayLlmRequest) {
           if (llmRequestMode == 'rewrite') {
             reply(<String, dynamic>{
@@ -558,4 +664,6 @@ abstract final class StationIds {
   static const String relayLlmRequest = 'system.relay.llm.request';
   static const String relayContextCompact = 'system.relay.context.compact';
   static const String relayPromptSystem = 'system.relay.prompt.system';
+  static const String relayLoopRun = 'system.relay.loop.run';
+  static const String executeTool = 'system.execute.tool';
 }

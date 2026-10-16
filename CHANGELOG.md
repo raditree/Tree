@@ -57,10 +57,14 @@
     一定会漂，而漂了的表现是「取消偶尔不生效」这种最难查的 bug。
   - **工具表内置与接管者必须同一份**：`tools` 与 `messages` 一起进 payload（这份表同时决定
     缓存前缀，不变量 15），不由接管者自己拼。
-  - 用例：`plugin_loop_relay_test.dart`（**15**：六个交付位齐 / 接管判据三种各留说明 / payload
-    形状 / 在册可查与归属 / 取消只一条 Done / 孤儿 `tool.call` 被拒 / 卡片成对 /
-    `agent.message` 双写拒绝 / usage 同表）；派生计数同步 8 份（点位表与预建数量、快照、
-    中转站条数）。
+  - 用例：`plugin_loop_relay_test.dart`（**20**，分两层）——总线内一层钉接管判据三种（各留一行
+    说明）、payload 形状、在册可查与归属、取消只一条 Done、孤儿 `run_id` 被拒、卡片成对、
+    `agent.message` 双写拒绝、`usage` 同表；**真进程一层**（夹具 `fake_llm_plugin.dart` 新增
+    `--loop-mode stream|tool|late-tool|decline|whole`）钉 `station/stream` 的帧真能翻成会话认的
+    那套事件（text/notice/usage/done 按序且只一条 Done）、接管者的工具真经执行站 `tool.call`
+    回到核心（卡片由核心播、`end.id == start.id`）、**收尾后再拿同一个 `run_id` 发工具 ⇒ 工具
+    根本没跑（`toolCaller` 零记录）且插件收到可读的拒**。派生计数同步 8 份（点位表与预建数量、
+    快照、中转站条数）。
 - **加一个点位要同时交付六件；看现场一律只读；并发形状必须有上界**（**新增**
   [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 30、
   [docs/plugin-development.md](docs/plugin-development.md) §3.1 / §6.9 / §7.1）（plan 阶段 6：A 级点位批 +

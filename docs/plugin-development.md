@@ -1040,7 +1040,10 @@ plugins:
   接法与其他中转点位完全一致；`system.relay.loop.run`（**整轮接管**）——口径与帧序列见
   §5.6，没示例是因为接管者得**自带一份模型调用**（它才是循环的主人）：`sample_plugin.py`
   里那套 `--relay-llm` 的流式写法就是它的下半身，把“每跳被问一次”换成“每轮被问一次”
-  并把工具改成 `tool.call` + `run_id` 即成。
+  并把工具改成 `tool.call` + `run_id` 即成。要看逐帧形状，读测试夹具
+  [`test/fixtures/fake_llm_plugin.dart`](../packages/tree_core/test/fixtures/fake_llm_plugin.dart)
+  的 `--loop-mode`（`stream` / `tool` / `late-tool` / `decline` / `whole` 五种回法，
+  端到端用例在 `test/plugin_loop_relay_test.dart`）。
 - 运行：把 `examples/plugins/` 下的脚本拷到桌面端的 `plugins/` 目录（或直接写绝对路径），
   在「设置 → 插件开发」里启用，即可在面板与消息流里看到它。
 

@@ -360,8 +360,11 @@
     心跳丢失收尾全部复用 `llm.handle` 那条插件流（`_PluginLlmStream` + `_guardPluginStream`）——
     两套守护一定会漂，而漂了就变成“取消偶尔不生效”这种最难查的 bug。引擎侧只多一处分流
     （**进入 LlmSession 之前**），`LlmSession` 本身一行未改。
-    用例：`plugin_loop_relay_test.dart`（15：接管判据三种、payload 形状、在册可查、取消只一条
-    Done、孤儿 tool.call 被拒、卡片成对与归属、agent.message 双写拒绝、usage 同表）。
+    用例：`plugin_loop_relay_test.dart`（**20，分两层**）——总线内一层 15 条（接管判据三种、
+    payload 形状、在册可查、取消只一条 Done、孤儿 tool.call 被拒、卡片成对与归属、
+    agent.message 双写拒绝、usage 同表）；**真插件进程一层 5 条**（夹具 `fake_llm_plugin.dart`
+    新增 `--loop-mode`）：因为“写进了回包”≠“走到了插件”——帧的解码、工具经执行站回到核心、
+    收尾后那个 run_id 再发工具被拒（工具**根本没跑**），这些都只能在真进程上钉。
 
 ## 测试
 
