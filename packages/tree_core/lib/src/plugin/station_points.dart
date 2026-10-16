@@ -136,6 +136,84 @@ abstract final class StationPoints {
           '三者是独立的轴，谁也不得吃掉谁；要看某个插件的当前读数请下执行站命令 '
           '`plugin.state`（那是“问”，这里是“推”）。',
     ),
+    StationPointSpec(
+      id: StationHubIds.broadcastTurnDone,
+      kind: StationKind.broadcast,
+      label: '本轮结束',
+      description:
+          '广播站·本轮结束：agent 一轮生成**正常收尾**时广播一条（单向通知；载荷含 '
+          'agent_id / session_id / team_id / content_chars / elapsed_ms / finish_reason / tool_rounds）',
+      alias: 'turn.done',
+      readme:
+          '一轮生成**正常结束**时的单向通知：发布点在会话服务收尾那一处（与前端收到的 '
+          'msg_end 同一时机）。适合做耗时统计、轮次上限、计费汇总。载荷**只有度量，不带正文**：'
+          '正文的正经读处是会话存储与 REST，广播里塞全文等于把用户的内容复制进每一个插件。'
+          '回包只当送达确认。与 turn.cancelled / turn.error **互斥**：同一轮只会出一条，'
+          '统计口径因此不需要先判“到底有几个结束事件”。',
+    ),
+    StationPointSpec(
+      id: StationHubIds.broadcastTurnCancelled,
+      kind: StationKind.broadcast,
+      label: '本轮取消',
+      description:
+          '广播站·本轮取消：一轮生成被**用户停止**或**被新消息插话**时广播一条（单向通知；'
+          '载荷含 source = user_stop | interjection，与 turn.done 互斥）',
+      alias: 'turn.cancelled',
+      readme:
+          '一轮被**取消**时的单向通知：用户按停止、或新消息插话打断本轮（插话会先停旧轮再开新轮）。'
+          '为什么单独一个点位而不复用 turn.done 加个键：两种结局的统计口径完全不同（失败率、'
+          '平均耗时都靠它），把它们挤在一条里就只能靠“读一个可选键”分家，而那种形状迟早漂移。'
+          '`source` 固定两个取值（`user_stop` / `interjection`）：**插话不算“用户停了本轮”**。'
+          '回包不参与业务，也不会因为广播改变取消语义（取消已发生，这里是通知）。',
+    ),
+    StationPointSpec(
+      id: StationHubIds.broadcastTurnError,
+      kind: StationKind.broadcast,
+      label: '本轮失败',
+      description:
+          '广播站·本轮失败：一轮以可读错误文案收尾时广播一条（单向通知；载荷含 error / '
+          'failed_after_tools；文案与用户看到的同一句）',
+      alias: 'turn.error',
+      readme:
+          '一轮**错误终止**时的单向通知：载荷里的 `error` 就是核心已经发给用户那句可读文案'
+          '（不另造一套说法），`failed_after_tools` 表示它是不是在工具循环中途坏的。'
+          '取消与错误同时发生时**先报错误**：取消是用户意图，错误才是这一轮的实际结论。'
+          '本点位**不能判死**也不改变重试：重试退避是传输层的事，插件在这里只能观察。'
+          '广播是单向的：订阅者抛异常也不会让生成失败（与 turn.done 同一个派发入口）。',
+    ),
+    StationPointSpec(
+      id: StationHubIds.broadcastAskPaused,
+      kind: StationKind.broadcast,
+      label: '提问暂停',
+      description:
+          '广播站·提问暂停：`ask_user_question` 落盘并推帧后、开始等作答时广播一条'
+          '（单向通知；载荷含 question_id / question_count，**不带题面与选项**）',
+      alias: 'ask.paused',
+      readme:
+          'agent **等人作答**这一刻的单向通知：发布点在提问回路把问题落盘、推帧之后，开始'
+          '等待之前（不是工具执行前：那时还证明不了这个问题真的在等人）。适合做“长时间没人答”'
+          '提醒、把待答问题转送到其它渠道。载荷**不带题面与选项**，只有 `question_id` 与'
+          ' `question_count`：那是用户与 agent 之间的内容，审计只需要知道“谁在等、等几道”。'
+          '回包**不会**替你答题：作答只有面板 / 右栏 / REST 那三条用户入口，'
+          '插件代答会直接假成“用户说了话”。',
+    ),
+    StationPointSpec(
+      id: StationHubIds.broadcastConfigChanged,
+      kind: StationKind.broadcast,
+      label: '插件清单变更',
+      description:
+          '广播站·插件清单变更：`applyConfigs()` 逐条对账**完成后**每条动作广播一条'
+          '（单向通知；action = started | stopped | restarted | failed，与 PluginReconcileKind 同源；'
+          '**unchanged 不广播**）',
+      alias: 'config.changed',
+      readme:
+          '插件**清单对账结果**的单向通知：面板改开关、REST 写条目、发布仓库装完都会走到'
+          '同一条对账（`PluginBus.applyConfigs`），这里就在那一遍逐条结果之后发。载荷的 `action` '
+          '与对账结论同源（started / stopped / restarted / failed），带 plugin_id / reason / generation。'
+          '**unchanged 一律不发**：“没改动”不是变更；把它也广播出去，监听插件会被每次对账白叫醒'
+          '一次，而它读到的状态与上一帧完全一样。回包不参与业务；**这个点位不能反过来改配置**'
+          '（插件写 plugins.yaml 等于绕开面板那条用户入口，见不变量 29）。',
+    ),
   ];
 
   /// 执行站点位（按命令族）。

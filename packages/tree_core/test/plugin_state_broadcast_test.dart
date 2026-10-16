@@ -138,7 +138,7 @@ void main() {
       contains('活性看 `health`、启停看 `status`、阶段看 `lifecycle`'),
       reason: 'readme 必须把三轴纪律写给插件作者（这是本点位最容易混的地方）',
     );
-    expect(StationPoints.ofKind(StationKind.broadcast), hasLength(5));
+    expect(StationPoints.ofKind(StationKind.broadcast), hasLength(10));
   });
 
   test('启动 = booting + ready 各一条广播，载荷字段齐全', () async {

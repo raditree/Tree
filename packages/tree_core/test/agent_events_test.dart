@@ -180,7 +180,11 @@ void main() {
 
       await send('跑两个工具');
 
-      expect(events, hasLength(4), reason: '两次工具调用 ⇒ 两条 start + 两条 end');
+      expect(
+        events,
+        hasLength(5),
+        reason: '两次工具调用（start + end 各两条）+ 本轮一条结局事件',
+      );
       expect(events[0], <String, dynamic>{
         'event': AgentEvents.toolCall,
         'agent_id': agentId,
@@ -202,8 +206,83 @@ void main() {
 
       // 顺序与帧/落库一致：start 在 end 之前（同一 call_id 成对）
       expect(
-        events.map((Map<String, dynamic> e) => '${e['call_id']}:${e['phase']}'),
+        events
+            .where((Map<String, dynamic> e) => e['event'] == AgentEvents.toolCall)
+            .map((Map<String, dynamic> e) => '${e['call_id']}:${e['phase']}'),
         <String>['call_a:start', 'call_a:end', 'call_b:start', 'call_b:end'],
+      );
+      // 本轮结局（阶段 6 的广播点位）：**恰好一条**，且只有度量
+      expect(events.last['event'], AgentEvents.turnDone);
+      expect(events.last['tool_rounds'], 2, reason: '与两条 start 的轮次同源');
+      expect(events.last['finish_reason'], 'stop');
+      expect(events.last.containsKey('content'), isFalse);
+    });
+
+    test('本轮失败 ⇒ 只发 turn.error，不发 turn.done / turn.cancelled', () async {
+      await start(<AgentEvent>[
+        AgentToolStart(
+          id: 'tool_a',
+          callId: 'call_a',
+          name: 'read',
+          arguments: const <String, dynamic>{'file_path': 'a.txt'},
+        ),
+        const AgentToolEnd(id: 'tool_a', name: 'read', result: 'A 的内容'),
+        const AgentError('生成失败：端点返回 500'),
+      ]);
+      final List<Map<String, dynamic>> events = <Map<String, dynamic>>[];
+      server.conversation.agentEvents.sink = events.add;
+
+      await send('跑一个工具然后坏掉');
+
+      final List<String> names = events
+          .map((Map<String, dynamic> e) => '${e['event']}')
+          .toList(growable: false);
+      expect(
+        names.where((String n) => n.startsWith('agent.turn.')),
+        <String>[AgentEvents.turnError],
+        reason: '三条互斥：坏掉的那一轮不能又报成功又报取消',
+      );
+      final Map<String, dynamic> turn = events.last;
+      expect(
+        turn['error'],
+        '生成失败：端点返回 500',
+        reason: '与用户看到的那一句同源（不另造一套说法）',
+      );
+      expect(turn['failed_after_tools'], isTrue, reason: '确实跑过一个工具');
+    });
+
+    test('本轮被取消 ⇒ turn.cancelled（来源可分），而不是一条成功的结束', () async {
+      await start(<AgentEvent>[
+        const AgentText('说到一半'),
+        const AgentDone(cancelled: true),
+      ]);
+      final List<Map<String, dynamic>> events = <Map<String, dynamic>>[];
+      server.conversation.agentEvents.sink = events.add;
+
+      ws.send(<String, dynamic>{
+        'type': WsInboundType.userMessage,
+        'agent_id': agentId,
+        'content': '随便说两句',
+        'session_id': sessionId,
+      });
+      await waitIdle(ws);
+      // 引擎以 `AgentDone(cancelled: true)` 交出“这一轮被停了”——这与用户按 stop
+      // 是同一条事实（会话层本来就按这个键置 cancelled）。
+
+      expect(
+        events.map((Map<String, dynamic> e) => '${e['event']}'),
+        containsAllInOrder(<String>[AgentEvents.turnCancelled]),
+      );
+      final Map<String, dynamic> turn = events.last;
+      expect(
+        turn['source'],
+        AgentEvents.sourceUserStop,
+        reason: '不是插话（没有新消息进来），只能算用户停了本轮',
+      );
+      expect(
+        events.where((Map<String, dynamic> e) => e['event'] == AgentEvents.turnDone),
+        isEmpty,
+        reason: '取消的轮不算正常结束（否则失败率统计会把停掉的当成成功）',
       );
     });
 

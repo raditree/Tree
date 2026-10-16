@@ -141,6 +141,9 @@ Future<void> main(List<String> args) async {
     questions: questionStore,
     transcript: store,
     broadcast: (Map<String, dynamic> frame) => hubSink?.call(frame),
+    // 阶段 6（广播站点位 ask.paused）：问题落盘并推帧后，经**同一个** agent 事件入口
+    // 投给订了这个点位的插件（没接线 / 没人订 = 零开销，提问行为不变）。
+    onAskPaused: plugins.dispatchAgentEvent,
     log: coreLog.forPrefix('core:ask'),
   );
   // 团队服务：成员就是 agent（`agents/<id>.yaml`）。working 状态同样后置绑定到

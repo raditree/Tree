@@ -28,6 +28,21 @@ abstract final class AgentEvents {
   /// - `phase`：[phaseStart] | [phaseEnd]（结束事件用于统计耗时）。
   static const String toolCall = 'agent.tool_call';
 
+  /// 本轮**正常结束**（与下面三条互斥：同一轮只出一条）。
+  ///
+  /// 载荷字段：`{event, agent_id, session_id, team_id, content_chars, elapsed_ms,
+  /// finish_reason, tool_rounds}`。**不带正文**（见 `StationHubIds.broadcastTurnDone`）。
+  static const String turnDone = 'agent.turn.done';
+
+  /// 本轮被**取消**（额外带 `source` = `user_stop` | `interjection`）。
+  static const String turnCancelled = 'agent.turn.cancelled';
+
+  /// 本轮以**可读错误**收尾（额外带 `error` 与 `failed_after_tools`）。
+  static const String turnError = 'agent.turn.error';
+
+  /// agent **开始等用户作答**（额外带 `question_id` 与 `question_count`）。
+  static const String askPaused = 'agent.ask.paused';
+
   /// 事件名字段（`{event: 'agent.tool_call', ...}`）。
   static const String fieldEvent = 'event';
 
@@ -57,6 +72,42 @@ abstract final class AgentEvents {
 
   /// [fieldPhase] 的取值：工具调用结束。
   static const String phaseEnd = 'end';
+
+  /// 本轮正文字符数（**度量，不是内容**）。
+  static const String fieldContentChars = 'content_chars';
+
+  /// 本轮耗时（毫秒，从进入生成到收尾）。
+  static const String fieldElapsedMs = 'elapsed_ms';
+
+  /// 端点给的 `finish_reason`（stop / length / tool_calls …）。空串 = 端点没给。
+  static const String fieldFinishReason = 'finish_reason';
+
+  /// 本轮工具调用次数（与 `round` 同源，结束时即为总数）。
+  static const String fieldToolRounds = 'tool_rounds';
+
+  /// 取消来源（`user_stop` | `interjection`；**插话不算“用户停了本轮”**）。
+  static const String fieldSource = 'source';
+
+  /// 错误文案（与用户看到的那一句同源）。
+  static const String fieldError = 'error';
+
+  /// 错误发生在工具循环中途？（插件据此判“已干了半活”）。
+  static const String fieldFailedAfterTools = 'failed_after_tools';
+
+  /// 提问 id（去 REST / 右栏对得上号）。
+  static const String fieldQuestionId = 'question_id';
+
+  /// 本次提问的题目数（一次提问 = 一张卡片，里面可含 N 道题）。
+  static const String fieldQuestionCount = 'question_count';
+
+  /// 临时员工归属（主 agent 不带这个键）。
+  static const String fieldSubagentId = 'subagent_id';
+
+  /// 取消来源的取值：用户按停止。
+  static const String sourceUserStop = 'user_stop';
+
+  /// 取消来源的取值：被新消息**插话**打断。
+  static const String sourceInterjection = 'interjection';
 }
 
 /// agent 事件的订阅入口（生产路径 = `PluginBus.dispatchAgentEvent`）。
@@ -120,4 +171,99 @@ class AgentEventPublisher {
       );
     }
   }
+
+  /// 本轮**正常结束**（与 [turnCancelled] / [turnError] 互斥，同一轮只发一条）。
+  ///
+  /// [contentChars] = 本轮正文**字数**（不是内容）；[toolRounds] = 本轮工具调用次数。
+  void turnDone({
+    required String agentId,
+    required String sessionId,
+    required String teamId,
+    required int contentChars,
+    required int elapsedMs,
+    required int toolRounds,
+    String finishReason = '',
+  }) {
+    _deliver(<String, dynamic>{
+      AgentEvents.fieldEvent: AgentEvents.turnDone,
+      AgentEvents.fieldAgentId: agentId,
+      AgentEvents.fieldSessionId: sessionId,
+      AgentEvents.fieldTeamId: teamId,
+      AgentEvents.fieldContentChars: contentChars,
+      AgentEvents.fieldElapsedMs: elapsedMs,
+      AgentEvents.fieldToolRounds: toolRounds,
+      AgentEvents.fieldFinishReason: finishReason,
+    });
+  }
+
+  /// 本轮被**取消**（[source] = [AgentEvents.sourceUserStop] |
+  /// [AgentEvents.sourceInterjection]：两种取消在审计里必须分得开）。
+  void turnCancelled({
+    required String agentId,
+    required String sessionId,
+    required String teamId,
+    required String source,
+    required int contentChars,
+    required int elapsedMs,
+    required int toolRounds,
+    String subagentId = '',
+  }) {
+    _deliver(<String, dynamic>{
+      AgentEvents.fieldEvent: AgentEvents.turnCancelled,
+      AgentEvents.fieldAgentId: agentId,
+      AgentEvents.fieldSessionId: sessionId,
+      AgentEvents.fieldTeamId: teamId,
+      AgentEvents.fieldSource: source,
+      AgentEvents.fieldContentChars: contentChars,
+      AgentEvents.fieldElapsedMs: elapsedMs,
+      AgentEvents.fieldToolRounds: toolRounds,
+      if (subagentId.isNotEmpty) AgentEvents.fieldSubagentId: subagentId,
+    });
+  }
+
+  /// 本轮以**可读错误**收尾（[message] 就是核心已经发给用户的那一句）。
+  ///
+  /// 取消与错误同时发生时走这里：取消是用户意图，错误才是这一轮的实际结论。
+  void turnError({
+    required String agentId,
+    required String sessionId,
+    required String teamId,
+    required String message,
+    required bool failedAfterTools,
+    required int contentChars,
+    required int elapsedMs,
+    required int toolRounds,
+  }) {
+    _deliver(<String, dynamic>{
+      AgentEvents.fieldEvent: AgentEvents.turnError,
+      AgentEvents.fieldAgentId: agentId,
+      AgentEvents.fieldSessionId: sessionId,
+      AgentEvents.fieldTeamId: teamId,
+      AgentEvents.fieldError: message,
+      AgentEvents.fieldFailedAfterTools: failedAfterTools,
+      AgentEvents.fieldContentChars: contentChars,
+      AgentEvents.fieldElapsedMs: elapsedMs,
+      AgentEvents.fieldToolRounds: toolRounds,
+    });
+  }
 }
+
+/// 构造一条 `agent.ask.paused`（**提问回路**用它：那边没有本发布器，只有同一个
+/// 派发入口 `PluginBus.dispatchAgentEvent`）。
+///
+/// 为什么单独放在这里而不是给 `QuestionBroker` 装一个 `PluginBus` 引用：事件**形状**
+/// 归事件层定（字段名只有一份），提问回路只递事实。载荷不带题面与选项。
+Map<String, dynamic> agentAskPausedEvent({
+  required String questionId,
+  required String agentId,
+  required String sessionId,
+  required String teamId,
+  required int questionCount,
+}) => <String, dynamic>{
+  AgentEvents.fieldEvent: AgentEvents.askPaused,
+  AgentEvents.fieldQuestionId: questionId,
+  AgentEvents.fieldAgentId: agentId,
+  AgentEvents.fieldSessionId: sessionId,
+  AgentEvents.fieldTeamId: teamId,
+  AgentEvents.fieldQuestionCount: questionCount,
+};

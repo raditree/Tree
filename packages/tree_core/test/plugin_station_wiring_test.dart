@@ -210,9 +210,9 @@ void main() {
     expect(
       bus.stations.stationList().map((StationInstance s) => s.id).toList(),
       expected,
-      reason: '广播 5 + 执行 9 + 中转 7 = 21：每个点位一个独立实例，id 不含 team / mode',
+      reason: '广播 10 + 执行 9 + 中转 7 = 26：每个点位一个独立实例，id 不含 team / mode',
     );
-    expect(bus.stations.stationList(), hasLength(21));
+    expect(bus.stations.stationList(), hasLength(26));
     expect(
       bus.stations.stationList().whereType<CollectStation>(),
       isEmpty,
@@ -234,7 +234,7 @@ void main() {
   });
 
   test('站点数不随工作空间模式 / 重启变化（team×mode 不再产生新实例）', () async {
-    expect(bus.stations.stationList(), hasLength(21));
+    expect(bus.stations.stationList(), hasLength(26));
 
     // 同一团队里出现 SSH 工作面的 agent：**不再**多出站点（点位化的核心）。
     // mode 仍是有意义的隔离维度，但它属于消息 scope，不属于站点身份。
@@ -244,7 +244,7 @@ void main() {
     addTearDown(second.close);
     expect(
       bus.stations.stationList(),
-      hasLength(21),
+      hasLength(26),
       reason: 'local / ssh 是同一个点位的两种工作面，不各自建站',
     );
 

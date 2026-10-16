@@ -474,4 +474,75 @@ void main() {
       await runner.close();
     });
   });
+
+  group('提问暂停事件（阶段 6：广播站点位 ask.paused）', () {
+    test('只递 qid 与题数；一次提问一条', () async {
+      // 发布时机 = 问题**落盘并推帧之后**（那时才证明得了“真的在等人”）。
+      // 题面与选项**不进事件**：那是用户与 agent 之间的内容，审计只需要
+      // “谁在等、等几道”（插件代答会直接假成“用户说了话”，所以也不递答案）。
+      final List<Map<String, dynamic>> events = <Map<String, dynamic>>[];
+      final QuestionBroker wired = QuestionBroker(
+        questions: questions,
+        transcript: store,
+        broadcast: frames.add,
+        onAskPaused: events.add,
+        pollInterval: const Duration(milliseconds: 10),
+      );
+      final Future<QuestionOutcome> pending = wired.ask(
+        request(
+          questions: <AskedQuestion>[
+            AskedQuestion(
+              question: '选哪个方案？',
+              options: const <String>['A', 'B'],
+            ),
+            AskedQuestion(question: '要不要顺手改配置？'),
+          ],
+        ),
+      );
+      final QuestionRecord record = questions.list().single;
+      expect(
+        events,
+        hasLength(1),
+        reason: '一次提问 = 一条暂停事件（不是每题一条：等的是一次作答）',
+      );
+      final Map<String, dynamic> event = events.single;
+      expect(event['event'], AgentEvents.askPaused);
+      expect(event['question_id'], record.qid, reason: '要去 REST / 右栏对得上号');
+      expect(event['question_count'], 2);
+      expect(event['agent_id'], agent.id);
+      expect(event['session_id'], sessionId);
+      expect(
+        '$event',
+        isNot(contains('选哪个方案')),
+        reason: '题面与选项不许被复制进插件',
+      );
+      // 事件发布不能抢占提问本身：照常等到作答
+      expect(wired.answer(record.qid, <String>['A', '改']), isTrue);
+      final QuestionOutcome outcome = await pending;
+      expect(outcome.cancelled, isFalse);
+      expect(broker.inFlightCount, 0, reason: '两个 broker 互不干扰');
+    });
+
+    test('订阅方抛异常也不影响提问回路（插件侧问题不能让 agent 问不出话）', () async {
+      final List<String> logs = <String>[];
+      final QuestionBroker wired = QuestionBroker(
+        questions: questions,
+        transcript: store,
+        broadcast: frames.add,
+        onAskPaused: (Map<String, dynamic> _) => throw StateError('插件侧炸了'),
+        log: logs.add,
+        pollInterval: const Duration(milliseconds: 10),
+      );
+      final Future<QuestionOutcome> pending = wired.ask(request());
+      expect(questions.list(), hasLength(1));
+      expect(
+        logs.any((String line) => line.contains('提问暂停事件发布失败')),
+        isTrue,
+        reason: '发不出去要查得到（不变量 6），但不能拖死提问',
+      );
+      final QuestionRecord record = questions.list().single;
+      expect(wired.answer(record.qid, <String>['A']), isTrue);
+      expect((await pending).answer, 'A');
+    });
+  });
 }

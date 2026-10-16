@@ -12,6 +12,7 @@ import '../store/atomic_file.dart';
 import '../store/tree_store.dart';
 import '../store/yaml_codec.dart';
 import '../util/liveness.dart';
+import 'agent_events.dart';
 import 'execute_mounts.dart';
 import 'plugin_host.dart';
 import 'plugin_lifecycle.dart';
@@ -816,6 +817,78 @@ class PluginBus {
     return delivered;
   }
 
+  /// agent 事件名 → **广播站点位**的分流表（阶段 6：A 级点位批）。
+  ///
+  /// 为什么分出去就**不再**走下面的 [dispatch]：那一路是「scope 命中就收」（插件不订阅
+  /// 也收），而点位语义是「订了才投」。同一条事件走两处 = 订了站点的插件收到两份，
+  /// 没订的插件被塞了新事件（后者才是真正会漂移的地方）。`agent.tool_call` 保持原路
+  /// 不变：已有插件靠它数轮次（Q8），改它的投递口径就是改一个已经上线的行为。
+  static const Map<String, String> _agentEventPoints = <String, String>{
+    AgentEvents.turnDone: StationHubIds.broadcastTurnDone,
+    AgentEvents.turnCancelled: StationHubIds.broadcastTurnCancelled,
+    AgentEvents.turnError: StationHubIds.broadcastTurnError,
+    AgentEvents.askPaused: StationHubIds.broadcastAskPaused,
+  };
+
+  /// 广播点位 id 的前缀（topic 由 id 推导用）。
+  static const String _broadcastIdPrefix = 'system.broadcast.';
+
+  /// 点位的 **topic** = 去掉前缀的点位名（`system.broadcast.turn.done` → `turn.done`）。
+  ///
+  /// 由 id 推导而不是再记一张表：别名改了 topic 跟着改，不会出现两处不同名。
+  static String _broadcastTopicOf(String pointId) =>
+      pointId.startsWith(_broadcastIdPrefix)
+      ? pointId.substring(_broadcastIdPrefix.length)
+      : pointId;
+
+  /// 把一条 agent 事件投到它对应的**广播站点位**（只给订阅者，单向不回填）。
+  ///
+  /// 与 [announceToolCall] 同口径：`unawaited`、没人订阅就走快路径零开销、投递失败
+  /// 只记日志。不同点只有一处：**证明不了归属时不静默**（记一行为什么没发），
+  /// 因为这类事件只有会话层在发，发不出来说明接线与 agent 归属对不上。
+  int _announceAgentPoint(
+    String pointId,
+    Map<String, dynamic> event,
+  ) {
+    final BroadcastStation? station = stations.broadcastPointFor(pointId);
+    if (station == null) return 0;
+    if (station.subscribers.isEmpty) return 0; // 快路径：没人订阅，零开销
+    final StationScope scope = runtimeScopeFor(
+      agentId: (event[AgentEvents.fieldAgentId] ?? '').toString(),
+      sessionId: (event[AgentEvents.fieldSessionId] ?? '').toString(),
+    );
+    if (!scope.isValid) {
+      log?.call(
+        'agent 广播 ${event[AgentEvents.fieldEvent]} 未投递（${scope.describe()} '
+        '不能证明归属，fail-closed）',
+      );
+      return 0;
+    }
+    final String topic = _broadcastTopicOf(pointId);
+    unawaited(
+      station
+          .publish(
+            topic: topic,
+            scope: scope,
+            payload: <String, dynamic>{'point': station.id, ...event},
+            meta: <String, dynamic>{
+              'point': station.id,
+              'agent_id': (event[AgentEvents.fieldAgentId] ?? '').toString(),
+              'session_id': (event[AgentEvents.fieldSessionId] ?? '').toString(),
+            },
+          )
+          .then((StationPublishResult result) {
+            if (result.deliveries.any((StationDelivery d) => !d.ok)) {
+              log?.call('agent 广播 $topic ${result.describe()}');
+            }
+          })
+          .catchError((Object error) {
+            log?.call('agent 广播 $topic 异常（已忽略，不影响生成）：$error');
+          }),
+    );
+    return station.subscribers.length;
+  }
+
   /// **agent 事件派发**（M9 追加）：把会话服务发布的 agent 侧事件（如
   /// `agent.tool_call`）按**既有订阅口径**投给插件实例。
   ///
@@ -835,6 +908,18 @@ class PluginBus {
       return 0;
     }
     try {
+      final String? pointId = _agentEventPoints[name];
+      if (pointId != null) {
+        // 分流到广播点位（订了才投），不再走下面那一路「不订阅也收」的既有事件流。
+        return _announceAgentPoint(
+          pointId,
+          <String, dynamic>{
+            ...event,
+            'event': name,
+            if (!event.containsKey('ts')) 'ts': _nowSeconds(),
+          },
+        );
+      }
       return dispatch(<String, dynamic>{
         ...event,
         'event': name,
@@ -1494,6 +1579,64 @@ class PluginBus {
     );
   }
 
+  /// **广播站点位「插件清单变更」**（`system.broadcast.config.changed`，阶段 6 新增）。
+  ///
+  /// 载荷 = `{point, plugin_id, action, reason, generation}`：`action` 直接取
+  /// `PluginReconcileKind.name`（与 `applyConfigs` 的结论同源，不发明第二套词汇）。
+  /// 与 [announcePluginState] 同口径：**单向通知**、没人订阅就零开销、投递失败只记日志；
+  /// 对账不会因为「有人在听」而多等一拍。generation 取不到时不带（不发一个假的 0）。
+  void _announceConfigChanged(PluginReconcileAction action) {
+    load();
+    if (!enabled) return;
+    final BroadcastStation? station = stations.broadcastPointFor(
+      StationHubIds.broadcastConfigChanged,
+    );
+    if (station == null) return;
+    if (station.subscribers.isEmpty) return; // 快路径：没人订阅，零开销
+    final PluginConfig? cfg = config(action.pluginId);
+    final StationScope scope = cfg == null
+        ? const StationScope()
+        : _broadcastScopeOf(cfg);
+    if (!scope.isValid) {
+      // 条目已经被删除时对账仍会给 stopped —— 那时候插件自己证明不了归属，
+      // 只能用核心已经解析出的那一份声明；证明不了就不发，但要说得出口。
+      log?.call(
+        '清单变更广播跳过（${action.pluginId} 的 ${scope.describe()} 不能证明归属，'
+        'fail-closed）：${action.kind.name}',
+      );
+      return;
+    }
+    final int generation = generationOf(action.pluginId);
+    final Map<String, dynamic> payload = <String, dynamic>{
+      'point': station.id,
+      'plugin_id': action.pluginId,
+      'action': action.kind.name,
+      'action_label': action.kind.label,
+      'reason': action.reason,
+      if (generation > 0) 'generation': generation,
+    };
+    unawaited(
+      station
+          .publish(
+            topic: _broadcastTopicOf(station.id),
+            scope: scope,
+            payload: payload,
+            meta: <String, dynamic>{
+              'plugin_id': action.pluginId,
+              'action': action.kind.name,
+            },
+          )
+          .then((StationPublishResult result) {
+            if (result.deliveries.any((StationDelivery d) => !d.ok)) {
+              log?.call('清单变更广播 ${result.describe()}');
+            }
+          })
+          .catchError((Object error) {
+            log?.call('清单变更广播异常（已忽略，不影响对账）：$error');
+          }),
+    );
+  }
+
   /// 广播载荷的**消息**四元组：以插件自己的声明为 team，mode 解析不出来时退回它的
   /// agent 的工作面（与 [_scopeOf] 同源，不自己猜）。
   ///
@@ -2125,6 +2268,18 @@ class PluginBus {
       failed: failed,
       totalEnabled: enabled,
     );
+    // **广播站点位「插件清单变更」**（`system.broadcast.config.changed`，阶段 6 新增）：
+    // 面板改开关、REST 写条目、发布仓库装完都走到这一遍对账，所以对外也只在这里说一次
+    // （写两遍 = 两条入口的回报形状迟早漂）。`unchanged` **一律不发**：“没改动”不是变更，
+    // 发了就是让监听插件每次对账白醒一次，而它读到的状态与上一帧完全一样。
+    for (final PluginReconcileAction action in <PluginReconcileAction>[
+      ...started,
+      ...restarted,
+      ...stopped,
+      ...failed,
+    ]) {
+      _announceConfigChanged(action);
+    }
     if (result.hasChanges) {
       invalidateToolTable(reason: '插件配置对账：运行态有变化');
       await refreshToolDefinitions();

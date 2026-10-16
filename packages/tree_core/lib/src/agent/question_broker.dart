@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:tree_protocol/tree_protocol.dart';
 
+import '../plugin/agent_events.dart';
 import '../store/tree_store.dart';
 import '../tool/question_channel.dart';
 import '../util/ids.dart';
@@ -42,6 +43,7 @@ class QuestionBroker {
     required this.questions,
     required this.transcript,
     required this.broadcast,
+    this.onAskPaused,
     this.log,
     this.pollInterval = const Duration(milliseconds: 500),
     this.defaultTimeout,
@@ -56,6 +58,13 @@ class QuestionBroker {
 
   /// 下行帧通道（生产环境是 `WsHub.broadcast`）。
   final void Function(Map<String, dynamic> frame) broadcast;
+
+  /// **提问暂停**的对外读数口（阶段 6：广播站点位 `ask.paused` 的入口）。
+  ///
+  /// 生产接线 = `PluginBus.dispatchAgentEvent`（与 agent 工具调用事件**同一个**入口，
+  /// 不另造一套派发机制）。null = 未接线（提问行为与本改动之前逐字一致）。
+  /// 只递“谁在等、等几道”（qid + 归属 + 题数），**不递题面与选项**。
+  final AgentEventSink? onAskPaused;
 
   final void Function(String message)? log;
 
@@ -144,6 +153,25 @@ class QuestionBroker {
       },
     });
     log?.call('提问 $qid（agent=${request.agentId}）等待作答');
+    // **广播站点位「提问暂停」**：问题已落盘、也已推到用户界面，这一刻它真的在等人
+    // （不是工具执行前：那时还证明不了）。发布失败绝不影响提问回路——插件侧的问题
+    // 不能让用户问不出话（与 agent 事件发布器同一个收敛口径）。
+    final AgentEventSink? paused = onAskPaused;
+    if (paused != null) {
+      try {
+        paused(
+          agentAskPausedEvent(
+            questionId: qid,
+            agentId: request.agentId,
+            sessionId: request.sessionId,
+            teamId: request.teamId,
+            questionCount: request.questions.length,
+          ),
+        );
+      } catch (error) {
+        log?.call('提问暂停事件发布失败（已忽略，不影响等待作答）：$error');
+      }
+    }
 
     flight.poll = Timer.periodic(pollInterval, (Timer _) {
       // 这个谓词是**硬**取消（`stop` / 删除 agent / 关服），插话不在其中：用户 2026-10-04

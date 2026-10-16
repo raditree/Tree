@@ -797,6 +797,11 @@ class ConversationService {
     // 工具调用轮次（插件生态）：**本任务内**从 1 开始计数，随 `agent.tool_call`
     // 事件下发给插件——插件据此实现"超过 N 次就停"（Q8：限制交给插件做）。
     int toolRound = 0;
+    // 本轮耗时（广播 turn.* 用）：从**进入生成**算到收尾，不含前面的压缩与提示词钉住
+    // ——那两个已经有自己的读数面，混进来会让插件算出的“模型耗时”偏高。
+    final Stopwatch turnWatch = Stopwatch()..start();
+    // 端点给的 finish_reason（广播用；端点没给就带空串，不猜）。
+    String finishReason = '';
     // 整轮正文：端点没给 usage 时，completion 的兜底口径是**整轮**生成量。
     final StringBuffer roundText = StringBuffer();
     Map<String, dynamic>? usage;
@@ -1060,6 +1065,7 @@ class ConversationService {
           errorMessage = event.message;
         } else if (event is AgentDone) {
           if (event.cancelled) cancelled = true;
+          if (event.finishReason.isNotEmpty) finishReason = event.finishReason;
         }
       }
     } catch (error) {
@@ -1125,6 +1131,19 @@ class ConversationService {
         );
       }
     }
+    _publishTurnOutcome(
+      agent: agent,
+      session: session,
+      teamAgentId: ownerId,
+      errorMessage: failure,
+      cancelled: cancelled,
+      interrupted: token.interrupted,
+      contentChars: roundText.length,
+      elapsedMs: turnWatch.elapsedMilliseconds,
+      toolRounds: toolRound,
+      finishReason: finishReason,
+      subagentId: subagent?.id ?? '',
+    );
     _running.remove(runKey);
     // 本轮结束：清掉它的实时真值（下一轮会在**自己**首跳的 AgentUsage 里重新写入；
     // 预压缩不依赖它，故留着也不会误读，但及时回收避免跨轮脏值堆积）。
@@ -1412,6 +1431,76 @@ class ConversationService {
       callId: message.toolCallId,
       round: message.round,
       phase: phase,
+    );
+  }
+
+  /// 本轮**最终结论**的对外广播（阶段 6 的三个广播点位：turn.done / turn.cancelled /
+  /// turn.error）。
+  ///
+  /// 三条**互斥**，按 error > cancelled > done 取第一条：取消与错误同时发生时先报
+  /// 错误——取消是用户意图，错误才是这一轮的实际结论（把 cancelled 报成最终结论会
+  /// 让插件把一次真故障计成一次“用户主动停了”）。
+  ///
+  /// 只报**度量与结论**，不报正文与工具结果：正文的正经读处是会话存储与 REST。
+  /// `team_id` 与 [_publishToolCall] 同一个口径（顶层 agent 自成一队），否则订了 team
+  /// 的插件收不到自己 agent 的轮次事件（同一个坑已经踩过一次）。
+  /// 未接线（[agentEvents].sink 为空）时是**纯 no-op**，行为与本改动之前一致。
+  void _publishTurnOutcome({
+    required CoreAgent agent,
+    required CoreSession session,
+    required String teamAgentId,
+    required String? errorMessage,
+    required bool cancelled,
+    required bool interrupted,
+    required int contentChars,
+    required int elapsedMs,
+    required int toolRounds,
+    required String finishReason,
+    String subagentId = '',
+  }) {
+    final CoreAgent teamAgent = store.agent(teamAgentId) ?? agent;
+    final String teamId = teamAgent.teamId.trim();
+    final String effectiveTeam = teamId.isEmpty ? teamAgent.id : teamId;
+    final String agentId = subagentId.isEmpty ? agent.id : subagentId;
+    final String sessionId = session.sessionId;
+    final String? failure = errorMessage;
+    if (failure != null) {
+      agentEvents.turnError(
+        agentId: agentId,
+        sessionId: sessionId,
+        teamId: effectiveTeam,
+        message: failure,
+        failedAfterTools: toolRounds > 0,
+        contentChars: contentChars,
+        elapsedMs: elapsedMs,
+        toolRounds: toolRounds,
+      );
+      return;
+    }
+    if (cancelled) {
+      agentEvents.turnCancelled(
+        agentId: agentId,
+        sessionId: sessionId,
+        teamId: effectiveTeam,
+        // 插话不算“用户停了本轮”（审计上这是两件事）
+        source: interrupted
+            ? AgentEvents.sourceInterjection
+            : AgentEvents.sourceUserStop,
+        contentChars: contentChars,
+        elapsedMs: elapsedMs,
+        toolRounds: toolRounds,
+        subagentId: subagentId,
+      );
+      return;
+    }
+    agentEvents.turnDone(
+      agentId: agentId,
+      sessionId: sessionId,
+      teamId: effectiveTeam,
+      contentChars: contentChars,
+      elapsedMs: elapsedMs,
+      toolRounds: toolRounds,
+      finishReason: finishReason,
     );
   }
 

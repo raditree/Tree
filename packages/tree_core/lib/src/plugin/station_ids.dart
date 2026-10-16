@@ -50,6 +50,45 @@ abstract final class StationHubIds {
   /// 执行命令靠 command 名），但名字相近，写插件时别看错。
   static const String broadcastPluginState = 'system.broadcast.plugin.state';
 
+  /// 广播站·本轮正常结束（**单向通知**，无回填）。
+  ///
+  /// 20261015-hot-restart 阶段 6（A 级点位批）新增：投递口不是「要新建」，而是
+  /// `ConversationService` 本轮收尾那一处（它已经把 `msg_end` 帧发给前端了）。
+  /// 载荷 = `{point, agent_id, session_id, team_id, content_chars, elapsed_ms, finish_reason, tool_rounds}`；
+  /// **不带正文**（正文有会话与 REST 两个正经读处，广播里塞全文等于把隐私复制进每个插件）。
+  static const String broadcastTurnDone = 'system.broadcast.turn.done';
+
+  /// 广播站·本轮被取消（**单向通知**，无回填）。
+  ///
+  /// 与 [broadcastTurnDone] **互斥**：同一轮只出一条（取消的轮不算正常结束）。
+  /// 载荷额外带 `source`（`interjection` = 被新消息插话，`user_stop` = 用户按停止）
+  /// 与会话/临时员工归属——不变量 5 的两种取消在审计里必须分得开（插话不该被记成
+  /// “用户停了这一轮”），否则「谁停的」这个问题又只能靠猜。
+  static const String broadcastTurnCancelled = 'system.broadcast.turn.cancelled';
+
+  /// 广播站·本轮错误终止（**单向通知**，无回填）。
+  ///
+  /// 载荷 = `{point, agent_id, session_id, team_id, error, failed_after_tools}`。
+  /// `error` 就是核心已经发给用户那句**可读文案**（不变量 6），不另造一套说法。
+  /// 取消与错误同时发生时**先报错误**：取消是用户意图，错误才是这一轮的实际结论。
+  static const String broadcastTurnError = 'system.broadcast.turn.error';
+
+  /// 广播站·提问暂停（**单向通知**，无回填）。
+  ///
+  /// 触发点 = `QuestionBroker.ask` 把问题**落盘并推帧之后**、开始等待作答的那一刻
+  /// （不是工具执行前：那时还证明不了这个问题真的在等人）。
+  /// 载荷 = `{point, agent_id, session_id, team_id, question_id, question_count}`；
+  /// **不带题面与选项**（那是用户与 agent 之间的内容，审计只需要知道「谁在等、等几道」）。
+  static const String broadcastAskPaused = 'system.broadcast.ask.paused';
+
+  /// 广播站·插件清单对账结果（**单向通知**，无回填）。
+  ///
+  /// 触发点 = `PluginBus.applyConfigs()` 逐条对账**完成后**，每条一个动作一个 topic
+  /// `config.changed`；载荷的 `action` 取值与 `PluginReconcileKind` 同源（
+  /// `started` / `stopped` / `restarted` / `failed`）。**`unchanged` 一律不广播**：
+  /// 没改动的对账是噪声（面板插件会被白叫醒，而它读到的状态与上一帧完全一样）。
+  static const String broadcastConfigChanged = 'system.broadcast.config.changed';
+
   // ── 执行站（插件主动下命令；按命令族拆点位） ────────────────────────────
 
   /// 执行站·文件操作族：`fs.read` / `fs.write` / `fs.list` / `fs.grep`。
@@ -148,6 +187,11 @@ abstract final class StationHubIds {
     broadcastToolPost,
     broadcastToolTimeout,
     broadcastPluginState,
+    broadcastTurnDone,
+    broadcastTurnCancelled,
+    broadcastTurnError,
+    broadcastAskPaused,
+    broadcastConfigChanged,
     executeFs,
     executeTerminal,
     executeAgent,
