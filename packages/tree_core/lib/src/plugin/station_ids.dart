@@ -38,6 +38,18 @@ abstract final class StationHubIds {
   /// `system.*` 点位：`{station: 'broadcast', point: 'tool.timeout'}`。
   static const String broadcastToolTimeout = 'system.tool.timeout';
 
+  /// 广播站·插件生命周期（**单向通知**，无回填）。
+  ///
+  /// 20261015-hot-restart 阶段 2 新增：重启 / 挂起期间插件对外仍是“正常状态”，
+  /// 所以前端与审计插件不能靠“没回音”去猜它到哪个阶段了——阶段跃迁得有人主动说出来。
+  /// 载荷 = `{plugin_id, lifecycle, generation, missed_heartbeats, reason, buffer}`；
+  /// 判定源与 `health` 同一个（`LivenessTracker`），**不另造一套时钟**。
+  ///
+  /// ⚠ 与执行站命令 `plugin.state` **不是同一个东西**：这里是“核心推给你”，
+  /// 那里是“你去问一次”。两套寻址空集不重叠（广播点位靠 station+point，
+  /// 执行命令靠 command 名），但名字相近，写插件时别看错。
+  static const String broadcastPluginState = 'system.broadcast.plugin.state';
+
   // ── 执行站（插件主动下命令；按命令族拆点位） ────────────────────────────
 
   /// 执行站·文件操作族：`fs.read` / `fs.write` / `fs.list` / `fs.grep`。
@@ -135,6 +147,7 @@ abstract final class StationHubIds {
     broadcastToolPre,
     broadcastToolPost,
     broadcastToolTimeout,
+    broadcastPluginState,
     executeFs,
     executeTerminal,
     executeAgent,

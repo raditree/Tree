@@ -19,6 +19,39 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **插件重启期保活：有界暂存 + 重放 + `plugin.state` 广播**（**新增**
+  [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 27、
+  [docs/plugin-development.md](docs/plugin-development.md) §3.1/§6.6）：
+  - **重启窗口对外是「暂时不可用」而不是「不在了」**（D2）：`lifecycle ∈
+    {restarting, suspended, booting}` 时站点请求在**唯一投递点**进有界暂存队列
+    （每插件默认 32 条 + 全局字节上限），`ready` 后 FIFO 重放；重放前逐条复查
+    归属与 `request_id` 是否已收尾（迟到无害口径），不过的那条**丢弃并计数**。
+    配置驱动的换一世（`applyConfigs` 看 args/scope 变了）与 `hotRestart` / `restart`
+    算**同一个窗口**：一个命题不能一套保活一套不保活。
+  - **溢出走既有 fail-open；队列只以三种方式收尾**（ready 重放 / 落到 stopped|failed
+    以可读失败收尾 / 核心退出），且收尾点挂在生命周期跃迁那一处：分散到四个调用方
+    一定漏一处，漏掉的那一处就是「会话永远等一条不会被投递的请求」。
+  - **保活押后的订阅注销，在新一世重新申报时必须当场作废**（新断言）：否则改了
+    `scope` 的重启会让旧团队还能把请求递给新归属的进程，而中转站「全站只许一个
+    处理者」会反过来把新一世拒成 `key_conflict`。插件侧 `station/subscribe` 与核心
+    侧的工具表收集**两条申报路都要销账**（收集站的订阅是核心自己下的）。
+  - **新增广播点位 `system.broadcast.plugin.state`（别名 `plugin.state`），内置点位
+    总数 21→22**（`station_points_test` 钉住；广播站 4→5、预建 20→21）：单向通知，
+    回包仅作送达确认；发布点 = `_setLifecycle()` 与看门狗 degraded/恢复处（与 `health`
+    同一个判定源，不另造时钟）；**归属证明不了就跳过并记日志**（宁可不广播）。
+    阶段跃迁**不进** `plugin_status` 帧（帧的产出点一个都没多）。
+  - **判死定义一个字节都没动**（不变量 15）：窗口里的活性读数如实报「无信息」
+    ⇒ 站点退回既有活性窗口（I×N），既不谎报活着，也不拿「暂时不可用」当死证；
+    `callTool` 在窗口里等的是**生命周期跃迁这个事件**，不是时长（D8/不变量 4）。
+  - UI（只读，向后兼容）：`lifecycle` 在面板 / 详情页 / 监控服务各成一个徒，钉
+    「**活性看 `health`，生命周期看 `lifecycle`**」；`status`/`health` 的既有分支
+    一字未改，新键缺失 = 保持原值（旧核心连新前端也不崩）。
+  - 用例（真子进程 + 可计数证据）：`plugin_restart_keepalive_test`（7）、
+    `plugin_restart_buffer_bounded_test`（9）、`plugin_state_broadcast_test`（6）、
+    `plugin_status_compat_test`（6，把 `status`/`health` 的产出值与逐字文案钉住）。
+    本次计数：tree_core **1343 passed / 3 skipped / 0 failed**（1315 + 新增 28），
+    tree_protocol **44 passed**，`flutter test` **877 passed**。
+
 - **插件热重启：两阶段关闭 + 内存池续跑 + 生命周期第三个轴**（**新增**
   [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 23/24/25/26、
   [docs/plugin-development.md](docs/plugin-development.md) §2.1/§3.1/§6.1/§6.5）：

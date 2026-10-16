@@ -129,7 +129,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | 中转站 relay | 拦截-回填：核心把数据交给你，你决定改不改 | 订阅；**每个点位唯一订阅者** |
 | 收集站 collect | 一对多收集 + 汇聚，不回填原数据流 | 由核心按接入点代订阅（工具定义） |
 
-### 3.1 全部内置点位（21 个 id：广播 4 + 执行 9 + 中转 7 + 收集 1）
+### 3.1 全部内置点位（22 个 id：广播 5 + 执行 9 + 中转 7 + 收集 1）
 
 | 点位 id | 类型 | 触发时机 | 回填/产出 |
 |---|---|---|---|
@@ -153,6 +153,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.broadcast.tool.pre` | 广播 | 工具调用前 | 通知 |
 | `system.broadcast.tool.post` | 广播 | 工具调用后 | 通知 |
 | `system.tool.timeout` | 广播 | 某次**工具运行/LLM 请求**超过阈值（默认 **300 s**）时，**每个运行只广播一次** | 通知：载荷 `{handle, agent_id, session_id, tool, command, elapsed_ms, started_at, point}`——拿到 `handle` 后可经执行站 `tool.close` 显式关闭这次运行（见下行）；别名 `tool.timeout`（`{station: 'broadcast', point: 'tool.timeout'}`） |
+| `system.broadcast.plugin.state` | 广播 | 插件**生命周期跃迁**（booting / ready / restarting / suspended / failed / stopped）与**失活标记**（心跳连续丢失 / 恢复）| 通知：载荷 `{plugin_id, lifecycle, previous, generation, missed_heartbeats, reason, buffer}`；别名 `plugin.state`（`{station: 'broadcast', point: 'plugin.state'}`）。发布点**只有这两处**（跃迁集中在 `PluginBus._setLifecycle`，失活与 `health` 同一个判定源 `LivenessTracker`，**不另造时钟**）。要看某个插件的当前读数请下执行站命令 `plugin.state`——**那是“问”，这里是“推”**；三者各管各的轴：**活性看 `health`、启停看 `status`、阶段看 `lifecycle`** |
 | `plugin.tool.define` | 收集 | 工具表刷新 | 申报工具定义 |
 
 ### 3.2 怎么订阅
@@ -633,6 +634,28 @@ plugins:
   装死也不划算——连续 N 拍（缺省 3×I）没有任何入站报文会被判失活，那时核心会收尸。
 
 最小可运行参考实现：`examples/plugins/suspendable_plugin.py`（带 `--selftest`）。
+
+### 6.6 重启窗口里对外保持正常状态（保活与暂存）
+
+上面那套“转储→退出→取回”中间有几百毫秒你不在。这段时间**核心不会把失败扔给会话**：
+指向你的站点请求会先进一个**有界暂存队列**，你新一世 `ready` 后按 **FIFO** 补发。
+
+作为插件作者你需要知道四件事：
+
+* **会补发，也会丢弃**：重放前逐条复查归属（四元组）与 `request_id` 是否已收尾，
+  已取消/迟到的那条不递给你。所以**不要**把“收到同一条 `call_id` 两次”当异常。
+* **每插件默认 32 条 + 全局字节上限**：溢出的那条**当场**按该点位既有的兜底口径
+  处理（中转站就是放行原数据），不会排队到你回来。不订中转站的插件对这件事完全无感。
+* **新一世必须重新 `station/subscribe`**：上一世那几份声明在你重新申报的**当场作废**
+  （留着它 = 旧归属还能把请求递给你这个新归属的进程）。改了 `scope` 后忘了重报 =
+  你以为能接管工具改写，实际站点上已经没人了；这也是“为什么不把旧声明一直挂着”的理由。
+* **只有窗口内才暂存**：`stopped` / `failed` 是**不投递**（可读原因）而不是排队，
+  否则会话会永远等一条不会被投递的请求。配置驱动的换一世（改了 `args`/`scope` 后对账）
+  与热重启算**同一个窗口**。
+
+面板与 REST 现在能看到两个相关读数：`lifecycle`（阶段）与 `buffered_station_requests`
+（这个插件当前积压了几条）。广播点 `system.broadcast.plugin.state` 的载荷里也带
+ `buffer`（全局水位）；订阅方式见 §3.1 与 §7.1。
 
 ---
 

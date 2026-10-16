@@ -3547,6 +3547,10 @@ class CoreServer {
   /// 每条插件的运行态（给面板显示"在跑 / 已停用 / 心跳降级 / 启动失败原因"）。
   ///
   /// 数据源是插件总线的公开探针（healthOf / errorOf），不是自己另立台账。
+  ///
+  /// **只增键**（阶段 2 / D11）：`lifecycle` 与 `generation` 是新增的可选读数（面板
+  /// 据此显示「重启中 / 已挂起」），`running` / `health` / `reason` / `error` / `known`
+  /// 的产出值与口径一字未改——**活性看 health、启停看 status、阶段看 lifecycle**。
   Map<String, dynamic> _pluginRuntimeOf(
     PluginBus bus,
     List<Map<String, dynamic>> configs,
@@ -3563,6 +3567,8 @@ class CoreServer {
         'error': bus.errorOf(id) ?? '',
         // 总线运行期是否认识这一条：false = 还没对账过（写一次盘就会认识）
         'known': bus.config(id) != null,
+        'lifecycle': bus.lifecycleOf(id).wire,
+        'generation': bus.generationOf(id),
       };
     }
     return out;

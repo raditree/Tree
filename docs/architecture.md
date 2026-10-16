@@ -40,7 +40,7 @@ Flutter UI 进程（lib/）                     核心进程（packages/tree_cor
 | `TeamService` + `MessageDispatcher` | 成员即 agent；创建/审核/移除；派活、广播、`wait_for`；活动日志；失活 fail-closed + 待补发 |
 | `SpecService` | 内置规范播种 + 自定义规范扫描 + 索引/已选全文两个快照（进系统提示词） |
 | `McpService` | stdio / Streamable HTTP MCP 客户端；懒连接、心跳判活、工具命名空间化 |
-| `PluginBus` + 站点体系 | 插件子进程 JSON-RPC；广播 / 执行 / 中转 / 收集四类站点、21 个点位（中转站含 `ssh.execute`）|
+| `PluginBus` + 站点体系 | 插件子进程 JSON-RPC；广播 / 执行 / 中转 / 收集四类站点、22 个点位（中转站含 `ssh.execute`）|
 
 ## 3. 一次会话运行的链路
 
@@ -283,6 +283,6 @@ M9 阶段定的 14 项语义决策已全部实现，逐项的**实现记录**归
 | Q8 工具轮次上限 | 核心**不设上限**；要限由插件订阅 `agent.tool_call` 后 `agent.stop` | `llm/llm_session.dart`、`plugin/agent_events.dart` |
 | Q9 spec 工具瘦身 + 索引前置 | `spec` 只有 select/create/update；索引进系统提示词、`select` 直接返回全文 | `spec/spec_service.dart` |
 | Q10 grep 无匹配 | 返回**实际扫描清单**与生效的排除目录，区分"真没有"与"被排除" | `tree_local_exec` 的 `GrepOutcome` |
-| Q11 站点体系 | 四类站点 / 21 个点位 / 收集站申报工具 | §9、[plugin-development.md](plugin-development.md) |
+| Q11 站点体系 | 四类站点 / 22 个点位 / 收集站申报工具 | §9、[plugin-development.md](plugin-development.md) |
 | Q12 插件布局 | 前端与协议先行、核心侧接线；插件面板 / 编辑器 / UI 槽位 | `lib/ui/widgets/plugin_*`、`plugin/plugin_ui_bridge.dart` |
 | Q13 token rate 管道 | 思考 / 正文 / 工具参数**共用同一条节拍器**，速率现读设置 | `agent/conversation_service.dart` 的 `TokenPacer` |

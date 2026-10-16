@@ -117,6 +117,25 @@ abstract final class StationPoints {
           '或用执行站工具族的 `tool.close`（带 handle）**显式关闭**这次运行。'
           '核心不会因为超阈值自己杀进程——关闭必须有人显式下令。',
     ),
+    StationPointSpec(
+      id: StationHubIds.broadcastPluginState,
+      kind: StationKind.broadcast,
+      label: '插件生命周期',
+      description:
+          '广播站·插件生命周期：每次阶段跃迁（booting / ready / restarting / suspended / '
+          'failed / stopped）广播一条，失活标记也广播一条（单向通知；载荷含 plugin_id / '
+          'lifecycle / generation / missed_heartbeats / reason / buffer）',
+      alias: 'plugin.state',
+      readme:
+          '插件**生命周期阶段**的单向通知：发布点只有两处——生命周期的跃迁（集中在 '
+          '`PluginBus.lifecycleOf` 的唯一写入口）与失活标记（与 `health` 同一个判定源 '
+          '`LivenessTracker`，**不另造时钟**）。回包仅作送达确认，内容不参与业务。'
+          '为什么需要它：重启窗口里插件对外仍是“正常状态”（不被路由真实任务，站点请求'
+          '被有界暂存后重放），所以“现在到哪个阶段了”必须由核心推出来，而不是让前端'
+          '靠“没回音”去猜。限制：**活性看 `health`、启停看 `status`、阶段看 `lifecycle`**，'
+          '三者是独立的轴，谁也不得吃掉谁；要看某个插件的当前读数请下执行站命令 '
+          '`plugin.state`（那是“问”，这里是“推”）。',
+    ),
   ];
 
   /// 执行站点位（按命令族）。

@@ -23,14 +23,14 @@ void main() {
       );
     });
 
-    test('类型分布：广播 4 / 执行 9 / 中转 7 / 收集 1', () {
+    test('类型分布：广播 5 / 执行 9 / 中转 7 / 收集 1', () {
       int count(StationKind kind) =>
           StationPoints.ofKind(kind).length;
-      expect(count(StationKind.broadcast), 4);
+      expect(count(StationKind.broadcast), 5);
       expect(count(StationKind.execute), 9);
       expect(count(StationKind.relay), 7);
       expect(count(StationKind.collect), 1);
-      expect(StationPoints.all.length, 21);
+      expect(StationPoints.all.length, 22);
     });
 
     test('退役 id 不在表里（它们只用于读侧迁移）', () {

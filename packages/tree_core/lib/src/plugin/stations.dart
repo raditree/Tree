@@ -328,7 +328,7 @@ class StationHub {
     );
   }
 
-  /// **确保全部内置点位存在**（20 个：广播 4 + 执行 9 + 中转 7；收集站除外）。
+  /// **确保全部内置点位存在**（21 个：广播 5 + 执行 9 + 中转 7；收集站除外）。
   ///
   /// 为什么需要这一步：[pointFor] 是**懒创建**（首次使用时才实例化）。按需开销为零
   /// 是好事，代价却是"没配插件 / 没人用过"时一个点位都没有——面板上就是
@@ -355,10 +355,10 @@ class StationHub {
   List<String> ensureBuiltinStations() {
     load();
     final List<String> created = <String>[];
-    // 一批预建只落一次盘（每个点位的懒创建都会 save 一次，不合并就是 20 次写）
+    // 一批预建只落一次盘（每个点位的懒创建都会 save 一次，不合并就是 21 次写）
     _saveSuspend++;
     try {
-      // 全部内置点位（广播 4 + 执行 9 + 中转 7）预建；**收集站不预建**（见下）。
+      // 全部内置点位（广播 5 + 执行 9 + 中转 7）预建；**收集站不预建**（见下）。
       for (final StationPointSpec spec in StationPoints.all) {
         if (spec.kind == StationKind.collect) continue;
         _ensureOneBuiltin(() => pointFor(spec.id), created);

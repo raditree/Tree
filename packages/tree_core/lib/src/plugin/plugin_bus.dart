@@ -15,6 +15,7 @@ import '../util/liveness.dart';
 import 'execute_mounts.dart';
 import 'plugin_host.dart';
 import 'plugin_lifecycle.dart';
+import 'plugin_restart_buffer.dart';
 import 'plugin_state_pool.dart';
 import 'plugin_tool_definition.dart';
 import 'plugin_ui_bridge.dart';
@@ -60,8 +61,10 @@ class PluginUsageRecent {
 /// 返回 null = 这条通路没接（payload 里就不会出现 `recent_usage`）；
 /// 抛异常 / 读不到文件 ⇒ 由 [PluginBus.relayCompaction] 收敛成"不带这个键"——
 /// 用量是**遥测**，它出问题绝不该影响一次压缩（fail-open）。
-typedef PluginUsageRecentProvider =
-    Future<PluginUsageRecent?> Function(String agentId, String sessionId);
+typedef PluginUsageRecentProvider = Future<PluginUsageRecent?> Function(
+  String agentId,
+  String sessionId,
+);
 
 /// 插件总线（M6b + M9 Wave 3-F）：配置、实例生命周期、事件分发、工具聚合、
 /// **站点体系**与**心跳判活**。
@@ -98,7 +101,13 @@ class PluginBus {
     this.agentModeKeyResolver,
     this.callSiteContext,
     this.toolTableRefreshHook,
+    this.restartBufferMaxPerPlugin = 32,
+    this.restartBufferMaxTotalBytes = 1 << 20,
   }) : uiBridge = uiBridge ?? PluginUiBridge(),
+       restartBuffer = PluginRestartBuffer(
+         maxPerPlugin: restartBufferMaxPerPlugin,
+         maxTotalBytes: restartBufferMaxTotalBytes,
+       ),
        stations =
            stations ??
            StationHub(
@@ -113,6 +122,8 @@ class PluginBus {
     // 快照池的降级原因必须走同一条日志出口：超上限 / LRU 丢弃 / 归属不符都是
     // 用户要能查到的事，不能只进 stderr（不变量 6）。
     statePool.log = log;
+    // 暂存队列的溢出与丢弃同理：每一条都直接写日志，不靠调用方去猜。
+    restartBuffer.log = log;
     // **所有**前端下行帧（含执行站 ui.push 的 card 槽位）都在这里过一遍再广播，
     // 缓存因此自动收全，不需要每个发射点各自记得记一笔。
     if (broadcast != null) {
@@ -147,6 +158,15 @@ class PluginBus {
 
   /// 心跳间隔 I（默认 10s；看门狗节拍与单拍窗口都用它）。
   final Duration heartbeatInterval;
+
+  /// **重启期暂存的每插件条数上限**（默认 32，保守值；测试可缩小）。
+  ///
+  /// 为什么要把上限做成参数而不是写死：溢出行为本身（fail-open + 可读原因）必须
+  /// 能被用例**真的跑到**，而不是只能读代码。默认值仍按保守定，不由调用方负责想清楚。
+  final int restartBufferMaxPerPlugin;
+
+  /// 重启期暂存的**全局字节上限**（估算值；默认 1 MiB）。与上面同口径。
+  final int restartBufferMaxTotalBytes;
 
   /// 连续丢失阈值 N（默认 3）：连续 N 拍没有心跳 ⇒ degraded。
   final int missThreshold;
@@ -252,7 +272,29 @@ class PluginBus {
   /// 上限保守、超限按 LRU 丢最旧并写可读原因（见 [PluginStatePool]）。
   final PluginStatePool statePool = PluginStatePool();
 
-  /// 每个插件的**代际**（每次启动 +1；没启动过 = 0）。快照的索引键就用它。
+  /// **重启期保活的有界暂存队列**（20261015-hot-restart 阶段 2）。
+  ///
+  /// 为什么放在总线而不是宿主里：保活要跨**宿主实例**——旧进程已经没了、新进程还没
+  /// 就绪，这段时间里替插件把站点请求接住的必须是那个跨实例的持有者（与 [statePool]
+  /// 同一个理由）。上限、溢出、重放与收尾的口径全部见 [PluginRestartBuffer]；
+  /// 上限由构造参数 [restartBufferMaxPerPlugin] / [restartBufferMaxTotalBytes] 定。
+  final PluginRestartBuffer restartBuffer;
+
+  /// 重启窗口里**暂时不注销**其站点订阅的插件（见 [_disconnect]）。
+  ///
+  /// 为什么必须留着：订阅一注销，重启窗口里到达的请求根本走不到这个插件的回包函数，
+  /// 「暂存」就没有入口。留着订阅 = 请求能落到队列里；代价是本轮启动最终失败时
+  /// 必须补一次注销（见 [_setLifecycle] 的 stopped/failed 分支），不能让它悬着。
+  final Set<String> _stationKept = <String>{};
+
+  /// 在等某插件跃出保活窗口的工具调用方（见 [_awaitLifecycleSettled]）。
+  ///
+  /// 为什么不是时长轮询也不是定时重试：那又回到“拿时长判定”（不变量 4 / D8）。
+  /// 生命周期跃迁就是唯一真实存在的事件，而它一定发生（要么 ready 要么 stopped/failed）。
+  final Map<String, List<Completer<void>>> _lifecycleWaiters =
+      <String, List<Completer<void>>>{};
+
+  /// 代际计数与生命周期台账（两者的读写都集中在下面的几个方法里）。
   final Map<String, int> _generations = <String, int>{};
 
   /// 每个插件当前的生命周期。**只能由 [_setLifecycle] 写**（映射集中一处，
@@ -396,7 +438,7 @@ class PluginBus {
 
   /// `tunnel/event` 的**多消费者**出口（站点路径用；与 [onTunnelEvent] 并列派发）。
   final List<void Function(String pluginId, Map<String, dynamic> params)>
-      _tunnelEventListeners =
+  _tunnelEventListeners =
       <void Function(String pluginId, Map<String, dynamic> params)>[];
 
   /// 登记一个 `tunnel/event` 消费者（`StationTunnelLink` 构造时调用）。
@@ -418,7 +460,8 @@ class PluginBus {
   /// 返回 `(host, reason)`：`host == null` 时 [reason] 是**可读的"为什么没有"**
   /// （直接进日志 / 右栏，用户看得懂）；`host != null` 时 reason 为空串。
   /// 刻意**不抛异常**也不回 null-only：判空失败必须有话可说，否则就是"点了开关没反应"。
-  ({PluginHost? host, String reason}) sshExecutorLookup() {    load();
+  ({PluginHost? host, String reason}) sshExecutorLookup() {
+    load();
     if (!enabled) {
       return (host: null, reason: '插件系统总开关为关（plugins.yaml 顶层 enabled: false）');
     }
@@ -433,7 +476,8 @@ class PluginBus {
       if (host == null) {
         return (
           host: null,
-          reason: '中转站插件「${config.name.isEmpty ? config.id : config.name}」'
+          reason:
+              '中转站插件「${config.name.isEmpty ? config.id : config.name}」'
               '未在运行（${_errors[config.id] ?? '尚未启动'}）',
         );
       }
@@ -446,7 +490,8 @@ class PluginBus {
       if (!host.capabilities.contains(kCapabilitySshExecutor)) {
         return (
           host: null,
-          reason: '中转站插件未申报 ssh-executor 能力'
+          reason:
+              '中转站插件未申报 ssh-executor 能力'
               '（申报的是：${host.capabilities.isEmpty ? '无' : host.capabilities.join('、')}）',
         );
       }
@@ -713,10 +758,10 @@ class PluginBus {
       // 两条路径都靠它拿 PTY：旧 `PluginTunnelLink`（[onTunnelEvent] 字段）与新
       // `StationTunnelLink`（监听器列表）并存；各自按 conn_id 认领，不属于自己就丢弃。
       onTunnelEvent?.call(pluginId, params);
-      for (final void Function(String, Map<String, dynamic>) listener in List<
-          void Function(String, Map<String, dynamic>)>.of(
-        _tunnelEventListeners,
-      )) {
+      for (final void Function(String, Map<String, dynamic>) listener
+          in List<void Function(String, Map<String, dynamic>)>.of(
+            _tunnelEventListeners,
+          )) {
         listener(pluginId, params);
       }
       return;
@@ -731,7 +776,8 @@ class PluginBus {
         declaredTeamId: declaredTeam,
         method: method,
         params: params,
-        onRejected: (String reason) => log?.call('插件 $pluginId 的 UI 声明被拒：$reason'),
+        onRejected: (String reason) =>
+            log?.call('插件 $pluginId 的 UI 声明被拒：$reason'),
       );
       if (frame != null) {
         // 出口自带缓存记录（见构造器里的 _outbound）：重连时按缓存重放，
@@ -852,11 +898,22 @@ class PluginBus {
     if (targetPlugin.isEmpty) {
       return PluginCallResult(text: '未找到插件工具: $toolName', isError: true);
     }
-    final PluginHost? host = _hosts[targetPlugin];
+    PluginHost? host = _hosts[targetPlugin];
     if (host == null || host.isClosed) {
-      final String reason = _errors[targetPlugin] ?? '未启动';
+      // **重启窗口里的工具调用不当场失败**（阶段 2 的路由判据）：等它跃出「暂时
+      // 不可用」那一段再投一次。等的是**事件**（生命周期跃迁）而不是时长（不变量 4 /
+      // D8）；跃迁一定会发生（ready 或 stopped/failed），因此不会无界挂住。
+      // 为什么值得多这一手：不这样的话，“agent 在插件重启那几百毫秒里调了一下工具”
+      // 就是一次真失败（而重启正是插件自己用 agent tool 发起的，见阶段 3）。
+      if (_isKeepaliveWindow(targetPlugin)) {
+        await _awaitLifecycleSettled(targetPlugin);
+        final PluginHost? again = _hosts[targetPlugin];
+        if (again != null && !again.isClosed) host = again;
+      }
+    }
+    if (host == null || host.isClosed) {
       return PluginCallResult(
-        text: '插件 $targetPlugin 不可用：$reason',
+        text: '插件 $targetPlugin 不可用：${_unavailabilityReason(targetPlugin)}',
         isError: true,
       );
     }
@@ -872,6 +929,55 @@ class PluginBus {
       host.liveness.recordBeat();
     }
     return result;
+  }
+
+  /// 一个插件「现在为什么接不了活」的可读原因（按生命周期分化）。
+  ///
+  /// 为什么不是一句「不可用：未启动」到底：重启中的插件明明会回来，却对用户报成
+  /// 像坏了（不变量 6：失败要可读，而「可读」包含**能不能重试**）。三个轴仍各自
+  /// 保持原语义：这里只解释**为什么这次没投出去**，不改 status/health 也不判死。
+  String _unavailabilityReason(String pluginId) {
+    final String error = _errors[pluginId] ?? '';
+    return switch (lifecycleOf(pluginId)) {
+      PluginLifecycleState.restarting ||
+      PluginLifecycleState.suspended ||
+      PluginLifecycleState.booting =>
+        '正在 ${lifecycleOf(pluginId).wire}（第 ${generationOf(pluginId)} 代还没就绪）'
+            '⇒ 这次调用没有投出去，就绪后重试即可（不是故障，也不是判死）',
+      PluginLifecycleState.failed => error.isEmpty ? '本轮启动失败' : '本轮启动失败：$error',
+      PluginLifecycleState.ready => error.isEmpty ? '进程已退出' : error,
+      PluginLifecycleState.stopped => error.isEmpty ? '未启动' : error,
+    };
+  }
+
+  /// 等某插件跃出保活窗口（**只由生命周期跃迁唤醒**，不设时长；已跃出则立即返回）。
+  Future<void> _awaitLifecycleSettled(String pluginId) {
+    if (!_isKeepaliveWindow(pluginId)) return Future<void>.value();
+    final Completer<void> waiter = Completer<void>();
+    _lifecycleWaiters
+        .putIfAbsent(pluginId, () => <Completer<void>>[])
+        .add(waiter);
+    return waiter.future;
+  }
+
+  /// 唤醒某插件全部在等它就绪的调用方（跃迁 / 核心退出两条路径都会走到）。
+  void _wakeLifecycleWaiters(String pluginId) {
+    final List<Completer<void>>? waiters = _lifecycleWaiters.remove(pluginId);
+    if (waiters == null) return;
+    for (final Completer<void> waiter in waiters) {
+      if (!waiter.isCompleted) waiter.complete();
+    }
+  }
+
+  /// 核心退出：把所有还在等就绪的调用方放回去（否则会话挂在一条永远不会回来的工具
+  /// 调用上；不变量 6）。
+  void _wakeAllLifecycleWaiters() {
+    for (final String pluginId in _lifecycleWaiters.keys.toList(
+      growable: false,
+    )) {
+      _wakeLifecycleWaiters(pluginId);
+    }
+    _lifecycleWaiters.clear();
   }
 
   /// 核心 → 插件 `tools/call` 的身份四元组（Q2）。
@@ -921,6 +1027,15 @@ class PluginBus {
         if (_degraded.remove(pluginId)) {
           log?.call('插件 $pluginId 心跳恢复（degraded 已清除）');
           _emitStatus(pluginConfig, 'registered', degraded: false);
+          // 失活标记与解除各推一条（与本点位 readme 逐字一致）：**与 degraded 同一个
+          // 判定源**（就是上面那个 `host.liveness`，不另造时钟），只是这里报的是“又听见了”。
+          announcePluginState(
+            pluginId,
+            from: lifecycleOf(pluginId),
+            to: lifecycleOf(pluginId),
+            reason: '心跳恢复（degraded 已清除）',
+            missedHeartbeats: host.liveness.missedCount,
+          );
         }
         continue;
       }
@@ -930,10 +1045,14 @@ class PluginBus {
         // 否则前端只能等下一次快照 / 重启，而它声明过的卡片与面板会一直留在界面上
         // （真机反馈："关闭后卡片、面板均被保留"）。
         _degraded.remove(pluginId);
+        // **进程真的没了 ⇒ 生命周期进 stopped**（不能让台账停在 ready：面板与
+        // `plugin.state` 会一起说“就绪”，而它已经没了）。这一句同时把该插件的
+        // 暂存队列以可读失败收尾（见 [_setLifecycle] 的 stopped 分支）。
+        // 这**不是新增一个判死来源**：用的仍是 `PluginHost.isClosed`（快照本来就把
+        // isClosed 记成 disabled），只是把同一个事实也写进生命周期台账（不变量 15）。
+        _setLifecycle(pluginId, PluginLifecycleState.stopped);
         if (_dead.add(pluginId)) {
-          log?.call(
-            '插件 $pluginId 进程已退出 ⇒ 广播 disabled（其声明的 UI 槽位应随之注销）',
-          );
+          log?.call('插件 $pluginId 进程已退出 ⇒ 广播 disabled（其声明的 UI 槽位应随之注销）');
           _emitStatus(pluginConfig, 'disabled', reason: '插件进程已退出');
         }
         continue;
@@ -949,6 +1068,15 @@ class PluginBus {
           'registered',
           degraded: true,
           reason: host.liveness.staleMessage,
+        );
+        // 失活标记广播（发布点之二）：带的就是 degraded 那个判定源自己的丢失拍数，
+        // **不另起时钟**；lifecycle 一字不改（它是 ready 还是 degraded 是两回事）。
+        announcePluginState(
+          pluginId,
+          from: lifecycleOf(pluginId),
+          to: lifecycleOf(pluginId),
+          reason: host.liveness.staleMessage,
+          missedHeartbeats: host.liveness.missedCount,
         );
       }
     }
@@ -1035,19 +1163,251 @@ class PluginBus {
   PluginLifecycleState lifecycleOf(String pluginId) =>
       _lifecycle[pluginId] ?? PluginLifecycleState.stopped;
 
-  /// 生命周期的**唯一写入口**：只在真的跃迁时记台账 + 写日志。
+  /// 生命周期的**唯一写入口**：只在真的跃迁时记台账 + 写日志 + 驱动保活。
   ///
   /// 这里**故意不推 `plugin_status` 帧**：帧的产出点仍是原有的那几个（就绪 / 下线 /
-  /// degraded），它们都改成从这里读 `lifecycle`。在同一处既写台账又发帧会造出
-  /// 重复帧（一次上线发两条），而阶段 2 的「状态广播」有自己的点位
-  ///（`plugin.state`），不该混进增量里。
+  /// degraded），它们都改成从这里读 `lifecycle`。阶段 2 的状态跃迁走**自己的点位**
+  /// （广播站 `plugin.state`，见 [announcePluginState]），不混进增量里。
+  ///
+  /// 为什么暂存队列的**收尾也挂在这里**（而不是挂在 hotRestart / restart 里）：
+  /// 跃迁点有四处（启动 / 就绪 / 失败 / 下线），把收尾分散到四个调用方一定会漏一处；
+  /// 漏掉的那一处就是「会话永远等一条不会被投递的请求」——那是比失败更难查的东西。
   void _setLifecycle(String pluginId, PluginLifecycleState state) {
     final PluginLifecycleState previous =
         _lifecycle[pluginId] ?? PluginLifecycleState.stopped;
     if (previous == state) return;
     _lifecycle[pluginId] = state;
     log?.call('插件 $pluginId 生命周期：${previous.wire} → ${state.wire}');
+    // 跃出保活窗口 ⇒ 把在等就绪的工具调用方放回去（上面那个 future 的唯一完成来路）。
+    if (!state.isTemporarilyUnavailable) _wakeLifecycleWaiters(pluginId);
+    switch (state) {
+      case PluginLifecycleState.ready:
+        // ready **不清代管台账**：订阅申报常常晚于 ready 到达（插件收到 hello 回包
+        // 才发 station/subscribe），在这里清掉就等于让 [_subscribeToStation] 看不出
+        // 「这条声明是上一世留下的」，旧归属会和新归属同时挂在同一个点上。
+        // 代管只有三条销账路：新实例重新申报（见 _subscribeToStation）、落到
+        // stopped/failed（下面两个分支补注销）、核心退出（close 里整张清）。
+        // 重放点仍在 ready：队列与申报路径是两件事，重放不依赖订阅台账。
+        unawaited(_replayBuffered(pluginId));
+        break;
+      case PluginLifecycleState.stopped:
+      case PluginLifecycleState.failed:
+        final String why = state == PluginLifecycleState.failed
+            ? '插件 $pluginId 本轮启动失败'
+            : '插件 $pluginId 已下线';
+        if (_stationKept.remove(pluginId)) {
+          stations.unsubscribePlugin(pluginId);
+          log?.call('$why ⇒ 补上重启窗口里押后的订阅注销（不再保活）');
+        }
+        _abandonBuffered(pluginId, '$why ⇒ 这些请求不再等待，各自的调用点按既有 fail-open 兜底');
+        break;
+      case PluginLifecycleState.booting:
+      case PluginLifecycleState.restarting:
+      case PluginLifecycleState.suspended:
+        // 这三态都是「暂时不可用」：不重放也不收尾，新到的请求继续入队（有界）。
+        break;
+    }
+    announcePluginState(pluginId, from: previous, to: state);
   }
+
+  // ── 重启期保活：暂存 / 重放 / 收尾（阶段 2）──────────────────────
+
+  /// 把一条站点请求**真的投出去**（重放与直投共用，不另开一条投递路径）。
+  ///
+  /// 宿主按插件 id **延迟解析**：重放时必须拿到新一世那个进程，而不是入队时那个
+  /// （已经退掉了）。这与订阅时回包函数的延迟解析是同一个口径（见 [_subscribeToStation]）。
+  Future<StationReply> _deliverStationRequest(
+    String pluginId,
+    StationRequest request,
+  ) async {
+    final PluginHost? host = _hosts[pluginId];
+    if (host == null || host.isClosed) {
+      return StationReply.failed('插件 $pluginId 未运行，无法处理站点请求');
+    }
+    return host.requestStation(request);
+  }
+
+  /// 某插件处于「暂时不可用」的哪一段（站点投递的分流判据）。
+  ///
+  /// 为什么以 **lifecycle** 而不是 `_hosts` 为判据：`_hosts` 只能回答「有没有进程」，
+  /// 而重启窗口里真正的问题是「这个插件对外还算不算正常」（阶段 2 的命题）。
+  /// 旧宿主在 `restarting` 的开头几毫秒可能还在表里，把它递一个正在转储的进程
+  /// 等于亲手制造一次失败。
+  bool _isKeepaliveWindow(String pluginId) =>
+      lifecycleOf(pluginId).isTemporarilyUnavailable;
+
+  /// 新一世**重新申报**订阅时，把上一世被保活代管的那份声明当场作废。
+  ///
+  /// 保活窗口里 [_disconnect] 刻意不注销订阅（注销了，窗口里到达的请求连暂存的
+  /// 入口都没有）。留着它的代价是**可证明的**：若这一世改了归属（`scope.team_id`
+  /// 变了），新声明会以**不同的键**再挂一份到同一个点上，旧那条 `team-1` 的声明
+  /// 不会自己消失 —— 于是 team-1 的请求会被递给一个已经不属于 team-1 的进程：
+  /// 那是隔离被绕过，不是「快照多一条读数」。归属声明只能有一份。
+  ///
+  /// 为什么两条申报路都要接（插件侧 station/subscribe + 核心侧工具表收集）：
+  /// 收集站的订阅是 [refreshToolDefinitions] 自己下的，插件一行代码都不用写；
+  /// 只堵插件那一路，改了 `scope` 的配置对账就会留下旧归属（对账用例直接可观测）。
+  ///
+  /// 只在「确实代管着」时动手（平时零开销）；注销后新一世会照常重新申报，
+  /// 中间那个极短的缝隙按既有 fail-open 兜底，不谎报成成功。
+  void _supersedeCarriedSubscriptions(String pluginId) {
+    if (!_stationKept.remove(pluginId)) return;
+    stations.unsubscribePlugin(pluginId);
+    log?.call('插件 $pluginId 新一世重新申报订阅 ⇒ 注销上一世被保活代管的那份站点声明');
+  }
+
+  /// ready 后重放某插件的暂存请求（失败只写日志，绝不抛出：重放不能把就绪弄成失败）。
+  Future<void> _replayBuffered(String pluginId) async {
+    if (restartBuffer.lengthOf(pluginId) == 0) return;
+    final int before = restartBuffer.replayedCount;
+    await restartBuffer.replay(
+      pluginId,
+      deliver: (StationRequest request) =>
+          _deliverStationRequest(pluginId, request),
+      stillValid: (QueuedStationRequest item) =>
+          _bufferedRequestStillValid(pluginId, item),
+    );
+    final int delivered = restartBuffer.replayedCount - before;
+    if (delivered > 0) {
+      log?.call('插件 $pluginId 就绪 ⇒ 重放重启窗口里暂存的 $delivered 条站点请求（FIFO）');
+    }
+  }
+
+  /// 重放前的逐条复查（为什么不能无条件重放见 [PluginRestartBuffer.replay]）。
+  ///
+  /// 两条判据都**沿用已有台账**，不另造一套记录：
+  /// - `request_id` 已收尾（done / error / 取消 / 活性窗口判无回）⇒ 按「迟到无害」丢，
+  ///   与 [_handleStationStream] 对迟到增量的处置同一口径（用的就是同一个 [_closedStreamIds]）；
+  /// - scope 与这个插件现在的声明不再相容 ⇒ 丢（fail-closed：宁可让调用点放行原数据，
+  ///   也不把 A 工作面的请求递到 B 工作面上）。
+  bool _bufferedRequestStillValid(String pluginId, QueuedStationRequest item) {
+    if (_closedStreamIds.contains(item.request.requestId)) {
+      log?.call(
+        '重放前丢弃 ${item.request.requestId}：它的发起方已经收尾（迟到无害），'
+        '不再递第二条给插件 ${item.request.stationId}',
+      );
+      return false;
+    }
+    final PluginConfig? cfg = config(pluginId);
+    if (cfg == null) {
+      log?.call('重放前丢弃一条请求：插件 $pluginId 已不在配置里（对账把它删了）');
+      return false;
+    }
+    final StationIsolationVerdict verdict = StationIsolation.checkSubscriber(
+      message: item.request.scope,
+      subscriber: _scopeOf(cfg),
+    );
+    if (!verdict.ok) {
+      log?.call(
+        '重放前丢弃一条 ${item.request.stationId} 请求（归属不再相容）：${verdict.reason}',
+      );
+      return false;
+    }
+    return true;
+  }
+
+  /// 以可读失败收尾某插件的暂存队列（返回被结掉的条数）。
+  int _abandonBuffered(String pluginId, String reason) =>
+      restartBuffer.abandon(pluginId, reason);
+
+  /// 暂存队列的水位（面板 / 广播载荷 / 用例都从这里读数，不另取一份）。
+  Map<String, dynamic> restartBufferReadings() => restartBuffer.readings();
+
+  /// **广播站点位「插件生命周期」**（`system.broadcast.plugin.state`，阶段 2 新增）。
+  ///
+  /// 发布点只有两处（与本点位 readme 逐字一致）：这里（生命周期的唯一写入口）与
+  /// [watchdog] 的失活标记——后者与 `health` 用**同一个判定源** `LivenessTracker`，
+  /// 不另造时钟（两套时钟必飘）。载荷含 `plugin_id` / `lifecycle` / `generation` /
+  /// `missed_heartbeats` / `reason` / `buffer`。
+  ///
+  /// 与 [announceToolCall] 同口径：**单向通知**（`unawaited`，不等回包，投递结果
+  /// 不回灌）——插件重启不该因为「有人在听广播」而多等一拍。
+  ///
+  /// 为什么需要它：重启窗口里插件对外仍是「正常状态」（不被路由真实任务、站点请求
+  /// 被有界暂存后重放），所以「现在到哪个阶段了」必须由核心推出来，而不是让前端
+  /// 靠「没回音」去猜（猜 = 把暂时不可用误报成挂了）。
+  void announcePluginState(
+    String pluginId, {
+    required PluginLifecycleState from,
+    required PluginLifecycleState to,
+    String reason = '',
+    int missedHeartbeats = 0,
+  }) {
+    load();
+    if (!enabled) return;
+    final BroadcastStation? station = stations.broadcastPointFor(
+      StationHubIds.broadcastPluginState,
+    );
+    if (station == null) return;
+    if (station.subscribers.isEmpty) return; // 快路径：没人订阅，零开销
+    final PluginConfig? cfg = config(pluginId);
+    if (cfg == null) return;
+    final StationScope scope = _broadcastScopeOf(cfg);
+    if (!scope.isValid) {
+      // 不静默：为什么这条广播没发出去必须能查到（不变量 6）。
+      log?.call(
+        '插件生命周期广播跳过（$pluginId 的 ${scope.describe()} 不能证明归属，'
+        'fail-closed）：${from.wire} → ${to.wire}',
+      );
+      return;
+    }
+    final Map<String, dynamic> payload = <String, dynamic>{
+      'point': station.id,
+      'plugin_id': pluginId,
+      'lifecycle': to.wire,
+      'previous': from.wire,
+      'generation': generationOf(pluginId),
+      'missed_heartbeats': missedHeartbeats,
+      if (reason.isNotEmpty) 'reason': reason,
+      'buffer': restartBuffer.readings(),
+    };
+    _pluginStateBroadcasts++;
+    unawaited(
+      station
+          .publish(
+            topic: 'plugin.state',
+            scope: scope,
+            payload: payload,
+            meta: <String, dynamic>{
+              'plugin_id': pluginId,
+              'lifecycle': to.wire,
+            },
+          )
+          .then((StationPublishResult result) {
+            if (result.deliveries.any((StationDelivery d) => !d.ok)) {
+              log?.call('插件生命周期广播 ${result.describe()}');
+            }
+          })
+          .catchError((Object error) {
+            log?.call('插件生命周期广播异常（已忽略，不影响重启）：$error');
+          }),
+    );
+  }
+
+  /// 广播载荷的**消息**四元组：以插件自己的声明为 team，mode 解析不出来时退回它的
+  /// agent 的工作面（与 [_scopeOf] 同源，不自己猜）。
+  ///
+  /// 为什么不能像工具广播那样用调用点上下文：插件的生命周期不属于某个会话，它是
+  /// 这个插件实例自己的事；拿声明做信封才能回答「这件事归哪个 team」。
+  StationScope _broadcastScopeOf(PluginConfig cfg) {
+    final StationScope declared = _scopeOf(cfg);
+    if (StationModeKey.isValid(declared.modeKey)) return declared;
+    final String agent = declared.agentId;
+    if (agent.isEmpty) return declared;
+    final String mode = agentModeKeyResolver?.call(agent) ?? '';
+    return StationModeKey.isValid(mode)
+        ? StationScope(
+            teamId: declared.teamId,
+            agentId: declared.agentId,
+            sessionId: declared.sessionId,
+            modeKey: mode,
+          )
+        : declared;
+  }
+
+  /// 已发出的生命周期广播条数（用例与面板用；与点位 readme 的「每个跃迁一条」对照）。
+  int _pluginStateBroadcasts = 0;
+  int get pluginStateBroadcasts => _pluginStateBroadcasts;
 
   // ── 热重启（阶段 1 的产出点）───────────────────────────────────────
 
@@ -1168,7 +1528,7 @@ class PluginBus {
   ///
   /// **自重启不许挂死**（D2 的核心卡点）：`plugin.restart` / `plugin.suspend` 要回头
   /// 跟插件讲话（`suspend` 是核心→插件的请求）。如果发起者正是目标，那就成了
-  /// 「正在等回包的进程被要求先回一条别的包」——单读循环的插件会当场侸住。
+  /// 「正在等回包的进程被要求先回一条别的包」——单读循环的插件会当场卡住。
   /// 所以这两条命令在**目标 == 发起者**时先应答、后动手：用 [Timer.run] 排到
   /// 下一个事件循环回合（而不是 microtask：回包本身就在当前回合的微任务队列里，
   /// 抢在它前面写 suspend 就等于没修）。这是“核心代答”的最小形态；窗口内的
@@ -1179,8 +1539,7 @@ class PluginBus {
     required String sourcePluginId,
     Map<String, dynamic>? arguments,
   }) async {
-    final Map<String, dynamic> args =
-        arguments ?? const <String, dynamic>{};
+    final Map<String, dynamic> args = arguments ?? const <String, dynamic>{};
     switch (command) {
       case 'plugin.list':
         return <String, dynamic>{
@@ -1206,10 +1565,12 @@ class PluginBus {
         if (pluginId.isNotEmpty && pluginId == sourcePluginId) {
           // 先应答，下一回合再真动手（见上面注释里为什么必须是 Timer）。
           Timer.run(() {
-            unawaited(hotRestart(pluginId, keepState: keepState).then(
-              (PluginHotRestartResult result) =>
-                  log?.call('自重启收尾：${result.reason}'),
-            ));
+            unawaited(
+              hotRestart(pluginId, keepState: keepState).then(
+                (PluginHotRestartResult result) =>
+                    log?.call('自重启收尾：${result.reason}'),
+              ),
+            );
           });
           return <String, dynamic>{
             'ok': true,
@@ -1274,6 +1635,9 @@ class PluginBus {
           if (reading.pluginId == pluginId) reading.toJson(),
       ],
       'kill_reason': host?.killReason ?? '',
+      // 重启窗口里为它暂存的站点请求条数（保活水位）；全局上限与溢出计数见
+      // [restartBufferReadings]（广播载荷的 `buffer` 里带的就是它）。
+      'buffered_station_requests': restartBuffer.lengthOf(pluginId),
     };
   }
 
@@ -1314,9 +1678,11 @@ class PluginBus {
     if (!deferred) return run();
     // 目标就是发起者：同 plugin.restart 那条路径，先应答再动手。
     Timer.run(() {
-      unawaited(run().then((Map<String, dynamic> result) {
-        log?.call('自挂起收尾：${result['dump_id'] ?? result['error'] ?? ''}');
-      }));
+      unawaited(
+        run().then((Map<String, dynamic> result) {
+          log?.call('自挂起收尾：${result['dump_id'] ?? result['error'] ?? ''}');
+        }),
+      );
     });
     return <String, dynamic>{
       'ok': true,
@@ -1342,7 +1708,8 @@ class PluginBus {
     if (rawPayload is! Map) {
       return <String, dynamic>{
         'ok': false,
-        'error': 'plugin.stateDump 需要 arguments.payload（JSON 对象）：转储的内容就是它，'
+        'error':
+            'plugin.stateDump 需要 arguments.payload（JSON 对象）：转储的内容就是它，'
             '核心不猜、也不空收一条“没内容的快照”',
       };
     }
@@ -1577,6 +1944,10 @@ class PluginBus {
         );
         continue;
       }
+      // **重启窗口对外保持正常状态**（阶段 2）：先置 restarting，下面那个 [_disconnect]
+      // 才不会注销它的站点订阅（注销了，窗口里到达的请求连暂存的入口都没有）。
+      // 配置驱动的换一世与 hotRestart / restart 是同一件事，不能一套保活一套不保活。
+      _setLifecycle(config.id, PluginLifecycleState.restarting);
       await _disconnect(config.id);
       final PluginReconcileAction action = await _startForReconcile(
         config,
@@ -1756,6 +2127,10 @@ class PluginBus {
       if (crossScope != null) skipped.add(crossScope);
       if (station == null) continue;
       stationIds.add(station.id);
+      // 收集站的订阅是核心自己下的（插件不必写一行代码）⇒ 这一路同样是「新一世
+      // 重新申报」，必须先把上一世代管的那份作废，否则改了 scope 的配置对账会给
+      // 旧团队留下一条还能投递的声明。见 [_supersedeCarriedSubscriptions]。
+      _supersedeCarriedSubscriptions(config.id);
       stations.subscribe(
         station.id,
         StationSubscriber(
@@ -1803,9 +2178,7 @@ class PluginBus {
         );
         continue;
       }
-      if (!messageScopes.any(
-        (StationScope s) => s.exactEquals(messageScope),
-      )) {
+      if (!messageScopes.any((StationScope s) => s.exactEquals(messageScope))) {
         messageScopes.add(messageScope);
       }
     }
@@ -2004,6 +2377,7 @@ class PluginBus {
     Map<String, dynamic>? arguments,
     String result = '',
     bool isError = false,
+
     /// 这次调用是谁发起的（`agent` = 模型的工具调用；`plugin` = 插件经 `tool.call`）。
     ///
     /// 与广播 payload 同口径：中转订阅者拿到它才能区分"模型的调用"与"自己发起的
@@ -2097,7 +2471,8 @@ class PluginBus {
   // 心跳丢失 / 任何异常 ⇒ 回退系统默认（fail-open）；每个点位唯一订阅者。
 
   /// 打开中的「LLM 处理」插件流（`request_id` → 流状态）。
-  final Map<String, _PluginLlmStream> _llmStreams = <String, _PluginLlmStream>{};
+  final Map<String, _PluginLlmStream> _llmStreams =
+      <String, _PluginLlmStream>{};
 
   /// **比流登记更早到达**的 `station/stream` 通知（`request_id` → 帧列表）。
   ///
@@ -2444,7 +2819,10 @@ class PluginBus {
     final _PluginLlmStream? stream = _llmStreams[requestId];
     if (stream == null || stream.cancelled) return;
     stream.cancelled = true;
-    _hosts[stream.pluginId]?.cancelStation(requestId: requestId, reason: reason);
+    _hosts[stream.pluginId]?.cancelStation(
+      requestId: requestId,
+      reason: reason,
+    );
     _closeLlmStream(requestId, failure: '生成已取消（插件接管流被中断）', cancelled: true);
   }
 
@@ -2466,9 +2844,7 @@ class PluginBus {
       if (_closedStreamIds.contains(requestId)) {
         // 这条流已经收尾（done / error / 取消 / 心跳丢失）：迟到增量只能丢弃。
         // **当场记日志**——插件以为还在推，核心必须给出反馈，否则是静默数据丢失。
-        log?.call(
-          '插件 $pluginId 的 station/stream 迟到（$requestId 已收尾），本条增量已丢弃',
-        );
+        log?.call('插件 $pluginId 的 station/stream 迟到（$requestId 已收尾），本条增量已丢弃');
         return;
       }
       // 从没登记过：可能是"回包还没被处理完、插件已经推了第一片"——暂存等重放。
@@ -2535,14 +2911,15 @@ class PluginBus {
     final String kind = (delta['kind'] ?? delta['type'] ?? '').toString();
     switch (kind) {
       case 'text':
-        final String text = (delta['text'] ?? delta['content'] ?? '').toString();
+        final String text = (delta['text'] ?? delta['content'] ?? '')
+            .toString();
         return text.isEmpty
             ? const <LlmStreamEvent>[]
             : <LlmStreamEvent>[LlmTextDelta(text)];
       case 'thinking':
       case 'reasoning':
-        final String text =
-            (delta['text'] ?? delta['reasoning_content'] ?? '').toString();
+        final String text = (delta['text'] ?? delta['reasoning_content'] ?? '')
+            .toString();
         return text.isEmpty
             ? const <LlmStreamEvent>[]
             : <LlmStreamEvent>[LlmThinkingDelta(text)];
@@ -2615,9 +2992,7 @@ class PluginBus {
           : data;
       final LlmRequest? rewritten = LlmRequest.tryFromWire(rawRequest);
       if (rewritten == null) {
-        log?.call(
-          '投入 LLM 前改写点回包无法重建请求（第 $turn 跳）：按原请求放行',
-        );
+        log?.call('投入 LLM 前改写点回包无法重建请求（第 $turn 跳）：按原请求放行');
         return null;
       }
       log?.call('投入 LLM 前改写点：插件 ${relayed.pluginId} 改写了第 $turn 跳的请求');
@@ -2801,10 +3176,8 @@ class PluginBus {
         }
         context.add(
           (item as Map).map(
-            (dynamic k, dynamic v) => MapEntry<String, dynamic>(
-              k.toString(),
-              v,
-            ),
+            (dynamic k, dynamic v) =>
+                MapEntry<String, dynamic>(k.toString(), v),
           ),
         );
       }
@@ -3088,9 +3461,7 @@ class PluginBus {
     if (!scope.isValid) return;
     final bool isPost = phase == 'post';
     final BroadcastStation? station = stations.broadcastPointFor(
-      isPost
-          ? StationHubIds.broadcastToolPost
-          : StationHubIds.broadcastToolPre,
+      isPost ? StationHubIds.broadcastToolPost : StationHubIds.broadcastToolPre,
     );
     if (station == null) return;
     if (station.subscribers.isEmpty) return; // 快路径：没人订阅，零开销
@@ -3183,10 +3554,7 @@ class PluginBus {
   }
 
   /// 浅比较两个报文（回填 = 整体替换，键集与值都相同才算"未改动"）。
-  static bool _sameMap(
-    Map<String, dynamic> a,
-    Map<String, dynamic> b,
-  ) {
+  static bool _sameMap(Map<String, dynamic> a, Map<String, dynamic> b) {
     if (a.length != b.length) return false;
     for (final MapEntry<String, dynamic> e in a.entries) {
       if (!b.containsKey(e.key)) return false;
@@ -3643,7 +4011,8 @@ class PluginBus {
     final Map<String, dynamic> first = results.first;
     final List<String> errors = <String>[
       for (final Map<String, dynamic> item in results)
-        if ('${item['error']}'.trim().isNotEmpty) '${item['station_id']}：${item['error']}',
+        if ('${item['error']}'.trim().isNotEmpty)
+          '${item['station_id']}：${item['error']}',
     ];
     final List<String> replaced = <String>[
       for (final Map<String, dynamic> item in results)
@@ -3691,6 +4060,10 @@ class PluginBus {
       };
     }
     final StationKind kind = station.kind;
+    // 新一世重新申报 ⇒ 上一世那份代管声明当场作废（理由与只堵这一路不够的原因
+    // 都写在 [_supersedeCarriedSubscriptions]）。**必须先清旧的再挂新的**，顺序反了
+    // 就会把刚挂上的这一世一起摘掉。
+    _supersedeCarriedSubscriptions(config.id);
     final StationSubResult result = stations.subscribe(
       station.id,
       StationSubscriber(
@@ -3703,7 +4076,18 @@ class PluginBus {
       // **回包函数延迟解析宿主**（不在订阅时固定 host 实例）：插件可以在
       // `hello` 握手期间就发订阅请求（此时 `_hosts` 还没登记），若在此刻取
       // `_hosts[config.id]` 会把「启动即订阅」的插件误判成"实例不在运行"。
+      //
+      // **先判 lifecycle、再判宿主**（阶段 2 保活的唯一入口）：重启窗口里旧宿主可能
+      // 还在表里，把请求递给它等于亲手制造一次失败；而此刻没有宿主也不该直接回
+      // failed——那是「暂时不可用」，不是「这个插件不干了」。
       (StationRequest request) async {
+        if (_isKeepaliveWindow(config.id)) {
+          return restartBuffer.push(
+            config.id,
+            request,
+            (StationRequest r) => _deliverStationRequest(config.id, r),
+          );
+        }
         final PluginHost? host = _hosts[config.id];
         if (host == null || host.isClosed) {
           return StationReply.failed('插件 ${config.id} 未运行，无法处理站点请求');
@@ -3798,7 +4182,8 @@ class PluginBus {
         'station_ids': <String>[],
         'kind': kind.wire,
         'removed': 0,
-        'error': '插件 ${config.id} 的 scope（${scope.describe()}）没有可用的${kind.label}',
+        'error':
+            '插件 ${config.id} 的 scope（${scope.describe()}）没有可用的${kind.label}',
       };
     }
     return <String, dynamic>{
@@ -4230,7 +4615,8 @@ class PluginBus {
       final String team = requestedTeam.isNotEmpty
           ? requestedTeam
           : declared.teamId.trim();
-      if (declared.teamId.trim().isNotEmpty && team.isNotEmpty &&
+      if (declared.teamId.trim().isNotEmpty &&
+          team.isNotEmpty &&
           declared.teamId.trim() != team) {
         throw PluginRequestException(
           PluginRpcErrorCode.scopeDenied,
@@ -4483,7 +4869,22 @@ class PluginBus {
   }
 
   /// 站点活性探针：订阅者（插件）心跳还在不在。
+  ///
+  /// **重启窗口里给「无活性信息」而不是 lost**（阶段 2）：这不是谎报也不回避——
+  /// 心跳台账本来就只能回答「这个进程还在不应」，而“旧进程已退、新进程未就绪”这一段
+  /// 根本没有心跳可依据。报 lost 会让站点立刻终结等待（「订阅者心跳丢失」），暂存
+  /// 就白做了；报 alive 那么核心在说一个自己知道不真的事。退回**活性窗口**（I×N）
+  /// 才是既有口径：窗口内插件若真的再也没起来，stopped/failed 会把队列以可读失败收尾。
+  /// 判死定义一字未改（不变量 15：只有心跳快照 down 与插件进程不可用两处能判死）。
   StationLivenessState _livenessOf(String pluginId) {
+    final PluginLifecycleState lifecycle = lifecycleOf(pluginId);
+    if (lifecycle.isTemporarilyUnavailable) {
+      return StationLivenessState(
+        known: false,
+        alive: false,
+        detail: '插件 $pluginId 处于 ${lifecycle.wire}（暂时不可用，不是判死）',
+      );
+    }
     final PluginHost? host = _hosts[pluginId];
     if (host == null) {
       return const StationLivenessState.lost('插件未启动或已下线');
@@ -4527,10 +4928,12 @@ class PluginBus {
         // 插件没启动就是空表（面板据此说“未提供工具”，而不是假装它有能力）。
         'description': config.description,
         'tools': toolsOf(config.id)
-            .map((PluginToolInfo t) => <String, dynamic>{
-              'name': t.name,
-              'description': t.description,
-            })
+            .map(
+              (PluginToolInfo t) => <String, dynamic>{
+                'name': t.name,
+                'description': t.description,
+              },
+            )
             .toList(growable: false),
         'granularity': config.granularity,
         'scope': config.scope,
@@ -4599,6 +5002,13 @@ class PluginBus {
     //（不变量 6：失败要可读上报，不静默挂住）。
     _failDumpWaiters('核心已退出 ⇒ 不再等这份快照');
     statePool.clear();
+    // 暂存的站点请求也必须有人接盘：留一个永不完成的 future 就等于把会话挂在半空
+    //（不变量 6：失败要可读上报，不静默挂住）。
+    restartBuffer.abandonAll('核心已退出 ⇒ 这些暂存的站点请求不再等待');
+    // 在等就绪的工具调用方也一样放回去（它们下一次取宿主会拿到 null，进而拿到
+    // 一句可读的不可用原因，而不是永远挂着）。
+    _wakeAllLifecycleWaiters();
+    _stationKept.clear();
     stations.save();
   }
 
@@ -4612,10 +5022,7 @@ class PluginBus {
     log?.call('快照等待收尾：$reason');
   }
 
-  Future<PluginHost> _spawn(
-    PluginConfig config, {
-    String resumeDumpId = '',
-  }) {
+  Future<PluginHost> _spawn(PluginConfig config, {String resumeDumpId = ''}) {
     final Future<PluginHost> Function(PluginConfig config)? factory =
         hostFactory;
     // 注入宿主（测试 / 自定义宿主）**拿不到 resumeDumpId**：它自己就是假定的插件，
@@ -4647,8 +5054,15 @@ class PluginBus {
     // **UI 缓存一并作废**：插件下线后它的槽位不该再被重放给新连接（前端收不到
     // plugin_status 时尤其重要——例如核心重启、或前端当时正断线）
     uiCache.remove(pluginId);
-    // **插件下线由总线注销其订阅**（站点订阅关系随之落盘）
-    stations.unsubscribePlugin(pluginId);
+    // **插件下线由总线注销其订阅**（站点订阅关系随之落盘）——但**重启窗口不注销**：
+    // 注销后站点上就没有这个插件的回包函数，重启期间到达的请求连暂存的入口都
+    // 没有（保活当场失效）。代价由 [_setLifecycle] 的 stopped/failed 分支补销。
+    if (lifecycleOf(pluginId) == PluginLifecycleState.restarting) {
+      _stationKept.add(pluginId);
+    } else {
+      _stationKept.remove(pluginId);
+      stations.unsubscribePlugin(pluginId);
+    }
     // 插件下线 ⇒ 它打开着的 LLM 接管流**必须以失败收尾**：否则会话会一直等一条
     // 永远不会有数据的流（判活定时器也会在一拍内发现并收尾，这里只是更快更明确）
     _failLlmStreamsOf(pluginId, '插件已下线，LLM 接管流中断');
@@ -4684,7 +5098,8 @@ class PluginBus {
   /// 让某插件打开着的全部 LLM 接管流以失败收尾（下线 / 重启时调用）。
   void _failLlmStreamsOf(String pluginId, String reason) {
     final List<String> owned = <String>[
-      for (final MapEntry<String, _PluginLlmStream> entry in _llmStreams.entries)
+      for (final MapEntry<String, _PluginLlmStream> entry
+          in _llmStreams.entries)
         if (entry.value.pluginId == pluginId) entry.key,
     ];
     for (final String requestId in owned) {

@@ -69,7 +69,7 @@
     - **新定位**：中转站不只会拦下数据让插件改写，还会把**整块处理工作**交给插件。SSH 工作空间因此新增内置点位
       `system.relay.ssh.execute`（别名 `ssh.execute`，中转站唯一订阅者）：核心把 `ensure` / `request` / `state` /
       `reconnect` / `close` / `shell.*` 都投成一次 `station/request`，插件自己完成到目标机的通信与回包，
-      共 21 个内置点位（广播 4 + 执行 9 + 中转 7 + 收集 1）。
+      共 22 个内置点位（广播 5 + 执行 9 + 中转 7 + 收集 1）。
     - 选路信号：`PluginBus.sshExecuteStationSubscribed()`（新，按「中转站点位有没有订阅者」）
       与 `PluginBus.sshExecutorLookup()`（旧，按 `hello.capabilities` + 进程在跑）**OR**：
       旧插件只报 capability 不订站点 ⇒ 行为与今天一致（走 `tunnel.*` 顶层方法）；
@@ -187,6 +187,39 @@
     自重启不许挂死：目标 == 发起者时用 `Timer.run` **先应答再动手**（microtask 不够：回包本身就在
     当前回合的微任务队列里，抢在它前面写 `suspend` 等于没修）。
     用例：[test/plugin_hot_restart_station_test.dart](../../../test/plugin_hot_restart_station_test.dart)。
+
+27. **重启窗口对外是「暂时不可用」，不是「不在了」**（2026-10-15 阶段 2，D2/D8/不变量 6/15）：
+    `lifecycle ∈ {restarting, suspended, booting}` 时，站点请求在**唯一投递点**进
+    **有界暂存队列**（每插件默认 32 条 + 全局字节上限），`ready` 后按 **FIFO 重放**；
+    重放前逐条复查归属（`StationIsolation.checkSubscriber`）与 `request_id` 是否已收尾
+    （迟到无害口径）——复查不过的那条**丢弃并计数**，不递一个已经没人等的请求。
+    - **溢出 = 当场按既有 fail-open 放行原数据**（会话不受影响），并写下可读原因；
+      绝不无界堆积（那是把失败换成一次内存事故）。
+    - 队列**只以三种方式收尾**：`ready` 重放 / 落到 `stopped|failed` 以可读失败收尾 /
+      核心退出。收尾点挂在**生命周期跃迁那一处**（分散到四个调用方一定漏一处，
+      漏掉的那一处就是「会话永远等一条不会被投递的请求」）。
+    - **保活期间不得押后注销**（押后就轮不到暂存），但新一世**重新申报订阅时上一世那条
+      必须当场作废**：否则改了 `scope` 的重启会让旧团队还能把请求递给新归属的进程
+      （中转站那边则是「全站只许一个处理者」直接把新一世拒成 `key_conflict`）。插件侧
+      `station/subscribe` 与核心侧工具表收集**两条申报路都要销账**（收集站的订阅是核心
+      自己下的，插件一行代码都没写）。
+    - **判死定义一个字节都没动**（不变量 15）：只有心跳快照 `down` 与插件进程不可用两处
+      能判死；窗口里的活性读数如实报「无信息」⇒ 站点退回既有活性窗口，既不谎报活着，
+      也不拿「暂时不可用」当死证。
+    - 阶段跃迁走**自己的点位**：新增广播点 `system.broadcast.plugin.state`（别名
+      `plugin.state`，单向通知，回包仅作送达确认），发布点 = `_setLifecycle()` 与看门狗
+       degraded/恢复处（与 `health` **同一个判定源**，不另造时钟）；载荷含
+      `plugin_id`/`lifecycle`/`previous`/`generation`/`missed_heartbeats`/`reason`/`buffer`。
+      **归属证明不了就跳过并记日志**（宁可不广播，不广播一条证明不了来源的）。
+      它**不进** `plugin_status` 帧（帧的产出点一个都没多）。
+    - 路由判据：`stopped`/`failed` ⇒ **不投递**（可读原因，不是默认兜底）；
+      `restarting`/`suspended`/`booting` ⇒ 暂存；`callTool` 在窗口里**等事件而不是等时长**。
+      配置驱动的换一世（`applyConfigs` 看到 args/scope 变了）与 `hotRestart`/`restart`
+      算**同一个窗口**：一个命题不能一套保活一套不保活。
+    用例：[test/plugin_restart_keepalive_test.dart](../../../test/plugin_restart_keepalive_test.dart)（7）、
+    [test/plugin_restart_buffer_bounded_test.dart](../../../test/plugin_restart_buffer_bounded_test.dart)（9）、
+    [test/plugin_state_broadcast_test.dart](../../../test/plugin_state_broadcast_test.dart)（6）、
+    [test/plugin_status_compat_test.dart](../../../test/plugin_status_compat_test.dart)（6）。
 
 ## 测试
 
