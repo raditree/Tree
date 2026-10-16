@@ -19,6 +19,48 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **整轮接管只能夺「编排」，不能夺「写」**（**新增**
+  [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 31、
+  [docs/plugin-development.md](docs/plugin-development.md) §5.6、
+  [docs/architecture.md](docs/architecture.md) 组件表）（用户 2026-10-17 checklist 第 4 项
+  「tool loop 是否支持插件化」；plan 阶段 8）：
+  - **内置点位 34 → 35**（中转 11 → **12**，预建 32 → **33**，快照 34 → **35**）：新增中转站
+    `system.relay.loop.run`（别名 `loop.run`，唯一订阅者）。它与 `llm.handle` 的分界是这条断言的
+    核心——**handle 只交一跳**（第几跳、工具怎么排、何时收尾仍由核心定），**loop.run 交整轮**
+    （一条用户消息 = 一个 run，循环形状归接管者）。分流发生在**上下文装配完、进入内置
+    `LlmSession` 之前**那一次（不是每跳一次）；无人接管 ⇒ 内置 loop 逐字不变，且引擎与
+    `LlmSession` 都不认识插件总线（只多一个 `AgentLoopHandler?` 槽，由
+    `CoreServer._wirePluginRelayPoints` 赋值）。
+  - **接管信号只有一个**：回 `{stream: true}`（与 `llm.handle` 同一约定，**不另外发明**一套
+    「还必须带 `taken: true`」）；不回 / 明确 `taken: false` / 只回整包 ⇒ 都按未接管走内置 loop，
+    但**每一种都留下一行说明**——「我装了插件为什么没生效」不能变成零线索的悬案。
+  - **写侧不可剥**：落库、`tool_start` / `tool_end` 卡片、用量账本、取消与判死全部仍在核心。
+    卡片由**核心**从执行站 `tool.call` 那一条唯一入口播（接管者回带 `run_id` ⇒ 走同一套
+    `tool.pre` / `tool.post` / `tool.timeout` / 审批 / 台账），所以「插件自实现 loop 会绕过核心
+    站点」这条风险是被路径本身堵住的；接管者往事件流里直接推 `tool_call` 增量**不产生任何
+    历史**（只留一行日志告诉它该走哪条路）。接管期间同一会话的 `agent.message` **被拒**——
+    不开第二条写入口，否则就是双写历史。
+  - **孤儿行为当场拒**：`tool.call` 带的 `run_id` 不在册（这一轮已收尾 / 属于别的插件 / 从未
+    接管）⇒ 这次调用**失败并给可读原因**，不是「工具照跑但卡片丢了」；`run_id` 由核心拼
+    （= `request_id`），插件自述的归属一律不采信。工具真的跑了而卡片没播出去 ⇒ 不抹结果，
+    但必留下一行（「卡片没上屏」与「没人管」是两件事）。
+  - **收尾只播一条 `AgentDone`**：不管这条流是从接管者的 `done` 帧、从用户取消、还是从心跳
+    丢失关的（两条 Done 会让会话以为这一轮既正常结束又被取消）。取消形状照内置——只
+    `cancelled: true`，**不发 `AgentError`**（被用户停下不是出错）。单方面收尾只靠「显式取消 /
+    心跳丢失」两条（D8：不拿时长杀长任务）。
+  - **usage 与内置同表**（写成公开函数 `loopRunUsageMap` 就是为了能直接钉住）：`total_tokens`
+    端点给了真值就用真值、没给才 prompt + completion；`cached_tokens` 为 0 ⇒ **不写键**（端点
+    没给这个字段就绝不编造 0）；`max_tokens` 由引擎递进来，拿不到就不写——进度条宁可少
+    一段，也不能拿一个假的上限算百分比。
+  - **不另造一套流式机制**：登记、归属校验、早到帧暂存、`station/cancel` 下发、心跳丢失收尾
+    全部复用 `llm.handle` 那条插件流（`_openPluginLlmStream` / `_guardPluginStream`）——两套守护
+    一定会漂，而漂了的表现是「取消偶尔不生效」这种最难查的 bug。
+  - **工具表内置与接管者必须同一份**：`tools` 与 `messages` 一起进 payload（这份表同时决定
+    缓存前缀，不变量 15），不由接管者自己拼。
+  - 用例：`plugin_loop_relay_test.dart`（**15**：六个交付位齐 / 接管判据三种各留说明 / payload
+    形状 / 在册可查与归属 / 取消只一条 Done / 孤儿 `tool.call` 被拒 / 卡片成对 /
+    `agent.message` 双写拒绝 / usage 同表）；派生计数同步 8 份（点位表与预建数量、快照、
+    中转站条数）。
 - **加一个点位要同时交付六件；看现场一律只读；并发形状必须有上界**（**新增**
   [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 30、
   [docs/plugin-development.md](docs/plugin-development.md) §3.1 / §6.9 / §7.1）（plan 阶段 6：A 级点位批 +

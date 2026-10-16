@@ -129,7 +129,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | 中转站 relay | 拦截-回填：核心把数据交给你，你决定改不改 | 订阅；**每个点位唯一订阅者** |
 | 收集站 collect | 一对多收集 + 汇聚，不回填原数据流 | 由核心按接入点代订阅（工具定义） |
 
-### 3.1 全部内置点位（34 个 id：广播 10 + 执行 11 + 中转 11 + 收集 2）
+### 3.1 全部内置点位（35 个 id：广播 10 + 执行 11 + 中转 12 + 收集 2）
 
 | 点位 id | 类型 | 触发时机 | 回填/产出 |
 |---|---|---|---|
@@ -144,6 +144,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.relay.tool.probe` | 中转 | 同一批：判断这次调用是否已有结果 | `{found:true, text}` / `{found:false}` / 不回 ⇒ 三档：**有结果 / 肯定没有 / 交回内置探针查库**（别名 `tool.probe`） |
 | `system.relay.llm.register` | 中转 | 每个流式请求建立时（登记之后） | `{accepted, note}` ⇒ 回执只进日志；**内置登记表永远先建立**，取消/关闭/判死不在这一条上（别名 `llm.register`） |
 | `system.relay.compact.skip.reason` | 中转 | 每一次「压缩没走插件」（早退不投） | `{reason}` ⇒ **覆盖还账上那一条**（REST 与压缩结论会看到）；已推进历史的通知不回改；不改分级位（别名 `compact.skip.reason`） |
+| `system.relay.loop.run` | 中转 | 每一轮开始处（上下文装配完、进入内置 LlmSession **之前**） | 回 `{stream:true}` ⇒ **整轮循环形状归你**（第几跳、工具怎么排、何时收尾）；文本/思考/提示/用量经 `station/stream` 推回，**工具走 `tool.call` 并回带 `run_id`**；落库、卡片、取消与判死仍在核心（别名 `loop.run`，详见 §5.6） |
 | `system.execute.fs` | 执行 | — | `fs.read` / `fs.write` / `fs.list` / `fs.grep` |
 | `system.execute.terminal` | 执行 | — | `terminal.exec`（含 hook 后台任务）、`terminal.listRuns` / `terminal.stopRun` / `terminal.log`（后台任务的**结构化读口与控口**：列表回行不回散文，`exit_code`/`pid` 拿不到写 `null` 不省略键，终止**不保证杀得掉**且 `requested=false` 必带 `reason`，`log` 只递尾部；只看/只动目标 agent 自己的任务） |
 | `system.execute.agent` | 执行 | — | `agent.message` / `agent.stop` / `agent.compact` |
@@ -341,7 +342,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 
 **fail-open 红线**（全部对插件友好）：无订阅者 ⇒ 核心零等待走默认路径；你没回 /
 心跳丢失 / 回包非法 / 抛异常 ⇒ 一律回退默认路径并记日志。**你永远不会阻塞核心的
-主流程**——但"你慢了"就是"生成慢了"，见 §5.6。
+主流程**——但"你慢了"就是"生成慢了"，见 §5.7。
 
 > `tool.post` 的两条回填路径差别要记牢：**回字符串** = 只换结果文本（`is_error` 保持原值）；
 > **回对象** = 整体替换报文——要保留"这是一次失败调用"就必须带上 `"is_error": true`，
@@ -361,6 +362,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.relay.tool.probe` | `point`, `agent_id`, `session_id`, `tool_call_id` | `{found:true, text}` / `{found:false}`；缺布尔 `found` ⇒ 按**未接管**回内置探针 |
 | `system.relay.llm.register` | `point`, `handle`, `agent_id`, `session_id`, `model`, `turn` | `{accepted, note}` ⇒ note 只进日志；**fire-and-forget，不卡请求本身** |
 | `system.relay.compact.skip.reason` | `point`, `agent_id`, `session_id`, `reason`（内置那句，已先记账） | `{reason}` ⇒ 覆盖还账上那一条（保留分级位）；空/晚 ⇒ 内置那句原样在 |
+| `system.relay.loop.run` | `point`, `agent_id`, `session_id`, `team_id`, `mode`, `model`, `message_count`, `messages`（引擎这一轮真会用的那份线形消息）, `tools`（与会话同一份工具表） | 接管：`{stream:true}` ⇒ 之后用 `station/stream` 推 `delta{kind:text\|thinking\|notice}` / `usage` / `done{finish_reason,usage}` / `error`；不接管：不回 / `{taken:false}` / 只回整包（均留下一行说明） |
 
 > **压缩点位：原料只有"引擎真会发的那份"（2026-10 定稿）**。只要这个点位有订阅者，
 > 核心就不再算切点、也不再下发落库全量原文——它把 `request`（预压缩态的线形请求：
@@ -524,7 +526,60 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 - 系统提示词点位每轮生成调一次（压缩后重建时会再调一次）。你改写后的提示词**不进**
   压缩阈值估算（估算读的是内置构造结果），所以"改得多"会与进度条口径有偏差。
 
-### 5.6 性能与超时
+### 5.6 整轮接管：把 tool loop 交出去（`system.relay.loop.run`）
+
+上面那些点位有一个共同边界：**编排仍在核心**——哪怕你用 `llm.handle` 接管了每一跳，
+“这是第几跳、工具怎么排、什么时候算完”还是核心定的。要拿走整个循环形状（并行工具、
+先反思一轮、自己定终止条件、按业务分支决定要不要再问模型），接这一条。
+
+```jsonc
+// 1) 订阅（中转点位：唯一订阅者）
+{"jsonrpc":"2.0","id":1,"method":"station/subscribe","params":{
+  "station_id":"system.relay.loop.run","replace":true}}
+
+// 2) 核心会在每一轮开始处问你（上下文已经装配完）
+{"method":"station/request","params":{"station_id":"system.relay.loop.run","request_id":"req-42",
+ "payload":{"point":"system.relay.loop.run","agent_id":"agt_1","session_id":"ses_1",
+   "team_id":"team-1","mode":"local","model":"…","message_count":12,
+   "messages":[{"role":"user","content":"…"}],           // 引擎这一轮真会用的那份
+   "tools":[{"name":"read","description":"…","parameters":{…}}]}}}   // 与会话同一份工具表
+
+// 3) 接管信号与 llm.handle 同一个约定：回 stream:true
+{"jsonrpc":"2.0","id":"<上面的 id>","result":{"stream":true}}
+
+// 4) 文本、思考、提示、用量、收尾经 station/stream 推回同一个 request_id
+{"method":"station/stream","params":{"request_id":"req-42","delta":{"kind":"text","text":"我查完了"}}}
+{"method":"station/stream","params":{"request_id":"req-42","delta":{"kind":"notice","text":"先跑三个工具"}}}
+{"method":"station/stream","params":{"request_id":"req-42","done":true,"finish_reason":"stop","usage":{"prompt_tokens":120,"completion_tokens":30}}}
+
+// 5) 工具必须走 tool.call，并回带 run_id（就是那个 request_id）
+{"method":"station/call","params":{"station_id":"system.execute.tool","command":"tool.call",
+  "arguments":{"tool":"read","arguments":{"path":"a.txt"},"run_id":"req-42","call_id":"c1"}}}
+```
+
+四条必须写明白的纪律：
+
+- **接管信号只有一个**：`{"stream": true}`。不回 / 回 `{"taken": false}` / 只回整包（没有
+  `stream`）⇒ 核心走内置 loop，**每种都留下一行日志**说清为什么没生效。只收流式：取消与
+  单方面收尾都靠这条流，一次性回整包等于让核心无法中途收尾。
+- **写侧全部在核心**：落库、上行帧、用量账本、取消与判死都不交出去。你报的 `usage` 会被
+  翻成与内置同一张表（`total_tokens` 有真值用真值；`cached_tokens=0` **不写键**；上限拿不到
+  就**不写** `max_tokens`）。
+- **工具走 `tool.call`**（同一条唯一入口）：所以 `tool.pre` / `tool.post` / `tool.timeout`、
+  运行台账、`ask_user_question` 的提问审批**一个都不会绕过**；核心拿到这一次调用后会替你
+  播 `tool_start` / `tool_end` 卡片。直接往流里推 `tool_call` 增量**不会**产生任何历史
+  （只留一行日志）。
+- **接管期间不开第二条写入口**：同一会话的 `agent.message` 会被拒（那会双写历史）。
+
+收尾判据（与不变量 8 同一口径，**不拿时长杀长任务**）：核心下发 `station/cancel`（用户
+停止）或插件心跳丢失 ⇒ 核心**单方面收尾**：关流、如实落一条取消结论（取消只发
+`AgentDone(cancelled:true)`，**不发错误**）、并**拒收该 `run_id` 之后的 `tool.call`**（否则就
+是“核心已收尾、插件还在写工作空间”的孤儿行为）。
+
+想让别人看见你自己的事件？用收集站 `plugin.capability.define` 把它连字段表一起**申报**
+出去（见 §3.1），别的插件就能在拓扑里发现它。
+
+### 5.7 性能与超时
 
 - 不设静态总超时：核心按**心跳判活**等你（长任务不会被时间杀）。
 - 但"你慢 = 生成慢"：`tool.pre/post` 在每次工具调用的关键路径上，`llm.handle` 在每一跳上。
@@ -555,7 +610,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `agent.compact` | `agent_id?`, `session_id?` | `{…}` | **发起上下文压缩** |
 | `ui.push` | `slot_key`, `view?` | `{pushed, slot, slot_key, unregistered}` | 往消息流推一张卡片（§7） |
 | `llm.call` | `messages?` 或 `prompt?`, `system?`, `model?`, `temperature?`, `max_tokens?`, `tools?`（OpenAI 工具声明**原样透传**，给压缩插件对齐对话前缀用）, `response_format?`（`"json_object"` 缺省 / `"text"` = **不发**该字段，为复用对话前缀缓存；也接受 `{"type": …}`） | 成功 `{ok, json, text, model, usage}`；失败 `{ok:false, error, error_kind?, text, text_length, truncated_suspect?}`（**失败也带模型正文原文**，见下表后说明） | **站点处缺省硬设 JSON 返回形式**的 LLM 调用，复用目标 agent 的模型（显式 `"text"` 时改用对话同形态，见 §「缓存」第 3 条） |
-| `tool.call` | `tool`, `arguments?`, `relay?`（默认 false） | `{tool, result, is_error, relayed}` | 执行**任意工具**（内置 / MCP / 插件工具同一入口） |
+| `tool.call` | `tool`, `arguments?`, `relay?`（默认 false）, `run_id?` / `call_id?`（**只在整轮接管 `loop.run` 里用**，见 §5.6：`run_id` = 那一轮的 `request_id`） | `{tool, result, is_error, relayed}` | 执行**任意工具**（内置 / MCP / 插件工具同一入口）。带了 `run_id` 而它**不在册**（那一轮已收尾 / 属于别的插件）⇒ **这次调用被拒**，核心同时替你播上 `tool_start` / `tool_end` 卡片 |
 | `session.rename` | `title`（必填）, `session_id?` | `{renamed, title, session_id}` | 会话重命名（前端即时刷新标题） |
 | `ssh.reconnect` | `agent_id?` | `{ok, agent_id, stale?}` | 重建目标 agent 的远端（SSH）链路；与 REST /api/agents/{id}/ssh/reconnect、右栏文件面板「重连」按钮同一实现 |
 | `plugin.list` | — | `{ok, plugins:[{plugin_id, name, enabled, running, lifecycle, generation, suspendable, health}]}` | 看全部插件（需能证明 `team_id`） |
@@ -982,7 +1037,10 @@ plugins:
   带 `--selftest`（退出码 0 = 全绿）。它不是脚本，但是“一个插件能做到什么”的最小可读完整面（见 §6.7）。
 - 这些脚本都**不依赖第三方库**、都能被绝对路径启动（不依赖 cwd）。
 - 尚未提供可运行示例的点位：`system.relay.llm.request`（投入前改写）——口径见 §5.3，
-  接法与其他中转点位完全一致。
+  接法与其他中转点位完全一致；`system.relay.loop.run`（**整轮接管**）——口径与帧序列见
+  §5.6，没示例是因为接管者得**自带一份模型调用**（它才是循环的主人）：`sample_plugin.py`
+  里那套 `--relay-llm` 的流式写法就是它的下半身，把“每跳被问一次”换成“每轮被问一次”
+  并把工具改成 `tool.call` + `run_id` 即成。
 - 运行：把 `examples/plugins/` 下的脚本拷到桌面端的 `plugins/` 目录（或直接写绝对路径），
   在「设置 → 插件开发」里启用，即可在面板与消息流里看到它。
 

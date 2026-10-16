@@ -341,6 +341,28 @@
     `plugin_mass_restart_stress_test.dart`（内存层 3 条进闸门；真链路 1 条靠环境变量开）、
     `plugin_status_compat_test.dart`（帧键集合钉在明面上）。
 
+31. **整轮接管只能夺「编排」，不能夺「写」**（2026-10-17 阶段 8，`system.relay.loop.run`）：
+    内置点位 34 → **35**（中转 11 → **12**，预建 32 → **33**，快照 34 → **35**）。这一条把
+    tool loop 从核心交给插件（第几跳、工具怎么排、何时收尾都归接管者），边界靠四条纪律划：
+    - **接管信号只有一个**：`{stream: true}`（与 `llm.handle` 同一约定，**不另外发明**一套
+      “还必须带 taken:true”）；不回 / `taken:false` / 只回整包 ⇒ 内置 loop 逐字不变，
+      但**每种都要留下一行日志**（“没生效”不能变成零线索的悬案）；
+    - **写侧不可剥**：落库、`tool_start`/`tool_end` 卡片、用量账本、取消与判死全在核心。
+      卡片由**核心**从 `tool.call` 那一条路播（工具走唯一入口 ⇒ pre/post/timeout/台账/审批
+      天然不被绕过），接管者直接往流里推 `tool_call` 增量**不产生任何历史**；
+    - **孤儿行为必须当场拒**：`tool.call` 带的 `run_id` 不在册（已收尾 / 属于别的插件）就
+      拒收，不是“工具照跑但卡片丢了”；接管期间同一会话的 `agent.message` 也拒（不开
+      第二条写入口，那就是双写历史）；
+    - **收尾只播一条 `AgentDone`**：取消的形状照内置——只 `cancelled:true`，**不发
+      `AgentError`**（被用户停下不是出错）。单方面收尾只靠“显式取消 / 心跳丢失”（D8：
+      不拿时长杀长任务）。
+    实现上**不另造一套流式机制**：底下的登记、归属校验、早到帧暂存、`station/cancel` 下发、
+    心跳丢失收尾全部复用 `llm.handle` 那条插件流（`_PluginLlmStream` + `_guardPluginStream`）——
+    两套守护一定会漂，而漂了就变成“取消偶尔不生效”这种最难查的 bug。引擎侧只多一处分流
+    （**进入 LlmSession 之前**），`LlmSession` 本身一行未改。
+    用例：`plugin_loop_relay_test.dart`（15：接管判据三种、payload 形状、在册可查、取消只一条
+    Done、孤儿 tool.call 被拒、卡片成对与归属、agent.message 双写拒绝、usage 同表）。
+
 ## 测试
 
 ```bash

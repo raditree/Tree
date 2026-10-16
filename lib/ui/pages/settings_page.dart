@@ -603,7 +603,7 @@ class _SettingsPageState extends State<SettingsPage> {
             const SizedBox(height: 4),
             const Text(
               '插件是独立进程，走 stdio JSON-RPC 与核心通信：可申报工具（收集站）、'
-              '订阅 17 个站点接入点（中转/广播/执行/收集）、主动下命令（执行站，'
+              '订阅 35 个内置点位（中转/广播/执行/收集，含整轮 tool loop 接管）、主动下命令（执行站，'
               '含 LLM 调用与任意工具调用）、接管 LLM 生成、自建站点、声明前端面板。'
               '完整协议与可运行示例见 plugin-development.md。',
               style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
