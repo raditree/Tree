@@ -197,8 +197,7 @@ class BuiltinPluginCatalog {
     String? executableDir,
     this._probeTimeout = const Duration(seconds: 5),
   }) : _isWindows = isWindows ?? Platform.isWindows,
-       _executableDir =
-           executableDir ?? p.dirname(Platform.resolvedExecutable);
+       _executableDir = executableDir ?? p.dirname(Platform.resolvedExecutable);
 
   /// 核心内置的插件清单（至少一项：示例插件 sample）。
   ///
@@ -492,6 +491,14 @@ class BuiltinPluginCatalog {
     _cache.clear();
     _probeCache.clear();
   }
+
+  /// 探测本机可用的 Python 解释器（没有 = null）。
+  ///
+  /// 为什么公开：发布仓库里一条 `runtime: python` 的条目在**装之前**就要回答
+  /// “这台机器拉得起它吗”。写一条注定起不来的配置比不装更糟（面板上会多一个
+  /// 永远“启动失败”的条目），所以安装方要用与内置插件**同一个**探测口径，而不是
+  /// 自己再拼一套 `which python`。
+  Future<BuiltinRuntime?> detectRuntime() => _resolveRuntime();
 
   // ── 内部 ─────────────────────────────────────────────────────────────
 

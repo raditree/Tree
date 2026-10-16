@@ -1204,6 +1204,61 @@ class PluginBus {
     };
   }
 
+  /// 换文件前的**闸门**（阶段 5：从发布仓库装一条插件时由安装方调用）。
+  ///
+  /// 返回空串 = 这个插件的进程**已确认退出**，`plugins/` 里那些文件现在可以替换；
+  /// 否则回**为什么现在不能换**的可读原因，调用方据此一个旧文件都不碰。
+  ///
+  /// 与 [forceStop] 的分工是刻意的：这里**绝不 kill**。「为了让新文件落地就强杀一个
+  /// 正在干活的插件」= 核心替用户做了本该用户拍板的动作；这里只发优雅关闭通知，
+  /// 然后等「退出已确认」这个**事件**（对照 D8：按失活心跳赛跑，不按墙钟赛跑）。
+  /// 插件赖着不退就说「现在换不了」，由用户自己选「强制停止」那条显式路。
+  ///
+  /// 为什么把 [_reaping] 里同 id 的未确认实例也算进来：那是上一世赖着不退的进程，
+  /// 它**同样锁着文件**——只看实例表会让闸门在明明还锁着的时候放行。
+  ///
+  /// 停下来的这一世是 `stopped`（不是 `restarting`）：换文件期间没有「下一世一定会回来」
+  /// 的保证（安装可能失败），所以站点请求该按 stopped 的判据不投递，而不是暂存后重放
+  /// 一个装不上的新版。
+  Future<String> quiesceForSwap(String pluginId) async {
+    load();
+    final String id = pluginId.trim();
+    final PluginHost? live = _hosts[id];
+    final List<PluginHost> stragglers = <PluginHost>[
+      for (final PluginHost host in _reaping)
+        if (host.config.id == id && !host.exitedConfirmed) host,
+    ];
+    if (live == null && stragglers.isEmpty) {
+      // 没有在跑的实例、也没有待收尸的残留 ⇒ 这台核心没在持那些文件，可以放置。
+      // 注意这里**不看条目是否存在**：一条 `enabled: false` 的条目照样可能刚刚被
+      // 强制停止留下残留，那已经由上面两个集合覆盖。
+      return '';
+    }
+    if (live != null) {
+      // 优雅关闭 + 把状态推给前端（面板要看得见「它停了」，不然用户以为没点上）。
+      await _stopPlugin(id, '为替换插件文件而停止（发布仓库安装；没有强杀）');
+    }
+    final List<PluginHost> pending = <PluginHost>[
+      if (live != null && !live.exitedConfirmed) live,
+      ...stragglers,
+    ];
+    for (final PluginHost host in pending) {
+      final Completer<void> stale = host.liveness.watchStale();
+      try {
+        // 两个事件赛跑：进程确认退出（可以换）/ 心跳判失活（换不了，且不许强杀）。
+        await Future.any<void>(<Future<void>>[host.exited, stale.future]);
+      } finally {
+        host.liveness.unwatchStale(stale);
+      }
+      if (!host.exitedConfirmed) {
+        return '插件 $id 的进程还没确认退出（优雅关闭已发出，它还在收尾或已失联）'
+            '⇒ 这次**不替换文件**，旧文件一个都没动。'
+            '等它退出后重试，或在面板上对它「强制停止」（那是唯一会强杀的动作）';
+      }
+    }
+    return '';
+  }
+
   // ── 生命周期映射（集中一处）─────────────────────────────────────────
 
   /// 某插件当前的**代际**（每次 [_startOne] +1；从未启动过 = 0）。

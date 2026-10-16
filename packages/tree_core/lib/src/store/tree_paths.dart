@@ -87,6 +87,15 @@ class TreePaths {
   /// 插件配置（可直接手改的 yaml）。
   String get pluginsConfigFile => p.join(configDir, 'plugins.yaml');
 
+  /// 插件**发布仓库**的下载缓存（`<root>/plugins_release`）。
+  ///
+  /// 为什么放在数据根而不是可执行文件同级：这里存的是**半成品**（发布索引
+  /// `plugin-index.json` 与按 `<id>/<version>/` 分层的资产），而 `plugins/`（exe 同级）是
+  /// **已就位、会被拉起**的那一份。混在一起会让“下载了一半”的东西出现在插件查找
+  /// 路径里（面板上就多一条起不来的插件），而重装/换版时也不好判断该删哪一份。
+  /// 删掉这个目录没有破坏性：下一次刷新会重新拉。
+  String get pluginsReleaseDir => p.join(root, 'plugins_release');
+
   /// 图像附件的 `file_id` 缓存（`if_vision` 用）。
   ///
   /// 为什么放在配置目录而不是工作空间：它是**模型服务侧**的状态（同一张图在

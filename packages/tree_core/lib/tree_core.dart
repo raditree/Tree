@@ -58,6 +58,7 @@ export 'src/plugin/builtin_plugins.dart';
 export 'src/plugin/execute_mounts.dart';
 export 'src/plugin/plugin_bus.dart';
 export 'src/plugin/plugin_config_store.dart';
+export 'src/plugin/plugin_downloader.dart';
 export 'src/plugin/plugin_guide.dart';
 export 'src/plugin/plugin_host.dart';
 export 'src/plugin/plugin_tool_definition.dart';
