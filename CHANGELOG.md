@@ -23,12 +23,13 @@
   [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 30、
   [docs/plugin-development.md](docs/plugin-development.md) §3.1 / §6.9 / §7.1）（plan 阶段 6：A 级点位批 +
   稳定性四项）：
-  - **内置点位 22 → 29**（广播 10 / 执行 11 / 中转 7 / 收集 1），执行站命令 20 → **26**：广播新增
+  - **内置点位 22 → 34**（广播 10 / 执行 11 / 中转 11 / 收集 2），执行站命令 20 → **26**：广播新增
     `turn.done` / `turn.cancelled` / `turn.error` / `ask.paused` / `config.changed`；执行站新增
     `system.execute.station`（`station.list/state`）与 `system.execute.usage`（`usage.query`），并把
-    `terminal` 点位从 1 条命令扩到 4 条（`listRuns/stopRun/log`）。每个点位都是**六处同时交付**
-    （表项 + 常量 + 进 `StationHubIds.all` + 核心投递口 + readme 四段式 + 派生用例计数），漏任何一处
-    都是“面板上看得见、永远没人投”。
+    `terminal` 点位从 1 条命令扩到 4 条（`listRuns/stopRun/log`）；中转站新增 `tool.repair` /
+    `tool.probe` / `llm.register` / `compact.skip.reason`；收集站新增 `plugin.capability.define`。
+    每个点位都是**六处同时交付**（表项 + 常量 + 进 `StationHubIds.all` + 核心投递口 + readme 四段式
+    + 派生用例计数），漏任何一处都是「面板上看得见、永远没人投」。
   - **“问”与“推”分开钉住**：轮次类广播**订了才投**，命中分流表的事件**不再走 legacy 事件流**
     （否则一个事件两种形状同时在插件侧漂）；topic 由点位 id 去前缀**推导**，不另记表。载荷**只报
     结论不报内容**（轮次不带正文、`ask.paused` 不带题面与选项）；`config.changed` 的 `unchanged`
@@ -51,13 +52,21 @@
     三处有界结构不越界、不静默）；真链路 1 条（**50 个真插件进程同时 hotRestart**）默认**跳过**，需
     `$env:TREE_MASS_STRESS='1'` 才跑：一层就要 50 个 Dart VM、重启窗口两世并存使峰值翻倍，不该压垮
     开发机。本次**实跑一次全绿（37 秒）**；取保守侧的这一点写在这里。
-  - **本阶段未接的 A 级点位（遗留项，plan 允许降级）**：中转 `tool.repair` / `tool.probe` /
-    `llm.register` / `compact.skip.reason` 与收集 `plugin.capability.define`。它们差的都不是表项而是
-    **核心侧那一个投递口**（业务时机判断，不能靠猜）；接的时候仍按上面的六件同时交付。
+  - **A 级点位批已全部接完，没有遗留项**（原先写进这里当「遗留项」的四条中转与一条收集，同一天
+    就补完了）：它们差的从来不是表项，而是那一个投递口——而四个槽在核心里早就存在
+    （`LlmAgentEngine.toolResultRepair` / `toolResultProbe` / `llmRequestRegistrar` /
+    `PluginBus.compactionSkipSink`），所以接法全是「表 + 装配」，引擎与 LlmSession 一行未改。
+    接的口径：**接管只能改文案或附加观测，不能替换判据**——`tool.repair` 只决定那句修复说明
+    写什么（落库与 `tool_end` 帧仍只走内置那一条）；`tool.probe` 三档分得开（没接管 / 有结果 /
+    肯定没有）；`llm.register` 里**内置登记表永远先建立**（它是流式可关闭性的唯一执行点），
+    取消 / 关闭 / 判死仍然只在核心里（不变量 4 / 15）；`compact.skip.reason` 只覆盖还账上那一条
+    且保留分级位，已经推进会话历史的那条通知**不回改**。
   - 用例：`plugin_turn_broadcast_test.dart`（12）、`plugin_station_query_test.dart`（8）、
     `plugin_execute_mounts_test.dart`（+5）、`plugin_station_wiring_test.dart`（+1）、
+    `plugin_relay_capability_test.dart`（15：repair/probe/register/skip.reason/capability）、
     `plugin_mass_restart_stress_test.dart`（3 进闸门 + 1 靠环境变量）、`plugin_status_compat_test.dart`
-    （帧键集合）。派生计数 7 份同步（点位 29 / 预建 28 / 快照 29 / 命令 26）。
+    （帧键集合）。派生计数 9 份同步（点位 34 / 预建 32 / 快照 34 / 命令 26；一个插件现在同时挂
+    **两个**收集站）。
 - **插件管理只拉 release，不拉源码**（**新增**
   [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 29、
   [docs/plugin-development.md](docs/plugin-development.md) §6.8、插件发布仓合同

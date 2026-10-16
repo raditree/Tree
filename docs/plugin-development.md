@@ -129,7 +129,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | 中转站 relay | 拦截-回填：核心把数据交给你，你决定改不改 | 订阅；**每个点位唯一订阅者** |
 | 收集站 collect | 一对多收集 + 汇聚，不回填原数据流 | 由核心按接入点代订阅（工具定义） |
 
-### 3.1 全部内置点位（29 个 id：广播 10 + 执行 11 + 中转 7 + 收集 1）
+### 3.1 全部内置点位（34 个 id：广播 10 + 执行 11 + 中转 11 + 收集 2）
 
 | 点位 id | 类型 | 触发时机 | 回填/产出 |
 |---|---|---|---|
@@ -140,6 +140,10 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.relay.context.compact` | 中转 | 要压缩上下文时（规划也归你） | 产出**摘要侧上下文** + 覆盖切点下标（之后的原文由核心追加） |
 | `system.relay.prompt.system` | 中转 | 每轮构造系统提示词时 | 产出最终 system prompt |
 | `system.relay.ssh.execute` | 中转 | 每次 SSH 工作空间操作（建/销隧道、读写、命令、拉心跳、开 PTY）时 | 订阅者（`ssh_executor` 插件）自己完成到目标机的通信，以同一形状 payload 回包；**无订阅者 fail-open 回退内置 dartssh2**（别名 `ssh.execute`，详见 [ssh-tunnel-protocol.md](ssh-tunnel-protocol.md) §2） |
+| `system.relay.tool.repair` | 中转 | 收尾时发现历史里缺某次工具调用的结果 | `{repaired:true, text}` ⇒ 用插件那句落库；**落库与 `tool_end` 帧仍只走内置那一条**（别名 `tool.repair`） |
+| `system.relay.tool.probe` | 中转 | 同一批：判断这次调用是否已有结果 | `{found:true, text}` / `{found:false}` / 不回 ⇒ 三档：**有结果 / 肯定没有 / 交回内置探针查库**（别名 `tool.probe`） |
+| `system.relay.llm.register` | 中转 | 每个流式请求建立时（登记之后） | `{accepted, note}` ⇒ 回执只进日志；**内置登记表永远先建立**，取消/关闭/判死不在这一条上（别名 `llm.register`） |
+| `system.relay.compact.skip.reason` | 中转 | 每一次「压缩没走插件」（早退不投） | `{reason}` ⇒ **覆盖还账上那一条**（REST 与压缩结论会看到）；已推进历史的通知不回改；不改分级位（别名 `compact.skip.reason`） |
 | `system.execute.fs` | 执行 | — | `fs.read` / `fs.write` / `fs.list` / `fs.grep` |
 | `system.execute.terminal` | 执行 | — | `terminal.exec`（含 hook 后台任务）、`terminal.listRuns` / `terminal.stopRun` / `terminal.log`（后台任务的**结构化读口与控口**：列表回行不回散文，`exit_code`/`pid` 拿不到写 `null` 不省略键，终止**不保证杀得掉**且 `requested=false` 必带 `reason`，`log` 只递尾部；只看/只动目标 agent 自己的任务） |
 | `system.execute.agent` | 执行 | — | `agent.message` / `agent.stop` / `agent.compact` |
@@ -162,6 +166,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.broadcast.ask.paused` | 广播 | `AskUserQuestion` **落盘并推帧之后**、开始等作答那一刻 | 通知：`{agent_id, session_id, team_id, question_id, question_count}`；**不带题面与选项**（那是用户与 agent 之间的内容，审计只需知道“谁在等、等几道”） |
 | `system.broadcast.config.changed` | 广播 | `applyConfigs()` 逐条对账**完成后**，一条动作一个 topic | 通知：`{plugin_id, action, action_label, reason, generation}`；`action` 与 `PluginReconcileKind` 同源（`started` / `stopped` / `restarted` / `failed`）；**`unchanged` 一律不广播**（没改动的对账是噪声） |
 | `plugin.tool.define` | 收集 | 工具表刷新 | 申报工具定义 |
+| `plugin.capability.define` | 收集 | 与工具申报**同一趟** | 申报自己认得的**点位**（`{capabilities:[{capability_id, direction:push\|pull, event, description, schema}]}`）；**`schema` 为空就拒那一条**；申报只是描述，**不产生投递路** |
 
 ### 3.2 怎么订阅
 
@@ -352,6 +357,10 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.relay.llm.request` | 同 `request` | 改后的请求体（`{model, messages, tools, max_tokens, …}`，未识别字段会透传进请求体）或 `null` |
 | `system.relay.context.compact` | `system_prompt`（内置拼装的系统提示词，放在提示词槽位用）, `request`（**引擎这一轮真会发的那份线形请求** `{model, messages, tools, …}`——唯一的原料与缓存前缀）, `total_message_count`, `compacted_message_count`（当前水位线）, `existing_summary`, `compacted`, **`usage_file` + `recent_usage`**（可选：该会话用量账本的路径与最近 50 行，见下） | `{messages: [{role, content, …}, …], covered_message_count: N}`；`null` = 用内置 compact |
 | `system.relay.prompt.system` | `default`（核心构造的完整 system prompt） | 最终 system prompt 字符串（空串 = 明确不要系统提示词）；`null` = 用 `default` |
+| `system.relay.tool.repair` | `point`, `agent_id`, `session_id`, `tool_call_id`, `tool_name`, `text`（核心算出的内置那句） | `{repaired:true, text}` ⇒ 用这句落库；其余一律用内置那句 |
+| `system.relay.tool.probe` | `point`, `agent_id`, `session_id`, `tool_call_id` | `{found:true, text}` / `{found:false}`；缺布尔 `found` ⇒ 按**未接管**回内置探针 |
+| `system.relay.llm.register` | `point`, `handle`, `agent_id`, `session_id`, `model`, `turn` | `{accepted, note}` ⇒ note 只进日志；**fire-and-forget，不卡请求本身** |
+| `system.relay.compact.skip.reason` | `point`, `agent_id`, `session_id`, `reason`（内置那句，已先记账） | `{reason}` ⇒ 覆盖还账上那一条（保留分级位）；空/晚 ⇒ 内置那句原样在 |
 
 > **压缩点位：原料只有"引擎真会发的那份"（2026-10 定稿）**。只要这个点位有订阅者，
 > 核心就不再算切点、也不再下发落库全量原文——它把 `request`（预压缩态的线形请求：
@@ -770,9 +779,10 @@ plugins:
   failed 并计 `overload_skipped`，**不排队**（排队只是把无界改成延后，热点点位上一样堆得
   起来），走的仍是与“心跳丢失”同一条 fail-open 路。插件侧看到的仍是“这次没接管”。
 
-> 本阶段未接的 A 级点位（遗留项，见 CHANGELOG）：中转站 `tool.repair` / `tool.probe` /
-> `llm.register` / `compact.skip.reason`，与收集站 `plugin.capability.define`。接它们的
-> 纪律不变：表项 + 常量 + 进 `StationHubIds.all` + readme 四段式 + 投递口 + 派生用例计数。
+> 阶段 6 的 A 级点位批**已全部接完**（中转站 `tool.repair` / `tool.probe` / `llm.register` /
+> `compact.skip.reason`，与收集站 `plugin.capability.define`）。接它们的纪律不变：表项 +
+> 常量 + 进 `StationHubIds.all` + readme 四段式 + 投递口 + 派生用例计数；**接管只能改文案或
+> 附加观测，不能替换判据**（落库、可关闭性、分级位这三样永远在核心手里）。
 
 ---
 

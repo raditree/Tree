@@ -299,7 +299,8 @@
     合同原文见仓库根 [plugins/README.md](../../../../../plugins/README.md)。
 
 30. **加一个点位要同时交付六件；看现场一律只读；并发形状必须有上界**（2026-10-16 阶段 6，D6/D9/D10/D11）：
-    本阶段把内置点位从 22 接到 **29**（广播 10 + 执行 11 + 中转 7 + 收集 1），命令 26 条。
+    本阶段把内置点位从 22 接到 **34**（广播 10 + 执行 11 + 中转 11 + 收集 1 个预建不
+    算），执行站命令 26 条。
     - **一个点位 = 六处同时交付**：表项（`station_points.dart`，含 **readme 四段式**：是什么 /
       何时触发 / 回包形状 / 限制）+ 常量（`station_ids.dart`）+ **进 `StationHubIds.all`** +
       **核心投递口**（只建表不接投递口就是“面板上多一个永远静默的点位”）+ 派生用例计数
@@ -325,12 +326,16 @@
       `overflow`（超限当场拒）与 `dropped`（主动弃）分开计；站点在途等待新增每站点缺省 64 的
       准入上界，超限**当场回 failed 且不排队**（判活已取消时长硬上限，不靠数量上界就没有任何东西
       守着并发形状），计数 `overload_skipped`、`gauges` 多一个 `waits_limit`。
-    - **本阶段未接的 A 级点位（遗留项）**：中转 `tool.repair` / `tool.probe` / `llm.register` /
-      `compact.skip.reason` 与收集 `plugin.capability.define`（收集站**必须带非空 schema**，
-      `register` 里那条校验就是为它设的）。接它们的成本全在“多一个投递口”，而投递口是
-      业务时机判断，不能靠猜。
+    - **A 级点位批已全部接完（没有遗留项）**：中转 `tool.repair` / `tool.probe` /
+      `llm.register` / `compact.skip.reason` 与收集 `plugin.capability.define`（收集站**必须带非空
+      schema**，不申报字段表的那一条直接拒）。这四个槽在核心里早就存在（`toolResultRepair` /
+      `toolResultProbe` / `llmRequestRegistrar` / `compactionSkipSink`），所以接法全是「表 + 装配」，
+      引擎与 LlmSession 一行未改。接管口径：**只能改文案或附加观测，不能替换判据**——
+      落库与 `tool_end` 帧仍只走内置那一条；`llm.register` 里内置登记表永远先建立（可关闭性
+      的唯一执行点），取消/关闭/判死仍然只在核心里；`compact.skip.reason` 不能改分级位。
     用例：`plugin_turn_broadcast_test.dart`（12，广播互斥与只报结论）、
     `plugin_station_query_test.dart`（8，拓扑可见性与只读）、
+    `plugin_relay_capability_test.dart`（15，四条中转与点位申报的拒收口径），
     `plugin_execute_mounts_test.dart`（新增 5，后台任务三命令 + 用量钳制）、
     `plugin_station_wiring_test.dart`（新增 1，`usage.query` 的生产接线）、
     `plugin_mass_restart_stress_test.dart`（内存层 3 条进闸门；真链路 1 条靠环境变量开）、
