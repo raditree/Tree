@@ -131,6 +131,20 @@ typedef StationPluginManager = Future<Map<String, dynamic>> Function({
   Map<String, dynamic>? arguments,
 });
 
+/// `station.*` 族的**统一入口**（20261015-hot-restart 阶段 6）：由 `PluginBus` 实现。
+///
+/// 这一族的实现只能是总线：站点实例表、订阅者、公告板与计数都在它那里，挂载位置层
+/// 因此**不拿任何站点状态**，只负责「能不能证明发起者属于这个 team」这一道闸门。
+///
+/// [teamId] 是**已经在这里证明过**的发起者 team（空串到不了实现）；`station.state`
+/// 的目标写在 [arguments] 的 `station_id`（也接受订阅时那套 `point` 别名）。
+typedef StationTopologyQuery = Future<Map<String, dynamic>> Function({
+  required String command,
+  required String teamId,
+  Map<String, dynamic>? arguments,
+  String sourcePluginId,
+});
+
 /// 执行站命令的挂载位置集合（M9 Wave 3-I）。
 ///
 /// 站点体系里「执行器只是执行站的一种挂载位置」：本类就是**系统内置挂载位置**，
@@ -173,6 +187,7 @@ class ExecuteStationMounts {
     this.toolCloser,
     this.sshReconnector,
     this.pluginManager,
+    this.topologyQuery,
     this.log,
   }) : _injectedHooks = hooks;
 
@@ -195,6 +210,7 @@ class ExecuteStationMounts {
     StationToolCloser? toolCloser,
     StationSshReconnector? sshReconnector,
     StationPluginManager? pluginManager,
+    StationTopologyQuery? topologyQuery,
     void Function(String message)? log,
   }) => ExecuteStationMounts(
     ioFor: ioFor,
@@ -221,6 +237,7 @@ class ExecuteStationMounts {
     toolCloser: toolCloser,
     sshReconnector: sshReconnector,
     pluginManager: pluginManager,
+    topologyQuery: topologyQuery,
     log: log,
   );
 
@@ -270,6 +287,13 @@ class ExecuteStationMounts {
   /// 这一族的实现只能是 `PluginBus`：插件实例表、generation 计数、快照内存池
   /// 都在它那里，挂载位置层因此不拿任何插件状态、只负责**归属校验 + 分派**。
   final StationPluginManager? pluginManager;
+
+  /// `station.*` 族（站点拓扑，只读）入口；null = 这些命令显式报「未接线」。
+  ///
+  /// 为什么单独一个槽而不并进 [pluginManager]：两道闸门不同——插件族问的是
+  /// 「谁能动谁的快照」，站点族问的是「这个 team 能看见哪些站」。并进一个入口
+  /// 就会把两套口径挤在一个 switch 里，而过两年没人记得它们为何不同。
+  final StationTopologyQuery? topologyQuery;
 
   final void Function(String message)? log;
 
@@ -343,6 +367,15 @@ class ExecuteStationMounts {
     if (command.startsWith('plugin.')) {
       try {
         return await _pluginCommand(context, command);
+      } catch (error) {
+        return StationCommandOutcome.failed('命令 $command 执行异常：$error');
+      }
+    }
+    // `station.*` 也不靠 agent 工作空间归属证明身份（看站点拓扑本来就没有目标 agent），
+    // 因此同样在 `_resolveTarget` 之前分派。
+    if (command.startsWith('station.')) {
+      try {
+        return await _stationCommand(context, command);
       } catch (error) {
         return StationCommandOutcome.failed('命令 $command 执行异常：$error');
       }
@@ -459,11 +492,53 @@ class ExecuteStationMounts {
       sourcePluginId: context.sourcePluginId,
       arguments: context.arguments,
     );
+    return _outcomeOf(result, command);
+  }
+
+  /// `station.*` 族的归属闸门与分派（站点拓扑，**只读**）。
+  ///
+  /// 闸门只有一条：**team 必须证明得了**（与插件族控制面四条同形，但理由不同：
+  /// 那里问的是“能不能动它”，这里问的是“能不能看见它”——插件自建站里写着别人的
+  /// topic 与配置）。具体可见性过滤在实现方（`PluginBus.handleStationQuery`）里做，
+  /// 本层不复制那份规则（复制一次就会两头漂）。
+  Future<StationCommandOutcome> _stationCommand(
+    StationCommandContext context,
+    String command,
+  ) async {
+    final StationTopologyQuery? query = topologyQuery;
+    if (query == null) {
+      return StationCommandOutcome.failed(
+        '命令 $command 尚无挂载实现（核心未给执行站注入站点拓扑读口：未接线，'
+        '不假装已经读过）',
+      );
+    }
+    final String teamId = context.scope.teamId.trim();
+    if (teamId.isEmpty) {
+      return StationCommandOutcome.failed(
+        '命令 $command 的 scope 缺少 team_id：证明不了归属 ⇒ 拒绝执行'
+        '（fail-closed）',
+      );
+    }
+    final Map<String, dynamic> result = await query(
+      command: command,
+      teamId: teamId,
+      arguments: context.arguments,
+      sourcePluginId: context.sourcePluginId,
+    );
+    return _outcomeOf(result, command);
+  }
+
+  /// 把槽返回的 `{ok, …}` 翻成站点结论（插件族与站点族**共用这一条**口径）。
+  ///
+  /// 原因的键有两套写法：本层惯例是 `error`，而热重启的结论带的是 `reason`
+  /// （`PluginHotRestartResult.toJson`）。只读 error 会把“新一世没起来”这种最要紧
+  /// 的失败说成“未给出原因”（不变量 6：失败必须可读）。
+  static StationCommandOutcome _outcomeOf(
+    Map<String, dynamic> result,
+    String command,
+  ) {
     final Object? ok = result['ok'];
     if (ok is bool && !ok) {
-      // 原因的键有两套写法：本层惯例是 `error`，而热重启的结论带的是 `reason`
-      // （`PluginHotRestartResult.toJson`）。只读 error 会把“新一世没起来”这种最要紧
-      // 的失败说成“未给出原因”（不变量 6：失败必须可读）。
       final String error = _string(result['error']).isNotEmpty
           ? _string(result['error'])
           : _string(result['reason']);

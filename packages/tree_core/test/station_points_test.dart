@@ -23,13 +23,13 @@ void main() {
       );
     });
 
-    test('类型分布：广播 10 / 执行 9 / 中转 7 / 收集 1', () {
+    test('类型分布：广播 10 / 执行 10 / 中转 7 / 收集 1', () {
       int count(StationKind kind) => StationPoints.ofKind(kind).length;
       expect(count(StationKind.broadcast), 10);
-      expect(count(StationKind.execute), 9);
+      expect(count(StationKind.execute), 10);
       expect(count(StationKind.relay), 7);
       expect(count(StationKind.collect), 1);
-      expect(StationPoints.all.length, 27);
+      expect(StationPoints.all.length, 28);
     });
 
     test('退役 id 不在表里（它们只用于读侧迁移）', () {
@@ -84,9 +84,9 @@ void main() {
       expect(StationPoints.byId(StationHubIds.broadcast)!.suffix, StationHubIds.broadcast);
     });
 
-    test('命令 → 点位：20 条命令，每条恰好属于一个执行站点位', () {
+    test('命令 → 点位：22 条命令，每条恰好属于一个执行站点位', () {
       final Set<String> commands = StationPoints.allCommands;
-      expect(commands.length, 20, reason: '$commands');
+      expect(commands.length, 22, reason: '$commands');
       expect(
         commands,
         <String>{
@@ -111,6 +111,9 @@ void main() {
           'plugin.state',
           'plugin.stateDump',
           'plugin.stateFetch',
+          // 站点族（20261015-hot-restart 阶段 6：只看不动的控制面）
+          'station.list',
+          'station.state',
         },
       );
       for (final String command in commands) {

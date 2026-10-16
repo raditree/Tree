@@ -247,7 +247,8 @@ abstract final class StationPoints {
       id: StationHubIds.executeAgent,
       kind: StationKind.execute,
       label: 'Agent 操作',
-      description: '执行站·Agent 族：agent.message / agent.stop / agent.compact（发起上下文压缩）',
+      description:
+          '执行站·Agent 族：agent.message / agent.stop / agent.compact（发起上下文压缩）',
       alias: 'agent',
       readme:
           'Agent 族（agent.message / agent.stop / agent.compact）：往会话里投一条消息、停下来、'
@@ -310,8 +311,7 @@ abstract final class StationPoints {
       id: StationHubIds.executeSsh,
       kind: StationKind.execute,
       label: '链路重连',
-      description:
-          '执行站·SSH 族：ssh.reconnect（重建目标 agent 的远端链路；args {agent_id?}；与 REST 端点同一实现）',
+      description: '执行站·SSH 族：ssh.reconnect（重建目标 agent 的远端链路；args {agent_id?}；与 REST 端点同一实现）',
       alias: 'ssh',
       readme:
           '链路族（ssh.reconnect）：重建目标 agent 的远端链路（可选 args {agent_id}）。'
@@ -346,6 +346,29 @@ abstract final class StationPoints {
         'plugin.stateDump',
         'plugin.stateFetch',
       ],
+    ),
+    StationPointSpec(
+      id: StationHubIds.executeStation,
+      kind: StationKind.execute,
+      label: '站点拓扑',
+      description:
+          '执行站·站点族：station.list / station.state（看内置点位被谁订了、哪个点位'
+          '已被接管、自建站归谁；只读，不改接管权）',
+      alias: 'station',
+      readme:
+          '站点族（station.list / station.state）：回答「谁接管了哪个点位」。'
+          '它存在的理由很窄也很硬：热重启一个插件前必须先能看见这层关系——接走 '
+          '`relay.llm.handle` 的那个插件一停，整条 LLM 就回退内置实现；看不见就只能猜，'
+          '而猜错的代价是停在正在干活的插件上。触发时机：插件调 `station/command` 时。'
+          '回包口径：`station.list` 回 `{ok, team_id, count, stations:[{station_id, kind, '
+          'builtin, subscriber_count, subscribers, handled_by?, commands?, counts}]}`；'
+          '`station.state` 收 `arguments.station_id`（也接受订阅时那套别名，如 '
+          '`llm.handle`）并按可见性**整份**递 describe（含公告板与配置）。'
+          '限制：① 内置点位对任何 team 可见（它们是系统接口），**插件自建站只对订阅者'
+          '所在 team 可见**，跳 team 一律拒并说明原因；② 本族**只读**——接管权易手只走 '
+          '`station/subscribe` 那一条（那里已有 replace 与唯一订阅者规则），这里不开第二条路；'
+          '③ team 证明不了就拒（fail-closed，与 plugin 族控制面同口径）。',
+      commands: <String>['station.list', 'station.state'],
     ),
   ];
 
@@ -522,13 +545,14 @@ abstract final class StationPoints {
     if (key.isEmpty) {
       return switch (kind) {
         // 中转站：留空 = 工具前 / 工具后两个点位（点位化之前就是一个实例收两段）
-        StationKind.relay => relays
-            .where(
-              (StationPointSpec spec) =>
-                  spec.id == StationHubIds.relayToolPre ||
-                  spec.id == StationHubIds.relayToolPost,
-            )
-            .toList(growable: false),
+        StationKind.relay =>
+          relays
+              .where(
+                (StationPointSpec spec) =>
+                    spec.id == StationHubIds.relayToolPre ||
+                    spec.id == StationHubIds.relayToolPost,
+              )
+              .toList(growable: false),
         _ => <StationPointSpec>[pool.first],
       };
     }

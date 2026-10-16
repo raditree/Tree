@@ -64,7 +64,8 @@ abstract final class StationHubIds {
   /// 载荷额外带 `source`（`interjection` = 被新消息插话，`user_stop` = 用户按停止）
   /// 与会话/临时员工归属——不变量 5 的两种取消在审计里必须分得开（插话不该被记成
   /// “用户停了这一轮”），否则「谁停的」这个问题又只能靠猜。
-  static const String broadcastTurnCancelled = 'system.broadcast.turn.cancelled';
+  static const String broadcastTurnCancelled =
+      'system.broadcast.turn.cancelled';
 
   /// 广播站·本轮错误终止（**单向通知**，无回填）。
   ///
@@ -87,7 +88,8 @@ abstract final class StationHubIds {
   /// `config.changed`；载荷的 `action` 取值与 `PluginReconcileKind` 同源（
   /// `started` / `stopped` / `restarted` / `failed`）。**`unchanged` 一律不广播**：
   /// 没改动的对账是噪声（面板插件会被白叫醒，而它读到的状态与上一帧完全一样）。
-  static const String broadcastConfigChanged = 'system.broadcast.config.changed';
+  static const String broadcastConfigChanged =
+      'system.broadcast.config.changed';
 
   // ── 执行站（插件主动下命令；按命令族拆点位） ────────────────────────────
 
@@ -124,6 +126,17 @@ abstract final class StationHubIds {
   /// **插件对自己快照**的存取：归属校验只许操作以发起者 pluginId 开头的键，
   /// 且这两条**不申报成 agent tool**（D9：它们是生命周期原语，不是给模型使唤的能力）。
   static const String executePlugin = 'system.execute.plugin';
+
+  /// 执行站·站点族：`station.list` / `station.state`（阶段 6 新增）。
+  ///
+  /// 定位：控制面的**只看不动**那一半。热重启一个插件前得先问得出「谁接管了哪个
+  /// 点位」——接走 `relay.llm.handle` 的那个插件被停，整条 LLM 就回退内置实现；
+  /// 没有这个入口，agent 就只能靠猜（而猜错的代价是停在正在干活的插件上）。
+  ///
+  /// 口径：内置点位对任何 team 可见（它们是系统接口），**插件自建站只对订阅者所在
+  /// team 可见**（别人的站里写着别人的 topic 与配置）；本族只读，接管权易手仍然
+  /// 只走 `station/subscribe` 那一条（不在这里开第二条口子）。
+  static const String executeStation = 'system.execute.station';
 
   // ── 中转站（拦截-回填；每个点位各自唯一订阅者） ──────────────────────────
 
@@ -201,6 +214,7 @@ abstract final class StationHubIds {
     executeSession,
     executeSsh,
     executePlugin,
+    executeStation,
     relayToolPre,
     relayToolPost,
     relayLlmHandle,

@@ -722,6 +722,10 @@ class CoreServer {
       // `plugin.*` 族（插件热重启控制面）：实现只能是总线——插件实例表、代际
       // 计数、快照内存池都在它那里。没注入时这些命令以「未接线」显式失败。
       pluginManager: bus.handlePluginCommand,
+      // `station.*` 族（阶段 6：站点拓扑，只读）：同一个理由——谁订了哪个点位、哪个
+      // 点位已接管、自建站归谁，这些事实只在总线的站点表里。这里不另取一份，
+      // 否则面板与插件看到的就是两套拓扑。
+      topologyQuery: bus.handleStationQuery,
       log: (String message) => errorLog?.call('[core:station] $message'),
     );
     _stationMounts = mounts;

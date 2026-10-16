@@ -846,10 +846,7 @@ class PluginBus {
   /// 与 [announceToolCall] 同口径：`unawaited`、没人订阅就走快路径零开销、投递失败
   /// 只记日志。不同点只有一处：**证明不了归属时不静默**（记一行为什么没发），
   /// 因为这类事件只有会话层在发，发不出来说明接线与 agent 归属对不上。
-  int _announceAgentPoint(
-    String pointId,
-    Map<String, dynamic> event,
-  ) {
+  int _announceAgentPoint(String pointId, Map<String, dynamic> event) {
     final BroadcastStation? station = stations.broadcastPointFor(pointId);
     if (station == null) return 0;
     if (station.subscribers.isEmpty) return 0; // 快路径：没人订阅，零开销
@@ -874,7 +871,8 @@ class PluginBus {
             meta: <String, dynamic>{
               'point': station.id,
               'agent_id': (event[AgentEvents.fieldAgentId] ?? '').toString(),
-              'session_id': (event[AgentEvents.fieldSessionId] ?? '').toString(),
+              'session_id': (event[AgentEvents.fieldSessionId] ?? '')
+                  .toString(),
             },
           )
           .then((StationPublishResult result) {
@@ -911,14 +909,11 @@ class PluginBus {
       final String? pointId = _agentEventPoints[name];
       if (pointId != null) {
         // 分流到广播点位（订了才投），不再走下面那一路「不订阅也收」的既有事件流。
-        return _announceAgentPoint(
-          pointId,
-          <String, dynamic>{
-            ...event,
-            'event': name,
-            if (!event.containsKey('ts')) 'ts': _nowSeconds(),
-          },
-        );
+        return _announceAgentPoint(pointId, <String, dynamic>{
+          ...event,
+          'event': name,
+          if (!event.containsKey('ts')) 'ts': _nowSeconds(),
+        });
       }
       return dispatch(<String, dynamic>{
         ...event,
@@ -1771,6 +1766,176 @@ class PluginBus {
       }
     }
     return null;
+  }
+
+  /// 执行站 `station.*` 族的**入口**（阶段 6：`station.list` / `station.state`）。
+  ///
+  /// 为什么控制面必须先能「看」：agent 要热重启**任何**插件（阶段 4 的 tool），得先
+  /// 问得出「谁接管了哪个点位」——订走 `relay.llm.handle` 的那个插件被停掉，整条 LLM
+  /// 就回退内置实现；看不见这层关系就只能靠猜（而猜错的代价是停在正在干活的插件上）。
+  ///
+  /// 归属口径（只有一条，且**不放大**）：
+  /// - **内置点位对任何 team 可见**：它们是系统接口（名字、类型、谁订了它），不是
+  ///   某个人的私有数据；
+  /// - **插件自建站只对订阅者所在 team 可见**：别人的站里写着别人的 topic 与配置，
+  ///   连「它存在」都不该漏出去；
+  /// - team 证明不了 ⇒ 整条命令拒（fail-closed，与 `plugin.*` 控制面同口径）。
+  ///
+  /// 只**读**不改：接管权易手仍然走 `station/subscribe`（那套 replace 规则已经在
+  /// 钉住的不变量里），这里不提供「把谁从点位上摘下来」的第二条路。
+  Future<Map<String, dynamic>> handleStationQuery({
+    required String command,
+    required String teamId,
+    Map<String, dynamic>? arguments,
+    String sourcePluginId = '',
+  }) async {
+    load();
+    final String team = teamId.trim();
+    if (team.isEmpty) {
+      return <String, dynamic>{
+        'ok': false,
+        'error':
+            '命令 $command 的 scope 缺少 team_id：证明不了归属 ⇒ 拒绝执行'
+            '（fail-closed）',
+      };
+    }
+    if (command == 'station.state') {
+      final String requested = _stationArgId(arguments);
+      if (requested.isEmpty) {
+        return <String, dynamic>{
+          'ok': false,
+          'error':
+              '命令 station.state 需要 arguments.station_id（或 point 别名，'
+              '如 llm.handle）：要看哪个点位的当前读数',
+        };
+      }
+      final String? id = _resolveStationId(requested);
+      if (id == null) {
+        return <String, dynamic>{
+          'ok': false,
+          'error': '找不到站点 $requested（内置点位可用别名，自建站要用完整 id）',
+        };
+      }
+      final Map<String, dynamic> described = stations.snapshot().firstWhere(
+        (Map<String, dynamic> s) => s['station_id'] == id,
+        orElse: () => <String, dynamic>{},
+      );
+      if (described.isEmpty) {
+        return <String, dynamic>{'ok': false, 'error': '站点 $id 不在当前快照里'};
+      }
+      if (!_stationVisibleToTeam(described, team)) {
+        return <String, dynamic>{
+          'ok': false,
+          'error':
+              '站点 $id 不属于 team $team：插件自建站只对它的订阅者所在 team 可见'
+              '（跨 team 一律拒，不透露它存不存在）',
+        };
+      }
+      return <String, dynamic>{
+        'ok': true,
+        'team_id': team,
+        'station': described,
+      };
+    }
+    if (command != 'station.list') {
+      return <String, dynamic>{
+        'ok': false,
+        'error': '命令 $command 不在 station 族里（可用：station.list / station.state）',
+      };
+    }
+    final List<Map<String, dynamic>> rows = <Map<String, dynamic>>[
+      for (final Map<String, dynamic> described in stations.snapshot())
+        if (_stationVisibleToTeam(described, team))
+          _stationRow(described, team),
+    ];
+    return <String, dynamic>{
+      'ok': true,
+      'team_id': team,
+      'count': rows.length,
+      'stations': rows,
+      if (sourcePluginId.isNotEmpty) 'asked_by': sourcePluginId,
+    };
+  }
+
+  /// 取 `station.state` 的目标 id（`station_id` 优先，允许写点位别名 `point`）。
+  static String _stationArgId(Map<String, dynamic>? arguments) {
+    final String explicit = (arguments?['station_id'] ?? '').toString().trim();
+    if (explicit.isNotEmpty) return explicit;
+    final String point = (arguments?['point'] ?? '').toString().trim();
+    return point;
+  }
+
+  /// 把别名 / 后缀 / 完整 id 解析成内置点位 id；不是内置点位时原样当自建站 id。
+  ///
+  /// 为什么不能只认完整 id：插件作者手上写的是订阅时那套别名（`llm.handle`），
+  /// 问读数却要求换一种写法就会造出「订得到、问不到」这种自相矛盾的面。
+  static String? _resolveStationId(String requested) {
+    final String want = requested.trim();
+    if (want.isEmpty) return null;
+    if (StationHubIds.all.contains(want)) return want;
+    for (final StationPointSpec spec in StationPoints.all) {
+      if (spec.alias == want) return spec.id;
+      if (spec.suffix == want) return spec.id;
+      if (spec.id.endsWith('.$want')) return spec.id;
+    }
+    // 自建站：没有别名概念，id 就是注册时那一个（看不见也回可读失败，不猜）。
+    return want;
+  }
+
+  /// 这个站点对该 team 可见吗（内置恒可见；自建站要能看到订阅者或归属）。
+  static bool _stationVisibleToTeam(
+    Map<String, dynamic> described,
+    String team,
+  ) {
+    if (described['builtin'] == true) return true;
+    final Object? byTeam = described['subscribers_by_team'];
+    if (byTeam is Map && byTeam.containsKey(team)) return true;
+    // 自建站注册时把 owner 的 scope 记在站点自己的 scope 上（它没订阅者也要能被
+    // 归属者看到，否则注册完就再也问不到了）。
+    final Object? scope = described['scope'];
+    if (scope is Map && '${scope['team_id']}'.trim() == team) return true;
+    return false;
+  }
+
+  /// `station.list` 的一行（**投影**，不整份递 describe）。
+  ///
+  /// 为什么不递整份：`readme` / `board_latest` / `config` 里可能有别人的数据，而列表
+  /// 的用途是「谁订了哪个点位 / 哪个点位已接管」。要看细节请对那一个点位下
+  /// `station.state`（那里按可见性整份递，看得明明白白）。
+  static Map<String, dynamic> _stationRow(
+    Map<String, dynamic> described,
+    String team,
+  ) {
+    final String kind = '${described['kind']}';
+    final List<Object?> subscriptions =
+        (described['subscriptions'] as List?) ?? const <Object>[];
+    final List<Map<String, dynamic>> subscribers = <Map<String, dynamic>>[
+      for (final Object? item in subscriptions)
+        if (item is Map<String, dynamic>)
+          <String, dynamic>{
+            'plugin_id': item['plugin_id'],
+            'team_id': (item['scope'] is Map
+                ? '${(item['scope'] as Map)['team_id'] ?? ''}'
+                : ''),
+            'disabled': item['disabled'] == true,
+          },
+    ];
+    return <String, dynamic>{
+      'station_id': described['station_id'],
+      'kind': kind,
+      'kind_label': described['kind_label'],
+      'builtin': described['builtin'] == true,
+      'description': described['description'],
+      'subscriber_count': subscribers.length,
+      'subscribers': subscribers,
+      // 中转站唯一处理者：这就是「谁接管了这一跳」的那一个读数。
+      if (kind == 'relay')
+        'handled_by': subscribers.isEmpty
+            ? ''
+            : '${subscribers.first['plugin_id']}',
+      if (kind == 'execute') 'commands': described['commands'],
+      'counts': described['counts'],
+    };
   }
 
   /// 执行站 `plugin.*` 族的**入口**（挂载位置转进来）：干活 + 留审计。
