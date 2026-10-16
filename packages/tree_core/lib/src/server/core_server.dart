@@ -729,6 +729,11 @@ class CoreServer {
       // `usage.query`（阶段 6：逐调用用量账本）：账本在**数据根**下，只有存储层那
       // 一份路径规则能读到它（插件的 `fs.read` 只在工作空间作用域内）。
       usageQuerier: _stationUsageQuery,
+      // 阶段 8（整轮接管）：接管者给自己发起的 tool.call 回带 `run_id` 时，
+      // **由核心**把这一次工具播成这一轮的 tool_start / tool_end 卡片；而接管
+      // 期间同一会话的 `agent.message` 会被拒（不开第二条写入口）。
+      runToolNote: bus.noteRunToolActivity,
+      activeLoopRunOf: bus.activeLoopRunOf,
       log: (String message) => errorLog?.call('[core:station] $message'),
     );
     _stationMounts = mounts;
@@ -780,6 +785,10 @@ class CoreServer {
       engine.llmTurnHandler = bus.relayLlmHandle;
       engine.llmRequestRewriter = bus.relayLlmRequest;
       engine.systemPromptRelay = bus.relaySystemPrompt;
+      // 阶段 8：**整轮 tool loop 接管**（`system.relay.loop.run`）。与 handle 的分界：
+      // handle 只交一跳（编排仍在核心），这一条把一整轮交出去；分流发生在
+      // **进入 LlmSession 之前**，无人接管时内置路径一行没跑过、逐字不变。
+      engine.loopTurnHandler = bus.relayLoopRun;
     }
     final CompactionService? compactionService = conversation.compaction;
     if (compactionService != null) {

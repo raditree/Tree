@@ -125,7 +125,7 @@ void main() {
     expect(instance['granularity'], 'team');
     expect(instance['last_heartbeat'], isA<int>());
     // 站点段**不再按 team 过滤**（站点全局唯一，过滤恒真）：快照恒看到**全部内置点位**
-    // （广播 10 + 执行 11 + 中转 11 = 32；收集站不预建）+ 该插件申报时现建的**两个**收集站。
+    // （广播 10 + 执行 11 + 中转 12 = 33；收集站不预建）+ 该插件申报时现建的**两个**收集站。
     final List<dynamic> stations = res.json['stations'] as List<dynamic>;
     final List<String> prebuiltPoints =
         StationPoints.all

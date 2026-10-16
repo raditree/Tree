@@ -214,6 +214,14 @@ abstract final class StationHubIds {
   static const String relayCompactSkipReason =
       'system.relay.compact.skip.reason';
 
+  /// 中转站·**整轮 tool loop 由谁跑**（阶段 8；槽 `LlmAgentEngine.loopTurnHandler`）。
+  ///
+  /// 与 `llm.handle` 的分界：handle 是**一跳**（编排仍在核心：第几跳、工具怎么排、
+  /// 何时收尾都是核心定的）；这一条把**整轮**交出去（一条用户消息 = 一个 run，
+  /// 循环形状归接管者）。接管者只产出事件流，**写侧（落库 / 帧 / 用量 / 取消）仍在核心**：
+  /// 工具经 `tool.call` 跑，那一条路径上的 pre/post/timeout/审批/台账一个都不会绕过。
+  static const String relayLoopRun = 'system.relay.loop.run';
+
   // ── 收集站（一对多收集 + 汇聚；不回填原数据流） ──────────────────────────
 
   /// 收集站·插件定义 tool（系统自带；收集站的接入点）。
@@ -275,6 +283,7 @@ abstract final class StationHubIds {
     relayToolProbe,
     relayLlmRegister,
     relayCompactSkipReason,
+    relayLoopRun,
     collect,
     collectCapability,
   };

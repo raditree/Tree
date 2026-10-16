@@ -6,8 +6,9 @@
 // 接法全部是「表 + 装配」：引擎与 LlmSession 一行都没改。
 //
 // 钉住的六件事：
-// 1. 五个新点位都**四处齐改**（表项 + 常量 + 进 `StationHubIds.all` + 投递口），
-//    类型分布 广播 10 / 执行 11 / 中转 11 / 收集 2 = **34**，预建 **32**（收集站不预建）；
+// 1. 五个新点位都**四处齐改**（表项 + 常量 + 进 `StationHubIds.all` + 投递口）；
+//    本文件写的是**本阶段那一批**的增量，而类型分布断言钉的是**当前**总数（阶段 8
+//    又加了中转站 `loop.run` ⇒ 中转 12），与 `station_points_test` 保持同步；
 // 2. `tool.repair` 接管的是**文案**，落库仍然只走内置那一条路；
 // 3. `tool.probe` 的**三档**必须分得开（没接管 / 有结果 / 肯定没有）；
 // 4. `llm.register` 只能附加：内置登记表永远建立，取消 / 关闭 / 判死不在这一条上；
@@ -139,10 +140,10 @@ void main() {
       }
     });
 
-    test('类型分布 广播 10 / 执行 11 / 中转 11 / 收集 2 = 34；预建 32', () {
-      expect(StationPoints.ofKind(StationKind.relay), hasLength(11));
+    test('类型分布 广播 10 / 执行 11 / 中转 12 / 收集 2 = 35；预建 33', () {
+      expect(StationPoints.ofKind(StationKind.relay), hasLength(12));
       expect(StationPoints.ofKind(StationKind.collect), hasLength(2));
-      expect(StationPoints.all.length, 34);
+      expect(StationPoints.all.length, 35);
     });
 
     test('点位不可用（被别的类型占住）⇒ 一律按未接管放行，不抛', () async {
@@ -486,7 +487,7 @@ void main() {
       final StationHub hub = StationHub(
         storePath: p.join(temp.path, 'stations-fresh.yaml'),
       );
-      expect(hub.ensureBuiltinStations(), hasLength(32));
+      expect(hub.ensureBuiltinStations(), hasLength(33));
       expect(
         hub.station(StationHubIds.collectCapability),
         isNull,

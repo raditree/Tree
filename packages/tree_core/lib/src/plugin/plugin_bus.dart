@@ -11,6 +11,7 @@ import '../llm/openai_codec.dart';
 import '../store/atomic_file.dart';
 import '../store/tree_store.dart';
 import '../store/yaml_codec.dart';
+import '../tool/tool_runner.dart';
 import '../util/liveness.dart';
 import 'agent_events.dart';
 import 'execute_mounts.dart';
@@ -3273,6 +3274,297 @@ class PluginBus {
     );
   }
 
+  // ── 阶段 8：整轮 tool loop 接管（`system.relay.loop.run`）───────────────────
+  //
+  // 这一条**不另造一套流式机制**：底下复用 `llm.handle` 那条已验证的插件流
+  // （`_PluginLlmStream` + `_guardPluginStream`：归属校验、早到帧暂存、`station/cancel`
+  // 下发、心跳丢失收尾、同 id 顶替、下线时统一作废），上面只盖两层：
+  // ① LlmStreamEvent → AgentEvent 的翻译；② **由核心发的**工具活动卡片。
+  // 为什么工具卡片不能由接管者自己写：tool_start / tool_end 同时是**落库与面板的口径**
+  // （历史里一条工具调用及其结果），让插件造就等于把写侧交出去了。
+
+  /// 在册的整轮接管（键 = 打开这条 run 的 station request_id）。
+  final Map<String, _PluginRunPipe> _runPipes = <String, _PluginRunPipe>{};
+
+  /// 工具活动卡片的本地消息 id 计数（与 `LlmSession` 那份同性质：UI / 落库用）。
+  int _runToolSeq = 0;
+
+  /// 在册的整轮接管数（观测 / 用例）。
+  int get openLoopRuns => _runPipes.length;
+
+  /// 中转点 `loop.run`：**把整轮交出去**（一条用户消息 = 一个 run）。
+  ///
+  /// 返回 null = 未接管（未接线 / 无订阅者 / 回包不认 / 任何异常）⇒ 内置 loop **逐字不变**。
+  /// 返回一条流 = 接管成立；这条流开到接管者推 `done` / 出错 / 被取消 / 心跳丢失。
+  ///
+  /// 只支持流式（`stream: true`）：整轮的文本必须边产边播，否则面板上整轮空白到结束，
+  /// 而且一次性回整包就等于让核心无法在中间收尾（取消与判死仍是核心的职责）。
+  Future<Stream<AgentEvent>?> relayLoopRun({
+    required List<LlmMessage> messages,
+    required List<ToolSpec> tools,
+    required String agentId,
+    required String sessionId,
+    required String model,
+    required int maxContextTokens,
+    required bool Function() isCancelled,
+    bool Function()? isHardCancelled,
+  }) async {
+    load();
+    if (!enabled) return null;
+    final StationScope scope = runtimeScopeFor(
+      agentId: agentId,
+      sessionId: sessionId,
+    );
+    if (!scope.isValid) return null;
+    final RelayStation? station = stations.relayPointFor(
+      StationHubIds.relayLoopRun,
+    );
+    if (station == null) {
+      log?.call(
+        '整轮接管：点位 ${StationHubIds.relayLoopRun} 不可用（未接线 / 类型不符），'
+        '走内置 loop',
+      );
+      return null;
+    }
+    if (station.subscribers.isEmpty) return null; // 快路径：没人接管，零等待
+    final Map<String, dynamic> payload = <String, dynamic>{
+      'point': station.id,
+      'agent_id': agentId,
+      'session_id': sessionId,
+      'team_id': scope.teamId,
+      'mode': scope.modeKey,
+      'model': model,
+      'message_count': messages.length,
+      // 与 `context.compact` 同口径：递“引擎这一轮真会用的那份线形消息”，
+      // 而不是存储里的全量（否则接管者看到的与内置会发的不一致）。
+      'messages': <Map<String, dynamic>>[
+        for (final LlmMessage message in messages) message.toWire(),
+      ],
+      // 工具表也必须同一份：接管者靠它知道能用哪些工具、参数长什么样。
+      'tools': <Map<String, dynamic>>[
+        for (final ToolSpec tool in tools)
+          <String, dynamic>{
+            'name': tool.name,
+            'description': tool.description,
+            'parameters': tool.parameters,
+          },
+      ],
+    };
+    try {
+      final StationRelayResult relayed = await station.relay(
+        data: payload,
+        scope: scope,
+        meta: <String, dynamic>{'purpose': 'loop.run', 'session_id': sessionId},
+      );
+      if (!relayed.handled) {
+        if (relayed.reason.isNotEmpty) {
+          log?.call('整轮接管未接管：${relayed.reason}');
+        }
+        return null;
+      }
+      final Object? data = relayed.data;
+      if (data is! Map) {
+        log?.call('整轮接管回包不是对象（${data.runtimeType}），按未接管走内置 loop');
+        return null;
+      }
+      if (data['taken'] == false) {
+        // 接管者**明确说不接管**：这与“没回”不是同一件事（前者是插件主动让路，
+        // 后者可能只是这个点位没人写）；两者都回退内置，但只有这条会留下一行。
+        log?.call('整轮接管：插件明确回了 taken:false，本轮走内置 loop');
+        return null;
+      }
+      if (data['stream'] != true) {
+        // **显式说出来**，不静默当成“没接管”了事：插件作者需要知道这一条只收流式。
+        // 接管信号与 `llm.handle` 同一个约定（回 `stream: true` 就是流式接管），
+        // 不另外发明一套“还必须带 taken:true”的写法。
+        log?.call(
+          '整轮接管只回了整包（没有 stream:true）：这一条点位要求流式接管（取消与'
+          '单方面收尾都靠这条流），本轮按未接管走内置 loop',
+        );
+        return null;
+      }
+      return _openPluginRunStream(
+        station: station,
+        requestId: relayed.requestId,
+        pluginId: relayed.pluginId,
+        scope: scope,
+        agentId: agentId,
+        sessionId: sessionId,
+        model: model,
+        maxContextTokens: maxContextTokens,
+        isCancelled: isCancelled,
+      );
+    } catch (error) {
+      log?.call('整轮接管异常（已回退内置 loop）：$error');
+      return null;
+    }
+  }
+
+  /// 把一条插件流包装成“这一轮的 AgentEvent 流”。
+  ///
+  /// 登记与守护全部走现成的 [_openPluginLlmStream] / [_guardPluginStream]：
+  /// 取消下发、心跳丢失、早到帧暂存、同 id 顶替、下线作废都不需再写一遍。
+  Stream<AgentEvent> _openPluginRunStream({
+    required RelayStation station,
+    required String requestId,
+    required String pluginId,
+    required StationScope scope,
+    required String agentId,
+    required String sessionId,
+    required String model,
+    required int maxContextTokens,
+    required bool Function() isCancelled,
+  }) {
+    final Stream<LlmStreamEvent> hopStream = _openPluginLlmStream(
+      station: station,
+      requestId: requestId,
+      pluginId: pluginId,
+      scope: scope,
+      isCancelled: isCancelled,
+      turn: 0,
+    );
+    final StreamController<AgentEvent> controller =
+        StreamController<AgentEvent>();
+    final _PluginRunPipe pipe = _PluginRunPipe(
+      runId: requestId,
+      pluginId: pluginId,
+      agentId: agentId,
+      sessionId: sessionId,
+      model: model,
+      maxContextTokens: maxContextTokens,
+      controller: controller,
+    );
+    _runPipes[requestId] = pipe;
+    log?.call(
+      '整轮接管：插件 $pluginId 接管了一轮（$requestId，agent=$agentId '
+      'session=$sessionId model=$model）',
+    );
+    pipe.sub = hopStream.listen(
+      (LlmStreamEvent event) {
+        if (pipe.finished) return;
+        if (event is LlmTextDelta) {
+          pipe.add(AgentText(event.text));
+        } else if (event is LlmThinkingDelta) {
+          pipe.add(AgentThinking(event.text));
+        } else if (event is LlmRetryNotice) {
+          log?.call('整轮接管提示（$requestId）：${event.message}');
+          pipe.add(AgentNotice(event.message));
+        } else if (event is LlmUsageEvent) {
+          pipe.add(
+            AgentUsage(loopRunUsageMap(event.usage, pipe.maxContextTokens)),
+          );
+        } else if (event is LlmFinishEvent) {
+          // 收尾原因先记下来：真正的 AgentDone 在流关闭时发（与内置同一手：
+          // “收尾”只能有一次，而关闭可能来自 done / 取消 / 心跳三条路）。
+          pipe.finishReason = event.reason;
+        } else if (event is LlmFailureEvent) {
+          pipe.cancelled = event.cancelled;
+          pipe.failure = event.message;
+        } else if (event is LlmToolCallDelta) {
+          // 接管者的工具**自己执行**（它才是循环的主人）：这里只留痕，不造卡片——
+          // 面板上的工具卡片只从 `tool.call` 那一条路来（写侧在核心）。
+          log?.call(
+            '整轮接管（$requestId）推了一个 tool_call 增量（'
+            '${event.name ?? event.id ?? '?'}）：这一条点位不看它，'
+            '工具请经 tool.call 发起（带 run_id=$requestId）',
+          );
+        }
+      },
+      onError: (Object error, StackTrace stack) {
+        pipe.failure = error.toString();
+        pipe.finish();
+        _runPipes.remove(requestId);
+      },
+      onDone: () {
+        pipe.finish();
+        _runPipes.remove(requestId);
+      },
+    );
+    controller.onCancel = () {
+      // 消费方（会话）提前放弃：把底下那条流一起收尾，并把取消下发给插件
+      _closeLlmStream(requestId, cancelReason: '核心已放弃这一轮接管', cancelled: true);
+      _runPipes.remove(requestId);
+      pipe.cancelled = true;
+      pipe.finish();
+    };
+    return controller.stream;
+  }
+
+  /// 整轮接管期间，**由核心**把一次 `tool.call` 播报成这一轮的 tool_start / tool_end。
+  ///
+  /// 返回 false ⇒ 这个 `run_id` 不在册（不属于该插件 / 已经收尾）。调用方必须
+  /// **拒收这次 tool.call**：把“核心已收尾、插件还在写工作空间”那类孤儿行为变成
+  /// 一条看得见的拒绝，而不是默默改了磁盘。
+  ///
+  /// [phase] 只能是 `start` | `end`；两者靠同一个 `call_id` 配对（没给 call_id 就
+  /// 按“该 run 最后一条还没收尾的 start”配）。
+  bool noteRunToolActivity({
+    required String runId,
+    required String sourcePluginId,
+    required String phase,
+    required String tool,
+    String callId = '',
+    Map<String, dynamic>? arguments,
+    String result = '',
+    bool isError = false,
+  }) {
+    final _PluginRunPipe? pipe = _runPipes[runId];
+    if (pipe == null) {
+      log?.call(
+        'tool.call 带了 run_id=$runId，但这一轮不在册（已收尾 / 从未接管 / 属于别的插件）：'
+        '这扇工具调用已被拒',
+      );
+      return false;
+    }
+    if (pipe.pluginId != sourcePluginId) {
+      log?.call(
+        '插件 $sourcePluginId 想往 $runId 的整轮播报工具活动（属于 ${pipe.pluginId}），已拒绝',
+      );
+      return false;
+    }
+    if (phase == 'start') {
+      final String id = 'runtool-${++_runToolSeq}';
+      pipe.openToolIds[callId] = id;
+      pipe.add(
+        AgentToolStart(
+          id: id,
+          name: tool,
+          arguments: arguments ?? const <String, dynamic>{},
+          callId: callId,
+        ),
+      );
+      return true;
+    }
+    if (phase != 'end') {
+      log?.call('整轮接管的工具播报 phase=$phase 非法（只能 start | end），已忽略');
+      return false;
+    }
+    final String id =
+        pipe.openToolIds.remove(callId) ??
+        pipe.openToolIds.remove('') ??
+        'runtool-${++_runToolSeq}';
+    pipe.add(AgentToolEnd(id: id, name: tool, result: result));
+    if (isError) {
+      // 失败结果本身就是卡片里的正文（内置路径也是这个口径），这里只多留一行日志
+      log?.call('整轮接管（$runId）的工具 $tool 回了错误结果');
+    }
+    return true;
+  }
+
+  /// 这个会话现在有被插件接管的整轮吗（返回 run_id；null = 没有）。
+  ///
+  /// 用途只有一件：**接管期间拒绝同一会话的 `agent.message`**——那一族会往会话里
+  /// 塞消息，与接管者的事件流开两条写入口就是双写历史。
+  String? activeLoopRunOf({String agentId = '', String sessionId = ''}) {
+    for (final _PluginRunPipe pipe in _runPipes.values) {
+      if (pipe.finished) continue;
+      if (sessionId.isNotEmpty && pipe.sessionId != sessionId) continue;
+      if (agentId.isNotEmpty && pipe.agentId != agentId) continue;
+      return pipe.runId;
+    }
+    return null;
+  }
+
   // ── 中转站点位：LLM 路径（点位化，2026-10-01） ─────────────────────────────
   //
   // 四个点位，各自独立实例、各自唯一订阅者：
@@ -3564,6 +3856,33 @@ class PluginBus {
     _replayStreamFrames(requestId);
     // 收尾守护：既不设静态总超时（长任务不该被时间杀），也不放任无限等——
     // 每拍检查取消信号与订阅者心跳（与站点 awaitReply 的判活口径一致）。
+    _guardPluginStream(
+      stream: stream,
+      station: station,
+      requestId: requestId,
+      pluginId: pluginId,
+      isCancelled: isCancelled,
+    );
+    controller.onCancel = () {
+      // 消费方提前放弃（会话被取消 / 出错退出）：通知插件别再推了
+      _cancelLlmStream(requestId, '核心已放弃这条流');
+    };
+    return controller.stream;
+  }
+
+  /// 插件流的**收尾守护**（一跳接管与整轮接管共用同一套判据，两处写一定会漂）。
+  ///
+  /// 不设静态总超时（D8：长任务不该被时间杀），也不放任无限等：每拍查两件事
+  /// ——用户取消信号与订阅者心跳（与站点 awaitReply 同一个活性口径）。[what]
+  /// 只影响日志里那条“什么断了”的措辞。
+  void _guardPluginStream({
+    required _PluginLlmStream stream,
+    required RelayStation station,
+    required String requestId,
+    required String pluginId,
+    required bool Function() isCancelled,
+    String what = 'LLM 接管流',
+  }) {
     stream.timer = Timer.periodic(const Duration(milliseconds: 250), (
       Timer timer,
     ) {
@@ -3586,16 +3905,11 @@ class PluginBus {
           requestId,
           failure:
               '插件 $pluginId 心跳丢失（${state.detail.isEmpty ? '连续未达' : state.detail}），'
-              'LLM 接管流中断',
+              '$what中断',
         );
         return;
       }
     });
-    controller.onCancel = () {
-      // 消费方提前放弃（会话被取消 / 出错退出）：通知插件别再推了
-      _cancelLlmStream(requestId, '核心已放弃这条流');
-    };
-    return controller.stream;
   }
 
   /// 收尾一条插件流（幂等）。
@@ -3737,6 +4051,17 @@ class PluginBus {
         return text.isEmpty
             ? const <LlmStreamEvent>[]
             : <LlmStreamEvent>[LlmThinkingDelta(text)];
+      case 'notice':
+        // 整轮接管专用（`loop.run`）：接管者要能播一条“说给人看”的进度（排队、
+        // 切渠道、重试）。形状复用 `LlmRetryNotice`（会话那一侧本来就把它们翻成
+        // `AgentNotice` + `llm_hidden`）；attempt/total 对整轮无意义 ⇒ 给 1/1。
+        final String noticeText = (delta['text'] ?? delta['message'] ?? '')
+            .toString();
+        return noticeText.isEmpty
+            ? const <LlmStreamEvent>[]
+            : <LlmStreamEvent>[
+                LlmRetryNotice(noticeText, attempt: 1, total: 1),
+              ];
       case 'tool_call':
         final Object? index = delta['index'];
         final String id = (delta['id'] ?? '').toString();
@@ -5999,6 +6324,79 @@ class _PluginLlmStream {
   void fail(String reason) => finish(failure: reason);
 }
 
+/// 一条被插件接管的**整轮**（`system.relay.loop.run`，阶段 8）。
+///
+/// 底下那条流（[_PluginLlmStream]）负责“插件说了什么”，这一层只负责两件事：
+/// ① 把它们翻成**会话认的那套事件**（AgentText / AgentThinking / AgentNotice /
+///   AgentUsage / AgentToolStart / AgentToolEnd）；② **收尾只发一次**——不管这条流
+/// 是从接管者的 `done` 帧、从用户取消、还是从心跳丢失关的，`AgentDone` 只能有一条
+/// （两条会让会话以为这一轮既正常结束又被取消）。
+class _PluginRunPipe {
+  _PluginRunPipe({
+    required this.runId,
+    required this.pluginId,
+    required this.agentId,
+    required this.sessionId,
+    required this.model,
+    required this.maxContextTokens,
+    required this.controller,
+  });
+
+  /// 这条 run 的 station request_id（也是工具调用回带的 `run_id`）。
+  final String runId;
+  final String pluginId;
+  final String agentId;
+  final String sessionId;
+  final String model;
+
+  /// 模型上下文上限（由引擎递进来）：只用来把接管者的 usage 补成内置那张表的形状。
+  final int maxContextTokens;
+
+  final StreamController<AgentEvent> controller;
+
+  /// 底下那条插件流的订阅（收尾时取消，不留挂着的订阅）。
+  StreamSubscription<LlmStreamEvent>? sub;
+
+  /// 接管者给的 `finish_reason`（没有就留空）。
+  String finishReason = '';
+
+  /// 是不是以取消收尾（用户停止 / 核心放弃这条流）。
+  bool cancelled = false;
+
+  /// 失败原因（非空 ⇒ 收尾前先播一条 `AgentError`）。
+  String? failure;
+
+  /// 是否已收尾（幂等标记）。
+  bool finished = false;
+
+  /// 开了头还没收尾的工具卡片（键 = call_id，空键 = 没给 call_id 的那一条）。
+  final Map<String, String> openToolIds = <String, String>{};
+
+  void add(AgentEvent event) {
+    if (finished || controller.isClosed) return;
+    controller.add(event);
+  }
+
+  /// 收尾（幂等）：失败先播一条 `AgentError`，再播**唯一那一条** `AgentDone`。
+  ///
+  /// 取消的形状与内置一致：内置的取消只发 `AgentDone(cancelled: true)`、**不发**
+  /// 错误（“被用户停下”不是“出错”），这里照同一个形状。
+  void finish() {
+    if (finished) return;
+    finished = true;
+    final StreamSubscription<LlmStreamEvent>? s = sub;
+    sub = null;
+    if (s != null) unawaited(s.cancel());
+    if (controller.isClosed) return;
+    final String? why = failure;
+    if (!cancelled && why != null && why.isNotEmpty) {
+      controller.add(AgentError(why));
+    }
+    controller.add(AgentDone(cancelled: cancelled, finishReason: finishReason));
+    controller.close();
+  }
+}
+
 /// `plugin.*` 六条命令的**对外面**（20261015-hot-restart 阶段 1，D9/D2）。
 ///
 /// 为什么要把这个划分写成常量而不是“等做 tool 的时候再说”：`plugin.stateDump` /
@@ -6032,6 +6430,25 @@ abstract final class PluginToolSurface {
   /// （`_pluginCommand` 那里已经钉住了“只能是自己的键”）。
   static const Set<String> auditedCommands = agentToolCommands;
 }
+
+/// 接管者报的 usage 翻成与内置**同一形状**的那张表（`loop.run`，阶段 8）。
+///
+/// 三条口径照内置，写成公开函数是为了能被直接钉住（这张表一路走进前端进度条与
+/// 逐调用账本，形状漂了看不出来）：
+/// - `total_tokens`：**端点给了真值就用真值**，没给才用 prompt + completion；
+/// - `cached_tokens` 为 0 ⇒ **不写键**（端点没给这个字段就绝不编造 0）；
+/// - `max_tokens` 由引擎递进来（它才是认识模型配置的那一侧），拿不到就不写——
+///   进度条宁可少一段，也不能拿一个假的上限算百分比。
+Map<String, dynamic> loopRunUsageMap(LlmUsage usage, int maxTokens) =>
+    <String, dynamic>{
+      'prompt_tokens': usage.promptTokens,
+      'completion_tokens': usage.completionTokens,
+      'total_tokens': usage.totalTokens > 0
+          ? usage.totalTokens
+          : usage.promptTokens + usage.completionTokens,
+      if (usage.cachedTokens > 0) 'cached_tokens': usage.cachedTokens,
+      if (maxTokens > 0) 'max_tokens': maxTokens,
+    };
 
 /// 一次**热重启**的结论（每条都带可读结果，不“看起来成功了”）。
 ///

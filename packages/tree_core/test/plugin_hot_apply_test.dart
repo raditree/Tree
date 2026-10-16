@@ -284,8 +284,8 @@ void main() {
     }, reason: '团队归属在订阅声明上：重启后只剩 team-2 这一条（旧订阅已注销）');
     expect(
       bus.snapshot()['stations'],
-      hasLength(34),
-      reason: '收集站全局唯一：换团队不产生新站；快照恒为 32 个内置点位 + 两个收集站',
+      hasLength(35),
+      reason: '收集站全局唯一：换团队不产生新站；快照恒为 33 个内置点位 + 两个收集站',
     );
   });
 

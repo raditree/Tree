@@ -186,6 +186,34 @@ typedef StationUsageQuerier = Future<Map<String, dynamic>> Function({
 /// - 任何一个归属**证明不了**（agent 不存在 / 解析器没接线）⇒ 拒绝并给可读原因。
 ///
 /// 依赖没接线时**不做静默降级**：命令以「未接线」的可读原因失败。
+
+/// 整轮接管（中转点位 `loop.run`）期间的**工具活动播报**入口（核心注入 = 插件总线）。
+///
+/// 工具本身仍走工具层唯一入口（[StationToolCaller]），这一条只负责把“这一轮里有一次
+/// 工具在跑 / 跑完了”播成会话认的 `tool_start` / `tool_end` 卡片——**写侧仍在核心**。
+///
+/// 返回 false ⇒ 这个 `run_id` 不在册（这一轮已收尾 / 属于别的插件 / 从未接管）：
+/// 调用方必须**拒收这次 tool.call**，否则就是“核心已收尾、插件还在写工作空间”的孤儿行为。
+typedef StationRunToolNote = bool Function({
+  required String runId,
+  required String sourcePluginId,
+  required String phase,
+  required String tool,
+  required String callId,
+  required Map<String, dynamic> arguments,
+  String result,
+  bool isError,
+});
+
+/// 这一条会话现在有被插件接管的整轮吗（返回 run_id；null = 没有）。核心注入 = 总线。
+///
+/// 用途只有一件：接管期间**拒绝 `agent.message`**——那一族会往会话里塞消息，
+/// 与接管者的事件流开两条写入口就是双写历史。
+typedef StationActiveLoopRunLookup = String? Function({
+  required String agentId,
+  required String sessionId,
+});
+
 class ExecuteStationMounts {
   ExecuteStationMounts({
     required this.ioFor,
@@ -208,6 +236,8 @@ class ExecuteStationMounts {
     this.pluginManager,
     this.topologyQuery,
     this.usageQuerier,
+    this.runToolNote,
+    this.activeLoopRunOf,
     this.log,
   }) : _injectedHooks = hooks;
 
@@ -232,6 +262,8 @@ class ExecuteStationMounts {
     StationPluginManager? pluginManager,
     StationTopologyQuery? topologyQuery,
     StationUsageQuerier? usageQuerier,
+    StationRunToolNote? runToolNote,
+    StationActiveLoopRunLookup? activeLoopRunOf,
     void Function(String message)? log,
   }) => ExecuteStationMounts(
     ioFor: ioFor,
@@ -260,6 +292,8 @@ class ExecuteStationMounts {
     pluginManager: pluginManager,
     topologyQuery: topologyQuery,
     usageQuerier: usageQuerier,
+    runToolNote: runToolNote,
+    activeLoopRunOf: activeLoopRunOf,
     log: log,
   );
 
@@ -322,6 +356,13 @@ class ExecuteStationMounts {
   /// 与 [topologyQuery] 同样的理由：数据只在实现方那里（一份在总线站点表，一份在
   /// 核心的存储层），本层只做四元组隔离与参数钳制，不另拿一份路径规则。
   final StationUsageQuerier? usageQuerier;
+
+  /// 整轮接管期间的工具活动播报（阶段 8）；null = 核心未接线，此时带 `run_id` 的
+  /// `tool.call` 会被**显式拒**而不是静默不收卡片。
+  final StationRunToolNote? runToolNote;
+
+  /// “这一条会话正被插件接管整轮吗”（阶段 8）；null = 没接线 ⇒ 不拦 `agent.message`。
+  final StationActiveLoopRunLookup? activeLoopRunOf;
 
   final void Function(String message)? log;
 
@@ -1068,6 +1109,18 @@ class ExecuteStationMounts {
     final String content = _string(
       context.arguments['message'] ?? context.arguments['content'],
     );
+    // 整轮接管期间不开第二条写入口（阶段 8）：这一轮正文归接管者的事件流，
+    // 这里再塞一条就是双写历史。拒得**说得出理由**（不静默改掉行为）。
+    final String? activeRun = activeLoopRunOf?.call(
+      agentId: target.agentId,
+      sessionId: _sessionOf(context),
+    );
+    if (activeRun != null) {
+      return StationCommandOutcome.failed(
+        '这一轮正被插件接管（run=$activeRun）：agent.message 会双写历史，'
+        '本轮的消息只能由接管者经它的事件流产出',
+      );
+    }
     if (content.isEmpty) {
       return const StationCommandOutcome.failed(
         'agent.message 需要 message（消息正文）',
@@ -1266,6 +1319,34 @@ class ExecuteStationMounts {
         : <String, dynamic>{};
     final bool relay = context.arguments['relay'] == true;
     final String sessionId = _sessionOf(context);
+    // 整轮接管（阶段 8，点位 `loop.run`）：接管者可以给自己发起的 tool.call 回带
+    // `run_id`，核心据此把这一次工具播成**这一轮的** tool_start / tool_end 卡片。
+    // 工具仍走上面那一条唯一入口（带 relay 的那套 pre/post/timeout/审批/台账一个不少），
+    // 播卡片只补“会话面板看得见的两条事件”——写侧因此在核心手里。
+    final String runId = _string(context.arguments['run_id']);
+    final String callId = _string(context.arguments['call_id']);
+    final StationRunToolNote? note = runToolNote;
+    if (runId.isNotEmpty) {
+      if (note == null) {
+        return const StationCommandOutcome.failed(
+          'tool.call 带了 run_id，但核心没接整轮播报（loop.run 未接线）：这次调用已拒，'
+          '不留一条核心看不见的工具活动',
+        );
+      }
+      if (!note(
+        runId: runId,
+        sourcePluginId: context.sourcePluginId,
+        phase: 'start',
+        tool: tool,
+        callId: callId,
+        arguments: arguments,
+      )) {
+        return StationCommandOutcome.failed(
+          'run_id=$runId 不在册（这一轮已收尾 / 属于别的插件 / 从未接管）：'
+          '这次 tool.call 已拒（不收孤儿调用）',
+        );
+      }
+    }
     final ToolOutcome outcome = await caller(
       agentId: target.agentId,
       sessionId: sessionId,
@@ -1274,6 +1355,26 @@ class ExecuteStationMounts {
       sourcePluginId: context.sourcePluginId,
       relay: relay,
     );
+    if (runId.isNotEmpty) {
+      // 播报失败不会抹掉已发生的结果（工具真的跑了），但一定留下一行日志：
+      // “卡片没上屏”与“没人管”是两件事，不能因为“工具已执行”就假装没事。
+      final bool ended = note!(
+        runId: runId,
+        sourcePluginId: context.sourcePluginId,
+        phase: 'end',
+        tool: tool,
+        callId: callId,
+        arguments: arguments,
+        result: outcome.content,
+        isError: outcome.isError,
+      );
+      if (!ended) {
+        log?.call(
+          'tool.call（$tool）跑完了，但整轮 $runId 已不在册：这一次工具的结果'
+          '不会再上屏（已回给插件，历史里没那张卡片）',
+        );
+      }
+    }
     return StationCommandOutcome.ok(<String, dynamic>{
       'tool': tool,
       'result': outcome.content,

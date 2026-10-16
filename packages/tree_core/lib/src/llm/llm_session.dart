@@ -32,6 +32,27 @@ typedef LlmTurnHandler =
       required bool Function() isCancelled,
     });
 
+/// **整轮 tool loop 接管钩子**（中转站点位 `system.relay.loop.run`）；null = 未接线。
+///
+/// 与 [LlmTurnHandler] 同一类形状，但粒度从**一跳**抬到**整轮**：核心把上下文装配完
+/// （系统提示词 / 摘要 / 水位线之后的原文都是核心那份，**缓存前缀同源**不变量 15
+/// 不围这刀），在进入内置 [LlmSession.run] 之前先问一次；回 null ⇒ 内置 loop **逐字不变**。
+///
+/// 接管者交回的那条流只负责**说什么**（文本 / 思考 / 提示 / 用量 / 收尾），
+/// **写侧与工具执行仍在核心**：工具走执行站 `tool.call`（同一条唯一入口、同一份
+/// 权限，因此 pre/post/timeout/审批/台账一个不少），落库与上行帧走会话那条原路。
+typedef AgentLoopHandler =
+    Future<Stream<AgentEvent>?> Function({
+      required List<LlmMessage> messages,
+      required List<ToolSpec> tools,
+      required String agentId,
+      required String sessionId,
+      required String model,
+      required int maxContextTokens,
+      required bool Function() isCancelled,
+      bool Function()? isHardCancelled,
+    });
+
 /// 「投入 LLM 前」**请求改写钩子**（中转站点位 `system.relay.llm.request`）。
 ///
 /// 返回 null = 不改（走原请求）；返回新请求 = 用它的报文投给模型。

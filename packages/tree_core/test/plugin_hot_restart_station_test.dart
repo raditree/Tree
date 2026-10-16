@@ -8,8 +8,9 @@
 // 1. 新点位 `system.execute.plugin` 在 `StationHubIds.all` 里（漏了这一条 ⇒ 插件订阅
 //    会被当成别人的自建站拒掉，是 plan 风险表里"新点位静默失效"那格）；
 // 2. 内置点位总数 19 → **22**（阶段 1 加了执行站 plugin 族、阶段 2 加了广播站
-//    plugin.state）→ **34**（阶段 6 的 A 级点位批：广播站 +5、执行站 station / usage
-//    族 +2、中转站 +4、收集站 +1）；派生计数，加点位必须同时改这里；
+//    plugin.state）→ **35**（阶段 6 的 A 级点位批：广播站 +5、执行站 station / usage
+//    族 +2、中转站 +4、收集站 +1；阶段 8 再加中转站 `loop.run` 整轮接管）；
+//    派生计数，加点位必须同时改这里；
 // 3. 六条命令都挂到了这个点位上（挂载位置由点位表的 commands 驱动，不是硬编码）；
 // 4. 未知命令被显式拒绝并回整张白名单（不"看起来执行了"）；
 // 5. 归属口径分两套：控制面四条要求 `scope.team_id`（证明不了就拒），快照两条要求
@@ -103,13 +104,13 @@ void main() {
       (result.payload ?? const <String, dynamic>{}) as Map<String, dynamic>;
 
   // ── 1/2/3：点位登记与挂载 ─────────────────────────────────────────────
-  test('新点位进了 StationHubIds.all，且内置点位总数是 34', () {
+  test('新点位进了 StationHubIds.all，且内置点位总数是 35', () {
     expect(
       StationHubIds.all,
       contains(StationHubIds.executePlugin),
       reason: '漏进 all ⇒ 插件订阅被当成别人的自建站拒掉（静默失效）',
     );
-    expect(StationPoints.all.length, 34);
+    expect(StationPoints.all.length, 35);
     expect(StationHubIds.all.length, StationPoints.all.length);
     expect(
       StationPoints.byId(StationHubIds.executePlugin),

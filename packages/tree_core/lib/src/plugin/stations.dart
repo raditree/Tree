@@ -18,9 +18,10 @@ import 'station_store.dart';
 ///   `.turn.error` / `.ask.paused` / `.config.changed`
 /// - 执行站 11 个（按命令族）：`system.execute.fs` / `.terminal` / `.agent` / `.ui` /
 ///   `.llm` / `.tool` / `.session` / `.ssh` + `.plugin` / `.station` / `.usage`
-/// - 中转站 11 个（每个各自唯一订阅者）：`system.relay.tool.pre` / `.tool.post` /
+/// - 中转站 12 个（每个各自唯一订阅者）：`system.relay.tool.pre` / `.tool.post` /
 ///   `.llm.handle` / `.llm.request` / `.context.compact` / `.prompt.system` / `.ssh.execute`
 ///   + 阶段 6 四个：`.tool.repair` / `.tool.probe` / `.llm.register` / `.compact.skip.reason`
+///   + 阶段 8 一个：`.loop.run`（整轮循环接管）
 /// - 收集站 2 个：`plugin.tool.define` 与 `plugin.capability.define`（**都不预建**，
 ///   见 [ensureBuiltinStations]：schema 就是接入点定义的输入格式）
 ///
@@ -385,7 +386,7 @@ class StationHub {
     );
   }
 
-  /// **确保全部内置点位存在**（32 个：广播 10 + 执行 11 + 中转 11；收集站除外）。
+  /// **确保全部内置点位存在**（33 个：广播 10 + 执行 11 + 中转 12；收集站除外）。
   ///
   /// 为什么需要这一步：[pointFor] 是**懒创建**（首次使用时才实例化）。按需开销为零
   /// 是好事，代价却是"没配插件 / 没人用过"时一个点位都没有——面板上就是
@@ -415,7 +416,7 @@ class StationHub {
     // 一批预建只落一次盘（每个点位的懒创建都会 save 一次，不合并就是二十几次写）
     _saveSuspend++;
     try {
-      // 全部内置点位（广播 10 + 执行 11 + 中转 11 = 32）预建；**收集站不预建**（见下）。
+      // 全部内置点位（广播 10 + 执行 11 + 中转 12 = 33）预建；**收集站不预建**（见下）。
       for (final StationPointSpec spec in StationPoints.all) {
         if (spec.kind == StationKind.collect) continue;
         _ensureOneBuiltin(() => pointFor(spec.id), created);

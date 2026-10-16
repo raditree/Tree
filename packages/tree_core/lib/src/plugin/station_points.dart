@@ -588,6 +588,36 @@ abstract final class StationPoints {
           '限制：只能改**文案**，不能改分级位 `has_subscriber`（那是“该不该写进历史”的判据，'
           '归核心）；也不能拿它反过来宣布“其实接管了”。',
     ),
+    StationPointSpec(
+      id: StationHubIds.relayLoopRun,
+      kind: StationKind.relay,
+      label: '整轮循环接管',
+      description:
+          '中转站·**整轮 tool loop 由谁跑**：一条用户消息 = 一个 run，第几跳、工具怎么排、'
+          '何时收尾全归接管者（上下文仍由核心装配，写侧也在核心）',
+      alias: 'loop.run',
+      maxSubscriptions: 1,
+      readme:
+          '整轮循环中转点：核心把上下文装配完（含系统提示词、摘要、水位线之后的原文）之后、'
+          '进入内置 LlmSession 之前，先把这一轮投给本站。接管者回 `{stream: true}` '
+          '（与 `llm.handle` 同一个接管信号）⇒ 这一轮的循环形状完全归你；不回 / 回 '
+          '`{taken: false}` / 只回整包 ⇒ **内置 loop 逐字不变**。\n'
+          '与 `llm.handle` 的分界：handle 只交**一跳**（编排、工具执行、收尾判据仍在核心）；'
+          '本站交**整轮**（你可以并行跑工具、可以先反思一轮、也可以自己定终止条件）。\n'
+          '触发时机：每一轮开始处——上下文装配完、进入内置 LlmSession **之前**一次（不是'
+          '每跳一次）。接管成立后本站在这一轮里不再被问：循环形状已经归你。\n'
+          '回包之后的约定：① 文本/思考/提示/用量经 `station/stream` 推回同一个 request_id'
+          '（写法与 `llm.handle` 完全同形，额外支持 `delta.kind = "notice"`）；② **工具必须走 `tool.call`**'
+          '并回带 `run_id`，核心会把它们的 tool_start / tool_end 卡片与历史写回这一轮，'
+          '且 pre / post / timeout / 提问审批一个不少；③ 自己跑完了推 `done`（带 `finish_reason` / `usage`）。\n'
+          '**限制（写侧不可剥）**：落库、上行帧、用量账本（接管者不带 usage 就本地估算并标 '
+          'estimated）、取消与判死全部仍在核心。接管期间同一会话的 `agent.message`（往会话里塞消息）会被拒，'
+          '因为那会造成双写历史；工具只能经 `tool.call` 发起（核心据此播卡片），'
+          '直接往流里推 tool_call 增量**不会**产生任何历史。\n'
+          '收尾判据（不拿时长杀长任务）：核心下发 `station/cancel`（用户停止）或插件心跳丢失 ⇒ '
+          '核心**单方面收尾**（关流 + 如实落一条取消结论 + 拒收该 run_id 之后的 `tool.call`，'
+          '避免“核心已收尾、插件还在写工作空间”的孤儿行为）。',
+    ),
   ];
 
   /// 收集站点位（schema 由接入点决定，不在这里预建）。

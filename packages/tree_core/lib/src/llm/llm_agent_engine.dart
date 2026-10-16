@@ -132,6 +132,13 @@ class LlmAgentEngine implements AgentEngine {
   /// 在拿到 PluginBus 之后赋值——引擎与 [LlmSession] 都不认识插件总线。
   LlmTurnHandler? llmTurnHandler;
 
+  /// **整轮 tool loop 接管钩子**（中转站点位 `system.relay.loop.run`，阶段 8）；null = 未接线。
+  ///
+  /// 与 [llmTurnHandler] 同一个接线范式（可写字段，由 `CoreServer._wirePluginRelayPoints`
+  /// 在拿到总线之后赋值；引擎与 [LlmSession] 都不认识插件总线），但分流发生在
+  /// **进入会话之前**：接管成立就这一轮不再跑内置的跳循环。
+  AgentLoopHandler? loopTurnHandler;
+
   /// **「投入 LLM 前」请求改写钩子**（中转站点位 `system.relay.llm.request`）。
   LlmRequestRewriter? llmRequestRewriter;
 
@@ -228,13 +235,43 @@ class LlmAgentEngine implements AgentEngine {
       // 是两件事（实测表见 LlmMessage.thinkingTurn）。
       thinkingTurn: thinkingModel,
     );
+    // 这一轮能用的工具表：**内置与接管者必须拿到同一份**（否则插件看到的工具与世界
+    // 不一致，而这份表同时决定缓存前缀）。
+    final List<ToolSpec> toolSpecs = toolRunner.specsFor(
+      agentId: context.agentId,
+      sessionId: context.sessionId,
+    );
+    // **整轮接管**（中转站点位 `system.relay.loop.run`，阶段 8）：上下文已由核心装配完，
+    // 在进入内置 LlmSession 之前先问一次。回 null（未接线 / 未接管 / 非法回包）⇒
+    // 下面的内置路径逐字不变。接管者只决定**循环形状**；落库、上行帧、用量账本、
+    // 取消与工具执行都仍在核心这一侧（写侧不可剥）。
+    final AgentLoopHandler? loopHandler = loopTurnHandler;
+    if (loopHandler != null) {
+      final Stream<AgentEvent>? taken = await loopHandler(
+        messages: messages,
+        tools: toolSpecs,
+        agentId: context.agentId,
+        sessionId: context.sessionId,
+        model: config.modelId,
+        maxContextTokens: config.effectiveMaxSeqlen,
+        isCancelled: isCancelled,
+        isHardCancelled: context.isHardCancelled,
+      );
+      if (taken != null) {
+        // 与内置路径共用那一手 usage 处理（账本、剥内部字段），两套写法一定会漂
+        yield* _accountedEvents(
+          source: taken,
+          context: context,
+          resolved: resolved,
+          config: config,
+        );
+        return;
+      }
+    }
     final LlmSession session = LlmSession(
       transport: _transportFor(config),
       model: config.modelId,
-      tools: toolRunner.specsFor(
-        agentId: context.agentId,
-        sessionId: context.sessionId,
-      ),
+      tools: toolSpecs,
       toolRunner: toolRunner,
       // 工具久不返回时的**对账探针**（见 ToolResultProbe）：存储里已有真实结果就采用它，
       // 让批能收尾；没有就继续等显式取消（用户 / 插件 / agent 的 tool_runs）。
@@ -268,13 +305,33 @@ class LlmAgentEngine implements AgentEngine {
     );
     // usage 事件要**过一手**：真实 usage 里夹带着"本次上下文字符数"，学习完之后
     // 必须剥掉再上行，否则内部字段会流进前端帧与落库。
-    await for (final AgentEvent event in session.run(
-      messages: messages,
-      agentId: context.agentId,
-      sessionId: context.sessionId,
-      isCancelled: isCancelled,
-      isHardCancelled: context.isHardCancelled,
-    )) {
+    yield* _accountedEvents(
+      source: session.run(
+        messages: messages,
+        agentId: context.agentId,
+        sessionId: context.sessionId,
+        isCancelled: isCancelled,
+        isHardCancelled: context.isHardCancelled,
+      ),
+      context: context,
+      resolved: resolved,
+      config: config,
+    );
+  }
+
+  /// 一条事件流的 usage 那一手（**内置 loop 与插件接管的整轮共用同一个出口**）。
+  ///
+  /// 为什么只能有一处：学习 token scale、落逐调用账本、剥掉内部字段这三件事都是
+  /// 对账本与上行形状负责；两处写就会漂（漂了看不出来，代价是下一轮的预算估算与
+  /// 面板上的用量都错）。接管者不报 usage 时这里拿不到东西，估算与 `source=plugin`
+  /// 归账仍在会话那一侧按既有口径走。
+  Stream<AgentEvent> _accountedEvents({
+    required Stream<AgentEvent> source,
+    required AgentRunContext context,
+    required CoreModelConfig? resolved,
+    required CoreModelConfig config,
+  }) async* {
+    await for (final AgentEvent event in source) {
       if (event is AgentUsage) {
         _learnTokenScale(resolved, event.usage);
         _recordCallUsage(context, config, event.usage);
