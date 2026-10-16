@@ -145,6 +145,23 @@ typedef StationTopologyQuery = Future<Map<String, dynamic>> Function({
   String sourcePluginId,
 });
 
+/// `usage.query` 的**逐调用用量账本**读口（20261015-hot-restart 阶段 6）：由核心实现。
+///
+/// 为什么这一条不写在挂载位置里：账本落在**数据根**下的会话目录
+/// （`<agent>/<session>/usage.jsonl`），路径布局与容错读取都属于存储层；挂载位置
+/// 只有 `ioFor`（工作空间抽象），**够不到数据根**——硬接就会在插件层复制一份路径
+/// 规则，而那份规则以后一定与 `TreePaths` 漂。
+///
+/// [tailBytes] `<= 0` = 用实现方的默认上限（与面板同源）。返回值约定与其它槽一致：
+/// `{ok: true, session_id, usage_file, count, skipped, calls, summary}` 或
+/// `{ok: false, error: 可读中文}`。`calls` 的行形状必须与 `UsageCall.toJson()`
+/// **逐字一致**（字段表的唯一出处是账本自己，不在这里另拼一套键）。
+typedef StationUsageQuerier = Future<Map<String, dynamic>> Function({
+  required String agentId,
+  required String sessionId,
+  int tailBytes,
+});
+
 /// 执行站命令的挂载位置集合（M9 Wave 3-I）。
 ///
 /// 站点体系里「执行器只是执行站的一种挂载位置」：本类就是**系统内置挂载位置**，
@@ -155,6 +172,8 @@ typedef StationTopologyQuery = Future<Map<String, dynamic>> Function({
 /// |---|---|
 /// | `fs.read` / `fs.write` / `fs.list` / `fs.grep` | [WorkspaceIO]（local / ssh 同一抽象） |
 /// | `terminal.exec` | 既有 `terminal` 工具的执行路径（含 hook 模式语义） |
+/// | `terminal.listRuns` / `stopRun` / `log` | [TerminalHooks] 的任务表与 `readTail`：后台任务的**结构化读口与控口**（阶段 6） |
+/// | `usage.query` | [StationUsageQuerier]（核心的 `UsageLog.read`：账本在数据根，插件本来够不到） |
 /// | `agent.message` | 团队派发 / 会话投递（[StationAgentMessageSender]） |
 /// | `agent.stop` | 既有停止路径（含**级联**语义，[StationAgentStopper]） |
 /// | `agent.compact` | [StationAgentCompactor]（CompactionService 手动压缩入口） |
@@ -188,6 +207,7 @@ class ExecuteStationMounts {
     this.sshReconnector,
     this.pluginManager,
     this.topologyQuery,
+    this.usageQuerier,
     this.log,
   }) : _injectedHooks = hooks;
 
@@ -211,6 +231,7 @@ class ExecuteStationMounts {
     StationSshReconnector? sshReconnector,
     StationPluginManager? pluginManager,
     StationTopologyQuery? topologyQuery,
+    StationUsageQuerier? usageQuerier,
     void Function(String message)? log,
   }) => ExecuteStationMounts(
     ioFor: ioFor,
@@ -238,6 +259,7 @@ class ExecuteStationMounts {
     sshReconnector: sshReconnector,
     pluginManager: pluginManager,
     topologyQuery: topologyQuery,
+    usageQuerier: usageQuerier,
     log: log,
   );
 
@@ -294,6 +316,12 @@ class ExecuteStationMounts {
   /// 「谁能动谁的快照」，站点族问的是「这个 team 能看见哪些站」。并进一个入口
   /// 就会把两套口径挤在一个 switch 里，而过两年没人记得它们为何不同。
   final StationTopologyQuery? topologyQuery;
+
+  /// `usage.query`（逐调用用量账本，只读）入口；null = 该命令显式报「未接线」。
+  ///
+  /// 与 [topologyQuery] 同样的理由：数据只在实现方那里（一份在总线站点表，一份在
+  /// 核心的存储层），本层只做四元组隔离与参数钳制，不另拿一份路径规则。
+  final StationUsageQuerier? usageQuerier;
 
   final void Function(String message)? log;
 
@@ -398,6 +426,14 @@ class ExecuteStationMounts {
           return await _fsGrep(context, target);
         case 'terminal.exec':
           return await _terminalExec(context, target);
+        case 'terminal.listRuns':
+          return await _terminalListRuns(context, target);
+        case 'terminal.stopRun':
+          return await _terminalStopRun(context, target);
+        case 'terminal.log':
+          return await _terminalLog(context, target);
+        case 'usage.query':
+          return await _usageQuery(context, target);
         case 'agent.message':
           return await _agentMessage(context, target);
         case 'agent.stop':
@@ -808,6 +844,213 @@ class ExecuteStationMounts {
       'text': outcome.content,
       'is_error': outcome.isError,
     });
+  }
+
+  /// `terminal.listRuns`：目标 agent 的后台（hook）任务，**结构化行**。
+  ///
+  /// 为什么已有 `hook_action=status` 还要这一条：那条回的是写给模型看的散文，而
+  /// 转发/看护类插件要的是能直接消费的字段；`tool.close` 只按 handle 关一次运行，
+  /// 也递不出台账里那些（远端 pid / 日志路径 / 接续失败次数）。
+  ///
+  /// 归属：任务表是**全进程一份**（本机与远端、所有 agent 混在一起），不按目标
+  /// agent 过滤就等于把别人跑过什么命令递出去。会话口径**不外推**：给了才筛，
+  /// 没给就返回该 agent 的全部——拿默认会话去筛会把别的会话的任务悄悄藏起来。
+  Future<StationCommandOutcome> _terminalListRuns(
+    StationCommandContext context,
+    _StationTarget target,
+  ) async {
+    final String sessionFilter = _string(context.arguments['session_id']);
+    final bool onlyRunning = context.arguments['only_running'] == true;
+    final List<HookTask> matched =
+        _hooks.tasks
+            .where(
+              (HookTask task) =>
+                  task.agentId == target.agentId &&
+                  (sessionFilter.isEmpty || task.sessionId == sessionFilter) &&
+                  (!onlyRunning || task.running),
+            )
+            .toList()
+          // 新的在前：控制面问的是「现在有什么在跑」，不是台账的考古顺序
+          ..sort(
+            (HookTask a, HookTask b) => b.startedAt.compareTo(a.startedAt),
+          );
+    final int limit = _boundedInt(
+      context.arguments['limit'],
+      fallback: 50,
+      min: 1,
+      max: 500,
+    );
+    final List<HookTask> page = matched.take(limit).toList(growable: false);
+    return StationCommandOutcome.ok(<String, dynamic>{
+      'agent_id': target.agentId,
+      'mode_key': target.modeKey,
+      if (sessionFilter.isNotEmpty) 'session_id': sessionFilter,
+      'only_running': onlyRunning,
+      'total': matched.length,
+      'count': page.length,
+      'truncated': matched.length > page.length,
+      'runs': <Map<String, dynamic>>[
+        for (final HookTask task in page) _hookRow(task),
+      ],
+    });
+  }
+
+  /// `terminal.stopRun`：按台账 id 终止一条后台任务（**不保证杀得掉**）。
+  ///
+  /// 与 `terminal.exec` 的 `hook_action=cancel` 用的是同一个 `TerminalHooks.cancel`，
+  /// 差别只在回包形状。最要紧的是**不假装杀成功**：会话失联转的、远端没拿到 pid 的，
+  /// 都得给出一句能说清为什么杀不掉的话（[cancelRefusal]）。
+  Future<StationCommandOutcome> _terminalStopRun(
+    StationCommandContext context,
+    _StationTarget target,
+  ) async {
+    final String taskId = _string(context.arguments['task_id']);
+    if (taskId.isEmpty) {
+      return const StationCommandOutcome.failed(
+        'terminal.stopRun 需要 task_id（terminal.listRuns 里的那一个）',
+      );
+    }
+    final HookTask? task = _hooks.task(taskId);
+    // 别人的任务一律当成“不存在”：既不动它，也不告诉发起者它真的存在
+    if (task == null || task.agentId != target.agentId) {
+      return StationCommandOutcome.failed(
+        '未知 task_id：$taskId（目标 agent ${target.agentId} 名下没有这条后台任务；'
+        '可用 terminal.listRuns 看有哪些）',
+      );
+    }
+    final bool requested = task.running && await _hooks.cancel(taskId);
+    return StationCommandOutcome.ok(<String, dynamic>{
+      'agent_id': target.agentId,
+      'mode_key': target.modeKey,
+      'task_id': taskId,
+      'requested': requested,
+      'running': task.running,
+      'exit_code': task.exitCode,
+      // 命令本身是跑成了的（杀不掉不等于没执行）：结论写在 requested，理由写在这里
+      if (!requested)
+        'reason': task.running
+            ? cancelRefusal(task)
+            : '任务已结束（退出码 ${task.exitCode}），无需终止',
+    });
+  }
+
+  /// `terminal.log`：读一条后台任务的**日志尾部**。
+  ///
+  /// 为什么不走 `fs.read`：日志可能在**远端**工作空间（而且可能是链路已断那一边），
+  /// 读口径只在 `BackgroundExecHost.readTail` 那里；本层不自己拼路径。
+  Future<StationCommandOutcome> _terminalLog(
+    StationCommandContext context,
+    _StationTarget target,
+  ) async {
+    final String taskId = _string(context.arguments['task_id']);
+    if (taskId.isEmpty) {
+      return const StationCommandOutcome.failed(
+        'terminal.log 需要 task_id（terminal.listRuns 里的那一个）',
+      );
+    }
+    final HookTask? task = _hooks.task(taskId);
+    if (task == null || task.agentId != target.agentId) {
+      return StationCommandOutcome.failed(
+        '未知 task_id：$taskId（目标 agent ${target.agentId} 名下没有这条后台任务）',
+      );
+    }
+    final BackgroundExecHost? host = task.background;
+    if (host == null) {
+      // 退化场景如实说：该工作空间后端不支持后台执行，日志本来就没写进去过
+      return StationCommandOutcome.failed(
+        '任务 $taskId 的工作空间后端不支持后台执行：日志读不到（不假装写过）',
+      );
+    }
+    // 上限挂在核心自己那份读数上（与 `hook_action=status` 同源），插件能往下调不能往上调：
+    // 一条命令把几百 MB 日志拽进内存 = 整个核心被一个插件拖死。
+    final int chars = _boundedInt(
+      context.arguments['tail_chars'],
+      fallback: _hooks.maxTailChars,
+      min: 1,
+      max: _hooks.maxTailChars * 20,
+    );
+    final String? text = await host.readTail(task.logRelative, chars);
+    return StationCommandOutcome.ok(<String, dynamic>{
+      'agent_id': target.agentId,
+      'mode_key': target.modeKey,
+      'task_id': taskId,
+      'log_relative': task.logRelative,
+      'remote_log': task.remoteLog,
+      // 口径明示：这是**尾部**，不是全文（全文属于会话工作空间，走 fs.read）
+      'tail': true,
+      'tail_chars': chars,
+      'text': text ?? '',
+      'has_content': text != null && text.trim().isNotEmpty,
+      if (text == null) 'reason': '日志文件还不存在（任务刚起，或远端命令结束时才回写完整输出）',
+    });
+  }
+
+  /// `usage.query`：取一个会话的逐调用用量账本（只读，四元组隔离后交给核心）。
+  ///
+  /// 本层不自己拼路径也不自己算聚合：前者属于存储层（见 [StationUsageQuerier]），
+  /// 后者算两份就会与面板上那份漂。参数只钳一件事：`tail_bytes`（上限 2 MiB，
+  /// 超限按上限走——账本可以很长，而这是一次站点命令不是导库）。
+  Future<StationCommandOutcome> _usageQuery(
+    StationCommandContext context,
+    _StationTarget target,
+  ) async {
+    final StationUsageQuerier? querier = usageQuerier;
+    if (querier == null) {
+      return const StationCommandOutcome.failed(
+        'usage.query 尚无挂载实现（核心未给执行站注入用量账本读口：未接线，'
+        '不假装读过）',
+      );
+    }
+    final int tailBytes = _boundedInt(
+      context.arguments['tail_bytes'],
+      fallback: 0,
+      min: 0,
+      max: 2 * 1024 * 1024,
+    );
+    final Map<String, dynamic> result = await querier(
+      agentId: target.agentId,
+      // 会话口径与 llm.call / agent.compact 逐字一致：命令参数 → 站点 scope → 默认会话
+      sessionId: _sessionOf(context),
+      tailBytes: tailBytes,
+    );
+    return _outcomeOf(result, 'usage.query');
+  }
+
+  /// 一条后台任务的结构化行（`terminal.listRuns` 的形状，字段表只在这里给一次）。
+  ///
+  /// `exit_code` / `pid` 拿不到时写 **null 而不省略键**：省略就分不出“正常退出码 0”
+  /// 与“根本没读到”，而后者才是插件要不要重试的判据。
+  static Map<String, dynamic> _hookRow(HookTask task) => <String, dynamic>{
+    'task_id': task.id,
+    'command': task.command,
+    'session_id': task.sessionId,
+    'running': task.running,
+    'exit_code': task.exitCode,
+    'elapsed_seconds': task.elapsed.inSeconds,
+    'started_at': task.startedAt.millisecondsSinceEpoch,
+    'log_relative': task.logRelative,
+    'remote': task.remote,
+    'remote_log': task.remoteLog,
+    'detached': task.detached,
+    'cancelled': task.cancelled,
+    'pid': task.handle?.pid,
+    'fail_streak': task.failStreak,
+  };
+
+  /// 钳一个整数参数（越界不静默接受：拿到上限就按上限跑，并把生效值 echo 回包里）。
+  static int _boundedInt(
+    Object? raw, {
+    required int fallback,
+    required int min,
+    required int max,
+  }) {
+    final int? parsed = raw is num
+        ? raw.toInt()
+        : (raw is String ? int.tryParse(raw.trim()) : null);
+    if (parsed == null) return fallback;
+    if (parsed < min) return min;
+    if (parsed > max) return max;
+    return parsed;
   }
 
   // ── agent.*：会话侧既有路径 ──────────────────────────────────────────

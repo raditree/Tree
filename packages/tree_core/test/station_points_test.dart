@@ -23,13 +23,13 @@ void main() {
       );
     });
 
-    test('类型分布：广播 10 / 执行 10 / 中转 7 / 收集 1', () {
+    test('类型分布：广播 10 / 执行 11 / 中转 7 / 收集 1', () {
       int count(StationKind kind) => StationPoints.ofKind(kind).length;
       expect(count(StationKind.broadcast), 10);
-      expect(count(StationKind.execute), 10);
+      expect(count(StationKind.execute), 11);
       expect(count(StationKind.relay), 7);
       expect(count(StationKind.collect), 1);
-      expect(StationPoints.all.length, 28);
+      expect(StationPoints.all.length, 29);
     });
 
     test('退役 id 不在表里（它们只用于读侧迁移）', () {
@@ -78,44 +78,53 @@ void main() {
           reason: '${kind.label} 的点位名重复：$suffixes',
         );
       }
-      expect(StationPoints.byId(StationHubIds.relayLlmHandle)!.suffix, 'llm.handle');
+      expect(
+        StationPoints.byId(StationHubIds.relayLlmHandle)!.suffix,
+        'llm.handle',
+      );
       expect(StationPoints.byId(StationHubIds.executeFs)!.suffix, 'fs');
       // 经典点位（system.broadcast）没有点位后缀：返回 id 本身
-      expect(StationPoints.byId(StationHubIds.broadcast)!.suffix, StationHubIds.broadcast);
+      expect(
+        StationPoints.byId(StationHubIds.broadcast)!.suffix,
+        StationHubIds.broadcast,
+      );
     });
 
-    test('命令 → 点位：22 条命令，每条恰好属于一个执行站点位', () {
+    test('命令 → 点位：26 条命令，每条恰好属于一个执行站点位', () {
       final Set<String> commands = StationPoints.allCommands;
-      expect(commands.length, 22, reason: '$commands');
-      expect(
-        commands,
-        <String>{
-          'fs.read',
-          'fs.write',
-          'fs.list',
-          'fs.grep',
-          'terminal.exec',
-          'agent.message',
-          'agent.stop',
-          'agent.compact',
-          'ui.push',
-          'llm.call',
-          'tool.call',
-          'tool.close',
-          'session.rename',
-          'ssh.reconnect',
-          // 插件族（20261015-hot-restart 阶段 1）
-          'plugin.list',
-          'plugin.restart',
-          'plugin.suspend',
-          'plugin.state',
-          'plugin.stateDump',
-          'plugin.stateFetch',
-          // 站点族（20261015-hot-restart 阶段 6：只看不动的控制面）
-          'station.list',
-          'station.state',
-        },
-      );
+      expect(commands.length, 26, reason: '$commands');
+      expect(commands, <String>{
+        'fs.read',
+        'fs.write',
+        'fs.list',
+        'fs.grep',
+        'terminal.exec',
+        // 后台（hook）任务的结构化读口与控口（阶段 6）
+        'terminal.listRuns',
+        'terminal.stopRun',
+        'terminal.log',
+        // 用量族（阶段 6）
+        'usage.query',
+        'agent.message',
+        'agent.stop',
+        'agent.compact',
+        'ui.push',
+        'llm.call',
+        'tool.call',
+        'tool.close',
+        'session.rename',
+        'ssh.reconnect',
+        // 插件族（20261015-hot-restart 阶段 1）
+        'plugin.list',
+        'plugin.restart',
+        'plugin.suspend',
+        'plugin.state',
+        'plugin.stateDump',
+        'plugin.stateFetch',
+        // 站点族（20261015-hot-restart 阶段 6：只看不动的控制面）
+        'station.list',
+        'station.state',
+      });
       for (final String command in commands) {
         final StationPointSpec? owner = StationPoints.ownerOfCommand(command);
         expect(owner, isNotNull, reason: command);
@@ -144,11 +153,13 @@ void main() {
     test('订阅别名解析：类型 + 点位 / 完整 id / 后缀 / 留空', () {
       // 留空：中转站 = 工具前 + 工具后两点位（**不含 ssh.execute**：它需要显式订）
       expect(
-        StationPoints.resolveAlias(kindWire: 'relay').map((StationPointSpec s) => s.id),
+        StationPoints.resolveAlias(kindWire: 'relay')
+            .map((StationPointSpec s) => s.id),
         <String>[StationHubIds.relayToolPre, StationHubIds.relayToolPost],
       );
       expect(
-        StationPoints.resolveAlias(kindWire: 'broadcast').map((StationPointSpec s) => s.id),
+        StationPoints.resolveAlias(kindWire: 'broadcast')
+            .map((StationPointSpec s) => s.id),
         <String>[StationHubIds.broadcast],
       );
       // 别名 / 完整 id / 后缀三种写法都命中同一个点位
@@ -158,16 +169,19 @@ void main() {
         'llm.handle',
       ]) {
         expect(
-          StationPoints.resolveAlias(kindWire: 'relay', point: key)
-              .map((StationPointSpec s) => s.id)
-              .toList(),
+          StationPoints.resolveAlias(
+            kindWire: 'relay',
+            point: key,
+          ).map((StationPointSpec s) => s.id).toList(),
           <String>[StationHubIds.relayLlmHandle],
           reason: key,
         );
       }
       expect(
-        StationPoints.resolveAlias(kindWire: 'broadcast', point: 'tool.post')
-            .map((StationPointSpec s) => s.id),
+        StationPoints.resolveAlias(
+          kindWire: 'broadcast',
+          point: 'tool.post',
+        ).map((StationPointSpec s) => s.id),
         <String>[StationHubIds.broadcastToolPost],
       );
       // ssh.execute：新「处理拓展点位」必须显式订才命中（别名 / 完整 id / 后缀三种写法）
@@ -177,16 +191,18 @@ void main() {
         'ssh.execute',
       ]) {
         expect(
-          StationPoints.resolveAlias(kindWire: 'relay', point: key)
-              .map((StationPointSpec s) => s.id)
-              .toList(),
+          StationPoints.resolveAlias(
+            kindWire: 'relay',
+            point: key,
+          ).map((StationPointSpec s) => s.id).toList(),
           <String>[StationHubIds.relaySshExecute],
           reason: key,
         );
       }
       // 留空解析绝不含 ssh.execute（老插件 `station: 'relay'` 不会误吞 SSH 执行）
       expect(
-        StationPoints.resolveAlias(kindWire: 'relay').map((StationPointSpec s) => s.id),
+        StationPoints.resolveAlias(kindWire: 'relay')
+            .map((StationPointSpec s) => s.id),
         isNot(contains(StationHubIds.relaySshExecute)),
       );
       // 执行站不可订阅 ⇒ 任何 point 都解析不出来
@@ -196,8 +212,14 @@ void main() {
         isEmpty,
       );
       // 不存在的点位 / 类型
-      expect(StationPoints.resolveAlias(kindWire: 'relay', point: 'nope'), isEmpty);
-      expect(StationPoints.resolveAlias(kindWire: 'bogus', point: 'tool.pre'), isEmpty);
+      expect(
+        StationPoints.resolveAlias(kindWire: 'relay', point: 'nope'),
+        isEmpty,
+      );
+      expect(
+        StationPoints.resolveAlias(kindWire: 'bogus', point: 'tool.pre'),
+        isEmpty,
+      );
     });
 
     test('别名提示按类型列出（可读错误里用）', () {

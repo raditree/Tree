@@ -199,10 +199,10 @@ void main() {
     expect(jsonDecode(lines.single), containsPair('type', 'task'));
 
     // 站点体系：插件启动 = 工具表刷新点⇒ 插件挂到**全局唯一的收集站**上。
-    // 快照恒看到全部内置点位（广播 10 + 执行 10 + 中转 7 = 27）+ 收集站；
+    // 快照恒看到全部内置点位（广播 10 + 执行 11 + 中转 7 = 28）+ 收集站；
     // 收集站是唯一有订阅者的那个。
     final List<dynamic> stations = bus.snapshot()['stations'] as List<dynamic>;
-    expect(stations, hasLength(28), reason: '27 个内置点位 + 收集站');
+    expect(stations, hasLength(29), reason: '28 个内置点位 + 收集站');
     final Map<String, dynamic> station = stations.firstWhere(
       (dynamic s) => (s as Map<String, dynamic>)['kind'] == 'collect',
     ) as Map<String, dynamic>;
@@ -215,16 +215,12 @@ void main() {
       (station['subscriptions'] as List<dynamic>).single['plugin_id'],
       'sample',
     );
-    expect(
-      station['subscribers_by_team'],
-      <String, dynamic>{
-        'team-1': <String, dynamic>{
-          'count': 1,
-          'plugin_ids': <String>['sample'],
-        },
+    expect(station['subscribers_by_team'], <String, dynamic>{
+      'team-1': <String, dynamic>{
+        'count': 1,
+        'plugin_ids': <String>['sample'],
       },
-      reason: 'team 视角落在订阅者 scope 上（面板据此分组）',
-    );
+    }, reason: 'team 视角落在订阅者 scope 上（面板据此分组）');
 
     // 工具调用（命名空间名）
     final PluginCallResult called = await bus.callTool(
@@ -259,11 +255,12 @@ void main() {
     expect(snapshot['enabled'], isTrue);
     // 站点全局唯一：快照恒看到**全部内置点位**（21 个）+ 接入点现建的收集站，
     // 与"有没有插件成功启动"无关（坏插件不该让站点段时有时无）。
-    final List<String> prebuiltPoints = StationPoints.all
-        .where((StationPointSpec spec) => spec.kind != StationKind.collect)
-        .map((StationPointSpec spec) => spec.id)
-        .toList()
-      ..sort();
+    final List<String> prebuiltPoints =
+        StationPoints.all
+            .where((StationPointSpec spec) => spec.kind != StationKind.collect)
+            .map((StationPointSpec spec) => spec.id)
+            .toList()
+          ..sort();
     expect(
       (snapshot['stations'] as List<dynamic>)
           .map((dynamic s) => (s as Map<String, dynamic>)['station_id'])
@@ -274,8 +271,7 @@ void main() {
     expect(
       (snapshot['stations'] as List<dynamic>).every(
         (dynamic s) =>
-            ((s as Map<String, dynamic>)['subscribers_by_team'] as Map)
-                .isEmpty,
+            ((s as Map<String, dynamic>)['subscribers_by_team'] as Map).isEmpty,
       ),
       isTrue,
       reason: '没有插件成功订阅 ⇒ 没有团队分组',

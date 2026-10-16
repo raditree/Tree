@@ -13,7 +13,7 @@ import 'package:tree_core/tree_core.dart';
 /// **每次交互携带的信封**（消息 scope）与**订阅声明**，只在投递时用于匹配订阅者。
 ///
 /// 这个文件锁住六条语义：
-/// 1. **就位**：27 个内置点位一次建齐（广播 10 + 执行 10 + 中转 7），id = 点位常量；
+/// 1. **就位**：28 个内置点位一次建齐（广播 10 + 执行 11 + 中转 7），id = 点位常量；
 /// 2. **与 team / agent 无关**：站点数不随团队或 agent 数量变化；
 /// 3. **幂等**：重复调用不产生重复实例，也不重复落盘；
 /// 4. **持久化**：第二次启动从 stations.yaml 恢复，数量与 id 不变、不再新建；
@@ -47,23 +47,20 @@ void main() {
       hub.stationList().map((StationInstance s) => s.id).toList();
 
   /// 预建点位（= 除收集站外的全部内置点位，按 id 字典序：`stationList()` 的输出顺序）。
-  List<String> expectedPrebuilt() => StationPoints.all
-      .where((StationPointSpec spec) => spec.kind != StationKind.collect)
-      .map((StationPointSpec spec) => spec.id)
-      .toList()
-    ..sort();
+  List<String> expectedPrebuilt() =>
+      StationPoints.all
+          .where((StationPointSpec spec) => spec.kind != StationKind.collect)
+          .map((StationPointSpec spec) => spec.id)
+          .toList()
+        ..sort();
 
-  test('空存储：27 个内置点位一次建齐，id 是点位常量（不含 team / mode）', () {
+  test('空存储：28 个内置点位一次建齐，id 是点位常量（不含 team / mode）', () {
     final StationHub hub = StationHub(storePath: storePath);
     expect(hub.stationList(), isEmpty, reason: '预建之前确实是空的（懒创建的世界）');
 
     final List<String> created = hub.ensureBuiltinStations();
 
-    expect(
-      created,
-      hasLength(27),
-      reason: '广播 10 + 执行 10 + 中转 7；每个点位是一个独立实例',
-    );
+    expect(created, hasLength(28), reason: '广播 10 + 执行 11 + 中转 7；每个点位是一个独立实例');
     // stationList() 按 id 字典序（输出稳定）
     expect(idsOf(hub), expectedPrebuilt());
     for (final StationInstance station in hub.stationList()) {
@@ -74,17 +71,15 @@ void main() {
         reason: '点位 id 不含 team×mode 后缀（点位化的核心）',
       );
     }
-    // 每个**点位**都是一条独立实例：按类型数是 10 / 10 / 7（不是四种类型各一个）
+    // 每个**点位**都是一条独立实例：按类型数是 10 / 11 / 7（不是四种类型各一个）
     expect(hub.stationList().whereType<BroadcastStation>(), hasLength(10));
-    expect(hub.stationList().whereType<ExecuteStation>(), hasLength(10));
+    expect(hub.stationList().whereType<ExecuteStation>(), hasLength(11));
     expect(hub.stationList().whereType<RelayStation>(), hasLength(7));
 
     // 面板快照口径（前端卡片直接渲染这几个字段）：中文名 / 内置 / 订阅数 / 分组
-    final Map<String, dynamic> described = hub
-        .snapshot()
-        .firstWhere(
-          (Map<String, dynamic> s) => s['station_id'] == StationHubIds.broadcast,
-        );
+    final Map<String, dynamic> described = hub.snapshot().firstWhere(
+      (Map<String, dynamic> s) => s['station_id'] == StationHubIds.broadcast,
+    );
     expect(described['kind'], 'broadcast');
     expect(described['kind_label'], '广播站');
     expect(described['builtin'], isTrue);
@@ -96,7 +91,7 @@ void main() {
     final StationHub hub = StationHub(storePath: storePath);
     hub.ensureBuiltinStations();
     final List<String> baseline = idsOf(hub);
-    expect(baseline, hasLength(27));
+    expect(baseline, hasLength(28));
 
     // 模拟"团队变多 / 新 agent 出现"：这些在收敛后**不再**是站点的输入。
     // 反复调用预建（核心在启动接线处与任何补建点都可能调）必须一字不变。
@@ -115,7 +110,7 @@ void main() {
       isEmpty,
       reason: '没有接入点就没有输入格式，空 schema 的收集站没有意义',
     );
-    expect(idsOf(hub), hasLength(27));
+    expect(idsOf(hub), hasLength(28));
 
     // 接入点需要时现建（「插件定义 tool」的首个接入点），预建不会碰它
     final CollectStation collect = hub.toolDefineStationFor()!;
@@ -124,7 +119,7 @@ void main() {
     // 再来一次拿到的必须是同一个实例（全局唯一），而不是又建一个
     expect(hub.toolDefineStationFor(), same(collect));
     expect(hub.ensureBuiltinStations(), isEmpty);
-    expect(idsOf(hub), hasLength(28));
+    expect(idsOf(hub), hasLength(29));
     expect(hub.stationList().whereType<CollectStation>().single.id, collect.id);
   });
 
@@ -132,7 +127,7 @@ void main() {
     final _CountingStationStore counting = _CountingStationStore(storePath);
     final StationHub hub = StationHub(storePath: storePath, store: counting);
 
-    expect(hub.ensureBuiltinStations(), hasLength(27));
+    expect(hub.ensureBuiltinStations(), hasLength(28));
     expect(counting.saves, 1, reason: '一批预建合并成一次落盘（不是每站一次）');
     final String after = File(storePath).readAsStringSync();
 
@@ -140,7 +135,7 @@ void main() {
     expect(hub.ensureBuiltinStations(), isEmpty);
     expect(hub.ensureBuiltinStations(), isEmpty);
     expect(counting.saves, 1);
-    expect(idsOf(hub), hasLength(27), reason: '不产生重复实例');
+    expect(idsOf(hub), hasLength(28), reason: '不产生重复实例');
     expect(File(storePath).readAsStringSync(), after, reason: '磁盘内容一字不差');
   });
 
@@ -155,8 +150,8 @@ void main() {
     );
 
     final List<String> created = hub.ensureBuiltinStations();
-    // 预建按**点位表顺序**（广播 10 → 执行 10 → 中转 7）：通用主题点位已存在 ⇒
-    // 本轮只新建其余 26 个点位（已存在的既不新建也不覆盖）
+    // 预建按**点位表顺序**（广播 10 → 执行 11 → 中转 7）：通用主题点位已存在 ⇒
+    // 本轮只新建其余 27 个点位（已存在的既不新建也不覆盖）
     expect(
       created,
       StationPoints.all
@@ -167,9 +162,9 @@ void main() {
           )
           .map((StationPointSpec spec) => spec.id)
           .toList(),
-      reason: '广播站·通用主题已存在 ⇒ 只补其余 26 个点位',
+      reason: '广播站·通用主题已存在 ⇒ 只补其余 27 个点位',
     );
-    expect(created, hasLength(26));
+    expect(created, hasLength(27));
     expect(hub.station(broadcast.id), same(broadcast));
     expect(hub.station(broadcast.id)!.subscribers, hasLength(1));
     // 订阅者的 team 视角由一个全局站承载（面板据此分组）
@@ -180,7 +175,7 @@ void main() {
 
   test('持久化：第二次启动从 stations.yaml 恢复，数量与 id 不变且不再新建', () {
     final StationHub first = StationHub(storePath: storePath);
-    expect(first.ensureBuiltinStations(), hasLength(27));
+    expect(first.ensureBuiltinStations(), hasLength(28));
     final List<String> baseline = idsOf(first);
     expect(File(storePath).existsSync(), isTrue, reason: '内置站必须落盘');
 
@@ -190,11 +185,7 @@ void main() {
     second.load();
     expect(idsOf(second), baseline, reason: '从盘恢复的实例一字不差');
 
-    expect(
-      second.ensureBuiltinStations(),
-      isEmpty,
-      reason: '恢复完就没有可建的了',
-    );
+    expect(second.ensureBuiltinStations(), isEmpty, reason: '恢复完就没有可建的了');
     expect(counting.saves, 0, reason: '一个都没新建 ⇒ 一次盘都不写');
     expect(idsOf(second), baseline);
     expect(second.stationList().whereType<CollectStation>(), isEmpty);
@@ -286,11 +277,9 @@ stations:
         hub.station(StationHubIds.broadcast)! as BroadcastStation;
     expect(broadcast.subscribers, hasLength(2));
     expect(broadcast.subscribersByTeam().keys, <String>['team-1']);
-    expect(
-      broadcast.subscribersByTeam()['team-1']!['plugin_ids'],
-      <String>['sample'],
-      reason: '同期同插件的订阅者按 team 归到一处',
-    );
+    expect(broadcast.subscribersByTeam()['team-1']!['plugin_ids'], <String>[
+      'sample',
+    ], reason: '同期同插件的订阅者按 team 归到一处');
     // created_at 取最小（跨迁移保留"资历"）
     expect(broadcast.createdAt, 90);
     // 公告板：合并后 board_seq 取最大水位
@@ -307,10 +296,10 @@ stations:
         .whereType<RelayStation>()
         .toList();
     expect(relays, hasLength(2));
-    expect(
-      relays.map((RelayStation r) => r.id).toSet(),
-      <String>{StationHubIds.relayToolPre, StationHubIds.relayToolPost},
-    );
+    expect(relays.map((RelayStation r) => r.id).toSet(), <String>{
+      StationHubIds.relayToolPre,
+      StationHubIds.relayToolPost,
+    });
     expect(relays.every((RelayStation r) => r.createdAt == 60), isTrue);
     // **旧中转站的订阅复制到两个点位**（原订阅者照样 pre / post 都收到）
     for (final RelayStation relay in relays) {
@@ -364,15 +353,11 @@ stations:
     final StationHub hub = StationHub(storePath: storePath, store: counting);
     hub.load();
 
-    expect(
-      idsOf(hub),
-      <String>[
-        // 字典序：tool.post < tool.pre
-        StationHubIds.relayToolPost,
-        StationHubIds.relayToolPre,
-      ],
-      reason: '退役中转站拆成两个点位；退役执行站无订阅可迁 ⇒ 丢弃',
-    );
+    expect(idsOf(hub), <String>[
+      // 字典序：tool.post < tool.pre
+      StationHubIds.relayToolPost,
+      StationHubIds.relayToolPre,
+    ], reason: '退役中转站拆成两个点位；退役执行站无订阅可迁 ⇒ 丢弃');
     expect(counting.saves, 1, reason: '迁移结果立刻写回一次');
 
     // **旧订阅复制到两处**：原订阅者行为等价（照样 pre / post 都收到），

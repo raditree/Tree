@@ -96,7 +96,12 @@ abstract final class StationHubIds {
   /// 执行站·文件操作族：`fs.read` / `fs.write` / `fs.list` / `fs.grep`。
   static const String executeFs = 'system.execute.fs';
 
-  /// 执行站·终端族：`terminal.exec`。
+  /// 执行站·终端族：`terminal.exec` + `terminal.listRuns` / `stopRun` / `log`。
+  ///
+  /// 20261015-hot-restart 阶段 6（A 级点位批）扩后三条：后台（hook）任务的台账与
+  /// 任务表已经在核心里跨重启存活，`exec` 的 `hook_action=status` 也早就存在——但那是
+  /// **写给模型看的散文**。要做转发/看护的插件要的是行（task_id / 退出码 / 日志路径 /
+  /// 远端 pid），而工具族的 `tool.close` 只按 handle 关一次运行、拿不到这些读数。
   static const String executeTerminal = 'system.execute.terminal';
 
   /// 执行站·Agent 族：`agent.message` / `agent.stop` / `agent.compact`。
@@ -137,6 +142,15 @@ abstract final class StationHubIds {
   /// team 可见**（别人的站里写着别人的 topic 与配置）；本族只读，接管权易手仍然
   /// 只走 `station/subscribe` 那一条（不在这里开第二条口子）。
   static const String executeStation = 'system.execute.station';
+
+  /// 执行站·用量族：`usage.query`（按会话取逐调用用量账本；阶段 6 新增）。
+  ///
+  /// 这一族存在的理由是**读取范围**：`<会话目录>/usage.jsonl` 在数据根下，而插件的
+  /// `fs.read` 只在工作空间作用域内——它永远够不到那一份账（压缩中转载荷里那
+  /// 「最近 N 行」只服务压缩，不是一个可以按会话主动问的读口）。计费/预算类插件
+  /// 需要它，而核心只是把已有的容错读取递出去：只读一个会话、只读尾部、行形状与
+  /// `UsageCall.toJson()` 逐字一致（不在别处再拼一套键）。
+  static const String executeUsage = 'system.execute.usage';
 
   // ── 中转站（拦截-回填；每个点位各自唯一订阅者） ──────────────────────────
 
@@ -215,6 +229,7 @@ abstract final class StationHubIds {
     executeSsh,
     executePlugin,
     executeStation,
+    executeUsage,
     relayToolPre,
     relayToolPost,
     relayLlmHandle,

@@ -235,13 +235,35 @@ abstract final class StationPoints {
       id: StationHubIds.executeTerminal,
       kind: StationKind.execute,
       label: '终端执行',
-      description: '执行站·终端族：terminal.exec（含后台任务 hook 模式）',
+      description:
+          '执行站·终端族：terminal.exec（含后台任务 hook 模式）+ 后台任务的'
+          '结构化问口与控口（terminal.listRuns / stopRun / log）',
       alias: 'terminal',
       readme:
-          '终端族（terminal.exec）：在目标 agent 的工作空间执行命令，前台等结果或以 hook 模式转后台任务。'
+          '终端族（terminal.exec / terminal.listRuns / terminal.stopRun / terminal.log）：'
+          'exec 在目标 agent 的工作空间执行命令，前台等结果或以 hook 模式转后台任务；'
           '它与内置工具走同一条执行链，所以长任务同样会收到超时广播（广播站 tool.timeout），'
-          '也可以用工具族的 `tool.close` 显式关闭。执行站不可订阅，只能下命令。',
-      commands: <String>['terminal.exec'],
+          '也可以用工具族的 `tool.close` 显式关闭。后三条是给后台（hook）任务的'
+          '**结构化读口与控口**：`exec` 的 `hook_action=status` 回的是给人看的文案，'
+          '而转发型插件要的是行（task_id / 状态 / 退出码 / 日志路径 / 远端 pid）。'
+          '触发时机：插件调 `station/command` 时（执行站不可订阅）。'
+          '回包口径：`listRuns` 回 `{agent_id, total, count, runs:[{task_id, command, '
+          'session_id, running, exit_code, elapsed_seconds, started_at, log_relative, '
+          'remote, detached, cancelled, pid, fail_streak}]}`；`stopRun` 收 `task_id` 并回 '
+          '`{task_id, requested, running, exit_code}`（`requested=false` 必带 `reason`，'
+          '远端杀不掉就如实说杀不掉）；`log` 收 `task_id`（可选 `tail_chars`）回'
+          '`{task_id, log_relative, remote_log, tail: true, text}`——text 是**尾部**。'
+          '限制：① 只看/只动**目标 agent 自己**的任务（四元组隔离，任务表是全进程一份，'
+          '不按 agent 过滤就等于泄别人的命令）；② `exit_code` / `pid` 拿不到时写 null '
+          '而不省略键（省略就分不出“已结束正常退出码 0”与“根本没读到”）；'
+          '③ 终止**不保证成功**：会话失联转的、远端没拿到 pid 的都杀不掉；'
+          '④ 日志读取上限由核心的 `maxTailChars` 量级决定，超出部分不递（尾部口径）。',
+      commands: <String>[
+        'terminal.exec',
+        'terminal.listRuns',
+        'terminal.stopRun',
+        'terminal.log',
+      ],
     ),
     StationPointSpec(
       id: StationHubIds.executeAgent,
@@ -365,10 +387,35 @@ abstract final class StationPoints {
           '`station.state` 收 `arguments.station_id`（也接受订阅时那套别名，如 '
           '`llm.handle`）并按可见性**整份**递 describe（含公告板与配置）。'
           '限制：① 内置点位对任何 team 可见（它们是系统接口），**插件自建站只对订阅者'
-          '所在 team 可见**，跳 team 一律拒并说明原因；② 本族**只读**——接管权易手只走 '
+          '所在 team 可见**，跨 team 一律拒并说明原因；② 本族**只读**——接管权易手只走 '
           '`station/subscribe` 那一条（那里已有 replace 与唯一订阅者规则），这里不开第二条路；'
           '③ team 证明不了就拒（fail-closed，与 plugin 族控制面同口径）。',
       commands: <String>['station.list', 'station.state'],
+    ),
+    StationPointSpec(
+      id: StationHubIds.executeUsage,
+      kind: StationKind.execute,
+      label: '用量查询',
+      description: '执行站·用量族：usage.query（按会话取逐调用用量账本）',
+      alias: 'usage',
+      readme:
+          '用量族（usage.query）：回答「这个会话的 token 花在哪一类调用上」。'
+          '它存在的理由是**读取范围**：逐调用用量落在数据根下的 `<会话目录>/usage.jsonl`，'
+          '而插件的 `fs.read` 只在工作空间作用域内——永远够不到那一份账。核心能同时'
+          '够到两端，所以这里开一个只问不做的口（计费/预算类插件的地基）。'
+          '触发时机：插件调 `station/command` 时。'
+          '回包口径：`{agent_id, session_id, usage_file, count, skipped, calls:[…], '
+          'summary:{calls, prompt_tokens, completion_tokens, cached_tokens, by_source}}`；'
+          '`calls` 的行形状与 `usage.jsonl` **逐字一致**（`UsageCall.toJson()` 是字段表的'
+          '唯一出处，不在别处另拼一份键），`summary` 是核心已经算好的聚合（插件不必'
+          '自己重算也不会算出两套）。会话口径与其他命令同一条：`session_id` 参数 → '
+          '站点 scope → 默认会话，回包 **echo 生效值**。'
+          '限制：① 一次只查**一个会话**（账本本来就是按会话分文件，跨会话聚合请自己'
+          '逐会话问，免得一不小心把整库读走）；② 只读**尾部**（账本随会话增长，'
+          '上限与面板同源），`skipped` 是读不到/坏行的行数；③ `estimated=true` 的行'
+          '是本地估算值，**不得当计费依据**（这个标记本来就是为了区分端点真值）；'
+          '④ 文件不存在回空账本而不报错（老会话本来就没有它），但不假装读过。',
+      commands: <String>['usage.query'],
     ),
   ];
 

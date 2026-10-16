@@ -267,24 +267,20 @@ void main() {
     expect(byScope.actionOf('alpha')!.reason, contains('scope'));
     expect(startCount('alpha'), 3);
     expect(subscribedStations(bus, 'alpha'), <String>[StationHubIds.collect]);
-    final Map<String, dynamic> collectStation = (bus.snapshot()['stations'] as List<dynamic>)
-        .firstWhere(
+    final Map<String, dynamic> collectStation =
+        (bus.snapshot()['stations'] as List<dynamic>).firstWhere(
           (dynamic s) => (s as Map<String, dynamic>)['kind'] == 'collect',
         ) as Map<String, dynamic>;
-    expect(
-      collectStation['subscribers_by_team'],
-      <String, dynamic>{
-        'team-2': <String, dynamic>{
-          'count': 1,
-          'plugin_ids': <String>['alpha'],
-        },
+    expect(collectStation['subscribers_by_team'], <String, dynamic>{
+      'team-2': <String, dynamic>{
+        'count': 1,
+        'plugin_ids': <String>['alpha'],
       },
-      reason: '团队归属在订阅声明上：重启后只剩 team-2 这一条（旧订阅已注销）',
-    );
+    }, reason: '团队归属在订阅声明上：重启后只剩 team-2 这一条（旧订阅已注销）');
     expect(
       bus.snapshot()['stations'],
-      hasLength(28),
-      reason: '收集站全局唯一：换团队不产生新站；快照恒为 27 个内置点位 + 收集站',
+      hasLength(29),
+      reason: '收集站全局唯一：换团队不产生新站；快照恒为 28 个内置点位 + 收集站',
     );
   });
 

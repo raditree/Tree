@@ -22,16 +22,18 @@ void main() {
   // 起一个核心（可注入执行站要用的后台任务管理器）：多次调用会**替换**同一批
   // mountId 的挂载位置（ExecuteStation.mount 幂等），因此用例可以拿第二个核心
   // 验证「注入 hooks」的分支。
-  Future<CoreServer> boot({TerminalHooks? stationHooks}) => CoreServer.start(
-    store: store,
-    pluginBus: bus,
-    specIoFor: (String agentId) async =>
-        agentId == agent.id ? LocalWorkspaceIO(workspace) : null,
-    enableHeartbeat: false,
-    streamChunkDelay: Duration.zero,
-    engine: ScriptedAgent(chunkDelay: Duration.zero),
-    stationHooks: stationHooks,
-  );
+  Future<CoreServer> boot({TerminalHooks? stationHooks, UsageLog? usageLog}) =>
+      CoreServer.start(
+        store: store,
+        pluginBus: bus,
+        usageLog: usageLog,
+        specIoFor: (String agentId) async =>
+            agentId == agent.id ? LocalWorkspaceIO(workspace) : null,
+        enableHeartbeat: false,
+        streamChunkDelay: Duration.zero,
+        engine: ScriptedAgent(chunkDelay: Duration.zero),
+        stationHooks: stationHooks,
+      );
 
   setUp(() async {
     temp = Directory.systemTemp.createTempSync('tree_station_wire_');
@@ -66,7 +68,7 @@ void main() {
     }
   });
 
-  /// **命令 → 所属执行站点位**（点位化：执行站按命令族拆成 9 个实例，命令只落在
+  /// **命令 → 所属执行站点位**（点位化：执行站按命令族拆成 11 个实例，命令只落在
   /// 自己那一族；`executeForCommand` 就是核心 `station/command` 的分发依据）。
   ///
   /// 站点与 mode 无关：local / ssh 是**命令 scope** 的取值，不是站点身份。
@@ -74,7 +76,7 @@ void main() {
       bus.stations.station(StationPoints.ownerOfCommand(command)!.id)!
           as ExecuteStation;
 
-  test('核心启动即把二十条命令挂到各自的点位（不再返回「暂无挂载位置」）', () {
+  test('核心启动即把二十六条命令挂到各自的点位（不再返回「暂无挂载位置」）', () {
     for (final StationPointSpec spec in StationPoints.executes) {
       expect(
         bus.stations
@@ -86,11 +88,11 @@ void main() {
         reason: '点位 ${spec.id} 只挂自己那族的命令（命令族之间互不干扰）',
       );
     }
-    // 全命令并集 = 二十条（fs 4 + terminal 1 + agent 3 + ui 1 + llm 1 + tool 2 +
-    // session 1 + ssh 1 + plugin 6）；`llm.call` / `tool.call` / `tool.close` / `session.rename` /
-    // `ssh.reconnect` 也被各自点位接管，只是落到「尚无挂载实现」的显式失败
+    // 全命令并集 = 二十六条（fs 4 + terminal 4 + agent 3 + ui 1 + llm 1 + tool 2 +
+    // session 1 + ssh 1 + plugin 6 + station 2 + usage 1）；`llm.call` / `tool.call` / `tool.close` /
+    // `session.rename` / `ssh.reconnect` 也被各自点位接管，只是落到「尚无挂载实现」的显式失败
     // （不是「暂无挂载位置」）。
-    expect(ExecuteStation.builtinCommands, hasLength(22));
+    expect(ExecuteStation.builtinCommands, hasLength(26));
   });
 
   test('运行期四元组：team 取 agent 归属、mode_key 取工作空间模式', () {
@@ -201,18 +203,19 @@ void main() {
 
   // ── 内置点位「启动即存在」（懒创建 ⇒ 用户实机看到「站点（0）」） ──
 
-  test('核心启动即建齐 27 个内置点位（**每个接入点一个实例，与 team / mode 无关**）', () {
-    final List<String> expected = StationPoints.all
-        .where((StationPointSpec spec) => spec.kind != StationKind.collect)
-        .map((StationPointSpec spec) => spec.id)
-        .toList()
-      ..sort();
+  test('核心启动即建齐 28 个内置点位（**每个接入点一个实例，与 team / mode 无关**）', () {
+    final List<String> expected =
+        StationPoints.all
+            .where((StationPointSpec spec) => spec.kind != StationKind.collect)
+            .map((StationPointSpec spec) => spec.id)
+            .toList()
+          ..sort();
     expect(
       bus.stations.stationList().map((StationInstance s) => s.id).toList(),
       expected,
-      reason: '广播 10 + 执行 10 + 中转 7 = 27：每个点位一个独立实例，id 不含 team / mode',
+      reason: '广播 10 + 执行 11 + 中转 7 = 28：每个点位一个独立实例，id 不含 team / mode',
     );
-    expect(bus.stations.stationList(), hasLength(27));
+    expect(bus.stations.stationList(), hasLength(28));
     expect(
       bus.stations.stationList().whereType<CollectStation>(),
       isEmpty,
@@ -234,7 +237,7 @@ void main() {
   });
 
   test('站点数不随工作空间模式 / 重启变化（team×mode 不再产生新实例）', () async {
-    expect(bus.stations.stationList(), hasLength(27));
+    expect(bus.stations.stationList(), hasLength(28));
 
     // 同一团队里出现 SSH 工作面的 agent：**不再**多出站点（点位化的核心）。
     // mode 仍是有意义的隔离维度，但它属于消息 scope，不属于站点身份。
@@ -244,7 +247,7 @@ void main() {
     addTearDown(second.close);
     expect(
       bus.stations.stationList(),
-      hasLength(27),
+      hasLength(28),
       reason: 'local / ssh 是同一个点位的两种工作面，不各自建站',
     );
 
@@ -277,7 +280,7 @@ void main() {
           .map((StationInstance s) => s.id)
           .toList(),
       builtinIds,
-      reason: '第二次启动从盘恢复：数量与 id 都不变（27 个内置点位不重复建）',
+      reason: '第二次启动从盘恢复：数量与 id 都不变（28 个内置点位不重复建）',
     );
   });
 
@@ -375,5 +378,92 @@ void main() {
     await second.close();
     expect(shared.task(task.id), isNotNull, reason: 'close 不得清空外部注入的实例');
     expect(shared.tasks, hasLength(1));
+  });
+
+  test('生产接线：usage.query 经执行站读到真实账本（聚合一处只算一份）', () async {
+    final TreePaths paths = TreePaths(p.join(temp.path, 'data-root'));
+    final UsageLog ledger = UsageLog(paths);
+    final CoreServer second = await boot(usageLog: ledger);
+    addTearDown(second.close);
+
+    // 走**生产同一条落盘路径**记三笔：会话 ses_1 两笔（其中一笔端点没给缓存读数）
+    // + 会话 ses_2 一笔（它不该出现在 ses_1 的回包里）
+    ledger.record(
+      agent.id,
+      'ses_1',
+      UsageCall(
+        at: DateTime(2026, 10, 16, 10),
+        source: UsageSource.turn,
+        model: 'demo',
+        promptTokens: 1000,
+        cachedTokens: 400,
+        completionTokens: 50,
+      ),
+    );
+    ledger.record(
+      agent.id,
+      'ses_1',
+      UsageCall(
+        at: DateTime(2026, 10, 16, 11),
+        source: UsageSource.compact,
+        model: 'demo',
+        promptTokens: 300,
+        completionTokens: 30,
+      ),
+    );
+    ledger.record(
+      agent.id,
+      'ses_2',
+      UsageCall(
+        at: DateTime(2026, 10, 16, 12),
+        source: UsageSource.llmCall,
+        model: 'demo',
+        promptTokens: 200,
+        completionTokens: 20,
+        estimated: true,
+      ),
+    );
+    await ledger.flush();
+
+    final StationCommandResult result = await station('usage.query').execute(
+      command: 'usage.query',
+      scope: bus.runtimeScopeFor(agentId: agent.id, sessionId: 'ses_1'),
+      arguments: <String, dynamic>{'agent_id': agent.id},
+    );
+    expect(result.ok, isTrue, reason: result.error);
+    final Map<String, dynamic> body = result.payload! as Map<String, dynamic>;
+    expect(body['session_id'], 'ses_1', reason: 'scope 的会话就是生效会话（回包 echo）');
+    expect(body['usage_file'], paths.usageFile(agent.id, 'ses_1'));
+    expect(body['count'], 2, reason: '账本按会话分文件：别的会话那一笔不许混进来');
+    expect(
+      body['tail_bytes'],
+      UsageLog.defaultTailBytes,
+      reason: '没给就用默认上限，并把生效值回出去',
+    );
+    final List<dynamic> calls = body['calls'] as List<dynamic>;
+    // 行形状与 UsageCall.toJson() **逐字一致**（字段表只有一处出处）
+    expect((calls.first as Map<String, dynamic>).keys.toList(), <String>[
+      'at',
+      'source',
+      'model',
+      'prompt_tokens',
+      'cached_tokens',
+      'completion_tokens',
+      'estimated',
+      'duration_ms',
+    ]);
+    final Map<String, dynamic> summary =
+        body['summary'] as Map<String, dynamic>;
+    expect(summary['prompt_tokens'], 1300);
+    expect(summary['completion_tokens'], 80);
+    expect(
+      summary['cached_tokens'],
+      400,
+      reason: '只有一笔给了缓存读数：另一笔不许被编成 0（与账本那一列同口径）',
+    );
+    expect((summary['by_source'] as Map).keys.toSet(), <String>{
+      UsageSource.turn,
+      UsageSource.compact,
+    });
   });
 }

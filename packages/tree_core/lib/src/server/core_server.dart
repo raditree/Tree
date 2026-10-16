@@ -726,6 +726,9 @@ class CoreServer {
       // 点位已接管、自建站归谁，这些事实只在总线的站点表里。这里不另取一份，
       // 否则面板与插件看到的就是两套拓扑。
       topologyQuery: bus.handleStationQuery,
+      // `usage.query`（阶段 6：逐调用用量账本）：账本在**数据根**下，只有存储层那
+      // 一份路径规则能读到它（插件的 `fs.read` 只在工作空间作用域内）。
+      usageQuerier: _stationUsageQuery,
       log: (String message) => errorLog?.call('[core:station] $message'),
     );
     _stationMounts = mounts;
@@ -927,6 +930,98 @@ class CoreServer {
       'ok': false,
       if (outcome.notSsh) 'not_ssh': true,
       'error': outcome.reason,
+    };
+  }
+
+  /// 执行站 `usage.query`：读一个会话的**逐调用用量账本**并算好聚合（阶段 6）。
+  ///
+  /// 实现放核心而不是挂载位置：账本在数据根下的会话目录里，路径布局与容错读取
+  /// 的出处只有 [TreePaths] + [UsageLog.read] 一份；`calls` 原样递
+  /// [UsageCall.toJson]（字段表的唯一出处，不在插件层另拼一套键），聚合也在这里算——
+  /// 算两份就与面板上那份漂。
+  ///
+  /// 口径：① 文件不存在 ⇒ **空账本**而不是错（老会话本来就没有它）；② 只读尾部
+  /// （[tailBytes] `<= 0` 用 [UsageLog.defaultTailBytes]，与面板同源）；③ 端点没给
+  /// `cached_tokens` 时汇总写 **null** 不编造 0（与账本里那一列同口径）。
+  Future<Map<String, dynamic>> _stationUsageQuery({
+    required String agentId,
+    required String sessionId,
+    int tailBytes = 0,
+  }) async {
+    final UsageLog? ledger = usageLog;
+    if (ledger == null) {
+      return <String, dynamic>{
+        'ok': false,
+        'error':
+            'usage.query 未接线：核心没有接入用量账本（usageLog 未注入），'
+            '没有东西可以读',
+      };
+    }
+    final TreePaths paths = ledger.paths;
+    final String file;
+    try {
+      file = paths.usageFile(agentId, sessionId);
+    } catch (error) {
+      // id 过不了 safeSegment：这不是“没账”，是“读不了”——如实分开，不回空账本
+      return <String, dynamic>{
+        'ok': false,
+        'error':
+            'usage.query 的目标 id 不合法（agent=$agentId / 会话=$sessionId）：$error',
+      };
+    }
+    final UsageHistory history = await UsageLog.read(
+      paths,
+      agentId,
+      sessionId,
+      tailBytes: tailBytes > 0 ? tailBytes : UsageLog.defaultTailBytes,
+    );
+    int prompt = 0;
+    int completion = 0;
+    int cached = 0;
+    bool anyCached = false;
+    final Map<String, Map<String, int>> bySource = <String, Map<String, int>>{};
+    for (final UsageCall call in history.calls) {
+      prompt += call.promptTokens;
+      completion += call.completionTokens;
+      final int? hit = call.cachedTokens;
+      if (hit != null) {
+        anyCached = true;
+        cached += hit;
+      }
+      // 分组键就是 `UsageSource` 那四类（账本自己写的）：不在此处再造第五类
+      final Map<String, int> row = bySource.putIfAbsent(
+        call.source,
+        () => <String, int>{
+          'calls': 0,
+          'prompt_tokens': 0,
+          'completion_tokens': 0,
+        },
+      );
+      row['calls'] = row['calls']! + 1;
+      row['prompt_tokens'] = row['prompt_tokens']! + call.promptTokens;
+      row['completion_tokens'] =
+          row['completion_tokens']! + call.completionTokens;
+    }
+    return <String, dynamic>{
+      'ok': true,
+      'agent_id': agentId,
+      'session_id': sessionId,
+      // 路径只作排障（与压缩中转载荷里的 `usage_file` 同一个口径）：插件据此向
+      // 用户解释“这笔账在哪”，但它自己读不到那个目录。
+      'usage_file': file,
+      'count': history.calls.length,
+      'skipped': history.skipped,
+      'tail_bytes': tailBytes > 0 ? tailBytes : UsageLog.defaultTailBytes,
+      'calls': <Map<String, dynamic>>[
+        for (final UsageCall call in history.calls) call.toJson(),
+      ],
+      'summary': <String, dynamic>{
+        'calls': history.calls.length,
+        'prompt_tokens': prompt,
+        'completion_tokens': completion,
+        'cached_tokens': anyCached ? cached : null,
+        'by_source': bySource,
+      },
     };
   }
 

@@ -147,12 +147,14 @@ void main() {
     Map<String, dynamic> arguments = const <String, dynamic>{},
     StationScope? scoped,
     String pluginId = 'sample',
-  }) => wiring.point(command).execute(
-    command: command,
-    scope: scoped ?? scope(),
-    arguments: <String, dynamic>{'agent_id': agent, ...arguments},
-    sourcePluginId: pluginId,
-  );
+  }) => wiring
+      .point(command)
+      .execute(
+        command: command,
+        scope: scoped ?? scope(),
+        arguments: <String, dynamic>{'agent_id': agent, ...arguments},
+        sourcePluginId: pluginId,
+      );
 
   test('九条命令各自挂到自己的点位（ui.push 由站点中枢挂载）', () {
     final _Wiring wired = wiring(mounts());
@@ -567,6 +569,246 @@ void main() {
     final Map<String, dynamic> payload = stop.payload! as Map<String, dynamic>;
     expect(payload['any_running'], isFalse);
     expect(payload['reason'], contains('没有进行中的任务'));
+  });
+
+  // ── 阶段 6：后台任务的结构化读口与控口 + 用量问口 ──────────────────────
+
+  /// 挂着**注入的任务表**的挂载位置（插件下发的 hook 与 agent 自己起的共用一张）。
+  ExecuteStationMounts hookMounts(TerminalHooks hooks) {
+    final ExecuteStationMounts built = ExecuteStationMounts(
+      ioFor: (String agentId) async => LocalWorkspaceIO(workspace),
+      agentTeamOf: (String agentId) => agentId == agent ? team : '',
+      agentModeOf: (String agentId) =>
+          agentId == agent ? StationModeKey.local : '',
+      hooks: hooks,
+    );
+    opened.add(built);
+    return built;
+  }
+
+  /// 直接起一条真后台任务（不走 `terminal.exec`：归属与会话正是本族要钉的东西）。
+  Future<HookTask> startTask(
+    TerminalHooks hooks, {
+    String taskAgent = agent,
+    String sessionId = 'sess-a',
+    String command = 'echo structured',
+  }) => hooks.start(
+    io: LocalWorkspaceIO(workspace),
+    agentId: taskAgent,
+    sessionId: sessionId,
+    command: command,
+  );
+
+  test('terminal.listRuns：回结构化行，且只给目标 agent 的任务', () async {
+    final TerminalHooks shared = TerminalHooks();
+    addTearDown(shared.close);
+    final _Wiring wired = wiring(hookMounts(shared));
+    await startTask(shared, sessionId: 'sess-a', command: 'echo mine-a');
+    await startTask(shared, sessionId: 'sess-b', command: 'echo mine-b');
+    await startTask(shared, taskAgent: 'agt_2', command: 'echo somebody-else');
+
+    final StationCommandResult all = await run(wired, 'terminal.listRuns');
+    expect(all.ok, isTrue, reason: all.error);
+    final Map<String, dynamic> body = all.payload! as Map<String, dynamic>;
+    expect(body['agent_id'], agent);
+    expect(body['total'], 2, reason: '任务表是全进程一份：不按 agent 过滤就等于泄别人的命令');
+    expect(body['count'], 2);
+    expect(body['truncated'], isFalse);
+    final List<dynamic> runs = body['runs'] as List<dynamic>;
+    expect(
+      runs
+          .map((dynamic r) => (r as Map<String, dynamic>)['session_id'])
+          .toSet(),
+      <String>{'sess-a', 'sess-b'},
+    );
+    final List<int> stamps = runs
+        .map((dynamic r) => (r as Map<String, dynamic>)['started_at'] as int)
+        .toList();
+    for (int i = 1; i < stamps.length; i++) {
+      expect(
+        stamps[i - 1] >= stamps[i],
+        isTrue,
+        reason: '新的在前：控制面问的是「现在有什么在跑」',
+      );
+    }
+    final Map<String, dynamic> row = runs.first as Map<String, dynamic>;
+    // 拿不到也写键：省略就分不出「正常退出码 0」与「根本没读到」
+    for (final String key in <String>[
+      'exit_code',
+      'pid',
+      'log_relative',
+      'task_id',
+    ]) {
+      expect(row.containsKey(key), isTrue, reason: key);
+    }
+    expect(row['detached'], isFalse);
+    expect(row['fail_streak'], 0);
+
+    final StationCommandResult limited = await run(
+      wired,
+      'terminal.listRuns',
+      arguments: <String, dynamic>{'limit': 1},
+    );
+    final Map<String, dynamic> one = limited.payload! as Map<String, dynamic>;
+    expect(one['count'], 1);
+    expect(one['total'], 2);
+    expect(one['truncated'], isTrue, reason: '截断必须说出来（不然像“只有这一条”）');
+
+    final StationCommandResult filtered = await run(
+      wired,
+      'terminal.listRuns',
+      arguments: <String, dynamic>{'session_id': 'sess-a'},
+    );
+    final Map<String, dynamic> only = filtered.payload! as Map<String, dynamic>;
+    expect(only['count'], 1);
+    expect(only['session_id'], 'sess-a', reason: '给了才筛；没给就返回该 agent 的全部');
+  });
+
+  test('terminal.stopRun：未知 / 别人的 task_id 显式拒，且不假装杀成功', () async {
+    final TerminalHooks shared = TerminalHooks();
+    addTearDown(shared.close);
+    final _Wiring wired = wiring(hookMounts(shared));
+    final HookTask mine = await startTask(shared, command: 'echo stop-me');
+    final HookTask other = await startTask(
+      shared,
+      taskAgent: 'agt_2',
+      command: 'echo not-yours',
+    );
+
+    // 别人的任务 = 未知：既不中断它，也不告诉发起者它真的存在
+    final StationCommandResult denied = await run(
+      wired,
+      'terminal.stopRun',
+      arguments: <String, dynamic>{'task_id': other.id},
+    );
+    expect(denied.ok, isFalse);
+    expect(denied.error, contains('未知 task_id'));
+    expect(
+      denied.error,
+      isNot(contains('not-yours')),
+      reason: '错误文案里不许漏出别人跑的是什么',
+    );
+    expect(shared.task(other.id)!.cancelled, isFalse);
+
+    final StationCommandResult result = await run(
+      wired,
+      'terminal.stopRun',
+      arguments: <String, dynamic>{'task_id': mine.id},
+    );
+    expect(result.ok, isTrue, reason: result.error);
+    final Map<String, dynamic> body = result.payload! as Map<String, dynamic>;
+    expect(body['task_id'], mine.id);
+    expect(body['requested'], isA<bool>());
+    // 关键口径：`requested=false`（已结束 / 远端没拿到 pid）也**必须带可读 reason**，
+    // 而命令本身仍算跑成了（杀不掉 ≠ 没执行）
+    if (body['requested'] == false) {
+      expect('${body['reason']}', isNotEmpty);
+    }
+
+    final StationCommandResult missing = await run(wired, 'terminal.stopRun');
+    expect(missing.ok, isFalse);
+    expect(missing.error, contains('task_id'));
+  });
+
+  test('terminal.log：读尾部并把生效上限 echo 回去（越界不静默接受）', () async {
+    final TerminalHooks shared = TerminalHooks();
+    addTearDown(shared.close);
+    final _Wiring wired = wiring(hookMounts(shared));
+    final HookTask task = await startTask(shared, command: 'echo tail-me');
+
+    final StationCommandResult result = await run(
+      wired,
+      'terminal.log',
+      arguments: <String, dynamic>{'task_id': task.id, 'tail_chars': 1000000},
+    );
+    expect(result.ok, isTrue, reason: result.error);
+    final Map<String, dynamic> body = result.payload! as Map<String, dynamic>;
+    expect(body['tail'], isTrue, reason: '口径明示：这是尾部不是全文');
+    expect(body['log_relative'], task.logRelative);
+    expect(body['tail_chars'], 4000 * 20, reason: '上限挂在核心自己那份读数上：插件能下调不能上调');
+    expect(body.containsKey('text'), isTrue);
+    if (body['has_content'] != true) {
+      expect('${body['reason']}', contains('还不存在'));
+    }
+
+    final StationCommandResult unknown = await run(
+      wired,
+      'terminal.log',
+      arguments: <String, dynamic>{'task_id': 'hook_does_not_exist'},
+    );
+    expect(unknown.ok, isFalse);
+    expect(unknown.error, contains('未知 task_id'));
+  });
+
+  test('usage.query：参数原样交给核心读口（会话口径 + 上限钳制）', () async {
+    final List<Map<String, Object?>> asked = <Map<String, Object?>>[];
+    final ExecuteStationMounts withUsage = ExecuteStationMounts(
+      ioFor: (String agentId) async => LocalWorkspaceIO(workspace),
+      agentTeamOf: (String agentId) => agentId == agent ? team : '',
+      agentModeOf: (String agentId) =>
+          agentId == agent ? StationModeKey.local : '',
+      usageQuerier:
+          ({
+            required String agentId,
+            required String sessionId,
+            int tailBytes = 0,
+          }) async {
+            asked.add(<String, Object?>{
+              'agent_id': agentId,
+              'session_id': sessionId,
+              'tail_bytes': tailBytes,
+            });
+            if (sessionId == 'boom') {
+              return <String, dynamic>{'ok': false, 'error': '账本读不出：数据根不可用'};
+            }
+            return <String, dynamic>{
+              'ok': true,
+              'session_id': sessionId,
+              'count': 1,
+            };
+          },
+    );
+    opened.add(withUsage);
+    final _Wiring wired = wiring(withUsage);
+
+    final StationCommandResult result = await run(
+      wired,
+      'usage.query',
+      arguments: <String, dynamic>{
+        'session_id': 'sess-x',
+        'tail_bytes': 99999999,
+      },
+    );
+    expect(result.ok, isTrue, reason: result.error);
+    expect(asked.single['agent_id'], agent);
+    expect(asked.single['session_id'], 'sess-x');
+    expect(
+      asked.single['tail_bytes'],
+      2 * 1024 * 1024,
+      reason: '这是一次站点命令不是导库：越界按上限走并把生效值 echo 回去',
+    );
+    expect((result.payload! as Map<String, dynamic>)['session_id'], 'sess-x');
+
+    // 没给会话 ⇒ 与 llm.call / agent.compact 同一条口径（参数 → scope → 默认会话），
+    // 而且回包 echo 的是**生效值**：插件要能知道它读到的是哪个会话的账
+    await run(wired, 'usage.query');
+    expect(asked.last['session_id'], isNotEmpty);
+
+    // 实现给的失败原因必须原样递出去（不压成一句「执行失败」）
+    final StationCommandResult failed = await run(
+      wired,
+      'usage.query',
+      arguments: <String, dynamic>{'session_id': 'boom'},
+    );
+    expect(failed.ok, isFalse);
+    expect(failed.error, contains('账本读不出'));
+  });
+
+  test('未接线：核心没注入用量读口时 usage.query 以「未接线」失败，不假装读过', () async {
+    final _Wiring wired = wiring(mounts());
+    final StationCommandResult result = await run(wired, 'usage.query');
+    expect(result.ok, isFalse);
+    expect(result.error, contains('未接线'));
   });
 }
 
