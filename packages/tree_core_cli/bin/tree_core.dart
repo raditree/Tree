@@ -572,6 +572,10 @@ Future<void> main(List<String> args) async {
     systemPromptStore: systemPrompts,
     mcpService: mcp,
     pluginBus: plugins,
+    // 发布仓库（阶段 5：插件管理只拉 GitHub Release 资产）：这里只给数据根的缓存
+    // 目录，剩下的接线（已装条目读 plugins.yaml / 脚本型解释器探测 / 换文件闸门）
+    // 在核心里做——路径口径归 CLI，行为口径归总线与下载器。
+    pluginReleaseCacheDir: paths.pluginsReleaseDir,
     fileService: files,
     // 核心改 agent yaml（工作目录镜像）前先备份，与团队自愈同约定
     agentBackup: (CoreAgent agent) => backupAgentFile(paths, agent.id),

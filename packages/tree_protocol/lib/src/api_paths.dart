@@ -153,6 +153,27 @@ abstract final class ApiPaths {
   static const String pluginBuiltinDisable =
       '/api/plugin/builtins/{pluginId}/disable';
 
+  /// 发布仓库清单的**只读面**（GET，**不联网**）：读本地缓存的 `plugin-index.json`。
+  ///
+  /// 为什么单独一条而不是“GET 也顺手刷新”：面板打开就要能列出“上次看到的那些”，
+  /// 而那是一个网络动作。把两者分开后，“这次没刷成功、你现在看到的是上一次那份”
+  /// 可以用 `online: false` 显式说出来，而不是离线看起来像最新。
+  static const String pluginRelease = '/api/plugin/release';
+
+  /// 拉最新 release 的发布索引并缓存（POST，**联网**）：成功回清单，失败回可读原因。
+  ///
+  /// 只读 GitHub **Releases 资产**，不 `git clone` 源码：`plugins` 仓里放的是给人改的
+  /// 源码，装机端要的是发布方事先备好的成品（索引就是那张合同）。
+  static const String pluginReleaseRefresh = '/api/plugin/release/refresh';
+
+  /// 从发布仓库装一条插件（POST，`pluginId` 取自索引）。
+  ///
+  /// 一个动作里包含：资产进缓存 → **闸门**（旧进程确认退出才换，不为换文件而强杀）
+  ///  → 复制到临时名 → 原子改名覆盖 `plugins/` → 写出待落盘条目。任一步失败都
+  /// 不碰旧文件，失败原因可读（`{ok:false, error}`）。
+  static const String pluginReleaseInstall =
+      '/api/plugin/release/{pluginId}/install';
+
   /// 单个站点的**详情**（GET）：介绍 + 可订阅上限 + 共享声明 + 自定义配置 +
   /// 订阅者列表（含禁用态）。
   ///
@@ -269,6 +290,9 @@ abstract final class ApiPaths {
     pluginBuiltins,
     pluginBuiltinEnable,
     pluginBuiltinDisable,
+    pluginRelease,
+    pluginReleaseRefresh,
+    pluginReleaseInstall,
     pluginStation,
     pluginStationConfig,
     pluginStationSubscriber,

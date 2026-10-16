@@ -62,6 +62,64 @@ class _Res {
   String get detail => (json['detail'] ?? '').toString();
 }
 
+/// 假的**发布仓库**（不发网络）：形状与 GitHub Releases API 一致。
+///
+/// 为什么整条链要能离线跑（用户 2026-10-16：「plugins 里是插件代码，插件管理只拉
+/// release」）：真正难钉的是“索引是不是那张合同”“字节数不符就不能缓存”“旧文件在
+/// 闸门没开时一字未动”，这些都不需要网络。
+class _Repo {
+  final Map<String, List<int>> assets = <String, List<int>>{};
+  Map<String, dynamic>? release;
+  final List<String> urls = <String>[];
+
+  Future<PluginFetchResult> fetch(
+    Uri url, {
+    Map<String, String>? headers,
+  }) async {
+    urls.add(url.toString());
+    if (url.path.endsWith('/releases/latest')) {
+      final Map<String, dynamic>? meta = release;
+      if (meta == null) {
+        return PluginFetchResult(statusCode: 404, error: 'HTTP 404');
+      }
+      return PluginFetchResult(
+        statusCode: 200,
+        bytes: utf8.encode(jsonEncode(meta)),
+      );
+    }
+    final String name = Uri.decodeComponent(url.pathSegments.last);
+    final List<int>? bytes = assets[name];
+    if (bytes == null) {
+      return PluginFetchResult(statusCode: 404, error: 'HTTP 404');
+    }
+    return PluginFetchResult(statusCode: 200, bytes: bytes);
+  }
+
+  /// 把索引与已在 [assets] 里的每个文件一起挂成这一版 release 的资产。
+  void publish({
+    String tag = 'v0.1.0',
+    required List<Map<String, dynamic>> plugins,
+  }) {
+    assets[kPluginIndexAsset] = utf8.encode(
+      jsonEncode(<String, dynamic>{
+        'schema': kPluginIndexSchema,
+        'plugins': plugins,
+      }),
+    );
+    release = <String, dynamic>{
+      'tag_name': tag,
+      'assets': <Map<String, dynamic>>[
+        for (final MapEntry<String, List<int>> e in assets.entries)
+          <String, dynamic>{
+            'name': e.key,
+            'size': e.value.length,
+            'browser_download_url': 'https://downloads.example/${e.key}',
+          },
+      ],
+    };
+  }
+}
+
 void main() {
   late Directory temp;
   late String script;
@@ -112,9 +170,12 @@ void main() {
   ];
 
   /// 起一个带插件总线的核心（content = 落盘的 plugins.yaml 内容）。
+  ///
+  /// [downloader] = 接上发布仓库（阶段 5）；不传 ⇒ 三个 release 路由回可读 503。
   Future<({CoreServer server, _Client client, PluginBus bus})> serve(
     String content, {
     BuiltinPluginCatalog? builtins,
+    PluginDownloader? downloader,
   }) async {
     final File file = File(configFile);
     file.createSync(recursive: true);
@@ -127,6 +188,7 @@ void main() {
     final CoreServer server = await CoreServer.start(
       pluginBus: bus,
       builtinPlugins: builtins ?? catalog(),
+      pluginDownloader: downloader,
       enableHeartbeat: false,
       streamChunkDelay: Duration.zero,
       engine: ScriptedAgent(chunkDelay: Duration.zero),
@@ -651,5 +713,286 @@ void main() {
     expect(res.status, 503);
     expect(res.detail, contains('插件总线尚未接入核心'));
     expect((await client.send('GET', '/api/plugin/snapshot')).status, 200);
+  });
+
+  // ── 发布仓库的三个路由（阶段 5：只拉 GitHub Release 资产）──────────────
+
+  /// 一条脚本型索引条目（资产 = 那个**真能跑**的假插件源码）。
+  Map<String, dynamic> releaseEntry({
+    String id = 'released',
+    String version = '1.2.0',
+    String target = 'fake_plugin.dart',
+  }) => <String, dynamic>{
+    'id': id,
+    'name': '发布版假插件',
+    'version': version,
+    'runtime': 'python',
+    'command': target,
+    'files': <Map<String, dynamic>>[
+      <String, dynamic>{'asset': target, 'target': target},
+    ],
+    'suspension': PluginSuspension.keep,
+    'granularity': 'team',
+    'scope': <String, dynamic>{},
+  };
+
+  /// 指向临时目录的下载器（安装目标 = 临时 plugins/，与内置项查找路径同源）。
+  PluginDownloader releaseDownloader(_Repo repo) => PluginDownloader(
+    cacheDir: p.join(temp.path, 'plugins_release'),
+    installDir: pluginDir,
+    fetcher: repo.fetch,
+    nonce: () => 'api',
+    // 脚本型的解释器：用真 dart 可执行文件扮 python（资产内容是那个假插件源码）
+    runtimeResolver: () async => BuiltinRuntime(Platform.resolvedExecutable),
+  );
+
+  test('没接下载器：三个 release 路由都回 503 + 可读原因（不默默空转）', () async {
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve('enabled: true\nplugins: []\n');
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+    final _Res list = await ctx.client.send('GET', '/api/plugin/release');
+    expect(list.status, 503);
+    expect(list.detail, contains('没接发布仓库下载器'));
+    expect(
+      (await ctx.client.send('POST', '/api/plugin/release/refresh')).status,
+      503,
+    );
+    final _Res install = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/released/install',
+    );
+    expect(install.status, 503);
+  });
+
+  test('GET /api/plugin/release：只读本地缓存 ⇒ 一个 URL 都不碰', () async {
+    final _Repo repo = _Repo();
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve(
+          'enabled: true\nplugins: []\n',
+          downloader: releaseDownloader(repo),
+        );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+    final _Res res = await ctx.client.send('GET', '/api/plugin/release');
+    expect(res.status, 200, reason: '读列表不是网络动作 ⇒ 不因“没缓存”而 4xx');
+    expect(res.json['ok'], isFalse);
+    expect(res.json['error'], contains('请先点「刷新」'));
+    expect(
+      (res.json['index_path'] ?? '').toString(),
+      contains(kPluginIndexAsset),
+    );
+    expect(repo.urls, isEmpty, reason: '面板打开不该自己去联网');
+  });
+
+  test('POST /api/plugin/release/refresh：拉索引 + 缓存落盘，下一次 GET 读的就是这份', () async {
+    final _Repo repo = _Repo();
+    repo.assets['fake_plugin.dart'] = File(script).readAsBytesSync();
+    repo.publish(plugins: <Map<String, dynamic>>[releaseEntry()]);
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve(
+          'enabled: true\nplugins: []\n',
+          downloader: releaseDownloader(repo),
+        );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+    final _Res refreshed = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/refresh',
+    );
+    expect(refreshed.status, 200);
+    expect(refreshed.json['ok'], isTrue, reason: refreshed.json['error']);
+    expect(refreshed.json['online'], isTrue);
+    expect(refreshed.json['tag'], 'v0.1.0');
+    expect(refreshed.json['entries'], hasLength(1));
+    expect(
+      File(p.join(temp.path, 'plugins_release', kPluginIndexAsset))
+          .existsSync(),
+      isTrue,
+    );
+    repo.urls.clear();
+    final _Res cached = await ctx.client.send('GET', '/api/plugin/release');
+    expect(cached.json['ok'], isTrue);
+    expect(cached.json['online'], isFalse, reason: '离线不许看起来像最新');
+    expect(cached.json['entries'], hasLength(1));
+    expect(repo.urls, isEmpty);
+  });
+
+  test('refresh 失败：200 + ok:false + 原因 + 缓存那一份（不把限流显示成“仓库没插件”）', () async {
+    final _Repo repo = _Repo();
+    repo.assets['fake_plugin.dart'] = File(script).readAsBytesSync();
+    repo.publish(plugins: <Map<String, dynamic>>[releaseEntry()]);
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve(
+          'enabled: true\nplugins: []\n',
+          downloader: releaseDownloader(repo),
+        );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+    // 先刷成功一次（让缓存里有一份），再把仓库抹成“没有 release”
+    expect(
+      (await ctx.client.send('POST', '/api/plugin/release/refresh')).status,
+      200,
+    );
+    repo.release = null;
+    final _Res failed = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/refresh',
+    );
+    expect(failed.status, 200, reason: '失败仍然要把列表递到面板上');
+    expect(failed.json['ok'], isFalse);
+    expect(failed.json['error'], contains('还没有 release'));
+    final Map<String, dynamic> cached =
+        failed.json['cached'] as Map<String, dynamic>;
+    expect(cached['ok'], isTrue, reason: '上一次那份还能装就要递出去');
+    expect(cached['online'], isFalse);
+    expect(cached['entries'], hasLength(1));
+  });
+
+  test('POST …/install：放置文件 + 写条目（带来源标记）+ 立刻热应用', () async {
+    final _Repo repo = _Repo();
+    final List<int> source = File(script).readAsBytesSync();
+    repo.assets['fake_plugin.dart'] = source;
+    repo.publish(plugins: <Map<String, dynamic>>[releaseEntry()]);
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve(
+          'enabled: true\nplugins: []\n',
+          downloader: releaseDownloader(repo),
+        );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+    final _Res res = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/released/install',
+    );
+    expect(res.status, 200, reason: res.detail);
+    expect((res.json['install'] as Map<String, dynamic>)['swapped'], isTrue);
+    expect(
+      File(p.join(pluginDir, 'fake_plugin.dart')).readAsBytesSync(),
+      source,
+      reason: '文件要真落到可执行文件同级的那个 plugins/',
+    );
+    final Map<String, dynamic> entry = diskEntry('released');
+    expect(entry['source'], kRepoSourceValue);
+    expect(entry['repo_version'], '1.2.0');
+    expect(entry['command'], Platform.resolvedExecutable);
+    expect(entry['args'], <String>[p.join(pluginDir, 'fake_plugin.dart')]);
+    expect(entry['suspension'], PluginSuspension.keep);
+    expect(res.json['hot_applied'], isTrue, reason: '装上的东西该立刻被拉起来');
+    expect(ctx.bus.config('released'), isNotNull);
+    expect(ctx.bus.instances(), hasLength(1));
+  });
+
+  test('install 先过闸门：正在跑的旧一世被**优雅停掉**，才换文件再拉新一世', () async {
+    final _Repo repo = _Repo();
+    final List<int> source = File(script).readAsBytesSync();
+    repo.assets['fake_plugin.dart'] = <int>[
+      ...source,
+      ...utf8.encode('\n// 这一版发布里多的一行\n'),
+    ];
+    repo.publish(plugins: <Map<String, dynamic>>[releaseEntry()]);
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve(
+          <String>[
+            'enabled: true',
+            'plugins:',
+            ...fakePluginYaml('released'),
+            '',
+          ].join('\n'),
+          downloader: releaseDownloader(repo),
+        );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+    expect(ctx.bus.instances(), hasLength(1), reason: '旧的那一世在跑');
+    final int before = ctx.bus.generationOf('released');
+
+    final _Res res = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/released/install',
+    );
+    expect(res.status, 200, reason: res.detail);
+    expect(
+      res.json['hot_applied'],
+      isTrue,
+      reason: res.json['hot_apply_detail'],
+    );
+    expect(
+      ctx.bus.generationOf('released'),
+      greaterThan(before),
+      reason: '闸门开过（旧进程已确认退出）才换的文件，换完重新拉起一世',
+    );
+    expect(
+      File(p.join(pluginDir, 'fake_plugin.dart')).readAsBytesSync(),
+      isNot(source),
+      reason: '旧文件已被新版覆盖',
+    );
+  });
+
+  test('install 不给盖内置 id（就算还没落盘）：400 + 原因，文件与条目都不动', () async {
+    final _Repo repo = _Repo();
+    repo.assets['fake_plugin.dart'] = File(script).readAsBytesSync();
+    repo.publish(plugins: <Map<String, dynamic>>[releaseEntry(id: 'sample')]);
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve(
+          'enabled: true\nplugins: []\n',
+          downloader: releaseDownloader(repo),
+        );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+    final _Res res = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/sample/install',
+    );
+    expect(res.status, 400);
+    expect(res.detail, contains('已由核心内置提供'));
+    expect(
+      File(p.join(pluginDir, 'fake_plugin.dart')).existsSync(),
+      isFalse,
+      reason: '拒绝发生在任何磁盘动作之前',
+    );
+    expect(diskPlugins(), isEmpty);
+  });
+
+  test('install 一个索引里没有的 id：400 + 现在能装的是哪几条', () async {
+    final _Repo repo = _Repo();
+    repo.assets['fake_plugin.dart'] = File(script).readAsBytesSync();
+    repo.publish(
+      plugins: <Map<String, dynamic>>[
+        releaseEntry(),
+        releaseEntry(id: 'second'),
+      ],
+    );
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve(
+          'enabled: true\nplugins: []\n',
+          downloader: releaseDownloader(repo),
+        );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+    final _Res res = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/ghost/install',
+    );
+    expect(res.status, 400);
+    expect(res.detail, contains('没有插件 ghost'));
+    expect(res.detail, contains('released'));
+    expect(res.detail, contains('second'));
+    expect(diskPlugins(), isEmpty, reason: '没装成就一个字段也不写');
   });
 }

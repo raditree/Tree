@@ -23,6 +23,7 @@ import '../plugin/builtin_plugins.dart';
 import '../plugin/execute_mounts.dart';
 import '../plugin/plugin_bus.dart';
 import '../plugin/plugin_config_store.dart';
+import '../plugin/plugin_downloader.dart';
 import '../plugin/station_scope.dart';
 import '../settings/core_settings.dart';
 import '../settings/ssh_config.dart';
@@ -89,6 +90,7 @@ class CoreServer {
     required this.pluginBus,
     required this.builtinPlugins,
     required this.pluginHotApplier,
+    required this.pluginDownloader,
     required this.fileService,
     this.agentBackup,
     required this.hub,
@@ -212,6 +214,13 @@ class CoreServer {
   /// "新增 / 改启动参数 / 停用"在本轮只能**如实回报**热应用失败——见该类的文档）；
   /// 测试注入假实现可以直接断言"热应用失败"这条路径。
   final PluginHotApplier? pluginHotApplier;
+
+  /// 插件**发布仓库**（GitHub Releases）的取清单 / 下载 / 放置（阶段 5）。
+  ///
+  /// 为什么可以为 null：它需要**数据根**才能放缓存（`TreePaths.pluginsReleaseDir`），
+  /// 而数据根只有启动 CLI 知道。没接时三个路由都给**可读 503**（“这台核心没接发布
+  /// 仓库”），不像 501“功能开发中”——功能做了，只是这个实例不该去写磁盘。
+  final PluginDownloader? pluginDownloader;
 
   /// 执行站首命令集的**挂载位置**（M9 Wave 3-I）；为 null = 未接线（命令会显式报
   /// 「暂无挂载位置」而不是静默成功）。
@@ -360,7 +369,16 @@ class CoreServer {
     PluginBus? pluginBus,
     BuiltinPluginCatalog? builtinPlugins,
     PluginHotApplier? pluginHotApplier,
+
+    /// 发布仓库下载器（测试注入假的 ⇒ 整条安装链能离线钉死）。
+    PluginDownloader? pluginDownloader,
+
+    /// 发布仓库的下载缓存目录（生产传 `TreePaths.pluginsReleaseDir`）。
+    ///
+    /// null / 空 ⇒ **不自动建下载器**（不知道往哪写缓存就不该去碰网络）。
+    String? pluginReleaseCacheDir,
     FileService? fileService,
+
     /// 备份 `agents/<id>.yaml` 的回调（工作目录镜像写盘前留底）。
     ///
     /// 与 team 自愈同约定：核心要改某个 agent 的 yaml 就先把它备份成 `.bak.<n>`。
@@ -397,6 +415,17 @@ class CoreServer {
       interval: resolvedHeartbeatInterval,
       maxMisses: resolvedHeartbeatMissLimit,
     );
+    final BuiltinPluginCatalog resolvedBuiltinPlugins =
+        builtinPlugins ?? BuiltinPluginCatalog();
+    // 默认下载器接三个既有出口：已装条目读 plugins.yaml、脚本型解释器用**与内置
+    // 插件同一个**探测口径、换文件闸门问总线（只有它知道进程在不在）。
+    final PluginDownloader? resolvedDownloader =
+        pluginDownloader ??
+        _releaseDownloaderFor(
+          cacheDir: pluginReleaseCacheDir,
+          bus: pluginBus,
+          catalog: resolvedBuiltinPlugins,
+        );
     final CoreServer server = CoreServer._(
       http,
       processId: currentPid,
@@ -411,11 +440,12 @@ class CoreServer {
       systemPromptStore: systemPromptStore,
       mcpService: mcpService,
       pluginBus: pluginBus,
-      builtinPlugins: builtinPlugins ?? BuiltinPluginCatalog(),
+      builtinPlugins: resolvedBuiltinPlugins,
       // 默认热应用 = 总线公开面实现；总线为空时也用同一份（apply 前会先判空）
       pluginHotApplier:
           pluginHotApplier ??
           (pluginBus == null ? null : BusPluginHotApplier(pluginBus)),
+      pluginDownloader: resolvedDownloader,
       fileService: fileService,
       agentBackup: agentBackup,
       compaction: compaction,
@@ -452,17 +482,17 @@ class CoreServer {
     final AgentEngine wiredEngine = server.conversation.engine;
     if (wiredEngine is LlmAgentEngine) {
       wiredEngine.toolResultRepair = server.conversation.repairToolResult;
-    // 工具久不返回时的对账探针（同一个注入范式）：存储里已有真实结果 ⇒ 采用它让批收尾。
-    wiredEngine.toolResultProbe = server.conversation.probeToolResult;
-    // 「运行中的 LLM 请求」也进**同一张表**（用户 2026-10-03）：只有**连续沉默**（零事件）
-    // 达到阈值才登记（正常的长生成不进表、不 warning）；登记后被显式关闭 ⇒ 会话立刻以
-    // 取消收尾并掐掉底层订阅（插件挂住 / socket 挂住这条**无界**路径因此可关）。
-    // 见 `LlmSession._watchRequest` 与 `tool/llm_request_guard.dart`。
-    // 这里用进程级唯一那一个（`ToolRunRegistry.instance`）：生产路径下工具层的
-    // `WorkspaceToolRunner.toolRuns` 默认就是它，两边**是同一份表**。
-    wiredEngine.llmRequestRegistrar = llmRequestRegistrarOf(
-      ToolRunRegistry.instance,
-    );
+      // 工具久不返回时的对账探针（同一个注入范式）：存储里已有真实结果 ⇒ 采用它让批收尾。
+      wiredEngine.toolResultProbe = server.conversation.probeToolResult;
+      // 「运行中的 LLM 请求」也进**同一张表**（用户 2026-10-03）：只有**连续沉默**（零事件）
+      // 达到阈值才登记（正常的长生成不进表、不 warning）；登记后被显式关闭 ⇒ 会话立刻以
+      // 取消收尾并掐掉底层订阅（插件挂住 / socket 挂住这条**无界**路径因此可关）。
+      // 见 `LlmSession._watchRequest` 与 `tool/llm_request_guard.dart`。
+      // 这里用进程级唯一那一个（`ToolRunRegistry.instance`）：生产路径下工具层的
+      // `WorkspaceToolRunner.toolRuns` 默认就是它，两边**是同一份表**。
+      wiredEngine.llmRequestRegistrar = llmRequestRegistrarOf(
+        ToolRunRegistry.instance,
+      );
     }
     // Q9：Spec 索引注入系统提示词。做成**可设置的 provider**（而不是给
     // `systemPromptWithWorkspace` 加参数）是因为提示词在会话生成与压缩估算两处
@@ -521,7 +551,8 @@ class CoreServer {
     // 拼装（必须逐字一致），而"一路向上找到 TOP"要查 store ⇒ 与 spec 同范式用 provider；
     // 返回 null = 不接管（旧口径：agent 自己的 workspace_dir）。
     // agent 不属于本实例的 store 时不接管：否则会把别的 store 的团队结构写进提示词。
-    TeamWorkspace? teamBinding(CoreAgent agent) => server.store.agent(agent.id) == null
+    TeamWorkspace? teamBinding(CoreAgent agent) =>
+        server.store.agent(agent.id) == null
         ? null
         : teamWorkspaceFor(agent, server.store.agent);
     server._teamWorkspaceBinding = teamBinding;
@@ -835,11 +866,14 @@ class CoreServer {
   /// 执行站与工具层必须读同一份真值，所以这里只 attach 落点，不新建实例。
   void _wireToolRuns() {
     final WorkspaceToolRunner? runner = _runnerFromEngine();
-    final ToolRunRegistry registry = runner?.toolRuns ?? ToolRunRegistry.instance;
+    final ToolRunRegistry registry =
+        runner?.toolRuns ?? ToolRunRegistry.instance;
     final void Function(String message)? sink = errorLog;
     registry.attach(
       // core.log 一行（前缀与 [core:station] / [core:llm] 同口径）
-      log: sink == null ? null : (String message) => sink('[core:tool] $message'),
+      log: sink == null
+          ? null
+          : (String message) => sink('[core:tool] $message'),
       notice: conversation.sendHiddenNotice,
       onTimeout: (Map<String, dynamic> payload) =>
           pluginBus?.announceToolTimeout(payload),
@@ -1231,8 +1265,8 @@ class CoreServer {
         if (terminals == null) {
           connection.send(<String, dynamic>{
             'type': WsOutboundType.terminalError,
-            TerminalFrame.terminalId:
-                (frame[TerminalFrame.terminalId] ?? '').toString(),
+            TerminalFrame.terminalId: (frame[TerminalFrame.terminalId] ?? '')
+                .toString(),
             TerminalFrame.message: '核心未接线文件服务，终端不可用',
           });
         } else {
@@ -1331,7 +1365,11 @@ class CoreServer {
     router.add('GET', ApiPaths.agentModelsInfo, _agentModelsInfo);
     router.add('GET', ApiPaths.agentTodos, _agentTodos);
     router.add('GET', ApiPaths.agentSubagents, _agentSubagents);
-    router.add('GET', ApiPaths.agentSubagentTranscript, _agentSubagentTranscript);
+    router.add(
+      'GET',
+      ApiPaths.agentSubagentTranscript,
+      _agentSubagentTranscript,
+    );
     router.add('GET', ApiPaths.agentTeammates, _agentTeammates);
     router.add('PATCH', ApiPaths.teammate, _updateTeammate);
     router.add('GET', ApiPaths.teammateLog, _teammateLog);
@@ -1420,6 +1458,11 @@ class CoreServer {
     router.add('GET', ApiPaths.pluginBuiltins, _listBuiltinPlugins);
     router.add('POST', ApiPaths.pluginBuiltinEnable, _enableBuiltinPlugin);
     router.add('POST', ApiPaths.pluginBuiltinDisable, _disableBuiltinPlugin);
+    // 发布仓库（阶段 5）：只读 GitHub Release 资产，不 clone 源码；三个路由的分工
+    // 与理由见 ApiPaths.pluginRelease / pluginReleaseRefresh / pluginReleaseInstall。
+    router.add('GET', ApiPaths.pluginRelease, _pluginReleaseIndex);
+    router.add('POST', ApiPaths.pluginReleaseRefresh, _refreshPluginRelease);
+    router.add('POST', ApiPaths.pluginReleaseInstall, _installPluginRelease);
     // 站点详情与配置（面板「站点详情页」）：介绍 / 可订阅上限 / 自定义配置 / 订阅者禁用。
     router.add('GET', ApiPaths.pluginStation, _stationDetail);
     router.add('PATCH', ApiPaths.pluginStationConfig, _updateStationConfig);
@@ -1889,7 +1932,8 @@ class CoreServer {
       await writeJson(request, 404, errorBody('agent 不存在'));
       return;
     }
-    final bool cascade = request.uri.queryParameters['cascade'] == '1' ||
+    final bool cascade =
+        request.uri.queryParameters['cascade'] == '1' ||
         request.uri.queryParameters['cascade'] == 'true';
     final List<CoreAgent> descendants =
         teamService?.descendants(agentId) ?? const <CoreAgent>[];
@@ -1906,7 +1950,8 @@ class CoreServer {
               'parent_agent_id': member.parentAgentId,
             },
         ],
-        'hint': '直接删除会让这些下级变成孤儿（找不到上级，广播与级联停止都够不着）；'
+        'hint':
+            '直接删除会让这些下级变成孤儿（找不到上级，广播与级联停止都够不着）；'
             '确认后带 ?cascade=1 连同下级一并删除，或先用 team 工具逐个移除下级',
       });
       return;
@@ -1980,7 +2025,8 @@ class CoreServer {
     'detail': 'agent 正在运行，不能删除',
     'error': 'agent 正在运行，不能删除',
     'running': running,
-    'hint': '请先停止该 agent（成员可在标题栏按「停止」）并等它变为空闲后再删除；'
+    'hint':
+        '请先停止该 agent（成员可在标题栏按「停止」）并等它变为空闲后再删除；'
         '正在执行的工具无法被抢占（本地执行活着就永不超时），所以这里不会替你等待。',
   };
 
@@ -2094,24 +2140,26 @@ class CoreServer {
       return;
     }
     if (record.ownerAgentId != agentId || record.sessionId != sessionId) {
-      await writeJson(request, 404, errorBody(
-        '临时员工「${record.name}」属于会话 ${record.sessionId}，'
-        '不在这个会话（$sessionId）里——跨会话不保留是硬不变量。',
-      ));
+      await writeJson(
+        request,
+        404,
+        errorBody(
+          '临时员工「${record.name}」属于会话 ${record.sessionId}，'
+          '不在这个会话（$sessionId）里——跨会话不保留是硬不变量。',
+        ),
+      );
       return;
     }
     final List<CoreMessage> transcript =
-        List<CoreMessage>.of(store.messages(subagentId, sessionId))
-          ..sort(
-            (CoreMessage a, CoreMessage b) => a.timestamp.compareTo(b.timestamp),
-          );
+        List<CoreMessage>.of(store.messages(subagentId, sessionId))..sort(
+          (CoreMessage a, CoreMessage b) => a.timestamp.compareTo(b.timestamp),
+        );
     await writeJson(request, 200, <String, dynamic>{
       'agent_id': agentId,
       'subagent_id': subagentId,
       'session_id': sessionId,
       'total': transcript.length,
-      'messages':
-          transcript.map((CoreMessage m) => _messageJson(m)).toList(),
+      'messages': transcript.map((CoreMessage m) => _messageJson(m)).toList(),
     });
   }
 
@@ -3767,9 +3815,15 @@ class CoreServer {
         keepState: body['keep_state'] != false,
       );
       if (!hot.ok) {
-        await writeJson(request, 400, errorBody(hot.reason.isEmpty
-            ? '插件 $id 热重启后未就绪'
-            : '插件 $id 热重启失败：${hot.reason}'));
+        await writeJson(
+          request,
+          400,
+          errorBody(
+            hot.reason.isEmpty
+                ? '插件 $id 热重启后未就绪'
+                : '插件 $id 热重启失败：${hot.reason}',
+          ),
+        );
         return;
       }
       await writeJson(request, 200, hot.toJson());
@@ -3950,6 +4004,178 @@ class CoreServer {
     await writeJson(request, 200, _pluginWriteBody(store, result, outcome));
   }
 
+  // ── 发布仓库（阶段 5：插件管理只拉 GitHub Release 资产）─────────────────
+  //
+  // 三个处理器只做「调 [PluginDownloader] 的同一份实现 + 把条目落盘」：索引校验、
+  // 字节数核对、换文件闸门、原子改名全在下载器里——路由层不复制规则，复制一次就
+  // 会两头漂。落盘与热应用沿用**既有那一条路**（`_pluginStore` + `_applyPluginChange`），
+  // 与内置开关/自定义新增同一个语义。
+
+  /// 未接入发布仓库下载器时的统一回复（形状与 [_writePluginNotWired] 一致）。
+  ///
+  /// 为什么不是 501：前端对 501 有专门文案「功能开发中」，而这里是“做了，但这个
+  /// 实例不知道数据根”（只有测试 / 最小骨架会这样，CLI 恒接线）。
+  Future<void> _writePluginRepoNotWired(HttpRequest request) async {
+    await writeJson(
+      request,
+      503,
+      errorBody(
+        '这台核心没接发布仓库下载器（没给它数据根的 plugins_release 缓存目录）：'
+        '发布仓库面板会显示这条原因，不会默默空转',
+      ),
+    );
+  }
+
+  /// GET /api/plugin/release：读**本地缓存**的发布清单（不联网）。
+  ///
+  /// 为什么“没缓存”也回 200 + `ok:false`：面板要能把“为什么这个列表是空的” 显示
+  /// 出来（并递上 `index_path` 让人去查），而 4xx 会把它压成一条 Exception；
+  /// 与只读快照接口同样用 200 回空集的形状一致。
+  Future<void> _pluginReleaseIndex(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    final PluginDownloader? downloader = pluginDownloader;
+    if (downloader == null) {
+      await _writePluginRepoNotWired(request);
+      return;
+    }
+    await writeJson(request, 200, downloader.cachedListing().toJson());
+  }
+
+  /// POST /api/plugin/release/refresh：联网拉最新 release 的索引并缓存。
+  ///
+  /// 失败同样回 **200 + `ok:false` + 可读原因**（而不是 4xx）：刷新失败后还要把
+  /// “上次那份”一并递出去（`cached`），否则前端只能剩一条错误而列表整个空掉——
+  /// 那会把“GitHub 今晚限流”显示成“这个仓库没有插件”。
+  Future<void> _refreshPluginRelease(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    final PluginDownloader? downloader = pluginDownloader;
+    if (downloader == null) {
+      await _writePluginRepoNotWired(request);
+      return;
+    }
+    final PluginReleaseListing listing = await downloader.refresh();
+    errorLog?.call(
+      '[core:plugin-release] 刷新发布索引：${listing.ok ? '成功（${listing.entries.length} 条，'
+                'release ${listing.tag}）' : '失败：${listing.error}'}',
+    );
+    await writeJson(request, 200, <String, dynamic>{
+      ...listing.toJson(),
+      if (!listing.ok) 'cached': downloader.cachedListing().toJson(),
+    });
+  }
+
+  /// POST /api/plugin/release/{pluginId}/install：从发布仓库装一条插件。
+  ///
+  /// 三段顺序不能反：
+  /// 1. **先挡住内置 id**（在任何磁盘动作之前）：发布条目不能盖掉内置项，否则面板
+  ///    上会出现“既被内置开关管、又被发布仓库管”的双主条目（内置开关一按就会把
+  ///    command 写回随包那一份）——取保守侧：不装，并说清为什么；
+  /// 2. 装（资产进缓存 → 闸门 → 原子改名）：失败回 **400 + 可读原因**，旧文件一个
+  ///    都没动（面板把这句话直接给用户看）；
+  /// 3. 成功才写 plugins.yaml 并热应用（启用 = 拉起新版）。
+  ///
+  /// “文件已就位但条目写不进去”要**如实分开**说（不把 400 写成“已装好”）：那意味着
+  /// 新文件在盘上而旧条目仍指旧路，需用户看 plugins.yaml。
+  Future<void> _installPluginRelease(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    final PluginDownloader? downloader = pluginDownloader;
+    if (downloader == null) {
+      await _writePluginRepoNotWired(request);
+      return;
+    }
+    final String id = (params['pluginId'] ?? '').trim();
+    final PluginConfigStore store = _pluginStore(bus);
+    final Map<String, dynamic>? existing = store.readEntry(id);
+    // 判据**不看条目在不在**：内置 id 就算还没落盘也已经是内置身份（面板上有它
+    // 自己的开关），先被发布仓库写一条、再被人按内置开关 = 两个主人抢同一条目。
+    final bool builtinClash =
+        BuiltinPluginCatalog.specOf(id) != null ||
+        (existing != null && existing['builtin'] == true);
+    if (builtinClash) {
+      await writeJson(
+        request,
+        400,
+        errorBody(
+          '插件 $id 已由核心内置提供（内置项只走内置开关）：发布仓库不提供覆盖安装，'
+          '否则两个开关会抢同一条目。请先用自定义 id 发布，或继续用内置项',
+        ),
+      );
+      return;
+    }
+    final PluginInstallResult install = await downloader.install(
+      id,
+      swapGate: bus.quiesceForSwap,
+    );
+    final Map<String, dynamic>? entry = install.entry;
+    if (!install.ok || entry == null) {
+      final String reason = install.error.isEmpty
+          ? '插件 $id 安装失败（下载器没给出原因）'
+          : install.error;
+      errorLog?.call('[core:plugin-release] 安装 $id 失败：$reason');
+      await writeJson(request, 400, errorBody(reason));
+      return;
+    }
+    final PluginStoreResult result = store.upsert(entry);
+    final Map<String, dynamic>? stored = result.entry;
+    if (!result.ok || stored == null) {
+      final String reason =
+          '插件文件已放置到 ${install.files.join(' / ')}，但写入 plugins.yaml 失败：'
+          '${result.error}（旧条目未改动，新文件暂时不会被拉起）';
+      errorLog?.call('[core:plugin-release] $reason');
+      await writeJson(request, 400, errorBody(reason));
+      return;
+    }
+    final PluginHotApplyOutcome outcome = await _applyPluginChange(
+      bus,
+      stored,
+      enable: true,
+    );
+    errorLog?.call(
+      '[core:plugin-release] 已安装 $id（${install.version}，'
+      '${install.files.length} 个文件，热应用 ${outcome.applied ? '成功' : '失败：${outcome.detail}'}）',
+    );
+    await writeJson(request, 200, <String, dynamic>{
+      ..._pluginWriteBody(store, result, outcome),
+      'install': install.toJson(),
+    });
+  }
+
+  /// 默认接线：造一个发布仓库下载器（为什么可以回 null 见 [pluginDownloader]）。
+  ///
+  /// 四个注入都指向**既有事实源**，这里不再造一份判定：
+  /// - `installedEntryOf`：plugins.yaml 里那条的 `repo_version`（判断“有没有更新”）；
+  /// - `runtimeResolver`：内置插件目录的 Python 探测（与内置项同一口径，避免两套
+  ///   “装了没”的结论互相矛盾）；
+  /// - 换文件闸门由路由层现给（[PluginBus.quiesceForSwap]）：只有总线知道进程在不在；
+  /// - `accessToken`：`GITHUB_TOKEN`（公开仓库不登录也能读，只在被限流时才用得上）。
+  static PluginDownloader? _releaseDownloaderFor({
+    required String? cacheDir,
+    required PluginBus? bus,
+    required BuiltinPluginCatalog catalog,
+  }) {
+    final String dir = (cacheDir ?? '').trim();
+    if (dir.isEmpty || bus == null) return null;
+    final PluginConfigStore store = PluginConfigStore(bus.configFile);
+    return PluginDownloader(
+      cacheDir: dir,
+      installDir: defaultPluginInstallDir(),
+      accessToken: (Platform.environment['GITHUB_TOKEN'] ?? '').trim(),
+      runtimeResolver: catalog.detectRuntime,
+      installedEntryOf: store.readEntry,
+    );
+  }
+
   // ── 站点详情与配置（面板「站点详情页」的唯一写入口）──────────────────────
   //
   // 三个处理器都只做「取一条 + 调 [StationHub] 的同一份实现」：能改什么（内置只
@@ -3982,7 +4208,9 @@ class CoreServer {
       return;
     }
     final String stationId = (params['stationId'] ?? '').trim();
-    final Map<String, dynamic>? detail = bus.stations.station(stationId)?.describe();
+    final Map<String, dynamic>? detail = bus.stations
+        .station(stationId)
+        ?.describe();
     if (detail == null) {
       await _writeStationMissing(request, stationId);
       return;
@@ -4055,7 +4283,9 @@ class CoreServer {
       await writeJson(
         request,
         400,
-        errorBody('缺少 subscriberKey（形如 plugin_id|scope，取自站点详情的 subscriptions[].subscriber）'),
+        errorBody(
+          '缺少 subscriberKey（形如 plugin_id|scope，取自站点详情的 subscriptions[].subscriber）',
+        ),
       );
       return;
     }

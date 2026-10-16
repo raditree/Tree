@@ -217,8 +217,12 @@ void main() {
       reason: '$logs',
     );
 
-    // ③ 快照真的走了一遍池（1 次入池、随后被新一世取走 ⇒ 池里不剩东西）
+    // ③ 快照真的走了一遍池（1 次入池、随后被新一世取走 ⇒ 池里不剩东西）。
+    //    顺序不是“先取快照再 ready”：新一世是在 hello **之后**才发 `plugin.stateFetch`，
+    //    所以“已 ready 而快照还没被取走”是正常现场。拿它当必定同时成立去断言，
+    //    机器一忙就会偶发失败（与上面那条“等日志而不是等 ready”同一个坑）。
     expect(bus.statePool.putCount, 1, reason: '一份可续跑状态只递一次');
+    await waitFor(() => bus.statePool.length == 0, '新一世把快照取走（取回即消费）');
     expect(bus.statePool.length, 0, reason: '取回即消费（一份快照只喂一世）');
     final String settled = await waitForLog(
       (String m) => m.contains('自重启收尾') && m.contains('快照已入池'),
@@ -238,7 +242,8 @@ void main() {
       RegExp(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}')
           .hasMatch(restartAudit.single),
       isTrue,
-      reason: '审计必须带**可读**的时间戳与偏移（“何时”是事后唯一能查的东西）：'
+      reason:
+          '审计必须带**可读**的时间戳与偏移（“何时”是事后唯一能查的东西）：'
           '${restartAudit.single}',
     );
   }, timeout: const Timeout(Duration(minutes: 2)));
