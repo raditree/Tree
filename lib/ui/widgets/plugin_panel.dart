@@ -1058,10 +1058,22 @@ class _PluginPanelState extends State<PluginPanel> {
   /// 自定义插件的运行态一句话。
   ///
   /// known=false 表示这条配置**还没被总线对账过**（例如刚写盘、或在旧核心上）。
-  /// 热应用（applyConfigs）落地后这种情况几乎不再出现：写入即对账，所以这里
+  /// 热应用（applyConfigs）落地后这种情况不再出现：写入即对账，所以这里
   /// 提示用户"可点重启或看原因"，而不是断言一定要重启核心。
+  ///
+  /// **阶段看 `lifecycle`**（阶段 2 新增的第三个轴）：重启中 / 已挂起都不能说成
+  /// “未运行”——前者是安排内的一世交替（站点请求由核心有界暂存后重放），后者是
+  /// 进程已退但快照已转储。两行都不写“失败/停用”：那是 `status` 与健康度的事。
+  /// 旧核心没有这个键 ⇒ 空串 ⇒ 走下面的原有分支（行为与改动前逐字一致）。
   String _runtimeText(bool enabled, Map<String, dynamic> runtime) {
     if (!enabled) return '状态：已停用（条目保留）';
+    final String lifecycle = (runtime['lifecycle'] ?? '').toString();
+    if (lifecycle == PluginInstanceInfo.lifecycleRestarting) {
+      return '状态：重启中（暂时不接新活，站点请求由核心暂存后重放）';
+    }
+    if (lifecycle == PluginInstanceInfo.lifecycleSuspended) {
+      return '状态：已挂起（可续跑状态已转储给核心，等下一世取回）';
+    }
     if (runtime['running'] == true) {
       return runtime['health'] == 'degraded' ? '状态：运行中（心跳降级，仍注册）' : '状态：运行中';
     }
@@ -1069,12 +1081,20 @@ class _PluginPanelState extends State<PluginPanel> {
     return '状态：已启用但未运行（可点「重启」，或看上方原因）';
   }
 
+  /// 运行态颜色（与 [_runtimeText] 同一判据顺序，否则文字说“重启中”而颜色说“没跑”）。
+  ///
+  /// 重启中 / 已挂起都用蓝色：它不是错（橙色 = 降级、红色 = 失败），但也不是“一切照旧”。
   Color _runtimeColor(
     ColorScheme cs,
     bool enabled,
     Map<String, dynamic> runtime,
   ) {
     if (!enabled) return cs.onSurfaceVariant;
+    final String lifecycle = (runtime['lifecycle'] ?? '').toString();
+    if (lifecycle == PluginInstanceInfo.lifecycleRestarting ||
+        lifecycle == PluginInstanceInfo.lifecycleSuspended) {
+      return Colors.lightBlue;
+    }
     if (runtime['health'] == 'degraded') return Colors.orange;
     if (runtime['running'] == true) return Colors.green;
     return cs.onSurfaceVariant;
@@ -1194,6 +1214,11 @@ class _PluginPanelState extends State<PluginPanel> {
   ///
   /// 健康度（M9 §1.1）：心跳连续丢失 ⇒ 角标「心跳降级」+ 一行说明；
   /// 此时 **状态标签仍是「已注册」**——降级不是停用，文案不得写成"已停用"。
+  ///
+  /// 生命周期（阶段 2）：另加一个角标（「重启中」/「已挂起」/「启动中」）。
+  /// **活性看 `health`、启停看 `status`、阶段看 `lifecycle`**：三个轴各自成图，
+  /// 谁也不吃掉谁——重启中的实例仍是「已注册」，也不会因为重启而被报成降级。
+  /// 旧核心没有 lifecycle ⇒ 不渲染角标（与改动前逐字一致）。
   Widget _instanceCard(
     ColorScheme cs,
     PluginInstanceInfo e,
@@ -1206,6 +1231,9 @@ class _PluginPanelState extends State<PluginPanel> {
       if (e.missedHeartbeats != null && e.missedHeartbeats! > 0)
         '丢失 ${e.missedHeartbeats} 拍',
       if (e.queueDepth != null && e.queueDepth! > 0) '队列 ${e.queueDepth}',
+      // 阶段与代际：只在核心真的报了 lifecycle 时才写（旧核心不臆测）
+      if (e.lifecycle.isNotEmpty) '阶段 ${pluginLifecycleText(e.lifecycle)}',
+      if (e.generation != null && e.generation! > 0) '第 ${e.generation} 代',
     ];
     return Container(
       margin: const EdgeInsets.only(bottom: 6),
@@ -1236,6 +1264,11 @@ class _PluginPanelState extends State<PluginPanel> {
               ),
               if (e.isDegraded) ...<Widget>[
                 _pill(cs, '心跳降级', color: Colors.orange),
+                const SizedBox(width: 6),
+              ],
+              // 生命周期角标（阶段 2）：与上面的降级角标互不干扰，两个轴各说各的事。
+              if (_lifecyclePill(cs, e.lifecycle) != null) ...<Widget>[
+                _lifecyclePill(cs, e.lifecycle)!,
                 const SizedBox(width: 6),
               ],
               _statusLabel(cs, e.status),
@@ -1269,6 +1302,25 @@ class _PluginPanelState extends State<PluginPanel> {
         ],
       ),
     );
+  }
+
+  /// 生命周期角标（阶段 2）：只给「需要用户看得见的中间态」上角标。
+  ///
+  /// 就绪 / 未运行 不上角标：它们与旁边的 [pluginStatusText] 标签（已注册 / 已停用）
+  /// 说的是同一件事的两个面，多一个角标只会让人以为出了新情况。返回 null = 不渲染
+  ///（包括旧核心没报 lifecycle 的空值 ⇒ 面板与改动前逐字一致）。
+  Widget? _lifecyclePill(ColorScheme cs, String lifecycle) {
+    switch (lifecycle) {
+      case PluginInstanceInfo.lifecycleRestarting:
+      case PluginInstanceInfo.lifecycleBooting:
+        return _pill(cs, pluginLifecycleText(lifecycle), color: Colors.lightBlue);
+      case PluginInstanceInfo.lifecycleSuspended:
+        return _pill(cs, '已挂起', color: Colors.teal);
+      case PluginInstanceInfo.lifecycleFailed:
+        return _pill(cs, '本轮失败', color: cs.error);
+      default:
+        return null;
+    }
   }
 
   /// 降级说明（角标下方那行橙字）：原因 + 丢失拍数 + 判活窗口 I×N。

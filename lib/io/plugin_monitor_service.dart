@@ -88,6 +88,23 @@ class PluginInstanceInfo {
   /// 心跳降级原因（core 的 `degraded_reason` / 增量 `reason`；未降级为空串）
   final String degradedReason;
 
+  /// **生命周期阶段**（20261015-hot-restart 阶段 2 新增的第三个轴）：
+  /// `stopped` / `booting` / `ready` / `restarting` / `suspended` / `failed`；
+  /// 缺失为**空串 = 未知**（旧核心根本不发这个键，展示层不崩、不臆测）。
+  ///
+  /// **三个轴各管各的，谁也不得吃掉谁**（这是文案纪律，不只是字段纪律）：
+  /// **活性看 [health]、启停看 [status]、阶段看 [lifecycle]**。举两个真实会发生的组合：
+  /// - `restarting` + `registered` + `ok`：插件正在热重启，对外仍是正常状态（核心
+  ///   替它有界暂存站点请求），此时**绝不能**渲染成“已停用”或“降级”；
+  /// - `ready` + `registered` + `degraded`：进程好好的、只是几拍没回心跳（阶段 2 前就存在）。
+  final String lifecycle;
+
+  /// 当前**代际**（第几世；每次启动 +1；缺失为 null）。
+  ///
+  /// 为什么面板要显示它：重启后面板上的名字没变，但“它是同一个进程”已经变了；
+  /// 没有代际就分不清“这个 ready 是刚起来的那个还是上一世残留的读数”。
+  final int? generation;
+
   /// 健康度取值：正常
   static const String healthOk = 'ok';
 
@@ -96,6 +113,31 @@ class PluginInstanceInfo {
 
   /// 健康度取值：宿主不可用（未启动 / 已断开）
   static const String healthUnavailable = 'unavailable';
+
+  /// 生命周期取值：重启中（旧实例在转储或已退、新实例未就绪）
+  static const String lifecycleRestarting = 'restarting';
+
+  /// 生命周期取值：已挂起（进程已退，可续跑状态已转储给核心）
+  static const String lifecycleSuspended = 'suspended';
+
+  /// 生命周期取值：启动中（进程已拉起，握手或首次 tools/list 未完）
+  static const String lifecycleBooting = 'booting';
+
+  /// 生命周期取值：就绪
+  static const String lifecycleReady = 'ready';
+
+  /// 生命周期取值：失败（启动失败 / 通道断裂 / 判死）
+  static const String lifecycleFailed = 'failed';
+
+  /// 是否处于「暂时不可用但工作安排上是暂时性」的那一段（核心侧同口径：
+  /// `PluginLifecycleState.isTemporarilyUnavailable`）。
+  ///
+  /// 面板用它说明“在等它回来”而不是“它坏了”；但**徽章文案仍逐态给**（重启中 /
+  /// 已挂起 / 启动中），因为这三件事对用户的下一步动作不同。
+  bool get isTemporarilyUnavailable =>
+      lifecycle == lifecycleRestarting ||
+      lifecycle == lifecycleSuspended ||
+      lifecycle == lifecycleBooting;
 
   const PluginInstanceInfo({
     required this.pluginId,
@@ -112,6 +154,8 @@ class PluginInstanceInfo {
     this.missedHeartbeats,
     this.heartbeatIntervalS,
     this.degradedReason = '',
+    this.lifecycle = '',
+    this.generation,
   });
 
   /// 是否处于「心跳降级」（M9 §1.1）：连续 N 拍没收到心跳。
@@ -144,6 +188,9 @@ class PluginInstanceInfo {
     final Object? rawHealth = m['health'];
     final Object? rawMissed = m['missed_heartbeats'];
     final Object? rawInterval = m['heartbeat_interval_s'];
+    // 生命周期与代际：**新增的可选键**（旧核心没有 ⇒ 空/ null，不臆测）
+    final Object? rawLifecycle = m['lifecycle'];
+    final Object? rawGeneration = m['generation'];
     final List<PluginToolBrief> tools = <PluginToolBrief>[];
     final Object? rawTools = m['tools'];
     if (rawTools is List) {
@@ -169,6 +216,8 @@ class PluginInstanceInfo {
       missedHeartbeats: rawMissed is num ? rawMissed.toInt() : null,
       heartbeatIntervalS: rawInterval is num ? rawInterval.toDouble() : null,
       degradedReason: (m['degraded_reason'] ?? '').toString(),
+      lifecycle: rawLifecycle is String ? rawLifecycle : '',
+      generation: rawGeneration is num ? rawGeneration.toInt() : null,
     );
   }
 
@@ -196,6 +245,8 @@ class PluginInstanceInfo {
     int? missedHeartbeats,
     double? heartbeatIntervalS,
     String? degradedReason,
+    String? lifecycle,
+    int? generation,
   }) {
     return PluginInstanceInfo(
       pluginId: pluginId,
@@ -214,6 +265,10 @@ class PluginInstanceInfo {
       missedHeartbeats: missedHeartbeats ?? this.missedHeartbeats,
       heartbeatIntervalS: heartbeatIntervalS ?? this.heartbeatIntervalS,
       degradedReason: degradedReason ?? this.degradedReason,
+      // 生命周期与代际同样是「增量没说 ⇒ 保持原值」：不能让一次不带 lifecycle 的
+      // 旧口径增量把阶段从面板上抹掉（那会「重启中」闪一下又变成就绪）。
+      lifecycle: lifecycle ?? this.lifecycle,
+      generation: generation ?? this.generation,
     );
   }
 }
@@ -784,6 +839,15 @@ class PluginMonitorService extends ChangeNotifier {
     final int? missed = rawMissed is num ? rawMissed.toInt() : null;
     final Object? rawInterval = d['heartbeat_interval_s'];
     final double? interval = rawInterval is num ? rawInterval.toDouble() : null;
+    // 生命周期增量（阶段 2）：与 health 同一口径——**缺失 = 本次增量没说 ⇒ 保持原值**，
+    // 绝不能当成“没在重启”。status / health 的合并规则一字未改：lifecycle 只多一个轴。
+    final Object? rawLifecycle = d['lifecycle'];
+    final String? lifecycle =
+        rawLifecycle is String && rawLifecycle.isNotEmpty ? rawLifecycle : null;
+    final Object? rawGeneration = d['generation'];
+    final int? generation = rawGeneration is num
+        ? rawGeneration.toInt()
+        : null;
 
     final PluginSnapshot? snap = _snapshot;
     if (snap == null) {
@@ -812,6 +876,8 @@ class PluginMonitorService extends ChangeNotifier {
             degradedReason: health == null
                 ? null
                 : (health == PluginInstanceInfo.healthDegraded ? reason : ''),
+            lifecycle: lifecycle,
+            generation: generation,
           );
         } else {
           list.add(
@@ -826,6 +892,8 @@ class PluginMonitorService extends ChangeNotifier {
               degradedReason: health == PluginInstanceInfo.healthDegraded
                   ? reason
                   : '',
+              lifecycle: lifecycle ?? '',
+              generation: generation,
             ),
           );
         }
@@ -842,6 +910,8 @@ class PluginMonitorService extends ChangeNotifier {
             missedHeartbeats: missed ?? 0,
             heartbeatIntervalS: interval,
             degradedReason: '',
+            lifecycle: lifecycle,
+            generation: generation,
           );
         }
         break;

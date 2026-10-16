@@ -145,9 +145,13 @@ class _Kv extends StatelessWidget {
   }
 }
 
-/// 生命周期状态的中文名（面板卡片与详情页共用，**口径必须一致**）。
+/// 启停状态（`status`）的中文名（面板卡片与详情页共用，**口径必须一致**）。
 ///
 /// 认不出的值原样显示（旧核心 / 新枚举都不能崩，也不能翻译成"未知"之外的小动作）。
+///
+/// 注意：这里的"生命周期"只回答**配置上要不要跑**（registered / disabled）；
+/// “现在处在阶段 2 的哪一段”是 [pluginLifecycleText] 的事（`lifecycle`），
+/// “还听得见吗”是健康度（`health`）——**三个轴各管各的，谁也不得吃掉谁**。
 String pluginStatusText(String status) {
   switch (status) {
     case 'registered':
@@ -158,6 +162,31 @@ String pluginStatusText(String status) {
       return '已销毁';
     default:
       return status.isEmpty ? '未知' : status;
+  }
+}
+
+/// 插件**生命周期阶段**（`lifecycle`）的中文名（面板卡片与详情页共用）。
+///
+/// 与 [pluginStatusText] / 健康度是**三个独立的轴**：`restarting` 时 `status` 仍是
+/// `registered`、`health` 仍可能是 `ok` —— 所以这里只能说“重启中”，绝不能翻译成
+/// “已停用”或“降级”（那会把一个安排内的动作报成事故）。缺失（旧核心）⇒ “未知”，
+/// 不臆测；认不出的值原样显示（新核心发新阶段时前端不能崩）。
+String pluginLifecycleText(String lifecycle) {
+  switch (lifecycle) {
+    case PluginInstanceInfo.lifecycleRestarting:
+      return '重启中';
+    case PluginInstanceInfo.lifecycleSuspended:
+      return '已挂起';
+    case PluginInstanceInfo.lifecycleBooting:
+      return '启动中';
+    case PluginInstanceInfo.lifecycleReady:
+      return '就绪';
+    case PluginInstanceInfo.lifecycleFailed:
+      return '失败';
+    case 'stopped':
+      return '未运行';
+    default:
+      return lifecycle.isEmpty ? '未知（核心未提供生命周期）' : lifecycle;
   }
 }
 
@@ -344,6 +373,7 @@ class PluginDetailPage extends StatelessWidget {
                                     : '未运行'),
                         ),
                         _Kv(label: '健康度', value: _healthText()),
+                        _Kv(label: '生命周期', value: _lifecycleText()),
                         _Kv(label: '停用原因', value: instance?.disabledReason ?? ''),
                         if ((runtime['error'] ?? '').toString().isNotEmpty)
                           _Kv(
@@ -361,7 +391,9 @@ class PluginDetailPage extends StatelessWidget {
                       ],
               ),
             ],
-            note: '心跳降级 ≠ 停用：降级只表示连续几拍没收到心跳，插件仍注册运行。',
+            note: '心跳降级 ≠ 停用：降级只表示连续几拍没收到心跳，插件仍注册运行。\n'
+                '活性看健康度、启停看状态、阶段看生命周期（三个轴各管各的）：'
+                '「重启中」是安排内的一世交替，不是故障，也不是停用。',
           ),
           _sectionWithNote(
             title: '提供的工具（${tools.length}）',
@@ -450,6 +482,22 @@ class PluginDetailPage extends StatelessWidget {
       return '运行时 ${spec['command']} · 脚本 ${spec['script_path']}';
     }
     return '运行时未就绪：${spec['error'] ?? '未知原因'}';
+  }
+
+  /// 生命周期一行（阶段 2 新增的第三个轴）。
+  ///
+  /// 数据源与状态/健康度分开：`lifecycle` 是**新增的可选键**，旧核心没有 ⇒ 走
+  /// [pluginLifecycleText] 的“未知”分支，绝不臆测成“未运行”（那会把一个装好的
+  /// 插件讲成没跑）。代际只在真有值时附一句。
+  String _lifecycleText() {
+    final String lifecycle =
+        instance?.lifecycle ?? (runtime['lifecycle'] ?? '').toString();
+    final Object? rawGeneration = instance?.generation ?? runtime['generation'];
+    final int? generation = rawGeneration is num ? rawGeneration.toInt() : null;
+    final String text = pluginLifecycleText(lifecycle);
+    return generation == null || generation <= 0
+        ? text
+        : '$text（第 $generation 代）';
   }
 
   /// 健康度一行（未知就写未知，不翻译）。
