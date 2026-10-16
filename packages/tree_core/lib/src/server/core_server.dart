@@ -3711,10 +3711,19 @@ class CoreServer {
     await writeJson(request, 200, _pluginWriteBody(store, result, outcome));
   }
 
-  /// POST /api/plugin/configs/{pluginId}/restart：显式重启一个插件实例。
+  /// POST /api/plugin/configs/{pluginId}/restart：显式处置一个插件实例。
   ///
   /// 用途一：心跳 degraded 之后由用户手动恢复；用途二：改完配置想立刻按新参数拉起
   /// （日常开关走 PATCH，已经会自动对账，不必手动点这里）。
+  ///
+  /// **同一个路径三种做法**（body 的 `mode`，缺省 = 无 body = 旧行为逐字不变）：
+  /// - 缺省 / `cold`：冷重启（断开再拉起，不做转储）——响应形状与升级前一致；
+  /// - `hot`：热重启（先请插件转储、新一世取回续跑），回包带 `resumed`/`generation`；
+  ///   目标没声明 `suspension: keep` 时 `resumed=false` 且 **不算失败**（那是冷启动，不是错误）；
+  /// - `force_stop`：**用户显式强制停止**，全框架唯一能因为界面按钮而 `kill()` 的入口（D8）。
+  ///
+  /// 未知 mode 一律拒并给可读原因：把拼错的 `mode: 'hotr'` 静默当成冷重启，
+  /// 用户看到的就是“我点了热重启但状态没续上”，而它会回一句成功。
   ///
   /// 若总线运行期还没见过这一条（例如用户直接手改了 plugins.yaml 再点重启），先按
   /// 磁盘对一次账——否则会误报"要重启核心"，而它其实现在就能被拉起来。
@@ -3743,6 +3752,38 @@ class CoreServer {
         request,
         400,
         errorBody('插件 $id 不在插件清单里（${store.path}）：请检查 plugins.yaml'),
+      );
+      return;
+    }
+    final Map<String, dynamic> body = await readJsonBody(request);
+    final String mode = (body['mode'] ?? '').toString().trim();
+    if (mode == 'force_stop') {
+      await writeJson(request, 200, await bus.forceStop(id));
+      return;
+    }
+    if (mode == 'hot') {
+      final PluginHotRestartResult hot = await bus.hotRestart(
+        id,
+        keepState: body['keep_state'] != false,
+      );
+      if (!hot.ok) {
+        await writeJson(request, 400, errorBody(hot.reason.isEmpty
+            ? '插件 $id 热重启后未就绪'
+            : '插件 $id 热重启失败：${hot.reason}'));
+        return;
+      }
+      await writeJson(request, 200, hot.toJson());
+      return;
+    }
+    if (mode.isNotEmpty && mode != 'cold') {
+      await writeJson(
+        request,
+        400,
+        errorBody(
+          '未知的 mode「$mode」：这一条只有 cold（冷重启，缺省）/ hot（热重启续跑）/ '
+          'force_stop（用户显式强制停止）三种做法；不把拼错的值静默当成缺省，'
+          '因为你看到的就是“点了热重启但状态没续上”',
+        ),
       );
       return;
     }

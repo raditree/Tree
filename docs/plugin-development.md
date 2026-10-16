@@ -148,7 +148,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.execute.tool` | 执行 | — | `tool.call`（执行任意工具）、`tool.close`（按 `handle` **显式关闭**一次运行中的工具/请求：先尽力终止进程树、再让在途调用收敛；句柄失效或不归你管 ⇒ 可读拒绝，**绝不自动关**） |
 | `system.execute.session` | 执行 | — | `session.rename`（会话重命名） |
 | `system.execute.ssh` | 执行 | — | `ssh.reconnect`（重建目标 agent 的远端链路；与 REST `POST /api/agents/{id}/ssh/reconnect`、右栏文件面板「重连」按钮同一实现） |
-| `system.execute.plugin` | 执行 | — | `plugin.list` / `plugin.restart` / `plugin.suspend` / `plugin.state` / `plugin.stateDump` / `plugin.stateFetch`（插件热重启的控制面，见 §6.5；别名 `plugin`）。**后两条不得被申报成 agent tool**：它们是生命周期原语，只能由插件自己下 |
+| `system.execute.plugin` | 执行 | — | `plugin.list` / `plugin.restart` / `plugin.suspend` / `plugin.state` / `plugin.stateDump` / `plugin.stateFetch`（插件热重启的控制面，见 §6.5；模型能使唤的那一面见 §6.7；别名 `plugin`）。**后两条不得被申报成 agent tool**：它们是生命周期原语，只能由插件自己下 |
 | `system.broadcast` | 广播 | 通用主题（自定 topic） | 通知 |
 | `system.broadcast.tool.pre` | 广播 | 工具调用前 | 通知 |
 | `system.broadcast.tool.post` | 广播 | 工具调用后 | 通知 |
@@ -657,6 +657,37 @@ plugins:
 （这个插件当前积压了几条）。广播点 `system.broadcast.plugin.state` 的载荷里也带
  `buffer`（全局水位）；订阅方式见 §3.1 与 §7.1。
 
+### 6.7 agent tool 那一面：`plugin_hot_restart`（阶段 3）
+
+“重启一个插件”已经是一个模型能使唤的动作了：内置插件 **`self_updater`**（框架自迭代插件，
+随包二进制）经收集站 `plugin.tool.define` 申报**一个** tool：
+
+| 参数 | 语义 |
+|---|---|
+| `action` | `list` / `state` / `restart` / `suspend`（四个问法对应四条执行站命令） |
+| `plugin_id` | 目标插件；`list` 可省略。填自己的 id 就是“重启我自己”，这是**允许**的 |
+| `keep_state` | `restart` 时是否尝试续跑（缺省 `true`；目标没声明 `suspension: keep` 就按冷启动，回包会写明） |
+| `wait_ready` | `restart` 后再读一次 `plugin.state`，把新一世的阶段/代际附进结果（缺省 `true`；重启自己时无效） |
+
+它自己不碰任何插件状态，只是把动作转成执行站 `plugin.*` 命令，所以下面这些**对所有插件都成立**：
+
+* **身份只能由核心给你**：`tools/call` 的参数里有一个可选的 `scope`（本次调用的四元组），
+  把它**原样**带回 `station/command` 的顶层参数。自己编一个 `team_id` 就是越权，
+  而核心会拿目标 agent 的真实归属再核一遍，对不上就拒。没有可证明的归属 ⇒ 四条控制面命令
+  全部被拒（fail-closed），而且工具回包会把这件事说破，不留一个“不知道为什么失败”。
+* **快照两条不得做成 tool**（`plugin.stateDump` / `plugin.stateFetch`）：它们是插件自己
+  生命周期的一部分，模型没有资格代它发言。需要它们的时候只有两个时刻：收到 `suspend`
+  时（**先转储、等回包、再 ack**）与 `hello` 完成后（问一次“有没有我的快照”）。
+* **每一次控制面动作都进审计**（谁 / 何时 / 目标 / 结论），一行一条；快照两条不记。
+  自重启那一条记的是“已受理”，结论在紧随其后的“自重启收尾”行里。
+* **“强制停止”只能由用户按**：REST `POST /api/plugins/<id>/restart` 的 body `mode`
+  可取 `cold`（缺省，与旧请求逐字一致）/ `hot` / `force_stop`，第三个值是全框架
+  **唯一**能因为一个按钮而 `kill()` 的入口（核心自己从不因为时长杀插件）。
+
+写自己的插件时能拿到的两个现成好处：声明 `suspension: keep` ⇒ 面板上的“热重启（保留状态）”
+与 agent 的那条 tool 对你就都是“换个进程接着干”；而随包二进制都建议带一条 `--selftest`
+（输出走 stderr、退出码 0 = 全部通过）：装机后的端到端验证读的是退出码，不是“面板有没有报错”。
+
 ---
 
 ## 7. 广播站与前端 UI
@@ -842,7 +873,10 @@ plugins:
   **左栏面板**（`activity` 槽位 = 活动栏图标 + 左栏整页）：最近 N 次压缩的时间 / 来源 /
   覆盖条数 / 耗时 / 降级与未接管原因，加一个「立即压缩一次」按钮（执行站 `agent.compact`）
   ——"面板 + 面板动作回传"这份契约的可运行答案（`--no-panel` 可关掉面板）。
-- 三个脚本都**只用标准库**、都能被绝对路径启动（不依赖 cwd）。
+- [packages/tree_self_updater](../packages/tree_self_updater/README.md)：**binary 型内置插件**的参考实现
+  （框架自迭代插件）：自带协议常量表、两条申报路共用同一份参数表、`suspend` 里「先转储等回包再 ack」，
+  带 `--selftest`（退出码 0 = 全绿）。它不是脚本，但是“一个插件能做到什么”的最小可读完整面（见 §6.7）。
+- 这些脚本都**不依赖第三方库**、都能被绝对路径启动（不依赖 cwd）。
 - 尚未提供可运行示例的点位：`system.relay.llm.request`（投入前改写）——口径见 §5.3，
   接法与其他中转点位完全一致。
 - 运行：把 `examples/plugins/` 下的脚本拷到桌面端的 `plugins/` 目录（或直接写绝对路径），

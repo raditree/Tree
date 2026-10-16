@@ -19,6 +19,49 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **框架自迭代插件：把「热重启一个插件（含重启它自己）」做成 agent tool**（**新增**
+  [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 28、
+  [packages/tree_self_updater/README.md](packages/tree_self_updater/README.md) 不变量 1-5、
+  [docs/plugin-development.md](docs/plugin-development.md) §6.7）：
+  - **对外面是三张常量表，不是“等做 tool 时再说”**（把不变量 26 的划分接到 tool 面上）：
+    `PluginToolSurface.agentToolCommands`（控制面四条）可申报成 tool、`lifecycleOnlyCommands`
+    （`plugin.stateDump/stateFetch`）**永不进工具表**（D9）、`auditedCommands` = 前者。
+    形状是**一个 tool + `action`**（`plugin_hot_restart`）而不是四个同族 tool；`action` 的枚举
+    由映射表推导（写成固定表就会漏项：模型按说明书填了合法值却被拒，而这种错只有运行时才看得见）。
+  - **自重启不许挂死**（D2 的最后一格）：目标 == 发起者 ⇒ 核心**先应答再动手**（`Timer.run`
+    排到下一事件循环回合；microtask 不够：回包本身就在当前回合的微任务队列里），回包带
+    `deferred: true` + “结果以新一世取回快照时的读数为准”；**审计行据此写「已受理」而不写成功**。
+  - **每一次控制面动作留一行审计**（谁 / 何时 / 目标 / 结论），挂在 `handlePluginCommand` 这一处
+    而不是四个调用点；快照两条不审计。时间戳固定 `±HH:MM` 偏移形状（由用例正则钉住：审计的唯一
+    价值就是事后能读、能 grep）。**失败原因的键有两个名字**（挂载层惯例 `error`、热重启结论 `reason`）：
+    只读前者会把“新一世没起来”说成“未给出原因”（违反不变量 6）⇒ 挂载层现在两个都读。
+  - **「强制停止」是全框架唯一能因为界面按钮而 `kill()` 的入口**（`PluginBus.forceStop`）：
+    D8 不许的是**时长**判死，不是用户显式动作；它同时覆盖实例表与收尸台账两处目标，停完
+    逐个数退出确认，并如实说明“条目仍启用 ⇒ 下一次对账会再拉起来”。REST 仍是**同一条**
+    `POST /api/plugins/<id>/restart` 扩展 body `mode ∈ {cold, hot, force_stop}`（`cold` 缺省不带 body
+    ⇒ 旧请求逐字一致；未知值显式拒），不新开路径。
+  - **内置清单必须显式带 `suspension`**（**修改**不变量 25 的落点）：`PluginConfig.fromJson` 不保留
+    未知键 ⇒ 清单不写这一项，落盘条目就永远没有它 ⇒ “声明了可挂起的内置插件”被冷重启，而界面上
+    看上去就是“状态莫名没了”。`self_updater` = `kind: binary` + `granularity: team` + `scope: {}` +
+    `defaultEnabled: true` + `suspension: keep`；播种严格（条目根本没有才种 / 解析失败只记日志不落盘 /
+    用户关过绝不再自动打开）。空 `scope` ⇒ 工具走 `tools/list` 申报，给了 team ⇒ 走收集站
+    `plugin.tool.define`，**两条申报路共用同一份参数表**（漂移出的两个工具比“没工具”更难查）。
+  - **插件包零核心依赖 ⇒ 协议常量各自一份**：`packages/tree_self_updater` 只依赖
+    `tree_tunnel_protocol`（与 `tree_ssh_plugin` 同一条约束），漂移由 tree_protocol 的门禁把
+    `tree_self_updater/{lib,bin}` 列入扫描面来钉；“工具命名空间 `plugin__self_updater__*` 与插件
+    在 `hello` 里自报的 id 同串”由真子进程用例钉。
+  - **随包自检给的是退出码**：`tree_self_updater --selftest`（输出走 stderr，“stdout 只有协议帧”
+    这条规则不因模式而变）；`tool/build_self_updater.dart` 从根 pubspec 注入版本，
+    `tool/package_windows.dart` 拷 `build/plugins/tree_self_updater.exe` 进发行包 `plugins/`，
+    缺失只打印不算失败（与其他插件二进制同口径）——**装机后没有它 = 阶段 3 白做**。
+  - 用例（真子进程 + 可计数证据）：`plugin_tool_define_self_updater_test`（6：内置清单形状、
+    播种四态、两条申报路、schema 逐字一致、产物解析 + 自检退出码 0）、
+    `plugin_self_restart_tool_test`（6：代答不挂死、重启别人的完整结论、可读失败、
+    归属拒、审计、强制停止）、`plugin_hot_restart_station_test`（11→13：审计面与 `reason` 键）；
+    新包自身 `packages/tree_self_updater`（16）。本次计数：tree_core **1357 passed / 3 skipped /
+    0 failed**（上一轮 1343 + 14），tree_protocol **44**，tree_self_updater **16**，
+    `flutter test` **880**（877 + 3）。
+
 - **插件重启期保活：有界暂存 + 重放 + `plugin.state` 广播**（**新增**
   [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 27、
   [docs/plugin-development.md](docs/plugin-development.md) §3.1/§6.6）：

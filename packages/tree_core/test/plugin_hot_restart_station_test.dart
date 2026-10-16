@@ -32,26 +32,28 @@ void main() {
     Directory(p.dirname(configFile)).createSync(recursive: true);
     // 两条**不同 team** 的条目：归属口径的用例要靠它们区分（写在第一次 load 之前，
     // 否则 load() 的幂等会让新条目进不了内存 —— 这正是 applyConfigs 存在的理由）。
-    File(configFile).writeAsStringSync(<String>[
-      'enabled: true',
-      'plugins:',
-      '  - id: alpha',
-      '    name: 甲插件',
-      '    command: "definitely-not-a-real-command-xyz"',
-      '    args: []',
-      '    enabled: true',
-      '    granularity: team',
-      '    suspension: keep',
-      '    scope: {team_id: team-1}',
-      '  - id: beta',
-      '    name: 乙插件',
-      '    command: "definitely-not-a-real-command-xyz"',
-      '    args: []',
-      '    enabled: true',
-      '    granularity: team',
-      '    scope: {team_id: team-2}',
-      '',
-    ].join('\n'));
+    File(configFile).writeAsStringSync(
+      <String>[
+        'enabled: true',
+        'plugins:',
+        '  - id: alpha',
+        '    name: 甲插件',
+        '    command: "definitely-not-a-real-command-xyz"',
+        '    args: []',
+        '    enabled: true',
+        '    granularity: team',
+        '    suspension: keep',
+        '    scope: {team_id: team-1}',
+        '  - id: beta',
+        '    name: 乙插件',
+        '    command: "definitely-not-a-real-command-xyz"',
+        '    args: []',
+        '    enabled: true',
+        '    granularity: team',
+        '    scope: {team_id: team-2}',
+        '',
+      ].join('\n'),
+    );
     bus = PluginBus(
       configFile: configFile,
       coreVersion: 'test',
@@ -116,8 +118,9 @@ void main() {
   });
 
   test('插件点位的六条命令都真的挂上了挂载位置（表驱动，不是硬编码）', () {
-    final StationPointSpec spec =
-        StationPoints.byId(StationHubIds.executePlugin)!;
+    final StationPointSpec spec = StationPoints.byId(
+      StationHubIds.executePlugin,
+    )!;
     expect(spec.alias, 'plugin');
     expect(spec.label, '插件管理');
     expect(spec.readme, isNotEmpty, reason: '内置点位必须有介绍（面板详情页读它）');
@@ -130,8 +133,9 @@ void main() {
       'plugin.stateFetch',
     ]);
 
-    final ExecuteStation station =
-        bus.stations.executePointFor(StationHubIds.executePlugin)!;
+    final ExecuteStation station = bus.stations.executePointFor(
+      StationHubIds.executePlugin,
+    )!;
     final Set<String> mounted = station
         .mounts()
         .map((StationCommandMount m) => m.command)
@@ -142,8 +146,7 @@ void main() {
   test('每条 plugin.* 命令的 owner 都是插件点位（命令 → 点位唯一）', () {
     for (final String command in StationPoints.byId(
       StationHubIds.executePlugin,
-    )!
-        .commands) {
+    )!.commands) {
       expect(
         StationPoints.ownerOfCommand(command)?.id,
         StationHubIds.executePlugin,
@@ -159,8 +162,9 @@ void main() {
     expect(StationPoints.ownerOfCommand('plugin.stateDumpX'), isNull);
 
     // 2) 站点层面：直接拿插件点位执行它 ⇒ 拒并把本点位允许的六条全列出来
-    final ExecuteStation station =
-        bus.stations.executePointFor(StationHubIds.executePlugin)!;
+    final ExecuteStation station = bus.stations.executePointFor(
+      StationHubIds.executePlugin,
+    )!;
     final StationCommandResult denied = await station.execute(
       command: 'plugin.bogus',
       scope: const StationScope(teamId: 'team-1'),
@@ -216,7 +220,9 @@ void main() {
       // 没有 source_plugin_id ⇒ 证明不了快照归谁
       final StationCommandResult anonymous = await run(
         command,
-        arguments: const <String, dynamic>{'payload': <String, dynamic>{'a': 1}},
+        arguments: const <String, dynamic>{
+          'payload': <String, dynamic>{'a': 1},
+        },
       );
       expect(anonymous.ok, isFalse, reason: command);
       expect(anonymous.error, contains('插件身份'), reason: command);
@@ -241,7 +247,9 @@ void main() {
     final StationCommandResult noEra = await run(
       'plugin.stateDump',
       sourcePluginId: 'alpha',
-      arguments: const <String, dynamic>{'payload': <String, dynamic>{'k': 1}},
+      arguments: const <String, dynamic>{
+        'payload': <String, dynamic>{'k': 1},
+      },
     );
     expect(noEra.ok, isFalse, reason: '进程还没起来过就收快照 ⇒ 快照没有主人');
     expect(payloadOf(noEra), isEmpty);
@@ -252,7 +260,9 @@ void main() {
       command: 'plugin.stateDump',
       pluginId: 'ghost',
       sourcePluginId: 'ghost',
-      arguments: const <String, dynamic>{'payload': <String, dynamic>{'k': 1}},
+      arguments: const <String, dynamic>{
+        'payload': <String, dynamic>{'k': 1},
+      },
     );
     expect(unknown['ok'], isFalse);
     expect(unknown['error'], contains('没有插件条目'));
@@ -299,8 +309,9 @@ void main() {
     );
     expect(bare.mountExecuteStations(noManager), isNull);
 
-    final ExecuteStation station =
-        bare.stations.executePointFor(StationHubIds.executePlugin)!;
+    final ExecuteStation station = bare.stations.executePointFor(
+      StationHubIds.executePlugin,
+    )!;
     final StationCommandResult denied = await station.execute(
       command: 'plugin.list',
       scope: const StationScope(teamId: 'team-1'),
@@ -329,5 +340,119 @@ void main() {
         .cast<Map<String, dynamic>>()
         .firstWhere((Map<String, dynamic> e) => e['plugin_id'] == 'beta');
     expect(beta['suspendable'], isFalse, reason: 'beta 没声明 ⇒ 默认不可挂起（D3）');
+  });
+
+  // ── 7（阶段 3 新增）：审计面 ───────────────────────────────────────
+  test('审计面就是控制面四条（常量决定，不靠下一个写代码的人记得）', () async {
+    final List<String> logs = <String>[];
+    final PluginBus audited = PluginBus(
+      configFile: configFile,
+      heartbeatInterval: const Duration(seconds: 30),
+      log: (String message) => logs.add(message),
+    );
+    addTearDown(audited.close);
+    final ExecuteStationMounts mounts = ExecuteStationMounts.forStore(
+      store: MemoryStore(),
+      ioFor: (String agentId) async => null,
+      pluginManager: audited.handlePluginCommand,
+    );
+    expect(audited.mountExecuteStations(mounts), isNull);
+
+    // 常量层面：审计面**正好是**控制面四条（少一条 = 有一种重启事后查不到），
+    // 而快照两条不审计也是写定的（它们每一世都要下一次，记进去只会把日志刷满）。
+    expect(
+      PluginToolSurface.auditedCommands,
+      PluginToolSurface.agentToolCommands,
+    );
+    expect(
+      PluginToolSurface.auditedCommands.intersection(
+        PluginToolSurface.lifecycleOnlyCommands,
+      ),
+      isEmpty,
+    );
+
+    for (final String command in PluginToolSurface.agentToolCommands) {
+      await audited.handlePluginCommand(
+        command: command,
+        pluginId: 'alpha',
+        sourcePluginId: 'ui',
+      );
+    }
+    final List<String> audit = logs
+        .where((String m) => m.contains('插件控制面审计'))
+        .toList();
+    expect(audit, hasLength(PluginToolSurface.agentToolCommands.length));
+    // 一行里齐了四件事：谁 / 何时 / 目标 / 结论（缺任一件就回答不了“那次重启是谁干的”）
+    expect(
+      RegExp(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}')
+          .hasMatch(audit.first),
+      isTrue,
+      reason: audit.first,
+    );
+    for (final String command in PluginToolSurface.agentToolCommands) {
+      expect(
+        audit.any((String m) => m.contains('⇒ $command 目标=alpha')),
+        isTrue,
+        reason: command,
+      );
+    }
+    expect(audit.first, contains('插件 ui'), reason: '发起者不是插件时要说成“核心”，而不是留空');
+
+    // 快照两条：即使真的下了命令也不得出现在审计里
+    for (final String command in PluginToolSurface.lifecycleOnlyCommands) {
+      await audited.handlePluginCommand(
+        command: command,
+        pluginId: 'alpha',
+        sourcePluginId: 'alpha',
+        arguments: const <String, dynamic>{
+          'payload': <String, dynamic>{'k': 1},
+        },
+      );
+    }
+    expect(
+      logs.where((String m) => m.contains('插件控制面审计')).length,
+      audit.length,
+      reason: '快照两条把审计刷满的话，“谁重启了插件”就不好查了',
+    );
+  });
+
+  // ── 8（阶段 3 新增）：失败原因的键 ─────────────────────────────────
+  test('实现层只给 reason 时，挂载层也得把原因递出去（不许退化成“未给出原因”）', () async {
+    // `PluginHotRestartResult.toJson` 用的键是 reason，而挂载层惯例是 error：
+    // 只读 error 会把“新一世没起来”这种最要紧的失败说成没给原因（不变量 6）。
+    final PluginBus reasonOnly = PluginBus(
+      configFile: configFile,
+      heartbeatInterval: const Duration(seconds: 30),
+    );
+    addTearDown(reasonOnly.close);
+    final ExecuteStationMounts mounts = ExecuteStationMounts.forStore(
+      store: MemoryStore(),
+      ioFor: (String agentId) async => null,
+      pluginManager:
+          ({
+            required String command,
+            required String pluginId,
+            required String sourcePluginId,
+            Map<String, dynamic>? arguments,
+          }) async => <String, dynamic>{
+            'ok': false,
+            'plugin_id': pluginId,
+            'reason': '新一世没起来：模拟的启动失败',
+          },
+    );
+    expect(reasonOnly.mountExecuteStations(mounts), isNull);
+
+    final ExecuteStation station = reasonOnly.stations.executePointFor(
+      StationHubIds.executePlugin,
+    )!;
+    final StationCommandResult denied = await station.execute(
+      command: 'plugin.restart',
+      scope: const StationScope(teamId: 'team-1'),
+      arguments: const <String, dynamic>{'plugin_id': 'alpha'},
+      sourcePluginId: 'ui',
+    );
+    expect(denied.ok, isFalse);
+    expect(denied.error, contains('新一世没起来：模拟的启动失败'), reason: denied.error);
+    expect(denied.error, isNot(contains('未给出原因')));
   });
 }

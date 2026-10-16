@@ -63,45 +63,44 @@ typedef StationAgentCompactor = Future<Map<String, dynamic>> Function(
 /// ——为的是让这次调用的提示词与对话那一轮**逐字一致**从而吃到端点前缀缓存
 /// （实测：只加 `{"type":"json_object"}` 就会让端点改写提示词，同一 492 token 前缀的
 /// 命中从 384/256 掉到 **0**；见 docs/known-issues.md #27）。
-typedef StationLlmCaller =
-    Future<Map<String, dynamic>> Function({
-      required String agentId,
-      required String sessionId,
-      List<Object?>? messages,
-      String? prompt,
-      String? system,
-      String? model,
-      double? temperature,
-      int? maxTokens,
-      List<Object?>? tools,
-      String? responseFormat,
-    });
+typedef StationLlmCaller = Future<Map<String, dynamic>> Function({
+  required String agentId,
+  required String sessionId,
+  List<Object?>? messages,
+  String? prompt,
+  String? system,
+  String? model,
+  double? temperature,
+  int? maxTokens,
+  List<Object?>? tools,
+  String? responseFormat,
+});
 
 /// `tool.call` 的**执行任意工具**入口（点位化新增）。
 ///
 /// 走工具层的唯一入口（内置 / MCP / 插件工具统一分派），因此与模型调用工具**同一条
 /// 路径、同一份权限**（本仓库没有工具审批层，插件与 agent 同权）。
-typedef StationToolCaller =
-    Future<ToolOutcome> Function({
-      required String agentId,
-      required String sessionId,
-      required String tool,
-      required Map<String, dynamic> arguments,
-      required String sourcePluginId,
-      required bool relay,
-    });
+typedef StationToolCaller = Future<ToolOutcome> Function({
+  required String agentId,
+  required String sessionId,
+  required String tool,
+  required Map<String, dynamic> arguments,
+  required String sourcePluginId,
+  required bool relay,
+});
 
 /// `session.rename` 的会话重命名入口（与 REST `PATCH …/sessions/{id}` 同一实现）。
-typedef StationSessionRenamer =
-    Future<Map<String, dynamic>> Function({
-      required String agentId,
-      required String sessionId,
-      required String title,
-    });
+typedef StationSessionRenamer = Future<Map<String, dynamic>> Function({
+  required String agentId,
+  required String sessionId,
+  required String title,
+});
 
 /// `tool.close` 的**关闭一次运行中的工具**入口（核心注入；与右栏"关闭"按钮、
 /// ToolRunRegistry.close 是同一个实现）。
-typedef StationToolCloser = Future<Map<String, dynamic>> Function(String handle);
+typedef StationToolCloser = Future<Map<String, dynamic>> Function(
+  String handle,
+);
 
 /// `ssh.reconnect` 的**重建远端（SSH）链路**入口（核心注入；与 REST
 /// `POST /api/agents/{id}/ssh/reconnect`、右栏文件面板「重连」按钮同一实现）。
@@ -125,13 +124,12 @@ typedef StationSshReconnector = Future<Map<String, dynamic>> Function(
 ///
 /// 返回值约定与其它槽一致：`{ok: true, ...结论}` 或 `{ok: false, error: 可读中文}`。
 /// **不做静默降级**：没接线时本层直接以「未接线」失败（口径见类注释第 15 条）。
-typedef StationPluginManager =
-    Future<Map<String, dynamic>> Function({
-      required String command,
-      required String pluginId,
-      required String sourcePluginId,
-      Map<String, dynamic>? arguments,
-    });
+typedef StationPluginManager = Future<Map<String, dynamic>> Function({
+  required String command,
+  required String pluginId,
+  required String sourcePluginId,
+  Map<String, dynamic>? arguments,
+});
 
 /// 执行站命令的挂载位置集合（M9 Wave 3-I）。
 ///
@@ -463,7 +461,12 @@ class ExecuteStationMounts {
     );
     final Object? ok = result['ok'];
     if (ok is bool && !ok) {
-      final String error = _string(result['error']);
+      // 原因的键有两套写法：本层惯例是 `error`，而热重启的结论带的是 `reason`
+      // （`PluginHotRestartResult.toJson`）。只读 error 会把“新一世没起来”这种最要紧
+      // 的失败说成“未给出原因”（不变量 6：失败必须可读）。
+      final String error = _string(result['error']).isNotEmpty
+          ? _string(result['error'])
+          : _string(result['reason']);
       return StationCommandOutcome.failed(
         error.isEmpty ? '命令 $command 失败（未给出原因）' : error,
       );
@@ -849,9 +852,7 @@ class ExecuteStationMounts {
   ) async {
     final StationLlmCaller? caller = llmCaller;
     if (caller == null) {
-      return const StationCommandOutcome.failed(
-        'llm.call 未接线：核心未注入 LLM 调用器',
-      );
+      return const StationCommandOutcome.failed('llm.call 未接线：核心未注入 LLM 调用器');
     }
     final Object? rawMessages = context.arguments['messages'];
     final String prompt = _string(
@@ -927,9 +928,7 @@ class ExecuteStationMounts {
   ) async {
     final StationToolCaller? caller = toolCaller;
     if (caller == null) {
-      return const StationCommandOutcome.failed(
-        'tool.call 未接线：核心未注入工具执行器',
-      );
+      return const StationCommandOutcome.failed('tool.call 未接线：核心未注入工具执行器');
     }
     final String tool = _string(
       context.arguments['tool'] ?? context.arguments['name'],
@@ -987,9 +986,7 @@ class ExecuteStationMounts {
   ) async {
     final StationToolCloser? closer = toolCloser;
     if (closer == null) {
-      return const StationCommandOutcome.failed(
-        'tool.close 未接线：核心未注入工具运行关闭器',
-      );
+      return const StationCommandOutcome.failed('tool.close 未接线：核心未注入工具运行关闭器');
     }
     final String handle = _string(context.arguments['handle']);
     if (handle.isEmpty) {

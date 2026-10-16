@@ -221,6 +221,40 @@
     [test/plugin_state_broadcast_test.dart](../../../test/plugin_state_broadcast_test.dart)（6）、
     [test/plugin_status_compat_test.dart](../../../test/plugin_status_compat_test.dart)（6）。
 
+28. **「热重启一个插件」是一项能力，不是一次手工操作**（2026-10-15 阶段 3，D9/D2/D8）：
+    agent 侧的对外面由**三张常量表**定死，不靠下一个写 tool 的人记得：
+    `PluginToolSurface.agentToolCommands` = 可申报的控制面四条、`lifecycleOnlyCommands` =
+    永不进工具表的快照两条、`auditedCommands` = 前者。
+    - **一个 tool + `action` 参数**（`plugin_hot_restart`）而不是四个 tool：四个 tool 会
+      把模型工具表撑出四行同族条目，而它们本来就是同一个动作的四种问法。`action` 的
+      枚举**由映射表推导**（改成手写的固定表就会漏项：模型按说明书填了合法值却被拒，
+      而这种错只有运行时才看得见）。
+    - **自重启不许挂死**：目标 == 发起者 ⇒ **先应答再动手**（`Timer.run` 排到下一事件
+      循环回合；microtask 不够：回包本身就在当前回合的微任务队列里）。回包带
+      `deferred: true`，审计行据此写「已受理」而**不写成功**，结论在紧随其后的
+      「自重启收尾」行里；窗口内的站点请求由不变量 27 接住。
+    - **控制面每一次动作留一行审计**（谁 / 何时 / 目标 / 结论），挂在
+      `handlePluginCommand` **这一处**而不是四个调用点（REST / tool / 看门狗 / UI 各记一处
+      就一定会漏一个，漏掉的那个恰好是最需要它的那一个）；快照两条**不审计**（它们
+      每一世都要下一次，记进去只会把「谁重启了插件」淹掉）。只记结论，不记载荷。
+    - **「强制停止」是全框架唯一能因为界面按钮而 `kill()` 的入口**（`PluginBus.forceStop`）：
+      D8 不许的是**时长**判死，不是用户显式动作。它同时覆盖实例表与收尸台账两处目标，
+      停完逐个数退出确认，并如实说明「条目仍启用 ⇒ 下一次对账会再拉起来」。
+    - **内置清单必须显式带 `suspension`**：`PluginConfig.fromJson` 不保留未知键（不变量 25），
+      清单不写这一项 ⇒ 落盘条目永远没有它 ⇒ 「声明了可挂起的内置插件」被冷重启，而界面上
+      看上去就是「状态莫名没了」。`self_updater` 因此是 `defaultEnabled: true` + `suspension: keep`；
+      播种语义严格（条目根本没有才种 / 解析失败只记日志不落盘 / 用户关过绝不再自动打开）。
+    - **插件包零核心依赖 ⇒ 协议常量各自一份**，漂移由
+      [tree_protocol 的门禁](../../../../tree_protocol/test/plugin_rpc_method_gate_test.dart) 把
+      `packages/tree_self_updater/{lib,bin}` 列入扫描面来钉；而「工具名与插件自报 id 同串」
+      由真子进程用例钉。
+    - **随包自检给的是退出码**：`tree_self_updater --selftest`（输出走 stderr，
+      「stdout 只有协议帧」这条规则不因模式而变）。「面板没报错」证明不了工具真能申报进表。
+    用例：[test/plugin_tool_define_self_updater_test.dart](../../../test/plugin_tool_define_self_updater_test.dart)（6）、
+    [test/plugin_self_restart_tool_test.dart](../../../test/plugin_self_restart_tool_test.dart)（6）、
+    [test/plugin_hot_restart_station_test.dart](../../../test/plugin_hot_restart_station_test.dart)（13）；
+    插件自身：[packages/tree_self_updater](../../../../tree_self_updater/test/self_updater_loop_test.dart)（16）。
+
 ## 测试
 
 ```bash
@@ -234,6 +268,11 @@ dart test test/plugin_test.dart test/plugin_request_test.dart test/plugin_statio
           test/plugin_ui_replay_test.dart test/plugin_config_store_test.dart test/plugin_hot_apply_test.dart \
           test/builtin_plugin_script_roots_test.dart test/plugin_llm_relay_test.dart \
           test/compact_plugin_e2e_test.dart test/sample_plugin_layout_e2e_test.dart \
+          test/plugin_hot_restart_test.dart test/plugin_hot_restart_station_test.dart \
+          test/plugin_close_no_hard_timeout_test.dart test/plugin_state_pool_scope_test.dart \
+          test/plugin_restart_keepalive_test.dart test/plugin_restart_buffer_bounded_test.dart \
+          test/plugin_state_broadcast_test.dart test/plugin_status_compat_test.dart \
+          test/plugin_tool_define_self_updater_test.dart test/plugin_self_restart_tool_test.dart \
           test/plugin_api_test.dart
 ```
 

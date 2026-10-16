@@ -1149,6 +1149,61 @@ class PluginBus {
     return _hosts.containsKey(pluginId);
   }
 
+  /// **用户显式强制停止**一个插件实例：全项目里唯一能“因为有人按了按钮”而 `kill()`
+  /// 的入口（D8）。
+  ///
+  /// 顺序刻意是“先走优雅那条路、再补一刀”：直接 kill 会留下一堆指向死进程的东西
+  /// （站点订阅、工具表、UI 槽位、在途请求）。[_disconnect] 负责把那些一次收干净；
+  /// 只有它没等到进程自己走完时，才强杀 —— 原因写进日志与读数（谁杀的、为什么）。
+  ///
+  /// **不得接成任何自动动作**：判死只看心跳与进程不可用两处（不变量 15），“跑得太久”
+  /// 不是理由。也不能当作“停用”：对账看见 `enabled: true` 且没在跑就会再拉起来；
+  /// 想彻底不跑请关开关（那才是停用）。
+  ///
+  /// 等的仍是**事件**而不是时长：kill 之后等“退出已确认”，没杀成就不等。
+  Future<Map<String, dynamic>> forceStop(String pluginId) async {
+    load();
+    // 目标包括“已在实例表里”与“已在收尸台账里”两处：后者是上一世赖着不退的那个，
+    // 只处理前一处会让“强制停止”对真正卡住的那个进程一无所获。
+    final List<PluginHost> targets = <PluginHost>[
+      ?_hosts[pluginId],
+      for (final PluginHost host in _reaping)
+        if (host.config.id == pluginId) host,
+    ];
+    await _disconnect(pluginId);
+    int killed = 0;
+    for (final PluginHost host in targets) {
+      if (host.exitedConfirmed) continue;
+      if (host.killReason.isEmpty) {
+        host.killStray('用户显式强制停止插件 $pluginId');
+        killed++;
+        log?.call(
+          '插件 $pluginId 被用户强制停止 ⇒ 显式 kill（这是唯一的用户强杀入口；'
+          '不是时长判死，也不是看门狗收尸）',
+        );
+      }
+      // 等“退出已确认”这个事件（close 已关过，这里只是把退出递回来）。
+      await host.close(waitForExit: true);
+    }
+    return <String, dynamic>{
+      'ok': true,
+      'plugin_id': pluginId,
+      'killed': killed,
+      // 退出确认逐个数：没有目标（本来就没在跑）也算干净，否则面板会报“停不掉”。
+      'exited': targets.every((PluginHost host) => host.exitedConfirmed),
+      'lifecycle': lifecycleOf(pluginId).wire,
+      'generation': generationOf(pluginId),
+      // 原因从**目标宿主本身**读：`_disconnect` 已经把实例从表里摸掉了，
+      // 再走 [_pluginState] 那条路只会拿到空串（“杀了但说不清为什么杀的”）。
+      'kill_reason': targets
+          .map((PluginHost host) => host.killReason)
+          .firstWhere((String reason) => reason.isNotEmpty, orElse: () => ''),
+      'note':
+          '强制停止只结束这一世：条目仍是启用时，下一次对账会把它再拉起来'
+          '（想不再跑请关掉开关）',
+    };
+  }
+
   // ── 生命周期映射（集中一处）─────────────────────────────────────────
 
   /// 某插件当前的**代际**（每次 [_startOne] +1；从未启动过 = 0）。
@@ -1520,6 +1575,55 @@ class PluginBus {
     return null;
   }
 
+  /// 执行站 `plugin.*` 族的**入口**（挂载位置转进来）：干活 + 留审计。
+  ///
+  /// 为什么审计挂在这里而不是调用方：“热重启一个插件”是可以把别人在跑的会话
+  /// 拍掉的动作，**谁、何时、对哪个插件、结果如何**必须事后查得到（不变量 6/10）。
+  /// 挂在四个调用点（REST / agent tool / 看门狗 / UI）上就一定会漏一个，而漏掉的那个
+  /// 恰好是最需要它的那一个。只记结论，不记载荷（快照内容不归日志管）。
+  Future<Map<String, dynamic>> handlePluginCommand({
+    required String command,
+    required String pluginId,
+    required String sourcePluginId,
+    Map<String, dynamic>? arguments,
+  }) async {
+    final Map<String, dynamic> result = await _runPluginCommand(
+      command: command,
+      pluginId: pluginId,
+      sourcePluginId: sourcePluginId,
+      arguments: arguments,
+    );
+    if (PluginToolSurface.auditedCommands.contains(command)) {
+      final String who = sourcePluginId.isEmpty ? '核心' : '插件 $sourcePluginId';
+      final Object? ok = result['ok'];
+      // 自重启那一条**没有布尔结论**（结论在下一回合）：审计里不许写成「成功」，
+      // 否则事后查日志的人会以为重启已经完成，而它当时才刚排进事件循环。
+      final String outcome = result['deferred'] == true
+          ? '已受理（先应答再动手，结论见紧随其后的「自重启收尾」行）'
+          : ok is bool
+          ? (ok ? '成功' : '失败：${result['error'] ?? result['reason'] ?? '未给出原因'}')
+          : '已受理（命令没给布尔结论）';
+      log?.call(
+        '插件控制面审计｜$_auditStamp｜$who ⇒ $command 目标=${pluginId.isEmpty ? '（全部）' : pluginId}｜$outcome',
+      );
+    }
+    return result;
+  }
+
+  /// 审计行里的时间戳（到秒，带 ±HH:MM 偏移）：够定位“哪一次重启”，又不多到把日志搞脏。
+  String get _auditStamp {
+    final DateTime now = DateTime.now();
+    String two(int v) => v.toString().padLeft(2, '0');
+    // 偏移必须自己拼成 ±HH:MM：`Duration.toString()` 给的是 `8:00:00`，直接拼在秒后面
+    // 就成了 `11:47:278:00:00` —— 而审计的唯一价值就是事后能读、能 grep。
+    final Duration offset = now.timeZoneOffset;
+    final int absMinutes = offset.inMinutes.abs();
+    return '${now.year}-${two(now.month)}-${two(now.day)} '
+        '${two(now.hour)}:${two(now.minute)}:${two(now.second)}'
+        '${offset.inMinutes < 0 ? '-' : '+'}'
+        '${two(absMinutes ~/ 60)}:${two(absMinutes % 60)}';
+  }
+
   /// 执行站 `plugin.*` 族的实现（由 `ExecuteStationMounts.pluginManager` 转进来）。
   ///
   /// 「插件只能动自己的快照」已在挂载位置层校过一道（`_pluginCommand`）；这里再钉
@@ -1533,7 +1637,7 @@ class PluginBus {
   /// 下一个事件循环回合（而不是 microtask：回包本身就在当前回合的微任务队列里，
   /// 抢在它前面写 suspend 就等于没修）。这是“核心代答”的最小形态；窗口内的
   /// 暂存重放是阶段 2 的活。
-  Future<Map<String, dynamic>> handlePluginCommand({
+  Future<Map<String, dynamic>> _runPluginCommand({
     required String command,
     required String pluginId,
     required String sourcePluginId,
@@ -5191,6 +5295,13 @@ abstract final class PluginToolSurface {
     'plugin.stateDump',
     'plugin.stateFetch',
   };
+
+  /// 需要**留审计行**的命令：就是控制面那四条。
+  ///
+  /// 快照两条不审计是有意的：它们是插件自己续跑的内部动作（每一世都会下一次），
+  /// 把它们记进审计只会把日志刷满，而它们证明不了“动了别人的东西”——本来就动不了
+  /// （`_pluginCommand` 那里已经钉住了“只能是自己的键”）。
+  static const Set<String> auditedCommands = agentToolCommands;
 }
 
 /// 一次**热重启**的结论（每条都带可读结果，不“看起来成功了”）。
