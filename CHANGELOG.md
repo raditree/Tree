@@ -19,6 +19,41 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **插件管理只拉 release，不拉源码**（**新增**
+  [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 29、
+  [docs/plugin-development.md](docs/plugin-development.md) §6.8、插件发布仓合同
+  [plugins/README.md](plugins/README.md)）（用户 2026-10-16 定稿：「plugins 里是插件代码，
+  插件管理只拉 release」；plan 阶段 5 原定“`git clone` 源码仓”被这条口径**取代**）：
+  - **索引就是那张合同**：`releases/latest` → `plugin-index.json`（`schema: 1`）。schema 不认
+    就整份拒并说“不猜新字段的含义”（猜错的表现是“装上去起不来”，比“没得上”难查）；
+    `plugins[]` 里**坏条目只跳过自己**并逐条写下原因（一个手错的 JSON 不许带走整份清单）。
+    三道防线各自钉死：`asset`/`target` 必须纯文件名（与 `TreePaths.safeSegment` 同一条防穿越线）、
+    `bytes` 不符 ⇒ **不缓存半截文件**、`command` 必须出现在 `files[].target` 里。
+  - **换文件必须先过闸门**（`PluginBus.quiesceForSwap`，新增公开方法）：旧进程**已确认退出**
+    才动 `plugins/`。核心**不为换文件而 `kill()`**（唯一强杀入口仍是用户的「强制停止」，
+    不变量 15），也**不按墙钟等**：赛跑的是“退出已确认”与“心跳判失活”两个事件（D8）；
+    没等到就回可读原因且旧文件一字未动。停下来那一世记 `stopped` 而非 `restarting`（不变量 27
+    的路由判据因此不会把请求暂存后去重放一个装不上的新版）。顺序固定：缓存 → 闸门 →
+    同目录临时名 → 逐个原子改名（Windows 上正在运行的 exe 删不掉，“先换文件再重启”不成立）。
+  - **落盘与热应用不在下载器里**：`plugins.yaml` 仍只有 `_pluginStore` + `_applyPluginChange`
+    那一条既有路（不变量 10/20 的延伸）；条目上的 `source: release` / `repo_version` **只是展示键**
+    （行为一律只读已知键，写坏了也不影响运行），详情页据此回答“从哪里装的、哪一版”。
+  - **内置 id 不给覆盖**（取保守侧并在此记录）：`BuiltinPluginCatalog.specOf(id)` 命中就拒，
+    **不看条目在不在盘上**——内置身份由静态清单认定，两边各开一个开关就会抢同一条目。
+  - **REST 三条路由的失败形状写进契约**（`ApiPaths.pluginRelease` / `pluginReleaseRefresh` /
+    `pluginReleaseInstall`，均已进 `kept`）：读列表不联网（一个 URL 都不碰）并把
+    `online: false` 写进回包；**刷新失败也回 200 + `ok:false` + 缓存那一份**（`cached`），否则
+    “GitHub 限流”会显示成“仓库里没插件”；只有安装失败回 400 + `detail`（那一次确实什么都没改）。
+    未接入时三路由回可读 **503**（与插件总线未接入同口径，不用 501“功能开发中”）。
+  - **脚本型条目用与内置插件同一个探测口径**（`BuiltinPluginCatalog.detectRuntime`，新增公开
+    方法）：探不到解释器就**拒装**而不是写一条注定起不来的配置；解释器回 `BuiltinRuntime`
+    （命令 + 前缀参数）而非字符串（Windows 上命中的常常是 `py -3`）。
+  - **缓存与放置分目录**（`TreePaths.pluginsReleaseDir` = `<数据根>/plugins_release`）：半成品
+    不该出现在插件查找路径里，否则“下载了一半”会变成面板上一条起不来的插件。
+  用例：`test/plugin_downloader_test.dart`（19，整条发布链**离线**跑：假取回器注入）、
+  `test/plugin_config_api_test.dart`（+8：含“旧一世被优雅停掉后才换文件、再拉新一世”的真子进程用例）、
+  `test/plugin_panel_admin_test.dart`（+6）、`test/plugin_detail_page_test.dart`（+2）。
+
 - **框架自迭代插件：把「热重启一个插件（含重启它自己）」做成 agent tool**（**新增**
   [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 28、
   [packages/tree_self_updater/README.md](packages/tree_self_updater/README.md) 不变量 1-5、

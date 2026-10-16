@@ -689,6 +689,39 @@ plugins:
 与 agent 的那条 tool 对你就都是“换个进程接着干”；而随包二进制都建议带一条 `--selftest`
 （输出走 stderr、退出码 0 = 全部通过）：装机后的端到端验证读的是退出码，不是“面板有没有报错”。
 
+### 6.8 发布仓库：插件管理只拉 release（阶段 5）
+
+用户口径（2026-10-16 定稿）：**`plugins/` 仓里是插件源码，插件管理只拉 release**。
+装机端只读 `raditree/tree-plugins` 的 **GitHub Release 资产**，不 `git clone` 源码：
+源目录形状、构建产物在不在、谁负责编译，不该在用户机器上现场猜。
+
+合同的原文在 [plugins/README.md](../plugins/README.md)；装机端的实现是
+[plugin_downloader.dart](../packages/tree_core/lib/src/plugin/plugin_downloader.dart)，
+**改了合同必须同时改那里的校验**（两边各说各话的结局是“面板列不出来”或“装上去起不来”）。
+
+| 路由 | 做什么 | 失败时的形状 |
+|---|---|---|
+| `GET /api/plugin/release` | 读**本地缓存**的索引（一个 URL 都不碰，`online: false`） | 200 + `ok:false` + 可读原因 |
+| `POST /api/plugin/release/refresh` | `releases/latest` → `plugin-index.json` → 缓存 | 200 + `ok:false` + 原因 + `cached`（上一次那份） |
+| `POST /api/plugin/release/{pluginId}/install` | 资产进缓存 → 闸门 → 原子改名 → 写条目 + 热应用 | 400 + `detail`（那一次确实什么都没改） |
+
+三个关键点（都是现场能复现的）：
+
+* **索引 = 合同**：`schema: 1` 不认就整份拒（“不猜新字段的含义”），而 `plugins[]` 里的
+  坏条目**只跳过自己**并把原因交出去（面板逐条显示“跳过：…”）。`target` / `asset` 必须是
+  纯文件名，`bytes` 不符就**不缓存半截**，`command` 必须在 `files[].target` 里。
+* **换文件先过闸门**：该插件的旧进程**已确认退出**才动 `plugins/`。核心不会为了换文件
+  去杀一个正在干活的插件（强杀只有用户的「强制停止」那一条路，见 §6.7），也不按墙钟等：
+  等的是“退出已确认”与“心跳判失活”两个事件。换不成 ⇒ 旧文件一字未动，原因原样递到面板。
+* **来源标记只是展示**：装完写进 `plugins.yaml` 的 `source: release` / `repo_version`
+  由 `PluginConfigStore` 当未知键原样保留，行为一律只读已知键；详情页据此回答
+  “这一条是从哪里装的、装的是哪一版”。内置 id **不给覆盖**（内置项只走内置开关，
+  否则两个开关会抢同一条目）。
+
+发布一版（在 `tree-plugins` 仓根）：把 `plugin-index.json` 与索引里点到的每个文件
+一起传成 release 的资产 —— `gh release create v0.1.0 release/plugin-index.json <各资产>`。
+只传文件不改索引（或反之）会被判成“发布与索引不同版”，并给出这句原因。
+
 ---
 
 ## 7. 广播站与前端 UI

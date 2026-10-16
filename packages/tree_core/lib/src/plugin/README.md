@@ -10,6 +10,7 @@
 | [plugin_host.dart](plugin_host.dart) | 进程外插件宿主：行分隔 JSON-RPC 2.0，入站报文分三类（响应 / 请求 / 通知） |
 | [plugin_bus.dart](plugin_bus.dart) | 总线：配置、实例生命周期、事件分发、工具聚合、站点体系、心跳判活 |
 | [plugin_config_store.dart](plugin_config_store.dart) | `plugins.yaml` 读写层：直接在原始 Map 上"读 → 改 → 原子写"（保留未知键） |
+| [plugin_downloader.dart](plugin_downloader.dart) | 插件**发布仓库**（只读 GitHub Release 资产）：取索引 / 校验 / 下载缓存 / 原子放置（不落盘、不动总线） |
 | [builtin_plugins.dart](builtin_plugins.dart) | 内置插件静态清单 + 运行时 / 脚本解析 |
 | [plugin_guide.dart](plugin_guide.dart) | 插件开发指南在工作空间内的落点（`.self/docs/plugin-development.md`）与播种 |
 
@@ -255,6 +256,43 @@
     [test/plugin_hot_restart_station_test.dart](../../../test/plugin_hot_restart_station_test.dart)（13）；
     插件自身：[packages/tree_self_updater](../../../../tree_self_updater/test/self_updater_loop_test.dart)（16）。
 
+29. **插件管理只拉 release，不拉源码**（2026-10-16 阶段 5，用户定稿；D6/D8/不变量 6/10）：
+    `raditree/tree-plugins` 里放的是给人改的**源码**，装机端要的是发布方事先备好的
+    成品。把"能拉到源码"当成"能装上"会在用户机器上再造一条没人审的路（源目录形状、
+    构建产物在不在、谁负责编译，全得现场猜）。所以：
+    - **索引就是那张合同**：`releases/latest` → `plugin-index.json`（`schema: 1`）。
+      schema 不认就拒并说"不猜新字段的含义"——猜错的表现是"装上去起不来"，比
+      "没得上"难查得多。`plugins[]` 里**坏条目只跳过自己**并逐条写下原因，一个手错的
+      JSON 不许带走整份清单（面板把跳过原因原样显示）。
+    - **三道防线各自钉死**：`asset` / `target` 必须是纯文件名（与 `TreePaths.safeSegment`
+      同一条防路径穿越的线）；`bytes` 不符 ⇒ 按"没拿到"处理，**不缓存半截文件**；
+      `command` 必须出现在 `files[].target` 里（否则装完不知道拉哪个）。
+    - **换文件必须先过闸门**（`PluginBus.quiesceForSwap`）：旧进程**已确认退出**才换。
+      核心不为换文件而 `kill()`（唯一强杀入口仍是用户的「强制停止」，不变量 15），也不
+      按墙钟等：赛跑的是「退出已确认」与「心跳判失活」两个**事件**（D8）。顺序是
+      Windows 的现实：缓存 → 闸门 → 同目录临时名 → 逐个原子改名；任一步失败旧文件
+      一字未动。停下来那一世记 `stopped` 而不是 `restarting`：换文件期间没有"下一世一定
+      会回来"的保证，站点请求该按 stopped 的判据不投递，而不是暂存后重放一个装不上的新版。
+    - **落盘与热应用不在下载器里**：`plugins.yaml` 只有 `_pluginStore` + `_applyPluginChange`
+      那一条既有路（内置开关、自定义新增都走它）。再写一遍 = 两套会漂移的语义，而漂移的
+      代价是"面板说装好了、总线里却没有"。条目上的 `source: release` / `repo_version` 只是
+      展示键（行为一律只读已知键，所以它们写坏了也不影响运行）。
+    - **内置 id 不给覆盖**（取保守侧）：`BuiltinPluginCatalog.specOf(id)` 命中就拒，而且
+      **不看条目在不在盘上**——内置身份由静态清单认定，先被发布仓库写一条、再被人按内置
+      开关，就会变成两个主人抢同一条目（开关一按就把 command 写回随包那一份）。
+    - **离线不许看起来像最新**：`GET /api/plugin/release` 只读缓存（一个 URL 都不碰）并把
+      `online: false` 写进回包；刷新失败也回 **200 + `ok:false` + 缓存那一份**（`cached`），
+      否则"GitHub 今晚限流"会显示成"这个仓库没有插件"。只有安装失败回 400 + `detail`，
+      因为那一次确实什么都没改。
+    - 脚本型条目（`runtime: python`）用**与内置插件同一个**探测口径
+      （`BuiltinPluginCatalog.detectRuntime`）：探不到解释器就拒装，而不是写一条注定起不来的
+      配置（面板上多一个永远"启动失败"的条目比不装更糟）。解释器回的是
+      `BuiltinRuntime`（命令 + 前缀参数）而不是一个字符串：Windows 上命中的常常是 `py -3`。
+    用例：[test/plugin_downloader_test.dart](../../../test/plugin_downloader_test.dart)（19，整条链离线跑）、
+    [test/plugin_config_api_test.dart](../../../test/plugin_config_api_test.dart)（新增 8 条 REST）、
+    面板与详情页：`test/plugin_panel_admin_test.dart`（新增 6）、`test/plugin_detail_page_test.dart`（新增 2）。
+    合同原文见仓库根 [plugins/README.md](../../../../../plugins/README.md)。
+
 ## 测试
 
 ```bash
@@ -273,6 +311,7 @@ dart test test/plugin_test.dart test/plugin_request_test.dart test/plugin_statio
           test/plugin_restart_keepalive_test.dart test/plugin_restart_buffer_bounded_test.dart \
           test/plugin_state_broadcast_test.dart test/plugin_status_compat_test.dart \
           test/plugin_tool_define_self_updater_test.dart test/plugin_self_restart_tool_test.dart \
+          test/plugin_downloader_test.dart test/plugin_config_api_test.dart \
           test/plugin_api_test.dart
 ```
 
