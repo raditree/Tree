@@ -456,12 +456,16 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 >    ⚠️ 本节旧版写的"`response_format` 只是请求参数、**不影响**前缀匹配"**已被真机证伪**；
 >    走 text 之后输出形状靠你在提示词里写死（非法 JSON 会让 `llm.call` 如实报错）。
 >
-> **参考实现**：内置插件「上下文压缩」（`plugins/compact_plugin.py`，界面里一项开关）——
+> **参考实现**：内置插件「上下文压缩」（[`plugins/compact/compact_plugin.dart`](../plugins/compact/compact_plugin.dart)，
+> 界面里一项开关，随包为 `tree_compact[.exe]`）——
 > 摘要（背景 / 轨迹 / 改动产出文件）+ 必读文件（≤11 个、精确行范围，用伪造的 `read`
 > 工具调用拼进上下文）+ todo 快照（`set_todo_list get`）；**尾部原样抄回**
 > （`covered = total_message_count`），切点保留最近 `--keep-rounds` 轮 user，且在该区域
-> 里最多保留 `--keep-tool-rounds`（默认 8）个工具轮（单轮超长工具轨迹因此压得动）。
-> 任何一步失败都回 `null`。可直接读它当模板（`python plugins/compact_plugin.py --selftest`）。
+> 里最多保留 `--keep-tool-rounds`（默认 8）个工具轮（单轮超长工具轨迹因此压得动），
+> 并且**切点永不落在 `tool` 消息上**（否则尾部以孤儿工具结果开头 = 端点 400）。
+> 任何一步失败都回 `null`，而且**带一句可读原因**（回包可选键 `reason`）。
+> 可直接读它当模板（`dart run plugins/compact/compact_plugin.dart --selftest`，193 条，
+> 不需要真核心；编译：`dart run tool/build_plugins.dart --only compact`）。
 
 ### 5.4 接管 LLM：一次性 与 流式
 
@@ -1044,12 +1048,17 @@ plugins:
   `prompt.system` 改写（`--relay-prompt`）、`llm.call` / `tool.call` / `session.rename`
   三条新命令（`--llm-call` / `--tool-call` / `--rename-session`）、工具广播订阅（`--watch-tools`）、
   自建站点（`--self-station`）、心跳与 `--selftest`。
-- [`examples/plugins/compact_plugin.py`](../examples/plugins/compact_plugin.py)：**内置插件
-  「上下文压缩」**——`system.relay.context.compact` 的完整实现（摘要 + 必读文件 + todo 快照，
-  编排 `llm.call` / `fs.read` / `tool.call`），也是"压缩点位怎么接"的活文档。它还带一个
-  **左栏面板**（`activity` 槽位 = 活动栏图标 + 左栏整页）：最近 N 次压缩的时间 / 来源 /
-  覆盖条数 / 耗时 / 降级与未接管原因，加一个「立即压缩一次」按钮（执行站 `agent.compact`）
-  ——"面板 + 面板动作回传"这份契约的可运行答案（`--no-panel` 可关掉面板）。
+- [`plugins/compact/compact_plugin.dart`](../plugins/compact/compact_plugin.dart)：**内置插件
+  「上下文压缩」（Dart，成品 `tree_compact[.exe]`）**——`system.relay.context.compact` 的完整实现
+  （摘要 + 必读文件 + todo 快照，编排 `llm.call` / `fs.read` / `tool.call`），也是"压缩点位怎么接"
+  与"前缀缓存三条件怎么满"的活文档（tools 原样透传 / 不用 `llm.call` 的 `system` /
+  `response_format` 显式 `text`，少一条就整段不命中）。它还交了另一份完整面：**不接管必须带原因**
+  （回包可选键 `reason` + 面板 + 日志三处落点）、**总结回包坏了的三段抢救**（本地结构修复 →
+  一次“判完整性 + 修 json”小调用 → 放弃）、**用量从载荷里的 `recent_usage` 并入面板**（插件读不到
+  数据根，按整行内容去重）。自检 193 条（同样走真帧面）。编译：`--only compact`。
+- [`examples/plugins/compact_plugin.py`](../examples/plugins/compact_plugin.py)：上面那份的
+  **Python 旧版**，暂时还住在示例目录里：两份真进程用例（`compact_plugin_e2e_test.dart` /
+  `compact_panel_ui_test.dart`）目前还拿它拼命令，改跑 Dart 产物后一并删除。
 - [packages/tree_self_updater](../packages/tree_self_updater/README.md)：**binary 型内置插件**的参考实现
   （框架自迭代插件）：自带协议常量表、两条申报路共用同一份参数表、`suspend` 里「先转储等回包再 ack」，
   带 `--selftest`（退出码 0 = 全绿）。它不是脚本，但是“一个插件能做到什么”的最小可读完整面（见 §6.7）。

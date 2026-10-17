@@ -49,12 +49,35 @@
     家另在 `PluginUiFrameType`，**故意不在** RPC 登记面）、`kUiViewTypes` 对 `PluginUiViewType.all`。
     两张表拿同一个名字 = 两边谁也不信谁；控件集清单漂了的现场表现是"面板报了个未知类型"，
     而插件自己看到的是"声明成功了"。
-  - 首批迁移：**`minimal`、`suspendable` 与 `terminal_probe` 已入插件仓（Dart）并从
-    `examples/plugins/` 删除**；其余两个（`sample` / `compact`）仍按 Python 随包，逐个跟进
-    （本阶段不一次动完，是为了每个切片都能单独回滚）。
+  - **`runtime: binary` 的内置插件换了代，老落盘配置必须启动期重写**（**新增**
+    [packages/tree_core/lib/src/plugin/builtin_plugins.dart](packages/tree_core/lib/src/plugin/builtin_plugins.dart)
+    `migrateBuiltinEntries`、
+    [packages/tree_core/test/builtin_entry_migration_test.dart](packages/tree_core/test/builtin_entry_migration_test.dart)）：
+    `plugins.yaml` 存的是**解析后的** command/args（只有面板拨开关才会重写），所以清单从
+    `python + compact_plugin.py` 改成 `tree_compact` 之后，老用户那条仍指向一个已经不在包里的
+    `.py`——表现是“上下文压缩突然起不来”，而配置看上去完全正常（归因要穿过落盘配置 / 打包
+    清单 / 发布索引三处）。迁移的四条口径都是**少改**：只动 `builtin: true` 的条目、只处理清单
+    已是 binary 的这一代（python→python 的重写会白白在开机时探一遍解释器）、命令已是目标二进制
+    就什么都不做（**幂等**：每次开机都跑，不能每次改用户的文件）、解析失败则保持现状并留一行。
+    迁移的是命令，不是开关：用户的 `enabled` 与 `env` 原样保留。
+  - **`--only` 不得把发布索引截成一条**（**修改** [tool/build_plugins.dart](tool/build_plugins.dart)）：
+    `build/plugins/plugin-index.json` 就是发布合同本体，装机端拿它列可装清单——以前单编一个插件
+    会写出一份只有一条的索引，其余插件从市场上“突然消失”，而原因藏在一次本地开发构建里。现在
+    `--only` 与旧索引**按 id 合并**（全量构建仍不合并：仓里删掉的插件必须从索引消失，留着就是幽灵条目）。
+  - **抢救摘要那段尾逗号修复以前是坏的**（实现事实，但由自检当场抓出）：Dart 的
+    `String.replaceAll(Pattern, String)` **不展开** `$1`（把 `$1` 当字面量插回去），所以
+    `{…,}` 会被“修”成 `{…$1`——看着像走通了 salvage 分支，实际把 json 越修越坏。改用
+    `replaceAllMapped` 并由自检钉住（“本地能修好就不该再调模型”那一条）。这也是“产物必须跑
+    真代码自检”的理由之一：它不需要真核心，却能拓住一个静默错误的分支。
+  - 首批迁移：**`minimal`、`suspendable`、`terminal_probe` 已入插件仓（Dart）并从
+    `examples/plugins/` 删除**；**`compact` 已入插件仓并已接进内置清单**（它的
+    `examples/plugins/compact_plugin.py` 还在，因为两个真进程用例仍拿它拼命令——改跑 Dart
+    产物的下一个切片一并删）；只剩 `sample`（仍按 Python 随包）。本阶段不一次动完，
+    是为了每个切片都能单独回滚。
   - 计数：tree_protocol 门禁 44 → **49**（新增 5 条源码侧合同用例；扫描面 += `plugins`）；
-    插件自检 minimal 9 条 + suspendable 16 条 + terminal_probe 77 条（假核心，跑的是与成品
-    exe 同一个 `run()`）。
+    tree_core 1455 → **1462**（新增 7 条换代迁移用例）；
+    插件自检 minimal 9 条 + suspendable 16 条 + terminal_probe 77 条 + **compact 193 条**
+    （假核心，跑的是与成品 exe 同一个 `run()`）。
 - **整轮接管只能夺「编排」，不能夺「写」**（**新增**
   [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 31、
   [docs/plugin-development.md](docs/plugin-development.md) §5.6、

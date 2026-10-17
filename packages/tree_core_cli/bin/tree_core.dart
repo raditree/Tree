@@ -747,14 +747,34 @@ Future<void> _warmUpPeripheralsAfterHandshake(
         (
           name: '插件',
           run: () async {
-            // 「默认开」的内置插件（目前只有 `ssh_executor` 中转站）在**首次随包出现**
-            // 时播种一条 enabled: true —— 用户显式关过就绝不再自动打开（见
-            // [seedDefaultEnabledBuiltins]）。必须排在 `plugins.start()` 之前：
-            // start 会做一次配置对账，播种晚了对账就看不到这条。
+            // 内置插件的两件 startup 事必须都排在 `plugins.start()` 之前（start 会做
+            // 一次配置对账，改晚了对账看不到）：
+            // 1) [migrateBuiltinEntries]：清单已从 Python 脚本换成随包二进制的项（现在
+            //    是 `compact`），把磁盘上那条老命令重写掉——不迁移的后果是“插件突然
+            //    起不来”，而 plugins.yaml 看上去完全正常；
+            // 2) [seedDefaultEnabledBuiltins]：`defaultEnabled` 的项（`ssh_executor` 中转站
+            //    与 `self_updater`）首次随包出现时播种一条 enabled: true；用户显式关过
+            //    就绝不自动打开。
+            final PluginConfigStore builtinStore = PluginConfigStore(
+              plugins.configFile,
+            );
+            try {
+              final List<String> moved = await migrateBuiltinEntries(
+                catalog: BuiltinPluginCatalog(),
+                store: builtinStore,
+                log: log,
+              );
+              if (moved.isNotEmpty) {
+                log('已迁移换代后的内置插件命令：${moved.join('、')}');
+              }
+            } catch (error) {
+              // 迁移失败不该拦住插件系统启动（最坏就是那一项还要用户在面板上重开一次）。
+              log('内置插件换代迁移失败（已忽略）：$error');
+            }
             try {
               final List<String> seeded = await seedDefaultEnabledBuiltins(
                 catalog: BuiltinPluginCatalog(),
-                store: PluginConfigStore(plugins.configFile),
+                store: builtinStore,
                 log: log,
               );
               if (seeded.isNotEmpty) {

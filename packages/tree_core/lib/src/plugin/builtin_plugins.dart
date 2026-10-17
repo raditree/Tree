@@ -15,6 +15,10 @@ const String kSelfUpdaterPluginId = 'self_updater';
 /// 随包可执行文件的基本名（Windows 上解析时补 `.exe`）。
 const String kSelfUpdaterBinaryName = 'tree_self_updater';
 
+/// 内置压缩器的插件 id 与随包二进制基本名（2026-10-17：从 Python 脚本换成 Dart 产物）。
+const String kCompactPluginId = 'compact';
+const String kCompactBinaryName = 'tree_compact';
+
 /// 内置插件的**静态清单**（M9 §4.2：内置插件与自定义插件都要能在前端开/关）。
 ///
 /// 为什么清单在核心而不是前端：内置插件的"身份"必须由核心认定——前端只拿到
@@ -215,18 +219,25 @@ class BuiltinPluginCatalog {
       granularity: 'team',
       scope: <String, dynamic>{},
     ),
+    // 2026-10-17：**随包二进制**（以前是 `compact_plugin.py` + 解释器）。
+    // 换代的理由不是“Dart 比较好看”，而是这份插件要在用户机器上零依赖地跑起来：
+    // Python 形态下“没装 Python”与“装了但不在 PATH”在面板上都表现为一个开关弹不开，
+    // 而核心自己就是 Dart，产物已经在包里——没道理再要求用户多一个运行时。
+    // 老磁盘配置里那条 `python + …compact_plugin.py` 由 [migrateBuiltinEntries] 在
+    // 启动期重写（不重写的结局是“压缩突然起不来”，而配置看上去完全正常）。
     BuiltinPluginSpec(
-      id: 'compact',
+      id: kCompactPluginId,
       name: '上下文压缩',
       description:
-          '内置压缩器（Python）：接管 `system.relay.context.compact`，把长会话压成'
+          '内置压缩器（随包二进制，不是脚本）：接管 `system.relay.context.compact`，把长会话压成'
           '「摘要（背景 / 轨迹 / 改动产出文件）+ 必读文件（≤11 个，精确行范围，'
           '以 read 工具调用的形式拼进上下文）+ todo 快照」，最近一轮原文原样保留。'
+          '总结调用走前缀缓存三条件（tools 透传 / 不用 system / response_format=text）；'
           '任何一步失败都会退回核心内置压缩，不会让上下文丢失。'
-          '打开后会调用 Python 运行 plugins/compact_plugin.py；'
-          '自检：`python plugins/compact_plugin.py --selftest`。',
-      script: 'compact_plugin.py',
-      runtime: 'python',
+          '自检：`tree_compact --selftest`（不需要真核心，退出码 0 = 全绿）。',
+      script: kCompactBinaryName,
+      runtime: 'binary',
+      kind: BuiltinPluginSpec.kindBinary,
       granularity: 'team',
       scope: <String, dynamic>{},
     ),
@@ -618,4 +629,73 @@ Future<List<String>> seedDefaultEnabledBuiltins({
     }
   }
   return seeded;
+}
+
+/// **内置插件换代迁移**：清单已经把某一项换成随包二进制，而磁盘上那条还是老一代的
+/// 解释器命令（`python` + `…/compact_plugin.py`）时，启动期把它重写掉。
+///
+/// 为什么必须做在启动期而不是等用户拨开关：`plugins.yaml` 里存的是**解析后的**
+/// command/args（见 [BuiltinPluginCatalog.entryFor]），只有面板开关才会重写。清单一改，
+/// 老条目仍指向那个已经不在包里的 `.py`——表现是“上下文压缩突然起不来”，而配置
+/// 看上去完全正常，归因要穿过落盘配置、打包清单、发布索引三处。
+///
+/// 四条口径都是“少改”而不是“改全”：
+/// - 只动 `builtin: true` 的条目（用户自己写的同 id 条目不是我们的事）；
+/// - 只处理**清单已是 binary** 的这一代：python→python 的重写会白白触发解释器探测
+///   （开机多起两个进程），而那条路由面板开关服务已经够了；
+/// - 命令名已经是目标二进制 ⇒ 什么都不做（**幂等**：每次启动都跑，不能每次改文件）；
+/// - 解析失败 ⇒ 保持现状并留一行（改坏比不改更糟）。
+///
+/// 迁移的是**命令**：用户的 `enabled` 与 `env` 原样保留（不该因为换运行时就被
+/// 重新打开，也不该丢掉他手加的环境变量）。
+Future<List<String>> migrateBuiltinEntries({
+  required BuiltinPluginCatalog catalog,
+  required PluginConfigStore store,
+  void Function(String message)? log,
+  bool? isWindows,
+}) async {
+  final bool windows = isWindows ?? Platform.isWindows;
+  final List<String> migrated = <String>[];
+  for (final BuiltinPluginSpec spec in BuiltinPluginCatalog.specs) {
+    if (spec.kind != BuiltinPluginSpec.kindBinary) continue;
+    final Map<String, dynamic>? stored = store.readEntry(spec.id);
+    if (stored == null || stored['builtin'] != true) continue;
+    final String want = BuiltinPluginCatalog.binaryFileName(
+      spec,
+      isWindows: windows,
+    );
+    final String storedCommand = '${stored['command'] ?? ''}';
+    if (storedCommand.isNotEmpty &&
+        p.basename(storedCommand.replaceAll('\\', '/')) == want) {
+      continue; // 已经是这一代
+    }
+    final BuiltinResolution resolution = await catalog.resolve(spec);
+    if (!resolution.ok) {
+      log?.call('内置插件 ${spec.id} 换代跳过（解析不到 $want，保持现状）：${resolution.error}');
+      continue;
+    }
+    final Map<String, dynamic> fresh = BuiltinPluginCatalog.entryFor(
+      spec,
+      resolution,
+      enabled: stored['enabled'] != false,
+    );
+    final Object? env = stored['env'];
+    if (env is Map && env.isNotEmpty) {
+      fresh['env'] = env.map(
+        (Object? key, Object? value) =>
+            MapEntry<String, dynamic>('$key', '$value'),
+      );
+    }
+    final PluginStoreResult result = store.upsert(fresh);
+    if (!result.ok) {
+      log?.call('内置插件 ${spec.id} 换代写入失败：${result.error}');
+      continue;
+    }
+    migrated.add(spec.id);
+    log?.call(
+      '内置插件 ${spec.id} 已从「${storedCommand.isEmpty ? '空命令' : storedCommand}」'
+      '换到随包二进制 ${resolution.command}',
+    );
+  }
+  return migrated;
 }

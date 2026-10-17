@@ -2,7 +2,7 @@
 ///
 /// 用法：
 ///   dart run tool/build_plugins.dart                 # 全编 + 逐个 --selftest + 写索引
-///   dart run tool/build_plugins.dart --only compact  # 只编一个（开发回路）
+///   dart run tool/build_plugins.dart --only compact  # 只编一个（开发回路；**索引与其余条目合并**）
 ///   dart run tool/build_plugins.dart --skip-selftest # 只编译（CI 里先验编译面）
 ///   dart run tool/build_plugins.dart --out 目录 --index 文件  # 改产物目录 / 索引落地
 ///
@@ -130,17 +130,54 @@ Future<void> main(List<String> args) async {
   }
 
   indexFile.parent.createSync(recursive: true);
+  // `--only` 只编一个时，**绝不能把索引重写成那一条**：`plugin-index.json` 就是发布
+  // 合同本体，装机端（`PluginDownloader`）拿它列可装清单——这里少一条，界面上就是
+  // “那个插件突然装不上了”，而原因藏在一次本地开发构建里（最难归因的一类）。
+  // 全量构建则不合并：仓里删掉的插件必须从索引里消失，留着就是幽灵条目。
+  final Set<String> rebuilt = indexEntries
+      .map((Map<String, dynamic> entry) => '${entry['id']}')
+      .toSet();
+  final List<Map<String, dynamic>> outbound = <Map<String, dynamic>>[
+    ...indexEntries,
+  ];
+  int carried = 0;
+  if (only.isNotEmpty && indexFile.existsSync()) {
+    try {
+      final Object? previous = asJson(indexFile.readAsStringSync())['plugins'];
+      if (previous is List) {
+        for (final Object? item in previous) {
+          if (item is! Map) continue;
+          final String id = '${item['id'] ?? ''}';
+          if (id.isEmpty || rebuilt.contains(id)) continue;
+          outbound.add(
+            item.map(
+              (Object? key, Object? value) =>
+                  MapEntry<String, dynamic>('$key', value),
+            ),
+          );
+          carried++;
+        }
+      }
+    } catch (error) {
+      stderr.writeln('[build_plugins] 现有索引读不动（本次产物直接覆盖）：$error');
+    }
+  }
+  outbound.sort(
+    (Map<String, dynamic> a, Map<String, dynamic> b) =>
+        '${a['id']}'.compareTo('${b['id']}'),
+  );
   indexFile.writeAsStringSync(
-    '${const JsonEncoder.withIndent('  ').convert(<String, dynamic>{'schema': 1, 'plugins': indexEntries})}\n',
+    '${const JsonEncoder.withIndent('  ').convert(<String, dynamic>{'schema': 1, 'plugins': outbound})}\n',
     encoding: utf8,
   );
   stdout.writeln(
     '[build_plugins] 索引已写出：${_relative(root, indexFile.path)}'
-    '（${indexEntries.length} 条 / ${manifests.length} 个插件目录）',
+    '（本次 ${indexEntries.length} 条 / 沿用上批 $carried 条 / '
+    '${manifests.length} 个插件目录参与编译）',
   );
   stdout.writeln(
     '[build_plugins] 发布：gh release create v<版本> ${_relative(root, indexFile.path)} '
-    '${indexEntries.map((Map<String, dynamic> e) => _assetName(e)).join(' ')}',
+    '${outbound.map((Map<String, dynamic> e) => _assetName(e)).join(' ')}',
   );
 
   if (failures.isNotEmpty) {

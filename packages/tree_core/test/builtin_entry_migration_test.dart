@@ -1,0 +1,255 @@
+// 内置插件的**换代迁移**（Python 脚本 → 随包二进制）：钉住"老用户开机不炸"这一件事。
+//
+// 背景：内置清单里 `compact` 从 `python + …/compact_plugin.py` 换成了随包二进制
+// `tree_compact[.exe]`。而 `plugins.yaml` 存的是**解析后的** command/args（只有面板开关
+// 才会重写它），于是老用户磁盘上那条仍然指向一个已经不在包里的 `.py`：表现是
+// "上下文压缩突然起不来"，配置看上去完全正常，归因要穿过落盘配置 / 打包清单 / 发布
+// 索引三处——这是最难查的一类，所以迁移与这几条用例一起进仓。
+//
+// 钉住的五件事：
+// 1. 清单真换了代（kind=binary + 二进制名进 `protectedFileNames`，脚本名不再进）；
+// 2. 老条目被重写成新命令，而用户的 `enabled` 与 `env` **一个都不动**；
+// 3. 幂等：命令已是这一代就什么都不做（每次开机都跑，不能每次都改用户的文件）；
+// 4. 三种"不该动"：不是 builtin / 条目根本不存在 / 解析失败（最后一种必须留一行）；
+// 5. **python 型条目绝不在启动期重写**——那会白白跑一遍解释器探测（开机多起两个进程），
+//    而那条路本来就有面板开关在服务。
+import 'dart:io';
+
+import 'package:path/path.dart' as p;
+import 'package:test/test.dart';
+import 'package:tree_core/tree_core.dart';
+
+void main() {
+  late Directory temp;
+  late Directory binDir;
+  late String configFile;
+  late PluginConfigStore store;
+
+  setUp(() {
+    temp = Directory.systemTemp.createTempSync('tree_builtin_migration_');
+    binDir = Directory(p.join(temp.path, 'plugins'))
+      ..createSync(recursive: true);
+    final File file = File(p.join(temp.path, 'config', 'plugins.yaml'));
+    file.createSync(recursive: true);
+    configFile = file.path;
+    store = PluginConfigStore(configFile);
+  });
+
+  tearDown(() {
+    for (int i = 0; i < 5; i++) {
+      try {
+        if (temp.existsSync()) temp.deleteSync(recursive: true);
+        return;
+      } catch (_) {
+        // Windows 上刚落盘的句柄可能还没释放。
+        sleep(const Duration(milliseconds: 50));
+      }
+    }
+  });
+
+  /// 假目录：产物只有一条 `tree_compact`（[withBinary] = false 模拟"还没构建产物"）。
+  ///
+  /// `isWindows: false` 让名字不带 `.exe`，用例在哪个平台跑都同一个字符串。
+  BuiltinPluginCatalog catalog({bool withBinary = true}) {
+    if (withBinary) {
+      File(p.join(binDir.path, kCompactBinaryName))
+          .writeAsStringSync('placeholder');
+    }
+    return BuiltinPluginCatalog(
+      scriptRoots: <String>[
+        p.join(temp.path, withBinary ? 'plugins' : 'nowhere'),
+      ],
+      isWindows: false,
+    );
+  }
+
+  /// 落一条"老一代"的内置条目：解释器 + 脚本绝对路径（就是换代前 `entryFor` 的产物）。
+  void seedLegacy({
+    String id = kCompactPluginId,
+    String name = '上下文压缩',
+    String command = 'python',
+    List<String> args = const <String>[],
+    bool builtin = true,
+    bool enabled = true,
+    Map<String, String> env = const <String, String>{},
+  }) {
+    final Map<String, dynamic> entry = <String, dynamic>{
+      'id': id,
+      'name': name,
+      'command': command,
+      'args': <String>[
+        if (args.isEmpty)
+          p.join(temp.path, 'examples', 'plugins', '${id}_plugin.py'),
+        ...args,
+      ],
+      'env': <String, String>{...env},
+      'enabled': enabled,
+      'granularity': 'team',
+      'scope': <String, dynamic>{},
+      if (builtin) 'builtin': true,
+    };
+    expect(store.upsert(entry).ok, isTrue, reason: '夹具写不进去就是用例自己的问题');
+  }
+
+  // ── 1 清单本身 ──────────────────────────────────────────────────────────
+
+  test('内置清单：compact 已是随包二进制（不再要求用户额外装 Python）', () {
+    final BuiltinPluginSpec? spec = BuiltinPluginCatalog.specOf(
+      kCompactPluginId,
+    );
+    expect(spec, isNotNull);
+    expect(spec!.kind, BuiltinPluginSpec.kindBinary);
+    expect(spec.runtime, 'binary');
+    expect(spec.script, kCompactBinaryName);
+    // 随包名进"受保护文件"名单：发布索引把这两个名字当 target 就会盖掉核心自带的东西。
+    final Set<String> protected = BuiltinPluginCatalog.protectedFileNames(
+      isWindows: true,
+    );
+    expect(protected, contains('$kCompactBinaryName.exe'));
+    expect(
+      protected,
+      isNot(contains('compact_plugin.py')),
+      reason: '清单换了代，受保护名也跟着换——留着旧名等于假装那个脚本还在包里',
+    );
+  });
+
+  // ── 2 迁移本体 ──────────────────────────────────────────────────────────
+
+  test('老配置（python + compact_plugin.py）在启动期换成随包二进制', () async {
+    seedLegacy(enabled: false, env: const <String, String>{'TREE_DEBUG': '1'});
+    final List<String> lines = <String>[];
+    final List<String> moved = await migrateBuiltinEntries(
+      catalog: catalog(),
+      store: store,
+      log: lines.add,
+      isWindows: false,
+    );
+    expect(moved, contains(kCompactPluginId));
+    final Map<String, dynamic> entry = store.readEntry(kCompactPluginId)!;
+    expect(entry['command'], endsWith(kCompactBinaryName));
+    expect(
+      entry['args'],
+      isEmpty,
+      reason: 'binary 型没有脚本参数；留着那条 .py 路径就是指向不存在的文件',
+    );
+    expect(entry['enabled'], false, reason: '迁移的是命令，不是开关：用户关过就不该被这次重写打开');
+    expect(
+      (entry['env'] as Map)['TREE_DEBUG'],
+      '1',
+      reason: '用户手加的环境变量不能被 entryFor 的空 env 抹掉',
+    );
+    expect(
+      entry['builtin'],
+      true,
+      reason: '仍标 builtin，UI 才能继续把它放在「内置」分组里（只给停用不给删除）',
+    );
+    expect(lines.join('\n'), contains(kCompactBinaryName));
+  });
+
+  // ── 3 幂等 ──────────────────────────────────────────────────────────────
+
+  test('幂等：命令已是这一代 ⇒ 什么都不做，连产物都不必再解析', () async {
+    seedLegacy();
+    expect(
+      await migrateBuiltinEntries(
+        catalog: catalog(),
+        store: store,
+        isWindows: false,
+      ),
+      contains(kCompactPluginId),
+    );
+    // 第二次故意换成"没有产物"的目录：如果它还要去解析，就会失败并留日志。
+    final List<String> lines = <String>[];
+    expect(
+      await migrateBuiltinEntries(
+        catalog: catalog(withBinary: false),
+        store: store,
+        log: lines.add,
+        isWindows: false,
+      ),
+      isEmpty,
+      reason: '每次开机都跑这一段，第二次必须原地不动（不能每次改用户的文件）',
+    );
+    expect(lines, isEmpty, reason: '跳过发生在解析之前：不该产出一句日志');
+    expect(
+      store.readEntry(kCompactPluginId)!['command'],
+      endsWith(kCompactBinaryName),
+    );
+  });
+
+  // ── 4 三种"不该动" ──────────────────────────────────────────────────────
+
+  test('不是 builtin 的同 id 条目不动（那是用户自己写的东西）', () async {
+    seedLegacy(builtin: false);
+    final List<String> lines = <String>[];
+    expect(
+      await migrateBuiltinEntries(
+        catalog: catalog(),
+        store: store,
+        log: lines.add,
+        isWindows: false,
+      ),
+      isEmpty,
+    );
+    expect(store.readEntry(kCompactPluginId)!['command'], 'python');
+    expect(lines, isEmpty);
+  });
+
+  test('条目根本不存在 ⇒ 什么都不做（没有的东西交给播种，不是迁移）', () async {
+    final List<String> lines = <String>[];
+    expect(
+      await migrateBuiltinEntries(
+        catalog: catalog(),
+        store: store,
+        log: lines.add,
+        isWindows: false,
+      ),
+      isEmpty,
+    );
+    expect(store.readEntry(kCompactPluginId), isNull);
+    expect(lines, isEmpty);
+  });
+
+  test('解析不到产物 ⇒ 保持现状 + 留一行（改坏比不改更糟）', () async {
+    seedLegacy();
+    final List<String> lines = <String>[];
+    expect(
+      await migrateBuiltinEntries(
+        catalog: catalog(withBinary: false),
+        store: store,
+        log: lines.add,
+        isWindows: false,
+      ),
+      isEmpty,
+    );
+    final Map<String, dynamic> entry = store.readEntry(kCompactPluginId)!;
+    expect(
+      entry['command'],
+      'python',
+      reason: '解析失败就维持原样：把一个能起的东西改成起不来的路径是最坏的结果',
+    );
+    expect(
+      lines.join('\n'),
+      contains('保持现状'),
+      reason: '静默跳过在界面上就是"点了开关没反应"，必须给一行',
+    );
+  });
+
+  // ── 5 python 型不进这条路 ───────────────────────────────────────────────
+
+  test('python 型条目绝不在启动期重写（那会白白探测解释器，开机多起两个进程）', () async {
+    seedLegacy(id: 'sample', name: '示例插件');
+    final List<String> lines = <String>[];
+    expect(
+      await migrateBuiltinEntries(
+        catalog: catalog(),
+        store: store,
+        log: lines.add,
+        isWindows: false,
+      ),
+      isEmpty,
+    );
+    expect(store.readEntry('sample')!['command'], 'python');
+    expect(lines, isEmpty, reason: '清单里 sample 仍是 python ⇒ 这条压根不该被处理');
+  });
+}
