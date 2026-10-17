@@ -88,7 +88,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 |---|---|---|---|
 | `hello` | 进程起好后第一件事 | `{core_version, plugin_id, scope, config, resume_dump_id?}` | `{ok: true}`（其余字段忽略）。`resume_dump_id` 只在**热重启后的新一世**才出现，没快照时根本不递这个键（旧插件不受影响） |
 | `tools/list` | 握手后（工具表刷新点也会再来） | `{}` | `{tools: [见 §6]}` |
-| `tools/call` | 模型要调你的工具 | `{name, arguments, agent_id?, session_id?}` | `{text?, content?, isError?}`（见 §6.3） |
+| `tools/call` | 模型要调你的工具 | `{name, arguments, scope?}`——`scope` 是**本次调用的四元组** `{team_id, agent_id, session_id, mode_key?}`（与 station/request 的 scope 同源；agent 与 session 都为空时核心**不带这一键**） | `{text?, content?, isError?}`（见 §6.3） |
 | `ping` | 每 `heartbeat_interval`（默认 10s） | `{}` | 任意合法响应（核心只看"这一拍回了没"） |
 | `station/request` | 你订阅的点位被触发 | `{request_id, station_id, kind, scope, payload, meta, schema?}` | `{reply: {payload: …}}`（见 §5） |
 | `station/cancel` | **通知**（无 id）：你接管的 LLM 流该收了 | `{request_id, reason?}` | 不需要应答 |
@@ -665,8 +665,15 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 ```jsonc
 {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{
   "name":"etl_stats","arguments":{"path":"data.csv"},
-  "agent_id":"agt_1","session_id":"session_default"}}
+  "scope":{"team_id":"team-1","agent_id":"agt_1","session_id":"session_default"}}}
 ```
+
+- `params.scope` 是**这一次调用的身份**（由核心按目标 agent 的真实归属解析出来）。
+  工具里要经执行站下命令（`fs.read` / `agent.stop` / `tool.call`）就把它**原样**带到
+  `station/command` 的顶层参数：拿它才能服务多个 team / 空 scope 的配置，退回
+  `plugins.yaml` 里写死的那个 agent 就是猜，而猜错的结局是 fail-closed 拒绝而不是“帮你执行”。
+  （早期的写法是把 `agent_id` / `session_id` 平铺在 params 顶层—— Dart 骨架两种都认，
+  但新代码请按上面这份形状读。）
 
 回包约定：
 
