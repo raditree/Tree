@@ -44,10 +44,17 @@
     （`statePool.take`，一份只喂一世），而键按 `pluginId` + 核心算的代际认（不接受插件指定）——
     没点名自己去取，多实例插件里先抢到的那一个会让真正该续的那一世只拿得到 `has_snapshot:false`。
     旧的 Python 示例是无条件取回；现在这条由自检钉住（"没有 resume_dump_id ⇒ 不下 stateFetch"）。
-  - 首批迁移：**`minimal` 与 `suspendable` 已入插件仓（Dart）并从 `examples/plugins/` 删除**；
-    其余三个仍按 Python 随包，逐个跟进（本阶段不一次动完，是为了每个切片都能单独回滚）。
-  - 计数：tree_protocol 门禁 44 → **48**（新增 4 条源码侧合同用例；扫描面 += `plugins`）；
-    插件自检 minimal 9 条 + suspendable 16 条（假核心，跑的是与成品 exe 同一个 `run()`）。
+  - **骨架里每一张名字表都要有真源**：`M` 对 `PluginRpcMethods.all`、`Ui` 对
+    `nonProtocolPluginMethodLiterals`（`ui/manifest` / `ui/update` 是插件 UI 帧的约定 method，
+    家另在 `PluginUiFrameType`，**故意不在** RPC 登记面）、`kUiViewTypes` 对 `PluginUiViewType.all`。
+    两张表拿同一个名字 = 两边谁也不信谁；控件集清单漂了的现场表现是"面板报了个未知类型"，
+    而插件自己看到的是"声明成功了"。
+  - 首批迁移：**`minimal`、`suspendable` 与 `terminal_probe` 已入插件仓（Dart）并从
+    `examples/plugins/` 删除**；其余两个（`sample` / `compact`）仍按 Python 随包，逐个跟进
+    （本阶段不一次动完，是为了每个切片都能单独回滚）。
+  - 计数：tree_protocol 门禁 44 → **49**（新增 5 条源码侧合同用例；扫描面 += `plugins`）；
+    插件自检 minimal 9 条 + suspendable 16 条 + terminal_probe 77 条（假核心，跑的是与成品
+    exe 同一个 `run()`）。
 - **整轮接管只能夺「编排」，不能夺「写」**（**新增**
   [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 31、
   [docs/plugin-development.md](docs/plugin-development.md) §5.6、

@@ -18,6 +18,9 @@ dart run plugins/minimal/minimal_plugin.dart --selftest
 # ①b 热重启示例（同样已在插件仓）：转储 → 退出 → 新一世取回续跑
 dart run plugins/suspendable/suspendable_plugin.dart --selftest
 
+# ①c 终端探针示例（插件仓）：3 小时后台任务的启动 / 轮询 / 超时广播三段
+dart run plugins/terminal_probe/terminal_probe_plugin.dart --selftest
+
 # ② 完整示例：四站 + 插件布局 + 点位化新能力（同样不连真核心）
 python examples/plugins/sample_plugin.py --selftest
 
@@ -25,8 +28,8 @@ python examples/plugins/sample_plugin.py --selftest
 python examples/plugins/compact_plugin.py --selftest
 ```
 
-四个 `--selftest` 都用**假核心**（往插件 stdin 写、读 stdout 断言），不启动桌面端、
-不需要参数、不产生副作用：先确认脚本本身没坏，再去配 `plugins.yaml`。Dart 那两条跑的是
+五个 `--selftest` 都用**假核心**（往插件 stdin 写、读 stdout 断言），不启动桌面端、
+不需要参数、不产生副作用：先确认脚本本身没坏，再去配 `plugins.yaml`。Dart 那三条跑的是
 与成品 exe **同一个 `run()`**（`dart run tool/build_plugins.dart` 会立刻拿编出来的 exe 再跑一遍）。
 
 ## 示例矩阵
@@ -35,6 +38,7 @@ python examples/plugins/compact_plugin.py --selftest
 |---|---|---|
 | [`plugins/minimal/minimal_plugin.dart`](../../plugins/minimal/minimal_plugin.dart)（无开关） | **最小插件骨架（Dart）**：`hello` / `ping`（心跳）/ `tools/list` / `tools/call`——读循环、异常收敛、`suspend` 转储都在骨架里，插件侧只剩一张工具表 | §1 一分钟上手、§2 RPC 清单、§6.3 工具申报 |
 | [`plugins/suspendable/suspendable_plugin.dart`](../../plugins/suspendable/suspendable_plugin.dart)（无开关） | **热重启（Dart）**：`suspend` 时先下 `plugin.stateDump` 并**等回包再 ack**；新一世从 `hello` 拿 `resume_dump_id` 下 `plugin.stateFetch`，取不到就按冷启动（不是错误）。工具 `era` 回一个**来自快照本身**的世数 | §6.5 转储 → 退出 → 取回 |
+| [`plugins/terminal_probe/terminal_probe_plugin.dart`](../../plugins/terminal_probe/terminal_probe_plugin.dart)（`--hours` / `--interval` / `--agent-id` / `--mode` / `--shell` / `--no-panel` / `--no-probe`） | **terminal 三段通路的探针（Dart）**：`terminal.exec` + `hook: true` 起长任务 → `hook_action=status` 逐拍量 → `system.tool.timeout` 广播只记不取消；拿不到句柄就降级成"通路存活"每一拍 echo；时间线推成左栏 `activity` 面板 | §6.1 terminal 族、§3.2 订点位、§7.1 广播、§7.2 面板动作 |
 | `sample_plugin.py`（默认） | **四站全链路**：收集站申报 + 广播/事件订阅 + 执行站 `fs.read` + 中转站工具前/后改写；`ui/manifest` 声明 activity / panel / **card** 槽位并推卡片 | §3 站点体系、§5 中转站、§6 执行站、§7 UI、§8 收集站 |
 | `--relay-llm <关键词>` | 中转站 `system.relay.llm.handle`：最后一条 user 消息含关键词时**流式接管**（`thinking` + 分片正文 + `done`），并处理下行 `station/cancel` | §5.4 接管 LLM |
 | `--relay-llm-tool-call` | 流式接管里多推一段 `tool_call` 增量（会**真的**触发一次工具调用，所以单独开关） | §5.4 |

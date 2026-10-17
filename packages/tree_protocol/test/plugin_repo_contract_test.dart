@@ -12,7 +12,10 @@
 //    而它会以"跳过"的形式静默过去）；
 // 3. `_kit` 与 `release` **不是插件**（没有 plugin.json ⇒ 合同里就该被跳过）；
 // 4. 骨架里那张方法名表 [M] 的每个值都必须是 `PluginRpcMethods` 已登记的名字——
-//    插件自带常量表是"零核心依赖"的代价，代价必须由这条用例兜住。
+//    插件自带常量表是"零核心依赖"的代价，代价必须由这条用例兜住；
+// 5. 骨架的 UI 表（`Ui`）里的名字必须**故意不在** `PluginRpcMethods`，而是在
+//    `nonProtocolPluginMethodLiterals`（它们是插件 UI 帧的约定 method，家另在
+//    `PluginUiFrameType`）——两张表拿同一个名字就是两边谁也不信谁。
 import 'dart:convert';
 import 'dart:io';
 
@@ -195,6 +198,62 @@ void main() {
     expect(
       PluginRpcMethods.all,
       containsAll(<String>['hello', 'ping', 'tools/list', 'station/command']),
+    );
+  });
+
+  test('骨架的 UI 表落在另一张登记面上（不得与 M 混用同一个名字）', () {
+    final String src = File(
+      '${pluginRepo.path}/_kit/plugin_kit.dart',
+    ).readAsStringSync();
+    final int start = src.indexOf('abstract final class Ui {');
+    if (start < 0) return; // 还没有 UI 声明面（比如只搬了 minimal）：不强行要求
+    final int end = src.indexOf('/// 一帧 → 一行字节', start);
+    expect(end, greaterThan(start), reason: '找不到 Ui 表的结束边界');
+    final List<String> uiMethods = RegExp(
+      r"static const String \w+ = '([^']+)';",
+    )
+        .allMatches(src.substring(start, end))
+        .map((RegExpMatch m) => m.group(1)!)
+        .toList();
+    expect(uiMethods, isNotEmpty, reason: 'Ui 表是空的：读法漂了');
+    for (final String name in uiMethods) {
+      expect(
+        PluginRpcMethods.all,
+        isNot(contains(name)),
+        reason: '「$name」既是插件 RPC 又被当成 UI 约定 method：两张表得归一张',
+      );
+      expect(
+        nonProtocolPluginMethodLiterals.keys,
+        contains(name),
+        reason: '「$name」没在 nonProtocolPluginMethodLiterals 登记 ⇒ 门禁扫到它会红，'
+            '而插件抄的就是骨架这一份',
+      );
+    }
+    // 受限控件集也要逐字对齐：骨架自带一份清单是为了插件零核心依赖，
+    // 而清单漂了的现场表现是"面板报了个未知类型"，插件那边完全看不出来。
+    final Iterable<RegExpMatch> viewTypeMatches = RegExp(
+      r"^  '([a-z]+)',$",
+      multiLine: true,
+    ).allMatches(
+      src.substring(
+        src.indexOf('const List<String> kUiViewTypes = <String>['),
+        src.indexOf('];', src.indexOf('const List<String> kUiViewTypes')),
+      ),
+    );
+    final List<String> kitTypes = viewTypeMatches
+        .map((RegExpMatch m) => m.group(1)!)
+        .toList();
+    expect(
+      kitTypes,
+      unorderedEquals(PluginUiViewType.all),
+      reason:
+          '骨架的 kUiViewTypes（$kitTypes）与核心 PluginUiViewType.all '
+          '不再是同一份名单',
+    );
+    expect(
+      src.contains('List<String> validateUiView('),
+      isTrue,
+      reason: '骨架里没有 validateUiView：插件各自吞错的结局就是三份不同写法',
     );
   });
 }

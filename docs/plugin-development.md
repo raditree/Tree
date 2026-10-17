@@ -1031,8 +1031,14 @@ plugins:
   编译成成品：`dart run tool/build_plugins.dart --only minimal`。
 - [`plugins/suspendable/suspendable_plugin.dart`](../plugins/suspendable/suspendable_plugin.dart)：**热重启参考实现（Dart）**
   ——“先转储等回包、再 ack、退；新一世 `hello` 拿 `resume_dump_id` 主动取回”这条时序的活文档，
-  工具 `era` 回一个**来自快照本身**的世数（自检 13 条：冷启动不下取回、dump 先于 ack、取不到按冷启动且留一行）。
+  工具 `era` 回一个**来自快照本身**的世数（自检 16 条：冷启动不下取回、dump 先于 ack、
+  转储未回包时 ack 一句都不发、慢转储在途心跳照答、取不到按冷启动且留一行）。
   编译：`dart run tool/build_plugins.dart --only suspendable`。
+- [`plugins/terminal_probe/terminal_probe_plugin.dart`](../plugins/terminal_probe/terminal_probe_plugin.dart)：**terminal 三段通路的探针（Dart）**
+  ——`terminal.exec` + `hook: true` 起长任务、`hook_action=status` 逐拍量、`system.tool.timeout` 广播只记不取消；
+  拿不到句柄就如实**降级**成"通路存活"（每一拍 echo），并把降级原因写进时间线。它还交了左栏 `activity`
+  面板的完整形状（`ui/manifest` 一次 + `ui/update` 整块替换 + 按钮动作从 `params.event` 判）。
+  自检 77 条（走**真帧面**：订阅、面板声明、执行站命令都在帧上断言）。编译：`--only terminal_probe`。
 - [`examples/plugins/sample_plugin.py`](../examples/plugins/sample_plugin.py)：全功能参考实现
   ——工具申报、活动栏面板、消息流卡片、工具前/后中转改写、**LLM 流式接管**（`--relay-llm`）、
   `prompt.system` 改写（`--relay-prompt`）、`llm.call` / `tool.call` / `session.rename`
