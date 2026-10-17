@@ -106,7 +106,18 @@ void main() {
     // 正文要告诉 agent"指南副本在工作空间里"——它读不到应用目录/仓库里的原件
     expect(last.body, contains('.self/docs/plugin-development.md'));
     expect(last.raw, kBuiltinSpecTexts['plugin-creator']);
-    expect(last.changelog.first, contains('第 0 步'));
+    // 与 general-task 同一条纪律：最新一条对应当前 version，“第 0 步”那条沉在历史里
+    expect(
+      last.changelog.first,
+      startsWith('v${last.version}('),
+      reason: 'plugin-creator 最新一条 changelog 必须对应当前 version：'
+          '${last.changelog.first}',
+    );
+    expect(
+      last.changelog.any((String c) => c.contains('第 0 步')),
+      isTrue,
+      reason: '「第 0 步」的引入记录要留在 changelog 里',
+    );
   });
 
   test('seedInto：内置模板播种到工作空间 .self/spec/（含共享第 0 步）', () async {

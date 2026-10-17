@@ -69,9 +69,20 @@
     `{…,}` 会被“修”成 `{…$1`——看着像走通了 salvage 分支，实际把 json 越修越坏。改用
     `replaceAllMapped` 并由自检钉住（“本地能修好就不该再调模型”那一条）。这也是“产物必须跑
     真代码自检”的理由之一：它不需要真核心，却能拓住一个静默错误的分支。
-  - 首批迁移：**`minimal`、`suspendable`、`terminal_probe` 与 `compact` 已入插件仓（Dart）
-    并从 `examples/plugins/` 删除**；只剩 `sample`（仍按 Python 随包）。本阶段不一次动完，
-    是为了每个切片都能单独回滚。
+  - 迁移已全部收完：**`minimal`、`suspendable`、`terminal_probe`、`compact` 与 `sample` 五个
+    都在插件仓（Dart）**，桌面仓的 `examples/plugins/` 目录**整个删除**（最后一份 Python 示例
+    迁完就没有东西住在那里了；分片迁移是为了每个切片能单独回滚）。随之两条口径：
+    **随包产物只从 `build/plugins/` 出来**（`BuiltinPluginCatalog.scriptRoots()` 不再把示例目录
+    当回退——失败信息里不许列一个查不到的地点，由
+    [packages/tree_core/test/builtin_plugin_script_roots_test.dart](packages/tree_core/test/builtin_plugin_script_roots_test.dart)
+    钉住）；**打包链不再产 Python 文件**（`tool/package_windows.dart` 的 ②c 从“整目录拷示例 +
+    过滤 `__pycache__`/`*.pyc`”缩成只拷指南，成品由 ②f 按索引拷）。
+  - **插件文档的候选面不许认祖先目录里的泛化文件名**（**修改**
+    [lib/app_version.dart](lib/app_version.dart) `PluginDocs`、
+    [test/version_info_test.dart](test/version_info_test.dart)）：删掉 `examples/plugins` 那一档后，
+    **不顺手**换成“向上认 `<祖先>/plugins/README.md`”——`<仓根>/build/plugins/` 同样是祖先目录里的
+    `plugins/`，认它等于把“只认 `plugin-development.md` 这个专有文件名”那条既有纪律重新打开
+    （当初就是 Flutter SDK 自带的 `flutter/docs/README.md` 会把用户送到无关文档上）。
   - **执行站命令失败时 payload 必须跟着异常一起走**（**修改**
     [plugins/_kit/plugin_kit.dart](plugins/_kit/plugin_kit.dart) `CmdFailureException`）：核心对
     `llm.call` 的口径是 `StationCommandOutcome.failedWith(error, payload)`——“调用失败”也带着
@@ -79,10 +90,12 @@
     包成异常，
     payload 就在这一跳被丢掉，结局是插件报“原文 0 字”当场弃权、把已经付费的那次总结整包扔掉
     （真进程用例 `compact_plugin_e2e_test.dart` 把它钉住了：那三条抢救用例到此才跑得绿）。
-  - 计数：tree_protocol 门禁 44 → **49**（新增 5 条源码侧合同用例；扫描面 += `plugins`）；
-    tree_core 1455 → **1462**（新增 7 条换代迁移用例）；
-    插件自检 minimal 9 条 + suspendable 16 条 + terminal_probe 77 条 + **compact 194 条**
-    （假核心，跑的是与成品 exe 同一个 `run()`）。
+  - 计数：tree_protocol 门禁 44 → **49**（新增 5 条源码侧合同用例；扫描面 += `plugins`，并
+    跟示例目录一起删掉 `examples/plugins` 那一条——门禁对不存在的扫描面是显式失败）；
+    tree_core 1455 → **1463**（新增 7 条换代迁移用例 + 1 条 sample 清单用例）；
+    插件自检 minimal 9 条 + suspendable 16 条 + terminal_probe 77 条 + compact 194 条 +
+    **sample 215 条**（都是假核心，跑的是与成品 exe 同一个 `run()`）；四份 sample/compact
+    真进程用例现在都跑插件仓的 Dart 源码入口（以前本机没 Python 就整组静默跳过）。
 - **整轮接管只能夺「编排」，不能夺「写」**（**新增**
   [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 31、
   [docs/plugin-development.md](docs/plugin-development.md) §5.6、
@@ -1407,7 +1420,9 @@
 - **MCP**：stdio 与 Streamable HTTP 两种传输、懒连接、心跳判活、工具命名空间化（`mcp__<服务>__<工具>`）。
 - **插件与站点体系**：进程外插件（行分隔 JSON-RPC 2.0）+ 四类站点 / 17 个点位——广播、执行（fs / terminal /
   agent / ui / llm / tool / session）、中转（工具前 / 工具后 / LLM 接管 / 请求改写 / 压缩 / 系统提示词）、收集（工具申报）；
-  插件可申报 UI 槽位与自己的工具。指南见 [docs/plugin-development.md](docs/plugin-development.md)，示例见 [examples/plugins/](examples/plugins/)。
+  插件可申报 UI 槽位与自己的工具。指南见 [docs/plugin-development.md](docs/plugin-development.md)，
+  示例住在插件仓（raditree/tree-plugins，本地 clone 在桌面仓的 `plugins/`；2026-10-17 前的
+  `examples/plugins/` 已随五个插件迁完而删除）。
 - **SSH 运行模式**：工具、文件面板、Git 面板同一套语义；**成员跟随 leader 的 SSH**（同一台远端主机、同一个根）。
 - **私有状态按 agent 分栏**：`.self/…` 真实落在 `.tree/<agent_id>/.self/…`（提示词 / 规范 / 长结果 / 活动日志）；
   团队共享项目文件、各自保留私有状态；核心启动时一次性迁移旧 `.self`。

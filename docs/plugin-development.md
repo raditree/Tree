@@ -40,7 +40,11 @@
 3. **心跳是硬要求**：核心按 `ping` 判活。连续多拍不回 → 标 `degraded`；
    中转站请求在等待回包期间**依赖心跳续期**——心跳丢了，那一路立即判"未响应"。
 
-最小骨架（Python，完整版见示例）：
+最小骨架（协议是**语言无关**的：这里用 Python 只为把"读循环 + 每个请求必回一条"摊开给人看；
+**要抄请抄 Dart 那一份**——插件仓的
+[`plugins/minimal/minimal_plugin.dart`](../plugins/minimal/minimal_plugin.dart) 与公共骨架
+[`plugins/_kit/plugin_kit.dart`](../plugins/_kit/plugin_kit.dart)，它把读循环、并发、异常收敛与
+`suspend` 转储全部做进去了，插件侧只剩一张工具表）：
 
 ```python
 import json, sys, threading
@@ -806,9 +810,9 @@ plugins:
   由 `PluginConfigStore` 当未知键原样保留，行为一律只读已知键；详情页据此回答
   “这一条是从哪里装的、装的是哪一版”。内置 id **不给覆盖**（内置项只走内置开关，
   否则两个开关会抢同一条目）。
-* **也不给盖掉随包的插件源码**：`files[].target` 撞上 `BuiltinPluginCatalog.protectedFileNames()`
-  （示例/压缩脚本、SSH 执行器与自迭代插件的二进制）就整条跳过 —— “撞 id”与“撞文件名”
-  是两道不同的防线：后者不需要撞上内置 id 就能把 `sample_plugin.py` 覆盖掉，而现象是
+* **也不给盖掉随包的插件产物**：`files[].target` 撞上 `BuiltinPluginCatalog.protectedFileNames()`
+  （示例/压缩/SSH 执行器与自迭代插件的**随包二进制**）就整条跳过 —— “撞 id”与“撞文件名”
+  是两道不同的防线：后者不需要撞上内置 id 就能把 `tree_sample.exe` 覆盖掉，而现象是
   “示例插件突然起不来”，归因要翻到一份远端 JSON 里去。跳过发生在**列清单**时（面板当场
   说得出原因），不是等用户点了安装才失败。
 
@@ -985,8 +989,8 @@ plugins:
     name: 示例插件
     description: 把工具公告转发给队友   # 可选：插件介绍（「插件详情页」正文读这里）
     enabled: true
-    command: python                 # 启动命令（argv[0]）
-    args: ["plugins/sample_plugin.py", "--slot-key", "sample.card.rounds"]
+    command: "E:/programs/Tree/desktop/build/plugins/tree_sample.exe"   # 启动命令（argv[0]）
+    args: ["--slot-key", "sample.card.rounds"]   # 随包二进制：args 只放插件自己的开关
     cwd: ""                         # 可选
     env: {}                         # 可选
     granularity: team               # team / agent / session（实例粒度声明，缺省 team）
@@ -1001,7 +1005,9 @@ plugins:
   只在插件连上之后才有，而**启动失败的插件最需要介绍**。空串不写这一键（不给全表
   添一行噪声）。
 - 界面上的「启用」开关会写这份文件；改动在核心下次启动或热应用时生效。
-- 插件脚本路径：相对路径按**核心进程的工作目录**解析（桌面端是 `plugins/`）。
+- 插件路径：随包（内置）插件的成品由核心按**可执行文件同级**的 `plugins/<name>[.exe]` 解析
+  （Windows 补 `.exe`），`args` 不写脚本路径；自定义插件的相对路径按**核心进程的工作目录**
+  解析（桌面端是应用目录），**绝对路径最稳**。
 
 ---
 
@@ -1012,7 +1018,7 @@ plugins:
 | 插件日志 | `log` 通知（`{"method":"log","params":{"level":"info","message":"…"}}`）或直接写 stderr |
 | 面板 | 设置 → 插件开发：「插件」段看实例状态与订阅，**「站点」段看每个点位**的订阅者/计数（`requests` / `responded` / `timeout` / `no_subscriber` 等）。两类卡片**都能点进详情页**：插件页全程只读（介绍 / 基本信息 / 内置运行时 / 运行态 / 提供的工具 / 它建的与它订阅的站）；站点页重新 GET 一次真值，可改「可订阅插件数量」、订阅者的**禁用开关**、以及 `config` 里的自定义项（增 / 删 / 改） |
 | 骨架探针 | 先用 §1 的最小骨架跑通 `hello` / `ping` / `tools/list`，再加站点订阅；不要一上来就写全功能 |
-| 不用真核心自测 | 写一个假核心：按 §2 的报文往你的 stdin 写，读你的 stdout 断言（示例仓库里的 `sample_plugin.py --selftest` 就是这么做的） |
+| 不用真核心自测 | 写一个假核心：按 §2 的报文往你的 stdin 写，读你的 stdout 断言（插件仓每个示例都带 `--selftest`，`sample_plugin.dart` 那一份 215 条就是这么跑的；`tool/build_plugins.dart` 会拿编出来的 exe 再跑一遍） |
 | 常见坑 | ① stdout 混入日志 ⇒ 解析失败；② 单线程顺序处理 ⇒ 自锁 + 心跳丢失；③ 忘了 `ui/manifest` 声明 `card` 槽位 ⇒ 推了看不到；④ 订阅写了错的 `mode_key` ⇒ 收不到消息；⑤ 流式接管忘了 `done` ⇒ 该轮一直等（最终被取消/心跳判死）；⑥ **面板按钮判据写成 `method == "plugin_ui_action"`** ⇒ 永远不命中，表现为"点了没反应"（真实形状见 §7.2，判据在 `params.event` 上） |
 
 ---

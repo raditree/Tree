@@ -34,9 +34,10 @@ desktop/
 │   ├── tree_core/             # 核心：服务 / LLM / 工具 / 团队 / Spec / MCP / 插件
 │   └── tree_core_cli/         # tree_core.exe 入口 + 真进程端到端测试
 ├── test/                      # 前端测试（flutter test）
-├── tool/                      # 构建与打包脚本（build_core / build_agent / build_ssh_plugin / package_windows / installer）
+├── tool/                      # 构建与打包脚本（build_core / build_agent / build_ssh_plugin / build_plugins / package_windows / installer）
 ├── docs/                      # 文档（入口 docs/README.md）
-└── examples/plugins/          # 可运行插件示例（Python 标准库）
+└── plugins/                   # **插件仓（raditree/tree-plugins）的本地 clone**（独立 git 仓、对桌面仓已 gitignore）：
+                               #   五个随包插件的 Dart 源码 + 公共骨架 `_kit` + 每个目录一份 `plugin.json`
 ```
 
 ## 3. 构建与运行
@@ -92,6 +93,32 @@ dart run tool/build_agent.dart [--out <dir>] [--version <v>] [--arch x64,arm64]
 >
 > 这两份产物**缺失不会报错**（只是包内没有中转站，核心自动回退内置 dartssh2，功能不变），
 > 只有「版本对不上」才会拦。出包流程见 §5，端到端真机验证见 §4。
+
+### 3.2 插件仓的成品（`build_plugins.dart`）
+
+五个随包插件（`minimal` / `suspendable` / `terminal_probe` / `compact` / `sample`）的**源码不在
+本仓**，而在插件仓（clone 到桌面仓的 `plugins/`，2026-10-17 之前的 `examples/plugins/` 已删）。
+构建从**仓根**执行，一条命令覆盖整仓：
+
+```powershell
+dart run tool/build_plugins.dart                  # 全编 + 逐个 `<exe> --selftest` + 写索引
+dart run tool/build_plugins.dart --only compact   # 只编一个（开发回路；**索引与其余条目合并**）
+dart run tool/build_plugins.dart --skip-selftest  # 只编译（CI 里先验编译面）
+dart run tool/build_plugins.dart --out <目录> --index <文件>   # 改产物目录 / 索引落地
+```
+
+产出 `build/plugins/tree_<id>[.exe]` 与 `build/plugins/plugin-index.json`（**发布合同本体**）。
+三条硬规矩写在脚本里而不是靠文档守：字段先过合同再编译（与装机端 `PluginDownloader` 读同一
+份规则）、**编出来的 exe 必须真跑一遍 `--selftest`**（“能编译”不等于“协议对”，协议错在用户
+机器上就是“插件起不来”）、索引里的 `bytes` 是真字节数。另两条容易踩的：
+
+- `--only` **不会**把索引重写成那一条（与旧索引按 id 合并）——全量构建才不合并（仓里删掉的
+  插件必须从索引消失，留着就是幽灵条目）；
+- 插件仓没 clone 时本命令直接退 2 并告诉你该 clone 到哪，不静默产出空索引。
+
+开发态不必先构建也能跑：真进程用例（`compact_plugin_e2e_test` / `compact_panel_ui_test` /
+`sample_plugin_layout_e2e_test` / `plugin_self_station_e2e_test`）跑的是 `dart <插件仓里那个
+.dart>` 起的**源码**，产物只归打包链与 `<exe> --selftest`。
 
 ## 4. 测试矩阵
 
@@ -209,6 +236,11 @@ dart run tool/build_agent.dart           # → build/agents/tree_agent-linux-{am
                                          #   交叉编译（--target-os/--target-arch，本仓 Dart 3.13.4 实测可用；
                                          #   首次会下载目标端 AOT 产物，约 2 分钟）
 
+# 插件仓（clone 在 `plugins/`）的五个成品 + 发布合同（见 §3.2）
+# ⚠ 出包前必须跑：`package_windows.dart` 只按 `build/plugins/plugin-index.json` 拷成品，
+#   索引不在就是“面板上能装、随包却没带”（它会打一行跳过，不会静默）
+dart run tool/build_plugins.dart
+
 # 安装包（需要 Inno Setup 6；iscc 不在 PATH 时用 --iscc 指定）
 dart run tool/package_windows.dart --installer
 dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
@@ -223,9 +255,14 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
    不把空白按钮发给用户（代价：字体 18 KB → 1.6 MB，安装包约 +0.5 MB）；
 2. 用**同一个 SDK** 编译 `tree_core.exe` 并放进 Release 目录——发行版要求核心与 `Tree.exe` 同目录；
 3. 拷 `build/native_assets/windows/*.dll`（pdfrx 的 `pdfium.dll`）到 exe 旁边（native assets 不会自动进发行目录）；
-4. 拷 `examples/plugins/` → 发行目录 `plugins/`（核心按**自身可执行文件同级**的 `plugins/<name>.py` 解析内置插件），
-   并**过滤本地产物**（`__pycache__` 等目录、`*.pyc`/`*.pyo`）——开发机上跑过一次示例插件就会留下它们，
-   不过滤就会被 zip 与安装包原样带走；`--release-dir` 指向用户目录时只删同类产物，不动用户自己放的插件；
+4. 拷**插件成品与开发指南** → 发行目录 `plugins/`（核心按**自身可执行文件同级**的
+   `plugins/<name>[.exe]` 解析内置插件）：成品按 `build/plugins/plugin-index.json` 里的
+   `files[].target` 逐条拷（那份索引是**装机端唯一读的合同**，打包链按同一份拷才能做到
+   “发布仓库有的，安装包也有”；自己扫目录就是第二份真相、两边一定会漂），另拷一份
+   `docs/plugin-development.md` → `plugins/plugin-development.md`（应用内「打开插件开发说明」
+   与核心播种到工作空间的那一份都找它）；2026-10-17：**不再拷 `examples/plugins/` 的 Python
+   脚本**（最后一份示例迁进插件仓后那个目录已删），配套的 `__pycache__`/`*.pyc` 过滤也跟着
+   删了——打包链不再产 Python 文件；
 5. 写 `使用说明.txt`（数据目录、可手改的配置文件、常见问题）；
 6. **自检**：真启动一次打包好的核心，读到握手再让它优雅退出；
 7. 压 zip 到 `dist/`。
@@ -233,6 +270,8 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 安装包自检（本仓库验证过的流程）：静默装到临时目录 → 检查
 `Tree.exe` / `tree_core.exe` / `pdfium.dll` / `使用说明.txt` /
 **`plugins/tree_ssh_executor.exe`（中转站插件，与 `Tree.exe` 同级）** /
+**`plugins/` 里索引列出的那几条插件成品**（按 `build/plugins/plugin-index.json` 逐条点名，
+少一条就是面板上那个开关拉不上去）** /
 **`agents/tree_agent-linux-{amd64,arm64}`（目标机执行体，与 `plugins/` 同级）** 是否齐 →
 用装好的核心跑一遍冒烟与文件写路径测试 → 静默卸载并确认无残留。
 

@@ -677,11 +677,12 @@ tags: [plugin, 插件, 分工, 指南, 自测]
 pinned: true
 builtin: true
 created_at: 0
-updated_at: 2026-10-02
-version: 3
+updated_at: 2026-10-17
+version: 4
 classification: 内部规范
 risk: medium
 changelog:
+  - "v4(2026-10-17): 可运行样例的落点从桌面仓的 `examples/plugins/`（Python）改成**插件仓**（本地 clone 在 `plugins/`：五个 Dart 插件 + 公共骨架 `_kit`，`dart run tool/build_plugins.dart` 编成 exe 并逐个跑 `--selftest`）——那个目录已随最后一份示例迁完而删除，指着它等于给 agent 一条读不到的路径"
   - "v3(2026-10-02): 共享第 0 步改为「先查文档再查代码」；明确读指南（.self/docs/plugin-development.md）先于读核心源码"
   - "v2(2026-10-02): 新增共享「第 0 步：先对齐用户语义」（动手前复述目标/范围/验收并取得用户确认；歧义先问不猜；默认值显式）——由 kSpecAlignFirstSection 统一注入"
   - "v1(2026-10-01): 初版：插件开发（新建/改造）专用规范——单一口径（指南+代码）+ 本机/远端分工 + 流程与验收红线"
@@ -717,7 +718,9 @@ changelog:
   §5 中转站、§6 执行站、§7 广播与前端槽位、§9 配置、§10 调试与排错。
 - **源码口径只在工作空间恰是 Tree 源码仓库时才读得到**：点位 id 看
   `packages/tree_core/lib/src/plugin/station_points.dart`，命令名看 `execute_mounts.dart` / `station_ids.dart`，
-  可运行样例在 `examples/plugins/`（最小骨架 + 全功能参考，都能 `--selftest` 用假核心自测）。
+  可运行样例在**插件仓**（本地 clone 在桌面仓的 `plugins/`）：`plugins/minimal/` 最小骨架 +
+  `plugins/sample/` 全功能参考，公共骨架 `plugins/_kit/plugin_kit.dart`，每个都能 `--selftest`
+  用假核心自测（`dart run tool/build_plugins.dart` 会拿编出来的 exe 再跑一遍）。
   读不到源码时**以指南副本为准**，把拿不准的点列成"待确认"去问用户——**别凭记忆或猜测写协议**。
 - 指南拿不到（播种失败 / 被人删了 / 核心那台机器缺原件）时的索取流程：
   1. 请用户把 `plugin-development.md` **拖进对话输入框**——附件会落到工作空间 `.input/<日期>/`，你就能 `read`；
@@ -733,7 +736,7 @@ changelog:
 |---|---|
 | **本机**（工作空间在本机文件系统上） | **自己构建**：`read .self/docs/plugin-development.md` → 骨架先行 → 逐步加能力 → 自测（假核心）→ 给出交付说明（脚本路径 + `plugins.yaml` 条目，用**绝对路径**，由用户注册启用）。完整流程见「工作流」 |
 | **远端（SSH）** | **不要在远端落地插件**：你写下的文件在远端主机，本机核心既看不到也 spawn 不起来。<br>改为**派活**：用 `message send_message` 把需求交给**工作空间在本机**的 agent 构建（对方读同一份指南、按本规范执行），<br>你负责：写清需求与验收标准 → 提供必要上下文 → 等交付 → 验收与回传。<br>没有可派活的 agent → 与用户确认：由用户在本机执行，或把工作换到本机工作空间再做。 |
-| **工作空间恰是 Tree 源码仓库** | 额外便利：能直接读 `docs/plugin-development.md` 与 `examples/plugins/`（最小骨架 + 全功能参考，都能 `--selftest`）当参照 |
+| **工作空间恰是 Tree 源码仓库** | 额外便利：能直接读 `docs/plugin-development.md` 与插件仓那份 `plugins/`（`minimal` 最小骨架 + `sample` 全功能参考，都能 `--selftest`）当参照 |
 
 派活时（远端侧）消息里必须带：插件目标与触发场景、要订的**点位**、要提供的**工具**、要不要 **UI 槽位**、
 配置需求（id / command / args / env / scope / granularity）、**验收标准**、以及"脚本要落到本机核心可见路径"这一硬约束。
