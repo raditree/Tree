@@ -24,12 +24,12 @@ dart run plugins/terminal_probe/terminal_probe_plugin.dart --selftest
 # ② 完整示例：四站 + 插件布局 + 点位化新能力（同样不连真核心）
 python examples/plugins/sample_plugin.py --selftest
 
-# ③ 内置压缩插件：压缩编排 + 左栏面板 / 面板按钮回传（同样不连真核心）
-python examples/plugins/compact_plugin.py --selftest
+# ③ 内置压缩插件（已在插件仓）：压缩编排 + 左栏面板 / 面板按钮回传
+dart run plugins/compact/compact_plugin.dart --selftest
 ```
 
 五个 `--selftest` 都用**假核心**（往插件 stdin 写、读 stdout 断言），不启动桌面端、
-不需要参数、不产生副作用：先确认脚本本身没坏，再去配 `plugins.yaml`。Dart 那三条跑的是
+不需要参数、不产生副作用：先确认脚本本身没坏，再去配 `plugins.yaml`。Dart 那四条跑的是
 与成品 exe **同一个 `run()`**（`dart run tool/build_plugins.dart` 会立刻拿编出来的 exe 再跑一遍）。
 
 ## 示例矩阵
@@ -39,6 +39,7 @@ python examples/plugins/compact_plugin.py --selftest
 | [`plugins/minimal/minimal_plugin.dart`](../../plugins/minimal/minimal_plugin.dart)（无开关） | **最小插件骨架（Dart）**：`hello` / `ping`（心跳）/ `tools/list` / `tools/call`——读循环、异常收敛、`suspend` 转储都在骨架里，插件侧只剩一张工具表 | §1 一分钟上手、§2 RPC 清单、§6.3 工具申报 |
 | [`plugins/suspendable/suspendable_plugin.dart`](../../plugins/suspendable/suspendable_plugin.dart)（无开关） | **热重启（Dart）**：`suspend` 时先下 `plugin.stateDump` 并**等回包再 ack**；新一世从 `hello` 拿 `resume_dump_id` 下 `plugin.stateFetch`，取不到就按冷启动（不是错误）。工具 `era` 回一个**来自快照本身**的世数 | §6.5 转储 → 退出 → 取回 |
 | [`plugins/terminal_probe/terminal_probe_plugin.dart`](../../plugins/terminal_probe/terminal_probe_plugin.dart)（`--hours` / `--interval` / `--agent-id` / `--mode` / `--shell` / `--no-panel` / `--no-probe`） | **terminal 三段通路的探针（Dart）**：`terminal.exec` + `hook: true` 起长任务 → `hook_action=status` 逐拍量 → `system.tool.timeout` 广播只记不取消；拿不到句柄就降级成"通路存活"每一拍 echo；时间线推成左栏 `activity` 面板 | §6.1 terminal 族、§3.2 订点位、§7.1 广播、§7.2 面板动作 |
+| [`plugins/compact/compact_plugin.dart`](../../plugins/compact/compact_plugin.dart)（`--keep-rounds` / `--keep-tool-rounds` / `--max-files` / `--dry-run` / `--no-panel` / `--usage-jsonl`） | **内置压缩器（Dart）**：订 `system.relay.context.compact` 做全权压缩（摘要 + 必读文件 + 待办快照）、前缀缓存三条件、失败三段抢救、不接管带原因；面板里一个「立即压缩一次」（执行站 `agent.compact`） | §5.3 压缩点位、§6.1 `llm.call`/`fs.read`/`tool.call`、§7.2 面板动作 |
 | `sample_plugin.py`（默认） | **四站全链路**：收集站申报 + 广播/事件订阅 + 执行站 `fs.read` + 中转站工具前/后改写；`ui/manifest` 声明 activity / panel / **card** 槽位并推卡片 | §3 站点体系、§5 中转站、§6 执行站、§7 UI、§8 收集站 |
 | `--relay-llm <关键词>` | 中转站 `system.relay.llm.handle`：最后一条 user 消息含关键词时**流式接管**（`thinking` + 分片正文 + `done`），并处理下行 `station/cancel` | §5.4 接管 LLM |
 | `--relay-llm-tool-call` | 流式接管里多推一段 `tool_call` 增量（会**真的**触发一次工具调用，所以单独开关） | §5.4 |
@@ -49,11 +50,12 @@ python examples/plugins/compact_plugin.py --selftest
 | `--watch-tools` | 广播站 `system.broadcast.tool.pre` + `.tool.post`：统计"看到了 N 次工具调用"并推到面板 | §7.1 广播、§3.2 订点位 |
 | `--self-station` | 插件**自建站点**并订阅自己（`station/register` → `station/subscribe`）：按 team/agent 分流时的"转发型订阅者"正解 | §3.2、§7 |
 | `--threshold N` / `--no-relay` / `--no-panel` / `--no-fs-demo` / `--agent-id` / `--read-path` / `--slot-key` / `--card-interval` / `--stop-cascade` | 既有开关：轮次阈值与 `agent.stop`、是否订工具中转、是否声明面板、启动自检、命令目标 agent、卡片槽位键与刷新周期 | §6、§7 |
-| `--selftest`（两个脚本都有） | 假核心自测：不连真核心验证协议形状（订阅回包、流式 `request_id`、`station/cancel`、三条新命令的请求构造…） | §10 调试与测试 |
+| `--selftest`（剩下的这个脚本） | 假核心自测：不连真核心验证协议形状（订阅回包、流式 `request_id`、`station/cancel`、三条新命令的请求构造…） | §10 调试与测试 |
 
 ## compact 插件：左栏「上下文压缩」面板
 
-`compact_plugin.py` 除了做压缩，还会在**左栏**放一页可视面板（`ui/manifest` 声明一条
+[`plugins/compact/compact_plugin.dart`](../../plugins/compact/compact_plugin.dart)（成品
+`tree_compact.exe`）除了做压缩，还会在**左栏**放一页可视面板（`ui/manifest` 声明一条
 `activity` 槽位：左侧活动栏多一个图标，点开就是左栏整页）。看板长得是这样：
 
 ```
@@ -134,7 +136,7 @@ plugins:
 也可以不改文件：**设置 → 插件开发 → 插件面板**里每个插件各有开关，改完热应用；
 面板同时显示实例状态、订阅与每个点位的计数。
 
-## 两个脚本共同的约定
+## 本目录这个脚本的约定（Dart 那批见 [插件仓的合同](../../plugins/README.md)）
 
 - **stdout 只放协议报文**（一行一条 JSON-RPC）；**日志走 stderr** 或 `log` 通知；
 - **每个入站请求另开线程**处理：处理中还要回 `ping`，单线程顺序处理会自锁；

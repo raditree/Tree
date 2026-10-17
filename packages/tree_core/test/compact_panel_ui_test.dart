@@ -6,7 +6,7 @@ import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
 import 'package:tree_protocol/tree_protocol.dart';
 
-/// **compact 插件的左栏面板：核心侧契约**（真 Python 插件 + 真插件总线）。
+/// **compact 插件的左栏面板：核心侧契约**（真 Dart 插件 + 真插件总线）。
 ///
 /// 为什么单独钉这一条：面板是"受限控件集的 JSON"，而核心对它的校验**全是静默的**——
 /// 槽位超过 16 条、单个视图超过 64 KB、槽位类型写错、视图解析失败，一律只在核心日志里
@@ -39,28 +39,18 @@ void main() {
     }
   });
 
-  /// 真插件脚本（测试 cwd = packages/tree_core ⇒ 上两级才是仓根）。
-  String compactScript() => p.normalize(
-    p.join(
-      Directory.current.path,
-      '..',
-      '..',
-      'examples',
-      'plugins',
-      'compact_plugin.py',
-    ),
-  );
+  /// 插件入口（插件仓里的 Dart 源码，不是 `build/` 产物；测试 cwd = packages/tree_core）。
+  ///
+  /// 2026-10-17：这一份从 `examples/plugins/compact_plugin.py` 改跑插件仓的入口；以前
+  /// 本机没 Python 就整条跳过，而现在面板契约在每台跑测试的机器上都会被真验一遍。
+  final String compactEntry = () {
+    final String? repo = BuiltinPluginCatalog.repoRoot(Directory.current.path);
+    return repo == null
+        ? ''
+        : p.normalize(p.join(repo, 'plugins', 'compact', 'compact_plugin.dart'));
+  }();
 
   String slash(String path) => path.replaceAll(Platform.pathSeparator, '/');
-
-  bool pythonAvailable() {
-    final String command = Platform.isWindows ? 'python' : 'python3';
-    try {
-      return Process.runSync(command, <String>['--version']).exitCode == 0;
-    } catch (_) {
-      return false;
-    }
-  }
 
   /// 深度遍历视图（含容器 children），按顺序收集所有节点。
   List<PluginUiNode> walk(PluginUiView view) {
@@ -79,11 +69,11 @@ void main() {
   }
 
   test('真插件声明一条 activity 槽位：过桥 + 受限控件集 + 按钮形状', () async {
-    final String script = compactScript();
-    if (!File(script).existsSync() || !pythonAvailable()) {
-      markTestSkipped('没有 python 或示例插件不在预期路径：$script');
+    if (compactEntry.isEmpty || !File(compactEntry).existsSync()) {
+      markTestSkipped('插件仓没装在 <仓根>/plugins/，面板契约用例跳过：$compactEntry');
       return;
     }
+    final String script = compactEntry;
 
     final File config = File(p.join(temp.path, 'config', 'plugins.yaml'));
     config.createSync(recursive: true);
@@ -94,7 +84,7 @@ void main() {
       'plugins:\n'
       '  - id: compact\n'
       '    name: 上下文压缩\n'
-      '    command: "${Platform.isWindows ? 'python' : 'python3'}"\n'
+      '    command: "${slash(Platform.resolvedExecutable)}"\n'
       '    args: ["${slash(script)}"]\n'
       '    granularity: team\n'
       '    scope: {}\n',

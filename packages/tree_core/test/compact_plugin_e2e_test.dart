@@ -6,12 +6,18 @@ import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
 import 'package:tree_local_exec/tree_local_exec.dart';
 
-/// **内置压缩插件（真 Python 进程）的端到端契约**。
+/// **内置压缩插件（真 Dart 进程）的端到端契约**。
 ///
 /// 为什么必须真进程：压缩插件不是"回一段文本"，它要经 `station/command` 调
 /// `llm.call` / `fs.read` / `tool.call` 三个执行站命令，再把结果拼成一份**整份新上下文**
 /// 回填。这条链路跨了 插件进程 → 插件总线 → 执行站 → 四项假依赖 → 回填 → 落库，
 /// 任何一环的报文形状错了都只表现为"压缩没发生"（静默），所以这里全程真进程 + 真总线。
+///
+/// 2026-10-17：这一份从 `examples/plugins/compact_plugin.py` 改跑插件仓里的 Dart 入口
+/// （**源码**，不是 `build/plugins/` 里的产物：产物是 gitignore 的构建输出，拿它当唯一
+/// 依赖会让没跑过构建的机器全部跳过；成品的协议面由 `tool/build_plugins.dart` 跑
+/// `<exe> --selftest` 钉住）。顺带：以前本机没 Python 就整组静默跳过，现在只要有 Dart
+/// 就真跑——覆盖面反而大了。
 ///
 /// 覆盖：
 /// 1. 接管成功：**原料 = 引擎口径的 `request.messages`**（不是落库全量）⇒ 总结调用
@@ -27,31 +33,18 @@ void main() {
 
   const String team = 'team-1';
 
-  /// 真插件脚本（测试 cwd = packages/tree_core ⇒ 上两级是仓根）。
-  String compactScript() => p.normalize(
-    p.join(
-      Directory.current.path,
-      '..',
-      '..',
-      'examples',
-      'plugins',
-      'compact_plugin.py',
-    ),
-  );
+  /// 插件入口（插件仓 `plugins/compact/compact_plugin.dart`；测试 cwd = packages/tree_core）。
+  final String compactEntry = () {
+    final String? repo = BuiltinPluginCatalog.repoRoot(Directory.current.path);
+    return repo == null
+        ? ''
+        : p.normalize(p.join(repo, 'plugins', 'compact', 'compact_plugin.dart'));
+  }();
 
-  String pythonCommand() => Platform.isWindows ? 'python' : 'python3';
-
-  bool pythonAvailable() {
-    try {
-      return Process.runSync(pythonCommand(), <String>['--version']).exitCode == 0;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  final String? noPython = pythonAvailable()
-      ? null
-      : '本机没有 ${pythonCommand()}，跳过内置压缩插件的真进程用例';
+  final String? missingEntry =
+      compactEntry.isEmpty || !File(compactEntry).existsSync()
+      ? '插件仓（raditree/tree-plugins）没装在 <仓根>/plugins/，跳过内置压缩插件的真进程用例'
+      : null;
 
   /// 引擎口径的线形前缀（真核心里由 `LlmAgentEngine.wireRequestFor` 产出）：
   /// 系统提示词 + 交替的 user/assistant；**最后一条 user 之后是尾部**。
@@ -101,8 +94,8 @@ void main() {
       'plugins:\n'
       '  - id: compact\n'
       '    name: 上下文压缩\n'
-      '    command: "${pythonCommand()}"\n'
-      '    args: ["${slash(compactScript())}"]\n'
+      '    command: "${slash(Platform.resolvedExecutable)}"\n'
+      '    args: ["${slash(compactEntry)}"]\n'
       '    granularity: team\n'
       '    scope: {}\n';
 
@@ -155,8 +148,8 @@ void main() {
               List<Object?>? tools,
               String? responseFormat,
             }) async {
-              // 修复调用（自愈第二段）的判别：单条 user、**不带** response_format
-              // / tools —— 与插件 [repair_json] 的入参口径一一对应。
+              // 修复调用（抢救的第二段）的判别：单条 user、**不带** response_format
+              // / tools —— 与插件 `repairJson` 的入参口径一一对应。
               final bool isRepair =
                   responseFormat == null &&
                   messages != null &&
@@ -482,7 +475,7 @@ void main() {
       isEmpty,
       reason: '总结输入本身就是一次真实请求，同样必须结构合法',
     );
-  }, timeout: const Timeout(Duration(seconds: 180)), skip: noPython);
+  }, timeout: const Timeout(Duration(seconds: 180)), skip: missingEntry);
 
   test('单轮超长工具轨迹：只留最后 8 个工具轮，其余进总结输入', () async {
     // 一条 user 后面跟 12 个工具轮 —— "keep 死保整轮"会压不动的那种会话
@@ -593,7 +586,7 @@ void main() {
       reason: '总结前缀仍是"引擎真会发的那份"的前缀（缓存可命中）',
     );
     expect(structureProblems(sent), isEmpty);
-  }, timeout: const Timeout(Duration(seconds: 180)), skip: noPython);
+  }, timeout: const Timeout(Duration(seconds: 180)), skip: missingEntry);
 
   test('插件不接管（llm.call 失败）⇒ 核心回退内置 compact，内容不丢', () async {
     final MemoryStore store = storeWithThreeTurns();
@@ -629,7 +622,7 @@ void main() {
       isEmpty,
       reason: '互斥的另一半：内置摘要接管时清掉中转站的列表',
     );
-  }, timeout: const Timeout(Duration(seconds: 180)), skip: noPython);
+  }, timeout: const Timeout(Duration(seconds: 180)), skip: missingEntry);
 
   test('总结正文非法 JSON（可本地修复）⇒ 插件零额外调用仍接管（钱别白花）', () async {
     // 真机现场（2026-10-05 18:29）：`llm.call` **成功了**（448k prompt、≈100% 命中
@@ -685,7 +678,7 @@ void main() {
     );
     expect(summary, contains('## 背景'));
     expect(summary, contains('lib/auth.dart'));
-  }, timeout: const Timeout(Duration(seconds: 180)), skip: noPython);
+  }, timeout: const Timeout(Duration(seconds: 180)), skip: missingEntry);
 
   test('正文被截断 ⇒ 恰好一次修复调用（不带 tools / response_format / max_tokens）后接管', () async {
     // 本地修不了（真截断）时的第二段自愈：一次小的"判断完整性 + 修 json"调用。
@@ -743,7 +736,7 @@ void main() {
     final String summary = after.compactedContext[1]['content'] as String;
     expect(summary, contains('由一次 JSON 修复调用补全'));
     expect(summary, contains('模型判定原文被截断'));
-  }, timeout: const Timeout(Duration(seconds: 180)), skip: noPython);
+  }, timeout: const Timeout(Duration(seconds: 180)), skip: missingEntry);
 
   test('本地修不了 + 修复调用也失败 ⇒ 不接管，且原因可读（不再是"原文 0 字"）', () async {
     const String truncated =
@@ -792,7 +785,7 @@ void main() {
       isNot(contains('原文 0 字')),
       reason: '插件拿到原文了，就不该再报 0 字',
     );
-  }, timeout: const Timeout(Duration(seconds: 180)), skip: noPython);
+  }, timeout: const Timeout(Duration(seconds: 180)), skip: missingEntry);
 }
 
 /// 假总结器的"合法摘要"（与真插件约定的四键 schema 一致）。

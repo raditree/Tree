@@ -69,14 +69,19 @@
     `{…,}` 会被“修”成 `{…$1`——看着像走通了 salvage 分支，实际把 json 越修越坏。改用
     `replaceAllMapped` 并由自检钉住（“本地能修好就不该再调模型”那一条）。这也是“产物必须跑
     真代码自检”的理由之一：它不需要真核心，却能拓住一个静默错误的分支。
-  - 首批迁移：**`minimal`、`suspendable`、`terminal_probe` 已入插件仓（Dart）并从
-    `examples/plugins/` 删除**；**`compact` 已入插件仓并已接进内置清单**（它的
-    `examples/plugins/compact_plugin.py` 还在，因为两个真进程用例仍拿它拼命令——改跑 Dart
-    产物的下一个切片一并删）；只剩 `sample`（仍按 Python 随包）。本阶段不一次动完，
+  - 首批迁移：**`minimal`、`suspendable`、`terminal_probe` 与 `compact` 已入插件仓（Dart）
+    并从 `examples/plugins/` 删除**；只剩 `sample`（仍按 Python 随包）。本阶段不一次动完，
     是为了每个切片都能单独回滚。
+  - **执行站命令失败时 payload 必须跟着异常一起走**（**修改**
+    [plugins/_kit/plugin_kit.dart](plugins/_kit/plugin_kit.dart) `CmdFailureException`）：核心对
+    `llm.call` 的口径是 `StationCommandOutcome.failedWith(error, payload)`——“调用失败”也带着
+    `text` / `error_kind` / `truncated_suspect`（known-issues #31）。以前 `command()` 只把 error
+    包成异常，
+    payload 就在这一跳被丢掉，结局是插件报“原文 0 字”当场弃权、把已经付费的那次总结整包扔掉
+    （真进程用例 `compact_plugin_e2e_test.dart` 把它钉住了：那三条抢救用例到此才跑得绿）。
   - 计数：tree_protocol 门禁 44 → **49**（新增 5 条源码侧合同用例；扫描面 += `plugins`）；
     tree_core 1455 → **1462**（新增 7 条换代迁移用例）；
-    插件自检 minimal 9 条 + suspendable 16 条 + terminal_probe 77 条 + **compact 193 条**
+    插件自检 minimal 9 条 + suspendable 16 条 + terminal_probe 77 条 + **compact 194 条**
     （假核心，跑的是与成品 exe 同一个 `run()`）。
 - **整轮接管只能夺「编排」，不能夺「写」**（**新增**
   [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 31、

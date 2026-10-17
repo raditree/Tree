@@ -464,7 +464,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 > 里最多保留 `--keep-tool-rounds`（默认 8）个工具轮（单轮超长工具轨迹因此压得动），
 > 并且**切点永不落在 `tool` 消息上**（否则尾部以孤儿工具结果开头 = 端点 400）。
 > 任何一步失败都回 `null`，而且**带一句可读原因**（回包可选键 `reason`）。
-> 可直接读它当模板（`dart run plugins/compact/compact_plugin.dart --selftest`，193 条，
+> 可直接读它当模板（`dart run plugins/compact/compact_plugin.dart --selftest`，194 条，
 > 不需要真核心；编译：`dart run tool/build_plugins.dart --only compact`）。
 
 ### 5.4 接管 LLM：一次性 与 流式
@@ -1055,10 +1055,11 @@ plugins:
   `response_format` 显式 `text`，少一条就整段不命中）。它还交了另一份完整面：**不接管必须带原因**
   （回包可选键 `reason` + 面板 + 日志三处落点）、**总结回包坏了的三段抢救**（本地结构修复 →
   一次“判完整性 + 修 json”小调用 → 放弃）、**用量从载荷里的 `recent_usage` 并入面板**（插件读不到
-  数据根，按整行内容去重）。自检 193 条（同样走真帧面）。编译：`--only compact`。
-- [`examples/plugins/compact_plugin.py`](../examples/plugins/compact_plugin.py)：上面那份的
-  **Python 旧版**，暂时还住在示例目录里：两份真进程用例（`compact_plugin_e2e_test.dart` /
-  `compact_panel_ui_test.dart`）目前还拿它拼命令，改跑 Dart 产物后一并删除。
+  数据根，按整行内容去重）。自检 194 条（同样走真帧面）。编译：`--only compact`。
+- 两份真进程用例（`compact_plugin_e2e_test.dart` / `compact_panel_ui_test.dart`）跑的就是
+  上面那份 Dart 入口（`dart <文件.dart>` 起进程，不依赖 `build/` 产物）；Python 版已随这次
+  迁移从 `examples/plugins/` 删除——那两条以前本机没有 Python 就整组静默跳过，现在只要有
+  Dart 就真跑（覆盖面反而大了）。旧脚本的历史看 git 历史与 `docs/known-issues.md` 里的现场记录。
 - [packages/tree_self_updater](../packages/tree_self_updater/README.md)：**binary 型内置插件**的参考实现
   （框架自迭代插件）：自带协议常量表、两条申报路共用同一份参数表、`suspend` 里「先转储等回包再 ack」，
   带 `--selftest`（退出码 0 = 全绿）。它不是脚本，但是“一个插件能做到什么”的最小可读完整面（见 §6.7）。
