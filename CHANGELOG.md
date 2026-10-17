@@ -39,10 +39,15 @@
   - **产物必须自检过**：`tool/build_plugins.dart` 编译完立即跑 `<exe> --selftest`，非 0 就整个
     构建失败——"能编译"不等于"协议对"，而协议错在用户机器上的表现是"插件起不来"。
     打包链（②f）只读 `build/plugins/plugin-index.json` 拷成品，不自己扫目录（第二份真相一定漂）。
-  - 首批迁移：**`minimal` 已入插件仓（Dart）并从 `examples/plugins/` 删除**；其余四个仍按
-    Python 随包，逐个跟进（本阶段不一次动完，是为了每个切片都能单独回滚）。
+  - **取回只能由核心的 `hello` 点名触发**（**修改** [docs/plugin-development.md](docs/plugin-development.md) §6.5 第 5 步）：
+    骨架只在 hello 的 params 带了 `resume_dump_id` 时下一次 `plugin.stateFetch`。因为**取回就是消费**
+    （`statePool.take`，一份只喂一世），而键按 `pluginId` + 核心算的代际认（不接受插件指定）——
+    没点名自己去取，多实例插件里先抢到的那一个会让真正该续的那一世只拿得到 `has_snapshot:false`。
+    旧的 Python 示例是无条件取回；现在这条由自检钉住（"没有 resume_dump_id ⇒ 不下 stateFetch"）。
+  - 首批迁移：**`minimal` 与 `suspendable` 已入插件仓（Dart）并从 `examples/plugins/` 删除**；
+    其余三个仍按 Python 随包，逐个跟进（本阶段不一次动完，是为了每个切片都能单独回滚）。
   - 计数：tree_protocol 门禁 44 → **48**（新增 4 条源码侧合同用例；扫描面 += `plugins`）；
-    插件自检 9 条（假核心，跑的是与真进程同一个 `run()`）。
+    插件自检 minimal 9 条 + suspendable 16 条（假核心，跑的是与成品 exe 同一个 `run()`）。
 - **整轮接管只能夺「编排」，不能夺「写」**（**新增**
   [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 31、
   [docs/plugin-development.md](docs/plugin-development.md) §5.6、
@@ -288,7 +293,7 @@
     `plugin_state_pool_scope_test` 把这条当契约钉下。
   - 用例（真子进程 + 可计数证据，不靠“看起来成功”）：`plugin_hot_restart_test`（11）、
     `plugin_hot_restart_station_test`（11）、`plugin_close_no_hard_timeout_test`（6）、
-    `plugin_state_pool_scope_test`（5）；参考实现 `examples/plugins/suspendable_plugin.py`（带 `--selftest`）。
+    `plugin_state_pool_scope_test`（5）；参考实现 `plugins/suspendable/suspendable_plugin.dart`（Dart，带 `--selftest`）。
     本次计数：tree_core **1315 passed / 3 skipped / 0 failed**（基线 1282 + 新增 33），tree_protocol **44 passed**。
 
 - **SSH 执行从「平行通道协议」迁入中转站点位**（**修改**

@@ -700,6 +700,9 @@ plugins:
 4. 新一世的 `hello` 参数里会带 `resume_dump_id`（没快照时根本没这个键）；
 5. 你下 `plugin.stateFetch` 取回它。核心只认"上一世"那一份，且一份只喂一世；
    拿不到就按冷启动继续（`has_snapshot:false` + `reason`），**这不是错误**。
+   **核心没点名（hello 里没这个键）就不要去自己取一份**：`stateFetch` 是按 `pluginId`
+   认"上一世"的（代际由核心算，不接受插件指定），而取回就是**消费**——多实例插件里
+   先抢到的那一个，会让真正该续的那一世只拿得到 `has_snapshot:false`。
 
 三条红线：
 
@@ -710,7 +713,10 @@ plugins:
 * **不要指望时长**：没有任何"多少毫秒内必须转储完"的上限，也没有"慢了就杀"。反过来，
   装死也不划算——连续 N 拍（缺省 3×I）没有任何入站报文会被判失活，那时核心会收尸。
 
-最小可运行参考实现：`examples/plugins/suspendable_plugin.py`（带 `--selftest`）。
+最小可运行参考实现：[`plugins/suspendable/suspendable_plugin.dart`](../plugins/suspendable/suspendable_plugin.dart)
+（Dart，住插件仓；`dart run plugins/suspendable/suspendable_plugin.dart --selftest` 用假核心把
+“两世”跑一遍）。转储与取回的管道（`suspend` 分支、`plugin.stateDump` / `plugin.stateFetch` 的
+信封剥层）都在骨架 `plugins/_kit/plugin_kit.dart` 里，插件侧只交“这一世要留什么”。
 
 ### 6.6 重启窗口里对外保持正常状态（保活与暂存）
 
@@ -1023,6 +1029,10 @@ plugins:
   （hello / ping / tools/list / 一个工具；读循环、并发、异常收敛都在 `plugins/_kit/plugin_kit.dart`），
   `dart run plugins/minimal/minimal_plugin.dart --selftest` 用假核心自检。
   编译成成品：`dart run tool/build_plugins.dart --only minimal`。
+- [`plugins/suspendable/suspendable_plugin.dart`](../plugins/suspendable/suspendable_plugin.dart)：**热重启参考实现（Dart）**
+  ——“先转储等回包、再 ack、退；新一世 `hello` 拿 `resume_dump_id` 主动取回”这条时序的活文档，
+  工具 `era` 回一个**来自快照本身**的世数（自检 13 条：冷启动不下取回、dump 先于 ack、取不到按冷启动且留一行）。
+  编译：`dart run tool/build_plugins.dart --only suspendable`。
 - [`examples/plugins/sample_plugin.py`](../examples/plugins/sample_plugin.py)：全功能参考实现
   ——工具申报、活动栏面板、消息流卡片、工具前/后中转改写、**LLM 流式接管**（`--relay-llm`）、
   `prompt.system` 改写（`--relay-prompt`）、`llm.call` / `tool.call` / `session.rename`
@@ -1046,8 +1056,9 @@ plugins:
   [`test/fixtures/fake_llm_plugin.dart`](../packages/tree_core/test/fixtures/fake_llm_plugin.dart)
   的 `--loop-mode`（`stream` / `tool` / `late-tool` / `decline` / `whole` 五种回法，
   端到端用例在 `test/plugin_loop_relay_test.dart`）。
-- 运行：把 `examples/plugins/` 下的脚本拷到桌面端的 `plugins/` 目录（或直接写绝对路径），
-  在「设置 → 插件开发」里启用，即可在面板与消息流里看到它。
+- 运行：Dart 那批先 `dart run tool/build_plugins.dart` 产出到 `build/plugins/`，再把成品 exe 的路径
+  写进 `plugins.yaml`（或直接在「设置 → 插件开发」里启用）；Python 脚本拷到桌面端的 `plugins/`
+  目录（或直接写绝对路径）同理。两者都能在面板与消息流里看到它。
 
 有疑问先看两条不变量：**"空 = 通配"只适用于订阅声明**；**任何异常都 fail-open，
 绝不阻塞生成**。其余细节都能从这两条推出来。
