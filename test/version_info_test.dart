@@ -3,7 +3,7 @@
 // 两件容易被"看起来对"骗过去的事，这里都钉住：
 // 1. `kAppVersion` 是**手写常量**（运行时读不到 pubspec），所以必须有一条测试直接
 //    读 pubspec.yaml 比对——漂移要让测试红，而不是让用户看到一个假版本号；
-// 2. 插件文档路径是**多候选探测**（发行版 plugins/ 与仓库 examples/plugins/ 两种
+// 2. 插件文档路径是**多候选探测**（发行版 plugins/ 与仓库 docs/ 两种
 //    布局），顺序与回退都要可验证，否则用户点了"打开说明"只会看到没反应。
 import 'dart:io';
 
@@ -74,29 +74,56 @@ void main() {
       );
     });
 
-    test('源码布局：从产物目录向上找到 examples/plugins/README.md', () {
+    test('源码布局：产物目录向上只认 docs/ 里那份指南（不再有 examples/plugins）', () {
       // 模拟 build/windows/x64/runner/Debug/Tree.exe 这种深层产物目录
       final Directory deep = Directory(
         p.join(temp.path, 'build', 'windows', 'x64', 'runner', 'Debug'),
       )..createSync(recursive: true);
-      final String expected = writeReadme(
-        p.join(temp.path, p.joinAll(PluginDocs.repoDirName.split('/'))),
-      );
+      final Directory docs = Directory(
+        p.join(temp.path, PluginDocs.repoDocDirName),
+      )..createSync(recursive: true);
+      final File guide = File(p.join(docs.path, PluginDocs.guideName))
+        ..writeAsStringSync('# 插件开发指南\n');
+      // 插件仓 clone（桌面仓里那个 gitignore 的 plugins/）也在同一层：它不该抢指南
+      writeReadme(p.join(temp.path, PluginDocs.bundledDirName));
       expect(
         PluginDocs.resolvePath(executablePath: fakeExeIn(deep)),
-        expected,
+        guide.path,
+        reason: '2026-10-17：examples/plugins 已删；向上那一档只留 docs/ 里的专有文件名',
+      );
+    });
+
+    test('祖先目录里的 plugins/README.md 不算插件文档（泛化文件名会认错文档）', () {
+      // 与 docs/README.md 那一条同一个纪律：2026-10-17 把 examples/plugins 那一档
+      //收掉时，不能顺手换成"向上认任意祖先的 plugins/README.md"——`build/plugins/`
+      // 也是祖先目录里的 plugins/，构建产物里哪天多一份 README 就会把用户带走。
+      final Directory deep = Directory(
+        p.join(temp.path, 'build', 'windows', 'x64', 'runner', 'Debug'),
+      )..createSync(recursive: true);
+      writeReadme(p.join(temp.path, PluginDocs.bundledDirName));
+      writeReadme(p.join(temp.path, 'build', PluginDocs.bundledDirName));
+      expect(
+        PluginDocs.resolvePath(executablePath: fakeExeIn(deep)),
+        isNull,
+        reason: '可执行文件同级没有 plugins/ 时，不许靠祖先目录里的 README 兜底',
       );
     });
 
     test('两种布局都在时**优先发行目录**（离可执行文件最近的那份）', () {
+      // 发行包解在 temp/app/，仓库布局在 temp/：同一个仓里两种布局都可能命中时，
+      // 用户要看的是随包发出去的那一份。
+      final Directory app = Directory(p.join(temp.path, 'app'))
+        ..createSync(recursive: true);
       final String bundled = writeReadme(
-        p.join(temp.path, PluginDocs.bundledDirName),
+        p.join(app.path, PluginDocs.bundledDirName),
       );
-      writeReadme(
-        p.join(temp.path, p.joinAll(PluginDocs.repoDirName.split('/'))),
-      );
+      final Directory docs = Directory(
+        p.join(temp.path, PluginDocs.repoDocDirName),
+      )..createSync(recursive: true);
+      File(p.join(docs.path, PluginDocs.guideName))
+          .writeAsStringSync('# 插件开发指南\n');
       expect(
-        PluginDocs.resolvePath(executablePath: fakeExeIn(temp)),
+        PluginDocs.resolvePath(executablePath: fakeExeIn(app)),
         bundled,
         reason: '发行包与仓库同时在时，用户要看的是随包发出去的那份文档',
       );
@@ -193,7 +220,7 @@ void main() {
       expect(error, isNotNull);
       expect(error, contains('未找到'));
       expect(error, contains(PluginDocs.bundledDirName));
-      expect(error, contains(PluginDocs.repoDirName));
+      expect(error, contains(PluginDocs.repoDocDirName));
     });
 
     test('openPath：路径不存在时给可读原因', () async {

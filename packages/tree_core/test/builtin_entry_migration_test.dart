@@ -81,7 +81,7 @@ void main() {
       'command': command,
       'args': <String>[
         if (args.isEmpty)
-          p.join(temp.path, 'examples', 'plugins', '${id}_plugin.py'),
+          p.join(temp.path, 'old_scripts', '${id}_plugin.py'),
         ...args,
       ],
       'env': <String, String>{...env},

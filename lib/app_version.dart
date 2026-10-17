@@ -138,7 +138,8 @@ class PluginDocs {
   /// 系统性指南文件名（**首选**）。
   static const String guideName = 'plugin-development.md';
 
-  /// 简版说明文件名（指南缺失时的兜底；`examples/plugins/README.md` 是示例索引）。
+  /// 简版说明文件名（**只在显式指定的目录与应用目录那一档认**；
+  /// 逐级向上的仓库布局不认它，理由见 [candidatePaths]）。
   static const String readmeName = 'README.md';
 
   /// 候选文件名（**顺序即优先级**：系统性指南优先，简版说明兜底）。
@@ -147,9 +148,6 @@ class PluginDocs {
   /// 发行目录下的插件目录名（安装包与 Release 目录都是这个名字）。
   static const String bundledDirName = 'plugins';
 
-  /// 仓库里的插件目录相对路径（开发态）。
-  static const String repoDirName = 'examples/plugins';
-
   /// 仓库里的文档目录（开发态；`docs/plugin-development.md` 在这里）。
   static const String repoDocDirName = 'docs';
 
@@ -157,14 +155,18 @@ class PluginDocs {
   ///
   /// 顺序即优先级，且**只列可能存在的路径**——调用方按顺序取第一个存在的：
   /// 1. [overrideDir]：调用方显式指定（测试 / 将来加设置项）——两个文件名都认；
-  /// 2. **应用目录**下的 `plugins/<name>`：发行版布局（安装包与 Tree.exe 同级
-  ///    拷贝 `examples/plugins/` 的内容与 `docs/plugin-development.md`，
-  ///    见 `tool/package_windows.dart`）——两个文件名都认；
-  /// 3. 从可执行文件目录**逐级向上**找仓库布局：
-  ///    - `docs/plugin-development.md`：**只认指南这个专有文件名**。泛化的
-  ///      `README.md` 在任意祖先目录里都可能存在（实测：Flutter SDK 自带
-  ///      `flutter/docs/README.md`），认它会把用户送到一份**无关文档**上；
-  ///    - `examples/plugins/<name>`：两个文件名都认（仓库里的示例目录是专有路径）。
+  /// 2. **应用目录**下的 `plugins/<name>`：发行版布局（安装包与 Tree.exe 同级的
+  ///    `plugins/` 里有 `tool/package_windows.dart` 从 `docs/plugin-development.md`
+  ///    拷过去的那一份，见该脚本的 ②c）——两个文件名都认；
+  /// 3. 从可执行文件目录**逐级向上**找仓库布局的 `docs/plugin-development.md`：
+  ///    **只认指南这个专有文件名**。泛化的
+  ///    `README.md` 在任意祖先目录里都可能存在（实测：Flutter SDK 自带
+  ///    `flutter/docs/README.md`），认它会把用户送到一份**无关文档**上。
+  ///
+  /// 2026-10-17：**删掉了仓库里 `examples/plugins/` 那一档**（示例插件源码已搬进独立
+  /// 插件仓，那个目录不存在了）。它不能顺手改成“向上认 `<祖先>/plugins/README.md`”：
+  /// 那等于把上面那条“泛化文件名不认”的纪律重新打开——`<仓根>/build/plugins/` 同样
+  /// 是一个“祖先目录里的 plugins/”，构建产物目录哪天多出一份 README 就会把人带走。
   ///
   /// `flutter run` 的产物在 `build/windows/x64/runner/Debug/`，仓库根在好几层之上；
   /// 逐级向上同时覆盖"树内任意深度启动"的情形（与核心找内置插件脚本同一思路）。
@@ -191,10 +193,6 @@ class PluginDocs {
       add(
         p.join(dir.path, p.joinAll(repoDocDirName.split('/'))),
         <String>[guideName],
-      );
-      add(
-        p.join(dir.path, p.joinAll(repoDirName.split('/'))),
-        docNames,
       );
       dir = dir.parent;
     }
@@ -228,8 +226,7 @@ class PluginDocs {
     );
     if (path == null) {
       return '未找到插件开发指南（${docNames.join(' 或 ')}）。\n'
-          '查找位置：应用目录下的 $bundledDirName/、仓库的 $repoDocDirName/ 与 '
-          '$repoDirName/。\n'
+          '查找位置：应用目录下的 $bundledDirName/、仓库的 $repoDocDirName/。\n'
           '发行版请确认安装完整（$bundledDirName 目录与主程序同级）；'
           '源码仓库请确认在仓库内运行。';
     }

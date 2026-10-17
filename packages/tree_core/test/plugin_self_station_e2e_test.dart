@@ -9,8 +9,26 @@ import 'package:tree_core/tree_core.dart';
 ///
 /// 链路：插件的 `station/register`（自建广播站）→ `station/subscribe`
 /// （用核心返回的 `station_id` 订自己）→ 站点上出现唯一订阅者。
+///
+/// 2026-10-17：这一份从 `examples/plugins/sample_plugin.py` 改跑插件仓的 Dart 入口
+/// （**源码**，不是 `build/plugins/` 里的产物，理由同 `sample_plugin_layout_e2e_test`）。
+/// 以前本机没有 Python 就整条静默跳过，现在只要有 Dart SDK 就真验一遍。
 void main() {
   late Directory temp;
+
+  /// 示例插件入口（插件仓里的 Dart 源码；测试 cwd = packages/tree_core）。
+  final String sampleEntry = () {
+    final String? repo = BuiltinPluginCatalog.repoRoot(Directory.current.path);
+    return repo == null
+        ? ''
+        : p.normalize(p.join(repo, 'plugins', 'sample', 'sample_plugin.dart'));
+  }();
+
+  /// 插件仓未 clone（或没有这个入口）时才跳过。
+  final String? missingEntry =
+      sampleEntry.isEmpty || !File(sampleEntry).existsSync()
+      ? '插件仓（tree-plugins）未 clone 或没有 plugins/sample/ 入口'
+      : null;
 
   setUp(() {
     temp = Directory.systemTemp.createTempSync('tree_self_station_');
@@ -28,23 +46,8 @@ void main() {
   });
 
   test('示例插件 --self-station：自建站点并订阅自己（id 由核心拼装）', () async {
-    // 测试的工作目录是 packages/tree_core ⇒ 往上两层才是仓根
-    final String script = p.normalize(
-      p.join(
-        Directory.current.path,
-        '..',
-        '..',
-        'examples',
-        'plugins',
-        'sample_plugin.py',
-      ),
-    );
-    if (!File(script).existsSync()) {
-      markTestSkipped('示例插件不在预期路径：$script');
-      return;
-    }
-    final String python = Platform.isWindows ? 'python' : 'python3';
-
+    // 命令行用当前 Dart SDK 起插件源码（`dart <文件.dart>`）：这条用例要验的是
+    // 「真插件进程 + 真站点中枢」，用产物 exe 就把依赖扩到了构建输出。
     final File config = File(p.join(temp.path, 'config', 'plugins.yaml'));
     config.createSync(recursive: true);
     config.writeAsStringSync(
@@ -52,8 +55,8 @@ void main() {
       'plugins:\n'
       '  - id: sample\n'
       '    name: 示例插件\n'
-      '    command: "$python"\n'
-      '    args: ["${script.replaceAll('\\', '/')}", "--self-station", "--no-relay"]\n'
+      '    command: "${_slash(Platform.resolvedExecutable)}"\n'
+      '    args: ["${_slash(sampleEntry)}", "--self-station", "--no-relay"]\n'
       '    granularity: team\n'
       '    scope: {team_id: team-1}\n',
     );
@@ -99,5 +102,8 @@ void main() {
       File(config.path.replaceAll('plugins.yaml', 'stations.yaml')).existsSync(),
       isTrue,
     );
-  }, timeout: const Timeout(Duration(seconds: 90)));
+  }, timeout: const Timeout(Duration(seconds: 90)), skip: missingEntry);
 }
+
+/// Windows 反斜杠转 `/`：yaml 里 `\\` 是转义，正斜杠两种平台都认。
+String _slash(String path) => path.replaceAll(r'\', '/');

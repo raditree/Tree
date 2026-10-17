@@ -281,8 +281,8 @@
       **不看条目在不在盘上**——内置身份由静态清单认定，先被发布仓库写一条、再被人按内置
       开关，就会变成两个主人抢同一条目（开关一按就把 command 写回随包那一份）。
     - **随包的文件名也不给盖**（与上一条是两道不同的防线）：`files[].target` 撞上
-      `BuiltinPluginCatalog.protectedFileNames()`（示例/压缩脚本、SSH 执行器与自迭代插件的
-      二进制）就整条跳过——不撞上内置 id 也能把 `sample_plugin.py` 覆盖掉，而现象是“示例
+      `BuiltinPluginCatalog.protectedFileNames()`（示例/压缩/SSH 执行器与自迭代插件的
+      随包二进制）就整条跳过——不撞上内置 id 也能把 `tree_sample.exe` 覆盖掉，而现象是“示例
       插件突然起不来”，归因要翻到一份远端 JSON 里。跳过发生在**列清单**时（面板当场说得出
       原因），不是等用户点了安装才失败。
     - **离线不许看起来像最新**：`GET /api/plugin/release` 只读缓存（一个 URL 都不碰）并把

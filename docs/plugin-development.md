@@ -1,7 +1,9 @@
 # 插件开发指南（Tree 桌面端）
 
 > 面向"从零写一个能用的插件"。协议、站点体系、隔离语义、UI 槽位、调试手段都在这里；
-> 可运行示例见 [`examples/plugins/`](../examples/plugins/)。
+> 可运行示例**全部住在插件仓**（raditree/tree-plugins，本地 clone 在桌面仓的
+> [`plugins/`](../plugins/README.md)：五个 Dart 插件 + 公共骨架 `_kit`，`dart compile exe` 编成
+> 成品，不再要求用户机器装 Python）；“从哪个示例下手”见 §12。
 >
 > 在 agent 的工作空间里读到这份时，它是**核心播种的副本**（`.self/docs/plugin-development.md`，
 > 选中 `plugin-creator` 规范时播种、由核心维护）：权威仍是应用目录 `plugins/`（发行版）与仓库
@@ -1043,11 +1045,13 @@ plugins:
   拿不到句柄就如实**降级**成"通路存活"（每一拍 echo），并把降级原因写进时间线。它还交了左栏 `activity`
   面板的完整形状（`ui/manifest` 一次 + `ui/update` 整块替换 + 按钮动作从 `params.event` 判）。
   自检 77 条（走**真帧面**：订阅、面板声明、执行站命令都在帧上断言）。编译：`--only terminal_probe`。
-- [`examples/plugins/sample_plugin.py`](../examples/plugins/sample_plugin.py)：全功能参考实现
-  ——工具申报、活动栏面板、消息流卡片、工具前/后中转改写、**LLM 流式接管**（`--relay-llm`）、
-  `prompt.system` 改写（`--relay-prompt`）、`llm.call` / `tool.call` / `session.rename`
-  三条新命令（`--llm-call` / `--tool-call` / `--rename-session`）、工具广播订阅（`--watch-tools`）、
-  自建站点（`--self-station`）、心跳与 `--selftest`。
+- [`plugins/sample/sample_plugin.dart`](../plugins/sample/sample_plugin.dart)：**全功能参考实现（Dart，成品
+  `tree_sample[.exe]`）**——工具申报、活动栏面板、消息流卡片、工具前/后中转改写、**LLM 流式接管**
+  （`--relay-llm`）、`prompt.system` 改写（`--relay-prompt`）、`llm.call` / `tool.call` /
+  `session.rename` 三条新命令（`--llm-call` / `--tool-call` / `--rename-session`）、工具广播订阅
+  （`--watch-tools`）、自建站点（`--self-station`）、心跳与 `--selftest`（**215 条**，同样走真帧面：
+  订阅形状、流式接管的 `request_id`、取消后不再推 done、收集站回包根对象只允许 `tools` 一个键…）。
+  编译：`dart run tool/build_plugins.dart --only sample`。
 - [`plugins/compact/compact_plugin.dart`](../plugins/compact/compact_plugin.dart)：**内置插件
   「上下文压缩」（Dart，成品 `tree_compact[.exe]`）**——`system.relay.context.compact` 的完整实现
   （摘要 + 必读文件 + todo 快照，编排 `llm.call` / `fs.read` / `tool.call`），也是"压缩点位怎么接"
@@ -1056,25 +1060,29 @@ plugins:
   （回包可选键 `reason` + 面板 + 日志三处落点）、**总结回包坏了的三段抢救**（本地结构修复 →
   一次“判完整性 + 修 json”小调用 → 放弃）、**用量从载荷里的 `recent_usage` 并入面板**（插件读不到
   数据根，按整行内容去重）。自检 194 条（同样走真帧面）。编译：`--only compact`。
-- 两份真进程用例（`compact_plugin_e2e_test.dart` / `compact_panel_ui_test.dart`）跑的就是
-  上面那份 Dart 入口（`dart <文件.dart>` 起进程，不依赖 `build/` 产物）；Python 版已随这次
-  迁移从 `examples/plugins/` 删除——那两条以前本机没有 Python 就整组静默跳过，现在只要有
-  Dart 就真跑（覆盖面反而大了）。旧脚本的历史看 git 历史与 `docs/known-issues.md` 里的现场记录。
+- 四份真进程用例跑的就是上面那些 **Dart 源码入口**（`dart <文件.dart>` 起进程，**不依赖**
+  `build/` 产物：产物是 gitignore 的构建输出，拿它当唯一依赖会让没跑过构建的机器整组静默
+  跳过；成品的协议面由 `tool/build_plugins.dart` 拿编出来的 exe 再跑一遍 `--selftest` 钉住）：
+  compact 两份（`compact_plugin_e2e_test.dart` / `compact_panel_ui_test.dart`）、示例插件两份
+  （`sample_plugin_layout_e2e_test.dart` / `plugin_self_station_e2e_test.dart`）。
+  **`examples/plugins/` 目录已随这批迁移整个删掉**（五份 Python 示例全部进了插件仓）：以前这些
+  用例本机没有 Python 就整组静默跳过，现在只要有 Dart 就真跑（覆盖面反而大了）。旧脚本的历史
+  看 git 历史与 `docs/known-issues.md` 里的现场记录。
 - [packages/tree_self_updater](../packages/tree_self_updater/README.md)：**binary 型内置插件**的参考实现
   （框架自迭代插件）：自带协议常量表、两条申报路共用同一份参数表、`suspend` 里「先转储等回包再 ack」，
   带 `--selftest`（退出码 0 = 全绿）。它不是脚本，但是“一个插件能做到什么”的最小可读完整面（见 §6.7）。
 - 这些脚本都**不依赖第三方库**、都能被绝对路径启动（不依赖 cwd）。
 - 尚未提供可运行示例的点位：`system.relay.llm.request`（投入前改写）——口径见 §5.3，
   接法与其他中转点位完全一致；`system.relay.loop.run`（**整轮接管**）——口径与帧序列见
-  §5.6，没示例是因为接管者得**自带一份模型调用**（它才是循环的主人）：`sample_plugin.py`
-  里那套 `--relay-llm` 的流式写法就是它的下半身，把“每跳被问一次”换成“每轮被问一次”
+  §5.6，没示例是因为接管者得**自带一份模型调用**（它才是循环的主人）：示例插件里那套
+  `--relay-llm` 的流式写法就是它的下半身，把“每跳被问一次”换成“每轮被问一次”
   并把工具改成 `tool.call` + `run_id` 即成。要看逐帧形状，读测试夹具
   [`test/fixtures/fake_llm_plugin.dart`](../packages/tree_core/test/fixtures/fake_llm_plugin.dart)
   的 `--loop-mode`（`stream` / `tool` / `late-tool` / `decline` / `whole` 五种回法，
   端到端用例在 `test/plugin_loop_relay_test.dart`）。
-- 运行：Dart 那批先 `dart run tool/build_plugins.dart` 产出到 `build/plugins/`，再把成品 exe 的路径
-  写进 `plugins.yaml`（或直接在「设置 → 插件开发」里启用）；Python 脚本拷到桌面端的 `plugins/`
-  目录（或直接写绝对路径）同理。两者都能在面板与消息流里看到它。
+- 运行：先 `dart run tool/build_plugins.dart` 产出到 `build/plugins/`，再把成品 exe 的路径
+  写进 `plugins.yaml`（或直接在「设置 → 插件开发」里把内置插件的开关拉开：核心自己按可执行文件
+  同级的 `plugins/<name>[.exe]` 解析随包产物）。两者都能在面板与消息流里看到它。
 
 有疑问先看两条不变量：**"空 = 通配"只适用于订阅声明**；**任何异常都 fail-open，
 绝不阻塞生成**。其余细节都能从这两条推出来。

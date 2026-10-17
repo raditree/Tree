@@ -146,19 +146,15 @@ Future<void> _package(List<String> args) async {
     }
   }
 
-  // ②c 内置插件脚本：examples/plugins/ → 发行目录 plugins/（与 Tree.exe / tree_core.exe 同级）
+  // ②c 插件开发指南：docs/plugin-development.md → 发行目录 plugins/（与 Tree.exe / tree_core.exe 同级）
   //
-  // 为什么必须拷：核心按**自身可执行文件同级的** plugins/<name>.py 解析内置插件的
-  // 脚本（见 packages/tree_core/lib/src/plugin/builtin_plugins.dart 的 scriptRoots）。
-  // 漏了这一层，用户在界面上打开「示例插件」只会得到"找不到内置插件脚本"。
-  // 目录不存在不算失败（有人可能只要核心，不带示例脚本），但要**打印一行**说明。
-  final _PluginCopy plugins = _copyPlugins(root, releaseDir);
-  stdout.writeln(
-    !plugins.sourceExists
-        ? '   插件脚本：跳过（没有 examples/plugins 目录）'
-        : '   插件脚本：plugins/（${plugins.copied} 个文件'
-              '${plugins.skipped > 0 ? '，跳过 ${plugins.skipped} 个本地产物' : ''}）',
-  );
+  // 为什么必须拷：应用内「打开插件开发说明」与核心播种到工作空间的那一份，找的都是
+  // **可执行文件同级的** plugins/plugin-development.md（见 `lib/app_version.dart` 的
+  // PluginDocs 与 `packages/tree_core/lib/src/plugin/plugin_guide.dart`）。
+  // 2026-10-17：这一档原来还负责把 examples/plugins/ 的 Python 脚本整目录拷过去；五个
+  // 插件全部换成插件仓的 Dart 成品后那个目录已删，**成品由下面的 ②f 按
+  // build/plugins/plugin-index.json 拷**（本步只留指南这一份文档）。
+  stdout.writeln(_copyPluginGuide(root, releaseDir));
   // ②d SSH 执行器的两份二进制（2026-10-10）：
   //   - 中转站插件 `plugins/tree_ssh_executor[.exe]`（跑在**用户本机**，与核心同级）；
   //   - 目标机 agent `agents/tree_agent-linux-{amd64,arm64}`（由插件按目标机架构推送）。
@@ -280,10 +276,11 @@ Tree 桌面端（Windows 便携版）
     data/<agent>/<session>/     会话数据：session.json + messages.jsonl（一行一条消息）
 
 内置插件
-  plugins/ 目录与 Tree.exe 同级，里面是核心自带的示例插件脚本。界面上「插件」页把
-  内置插件与自定义插件分开列出，每一项都有自己的开关；打开内置插件时核心会去探测
-  Python（python / py -3）并解析 plugins/<name>.py 的绝对路径，两者缺一都会给可读
-  错误（装了 Python 之后点面板上的刷新即可重新探测）。
+  plugins/ 目录与 Tree.exe 同级，里面是核心自带的插件**可执行文件**（示例插件
+  tree_sample.exe、压缩器 tree_compact.exe 等）与一份插件开发指南
+  plugin-development.md。界面上「插件」页把内置插件与自定义插件分开列出，每一项都有
+  自己的开关；打开内置插件时核心直接在 plugins/ 里找同名可执行文件（Windows 补
+  .exe），找不到会给可读错误（补上文件后在面板上点「重新解析内置插件的随包产物」）。
 
 出问题先看这里
   - 提示"未找到核心进程可执行文件 tree_core.exe"：确认 tree_core.exe 与 Tree.exe
@@ -306,108 +303,29 @@ Future<Never> _fail(String message, int code) async {
   exit(code);
 }
 
-/// 一次插件脚本拷贝的结果。
+/// 把 `docs/plugin-development.md`（系统性插件开发指南）拷进发行目录的 plugins/。
 ///
-/// [sourceExists] 单独一个字段：`examples/plugins` 不存在（"没有可拷的"）与
-/// "拷了 0 个文件"是两件事，日志与调用方要能区分（原来用一个 -1 表达；加了
-/// "跳过几个"之后，继续挤在一个 int 里会更难读）。
-class _PluginCopy {
-  const _PluginCopy({
-    required this.sourceExists,
-    this.copied = 0,
-    this.skipped = 0,
-  });
-
-  const _PluginCopy.missing() : this(sourceExists: false);
-
-  final bool sourceExists;
-
-  /// 真正拷进去的文件数（含指南副本）。
-  final int copied;
-
-  /// 被当作"本地产物"跳过的文件数（见 [_isPluginJunkPath]）。
-  final int skipped;
-}
-
-/// **不该进发行包**的目录名：本地跑插件留下的缓存与环境。
-///
-/// 实际踩到的：在仓库里用 python 跑一次示例插件，目录里就多出 `__pycache__/*.pyc`；
-/// 而打包脚本原来是**整目录递归复制**，于是两个字节码文件一路进了 `Release/plugins/`，
-/// 再被 zip 与安装包原样带走（用户机器上纯属垃圾，也让"包里到底有什么"说不清）。
-const Set<String> _pluginJunkDirs = <String>{
-  '__pycache__',
-  '.git',
-  '.venv',
-  'venv',
-  '.mypy_cache',
-  '.pytest_cache',
-  '.ruff_cache',
-  '.idea',
-};
-
-/// 相对路径是否属于"本地产物"：任一路径段命中 [_pluginJunkDirs]，或是字节码文件。
-bool _isPluginJunkPath(String relative) {
-  final List<String> segments = relative.split(RegExp(r'[\\/]+'));
-  for (final String segment in segments) {
-    if (_pluginJunkDirs.contains(segment.toLowerCase())) return true;
-  }
-  final String name = segments.isEmpty ? relative : segments.last;
-  final String lower = name.toLowerCase();
-  return lower.endsWith('.pyc') || lower.endsWith('.pyo');
-}
-
-/// 把 examples/plugins/ 复制到发行目录的 plugins/。
-///
-/// 递归复制、保留子目录结构：插件常带自己的模块与数据文件；但**跳过本地产物**
-/// （[_pluginJunkDirs] 里的目录与 `.pyc`/`.pyo`，见 [_isPluginJunkPath]），
-/// 并顺手清掉目标目录里同类的残留（上一轮构建留下的、这一轮才发现不该在里面）。
-///
-/// 为什么不"先清空目标再拷"：`--release-dir` 可以指向任意目录（包括用户装好的
-/// 应用目录），那里的 `plugins/` 下可能有用户自己放的插件，整目录删除会把它一起抹掉；
-/// 只删自己认得出来的产物，是这里刻意的保守取舍。
-///
-/// **另外**把 `docs/plugin-development.md`（系统性插件开发指南）也拷进 `plugins/`：
 /// 应用内「打开插件开发说明」首先找的就是 `plugins/plugin-development.md`
 /// （见 `lib/app_version.dart` 的 `PluginDocs`），发行版因此不必带整个 `docs/`。
-/// 指南缺失不算失败（会退回 `plugins/README.md`），所以这里静默跳过。
-_PluginCopy _copyPlugins(Directory root, Directory releaseDir) {
-  final Directory source = Directory(_join(root.path, 'examples/plugins'));
-  if (!source.existsSync()) return const _PluginCopy.missing();
-  final Directory target = Directory(_join(releaseDir.path, 'plugins'))
-    ..createSync(recursive: true);
-  // 目标里的同类残留：只删认得出来的产物（保守起见不整目录重建）。
-  for (final FileSystemEntity entity in target.listSync()) {
-    final String name = _basename(entity.path).toLowerCase();
-    final bool junkDir = entity is Directory && _pluginJunkDirs.contains(name);
-    final bool junkFile =
-        entity is File && (name.endsWith('.pyc') || name.endsWith('.pyo'));
-    if (junkDir || junkFile) entity.deleteSync(recursive: true);
-  }
-  int copied = 0;
-  int skipped = 0;
-  for (final FileSystemEntity entity in source.listSync(recursive: true)) {
-    if (entity is! File) continue;
-    final String relative = entity.path
-        .substring(source.path.length)
-        .replaceAll(RegExp(r'^[\\/]+'), '');
-    if (relative.isEmpty) continue;
-    if (_isPluginJunkPath(relative)) {
-      skipped++;
-      continue;
-    }
-    final File destination = File(_join(target.path, relative));
-    destination.parent.createSync(recursive: true);
-    entity.copySync(destination.path);
-    copied++;
-  }
+/// 指南缺失**不算打包失败**（它只让“点开说明”这一件事没东西可看，不像插件成品
+/// 那样直接关系面板上的开关），但必须打一行 —— 与下面几档拷贝同一个口径。
+///
+/// 2026-10-17：本函数取代了原来的 `_copyPlugins`（拷 examples/plugins/ 整目录 + 过滤
+/// `__pycache__`/`*.pyc` 等 Python 本地产物）。**那套过滤跟着删了**：打包链不再产
+/// Python 文件，而 `--release-dir` 指向用户装好的目录时，人家目录里有什么不是这里
+/// 该管的（原来“只删认得出来的产物、不整目录重建”就是为此而作的保守取舍）。
+String _copyPluginGuide(Directory root, Directory releaseDir) {
   final File guide = File(
     _join(root.path, _join('docs', 'plugin-development.md')),
   );
-  if (guide.existsSync()) {
-    guide.copySync(_join(target.path, 'plugin-development.md'));
-    copied++;
+  if (!guide.existsSync()) {
+    return '   插件指南：跳过（没有 docs/plugin-development.md）';
   }
-  return _PluginCopy(sourceExists: true, copied: copied, skipped: skipped);
+  final Directory target = Directory(_join(releaseDir.path, 'plugins'))
+    ..createSync(recursive: true);
+  guide.copySync(_join(target.path, 'plugin-development.md'));
+  return '   插件指南：plugins/plugin-development.md（'
+      '${(guide.lengthSync() / 1024).toStringAsFixed(1)} KB）';
 }
 
 /// 把 SSH 执行器的两份二进制复制进发行目录（2026-10-10）。

@@ -65,7 +65,8 @@ dart run bin/tree_self_updater.dart --selftest   # 开发态自检（cwd = 本�
 `tool/package_windows.dart` 会把产物拷进发行包的 `plugins/` 目录（缺失只打印不算失败，
 与其他插件二进制同口径）；核心侧的解析顺序见
 [builtin_plugins.dart](../tree_core/lib/src/plugin/builtin_plugins.dart)：可执行文件同级
-`plugins/` → 仓根 `build/plugins/` → `examples/plugins/`。
+`plugins/` → 仓根 `build/plugins/` → cwd 的 `plugins/` 与 `build/plugins/`
+（2026-10-17：仓里的 `examples/plugins/` 已删，那两条回退跟着收掉）。
 
 ## 测试
 

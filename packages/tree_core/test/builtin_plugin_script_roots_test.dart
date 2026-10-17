@@ -34,7 +34,6 @@ void main() {
   /// 造一个"像仓库"的目录树：`<root>/packages/tree_core` 是标记。
   String makeRepo(String root) {
     Directory(p.join(root, 'packages', 'tree_core')).createSync(recursive: true);
-    Directory(p.join(root, 'examples', 'plugins')).createSync(recursive: true);
     return root;
   }
 
@@ -89,14 +88,19 @@ void main() {
       isWindows: true,
     );
 
-    // 目录清单里必须有"仓根 build/plugins"这一条，且它排在 cwd 回退之前
+    // 目录清单里必须有"仓根 build/plugins"这一条，且它排在 cwd 兜底之前
     final List<String> roots = catalog.scriptRoots();
     final String expectedRoot = p.normalize(p.join(root, 'build', 'plugins'));
     expect(roots, contains(expectedRoot));
     expect(
-      roots.indexOf(expectedRoot) < roots.length - 2,
+      roots.indexOf(expectedRoot) < roots.length - 1,
       isTrue,
       reason: '仓根回退应优先于 cwd 兜底：$roots',
+    );
+    expect(
+      roots.any((String r) => r.replaceAll('\\', '/').contains('examples/plugins')),
+      isFalse,
+      reason: '仓里的 examples/plugins 已删：失败信息里不该再多列一个查不到的地点',
     );
 
     // 端到端：真解析一次，命中的必须是仓根下那个产物（这就是面板上不再报

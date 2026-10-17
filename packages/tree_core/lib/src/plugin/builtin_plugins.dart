@@ -34,10 +34,12 @@ const String kSampleBinaryName = 'tree_sample';
 /// - **python 型**：Windows 依次探测 python / py -3；其他平台 python3 / python；
 /// - **binary 型**（2026-10-10 新增，用于 `ssh_executor` 中转站）：**不做运行时探测**，
 ///   直接解析"可执行文件同级的 `plugins/<name>`（Windows 补 `.exe`）"；
-/// - 脚本：优先核心可执行文件同级的 `plugins/<name>.py`（发行包里由
-///   tool/package_windows.dart 把 examples/plugins 复制到那里）；开发态向上定位
-///   **仓根**后查 `examples/plugins/`（不依赖当前工作目录——桌面壳是以自己所在
+/// - 脚本：优先核心可执行文件同级的 `plugins/<name>`（发行包里由
+///   tool/package_windows.dart 放进去）；开发态向上定位**仓根**后查
+///   `build/plugins/`（不依赖当前工作目录——桌面壳是以自己所在
 ///   目录为 cwd 拉起核心的，Debug 产物目录下没有 plugins/）。
+///   2026-10-17：仓里的 `examples/plugins/` 已删（最后一份 Python 示例搬进插件仓），
+///   所以这里**不再有“开发态查示例目录”这一条回退**。
 ///
 /// 解析结果会写成一条**普通插件配置**（带 builtin: true 标记供 UI 分组），
 /// 因此内置插件与用户自己加的插件在运行时走的是同一条路（插件总线只认这一份配置）。
@@ -391,9 +393,9 @@ class BuiltinPluginCatalog {
     if (script == null) {
       return _cache[spec.id] = BuiltinResolution.failed(
         '找不到内置插件脚本 ${spec.script}（依次查找：${roots.join('；')}）。'
-        '发行包应当把 examples/plugins 复制到可执行文件同级的 plugins/ 目录'
+        '发行包应当在可执行文件同级的 plugins/ 目录里带上它'
         '（打包脚本 tool/package_windows.dart 已包含这一步）；'
-        '开发态则会自动向上定位仓根再查 examples/plugins。',
+        '开发态请先跑 tool/build_plugins.dart 产出到仓根 build/plugins/。',
         searchedScriptRoots: roots,
       );
     }
@@ -444,11 +446,14 @@ class BuiltinPluginCatalog {
   ///
   /// 1. 核心可执行文件同级的 `plugins/`（**发行包的正规位置**：Tree.exe /
   ///    tree_core.exe 与 plugins/ 同级）；
-  /// 2. **仓根**的 `build/plugins/`（开发态的构建产物，`tool/build_ssh_plugin.dart` 的落点）;
-  /// 3. **仓根**的 `examples/plugins/`（开发态回退，见 [repoRoot]）；
-  /// 4. 当前工作目录下的 `plugins/`、`build/plugins/`、`examples/plugins/`（`dart run` 时的兜底）。
+  /// 2. **仓根**的 `build/plugins/`（开发态的构建产物，`tool/build_plugins.dart` 的落点）;
+  /// 3. 当前工作目录下的 `plugins/`、`build/plugins/`（`dart run` 时的兜底）。
   ///
-  /// 为什么第 2/3 条必须**锚定仓根**而不是相对 cwd：桌面壳是以**自己所在目录**为
+  /// 2026-10-17：**删掉了仓根与 cwd 下的 `examples/plugins/` 两条**——那个目录已经不
+  /// 存在（示例插件的源码进了独立的插件仓，成品只从 `build/plugins/` 出来），留着
+  /// 只会让“找不到内置插件”的失败信息里多一个查不到的地点。
+  ///
+  /// 为什么第 2 条必须**锚定仓根**而不是相对 cwd：桌面壳是以**自己所在目录**为
   /// 工作目录拉起核心的，所以跑 Debug 构建时 cwd 是
   /// `build/windows/x64/runner/Debug`（该目录下没有 plugins/，Debug 产物也不复制），
   /// 于是"相对 cwd 的回退"一个都命中不了，内置示例插件在面板上就变成
@@ -461,14 +466,13 @@ class BuiltinPluginCatalog {
     final String? repo = repoRoot(exeDir);
     return <String>[
       p.join(exeDir, 'plugins'),
-      // 开发态的**构建产物**（`tool/build_ssh_plugin.dart` / `build_agent.dart` 的落点）：
+      // 开发态的**构建产物**（`tool/build_plugins.dart` / `build_ssh_plugin.dart` /
+      // `build_agent.dart` 的落点）：
       // 打了包就走上面那条（发行目录 plugins/），没打包时从这里读，免得开发时必须
       // 手动把二进制搬到 exe 同级。
       if (repo != null) p.join(repo, 'build', 'plugins'),
-      if (repo != null) p.join(repo, 'examples', 'plugins'),
       p.join(cwd, 'plugins'),
       p.join(cwd, 'build', 'plugins'),
-      p.join(cwd, 'examples', 'plugins'),
     ];
   }
 

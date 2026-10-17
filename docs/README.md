@@ -20,7 +20,7 @@
 [tree_local_exec](../packages/tree_local_exec/README.md) ·
 [tree_core_cli](../packages/tree_core_cli/README.md) ·
 [lib（Flutter UI）](../lib/README.md) ·
-[examples/plugins](../examples/plugins/README.md)
+[插件仓（tree-plugins，本地 clone 在 `plugins/`）](../plugins/README.md)
 
 tree_core 内部的 13 个业务模块各自也有 README（文件清单 + 不变量 + 测试）：
 见 [tree_core 的模块地图](../packages/tree_core/README.md#模块地图)。

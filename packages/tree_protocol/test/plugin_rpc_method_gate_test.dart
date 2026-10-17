@@ -30,13 +30,16 @@ void main() {
   /// `plugins` = 插件仓（raditree/tree-plugins，装在桌面仓的 plugins/ 下）：
   /// 那才是**插件作者真的会抄的那一份**（五个示例 + 公共骨架 `_kit`），它漂了
   /// 就是“指南写的协议名与代码里的协议名各自漂”，所以这一面必须在门里。
+  ///
+  /// 2026-10-17：原来这里还有一条 `examples/plugins`（Python 示例面）——最后一份
+  /// 示例插件搬进插件仓后那个目录已删，扫描面跟着收掉（留着就是“扫一个不存在的
+  /// 目录”，而门禁对不存在的扫描面是显式失败的）。
   final List<String> scanFaces = <String>[
     'packages/tree_core/lib/src/plugin',
     'packages/tree_ssh_plugin/lib',
     'packages/tree_self_updater/lib',
     'packages/tree_self_updater/bin',
     'plugins',
-    'examples/plugins',
   ];
 
   /// method 字面量的四种出现形态：下行帧的 `'method': 'x'`、JSON 双引号形态

@@ -27,7 +27,13 @@ class _ToolEngine implements AgentEngine {
   Future<void> close() async {}
 }
 
-/// **示例插件的可见性契约**（真 Python 插件 + 真插件总线，端到端）。
+/// **示例插件的可见性契约**（真插件进程 + 真插件总线，端到端）。
+///
+/// 2026-10-17：这一份从 `examples/plugins/sample_plugin.py` 改跑插件仓的 Dart 入口
+/// （**源码**，不是 `build/plugins/` 里的产物：产物是 gitignore 的构建输出，拿它当唯一
+/// 依赖会让没跑过构建的机器整组跳过；成品的协议面另有 `tool/build_plugins.dart` 跑的
+/// `<exe> --selftest`）。与 compact 那两份同口径：以前没 Python 就静默跳过，现在只要有
+/// Dart SDK 就会真验一遍。
 ///
 /// 为什么单独一个文件：示例插件是用户的"第一个插件"，它一旦"看起来没生效"，
 /// 现象全是**静默**的（面板停在 0、卡片不出现、没有任何报错），排查成本极高。
@@ -60,17 +66,22 @@ void main() {
     }
   });
 
-  /// 示例插件脚本（测试的工作目录是 packages/tree_core ⇒ 往上两层才是仓根）。
-  String sampleScript() => p.normalize(
-    p.join(
-      Directory.current.path,
-      '..',
-      '..',
-      'examples',
-      'plugins',
-      'sample_plugin.py',
-    ),
-  );
+  /// 示例插件入口（插件仓里的 Dart 源码；测试 cwd = packages/tree_core）。
+  ///
+  /// 不拿 `build/plugins/tree_sample.exe` 当依赖：那是构建输出（gitignore），
+  /// 没跑过构建的机器会让这一组整组静默跳过。
+  final String sampleEntry = () {
+    final String? repo = BuiltinPluginCatalog.repoRoot(Directory.current.path);
+    return repo == null
+        ? ''
+        : p.normalize(p.join(repo, 'plugins', 'sample', 'sample_plugin.dart'));
+  }();
+
+  /// 插件仓未 clone（或没有这个入口）时才跳过——比原来的“没 Python 就跳”覆盖面更大。
+  final String? missingEntry =
+      sampleEntry.isEmpty || !File(sampleEntry).existsSync()
+      ? '插件仓（tree-plugins）未 clone 或没有 plugins/sample/ 入口'
+      : null;
 
   String slash(String path) => path.replaceAll(Platform.pathSeparator, '/');
 
@@ -79,8 +90,8 @@ void main() {
       'plugins:\n'
       '  - id: sample\n'
       '    name: 示例插件\n'
-      '    command: "${Platform.isWindows ? 'python' : 'python3'}"\n'
-      '    args: ["${slash(sampleScript())}"]\n'
+      '    command: "${slash(Platform.resolvedExecutable)}"\n'
+      '    args: ["${slash(sampleEntry)}"]\n'
       '    granularity: team\n'
       '    $scopeLine\n';
 
@@ -125,12 +136,6 @@ void main() {
   }
 
   test('声明了 team：站点订阅成立，且 card 槽位在 ui.push 之前先申报', () async {
-    final String script = sampleScript();
-    if (!File(script).existsSync()) {
-      markTestSkipped('示例插件不在预期路径：$script');
-      return;
-    }
-
     final ({PluginBus bus, List<Map<String, dynamic>> frames}) started =
         await start('scope: {team_id: team-1}');
 
@@ -204,17 +209,11 @@ void main() {
     expect(
       relayPost?.subscribers.map((StationSubscriber s) => s.pluginId),
       contains('sample'),
-      reason: '声明 team 后「工具调用后」点位订阅同样成立（两个点位一起订）',
+      reason: '声明 team 后「工具调用后」点位同样成立（两个点位一起订）',
     );
-  }, timeout: const Timeout(Duration(seconds: 120)));
+  }, timeout: const Timeout(Duration(seconds: 120)), skip: missingEntry);
 
   test('没声明 team（scope: {}）：订阅落成通配（所有 team），事件照收', () async {
-    final String script = sampleScript();
-    if (!File(script).existsSync()) {
-      markTestSkipped('示例插件不在预期路径：$script');
-      return;
-    }
-
     final ({PluginBus bus, List<Map<String, dynamic>> frames}) started =
         await start('scope: {}');
     // 等插件就绪（有工具表内容即说明握过手了）
@@ -269,15 +268,9 @@ void main() {
       1,
       reason: 'scope: {} 的插件收全部事件——轮次计数一直在工作',
     );
-  }, timeout: const Timeout(Duration(seconds: 120)));
+  }, timeout: const Timeout(Duration(seconds: 120)), skip: missingEntry);
 
   test('没声明 team（scope: {}）：卡片与中转拦截开箱即用（无需手改配置）', () async {
-    final String script = sampleScript();
-    if (!File(script).existsSync()) {
-      markTestSkipped('示例插件不在预期路径：$script');
-      return;
-    }
-
     // 空 scope = 内置项在界面上开关后的默认形态：**应当开箱即用**。
     final ({PluginBus bus, List<Map<String, dynamic>> frames}) started =
         await start('scope: {}');
@@ -355,5 +348,5 @@ void main() {
       contains('sample'),
       reason: '空 scope 的通配订阅让中转拦截也开箱即用（不必等第一个事件）',
     );
-  }, timeout: const Timeout(Duration(seconds: 120)));
+  }, timeout: const Timeout(Duration(seconds: 120)), skip: missingEntry);
 }
