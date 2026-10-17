@@ -316,7 +316,7 @@ class _PluginEditorDialogState extends State<PluginEditorDialog> {
                   maxLines: 3,
                   decoration: const InputDecoration(
                     labelText: '参数（每行一个）',
-                    helperText: '例如：plugins/sample_plugin.py',
+                    helperText: '每行一个参数，例如：--threshold 200（示例插件不需参数）',
                     isDense: true,
                   ),
                 ),

@@ -19,6 +19,13 @@ const String kSelfUpdaterBinaryName = 'tree_self_updater';
 const String kCompactPluginId = 'compact';
 const String kCompactBinaryName = 'tree_compact';
 
+/// 示例插件的插件 id 与随包二进制基本名（2026-10-17：同一批换代，源码进插件仓）。
+///
+/// 为什么连它也要换成二进制：这份插件是**用户写插件时照着抄的那一个**，而它原先
+/// 要求用户先装 Python——一个只想看看"插件能干什么"的人不该为此多装一个运行时。
+const String kSamplePluginId = 'sample';
+const String kSampleBinaryName = 'tree_sample';
+
 /// 内置插件的**静态清单**（M9 §4.2：内置插件与自定义插件都要能在前端开/关）。
 ///
 /// 为什么清单在核心而不是前端：内置插件的"身份"必须由核心认定——前端只拿到
@@ -208,14 +215,24 @@ class BuiltinPluginCatalog {
   /// 新增内置插件 = 往这里加一条 + 随包分发 `plugins/<script>`；
   /// 面板会自动出现这一项（前端不写死任何内置插件）。
   static const List<BuiltinPluginSpec> specs = <BuiltinPluginSpec>[
+    // 2026-10-17：**随包二进制**（以前是 `examples/plugins/sample_plugin.py` + 解释器）。
+    // 它仍是**默认关闭**的那一个：这不是一块功能，而是一份演示，不该在用户没要求时
+    // 就在后台拉起一个进程；面板里看得见、能一键开就够了。
     BuiltinPluginSpec(
-      id: 'sample',
+      id: kSamplePluginId,
       name: '示例插件',
       description:
-          '核心自带的示例插件（Python）：演示 stdio JSON-RPC 握手、工具申报与站点订阅，'
-          '可以直接当自己写插件的骨架。打开后会调用 Python 运行 plugins/sample_plugin.py。',
-      script: 'sample_plugin.py',
-      runtime: 'python',
+          '核心自带的示例插件（随包二进制，不是脚本）：四站 + 插件布局的全链路参考—'
+          '收集站申报 echo/rounds/read_probe 三个工具，事件按 (agent, session) 数工具轮次、'
+          '超阈值（默认 200）经执行站发 agent.stop 并重置计数（“核心不设轮次上限，限制交给插件”的参考实现），'
+          'fs.read / llm.call / tool.call / session.rename 四条演示命令各一个开关，'
+          'ui/manifest 申报 activity + panel + card 三个槽位；新协议点位（llm.handle 流式接管、'
+          'prompt.system 改写、tool.pre/post 广播）默认全关，开关见 `tree_sample --help`。'
+          '可以直接当自己写插件的骨架（源码：插件仓 plugins/sample/）。'
+          '自检：`tree_sample --selftest`（不需要真核心，退出码 0 = 全绿）。',
+      script: kSampleBinaryName,
+      runtime: 'binary',
+      kind: BuiltinPluginSpec.kindBinary,
       granularity: 'team',
       scope: <String, dynamic>{},
     ),
@@ -325,7 +342,7 @@ class BuiltinPluginCatalog {
   ///
   /// 唯一的读者是发布仓库的校验（`PluginDownloader`）：`plugins/` 里放的是插件**源码与
   /// 随包成品**，而插件管理只从 release 拉成品 —— 一条索引只要把 `files[].target` 写成
-  /// `sample_plugin.py`，就能把核心自带的脚本盖掉。那在界面上表现为「示例插件突然起不
+  /// `tree_sample.exe`，就能把核心自带的成品盖掉。那在界面上表现为「示例插件突然起不
   /// 来」，而原因藏在一份远端 JSON 里，是归因最难的一类。
   static Set<String> protectedFileNames({bool? isWindows}) {
     final bool windows = isWindows ?? Platform.isWindows;
@@ -648,15 +665,20 @@ Future<List<String>> seedDefaultEnabledBuiltins({
 ///
 /// 迁移的是**命令**：用户的 `enabled` 与 `env` 原样保留（不该因为换运行时就被
 /// 重新打开，也不该丢掉他手加的环境变量）。
+///
+/// [specs] 是测试注入点：2026-10-17 这一批把 sample 也换成二进制后，真清单里**已经
+/// 没有 python 型的内置项**，不注入就没有一条用例能钉住“python 型绝不在启动期重写”
+/// 那条口径（它是给下一代内置项防用的，不是当前死代码）。
 Future<List<String>> migrateBuiltinEntries({
   required BuiltinPluginCatalog catalog,
   required PluginConfigStore store,
   void Function(String message)? log,
   bool? isWindows,
+  Iterable<BuiltinPluginSpec>? specs,
 }) async {
   final bool windows = isWindows ?? Platform.isWindows;
   final List<String> migrated = <String>[];
-  for (final BuiltinPluginSpec spec in BuiltinPluginCatalog.specs) {
+  for (final BuiltinPluginSpec spec in specs ?? BuiltinPluginCatalog.specs) {
     if (spec.kind != BuiltinPluginSpec.kindBinary) continue;
     final Map<String, dynamic>? stored = store.readEntry(spec.id);
     if (stored == null || stored['builtin'] != true) continue;

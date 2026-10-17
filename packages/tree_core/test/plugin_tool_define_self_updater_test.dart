@@ -193,15 +193,20 @@ void main() {
 
     // 反面对照：没声明的内置项**不该**多出一个无意义的键（用户看到的键只含真影响行为的）
     final Map<String, dynamic> sampleEntry = BuiltinPluginCatalog.entryFor(
-      BuiltinPluginCatalog.specOf('sample')!,
+      BuiltinPluginCatalog.specOf(kSamplePluginId)!,
       BuiltinResolution.ok(
-        command: 'python',
+        command: p.join('build', 'plugins', 'tree_sample.exe'),
         prefixArgs: const <String>[],
-        scriptPath: 'plugins/sample_plugin.py',
+        scriptPath: '',
         searchedScriptRoots: const <String>[],
       ),
     );
     expect(sampleEntry.containsKey('suspension'), isFalse);
+    expect(
+      sampleEntry['args'],
+      isEmpty,
+      reason: '示例插件也是 binary 型：同样不许塞一个脚本参数或空串',
+    );
   });
 
   // ── 2：播种语义 ────────────────────────────────────────────────────────

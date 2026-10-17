@@ -1000,7 +1000,7 @@ class _PluginPanelState extends State<PluginPanel> {
         '内置插件（${_builtins.length}）',
         trailing: IconButton(
           key: const Key('plugin-builtins-refresh'),
-          tooltip: '重新探测内置插件运行时（装了 Python 之后点这里）',
+          tooltip: '重新解析内置插件的随包产物（补上产物后点这里）',
           iconSize: 16,
           visualDensity: VisualDensity.compact,
           onPressed: () => _loadAdmin(refreshBuiltins: true),

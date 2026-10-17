@@ -1090,7 +1090,7 @@ class ApiService {
   ///
   /// 返回 {path, builtins: [...]}，每项含 id / 名称 / 说明 / 默认粒度与 scope /
   /// 启用态 / 落盘条目（config，未启用过为 null）/ 运行时解析结果（resolution）。
-  /// [refresh] = 强制核心重探运行时（用户刚装好 Python 时用）。
+  /// [refresh] = 强制核心重新解析（内置项都是随包产物：刚补上 / 重新编译过产物时用）。
   static Future<Map<String, dynamic>> getPluginBuiltins({
     bool refresh = false,
   }) async {
@@ -1103,8 +1103,8 @@ class ApiService {
   /// 打开 / 关闭一个内置插件（**每项各自一个开关**，没有批量开关）
   ///
   /// - 打开：POST /api/plugin/builtins/{id}/enable —— 核心解析运行时与脚本，
-  ///   写成一条普通插件配置（带 builtin 标记）再热启动；运行时 / 脚本缺失时
-  ///   核心回**可读 400**（如「未检测到 Python，请先安装或改用自定义命令」）；
+  ///   写成一条普通插件配置（带 builtin 标记）再热启动；运行时 / 产物缺失时
+  ///   核心回**可读 400**（如「找不到内置插件可执行文件 tree_sample.exe」）；
   /// - 关闭：POST /api/plugin/builtins/{id}/disable —— 条目置 enabled:false 并保留
   ///   （面板显示「已停用」而不是让它消失）。
   static Future<Map<String, dynamic>> setBuiltinPluginEnabled(

@@ -137,8 +137,8 @@ void main() {
     configFile = p.join(temp.path, 'config', 'plugins.yaml');
     pluginDir = p.join(temp.path, 'plugins');
     Directory(pluginDir).createSync(recursive: true);
-    // 内置插件的脚本：内容无关紧要（用例只解析路径，不真跑 python）
-    File(p.join(pluginDir, 'sample_plugin.py')).writeAsStringSync('# 示例\n');
+    // 内置插件的随包产物：内容无关紧要（用例只解析路径，不真跑那个假 exe）
+    File(p.join(pluginDir, 'tree_sample.exe')).writeAsStringSync('placeholder');
   });
 
   tearDown(() async {
@@ -152,14 +152,21 @@ void main() {
     }
   });
 
-  /// 假的内置插件目录：脚本目录指向临时 plugins/，探测器把 python 判为可用。
-  BuiltinPluginCatalog catalog({bool python = true, String? roots}) =>
-      BuiltinPluginCatalog(
-        scriptRoots: <String>[roots ?? pluginDir],
-        probe: (String command, List<String> args) async =>
-            python && command == 'python',
-        isWindows: true,
-      );
+  /// 假的内置插件目录：产物目录指向临时 plugins/（里面那条 tree_sample.exe 是夹具写的）。
+  ///
+  /// [probe] 装一个会记录调用的探测器：用来证明 **binary 型根本不该跑探测**。
+  BuiltinPluginCatalog catalog({
+    bool python = true,
+    String? roots,
+    void Function(String command)? probe,
+  }) => BuiltinPluginCatalog(
+    scriptRoots: <String>[roots ?? pluginDir],
+    probe: (String command, List<String> args) async {
+      probe?.call(command);
+      return python && command == 'python';
+    },
+    isWindows: true,
+  );
 
   /// 假插件的启动命令行（真跑 dart test/fixtures/fake_plugin.dart）。
   List<String> fakePluginYaml(String id) => <String>[
@@ -581,7 +588,7 @@ void main() {
     expect(
       (sample['resolution'] as Map<String, dynamic>)['ok'],
       isTrue,
-      reason: '注入的探测器把 python 判为可用',
+      reason: '夹具的 plugins/ 里就放着那条 tree_sample.exe（binary 型只看产物在不在）',
     );
 
     final _Res on = await ctx.client.send(
@@ -589,17 +596,18 @@ void main() {
       '/api/plugin/builtins/sample/enable',
     );
     expect(on.status, 200, reason: on.detail);
-    // 这个内置条目的命令是 python + 一行注释的示例脚本：握手必然失败。用例在这里
-    // 锁的是"回报自洽"——真起来了就必须 hot_applied=true，没起来就必须带
+    // 这个内置条目的命令是夹具里那个**占位文件**（名字对、内容不是真 exe）：握手必然失败。
+    // 用例在这里锁的是"回报自洽"——真起来了就必须 hot_applied=true，没起来就必须带
     // 「重启核心后生效」+ 可读原因，不许含糊。
     final bool hot = on.json['hot_applied'] as bool;
-    expect(hot, isFalse, reason: '示例脚本不是真插件，起不来');
+    expect(hot, isFalse, reason: '占位文件不是真产物，起不来');
     expect(on.json['notice'], hot ? '' : '配置已保存，但本次热应用失败，重启核心后生效');
     expect(on.json['hot_apply_detail'], isNotEmpty);
     final Map<String, dynamic> entry = diskEntry('sample');
     expect(entry['builtin'], isTrue, reason: 'UI 靠它把这一条分到「内置」组');
-    expect(entry['command'], 'python');
-    expect(entry['args'], <String>[p.join(pluginDir, 'sample_plugin.py')]);
+    // 换代后的命令就是那个二进制本身：**不再有解释器**，也**不该多一个空参**。
+    expect(entry['command'], p.join(pluginDir, 'tree_sample.exe'));
+    expect(entry['args'], isEmpty);
     expect(entry['enabled'], isTrue);
 
     final _Res afterEnable = await ctx.client.send(
@@ -663,38 +671,43 @@ void main() {
     expect(diskPlugins(), hasLength(1), reason: '条目仍然在');
   });
 
-  test('内置插件：运行时缺失 / 脚本缺失都给可读 400（不静默、不落盘）', () async {
-    final ({CoreServer server, _Client client, PluginBus bus}) noPython =
+  test('内置插件：产物缺失给可读 400；binary 型根本不跑解释器探测', () async {
+    // ① binary 型不探测运行时：开机多起两个进程去问 python 在不在，对一条
+    //    `tree_sample.exe` 没有任何意义（而“探测”这件事以前是每个内置项都要跑一遍的）。
+    final List<String> probed = <String>[];
+    final ({CoreServer server, _Client client, PluginBus bus}) withBinary =
         await serve(
           'enabled: true\nplugins: []\n',
-          builtins: catalog(python: false),
+          builtins: catalog(probe: probed.add),
         );
     addTearDown(() async {
-      noPython.client.close();
-      await noPython.server.close();
+      withBinary.client.close();
+      await withBinary.server.close();
     });
-    final _Res runtime = await noPython.client.send(
+    final _Res ok = await withBinary.client.send(
       'POST',
       '/api/plugin/builtins/sample/enable',
     );
-    expect(runtime.status, 400);
-    expect(runtime.detail, contains('未检测到 Python'));
+    expect(ok.status, 200, reason: ok.detail);
+    expect(probed, isEmpty, reason: 'binary 型不得碰解释器探测器：一次都不行');
 
-    final ({CoreServer server, _Client client, PluginBus bus}) noScript =
+    // ② 产物不在 ⇒ 400 + 可读原因 + 不落盘（静默失败在界面上就是“点了开关没反应”）。
+    final ({CoreServer server, _Client client, PluginBus bus}) noBinary =
         await serve(
           'enabled: true\nplugins: []\n',
           builtins: catalog(roots: p.join(temp.path, 'empty')),
         );
     addTearDown(() async {
-      noScript.client.close();
-      await noScript.server.close();
+      noBinary.client.close();
+      await noBinary.server.close();
     });
-    final _Res script = await noScript.client.send(
+    final _Res script = await noBinary.client.send(
       'POST',
       '/api/plugin/builtins/sample/enable',
     );
     expect(script.status, 400);
-    expect(script.detail, contains('找不到内置插件脚本'));
+    expect(script.detail, contains('找不到内置插件可执行文件'));
+    expect(script.detail, contains('tree_sample.exe'));
     expect(diskPlugins(), isEmpty, reason: '解析失败不落盘');
   });
 
@@ -967,14 +980,20 @@ void main() {
     expect(diskPlugins(), isEmpty);
   });
 
-  test('索引想把 plugins/ 里的内置脚本盖掉 ⇒ 列表当场跳过，install 拿不到这一条', () async {
+  test('索引想把 plugins/ 里的内置成品盖掉 ⇒ 列表当场跳过，install 拿不到这一条', () async {
     // 与上一条不同的防线：上一条管“id 撞内置”，这一条管“**文件名**撞内置”。
     // plugins/ 里放的是插件源码与随包成品，两者靠文件名区分 ⇒ 发布仓库只能装自己的成品。
     final _Repo repo = _Repo();
-    repo.assets['sample_plugin.py'] = File(script).readAsBytesSync();
+    // 受保护名按**本机口径**算（下载器读的就是这一份集合）：写死一个平台名
+    // 就会在另一个平台上假绿。
+    final String target = BuiltinPluginCatalog.binaryFileName(
+      BuiltinPluginCatalog.specOf(kSamplePluginId)!,
+      isWindows: Platform.isWindows,
+    );
+    repo.assets[target] = File(script).readAsBytesSync();
     repo.publish(
       plugins: <Map<String, dynamic>>[
-        releaseEntry(id: 'overwrite', target: 'sample_plugin.py'),
+        releaseEntry(id: 'overwrite', target: target),
       ],
     );
     final ({CoreServer server, _Client client, PluginBus bus}) ctx =
@@ -1004,9 +1023,9 @@ void main() {
     );
     expect(install.status, 400);
     expect(
-      File(p.join(pluginDir, 'sample_plugin.py')).readAsStringSync(),
-      '# 示例\n',
-      reason: '随包脚本一字未动（被跳过的条目连一个字节都不许写进 plugins/）',
+      File(p.join(pluginDir, target)).readAsStringSync(),
+      'placeholder',
+      reason: '随包成品一字未动（被跳过的条目连一个字节都不许写进 plugins/）',
     );
     expect(diskPlugins(), isEmpty);
   });

@@ -2,8 +2,8 @@
 ///
 /// **为什么有这一层**（plan §2 Q8）：核心侧的工具轮次静态上限已经删除——"跑到多少轮"
 /// 不再由核心写死，限制能力交给插件：插件订阅 `agent.tool_call` 事件自己数轮次，
-/// 超限就用**执行站的 `agent.stop`** 发停止信号（示例见
-/// `examples/plugins/sample_plugin.py`）。
+/// 超限就用**执行站的 `agent.stop`** 发停止信号（参考实现：插件仓
+/// `plugins/sample/sample_plugin.dart`，也就是内置示例插件 sample 的那份随包二进制）。
 ///
 /// **本文件不做传输**：只负责"把事件构造出来，交给唯一订阅入口"。派发口径复用
 /// [PluginBus.dispatchAgentEvent] 的**既有 scope 匹配**（`config.scope` 为空即通配，

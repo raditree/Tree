@@ -384,20 +384,25 @@ void main() {
       expect(listing.skipped.single, contains('scope 必须是 JSON 对象'));
     });
 
-    test('目标名撞上随包的内置插件文件 ⇒ 跳过，install 也拿不到它', () async {
+    test('目标名撞上随包的内置插件成品 ⇒ 跳过，install 也拿不到它', () async {
       // 「plugins/ 里是插件代码」的另一面：发布仓库只能装自己的成品。
-      // 一条把 target 写成 sample_plugin.py 的索引，本来能把核心自带的脚本盖掉，
+      // 一条把 target 写成 `tree_sample[.exe]` 的索引，本来能把核心自带的成品盖掉，
       // 而现象是“示例插件突然起不来”——归因要翻到一份远端 JSON 里去了。
-      putAsset('sample_plugin.py');
+      // 名字按本机口径算（Windows 上补 .exe）：写死一个平台名就会在另一个平台上假绿。
+      final String builtinName = BuiltinPluginCatalog.binaryFileName(
+        BuiltinPluginCatalog.specOf(kSamplePluginId)!,
+        isWindows: Platform.isWindows,
+      );
+      putAsset(builtinName);
       repo.publish(
         plugins: <Map<String, dynamic>>[
           _entry(
             id: 'overwrite_builtin',
-            command: 'sample_plugin.py',
+            command: builtinName,
             files: <Map<String, dynamic>>[
               <String, dynamic>{
-                'asset': 'sample_plugin.py',
-                'target': 'sample_plugin.py',
+                'asset': builtinName,
+                'target': builtinName,
                 'bytes': 8,
               },
             ],
@@ -420,7 +425,7 @@ void main() {
       expect(result.ok, isFalse);
       expect(result.error, contains('skipped'));
       expect(
-        File(p.join(installDir, 'sample_plugin.py')).existsSync(),
+        File(p.join(installDir, builtinName)).existsSync(),
         isFalse,
         reason: '被跳过的条目一个字节都不许落进 plugins/',
       );
