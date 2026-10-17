@@ -1,7 +1,10 @@
 # 示例插件（examples/plugins）
 
-本目录是**插件生态的参考实现**：纯标准库的 Python 插件 + 可直接粘贴的 `plugins.yaml`
-片段。**系统性的口径（协议、四类站与 17 个点位、隔离语义、UI 槽位、`plugins.yaml`
+本目录是**插件生态的参考实现**（Python 部分）：纯标准库的 Python 插件 + 可直接粘贴的 `plugins.yaml`
+片段。**已迁往 Dart 的那些住在插件仓 [`plugins/`](../../plugins/README.md)**（一个目录一个插件，
+`dart compile exe` 编成 exe，不再要求用户机器装 Python）。
+
+**系统性的口径（协议、四类站与 35 个点位、隔离语义、UI 槽位、`plugins.yaml`
 全字段、调试手段）在 [`docs/plugin-development.md`](../../docs/plugin-development.md)**
 ——那份指南是唯一权威，本文件只负责"从哪个示例下手"，不重复它的内容。
 
@@ -9,7 +12,8 @@
 
 ```powershell
 # ① 最小示例：hello / ping / tools/list / 一个工具（不连真核心，30 秒看完）
-python examples/plugins/minimal_plugin.py --selftest
+#    已在插件仓（Dart）：零依赖单文件，骨架在 plugins/_kit/plugin_kit.dart
+dart run plugins/minimal/minimal_plugin.dart --selftest
 
 # ② 完整示例：四站 + 插件布局 + 点位化新能力（同样不连真核心）
 python examples/plugins/sample_plugin.py --selftest
@@ -25,7 +29,7 @@ python examples/plugins/compact_plugin.py --selftest
 
 | 文件 / 开关 | 演示什么 | 该看哪份文档 |
 |---|---|---|
-| `minimal_plugin.py`（无开关） | **最小插件骨架**：`hello` / `ping`（心跳）/ `tools/list` / `tools/call`，含并发读循环与 stderr 日志 | §1 一分钟上手、§2 RPC 清单、§6.3 工具申报 |
+| [`plugins/minimal/minimal_plugin.dart`](../../plugins/minimal/minimal_plugin.dart)（无开关） | **最小插件骨架（Dart）**：`hello` / `ping`（心跳）/ `tools/list` / `tools/call`——读循环、异常收敛、`suspend` 转储都在骨架里，插件侧只剩一张工具表 | §1 一分钟上手、§2 RPC 清单、§6.3 工具申报 |
 | `sample_plugin.py`（默认） | **四站全链路**：收集站申报 + 广播/事件订阅 + 执行站 `fs.read` + 中转站工具前/后改写；`ui/manifest` 声明 activity / panel / **card** 槽位并推卡片 | §3 站点体系、§5 中转站、§6 执行站、§7 UI、§8 收集站 |
 | `--relay-llm <关键词>` | 中转站 `system.relay.llm.handle`：最后一条 user 消息含关键词时**流式接管**（`thinking` + 分片正文 + `done`），并处理下行 `station/cancel` | §5.4 接管 LLM |
 | `--relay-llm-tool-call` | 流式接管里多推一段 `tool_call` 增量（会**真的**触发一次工具调用，所以单独开关） | §5.4 |
@@ -87,20 +91,22 @@ python examples/plugins/compact_plugin.py --selftest
 ## 配进核心（`plugins.yaml` 片段）
 
 配置文件在 **`<数据根>/config/plugins.yaml`**（默认数据根见核心启动日志的「数据目录」）。
-`command` 填**解释器**，脚本放 `args[0]`：
+Python 型：`command` 填**解释器**，脚本放 `args[0]`；
+Dart 型（插件仓那批）：`command` 直接填**成品 exe**，`args` 通常为空的列表 `[]`。
 
 ```yaml
 enabled: true
 plugins:
   - id: minimal                     # 工具在模型眼里叫 plugin__minimal__hello_tool
-    name: 最小示例插件
-    command: "D:/app/python/python.exe"          # 用 `where.exe python` 找绝对路径
-    args: ["E:/programs/Tree/desktop/examples/plugins/minimal_plugin.py"]
+    name: 最小示例插件（Dart）
+    # 先 `dart run tool/build_plugins.dart --only minimal` 产出到 build/plugins/
+    command: "E:/programs/Tree/desktop/build/plugins/tree_minimal.exe"
+    args: []
     enabled: true
     scope: {}                       # **空 = 作用于所有 team**（不是"缺少 team"）
 
   - id: sample
-    command: "D:/app/python/python.exe"
+    command: "D:/app/python/python.exe"          # 仍待迁 Dart 的 Python 型
     args:                            # YAML 列表：一项一个 argv，别写成一行
       - "E:/programs/Tree/desktop/examples/plugins/sample_plugin.py"
       - "--threshold"

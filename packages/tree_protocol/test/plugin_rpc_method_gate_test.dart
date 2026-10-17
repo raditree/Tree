@@ -26,11 +26,16 @@ void main() {
   /// `tree_self_updater` 也在内：它和 `tree_ssh_plugin` 一样自带一张方法名常量表
   /// （插件包要零核心依赖，不能引本包），所以**新插件不会自动进门禁**这件事
   /// 必须靠扫描面清单兜住 —— 漏一个目录就等于给那个目录开了一个无门区。
+  ///
+  /// `plugins` = 插件仓（raditree/tree-plugins，装在桌面仓的 plugins/ 下）：
+  /// 那才是**插件作者真的会抄的那一份**（五个示例 + 公共骨架 `_kit`），它漂了
+  /// 就是“指南写的协议名与代码里的协议名各自漂”，所以这一面必须在门里。
   final List<String> scanFaces = <String>[
     'packages/tree_core/lib/src/plugin',
     'packages/tree_ssh_plugin/lib',
     'packages/tree_self_updater/lib',
     'packages/tree_self_updater/bin',
+    'plugins',
     'examples/plugins',
   ];
 
@@ -57,6 +62,9 @@ void main() {
       for (final FileSystemEntity entity in dir.listSync(recursive: true)) {
         if (entity is! File) continue;
         final String path = entity.path;
+        // 独立插件仓带着自己的 `.git`（对象库里有同名的历史文件），不该进门禁。
+        final String normalized = path.replaceAll('\\', '/');
+        if (normalized.contains('/.git/')) continue;
         if (!path.endsWith('.dart') && !path.endsWith('.py')) continue;
         scannedFiles++;
         final String src = entity.readAsStringSync();

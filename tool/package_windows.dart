@@ -173,6 +173,13 @@ Future<void> _package(List<String> args) async {
   stdout.writeln(
     _copySelfUpdaterArtifacts(root, releaseDir, _versionOf(pubspec['version'])),
   );
+  // ②f 插件仓（plugins/）的成品：读 `build/plugins/plugin-index.json` 把每条 `files[].target` 拷进发行目录。
+  //
+  // 为什么读索引而不是自己扫目录：那份索引是**装机端唯一读的合同**（`PluginDownloader`），
+  // 打包链按同一份合同拷，才能做到“发布仓库有的，安装包也有”；在这里自己扫一遍
+  // 就是第二份真相，两边一定会漂（而漂了的表现是“面板上能装、随包却没带”）。
+  // 索引由 `dart run tool/build_plugins.dart` 产出；缺了它不算打包失败，但要打一行。
+  stdout.writeln(_copyRepoPluginArtifacts(root, releaseDir));
 
   // ③ 便携包说明（首次运行指引：数据在哪、怎么手改配置、出问题看哪）
   final File guide = File(_join(releaseDir.path, '使用说明.txt'));
@@ -501,6 +508,57 @@ String _copySelfUpdaterArtifacts(
         '—— 缺了它装机后没有 plugin_hot_restart 这个 agent tool';
   }
   return '   自迭代插件：${copied.join('、')}';
+}
+
+/// 把插件仓（`plugins/`）已编译好的成品拷到发行目录的 `plugins/`。
+///
+/// 只认 `build/plugins/plugin-index.json` 里列出的 `files[].target`（那些名字已经按
+/// 平台去过 `.exe`，见 `tool/build_plugins.dart`）。
+///
+/// **缺产物不算打包失败，但必须打一行**：这些是“随包示例/功能插件”，少一个就是
+/// 装机后开关拉不上去；而只写“拷贝完成”的日志会把这件事变成查不到的坑（与
+/// 自迭代插件、SSH 执行器同一口径）。
+String _copyRepoPluginArtifacts(Directory root, Directory releaseDir) {
+  final Directory built = Directory(_join(_join(root.path, 'build'), 'plugins'));
+  final File index = File(_join(built.path, 'plugin-index.json'));
+  if (!index.existsSync()) {
+    return '   插件仓成品：跳过（没有 build/plugins/plugin-index.json；'
+        '先跑 dart run tool/build_plugins.dart）';
+  }
+  final Object? decoded;
+  try {
+    decoded = json.decode(index.readAsStringSync());
+  } catch (error) {
+    return '   插件仓成品：索引读不了（$error）—— 重跑 build_plugins';
+  }
+  if (decoded is! Map || decoded['plugins'] is! List) {
+    return '   插件仓成品：索引形状不对（缺 plugins 数组）';
+  }
+  final Directory target = Directory(_join(releaseDir.path, 'plugins'))
+    ..createSync(recursive: true);
+  final List<String> copied = <String>[];
+  final List<String> missing = <String>[];
+  for (final Object? raw in decoded['plugins'] as List<Object?>) {
+    if (raw is! Map || raw['files'] is! List) continue;
+    for (final Object? file in raw['files'] as List<Object?>) {
+      if (file is! Map) continue;
+      final String name = '${file['target'] ?? ''}'.trim();
+      if (name.isEmpty || name.contains('/') || name.contains(r'\')) continue;
+      final File source = File(_join(built.path, name));
+      if (!source.existsSync()) {
+        missing.add(name);
+        continue;
+      }
+      source.copySync(_join(target.path, name));
+      copied.add('plugins/$name');
+    }
+  }
+  if (copied.isEmpty) {
+    return '   插件仓成品：跳过（索引里没有可拷的产物'
+        '${missing.isEmpty ? '' : '；缺：${missing.join('、')}'}）';
+  }
+  return '   插件仓成品：${copied.join('、')}'
+      '${missing.isEmpty ? '' : '（缺 ${missing.join('、')} ⇒ 重跑 build_plugins）'}';
 }
 
 /// 启动核心读握手（打包产物自检）。

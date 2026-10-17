@@ -19,6 +19,30 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **插件源码的家在插件仓；那份合同现在有三个读者**（**新增**
+  [packages/tree_protocol/test/plugin_repo_contract_test.dart](packages/tree_protocol/test/plugin_repo_contract_test.dart)、
+  [plugins/_kit/plugin_kit.dart](plugins/_kit/plugin_kit.dart)、
+  [tool/build_plugins.dart](tool/build_plugins.dart)；阶段 9：示例插件从 Python 脚本迁为 Dart 成品）：
+  - **字段纪律不再只住在两端**：`plugin.json` 的校验以前只有发布方与装机端（`PluginDownloader`）
+    两个读者；现在多了**源码自己**这一道（id = 目录名、三段版本、`command` ∈ `files`、
+    `files` 必须纯文件名、值域只许列出的那几个、id 与 command 都不得重复）。两边各说各话的
+    现场表现是"面板列不出来"或"装上去起不来"，两边都难归因。
+  - **骨架那张方法名表必须逐个已登记**：插件要零核心依赖（不能 `import package:tree_protocol`），
+    所以 `plugins/_kit/plugin_kit.dart` 自带一张方法名常量表——代价由用例兜住：表里每个值都
+    必须在 `PluginRpcMethods.all` 里（转储/取回那两条是**执行站命令名**、不是 method，按 D10 分开设域）。
+  - **`runtime: binary` 必须有 `<id>_plugin.dart` 入口**：构建脚本按约定找它；找不到以前会
+    以"跳过"的形式静默过去，现在源码侧用例直接红。
+  - **`_kit` / `release` 不是插件**：没 `plugin.json` ⇒ 合同里就该被跳过；被当成插件就会被
+    装机端列进清单（那个条目永远起不来）。
+  - 一个插件一个文件、**管道只一份**：`hello` / `ping` / `tools/list` / 异常收敛 / `suspend` 转储
+    全在骨架里（旧示例是五个各抄一份读循环，那五条副本在不同示例里以不同方式漂）。
+  - **产物必须自检过**：`tool/build_plugins.dart` 编译完立即跑 `<exe> --selftest`，非 0 就整个
+    构建失败——"能编译"不等于"协议对"，而协议错在用户机器上的表现是"插件起不来"。
+    打包链（②f）只读 `build/plugins/plugin-index.json` 拷成品，不自己扫目录（第二份真相一定漂）。
+  - 首批迁移：**`minimal` 已入插件仓（Dart）并从 `examples/plugins/` 删除**；其余四个仍按
+    Python 随包，逐个跟进（本阶段不一次动完，是为了每个切片都能单独回滚）。
+  - 计数：tree_protocol 门禁 44 → **48**（新增 4 条源码侧合同用例；扫描面 += `plugins`）；
+    插件自检 9 条（假核心，跑的是与真进程同一个 `run()`）。
 - **整轮接管只能夺「编排」，不能夺「写」**（**新增**
   [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 31、
   [docs/plugin-development.md](docs/plugin-development.md) §5.6、

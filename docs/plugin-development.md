@@ -1019,8 +1019,10 @@ plugins:
 
 ## 12. 完整示例
 
-- [`examples/plugins/minimal_plugin.py`](../examples/plugins/minimal_plugin.py)：**最小骨架**
-  （hello / ping / tools/list / 一个工具 + 并发读循环），`--selftest` 用假核心自检。
+- [`plugins/minimal/minimal_plugin.dart`](../plugins/minimal/minimal_plugin.dart)：**最小骨架（Dart，已迁插件仓）**
+  （hello / ping / tools/list / 一个工具；读循环、并发、异常收敛都在 `plugins/_kit/plugin_kit.dart`），
+  `dart run plugins/minimal/minimal_plugin.dart --selftest` 用假核心自检。
+  编译成成品：`dart run tool/build_plugins.dart --only minimal`。
 - [`examples/plugins/sample_plugin.py`](../examples/plugins/sample_plugin.py)：全功能参考实现
   ——工具申报、活动栏面板、消息流卡片、工具前/后中转改写、**LLM 流式接管**（`--relay-llm`）、
   `prompt.system` 改写（`--relay-prompt`）、`llm.call` / `tool.call` / `session.rename`
