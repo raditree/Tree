@@ -340,23 +340,12 @@ class BuiltinPluginCatalog {
     return null;
   }
 
-  /// 随包分发的**内置插件文件名**（脚本名与二进制的两种拼写都收进来）。
-  ///
-  /// 唯一的读者是发布仓库的校验（`PluginDownloader`）：`plugins/` 里放的是插件**源码与
-  /// 随包成品**，而插件管理只从 release 拉成品 —— 一条索引只要把 `files[].target` 写成
-  /// `tree_sample.exe`，就能把核心自带的成品盖掉。那在界面上表现为「示例插件突然起不
-  /// 来」，而原因藏在一份远端 JSON 里，是归因最难的一类。
-  static Set<String> protectedFileNames({bool? isWindows}) {
-    final bool windows = isWindows ?? Platform.isWindows;
-    final Set<String> names = <String>{};
-    for (final BuiltinPluginSpec spec in specs) {
-      names.add(spec.script);
-      if (spec.kind == BuiltinPluginSpec.kindBinary) {
-        names.add(binaryFileName(spec, isWindows: windows));
-      }
-    }
-    return names;
-  }
+  /// 以前这里还有一条 `static Set<String> protectedFileNames()`：**从静态清单推导**
+  /// “哪些名字是核心随包、不许发布仓库盖”。2026-10-18 插件成品不再随包之后，那个推导
+  /// 正好把自己锁死：装机端会把“本机根本没有的文件”当受保护名 ⇒ 这些内置 id 永远装不上，
+  /// 而它们在面板上又开不了 ⇒ 条目彻底坏死。判据现在只有一个读者：
+  /// `PluginDownloader.protectedFileNames()`（看两个事实：文件在不在放置目录 +
+  /// 它是不是上一次从 release 装的），名字本身仍由 `binaryFileName(spec, isWindows:)` 算。
 
   /// 解析某项的运行时与脚本（结果缓存；[refresh] = 强制重探）。
   Future<BuiltinResolution> resolve(

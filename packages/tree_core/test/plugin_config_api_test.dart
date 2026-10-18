@@ -750,9 +750,14 @@ void main() {
   };
 
   /// 指向临时目录的下载器（安装目标 = 临时 plugins/，与内置项查找路径同源）。
+  ///
+  /// `isWindows: true` 与本文件的 catalog 夹具（`builtins()`）以及 setUp 写下的
+  /// `tree_sample.exe` **同一个口径**：不注入的话，在非 Windows 主机上保护面会算成
+  /// 不带 `.exe` 的名字而查不到文件 ⇒ “受保护名”相关的儿条用例全变成假绿。
   PluginDownloader releaseDownloader(_Repo repo) => PluginDownloader(
     cacheDir: p.join(temp.path, 'plugins_release'),
     installDir: pluginDir,
+    isWindows: true,
     fetcher: repo.fetch,
     nonce: () => 'api',
     // 脚本型的解释器：用真 dart 可执行文件扮 python（资产内容是那个假插件源码）
@@ -953,7 +958,9 @@ void main() {
     );
   });
 
-  test('install 不给盖内置 id（就算还没落盘）：400 + 原因，文件与条目都不动', () async {
+  test('本机带着内置成品时，内置 id 不给覆盖：400 + 原因，文件与条目都不动', () async {
+    // 判据是“本机有没有那一件”，不是“清单里有没有这一条”（2026-10-18 改）——
+    // 而 setUp 正好写了 `tree_sample.exe`，这一条就是在钉那个“在”的场景。
     final _Repo repo = _Repo();
     repo.assets['fake_plugin.dart'] = File(script).readAsBytesSync();
     repo.publish(plugins: <Map<String, dynamic>>[releaseEntry(id: 'sample')]);
@@ -971,13 +978,67 @@ void main() {
       '/api/plugin/release/sample/install',
     );
     expect(res.status, 400);
-    expect(res.detail, contains('已由核心内置提供'));
+    expect(res.detail, contains('本机已带着核心内置的那一份成品'));
     expect(
       File(p.join(pluginDir, 'fake_plugin.dart')).existsSync(),
       isFalse,
       reason: '拒绝发生在任何磁盘动作之前',
     );
     expect(diskPlugins(), isEmpty);
+  });
+
+  test('内置 id 但本机没带它的成品 ⇒ 从 release 装得进来，而装完不会被自己锁死', () async {
+    // 这一条是“插件成品不再随包”能不能真的跑通的钥匙。旧判据（清单里有这条就拒）
+    // 在新装机上会把这几条内置项变成“既开不了（没有 exe）又装不上（被内置身份挡住）”
+    // 的坏死条目 —— 而面板上只看得见一个弹不开的开关。
+    // 另外钉一件事：**装进来之后还能再装**（随包成品与 release 成品住在同一个目录，
+    // 只看“文件在不在”会把上一次刚装好的那条也变成受保护 ⇒ 从此自己锁死自己）。
+    File(p.join(pluginDir, 'tree_sample.exe')).deleteSync(); // 模拟“不随包”的新装机
+    final _Repo repo = _Repo();
+    repo.assets['fake_plugin.dart'] = File(script).readAsBytesSync();
+    repo.publish(plugins: <Map<String, dynamic>>[releaseEntry(id: 'sample')]);
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve(
+          'enabled: true\nplugins: []\n',
+          downloader: releaseDownloader(repo),
+        );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+
+    final _Res first = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/sample/install',
+    );
+    expect(first.status, 200, reason: first.detail);
+    expect(
+      File(p.join(pluginDir, 'fake_plugin.dart')).existsSync(),
+      isTrue,
+      reason: '成品真的落到了与核心同级的 plugins/（那就是内置项的查找路径）',
+    );
+    expect(
+      diskPlugins().single['source'],
+      'release',
+      reason: '来源标了 release ⇒ 下一次它不算“核心自带的那一份”',
+    );
+
+    // 再装一次：文件已在（上一次装的），但来源是 release ⇒ 仍必须装得进来。
+    // 中间必须**刷新索引**：下载器读的是缓存那一份，不刷新就装回 1.2.0，
+    // 看上去“能重装”其实测的是“缓存里那一版”。
+    repo.publish(
+      plugins: <Map<String, dynamic>>[releaseEntry(id: 'sample', version: '1.3.0')],
+    );
+    expect(
+      (await ctx.client.send('POST', '/api/plugin/release/refresh')).status,
+      200,
+    );
+    final _Res second = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/sample/install',
+    );
+    expect(second.status, 200, reason: second.detail);
+    expect(diskPlugins().single['repo_version'], '1.3.0');
   });
 
   test('索引想把 plugins/ 里的内置成品盖掉 ⇒ 列表当场跳过，install 拿不到这一条', () async {

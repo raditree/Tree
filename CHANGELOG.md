@@ -19,6 +19,29 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **“内置项不给装”的判据从「清单」改成「本机事实”**（**修改**
+  [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md)
+  不变量“内置 id 只在本机带着它那一份成品时不给覆盖”与“随包的文件名也不给盖”；
+  [docs/plugin-development.md](docs/plugin-development.md) §发布仓库）：插件成品从不在安装包
+  里之后，“清单项 = 随包成品”不再成立。旧判据直接把内置 id 锁死：新装机上那些条目
+  **既开不了（没有 exe）又装不上（被内置身份挡住）**，而面板上只看得见一个弹不开的开关。
+  - `BuiltinPluginCatalog.protectedFileNames()`（从 `specs` 推导）**删除**；判据移到
+    `PluginDownloader.protectedFileNames()`，只看两个本机事实：文件在 `plugins/` 里存在
+    **且** 该 id 的条目没标 `source: release`。后一半不能省：随包成品与装进来的成品住在
+    **同一个目录**，只看“在不在”会把上一次刚装好的那条也变成受保护 ⇒ 从此它自己再也
+    更新不了（把保护做成死锁）。`core_server` 的“撞内置 id”改用 `shipsOwnArtifact(id)`，
+    两道防线共用同一份事实与同一个平台口径（不在路由层再拼一次 `.exe`——那是第二个
+    “两边对不上谁也不报错”的假绿面）。
+  - **`source` 多了一个行为读者**：两边文档原先都写“行为一律不读来源标记”，现在改成
+    “基本只是展示，**只有受保护名这一处例外**”。手工抹掉它不改坏运行，只会让那条重新
+    变成“核心自带的那一份”，代价是再装一次。
+  - 从 release 装一个内置 id 时，**`builtin: true` 跟着条目走**（路由层回写）。丢了它面板
+    就把内置项当自定义项，而 `migrateBuiltinEntries` 从此不再管这条 ⇒ 下一次内置换代没人
+    替这位用户改命令（“配置看上去正常但起不来”那一类最难查的坑）。
+  - **首启动播种不需要改**：`seedDefaultEnabledBuiltins` 本来就先 `resolve(spec)`、产物解
+    不开就跳过并留一行——所以 `defaultEnabled: true` 保持原样（用户 2026-10-10 的拍板未被
+    覆盖），新装机也不会播出一条“开着却没有文件”的条目。
+
 - **插件源码的家在插件仓；那份合同现在有三个读者**（**新增**
   [packages/tree_protocol/test/plugin_repo_contract_test.dart](packages/tree_protocol/test/plugin_repo_contract_test.dart)、
   [plugins/_kit/plugin_kit.dart](plugins/_kit/plugin_kit.dart)、

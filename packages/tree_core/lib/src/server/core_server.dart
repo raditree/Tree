@@ -4294,18 +4294,23 @@ class CoreServer {
     final String id = (params['pluginId'] ?? '').trim();
     final PluginConfigStore store = _pluginStore(bus);
     final Map<String, dynamic>? existing = store.readEntry(id);
-    // 判据**不看条目在不在**：内置 id 就算还没落盘也已经是内置身份（面板上有它
-    // 自己的开关），先被发布仓库写一条、再被人按内置开关 = 两个主人抢同一条目。
-    final bool builtinClash =
-        BuiltinPluginCatalog.specOf(id) != null ||
-        (existing != null && existing['builtin'] == true);
+    // 判据（**2026-10-18 改**）：内置 id 只有在“本机确实带着它那一份成品、而且那一份
+    // 不是上一次从 release 装的”时候才归内置开关管 —— 那时发布仓库再装 = 两个主人抢
+    // 同一条目（开关一按就把 command 写回随包那一份）。
+    //
+    // 旧判据是“清单里有这一条就拒”（不看条目在不在、也不看文件在不在）。插件成品不再
+    // 随包之后它正好会锁死自己：这些条目既开不了（没有 exe）又装不上（被内置身份挡住），
+    // 而“从仓库更新”是它们唯一的启用路径。现在两道防线共用同一份事实
+    //（[PluginDownloader.protectedFileNames]），不留第二套判断。
+    final bool builtinClash = downloader.shipsOwnArtifact(id);
     if (builtinClash) {
       await writeJson(
         request,
         400,
         errorBody(
-          '插件 $id 已由核心内置提供（内置项只走内置开关）：发布仓库不提供覆盖安装，'
-          '否则两个开关会抢同一条目。请先用自定义 id 发布，或继续用内置项',
+          '插件 $id 本机已带着核心内置的那一份成品（内置项只走内置开关）：'
+          '发布仓库不提供覆盖安装，否则两个开关会抢同一条目。'
+          '要换这一条的版本请用内置开关；发布仓库请改用自定义 id',
         ),
       );
       return;
@@ -4323,7 +4328,16 @@ class CoreServer {
       await writeJson(request, 400, errorBody(reason));
       return;
     }
-    final PluginStoreResult result = store.upsert(entry);
+    // 内置身份跟着**条目**走，不跟着文件走：这条本来就是清单里的内置项，从 release
+    // 装了成品之后它仍是同一个内置开关在服务，只是 command 指到了装进来的那一份。
+    // 丢掉 `builtin: true` 会让面板把它当自定义条目，而 [migrateBuiltinEntries] 从此
+    // 不再管它 —— 下一次内置换代就没人替这位用户改命令了（“配置看上去正常但起不来”
+    // 那一类最难查的坑）。
+    final Map<String, dynamic> toWrite = <String, dynamic>{
+      ...entry,
+      if (existing?['builtin'] == true) 'builtin': true,
+    };
+    final PluginStoreResult result = store.upsert(toWrite);
     final Map<String, dynamic>? stored = result.entry;
     if (!result.ok || stored == null) {
       final String reason =

@@ -3,7 +3,8 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 
-import 'builtin_plugins.dart' show BuiltinPluginCatalog, BuiltinRuntime;
+import 'builtin_plugins.dart'
+    show BuiltinPluginCatalog, BuiltinPluginSpec, BuiltinRuntime;
 import 'plugin_host.dart' show PluginSuspension;
 
 /// 插件**发布**仓库（GitHub Releases）的默认坐标。
@@ -289,11 +290,12 @@ class PluginDownloader {
     String Function()? nonce,
     PluginInstalledEntryReader? installedEntryOf,
     Set<String> Function()? protectedFiles,
+    this.isWindows,
   }) : fetcherOverride = fetcher,
        injectedClient = client,
        nonceFactory = nonce ?? _defaultNonce,
        installedReader = installedEntryOf ?? _noInstalledEntry,
-       protected = protectedFiles ?? BuiltinPluginCatalog.protectedFileNames;
+       protectedOverride = protectedFiles;
 
   /// 没注入读条目时的默认：永远当"本机没装过"（判断有没有更新就保守地回答"有"）。
   static Map<String, dynamic>? _noInstalledEntry(String pluginId) => null;
@@ -330,14 +332,68 @@ class PluginDownloader {
   /// 读已落盘条目（看“装的是哪一版”，从而判断有没有更新）。
   final PluginInstalledEntryReader installedReader;
 
-  /// **不许被发布仓库覆盖的文件名**（缺省 = 核心随包的内置插件脚本与二进制）。
+  /// 成品文件名的平台口径（null = 本机）。**测试必须注入**：不注入的话，
+  /// 夹具写 `tree_sample.exe` 而真实平台不是 Windows ⇒ 保护面算空，用例假绿。
+  final bool? isWindows;
+
+  /// 测试注入的覆盖（null = 用本机事实算，见 [protectedFileNames]）。
+  final Set<String> Function()? protectedOverride;
+  
+  /// **本机不许被发布仓库覆盖的文件名**（按两个事实算，不按静态清单猜）。
   ///
-  /// 为什么算进索引校验而不是只堵 install：`plugins/` 里是插件源码与随包成品，一条写错
-  /// `target` 的索引就够把内置脚本盖掉；而“面板提前列出它、点了才失败”会把一个合同错误
-  /// 伪装成一个运行时故障。列清单时就当场跳过并写下原因，与其余坏条目同口径。
-  final Set<String> Function() protected;
+  /// 2026-10-18 的口径变化（以前是 `BuiltinPluginCatalog.protectedFileNames()` 从清单推）：
+  /// 插件成品不再随包之后，“清单项 = 随包成品”不成立，那张表会把**本机根本没有的文件**
+  /// 当成受保护名 ⇒ 这些内置 id 从 release 永远装不上，而它们在面板上又开不了 ——
+  /// 保护做过头，条目就彻底坏死。所以判据改成两个事实的**合取**：
+  ///
+  /// 1. `installDir/<文件名>` 确实存在 ⇒ 本机带着这一份成品；
+  /// 2. 该 id 的条目**没打过 `source: release`** ⇒ 它是内置随包的那一份，不是上一次从
+  ///    仓库装的。**这一半不能省**：随包成品与装进来的成品住在**同一个目录**，只看
+  ///    “文件在不在”会把上一次刚装好的那条也变成受保护 ⇒ 从此它自己再也更新不了
+  ///    （那是把保护做成死锁，而表现是“更新按下去没反应”）。
+  ///
+  /// 两条防线各管一面，别混淆：这一条管**文件名**（不撞内置 id 也能把 `tree_sample.exe`
+  /// 盖掉）；`_installPluginRelease` 里的“撞内置 id”是另一条，两者现在共用这一份事实。
+  Set<String> protectedFileNames() {
+    final Set<String> Function()? injected = protectedOverride;
+    if (injected != null) return injected();
+    final Set<String> names = <String>{};
+    final bool windows = isWindows ?? Platform.isWindows;
+    for (final BuiltinPluginSpec spec in BuiltinPluginCatalog.specs) {
+      if (spec.kind != BuiltinPluginSpec.kindBinary) continue;
+      final String fileName = BuiltinPluginCatalog.binaryFileName(
+        spec,
+        isWindows: windows,
+      );
+      if (!File(p.join(installDir, fileName)).existsSync()) continue;
+      // 上一次从 release 装的那一份 ⇒ 不算随包，允许再装（否则它自己锁死自己）。
+      final Object? source = installedReader(spec.id)?[kRepoSourceKey];
+      if (source == kRepoSourceValue) continue;
+      names.add(fileName);
+    }
+    return names;
+  }
 
   final void Function(String message)? log;
+
+  /// 这条内置 id 在本机是否已有“核心自带的那一份成品”（`POST /release/{id}/install` 的判据）。
+  ///
+  /// 为什么住在这里而不是路由层：它要用的平台口径与受保护名是**同一件事**（见
+  /// [protectedFileNames]）。路由层自己再拼一次 `binaryFileName(…, isWindows: Platform.isWindows)`
+  /// 就是第二套判断 —— 不注入 isWindows 的用例在别的平台上会**假绿**（保护面算 `.exe`、
+  /// 查的名字不带 `.exe`，两边对不上谁也不报错）。
+  bool shipsOwnArtifact(String id) {
+    final BuiltinPluginSpec? spec = BuiltinPluginCatalog.specOf(id.trim());
+    if (spec == null || spec.kind != BuiltinPluginSpec.kindBinary) return false;
+    // 受保护名本身已尊重注入（[protectedFileNames] 开头那行），这里不再分叉；
+    // 只把名字按**同一个平台口径**拼出来去查它。
+    return protectedFileNames().contains(
+      BuiltinPluginCatalog.binaryFileName(
+        spec,
+        isWindows: isWindows ?? Platform.isWindows,
+      ),
+    );
+  }
 
   static final RegExp _idPattern = RegExp(r'^[A-Za-z0-9_.-]+$');
   static final RegExp _versionPattern = RegExp(r'^\d+\.\d+\.\d+$');
@@ -562,7 +618,7 @@ class PluginDownloader {
       return (entry: null, error: '$id 的 files 必须是非空数组（要放进 plugins/ 的文件）');
     }
     final List<PluginRepoFile> files = <PluginRepoFile>[];
-    final Set<String> reserved = protected();
+    final Set<String> reserved = protectedFileNames();
     for (final Object? item in rawFiles) {
       if (item is! Map) {
         return (entry: null, error: '$id 的 files 里有一项不是对象（要 {asset, target}）');

@@ -393,6 +393,12 @@ void main() {
         BuiltinPluginCatalog.specOf(kSamplePluginId)!,
         isWindows: Platform.isWindows,
       );
+      // 本机确实带着这一份随包成品。这一句是 **2026-10-18 的判据变化**带来的：
+      // 受保护名不再从静态清单推，而是看“文件在不在 + 它是不是上一次从 release 装的”。
+      // 新装机上插件成品不随包 ⇒ 这一份不存在 ⇒ 不拦（那条路见
+      // `plugin_config_api_test.dart` 的「内置 id 但本机没带它的成品 ⇒ 从 release 装得进来」）；
+      // 所以“拦得住”的夹具必须自己把文件摆上，否则这条用例测的就不是它声称的那件事。
+      File(p.join(installDir, builtinName)).writeAsStringSync('MZ shipped');
       putAsset(builtinName);
       repo.publish(
         plugins: <Map<String, dynamic>>[
@@ -424,10 +430,18 @@ void main() {
       );
       expect(result.ok, isFalse);
       expect(result.error, contains('skipped'));
+      // 新判据下这份文件**本来就该在**（它就是“本机带着随包成品”那个事实本身）。
+      // 所以这里能钉的不再只是“文件没出现”，而是更强的那一条：**内容一字未动**。
+      final File shipped = File(p.join(installDir, builtinName));
       expect(
-        File(p.join(installDir, builtinName)).existsSync(),
-        isFalse,
-        reason: '被跳过的条目一个字节都不许落进 plugins/',
+        shipped.existsSync(),
+        isTrue,
+        reason: '夹具里那份随包成品必须在：它就是保护判据的那个事实',
+      );
+      expect(
+        shipped.readAsStringSync(),
+        'MZ shipped',
+        reason: '被跳过的条目一个字节都不许盖掉它（真盖掉就是“示例插件突然起不来”）',
       );
     });
   });

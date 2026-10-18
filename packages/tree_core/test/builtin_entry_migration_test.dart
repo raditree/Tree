@@ -7,7 +7,7 @@
 // 归因要穿过落盘配置 / 打包清单 / 发布索引三处——这是最难查的一类，所以迁移与这几条用例一起进仓。
 //
 // 钉住的五件事：
-// 1. 清单真换了代（kind=binary + 二进制名进 `protectedFileNames`，脚本名不再进）；
+// 1. 清单真换了代（kind=binary + 两种平台拼写的二进制名都对，旧脚本名不再出现在任何一项上）；
 // 2. 老条目被重写成新命令，而用户的 `enabled` 与 `env` **一个都不动**；
 // 3. 幂等：命令已是这一代就什么都不做（每次开机都跑，不能每次都改用户的文件）；
 // 4. 三种"不该动"：不是 builtin / 条目根本不存在 / 解析失败（最后一种必须留一行）；
@@ -95,10 +95,16 @@ void main() {
 
   // ── 1 清单本身 ──────────────────────────────────────────────────────────
 
-  /// 一条换代项的共同断言：kind=binary + 受保护名换了代。
+  /// 一条换代项的共同断言：kind=binary + 二进制名的两种平台拼写。
   ///
-  /// 写成函数而不是两条复制：这一批有两个 id，而“旧名不得再在名单里”这类断言
+  /// 写成函数而不是两条复制：这一批有两个 id，而“旧名不得再在任何清单项上”这类断言
   /// 很容易只给新加的那条写。
+  ///
+  /// 2026-10-18：这里以前钉的是 `protectedFileNames()` 含这个二进制名，而那份“受保护名”
+  /// 已从**由清单推**改成**看本机事实**（`PluginDownloader.protectedFileNames`）——插件成品
+  /// 不再随包之后，按清单推会把本机根本没有的文件当保护名，那些内置 id 就永远装不上。
+  /// 保护那件事的钉子搬到了 `plugin_config_api_test.dart`（它拿**真文件**当夹具）；
+  /// 本文件只钉清单本身换代了没有。
   void expectSwappedToBinary(
     String id,
     String binaryName,
@@ -109,15 +115,23 @@ void main() {
     expect(spec!.kind, BuiltinPluginSpec.kindBinary, reason: id);
     expect(spec.runtime, 'binary', reason: id);
     expect(spec.script, binaryName, reason: id);
-    // 随包名进"受保护文件"名单：发布索引把这两个名字当 target 就会盖掉核心自带的东西。
-    final Set<String> protected = BuiltinPluginCatalog.protectedFileNames(
-      isWindows: true,
-    );
-    expect(protected, contains('$binaryName.exe'), reason: id);
+    // 平台拼写：Windows 补 `.exe`，其余平台不带——装机端与打包链都拿这个名字找文件，
+    // 写错一个点就是“面板上能看见、装上去起不来”。
     expect(
-      protected,
+      BuiltinPluginCatalog.binaryFileName(spec, isWindows: true),
+      '$binaryName.exe',
+      reason: id,
+    );
+    expect(
+      BuiltinPluginCatalog.binaryFileName(spec, isWindows: false),
+      binaryName,
+      reason: id,
+    );
+    // 旧脚本名不得还出现在**任何一项**上（包括别的 id）。
+    expect(
+      BuiltinPluginCatalog.specs.map((BuiltinPluginSpec s) => s.script),
       isNot(contains(legacyScript)),
-      reason: '$id：清单换了代，受保护名也跟着换——留着旧名等于假装那个脚本还在包里',
+      reason: '$id：清单换了代，旧脚本名也跟着消失——留着就是假装那个脚本还在包里',
     );
   }
 
