@@ -455,6 +455,54 @@ void main() {
     expect(find.textContaining('显式 kill'), findsOneWidget);
   });
 
+  testWidgets('内置项解析不到 ⇒ 明说“去从发布仓库更新装它”，而不是只留一行红色的“未就绪”', (WidgetTester tester) async {
+    // 2026-10-18：插件成品不再随安装包 ⇒ 新装机上内置项一律解析不到，那是**常态**不是故障。
+    // 光有“运行时未就绪：在 … 找不到 tree_sample.exe”会让用户以为装坏了，而他真正需要的
+    // 是一句“去下面那一节装它”。原始错误仍然留着（它列了查找路径，是诊断信息）。
+    final Map<String, dynamic> missing = _FakeAdmin._defaultBuiltins();
+    (
+      (missing['builtins'] as List<dynamic>).single as Map<String, dynamic>
+    )['resolution'] = <String, dynamic>{
+      'ok': false,
+      'error': '在 C:/app/plugins 找不到 tree_sample.exe',
+    };
+    final _FakeAdmin admin = _FakeAdmin(builtins: missing);
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+
+    expect(find.textContaining('运行时未就绪'), findsOneWidget);
+    expect(
+      find.byKey(const Key('plugin-builtin-needs-repo-sample')),
+      findsOneWidget,
+      reason: '要指到用户真能动手的那一节；文案里的节名必须与面板标题一致',
+    );
+    expect(
+      (find
+              .byKey(const Key('plugin-builtin-needs-repo-sample'))
+              .evaluate()
+              .single
+              .widget
+          as Text)
+      .data,
+      contains('从发布仓库更新'),
+      reason: '“从发布仓库更新”是面板上那一节的实际标题（写错名字等于指引到不存在的地方）',
+    );
+
+    // 反过来：成品在（默认夹具 resolution.ok=true）⇒ 不许出现这一行“待装”提示。
+    // 写成**另一条** testWidgets 而不是在本条里再 pump 一次：同一个位置的同类 widget
+    // 会被复用 State，而面板只在 initState 里拉数据 —— 第二次 pump 看到的还是上面那份
+    // “解析不到”的旧状态（实测过一次，断言假红）。
+  });
+
+  testWidgets('内置项成品在 ⇒ 不许出现“去仓库装”那一行（也不许染成错误色）', (WidgetTester tester) async {
+    final _FakeAdmin shipped = _FakeAdmin();
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: shipped);
+    expect(
+      find.byKey(const Key('plugin-builtin-needs-repo-sample')),
+      findsNothing,
+    );
+    expect(find.textContaining('运行时未就绪'), findsNothing);
+  });
+
   testWidgets('每项开关各自打各自的接口', (WidgetTester tester) async {
     final _FakeAdmin admin = _FakeAdmin();
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);

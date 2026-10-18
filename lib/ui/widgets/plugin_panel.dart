@@ -1000,7 +1000,7 @@ class _PluginPanelState extends State<PluginPanel> {
         '内置插件（${_builtins.length}）',
         trailing: IconButton(
           key: const Key('plugin-builtins-refresh'),
-          tooltip: '重新解析内置插件的随包产物（补上产物后点这里）',
+          tooltip: '重新解析内置插件的成品（从发布仓库装完点这里）',
           iconSize: 16,
           visualDensity: VisualDensity.compact,
           onPressed: () => _loadAdmin(refreshBuiltins: true),
@@ -1129,6 +1129,17 @@ class _PluginPanelState extends State<PluginPanel> {
               color: resolvable ? cs.onSurfaceVariant : cs.error,
             ),
           ),
+          if (!resolvable)
+            // 2026-10-18：插件成品不再随安装包（只由 tree-plugins 的 release 提供），
+            // 所以“解析不到”是新装机的**常态**而不是故障。上面那行只说“运行时未就绪：
+            // 在 … 找不到 tree_xxx.exe”，读起来像坏了；这一行把用户引到他真能动手的地方
+            // ——本面板下面的「从发布仓库更新」。两条都留着：原始错误是诊断信息（它列了
+            // 查找路径），不能拿指引替掉它。
+            Text(
+              '本机还没有这一份成品 · 到下面「从发布仓库更新」装它（装完回来再打开开关）',
+              key: Key('plugin-builtin-needs-repo-$id'),
+              style: TextStyle(fontSize: 11, color: cs.tertiary),
+            ),
           if (configured)
             Text(
               '命令：${entry['command']} ${entryArgs.join(' ')}',

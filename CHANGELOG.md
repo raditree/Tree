@@ -42,6 +42,20 @@
     不开就跳过并留一行——所以 `defaultEnabled: true` 保持原样（用户 2026-10-10 的拍板未被
     覆盖），新装机也不会播出一条“开着却没有文件”的条目。
 
+- **内置项“本机没有成品”是一种状态，不是故障**（**新增**文案与 widget 用例
+  [lib/ui/widgets/plugin_panel.dart](lib/ui/widgets/plugin_panel.dart) `_builtinCard`、
+  [test/plugin_panel_admin_test.dart](test/plugin_panel_admin_test.dart)）：成品不随包之后，
+  新装机上每一项内置插件都是`resolution.ok=false`。以前面板只给一行红色的
+  “运行时未就绪：在 … 找不到 tree_xxx.exe”——读起来像装坏了，而用户真正需要的是一句
+  “去下面「从发布仓库更新」装它”。现在两条都显示：**指引行**（`plugin-builtin-needs-repo-<id>`，
+  非错误色）+ **原始错误**（它列了查找路径，是诊断信息，不能拿指引替掉）。
+  用例钉了三件事：① 解析不到 ⇒ 指引出现；② 指引里的**节名必须与面板实际标题一致**
+  （“从发布仓库更新”写错名字等于指引到一个不存在的地方）；③ 成品在 ⇒ 不许出现这一行。
+  便携包说明（`使用说明.txt` 的「内置插件」段）与“重新解析”按钮的 tooltip 跟着改口径。
+  - 写用例时踩到一条通用的坑（已写进注释）：同一个位置的同类 widget 在第二次
+    `pumpWidget` 时**复用 State**，而面板只在 `initState` 拉数据 ⇒ 同一个 `testWidgets` 里
+    连 pump 两次会拿旧状态断言（实测假红）。正/反两种夹具宜拆成两条用例。
+
 - **安装包不再带插件成品；`plugins/` 只许有文档**（**新增**自检
   [tool/package_windows.dart](tool/package_windows.dart) `_assertNoBundledPluginBinaries`，
   并**删除**②d 的插件分支 / ②e `_copySelfUpdaterArtifacts` / ②f `_copyRepoPluginArtifacts`；
