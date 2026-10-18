@@ -1,7 +1,7 @@
 # tree_agent
 
 **跑在目标机（Linux）上的执行体**：经 **stdio 行分隔 JSON-RPC 2.0** 被「中转站插件」
-（`packages/tree_ssh_plugin`）调用，**真正执行**文件读写与命令。
+（插件仓 `plugins/ssh_executor`，2026-10-18 前在 `packages/tree_ssh_plugin`）调用，**真正执行**文件读写与命令。
 
 它是 SSH 执行器新架构里"真正干活"的那一端（协议定稿见
 [../../docs/ssh-tunnel-protocol.md](../../docs/ssh-tunnel-protocol.md)）：

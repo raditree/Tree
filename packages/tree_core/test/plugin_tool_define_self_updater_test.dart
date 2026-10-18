@@ -21,7 +21,7 @@ import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
 
-/// 插件自报的工具名（源头在 `packages/tree_self_updater/lib/src/tool_surface.dart`）。
+/// 插件自报的工具名（源头在插件仓 `plugins/self_updater/lib/src/tool_surface.dart`）。
 /// 这里**故意手抄**：本用例要的正是"两边不一致时闸门得红"，共用常量就等于没测。
 const String kToolName = 'plugin_hot_restart';
 const String kNamespaced = 'plugin__self_updater__$kToolName';
@@ -46,12 +46,18 @@ void main() {
     repo = found!;
     selfUpdaterBin = p.join(
       repo,
-      'packages',
-      'tree_self_updater',
-      'bin',
-      'tree_self_updater.dart',
+      'plugins',
+      'self_updater',
+      'self_updater_plugin.dart',
     );
     expect(File(selfUpdaterBin).existsSync(), isTrue, reason: selfUpdaterBin);
+    // 同一个口径：入口住在插件仓的一个 package 里，`dart run` 要先有 package_config
+    // （由 `dart run tool/build_plugins.dart` 的 pub get 产出）。
+    expect(
+      File(p.join(repo, 'plugins', 'self_updater', '.dart_tool', 'package_config.json')).existsSync(),
+      isTrue,
+      reason: '插件包还没 pub get：先跑 dart run tool/build_plugins.dart',
+    );
   });
 
   tearDown(() async {
@@ -384,7 +390,7 @@ void main() {
     );
     if (!resolution.ok) {
       markTestSkipped(
-        '没跑 `dart run tool/build_self_updater.dart`（${resolution.error}）：'
+        '没跑 `dart run tool/build_plugins.dart --only self_updater`（${resolution.error}）：'
         '本机没有产物时这是预期行为（真机构建门控）',
       );
       return;

@@ -167,6 +167,34 @@ void main() {
     );
   });
 
+  test('声明了 app_version_define 的插件，那个键名必须真出现在它的源码里', () {
+    // 钉的是“注到了东西”而不是“注对了”：键名写错（多一个字母、拿成另一个插件的键）
+    // 会静默地注不上，而插件拿着 `defaultValue` 自报一个假版本——目标机驻留目录按
+    // 版本命名 ⇒ 每次装都当新版重推，面板上那一行版本号也是假的。
+    // “注对了”由**产物自检**核（`ssh_executor --selftest` 第 7 条：版本不等于兜底值），
+    // 因为那个兜底值住在 `tree_tunnel_protocol` 里，本用例隔着一个仓去推它不诚实。
+    final List<String> dangling = <String>[];
+    for (final Map<String, dynamic> manifest in manifests) {
+      final String id = _str(manifest['id']);
+      final String define = _str(manifest['app_version_define']);
+      if (define.isEmpty) continue;
+      final Directory dir = Directory('${pluginRepo.path}/$id');
+      final List<String> hits = <String>[];
+      for (final FileSystemEntity entity in dir.listSync(recursive: true)) {
+        if (entity is! File || !entity.path.endsWith('.dart')) continue;
+        // `.dart_tool/` 是 pub 生成的缓存（含依赖自己的源码），不算这条插件的源码。
+        if (entity.path.contains(r'.dart_tool')) continue;
+        if (entity.readAsStringSync().contains(define)) hits.add(entity.path);
+      }
+      if (hits.isEmpty) dangling.add('$id → 键名 $define 在这条插件的源码里找不到');
+    }
+    expect(
+      dangling,
+      isEmpty,
+      reason: '这些 app_version_define 注不到任何东西：\n${dangling.join('\n')}',
+    );
+  });
+
   test('骨架那张方法名表逐个已登记（插件自带常量表不能漂）', () {
     final File kit = File('${pluginRepo.path}/_kit/plugin_kit.dart');
     expect(kit.existsSync(), isTrue);

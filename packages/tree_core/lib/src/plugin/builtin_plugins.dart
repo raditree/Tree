@@ -6,7 +6,7 @@ import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart';
 import 'plugin_config_store.dart';
 import 'plugin_host.dart' show PluginSuspension;
 
-/// 框架自迭代插件的**内置身份**（与 `packages/tree_self_updater` 里那一份**必须同串**）。
+/// 框架自迭代插件的**内置身份**（与插件仓 `plugins/self_updater` 里那一份**必须同串**）。
 ///
 /// 为什么不共享常量：插件包要零核心依赖（不能反过来依赖 tree_core），因此两边各一条，
 /// 而“不同串”这个错由真子进程用例钉住：[plugin_tool_define_self_updater_test]。
@@ -466,8 +466,8 @@ class BuiltinPluginCatalog {
     final String? repo = repoRoot(exeDir);
     return <String>[
       p.join(exeDir, 'plugins'),
-      // 开发态的**构建产物**（`tool/build_plugins.dart` / `build_ssh_plugin.dart` /
-      // `build_agent.dart` 的落点）：
+      // 开发态的**构建产物**（`tool/build_plugins.dart` 编七条插件、`tool/build_agent.dart`
+      // 编目标机执行体的落点）：
       // 打了包就走上面那条（发行目录 plugins/），没打包时从这里读，免得开发时必须
       // 手动把二进制搬到 exe 同级。
       if (repo != null) p.join(repo, 'build', 'plugins'),

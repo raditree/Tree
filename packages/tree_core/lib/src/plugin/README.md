@@ -247,14 +247,15 @@
       播种语义严格（条目根本没有才种 / 解析失败只记日志不落盘 / 用户关过绝不再自动打开）。
     - **插件包零核心依赖 ⇒ 协议常量各自一份**，漂移由
       [tree_protocol 的门禁](../../../../tree_protocol/test/plugin_rpc_method_gate_test.dart) 把
-      `packages/tree_self_updater/{lib,bin}` 列入扫描面来钉；而「工具名与插件自报 id 同串」
-      由真子进程用例钉。
+      整个插件仓（`plugins`，含搬进来的 `ssh_executor` / `self_updater`）列入扫描面来钉；
+      而「工具名与插件自报 id 同串」由真子进程用例钉。
     - **随包自检给的是退出码**：`tree_self_updater --selftest`（输出走 stderr，
       「stdout 只有协议帧」这条规则不因模式而变）。「面板没报错」证明不了工具真能申报进表。
     用例：[test/plugin_tool_define_self_updater_test.dart](../../../test/plugin_tool_define_self_updater_test.dart)（6）、
     [test/plugin_self_restart_tool_test.dart](../../../test/plugin_self_restart_tool_test.dart)（6）、
     [test/plugin_hot_restart_station_test.dart](../../../test/plugin_hot_restart_station_test.dart)（13）；
-    插件自身：[packages/tree_self_updater](../../../../tree_self_updater/test/self_updater_loop_test.dart)（16）。
+    插件自身：[self_updater 的用例](https://github.com/raditree/tree-plugins/blob/master/self_updater/test/self_updater_loop_test.dart)（16，
+    2026-10-18 从 `packages/tree_self_updater` 搬进插件仓）。
 
 29. **插件管理只拉 release，不拉源码**（2026-10-16 阶段 5，用户定稿；D6/D8/不变量 6/10）：
     `raditree/tree-plugins` 里放的是给人改的**源码**，装机端要的是发布方事先备好的

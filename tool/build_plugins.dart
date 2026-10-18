@@ -19,6 +19,22 @@
 ///   2. **产物必须自检过**：编出来的 exe 立刻跑 `<exe> --selftest`，非 0 就整个构建
 ///      失败。"能编译"不等于"协议对"，而协议错在用户机器上的表现是"插件起不来"。
 ///   3. **索引里的 `bytes` 是真字节数**：装机端拿它核对下载完整性，填错等于"不落地"。
+///
+/// **两种插件形状，同一个入口约定**（`plugins/<id>/<id>_plugin.dart`）：
+///   - 单文件型（五个示例插件）：零 package 依赖，以**桌面仓根**为工作目录直接编；
+///   - package 型（目录里有 `pubspec.yaml`，如 `ssh_executor` / `self_updater`）：先在该
+///     目录 `dart pub get`，再以**该目录**为工作目录编译——`dart compile` 是按入口文件
+///     往上找 `package_config.json` 的，工作目录错了就解析不到它依赖的 `dartssh2` /
+///     `tree_tunnel_protocol`（表现是"编译失败：Target of URI doesn't exist"，而不是
+///     "这个插件没依赖"）。
+/// package 型必须能拿到 `../../packages/tree_tunnel_protocol` ⇒ 插件仓装在桌面仓的
+/// `plugins/` 下是它的**编译前提**（不只是构建便利），这条已写进 plugins/README.md。
+///
+/// 为什么要有 `app_version_define` 这个可选字段：功能型插件会**自报一个版本**（面板与
+/// 目标机目录名都拿它当依据），而这个版本必须由**构建时注入**（`String.fromEnvironment`）——
+/// 注入点写在源码里，声明写在 plugin.json 里，两边同名的这件事由合同测试钉住（见
+/// `plugin_repo_contract_test.dart`）。靠工具猜键名一定会漂：`ssh_executor` 的键是
+/// `kAgentVersion`，`self_updater` 的键是 `kSelfUpdaterVersion`，两个不一样。
 library;
 
 import 'dart:convert';
@@ -47,6 +63,9 @@ Future<void> main(List<String> args) async {
   );
   final bool skipSelfTest = args.contains('--skip-selftest');
   final String only = _arg(args, '--only') ?? '';
+  // 只有**声明了 `app_version_define`** 的插件才需要它（见文件头那段理由），所以取不到
+  // 也不算错——但一旦有插件声明，就必须有版本可注：拿 `0.0.0` 冒充会让插件自报一个假版本。
+  final String? appVersion = _readAppVersion(root);
 
   final List<_PluginManifest> manifests = _readManifests(
     pluginRepo,
@@ -86,7 +105,36 @@ Future<void> main(List<String> args) async {
           ok = false;
           continue;
         }
-        final int code = await _compile(root, entrySource, artifact.path);
+        final String define = manifest.appVersionDefine;
+        if (define.isNotEmpty && appVersion == null) {
+          failures.add(
+            '${manifest.id}：声明了 app_version_define=$define，却读不到仓根 '
+            'pubspec.yaml 的 version（不能拿假版本注进产物）',
+          );
+          ok = false;
+          continue;
+        }
+        // package 型：入口在插件自己的包里，得先在那儿解析依赖（文件头有理由）。
+        final String? packageDir = manifest.isPackage ? manifest.dirPath : null;
+        if (packageDir != null) {
+          final int getCode = await _pubGet(packageDir);
+          if (getCode != 0) {
+            failures.add(
+              '${manifest.id}：dart pub get 失败（exit=$getCode）——'
+              'package 型插件的依赖解析不了就是编不出，不能用上一批的产物蒙过去',
+            );
+            ok = false;
+            continue;
+          }
+        }
+        final int code = await _compile(
+          packageDir ?? root.path,
+          entrySource,
+          artifact.path,
+          define: define.isNotEmpty && appVersion != null
+              ? '$define=$appVersion'
+              : '',
+        );
         if (code != 0) {
           failures.add('${manifest.id}：编译失败（exit=$code）');
           ok = false;
@@ -94,7 +142,9 @@ Future<void> main(List<String> args) async {
         }
         stdout.writeln(
           '[build_plugins] ${manifest.id} → ${_relative(root, artifact.path)}'
-          '（${(artifact.lengthSync() / 1024 / 1024).toStringAsFixed(1)} MB）',
+          '（${(artifact.lengthSync() / 1024 / 1024).toStringAsFixed(1)} MB'
+          '${packageDir != null ? ', package 型' : ''}'
+          '${define.isNotEmpty && appVersion != null ? ', -D$define=$appVersion' : ''}）',
         );
         if (!skipSelfTest) {
           final int selfTestCode = await _selfTest(artifact.path);
@@ -228,15 +278,62 @@ Map<String, dynamic> asJson(String text) => (json.decode(text) as Map).map(
       MapEntry<String, dynamic>(key.toString(), value),
 );
 
-Future<int> _compile(Directory root, String entry, String output) async {
+Future<int> _compile(
+  String workingDirectory,
+  String entry,
+  String output, {
+  String define = '',
+}) async {
   final ProcessResult result = await Process.run(
     Platform.resolvedExecutable,
-    <String>['compile', 'exe', entry, '-o', output],
-    workingDirectory: root.path,
+    <String>[
+      'compile',
+      'exe',
+      if (define.isNotEmpty) '-D$define',
+      entry,
+      '-o',
+      output,
+    ],
+    workingDirectory: workingDirectory,
   );
   stdout.write(result.stdout);
   stderr.write(result.stderr);
   return result.exitCode;
+}
+
+/// package 型插件的依赖解析（在工作目录 = 该插件目录里跑）。
+///
+/// 为什么不缓存“已经 get 过”：pubspec 里一行 path 依赖改了不重新 get 就会拿着旧的
+/// `package_config.json` 编出一个“看上去成功、实际链的是另一个版本”的产物——多跑一次
+/// `pub get`（命中缓存时一秒量级）与这个代价比不上一根毛。
+Future<int> _pubGet(String packageDir) async {
+  final ProcessResult result = await Process.run(
+    Platform.resolvedExecutable,
+    const <String>['pub', 'get'],
+    workingDirectory: packageDir,
+  );
+  if (result.exitCode != 0) {
+    stderr.write(result.stdout);
+    stderr.write(result.stderr);
+  }
+  return result.exitCode;
+}
+
+/// 从仓根 `pubspec.yaml` 读应用版本（`version: 1.0.4+1` → `1.0.4`）。
+///
+/// 与 `tool/build_agent.dart` **同一条规则**：拿 `+` 之前那一段。构建号每打一次包都变，
+/// 拿它当插件自报的版本会导致目标机每次重推 agent（而这两边必须同值：agent 二进制就是
+/// 按 `build_agent.dart` 那一条规则打的标）。
+String? _readAppVersion(Directory root) {
+  final File pubspec = File(_join(root.path, 'pubspec.yaml'));
+  if (!pubspec.existsSync()) return null;
+  for (final String line in pubspec.readAsLinesSync()) {
+    if (!line.startsWith('version:')) continue;
+    final String raw = line.substring('version:'.length).trim();
+    final int plus = raw.indexOf('+');
+    return plus > 0 ? raw.substring(0, plus) : raw;
+  }
+  return null;
 }
 
 /// 产物自检：**真进程**跑一遍（这就是"编译出来的那个东西"，不是源文件）。
@@ -306,6 +403,7 @@ class _PluginManifest {
     required this.suspension,
     required this.granularity,
     required this.scope,
+    required this.appVersionDefine,
   });
 
   final String dirName;
@@ -321,6 +419,13 @@ class _PluginManifest {
   final String suspension;
   final String granularity;
   final Map<String, dynamic> scope;
+
+  /// 可选：**把仓根 pubspec 的版本注进哪个 `String.fromEnvironment` 键**。
+  ///
+  /// 空 = 不注入（五个示例插件就是：它们不自报应用版本）。声明了它就必须真的在源码里
+  /// 读同名键——否则“看上去注入了”而插件拿着 `defaultValue` 自报一个假版本，这条由
+  /// `plugin_repo_contract_test.dart` 钉住。
+  final String appVersionDefine;
 
   static final RegExp _idPattern = RegExp(r'^[A-Za-z0-9_.-]+$');
   static final RegExp _versionPattern = RegExp(r'^\d+\.\d+\.\d+$');
@@ -353,8 +458,12 @@ class _PluginManifest {
               (Object? k, Object? v) => MapEntry<String, dynamic>('$k', v),
             )
           : <String, dynamic>{},
+      appVersionDefine: '${json['app_version_define'] ?? ''}'.trim(),
     );
   }
+
+  /// 是不是 package 型（目录里有 `pubspec.yaml`）。
+  bool get isPackage => File(_join(dirPath, 'pubspec.yaml')).existsSync();
 
   /// 合同的字段纪律（**逐条给人话理由**：构建失败的原因要能直接拿去改 plugin.json）。
   String? validate({required String dirName}) {
@@ -387,6 +496,11 @@ class _PluginManifest {
           fileName.contains('..')) {
         return 'files 里的「$fileName」必须是纯文件名（防路径穿越）';
       }
+    }
+    if (appVersionDefine.isNotEmpty &&
+        !RegExp(r'^[A-Za-z_][A-Za-z0-9_]*$').hasMatch(appVersionDefine)) {
+      return 'app_version_define（$appVersionDefine）必须是合法 Dart 标识符 '
+          '（它会变成 -D<这个名字>=<版本> 注入产物）';
     }
     return null;
   }

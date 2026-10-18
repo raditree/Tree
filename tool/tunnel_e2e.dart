@@ -6,7 +6,7 @@
 /// 远端 shell 通道）都因为"本机没有可连的 sshd"只能靠门控用例，**这一条可以真跑**。
 ///
 /// 前置：
-///   1. `dart run tool/build_ssh_plugin.dart` → `build/plugins/tree_ssh_executor[.exe]`
+///   1. `dart run tool/build_plugins.dart --only ssh_executor` → `build/plugins/tree_ssh_executor[.exe]`
 ///   2. `dart run tool/build_agent.dart` → `build/agents/tree_agent-linux-amd64`
 ///   3. 一个可连的 sshd（本仓 `docs/ssh-tunnel-protocol.md` 的做法：WSL 里起一个，
 ///      见 `.self/e2e/setup_sshd.sh`）
@@ -84,7 +84,7 @@ void main(List<String> args) async {
   final String? plugin = _pluginPath(root);
   if (plugin == null) {
     stderr.writeln(
-      '[e2e] 找不到插件可执行文件：先跑 `dart run tool/build_ssh_plugin.dart`',
+      '[e2e] 找不到插件可执行文件：先跑 `dart run tool/build_plugins.dart --only ssh_executor`',
     );
     exitCode = 2;
     return;

@@ -1,7 +1,7 @@
 # SSH 执行器「中转站」协议（core ⇄ ssh_executor 插件 ⇄ tree_agent）
 
 > 面向**改这三段任一环的人**。改动本协议 = 同时改三层：核心（`tree_local_exec` 的
-> `TunnelSshTransport` + `PluginBus`）、插件（`packages/tree_ssh_plugin`）、
+> `TunnelSshTransport` + `PluginBus`）、插件（插件仓 `plugins/ssh_executor`，2026-10-18 前在 `packages/tree_ssh_plugin`）、
 > 目标机执行体（`packages/tree_agent`）。**常量以 `packages/tree_tunnel_protocol` 为唯一真源**
 > （方法名 / 错误码 / 帧编解码 / 协议版本都在那里，三端共用，不允许各处手写字符串）。
 
@@ -278,9 +278,10 @@ JSON-RPC 标准：`-32700` 解析错 / `-32600` 非法请求 / `-32601` 方法�
   `agent.hello` 回 `protocol != 1` ⇒ 插件报 `handshake_failed` ⇒ 核心回退（并在日志里写清
   "agent 协议 1 不匹配：目标是 N —— 请升级随包 agent"）。
 - **版本号来源**：`tree_tunnel_protocol` 里的 `kAgentProtocolVersion` +
-  `kAgentVersion`。`kAgentVersion` **只由两个构建脚本注入**：`tool/build_ssh_plugin.dart`（插件自报它）
-  与 `tool/build_agent.dart`（agent 自报它）——**核心不参与**（2026-10-11 起，见 §10.5）。
-  两个脚本都取 `pubspec.yaml` 的版本（`+` 之前那部分），因此**升版本号必须重跑它们**；
+  `kAgentVersion`。`kAgentVersion` **只由两个构建入口注入**：`tool/build_plugins.dart`（插件自报它；
+  注入哪个键由该插件 `plugin.json` 的 `app_version_define` 声明，2026-10-18 起取代已删的
+  `tool/build_ssh_plugin.dart`）与 `tool/build_agent.dart`（agent 自报它）——**核心不参与**（2026-10-11 起，见 §10.5）。
+  两边都取 `pubspec.yaml` 的版本（`+` 之前那部分），因此**升版本号必须重跑它们**；
   `tool/package_windows.dart` 出包时会**校验**产物里的版本串与当前版本一致，不一致直接拒绝出包
   （那次教训：1.0.3+2 的包里塞着 1.0.2 编的插件与 agent，目标机上因此出现 `~/.tree/agent/1.0.2/`）。
 
@@ -338,17 +339,17 @@ JSON-RPC 标准：`-32700` 解析错 / `-32600` 非法请求 / `-32601` 方法�
    "这一条通道是同一个启动方"的一次性校验（防同机别的用户蹭上）。
 6. **推送分块 = 64 KiB 原文**（base64 ≈ 87 KiB 命令）。上限**不是** `ARG_MAX`，而是 **SSH 信道请求报文**：
    `exec` 的 command 是一个报文，塞太大会被对端当协议错误**直接断连**。
-   **实测**（`packages/tree_ssh_plugin/tool/probe_command_len.dart`，2026-10-10，WSL 的 OpenSSH sshd）：
+   **实测**（插件仓 `plugins/ssh_executor/tool/probe_command_len.dart`，2026-10-10，WSL 的 OpenSSH sshd）：
    base64 载荷 131072 / 174764 / **218456** 字节 OK，**262144 字节起失败**
    （`SSHStateError(SSH connection closed)`）。取 64 KiB 留 3 倍余量；
-   回归钉子见 `packages/tree_ssh_plugin/test/bootstrap_test.dart` 的「推送块必须留在实测上限之下」。
+   回归钉子见插件仓 `plugins/ssh_executor/test/bootstrap_test.dart` 的「推送块必须留在实测上限之下」。
 7. **agent 二进制的查找位置**：`<插件可执行文件所在目录的上一级>/agents/tree_agent-linux-<arch>`
    （发行 = `<应用目录>/agents/`，开发 = `<仓根>/build/agents/`，正是 `tool/build_agent.dart` 的落点），
    再退 `agent.binary_path` → 环境变量 `TREE_AGENT_BINARY` → 仓根 → cwd。
 8. **`hello.plugin_id` = `kSshExecutorPluginId`（`ssh_executor`）**，与核心的内置目录 / 面板开关 / 播种同源。
 9. **`tree_agent` 的 POSIX 专属行为在 Windows 开发机上 `skip`**（`script` / `setsid` / `kill -0` / 符号链接语义，
    共 19 条，带可读理由），因此**真机验证靠两条门控**：
-   `packages/tree_ssh_plugin` 与 `tool/tunnel_e2e.dart`（真 sshd + 真二进制，未设 `TREE_SSH_TEST_HOST` 时跳过）。
+   插件仓 `plugins/ssh_executor` 与 `tool/tunnel_e2e.dart`（真 sshd + 真二进制，未设 `TREE_SSH_TEST_HOST` 时跳过）。
 10. **拉起 agent 时 `--root` 一定带、且一定是绝对路径**（实测教训，2026-10-10）：
     `--root` 既是 agent 的**越界防护基线**，也是 `exec.run` 里 `cd` 的目标。给空 / 相对路径 / `~` 都不行 ——
     agent 会以「缺少 --root」直接退出、通道随即关闭，插件只能报 `handshake_failed`。

@@ -233,7 +233,7 @@
 
 - **框架自迭代插件：把「热重启一个插件（含重启它自己）」做成 agent tool**（**新增**
   [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 28、
-  [packages/tree_self_updater/README.md](packages/tree_self_updater/README.md) 不变量 1-5、
+  [插件仓 self_updater/README.md](https://github.com/raditree/tree-plugins/blob/master/self_updater/README.md) 不变量 1-5、
   [docs/plugin-development.md](docs/plugin-development.md) §6.7）：
   - **对外面是三张常量表，不是“等做 tool 时再说”**（把不变量 26 的划分接到 tool 面上）：
     `PluginToolSurface.agentToolCommands`（控制面四条）可申报成 tool、`lifecycleOnlyCommands`
@@ -422,8 +422,29 @@
   - 测试：`packages/tree_core/test/truncated_tool_args_repair_test.dart` 15 例（含真机 500 报错里
     那段半截 markdown 的还原；会话 e2e 钉 marker 只出现一次——回灌不二次补洞）。
 
-> 版本说明：本节只改行为与文档，**没有重新出包**，故先记 `Unreleased`；`pubspec.yaml` 仍是 1.0.3+4，
-> 出包时再按用户口径定构建号。
+- **插件有两种形状，而“能不能独立编”这件事不再口头负责**（**新增**
+  [plugins/README.md](https://github.com/raditree/tree-plugins/blob/master/README.md) 的「两种形状」与
+  `plugin.json` 字段表、[packages/tree_protocol/test/plugin_repo_contract_test.dart](packages/tree_protocol/test/plugin_repo_contract_test.dart)、
+  [tool/build_plugins.dart](tool/build_plugins.dart)；阶段 9 延伸：`ssh_executor` / `self_updater`
+  从本仓 `packages/` 搬进插件仓）：
+  - **入口约定只有一条**：两种形状都是 `plugins/<id>/<id>_plugin.dart`，package 型的
+    `bin/<原二进制名>.dart` 已改名进约定（第二套约定一定会漂，而它的表现是“这个插件突然编不了”）；
+  - **形状靠“目录里有没有 `pubspec.yaml`”判**，不靠 plugin.json 加一个 `type` 字段：字段是给人
+    填的（填错与不填都会发生），而 pubspec 在不在是编译时的事实，两个读者不可能各执一词；
+  - **新增 `app_version_define`（开发期字段，不进索引）**：声明“把仓根 pubspec 的 `x.y.z` 注进哪个
+    `String.fromEnvironment` 键”。分工写清了：合同测试钉“键名在这条插件自己的源码里出现过”（防注到
+    一个与它无关的键上），而“注对了”由**产物自检**核（`ssh_executor --selftest` 第 7 条：自报版本
+    不等于兜底值 `0.0.0-dev`）——“看上去注入了”而插件拿着 `defaultValue` 自报一个假版本，目标机
+    驻留目录按版本命名 ⇒ 每次装都当新版重推；
+  - **门禁的扫描面从五条目录收成两条**（`packages/tree_core/lib/src/plugin` + `plugins`）：
+    两条插件搬进插件仓后归 `plugins` 这一面管，**而不留占位路径** —— 门禁对不存在的扫描面是显式
+    失败的，“目录被移动时必须显式失败”正是它存在的理由（留着就是把它自己写的纪律删了）；
+  - **代价也要说清**：package 型的 path 依赖 `../../packages/tree_tunnel_protocol` 把“本仓 clone 在
+    桌面仓的 `plugins/` 下”从**构建便利**升级成**编译前提**；单独 clone 插件仓的人编不出这两条。
+    取舍理由与“为什么不用一个 `type` 字段”同源：协议帧形状只住一处。
+
+> 版本说明：本节随 **1.0.4+1** 发布（原先写先记 `Unreleased`、pubspec 仍在 1.0.3+4 的那句已过期，
+> 三处一致在 `chore(version)` 那一刀里已改）。下面的「验证」是**发版当日逐条重跑**的计数。
 
 ### 验证
 
@@ -466,7 +487,7 @@
 
 - **SSH 执行器：判死口径精确化、判死即静默、判死必须能穿透到核心、重建后拾回挂账任务**（**修改**
   [packages/tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 22、**新增**
-  [packages/tree_ssh_plugin/README.md](packages/tree_ssh_plugin/README.md) 不变量 15/16、
+  [插件仓 ssh_executor/README.md](https://github.com/raditree/tree-plugins/blob/master/ssh_executor/README.md) 不变量 15/16、
   **同步** [docs/ssh-tunnel-protocol.md](docs/ssh-tunnel-protocol.md) §10.1 / §10.8）：
   - **判死 = "我这条会话绑定的那个中转站实例已不可用"**（而不是"当前有没有插件"）：插件停用→启用
     或崩溃被重拉会换一个进程实例，旧会话绑的是旧实例；只看"当前有没有插件"会让这条绑着死实例的
@@ -491,7 +512,7 @@
 ### 断言变化（新增 / 修改的 README 不变量）
 
 - **"重连中"不再被当成"判死"**（新增 [packages/tree_local_exec/README.md](packages/tree_local_exec/README.md)
-  不变量 22、[packages/tree_ssh_plugin/README.md](packages/tree_ssh_plugin/README.md) 不变量 6、
+  不变量 22、[插件仓 ssh_executor/README.md](https://github.com/raditree/tree-plugins/blob/master/ssh_executor/README.md) 不变量 6、
   [docs/ssh-tunnel-protocol.md](docs/ssh-tunnel-protocol.md) §0/§2/§5/§6/§8 + **新增 §10**、
   [docs/architecture.md](docs/architecture.md) §11 新增两行 + §13 不变量 15）：
   - 插件在 `connecting` / `booting` / `reconnecting` 时对请求回 **`error_kind: tunnel_not_ready`**
@@ -505,7 +526,7 @@
     因为上一版把"重连中"也报成 `tunnel_down`，核心据此**瞬间判死**——`512a124` 加的核心侧忍耐
     （不误发 / 30s 慢探 / 判死才收尾）**从未有机会生效**。
 - **执行器自己察觉断连后优雅退出；重建前收掉上一世 agent**
-  （新增 [packages/tree_ssh_plugin/README.md](packages/tree_ssh_plugin/README.md) 不变量 13/14、
+  （新增 [插件仓 ssh_executor/README.md](https://github.com/raditree/tree-plugins/blob/master/ssh_executor/README.md) 不变量 13/14、
   [packages/tree_agent/README.md](packages/tree_agent/README.md) 不变量 20）：
   - 插件在 `ready` 期间每 **20s** 发 `agent.ping`（单次 10s 响应窗口，连丢 **3** 拍 ⇒ 拆掉重建）；
     `tunnel.reconnect` 走**同一探针** ⇒ **卡死（进程还在、但不回帧）也能换掉**（此前是 no-op 空转）；
@@ -517,7 +538,7 @@
   - **症状**（同上）：恢复网络后目标机上多出一个执行器进程（`lsof` 两个 pid），反复抖动会累积。
 - **agent 版本只由插件自报；出包校验二进制里的版本串**
   （[docs/ssh-tunnel-protocol.md](docs/ssh-tunnel-protocol.md) §2/§6/§10.5
-  + [packages/tree_ssh_plugin/README.md](packages/tree_ssh_plugin/README.md) 补充决定 1）：
+  + [插件仓 ssh_executor/README.md](https://github.com/raditree/tree-plugins/blob/master/ssh_executor/README.md) 补充决定 1）：
   - 核心**不再声明** agent 版本 / sha256 / 二进制名（`TunnelConnectRequest` 删掉这三个字段）——
     那两个值从来就没被插件读到过（核心只发 `config`、插件读 `request['agent']`，键从来没对上）；
     版本以**插件自报**（编译期注入）为准，sha256 由插件本机算；

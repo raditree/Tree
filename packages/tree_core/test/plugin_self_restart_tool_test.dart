@@ -1,6 +1,6 @@
 // 阶段 3（第 4 天）：agent 经 tool **热重启插件（含重启它自己）**的钉住用例。
 //
-// 跑的是真子进程（`packages/tree_self_updater` 的源码入口 + 可挂起假插件夹具），
+// 跑的是真子进程（插件仓 `plugins/self_updater` 的源码入口 + 可挂起假插件夹具），
 // 执行站接线与生产同一条（`ExecuteStationMounts.forStore(pluginManager: bus.handlePluginCommand)`）。
 // 所有结论都来自核心侧读数、插件回包与日志行 —— 不靠"看起来重启成功了"。
 //
@@ -43,10 +43,9 @@ void main() {
     repo = found!;
     selfUpdaterBin = p.join(
       repo,
-      'packages',
-      'tree_self_updater',
-      'bin',
-      'tree_self_updater.dart',
+      'plugins',
+      'self_updater',
+      'self_updater_plugin.dart',
     );
     suspendableScript = p.join(
       repo,
@@ -57,6 +56,15 @@ void main() {
       'suspendable_plugin.dart',
     );
     expect(File(selfUpdaterBin).existsSync(), isTrue, reason: selfUpdaterBin);
+    // 入口现在住在**插件仓的一个 package** 里（2026-10-18 搬迁）：`dart run` 要按入口
+    // 文件往上找 `package_config.json` 才能解析它的依赖。没跑过
+    // `dart run tool/build_plugins.dart`（它先 `pub get`）就会在这里红——
+    // 红得明确比默默跑过强（不查 package_config 的话，它可能“看着绿了但其实没测”）。
+    expect(
+      File(p.join(repo, 'plugins', 'self_updater', '.dart_tool', 'package_config.json')).existsSync(),
+      isTrue,
+      reason: '插件包还没 pub get：先跑 dart run tool/build_plugins.dart',
+    );
     expect(
       File(suspendableScript).existsSync(),
       isTrue,

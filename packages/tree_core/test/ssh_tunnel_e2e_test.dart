@@ -43,7 +43,7 @@ void main() {
     // `executableDir` 是这本就为测试准备的注入点（见 `BuiltinPluginCatalog` 的构造器注释）：
     // 跑 `dart test` 时 `Platform.resolvedExecutable` 是 SDK 里的 dart，
     // `repoRoot()` 因此锚不到仓根。注入 `<仓根>/build` 正好复现**开发态的真实布局**
-    // （`tool/build_ssh_plugin.dart` 就把产物放在 `<仓根>/build/plugins/`）。
+    // （`tool/build_plugins.dart` 就把七条插件的产物放在 `<仓根>/build/plugins/`）。
     final String? repo = BuiltinPluginCatalog.repoRoot(Directory.current.path);
     final BuiltinPluginCatalog catalog = BuiltinPluginCatalog(
       executableDir: repo == null ? null : p.join(repo, 'build'),

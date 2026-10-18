@@ -1081,8 +1081,9 @@ plugins:
   **`examples/plugins/` 目录已随这批迁移整个删掉**（五份 Python 示例全部进了插件仓）：以前这些
   用例本机没有 Python 就整组静默跳过，现在只要有 Dart 就真跑（覆盖面反而大了）。旧脚本的历史
   看 git 历史与 `docs/known-issues.md` 里的现场记录。
-- [packages/tree_self_updater](../packages/tree_self_updater/README.md)：**binary 型内置插件**的参考实现
-  （框架自迭代插件）：自带协议常量表、两条申报路共用同一份参数表、`suspend` 里「先转储等回包再 ack」，
+- [插件仓的 self_updater](https://github.com/raditree/tree-plugins/blob/master/self_updater/README.md)：**binary 型内置插件**的参考实现
+  （框架自迭代插件，2026-10-18 从本仓 `packages/tree_self_updater` 搬过去，形状改成 package 型）：
+  自带协议常量表、两条申报路共用同一份参数表、`suspend` 里「先转储等回包再 ack」，
   带 `--selftest`（退出码 0 = 全绿）。它不是脚本，但是“一个插件能做到什么”的最小可读完整面（见 §6.7）。
 - 这些脚本都**不依赖第三方库**、都能被绝对路径启动（不依赖 cwd）。
 - 尚未提供可运行示例的点位：`system.relay.llm.request`（投入前改写）——口径见 §5.3，

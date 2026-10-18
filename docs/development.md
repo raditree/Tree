@@ -29,15 +29,17 @@ desktop/
 │   ├── tree_protocol/         # 协议单一真源（WS 帧 / REST 路径 / 握手）+ 完备性门禁
 │   ├── tree_local_exec/       # 本机与 SSH 工作空间 IO（dartssh2 与中转站两条后端）
 │   ├── tree_tunnel_protocol/  # SSH 执行器「中转站」协议的共享定义（方法名 / 错误码 / 帧 / 版本）
-│   ├── tree_agent/            # 目标机（Linux）执行体：tree_agent 二进制
-│   ├── tree_ssh_plugin/       # ssh_executor 中转站插件（binary 型内置插件）
-│   ├── tree_core/             # 核心：服务 / LLM / 工具 / 团队 / Spec / MCP / 插件
-│   └── tree_core_cli/         # tree_core.exe 入口 + 真进程端到端测试
-├── test/                      # 前端测试（flutter test）
-├── tool/                      # 构建与打包脚本（build_core / build_agent / build_ssh_plugin / build_plugins / package_windows / installer）
-├── docs/                      # 文档（入口 docs/README.md）
-└── plugins/                   # **插件仓（raditree/tree-plugins）的本地 clone**（独立 git 仓、对桌面仓已 gitignore）：
-                               #   五个随包插件的 Dart 源码 + 公共骨架 `_kit` + 每个目录一份 `plugin.json`
+│   ├── tree_agent/             # 目标机（Linux）执行体：tree_agent 二进制
+│   ├── tree_core/               # 核心：服务 / LLM / 工具 / 团队 / Spec / MCP / 插件
+│   └── tree_core_cli/           # tree_core.exe 入口 + 真进程端到端测试
+├── test/                        # 前端测试（flutter test）
+├── tool/                        # 构建与打包脚本（build_core / build_agent / build_plugins / package_windows / installer）
+├── docs/                        # 文档（入口 docs/README.md）
+└── plugins/                     # **插件仓（raditree/tree-plugins）的本地 clone**（独立 git 仓、对桌面仓已 gitignore）：
+                                 #   七个插件的 Dart 源码 + 公共骨架 `_kit` + 每个目录一份 `plugin.json`。
+                                 #   其中 `ssh_executor` / `self_updater` 是 package 型（自带 pubspec，
+                                 #   path 依赖本仓的 tree_tunnel_protocol）⇒ **本仓必须 clone 在桌面仓的
+                                 #   plugins/ 下才能编出这两条**（其余五条零依赖，单文件即可）。
 ```
 
 ## 3. 构建与运行
@@ -54,26 +56,30 @@ flutter run -d windows
 核心可执行文件查找顺序：`TREE_CORE_EXE` → 应用同目录（发行版布局）→ 向上 8 层找
 `.output/tree_core.exe`（开发期）。都找不到时应用显示**带修复指引**的错误页。
 
-### 3.1 SSH 相关包的构建（`tree_ssh_plugin` / `tree_agent`）
+### 3.1 SSH 链路上的两份产物（`tree_agent` / `ssh_executor`）
 
-SSH 执行器链路上有**两个包要单独编译成二进制**（不是 `dart test` 能覆盖的：它们是随包分发、
-目标机上没有 Dart 运行时的产物）。都走 `tool/` 下的脚本，从**仓根**执行：
+SSH 执行器链路上有**两个东西要编译成二进制**（不是 `dart test` 能覆盖的：它们随包分发、
+目标机上没有 Dart 运行时）。两者的构建入口从 2026-10-18 起**分属两条链**：
 
-| 包 | 编译脚本 | 入口 | 产出（默认目录） | 跑在哪 |
+| 产物 | 编译命令 | 入口 | 产出（默认目录） | 跑在哪 |
 | --- | --- | --- | --- | --- |
-| `tree_ssh_plugin`（`ssh_executor` 中转站插件） | `dart run tool/build_ssh_plugin.dart` | `packages/tree_ssh_plugin/bin/tree_ssh_executor.dart` | `build/plugins/tree_ssh_executor`（Windows 补 `.exe`，约 10 MB） | **用户本机**（与 `tree_core.exe` 同级） |
+| `ssh_executor`（中转站插件） | `dart run tool/build_plugins.dart --only ssh_executor` | 插件仓 `plugins/ssh_executor/ssh_executor_plugin.dart` | `build/plugins/tree_ssh_executor`（Windows 补 `.exe`，约 10 MB） | **用户本机**（与 `tree_core.exe` 同级） |
+| `self_updater`（框架自迭代插件） | `dart run tool/build_plugins.dart --only self_updater` | 插件仓 `plugins/self_updater/self_updater_plugin.dart` | `build/plugins/tree_self_updater[.exe]` | **用户本机**（同上） |
 | `tree_agent`（目标机执行体） | `dart run tool/build_agent.dart` | `packages/tree_agent/bin/tree_agent.dart` | `build/agents/tree_agent-linux-{amd64,arm64}`（各约 6.5 MB） | **目标机 Linux** |
 
 **为什么是二进制而非脚本**：两者都要 `dartssh2` / 常驻通道 / base64 分块推送等能力，编译成单文件后
 目标机器上**不需要任何运行时**；核心侧按 `BuiltinPluginSpec.kind == binary` 解析插件（见
 `packages/tree_core/lib/src/plugin/builtin_plugins.dart`）。
 
-**可选参数**（`--out` 两者通用，留空即上表的默认目录）：
+**三条都接同一个版本口径**（`kAgentVersion` / `kSelfUpdaterVersion` 由构建时注入，值 = 仓根
+pubspec 的 `x.y.z`）：插件自报的版本与 agent 二进制的打标必须同串，否则目标机每次安装都
+当新版重推。原先负责注入的 `tool/build_ssh_plugin.dart` / `tool/build_self_updater.dart` 已删，
+注入点改成 `plugin.json` 的 `app_version_define`（声明注进哪个键）——两份脚本各自读 pubspec
+就是两份真相，而现在只有一个读者。
+
+**可选参数**：
 
 ```powershell
-# 中转站插件：只编「自机平台」那一份（Windows 出 .exe，Linux/macOS 无扩展名）
-dart run tool/build_ssh_plugin.dart [--out <dir>]
-
 # 目标机执行体：交叉编译，一次产出 amd64 + arm64 两份
 dart run tool/build_agent.dart [--out <dir>] [--version <v>] [--arch x64,arm64]
 ```
@@ -96,7 +102,8 @@ dart run tool/build_agent.dart [--out <dir>] [--version <v>] [--arch x64,arm64]
 
 ### 3.2 插件仓的成品（`build_plugins.dart`）
 
-五个随包插件（`minimal` / `suspendable` / `terminal_probe` / `compact` / `sample`）的**源码不在
+七个插件（`minimal` / `suspendable` / `terminal_probe` / `compact` / `sample` 五个示例，
+加 `ssh_executor` / `self_updater` 两条功能插件）的**源码不在
 本仓**，而在插件仓（clone 到桌面仓的 `plugins/`，2026-10-17 之前的 `examples/plugins/` 已删）。
 构建从**仓根**执行，一条命令覆盖整仓：
 
@@ -128,7 +135,8 @@ dart run tool/build_plugins.dart --out <目录> --index <文件>   # 改产物�
 | 工作空间 IO | `cd packages/tree_local_exec && dart test` | 本机 + SSH（dartssh2 **与中转站两条后端**）语义；路径越界；后台执行的两条路 |
 | **中转站协议** | `cd packages/tree_tunnel_protocol && dart test` | 帧编解码（分片 / 多帧 / `\r` / 坏帧不断读循环 / 超长行丢弃）、路径归一化与越界判定 |
 | **目标机执行体** | `cd packages/tree_agent && dart test` | L2 全部方法；越界拒绝；分块读写；`exec.spawn` 台账对账；PTY。**POSIX 专属行为在 Windows 上 skip（19 条）**，真机归下面那条门控 |
-| **中转站插件** | `cd packages/tree_ssh_plugin && dart test` | L1 分发 / 多隧道去重 / bootstrap 命令形状 / 退避节奏与 `down` 跃迁 / 真进程多帧 |
+| **中转站插件** | `cd plugins/ssh_executor && dart test` | L1 分发 / 多隧道去重 / bootstrap 命令形状 / 退避节奏与 `down` 跃迁 / 真进程多帧。2026-10-18 搬进插件仓 ⇒ **它不在桌面仓的包列表里了**，`dart analyze` 与出包闸门都要显式多跑这一条 |
+| **自迭代插件** | `cd plugins/self_updater && dart test` | 三世时序、工具申报、转储/取回、拒绝生命周期原语（同上，也在插件仓） |
 | 核心 | `cd packages/tree_core && dart test` | 存储 / LLM 循环 / 工具 / 团队 / Spec / MCP / 插件 / REST+WS 端到端 |
 | 核心真进程 | `cd packages/tree_core_cli && dart test` | 编译产物能起、握手、鉴权、优雅退出（需 `TREE_CORE_EXE`） |
 | 前端 | `flutter test`（仓库根） | 组件与 API 客户端 |
@@ -153,7 +161,7 @@ cd packages/tree_core_cli; dart test test/binary_smoke_test.dart
 
 ```powershell
 # 先产出两份二进制（缺了它们核心自动回退内置 dartssh2，功能不变）
-dart run tool/build_ssh_plugin.dart     # → build/plugins/tree_ssh_executor[.exe]
+dart run tool/build_plugins.dart --only ssh_executor   # → build/plugins/tree_ssh_executor[.exe]
 dart run tool/build_agent.dart          # → build/agents/tree_agent-linux-{amd64,arm64}
 
 # 目标机：起一个可连的 sshd（本机开发推荐 WSL；脚本见任务留痕 .self/e2e/setup_sshd.sh）
@@ -229,14 +237,14 @@ dart run tool/package_windows.dart --flutter "<flutter.bat 的路径>"
 # 只要核心单文件
 dart run tool/build_core.dart            # → dist/tree_core.exe（约 10 MB）
 
-# SSH 执行器的两份二进制（2026-10-10 新增；缺了它们核心自动回退内置 dartssh2，功能不变）
+# SSH 执行器链路的二进制（缺了中转站核心自动回退内置 dartssh2，功能不变）
 # ⚠ 改了 pubspec 的版本号就**必须重跑这两条**：出包脚本会校验产物里的版本串，不一致直接拒绝出包
-dart run tool/build_ssh_plugin.dart      # → build/plugins/tree_ssh_executor[.exe]（约 10 MB，跑在用户本机）
+dart run tool/build_plugins.dart --only ssh_executor  # → build/plugins/tree_ssh_executor[.exe]（约 10 MB，跑在用户本机）
 dart run tool/build_agent.dart           # → build/agents/tree_agent-linux-{amd64,arm64}（各约 6.5 MB）
                                          #   交叉编译（--target-os/--target-arch，本仓 Dart 3.13.4 实测可用；
                                          #   首次会下载目标端 AOT 产物，约 2 分钟）
 
-# 插件仓（clone 在 `plugins/`）的五个成品 + 发布合同（见 §3.2）
+# 插件仓（clone 在 `plugins/`）的七个成品 + 发布合同（见 §3.2）
 # ⚠ 出包前必须跑：`package_windows.dart` 只按 `build/plugins/plugin-index.json` 拷成品，
 #   索引不在就是“面板上能装、随包却没带”（它会打一行跳过，不会静默）
 dart run tool/build_plugins.dart
@@ -350,10 +358,13 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 
 ## 8. 发布检查单
 
-- [ ] `dart analyze`（6 个 Dart 包 + `tree_core_cli/bin` + `tool/`）+ `flutter analyze lib test` 零告警
-- [ ] 7 个包测试全绿（`tree_protocol` / `tree_tunnel_protocol` / `tree_agent` / `tree_ssh_plugin` /
+- [ ] `dart analyze`（6 个 Dart 包 + `tree_core_cli/bin` + `tool/` + **插件仓 `plugins/`**）
+      + `flutter analyze lib test` 零告警
+      （插件仓是**嵌套 package**，不显式指路径时根上的 analyze 不保证扫到它）
+- [ ] 八个面测试全绿（`tree_protocol` / `tree_tunnel_protocol` / `tree_agent` /
+      **`plugins/ssh_executor`** / **`plugins/self_updater`** /
       `tree_local_exec` / `tree_core` / `tree_core_cli`）+ `flutter test`；数字对照 §6 基线
-- [ ] **出包前先产出两份 SSH 执行器二进制**：`dart run tool/build_ssh_plugin.dart` 与
+- [ ] **出包前先产出中转站的二进制**：`dart run tool/build_plugins.dart --only ssh_executor` 与
       `dart run tool/build_agent.dart`。`package_windows.dart` 会把 `build/plugins/`、
       `build/agents/` 复制进发行目录 —— 产物**缺失**不会报错（只是包内没有中转站、核心自动回退内置
       dartssh2）；产物**版本对不上**则会**直接拒绝出包**（`_verifyBinaryVersion`，2026-10-11 加），
