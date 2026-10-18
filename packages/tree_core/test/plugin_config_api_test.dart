@@ -963,12 +963,22 @@ void main() {
     );
   });
 
-  test('本机带着内置成品时，内置 id 不给覆盖：400 + 原因，文件与条目都不动', () async {
-    // 判据是“本机有没有那一件”，不是“清单里有没有这一条”（2026-10-18 改）——
-    // 而 setUp 正好写了 `tree_sample.exe`，这一条就是在钉那个“在”的场景。
+  test('自己那件成品自己可更新：内置 id 从 release 覆盖自己 ⇒ 200，文件真的被换掉', () async {
+    // A+（2026-10-18）：保护规则收窄为“不许盖别人的成品，自己的条目自己可更新”。
+    // 旧规则按 id 一刀切（`shipsOwnArtifact` 命中就 400）——本机带着 tree_sample.exe 时
+    // 连“从仓库更新自己”都被挡死，而那是缺成品的内置项唯一的启用路径。这里同时钉两道
+    // 改动：`_readEntry` 的归属例外（target = 自己那件成品 ⇒ 列得出来）+ 400 拦截已删。
+    final String target = BuiltinPluginCatalog.binaryFileName(
+      BuiltinPluginCatalog.specOf(kSamplePluginId)!,
+      isWindows: Platform.isWindows,
+    );
     final _Repo repo = _Repo();
-    repo.assets['fake_plugin.dart'] = File(script).readAsBytesSync();
-    repo.publish(plugins: <Map<String, dynamic>>[releaseEntry(id: 'sample')]);
+    repo.assets[target] = File(script).readAsBytesSync();
+    repo.publish(
+      plugins: <Map<String, dynamic>>[
+        releaseEntry(id: kSamplePluginId, target: target),
+      ],
+    );
     final ({CoreServer server, _Client client, PluginBus bus}) ctx =
         await serve(
           'enabled: true\nplugins: []\n',
@@ -978,26 +988,43 @@ void main() {
       ctx.client.close();
       await ctx.server.close();
     });
-    final _Res res = await ctx.client.send(
+
+    final _Res first = await ctx.client.send(
       'POST',
-      '/api/plugin/release/sample/install',
+      '/api/plugin/release/$kSamplePluginId/install',
     );
-    expect(res.status, 400);
-    expect(res.detail, contains('本机已带着核心内置的那一份成品'));
+    expect(first.status, 200, reason: first.detail);
     expect(
-      File(p.join(pluginDir, 'fake_plugin.dart')).existsSync(),
-      isFalse,
-      reason: '拒绝发生在任何磁盘动作之前',
+      File(p.join(pluginDir, target)).readAsStringSync(),
+      isNot('placeholder'),
+      reason: '自己那件成品被自己这一版真的换掉（setUp 写的占位内容没了）',
     );
-    expect(diskPlugins(), isEmpty);
+    expect(diskPlugins().single['repo_version'], '1.2.0');
+
+    // 再装一版（“从仓库更新”的常态）：刷新索引 → 同一个 id 再装 ⇒ 仍 200。
+    repo.publish(
+      plugins: <Map<String, dynamic>>[
+        releaseEntry(id: kSamplePluginId, target: target, version: '1.3.0'),
+      ],
+    );
+    expect(
+      (await ctx.client.send('POST', '/api/plugin/release/refresh')).status,
+      200,
+    );
+    final _Res second = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/$kSamplePluginId/install',
+    );
+    expect(second.status, 200, reason: second.detail);
+    expect(diskPlugins().single['repo_version'], '1.3.0');
   });
 
   test('内置 id 但本机没带它的成品 ⇒ 从 release 装得进来，而装完不会被自己锁死', () async {
     // 这一条是“插件成品不再随包”能不能真的跑通的钥匙。旧判据（清单里有这条就拒）
     // 在新装机上会把这几条内置项变成“既开不了（没有 exe）又装不上（被内置身份挡住）”
     // 的坏死条目 —— 而面板上只看得见一个弹不开的开关。
-    // 另外钉一件事：**装进来之后还能再装**（随包成品与 release 成品住在同一个目录，
-    // 只看“文件在不在”会把上一次刚装好的那条也变成受保护 ⇒ 从此自己锁死自己）。
+    // 另外钉一件事：**装进来之后还能再装**（A+ 起归属按 id 判，自己的条目自己可更新；
+    // 这里的 target 是 fake_plugin.dart，不撞任何内置成品名，走的是最普通的那条路）。
     File(p.join(pluginDir, 'tree_sample.exe')).deleteSync(); // 模拟“不随包”的新装机
     final _Repo repo = _Repo();
     repo.assets['fake_plugin.dart'] = File(script).readAsBytesSync();
@@ -1025,10 +1052,10 @@ void main() {
     expect(
       diskPlugins().single['source'],
       'release',
-      reason: '来源标了 release ⇒ 下一次它不算“核心自带的那一份”',
+      reason: '来源标了 release：纯展示键（面板用它答“从哪装的、哪一版”），行为不读它',
     );
 
-    // 再装一次：文件已在（上一次装的），但来源是 release ⇒ 仍必须装得进来。
+    // 再装一次：文件已在（上一次装的）⇒ 仍必须装得进来（“自己的条目自己可更新”）。
     // 中间必须**刷新索引**：下载器读的是缓存那一份，不刷新就装回 1.2.0，
     // 看上去“能重装”其实测的是“缓存里那一版”。
     repo.publish(
@@ -1047,8 +1074,9 @@ void main() {
   });
 
   test('索引想把 plugins/ 里的内置成品盖掉 ⇒ 列表当场跳过，install 拿不到这一条', () async {
-    // 与上一条不同的防线：上一条管“id 撞内置”，这一条管“**文件名**撞内置”。
-    // plugins/ 里放的是插件源码与随包成品，两者靠文件名区分 ⇒ 发布仓库只能装自己的成品。
+    // 文件名这道防线的“不许盖别人的成品”那一半：上一条钉的是 id 是**自己**时放行
+    // （归属例外），这一条钉 id 是**别人**时照样整条跳过 —— plugins/ 里的源码与成品
+    // 靠文件名区分，谁也不许拿一个外来 id 把 tree_sample.exe 盖掉。
     final _Repo repo = _Repo();
     // 受保护名按**本机口径**算（下载器读的就是这一份集合）：写死一个平台名
     // 就会在另一个平台上假绿。

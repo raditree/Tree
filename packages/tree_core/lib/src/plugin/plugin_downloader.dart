@@ -339,21 +339,19 @@ class PluginDownloader {
   /// 测试注入的覆盖（null = 用本机事实算，见 [protectedFileNames]）。
   final Set<String> Function()? protectedOverride;
   
-  /// **本机不许被发布仓库覆盖的文件名**（按两个事实算，不按静态清单猜）。
+  /// **本机哪些成品文件名归哪个内置 id 所有**（别人不许盖；按本机事实算，不按静态清单猜）。
   ///
-  /// 2026-10-18 的口径变化（以前是 `BuiltinPluginCatalog.protectedFileNames()` 从清单推）：
-  /// 插件成品不再随包之后，“清单项 = 随包成品”不成立，那张表会把**本机根本没有的文件**
-  /// 当成受保护名 ⇒ 这些内置 id 从 release 永远装不上，而它们在面板上又开不了 ——
-  /// 保护做过头，条目就彻底坏死。所以判据改成两个事实的**合取**：
+  /// 判据（2026-10-18 A+ 再收窄）：`installDir/<文件名>` 确实存在 ⇒ 本机带着这件成品，
+  /// 名字就归清单里那个内置 id。**不再读 `source: release` 豁免**——release 装过之后
+  /// `tree_sample.exe` 这个名字仍归 `sample`，**别人**照旧不许盖（“不许盖别人的成品”）；
+  /// 旧豁免反而让“上一次从仓库装的”对所有第三方敞开，挡错了对象。
   ///
-  /// 1. `installDir/<文件名>` 确实存在 ⇒ 本机带着这一份成品；
-  /// 2. 该 id 的条目**没打过 `source: release`** ⇒ 它是内置随包的那一份，不是上一次从
-  ///    仓库装的。**这一半不能省**：随包成品与装进来的成品住在**同一个目录**，只看
-  ///    “文件在不在”会把上一次刚装好的那条也变成受保护 ⇒ 从此它自己再也更新不了
-  ///    （那是把保护做成死锁，而表现是“更新按下去没反应”）。
+  /// “自己的条目自己可更新”在 [_readEntry] 的**归属例外**里：`target` 正是这个 id
+  /// 自己的成品名（`binaryFileName(specOf(id))`）⇒ 放行。旧实现的另一半拦截
+  /// （`_installPluginRelease` 按 `shipsOwnArtifact` 对内置 id 一律 400）已随之删除：
+  /// 它把“从仓库更新自己”一起挡死，而那是缺成品的内置项唯一的启用路径。
   ///
-  /// 两条防线各管一面，别混淆：这一条管**文件名**（不撞内置 id 也能把 `tree_sample.exe`
-  /// 盖掉）；`_installPluginRelease` 里的“撞内置 id”是另一条，两者现在共用这一份事实。
+  /// 文件不存在 ⇒ 不进名单（插件成品不再随包：本机没有的文件谈不上被盖）。
   Set<String> protectedFileNames() {
     final Set<String> Function()? injected = protectedOverride;
     if (injected != null) return injected();
@@ -366,34 +364,12 @@ class PluginDownloader {
         isWindows: windows,
       );
       if (!File(p.join(installDir, fileName)).existsSync()) continue;
-      // 上一次从 release 装的那一份 ⇒ 不算随包，允许再装（否则它自己锁死自己）。
-      final Object? source = installedReader(spec.id)?[kRepoSourceKey];
-      if (source == kRepoSourceValue) continue;
       names.add(fileName);
     }
     return names;
   }
 
   final void Function(String message)? log;
-
-  /// 这条内置 id 在本机是否已有“核心自带的那一份成品”（`POST /release/{id}/install` 的判据）。
-  ///
-  /// 为什么住在这里而不是路由层：它要用的平台口径与受保护名是**同一件事**（见
-  /// [protectedFileNames]）。路由层自己再拼一次 `binaryFileName(…, isWindows: Platform.isWindows)`
-  /// 就是第二套判断 —— 不注入 isWindows 的用例在别的平台上会**假绿**（保护面算 `.exe`、
-  /// 查的名字不带 `.exe`，两边对不上谁也不报错）。
-  bool shipsOwnArtifact(String id) {
-    final BuiltinPluginSpec? spec = BuiltinPluginCatalog.specOf(id.trim());
-    if (spec == null || spec.kind != BuiltinPluginSpec.kindBinary) return false;
-    // 受保护名本身已尊重注入（[protectedFileNames] 开头那行），这里不再分叉；
-    // 只把名字按**同一个平台口径**拼出来去查它。
-    return protectedFileNames().contains(
-      BuiltinPluginCatalog.binaryFileName(
-        spec,
-        isWindows: isWindows ?? Platform.isWindows,
-      ),
-    );
-  }
 
   // ── 卸载：算要删哪些文件 + 真删 ────────────────────────────────────────
 
@@ -727,6 +703,15 @@ class PluginDownloader {
     }
     final List<PluginRepoFile> files = <PluginRepoFile>[];
     final Set<String> reserved = protectedFileNames();
+    // 归属例外（A+）：这个 id 自己的那件成品名 —— “自己的条目自己可更新”靠它放行。
+    final BuiltinPluginSpec? ownSpec = BuiltinPluginCatalog.specOf(id);
+    final String ownArtifact =
+        ownSpec != null && ownSpec.kind == BuiltinPluginSpec.kindBinary
+        ? BuiltinPluginCatalog.binaryFileName(
+            ownSpec,
+            isWindows: isWindows ?? Platform.isWindows,
+          )
+        : '';
     for (final Object? item in rawFiles) {
       if (item is! Map) {
         return (entry: null, error: '$id 的 files 里有一项不是对象（要 {asset, target}）');
@@ -743,13 +728,15 @@ class PluginDownloader {
       if (target != p.basename(target) || p.isAbsolute(target)) {
         return (entry: null, error: '$id 的目标名「$target」不是纯文件名（不许含路径或绝对路径）');
       }
-      // 也不能拿它盖住随包的插件源码与成品（它们同在一个 plugins/ 里，靠文件名区分）。
-      if (reserved.contains(target)) {
+      // 也不能拿它盖住 plugins/ 里的插件源码与成品（它们同在一个 plugins/ 里，靠文件名区分）。
+      // 归属按 **id** 判：撞的名字是这个 id 自己的那件成品 ⇒ 放行（自己的条目自己可
+      // 更新，覆盖自己 = 从仓库更新）；撞的是**别人**的成品才拒（不许盖别人的成品）。
+      if (reserved.contains(target) && target != ownArtifact) {
         return (
           entry: null,
           error:
               '$id 的目标名「$target」是核心内置插件随包的文件：'
-              '发布仓库只装自己的成品，不盖 plugins/ 里的插件源码',
+              '不盖 plugins/ 里的插件源码（自己的 id 装自己的成品才放行）',
         );
       }
       files.add(

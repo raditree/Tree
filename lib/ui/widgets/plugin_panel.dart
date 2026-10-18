@@ -281,6 +281,12 @@ class _PluginPanelState extends State<PluginPanel> {
   /// 正在拉索引（拉期间禁用刷新按钮，避免连点叠成两个请求）。
   bool _releaseLoading = false;
 
+  /// 「从仓库装它 / 从仓库更新」的**就地**失败原因（id → 原因）。
+  ///
+  /// 与 release 那一节的 snack 不同：这颗按钮长在卡片上，失败就必须显示在卡片上 ——
+  /// 刷新失败、索引里没有这一条、安装被闸门拦住都算，成功或重试时清掉。
+  final Map<String, String> _repoErrors = <String, String>{};
+
   @override
   void initState() {
     super.initState();
@@ -433,6 +439,76 @@ class _PluginPanelState extends State<PluginPanel> {
 
   static String _reasonOf(Object error) =>
       '$error'.replaceFirst('Exception: ', '');
+
+  /// 内置项的「从仓库装它 / 从仓库更新」：**先自动刷新索引，再 install**。
+  ///
+  /// 与 release 那一节的手动按钮不同，这颗按钮是“缺成品”场景的就地入口 —— 用户不该
+  /// 先去下面那一节点「刷新」再找这一条。失败原因写进 [_repoErrors]（卡片上直接显示，
+  /// 不只是一条转瞬即逝的 snack）：刷新失败、索引里没有这一条、安装被闸门拦住都算。
+  Future<void> _installFromRepo(String id) async {
+    setState(() {
+      _busy.add(id);
+      _repoErrors.remove(id);
+    });
+    try {
+      // ① 先刷新：装机端要的是**最新索引**（缓存那份可能还没有这一条，或版本旧）。
+      final Map<String, dynamic> refreshed = await _admin.refreshRelease();
+      _applyReleaseListing(refreshed);
+      final String refreshError = (refreshed['error'] ?? '').toString();
+      if (refreshed['ok'] == false) {
+        // 刷新失败不清空条目：核心把上一次那份递在 cached 里，里面**有**这一条
+        // 就还能装（“今晚限流”不该变成“什么都装不了”）。
+        final Object? cached = refreshed['cached'];
+        if (cached is Map) {
+          _applyReleaseListing(
+            Map<String, dynamic>.from(cached),
+            keepError: refreshError,
+          );
+        }
+      }
+      // ② 索引里没有这一条（仓库还没发 / 刷新后仍是旧索引）⇒ 就地说明，不发 install。
+      final bool known = _releaseEntries.any(
+        (Map<String, dynamic> e) =>
+            (e['plugin_id'] ?? '').toString() == id,
+      );
+      if (!known) {
+        setState(() {
+          _repoErrors[id] = refreshError.isEmpty
+              ? '索引里没有 $id 这一条（发布仓库还没发它，或刷新后仍是旧索引）'
+              : '刷新索引失败：$refreshError（缓存里也没有 $id 这一条）';
+        });
+        return;
+      }
+      // ③ install（核心失败会抛成带原因的异常，下面 catch 里就地显示）。
+      final Map<String, dynamic> result = await _admin.installRelease(id);
+      setState(() => _repoErrors.remove(id));
+      final Object? install = result['install'];
+      final String version = install is Map
+          ? (install['version'] ?? '').toString()
+          : '';
+      _showWriteResult(
+        result,
+        successText: version.isEmpty
+            ? '已从发布仓库安装 $id'
+            : '已从发布仓库安装 $id（$version）',
+      );
+      await _loadAdmin();
+      await _svc.refresh();
+    } catch (error) {
+      final String reason = _reasonOf(error);
+      if (!mounted) return;
+      setState(() => _repoErrors[id] = reason);
+    } finally {
+      if (mounted) setState(() => _busy.remove(id));
+    }
+  }
+
+  /// 从仓库装/更新成功后的重拉（清单 + 快照：新版本立刻反映在卡片上）。
+  /// 详情页的仓库按钮装完也走这里（页面自己不持有面板状态）。
+  Future<void> _reloadAfterRepoInstall() async {
+    await _loadAdmin();
+    await _svc.refresh();
+  }
 
   /// 自定义插件：落盘条目里没有 builtin 标记、且**不属于内置清单**的那些。
   ///
@@ -617,6 +693,8 @@ class _PluginPanelState extends State<PluginPanel> {
         instance: _instanceOf(id),
         stations: _allStations,
         onOpenStation: _openStationDetail,
+        admin: _admin,
+        onInstalled: _reloadAfterRepoInstall,
       ),
     );
   }
@@ -1132,13 +1210,31 @@ class _PluginPanelState extends State<PluginPanel> {
           if (!resolvable)
             // 2026-10-18：插件成品不再随安装包（只由 tree-plugins 的 release 提供），
             // 所以“解析不到”是新装机的**常态**而不是故障。上面那行只说“运行时未就绪：
-            // 在 … 找不到 tree_xxx.exe”，读起来像坏了；这一行把用户引到他真能动手的地方
-            // ——本面板下面的「从发布仓库更新」。两条都留着：原始错误是诊断信息（它列了
-            // 查找路径），不能拿指引替掉它。
+            // 在 … 找不到 tree_xxx.exe”，读起来像坏了；这一行把用户引到他真能动手的
+            // 地方——就地这颗「从仓库装它」（A+ 起按钮就在卡片上，不用再去下面那一节）。
+            // 两条都留着：原始错误是诊断信息（它列了查找路径），不能拿指引替掉它。
             Text(
-              '本机还没有这一份成品 · 到下面「从发布仓库更新」装它（装完回来再打开开关）',
+              '本机还没有这一份成品 · 点「从仓库装它」（装完回来再打开开关）',
               key: Key('plugin-builtin-needs-repo-$id'),
               style: TextStyle(fontSize: 11, color: cs.tertiary),
+            ),
+          // A+：同一颗按钮两种文案 —— 缺成品「从仓库装它」、已装/有更新「从仓库更新」。
+          // 点它先自动刷新索引再 install；失败原因**就地**显示在这张卡上（不只 snack）。
+          TextButton(
+            key: Key('plugin-builtin-repo-$id'),
+            onPressed: _busy.contains(id) ? null : () => _installFromRepo(id),
+            child: Text(
+              _busy.contains(id)
+                  ? '正在处理…'
+                  : (resolvable ? '从仓库更新' : '从仓库装它'),
+              style: const TextStyle(fontSize: 12),
+            ),
+          ),
+          if (_repoErrors.containsKey(id))
+            Text(
+              _repoErrors[id]!,
+              key: Key('plugin-builtin-repo-error-$id'),
+              style: TextStyle(fontSize: 11, color: cs.error),
             ),
           if (configured)
             Text(

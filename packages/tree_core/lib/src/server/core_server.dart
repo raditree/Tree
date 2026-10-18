@@ -4270,9 +4270,12 @@ class CoreServer {
   /// POST /api/plugin/release/{pluginId}/install：从发布仓库装一条插件。
   ///
   /// 三段顺序不能反：
-  /// 1. **先挡住内置 id**（在任何磁盘动作之前）：发布条目不能盖掉内置项，否则面板
-  ///    上会出现“既被内置开关管、又被发布仓库管”的双主条目（内置开关一按就会把
-  ///    command 写回随包那一份）——取保守侧：不装，并说清为什么；
+  /// 1. **先过索引的归属防线**（在任何磁盘动作之前）：`files[].target` 撞上本机已有的
+  ///    内置成品、又不是这个 id 自己那件 ⇒ 整条进 skipped，install 拿不到它
+  ///    （“不许盖别人的成品”，在 `_readEntry` 里拦）。反向的“自己的条目自己可更新”
+  ///    由同一处的归属例外放行 —— 2026-10-18 A+ 删掉了这里按 `shipsOwnArtifact`
+  ///    对内置 id 一律 400 的拦截：它把“从仓库更新自己”一起挡死，而那是缺成品的
+  ///    内置项唯一的启用路径；
   /// 2. 装（资产进缓存 → 闸门 → 原子改名）：失败回 **400 + 可读原因**，旧文件一个
   ///    都没动（面板把这句话直接给用户看）；
   /// 3. 成功才写 plugins.yaml 并热应用（启用 = 拉起新版）。
@@ -4296,27 +4299,6 @@ class CoreServer {
     final String id = (params['pluginId'] ?? '').trim();
     final PluginConfigStore store = _pluginStore(bus);
     final Map<String, dynamic>? existing = store.readEntry(id);
-    // 判据（**2026-10-18 改**）：内置 id 只有在“本机确实带着它那一份成品、而且那一份
-    // 不是上一次从 release 装的”时候才归内置开关管 —— 那时发布仓库再装 = 两个主人抢
-    // 同一条目（开关一按就把 command 写回随包那一份）。
-    //
-    // 旧判据是“清单里有这一条就拒”（不看条目在不在、也不看文件在不在）。插件成品不再
-    // 随包之后它正好会锁死自己：这些条目既开不了（没有 exe）又装不上（被内置身份挡住），
-    // 而“从仓库更新”是它们唯一的启用路径。现在两道防线共用同一份事实
-    //（[PluginDownloader.protectedFileNames]），不留第二套判断。
-    final bool builtinClash = downloader.shipsOwnArtifact(id);
-    if (builtinClash) {
-      await writeJson(
-        request,
-        400,
-        errorBody(
-          '插件 $id 本机已带着核心内置的那一份成品（内置项只走内置开关）：'
-          '发布仓库不提供覆盖安装，否则两个开关会抢同一条目。'
-          '要换这一条的版本请用内置开关；发布仓库请改用自定义 id',
-        ),
-      );
-      return;
-    }
     final PluginInstallResult install = await downloader.install(
       id,
       swapGate: bus.quiesceForSwap,

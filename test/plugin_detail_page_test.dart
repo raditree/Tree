@@ -1,7 +1,8 @@
 // 插件 / 站点**详情页**的 widget 用例：卡片点进去能看到什么、写操作发的是什么请求。
 //
 // 这一层锁的是"界面上讲的话"与"界面发出去的形状"：
-// - 插件页只读（介绍、工具、它建的/它订阅的站点），所以断言的是渲染而不是请求；
+// - 插件页只读（介绍、工具、它建的/它订阅的站点）+ A+ 起的发布仓库安装按钮
+//   （断言 refresh → install 的顺序与就地失败原因）；
 // - 站点页有写操作，所以断言的是 **PATCH / POST 的 body 形状**（禁用订阅者发的是
 //   `disabled: true` 而不是"退订"；改配置发的类型不能把 int 变成 "8"）；
 // 核心侧的落盘与判定规则由 packages/tree_core/test/plugin_api_test.dart 锁住。
@@ -59,12 +60,15 @@ class _FakeAdmin implements PluginAdminClient {
     ],
   };
 
+  /// 内置目录响应（可赋值：用例用它换 resolution，钉按钮的第二种文案「从仓库更新」）。
+  Map<String, dynamic> builtinsResponse = _builtins();
+
   @override
   Future<Map<String, dynamic>> fetchConfigs() async => configsResponse;
 
   @override
   Future<Map<String, dynamic>> fetchBuiltins({bool refresh = false}) async =>
-      _builtins();
+      builtinsResponse;
 
   @override
   Future<Map<String, dynamic>> createConfig(Map<String, dynamic> body) async =>
@@ -126,7 +130,19 @@ class _FakeAdmin implements PluginAdminClient {
     return stationResponses[stationId]!;
   }
 
-  // ── 发布仓库（阶段 5）：详情页不拉它，但接口要求实现 ⇒ 给最简的假面 ──────
+  // ── 发布仓库：详情页的「从仓库装它 / 从仓库更新」（A+）──────────────────
+
+  /// 刷新的返回体（null = 没有索引的旧口径回包：ok:false「没有缓存」+ 空条目）。
+  Map<String, dynamic>? refreshResponse;
+
+  /// 刷新没成功时核心附上的“上一次那份”（里面**有**这一条就还能装）。
+  Map<String, dynamic>? refreshCached;
+
+  /// install 的返回体（形状 = 核心回包里的 install 段，用来钉成功话术里的版本号）。
+  Map<String, dynamic> installResponse = <String, dynamic>{
+    'ok': true,
+    'install': <String, dynamic>{'ok': true, 'plugin_id': 'sample', 'version': '1.2.0'},
+  };
 
   @override
   Future<Map<String, dynamic>> fetchRelease() async => <String, dynamic>{
@@ -136,17 +152,23 @@ class _FakeAdmin implements PluginAdminClient {
   };
 
   @override
-  Future<Map<String, dynamic>> refreshRelease() async => <String, dynamic>{
-    'ok': false,
-    'error': '没有缓存',
-    'entries': <dynamic>[],
-  };
+  Future<Map<String, dynamic>> refreshRelease() async {
+    calls.add('release:refresh');
+    return <String, dynamic>{
+      ...(refreshResponse ?? <String, dynamic>{
+        'ok': false,
+        'error': '没有缓存',
+        'entries': <dynamic>[],
+      }),
+      if (refreshCached != null) 'cached': refreshCached,
+    };
+  }
 
   @override
   Future<Map<String, dynamic>> installRelease(String id) async {
     calls.add('release-install:$id');
     if (failWrite.isNotEmpty) throw Exception(failWrite);
-    return <String, dynamic>{'ok': true};
+    return installResponse;
   }
 }
 
@@ -694,6 +716,194 @@ void main() {
       find.descendant(of: detail, matching: find.text('来源')),
       findsNothing,
       reason: '没有来源键就整行不渲染：显示一个空值会被当成 bug',
+    );
+  });
+
+  // ── A+：详情页的「从仓库装它 / 从仓库更新」────────────────────────────
+
+  /// 一条索引条目（键与核心 `PluginRepoEntry.toJson()` 一致）。
+  Map<String, dynamic> releaseEntry({String id = 'sample'}) =>
+      <String, dynamic>{
+        'plugin_id': id,
+        'name': '示例插件',
+        'version': '1.2.0',
+        'installed_version': '',
+        'has_update': true,
+        'runtime': 'binary',
+      };
+
+  testWidgets('详情页发布仓库：缺成品给「从仓库装它」，点了先刷新索引再 install', (
+    WidgetTester tester,
+  ) async {
+    // 默认夹具 resolution.ok=false（本机没装 Python）⇒ needsArtifact ⇒ 装它。
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    )..refreshResponse = <String, dynamic>{
+      'ok': true,
+      'error': '',
+      'tag': 'v0.1.0',
+      'online': true,
+      'index_path': 'C:/data/plugins_release/plugin-index.json',
+      'entries': <dynamic>[releaseEntry()],
+      'skipped': <dynamic>[],
+    };
+    await _pump(tester, svc: await _service(), admin: admin);
+
+    await tester.tap(find.byKey(const Key('plugin-detail-builtin-sample')));
+    await tester.pumpAndSettle();
+
+    final Finder detail = find.byType(PluginDetailPage);
+    expect(find.text('发布仓库'), findsOneWidget);
+    final Finder button = find.byKey(const Key('plugin-detail-repo-sample'));
+    expect(
+      find.descendant(of: detail, matching: button),
+      findsOneWidget,
+      reason: '详情页是缺成品时的第二个入口（卡片在面板上，详情页就地也能装）',
+    );
+    expect(find.descendant(of: detail, matching: find.text('从仓库装它')), findsOneWidget);
+
+    await tester.tap(button);
+    await tester.pumpAndSettle();
+
+    expect(admin.calls, contains('release:refresh'), reason: '先自动刷新索引');
+    expect(admin.calls, contains('release-install:sample'), reason: '索引里有这一条 ⇒ 接着 install');
+    expect(
+      admin.calls.indexOf('release:refresh'),
+      lessThan(admin.calls.indexOf('release-install:sample')),
+      reason: '顺序必须是 refresh → install（装机端要的是最新索引）',
+    );
+    expect(
+      find.text('已从发布仓库安装 sample（1.2.0）'),
+      findsOneWidget,
+      reason: '装了哪一版要说出来',
+    );
+    expect(
+      find.byKey(const Key('plugin-detail-repo-error-sample')),
+      findsNothing,
+      reason: '成功后不该还挂着错误',
+    );
+  });
+
+  testWidgets('详情页发布仓库：成品在 ⇒ 同一颗按钮显示「从仓库更新」', (
+    WidgetTester tester,
+  ) async {
+    final Map<String, dynamic> resolvable = _FakeAdmin._builtins();
+    (
+      (resolvable['builtins'] as List<dynamic>).single as Map<String, dynamic>
+    )['resolution'] = <String, dynamic>{
+      'ok': true,
+      'command': 'C:/app/plugins/tree_sample.exe',
+      'script_path': '',
+    };
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    )..builtinsResponse = resolvable;
+    await _pump(tester, svc: await _service(), admin: admin);
+
+    await tester.tap(find.byKey(const Key('plugin-detail-builtin-sample')));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.descendant(
+        of: find.byType(PluginDetailPage),
+        matching: find.text('从仓库更新'),
+      ),
+      findsOneWidget,
+      reason: '已装/有更新时同一颗按钮换文案（不消失：它就是更新入口）',
+    );
+  });
+
+  testWidgets('详情页发布仓库：索引里没有这一条 ⇒ 就地显示原因，不发 install', (
+    WidgetTester tester,
+  ) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    )..refreshResponse = <String, dynamic>{
+      'ok': true,
+      'error': '',
+      'tag': 'v0.1.0',
+      'online': true,
+      'index_path': 'C:/data/plugins_release/plugin-index.json',
+      'entries': <dynamic>[], // 刷新成功了，但索引里没有 sample
+      'skipped': <dynamic>[],
+    };
+    await _pump(tester, svc: await _service(), admin: admin);
+
+    await tester.tap(find.byKey(const Key('plugin-detail-builtin-sample')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('plugin-detail-repo-sample')));
+    await tester.pumpAndSettle();
+
+    expect(admin.calls, contains('release:refresh'));
+    expect(
+      admin.calls,
+      isNot(contains('release-install:sample')),
+      reason: '索引里没这一条时 install 必然失败，就地说明比发一次注定失败的请求好',
+    );
+    expect(
+      find.byKey(const Key('plugin-detail-repo-error-sample')),
+      findsOneWidget,
+      reason: '失败原因就地显示在按钮下方（不只是一条转瞬即逝的 snack）',
+    );
+    expect(find.textContaining('索引里没有 sample 这一条'), findsOneWidget);
+  });
+
+  testWidgets('详情页发布仓库：install 被核心拒绝 ⇒ 原因就地显示', (
+    WidgetTester tester,
+  ) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    )
+      ..refreshResponse = <String, dynamic>{
+        'ok': true,
+        'error': '',
+        'tag': 'v0.1.0',
+        'online': true,
+        'index_path': 'C:/data/plugins_release/plugin-index.json',
+        'entries': <dynamic>[releaseEntry()],
+        'skipped': <dynamic>[],
+      }
+      ..failWrite = '插件 sample 的进程还没确认退出 ⇒ 这次不替换文件，旧文件一个都没动';
+    await _pump(tester, svc: await _service(), admin: admin);
+
+    await tester.tap(find.byKey(const Key('plugin-detail-builtin-sample')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('plugin-detail-repo-sample')));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byKey(const Key('plugin-detail-repo-error-sample')),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining('旧文件一个都没动'),
+      findsOneWidget,
+      reason: '核心那句话得原样递到用户眼前（“现在换不了”与“换坏了”是两回事）',
+    );
+  });
+
+  testWidgets('自定义插件详情页不渲染发布仓库区块（那是内置项缺成品的入口）', (
+    WidgetTester tester,
+  ) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    );
+    await _pump(tester, svc: await _service(), admin: admin);
+
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-demo')));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.descendant(
+        of: find.byType(PluginDetailPage),
+        matching: find.text('发布仓库'),
+      ),
+      findsNothing,
+      reason: '自定义插件没有“缺成品”这一说（它的命令是用户自己填的）',
+    );
+    expect(
+      find.byKey(const Key('plugin-detail-repo-demo')),
+      findsNothing,
     );
   });
 }

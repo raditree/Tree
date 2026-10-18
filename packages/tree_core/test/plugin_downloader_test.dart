@@ -385,7 +385,8 @@ void main() {
     });
 
     test('目标名撞上随包的内置插件成品 ⇒ 跳过，install 也拿不到它', () async {
-      // 「plugins/ 里是插件代码」的另一面：发布仓库只能装自己的成品。
+      // 「plugins/ 里是插件代码」的另一面：不许盖别人的成品（A+：归属按 id 判，
+      // 这条索引的 id 是外来的 `overwrite_builtin`，名字却归 `sample` ⇒ 照样拦）。
       // 一条把 target 写成 `tree_sample[.exe]` 的索引，本来能把核心自带的成品盖掉，
       // 而现象是“示例插件突然起不来”——归因要翻到一份远端 JSON 里去了。
       // 名字按本机口径算（Windows 上补 .exe）：写死一个平台名就会在另一个平台上假绿。
@@ -393,10 +394,9 @@ void main() {
         BuiltinPluginCatalog.specOf(kSamplePluginId)!,
         isWindows: Platform.isWindows,
       );
-      // 本机确实带着这一份随包成品。这一句是 **2026-10-18 的判据变化**带来的：
-      // 受保护名不再从静态清单推，而是看“文件在不在 + 它是不是上一次从 release 装的”。
-      // 新装机上插件成品不随包 ⇒ 这一份不存在 ⇒ 不拦（那条路见
-      // `plugin_config_api_test.dart` 的「内置 id 但本机没带它的成品 ⇒ 从 release 装得进来」）；
+      // 本机确实带着这一份成品（保护名单只收**本机存在**的：插件成品不再随包，
+      // 本机没有的文件谈不上被盖）；新装机场景见 `plugin_config_api_test.dart`
+      // 的「内置 id 但本机没带它的成品 ⇒ 从 release 装得进来」。
       // 所以“拦得住”的夹具必须自己把文件摆上，否则这条用例测的就不是它声称的那件事。
       File(p.join(installDir, builtinName)).writeAsStringSync('MZ shipped');
       putAsset(builtinName);
@@ -442,6 +442,51 @@ void main() {
         shipped.readAsStringSync(),
         'MZ shipped',
         reason: '被跳过的条目一个字节都不许盖掉它（真盖掉就是“示例插件突然起不来”）',
+      );
+    });
+
+    test('target 是这个 id 自己那件成品 ⇒ 放行（自己的条目自己可更新）', () async {
+      // 与上一条同一份事实的另一半：撞的名字归 `sample`，而这条索引的 id 就是
+      // `sample` 自己 ⇒ 覆盖自己 = 从仓库更新，不许拦（A+ 收窄保护规则的正向钉子）。
+      final String builtinName = BuiltinPluginCatalog.binaryFileName(
+        BuiltinPluginCatalog.specOf(kSamplePluginId)!,
+        isWindows: Platform.isWindows,
+      );
+      File(p.join(installDir, builtinName)).writeAsStringSync('MZ shipped');
+      putAsset(builtinName);
+      repo.publish(
+        plugins: <Map<String, dynamic>>[
+          _entry(
+            id: kSamplePluginId,
+            command: builtinName,
+            files: <Map<String, dynamic>>[
+              <String, dynamic>{
+                'asset': builtinName,
+                'target': builtinName,
+                'bytes': 8,
+              },
+            ],
+          ),
+        ],
+      );
+      final PluginDownloader d = downloader();
+      final PluginReleaseListing listing = await d.refresh();
+      expect(listing.ok, isTrue, reason: listing.error);
+      expect(
+        listing.entries.single.id,
+        kSamplePluginId,
+        reason: '列得出来才谈得上“从仓库更新自己”（被跳过 = install 也拿不到）',
+      );
+      expect(listing.skipped, isEmpty);
+      final PluginInstallResult result = await d.install(
+        kSamplePluginId,
+        swapGate: allowSwap,
+      );
+      expect(result.ok, isTrue, reason: result.error);
+      expect(
+        File(p.join(installDir, builtinName)).readAsStringSync(),
+        isNot('MZ shipped'),
+        reason: '自己那件成品被自己这一版真的换掉',
       );
     });
   });

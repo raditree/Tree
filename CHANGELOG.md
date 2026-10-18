@@ -39,6 +39,22 @@
   install 挂住不返回）。现在按 `staleWindow + interval`（由判活参数派生）加第三条腿，
   到期回可读拒绝、**照样不 kill**——D8 拦的是“按时长杀进程”，不是“按时长放弃等待”。
 
+- **保护规则收窄为「不许盖别人的成品，自己的条目自己可更新」；`source` 回归纯展示键**
+  （**修改** [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md)
+  不变量 29：原「内置 id 只在本机带着它那一份成品时不给覆盖」+「随包的文件名也不给盖」
+  两条款）：归属改按 **id** 判 —— `_readEntry` 里 `files[].target` 撞上 `protectedFileNames()`
+  （本机存在的内置成品名）时，只有 `target` 正是这个 id 自己那件成品才放行，撞的是
+  别人的才整条跳过。旧判据的两半各挡错了对象：`source: release` 豁免让 release 装过的
+  文件对所有第三方敞开（挡轻了），`shipsOwnArtifact(id)` 对内置 id 一律 400 把“从仓库
+  更新自己”挡死（挡重了，而那是缺成品的内置项唯一启用路径）——两者连同 400 拦截一并
+  删除，`source` / `repo_version` 从此任何行为路径都不读（出处：
+  [docs/plugin-development.md](docs/plugin-development.md) 同段口径）。
+
+- **内置项卡片与详情页长出「从仓库装它 / 从仓库更新」按钮**（随不变量 29 收窄而来，
+  同一份断言的界面面）：缺成品时文案「从仓库装它」、已装/有更新时「从仓库更新」；点击
+  **先自动刷新索引再 install**，索引里没有这一条、刷新失败、安装被闸门拦住都把原因
+  **就地**写在按钮下方（不只是一条转瞬即逝的 snack）。
+
 ## [1.0.4+1] — 2026-10-18
 
 ### 断言变化（新增 / 修改的 README 不变量）

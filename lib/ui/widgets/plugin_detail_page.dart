@@ -17,9 +17,10 @@ import 'plugin_panel.dart';
 /// - **站点详情**必须重新 GET 一次：卡片上那份来自 WS 节流的快照（可能滞后），而
 ///   「禁用订阅者 / 改配置」要落在当前真值上；核心给的 404 / 400 原因原样显示。
 ///
-/// 写操作只在站点页（可订阅数量 / 订阅者禁用 / 自定义配置）；插件页**全程只读**——
-/// 改插件配置仍然只走卡片上的「编辑」弹窗（那里有字段校验与拉起进程的安全二次确认），
-/// 两处都能写就会分叉。
+/// 写操作：站点页（可订阅数量 / 订阅者禁用 / 自定义配置）+ 插件页的**发布仓库**
+/// （「从仓库装它 / 从仓库更新」，A+ 起；面板不传 admin 时这一块不渲染，页面退回全只读）。
+/// 除此之外插件页仍然只读——改插件配置走卡片上的「编辑」弹窗（那里有字段校验与
+/// 拉起进程的安全二次确认），两处都能写就会分叉。
 Widget _sectionTitle(BuildContext context, String text) => Text(
   text,
   style: TextStyle(
@@ -211,8 +212,9 @@ String detailScopeText(Map<String, dynamic> scope) {
 
 /// 插件详情页：**这个插件是什么、能做什么、现在怎么样**。
 ///
-/// 不接任何写接口（理由见文件头）。所有数据都由面板已有的两份（清单 + 快照）传入，
-/// 所以本页面不需要新的核心端点，也不会在没有网络的情况下卡住。
+/// 数据都由面板已有的两份（清单 + 快照）传入，所以本页面不需要新的核心端点。
+/// A+ 起唯一的写接口是发布仓库的 install（可选的 [admin] 传入时才渲染「发布仓库」
+/// 区块，失败原因就地显示）；不传 ⇒ 与旧口径一致的全只读页。
 class PluginDetailPage extends StatelessWidget {
   const PluginDetailPage({
     super.key,
@@ -226,6 +228,8 @@ class PluginDetailPage extends StatelessWidget {
     this.instance,
     this.stations = const <PluginStationInfo>[],
     this.onOpenStation,
+    this.admin,
+    this.onInstalled,
   });
 
   /// 插件 id（清单与快照的公共键）
@@ -256,6 +260,12 @@ class PluginDetailPage extends StatelessWidget {
 
   /// 点站点行时跳转（由面板负责 push：页面自己不认识路由）
   final void Function(String stationId)? onOpenStation;
+
+  /// 发布仓库读写通道（非空 ⇒ 内置项渲染「发布仓库」区块；null = 全只读）
+  final PluginAdminClient? admin;
+
+  /// 从仓库装/更新成功后的回调（面板拿它重拉清单 + 快照；页面自己不持有面板状态）
+  final Future<void> Function()? onInstalled;
 
   bool get _hasRuntime {
     if (runtime.isNotEmpty || instance != null) {
@@ -361,6 +371,23 @@ class PluginDetailPage extends StatelessWidget {
                   children: <Widget>[_Kv(label: '解析结果', value: _resolutionText())],
                 ),
               ],
+            ),
+          // A+：内置项缺成品（或想拿新版）时的就地入口。面板不传 admin ⇒ 整块不渲染，
+          // 页面回到"全程只读"的旧口径（旧调用方与测试不用改）。
+          if (isBuiltin && admin != null)
+            _sectionWithNote(
+              title: '发布仓库',
+              children: <Widget>[
+                _RepoInstallAction(
+                  admin: admin!,
+                  pluginId: pluginId,
+                  // 解析不到成品 ⇒ 缺货（「从仓库装它」）；否则「从仓库更新」——
+                  // 与面板卡片那颗按钮同一判据（resolution.ok）。
+                  needsArtifact: resolution == null || resolution!['ok'] != true,
+                  onInstalled: onInstalled,
+                ),
+              ],
+              note: '装它会先自动刷新发布索引再安装；失败原因就地显示在按钮下方。',
             ),
           _sectionWithNote(
             title: '运行态',
@@ -563,6 +590,152 @@ class PluginDetailPage extends StatelessWidget {
     text,
     style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
   );
+}
+
+/// 详情页里的「从仓库装它 / 从仓库更新」按钮（A+）：内置项缺成品时的就地入口。
+///
+/// 流程与面板卡片那颗同口径（见 plugin_panel._installFromRepo）：**先自动刷新索引，
+/// 再 install**——用户不该先去面板下面那一节点「刷新」再回来找这一条。失败原因
+/// **就地**显示在按钮下方（不只是一条转瞬即逝的 snack）：刷新失败、索引里没有这一条、
+/// 安装被换文件闸门拦住都算。
+///
+/// 自带 busy/error 状态（页面本体保持 StatelessWidget）：这颗按钮是页面上唯一的
+/// 异步写操作，状态跟着按钮走比给整页升格更省事。
+class _RepoInstallAction extends StatefulWidget {
+  const _RepoInstallAction({
+    required this.admin,
+    required this.pluginId,
+    required this.needsArtifact,
+    this.onInstalled,
+  });
+
+  final PluginAdminClient admin;
+  final String pluginId;
+
+  /// true = 本机缺成品 ⇒ 「从仓库装它」；false = 已装 / 有更新 ⇒ 「从仓库更新」。
+  final bool needsArtifact;
+
+  /// 装成功后的回调（面板重拉清单 + 快照）。
+  final Future<void> Function()? onInstalled;
+
+  @override
+  State<_RepoInstallAction> createState() => _RepoInstallActionState();
+}
+
+class _RepoInstallActionState extends State<_RepoInstallAction> {
+  bool _busy = false;
+
+  /// 就地失败原因（非空 ⇒ 按钮下方红字；清空时机 = 下一次点按钮 / 装成功）。
+  String _error = '';
+
+  Future<void> _run() async {
+    setState(() {
+      _busy = true;
+      _error = '';
+    });
+    try {
+      // ① 先刷新：装机端要的是**最新索引**（缓存那份可能还没有这一条，或版本旧）。
+      final Map<String, dynamic> refreshed = await widget.admin.refreshRelease();
+      final String refreshError = (refreshed['error'] ?? '').toString();
+      List<Map<String, dynamic>> entries = _mapList(refreshed['entries']);
+      if (refreshed['ok'] == false) {
+        // 刷新失败不清空：核心把上一次那份递在 cached 里，里面**有**这一条就还能装
+        // （“今晚限流”不该变成“什么都装不了”）。
+        final Object? cached = refreshed['cached'];
+        if (cached is Map) {
+          entries = _mapList(cached['entries']);
+        }
+      }
+      // ② 索引里没有这一条（仓库还没发 / 刷新后仍是旧索引）⇒ 就地说明，不发 install。
+      final bool known = entries.any(
+        (Map<String, dynamic> e) =>
+            (e['plugin_id'] ?? '').toString() == widget.pluginId,
+      );
+      if (!known) {
+        setState(() {
+          _error = refreshError.isEmpty
+              ? '索引里没有 ${widget.pluginId} 这一条'
+                    '（发布仓库还没发它，或刷新后仍是旧索引）'
+              : '刷新索引失败：$refreshError'
+                    '（缓存里也没有 ${widget.pluginId} 这一条）';
+        });
+        return;
+      }
+      // ③ install（核心失败会抛成带原因的异常，下面 catch 里就地显示）。
+      final Map<String, dynamic> result = await widget.admin.installRelease(
+        widget.pluginId,
+      );
+      if (!mounted) return;
+      setState(() => _error = '');
+      final Object? install = result['install'];
+      final String version = install is Map
+          ? (install['version'] ?? '').toString()
+          : '';
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+        SnackBar(
+          content: Text(
+            version.isEmpty
+                ? '已从发布仓库安装 ${widget.pluginId}'
+                : '已从发布仓库安装 ${widget.pluginId}（$version）',
+          ),
+          duration: const Duration(seconds: 6),
+        ),
+      );
+      await widget.onInstalled?.call();
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _error = _reason(error));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  static List<Map<String, dynamic>> _mapList(Object? raw) => raw is List
+      ? <Map<String, dynamic>>[
+          for (final Object? item in raw)
+            if (item is Map) Map<String, dynamic>.from(item),
+        ]
+      : <Map<String, dynamic>>[];
+
+  static String _reason(Object error) =>
+      '$error'.replaceFirst('Exception: ', '');
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return _Card(
+      children: <Widget>[
+        Row(
+          children: <Widget>[
+            Expanded(
+              child: Text(
+                widget.needsArtifact
+                    ? '本机还没有这一份成品，可从发布仓库装'
+                    : '发布仓库里有它（可装最新版）',
+                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+              ),
+            ),
+            TextButton(
+              key: Key('plugin-detail-repo-${widget.pluginId}'),
+              onPressed: _busy ? null : _run,
+              child: Text(
+                _busy
+                    ? '正在处理…'
+                    : (widget.needsArtifact ? '从仓库装它' : '从仓库更新'),
+                style: const TextStyle(fontSize: 12),
+              ),
+            ),
+          ],
+        ),
+        if (_error.isNotEmpty)
+          Text(
+            _error,
+            key: Key('plugin-detail-repo-error-${widget.pluginId}'),
+            style: TextStyle(fontSize: 11, color: cs.error),
+          ),
+      ],
+    );
+  }
 }
 
 /// 站点行（插件页里"它建的 / 它订阅的"两处共用；点一下进站点详情页）。

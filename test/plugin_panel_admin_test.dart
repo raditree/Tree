@@ -473,7 +473,7 @@ void main() {
     expect(
       find.byKey(const Key('plugin-builtin-needs-repo-sample')),
       findsOneWidget,
-      reason: '要指到用户真能动手的那一节；文案里的节名必须与面板标题一致',
+      reason: '要指到卡片上那颗「从仓库装它」按钮（A+ 起按钮就地，不用再指到下面那一节）',
     );
     expect(
       (find
@@ -483,8 +483,8 @@ void main() {
               .widget
           as Text)
       .data,
-      contains('从发布仓库更新'),
-      reason: '“从发布仓库更新”是面板上那一节的实际标题（写错名字等于指引到不存在的地方）',
+      contains('从仓库装它'),
+      reason: 'A+ 起指引直接指到卡片上那颗按钮（按钮就在同一张卡上，不再指向下面那一节）',
     );
 
     // 反过来：成品在（默认夹具 resolution.ok=true）⇒ 不许出现这一行“待装”提示。
@@ -501,6 +501,77 @@ void main() {
       findsNothing,
     );
     expect(find.textContaining('运行时未就绪'), findsNothing);
+    // A+：成品在 ⇒ 同一颗按钮换文案（不消失：有更新时它就是更新入口）。
+    expect(
+      find.text('从仓库更新'),
+      findsOneWidget,
+      reason: '已装/有更新时按钮显示「从仓库更新」（同一颗按钮两种文案）',
+    );
+  });
+
+  testWidgets('卡片「从仓库装它」：点它先自动刷新索引再 install，成功后就地清错误', (WidgetTester tester) async {
+    // 缺成品（解析不到）+ 索引里**有**这一条 ⇒ 一次点击走完 refresh → install。
+    final Map<String, dynamic> missing = _FakeAdmin._defaultBuiltins();
+    (
+      (missing['builtins'] as List<dynamic>).single as Map<String, dynamic>
+    )['resolution'] = <String, dynamic>{
+      'ok': false,
+      'error': '在 C:/app/plugins 找不到 tree_sample.exe',
+    };
+    final _FakeAdmin admin = _FakeAdmin(builtins: missing)
+      ..refreshResponse = _releaseListing(
+        entries: <Map<String, dynamic>>[
+          _releaseEntry(id: 'sample', name: '示例插件'),
+        ],
+      );
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    expect(find.text('从仓库装它'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('plugin-builtin-repo-sample')));
+    await tester.pumpAndSettle();
+
+    expect(admin.calls, contains('release:refresh'), reason: '先刷新索引（用户不该手动先去点刷新）');
+    expect(admin.calls, contains('release:install:sample'), reason: '索引里有这一条 ⇒ 接着 install');
+    expect(
+      admin.calls.indexOf('release:refresh'),
+      lessThan(admin.calls.indexOf('release:install:sample')),
+      reason: '顺序必须是 refresh → install（装机端要的是最新索引）',
+    );
+    expect(
+      find.text('已从发布仓库安装 sample（1.2.0）'),
+      findsOneWidget,
+      reason: '装了哪一版要说出来',
+    );
+    expect(
+      find.byKey(const Key('plugin-builtin-repo-error-sample')),
+      findsNothing,
+      reason: '成功了就不该还挂着错误',
+    );
+  });
+
+  testWidgets('卡片「从仓库装它」：索引里没有这一条 ⇒ 就地显示原因，不发 install', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin()
+      ..refreshResponse = _releaseListing(entries: <Map<String, dynamic>>[]);
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+
+    await tester.tap(find.byKey(const Key('plugin-builtin-repo-sample')));
+    await tester.pumpAndSettle();
+
+    expect(admin.calls, contains('release:refresh'));
+    expect(
+      admin.calls,
+      isNot(contains('release:install:sample')),
+      reason: '索引里没这一条时 install 必然 404，就地说明比发一次注定失败的请求好',
+    );
+    expect(
+      find.byKey(const Key('plugin-builtin-repo-error-sample')),
+      findsOneWidget,
+      reason: '失败原因就地显示在卡片上（不只是一条转瞬即逝的 snack）',
+    );
+    expect(
+      find.textContaining('索引里没有 sample 这一条'),
+      findsOneWidget,
+    );
   });
 
   testWidgets('每项开关各自打各自的接口', (WidgetTester tester) async {
