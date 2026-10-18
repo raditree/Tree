@@ -174,6 +174,16 @@ abstract final class ApiPaths {
   static const String pluginReleaseInstall =
       '/api/plugin/release/{pluginId}/install';
 
+  /// 卸载一条插件（POST，`pluginId` 取自已装条目）。
+  ///
+  /// 四段顺序（用户 2026-10-18 定稿）：**停用 → 等退出确认（不强杀）→ 删
+  /// `plugins/` 里的文件 → 落盘条目**。内置项的分岔只在最后一步：删文件但
+  /// **条目保留并置 `enabled: false`**（回到“待从仓库装”那一格，不从面板消失）；
+  /// 自定义 / 从仓库装的条目则整条删掉。闸门等不到退出确认时回 400 + 可读原因，
+  /// 文件与条目一个都不动。
+  static const String pluginReleaseUninstall =
+      '/api/plugin/release/{pluginId}/uninstall';
+
   /// 单个站点的**详情**（GET）：介绍 + 可订阅上限 + 共享声明 + 自定义配置 +
   /// 订阅者列表（含禁用态）。
   ///
@@ -293,6 +303,7 @@ abstract final class ApiPaths {
     pluginRelease,
     pluginReleaseRefresh,
     pluginReleaseInstall,
+    pluginReleaseUninstall,
     pluginStation,
     pluginStationConfig,
     pluginStationSubscriber,

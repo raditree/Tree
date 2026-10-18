@@ -15,6 +15,30 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
+## [1.0.4+2] — 2026-10-18
+
+### 断言变化（新增 / 修改的 README 不变量）
+
+- **卸载一条插件有了自己的端点与四段顺序；内置项卸载 = 删文件 + 条目保留停用**
+  （**新增**
+  [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md)
+  不变量 32「卸载 = 四段顺序，内置项只落『停用』；换文件闸门的等待有预算、照旧不 kill」；
+  `ApiPaths.pluginReleaseUninstall`）：`POST /api/plugin/release/{id}/uninstall` 按
+  **停用 → 等退出确认（不强杀）→ 删 `plugins/` 里的文件 → 落盘条目**四段走，闸门等不到
+  退出就 400 + 可读原因、磁盘一个字节都不动。内置项只落最后一步的分岔：删文件但条目
+  **保留并置 `enabled: false`**（回到“待从仓库装”那一格，不从面板消失）；自定义 /
+  从仓库装的条目整条删掉。删除范围是三来源并集（索引 `files[].target` ∪ 内置成品名 ∪
+  条目指进 `plugins/` 的路径），**目录外的解释器绝不碰**；半删也照常落盘条目，失败逐个
+  列在回包里。
+
+- **换文件闸门的等待加了预算：install/uninstall 不再可能永不回包**（**修改**同一不变量
+  32 的“闸门等待有预算”款；[packages/tree_core/lib/src/plugin/plugin_bus.dart](packages/tree_core/lib/src/plugin/plugin_bus.dart)
+  `quiesceForSwap`，遗留问题，随卸载一并修）：原实现只等「退出确认 / 心跳判失活」两条腿，
+  而任何入站报文都 `recordBeat()` ⇒ 一个“话多但不退”的进程既永不判失活、也永不退出，
+  闸门无限等、HTTP 调用侧没有任何可读回包（真机现象：正在运行的内置 id 从仓库更新时
+  install 挂住不返回）。现在按 `staleWindow + interval`（由判活参数派生）加第三条腿，
+  到期回可读拒绝、**照样不 kill**——D8 拦的是“按时长杀进程”，不是“按时长放弃等待”。
+
 ## [1.0.4+1] — 2026-10-18
 
 ### 断言变化（新增 / 修改的 README 不变量）

@@ -395,6 +395,114 @@ class PluginDownloader {
     );
   }
 
+  // ── 卸载：算要删哪些文件 + 真删 ────────────────────────────────────────
+
+  /// 卸载 [pluginId] 该删的文件：**只列本机真实存在的**，路径一律限定在
+  /// 「插件成品该住的 plugins/ 目录」里（[installDir] + [extraDirs] —— 后者由
+  /// 路由层给内置清单的 `scriptRoots()`：开发态的成品常住在仓根 `build/plugins`，
+  /// 不在 exe 同级，不给这个口子就会出现“卸载了但下次还能解析到”的假卸载）。
+  ///
+  /// 三个来源取并集（缺谁都不行，谁缺席另外两个还兜得住）：
+  /// 1. 发布索引里这条的 `files[].target`：从仓库装的那一批，含**没写进条目的伴随文件**
+  ///    （共享库之类）——只看 command/args 会把它们留在盘上变孤儿；
+  /// 2. 内置清单里这个 id 的成品名（`binaryFileName`）：内置项卸载要回到“缺成品”那一格，
+  ///    索引缓存不在（用户清过 / 从没刷过）时靠它；
+  /// 3. 条目自己指进那些目录的路径（`command` / `args`）：手改条目、以及解析器当年
+  ///    落在别的根下的那一份。**目录外的路径一概不碰**——`command` 常常是解释器
+  ///    （python / dart 可执行文件），卸载插件不许把本机解释器删了。
+  List<String> uninstallTargets(
+    String pluginId,
+    Map<String, dynamic>? entry, {
+    Iterable<String> extraDirs = const <String>[],
+  }) {
+    final String id = pluginId.trim();
+    final Set<String> dirs = <String>{
+      p.normalize(installDir),
+      for (final String dir in extraDirs) p.normalize(dir),
+    };
+    final Set<String> names = <String>{};
+
+    // ① 发布索引里这条的 files[].target（缓存不在就跳过：下面两条还兜得住）
+    if (File(indexPath).existsSync()) {
+      final PluginReleaseListing listing = cachedListing();
+      final PluginRepoEntry? indexEntry = listing.entries
+          .where((PluginRepoEntry e) => e.id == id)
+          .firstOrNull;
+      if (indexEntry != null) names.addAll(indexEntry.targets);
+    }
+
+    // ② 内置成品名（平台口径与 [protectedFileNames] 同一处，不另拼一套）
+    final BuiltinPluginSpec? spec = BuiltinPluginCatalog.specOf(id);
+    if (spec != null && spec.kind == BuiltinPluginSpec.kindBinary) {
+      names.add(
+        BuiltinPluginCatalog.binaryFileName(
+          spec,
+          isWindows: isWindows ?? Platform.isWindows,
+        ),
+      );
+    }
+
+    final Set<String> targets = <String>{};
+    for (final String name in names) {
+      // 纯文件名才收（索引已校验过，这里只再兜一次内置清单拼出来的名字）。
+      if (name != p.basename(name) || name == '.' || name == '..') continue;
+      for (final String dir in dirs) {
+        final File file = File(p.join(dir, name));
+        if (file.existsSync()) targets.add(p.normalize(file.path));
+      }
+    }
+
+    // ③ 条目里指进 plugins/ 目录的路径（command + args；目录外的不碰）
+    if (entry != null) {
+      final List<Object?> pointers = <Object?>[
+        entry['command'],
+        if (entry['args'] is List) ...(entry['args'] as List<Object?>),
+      ];
+      for (final Object? raw in pointers) {
+        final String path = (raw ?? '').toString().trim();
+        if (path.isEmpty) continue;
+        final String norm = p.normalize(path);
+        final String? dir = p.isAbsolute(norm) ? p.dirname(norm) : null;
+        // 相对路径只认“纯文件名”（相对 installDir 的裸名）；绝对路径必须住在
+        // 上面那几个 plugins/ 目录里。两条都不满足的（解释器等）一概跳过。
+        final bool owned =
+            dir != null
+                ? dirs.contains(dir)
+                : norm == p.basename(norm) && norm != '.' && norm != '..';
+        if (!owned) continue;
+        final File file = File(
+          dir == null ? p.join(installDir, norm) : norm,
+        );
+        if (file.existsSync()) targets.add(p.normalize(file.path));
+      }
+    }
+    return targets.toList(growable: false);
+  }
+
+  /// 删掉 [targets]（全部来自 [uninstallTargets]：已在闸门之后，进程已确认退出）。
+  ///
+  /// **不因单个失败而中止**：半删状态里“条目还开着”才是最坏的那种
+  /// （面板说能跑、盘上缺一半文件），所以调用方无论结果如何都会照常落盘条目；
+  /// 失败逐个列出来交给回包如实显示（Windows 上还锁着文件的是别的进程，
+  /// 与“我们这一世已退出”是两回事）。
+  ({List<String> deleted, Map<String, String> failed}) removeUninstallTargets(
+    Iterable<String> targets,
+  ) {
+    final List<String> deleted = <String>[];
+    final Map<String, String> failed = <String, String>{};
+    for (final String path in targets) {
+      try {
+        final File file = File(path);
+        if (!file.existsSync()) continue;
+        file.deleteSync();
+        deleted.add(p.basename(path));
+      } catch (error) {
+        failed[p.basename(path)] = '$error';
+      }
+    }
+    return (deleted: deleted, failed: failed);
+  }
+
   static final RegExp _idPattern = RegExp(r'^[A-Za-z0-9_.-]+$');
   static final RegExp _versionPattern = RegExp(r'^\d+\.\d+\.\d+$');
 

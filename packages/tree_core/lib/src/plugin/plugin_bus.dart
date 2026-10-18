@@ -1367,8 +1367,15 @@ class PluginBus {
   ///
   /// 与 [forceStop] 的分工是刻意的：这里**绝不 kill**。「为了让新文件落地就强杀一个
   /// 正在干活的插件」= 核心替用户做了本该用户拍板的动作；这里只发优雅关闭通知，
-  /// 然后等「退出已确认」这个**事件**（对照 D8：按失活心跳赛跑，不按墙钟赛跑）。
+  /// 然后等「退出已确认」这个**事件**（对照 D8：判死只认失活心跳，不认墙钟）。
   /// 插件赖着不退就说「现在换不了」，由用户自己选「强制停止」那条显式路。
+  ///
+  /// **等待本身有预算**（2026-10-18 遗留修复）：只等「退出确认 / 心跳判失活」
+  /// 两腿是会挂死的——任何入站报文都 `recordBeat()`，一个“话多但不退”的进程既
+  /// 永不判失活、也永不退出，HTTP 调用侧就永远等不到回包。预算 = 该宿主的
+  /// `staleWindow + interval`（**由判活参数派生，不是另立一个墙钟判死**），
+  /// 到期即回可读拒绝并**照样不 kill**——D8 拦的是“按时长杀进程”，不是
+  /// “按时长放弃等待”。
   ///
   /// 为什么把 [_reaping] 里同 id 的未确认实例也算进来：那是上一世赖着不退的进程，
   /// 它**同样锁着文件**——只看实例表会让闸门在明明还锁着的时候放行。
@@ -1400,15 +1407,40 @@ class PluginBus {
     ];
     for (final PluginHost host in pending) {
       final Completer<void> stale = host.liveness.watchStale();
+      // 第三条腿（2026-10-18 遗留修复：install/uninstall 会一直不回包的根因）：
+      // 上面两个事件**都可能永不完成**——[PluginHost] 对任意入站报文都
+      // `recordBeat()`，一个“话多但不退”的进程永远刷不出失活、也永远不退出，
+      // 于是这里无限等，HTTP 调用侧没有任何可读回包。按「判活窗口 + 一个心跳间隔」
+      // 给一个预算，到期即放弃等待并回可读拒绝——**照旧不 kill**（D8 不变：
+      // 换不掉就说换不掉，用户要杀自己去走「强制停止」那条显式路）。
+      final Duration budget = host.liveness.staleWindow + host.liveness.interval;
+      bool timedOut = false;
+      final Completer<void> giveUp = Completer<void>();
+      final Timer timer = Timer(budget, () {
+        timedOut = true;
+        if (!giveUp.isCompleted) giveUp.complete();
+      });
       try {
-        // 两个事件赛跑：进程确认退出（可以换）/ 心跳判失活（换不了，且不许强杀）。
-        await Future.any<void>(<Future<void>>[host.exited, stale.future]);
+        // 三个事件赛跑：进程确认退出（可以换）/ 心跳判失活（换不了，且不许强杀）
+        // / 等待预算用尽（同上，只是这回连“失联”都判不出来——它一直在说话）。
+        await Future.any<void>(<Future<void>>[
+          host.exited,
+          stale.future,
+          giveUp.future,
+        ]);
       } finally {
+        timer.cancel();
         host.liveness.unwatchStale(stale);
       }
       if (!host.exitedConfirmed) {
+        if (timedOut) {
+          return '插件 $id 的进程在等待预算（${budget.inSeconds} 秒）内始终没确认退出'
+              '（优雅关闭已发出，它既没退、也没失联——一直在应答就是不走）'
+              '⇒ 这次**不动插件文件**，旧文件一个都没动。'
+              '等它自己退出后重试，或在面板上对它「强制停止」（那是唯一会强杀的动作）';
+        }
         return '插件 $id 的进程还没确认退出（优雅关闭已发出，它还在收尾或已失联）'
-            '⇒ 这次**不替换文件**，旧文件一个都没动。'
+            '⇒ 这次**不动插件文件**，旧文件一个都没动。'
             '等它退出后重试，或在面板上对它「强制停止」（那是唯一会强杀的动作）';
       }
     }

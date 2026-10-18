@@ -1655,11 +1655,13 @@ class CoreServer {
     router.add('GET', ApiPaths.pluginBuiltins, _listBuiltinPlugins);
     router.add('POST', ApiPaths.pluginBuiltinEnable, _enableBuiltinPlugin);
     router.add('POST', ApiPaths.pluginBuiltinDisable, _disableBuiltinPlugin);
-    // 发布仓库（阶段 5）：只读 GitHub Release 资产，不 clone 源码；三个路由的分工
-    // 与理由见 ApiPaths.pluginRelease / pluginReleaseRefresh / pluginReleaseInstall。
+    // 发布仓库（阶段 5）：只读 GitHub Release 资产，不 clone 源码；四个路由的分工
+    // 与理由见 ApiPaths.pluginRelease / pluginReleaseRefresh / pluginReleaseInstall /
+    // pluginReleaseUninstall。
     router.add('GET', ApiPaths.pluginRelease, _pluginReleaseIndex);
     router.add('POST', ApiPaths.pluginReleaseRefresh, _refreshPluginRelease);
     router.add('POST', ApiPaths.pluginReleaseInstall, _installPluginRelease);
+    router.add('POST', ApiPaths.pluginReleaseUninstall, _uninstallPluginRelease);
     // 站点详情与配置（面板「站点详情页」）：介绍 / 可订阅上限 / 自定义配置 / 订阅者禁用。
     router.add('GET', ApiPaths.pluginStation, _stationDetail);
     router.add('PATCH', ApiPaths.pluginStationConfig, _updateStationConfig);
@@ -4359,6 +4361,119 @@ class CoreServer {
     await writeJson(request, 200, <String, dynamic>{
       ..._pluginWriteBody(store, result, outcome),
       'install': install.toJson(),
+    });
+  }
+
+  /// POST /api/plugin/release/{pluginId}/uninstall：卸载一条插件（**不强杀**）。
+  ///
+  /// 四段顺序（2026-10-18 定稿，见 ApiPaths.pluginReleaseUninstall）：
+  /// **停用 → 等退出确认 → 删 `plugins/` 里的文件 → 落盘条目**。前两段由
+  /// [PluginBus.quiesceForSwap] 一次做完：它回可读拒绝时直接 400，文件与条目
+  /// **一个都没动**（与 install 同一条纪律）。
+  ///
+  /// 内置项的分岔只在最后一步：删文件但**条目保留并置 `enabled: false`**——回到
+  /// “待从仓库装”那一格（缺成品、开关还在），不从面板消失；自定义 / 从仓库装的
+  /// 条目整条删掉。条目不存在但成品在盘上（从未启用过的内置成品）也算卸载：
+  /// 只删文件，无条目可写。
+  ///
+  /// 到落盘那一步时文件可能已经半删（Windows 上被别的进程锁着），所以
+  /// **无论删成功几个都照常落盘条目**——“文件删了但条目还开着”才是最坏状态；
+  /// 删除失败逐个列在 `uninstall.failed` 里如实回报。
+  Future<void> _uninstallPluginRelease(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    final PluginDownloader? downloader = pluginDownloader;
+    if (downloader == null) {
+      await _writePluginRepoNotWired(request);
+      return;
+    }
+    final String id = (params['pluginId'] ?? '').trim();
+    final PluginConfigStore store = _pluginStore(bus);
+    final Map<String, dynamic>? before = store.readEntry(id);
+    final List<String> targets = downloader.uninstallTargets(
+      id,
+      before,
+      extraDirs: builtinPlugins.scriptRoots(),
+    );
+    // 没条目也没文件 = 没东西可卸（404）；只有其一（老条目 / 裸成品）都继续。
+    if (before == null && targets.isEmpty) {
+      await writeJson(request, 404, errorBody('插件不存在：$id'));
+      return;
+    }
+    // 闸门：停用 + 等退出确认（[quiesceForSwap] 绝不 kill）。等不到 ⇒ 400 +
+    // 可读原因，此刻文件与条目都还没被碰。
+    final String blocked = await bus.quiesceForSwap(id);
+    if (blocked.isNotEmpty) {
+      await writeJson(request, 400, errorBody(blocked));
+      return;
+    }
+    final ({List<String> deleted, Map<String, String> failed}) removed =
+        downloader.removeUninstallTargets(targets);
+
+    final PluginStoreResult result;
+    final PluginHotApplyOutcome outcome;
+    final bool builtinKept;
+    if (before == null) {
+      // 裸成品（从来没有条目）：文件删完就没别的要写，也不需要热应用。
+      builtinKept = false;
+      result = PluginStoreResult.success(null, store.readEntries());
+      outcome = const PluginHotApplyOutcome.applied('没有条目可写（只删了成品文件）');
+    } else {
+      // 判内置看**清单 + 条目标记**两路：老条目可能没带 `builtin: true`，
+      // 而清单里的 id 换代自哪一边都不该被整条删掉（删了就回不到内置开关那一格）。
+      final bool builtin =
+          before['builtin'] == true ||
+          BuiltinPluginCatalog.specOf(id) != null;
+      builtinKept = builtin;
+      final PluginStoreResult written = builtin
+          ? store.setEnabled(id, false)
+          : store.remove(id);
+      final Map<String, dynamic>? stored = written.entry;
+      if (!written.ok) {
+        // 文件已经删了、条目却写不动：如实分开说（与 install 的对偶情形同纪律），
+        // 不把半删状态包装成成功。
+        final String reason =
+            '插件成品文件已删除（${removed.deleted.join(' / ')}），但写入 '
+            'plugins.yaml 失败：${written.error}'
+            '（文件已不在盘上，条目仍是旧的，请手工核对 ${store.path}）';
+        errorLog?.call('[core:plugin-release] 卸载 $id 失败：$reason');
+        await writeJson(request, 400, errorBody(reason));
+        return;
+      }
+      result = written;
+      outcome = await _applyPluginChange(
+        bus,
+        stored ?? before, // 整条删掉时用被删的那条去断开（与 _deletePluginConfig 同）
+        enable: false,
+      );
+    }
+
+    final String fileNotice = removed.failed.isEmpty
+        ? ''
+        : '以下文件这次没删掉（可能被别的进程占用）：'
+              '${removed.failed.keys.join(' / ')}——其余已删除，条目已按卸载落盘；'
+              '等占用它的进程退出后可再删一次';
+    errorLog?.call(
+      '[core:plugin-release] 已卸载 $id'
+      '${builtinKept ? '（内置项：条目保留并停用，回到“待从仓库装”）' : '（条目已删除）'}'
+      '：删除 ${removed.deleted.length} 个文件'
+      '${removed.failed.isEmpty ? '' : '，失败 ${removed.failed.length} 个'}',
+    );
+    await writeJson(request, 200, <String, dynamic>{
+      ..._pluginWriteBody(store, result, outcome),
+      'uninstall': <String, dynamic>{
+        'plugin_id': id,
+        'builtin_kept': builtinKept,
+        'deleted': removed.deleted,
+        'failed': removed.failed,
+        'notice': fileNotice,
+      },
     });
   }
 

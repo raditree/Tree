@@ -178,7 +178,7 @@ void main() {
 
   /// 起一个带插件总线的核心（content = 落盘的 plugins.yaml 内容）。
   ///
-  /// [downloader] = 接上发布仓库（阶段 5）；不传 ⇒ 三个 release 路由回可读 503。
+  /// [downloader] = 接上发布仓库（阶段 5）；不传 ⇒ 四个 release 路由回可读 503。
   Future<({CoreServer server, _Client client, PluginBus bus})> serve(
     String content, {
     BuiltinPluginCatalog? builtins,
@@ -728,7 +728,7 @@ void main() {
     expect((await client.send('GET', '/api/plugin/snapshot')).status, 200);
   });
 
-  // ── 发布仓库的三个路由（阶段 5：只拉 GitHub Release 资产）──────────────
+  // ── 发布仓库的四个路由（阶段 5：只拉 GitHub Release 资产 + 卸载）────────
 
   /// 一条脚本型索引条目（资产 = 那个**真能跑**的假插件源码）。
   Map<String, dynamic> releaseEntry({
@@ -764,7 +764,7 @@ void main() {
     runtimeResolver: () async => BuiltinRuntime(Platform.resolvedExecutable),
   );
 
-  test('没接下载器：三个 release 路由都回 503 + 可读原因（不默默空转）', () async {
+  test('没接下载器：四个 release 路由都回 503 + 可读原因（不默默空转）', () async {
     final ({CoreServer server, _Client client, PluginBus bus}) ctx =
         await serve('enabled: true\nplugins: []\n');
     addTearDown(() async {
@@ -783,6 +783,11 @@ void main() {
       '/api/plugin/release/released/install',
     );
     expect(install.status, 503);
+    final _Res uninstall = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/released/uninstall',
+    );
+    expect(uninstall.status, 503);
   });
 
   test('GET /api/plugin/release：只读本地缓存 ⇒ 一个 URL 都不碰', () async {
@@ -1118,5 +1123,155 @@ void main() {
     expect(res.detail, contains('released'));
     expect(res.detail, contains('second'));
     expect(diskPlugins(), isEmpty, reason: '没装成就一个字段也不写');
+  });
+
+  // ── 卸载（2026-10-18 定稿：停用 → 等退出确认 → 删文件 → 落盘条目）────────
+
+  test('uninstall：先过闸门停掉在跑的一世，再删文件 + 整条删掉条目', () async {
+    final _Repo repo = _Repo();
+    repo.assets['fake_plugin.dart'] = File(script).readAsBytesSync();
+    repo.publish(plugins: <Map<String, dynamic>>[releaseEntry()]);
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve(
+          'enabled: true\nplugins: []\n',
+          downloader: releaseDownloader(repo),
+        );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+    final _Res installed = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/released/install',
+    );
+    expect(installed.status, 200, reason: installed.detail);
+    expect(ctx.bus.instances(), hasLength(1), reason: '装完这一世在跑');
+
+    final _Res res = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/released/uninstall',
+    );
+    expect(res.status, 200, reason: res.detail);
+    final Map<String, dynamic> uninstall =
+        res.json['uninstall'] as Map<String, dynamic>;
+    expect(uninstall['builtin_kept'], isFalse, reason: '自定义条目整条删掉');
+    expect(
+      (uninstall['deleted'] as List<dynamic>).cast<String>(),
+      contains('fake_plugin.dart'),
+    );
+    expect(uninstall['failed'], <String, String>{});
+    expect(
+      File(p.join(pluginDir, 'fake_plugin.dart')).existsSync(),
+      isFalse,
+      reason: '四段顺序的第三段：文件真删了',
+    );
+    expect(
+      diskPlugins(),
+      isEmpty,
+      reason: '四段顺序的第四段：自定义条目不留',
+    );
+    expect(ctx.bus.config('released'), isNull);
+    expect(ctx.bus.instances(), isEmpty, reason: '停用发生在删文件之前');
+    expect(
+      File(Platform.resolvedExecutable).existsSync(),
+      isTrue,
+      reason: '解释器不是插件的文件——卸载不许把它删了',
+    );
+  });
+
+  test('uninstall 内置项：删成品 + 条目保留并置 enabled:false（回到“待从仓库装”）', () async {
+    // 条目指向 plugins/ 里的假插件源码（模拟“从仓库装过一版的内置项”），
+    // 随包成品 tree_sample.exe 也在——两者都要被删，但**条目不能消失**：
+    // 删了就回不到内置开关那一格，面板上这项就凭空没了。
+    final String inPlugins = p.join(pluginDir, 'fake_plugin.dart');
+    File(inPlugins).writeAsStringSync(File(script).readAsStringSync());
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve(
+          <String>[
+            'enabled: true',
+            'plugins:',
+            '  - id: sample',
+            '    name: 示例插件',
+            '    builtin: true',
+            '    command: "${Platform.resolvedExecutable.replaceAll('\\', '/')}"',
+            '    args: ["${inPlugins.replaceAll('\\', '/')}"]',
+            '    enabled: true',
+            '',
+          ].join('\n'),
+          downloader: releaseDownloader(_Repo()),
+        );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+    expect(ctx.bus.instances(), hasLength(1), reason: '这一世在跑（要过闸门）');
+
+    final _Res res = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/sample/uninstall',
+    );
+    expect(res.status, 200, reason: res.detail);
+    final Map<String, dynamic> uninstall =
+        res.json['uninstall'] as Map<String, dynamic>;
+    expect(uninstall['builtin_kept'], isTrue, reason: '内置项条目保留');
+    final List<String> deleted =
+        (uninstall['deleted'] as List<dynamic>).cast<String>();
+    expect(deleted, contains('fake_plugin.dart'));
+    expect(
+      deleted,
+      contains(
+        BuiltinPluginCatalog.binaryFileName(
+          BuiltinPluginCatalog.specOf(kSamplePluginId)!,
+          isWindows: true,
+        ),
+      ),
+      reason: '内置成品也删（来源②：清单里的成品名）',
+    );
+    expect(File(inPlugins).existsSync(), isFalse);
+    expect(
+      File(p.join(pluginDir, 'tree_sample.exe')).existsSync(),
+      isFalse,
+    );
+    final Map<String, dynamic> entry = diskEntry('sample');
+    expect(entry, isNotEmpty, reason: '条目保留——不从面板消失');
+    expect(entry['enabled'], isFalse, reason: '回到“待从仓库装”那一格');
+    expect(entry['builtin'], isTrue);
+    expect(ctx.bus.instances(), isEmpty, reason: '先停用才删的文件');
+  });
+
+  test('uninstall 裸成品（没有条目）：只删文件；两个都没有 ⇒ 404', () async {
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve(
+          'enabled: true\nplugins: []\n',
+          downloader: releaseDownloader(_Repo()),
+        );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+    // 没启用过的内置项：盘上有成品、plugins.yaml 里没有这一条。
+    final _Res bare = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/sample/uninstall',
+    );
+    expect(bare.status, 200, reason: bare.detail);
+    expect(
+      (bare.json['uninstall'] as Map<String, dynamic>)['builtin_kept'],
+      isFalse,
+      reason: '没条目可留',
+    );
+    expect(
+      File(p.join(pluginDir, 'tree_sample.exe')).existsSync(),
+      isFalse,
+    );
+    expect(diskPlugins(), isEmpty, reason: '没条目就什么都不写');
+
+    // 既没条目、也没属于它的文件 ⇒ 404（不是 200 空转）。
+    final _Res ghost = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/ghost/uninstall',
+    );
+    expect(ghost.status, 404);
+    expect(ghost.detail, contains('插件不存在：ghost'));
   });
 }

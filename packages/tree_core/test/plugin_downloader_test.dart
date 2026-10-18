@@ -667,4 +667,93 @@ void main() {
       );
     });
   });
+
+  group('卸载（算要删哪些文件 + 真删）', () {
+    test('三个来源取并集，目录外的解释器一个都不碰', () async {
+      // ① 索引里的 files[].target（含**没写进条目的伴随文件**）：先刷一份进缓存。
+      putAsset('tree_released.exe');
+      putAsset('extra.dll', bytes: 4);
+      repo.publish(
+        plugins: <Map<String, dynamic>>[
+          _entry(
+            files: <Map<String, dynamic>>[
+              <String, dynamic>{
+                'asset': 'tree_released.exe',
+                'target': 'tree_released.exe',
+                'bytes': 8,
+              },
+              <String, dynamic>{
+                'asset': 'extra.dll',
+                'target': 'extra.dll',
+                'bytes': 4,
+              },
+            ],
+          ),
+        ],
+      );
+      expect((await downloader().refresh()).ok, isTrue);
+      File(p.join(installDir, 'tree_released.exe')).writeAsStringSync('bin');
+      File(p.join(installDir, 'extra.dll')).writeAsStringSync('dll');
+
+      // ② 内置清单里 sample 的成品名（索引里没有它，靠清单兜）。
+      final String builtinName = BuiltinPluginCatalog.binaryFileName(
+        BuiltinPluginCatalog.specOf('sample')!,
+        isWindows: Platform.isWindows,
+      );
+      File(p.join(installDir, builtinName)).writeAsStringSync('MZ');
+
+      // ③ 条目 command/args 指进 plugins/ 的路径：脚本在 installDir 里要删；
+      //    解释器虽然真实存在、但住在 plugins/ 之外 ⇒ 不碰。
+      final String scriptIn = p.join(installDir, 'released_plugin.py');
+      File(scriptIn).writeAsStringSync('print(1)');
+      final String interpreter = p.join(temp.path, 'python.exe');
+      File(interpreter).writeAsStringSync('not really python');
+      final String elsewhere = p.join(temp.path, 'other_plugins');
+      Directory(elsewhere).createSync();
+      final String helper = p.join(elsewhere, 'helper.dll');
+      File(helper).writeAsStringSync('x');
+
+      final List<String> targets = downloader().uninstallTargets(
+        'released',
+        <String, dynamic>{
+          'command': interpreter,
+          'args': <String>[scriptIn, helper],
+        },
+        extraDirs: <String>[elsewhere],
+      );
+      expect(
+        targets,
+        containsAll(<String>[
+          p.join(installDir, 'tree_released.exe'),
+          p.join(installDir, 'extra.dll'),
+          scriptIn,
+          helper,
+        ]),
+        reason: '索引 target（含伴随文件）+ 条目指进 plugins/ 的路径并集',
+      );
+      expect(
+        targets,
+        isNot(contains(interpreter)),
+        reason: '解释器不是插件的文件——卸载不许把本机 python/dart 删了',
+      );
+
+      // ② 单独按内置 id 算：索引缓存里根本没有 sample 这一条，成品名靠清单兜。
+      final List<String> builtinTargets = downloader().uninstallTargets(
+        'sample',
+        null,
+      );
+      expect(builtinTargets, <String>[p.join(installDir, builtinName)]);
+    });
+
+    test('removeUninstallTargets：只删真实存在的，不存在的既不算删掉也不算失败', () {
+      final String gone = p.join(installDir, 'gone.dart');
+      File(gone).writeAsStringSync('y');
+      final String missing = p.join(installDir, 'missing.dart');
+      final ({List<String> deleted, Map<String, String> failed}) result =
+          downloader().removeUninstallTargets(<String>[gone, missing]);
+      expect(result.deleted, <String>['gone.dart']);
+      expect(File(gone).existsSync(), isFalse, reason: '真的删了');
+      expect(result.failed, <String, String>{}, reason: '不存在不是失败');
+    });
+  });
 }
