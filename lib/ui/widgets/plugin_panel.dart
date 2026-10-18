@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
 import '../../io/plugin_monitor_service.dart';
+import '../services/detail_selection.dart';
 import 'plugin_detail_page.dart';
 import 'plugin_editor_dialog.dart';
 
@@ -66,6 +67,14 @@ abstract class PluginAdminClient {
   /// 旧进程没确认退出就**不换文件**（核心不为换文件而强杀插件），那种失败回
   /// 400 + 原因；这里抛成异常，面板直接显示那句话。
   Future<Map<String, dynamic>> installRelease(String id);
+
+  /// 卸载一条插件：POST /api/plugin/release/{id}/uninstall。
+  ///
+  /// 四段顺序（用户 2026-10-18 定稿）：停用 → 等退出确认（**不强杀**）→ 删
+  /// `plugins/` 里的文件 → 落盘条目。内置项只删文件、条目保留并置 `enabled: false`。
+  /// 闸门等不到退出确认时核心回 400 + 原因（一个文件都没动），这里抛成异常，
+  /// 详情页直接显示那句话。
+  Future<Map<String, dynamic>> uninstallRelease(String id);
 
   /// 站点详情（GET /api/plugin/stations/{id}）：`StationInstance.describe()` 一整块。
   ///
@@ -150,6 +159,10 @@ class ApiPluginAdminClient implements PluginAdminClient {
   @override
   Future<Map<String, dynamic>> installRelease(String id) =>
       ApiService.installPluginRelease(id);
+
+  @override
+  Future<Map<String, dynamic>> uninstallRelease(String id) =>
+      ApiService.uninstallPluginRelease(id);
 
   @override
   Future<Map<String, dynamic>> stationDetail(String stationId) =>
@@ -526,10 +539,11 @@ class _PluginPanelState extends State<PluginPanel> {
   }
 
   /// 从仓库装/更新成功后的重拉（清单 + 快照：新版本立刻反映在卡片上）。
-  /// 详情页的仓库按钮装完也走这里（页面自己不持有面板状态）。
+  /// 详情页的仓库按钮与管理按钮装完也走这里（页面自己不持有面板状态）。
   Future<void> _reloadAfterRepoInstall() async {
     await _loadAdmin();
     await _svc.refresh();
+    _reinjectDetail();
   }
 
   /// 自定义插件：落盘条目里没有 builtin 标记、且**不属于内置清单**的那些。
@@ -569,6 +583,8 @@ class _PluginPanelState extends State<PluginPanel> {
       );
       await _loadAdmin();
       await _svc.refresh();
+      // 详情页开着时（编辑弹窗从详情页进来）：重注入一次，别让详情停在旧条目上。
+      _reinjectDetail();
     } catch (error) {
       _snack('操作失败：${'$error'.replaceFirst('Exception: ', '')}');
     } finally {
@@ -603,11 +619,32 @@ class _PluginPanelState extends State<PluginPanel> {
 
   // ── 详情页导航 ─────────────────────────────────────────────────────
 
-  /// 推一个详情页（卡片整张可点；卡片内的开关与按钮自己吃掉手势，不会误跳）。
-  void _push(Widget page) {
-    Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (BuildContext ctx) => page),
-    );
+  /// 当前注入右栏的详情页**构造器**（C）。
+  ///
+  /// 为什么存构造器而不是只存那份 widget：注入的是**实例**，面板重拉清单 / 快照后
+  /// 它不会自己重建——拿旧实例接着显示就会停在写之前的条目上。写成功后用它
+  /// 重新 [DetailSelection.inject] 一次，详情页当场拿到新数据。
+  Widget Function()? _detailPageBuilder;
+
+  /// 把一页详情**注入**右栏 DetailPanel（C：不再 Navigator.push 全屏）。
+  ///
+  /// 卡片整张可点（卡片内的开关与按钮自己吃掉手势，不会误跳）；关闭由详情页
+  /// AppBar 上的 × 调 `DetailSelection.clear()`（注入态没有路由可返回）。
+  void _push(Widget Function() build) {
+    _detailPageBuilder = build;
+    DetailSelection.instance.inject(build());
+  }
+
+  /// 清单 / 快照重拉后：详情页还开着就重新注入一份（拿到新数据）。
+  void _reinjectDetail() {
+    final Widget Function()? build = _detailPageBuilder;
+    if (build == null) return;
+    if (DetailSelection.instance.injected == null) {
+      // 已被关闭，或被一条消息详情顶掉：构造器作废，别把旧页面再拽回来。
+      _detailPageBuilder = null;
+      return;
+    }
+    DetailSelection.instance.inject(build());
   }
 
   /// 某个插件的运行实例（快照里同 id 可能有多条：粒度不同）。
@@ -646,8 +683,8 @@ class _PluginPanelState extends State<PluginPanel> {
     return _instanceOf(id)?.description ?? '';
   }
 
-  /// 打开插件详情页（**只读**：数据全部来自面板已有的清单 + 快照，不发新请求）。
-  void _openPluginDetail(PluginDetailPage page) => _push(page);
+  /// 打开插件详情页（注入右栏；C 起页面自带管理按钮，数据来自面板的清单 + 快照）。
+  void _openPluginDetail(Widget Function() build) => _push(build);
 
   /// 打开站点详情页（带上快照里那一份先渲染，页面自己再去 GET 当前真值）。
   void _openStationDetail(String stationId) {
@@ -659,7 +696,7 @@ class _PluginPanelState extends State<PluginPanel> {
       }
     }
     _push(
-      StationDetailPage(
+      () => StationDetailPage(
         stationId: stationId,
         admin: _admin,
         initial: initial,
@@ -698,56 +735,85 @@ class _PluginPanelState extends State<PluginPanel> {
     );
   }
 
+  /// 当前清单里的内置条目（写后重注入时按 id 重取；没有了才回落构造时那份）。
+  Map<String, dynamic>? _builtinItemOf(String id) {
+    for (final Map<String, dynamic> b in _builtins) {
+      if ((b['id'] ?? '').toString() == id) return b;
+    }
+    return null;
+  }
+
+  /// 当前清单里的一条自定义条目（同上：重注入按 id 重取，避免详情停在旧数据）。
+  Map<String, dynamic>? _configEntryOf(String id) {
+    for (final Map<String, dynamic> c in _configs) {
+      if ((c['id'] ?? '').toString() == id) return c;
+    }
+    return null;
+  }
+
   /// 内置项详情（介绍口径与「编辑」弹窗回填一致：清单条目优先于内置目录）。
+  ///
+  /// 构造器里按 id **重新查一遍**当前清单（而不是闭包捕获那一份）：管理按钮写完、
+  /// 面板重拉后重新注入时，详情页拿到的必须是新条目（开关态 / 解析结果 / 版本）。
   void _openBuiltinDetail(Map<String, dynamic> item) {
     final String id = (item['id'] ?? '').toString();
-    final Map<String, dynamic> entry =
-        (item['config'] as Map<String, dynamic>?) ?? const <String, dynamic>{};
-    _openPluginDetail(
-      PluginDetailPage(
+    _openPluginDetail(() {
+      final Map<String, dynamic> cur = _builtinItemOf(id) ?? item;
+      final Map<String, dynamic> entry =
+          (cur['config'] as Map<String, dynamic>?) ?? const <String, dynamic>{};
+      return PluginDetailPage(
         pluginId: id,
-        name: (item['name'] ?? '').toString(),
-        intro: _introOf(id, entry: entry, spec: item),
+        name: (cur['name'] ?? '').toString(),
+        intro: _introOf(id, entry: entry, spec: cur),
         isBuiltin: true,
         entry: entry,
         runtime: _runtimeOf(id),
-        resolution: item['resolution'] as Map<String, dynamic>?,
+        resolution: cur['resolution'] as Map<String, dynamic>?,
         instance: _instanceOf(id),
         stations: _allStations,
         onOpenStation: _openStationDetail,
         admin: _admin,
         onInstalled: _reloadAfterRepoInstall,
-      ),
-    );
+        onChanged: _reloadAfterRepoInstall,
+        onEdit: () => _openEditor(entry: entry, spec: cur, isBuiltin: true),
+      );
+    });
   }
 
   /// 自定义项详情。
   void _openCustomDetail(Map<String, dynamic> entry) {
     final String id = (entry['id'] ?? '').toString();
-    _openPluginDetail(
-      PluginDetailPage(
+    _openPluginDetail(() {
+      final Map<String, dynamic> cur = _configEntryOf(id) ?? entry;
+      return PluginDetailPage(
         pluginId: id,
-        name: (entry['name'] ?? '').toString(),
-        intro: _introOf(id, entry: entry),
-        entry: entry,
+        name: (cur['name'] ?? '').toString(),
+        intro: _introOf(id, entry: cur),
+        entry: cur,
         runtime: _runtimeOf(id),
         instance: _instanceOf(id),
         stations: _allStations,
         onOpenStation: _openStationDetail,
-      ),
-    );
+        admin: _admin,
+        onInstalled: _reloadAfterRepoInstall,
+        onChanged: _reloadAfterRepoInstall,
+        onEdit: () => _openEditor(entry: cur),
+      );
+    });
   }
 
   /// 快照实例详情（**清单接口不可用时的兜底路径**：只有运行态，没有落盘条目）。
   void _openInstanceDetail(PluginInstanceInfo e) {
     _openPluginDetail(
-      PluginDetailPage(
+      () => PluginDetailPage(
         pluginId: e.pluginId,
         name: e.name,
         intro: _introOf(e.pluginId),
-        instance: e,
+        instance: _instanceOf(e.pluginId) ?? e,
         stations: _allStations,
         onOpenStation: _openStationDetail,
+        admin: _admin,
+        onChanged: _reloadAfterRepoInstall,
       ),
     );
   }

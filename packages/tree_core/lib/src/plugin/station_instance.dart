@@ -28,14 +28,16 @@ sealed class StationInstance {
     int? maxSubscriptions,
     this.builtin = false,
     bool? shared,
+    bool? enabled,
     List<String>? allowedPlugins,
     Map<String, dynamic>? config,
     int? createdAt,
     List<StationSubscriber>? subscribers,
   }) : readme = readme ?? '',
        maxSubscriptions = maxSubscriptions ?? defaultMaxSubscriptions,
-       shared = shared ?? false,
-       allowedPlugins = allowedPlugins ?? <String>[],
+      shared = shared ?? false,
+      enabled = enabled ?? true,
+      allowedPlugins = allowedPlugins ?? <String>[],
        config = config ?? <String, dynamic>{},
        createdAt = createdAt ?? nowSeconds(),
        subscribers = subscribers ?? <StationSubscriber>[];
@@ -82,6 +84,14 @@ sealed class StationInstance {
   /// 「别人能不能用」必须由建站方说，不能靠「知道 id 就能订」——那等于任何插件
   /// 都能挂上别人的拦截点。
   bool shared;
+
+  /// 站点是否启用（**默认启用**；停用跨重启保留，落 `config/stations.yaml`）。
+  ///
+  /// C 起面板站点详情页可切（用户定稿「站点 = 启用/禁用，改后落盘」）。停用的语义：
+  /// 四类触发（publish / relay / collect / execute）都以**可读原因**跳过并计
+  /// `skipped_disabled`——订阅关系、配置与公告板一律保留，重新启用后原样继续；
+  /// 管理面（订阅 / 配置 / 上限）不受影响，停用期间照样能改。
+  bool enabled;
 
   /// 共享白名单（**空 = 所有插件都能用**；非空 = 只有列出的插件 id 能用）。
   ///
@@ -169,6 +179,16 @@ sealed class StationInstance {
   /// 否则“面板上关了、但没人告诉过触发方”就是事后无法诊断的黑洞。
   String? disabledReasonFor(StationSubscriber subscriber) =>
       subscriber.disabled ? '订阅者 ${subscriber.pluginId} 已被本站所有者禁用' : null;
+
+  /// 站点自身被停用时的可读原因（启用中返回 null）。
+  ///
+  /// 四类 trigger 的第一道闸：停用**整站**后任何触发都不投递，原因必须原样回到
+  /// 触发方（与订阅者禁用同一口径：不静默、计 `skipped_disabled`）。管理面
+  /// （订阅 / 配置 / 上限）不走触发，不受这道闸影响。
+  String? get stationDisabledReason =>
+      enabled
+          ? null
+          : '站点 $id 已停用（面板「站点详情」里可重新启用）';
 
   /// 子类附加持久化字段。
   Map<String, dynamic> extraJson() => const <String, dynamic>{};
@@ -400,6 +420,7 @@ sealed class StationInstance {
     'scope': scope.toJson(),
     'max_subscriptions': maxSubscriptions,
     if (shared) 'shared': true,
+    if (!enabled) 'enabled': false,
     if (allowedPlugins.isNotEmpty) 'allowed_plugins': allowedPlugins,
     if (config.isNotEmpty) 'config': config,
     if (builtin) 'builtin': true,
@@ -424,6 +445,7 @@ sealed class StationInstance {
     'builtin': builtin,
     'max_subscriptions': maxSubscriptions,
     'shared': shared,
+    'enabled': enabled,
     'allowed_plugins': allowedPlugins,
     'config': config,
     'subscriber_count': subscribers.length,
@@ -481,6 +503,8 @@ sealed class StationInstance {
         : defaultMaxSubscriptions;
     final bool builtin = raw['builtin'] == true;
     final bool shared = raw['shared'] == true;
+    // 缺键 = 启用（旧 stations.yaml 没有这一项；默认启用与用户定稿一致）
+    final bool enabled = raw['enabled'] != false;
     final List<String> allowedPlugins = <String>[
       for (final Object? item
           in (raw['allowed_plugins'] is List
@@ -519,6 +543,7 @@ sealed class StationInstance {
           allowedPlugins: allowedPlugins,
           config: config,
           builtin: builtin,
+          enabled: enabled,
           createdAt: createdAt,
           subscribers: subscribers,
           boardLimit: rawLimit is num ? rawLimit.toInt() : 50,
@@ -533,6 +558,7 @@ sealed class StationInstance {
           scope: scope,
           maxSubscriptions: maxSubscriptions,
           builtin: builtin,
+          enabled: enabled,
           createdAt: createdAt,
           subscribers: subscribers,
           // 白名单由**点位表**决定，不从盘上读：点位新增命令后旧文件也能立刻生效
@@ -549,6 +575,7 @@ sealed class StationInstance {
           allowedPlugins: allowedPlugins,
           config: config,
           builtin: builtin,
+          enabled: enabled,
           createdAt: createdAt,
           subscribers: subscribers,
         );
@@ -563,6 +590,7 @@ sealed class StationInstance {
           allowedPlugins: allowedPlugins,
           config: config,
           builtin: builtin,
+          enabled: enabled,
           createdAt: createdAt,
           subscribers: subscribers,
           schema: StationSchema.fromJson(raw['schema']),
@@ -653,6 +681,7 @@ final class BroadcastStation extends StationInstance {
     super.maxSubscriptions,
     super.builtin,
     super.shared,
+    super.enabled,
     super.allowedPlugins,
     super.config,
     super.createdAt,
@@ -685,6 +714,15 @@ final class BroadcastStation extends StationInstance {
     Map<String, dynamic> meta = const <String, dynamic>{},
     String sourcePluginId = '',
   }) async {
+    final String? off = stationDisabledReason;
+    if (off != null) {
+      counters.bump('skipped_disabled');
+      return StationPublishResult(
+        topic: topic,
+        boardSeq: 0,
+        skipped: <String>['广播未投递：$off'],
+      );
+    }
     final StationIsolationVerdict verdict = checkScope(scope);
     if (!verdict.ok) {
       counters.bump('skipped_scope');
@@ -869,6 +907,7 @@ final class ExecuteStation extends StationInstance {
     super.scope,
     super.maxSubscriptions,
     super.builtin,
+    super.enabled,
     super.createdAt,
     super.subscribers,
     List<String>? commands,
@@ -945,6 +984,11 @@ final class ExecuteStation extends StationInstance {
     Map<String, dynamic> arguments = const <String, dynamic>{},
     String sourcePluginId = '',
   }) async {
+    final String? off = stationDisabledReason;
+    if (off != null) {
+      counters.bump('skipped_disabled');
+      return StationCommandResult(command: command, ok: false, error: off);
+    }
     final StationIsolationVerdict verdict =
         StationIsolation.checkCommandScope(scope);
     if (!verdict.ok) {
@@ -1053,6 +1097,7 @@ final class RelayStation extends StationInstance {
     super.maxSubscriptions,
     super.builtin,
     super.shared,
+    super.enabled,
     super.allowedPlugins,
     super.config,
     super.createdAt,
@@ -1094,6 +1139,11 @@ final class RelayStation extends StationInstance {
     Map<String, dynamic> meta = const <String, dynamic>{},
     String sourcePluginId = '',
   }) async {
+    final String? off = stationDisabledReason;
+    if (off != null) {
+      counters.bump('skipped_disabled');
+      return StationRelayResult(data: data, handled: false, reason: '$off（原数据放行）');
+    }
     final StationIsolationVerdict verdict = checkScope(scope);
     if (!verdict.ok) {
       counters.bump('skipped_scope');
@@ -1208,6 +1258,7 @@ final class CollectStation extends StationInstance {
     super.maxSubscriptions,
     super.builtin,
     super.shared,
+    super.enabled,
     super.allowedPlugins,
     super.config,
     super.createdAt,
@@ -1230,6 +1281,11 @@ final class CollectStation extends StationInstance {
     Map<String, dynamic> meta = const <String, dynamic>{},
     String sourcePluginId = '',
   }) async {
+    final String? off = stationDisabledReason;
+    if (off != null) {
+      counters.bump('skipped_disabled');
+      return StationCollectResult(skipped: <String>['采集未投递：$off']);
+    }
     final StationIsolationVerdict verdict = checkScope(scope);
     if (!verdict.ok) {
       counters.bump('skipped_scope');

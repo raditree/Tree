@@ -929,6 +929,130 @@ void main() {
     expect(again.config, <String, dynamic>{'limit': 10});
   });
 
+  test('站点 enabled：停用后四类触发都以可读原因跳过，落盘跨重启保留', () async {
+    final StationHub h = hub();
+    final StationScope scope = team('team-1');
+    final BroadcastStation broadcast = h.broadcastFor()!;
+    final RelayStation relay = h.relayPointFor(StationHubIds.relayToolPre)!;
+    final CollectStation collect = h.toolDefineStationFor()!;
+    final ExecuteStation execute = h.executePointFor(StationHubIds.executeFs)!;
+
+    // 默认启用（缺键 = 启用），describe 带着它给面板
+    expect(broadcast.enabled, isTrue);
+    expect(broadcast.describe()['enabled'], isTrue);
+    expect(broadcast.stationDisabledReason, isNull);
+
+    // 内置站也能切（面板写面四格的第 ② 格）；非法值显式报错
+    expect(
+      h.updateConfig(execute.id, <String, dynamic>{'enabled': false}),
+      isNull,
+    );
+    expect(execute.enabled, isFalse);
+    expect(execute.describe()['enabled'], isFalse);
+    expect(execute.stationDisabledReason, contains('已停用'));
+    expect(
+      h.updateConfig(broadcast.id, <String, dynamic>{'enabled': 'yes'}),
+      contains('布尔'),
+    );
+    expect(
+      broadcast.enabled,
+      isTrue,
+      reason: '报错的键没被写进去（先校验后落）',
+    );
+    final String? forbidden = h.updateConfig(execute.id, <String, dynamic>{
+      'shared': true,
+    });
+    expect(forbidden, contains('启用 / 停用'), reason: '内置站文案要指路可改的两格');
+
+    // ① 执行站：第一道闸就地拒绝
+    final StationCommandResult cmd = await execute.execute(
+      command: 'fs.read',
+      scope: scope,
+    );
+    expect(cmd.ok, isFalse);
+    expect(cmd.error, contains('已停用'));
+    expect(execute.counters['skipped_disabled'], 1);
+
+    // ② 广播站：可读原因 + 不入板
+    expect(
+      h.updateConfig(broadcast.id, <String, dynamic>{'enabled': false}),
+      isNull,
+    );
+    final StationPublishResult pub = await broadcast.publish(
+      topic: 'off',
+      scope: scope,
+      payload: <String, dynamic>{'x': 1},
+    );
+    expect(pub.boardSeq, 0, reason: '停用的站不入公告板');
+    expect(pub.delivered, 0);
+    expect(pub.skipped.single, contains('已停用'));
+    expect(broadcast.counters['skipped_disabled'], 1);
+
+    // ③ 中转站：照旧放行原数据（fail-open 红线不因停用破例）
+    expect(
+      h.updateConfig(relay.id, <String, dynamic>{'enabled': false}),
+      isNull,
+    );
+    h.subscribe(
+      relay.id,
+      StationSubscriber(pluginId: 'p1', scope: scope),
+      ok(),
+    );
+    final StationRelayResult rr = await relay.relay(
+      data: '原数据',
+      scope: scope,
+    );
+    expect(rr.handled, isFalse);
+    expect(rr.data, '原数据', reason: '停用只是不接管，原数据照旧放行');
+    expect(rr.reason, contains('已停用'));
+    expect(rr.reason, contains('原数据放行'));
+
+    // ④ 收集站：可读原因 + 无产出
+    expect(
+      h.updateConfig(collect.id, <String, dynamic>{'enabled': false}),
+      isNull,
+    );
+    final StationCollectResult cr = await collect.collect(scope: scope);
+    expect(cr.items, isEmpty);
+    expect(cr.skipped.single, contains('已停用'));
+
+    // 管理面不受影响：停用期间照样能改配置、照样能订阅（禁用 ≠ 退订）
+    expect(
+      h.updateConfig(collect.id, <String, dynamic>{'max_subscriptions': 7}),
+      isNull,
+    );
+    expect(collect.maxSubscriptions, 7);
+    expect(
+      h
+          .subscribe(
+            broadcast.id,
+            StationSubscriber(pluginId: 'p2', scope: scope),
+            ok(),
+          )
+          .ok,
+      isTrue,
+      reason: '停用不退订：订阅关系与管理面原样保留',
+    );
+
+    // 落盘跨重启
+    final StationHub reloaded = hub();
+    reloaded.load();
+    expect(reloaded.station(broadcast.id)!.enabled, isFalse);
+    expect(reloaded.station(execute.id)!.enabled, isFalse);
+
+    // 重新启用后原样继续
+    expect(
+      h.updateConfig(broadcast.id, <String, dynamic>{'enabled': true}),
+      isNull,
+    );
+    final StationPublishResult back = await broadcast.publish(
+      topic: 'on',
+      scope: scope,
+    );
+    expect(back.boardSeq, 1, reason: '重新启用后公告板继续');
+    expect(back.delivered, 1, reason: '停用期间保留的订阅者原样收到');
+  });
+
   test('订阅者的禁用标记落盘：重启后仍是关着的（不会被重新订阅悄悄打开）', () async {
     final StationHub h = hub();
     expect(

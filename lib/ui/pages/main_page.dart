@@ -514,7 +514,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
 
   /// 中栏选中了详情：右栏收着就展开（选中项被清空时什么都不做）
   void _onDetailSelected() {
-    if (DetailSelection.instance.message == null) return;
+    if (DetailSelection.instance.message == null &&
+        DetailSelection.instance.injected == null) {
+      return;
+    }
     if (!_rightCollapsed) return;
     setState(() {
       _rightCollapsed = false;

@@ -302,7 +302,10 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
   /// 只在**选中**时切（清空不动）：用户点关闭收掉详情后，不该再被拽回这一页。
   void _onDetailSelected() {
     if (!mounted) return;
-    if (DetailSelection.instance.message == null) return;
+    if (DetailSelection.instance.message == null &&
+        DetailSelection.instance.injected == null) {
+      return;
+    }
     if (_tabController.index != _detailTabIndex) {
       _tabController.animateTo(_detailTabIndex);
     }

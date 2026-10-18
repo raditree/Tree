@@ -1146,6 +1146,19 @@ class ApiService {
     );
   }
 
+  /// 卸载一条插件：POST [ApiPaths.pluginReleaseUninstall]
+  ///
+  /// 四段顺序（用户 2026-10-18 定稿）：停用 → 等退出确认（**不强杀**）→ 删
+  /// `plugins/` 里的文件 → 落盘条目。内置项只删文件、条目保留并置 `enabled: false`
+  /// （回到“待从仓库装”那一格，不从面板消失）。闸门等不到退出确认时核心回
+  /// 400 + 中文原因（文件与条目一个都没动），这里抛成异常给详情页就地显示。
+  static Future<Map<String, dynamic>> uninstallPluginRelease(String pluginId) async {
+    final String encoded = Uri.encodeComponent(pluginId.trim());
+    return _postJson(
+      ApiPaths.pluginReleaseUninstall.replaceFirst('{pluginId}', encoded),
+    );
+  }
+
   /// 站点详情：GET [ApiPaths.pluginStation]
   ///
   /// 返回 `StationInstance.describe()` 一整块：`readme`（站点介绍）、`max_subscriptions`

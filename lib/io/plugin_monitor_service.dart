@@ -360,6 +360,12 @@ class PluginStationInfo {
   /// 是否**对外共享**（自建站默认私有；true = 别的插件可按 `allowed_plugins` 订阅与触发）
   final bool shared;
 
+  /// 站点**启用态**（C 起面板可写；缺键 / 旧核心 = true = 启用）。
+  ///
+  /// 停用只是"四类触发的第一道闸"（核心计 `skipped_disabled` 并给可读原因），
+  /// 订阅关系与配置原样保留——所以详情页那颗开关的文案是「启用 / 停用」，不是「删除」。
+  final bool enabled;
+
   /// 共享白名单（**空 = 所有插件都能用**；只在 [shared] 为 true 时参与判定）
   final List<String> allowedPlugins;
 
@@ -402,6 +408,7 @@ class PluginStationInfo {
     this.description = '',
     this.readme = '',
     this.shared = false,
+    this.enabled = true,
     this.allowedPlugins = const <String>[],
     this.config = const <String, dynamic>{},
     this.maxSubscriptions,
@@ -527,6 +534,7 @@ class PluginStationInfo {
       description: (m['description'] ?? '').toString(),
       readme: (m['readme'] ?? '').toString(),
       shared: m['shared'] == true,
+      enabled: m['enabled'] != false,
       allowedPlugins: allowed,
       config: config,
       maxSubscriptions: rawMax is num ? rawMax.toInt() : null,

@@ -28,6 +28,10 @@ class DetailPanel extends StatelessWidget {
     return ListenableBuilder(
       listenable: DetailSelection.instance,
       builder: (BuildContext context, Widget? child) {
+        // 注入的整页（插件详情页等）：它自带 Scaffold/AppBar，直接顶掉这一格，
+        // 不再套本面板的头部与滚动容器（否则会出现两层头）。
+        final Widget? injected = DetailSelection.instance.injected;
+        if (injected != null) return injected;
         final ChatMessage? message = DetailSelection.instance.message;
         if (message == null) return _buildEmpty(cs);
         return Column(

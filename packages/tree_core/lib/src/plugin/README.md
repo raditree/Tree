@@ -102,7 +102,7 @@
     `readme` 与 `shared` / `allowed_plugins` / `config` / 每个订阅者的禁用标记一起**落盘**
     `config/stations.yaml`（不变量 22）。**同名重复注册 = 幂等**：返回既有站点、不报错、
     **也不覆盖**第一次写的 `readme`——插件重启会再注册一遍，这次没带介绍不该把既有站拒掉。
-    面板上能改的面按「内置 / 自建」分开：内置站**只**能改「可订阅插件数量」。参见
+    面板上能改的面按「内置 / 自建」分开：内置站只能改「可订阅插件数量」与「启用 / 停用」。参见
     [test/plugin_request_test.dart](../../../test/plugin_request_test.dart)
     （`station/register：自建广播站 ⇒ id 由核心拼装…`、`…name 非法 / 缺 readme / 执行站 / 收集站缺 schema 都是可读拒绝`）
     与 [test/plugin_station_test.dart](../../../test/plugin_station_test.dart)
@@ -122,15 +122,22 @@
     `shared 的 allowed_plugins ⇒ 只有名单内的插件能用（所有者不受限）`）。
     **断言 1（左侧站点栏可见）由「快照不按 team 过滤」保证**：站点 id 里不含 team / mode（不变量 2），
     `stationList()` / `snapshot()` 给的就是全局那一份，插件自建站因此与内置点位同栏同列表出现。
-22. **面板对站点的写面只有三格，且「禁用 ≠ 退订」**（2026-10-14，界面升级的落点）：
-    ① `updateConfig` 改 `max_subscriptions`（内置站唯一可改项，非法值显式报错且**一个键都不写**）；
-    ② 自建站另可改 `readme` / `shared` / `allowed_plugins` / `config`（PATCH = 局部更新，**没发的键不改动**）；
-    ③ `setSubscriberDisabled(stationId, key, disabled)` 按订阅键位（`plugin_id|scope`）开关某个订阅者。
+22. **面板对站点的写面只有四格，且「禁用 ≠ 退订」**（2026-10-14 界面升级的落点；2026-10-18 C
+    切片扩一格）：
+    ① `updateConfig` 改 `max_subscriptions`（两类站都能改，非法值显式报错且**一个键都不写**）；
+    ② `updateConfig` 改 `enabled`（**站点启用/停用，两类站都能改**）：默认启用，缺键 = 启用；
+    停用后**四类触发**（publish / relay / collect / execute）的第一道闸就地以可读原因跳过、计入
+    `skipped_disabled`（中转照旧放行原数据），订阅关系、配置与公告板**一律保留**，重新启用后
+    原样继续；管理面（订阅 / 配置 / 上限）不受影响，停用期间照样能改；标记与值一起落盘
+    `config/stations.yaml`，跨重启保留；
+    ③ 自建站另可改 `readme` / `shared` / `allowed_plugins` / `config`（PATCH = 局部更新，**没发的键不改动**）；
+    ④ `setSubscriberDisabled(stationId, key, disabled)` 按订阅键位（`plugin_id|scope`）开关某个订阅者。
     **禁用保留订阅关系与回包通道**，只是触发时不投给它；每条跳过都写进 `result.skipped` 并计入
     `skipped_disabled`——**不静默**。禁用标记跨重启保留，插件重新上线**也不会把用户关掉的东西悄悄打开**。
     用例：[test/plugin_station_test.dart](../../../test/plugin_station_test.dart)
     （`updateConfig：面板上能改什么按「内置 / 自建」分开（改完立即生效并落盘）`、
-    `订阅者的禁用标记落盘：重启后仍是关着的（不会被重新订阅悄悄打开）`）、
+    `订阅者的禁用标记落盘：重启后仍是关着的（不会被重新订阅悄悄打开）`、
+    `站点 enabled：停用后四类触发都以可读原因跳过，落盘跨重启保留`）、
     [test/plugin_request_test.dart](../../../test/plugin_request_test.dart)
     （`站点所有者禁用订阅者 ⇒ 触发不再投递，原因写在 skipped（不静默）`）。
 

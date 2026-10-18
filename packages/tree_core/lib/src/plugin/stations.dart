@@ -619,6 +619,8 @@ class StationHub {
   ///
   /// 可改的字段按“内置 / 自建”分开：
   /// - `max_subscriptions`（可订阅插件数量）：**都能改**——它是投递上限，不改变语义；
+  /// - `enabled`（站点启用/停用，C 起）：**都能改**——默认启用，停用只是让四类触发
+  ///   以可读原因跳过（落 `config/stations.yaml`，管理面不受影响）；
   /// - `readme` / `config` / `shared` / `allowed_plugins`：**只有非内置能改**。
   ///   内置点位的介绍与可配置项在点位表里（`station_points.dart`）——那才是唯一定义处，
   ///   面板上改它等于把行为从代码里摸到盘上，下次启动就会被点位表覆盖回去。
@@ -642,7 +644,7 @@ class StationHub {
       if (asked.isNotEmpty) {
         return '内置站点 $stationId 不提供修改 ${asked.join(' / ')}：'
             '内置点位的介绍与配置在核心的点位表（station_points.dart）里，'
-            '界面上可改的只有「可订阅插件数量」';
+            '界面上可改的只有「可订阅插件数量」与「启用 / 停用」';
       }
     }
     if (patch.containsKey('max_subscriptions')) {
@@ -653,6 +655,11 @@ class StationHub {
       if (station.maxSubscriptions != value) {
         station.maxSubscriptions = value;
       }
+    }
+    if (patch.containsKey('enabled')) {
+      final Object? raw = patch['enabled'];
+      if (raw is! bool) return 'enabled 必须是布尔值（收到「$raw」）';
+      station.enabled = raw;
     }
     if (patch.containsKey('readme')) {
       station.readme = (patch['readme'] ?? '').toString();

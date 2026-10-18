@@ -282,6 +282,13 @@ class _FakeAdmin implements PluginAdminClient {
     if (failWrite.isNotEmpty) throw Exception(failWrite);
     return installResponse;
   }
+
+  @override
+  Future<Map<String, dynamic>> uninstallRelease(String id) async {
+    calls.add('release:uninstall:$id');
+    if (failWrite.isNotEmpty) throw Exception(failWrite);
+    return <String, dynamic>{'ok': true};
+  }
 }
 
 /// 注入快照的服务（不共享单例状态）。

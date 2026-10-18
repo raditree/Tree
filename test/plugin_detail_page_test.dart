@@ -1,14 +1,19 @@
-// 插件 / 站点**详情页**的 widget 用例：卡片点进去能看到什么、写操作发的是什么请求。
+// 插件 / 站点**详情页**的 widget 用例：点进右栏能看到什么、写操作发的是什么请求。
 //
 // 这一层锁的是"界面上讲的话"与"界面发出去的形状"：
-// - 插件页只读（介绍、工具、它建的/它订阅的站点）+ A+ 起的发布仓库安装按钮
-//   （断言 refresh → install 的顺序与就地失败原因）；
+// - 详情页 C 起经 DetailSelection **注入右栏 DetailPanel**（不再 Navigator push）：
+//   断言注入可见、关闭按钮清空注入态；
+// - 插件页的管理按钮（启用 / 停用 / 重启 / 热重启 / 卸载）+ A+ 起的发布仓库安装按钮
+//   （断言 refresh → install 的顺序与就地失败原因、卸载的确认对话框与关闭时机）；
 // - 站点页有写操作，所以断言的是 **PATCH / POST 的 body 形状**（禁用订阅者发的是
-//   `disabled: true` 而不是"退订"；改配置发的类型不能把 int 变成 "8"）；
+//   `disabled: true` 而不是"退订"；改配置发的类型不能把 int 变成 "8"；
+//   站点启用停用发的是 `enabled` 单键）；
 // 核心侧的落盘与判定规则由 packages/tree_core/test/plugin_api_test.dart 锁住。
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:tree/io/plugin_monitor_service.dart';
+import 'package:tree/ui/services/detail_selection.dart';
+import 'package:tree/ui/widgets/detail_panel.dart';
 import 'package:tree/ui/widgets/plugin_detail_page.dart';
 import 'package:tree/ui/widgets/plugin_panel.dart';
 
@@ -78,7 +83,10 @@ class _FakeAdmin implements PluginAdminClient {
   Future<Map<String, dynamic>> updateConfig(
     String id,
     Map<String, dynamic> patch,
-  ) async => <String, dynamic>{'ok': true};
+  ) async {
+    calls.add('update:$id:${patch['enabled'] == false ? 'off' : 'edit'}');
+    return <String, dynamic>{'ok': true};
+  }
 
   @override
   Future<Map<String, dynamic>> deleteConfig(String id) async =>
@@ -89,13 +97,19 @@ class _FakeAdmin implements PluginAdminClient {
     String id, {
     String mode = 'cold',
     bool keepState = true,
-  }) async => <String, dynamic>{'ok': true};
+  }) async {
+    calls.add('restart:$id:$mode');
+    return <String, dynamic>{'ok': true};
+  }
 
   @override
   Future<Map<String, dynamic>> setBuiltinEnabled(
     String id, {
     required bool enabled,
-  }) async => <String, dynamic>{'ok': true};
+  }) async {
+    calls.add('builtin:$id:${enabled ? 'on' : 'off'}');
+    return <String, dynamic>{'ok': true};
+  }
 
   @override
   Future<Map<String, dynamic>> stationDetail(String stationId) async {
@@ -113,10 +127,12 @@ class _FakeAdmin implements PluginAdminClient {
     String stationId,
     Map<String, dynamic> patch,
   ) async {
-    calls.add('patch:$stationId');
+    calls.add('patch:$stationId:${patch.keys.join('+')}');
     lastStationPatch = patch;
     if (failWrite.isNotEmpty) throw Exception(failWrite);
-    return stationResponses[stationId]!;
+    // 核心回**改后的完整详情**：把这一个键合并进去（形状与 describe() 一致），
+    // 页面才能拿回包刷新出新值（站点启用停用的 Switch 靠它翻面）。
+    return <String, dynamic>{...stationResponses[stationId]!, ...patch};
   }
 
   @override
@@ -169,6 +185,16 @@ class _FakeAdmin implements PluginAdminClient {
     calls.add('release-install:$id');
     if (failWrite.isNotEmpty) throw Exception(failWrite);
     return installResponse;
+  }
+
+  /// 卸载的返回体（成功关详情；非空 [failWrite] 时抛出，钉就地错误显示）。
+  Map<String, dynamic> uninstallResponse = <String, dynamic>{'ok': true};
+
+  @override
+  Future<Map<String, dynamic>> uninstallRelease(String id) async {
+    calls.add('uninstall:$id');
+    if (failWrite.isNotEmpty) throw Exception(failWrite);
+    return uninstallResponse;
   }
 }
 
@@ -265,16 +291,30 @@ Future<void> _pump(
   required PluginMonitorService svc,
   required _FakeAdmin admin,
 }) async {
-  tester.view.physicalSize = const Size(1000, 2200);
+  tester.view.physicalSize = const Size(1560, 2200);
   tester.view.devicePixelRatio = 1.0;
   addTearDown(tester.view.reset);
+  // C 起详情页不再 push 全屏：面板与 DetailPanel **并排**（右栏那一格），
+  // 点卡片后 DetailSelection 注入，由 DetailPanel 显示。
   await tester.pumpWidget(
     MaterialApp(
       home: Scaffold(
         body: SizedBox(
           height: 2200,
-          width: 1000,
-          child: PluginPanel(service: svc, admin: admin, showHeader: false),
+          width: 1560,
+          child: Row(
+            children: <Widget>[
+              SizedBox(
+                width: 860,
+                child: PluginPanel(
+                  service: svc,
+                  admin: admin,
+                  showHeader: false,
+                ),
+              ),
+              const SizedBox(width: 700, child: DetailPanel()),
+            ],
+          ),
         ),
       ),
     ),
@@ -289,6 +329,11 @@ Future<void> _showTab(WidgetTester tester, String key) async {
 }
 
 void main() {
+  // 注入态是全局单例：每个用例从干净状态开始、结束时清掉，
+  // 否则上一个用例开着的详情页会被下一个用例看见。
+  setUp(() => DetailSelection.instance.clear());
+  tearDown(() => DetailSelection.instance.clear());
+
   testWidgets('点自定义插件卡片进详情页：介绍、工具、它建的与它订阅的站点', (WidgetTester tester) async {
     final _FakeAdmin admin = _FakeAdmin(
       stationResponses: <String, Map<String, dynamic>>{
@@ -304,9 +349,15 @@ void main() {
 
     // 介绍（清单里那句 description，卡片上只显示一行，详情页给全文）
     expect(find.textContaining('把工具公告转发给队友，并把执行结果收回来'), findsWidgets);
-    // 基本信息
+    // 基本信息（命令一行面板卡片也在显示：并排后不再被全屏路由遮住 ⇒ 按详情页范围查）
     expect(find.text('基本信息'), findsOneWidget);
-    expect(find.textContaining('python demo.py'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byType(PluginDetailPage),
+        matching: find.textContaining('python demo.py'),
+      ),
+      findsOneWidget,
+    );
     expect(find.textContaining('team_id=t1'), findsWidgets);
     // 详情页里不能出现"内置"归属（卡片列表在路由下方，所以按详情页范围查）
     final Finder detail = find.byType(PluginDetailPage);
@@ -367,7 +418,14 @@ void main() {
     expect(find.text('内置插件'), findsOneWidget);
     // 运行时没就绪：详情必须显示核心给的原因（不显示就等于骗用户"能跑"）
     expect(find.text('内置运行时'), findsOneWidget);
-    expect(find.textContaining('运行时未就绪：本机没装 Python'), findsOneWidget);
+    // 面板卡片也显示同一句（并排后不再被路由遮住）⇒ 按详情页范围查
+    expect(
+      find.descendant(
+        of: find.byType(PluginDetailPage),
+        matching: find.textContaining('运行时未就绪：本机没装 Python'),
+      ),
+      findsOneWidget,
+    );
     // 没有运行实例 ⇒ 不假装有能力
     expect(find.text('提供的工具（0）'), findsOneWidget);
     expect(find.textContaining('未提供工具'), findsOneWidget);
@@ -493,7 +551,10 @@ void main() {
     await tester.enterText(find.byKey(const Key('station-detail-max')), 'abc');
     await tester.tap(find.byKey(const Key('station-detail-save-max')));
     await tester.pumpAndSettle();
-    expect(admin.calls, isNot(contains('patch:plugin.demo.relay.audit')));
+    expect(
+      admin.calls.where((String c) => c.startsWith('patch:plugin.demo.relay.audit')),
+      isEmpty,
+    );
     expect(find.textContaining('要写整数'), findsOneWidget);
 
     await tester.enterText(find.byKey(const Key('station-detail-max')), '0');
@@ -615,7 +676,14 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.textContaining('站点详情刷新失败：站点不存在'), findsOneWidget);
-    expect(find.textContaining('下方为最近一次数据'), findsOneWidget);
+    // 面板自己的“连接断开…（下方为最近一次数据）”横幅同一时段也在台上 ⇒ 按站点页范围查
+    expect(
+      find.descendant(
+        of: find.byType(StationDetailPage),
+        matching: find.textContaining('下方为最近一次数据'),
+      ),
+      findsOneWidget,
+    );
   });
 
   testWidgets('站点详情完全读不到（没有快照那份）：说清原因 + 给重试，不渲染空白详情页', (
@@ -929,5 +997,215 @@ void main() {
       find.byKey(const Key('plugin-detail-repo-demo')),
       findsNothing,
     );
+  });
+
+  // ── C：注入右栏 + 管理按钮 + 站点启用停用 ────────────────────────────────
+
+  testWidgets('详情页注入右栏 DetailPanel：管理按钮齐全，关闭按钮清空注入态', (
+    WidgetTester tester,
+  ) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{
+        'plugin.demo.relay.audit': _selfBuiltStation(),
+      },
+    );
+    await _pump(tester, svc: await _service(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-demo')));
+    await tester.pumpAndSettle();
+
+    // 点卡片 = 注入右栏那一格，不是压在面板上的全屏路由
+    expect(DetailSelection.instance.injected, isNotNull);
+    expect(
+      find.descendant(
+        of: find.byType(DetailPanel),
+        matching: find.byType(PluginDetailPage),
+      ),
+      findsOneWidget,
+      reason: '详情页显示在 DetailPanel 里（C：不再 Navigator.push）',
+    );
+    // 管理按钮区：插件 = 启用/停用 · 重启 · 热重启 · 编辑 · 卸载
+    final Finder detail = find.byType(PluginDetailPage);
+    for (final String key in <String>[
+      'plugin-detail-toggle-demo',
+      'plugin-detail-restart-demo',
+      'plugin-detail-hot-restart-demo',
+      'plugin-detail-edit-demo',
+      'plugin-detail-uninstall-demo',
+    ]) {
+      expect(
+        find.descendant(of: detail, matching: find.byKey(Key(key))),
+        findsOneWidget,
+        reason: '详情页要有 $key',
+      );
+    }
+
+    // 关闭（注入态没有路由可返回，只能显式 ×）：清空注入、DetailPanel 回到空态
+    await tester.tap(find.byKey(const Key('plugin-detail-close')));
+    await tester.pumpAndSettle();
+    expect(DetailSelection.instance.injected, isNull);
+    expect(find.byType(PluginDetailPage), findsNothing);
+    expect(find.text('点中栏的工具调用或思考'), findsOneWidget);
+  });
+
+  testWidgets('管理按钮：停用发 PATCH enabled、重启与热重启各发各的 mode', (
+    WidgetTester tester,
+  ) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    );
+    await _pump(tester, svc: await _service(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-demo')));
+    await tester.pumpAndSettle();
+
+    // 自定义项（当前已启用）：点「停用」⇒ updateConfig(id, enabled:false)
+    expect(
+      tester
+          .widget<Text>(
+            find.descendant(
+              of: find.byKey(const Key('plugin-detail-toggle-demo')),
+              matching: find.byType(Text),
+            ),
+          )
+          .data,
+      '停用',
+    );
+    await tester.tap(find.byKey(const Key('plugin-detail-toggle-demo')));
+    await tester.pumpAndSettle();
+    expect(admin.calls, contains('update:demo:off'));
+
+    await tester.tap(find.byKey(const Key('plugin-detail-restart-demo')));
+    await tester.pumpAndSettle();
+    expect(admin.calls, contains('restart:demo:cold'));
+
+    await tester.tap(find.byKey(const Key('plugin-detail-hot-restart-demo')));
+    await tester.pumpAndSettle();
+    expect(admin.calls, contains('restart:demo:hot'));
+  });
+
+  testWidgets('内置项管理：停用走 enable/disable 端点（不是 PATCH 自定义配置）', (
+    WidgetTester tester,
+  ) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    )..builtinsResponse = <String, dynamic>{
+      'builtins': <dynamic>[
+        <String, dynamic>{
+          'id': 'sample',
+          'name': '示例插件',
+          'description': '核心自带的示例插件（Python）',
+          'enabled': true,
+          'configured': true,
+          'config': <String, dynamic>{
+            'id': 'sample',
+            'name': '示例插件',
+            'command': 'python',
+            'args': <String>['sample.py'],
+            'enabled': true,
+            'granularity': 'team',
+            'scope': <String, dynamic>{},
+            'builtin': true,
+          },
+          'resolution': <String, dynamic>{'ok': false, 'error': '本机没装 Python'},
+        },
+      ],
+    };
+    await _pump(tester, svc: await _service(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
+    await tester.tap(find.byKey(const Key('plugin-detail-builtin-sample')));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('plugin-detail-toggle-sample')));
+    await tester.pumpAndSettle();
+    expect(admin.calls, contains('builtin:sample:off'));
+    expect(
+      admin.calls.where((String c) => c.startsWith('update:')),
+      isEmpty,
+      reason: '内置项的开关与自定义项各走各的端点，不能混',
+    );
+  });
+
+  testWidgets('卸载：先确认（不点确认不发请求），成功后关掉详情页', (
+    WidgetTester tester,
+  ) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    );
+    await _pump(tester, svc: await _service(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-demo')));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('plugin-detail-uninstall-demo')));
+    await tester.pumpAndSettle();
+    expect(find.text('卸载这个插件？'), findsOneWidget);
+    expect(
+      admin.calls.where((String c) => c.startsWith('uninstall')),
+      isEmpty,
+      reason: '没点确认就一个请求都不发',
+    );
+
+    await tester.tap(find.byKey(const Key('plugin-detail-uninstall-confirm')));
+    await tester.pumpAndSettle();
+    expect(admin.calls, contains('uninstall:demo'));
+    // 成功 ⇒ 条目没了，这一页没有对象：直接关掉（注入态没有路由，只能 clear）
+    expect(find.byType(PluginDetailPage), findsNothing);
+    expect(DetailSelection.instance.injected, isNull);
+  });
+
+  testWidgets('卸载被核心拒（等不到退出确认）⇒ 原因就地显示，详情页不关', (
+    WidgetTester tester,
+  ) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    )..failWrite = '插件 demo 的进程还没确认退出 ⇒ 这次不删任何文件';
+    await _pump(tester, svc: await _service(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-demo')));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('plugin-detail-uninstall-demo')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('plugin-detail-uninstall-confirm')));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byKey(const Key('plugin-detail-manage-error-demo')),
+      findsOneWidget,
+      reason: '失败原因就地留在屏幕上（不是一条转瞬即逝的 snack）',
+    );
+    expect(find.textContaining('还没确认退出'), findsOneWidget);
+    expect(find.byType(PluginDetailPage), findsOneWidget, reason: '失败不关页');
+  });
+
+  testWidgets('站点启用/停用：只发 enabled 单键，开关随回包翻面', (
+    WidgetTester tester,
+  ) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{
+        'plugin.demo.relay.audit': _selfBuiltStation(),
+        'system.broadcast': _builtinStation(),
+      },
+    );
+    await _pump(tester, svc: await _service(), admin: admin);
+    await _showTab(tester, 'plugin-tab-stations');
+    await tester.tap(
+      find.byKey(const Key('station-detail-plugin.demo.relay.audit')),
+    );
+    await tester.pumpAndSettle();
+
+    final Finder toggle = find.byKey(const Key('station-detail-toggle'));
+    expect(tester.widget<Switch>(toggle).value, isTrue, reason: '缺键 = 默认启用');
+
+    await tester.tap(toggle);
+    await tester.pumpAndSettle();
+    expect(admin.lastStationPatch, <String, dynamic>{'enabled': false});
+    expect(
+      tester.widget<Switch>(toggle).value,
+      isFalse,
+      reason: '写成功后用核心回的改后详情刷新（开关当场翻面）',
+    );
+    expect(find.textContaining('已停用（触发以可读原因跳过'), findsOneWidget);
   });
 }

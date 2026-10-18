@@ -1,4 +1,4 @@
-import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 
 import '../models/message.dart';
 
@@ -26,9 +26,29 @@ class DetailSelection extends ChangeNotifier {
   /// 当前选中项的消息 id（null = 未选中）
   String? get selectedId => _message?.id;
 
-  /// 选中一条消息（点工具行 / 思考行时调用）
+  Widget? _injected;
+
+  /// 注入右栏的**整页内容**（插件面板点卡片进详情页时调用 [inject]）。
+  ///
+  /// 为什么不走 Navigator.push：详情页要与中栏消息选中共用右栏那一格
+  /// （用户 2026-10-18 定稿：详情页不再全屏 push），而右栏在窄屏折叠时根本没有
+  /// 自己的路由栈可言。注入态下 DetailPanel 直接返回这一页（它自带 Scaffold/AppBar，
+  /// 由详情页自己负责关闭——AppBar 上的 × 调 [clear]）。
+  Widget? get injected => _injected;
+
+  /// 选中一条消息（点工具行 / 思考行时调用）。
+  ///
+  /// 消息选中与注入详情**互斥**：右栏一格只能显示一种内容。
   void select(ChatMessage message) {
     _message = message;
+    _injected = null;
+    notifyListeners();
+  }
+
+  /// 注入一页详情（插件面板点卡片时调用），同时清掉消息选中。
+  void inject(Widget page) {
+    _injected = page;
+    _message = null;
     notifyListeners();
   }
 
@@ -47,8 +67,9 @@ class DetailSelection extends ChangeNotifier {
   }
 
   void clear() {
-    if (_message == null) return;
+    if (_message == null && _injected == null) return;
     _message = null;
+    _injected = null;
     notifyListeners();
   }
 
