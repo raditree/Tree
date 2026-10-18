@@ -1117,18 +1117,6 @@ class ApiService {
     );
   }
 
-  /// 把一个内置插件从「已隐藏」里放回面板：POST [ApiPaths.pluginBuiltinRestore]
-  ///
-  /// 只恢复可见性（id 从 plugins.yaml 顶层 `hidden_builtins` 摘掉），条目与开关
-  /// 一个字不动——隐藏时已停用，所以恢复后显示「已停用」，要跑起来请再拨开关。
-  /// 隐藏的入口是 [deletePluginConfig]（对内置项 = 停用 + 隐藏，不再 400）。
-  static Future<Map<String, dynamic>> restoreBuiltinPlugin(String id) async {
-    final String encoded = Uri.encodeComponent(id);
-    return _postJson(
-      ApiPaths.pluginBuiltinRestore.replaceFirst('{pluginId}', encoded),
-    );
-  }
-
   /// 发布仓库清单（**只读本地缓存**）：GET [ApiPaths.pluginRelease]
   ///
   /// 返回 `{ok, entries[], skipped[], tag, index_path, online, error}`。注意它**不联网**：

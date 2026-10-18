@@ -46,6 +46,19 @@ class _FakeAdmin implements PluginAdminClient {
         'granularity': 'team',
         'scope': <String, dynamic>{'team_id': 't1'},
       },
+      // 2026-10-18 用户定稿：内置项装进来后就是一条**普通条目**——面板把它当普通
+      // 插件列（同一种 key / 同一套按钮），"内置"这层身份只在详情页按 id 现查补上。
+      <String, dynamic>{
+        'id': 'sample',
+        'name': '示例插件',
+        'description': '核心自带的示例插件（Python）',
+        'command': 'python',
+        'args': <String>['sample.py'],
+        'enabled': true,
+        'granularity': 'team',
+        'scope': <String, dynamic>{},
+        'builtin': true,
+      },
     ],
     'runtime': <String, dynamic>{
       'demo': <String, dynamic>{'running': true, 'health': 'ok', 'known': true},
@@ -59,7 +72,7 @@ class _FakeAdmin implements PluginAdminClient {
         'name': '示例插件',
         'description': '核心自带的示例插件（Python）',
         'enabled': true,
-        'configured': false,
+        'configured': true,
         'resolution': <String, dynamic>{'ok': false, 'error': '本机没装 Python'},
       },
     ],
@@ -93,27 +106,12 @@ class _FakeAdmin implements PluginAdminClient {
       <String, dynamic>{'ok': true};
 
   @override
-  Future<Map<String, dynamic>> restoreBuiltin(String id) async {
-    calls.add('restore:$id');
-    return <String, dynamic>{'ok': true};
-  }
-
-  @override
   Future<Map<String, dynamic>> restartConfig(
     String id, {
     String mode = 'cold',
     bool keepState = true,
   }) async {
     calls.add('restart:$id:$mode');
-    return <String, dynamic>{'ok': true};
-  }
-
-  @override
-  Future<Map<String, dynamic>> setBuiltinEnabled(
-    String id, {
-    required bool enabled,
-  }) async {
-    calls.add('builtin:$id:${enabled ? 'on' : 'off'}');
     return <String, dynamic>{'ok': true};
   }
 
@@ -409,14 +407,14 @@ void main() {
     );
   });
 
-  testWidgets('点内置卡片进详情页：没有落盘条目也要讲清介绍与运行时', (WidgetTester tester) async {
+  testWidgets('点已安装的内置项进详情页：按 id 现查补出「内置插件」身份与运行时', (WidgetTester tester) async {
     final _FakeAdmin admin = _FakeAdmin(
       stationResponses: <String, Map<String, dynamic>>{},
     );
     await _pump(tester, svc: await _service(), admin: admin);
 
     await _showTab(tester, 'plugin-tab-installed');
-    await tester.tap(find.byKey(const Key('plugin-detail-builtin-sample')));
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-sample')));
     await tester.pumpAndSettle();
 
     expect(find.text('核心自带的示例插件（Python）'), findsWidgets);
@@ -843,7 +841,7 @@ void main() {
     await _pump(tester, svc: await _service(), admin: admin);
 
     await _showTab(tester, 'plugin-tab-installed');
-    await tester.tap(find.byKey(const Key('plugin-detail-builtin-sample')));
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-sample')));
     await tester.pumpAndSettle();
 
     final Finder detail = find.byType(PluginDetailPage);
@@ -895,7 +893,7 @@ void main() {
     await _pump(tester, svc: await _service(), admin: admin);
 
     await _showTab(tester, 'plugin-tab-installed');
-    await tester.tap(find.byKey(const Key('plugin-detail-builtin-sample')));
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-sample')));
     await tester.pumpAndSettle();
 
     expect(
@@ -925,7 +923,7 @@ void main() {
     await _pump(tester, svc: await _service(), admin: admin);
 
     await _showTab(tester, 'plugin-tab-installed');
-    await tester.tap(find.byKey(const Key('plugin-detail-builtin-sample')));
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-sample')));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('plugin-detail-repo-sample')));
     await tester.pumpAndSettle();
@@ -963,7 +961,7 @@ void main() {
     await _pump(tester, svc: await _service(), admin: admin);
 
     await _showTab(tester, 'plugin-tab-installed');
-    await tester.tap(find.byKey(const Key('plugin-detail-builtin-sample')));
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-sample')));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('plugin-detail-repo-sample')));
     await tester.pumpAndSettle();
@@ -1090,114 +1088,26 @@ void main() {
     expect(admin.calls, contains('restart:demo:hot'));
   });
 
-  testWidgets('内置项管理：停用走 enable/disable 端点（不是 PATCH 自定义配置）', (
+  testWidgets('内置项装进来后与自定义同一条命：开关走 PATCH（不再打内置专属端点）', (
     WidgetTester tester,
   ) async {
     final _FakeAdmin admin = _FakeAdmin(
       stationResponses: <String, Map<String, dynamic>>{},
-    )..builtinsResponse = <String, dynamic>{
-      'builtins': <dynamic>[
-        <String, dynamic>{
-          'id': 'sample',
-          'name': '示例插件',
-          'description': '核心自带的示例插件（Python）',
-          'enabled': true,
-          'configured': true,
-          'config': <String, dynamic>{
-            'id': 'sample',
-            'name': '示例插件',
-            'command': 'python',
-            'args': <String>['sample.py'],
-            'enabled': true,
-            'granularity': 'team',
-            'scope': <String, dynamic>{},
-            'builtin': true,
-          },
-          'resolution': <String, dynamic>{'ok': false, 'error': '本机没装 Python'},
-        },
-      ],
-    };
+    );
     await _pump(tester, svc: await _service(), admin: admin);
     await _showTab(tester, 'plugin-tab-installed');
-    await tester.tap(find.byKey(const Key('plugin-detail-builtin-sample')));
+    // 面板把它当**普通条目**列（同一种 key）；内置身份由详情页按 id 现查补上
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-sample')));
     await tester.pumpAndSettle();
 
     await tester.tap(find.byKey(const Key('plugin-detail-toggle-sample')));
     await tester.pumpAndSettle();
-    expect(admin.calls, contains('builtin:sample:off'));
+    expect(admin.calls, contains('update:sample:off'));
     expect(
-      admin.calls.where((String c) => c.startsWith('update:')),
-      isEmpty,
-      reason: '内置项的开关与自定义项各走各的端点，不能混',
+      admin.calls.any((String c) => c.startsWith('builtin:')),
+      isFalse,
+      reason: '面板不再打内置专属端点（那条端点留着给别的调用方，UI 不再用）',
     );
-  });
-
-  testWidgets('已隐藏的内置项：管理区只留「恢复显示」，点了发 restore 端点', (
-    WidgetTester tester,
-  ) async {
-    final _FakeAdmin admin = _FakeAdmin(
-      stationResponses: <String, Map<String, dynamic>>{},
-    )..builtinsResponse = <String, dynamic>{
-      'builtins': <dynamic>[
-        <String, dynamic>{
-          'id': 'sample',
-          'name': '示例插件',
-          'description': '核心自带的示例插件（Python）',
-          'enabled': false,
-          'configured': true,
-          'config': <String, dynamic>{
-            'id': 'sample',
-            'name': '示例插件',
-            'command': 'python',
-            'args': <String>['sample.py'],
-            'enabled': false,
-            'granularity': 'team',
-            'scope': <String, dynamic>{},
-            'builtin': true,
-          },
-          'resolution': <String, dynamic>{'ok': false, 'error': '本机没装 Python'},
-        },
-      ],
-      'hidden_builtins': <dynamic>['sample'],
-    };
-    await _pump(tester, svc: await _service(), admin: admin);
-    await _showTab(tester, 'plugin-tab-installed');
-
-    // 主列表不列它，只有「已隐藏」段的行能点进详情（找回入口）
-    expect(find.byKey(const Key('plugin-detail-builtin-sample')), findsNothing);
-    await tester.tap(find.byKey(const Key('plugin-detail-hidden-sample')));
-    await tester.pumpAndSettle();
-
-    final Finder detail = find.byType(PluginDetailPage);
-    expect(
-      find.descendant(
-        of: detail,
-        matching: find.byKey(const Key('plugin-detail-hidden-note-sample')),
-      ),
-      findsOneWidget,
-      reason: '讲清"藏到哪了、条目还在"——隐藏不等于删掉',
-    );
-    expect(
-      find.descendant(
-        of: detail,
-        matching: find.byKey(const Key('plugin-detail-restore-sample')),
-      ),
-      findsOneWidget,
-    );
-    // 隐藏期间不给别的管理按钮（面板都看不见它了，还能点到「启用」就自相矛盾）
-    expect(
-      find.descendant(
-        of: detail,
-        matching: find.byKey(const Key('plugin-detail-toggle-sample')),
-      ),
-      findsNothing,
-    );
-
-    await tester.tap(
-      find.byKey(const Key('plugin-detail-restore-sample')),
-    );
-    await tester.pumpAndSettle();
-    expect(admin.calls, contains('restore:sample'));
   });
 
   testWidgets('卸载：先确认（不点确认不发请求），成功后关掉详情页', (

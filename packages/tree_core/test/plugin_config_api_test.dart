@@ -8,9 +8,9 @@
 //    （命令不存在等）才回 hot_applied=false +
 //    「配置已保存，但本次热应用失败，重启核心后生效」+ 可读原因——不许假装成功。
 // 4. 内置插件：清单常驻（未启用也可见）、enable 写一条带 builtin 标记的普通配置、
-//    disable 把条目置 enabled:false 但**保留条目**；DELETE 对内置项同样不整条删
-//    （E：停用 + 记入顶层 hidden_builtins 隐藏，restore 端点可恢复显示）；
-//    运行时 / 脚本缺失给可读错误。
+//    disable 把条目置 enabled:false 但**保留条目**；DELETE 与自定义项同一条命
+//    （2026-10-18 用户定稿：内置项走普通安装流程，不再"停用 + 隐藏"），
+//    新增同 id 仍 400（不许自定义条目冒名顶替）；运行时 / 脚本缺失给可读错误。
 import 'dart:convert';
 import 'dart:io';
 
@@ -223,10 +223,6 @@ void main() {
     orElse: () => <String, dynamic>{},
   );
 
-  /// 落盘的隐藏名单（plugins.yaml 顶层 `hidden_builtins`，E：内置项的"删除"写这里）。
-  List<String> diskHidden() =>
-      PluginConfigStore(configFile).readHiddenBuiltins();
-
   test('核心启动即接线 agent 工具调用事件（Q8：轮次上限交给插件）', () async {
     final ({CoreServer server, _Client client, PluginBus bus}) ctx =
         await serve('enabled: true\nplugins: []\n');
@@ -403,9 +399,9 @@ void main() {
   });
 
   test('PATCH / DELETE：改开关与删除都写盘；不存在 404', () async {
-    // 夹具 id 用 'crud' 而不是 'sample'：E 起 DELETE 的内置判定是「清单 + 条目标记」
-    // 两路，`sample` 撞内置清单 ⇒ 会被停用+隐藏而不是整条删掉。本用例钉的是**自定义
-    // 插件**的删除语义（整条删 + 实例断开），id 必须挑一个不在内置清单里的。
+    // 夹具 id 用 'crud' 而不是 'sample'：`sample` 撞内置清单 ⇒ POST 新增会被 400
+    // 拒掉。本用例钉的是**自定义插件**的删除语义（整条删 + 实例断开），
+    // id 必须挑一个不在内置清单里的。
     final ({CoreServer server, _Client client, PluginBus bus}) ctx =
         await serve(
           <String>[
@@ -647,7 +643,7 @@ void main() {
     );
   });
 
-  test('内置插件 id 被保护：新增同 id 仍 400，DELETE 改为停用 + 隐藏（可恢复）', () async {
+  test('内置插件 id 被保护：新增同 id 仍 400；DELETE 与自定义项同一条命（整条删）', () async {
     final ({CoreServer server, _Client client, PluginBus bus}) ctx =
         await serve('enabled: true\nplugins: []\n');
     addTearDown(() async {
@@ -664,8 +660,8 @@ void main() {
     expect(create.detail, contains('是内置插件'));
     expect(diskPlugins(), isEmpty, reason: '被拒的请求不落盘');
 
-    // ② 打开内置插件后 DELETE：不再是 400，而是「停用 + 记入 hidden_builtins」——
-    //    条目保留（enabled:false）、成品一个不碰，回包把 hidden 与名单都递回来。
+    // ② 打开内置插件（落一条条目），DELETE 就与自定义项一样：**整条删掉**。
+    //    2026-10-18 用户定稿：内置项走普通安装流程，E 那套「停用 + 隐藏」不再特殊对待。
     expect(
       (await ctx.client.send(
         'POST',
@@ -673,60 +669,39 @@ void main() {
       )).status,
       200,
     );
+    expect(diskEntry('sample'), isNotEmpty, reason: 'enable 先落一条条目');
     final _Res remove = await ctx.client.send(
       'DELETE',
       '/api/plugin/configs/sample',
     );
     expect(remove.status, 200, reason: remove.detail);
-    expect(remove.json['hidden'], isTrue);
-    expect(diskPlugins(), hasLength(1), reason: '内置项不整条删，条目必须还在');
-    expect(diskEntry('sample')['enabled'], isFalse, reason: '隐藏 = 先停用');
-    expect(diskHidden(), contains('sample'));
+    expect(diskPlugins(), isEmpty, reason: '内置项不再"停用 + 隐藏"，就是整条删');
 
-    // ③ 面板据以过滤的那份名单就挂在 GET builtins 顶层（隐藏项本身仍带完整数据）
-    final _Res list = await ctx.client.send('GET', '/api/plugin/builtins');
-    expect(list.status, 200);
+    // ③ 没落过条目的内置 id（compact）：DELETE 如实 404（不凭空造条目、也不记一笔）
     expect(
-      (list.json['hidden_builtins'] as List<dynamic>).cast<String>(),
-      contains('sample'),
+      (await ctx.client.send('DELETE', '/api/plugin/configs/compact')).status,
+      404,
     );
-    expect(
-      (list.json['builtins'] as List<dynamic>),
-      hasLength(greaterThan(0)),
-      reason: '隐藏只是不列，清单数据不丢',
-    );
+    expect(diskEntry('compact'), isEmpty);
 
-    // ④ 恢复显示：摘 id 而已——条目仍停着（恢复显示 ≠ 重新打开）
-    final _Res restore = await ctx.client.send(
-      'POST',
-      '/api/plugin/builtins/sample/restore',
-    );
-    expect(restore.status, 200, reason: restore.detail);
-    expect(diskHidden(), isNot(contains('sample')));
-    expect(diskPlugins(), hasLength(1));
-    expect(diskEntry('sample')['enabled'], isFalse);
-
-    // ⑤ 没落过条目的内置 id（compact）：DELETE 也给 200——只隐藏，不凭空造条目
-    final _Res noEntry = await ctx.client.send(
-      'DELETE',
-      '/api/plugin/configs/compact',
-    );
-    expect(noEntry.status, 200, reason: noEntry.detail);
-    expect(noEntry.json['hidden'], isTrue);
-    expect(diskHidden(), contains('compact'));
-    expect(diskEntry('compact'), isEmpty, reason: '只隐藏，不造条目');
-
-    // ⑥ 未知 id：两个端点都如实 404（隐藏/恢复都不是"随便记一笔"）
+    // ④ 未知 id：DELETE 404
     expect(
       (await ctx.client.send('DELETE', '/api/plugin/configs/unknown')).status,
       404,
     );
+
+    // ⑤ 隐藏机制随 E 一起撤掉：GET builtins 顶层不再有 hidden_builtins
+    final _Res list = await ctx.client.send('GET', '/api/plugin/builtins');
+    expect(list.status, 200);
     expect(
-      (await ctx.client.send(
-        'POST',
-        '/api/plugin/builtins/unknown/restore',
-      )).status,
-      404,
+      list.json.containsKey('hidden_builtins'),
+      isFalse,
+      reason: 'hidden 名单已随 E 的隐藏机制一起撤掉',
+    );
+    expect(
+      (list.json['builtins'] as List<dynamic>),
+      hasLength(greaterThan(0)),
+      reason: '清单本身照旧常驻（未启用也可见）',
     );
   });
 

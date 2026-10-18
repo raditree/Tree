@@ -401,25 +401,6 @@
     用例：`plugin_config_api_test.dart`（卸载三条 + 四路由 503）、
     `plugin_downloader_test.dart`（三来源并集 / 解释器不碰 / 只删存在的）。
 
-33. **内置项的可见性交给盘：DELETE = 「停用 + 隐藏」不删条目，`hidden_builtins` 里的 id 不播种**
-    （2026-10-18 用户定稿 E）：
-    - **`DELETE /api/plugin/configs/{id}` 对内置项不再 400**：判内置看清单 + 条目标记两路
-      （与不变量 32 同口径）⇒ 停用（有条目才置 `enabled: false`，**条目保留**）⇒ id 记进
-      `plugins.yaml` **顶层 `hidden_builtins`** ⇒ 200 + `hidden: true` + `hidden_builtins`。
-      成品文件一个不碰（隐藏只管“看得见看不见”，与“装没装 / 能不能跑”无关）；**没落过条目的
-      内置 id 同样 200**（只隐藏、不凭空造条目）；非内置且无条目仍 404；自定义条目整条删除不变。
-    - **`GET /api/plugin/builtins` 顶层递 `hidden_builtins`**：隐藏项**仍带完整数据**留在
-      `builtins` 里（名字 / 说明 / 解析都在），由**面板侧过滤**——主列表只列未隐藏项，
-      另设「已隐藏」段作找回入口（否则恢复按钮不可达，隐藏成单行道）。
-    - **`POST /api/plugin/builtins/{pluginId}/restore` 只恢复可见性**：把 id 从名单摘掉即可，
-      **条目与开关一个字不动**（恢复显示 ≠ 重新打开）；非内置 id 404。详情页在隐藏态只渲染
-      「恢复显示」一颗按钮——面板里都看不见它了，还能点到「启用」就自相矛盾。
-    - **播种跳过**（[seedDefaultEnabledBuiltins]）：命中 hidden 名单的一律不播（面板都不列它，
-      落一条只会“越藏越深”）；把 id 摘掉后照常播。
-    用例：`plugin_config_api_test.dart`（DELETE / GET / restore 三端点 + 无条目内置项）、
-    `plugin_config_store_test.dart`（名单往返 / 幂等 / 空了删键）、
-    `plugin_tool_define_self_updater_test.dart`（不播种）。
-
 ## 测试
 
 ```bash

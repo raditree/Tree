@@ -43,18 +43,6 @@ abstract class PluginAdminClient {
     bool keepState = true,
   });
 
-  /// 打开 / 关闭一个内置插件（每项各自一个开关）。
-  Future<Map<String, dynamic>> setBuiltinEnabled(
-    String id, {
-    required bool enabled,
-  });
-
-  /// 把一个内置插件从「已隐藏」里放回面板（E）：POST …/builtins/{id}/restore。
-  ///
-  /// 只恢复可见性（id 从 plugins.yaml 顶层 `hidden_builtins` 摘掉），条目保持原样；
-  /// 隐藏的入口是 [deleteConfig]（对内置项核心不再 400，而是「停用 + 隐藏」）。
-  Future<Map<String, dynamic>> restoreBuiltin(String id);
-
   /// 发布仓库清单（**只读本地缓存**，不联网）：GET /api/plugin/release。
   ///
   /// 面板打开先用它立刻列出“上次看到的那些”（断网时也有的可看，并标清是缓存）；
@@ -148,16 +136,6 @@ class ApiPluginAdminClient implements PluginAdminClient {
     String mode = 'cold',
     bool keepState = true,
   }) => ApiService.restartPluginConfig(id, mode: mode, keepState: keepState);
-
-  @override
-  Future<Map<String, dynamic>> setBuiltinEnabled(
-    String id, {
-    required bool enabled,
-  }) => ApiService.setBuiltinPluginEnabled(id, enabled: enabled);
-
-  @override
-  Future<Map<String, dynamic>> restoreBuiltin(String id) =>
-      ApiService.restoreBuiltinPlugin(id);
 
   @override
   Future<Map<String, dynamic>> fetchRelease() => ApiService.getPluginRelease();
@@ -276,12 +254,11 @@ class _PluginPanelState extends State<PluginPanel> {
   Map<String, dynamic> _runtime = <String, dynamic>{};
 
   /// 内置插件目录（静态清单 + 启用态 + 运行时解析结果）。
+  ///
+  /// 面板**不再**单列内置组（2026-10-18 用户定稿：内置项走普通安装流程），
+  /// 但这份清单仍要读：据 id 判定某条是不是内置项、详情页据此给「发布仓库」区块
+  /// 与成品解析结果。
   List<Map<String, dynamic>> _builtins = <Map<String, dynamic>>[];
-
-  /// 已隐藏的内置插件 id（E：核心 plugins.yaml 顶层 `hidden_builtins`，随
-  /// GET builtins 一起递来）。主列表据此把它们滤掉（面板只列未隐藏项），
-  /// 另开「已隐藏」段承载找回入口——藏起来不等于找不回来。
-  Set<String> _hiddenBuiltinIds = <String>{};
 
   /// plugins.yaml 的真实路径（核心给；清单接口不可用时退回快照里的路径）。
   String _adminPath = '';
@@ -314,12 +291,6 @@ class _PluginPanelState extends State<PluginPanel> {
 
   /// 正在拉索引（拉期间禁用刷新按钮，避免连点叠成两个请求）。
   bool _releaseLoading = false;
-
-  /// 「从仓库装它 / 从仓库更新」的**就地**失败原因（id → 原因）。
-  ///
-  /// 与 release 那一节的 snack 不同：这颗按钮长在卡片上，失败就必须显示在卡片上 ——
-  /// 刷新失败、索引里没有这一条、安装被闸门拦住都算，成功或重试时清掉。
-  final Map<String, String> _repoErrors = <String, String>{};
 
   // ── 三栏（B：未安装 / 已安装 / 站点）──────────────────────────────────
 
@@ -383,10 +354,6 @@ class _PluginPanelState extends State<PluginPanel> {
             ? Map<String, dynamic>.from(runtime)
             : <String, dynamic>{};
         _builtins = _mapList(builtins['builtins']);
-        final Object? hiddenIds = builtins['hidden_builtins'];
-        _hiddenBuiltinIds = hiddenIds is List
-            ? <String>{for (final Object? v in hiddenIds) v.toString()}
-            : <String>{};
         _adminPath = (configs['path'] ?? builtins['path'] ?? '').toString();
         _adminError = null;
       });
@@ -476,7 +443,7 @@ class _PluginPanelState extends State<PluginPanel> {
   }
 
   /// 装一条（含写盘 + 热应用）：走 [_submit] ⇒ 提交期间禁用该项、结果如实显示、
-  /// 之后重拉清单与快照（新装的那一条应该立刻出现在“自定义”组里）。
+  /// 之后重拉清单与快照（新装的那一条应该立刻出现在「已安装」栏里）。
   Future<void> _installRelease(String id) => _submit(
     id,
     () => _admin.installRelease(id),
@@ -494,69 +461,6 @@ class _PluginPanelState extends State<PluginPanel> {
   static String _reasonOf(Object error) =>
       '$error'.replaceFirst('Exception: ', '');
 
-  /// 内置项的「从仓库装它 / 从仓库更新」：**先自动刷新索引，再 install**。
-  ///
-  /// 与 release 那一节的手动按钮不同，这颗按钮是“缺成品”场景的就地入口 —— 用户不该
-  /// 先去下面那一节点「刷新」再找这一条。失败原因写进 [_repoErrors]（卡片上直接显示，
-  /// 不只是一条转瞬即逝的 snack）：刷新失败、索引里没有这一条、安装被闸门拦住都算。
-  Future<void> _installFromRepo(String id) async {
-    setState(() {
-      _busy.add(id);
-      _repoErrors.remove(id);
-    });
-    try {
-      // ① 先刷新：装机端要的是**最新索引**（缓存那份可能还没有这一条，或版本旧）。
-      final Map<String, dynamic> refreshed = await _admin.refreshRelease();
-      _applyReleaseListing(refreshed);
-      final String refreshError = (refreshed['error'] ?? '').toString();
-      if (refreshed['ok'] == false) {
-        // 刷新失败不清空条目：核心把上一次那份递在 cached 里，里面**有**这一条
-        // 就还能装（“今晚限流”不该变成“什么都装不了”）。
-        final Object? cached = refreshed['cached'];
-        if (cached is Map) {
-          _applyReleaseListing(
-            Map<String, dynamic>.from(cached),
-            keepError: refreshError,
-          );
-        }
-      }
-      // ② 索引里没有这一条（仓库还没发 / 刷新后仍是旧索引）⇒ 就地说明，不发 install。
-      final bool known = _releaseEntries.any(
-        (Map<String, dynamic> e) =>
-            (e['plugin_id'] ?? '').toString() == id,
-      );
-      if (!known) {
-        setState(() {
-          _repoErrors[id] = refreshError.isEmpty
-              ? '索引里没有 $id 这一条（发布仓库还没发它，或刷新后仍是旧索引）'
-              : '刷新索引失败：$refreshError（缓存里也没有 $id 这一条）';
-        });
-        return;
-      }
-      // ③ install（核心失败会抛成带原因的异常，下面 catch 里就地显示）。
-      final Map<String, dynamic> result = await _admin.installRelease(id);
-      setState(() => _repoErrors.remove(id));
-      final Object? install = result['install'];
-      final String version = install is Map
-          ? (install['version'] ?? '').toString()
-          : '';
-      _showWriteResult(
-        result,
-        successText: version.isEmpty
-            ? '已从发布仓库安装 $id'
-            : '已从发布仓库安装 $id（$version）',
-      );
-      await _loadAdmin();
-      await _svc.refresh();
-    } catch (error) {
-      final String reason = _reasonOf(error);
-      if (!mounted) return;
-      setState(() => _repoErrors[id] = reason);
-    } finally {
-      if (mounted) setState(() => _busy.remove(id));
-    }
-  }
-
   /// 从仓库装/更新成功后的重拉（清单 + 快照：新版本立刻反映在卡片上）。
   /// 详情页的仓库按钮与管理按钮装完也走这里（页面自己不持有面板状态）。
   Future<void> _reloadAfterRepoInstall() async {
@@ -565,34 +469,17 @@ class _PluginPanelState extends State<PluginPanel> {
     _reinjectDetail();
   }
 
-  /// 自定义插件：落盘条目里没有 builtin 标记、且**不属于内置清单**的那些。
+  /// 已落盘的插件条目——**内置与自定义同一条命**。
   ///
-  /// 排除内置 id 是为了防手改：用户把 plugins.yaml 里的 builtin 标记删掉之后，
-  /// 同一条目会同时出现在内置组（清单常驻）与自定义组（显示两份）——这里按 id 去重。
-  List<Map<String, dynamic>> get _customConfigs {
-    final Set<String> builtinIds = <String>{
-      for (final Map<String, dynamic> b in _builtins)
-        (b['id'] ?? '').toString(),
-    };
-    return <Map<String, dynamic>>[
-      for (final Map<String, dynamic> c in _configs)
-        if (c['builtin'] != true &&
-            !builtinIds.contains((c['id'] ?? '').toString()))
-          c,
-    ];
-  }
-
-  /// 内置组**主列表**列出来的那些（E：hidden 里的不列——「面板只列未隐藏项」）。
-  List<Map<String, dynamic>> get _visibleBuiltins => <Map<String, dynamic>>[
-    for (final Map<String, dynamic> b in _builtins)
-      if (!_hiddenBuiltinIds.contains((b['id'] ?? '').toString())) b,
-  ];
-
-  /// 被隐藏的那些（E：单独一段列出，点开详情页「恢复显示」）。
-  List<Map<String, dynamic>> get _hiddenBuiltinItems => <Map<String, dynamic>>[
-    for (final Map<String, dynamic> b in _builtins)
-      if (_hiddenBuiltinIds.contains((b['id'] ?? '').toString())) b,
-  ];
+  /// 为什么不再分「内置 / 自定义」两组（2026-10-18 用户定稿）：内置项就是 `plugins/`
+  /// 目录下的那四个，成品不随主包、从发布仓库装。既是"装出来的"，装完就是一条普通
+  /// 条目：面板单列一组让用户看到"清单里常驻但本机还没装"的那些，反而是把"能装"和
+  /// "已装"混在一处。所以这一栏只列**真有条目**的插件，内置项的"去哪儿装"交给
+  /// 「未安装」栏（发布索引 + 从仓库装它），两者不再各说一套。
+  ///
+  /// 内置清单 [builtins] 仍要读：面板据 id 判断某条是不是内置项（详情页据此给
+  /// 「发布仓库」区块与成品解析结果），列表本身不再用它。
+  List<Map<String, dynamic>> get _installedConfigs => _configs;
 
   // ── 提交 ─────────────────────────────────────────────────────────────
 
@@ -705,11 +592,11 @@ class _PluginPanelState extends State<PluginPanel> {
   String _introOf(
     String id, {
     Map<String, dynamic> entry = const <String, dynamic>{},
-    Map<String, dynamic> spec = const <String, dynamic>{},
+    Map<String, dynamic>? spec,
   }) {
     final String fromEntry = (entry['description'] ?? '').toString();
     if (fromEntry.isNotEmpty) return fromEntry;
-    final String fromSpec = (spec['description'] ?? '').toString();
+    final String fromSpec = (spec?['description'] ?? '').toString();
     if (fromSpec.isNotEmpty) return fromSpec;
     return _instanceOf(id)?.description ?? '';
   }
@@ -782,54 +669,41 @@ class _PluginPanelState extends State<PluginPanel> {
     return null;
   }
 
-  /// 内置项详情（介绍口径与「编辑」弹窗回填一致：清单条目优先于内置目录）。
+  /// 一条**已安装插件**的详情。
+  ///
+  /// 内置与自定义合流后这里只有一个入口（原先的 `_openBuiltinDetail` 已并入）：
+  /// 同一条条目可能正是内置清单里的 id（那四个内置插件的成品从发布仓库装、装完就
+  /// 是一条普通条目），此时详情页要**多知道两件事**——归属是内置（intro 用清单里的
+  /// 说明）与成品解析结果（「发布仓库」区块据此判断"本机有没有这一份"）。这两样都
+  /// 按 id 现查清单，查不到就按普通自定义项渲染。
   ///
   /// 构造器里按 id **重新查一遍**当前清单（而不是闭包捕获那一份）：管理按钮写完、
   /// 面板重拉后重新注入时，详情页拿到的必须是新条目（开关态 / 解析结果 / 版本）。
-  void _openBuiltinDetail(Map<String, dynamic> item) {
-    final String id = (item['id'] ?? '').toString();
-    _openPluginDetail(() {
-      final Map<String, dynamic> cur = _builtinItemOf(id) ?? item;
-      final Map<String, dynamic> entry =
-          (cur['config'] as Map<String, dynamic>?) ?? const <String, dynamic>{};
-      return PluginDetailPage(
-        pluginId: id,
-        name: (cur['name'] ?? '').toString(),
-        intro: _introOf(id, entry: entry, spec: cur),
-        isBuiltin: true,
-        entry: entry,
-        runtime: _runtimeOf(id),
-        resolution: cur['resolution'] as Map<String, dynamic>?,
-        instance: _instanceOf(id),
-        stations: _allStations,
-        onOpenStation: _openStationDetail,
-        admin: _admin,
-        onInstalled: _reloadAfterRepoInstall,
-        onChanged: _reloadAfterRepoInstall,
-        onEdit: () => _openEditor(entry: entry, spec: cur, isBuiltin: true),
-        isHidden: _hiddenBuiltinIds.contains(id),
-      );
-    });
-  }
-
-  /// 自定义项详情。
   void _openCustomDetail(Map<String, dynamic> entry) {
     final String id = (entry['id'] ?? '').toString();
     _openPluginDetail(() {
       final Map<String, dynamic> cur = _configEntryOf(id) ?? entry;
+      final Map<String, dynamic>? spec = _builtinItemOf(id);
+      final bool isBuiltin = spec != null;
       return PluginDetailPage(
         pluginId: id,
-        name: (cur['name'] ?? '').toString(),
-        intro: _introOf(id, entry: cur),
+        name: (cur['name'] ?? spec?['name'] ?? '').toString(),
+        intro: _introOf(id, entry: cur, spec: spec),
+        isBuiltin: isBuiltin,
         entry: cur,
         runtime: _runtimeOf(id),
+        resolution: spec?['resolution'] as Map<String, dynamic>?,
         instance: _instanceOf(id),
         stations: _allStations,
         onOpenStation: _openStationDetail,
         admin: _admin,
         onInstalled: _reloadAfterRepoInstall,
         onChanged: _reloadAfterRepoInstall,
-        onEdit: () => _openEditor(entry: cur),
+        onEdit: () => _openEditor(
+          entry: cur,
+          spec: spec,
+          isBuiltin: isBuiltin,
+        ),
       );
     });
   }
@@ -850,21 +724,16 @@ class _PluginPanelState extends State<PluginPanel> {
     );
   }
 
-  /// 每一项自己的开关：自定义插件 → PATCH enabled；内置插件 → enable / disable。
+  /// 每一项自己的开关（一律走 PATCH enabled）。
+  ///
+  /// 内置项装进来之后就是一条**普通条目**（2026-10-18 用户定稿），不再有
+  /// 「内置插件走 enable / disable 端点」这条岔路——那条端点仍在核心侧（供
+  /// 别的调用方），面板不再用它。
   Future<void> _toggleCustom(Map<String, dynamic> entry, bool value) {
     final String id = (entry['id'] ?? '').toString();
     return _submit(
       id,
       () => _admin.updateConfig(id, <String, dynamic>{'enabled': value}),
-      successText: value ? '已写入启用状态' : '已写入停用状态',
-    );
-  }
-
-  Future<void> _toggleBuiltin(Map<String, dynamic> item, bool value) {
-    final String id = (item['id'] ?? '').toString();
-    return _submit(
-      id,
-      () => _admin.setBuiltinEnabled(id, enabled: value),
       successText: value ? '已写入启用状态' : '已写入停用状态',
     );
   }
@@ -975,42 +844,6 @@ class _PluginPanelState extends State<PluginPanel> {
     );
     if (confirmed != true || !mounted) return;
     await _submit(id, () => _admin.deleteConfig(id), successText: '已删除插件 $id');
-  }
-
-  /// 内置项的「删除」（E）：核心侧 DELETE 对内置项**不整条删**，改为停用 +
-  /// 记入 plugins.yaml 顶层 `hidden_builtins`——条目与成品都还在，详情页
-  /// 「恢复显示」把 id 摘掉就回来了。所以确认框必须把这条退路说清楚。
-  Future<void> _hideBuiltin(Map<String, dynamic> item) async {
-    final String id = (item['id'] ?? '').toString();
-    final bool? confirmed = await showDialog<bool>(
-      context: context,
-      builder: (BuildContext ctx) => AlertDialog(
-        title: const Text('从面板隐藏这个内置插件？'),
-        content: Text(
-          '内置插件不会真的删掉：条目会停用并记入 plugins.yaml 的 '
-          'hidden_builtins，成品也保留。之后可在「已隐藏」里点开详情，'
-          '用「恢复显示」把它放回面板。',
-          style: const TextStyle(fontSize: 12),
-        ),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            key: const Key('plugin-hide-confirm'),
-            onPressed: () => Navigator.of(ctx).pop(true),
-            child: const Text('隐藏'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true || !mounted) return;
-    await _submit(
-      id,
-      () => _admin.deleteConfig(id),
-      successText: '已停用并隐藏 $id（可在「已隐藏」里恢复）',
-    );
   }
 
   /// 添加 / 编辑弹窗（内置插件也能编辑；id 不可改）。
@@ -1313,9 +1146,9 @@ class _PluginPanelState extends State<PluginPanel> {
     return id.contains(query) || name.contains(query);
   }
 
-  /// 「插件实例」的条目数：清单可用 = 内置项（未隐藏的）+ 自定义项；否则退回快照实例数。
+  /// 「插件实例」的条目数：清单可用 = 已落盘条目（内置与自定义同一条命）；否则退回快照实例数。
   int _instanceCount(PluginSnapshot snap) => _adminError == null
-      ? _visibleBuiltins.length + _customConfigs.length
+      ? _installedConfigs.length
       : snap.instances.length;
 
   /// 清单文件路径 + 生效方式（M9 §4.2 要求把"真实路径"与"怎么生效"写在界面上）。
@@ -1336,7 +1169,8 @@ class _PluginPanelState extends State<PluginPanel> {
     );
   }
 
-  /// 插件实例区：内置 / 自定义两组；清单接口不可用时退回只读实例列表。
+  /// 插件实例区：一条清单（内置与自定义不再分组）；清单接口不可用时退回只读实例列表
+  /// （旧核心没有这些端点）。
   List<Widget> _buildInstances(ColorScheme cs, PluginSnapshot snap) {
     if (_adminError != null) {
       return <Widget>[
@@ -1354,52 +1188,11 @@ class _PluginPanelState extends State<PluginPanel> {
           ),
       ];
     }
-    final List<Map<String, dynamic>> custom = _customConfigs;
-    final List<Map<String, dynamic>> visible = _visibleBuiltins;
-    final List<Map<String, dynamic>> hidden = _hiddenBuiltinItems;
+    final List<Map<String, dynamic>> installed = _installedConfigs;
     return <Widget>[
       _groupHeader(
         cs,
-        '内置插件（${visible.length}）',
-        trailing: IconButton(
-          key: const Key('plugin-builtins-refresh'),
-          tooltip: '重新解析内置插件的成品（从发布仓库装完点这里）',
-          iconSize: 16,
-          visualDensity: VisualDensity.compact,
-          onPressed: () => _loadAdmin(refreshBuiltins: true),
-          icon: const Icon(Icons.refresh),
-        ),
-      ),
-      // E：主列表只列**未隐藏**的内置项；被隐藏的挪到下面「已隐藏」段，
-      // 免得"隐藏"成了找不回来的单行道（恢复按钮在详情页，入口在这儿）。
-      if (_builtins.isEmpty)
-        _emptyHint(cs, '核心没有提供内置插件目录（旧核心？）')
-      else if (visible.isEmpty)
-        _emptyHint(cs, '内置插件都在下面的「已隐藏」里（点开可恢复显示）。')
-      else
-        ...visible.map(
-          (Map<String, dynamic> b) => _tappable(
-            key: Key('plugin-detail-builtin-${(b['id'] ?? '').toString()}'),
-            onTap: () => _openBuiltinDetail(b),
-            card: _builtinCard(cs, b),
-          ),
-        ),
-      if (hidden.isNotEmpty) ...<Widget>[
-        _groupHeader(cs, '已隐藏（${hidden.length}）'),
-        _emptyHint(cs, '条目与成品都还在 · 点开详情页「恢复显示」把它放回上面。'),
-        ...hidden.map(
-          (Map<String, dynamic> b) => _tappable(
-            key: Key(
-              'plugin-detail-hidden-${(b['id'] ?? '').toString()}',
-            ),
-            onTap: () => _openBuiltinDetail(b),
-            card: _hiddenBuiltinCard(cs, b),
-          ),
-        ),
-      ],
-      _groupHeader(
-        cs,
-        '自定义插件（${custom.length}）',
+        '已安装插件（${installed.length}）',
         trailing: TextButton.icon(
           key: const Key('plugin-add'),
           onPressed: () => _openEditor(),
@@ -1407,10 +1200,10 @@ class _PluginPanelState extends State<PluginPanel> {
           label: const Text('添加插件', style: TextStyle(fontSize: 12)),
         ),
       ),
-      if (custom.isEmpty)
-        _emptyHint(cs, '还没有自定义插件。点「添加插件」写一个（命令 = 要拉起的进程）。')
+      if (installed.isEmpty)
+        _emptyHint(cs, '还没有插件。内置项与自定义插件都从「未安装」栏装进来。')
       else
-        ...custom.map(
+        ...installed.map(
           (Map<String, dynamic> e) => _tappable(
             key: Key('plugin-detail-custom-${(e['id'] ?? '').toString()}'),
             onTap: () => _openCustomDetail(e),
@@ -1420,7 +1213,7 @@ class _PluginPanelState extends State<PluginPanel> {
     ];
   }
 
-  /// 分组标题（内置 / 自定义），右侧可挂一个操作。
+  /// 分组标题（右侧可挂一个操作）。
   Widget _groupHeader(ColorScheme cs, String text, {Widget? trailing}) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 4),
@@ -1442,198 +1235,15 @@ class _PluginPanelState extends State<PluginPanel> {
     );
   }
 
-  /// 内置插件卡片：**每一项一个开关**；「删除」= 停用 + 记入 hidden_builtins
-  /// 隐藏（条目保留，详情页「恢复显示」拿得回来），见 [_hideBuiltin]。
-  Widget _builtinCard(ColorScheme cs, Map<String, dynamic> item) {
-    final String id = (item['id'] ?? '').toString();
-    final String name = (item['name'] ?? '').toString();
-    final bool enabled = item['enabled'] == true;
-    final bool configured = item['configured'] == true;
-    final Map<String, dynamic> entry =
-        (item['config'] as Map<String, dynamic>?) ?? <String, dynamic>{};
-    final Map<String, dynamic> resolution =
-        (item['resolution'] as Map<String, dynamic>?) ?? <String, dynamic>{};
-    final bool resolvable = resolution['ok'] == true;
-    final String resolutionText = resolvable
-        ? '运行时 ${resolution['command']} · 脚本 ${resolution['script_path']}'
-        : '运行时未就绪：${resolution['error'] ?? '未知原因'}';
-    final List<String> entryArgs = <String>[
-      for (final Object? a in (entry['args'] as List<dynamic>? ?? <dynamic>[]))
-        a.toString(),
-    ];
-    return Container(
-      margin: const EdgeInsets.only(bottom: 6),
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        border: Border.all(color: Theme.of(context).dividerColor),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          Row(
-            children: <Widget>[
-              Expanded(
-                child: Text(
-                  name.isEmpty ? id : name,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-              _pill(cs, '内置', emphasize: true),
-              const SizedBox(width: 6),
-              _enabledLabel(cs, enabled),
-              Switch(
-                key: Key('plugin-switch-builtin-$id'),
-                value: enabled,
-                onChanged: _busy.contains(id)
-                    ? null
-                    : (bool value) => _toggleBuiltin(item, value),
-              ),
-            ],
-          ),
-          Text(id, style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
-          if ((item['description'] ?? '').toString().isNotEmpty)
-            Text(
-              (item['description'] ?? '').toString(),
-              maxLines: 3,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
-            ),
-          Text(
-            resolutionText,
-            style: TextStyle(
-              fontSize: 11,
-              color: resolvable ? cs.onSurfaceVariant : cs.error,
-            ),
-          ),
-          if (!resolvable)
-            // 2026-10-18：插件成品不再随安装包（只由 tree-plugins 的 release 提供），
-            // 所以“解析不到”是新装机的**常态**而不是故障。上面那行只说“运行时未就绪：
-            // 在 … 找不到 tree_xxx.exe”，读起来像坏了；这一行把用户引到他真能动手的
-            // 地方——就地这颗「从仓库装它」（A+ 起按钮就在卡片上，不用再去下面那一节）。
-            // 两条都留着：原始错误是诊断信息（它列了查找路径），不能拿指引替掉它。
-            Text(
-              '本机还没有这一份成品 · 点「从仓库装它」（装完回来再打开开关）',
-              key: Key('plugin-builtin-needs-repo-$id'),
-              style: TextStyle(fontSize: 11, color: cs.tertiary),
-            ),
-          // A+：同一颗按钮两种文案 —— 缺成品「从仓库装它」、已装/有更新「从仓库更新」。
-          // 点它先自动刷新索引再 install；失败原因**就地**显示在这张卡上（不只 snack）。
-          TextButton(
-            key: Key('plugin-builtin-repo-$id'),
-            onPressed: _busy.contains(id) ? null : () => _installFromRepo(id),
-            child: Text(
-              _busy.contains(id)
-                  ? '正在处理…'
-                  : (resolvable ? '从仓库更新' : '从仓库装它'),
-              style: const TextStyle(fontSize: 12),
-            ),
-          ),
-          if (_repoErrors.containsKey(id))
-            Text(
-              _repoErrors[id]!,
-              key: Key('plugin-builtin-repo-error-$id'),
-              style: TextStyle(fontSize: 11, color: cs.error),
-            ),
-          if (configured)
-            Text(
-              '命令：${entry['command']} ${entryArgs.join(' ')}',
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
-            ),
-          Row(
-            children: <Widget>[
-              if (configured)
-                TextButton(
-                  key: Key('plugin-edit-$id'),
-                  onPressed: _busy.contains(id)
-                      ? null
-                      : () => _openEditor(
-                          entry: entry,
-                          spec: item,
-                          isBuiltin: true,
-                        ),
-                  child: const Text('编辑', style: TextStyle(fontSize: 12)),
-                ),
-              if (configured)
-                TextButton(
-                  key: Key('plugin-restart-$id'),
-                  onPressed: _busy.contains(id) ? null : () => _restart(id),
-                  child: const Text('重启', style: TextStyle(fontSize: 12)),
-                ),
-              if (configured)
-                TextButton(
-                  key: Key('plugin-delete-$id'),
-                  onPressed: _busy.contains(id)
-                      ? null
-                      : () => _hideBuiltin(item),
-                  child: Text(
-                    '删除',
-                    style: TextStyle(fontSize: 12, color: cs.error),
-                  ),
-                ),
-              Expanded(
-                child: Text(
-                  configured
-                      ? '停用用右侧开关；删除 = 停用并隐藏（可恢复）'
-                      : '打开后可编辑（核心会解析运行时与脚本）',
-                  style: TextStyle(fontSize: 10, color: cs.outline),
-                ),
-              ),
-            ],
-          ),
-          // 热重启 / 强制停止（阶段 3）：只对已落盘的内置项开放。
-          if (configured) Wrap(spacing: 4, children: _lifecycleActions(id)),
-          _detailAffordance(cs, '看插件介绍与工具'),
-        ],
-      ),
-    );
-  }
-
-  /// 已隐藏内置项的紧凑行（E）：不摆开关和管理按钮——它在面板里本来就该
-  /// "不存在"；这行只是找回入口，点开详情页用「恢复显示」放回去。
-  Widget _hiddenBuiltinCard(ColorScheme cs, Map<String, dynamic> item) {
-    final String id = (item['id'] ?? '').toString();
-    final String name = (item['name'] ?? '').toString();
-    return Container(
-      margin: const EdgeInsets.only(bottom: 6),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      decoration: BoxDecoration(
-        border: Border.all(color: Theme.of(context).dividerColor),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Row(
-        children: <Widget>[
-          Expanded(
-            child: Text(
-              name.isEmpty ? id : name,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: 13,
-                fontWeight: FontWeight.w600,
-                color: cs.onSurfaceVariant,
-              ),
-            ),
-          ),
-          _pill(cs, '已隐藏'),
-          const SizedBox(width: 6),
-          Icon(Icons.chevron_right, size: 16, color: cs.outline),
-        ],
-      ),
-    );
-  }
-
-  /// 自定义插件卡片：**每一项一个开关** + 编辑 / 删除 / 重启。
+  /// 已安装插件卡片——**内置与自定义同一条命**（2026-10-18 用户定稿）：
+  /// 内置项装进来后就是一条普通条目，这张卡不再分岔；只在编辑时按 id 补一份内置
+  /// 清单（`spec` / `isBuiltin`），让编辑器仍能显示内置默认值。
   Widget _configCard(ColorScheme cs, Map<String, dynamic> entry) {
     final String id = (entry['id'] ?? '').toString();
     final String name = (entry['name'] ?? '').toString();
     final bool enabled = entry['enabled'] != false;
     final Map<String, dynamic> runtime = _runtimeOf(id);
+    final Map<String, dynamic>? spec = _builtinItemOf(id);
     final List<String> args = <String>[
       for (final Object? a in (entry['args'] as List<dynamic>? ?? <dynamic>[]))
         a.toString(),
@@ -1717,7 +1327,11 @@ class _PluginPanelState extends State<PluginPanel> {
                 key: Key('plugin-edit-$id'),
                 onPressed: _busy.contains(id)
                     ? null
-                    : () => _openEditor(entry: entry),
+                    : () => _openEditor(
+                        entry: entry,
+                        spec: spec,
+                        isBuiltin: spec != null,
+                      ),
                 child: const Text('编辑', style: TextStyle(fontSize: 12)),
               ),
               TextButton(

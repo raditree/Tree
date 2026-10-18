@@ -241,7 +241,6 @@ class PluginDetailPage extends StatelessWidget {
     this.onInstalled,
     this.onEdit,
     this.onChanged,
-    this.isHidden = false,
   });
 
   /// 插件 id（清单与快照的公共键）
@@ -286,10 +285,6 @@ class PluginDetailPage extends StatelessWidget {
   /// 管理按钮（启用 / 停用 / 卸载 / 重启 / 热重启）写成功后的回调：面板重拉清单
   /// 并重新注入本页（否则详情页停在写之前的旧条目上）。null ⇒ 只发请求不回刷。
   final Future<void> Function()? onChanged;
-
-  /// 这一条已被从面板隐藏（E：plugins.yaml 顶层 `hidden_builtins` 里有它）。
-  /// 管理区换成「恢复显示」——隐藏期间不该还能启用它（面板都看不见了）。
-  final bool isHidden;
 
   bool get _hasRuntime {
     if (runtime.isNotEmpty || instance != null) {
@@ -353,7 +348,6 @@ class PluginDetailPage extends StatelessWidget {
                   entry: entry,
                   onEdit: onEdit,
                   onChanged: onChanged,
-                  isHidden: isHidden,
                 ),
               ],
               note: entry.isEmpty
@@ -817,15 +811,11 @@ class _PluginManageActions extends StatefulWidget {
     required this.entry,
     this.onEdit,
     this.onChanged,
-    this.isHidden = false,
   });
 
   final PluginAdminClient admin;
   final String pluginId;
   final bool isBuiltin;
-
-  /// 已从面板隐藏（E）：本区只留「恢复显示」，其余管理按钮不渲染。
-  final bool isHidden;
 
   /// 落盘条目（空 = 只有运行实例没有条目：开关与卸载都没有对象，只留重启）。
   final Map<String, dynamic> entry;
@@ -883,16 +873,15 @@ class _PluginManageActionsState extends State<_PluginManageActions> {
     }
   }
 
-  /// 启用 / 停用：内置走 enable / disable 端点，自定义走 PATCH enabled（与面板同口径）。
+  /// 启用 / 停用：一律走 PATCH enabled（2026-10-18 用户定稿：内置项装进来后就是
+  /// 一条普通条目，不再有「内置走 enable / disable 端点」那条岔路）。
   Future<void> _toggle() async {
     final bool next = !_enabled;
     final bool ok = await _run(
-      () => widget.isBuiltin
-          ? widget.admin.setBuiltinEnabled(widget.pluginId, enabled: next)
-          : widget.admin.updateConfig(
-              widget.pluginId,
-              <String, dynamic>{'enabled': next},
-            ),
+      () => widget.admin.updateConfig(
+        widget.pluginId,
+        <String, dynamic>{'enabled': next},
+      ),
       successText: next ? '已写入启用状态' : '已写入停用状态',
     );
     if (ok && mounted) setState(() => _enabled = next);
@@ -950,13 +939,6 @@ class _PluginManageActionsState extends State<_PluginManageActions> {
     if (ok && mounted) DetailSelection.instance.clear();
   }
 
-  /// 恢复显示（E）：把 id 从 hidden_builtins 摘掉——不碰条目与开关，面板重拉
-  /// 后 isHidden 变回 false，本区自动换回正常管理按钮。
-  Future<void> _restore() => _run(
-    () => widget.admin.restoreBuiltin(widget.pluginId),
-    successText: '已恢复显示 ${widget.pluginId}',
-  );
-
   void _snack(String text) {
     if (text.isEmpty) return;
     ScaffoldMessenger.maybeOf(context)?.showSnackBar(
@@ -972,42 +954,6 @@ class _PluginManageActionsState extends State<_PluginManageActions> {
     final ColorScheme cs = Theme.of(context).colorScheme;
     final String id = widget.pluginId;
     final bool hasEntry = widget.entry.isNotEmpty;
-    // E：已隐藏 ⇒ 只给「恢复显示」一条路。别的按钮全不渲染——面板里都看不见它了，
-    // 还能点到"启用"就自相矛盾了。
-    if (widget.isHidden) {
-      return _Card(
-        children: <Widget>[
-          Text(
-            '已从面板隐藏：条目与成品都还在（记在 plugins.yaml 的 hidden_builtins），'
-            '只是不在插件列表里显示。',
-            key: Key('plugin-detail-hidden-note-$id'),
-            style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
-          ),
-          Wrap(
-            spacing: 2,
-            runSpacing: 0,
-            children: <Widget>[
-              TextButton(
-                key: Key('plugin-detail-restore-$id'),
-                onPressed: _busy ? null : _restore,
-                child: const Text('恢复显示', style: TextStyle(fontSize: 12)),
-              ),
-            ],
-          ),
-          if (_busy)
-            Text(
-              '正在处理…',
-              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
-            ),
-          if (_error.isNotEmpty)
-            Text(
-              _error,
-              key: Key('plugin-detail-manage-error-$id'),
-              style: TextStyle(fontSize: 11, color: cs.error),
-            ),
-        ],
-      );
-    }
     return _Card(
       children: <Widget>[
         Text(

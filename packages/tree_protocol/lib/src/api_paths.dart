@@ -153,14 +153,6 @@ abstract final class ApiPaths {
   static const String pluginBuiltinDisable =
       '/api/plugin/builtins/{pluginId}/disable';
 
-  /// 把一个内置插件从「已隐藏」里放回面板（POST，E）：把 id 从 plugins.yaml
-  /// 顶层的 `hidden_builtins` 摘掉——**只恢复可见性**，条目与开关一个字不动
-  /// （隐藏时已被停用，回到面板显示「已停用」，要跑起来请再拨开关）。
-  ///
-  /// 隐藏的入口是 [pluginConfig] 的 DELETE：对内置项不再 400，而是「停用 + 隐藏」。
-  static const String pluginBuiltinRestore =
-      '/api/plugin/builtins/{pluginId}/restore';
-
   /// 发布仓库清单的**只读面**（GET，**不联网**）：读本地缓存的 `plugin-index.json`。
   ///
   /// 为什么单独一条而不是“GET 也顺手刷新”：面板打开就要能列出“上次看到的那些”，
@@ -308,7 +300,6 @@ abstract final class ApiPaths {
     pluginBuiltins,
     pluginBuiltinEnable,
     pluginBuiltinDisable,
-    pluginBuiltinRestore,
     pluginRelease,
     pluginReleaseRefresh,
     pluginReleaseInstall,

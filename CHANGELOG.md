@@ -34,6 +34,30 @@
     applyTo 的字体族与抬档映射）、`test/settings_font_test.dart`（渲染 / 点击写入 /
     选中态跟随）。
 
+- **内置项不再在「已安装」栏单列：装进来后与自定义条目同一条命；E 的「停用 + 隐藏」整套撤掉**
+  （**删除**
+  [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md)
+  不变量 33「内置项的可见性交给盘」及 `ApiPaths.pluginBuiltinRestore` 的 `kept` 条目；
+  [packages/tree_core/lib/src/plugin/plugin_config_store.dart](packages/tree_core/lib/src/plugin/plugin_config_store.dart)
+  的 `hiddenBuiltinsKey` / `readHiddenBuiltins` / `setBuiltinHidden` 删除；
+  `builtin_plugins.dart` 的播种去掉 hidden 跳过）：
+  - 面板「已安装」栏由「内置插件（n）+ 自定义插件（n）」两组并为**单组「已安装插件（n）」**，
+    只列真有条目的插件（内置与自定义同一种卡片、同一颗开关、同一套 编辑 / 删除 / 重启）；
+    内置项"去哪儿装"交给「未安装」栏（发布仓库索引）。
+  - `DELETE /api/plugin/configs/{id}` 对内置 id **不再特殊**：整条删掉 + 断开实例
+    （与自定义项完全一致）；没落过条目的内置 id 如实 404。内置 id 的保护只剩**新增那一侧**
+    （POST 不许自定义条目冒名内置 id，仍 400）。
+  - `GET /api/plugin/builtins` 顶层不再递 `hidden_builtins`；
+    `POST /api/plugin/builtins/{id}/restore` 端点删除。核心侧的
+    `POST /api/plugin/builtins/{id}/enable|disable` 端点与其用例**保留**（不再有 UI 调用）。
+  - 详情页管理区不再有「已隐藏」分支与「恢复显示」：内置项按 id 现查清单补
+    `isBuiltin` / `resolution`，开关一并走 PATCH enabled。
+  - 用例：`packages/tree_core/test/plugin_config_api_test.dart`（DELETE 同一条命 + 无条目
+    内置 id 404 + 顶层无 hidden_builtins）、`plugin_config_store_test.dart` /
+    `plugin_tool_define_self_updater_test.dart`（hidden 往返与不播种用例删除）、
+    `test/plugin_panel_admin_test.dart`（单组 + 同一颗开关 + 普通删除确认框）、
+    `test/plugin_detail_page_test.dart`。
+
 ## [1.0.4+2] — 2026-10-18
 
 ### 断言变化（新增 / 修改的 README 不变量）

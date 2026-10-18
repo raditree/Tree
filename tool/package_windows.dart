@@ -273,13 +273,12 @@ Tree 桌面端（Windows 便携版）
         spec/*.md               内置 + 自定义 Spec（右栏可一键重置，旧文件备份 .bak.N）
     data/<agent>/<session>/     会话数据：session.json + messages.jsonl（一行一条消息）
 
-内置插件
+插件
   plugins/ 目录与 Tree.exe 同级。安装包**不带插件可执行文件**（2026-10-18 起），里面只有
-  一份插件开发指南 plugin-development.md。界面上「插件」页把内置插件与自定义插件分开
-  列出，每一项都有自己的开关；内置项如果本机还没有，卡片会直接告诉你去哪儿装 ——
-  同一页下面的「从发布仓库更新」：先点刷新（拉 tree-plugins 仓库的 release 成品）再装它。
-  装完核心就在 plugins/ 里按同名可执行文件找它（Windows 补 .exe），界面上点
-  「重新解析内置插件的成品」让它重新认一次。
+  一份插件开发指南 plugin-development.md。界面上「插件」页分三栏：**未安装** / **已安装** /
+  站点。没装过的（含四个内置项）都在「未安装」栏，先点刷新（拉 tree-plugins 仓库的 release
+  成品）再装它；装好的条目落在「已安装」栏，与自定义插件**同一种卡片、同一套开关与按钮**。
+  装完核心就在 plugins/ 里按同名可执行文件找它（Windows 补 .exe）。
 
 出问题先看这里
   - 提示"未找到核心进程可执行文件 tree_core.exe"：确认 tree_core.exe 与 Tree.exe

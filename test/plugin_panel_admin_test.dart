@@ -95,6 +95,19 @@ class _FakeAdmin implements PluginAdminClient {
         'granularity': 'team',
         'scope': <String, dynamic>{'team_id': 't1'},
       },
+      // 2026-10-18 用户定稿：内置项装进来后就是一条**普通条目**（同一条命）。
+      // 这里让 sample 以"从仓库装好的内置项"身份躺在配置里：面板只列这一条，
+      // 不分组、也不再有内置专属开关。
+      <String, dynamic>{
+        'id': 'sample',
+        'name': '示例插件',
+        'command': 'C:/app/plugins/tree_sample.exe',
+        'args': <String>[],
+        'enabled': false,
+        'granularity': 'team',
+        'scope': <String, dynamic>{},
+        'builtin': true,
+      },
     ],
     'runtime': <String, dynamic>{
       'demo': <String, dynamic>{'running': true, 'health': 'ok', 'known': true},
@@ -207,13 +220,6 @@ class _FakeAdmin implements PluginAdminClient {
   }
 
   @override
-  Future<Map<String, dynamic>> restoreBuiltin(String id) async {
-    calls.add('restore:$id');
-    if (failWrite.isNotEmpty) throw Exception(failWrite);
-    return writeResponse;
-  }
-
-  @override
   Future<Map<String, dynamic>> restartConfig(
     String id, {
     String mode = 'cold',
@@ -221,16 +227,6 @@ class _FakeAdmin implements PluginAdminClient {
   }) async {
     // 记下的 mode 就是本文件那两条新用例的证据面：界面到底把哪三种做法发给了核心。
     calls.add('restart:$id:$mode');
-    if (failWrite.isNotEmpty) throw Exception(failWrite);
-    return writeResponse;
-  }
-
-  @override
-  Future<Map<String, dynamic>> setBuiltinEnabled(
-    String id, {
-    required bool enabled,
-  }) async {
-    calls.add('builtin:$id:${enabled ? 'on' : 'off'}');
     if (failWrite.isNotEmpty) throw Exception(failWrite);
     return writeResponse;
   }
@@ -378,34 +374,44 @@ Map<String, dynamic> _releaseEntry({
 };
 
 void main() {
-  testWidgets('插件实例分「内置 / 自定义」两组，每一项各有自己的开关', (WidgetTester tester) async {
+  testWidgets('已安装栏只有一条命：内置与自定义同列、不分组、同一颗开关', (WidgetTester tester) async {
     final _FakeAdmin admin = _FakeAdmin();
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
     await _showTab(tester, 'plugin-tab-installed');
 
+    // 2026-10-18 用户定稿：内置项装进来后就是普通条目 —— 单组、同一种开关，
+    // 面板不再给它们开第二张脸（旧「内置插件（n）/ 自定义插件（n）」两组已合并）。
     expect(find.text('插件实例（2）'), findsOneWidget);
-    expect(find.text('内置插件（1）'), findsOneWidget);
-    expect(find.text('自定义插件（1）'), findsOneWidget);
+    expect(find.text('已安装插件（2）'), findsOneWidget);
+    expect(find.text('内置插件（1）'), findsNothing);
+    expect(find.text('自定义插件（1）'), findsNothing);
     expect(find.text('示例插件'), findsOneWidget);
     expect(find.text('演示插件'), findsOneWidget);
-    // 每一项一个开关（不是统一开关）
-    final Finder builtinSwitch = find.byKey(
-      const Key('plugin-switch-builtin-sample'),
+    // 每一项一个开关，**同一颗键**（不再有内置专属开关）
+    final Finder sampleSwitch = find.byKey(
+      const Key('plugin-switch-custom-sample'),
     );
     final Finder customSwitch = find.byKey(
       const Key('plugin-switch-custom-demo'),
     );
-    expect(builtinSwitch, findsOneWidget);
+    expect(sampleSwitch, findsOneWidget);
     expect(customSwitch, findsOneWidget);
     expect(
-      tester.widget<Switch>(builtinSwitch).value,
+      find.byKey(const Key('plugin-switch-builtin-sample')),
+      findsNothing,
+      reason: '内置专属开关已随内置组一起撤掉',
+    );
+    expect(
+      tester.widget<Switch>(sampleSwitch).value,
       isFalse,
-      reason: '内置项未启用',
+      reason: '内置项（从仓库装的）未启用',
     );
     expect(tester.widget<Switch>(customSwitch).value, isTrue);
-    // 内置项的「删除」= 停用 + 记入 hidden_builtins 隐藏（E，可恢复），提示写清代价
+    // 内置项走**普通条目**那一套按钮：编辑 / 删除 / 重启都在，没有"停用并隐藏"那套
+    expect(find.byKey(const Key('plugin-edit-sample')), findsOneWidget);
     expect(find.byKey(const Key('plugin-delete-sample')), findsOneWidget);
-    expect(find.textContaining('删除 = 停用并隐藏'), findsOneWidget);
+    expect(find.byKey(const Key('plugin-restart-sample')), findsOneWidget);
+    expect(find.textContaining('删除 = 停用并隐藏'), findsNothing);
     // 自定义项有 编辑 / 删除 / 重启
     expect(find.byKey(const Key('plugin-edit-demo')), findsOneWidget);
     expect(find.byKey(const Key('plugin-delete-demo')), findsOneWidget);
@@ -480,137 +486,25 @@ void main() {
     expect(find.textContaining('显式 kill'), findsOneWidget);
   });
 
-  testWidgets('内置项解析不到 ⇒ 明说“去从发布仓库更新装它”，而不是只留一行红色的“未就绪”', (WidgetTester tester) async {
-    // 2026-10-18：插件成品不再随安装包 ⇒ 新装机上内置项一律解析不到，那是**常态**不是故障。
-    // 光有“运行时未就绪：在 … 找不到 tree_sample.exe”会让用户以为装坏了，而他真正需要的
-    // 是一句“去下面那一节装它”。原始错误仍然留着（它列了查找路径，是诊断信息）。
-    final Map<String, dynamic> missing = _FakeAdmin._defaultBuiltins();
-    (
-      (missing['builtins'] as List<dynamic>).single as Map<String, dynamic>
-    )['resolution'] = <String, dynamic>{
-      'ok': false,
-      'error': '在 C:/app/plugins 找不到 tree_sample.exe',
-    };
-    final _FakeAdmin admin = _FakeAdmin(builtins: missing);
-    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
-    await _showTab(tester, 'plugin-tab-installed');
-
-    expect(find.textContaining('运行时未就绪'), findsOneWidget);
-    expect(
-      find.byKey(const Key('plugin-builtin-needs-repo-sample')),
-      findsOneWidget,
-      reason: '要指到卡片上那颗「从仓库装它」按钮（A+ 起按钮就地，不用再指到下面那一节）',
-    );
-    expect(
-      (find
-              .byKey(const Key('plugin-builtin-needs-repo-sample'))
-              .evaluate()
-              .single
-              .widget
-          as Text)
-      .data,
-      contains('从仓库装它'),
-      reason: 'A+ 起指引直接指到卡片上那颗按钮（按钮就在同一张卡上，不再指向下面那一节）',
-    );
-
-    // 反过来：成品在（默认夹具 resolution.ok=true）⇒ 不许出现这一行“待装”提示。
-    // 写成**另一条** testWidgets 而不是在本条里再 pump 一次：同一个位置的同类 widget
-    // 会被复用 State，而面板只在 initState 里拉数据 —— 第二次 pump 看到的还是上面那份
-    // “解析不到”的旧状态（实测过一次，断言假红）。
-  });
-
-  testWidgets('内置项成品在 ⇒ 不许出现“去仓库装”那一行（也不许染成错误色）', (WidgetTester tester) async {
-    final _FakeAdmin shipped = _FakeAdmin();
-    await _pumpPanel(tester, svc: await _serviceWith(), admin: shipped);
-    await _showTab(tester, 'plugin-tab-installed');
-    expect(
-      find.byKey(const Key('plugin-builtin-needs-repo-sample')),
-      findsNothing,
-    );
-    expect(find.textContaining('运行时未就绪'), findsNothing);
-    // A+：成品在 ⇒ 同一颗按钮换文案（不消失：有更新时它就是更新入口）。
-    expect(
-      find.text('从仓库更新'),
-      findsOneWidget,
-      reason: '已装/有更新时按钮显示「从仓库更新」（同一颗按钮两种文案）',
-    );
-  });
-
-  testWidgets('卡片「从仓库装它」：点它先自动刷新索引再 install，成功后就地清错误', (WidgetTester tester) async {
-    // 缺成品（解析不到）+ 索引里**有**这一条 ⇒ 一次点击走完 refresh → install。
-    final Map<String, dynamic> missing = _FakeAdmin._defaultBuiltins();
-    (
-      (missing['builtins'] as List<dynamic>).single as Map<String, dynamic>
-    )['resolution'] = <String, dynamic>{
-      'ok': false,
-      'error': '在 C:/app/plugins 找不到 tree_sample.exe',
-    };
-    final _FakeAdmin admin = _FakeAdmin(builtins: missing)
-      ..refreshResponse = _releaseListing(
-        entries: <Map<String, dynamic>>[
-          _releaseEntry(id: 'sample', name: '示例插件'),
-        ],
-      );
-    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
-    await _showTab(tester, 'plugin-tab-installed');
-    expect(find.text('从仓库装它'), findsOneWidget);
-
-    await tester.tap(find.byKey(const Key('plugin-builtin-repo-sample')));
-    await tester.pumpAndSettle();
-
-    expect(admin.calls, contains('release:refresh'), reason: '先刷新索引（用户不该手动先去点刷新）');
-    expect(admin.calls, contains('release:install:sample'), reason: '索引里有这一条 ⇒ 接着 install');
-    expect(
-      admin.calls.indexOf('release:refresh'),
-      lessThan(admin.calls.indexOf('release:install:sample')),
-      reason: '顺序必须是 refresh → install（装机端要的是最新索引）',
-    );
-    expect(
-      find.text('已从发布仓库安装 sample（1.2.0）'),
-      findsOneWidget,
-      reason: '装了哪一版要说出来',
-    );
-    expect(
-      find.byKey(const Key('plugin-builtin-repo-error-sample')),
-      findsNothing,
-      reason: '成功了就不该还挂着错误',
-    );
-  });
-
-  testWidgets('卡片「从仓库装它」：索引里没有这一条 ⇒ 就地显示原因，不发 install', (WidgetTester tester) async {
-    final _FakeAdmin admin = _FakeAdmin()
-      ..refreshResponse = _releaseListing(entries: <Map<String, dynamic>>[]);
-    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
-    await _showTab(tester, 'plugin-tab-installed');
-
-    await tester.tap(find.byKey(const Key('plugin-builtin-repo-sample')));
-    await tester.pumpAndSettle();
-
-    expect(admin.calls, contains('release:refresh'));
-    expect(
-      admin.calls,
-      isNot(contains('release:install:sample')),
-      reason: '索引里没这一条时 install 必然 404，就地说明比发一次注定失败的请求好',
-    );
-    expect(
-      find.byKey(const Key('plugin-builtin-repo-error-sample')),
-      findsOneWidget,
-      reason: '失败原因就地显示在卡片上（不只是一条转瞬即逝的 snack）',
-    );
-    expect(
-      find.textContaining('索引里没有 sample 这一条'),
-      findsOneWidget,
-    );
-  });
-
-  testWidgets('每项开关各自打各自的接口', (WidgetTester tester) async {
+  testWidgets('每项开关同一颗键：内置项装进来也走普通 PATCH enabled', (WidgetTester tester) async {
     final _FakeAdmin admin = _FakeAdmin();
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
     await _showTab(tester, 'plugin-tab-installed');
 
-    await tester.tap(find.byKey(const Key('plugin-switch-builtin-sample')));
+    // 内置项（sample）与自定义项（demo）**同一颗开关、同一个接口**：
+    // 不再有「内置走 enable / disable 端点」那条岔路。
+    await tester.tap(find.byKey(const Key('plugin-switch-custom-sample')));
     await tester.pumpAndSettle();
-    expect(admin.calls, contains('builtin:sample:on'));
+    expect(
+      admin.calls.any((String c) => c.startsWith('custom:sample:')),
+      isTrue,
+      reason: '内置项走普通 PATCH enabled（不是内置专属端点）',
+    );
+    expect(
+      admin.calls.any((String c) => c.startsWith('builtin:')),
+      isFalse,
+      reason: '面板不再打内置专属端点（那条端点留着给别的调用方，UI 不再用）',
+    );
 
     await tester.tap(find.byKey(const Key('plugin-switch-custom-demo')));
     await tester.pumpAndSettle();
@@ -755,46 +649,26 @@ void main() {
     expect(admin.calls, contains('delete:demo'));
   });
 
-  testWidgets('内置项的删除 = 停用 + 隐藏：确认框写清 hidden_builtins 与恢复路径', (WidgetTester tester) async {
+  testWidgets('内置项删除走普通确认框：不再有“停用并隐藏”那条退路', (WidgetTester tester) async {
     final _FakeAdmin admin = _FakeAdmin();
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
     await _showTab(tester, 'plugin-tab-installed');
 
     await tester.tap(find.byKey(const Key('plugin-delete-sample')));
     await tester.pumpAndSettle();
-    expect(find.text('从面板隐藏这个内置插件？'), findsOneWidget);
-    expect(
-      find.textContaining('hidden_builtins'),
-      findsWidgets,
-      reason: '确认框必须把"藏到哪、怎么找回来"说清楚，否则用户以为真删了',
-    );
+    // 普通删除确认框（不是 E 的那张「从面板隐藏这个内置插件？」）
+    expect(find.text('删除插件？'), findsOneWidget);
+    expect(find.text('从面板隐藏这个内置插件？'), findsNothing);
+    expect(find.textContaining('hidden_builtins'), findsNothing);
     expect(
       admin.calls.where((String c) => !c.startsWith('release:')),
       isEmpty,
       reason: '确认之前不发写请求',
     );
 
-    await tester.tap(find.byKey(const Key('plugin-hide-confirm')));
+    await tester.tap(find.byKey(const Key('plugin-delete-confirm')));
     await tester.pumpAndSettle();
     expect(admin.calls, contains('delete:sample'));
-  });
-
-  testWidgets('hidden_builtins 里的项不进主列表，另列「已隐藏」段作找回入口', (WidgetTester tester) async {
-    final _FakeAdmin admin = _FakeAdmin()
-      ..builtinsResponse = <String, dynamic>{
-        ..._FakeAdmin._defaultBuiltins(),
-        'hidden_builtins': <dynamic>['sample'],
-      };
-    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
-    await _showTab(tester, 'plugin-tab-installed');
-
-    // 主列表不列被隐藏的（面板只列未隐藏项）
-    expect(find.byKey(const Key('plugin-detail-builtin-sample')), findsNothing);
-    expect(find.text('内置插件（0）'), findsOneWidget);
-    // 「已隐藏」段承接找回入口：行可点开详情（恢复按钮在详情页）
-    expect(find.textContaining('已隐藏（1）'), findsOneWidget);
-    expect(find.byKey(const Key('plugin-detail-hidden-sample')), findsOneWidget);
-    expect(find.text('示例插件'), findsOneWidget);
   });
 
   testWidgets('旧核心（清单接口不可用）：退回只读实例列表并说明原因', (WidgetTester tester) async {
