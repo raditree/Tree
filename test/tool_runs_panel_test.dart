@@ -4,7 +4,7 @@
 // ① 纯数据（`ToolRun.fromJson` / 命令摘要压行截断 / 已执行时间文案）——脏数据不抛异常；
 // ② 面板本身（列表 + 超阈值高亮、点关闭发出**正确 handle** 的请求并刷新、
 //    关闭失败给**可读原因**、空态、加载失败态 + 重试、refreshTrigger 变化重拉）；
-// ③ 接线：右栏第 6 个内置页签「正在执行的 tool」（切过去才建面板）。
+// ③ 接线：右栏「正在执行的 tool」**窗口**（经「+」路由页打开才建面板）。
 //
 // 为什么用"假核心 + 真 socket"（与 test/message_panel_usage_calls_test.dart 同一套路）：
 // 面板是静态 `ApiService` 直连核心的，只有让它真发一次请求，才能验证"打到的是哪个端点、
@@ -21,7 +21,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:tree/io/api_service.dart';
 import 'package:tree/ui/models/tool_run.dart';
-import 'package:tree/ui/widgets/file_panel.dart';
+import 'package:tree/ui/widgets/right_panel_host.dart';
 import 'package:tree/ui/widgets/tool_runs_panel.dart';
 
 /// 假核心：只实现「正在执行的工具」用得上的两个端点，其余路径一律 200 + `{success:true}`
@@ -484,44 +484,86 @@ void main() {
     });
   });
 
-  // ══ 接线：右栏第 6 个内置页签 ═════════════════════════════════════════════
+  // ══ 接线：右栏「正在执行的 tool」窗口 ═══════════════════════════════════
 
-  group('右栏第 6 个内置页签', () {
-    testWidgets('页签「正在执行的 tool」在详情之前，切过去才按需拉数据', (
-      WidgetTester tester,
-    ) async {
-      core.runs = <Map<String, dynamic>>[runJson('toolrun_1')];
-
-      await tester.pumpWidget(
-        MaterialApp(
+  group('右栏「正在执行的 tool」窗口', () {
+    // 右栏 2026-10-18 起是窗口宿主：这块不再是第 6 个顶层页签，
+    // 而是「+」路由页里的一个窗口；打开才建面板、才拉数据。
+    Widget host() => MaterialApp(
           home: Scaffold(
             body: SizedBox(
               width: 760,
               height: 600,
-              child: FilePanel(workspaceId: 'ws1', teamId: 'ws1'),
+              child: RightPanelHost(
+                entries: <RightPanelEntry>[
+                  const RightPanelEntry(
+                    id: 'files',
+                    label: '文件',
+                    icon: Icons.folder_outlined,
+                    openByDefault: true,
+                    bodyBuilder: _emptyWindowBody,
+                  ),
+                  RightPanelEntry(
+                    id: 'toolRuns',
+                    label: '正在执行的 tool',
+                    icon: Icons.terminal_outlined,
+                    bodyBuilder: (BuildContext context) =>
+                        const ToolRunsPanel(refreshTrigger: 0),
+                  ),
+                  const RightPanelEntry(
+                    id: 'detail',
+                    label: '详情',
+                    icon: Icons.article_outlined,
+                    bodyBuilder: _emptyWindowBody,
+                  ),
+                ],
+              ),
             ),
           ),
-        ),
-      );
+        );
+
+    testWidgets('窗口「正在执行的 tool」在详情之前，打开后才按需拉数据', (
+      WidgetTester tester,
+    ) async {
+      core.runs = <Map<String, dynamic>>[runJson('toolrun_1')];
+
+      await tester.pumpWidget(host());
       await flyIO(tester, rounds: 20);
 
-      expect(find.text('正在执行的 tool'), findsOneWidget);
-      expect(
-        tester.getTopLeft(find.text('正在执行的 tool')).dx,
-        lessThan(tester.getTopLeft(find.text('详情')).dx),
-        reason: '内置顺序：… 问题回复 / 正在执行的 tool / 详情',
-      );
-      expect(find.text('terminal'), findsNothing, reason: '没切过去不建面板');
+      // 默认只开「文件」窗：「正在执行的 tool」窗没打开 → 不建面板、一次都不拉
+      expect(find.text('terminal'), findsNothing, reason: '窗没打开不建面板');
       expect(
         core.runningRequests,
         0,
-        reason: '页签没被选中时一次都不该拉（TabBarView 懒建 + initState 才拉）',
+        reason: '窗没被打开时一次都不该拉（IndexedStack 只建已打开的窗）',
       );
 
-      await tester.tap(find.text('正在执行的 tool'));
+      // 经「+」路由页打开；同排里「正在执行的 tool」在「详情」之前
+      await tester.tap(
+        find.byKey(const ValueKey<String>('right-panel-new-window')),
+      );
+      await tester.pump();
+      expect(
+        tester
+            .getTopLeft(
+              find.byKey(const ValueKey<String>('right-panel-pick-toolRuns')),
+            )
+            .dx,
+        lessThan(
+          tester
+              .getTopLeft(
+                find.byKey(const ValueKey<String>('right-panel-pick-detail')),
+              )
+              .dx,
+        ),
+        reason: '内置顺序：… 问题回复 / 正在执行的 tool / 详情',
+      );
+      await tester.tap(
+        find.byKey(const ValueKey<String>('right-panel-pick-toolRuns')),
+      );
       await flyIO(tester, rounds: 20);
 
-      expect(core.runningRequests, 1, reason: '切过去才拉一次快照');
+      expect(core.runningRequests, 1, reason: '打开才拉一次快照');
       expect(find.text('terminal'), findsOneWidget);
       expect(find.text('1.8s'), findsOneWidget);
 
@@ -535,3 +577,6 @@ void main() {
     });
   });
 }
+
+/// 占位窗口身体（测试里「文件」/「详情」窗不渲染任何东西）。
+Widget _emptyWindowBody(BuildContext context) => const SizedBox.shrink();

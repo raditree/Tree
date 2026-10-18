@@ -58,9 +58,10 @@ void main() {
     await tester.pumpAndSettle();
   }
 
-  /// 折叠右栏：未选 Agent 时右栏是占位，点它即可（与真机同一条路）
+  /// 折叠右栏：点右栏窗口顶栏最右的折叠键（右栏 2026-10-18 起是窗口宿主，
+  /// 折叠键在宿主顶栏；旧口径"点占位空白折叠"随占位改窗口而撤掉）。
   Future<void> collapseRight(WidgetTester tester) async {
-    await tester.tap(find.text('请先在左侧选择或创建一个 Agent'));
+    await tester.tap(find.byTooltip('折叠右侧栏'));
     await tester.pumpAndSettle();
   }
 

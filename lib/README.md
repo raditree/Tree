@@ -14,9 +14,9 @@
 | [io/websocket_service.dart](io/websocket_service.dart) | WS 连接与重连、**10s 心跳**、帧分发 |
 | [io/local_executor_service.dart](io/local_executor_service.dart) · [io/ssh_executor_service.dart](io/ssh_executor_service.dart) | per-team 执行模式配置（local/ssh 的读写与注册）；命令本身由核心执行 |
 | [ui/pages/main_page.dart](ui/pages/main_page.dart) | 三栏骨架、agent 列表（顶层 agent + 团队成员）、会话切换、插件槽位作用域 |
-| [ui/widgets/message_panel.dart](ui/widgets/message_panel.dart) | 中栏消息流：分段渲染、工具/思考**一行式**（完整内容见右栏「详情」页）、提问卡片（**一次可问多道题**：逐题作答后一次交齐）、断线重播去重、按 agent+会话过滤 |
+| [ui/widgets/message_panel.dart](ui/widgets/message_panel.dart) | 中栏消息流：分段渲染、工具/思考**一行式**（完整内容见右栏「详情」窗）、提问卡片（**一次可问多道题**：逐题作答后一次交齐）、断线重播去重、按 agent+会话过滤 |
 | [ui/widgets/teammates_window_page.dart](ui/widgets/teammates_window_page.dart) | 团队成员拓扑与成员工作进度窗口 |
-| [ui/widgets/](ui/widgets/) | 文件面板（**VS Code 型资源管理器** [file_tree.dart](ui/widgets/file_tree.dart) + 类型图标纯函数 [file_tree_icon.dart](ui/widgets/file_tree_icon.dart)）/ 查看器（源码高亮 + 编辑保存 + 分屏，见 [split_panes.dart](ui/widgets/split_panes.dart)）/ **集成终端（[terminal_panel.dart](ui/widgets/terminal_panel.dart)，Ctrl+J）**/ 消息输入框（[message_input.dart](ui/widgets/message_input.dart) + [attachment_preview.dart](ui/widgets/attachment_preview.dart) + 无边框输入样式 [input_style.dart](ui/widgets/input_style.dart)）/ 右栏详情（[detail_panel.dart](ui/widgets/detail_panel.dart)）、PDF 预览、Spec、待办、提问、插件（面板 + **插件/站点详情页** [plugin_detail_page.dart](ui/widgets/plugin_detail_page.dart)，见不变量 27）、MCP、模型信息、Git 历史、设置页 |
+| [ui/widgets/](ui/widgets/) | **右栏窗口宿主（[right_panel_host.dart](ui/widgets/right_panel_host.dart)，见不变量 28）** / 文件面板（**VS Code 型资源管理器** [file_tree.dart](ui/widgets/file_tree.dart) + 类型图标纯函数 [file_tree_icon.dart](ui/widgets/file_tree_icon.dart)）/ 查看器（源码高亮 + 编辑保存 + 分屏，见 [split_panes.dart](ui/widgets/split_panes.dart)）/ **集成终端（[terminal_panel.dart](ui/widgets/terminal_panel.dart)，Ctrl+J）**/ 消息输入框（[message_input.dart](ui/widgets/message_input.dart) + [attachment_preview.dart](ui/widgets/attachment_preview.dart) + 无边框输入样式 [input_style.dart](ui/widgets/input_style.dart)）/ 右栏详情（[detail_panel.dart](ui/widgets/detail_panel.dart)）、PDF 预览、Spec、待办、提问、插件（面板 + **插件/站点详情页** [plugin_detail_page.dart](ui/widgets/plugin_detail_page.dart)，见不变量 27）、MCP、模型信息、Git 历史、设置页 |
 | [ui/services/](ui/services/) | 重播守卫、下载中心、会话重命名、插件 UI 槽位注册、主题、**共享编辑缓冲（[editor_buffer.dart](ui/services/editor_buffer.dart)）**、**代码高亮（[code_highlight.dart](ui/services/code_highlight.dart)）**、**行号槽布局（[code_gutter_layout.dart](ui/services/code_gutter_layout.dart)：逐视觉行给号，软换行的续行留空）**、**编辑器偏好（[editor_settings.dart](ui/services/editor_settings.dart)）**、详情选中（[detail_selection.dart](ui/services/detail_selection.dart)）、**团队级模式与目录合成（[team_scope_view.dart](ui/services/team_scope_view.dart)）**、**工作空间相对路径纯函数与条目名校验（[workspace_paths.dart](ui/services/workspace_paths.dart)）** |
 
 ## 不变量（assertions）
@@ -68,7 +68,7 @@
     表现就是「输入框里还有一个方框」（用户 2026-10-03 的截图）。统一常量见
     [ui/widgets/input_style.dart](ui/widgets/input_style.dart)，代码编辑器同一条口径。
 
-11. **消息流是一行式：模型消息高亮、工具与思考各占一行，完整内容去右栏「详情」页**
+11. **消息流是一行式：模型消息高亮、工具与思考各占一行，完整内容去右栏「详情」窗**
     （[ui/widgets/tool_call_card.dart](ui/widgets/tool_call_card.dart)、[ui/widgets/thinking_card.dart](ui/widgets/thinking_card.dart)、
     [ui/widgets/detail_panel.dart](ui/widgets/detail_panel.dart)、[ui/services/detail_selection.dart](ui/services/detail_selection.dart)）：
     模型消息是**高亮块**（左侧主色竖条 + 极淡同色底，**没有整圈边框**），用户消息仍是主色气泡；
@@ -85,7 +85,7 @@
     **不带 diff**，所以不许去解析结果文本；参数不全 / 不是编辑写入类工具 ⇒ 行尾**不给数字**（`+0 -0` 是假信息，宁缺勿假）；
     行数与核心的 `LineSplitter` 同口径（末尾换行不额外算一行）。
     思考一行 =「思考 · 首行摘要」。**中栏不再就地展开**——一轮里工具动辄几十条，卡片会把时间线切散，
-        一行之后整轮动作像一份清单。悬停有呼应（图标提亮 + 底色），点击 → 右栏**第 6 个内置页签「详情」**摊开完整参数与结果；
+        一行之后整轮动作像一份清单。悬停有呼应（图标提亮 + 底色），点击 → 右栏**自动打开「详情」窗**摊开完整参数与结果；
     **巨型思考的渲染成本必须与总长解耦**（用户 2026-10-15：「气泡不会很长，主要是思考内容会很长」）：
     摘要只扫**头部窗口 512 字**（短文本与全文实现逐字一致）；详情页**全量在场、分块增量渲染**
     （[thinking_card.dart](ui/widgets/thinking_card.dart) 的 `ThinkingDetail`）——每 ~6000 字"定居"成缓存
@@ -297,7 +297,7 @@
     顺序**就是用户定的顺序**（不要顺手重排）：模型配置（设置页）→ 创建 agent → 配置模型信息 →
     配置工作目录 → 启用插件 → 文件浏览 → Ctrl+J → demo 输入（「创建一名成员，负责插件开发」）。
     ① **浮层是非模态的**（盖在中栏上方一小块）：每一步的「带我过去」都要打开**真实界面**——设置页的
-    「自定义模型」一节、建 agent 对话框、右栏「模型信息」/「文件」页、插件管理面板、集成终端、
+    「自定义模型」一节、建 agent 对话框、右栏「模型信息」/「文件」窗（窗口宿主，见不变量 28）、插件管理面板、集成终端、
     工作目录选择器；模态对话框会把那些界面挡在外面，用户只能对着引导发愣；
     ② **只做导航、不替用户决定**：除最后一步外「带我过去」只是把人带到地方；最后一步把 demo 那句话
     **填进输入框**（光标就位、**不自动发送**，用户看清了自己按发送）；
@@ -308,7 +308,7 @@
     ④ 跨面板的动作走**全局广播**（`ComposerPrefillRequest` / `WorkspacePickRequest`，与
     [TerminalToggleRequest](ui/services/terminal_toggle_request.dart) 同一范式）：引导在 MainPage 里、
     要落地的动作在消息面板里（只有它知道当前 agent / 会话、手里有那份工作目录配置），所以只广播
-    「要做这件事」；右栏页签用「索引 + 请求序号」表达（用户自己翻页后再点一次「带我过去」也要生效，
+    「要做这件事」；右栏窗口用「窗口 id + 请求序号」表达（用户自己关掉窗后再点一次「带我过去」也要生效，
     不能被「值没变」吞掉）；
     ⑤ 偏好读不到（平台不支持 / 测试环境）时**静默不弹**，绝不因为引导把启动搞出未捕获异常。
 
@@ -484,7 +484,7 @@
     - **多问**：每题各自"选项点选（可再点取消）/ 自由输入"（自由输入优先于点选），底部
       「提交全部回答」一次回传，按钮旁如实标注「还有 N 题未作答」；**未答完也允许提交**，
       未作答项传空串（核心显示为「未作答」），**不许替用户编答案**；
-    - **已作答**：卡片底部逐题列出答案（未答的写「（未作答）」），不再显示输入框；右栏「问题回复」页
+    - **已作答**：卡片底部逐题列出答案（未答的写「（未作答）」），不再显示输入框；右栏「问题回复」窗
       同样逐题渲染与作答（`ApiService.answerQuestion(qid, answers)`）。
 
 25. **三栏骨架的宽度规则：中栏可折叠，让出的宽度归展开着的侧栏**（[ui/pages/main_page.dart](ui/pages/main_page.dart)、
@@ -544,6 +544,26 @@
     [server/README.md](../packages/tree_core/lib/src/server/README.md) 不变量 17 与
     [plugin/README.md](../packages/tree_core/lib/src/plugin/README.md) 不变量 20/21/22。
 
+28. **右栏是「窗口宿主」：设置 / 文件 / 详情 / MCP 配置 / 模型信息 / 问题回复 / 正在执行的 tool /
+    插件面板槽位都是"按需打开的窗口"**（用户 2026-10-18 定稿：「右侧面板不要做那种固定的栏，改为窗口式，
+    像 VS Studio 一样，把设置、文件查看、详情、etc 统一化，按需打开」）（
+    [ui/widgets/right_panel_host.dart](ui/widgets/right_panel_host.dart)、[ui/pages/main_page.dart](ui/pages/main_page.dart)）：
+    - **右栏长期存在**：一个窗口都没开也还在（空态里一颗「打开窗口」按钮），所以**没选中 agent 时**插件卡片
+      点进的详情也有地方显示（旧形态下未选 agent 右栏是空白占位，详情无处落——用户反馈的痛点）；
+    - **「+」是页内路由页**（不是 `Navigator.push` 全屏）：可用窗口**5 列 × 4 行**网格排列，超过 20 个分页；
+      点一项打开并聚焦，chip 上可关闭；
+    - **窗口种类由主页面算好传入**（`List<RightPanelEntry>`）：7 个内置 + 插件声明的 `panel` 槽位
+      （[PluginPanelSlotView](ui/widgets/plugin_ui_slots.dart)）。主机**不认识**任何具体窗口，因此好测也便于
+      插件面板继续接入；
+    - **「文件」窗**在未选 agent 时显示「请先在左侧选择或创建一个 Agent」（其余窗口照常可用）；
+    - **「详情」窗**标了 `autoOpenOnSelection`：中栏选中工具 / 思考行、插件卡片 `DetailSelection.inject`
+      时**自动打开并聚焦**；
+    - **设置**收进右栏「设置」窗（[SettingsPage](ui/pages/settings_page.dart) 的 `embedded` 模式，不再
+      `Navigator.push` 全屏）；「重新显示新手引导」改走 `onReplayRequested` 回调（窗口没有路由返回值可等）；
+    - 已打开的窗用 `IndexedStack` **常挂**：切窗不重建，文件树的展开态 / 查看器缓冲都不丢；
+    - `WorkspaceRefreshService.takeAreas()` 是"取走即清空"：**只由主页面一个监听者**消费，再按区域透给
+      「文件」窗（files/git/todo）与「正在执行的 tool」窗（两个监听者会互相抢）。
+
 ## 测试
 
 ```bash
@@ -566,7 +586,9 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 「+」菜单展开原位变高与 Esc 收起、图片缩略图 vs 文件卡、点开预览）、`test/attachment_preview_test.dart`
 （附件预览：扩展名分类与大小文案、三档读取（文本 / 二进制 / 图片 / 缺失 / 目录 / 截断）、预览对话框）、
 `test/tool_row_detail_test.dart`（一行式：中文标签 + 关键参数、行尾增量、悬停提亮、点击 → 详情页完整参数与结果、空态与关闭、
-派生文本纯函数、右栏页签接线源钉）、`test/message_stream_style_test.dart`（模型消息高亮块不套边框、用户消息仍是气泡）、
+派生文本纯函数、右栏窗口接线源钉）、`test/message_stream_style_test.dart`（模型消息高亮块不套边框、用户消息仍是气泡）、
+`test/right_panel_host_test.dart`（右栏窗口宿主：默认按 `openByDefault` 开窗、空态时右栏仍长期存在、
+「+」路由页 5 列排布且超过 20 个分页、点格子开窗 / chip 关窗、注入详情自动打开「详情」窗、已开窗口切走后仍常挂）、
 `test/code_highlight_test.dart`（语言识别、各语言词法、注释与字符串的优先级、未闭合块注释、记号不重叠、控制器着色 +
 大文件退回单色 + 输入法组字交回平台）、`test/code_gutter_layout_test.dart`（行号槽布局：逐视觉行给号、折行的续行留空、宽度越窄折行越多、尾随换行与空文本各占一个号、纵向位置单调递增且末行底边 = totalHeight、宽度非法不抛）、`test/file_editor_test.dart`（真起假核心 HttpServer：改一下就进未保存态、Ctrl+S 发出
 完整内容与 `if_size`、保存失败给可见原因、409 冲突 → 覆盖保存带 force=1、截断/二进制/图片/外部 readOnly 四种只读闸门、

@@ -9,6 +9,7 @@ import '../../io/api_service.dart';
 import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
 import '../../io/ssh_executor_service.dart';
+import '../../io/workspace_refresh_service.dart';
 import '../services/detail_selection.dart';
 import '../services/onboarding_requests.dart';
 import '../services/onboarding_state.dart';
@@ -18,13 +19,19 @@ import '../services/terminal_toggle_request.dart';
 import '../widgets/activity_bar_item.dart';
 import '../widgets/agent_list.dart';
 import '../widgets/create_agent_dialog.dart';
+import '../widgets/detail_panel.dart';
 import '../widgets/download_panel.dart';
 import '../widgets/file_panel.dart';
+import '../widgets/mcp_config_panel.dart';
 import '../widgets/message_panel.dart';
+import '../widgets/model_info_panel.dart';
 import '../widgets/onboarding_guide.dart';
 import '../widgets/plugin_panel.dart';
 import '../widgets/plugin_ui_slots.dart';
+import '../widgets/question_panel.dart';
+import '../widgets/right_panel_host.dart';
 import '../widgets/teammates_window_page.dart';
+import '../widgets/tool_runs_panel.dart';
 import 'settings_page.dart';
 
 /// 主页面 - 三栏布局
@@ -479,9 +486,23 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   /// 当前第几步（0 基，见 [kOnboardingSteps]）。
   int _guideIndex = 0;
 
-  /// 右栏顶层页签的外部选中请求（引导第 3/6 步用）：索引 + 请求序号。
-  int? _filePanelTab;
-  int _filePanelTabRevision = 0;
+  /// 右栏窗口的外部打开请求（引导第 1/3/6 步用）：窗口 id + 请求序号。
+  ///
+  /// 右栏 2026-10-18 起是窗口宿主（[RightPanelHost]）：「文件 / 模型信息 / 设置」
+  /// 各是一个**按需打开的窗口**，引导「带我过去」用这两个字段把对应窗叫出来。
+  String? _rightWindowId;
+  int _rightWindowRevision = 0;
+
+  /// 打开「设置」窗时是否要滚到「自定义模型」一节（引导第 1 步）。
+  bool _settingsFocusModels = false;
+
+  /// 右栏各区的**外部刷新触发**（由主页面统一监听 `WorkspaceRefreshService` 后递增，
+  /// 再透给窗口身体——避免「文件」窗与「正在执行的 tool」窗各自监听、互相抢
+  /// `takeAreas()`，那是个"取走即清空"的通知）。
+  int _fileRefreshTrigger = 0;
+  int _gitRefreshTrigger = 0;
+  int _todoRefreshTrigger = 0;
+  int _toolRunsRefreshTrigger = 0;
 
   /// 活动栏里「插件管理」的位置（引导第 5 步）。
   static const int _pluginPanelIndex = 1;
@@ -496,6 +517,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     // 中栏点了工具行 / 思考行 → 详情在右栏；右栏收着的话先展开，
     // 否则用户点了半天什么也没发生
     DetailSelection.instance.addListener(_onDetailSelected);
+    // 工作空间数据变更（工具写文件 / git / todo / 工具启停）→ 右栏对应窗口增量刷新
+    WorkspaceRefreshService.instance.addListener(_onWorkspaceChanged);
     _loadAgents();
     unawaited(_maybeShowGuide());
   }
@@ -504,12 +527,30 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     DetailSelection.instance.removeListener(_onDetailSelected);
+    WorkspaceRefreshService.instance.removeListener(_onWorkspaceChanged);
     _registry.removeListener(_onPluginSlotsChanged);
     // 清理本地执行器：注销核心进程注册并释放 WebSocket 引用
     LocalExecutorService.instance.cleanup();
     // 清理 SSH 执行器：仅释放引用（不注销，SSH 配置后端持久化）
     SshExecutorService.instance.cleanup();
     super.dispose();
+  }
+
+  /// 工作空间数据变更：按区域递增右栏对应窗口的刷新触发。
+  ///
+  /// **单一监听者**：`takeAreas()` 是"取走即清空"，两个监听者会互相抢，
+  /// 所以这里由主页面统一消费，再透给「文件」窗与「正在执行的 tool」窗。
+  void _onWorkspaceChanged() {
+    if (!mounted) return;
+    final Set<WorkspaceArea>? areas = WorkspaceRefreshService.instance
+        .takeAreas();
+    if (areas == null || areas.isEmpty) return;
+    setState(() {
+      if (areas.contains(WorkspaceArea.files)) _fileRefreshTrigger++;
+      if (areas.contains(WorkspaceArea.git)) _gitRefreshTrigger++;
+      if (areas.contains(WorkspaceArea.todo)) _todoRefreshTrigger++;
+      if (areas.contains(WorkspaceArea.toolRuns)) _toolRunsRefreshTrigger++;
+    });
   }
 
   /// 中栏选中了详情：右栏收着就展开（选中项被清空时什么都不做）
@@ -700,10 +741,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                   teamId: _selectedAgent?.id,
                   teamName: _selectedAgent?.name ?? '',
                   sessionId: _currentSessionId,
-                  onNavigateToQuestion: _handleNavigateToQuestion,
-                  onNavigateToToolRun: _handleNavigateToToolRun,
-                  selectTab: _filePanelTab,
-                  selectTabRevision: _filePanelTabRevision,
+                  fileRefreshTrigger: _fileRefreshTrigger,
+                  gitRefreshTrigger: _gitRefreshTrigger,
+                  todoRefreshTrigger: _todoRefreshTrigger,
                 ),
         ],
       ),
@@ -890,7 +930,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             expandedWidth: renderRight,
             fill: rightAbsorbs,
             collapsedBar: _buildCollapsedRightBar(),
-            expandedBar: _buildFilePanel(),
+            expandedBar: _buildRightPanel(),
           ),
         ),
         // 中栏折叠、两侧也都收着：没人承接的宽度由空占位吃掉。
@@ -1371,17 +1411,17 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   void _runGuideAction(OnboardingStep step) {
     switch (step.id) {
       case OnboardingStepId.models:
-        unawaited(_openSettings(focusModels: true));
+        _openSettings(focusModels: true);
       case OnboardingStepId.createAgent:
         unawaited(_handleCreateAgent());
       case OnboardingStepId.agentModel:
-        _requestFilePanelTab(FilePanel.modelInfoTabIndex);
+        _requestRightWindow('modelInfo');
       case OnboardingStepId.workspace:
         WorkspacePickRequest.instance.request();
       case OnboardingStepId.plugins:
         _selectBuiltinPanel(_pluginPanelIndex);
       case OnboardingStepId.files:
-        _requestFilePanelTab(FilePanel.filesTabIndex);
+        _requestRightWindow('files');
       case OnboardingStepId.terminal:
         TerminalToggleRequest.instance.request();
       case OnboardingStepId.demo:
@@ -1390,27 +1430,31 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     }
   }
 
-  /// 展开右栏并请求切到某个顶层页签（序号自增 ⇒ 同一个页签点第二次也生效）。
-  void _requestFilePanelTab(int tab) {
+  /// 展开右栏并打开 / 聚焦某个**窗口**（序号自增 ⇒ 同一个窗口点第二次也生效）。
+  void _requestRightWindow(String id) {
     setState(() {
       _rightCollapsed = false;
-      _filePanelTab = tab;
-      _filePanelTabRevision++;
+      _rightWindowId = id;
+      _rightWindowRevision++;
     });
   }
 
-  /// 打开设置页（活动栏底部全局入口）。
+  /// 打开右栏「设置」窗口（活动栏底部全局入口）。
   ///
   /// [focusModels] 为真时滚到「自定义模型」一节（新手引导第 1 步）。
-  /// 设置页返回 `true` = 用户在那里点了「重新显示新手引导」⇒ 清记录再弹一次。
-  Future<void> _openSettings({bool focusModels = false}) async {
-    final bool? replay = await Navigator.of(context).push<bool>(
-      MaterialPageRoute<bool>(
-        builder: (BuildContext context) =>
-            SettingsPage(focusModels: focusModels),
-      ),
-    );
-    if (replay != true) return;
+  /// 设置页里点「重新显示新手引导」走 [SettingsPage.onReplayRequested] ——
+  /// 收进窗口后没有路由返回值可等，改为回调。
+  void _openSettings({bool focusModels = false}) {
+    setState(() {
+      _rightCollapsed = false;
+      _settingsFocusModels = focusModels;
+      _rightWindowId = 'settings';
+      _rightWindowRevision++;
+    });
+  }
+
+  /// 设置窗口里点了「重新显示新手引导」：清记录再弹一次。
+  Future<void> _replayOnboarding() async {
     await OnboardingState.instance.reset();
     if (!mounted) return;
     setState(() {
@@ -1473,61 +1517,131 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     );
   }
 
-  /// 构建右栏文件面板
+  /// 构建右栏**窗口宿主**。
   ///
-  /// 显示当前选中 agent 的工作空间文件与 git 历史；
-  /// 未选中任何 agent 时显示占位提示。
-  Widget _buildFilePanel() {
-    final cs = Theme.of(context).colorScheme;
-    final workspaceId = _selectedAgent?.workspaceId ?? '';
-    if (workspaceId.isEmpty) {
-      // 未选中 agent：右侧为空白占位，点击任意空白处折叠右侧栏。
-      // 这里保留现有文字（不新增"点击空白处折叠"提醒，用户可自然外推）。
-      return GestureDetector(
-        behavior: HitTestBehavior.translucent,
-        onTap: () {
-          setState(() {
-            _rightCollapsed = true;
-          });
-        },
-        child: Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(
-                Icons.folder_open_outlined,
-                size: 56,
-                color: cs.onSurfaceVariant,
-              ),
-              const SizedBox(height: 12),
-              Text(
-                '请先在左侧选择或创建一个 Agent',
-                style: TextStyle(fontSize: 14, color: cs.onSurfaceVariant),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-    return FilePanel(
-      key: ValueKey(workspaceId),
-      workspaceId: workspaceId,
-      teamId: _selectedAgent?.id,
-      teamName: _selectedAgent?.name ?? '',
-      sessionId: _currentSessionId,
-      // 与主页面共用同一注册表（注入实例优先，便于测试）
-      registry: widget.registry,
+  /// 右栏 2026-10-18 起窗口化（用户定稿）：不再是六页签一根固定栏，而是一排可开关的
+  /// 窗口。宿主**长期存在**——没选 agent 也照样在，所以「详情」窗（插件卡片点进去的
+  /// 详情页也注入这里）在任何时候都有地方显示。窗口种类见 [_rightPanelEntries]。
+  Widget _buildRightPanel() {
+    return RightPanelHost(
+      entries: _rightPanelEntries(),
+      openRequestId: _rightWindowId,
+      openRequestRevision: _rightWindowRevision,
       onCollapse: () {
         setState(() {
           _rightCollapsed = true;
         });
       },
-      onNavigateToQuestion: _handleNavigateToQuestion,
-      // 「正在执行的 tool」点一行切中栏到该运行所属的 agent / 会话
-      onNavigateToToolRun: _handleNavigateToToolRun,
-      // 引导「带我过去」的页签请求（按序号触发，见 _requestFilePanelTab）
-      selectTab: _filePanelTab,
-      selectTabRevision: _filePanelTabRevision,
+    );
+  }
+
+  /// 右栏可用窗口集合（顺序 = chip 顺序 = 「+」路由页顺序）。
+  ///
+  /// - 「文件」默认打开：未选 agent 时显示「请先选择 Agent」空态，右栏因此一直有东西；
+  /// - 「详情」在中栏选中共 / 插件卡片注入详情时自动打开聚焦（[_RightPanelEntry.autoOpenOnSelection]）；
+  /// - 「设置」把原来 `Navigator.push` 全屏的 [SettingsPage] 收进右栏窗口（embedded）；
+  /// - 之后是插件声明的 `panel` 槽位（[PluginPanelSlotView]）——**插件申请面板不回归**。
+  List<RightPanelEntry> _rightPanelEntries() {
+    final String workspaceId = _selectedAgent?.workspaceId ?? '';
+    final String agentId = _selectedAgent?.id ?? '';
+    return <RightPanelEntry>[
+      RightPanelEntry(
+        id: 'files',
+        label: '文件',
+        icon: Icons.folder_outlined,
+        openByDefault: true,
+        bodyBuilder: (BuildContext context) => workspaceId.isEmpty
+            ? _buildNoAgentHint()
+            : FilePanel(
+                // 换 agent = 换工作空间：整块重建（树/查看器状态都归零）
+                key: ValueKey<String>('file-window-$workspaceId'),
+                workspaceId: workspaceId,
+                teamId: _selectedAgent?.id,
+                teamName: _selectedAgent?.name ?? '',
+                sessionId: _currentSessionId,
+                fileRefreshTrigger: _fileRefreshTrigger,
+                gitRefreshTrigger: _gitRefreshTrigger,
+                todoRefreshTrigger: _todoRefreshTrigger,
+              ),
+      ),
+      RightPanelEntry(
+        id: 'mcp',
+        label: 'MCP 配置',
+        icon: Icons.hub_outlined,
+        bodyBuilder: (BuildContext context) => const McpConfigPanel(),
+      ),
+      RightPanelEntry(
+        id: 'modelInfo',
+        label: '模型信息',
+        icon: Icons.smart_toy_outlined,
+        bodyBuilder: (BuildContext context) => ModelInfoPanel(agentId: agentId),
+      ),
+      RightPanelEntry(
+        id: 'questions',
+        label: '问题回复',
+        icon: Icons.forum_outlined,
+        bodyBuilder: (BuildContext context) => QuestionPanel(
+          sessionId: _currentSessionId,
+          onNavigateToQuestion: _handleNavigateToQuestion,
+        ),
+      ),
+      RightPanelEntry(
+        id: 'toolRuns',
+        label: '正在执行的 tool',
+        icon: Icons.terminal_outlined,
+        bodyBuilder: (BuildContext context) => ToolRunsPanel(
+          refreshTrigger: _toolRunsRefreshTrigger,
+          onNavigate: _handleNavigateToToolRun,
+        ),
+      ),
+      RightPanelEntry(
+        id: 'detail',
+        label: '详情',
+        icon: Icons.article_outlined,
+        autoOpenOnSelection: true,
+        bodyBuilder: (BuildContext context) =>
+            DetailPanel(workspaceId: workspaceId, teamId: agentId),
+      ),
+      RightPanelEntry(
+        id: 'settings',
+        label: '设置',
+        icon: Icons.settings_outlined,
+        bodyBuilder: (BuildContext context) => SettingsPage(
+          embedded: true,
+          focusModels: _settingsFocusModels,
+          onReplayRequested: _replayOnboarding,
+        ),
+      ),
+      for (final PluginUiSlot slot in _registry.slotsOfKind(PluginUiSlotKind.panel))
+        RightPanelEntry(
+          id: 'panel:${slot.slotKey}',
+          label: pluginSlotLabel(slot),
+          icon: pluginUiIcon(slot.icon),
+          bodyBuilder: (BuildContext context) => PluginPanelSlotView(
+            slot: slot,
+            registry: _registry,
+            agentId: agentId,
+            sessionId: _currentSessionId,
+          ),
+        ),
+    ];
+  }
+
+  /// 「文件」窗口在**未选中 agent** 时的空态：提示先选 agent（其余窗口照常可用）。
+  Widget _buildNoAgentHint() {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Icon(Icons.folder_open_outlined, size: 56, color: cs.onSurfaceVariant),
+          const SizedBox(height: 12),
+          Text(
+            '请先在左侧选择或创建一个 Agent',
+            style: TextStyle(fontSize: 14, color: cs.onSurfaceVariant),
+          ),
+        ],
+      ),
     );
   }
 

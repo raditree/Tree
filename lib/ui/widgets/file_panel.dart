@@ -4,70 +4,47 @@ import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:tree_protocol/tree_protocol.dart';
 
 import '../../io/api_service.dart';
 import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
-import '../../io/workspace_refresh_service.dart';
-import '../services/detail_selection.dart';
 import '../services/download_center.dart';
 import '../services/editor_buffer.dart';
-import '../services/plugin_ui_registry.dart';
 import '../services/workspace_paths.dart';
 import 'file_sync_button.dart';
 import 'file_tree.dart';
-import 'detail_panel.dart';
 import 'file_viewer.dart';
 import 'git_history.dart';
-import 'mcp_config_panel.dart';
-import 'model_info_panel.dart';
-import 'plugin_ui_slots.dart';
-import 'question_panel.dart';
 import 'split_panes.dart';
 import 'todo_panel.dart';
-import 'tool_runs_panel.dart';
 
 /// 同文件双开时的窗格提示：两侧**共享同一份缓冲**，不是两份各写各的。
 const String _sharedBufferNotice = '同一文件已在另一窗格打开：两侧共享同一份缓冲，就地编辑即同步';
 
-/// 文件管理面板（右栏）
+/// 文件管理面板——右栏「文件」**窗口**的身体。
 ///
-/// 作为右栏的主容器，以 Tab 组织六个内置分区：
-/// - 「文件」：文件浏览（[FileTree]）/ Git 历史（[GitHistory]）/ Todo（[TodoPanel]）
-/// - 「MCP 配置」：MCP 服务列表与注册（[McpConfigPanel]）
-/// - 「模型信息」：模型下拉、系统提示词与模型参数覆盖（[ModelInfoPanel]）
-/// - 「问题回复」：统一汇总并答复所有提问（[QuestionPanel]）
-/// - 「正在执行的 tool」：核心内存登记表里正在跑的工具，超阈值高亮 + 每行显式关闭
-///   （[ToolRunsPanel]；关闭与执行站 `tool.close` 同实现）
-/// - 「详情」：中栏点中的工具 / 思考行完整摊开（[DetailPanel]）
+/// 用户 2026-10-18 把右栏改成了窗口宿主（见 [RightPanelHost]）：原先这里一口气
+/// 挂着「文件 / MCP 配置 / 模型信息 / 问题回复 / 正在执行的 tool / 详情 + 插件面板」
+/// 六个顶层页签，现在拆成一个个**按需打开的窗口**——本控件只保留「文件」这一格：
+/// 文件浏览（[FileTree]）/ Git 历史（[GitHistory]）/ Todo（[TodoPanel]）。
 ///
-/// 「插件」原本是这里的第 5 个页签，已迁到**左侧活动栏**（见
-/// main_page.dart 的 _buildActivityBar），与 Agent 列表并列。
+/// 其余窗口各归其位：MCP 配置 / 模型信息 / 问题回复 / 正在执行的 tool / 详情 /
+/// 设置 / 插件声明的 `panel` 槽位（[PluginPanelSlotView]）都由 RightPanelHost 打开。
+/// 本窗口**不再需要 agent 的 workspace 才存在**：未选中 agent 时由宿主渲染
+/// 「请先选择 Agent」的空态（见 main_page），所以右栏在没有 agent 时也长期在。
 ///
-/// Q12 插件布局：插件声明的 `panel` 槽位作为**插件 Tab 追加在既有 Tab 之后**
-/// （见 [PluginUiRegistry.slotsOfKind]），内容由 [PluginPanelSlotView] 渲染；
-/// 槽位变化（manifest / 注销 / 切 team）时按槽位键比对，仅在集合真变化时重建
-/// TabController——避免每次 plugin_ui_update 都重置当前页签。
-///
-/// 点击文件时在**下格**打开 [FileViewer]：树与查看器**同屏**（上下分栏，比例默认 0.4，
-/// 太矮时按 [SplitPanes] 的既有口径降级成一次只显示一个）；没打开文件时树独占整个区域。
+/// 点击文件时在**下格**打开 [FileViewer]：树与查看器**同屏**（左右分栏，比例默认 0.3，
+/// 太窄时按 [SplitPanes] 的既有口径降级成一次只显示一个）；没打开文件时树独占整个区域。
 /// 关闭查看器（工具条 / 窗格的返回按钮）回到树独占。见 lib/README.md 不变量 16。
 ///
 /// **分屏是"一个文件一份文档、两个视图"**：同一个路径的窗格共用同一个
 /// [EditorBuffer]（同一个控制器 + 一份 dirty / saving / loadedSize），两边都能编辑、
 /// 一边打字另一边立刻可见，保存只有一套语义（见 [lib/README.md] 不变量 13）。
 class FilePanel extends StatefulWidget {
-  /// 顶层页签里「文件」的索引（新手引导第 6 步要切到它；与内部 Tab 顺序同源）。
-  static const int filesTabIndex = 0;
-
-  /// 顶层页签里「模型信息」的索引（新手引导第 3 步要切到它）。
-  static const int modelInfoTabIndex = 2;
-
   /// 工作空间 ID
   final String workspaceId;
 
-  /// 所属团队 ID（Todo 面板本地模式读取、模型信息页需要）
+  /// 所属团队 ID（Todo 面板本地模式读取）
   final String? teamId;
 
   /// 所属团队显示名（下载列表里标注「来自哪个 team」）；为空时退回 [teamId]。
@@ -76,30 +53,14 @@ class FilePanel extends StatefulWidget {
   /// 当前会话 ID（Todo 面板按会话隔离查询 todos）
   final String sessionId;
 
-  /// 折叠右侧栏的回调
-  final VoidCallback? onCollapse;
+  /// 文件区外部刷新触发（由宿主监听 `WorkspaceArea.files` 递进来；本面板只叠加内部计数）
+  final int fileRefreshTrigger;
 
-  /// 提问定位回调（透传给 [QuestionPanel]）
-  final QuestionNavigateCallback? onNavigateToQuestion;
+  /// Git 区外部刷新触发（`WorkspaceArea.git`）
+  final int gitRefreshTrigger;
 
-  /// 「正在执行的 tool」定位回调（透传给 [ToolRunsPanel]）：点某一行切中栏到
-  /// 该运行所属的 agent / 会话。
-  final ToolRunNavigateCallback? onNavigateToToolRun;
-
-  /// 插件槽位注册表（默认全局单例；测试注入独立实例，避免污染单例）
-  final PluginUiRegistry? registry;
-
-  /// 顶层页签的外部选中请求（索引：0=文件，2=模型信息，…；null = 不动）。
-  ///
-  /// 新手引导用它把用户直接带到「模型信息」/「文件」页；只在**值变化**时生效——
-  /// 用户自己翻页后不该被下一次重建拽回去。
-  final int? selectTab;
-
-  /// [selectTab] 的**请求序号**：每次外部请求自增。
-  ///
-  /// 为什么不能只看索引有没有变：用户可能自己翻走再点一次引导的「带我过去」——
-  /// 索引没变、但用户确实要回到那一页。按序号判"这是一次新请求"才没有死按钮。
-  final int selectTabRevision;
+  /// Todo 区外部刷新触发（`WorkspaceArea.todo`）
+  final int todoRefreshTrigger;
 
   const FilePanel({
     super.key,
@@ -107,12 +68,9 @@ class FilePanel extends StatefulWidget {
     this.teamId,
     this.teamName = '',
     this.sessionId = 'session_default',
-    this.onCollapse,
-    this.onNavigateToQuestion,
-    this.onNavigateToToolRun,
-    this.registry,
-    this.selectTab,
-    this.selectTabRevision = 0,
+    this.fileRefreshTrigger = 0,
+    this.gitRefreshTrigger = 0,
+    this.todoRefreshTrigger = 0,
   });
 
   @override
@@ -120,26 +78,8 @@ class FilePanel extends StatefulWidget {
 }
 
 class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
-  /// 内置顶层 Tab 数量（文件 / MCP 配置 / 模型信息 / 问题回复 / 正在执行的 tool / 详情）
-  static const int _builtinTabCount = 6;
-
-
-  /// 「详情」页的固定索引（中栏点了工具行 / 思考行就切到它）
-  static const int _detailTabIndex = _builtinTabCount - 1;
-
-  /// 顶层 Tab 控制器（0=文件，1=MCP 配置，2=模型信息，3=问题回复，4=正在执行的 tool，
-  /// 5=详情，之后是插件 panel 槽位；插件槽位集合变化时重建）
-  late TabController _tabController;
-
-  /// 顶层 Tab 当前选中索引（重建控制器时保持选中页）
-  int _topTabIndex = 0;
-
-  /// 当前 team 可见的插件面板槽位（右栏顶层 Tab 的插件段）
-  List<PluginUiSlot> _pluginPanels = <PluginUiSlot>[];
-
-  /// 槽位注册表（默认全局单例）
-  PluginUiRegistry get _registry =>
-      widget.registry ?? PluginUiRegistry.instance;
+  /// 文件区**内部**刷新计数：本面板自己的动作（上传等）递增，与外部触发相加后交给 FileTree。
+  int _fileRefreshTrigger = 0;
 
   /// 文件子 Tab 控制器（0=文件浏览，1=Git 历史，2=Todo）
   late final TabController _fileTabController;
@@ -201,22 +141,10 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
   /// 是否正显示查看器
   bool get _viewerOpen => _viewerPaths.isNotEmpty;
 
-  /// 文件树刷新触发器（上传等操作后递增，触发 FileTree 重新加载）
-  int _fileRefreshTrigger = 0;
-
   /// 文件树当前所在目录（空 = 根）；「同步到本地」按它限定作用域（M8b）
   String _treePath = '';
 
-  /// Git 历史刷新触发器
-  int _gitRefreshTrigger = 0;
-
-  /// Todo 列表刷新触发器
-  int _todoRefreshTrigger = 0;
-
-  /// 「正在执行的 tool」页刷新触发器（工具开始 / 结束时登记表变了）
-  int _toolRunsRefreshTrigger = 0;
-
-  /// 刷新文件树（兼容旧调用：视为文件区域）
+  /// 刷新文件树（本面板自己的动作，如上传完成；与外部触发叠加后交给 FileTree）
   void _refreshFileTree() {
     setState(() {
       _fileRefreshTrigger++;
@@ -251,141 +179,22 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
-    _pluginPanels = _registry.slotsOfKind(PluginUiSlotKind.panel);
-    _tabController = TabController(
-      length: _builtinTabCount + _pluginPanels.length,
-      vsync: this,
-    );
-    _tabController.addListener(_onTopTabChanged);
-    // 中栏点了工具行 / 思考行 → 自动切到「详情」页
-    DetailSelection.instance.addListener(_onDetailSelected);
     _fileTabController = TabController(length: 3, vsync: this);
-    // Q12：插件槽位（manifest / 注销 / 切 team）变化时重算插件 Tab
-    _registry.addListener(_onPluginSlotsChanged);
     // 本地模式开关/工作目录变化时重新加载文件列表
     LocalExecutorService.instance.addListener(_onLocalModeChanged);
-    // 工作空间数据变更（文件/Git/Todo 工具执行）时即时刷新右栏
-    WorkspaceRefreshService.instance.addListener(_onWorkspaceChanged);
   }
 
   @override
   void dispose() {
-    DetailSelection.instance.removeListener(_onDetailSelected);
     LocalExecutorService.instance.removeListener(_onLocalModeChanged);
-    WorkspaceRefreshService.instance.removeListener(_onWorkspaceChanged);
-    _registry.removeListener(_onPluginSlotsChanged);
     // 面板没了，手里那些共享缓冲（及其控制器）一起收掉；
     // 同文件双开时两格是同一个实例，去重后再 dispose。
     for (final EditorBuffer buffer in <EditorBuffer>{..._viewerBuffers}) {
       buffer.dispose();
     }
     _viewerBuffers.clear();
-    _tabController.dispose();
     _fileTabController.dispose();
     super.dispose();
-  }
-
-  @override
-  void didUpdateWidget(covariant FilePanel oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    // 外部页签请求（新手引导）：按**请求序号**判"这是一次新请求"（见 selectTabRevision）
-    final int? requested = widget.selectTab;
-    if (requested != null &&
-        widget.selectTabRevision != oldWidget.selectTabRevision) {
-      final int index = requested.clamp(0, _tabController.length - 1);
-      if (_tabController.index != index) _tabController.animateTo(index);
-    }
-  }
-
-  /// 中栏选中了工具行 / 思考行：切到「详情」页。
-  ///
-  /// 只在**选中**时切（清空不动）：用户点关闭收掉详情后，不该再被拽回这一页。
-  void _onDetailSelected() {
-    if (!mounted) return;
-    if (DetailSelection.instance.message == null &&
-        DetailSelection.instance.injected == null) {
-      return;
-    }
-    if (_tabController.index != _detailTabIndex) {
-      _tabController.animateTo(_detailTabIndex);
-    }
-  }
-
-  /// 顶层 Tab 选中索引跟踪（TabController 重建时保持当前页）
-  void _onTopTabChanged() {
-    if (_tabController.index != _topTabIndex) {
-      _topTabIndex = _tabController.index;
-    }
-  }
-
-  /// 插件槽位集合变化：只有"槽位键序列"真的变了才重建 TabController。
-  ///
-  /// 视图更新（plugin_ui_update）不改变槽位键，因此不会重置当前页签，也不会
-  /// 让用户正在填的表单被重建。
-  void _onPluginSlotsChanged() {
-    if (!mounted) return;
-    final List<PluginUiSlot> slots = _registry.slotsOfKind(
-      PluginUiSlotKind.panel,
-    );
-    if (_samePanelKeys(slots)) {
-      return;
-    }
-    setState(() {
-      _pluginPanels = slots;
-      _rebuildTopTabController();
-    });
-  }
-
-  /// 槽位键序列是否与当前一致（顺序敏感：Tab 顺序必须稳定）。
-  bool _samePanelKeys(List<PluginUiSlot> slots) {
-    if (slots.length != _pluginPanels.length) {
-      return false;
-    }
-    for (int i = 0; i < slots.length; i++) {
-      if (slots[i].slotKey != _pluginPanels[i].slotKey) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  /// 重建顶层 TabController（长度变了必须重建；保持当前选中页）
-  void _rebuildTopTabController() {
-    final int length = _builtinTabCount + _pluginPanels.length;
-    final int index = _topTabIndex.clamp(0, length - 1);
-    _tabController.dispose();
-    _tabController = TabController(
-      length: length,
-      vsync: this,
-      initialIndex: index,
-    );
-    _tabController.addListener(_onTopTabChanged);
-    _topTabIndex = index;
-  }
-
-  /// 工作空间数据变更（工具写文件 / git 提交 / 更新 todo / 工具开始结束）时增量刷新右栏。
-  ///
-  /// 依据变更影响的区域，只递增对应 tab 的触发器；只读工具不触发，
-  /// 不再"切 Tab 再切回"也无需整表重拉。
-  void _onWorkspaceChanged() {
-    if (!mounted) return;
-    final Set<WorkspaceArea>? areas = WorkspaceRefreshService.instance
-        .takeAreas();
-    if (areas == null || areas.isEmpty) return;
-    setState(() {
-      if (areas.contains(WorkspaceArea.files)) {
-        _fileRefreshTrigger++;
-      }
-      if (areas.contains(WorkspaceArea.git)) {
-        _gitRefreshTrigger++;
-      }
-      if (areas.contains(WorkspaceArea.todo)) {
-        _todoRefreshTrigger++;
-      }
-      if (areas.contains(WorkspaceArea.toolRuns)) {
-        _toolRunsRefreshTrigger++;
-      }
-    });
   }
 
   /// 本地执行模式状态变化（切换开关/选择工作目录）时刷新文件树。
@@ -649,121 +458,11 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
 
   @override
   Widget build(BuildContext context) {
+    // 本控件就是「文件」窗口的身体：只有一块文件区（子 Tab：文件浏览 / Git / Todo）。
+    // 顶层没有 Tab 栏——窗口 chip、关闭、折叠都在宿主 [RightPanelHost] 的顶栏里。
     return Container(
       color: Theme.of(context).scaffoldBackgroundColor,
-      child: Column(
-        children: [
-          // 顶层 Tab 栏（文件 / MCP 配置 / 模型信息 / 问题回复 / 插件）+ 折叠按钮
-          _buildTopTabBar(),
-          Divider(
-            height: 1,
-            thickness: 1,
-            color: Theme.of(context).dividerColor,
-          ),
-          // 内容区域：按顶层 Tab 切换
-          Expanded(
-            child: GestureDetector(
-              // 点击任意页签内容区的空白处折叠右侧栏（文件较少、Todo 为空、
-              // MCP 配置、模型信息等的大片空白均生效）。子项自带点击手势
-              // （列表项、Tab、按钮等）会优先消费，只有点到真正空白处才命中，
-              // 不会误伤内容交互。打开 FileViewer 时禁止折叠。
-              behavior: HitTestBehavior.translucent,
-              onTap: _viewerOpen ? null : widget.onCollapse,
-              child: TabBarView(
-                controller: _tabController,
-                children: <Widget>[
-                  _buildFileSection(),
-                  const McpConfigPanel(),
-                  ModelInfoPanel(agentId: widget.teamId ?? ''),
-                  QuestionPanel(
-                    sessionId: widget.sessionId,
-                    onNavigateToQuestion: widget.onNavigateToQuestion,
-                  ),
-                  // 正在执行的 tool：核心内存登记表的快照 + 每行一个显式「关闭」
-                  // （与执行站 tool.close 同实现）；每行标注**来源**（agent · 会话），
-                  // 点整行切中栏到那里。见 ToolRunsPanel。
-                  ToolRunsPanel(
-                    refreshTrigger: _toolRunsRefreshTrigger,
-                    onNavigate: widget.onNavigateToToolRun,
-                  ),
-                  // 详情页：中栏点中的工具调用 / 思考完整摊开（见 DetailPanel）
-                  // 带上工作空间：edit 的「变更」要读一次当前文件才有上下文
-                  DetailPanel(
-                    workspaceId: widget.workspaceId,
-                    teamId: widget.teamId ?? '',
-                  ),
-                  // Q12：插件面板 Tab（追加在既有 Tab 之后）
-                  for (final PluginUiSlot slot in _pluginPanels)
-                    PluginPanelSlotView(
-                      slot: slot,
-                      registry: _registry,
-                      agentId: widget.teamId ?? '',
-                      sessionId: widget.sessionId,
-                    ),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// 顶层 Tab 栏
-  Widget _buildTopTabBar() {
-    final cs = Theme.of(context).colorScheme;
-    return Container(
-      height: 48,
-      color: cs.surface,
-      child: Row(
-        children: [
-          Expanded(
-            child: TabBar(
-              controller: _tabController,
-              labelColor: cs.primary,
-              unselectedLabelColor: cs.onSurfaceVariant,
-              indicatorColor: cs.primary,
-              indicatorSize: TabBarIndicatorSize.label,
-              isScrollable: true,
-              labelStyle: const TextStyle(
-                fontSize: 13,
-                fontWeight: FontWeight.w600,
-              ),
-              unselectedLabelStyle: const TextStyle(fontSize: 13),
-              tabs: <Widget>[
-                const Tab(text: '文件'),
-                const Tab(text: 'MCP 配置'),
-                const Tab(text: '模型信息'),
-                const Tab(text: '问题回复'),
-                const Tab(text: '正在执行的 tool'),
-                const Tab(text: '详情'),
-                // Q12 插件 Tab：追加在既有六个 Tab 之后，文案用槽位 title
-                for (final PluginUiSlot slot in _pluginPanels)
-                  Tab(text: pluginSlotLabel(slot)),
-              ],
-            ),
-          ),
-          // 一键重置（备份 .bak.<n> 后还原默认）：系统提示词 / Spec
-          IconButton(
-            tooltip: '重置系统提示词（备份 .bak.<n>）',
-            visualDensity: VisualDensity.compact,
-            icon: const Icon(Icons.assignment_return_outlined, size: 18),
-            onPressed: () => _resetWorkspace('system_prompt'),
-          ),
-          IconButton(
-            tooltip: '重置 Spec（备份 .bak.<n>）',
-            visualDensity: VisualDensity.compact,
-            icon: const Icon(Icons.rule_folder_outlined, size: 18),
-            onPressed: () => _resetWorkspace('spec'),
-          ),
-          // 折叠右侧栏
-          IconButton(
-            tooltip: '折叠右侧栏',
-            icon: const Icon(Icons.chevron_right),
-            onPressed: widget.onCollapse,
-          ),
-        ],
-      ),
+      child: _buildFileSection(),
     );
   }
 
@@ -957,7 +656,7 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
     final cs = Theme.of(context).colorScheme;
     return Column(
       children: [
-        // 子 Tab 栏 + 文件同步按钮
+        // 子 Tab 栏 + 工作空间动作（同步到本地 / 一键重置系统提示词 / Spec）
         Container(
           color: cs.surface,
           padding: const EdgeInsets.only(right: 4),
@@ -981,6 +680,20 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
                     Tab(text: 'Todo'),
                   ],
                 ),
+              ),
+              // 一键重置（备份 .bak.<n> 后还原默认）：原先挂在右栏顶层 Tab 栏上，
+              // 顶层 Tab 栏随窗口化撤掉后落到这里，功能不丢。
+              IconButton(
+                tooltip: '重置系统提示词（备份 .bak.<n>）',
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.assignment_return_outlined, size: 18),
+                onPressed: () => _resetWorkspace('system_prompt'),
+              ),
+              IconButton(
+                tooltip: '重置 Spec（备份 .bak.<n>）',
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.rule_folder_outlined, size: 18),
+                onPressed: () => _resetWorkspace('spec'),
               ),
               FileSyncButton(
                 workspaceId: widget.workspaceId,
@@ -1044,7 +757,7 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
           FileTree(
             workspaceId: widget.workspaceId,
             teamId: widget.teamId,
-            refreshTrigger: _fileRefreshTrigger,
+            refreshTrigger: _fileRefreshTrigger + widget.fileRefreshTrigger,
             onDownload: _handleDownload,
             onPathChanged: (String path) {
               if (path == _treePath) return;
@@ -1062,13 +775,13 @@ class _FilePanelState extends State<FilePanel> with TickerProviderStateMixin {
           GitHistory(
             workspaceId: widget.workspaceId,
             teamId: widget.teamId,
-            refreshTrigger: _gitRefreshTrigger,
+            refreshTrigger: widget.gitRefreshTrigger,
           ),
           TodoPanel(
             workspaceId: widget.workspaceId,
             teamId: widget.teamId,
             sessionId: widget.sessionId,
-            refreshTrigger: _todoRefreshTrigger,
+            refreshTrigger: widget.todoRefreshTrigger,
           ),
         ],
       ),

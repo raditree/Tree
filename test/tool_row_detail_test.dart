@@ -631,28 +631,46 @@ void main() {
     });
   });
 
-  group('右栏「详情」页的接线（源钉）', () {
+  group('右栏「详情」窗口的接线（源钉）', () {
     final String panel =
         File('lib/ui/widgets/file_panel.dart').readAsStringSync();
     final String page = File('lib/ui/pages/main_page.dart').readAsStringSync();
+    final String host =
+        File('lib/ui/widgets/right_panel_host.dart').readAsStringSync();
 
-    test('FilePanel 多出第 6 个内置页签「详情」（新增「正在执行的 tool」后仍是最后一页）', () {
-      expect(panel.contains('static const int _builtinTabCount = 6;'), isTrue);
-      expect(panel.contains("const Tab(text: '正在执行的 tool')"), isTrue);
-      expect(panel.contains("const Tab(text: '详情')"), isTrue);
-      // 详情页要带上工作空间：edit 的「变更」得读一次当前文件才有上下文（用户 2026-10-04）
-      expect(panel.contains('DetailPanel('), isTrue);
-      expect(panel.contains('workspaceId: widget.workspaceId'), isTrue);
+    test('右栏窗口化：FilePanel 只剩「文件」身体，不再有顶层页签', () {
+      // 用户 2026-10-18：右栏不再是六页签的一根栏，而是窗口宿主。
+      expect(panel.contains('_tabController'), isFalse,
+          reason: '顶层页签已撤，改由 RightPanelHost 的窗口 chip 承担');
+      expect(panel.contains("const Tab(text: '详情')"), isFalse);
+      // 文件区自己的子 Tab 仍在
+      expect(panel.contains("Tab(text: 'Git 历史')"), isTrue);
+      expect(panel.contains("Tab(text: 'Todo')"), isTrue);
     });
 
-    test('选中详情时自动切到该页签，并让右栏收着就展开', () {
+    test('「详情」是一个窗口，且排在「正在执行的 tool」之后', () {
+      expect(page.contains("id: 'detail'"), isTrue);
+      expect(page.contains('autoOpenOnSelection: true'), isTrue);
+      // 详情窗要带上工作空间：edit 的「变更」得读一次当前文件才有上下文（用户 2026-10-04）
+      expect(page.contains('DetailPanel('), isTrue);
+      expect(page.contains('workspaceId: workspaceId'), isTrue);
+      expect(page.indexOf("id: 'toolRuns'"),
+          lessThan(page.indexOf("id: 'detail'")),
+          reason: '内置顺序：… 问题回复 / 正在执行的 tool / 详情');
+    });
+
+    test('选中 / 注入详情时自动打开详情窗，并让右栏收着就展开', () {
+      // 窗口宿主：选中详情 → 自动打开被标了 autoOpenOnSelection 的窗口
       expect(
-        panel.contains('DetailSelection.instance.addListener(_onDetailSelected)'),
+        host.contains(
+            'DetailSelection.instance.addListener(_onDetailSelected)'),
         isTrue,
       );
-      expect(panel.contains('_tabController.animateTo(_detailTabIndex)'), isTrue);
+      expect(host.contains('autoOpenOnSelection'), isTrue);
+      // 主页面：右栏收着就展开（否则点了半天什么也没发生）
       expect(
-        page.contains('DetailSelection.instance.addListener(_onDetailSelected)'),
+        page.contains(
+            'DetailSelection.instance.addListener(_onDetailSelected)'),
         isTrue,
       );
       expect(page.contains('if (!_rightCollapsed) return;'), isTrue);

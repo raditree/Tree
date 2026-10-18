@@ -8,12 +8,15 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:tree/ui/models/message.dart';
 import 'package:tree/ui/services/plugin_ui_registry.dart';
 import 'package:tree/ui/widgets/activity_bar_item.dart';
-import 'package:tree/ui/widgets/file_panel.dart';
+import 'package:tree/ui/widgets/right_panel_host.dart';
 import 'package:tree/ui/widgets/message_list.dart';
 import 'package:tree/ui/widgets/plugin_ui_slots.dart';
 import 'package:tree_protocol/tree_protocol.dart';
 
 void _noop() {}
+
+/// 占位窗口身体（测试里「文件」窗不渲染任何东西）。
+Widget _emptyBody(BuildContext context) => const SizedBox.shrink();
 
 /// 槽位声明 JSON（合成）。
 Map<String, dynamic> _slot(
@@ -159,25 +162,44 @@ void main() {
     });
   });
 
-  // ══ 接入点 2：右栏 Tab ═════════════════════════════════════════════════
+  // ══ 接入点 2：右栏窗口（插件 panel 槽位） ═════════════════════════════
 
-  group('右栏插件 Tab', () {
+  group('右栏插件窗口', () {
+    // 右栏 2026-10-18 起是窗口宿主：插件 `panel` 槽位不再是顶层 Tab，
+    // 而是一个**窗口**（从「+」路由页打开）。这里钉住这条通路不回归。
     Widget host(PluginUiRegistry reg) => MaterialApp(
           home: Scaffold(
             body: SizedBox(
               width: 760,
               height: 600,
-              child: FilePanel(
-                workspaceId: 'ws_test',
-                teamId: 't1',
-                sessionId: 'session_default',
-                registry: reg,
+              child: ListenableBuilder(
+                listenable: reg,
+                builder: (BuildContext context, Widget? child) => RightPanelHost(
+                  entries: <RightPanelEntry>[
+                    const RightPanelEntry(
+                      id: 'files',
+                      label: '文件',
+                      icon: Icons.folder_outlined,
+                      openByDefault: true,
+                      bodyBuilder: _emptyBody,
+                    ),
+                    for (final PluginUiSlot slot
+                        in reg.slotsOfKind(PluginUiSlotKind.panel))
+                      RightPanelEntry(
+                        id: 'panel:${slot.slotKey}',
+                        label: pluginSlotLabel(slot),
+                        icon: pluginUiIcon(slot.icon),
+                        bodyBuilder: (BuildContext context) =>
+                            PluginPanelSlotView(slot: slot, registry: reg),
+                      ),
+                  ],
+                ),
               ),
             ),
           ),
         );
 
-    testWidgets('插件 Tab 追加在既有 Tab 之后，切过去渲染槽位视图',
+    testWidgets('插件面板以窗口形式出现，打开后渲染槽位视图且更新即时生效',
         (WidgetTester tester) async {
       final PluginUiRegistry reg = PluginUiRegistry.forTesting()..setTeam('t1');
       _feedManifest(reg, 'demo.a', 't1', <Map<String, dynamic>>[
@@ -191,29 +213,30 @@ void main() {
       await tester.pumpWidget(host(reg));
       await tester.pump();
 
-      // 既有四个 Tab 仍在
+      // 默认只开「文件」窗；插件面板窗要经「+」路由页打开
       expect(find.text('文件'), findsOneWidget);
-      expect(find.text('MCP 配置'), findsOneWidget);
-      expect(find.text('模型信息'), findsOneWidget);
-      expect(find.text('问题回复'), findsOneWidget);
-      // 插件 Tab 追加在最后
-      expect(find.text('演示面板'), findsOneWidget);
-      expect(
-        tester.getTopLeft(find.text('演示面板')).dx,
-        greaterThan(tester.getTopLeft(find.text('问题回复')).dx),
-      );
+      expect(find.text('面板内容'), findsNothing);
 
-      // 切到插件 Tab：内容为槽位视图
-      //
-      // 右栏 2026-10-03 起有 **6 个内置页签**（新增「正在执行的 tool」），而 TabBar 是
-      // `isScrollable`：760px 宽下最后一个插件页签落在**滚动区之外**，直接 tap 会点在
-      // 视口外的坐标上（hit test 落空 ⇒ 点不动）。先滚到可见再点，断言口径不变。
-      await tester.ensureVisible(find.text('演示面板'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('演示面板'));
+      await tester.tap(
+        find.byKey(const ValueKey<String>('right-panel-new-window')),
+      );
       await tester.pump();
-      await tester.pump(const Duration(milliseconds: 400));
+
+      // 路由页里出现该插件窗口格子，点开后渲染槽位视图
+      final Finder pick = find.byKey(
+        const ValueKey<String>('right-panel-pick-panel:a.panel.1'),
+      );
+      expect(pick, findsOneWidget);
+      expect(find.text('演示面板'), findsWidgets);
+      await tester.tap(pick);
+      await tester.pump();
+
       expect(find.text('面板内容'), findsOneWidget);
+      // 打开的窗口成为 chip（可关闭）
+      expect(
+        find.byKey(const ValueKey<String>('right-panel-chip-panel:a.panel.1')),
+        findsOneWidget,
+      );
 
       // 整块替换：plugin_ui_update 后内容即时变化
       _feedUpdate(reg, 'demo.a', 't1', 'a.panel.1', <String, dynamic>{
@@ -225,15 +248,24 @@ void main() {
       expect(find.text('面板内容'), findsNothing);
     });
 
-    testWidgets('别的 team 的插件 Tab 不出现', (WidgetTester tester) async {
+    testWidgets('别的 team 的插件面板不作为窗口出现', (WidgetTester tester) async {
       final PluginUiRegistry reg = PluginUiRegistry.forTesting()..setTeam('t1');
       _feedManifest(reg, 'demo.b', 't2', <Map<String, dynamic>>[
         _slot('b.panel.1', PluginUiSlotKind.panel, title: '乙队面板'),
       ]);
       await tester.pumpWidget(host(reg));
       await tester.pump();
+
+      await tester.tap(
+        find.byKey(const ValueKey<String>('right-panel-new-window')),
+      );
+      await tester.pump();
       expect(find.text('乙队面板'), findsNothing);
-      expect(find.text('问题回复'), findsOneWidget);
+      // 内置窗口仍在（只有「文件」默认打开，路由页里能看到内置项）
+      expect(
+        find.byKey(const ValueKey<String>('right-panel-pick-files')),
+        findsOneWidget,
+      );
     });
   });
 

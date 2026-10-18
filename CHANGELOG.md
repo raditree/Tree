@@ -58,6 +58,35 @@
     `test/plugin_panel_admin_test.dart`（单组 + 同一颗开关 + 普通删除确认框）、
     `test/plugin_detail_page_test.dart`。
 
+- **右栏从"一根固定分栏"改成「窗口宿主」：设置 / 文件 / 详情 / 各内置页与插件面板槽位都是按需打开的窗口**
+  （**新增** [lib/README.md](lib/README.md) 不变量 28；
+  [lib/ui/widgets/right_panel_host.dart](lib/ui/widgets/right_panel_host.dart)、
+  [lib/ui/pages/main_page.dart](lib/ui/pages/main_page.dart)；
+  **用户 2026-10-18**：「右侧面板不要做那种固定的栏，改为窗口式，像 VS Studio 一样，把设置、文件查看、
+  详情、etc 统一化，按需打开」）：
+  - **右栏长期存在**：一个窗口都没开也还在（空态里一颗「打开窗口」按钮）；因此**没选中 agent 时**插件卡片
+    点进的详情也有地方显示（旧形态下未选 agent 右栏是空白占位，详情无处落 —— 用户反馈的痛点）。
+    「文件」窗在未选 agent 时显示「请先在左侧选择或创建一个 Agent」，其余窗口照常可用；
+  - 顶栏是一排窗口 chip +「+」创建按钮 + 折叠按钮；**「+」是页内路由页**（不是 `Navigator.push` 全屏），
+    可用窗口**5 列 × 4 行**网格排列、超过 20 个分页；点一项打开并聚焦，chip 可关闭；
+  - **窗口种类由主页面算好传入**（`List<RightPanelEntry>`）：7 个内置（文件 / MCP 配置 / 模型信息 / 问题回复 /
+    正在执行的 tool / 详情 / 设置）+ 插件声明的 `panel` 槽位（[PluginPanelSlotView](lib/ui/widgets/plugin_ui_slots.dart)）。
+    主机不认识任何具体窗口，**插件申请面板照旧接入**；
+  - **「详情」窗**标了 `autoOpenOnSelection`：中栏选中工具 / 思考行、插件卡片 `DetailSelection.inject` 时
+    **自动打开并聚焦**；
+  - **设置**收进右栏「设置」窗（[SettingsPage](lib/ui/pages/settings_page.dart) 的 `embedded` 模式，不再
+    `Navigator.push` 全屏、「重新显示新手引导」改走 `onReplayRequested` 回调）；
+  - [FilePanel](lib/ui/widgets/file_panel.dart) 只剩「文件」窗身体（文件浏览 / Git / Todo），顶层页签撤掉；
+    原先挂在顶层 Tab 栏的「重置系统提示词 / Spec」落到文件区工具条上，功能不丢；
+  - 已打开的窗 `IndexedStack` **常挂**（切窗不重建，文件树展开态 / 查看器缓冲不丢）；
+    `WorkspaceRefreshService.takeAreas()` 改由**主页面一个监听者**消费，再按区域透给「文件」窗与
+    「正在执行的 tool」窗（"取走即清空"，两个监听者会互相抢）；
+  - 用例：`test/right_panel_host_test.dart`（默认开窗 / 空态仍在 / 5 列分页 / 开窗关窗 / 注入详情自动开 /
+    切窗常挂）、`test/plugin_ui_slots_test.dart`（插件面板作为窗口出现且更新即时生效）、
+    `test/tool_runs_panel_test.dart`（打开窗才拉数据 + 顺序在详情之前）、
+    `test/tool_row_detail_test.dart`（源钉：FilePanel 无顶层页签 / 详情是窗口且带工作空间 /
+    选中自动开窗 + 右栏收着就展开）、`test/main_page_center_collapse_test.dart`（折叠键改到窗口顶栏）。
+
 ## [1.0.4+2] — 2026-10-18
 
 ### 断言变化（新增 / 修改的 README 不变量）

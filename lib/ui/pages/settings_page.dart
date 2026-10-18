@@ -33,6 +33,8 @@ class SettingsPage extends StatefulWidget {
     super.key,
     this.versionInfo,
     this.focusModels = false,
+    this.embedded = false,
+    this.onReplayRequested,
   });
 
   /// 版本信息数据源（**测试注入用**；null = 从核心启动器读当前运行态）。
@@ -40,6 +42,13 @@ class SettingsPage extends StatefulWidget {
 
   /// 打开时**滚到「自定义模型」一节**（新手引导第 1 步：先配模型）。
   final bool focusModels;
+
+  /// 嵌在右栏「设置」**窗口**里（用户 2026-10-18 右栏窗口化）：不套 Scaffold/AppBar，
+  /// 标题由窗口 chip 承担；「重新显示新手引导」改为回调而不是 `Navigator.pop(true)`。
+  final bool embedded;
+
+  /// [embedded] 下点「重新显示新手引导」时的回调（非嵌入模式仍走 `pop(true)`）。
+  final VoidCallback? onReplayRequested;
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -126,19 +135,30 @@ class _SettingsPageState extends State<SettingsPage> {
     _loadPluginConfigPath();
     // 引导带过来的（focusModels）：首帧之后滚到「自定义模型」——此时 ListView
     // 还没布局完，ensureVisible 拿不到位置。
-    if (widget.focusModels) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        final BuildContext? target = _modelsSectionKey.currentContext;
-        if (target == null) return;
-        unawaited(
-          Scrollable.ensureVisible(
-            target,
-            duration: const Duration(milliseconds: 300),
-            alignment: 0.1,
-          ),
-        );
-      });
-    }
+    if (widget.focusModels) _scheduleScrollToModels();
+  }
+
+  @override
+  void didUpdateWidget(covariant SettingsPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 嵌在右栏窗口里时本控件常挂（IndexedStack），再次收到 focusModels
+    // （引导「带我过去」又点了一次）得重新滚，不能只在 initState 里做一次。
+    if (widget.focusModels && !oldWidget.focusModels) _scheduleScrollToModels();
+  }
+
+  /// 帧后滚到「自定义模型」一节。
+  void _scheduleScrollToModels() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final BuildContext? target = _modelsSectionKey.currentContext;
+      if (target == null) return;
+      unawaited(
+        Scrollable.ensureVisible(
+          target,
+          duration: const Duration(milliseconds: 300),
+          alignment: 0.1,
+        ),
+      );
+    });
   }
 
   /// 读插件快照，只为拿 `config.path`（插件清单的真实路径）。
@@ -418,69 +438,77 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   Widget build(BuildContext context) {
+    final Widget body = ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        _buildSectionTitle('流式帧率'),
+        const SizedBox(height: 8),
+        _buildTokenRateCard(),
+        const SizedBox(height: 12),
+        _buildFrameRateCard(),
+        const SizedBox(height: 24),
+        _buildSectionTitle('心跳判活'),
+        const SizedBox(height: 8),
+        _buildHeartbeatCard(),
+        const SizedBox(height: 24),
+        KeyedSubtree(
+          key: _modelsSectionKey,
+          child: _buildSectionTitle('自定义模型'),
+        ),
+        const SizedBox(height: 8),
+        _buildCustomModelCard(),
+        const SizedBox(height: 24),
+        _buildSectionTitle('主题管理'),
+        const SizedBox(height: 8),
+        _buildThemeCard(),
+        const SizedBox(height: 24),
+        _buildSectionTitle('主题色'),
+        const SizedBox(height: 8),
+        const _AccentColorCard(),
+        const SizedBox(height: 24),
+        _buildSectionTitle('文字大小'),
+        const SizedBox(height: 8),
+        _buildTextScaleCard(),
+        const SizedBox(height: 24),
+        _buildSectionTitle('界面字体'),
+        const SizedBox(height: 8),
+        _buildFontCard(),
+        const SizedBox(height: 24),
+        _buildSectionTitle('窗口与托盘'),
+        const SizedBox(height: 8),
+        _buildTrayCard(),
+        const SizedBox(height: 24),
+        _buildSectionTitle('编辑器'),
+        const SizedBox(height: 8),
+        _buildEditorCard(),
+        const SizedBox(height: 24),
+        _buildSectionTitle('插件开发'),
+        const SizedBox(height: 8),
+        _buildPluginDevCard(),
+        const SizedBox(height: 24),
+        _buildSectionTitle('核心日志'),
+        const SizedBox(height: 8),
+        const CoreLogCard(),
+        const SizedBox(height: 24),
+        _buildSectionTitle('新手引导'),
+        const SizedBox(height: 8),
+        _buildOnboardingCard(),
+        const SizedBox(height: 24),
+        _buildSectionTitle('版本信息'),
+        const SizedBox(height: 8),
+        _buildVersionCard(),
+      ],
+    );
+    // 嵌入右栏窗口：不套 Scaffold/AppBar（标题由窗口 chip 承担，避免两层头）
+    if (widget.embedded) {
+      return Container(
+        color: Theme.of(context).scaffoldBackgroundColor,
+        child: body,
+      );
+    }
     return Scaffold(
       appBar: AppBar(title: const Text('设置'), centerTitle: false),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          _buildSectionTitle('流式帧率'),
-          const SizedBox(height: 8),
-          _buildTokenRateCard(),
-          const SizedBox(height: 12),
-          _buildFrameRateCard(),
-          const SizedBox(height: 24),
-          _buildSectionTitle('心跳判活'),
-          const SizedBox(height: 8),
-          _buildHeartbeatCard(),
-          const SizedBox(height: 24),
-          KeyedSubtree(
-            key: _modelsSectionKey,
-            child: _buildSectionTitle('自定义模型'),
-          ),
-          const SizedBox(height: 8),
-          _buildCustomModelCard(),
-          const SizedBox(height: 24),
-          _buildSectionTitle('主题管理'),
-          const SizedBox(height: 8),
-          _buildThemeCard(),
-          const SizedBox(height: 24),
-          _buildSectionTitle('主题色'),
-          const SizedBox(height: 8),
-          const _AccentColorCard(),
-          const SizedBox(height: 24),
-          _buildSectionTitle('文字大小'),
-          const SizedBox(height: 8),
-          _buildTextScaleCard(),
-          const SizedBox(height: 24),
-          _buildSectionTitle('界面字体'),
-          const SizedBox(height: 8),
-          _buildFontCard(),
-          const SizedBox(height: 24),
-          _buildSectionTitle('窗口与托盘'),
-          const SizedBox(height: 8),
-          _buildTrayCard(),
-          const SizedBox(height: 24),
-          _buildSectionTitle('编辑器'),
-          const SizedBox(height: 8),
-          _buildEditorCard(),
-          const SizedBox(height: 24),
-          _buildSectionTitle('插件开发'),
-          const SizedBox(height: 8),
-          _buildPluginDevCard(),
-          const SizedBox(height: 24),
-          _buildSectionTitle('核心日志'),
-          const SizedBox(height: 8),
-          const CoreLogCard(),
-          const SizedBox(height: 24),
-          _buildSectionTitle('新手引导'),
-          const SizedBox(height: 8),
-          _buildOnboardingCard(),
-          const SizedBox(height: 24),
-          _buildSectionTitle('版本信息'),
-          const SizedBox(height: 8),
-          _buildVersionCard(),
-        ],
-      ),
+      body: body,
     );
   }
 
@@ -505,7 +533,9 @@ class _SettingsPageState extends State<SettingsPage> {
             const SizedBox(height: 8),
             OutlinedButton.icon(
               key: const ValueKey<String>('settings-replay-onboarding'),
-              onPressed: () => Navigator.of(context).pop(true),
+              onPressed: widget.embedded
+                  ? widget.onReplayRequested
+                  : () => Navigator.of(context).pop(true),
               icon: const Icon(Icons.tips_and_updates_outlined, size: 16),
               label: const Text('重新显示新手引导'),
             ),
