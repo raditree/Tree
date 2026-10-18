@@ -107,7 +107,7 @@ class _FakeAdmin implements PluginAdminClient {
       <String, dynamic>{
         'id': 'sample',
         'name': '示例插件',
-        'description': '核心自带的示例插件（随包二进制）',
+        'description': '核心自带的示例插件（Dart 二进制，不随主包、成品从发布仓库装）',
         'script': 'tree_sample',
         'runtime': 'binary',
         'granularity': 'team',

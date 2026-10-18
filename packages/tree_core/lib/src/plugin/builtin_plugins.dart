@@ -63,7 +63,7 @@ class BuiltinPluginSpec {
   /// 插件类型：需要 Python 解释器的脚本。
   static const String kindPython = 'python';
 
-  /// 插件类型：随包分发的**可执行文件**（不探测任何运行时）。
+  /// 插件类型：**可执行文件**（不探测任何运行时；成品由发布仓库分发，不随主包）。
   static const String kindBinary = 'binary';
 
   /// 插件 id（也是落盘条目的 id；面板用它做开关）。
@@ -214,7 +214,7 @@ class BuiltinPluginCatalog {
 
   /// 核心内置的插件清单（至少一项：示例插件 sample）。
   ///
-  /// 新增内置插件 = 往这里加一条 + 随包分发 `plugins/<script>`；
+  /// 新增内置插件 = 往这里加一条 + 在发布仓库（tree-plugins release）发一份成品；
   /// 面板会自动出现这一项（前端不写死任何内置插件）。
   static const List<BuiltinPluginSpec> specs = <BuiltinPluginSpec>[
     // 2026-10-17：**随包二进制**（以前是 `examples/plugins/sample_plugin.py` + 解释器）。
@@ -224,7 +224,7 @@ class BuiltinPluginCatalog {
       id: kSamplePluginId,
       name: '示例插件',
       description:
-          '核心自带的示例插件（随包二进制，不是脚本）：四站 + 插件布局的全链路参考—'
+          '核心自带的示例插件（Dart 二进制，不随主包、成品从发布仓库装）：四站 + 插件布局的全链路参考—'
           '收集站申报 echo/rounds/read_probe 三个工具，事件按 (agent, session) 数工具轮次、'
           '超阈值（默认 200）经执行站发 agent.stop 并重置计数（“核心不设轮次上限，限制交给插件”的参考实现），'
           'fs.read / llm.call / tool.call / session.rename 四条演示命令各一个开关，'
@@ -248,7 +248,7 @@ class BuiltinPluginCatalog {
       id: kCompactPluginId,
       name: '上下文压缩',
       description:
-          '内置压缩器（随包二进制，不是脚本）：接管 `system.relay.context.compact`，把长会话压成'
+          '内置压缩器（Dart 二进制，不随主包、成品从发布仓库装）：接管 `system.relay.context.compact`，把长会话压成'
           '「摘要（背景 / 轨迹 / 改动产出文件）+ 必读文件（≤11 个，精确行范围，'
           '以 read 工具调用的形式拼进上下文）+ todo 快照」，最近一轮原文原样保留。'
           '总结调用走前缀缓存三条件（tools 透传 / 不用 system / response_format=text）；'
@@ -273,7 +273,7 @@ class BuiltinPluginCatalog {
       id: kSshExecutorPluginId,
       name: 'SSH 执行器中转站',
       description:
-          'SSH 工作空间的**执行中转站**（随包二进制，不是脚本）：核心经它维护一条常驻 '
+          'SSH 工作空间的**执行中转站**（Dart 二进制，不随主包、成品从发布仓库装）：核心经它维护一条常驻 '
           'SSH 通道，把文件读写、命令执行、交互终端转发给目标机上的 `tree_agent`；'
           '目标机上首次使用会自动推送 agent（约 6 MB，按架构选 amd64/arm64）。'
           '隧道断开按退避重连（累计 30 分钟上限）；耗尽后核心**自动回退**内置 dartssh2 '
@@ -296,7 +296,7 @@ class BuiltinPluginCatalog {
       id: kSelfUpdaterPluginId,
       name: '框架自迭代插件',
       description:
-          '把「热重启一个插件（含重启它自己所在的插件）」做成一个 agent tool（随包二进制）：'
+          '把「热重启一个插件（含重启它自己所在的插件）」做成一个 agent tool（Dart 二进制，不随主包、成品从发布仓库装）：'
           '模型或右栏可以列出插件、看运行阶段、请求转储、热重启（默认尽量续跑）。'
           '重启期间核心照常响应这个插件的站点请求（有界暂存后重放），会话不因此失败；'
           '全部失败都以可读原因收尾，不会把一个插件拖成整个框架。'
@@ -365,9 +365,10 @@ class BuiltinPluginCatalog {
         return _cache[spec.id] = BuiltinResolution.failed(
           '找不到内置插件可执行文件 ${binaryFileName(spec, isWindows: _isWindows)}'
           '（依次查找：${roots.join('；')}）。'
-          '发行包应当把 ${spec.script} 放在可执行文件同级的 plugins/ 目录'
-          '（tool/package_windows.dart 已包含这一步）；开发态请先跑 tool/ 下'
-          '对应的 build_*.dart 产出到仓根 build/plugins/。',
+          // 2026-10-18 成品不随安装包（S4）之后，“发行包应当带上它（打包脚本已包含
+          // 这一步）”这句是**假话**：新装机解析不到是常态，要指的路是发布仓库。
+          '成品不随安装包：去「插件」页的「从发布仓库更新」装它，装完回来打开开关；'
+          '开发态请先跑 tool/ 下对应的 build_*.dart 产出到仓根 build/plugins/。',
           searchedScriptRoots: roots,
         );
       }
@@ -382,8 +383,7 @@ class BuiltinPluginCatalog {
     if (script == null) {
       return _cache[spec.id] = BuiltinResolution.failed(
         '找不到内置插件脚本 ${spec.script}（依次查找：${roots.join('；')}）。'
-        '发行包应当在可执行文件同级的 plugins/ 目录里带上它'
-        '（打包脚本 tool/package_windows.dart 已包含这一步）；'
+        '成品不随安装包：去「插件」页的「从发布仓库更新」装它，装完回来打开开关；'
         '开发态请先跑 tool/build_plugins.dart 产出到仓根 build/plugins/。',
         searchedScriptRoots: roots,
       );

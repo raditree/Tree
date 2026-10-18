@@ -93,6 +93,24 @@
     新增注入/关闭、管理按钮请求形状（含内置分流）、卸载确认与失败就地显示、站点开关
     6 条；原“点进详情”用例因面板不再被全屏路由遮住，重复文案的断言按详情页范围收窄。
 
+- **文案批（D，用户 2026-10-18 定稿）：四句在“成品不随主包”后说了假话 / 说错了对象的话**
+  （均无断言面变化，`dart analyze` / `flutter analyze` / 两包全量测试按基线全绿）：
+  - **核心解析失败话术**（[packages/tree_core/lib/src/plugin/builtin_plugins.dart](packages/tree_core/lib/src/plugin/builtin_plugins.dart)
+    `resolve()` 两条 failed 原因）：原句“发行包应当把 … 放在 plugins/（tool/package_windows.dart
+    已包含这一步）”在 S4 之后是**假话**（打包已不带插件成品）——改为指真路：
+    “成品不随安装包：去「插件」页的「从发布仓库更新」装它，装完回来打开开关”，
+    开发态的 build_*.dart 提示保留；查找路径（诊断信息）原样在前。
+  - **内置 spec 描述里的“随包二进制”**（同文件 `specs` 四条 description + 两条无日期注释）：
+    统一改成「Dart 二进制，不随主包、成品从发布仓库装」——描述是给 agent 与用户看的，
+    “随包”在新分发方式下不指任何东西（带日期的历史注释不动）。
+  - **release 空提示改说给装机用户**（[lib/ui/widgets/plugin_panel.dart](lib/ui/widgets/plugin_panel.dart)
+    「从发布仓库更新」的空态）：原句“发布时要把 plugin-index.json 与各插件文件一起传到
+    release”是**对发布者说的话**，摆在装机用户界面上读起来像让人自己去传——改为
+    “要等发布方把 … 传到 release；传完点「刷新」就能看见”。
+  - **S5 指引补“先点刷新”**（[tool/package_windows.dart](tool/package_windows.dart)
+    `使用说明.txt` 的「内置插件」段）：装的路径原话“点刷新 … 再装它”补成“**先**点刷新
+    （拉 tree-plugins 仓库的 release 成品）再装它”，步骤顺序说得不含糊。
+
 ## [1.0.4+1] — 2026-10-18
 
 ### 断言变化（新增 / 修改的 README 不变量）

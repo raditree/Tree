@@ -1805,7 +1805,10 @@ class _PluginPanelState extends State<PluginPanel> {
         if (_releaseEntries.isEmpty && _releaseError.isEmpty)
           _emptyHint(
             cs,
-            '索引里没有可装的条目（发布时要把 plugin-index.json 与各插件文件一起传到 release）',
+            // 面向**装机用户**说话：上传 release 是发布方的动作，别把读者当发布者
+            // 教（原句“发布时要把 … 一起传到 release”在界面上读起来像让人自己去传）。
+            '索引里还没有可装的条目（要等发布方把 plugin-index.json 与各插件文件一起'
+            '传到 release；传完点「刷新」就能看见）',
           )
         else if (visible.isEmpty && _searchQuery.trim().isNotEmpty)
           _emptyHint(
