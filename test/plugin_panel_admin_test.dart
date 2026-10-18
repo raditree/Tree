@@ -207,6 +207,13 @@ class _FakeAdmin implements PluginAdminClient {
   }
 
   @override
+  Future<Map<String, dynamic>> restoreBuiltin(String id) async {
+    calls.add('restore:$id');
+    if (failWrite.isNotEmpty) throw Exception(failWrite);
+    return writeResponse;
+  }
+
+  @override
   Future<Map<String, dynamic>> restartConfig(
     String id, {
     String mode = 'cold',
@@ -396,9 +403,9 @@ void main() {
       reason: '内置项未启用',
     );
     expect(tester.widget<Switch>(customSwitch).value, isTrue);
-    // 内置项不给删除，只给停用（开关）+ 编辑
-    expect(find.byKey(const Key('plugin-delete-sample')), findsNothing);
-    expect(find.textContaining('内置插件不可删除'), findsOneWidget);
+    // 内置项的「删除」= 停用 + 记入 hidden_builtins 隐藏（E，可恢复），提示写清代价
+    expect(find.byKey(const Key('plugin-delete-sample')), findsOneWidget);
+    expect(find.textContaining('删除 = 停用并隐藏'), findsOneWidget);
     // 自定义项有 编辑 / 删除 / 重启
     expect(find.byKey(const Key('plugin-edit-demo')), findsOneWidget);
     expect(find.byKey(const Key('plugin-delete-demo')), findsOneWidget);
@@ -746,6 +753,48 @@ void main() {
     await tester.tap(find.byKey(const Key('plugin-delete-confirm')));
     await tester.pumpAndSettle();
     expect(admin.calls, contains('delete:demo'));
+  });
+
+  testWidgets('内置项的删除 = 停用 + 隐藏：确认框写清 hidden_builtins 与恢复路径', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin();
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
+
+    await tester.tap(find.byKey(const Key('plugin-delete-sample')));
+    await tester.pumpAndSettle();
+    expect(find.text('从面板隐藏这个内置插件？'), findsOneWidget);
+    expect(
+      find.textContaining('hidden_builtins'),
+      findsWidgets,
+      reason: '确认框必须把"藏到哪、怎么找回来"说清楚，否则用户以为真删了',
+    );
+    expect(
+      admin.calls.where((String c) => !c.startsWith('release:')),
+      isEmpty,
+      reason: '确认之前不发写请求',
+    );
+
+    await tester.tap(find.byKey(const Key('plugin-hide-confirm')));
+    await tester.pumpAndSettle();
+    expect(admin.calls, contains('delete:sample'));
+  });
+
+  testWidgets('hidden_builtins 里的项不进主列表，另列「已隐藏」段作找回入口', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin()
+      ..builtinsResponse = <String, dynamic>{
+        ..._FakeAdmin._defaultBuiltins(),
+        'hidden_builtins': <dynamic>['sample'],
+      };
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
+
+    // 主列表不列被隐藏的（面板只列未隐藏项）
+    expect(find.byKey(const Key('plugin-detail-builtin-sample')), findsNothing);
+    expect(find.text('内置插件（0）'), findsOneWidget);
+    // 「已隐藏」段承接找回入口：行可点开详情（恢复按钮在详情页）
+    expect(find.textContaining('已隐藏（1）'), findsOneWidget);
+    expect(find.byKey(const Key('plugin-detail-hidden-sample')), findsOneWidget);
+    expect(find.text('示例插件'), findsOneWidget);
   });
 
   testWidgets('旧核心（清单接口不可用）：退回只读实例列表并说明原因', (WidgetTester tester) async {

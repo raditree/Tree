@@ -187,7 +187,7 @@ void main() {
       expect(
         entry['builtin'],
         true,
-        reason: '$id：仍标 builtin，UI 才能继续把它放在「内置」分组里（只给停用不给删除）',
+        reason: '$id：仍标 builtin，UI 才能继续把它放在「内置」分组里（删除 = 停用 + 隐藏，可恢复）',
       );
     }
     final Map<String, dynamic> compact = store.readEntry(kCompactPluginId)!;

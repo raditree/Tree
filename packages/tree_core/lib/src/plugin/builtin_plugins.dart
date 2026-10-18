@@ -427,7 +427,8 @@ class BuiltinPluginCatalog {
     // 可挂起声明只在**非空**时写：留空也写就是给配置文件多一个无意义的键，
     // 而「用户看到的键」应当只包含真正影响行为的声明（与不变量 10「保留未知键」同一纪律）。
     if (spec.suspension.isNotEmpty) 'suspension': spec.suspension,
-    // 标记：UI 据此把这一条分到「内置」组（内置插件不给删除，只给停用）
+    // 标记：UI 据此把这一条分到「内置」组（内置项 DELETE 不整条删：停用 + 记入
+    // hidden_builtins 隐藏，条目保留，详情页「恢复显示」拿得回来）
     'builtin': true,
   };
 
@@ -610,6 +611,9 @@ class BuiltinPluginCatalog {
 /// 语义（用户 2026-10-10 拍板：「默认开（升级即生效）」）刻意收得很紧：
 /// - **只处理"`plugins.yaml` 里根本没有这一条"**的情况。用户显式关过（条目在、
 ///   `enabled: false`）就**绝不再自动打开** —— 否则就是"帮用户改回他自己关掉的东西"；
+/// - **hidden_builtins 里的不播种**（E）：隐藏是用户明确"别让它出现在面板上"，
+///   播种会把这一项凭顶回来（尤其隐藏一个**从未落过条目**的默认开启项时，
+///   不拦就正好落回它藏起来之前那一格）；
 /// - 解析不出来（缺二进制 / 缺 Python）⇒ **只记日志、不落盘**：装不上就不该在清单里
 ///   留一条永远起不来的条目（那只会让面板多一个"打开失败"）；
 /// - **幂等**：重复调用没有副作用（已存在就跳过）。
@@ -621,8 +625,10 @@ Future<List<String>> seedDefaultEnabledBuiltins({
   void Function(String message)? log,
 }) async {
   final List<String> seeded = <String>[];
+  final Set<String> hidden = store.readHiddenBuiltins().toSet();
   for (final BuiltinPluginSpec spec in BuiltinPluginCatalog.specs) {
     if (!spec.defaultEnabled) continue;
+    if (hidden.contains(spec.id)) continue; // E：被隐藏的不播种
     if (store.readEntry(spec.id) != null) continue; // 已落盘（开或关）⇒ 尊重现状
     final BuiltinResolution resolution = await catalog.resolve(spec);
     if (!resolution.ok) {

@@ -111,6 +111,28 @@
     `使用说明.txt` 的「内置插件」段）：装的路径原话“点刷新 … 再装它”补成“**先**点刷新
     （拉 tree-plugins 仓库的 release 成品）再装它”，步骤顺序说得不含糊。
 
+- **内置项可见性交给盘：DELETE 对内置项改为「停用 + 隐藏」，`hidden_builtins` 里的 id 不播种**
+  （**新增**
+  [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md)
+  不变量 33「内置项的可见性交给盘」；用户 2026-10-18 定稿 E）：
+  - **`DELETE /api/plugin/configs/{id}` 对内置项不再 400**：停用（条目保留置
+    `enabled: false`）⇒ id 记进 `plugins.yaml` **顶层 `hidden_builtins`** ⇒ 200 回
+    `hidden: true`；成品文件一个不碰，**没落过条目的内置 id 也 200**（只隐藏、不凭空造
+    条目），未知 id 照旧 404，自定义条目整条删除不变。
+  - **`GET /api/plugin/builtins` 顶层递 `hidden_builtins`，面板只列未隐藏项**：隐藏项仍带
+    完整数据留在 `builtins` 里（名字 / 说明 / 解析），面板主列表过滤它们，另设「已隐藏（N）」
+    段承接找回入口；内置卡片的「删除」按钮是这次的触发点（确认框写明藏到哪、怎么回来）。
+  - **详情页给「恢复显示」**（`POST /api/plugin/builtins/{pluginId}/restore`，`ApiPaths.
+    pluginBuiltinRestore` 入 `kept`）：只摘 id，**条目与开关一个字不动**（恢复显示 ≠ 重新
+    打开）；隐藏态的管理区只渲染这一颗按钮，恢复成功面板重拉后自动换回正常按钮。
+  - **不播种**：[seedDefaultEnabledBuiltins] 命中 hidden 名单的一律跳过（面板都不列它了，
+    落一条只会“越藏越深”），摘掉名单后照常播。
+  - 用例：`plugin_config_api_test.dart`（原「删除被拒 400」用例改写为三端点 + 无条目内置
+    项 + 404 共 6 段）、`plugin_config_store_test.dart`（名单往返）、
+    `plugin_tool_define_self_updater_test.dart`（不播种 ⑤）、
+    `test/plugin_panel_admin_test.dart`（删除确认框 / 「已隐藏」段）、
+    `test/plugin_detail_page_test.dart`（隐藏态只留恢复按钮）。
+
 ## [1.0.4+1] — 2026-10-18
 
 ### 断言变化（新增 / 修改的 README 不变量）

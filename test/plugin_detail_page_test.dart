@@ -93,6 +93,12 @@ class _FakeAdmin implements PluginAdminClient {
       <String, dynamic>{'ok': true};
 
   @override
+  Future<Map<String, dynamic>> restoreBuiltin(String id) async {
+    calls.add('restore:$id');
+    return <String, dynamic>{'ok': true};
+  }
+
+  @override
   Future<Map<String, dynamic>> restartConfig(
     String id, {
     String mode = 'cold',
@@ -1124,6 +1130,74 @@ void main() {
       isEmpty,
       reason: '内置项的开关与自定义项各走各的端点，不能混',
     );
+  });
+
+  testWidgets('已隐藏的内置项：管理区只留「恢复显示」，点了发 restore 端点', (
+    WidgetTester tester,
+  ) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    )..builtinsResponse = <String, dynamic>{
+      'builtins': <dynamic>[
+        <String, dynamic>{
+          'id': 'sample',
+          'name': '示例插件',
+          'description': '核心自带的示例插件（Python）',
+          'enabled': false,
+          'configured': true,
+          'config': <String, dynamic>{
+            'id': 'sample',
+            'name': '示例插件',
+            'command': 'python',
+            'args': <String>['sample.py'],
+            'enabled': false,
+            'granularity': 'team',
+            'scope': <String, dynamic>{},
+            'builtin': true,
+          },
+          'resolution': <String, dynamic>{'ok': false, 'error': '本机没装 Python'},
+        },
+      ],
+      'hidden_builtins': <dynamic>['sample'],
+    };
+    await _pump(tester, svc: await _service(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
+
+    // 主列表不列它，只有「已隐藏」段的行能点进详情（找回入口）
+    expect(find.byKey(const Key('plugin-detail-builtin-sample')), findsNothing);
+    await tester.tap(find.byKey(const Key('plugin-detail-hidden-sample')));
+    await tester.pumpAndSettle();
+
+    final Finder detail = find.byType(PluginDetailPage);
+    expect(
+      find.descendant(
+        of: detail,
+        matching: find.byKey(const Key('plugin-detail-hidden-note-sample')),
+      ),
+      findsOneWidget,
+      reason: '讲清"藏到哪了、条目还在"——隐藏不等于删掉',
+    );
+    expect(
+      find.descendant(
+        of: detail,
+        matching: find.byKey(const Key('plugin-detail-restore-sample')),
+      ),
+      findsOneWidget,
+    );
+    // 隐藏期间不给别的管理按钮（面板都看不见它了，还能点到「启用」就自相矛盾）
+    expect(
+      find.descendant(
+        of: detail,
+        matching: find.byKey(const Key('plugin-detail-toggle-sample')),
+      ),
+      findsNothing,
+    );
+
+    await tester.tap(
+      find.byKey(const Key('plugin-detail-restore-sample')),
+    );
+    await tester.pumpAndSettle();
+    expect(admin.calls, contains('restore:sample'));
   });
 
   testWidgets('卸载：先确认（不点确认不发请求），成功后关掉详情页', (

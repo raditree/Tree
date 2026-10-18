@@ -1655,6 +1655,7 @@ class CoreServer {
     router.add('GET', ApiPaths.pluginBuiltins, _listBuiltinPlugins);
     router.add('POST', ApiPaths.pluginBuiltinEnable, _enableBuiltinPlugin);
     router.add('POST', ApiPaths.pluginBuiltinDisable, _disableBuiltinPlugin);
+    router.add('POST', ApiPaths.pluginBuiltinRestore, _restoreBuiltinPlugin);
     // 发布仓库（阶段 5）：只读 GitHub Release 资产，不 clone 源码；四个路由的分工
     // 与理由见 ApiPaths.pluginRelease / pluginReleaseRefresh / pluginReleaseInstall /
     // pluginReleaseUninstall。
@@ -3918,7 +3919,8 @@ class CoreServer {
     await writeJson(request, 200, _pluginWriteBody(store, result, outcome));
   }
 
-  /// DELETE /api/plugin/configs/{pluginId}：删除一个自定义插件。
+  /// DELETE /api/plugin/configs/{pluginId}：
+  /// 删一个自定义插件；**内置项 = 停用 + 隐藏**（E，不再 400）。
   Future<void> _deletePluginConfig(
     HttpRequest request,
     Map<String, String> params,
@@ -3931,17 +3933,43 @@ class CoreServer {
     final String id = (params['pluginId'] ?? '').trim();
     final PluginConfigStore store = _pluginStore(bus);
     final Map<String, dynamic>? before = store.readEntry(id);
-    if (before == null) {
-      await writeJson(request, 404, errorBody('插件不存在：$id'));
+    // 内置判定两路（与发布仓库卸载同一口径）：条目标记 与 静态清单——老条目可能
+    // 没带 builtin 标记，而清单里的 id 即使还没落过条目也归内置（它压根不该被整条删掉）。
+    final bool builtin =
+        BuiltinPluginCatalog.specOf(id) != null ||
+        (before != null && before['builtin'] == true);
+    if (builtin) {
+      // E（2026-10-18）：不再回 400，改成「停用 + 隐藏」——条目保留（多半刚置
+      // enabled:false）、成品文件一个不碰，id 记进顶层 hidden_builtins；面板据此
+      // 只列未隐藏项，详情页「恢复显示」把它摘回来。隐藏只管“看得见看不见”，
+      // 与“装没装 / 能不能跑”无关，所以这里不做任何文件操作。
+      final PluginStoreResult written = before == null
+          ? PluginStoreResult.success(null, store.readEntries())
+          : store.setEnabled(id, false);
+      if (!written.ok) {
+        await writeJson(request, 400, errorBody(written.error));
+        return;
+      }
+      final PluginStoreResult hidden = store.setBuiltinHidden(id, true);
+      if (!hidden.ok) {
+        await writeJson(request, 400, errorBody(hidden.error));
+        return;
+      }
+      final PluginHotApplyOutcome outcome = written.entry == null
+          ? const PluginHotApplyOutcome.applied(
+              '本就没有落盘条目（只把这一项从面板隐藏了）',
+            )
+          : await _applyPluginChange(bus, written.entry!, enable: false);
+      errorLog?.call('[core:plugin] 内置插件 $id 已停用并隐藏（hidden_builtins）');
+      await writeJson(request, 200, <String, dynamic>{
+        ..._pluginWriteBody(store, written, outcome),
+        'hidden': true,
+        'hidden_builtins': store.readHiddenBuiltins(),
+      });
       return;
     }
-    // 内置条目不给删除（M9 §4.2：内置项只给"停用"，条目保留才能再次打开）
-    if (before['builtin'] == true) {
-      await writeJson(
-        request,
-        400,
-        errorBody('内置插件 $id 不提供删除：请用停用（条目保留，可再次打开）'),
-      );
+    if (before == null) {
+      await writeJson(request, 404, errorBody('插件不存在：$id'));
       return;
     }
     final PluginStoreResult result = store.remove(id);
@@ -4063,6 +4091,10 @@ class CoreServer {
   /// 内置项**永远在响应里**（未启用也可见，面板才有"带说明的开关"可点）；
   /// config 为落盘的那一条（从未启用过 = null），resolution 是核心此刻解析出来的
   /// 运行时与脚本路径（含可读错误，前端直接显示）。
+  ///
+  /// E：顶层另递 `hidden_builtins`（plugins.yaml 里隐藏名单的 id）。**隐藏项仍带
+  /// 完整数据在 `builtins` 里**——面板据此把它滤出主列表（只列未隐藏项），但
+  /// 「已隐藏」段与详情页「恢复显示」还要用它的名字与说明（滤掉数据就找不回来了）。
   Future<void> _listBuiltinPlugins(
     HttpRequest request,
     Map<String, String> _,
@@ -4095,6 +4127,7 @@ class CoreServer {
       'enabled': store.totalEnabled(),
       'runtime_checked': refresh,
       'builtins': builtins,
+      'hidden_builtins': store.readHiddenBuiltins(),
     });
   }
 
@@ -4201,6 +4234,46 @@ class CoreServer {
       enable: false,
     );
     await writeJson(request, 200, _pluginWriteBody(store, result, outcome));
+  }
+
+  /// POST /api/plugin/builtins/{pluginId}/restore：从「已隐藏」里放回面板（E）。
+  ///
+  /// 只恢复可见性：id 从顶层 `hidden_builtins` 摘掉，**条目与开关一个字不动**
+  /// （隐藏时已停用，所以回到面板时是「已停用」——要跑起来请再拨开关）。
+  /// 从未落过条目的隐藏项同样适用：恢复后它按清单常驻显示、仍未启用。
+  Future<void> _restoreBuiltinPlugin(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    final String id = (params['pluginId'] ?? '').trim();
+    if (BuiltinPluginCatalog.specOf(id) == null) {
+      await writeJson(
+        request,
+        404,
+        errorBody('未知的内置插件：$id（清单见 GET /api/plugin/builtins）'),
+      );
+      return;
+    }
+    final PluginConfigStore store = _pluginStore(bus);
+    final PluginStoreResult result = store.setBuiltinHidden(id, false);
+    if (!result.ok) {
+      await writeJson(request, 400, errorBody(result.error));
+      return;
+    }
+    errorLog?.call('[core:plugin] 内置插件 $id 已从 hidden_builtins 恢复显示');
+    await writeJson(request, 200, <String, dynamic>{
+      ..._pluginWriteBody(
+        store,
+        PluginStoreResult.success(store.readEntry(id), store.readEntries()),
+        const PluginHotApplyOutcome.applied('没有改开关（只是恢复显示）'),
+      ),
+      'hidden_builtins': store.readHiddenBuiltins(),
+    });
   }
 
   // ── 发布仓库（阶段 5：插件管理只拉 GitHub Release 资产）─────────────────

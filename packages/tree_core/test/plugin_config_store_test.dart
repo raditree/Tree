@@ -104,6 +104,34 @@ plugins:
     expect(doc['enabled'], isTrue);
   });
 
+  test('hidden_builtins（E）：名单往返、幂等，空了删顶层键，别的键不被吃掉', () {
+    write('enabled: true\nversion: 7\nfuture_key: 未来字段\nplugins: []\n');
+    expect(store.readHiddenBuiltins(), isEmpty, reason: '缺省 = 谁都没藏');
+
+    expect(store.setBuiltinHidden('sample', true).ok, isTrue);
+    expect(store.setBuiltinHidden('compact', true).ok, isTrue);
+    expect(
+      store.setBuiltinHidden('sample', true).ok,
+      isTrue,
+      reason: '重复藏同一个不报错（面板可能连点两次）',
+    );
+    expect(store.readHiddenBuiltins(), <String>['sample', 'compact']);
+
+    // 写名单顺手不能碰别的顶层键（否则"隐藏一个插件"会把用户文件改得面目全非）
+    Map<String, dynamic> doc = readDocument();
+    expect(doc['version'], 7);
+    expect(doc['future_key'], '未来字段');
+    expect(doc['enabled'], isTrue);
+
+    expect(store.setBuiltinHidden('sample', false).ok, isTrue);
+    expect(store.readHiddenBuiltins(), <String>['compact']);
+
+    // 摘干净 ⇒ 顶层键整个消失（留个空列表在文件里只会让人以为还有东西藏着）
+    expect(store.setBuiltinHidden('compact', false).ok, isTrue);
+    expect(readDocument().containsKey('hidden_builtins'), isFalse);
+    expect(store.readHiddenBuiltins(), isEmpty);
+  });
+
   test('id 唯一：重复 create 被拒且不改写文件', () {
     write('enabled: true\nplugins:\n  - id: demo\n    command: python\n');
     final PluginStoreResult dup = store.create(<String, dynamic>{

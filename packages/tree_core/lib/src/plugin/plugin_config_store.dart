@@ -113,6 +113,46 @@ class PluginConfigStore {
     return null;
   }
 
+  /// E（2026-10-18）：「已隐藏的内置插件」落盘键（顶层 id 列表）。
+  ///
+  /// 为什么是**顶层键**而不是条目上的一个布尔：隐藏要对**从未落过条目**的内置项
+  /// 也成立（清单常驻、面板照常列它），而那种项在 `plugins` 里根本没有条目；
+  /// 顶层列表让「面板列不列它」与「条目在不在」彻底解耦——恢复显示只动这一个键，
+  /// 条目、成品文件、开关状态一个字不碰。
+  static const String hiddenBuiltinsKey = 'hidden_builtins';
+
+  /// 已隐藏的内置插件 id（文件缺失 / 手改坏 / 空列表 = 空集）。
+  List<String> readHiddenBuiltins() {
+    final Object? raw = readDocument()[hiddenBuiltinsKey];
+    if (raw is! List) return const <String>[];
+    return <String>[for (final Object? id in raw) id.toString()];
+  }
+
+  /// 记入 / 摘出「已隐藏」（只动顶层这一个键；条目、未知键与其它顶层键原样保留）。
+  ///
+  /// 摘出后列表为空时**把键整个删掉**：空列表不给用户的手写文件留一行噪声
+  /// （与 description / suspension 「空串不写这一键」同一纪律）。
+  PluginStoreResult setBuiltinHidden(String id, bool hidden) {
+    final String wanted = id.trim();
+    final Map<String, dynamic> doc = readDocument();
+    final List<String> ids = <String>[];
+    final Object? raw = doc[hiddenBuiltinsKey];
+    if (raw is List) {
+      ids.addAll(<String>[for (final Object? v in raw) v.toString()]);
+    }
+    if (hidden) {
+      if (!ids.contains(wanted)) ids.add(wanted);
+    } else {
+      ids.remove(wanted);
+    }
+    if (ids.isEmpty) {
+      doc.remove(hiddenBuiltinsKey);
+    } else {
+      doc[hiddenBuiltinsKey] = ids;
+    }
+    return _commit(doc, _rawEntries(doc), null);
+  }
+
   // ── 写（全部返回可读结果，不抛异常） ──────────────────────────────────
 
   /// 新增一条（id 必须唯一）。
@@ -414,6 +454,8 @@ class PluginConfigStore {
       'plugins: 每个插件一项；enabled=false 表示停用但**条目保留**。\n'
       'builtin: true 的条目由核心的内置插件清单生成（在界面上开关内置插件时写入），\n'
       '        可以改，但下次在界面上开关该内置插件时会被重新解析覆盖。\n'
+      'hidden_builtins: 从面板隐藏起来的内置插件 id（删除内置项时写入：停用 + 隐藏，\n'
+      '        条目与成品都还在；详情页「恢复显示」会把它从这里摘掉）。\n'
       '本文件可手工编辑；界面上的改动保存后会立即热应用，热应用失败时重启核心生效。';
 }
 

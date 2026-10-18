@@ -49,6 +49,12 @@ abstract class PluginAdminClient {
     required bool enabled,
   });
 
+  /// 把一个内置插件从「已隐藏」里放回面板（E）：POST …/builtins/{id}/restore。
+  ///
+  /// 只恢复可见性（id 从 plugins.yaml 顶层 `hidden_builtins` 摘掉），条目保持原样；
+  /// 隐藏的入口是 [deleteConfig]（对内置项核心不再 400，而是「停用 + 隐藏」）。
+  Future<Map<String, dynamic>> restoreBuiltin(String id);
+
   /// 发布仓库清单（**只读本地缓存**，不联网）：GET /api/plugin/release。
   ///
   /// 面板打开先用它立刻列出“上次看到的那些”（断网时也有的可看，并标清是缓存）；
@@ -148,6 +154,10 @@ class ApiPluginAdminClient implements PluginAdminClient {
     String id, {
     required bool enabled,
   }) => ApiService.setBuiltinPluginEnabled(id, enabled: enabled);
+
+  @override
+  Future<Map<String, dynamic>> restoreBuiltin(String id) =>
+      ApiService.restoreBuiltinPlugin(id);
 
   @override
   Future<Map<String, dynamic>> fetchRelease() => ApiService.getPluginRelease();
@@ -268,6 +278,11 @@ class _PluginPanelState extends State<PluginPanel> {
   /// 内置插件目录（静态清单 + 启用态 + 运行时解析结果）。
   List<Map<String, dynamic>> _builtins = <Map<String, dynamic>>[];
 
+  /// 已隐藏的内置插件 id（E：核心 plugins.yaml 顶层 `hidden_builtins`，随
+  /// GET builtins 一起递来）。主列表据此把它们滤掉（面板只列未隐藏项），
+  /// 另开「已隐藏」段承载找回入口——藏起来不等于找不回来。
+  Set<String> _hiddenBuiltinIds = <String>{};
+
   /// plugins.yaml 的真实路径（核心给；清单接口不可用时退回快照里的路径）。
   String _adminPath = '';
 
@@ -368,6 +383,10 @@ class _PluginPanelState extends State<PluginPanel> {
             ? Map<String, dynamic>.from(runtime)
             : <String, dynamic>{};
         _builtins = _mapList(builtins['builtins']);
+        final Object? hiddenIds = builtins['hidden_builtins'];
+        _hiddenBuiltinIds = hiddenIds is List
+            ? <String>{for (final Object? v in hiddenIds) v.toString()}
+            : <String>{};
         _adminPath = (configs['path'] ?? builtins['path'] ?? '').toString();
         _adminError = null;
       });
@@ -562,6 +581,18 @@ class _PluginPanelState extends State<PluginPanel> {
           c,
     ];
   }
+
+  /// 内置组**主列表**列出来的那些（E：hidden 里的不列——「面板只列未隐藏项」）。
+  List<Map<String, dynamic>> get _visibleBuiltins => <Map<String, dynamic>>[
+    for (final Map<String, dynamic> b in _builtins)
+      if (!_hiddenBuiltinIds.contains((b['id'] ?? '').toString())) b,
+  ];
+
+  /// 被隐藏的那些（E：单独一段列出，点开详情页「恢复显示」）。
+  List<Map<String, dynamic>> get _hiddenBuiltinItems => <Map<String, dynamic>>[
+    for (final Map<String, dynamic> b in _builtins)
+      if (_hiddenBuiltinIds.contains((b['id'] ?? '').toString())) b,
+  ];
 
   // ── 提交 ─────────────────────────────────────────────────────────────
 
@@ -776,6 +807,7 @@ class _PluginPanelState extends State<PluginPanel> {
         onInstalled: _reloadAfterRepoInstall,
         onChanged: _reloadAfterRepoInstall,
         onEdit: () => _openEditor(entry: entry, spec: cur, isBuiltin: true),
+        isHidden: _hiddenBuiltinIds.contains(id),
       );
     });
   }
@@ -943,6 +975,42 @@ class _PluginPanelState extends State<PluginPanel> {
     );
     if (confirmed != true || !mounted) return;
     await _submit(id, () => _admin.deleteConfig(id), successText: '已删除插件 $id');
+  }
+
+  /// 内置项的「删除」（E）：核心侧 DELETE 对内置项**不整条删**，改为停用 +
+  /// 记入 plugins.yaml 顶层 `hidden_builtins`——条目与成品都还在，详情页
+  /// 「恢复显示」把 id 摘掉就回来了。所以确认框必须把这条退路说清楚。
+  Future<void> _hideBuiltin(Map<String, dynamic> item) async {
+    final String id = (item['id'] ?? '').toString();
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext ctx) => AlertDialog(
+        title: const Text('从面板隐藏这个内置插件？'),
+        content: Text(
+          '内置插件不会真的删掉：条目会停用并记入 plugins.yaml 的 '
+          'hidden_builtins，成品也保留。之后可在「已隐藏」里点开详情，'
+          '用「恢复显示」把它放回面板。',
+          style: const TextStyle(fontSize: 12),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            key: const Key('plugin-hide-confirm'),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('隐藏'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    await _submit(
+      id,
+      () => _admin.deleteConfig(id),
+      successText: '已停用并隐藏 $id（可在「已隐藏」里恢复）',
+    );
   }
 
   /// 添加 / 编辑弹窗（内置插件也能编辑；id 不可改）。
@@ -1245,9 +1313,9 @@ class _PluginPanelState extends State<PluginPanel> {
     return id.contains(query) || name.contains(query);
   }
 
-  /// 「插件实例」的条目数：清单可用 = 内置项 + 自定义项；否则退回快照实例数。
+  /// 「插件实例」的条目数：清单可用 = 内置项（未隐藏的）+ 自定义项；否则退回快照实例数。
   int _instanceCount(PluginSnapshot snap) => _adminError == null
-      ? _builtins.length + _customConfigs.length
+      ? _visibleBuiltins.length + _customConfigs.length
       : snap.instances.length;
 
   /// 清单文件路径 + 生效方式（M9 §4.2 要求把"真实路径"与"怎么生效"写在界面上）。
@@ -1287,10 +1355,12 @@ class _PluginPanelState extends State<PluginPanel> {
       ];
     }
     final List<Map<String, dynamic>> custom = _customConfigs;
+    final List<Map<String, dynamic>> visible = _visibleBuiltins;
+    final List<Map<String, dynamic>> hidden = _hiddenBuiltinItems;
     return <Widget>[
       _groupHeader(
         cs,
-        '内置插件（${_builtins.length}）',
+        '内置插件（${visible.length}）',
         trailing: IconButton(
           key: const Key('plugin-builtins-refresh'),
           tooltip: '重新解析内置插件的成品（从发布仓库装完点这里）',
@@ -1300,16 +1370,33 @@ class _PluginPanelState extends State<PluginPanel> {
           icon: const Icon(Icons.refresh),
         ),
       ),
+      // E：主列表只列**未隐藏**的内置项；被隐藏的挪到下面「已隐藏」段，
+      // 免得"隐藏"成了找不回来的单行道（恢复按钮在详情页，入口在这儿）。
       if (_builtins.isEmpty)
         _emptyHint(cs, '核心没有提供内置插件目录（旧核心？）')
+      else if (visible.isEmpty)
+        _emptyHint(cs, '内置插件都在下面的「已隐藏」里（点开可恢复显示）。')
       else
-        ..._builtins.map(
+        ...visible.map(
           (Map<String, dynamic> b) => _tappable(
             key: Key('plugin-detail-builtin-${(b['id'] ?? '').toString()}'),
             onTap: () => _openBuiltinDetail(b),
             card: _builtinCard(cs, b),
           ),
         ),
+      if (hidden.isNotEmpty) ...<Widget>[
+        _groupHeader(cs, '已隐藏（${hidden.length}）'),
+        _emptyHint(cs, '条目与成品都还在 · 点开详情页「恢复显示」把它放回上面。'),
+        ...hidden.map(
+          (Map<String, dynamic> b) => _tappable(
+            key: Key(
+              'plugin-detail-hidden-${(b['id'] ?? '').toString()}',
+            ),
+            onTap: () => _openBuiltinDetail(b),
+            card: _hiddenBuiltinCard(cs, b),
+          ),
+        ),
+      ],
       _groupHeader(
         cs,
         '自定义插件（${custom.length}）',
@@ -1355,7 +1442,8 @@ class _PluginPanelState extends State<PluginPanel> {
     );
   }
 
-  /// 内置插件卡片：**每一项一个开关**；内置项不给删除（只给停用）。
+  /// 内置插件卡片：**每一项一个开关**；「删除」= 停用 + 记入 hidden_builtins
+  /// 隐藏（条目保留，详情页「恢复显示」拿得回来），见 [_hideBuiltin]。
   Widget _builtinCard(ColorScheme cs, Map<String, dynamic> item) {
     final String id = (item['id'] ?? '').toString();
     final String name = (item['name'] ?? '').toString();
@@ -1478,9 +1566,22 @@ class _PluginPanelState extends State<PluginPanel> {
                   onPressed: _busy.contains(id) ? null : () => _restart(id),
                   child: const Text('重启', style: TextStyle(fontSize: 12)),
                 ),
+              if (configured)
+                TextButton(
+                  key: Key('plugin-delete-$id'),
+                  onPressed: _busy.contains(id)
+                      ? null
+                      : () => _hideBuiltin(item),
+                  child: Text(
+                    '删除',
+                    style: TextStyle(fontSize: 12, color: cs.error),
+                  ),
+                ),
               Expanded(
                 child: Text(
-                  configured ? '内置插件不可删除；停用请用右侧开关' : '打开后可编辑（核心会解析运行时与脚本）',
+                  configured
+                      ? '停用用右侧开关；删除 = 停用并隐藏（可恢复）'
+                      : '打开后可编辑（核心会解析运行时与脚本）',
                   style: TextStyle(fontSize: 10, color: cs.outline),
                 ),
               ),
@@ -1489,6 +1590,39 @@ class _PluginPanelState extends State<PluginPanel> {
           // 热重启 / 强制停止（阶段 3）：只对已落盘的内置项开放。
           if (configured) Wrap(spacing: 4, children: _lifecycleActions(id)),
           _detailAffordance(cs, '看插件介绍与工具'),
+        ],
+      ),
+    );
+  }
+
+  /// 已隐藏内置项的紧凑行（E）：不摆开关和管理按钮——它在面板里本来就该
+  /// "不存在"；这行只是找回入口，点开详情页用「恢复显示」放回去。
+  Widget _hiddenBuiltinCard(ColorScheme cs, Map<String, dynamic> item) {
+    final String id = (item['id'] ?? '').toString();
+    final String name = (item['name'] ?? '').toString();
+    return Container(
+      margin: const EdgeInsets.only(bottom: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        border: Border.all(color: Theme.of(context).dividerColor),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: <Widget>[
+          Expanded(
+            child: Text(
+              name.isEmpty ? id : name,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: cs.onSurfaceVariant,
+              ),
+            ),
+          ),
+          _pill(cs, '已隐藏'),
+          const SizedBox(width: 6),
+          Icon(Icons.chevron_right, size: 16, color: cs.outline),
         ],
       ),
     );

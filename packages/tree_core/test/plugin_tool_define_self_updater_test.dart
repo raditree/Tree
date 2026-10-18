@@ -273,6 +273,20 @@ void main() {
     expect(store.setEnabled(kSelfUpdaterPluginId, false).ok, isTrue);
     await seedDefaultEnabledBuiltins(catalog: present, store: store);
     expect(store.readEntry(kSelfUpdaterPluginId)!['enabled'], isFalse);
+
+    // ⑤ 被隐藏的（E：hidden_builtins 里的）也不播种——面板都不列它了，
+    //    再落一条只会"越藏越深"；摘掉名单后照常播回来。
+    expect(store.remove(kSelfUpdaterPluginId).ok, isTrue);
+    expect(store.setBuiltinHidden(kSelfUpdaterPluginId, true).ok, isTrue);
+    expect(await seedDefaultEnabledBuiltins(catalog: present, store: store), isEmpty);
+    expect(store.readEntry(kSelfUpdaterPluginId), isNull);
+    expect(store.setBuiltinHidden(kSelfUpdaterPluginId, false).ok, isTrue);
+    expect(
+      await seedDefaultEnabledBuiltins(catalog: present, store: store),
+      contains(kSelfUpdaterPluginId),
+      reason: '恢复显示后不再被名单挡住（但 ④ 那种"用户关过"仍另算）',
+    );
+    expect(store.readEntry(kSelfUpdaterPluginId)!['enabled'], isTrue);
   });
 
   // ── 3/4：真子进程的两条申报路 ──────────────────────────────────────────
