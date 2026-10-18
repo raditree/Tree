@@ -152,30 +152,27 @@ Future<void> _package(List<String> args) async {
   // **可执行文件同级的** plugins/plugin-development.md（见 `lib/app_version.dart` 的
   // PluginDocs 与 `packages/tree_core/lib/src/plugin/plugin_guide.dart`）。
   // 2026-10-17：这一档原来还负责把 examples/plugins/ 的 Python 脚本整目录拷过去；五个
-  // 插件全部换成插件仓的 Dart 成品后那个目录已删，**成品由下面的 ②f 按
-  // build/plugins/plugin-index.json 拷**（本步只留指南这一份文档）。
+  // 插件全部换成插件仓的 Dart 成品后那个目录已删。
+  // **2026-10-18 的口径变化**（用户指令）：插件成品也不再进安装包——它们只由
+  // tree-plugins 的 release 提供，装机后在插件面板上“从仓库装”。所以这里只剩指南这一份
+  // 文档，而②d 只带目标机 agent（那不是插件成品，是插件要推到远端机器的执行体）。
   stdout.writeln(_copyPluginGuide(root, releaseDir));
-  // ②d SSH 执行器的两份二进制（2026-10-10）：
-  //   - 中转站插件 `plugins/tree_ssh_executor[.exe]`（跑在**用户本机**，与核心同级）；
-  //   - 目标机 agent `agents/tree_agent-linux-{amd64,arm64}`（由插件按目标机架构推送）。
-  // 缺了插件 ⇒ 核心回退内置 dartssh2（功能不变，只是没有中转站）；
-  // 缺了 agent ⇒ 插件在目标机推送那一步失败 ⇒ 同样回退。**不算打包失败**，但要打印出来。
+  // ②d 目标机 agent `agents/tree_agent-linux-{amd64,arm64}`（由 ssh_executor 插件按目标机
+  // 架构推过去）。它**不是插件成品**：插件本体改走“从仓库装”，而这两个文件是被连
+  // 出去之后在远端跑的东西，用户不会去面板上装它。
+  // 缺了 agent ⇒ 中转站插件在目标机推送那一步失败 ⇒ 核心回退内置 dartssh2（功能不变）。
+  // **不算打包失败**，但要打印出来。
   stdout.writeln(
-    _copySshExecutorArtifacts(root, releaseDir, _versionOf(pubspec['version'])),
+    _copyAgentArtifacts(root, releaseDir, _versionOf(pubspec['version'])),
   );
-  // ②e 框架自迭代插件的二进制（2026-10-15 阶段 3）：`plugins/tree_self_updater[.exe]`。
-  // 缺了它 = 装机后没有“热重启插件”这个 agent tool（面板上那一项会变“找不到可执行文件”），
-  // 而它是内置且默认开的 —— **少拷这一行 = 阶段 3 白做**（所以第 7 天的打包日志要能查到这行）。
-  stdout.writeln(
-    _copySelfUpdaterArtifacts(root, releaseDir, _versionOf(pubspec['version'])),
-  );
-  // ②f 插件仓（plugins/）的成品：读 `build/plugins/plugin-index.json` 把每条 `files[].target` 拷进发行目录。
+  // ②e 反向自检：**发行目录里不许出现插件成品**（2026-10-18）。
   //
-  // 为什么读索引而不是自己扫目录：那份索引是**装机端唯一读的合同**（`PluginDownloader`），
-  // 打包链按同一份合同拷，才能做到“发布仓库有的，安装包也有”；在这里自己扫一遍
-  // 就是第二份真相，两边一定会漂（而漂了的表现是“面板上能装、随包却没带”）。
-  // 索引由 `dart run tool/build_plugins.dart` 产出；缺了它不算打包失败，但要打一行。
-  stdout.writeln(_copyRepoPluginArtifacts(root, releaseDir));
+  // 为什么写成断言而不是“删掉那三步拷贝”就完事：随包成品与“从仓库装”的成品住在
+  // **同一个目录**、读的是同一份合同，一旦哪里又把它们拷进去，用户装的那一份就永远
+  // 更新不到新版（它会被当作“核心自带的那一份”保护起来，见
+  // `PluginDownloader.protectedFileNames`），而现象只是“更新按钮按了没反应”。
+  // 多拷必须当场红，而不是等用户在装机端发现。
+  stdout.writeln(_assertNoBundledPluginBinaries(releaseDir));
 
   // ③ 便携包说明（首次运行指引：数据在哪、怎么手改配置、出问题看哪）
   final File guide = File(_join(releaseDir.path, '使用说明.txt'));
@@ -328,41 +325,22 @@ String _copyPluginGuide(Directory root, Directory releaseDir) {
       '${(guide.lengthSync() / 1024).toStringAsFixed(1)} KB）';
 }
 
-/// 把 SSH 执行器的两份二进制复制进发行目录（2026-10-10）。
+/// 把**目标机 agent** 复制进发行目录的 `agents/`（2026-10-10 起随包，2026-10-18 收窄到这里）。
 ///
-/// - `build/plugins/tree_ssh_executor[.exe]` → `<release>/plugins/`
-///   （**必须**与核心可执行文件同级：`BuiltinPluginCatalog.scriptRoots()` 第一优先就是
-///   `<exeDir>/plugins`，漏了这一层，面板上"SSH 执行器中转站"会变成"找不到可执行文件"）；
-/// - `build/agents/tree_agent-linux-*` → `<release>/agents/`
-///   （中转站插件按目标机架构挑一个推过去；`agents/` 与 `plugins/` 同级是插件的查找约定）。
+/// `build/agents/tree_agent-linux-*` → `<release>/agents/`：中转站插件按目标机架构挑一个
+/// 推过去。这两个文件**不是插件成品**（插件成品现在只从 tree-plugins 的 release 装），
+/// 而是被连出去之后在**远端机器**上跑的执行体，用户不会在面板上装它们。
 ///
-/// 返回一行给用户看的总结。**产物缺失不算打包失败**：没有它，核心自动回退内置
-/// dartssh2 —— 功能不变，只是少了"中转站"这条路（见 docs/ssh-tunnel-protocol.md §0）。
-String _copySshExecutorArtifacts(
+/// 返回一行给用户看的总结。**产物缺失不算打包失败**：没有它，中转站插件在推送那一步
+/// 失败，核心自动回退内置 dartssh2 —— 功能不变，只是少了“中转站”这条路
+/// （见 docs/ssh-tunnel-protocol.md §0）。
+String _copyAgentArtifacts(
   Directory root,
   Directory releaseDir,
   String binaryVersion,
 ) {
-  final Directory pluginSource = Directory(_join(root.path, 'build/plugins'));
   final Directory agentsSource = Directory(_join(root.path, 'build/agents'));
   final List<String> copied = <String>[];
-
-  if (pluginSource.existsSync()) {
-    final Directory target = Directory(_join(releaseDir.path, 'plugins'))
-      ..createSync(recursive: true);
-    for (final FileSystemEntity entity in pluginSource.listSync()) {
-      if (entity is! File) continue;
-      final String name = _basename(entity.path);
-      if (!name.startsWith('tree_ssh_executor')) continue;
-      _verifyBinaryVersion(
-        entity,
-        binaryVersion,
-        'dart run tool/build_ssh_plugin.dart',
-      );
-      entity.copySync(_join(target.path, name));
-      copied.add('plugins/$name');
-    }
-  }
 
   if (agentsSource.existsSync()) {
     final Directory target = Directory(_join(releaseDir.path, 'agents'))
@@ -382,101 +360,55 @@ String _copySshExecutorArtifacts(
   }
 
   if (copied.isEmpty) {
-    return '   SSH 执行器：跳过（build/plugins 与 build/agents 里没有产物；'
-        '用 dart run tool/build_ssh_plugin.dart 与 dart run tool/build_agent.dart 产出）'
-        '—— 缺了它核心会自动回退内置 dartssh2，功能不变';
+    return '   目标机 agent：跳过（build/agents 里没有产物；'
+        '用 dart run tool/build_agent.dart 产出）'
+        '—— 缺了它中转站插件推不上目标机，核心回退内置 dartssh2，功能不变';
   }
-  return '   SSH 执行器：${copied.join('、')}';
+  return '   目标机 agent：${copied.join('、')}';
 }
 
-/// 把**框架自迭代插件**的二进制复制进发行目录（2026-10-15 阶段 3）。
+/// 反向自检：发行目录的 `plugins/` 里**只许有文档**（2026-10-18，用户指令）。
 ///
-/// `build/plugins/tree_self_updater[.exe]` → `<release>/plugins/`：与核心可执行文件
-/// **同级**是硬要求（`BuiltinPluginCatalog.scriptRoots()` 第一优先就是 `<exeDir>/plugins`）。
+/// 插件成品（`tree_sample.exe` / `tree_compact.exe` / `tree_ssh_executor.exe` /
+/// `tree_self_updater.exe` …）现在只有一个出路：tree-plugins 的 release，装机后由用户在
+/// 插件面板上“从仓库装”。安装包再带一份就是第二份真相，而它不是“多余”那么简单：
+/// 那个目录里它会被 `PluginDownloader.protectedFileNames()` 当成“核心自带的那一份”
+/// 保护起来 ⇒ 用户从仓库装的那版**永远更新不到新版**，而现象只是“更新按了没反应”。
 ///
-/// 与 SSH 执行器同一口径：**产物缺失不算打包失败**，但必须打印那一行——这个插件是
-/// `defaultEnabled: true` 的内置项，“没拷进去”在界面上只会变成一句“解析失败”，
-/// 而打包日志里那一行就是归因它的唯一线索。
-String _copySelfUpdaterArtifacts(
-  Directory root,
-  Directory releaseDir,
-  String binaryVersion,
-) {
-  final Directory pluginSource = Directory(_join(root.path, 'build/plugins'));
-  final List<String> copied = <String>[];
-  if (pluginSource.existsSync()) {
-    final Directory target = Directory(_join(releaseDir.path, 'plugins'))
-      ..createSync(recursive: true);
-    for (final FileSystemEntity entity in pluginSource.listSync()) {
-      if (entity is! File) continue;
+/// 顺手把 `.py` 也钉住：打包链 2026-10-17 起就不再产 Python 文件，而 `releaseDir`（默认
+/// `build/windows/x64/runner/Release`）**从不清空** —— flutter build 也不清。实测 2026-10-18：
+/// 那个目录里还留着上个时代的 4 个 `.py` 与一个 8.8 MB 的 `tree_ssh_executor.exe`，
+/// 而 Inno 的 `[Files]` 是整目录递归通配 ⇒ 不加这一条，它们会原样跟着进 zip 与安装包。
+///
+/// 所以这里不是注释而是**抛错**，且**只报不删**：`--release-dir` 可以指向用户装好的
+/// 目录，人家目录里有什么不是打包链该动的。判据：`plugins/` 直属子项只许是文档。
+String _assertNoBundledPluginBinaries(Directory releaseDir) {
+  final Directory plugins = Directory(_join(releaseDir.path, 'plugins'));
+  final List<String> offenders = <String>[];
+  if (plugins.existsSync()) {
+    for (final FileSystemEntity entity in plugins.listSync()) {
+      if (entity is! File) continue;   // `agents/` 等同级子目录另管
       final String name = _basename(entity.path);
-      if (!name.startsWith('tree_self_updater')) continue;
-      _verifyBinaryVersion(
-        entity,
-        binaryVersion,
-        'dart run tool/build_self_updater.dart',
-      );
-      entity.copySync(_join(target.path, name));
-      copied.add('plugins/$name');
-    }
-  }
-  if (copied.isEmpty) {
-    return '   自迭代插件：跳过（build/plugins 里没有 tree_self_updater 产物；'
-        '用 dart run tool/build_self_updater.dart 产出）'
-        '—— 缺了它装机后没有 plugin_hot_restart 这个 agent tool';
-  }
-  return '   自迭代插件：${copied.join('、')}';
-}
-
-/// 把插件仓（`plugins/`）已编译好的成品拷到发行目录的 `plugins/`。
-///
-/// 只认 `build/plugins/plugin-index.json` 里列出的 `files[].target`（那些名字已经按
-/// 平台去过 `.exe`，见 `tool/build_plugins.dart`）。
-///
-/// **缺产物不算打包失败，但必须打一行**：这些是“随包示例/功能插件”，少一个就是
-/// 装机后开关拉不上去；而只写“拷贝完成”的日志会把这件事变成查不到的坑（与
-/// 自迭代插件、SSH 执行器同一口径）。
-String _copyRepoPluginArtifacts(Directory root, Directory releaseDir) {
-  final Directory built = Directory(_join(_join(root.path, 'build'), 'plugins'));
-  final File index = File(_join(built.path, 'plugin-index.json'));
-  if (!index.existsSync()) {
-    return '   插件仓成品：跳过（没有 build/plugins/plugin-index.json；'
-        '先跑 dart run tool/build_plugins.dart）';
-  }
-  final Object? decoded;
-  try {
-    decoded = json.decode(index.readAsStringSync());
-  } catch (error) {
-    return '   插件仓成品：索引读不了（$error）—— 重跑 build_plugins';
-  }
-  if (decoded is! Map || decoded['plugins'] is! List) {
-    return '   插件仓成品：索引形状不对（缺 plugins 数组）';
-  }
-  final Directory target = Directory(_join(releaseDir.path, 'plugins'))
-    ..createSync(recursive: true);
-  final List<String> copied = <String>[];
-  final List<String> missing = <String>[];
-  for (final Object? raw in decoded['plugins'] as List<Object?>) {
-    if (raw is! Map || raw['files'] is! List) continue;
-    for (final Object? file in raw['files'] as List<Object?>) {
-      if (file is! Map) continue;
-      final String name = '${file['target'] ?? ''}'.trim();
-      if (name.isEmpty || name.contains('/') || name.contains(r'\')) continue;
-      final File source = File(_join(built.path, name));
-      if (!source.existsSync()) {
-        missing.add(name);
-        continue;
+      final int dot = name.lastIndexOf('.');
+      final String ext = dot < 0 ? '' : name.substring(dot).toLowerCase();
+      // 只留文档：成品（tree_*，无论有没有 .exe）与已停产的脚本都不许在包里
+      if (name.startsWith('tree_') || ext == '.py' || ext == '.pyc') {
+        offenders.add('$name（${(entity.lengthSync() / 1024 / 1024).toStringAsFixed(2)} MB）');
       }
-      source.copySync(_join(target.path, name));
-      copied.add('plugins/$name');
     }
   }
-  if (copied.isEmpty) {
-    return '   插件仓成品：跳过（索引里没有可拷的产物'
-        '${missing.isEmpty ? '' : '；缺：${missing.join('、')}'}）';
+  if (offenders.isNotEmpty) {
+    throw StateError(
+      '安装包不许带插件成品：\n  - ${offenders.join('\n  - ')}\n'
+      '位置：${plugins.path}\n'
+      '它们只由 tree-plugins 的 release 提供（装机后在插件面板“从仓库装”）；随包一份会被'
+      '当成“核心自带的成品”保护起来，把用户装的那版锁在旧版上。\n'
+      '修法：删掉上面列出的那几个文件再重跑打包（这个目录不会被自动清空，'
+      '而打包链只报不删 —— `--release-dir` 可能指向用户装好的目录）。\n'
+      '口径出处：docs/plugin-development.md §发布仓库。',
+    );
   }
-  return '   插件仓成品：${copied.join('、')}'
-      '${missing.isEmpty ? '' : '（缺 ${missing.join('、')} ⇒ 重跑 build_plugins）'}';
+  return '   插件成品：确认不在包里（plugins/ 只剩文档；改由 tree-plugins release 提供）';
 }
 
 /// 启动核心读握手（打包产物自检）。

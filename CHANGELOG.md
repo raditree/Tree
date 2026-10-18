@@ -42,6 +42,25 @@
     不开就跳过并留一行——所以 `defaultEnabled: true` 保持原样（用户 2026-10-10 的拍板未被
     覆盖），新装机也不会播出一条“开着却没有文件”的条目。
 
+- **安装包不再带插件成品；`plugins/` 只许有文档**（**新增**自检
+  [tool/package_windows.dart](tool/package_windows.dart) `_assertNoBundledPluginBinaries`，
+  并**删除**②d 的插件分支 / ②e `_copySelfUpdaterArtifacts` / ②f `_copyRepoPluginArtifacts`；
+  用户 2026-10-18 指令）：插件成品只有一个出路——tree-plugins 的 release，装机后由用户在
+  面板上“从仓库装”。
+  - 为什么不是“删掉那三步拷贝”就完事：随包成品与“从仓库装”的成品住在**同一个目录**，
+    一旦哪里又拷进去，它就会被 S3 那层保护当成“核心自带的那一份”⇒ 用户装的那版
+    **永远更新不到新版**，而现象只是“更新按钮按了没反应”。所以判据写成**抛错**而不是注释。
+  - ②d 保留的只有 `agents/tree_agent-linux-*`：它们**不是插件成品**，是被连出去之后在
+    **远端机器**上跑的执行体，用户不会去面板上装它们。
+  - **自检顺手抓出一个真东西**（实测）：`releaseDir` 从不清空、`flutter build` 也不清，
+    而 Inno 的 `[Files]` 是整目录递归通配 —— 默认目录里还留着上个时代的 4 个 `.py`
+    （打包链 2026-10-17 起就不再产 Python）与一个 8.8 MB 的 `tree_ssh_executor.exe`，
+    不加这一条它们会原样跟着进 zip 与安装包。判据因此连 `.py`/`.pyc` 一起拦，
+    且**只报不删**（`--release-dir` 可以指向用户装好的目录）。
+  - 跑出来的证据：同一条 `--skip-build --no-zip` 命令先**红**（点名 5 个残留带体积）、
+    清理后**绿**（exit=0，“插件成品：确认不在包里”），并且那一次的核心握手自检（含优雅退出）
+    也在同一份日志里。
+
 - **插件源码的家在插件仓；那份合同现在有三个读者**（**新增**
   [packages/tree_protocol/test/plugin_repo_contract_test.dart](packages/tree_protocol/test/plugin_repo_contract_test.dart)、
   [plugins/_kit/plugin_kit.dart](plugins/_kit/plugin_kit.dart)、
@@ -61,7 +80,8 @@
     全在骨架里（旧示例是五个各抄一份读循环，那五条副本在不同示例里以不同方式漂）。
   - **产物必须自检过**：`tool/build_plugins.dart` 编译完立即跑 `<exe> --selftest`，非 0 就整个
     构建失败——"能编译"不等于"协议对"，而协议错在用户机器上的表现是"插件起不来"。
-    打包链（②f）只读 `build/plugins/plugin-index.json` 拷成品，不自己扫目录（第二份真相一定漂）。
+    （本条后半句写于成品还进包时：**成品现在不进安装包**，`build/plugins/plugin-index.json`
+    只交给发布仓库那条路读，打包链反过来自检“包里不许有成品”，见上面那条。）
   - **取回只能由核心的 `hello` 点名触发**（**修改** [docs/plugin-development.md](docs/plugin-development.md) §6.5 第 5 步）：
     骨架只在 hello 的 params 带了 `resume_dump_id` 时下一次 `plugin.stateFetch`。因为**取回就是消费**
     （`statePool.take`，一份只喂一世），而键按 `pluginId` + 核心算的代际认（不接受插件指定）——
@@ -99,7 +119,7 @@
     当回退——失败信息里不许列一个查不到的地点，由
     [packages/tree_core/test/builtin_plugin_script_roots_test.dart](packages/tree_core/test/builtin_plugin_script_roots_test.dart)
     钉住）；**打包链不再产 Python 文件**（`tool/package_windows.dart` 的 ②c 从“整目录拷示例 +
-    过滤 `__pycache__`/`*.pyc`”缩成只拷指南，成品由 ②f 按索引拷）。
+    过滤 `__pycache__`/`*.pyc`”缩成只拷指南；成品也不再进包，见本节首条）。
   - **插件文档的候选面不许认祖先目录里的泛化文件名**（**修改**
     [lib/app_version.dart](lib/app_version.dart) `PluginDocs`、
     [test/version_info_test.dart](test/version_info_test.dart)）：删掉 `examples/plugins` 那一档后，
