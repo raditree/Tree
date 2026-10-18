@@ -282,6 +282,12 @@ Future<void> _pump(
   await tester.pumpAndSettle();
 }
 
+/// 切到指定栏（三栏面板：卡片各归各栏，点之前先让它可见）。
+Future<void> _showTab(WidgetTester tester, String key) async {
+  await tester.tap(find.byKey(Key(key)));
+  await tester.pumpAndSettle();
+}
+
 void main() {
   testWidgets('点自定义插件卡片进详情页：介绍、工具、它建的与它订阅的站点', (WidgetTester tester) async {
     final _FakeAdmin admin = _FakeAdmin(
@@ -292,6 +298,7 @@ void main() {
     );
     await _pump(tester, svc: await _service(), admin: admin);
 
+    await _showTab(tester, 'plugin-tab-installed');
     await tester.tap(find.byKey(const Key('plugin-detail-custom-demo')));
     await tester.pumpAndSettle();
 
@@ -351,6 +358,7 @@ void main() {
     );
     await _pump(tester, svc: await _service(), admin: admin);
 
+    await _showTab(tester, 'plugin-tab-installed');
     await tester.tap(find.byKey(const Key('plugin-detail-builtin-sample')));
     await tester.pumpAndSettle();
 
@@ -371,6 +379,7 @@ void main() {
     );
     await _pump(tester, svc: await _service(), admin: admin);
 
+    await _showTab(tester, 'plugin-tab-installed');
     await tester.tap(find.byKey(const Key('plugin-switch-custom-demo')));
     await tester.pumpAndSettle();
 
@@ -387,6 +396,7 @@ void main() {
     );
     await _pump(tester, svc: await _service(), admin: admin);
 
+    await _showTab(tester, 'plugin-tab-stations');
     await tester.tap(
       find.byKey(const Key('station-detail-plugin.demo.relay.audit')),
     );
@@ -439,6 +449,7 @@ void main() {
       },
     );
     await _pump(tester, svc: await _service(), admin: admin);
+    await _showTab(tester, 'plugin-tab-stations');
     await tester.tap(
       find.byKey(const Key('station-detail-plugin.demo.relay.audit')),
     );
@@ -473,6 +484,7 @@ void main() {
       },
     );
     await _pump(tester, svc: await _service(), admin: admin);
+    await _showTab(tester, 'plugin-tab-stations');
     await tester.tap(
       find.byKey(const Key('station-detail-plugin.demo.relay.audit')),
     );
@@ -498,6 +510,7 @@ void main() {
       },
     );
     await _pump(tester, svc: await _service(), admin: admin);
+    await _showTab(tester, 'plugin-tab-stations');
     await tester.tap(
       find.byKey(const Key('station-detail-plugin.demo.relay.audit')),
     );
@@ -530,6 +543,7 @@ void main() {
       },
     );
     await _pump(tester, svc: await _service(), admin: admin);
+    await _showTab(tester, 'plugin-tab-stations');
     await tester.tap(
       find.byKey(const Key('station-detail-plugin.demo.relay.audit')),
     );
@@ -564,6 +578,7 @@ void main() {
       },
     );
     await _pump(tester, svc: await _service(), admin: admin);
+    await _showTab(tester, 'plugin-tab-stations');
     await tester.tap(find.byKey(const Key('station-detail-system.broadcast')));
     await tester.pumpAndSettle();
 
@@ -593,6 +608,7 @@ void main() {
     await _pump(tester, svc: await _service(), admin: admin);
     // 卡片来自快照，但核心这边这个站点已经不在了（例如插件注销了自建站）
     admin.stationResponses.remove('plugin.demo.relay.audit');
+    await _showTab(tester, 'plugin-tab-stations');
     await tester.tap(
       find.byKey(const Key('station-detail-plugin.demo.relay.audit')),
     );
@@ -644,6 +660,7 @@ void main() {
       },
     );
     await _pump(tester, svc: await _service(), admin: admin);
+    await _showTab(tester, 'plugin-tab-stations');
     await tester.tap(
       find.byKey(const Key('station-detail-plugin.demo.relay.audit')),
     );
@@ -688,6 +705,7 @@ void main() {
     )..configsResponse = releasedConfigs();
     await _pump(tester, svc: await _service(), admin: admin);
 
+    await _showTab(tester, 'plugin-tab-installed');
     await tester.tap(find.byKey(const Key('plugin-detail-custom-demo')));
     await tester.pumpAndSettle();
 
@@ -708,6 +726,7 @@ void main() {
     )..configsResponse = releasedConfigs(withSource: false);
     await _pump(tester, svc: await _service(), admin: admin);
 
+    await _showTab(tester, 'plugin-tab-installed');
     await tester.tap(find.byKey(const Key('plugin-detail-custom-demo')));
     await tester.pumpAndSettle();
 
@@ -749,6 +768,7 @@ void main() {
     };
     await _pump(tester, svc: await _service(), admin: admin);
 
+    await _showTab(tester, 'plugin-tab-installed');
     await tester.tap(find.byKey(const Key('plugin-detail-builtin-sample')));
     await tester.pumpAndSettle();
 
@@ -800,6 +820,7 @@ void main() {
     )..builtinsResponse = resolvable;
     await _pump(tester, svc: await _service(), admin: admin);
 
+    await _showTab(tester, 'plugin-tab-installed');
     await tester.tap(find.byKey(const Key('plugin-detail-builtin-sample')));
     await tester.pumpAndSettle();
 
@@ -829,6 +850,7 @@ void main() {
     };
     await _pump(tester, svc: await _service(), admin: admin);
 
+    await _showTab(tester, 'plugin-tab-installed');
     await tester.tap(find.byKey(const Key('plugin-detail-builtin-sample')));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('plugin-detail-repo-sample')));
@@ -866,6 +888,7 @@ void main() {
       ..failWrite = '插件 sample 的进程还没确认退出 ⇒ 这次不替换文件，旧文件一个都没动';
     await _pump(tester, svc: await _service(), admin: admin);
 
+    await _showTab(tester, 'plugin-tab-installed');
     await tester.tap(find.byKey(const Key('plugin-detail-builtin-sample')));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('plugin-detail-repo-sample')));
@@ -890,6 +913,7 @@ void main() {
     );
     await _pump(tester, svc: await _service(), admin: admin);
 
+    await _showTab(tester, 'plugin-tab-installed');
     await tester.tap(find.byKey(const Key('plugin-detail-custom-demo')));
     await tester.pumpAndSettle();
 

@@ -50,8 +50,9 @@ abstract class PluginAdminClient {
 
   /// 发布仓库清单（**只读本地缓存**，不联网）：GET /api/plugin/release。
   ///
-  /// 为什么面板打开时用它而不是刷新：那是一个网络动作，而左栏打开不该被网络
-  /// 拖住（断网时也要能把“上次看到的那些”列出来，并标清这是缓存）。
+  /// 面板打开先用它立刻列出“上次看到的那些”（断网时也有的可看，并标清是缓存）；
+  /// 联网走 [refreshRelease]——B 起进页面就**后台**自动拉一次，但这条读接口本身
+  /// 仍然是一个 URL 都不碰的。
   Future<Map<String, dynamic>> fetchRelease();
 
   /// 拉最新 release 的发布索引（**联网**）：POST /api/plugin/release/refresh。
@@ -192,6 +193,11 @@ class ApiPluginAdminClient implements PluginAdminClient {
 /// 2. 运行态（只读）——[PluginMonitorService]（快照 + WS 增量）：站点 / 看门狗 /
 ///    心跳健康度，以及清单接口不可用时（旧核心）的实例列表兜底。
 ///
+/// 布局（B 起拆三栏，默认停在「未安装」）：「未安装」= 发布索引条目 + 添加自定义
+/// 插件入口（按名字 / id 可检索；索引**进页面后台自动拉**：先读缓存立刻可看，
+/// 失败不阻塞、不转全屏圈）；「已安装」= 开关与配置 + 插件实例 + 看门狗；
+/// 「站点」= 四类站点。
+///
 /// 展示纪律（延续既有口径）：
 /// - 心跳降级 **不是** 停用（角标橙色 + 说明，状态标签仍是「已注册」）；
 /// - 未知字段与未知状态一律忽略（不崩、不臆测）；
@@ -287,14 +293,28 @@ class _PluginPanelState extends State<PluginPanel> {
   /// 刷新失败、索引里没有这一条、安装被闸门拦住都算，成功或重试时清掉。
   final Map<String, String> _repoErrors = <String, String>{};
 
+  // ── 三栏（B：未安装 / 已安装 / 站点）──────────────────────────────────
+
+  /// 当前栏：0 = 未安装（默认）/ 1 = 已安装 / 2 = 站点。
+  int _tab = 0;
+
+  /// 「未安装」栏的检索词（按名字 / plugin_id 过滤索引条目；空 = 不过滤）。
+  String _searchQuery = '';
+
   @override
   void initState() {
     super.initState();
     _svc.addListener(_onChanged);
     _svc.start(teamId: widget.teamId ?? '');
     _loadAdmin();
-    // 发布仓库：只读本地缓存（不联网），所以面板打开不会卡在网络上。
+    // 发布仓库（B，覆盖阶段 5「面板打开不联网」那条定稿）：先读本地缓存，打开那
+    // 一刻就能列出“上次看到的那些”；首帧后再**后台**拉一次最新索引。降级照旧：
+    // 拉期间显示缓存那份（online:false），失败只写进区块里的原因行 —— 不阻塞面板、
+    // 不转全屏圈，也不弹 snack（后台动作不抢注意力；用户手动点「刷新」失败仍走 snack）。
     _loadRelease();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _refreshRelease(background: true);
+    });
   }
 
   @override
@@ -365,11 +385,13 @@ class _PluginPanelState extends State<PluginPanel> {
     }
   }
 
-  /// 联网拉最新 release 的索引并缓存。
+  /// 联网拉最新 release 的索引并缓存（[background] = 进页面的后台自动拉）。
   ///
   /// 失败**不清空列表**：核心会把上一次那份递在 `cached` 里，面板要说的是
   /// “这次没刷成功，下面这些是上次那份”，而不是把限流显示成“仓库里没插件”。
-  Future<void> _refreshRelease() async {
+  /// 后台拉（[background]）失败**不弹 snack**：原因已经写进区块里那一行，
+  /// 打开面板不该被一条自动弹出的提示抢走注意力（手动点「刷新」失败仍弹）。
+  Future<void> _refreshRelease({bool background = false}) async {
     setState(() => _releaseLoading = true);
     try {
       final Map<String, dynamic> result = await _admin.refreshRelease();
@@ -383,12 +405,12 @@ class _PluginPanelState extends State<PluginPanel> {
             keepError: error,
           );
         }
-        _snack('刷新失败：$error');
+        if (!background) _snack('刷新失败：$error');
       }
     } catch (error) {
       final String reason = _reasonOf(error);
       setState(() => _releaseError = reason);
-      _snack('刷新失败：$reason');
+      if (!background) _snack('刷新失败：$reason');
     } finally {
       if (mounted) setState(() => _releaseLoading = false);
     }
@@ -998,36 +1020,163 @@ class _PluginPanelState extends State<PluginPanel> {
     );
   }
 
-  /// 面板主体内容（各区块，原 ListView 的 children）。
+  /// 面板主体内容：三栏（B）——「未安装」（默认）/「已安装」/「站点」各归各栏。
+  ///
+  /// 为什么拆：一页堆下“仓库索引 + 插件实例 + 站点 + 看门狗”之后，“还没装的”会被
+  /// 挤到看不见，而它才是打开面板最常见的目的。
   Widget _bodyContent(ColorScheme cs, PluginSnapshot snap) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _sectionTitle(cs, '开关与配置'),
-          _buildSwitchSection(cs, snap),
-          const SizedBox(height: 12),
-          _sectionTitle(cs, '插件实例（${_instanceCount(snap)}）'),
-          _buildConfigPathHint(cs, snap),
-          ..._buildInstances(cs, snap),
-          const SizedBox(height: 12),
-          _sectionTitle(cs, '从发布仓库更新'),
-          _buildReleaseSection(cs),
-          const SizedBox(height: 12),
-          // M9 §3 的正式名字是「站点」（广播 / 执行 / 中转 / 收集四类），
-          // 旧文案「处理站」是已废弃的旧名（旧「处理站」= 现在的中转站）。
-          _sectionTitle(cs, _stationsTitle(snap)),
-          if (snap.stations.isEmpty)
-            _emptyHint(cs, _stationsEmptyText(snap))
-          else
-            ..._buildStationGroups(cs, snap),
-          const SizedBox(height: 12),
-          _sectionTitle(cs, '看门狗'),
-          _buildWatchdog(cs, snap),
+          _buildTabBar(cs),
+          if (_tab == 0) ..._uninstalledTab(cs),
+          if (_tab == 1) ..._installedTab(cs, snap),
+          if (_tab == 2) ..._stationsTab(cs, snap),
         ],
       ),
     );
+  }
+
+  /// 三栏切换条（默认停在「未安装」）。
+  Widget _buildTabBar(ColorScheme cs) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 8, bottom: 8),
+      child: Row(
+        children: <Widget>[
+          _tabButton(cs, 0, '未安装', 'plugin-tab-uninstalled'),
+          _tabButton(cs, 1, '已安装', 'plugin-tab-installed'),
+          _tabButton(cs, 2, '站点', 'plugin-tab-stations'),
+        ],
+      ),
+    );
+  }
+
+  Widget _tabButton(ColorScheme cs, int index, String label, String key) {
+    final bool selected = _tab == index;
+    return Expanded(
+      child: TextButton(
+        key: Key(key),
+        onPressed: () => setState(() => _tab = index),
+        style: TextButton.styleFrom(
+          foregroundColor: selected ? cs.primary : cs.onSurfaceVariant,
+          backgroundColor: selected ? cs.primaryContainer : Colors.transparent,
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 「未安装」栏（默认）：发布索引条目 + 添加自定义插件入口，按名字 / id 可检索。
+  List<Widget> _uninstalledTab(ColorScheme cs) => <Widget>[
+    _buildSearchField(cs),
+    // 区块名沿用「从发布仓库更新」不改口径：索引里既有没装过的（装它）也有装过的
+    // （更新它），使用说明.txt 按这个名字指路。
+    _sectionTitle(cs, '从发布仓库更新'),
+    _buildReleaseSection(cs),
+    const SizedBox(height: 12),
+    _tappable(
+      key: const Key('plugin-add'),
+      onTap: () => _openEditor(),
+      card: _addCustomCard(cs),
+    ),
+  ];
+
+  /// 「已安装」栏：开关与配置 + 插件实例（内置 / 自定义）+ 看门狗。
+  List<Widget> _installedTab(ColorScheme cs, PluginSnapshot snap) => <Widget>[
+    _sectionTitle(cs, '开关与配置'),
+    _buildSwitchSection(cs, snap),
+    const SizedBox(height: 12),
+    _sectionTitle(cs, '插件实例（${_instanceCount(snap)}）'),
+    _buildConfigPathHint(cs, snap),
+    ..._buildInstances(cs, snap),
+    const SizedBox(height: 12),
+    _sectionTitle(cs, '看门狗'),
+    _buildWatchdog(cs, snap),
+  ];
+
+  /// 「站点」栏：四类站点分组（M9 §3 的正式名字是「站点」，旧文案「处理站」
+  /// 是已废弃的旧名——旧「处理站」= 现在的中转站）。
+  List<Widget> _stationsTab(ColorScheme cs, PluginSnapshot snap) => <Widget>[
+    _sectionTitle(cs, _stationsTitle(snap)),
+    if (snap.stations.isEmpty)
+      _emptyHint(cs, _stationsEmptyText(snap))
+    else
+      ..._buildStationGroups(cs, snap),
+  ];
+
+  /// 「未安装」栏的检索框：按名字 / plugin_id 过滤索引条目。
+  Widget _buildSearchField(ColorScheme cs) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: TextField(
+        key: const Key('plugin-tab-search'),
+        onChanged: (String value) => setState(() => _searchQuery = value),
+        style: const TextStyle(fontSize: 12),
+        decoration: InputDecoration(
+          isDense: true,
+          hintText: '按名字 / id 检索',
+          hintStyle: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+          prefixIcon: Icon(Icons.search, size: 16, color: cs.onSurfaceVariant),
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 8,
+            vertical: 8,
+          ),
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+        ),
+      ),
+    );
+  }
+
+  /// 「添加自定义插件」入口卡（未安装栏）：手写命令行拉起的进程从这里进。
+  Widget _addCustomCard(ColorScheme cs) {
+    return Container(
+      margin: const EdgeInsets.only(top: 6),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        border: Border.all(color: Theme.of(context).dividerColor),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: <Widget>[
+          Icon(Icons.add, size: 16, color: cs.primary),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                const Text(
+                  '添加自定义插件',
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                ),
+                Text(
+                  '写一条自己的：命令 = 要拉起的进程（落盘 plugins.yaml）',
+                  style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 索引条目是否命中当前检索词（按名字 / plugin_id，忽略大小写；空词 = 全部）。
+  bool _matchesSearch(Map<String, dynamic> entry) {
+    final String query = _searchQuery.trim().toLowerCase();
+    if (query.isEmpty) return true;
+    final String id = (entry['plugin_id'] ?? '').toString().toLowerCase();
+    final String name = (entry['name'] ?? '').toString().toLowerCase();
+    return id.contains(query) || name.contains(query);
   }
 
   /// 「插件实例」的条目数：清单可用 = 内置项 + 自定义项；否则退回快照实例数。
@@ -1550,6 +1699,11 @@ class _PluginPanelState extends State<PluginPanel> {
         : (_releaseTag.isEmpty
               ? '本地缓存（还没拉过）'
               : '本地缓存（release $_releaseTag，不是最新）');
+    // 检索只过滤**条目行**：来源行、失败原因、索引路径、skipped 都是“这份索引
+    // 自己怎么了”的诊断，跟找不找得到某一条无关，不跟着消失。
+    final List<Map<String, dynamic>> visible = _releaseEntries
+        .where(_matchesSearch)
+        .toList(growable: false);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
@@ -1587,8 +1741,13 @@ class _PluginPanelState extends State<PluginPanel> {
             cs,
             '索引里没有可装的条目（发布时要把 plugin-index.json 与各插件文件一起传到 release）',
           )
+        else if (visible.isEmpty && _searchQuery.trim().isNotEmpty)
+          _emptyHint(
+            cs,
+            '没有匹配「${_searchQuery.trim()}」的条目（按名字 / id 检索）',
+          )
         else
-          for (final Map<String, dynamic> entry in _releaseEntries)
+          for (final Map<String, dynamic> entry in visible)
             _releaseRow(cs, entry),
         if (_releaseSkipped.isNotEmpty) ...<Widget>[
           const SizedBox(height: 4),

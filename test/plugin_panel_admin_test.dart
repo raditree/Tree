@@ -47,7 +47,8 @@ class _FakeAdmin implements PluginAdminClient {
 
   // ── 发布仓库（阶段 5）的假数据 ──────────────────────────────────
 
-  /// 发布清单：默认“本机还没缓存”（面板打开不该自己去联网）。
+  /// 发布清单：默认“本机还没缓存”。B 起面板打开会后台自动拉一次（读与拉分开记：
+  /// 读进 [releaseFetches]，拉进 [calls]），这里给的是“拉之前/拉也没拉到”的那份。
   Map<String, dynamic> releaseResponse = <String, dynamic>{
     'ok': false,
     'error': '本机还没有发布索引的缓存：C:/data/plugins_release/plugin-index.json'
@@ -321,6 +322,12 @@ Future<void> _pumpPanel(
   await tester.pumpAndSettle();
 }
 
+/// 切到指定栏（三栏面板：卡片与区块各归各栏，点之前先让它可见）。
+Future<void> _showTab(WidgetTester tester, String key) async {
+  await tester.tap(find.byKey(Key(key)));
+  await tester.pumpAndSettle();
+}
+
 /// 发布索引清单的回包（形状 = 核心 `PluginReleaseListing.toJson()`）。
 Map<String, dynamic> _releaseListing({
   bool ok = true,
@@ -360,6 +367,7 @@ void main() {
   testWidgets('插件实例分「内置 / 自定义」两组，每一项各有自己的开关', (WidgetTester tester) async {
     final _FakeAdmin admin = _FakeAdmin();
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
 
     expect(find.text('插件实例（2）'), findsOneWidget);
     expect(find.text('内置插件（1）'), findsOneWidget);
@@ -407,6 +415,7 @@ void main() {
         'generation': 3,
       };
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
 
     await tester.tap(find.byKey(const Key('plugin-hot-restart-demo')));
     await tester.pumpAndSettle();
@@ -421,6 +430,7 @@ void main() {
     final _FakeAdmin admin = _FakeAdmin()
       ..writeResponse = <String, dynamic>{'ok': true, 'resumed': false};
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
 
     await tester.tap(find.byKey(const Key('plugin-hot-restart-demo')));
     await tester.pumpAndSettle();
@@ -438,6 +448,7 @@ void main() {
     final _FakeAdmin admin = _FakeAdmin()
       ..writeResponse = <String, dynamic>{'ok': true, 'killed': 1};
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
 
     await tester.tap(find.byKey(const Key('plugin-force-stop-demo')));
     await tester.pumpAndSettle();
@@ -468,6 +479,7 @@ void main() {
     };
     final _FakeAdmin admin = _FakeAdmin(builtins: missing);
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
 
     expect(find.textContaining('运行时未就绪'), findsOneWidget);
     expect(
@@ -496,6 +508,7 @@ void main() {
   testWidgets('内置项成品在 ⇒ 不许出现“去仓库装”那一行（也不许染成错误色）', (WidgetTester tester) async {
     final _FakeAdmin shipped = _FakeAdmin();
     await _pumpPanel(tester, svc: await _serviceWith(), admin: shipped);
+    await _showTab(tester, 'plugin-tab-installed');
     expect(
       find.byKey(const Key('plugin-builtin-needs-repo-sample')),
       findsNothing,
@@ -525,6 +538,7 @@ void main() {
         ],
       );
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
     expect(find.text('从仓库装它'), findsOneWidget);
 
     await tester.tap(find.byKey(const Key('plugin-builtin-repo-sample')));
@@ -553,6 +567,7 @@ void main() {
     final _FakeAdmin admin = _FakeAdmin()
       ..refreshResponse = _releaseListing(entries: <Map<String, dynamic>>[]);
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
 
     await tester.tap(find.byKey(const Key('plugin-builtin-repo-sample')));
     await tester.pumpAndSettle();
@@ -577,6 +592,7 @@ void main() {
   testWidgets('每项开关各自打各自的接口', (WidgetTester tester) async {
     final _FakeAdmin admin = _FakeAdmin();
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
 
     await tester.tap(find.byKey(const Key('plugin-switch-builtin-sample')));
     await tester.pumpAndSettle();
@@ -596,6 +612,7 @@ void main() {
         'hot_apply_detail': '该条目不在核心启动时读取的配置里（新增条目）',
       };
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
     await tester.tap(find.byKey(const Key('plugin-switch-custom-demo')));
     await tester.pumpAndSettle();
     expect(find.textContaining('配置已保存，但本次热应用失败，重启核心后生效'), findsOneWidget);
@@ -605,6 +622,7 @@ void main() {
   testWidgets('写操作失败：面板显示核心的可读原因', (WidgetTester tester) async {
     final _FakeAdmin admin = _FakeAdmin()..failWrite = '插件 demo 的 command 不能为空';
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
     await tester.tap(find.byKey(const Key('plugin-switch-custom-demo')));
     await tester.pumpAndSettle();
     expect(find.textContaining('操作失败：插件 demo 的 command 不能为空'), findsOneWidget);
@@ -707,11 +725,16 @@ void main() {
   testWidgets('删除要二次确认，确认后才发请求', (WidgetTester tester) async {
     final _FakeAdmin admin = _FakeAdmin();
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
 
     await tester.tap(find.byKey(const Key('plugin-delete-demo')));
     await tester.pumpAndSettle();
     expect(find.text('删除插件？'), findsOneWidget);
-    expect(admin.calls, isEmpty, reason: '确认之前不发请求');
+    expect(
+      admin.calls.where((String c) => !c.startsWith('release:')),
+      isEmpty,
+      reason: '确认之前不发写请求（release:refresh 是 B 进页面的后台索引刷新，不算）',
+    );
 
     await tester.tap(find.byKey(const Key('plugin-delete-confirm')));
     await tester.pumpAndSettle();
@@ -735,6 +758,7 @@ void main() {
       'config': <String, dynamic>{'path': 'C:/data/config/plugins.yaml'},
     });
     await _pumpPanel(tester, svc: svc, admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
 
     expect(find.textContaining('插件清单接口不可用'), findsOneWidget);
     expect(find.text('插件实例（1）'), findsOneWidget);
@@ -744,23 +768,122 @@ void main() {
 
   // ── 发布仓库（阶段 5：插件管理只拉 GitHub Release 资产，不拉源码）──────
 
-  testWidgets('发布仓库：面板打开只读本地缓存（不联网），没缓存也写明原因', (WidgetTester tester) async {
+  testWidgets('发布仓库：进页面先读缓存，再后台自动拉（失败不阻塞、不弹 snack）', (WidgetTester tester) async {
     final _FakeAdmin admin = _FakeAdmin();
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
 
-    expect(admin.releaseFetches, 1, reason: '面板打开读一次本地缓存');
+    expect(admin.releaseFetches, 1, reason: '打开先读本地缓存：那一刻就有东西可列');
     expect(
       admin.calls,
-      isEmpty,
-      reason: '列清单不是网络动作：拉最新 release 必须用户点「刷新」',
+      contains('release:refresh'),
+      reason: 'B 覆盖阶段 5「面板打开不联网」：索引进页面后台自动拉（GET 本身仍只读缓存）',
     );
     expect(find.textContaining('只读 GitHub Release 资产'), findsOneWidget);
     expect(
       find.textContaining('本机还没有发布索引的缓存'),
       findsOneWidget,
-      reason: '空列表必须说清为什么是空的，不让人以为“没插件”',
+      reason: '没缓存也写明原因（后台自动拉失败同样只写这一行，不转全屏圈）',
     );
-    expect(find.textContaining('本地缓存（还没拉过）'), findsOneWidget);
+    expect(
+      find.textContaining('本地缓存（还没拉过）'),
+      findsOneWidget,
+      reason: '自动拉没成功 ⇒ 按缓存那份标清 online:false，不冒充最新',
+    );
+    expect(
+      find.textContaining('刷新失败'),
+      findsNothing,
+      reason: '后台动作失败不弹 snack 抢注意力（用户手动点「刷新」失败才弹）',
+    );
+    // 失败不阻塞：其它栏照常可进，内容不等这次网络动作。
+    await _showTab(tester, 'plugin-tab-installed');
+    expect(find.text('插件实例（2）'), findsOneWidget);
+  });
+
+  testWidgets('发布仓库：后台自动拉失败也照列缓存那份（一个按钮都没点）', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin()
+      ..refreshResponse = _releaseListing(
+        ok: false,
+        error: '取最新 release 失败：HTTP 403（GitHub API 限流）',
+        tag: '',
+      )
+      ..refreshCached = _releaseListing(
+        online: false,
+        tag: 'v0.0.9',
+        entries: <Map<String, dynamic>>[
+          _releaseEntry(id: 'cached1', name: '缓存里那条', installed: '1.0.0'),
+        ],
+      );
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+
+    expect(admin.calls, contains('release:refresh'), reason: '进页面的后台自动拉已跑过');
+    expect(
+      find.text('缓存里那条'),
+      findsOneWidget,
+      reason: '拉失败不等于“仓库里没插件”：缓存那份照列',
+    );
+    expect(find.textContaining('本地缓存（release v0.0.9，不是最新）'), findsOneWidget);
+    expect(
+      find.textContaining('取最新 release 失败'),
+      findsOneWidget,
+      reason: '失败原因就地写进区块里那一行',
+    );
+    expect(find.textContaining('刷新失败'), findsNothing, reason: '后台失败不弹 snack');
+  });
+
+  testWidgets('三栏：默认停在「未安装」，插件实例与站点各归各栏', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin();
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+
+    // 默认 = 未安装：索引区块 + 添加自定义插件入口在，已装 / 站点内容不在
+    expect(find.text('从发布仓库更新'), findsOneWidget);
+    expect(
+      find.byKey(const Key('plugin-add')),
+      findsOneWidget,
+      reason: '「未安装」栏带添加自定义插件入口',
+    );
+    expect(find.text('插件实例（2）'), findsNothing, reason: '已装内容不在未安装栏');
+    expect(find.textContaining('站点（已建'), findsNothing);
+
+    await _showTab(tester, 'plugin-tab-installed');
+    expect(find.text('插件实例（2）'), findsOneWidget);
+    expect(find.text('看门狗'), findsOneWidget);
+    expect(find.text('从发布仓库更新'), findsNothing);
+
+    await _showTab(tester, 'plugin-tab-stations');
+    expect(find.text('站点（已建 0/4 类）'), findsOneWidget);
+    expect(find.text('插件实例（2）'), findsNothing);
+  });
+
+  testWidgets('「未安装」栏按名字 / id 检索：过滤索引条目，检索不到写明', (WidgetTester tester) async {
+    final _FakeAdmin admin = _FakeAdmin()
+      ..refreshResponse = _releaseListing(
+        entries: <Map<String, dynamic>>[
+          _releaseEntry(id: 'alpha', name: '阿尔法工具'),
+          _releaseEntry(id: 'beta', name: '贝塔采集器'),
+        ],
+      );
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    expect(find.text('阿尔法工具'), findsOneWidget);
+    expect(find.text('贝塔采集器'), findsOneWidget);
+
+    await tester.enterText(find.byKey(const Key('plugin-tab-search')), 'alpha');
+    await tester.pumpAndSettle();
+    expect(find.text('阿尔法工具'), findsOneWidget, reason: '按 id 检索命中');
+    expect(find.text('贝塔采集器'), findsNothing);
+
+    await tester.enterText(find.byKey(const Key('plugin-tab-search')), '贝塔');
+    await tester.pumpAndSettle();
+    expect(find.text('阿尔法工具'), findsNothing);
+    expect(find.text('贝塔采集器'), findsOneWidget, reason: '按名字检索命中');
+
+    await tester.enterText(find.byKey(const Key('plugin-tab-search')), 'zzz');
+    await tester.pumpAndSettle();
+    expect(
+      find.textContaining('没有匹配「zzz」'),
+      findsOneWidget,
+      reason: '检索不到要写明，不留白（不让人以为索引里真的一条都没有）',
+    );
+    expect(find.text('阿尔法工具'), findsNothing);
   });
 
   testWidgets('发布仓库：刷新后列出条目，并把跳过的条目与原因写出来', (WidgetTester tester) async {

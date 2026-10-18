@@ -39,6 +39,12 @@ Future<void> _pumpPanel(WidgetTester tester, PluginMonitorService svc) async {
   await tester.pumpAndSettle();
 }
 
+/// 切到指定栏（三栏面板：实例与站点各归各栏，断言前先让它可见）。
+Future<void> _showTab(WidgetTester tester, String key) async {
+  await tester.tap(find.byKey(Key(key)));
+  await tester.pumpAndSettle();
+}
+
 /// 站点快照条目（形状与核心 StationInstance.describe() 一致）。
 Map<String, dynamic> _station(
   String id,
@@ -83,6 +89,7 @@ void main() {
       'config': <String, dynamic>{'path': 'C:/data/config/plugins.yaml'},
     });
     await _pumpPanel(tester, svc);
+    await _showTab(tester, 'plugin-tab-stations');
 
     // 计数不能是裸实例数：三站是实建数，体系本身是四类
     expect(find.text('站点（已建 3/4 类）'), findsOneWidget);
@@ -126,6 +133,7 @@ void main() {
       'config': <String, dynamic>{'path': 'C:/data/config/plugins.yaml'},
     });
     await _pumpPanel(tester, svc);
+    await _showTab(tester, 'plugin-tab-stations');
 
     expect(find.text('站点（已建 4/4 类）'), findsOneWidget);
     expect(find.text('收集站'), findsNWidgets(2), reason: '分组头 + 卡片标签');
@@ -144,6 +152,7 @@ void main() {
       'config': <String, dynamic>{'path': 'C:/data/config/plugins.yaml'},
     });
     await _pumpPanel(tester, svc);
+    await _showTab(tester, 'plugin-tab-stations');
 
     expect(find.text('其他（类型未知）'), findsOneWidget);
     expect(find.text('legacy.station'), findsOneWidget);
@@ -174,6 +183,7 @@ void main() {
       'config': <String, dynamic>{'path': 'C:/data/config/plugins.yaml'},
     });
     await _pumpPanel(tester, svc);
+    await _showTab(tester, 'plugin-tab-stations');
 
     expect(find.text('团队: team-1（1）'), findsOneWidget);
   });
@@ -199,6 +209,7 @@ void main() {
       'config': <String, dynamic>{'path': 'C:/data/config/plugins.yaml'},
     });
     await _pumpPanel(tester, svc);
+    await _showTab(tester, 'plugin-tab-stations');
 
     expect(find.textContaining('订阅（2）'), findsOneWidget);
     expect(find.textContaining('订阅（0）'), findsOneWidget);
@@ -213,6 +224,7 @@ void main() {
       'config': <String, dynamic>{'path': 'C:/data/config/plugins.yaml'},
     });
     await _pumpPanel(tester, svc);
+    await _showTab(tester, 'plugin-tab-stations');
 
     expect(find.text('站点（已建 0/4 类）'), findsOneWidget);
     expect(find.textContaining('内置四站（广播 / 执行 / 中转 / 收集）'), findsOneWidget);
@@ -236,6 +248,7 @@ void main() {
       'config': <String, dynamic>{'path': 'C:/data/config/plugins.yaml'},
     });
     await _pumpPanel(tester, svc);
+    await _showTab(tester, 'plugin-tab-installed');
 
     expect(find.text('插件实例（0）'), findsOneWidget);
     expect(
@@ -251,10 +264,13 @@ void main() {
       'stations': <dynamic>[],
     });
     await _pumpPanel(tester, svc);
+    await _showTab(tester, 'plugin-tab-installed');
 
     // 段内空态 + 折叠区提示都会出现「暂无插件实例」（两处文案同一个短句）
     expect(find.text('暂无插件实例'), findsWidgets);
     expect(find.textContaining('插件配置在'), findsNothing);
+    // 站点段的空态在「站点」栏（三栏后两段不同栏，断言跟着切栏）
+    await _showTab(tester, 'plugin-tab-stations');
     expect(find.textContaining('内置四站'), findsOneWidget, reason: '站点段空态仍给说明');
     expect(find.textContaining('插件配置：'), findsNothing, reason: '没有路径就不显示那一行');
   });
