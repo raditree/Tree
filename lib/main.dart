@@ -12,6 +12,7 @@ import 'io/core_process_launcher.dart';
 import 'io/single_instance.dart';
 import 'io/tray_service.dart';
 import 'io/websocket_service.dart';
+import 'ui/font_service.dart';
 import 'ui/pages/main_page.dart';
 import 'ui/services/editor_settings.dart';
 import 'ui/theme_service.dart';
@@ -52,6 +53,8 @@ Future<void> main() async {
   await EditorSettings.instance.load();
   // 文字缩放：读了才画界面，避免先默认再跳一次
   await TextScaleService.instance.load();
+  // 字体族 / 字重：同上（读了才画界面，免得先默认再跳一次）
+  await FontService.instance.load();
 
   final CoreHandshake? handshake = await CoreProcessLauncher.instance.start();
   if (handshake == null) {
@@ -132,9 +135,10 @@ class AgentTeamApp extends StatefulWidget {
   /// 所有用 `colorScheme.primary` 的控件（用户消息色块、选中态、滑杆等）跟着换。
   static ThemeData _buildLightTheme(Color accent) {
     final Color deep = ThemeService.deriveDeep(accent);
-    return ThemeData(
-      fontFamily: 'Microsoft YaHei',
-      fontFamilyFallback: const ['PingFang SC', 'Noto Sans CJK SC', 'sans-serif'],
+    final UiFontFamily uiFont = FontService.instance.family;
+    return _withUiFont(ThemeData(
+      fontFamily: uiFont.family,
+      fontFamilyFallback: uiFont.fallback,
       primaryColor: deep,
       scaffoldBackgroundColor: const Color(0xFFF4FAF6),
       cardColor: Colors.white,
@@ -197,7 +201,7 @@ class AgentTeamApp extends StatefulWidget {
         selectionHandleColor: deep,
       ),
       useMaterial3: false,
-    );
+    ));
   }
 
   /// 深色主题（黑背景 + 主题色 HUD 弧线，主色默认 #00FF8C 与图标一致）
@@ -205,9 +209,10 @@ class AgentTeamApp extends StatefulWidget {
   /// 荧光绿晃眼时可换豆沙绿/薄荷绿/自定义：主亮色及其整套派生色（容器/边线/
   /// 选中态前景）全部从同一个色算出（见 ThemeService 的派生注释）。
   static ThemeData _buildDarkTheme(Color accent) {
-    return ThemeData(
-      fontFamily: 'Microsoft YaHei',
-      fontFamilyFallback: const ['PingFang SC', 'Noto Sans CJK SC', 'sans-serif'],
+    final UiFontFamily uiFont = FontService.instance.family;
+    return _withUiFont(ThemeData(
+      fontFamily: uiFont.family,
+      fontFamilyFallback: uiFont.fallback,
       brightness: Brightness.dark,
       primaryColor: accent,
       scaffoldBackgroundColor: brandBlack,
@@ -268,7 +273,22 @@ class AgentTeamApp extends StatefulWidget {
         selectionHandleColor: Color(0xFF00ACC1),
       ),
       useMaterial3: false,
-    );
+    ));
+  }
+
+  /// 把当前字体偏好（字体族已在上面传进 ThemeData，字重走 textTheme）落到主题上。
+  ///
+  /// 单独一层是因为字重只能落 textTheme：Material 的 textTheme 各样式默认 w400，
+  /// 逐样式 `TextStyle.apply(fontWeightDelta:)` 整体抬档，覆盖所有没写死
+  /// fontWeight 的 Text（含只写了 fontSize 的那些——它们会与默认样式合并）。
+  /// primaryTextTheme 一起改，否则 AppBar 里的文字会保持旧粗细。
+  static ThemeData _withUiFont(ThemeData theme) {
+    final TextTheme text = FontService.instance.applyTo(theme.textTheme);
+    final TextTheme primary = FontService.instance.applyTo(theme.primaryTextTheme);
+    if (identical(text, theme.textTheme) && identical(primary, theme.primaryTextTheme)) {
+      return theme;
+    }
+    return theme.copyWith(textTheme: text, primaryTextTheme: primary);
   }
 
   @override
@@ -364,10 +384,11 @@ class _AgentTeamAppState extends State<AgentTeamApp> with WindowListener {
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      // 合并两个 Listenable：主题或字号任一变化都会重建
+      // 合并三个 Listenable：主题、字号、字体任一变化都会重建
       animation: Listenable.merge(<Listenable>[
         ThemeService.instance,
         TextScaleService.instance,
+        FontService.instance,
       ]),
       builder: (BuildContext context, _) {
         return MaterialApp(
@@ -375,7 +396,8 @@ class _AgentTeamAppState extends State<AgentTeamApp> with WindowListener {
           navigatorKey: _navigatorKey,
           debugShowCheckedModeBanner: false,
           // 主题色（荧光绿/豆沙绿/薄荷绿/自定义）变化时这两个 builder
-          // 会随 ThemeService 的 notifyListeners 重建，全局实时生效
+          // 会随 ThemeService 的 notifyListeners 重建，全局实时生效；
+          // 字体族 / 字重同理，随 FontService 重建（见 _withUiFont）
           theme: AgentTeamApp._buildLightTheme(ThemeService.instance.accentColor),
           darkTheme: AgentTeamApp._buildDarkTheme(ThemeService.instance.accentColor),
           themeMode: ThemeService.instance.mode,

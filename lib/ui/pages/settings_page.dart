@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../app_version.dart';
+import '../font_service.dart';
 import '../text_scale_service.dart';
 import '../../io/api_service.dart';
 import '../../io/tray_service.dart';
@@ -22,6 +23,8 @@ import '../widgets/core_log_card.dart';
 /// - 自定义模型：模型池 CRUD（M2 起落 `~/.tree/config/models/*.yaml`）
 /// - 主题管理：浅色 / 深色 / 跟随系统三种模式
 /// - 主题色：荧光绿 / 豆沙绿 / 薄荷绿 / 自定义十六进制（晃眼可换护眼色）
+/// - 文字大小：全局文字缩放（MediaQuery.textScaler，叠加在系统无障碍缩放之上）
+/// - 界面字体：字体族 + 字重（FontService 注入 ThemeData.textTheme，改完即时生效）
 /// - 窗口与托盘：关闭按钮行为的开关 + 真正的退出入口
 /// - 插件开发：文档入口（打开 `plugins/README.md`）+ 插件目录定位
 /// - 版本信息：应用 / 核心 / 接口契约 / 核心进程与产物（含"核心比界面旧"告警）
@@ -448,6 +451,10 @@ class _SettingsPageState extends State<SettingsPage> {
           _buildSectionTitle('文字大小'),
           const SizedBox(height: 8),
           _buildTextScaleCard(),
+          const SizedBox(height: 24),
+          _buildSectionTitle('界面字体'),
+          const SizedBox(height: 8),
+          _buildFontCard(),
           const SizedBox(height: 24),
           _buildSectionTitle('窗口与托盘'),
           const SizedBox(height: 8),
@@ -1499,6 +1506,88 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
         );
       },
+    );
+  }
+
+  /// 界面字体卡片（用户 2026-10-18：「增加更多字体设置（大小、粗细、字体等等）」）。
+  ///
+  /// 分工：**字号**在上一节「文字大小」（走 MediaQuery 的 textScaler），这一节管
+  /// **字形**——字体族与字重（走 [FontService] 注入的 ThemeData.textTheme）。
+  /// 两项都随 FontService 的 notifyListeners 触发根 Widget 重建，改完即时生效，
+  /// 不用重启；选中的 chip 自己就长在新字体上，等于一个实时预览。
+  Widget _buildFontCard() {
+    const TextStyle hintStyle = TextStyle(fontSize: 12, color: Color(0xFF94A3B8));
+    return Card(
+      margin: EdgeInsets.zero,
+      child: ListenableBuilder(
+        listenable: FontService.instance,
+        builder: (BuildContext context, Widget? child) {
+          return Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                const Text(
+                  '字体族',
+                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  '全应用统一换字体。等宽体适合长时间看代码，系统默认交给 Windows 决定。',
+                  style: hintStyle,
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: <Widget>[
+                    for (final UiFontFamily f in UiFontFamily.values)
+                      ChoiceChip(
+                        key: Key('ui-font-family-${f.key}'),
+                        label: Text(f.label, style: const TextStyle(fontSize: 12)),
+                        selected: FontService.instance.family == f,
+                        onSelected: (bool on) {
+                          if (on) FontService.instance.setFamily(f);
+                        },
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  '字重',
+                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  '整体加粗一档：没写死粗细的文字都跟着变（标题本身更粗，不会被压平）。',
+                  style: hintStyle,
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: <Widget>[
+                    for (final UiFontWeight w in UiFontWeight.values)
+                      ChoiceChip(
+                        key: Key('ui-font-weight-${w.key}'),
+                        label: Text(w.label, style: const TextStyle(fontSize: 12)),
+                        selected: FontService.instance.weight == w,
+                        onSelected: (bool on) {
+                          if (on) FontService.instance.setWeight(w);
+                        },
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  '字号在上面的「文字大小」一节调整。',
+                  style: hintStyle.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
     );
   }
 

@@ -15,6 +15,25 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
+## [1.0.4+3] — 2026-10-18
+
+### 断言变化（新增 / 修改的 README 不变量）
+
+- **界面字体可调：字体族 + 字重落进 ThemeData.textTheme，字号仍是全局 textScaler**
+  （**新增** [lib/ui/font_service.dart](lib/ui/font_service.dart)；
+  [lib/main.dart](lib/main.dart) `_withUiFont`；设置页「界面字体」一节）：
+  - 字体族四档（微软雅黑 / 系统默认 / 黑体 / 等宽 Consolas），系统默认**不指定**
+    fontFamily（交给 Windows，不影响 Flutter 默认）；
+  - 字重三档（常规 / 中等 / 加粗），按**相对 Material 默认的档位增量**整体抬档：
+    null 字重按 w400 起算，标题一起抬（不会被压成正文粗细）。**出厂默认「中等」**
+    ——用户 2026-10-18 试用反馈"目前感觉偏细"；
+  - 两项都存 `shared_preferences`（`ui_font_family` / `ui_font_weight`，跨版本契约），
+    认不出的值回落默认而不抛（load 在启动路径上）；
+  - 字号仍由「文字大小」一节管（`textScaler`），与系统无障碍缩放叠加。
+  - 用例：`test/font_service_test.dart`（默认值 / 认不出的值 / 幂等 / 持久化 /
+    applyTo 的字体族与抬档映射）、`test/settings_font_test.dart`（渲染 / 点击写入 /
+    选中态跟随）。
+
 ## [1.0.4+2] — 2026-10-18
 
 ### 断言变化（新增 / 修改的 README 不变量）
