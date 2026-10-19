@@ -481,90 +481,139 @@ class _FilePanelState extends State<FilePanel> {
     );
   }
 
-  /// 查看器工具条：收起/显示目录 / 分屏 / 切方向 / 关窗格 / 关查看器。
+  /// 顶部**单行**：文件 tab 条（无 tab 时退回标题）+ 工作空间动作 + 视图动作。
   ///
-  /// 为什么控件放顶栏而不是塞进每个窗格的标题栏：窗格可能被拖得很窄，标题栏还要
-  /// 放文件名、语言标签、保存键；而分屏是「整个查看器」的动作，独立一条更稳。
+  /// 用户 2026-10-19 的两条反馈在这里一并落地：
+  /// - 「文件标签在中间也不合理」：旧实现把 tab 条塞进**查看器那一格**（只占右半格，
+  ///   于是标签看起来悬在中间），现在 tab 条铺满**整块顶部**（[Expanded] 占满整宽）；
+  /// - 「各类框格导致大量空间被浪费」：旧实现叠了四条横条（标题 36 + tab 30 +
+  ///   工具条 32 + 两条分隔线）≈100px，现在**收敛成一条**（32px）——tab / 标题、
+  ///   工作空间动作（重置系统提示词 / 重置 Spec / 同步到本地）、视图动作（收起目录 /
+  ///   分屏 / 切方向 / 关窗格 / 关查看器）同处一行，纵向空间还给正文。
   ///
   /// 「目录」这颗键（用户 2026-10-04）：目录在左时一键收起、收起后一键叫回来；
   /// 面板窄到放不下并排两栏时，这里**如实写出原因**（而不是让用户对着一个看起来
   /// 没反应的按钮猜）。
-  Widget _buildViewerToolbar() {
-    final ColorScheme cs = Theme.of(context).colorScheme;
+  Widget _buildTopBar(ColorScheme cs) {
     final bool twoPanes = _split;
     return Container(
       height: 32,
-      padding: const EdgeInsets.symmetric(horizontal: 6),
       color: cs.surface,
       child: Row(
         children: <Widget>[
-          Text(
-            twoPanes ? '2 个窗格' : '1 个窗格',
-            style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+          // 左：有打开文件就是整条 tab 条（铺满整宽）；没打开文件就退回标题。
+          Expanded(
+            child: _openFiles.isEmpty
+                ? _buildTitleBar(cs)
+                : _buildFileTabStrip(),
           ),
           // 目录在左但**这一刻显示不出来**（面板太窄被 SplitPanes 降级）：如实说原因，
           // 否则用户会觉得这颗按钮点了没反应。
-          if (_treeWanted && _treeAreaTooNarrow) ...<Widget>[
-            const SizedBox(width: 6),
+          if (_viewerOpen && _treeWanted && _treeAreaTooNarrow)
             Flexible(
-              child: Text(
-                '面板太窄 · 目录已收起（拖宽右栏恢复）',
-                key: const ValueKey<String>('tree-too-narrow-hint'),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+              child: Padding(
+                padding: const EdgeInsets.only(left: 6),
+                child: Text(
+                  '面板太窄 · 目录已收起（拖宽右栏恢复）',
+                  key: const ValueKey<String>('tree-too-narrow-hint'),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                ),
               ),
             ),
-          ],
-          const Spacer(),
-          _toolbarAction(
-            // 目录在左：收起 = 箭头朝左、显示 = 箭头朝右（`left_panel_*` 这套图标
-            // 在当前的 Flutter 版本里不存在，别用）
-            icon: _treeWanted
-                ? Icons.keyboard_double_arrow_left
-                : Icons.keyboard_double_arrow_right,
-            tooltip: _treeWanted ? '收起文件树（查看器占满）' : '显示文件树（目录在左）',
-            color: cs.onSurfaceVariant,
-            onPressed: () {
-              setState(() {
-                _treeWanted = !_treeWanted;
-              });
-            },
+          // 工作空间动作：一键重置（备份 .bak.<n> 后还原默认）+ 同步到本地。
+          // 原先挂在「文件浏览」标题行上，标题行随重排撤掉后落到这一行，功能不丢。
+          IconButton(
+            tooltip: '重置系统提示词（备份 .bak.<n>）',
+            visualDensity: VisualDensity.compact,
+            padding: const EdgeInsets.all(4),
+            constraints: const BoxConstraints(minWidth: 26, minHeight: 26),
+            icon: const Icon(Icons.assignment_return_outlined, size: 16),
+            onPressed: () => _resetWorkspace('system_prompt'),
           ),
-          if (twoPanes)
+          IconButton(
+            tooltip: '重置 Spec（备份 .bak.<n>）',
+            visualDensity: VisualDensity.compact,
+            padding: const EdgeInsets.all(4),
+            constraints: const BoxConstraints(minWidth: 26, minHeight: 26),
+            icon: const Icon(Icons.rule_folder_outlined, size: 16),
+            onPressed: () => _resetWorkspace('spec'),
+          ),
+          FileSyncButton(
+            workspaceId: widget.workspaceId,
+            teamId: widget.teamId ?? '',
+            currentPath: _treePath,
+            onUploaded: _refreshFileTree,
+          ),
+          // 视图动作：只在查看器打开时出现（查看器关着时没有可视图可收放）。
+          if (_viewerOpen) ...<Widget>[
             _toolbarAction(
-              icon: _splitAxis == Axis.horizontal
-                  ? Icons.splitscreen_outlined
-                  : Icons.view_agenda_outlined,
-              tooltip: _splitAxis == Axis.horizontal ? '切成上下分屏' : '切成左右分屏',
+              // 目录在左：收起 = 箭头朝左、显示 = 箭头朝右（`left_panel_*` 这套图标
+              // 在当前的 Flutter 版本里不存在，别用）
+              icon: _treeWanted
+                  ? Icons.keyboard_double_arrow_left
+                  : Icons.keyboard_double_arrow_right,
+              tooltip: _treeWanted ? '收起文件树（查看器占满）' : '显示文件树（目录在左）',
               color: cs.onSurfaceVariant,
               onPressed: () {
                 setState(() {
-                  _splitAxis = _splitAxis == Axis.horizontal
-                      ? Axis.vertical
-                      : Axis.horizontal;
+                  _treeWanted = !_treeWanted;
                 });
               },
             ),
-          if (!twoPanes)
+            if (twoPanes)
+              _toolbarAction(
+                icon: _splitAxis == Axis.horizontal
+                    ? Icons.splitscreen_outlined
+                    : Icons.view_agenda_outlined,
+                tooltip: _splitAxis == Axis.horizontal ? '切成上下分屏' : '切成左右分屏',
+                color: cs.onSurfaceVariant,
+                onPressed: () {
+                  setState(() {
+                    _splitAxis = _splitAxis == Axis.horizontal
+                        ? Axis.vertical
+                        : Axis.horizontal;
+                  });
+                },
+              ),
+            if (!twoPanes)
+              _toolbarAction(
+                icon: Icons.vertical_split_outlined,
+                tooltip: '分屏：同一个文件再开一个窗格（两侧共享同一份缓冲）',
+                color: cs.onSurfaceVariant,
+                onPressed: _splitViewer,
+              ),
+            if (twoPanes)
+              _toolbarAction(
+                icon: Icons.close_fullscreen,
+                tooltip: '关闭当前窗格',
+                color: cs.onSurfaceVariant,
+                onPressed: _unsplitViewer,
+              ),
             _toolbarAction(
-              icon: Icons.vertical_split_outlined,
-              tooltip: '分屏：同一个文件再开一个窗格（两侧共享同一份缓冲）',
+              icon: Icons.close,
+              tooltip: '关闭查看器',
               color: cs.onSurfaceVariant,
-              onPressed: _splitViewer,
+              onPressed: () => unawaited(_closeViewer()),
             ),
-          if (twoPanes)
-            _toolbarAction(
-              icon: Icons.close_fullscreen,
-              tooltip: '关闭当前窗格',
-              color: cs.onSurfaceVariant,
-              onPressed: _unsplitViewer,
-            ),
-          _toolbarAction(
-            icon: Icons.close,
-            tooltip: '关闭查看器',
-            color: cs.onSurfaceVariant,
-            onPressed: () => unawaited(_closeViewer()),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// 没有打开文件时顶栏左侧的标题（有 tab 时它让位给整条 tab 条）。
+  Widget _buildTitleBar(ColorScheme cs) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 10),
+      child: Row(
+        children: <Widget>[
+          Icon(Icons.folder_outlined, size: 16, color: cs.onSurfaceVariant),
+          const SizedBox(width: 6),
+          Text(
+            '文件浏览',
+            style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
           ),
         ],
       ),
@@ -600,89 +649,101 @@ class _FilePanelState extends State<FilePanel> {
   /// 用户 2026-10-19：「支持多文件同时存在（目前仅支持单文件+二分屏）」——
   /// 这一排 tab 就是"同时开着"的可见形态（与 VS Code 同一套心智）；一个文档一份
   /// 缓冲，切 tab 不丢改动，只有**关闭 tab** 才问未保存。
+  ///
+  /// 这一条挂在顶栏 [Expanded] 里，因此**铺满整块宽度**（不再是只占查看器那半格）。
   Widget _buildFileTabStrip() {
     final ColorScheme cs = Theme.of(context).colorScheme;
-    return Container(
-      height: 30,
-      color: cs.surfaceContainerHighest,
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        child: Row(
-          children: <Widget>[
-            const SizedBox(width: 4),
-            for (final String path in _openFiles) _buildFileTab(cs, path),
-            const SizedBox(width: 4),
-          ],
-        ),
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: Row(
+        children: <Widget>[
+          for (final String path in _openFiles) _buildFileTab(cs, path),
+        ],
       ),
     );
   }
 
   /// 一个文件 tab：图标 + 文件名 + 未保存圆点 + 关闭；**右键**弹菜单——旧头部的
   /// 文件级动作（预览/源码、复制、下载、重新加载、关闭）都收在这里。
+  ///
+  /// 视觉**对标标准代码编辑器**（用户 2026-10-19）：扁平**矩形**（不再是圆角胶囊）、
+  /// 活动 tab 顶部一条 2px 主色细条 + 用正文底色连成一片、非活动 tab 融进顶栏底色、
+  /// 相邻 tab 之间一条竖直分隔线。整块铺满顶栏高度（32）。
   Widget _buildFileTab(ColorScheme cs, String path) {
     final bool active = path == _activeFile;
     final String name = path.isEmpty ? '未知文件' : path.split('/').last;
     final EditorBuffer buffer = _buffers[path]!; // tab 开着 ⇔ 缓冲一定在
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 3, horizontal: 1),
-      child: Material(
-        color: active ? cs.surface : Colors.transparent,
-        borderRadius: BorderRadius.circular(5),
-        child: InkWell(
-          key: ValueKey<String>('file-tab-$path'),
-          borderRadius: BorderRadius.circular(5),
-          onTap: () => _activateFile(path),
-          onSecondaryTapUp: (TapUpDetails details) =>
-              unawaited(_showTabMenu(path, details.globalPosition)),
-          child: Padding(
-            padding: const EdgeInsets.only(left: 8, right: 2),
-            // 缓冲一变（打字 / 保存）就重建 tab：未保存的圆点要实时亮 / 熄
-            child: ListenableBuilder(
-              listenable: buffer,
-              builder: (BuildContext context, Widget? _) => Row(
-                mainAxisSize: MainAxisSize.min,
-                children: <Widget>[
+    final Color divider = Theme.of(context).dividerColor;
+    final Color editorBg = Theme.of(context).scaffoldBackgroundColor;
+    return Material(
+      color: active ? editorBg : Colors.transparent,
+      child: InkWell(
+        key: ValueKey<String>('file-tab-$path'),
+        onTap: () => _activateFile(path),
+        onSecondaryTapUp: (TapUpDetails details) =>
+            unawaited(_showTabMenu(path, details.globalPosition)),
+        child: Container(
+          height: 32,
+          decoration: BoxDecoration(
+            border: Border(
+              // 活动 tab 顶部那条主色细条（VS Code 口径：活动文档一眼可辨）
+              top: BorderSide(
+                color: active ? cs.primary : Colors.transparent,
+                width: 2,
+              ),
+              // tab 之间的竖直分隔线：非活动 tab 画，活动 tab 不画（与内容连成一片）
+              right: BorderSide(
+                color: active ? Colors.transparent : divider,
+                width: 1,
+              ),
+            ),
+          ),
+          padding: const EdgeInsets.only(left: 10, right: 2),
+          // 缓冲一变（打字 / 保存）就重建 tab：未保存的圆点要实时亮 / 熄
+          child: ListenableBuilder(
+            listenable: buffer,
+            builder: (BuildContext context, Widget? _) => Row(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Icon(
+                  Icons.description_outlined,
+                  size: 13,
+                  color: active ? cs.primary : cs.onSurfaceVariant,
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: active ? cs.onSurface : cs.onSurfaceVariant,
+                  ),
+                ),
+                // 未保存的改动：tab 上一颗小圆点（旧头部的状态行随头部一起去掉了）
+                if (buffer.dirty) ...<Widget>[
+                  const SizedBox(width: 3),
                   Icon(
-                    Icons.description_outlined,
-                    size: 13,
-                    color: active ? cs.primary : cs.onSurfaceVariant,
-                  ),
-                  const SizedBox(width: 4),
-                  Text(
-                    name,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: active ? cs.onSurface : cs.onSurfaceVariant,
-                    ),
-                  ),
-                  // 未保存的改动：tab 上一颗小圆点（旧头部的状态行随头部一起去掉了）
-                  if (buffer.dirty) ...<Widget>[
-                    const SizedBox(width: 3),
-                    Icon(
-                      Icons.fiber_manual_record,
-                      size: 8,
-                      color: cs.primary,
-                    ),
-                  ],
-                  const SizedBox(width: 2),
-                  InkWell(
-                    key: ValueKey<String>('file-tab-close-$path'),
-                    borderRadius: BorderRadius.circular(9),
-                    onTap: () => unawaited(_closeFile(path)),
-                    child: Padding(
-                      padding: const EdgeInsets.all(3),
-                      child: Icon(
-                        Icons.close,
-                        size: 12,
-                        color: cs.onSurfaceVariant,
-                      ),
-                    ),
+                    Icons.fiber_manual_record,
+                    size: 8,
+                    color: cs.primary,
                   ),
                 ],
-              ),
+                const SizedBox(width: 2),
+                InkWell(
+                  key: ValueKey<String>('file-tab-close-$path'),
+                  borderRadius: BorderRadius.circular(9),
+                  onTap: () => unawaited(_closeFile(path)),
+                  child: Padding(
+                    padding: const EdgeInsets.all(3),
+                    child: Icon(
+                      Icons.close,
+                      size: 12,
+                      color: cs.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
         ),
@@ -835,51 +896,15 @@ class _FilePanelState extends State<FilePanel> {
     );
   }
 
-  /// 文件分区：头部（标题 + 工作空间动作）+ 内容
+  /// 文件分区：顶部**单行**（tab 条 / 标题 + 各类动作）+ 内容
   ///
   /// 内容区两种形态：没打开文件 = 文件树独占；打开文件 = 左右分栏（目录在左、查看器在右）。
   Widget _buildFileSection() {
-    final cs = Theme.of(context).colorScheme;
     return Column(
       children: [
-        // 头部：原先这里是「文件浏览 / Git 历史 / Todo」三 Tab，Git 与 Todo 已移出，
-        // 只剩一个标题 + 工作空间动作（同步到本地 / 一键重置系统提示词 / Spec）。
-        Container(
-          color: cs.surface,
-          height: 36,
-          padding: const EdgeInsets.only(left: 10, right: 4),
-          child: Row(
-            children: [
-              Icon(Icons.folder_outlined, size: 16, color: cs.onSurfaceVariant),
-              const SizedBox(width: 6),
-              Text(
-                '文件浏览',
-                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-              ),
-              const Spacer(),
-              // 一键重置（备份 .bak.<n> 后还原默认）：原先挂在右栏顶层 Tab 栏上，
-              // 顶层 Tab 栏随窗口化撤掉后落到这里，功能不丢。
-              IconButton(
-                tooltip: '重置系统提示词（备份 .bak.<n>）',
-                visualDensity: VisualDensity.compact,
-                icon: const Icon(Icons.assignment_return_outlined, size: 18),
-                onPressed: () => _resetWorkspace('system_prompt'),
-              ),
-              IconButton(
-                tooltip: '重置 Spec（备份 .bak.<n>）',
-                visualDensity: VisualDensity.compact,
-                icon: const Icon(Icons.rule_folder_outlined, size: 18),
-                onPressed: () => _resetWorkspace('spec'),
-              ),
-              FileSyncButton(
-                workspaceId: widget.workspaceId,
-                teamId: widget.teamId ?? '',
-                currentPath: _treePath,
-                onUploaded: _refreshFileTree,
-              ),
-            ],
-          ),
-        ),
+        // 顶栏收敛成**一条**（用户 2026-10-19：各类框格浪费空间）：tab 条铺满整宽，
+        // 工作空间动作与视图动作同处一行；不再有叠罗汉式的标题行 + tab 行 + 工具条。
+        _buildTopBar(Theme.of(context).colorScheme),
         Divider(height: 1, thickness: 1, color: Theme.of(context).dividerColor),
         // 内容区域：**目录在左、查看器在右**（用户 2026-10-04 二改）。
         //
@@ -889,13 +914,13 @@ class _FilePanelState extends State<FilePanel> {
         // （代码是按行看的，高度比宽度更吃紧），而面板宽度是用户能拖的；目录当左侧栏
         // 更接近 VS Code，也允许一键收起把整格让给查看器。
         // 面板太窄（< [_treeSplitDegradeBelow]）时按 [SplitPanes] 的既有口径降级成
-        // **只显示查看器**——此时工具条上写着原因，拖宽右栏目录自己回来。
+        // **只显示查看器**——此时顶栏上写着原因，拖宽右栏目录自己回来。
         Expanded(
           child: LayoutBuilder(
             builder: (BuildContext context, BoxConstraints constraints) {
               _lastTreeAreaWidth = constraints.maxWidth;
               if (!_viewerOpen) return _buildFileTree();
-              if (!_treeWanted) return _buildViewerPane();
+              if (!_treeWanted) return _buildPanes();
               return SplitPanes(
                 axis: Axis.horizontal,
                 ratio: _treeSplitRatio,
@@ -908,10 +933,10 @@ class _FilePanelState extends State<FilePanel> {
                   });
                 },
                 first: _buildFileTree(),
-                second: _buildViewerPane(),
-                // 太窄时只留查看器：工具条上的「显示文件树」把目录叫回来
+                second: _buildPanes(),
+                // 太窄时只留查看器：顶栏上的「显示文件树」把目录叫回来
                 // （用户的意愿不被清掉，拖宽右栏目录自己回来）
-                degraded: _buildViewerPane(),
+                degraded: _buildPanes(),
               );
             },
           ),
@@ -942,21 +967,6 @@ class _FilePanelState extends State<FilePanel> {
         // 改名 / 删除之后查看器要跟着走（见 _onTreePathRenamed / _onTreePathDeleted）
         onPathRenamed: _onTreePathRenamed,
         onPathDeleted: _onTreePathDeleted,
-      ),
-    );
-  }
-
-  /// 查看器那一格：多文件 tab 条 + 分屏工具条 + 1–2 个窗格（同屏分栏时它是**右格**）
-  Widget _buildViewerPane() {
-    return Container(
-      color: Theme.of(context).scaffoldBackgroundColor,
-      child: Column(
-        children: <Widget>[
-          _buildFileTabStrip(),
-          _buildViewerToolbar(),
-          Divider(height: 1, thickness: 1, color: Theme.of(context).dividerColor),
-          Expanded(child: _buildPanes()),
-        ],
       ),
     );
   }
