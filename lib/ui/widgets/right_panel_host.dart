@@ -243,6 +243,10 @@ class _RightPanelHostState extends State<RightPanelHost> {
   /// chip 行**常显滑动条**（用户 2026-10-19）：窗口开得多时标签会顶到右端被遮住，
   /// 以前只能横向拖，鼠标用户根本看不出来还有没有更多——现在底下有一条细滑动条
   /// 常驻，并且把鼠标滚轮的**竖直**增量也转成横向滚动（见 [_onChipPointerSignal]）。
+  ///
+  /// 「+」**跟在最后一个 chip 之后**（用户 2026-10-19：钉在右端不够人性）——它是
+  /// 「再加一个窗口」，位置就该在窗口序列的末端，而不是隔着半屏空档贴到最右边。
+  /// 因此它被放进这条横向滚动行里（标签多时跟随视图一起滚），折叠键仍钉在最右。
   Widget _buildTopBar(ColorScheme cs) {
     return Container(
       height: 44,
@@ -271,19 +275,27 @@ class _RightPanelHostState extends State<RightPanelHost> {
                       for (final String id in _open)
                         if (_entryById(id) != null)
                           _buildWindowChip(cs, _entryById(id)!),
+                      IconButton(
+                        key: const ValueKey<String>('right-panel-new-window'),
+                        tooltip: _picking ? '关闭创建页' : '新建窗口',
+                        visualDensity: VisualDensity.compact,
+                        padding: const EdgeInsets.all(6),
+                        constraints: const BoxConstraints(
+                          minWidth: 30,
+                          minHeight: 30,
+                        ),
+                        icon: Icon(
+                          _picking ? Icons.close : Icons.add,
+                          size: 18,
+                        ),
+                        onPressed: _togglePicker,
+                      ),
                       const SizedBox(width: 6),
                     ],
                   ),
                 ),
               ),
             ),
-          ),
-          IconButton(
-            key: const ValueKey<String>('right-panel-new-window'),
-            tooltip: _picking ? '关闭创建页' : '新建窗口',
-            visualDensity: VisualDensity.compact,
-            icon: Icon(_picking ? Icons.close : Icons.add),
-            onPressed: _togglePicker,
           ),
           if (widget.onCollapse != null)
             IconButton(

@@ -295,4 +295,22 @@ void main() {
     expect(label.style?.fontWeight, FontWeight.w800,
         reason: '窗口文字粗细必须跟着「界面字重」设置走');
   });
+
+  testWidgets('「+」跟在最后一个 chip 之后，不钉在最右端（用户 2026-10-19）',
+      (WidgetTester tester) async {
+    await pumpHost(tester, entries());
+
+    final Rect chipRect = tester.getRect(chip('files'));
+    final Rect plusRect = tester.getRect(
+      find.byKey(const ValueKey<String>('right-panel-new-window')),
+    );
+    final Rect hostRect = tester.getRect(find.byType(RightPanelHost));
+
+    // 紧跟最后一个 chip（只隔一点间距）
+    expect(plusRect.left, greaterThan(chipRect.left));
+    expect(plusRect.left - chipRect.right, lessThan(20));
+    // 位置随窗口序列走，右侧还留着一大段空档（不是隔着半屏贴右端）
+    expect(hostRect.right - plusRect.right, greaterThan(100),
+        reason: '「+」要跟着窗口序列末端，而不是钉在最右边');
+  });
 }
