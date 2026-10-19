@@ -1066,8 +1066,11 @@ class FileViewerState extends State<FileViewer> {
   ///
   /// 只量一次几个字符：宽度定死之后槽宽不随滚动与文本内容抖，正文宽度也就不会跟着抖
   /// （否则折行点会在打字时来回跳）。
+  ///
+  /// 行数**手数换行符**而不是 `text.split('\n')`：后者每次重建都要分配一个 O(行数) 的
+  /// 列表（敲一个键就重建一次，长文件上纯属白花的分配与内存）。
   double _codeGutterWidth(String text, TextStyle style, TextScaler textScaler) {
-    final int digits = '${text.split('\n').length}'.length;
+    final int digits = '${_logicalLineCount(text)}'.length;
     final TextPainter painter = TextPainter(
       text: TextSpan(text: '0' * digits, style: style),
       textDirection: TextDirection.ltr,
@@ -1076,6 +1079,15 @@ class FileViewerState extends State<FileViewer> {
     final double width = painter.width;
     painter.dispose();
     return width + 2 * kCodeGutterPadding;
+  }
+
+  /// 逻辑行数（= 换行符个数 + 1；末尾换行会多算一条空行，与编辑器口径一致）。
+  static int _logicalLineCount(String text) {
+    int count = 1;
+    for (int i = 0; i < text.length; i++) {
+      if (text.codeUnitAt(i) == 0x0A) count++;
+    }
+    return count;
   }
 
   /// 可编辑正文：文本域（高亮控制器 + **行号槽共用**的那条滚动控制器）。
@@ -1481,44 +1493,50 @@ class _CodeGutter extends StatefulWidget {
 }
 
 class _CodeGutterState extends State<_CodeGutter> {
-  /// 上一次量出来的布局与它的输入：**只在文本 / 宽度变了才重算**。
+  /// 上一次的**增量测量器**与它的输入：只在文本 / 宽度 / 缩放 / 度量变了才换新的。
   ///
-  /// 每帧重算等于每次滚动都跑一遍全篇 TextPainter（几千行就是几千次 layout）。
-  CodeGutterLayout? _layout;
-  String? _layoutText;
-  double? _layoutWidth;
-  TextScaler? _layoutScaler;
-  TextStyle? _layoutStyle;
+  /// 每帧重算等于每次滚动都跑一遍全篇 TextPainter（几千行就是几千次 layout），
+  /// 而且敲一个键（文本变）就再来一遍——这正是"长文件卡、打字涩"的根。改成
+  /// [_measurerFor] 拿一个可**增量**往下量的 [CodeGutterMeasurer]：换文件才换测量器，
+  /// 打字时只重量看得见的那一段（见 [CodeGutterMeasurer]）。
+  CodeGutterMeasurer? _measurer;
+  String? _mText;
+  double? _mWidth;
+  TextScaler? _mScaler;
+  TextStyle? _mStyle;
 
-  /// 取（必要时重算）行号布局：键 = 文本 + 内容宽度 + 缩放 + 字体度量。
-  CodeGutterLayout _layoutFor() {
-    final CodeGutterLayout? cached = _layout;
+  /// 取（必要时新建）增量测量器：键 = 文本 + 内容宽度 + 缩放 + 字体度量。
+  CodeGutterMeasurer _measurerFor() {
+    final CodeGutterMeasurer? cached = _measurer;
     if (cached != null &&
-        _layoutText == widget.text &&
-        _layoutWidth == widget.contentWidth &&
-        _layoutScaler == widget.textScaler &&
-        _layoutStyle == widget.style) {
+        _mText == widget.text &&
+        _mWidth == widget.contentWidth &&
+        _mScaler == widget.textScaler &&
+        _mStyle == widget.style) {
       return cached;
     }
-    final CodeGutterLayout layout = CodeGutterLayout.compute(
+    final CodeGutterMeasurer next = CodeGutterMeasurer(
       text: widget.text,
       style: widget.style,
       maxWidth: widget.contentWidth,
       textScaler: widget.textScaler,
     );
-    _layout = layout;
-    _layoutText = widget.text;
-    _layoutWidth = widget.contentWidth;
-    _layoutScaler = widget.textScaler;
-    _layoutStyle = widget.style;
-    return layout;
+    _measurer = next;
+    _mText = widget.text;
+    _mWidth = widget.contentWidth;
+    _mScaler = widget.textScaler;
+    _mStyle = widget.style;
+    return next;
   }
 
   /// 可见窗口：返回 [first, last) 与窗口第一行的纵向位置。
   ///
   /// 上下各留一屏（快速滚动时数字不会晚一帧才贴上）。行按下标递增排好序，线性扫一遍。
-  (int, int, double) _window(CodeGutterLayout layout, double offset) {
-    final int count = layout.rows.length;
+  /// 只扫**已量出**的那一段（[CodeGutterMeasurer.rows]）；调用方已先按需量到窗口底部，
+  /// 所以这里看到的就是"该显示的那批"。
+  (int, int, double) _window(CodeGutterMeasurer measurer, double offset) {
+    final List<CodeGutterRow> rows = measurer.rows;
+    final int count = rows.length;
     if (count == 0) return (0, 0, 0);
     final double height = widget.viewportHeight;
     if (!height.isFinite || height <= 0) return (0, count, 0);
@@ -1526,14 +1544,14 @@ class _CodeGutterState extends State<_CodeGutter> {
     final double to = offset + height + height;
     int first = 0;
     while (first < count &&
-        layout.rows[first].top + layout.rows[first].height < from) {
+        rows[first].top + rows[first].height < from) {
       first++;
     }
     int last = first;
-    while (last < count && layout.rows[last].top <= to) {
+    while (last < count && rows[last].top <= to) {
       last++;
     }
-    return (first, last, first < count ? layout.rows[first].top : 0);
+    return (first, last, first < count ? rows[first].top : 0);
   }
 
   /// 一个视觉行：高度与正文那一个视觉行一致，行首画号（续行留空）。
@@ -1558,7 +1576,7 @@ class _CodeGutterState extends State<_CodeGutter> {
 
   @override
   Widget build(BuildContext context) {
-    final CodeGutterLayout layout = _layoutFor();
+    final CodeGutterMeasurer measurer = _measurerFor();
     final TextStyle numberStyle = widget.style.copyWith(color: widget.color);
     return SizedBox(
       width: widget.width,
@@ -1572,8 +1590,17 @@ class _CodeGutterState extends State<_CodeGutter> {
                 final double offset = widget.scrollController.hasClients
                     ? widget.scrollController.offset
                     : 0;
+                final double height = widget.viewportHeight;
+                // **按需增量**测量：只量到看得见的那一段（上下各留一屏）。
+                // 打开长文件只付第一屏的代价，往下滚才继续量——这是"懒加载"的核心。
+                // 视口高度不定（测试里没给约束）就退回全篇，行为与旧实现一致。
+                if (!height.isFinite || height <= 0) {
+                  measurer.measureAll();
+                } else {
+                  measurer.measureUntilHeight(offset + height + height);
+                }
                 final (int first, int last, double firstTop) =
-                    _window(layout, offset);
+                    _window(measurer, offset);
                 return OverflowBox(
                   // 行号列比视口高（只裁不报溢出）：裁剪由外层 ClipRect 做
                   alignment: Alignment.topCenter,
@@ -1587,7 +1614,7 @@ class _CodeGutterState extends State<_CodeGutter> {
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: <Widget>[
                         for (int i = first; i < last; i++)
-                          _buildRow(layout.rows[i], numberStyle),
+                          _buildRow(measurer.rows[i], numberStyle),
                       ],
                     ),
                   ),

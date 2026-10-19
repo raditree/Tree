@@ -126,6 +126,28 @@
     关闭；未保存圆点亮灭；关 tab 的静默写回与取消确认；保存失败只剩 SnackBar）、
     `test/file_tree_viewer_sync_test.dart`（端到端不受影响）、`test/split_panes_test.dart`（源钉）。
 
+- **文件视图第三批：长文件懒加载、顶栏收敛成一条、tab 对标标准编辑器、「+」跟随最后一个 chip（用户 2026-10-19，四条）**
+  （**修改** [lib/README.md](lib/README.md) 不变量 12（行号槽增量测量）、不变量 16 ⑧/⑪、不变量 28；
+  [lib/ui/services/code_gutter_layout.dart](lib/ui/services/code_gutter_layout.dart)、
+  [lib/ui/widgets/file_viewer.dart](lib/ui/widgets/file_viewer.dart)、
+  [lib/ui/widgets/file_panel.dart](lib/ui/widgets/file_panel.dart)、
+  [lib/ui/widgets/right_panel_host.dart](lib/ui/widgets/right_panel_host.dart)）：
+  - **长文件懒加载**（用户：「2000 行的文件加载就要卡几秒了（长文件甚至崩溃）」「文件改为懒加载」）：行号槽原本
+    把**全篇**逻辑行各 `TextPainter.layout` 一次（2000 行 = 2000 次同步布局）压在打开那一帧，且可编辑时**每敲一个键**
+    都重来一遍——新增 `CodeGutterMeasurer` 做**按需增量测量**（只量到看得见的那一段、往下滚才继续）；`CodeGutterLayout.compute`
+    保留为"一次量完"入口（测试用）。同时把行号槽宽度里的 `text.split('\n')`（每次重建分配一个 O(行数) 列表）
+    换成手数换行符；
+  - **顶栏收敛成一条**（用户：「各类框格导致大量空间被浪费」「文件标签在中间也不合理」）：旧的标题行 36 + tab 30 +
+    查看器工具条 32 + 两条分隔线（≈100px）合并为**一条 32px**——左段是**铺满整宽**的 tab 条（无文件时退回标题），
+    右段是工作空间动作与视图动作；
+  - **tab 对标标准代码编辑器**（用户：「标签对标标准解释器」）：扁平矩形（去掉圆角胶囊），活动 tab 顶部一条
+    **2px 主色细条** + 用正文底色与下方内容连成一片，非活动 tab 融进顶栏、相邻 tab 间一条竖直分隔线；key 不变；
+  - **「+」跟随最后一个 chip**（用户：「窗口的「+」固定在右侧不够人性」）：把「+」移进 chip 那条横向滚动行、
+    排在 chips 之后（标签多时随视图一起滚），不再隔着半屏钉在最右；折叠键仍钉最右。
+  - 用例：`test/code_gutter_layout_test.dart`（增量测量量到目标高就停 / 与一次量完逐行等价）、
+    `test/right_panel_host_test.dart`（「+」紧跟在最后一个 chip 之后、不贴右端）、
+    `test/file_editor_test.dart` 与 `test/file_tree_viewer_sync_test.dart`（行号槽与文件窗端到端不受影响）。
+
 ## [1.0.4+2] — 2026-10-18
 
 ### 断言变化（新增 / 修改的 README 不变量）

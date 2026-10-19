@@ -80,4 +80,48 @@ void main() {
     expect(g.rows, isNotEmpty);
     expect(g.lineCount, greaterThanOrEqualTo(1));
   });
+
+  // ── 用户 2026-10-19：长文件要「懒加载」，别在打开 / 敲键时全篇铺开 ──────────
+
+  test('增量测量：量到目标高度就停，不全篇铺开（懒加载的核心）', () {
+    final String text =
+        List<String>.generate(200, (int i) => 'line$i').join('\n');
+    final CodeGutterMeasurer m = CodeGutterMeasurer(
+      text: text,
+      style: style,
+      maxWidth: 400,
+    );
+    expect(m.rows, isEmpty, reason: '新建的测量器还不该量任何一行');
+
+    m.measureUntilHeight(lineHeight * 5);
+    expect(m.rows, isNotEmpty);
+    expect(m.rows.length, lessThan(200), reason: '只量看得见的一小段，不铺满全篇');
+    expect(m.height, greaterThanOrEqualTo(lineHeight * 5));
+    expect(m.complete, isFalse, reason: '目标没到全篇就不该量完');
+
+    m.measureAll();
+    expect(m.complete, isTrue);
+    expect(m.lineCount, 200);
+    expect(m.rows.length, 200);
+    expect(m.height, closeTo(lineHeight * 200, 1));
+  });
+
+  test('增量测量与一次量完等价（同文本同宽度：行号与位置逐行一致）', () {
+    final String text = 'a\n${'z' * 120}\n${'q' * 40}';
+    final CodeGutterMeasurer incremental = CodeGutterMeasurer(
+      text: text,
+      style: style,
+      maxWidth: 70,
+    );
+    incremental.measureUntilHeight(lineHeight); // 先量一小段
+    incremental.measureAll(); // 再补完
+    final CodeGutterLayout full = layout(text, width: 70);
+
+    expect(incremental.rows.length, full.rows.length);
+    for (int i = 0; i < full.rows.length; i++) {
+      expect(incremental.rows[i].number, full.rows[i].number);
+      expect(incremental.rows[i].top, closeTo(full.rows[i].top, 0.01));
+      expect(incremental.rows[i].height, closeTo(full.rows[i].height, 0.01));
+    }
+  });
 }
