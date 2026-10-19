@@ -111,6 +111,21 @@
     `test/tool_row_detail_test.dart`（源钉：文件窗无 Git/Todo 子 Tab、git/todo 独立窗口、chip 滑动条、真 markdown 渲染器）、
     `test/message_stream_style_test.dart`（思考条不斜体）。
 
+- **查看器旧头部退场：文件级动作右键 tab；查看器滚动条常驻（用户 2026-10-19，两条）**
+  （**修改** [lib/README.md](lib/README.md) 不变量 16 ⑧/⑩；[lib/ui/widgets/file_viewer.dart](lib/ui/widgets/file_viewer.dart)、
+  [lib/ui/widgets/file_panel.dart](lib/ui/widgets/file_panel.dart)）：
+  - 多文件 tab 条上已有文件名，[FileViewer](lib/ui/widgets/file_viewer.dart) 的旧头部（返回 / 文件名 / 路径 /
+    语言标签 / 保存 / 预览源码 / 复制 / 下载 / 刷新）**整个去掉**（用户：「文件浏览页有一个标签了，旧的就可以
+    去掉了（相应功能右键标签）」）：预览/源码、复制、重新加载（放弃未保存的改动）、保存收进 **tab 右键菜单**
+    （活动文件才有这些条目——动作要落在挂载着的查看器 state 上；保存只在有改动时出现），下载与关闭对
+    **任何** tab 都可用；未保存的改动改为 **tab 上的小圆点**（`ListenableBuilder` 听共享缓冲），保存失败
+    一律 SnackBar 可见（静默自动保存失败也不静默）；
+  - 查看器内容区（Markdown / SVG 预览、只读正文、编辑正文）包**常驻滚动条**（`Scrollbar(thumbVisibility: true)`，
+    桌面端滚动条不自动出现）——用户：「还有这个为什么又没给滑动条」。
+  - 用例：`test/file_editor_test.dart`（右键 tab 真点击：切到源码 / 保存真发 PUT / 重新加载回到盘上那份 /
+    关闭；未保存圆点亮灭；关 tab 的静默写回与取消确认；保存失败只剩 SnackBar）、
+    `test/file_tree_viewer_sync_test.dart`（端到端不受影响）、`test/split_panes_test.dart`（源钉）。
+
 ## [1.0.4+2] — 2026-10-18
 
 ### 断言变化（新增 / 修改的 README 不变量）

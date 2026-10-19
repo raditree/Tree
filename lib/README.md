@@ -277,9 +277,10 @@
     显示"分开**——面板太窄时按下面的降级口径只显示查看器，但*不*清掉意愿，拖宽之后目录自己回来，不用再点一次。
     **降级口径**：可用**宽度** < 400px（`_treeSplitDegradeBelow`，每侧最小 200px）时只显示查看器，并在工具条上
     **如实写出原因**（`tree-too-narrow-hint`：「面板太窄 · 目录已收起（拖宽右栏恢复）」）——不让用户对着一个看起来
-    没反应的按钮猜。窄栏位的自保：目录头部（`根目录` + 同步作用域）与查看器头部（文件名 / 语言标签 / 动作键）都必须
-    能缩——查看器头部在 < 360px 时把预览切换 / 复制 / 下载收进「更多」菜单（`_headerAction` = 28px 紧凑键），
-    目录头部的标题走 `Flexible` + 省略号，否则左右分栏下必然出现黄黑溢出条。
+    没反应的按钮猜。窄栏位的自保：目录头部（`根目录` + 同步作用域）的标题走 `Flexible` + 省略号；**查看器不再有
+    自己的头部**——文件名 / 路径 / 语言标签 / 保存 / 预览源码 / 复制 / 下载 / 刷新那一条随多文件 tab 退场
+    （用户 2026-10-19：「文件浏览页有一个标签了，旧的就可以去掉了（相应功能右键标签）」），文件级动作改走
+    tab 右键菜单（见⑩），自然没有溢出。
     开 / 关查看器时文件树用 `GlobalKey`（`_fileTabsKey`）
     **搬**进 / 搬出分栏而不是重建：展开状态、选中项、已加载的目录都不丢。树里的改名 / 删除对已打开文件的联动经
     `FileTree.onPathRenamed` / `onPathDeleted` → FilePanel 更新窗格路径（缓冲实例不动）或关掉窗格并提示。
@@ -297,6 +298,16 @@
     **没有 tab 再引用才释放**（`_releaseBuffer`）；已开着的文件再点只切过去，不叠第二个同名 tab。
     **分屏（`_split`）仍是"当前文件再开一个视图"**：两侧取**同一个缓冲实例**、就地编辑即同步（不是各一份，
     也不是"两个不同文件"）。
+    **tab 是文件级动作的入口**（用户 2026-10-19：「文件浏览页有一个标签了，旧的就可以去掉了（相应功能右键标签）」）：
+    [FileViewer](ui/widgets/file_viewer.dart) 的旧头部（返回 / 文件名 / 路径 / 语言标签 / 保存 / 预览源码 / 复制 /
+    下载 / 刷新）整体退场，这些动作收进 **tab 右键菜单**（[file_panel.dart](ui/widgets/file_panel.dart) 的
+    `_showTabMenu`）——预览/源码切换、复制、重新加载（放弃未保存的改动）、保存（有改动才出现）落在**活动窗格
+    挂载着的查看器 state** 上（[FileViewerState](ui/widgets/file_viewer.dart) 的公开只读口 `isDirty` /
+    `canTogglePreview` / `canCopyContent` / `canReload` 与动作 `togglePreview` / `copyContent` / `reloadFromDisk` /
+    `saveIfDirty`），**下载与关闭对任何 tab 都可用**；未保存的改动在 tab 上**亮小圆点**（`ListenableBuilder`
+    听共享缓冲的 dirty），保存后熄灭——旧头部的状态行没了，未保存态就挂在这颗点上，保存失败**一律 SnackBar**
+    （静默自动保存失败也要可见）。查看器内容区（Markdown / SVG 预览、只读正文、编辑正文）都包**常驻滚动条**
+    （`Scrollbar(thumbVisibility: true)`；桌面端滚动条不自动常驻——用户 2026-10-19：「还有这个为什么又没给滑动条」）。
 
 17. **首次使用有八步新手引导，处处可跳过**（[ui/services/onboarding_steps.dart](ui/services/onboarding_steps.dart)、
     [ui/services/onboarding_state.dart](ui/services/onboarding_state.dart)、

@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
@@ -198,7 +199,6 @@ void main() {
     String path = 'lib/main.dart',
     bool readOnly = false,
     String reason = '',
-    VoidCallback? onClose,
     ThemeData? theme,
   }) async {
     await tester.pumpWidget(MaterialApp(
@@ -210,7 +210,6 @@ void main() {
           filePath: path,
           readOnly: readOnly,
           readOnlyReason: reason,
-          onClose: onClose,
         ),
       ),
     ));
@@ -284,12 +283,12 @@ void main() {
       expect(effective.focusedBorder, InputBorder.none);
     });
 
-    testWidgets('按扩展名挑语言，标题栏给出语言标签', (WidgetTester tester) async {
+    testWidgets('按扩展名挑语言（语言标签随旧头部退场，着色语义不变）',
+        (WidgetTester tester) async {
       core.content = 'final int x = 1;';
       core.size = core.content.length;
       await pumpViewer(tester, path: 'lib/main.dart');
 
-      expect(find.text('Dart'), findsOneWidget);
       final TextField field = tester.widget<TextField>(find.byType(TextField));
       final CodeEditingController controller =
           field.controller! as CodeEditingController;
@@ -454,7 +453,8 @@ testWidgets('换文件（可编辑 → 只读）后行号槽仍在，滚动控�
       await pumpViewer(tester, path: 'readme.md');
       expect(find.byKey(codeGutterKey), findsNothing, reason: 'Markdown 默认是预览');
 
-      await tester.tap(find.text('源码'));
+      // 旧头部的「源码」chip 随头部退场：切源码走 tab 右键菜单（真点击钉在文件面板用例）
+      tester.state<FileViewerState>(find.byType(FileViewer)).togglePreview();
       await tester.pump();
       expect(find.byKey(codeGutterKey), findsOneWidget);
       expect(gutterNumbers(tester), <int>[1, 2]);
@@ -468,9 +468,11 @@ testWidgets('换文件（可编辑 → 只读）后行号槽仍在，滚动控�
       core.size = 6;
       await pumpViewer(tester, path: 'notes.txt');
 
+      final FileViewerState state =
+          tester.state<FileViewerState>(find.byType(FileViewer));
       await tester.enterText(find.byType(TextField), 'line1\nline2\n');
       await tester.pump();
-      expect(find.textContaining('未保存的改动'), findsOneWidget);
+      expect(state.isDirty, isTrue);
 
       await pressCtrlS(tester);
       await settleIo(tester);
@@ -481,7 +483,7 @@ testWidgets('换文件（可编辑 → 只读）后行号槽仍在，滚动控�
           reason: '带上加载时的字节数，核心才能发现外部改动');
       expect(core.puts.singleWhere((({String query, Map<String, dynamic> body}) p) => p.body['content'] == 'line1\nline2\n').query,
           contains('path=notes.txt'));
-      expect(find.textContaining('未保存的改动'), findsNothing);
+      expect(state.isDirty, isFalse);
     });
 
     testWidgets('保存失败给出可见原因，不静默', (WidgetTester tester) async {
@@ -498,13 +500,18 @@ testWidgets('换文件（可编辑 → 只读）后行号槽仍在，滚动控�
       await pressCtrlS(tester);
       await settleIo(tester);
 
-      // 标题栏状态行 + SnackBar 兜底：两处都给原因，不静默
-      expect(find.textContaining('保存失败'), findsWidgets);
-      expect(find.textContaining('目标不是纯文本'), findsWidgets);
-      expect(find.textContaining('未保存的改动'), findsNothing,
-          reason: '失败时状态行让位给失败原因，但改动仍在（保存键仍可点）');
-      // 改动还在：保存键仍是实心可点的
-      expect(find.byIcon(Icons.save), findsOneWidget);
+      // 旧头部的状态行没了：失败原因靠 SnackBar（保存失败也要可见，不静默）
+      expect(find.textContaining('保存失败'), findsOneWidget);
+      expect(find.textContaining('目标不是纯文本'), findsOneWidget);
+      // 改动还在：没写成功就仍是未保存态，正文也没被清掉
+      expect(
+        tester.state<FileViewerState>(find.byType(FileViewer)).isDirty,
+        isTrue,
+      );
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        'failcase',
+      );
     });
 
     testWidgets('409 冲突：弹框说明后「覆盖保存」带 force=1 重试',
@@ -570,8 +577,7 @@ testWidgets('换文件（可编辑 → 只读）后行号槽仍在，滚动控�
 
       expect(find.byType(TextField), findsNothing);
       expect(find.textContaining('图片不支持编辑'), findsNothing,
-          reason: '图片视图不铺只读提示条，锁图标 tooltip 里说明即可');
-      expect(find.byTooltip('图片不支持编辑'), findsOneWidget);
+          reason: '图片视图不铺只读提示条（旧头部的锁图标已随头部退场）');
     });
 
     testWidgets('外部 readOnly 参数语义不变：给出理由，不给文本域',
@@ -626,7 +632,7 @@ testWidgets('换文件（可编辑 → 只读）后行号槽仍在，滚动控�
 
       // 另一个窗格的文本域跟着变（同一个控制器 ⇒ 同一份文本、同一份脏标记）
       expect(find.text('line1\nline2\n'), findsNWidgets(2));
-      expect(find.textContaining('未保存的改动'), findsNWidgets(2));
+      expect(buffer.dirty, isTrue, reason: '一边打字，共享缓冲就是未保存态');
     });
 
     testWidgets('任一窗格保存成功：两边一起变成已保存，loadedSize 一起更新，只发一次 PUT',
@@ -637,12 +643,10 @@ testWidgets('换文件（可编辑 → 只读）后行号槽仍在，滚动控�
 
       await tester.enterText(find.byType(TextField).first, 'two-panes');
       await tester.pump();
-      expect(find.textContaining('未保存的改动'), findsNWidgets(2));
-      expect(find.byIcon(Icons.save), findsNWidgets(2),
-          reason: '脏标记共享：两边都显示可点的保存键');
+      expect(buffer.dirty, isTrue, reason: '脏标记共享：两个窗格是同一份未保存态');
 
-      // 在第二个窗格点保存（共享缓冲：从哪一边保存都是同一份文档）
-      await tester.tap(find.byIcon(Icons.save).last);
+      // Ctrl+S 保存（共享缓冲：从哪一边保存都是同一份文档）
+      await pressCtrlS(tester);
       await settleIo(tester);
 
       final List<Map<String, dynamic>> saved = putsWith(core, 'two-panes');
@@ -651,9 +655,7 @@ testWidgets('换文件（可编辑 → 只读）后行号槽仍在，滚动控�
           reason: '两个窗格看到的是同一个加载字节数');
       expect(buffer.loadedSize, 'two-panes'.length,
           reason: '保存成功后共享的 loadedSize 一起更新');
-      expect(find.textContaining('未保存的改动'), findsNothing,
-          reason: '保存成功后两边都不再是未保存态');
-      expect(find.byIcon(Icons.save), findsNothing);
+      expect(buffer.dirty, isFalse, reason: '保存成功后两边都不再是未保存态');
     });
 
     testWidgets('FileViewer 对**外部传入**的缓冲不做 dispose：窗格关了，控制器还在',
@@ -737,43 +739,6 @@ testWidgets('换文件（可编辑 → 只读）后行号槽仍在，滚动控�
 
       expect(putsWith(core, 'blur-off'), isEmpty);
     });
-
-    testWidgets('返回时先静默写回再关（开着失焦保存）',
-        (WidgetTester tester) async {
-      core.content = 'x';
-      core.size = 1;
-      bool closed = false;
-      await pumpViewer(tester, path: 'a.txt', onClose: () => closed = true);
-
-      await tester.enterText(find.byType(TextField), 'close-save');
-      await tester.pump();
-      await tester.tap(find.byTooltip('返回'));
-      await settleIo(tester);
-
-      expect(putsWith(core, 'close-save'), hasLength(1));
-      expect(closed, isTrue);
-    });
-
-    testWidgets('关掉失焦保存：返回前问一次，选取消就不关',
-        (WidgetTester tester) async {
-      await EditorSettings.instance.setSaveOnBlur(false);
-      core.content = 'x';
-      core.size = 1;
-      bool closed = false;
-      await pumpViewer(tester, path: 'a.txt', onClose: () => closed = true);
-
-      await tester.enterText(find.byType(TextField), 'close-cancel');
-      await tester.pump();
-      await tester.tap(find.byTooltip('返回'));
-      await tester.pumpAndSettle();
-
-      expect(find.text('还有未保存的改动'), findsOneWidget);
-      await tester.tap(find.text('取消'));
-      await tester.pumpAndSettle();
-
-      expect(putsWith(core, 'close-cancel'), isEmpty);
-      expect(closed, isFalse);
-    });
   });
 
   /// 端到端：真文件面板 + 真分屏按钮（面板自己的缓冲接线，不只是源钉）
@@ -836,9 +801,9 @@ testWidgets('换文件（可编辑 → 只读）后行号槽仍在，滚动控�
       expect(find.byType(TextField), findsOneWidget);
       expect(find.text('alpha\nbeta\n'), findsOneWidget);
 
-      // 再用窗格自己的「返回」关掉**最后一个**窗格：列表清空也要能关
+      // 再用 tab 的 × 关掉**最后一个**文件：列表清空也要能关
       // （曾经 clamp(0, -1) 会抛 ArgumentError）
-      await tester.tap(find.byTooltip('返回'));
+      await tester.tap(find.byKey(const ValueKey<String>('file-tab-close-a.txt')));
       await settleIo(tester);
       expect(find.byType(TextField), findsNothing);
       expect(find.text('a.txt'), findsOneWidget, reason: '查看器关掉后回到文件树');
@@ -847,23 +812,27 @@ testWidgets('换文件（可编辑 → 只读）后行号槽仍在，滚动控�
 
   /// 用户 2026-10-19：「支持多文件同时存在（目前仅支持单文件+二分屏）」。
   group('文件面板的多文件（tab 条）', () {
-    Future<void> pumpTwoFiles(WidgetTester tester) async {
-      core.files = <Map<String, dynamic>>[
-        <String, dynamic>{
-          'name': 'a.txt',
-          'path': 'a.txt',
-          'type': 'file',
-          'size': 6,
-          'modified': '',
-        },
-        <String, dynamic>{
-          'name': 'b.txt',
-          'path': 'b.txt',
-          'type': 'file',
-          'size': 6,
-          'modified': '',
-        },
-      ];
+    Future<void> pumpTwoFiles(
+      WidgetTester tester, {
+      List<Map<String, dynamic>>? files,
+    }) async {
+      core.files = files ??
+          <Map<String, dynamic>>[
+            <String, dynamic>{
+              'name': 'a.txt',
+              'path': 'a.txt',
+              'type': 'file',
+              'size': 6,
+              'modified': '',
+            },
+            <String, dynamic>{
+              'name': 'b.txt',
+              'path': 'b.txt',
+              'type': 'file',
+              'size': 6,
+              'modified': '',
+            },
+          ];
       core.content = 'alpha\n';
       core.size = 6;
       await tester.pumpWidget(MaterialApp(
@@ -920,6 +889,124 @@ testWidgets('换文件（可编辑 → 只读）后行号槽仍在，滚动控�
       expect(tab('b.txt'), findsNothing);
       expect(find.byType(TextField), findsNothing);
       expect(find.text('a.txt'), findsOneWidget, reason: '回到文件树');
+    });
+
+    testWidgets('未保存的改动在 tab 上亮小圆点，保存后熄灭', (WidgetTester tester) async {
+      await pumpTwoFiles(tester);
+      await tester.tap(find.text('a.txt'));
+      await settleIo(tester);
+
+      Finder dot(String path) => find.descendant(
+            of: tab(path),
+            matching: find.byIcon(Icons.fiber_manual_record),
+          );
+      expect(dot('a.txt'), findsNothing);
+
+      await tester.enterText(find.byType(TextField), 'dirty\n');
+      await tester.pump();
+      expect(dot('a.txt'), findsOneWidget, reason: '旧头部状态行没了：未保存挂在 tab 上');
+
+      await pressCtrlS(tester);
+      await settleIo(tester);
+      expect(dot('a.txt'), findsNothing);
+    });
+
+    testWidgets('关 tab 先静默写回再关（开着失焦保存）', (WidgetTester tester) async {
+      await pumpTwoFiles(tester);
+      await tester.tap(find.text('a.txt'));
+      await settleIo(tester);
+
+      await tester.enterText(find.byType(TextField), 'close-save');
+      await tester.pump();
+      await tester.tap(tabClose('a.txt'));
+      await settleIo(tester);
+
+      expect(putsWith(core, 'close-save'), hasLength(1));
+      expect(tab('a.txt'), findsNothing);
+      expect(find.byType(TextField), findsNothing);
+    });
+
+    testWidgets('关掉失焦保存：关 tab 前问一次，选取消就不关',
+        (WidgetTester tester) async {
+      await EditorSettings.instance.setSaveOnBlur(false);
+      await pumpTwoFiles(tester);
+      await tester.tap(find.text('a.txt'));
+      await settleIo(tester);
+
+      await tester.enterText(find.byType(TextField), 'close-cancel');
+      await tester.pump();
+      await tester.tap(tabClose('a.txt'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('还有未保存的改动'), findsOneWidget);
+      await tester.tap(find.text('取消'));
+      await tester.pumpAndSettle();
+
+      expect(putsWith(core, 'close-cancel'), isEmpty);
+      expect(tab('a.txt'), findsOneWidget, reason: '取消了就别关');
+    });
+
+    testWidgets('右键 tab 弹菜单：切到源码 / 保存 / 重新加载 / 关闭都真做',
+        (WidgetTester tester) async {
+      await EditorSettings.instance.setSaveOnBlur(false);
+      await pumpTwoFiles(
+        tester,
+        files: <Map<String, dynamic>>[
+          <String, dynamic>{
+            'name': 'a.md',
+            'path': 'a.md',
+            'type': 'file',
+            'size': 10,
+            'modified': '',
+          },
+        ],
+      );
+      core.content = '# 标题\n\n正文';
+      core.size = core.content.length;
+      await tester.tap(find.text('a.md'));
+      await settleIo(tester);
+      expect(find.byKey(codeGutterKey), findsNothing, reason: 'Markdown 默认预览');
+
+      Future<void> openMenu() async {
+        await tester.tap(tab('a.md'), buttons: kSecondaryButton);
+        await tester.pumpAndSettle();
+      }
+
+      await openMenu();
+      expect(find.text('切到源码'), findsOneWidget);
+      expect(find.text('复制内容'), findsOneWidget);
+      expect(find.textContaining('重新加载'), findsOneWidget);
+      expect(find.text('下载'), findsOneWidget);
+      expect(find.text('关闭'), findsOneWidget);
+      expect(find.text('保存（Ctrl+S）'), findsNothing, reason: '没改动时不给保存项');
+
+      await tester.tap(find.text('切到源码'));
+      await tester.pumpAndSettle();
+      expect(find.byKey(codeGutterKey), findsOneWidget, reason: '切到源码就有行号槽');
+
+      // 改一下：菜单里出现「保存」，点它真发出 PUT
+      await tester.enterText(find.byType(TextField), '# 改过\n');
+      await tester.pump();
+      await openMenu();
+      expect(find.text('保存（Ctrl+S）'), findsOneWidget);
+      await tester.tap(find.text('保存（Ctrl+S）'));
+      await settleIo(tester);
+      expect(putsWith(core, '# 改过\n'), hasLength(1));
+
+      // 重新加载：改掉盘上内容后从菜单重读，回到盘上那份
+      core.content = '# 盘上新版';
+      core.size = core.content.length;
+      await openMenu();
+      await tester.tap(find.textContaining('重新加载'));
+      await settleIo(tester);
+      expect(find.text('# 盘上新版'), findsOneWidget);
+
+      // 关闭：从菜单关掉 tab，回到文件树
+      await openMenu();
+      await tester.tap(find.text('关闭'));
+      await settleIo(tester);
+      expect(tab('a.md'), findsNothing);
+      expect(find.byType(TextField), findsNothing);
     });
   });
 }

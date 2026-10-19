@@ -37,7 +37,7 @@ const String _sharedBufferNotice = '同一文件已在另一窗格打开：两�
 ///
 /// 点击文件时在**查看器**打开它：树与查看器**同屏**（左右分栏，比例默认 0.3，
 /// 太窄时按 [SplitPanes] 的既有口径降级成一次只显示一个）；没打开文件时树独占整个区域。
-/// 关闭查看器（tab 上的 × / 工具条 / 窗格的返回按钮）回到树独占。见 lib/README.md 不变量 16。
+/// 关闭查看器（tab 上的 × / tab 右键菜单 / 工具条）回到树独占。见 lib/README.md 不变量 16。
 ///
 /// **分屏是"一个文件一份文档、两个视图"**：两侧共用同一个
 /// [EditorBuffer]（同一个控制器 + 一份 dirty / saving / loadedSize），两边都能编辑、
@@ -282,6 +282,14 @@ class _FilePanelState extends State<FilePanel> {
     return _fileKeys[path]?.currentState;
   }
 
+  /// 活动窗格里挂载着的查看器 state（tab 右键菜单的预览/源码、复制、重新加载
+  /// 落在用户正看着的那一格；非活动文件没挂载查看器，没有这些动作）。
+  FileViewerState? get _activePaneState {
+    if (_activeFile == null) return null;
+    if (_split) return _splitKeys[_activePane.clamp(0, 1)].currentState;
+    return _fileKeys[_activeFile]?.currentState;
+  }
+
   /// 离开某个文件前把未保存内容处理掉（true = 可以离开）。
   ///
   /// 非活动文件没挂载查看器 ⇒ 未保存内容只留在它的缓冲里、不会因为切 tab 丢
@@ -371,17 +379,6 @@ class _FilePanelState extends State<FilePanel> {
     for (final EditorBuffer buffer in closing) {
       _releaseBuffer(buffer);
     }
-  }
-
-  /// 窗格上的「返回」：分屏时收掉这一格，单视图时关掉当前文件的 tab。
-  Future<void> _closePaneOrFile(int index) async {
-    if (_split) {
-      _unsplitViewer();
-      return;
-    }
-    final String? path = _activeFile;
-    if (path == null) return;
-    await _closeFile(path);
   }
 
   /// 当前文件的查看器是否在分屏里（两侧共享同一份缓冲 ⇒ 提示用户）
@@ -621,10 +618,12 @@ class _FilePanelState extends State<FilePanel> {
     );
   }
 
-  /// 一个文件 tab：图标 + 文件名 + 关闭。
+  /// 一个文件 tab：图标 + 文件名 + 未保存圆点 + 关闭；**右键**弹菜单——旧头部的
+  /// 文件级动作（预览/源码、复制、下载、重新加载、关闭）都收在这里。
   Widget _buildFileTab(ColorScheme cs, String path) {
     final bool active = path == _activeFile;
     final String name = path.isEmpty ? '未知文件' : path.split('/').last;
+    final EditorBuffer buffer = _buffers[path]!; // tab 开着 ⇔ 缓冲一定在
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 3, horizontal: 1),
       child: Material(
@@ -634,41 +633,56 @@ class _FilePanelState extends State<FilePanel> {
           key: ValueKey<String>('file-tab-$path'),
           borderRadius: BorderRadius.circular(5),
           onTap: () => _activateFile(path),
+          onSecondaryTapUp: (TapUpDetails details) =>
+              unawaited(_showTabMenu(path, details.globalPosition)),
           child: Padding(
             padding: const EdgeInsets.only(left: 8, right: 2),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: <Widget>[
-                Icon(
-                  Icons.description_outlined,
-                  size: 13,
-                  color: active ? cs.primary : cs.onSurfaceVariant,
-                ),
-                const SizedBox(width: 4),
-                Text(
-                  name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: active ? cs.onSurface : cs.onSurfaceVariant,
+            // 缓冲一变（打字 / 保存）就重建 tab：未保存的圆点要实时亮 / 熄
+            child: ListenableBuilder(
+              listenable: buffer,
+              builder: (BuildContext context, Widget? _) => Row(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Icon(
+                    Icons.description_outlined,
+                    size: 13,
+                    color: active ? cs.primary : cs.onSurfaceVariant,
                   ),
-                ),
-                const SizedBox(width: 2),
-                InkWell(
-                  key: ValueKey<String>('file-tab-close-$path'),
-                  borderRadius: BorderRadius.circular(9),
-                  onTap: () => unawaited(_closeFile(path)),
-                  child: Padding(
-                    padding: const EdgeInsets.all(3),
-                    child: Icon(
-                      Icons.close,
-                      size: 12,
-                      color: cs.onSurfaceVariant,
+                  const SizedBox(width: 4),
+                  Text(
+                    name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: active ? cs.onSurface : cs.onSurfaceVariant,
                     ),
                   ),
-                ),
-              ],
+                  // 未保存的改动：tab 上一颗小圆点（旧头部的状态行随头部一起去掉了）
+                  if (buffer.dirty) ...<Widget>[
+                    const SizedBox(width: 3),
+                    Icon(
+                      Icons.fiber_manual_record,
+                      size: 8,
+                      color: cs.primary,
+                    ),
+                  ],
+                  const SizedBox(width: 2),
+                  InkWell(
+                    key: ValueKey<String>('file-tab-close-$path'),
+                    borderRadius: BorderRadius.circular(9),
+                    onTap: () => unawaited(_closeFile(path)),
+                    child: Padding(
+                      padding: const EdgeInsets.all(3),
+                      child: Icon(
+                        Icons.close,
+                        size: 12,
+                        color: cs.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ),
@@ -683,6 +697,70 @@ class _FilePanelState extends State<FilePanel> {
       _activeFile = path;
       _activePane = 0;
     });
+  }
+
+  /// tab 右键菜单：旧头部退场后，文件级动作的入口（用户 2026-10-19：
+  /// 「相应功能右键标签」）。
+  ///
+  /// 预览/源码、复制、重新加载、保存要落在**挂载着的查看器 state** 上，只对活动
+  /// 文件给（非活动文件没挂载查看器）；下载与关闭对任何 tab 都可用。
+  Future<void> _showTabMenu(String path, Offset position) async {
+    final FileViewerState? state =
+        path == _activeFile ? _activePaneState : null;
+    final String? action = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        position.dx,
+        position.dy,
+      ),
+      items: <PopupMenuEntry<String>>[
+        if (state != null && state.isDirty)
+          const PopupMenuItem<String>(
+            value: 'save',
+            child: Text('保存（Ctrl+S）'),
+          ),
+        if (state != null && state.canTogglePreview)
+          PopupMenuItem<String>(
+            value: 'toggle',
+            child: Text(state.showingPreview ? '切到源码' : '切到预览'),
+          ),
+        if (state != null && state.canCopyContent)
+          const PopupMenuItem<String>(
+            value: 'copy',
+            child: Text('复制内容'),
+          ),
+        if (state != null && state.canReload)
+          const PopupMenuItem<String>(
+            value: 'reload',
+            child: Text('重新加载（放弃未保存的改动）'),
+          ),
+        const PopupMenuItem<String>(
+          value: 'download',
+          child: Text('下载'),
+        ),
+        const PopupMenuItem<String>(
+          value: 'close',
+          child: Text('关闭'),
+        ),
+      ],
+    );
+    if (action == null || !mounted) return;
+    switch (action) {
+      case 'save':
+        unawaited(state!.saveIfDirty());
+      case 'toggle':
+        state!.togglePreview();
+      case 'copy':
+        unawaited(state!.copyContent());
+      case 'reload':
+        unawaited(state!.reloadFromDisk());
+      case 'download':
+        unawaited(_handleDownload(path, false));
+      case 'close':
+        unawaited(_closeFile(path));
+    }
   }
 
   /// 窗格区：单视图铺满；分屏（同一个文件两个视图）交给 [SplitPanes]
@@ -724,7 +802,6 @@ class _FilePanelState extends State<FilePanel> {
       // 同一个文件的另一个视图共用这一份缓冲：就地编辑即同步（见 EditorBuffer）
       buffer: _buffers[path],
       paneNotice: _isDuplicateView ? _sharedBufferNotice : '',
-      onClose: () => unawaited(_closePaneOrFile(index)),
     );
     if (!_split) return viewer;
     return Stack(

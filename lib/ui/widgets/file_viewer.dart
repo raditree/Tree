@@ -111,7 +111,7 @@ const Key codeGutterKey = ValueKey<String>('code-gutter');
 ///
 /// 根据文件扩展名自动选择合适的查看方式：
 /// - 文本 / 源码：**按语言着色**（见 code_highlight.dart），纯文本可直接编辑并保存
-///   （Ctrl+S 或标题栏保存键；失焦 / 关窗格 / 换文件时自动保存，可在设置里关）
+///   （Ctrl+S 或文件 tab 右键菜单的「保存」；失焦 / 关窗格 / 换文件时自动保存，可在设置里关）
 /// - Markdown：源码 / 预览切换，预览支持基础语法渲染
 /// - SVG：源码 / 预览切换（预览暂显示提示与源码）
 /// - 图片：通过 base64 解码后用 Image.memory 显示
@@ -137,9 +137,6 @@ class FileViewer extends StatefulWidget {
   /// 文件相对路径
   final String filePath;
 
-  /// 返回回调（用于关闭查看器）
-  final VoidCallback? onClose;
-
   /// 外部强制只读（其它调用方与测试用；分屏**不再**用它锁第二个窗格）
   final bool readOnly;
 
@@ -163,7 +160,6 @@ class FileViewer extends StatefulWidget {
     this.teamId,
     this.teamName,
     required this.filePath,
-    this.onClose,
     this.readOnly = false,
     this.readOnlyReason = '',
     this.buffer,
@@ -223,6 +219,10 @@ class FileViewerState extends State<FileViewer> {
   /// 因此共用同一个滚动位置——各挂一个 Scrollable 迟早会不同步（惯性、夹取各跳各的）。
   final ScrollController _codeScroll = ScrollController();
 
+  /// 预览（Markdown / SVG）那一层的滚动控制器：桌面端滚动条要常驻，
+  /// 得有一条明确的控制器（见 [_buildMarkdownPreview]）。
+  final ScrollController _previewScroll = ScrollController();
+
   /// 是否有未保存的改动（共享：任一窗格改了，两边都是未保存态）
   bool get _dirty => _buf.dirty;
   set _dirty(bool value) => _buf.dirty = value;
@@ -240,9 +240,6 @@ class FileViewerState extends State<FileViewer> {
 
   /// 内容含 NUL ⇒ 二进制 ⇒ 只读
   bool _isBinary = false;
-
-  /// 上一次保存失败的可见原因（挂在标题栏状态行上，不指望用户看见 SnackBar）
-  String? _saveError;
 
   @override
   void initState() {
@@ -297,7 +294,6 @@ class FileViewerState extends State<FileViewer> {
     }
     // 只清**本窗格**自己的态：控制器 / dirty / saving / loadedSize 是共享缓冲的，
     // 新文档有它自己的那份（上面刚绑好）。
-    _saveError = null;
     _content = '';
     _truncated = false;
     _isBinary = false;
@@ -373,6 +369,7 @@ class FileViewerState extends State<FileViewer> {
     _ownBuf?.dispose();
     _editorFocus.dispose();
     _codeScroll.dispose();
+    _previewScroll.dispose();
     super.dispose();
   }
 
@@ -581,30 +578,20 @@ class FileViewerState extends State<FileViewer> {
 
   @override
   Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (BuildContext context, BoxConstraints constraints) {
-        // 窗格可能被左右分栏与窄面板压到 ~240px：头部动作键要据此收进「更多」菜单。
-        // 这是"这一刻的布局事实"，不是状态（不需要 setState，下一次布局重新算）。
-        _narrowHeader = constraints.maxWidth < 360;
-        return Container(
-          color: Theme.of(context).colorScheme.surface,
-          child: Column(
-            children: [
-              // 顶部标题栏
-              _buildHeader(),
-              Divider(
-                height: 1,
-                thickness: 1,
-                color: Theme.of(context).dividerColor,
-              ),
-              // 非阻断的窗格提示（同文件双开：说明两侧共享同一份缓冲，不挡编辑）
-              if (widget.paneNotice.isNotEmpty) _buildPaneNotice(),
-              // 内容区域
-              Expanded(child: _buildBody()),
-            ],
-          ),
-        );
-      },
+    // 用户 2026-10-19：「文件浏览页有一个标签了，旧的就可以去掉了（相应功能右键标签）」
+    // ——多文件 tab 条上已经有文件名，旧头部（文件名 / 路径 / 预览源码 / 复制 / 下载 /
+    // 刷新）整个退场：文件级动作改由文件面板的 **tab 右键菜单** 提供（file_panel 的
+    // _showTabMenu），本控件只负责把内容摆出来。
+    return Container(
+      color: Theme.of(context).colorScheme.surface,
+      child: Column(
+        children: [
+          // 非阻断的窗格提示（同文件双开：说明两侧共享同一份缓冲，不挡编辑）
+          if (widget.paneNotice.isNotEmpty) _buildPaneNotice(),
+          // 内容区域
+          Expanded(child: _buildBody()),
+        ],
+      ),
     );
   }
 
@@ -630,244 +617,49 @@ class FileViewerState extends State<FileViewer> {
     );
   }
 
-  /// 这一刻窗格有多窄（< 360px ⇒ 头部动作键收进「更多」菜单）。
+  /// ===== 文件 tab 右键菜单（file_panel）用的公开只读口 =====
   ///
-  /// 由 [build] 里的 `LayoutBuilder` 在布局时写入：左右分栏 + 窄面板会把单个窗格压到
-  /// ~240px，头部全摆出来必然溢出（黄黑条）。它是布局事实、不是状态，所以不走 setState。
-  bool _narrowHeader = false;
+  /// 旧头部退场后，预览/源码、复制、重新加载这些文件级动作挂在 tab 的右键菜单上
+  /// （file_panel 的 _showTabMenu）；菜单要按「此刻能不能做」取舍条目，就问这里。
+  /// 有没有未保存的改动（tab 上的脏点与「保存」菜单项都看它；改动本身在共享缓冲里）
+  bool get isDirty => _dirty;
 
-  /// 构建顶部标题栏
-  ///
-  /// 左侧：返回按钮 + 文件名（下行显示路径）；
-  /// 右侧：预览/源码切换（如适用）+ 复制按钮 + 下载按钮 + 刷新按钮。
-  Widget _buildHeader() {
+  /// 能不能切换预览/源码（Markdown / SVG，且加载成功）
+  bool get canTogglePreview {
+    if (_isLoading || _error != null) return false;
     final _FileType type = _fileType;
-    final cs = Theme.of(context).colorScheme;
-    final bool canToggle = type == _FileType.markdown || type == _FileType.svg;
-    final bool canCopy = !_isLoading && _error == null && _content.isNotEmpty;
-    final bool canRefresh = type != _FileType.pdf && type != _FileType.office;
-    return Container(
-      height: 56,
-      padding: const EdgeInsets.symmetric(horizontal: 8),
-      child: Row(
-        children: [
-          // 返回按钮（先把未保存内容处理掉再关）
-          if (widget.onClose != null)
-            _headerAction(
-              icon: Icons.arrow_back,
-              color: cs.onSurfaceVariant,
-              tooltip: '返回',
-              onPressed: () => unawaited(_handleClose()),
-            ),
-          // 文件名 + 语言标签 + 路径 / 状态
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Row(
-                  children: <Widget>[
-                    Flexible(
-                      child: Text(
-                        _fileName,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
-                          color: cs.onSurface,
-                        ),
-                      ),
-                    ),
-                    if (_showLanguageTag) ...<Widget>[
-                      const SizedBox(width: 6),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 5,
-                          vertical: 1,
-                        ),
-                        decoration: BoxDecoration(
-                          color: cs.primary.withValues(alpha: 0.12),
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        child: Text(
-                          _language.label,
-                          style: TextStyle(fontSize: 10, color: cs.primary),
-                        ),
-                      ),
-                    ],
-                    if (!_editableFile && !_isLoading) ...<Widget>[
-                      const SizedBox(width: 6),
-                      Tooltip(
-                        message: _readOnlyReason,
-                        child: Icon(
-                          Icons.lock_outline,
-                          size: 13,
-                          color: cs.outline,
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-                if (widget.filePath.isNotEmpty)
-                  Text(
-                    _subtitle,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: _saveError != null
-                          ? cs.error
-                          : (_dirty ? cs.primary : cs.outline),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          // 保存（有未保存改动时才可点，键位是 Ctrl+S）
-          if (_editor != null)
-            _headerAction(
-              icon: _dirty ? Icons.save : Icons.save_outlined,
-              color: _dirty ? cs.primary : cs.onSurfaceVariant,
-              tooltip: _dirty ? '保存（Ctrl+S）' : '没有未保存的改动',
-              onPressed:
-                  (_dirty && !_saving) ? () => unawaited(_save()) : null,
-            ),
-          // 预览 / 源码切换（窄窗格收进「更多」菜单）
-          if (canToggle && !_isLoading && _error == null && !_narrowHeader)
-            Padding(
-              padding: const EdgeInsets.only(right: 4),
-              child: _buildToggleButtons(),
-            ),
-          // 复制按钮（窄窗格收进「更多」菜单）
-          if (canCopy && !_narrowHeader)
-            _headerAction(
-              icon: Icons.copy,
-              color: cs.primary,
-              tooltip: '复制',
-              onPressed: _copyContent,
-            ),
-          // 下载按钮（窄窗格收进「更多」菜单）
-          if (!_narrowHeader)
-            _headerAction(
-              icon: Icons.download,
-              color: cs.onSurfaceVariant,
-              tooltip: '下载',
-              onPressed: _downloadFile,
-            ),
-          // 刷新按钮
-          if (canRefresh)
-            _headerAction(
-              icon: Icons.refresh,
-              color: cs.onSurfaceVariant,
-              tooltip: '刷新（重新读盘，放弃未保存的改动）',
-              onPressed:
-                  _isLoading ? null : () => unawaited(_loadContent(reload: true)),
-            ),
-          // 窄窗格：把刚才收起来的动作放进「更多」，一个都不丢
-          if (_narrowHeader)
-            PopupMenuButton<String>(
-              tooltip: '更多操作',
-              padding: EdgeInsets.zero,
-              icon: Icon(
-                Icons.more_vert,
-                size: 18,
-                color: cs.onSurfaceVariant,
-              ),
-              itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
-                if (canToggle && !_isLoading && _error == null)
-                  PopupMenuItem<String>(
-                    value: 'toggle',
-                    child: Text(_showPreview ? '切到源码' : '切到预览'),
-                  ),
-                if (canCopy)
-                  const PopupMenuItem<String>(
-                    value: 'copy',
-                    child: Text('复制'),
-                  ),
-                const PopupMenuItem<String>(
-                  value: 'download',
-                  child: Text('下载'),
-                ),
-              ],
-              onSelected: (String value) {
-                switch (value) {
-                  case 'toggle':
-                    setState(() => _showPreview = !_showPreview);
-                  case 'copy':
-                    _copyContent();
-                  case 'download':
-                    _downloadFile();
-                }
-              },
-            ),
-        ],
-      ),
-    );
+    return type == _FileType.markdown || type == _FileType.svg;
   }
 
-  /// 头部动作键：统一压成紧凑尺寸。
-  ///
-  /// 为什么：默认 `IconButton` 是 48×48，头部最多会摆 6 颗（返回 / 保存 / 复制 / 下载 /
-  /// 刷新 + 切换组）——窗格被左右分栏与窄面板压到 ~240px 时必然溢出（黄黑条）。
-  Widget _headerAction({
-    required IconData icon,
-    required String tooltip,
-    required VoidCallback? onPressed,
-    Color? color,
-  }) => IconButton(
-    icon: Icon(icon, size: 18),
-    tooltip: tooltip,
-    color: color,
-    visualDensity: VisualDensity.compact,
-    padding: const EdgeInsets.all(4),
-    constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-    onPressed: onPressed,
-  );
+  /// 当前是不是预览态（决定菜单写「切到源码」还是「切到预览」）
+  bool get showingPreview => _showPreview;
 
-  /// 构建预览 / 源码切换按钮组
-  Widget _buildToggleButtons() {
-    return Container(
-      decoration: BoxDecoration(
-        color: Theme.of(context).scaffoldBackgroundColor,
-        borderRadius: BorderRadius.circular(6),
-      ),
-      padding: const EdgeInsets.all(2),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          _buildToggleChip('预览', _showPreview, () {
-            if (!_showPreview) setState(() => _showPreview = true);
-          }),
-          _buildToggleChip('源码', !_showPreview, () {
-            if (_showPreview) setState(() => _showPreview = false);
-          }),
-        ],
-      ),
-    );
+  /// 现在有没有内容可复制
+  bool get canCopyContent =>
+      !_isLoading && _error == null && _content.isNotEmpty;
+
+  /// 能不能重新读盘（PDF / Office 没有源码可重读）
+  bool get canReload =>
+      _fileType != _FileType.pdf &&
+      _fileType != _FileType.office &&
+      !_isLoading;
+
+  /// 切预览/源码（仅 Markdown / SVG；不能切时不动）
+  void togglePreview() {
+    if (!canTogglePreview) return;
+    setState(() => _showPreview = !_showPreview);
   }
 
-  /// 构建单个切换标签
-  Widget _buildToggleChip(String label, bool active, VoidCallback onTap) {
-    final cs = Theme.of(context).colorScheme;
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-        decoration: BoxDecoration(
-          color: active ? cs.surface : Colors.transparent,
-          borderRadius: BorderRadius.circular(4),
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            fontSize: 11,
-            fontWeight: FontWeight.w600,
-            color: active ? cs.primary : cs.onSurfaceVariant,
-          ),
-        ),
-      ),
-    );
+  /// 复制全文到剪贴板（tab 右键菜单入口）
+  Future<void> copyContent() => _copyContent();
+
+  /// 重新读盘，放弃未保存的改动（tab 右键菜单入口；与旧头部「刷新」同一语义）
+  Future<void> reloadFromDisk() => _loadContent(reload: true);
+
+  /// 有未保存的改动就保存（tab 右键菜单入口）
+  Future<bool> saveIfDirty() async {
+    if (!_dirty) return true;
+    return _save();
   }
 
   /// 构建内容主体
@@ -900,23 +692,6 @@ class FileViewerState extends State<FileViewer> {
 
   /// 着色语言（按扩展名；认不出来是纯文本语言，不着色）
   CodeLanguage get _language => languageForPath(widget.filePath);
-
-  /// 标题栏要不要显示语言标签：认得出语言、且这个类型确实走代码视图
-  bool get _showLanguageTag {
-    if (_language.id == 'plain') return false;
-    switch (_fileType) {
-      case _FileType.image:
-      case _FileType.pdf:
-      case _FileType.office:
-        return false;
-      case _FileType.markdown:
-      case _FileType.svg:
-        return !_showPreview;
-      case _FileType.text:
-      case _FileType.unknown:
-        return true;
-    }
-  }
 
   /// 这个文件**允许**编辑吗：只看类型与内容特征，不看控制器是否就绪。
   ///
@@ -993,15 +768,7 @@ class FileViewerState extends State<FileViewer> {
     }
     if (!reload) return;
     open.text = _content;
-    _saveError = null;
     _buf.dirty = false;
-  }
-
-  /// 标题栏副标题：优先报「保存失败 / 未保存」，否则给路径
-  String get _subtitle {
-    if (_saveError != null) return '保存失败：$_saveError';
-    if (_dirty) return '未保存的改动 · ${widget.filePath}';
-    return widget.filePath;
   }
 
   /// Ctrl/Cmd+S 保存；其它按键一律不拦（回车、Tab、撤销都留给文本域自己）
@@ -1030,11 +797,6 @@ class FileViewerState extends State<FileViewer> {
     if (!_dirty && !force) return true;
     final String content = editor.text;
     _saving = true;
-    if (mounted) {
-      setState(() {
-        _saveError = null;
-      });
-    }
     try {
       final int written = await ApiService.saveFileContent(
         widget.workspaceId,
@@ -1069,12 +831,9 @@ class FileViewerState extends State<FileViewer> {
     } catch (error) {
       _saving = false;
       final String reason = error.toString().replaceFirst('Exception: ', '');
-      if (mounted) {
-        setState(() {
-          _saveError = reason;
-        });
-      }
-      if (!silent) _toast('保存失败：$reason');
+      // 旧头部的状态行没了：失败原因只剩 SnackBar，静默自动保存失败也要让人看见
+      if (mounted) setState(() {});
+      _toast('保存失败：$reason');
       return false;
     }
   }
@@ -1139,14 +898,6 @@ class FileViewerState extends State<FileViewer> {
     );
     if (choice == 'save') return _save();
     return choice == 'discard';
-  }
-
-  /// 返回：先把未保存内容处理掉再关（开着失焦保存就静默写回）
-  Future<void> _handleClose() async {
-    final VoidCallback? onClose = widget.onClose;
-    if (onClose == null) return;
-    final bool canLeave = await confirmLeave();
-    if (canLeave && mounted) onClose();
   }
 
   /// dispose 里的静默补写：不能 setState、不需要回报。
@@ -1335,31 +1086,36 @@ class FileViewerState extends State<FileViewer> {
     TextStyle baseStyle,
     CodeEditingController editor,
   ) {
-    return Focus(
-      onKeyEvent: _handleEditorKey,
-      child: TextField(
-        controller: editor,
-        focusNode: _editorFocus,
-        // 行号槽跟着这一条平移（见 [_CodeGutter]）：不能再挂第二个 Scrollable
-        scrollController: _codeScroll,
-        maxLines: null,
-        expands: true,
-        textAlignVertical: TextAlignVertical.top,
-        style: baseStyle,
-        cursorColor: cs.primary,
-        // 编辑器自己的框由外层窗格画；这里必须显式清掉主题的 enabled/focused 边框
-        // （只写 border: none 会被 inputDecorationTheme 覆盖回来，见 input_style.dart）
-        decoration: kBorderlessInput.copyWith(
-          isDense: true,
-          contentPadding: const EdgeInsets.all(kCodeViewPadding),
+    // 桌面端常驻滚动条：正文长了能一眼看到还有多少（滚动条不占布局宽，行号度量不变）
+    return Scrollbar(
+      controller: _codeScroll,
+      thumbVisibility: true,
+      child: Focus(
+        onKeyEvent: _handleEditorKey,
+        child: TextField(
+          controller: editor,
+          focusNode: _editorFocus,
+          // 行号槽跟着这一条平移（见 [_CodeGutter]）：不能再挂第二个 Scrollable
+          scrollController: _codeScroll,
+          maxLines: null,
+          expands: true,
+          textAlignVertical: TextAlignVertical.top,
+          style: baseStyle,
+          cursorColor: cs.primary,
+          // 编辑器自己的框由外层窗格画；这里必须显式清掉主题的 enabled/focused 边框
+          // （只写 border: none 会被 inputDecorationTheme 覆盖回来，见 input_style.dart）
+          decoration: kBorderlessInput.copyWith(
+            isDense: true,
+            contentPadding: const EdgeInsets.all(kCodeViewPadding),
+          ),
+          onChanged: (String _) {
+            if (!_dirty) {
+              setState(() {
+                _dirty = true;
+              });
+            }
+          },
         ),
-        onChanged: (String _) {
-          if (!_dirty) {
-            setState(() {
-              _dirty = true;
-            });
-          }
-        },
       ),
     );
   }
@@ -1377,10 +1133,14 @@ class FileViewerState extends State<FileViewer> {
             baseStyle: baseStyle,
           )
         : TextSpan(style: baseStyle, text: _content);
-    return SingleChildScrollView(
+    return Scrollbar(
       controller: _codeScroll,
-      padding: const EdgeInsets.all(kCodeViewPadding),
-      child: SelectableText.rich(span),
+      thumbVisibility: true,
+      child: SingleChildScrollView(
+        controller: _codeScroll,
+        padding: const EdgeInsets.all(kCodeViewPadding),
+        child: SelectableText.rich(span),
+      ),
     );
   }
 
@@ -1443,29 +1203,36 @@ class FileViewerState extends State<FileViewer> {
       );
     }
     final ColorScheme cs = Theme.of(context).colorScheme;
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(16),
-      child: MarkdownBody(
-        data: _content,
-        // 可框选复制：与中栏消息同一种口径（跨段落复制走「复制全文」在外层）
-        selectable: true,
-        styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
-          p: TextStyle(fontSize: 14, height: 1.6, color: cs.onSurface),
-          // 代码块 / 行内代码给一层可辨的底色，别跟面板底色混成一团
-          code: TextStyle(
-            fontSize: 12.5,
-            fontFamily: 'monospace',
-            backgroundColor: cs.surfaceContainerHighest,
-            color: cs.onSurface,
-          ),
-          codeblockDecoration: BoxDecoration(
-            color: cs.surfaceContainerHighest,
-            borderRadius: BorderRadius.circular(6),
-            border: Border.all(color: cs.outlineVariant),
-          ),
-          blockquoteDecoration: BoxDecoration(
-            color: cs.surfaceContainerHighest,
-            border: Border(left: BorderSide(color: cs.primary, width: 3)),
+    // 用户 2026-10-19：「还有这个为什么又没给滑动条」——桌面端滚动条不自动常驻，
+    // 预览这里显式包一条（与 tab 条 / 只读正文同一口径）。
+    return Scrollbar(
+      controller: _previewScroll,
+      thumbVisibility: true,
+      child: SingleChildScrollView(
+        controller: _previewScroll,
+        padding: const EdgeInsets.all(16),
+        child: MarkdownBody(
+          data: _content,
+          // 可框选复制：与中栏消息同一种口径（跨段落复制走「复制全文」在外层）
+          selectable: true,
+          styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
+            p: TextStyle(fontSize: 14, height: 1.6, color: cs.onSurface),
+            // 代码块 / 行内代码给一层可辨的底色，别跟面板底色混成一团
+            code: TextStyle(
+              fontSize: 12.5,
+              fontFamily: 'monospace',
+              backgroundColor: cs.surfaceContainerHighest,
+              color: cs.onSurface,
+            ),
+            codeblockDecoration: BoxDecoration(
+              color: cs.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(color: cs.outlineVariant),
+            ),
+            blockquoteDecoration: BoxDecoration(
+              color: cs.surfaceContainerHighest,
+              border: Border(left: BorderSide(color: cs.primary, width: 3)),
+            ),
           ),
         ),
       ),
@@ -1474,42 +1241,48 @@ class FileViewerState extends State<FileViewer> {
 
   /// SVG 预览视图（暂显示提示 + 源码）
   Widget _buildSvgPreview() {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: const Color(0xFFFEF3C7),
-              borderRadius: BorderRadius.circular(6),
-              border: Border.all(color: const Color(0xFFF59E0B), width: 1),
-            ),
-            child: Row(
-              children: const [
-                Icon(Icons.info_outline, size: 16, color: Color(0xFFF59E0B)),
-                SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    'SVG 预览需要 svg 包支持，当前显示源码',
-                    style: TextStyle(fontSize: 12, color: Color(0xFF92400E)),
+    // 同 Markdown 预览：桌面端显式给一条常驻滚动条
+    return Scrollbar(
+      controller: _previewScroll,
+      thumbVisibility: true,
+      child: SingleChildScrollView(
+        controller: _previewScroll,
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFFFEF3C7),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: const Color(0xFFF59E0B), width: 1),
+              ),
+              child: Row(
+                children: const [
+                  Icon(Icons.info_outline, size: 16, color: Color(0xFFF59E0B)),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'SVG 预览需要 svg 包支持，当前显示源码',
+                      style: TextStyle(fontSize: 12, color: Color(0xFF92400E)),
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
-          const SizedBox(height: 12),
-          SelectableText(
-            _content,
-            style: TextStyle(
-              fontSize: 13,
-              height: 1.5,
-              fontFamily: 'monospace',
-              color: Theme.of(context).colorScheme.onSurface,
+            const SizedBox(height: 12),
+            SelectableText(
+              _content,
+              style: TextStyle(
+                fontSize: 13,
+                height: 1.5,
+                fontFamily: 'monospace',
+                color: Theme.of(context).colorScheme.onSurface,
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
