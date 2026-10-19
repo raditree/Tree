@@ -18,6 +18,7 @@
 4. 四条模板共享同一段**第 0 步**（动手前先跟用户对齐语义）——做成共享常量而不是抄进每条正文，否则改三处漏一处。
 5. `plugin-creator` 规范有**副作用**：选中它时由核心把插件开发指南原件播种到 `.self/docs/plugin-development.md`（工作空间类工具读不到应用目录 / 仓库里的原件，而正文里那句"读指南"就执行不了）。原则是**文档只有一份真相源**：模板是内嵌常量、随附文档是磁盘原件，核心只负责搬运；原件缺失时如实回报 `action: missing` + **探过的目录**，由规范正文的兜底流程接住（向用户索取原件），不静默、不假装成功。
 6. 播种路径 [plugin_guide.dart](../plugin/plugin_guide.dart) 的 `kPluginGuideWorkspacePath` 与前端 `PluginDocs` 认的**专有文件名**必须一致（它不用泛化的 `README.md`，避免把用户送到一份无关文档上）。
+7. **内置模板的 front matter `changelog:` 至多 3 条**——模板是给人读的样例，不是审计台账；更早的版本演进看 git 历史，改内置 changelog 时同步遵守上限。约定**只约束内置模板**：`spec update` 写自定义 spec 的 changelog 仍按现状逐条 prepend（用户文件，不由核心裁长度）。
 
 ## 测试
 
