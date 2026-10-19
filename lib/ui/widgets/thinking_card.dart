@@ -76,7 +76,6 @@ class _ThinkingCardState extends State<ThinkingCard> {
                         style: TextStyle(
                           fontSize: 12.5,
                           color: cs.onSurfaceVariant,
-                          fontStyle: FontStyle.italic,
                         ),
                       ),
                     ),

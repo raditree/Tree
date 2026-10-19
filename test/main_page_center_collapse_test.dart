@@ -224,4 +224,46 @@ void main() {
         reason: '折叠键由宿主（三栏布局）注入，独立使用时不出现');
     expect(tester.takeException(), isNull);
   });
+
+  // ── 用户 2026-10-19：窗口尺寸过小时右栏自动折叠，省手动点折叠键 ──────────
+
+  testWidgets('⑧ 窗口缩窄越过阈值：右栏自动折叠；恢复够宽自动展开',
+      (WidgetTester tester) async {
+    await pumpMainPage(tester);
+    expect(paneWidth(tester, 'right'), rightInit);
+
+    // 缩到 1050（仍在最小 1024 之上、低于 1120 阈值）：**跨越**阈值那一下替用户把右栏收起
+    tester.view.physicalSize = const Size(1050, 900);
+    await tester.pump();
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    expect(paneWidth(tester, 'right'), collapsed,
+        reason: '窗口太窄 ⇒ 右栏自动折叠，不用手动点');
+
+    // 恢复到 1400（> 阈值）：这次是"因它自己收的"，自动展开
+    tester.view.physicalSize = const Size(1400, 900);
+    await tester.pump();
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    expect(paneWidth(tester, 'right'), rightInit,
+        reason: '窗口恢复 ⇒ 自动展开，宽度状态没被改掉');
+  });
+
+  testWidgets('⑨ 用户自己折叠的右栏，窗口变宽也不被自动拽开',
+      (WidgetTester tester) async {
+    await pumpMainPage(tester);
+    await collapseRight(tester);
+    expect(paneWidth(tester, 'right'), collapsed);
+
+    tester.view.physicalSize = const Size(1050, 900);
+    await tester.pump();
+    await tester.pumpAndSettle();
+    expect(paneWidth(tester, 'right'), collapsed);
+
+    tester.view.physicalSize = const Size(1400, 900);
+    await tester.pump();
+    await tester.pumpAndSettle();
+    expect(paneWidth(tester, 'right'), collapsed,
+        reason: '用户自己收的，窗口变宽不自动展开（尊重手动选择）');
+  });
 }

@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:tree/ui/models/message.dart';
 import 'package:tree/ui/widgets/message_list.dart';
+import 'package:tree/ui/widgets/thinking_card.dart';
 
 /// 消息流的排版口径（[lib/README.md](../lib/README.md) 不变量 11）：
 /// 模型消息是**高亮块**（左侧主色竖条 + 极淡同色底，没有整圈边框），
@@ -80,5 +81,32 @@ void main() {
     ]);
 
     expect(find.textContaining('加粗', findRichText: true), findsOneWidget);
+  });
+
+  testWidgets('思考行摘要不是斜体（与工具调用条一致）', (WidgetTester tester) async {
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: ListView(
+          children: <Widget>[
+            ThinkingCard(
+              message: textMessage(
+                id: 'k1',
+                role: 'assistant',
+                content: '先看看 team 的字段，再决定怎么改',
+              ),
+            ),
+          ],
+        ),
+      ),
+    ));
+
+    final Text summary = tester.widget<Text>(
+      find.text('先看看 team 的字段，再决定怎么改'),
+    );
+    expect(
+      summary.style?.fontStyle,
+      isNot(FontStyle.italic),
+      reason: '思考摘要不斜体（用户 2026-10-19：与工具调用条的字重/样式一致）',
+    );
   });
 }

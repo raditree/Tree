@@ -147,21 +147,35 @@ void main() {
     expect(find.byType(FileTree), findsOneWidget);
   });
 
-  testWidgets('分屏后（查看器内部两格）在树里点另一个文件：落到**活动窗格**', (
+  testWidgets('打开多个文件各自成 tab；点目录里的文件只切当前文件，不顶掉别的', (
     WidgetTester tester,
   ) async {
     await pumpPanel(tester);
     await openFile(tester, 'a.txt');
+    expect(panePaths(tester), <String>['a.txt']);
 
+    // 再开 b.md：两个 tab **并存**，当前是 b.md（用户 2026-10-19：支持多文件同时存在）
+    await openFile(tester, 'b.md');
+    expect(panePaths(tester), <String>['b.md']);
+    expect(
+      find.byKey(const ValueKey<String>('file-tab-a.txt')),
+      findsOneWidget,
+      reason: '开第二个文件不顶掉第一个',
+    );
+    expect(find.byKey(const ValueKey<String>('file-tab-b.md')), findsOneWidget);
+
+    // 点 a.txt 的 tab：切回 a.txt，b.md 的 tab 还在
+    await tester.tap(find.byKey(const ValueKey<String>('file-tab-a.txt')));
+    await settleIo(tester);
+    expect(panePaths(tester), <String>['a.txt']);
+    expect(find.byKey(const ValueKey<String>('file-tab-b.md')), findsOneWidget);
+
+    // 分屏是**当前文件**的第二个视图：两格都看 a.txt（同一个缓冲）
     await tester.tap(
       find.byTooltip('分屏：同一个文件再开一个窗格（两侧共享同一份缓冲）'),
     );
     await settleIo(tester);
     expect(panePaths(tester), <String>['a.txt', 'a.txt']);
-
-    // 目录在左边且可点：换的是活动窗格（第二个），第一个不动
-    await openFile(tester, 'b.md');
-    expect(panePaths(tester), <String>['a.txt', 'b.md']);
   });
 
   testWidgets('打开文件后在树里**重命名**它：窗格路径跟着改并按新路径重拉', (

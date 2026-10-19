@@ -144,25 +144,23 @@ void main() {
         File('lib/ui/widgets/file_panel.dart').readAsStringSync();
 
     test('窗格状态、动作与 SplitPanes 都在', () {
-      expect(panel.contains('final List<String> _viewerPaths'), isTrue);
-      expect(panel.contains('final List<EditorBuffer> _viewerBuffers'), isTrue);
+      // 用户 2026-10-19：多文件 tab（_openFiles）+ 分屏（_split）替换了旧的
+      // 「_viewerPaths 最多两项」模型
+      expect(panel.contains('final List<String> _openFiles'), isTrue);
+      expect(panel.contains('final Map<String, EditorBuffer> _buffers'), isTrue);
       expect(panel.contains('void _splitViewer()'), isTrue);
-      expect(panel.contains('Future<void> _closePane(int index)'), isTrue);
+      expect(panel.contains('void _unsplitViewer()'), isTrue);
       expect(panel.contains('Future<void> _closeViewer()'), isTrue);
-      expect(panel.contains('bool _isDuplicatePane(int index)'), isTrue);
+      expect(panel.contains('bool get _isDuplicateView'), isTrue);
       expect(panel.contains('return SplitPanes('), isTrue);
     });
 
-    test('换文件 / 关窗格前先处理未保存内容；同文件双开共享同一份缓冲', () {
-      expect(panel.contains('await _confirmLeave(index)'), isTrue);
-      // 同文件双开：新窗格复用**同一个** EditorBuffer 实例，而不是又开一份
-      expect(
-        panel.contains('_viewerBuffers.add(_viewerBuffers[_activePane])'),
-        isTrue,
-      );
-      expect(panel.contains('buffer: _viewerBuffers[index]'), isTrue);
-      expect(panel.contains('readOnly: duplicated'), isFalse,
-          reason: '同文件双开不再是只读的理由（旧口径已被推翻）');
+    test('关 tab 前先处理未保存内容；分屏两侧共享同一份缓冲', () {
+      expect(panel.contains('await _confirmLeavePath(path)'), isTrue);
+      // 分屏：两侧都按**路径**取同一个 EditorBuffer 实例，不是各开一份
+      expect(panel.contains('buffer: _buffers[path]'), isTrue);
+      expect(panel.contains('readOnly:'), isFalse,
+          reason: '共享同一份缓冲就不再是只读的理由（旧口径已被推翻）');
       expect(
         panel.contains('同一文件已在另一窗格打开：两侧共享同一份缓冲'),
         isTrue,
@@ -171,7 +169,7 @@ void main() {
       expect(
         panel.contains('void _releaseBuffer(EditorBuffer buffer)'),
         isTrue,
-        reason: '没有窗格再引用才释放，不能把另一个窗格在用的控制器 dispose 掉',
+        reason: '没有 tab 再引用才释放，不能把另一个视图在用的控制器 dispose 掉',
       );
     });
   });

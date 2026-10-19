@@ -87,6 +87,30 @@
     `test/tool_row_detail_test.dart`（源钉：FilePanel 无顶层页签 / 详情是窗口且带工作空间 /
     选中自动开窗 + 右栏收着就展开）、`test/main_page_center_collapse_test.dart`（折叠键改到窗口顶栏）。
 
+- **右栏窗口化试用反馈第二批（用户 2026-10-19，六条）**（**修改** [lib/README.md](lib/README.md)
+  不变量 16 ⑧/⑩ 与不变量 28；[lib/ui/widgets/right_panel_host.dart](lib/ui/widgets/right_panel_host.dart)、
+  [lib/ui/widgets/file_panel.dart](lib/ui/widgets/file_panel.dart)、[lib/ui/widgets/file_viewer.dart](lib/ui/widgets/file_viewer.dart)、
+  [lib/ui/widgets/thinking_card.dart](lib/ui/widgets/thinking_card.dart)、[lib/ui/pages/main_page.dart](lib/ui/pages/main_page.dart)）：
+  - **窗口 chip 行常显横向滑动条**（`right-panel-chip-scrollbar`），鼠标滚轮竖直滚动**映射成横向翻页**——
+    开的窗口多了也不会把后面的 chip 与关闭键顶出视野；**chip 字重跟随界面字重设置**（从 `DefaultTextStyle`
+    派生，不再写死 w400/w600）——用户：「窗口标签栏被挡住了，需增加滑动条。而且窗口文字粗细似乎不受设置影响」；
+  - **「文件」窗支持多文件同时存在**（tab 条）：打开的文件排成 tab，点树 / 点 tab 都能切；一个文档一份
+    `EditorBuffer`，切 tab 不丢改动，没有 tab 再引用才释放；**分屏仍是"当前文件再开一个视图"**（两侧共享同一
+    缓冲）——推翻旧的"单文件 + 最多两个窗格"模型（用户：「支持多文件同时存在（目前仅支持单文件+二分屏）」）；
+  - **「Git 历史」/「Todo」从文件窗移出、各归一独立窗口**（右栏内置窗口 7 → 9 个）（用户：「移除文件浏览
+    窗口内的 git 与 todo」「增加 todo 的单独窗口」）；
+  - **窗口尺寸过窄时右栏自动折叠**（可用宽度跨越 **1120px** 阈值那一下动作）：变窄自动收、变宽只对**自动收的**
+    自动展开，用户手动收的不抢着开（用户：「窗口尺寸过小时自动折叠」）；
+  - **「文件」窗的 markdown 预览改用真渲染器**（`flutter_markdown_plus` 的 `MarkdownBody`，与中栏消息同源；
+    删掉自绘 `_MarkdownRenderer`）：代码块 / 表格 / 引用等内置块正常渲染（用户：「内置代码块、表格等无法正常渲染」）；
+  - **思考条摘要去斜体**，与工具调用条一致（用户：「思考条目上的文字是斜体，改为与其他工具调用条一致」）。
+  - 用例：`test/right_panel_host_test.dart`（chip 行常显滑动条 + 滚轮横向翻、chip 字重跟随主题）、
+    `test/main_page_center_collapse_test.dart`（缩窄跨阈值右栏自动折叠 / 恢复自动展开 / 手动收的不被自动打开）、
+    `test/file_editor_test.dart` 与 `test/file_tree_viewer_sync_test.dart`（多文件 tab：切 tab 不丢内容、关一个还有别的）、
+    `test/split_panes_test.dart`（源钉：`_openFiles` / `_buffers` / 分屏是同文件第二视图 / `_releaseBuffer`）、
+    `test/tool_row_detail_test.dart`（源钉：文件窗无 Git/Todo 子 Tab、git/todo 独立窗口、chip 滑动条、真 markdown 渲染器）、
+    `test/message_stream_style_test.dart`（思考条不斜体）。
+
 ## [1.0.4+2] — 2026-10-18
 
 ### 断言变化（新增 / 修改的 README 不变量）

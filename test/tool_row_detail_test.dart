@@ -643,9 +643,52 @@ void main() {
       expect(panel.contains('_tabController'), isFalse,
           reason: '顶层页签已撤，改由 RightPanelHost 的窗口 chip 承担');
       expect(panel.contains("const Tab(text: '详情')"), isFalse);
-      // 文件区自己的子 Tab 仍在
-      expect(panel.contains("Tab(text: 'Git 历史')"), isTrue);
-      expect(panel.contains("Tab(text: 'Todo')"), isTrue);
+      // 用户 2026-10-19：Git 历史 / Todo 也从文件窗移出，各自成窗（见下一条用例）；
+      // 文件窗只留"看文件"这一件事，TickerProvider + TabController 一并撤掉。
+      expect(panel.contains("Tab(text: 'Git 历史')"), isFalse);
+      expect(panel.contains("Tab(text: 'Todo')"), isFalse);
+      expect(panel.contains('TabBar'), isFalse);
+    });
+
+    test('Git 历史 / Todo 改成独立窗口，文件窗里没有它们', () {
+      // 用户 2026-10-19：「移除文件浏览窗口内的 git 与 todo」「增加 todo 的单独窗口」
+      expect(page.contains("id: 'git'"), isTrue);
+      expect(page.contains("id: 'todo'"), isTrue);
+      expect(page.contains('GitHistory('), isTrue);
+      expect(page.contains('TodoPanel('), isTrue);
+      // 文件窗不再透传 git/todo 刷新触发（它们各归自己的窗口）
+      expect(panel.contains('gitRefreshTrigger'), isFalse);
+      expect(panel.contains('todoRefreshTrigger'), isFalse);
+    });
+
+    test('文件窗支持多文件（tab 条），分屏仍是同一文件的第二个视图', () {
+      // 用户 2026-10-19：「支持多文件同时存在（目前仅支持单文件+二分屏）」
+      expect(panel.contains('_openFiles'), isTrue);
+      expect(panel.contains('_buildFileTabStrip'), isTrue);
+      expect(panel.contains("ValueKey<String>('file-tab-"), isTrue);
+      // 分屏两侧看同一个文件：一个路径一份缓冲 ⇒ 两个视图共用一个实例
+      expect(panel.contains('_buffers[path]'), isTrue);
+    });
+
+    test('右栏窗口标签：常显滑动条，且字重跟随主题（不再写死）', () {
+      // 用户 2026-10-19：「窗口标签栏被挡住，需增加滑动条」「文字粗细不受设置影响」
+      expect(
+        host.contains("ValueKey<String>('right-panel-chip-scrollbar')"),
+        isTrue,
+      );
+      expect(host.contains('thumbVisibility: true'), isTrue);
+      expect(host.contains('_bumpWeight'), isTrue,
+          reason: 'chip 字重取主题字重 +1 档，才会跟着「界面字重」设置走');
+    });
+
+    test('文件预览改用真 markdown 渲染器（代码块 / 表格都能画）', () {
+      // 用户 2026-10-19：「内置代码块、表格等无法正常渲染」
+      final String viewer =
+          File('lib/ui/widgets/file_viewer.dart').readAsStringSync();
+      expect(viewer.contains('MarkdownBody('), isTrue);
+      expect(viewer.contains('class _MarkdownRenderer'), isFalse,
+          reason: '自绘渲染器不认表格，已删除');
+      expect(viewer.contains('codeblockDecoration'), isTrue);
     });
 
     test('「详情」是一个窗口，且排在「正在执行的 tool」之后', () {

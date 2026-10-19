@@ -6,6 +6,7 @@ import 'dart:math' as math;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
 import '../../io/api_service.dart';
 import '../../io/platform_support.dart';
@@ -1423,6 +1424,12 @@ class FileViewerState extends State<FileViewer> {
   }
 
   /// Markdown 预览视图
+  ///
+  /// 用户 2026-10-19：原先这里挂的是自绘的 [_MarkdownRenderer]，只认"标题 / 列表 /
+  /// 引用 / 行内强调"这几样，**代码块画出来跟正文没区别（底色取的就是面板底色）、
+  /// 表格整段当普通段落显示**。改用与中栏消息同源的 flutter_markdown_plus
+  /// （[MarkdownBody]）：代码块 / 表格 / 任务列表 / 嵌套列表都按 GitHub 口径渲染，
+  /// 一份渲染器、两处复用，也不会再各自漂移。
   Widget _buildMarkdownPreview() {
     if (_content.isEmpty) {
       return Center(
@@ -1435,9 +1442,33 @@ class FileViewerState extends State<FileViewer> {
         ),
       );
     }
+    final ColorScheme cs = Theme.of(context).colorScheme;
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
-      child: _MarkdownRenderer(source: _content),
+      child: MarkdownBody(
+        data: _content,
+        // 可框选复制：与中栏消息同一种口径（跨段落复制走「复制全文」在外层）
+        selectable: true,
+        styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
+          p: TextStyle(fontSize: 14, height: 1.6, color: cs.onSurface),
+          // 代码块 / 行内代码给一层可辨的底色，别跟面板底色混成一团
+          code: TextStyle(
+            fontSize: 12.5,
+            fontFamily: 'monospace',
+            backgroundColor: cs.surfaceContainerHighest,
+            color: cs.onSurface,
+          ),
+          codeblockDecoration: BoxDecoration(
+            color: cs.surfaceContainerHighest,
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(color: cs.outlineVariant),
+          ),
+          blockquoteDecoration: BoxDecoration(
+            color: cs.surfaceContainerHighest,
+            border: Border(left: BorderSide(color: cs.primary, width: 3)),
+          ),
+        ),
+      ),
     );
   }
 
@@ -1797,295 +1828,3 @@ class _CodeGutterState extends State<_CodeGutter> {
   }
 }
 
-/// Markdown 简单渲染器
-///
-/// 解析以下 markdown 元素并渲染：
-/// - `#` ~ `###`：标题（不同字号）
-/// - `**text**`：加粗
-/// - `*text*`：斜体
-/// - `` `code` ``：行内代码（等宽字体 + 灰色背景）
-/// - ` ``` `：代码块（等宽字体 + 灰色背景 + 圆角）
-/// - `- `：无序列表
-/// - `1. `：有序列表
-/// - `[text](url)`：链接（蓝色文字 + 下划线）
-/// - `> `：引用（左侧竖线 + 灰色背景）
-///
-/// 仅实现基础渲染，不做完美 Markdown 解析。
-class _MarkdownRenderer extends StatelessWidget {
-  /// Markdown 源码
-  final String source;
-
-  const _MarkdownRenderer({required this.source});
-
-  @override
-  Widget build(BuildContext context) {
-    final List<String> lines = source.split('\n');
-    final List<Widget> widgets = <Widget>[];
-    bool inCodeBlock = false;
-    final StringBuffer codeBuffer = StringBuffer();
-
-    for (int i = 0; i < lines.length; i++) {
-      final String line = lines[i];
-      final String trimmed = line.trimLeft();
-
-      // 代码块开始 / 结束
-      if (trimmed.startsWith('```')) {
-        if (inCodeBlock) {
-          widgets.add(_buildCodeBlock(codeBuffer.toString(), context));
-          codeBuffer.clear();
-          inCodeBlock = false;
-        } else {
-          inCodeBlock = true;
-        }
-        continue;
-      }
-      if (inCodeBlock) {
-        if (codeBuffer.isNotEmpty) codeBuffer.write('\n');
-        codeBuffer.write(line);
-        continue;
-      }
-
-      // 空行
-      if (line.trim().isEmpty) {
-        widgets.add(const SizedBox(height: 8));
-        continue;
-      }
-
-      // 标题
-      if (line.startsWith('### ')) {
-        widgets.add(_buildHeading(line.substring(4), 3, context));
-      } else if (line.startsWith('## ')) {
-        widgets.add(_buildHeading(line.substring(3), 2, context));
-      } else if (line.startsWith('# ')) {
-        widgets.add(_buildHeading(line.substring(2), 1, context));
-      } else if (line.startsWith('> ')) {
-        widgets.add(_buildBlockquote(line.substring(2), context));
-      } else if (line.startsWith('- ') || line.startsWith('* ')) {
-        widgets.add(_buildListItem(line.substring(2), false, context: context));
-      } else {
-        final RegExpMatch? orderedMatch = RegExp(r'^(\d+)\.\s+(.*)')
-            .firstMatch(line);
-        if (orderedMatch != null) {
-          widgets.add(
-            _buildListItem(
-              orderedMatch.group(2)!,
-              true,
-              number: orderedMatch.group(1)!,
-              context: context,
-            ),
-          );
-        } else {
-          widgets.add(_buildParagraph(line, context));
-        }
-      }
-    }
-
-    // 处理未闭合的代码块
-    if (inCodeBlock) {
-      widgets.add(_buildCodeBlock(codeBuffer.toString(), context));
-    }
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: widgets,
-    );
-  }
-
-  /// 构建标题
-  Widget _buildHeading(String text, int level, BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    double fontSize;
-    if (level == 1) {
-      fontSize = 22;
-    } else if (level == 2) {
-      fontSize = 18;
-    } else {
-      fontSize = 15;
-    }
-    return Padding(
-      padding: const EdgeInsets.only(top: 12, bottom: 6),
-      child: RichText(
-        text: TextSpan(
-          children: _parseInline(text, context),
-          style: TextStyle(
-            fontSize: fontSize,
-            fontWeight: FontWeight.w700,
-            color: cs.onSurface,
-            height: 1.4,
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// 构建段落
-  Widget _buildParagraph(String text, BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 6),
-      child: RichText(
-        text: TextSpan(
-          children: _parseInline(text, context),
-          style: TextStyle(
-            fontSize: 14,
-            height: 1.6,
-            color: cs.onSurfaceVariant,
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// 构建引用块
-  Widget _buildBlockquote(String text, BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: Theme.of(context).scaffoldBackgroundColor,
-        border: Border(left: BorderSide(color: cs.primary, width: 3)),
-        borderRadius: const BorderRadius.only(
-          topRight: Radius.circular(4),
-          bottomRight: Radius.circular(4),
-        ),
-      ),
-      child: RichText(
-        text: TextSpan(
-          children: _parseInline(text, context),
-          style: TextStyle(
-            fontSize: 13,
-            height: 1.6,
-            color: cs.onSurfaceVariant,
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// 构建列表项
-  Widget _buildListItem(
-    String text,
-    bool ordered, {
-    String? number,
-    required BuildContext context,
-  }) {
-    final cs = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.only(left: 8, bottom: 4),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            ordered ? '$number. ' : '• ',
-            style: TextStyle(
-              fontSize: 14,
-              height: 1.6,
-              color: cs.onSurfaceVariant,
-            ),
-          ),
-          Expanded(
-            child: RichText(
-              text: TextSpan(
-                children: _parseInline(text, context),
-                style: TextStyle(
-                  fontSize: 14,
-                  height: 1.6,
-                  color: cs.onSurfaceVariant,
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// 构建代码块
-  Widget _buildCodeBlock(String code, BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: Theme.of(context).scaffoldBackgroundColor,
-        borderRadius: BorderRadius.circular(6),
-      ),
-      child: SelectableText(
-        code,
-        style: TextStyle(
-          fontSize: 12.5,
-          height: 1.5,
-          fontFamily: 'monospace',
-          color: cs.onSurface,
-        ),
-      ),
-    );
-  }
-
-  /// 解析行内样式：**加粗** *斜体* `代码` [链接](url)
-  ///
-  /// 返回 InlineSpan 列表，用于 RichText 渲染。
-  List<InlineSpan> _parseInline(String text, BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final List<InlineSpan> spans = <InlineSpan>[];
-    final RegExp regex = RegExp(
-      r'(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\)|\*[^*]+\*)',
-    );
-    int lastEnd = 0;
-    for (final RegExpMatch match in regex.allMatches(text)) {
-      if (match.start > lastEnd) {
-        spans.add(TextSpan(text: text.substring(lastEnd, match.start)));
-      }
-      final String token = match.group(0)!;
-      if (token.startsWith('**')) {
-        spans.add(
-          TextSpan(
-            text: token.substring(2, token.length - 2),
-            style: const TextStyle(fontWeight: FontWeight.bold),
-          ),
-        );
-      } else if (token.startsWith('`')) {
-        spans.add(
-          TextSpan(
-            text: token.substring(1, token.length - 1),
-            style: TextStyle(
-              fontFamily: 'monospace',
-              backgroundColor: Theme.of(context).dividerColor,
-            ),
-          ),
-        );
-      } else if (token.startsWith('[')) {
-        final RegExpMatch? linkMatch = RegExp(r'\[([^\]]+)\]\(([^)]+)\)')
-            .firstMatch(token);
-        if (linkMatch != null) {
-          spans.add(
-            TextSpan(
-              text: linkMatch.group(1),
-              style: TextStyle(
-                color: cs.primary,
-                decoration: TextDecoration.underline,
-              ),
-            ),
-          );
-        } else {
-          spans.add(TextSpan(text: token));
-        }
-      } else if (token.startsWith('*')) {
-        spans.add(
-          TextSpan(
-            text: token.substring(1, token.length - 1),
-            style: const TextStyle(fontStyle: FontStyle.italic),
-          ),
-        );
-      }
-      lastEnd = match.end;
-    }
-    if (lastEnd < text.length) {
-      spans.add(TextSpan(text: text.substring(lastEnd)));
-    }
-    return spans;
-  }
-}

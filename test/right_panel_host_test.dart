@@ -1,3 +1,4 @@
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:tree/ui/services/detail_selection.dart';
@@ -200,5 +201,98 @@ void main() {
     await tester.pump();
     expect(find.text('文件身体'), findsOneWidget);
     expect(find.text('设置身体', skipOffstage: false), findsOneWidget);
+  });
+
+  // ── 用户 2026-10-19 反馈 ──────────────────────────────────────────────
+
+  testWidgets('窗口标签过多时 chip 行常显滑动条，鼠标滚轮也能翻',
+      (WidgetTester tester) async {
+    // 12 个默认打开的窗口：1000 宽一定装不下
+    final List<RightPanelEntry> many = <RightPanelEntry>[
+      for (int i = 0; i < 12; i++)
+        RightPanelEntry(
+          id: 'w$i',
+          label: '很长的窗口名$i',
+          icon: Icons.circle_outlined,
+          openByDefault: true,
+          bodyBuilder: (_) => Center(child: Text('w$i 身体')),
+        ),
+    ];
+    await pumpHost(tester, many);
+
+    // 常显滑动条：不然标签被顶住时用户根本不知道还能往右翻
+    final Scrollbar bar = tester.widget<Scrollbar>(
+      find.byKey(const ValueKey<String>('right-panel-chip-scrollbar')),
+    );
+    expect(bar.thumbVisibility, isTrue, reason: '标签被挡住时要看得见滑动条');
+    expect(bar.scrollbarOrientation, ScrollbarOrientation.bottom);
+
+    final ScrollableState scrollable = tester.state<ScrollableState>(
+      find.descendant(
+        of: find.byKey(const ValueKey<String>('right-panel-chip-scrollbar')),
+        matching: find.byType(Scrollable),
+      ),
+    );
+    expect(scrollable.position.maxScrollExtent, greaterThan(0),
+        reason: '标签确实溢出了，才有得滚');
+
+    // 鼠标滚轮（竖直 scrollDelta）也要能横着翻：桌面端 Scrollable 对水平轴
+    // 只认 dx，宿主里补了 dy → 横向这张映射
+    final Offset at = tester.getCenter(
+      find.byKey(const ValueKey<String>('right-panel-chip-scrollbar')),
+    );
+    await tester.sendEventToBinding(
+      PointerScrollEvent(position: at, scrollDelta: const Offset(0, 200)),
+    );
+    await tester.pump();
+    expect(scrollable.position.pixels, greaterThan(0),
+        reason: '滚轮竖直增量被转成了横向滚动');
+  });
+
+  testWidgets('窗口 chip 字重跟随界面字重设置（不再写死 w400/w600）',
+      (WidgetTester tester) async {
+    // 模拟「界面字重」设置把 bodyMedium 抬到 w800
+    final ThemeData base = ThemeData();
+    final ThemeData theme = base.copyWith(
+      textTheme: base.textTheme.copyWith(
+        bodyMedium: base.textTheme.bodyMedium!
+            .copyWith(fontWeight: FontWeight.w800),
+      ),
+    );
+    await tester.pumpWidget(MaterialApp(
+      theme: theme,
+      home: Scaffold(
+        body: SizedBox(
+          width: 600,
+          height: 400,
+          child: RightPanelHost(
+            entries: <RightPanelEntry>[
+              RightPanelEntry(
+                id: 'a',
+                label: '甲',
+                icon: Icons.circle_outlined,
+                openByDefault: true,
+                bodyBuilder: (_) => const SizedBox.shrink(),
+              ),
+              RightPanelEntry(
+                id: 'b',
+                label: '乙',
+                icon: Icons.circle_outlined,
+                openByDefault: true,
+                bodyBuilder: (_) => const SizedBox.shrink(),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ));
+    await tester.pump();
+
+    // 未活动的那颗（乙）应**原样跟随**界面字重（w800），而不是被写死的 w400
+    final Text label = tester.widget<Text>(
+      find.descendant(of: chip('b'), matching: find.text('乙')),
+    );
+    expect(label.style?.fontWeight, FontWeight.w800,
+        reason: '窗口文字粗细必须跟着「界面字重」设置走');
   });
 }

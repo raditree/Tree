@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
 import '../services/detail_selection.dart';
@@ -93,6 +94,9 @@ class _RightPanelHostState extends State<RightPanelHost> {
   /// 路由页当前页码（0 基）
   int _page = 0;
 
+  /// 窗口 chip 行的滚动控制器：标签太多时靠它出滑动条 / 吞鼠标滚轮。
+  final ScrollController _chipScroll = ScrollController();
+
   @override
   void initState() {
     super.initState();
@@ -111,6 +115,7 @@ class _RightPanelHostState extends State<RightPanelHost> {
   @override
   void dispose() {
     DetailSelection.instance.removeListener(_onDetailSelected);
+    _chipScroll.dispose();
     super.dispose();
   }
 
@@ -233,7 +238,11 @@ class _RightPanelHostState extends State<RightPanelHost> {
     );
   }
 
-  /// 顶栏：窗口 chip（横向可滚）+「+」创建 + 折叠。
+  /// 顶栏：窗口 chip（横向可滚 + 常显滑动条）+「+」创建 + 折叠。
+  ///
+  /// chip 行**常显滑动条**（用户 2026-10-19）：窗口开得多时标签会顶到右端被遮住，
+  /// 以前只能横向拖，鼠标用户根本看不出来还有没有更多——现在底下有一条细滑动条
+  /// 常驻，并且把鼠标滚轮的**竖直**增量也转成横向滚动（见 [_onChipPointerSignal]）。
   Widget _buildTopBar(ColorScheme cs) {
     return Container(
       height: 44,
@@ -241,15 +250,31 @@ class _RightPanelHostState extends State<RightPanelHost> {
       child: Row(
         children: <Widget>[
           Expanded(
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
-                children: <Widget>[
-                  const SizedBox(width: 6),
-                  for (final String id in _open)
-                    if (_entryById(id) != null)
-                      _buildWindowChip(cs, _entryById(id)!),
-                ],
+            child: Listener(
+              // 桌面端鼠标滚轮是竖直的（scrollDelta.dy），而这条 chip 行是水平滚动视图
+              // ——Scrollable 对水平轴只认 scrollDelta.dx，所以滚轮默认纹丝不动。
+              // 这里把 dy 补成横向滚动，用户能直接滚轮翻标签。
+              onPointerSignal: _onChipPointerSignal,
+              child: Scrollbar(
+                key: const ValueKey<String>('right-panel-chip-scrollbar'),
+                controller: _chipScroll,
+                thumbVisibility: true,
+                scrollbarOrientation: ScrollbarOrientation.bottom,
+                thickness: 4,
+                radius: const Radius.circular(2),
+                child: SingleChildScrollView(
+                  controller: _chipScroll,
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children: <Widget>[
+                      const SizedBox(width: 6),
+                      for (final String id in _open)
+                        if (_entryById(id) != null)
+                          _buildWindowChip(cs, _entryById(id)!),
+                      const SizedBox(width: 6),
+                    ],
+                  ),
+                ),
               ),
             ),
           ),
@@ -273,9 +298,37 @@ class _RightPanelHostState extends State<RightPanelHost> {
     );
   }
 
+  /// 鼠标滚轮 / 触控板滚到 chip 行上时：把竖直增量转成横向滚动。
+  void _onChipPointerSignal(PointerSignalEvent event) {
+    if (event is! PointerScrollEvent) return;
+    if (!_chipScroll.hasClients) return;
+    final double delta =
+        event.scrollDelta.dy != 0 ? event.scrollDelta.dy : event.scrollDelta.dx;
+    if (delta == 0) return;
+    final double next = (_chipScroll.offset + delta)
+        .clamp(0.0, _chipScroll.position.maxScrollExtent);
+    if (next == _chipScroll.offset) return;
+    _chipScroll.jumpTo(next);
+  }
+
+  /// 在 [base] 的字重上抬 [delta] 档（夹在 w100…w900）。
+  ///
+  /// 窗口 chip 的"活动态更粗"要用**相对强调**（在界面字重之上抬一档），
+  /// 而不是写死 w400 / w600——写死会让「界面字重」设置在这排标签上完全失效
+  /// （用户 2026-10-19：窗口文字粗细不受设置影响）。
+  static FontWeight _bumpWeight(FontWeight base, int delta) {
+    final int slot = FontWeight.values.indexOf(base);
+    final int next = (slot + delta).clamp(0, FontWeight.values.length - 1);
+    return FontWeight.values[next];
+  }
+
   /// 一个窗口 chip（图标 + 标题 + 关闭）。
   Widget _buildWindowChip(ColorScheme cs, RightPanelEntry entry) {
     final bool active = entry.id == _active && !_picking;
+    // chip 文字跟随**界面字重设置**：默认样式来自 [Material] 写的
+    // textTheme.bodyMedium（已被 FontService 抬过档），活动态在它之上再抬一档。
+    final FontWeight baseWeight =
+        DefaultTextStyle.of(context).style.fontWeight ?? FontWeight.w400;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 2),
       child: Material(
@@ -304,7 +357,8 @@ class _RightPanelHostState extends State<RightPanelHost> {
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
                     fontSize: 12,
-                    fontWeight: active ? FontWeight.w600 : FontWeight.w400,
+                    fontWeight:
+                        active ? _bumpWeight(baseWeight, 1) : baseWeight,
                     color: active ? cs.primary : cs.onSurface,
                   ),
                 ),

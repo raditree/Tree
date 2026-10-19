@@ -844,4 +844,82 @@ testWidgets('换文件（可编辑 → 只读）后行号槽仍在，滚动控�
       expect(find.text('a.txt'), findsOneWidget, reason: '查看器关掉后回到文件树');
     });
   });
+
+  /// 用户 2026-10-19：「支持多文件同时存在（目前仅支持单文件+二分屏）」。
+  group('文件面板的多文件（tab 条）', () {
+    Future<void> pumpTwoFiles(WidgetTester tester) async {
+      core.files = <Map<String, dynamic>>[
+        <String, dynamic>{
+          'name': 'a.txt',
+          'path': 'a.txt',
+          'type': 'file',
+          'size': 6,
+          'modified': '',
+        },
+        <String, dynamic>{
+          'name': 'b.txt',
+          'path': 'b.txt',
+          'type': 'file',
+          'size': 6,
+          'modified': '',
+        },
+      ];
+      core.content = 'alpha\n';
+      core.size = 6;
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 760,
+            height: 600,
+            child: FilePanel(workspaceId: 'ws1', teamId: 'ws1'),
+          ),
+        ),
+      ));
+      await settleIo(tester);
+      core.puts.clear();
+    }
+
+    Finder tab(String path) => find.byKey(ValueKey<String>('file-tab-$path'));
+    Finder tabClose(String path) =>
+        find.byKey(ValueKey<String>('file-tab-close-$path'));
+
+    testWidgets('打开多个文件排成 tab：切 tab 不丢内容，关掉一个还有别的',
+        (WidgetTester tester) async {
+      await pumpTwoFiles(tester);
+
+      await tester.tap(find.text('a.txt')); // 此刻只有文件树里有 a.txt
+      await settleIo(tester);
+      expect(tab('a.txt'), findsOneWidget);
+      expect(find.byType(TextField), findsOneWidget);
+
+      // 再开 b.txt：a 的 tab **还在**（多文件同时存在，不再是"顶掉上一个"）
+      await tester.tap(find.text('b.txt'));
+      await settleIo(tester);
+      expect(tab('a.txt'), findsOneWidget, reason: '开第二个文件不能顶掉第一个');
+      expect(tab('b.txt'), findsOneWidget);
+      expect(find.byType(TextField), findsOneWidget, reason: '一次只显示当前文件');
+
+      // 在 b 上编辑，切回 a：两边各自的内容都不会丢（一个文件一份缓冲）
+      await tester.enterText(find.byType(TextField), 'BBB\n');
+      await tester.pump();
+      await tester.tap(tab('a.txt'));
+      await settleIo(tester);
+      expect(find.text('alpha\n'), findsOneWidget, reason: 'a 的内容还在');
+      expect(tab('b.txt'), findsOneWidget, reason: '切 tab 不会关掉别的文件');
+
+      // 关掉 a 的 tab：b 还在，查看器继续显示 b
+      await tester.tap(tabClose('a.txt'));
+      await settleIo(tester);
+      expect(tab('a.txt'), findsNothing);
+      expect(tab('b.txt'), findsOneWidget, reason: '关一个 tab 别的还在');
+      expect(find.byType(TextField), findsOneWidget);
+
+      // 把最后一个也关掉：查看器整体收起，回到文件树独占
+      await tester.tap(tabClose('b.txt'));
+      await settleIo(tester);
+      expect(tab('b.txt'), findsNothing);
+      expect(find.byType(TextField), findsNothing);
+      expect(find.text('a.txt'), findsOneWidget, reason: '回到文件树');
+    });
+  });
 }

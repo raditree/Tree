@@ -22,6 +22,7 @@ import '../widgets/create_agent_dialog.dart';
 import '../widgets/detail_panel.dart';
 import '../widgets/download_panel.dart';
 import '../widgets/file_panel.dart';
+import '../widgets/git_history.dart';
 import '../widgets/mcp_config_panel.dart';
 import '../widgets/message_panel.dart';
 import '../widgets/model_info_panel.dart';
@@ -32,6 +33,7 @@ import '../widgets/question_panel.dart';
 import '../widgets/right_panel_host.dart';
 import '../widgets/teammates_window_page.dart';
 import '../widgets/tool_runs_panel.dart';
+import '../widgets/todo_panel.dart';
 import 'settings_page.dart';
 
 /// 主页面 - 三栏布局
@@ -168,6 +170,20 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
 
   /// 是否正在拖拽侧栏分隔条（拖拽期间帧后收敛让位给拖拽本身）
   bool _sideDragging = false;
+
+  /// 上一次布局的可用宽度：用来识别窗口"变窄 / 变宽"**跨越**阈值那一下
+  /// （只在跨越时自动折叠 / 展开右栏，免得与用户手动操作打架）。
+  double? _prevLayoutWidth;
+
+  /// 右栏是否因**窗口过窄自动**折叠（窗口恢复够宽时据此自动展开；
+  /// 用户自己点开的折叠不会被窗口宽度悄悄拽回来）。
+  bool _rightAutoCollapsed = false;
+
+  /// 窗口可用宽度低于它时自动折叠右栏（用户 2026-10-19：省手动点击折叠按钮）。
+  ///
+  /// 取 1120：默认窗口 1280 宽时三栏都放得舒服；缩到 1120 以下中栏开始局促，
+  /// 这时替用户把右栏收成窄条，把宽度让给对话区。
+  static const double _autoCollapseRightBelow = 1120;
 
   // 窗口最小尺寸
   static const double _minWindowWidth = 1024;
@@ -740,10 +756,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                   workspaceId: workspaceId,
                   teamId: _selectedAgent?.id,
                   teamName: _selectedAgent?.name ?? '',
-                  sessionId: _currentSessionId,
                   fileRefreshTrigger: _fileRefreshTrigger,
-                  gitRefreshTrigger: _gitRefreshTrigger,
-                  todoRefreshTrigger: _todoRefreshTrigger,
                 ),
         ],
       ),
@@ -1172,7 +1185,43 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _sideNormalizeScheduled = false;
       _normalizeSideWidths();
+      _autoCollapseRightByWidth();
     });
+  }
+
+  /// 窗口变窄越过阈值时**自动折叠**右栏、恢复够宽时把**因它自动折叠**的右栏展开。
+  ///
+  /// 只在"跨越阈值"那一下动作（比较上/本帧宽度），不做成"窄就一直收着"：
+  /// 用户在窄窗口里手动把右栏点开，不该被下一次布局又悄悄折回去。
+  /// 用户自己折叠的右栏（`_rightAutoCollapsed == false`）也不会被窗口宽度拽开。
+  void _autoCollapseRightByWidth() {
+    if (_sideDragging || !mounted) return;
+    final double? width = _layoutAvailableWidth;
+    if (width == null) return;
+    final double? prev = _prevLayoutWidth;
+    _prevLayoutWidth = width;
+    if (prev == null) return; // 首帧只记基准
+    // 中栏折叠时右栏正在承接它让出的空间（[_rightAbsorbs]），不参与自动折叠
+    if (_centerCollapsed) return;
+
+    final bool narrowNow = width < _autoCollapseRightBelow;
+    final bool narrowBefore = prev < _autoCollapseRightBelow;
+    if (narrowNow && !narrowBefore && !_rightCollapsed) {
+      setState(() {
+        _rightCollapsed = true;
+        _rightAutoCollapsed = true;
+      });
+      return;
+    }
+    if (!narrowNow &&
+        narrowBefore &&
+        _rightCollapsed &&
+        _rightAutoCollapsed) {
+      setState(() {
+        _rightCollapsed = false;
+        _rightAutoCollapsed = false;
+      });
+    }
   }
 
   /// 开始拖拽侧栏分隔条：暂停帧后收敛，让拖拽完全说了算。
@@ -1434,6 +1483,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   void _requestRightWindow(String id) {
     setState(() {
       _rightCollapsed = false;
+      _rightAutoCollapsed = false;
       _rightWindowId = id;
       _rightWindowRevision++;
     });
@@ -1447,6 +1497,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   void _openSettings({bool focusModels = false}) {
     setState(() {
       _rightCollapsed = false;
+      _rightAutoCollapsed = false;
       _settingsFocusModels = focusModels;
       _rightWindowId = 'settings';
       _rightWindowRevision++;
@@ -1558,10 +1609,34 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 workspaceId: workspaceId,
                 teamId: _selectedAgent?.id,
                 teamName: _selectedAgent?.name ?? '',
-                sessionId: _currentSessionId,
                 fileRefreshTrigger: _fileRefreshTrigger,
-                gitRefreshTrigger: _gitRefreshTrigger,
-                todoRefreshTrigger: _todoRefreshTrigger,
+              ),
+      ),
+      // Git 历史 / Todo（用户 2026-10-19）：从「文件」窗里拆出来各自成窗，
+      // 文件窗只干"看文件"一件事；未选 agent 时同样走「请先选择 Agent」空态。
+      RightPanelEntry(
+        id: 'git',
+        label: 'Git 历史',
+        icon: Icons.history_outlined,
+        bodyBuilder: (BuildContext context) => workspaceId.isEmpty
+            ? _buildNoAgentHint()
+            : GitHistory(
+                workspaceId: workspaceId,
+                teamId: _selectedAgent?.id,
+                refreshTrigger: _gitRefreshTrigger,
+              ),
+      ),
+      RightPanelEntry(
+        id: 'todo',
+        label: 'Todo',
+        icon: Icons.checklist_outlined,
+        bodyBuilder: (BuildContext context) => workspaceId.isEmpty
+            ? _buildNoAgentHint()
+            : TodoPanel(
+                workspaceId: workspaceId,
+                teamId: _selectedAgent?.id,
+                sessionId: _currentSessionId,
+                refreshTrigger: _todoRefreshTrigger,
               ),
       ),
       RightPanelEntry(
@@ -1838,6 +1913,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 onPressed: () {
                   setState(() {
                     _rightCollapsed = false;
+                    _rightAutoCollapsed = false;
                   });
                 },
               ),
@@ -1850,6 +1926,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
               onTap: () {
                 setState(() {
                   _rightCollapsed = false;
+                  _rightAutoCollapsed = false;
                 });
               },
               child: RotatedBox(
