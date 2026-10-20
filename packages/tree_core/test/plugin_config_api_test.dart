@@ -762,7 +762,7 @@ void main() {
     expect((await client.send('GET', '/api/plugin/snapshot')).status, 200);
   });
 
-  // ── 发布仓库的四个路由（阶段 5：只拉 GitHub Release 资产 + 卸载）────────
+  // ── 发布仓库的四个路由（阶段 5：只拉发布源的 Release 资产 + 卸载）────────
 
   /// 一条脚本型索引条目（资产 = 那个**真能跑**的假插件源码）。
   Map<String, dynamic> releaseEntry({

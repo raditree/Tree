@@ -1655,9 +1655,9 @@ class CoreServer {
     router.add('GET', ApiPaths.pluginBuiltins, _listBuiltinPlugins);
     router.add('POST', ApiPaths.pluginBuiltinEnable, _enableBuiltinPlugin);
     router.add('POST', ApiPaths.pluginBuiltinDisable, _disableBuiltinPlugin);
-    // 发布仓库（阶段 5）：只读 GitHub Release 资产，不 clone 源码；四个路由的分工
-    // 与理由见 ApiPaths.pluginRelease / pluginReleaseRefresh / pluginReleaseInstall /
-    // pluginReleaseUninstall。
+    // 发布仓库（阶段 5）：只读发布源（Gitee → GitHub 自动回退）的 Release 资产，
+    // 不 clone 源码；四个路由的分工与理由见 ApiPaths.pluginRelease /
+    // pluginReleaseRefresh / pluginReleaseInstall / pluginReleaseUninstall。
     router.add('GET', ApiPaths.pluginRelease, _pluginReleaseIndex);
     router.add('POST', ApiPaths.pluginReleaseRefresh, _refreshPluginRelease);
     router.add('POST', ApiPaths.pluginReleaseInstall, _installPluginRelease);
@@ -4205,7 +4205,7 @@ class CoreServer {
     await writeJson(request, 200, _pluginWriteBody(store, result, outcome));
   }
 
-  // ── 发布仓库（阶段 5：插件管理只拉 GitHub Release 资产）─────────────────
+  // ── 发布仓库（阶段 5：插件管理只拉发布源的 Release 资产）─────────────────
   //
   // 三个处理器只做「调 [PluginDownloader] 的同一份实现 + 把条目落盘」：索引校验、
   // 字节数核对、换文件闸门、原子改名全在下载器里——路由层不复制规则，复制一次就
@@ -4468,7 +4468,9 @@ class CoreServer {
   /// - `runtimeResolver`：内置插件目录的 Python 探测（与内置项同一口径，避免两套
   ///   “装了没”的结论互相矛盾）；
   /// - 换文件闸门由路由层现给（[PluginBus.quiesceForSwap]）：只有总线知道进程在不在；
-  /// - `accessToken`：`GITHUB_TOKEN`（公开仓库不登录也能读，只在被限流时才用得上）。
+  /// - `sources`：**有序多源**（默认 Gitee → GitHub，见 [defaultPluginReleaseSources]）；
+  ///   token 从 `GITEE_TOKEN` / `GITHUB_TOKEN` 读，源顺序可用 `TREE_PLUGIN_RELEASE_ORDER`
+  ///   覆盖（公开仓库不登录也能读，token 只在被限流/401 时才用得上）。
   static PluginDownloader? _releaseDownloaderFor({
     required String? cacheDir,
     required PluginBus? bus,
@@ -4480,7 +4482,13 @@ class CoreServer {
     return PluginDownloader(
       cacheDir: dir,
       installDir: defaultPluginInstallDir(),
-      accessToken: (Platform.environment['GITHUB_TOKEN'] ?? '').trim(),
+      sources: defaultPluginReleaseSources(
+        giteeToken: (Platform.environment['GITEE_TOKEN'] ?? '').trim(),
+        githubToken: (Platform.environment['GITHUB_TOKEN'] ?? '').trim(),
+        order: parsePluginReleaseSourceOrder(
+          Platform.environment['TREE_PLUGIN_RELEASE_ORDER'] ?? '',
+        ),
+      ),
       runtimeResolver: catalog.detectRuntime,
       installedEntryOf: store.readEntry,
     );
