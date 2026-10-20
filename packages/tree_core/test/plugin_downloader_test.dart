@@ -1,7 +1,9 @@
 // 插件发布仓库下载器（阶段 5）的用例：**整条链离线跑**（HTTP 由假取回器给）。
 //
-// 钉住的口径（用户 2026-10-16 定稿：「plugins 里是插件代码，插件管理只拉 release」）：
-// 1. 只读 GitHub **Releases 资产**，索引就是那张合同（`plugin-index.json`，schema=1）；
+// 钉住的口径（用户 2026-10-16 定稿：「plugins 里是插件代码，插件管理只拉 release」；
+// 2026-10-20 加「发布源不止 GitHub，Gitee 优先、两个源自动回退」）：
+// 1. 只读发布源的 **Releases 资产**（默认 Gitee → GitHub），索引就是那张合同
+//    （`plugin-index.json`，schema=1）；第一个通的源胜出，全失败把各源原因都报出来；
 // 2. 索引校验：坏条目**只跳过并写下原因**，一个手错的 JSON 不许带走整份清单；
 // 3. 字节数不符 ⇒ 按"没拿到"处理，**不缓存半截**（半截索引/半截 exe 被下一次离线读到
 //    比没有更难查）；
@@ -32,12 +34,24 @@ class _FakeRepo {
   /// 强制 releases/latest 返回这个状态码（模拟限流 403 / 429）。
   int? releaseStatusOverride;
 
+  /// 这些主机一律"连不上"（模拟某个源被墙 / 挂了 ⇒ 触发换源）。
+  final Set<String> deadHosts = <String>{};
+
+  /// 这些主机上"仓库还没发布任何 release"（404）——模拟两个源不同步的现场。
+  final Set<String> releaseMissingHosts = <String>{};
+
   Future<PluginFetchResult> fetch(
     Uri url, {
     Map<String, String>? headers,
   }) async {
     urls.add(url.toString());
+    if (deadHosts.contains(url.host)) {
+      return PluginFetchResult.failure('连接 $url 失败（这个源不可达）');
+    }
     if (url.path.endsWith('/releases/latest')) {
+      if (releaseMissingHosts.contains(url.host)) {
+        return PluginFetchResult(statusCode: 404, error: 'HTTP 404');
+      }
       final int? forced = releaseStatusOverride;
       if (forced != null) {
         return PluginFetchResult(statusCode: forced, error: 'HTTP $forced');
@@ -155,9 +169,11 @@ void main() {
   PluginDownloader downloader({
     Map<String, dynamic>? Function(String id)? installedEntryOf,
     PluginRuntimeResolver? runtimeResolver,
+    List<PluginReleaseSource>? sources,
   }) => PluginDownloader(
     cacheDir: cacheDir,
     installDir: installDir,
+    sources: sources,
     fetcher: repo.fetch,
     nonce: () => 'nonce',
     installedEntryOf: installedEntryOf,
@@ -179,6 +195,7 @@ void main() {
       expect(listing.ok, isTrue, reason: listing.error);
       expect(listing.online, isTrue, reason: '这次是联网取的');
       expect(listing.tag, 'v0.1.0');
+      expect(listing.source, 'Gitee', reason: '默认第一个源就是 Gitee ⇒ 回包要如实标出');
       expect(listing.entries, hasLength(1));
       expect(listing.entries.single.id, 'released');
       expect(listing.entries.single.targets, <String>['tree_released.exe']);
@@ -243,7 +260,7 @@ void main() {
       expect(listing.error, contains('不猜新字段'));
     });
 
-    test('限流（403）⇒ 原因里给出 GITHUB_TOKEN 这条路', () async {
+    test('限流（403）⇒ 两个源各自的原因都在，且给出 token 这条路', () async {
       putAsset('tree_released.exe');
       repo.publish(plugins: <Map<String, dynamic>>[_entry()]);
       repo.releaseStatusOverride = 403;
@@ -251,6 +268,152 @@ void main() {
       expect(listing.ok, isFalse);
       expect(listing.error, contains('限流'));
       expect(listing.error, contains('GITHUB_TOKEN'));
+      expect(listing.error, contains('GITEE_TOKEN'), reason: '两个平台都提一句，别只认 GitHub');
+      expect(listing.error, contains('Gitee'), reason: '哪一个源、为什么，逐源说清');
+      expect(listing.error, contains('GitHub'));
+    });
+  });
+
+  group('多源回退（Gitee 优先、GitHub 兜底）', () {
+    test('第一源连不上 ⇒ 自动换下一个，回包标出真正生效的那一个', () async {
+      putAsset('tree_released.exe');
+      repo.publish(plugins: <Map<String, dynamic>>[_entry()]);
+      repo.deadHosts.add('gitee.com');
+      final PluginReleaseListing listing = await downloader().refresh();
+      expect(listing.ok, isTrue, reason: listing.error);
+      expect(listing.source, 'GitHub', reason: '要如实说这一版索引是从哪儿来的');
+      expect(
+        File(p.join(cacheDir, 'release-source.txt')).readAsStringSync().trim(),
+        'GitHub',
+        reason: 'install 查资产时优先回同一个源，靠这份记名文件',
+      );
+    });
+
+    test('第一源没有 release（404）⇒ 也不算全败，第二源照样能刷到', () async {
+      // 只有 Gitee 那一条链是坏的：用"Gitee 仓还没发 release"模拟两个源不同步的现场。
+      putAsset('tree_released.exe');
+      repo.publish(plugins: <Map<String, dynamic>>[_entry()]);
+      repo.releaseMissingHosts.add('gitee.example');
+      final PluginReleaseListing listing = await downloader(
+        sources: <PluginReleaseSource>[
+          const PluginReleaseSource(
+            name: 'Gitee',
+            repo: kTreePluginsRepo,
+            apiBase: 'https://gitee.example/api/v5',
+          ),
+          const PluginReleaseSource(
+            name: 'GitHub',
+            repo: kTreePluginsRepo,
+            apiBase: kGitHubApiBase,
+          ),
+        ],
+      ).refresh();
+      expect(listing.ok, isTrue, reason: listing.error);
+      expect(listing.source, 'GitHub');
+    });
+
+    test('两个源都连不上 ⇒ 各源原因都报出来，不静默', () async {
+      repo.deadHosts.addAll(<String>['gitee.com', 'api.github.com']);
+      final PluginReleaseListing listing = await downloader().refresh();
+      expect(listing.ok, isFalse);
+      expect(listing.error, contains('所有发布源都没刷成功'));
+      expect(listing.error, contains('Gitee'));
+      expect(listing.error, contains('GitHub'));
+    });
+
+    test('源顺序可由调用方给定（比如只用 GitHub）', () async {
+      putAsset('tree_released.exe');
+      repo.publish(plugins: <Map<String, dynamic>>[_entry()]);
+      final PluginReleaseListing listing = await downloader(
+        sources: <PluginReleaseSource>[
+          const PluginReleaseSource(
+            name: 'GitHub',
+            repo: kTreePluginsRepo,
+            apiBase: kGitHubApiBase,
+          ),
+        ],
+      ).refresh();
+      expect(listing.ok, isTrue, reason: listing.error);
+      expect(listing.source, 'GitHub');
+    });
+
+    test('默认源清单：Gitee 在前、GitHub 兜底，token 按 key 注入各自的鉴权形式', () {
+      final List<PluginReleaseSource> sources = defaultPluginReleaseSources(
+        giteeToken: 'gt',
+        githubToken: 'gh',
+      );
+      expect(sources.map((PluginReleaseSource s) => s.name).toList(), <String>[
+        'Gitee',
+        'GitHub',
+      ]);
+      expect(
+        sources.first.latestRelease.toString(),
+        'https://gitee.com/api/v5/repos/raditree/tree-plugins/releases/latest',
+      );
+      expect(sources.first.headers['Authorization'], 'token gt');
+      expect(sources[1].headers['Authorization'], 'Bearer gh');
+      expect(sources[1].headers['Accept'], 'application/vnd.github+json');
+      expect(
+        sources.first.headers.containsKey('Accept'),
+        isFalse,
+        reason: 'Gitee 不挑 Accept，别硬塞 GitHub 的那一串',
+      );
+    });
+
+    test('源顺序解析：认得出的 key 去重保序，认不出 / 空 ⇒ 回落默认', () {
+      expect(parsePluginReleaseSourceOrder('github, gitee'), <String>[
+        'github',
+        'gitee',
+      ]);
+      expect(parsePluginReleaseSourceOrder('GITHUB'), <String>['github']);
+      expect(parsePluginReleaseSourceOrder('foo, github'), <String>['github']);
+      expect(parsePluginReleaseSourceOrder(''), isEmpty);
+      expect(
+        defaultPluginReleaseSources(
+          order: parsePluginReleaseSourceOrder(''),
+        ).map((PluginReleaseSource s) => s.name).toList(),
+        <String>['Gitee', 'GitHub'],
+        reason: '环境变量没配 / 配错时的回落：默认顺序照旧可用',
+      );
+    });
+
+    test('安装回包也标出来源（索引缓存记的那个源）', () async {
+      putAsset('tree_released.exe');
+      repo.publish(plugins: <Map<String, dynamic>>[_entry()]);
+      final PluginInstallResult result = await downloader().install(
+        'released',
+        swapGate: allowSwap,
+      );
+      expect(result.ok, isTrue, reason: result.error);
+      expect(result.source, 'Gitee', reason: '这批文件是从哪个源下的，回包要如实说');
+    });
+
+    test('请求超时 ⇒ 给可读原因（不无限挂着，且能算出"这条链不通"）', () async {
+      // 收下请求但**从不回包**：建连成功 ⇒ 只有读超时能救场（模拟被墙/挂掉的源）。
+      final HttpServer server = await HttpServer.bind(
+        InternetAddress.loopbackIPv4,
+        0,
+      );
+      addTearDown(() => server.close(force: true));
+      server.listen((HttpRequest request) {
+        // 故意不回包、也不关连接。
+      });
+      final PluginDownloader d = PluginDownloader(
+        cacheDir: cacheDir,
+        installDir: installDir,
+        sources: <PluginReleaseSource>[
+          PluginReleaseSource(
+            name: '本地假源',
+            repo: 'raditree/tree-plugins',
+            apiBase: 'http://127.0.0.1:${server.port}',
+          ),
+        ],
+        timeout: const Duration(milliseconds: 300),
+      );
+      addTearDown(d.close);
+      final PluginReleaseListing listing = await d.refresh();
+      expect(listing.ok, isFalse);
+      expect(listing.error, contains('超时'));
     });
   });
 

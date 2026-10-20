@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -18,6 +19,112 @@ const String kTreePluginsRepo = 'raditree/tree-plugins';
 
 /// GitHub REST 基址（公开仓库匿名可读；限流时给可读原因，不静默重试到永远）。
 const String kGitHubApiBase = 'https://api.github.com';
+
+/// Gitee REST 基址（公开仓库可匿名读；与 GitHub 同一套 `releases/latest` 形状）。
+///
+/// 为什么把 Gitee 摆在默认源的**第一位**：`api.github.com` 在国内常有可达性问题，
+/// 而 `gitee.com` 同名的 `raditree/tree-plugins` 仓、同一版 release 是**同一份成品**。
+/// 两个源都试、谁通用谁，而不是把装机成败押在一条链路上。
+const String kGiteeApiBase = 'https://gitee.com/api/v5';
+
+/// 一个插件**发布源**：坐标 + REST 基址 + 可选令牌 +（GitHub 特有的）Accept 头。
+///
+/// 为什么把"平台差异"做成数据（一条源一个）而不是在请求处写分支：两个平台的 API
+/// 形状相近但**鉴权形式不同**（GitHub 用 `Bearer`、Gitee 用 `token`），Accept 头也
+/// 只有 GitHub 挑；做成数据之后，多源回退就只是"按顺序试"，请求处一行平台判断都没有。
+class PluginReleaseSource {
+  const PluginReleaseSource({
+    required this.name,
+    required this.repo,
+    required this.apiBase,
+    this.token = '',
+    this.authScheme = '',
+    this.accept = '',
+  });
+
+  /// 展示与日志用（`Gitee` / `GitHub`）：回包如实标出这一版是从哪儿拿的。
+  final String name;
+
+  /// `owner/name`（只用来拼 API，不 clone）。
+  final String repo;
+
+  /// REST 基址（不带尾斜杠）。
+  final String apiBase;
+
+  /// 可选令牌（`GITEE_TOKEN` / `GITHUB_TOKEN`）：公开仓库不登录也能读，限流时才用。
+  final String token;
+
+  /// 令牌放进 `Authorization` 头的形式（GitHub `Bearer`、Gitee `token`；空 = 不带）。
+  final String authScheme;
+
+  /// `Accept` 头（GitHub 要求 `application/vnd.github+json`；Gitee 不挑 ⇒ 留空）。
+  final String accept;
+
+  Uri get latestRelease => Uri.parse('$apiBase/repos/$repo/releases/latest');
+
+  Map<String, String> get headers => <String, String>{
+    if (accept.isNotEmpty) 'Accept': accept,
+    if (token.trim().isNotEmpty && authScheme.isNotEmpty)
+      'Authorization': '$authScheme ${token.trim()}',
+  };
+}
+
+/// 已知发布源的 key（环境变量 `TREE_PLUGIN_RELEASE_ORDER` 用它排顺序）。
+const List<String> kPluginReleaseSourceKeys = <String>['gitee', 'github'];
+
+/// 默认源清单：**Gitee 在前、GitHub 兜底**；token 由调用方从环境变量注入。
+///
+/// [order] 是 key 序列（见 [parsePluginReleaseSourceOrder]）；认不出的 key 被忽略，
+/// 结果为空时**回落到默认顺序** —— 一个"源都没配好"的核心不该因此装不上插件。
+List<PluginReleaseSource> defaultPluginReleaseSources({
+  String giteeToken = '',
+  String githubToken = '',
+  List<String> order = kPluginReleaseSourceKeys,
+}) {
+  final Map<String, PluginReleaseSource> known = <String, PluginReleaseSource>{
+    'gitee': PluginReleaseSource(
+      name: 'Gitee',
+      repo: kTreePluginsRepo,
+      apiBase: kGiteeApiBase,
+      token: giteeToken,
+      authScheme: 'token',
+    ),
+    'github': PluginReleaseSource(
+      name: 'GitHub',
+      repo: kTreePluginsRepo,
+      apiBase: kGitHubApiBase,
+      token: githubToken,
+      authScheme: 'Bearer',
+      accept: 'application/vnd.github+json',
+    ),
+  };
+  final List<PluginReleaseSource> picked = <PluginReleaseSource>[
+    for (final String key in order)
+      if (known.containsKey(key.trim().toLowerCase()))
+        known[key.trim().toLowerCase()]!,
+  ];
+  if (picked.isEmpty) {
+    return <PluginReleaseSource>[
+      for (final String key in kPluginReleaseSourceKeys) known[key]!,
+    ];
+  }
+  return picked;
+}
+
+/// 解析环境变量里的源顺序：逗号 / 空格分隔的 key，认不出的忽略、重复的去掉。
+///
+/// 空串 / 全是认不出的 ⇒ 返回空清单（交给 [defaultPluginReleaseSources] 回落默认）。
+List<String> parsePluginReleaseSourceOrder(String raw) {
+  final List<String> keys = <String>[];
+  for (final String token in raw.split(RegExp(r'[,\s]+'))) {
+    final String key = token.trim().toLowerCase();
+    if (key.isEmpty) continue;
+    if (!kPluginReleaseSourceKeys.contains(key)) continue;
+    if (keys.contains(key)) continue;
+    keys.add(key);
+  }
+  return keys;
+}
 
 /// 发布索引资产的**固定文件名**（release 必须带它，否则这一版没得上）。
 ///
@@ -181,6 +288,7 @@ class PluginReleaseListing {
     this.tag = '',
     this.indexPath = '',
     this.online = false,
+    this.source = '',
   });
 
   factory PluginReleaseListing.failed(String error, {String indexPath = ''}) =>
@@ -202,12 +310,17 @@ class PluginReleaseListing {
   /// 这次是**联网取的**，还是读的本地缓存（面板要如实区分，别让离线看起来像最新）。
   final bool online;
 
+  /// 这份索引**来自哪个发布源**（`Gitee` / `GitHub`；离线读缓存时是缓存时记下的那个）。
+  /// 为什么必须如实带出来：多源回退之后，"这次是从哪儿拿的"就是出问题时第一条线索。
+  final String source;
+
   Map<String, dynamic> toJson() => <String, dynamic>{
     'ok': ok,
     'error': error,
     'tag': tag,
     'index_path': indexPath,
     'online': online,
+    'source': source,
     'count': entries.length,
     'entries': entries.map((PluginRepoEntry e) => e.toJson()).toList(),
     'skipped': skipped,
@@ -226,6 +339,7 @@ class PluginInstallResult {
     this.swapped = false,
     this.downloaded = 0,
     this.note = '',
+    this.source = '',
   });
 
   factory PluginInstallResult.failed(String error, {String pluginId = ''}) =>
@@ -249,6 +363,9 @@ class PluginInstallResult {
   final String error;
   final String note;
 
+  /// 这批文件是从哪个发布源下的（缓存全命中时是索引缓存时记下的那个）。
+  final String source;
+
   Map<String, dynamic> toJson() => <String, dynamic>{
     'ok': ok,
     'plugin_id': pluginId,
@@ -259,13 +376,15 @@ class PluginInstallResult {
     'downloaded_bytes': downloaded,
     'error': error,
     'note': note,
+    'source': source,
   };
 }
 
-/// 插件**发布仓库**（GitHub Releases）的取清单、下载与放置。
+/// 插件**发布仓库**（有序多源：Gitee → GitHub）的取清单、下载与放置。
 ///
 /// 四段职责，刻意**不含**第五件（不落 plugins.yaml、不动插件总线）：
-/// 1. [refresh]：`releases/latest` → 找到 `plugin-index.json` 资产 → 下载并缓存；
+/// 1. [refresh]：逐源试 `releases/latest` → 找到 `plugin-index.json` 资产 → 下载并缓存
+///    （第一个成功的源胜出，失败逐源换下一个、全失败时把各源原因都报出来）；
 /// 2. [cachedListing]：读本地缓存列清单（**不联网**，面板"列表"用它；离线不冒充最新）；
 /// 3. 索引校验：一个条目 = 一份合同 —— id 字符集与 `PluginConfigStore` 同一条（防路径
 ///    穿越）、`target` 必须是纯文件名、`command` 必须在文件表里、version 是三段数字；
@@ -280,9 +399,8 @@ class PluginDownloader {
   PluginDownloader({
     required this.cacheDir,
     required this.installDir,
-    this.repo = kTreePluginsRepo,
-    this.apiBase = kGitHubApiBase,
-    this.accessToken = '',
+    List<PluginReleaseSource>? sources,
+    this.timeout = const Duration(seconds: 30),
     this.runtimeResolver,
     this.log,
     PluginFetcher? fetcher,
@@ -291,7 +409,10 @@ class PluginDownloader {
     PluginInstalledEntryReader? installedEntryOf,
     Set<String> Function()? protectedFiles,
     this.isWindows,
-  }) : fetcherOverride = fetcher,
+  }) : sources = (sources == null || sources.isEmpty)
+           ? defaultPluginReleaseSources()
+           : sources,
+       fetcherOverride = fetcher,
        injectedClient = client,
        nonceFactory = nonce ?? _defaultNonce,
        installedReader = installedEntryOf ?? _noInstalledEntry,
@@ -306,13 +427,17 @@ class PluginDownloader {
   /// 放置目录 = **可执行文件同级的 `plugins/`**（与 binary 型内置插件的查找路径同源）。
   final String installDir;
 
-  /// `owner/name`（GitHub 仓库坐标；只用来拼 API，不 clone）。
-  final String repo;
+  /// **有序发布源清单**（默认 Gitee → GitHub，见 [defaultPluginReleaseSources]）。
+  ///
+  /// 逐源尝试、失败就换下一个；成功时把"是哪一个"如实写进回包与日志 —— 装机端
+  /// 不该猜"这次是从哪儿拿的"，出问题时那个名字就是第一条线索。
+  final List<PluginReleaseSource> sources;
 
-  final String apiBase;
-
-  /// 可选 token（`GITHUB_TOKEN`）：公开仓库匿名可读，限流时才需要它。
-  final String accessToken;
+  /// 单次 HTTP 的超时（建连 + 读响应 + 收流）。
+  ///
+  /// 为什么必须有：被墙 / 挂掉的源会**一直挂着不动**，没有超时面板的「刷新」就永远
+  /// 转圈；有了它，"这条链不通"才能变成一个可读原因、进而触发换下一个源。
+  final Duration timeout;
 
   /// 注入的 HTTP 取回器（null = 用本类自带的 `dart:io HttpClient`）。
   ///
@@ -496,17 +621,33 @@ class PluginDownloader {
 
   // ── ① 取索引（联网那一段）─────────────────────────────────────────────
 
-  /// 拉最新 release 的 `plugin-index.json` 并缓存，然后回清单。
+  /// 逐源拉最新 release 的 `plugin-index.json` 并缓存，然后回清单。
   ///
+  /// **多源回退**：按 [sources] 的顺序逐个试，第一个成功的胜出；全失败时把**每个源
+  /// 各自的原因**拼成一句报出来（"Gitee 不通、GitHub 限流"比笼统的"刷新失败"有用得多）。
   /// 失败都回可读原因（网络、404「这个仓库还没发布任何 release」、403/429 限流、
   /// 以及"有 release 但没有索引资产"），**不静默回退到本地旧缓存** —— 面板要能说出
   /// "这次没刷成功，你现在看到的是上一次的那份"，所以调用方失败后自己再读 [cachedListing]。
   Future<PluginReleaseListing> refresh() async {
-    final Uri releaseUri = Uri.parse('$apiBase/repos/$repo/releases/latest');
-    final PluginFetchResult meta = await _get(releaseUri);
+    final List<String> failures = <String>[];
+    for (final PluginReleaseSource source in sources) {
+      final PluginReleaseListing listing = await _refreshFrom(source);
+      if (listing.ok) return listing;
+      failures.add('${source.name}：${listing.error}');
+    }
+    return PluginReleaseListing.failed(
+      '所有发布源都没刷成功 —— ${failures.join('；')}',
+      indexPath: indexPath,
+    );
+  }
+
+  /// 从**一个**源拉索引：失败只回可读原因（要不要换下一个源由 [refresh] 决定）。
+  Future<PluginReleaseListing> _refreshFrom(PluginReleaseSource source) async {
+    final Uri releaseUri = source.latestRelease;
+    final PluginFetchResult meta = await _get(releaseUri, source);
     if (!meta.ok) {
       return PluginReleaseListing.failed(
-        _httpFailure('取最新 release 失败', meta, releaseUri),
+        _httpFailure('取最新 release 失败', meta, releaseUri, source),
         indexPath: indexPath,
       );
     }
@@ -530,7 +671,7 @@ class PluginDownloader {
     }
     if (release is! Map) {
       return PluginReleaseListing.failed(
-        'release 响应不是 JSON 对象（形状与 GitHub API 不符）',
+        'release 响应不是 JSON 对象（形状与发布平台 API 不符）',
         indexPath: indexPath,
       );
     }
@@ -551,13 +692,17 @@ class PluginDownloader {
         indexPath: indexPath,
       );
     }
-    final PluginFetchResult index = await _get(Uri.parse(indexAsset.url));
+    final PluginFetchResult index = await _get(
+      Uri.parse(indexAsset.url),
+      source,
+    );
     if (!index.ok) {
       return PluginReleaseListing.failed(
         _httpFailure(
           '下载 $kPluginIndexAsset 失败',
           index,
           Uri.parse(indexAsset.url),
+          source,
         ),
         indexPath: indexPath,
       );
@@ -579,9 +724,16 @@ class PluginDownloader {
         indexPath: indexPath,
       );
     }
-    log?.call('插件发布仓库：索引已更新（release $tag，$kPluginIndexAsset）');
-    final PluginReleaseListing parsed = _readIndex(tag: tag, online: true);
-    return parsed;
+    // 记下"这一份索引来自哪个源"：install 查资产时**优先回同一个源** —— 索引出自
+    // Gitee、资产却去 GitHub 找，两边的 tag 未必同步，"合同"与"这批文件"就对不上了。
+    // 写不进只是诊断信息丢失（索引已经拿到了），不因此报失败。
+    try {
+      File(_sourceMarkerPath).writeAsStringSync(source.name);
+    } catch (_) {}
+    log?.call(
+      '插件发布仓库：索引已更新（来自 ${source.name}，release $tag，$kPluginIndexAsset）',
+    );
+    return _readIndex(tag: tag, online: true, source: source.name);
   }
 
   /// 读本地缓存的索引（**不联网**）。没有缓存 ⇒ 可读的"先点刷新"。
@@ -592,7 +744,7 @@ class PluginDownloader {
         indexPath: indexPath,
       );
     }
-    return _readIndex(tag: _cachedTag(), online: false);
+    return _readIndex(tag: _cachedTag(), online: false, source: _cachedSource());
   }
 
   ({String url, int size})? _findIndexAsset(List<dynamic> assets) {
@@ -612,8 +764,20 @@ class PluginDownloader {
     return marker.existsSync() ? marker.readAsStringSync().trim() : '';
   }
 
+  /// "这一份索引来自哪个源"的记名文件（与 tag 一样是诊断信息，写不进不影响正确性）。
+  String get _sourceMarkerPath => p.join(cacheDir, 'release-source.txt');
+
+  String _cachedSource() {
+    final File marker = File(_sourceMarkerPath);
+    return marker.existsSync() ? marker.readAsStringSync().trim() : '';
+  }
+
   /// 解析索引（[refresh] 与 [cachedListing] 共用同一段校验 —— 两条路必须同口径）。
-  PluginReleaseListing _readIndex({required String tag, required bool online}) {
+  PluginReleaseListing _readIndex({
+    required String tag,
+    required bool online,
+    String source = '',
+  }) {
     final Map<String, dynamic> json;
     try {
       final Object? decoded = jsonDecode(
@@ -680,6 +844,7 @@ class PluginDownloader {
       tag: tag,
       indexPath: indexPath,
       online: online,
+      source: source,
     );
   }
 
@@ -862,6 +1027,9 @@ class PluginDownloader {
 
     // ① 资产进缓存（缺什么就下什么；字节数不符 = 失败且不落地）
     int downloadedBytes = 0;
+    // 这批文件是从哪个源下的（缓存全命中时用索引缓存时记下的那个）——如实带进回包。
+    final String cachedSource = _cachedSource();
+    String usedSource = cachedSource.isEmpty ? listing.source : cachedSource;
     final Map<String, String> ready = <String, String>{}; // target → 缓存路径
     for (final PluginRepoFile file in entry.files) {
       final String cachedPath = p.join(
@@ -876,18 +1044,28 @@ class PluginDownloader {
         ready[file.target] = cachedPath;
         continue;
       }
-      final ({String url, int size})? asset = await _lookupAsset(file.asset);
+      final ({String url, int size, PluginReleaseSource source})? asset =
+          await _lookupAsset(file.asset);
       if (asset == null) {
         return PluginInstallResult.failed(
-          '最新 release 里找不到资产「${file.asset}」（插件 $id 需要它）：'
+          '发布源里找不到资产「${file.asset}」（插件 $id 需要它）：'
           '发布与索引不同版 ⇒ 请重新发布，或先刷新索引',
           pluginId: id,
         );
       }
-      final PluginFetchResult data = await _get(Uri.parse(asset.url));
+      usedSource = asset.source.name;
+      final PluginFetchResult data = await _get(
+        Uri.parse(asset.url),
+        asset.source,
+      );
       if (!data.ok) {
         return PluginInstallResult.failed(
-          _httpFailure('下载资产「${file.asset}」失败', data, Uri.parse(asset.url)),
+          _httpFailure(
+            '下载资产「${file.asset}」失败',
+            data,
+            Uri.parse(asset.url),
+            asset.source,
+          ),
           pluginId: id,
         );
       }
@@ -987,7 +1165,8 @@ class PluginDownloader {
     };
     log?.call(
       '插件发布仓库：已放置 $id（${entry.version}，${placed.length} 个文件，'
-      '本次下载 $downloadedBytes 字节）到 $installDir',
+      '本次下载 $downloadedBytes 字节，来自 ${usedSource.isEmpty ? '（未知）' : usedSource}）'
+      '到 $installDir',
     );
     return PluginInstallResult(
       ok: true,
@@ -997,28 +1176,45 @@ class PluginDownloader {
       entry: configEntry,
       swapped: true,
       downloaded: downloadedBytes,
+      source: usedSource,
       note:
           '文件已就位；插件条目由调用方写入 plugins.yaml 并热应用'
           '（起不来的原因会由面板与日志如实给出）',
     );
   }
 
-  /// 按资产名去最新 release 里查下载地址（install 时再查一次，而不是把 URL 缓存进索引：
+  /// 按资产名去**发布源**里查下载地址（install 时再查一次，而不是把 URL 缓存进索引：
   /// release 资产的 URL 带 id，重新发布就会变；缓存下来的旧 URL 会把人带到 404）。
-  Future<({String url, int size})?> _lookupAsset(String assetName) async {
-    final PluginFetchResult meta = await _get(
-      Uri.parse('$apiBase/repos/$repo/releases/latest'),
-    );
-    if (!meta.ok) return null;
-    final Object? release;
-    try {
-      release = jsonDecode(utf8.decode(meta.bytes));
-    } catch (_) {
-      return null;
+  ///
+  /// **优先回这份索引来自的那个源**，再依次试其余源 —— 索引出自 Gitee、资产却去
+  /// GitHub 找，两边的 tag 未必同步，"合同"与"这批文件"就对不上了。
+  Future<({String url, int size, PluginReleaseSource source})?> _lookupAsset(
+    String assetName,
+  ) async {
+    final String preferred = _cachedSource();
+    final List<PluginReleaseSource> ordered = <PluginReleaseSource>[
+      for (final PluginReleaseSource s in sources)
+        if (s.name == preferred) s,
+      for (final PluginReleaseSource s in sources)
+        if (s.name != preferred) s,
+    ];
+    for (final PluginReleaseSource source in ordered) {
+      final PluginFetchResult meta = await _get(source.latestRelease, source);
+      if (!meta.ok) continue;
+      final Object? release;
+      try {
+        release = jsonDecode(utf8.decode(meta.bytes));
+      } catch (_) {
+        continue;
+      }
+      final Object? assets = release is Map ? release['assets'] : null;
+      if (assets is! List) continue;
+      final ({String url, int size})? found = _findAsset(assets, assetName);
+      if (found != null) {
+        return (url: found.url, size: found.size, source: source);
+      }
     }
-    final Object? assets = release is Map ? release['assets'] : null;
-    if (assets is! List) return null;
-    return _findAsset(assets, assetName);
+    return null;
   }
 
   ({String url, int size})? _findAsset(List<dynamic> assets, String name) {
@@ -1034,50 +1230,67 @@ class PluginDownloader {
 
   // ── 内部：HTTP 与原子写 ────────────────────────────────────────────────
 
-  Future<PluginFetchResult> _get(Uri url) async {
+  Future<PluginFetchResult> _get(Uri url, PluginReleaseSource source) async {
+    final Map<String, String> headers = source.headers;
     final PluginFetcher? injected = fetcherOverride;
     if (injected != null) {
-      return injected(url, headers: _headers);
+      return injected(url, headers: headers);
     }
     // 注入的客户端归注入方；自己建的那一份留到 [close] 里收。
     final HttpClient client = injectedClient ?? (_ownedClient ??= HttpClient());
+    // 建连超时和读超时都要有：被墙的源会在**连接**这一步就挂着，不设它连
+    // "换下一个源"都轮不到（面板只会永远转圈）。注入的客户端也照设（幂等）。
+    client.connectionTimeout = timeout;
     try {
-      final HttpClientRequest request = await client.getUrl(url);
-      _headers.forEach(
+      final HttpClientRequest request = await client
+          .getUrl(url)
+          .timeout(timeout);
+      headers.forEach(
         (String key, String value) => request.headers.set(key, value),
       );
-      // GitHub API 要求 User-Agent；缺了会被拒成 403，而那条错误看上去像"没权限"。
+      // 有些 API 要求 User-Agent；缺了会被拒成 403，而那条错误看上去像"没权限"。
       request.headers.set(HttpHeaders.userAgentHeader, 'tree-desktop-core');
       request.followRedirects = true;
       request.maxRedirects = 5;
-      final HttpClientResponse response = await request.close();
+      final HttpClientResponse response = await request.close().timeout(timeout);
       // 响应体是 Stream<List<int>>：逐块收进一个列表，收完才交给上层校验字节数。
       final List<int> bytes = <int>[];
-      await for (final List<int> chunk in response) {
+      await for (final List<int> chunk in response.timeout(timeout)) {
         bytes.addAll(chunk);
       }
       return PluginFetchResult(statusCode: response.statusCode, bytes: bytes);
+    } on TimeoutException {
+      return PluginFetchResult.failure(
+        '请求超时（${timeout.inMilliseconds} 毫秒）：$url',
+      );
     } catch (error) {
       // 网络失败**不静默重试**（那是"看起来在转圈"的根源），一次就把原因说清。
       return PluginFetchResult.failure('$error');
     }
   }
 
-  Map<String, String> get _headers => <String, String>{
-    'Accept': 'application/vnd.github+json',
-    if (accessToken.trim().isNotEmpty)
-      'Authorization': 'Bearer ${accessToken.trim()}',
-  };
-
-  String _httpFailure(String what, PluginFetchResult result, Uri url) {
+  /// HTTP 失败的可读原因（按[源]说，不再假定是 GitHub：多源回退下"哪个源、为什么"才是关键）。
+  String _httpFailure(
+    String what,
+    PluginFetchResult result,
+    Uri url,
+    PluginReleaseSource source,
+  ) {
     final String reason = result.error.isNotEmpty
         ? result.error
         : 'HTTP ${result.statusCode}';
-    final String hint = result.statusCode == 403 || result.statusCode == 429
-        ? '（GitHub API 限流：公开仓库匿名每小时 60 次；需要更多请给核心设 GITHUB_TOKEN）'
-        : result.statusCode == 404
-        ? '（404：这个仓库还没有 release，或坐标写错了：$repo）'
-        : '';
+    final String hint;
+    if (result.statusCode == 403 || result.statusCode == 429) {
+      hint =
+          '（${source.name} 限流或拒绝：匿名读有配额；可给核心设 GITHUB_TOKEN / '
+          'GITEE_TOKEN 提额）';
+    } else if (result.statusCode == 401) {
+      hint = '（${source.name} 需要令牌：给核心设 GITEE_TOKEN / GITHUB_TOKEN）';
+    } else if (result.statusCode == 404) {
+      hint = '（404：这个仓库还没有 release，或坐标写错了：${source.repo}）';
+    } else {
+      hint = '';
+    }
     return '$what：$reason $url$hint';
   }
 
