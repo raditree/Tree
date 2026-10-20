@@ -148,6 +148,21 @@
     `test/right_panel_host_test.dart`（「+」紧跟在最后一个 chip 之后、不贴右端）、
     `test/file_editor_test.dart` 与 `test/file_tree_viewer_sync_test.dart`（行号槽与文件窗端到端不受影响）。
 
+- **插件发布源从"只有 GitHub"改成"有序多源（Gitee 优先、GitHub 兜底），逐源回退且来源如实标出"**
+  （**修改**
+  [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md)
+  不变量 29「离线不许看起来像最新」一段；用户 2026-10-20：「关键是你是否支持了从 gitee 下载插件」）：
+  - 新增 `PluginReleaseSource`（坐标 + REST 基址 + 令牌的**鉴权形式** + Accept 头，做成**数据**
+    而不是请求处的平台分支）与 `defaultPluginReleaseSources`；默认顺序 **Gitee → GitHub**，
+    `TREE_PLUGIN_RELEASE_ORDER` 可改、认不出的 key 回落默认，token 走 `GITEE_TOKEN` / `GITHUB_TOKEN`；
+  - `refresh()` **逐源尝试、第一个通的胜出**并把 `source` 写进回包（面板「本次来源 X」），
+    全部失败时把**各源原因**都报出来（"Gitee 不通、GitHub 限流"不是笼统的"刷新失败"）；
+    索引缓存另记 `release-source.txt`，`install` 查资产时**优先回同一个源**（两边的 tag 未必同步）；
+  - 单次 HTTP 加 **30 秒超时**（建连 + 读响应 + 收流）：被墙的源必须能变成"这条链不通"，
+    而不是让面板永远转圈；HTTP 失败文案**去 GitHub 化**（403/429/401/404 按**当前源**说）。
+  - 用例：`packages/tree_core/test/plugin_downloader_test.dart`（新增 7：逐源回退与全失败、
+    源顺序解析与默认清单、来源带进回包、真实 socket 上的读超时）。
+
 ## [1.0.4+2] — 2026-10-18
 
 ### 断言变化（新增 / 修改的 README 不变量）

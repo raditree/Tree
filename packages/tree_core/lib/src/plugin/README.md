@@ -10,7 +10,7 @@
 | [plugin_host.dart](plugin_host.dart) | 进程外插件宿主：行分隔 JSON-RPC 2.0，入站报文分三类（响应 / 请求 / 通知） |
 | [plugin_bus.dart](plugin_bus.dart) | 总线：配置、实例生命周期、事件分发、工具聚合、站点体系、心跳判活 |
 | [plugin_config_store.dart](plugin_config_store.dart) | `plugins.yaml` 读写层：直接在原始 Map 上"读 → 改 → 原子写"（保留未知键） |
-| [plugin_downloader.dart](plugin_downloader.dart) | 插件**发布仓库**（只读 GitHub Release 资产）：取索引 / 校验 / 下载缓存 / 原子放置（不落盘、不动总线） |
+| [plugin_downloader.dart](plugin_downloader.dart) | 插件**发布仓库**（只读 Gitee / GitHub Release 资产，有序多源自动回退）：取索引 / 校验 / 下载缓存 / 原子放置（不落盘、不动总线） |
 | [builtin_plugins.dart](builtin_plugins.dart) | 内置插件静态清单 + 运行时 / 脚本解析 |
 | [plugin_guide.dart](plugin_guide.dart) | 插件开发指南在工作空间内的落点（`.self/docs/plugin-development.md`）与播种 |
 
@@ -301,13 +301,18 @@
       （面板当场说得出原因），不是等用户点了安装才失败。
     - **离线不许看起来像最新**：`GET /api/plugin/release` 只读缓存（一个 URL 都不碰）并把
       `online: false` 写进回包；刷新失败也回 **200 + `ok:false` + 缓存那一份**（`cached`），
-      否则"GitHub 今晚限流"会显示成"这个仓库没有插件"。只有安装失败回 400 + `detail`，
+      否则"今晚哪个源被限流"会显示成"这个仓库没有插件"。只有安装失败回 400 + `detail`，
       因为那一次确实什么都没改。
     - 脚本型条目（`runtime: python`）用**与内置插件同一个**探测口径
       （`BuiltinPluginCatalog.detectRuntime`）：探不到解释器就拒装，而不是写一条注定起不来的
       配置（面板上多一个永远"启动失败"的条目比不装更糟）。解释器回的是
       `BuiltinRuntime`（命令 + 前缀参数）而不是一个字符串：Windows 上命中的常常是 `py -3`。
-    用例：[test/plugin_downloader_test.dart](../../../test/plugin_downloader_test.dart)（20，整条链离线跑）、
+    - **多源回退，来源如实标出**（2026-10-20）：默认 `Gitee → GitHub`（`PluginReleaseSource`
+      有序清单，`TREE_PLUGIN_RELEASE_ORDER` 改序），逐源试、第一个通的胜出，并把 `source`
+      写进回包与面板；索引缓存里同时记 `release-source.txt`，`install` 查资产时**优先回同一个
+      源**（两边的 tag 未必同步）。全部失败 ⇒ 各源原因都报出来；单次请求 30 秒超时 —— 被墙的
+      源必须能变成"这条链不通"再换下一个，而不是永远转圈。
+    用例：[test/plugin_downloader_test.dart](../../../test/plugin_downloader_test.dart)（32，整条链离线跑）、
     [test/plugin_config_api_test.dart](../../../test/plugin_config_api_test.dart)（新增 9 条 REST）、
     面板与详情页：`test/plugin_panel_admin_test.dart`（新增 6）、`test/plugin_detail_page_test.dart`（新增 2）。
     合同原文见仓库根 [plugins/README.md](../../../../../plugins/README.md)。

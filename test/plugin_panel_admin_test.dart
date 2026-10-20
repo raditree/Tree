@@ -696,7 +696,7 @@ void main() {
     expect(find.text('样例插件'), findsOneWidget);
   });
 
-  // ── 发布仓库（阶段 5：插件管理只拉 GitHub Release 资产，不拉源码）──────
+  // ── 发布仓库（阶段 5：插件管理只拉发布源的 Release 资产，不拉源码）──────
 
   testWidgets('发布仓库：进页面先读缓存，再后台自动拉（失败不阻塞、不弹 snack）', (WidgetTester tester) async {
     final _FakeAdmin admin = _FakeAdmin();
@@ -708,7 +708,7 @@ void main() {
       contains('release:refresh'),
       reason: 'B 覆盖阶段 5「面板打开不联网」：索引进页面后台自动拉（GET 本身仍只读缓存）',
     );
-    expect(find.textContaining('只读 GitHub Release 资产'), findsOneWidget);
+    expect(find.textContaining('只读发布源的 Release 资产'), findsOneWidget);
     expect(
       find.textContaining('本机还没有发布索引的缓存'),
       findsOneWidget,

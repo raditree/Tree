@@ -162,8 +162,9 @@ abstract final class ApiPaths {
 
   /// 拉最新 release 的发布索引并缓存（POST，**联网**）：成功回清单，失败回可读原因。
   ///
-  /// 只读 GitHub **Releases 资产**，不 `git clone` 源码：`plugins` 仓里放的是给人改的
-  /// 源码，装机端要的是发布方事先备好的成品（索引就是那张合同）。
+  /// 只读**发布源**的 **Releases 资产**（默认 Gitee → GitHub，逐源回退；回包带
+  /// `source` 说明这一版是从哪个源拿的），不 `git clone` 源码：`plugins` 仓里放的是
+  /// 给人改的源码，装机端要的是发布方事先备好的成品（索引就是那张合同）。
   static const String pluginReleaseRefresh = '/api/plugin/release/refresh';
 
   /// 从发布仓库装一条插件（POST，`pluginId` 取自索引）。

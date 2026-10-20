@@ -571,7 +571,7 @@ class PluginDetailPage extends StatelessWidget {
     final String repoVersion = (entry['repo_version'] ?? '').toString().trim();
     if (source.isEmpty && repoVersion.isEmpty) return '';
     final String label = source == 'release'
-        ? '发布仓库（只拉 GitHub Release 资产）'
+        ? '发布仓库（拉发布源 Release 资产）'
         : source;
     return repoVersion.isEmpty ? label : '$label · 已装 $repoVersion';
   }

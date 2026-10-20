@@ -785,7 +785,7 @@ void main() {
     expect(
       find.descendant(
         of: detail,
-        matching: find.textContaining('发布仓库（只拉 GitHub Release 资产） · 已装 1.2.0'),
+        matching: find.textContaining('发布仓库（拉发布源 Release 资产） · 已装 1.2.0'),
       ),
       findsOneWidget,
       reason: '“这一条是从发布仓库装的、装的是哪一版”必须看得到',

@@ -792,8 +792,15 @@ plugins:
 ### 6.8 发布仓库：插件管理只拉 release（阶段 5）
 
 用户口径（2026-10-16 定稿）：**`plugins/` 仓里是插件源码，插件管理只拉 release**。
-装机端只读 `raditree/tree-plugins` 的 **GitHub Release 资产**，不 `git clone` 源码：
+装机端只读 `raditree/tree-plugins` 的 **Release 资产**，不 `git clone` 源码：
 源目录形状、构建产物在不在、谁负责编译，不该在用户机器上现场猜。
+
+**发布源是 Gitee 与 GitHub 两个**（2026-10-20 起，`raditree/tree-plugins` 同名两处，
+同一版成品）：默认**逐源回退**（Gitee 优先、GitHub 兜底，`TREE_PLUGIN_RELEASE_ORDER`
+可改顺序），第一个通的源胜出，回包/面板如实标出 `source`；全失败时把**每个源各自的
+原因**都报出来。token 走 `GITEE_TOKEN` / `GITHUB_TOKEN`（公开仓库不登录也能读，
+只在限流/401 时才用得上），单次请求有 30 秒超时 —— 被墙的源要能变成"这条链不通"，
+而不是让面板永远转圈。
 
 合同的原文在 [plugins/README.md](../plugins/README.md)；装机端的实现是
 [plugin_downloader.dart](../packages/tree_core/lib/src/plugin/plugin_downloader.dart)，
@@ -802,7 +809,7 @@ plugins:
 | 路由 | 做什么 | 失败时的形状 |
 |---|---|---|
 | `GET /api/plugin/release` | 读**本地缓存**的索引（一个 URL 都不碰，`online: false`） | 200 + `ok:false` + 可读原因 |
-| `POST /api/plugin/release/refresh` | `releases/latest` → `plugin-index.json` → 缓存 | 200 + `ok:false` + 原因 + `cached`（上一次那份） |
+| `POST /api/plugin/release/refresh` | 逐源试 `releases/latest` → `plugin-index.json` → 缓存 | 200 + `ok:false` + 各源原因 + `cached`（上一次那份） |
 | `POST /api/plugin/release/{pluginId}/install` | 资产进缓存 → 闸门 → 原子改名 → 写条目 + 热应用 | 400 + `detail`（那一次确实什么都没改） |
 
 三个关键点（都是现场能复现的）：

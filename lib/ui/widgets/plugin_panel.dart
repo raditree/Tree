@@ -52,8 +52,9 @@ abstract class PluginAdminClient {
 
   /// 拉最新 release 的发布索引（**联网**）：POST /api/plugin/release/refresh。
   ///
-  /// 只读 GitHub Release 资产，不 `git clone` 源码（插件仓里是给人改的源码，装机端
-  /// 要的是发布方事先备好的成品）。失败仍回 `ok:false` + 可读原因 + `cached`。
+  /// 只读**发布源**的 Release 资产（Gitee 优先、GitHub 兜底，两个源自动回退），
+  /// 不 `git clone` 源码（插件仓里是给人改的源码，装机端要的是发布方事先备好的成品）。
+  /// 失败仍回 `ok:false` + 可读原因 + `cached`。
   Future<Map<String, dynamic>> refreshRelease();
 
   /// 从发布仓库装一条插件：POST /api/plugin/release/{id}/install。
@@ -283,6 +284,10 @@ class _PluginPanelState extends State<PluginPanel> {
   /// 这份索引来自哪个 release tag（离线读缓存时可能是空）。
   String _releaseTag = '';
 
+  /// 这份索引来自哪个**发布源**（`Gitee` / `GitHub`；多源回退后"这次是从哪儿拿的"
+  /// 就是排查问题的第一条线索，所以照核心的回包原样显示，不在面板里再猜一遍）。
+  String _releaseSource = '';
+
   /// 当前列表是**联网取的**还是读的本地缓存（离线不许看起来像最新）。
   bool _releaseOnline = false;
 
@@ -372,7 +377,7 @@ class _PluginPanelState extends State<PluginPanel> {
         ]
       : <Map<String, dynamic>>[];
 
-  // ── 发布仓库（阶段 5：只拉 GitHub Release 资产，不拉源码）─────────────
+  // ── 发布仓库（阶段 5：只拉发布源的 Release 资产，不拉源码）─────────────
 
   /// 读**本地缓存**的发布清单（不联网）。
   Future<void> _loadRelease() async {
@@ -434,6 +439,7 @@ class _PluginPanelState extends State<PluginPanel> {
         ];
       }
       _releaseTag = (listing['tag'] ?? '').toString();
+      _releaseSource = (listing['source'] ?? '').toString();
       _releaseOnline = listing['online'] == true;
       _releaseIndexPath = (listing['index_path'] ?? '').toString();
       _releaseError = keepError.isNotEmpty
@@ -1525,7 +1531,8 @@ class _PluginPanelState extends State<PluginPanel> {
           children: <Widget>[
             Expanded(
               child: Text(
-                '只读 GitHub Release 资产（不拉插件源码）。当前：$source',
+                '只读发布源的 Release 资产（Gitee 优先、GitHub 兜底，不拉插件源码）。'
+                '${_releaseSource.isEmpty ? '' : '本次来源 $_releaseSource；'}当前：$source',
                 style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
               ),
             ),

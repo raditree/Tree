@@ -1119,17 +1119,19 @@ class ApiService {
 
   /// 发布仓库清单（**只读本地缓存**）：GET [ApiPaths.pluginRelease]
   ///
-  /// 返回 `{ok, entries[], skipped[], tag, index_path, online, error}`。注意它**不联网**：
-  /// 面板打开时用它，才能立刻列出“上次看到的那些”；联网拉取是 [refreshPluginRelease]。
-  /// “没缓存”也回 `ok:false` + 中文原因（而不是抛异常），面板把那句话直接显示出来。
+  /// 返回 `{ok, entries[], skipped[], tag, index_path, online, source, error}`。注意它
+  /// **不联网**：面板打开时用它，才能立刻列出“上次看到的那些”；联网拉取是
+  /// [refreshPluginRelease]。“没缓存”也回 `ok:false` + 中文原因（而不是抛异常），
+  /// 面板把那句话直接显示出来。
   static Future<Map<String, dynamic>> getPluginRelease() async {
     return _getJson(ApiPaths.pluginRelease);
   }
 
   /// 拉最新 release 的发布索引（**联网**）：POST [ApiPaths.pluginReleaseRefresh]
   ///
-  /// 只读 GitHub Release 资产（核心不 clone 源码）。失败时核心仍回 200 + `ok:false`，
-  /// 并附上 `cached`（上一次那份清单）——这样“GitHub 今晚限流”不会显示成“仓库里没插件”。
+  /// 只读**发布源**的 Release 资产（默认 Gitee → GitHub 自动回退；核心不 clone 源码）。
+  /// 失败时核心仍回 200 + `ok:false`，并附上 `cached`（上一次那份清单）——这样
+  /// “今晚哪个源被限流/被墙”不会显示成“仓库里没插件”。
   static Future<Map<String, dynamic>> refreshPluginRelease() async {
     return _postJson(ApiPaths.pluginReleaseRefresh);
   }
