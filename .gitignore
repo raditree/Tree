@@ -108,6 +108,10 @@ agentspace
 /.dsh-plugins/
 # 构建 / 运行产物目录（开发期脚本会往这里写东西）
 /.output/
+# 包内构建 / 测试产物（上面的 /build/ 只锚在仓根，包内目录需单独忽略）
+packages/*/build/
+# 本地计划目录（编辑器 / AI 工具的个人草稿，不属于仓库源码）
+/.qoder/
 # 根级 Node 工具链残留（本仓库不用 npm；package.json 曾是空 {}）
 /node_modules/
 /package.json
