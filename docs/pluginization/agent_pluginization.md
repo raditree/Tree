@@ -54,18 +54,18 @@
 ## 2. 目标架构
 
 ```
-loader ──spawn──> tree_core.exe ──stdin/stdout──> tree.agent (binary plugin)
+loader ──spawn──> tree_core.exe ──stdin/stdout──> tree.agent (runtime: headless)
                       │                                │
                       │<── api/delegate (REST 请求) ────│
                       │<── station_delivery (topic) ────│
                       │─── workspace/register ─────────>│（登记工作空间定位）
                       │                                │
-UI (kind: ui) ──WS──> tree_core ──转发──> 订阅者
+UI (runtime: ui) ──WS──> tree_core ──转发──> 订阅者
 ```
 
 | 项 | 约定 |
 | --- | --- |
-| 形态 | `kind: binary`，Dart AOT 单文件可执行体 |
+| 形态 | `runtime: headless`，`command` 指向 Dart AOT 单文件可执行体 |
 | 代码来源 | 新包 `packages/tree_agent`，从 `tree_core` 平移；**不得反向依赖 `tree_core`** |
 | 传输 | stdio 行式 JSON-RPC（与现有插件一致） |
 | 对外 API | 25 条委派路由，由 `system.collect.api.routes` 申报 |

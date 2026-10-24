@@ -8,7 +8,7 @@
 
 ## 0. 一句话
 
-把「整个 Flutter 前端」做成插件平台里的**一种插件**（`kind: ui`），把原本由核心提供的**领域型 API**（UI、agent、Git、Spec、MCP、文件）逐组迁给插件；核心最终只剩三类能力：**插件体系基础 API + 日志 API + 数据存储 API**。
+把「整个 Flutter 前端」做成插件平台里的**一种插件**（`runtime: ui`），把原本由核心提供的**领域型 API**（UI、agent、Git、Spec、MCP、文件）逐组迁给插件；核心最终只剩三类能力：**插件体系基础 API + 日志 API + 数据存储 API**。
 
 **核心的定位随之改变**：从「Agent 系统的调度核心」变为「**面向未来的插件型超级应用的调度核心**」。核心不认识 agent、会话、提问、团队——这些全部是插件的领域知识。
 
@@ -46,7 +46,7 @@
 | ----- | ----------------------- | ------------------------------------------- | ----------- |
 | 内核    | `tree_core.exe`         | HTTP + WS（127.0.0.1，随机端口 + token）           | 常驻；唯一持有内核状态 |
 | 功能插件  | `plugins/*`             | stdio 行分隔 JSON-RPC 2.0                      | 现状不变        |
-| UI 插件 | `plugins/*`（`kind: ui`） | WS 客户端（`TREE_CORE_URL` + `TREE_CORE_TOKEN`） | 新增          |
+| UI 插件 | `plugins/*`（`runtime: ui`） | WS 客户端（`TREE_CORE_URL` + `TREE_CORE_TOKEN`） | 新增          |
 | 引导壳   | `Tree.exe`（非 Flutter）   | 拉起核心 + 打开浏览器                                | 新增，**不可卸载** |
 
 启动顺序由「UI 拉起核心」反转为「loader 拉起核心 → 核心按配置拉起 UI 插件」。
@@ -125,8 +125,13 @@
 
 | 键         | 取值                                     | 归属                       |
 | --------- | -------------------------------------- | ------------------------ |
-| `runtime` | `python` \| `binary` \| **`ui`**       | 第三档，与既有两档并列              |
+| `runtime` | **`headless`** \| **`ui`**              | **唯一分类维度**：有无界面。与执行形态无关 |
+| `command` + `args` | 顶层字段（现状不变）            | **任意**执行形态与语言均由它承载；核心不按语言分支 |
 | `routes`  | `[{method, pattern}]`（可选，仅作开发期声明与面板展示） | 运行期**以收集站申报为准**，清单值不参与路由 |
+
+**执行形态与语言不进入清单分类**：脚本、原生可执行体、包管理器拉起的进程、任何解释器——都只是 `command` / `args` 的差异，核心统一按命令启动。`runtime` 只有 `headless` 与 `ui` 两档，**不存在第三档**，也不存在按语言枚举的白名单。既有 `kind` 字段降级为内部实现细节，迁移完成后删除。
+
+**兼容**：旧清单中除 `ui` 外的任意取值（如 `runtime: "python"` / `"binary"`）一律按 `headless` 解释，并在面板提示"清单待升级"；不阻断安装与启动。
 
 `runtime: ui` 的条目在 `plugins.yaml` 中沿用既有字段；未知键保留规则不变。
 
@@ -165,7 +170,7 @@
 | **版本求交** | 同一 `id` 被多个插件要求 ⇒ 取区间交集；交集为空 ⇒ 可读失败，逐条列出谁要什么 |
 | **环检测** | 依赖闭包出现环 ⇒ 拒收并列出环路径 |
 | **卸载连带** | 卸载被依赖的插件 ⇒ 提示"N 个插件依赖它"；确认后**停用**依赖方，不自动卸载 |
-| **跨类型** | 依赖与 `kind` 无关：UI 可依赖普通插件，普通插件也可依赖 UI（少见但合法） |
+| **跨类型** | 依赖与 `runtime` 无关：UI 可依赖普通插件，普通插件也可依赖 UI（少见但合法） |
 | **索引字段** | `plugin-index.json` 每条增加可选 `requires`；旧客户端忽略未知字段，schema 1 保持兼容 |
 
 依赖解析属于**平台能力**，留在核心；它不引入任何领域概念，符合收束目标。
@@ -354,7 +359,7 @@
 3. 判活 = 进程退出事件 + 该插件的 WS 连接是否在场；
 4. 退出后按既有 `lifecycle` 置 `stopped`；被配置停用则不再拉起。
 
-`PluginBus._startOne` 按 `kind` 分叉：`ui` 走 `UiHost`，其余两档路径**逐字不变**。
+`PluginBus._startOne` 按 `runtime` 分叉：`ui` 走 `UiHost`，`headless` 路径**逐字不变**。任何语言 / 执行形态都在 `headless` 这一档内，只由 `command` / `args` 决定启动方式，不参与分叉，核心代码里也不出现语言判断。
 
 ### 6.3 `ui.hello` 与身份
 
@@ -383,7 +388,7 @@
 
 ### 6.5 多窗口
 
-订阅是按**连接**而非按插件：一个 UI 进程可开 N 条 WS 连接，各订不同站点，每个窗口只收自己要的数据。多个 `kind: ui` 插件也可并存。核心不引入任何"窗口"概念。
+订阅是按**连接**而非按插件：一个 UI 进程可开 N 条 WS 连接，各订不同站点，每个窗口只收自己要的数据。多个 `runtime: ui` 插件也可并存。核心不引入任何"窗口"概念。
 
 ### 6.6 `capabilities`
 
@@ -569,7 +574,7 @@ UI 插件可申报图标，核心通过内置收集站 `system.collect.ui.brandi
 | -- | --------------------------------------- | -------------------------------- | -------------------------------------------------- |
 | B  | 站点总线接 WS 订阅 + `/api/meta`               | —                                | UI 能订广播并收到投递；收集站仍只由核心触发                 |
 | C  | **18 条**领域委派（C-1 JSON 7 条，C-2 二进制 11 条） | `git` / `spec` / `mcp` / `files` | 18 条全部由插件供，核心对应路由全部移除                              |
-| D  | `kind: ui` + `UiHost` + **依赖闸门**         | —                                | 多个 UI 可并存、可独立卸载；缺依赖时拒绝启用并可一键补齐                 |
+| D  | `runtime: ui` + `UiHost` + **依赖闸门**      | —                                | 多个 UI 可并存、可独立卸载；缺依赖时拒绝启用并可一键补齐                 |
 | E  | 引导壳 + 删除旧 UI 面板协议                       | —                                | 卸掉所有 UI 后能从引导页装回                                   |
 | F  | 日志 API + 数据存储 API                       | —                                | 插件只经由公共出口读日志/落盘，跨命名空间被拒                            |
 | G  | **agent 面 25 条 + 领域帧所有权移交**             | `tree.agent`                     | 25 条由插件供；核心无 agent/session/question/ssh 路由，也不识别领域帧 |
@@ -589,7 +594,7 @@ UI 插件可申报图标，核心通过内置收集站 `system.collect.ui.brandi
 | A | 协议面新增                | `api_paths.dart`（+3 路径、`coreOwned` / `delegated` 集合）、`ws_inbound.dart`（+6 帧）、`ws_outbound.dart`（+1 帧）、`station_ws.dart`、`meta.dart`、`plugin_rpc_methods.dart`（+`api/delegate`、`workspace/register`） | 路径覆盖度与新帧编解码用例全绿                                                                          |
 | B | 站点接 WS + meta + 推送通道 | `core_server.dart`（连接身份、`ui.hello`、`/api/meta`）、`station_instance.dart`（订阅通道抽象、`closed` 终止帧）、`stations.dart`（订阅与注册权限、`topics[]` 过滤、按 `plugin_id` 归属）、`plugin_bus.dart`（投递分流）                        | 订广播收到投递 / 订自建站收到推送 / 下线收到 `closed` / 订中转被拒 / 身份不符被拒 / 申报后 `meta` 增长 / UI 自建站只限广播 / 关窗不销毁 |
 | C | 委派 + **18 条全搬**      | `http_router.dart`（`DelegatedRouter`）、`core_server.dart`（查表点、信封构造、`body_path`/`result_path` 落盘与清理）、`station_points.dart`（新收集站）、`station_ids.dart`、`plugin_bus.dart`（`api/delegate` 路由）、移除 18 条核心路由  | 插件未装/停用/在位三态正确；`coreOwned ∪ delegated == kept`；大文件下载无完整内存驻留                              |
-| D | kind:ui              | `builtin_plugins.dart`（`kindUi`）、`plugin_config_store.dart`（`runtime`）、`ui_host.dart`、`plugin_bus.dart`（`_startOne` 分叉）、`plugin_downloader.dart`（卸载目标）                                              | 多 UI 并存；卸一个不影响其他；全停用后核心健康                                                                |
+| D | runtime:ui           | `builtin_plugins.dart`（`runtime` 取值）、`plugin_config_store.dart`（`runtime` 两档）、`ui_host.dart`、`plugin_bus.dart`（`_startOne` 分叉）、`plugin_downloader.dart`（卸载目标）                                              | 多 UI 并存；卸一个不影响其他；全停用后核心健康                                                                |
 | E | 引导壳 + 删除             | token 作用域注册表、`/bootstrap`、`/api/bootstrap/session`、`assets`→种子化 HTML、非 Flutter loader、删除 §3.6 全部对象                                                                                                  | 全量测试 + flutter；手工走通「卸光 → 引导页装回」与「只剩悬浮球 → 仍开引导页」                                          |
 | F | 日志 + 存储              | `api_paths.dart`（+7）、`core_server.dart`（两组路由）、`util/core_log_sink.dart`（源注册与尾部读）、`store/`（命名空间代理、配额、etag）                                                                                           | 源列表/尾部读/清空；`ns != plugin_id` 403；配额与 etag 冲突可读                                           |
 | G | agent 面交接            | 见 [agent\_pluginization.md](agent_pluginization.md) §6；本仓只负责**删除** 25 条路由与领域帧，插件侧在 `tree-plugins` 仓交付                                                                                               | 25 条由插件供且零功能丢失；核心 grep 不到领域模型                                                            |
@@ -606,7 +611,7 @@ UI 插件可申报图标，核心通过内置收集站 `system.collect.ui.brandi
 | 核心 · 推送     | 插件自建广播站 → UI 收到；插件下线 → 收到 `state:"closed"`；公告板晚连回看                                      |
 | 核心 · 发现面    | 插件申报路由后 `meta.routes` 增长；自建站注册后 `meta.stations` 增长；未知 capability 原样透传                   |
 | 核心 · 委派     | 三态回包（503/504/502）、双家申报拒收、四元组与只读上下文透传、白名单外路径 404、`body_path`/`result_path` 流式与临时文件清理     |
-| 核心 · 生命周期   | `kind: ui` 分叉不影响 python/binary；UI 退出置 stopped；卸载四段顺序                                    |
+| 核心 · 生命周期   | `runtime: ui` 分叉不影响 `headless`（任意语言 / 执行形态）；UI 退出置 stopped；卸载四段顺序            |
 | 核心 · meta   | UI 连接数、`can_manage_plugins`、委派摘要                                                        |
 | 引导壳         | 票据单次使用、会话 token 限权（插件端点外一律 401）、到期失效、**只有** **`plugin.manage`** **缺席时才开窗**              |
 | 核心 · 日志     | 源枚举、尾部读（`tail`/`since`）、清空权限、插件源与核心源隔离                                                  |
