@@ -159,7 +159,7 @@ void main() {
       expect(spec.readme, contains('限制'));
       // 派生计数（加点位必须同时改这里）
       expect(StationPoints.ofKind(StationKind.relay), hasLength(12));
-      expect(StationPoints.all.length, 35);
+      expect(StationPoints.all.length, 36);
     });
 
     test('未接线（点位不可用）⇒ null，内置路径逐字不变', () async {

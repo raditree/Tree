@@ -8,6 +8,7 @@ import '../agent/agent_engine.dart';
 import '../agent/compaction_service.dart';
 import '../llm/llm_types.dart';
 import '../llm/openai_codec.dart';
+import '../server/http_router.dart';
 import '../store/atomic_file.dart';
 import '../store/tree_store.dart';
 import '../store/yaml_codec.dart';
@@ -121,6 +122,7 @@ class PluginBus {
     this.toolTableRefreshHook,
     this.restartBufferMaxPerPlugin = 32,
     this.restartBufferMaxTotalBytes = 1 << 20,
+    this.apiDelegateTimeout = const Duration(seconds: 30),
   }) : uiBridge = uiBridge ?? PluginUiBridge(),
        restartBuffer = PluginRestartBuffer(
          maxPerPlugin: restartBufferMaxPerPlugin,
@@ -176,6 +178,20 @@ class PluginBus {
 
   /// 心跳间隔 I（默认 10s；看门狗节拍与单拍窗口都用它）。
   final Duration heartbeatInterval;
+
+  /// `api/delegate` 的回包截止时间（默认 30s；测试可缩短）。
+  ///
+  /// 这不是"杀插件"的墙钟：到点只把**本次请求**以 504 失败，插件进程照常运行；
+  /// 与心跳判活（[missThreshold]）是两条独立的口径。
+  final Duration apiDelegateTimeout;
+
+  /// 片 C：委派路由归属表（核心接线时注入；未注入时仍可收集，只是不生效）。
+  DelegatedRouter? delegatedRouter;
+
+  /// 把核心的委派归属表接上总线（幂等）。
+  void bindDelegatedRouter(DelegatedRouter router) {
+    delegatedRouter = router;
+  }
 
   /// **重启期暂存的每插件条数上限**（默认 32，保守值；测试可缩小）。
   ///
@@ -2715,8 +2731,20 @@ class PluginBus {
     final List<StationCollectedItem> capabilityItems = <StationCollectedItem>[];
     final List<StationUnresponsive> capabilityUnresponsive =
         <StationUnresponsive>[];
+    // 片 C：委派 REST 路由申报收集站（与工具 / 点位申报共用这趟插件循环）。
+    // 归属表是**核心侧**的（DelegatedRouter 由 core_server 注入）；没注入时这一路
+    // 不订阅也不采集，避免做无用功。
+    final DelegatedRouter? routeTable = delegatedRouter;
+    final CollectStation? routeStation = routeTable == null
+        ? null
+        : stations.apiRoutesStationFor();
+    final List<StationCollectedItem> routeItems = <StationCollectedItem>[];
+    final List<StationUnresponsive> routeUnresponsive = <StationUnresponsive>[];
     // 这一趟的**消息 scope**：决定投给哪些订阅者。
     final List<StationScope> messageScopes = <StationScope>[];
+    // 委派路由申报与工具 / 点位不同：它不属于某个 team×mode 工作面，按插件自己
+    // 的 scope 各投一趟即可（通配 team 借 sentinel team 满足「消息必须能证明归属」）。
+    final List<StationScope> routeScopes = <StationScope>[];
     for (final PluginConfig config in _configs) {
       if (!config.enabled) continue;
       final PluginHost? host = _hosts[config.id];
@@ -2764,6 +2792,24 @@ class PluginBus {
           ),
           (StationRequest request) => _respondToCapability(host, request),
         );
+      }
+      // 委派 REST 路由申报：同一插件、同一份声明 scope，独立于消息工作面采集。
+      if (routeStation != null) {
+        stations.subscribe(
+          routeStation.id,
+          StationSubscriber(
+            pluginId: config.id,
+            scope: pluginScope,
+            subscribedAt: _nowSeconds(),
+          ),
+          (StationRequest request) => _respondToApiRoutes(host, request),
+        );
+        final StationScope routeScope = _routeCollectionScope(pluginScope);
+        if (!routeScopes.any(
+          (StationScope existing) => existing.exactEquals(routeScope),
+        )) {
+          routeScopes.add(routeScope);
+        }
       }
       // 采集的**消息 scope**：优先调用方指定（决定这一趟投给谁），其次插件声明，
       // 再次调用点运行期四元组。**消息侧必须能证明 team**（fail-closed）——
@@ -2833,6 +2879,22 @@ class PluginBus {
         }
       }
     }
+    // 委派路由申报：按插件自己的 scope 各投一趟（与工具 / 点位的消息 scope 解耦，
+    // 没有工作面上下文的插件也能正常申报）。
+    if (routeStation != null) {
+      for (final StationScope routeScope in routeScopes) {
+        final StationCollectResult routes = await routeStation.collect(
+          scope: routeScope,
+          meta: <String, dynamic>{
+            'purpose': 'api_route_definition',
+            'plugin_config': configFile,
+          },
+        );
+        routeItems.addAll(routes.items);
+        routeUnresponsive.addAll(routes.unresponsive);
+        skipped.addAll(routes.skipped);
+      }
+    }
     // 后续处理（触发方职责）：按来源 plugin_id 注册成动态工具。
     final List<String> registered = <String>[];
     final List<String> removed = <String>[];
@@ -2891,6 +2953,16 @@ class PluginBus {
       for (final String note in absorbed.notes) {
         log?.call('点位申报：$note');
       }
+    }
+    // 委派路由申报：**每轮重建**归属表。没回包 / schema 不过的插件按 plugin_id
+    // 整组清空（重新申报失败 = 不能再声称自己承接那条路由）；没出现在这一轮的
+    // 插件（已下线）保留上一份——请求仍能定位到归属插件并给 503，而不是 404。
+    if (routeStation != null && routeTable != null) {
+      _absorbApiRouteDeclarations(
+        table: routeTable,
+        items: routeItems,
+        unresponsive: routeUnresponsive,
+      );
     }
     // 一次收集完成 = 工具表不再脏（缓存随即清空，下次取表按新定义重建）
     final ToolDefinitionRefresh outcome = ToolDefinitionRefresh(
@@ -5999,6 +6071,188 @@ class PluginBus {
     return host.requestStation(request);
   }
 
+  /// 委派 REST 路由申报的回包实现：直接交给插件（与点位申报同形态）。
+  Future<StationReply> _respondToApiRoutes(
+    PluginHost host,
+    StationRequest request,
+  ) async {
+    return host.requestStation(request);
+  }
+
+  /// **核心 → 归属插件**的 `api/delegate` 请求（片 C）。
+  ///
+  /// [envelope] 由调用方（core_server）按 §5.2 组装：`method / path / params /
+  /// query / headers（白名单）/ scope / workspace_dir / data_dir / agent_id /
+  /// team_id / body | body_path / request_id`。
+  ///
+  /// 失败一律转成 [PluginDelegateException]（带可读 reason），由 HTTP 层映射：
+  /// - 归属插件未安装 / 已停用 / 当前不可用 ⇒ 503；
+  /// - 到 [apiDelegateTimeout] 仍未回包 ⇒ 504；
+  /// - 插件回 JSON-RPC 错误 / 通道异常 ⇒ 502（调用方还应校验回包 schema）。
+  Future<Map<String, dynamic>> requestApiDelegate(
+    String pluginId,
+    Map<String, dynamic> envelope,
+  ) async {
+    final PluginHost host = requireApiDelegateHost(pluginId);
+    try {
+      return await host.requestMethod(
+        PluginRpcMethods.apiDelegate,
+        envelope,
+        timeout: apiDelegateTimeout,
+      );
+    } on PluginRequestTimeout catch (error) {
+      throw PluginDelegateException(
+        504,
+        '归属插件 $pluginId 在 ${apiDelegateTimeout.inMilliseconds}ms 内没有回包'
+        '（api/delegate 超时）：$error',
+        pluginId: pluginId,
+      );
+    } on PluginException catch (error) {
+      // 通道在请求途中断掉 ⇒ 属于"服务不可用"，不是"回包非法"。
+      if (host.isClosed) {
+        throw PluginDelegateException(
+          503,
+          '归属插件 $pluginId 在请求途中下线（宿主已关闭）：$error',
+          pluginId: pluginId,
+        );
+      }
+      throw PluginDelegateException(
+        502,
+        '归属插件 $pluginId 回包错误：$error',
+        pluginId: pluginId,
+      );
+    }
+  }
+
+  /// 只做「归属插件现在能不能接委派请求」的前置判定，并返回可用宿主。
+  ///
+  /// `_handleDelegated` 在读请求体**之前**调用它：插件未安装 / 已停用 / 正在
+  /// 重启时先把 503 回掉，不必把 100MB 上传先落盘。
+  PluginHost requireApiDelegateHost(String pluginId) {
+    load();
+    if (!enabled) {
+      throw PluginDelegateException(
+        503,
+        '插件总线已停用（plugins.yaml enabled=false）⇒ 委派请求无法承接',
+        pluginId: pluginId,
+      );
+    }
+    final PluginConfig? config = this.config(pluginId);
+    if (config == null) {
+      throw PluginDelegateException(
+        503,
+        '归属插件 $pluginId 未安装（plugins.yaml 中没有这一项）⇒ 无法承接委派请求',
+        pluginId: pluginId,
+      );
+    }
+    if (!config.enabled) {
+      throw PluginDelegateException(
+        503,
+        '归属插件 $pluginId 已停用（plugins.yaml enabled=false）⇒ 无法承接委派请求',
+        pluginId: pluginId,
+      );
+    }
+    final PluginLifecycleState lifecycle = lifecycleOf(pluginId);
+    if (lifecycle != PluginLifecycleState.ready) {
+      throw PluginDelegateException(
+        503,
+        '归属插件 $pluginId 当前处于 ${lifecycle.wire}（不是 ready）⇒ 暂不可用，'
+        '本次委派请求未转发',
+        pluginId: pluginId,
+      );
+    }
+    final PluginHost? host = _hosts[pluginId];
+    if (host == null || host.isClosed) {
+      throw PluginDelegateException(
+        503,
+        '归属插件 $pluginId 的实例已不在运行（宿主已关闭）⇒ 无法承接委派请求',
+        pluginId: pluginId,
+      );
+    }
+    return host;
+  }
+
+  /// 委派路由申报不属于某个 team×mode 工作面：按插件自己的 scope 投一趟。
+  ///
+  /// 通配 team（空）借 `core` 这个 sentinel team 满足站点的「消息必须能证明归属」；
+  /// 声明了 team 的插件用自己 team 原样采集。
+  StationScope _routeCollectionScope(StationScope pluginScope) {
+    final String mode = StationModeKey.isValid(pluginScope.modeKey)
+        ? pluginScope.modeKey
+        : StationModeKey.local;
+    return StationScope(
+      teamId: pluginScope.teamId.trim().isEmpty
+          ? 'core'
+          : pluginScope.teamId.trim(),
+      agentId: pluginScope.agentId,
+      sessionId: pluginScope.sessionId,
+      modeKey: mode,
+    );
+  }
+
+  /// 把收集到的路由申报写进核心归属表。
+  ///
+  /// - 同一插件后申报整组覆盖前一份（`plugin_id` 销账）；
+  /// - schema 不过 / 没回包的插件按 `plugin_id` 清空（重新申报失败 = 不能继续声称）；
+  /// - 同一 `method + pattern` 被两家申报 ⇒ 由 [DelegatedRouter] 整条拒收并记录原因。
+  void _absorbApiRouteDeclarations({
+    required DelegatedRouter table,
+    required List<StationCollectedItem> items,
+    required List<StationUnresponsive> unresponsive,
+  }) {
+    table.beginRound();
+    for (final StationUnresponsive item in unresponsive) {
+      if (item.pluginId.isEmpty) continue;
+      table.removePlugin(item.pluginId);
+      log?.call('委派路由申报：插件 ${item.pluginId} 未通过收集（${item.reason}）⇒ 整组销账');
+    }
+    final Map<String, List<DelegatedRouteDeclaration>> byPlugin =
+        <String, List<DelegatedRouteDeclaration>>{};
+    for (final StationCollectedItem item in items) {
+      final Object? payload = item.payload;
+      final Object? rawRoutes = payload is Map ? payload['routes'] : null;
+      if (rawRoutes is! List) {
+        table.removePlugin(item.pluginId);
+        log?.call(
+          '委派路由申报：插件 ${item.pluginId} 的产出缺少 routes 数组'
+          '（按 schema 应为路由列表）⇒ 整组销账',
+        );
+        continue;
+      }
+      final List<DelegatedRouteDeclaration> declarations =
+          <DelegatedRouteDeclaration>[];
+      for (final Object? raw in rawRoutes) {
+        if (raw is! Map ||
+            raw['method'] is! String ||
+            raw['pattern'] is! String) {
+          log?.call(
+            '委派路由申报：插件 ${item.pluginId} 的一条申报形状非法'
+            '（method / pattern 必须是字符串）⇒ 该条拒收',
+          );
+          continue;
+        }
+        final DelegatedRouteDeclaration? declaration = table.declarationFor(
+          pluginId: item.pluginId,
+          method: raw['method'] as String,
+          pattern: raw['pattern'] as String,
+        );
+        if (declaration != null) declarations.add(declaration);
+      }
+      byPlugin[item.pluginId] = declarations;
+    }
+    for (final MapEntry<String, List<DelegatedRouteDeclaration>> entry
+        in byPlugin.entries) {
+      table.replacePlugin(entry.key, entry.value);
+    }
+    // 每一条拒收原因都要可见：不能只留在内存里等 UI 猜。
+    for (final String note in table.notes) {
+      log?.call('委派路由申报：$note');
+    }
+    if (table.conflictCount > 0) {
+      log?.call('委派路由归属表：${table.conflictCount} 条冲突整条拒收');
+    }
+  }
+
   /// 收集站订阅者的回包实现：**首选 station/request 通道**，老插件退回 tools/list。
   Future<StationReply> _respondToToolDefinition(
     PluginConfig config,
@@ -6271,6 +6525,12 @@ class PluginBus {
     _dropPendingStreamFrames(pluginId: pluginId);
     // 动态工具表：下线插件的定义一并移除（避免调用到不存在的插件）
     _definitions.removePlugin(pluginId);
+    // 片 C：**已从配置里删除**的插件按 plugin_id 销账委派路由（归于 404）。
+    // 只是停止 / 停用（配置还在）时**不销**：归属仍然存在，请求给 503 而不是
+    // 404——这是文档 §5.3「归属插件未安装 / 已停用 ⇒ 503」的落点。
+    if (!_configs.any((PluginConfig entry) => entry.id == pluginId)) {
+      delegatedRouter?.removePlugin(pluginId);
+    }
     // 插件下线 = 工具表失效点（模型工具表必须随之变化）
     invalidateToolTable(reason: '插件 $pluginId 下线');
     if (host == null) return;
@@ -6309,8 +6569,24 @@ class PluginBus {
   }
 }
 
+/// **`api/delegate` 的可读失败**（片 C）：HTTP 层据此映射 503 / 504 / 502。
+class PluginDelegateException implements Exception {
+  PluginDelegateException(this.status, this.reason, {required this.pluginId});
+
+  /// 建议的 HTTP 状态码（503 未安装/停用/不可用，504 超时，502 回包错误）。
+  final int status;
+
+  /// 可读原因（必须能直接进响应体给用户看）。
+  final String reason;
+
+  /// 归属插件 id。
+  final String pluginId;
+
+  @override
+  String toString() => reason;
+}
+
 /// 一条**比流登记更早到达**的 `station/stream` 通知（暂存待重放）。
-///
 /// 带 [pluginId] 是为了重放时**照走归属校验**：别人冒名推的帧不会因为"早到"而被放行。
 class _PendingStreamFrame {
   const _PendingStreamFrame({required this.pluginId, required this.params});

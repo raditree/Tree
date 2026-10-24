@@ -104,13 +104,13 @@ void main() {
       (result.payload ?? const <String, dynamic>{}) as Map<String, dynamic>;
 
   // ── 1/2/3：点位登记与挂载 ─────────────────────────────────────────────
-  test('新点位进了 StationHubIds.all，且内置点位总数是 35', () {
+  test('新点位进了 StationHubIds.all，且内置点位总数是 36', () {
     expect(
       StationHubIds.all,
       contains(StationHubIds.executePlugin),
       reason: '漏进 all ⇒ 插件订阅被当成别人的自建站拒掉（静默失效）',
     );
-    expect(StationPoints.all.length, 35);
+    expect(StationPoints.all.length, 36);
     expect(StationHubIds.all.length, StationPoints.all.length);
     expect(
       StationPoints.byId(StationHubIds.executePlugin),

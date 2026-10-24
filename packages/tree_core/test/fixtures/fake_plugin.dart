@@ -35,6 +35,14 @@ import 'dart:io';
 ///   槽位（左侧活动栏面板）与一个 panel 槽位（右栏 Tab），用于验证 Q12 的生产端。
 /// - --ui-manifest-foreign：同上，但槽位里冒用别的 plugin_id（验证越权被拒）。
 /// - --ui-team VALUE：`ui/manifest` 通告里自带 team_id（验证声明优先）。
+/// - --api-route METHOD:PATTERN：实现片 C 的 `system.collect.api.routes`
+///   收集站申报（可重复）。不带时也回空 routes，避免被当成"没实现收集站"。
+/// - --api-routes-invalid：路由申报故意给 schema 非法的形状（验证整条拒收）。
+/// - --api-delegate-mode envelope|text|invalid|timeout|result|escape：
+///   `api/delegate` 的回包行为（默认 envelope = 把收到的信封原样回吐成 JSON）。
+/// - --api-delegate-status N / --api-delegate-body TEXT：text 模式的状态码 / 正文。
+/// - --api-result-size N：result 模式写一个 N 字节文件并只回 `result_path`。
+/// - --api-result-path PATH：escape 模式直接回这个路径（越界校验用例）。
 void main(List<String> args) {
   String eventsFile = '';
   String pingGateFile = '';
@@ -61,6 +69,14 @@ void main(List<String> args) {
   String relayRewrite = 'REWRITTEN';
   String relayKey = 'content';
   String relayStation = 'relay';
+  // 片 C：委派路由申报 / api/delegate 回包行为。
+  final bool apiRoutesInvalid = args.contains('--api-routes-invalid');
+  final List<Map<String, String>> apiRoutes = <Map<String, String>>[];
+  String apiDelegateMode = 'envelope';
+  int apiDelegateStatus = 200;
+  String apiDelegateBody = '';
+  int apiResultSize = 32;
+  String apiResultPath = '';
   // 中转站订阅的**具体点位**（别名 / 完整 id / 后缀）：留空 = 按 station 类型默认解析。
   // 用于订 `ssh.execute` 这类需要显式点位的中转点（`station: 'relay'` 留空只订工具前/后）。
   String relayPoint = '';
@@ -73,6 +89,24 @@ void main(List<String> args) {
     if (args[i] == '--relay-station') relayStation = args[i + 1];
     if (args[i] == '--relay-point') relayPoint = args[i + 1];
     if (args[i] == '--ui-team') uiTeam = args[i + 1];
+    if (args[i] == '--api-route') {
+      final List<String> parts = args[i + 1].split(':');
+      if (parts.length == 2) {
+        apiRoutes.add(<String, String>{
+          'method': parts[0],
+          'pattern': parts[1],
+        });
+      }
+    }
+    if (args[i] == '--api-delegate-mode') apiDelegateMode = args[i + 1];
+    if (args[i] == '--api-delegate-status') {
+      apiDelegateStatus = int.tryParse(args[i + 1]) ?? 200;
+    }
+    if (args[i] == '--api-delegate-body') apiDelegateBody = args[i + 1];
+    if (args[i] == '--api-result-size') {
+      apiResultSize = int.tryParse(args[i + 1]) ?? 32;
+    }
+    if (args[i] == '--api-result-path') apiResultPath = args[i + 1];
   }
   // SSH 执行接管者默认显式订 `ssh.execute`（留空 relay 只订工具前/后）。
   if (sshExecuteFamily && relayPoint.isEmpty) relayPoint = 'ssh.execute';
@@ -400,6 +434,23 @@ void main(List<String> args) {
           reply(<String, dynamic>{'reply': <String, dynamic>{'payload': out}});
           return;
         }
+        if ((params['station_id'] ?? '').toString() ==
+            'system.collect.api.routes') {
+          // 片 C：委派路由申报。--api-routes-invalid 故意给 schema 非法的形状，
+          // 用于验证核心「schema 不过 ⇒ 整组销账并给可读原因」。
+          reply(<String, dynamic>{
+            'reply': <String, dynamic>{
+              'payload': apiRoutesInvalid
+                  ? <String, dynamic>{
+                      'routes': <Map<String, dynamic>>[
+                        <String, dynamic>{'method': 42, 'pattern': null},
+                      ],
+                    }
+                  : <String, dynamic>{'routes': apiRoutes},
+            },
+          });
+          return;
+        }
         if (relaySubscribe && payloadMap.containsKey('phase')) {
           final String phase = (payloadMap['phase'] ?? '').toString();
           Map<String, dynamic>? rewritten;
@@ -491,6 +542,84 @@ void main(List<String> args) {
             },
           },
         });
+      case 'api/delegate':
+        // 片 C：核心 → 归属插件的 REST 委派。params 就是 §5.2 信封。
+        final Map<String, dynamic> envelope = params;
+        if (apiDelegateMode == 'timeout') {
+          // 不回包：核心侧按 apiDelegateTimeout 映射 504，进程本身保持运行。
+          await Future<void>.delayed(const Duration(seconds: 5));
+          return;
+        }
+        if (apiDelegateMode == 'invalid') {
+          reply(<String, dynamic>{'status': 'oops', 'body': 'bad-shape'});
+          return;
+        }
+        if (apiDelegateMode == 'escape') {
+          reply(<String, dynamic>{
+            'status': 200,
+            'headers': <String, String>{'content-type': 'application/octet-stream'},
+            'result_path': apiResultPath,
+          });
+          return;
+        }
+        if (apiDelegateMode == 'result') {
+          final String dataDir = (envelope['data_dir'] ?? '').toString();
+          final String path = apiResultPath.isNotEmpty
+              ? apiResultPath
+              : '$dataDir${Platform.pathSeparator}tmp'
+                    '${Platform.pathSeparator}api-delegate'
+                    '${Platform.pathSeparator}'
+                    'fake-result-$pid-'
+                    '${DateTime.now().microsecondsSinceEpoch}.bin';
+          final File file = File(path);
+          if (!file.parent.existsSync()) {
+            file.parent.createSync(recursive: true);
+          }
+          final IOSink sink = file.openWrite();
+          // 分块写，避免假插件自己也把 100MB 放内存里。
+          const int chunk = 1 << 20;
+          final List<int> block = List<int>.filled(chunk, 7);
+          int remaining = apiResultSize;
+          while (remaining > 0) {
+            final int n = remaining < chunk ? remaining : chunk;
+            sink.add(n == chunk ? block : block.sublist(0, n));
+            remaining -= n;
+          }
+          await sink.close();
+          reply(<String, dynamic>{
+            'status': 200,
+            'headers': <String, String>{'content-type': 'application/octet-stream'},
+            'result_path': path,
+          });
+          return;
+        }
+        if (apiDelegateMode == 'text') {
+          reply(<String, dynamic>{
+            'status': apiDelegateStatus,
+            'headers': <String, String>{'content-type': 'text/plain; charset=utf-8'},
+            'body': apiDelegateBody.isEmpty
+                ? 'plugin:${envelope['method']} ${envelope['path']}'
+                : apiDelegateBody,
+          });
+          return;
+        }
+        // 默认 envelope：把核心发来的信封原样回吐（附加 body_path 的真实大小），
+        // 测试据此断言白名单头 / 只读上下文 / 大体积传输是否走了磁盘。
+        final Map<String, dynamic> echoed = <String, dynamic>{...envelope};
+        final Object? bodyPath = envelope['body_path'];
+        if (bodyPath is String) {
+          final File file = File(bodyPath);
+          echoed['body_path_exists'] = file.existsSync();
+          echoed['body_size'] = file.existsSync() ? file.lengthSync() : -1;
+        }
+        reply(<String, dynamic>{
+          'status': 200,
+          'headers': <String, String>{
+            'content-type': 'application/json; charset=utf-8',
+          },
+          'body': jsonEncode(echoed),
+        });
+        return;
       case 'tools/call':
         final String name = (params['name'] ?? '').toString();
         final Map<String, dynamic> callArgs =

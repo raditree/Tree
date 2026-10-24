@@ -443,8 +443,8 @@ class PluginHost {
       timeout,
       onTimeout: () {
         _pending.remove(id);
-        throw PluginException(
-          '插件 ${config.id} 的 $method 无响应（建连窗口 ${timeout.inMilliseconds}ms）',
+        throw PluginRequestTimeout(
+          '插件 ${config.id} 的 $method 无响应（窗口 ${timeout.inMilliseconds}ms）',
         );
       },
     );
@@ -699,6 +699,14 @@ class PluginException implements Exception {
   final String message;
   @override
   String toString() => message;
+}
+
+/// 请求在给定窗口内没有回包（区别于通道已断 / 插件报错）。
+///
+/// 只用于**调用方显式传了 timeout** 的场景（如 `api/delegate` 的 504 映射）；
+/// 默认无静态超时的请求永远不会抛它。
+class PluginRequestTimeout extends PluginException {
+  PluginRequestTimeout(super.message);
 }
 
 /// **插件 → 核心请求**的 JSON-RPC 错误码（与 JSON-RPC 2.0 / MCP 同表）。

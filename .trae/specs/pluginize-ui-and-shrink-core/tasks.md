@@ -19,7 +19,7 @@
 
 - [ ] Task 3: 片 C —— REST 委派（18 条）
   - [ ] SubTask 3.1: 新增内置收集站 `system.collect.api.routes`（六件同时交付）
-  - [ ] SubTask 3.2: `DelegatedRouter` 接入 `core_server` 查表顺序（router → stub → delegated → 404）
+  - [ ] SubTask 3.2: `DelegatedRouter` 接入 `core_server` 查表顺序（router → delegated → stub → 404）
   - [ ] SubTask 3.3: 新增 `api/delegate` RPC，信封含 `workspace_dir` / `data_dir` / `agent_id` / `team_id`
   - [ ] SubTask 3.4: 错误映射（503 / 503 / 504 / 502）与归属冲突整条拒收
   - [ ] SubTask 3.5: `body_path` / `result_path` 大体积通道与临时文件清理、路径越界校验

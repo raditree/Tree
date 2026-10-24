@@ -269,6 +269,34 @@ abstract final class ApiPaths {
   static const String agentSubagentTranscript =
       '/api/agents/{agentId}/subagents/{subagentId}/transcript';
 
+  /// 批次 C 起**允许由插件委派承担**的路径（静态白名单，按路径不看方法）。
+  ///
+  /// 委派层只放行这一集合里的 pattern：插件申报其它路径一律拒收，避免
+  /// "插件自己发明一条 REST 端点"绕开核心的路由面。批次 C 目前是 18 条
+  /// （JSON 7 + 二进制/大体积 11）；批次 D/E/F/G 再按批次追加，删除核心实现
+  /// 时也从这里同步。**注意**：本片只加白名单，核心实现仍保留（SubTask 3.6
+  /// 不在本次范围），所以这些路径此刻同时出现在 [kept] 与核心路由里。
+  static const Set<String> delegated = <String>{
+    fileGitStatus,
+    workspaceGitLog,
+    workspaceGitBranches,
+    agentSpecs,
+    agentSpec,
+    mcpServices,
+    mcpService,
+    files,
+    fileContent,
+    filePdfInfo,
+    fileUploadInit,
+    fileUploadChunk,
+    fileUploadComplete,
+    fileSyncToLocal,
+    fileDownload,
+    fileDownloadFolder,
+    fileMkdir,
+    fileRename,
+  };
+
   /// 桌面分支保留的全部路径。
   static const Set<String> kept = <String>{
     agents,

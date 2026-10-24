@@ -652,6 +652,27 @@ abstract final class StationPoints {
           '销账与工具申报同口径（插件 stopped/failed / 热重启旧世代 ⇒ 按 plugin_id 整批销）。',
       alias: '',
     ),
+    StationPointSpec(
+      id: StationHubIds.collectApiRoutes,
+      kind: StationKind.collect,
+      label: '委派 REST 路由',
+      description:
+          '收集站（系统自带）：插件申报自己承接的 REST 路由（method + pattern），'
+          '核心据此生成委派归属表并聚合进 /api/meta.routes',
+      readme:
+          '委派 REST 路由收集站：核心刷新工具表 / 插件上线时向**全部订阅者**发一次采集请求，'
+          '每个订阅者按 schema 回 `{routes: [{method, pattern}]}`——申报的是自己愿意承接的'
+          ' `method + pattern`（pattern 必须与核心的委派白名单逐字一致，当前是批次 C 的'
+          ' 18 条 Git / spec / MCP / 文件端点）。\n'
+          '触发时机：插件 ready（工具表刷新）与插件重新申报时各一次；同一插件后申报覆盖前申报。\n'
+          '核心怎么用：生成 `router（已实现）→ 桩（501）→ 委派 → 404` 的第三段归属表；'
+          '命中后核心把请求转成 `api/delegate` RPC 发给归属插件，回包原样回写给 REST 客户端。\n'
+          '限制：① 同一 `method + pattern` 被两家插件申报 ⇒ **整条拒收**并记录可读原因，'
+          '不按启动顺序择一；② 白名单外的 pattern、非法 method、schema 不过的申报一律拒收；'
+          '③ 插件被卸载 / 重新申报时按 `plugin_id` 整组销账（停止但仍在清单里 ⇒ 该路由回 503，'
+          '不是 404）；④ 已实现的核心路由永远优先，委派抢不到前面。',
+      alias: '',
+    ),
   ];
 
   /// 全部内置点位（顺序：广播 → 执行 → 中转 → 收集）。

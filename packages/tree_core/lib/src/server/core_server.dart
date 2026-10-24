@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data' show BytesBuilder;
 
 import 'package:path/path.dart' as p;
 import 'package:tree_local_exec/tree_local_exec.dart';
@@ -78,6 +79,7 @@ class CoreServer {
   CoreServer._(
     this._http, {
     required this.processId,
+    required this.dataDir,
     required this.token,
     required this.store,
     required this.settings,
@@ -286,6 +288,18 @@ class CoreServer {
   /// 显式登记为"未实现（501）"的路由。
   final CoreRouter stubRouter;
 
+  /// 插件委派路由归属表（`system.collect.api.routes` 收集到的申报）。
+  ///
+  /// 查表顺序：已实现 [router] → [delegatedRouter] → 501 [stubRouter] → 404；
+  /// 委派优先于桩但**永远不能**抢在已实现路由之前。
+  final DelegatedRouter delegatedRouter = DelegatedRouter();
+
+  /// 核心数据根（委派临时文件 `<dataDir>/tmp/api-delegate/` 的父目录）。
+  final String dataDir;
+
+  /// 委派请求/响应超过该字节数时改走磁盘（`body_path` / `result_path`）。
+  static const int delegateInlineBodyLimit = 1 << 20;
+
   /// WS 上行分片重组。
   final InboundFrameReassembler reassembler;
 
@@ -400,6 +414,7 @@ class CoreServer {
     UsageLog? usageLog,
     PtyStarter? ptyStarter,
     SshPtyStarter? sshPtyStarter,
+    String? dataDir,
   }) async {
     final HttpServer http = await HttpServer.bind(
       address ?? InternetAddress.loopbackIPv4,
@@ -426,6 +441,14 @@ class CoreServer {
     );
     final BuiltinPluginCatalog resolvedBuiltinPlugins =
         builtinPlugins ?? BuiltinPluginCatalog();
+    // 委派临时文件的根：优先用调用方显式给的 dataDir；否则从插件配置路径反推
+    // （`<数据根>/config/plugins.yaml` 的上两级）；都没有时退到系统临时目录。
+    final String resolvedDataDir =
+        (dataDir == null || dataDir.trim().isEmpty)
+        ? (pluginBus == null
+              ? p.join(Directory.systemTemp.path, 'tree_core')
+              : p.dirname(p.dirname(pluginBus.configFile)))
+        : dataDir;
     // 默认下载器接三个既有出口：已装条目读 plugins.yaml、脚本型解释器用**与内置
     // 插件同一个**探测口径、换文件闸门问总线（只有它知道进程在不在）。
     final PluginDownloader? resolvedDownloader =
@@ -438,6 +461,7 @@ class CoreServer {
     final CoreServer server = CoreServer._(
       http,
       processId: currentPid,
+      dataDir: resolvedDataDir,
       token: token ?? CoreToken.generate(),
       store: resolvedStore,
       settings: resolvedSettings,
@@ -766,6 +790,8 @@ class CoreServer {
     }
     // 运行期四元组就绪 = 工具表的失效点：下次刷新点按**真实工作面**（local/ssh）
     // 重新收集一次（CLI 里 plugins.start() 早于本接线，那次用的是声明里的 mode）。
+    // 片 C：同一趟刷新也收集 `system.collect.api.routes`，把插件申报写进委派归属表。
+    bus.bindDelegatedRouter(delegatedRouter);
     bus.invalidateToolTable(reason: '站点接线完成（运行期四元组就绪）');
     final String? mountError = bus.mountExecuteStations(mounts);
     if (mountError != null) {
@@ -777,6 +803,7 @@ class CoreServer {
     final StationWsBridge bridge = _stationWsBridge ??= StationWsBridge(
       stations: bus.stations,
       configs: bus.configs,
+      routes: delegatedRouter.metaRoutes,
       log: (String message) => errorLog?.call('[core:station/ws] $message'),
     );
     bus.stations.onStationRemoved = bridge.onStationRemoved;
@@ -1352,13 +1379,27 @@ class CoreServer {
       return;
     }
     final List<String> segments = request.uri.pathSegments;
-    // 先匹配已实现路由，再匹配"显式登记为未实现"的桩路由；两者由
-    // `server_test` 的覆盖度用例保证不相交且并集覆盖 ApiPaths.kept。
-    final HttpRouteMatch? match =
-        router.match(request.method, segments) ??
-        stubRouter.match(request.method, segments);
+    // 查表顺序（片 C）：**已实现路由** → 委派归属表 → 桩路由（501）→ 404。
+    // - 已实现路由必须先匹配：插件即使申报了同一 pattern 也抢不走核心实现；
+    // - 委派必须**先于**桩：桩覆盖所有 kept 路径，否则"已申报委派"永远是 501。
+    final HttpRouteMatch? match = router.match(request.method, segments);
     if (match != null) {
       await match.route.handler(request, match.params);
+      _access(request, request.response.statusCode);
+      return;
+    }
+    final DelegatedRouteMatch? delegated = delegatedRouter.match(
+      request.method,
+      segments,
+    );
+    if (delegated != null) {
+      await _handleDelegated(request, delegated);
+      _access(request, request.response.statusCode);
+      return;
+    }
+    final HttpRouteMatch? stub = stubRouter.match(request.method, segments);
+    if (stub != null) {
+      await stub.route.handler(request, stub.params);
       _access(request, request.response.statusCode);
       return;
     }
@@ -3761,11 +3802,466 @@ class CoreServer {
     await writeJson(request, 200, result);
   }
 
+  // ── REST 委派（片 C） ───────────────────────────────────────────────
+
+  /// 插件委派临时根：`<数据根>/tmp/api-delegate/`。
+  ///
+  /// 请求体落盘（`body_path`）与核心分配的结果文件都在这下面；每个请求一个
+  /// 子目录，回包结束后整目录递归清理。
+  String get _delegateTempRoot => p.join(dataDir, 'tmp', 'api-delegate');
+
+  /// 一次委派的完整处理：组装信封 → `api/delegate` → 校验回包 → 原样写回。
+  ///
+  /// 错误映射（每条 reason 都可读且具体，**绝不落到 404**）：
+  /// 归属插件未安装 / 已停用 / 当前不可用 ⇒ 503；超时 ⇒ 504；回包非法 ⇒ 502。
+  Future<void> _handleDelegated(
+    HttpRequest request,
+    DelegatedRouteMatch match,
+  ) async {
+    final String pluginId = match.pluginId;
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writeDelegateError(
+        request,
+        503,
+        'service_unavailable',
+        pluginId,
+        '归属插件 $pluginId 未安装（核心没有启用插件总线）⇒ 无法承接委派请求',
+      );
+      return;
+    }
+    // 先把"归属插件是否可用"判掉：插件不在位时不要把大请求体读进内存/落盘。
+    try {
+      bus.requireApiDelegateHost(pluginId);
+    } on PluginDelegateException catch (error) {
+      await _writeDelegateError(
+        request,
+        error.status,
+        _delegateErrorCode(error.status),
+        pluginId,
+        error.reason,
+      );
+      return;
+    }
+
+    final String requestId = CoreIds.next('api');
+    final Directory requestDir = Directory(
+      p.join(_delegateTempRoot, 'requests', requestId),
+    );
+    File? resultFile;
+    try {
+      final _DelegateBody body = await _readDelegateBody(request, requestDir);
+      final Map<String, dynamic> query = _delegateQuery(request);
+      final Object? rawAgentId =
+          match.params['agentId'] ??
+          match.params['workspaceId'] ??
+          query['agent_id'];
+      final String agentId = rawAgentId is String
+          ? rawAgentId.trim()
+          : '';
+      final CoreAgent? agent = agentId.isEmpty ? null : store.agent(agentId);
+      final String teamId = agent == null
+          ? ''
+          : (agent.teamId.trim().isEmpty
+                ? agent.id
+                : agent.teamId.trim());
+      final String workspaceDir = agent == null
+          ? ''
+          : ((fileService?.rootFor(agent) ?? agent.workspaceDir).trim());
+      final Map<String, dynamic> envelope = <String, dynamic>{
+        'method': request.method,
+        'path': request.uri.path,
+        'params': match.params,
+        'query': query,
+        // 只转发白名单头：token / cookie / host / content-length 一律不出去。
+        'headers': _delegateHeaders(request),
+        'scope': <String, dynamic>{
+          'team_id': teamId,
+          'agent_id': agentId,
+          'session_id': '',
+          'mode_key': agent?.sshConfig != null
+              ? StationModeKey.ssh
+              : StationModeKey.local,
+        },
+        'workspace_dir': workspaceDir,
+        'data_dir': dataDir,
+        'agent_id': agentId,
+        'team_id': teamId,
+        'request_id': requestId,
+        if (body.inline != null) 'body': body.inline,
+        if (body.path != null) 'body_path': body.path,
+      };
+
+      final Map<String, dynamic> raw;
+      try {
+        raw = await bus.requestApiDelegate(pluginId, envelope);
+      } on PluginDelegateException catch (error) {
+        await _writeDelegateError(
+          request,
+          error.status,
+          _delegateErrorCode(error.status),
+          pluginId,
+          error.reason,
+        );
+        return;
+      }
+
+      final _DelegateReply reply;
+      try {
+        reply = await _parseDelegateReply(raw, pluginId);
+        resultFile = reply.resultFile;
+      } on _InvalidDelegateReply catch (error) {
+        await _writeDelegateError(
+          request,
+          502,
+          'bad_gateway',
+          pluginId,
+          '归属插件 $pluginId 的回包非法：${error.reason}',
+        );
+        return;
+      }
+      await _writeDelegateReply(request, reply);
+    } finally {
+      // 请求体临时目录先清；结果文件在写完后单独清（可能不在请求目录下）。
+      try {
+        if (await requestDir.exists()) {
+          await requestDir.delete(recursive: true);
+        }
+      } catch (error) {
+        errorLog?.call('委派临时目录清理失败：${requestDir.path} → $error');
+      }
+      if (resultFile != null) {
+        try {
+          if (await resultFile.exists()) await resultFile.delete();
+        } catch (error) {
+          errorLog?.call('委派结果临时文件清理失败：${resultFile.path} → $error');
+        }
+      }
+    }
+  }
+
+  /// 组装发给插件的请求体。
+  ///
+  /// 超过 [delegateInlineBodyLimit]（1 MiB）或非文本内容 ⇒ 流式落盘到
+  /// `<requestDir>/body.bin`，信封只带 `body_path`；文本且不超过阈值才走 `body`。
+  /// 这样核心内存占用与请求体大小无关（100MB 上传也不会整块驻留）。
+  Future<_DelegateBody> _readDelegateBody(
+    HttpRequest request,
+    Directory requestDir,
+  ) async {
+    final int length = request.contentLength;
+    // 无 body 的方法（GET/HEAD/DELETE）在 length 未知时直接当空。
+    if (length == 0 ||
+        (length < 0 &&
+            request.method != 'POST' &&
+            request.method != 'PUT' &&
+            request.method != 'PATCH')) {
+      return const _DelegateBody(inline: '');
+    }
+    final String mime = (request.headers.contentType?.mimeType ?? '').trim();
+    final bool textual =
+        mime.isEmpty ||
+        mime == 'application/json' ||
+        mime == 'application/x-www-form-urlencoded' ||
+        mime.startsWith('text/') ||
+        mime.endsWith('+json');
+    if (textual && length >= 0 && length <= delegateInlineBodyLimit) {
+      final BytesBuilder builder = BytesBuilder(copy: false);
+      await for (final List<int> chunk in request) {
+        builder.add(chunk);
+      }
+      return _DelegateBody(
+        inline: utf8.decode(builder.takeBytes(), allowMalformed: true),
+      );
+    }
+    // 大体积 / 二进制 / 长度未知：边收边写，内存不随 body 增长。
+    await requestDir.create(recursive: true);
+    final File file = File(p.join(requestDir.path, 'body.bin'));
+    final IOSink sink = file.openWrite();
+    try {
+      await for (final List<int> chunk in request) {
+        sink.add(chunk);
+      }
+    } finally {
+      await sink.close();
+    }
+    return _DelegateBody(path: file.path);
+  }
+
+  /// 查询串 → 信封 `query`（重复键给数组；`token` 不转发，避免把本地凭证带给插件）。
+  Map<String, dynamic> _delegateQuery(HttpRequest request) {
+    final Map<String, dynamic> query = <String, dynamic>{};
+    for (final MapEntry<String, List<String>> entry
+        in request.uri.queryParametersAll.entries) {
+      if (entry.key == 'token') continue;
+      query[entry.key] = entry.value.length == 1
+          ? entry.value.single
+          : entry.value;
+    }
+    return query;
+  }
+
+  /// 请求头白名单：只转发语义头，鉴权 / 连接 / 体积头一律不出核心。
+  static const Set<String> _delegateRequestHeaders = <String>{
+    'accept',
+    'accept-language',
+    'cache-control',
+    'content-type',
+    'if-match',
+    'if-modified-since',
+    'if-none-match',
+    'if-unmodified-since',
+    'pragma',
+    'range',
+    'x-requested-with',
+  };
+
+  Map<String, String> _delegateHeaders(HttpRequest request) {
+    final Map<String, String> headers = <String, String>{};
+    for (final String name in _delegateRequestHeaders) {
+      final String? value = request.headers.value(name);
+      if (value != null) headers[name] = value;
+    }
+    return headers;
+  }
+
+  /// 校验并解析插件回包；所有"形状不对"都抛 [_InvalidDelegateReply]。
+  Future<_DelegateReply> _parseDelegateReply(
+    Map<String, dynamic> raw,
+    String pluginId,
+  ) async {
+    final Object? rawStatus = raw['status'];
+    if (rawStatus is! int || rawStatus < 100 || rawStatus > 599) {
+      throw const _InvalidDelegateReply('status 必须是 100..599 的整数');
+    }
+    final int status = rawStatus;
+    final Object? rawBody = raw['body'];
+    final Object? rawResultPath = raw['result_path'];
+    if (rawBody != null && rawResultPath != null) {
+      throw const _InvalidDelegateReply('body 与 result_path 只能给一个');
+    }
+    if (rawBody != null && rawBody is! String) {
+      throw const _InvalidDelegateReply('body 必须是字符串');
+    }
+    if (rawResultPath != null && rawResultPath is! String) {
+      throw const _InvalidDelegateReply('result_path 必须是字符串');
+    }
+    final Map<String, String> headers = <String, String>{};
+    final Object? rawHeaders = raw['headers'];
+    if (rawHeaders != null) {
+      if (rawHeaders is! Map) {
+        throw const _InvalidDelegateReply('headers 必须是对象');
+      }
+      for (final MapEntry<dynamic, dynamic> entry in rawHeaders.entries) {
+        if (entry.key is! String || entry.value is! String) {
+          throw const _InvalidDelegateReply('headers 的键和值都必须是字符串');
+        }
+        headers[entry.key as String] = entry.value as String;
+      }
+    }
+    String? body = rawBody as String?;
+    File? resultFile;
+    if (rawResultPath != null) {
+      resultFile = await _validateDelegateResultPath(
+        rawResultPath as String,
+        pluginId,
+      );
+    } else if (body != null &&
+        utf8.encode(body).length > delegateInlineBodyLimit) {
+      // 超阈值还在走内联 body ⇒ 核心必须整块驻留，违反传输约定。
+      throw const _InvalidDelegateReply(
+        '内联 body 超过 1 MiB 阈值（必须改用 result_path）',
+      );
+    }
+    if (body != null && body.isEmpty) body = '';
+    return _DelegateReply(
+      status: status,
+      headers: headers,
+      body: body,
+      resultFile: resultFile,
+    );
+  }
+
+  /// `result_path` 路径越界校验（§6）：只允许核心分配目录或归属插件自有命名空间。
+  ///
+  /// 同时要求文件真实存在；比较的是 `resolveSymbolicLinks` 之后的真实路径，
+  /// Windows 下再做大小写归一，防止符号链接 / 大小写绕过。
+  Future<File> _validateDelegateResultPath(
+    String rawPath,
+    String pluginId,
+  ) async {
+    if (rawPath.trim().isEmpty) {
+      throw const _InvalidDelegateReply('result_path 为空');
+    }
+    final String absolute = p.normalize(p.absolute(rawPath.trim()));
+    final File file = File(absolute);
+    if (!await file.exists()) {
+      throw const _InvalidDelegateReply('result_path 指向的文件不存在');
+    }
+    if (await FileSystemEntity.isDirectory(absolute)) {
+      throw const _InvalidDelegateReply('result_path 指向的是目录，不是文件');
+    }
+    final String realFile = _lower(await file.resolveSymbolicLinks());
+    final List<String> roots = <String>[
+      p.join(_delegateTempRoot),
+      p.join(dataDir, 'plugin-data', pluginId),
+    ];
+    for (final String root in roots) {
+      final String realRoot = await _realRoot(root);
+      if (_withinRoot(realRoot, realFile)) return file;
+    }
+    throw const _InvalidDelegateReply(
+      'result_path 越界（只允许核心委派临时目录或该插件的数据命名空间）',
+    );
+  }
+
+  Future<String> _realRoot(String root) async {
+    final Directory directory = Directory(root);
+    if (await directory.exists()) {
+      try {
+        return _lower(await directory.resolveSymbolicLinks());
+      } catch (_) {
+        // 解不出真实路径时退回规范化绝对路径，下面的前缀校验仍然生效。
+      }
+    }
+    return _lower(p.normalize(p.absolute(root)));
+  }
+
+  String _lower(String path) => path.toLowerCase();
+
+  bool _withinRoot(String root, String target) {
+    final String normalizedRoot = root.endsWith(p.separator)
+        ? root
+        : '$root${p.separator}';
+    return target == root || target.startsWith(normalizedRoot);
+  }
+
+  /// 把插件回包原样写回 HTTP（状态码 / 安全头 / 大体积流式）。
+  Future<void> _writeDelegateReply(
+    HttpRequest request,
+    _DelegateReply reply,
+  ) async {
+    final HttpResponse response = request.response;
+    response.statusCode = reply.status;
+    // 只回写一组安全响应头；content-type 走白名单，content-length 由核心按实际
+    // 字节数设置（插件给的不采信）。
+    for (final MapEntry<String, String> entry
+        in _delegateResponseHeaders(reply.headers).entries) {
+      response.headers.set(entry.key, entry.value);
+    }
+    final ContentType contentType = _safeDelegateContentType(
+      reply.headers['content-type'],
+    );
+    final bool bodyAllowed = reply.status != 204 && reply.status != 304;
+    if (reply.resultFile != null) {
+      final File file = reply.resultFile!;
+      if (!bodyAllowed) {
+        await response.close();
+        return;
+      }
+      response.headers.contentType = contentType;
+      response.headers.contentLength = await file.length();
+      await response.addStream(file.openRead());
+      await response.close();
+      return;
+    }
+    final List<int> bytes = utf8.encode(reply.body ?? '');
+    if (!bodyAllowed) {
+      await response.close();
+      return;
+    }
+    response.headers.contentType = contentType;
+    response.headers.contentLength = bytes.length;
+    response.add(bytes);
+    await response.close();
+  }
+
+  /// 插件可回写的响应头白名单（连接 / 长度 / cookie 等一律不采信）。
+  static const Set<String> _delegateResponseHeaderAllow = <String>{
+    'cache-control',
+    'content-disposition',
+    'content-range',
+    'etag',
+    'last-modified',
+    'accept-ranges',
+  };
+
+  Map<String, String> _delegateResponseHeaders(Map<String, String> headers) {
+    final Map<String, String> safe = <String, String>{};
+    for (final MapEntry<String, String> entry in headers.entries) {
+      final String name = entry.key.toLowerCase();
+      if (_delegateResponseHeaderAllow.contains(name)) safe[name] = entry.value;
+    }
+    return safe;
+  }
+
+  /// Content-Type 白名单：不认识的类型一律降级为 `application/octet-stream`。
+  static const Set<String> _delegateMimeTypes = <String>{
+    'application/json',
+    'application/octet-stream',
+    'application/pdf',
+    'application/zip',
+    'application/x-ndjson',
+    'text/plain',
+    'text/csv',
+    'text/markdown',
+    'text/event-stream',
+    'image/png',
+    'image/jpeg',
+    'image/gif',
+    'image/webp',
+    'audio/mpeg',
+    'audio/ogg',
+    'audio/wav',
+    'video/mp4',
+    'video/webm',
+  };
+
+  ContentType _safeDelegateContentType(String? raw) {
+    if (raw == null || raw.trim().isEmpty) {
+      return ContentType.parse('application/octet-stream');
+    }
+    try {
+      final ContentType parsed = ContentType.parse(raw.trim());
+      if (!_delegateMimeTypes.contains(parsed.mimeType)) {
+        return ContentType.parse('application/octet-stream');
+      }
+      return parsed;
+    } catch (_) {
+      return ContentType.parse('application/octet-stream');
+    }
+  }
+
+  Future<void> _writeDelegateError(
+    HttpRequest request,
+    int status,
+    String error,
+    String pluginId,
+    String reason,
+  ) async {
+    await writeJson(request, status, <String, dynamic>{
+      'ok': false,
+      'error': error,
+      'plugin_id': pluginId,
+      'reason': reason,
+    });
+  }
+
+  String _delegateErrorCode(int status) => switch (status) {
+    503 => 'service_unavailable',
+    504 => 'gateway_timeout',
+    _ => 'bad_gateway',
+  };
+
   Future<void> _apiMeta(HttpRequest request, Map<String, String> _) async {
     final StationWsBridge? bridge = _stationWsBridge;
     final ApiMeta meta =
         bridge?.buildMeta(coreVersion: version, apiVersion: apiVersion) ??
-        ApiMeta(coreVersion: version, apiVersion: apiVersion);
+        ApiMeta(
+          coreVersion: version,
+          apiVersion: apiVersion,
+          routes: delegatedRouter.metaRoutes(),
+        );
     await writeJson(request, 200, meta.toJson());
   }
 
@@ -4859,6 +5355,36 @@ class BusPluginHotApplier implements PluginHotApplier {
       ),
     };
   }
+}
+
+/// 委派请求体：内联字符串或落盘的 `body_path`（二选一）。
+class _DelegateBody {
+  const _DelegateBody({this.inline, this.path});
+
+  final String? inline;
+  final String? path;
+}
+
+/// 插件经 `api/delegate` 返回、且已通过 schema / 路径归属校验的回包。
+class _DelegateReply {
+  const _DelegateReply({
+    required this.status,
+    required this.headers,
+    required this.body,
+    required this.resultFile,
+  });
+
+  final int status;
+  final Map<String, String> headers;
+  final String? body;
+  final File? resultFile;
+}
+
+/// 回包形状非法（映射 502）。[reason] 会拼进响应体，必须可读。
+class _InvalidDelegateReply implements Exception {
+  const _InvalidDelegateReply(this.reason);
+
+  final String reason;
 }
 
 /// 便捷入口：启动核心并返回握手（CLI 用）。

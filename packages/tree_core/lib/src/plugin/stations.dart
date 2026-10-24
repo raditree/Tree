@@ -22,7 +22,8 @@ import 'station_store.dart';
 ///   `.llm.handle` / `.llm.request` / `.context.compact` / `.prompt.system` / `.ssh.execute`
 ///   + 阶段 6 四个：`.tool.repair` / `.tool.probe` / `.llm.register` / `.compact.skip.reason`
 ///   + 阶段 8 一个：`.loop.run`（整轮循环接管）
-/// - 收集站 2 个：`plugin.tool.define` 与 `plugin.capability.define`（**都不预建**，
+/// - 收集站 3 个：`plugin.tool.define` / `plugin.capability.define` /
+///   `system.collect.api.routes`（**都不预建**，
 ///   见 [ensureBuiltinStations]：schema 就是接入点定义的输入格式）
 ///
 /// 点位的类型 / 说明 / 命令 / 别名表在 `station_points.dart`（加点位只改那张表）。
@@ -104,6 +105,40 @@ class StationHub {
             type: StationFieldType.object,
             required: true,
             description: '字段表（**必须非空**：不申报字段表的点位不会被登记）',
+          ),
+        ],
+      ),
+    ],
+  );
+
+  /// 收集站（插件申报**委派 REST 路由**，批次 C）基础 id。
+  static const String apiRoutesBaseId = StationHubIds.collectApiRoutes;
+
+  /// 委派路由申报的 schema：`{routes: [{method, pattern}]}`。
+  ///
+  /// [method] 允许取 GET / POST / PUT / PATCH / DELETE；[pattern] 必须与
+  /// [ApiPaths.delegated] 中的一条逐字一致（内容校验在 `DelegatedRouter` 里做，
+  /// schema 只保证形状与类型）。
+  static const StationSchema apiRouteDeclarationSchema = StationSchema(
+    description: '插件委派 REST 路由申报清单（每项 method + pattern）',
+    fields: <StationSchemaField>[
+      StationSchemaField(
+        name: 'routes',
+        type: StationFieldType.array,
+        required: true,
+        description: '本插件承接的 REST 路由列表（没有时给空数组）',
+        fields: <StationSchemaField>[
+          StationSchemaField(
+            name: 'method',
+            type: StationFieldType.string,
+            required: true,
+            description: 'HTTP 方法（大写）：GET / POST / PUT / PATCH / DELETE',
+          ),
+          StationSchemaField(
+            name: 'pattern',
+            type: StationFieldType.string,
+            required: true,
+            description: '路径模式，必须与核心委派白名单逐字一致（含 {param} 占位）',
           ),
         ],
       ),
@@ -352,7 +387,12 @@ class StationHub {
       id: spec.id,
       description: spec.description,
       readme: spec.readme,
-      schema: toolDefinitionSchema,
+      // 收集站的 schema 就是接入点定义的输入格式：不同接入点不能共用工具定义 schema。
+      schema: switch (spec.id) {
+        StationHubIds.collectCapability => capabilityDefinitionSchema,
+        StationHubIds.collectApiRoutes => apiRouteDeclarationSchema,
+        _ => toolDefinitionSchema,
+      },
       builtin: true,
       subscribers: List<StationSubscriber>.of(subscribers),
       createdAt: createdAt,
@@ -487,6 +527,29 @@ class StationHub {
       description: '收集站（系统自带）：插件按 schema 申报自己认得的点位（名字/事件/字段/方向）',
       readme: StationPoints.byId(id)?.readme ?? '',
       schema: capabilityDefinitionSchema,
+      builtin: true,
+    );
+    _register(station);
+    return station;
+  }
+
+  /// 点位定义（委派 REST 路由）收集站：与工具定义同形态，**由接入点现建**。
+  ///
+  /// 没有它的时候（插件未启用 / 总线未接）调用方拿到 null 就跳过这一路——委派表
+  /// 保持为空，所有未命中的请求按 router → 桩 → 404 的老口径走。
+  CollectStation? apiRoutesStationFor() {
+    load();
+    const String id = apiRoutesBaseId;
+    final StationInstance? existing = _stations[id];
+    if (existing is CollectStation) return existing;
+    if (existing != null) return null;
+    final CollectStation station = CollectStation(
+      id: id,
+      description:
+          '收集站（系统自带）：插件申报自己承接的 REST 路由（method + pattern），'
+          '核心据此生成委派归属表并聚合进 /api/meta.routes',
+      readme: StationPoints.byId(id)?.readme ?? '',
+      schema: apiRouteDeclarationSchema,
       builtin: true,
     );
     _register(station);

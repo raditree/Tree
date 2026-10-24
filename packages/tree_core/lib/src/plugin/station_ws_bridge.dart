@@ -32,6 +32,7 @@ class StationWsBridge {
   StationWsBridge({
     required this.stations,
     required this.configs,
+    this.routes,
     this.log,
     this.queueCapacity = WsConnectionOutbox.defaultQueueCapacity,
   });
@@ -41,6 +42,12 @@ class StationWsBridge {
 
   /// 当前 `plugins.yaml` 配置（身份校验与发现面归属推导）。
   final List<PluginConfig> Function() configs;
+
+  /// 片 C：委派路由归属表的只读快照（`/api/meta.routes`）。
+  ///
+  /// 由核心接线时注入 `DelegatedRouter.metaRoutes`；桥**不缓存**第二份，
+  /// 因此插件重新申报 / 下线销账后这里立刻反映真实归属。
+  final List<ApiMetaRoute> Function()? routes;
 
   final void Function(String message)? log;
 
@@ -214,7 +221,8 @@ class StationWsBridge {
       ui: ui,
       canManagePlugins: canManage,
       // 片 B 没有委派路由；保持空数组让 UI 能区分「空」与「老核心没给」。
-      routes: const <ApiMetaRoute>[],
+      // 片 C 起由收集站的归属表提供：未申报 / 冲突条目一律不出现。
+      routes: routes?.call() ?? const <ApiMetaRoute>[],
       stations: stationRows,
       capabilities: capabilities,
     );

@@ -140,10 +140,10 @@ void main() {
       }
     });
 
-    test('类型分布 广播 10 / 执行 11 / 中转 12 / 收集 2 = 35；预建 33', () {
+    test('类型分布 广播 10 / 执行 11 / 中转 12 / 收集 3 = 36；预建 33', () {
       expect(StationPoints.ofKind(StationKind.relay), hasLength(12));
-      expect(StationPoints.ofKind(StationKind.collect), hasLength(2));
-      expect(StationPoints.all.length, 35);
+      expect(StationPoints.ofKind(StationKind.collect), hasLength(3));
+      expect(StationPoints.all.length, 36);
     });
 
     test('点位不可用（被别的类型占住）⇒ 一律按未接管放行，不抛', () async {

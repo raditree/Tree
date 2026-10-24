@@ -292,7 +292,9 @@
 
 ### 5.2 查表与投递
 
-请求路径：`_handle` 依次尝试 `router` → `stubRouter` → **`DelegatedRouter`** → 404。
+请求路径：`_handle` 依次尝试 `router` → **`DelegatedRouter`** → `stubRouter` → 404。
+
+> 顺序修正（实现后定稿）：委派必须**先于**桩路由。501 桩覆盖的是「清单里声明了但尚未实现」的路径，若它排在委派之前，任何已申报的委派路由都会永远命中 501——桩是「没人认领才降级」的兜底，不是占位优先。已实现路由仍排最前，委派不得抢占它们。
 
 匹配成功：
 
@@ -348,7 +350,7 @@
 }
 ```
 
-无 `role` / `entry` 字段。窗口形态只写在 `description` 里供人看。
+无 `role` 字段；分类只有 `runtime: headless | ui`，执行形态统一由 `command` / `args` 承载（与插件语言无关）。窗口形态只写在 `description` 里供人看。
 
 ### 6.2 `UiHost`
 

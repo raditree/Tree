@@ -235,6 +235,13 @@ abstract final class StationHubIds {
   /// 申报**必须带 schema**（不带的直接拒），否则核心面板与插件之间必然漂。
   static const String collectCapability = 'plugin.capability.define';
 
+  /// 收集站·插件**委派 REST 路由**的申报口（批次 C）。
+  ///
+  /// 订阅者按 schema 申报 `{routes: [{method, pattern}]}`；核心据此生成
+  /// `router` → 桩 → 委派 → 404 的第三段归属表，并聚合进 `/api/meta.routes`。
+  /// 与 [collect] / [collectCapability] 同形态：按 `plugin_id` 整组覆盖、冲突整条拒收。
+  static const String collectApiRoutes = 'system.collect.api.routes';
+
   // ── 退役 id（**只用于读侧迁移**，不再是实例 id） ─────────────────────────
 
   /// 退役：旧中转站（工具前/后共用、靠 payload.phase 区分）。
@@ -286,6 +293,7 @@ abstract final class StationHubIds {
     relayLoopRun,
     collect,
     collectCapability,
+    collectApiRoutes,
   };
 
   /// 退役 id 集合（迁移判定用；它们不再出现在 [all] 里）。
