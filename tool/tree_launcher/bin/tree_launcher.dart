@@ -10,8 +10,9 @@ import 'package:tree_launcher/src/handshake.dart';
 /// 职责只有一个：判断"当前是否存在可用的管理界面"，没有就拉起/附着核心并打开
 /// `/bootstrap?t=<ticket>`；有就只做控制台菜单（重签票据 / 数据目录 / 日志 / 退出）。
 ///
-/// 已知差距：本期不做 Windows 托盘图标（需要 Win32 FFI 或第三方包），
-/// 也不实现快捷方式 `IconLocation` 更新；核心已提供 `/api/meta.branding` 数据面。
+/// 已知差距：本期不做 Windows 托盘图标（需要 Win32 FFI 或第三方包）。
+/// 品牌落地只做快捷方式 `IconLocation`（见 [_applyShortcutBranding]），
+/// **绝不改写任何 exe 的 PE 资源**。
 Future<void> main(List<String> args) async {
   final Launcher launcher = Launcher();
   final int code = await launcher.run();
@@ -40,6 +41,7 @@ class Launcher {
     }
     _printBanner();
     await _evaluateAndOpen();
+    await _applyShortcutBranding();
     return _menuLoop();
   }
 
@@ -200,6 +202,59 @@ class Launcher {
       await Process.start('open', <String>[url]);
     } else {
       await Process.start('xdg-open', <String>[url]);
+    }
+  }
+
+  /// 品牌落地：只更新启动器旁的 `Tree.lnk` 的 `IconLocation`。
+  ///
+  /// - **绝不改写任何 exe 的 PE 资源**（图标是 Windows 快捷方式的属性）；
+  /// - 图标缺失 / 非 `.ico` ⇒ 把 `IconLocation` 清空，回默认图标；
+  /// - 非 Windows 平台直接跳过。
+  Future<void> _applyShortcutBranding() async {
+    if (!Platform.isWindows) return;
+    String? icon;
+    try {
+      icon = shortcutIconOf(await _getJson('/api/meta'));
+    } catch (error) {
+      stderr.writeln('[launcher] 读取品牌失败：$error');
+      return;
+    }
+    if (icon != null && !File(icon).existsSync()) {
+      stderr.writeln('[launcher] 品牌图标不存在，回默认：$icon');
+      icon = null;
+    }
+    final String launcherPath = Platform.resolvedExecutable;
+    final String shortcut = _join(
+      File(launcherPath).parent.path,
+      'Tree.lnk',
+    );
+    final String iconLocation = icon == null ? '' : '$icon,0';
+    String q(String s) => s.replaceAll("'", "''");
+    final String script =
+        r'$ws = New-Object -ComObject WScript.Shell; '
+        "\$s = \$ws.CreateShortcut('${q(shortcut)}'); "
+        "\$s.TargetPath = '${q(launcherPath)}'; "
+        "\$s.IconLocation = '${q(iconLocation)}'; "
+        r'$s.Save()';
+    try {
+      final ProcessResult result = await Process.run('powershell', <String>[
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        script,
+      ]);
+      if (result.exitCode == 0) {
+        stdout.writeln(
+          icon == null ? '  快捷方式图标已回默认。' : '  已应用品牌图标：$icon',
+        );
+      } else {
+        stderr.writeln(
+          '[launcher] 更新快捷方式图标失败（exit=${result.exitCode}）：'
+          '${result.stderr}',
+        );
+      }
+    } catch (error) {
+      stderr.writeln('[launcher] 更新快捷方式图标失败：$error');
     }
   }
 

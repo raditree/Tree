@@ -12,19 +12,11 @@ import 'package:tree_protocol/tree_protocol.dart';
 /// 3. 前端调用点的 `/api/...` 路径必须都能在 [ApiPaths] 中找到声明（含用
 ///    `$query` 拼接查询串、`Uri.parse('$baseUrl/api/...')` 这类隐式写法）。
 
-/// **片 A 只登记协议、尚未接线**的上行帧（核心分派在片 B 落地）。
-///
-/// 这里的键必须与核心实际未处理的帧集合**逐一相等**：核心接线一条就删一条，
+/// **尚未接线**的上行帧登记表。片 B 已把 6 条站点帧全部接到核心，故为空；
+/// 这里必须与核心实际未处理的帧集合**逐一相等**：核心接线一条就删一条，
 /// 否则「新增帧不得被 default 静默忽略」这条门禁会失真（与
 /// `CoreServer.stubApiPaths` 的「空集合不许悄悄长回来」同口径）。
-const Map<String, String> pendingCoreInbound = <String, String>{
-  WsInboundType.uiHello: '片 B：ui.hello 绑定连接身份（§6.3）',
-  WsInboundType.stationSubscribe: '片 B：广播站订阅与 topics[] 过滤',
-  WsInboundType.stationUnsubscribe: '片 B：退订',
-  WsInboundType.stationRegister: '片 B：UI 自建广播站注册（只允许广播）',
-  WsInboundType.stationUnregister: '片 B：注销自建站',
-  WsInboundType.stationTrigger: '片 B：向自己注册的自建广播站发布',
-};
+const Map<String, String> pendingCoreInbound = <String, String>{};
 
 void main() {
   final Directory repoRoot = Directory('../..');
@@ -264,9 +256,10 @@ String _relativeTo(Directory repoRoot, String path) {
   return relative;
 }
 
-/// `register_local_executor` → `registerLocalExecutor`。
-String _camel(String snake) {
-  final List<String> parts = snake.split('_');
+/// `register_local_executor` → `registerLocalExecutor`；`ui.hello` → `uiHello`；
+/// `station/subscribe` → `stationSubscribe`（分隔符不只下划线）。
+String _camel(String raw) {
+  final List<String> parts = raw.split(RegExp(r'[_.\/-]+'));
   return parts.first +
       parts
           .skip(1)

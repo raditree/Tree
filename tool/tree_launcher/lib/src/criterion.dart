@@ -69,6 +69,21 @@ bool needsBootstrap(
   return true;
 }
 
+/// 从 `/api/meta` 取生效品牌里可用的 `.ico` 绝对路径（role=exe）。
+///
+/// 只接受 `role == "exe"` 且路径以 `.ico` 结尾（Windows 快捷方式只认 ico）；
+/// 其余一律 `null`（回默认图标）。纯函数，文件存在性由调用方校验。
+String? shortcutIconOf(Object? metaJson) {
+  if (metaJson is! Map) return null;
+  final Object? branding = metaJson['branding'];
+  if (branding is! Map) return null;
+  if (branding['role']?.toString() != 'exe') return null;
+  final String icon = (branding['icon'] ?? '').toString().trim();
+  if (icon.isEmpty) return null;
+  if (!icon.toLowerCase().endsWith('.ico')) return null;
+  return icon;
+}
+
 /// 从 `/api/plugin/snapshot` 的原始 JSON 里收集被停用的插件 id。
 Set<String> disabledPluginIdsOf(Object? snapshotJson) {
   if (snapshotJson is! Map) return const <String>{};

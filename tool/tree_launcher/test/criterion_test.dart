@@ -89,5 +89,37 @@ void main() {
       expect(disabledPluginIdsOf(null), isEmpty);
       expect(disabledPluginIdsOf(<String, dynamic>{}), isEmpty);
     });
+
+    test('快捷方式只接受 role=exe 的 .ico 本地路径', () {
+      final Map<String, dynamic> metaJson = <String, dynamic>{
+        'branding': <String, dynamic>{
+          'role': 'exe',
+          'icon': r'C:\plugins\ui\brand.ico',
+        },
+      };
+      expect(shortcutIconOf(metaJson), r'C:\plugins\ui\brand.ico');
+      expect(
+        shortcutIconOf(<String, dynamic>{
+          'branding': <String, dynamic>{
+            'role': 'exe',
+            'icon': r'C:\plugins\ui\brand.png',
+          },
+        }),
+        isNull,
+        reason: '快捷方式只认 ico',
+      );
+      expect(
+        shortcutIconOf(<String, dynamic>{
+          'branding': <String, dynamic>{
+            'role': 'window',
+            'icon': r'C:\plugins\ui\brand.ico',
+          },
+        }),
+        isNull,
+        reason: '窗口图标由 UI 自己应用，不走快捷方式',
+      );
+      expect(shortcutIconOf(null), isNull);
+      expect(shortcutIconOf(<String, dynamic>{}), isNull);
+    });
   });
 }
