@@ -215,7 +215,4 @@ const Map<String, String> nonProtocolPluginMethodLiterals = <String, String>{
   'agent.write': '同上',
   'agent.exec': '同上',
   'agent.shell': '同上',
-  // 插件 UI 帧的 method（约定名）：家在本包 PluginUiFrameType，不在 PluginRpcMethods。
-  'ui/manifest': '插件 UI 声明帧，归 PluginUiFrameType',
-  'ui/update': '同上',
 };

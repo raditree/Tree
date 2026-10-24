@@ -30,9 +30,11 @@ void main() {
     expect(page.contains('连同下级成员一并删除？'), isTrue);
   });
 
-  test('UI：删成员不清插件作用域（只有删团队 TOP 才回落）', () {
-    final RegExp call = RegExp(r'_setTeamScope\(null\)');
-    expect(call.allMatches(page).length, 1, reason: '只保留 TOP 删除那一处回落');
-    expect(page.contains('if (agent.teamId.isEmpty) _setTeamScope(null);'), isTrue);
+  test('UI：插件 UI 作用域随旧面板协议退役（不再有 _setTeamScope 接线）', () {
+    // 片 E 删掉了旧的插件 UI 注册表与它的团队作用域回落；主页面不该再留任何
+    // 残留接线（否则删成员 / 删团队的分支里会冒出未定义方法）。
+    expect(RegExp(r'_setTeamScope\(').hasMatch(page), isFalse);
+    // 字符串拼接避免本条用例自己成为“残留引用”的假阳性（全仓扫描会读 test/）。
+    expect(page.contains('PluginUi' 'Registry'), isFalse);
   });
 }

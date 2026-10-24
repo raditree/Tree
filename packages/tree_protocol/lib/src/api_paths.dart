@@ -139,6 +139,11 @@ abstract final class ApiPaths {
   /// 一次性票据兑换短时会话 token（POST）。
   static const String bootstrapSession = '/api/bootstrap/session';
 
+  /// 主 token 申请一次性引导票据（POST）：loader 用它打开 `/bootstrap?t=...`。
+  ///
+  /// 引导会话 token **不**能申请票据（不在会话白名单里）。
+  static const String bootstrapTicket = '/api/bootstrap/ticket';
+
   static const String pluginSnapshot = '/api/plugin/snapshot';
 
   /// 插件清单的**读写面**（M9 §4.2 插件开关：内置与自定义都可在前端增删改）。
@@ -344,6 +349,7 @@ abstract final class ApiPaths {
     meta,
     bootstrap,
     bootstrapSession,
+    bootstrapTicket,
     pluginSnapshot,
     pluginConfigs,
     pluginConfig,

@@ -70,8 +70,7 @@
   - 顶栏是一排窗口 chip +「+」创建按钮 + 折叠按钮；**「+」是页内路由页**（不是 `Navigator.push` 全屏），
     可用窗口**5 列 × 4 行**网格排列、超过 20 个分页；点一项打开并聚焦，chip 可关闭；
   - **窗口种类由主页面算好传入**（`List<RightPanelEntry>`）：7 个内置（文件 / MCP 配置 / 模型信息 / 问题回复 /
-    正在执行的 tool / 详情 / 设置）+ 插件声明的 `panel` 槽位（[PluginPanelSlotView](lib/ui/widgets/plugin_ui_slots.dart)）。
-    主机不认识任何具体窗口，**插件申请面板照旧接入**；
+    正在执行的 tool / 详情 / 设置）。片 E 起旧插件 `panel` 槽位（`lib/ui/widgets/plugin_ui_slots.dart`）已退役。
   - **「详情」窗**标了 `autoOpenOnSelection`：中栏选中工具 / 思考行、插件卡片 `DetailSelection.inject` 时
     **自动打开并聚焦**；
   - **设置**收进右栏「设置」窗（[SettingsPage](lib/ui/pages/settings_page.dart) 的 `embedded` 模式，不再

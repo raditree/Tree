@@ -13,7 +13,6 @@ export 'src/core_handshake.dart';
 export 'src/meta.dart';
 export 'src/non_protocol_literals.dart';
 export 'src/plugin_rpc_methods.dart';
-export 'src/plugin_ui.dart';
 export 'src/station_ws.dart';
 export 'src/terminal.dart';
 export 'src/ws_frame.dart';

@@ -46,7 +46,6 @@ class StationHub {
     required this.storePath,
     StationStore? store,
     this.log,
-    this.frameSink,
     this.heartbeatInterval = LivenessTracker.defaultInterval,
     this.missThreshold = LivenessTracker.defaultMaxMisses,
     this.livenessProbe,
@@ -145,6 +144,37 @@ class StationHub {
     ],
   );
 
+  /// 品牌申报收集站（片 E / 5.5）基础 id。
+  static const String uiBrandingBaseId = StationHubIds.collectUiBranding;
+
+  /// 品牌申报的 schema：`{icon, role: exe|window|tray, sizes}`。
+  ///
+  /// 闸门（扩展名 / 体积 / 尺寸 / 路径 / 禁 URL）在 `UiBrandingRegistry` 里做，
+  /// schema 只保证形状与类型。
+  static const StationSchema uiBrandingSchema = StationSchema(
+    description: 'UI 插件品牌申报（图标路径 / 用途 / 声明尺寸）',
+    fields: <StationSchemaField>[
+      StationSchemaField(
+        name: 'icon',
+        type: StationFieldType.string,
+        required: true,
+        description: '图标路径（相对插件目录或绝对路径；禁止 URL / base64）',
+      ),
+      StationSchemaField(
+        name: 'role',
+        type: StationFieldType.string,
+        required: true,
+        description: '用途：exe（快捷方式） / window（窗口） / tray（托盘）',
+      ),
+      StationSchemaField(
+        name: 'sizes',
+        type: StationFieldType.array,
+        required: false,
+        description: '声明尺寸列表（像素边长；实际以文件内容为准）',
+      ),
+    ],
+  );
+
   /// 工具定义收集站的 schema（**站点定义输入格式**：插件必须按它产出）。
   ///
   /// 形状 = {tools: [ {tool_name, description, parameters, execution}, ... ]}：
@@ -208,12 +238,6 @@ class StationHub {
   /// 日志出口（可空）。
   final void Function(String message)? log;
 
-  /// 前端下行帧出口（**主 WS 广播**；ui.push 复用 card 槽位帧）。
-  ///
-  /// 非 final：[PluginBus] 构造后要把它换成"包了 UI 帧缓存"的那一层出口
-  /// （见 `PluginBus._outbound`），否则前端重连时卡片槽位回不来。
-  void Function(Map<String, dynamic> frame)? frameSink;
-
   /// **站点移除钩子**（注销 / 显式退订不会误触发；只在站点从表里消失时调用）。
   ///
   /// UI 侧 WS 订阅者不落盘，也没有 stdio 的“插件下线自动退订”路径；
@@ -235,9 +259,8 @@ class StationHub {
 
   /// **执行站挂载钩子**（M9 Wave 3-I）：执行站实例被创建或从落盘恢复时调用。
   ///
-  /// 「执行器只是执行站的一种挂载位置」——首命令集（fs.* / terminal.exec /
-  /// agent.* / ui.push）的挂载位置由核心在这里接上；不接的话命令会以
-  /// 「暂无挂载位置」显式失败（不静默）。
+  /// 「执行器只是执行站的一种挂载位置」——首命令集的挂载位置由核心在这里接上；
+  /// 不接的话命令会以「暂无挂载位置」显式失败（不静默）。
   void Function(ExecuteStation station)? onExecuteStation;
 
   /// 探测节拍（等待回包时轮询订阅者心跳的间隔）。
@@ -556,6 +579,28 @@ class StationHub {
     return station;
   }
 
+  /// 品牌申报收集站：由 UI `ui.hello` 接入点现建（没有就跳过这一路）。
+  ///
+  /// 设计约束：核心只**读取**当前生效品牌；绝不改写 exe 的 PE 资源。
+  CollectStation? uiBrandingStationFor() {
+    load();
+    const String id = uiBrandingBaseId;
+    final StationInstance? existing = _stations[id];
+    if (existing is CollectStation) return existing;
+    if (existing != null) return null;
+    final CollectStation station = CollectStation(
+      id: id,
+      description:
+          '收集站（系统自带）：UI 插件申报 {icon, role, sizes}，核心按 plugin_id 记账并'
+          '把当前生效品牌聚合进 /api/meta.branding',
+      readme: StationPoints.byId(id)?.readme ?? '',
+      schema: uiBrandingSchema,
+      builtin: true,
+    );
+    _register(station);
+    return station;
+  }
+
   /// 插件自建站点（**只能注册既有四种类型**，不允许发明新类型）。
   ///
   /// id **必须带命名空间**：内置保留 id（`system.*` 与 `plugin.tool.define`）不得冒用，
@@ -860,7 +905,7 @@ class StationHub {
     save();
   }
 
-  /// 运行期绑定：活性探针 / 探测节拍 / 活性窗口 / 变更即落盘 / 内置 ui.push 挂载。
+  /// 运行期绑定：活性探针 / 探测节拍 / 活性窗口 / 变更即落盘。
   void _attach(StationInstance station) {
     station.liveness = (String pluginId) =>
         livenessProbe?.call(pluginId) ?? const StationLivenessState.unknown();
@@ -868,56 +913,7 @@ class StationHub {
     station.livenessWindow = livenessWindow;
     station.onMutated = save;
     if (station is ExecuteStation) {
-      _ensureUiPushMount(station);
       onExecuteStation?.call(station);
     }
-  }
-
-  /// 内置 ui.push 挂载位置（**只挂在 `system.execute.ui` 点位上**）：复用 4.1 的
-  /// card 槽位帧（不发明新帧）。
-  ///
-  /// 帧发到主 WS 广播（前端只在主连接上消费插件 UI 帧）；team_id 取自命令
-  /// scope（1.2 隔离：槽位一律带 team_id）。
-  void _ensureUiPushMount(ExecuteStation station) {
-    if (station.id != StationHubIds.executeUi) return;
-    station.mount(
-      command: 'ui.push',
-      mountId: 'core.frontend.card',
-      handler: (StationCommandContext context) async {
-        final String slotKey = (context.arguments['slot_key'] ?? '')
-            .toString()
-            .trim();
-        if (slotKey.isEmpty) {
-          return const StationCommandOutcome.failed(
-            'ui.push 需要 slot_key（消息流内联卡片槽位键）',
-          );
-        }
-        final bool hasView = context.arguments.containsKey('view');
-        final Object? rawView = context.arguments['view'];
-        final PluginUiView? view = PluginUiView.tryParse(rawView);
-        if (hasView && rawView != null && view == null) {
-          return const StationCommandOutcome.failed(
-            'ui.push 的 view 非法（声明式视图模型解析失败）',
-          );
-        }
-        final void Function(Map<String, dynamic> frame)? sink = frameSink;
-        if (sink == null) {
-          return const StationCommandOutcome.failed('前端推送通道不可用（未接入主 WS 广播）');
-        }
-        final Map<String, dynamic> frame = PluginUiUpdate(
-          pluginId: context.sourcePluginId,
-          teamId: context.scope.teamId,
-          slotKey: slotKey,
-          view: view,
-        ).toFrame();
-        sink(frame);
-        return StationCommandOutcome.ok(<String, dynamic>{
-          'pushed': true,
-          'slot': PluginUiSlotKind.card,
-          'slot_key': slotKey,
-          'unregistered': view == null,
-        });
-      },
-    );
   }
 }

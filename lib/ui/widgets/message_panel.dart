@@ -22,7 +22,6 @@ import '../services/detail_selection.dart';
 import '../services/message_replay_guard.dart';
 import '../services/message_window.dart';
 import '../services/onboarding_requests.dart';
-import '../services/plugin_ui_registry.dart';
 import '../services/session_rename.dart';
 import '../services/subagent_transcript.dart';
 import '../services/team_scope_view.dart';
@@ -30,7 +29,6 @@ import '../services/terminal_toggle_request.dart';
 import '../services/usage_log_files.dart';
 import 'message_input.dart';
 import 'message_list.dart';
-import 'plugin_ui_slots.dart';
 import 'mode_switch.dart';
 import 'session_picker.dart';
 import 'subagent_process_list.dart';
@@ -153,13 +151,6 @@ class _MessagePanelState extends State<MessagePanel> {
 
   /// 终端高度（像素；Ctrl+J 打开时按面板高的 40% 起步，可拖）
   double _terminalHeight = 260;
-
-  /// 插件动作帧发送通道（Q12）：plugin_ui_action 经本面板的 WS 连接回核心。
-  ///
-  /// 存成字段（而不是每次现取 tear-off）是为了 dispose 时能用 identical 判断
-  /// "通道还是不是自己装的"——重连/重建后不能把新面板的通道清掉。
-  late final void Function(Map<String, dynamic> frame) _pluginActionSink =
-      _webSocket.send;
 
   /// 是否已尝试连接 WebSocket（避免重复连接）
   bool _wsConnected = false;
@@ -346,9 +337,6 @@ class _MessagePanelState extends State<MessagePanel> {
     // 新手引导第 4 步「选择工作目录」：与左上角那颗目录按钮**同一条路径**（同一条校验、
     // 同一套"成员写团队 TOP"的口径），不另开一个选择器。
     WorkspacePickRequest.instance.addListener(_onWorkspacePickRequested);
-    // Q12 插件布局：本面板的 WS 连接同时承载插件 UI 帧（manifest / update /
-    // plugin_status 卸载），并作为 plugin_ui_action 的发送出口。
-    PluginUiRegistry.instance.actionSender = _pluginActionSink;
     _webSocket.onMessage = _handleIncomingMessage;
     // 未知会话消息（Task 7 接收方会话保障）：msg_chunk/msg_end 携带不在
     // 已知列表中的 session_id 时自动创建本地会话条目，使被动接收
@@ -359,9 +347,6 @@ class _MessagePanelState extends State<MessagePanel> {
     // 若不清空，前端会残留旧的 working（无 API 调用却显示工作中）。
     // 清空后由后端在 WS 建立时补推真实的 agent_status（仍在工作的才重新标记）。
     _webSocket.onConnectionChange = (bool connected) {
-      // 插件声明式 UI 由核心重放重建：断连时先清空注册表，避免"离线期间插件被停用 /
-      // 条目被删除"留下的僵尸卡片与面板（详见 PluginUiRegistry.onConnectionChanged）。
-      PluginUiRegistry.instance.onConnectionChanged(connected);
       if (connected && mounted) {
         setState(() {
           _workingAgents.clear();
@@ -1310,9 +1295,6 @@ class _MessagePanelState extends State<MessagePanel> {
   /// `msg_usage`（token 用量）。
   void _handleIncomingMessage(Map<String, dynamic> data) {
     if (!mounted) return;
-    // Q12 插件布局帧先行分流：manifest / update / plugin_status(destroyed)
-    // 由槽位注册表消费（按 team 过滤 + 槽位生命周期），不落到下面的消息分支。
-    if (PluginUiRegistry.instance.handleFrame(data)) return;
     final String? type = data['type'] as String?;
 
     // 账本会在**没有对话帧**的时刻增长：压缩那两路（内置 `compact` / 插件中转经执行站
@@ -2185,10 +2167,6 @@ class _MessagePanelState extends State<MessagePanel> {
 
   @override
   void dispose() {
-    // 只回收自己装上的通道：期间可能已有新面板接管（多窗口/重建）
-    if (identical(PluginUiRegistry.instance.actionSender, _pluginActionSink)) {
-      PluginUiRegistry.instance.actionSender = null;
-    }
     TerminalToggleRequest.instance.removeListener(_onTerminalToggleRequested);
     WorkspacePickRequest.instance.removeListener(_onWorkspacePickRequested);
     _webSocket.disconnect();
@@ -2238,19 +2216,14 @@ class _MessagePanelState extends State<MessagePanel> {
                 )
               else
                 Expanded(
-                  // Q12 消息流内联卡片：有插件卡片槽位时，在消息列表末尾追加卡片区
-                  // （无卡片时传空列表，列表项数不变，不占位）。
-                  child: ListenableBuilder(
-                    listenable: PluginUiRegistry.instance,
-                    builder: (BuildContext context, Widget? child) {
+                  // 片 E：旧 UI 面板协议删除后，消息流不再追加插件卡片区。
+                  child: Builder(
+                    builder: (BuildContext context) {
                       // 临时员工视角：**同一个窗口**换成它自己的过程（不新开页面）
                       final String viewId = _effectiveViewId;
                       if (viewId.isNotEmpty) {
                         return _buildSubagentView(viewId);
                       }
-                      final bool hasCards = PluginUiRegistry.instance.hasKind(
-                        PluginUiSlotKind.card,
-                      );
                       // 临时员工的消息**不进主消息流**（用户 2026-10-04：「subagent 的输出跟主 agent
                       // 的输出混杂，根本没法分辨，subagent 的工具调用就在 subagent 的调用工具详情里看」）：
                       // 它们按 subagent_id 收进 [SubagentTranscript]，在"那次 subagent 工具调用的详情页"里看。
@@ -2280,14 +2253,6 @@ class _MessagePanelState extends State<MessagePanel> {
                         scrollToMessageId: _scrollToMessageId,
                         scrollToRevision: _scrollToRevision,
                         bottomJump: _bottomJump,
-                        trailingCards: hasCards
-                            ? <Widget>[
-                                PluginInlineCards(
-                                  agentId: agent.id,
-                                  sessionId: _currentSessionId,
-                                ),
-                              ]
-                            : const <Widget>[],
                       );
                     },
                   ),

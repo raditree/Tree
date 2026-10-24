@@ -175,6 +175,13 @@ Future<void> _package(List<String> args) async {
   // 用户在装机端发现。
   stdout.writeln(_assertNoBundledPluginBinaries(releaseDir));
 
+  // ②f 片 E：纯 Dart 引导启动器 + 引导页种子
+  //
+  // launcher 是独立 package（不依赖 Flutter）；它需要 package_config 才能编译，
+  // 这里先 `dart pub get --offline`，失败就打印 TODO 并跳过（不阻断整包）。
+  stdout.writeln(await _buildLauncher(root, dart, releaseDir));
+  stdout.writeln(_copyBootstrapAsset(root, releaseDir));
+
   // ③ 便携包说明（首次运行指引：数据在哪、怎么手改配置、出问题看哪）
   final File guide = File(_join(releaseDir.path, '使用说明.txt'));
   // 带 UTF-8 BOM 写出：目标是 Windows 用户，记事本/PowerShell 5.1 对无 BOM 的
@@ -299,6 +306,65 @@ Future<Never> _fail(String message, int code) async {
     // 输出流已关闭：能报的已经报了，别在兜底路径上再炸一次
   }
   exit(code);
+}
+
+/// 编译纯 Dart 引导启动器。
+///
+/// 失败只打 TODO、不阻断整包：launcher 不是运行桌面的必需品（核心可以单独启动，
+/// 引导页也能由用户手动打开）。但它**不得引入 Flutter**——这是设计约束。
+Future<String> _buildLauncher(
+  Directory root,
+  String dart,
+  Directory releaseDir,
+) async {
+  final Directory launcherDir = Directory(_join(root.path, 'tool/tree_launcher'));
+  if (!Directory(_join(launcherDir.path, 'bin')).existsSync()) {
+    return '   引导启动器：跳过（没有 tool/tree_launcher）';
+  }
+  final int pubCode = await _runLive(
+    dart,
+    <String>['pub', 'get', '--offline'],
+    launcherDir.path,
+  );
+  if (pubCode != 0) {
+    return '   引导启动器：TODO 跳过编译（dart pub get --offline 失败，exit=$pubCode）';
+  }
+  final String output = _join(releaseDir.path, 'tree_launcher.exe');
+  final int code = await _runLive(
+    dart,
+    <String>[
+      'compile',
+      'exe',
+      _join(launcherDir.path, 'bin/tree_launcher.dart'),
+      '-o',
+      output,
+    ],
+    root.path,
+  );
+  if (code != 0) {
+    return '   引导启动器：TODO 跳过（dart compile exe 失败，exit=$code）';
+  }
+  return '   引导启动器：tree_launcher.exe（'
+      '${(File(output).lengthSync() / 1024 / 1024).toStringAsFixed(1)} MB）';
+}
+
+/// 把引导页种子放到 `<release>/assets/bootstrap/index.html`。
+///
+/// 核心在运行时按「exe 同级 assets/」探测并种子化到数据根；漏拷的后果不是 500，
+/// 而是退化成内置最小页面（可读但功能不全），所以这里显式拷贝并报体积。
+String _copyBootstrapAsset(Directory root, Directory releaseDir) {
+  final File source = File(
+    _join(root.path, _join('assets', 'bootstrap/index.html')),
+  );
+  if (!source.existsSync()) {
+    return '   引导页种子：跳过（没有 assets/bootstrap/index.html）';
+  }
+  final Directory target = Directory(
+    _join(releaseDir.path, 'assets/bootstrap'),
+  )..createSync(recursive: true);
+  final File copied = source.copySync(_join(target.path, 'index.html'));
+  return '   引导页种子：assets/bootstrap/index.html（'
+      '${(copied.lengthSync() / 1024).toStringAsFixed(1)} KB）';
 }
 
 /// 把 `docs/plugin-development.md`（系统性插件开发指南）拷进发行目录的 plugins/。

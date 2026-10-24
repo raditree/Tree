@@ -156,7 +156,7 @@ void main() {
         sourcePluginId: pluginId,
       );
 
-  test('九条命令各自挂到自己的点位（ui.push 由站点中枢挂载）', () {
+  test('八条命令各自挂到自己的点位', () {
     final _Wiring wired = wiring(mounts());
     // 每个点位只挂自己那族的命令：命令族之间互不干扰（点位化的直接收益）
     for (final StationPointSpec spec in StationPoints.executes) {
@@ -173,10 +173,6 @@ void main() {
     expect(
       wired.point('fs.read').mounts(command: 'fs.read').single.mountId,
       'core.execute.fs.read',
-    );
-    expect(
-      wired.point('ui.push').mounts(command: 'ui.push').single.mountId,
-      'core.frontend.card',
     );
   });
 

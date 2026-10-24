@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tree 插件管理</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:#0f1216;color:#e5e9f0;font:14px/1.55 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.wrap{max-width:1080px;margin:0 auto;padding:28px 20px 64px}
+header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+h1{font-size:22px;margin:0}
+h2{font-size:16px;margin:0 0 12px}
+.muted{color:#8b98a9;font-size:12.5px}
+.card{background:#171c23;border:1px solid #262f3a;border-radius:12px;padding:18px;margin-bottom:16px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.spacer{flex:1}
+button{cursor:pointer;border:1px solid #33404f;background:#202832;color:#e5e9f0;border-radius:8px;padding:6px 11px;font:inherit}
+button:hover{background:#28323e}
+button.primary{background:#2563eb;border-color:#2563eb}
+button.primary:hover{background:#1d4ed8}
+button.danger{border-color:#7f1d1d;color:#fca5a5}
+button:disabled{opacity:.45;cursor:not-allowed}
+input{background:#0d1117;color:#e5e9f0;border:1px solid #33404f;border-radius:8px;padding:6px 9px;font:inherit}
+table{width:100%;border-collapse:collapse;margin-top:10px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #232c36;vertical-align:top}
+th{color:#93a1b3;font-weight:600;font-size:12.5px}
+tr:last-child td{border-bottom:none}
+.badge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;border:1px solid #33404f;white-space:nowrap}
+.badge.ok{color:#86efac;border-color:#14532d}
+.badge.warn{color:#fcd34d;border-color:#713f12}
+.badge.off{color:#9aa7b8}
+.badge.ui{color:#93c5fd;border-color:#1e3a8a}
+.banner{display:none;padding:10px 14px;border-radius:10px;margin-bottom:14px;border:1px solid}
+.banner.error{display:block;color:#fecaca;background:#2a1215;border-color:#7f1d1d}
+.banner.ok{display:block;color:#bbf7d0;background:#0f2417;border-color:#14532d}
+.notice{display:none;color:#fde68a;background:#241e0c;border:1px solid #713f12;border-radius:8px;padding:6px 10px;margin-top:8px;font-size:12.5px}
+.hint{color:#8b98a9;font-size:12.5px;margin-top:6px}
+.deps{margin-top:4px;font-size:12.5px;color:#9fb0c4}
+.deps code{background:#0d1117;border-radius:4px;padding:0 4px}
+.inline-empty{color:#8b98a9;padding:10px 0}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid #33404f;border-top-color:#93c5fd;border-radius:50%;animation:r .8s linear infinite;vertical-align:-2px;margin-right:6px}
+@keyframes r{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Tree 插件管理</h1>
+    <span class="muted">引导壳 · 仅插件管理</span>
+    <span class="spacer"></span>
+    <span id="tokenState" class="badge off">正在验证引导票据…</span>
+  </header>
+
+  <div id="errorBanner" class="banner error"></div>
+  <div id="readyBanner" class="banner ok">界面已就绪，可关闭本页。</div>
+
+  <div class="card" id="authCard">
+    <h2>引导链接</h2>
+    <div id="authBody" class="muted"><span class="spin"></span>正在用票据换取会话 token…</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <h2 style="margin:0">已配置插件</h2>
+      <span class="spacer"></span>
+      <button id="reloadBtn">刷新</button>
+    </div>
+    <div id="pluginsBody" class="inline-empty"><span class="spin"></span>加载中…</div>
+    <div id="pluginsNotice" class="notice"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <h2 style="margin:0">内置插件</h2>
+      <span class="spacer"></span>
+      <button id="reprobeBtn">重新探测运行时</button>
+    </div>
+    <div id="builtinsBody" class="inline-empty"><span class="spin"></span>加载中…</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <h2 style="margin:0">发布仓库</h2>
+      <span class="spacer"></span>
+      <button id="refreshReleaseBtn">刷新索引</button>
+    </div>
+    <div id="releaseMeta" class="hint"></div>
+    <div id="releaseBody" class="inline-empty"><span class="spin"></span>加载中…</div>
+    <div id="releaseNotice" class="notice"></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // 核心在返回 HTML 时把这一处替换成一次性换会话票据（不写死主 token）。
+  var BOOTSTRAP_TICKET = "__BOOTSTRAP_TICKET__";
+  var token = '';
+  var readyShown = false;
+  var pollTimer = null;
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  function esc(value) {
+    return String(value == null ? '' : value)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function showError(message) {
+    var banner = $('errorBanner');
+    if (!message) { banner.className = 'banner error'; banner.textContent = ''; return; }
+    banner.className = 'banner error';
+    banner.textContent = message;
+  }
+
+  function setNotice(id, message) {
+    var node = $(id);
+    if (!message) { node.style.display = 'none'; node.textContent = ''; return; }
+    node.style.display = 'block';
+    node.textContent = message;
+  }
+
+  function showReady() {
+    if (readyShown) return;
+    readyShown = true;
+    $('readyBanner').classList.add('ok');
+  }
+
+  async function api(path, options) {
+    options = options || {};
+    var headers = Object.assign({}, options.headers || {});
+    if (token) headers['Authorization'] = 'Bearer ' + token;
+    if (options.body) headers['Content-Type'] = 'application/json';
+    var response = await fetch(path, {
+      method: options.method || 'GET',
+      headers: headers,
+      body: options.body ? JSON.stringify(options.body) : undefined,
+      cache: 'no-store'
+    });
+    var text = await response.text();
+    var data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (_) { data = null; }
+    if (!response.ok) {
+      var detail = data && (data.detail || data.message) ? (data.detail || data.message) : text;
+      var error = new Error(detail || ('HTTP ' + response.status));
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  }
+
+  async function exchangeTicket() {
+    if (BOOTSTRAP_TICKET.indexOf('__BOOTSTRAP') === 0) {
+      $('authBody').innerHTML = '本页没有拿到引导票据（可能直接打开了内置最小页面）。请从启动器菜单重新打开。';
+      return;
+    }
+    try {
+      var data = await fetch('/api/bootstrap/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ticket: BOOTSTRAP_TICKET }),
+        cache: 'no-store'
+      }).then(async function (response) {
+        var text = await response.text();
+        var parsed = null;
+        try { parsed = text ? JSON.parse(text) : null; } catch (_) {}
+        if (!response.ok) {
+          var detail = parsed && parsed.detail ? parsed.detail : text;
+          throw new Error(detail || ('HTTP ' + response.status));
+        }
+        return parsed;
+      });
+      token = data.token || '';
+      $('authBody').innerHTML = '票据已兑换为会话 token（有效期约 ' + esc(data.expires_in || 600) +
+        ' 秒）。界面就绪后本页会自动失效。';
+      $('tokenState').className = 'badge ok';
+      $('tokenState').textContent = '会话已授权';
+      $('authCard').style.display = 'none';
+      showError('');
+      await loadAll();
+      startMetaPolling();
+    } catch (error) {
+      $('tokenState').className = 'badge warn';
+      $('tokenState').textContent = '引导链接不可用';
+      $('authBody').innerHTML = '票据兑换失败：' + esc(error.message) +
+        '<div class="hint">请在启动器菜单里重新签发引导票据，再打开新的链接。</div>';
+      showError('引导票据已失效：' + error.message);
+    }
+  }
+
+  function statusBadge(plugin) {
+    var status = plugin.status || '';
+    var health = plugin.health || '';
+    var lifecycle = plugin.lifecycle || '';
+    if (status === 'registered' && health !== 'degraded') {
+      return '<span class="badge ok">运行中</span>';
+    }
+    if (lifecycle === 'restarting') return '<span class="badge warn">重启中</span>';
+    if (health === 'degraded') return '<span class="badge warn">降级</span>';
+    if (status === 'disabled') return '<span class="badge off">已停用</span>';
+    return '<span class="badge off">' + esc(status || '未知') + '</span>';
+  }
+
+  function runtimeBadge(plugin) {
+    var runtime = plugin.runtime || '';
+    if (runtime === 'ui') return '<span class="badge ui">ui</span>';
+    return '<span class="badge">' + esc(runtime || '未声明') + '</span>';
+  }
+
+  function dependencyRows(requires) {
+    if (!requires) return '';
+    var plugins = requires.plugins || requires || [];
+    if (!plugins.length) return '';
+    var items = plugins.map(function (dep) {
+      var id = dep.plugin_id || dep.id || dep;
+      var version = dep.version || dep.min_version || '';
+      return '<code>' + esc(id) + (version ? ' @ ' + esc(version) : '') + '</code>';
+    });
+    return '<div class="deps">依赖：' + items.join('、') + '</div>';
+  }
+
+  async function loadPlugins() {
+    var body = $('pluginsBody');
+    try {
+      var snapshot = await api('/api/plugin/snapshot');
+      var instances = (snapshot && snapshot.instances) || [];
+      var configs = (snapshot && snapshot.config && snapshot.config.plugins) || [];
+      var byId = {};
+      instances.forEach(function (item) { byId[item.plugin_id] = item; });
+      var ids = {};
+      configs.forEach(function (config) { ids[config.id] = true; });
+      instances.forEach(function (item) { ids[item.plugin_id] = true; });
+      var list = Object.keys(ids).sort().map(function (id) {
+        var config = null;
+        configs.forEach(function (item) { if (item.id === id) config = item; });
+        var instance = byId[id] || {};
+        return { id: id, config: config || {}, instance: instance };
+      });
+      if (!list.length) {
+        body.className = 'inline-empty';
+        body.textContent = '还没有配置任何插件。可在下方「发布仓库」安装，或在上方「内置插件」启用。';
+        return;
+      }
+      body.className = '';
+      var html = '<table><thead><tr><th>插件</th><th>runtime / 源</th><th>状态</th><th>操作</th></tr></thead><tbody>';
+      list.forEach(function (row) {
+        var config = row.config || {};
+        var instance = row.instance || {};
+        var name = instance.name || config.name || row.id;
+        var version = config.version || instance.version || '';
+        var source = config.builtin ? '内置' : (config.release || config.source || '自定义');
+        var enabled = config.enabled !== false;
+        var actions = [];
+        actions.push('<button data-act="restart" data-id="' + esc(row.id) + '">重启</button>');
+        if (enabled) {
+          actions.push('<button class="danger" data-act="disable" data-id="' + esc(row.id) + '">停用</button>');
+        } else {
+          actions.push('<button class="primary" data-act="enable" data-id="' + esc(row.id) + '">启用</button>');
+        }
+        actions.push('<button class="danger" data-act="uninstall" data-id="' + esc(row.id) + '">卸载</button>');
+        html += '<tr>' +
+          '<td><strong>' + esc(name) + '</strong><div class="muted">' + esc(row.id) +
+            (version ? ' · v' + esc(version) : '') + '</div>' + dependencyRows(config.requires || instance.requires) + '</td>' +
+          '<td>' + runtimeBadge(instance) + '<div class="muted">' + esc(source) + '</div></td>' +
+          '<td>' + statusBadge(instance) + (instance.disabled_reason ?
+            '<div class="muted">' + esc(instance.disabled_reason) + '</div>' : '') + '</td>' +
+          '<td><div class="row">' + actions.join('') + '</div></td>' +
+          '</tr>';
+      });
+      html += '</tbody></table>';
+      body.innerHTML = html;
+      setNotice('pluginsNotice', '');
+    } catch (error) {
+      body.className = 'inline-empty';
+      body.textContent = '插件列表加载失败：' + error.message;
+    }
+  }
+
+  async function loadBuiltins(refresh) {
+    var body = $('builtinsBody');
+    try {
+      var data = await api('/api/plugin/builtins' + (refresh ? '?refresh=1' : ''));
+      var builtins = (data && data.builtins) || [];
+      if (!builtins.length) {
+        body.className = 'inline-empty';
+        body.textContent = '没有内置插件。';
+        return;
+      }
+      body.className = '';
+      var html = '<table><thead><tr><th>插件</th><th>运行时</th><th>状态</th><th>操作</th></tr></thead><tbody>';
+      builtins.forEach(function (item) {
+        var resolution = item.resolution || {};
+        var ready = resolution.ready !== false && resolution.ok !== false;
+        var reason = resolution.reason || resolution.error || '';
+        var actions = [];
+        if (item.enabled) {
+          actions.push('<button class="danger" data-act="builtin-disable" data-id="' + esc(item.id) + '">停用</button>');
+        } else {
+          actions.push('<button class="primary" data-act="builtin-enable" data-id="' + esc(item.id) + '">启用</button>');
+        }
+        html += '<tr>' +
+          '<td><strong>' + esc(item.name || item.id) + '</strong><div class="muted">' + esc(item.id) +
+            (item.version ? ' · v' + esc(item.version) : '') + '</div>' +
+            dependencyRows(item.requires) + '</td>' +
+          '<td>' + esc((item.runtime || resolution.runtime || '') || '未声明') + '</td>' +
+          '<td>' + (ready ? '<span class="badge ok">可用</span>' : '<span class="badge warn">不可用</span>') +
+            (reason ? '<div class="muted">' + esc(reason) + '</div>' : '') + '</td>' +
+          '<td><div class="row">' + actions.join('') + '</div></td>' +
+          '</tr>';
+      });
+      html += '</tbody></table>';
+      body.innerHTML = html;
+    } catch (error) {
+      body.className = 'inline-empty';
+      body.textContent = '内置插件加载失败：' + error.message;
+    }
+  }
+
+  async function loadRelease() {
+    var body = $('releaseBody');
+    try {
+      var data = await api('/api/plugin/release');
+      var entries = (data && data.entries) || [];
+      var meta = [];
+      if (data && data.source) meta.push('源：' + data.source);
+      if (data && data.tag) meta.push('release：' + data.tag);
+      if (data && data.online) meta.push('联网');
+      if (data && !data.ok && data.error) meta.push('错误：' + data.error);
+      $('releaseMeta').textContent = meta.join(' · ');
+      if (!entries.length) {
+        body.className = 'inline-empty';
+        body.textContent = (data && data.ok === false)
+          ? ('发布索引不可用：' + (data.error || '未知原因'))
+          : '本地还没有发布索引缓存，点「刷新索引」联网拉取。';
+        return;
+      }
+      body.className = '';
+      var html = '<table><thead><tr><th>插件</th><th>版本</th><th>依赖</th><th>操作</th></tr></thead><tbody>';
+      entries.forEach(function (item) {
+        var installed = item.installed_version || '';
+        var hasUpdate = item.has_update === true;
+        var label = installed
+          ? (hasUpdate ? '更新到 v' + esc(item.version) : '已安装 v' + esc(installed))
+          : '安装';
+        var actions = [];
+        actions.push('<button class="primary" data-act="install" data-id="' + esc(item.plugin_id) + '">' + label + '</button>');
+        var deps = item.requires && item.requires.plugins ? item.requires.plugins : [];
+        if (deps.length) {
+          actions.push('<button data-act="install-deps" data-id="' + esc(item.plugin_id) + '">自动补齐依赖并安装</button>');
+        }
+        html += '<tr>' +
+          '<td><strong>' + esc(item.name || item.plugin_id) + '</strong><div class="muted">' + esc(item.plugin_id) +
+            (item.description ? ' · ' + esc(item.description) : '') + '</div></td>' +
+          '<td>' + esc(item.version || '') + '</td>' +
+          '<td>' + (deps.length ? dependencyRows(item.requires) : '<span class="muted">无</span>') + '</td>' +
+          '<td><div class="row">' + actions.join('') + '</div></td>' +
+          '</tr>';
+      });
+      html += '</tbody></table>';
+      if (data && data.skipped && data.skipped.length) {
+        html += '<div class="hint">已跳过：' + data.skipped.map(esc).join('；') + '</div>';
+      }
+      body.innerHTML = html;
+      setNotice('releaseNotice', '');
+    } catch (error) {
+      body.className = 'inline-empty';
+      body.textContent = '发布索引加载失败：' + error.message;
+    }
+  }
+
+  async function runAction(button, task, successMessage) {
+    if (button) button.disabled = true;
+    showError('');
+    try {
+      await task();
+      if (successMessage) setNotice('pluginsNotice', successMessage);
+      await loadAll();
+    } catch (error) {
+      if (error.status === 401) {
+        showReady();
+        $('tokenState').className = 'badge off';
+        $('tokenState').textContent = '会话已失效';
+        showError('会话 token 已失效（通常表示界面已就绪）：' + error.message);
+      } else {
+        showError(error.message);
+      }
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  function post(path, body) {
+    return api(path, { method: 'POST', body: body || {} });
+  }
+
+  function bindActions() {
+    document.addEventListener('click', function (event) {
+      var button = event.target.closest('button[data-act]');
+      if (!button) return;
+      var id = button.getAttribute('data-id');
+      var act = button.getAttribute('data-act');
+      var releaseNotice = '';
+      if (act === 'restart') {
+        runAction(button, function () {
+          return post('/api/plugin/configs/' + encodeURIComponent(id) + '/restart');
+        }, '已请求重启：' + id);
+      } else if (act === 'disable') {
+        runAction(button, function () {
+          return api('/api/plugin/configs/' + encodeURIComponent(id), {
+            method: 'PATCH', body: { enabled: false }
+          });
+        }, '已停用：' + id);
+      } else if (act === 'enable') {
+        runAction(button, function () {
+          return api('/api/plugin/configs/' + encodeURIComponent(id), {
+            method: 'PATCH', body: { enabled: true }
+          });
+        }, '已启用：' + id);
+      } else if (act === 'uninstall') {
+        if (!window.confirm('卸载插件 ' + id + '？（会停用并删除插件文件，配置条目保留）')) return;
+        runAction(button, function () {
+          return post('/api/plugin/release/' + encodeURIComponent(id) + '/uninstall');
+        }, '已卸载：' + id);
+      } else if (act === 'builtin-enable') {
+        runAction(button, function () {
+          return post('/api/plugin/builtins/' + encodeURIComponent(id) + '/enable');
+        }, '已启用内置插件：' + id);
+      } else if (act === 'builtin-disable') {
+        runAction(button, function () {
+          return post('/api/plugin/builtins/' + encodeURIComponent(id) + '/disable');
+        }, '已停用内置插件：' + id);
+      } else if (act === 'install' || act === 'install-deps') {
+        var withDeps = act === 'install-deps';
+        releaseNotice = '正在' + (withDeps ? '补齐依赖并' : '') + '安装：' + id;
+        setNotice('releaseNotice', releaseNotice);
+        runAction(button, function () {
+          return post('/api/plugin/release/' + encodeURIComponent(id) + '/install', {
+            with_dependencies: withDeps
+          });
+        }, '安装请求完成：' + id);
+      }
+    });
+
+    $('reloadBtn').addEventListener('click', loadAll);
+    $('reprobeBtn').addEventListener('click', function () {
+      var button = $('reprobeBtn');
+      button.disabled = true;
+      loadBuiltins(true).finally(function () { button.disabled = false; });
+    });
+    $('refreshReleaseBtn').addEventListener('click', function () {
+      var button = $('refreshReleaseBtn');
+      button.disabled = true;
+      setNotice('releaseNotice', '正在联网刷新发布索引…');
+      post('/api/plugin/release/refresh').then(function (data) {
+        if (data && data.ok === false) {
+          setNotice('releaseNotice', '刷新失败：' + (data.error || '未知原因'));
+        } else {
+          setNotice('releaseNotice', '发布索引已刷新。');
+        }
+      }).catch(function (error) {
+        setNotice('releaseNotice', '刷新失败：' + error.message);
+      }).finally(function () {
+        button.disabled = false;
+        loadRelease();
+      });
+    });
+  }
+
+  async function loadAll() {
+    if (!token) return;
+    await Promise.all([loadPlugins(), loadBuiltins(false), loadRelease()]);
+  }
+
+  function startMetaPolling() {
+    if (pollTimer) return;
+    var tick = async function () {
+      try {
+        var meta = await api('/api/meta');
+        var ui = (meta && meta.ui) || [];
+        if (ui.length) {
+          showReady();
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        }
+      } catch (error) {
+        if (error.status === 401 || error.status === 403) {
+          // 会话 token 在首个 ui.hello 后会被核心吊销：这正是“界面就绪”的信号。
+          showReady();
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        }
+      }
+    };
+    tick();
+    pollTimer = setInterval(tick, 3000);
+  }
+
+  bindActions();
+  exchangeTicket();
+})();
+</script>
+</body>
+</html>

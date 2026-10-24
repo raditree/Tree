@@ -352,7 +352,7 @@ class StationCommandContext {
     this.sourcePluginId = '',
   });
 
-  /// 命令名（白名单内，如 fs.read / ui.push）。
+  /// 命令名（白名单内，如 fs.read / tool.call）。
   final String command;
 
   /// 命令参数（插件给的原始 JSON 对象）。
@@ -364,7 +364,7 @@ class StationCommandContext {
   /// 站点实例 id。
   final String stationId;
 
-  /// 下命令的插件 id（空 = 系统内置调用；ui.push 的卡片归属靠它）。
+  /// 下命令的插件 id（空 = 系统内置调用）。
   final String sourcePluginId;
 }
 

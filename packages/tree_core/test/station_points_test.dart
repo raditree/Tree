@@ -23,12 +23,12 @@ void main() {
       );
     });
 
-    test('类型分布：广播 10 / 执行 11 / 中转 12 / 收集 3', () {
+    test('类型分布：广播 10 / 执行 10 / 中转 12 / 收集 4', () {
       int count(StationKind kind) => StationPoints.ofKind(kind).length;
       expect(count(StationKind.broadcast), 10);
-      expect(count(StationKind.execute), 11);
+      expect(count(StationKind.execute), 10);
       expect(count(StationKind.relay), 12);
-      expect(count(StationKind.collect), 3);
+      expect(count(StationKind.collect), 4);
       expect(StationPoints.all.length, 36);
     });
 
@@ -90,9 +90,9 @@ void main() {
       );
     });
 
-    test('命令 → 点位：26 条命令，每条恰好属于一个执行站点位', () {
+    test('命令 → 点位：25 条命令，每条恰好属于一个执行站点位', () {
       final Set<String> commands = StationPoints.allCommands;
-      expect(commands.length, 26, reason: '$commands');
+      expect(commands.length, 25, reason: '$commands');
       expect(commands, <String>{
         'fs.read',
         'fs.write',
@@ -108,7 +108,6 @@ void main() {
         'agent.message',
         'agent.stop',
         'agent.compact',
-        'ui.push',
         'llm.call',
         'tool.call',
         'tool.close',

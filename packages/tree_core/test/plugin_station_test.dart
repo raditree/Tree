@@ -7,7 +7,6 @@ import 'package:tree_core/src/plugin/station_instance.dart';
 import 'package:tree_core/src/plugin/station_runtime.dart';
 import 'package:tree_core/src/plugin/station_scope.dart';
 import 'package:tree_core/src/plugin/stations.dart';
-import 'package:tree_protocol/tree_protocol.dart';
 
 /// 站点体系（M9 §3）：四站 + 落盘 + 隔离 + 收集站部分结果。
 ///
@@ -37,13 +36,11 @@ void main() {
     Duration interval = const Duration(milliseconds: 60),
     int miss = 3,
     String? path,
-    void Function(Map<String, dynamic> frame)? frameSink,
   }) => StationHub(
     storePath: path ?? storePath,
     heartbeatInterval: interval,
     missThreshold: miss,
     livenessProbeInterval: const Duration(milliseconds: 10),
-    frameSink: frameSink,
   );
 
   StationScope team(String id, {String mode = StationModeKey.local}) =>
@@ -566,9 +563,7 @@ void main() {
     final ExecuteStation execute = h.executePointFor(StationHubIds.executeFs)!;
     // 白名单由**点位**决定：本点位只有 fs.* 一族；全命令并集仍可从 builtinCommands 取
     expect(execute.commands, contains('fs.read'));
-    expect(execute.commands, isNot(contains('ui.push')), reason: 'ui.push 属于前端推送点位');
     expect(ExecuteStation.builtinCommands, contains('fs.read'));
-    expect(ExecuteStation.builtinCommands, contains('ui.push'));
     expect(execute.kind.subscribable, isFalse);
 
     // 未挂载：显式错误（不是静默成功）
@@ -675,42 +670,6 @@ void main() {
     );
     expect(sub.ok, isFalse);
     expect(sub.code, 'not_subscribable');
-  });
-
-  test('执行站·前端推送点位：ui.push 复用 4.1 的 card 槽位帧（带 team_id，发到广播）', () async {
-    final List<Map<String, dynamic>> frames = <Map<String, dynamic>>[];
-    final StationHub h = hub(frameSink: frames.add);
-    final StationScope scope = team('team-1');
-    final ExecuteStation execute = h.executePointFor(StationHubIds.executeUi)!;
-    final StationCommandResult pushed = await execute.execute(
-      command: 'ui.push',
-      scope: scope,
-      sourcePluginId: 'p1',
-      arguments: <String, dynamic>{
-        'slot_key': 'demo.plugin.card.1',
-        'view': <String, dynamic>{'type': 'text', 'text': '你好'},
-      },
-    );
-    expect(pushed.ok, isTrue);
-    expect(frames, hasLength(1));
-    expect(frames.single['type'], PluginUiFrameType.update);
-    final Map<String, dynamic> data =
-        frames.single['data']! as Map<String, dynamic>;
-    expect(data['plugin_id'], 'p1');
-    expect(data['team_id'], 'team-1');
-    expect(data['slot_key'], 'demo.plugin.card.1');
-    expect((data['view']! as Map<String, dynamic>)['type'], 'text');
-
-    // 缺 slot_key：可读错误
-    final StationCommandResult bad = await execute.execute(
-      command: 'ui.push',
-      scope: scope,
-      arguments: <String, dynamic>{
-        'view': <String, dynamic>{'type': 'text'},
-      },
-    );
-    expect(bad.ok, isFalse);
-    expect(bad.error, contains('slot_key'));
   });
 
   test('插件下线：中枢注销其全部订阅并落盘', () async {

@@ -238,8 +238,8 @@ abstract final class StationIsolation {
   /// 校验**执行站命令**的 scope（插件 → 核心）。
   ///
   /// 与 [checkMessageScope]（数据面消息）的差别只有一处：**team 允许为空 =
-  /// 通配所有 team**（用户定稿：为空默认作用于所有 team）——团队级命令（如
-  /// `ui.push` 推一张对所有 team 都可见的卡片）本来就没有单一 team。
+  /// 通配所有 team**（用户定稿：为空默认作用于所有 team）——团队级命令
+  /// （如 `station.list`）本来就没有单一 team。
   ///
   /// 真正需要"落到实处"的命令（写文件 / 跑终端 / 操作 agent）由**挂载位置**自己
   /// fail-closed：`execute_mounts._resolveTarget` 要求 team 非空、agent 可解析、

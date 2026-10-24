@@ -279,18 +279,6 @@ abstract final class StationPoints {
       commands: <String>['agent.message', 'agent.stop', 'agent.compact'],
     ),
     StationPointSpec(
-      id: StationHubIds.executeUi,
-      kind: StationKind.execute,
-      label: '前端推送',
-      description: '执行站·前端推送族：ui.push（复用 4.1 card 槽位帧）',
-      alias: 'ui',
-      readme:
-          '前端推送族（ui.push）：把一个卡片推到界面的约定槽位（slot_key）。'
-          '帧形状与插件 UI 系统的 card 槽位完全一致，所以不需要额外注册 UI。'
-          '推送是**尽力而为**：没连前端时命令会失败并回报原因，不会静默丢帧。',
-      commands: <String>['ui.push'],
-    ),
-    StationPointSpec(
       id: StationHubIds.executeLlm,
       kind: StationKind.execute,
       label: 'LLM 调用',
@@ -671,6 +659,30 @@ abstract final class StationPoints {
           '不按启动顺序择一；② 白名单外的 pattern、非法 method、schema 不过的申报一律拒收；'
           '③ 插件被卸载 / 重新申报时按 `plugin_id` 整组销账（停止但仍在清单里 ⇒ 该路由回 503，'
           '不是 404）；④ 已实现的核心路由永远优先，委派抢不到前面。',
+      alias: '',
+    ),
+    StationPointSpec(
+      id: StationHubIds.collectUiBranding,
+      kind: StationKind.collect,
+      label: 'UI 品牌申报',
+      description:
+          '收集站（系统自带）：UI 插件申报 {icon, role, sizes}，核心按 plugin_id 记账并'
+          '把当前生效品牌聚合进 /api/meta.branding',
+      readme:
+          '品牌申报收集站：每次 UI 插件 `ui.hello` 成功后，核心读取该帧携带的 '
+          '`branding` 字段 `{icon, role: exe|window|tray, sizes}`（不额外向 UI 发采集请求——'
+          'UI 是纯消费者，不参与收集站的请求 / 应答）。\n'
+          '生效顺序：**最后到达者生效**（按 plugin_id 记账，重复申报会移到队尾）；'
+          '撤回 / 停用 ⇒ 回退上一条；全部撤回 ⇒ 回到默认（`/api/meta.branding` 缺失）。\n'
+          '闸门（全部可读拒收）：扩展名白名单（role=exe 仅 `.ico`；window/tray 允许 '
+          '`.png` / `.ico`）、文件 ≤256KB、`.ico` 必须含 16/32/48/256 四种尺寸、'
+          '窗口图标 ≥32×32、路径必须落在插件目录内（解析 symlink 后复核）、'
+          '禁止 URL / base64。\n'
+          '边界：**绝不改写 exe 的 PE 资源**。核心只提供“当前生效品牌”的读取面；'
+          '运行时窗口/托盘图标由 UI 自己做，loader 只拿 `.ico` 去更新快捷方式 '
+          '`IconLocation`（本期数据面已交付，launcher 的快捷方式更新见片 E 报告缺口）。\n'
+          '失效：每次应用前重校验文件存在与可读，失败 ⇒ 回默认 + 一条可读日志，'
+          '不静默保留旧图。',
       alias: '',
     ),
   ];

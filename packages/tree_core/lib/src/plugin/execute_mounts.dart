@@ -165,8 +165,7 @@ typedef StationUsageQuerier = Future<Map<String, dynamic>> Function({
 /// 执行站命令的挂载位置集合（M9 Wave 3-I）。
 ///
 /// 站点体系里「执行器只是执行站的一种挂载位置」：本类就是**系统内置挂载位置**，
-/// 把首命令集里除 `ui.push`（由站点中枢复用 4.1 的 card 槽位帧挂载）之外的八条命令
-/// 接到核心既有实现上——不再出现「暂无挂载位置」：
+/// 把首命令集里的命令接到核心既有实现上——不再出现「暂无挂载位置」：
 ///
 /// | 命令 | 落到的既有实现 |
 /// |---|---|
@@ -400,8 +399,6 @@ class ExecuteStationMounts {
   String? mountInto(ExecuteStation station) {
     final List<String> failed = <String>[];
     for (final String command in station.commands) {
-      // ui.push 由站点中枢挂载（复用 4.1 card 槽位帧），不在这里重复挂
-      if (command == 'ui.push') continue;
       final String? error = station.mount(
         command: command,
         mountId: '$mountIdPrefix.$command',

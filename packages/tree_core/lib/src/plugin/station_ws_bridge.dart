@@ -36,6 +36,8 @@ class StationWsBridge {
     this.routes,
     this.log,
     this.onUiHello,
+    this.onUiBranding,
+    this.branding,
     this.queueCapacity = WsConnectionOutbox.defaultQueueCapacity,
   });
 
@@ -57,6 +59,15 @@ class StationWsBridge {
   ///
   /// 桥只负责“身份通过”这一事实，不关心宿主怎么记状态。
   final void Function(String pluginId)? onUiHello;
+
+  /// 片 E：`ui.hello` 里可选携带的品牌申报（`{icon, role, sizes}`）。
+  ///
+  /// 设计 §6.4 明确「UI 不参与收集站的请求/应答」，因此品牌申报**随 hello 投递**：
+  /// 连接建立即申报一次；重连视为新申报。`null` = 该连接没有申报 ⇒ 撤回该插件。
+  final void Function(String pluginId, Object? branding)? onUiBranding;
+
+  /// 片 E：`/api/meta.branding` 的只读快照（当前生效品牌）。
+  final ApiMetaBranding? Function()? branding;
 
   /// 每条连接的投递队列上限。
   final int queueCapacity;
@@ -230,6 +241,7 @@ class StationWsBridge {
       routes: routes?.call() ?? const <ApiMetaRoute>[],
       stations: stationRows,
       capabilities: capabilities,
+      branding: branding?.call(),
     );
   }
 
@@ -278,6 +290,8 @@ class StationWsBridge {
     state.bond = _UiBond(pluginId, version, capabilities);
     log?.call('UI 连接 ${connection.id} 已绑定插件 $pluginId（$version）');
     onUiHello?.call(pluginId);
+    // 品牌申报随 hello 到达：没带 branding 键 = 该插件撤回申报（回退上一条 / 默认）。
+    onUiBranding?.call(pluginId, data['branding']);
   }
 
   void _handleSubscribe(WsConnection connection, Map<String, dynamic> frame) {

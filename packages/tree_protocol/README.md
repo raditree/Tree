@@ -11,7 +11,6 @@
 | [lib/src/ws_inbound.dart](lib/src/ws_inbound.dart) · [ws_outbound.dart](lib/src/ws_outbound.dart) | WS 上行 / 下行帧类型 |
 | [lib/src/ws_stream_seq.dart](lib/src/ws_stream_seq.dart) | 流式增量的单调序号与封口水位（断线重播去重） |
 | [lib/src/core_handshake.dart](lib/src/core_handshake.dart) | 父进程 ↔ 核心的单行 JSON 握手（`{port, token, pid, version, data_root?}`）解析 |
-| [lib/src/plugin_ui.dart](lib/src/plugin_ui.dart) | 插件 UI 槽位 / 动作帧（4.1 card 槽位复用） |
 
 ## 不变量（assertions）
 

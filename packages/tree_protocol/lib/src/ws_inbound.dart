@@ -1,5 +1,4 @@
 import 'plugin_rpc_methods.dart';
-import 'plugin_ui.dart';
 import 'terminal.dart';
 
 /// WebSocket **上行**消息类型（前端 → 核心进程）。
@@ -27,11 +26,8 @@ abstract final class WsInboundType {
   // `tool_exec_progress`（反向执行结果回报）整套上行帧已删除——它们描述的
   // "前端执行器"不存在了。插件宿主同理（核心自己拉起插件进程）。
 
-  /// 插件 UI 交互回调（Q12）：前端在插件槽位上的按钮点击 / 表单提交。
-  ///
-  /// 值复用 [PluginUiFrameType.action]（**别名**，不重复字面量）；核心收到后按
-  /// `plugin_id` 路由给声明该槽位的插件（见 core_server 的 pluginUiAction 分支）。
-  static const String pluginUiAction = PluginUiFrameType.action;
+  // 片 E：旧 UI 面板协议的动作上行已删除；前端不再有插件槽位，
+  // 插件的功能扩展只走调用点 REST / 广播订阅。
 
   // ── 集成终端（Ctrl+J） ────────────────────────────────────────────────
   // 值复用 [TerminalInboundType.*]（**别名**，不重复字面量），见 terminal.dart。
@@ -80,7 +76,6 @@ abstract final class WsInboundType {
     stop,
     userAnswer,
     cancelQuestion,
-    pluginUiAction,
     terminalOpen,
     terminalInput,
     terminalResize,

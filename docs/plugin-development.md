@@ -1,6 +1,6 @@
 # 插件开发指南（Tree 桌面端）
 
-> 面向"从零写一个能用的插件"。协议、站点体系、隔离语义、UI 槽位、调试手段都在这里；
+> 面向"从零写一个能用的插件"。协议、站点体系、隔离语义、UI 插件（广播订阅 + 委派端点）、调试手段都在这里；
 > 可运行示例**全部住在插件仓**（raditree/tree-plugins，本地 clone 在桌面仓的
 > [`plugins/`](../plugins/README.md)：五个 Dart 插件 + 公共骨架 `_kit`，`dart compile exe` 编成
 > 成品，不再要求用户机器装 Python）；“从哪个示例下手”见 §12。
@@ -111,7 +111,6 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `station/stream` | **通知** | `{request_id, delta?}` / `{request_id, done:true, …}` / `{request_id, error:{…}}` | 不等应答（见 §5.4） |
 | `log` | **通知** | `{level, message}` | 进核心日志缓冲 |
 | `event` | **通知** | 任意 JSON 对象 | 转成前端 `plugin_event` 帧 |
-| `ui/manifest` / `ui/update` | **通知** | 见 §7 | 转成 UI 帧 |
 | `shutdown` | **通知** | `{}` | 核心请求你退出 |
 
 **请求 vs 通知**：带 `id` 且带 `method` = 请求（必回一条）；
@@ -135,7 +134,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | 中转站 relay | 拦截-回填：核心把数据交给你，你决定改不改 | 订阅；**每个点位唯一订阅者** |
 | 收集站 collect | 一对多收集 + 汇聚，不回填原数据流 | 由核心按接入点代订阅（工具定义） |
 
-### 3.1 全部内置点位（35 个 id：广播 10 + 执行 11 + 中转 12 + 收集 2）
+### 3.1 全部内置点位（36 个 id：广播 10 + 执行 10 + 中转 12 + 收集 4）
 
 | 点位 id | 类型 | 触发时机 | 回填/产出 |
 |---|---|---|---|
@@ -154,7 +153,6 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.execute.fs` | 执行 | — | `fs.read` / `fs.write` / `fs.list` / `fs.grep` |
 | `system.execute.terminal` | 执行 | — | `terminal.exec`（含 hook 后台任务）、`terminal.listRuns` / `terminal.stopRun` / `terminal.log`（后台任务的**结构化读口与控口**：列表回行不回散文，`exit_code`/`pid` 拿不到写 `null` 不省略键，终止**不保证杀得掉**且 `requested=false` 必带 `reason`，`log` 只递尾部；只看/只动目标 agent 自己的任务） |
 | `system.execute.agent` | 执行 | — | `agent.message` / `agent.stop` / `agent.compact` |
-| `system.execute.ui` | 执行 | — | `ui.push` |
 | `system.execute.llm` | 执行 | — | `llm.call`（硬设 JSON 返回形式） |
 | `system.execute.tool` | 执行 | — | `tool.call`（执行任意工具）、`tool.close`（按 `handle` **显式关闭**一次运行中的工具/请求：先尽力终止进程树、再让在途调用收敛；句柄失效或不归你管 ⇒ 可读拒绝，**绝不自动关**） |
 | `system.execute.session` | 执行 | — | `session.rename`（会话重命名） |
@@ -174,6 +172,8 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.broadcast.config.changed` | 广播 | `applyConfigs()` 逐条对账**完成后**，一条动作一个 topic | 通知：`{plugin_id, action, action_label, reason, generation}`；`action` 与 `PluginReconcileKind` 同源（`started` / `stopped` / `restarted` / `failed`）；**`unchanged` 一律不广播**（没改动的对账是噪声） |
 | `plugin.tool.define` | 收集 | 工具表刷新 | 申报工具定义 |
 | `plugin.capability.define` | 收集 | 与工具申报**同一趟** | 申报自己认得的**点位**（`{capabilities:[{capability_id, direction:push\|pull, event, description, schema}]}`）；**`schema` 为空就拒那一条**；申报只是描述，**不产生投递路** |
+| `system.collect.api.routes` | 收集 | 工具表刷新 / 插件上线 / 重新申报 | 申报自己承接的 `method + pattern`（委派归属表，聚合进 `/api/meta.routes`；冲突整条拒收） |
+| `system.collect.ui.branding` | 收集 | 每次 UI 插件 `ui.hello` 成功 | 申报 `{icon, role: exe\|window\|tray, sizes}`（随 hello 携带，不额外发采集请求）；核心按其闸门记账并聚合进 `/api/meta.branding`（§7.2） |
 
 ### 3.2 怎么订阅
 
@@ -289,7 +289,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | **订阅声明**（`station/subscribe` 的 `scope`、`plugins.yaml` 的 `scope`） | **不设条件（通配）**：空 team = 作用于**所有 team**；空 mode = local 与 ssh **都收** |
 | **消息信封**（核心投给你的请求里的 `scope`） | 空 = 不可证明归属 ⇒ 核心**拒绝投递**（你不会收到这类消息） |
 | **执行类命令的落地**（`fs.*` / `terminal.exec` / `agent.*`） | fail-closed：team / agent / mode 必须解析得出且与目标 agent 的真实归属**精确吻合**，否则拒绝执行 |
-| **`ui.push` 的 team** | 允许为空 = 推给**所有 team**（前端任何 team 下都可见） |
+| **团队级执行命令的 team** | 允许为空 = 作用于**所有 team**（如 `station.list`：拓扑本来就不分 team） |
 
 实践建议：
 
@@ -618,7 +618,6 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `agent.message` | `message`/`content`, `session_id?` | `{…}` | 给某 agent 的会话发消息 |
 | `agent.stop` | `agent_id?`, `cascade?`（缺省 true） | `{any_running, reason?, …}` | 停止（级联）生成 |
 | `agent.compact` | `agent_id?`, `session_id?` | `{…}` | **发起上下文压缩** |
-| `ui.push` | `slot_key`, `view?` | `{pushed, slot, slot_key, unregistered}` | 往消息流推一张卡片（§7） |
 | `llm.call` | `messages?` 或 `prompt?`, `system?`, `model?`, `temperature?`, `max_tokens?`, `tools?`（OpenAI 工具声明**原样透传**，给压缩插件对齐对话前缀用）, `response_format?`（`"json_object"` 缺省 / `"text"` = **不发**该字段，为复用对话前缀缓存；也接受 `{"type": …}`） | 成功 `{ok, json, text, model, usage}`；失败 `{ok:false, error, error_kind?, text, text_length, truncated_suspect?}`（**失败也带模型正文原文**，见下表后说明） | **站点处缺省硬设 JSON 返回形式**的 LLM 调用，复用目标 agent 的模型（显式 `"text"` 时改用对话同形态，见 §「缓存」第 3 条） |
 | `tool.call` | `tool`, `arguments?`, `relay?`（默认 false）, `run_id?` / `call_id?`（**只在整轮接管 `loop.run` 里用**，见 §5.6：`run_id` = 那一轮的 `request_id`） | `{tool, result, is_error, relayed}` | 执行**任意工具**（内置 / MCP / 插件工具同一入口）。带了 `run_id` 而它**不在册**（那一轮已收尾 / 属于别的插件）⇒ **这次调用被拒**，核心同时替你播上 `tool_start` / `tool_end` 卡片 |
 | `session.rename` | `title`（必填）, `session_id?` | `{renamed, title, session_id}` | 会话重命名（前端即时刷新标题） |
@@ -884,7 +883,7 @@ plugins:
 
 ---
 
-## 7. 广播站与前端 UI
+## 7. 广播站与 UI 插件
 
 ### 7.1 广播（单向通知）
 
@@ -918,75 +917,48 @@ plugins:
 （调用方不等，所以拖不慢工具调用），但**不回会被记为未响应/投递失败**并出现在计数与日志里——
 广播不是"可以不回"，而是"回了也没人用"。回 `null` 表示"收到，无内容"。
 
-### 7.2 前端槽位（声明式，无 JS）
+### 7.2 站点是唯一贡献面：广播订阅 + 委派端点
 
-用 `ui/manifest` 声明槽位，`ui/update` 更新内容，`ui.push` 往消息流推卡片：
+片 E 起，插件**不再声明界面槽位**：旧通知 `ui/manifest` / `ui/update` 与上行帧
+`plugin_ui_action`（以及只服务于它的 `ui.push` 执行站命令）已从协议删除。插件对界面的
+贡献只剩两条路：
 
-```jsonc
-// 声明（插件上线时发一次）
-{"jsonrpc":"2.0","method":"ui/manifest","params":{
-  "plugin_id":"sample", "title":"示例插件",
-  "slots":[
-    {"slot_key":"sample.activity.main","slot":"activity","title":"示例插件","order":10},
-    {"slot_key":"sample.panel.main","slot":"panel","title":"示例插件"},
-    {"slot_key":"sample.card.rounds","slot":"card","title":"工具轮次"}
-  ]}}
+1. **广播订阅**（推）：订 `system.broadcast` 或某个广播点位，把界面事件作为载荷收下。
+   后台插件要**主动推内容给界面**，只有三条合法路径：插件**自建广播站**、
+   `system.broadcast` 公告板、或 REST 委派端点的回包。核心没有第四条"直推前端"的通道，
+   也不接受新造一条。
+2. **REST 委派端点**（拉）：插件申报自己承接的 `method + pattern`（见 §8 的
+   `system.collect.api.routes`），核心据此生成委派归属表；UI 通过委派端点调用。
+   请求 / 响应超过 1 MB 时改走 `body_path` / `result_path`（磁盘传递，禁止 base64 内联）。
 
-// 更新（可多次）
-{"jsonrpc":"2.0","method":"ui/update","params":{
-  "slot_key":"sample.activity.main",
-  "view":{"type":"column","children":[{"type":"text","text":"已计数 3 次"}]}}}
-```
-
-槽位类型：
-
-| `slot` | 位置 | 备注 |
-|---|---|---|
-| `activity` | **左栏整页**：左侧活动栏的一个图标项 + 左栏里的一整页内容（同一个槽位两处呈现） | 点击回调走 `plugin_ui_action` 上行帧 |
-| `panel` | 右栏 Tab | 声明后才出现 |
-| `status` | 状态条 | 单行 |
-| `card` | 消息流内联卡片 | **必须先声明**；未声明的 `slot_key` 会被前端静默丢弃（这是最常见的"我推了但看不到"） |
-
-视图是**受限控件集的 JSON**（`column` / `row` / `text` / `button` / `divider` / `image` /
-`list` 等，风格 `body|title|caption|mono`）：不执行任何插件 JS。
-
-`ui.push`（执行站命令）适合"随对话出现"的卡片：`slot_key` 必须是已声明的 `card` 槽位；
-`view` 省略 = 注销该卡片。
-
-**面板交互的线上形状**（前端 → 核心 → 插件）—— 两段形状**不一样**，判错就是"按钮点了没反应"：
+**UI 插件**（`runtime: ui`）在 WS 连接建立时发一次 `ui.hello` 自报身份：
 
 ```jsonc
-// ① 前端 → 核心（WS 上行帧）
-{"type":"plugin_ui_action","data":{
-  "plugin_id":"demo","team_id":"team_1","agent_id":"agent_1","session_id":"session_default",
-  "slot_key":"demo.activity.1","action_id":"refresh","payload":{}}}
-
-// ② 核心 → 插件（**event 通知**，与 agent.tool_call 同一范式）
-{"jsonrpc":"2.0","method":"event","params":{
-  "event":"plugin_ui_action",          // ← 判据在这个键上，不是 method
-  "plugin_id":"demo","team_id":"team_1","agent_id":"agent_1","session_id":"session_default",
-  "slot_key":"demo.activity.1","action_id":"refresh","payload":{}}}
+{"type":"ui.hello","data":{
+  "plugin_id":"tree_ui_default","version":"1.0.0",
+  "capabilities":["plugin.manage"],
+  "branding":{"icon":"icons/app.ico","role":"exe","sizes":[16,32,48,256]}  // 可选
+}}
 ```
 
-- **判据必须写在 `params["event"]` 上**：`if params.get("event") == "plugin_ui_action"`。
-  写成 `if method == "plugin_ui_action"` 永远不命中（核心的 `method` 一律是 `event`），
-  表现就是"面板按钮点了没反应"，且**没有任何报错**——最容易浪费半天的坑。
-- `payload` 的语义由**插件**解释（核心只透传）：按钮点击 = 按钮声明的 `payload`；
-  表单提交 = `submit.payload` 与各字段值合并（**字段值覆盖同名键**）。
-- 动作是**单向通知**：核心不解释语义、也不回执。插件要"反馈"只能自己再推一帧
-  `ui/update`（或 `log`）；操作失败**务必**写进 `log` 通知，否则用户在界面上看不到任何反应。
-- 插件不在线时核心会**显式回一帧 `error` 并记日志**（不静默丢弃）；未知 `action_id`
-  由插件自己决定怎么处理（示例插件记一条 `log` 通知 + 忽略）。
+- **能力聚合**：`capabilities` 里声明 `plugin.manage` 的连接才会被算作"可管理插件"的
+  界面；零连接、只剩没有该能力的 UI、或能力条目被停用 ⇒ loader 打开浏览器里的引导页
+  （只做插件管理）。`GET /api/meta` 的 `ui` 数组就是这份聚合结果。
+- **引导会话**：引导页用一次性票据换来的会话 token 只放行插件端点与 `GET /api/meta`；
+  **首个 UI `ui.hello` 成功后立即吊销**，页面轮询到 `ui` 非空即可关闭。
+- **品牌申报**（`branding`，可选）：每次 `ui.hello` 成功即申报一次，核心按 `plugin_id`
+  记账，**最后到达者生效**；撤回 / 停用回退上一条，全部撤回回默认（`/api/meta.branding`
+  缺省）。闸门（全部可读拒收）：`role=exe` 仅 `.ico`；`window` / `tray` 允许 `.png` /
+  `.ico`；文件 ≤256KB；`.ico` 必须含 16/32/48/256；窗口图标 ≥32×32；路径必须落在申报
+  插件自己的目录内（解析 symlink 后复查）；禁止 URL / base64。核心**只读图标文件，
+  绝不改写 exe 的 PE 资源**；运行时窗口 / 托盘图标由 UI 插件自己负责。
+- **重校验**：每次应用品牌前都重新检查文件是否存在、可读；失效 ⇒ 移除该条并记一条可读
+  日志、回退上一条或默认，**不静默保留旧图**。
 
-
-**槽位生命周期**（2026-10-02 起的前端口径）：槽位跟着"插件是否在运行"走——
-
-- 插件**停用 / 条目被删除 / 启动失败 / 进程退出**（核心推 `plugin_status(disabled)`）⇒ 前端**立即注销**
-  它声明的全部槽位：卡片与面板一起消失（不留在界面上当僵尸）；
-- 前端**断连**时清空槽位注册表（离线期间核心不会重放已停用插件的声明），重连后按核心缓存的**当前态**重建；
-- 因此**重新启用 / 重启后要重新发 `ui/manifest` 与 `ui.push`**——在插件启动时发一次即可（本来就是推荐做法），
-  界面会自动回来；不要指望"插件不跑了界面还留着"。
-- **心跳丢失（degraded）不算下线**：进程还活着、槽位保留（恢复后照旧），所以别把 `ping` 当负担。
+**UI 插件是纯消费者**：不承接 `api/delegate`，也不能订阅 relay / execute / collect 站点。
+所有功能性调用走 REST，唯一例外是 PTY 流式会话（走 WebSocket）。WS 上行只允许：
+`ui.hello`、`station/subscribe` / `station/unsubscribe`、自建站 `trigger`、PTY 相关帧、
+`heartbeat`；其余一律拒绝并给出可读原因。
 
 ---
 
@@ -1046,7 +1018,7 @@ plugins:
 | 面板 | 设置 → 插件开发：「插件」段看实例状态与订阅，**「站点」段看每个点位**的订阅者/计数（`requests` / `responded` / `timeout` / `no_subscriber` 等）。两类卡片**都能点进详情页**：插件页全程只读（介绍 / 基本信息 / 内置运行时 / 运行态 / 提供的工具 / 它建的与它订阅的站）；站点页重新 GET 一次真值，可改「可订阅插件数量」、订阅者的**禁用开关**、以及 `config` 里的自定义项（增 / 删 / 改） |
 | 骨架探针 | 先用 §1 的最小骨架跑通 `hello` / `ping` / `tools/list`，再加站点订阅；不要一上来就写全功能 |
 | 不用真核心自测 | 写一个假核心：按 §2 的报文往你的 stdin 写，读你的 stdout 断言（插件仓每个示例都带 `--selftest`，`sample_plugin.dart` 那一份 215 条就是这么跑的；`tool/build_plugins.dart` 会拿编出来的 exe 再跑一遍） |
-| 常见坑 | ① stdout 混入日志 ⇒ 解析失败；② 单线程顺序处理 ⇒ 自锁 + 心跳丢失；③ 忘了 `ui/manifest` 声明 `card` 槽位 ⇒ 推了看不到；④ 订阅写了错的 `mode_key` ⇒ 收不到消息；⑤ 流式接管忘了 `done` ⇒ 该轮一直等（最终被取消/心跳判死）；⑥ **面板按钮判据写成 `method == "plugin_ui_action"`** ⇒ 永远不命中，表现为"点了没反应"（真实形状见 §7.2，判据在 `params.event` 上） |
+| 常见坑 | ① stdout 混入日志 ⇒ 解析失败；② 单线程顺序处理 ⇒ 自锁 + 心跳丢失；③ 后台推内容没走"自建广播站 / `system.broadcast` / 委派端点"这三条路之一 ⇒ 界面收不到（片 E 起没有直推前端的通道，见 §7.2）；④ 订阅写了错的 `mode_key` ⇒ 收不到消息；⑤ 流式接管忘了 `done` ⇒ 该轮一直等（最终被取消/心跳判死）；⑥ 对收集站回包多了不该有的键（如 `plugin.tool.define` 只允许 `tools`）⇒ 整条被拒 |
 
 ---
 
@@ -1055,7 +1027,7 @@ plugins:
 | 旧 | 新 | 迁移动作 |
 |---|---|---|
 | `system.relay`（工具前/后共用一个实例） | `system.relay.tool.pre` + `.tool.post` | 核心**自动迁移**落盘订阅（旧订阅复制到两个点位、含更早一代 `system.relay@team@mode`，行为等价）；插件代码不用改：`{"station":"relay"}` 现在一次订两个点位 |
-| `system.execute`（九条命令共用一个实例） | `system.execute.fs/terminal/agent/ui/llm/tool/session` | 插件无感（命令名不变，核心按命令路由） |
+| `system.execute`（九条命令共用一个实例） | `system.execute.fs/terminal/agent/llm/tool/session/ssh/plugin/station/usage` | 插件无感（命令名不变，核心按命令路由）；`ui.push` 随旧 UI 面板协议在片 E 删除 |
 | 无流式接管 | `station/stream` + `station/cancel` | 想用就用；不用则一次 `reply` 仍可 |
 | `point` 参数不存在 | `station/subscribe` 支持 `point` | 可选：用别名代替完整 id |
 | 点位化前"广播站只有一个" | 通用主题 + `tool.pre` / `tool.post` | 广播站**没有**"不带 point = 全订"的糖（`{"station":"broadcast"}` 仍是通用主题）；要工具广播就订两个点位 |
@@ -1075,11 +1047,11 @@ plugins:
   编译：`dart run tool/build_plugins.dart --only suspendable`。
 - [`plugins/terminal_probe/terminal_probe_plugin.dart`](../plugins/terminal_probe/terminal_probe_plugin.dart)：**terminal 三段通路的探针（Dart）**
   ——`terminal.exec` + `hook: true` 起长任务、`hook_action=status` 逐拍量、`system.tool.timeout` 广播只记不取消；
-  拿不到句柄就如实**降级**成"通路存活"（每一拍 echo），并把降级原因写进时间线。它还交了左栏 `activity`
-  面板的完整形状（`ui/manifest` 一次 + `ui/update` 整块替换 + 按钮动作从 `params.event` 判）。
-  自检 77 条（走**真帧面**：订阅、面板声明、执行站命令都在帧上断言）。编译：`--only terminal_probe`。
+  拿不到句柄就如实**降级**成"通路存活"（每一拍 echo），并把降级原因写进时间线。它曾经交出的
+  左栏 `activity` 面板（旧 `ui/manifest` / `ui/update`）已随片 E 退役，探针本体只保留站点通路。
+  自检 77 条（走**真帧面**：订阅、执行站命令都在帧上断言）。编译：`--only terminal_probe`。
 - [`plugins/sample/sample_plugin.dart`](../plugins/sample/sample_plugin.dart)：**全功能参考实现（Dart，成品
-  `tree_sample[.exe]`）**——工具申报、活动栏面板、消息流卡片、工具前/后中转改写、**LLM 流式接管**
+  `tree_sample[.exe]`）**——工具申报、工具前/后中转改写、**LLM 流式接管**
   （`--relay-llm`）、`prompt.system` 改写（`--relay-prompt`）、`llm.call` / `tool.call` /
   `session.rename` 三条新命令（`--llm-call` / `--tool-call` / `--rename-session`）、工具广播订阅
   （`--watch-tools`）、自建站点（`--self-station`）、心跳与 `--selftest`（**215 条**，同样走真帧面：

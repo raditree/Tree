@@ -40,6 +40,7 @@ class ApiMeta {
     this.routes = const <ApiMetaRoute>[],
     this.stations = const <ApiMetaStation>[],
     this.capabilities = const <Object?>[],
+    this.branding,
   });
 
   /// 核心版本（展示 / 兼容诊断用）。
@@ -63,6 +64,11 @@ class ApiMeta {
   /// 插件申报的 capability，**原样透传**（核心不解释、不校验）。
   final List<Object?> capabilities;
 
+  /// 当前生效的 UI 品牌（`system.collect.ui.branding` 的最后一条有效申报）。
+  ///
+  /// 全撤回 / 全部失效 ⇒ null（默认品牌）。核心**不改写 exe 的 PE 资源**。
+  final ApiMetaBranding? branding;
+
   /// 宽容解析（非 Map 入参由调用方先归一；未知键忽略）。
   factory ApiMeta.fromJson(Map<String, dynamic> json) => ApiMeta(
     coreVersion: _asString(json['core_version']),
@@ -76,6 +82,9 @@ class ApiMeta {
         .map(ApiMetaStation.fromJson)
         .toList(growable: false),
     capabilities: _asList(json['capabilities']),
+    branding: json['branding'] is Map
+        ? ApiMetaBranding.fromJson(Map<String, dynamic>.from(json['branding'] as Map))
+        : null,
   );
 
   /// 序列化（字段全写；列表为空也保留，便于 UI 区分「空」与「老核心没给」）。
@@ -87,6 +96,7 @@ class ApiMeta {
     'routes': routes.map((ApiMetaRoute item) => item.toJson()).toList(),
     'stations': stations.map((ApiMetaStation item) => item.toJson()).toList(),
     'capabilities': capabilities,
+    if (branding != null) 'branding': branding!.toJson(),
   };
 
   @override
@@ -202,6 +212,49 @@ class ApiMetaStation {
     if (point.isNotEmpty) 'point': point,
     if (ownerPluginId.isNotEmpty) 'owner_plugin_id': ownerPluginId,
     if (description.isNotEmpty) 'description': description,
+  };
+}
+
+/// 当前生效的 UI 品牌（`/api/meta.branding`，片 E / 5.5）。
+///
+/// 只在有**有效**申报时出现；默认品牌时字段缺失（不是 `{}`）。
+class ApiMetaBranding {
+  const ApiMetaBranding({
+    required this.pluginId,
+    required this.icon,
+    required this.role,
+    this.sizes = const <int>[],
+  });
+
+  /// 申报插件 id。
+  final String pluginId;
+
+  /// 图标绝对路径（已解析 symlink；loader 用它更新快捷方式 `IconLocation`）。
+  final String icon;
+
+  /// 用途：`exe` | `window` | `tray`。
+  final String role;
+
+  /// 文件内容实际尺寸（像素边长）。
+  final List<int> sizes;
+
+  /// 宽容解析。
+  factory ApiMetaBranding.fromJson(Map<String, dynamic> json) => ApiMetaBranding(
+    pluginId: _asString(json['plugin_id']),
+    icon: _asString(json['icon']),
+    role: _asString(json['role']),
+    sizes: _asList(json['sizes'])
+        .whereType<num>()
+        .map((num value) => value.toInt())
+        .toList(growable: false),
+  );
+
+  /// 序列化。
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'plugin_id': pluginId,
+    'icon': icon,
+    'role': role,
+    'sizes': sizes,
   };
 }
 

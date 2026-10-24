@@ -37,10 +37,6 @@ void main() {
       ...WsInboundType.all,
       ...WsOutboundType.all,
       ...CoreEventType.all,
-      // Q12 插件布局三件套（manifest / update / action）：action 已由
-      // WsInboundType.pluginUiAction 别名登记（规则 2 因此强制核心保留其分支），
-      // manifest / update 是下行帧，靠本行进入 covered 集合。
-      ...PluginUiFrameType.all,
       ...nonProtocolTypeLiterals.keys,
     };
     final Set<String> uncovered = scanned.difference(covered);
@@ -214,12 +210,6 @@ void main() {
       'WsInboundType': WsInboundType.all,
       'WsOutboundType': WsOutboundType.all,
       'CoreEventType': CoreEventType.all,
-      // Q12 插件布局常量集（帧 / 槽位 / 控件 / 字段 / 按钮样式）
-      'PluginUiFrameType': PluginUiFrameType.all,
-      'PluginUiSlotKind': PluginUiSlotKind.all,
-      'PluginUiViewType': PluginUiViewType.all,
-      'PluginUiFieldKind': PluginUiFieldKind.all,
-      'PluginUiButtonStyle': PluginUiButtonStyle.all,
       'ApiPaths.kept': ApiPaths.kept,
       'ApiPaths.removedWithAccounts': ApiPaths.removedWithAccounts,
     }.entries) {

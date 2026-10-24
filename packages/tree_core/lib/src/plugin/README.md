@@ -33,7 +33,6 @@
 | --- | --- |
 | [execute_mounts.dart](execute_mounts.dart) | **系统内置挂载位置**：把执行站各命令族接到核心既有实现，并做四元组隔离 |
 | [plugin_tool_definition.dart](plugin_tool_definition.dart) | 收集站首个接入点：插件定义 tool → 动态工具表 |
-| [plugin_ui_bridge.dart](plugin_ui_bridge.dart) | 插件通知 → 前端 UI 帧（槽位）+ 当前态缓存（供后连的前端重放） |
 | [agent_events.dart](agent_events.dart) | agent 事件发布器（工具调用开始 / 结束等） |
 
 ## 不变量（assertions）
@@ -60,8 +59,8 @@
 8. **无静态总时间上限**（M9 §1.1）：看门狗每拍 `ping`，连续 N 拍没有心跳 ⇒ 只标记 `health: degraded` 并让前端可见，**不自动终止插件**（长任务跑多久都不因时间被杀）；心跳恢复自动清除；用户可显式 `restart`。唯一保留的短窗口是**建连握手**——没有它就诊断不出"插件根本没起来"。**站请求 / `tools/call` 同样没有静态超时**（`plugin_host.requestStation` 明写这条）；未响应只记"未响应者清单"。**软窗口之后只允许显式收手**（用户 `restart` / 关闭那一次运行）——全仓同一条口径见 [../llm/README.md](../llm/README.md) 不变量 2。
 9. **插件与 agent 同权**：本仓库**没有工具审批层**，`tool.call` 走工具层唯一入口，与模型调用工具是同一条路径、同一份权限。这是设计事实，文档如实写出来，而不是假装有沙箱。
 10. **写回配置必须保留未知键**：直接在原始 Map 上改 + 原子写，不经 `PluginConfig.fromJson` 中转（它会丢未知键，改一个开关会把文件改瘦成核心认识的形状）。id 白名单 `[A-Za-z0-9_.-]`（防止 id 被当成路径分段用）；校验失败一律返回**可读中文原因**，不抛异常。
-11. **插件 UI 安全边界（fail-closed）**：`plugin_id` 一律取**实例 id**，不采信通知里的自述（否则 A 插件能注销 / 覆盖 B 的槽位）；`team_id` 以配置声明为准，冲突以声明为准并记日志；槽位条数 / `slot_key` / 视图大小都有上限，超限**整帧拒绝**。不做 webview / iframe、不执行插件 JS——视图只能是受限控件集的 JSON，未知控件由前端渲染成占位。
-12. **UI 帧缓存只存"桥已放行"的帧**：插件槽位声明是一次性的，而广播是"当下有谁在听就发给谁"——前端刷新 / 重连、插件比前端先就绪、断线期间插件重启，都会让面板**永久消失**直到插件进程重启。缓存按帧类型存最后一个生效帧，新连接注册时重放（前端对同内容重放幂等）。越权 / 非法声明连缓存都进不去，重放**不是**绕过校验的旁路。
+11. **UI 插件是纯消费者（片 E）**：`plugin_id` 一律取 `ui.hello` 里与 `plugins.yaml` 对账后的身份，不采信通知里的自述；WS 侧只允许**订阅广播站**，中转 / 执行 / 收集站与自建非广播站一律可读拒绝。旧槽位 / 受限控件集协议已随片 E 退役，UI 面板由插件自己的 UI 进程负责。
+12. **品牌申报只读、只记账**：`ui.hello` 可带 `{icon, role, sizes}`，核心按 `plugin_id` 记账、最后到达者生效；文件必须落在该插件目录内、体积与尺寸过闸门，**绝不改写 exe 的 PE 资源**。每次应用前重校验，失效回退上一条 / 默认并记一条可读日志（不静默保留旧图）。
 13. **agent 事件发布失败绝不冒泡**：发布发生在生成循环里（工具调用处），订阅方抛异常只回报 `onError`、事件丢弃——插件侧的任何问题都不该让生成失败。默认未接线 = **纯 no-op**。
 14. 内置插件的"身份"由**核心**认定（前端只拿到 id / 名称 / 说明 / 开关状态）；解析不出运行时必须给可读错误（「未检测到 Python，请先安装或改用自定义命令」）——静默失败在界面上表现为"点了开关没反应"。
 15. 执行站挂载位置的依赖**没接线时不做静默降级**：以「未接线」的可读原因失败。
@@ -415,10 +414,9 @@ dart test test/plugin_test.dart test/plugin_request_test.dart test/plugin_statio
           test/station_points_test.dart test/plugin_self_station_e2e_test.dart \
           test/plugin_execute_mounts_test.dart test/execute_mounts_scope_test.dart \
           test/plugin_execute_new_commands_test.dart test/plugin_tool_define_test.dart \
-          test/plugin_tool_table_test.dart test/plugin_ui_bridge_test.dart test/plugin_ui_manifest_test.dart \
-          test/plugin_ui_replay_test.dart test/plugin_config_store_test.dart test/plugin_hot_apply_test.dart \
+          test/plugin_tool_table_test.dart test/plugin_config_store_test.dart test/plugin_hot_apply_test.dart \
           test/builtin_plugin_script_roots_test.dart test/plugin_llm_relay_test.dart \
-          test/compact_plugin_e2e_test.dart test/sample_plugin_layout_e2e_test.dart \
+          test/compact_plugin_e2e_test.dart \
           test/plugin_hot_restart_test.dart test/plugin_hot_restart_station_test.dart \
           test/plugin_close_no_hard_timeout_test.dart test/plugin_state_pool_scope_test.dart \
           test/plugin_restart_keepalive_test.dart test/plugin_restart_buffer_bounded_test.dart \

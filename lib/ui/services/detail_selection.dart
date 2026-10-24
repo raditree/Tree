@@ -6,7 +6,7 @@ import '../models/message.dart';
 ///
 /// 为什么用一个全局可监听对象：点击发生在消息流深处（MessageList → 工具行 / 思考行），
 /// 要打开的页面在右栏（FilePanel），两边隔着 main_page 的三栏骨架与四个构造函数。
-/// 这个仓库本来就有同类做法（MessageDraftCache 的草稿、PluginUiRegistry 的槽位），
+/// 这个仓库本来就有同类做法（MessageDraftCache 的草稿），
 /// 所以这里沿用「一个全局对象 + 单向写入」的形态，不穿透回调。
 ///
 /// 为什么存**消息快照**而不是 id：右栏拿不到中栏的消息表。跑着的工具 / 思考内容是

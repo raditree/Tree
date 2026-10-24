@@ -61,6 +61,8 @@ import '../terminal/terminal_service.dart';
 import '../ws/ws_hub.dart';
 import 'http_io.dart';
 import 'http_router.dart';
+import 'bootstrap_page.dart';
+import 'token_registry.dart';
 import 'ws_liveness.dart';
 
 /// 核心进程的回环 HTTP + WS 服务（M1 骨架）。
@@ -111,7 +113,23 @@ class CoreServer {
     this.usageLog,
     this.ptyStarter,
     this.sshPtyStarter,
+    Duration bootstrapTicketTtl = const Duration(minutes: 5),
+    Duration bootstrapSessionTtl = const Duration(minutes: 10),
+    DateTime Function()? tokenClock,
+    String? bootstrapSourcePath,
   }) {
+    tokens = TokenRegistry(
+      primaryToken: token,
+      ticketTtl: bootstrapTicketTtl,
+      sessionTtl: bootstrapSessionTtl,
+      clock: tokenClock,
+      log: (String message) => errorLog?.call(message),
+    );
+    bootstrapPage = BootstrapPage(
+      dataDir: dataDir,
+      sourcePath: bootstrapSourcePath,
+      log: (String message) => errorLog?.call(message),
+    );
     // 集成终端会话（Ctrl+J）：它要按 agent 解析工作区根，所以只在接了文件服务时可用；
     // 伪终端实现默认用平台实现（ConPTY / script），测试可注入假的。
     terminalService = fileService == null
@@ -156,6 +174,12 @@ class CoreServer {
 
   /// 本次运行的一次性本地 token。
   final String token;
+
+  /// token 作用域注册表（主 token / 引导票据 / 引导会话）。
+  late final TokenRegistry tokens;
+
+  /// 引导页磁盘种子与渲染。
+  late final BootstrapPage bootstrapPage;
 
   /// 存储（默认内存实现；CLI 注入 `FileTreeStore` 落 `~/.tree`）。
   final TreeStore store;
@@ -417,6 +441,16 @@ class CoreServer {
     PtyStarter? ptyStarter,
     SshPtyStarter? sshPtyStarter,
     String? dataDir,
+
+    /// 引导页种子路径（测试注入；空 = 按 exe 同级 / 当前目录 / 仓库根探测）。
+    String? bootstrapSourcePath,
+
+    /// 引导票据与引导会话的时长（测试可缩短到毫秒级）。
+    Duration bootstrapTicketTtl = const Duration(minutes: 5),
+    Duration bootstrapSessionTtl = const Duration(minutes: 10),
+
+    /// token 注册表的时钟（测试注入可控时间）。
+    DateTime Function()? tokenClock,
   }) async {
     final HttpServer http = await HttpServer.bind(
       address ?? InternetAddress.loopbackIPv4,
@@ -443,6 +477,7 @@ class CoreServer {
     );
     final BuiltinPluginCatalog resolvedBuiltinPlugins =
         builtinPlugins ?? BuiltinPluginCatalog();
+    final String resolvedToken = token ?? CoreToken.generate();
     // 委派临时文件的根：优先用调用方显式给的 dataDir；否则从插件配置路径反推
     // （`<数据根>/config/plugins.yaml` 的上两级）；都没有时退到系统临时目录。
     final String resolvedDataDir =
@@ -460,11 +495,16 @@ class CoreServer {
           bus: pluginBus,
           catalog: resolvedBuiltinPlugins,
         );
+    // 片 E：品牌申报的路径闸门只认这几处插件目录（相对路径也按它们解析）。
+    pluginBus?.configureBrandingDirs(<String>{
+      defaultPluginInstallDir(),
+      ...resolvedBuiltinPlugins.scriptRoots(),
+    });
     final CoreServer server = CoreServer._(
       http,
       processId: currentPid,
       dataDir: resolvedDataDir,
-      token: token ?? CoreToken.generate(),
+      token: resolvedToken,
       store: resolvedStore,
       settings: resolvedSettings,
       todoStore: resolvedTodos,
@@ -504,6 +544,10 @@ class CoreServer {
       stubRouter: CoreRouter(),
       reassembler: InboundFrameReassembler(),
       version: version,
+      bootstrapTicketTtl: bootstrapTicketTtl,
+      bootstrapSessionTtl: bootstrapSessionTtl,
+      tokenClock: tokenClock,
+      bootstrapSourcePath: bootstrapSourcePath,
     );
     // 片 D：UI 插件要用 `TREE_CORE_URL` / `TREE_CORE_TOKEN` 直连本核心。
     // 监听成功后立刻把实际端口与 token 接到总线上（CLI 里 plugins.start() 在这之后）。
@@ -814,7 +858,17 @@ class CoreServer {
       routes: delegatedRouter.metaRoutes,
       log: (String message) => errorLog?.call('[core:station/ws] $message'),
       // 片 D：UI 插件连上后解除连接窗口的 degraded（总线只记状态，不做事）。
-      onUiHello: bus.noteUiHello,
+      onUiHello: (String pluginId) {
+        bus.noteUiHello(pluginId);
+        // 片 E / 5.2：会话 token 在**首个** UI `ui.hello` 成功后吊销（设计 §7.2 第 5 步）。
+        tokens.revokeSessions(reason: 'UI 插件 $pluginId 已连接');
+      },
+      // 片 E / 5.5：品牌申报随 `ui.hello` 到达（设计 §6.4 明确 UI 不参与收集站
+      // 请求/应答，因此这里由 hello 的 `branding` 字段投递一次）。
+      onUiBranding: (String pluginId, Object? branding) {
+        unawaited(bus.declareUiBranding(pluginId, branding));
+      },
+      branding: () => bus.activeBranding,
     );
     bus.stations.onStationRemoved = bridge.onStationRemoved;
     bus.onPluginOffline = bridge.onPluginOffline;
@@ -1379,13 +1433,41 @@ class CoreServer {
       await _handleWebSocket(request);
       return;
     }
-    if (!CoreToken.matchesAuthorization(
-      token,
+    if (request.method == 'GET' && request.uri.path == ApiPaths.bootstrap) {
+      // 引导页本身不认 Authorization：它只认 loader 签发的**一次性票据**。
+      await _handleBootstrapPage(request, const <String, String>{});
+      _access(request, request.response.statusCode);
+      return;
+    }
+    if (request.method == 'POST' &&
+        request.uri.path == ApiPaths.bootstrapSession) {
+      // 票据换会话：同样不走主 token（页面手里没有主 token）。
+      await _handleBootstrapSession(request, const <String, String>{});
+      _access(request, request.response.statusCode);
+      return;
+    }
+    final TokenAccess? accessed = tokens.resolveAuthorization(
       request.headers.value(HttpHeaders.authorizationHeader),
-    )) {
+    );
+    if (accessed == null) {
       rejectedRequests++;
       _access(request, 401);
-      await writeJson(request, 401, errorBody('本地 token 无效'));
+      await writeJson(request, 401, errorBody('本地 token 无效或已过期'));
+      return;
+    }
+    if (accessed.isBootstrapSession &&
+        !TokenRegistry.allowsBootstrapSession(
+          request.method,
+          request.uri.path,
+        )) {
+      // 会话 token 已知但权限不足：403（而不是 401，避免页面误以为票据过期）。
+      rejectedRequests++;
+      _access(request, 403);
+      await writeJson(
+        request,
+        403,
+        errorBody('引导会话 token 只放行插件端点与 GET /api/meta'),
+      );
       return;
     }
     final List<String> segments = request.uri.pathSegments;
@@ -1416,6 +1498,83 @@ class CoreServer {
     notFoundRequests++;
     _access(request, 404);
     await writeJson(request, 404, errorBody('未知接口：${request.uri.path}'));
+  }
+
+  // ── 引导壳（片 E） ───────────────────────────────────────────────────
+
+  /// `GET /bootstrap?t=<ticket>`：校验票据、**当场作废**，返回磁盘上的引导页。
+  ///
+  /// 页面里的 `__BOOTSTRAP_TICKET__` 会替换成一张**新的**换会话票据：loader 那张
+  /// 已经在本次请求里消费掉，重复使用一律 401。
+  Future<void> _handleBootstrapPage(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    final String? reason = tokens.consumeBootstrapTicket(
+      request.uri.queryParameters['t'],
+    );
+    if (reason != null) {
+      rejectedRequests++;
+      await writeJson(request, 401, errorBody(reason));
+      return;
+    }
+    final String exchangeTicket = tokens.issueBootstrapTicket(
+      ttl: const Duration(minutes: 2),
+    );
+    final String html = await bootstrapPage.render(
+      exchangeTicket: exchangeTicket,
+    );
+    final HttpResponse response = request.response;
+    response.statusCode = 200;
+    response.headers.contentType = ContentType(
+      'text',
+      'html',
+      charset: 'utf-8',
+    );
+    response.headers.set('cache-control', 'no-store');
+    response.add(utf8.encode(html));
+    await response.close();
+  }
+
+  /// `POST /api/bootstrap/session`：一次性票据换 10 分钟会话 token。
+  Future<void> _handleBootstrapSession(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    Map<String, dynamic> body;
+    try {
+      body = await readJsonBody(request);
+    } on FormatException catch (error) {
+      await writeJson(request, 400, errorBody('请求体不是合法 JSON：$error'));
+      return;
+    }
+    final String? reason = tokens.consumeBootstrapTicket(
+      (body['ticket'] ?? request.uri.queryParameters['t'])?.toString(),
+    );
+    if (reason != null) {
+      rejectedRequests++;
+      await writeJson(request, 401, errorBody(reason));
+      return;
+    }
+    final String sessionToken = tokens.issueBootstrapSession();
+    await writeJson(request, 200, <String, dynamic>{
+      'token': sessionToken,
+      'scope': 'plugin',
+      'expires_in': tokens.sessionTtl.inSeconds,
+    });
+  }
+
+  /// `POST /api/bootstrap/ticket`：主 token 申请一次性票据（loader 用）。
+  Future<void> _apiBootstrapTicket(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    final String ticket = tokens.issueBootstrapTicket();
+    await writeJson(request, 200, <String, dynamic>{
+      'ticket': ticket,
+      'expires_in': tokens.ticketTtl.inSeconds,
+      'url': '/bootstrap?t=$ticket',
+    });
   }
 
   // ── WebSocket ────────────────────────────────────────────────────────
@@ -1456,11 +1615,6 @@ class CoreServer {
       },
       cancelOnError: true,
     );
-    // **插件面板补发**：插件的槽位声明是"启动时发一次"的，前端刷新 / 重连 / 启动
-    // 竞态错过就再也拿不到（注册表是内存态）。核心缓存了每个插件最后一个生效的 UI
-    // 帧（PluginBus.uiCache），这里在连接就绪后只发给**这一条新连接**：重放是幂等
-    // 的（前端整块覆盖），但绝不能广播——否则每次有人重连都会给其他连接重刷一遍。
-    _replayPluginUi(connection);
   }
 
   /// 建连接：核心默认用带活性观测的 [LivenessWsConnection]（M9 1.1）；
@@ -1469,18 +1623,6 @@ class CoreServer {
     final WsHub registry = hub;
     if (registry is LivenessWsHub) return registry.createConnection(socket);
     return WsConnection(socket: socket);
-  }
-
-  /// 把已缓存插件 UI 帧重放给**刚注册的那一条连接**。
-  ///
-  /// 只发新连接，不走 [WsHub.broadcast]：重放对前端是幂等的，但广播会让每次重连
-  /// 都扰动其他已经正确的连接。未接 [pluginBus]（或插件系统关闭）时什么都不做。
-  void _replayPluginUi(WsConnection connection) {
-    final PluginBus? bus = pluginBus;
-    if (bus == null) return;
-    for (final Map<String, dynamic> frame in bus.uiCache.frames()) {
-      connection.send(frame);
-    }
   }
 
   void _handleWsFrame(WsConnection connection, dynamic data) {
@@ -1526,9 +1668,6 @@ class CoreServer {
             'data': <String, dynamic>{'message': '没有等待回答的问题'},
           });
         }
-        break;
-      case WsInboundType.pluginUiAction:
-        _handlePluginUiAction(connection, frame);
         break;
       // ── UI 插件 ⇄ 站点总线（片 B） ─────────────────────────────────────
       // ui.hello 是连接身份；其余五条在没有插件系统时也必须给可读拒绝，
@@ -1583,50 +1722,6 @@ class CoreServer {
         // 未知帧静默忽略（前向兼容：新前端配旧核心不应崩溃）
         break;
     }
-  }
-
-  /// 插件 UI 交互回调（Q12）：把前端在插件槽位上的动作转给**声明该槽位的插件**。
-  ///
-  /// 路由依据只有帧里的 plugin_id（槽位自带优先，缺省回落帧级——前端注册表已经
-  /// 按槽位做过 team 隔离，这里不替插件推断归属）；核心**不解释动作语义**，
-  /// slot_key / action_id / payload 原样透传，插件收到后自行响应（通常是再推一帧
-  /// plugin_ui_update 刷新槽位）。插件不在线时**显式回一帧 error 并记日志**，
-  /// 不静默丢弃——否则用户点了按钮会「没有任何反应」。
-  void _handlePluginUiAction(
-    WsConnection connection,
-    Map<String, dynamic> frame,
-  ) {
-    final Map<String, dynamic> data =
-        (frame['data'] as Map<String, dynamic>?)?.cast<String, dynamic>() ??
-        frame;
-    final String pluginId = (data['plugin_id'] ?? '').toString().trim();
-    final PluginBus? bus = pluginBus;
-    if (pluginId.isEmpty || bus == null) {
-      connection.send(<String, dynamic>{
-        'type': WsOutboundType.error,
-        'data': <String, dynamic>{'message': '插件交互未送达：缺少 plugin_id 或插件总线未启用'},
-      });
-      return;
-    }
-    for (final entry in bus.instances()) {
-      if (entry.pluginId != pluginId) continue;
-      entry.host.dispatchEvent(<String, dynamic>{
-        'event': WsInboundType.pluginUiAction,
-        'plugin_id': pluginId,
-        'team_id': data['team_id'] ?? '',
-        'agent_id': data['agent_id'] ?? '',
-        'session_id': data['session_id'] ?? '',
-        'slot_key': data['slot_key'] ?? '',
-        'action_id': data['action_id'] ?? '',
-        'payload': data['payload'] ?? const <String, dynamic>{},
-      });
-      return;
-    }
-    errorLog?.call('插件交互未送达：插件 $pluginId 未运行（slot_key=${data['slot_key']}）');
-    connection.send(<String, dynamic>{
-      'type': WsOutboundType.error,
-      'data': <String, dynamic>{'message': '插件 $pluginId 未运行，交互未送达'},
-    });
   }
 
   static Map<String, dynamic>? _decodeFrame(String raw) {
@@ -1747,6 +1842,10 @@ class CoreServer {
     // 发现面（片 B）：UI 插件启动后据此判断核心能力、可订阅广播站与委派路由。
     // routes 在片 C 之前为空数组（不编造静态清单）。
     router.add('GET', ApiPaths.meta, _apiMeta);
+    // 引导壳（片 E）：页面与票据换会话都走专用处理（不认主 token）。
+    router.add('GET', ApiPaths.bootstrap, _handleBootstrapPage);
+    router.add('POST', ApiPaths.bootstrapSession, _handleBootstrapSession);
+    router.add('POST', ApiPaths.bootstrapTicket, _apiBootstrapTicket);
     // 插件清单的读写面（M9 §4.2）：与只读快照分工见 ApiPaths.pluginConfigs 的注释。
     router.add('GET', ApiPaths.pluginConfigs, _listPluginConfigs);
     router.add('POST', ApiPaths.pluginConfigs, _createPluginConfig);

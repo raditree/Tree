@@ -1,7 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:tree_protocol/tree_protocol.dart' show PluginRpcMethods;
+import 'package:tree_protocol/tree_protocol.dart'
+    show ApiMetaBranding, PluginRpcMethods;
 import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart';
 
 import '../agent/agent_engine.dart';
@@ -24,7 +25,7 @@ import 'plugin_restart_buffer.dart';
 import 'plugin_runtime.dart';
 import 'plugin_state_pool.dart';
 import 'plugin_tool_definition.dart';
-import 'plugin_ui_bridge.dart';
+import 'ui_branding.dart';
 import 'ui_host.dart';
 import 'station_ids.dart';
 import 'station_channel.dart';
@@ -128,7 +129,6 @@ class PluginBus {
     this.coreVersion = '',
     this.broadcast,
     StationHub? stations,
-    PluginUiBridge? uiBridge,
     this.stationScopeResolver,
     this.agentModeKeyResolver,
     this.callSiteContext,
@@ -136,8 +136,7 @@ class PluginBus {
     this.restartBufferMaxPerPlugin = 32,
     this.restartBufferMaxTotalBytes = 1 << 20,
     this.apiDelegateTimeout = const Duration(seconds: 30),
-  }) : uiBridge = uiBridge ?? PluginUiBridge(),
-       restartBuffer = PluginRestartBuffer(
+  }) : restartBuffer = PluginRestartBuffer(
          maxPerPlugin: restartBufferMaxPerPlugin,
          maxTotalBytes: restartBufferMaxTotalBytes,
        ),
@@ -146,7 +145,6 @@ class PluginBus {
            StationHub(
              storePath: StationStore.pathFor(configFile),
              log: log,
-             frameSink: broadcast,
              heartbeatInterval: heartbeatInterval,
              missThreshold: missThreshold,
            ) {
@@ -157,27 +155,10 @@ class PluginBus {
     statePool.log = log;
     // 暂存队列的溢出与丢弃同理：每一条都直接写日志，不靠调用方去猜。
     restartBuffer.log = log;
-    // **所有**前端下行帧（含执行站 ui.push 的 card 槽位）都在这里过一遍再广播，
-    // 缓存因此自动收全，不需要每个发射点各自记得记一笔。
-    if (broadcast != null) {
-      final void Function(Map<String, dynamic> frame) sink = broadcast!;
-      _outbound = (Map<String, dynamic> frame) {
-        uiCache.record(frame); // 非 UI 帧由 record 自行忽略
-        sink(frame);
-      };
-      this.stations.frameSink = _outbound;
-    }
   }
 
-  /// 包了缓存记一笔的广播出口（[broadcast] 为空时也是空）。
-  void Function(Map<String, dynamic> frame)? _outbound;
-
-  /// 前端下行帧的实际出口（[broadcast] 的包装；见构造器）。
-  ///
-  /// 放在唯一的出口处（而不是每个发射点）是刻意的：发射点会随功能增加，漏一个就
-  /// 等于"那个面板重连后回不来"，而出口只有一个。
-  void Function(Map<String, dynamic> frame)? get outbound =>
-      _outbound ?? broadcast;
+  /// 前端下行帧的出口（片 E 删掉旧 UI 面板协议后不再记账 / 缓存）。
+  void Function(Map<String, dynamic> frame)? get outbound => broadcast;
 
   final String configFile;
 
@@ -254,16 +235,53 @@ class PluginBus {
   /// 站点中枢（四站、订阅、落盘；落点 = <数据根>/config/stations.yaml）。
   final StationHub stations;
 
-  /// 插件通知 → 前端 UI 帧的桥（Q12 生产端；见 [PluginUiBridge]）。
+  /// UI 品牌申报记账表（`system.collect.ui.branding`，片 E / 5.5）。
   ///
-  /// 可注入只为测试换阈值（槽位上限 / 视图字节上限），生产用默认即可。
-  final PluginUiBridge uiBridge;
+  /// 核心只读文件、只记账：**绝不改写 exe 的 PE 资源**。
+  late final UiBrandingRegistry branding = UiBrandingRegistry(log: log);
 
-  /// 插件 UI 帧的当前态缓存（**前端后连 / 重连时的重放来源**；见 [PluginUiCache]）。
+  /// 配置品牌闸门允许的插件目录（核心启动时注入；测试可显式给临时目录）。
+  void configureBrandingDirs(Iterable<String> dirs) {
+    branding.configureAllowedDirs(dirs);
+  }
+
+  /// 当前生效品牌（供 `/api/meta.branding` 同步读取）。
   ///
-  /// 插件只在启动时声明一次槽位，而广播是"当下有谁在听就发给谁"：没有这份缓存，
-  /// 前端刷新 / 重连 / 启动竞态错过的槽位就**永远回不来**（要等插件进程重启）。
-  final PluginUiCache uiCache = PluginUiCache();
+  /// 应用前重校验是异步的（[declareUiBranding] / [revalidateUiBranding] 里做）；
+  /// 这里只返回最近一次校验后的结果，保证 `/api/meta` 不阻塞。
+  ApiMetaBranding? get activeBranding {
+    final UiBrandingEntry? entry = branding.active;
+    if (entry == null) return null;
+    return ApiMetaBranding(
+      pluginId: entry.pluginId,
+      icon: entry.iconPath,
+      role: entry.role.wire,
+      sizes: entry.sizes,
+    );
+  }
+
+  /// 处理一次 `ui.hello` 带来的品牌申报（片 E / 5.5）。
+  ///
+  /// - [payload] 为空 ⇒ 撤回该插件（回退上一条 / 默认）。
+  /// - 闸门失败 ⇒ **撤销**该插件原有申报并记可读日志（不留旧图）。
+  Future<void> declareUiBranding(String pluginId, Object? payload) async {
+    // 每次应用前重校验：文件被删 / 不可读 ⇒ 回默认 + 一条可读日志。
+    await branding.revalidateActive();
+    if (payload == null) {
+      branding.retract(pluginId);
+      return;
+    }
+    final String? error = await branding.declare(pluginId, payload);
+    if (error != null) {
+      branding.retract(pluginId);
+      log?.call('插件 $pluginId 的品牌申报被拒：$error；已回退默认图标');
+    }
+  }
+
+  /// 应用前重校验当前品牌（loader / 测试可显式调用）。
+  Future<void> revalidateUiBranding() async {
+    await branding.revalidateActive();
+  }
 
   /// 插件配置 → 站点四元组的**运行期接线点**（M9 Wave 3-I）。
   ///
@@ -1082,12 +1100,10 @@ class PluginBus {
     });
   }
 
-  /// 推一条 plugin_event（插件主动通知：log / event）。
+  /// 推一条 plugin_event（插件主动通知：log / event / 站点数据面）。
   ///
-  /// **Q12 插件布局的生产端**：约定 method `ui/manifest` / `ui/update` 的通知在这里
-  /// 被转成前端 UI 帧（`plugin_ui_manifest` / `plugin_ui_update`），其余 method 维持
-  /// 原样 `plugin_event`——插件因此能用同一个 stdio 通知通道声明槽位，
-  /// 不需要新协议方法（面板里不执行任何插件 JS，视图只能是受限控件集的 JSON）。
+  /// 片 E：旧 UI 面板协议已删除，插件不能再通过通知声明槽位；功能扩展只走
+  /// 广播订阅（站点事件）与调用点 REST。
   void _emitPluginEvent(String pluginId, Map<String, dynamic> notification) {
     final String method = (notification['method'] ?? '').toString();
     final Object? rawParams = notification['params'];
@@ -1112,28 +1128,6 @@ class PluginBus {
           )) {
         listener(pluginId, params);
       }
-      return;
-    }
-    if (uiBridge.handles(method)) {
-      final PluginConfig? config = this.config(pluginId);
-      final String declaredTeam = (config?.scope['team_id'] ?? '')
-          .toString()
-          .trim();
-      final Map<String, dynamic>? frame = uiBridge.frameFor(
-        pluginId: pluginId,
-        declaredTeamId: declaredTeam,
-        method: method,
-        params: params,
-        onRejected: (String reason) =>
-            log?.call('插件 $pluginId 的 UI 声明被拒：$reason'),
-      );
-      if (frame != null) {
-        // 出口自带缓存记录（见构造器里的 _outbound）：重连时按缓存重放，
-        // 「前端后连」也能拿到同一份当前态
-        outbound?.call(frame);
-        return;
-      }
-      // 非法声明已经记过可读原因，**不再**降级成 plugin_event（避免前端收到半成品）
       return;
     }
     outbound?.call(<String, dynamic>{
@@ -6047,7 +6041,7 @@ class PluginBus {
   ///   team 内活动；未声明的插件可服务任意 team，但每条命令都必须能证明归属
   ///   （fail-closed：agent 缺失 / 不存在 / 归属解析不出 / 请求里带的 team_id 与
   ///   真实归属不一致，一律拒绝）；
-  /// - 不带 agent 的团队级命令（如 ui.push）：team 取请求或声明，agent 留空。
+  /// - 不带 agent 的团队级命令（如 station.list）：team 取请求或声明，agent 留空。
   ///
   /// 执行站的结论（含**可读错误**）原样放进 result 回给插件：命令被拒 / 挂载位置
   /// 失败不是 JSON-RPC 错误，而是 {ok: false, error: ...}——插件据此自查原因，
@@ -6060,7 +6054,7 @@ class PluginBus {
     if (command.isEmpty) {
       throw const PluginRequestException(
         PluginRpcErrorCode.invalidParams,
-        'station/command 需要 command（执行站命令名，如 fs.read / ui.push）',
+        'station/command 需要 command（执行站命令名，如 fs.read / tool.call）',
       );
     }
     final Object? rawArguments = params['arguments'];
@@ -6124,7 +6118,7 @@ class PluginBus {
   ///
   /// 规则（fail-closed）：
   /// 1. 目标 agent = 请求里的 agent_id（params 顶层或 arguments）→ 声明里的
-  ///    scope.agent_id；两者都空时才走"团队级命令"分支（如 ui.push）；
+  ///    scope.agent_id；两者都空时才走"团队级命令"分支（如 station.list）；
   /// 2. team / mode = 核心按目标 agent 的**真实归属**解析（callSiteContext /
   ///    agentModeKeyResolver）；解析器未接线（测试 / 嵌入式宿主）才回退到声明，
   ///    与改造前行为一致；
@@ -6153,7 +6147,7 @@ class PluginBus {
     final String requestedSession = pick('session_id');
     final String requestedAgent = pick('agent_id');
 
-    // ── 团队级命令（无目标 agent，如 ui.push）：team 可以留空 = 通配所有 team ──
+    // ── 团队级命令（无目标 agent，如 station.list）：team 可以留空 = 通配所有 team ──
     //
     // 用户定稿：**为空默认作用于所有 team**。所以这里不再 fail-closed 拒绝；
     // 真正需要"证明归属"的是**执行类命令**（fs.* / terminal.exec / agent.*）——
@@ -6816,9 +6810,8 @@ class PluginBus {
     _queueDepth[pluginId] = 0;
     _degraded.remove(pluginId);
     _dead.remove(pluginId);
-    // **UI 缓存一并作废**：插件下线后它的槽位不该再被重放给新连接（前端收不到
-    // plugin_status 时尤其重要——例如核心重启、或前端当时正断线）
-    uiCache.remove(pluginId);
+    // **品牌申报一并撤回**：插件下线后它的图标不该继续生效（回退上一条 / 默认）。
+    branding.retract(pluginId);
     // **插件下线由总线注销其订阅**（站点订阅关系随之落盘）——但**重启窗口不注销**：
     // 注销后站点上就没有这个插件的回包函数，重启期间到达的请求连暂存的入口都
     // 没有（保活当场失效）。代价由 [_setLifecycle] 的 stopped/failed 分支补销。

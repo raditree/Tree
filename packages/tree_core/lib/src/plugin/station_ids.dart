@@ -107,9 +107,6 @@ abstract final class StationHubIds {
   /// 执行站·Agent 族：`agent.message` / `agent.stop` / `agent.compact`。
   static const String executeAgent = 'system.execute.agent';
 
-  /// 执行站·前端推送族：`ui.push`。
-  static const String executeUi = 'system.execute.ui';
-
   /// 执行站·LLM 族：`llm.call`（硬设 JSON 返回形式，复用目标 agent 的模型）。
   static const String executeLlm = 'system.execute.llm';
 
@@ -242,6 +239,13 @@ abstract final class StationHubIds {
   /// 与 [collect] / [collectCapability] 同形态：按 `plugin_id` 整组覆盖、冲突整条拒收。
   static const String collectApiRoutes = 'system.collect.api.routes';
 
+  /// 收集站·UI 插件**品牌申报**口（片 E / 5.5）。
+  ///
+  /// 每次 `ui.hello` 成功后核心读取该帧携带的 `branding` 字段（`{icon, role, sizes}`）
+  /// ——UI 是纯消费者，核心**不**向它发采集请求（设计 §6.4）。
+  /// 核心只按 `plugin_id` 记账（最后到达者生效），**绝不改写 exe 的 PE 资源**。
+  static const String collectUiBranding = 'system.collect.ui.branding';
+
   // ── 退役 id（**只用于读侧迁移**，不再是实例 id） ─────────────────────────
 
   /// 退役：旧中转站（工具前/后共用、靠 payload.phase 区分）。
@@ -271,7 +275,6 @@ abstract final class StationHubIds {
     executeFs,
     executeTerminal,
     executeAgent,
-    executeUi,
     executeLlm,
     executeTool,
     executeSession,
@@ -294,6 +297,7 @@ abstract final class StationHubIds {
     collect,
     collectCapability,
     collectApiRoutes,
+    collectUiBranding,
   };
 
   /// 退役 id 集合（迁移判定用；它们不再出现在 [all] 里）。

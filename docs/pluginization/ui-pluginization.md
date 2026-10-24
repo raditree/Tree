@@ -86,6 +86,7 @@
 | `/api/meta`              | GET                | 发现面聚合：`core_version`、`api_version`、`ui[]`、`can_manage_plugins`、`routes[]`（委派）、`stations[]`（**仅可订阅的广播站**）、`capabilities[]`（插件申报，原样透传） |
 | `/bootstrap`             | GET                | 送磁盘上的引导页 HTML（内容不冻结，可独立更新）                                                                                                           |
 | `/api/bootstrap/session` | POST               | 一次性票据兑换短时会话 token                                                                                                                    |
+| `/api/bootstrap/ticket`  | POST               | 主 token 申请引导票据（loader 用；会话 token 不可申请）                                                                                              |
 | `/api/logs/sources`      | GET                | 日志源枚举（`core`、`plugin:<id>`）                                                                                                          |
 | `/api/logs/{source}`     | GET / DELETE       | 尾部读（NDJSON，`tail`/`since`）/ 清空轮转                                                                                                     |
 | `/api/store/{ns}`        | GET                | 列键（分页）                                                                                                                               |
@@ -117,7 +118,7 @@
 | 点位 id                       | 别名           | 类型 | 说明                                                |
 | --------------------------- | ------------ | -- | ------------------------------------------------- |
 | `system.collect.api.routes` | `api.routes` | 收集 | 插件按 schema 申报自己承担的 `{method, pattern}` 列表；核心缓存归属表 |
-| `system.collect.ui.branding` | `ui.branding` | 收集 | UI 插件申报图标（见 §6.9）；核心每次 `ui.hello` 后触发，取最后到达者 |
+| `system.collect.ui.branding` | `ui.branding` | 收集 | UI 插件申报图标（见 §6.9）；申报随每次 `ui.hello` 的 `branding` 字段到达，核心只记账不反向采集 |
 
 每个点位六处：表项（含四段式 readme）、`StationHubIds` 常量、进 `StationHubIds.all`、核心投递口、派生用例计数、面板顺序。
 
@@ -463,11 +464,11 @@ UI 插件**可以**注册自建站，但只开放广播类型。
 
 ### 6.9 品牌申报（图标）
 
-UI 插件可申报图标，核心通过内置收集站 `system.collect.ui.branding` 收集，**取最后一次到达者生效**。
+UI 插件可申报图标，核心通过内置点位 `system.collect.ui.branding` 记账（**申报随 `ui.hello` 的 `branding` 字段投递**，核心不向 UI 发收集站请求——UI 是纯消费者，不参与请求/应答），**取最后一次到达者生效**。
 
 | 项 | 规则 |
 | --- | --- |
-| 触发 | 每次 `ui.hello` 成功后触发一次；同一连接重连视为新的申报 |
+| 触发 | 每次 `ui.hello` 成功后读取其 `branding` 字段申报一次；同一连接重连视为新的申报 |
 | 回包 | `{icon: "<相对插件目录的路径>", role: "exe" \| "window" \| "tray", sizes: [16,32,48,256]}` |
 | 生效 | 按到达顺序应用，最后一条生效；记录到 `plugin_id` 维度，撤回/停用后**回退到上一条**，全部撤回则回默认图标 |
 | 校验 | 扩展名白名单（exe/快捷方式仅 `.ico`，窗口/托盘 `.png`/`.ico`）；单文件 ≤ 256 KB；`ico` 须含 16/32/48/256 四档；窗口图标 ≥ 32×32 |
@@ -526,6 +527,8 @@ UI 插件可申报图标，核心通过内置收集站 `system.collect.ui.brandi
 2. 读 `/api/meta` 决定是否开引导页；
 3. 托盘菜单：重新签发票据、打开数据目录、打开日志、退出；
 4. **不使用 Flutter**——否则"卸掉全部 UI"之后仍背着几十 MB 运行时。
+
+**本期落地差距（已知，非冻结面）**：loader 的托盘菜单暂以控制台菜单替代（托盘需 Win32 FFI / 第三方包）；快捷方式 `IconLocation` 更新暂未实现，品牌仅提供 `/api/meta.branding` 数据面与重校验。两项都不影响「全 UI 卸载后仍能装回」这一硬要求，后续可独立补齐。
 
 ***
 

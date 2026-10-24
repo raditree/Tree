@@ -5,7 +5,6 @@ import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
 import 'package:tree_local_exec/tree_local_exec.dart';
-import 'package:tree_protocol/tree_protocol.dart';
 
 /// **插件 → 核心的请求通道**（M9 §3 执行站的核心语义）：插件主动下命令
 /// （`station/command`）——此前这类报文会被宿主静默丢掉（只认响应 / 通知两类）。
@@ -713,73 +712,6 @@ void main() {
       'recovered': true,
     });
     expect(host.notifications, isEmpty, reason: '请求不是通知：不该落进通知转发口');
-  });
-
-  test('插件命令 ui.push ⇒ 核心按 card 槽位帧推到前端（带 team_id）', () async {
-    final List<Map<String, dynamic>> frames = <Map<String, dynamic>>[];
-    final PluginBus bus = await startBus(
-      teamPluginYaml(),
-      broadcast: frames.add,
-    );
-    final Map<String, dynamic> response = await pluginRequest(
-      bus,
-      method: 'station/command',
-      params: <String, dynamic>{
-        'command': 'ui.push',
-        'arguments': <String, dynamic>{
-          'slot_key': 'sample.card.1',
-          'view': <String, dynamic>{'type': 'text', 'text': '插件卡片'},
-        },
-      },
-    );
-    expect(
-      (response['result'] as Map<String, dynamic>)['ok'],
-      isTrue,
-      reason: '${(response['result'] as Map<String, dynamic>)['error']}',
-    );
-    final Map<String, dynamic> frame = frames.singleWhere(
-      (Map<String, dynamic> f) => f['type'] == PluginUiFrameType.update,
-    );
-    final Map<String, dynamic> data = frame['data'] as Map<String, dynamic>;
-    expect(data['plugin_id'], 'sample');
-    expect(data['team_id'], team, reason: '槽位帧一律带 team_id（1.2 隔离）');
-    expect(data['slot_key'], 'sample.card.1');
-    expect((data['view'] as Map<String, dynamic>)['text'], '插件卡片');
-  });
-
-  test('未声明 team 的插件 ui.push ⇒ 照推，帧的 team 为空 = 所有 team 都呈现', () async {
-    final List<Map<String, dynamic>> frames = <Map<String, dynamic>>[];
-    final PluginBus bus = await startBus(
-      noTeamPluginYaml(),
-      broadcast: frames.add,
-    );
-    final Map<String, dynamic> response = await pluginRequest(
-      bus,
-      pluginId: 'noteam',
-      method: 'station/command',
-      params: <String, dynamic>{
-        'command': 'ui.push',
-        'arguments': <String, dynamic>{
-          'slot_key': 'noteam.card.1',
-          'view': <String, dynamic>{'type': 'text', 'text': '通配卡片'},
-        },
-      },
-    );
-    final Map<String, dynamic> result =
-        response['result'] as Map<String, dynamic>;
-    expect(result['ok'], isTrue, reason: '${result['error']}');
-    final Map<String, dynamic> data =
-        frames
-                .singleWhere(
-                  (Map<String, dynamic> f) =>
-                      f['type'] == PluginUiFrameType.update,
-                )['data']
-            as Map<String, dynamic>;
-    expect(
-      data['team_id'],
-      '',
-      reason: '空 team 的槽位帧在前端对**所有 team** 可见（_visible 把空 team 当通配）',
-    );
   });
 
   // ── 插件自建站（station/register）：转发型订阅者的出路 ──────────────────

@@ -1,0 +1,10 @@
+name: tree_launcher
+description: Tree 桌面端的纯 Dart 引导启动器（不依赖 Flutter）。
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ">=3.5.0 <4.0.0"
+
+dev_dependencies:
+  test: ^1.25.0

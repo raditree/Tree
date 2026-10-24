@@ -140,9 +140,9 @@ void main() {
       }
     });
 
-    test('类型分布 广播 10 / 执行 11 / 中转 12 / 收集 3 = 36；预建 33', () {
+    test('类型分布 广播 10 / 执行 10 / 中转 12 / 收集 4 = 36；预建 33', () {
       expect(StationPoints.ofKind(StationKind.relay), hasLength(12));
-      expect(StationPoints.ofKind(StationKind.collect), hasLength(3));
+      expect(StationPoints.ofKind(StationKind.collect), hasLength(4));
       expect(StationPoints.all.length, 36);
     });
 
@@ -487,7 +487,7 @@ void main() {
       final StationHub hub = StationHub(
         storePath: p.join(temp.path, 'stations-fresh.yaml'),
       );
-      expect(hub.ensureBuiltinStations(), hasLength(33));
+      expect(hub.ensureBuiltinStations(), hasLength(32));
       expect(
         hub.station(StationHubIds.collectCapability),
         isNull,
