@@ -89,6 +89,16 @@ abstract final class WsOutboundType {
   /// 插件实例生命周期状态。
   static const String pluginStatus = 'plugin_status';
 
+  /// 站点投递（核心 → WS 订阅者，插件化新增）。
+  ///
+  /// 帧形状：`{type, station_id, point, topic?, payload, scope, origin_plugin_id,
+  /// state, seq?, reason?, from_seq?}`（值对象的家在同包的 `station_ws.dart`）。
+  ///
+  /// **命名风格**：本帧沿用下行历史帧的 snake_case；设计文档 §3.2 给的就是
+  /// `station_delivery`，因此不存在斜杠形式。上行那几条 `station/*` 是 RPC
+  /// 风格的方法名（见 `ws_inbound.dart`），两者不是同一套命名习惯。
+  static const String stationDelivery = 'station_delivery';
+
   // ── 集成终端（Ctrl+J） ────────────────────────────────────────────────
   // 值复用 [TerminalOutboundType.*]（**别名**，不重复字面量），见 terminal.dart。
 
@@ -126,6 +136,7 @@ abstract final class WsOutboundType {
     frameEnd,
     pluginEvent,
     pluginStatus,
+    stationDelivery,
     terminalReady,
     terminalOutput,
     terminalExit,

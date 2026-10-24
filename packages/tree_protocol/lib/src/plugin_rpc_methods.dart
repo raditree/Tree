@@ -61,6 +61,14 @@ abstract final class PluginRpcMethods {
   /// （D10：A+B 混合，核心侧那 6 个 `case` 一字不改）。
   static const String suspend = 'suspend';
 
+  /// **委派一次 HTTP 请求**（插件化新增；核心 → 插件，请求/应答）。
+  ///
+  /// 信封字段固定为 `{method, path, params, query, headers, scope,
+  /// workspace_dir, data_dir, agent_id, team_id, body?, body_path?,
+  /// request_id}`，插件回 `{status, headers?, body? | result_path?}`。
+  /// **只发往普通插件（stdio）**：UI 插件是委派端点的消费者，不走这条通道。
+  static const String apiDelegate = 'api/delegate';
+
   // ── 插件 → 核心（上行请求，必须应答）────────────────────────────────
 
   /// 下执行站命令（命令名与白名单见 `station_points.dart`）。
@@ -89,6 +97,12 @@ abstract final class PluginRpcMethods {
   /// 插件自报日志（核心不按名字分支，原样转成前端 `plugin_event`）。
   static const String log = 'log';
 
+  /// **登记工作空间定位**（插件化新增；插件 → 核心，通知）。
+  ///
+  /// `{workspace_id, dir}`：核心只做「字符串 → 路径」映射，供 `api/delegate`
+  /// 信封解析 `workspace_dir`，不解释语义；写入仅限登记方，读取对所有插件开放。
+  static const String workspaceRegister = 'workspace/register';
+
   // ── 集合与派生读数 ──────────────────────────────────────────────────
 
   /// 核心 → 插件的全部方法。
@@ -102,6 +116,7 @@ abstract final class PluginRpcMethods {
     event,
     shutdown,
     suspend,
+    apiDelegate,
   };
 
   /// 插件 → 核心的请求（核心必须逐一应答）。
@@ -116,7 +131,8 @@ abstract final class PluginRpcMethods {
 
   /// 插件 → 核心的通知（不等应答）。
   ///
-  /// ⚠ 口径：**只有 [stationStream] 在核心里按名字分流**（进流式回填的数据面）；
+  /// ⚠ 口径：**按名字分流**的通知目前只有 [stationStream]（进流式回填的数据面）；
+  /// [workspaceRegister] 是插件化片 A **只登记协议**、核心处理在片 C；
   /// [log] 是**约定名**——核心不认它，而是把整条通知原样转成前端 `plugin_event`
   /// （见 `PluginBus._emitPluginEvent` 与 `PluginHost.notifications`）。把它列在本表里
   /// 是为了让门禁能识别它为已登记的协议名，而不是误报成飘的字面量。
@@ -124,6 +140,7 @@ abstract final class PluginRpcMethods {
   static const Set<String> pluginToCoreNotifications = <String>{
     stationStream,
     log,
+    workspaceRegister,
   };
 
   /// 全部方法名（门禁用例据此判定"字面量是否已登记"）。
@@ -160,9 +177,22 @@ abstract final class PluginRpcMethods {
     log,
   };
 
-  /// 相对 [baselineBeforeHotRestart] 的新增方法（门禁据此断言"本任务只加了 1 个"）。
+  /// 相对 [baselineBeforeHotRestart] 的新增方法（门禁据此断言增量受控）。
   static Set<String> addedSinceBaseline() =>
       all.difference(baselineBeforeHotRestart);
+
+  /// **UI 插件化（协议片 A）之前的基线**（= [all] 去掉 [apiDelegate] /
+  /// [workspaceRegister]，即热重启任务收尾时的快照）。
+  ///
+  /// 为什么再钉一份：片 A 只允许新增这两条，其余一律视为协议漂移。
+  static const Set<String> baselineBeforeUiPluginization = <String>{
+    ...baselineBeforeHotRestart,
+    suspend,
+  };
+
+  /// 相对 [baselineBeforeUiPluginization] 的新增方法（门禁据此断言"片 A 只加了 2 个"）。
+  static Set<String> addedSinceUiPluginization() =>
+      all.difference(baselineBeforeUiPluginization);
 }
 
 /// 扫描到的**不属于插件协议**的方法名字面量的登记表（键 = 字面量，值 = 原因）。

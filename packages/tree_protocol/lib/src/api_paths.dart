@@ -120,6 +120,25 @@ abstract final class ApiPaths {
       '/api/settings/missed-heartbeat-limit';
 
   static const String settingsDataCollection = '/api/settings/data-collection';
+
+  // ── 发现面 / 引导壳（插件化新增，核心永久面）──────────────────────────
+
+  /// 发现面聚合（GET）：核心版本、`api_version`、UI 连接、可订广播站、
+  /// 委派路由与插件申报的 capability。
+  ///
+  /// 它是 UI 唯一的「我现在能用什么」探测入口（设计见
+  /// `docs/pluginization/ui-pluginization.md` §3.1 / §4.1）。
+  static const String meta = '/api/meta';
+
+  /// 引导页 HTML（GET）：无「能管插件的存活 UI 连接」时由 loader 打开。
+  ///
+  /// **不属 `/api` 前缀**：它是核心自有的页面入口（与插件端点分属两个命名
+  /// 空间），因此直接挂在根路径上。
+  static const String bootstrap = '/bootstrap';
+
+  /// 一次性票据兑换短时会话 token（POST）。
+  static const String bootstrapSession = '/api/bootstrap/session';
+
   static const String pluginSnapshot = '/api/plugin/snapshot';
 
   /// 插件清单的**读写面**（M9 §4.2 插件开关：内置与自定义都可在前端增删改）。
@@ -294,6 +313,9 @@ abstract final class ApiPaths {
     settingsHeartbeatInterval,
     settingsMissedHeartbeatLimit,
     settingsDataCollection,
+    meta,
+    bootstrap,
+    bootstrapSession,
     pluginSnapshot,
     pluginConfigs,
     pluginConfig,

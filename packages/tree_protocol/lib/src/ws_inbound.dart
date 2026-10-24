@@ -1,3 +1,4 @@
+import 'plugin_rpc_methods.dart';
 import 'plugin_ui.dart';
 import 'terminal.dart';
 
@@ -47,6 +48,31 @@ abstract final class WsInboundType {
   /// 结束会话。
   static const String terminalClose = TerminalInboundType.close;
 
+  // ── UI 插件 · 站点（WS 侧，插件化新增）──────────────────────────────
+  // **命名风格**：这六条按设计文档 §3.2 使用「点号 / 斜杠」形态，而不是本文件
+  // 历史帧的 snake_case。原因是它们与插件 stdio RPC 的方法名**同名同义**
+  // （`PluginRpcMethods.station*`），两侧共用一套叫法才能让 UI 与普通插件看到
+  // 同一个协议面；改成 snake_case 等于换协议（旧客户端会静默不认）。
+  // 其中五条 `station/*` 直接以 [PluginRpcMethods] 的常量为**别名**，不重复字面量。
+
+  /// UI 连接自我声明：`{plugin_id, version, capabilities[]}`。
+  static const String uiHello = 'ui.hello';
+
+  /// 订阅站点（WS 侧只允许广播站，可选 `topics[]`）。
+  static const String stationSubscribe = PluginRpcMethods.stationSubscribe;
+
+  /// 退订站点。
+  static const String stationUnsubscribe = PluginRpcMethods.stationUnsubscribe;
+
+  /// UI 注册自建站（只允许广播类型）。
+  static const String stationRegister = PluginRpcMethods.stationRegister;
+
+  /// 注销自建站。
+  static const String stationUnregister = PluginRpcMethods.stationUnregister;
+
+  /// 向**自己注册的**自建广播站发布事件（不得触发收集站 / 执行站）。
+  static const String stationTrigger = PluginRpcMethods.stationTrigger;
+
   /// 全部上行类型（完备性测试与文档用）。
   static const Set<String> all = <String>{
     heartbeat,
@@ -59,5 +85,11 @@ abstract final class WsInboundType {
     terminalInput,
     terminalResize,
     terminalClose,
+    uiHello,
+    stationSubscribe,
+    stationUnsubscribe,
+    stationRegister,
+    stationUnregister,
+    stationTrigger,
   };
 }

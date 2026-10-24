@@ -259,9 +259,18 @@ void main() {
   });
 
   group('路由覆盖度不变量', () {
-    test('保留路径 = 已实现 ∪ 显式 501 桩，且两组不相交', () {
+    test('保留路径 = 已实现 ∪ 显式 501 桩 ∪ 片 A 待实现清单', () {
       final Set<String> implemented = server.router.patterns;
       final Set<String> stubs = server.stubRouter.patterns;
+
+      // 插件化片 A 只做协议面（tree_protocol），核心实现分批落地：
+      // `/api/meta` 在片 B，`/bootstrap` 与 `/api/bootstrap/session` 在片 E。
+      // 与 `stubApiPaths` 同口径：**不许长期挂着**，实现一条就从这里删一条。
+      final Set<String> pendingImplementation = <String>{
+        ApiPaths.meta,
+        ApiPaths.bootstrap,
+        ApiPaths.bootstrapSession,
+      };
 
       expect(
         implemented.intersection(stubs),
@@ -270,8 +279,20 @@ void main() {
       );
       expect(
         ApiPaths.kept.difference(implemented.union(stubs)),
+        pendingImplementation,
+        reason:
+            '除片 A 待实现清单外，协议包声明保留的路径都必须在核心进程登记；'
+            '实现（或加 501 桩）后请同步收紧这份清单',
+      );
+      expect(
+        implemented.intersection(pendingImplementation),
         isEmpty,
-        reason: '协议包声明保留的路径必须在核心进程登记',
+        reason: '已实现的路径必须从 pendingImplementation 删除（否则门禁会失真）',
+      );
+      expect(
+        pendingImplementation.difference(ApiPaths.kept),
+        isEmpty,
+        reason: '待实现清单只允许包含协议包声明保留的路径',
       );
       expect(
         implemented.difference(ApiPaths.kept),

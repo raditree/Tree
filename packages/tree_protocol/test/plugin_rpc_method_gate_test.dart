@@ -16,8 +16,11 @@ import 'package:tree_protocol/tree_protocol.dart';
 /// 2. **核心侧不许写字面量**：`plugin_host.dart` / `plugin_bus.dart` 里
 ///    `'method': '<字面量>'` 的命中数必须为 0——这两处是协议的**生产端**，
 ///    在生产端保留字面量就等于给漂移留门；
-/// 3. **增量必须受控**：相对基线只允许多出登记过的新方法（本任务 = 只有 `suspend`），
-///    且核心侧上行分派的数量不变（那 6 个 `case` 一字不改，D10 的 A 侧代价为零）。
+/// 3. **增量必须受控**：相对基线只允许多出登记过的新方法（D10 = 只加
+///    `suspend`；UI 插件化片 A = 再加 `api/delegate` / `workspace/register`），
+///    且核心侧上行**请求**分派的数量不变（那 6 个 `case` 一字不改）。
+///    插件化新增的两条都落在「核心 → 插件」与「插件 → 核心通知」面上，
+///    不占用上行请求的第 7 条。
 void main() {
   final Directory repoRoot = Directory('../..');
 
@@ -113,17 +116,15 @@ void main() {
 
   test('核心侧（协议生产端）不再出现 method 字面量', () {
     // 这两份文件是核心 → 插件帧的唯一生产处；这里保留字面量就等于把漂移写在源头。
-    for (final String file in <String>[
-      'plugin_host.dart',
-      'plugin_bus.dart',
-    ]) {
+    for (final String file in <String>['plugin_host.dart', 'plugin_bus.dart']) {
       final File source = File(
         '${repoRoot.path}/packages/tree_core/lib/src/plugin/$file',
       );
       expect(source.existsSync(), isTrue, reason: '$file 不存在');
-      final List<String> offenders = RegExp(
-        r"'method':\s*'[A-Za-z0-9_./-]+'",
-      ).allMatches(source.readAsStringSync()).map((RegExpMatch m) => m.group(0)!).toList();
+      final List<String> offenders = RegExp(r"'method':\s*'[A-Za-z0-9_./-]+'")
+          .allMatches(source.readAsStringSync())
+          .map((RegExpMatch m) => m.group(0)!)
+          .toList();
       expect(
         offenders,
         isEmpty,
@@ -132,16 +133,42 @@ void main() {
     }
   });
 
-  test('本任务相对基线只新增 1 个 method：suspend（D10）', () {
+  test('相对热重启基线只新增登记过的 3 个 method（D10 + 插件化片 A）', () {
     expect(
       PluginRpcMethods.addedSinceBaseline(),
-      <String>{PluginRpcMethods.suspend},
-      reason: '转储与取回必须走已有 station/command，不得新增 method（D10 = A+B 混合）',
+      <String>{
+        PluginRpcMethods.suspend,
+        PluginRpcMethods.apiDelegate,
+        PluginRpcMethods.workspaceRegister,
+      },
+      reason:
+          'D10 只允许 suspend；插件化片 A 只允许 api/delegate 与 '
+          'workspace/register（见 ui-pluginization.md §3.3）',
     );
     expect(
       PluginRpcMethods.all.length,
-      PluginRpcMethods.baselineBeforeHotRestart.length + 1,
-      reason: 'all 只应比基线多一个 suspend',
+      PluginRpcMethods.baselineBeforeHotRestart.length + 3,
+      reason: 'all 只应比热重启基线多 suspend / api-delegate / workspace-register',
+    );
+  });
+
+  test('相对插件化片 A 基线只新增 api/delegate 与 workspace/register', () {
+    expect(
+      PluginRpcMethods.addedSinceUiPluginization(),
+      <String>{
+        PluginRpcMethods.apiDelegate,
+        PluginRpcMethods.workspaceRegister,
+      },
+      reason:
+          '片 A 是「只增不删」的协议面：除这两条外任何新增都算协议漂移，'
+          '请先更新设计文档与基线',
+    );
+    expect(
+      PluginRpcMethods.baselineBeforeUiPluginization.contains(
+        PluginRpcMethods.suspend,
+      ),
+      isTrue,
+      reason: '新基线应包含 D10 的 suspend，否则增量算法会把它算成新增',
     );
   });
 
@@ -159,9 +186,9 @@ void main() {
       '${repoRoot.path}/packages/tree_core/lib/src/plugin/plugin_bus.dart',
     );
     final String src = bus.readAsStringSync();
-    final int cases = RegExp(
-      r'case\s+PluginRpcMethods\.[A-Za-z]+\s*:',
-    ).allMatches(src).length;
+    final int cases = RegExp(r'case\s+PluginRpcMethods\.[A-Za-z]+\s*:')
+        .allMatches(src)
+        .length;
     expect(
       cases,
       PluginRpcMethods.pluginToCoreRequests.length,
@@ -192,8 +219,9 @@ void main() {
       reason: '方向集合存在重叠：新加方法时请确认它只属于一面',
     );
     expect(
-      PluginRpcMethods.coreToPlugin
-          .intersection(PluginRpcMethods.pluginToCoreRequests),
+      PluginRpcMethods.coreToPlugin.intersection(
+        PluginRpcMethods.pluginToCoreRequests,
+      ),
       isEmpty,
     );
   });

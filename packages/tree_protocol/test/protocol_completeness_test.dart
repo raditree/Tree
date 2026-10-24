@@ -11,6 +11,21 @@ import 'package:tree_protocol/tree_protocol.dart';
 /// 2. 核心必须**逐一处理**每一种上行帧常量（新增帧不能被 default 静默吞掉）；
 /// 3. 前端调用点的 `/api/...` 路径必须都能在 [ApiPaths] 中找到声明（含用
 ///    `$query` 拼接查询串、`Uri.parse('$baseUrl/api/...')` 这类隐式写法）。
+
+/// **片 A 只登记协议、尚未接线**的上行帧（核心分派在片 B 落地）。
+///
+/// 这里的键必须与核心实际未处理的帧集合**逐一相等**：核心接线一条就删一条，
+/// 否则「新增帧不得被 default 静默忽略」这条门禁会失真（与
+/// `CoreServer.stubApiPaths` 的「空集合不许悄悄长回来」同口径）。
+const Map<String, String> pendingCoreInbound = <String, String>{
+  WsInboundType.uiHello: '片 B：ui.hello 绑定连接身份（§6.3）',
+  WsInboundType.stationSubscribe: '片 B：广播站订阅与 topics[] 过滤',
+  WsInboundType.stationUnsubscribe: '片 B：退订',
+  WsInboundType.stationRegister: '片 B：UI 自建广播站注册（只允许广播）',
+  WsInboundType.stationUnregister: '片 B：注销自建站',
+  WsInboundType.stationTrigger: '片 B：向自己注册的自建广播站发布',
+};
+
 void main() {
   final Directory repoRoot = Directory('../..');
 
@@ -44,16 +59,28 @@ void main() {
     );
     expect(core.existsSync(), isTrue, reason: 'core_server.dart 不存在');
     final String src = core.readAsStringSync();
-    final List<String> missing = <String>[];
-    for (final String value in WsInboundType.all) {
-      // 常量名 = 值名的 camelCase（register_local_executor → registerLocalExecutor）
-      if (!src.contains('WsInboundType.${_camel(value)}')) missing.add(value);
-    }
+    // 常量名 = 值名的 camelCase（register_local_executor → registerLocalExecutor）
+    final Set<String> unhandled = <String>{
+      for (final String value in WsInboundType.all)
+        if (!src.contains('WsInboundType.${_camel(value)}')) value,
+    };
     expect(
-      missing,
-      isEmpty,
-      reason: '核心未显式处理以下上行帧：$missing —— 前端会发它们，静默忽略会造成"点了没反应"',
+      unhandled,
+      pendingCoreInbound.keys.toSet(),
+      reason:
+          '核心未显式处理的上行帧必须与 pendingCoreInbound 逐一相等：'
+          '实际未处理 ${unhandled.toList()..sort()}；'
+          '登记为待接线 ${pendingCoreInbound.keys.toList()..sort()} —— '
+          '接线后请从 pendingCoreInbound 删除该条（前端会发这些帧，'
+          '静默忽略会造成"点了没反应"）',
     );
+  });
+
+  test('片 A 待接线帧的登记都写明了原因', () {
+    pendingCoreInbound.forEach((String frame, String why) {
+      expect(WsInboundType.all, contains(frame));
+      expect(why.trim().length, greaterThan(1), reason: '$frame 的登记原因太空');
+    });
   });
 
   test('前端使用的 /api 路径全部在 ApiPaths 中声明', () {
@@ -74,6 +101,23 @@ void main() {
       undeclared..sort(),
       isEmpty,
       reason: '以下前端路径未在 ApiPaths 中声明：$undeclared',
+    );
+  });
+
+  test('插件化新增路径已在 kept 内，且 /bootstrap 不属 /api 前缀', () {
+    expect(
+      ApiPaths.kept,
+      containsAll(<String>[
+        ApiPaths.meta,
+        ApiPaths.bootstrap,
+        ApiPaths.bootstrapSession,
+      ]),
+      reason: '发现面 / 引导壳是核心永久面，必须进契约全集',
+    );
+    expect(
+      ApiPaths.bootstrap.startsWith('/api/'),
+      isFalse,
+      reason: '/bootstrap 是核心自有页面入口，不是 /api 命名空间',
     );
   });
 
@@ -136,7 +180,8 @@ void main() {
     // 所以这里按文件登记"非流式帧的 seq 用法"，其余一律必须走 WsStreamSeq。
     const Map<String, String> registered = <String, String>{
       'lib/io/websocket_service.dart': '大帧分片 frame_chunk 的分片序号（传输层）',
-      'packages/tree_core/lib/src/ws/ws_hub.dart': '大帧分片 frame_chunk 的分片序号（传输层）',
+      'packages/tree_core/lib/src/ws/ws_hub.dart':
+          '大帧分片 frame_chunk 的分片序号（传输层）',
       'packages/tree_core/lib/src/ws/inbound_frames.dart': '核心侧重组成大帧时读分片序号',
       'packages/tree_core/lib/src/plugin/station_instance.dart':
           '广播站公告板条目的单调序号（站点协议域，非流式帧）',
