@@ -15,7 +15,7 @@ import 'package:tree/ui/pages/settings_page.dart';
 /// 3. 选中态跟着 [FontService] 走（当前档位能被看出来，而不是每次都回到默认）。
 ///
 /// 为什么不测"全局文字真的变粗"：那要把整个 AgentTeamApp 跑起来，
-/// 依赖 windowManager / CoreProcessLauncher / TrayService 一堆平台插件，
+/// 依赖 windowManager / CoreAttachment / TrayService 一堆平台插件，
 /// 而应用逻辑只有 main.dart 里 `_withUiFont` 几行 + FontService.applyTo，
 /// 后者的映射由 test/font_service_test.dart 逐值锁住，这里重复跑整个 App 不划算。
 void main() {

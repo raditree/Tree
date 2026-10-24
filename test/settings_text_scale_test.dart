@@ -15,7 +15,7 @@ import 'package:tree/ui/text_scale_service.dart';
 /// 3. 常显的百分比文案随拖动更新（用户能感知当前值）。
 ///
 /// 为什么不测"全局 Text 真的变大"：那要把整个 AgentTeamApp 跑起来，
-/// 依赖 windowManager / CoreProcessLauncher / TrayService 一堆平台插件，
+/// 依赖 windowManager / CoreAttachment / TrayService 一堆平台插件，
 /// 而注入逻辑只有 main.dart 里 5 行（MediaQuery.copyWith(textScaler: ...)），
 /// 读一遍就能确认，投入产出比不划算。
 void main() {

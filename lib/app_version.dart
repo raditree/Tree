@@ -1,9 +1,8 @@
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
-import 'package:tree_protocol/tree_protocol.dart';
 
-import 'io/core_process_launcher.dart';
+import 'io/core_attachment.dart';
 
 /// 应用版本（与 `pubspec.yaml` 的 `version:` **必须一致**）。
 ///
@@ -39,8 +38,8 @@ typedef InfoRow = ({String label, String value});
 
 /// **版本与运行态信息**（设置页「版本信息」的数据源）。
 ///
-/// 只从 [CoreProcessLauncher] 读**已经在内存里**的握手信息与产物路径——
-/// 不新开 REST 端点、不落盘、不探活：这些值在应用启动握手时就已经拿到了，
+/// 只从 [CoreAttachment] 读**已经在内存里**的附着信息——
+/// 不新开 REST 端点、不落盘、不探活：这些值在 UI 被核心拉起时就已经拿到了，
 /// 显示它是纯读取（顺手解决"我到底连的是哪个核心"这个真机上极难自证的问题）。
 class VersionInfo {
   const VersionInfo({
@@ -52,17 +51,18 @@ class VersionInfo {
     required this.buildWarning,
   });
 
-  /// 从启动器取当前运行态。
-  factory VersionInfo.fromLauncher([CoreProcessLauncher? launcher]) {
-    final CoreProcessLauncher l = launcher ?? CoreProcessLauncher.instance;
-    final CoreHandshake? handshake = l.handshake;
+  /// 从附着信息取当前运行态。
+  factory VersionInfo.fromAttachment([CoreAttachment? attachment]) {
+    final CoreAttachment a = attachment ?? CoreAttachment.instance;
+    final int port = Uri.tryParse(a.wsBaseUrl)?.port ?? 0;
     return VersionInfo(
-      coreVersion: handshake?.version ?? '',
-      corePid: handshake?.pid ?? 0,
-      corePort: handshake?.port ?? 0,
-      attached: l.isAttached,
-      coreExecutablePath: l.coreExecutablePath ?? '',
-      buildWarning: l.buildWarning,
+      // UI 插件形态下核心由 loader 拉起：核心版本不随附着下发（与旧附着模式一致）。
+      coreVersion: a.isAttached ? 'attached' : '',
+      corePid: 0,
+      corePort: port,
+      attached: a.isAttached,
+      coreExecutablePath: '',
+      buildWarning: null,
     );
   }
 

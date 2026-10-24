@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
-import '../../io/core_process_launcher.dart';
+import '../../io/core_attachment.dart';
 import '../widgets/usage_calls_panel.dart';
 
 /// 逐调用用量账本 `usage.jsonl` 的定位与读取
@@ -11,8 +11,8 @@ import '../widgets/usage_calls_panel.dart';
 /// （`<数据根>/data/<agent_id>/<session_id>/usage.jsonl`，见核心侧
 /// `TreePaths.usageFile`），而桌面形态下应用与核心**同机**运行；走 REST 要多开
 /// 一条路由、过一遍协议门禁，读数却完全相同。这与核心日志入口
-/// （`core_log_files.dart`）是**同一个范式**：数据根来自握手的可选字段
-/// （`CoreProcessLauncher.instance.coreDataRoot`），拿不到就退回"没有入口"，
+/// （`core_log_files.dart`）是**同一个范式**：数据根来自附着环境
+/// （`CoreAttachment.instance.dataRoot`），拿不到就退回"没有入口"，
 /// **不猜** `%APPDATA%\Tree` 之类的替代路径。
 ///
 /// 与 `CoreLogFiles` 的差别只有三处：路径要拼 agent / session 两段、
@@ -29,9 +29,9 @@ class UsageLogFiles {
   /// 单次最多回读的字节数：账本只追加、长会话会到几 MB，而这里只要看尾巴。
   static const int maxTailBytes = 256 * 1024;
 
-  /// 拿不到数据根时的可读原因（核心未启动 / 老核心没带该字段 / 附着模式）。
+  /// 拿不到数据根时的可读原因（核心未注入 `TREE_DATA_ROOT`）。
   static const String reasonNoDataRoot =
-      '拿不到核心数据根（核心未启动 / 老核心没带这个字段）——'
+      '拿不到核心数据根（核心未注入 TREE_DATA_ROOT）——'
       '没有 usage.jsonl 的入口，也不猜一个数据根路径。';
 
   /// id 不合法时的可读原因（agentId / sessionId 来自 UI 或 HTTP，必须先校验）。
@@ -58,7 +58,7 @@ class UsageLogFiles {
     if (agent == null || session == null) return '';
     final String injected = (override ?? '').trim();
     if (injected.isNotEmpty) return injected;
-    final String root = CoreProcessLauncher.instance.coreDataRoot.trim();
+    final String root = CoreAttachment.instance.dataRoot.trim();
     if (root.isEmpty) return '';
     final String base = _stripTrailingSeparators(root);
     final String sep = Platform.pathSeparator;

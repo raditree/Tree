@@ -6,7 +6,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
-import 'core_process_launcher.dart';
 import 'single_instance.dart';
 
 /// 点窗口关闭按钮时该做什么（**纯决策**，与插件无关，便于单测）。
@@ -204,14 +203,14 @@ class TrayService extends ChangeNotifier {
     await windowManager.hide();
   }
 
-  /// **真正退出**：核心优雅退出 → 拿掉托盘图标 → 销毁窗口。
+  /// **真正退出界面**：解除单实例锁 → 拿掉托盘图标 → 销毁窗口。
   ///
   /// 顺序是有意的：先解除"拦截关闭"（否则后续关闭流程仍会被拦）、再拿掉图标
-  /// （否则图标会残留到鼠标划过才消失）、然后请核心优雅退出（stdin `shutdown`，
-  /// 超时强杀）、最后才关窗口——反过来做，核心可能变成孤儿进程继续占着端口。
+  /// （否则图标会残留到鼠标划过才消失）、最后才关窗口。**核心不退出**：UI 是插件，
+  /// 退出界面只让 `UiHost` 把它置为 stopped，系统继续运行。
   Future<void> quit() async {
-    // 先放开单实例锁：万一本进程还要多活一会儿（停核心、销毁窗口），下一个实例
-    // 不该被一个"正在退出"的进程挡在门外。
+    // 先放开单实例锁：万一本进程还要多活一会儿（销毁窗口），同一个核心的下一个
+    // UI 实例不该被一个"正在退出"的进程挡在门外。
     await SingleInstanceLock.instance.release();
     try {
       await windowManager.setPreventClose(false);
@@ -226,10 +225,9 @@ class TrayService extends ChangeNotifier {
     } catch (error) {
       debugPrint('移除托盘图标失败（继续退出）：$error');
     }
-    await CoreProcessLauncher.instance.stop();
+    // **只退出界面，不退出核心**：UI 是插件，核心的生命周期归 loader / 用户管理。
     await windowManager.destroy();
     // 兜底：个别平台/异常路径下窗口销毁不一定结束消息循环，2 秒后强制退出。
-    // 此时核心已经优雅退出，不会留下孤儿进程。
     Timer(const Duration(seconds: 2), () => exit(0));
   }
 }

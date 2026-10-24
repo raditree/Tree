@@ -2,7 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:tree/io/core_process_launcher.dart';
+import 'package:tree/io/core_attachment.dart';
 import 'package:tree/ui/services/usage_log_files.dart';
 import 'package:tree/ui/widgets/usage_calls_panel.dart';
 
@@ -104,7 +104,7 @@ void main() {
 
     test('拿不到数据根 ⇒ 空串（不猜 %APPDATA%）', () {
       // 前置条件：测试环境里握手无从发生 ⇒ 数据根恒为空串。
-      expect(CoreProcessLauncher.instance.coreDataRoot, isEmpty);
+      expect(CoreAttachment.instance.dataRoot, isEmpty);
       expect(
         UsageLogFiles.resolveUsageFile(agentId: 'agent_1', sessionId: 's1'),
         '',
@@ -374,7 +374,7 @@ void main() {
     });
 
     test('数据根不可用（不传 override）⇒ ok=false + 可读 reason', () async {
-      expect(CoreProcessLauncher.instance.coreDataRoot, isEmpty);
+      expect(CoreAttachment.instance.dataRoot, isEmpty);
 
       final UsageHistoryRead read = await UsageLogFiles.readRecent(
         agentId: 'agent_1',

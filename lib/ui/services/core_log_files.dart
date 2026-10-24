@@ -1,14 +1,14 @@
 import 'dart:convert';
 import 'dart:io';
 
-import '../../io/core_process_launcher.dart';
+import '../../io/core_attachment.dart';
 
 /// 核心日志文件的定位与读取（设置页「核心日志」卡片 + 查看弹窗的唯一实现）。
 ///
 /// 为什么应用侧直接读文件而不新增 REST 端点：核心日志就是**本机文件**，而应用
 /// （桌面形态）与核心**同机**运行；走 REST 要多开一条路由、过协议门禁，收益相同。
-/// 数据根来自握手的可选字段 `data_root`（核心写入 `<数据根>/logs/core.log`）——
-/// 拿不到时（老核心 / 附着模式）返回空串，调用方退回"没有日志入口"，**不猜路径**。
+/// 数据根来自附着环境（`TREE_DATA_ROOT`，核心写入 `<数据根>/logs/core.log`）——
+/// 拿不到时返回空串，调用方退回"没有日志入口"，**不猜路径**。
 class CoreLogFiles {
   CoreLogFiles._();
 
@@ -24,7 +24,7 @@ class CoreLogFiles {
   static String resolveLogFile({String? override}) {
     final String injected = (override ?? '').trim();
     if (injected.isNotEmpty) return injected;
-    return CoreProcessLauncher.instance.coreLogFile;
+    return CoreAttachment.instance.coreLogFile;
   }
 
   /// 日志目录（用于「打开日志目录」）。

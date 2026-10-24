@@ -726,7 +726,7 @@ class _SettingsPageState extends State<SettingsPage> {
   Widget _buildVersionCard() {
     final cs = Theme.of(context).colorScheme;
     final VersionInfo info =
-        widget.versionInfo ?? VersionInfo.fromLauncher();
+        widget.versionInfo ?? VersionInfo.fromAttachment();
     return Card(
       margin: EdgeInsets.zero,
       child: Padding(

@@ -4,11 +4,10 @@ import 'dart:io';
 import 'dart:ui' show AppExitResponse;
 
 import 'package:flutter/material.dart';
-import 'package:tree_protocol/tree_protocol.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'io/api_service.dart';
-import 'io/core_process_launcher.dart';
+import 'io/core_attachment.dart';
 import 'io/single_instance.dart';
 import 'io/tray_service.dart';
 import 'io/websocket_service.dart';
@@ -19,24 +18,30 @@ import 'ui/theme_service.dart';
 import 'ui/text_scale_service.dart';
 import 'ui/widgets/close_to_tray_dialog.dart';
 
-/// 应用入口（desktop 分支：无登录、无后端地址配置）。
+/// 应用入口（UI 插件形态：无登录、无后端地址配置）。
 ///
 /// 启动顺序：
-/// 1. 加载本地主题；
-/// 2. 拉起（或附着）**本机核心进程**，拿到随机端口与一次性本地 token；
-/// 3. 把 HTTP/WS 基址与 token 交给 [ApiService] / [WebSocketService]；
-/// 4. 进入主界面；核心启动失败时显示可操作的错误页而不是白屏。
+/// 1. 从 `TREE_CORE_URL` / `TREE_CORE_TOKEN` 读取**已运行核心**的地址；
+/// 2. 把 HTTP/WS 基址与 token 交给 [ApiService] / [WebSocketService]；
+/// 3. 加载本地主题与窗口偏好，进入主界面；
+/// 4. 缺少附着信息时显示可操作的错误页（**绝不自行拉起核心**）。
 Future<void> main() async {
   // shared_preferences / path_provider 等插件依赖绑定先初始化
   WidgetsFlutterBinding.ensureInitialized();
 
-  // **单实例判定必须在拉起核心之前**：否则第二个核心已经起来了，两个核心共用同一个
-  // 数据根（会话/消息互相覆盖）。
-  final SingleInstanceState instanceState =
-      await SingleInstanceLock.instance.acquire();
+  // U1：UI 只附着、不拉核心。缺失环境变量时给出可读错误页。
+  final CoreAttachment attachment = CoreAttachment.instance;
+  if (!attachment.attach()) {
+    runApp(CoreStartupErrorApp(message: attachment.lastError));
+    return;
+  }
+
+  // **单实例判定**：同一核心只跑一个 UI 进程（不同核心的端口不同，互不干扰）。
+  final SingleInstanceState instanceState = await SingleInstanceLock.instance
+      .acquire(key: attachment.instanceKey);
   if (instanceState == SingleInstanceState.alreadyRunning) {
     // 已经请那个实例把窗口叫到前面了（托盘里的窗口会自己出来）。这个窗口只说明
-    // 一句就自己关闭：**绝不拉起第二个核心**。
+    // 一句就自己关闭：**同一核心只保留一个 UI 实例**。
     runApp(const AlreadyRunningApp());
     return;
   }
@@ -56,18 +61,10 @@ Future<void> main() async {
   // 字体族 / 字重：同上（读了才画界面，免得先默认再跳一次）
   await FontService.instance.load();
 
-  final CoreHandshake? handshake = await CoreProcessLauncher.instance.start();
-  if (handshake == null) {
-    // 错误页**不拦截关闭**：这里连托盘都没装，拦下关闭按钮就等于让用户关不掉这个窗口
-    runApp(CoreStartupErrorApp(
-      message: CoreProcessLauncher.instance.lastError ?? '未知错误',
-    ));
-    return;
-  }
-  // 核心只监听 127.0.0.1，HTTP 与 WS 同源；token 每次启动都重新生成
-  ApiService.baseUrl = handshake.httpBaseUrl;
-  WebSocketService.baseUrl = handshake.wsBaseUrl;
-  ApiService.setToken(handshake.token);
+  // 核心只监听 127.0.0.1，HTTP 与 WS 同源（由 UiHost 注入的 URL 推导）
+  ApiService.baseUrl = attachment.httpBaseUrl;
+  WebSocketService.baseUrl = attachment.wsBaseUrl;
+  ApiService.setToken(attachment.token);
 
   // **拦截关闭按钮**：默认只隐藏窗口（见 [TrayService]），真正的退出走托盘菜单 /
   // 设置页的退出入口。桌面端的长任务正在跑时，误点关闭等于终止整轮工作。
@@ -91,8 +88,6 @@ Future<void> main() async {
 /// 启动期诊断（合并多条；都为空时返回 null）。
 String? _startupWarning() {
   final List<String> parts = <String>[
-    if (CoreProcessLauncher.instance.buildWarning != null)
-      CoreProcessLauncher.instance.buildWarning!,
     if (TrayService.instance.installError != null)
       '系统托盘不可用（${TrayService.instance.installError}）：关闭窗口会直接退出 Tree。',
   ];
