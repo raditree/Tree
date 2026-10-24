@@ -111,6 +111,7 @@ export 'src/settings/ssh_config.dart';
 export 'src/store/atomic_file.dart';
 export 'src/store/file_store.dart';
 export 'src/store/memory_store.dart';
+export 'src/store/plugin_store.dart';
 export 'src/store/records.dart';
 export 'src/store/subagent_registry.dart';
 export 'src/store/subagent_store.dart';

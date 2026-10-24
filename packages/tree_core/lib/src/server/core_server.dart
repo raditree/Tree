@@ -34,6 +34,7 @@ import '../settings/ssh_config.dart';
 import '../spec/builtin_spec_assets.dart';
 import '../spec/spec_service.dart';
 import '../store/memory_store.dart';
+import '../store/plugin_store.dart';
 import '../store/subagent_registry.dart';
 import '../store/tree_paths.dart';
 import '../store/tree_store.dart';
@@ -50,6 +51,7 @@ import '../tool/todo_store.dart';
 import '../tool/tool_run_registry.dart';
 import '../tool/tool_runner.dart';
 import '../tool/workspace_tool_runner.dart';
+import '../util/core_log_sink.dart';
 import '../util/ids.dart';
 import '../util/liveness.dart';
 import '../util/token.dart';
@@ -130,6 +132,14 @@ class CoreServer {
       sourcePath: bootstrapSourcePath,
       log: (String message) => errorLog?.call(message),
     );
+    final TreePaths apiPaths = TreePaths(dataDir);
+    logSources = LogSourceRegistry(
+      paths: apiPaths,
+      pluginIds: () =>
+          pluginBus?.configs().map((PluginConfig c) => c.id).toList() ??
+          const <String>[],
+    );
+    pluginStore = PluginStore(paths: apiPaths);
     // 集成终端会话（Ctrl+J）：它要按 agent 解析工作区根，所以只在接了文件服务时可用；
     // 伪终端实现默认用平台实现（ConPTY / script），测试可注入假的。
     terminalService = fileService == null
@@ -145,6 +155,15 @@ class CoreServer {
 
   /// WS 端点路径（前端 `WebSocketService.connect` 固定拼接 `/ws?token=`）。
   static const String wsPath = '/ws';
+
+  /// 存储 API 的**调用方插件身份**头（小写，`HttpHeaders.value` 不区分大小写）。
+  ///
+  /// 为什么不是独立插件 token：当前 UI 插件与核心共用主 token（片 D 的
+  /// `TREE_CORE_TOKEN`），没有第二套凭据。这里的身份是**自报 + 白名单校验**：
+  /// 头里的 id 必须能在已配置插件清单里找到，否则 403；未带头 ⇒ 主 token 视为
+  /// 核心自身（命名空间 `core`）。跨命名空间一律 403，且不查目标是否存在
+  /// （不变量 25：不泄露该命名空间是否存在）。
+  static const String pluginIdHeader = 'x-tree-plugin-id';
 
   /// 历史接口一次最多回多少条（[from] / [at] / 末尾分页共用同一上限）。
   ///
@@ -180,6 +199,12 @@ class CoreServer {
 
   /// 引导页磁盘种子与渲染。
   late final BootstrapPage bootstrapPage;
+
+  /// 日志 API 的源注册与尾部读（片 F；核心永久面）。
+  late final LogSourceRegistry logSources;
+
+  /// 插件命名空间存储（片 F；`/api/store/{ns}/{key}` 的落盘实现）。
+  late final PluginStore pluginStore;
 
   /// 存储（默认内存实现；CLI 注入 `FileTreeStore` 落 `~/.tree`）。
   final TreeStore store;
@@ -1733,6 +1758,283 @@ class CoreServer {
     }
   }
 
+  // ── 日志与存储 API（片 F，核心永久面） ───────────────────────────────
+
+  /// `GET /api/logs/sources`：枚举 `core` 与 `plugin:<id>` 日志源。
+  Future<void> _listLogSources(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    final List<Map<String, dynamic>> sources = await logSources.sources();
+    await writeJson(request, 200, <String, dynamic>{'sources': sources});
+  }
+
+  /// `GET /api/logs/{source}?tail=&since=`：尾部读 NDJSON。
+  ///
+  /// `since` = 行号（1 起，见 [LogSourceRegistry.readTail]）；`tail` 默认 200、上限 5000。
+  Future<void> _readLogSource(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final String source = (params['source'] ?? '').trim();
+    if (!logSources.isKnownSource(source)) {
+      await writeJson(
+        request,
+        400,
+        errorBody('非法日志源：只允许 "core" 或 "plugin:<已配置插件 id>"'),
+      );
+      return;
+    }
+    final Map<String, String> query = request.uri.queryParameters;
+    int tail = LogSourceRegistry.defaultTailLines;
+    final String rawTail = (query['tail'] ?? '').trim();
+    if (rawTail.isNotEmpty) {
+      final int? parsed = int.tryParse(rawTail);
+      if (parsed == null) {
+        await writeJson(request, 400, errorBody('tail 必须是整数行数'));
+        return;
+      }
+      tail = parsed;
+    }
+    int? since;
+    final String rawSince = (query['since'] ?? '').trim();
+    if (rawSince.isNotEmpty) {
+      since = int.tryParse(rawSince);
+      if (since == null || since < 1) {
+        await writeJson(request, 400, errorBody('since 必须是 >= 1 的行号'));
+        return;
+      }
+    }
+    final Map<String, dynamic> page = await logSources.readTail(
+      source,
+      tail: tail,
+      since: since,
+    );
+    await writeJson(request, 200, page);
+  }
+
+  /// `DELETE /api/logs/{source}`：清空当前日志并轮转成 `<name>.1.log`。
+  Future<void> _clearLogSource(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final String source = (params['source'] ?? '').trim();
+    if (!logSources.isKnownSource(source)) {
+      await writeJson(
+        request,
+        400,
+        errorBody('非法日志源：只允许 "core" 或 "plugin:<已配置插件 id>"'),
+      );
+      return;
+    }
+    await writeJson(request, 200, await logSources.clear(source));
+  }
+
+  /// 判定存储 API 的**调用方命名空间**。
+  ///
+  /// - 无 `X-Tree-Plugin-Id` ⇒ 主 token 视为核心自身，命名空间固定 `core`；
+  /// - 有 ⇒ 必须是**已配置**的插件 id（自报 + 白名单校验），否则视为身份无效；
+  /// - 引导会话 token 在更外层就被白名单挡掉（403），这里不重复处理。
+  String? _callerStoreNamespace(HttpRequest request) {
+    final String declared = (request.headers.value(pluginIdHeader) ?? '').trim();
+    if (declared.isEmpty) return PluginStore.coreNamespace;
+    if (declared == PluginStore.coreNamespace) return null;
+    final PluginBus? bus = pluginBus;
+    if (bus == null) return null;
+    return bus.config(declared) == null ? null : declared;
+  }
+
+  /// 校验命名空间：调用方身份有效、`ns` 合法、且 `ns == 调用方命名空间`。
+  ///
+  /// 跨命名空间**一律 403**，且不检查目标命名空间是否存在（不变量 25）。
+  Future<bool> _requireStoreNamespace(
+    HttpRequest request,
+    String ns,
+  ) async {
+    final String? caller = _callerStoreNamespace(request);
+    if (caller == null) {
+      await writeJson(
+        request,
+        403,
+        errorBody('存储 API 的调用方插件身份无效（$pluginIdHeader 必须是已配置插件 id）'),
+      );
+      return false;
+    }
+    if (!PluginStore.isValidNamespace(ns)) {
+      await writeJson(
+        request,
+        400,
+        errorBody('命名空间非法：只允许 [A-Za-z0-9_.-]，且不能是 . / .. / Windows 保留名'),
+      );
+      return false;
+    }
+    if (ns != caller) {
+      await writeJson(
+        request,
+        403,
+        errorBody('禁止访问命名空间 "$ns"（调用方命名空间为 "$caller"）'),
+      );
+      return false;
+    }
+    return true;
+  }
+
+  /// `GET /api/store/{ns}?limit=&cursor=`：列键（按 key 升序分页）。
+  Future<void> _listStoreKeys(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final String ns = params['ns'] ?? '';
+    if (!await _requireStoreNamespace(request, ns)) return;
+    final Map<String, String> query = request.uri.queryParameters;
+    int limit = PluginStore.defaultPageLimit;
+    final String rawLimit = (query['limit'] ?? '').trim();
+    if (rawLimit.isNotEmpty) {
+      final int? parsed = int.tryParse(rawLimit);
+      if (parsed == null || parsed < 1) {
+        await writeJson(request, 400, errorBody('limit 必须是正整数'));
+        return;
+      }
+      limit = parsed;
+    }
+    final StorePage page = await pluginStore.list(
+      ns,
+      limit: limit,
+      cursor: query['cursor'],
+    );
+    await writeJson(request, 200, page.toJson());
+  }
+
+  /// `GET /api/store/{ns}/{key}`：原样字节回包，头带 `etag`。
+  Future<void> _getStoreValue(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final String ns = params['ns'] ?? '';
+    if (!await _requireStoreNamespace(request, ns)) return;
+    final String key = params['key'] ?? '';
+    if (!pluginStore.isValidKey(key)) {
+      await writeJson(request, 400, errorBody('key 非法：禁止路径分隔符 / .. / 盘符 / Windows 保留名'));
+      return;
+    }
+    final StoreValue? value = await pluginStore.read(ns, key);
+    if (value == null) {
+      await writeJson(request, 404, errorBody('键不存在：$key'));
+      return;
+    }
+    request.response.headers.set('etag', '"${value.etag}"');
+    request.response.headers.set('cache-control', 'no-store');
+    await writeBytes(
+      request,
+      200,
+      value.bytes,
+      contentType: 'application/octet-stream',
+    );
+  }
+
+  /// `PUT /api/store/{ns}/{key}`：写值（二进制原样，核心不解析）。
+  ///
+  /// 乐观锁的 etag 可来自 `If-Match`、`X-Tree-Etag`、`?etag=`，或（仅当
+  /// `Content-Type: application/json` 时）信封体 `{etag, value}`。`*` = 无条件覆盖。
+  Future<void> _putStoreValue(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final String ns = params['ns'] ?? '';
+    if (!await _requireStoreNamespace(request, ns)) return;
+    final String key = params['key'] ?? '';
+    if (!pluginStore.isValidKey(key)) {
+      await writeJson(request, 400, errorBody('key 非法：禁止路径分隔符 / .. / 盘符 / Windows 保留名'));
+      return;
+    }
+    // 允许 JSON 信封（转义后可能略大于原值），但内存占用仍是硬上限。
+    final int bodyCap = pluginStore.maxValueBytes * 2 + 64 * 1024;
+    List<int> raw;
+    try {
+      raw = await readBodyBytes(request, maxBytes: bodyCap);
+    } on RequestBodyTooLarge {
+      await writeJson(
+        request,
+        413,
+        errorBody('请求体超过上限（单值上限 ${pluginStore.maxValueBytes} 字节）'),
+      );
+      return;
+    }
+    List<int> value = raw;
+    String? expected =
+        request.headers.value('if-match') ??
+        request.headers.value('x-tree-etag') ??
+        request.uri.queryParameters['etag'];
+    final String mime = request.headers.contentType?.mimeType ?? '';
+    if (mime == 'application/json' && (expected ?? '').trim().isEmpty) {
+      try {
+        final Object? decoded = jsonDecode(
+          utf8.decode(raw, allowMalformed: true),
+        );
+        if (decoded is Map<String, dynamic> &&
+            decoded.containsKey('etag') &&
+            decoded.containsKey('value')) {
+          expected = decoded['etag']?.toString();
+          value = utf8.encode(jsonEncode(decoded['value']));
+        }
+      } on FormatException {
+        // 不是信封：按原始字节写（二进制主路径）。
+      }
+    }
+    final StorePutResult result = await pluginStore.put(
+      ns,
+      key,
+      value,
+      expectedEtag: expected,
+    );
+    switch (result.status) {
+      case StorePutStatus.created:
+      case StorePutStatus.updated:
+        request.response.headers.set('etag', '"${result.etag}"');
+        await writeJson(request, 200, <String, dynamic>{
+          'ok': true,
+          'key': key,
+          'etag': result.etag,
+          'size': result.size,
+          'created': result.status == StorePutStatus.created,
+        });
+        break;
+      case StorePutStatus.conflict:
+        await writeJson(request, 409, errorBody(result.message ?? 'etag 冲突'));
+        break;
+      case StorePutStatus.tooLarge:
+        await writeJson(request, 413, errorBody(result.message ?? '值超过上限'));
+        break;
+      case StorePutStatus.quotaExceeded:
+        await writeJson(request, 413, errorBody(result.message ?? '命名空间配额已满'));
+        break;
+    }
+  }
+
+  /// `DELETE /api/store/{ns}/{key}`：删除；不存在 ⇒ 404 可读。
+  Future<void> _deleteStoreValue(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final String ns = params['ns'] ?? '';
+    if (!await _requireStoreNamespace(request, ns)) return;
+    final String key = params['key'] ?? '';
+    if (!pluginStore.isValidKey(key)) {
+      await writeJson(request, 400, errorBody('key 非法：禁止路径分隔符 / .. / 盘符 / Windows 保留名'));
+      return;
+    }
+    final StoreDeleteResult result = await pluginStore.delete(ns, key);
+    if (result.status == StoreDeleteStatus.notFound) {
+      await writeJson(request, 404, errorBody('键不存在：$key'));
+      return;
+    }
+    await writeJson(request, 200, <String, dynamic>{
+      'ok': true,
+      'key': key,
+      'freed_bytes': result.freedBytes,
+    });
+  }
+
   // ── 路由注册 ─────────────────────────────────────────────────────────
 
   void _registerStubRoutes() {
@@ -1842,6 +2144,15 @@ class CoreServer {
     // 发现面（片 B）：UI 插件启动后据此判断核心能力、可订阅广播站与委派路由。
     // routes 在片 C 之前为空数组（不编造静态清单）。
     router.add('GET', ApiPaths.meta, _apiMeta);
+    // 日志与存储（片 F，核心永久面）。`/api/logs/sources` 必须先于
+    // `/api/logs/{source}` 注册，否则会被路径参数路由抢走。
+    router.add('GET', ApiPaths.logSources, _listLogSources);
+    router.add('GET', ApiPaths.logSource, _readLogSource);
+    router.add('DELETE', ApiPaths.logSource, _clearLogSource);
+    router.add('GET', ApiPaths.storeNamespace, _listStoreKeys);
+    router.add('GET', ApiPaths.storeEntry, _getStoreValue);
+    router.add('PUT', ApiPaths.storeEntry, _putStoreValue);
+    router.add('DELETE', ApiPaths.storeEntry, _deleteStoreValue);
     // 引导壳（片 E）：页面与票据换会话都走专用处理（不认主 token）。
     router.add('GET', ApiPaths.bootstrap, _handleBootstrapPage);
     router.add('POST', ApiPaths.bootstrapSession, _handleBootstrapSession);

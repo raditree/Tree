@@ -274,6 +274,33 @@ abstract final class ApiPaths {
   static const String agentSubagentTranscript =
       '/api/agents/{agentId}/subagents/{subagentId}/transcript';
 
+  // ── 日志 / 存储（插件化新增，核心永久面）──────────────────────────────
+
+  /// 日志源枚举（GET）：`{sources:[{id, kind, size?, modified?}]}`。
+  ///
+  /// 源 id 只有两种合法形态：`core` 与 `plugin:<插件 id>`；后者只列**已配置
+  /// 或已存在日志文件**的插件（见 `docs/pluginization/ui-pluginization.md` §3.1）。
+  static const String logSources = '/api/logs/sources';
+
+  /// 单个日志源的尾部读（GET `?tail=&since=`）与清空（DELETE）。
+  ///
+  /// `since` 的口径是**行号**（1 起）：从第 `since` 行开始返回；回包 `next_since`
+  /// 是下一次继续读时应传的行号（没有新行时等于 EOF+1；若 `since` 已越过当前
+  /// EOF，例如清空后日志又从第 1 行写起，则回到 EOF+1）。`tail` 默认 200、上限
+  /// 5000；单次响应硬上限 1 MiB，超限返回最后一页并带 `truncated:true`。
+  static const String logSource = '/api/logs/{source}';
+
+  /// 某个命名空间的键列表（GET `?limit=&cursor=`）。
+  static const String storeNamespace = '/api/store/{ns}';
+
+  /// 某个键的读取（GET）/ 写入（PUT）/ 删除（DELETE）。
+  ///
+  /// 写入是二进制原样存取（核心不解析）：已存在的键必须带 `If-Match`（或
+  /// `?etag=` / `X-Tree-Etag`）做乐观锁，`*` 表示无条件覆盖；不存在的键允许
+  /// 不带 etag 创建。调用方命名空间由 `X-Tree-Plugin-Id` 头判定（缺省 = `core`），
+  /// `ns` 必须与调用方一致，否则一律 403（不泄露目标命名空间是否存在）。
+  static const String storeEntry = '/api/store/{ns}/{key}';
+
   /// 批次 C 起**允许由插件委派承担**的路径（静态白名单，按路径不看方法）。
   ///
   /// 委派层只放行这一集合里的 pattern：插件申报其它路径一律拒收，避免
@@ -370,6 +397,10 @@ abstract final class ApiPaths {
     toolsRunningClose,
     agentSubagents,
     agentSubagentTranscript,
+    logSources,
+    logSource,
+    storeNamespace,
+    storeEntry,
   };
 
   /// 全部路径（保留 + 账号组）。

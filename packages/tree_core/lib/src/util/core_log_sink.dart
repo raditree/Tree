@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import '../store/atomic_file.dart';
 import '../store/tree_paths.dart';
@@ -153,6 +154,15 @@ class CoreLogSink {
     try {
       final int pending = utf8.encode(entry).length + 1; // + '\n'
       int bytes = _bytes ?? (file.existsSync() ? file.lengthSync() : 0);
+      // 日志 API 的 DELETE 会在队列外把当前份改名成 `.1.log`；缓存的 `_bytes` 这时
+      // 已经失真。只在"即将轮转"这个真正会造成破坏的关口重新核对实际大小：
+      // 否则会拿旧的大小把刚清空的小文件又轮转一次，连带覆盖掉备份。
+      if (_bytes != null &&
+          maxBytes > 0 &&
+          bytes > 0 &&
+          bytes + pending > maxBytes) {
+        bytes = file.existsSync() ? file.lengthSync() : 0;
+      }
       if (maxBytes > 0 && bytes > 0 && bytes + pending > maxBytes) {
         await _rotate();
         bytes = 0;
@@ -204,4 +214,348 @@ class CoreLogSink {
       // 连提示都写不出去（stderr 也没了）：放弃提示，不影响核心。
     }
   }
+}
+
+/// 日志 API 的**源注册与尾部读**（`GET/DELETE /api/logs/...`）。
+///
+/// 合法源只有两种：
+/// - `core` → `<数据根>/logs/core.log`（与 [CoreLogSink] 同一份）；
+/// - `plugin:<id>` → `<数据根>/logs/plugins/<id>.log`。
+///
+/// 插件源只列**已配置**（由 [pluginIds] 提供）或**已存在日志文件**的插件：不存在的
+/// 源不凭空出现在枚举里，读它按非法源回 400（不泄露"这个插件有没有日志"）。
+class LogSourceRegistry {
+  LogSourceRegistry({required this.paths, List<String> Function()? pluginIds})
+    : _pluginIds = pluginIds ?? (() => const <String>[]);
+
+  /// 路径布局（只有这一个来源）。
+  final TreePaths paths;
+
+  /// 已配置的插件 id（核心启动时由插件总线注入；不启动插件也能枚举）。
+  final List<String> Function() _pluginIds;
+
+  /// 核心源 id。
+  static const String coreSourceId = 'core';
+
+  /// 插件源前缀。
+  static const String pluginSourcePrefix = 'plugin:';
+
+  /// 尾部读的默认行数。
+  static const int defaultTailLines = 200;
+
+  /// 尾部读允许的最大行数（查询参数再大也按这个截断）。
+  static const int maxTailLines = 5000;
+
+  /// 单次响应承载的**原始行字节**硬上限（1 MiB）。
+  ///
+  /// 超限只返回最后一页并 `truncated:true`，绝不整块载入大日志。
+  static const int maxResponseBytes = 1024 * 1024;
+
+  /// 从文件尾部倒读时的分块大小（64 KiB），保证内存只与"这一页"有关。
+  static const int _chunkBytes = 64 * 1024;
+
+  /// 枚举当前可见的日志源（core 在前，插件按 id 排序）。
+  ///
+  /// 回包形状按设计 §3.1：`{sources:[{id, kind, size?, modified?}]}`；文件不存在时
+  /// 不写 `size`/`modified`（已配置但还没产出日志的插件也要能出现在列表里）。
+  Future<List<Map<String, dynamic>>> sources() async {
+    final Set<String> ids = <String>{coreSourceId};
+    for (final String pluginId in _pluginIds()) {
+      final String trimmed = pluginId.trim();
+      if (trimmed.isEmpty) continue;
+      try {
+        TreePaths.safeSegment(trimmed);
+      } on ArgumentError {
+        // 配置里的 id 不安全 ⇒ 不可能有合法落点，跳过（不让枚举成为路径注入面）。
+        continue;
+      }
+      ids.add('$pluginSourcePrefix$trimmed');
+    }
+    // 已存在但配置里没有的插件日志（例如刚卸载的插件留下的文件）：仍可作为源读。
+    for (final String id in await _existingPluginIds()) {
+      ids.add('$pluginSourcePrefix$id');
+    }
+    final List<String> sorted = ids.toList()
+      ..sort((String a, String b) {
+        if (a == coreSourceId) return -1;
+        if (b == coreSourceId) return 1;
+        return a.compareTo(b);
+      });
+    final List<Map<String, dynamic>> rows = <Map<String, dynamic>>[];
+    for (final String id in sorted) {
+      final String? path = _resolve(id);
+      if (path == null) continue;
+      final File file = File(path);
+      final bool exists = await file.exists();
+      final Map<String, dynamic> row = <String, dynamic>{
+        'id': id,
+        'kind': id == coreSourceId ? 'core' : 'plugin',
+      };
+      if (exists) {
+        final FileStat stat = await file.stat();
+        row['size'] = stat.size;
+        row['modified'] = stat.modified.toUtc().toIso8601String();
+      }
+      rows.add(row);
+    }
+    return rows;
+  }
+
+  /// 把源 id 解析成磁盘文件；非法 / 未知 / 越界一律返回 null（调用方回 400）。
+  String? _resolve(String source) {
+    if (source == coreSourceId) return paths.coreLogFile;
+    if (!source.startsWith(pluginSourcePrefix)) return null;
+    final String pluginId = source.substring(pluginSourcePrefix.length).trim();
+    if (pluginId.isEmpty) return null;
+    try {
+      TreePaths.safeSegment(pluginId);
+    } on ArgumentError {
+      return null;
+    }
+    final bool configured = _pluginIds().any(
+      (String id) => id.trim() == pluginId,
+    );
+    if (!configured) {
+      // 未配置时只认已经存在的日志文件（不能凭一个 id 就读到任意路径）。
+      final File file = File(paths.pluginLogFile(pluginId));
+      if (!file.existsSync()) return null;
+    }
+    return paths.pluginLogFile(pluginId);
+  }
+
+  /// 源是否合法（供 HTTP 层在任何磁盘动作前给出 400）。
+  bool isKnownSource(String source) => _resolve(source) != null;
+
+  /// 尾部读（`GET /api/logs/{source}?tail=&since=`）。
+  ///
+  /// `since` 的口径 = **行号（1 起）**：从第 `since` 行开始返回；不传则读文件尾部。
+  /// 返回 `next_since`（下一次传 `since` 的值）。单次原始行字节超过
+  /// [maxResponseBytes] 时只回最后一页并 `truncated:true`。
+  Future<Map<String, dynamic>> readTail(
+    String source, {
+    int tail = defaultTailLines,
+    int? since,
+  }) async {
+    final String? path = _resolve(source);
+    if (path == null) {
+      throw ArgumentError.value(source, 'source', '未知日志源');
+    }
+    if (since != null && since < 1) {
+      throw ArgumentError.value(since, 'since', 'since 必须是 >= 1 的行号');
+    }
+    final int limit = tail.clamp(1, maxTailLines);
+    final File file = File(path);
+    if (!await file.exists()) {
+      return <String, dynamic>{
+        'source': source,
+        'lines': const <String>[],
+        // 文件不存在（还没写 / 刚被清空轮转）⇒ 从新文件第 1 行重新开始，
+        // 不能沿用旧文件的 since，否则会跳过清空后新写入的日志。
+        'next_since': 1,
+        'tail': limit,
+        'truncated': false,
+        'size': 0,
+      };
+    }
+    final FileStat stat = await file.stat();
+    final _LogPage page = since == null
+        ? await _tailFromEnd(file, limit)
+        : await _tailSince(file, since, limit);
+    return <String, dynamic>{
+      'source': source,
+      'lines': page.lines,
+      'next_since': page.nextSince,
+      'tail': limit,
+      'truncated': page.truncated,
+      'size': stat.size,
+      if (stat.size > 0)
+        'modified': stat.modified.toUtc().toIso8601String(),
+    };
+  }
+
+  /// 清空并轮转（`DELETE /api/logs/{source}`）：当前份 → `<name>.1.log`（覆盖旧备份）。
+  ///
+  /// 返回清理掉的字节数与备份路径；文件不存在时 cleared_bytes 为 0、backup_path 为 null。
+  Future<Map<String, dynamic>> clear(String source) async {
+    final String? path = _resolve(source);
+    if (path == null) {
+      throw ArgumentError.value(source, 'source', '未知日志源');
+    }
+    final File file = File(path);
+    if (!await file.exists()) {
+      return <String, dynamic>{
+        'source': source,
+        'cleared_bytes': 0,
+        'backup_path': null,
+      };
+    }
+    final int size = await file.length();
+    final String backup = source == coreSourceId
+        ? paths.coreLogFileAt(1)
+        : paths.pluginLogFileAt(
+            source.substring(pluginSourcePrefix.length),
+            1,
+          );
+    final File backupFile = File(backup);
+    if (await backupFile.exists()) await backupFile.delete();
+    await file.rename(backup);
+    return <String, dynamic>{
+      'source': source,
+      'cleared_bytes': size,
+      'backup_path': backup,
+    };
+  }
+
+  // ── 内部实现 ─────────────────────────────────────────────────────────
+
+  /// 已存在的插件日志文件名 → 插件 id（排除 `.<n>.log` 历史份）。
+  Future<List<String>> _existingPluginIds() async {
+    final Directory dir = Directory(paths.pluginLogsDir);
+    if (!await dir.exists()) return const <String>[];
+    final List<String> ids = <String>[];
+    await for (final FileSystemEntity entity in dir.list()) {
+      if (entity is! File) continue;
+      final String name = entity.uri.pathSegments.last;
+      if (!name.endsWith('.log')) continue;
+      final String stem = name.substring(0, name.length - 4);
+      // `foo.1.log` 是轮转备份，不是源。
+      if (RegExp(r'\.\d+$').hasMatch(stem)) continue;
+      if (stem.isEmpty) continue;
+      ids.add(stem);
+    }
+    return ids;
+  }
+
+  /// 从文件尾倒读最后 [tail] 行；只保留至多 [maxResponseBytes] 字节的尾部。
+  Future<_LogPage> _tailFromEnd(File file, int tail) async {
+    final RandomAccessFile handle = await file.open();
+    try {
+      final int length = await handle.length();
+      if (length == 0) {
+        return const _LogPage(
+          lines: <String>[],
+          nextSince: 1,
+          truncated: false,
+        );
+      }
+      int position = length;
+      int newlines = 0;
+      int collectedBytes = 0;
+      int collectedStart = length;
+      bool byteTruncated = false;
+      final List<List<int>> chunks = <List<int>>[];
+      while (position > 0) {
+        final int size = position > _chunkBytes ? _chunkBytes : position;
+        position -= size;
+        await handle.setPosition(position);
+        final List<int> chunk = await handle.read(size);
+        for (final int byte in chunk) {
+          if (byte == 0x0A) newlines++;
+        }
+        final int room = maxResponseBytes - collectedBytes;
+        if (room <= 0) {
+          byteTruncated = true;
+          continue;
+        }
+        if (chunk.length <= room) {
+          chunks.add(chunk);
+          collectedBytes += chunk.length;
+          collectedStart = position;
+        } else {
+          // 只收这一块尾部能放下的部分（起点因此落在块内）。
+          chunks.add(chunk.sublist(chunk.length - room));
+          collectedStart = position + (chunk.length - room);
+          collectedBytes = maxResponseBytes;
+          byteTruncated = true;
+        }
+      }
+      // 文件是否以换行结尾，决定总行数（用于 next_since）。
+      await handle.setPosition(length - 1);
+      final List<int> lastByte = await handle.read(1);
+      final bool endsWithNewline = lastByte.isNotEmpty && lastByte.first == 0x0A;
+      final int totalLines = newlines + (endsWithNewline ? 0 : 1);
+
+      final BytesBuilder builder = BytesBuilder(copy: false);
+      for (int index = chunks.length - 1; index >= 0; index--) {
+        builder.add(chunks[index]);
+      }
+      String text = utf8.decode(builder.takeBytes(), allowMalformed: true);
+      List<String> lines = text
+          .split('\n')
+          .map(
+            (String line) => line.endsWith('\r')
+                ? line.substring(0, line.length - 1)
+                : line,
+          )
+          .toList();
+      if (text.endsWith('\n')) lines.removeLast();
+      // 收集起点在文件中间 ⇒ 首行是半行，丢掉（与 AtomicFile.readTail 同口径）。
+      if (collectedStart > 0 && lines.isNotEmpty) lines.removeAt(0);
+      if (lines.length > tail) {
+        lines = lines.sublist(lines.length - tail);
+      }
+      return _LogPage(
+        lines: lines,
+        nextSince: totalLines + 1,
+        truncated: byteTruncated,
+      );
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /// 从第 [since] 行（1 起）开始读，最多 [tail] 行；流式读、内存只保留本页。
+  Future<_LogPage> _tailSince(File file, int since, int tail) async {
+    final List<String> lines = <String>[];
+    int bytes = 0;
+    int lineNo = 0;
+    bool byteTruncated = false;
+    // 是否一直读到文件尾。提前 break（行数 / 字节上限）时 next_since 指向未读的那行。
+    bool reachedEnd = true;
+    final Stream<String> stream = file
+        .openRead()
+        // 插件日志可能混入非 UTF-8 字节：与尾部读同一口径，坏字节按 U+FFFD 顶替，
+        // 不让一行坏输入把整个日志 API 变成 500。
+        .transform(const Utf8Decoder(allowMalformed: true))
+        .transform(const LineSplitter());
+    await for (final String line in stream) {
+      lineNo++;
+      if (lineNo < since) continue;
+      if (lines.length >= tail) {
+        reachedEnd = false;
+        break;
+      }
+      final int lineBytes = utf8.encode(line).length + 1;
+      if (bytes + lineBytes > maxResponseBytes) {
+        byteTruncated = true;
+        reachedEnd = false;
+        break;
+      }
+      lines.add(line);
+      bytes += lineBytes;
+    }
+    // 正常情况下 next_since = since + 本页行数；若 since 已越过当前 EOF（日志被清空
+    // / 轮转后又从第 1 行写起），则回到 EOF+1，避免永久跳过新日志。
+    final int nextSince = reachedEnd && lineNo < since
+        ? lineNo + 1
+        : since + lines.length;
+    return _LogPage(
+      lines: lines,
+      nextSince: nextSince,
+      truncated: byteTruncated,
+    );
+  }
+}
+
+/// 一页日志的内部结果（对外统一转成 JSON map）。
+class _LogPage {
+  const _LogPage({
+    required this.lines,
+    required this.nextSince,
+    required this.truncated,
+  });
+
+  final List<String> lines;
+  final int nextSince;
+  final bool truncated;
 }

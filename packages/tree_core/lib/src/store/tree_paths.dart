@@ -127,6 +127,26 @@ class TreePaths {
   /// 轮转后的历史日志份（[index] 从 1 开始；越大越旧）。
   String coreLogFileAt(int index) => p.join(logsDir, 'core.$index.log');
 
+  /// 插件运行日志目录（`<root>/logs/plugins`）。
+  ///
+  /// 日志 API 的 `plugin:<id>` 源在磁盘上的落点；清空时按与核心同一口径轮转成
+  /// `<id>.1.log`。文件名只取 [safeSegment] 后的插件 id（配置里的 id 天然满足）。
+  String get pluginLogsDir => p.join(logsDir, 'plugins');
+
+  /// 某个插件**当前**那一份日志（`<root>/logs/plugins/<id>.log`）。
+  String pluginLogFile(String pluginId) =>
+      p.join(pluginLogsDir, '${safeSegment(pluginId)}.log');
+
+  /// 某个插件轮转后的历史日志份（[index] 从 1 开始；越大越旧）。
+  String pluginLogFileAt(String pluginId, int index) =>
+      p.join(pluginLogsDir, '${safeSegment(pluginId)}.$index.log');
+
+  /// 插件**命名空间存储**根目录（`<root>/store`）。
+  ///
+  /// 布局：`<root>/store/<ns>/k_<base64url(key)>`，每个键一个文件、内容原样字节。
+  /// `ns` 与 key 的安全校验见 `store/plugin_store.dart`（这里不做文件名编码）。
+  String get storeDir => p.join(root, 'store');
+
   /// 全部提问的原子快照（跨会话，右侧「问题回复」页用）。
   ///
   /// 为什么不像消息那样按会话拆文件：提问是**跨会话**查询的队列（`GET /api/questions`），
@@ -192,6 +212,7 @@ class TreePaths {
       sessionsDataDir,
       logsDir,
       hooksDir,
+      storeDir,
     ]) {
       await Directory(dir).create(recursive: true);
     }
@@ -207,6 +228,7 @@ class TreePaths {
       sessionsDataDir,
       logsDir,
       hooksDir,
+      storeDir,
     ]) {
       Directory(dir).createSync(recursive: true);
     }

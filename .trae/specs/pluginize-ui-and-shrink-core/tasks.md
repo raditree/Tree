@@ -45,8 +45,8 @@
   - [ ] SubTask 5.8: 用例覆盖引导页三形态、票据复用、越权、品牌回退与闸门、旧协议零残留
 
 - [ ] Task 6: 片 F —— 日志与存储 API
-  - [ ] SubTask 6.1: `GET /api/logs/sources`、`GET /api/logs/tail`（尾部读，不整块载入）、`POST /api/logs/clear`
-  - [ ] SubTask 6.2: `GET/PUT/DELETE /api/store/{ns}` + `list`，按 `plugin_id` 隔离、`etag` 冲突 409、配额
+  - [ ] SubTask 6.1: `GET /api/logs/sources`、`GET /api/logs/{source}`（尾部读，不整块载入）、`DELETE /api/logs/{source}`（清空并轮转）
+  - [ ] SubTask 6.2: `GET /api/store/{ns}`（列键分页）+ `GET/PUT/DELETE /api/store/{ns}/{key}`，按 `plugin_id` 隔离、`etag` 冲突 409、配额
   - [ ] SubTask 6.3: 用例覆盖跨命名空间 403、冲突 409、配额、二进制原样存取
 
 - [ ] Task 7: 收尾

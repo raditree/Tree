@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 /// 以 UTF-8 JSON 写回响应。
 ///
@@ -32,6 +33,34 @@ Future<Map<String, dynamic>> readJsonBody(HttpRequest request) async {
     throw const FormatException('请求体必须是 JSON 对象');
   }
   return decoded;
+}
+
+/// 请求体超过上限（原始字节入口用；调用方转 413）。
+class RequestBodyTooLarge implements Exception {
+  const RequestBodyTooLarge(this.maxBytes);
+
+  final int maxBytes;
+
+  @override
+  String toString() => '请求体超过上限 $maxBytes 字节';
+}
+
+/// 读取**原始字节**请求体（存储 API 用；核心不解析值内容）。
+///
+/// [maxBytes] 是内存硬上限：超过就抛 [RequestBodyTooLarge]，绝不先整块收下再判断
+/// （否则一个恶意的大 body 就能把核心进程撑爆）。
+Future<List<int>> readBodyBytes(
+  HttpRequest request, {
+  required int maxBytes,
+}) async {
+  final BytesBuilder builder = BytesBuilder(copy: false);
+  await for (final List<int> chunk in request) {
+    if (builder.length + chunk.length > maxBytes) {
+      throw RequestBodyTooLarge(maxBytes);
+    }
+    builder.add(chunk);
+  }
+  return builder.takeBytes();
 }
 
 /// 统一的 501 响应体：前端 `_handleResponse` 对 501 有专门文案（功能开发中）。
