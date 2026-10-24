@@ -2,6 +2,7 @@ import 'dart:io';
 
 import '../store/atomic_file.dart';
 import '../store/yaml_codec.dart';
+import 'plugin_dependency.dart';
 import 'plugin_host.dart' show PluginSuspension;
 import 'station_scope.dart';
 
@@ -66,6 +67,7 @@ class PluginConfigStore {
     'granularity',
     'scope',
     'suspension',
+    'requires',
   ];
 
   /// id 允许的字符集：与 TreePaths.safeSegment 同口径（不含路径分隔符与 ..）。
@@ -299,6 +301,14 @@ class PluginConfigStore {
             '当前是「$value」';
       }
     }
+    // requires（片 D 依赖声明）：形状 / id / 版本区间都在这里当场校验。
+    // 依赖闸门只对“能解析出来的声明”负责，拼坏一条不许静默变成“没写依赖”。
+    final PluginDependencyParseResult requires = parsePluginDependencies(
+      entry['requires'],
+    );
+    if (requires.error != null) {
+      return '插件 $id 的 ${requires.error}';
+    }
     return null;
   }
 
@@ -369,6 +379,17 @@ class PluginConfigStore {
     // 结果就是“校验收了、落盘把它丢了”（这一条由 plugin_config_store_test 钉住）。
     final String suspension = (src['suspension'] ?? '').toString().trim();
     if (suspension.isNotEmpty) out['suspension'] = suspension;
+    // 依赖声明（片 D）：空表不写键；有声明时按规范化形状写回（去掉多余键）。
+    final PluginDependencyParseResult requires = parsePluginDependencies(
+      src['requires'],
+    );
+    if (requires.dependencies.isNotEmpty) {
+      out['requires'] = <String, dynamic>{
+        'plugins': requires.dependencies
+            .map((PluginDependency d) => d.toJson())
+            .toList(growable: false),
+      };
+    }
     // 未知键（含 builtin 标记、用户自己加的备注）排在规范字段之后
     for (final MapEntry<String, dynamic> e in src.entries) {
       if (canonicalFields.contains(e.key)) continue;

@@ -94,7 +94,7 @@ void main() {
           .cast<Map<String, dynamic>>()
           .firstWhere((Map<String, dynamic> i) => i['plugin_id'] == id);
 
-  test('快照实例的键集合：老键一个不少，新键恰好两个', () async {
+  test('快照实例的键集合：老键一个不少，新键恰好四个', () async {
     final PluginBus bus = busFor(
       'enabled: true\n'
       'plugins:\n'
@@ -128,11 +128,14 @@ void main() {
     for (final String key in legacyKeys) {
       expect(instance.containsKey(key), isTrue, reason: '老键 $key 不得消失');
     }
-    // 新增键：只允许这两个（哪天再加第三个，这条断言就该红，逼人来核对前端）
+    // 新增键：只允许这四个（片 D 的 runtime / runtime_legacy 也是**明面新增**；
+    // 哪天再加第五个，这条断言就该红，逼人来核对前端）
     expect(instance.keys.toSet().difference(legacyKeys), <String>{
       'lifecycle',
       'generation',
-    }, reason: '向后兼容的底线是"只增键"，而且增哪两个必须写在明面上');
+      'runtime',
+      'runtime_legacy',
+    }, reason: '向后兼容的底线是"只增键"，而且增哪几个必须写在明面上');
   });
 
   test('四种运行态的 status / health 取值与改动前逐字一致', () async {

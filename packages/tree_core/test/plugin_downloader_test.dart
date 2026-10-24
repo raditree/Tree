@@ -464,7 +464,7 @@ void main() {
   });
 
   group('索引校验（坏条目只跳过，不带走整份清单）', () {
-    test('五种坏法各自给原因，好条目照常进列表', () async {
+    test('坏条目各自给原因，好条目照常进列表', () async {
       putAsset('tree_released.exe');
       repo.publish(
         plugins: <Map<String, dynamic>>[
@@ -496,7 +496,6 @@ void main() {
               },
             ],
           ),
-          _entry(id: 'bad_runtime', runtime: 'node'),
           _entry(id: 'bad_suspension', suspension: 'Keep'),
           _entry(id: 'bad_granularity', granularity: 'global'),
           <String, dynamic>{
@@ -511,16 +510,40 @@ void main() {
       expect(fresh.entries.map((PluginRepoEntry e) => e.id).toList(), <String>[
         'released',
       ], reason: '只有第一条是合法的（其余每条都该被跳过）');
-      expect(fresh.skipped, hasLength(8), reason: '坏条目逐个带原因进 skipped，不许静默');
+      expect(fresh.skipped, hasLength(7), reason: '坏条目逐个带原因进 skipped，不许静默');
       final String all = fresh.skipped.join('\n');
       expect(all, contains('三段数字'));
       expect(all, contains('目标名'));
       expect(all, contains('资产名'));
       expect(all, contains('不在 files 的目标名里'));
-      expect(all, contains('binary | python'));
       expect(all, contains('suspension 只能留空或 keep'));
       expect(all, contains('team | agent | session'));
       expect(all, contains('files 必须是非空数组'));
+    });
+
+    test('未知 runtime 不再拒收：原样保留，归一化交给 PluginRuntime', () async {
+      putAsset('tree_released.exe');
+      repo.publish(
+        plugins: <Map<String, dynamic>>[
+          <String, dynamic>{
+            ..._entry(id: 'legacy_runtime', runtime: 'node'),
+            'requires': <String, dynamic>{
+              'plugins': <Map<String, dynamic>>[
+                <String, dynamic>{'id': 'tree.release', 'version': '>=1.0 <2.0'},
+              ],
+            },
+          },
+        ],
+      );
+      final PluginReleaseListing fresh = await downloader().refresh();
+      expect(fresh.ok, isTrue, reason: fresh.error);
+      expect(fresh.skipped, isEmpty, reason: '任意 runtime 都接受（片 D 的归一化口径）');
+      final PluginRepoEntry entry = fresh.entries.single;
+      expect(entry.runtime, 'node');
+      expect(entry.toJson()['runtime'], 'node', reason: '索引保留原始值，面板才能提示待升级');
+      expect(entry.requires, hasLength(1));
+      expect(entry.requires.single.id, 'tree.release');
+      expect(entry.toJson()['requires'], isNotNull, reason: '安装前就要能展示依赖');
     });
 
     test('scope 不是对象 ⇒ 跳过（不许把字符串当归属）', () async {

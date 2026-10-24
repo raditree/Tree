@@ -24,7 +24,9 @@ import '../plugin/builtin_plugins.dart';
 import '../plugin/execute_mounts.dart';
 import '../plugin/plugin_bus.dart';
 import '../plugin/plugin_config_store.dart';
+import '../plugin/plugin_dependency.dart';
 import '../plugin/plugin_downloader.dart';
+import '../plugin/plugin_host.dart' show PluginConfig;
 import '../plugin/station_scope.dart';
 import '../plugin/station_ws_bridge.dart';
 import '../settings/core_settings.dart';
@@ -503,6 +505,12 @@ class CoreServer {
       reassembler: InboundFrameReassembler(),
       version: version,
     );
+    // 片 D：UI 插件要用 `TREE_CORE_URL` / `TREE_CORE_TOKEN` 直连本核心。
+    // 监听成功后立刻把实际端口与 token 接到总线上（CLI 里 plugins.start() 在这之后）。
+    pluginBus?.bindCoreEndpoint(
+      url: 'ws://127.0.0.1:${server.port}',
+      token: server.token,
+    );
     // 记录"在线生效"的判活参数：设置变更时用它判断能不能热更新节拍，也是观测/
     // 测试的读数点（见 liveHeartbeatInterval / liveHeartbeatMissLimit）。
     server._heartbeatPinned = heartbeatPinned;
@@ -805,6 +813,8 @@ class CoreServer {
       configs: bus.configs,
       routes: delegatedRouter.metaRoutes,
       log: (String message) => errorLog?.call('[core:station/ws] $message'),
+      // 片 D：UI 插件连上后解除连接窗口的 degraded（总线只记状态，不做事）。
+      onUiHello: bus.noteUiHello,
     );
     bus.stations.onStationRemoved = bridge.onStationRemoved;
     bus.onPluginOffline = bridge.onPluginOffline;
@@ -4345,7 +4355,326 @@ class CoreServer {
     'hot_apply_detail': outcome.detail,
   };
 
-  /// 每条插件的运行态（给面板显示"在跑 / 已停用 / 心跳降级 / 启动失败原因"）。
+  /// 依赖闸门的统一回包（409）。
+  ///
+  /// 形状即 `spec.md` ADDED「插件依赖」：`{ok:false, error, reasons,
+  /// missing_dependencies:[{id, required, installed, actual, by, optional, reason}]}`。
+  Future<void> _writeDependencyConflict(
+    HttpRequest request,
+    Map<String, dynamic> block, {
+    String pluginId = '',
+  }) async {
+    await writeJson(request, 409, <String, dynamic>{
+      ...block,
+      if (pluginId.isNotEmpty) 'plugin_id': pluginId,
+    });
+  }
+
+  /// 用“即将写盘的条目”跑一次依赖闸门（refresh = 先读最新 plugins.yaml）。
+  Map<String, dynamic>? _dependencyBlockForEntry(
+    PluginBus bus,
+    Map<String, dynamic> entry,
+  ) {
+    final PluginDependencyReport report = bus.checkDependencies(
+      PluginConfig.fromJson(entry),
+      refresh: true,
+    );
+    return report.ok ? null : report.toJson();
+  }
+
+  /// `with_dependencies` 的自动补齐：**只装缺失项，不升级既有插件**。
+  ///
+  /// 返回 null = 依赖已齐（目标插件可以继续安装）；否则返回依赖闸门形状的 409 回包。
+  /// 规则：
+  /// - 已安装且版本满足 ⇒ 跳过（绝不因为索引里有新版就顺手升级）；
+  /// - 已安装但版本不满足 ⇒ 直接拒绝（升级是用户动作，不是安装副作用）；
+  /// - 同一 id 被多方要求 ⇒ 取区间交集，无交集 / 成环 ⇒ 可读失败、逐条列出；
+  /// - 只补齐依赖自身，不碰目标插件（调用方随后走正常 install）。
+  Future<Map<String, dynamic>?> _installMissingDependencies(
+    PluginBus bus,
+    PluginDownloader downloader,
+    PluginConfigStore store,
+    String targetId,
+  ) async {
+    PluginReleaseListing listing = downloader.cachedListing();
+    if (!listing.ok || listing.entries.isEmpty) {
+      listing = await downloader.refresh();
+    }
+    final Map<String, PluginRepoEntry> repo = <String, PluginRepoEntry>{
+      for (final PluginRepoEntry entry in listing.entries) entry.id: entry,
+    };
+    final PluginRepoEntry? targetEntry = repo[targetId];
+    if (targetEntry == null) {
+      // 目标条目不在索引里：让正常 install 去给它的错误（这里不抢话）。
+      return null;
+    }
+    final Map<String, Map<String, dynamic>> installed =
+        <String, Map<String, dynamic>>{
+          for (final Map<String, dynamic> entry in store.readEntries())
+            if ((entry['id'] ?? '').toString().isNotEmpty)
+              entry['id'].toString(): entry,
+        };
+    final List<PluginDependencyIssue> issues = <PluginDependencyIssue>[];
+    final List<String> reasons = <String>[];
+    final List<String> stack = <String>[targetId];
+
+    String versionOf(Map<String, dynamic>? entry) {
+      if (entry == null) return '';
+      final Object? version = entry['version'];
+      if (version is String && version.trim().isNotEmpty) return version.trim();
+      final Object? repoVersion = entry['repo_version'];
+      return repoVersion is String ? repoVersion.trim() : '';
+    }
+
+    /// 收集所有“已启用且要求 depId”的插件，加上当前这一条要求。
+    List<({String by, PluginDependency dependency})> requirementsFor(
+      String depId,
+      String currentBy,
+      PluginDependency current,
+    ) {
+      final List<({String by, PluginDependency dependency})> out =
+          <({String by, PluginDependency dependency})>[
+            (by: currentBy, dependency: current),
+          ];
+      for (final MapEntry<String, Map<String, dynamic>> item
+          in installed.entries) {
+        if (item.value['enabled'] == false) continue;
+        final PluginConfig config = PluginConfig.fromJson(item.value);
+        for (final PluginDependency dependency in config.requires) {
+          if (dependency.id != depId || dependency.optional) continue;
+          if (dependency.version == current.version &&
+              item.key == currentBy) {
+            continue;
+          }
+          out.add((by: item.key, dependency: dependency));
+        }
+      }
+      return out;
+    }
+
+    ({String text, PluginVersionConstraint? intersection, String? error})
+    intersectRequirements(
+      String depId,
+      List<({String by, PluginDependency dependency})> requirements,
+    ) {
+      final String text = requirements
+          .map(
+            (({String by, PluginDependency dependency}) item) =>
+                '${item.by}：'
+                '${item.dependency.version.isEmpty ? '任意版本' : item.dependency.version}',
+          )
+          .join('；');
+      PluginVersionConstraint? intersection;
+      for (final ({String by, PluginDependency dependency}) item
+          in requirements) {
+        final PluginVersionConstraint? one =
+            PluginVersionConstraint.tryParse(item.dependency.version);
+        if (one == null) {
+          return (
+            text: text,
+            intersection: null,
+            error: '依赖 $depId 的版本区间不可解析：${item.dependency.version}',
+          );
+        }
+        intersection = intersection == null ? one : intersection.intersect(one);
+        if (intersection.range.isEmpty) {
+          return (
+            text: text,
+            intersection: intersection,
+            error: '依赖 $depId 的版本区间无交集：$text',
+          );
+        }
+      }
+      return (text: text, intersection: intersection, error: null);
+    }
+
+    Future<bool> walk(PluginRepoEntry entry) async {
+      for (final PluginDependency dependency in entry.requires) {
+        if (dependency.optional) continue;
+        final List<({String by, PluginDependency dependency})> requirements =
+            requirementsFor(dependency.id, entry.id, dependency);
+        final PluginVersionConstraint? parsed =
+            PluginVersionConstraint.tryParse(dependency.version);
+        final ({String text, PluginVersionConstraint? intersection, String? error})
+        merged = intersectRequirements(dependency.id, requirements);
+        final String requiredText = merged.text;
+        final List<String> by = <String>[
+          for (final ({String by, PluginDependency dependency}) item
+              in requirements)
+            item.by,
+        ];
+        if (merged.error != null) {
+          reasons.add(merged.error!);
+          issues.add(
+            PluginDependencyIssue(
+              id: dependency.id,
+              required: requiredText,
+              installed: installed.containsKey(dependency.id),
+              actual: versionOf(installed[dependency.id]),
+              by: by,
+              reason: merged.error!,
+            ),
+          );
+          return false;
+        }
+        final Map<String, dynamic>? live = installed[dependency.id];
+        if (live != null) {
+          final String actual = versionOf(live);
+          if (merged.intersection != null &&
+              !merged.intersection!.isAny &&
+              (actual.isEmpty ||
+                  !merged.intersection!.satisfies(actual))) {
+            final String reason =
+                '依赖 ${dependency.id} 已安装版本「${actual.isEmpty ? '未知' : actual}」'
+                '不满足 $requiredText；自动安装只补齐缺失项，**不升级**既有插件';
+            reasons.add(reason);
+            issues.add(
+              PluginDependencyIssue(
+                id: dependency.id,
+                required: requiredText,
+                installed: true,
+                actual: actual,
+                by: by,
+                reason: reason,
+              ),
+            );
+            return false;
+          }
+          continue;
+        }
+        final PluginRepoEntry? candidate = repo[dependency.id];
+        if (candidate == null) {
+          final String reason =
+              '缺少依赖 ${dependency.id}（发布索引里也没有这条）';
+          reasons.add(reason);
+          issues.add(
+            PluginDependencyIssue(
+              id: dependency.id,
+              required: requiredText,
+              installed: false,
+              actual: '',
+              by: by,
+              reason: reason,
+            ),
+          );
+          return false;
+        }
+        if (stack.contains(dependency.id)) {
+          final int index = stack.indexOf(dependency.id);
+          final String path = <String>[
+            ...stack.sublist(index),
+            dependency.id,
+          ].join(' → ');
+          final String reason = '依赖成环：$path';
+          reasons.add(reason);
+          issues.add(
+            PluginDependencyIssue(
+              id: dependency.id,
+              required: requiredText,
+              installed: false,
+              actual: '',
+              by: by,
+              reason: reason,
+            ),
+          );
+          return false;
+        }
+        final String candidateVersion = candidate.version.trim();
+        if (parsed != null &&
+            !parsed.isAny &&
+            (candidateVersion.isEmpty || !parsed.satisfies(candidateVersion)) ||
+            (merged.intersection != null &&
+                !merged.intersection!.isAny &&
+                (candidateVersion.isEmpty ||
+                    !merged.intersection!.satisfies(candidateVersion)))) {
+          final String reason =
+              '发布索引里的 ${dependency.id} 版本'
+              '「${candidateVersion.isEmpty ? '未知' : candidateVersion}」'
+              '不满足 $requiredText';
+          reasons.add(reason);
+          issues.add(
+            PluginDependencyIssue(
+              id: dependency.id,
+              required: requiredText,
+              installed: false,
+              actual: candidateVersion,
+              by: by,
+              reason: reason,
+            ),
+          );
+          return false;
+        }
+        stack.add(dependency.id);
+        final bool nested = await walk(candidate);
+        stack.removeLast();
+        if (!nested) return false;
+        final PluginInstallResult install = await downloader.install(
+          dependency.id,
+          swapGate: bus.quiesceForSwap,
+        );
+        final Map<String, dynamic>? installedEntry = install.entry;
+        if (!install.ok || installedEntry == null) {
+          final String reason =
+              '自动安装依赖 ${dependency.id} 失败：${install.error}';
+          reasons.add(reason);
+          issues.add(
+            PluginDependencyIssue(
+              id: dependency.id,
+              required: requiredText,
+              installed: false,
+              actual: '',
+              by: by,
+              reason: reason,
+            ),
+          );
+          return false;
+        }
+        final PluginStoreResult stored = store.upsert(installedEntry);
+        final Map<String, dynamic>? row = stored.entry;
+        if (!stored.ok || row == null) {
+          final String reason =
+              '依赖 ${dependency.id} 的文件已放置，但写入 plugins.yaml 失败：'
+              '${stored.error}';
+          reasons.add(reason);
+          issues.add(
+            PluginDependencyIssue(
+              id: dependency.id,
+              required: requiredText,
+              installed: false,
+              actual: '',
+              by: by,
+              reason: reason,
+            ),
+          );
+          return false;
+        }
+        installed[dependency.id] = row;
+        await _applyPluginChange(bus, row, enable: true);
+      }
+      return true;
+    }
+
+    if (await walk(targetEntry)) return null;
+    return PluginDependencyReport(
+      error: '插件 $targetId 的依赖无法自动补齐：${reasons.join('；')}',
+      reasons: reasons,
+      issues: issues,
+    ).toJson();
+  }
+
+  /// 卸载“被依赖插件”的确认位（body 或 query 皆可，便于 CLI/面板两种调用）。
+  bool _uninstallConfirmed(
+    Map<String, dynamic> body,
+    HttpRequest request,
+  ) {
+    final Object? value =
+        body['confirm_dependents'] ??
+        body['confirmDependents'] ??
+        request.uri.queryParameters['confirm_dependents'];
+    return value == true || value?.toString().toLowerCase() == 'true';
+  }
+
+  /// 某插件当前的运行态（给面板显示"在跑 / 已停用 / 心跳降级 / 启动失败原因"）。
   ///
   /// 数据源是插件总线的公开探针（healthOf / errorOf），不是自己另立台账。
   ///
@@ -4432,6 +4761,16 @@ class CoreServer {
       await writeJson(request, 400, errorBody(result.error));
       return;
     }
+    // 片 D：新增条目默认启用 ⇒ 启用前先过依赖闸门；拦下就回滚这条条目，
+    // 保证磁盘上不会留下一条“开关开着但永远起不来”的配置。
+    if (entry['enabled'] != false) {
+      final Map<String, dynamic>? blocked = _dependencyBlockForEntry(bus, entry);
+      if (blocked != null) {
+        store.remove(newId);
+        await _writeDependencyConflict(request, blocked, pluginId: newId);
+        return;
+      }
+    }
     final PluginHotApplyOutcome outcome = await _applyPluginChange(
       bus,
       entry,
@@ -4454,7 +4793,8 @@ class CoreServer {
     final Map<String, dynamic>? body = await _jsonBody(request);
     if (body == null) return;
     final PluginConfigStore store = _pluginStore(bus);
-    if (store.readEntry(id) == null) {
+    final Map<String, dynamic>? before = store.readEntry(id);
+    if (before == null) {
       await writeJson(request, 404, errorBody('插件不存在：$id'));
       return;
     }
@@ -4463,6 +4803,19 @@ class CoreServer {
     if (!result.ok || entry == null) {
       await writeJson(request, 400, errorBody(result.error));
       return;
+    }
+    // 片 D：只有**从停用切到启用**（或显式 enabled:true）才过闸门；只是改名字 /
+    // 改介绍不该被旧依赖问题连带拒绝。拦下时把开关回滚到改动前，条目其余字段保留。
+    final bool enabling =
+        entry['enabled'] != false &&
+        (before['enabled'] != true || body['enabled'] == true);
+    if (enabling) {
+      final Map<String, dynamic>? blocked = _dependencyBlockForEntry(bus, entry);
+      if (blocked != null) {
+        store.update(id, <String, dynamic>{'enabled': before['enabled'] ?? false});
+        await _writeDependencyConflict(request, blocked, pluginId: id);
+        return;
+      }
     }
     final PluginHotApplyOutcome outcome = await _applyPluginChange(
       bus,
@@ -4556,8 +4909,19 @@ class CoreServer {
     final Map<String, dynamic> body = await readJsonBody(request);
     final String mode = (body['mode'] ?? '').toString().trim();
     if (mode == 'force_stop') {
+      // 用户显式强制停止永远放行：这是给“已经卡死、依赖怎么都不齐”留的出口。
       await writeJson(request, 200, await bus.forceStop(id));
       return;
+    }
+    // 片 D：重启前复核依赖（含热重启）。依赖缺失时重拉只会得到同样失败，
+    // 这里直接 409 并给可读清单，避免“看起来重启了，实际没起来”。
+    final PluginConfig restartConfig = bus.config(id)!;
+    if (restartConfig.enabled) {
+      final Map<String, dynamic>? blocked = bus.dependencyBlock(id);
+      if (blocked != null) {
+        await _writeDependencyConflict(request, blocked, pluginId: id);
+        return;
+      }
     }
     if (mode == 'hot') {
       final PluginHotRestartResult hot = await bus.hotRestart(
@@ -4688,9 +5052,20 @@ class CoreServer {
       return;
     }
     final PluginConfigStore store = _pluginStore(bus);
-    final PluginStoreResult result = store.upsert(
-      BuiltinPluginCatalog.entryFor(spec, resolution),
+    final Map<String, dynamic> candidateEntry = BuiltinPluginCatalog.entryFor(
+      spec,
+      resolution,
     );
+    // 片 D：内置项打开也要过依赖闸门（候选条目先判，拦下就不写盘）。
+    final Map<String, dynamic>? blocked = _dependencyBlockForEntry(
+      bus,
+      candidateEntry,
+    );
+    if (blocked != null) {
+      await _writeDependencyConflict(request, blocked, pluginId: id);
+      return;
+    }
+    final PluginStoreResult result = store.upsert(candidateEntry);
     final Map<String, dynamic>? entry = result.entry;
     if (!result.ok || entry == null) {
       await writeJson(request, 400, errorBody(result.error));
@@ -4855,6 +5230,20 @@ class CoreServer {
     final String id = (params['pluginId'] ?? '').trim();
     final PluginConfigStore store = _pluginStore(bus);
     final Map<String, dynamic>? existing = store.readEntry(id);
+    final Map<String, dynamic>? body = await _jsonBody(request);
+    if (body == null) return;
+    final bool withDependencies =
+        body['with_dependencies'] == true || body['withDependencies'] == true;
+    // 片 D：`with_dependencies` 只**补齐缺失**的依赖（不升级已装版本）。
+    // 冲突 / 成环 / 缺索引条目都在这一步回可读 409，且不会继续装目标插件。
+    if (withDependencies) {
+      final Map<String, dynamic>? dependencyBlock =
+          await _installMissingDependencies(bus, downloader, store, id);
+      if (dependencyBlock != null) {
+        await _writeDependencyConflict(request, dependencyBlock, pluginId: id);
+        return;
+      }
+    }
     final PluginInstallResult install = await downloader.install(
       id,
       swapGate: bus.quiesceForSwap,
@@ -4877,6 +5266,16 @@ class CoreServer {
       ...entry,
       if (existing?['builtin'] == true) 'builtin': true,
     };
+    // 片 D：依赖闸门在写盘之前。文件已经落到 plugins/，但**条目与进程都不动**：
+    // 回包会如实带上 install 段，用户补齐依赖后再点一次即可。
+    final Map<String, dynamic>? blocked = _dependencyBlockForEntry(bus, toWrite);
+    if (blocked != null) {
+      await _writeDependencyConflict(request, <String, dynamic>{
+        ...blocked,
+        'install': install.toJson(),
+      }, pluginId: id);
+      return;
+    }
     final PluginStoreResult result = store.upsert(toWrite);
     final Map<String, dynamic>? stored = result.entry;
     if (!result.ok || stored == null) {
@@ -4934,6 +5333,48 @@ class CoreServer {
     final String id = (params['pluginId'] ?? '').trim();
     final PluginConfigStore store = _pluginStore(bus);
     final Map<String, dynamic>? before = store.readEntry(id);
+    final Map<String, dynamic> body = await _jsonBody(request) ?? <String, dynamic>{};
+    // 片 D：卸载被依赖的插件要先确认——确认后**停用依赖方**（不是卸载它们）。
+    // 未确认时回 409 + 依赖方清单，目标与依赖方都保持原样（文件也不动）。
+    final List<PluginConfig> dependents = bus.dependentsOf(id);
+    if (dependents.isNotEmpty && !_uninstallConfirmed(body, request)) {
+      await _writeDependencyConflict(request, <String, dynamic>{
+        'ok': false,
+        'error': '插件 $id 正被 ${dependents.length} 个已启用插件依赖；'
+            '确认卸载将同时**停用**这些依赖方（不会卸载它们）',
+        'dependents': <Map<String, dynamic>>[
+          for (final PluginConfig config in dependents)
+            <String, dynamic>{
+              'id': config.id,
+              'name': config.name,
+              'optional': false,
+            },
+        ],
+        'missing_dependencies': <Map<String, dynamic>>[
+          for (final PluginConfig config in dependents)
+            <String, dynamic>{
+              'id': id,
+              'required': config.requires
+                  .where(
+                    (PluginDependency dependency) =>
+                        dependency.id == id && !dependency.optional,
+                  )
+                  .map(
+                    (PluginDependency dependency) => dependency.version.isEmpty
+                        ? '任意版本'
+                        : dependency.version,
+                  )
+                  .join(' / '),
+              'installed': true,
+              'actual': '',
+              'by': <String>[config.id],
+              'optional': false,
+              'reason': '卸载后依赖将缺失，依赖方会被停用',
+            },
+        ],
+      }, pluginId: id);
+      return;
+    }
     final List<String> targets = downloader.uninstallTargets(
       id,
       before,
@@ -4992,6 +5433,20 @@ class CoreServer {
       );
     }
 
+    // 片 D：已确认的依赖方**停用**（条目保留，不删文件）；停用失败如实列出。
+    final List<String> dependentsDisabled = <String>[];
+    final Map<String, String> dependentsFailed = <String, String>{};
+    for (final PluginConfig config in dependents) {
+      final PluginStoreResult disabled = store.setEnabled(config.id, false);
+      final Map<String, dynamic>? row = disabled.entry;
+      if (!disabled.ok || row == null) {
+        dependentsFailed[config.id] = disabled.error;
+        continue;
+      }
+      dependentsDisabled.add(config.id);
+      await _applyPluginChange(bus, row, enable: false);
+    }
+
     final String fileNotice = removed.failed.isEmpty
         ? ''
         : '以下文件这次没删掉（可能被别的进程占用）：'
@@ -5011,6 +5466,8 @@ class CoreServer {
         'deleted': removed.deleted,
         'failed': removed.failed,
         'notice': fileNotice,
+        'dependents_disabled': dependentsDisabled,
+        'dependents_failed': dependentsFailed,
       },
     });
   }

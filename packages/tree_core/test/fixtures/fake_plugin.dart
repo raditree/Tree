@@ -9,6 +9,7 @@ import 'dart:io';
 /// 参数：
 /// - --events-file PATH：把收到的 event 通知逐行追加到该文件（验证总线分发）
 /// - --ignore-ping：完全不回 ping（验证心跳丢失 ⇒ degraded，且进程不被杀）
+/// - --no-tools：不回 tools/list（验证缺失该能力不影响插件上线，也不产生占位工具）
 /// - --ignore-ping-until PATH：该文件不存在时忽略 ping，文件出现后恢复回包
 ///   （验证心跳恢复 ⇒ degraded 自动清除）
 /// - --exit-on-slow：tools/call 命中 slow 时直接退出进程
@@ -47,6 +48,7 @@ void main(List<String> args) {
   String eventsFile = '';
   String pingGateFile = '';
   final bool ignorePing = args.contains('--ignore-ping');
+  final bool noTools = args.contains('--no-tools');
   final bool exitOnSlow = args.contains('--exit-on-slow');
   final bool stationTools = args.contains('--station-tools');
   final bool stationClient = args.contains('--station-client');
@@ -317,6 +319,21 @@ void main(List<String> args) {
           'capabilities': <String>['tools'],
         });
       case 'tools/list':
+        if (noTools) {
+          // 片 D：tools/list 是**可选能力**。回一个标准的 method not found，
+          // 让核心走“取不到就当没有工具”的那条路。
+          stdout.writeln(
+            jsonEncode(<String, dynamic>{
+              'jsonrpc': '2.0',
+              'id': id,
+              'error': <String, dynamic>{
+                'code': -32601,
+                'message': 'method not found: tools/list',
+              },
+            }),
+          );
+          return;
+        }
         reply(<String, dynamic>{
           'tools': <Map<String, dynamic>>[
             <String, dynamic>{

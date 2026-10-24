@@ -72,7 +72,7 @@
 | D-1 | 启用两个 `runtime: ui` 插件 | 两个进程并存，各自连 WS，`/api/meta.ui` 两条 |
 | D-2 | 卸载其中一个（正在运行） | 进程退出、文件可删（无占用）、另一个不受影响 |
 | D-3 | 全部停用 | 核心健康、`/api/meta.ui` 为空、其余端点正常 |
-| D-4 | UI 进程崩溃 | `plugin_status` 变 `stopped`；不反复拉起（除非配置允许） |
+| D-4 | UI 进程崩溃 | `plugin_status` 变 `failed`（正常停止才是 `stopped`），`disabled_reason` 注明异常退出；不反复拉起（除非配置允许） |
 | D-5 | 检查 `UiHost` 行为 | 不发 `tools/list`、不注册站点、不进状态池；日志中无握手记录 |
 | D-6 | 注入环境 | UI 进程拿到 `TREE_CORE_URL` / `TREE_CORE_TOKEN`，能直连核心 |
 | D-7 | 未实现 `tools/list` 的普通插件 | 仍能正常上线（核心不生成工具占位、不写专用日志、不新增工具接口），与 UI 无关 |

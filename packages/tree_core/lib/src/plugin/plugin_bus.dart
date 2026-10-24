@@ -17,12 +17,15 @@ import '../util/liveness.dart';
 import 'agent_events.dart';
 import 'execute_mounts.dart';
 import 'plugin_capability.dart';
+import 'plugin_dependency.dart';
 import 'plugin_host.dart';
 import 'plugin_lifecycle.dart';
 import 'plugin_restart_buffer.dart';
+import 'plugin_runtime.dart';
 import 'plugin_state_pool.dart';
 import 'plugin_tool_definition.dart';
 import 'plugin_ui_bridge.dart';
+import 'ui_host.dart';
 import 'station_ids.dart';
 import 'station_channel.dart';
 import 'station_instance.dart';
@@ -85,6 +88,14 @@ final class StationToolProbeVerdict {
   final String text;
 }
 
+/// UI 宿主工厂（测试注入假宿主；生产走 [UiHost.start]）。
+typedef UiHostFactory =
+    Future<UiHost> Function(
+      PluginConfig config, {
+      required String coreUrl,
+      required String coreToken,
+    });
+
 /// 插件总线（M6b + M9 Wave 3-F）：配置、实例生命周期、事件分发、工具聚合、
 /// **站点体系**与**心跳判活**。
 ///
@@ -108,8 +119,10 @@ class PluginBus {
   PluginBus({
     required this.configFile,
     this.hostFactory,
+    this.uiHostFactory,
     this.log,
     this.connectTimeout = const Duration(seconds: 20),
+    this.uiHelloWindow = const Duration(seconds: 30),
     this.heartbeatInterval = LivenessTracker.defaultInterval,
     this.missThreshold = LivenessTracker.defaultMaxMisses,
     this.coreVersion = '',
@@ -170,6 +183,27 @@ class PluginBus {
 
   /// 宿主工厂（测试注入假宿主；生产走 [PluginHost.start]）。
   final Future<PluginHost> Function(PluginConfig config)? hostFactory;
+
+  /// UI 宿主工厂（片 D；null = 生产走 [UiHost.start]）。
+  final UiHostFactory? uiHostFactory;
+
+  /// UI 插件启动后等待 `ui.hello` 的连接窗口（超时只降级、**不杀进程**）。
+  final Duration uiHelloWindow;
+
+  /// 核心对插件暴露的 ws 基址（`ws://127.0.0.1:<port>`）。
+  ///
+  /// 由核心启动后 `bindCoreEndpoint` 注入；UI 插件启动时写成 TREE_CORE_URL。
+  /// 未接线时 UI 插件不会启动（可读失败原因），避免拉起一个“不知道该连哪”的进程。
+  String coreUrl = '';
+
+  /// 当前核心 token（UI 插件启动时写成 TREE_CORE_TOKEN）。
+  String coreToken = '';
+
+  /// 核心端点接线（`CoreServer.start` 在监听成功后调用；可重复调用）。
+  void bindCoreEndpoint({required String url, required String token}) {
+    coreUrl = url;
+    coreToken = token;
+  }
 
   final void Function(String message)? log;
 
@@ -298,6 +332,22 @@ class PluginBus {
 
   final List<PluginConfig> _configs = <PluginConfig>[];
   final Map<String, PluginHost> _hosts = <String, PluginHost>{};
+
+  /// **UI 插件实例**（片 D）。
+  ///
+  /// 刻意**不放进 [_hosts]**：那是 stdio 宿主的表——看门狗会给它们 ping、快照会读
+  /// 它们的 liveness、工具表会从它们身上收 tools/list。UI 插件没有这些语义，混在
+  /// 一起等于让看门狗把“没有 stdio 回包”误判成掉线。
+  final Map<String, UiHost> _uiHosts = <String, UiHost>{};
+
+  /// UI 插件启动后的连接窗口定时器（超时只降级，不杀进程）。
+  final Map<String, Timer> _uiHelloWindows = <String, Timer>{};
+
+  /// 已经完成过 `ui.hello` 的 UI 插件（窗口判定的唯一依据）。
+  final Set<String> _uiHelloSeen = <String>{};
+
+  /// UI 插件“进程活着但窗口内没连上”的可读原因（面板状态 degraded）。
+  final Map<String, String> _uiDegraded = <String, String>{};
 
   /// 每个**正在运行的实例**是按哪一份配置拉起来的（[applyConfigs] 判断"启动参数
   /// 有没有变"的唯一依据）。
@@ -492,6 +542,53 @@ class PluginBus {
           (pluginId: entry.key, host: entry.value),
       ];
 
+  /// **启用前依赖闸门**（片 D）。
+  ///
+  /// [candidate] 是即将启用的条目；判定基于内存里最新的已安装配置。
+  /// [refresh] = true 时先强制重读磁盘（HTTP 写盘后就是用它）。
+  /// 同一份判定同时服务 `_startOne`（进程不得启动）与 HTTP 409 回包。
+  PluginDependencyReport checkDependencies(
+    PluginConfig candidate, {
+    bool refresh = false,
+  }) {
+    if (refresh) _reloadConfigs();
+    return evaluatePluginDependencies(
+      target: candidate.dependencyInput,
+      installed: <PluginDependencyInput>[
+        for (final PluginConfig config in _configs)
+          if (config.id != candidate.id) config.dependencyInput,
+      ],
+    );
+  }
+
+  /// 供 HTTP 层在“启用 / 安装 / 重启”前复核：返回 null = 可以放行。
+  ///
+  /// 回包形状见 `spec.md` ADDED「插件依赖」：
+  /// `{ok:false, error, reasons, missing_dependencies:[{id, required, installed,
+  /// actual, by, optional, reason}]}`。
+  Map<String, dynamic>? dependencyBlock(String pluginId) {
+    _reloadConfigs();
+    final PluginConfig? candidate = config(pluginId);
+    if (candidate == null) return null;
+    final PluginDependencyReport report = checkDependencies(candidate);
+    return report.ok ? null : report.toJson();
+  }
+
+  /// 正在启用、且把 [pluginId] 作为**非可选**依赖的插件（卸载确认用）。
+  List<PluginConfig> dependentsOf(String pluginId) {
+    load();
+    return <PluginConfig>[
+      for (final PluginConfig config in _configs)
+        if (config.id != pluginId &&
+            config.enabled &&
+            config.requires.any(
+              (PluginDependency dependency) =>
+                  dependency.id == pluginId && !dependency.optional,
+            ))
+          config,
+    ];
+  }
+
   /// 某插件当前注册的工具（来自动态工具表 = 收集站收集到的定义）。
   List<PluginToolInfo> toolsOf(String pluginId) => _definitions
       .definitions()
@@ -636,6 +733,28 @@ class PluginBus {
 
   /// 某插件的健康度快照（心跳判活；degraded **不等于**死亡）。
   Map<String, dynamic> healthOf(String pluginId) {
+    final UiHost? uiHost = _uiHosts[pluginId];
+    if (uiHost != null) {
+      // UI 插件没有 stdio 心跳：存活 = 进程没退出；degraded 只看连接窗口。
+      final bool alive = !uiHost.isClosed;
+      final String? degradedReason = _uiDegraded[pluginId];
+      return <String, dynamic>{
+        'plugin_id': pluginId,
+        'runtime': 'ui',
+        'health': !alive
+            ? 'unavailable'
+            : (degradedReason == null ? 'ok' : 'degraded'),
+        'degraded': degradedReason != null,
+        'missed_heartbeats': 0,
+        'process_alive': alive,
+        'ui_hello_seen': _uiHelloSeen.contains(pluginId),
+        'pid': uiHost.pid,
+        if (degradedReason != null)
+          'reason': degradedReason
+        else if (!alive)
+          'reason': _errors[pluginId] ?? 'UI 插件进程已退出',
+      };
+    }
     final PluginHost? host = _hosts[pluginId];
     if (host == null) {
       return <String, dynamic>{
@@ -730,13 +849,29 @@ class PluginBus {
     PluginConfig config, {
     String resumeDumpId = '',
   }) async {
-    if (_hosts.containsKey(config.id)) return;
+    if (_hosts.containsKey(config.id) || _uiHosts.containsKey(config.id)) return;
     // **代际在拉起之前**就定下来：快照的索引键靠它，而「这一世是谁」必须在进程还
     // 没起来时就确定（否则转储与取回会各自猜一个号，两边对不上）。
     final int generation = (_generations[config.id] ?? 0) + 1;
     _generations[config.id] = generation;
     _setLifecycle(config.id, PluginLifecycleState.booting);
+    // 片 D：**启用前依赖闸门**——非可选依赖缺失 / 版本不符 / 区间无交集 / 成环
+    // ⇒ 进程绝不启动（HTTP 层回 409 与此处同一份判定）。
+    final PluginDependencyReport dependency = checkDependencies(config);
+    if (!dependency.ok) {
+      _errors[config.id] = dependency.error ?? '依赖未满足';
+      log?.call('插件 ${config.id} 不可用：${dependency.error}');
+      _setLifecycle(config.id, PluginLifecycleState.failed);
+      _emitStatus(config, 'disabled', reason: dependency.error ?? '依赖未满足');
+      return;
+    }
     try {
+      // 片 D：按**归一化 runtime** 分叉。只有 ui 走 UiHost；其余（含 legacy 的
+      // binary / python / 未知值）逐字走原 stdio 路径。
+      if (config.runtimeKind == PluginRuntimeKind.ui) {
+        await _startUiOne(config, generation: generation);
+        return;
+      }
       final PluginHost host = await _spawn(config, resumeDumpId: resumeDumpId);
       // **插件 → 核心请求通道**（M9 §3）：插件主动下命令（station/command）在这里
       // 接线。生产路径已在 _spawn 里接好（建连即生效），这里再设一次是为了覆盖
@@ -752,11 +887,17 @@ class PluginBus {
       host.liveness.recordBeat();
       if (!_scopeOf(config).isValid) {
         // 无 team 归属的插件进不了站点体系（隔离要求四元组）：
-        // 走既有 tools/list 直接申报，保证工具仍可用（显式路径，不是静默降级）
-        _registerLegacyTools(
-          config.id,
-          await host.listTools(timeout: connectTimeout),
-        );
+        // 走既有 tools/list 直接申报，保证工具仍可用（显式路径，不是静默降级）。
+        //
+        // 片 D：`tools/list` 是**可选能力**——旧插件 / 只做站点的插件完全可以不实现。
+        // 取不到就当“这个插件没有工具”：不写专用日志、不造占位工具、不新增接口。
+        List<PluginToolInfo> tools = const <PluginToolInfo>[];
+        try {
+          tools = await host.listTools(timeout: connectTimeout);
+        } catch (_) {
+          // 故意静默：缺失 tools/list 不是故障，只是没有工具。
+        }
+        _registerLegacyTools(config.id, tools);
       }
       // 插件上线 = 工具表失效点（下次工具表刷新点会重新收集它的申报）
       invalidateToolTable(reason: '插件 ${config.id} 上线');
@@ -772,6 +913,106 @@ class PluginBus {
       _setLifecycle(config.id, PluginLifecycleState.failed);
       _emitStatus(config, 'disabled', reason: '$error');
     }
+  }
+
+  /// 拉起一个 UI 插件实例（片 D）。
+  ///
+  /// 与 stdio 路径的差别是**结构性的**，不是“少调一个接口”：
+  /// - 不调 `listTools`、不 `refreshToolDefinitions`、不注册任何工具；
+  /// - 不进 [_hosts]（stdio 状态池），因此看门狗不会拿它做心跳判定；
+  /// - 判活只有“进程是否退出”；`ui.hello` 只影响连接窗口内的 degraded 标记。
+  Future<void> _startUiOne(
+    PluginConfig config, {
+    required int generation,
+  }) async {
+    final UiHost host = await _spawnUi(config);
+    _uiHosts[config.id] = host;
+    _spawnedConfigs[config.id] = config;
+    _errors.remove(config.id);
+    _queueDepth[config.id] = 0;
+    _dead.remove(config.id);
+    _uiHelloSeen.remove(config.id);
+    _uiDegraded.remove(config.id);
+    invalidateToolTable(reason: 'UI 插件 ${config.id} 上线');
+    _armUiHelloWindow(config, host);
+    // 进程退出的唯一判活信号；无论正常/异常都从这里收尾。
+    unawaited(
+      host.exited.then((int code) => _onUiExit(config, host, code)),
+    );
+    _setLifecycle(config.id, PluginLifecycleState.ready);
+    _emitStatus(config, 'registered', degraded: false);
+    log?.call('UI 插件 ${config.id} 已拉起（第 $generation 代，pid=${host.pid}）');
+  }
+
+  Future<UiHost> _spawnUi(PluginConfig config) {
+    final UiHostFactory? factory = uiHostFactory;
+    if (factory != null) {
+      return factory(config, coreUrl: coreUrl, coreToken: coreToken);
+    }
+    return UiHost.start(config, coreUrl: coreUrl, coreToken: coreToken);
+  }
+
+  /// 开启 `ui.hello` 连接窗口。
+  ///
+  /// 窗口内没连上 **不杀进程**：UI 插件可能只是起得慢；只把面板状态降级并给出
+  /// 可读原因，等它后来连上再自动恢复。
+  void _armUiHelloWindow(PluginConfig config, UiHost host) {
+    _uiHelloWindows.remove(config.id)?.cancel();
+    _uiHelloWindows[config.id] = Timer(uiHelloWindow, () {
+      _uiHelloWindows.remove(config.id);
+      if (_uiHosts[config.id] != host || _uiHelloSeen.contains(config.id)) return;
+      final String reason =
+          'UI 插件 ${config.id} 启动后 ${uiHelloWindow.inSeconds}s 内没有 '
+          'ui.hello 连接（进程仍在运行）';
+      _uiDegraded[config.id] = reason;
+      log?.call(reason);
+      _emitStatus(config, 'registered', degraded: true, reason: reason);
+    });
+  }
+
+  /// UI 插件完成 `ui.hello`（由 [StationWsBridge.onUiHello] 回调）。
+  ///
+  /// 只认**当前世代**的宿主：热重启后旧连接迟到的 hello 不能洗白新实例。
+  void noteUiHello(String pluginId) {
+    if (!_uiHosts.containsKey(pluginId)) return;
+    _uiHelloSeen.add(pluginId);
+    _uiHelloWindows.remove(pluginId)?.cancel();
+    final String? previous = _uiDegraded.remove(pluginId);
+    if (previous != null) {
+      final PluginConfig? config = this.config(pluginId);
+      if (config != null) {
+        log?.call('UI 插件 $pluginId 已连上，解除降级');
+        _emitStatus(config, 'registered', degraded: false);
+      }
+    }
+  }
+
+  /// UI 插件进程退出收尾。
+  Future<void> _onUiExit(PluginConfig config, UiHost host, int code) async {
+    // 已经被 stop / restart 替换掉的旧世代：心跳表里没有它，不重复记状态。
+    if (_uiHosts[config.id] != host) return;
+    final bool restarting =
+        lifecycleOf(config.id) == PluginLifecycleState.restarting;
+    final bool stoppedByCore = host.stopRequested;
+    final bool crashed = !stoppedByCore && code != 0;
+    await _disconnect(config.id);
+    if (restarting) return;
+    if (crashed) {
+      _errors[config.id] = 'UI 插件进程异常退出（exit=$code）';
+      _setLifecycle(config.id, PluginLifecycleState.failed);
+      _emitStatus(
+        config,
+        'disabled',
+        reason: 'UI 插件进程异常退出（exit=$code）',
+      );
+      return;
+    }
+    // 正常停止（核心发起或插件自己 exit 0）一律是 stopped，不是 failed。
+    _emitStatus(
+      config,
+      'disabled',
+      reason: stoppedByCore ? 'UI 插件已停止' : 'UI 插件进程已退出（exit=$code）',
+    );
   }
 
   /// 推一条 plugin_status 增量（前端按 plugin_id + scope 合并）。
@@ -799,8 +1040,14 @@ class PluginBus {
         // 可选字段：生命周期阶段（与 status/health 是三个独立轴，见 plugin_lifecycle.dart）
         'lifecycle': lifecycleOf(config.id).wire,
         'generation': generationOf(config.id),
+        // 片 D：status / health 之外再标出运行形态；UI 的判活只有进程。
+        'runtime': config.runtimeInfo.value,
         if (reason.isNotEmpty) 'reason': reason,
         if (degraded != null) 'health': degraded ? 'degraded' : 'ok',
+        if (_uiHosts.containsKey(config.id)) ...<String, dynamic>{
+          'process_alive': !_uiHosts[config.id]!.isClosed,
+          'ui_hello_seen': _uiHelloSeen.contains(config.id),
+        },
         if (host != null) ...<String, dynamic>{
           'missed_heartbeats': host.liveness.missedCount,
           'heartbeat_interval_s': host.liveness.interval.inMilliseconds / 1000,
@@ -1326,7 +1573,7 @@ class PluginBus {
     await _disconnect(pluginId);
     await _startOne(pluginConfig);
     await refreshToolDefinitions();
-    return _hosts.containsKey(pluginId);
+    return _hasInstance(pluginId);
   }
 
   /// **用户显式强制停止**一个插件实例：全项目里唯一能“因为有人按了按钮”而 `kill()`
@@ -1350,8 +1597,18 @@ class PluginBus {
       for (final PluginHost host in _reaping)
         if (host.config.id == pluginId) host,
     ];
+    // 片 D：UI 实例不在收尸台账里（没有心跳判死），强停直接对进程下手。
+    final UiHost? uiTarget = _uiHosts[pluginId];
     await _disconnect(pluginId);
     int killed = 0;
+    if (uiTarget != null && !uiTarget.isClosed) {
+      await uiTarget.kill('用户显式强制停止 UI 插件 $pluginId');
+      killed++;
+      log?.call('UI 插件 $pluginId 被用户强制停止 ⇒ 显式 kill');
+    }
+    if (uiTarget != null) {
+      await uiTarget.close(waitForExit: true);
+    }
     for (final PluginHost host in targets) {
       if (host.exitedConfirmed) continue;
       if (host.killReason.isEmpty) {
@@ -1370,14 +1627,17 @@ class PluginBus {
       'plugin_id': pluginId,
       'killed': killed,
       // 退出确认逐个数：没有目标（本来就没在跑）也算干净，否则面板会报“停不掉”。
-      'exited': targets.every((PluginHost host) => host.exitedConfirmed),
+      'exited':
+          targets.every((PluginHost host) => host.exitedConfirmed) &&
+          (uiTarget == null || uiTarget.isClosed),
       'lifecycle': lifecycleOf(pluginId).wire,
       'generation': generationOf(pluginId),
       // 原因从**目标宿主本身**读：`_disconnect` 已经把实例从表里摸掉了，
       // 再走 [_pluginState] 那条路只会拿到空串（“杀了但说不清为什么杀的”）。
-      'kill_reason': targets
-          .map((PluginHost host) => host.killReason)
-          .firstWhere((String reason) => reason.isNotEmpty, orElse: () => ''),
+      'kill_reason': <String>[
+        if (uiTarget != null) uiTarget.killReason,
+        ...targets.map((PluginHost host) => host.killReason),
+      ].firstWhere((String reason) => reason.isNotEmpty, orElse: () => ''),
       'note':
           '强制停止只结束这一世：条目仍是启用时，下一次对账会把它再拉起来'
           '（想不再跑请关掉开关）',
@@ -1411,19 +1671,35 @@ class PluginBus {
     load();
     final String id = pluginId.trim();
     final PluginHost? live = _hosts[id];
+    final UiHost? uiLive = _uiHosts[id];
     final List<PluginHost> stragglers = <PluginHost>[
       for (final PluginHost host in _reaping)
         if (host.config.id == id && !host.exitedConfirmed) host,
     ];
-    if (live == null && stragglers.isEmpty) {
+    if (live == null && uiLive == null && stragglers.isEmpty) {
       // 没有在跑的实例、也没有待收尸的残留 ⇒ 这台核心没在持那些文件，可以放置。
       // 注意这里**不看条目是否存在**：一条 `enabled: false` 的条目照样可能刚刚被
       // 强制停止留下残留，那已经由上面两个集合覆盖。
       return '';
     }
-    if (live != null) {
+    if (live != null || uiLive != null) {
       // 优雅关闭 + 把状态推给前端（面板要看得见「它停了」，不然用户以为没点上）。
       await _stopPlugin(id, '为替换插件文件而停止（发布仓库安装；没有强杀）');
+    }
+    if (uiLive != null) {
+      // UI 插件没有心跳：只等“进程真的退出”。这里同样**不 kill**——换不掉就
+      // 回可读原因，由用户去走「强制停止」。
+      try {
+        await uiLive.exited.timeout(const Duration(seconds: 5));
+      } on TimeoutException {
+        return 'UI 插件 $id 的进程在 5 秒内没有确认退出（优雅停止已发出）'
+            '⇒ 这次**不动插件文件**，旧文件一个都没动。'
+            '等它退出后重试，或在面板上对它「强制停止」（那是唯一会强杀的动作）';
+      }
+      if (!uiLive.isClosed) {
+        return 'UI 插件 $id 的进程还没确认退出 ⇒ 这次**不动插件文件**。'
+            '等它退出后重试，或在面板上对它「强制停止」';
+      }
     }
     final List<PluginHost> pending = <PluginHost>[
       if (live != null && !live.exitedConfirmed) live,
@@ -1849,7 +2125,7 @@ class PluginBus {
     await _disconnect(pluginId);
     await _startOne(pluginConfig, resumeDumpId: dumpId);
     await refreshToolDefinitions();
-    final bool ok = _hosts.containsKey(pluginId);
+    final bool ok = _hasInstance(pluginId);
     final int generation = generationOf(pluginId);
     final String outcome = ok
         ? '插件 $pluginId 已热重启至第 $generation 代'
@@ -2470,7 +2746,10 @@ class PluginBus {
 
     // ① 文件里已消失的运行实例：断开并忘掉。放在最前面——被删掉的插件不该继续
     //    收事件、占着工具命名空间与站点订阅。
-    for (final String pluginId in _hosts.keys.toList(growable: false)) {
+    for (final String pluginId in <String>{
+      ..._hosts.keys,
+      ..._uiHosts.keys,
+    }) {
       if (next.containsKey(pluginId)) continue;
       const String reason = '配置条目已删除：实例已断开并忘掉（工具定义与站点订阅一并注销）';
       await _stopPlugin(pluginId, reason);
@@ -2527,7 +2806,7 @@ class PluginBus {
       if (!running) {
         // 进程退出 / 被关掉留下的残留实例先摘干净：_startOne 见到"实例表里已经有
         // 这个 id"会直接返回，那样会把一个死进程当成已就绪（假成功）。
-        if (_hosts.containsKey(config.id)) await _disconnect(config.id);
+        if (_hasInstance(config.id)) await _disconnect(config.id);
         final PluginReconcileAction action = await _startForReconcile(config);
         (action.kind == PluginReconcileKind.failed ? failed : started).add(
           action,
@@ -2600,8 +2879,14 @@ class PluginBus {
   /// 某插件此刻**真的在跑**吗（实例在表里且进程没退出）。
   bool _isRunning(String pluginId) {
     final PluginHost? host = _hosts[pluginId];
-    return host != null && !host.isClosed;
+    if (host != null && !host.isClosed) return true;
+    final UiHost? uiHost = _uiHosts[pluginId];
+    return uiHost != null && !uiHost.isClosed;
   }
+
+  /// 某插件是否有实例（含 UI；哪怕刚退出但还没收尸）。
+  bool _hasInstance(String pluginId) =>
+      _hosts.containsKey(pluginId) || _uiHosts.containsKey(pluginId);
 
   /// 拉起一个插件并归类成 started / restarted / failed（**单个插件的失败不外溢**）。
   Future<PluginReconcileAction> _startForReconcile(
@@ -2615,7 +2900,7 @@ class PluginBus {
       // 中断整轮对账"（失败隔离是对账口径的一部分，不是可选项）。
       _errors[config.id] = '$error';
     }
-    if (_hosts.containsKey(config.id)) {
+    if (_hasInstance(config.id)) {
       return PluginReconcileAction(
         kind: changed.isEmpty
             ? PluginReconcileKind.started
@@ -6369,12 +6654,17 @@ class PluginBus {
         continue;
       }
       final PluginHost? host = _hosts[config.id];
+      final UiHost? uiHost = _uiHosts[config.id];
       final String? error = _errors[config.id];
-      final bool degraded = host != null && host.liveness.isStale;
+      final String? uiDegradedReason = _uiDegraded[config.id];
+      final bool uiAlive = uiHost != null && !uiHost.isClosed;
+      final bool degraded =
+          (host != null && host.liveness.isStale) || uiDegradedReason != null;
       if (degraded) degradedCount++;
       final String displayName = (host != null && host.name.isNotEmpty)
           ? host.name
           : config.name;
+      final bool running = host != null && !host.isClosed || uiAlive;
       instances.add(<String, dynamic>{
         'plugin_id': config.id,
         'name': displayName,
@@ -6392,20 +6682,31 @@ class PluginBus {
             .toList(growable: false),
         'granularity': config.granularity,
         'scope': config.scope,
-        'status': error == null && host != null && !host.isClosed
-            ? 'registered'
-            : 'disabled',
+        'status': error == null && running ? 'registered' : 'disabled',
         // **只增键**（D11）：status / health 的产出值与改动前逐字一致，lifecycle 与
         // generation 是新增的可选读数（面板据此显示「重启中 / 已挂起」）。
         'lifecycle': lifecycleOf(config.id).wire,
         'generation': generationOf(config.id),
-        'health': host == null ? 'unavailable' : (degraded ? 'degraded' : 'ok'),
+        // 片 D：实例上也标明运行形态；UI 没有 stdio 心跳，判活字段换成进程语义。
+        'runtime': config.runtimeInfo.value,
+        'runtime_legacy': config.runtimeInfo.legacy,
+        'health': uiHost != null
+            ? (!uiAlive
+                  ? 'unavailable'
+                  : (uiDegradedReason == null ? 'ok' : 'degraded'))
+            : (host == null ? 'unavailable' : (degraded ? 'degraded' : 'ok')),
         if (host != null) ...<String, dynamic>{
           'missed_heartbeats': host.liveness.missedCount,
           'heartbeat_interval_s': host.liveness.interval.inMilliseconds / 1000,
           'last_heartbeat':
               (host.liveness.lastBeatAt?.millisecondsSinceEpoch ?? 0) ~/ 1000,
           'degraded_reason': degraded ? host.liveness.staleMessage : '',
+        },
+        if (uiHost != null) ...<String, dynamic>{
+          'process_alive': uiAlive,
+          'ui_hello_seen': _uiHelloSeen.contains(config.id),
+          'pid': uiHost.pid,
+          'degraded_reason': uiDegradedReason ?? '',
         },
         if (_queueDepth[config.id] != null)
           'queue_depth': _queueDepth[config.id],
@@ -6440,7 +6741,10 @@ class PluginBus {
   Future<void> close() async {
     _watchdogTimer?.cancel();
     _watchdogTimer = null;
-    for (final String pluginId in _hosts.keys.toList(growable: false)) {
+    for (final String pluginId in <String>{
+      ..._hosts.keys,
+      ..._uiHosts.keys,
+    }) {
       final PluginConfig? pluginConfig = config(pluginId);
       await _disconnect(pluginId);
       if (pluginConfig != null) _emitStatus(pluginConfig, 'destroyed');
@@ -6501,6 +6805,12 @@ class PluginBus {
 
   Future<void> _disconnect(String pluginId, {bool awaitExit = false}) async {
     final PluginHost? host = _hosts.remove(pluginId);
+    // 片 D：UI 宿主与 stdio 宿主是两张表。断开时两边都收：哪怕配置刚改成 ui
+    // （或反过来），也不会留下一个没人管的进程。
+    final UiHost? uiHost = _uiHosts.remove(pluginId);
+    _uiHelloWindows.remove(pluginId)?.cancel();
+    _uiHelloSeen.remove(pluginId);
+    _uiDegraded.remove(pluginId);
     // 实例没了 ⇒ "上次按什么参数起来的"这条记录也失效（重启会重新记）
     _spawnedConfigs.remove(pluginId);
     _queueDepth[pluginId] = 0;
@@ -6533,7 +6843,21 @@ class PluginBus {
     }
     // 插件下线 = 工具表失效点（模型工具表必须随之变化）
     invalidateToolTable(reason: '插件 $pluginId 下线');
-    if (host == null) return;
+    if (uiHost != null) {
+      try {
+        // UI 插件没有 stdio shutdown：只能发信号。awaitExit 只给“要看到退出码”的场景。
+        await uiHost.close(waitForExit: awaitExit);
+      } catch (error) {
+        log?.call('关闭 UI 插件 $pluginId 失败：$error');
+      }
+    }
+    if (host == null) {
+      if (uiHost != null &&
+          lifecycleOf(pluginId) != PluginLifecycleState.restarting) {
+        _setLifecycle(pluginId, PluginLifecycleState.stopped);
+      }
+      return;
+    }
     try {
       // 默认不等退出（D8）：“退没退”交给收尸台账按心跳判，不在这里卡住调用方。
       // `awaitExit: true` 只给“真的必须拿到退出码”的场景（Windows 替换二进制前的

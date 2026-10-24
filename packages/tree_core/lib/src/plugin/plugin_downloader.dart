@@ -7,6 +7,8 @@ import 'package:path/path.dart' as p;
 import 'builtin_plugins.dart'
     show BuiltinPluginCatalog, BuiltinPluginSpec, BuiltinRuntime;
 import 'plugin_host.dart' show PluginSuspension;
+import 'plugin_dependency.dart';
+import 'plugin_runtime.dart';
 
 /// 插件**发布**仓库（GitHub Releases）的默认坐标。
 ///
@@ -234,6 +236,7 @@ class PluginRepoEntry {
     this.granularity = 'team',
     this.scope = const <String, dynamic>{},
     this.installedVersion = '',
+    this.requires = const <PluginDependency>[],
   });
 
   final String id;
@@ -244,7 +247,10 @@ class PluginRepoEntry {
   /// 装完后用来拉起它的那个**目标文件名**（必在 [files] 的 target 里）。
   final String command;
 
-  /// `binary`（随包可执行文件）/ `python`（脚本，需要解释器）。
+  /// 清单声明的**原始** runtime（归一化口径见 `PluginRuntime`）。
+  ///
+  /// 索引里保留原值：旧清单的 `binary` / `python` 仍要如实展示，面板才能提示
+  /// 「清单待升级」；真正是否 UI 由归一化结果决定。
   final String runtime;
 
   final String description;
@@ -252,6 +258,9 @@ class PluginRepoEntry {
   final String suspension;
   final String granularity;
   final Map<String, dynamic> scope;
+
+  /// 依赖声明（索引里透传，安装前即可展示；启用时由依赖闸门复核）。
+  final List<PluginDependency> requires;
 
   /// 本机已落盘条目记的发布版本（没装过 = 空串）。
   final String installedVersion;
@@ -273,6 +282,12 @@ class PluginRepoEntry {
     'files': files.map((PluginRepoFile f) => f.toJson()).toList(),
     'suspension': suspension,
     'granularity': granularity,
+    if (requires.isNotEmpty)
+      'requires': <String, dynamic>{
+        'plugins': requires
+            .map((PluginDependency d) => d.toJson())
+            .toList(growable: false),
+      },
     'installed_version': installedVersion,
     'has_update': hasUpdate,
   };
@@ -919,12 +934,14 @@ class PluginDownloader {
     if (!files.any((PluginRepoFile f) => f.target == command)) {
       return (entry: null, error: '$id 的 command「$command」不在 files 的目标名里');
     }
+    // 片 D：runtime **不再按语言枚举白名单拒收**。任意值都接受，原样保留进
+    // 索引（面板要展示「清单待升级」），归一化交给 `PluginRuntime`：只有 ui /
+    // headless 两档，其余（含 binary / python / 未知值）一律 headless + legacy。
     final String runtime = (raw['runtime'] ?? 'binary').toString().trim();
-    if (runtime != 'binary' && runtime != 'python') {
-      return (
-        entry: null,
-        error: '$id 的 runtime 只能是 binary | python（当前：$runtime）',
-      );
+    final PluginDependencyParseResult requires =
+        parsePluginDependencies(raw['requires']);
+    if (requires.error != null) {
+      return (entry: null, error: '$id 的 ${requires.error}');
     }
     final String suspension = (raw['suspension'] ?? '').toString().trim();
     if (suspension.isNotEmpty && suspension != PluginSuspension.keep) {
@@ -964,6 +981,7 @@ class PluginDownloader {
         scope: rawScope is Map
             ? rawScope.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
             : <String, dynamic>{},
+        requires: requires.dependencies,
         installedVersion: (installed == null
             ? ''
             : (installed[kRepoVersionKey] ?? '').toString()),
@@ -1004,13 +1022,18 @@ class PluginDownloader {
         pluginId: id,
       );
     }
-    // 脚本型要先有解释器，否则装上去就是一条永远起不来的条目（那比不装更糟）。
+    // **旧清单兼容路径**：只有 legacy 的 `python` 清单（片 D 归一化为
+    // headless + legacy）才去找解释器——这是为了不写出「一条注定起不来」的旧配置；
+    // 它不是运行形态的分类维度。新清单一律直接用索引里的 `command`（要么是随包
+    // 可执行文件，要么已经在 command 里写清了解释器）。
     BuiltinRuntime? interpreter;
-    if (entry.runtime == 'python') {
+    final PluginRuntimeInfo runtimeInfo = PluginRuntime.parse(entry.runtime);
+    if (runtimeInfo.legacy &&
+        runtimeInfo.raw.trim().toLowerCase() == 'python') {
       final PluginRuntimeResolver? resolver = runtimeResolver;
       if (resolver == null) {
         return PluginInstallResult.failed(
-          '插件 $id 是脚本型（runtime=python），但这台核心没有接解释器解析：'
+          '插件 $id 是旧清单（runtime=python），但这台核心没有接解释器解析：'
           '不写一条注定起不来的配置',
           pluginId: id,
         );
@@ -1158,6 +1181,15 @@ class PluginDownloader {
       'enabled': true,
       'granularity': entry.granularity,
       'scope': entry.scope,
+      // 片 D：索引里的原始 runtime（含旧清单的 binary / python）要落进配置，
+      // 否则 UI 插件装完会被当成无头；legacy 标记由归一化统一给出。
+      if (entry.runtime.isNotEmpty) 'runtime': entry.runtime,
+      if (entry.requires.isNotEmpty)
+        'requires': <String, dynamic>{
+          'plugins': entry.requires
+              .map((PluginDependency d) => d.toJson())
+              .toList(growable: false),
+        },
       if (entry.suspension.isNotEmpty) 'suspension': entry.suspension,
       // 来源标记（展示用；行为一律不读它 —— 见 kRepoSourceKey 的注释）
       kRepoSourceKey: kRepoSourceValue,

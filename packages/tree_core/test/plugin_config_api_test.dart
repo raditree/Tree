@@ -769,6 +769,7 @@ void main() {
     String id = 'released',
     String version = '1.2.0',
     String target = 'fake_plugin.dart',
+    List<Map<String, dynamic>> requires = const <Map<String, dynamic>>[],
   }) => <String, dynamic>{
     'id': id,
     'name': '发布版假插件',
@@ -781,6 +782,8 @@ void main() {
     'suspension': PluginSuspension.keep,
     'granularity': 'team',
     'scope': <String, dynamic>{},
+    if (requires.isNotEmpty)
+      'requires': <String, dynamic>{'plugins': requires},
   };
 
   /// 指向临时目录的下载器（安装目标 = 临时 plugins/，与内置项查找路径同源）。
@@ -1335,5 +1338,214 @@ void main() {
     );
     expect(ghost.status, 404);
     expect(ghost.detail, contains('插件不存在：ghost'));
+  });
+
+  // ── 片 D：插件依赖闸门（409 / 自动补齐 / 卸载连带停用）──────────────────
+
+  test('缺依赖 ⇒ 409 + 可读清单；条目与进程都不动（安装 / 新增两条路一致）', () async {
+    final _Repo repo = _Repo();
+    repo.assets['app_plugin.dart'] = File(script).readAsBytesSync();
+    repo.publish(
+      plugins: <Map<String, dynamic>>[
+        releaseEntry(
+          id: 'app',
+          target: 'app_plugin.dart',
+          requires: <Map<String, dynamic>>[
+            <String, dynamic>{'id': 'base', 'version': '>=1.0 <2.0'},
+          ],
+        ),
+      ],
+    );
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve(
+          'enabled: true\nplugins: []\n',
+          downloader: releaseDownloader(repo),
+        );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+
+    final _Res install = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/app/install',
+    );
+    expect(install.status, 409, reason: install.json.toString());
+    expect(install.json['ok'], isFalse);
+    expect(install.json['plugin_id'], 'app');
+    expect(install.json['error'], contains('缺少依赖 base'));
+    final List<dynamic> missing =
+        install.json['missing_dependencies'] as List<dynamic>;
+    final Map<String, dynamic> issue =
+        (missing.single as Map<dynamic, dynamic>).cast<String, dynamic>();
+    expect(issue['id'], 'base');
+    expect(issue['installed'], isFalse);
+    expect(issue['by'], <String>['app']);
+    expect(diskEntry('app'), isEmpty, reason: '依赖不齐不得写条目');
+    expect(ctx.bus.instances(), isEmpty, reason: '进程不得启动');
+
+    final _Res created = await ctx.client.send(
+      'POST',
+      '/api/plugin/configs',
+      body: <String, dynamic>{
+        'id': 'app2',
+        'name': 'App2',
+        'command': Platform.resolvedExecutable,
+        'args': <String>[script],
+        'requires': <String, dynamic>{
+          'plugins': <Map<String, dynamic>>[
+            <String, dynamic>{'id': 'base', 'version': '>=1.0'},
+          ],
+        },
+      },
+    );
+    expect(created.status, 409, reason: created.json.toString());
+    expect(created.json['ok'], isFalse);
+    expect(created.json['plugin_id'], 'app2');
+    expect(
+      diskEntry('app2'),
+      isEmpty,
+      reason: '拦下时回滚，磁盘不能留一条“开着却永远起不来”的条目',
+    );
+  });
+
+  test('with_dependencies：只补齐缺失项，不升级既有插件', () async {
+    final _Repo repo = _Repo();
+    final List<int> source = File(script).readAsBytesSync();
+    repo.assets['base_plugin.dart'] = source;
+    repo.assets['app_plugin.dart'] = source;
+    repo.publish(
+      plugins: <Map<String, dynamic>>[
+        // 仓库里 base 已是 2.0.0，但本机装的是 1.0.0（满足要求）⇒ 不许顺手升级。
+        releaseEntry(
+          id: 'base',
+          version: '2.0.0',
+          target: 'base_plugin.dart',
+        ),
+        releaseEntry(
+          id: 'app',
+          version: '1.0.0',
+          target: 'app_plugin.dart',
+          requires: <Map<String, dynamic>>[
+            <String, dynamic>{'id': 'base', 'version': '>=1.0 <2.0'},
+          ],
+        ),
+      ],
+    );
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve(
+          <String>[
+            'enabled: true',
+            'plugins:',
+            '  - id: base',
+            '    name: Base',
+            '    command: "${Platform.resolvedExecutable.replaceAll('\\', '/')}"',
+            '    args: ["${script.replaceAll('\\', '/')}"]',
+            '    enabled: false',
+            '    version: 1.0.0',
+            '',
+          ].join('\n'),
+          downloader: releaseDownloader(repo),
+        );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+
+    final _Res install = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/app/install',
+      body: <String, dynamic>{'with_dependencies': true},
+    );
+    expect(install.status, 200, reason: install.json.toString());
+    expect(diskEntry('app')['repo_version'], '1.0.0');
+    expect(
+      diskEntry('base')['version'],
+      '1.0.0',
+      reason: '既有版本已满足 ⇒ 绝不升级',
+    );
+    expect(diskEntry('base')['repo_version'], isNull, reason: '旧条目一字未动');
+    expect(
+      File(p.join(pluginDir, 'base_plugin.dart')).existsSync(),
+      isFalse,
+      reason: '没有下载 base 的新版本',
+    );
+    expect(ctx.bus.instances(), hasLength(1), reason: '只拉起新装的 app');
+  });
+
+  test('卸载被依赖插件：未确认 ⇒ 409 列出依赖方；确认后停用依赖方（不卸载）', () async {
+    final _Repo repo = _Repo();
+    repo.assets['base_plugin.dart'] = File(script).readAsBytesSync();
+    repo.publish(
+      plugins: <Map<String, dynamic>>[
+        releaseEntry(id: 'base', version: '1.0.0', target: 'base_plugin.dart'),
+      ],
+    );
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve(
+          'enabled: true\nplugins: []\n',
+          downloader: releaseDownloader(repo),
+        );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+    expect(
+      (await ctx.client.send('POST', '/api/plugin/release/base/install')).status,
+      200,
+    );
+    final _Res created = await ctx.client.send(
+      'POST',
+      '/api/plugin/configs',
+      body: <String, dynamic>{
+        'id': 'app',
+        'name': 'App',
+        'command': Platform.resolvedExecutable,
+        'args': <String>[script],
+        'requires': <String, dynamic>{
+          'plugins': <Map<String, dynamic>>[
+            <String, dynamic>{'id': 'base', 'version': '>=1.0'},
+          ],
+        },
+      },
+    );
+    expect(created.status, 200, reason: created.json.toString());
+    expect(diskEntry('app')['enabled'], isTrue);
+
+    final _Res blocked = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/base/uninstall',
+    );
+    expect(blocked.status, 409, reason: blocked.json.toString());
+    expect(blocked.json['error'], contains('正被'));
+    final List<dynamic> dependents = blocked.json['dependents'] as List<dynamic>;
+    expect(
+      (dependents.single as Map<dynamic, dynamic>)['id'],
+      'app',
+      reason: '确认前必须看清会停用谁',
+    );
+    expect(diskEntry('base'), isNotEmpty, reason: '未确认：文件与条目都不动');
+    expect(diskEntry('app')['enabled'], isTrue);
+
+    final _Res confirmed = await ctx.client.send(
+      'POST',
+      '/api/plugin/release/base/uninstall',
+      body: <String, dynamic>{'confirm_dependents': true},
+    );
+    expect(confirmed.status, 200, reason: confirmed.json.toString());
+    final Map<String, dynamic> uninstall =
+        confirmed.json['uninstall'] as Map<String, dynamic>;
+    expect(uninstall['dependents_disabled'], <String>['app']);
+    expect(uninstall['dependents_failed'], <String, String>{});
+    expect(
+      diskEntry('base'),
+      isEmpty,
+      reason: '自定义条目整条删掉（与普通卸载同一条命）',
+    );
+    expect(
+      diskEntry('app')['enabled'],
+      isFalse,
+      reason: '依赖方被停用，但条目保留（不是卸载）',
+    );
   });
 }

@@ -121,6 +121,16 @@ plugins:
     command: dart
     runtime: node
     enabled: false
+  - id: legacy.binary
+    name: Legacy Binary
+    command: dart
+    runtime: binary
+    enabled: false
+  - id: legacy.python
+    name: Legacy Python
+    command: dart
+    runtime: python
+    enabled: false
   - id: no.runtime
     name: No Runtime
     command: dart
@@ -285,6 +295,28 @@ plugins:
         isNotEmpty,
       );
       await ghost.closed;
+    });
+
+    test('片 D：只有归一化 ui 能连；binary/python/未知/空 runtime 一律拒绝', () async {
+      for (final String pluginId in <String>[
+        'legacy.binary',
+        'legacy.python',
+        'headless.one',
+        'no.runtime',
+      ]) {
+        final _WsClient ws = await _connect(server);
+        sockets.add(ws);
+        ws.send(_hello(pluginId));
+        await ws.until(
+          (Map<String, dynamic> f) =>
+              f['type'] == WsOutboundType.error &&
+              ((f['data'] as Map<String, dynamic>)['error'] as String).contains(
+                '不是 ui',
+              ),
+          reason: '$pluginId 不是 ui，必须拒绝',
+        );
+        await ws.closed;
+      }
     });
 
     test('站点注销 / 插件下线 → closed + reason', () async {

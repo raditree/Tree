@@ -19,6 +19,7 @@ import 'package:tree_protocol/tree_protocol.dart';
 
 import '../ws/ws_hub.dart';
 import 'plugin_host.dart';
+import 'plugin_runtime.dart';
 import 'station_channel.dart';
 import 'station_ids.dart';
 import 'station_instance.dart';
@@ -34,6 +35,7 @@ class StationWsBridge {
     required this.configs,
     this.routes,
     this.log,
+    this.onUiHello,
     this.queueCapacity = WsConnectionOutbox.defaultQueueCapacity,
   });
 
@@ -50,6 +52,11 @@ class StationWsBridge {
   final List<ApiMetaRoute> Function()? routes;
 
   final void Function(String message)? log;
+
+  /// 片 D：UI 插件成功完成 `ui.hello` 后通知总线（用于 30s 连接窗口判活）。
+  ///
+  /// 桥只负责“身份通过”这一事实，不关心宿主怎么记状态。
+  final void Function(String pluginId)? onUiHello;
 
   /// 每条连接的投递队列上限。
   final int queueCapacity;
@@ -70,12 +77,10 @@ class StationWsBridge {
 
   /// `ui.hello` 是否接受该运行形态。
   ///
-  /// 片 B 以 `ui` 为准；旧版 plugins.yaml 里的 `binary` / `python` 也接受
-  /// （任务 2.2 的兼容口径）。缺省空串**不接受**——没声明就不能当 UI。
-  static bool isUiRuntime(String runtime) {
-    final String value = runtime.trim().toLowerCase();
-    return value == 'ui' || value == 'binary' || value == 'python';
-  }
+  /// **片 D 口径**：只认归一化后的 `ui`。`binary` / `python` / 空串 / 任意未知值
+  /// 按 `headless` 处理，不允许作为 UI 连接（旧清单要用 UI 必须显式升级为
+  /// `runtime: ui`）。
+  static bool isUiRuntime(String runtime) => PluginRuntime.isUi(runtime);
 
   /// 处理一条上行帧；返回是否由本桥消费。
   bool handleFrame(WsConnection connection, Map<String, dynamic> frame) {
@@ -272,6 +277,7 @@ class StationWsBridge {
     }
     state.bond = _UiBond(pluginId, version, capabilities);
     log?.call('UI 连接 ${connection.id} 已绑定插件 $pluginId（$version）');
+    onUiHello?.call(pluginId);
   }
 
   void _handleSubscribe(WsConnection connection, Map<String, dynamic> frame) {

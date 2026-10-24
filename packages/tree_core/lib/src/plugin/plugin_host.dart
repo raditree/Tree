@@ -5,6 +5,8 @@ import 'dart:io';
 import 'package:tree_protocol/tree_protocol.dart' show PluginRpcMethods;
 
 import '../util/liveness.dart';
+import 'plugin_dependency.dart';
+import 'plugin_runtime.dart';
 import 'station_runtime.dart';
 import 'station_scope.dart';
 
@@ -774,9 +776,13 @@ class PluginConfig {
     Map<String, dynamic>? scope,
     this.suspension = PluginSuspension.none,
     this.runtime = '',
+    this.version = '',
+    this.repoVersion = '',
+    List<PluginDependency>? requires,
   }) : args = args ?? <String>[],
        env = env ?? <String, String>{},
-       scope = scope ?? <String, dynamic>{};
+       scope = scope ?? <String, dynamic>{},
+       requires = requires ?? const <PluginDependency>[];
 
   final String id;
   final String name;
@@ -809,11 +815,41 @@ class PluginConfig {
 
   /// 声明的运行形态（`plugins.yaml` 的 `runtime`，缺省空串）。
   ///
-  /// 片 B 只用它做 **UI 连接身份**校验（`ui.hello` 的 plugin_id 必须命中一条
-  /// `runtime: ui` 的声明；旧文件里的 `binary` / `python` 也接受，见
-  /// `StationWsBridge.isUiRuntime`）。真正的「UI / 无头」启动分流与依赖收敛
-  /// 留给片 D，这里**不**参与宿主选择，也不写进对外 API 快照。
+  /// 片 D 起它是**唯一的运行形态口径**：只有 `ui` / `headless` 两档，其余值
+  /// （空串、`binary`、`python`、未知值）归一化为 `headless` 并标记 legacy
+  /// （见 [PluginRuntime]）。真正的启动分流在 `PluginBus._startOne`。
   final String runtime;
+
+  /// 清单声明的版本（`version`，可空）。
+  final String version;
+
+  /// 从发布仓库安装时记下的版本（`repo_version`，可空）。
+  ///
+  /// 与 [version] 分开保存是为了**不回改**磁盘上的字段形状：依赖闸门取两者的
+  /// 有效值（[effectiveVersion]），但不凭空往 `plugins.yaml` 写一个新键。
+  final String repoVersion;
+
+  /// 依赖声明（`requires.plugins`）；空表 = 无依赖。
+  final List<PluginDependency> requires;
+
+  /// 归一化后的运行形态（`ui` / `headless`）+ legacy 标记。
+  PluginRuntimeInfo get runtimeInfo => PluginRuntime.parse(runtime);
+
+  PluginRuntimeKind get runtimeKind => runtimeInfo.kind;
+
+  bool get runtimeIsLegacy => runtimeInfo.legacy;
+
+  /// 依赖闸门用来比较的“本机版本”：显式 `version` 优先，其次发布仓库版本。
+  String get effectiveVersion =>
+      version.trim().isNotEmpty ? version.trim() : repoVersion.trim();
+
+  /// 依赖判定的输入投影。
+  PluginDependencyInput get dependencyInput => PluginDependencyInput(
+    id: id,
+    version: effectiveVersion,
+    dependencies: requires,
+    enabled: enabled,
+  );
 
   /// 这个插件能不能挂起（热重启走"转储→取回"而不是直接重启）。
   bool get canSuspend => suspension == PluginSuspension.keep;
@@ -833,6 +869,13 @@ class PluginConfig {
     if (suspension.isNotEmpty) 'suspension': suspension,
     // 同 suspension：只有声明了才写回，空串不让配置文档多一行噪声。
     if (runtime.isNotEmpty) 'runtime': runtime,
+    if (version.isNotEmpty) 'version': version,
+    if (requires.isNotEmpty)
+      'requires': <String, dynamic>{
+        'plugins': requires
+            .map((PluginDependency d) => d.toJson())
+            .toList(growable: false),
+      },
   };
 
   /// 前端形态（`GET /api/plugin/snapshot` 的 config 段）。
@@ -845,6 +888,14 @@ class PluginConfig {
     'enabled': enabled,
     'granularity': granularity,
     'suspension': suspension,
+    // 片 D：运行形态的唯一口径（原始值仍在 toJson / 发布索引里保留）。
+    'runtime': runtimeInfo.value,
+    'runtime_legacy': runtimeInfo.legacy,
+    'requires': <String, dynamic>{
+      'plugins': requires
+          .map((PluginDependency d) => d.toJson())
+          .toList(growable: false),
+    },
   };
 
   static PluginConfig fromJson(Map<String, dynamic> json) => PluginConfig(
@@ -875,10 +926,20 @@ class PluginConfig {
     suspension: (json['suspension'] is String)
         ? (json['suspension'] as String).trim()
         : PluginSuspension.none,
-    // 宽读：没写 / 非字符串 ⇒ 空串；片 D 才用真正语义，这里只供身份校验。
+    // 宽读：没写 / 非字符串 ⇒ 空串。归一化（ui / headless + legacy）在
+    // [PluginRuntime] 里完成，这里只保留清单原值。
     runtime: (json['runtime'] is String)
         ? (json['runtime'] as String).trim()
         : '',
+    version: (json['version'] is String)
+        ? (json['version'] as String).trim()
+        : '',
+    repoVersion: (json['repo_version'] is String)
+        ? (json['repo_version'] as String).trim()
+        : '',
+    // 形状已在 PluginConfigStore 校验；这里做纯解析，非法项丢弃（不会把插件
+    // 变成"读不出来"）。依赖闸门只对解析出来的声明负责。
+    requires: parsePluginDependencies(json['requires']).dependencies,
   );
 }
 
