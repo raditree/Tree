@@ -24,9 +24,13 @@ class StationSubscriber {
     required this.scope,
     this.subscribedAt = 0,
     this.disabled = false,
+    this.channelId = '',
   });
 
   /// 插件 id（下线时由总线按此注销其全部订阅）。
+  ///
+  /// 它仍是**归属 / 权限判据**：连接维度只用来区分同插件的多条连接，
+  /// 不改变“这条订阅属于哪个插件”。
   final String pluginId;
 
   /// 订阅声明 scope（可**更细**于消息 scope，但不得放大；见 StationIsolation）。
@@ -38,8 +42,25 @@ class StationSubscriber {
   /// 是否被站点所有者**禁用**（true = 保留订阅但触发时不投递）。
   final bool disabled;
 
+  /// **连接维度**（WS 订阅者用；stdio 插件为空串）。
+  ///
+  /// 为什么需要它：同一 UI 插件的两个窗口各自订阅同站时，若身份键仍是
+  /// `plugin_id|scope`，第二窗口会覆盖第一窗口的回包函数，只有一条连接收到投递。
+  /// 把连接 id 纳入键位后：同插件同站的多条连接彼此独立，各自收到一份。
+  ///
+  /// **不落盘**：连接是运行期对象，重启后由连接重建（见 [persistent]）。
+  final String channelId;
+
+  /// 是否持久化（stdio 插件订阅是；WS 连接订阅不是）。
+  bool get persistent => channelId.isEmpty;
+
   /// 订阅键位（同一站内唯一）。
-  String get key => '$pluginId|${scope.key}';
+  ///
+  /// 空 [channelId] 时保持历史形状 `plugin_id|scope`（stdio 订阅的落盘键位
+  /// 与旧版逐字一致）；有连接维度时追加 `|channel_id=…`，让多窗口互不覆盖。
+  String get key => channelId.isEmpty
+      ? '$pluginId|${scope.key}'
+      : '$pluginId|${scope.key}|channel_id=$channelId';
 
   /// 序列化（落盘）。
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -98,6 +119,8 @@ class StationRequest {
     this.payload,
     this.meta = const <String, dynamic>{},
     this.schema,
+    this.topic,
+    this.originPluginId = '',
   });
 
   /// 请求 id（回包关联用；插件应原样回传）。
@@ -123,6 +146,15 @@ class StationRequest {
 
   /// 收集站 schema（订阅者必须按它产出；其它站为 null）。
   final StationSchema? schema;
+
+  /// 广播事件 topic（仅广播站有；存在 meta `topic` 里，这里给 WS 通道直读）。
+  ///
+  /// **不写进 [toJson]**：stdio 插件的请求报文与改动前逐字一致，插件继续从
+  /// `meta.topic` 读；这个字段只服务进程内的通道实现（WS `station_delivery`）。
+  final String? topic;
+
+  /// 发布方插件 id（自环判定用；stdio 报文同样不带它）。
+  final String originPluginId;
 
   /// 序列化（stdio 报文 / 日志）。
   Map<String, dynamic> toJson() => <String, dynamic>{

@@ -25,6 +25,7 @@ import '../plugin/plugin_bus.dart';
 import '../plugin/plugin_config_store.dart';
 import '../plugin/plugin_downloader.dart';
 import '../plugin/station_scope.dart';
+import '../plugin/station_ws_bridge.dart';
 import '../settings/core_settings.dart';
 import '../settings/ssh_config.dart';
 import '../spec/builtin_spec_assets.dart';
@@ -135,6 +136,14 @@ class CoreServer {
   /// `lib/ui/widgets/pdf_preview.dart`），最后一项桩随之删除。保留这套机制给后续
   /// 新接口用——「前端会调、核心静默 404」的灰区比多条空集合更值得防。
   static const Set<String> stubApiPaths = <String>{};
+
+  /// 核心 HTTP API 的版本（`/api/meta.api_version`）。
+  ///
+  /// 与插件配置里的 `requires.api` 对比用；片 B 固定 1.0，协议形状变化才升。
+  static const String apiVersion = '1.0';
+
+  /// UI 插件 ⇄ 站点总线的 WS 接线；插件系统未启用（测试 / 最小骨架）时为 null。
+  StationWsBridge? _stationWsBridge;
 
   final HttpServer _http;
 
@@ -763,6 +772,15 @@ class CoreServer {
       errorLog?.call('执行站挂载位置接线不完整：$mountError');
     }
     _wirePluginRelayPoints(bus);
+    // 片 B：UI 插件的 WS 站点总线。桥只做「连接身份 + 广播站订阅 + 四态投递 +
+    // 自建站生命周期」，不碰 REST 委派（片 C）也不决定 UI 启动方式（片 D）。
+    final StationWsBridge bridge = _stationWsBridge ??= StationWsBridge(
+      stations: bus.stations,
+      configs: bus.configs,
+      log: (String message) => errorLog?.call('[core:station/ws] $message'),
+    );
+    bus.stations.onStationRemoved = bridge.onStationRemoved;
+    bus.onPluginOffline = bridge.onPluginOffline;
   }
 
   /// **点位化（2026-10-01）：把 LLM 侧的中转点接上插件总线**。
@@ -1377,8 +1395,14 @@ class CoreServer {
               Future<void>.value(),
         );
         hub.unregister(connection.id);
+        // 片 B：连接断开 = 该窗口的订阅全部失效；若是这个 UI 插件的最后一条
+        // 连接，它自建的广播站也一起注销（站点移除钩子会给其它订阅者补 closed）。
+        _stationWsBridge?.onConnectionClosed(connection);
       },
-      onError: (Object _) => hub.unregister(connection.id),
+      onError: (Object _) {
+        hub.unregister(connection.id);
+        _stationWsBridge?.onConnectionClosed(connection);
+      },
       cancelOnError: true,
     );
     // **插件面板补发**：插件的槽位声明是"启动时发一次"的，前端刷新 / 重连 / 启动
@@ -1454,6 +1478,29 @@ class CoreServer {
         break;
       case WsInboundType.pluginUiAction:
         _handlePluginUiAction(connection, frame);
+        break;
+      // ── UI 插件 ⇄ 站点总线（片 B） ─────────────────────────────────────
+      // ui.hello 是连接身份；其余五条在没有插件系统时也必须给可读拒绝，
+      // 不能像未知帧那样静默忽略（否则 UI 只会看到“没反应”）。
+      case WsInboundType.uiHello:
+      case WsInboundType.stationSubscribe:
+      case WsInboundType.stationUnsubscribe:
+      case WsInboundType.stationRegister:
+      case WsInboundType.stationUnregister:
+      case WsInboundType.stationTrigger:
+        final StationWsBridge? bridge = _stationWsBridge;
+        if (bridge == null) {
+          connection.send(<String, dynamic>{
+            'type': WsOutboundType.error,
+            'data': <String, dynamic>{
+              'ok': false,
+              'error': '核心未启用插件系统，UI 站点总线不可用',
+              'message': '核心未启用插件系统，UI 站点总线不可用',
+            },
+          });
+        } else {
+          bridge.handleFrame(connection, frame);
+        }
         break;
       // ── 集成终端（Ctrl+J） ──────────────────────────────────────────
       // 四条都要显式处理：静默忽略会让用户对着打不了字的终端猜（完备性门禁也拦）。
@@ -1646,6 +1693,9 @@ class CoreServer {
     router.add('GET', ApiPaths.workspaceGitLog, _workspaceGitLog);
     router.add('GET', ApiPaths.workspaceGitBranches, _workspaceGitBranches);
     router.add('GET', ApiPaths.pluginSnapshot, _pluginSnapshot);
+    // 发现面（片 B）：UI 插件启动后据此判断核心能力、可订阅广播站与委派路由。
+    // routes 在片 C 之前为空数组（不编造静态清单）。
+    router.add('GET', ApiPaths.meta, _apiMeta);
     // 插件清单的读写面（M9 §4.2）：与只读快照分工见 ApiPaths.pluginConfigs 的注释。
     router.add('GET', ApiPaths.pluginConfigs, _listPluginConfigs);
     router.add('POST', ApiPaths.pluginConfigs, _createPluginConfig);
@@ -3709,6 +3759,14 @@ class CoreServer {
     );
     if (await _writeResultError(request, result)) return;
     await writeJson(request, 200, result);
+  }
+
+  Future<void> _apiMeta(HttpRequest request, Map<String, String> _) async {
+    final StationWsBridge? bridge = _stationWsBridge;
+    final ApiMeta meta =
+        bridge?.buildMeta(coreVersion: version, apiVersion: apiVersion) ??
+        ApiMeta(coreVersion: version, apiVersion: apiVersion);
+    await writeJson(request, 200, meta.toJson());
   }
 
   Future<void> _pluginSnapshot(

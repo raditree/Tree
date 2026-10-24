@@ -264,10 +264,10 @@ void main() {
       final Set<String> stubs = server.stubRouter.patterns;
 
       // 插件化片 A 只做协议面（tree_protocol），核心实现分批落地：
-      // `/api/meta` 在片 B，`/bootstrap` 与 `/api/bootstrap/session` 在片 E。
+      // `/api/meta` 已在片 B 落地（见 `_apiMeta`），只剩 `/bootstrap` 与
+      // `/api/bootstrap/session` 等片 E 实现。
       // 与 `stubApiPaths` 同口径：**不许长期挂着**，实现一条就从这里删一条。
       final Set<String> pendingImplementation = <String>{
-        ApiPaths.meta,
         ApiPaths.bootstrap,
         ApiPaths.bootstrapSession,
       };

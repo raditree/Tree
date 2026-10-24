@@ -765,6 +765,7 @@ class PluginConfig {
     this.granularity = 'team',
     Map<String, dynamic>? scope,
     this.suspension = PluginSuspension.none,
+    this.runtime = '',
   }) : args = args ?? <String>[],
        env = env ?? <String, String>{},
        scope = scope ?? <String, dynamic>{};
@@ -798,6 +799,14 @@ class PluginConfig {
   /// 它们**——写在顶层却不建字段，结果就是"用户配了、核心读了个空"这种难查的错。
   final String suspension;
 
+  /// 声明的运行形态（`plugins.yaml` 的 `runtime`，缺省空串）。
+  ///
+  /// 片 B 只用它做 **UI 连接身份**校验（`ui.hello` 的 plugin_id 必须命中一条
+  /// `runtime: ui` 的声明；旧文件里的 `binary` / `python` 也接受，见
+  /// `StationWsBridge.isUiRuntime`）。真正的「UI / 无头」启动分流与依赖收敛
+  /// 留给片 D，这里**不**参与宿主选择，也不写进对外 API 快照。
+  final String runtime;
+
   /// 这个插件能不能挂起（热重启走"转储→取回"而不是直接重启）。
   bool get canSuspend => suspension == PluginSuspension.keep;
 
@@ -814,6 +823,8 @@ class PluginConfig {
     // 只在声明了可挂起时写这一条：没声明的插件的配置文档与改动前逐字一致
     //（未知键不写回比"多一个空键"更干净，也免得用户以为"写了 keep 之外的值也行"）。
     if (suspension.isNotEmpty) 'suspension': suspension,
+    // 同 suspension：只有声明了才写回，空串不让配置文档多一行噪声。
+    if (runtime.isNotEmpty) 'runtime': runtime,
   };
 
   /// 前端形态（`GET /api/plugin/snapshot` 的 config 段）。
@@ -856,6 +867,10 @@ class PluginConfig {
     suspension: (json['suspension'] is String)
         ? (json['suspension'] as String).trim()
         : PluginSuspension.none,
+    // 宽读：没写 / 非字符串 ⇒ 空串；片 D 才用真正语义，这里只供身份校验。
+    runtime: (json['runtime'] is String)
+        ? (json['runtime'] as String).trim()
+        : '',
   );
 }
 

@@ -23,6 +23,7 @@ import 'plugin_state_pool.dart';
 import 'plugin_tool_definition.dart';
 import 'plugin_ui_bridge.dart';
 import 'station_ids.dart';
+import 'station_channel.dart';
 import 'station_instance.dart';
 import 'station_points.dart';
 import 'station_runtime.dart';
@@ -192,6 +193,13 @@ class PluginBus {
 
   /// WS 下行广播（plugin_status / plugin_event / 插件 UI 帧）；null = 不推。
   final void Function(Map<String, dynamic> frame)? broadcast;
+
+  /// **插件下线钩子**（片 B：给 WS 订阅者补 `closed`）。
+  ///
+  /// 自建站不会随插件退出自动注销（这是既有语义，故意保留给“插件回来还能接着用”），
+  /// 所以站点表的移除钩子覆盖不到「插件下线」这条路；总线在这里显式通知接线方。
+  /// 回调必须**同步且不抛异常**。
+  void Function(String pluginId)? onPluginOffline;
 
   /// 站点中枢（四站、订阅、落盘；落点 = <数据根>/config/stations.yaml）。
   final StationHub stations;
@@ -1496,6 +1504,13 @@ class PluginBus {
         if (_stationKept.remove(pluginId)) {
           stations.unsubscribePlugin(pluginId);
           log?.call('$why ⇒ 补上重启窗口里押后的订阅注销（不再保活）');
+        }
+        // 片 B：WS 订阅者不是站点表里的持久订阅，没有 stdio 的“插件下线自动退订”
+        // 这条路径；它们必须收到显式的 `closed`，否则会一直等不会再来的事件。
+        try {
+          onPluginOffline?.call(pluginId);
+        } catch (error) {
+          log?.call('插件下线钩子异常（$pluginId）：$error');
         }
         _abandonBuffered(pluginId, '$why ⇒ 这些请求不再等待，各自的调用点按既有 fail-open 兜底');
         break;
@@ -5053,15 +5068,8 @@ class PluginBus {
   /// 名段只允许 `[A-Za-z0-9_-]`：它是 id 的一部分，混入 `.` / `@` / 空白会让
   /// 归属前缀判定（`plugin.{id}.`）产生歧义——例如插件 `a` 建 `b.relay.x`
   /// 就能顶掉插件 `a.b` 的站点。
-  static String? _checkSelfBuiltName(String name) {
-    if (name.isEmpty) {
-      return '自建站点需要 name（站点 id 为 plugin.<插件id>.<类型>.<name>）';
-    }
-    if (!RegExp(r'^[A-Za-z0-9_-]+$').hasMatch(name)) {
-      return '自建站点的 name 只允许字母 / 数字 / 下划线 / 连字符，收到「$name」';
-    }
-    return null;
-  }
+  static String? _checkSelfBuiltName(String name) =>
+      StationHubIds.selfBuiltNameError(name);
 
   /// 自建站归属校验（返回 null = 属于该插件）。
   static String? _selfBuiltOwnershipError(String pluginId, String stationId) {
@@ -5244,6 +5252,31 @@ class PluginBus {
     // 都写在 [_supersedeCarriedSubscriptions]）。**必须先清旧的再挂新的**，顺序反了
     // 就会把刚挂上的这一世一起摘掉。
     _supersedeCarriedSubscriptions(config.id);
+    // 站点 → 插件的回包通道与收集站同一条（`station/request`），不发明新协议。
+    //
+    // **回包函数延迟解析宿主**（不在订阅时固定 host 实例）：插件可以在
+    // `hello` 握手期间就发订阅请求（此时 `_hosts` 还没登记），若在此刻取
+    // `_hosts[config.id]` 会把「启动即订阅」的插件误判成"实例不在运行"。
+    //
+    // **先判 lifecycle、再判宿主**（阶段 2 保活的唯一入口）：重启窗口里旧宿主可能
+    // 还在表里，把请求递给它等于亲手制造一次失败；而此刻没有宿主也不该直接回
+    // failed——那是「暂时不可用」，不是「这个插件不干了」。
+    final StationSubscriberChannel channel = StdioStationSubscriberChannel((
+      StationRequest request,
+    ) async {
+      if (_isKeepaliveWindow(config.id)) {
+        return restartBuffer.push(
+          config.id,
+          request,
+          (StationRequest r) => _deliverStationRequest(config.id, r),
+        );
+      }
+      final PluginHost? host = _hosts[config.id];
+      if (host == null || host.isClosed) {
+        return StationReply.failed('插件 ${config.id} 未运行，无法处理站点请求');
+      }
+      return host.requestStation(request);
+    });
     final StationSubResult result = stations.subscribe(
       station.id,
       StationSubscriber(
@@ -5251,29 +5284,7 @@ class PluginBus {
         scope: scope,
         subscribedAt: _nowSeconds(),
       ),
-      // 站点 → 插件的回包通道与收集站同一条（`station/request`），不发明新协议。
-      //
-      // **回包函数延迟解析宿主**（不在订阅时固定 host 实例）：插件可以在
-      // `hello` 握手期间就发订阅请求（此时 `_hosts` 还没登记），若在此刻取
-      // `_hosts[config.id]` 会把「启动即订阅」的插件误判成"实例不在运行"。
-      //
-      // **先判 lifecycle、再判宿主**（阶段 2 保活的唯一入口）：重启窗口里旧宿主可能
-      // 还在表里，把请求递给它等于亲手制造一次失败；而此刻没有宿主也不该直接回
-      // failed——那是「暂时不可用」，不是「这个插件不干了」。
-      (StationRequest request) async {
-        if (_isKeepaliveWindow(config.id)) {
-          return restartBuffer.push(
-            config.id,
-            request,
-            (StationRequest r) => _deliverStationRequest(config.id, r),
-          );
-        }
-        final PluginHost? host = _hosts[config.id];
-        if (host == null || host.isClosed) {
-          return StationReply.failed('插件 ${config.id} 未运行，无法处理站点请求');
-        }
-        return host.requestStation(request);
-      },
+      channel.deliver,
       replace: params['replace'] == true,
     );
     if (!result.ok) {

@@ -179,6 +179,13 @@ class StationHub {
   /// （见 `PluginBus._outbound`），否则前端重连时卡片槽位回不来。
   void Function(Map<String, dynamic> frame)? frameSink;
 
+  /// **站点移除钩子**（注销 / 显式退订不会误触发；只在站点从表里消失时调用）。
+  ///
+  /// UI 侧 WS 订阅者不落盘，也没有 stdio 的“插件下线自动退订”路径；
+  /// 它们靠这个钩子收到 `station_delivery.closed`，避免 UI 以为站点还在、
+  /// 一直等永远不会来的事件。回调必须**同步且不抛异常**。
+  void Function(String stationId, String reason)? onStationRemoved;
+
   /// 心跳间隔 I（默认 10s；测试可缩参）。
   final Duration heartbeatInterval;
 
@@ -572,6 +579,12 @@ class StationHub {
     _stations.remove(stationId);
     save();
     log?.call('站点已注销：$stationId（连带 ${station.subscribers.length} 条订阅）');
+    try {
+      onStationRemoved?.call(stationId, '站点已注销：$stationId');
+    } catch (error) {
+      // 钩子只做投递通知；它失败不能反过来影响站点注销本身。
+      log?.call('站点移除钩子异常（$stationId）：$error');
+    }
     return true;
   }
 
@@ -718,6 +731,8 @@ class StationHub {
       scope: old.scope,
       subscribedAt: old.subscribedAt,
       disabled: disabled,
+      // 连接维度必须原样保留，否则键位从多窗口形状退回历史形状，禁用会找错条目。
+      channelId: old.channelId,
     );
     save();
     log?.call(

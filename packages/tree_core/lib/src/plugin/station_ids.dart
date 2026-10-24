@@ -290,4 +290,18 @@ abstract final class StationHubIds {
 
   /// 退役 id 集合（迁移判定用；它们不再出现在 [all] 里）。
   static const Set<String> retired = <String>{legacyRelay, legacyExecute};
+
+  /// 自建站 `name` 名段校验（返回 null = 合法）。
+  ///
+  /// 插件通道（`station/register`）与 UI 通道（WS）必须同一口径：否则同名站点
+  /// 在一边能建、另一边不能建，用户无法判断谁对。
+  static String? selfBuiltNameError(String name) {
+    if (name.isEmpty) {
+      return '自建站点需要 name（站点 id 为 plugin.<插件id>.<类型>.<name>）';
+    }
+    if (!RegExp(r'^[A-Za-z0-9_-]+$').hasMatch(name)) {
+      return '自建站点的 name 只允许字母 / 数字 / 下划线 / 连字符，收到「$name」';
+    }
+    return null;
+  }
 }

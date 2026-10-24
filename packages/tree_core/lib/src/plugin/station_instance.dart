@@ -426,6 +426,8 @@ sealed class StationInstance {
     if (builtin) 'builtin': true,
     'created_at': createdAt,
     'subscribers': subscribers
+        // WS 连接订阅是运行期态：连接 id 不落盘，重启后由连接重建。
+        .where((StationSubscriber s) => s.persistent)
         .map((StationSubscriber s) => s.toJson())
         .toList(),
     ...extraJson(),
@@ -778,6 +780,8 @@ final class BroadcastStation extends StationInstance {
         scope: scope,
         payload: payload,
         meta: <String, dynamic>{'topic': topic, ...meta},
+        topic: topic,
+        originPluginId: sourcePluginId,
       );
       pending.add(() async {
         final StationReply reply = await awaitReply(
