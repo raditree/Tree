@@ -23,7 +23,6 @@
 | [store](lib/src/store/README.md) | 数据根布局、记录模型、落盘 / 内存实现、写队列与原子快照 |
 | [files](lib/src/files/README.md) | 工作空间文件服务（唯一的路径安全边界）：读 / 写 / 结构改动（新建 / 重命名 / 删除）/ 上传 / 打包 / Git |
 | [spec](lib/src/spec/README.md) | 任务型规范：**内置 Spec 模板（`kBuiltinSpecs`，改文案要 bump version）**、播种与刷新、索引注入提示词、select / create / update |
-| [mcp](lib/src/mcp/README.md) | MCP 客户端（stdio + Streamable HTTP）与服务管理 |
 | [plugin](lib/src/plugin/README.md) | 插件宿主、四类站点与点位、执行站挂载、插件工具与 UI 槽位 |
 | [server](lib/src/server/README.md) | 回环 HTTP + WS 门面：路由、鉴权、响应编码、WS 发送活性 |
 | [ws](lib/src/ws/README.md) | WS 注册表与广播、帧分片与接收侧重组 |
@@ -63,7 +62,7 @@
 | [lib/src/store/tree_store.dart](lib/src/store/tree_store.dart) · [file_store.dart](lib/src/store/file_store.dart) · [records.dart](lib/src/store/records.dart) | 数据根读写与记录模型 |
 | [lib/src/team/](lib/src/team/) | 团队服务、消息派发、工作目录口径（`team_workspace.dart`） |
 | [subagent_tool.dart](lib/src/tool/subagent_tool.dart) · [subagent_service.dart](lib/src/agent/subagent_service.dart) · [subagent_registry.dart](lib/src/store/subagent_registry.dart) · [subagent_store.dart](lib/src/store/subagent_store.dart) | **临时员工**（`subagent` 工具）：会话级名册 + 内存覆盖层 + 与普通轮同一条生成实现 |
-| [lib/src/spec/](lib/src/spec/) · [lib/src/mcp/](lib/src/mcp/) · [lib/src/plugin/](lib/src/plugin/) | Spec 体系 / MCP 客户端 / 插件宿主与站点 |
+| [lib/src/spec/](lib/src/spec/) · [lib/src/plugin/](lib/src/plugin/) | Spec 体系 / 插件宿主与站点 |
 | [lib/src/terminal/](lib/src/terminal/) | 集成终端（Ctrl+J）：本机与远端（SSH）**两条真 PTY** 的会话管理 + 生命周期（判据是**有效 SSH**，不是 `agent.sshConfig`；平台实现与远端 shell 通道都由 tree_local_exec 注入） |
 
 ## 不变量（assertions）

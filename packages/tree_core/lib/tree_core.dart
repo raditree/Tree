@@ -15,7 +15,7 @@
 /// - M4：工具层（本机/SSH 工作空间 IO + 5 个工作空间工具 + 待办/hook）
 /// - M5：人机协作与团队编排（提问回路、team/message 工具、成员审核闸门、级联停止、
 ///   Spec 体系与会话状态注入）
-/// - M6：插件总线 + MCP（mcp_dart）+ 进程外插件宿主
+/// - M6：插件总线 + 进程外插件宿主（MCP 客户端与接线已于 2026-10 移除）
 library;
 
 import 'package:tree_local_exec/tree_local_exec.dart';
@@ -51,8 +51,6 @@ export 'src/llm/openai_codec.dart';
 export 'src/llm/sse_parser.dart';
 export 'src/llm/vision_files.dart';
 export 'src/files/file_service.dart';
-export 'src/mcp/mcp_client.dart';
-export 'src/mcp/mcp_service.dart';
 export 'src/plugin/agent_events.dart';
 export 'src/plugin/builtin_plugins.dart';
 export 'src/plugin/execute_mounts.dart';
@@ -81,7 +79,6 @@ export 'src/plugin/ui_host.dart';
 export 'src/tool/builtin_tools.dart';
 export 'src/tool/hook_ledger.dart';
 export 'src/tool/llm_request_guard.dart';
-export 'src/tool/mcp_tool.dart';
 export 'src/tool/message_tool.dart';
 export 'src/tool/plugin_tool.dart';
 export 'src/tool/question_channel.dart';

@@ -15,8 +15,8 @@ import 'ws_harness.dart';
 /// - 系统提示词在**第 0 条消息**里 ⇒ 一旦中途变样，整条前缀缓存作废（见 #8）。
 ///
 /// 真实路径：`LlmAgentEngine.run` 每次都调 `toolRunner.specsFor(...)`，而
-/// `WorkspaceToolRunner.specsFor` 现取 `mcpService` / `pluginBus` 的**运行态**
-/// （`McpService.allTools()` / 插件工具表），所以新工具天然是"下一次发消息可见"。
+/// `WorkspaceToolRunner.specsFor` 现取 `pluginBus` 的**运行态**（插件工具表），
+/// 所以新工具天然是"下一次发消息可见"。
 /// 这个用例用"按次增长"的替身把这条不变量钉住：谁把工具表缓存/并入钉住的上下文，它就红。
 class _GrowingToolRunner implements ToolRunner {
   int specsCalls = 0;

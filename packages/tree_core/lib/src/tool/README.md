@@ -12,7 +12,6 @@
 | [message_tool.dart](message_tool.dart) | 团队通信域：`send_message` / `broadcast` / `wait_for` |
 | [team_tool.dart](team_tool.dart) | 团队管理域：建队、成员名单与档案、审核状态 |
 | [spec_tool.dart](spec_tool.dart) | 任务型规范：`select` / `create` / `update` |
-| [mcp_tool.dart](mcp_tool.dart) | MCP 工具的发现入口（help / call）与"已配置但当前不可用"的如实说明 |
 | [plugin_tool.dart](plugin_tool.dart) | 插件工具发现入口与按定义来源路由的兜底调用 |
 | [question_channel.dart](question_channel.dart) | 提问通道契约（工具层 ↔ 编排层，避免反向依赖） |
 | [subagent_tool.dart](subagent_tool.dart) | **临时员工**工具（`subagent`）：形状/schema 校验 + 落点契约（`SubagentChannel`）与消息标记（`SubagentTag`） |
