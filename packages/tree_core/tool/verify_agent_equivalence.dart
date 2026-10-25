@@ -39,6 +39,15 @@ Future<void> main(List<String> args) async {
     return;
   }
   stdout.writeln('[verify] 插件产物：$exe');
+  final String? declarationFailure = await _verifyDeclarations(exe);
+  if (declarationFailure != null) {
+    stderr.writeln('[verify] 申报表不一致：$declarationFailure');
+    exitCode = 1;
+    return;
+  }
+  stdout.writeln(
+    '[OK] 申报表与等价用例表一致（${kImplementedRoutes.length} 条）',
+  );
   final List<String> failures = <String>[];
   for (final String route in kImplementedRoutes) {
     final String? failure = await _runCase(route, exe);
@@ -55,6 +64,74 @@ Future<void> main(List<String> args) async {
   }
   stderr.writeln('[verify] ${failures.length} 条不一致');
   exitCode = 1;
+}
+
+/// 校验插件的「收集站申报」与本工具的路由表**逐条一致**。
+///
+/// 为什么要这一条：申报了却没实现（或实现了却没申报、没进等价表）时，路由会
+/// 在交接后悄悄 501/404。这里把三张表钉在一起：插件 kDeclaredRoutes ≡
+/// [kImplementedRoutes]（等价用例表）。
+Future<String?> _verifyDeclarations(String exe) async {
+  final Process process = await Process.start(exe, const <String>[]);
+  final StreamIterator<String> iterator = StreamIterator<String>(
+    process.stdout.transform(utf8.decoder).transform(const LineSplitter()),
+  );
+  try {
+    Future<Map<String, dynamic>> waitForId(int id) async {
+      while (await iterator.moveNext()) {
+        final Map<String, dynamic> message =
+            jsonDecode(iterator.current) as Map<String, dynamic>;
+        if (message['id'] == id) return message;
+      }
+      throw StateError('插件 stdout 提前关闭（期待 id=$id）');
+    }
+
+    void send(Map<String, dynamic> frame) {
+      process.stdin.writeln(jsonEncode(frame));
+      unawaited(process.stdin.flush());
+    }
+
+    send(<String, dynamic>{
+      'jsonrpc': '2.0',
+      'id': 1,
+      'method': 'hello',
+      'params': <String, dynamic>{'plugin_id': 'tree.agent'},
+    });
+    await waitForId(1);
+    send(<String, dynamic>{
+      'jsonrpc': '2.0',
+      'id': 2,
+      'method': 'station/request',
+      'params': <String, dynamic>{
+        'station_id': 'system.collect.api.routes',
+        'payload': <String, dynamic>{},
+      },
+    });
+    final Map<String, dynamic> reply = await waitForId(2);
+    final Object? rawRoutes =
+        reply['result']?['reply']?['payload']?['routes'];
+    if (rawRoutes is! List) {
+      return '收集站回包缺少 routes 列表：${reply['result']}';
+    }
+    final Set<String> declared = <String>{};
+    for (final Object? item in rawRoutes) {
+      if (item is! Map) return '路由申报项不是对象：$item';
+      declared.add('${item['method']} ${item['pattern']}');
+    }
+    final Set<String> expected = kImplementedRoutes.toSet();
+    final Set<String> missing = expected.difference(declared);
+    final Set<String> extra = declared.difference(expected);
+    if (missing.isNotEmpty) return '申报缺这些已实现路由：${missing.toList()}';
+    if (extra.isNotEmpty) return '申报多出没有等价用例的路由：${extra.toList()}';
+    return null;
+  } finally {
+    process.kill();
+    await process.exitCode.timeout(
+      const Duration(seconds: 5),
+      onTimeout: () => -1,
+    );
+    await iterator.cancel();
+  }
 }
 
 /// 跑一条路由；返回 null = 一致，否则是可读差异。
