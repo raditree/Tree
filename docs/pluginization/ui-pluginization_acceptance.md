@@ -122,10 +122,11 @@
 
 细节见 [agent_pluginization.md](agent_pluginization.md) §5/§7；本仓侧验收：
 
-> **2026-10-25 状态：G-1~G-7 尚未开始。** 阻塞项（插件仓无 `tree.agent/` 宿主工程 / 领域代码
-> ~20k 行且依赖核心基础件 / 实测 agent 面 36 条 / 委派白名单仍静态）与已拍板决策见
-> [agent_pluginization.md](agent_pluginization.md) §10。
-> 在决策落定前，核心路由与领域帧保持原样（不变量 2/3 要求插件验收后才可删除）。
+> **2026-10-25 状态：A1 骨架已完成（tree-plugins `3704101`）；G-1~G-7 的等价验收尚未开始。**
+> A1 证据：`--selftest` 8 项全绿；真核心拉起 AOT 产物后 ready，stderr 与 `log` 通知两路日志都出现在
+> `/api/logs/plugin:tree.agent`，`enabled:false` 热应用后下线。A2~A5（只读面 / 写路径与生成 / 帧迁移 /
+> 核心删除）仍按 [agent_pluginization.md](agent_pluginization.md) §6 与 [agent_api_contract.md](agent_api_contract.md) 推进。
+> 在插件侧等价验收通过前，核心路由与领域帧保持原样（不变量 2/3）。
 
 | ID | 操作 | 期望 |
 | --- | --- | --- |
@@ -213,7 +214,7 @@
 
 | ID | 项 | 状态 | 阻塞 / 原因 | 解除条件与下一步 |
 | --- | --- | --- | --- | --- |
-| L-01 | G-1 端点等价对照（按实测 **36 条 = 34 存量 + 2 新增**；旧口径 23/25 已作废） | **进行中**：对照表已建立 | 无 `tree.agent` 实现；逐条搬与等价验收未开始 | 按 [agent_api_contract.md](agent_api_contract.md) 逐条实现；先拍板表内 C-01~C-12 |
+| L-01 | G-1 端点等价对照（按实测 **36 条 = 34 存量 + 2 新增**；旧口径 23/25 已作废） | **进行中**：A1 骨架 + 对照表已建立 | 36 条逐条搬与等价验收未开始（A2~A5） | A1 已完成（tree-plugins `3704101`）；按 [agent_api_contract.md](agent_api_contract.md) 逐条实现，决策已落 §3.1 |
 | L-02 | G-2 核心路由表去除领域路由 | 未开始 | 不变量 27：插件侧等价验收通过前不得删 | G-1 全绿后同批删除 |
 | L-03 | G-3 领域帧改 `station_delivery` | 未开始 | 依赖 G-1 的事件面迁移 | topic 沿用原帧名，10 条帧逐条迁移 |
 | L-04 | G-4 过渡映射删除 | 未开始 | 依赖 G-3 完成一个版本周期 | G+1 提交时删除映射代码 |
