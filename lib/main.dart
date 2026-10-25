@@ -10,6 +10,7 @@ import 'io/api_service.dart';
 import 'io/core_attachment.dart';
 import 'io/single_instance.dart';
 import 'io/tray_service.dart';
+import 'io/ui_identity.dart';
 import 'io/websocket_service.dart';
 import 'ui/font_service.dart';
 import 'ui/pages/main_page.dart';
@@ -61,10 +62,12 @@ Future<void> main() async {
   // 字体族 / 字重：同上（读了才画界面，免得先默认再跳一次）
   await FontService.instance.load();
 
-  // 核心只监听 127.0.0.1，HTTP 与 WS 同源（由 UiHost 注入的 URL 推导）
+  // HTTP 与 WS 同源（由 UiHost 注入的 URL 推导）
   ApiService.baseUrl = attachment.httpBaseUrl;
   WebSocketService.baseUrl = attachment.wsBaseUrl;
   ApiService.setToken(attachment.token);
+  // U3：装成插件时（同目录有 plugin.json）连上即声明身份；开发期不发。
+  WebSocketService.helloFrame = UiIdentity.load().helloFrame();
 
   // **拦截关闭按钮**：默认只隐藏窗口（见 [TrayService]），真正的退出走托盘菜单 /
   // 设置页的退出入口。桌面端的长任务正在跑时，误点关闭等于终止整轮工作。

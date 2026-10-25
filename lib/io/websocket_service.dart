@@ -52,6 +52,13 @@ class WebSocketService {
   /// WebSocket 基础地址（核心进程回环地址，形如 `ws://127.0.0.1:54321`）
   static String baseUrl = 'ws://127.0.0.1:0';
 
+  /// UI 插件握手帧（`ui.hello`，U3）。
+  ///
+  /// 非 null 时**每次建连（含自动重连）后第一件事**就是把它发出去；null 表示
+  /// 本进程不是插件形态（开发期 `flutter run` 没有 `plugin.json`），不发身份，
+  /// 避免核心按"未在 plugins.yaml 声明"拒绝整条连接。
+  static Map<String, dynamic>? helloFrame;
+
   /// WebSocket 通道
   WebSocketChannel? _channel;
 
@@ -209,12 +216,21 @@ class WebSocketService {
     );
 
     _startHeartbeat();
+    // 身份先于一切业务帧：核心按 ui.hello 建立连接归属，站点订阅依赖它。
+    _sendHello();
     // 连接确认：宽限期内未收到错误/正常关闭，则视为握手成功，此时才清零
     // 重连计数（使下一轮故障重新从 0 开始退避，而非叠加历史失败次数）。
     _connectedTimer?.cancel();
     _connectedTimer = Timer(_connectedGrace, () {
       _reconnectAttempts = 0;
     });
+  }
+
+  /// 发送 UI 握手帧（无身份时不发）。重连复用 [connect]，因此每次重连都会重发。
+  void _sendHello() {
+    final Map<String, dynamic>? frame = helloFrame;
+    if (frame == null) return;
+    send(frame);
   }
 
   /// 处理收到的数据

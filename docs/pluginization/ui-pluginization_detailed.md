@@ -82,6 +82,10 @@ plugin.json
 
 **关键：UI 不再拥有核心的生命周期。** 关闭界面不等于关闭系统；系统是否有界面由 `ui.hello` 连接数决定。
 
+身份来源：可执行体同目录的 `plugin.json`（`id` / `version`），能力默认声明
+`plugin.manage`。**没有清单时不发 `ui.hello`**（开发期 `flutter run`）：未在
+`plugins.yaml` 声明的 id 会让核心拒绝并关闭整条连接，开发回路会直接断掉。
+
 ---
 
 ## 4. 代码改造清单（本仓）
