@@ -27,6 +27,7 @@ import 'package:tree_core/tree_core.dart';
 const List<String> kImplementedRoutes = <String>[
   'GET /api/agents',
   'GET /api/agents/{agentId}',
+  'GET /api/conversations/{agentId}',
   'GET /api/agents/{agentId}/sessions',
   'GET /api/agents/{agentId}/sessions/{sessionId}',
   'GET /api/agents/{agentId}/todos',
@@ -148,6 +149,8 @@ Future<String?> _runCase(String route, String exe) async {
   final TreePaths paths = TreePaths(temp.path);
   final FileTreeStore store = FileTreeStore(paths);
   final CoreSettings settings = CoreSettings();
+  FileQuestionStore? questionStore;
+  QuestionBroker? questionBroker;
   final _RouteCall call;
   switch (route) {
     case 'GET /api/agents':
@@ -296,6 +299,36 @@ Future<String?> _runCase(String route, String exe) async {
         },
         agentId: 'agt',
       );
+    case 'GET /api/conversations/{agentId}':
+      await _seedSessions(store);
+      questionStore = FileQuestionStore(paths);
+      questionStore.add(
+        QuestionRecord(
+          qid: 'q1',
+          agentId: 'agt',
+          sessionId: 'session_default',
+          question: '选哪个',
+          options: <String>['A', 'B'],
+          answers: <String>['B'],
+          answer: 'B',
+          status: 'answered',
+          createdAt: DateTime.parse(
+            '2026-10-25T10:00:07.000',
+          ).millisecondsSinceEpoch,
+        ),
+      );
+      await questionStore.flush();
+      questionBroker = QuestionBroker(
+        questions: questionStore,
+        transcript: store,
+        broadcast: (Map<String, dynamic> _) {},
+      );
+      call = const _RouteCall(
+        concretePath: '/api/conversations/agt',
+        query: <String, String>{'session_id': 'session_default'},
+        pathParams: <String, String>{'agentId': 'agt'},
+        agentId: 'agt',
+      );
     case 'GET /api/agents/{agentId}/todos':
       store.putAgent(
         CoreAgent(
@@ -426,6 +459,7 @@ Future<String?> _runCase(String route, String exe) async {
     store: store,
     settings: settings,
     teamService: TeamService(store: store),
+    questions: questionBroker,
     todoStore: FileTodoStore(paths),
   );
   Process? process;
@@ -580,6 +614,17 @@ Future<void> _seedSessions(FileTreeStore store) async {
       content: '你好',
       kind: 'text',
       timestamp: t('2026-10-25T10:00:06.000'),
+    ),
+  );
+  store.appendMessage(
+    CoreMessage(
+      id: 'q1',
+      agentId: 'agt',
+      sessionId: 'session_default',
+      role: 'agent',
+      content: '选哪个',
+      kind: 'ask_user_question',
+      timestamp: t('2026-10-25T10:00:07.000'),
     ),
   );
   store.appendMessage(
