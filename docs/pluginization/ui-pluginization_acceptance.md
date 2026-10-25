@@ -229,7 +229,7 @@
 | L-13 | loader 托盘 | 延后 | 本期以控制台菜单替代（E-8 已按此口径） | 托盘实现单独排期，不影响其它项 |
 | L-14 | 历史已知问题：从仓库更新「运行中的内置插件」可能挂起 | 待复核 | 未见回归用例 | 补一条「运行中更新」回归，确认是否已修 |
 | L-20 | 平台能力：按声明「逐 agent 单独起实例」 | 不支持 | `granularity` 仅元数据；`_hosts` 按 plugin id 唯一（勘测见 [agent_pluginization.md §10.2](agent_pluginization.md#102-勘测插件平台是否支持按声明逐-agent-起实例)） | 本期由 `tree.agent` 内部调度；未来要支持需加实例键、按需启停与按 `agent_id` 路由 |
-| L-21 | 插件仓禁止 import 核心包（CI 闸门） | 未加 | 目前 `_kit` 只被本仓插件相对引用，尚无检查 | 在 tree-plugins CI 加一条：出现 `package:tree_core/` / `package:tree_protocol/` 即失败 |
+| L-21 | 插件仓禁止 import 核心包（CI 闸门） | **部分闭环**：桌面仓合同用例已加 | 插件仓独立 CI 尚未挂这条用例 | 已加 `plugin_repo_contract_test`：扫描全部插件源码的 `import 'package:tree_core|tree_protocol/...'`（mutation 验证会变红）；下一步在 tree-plugins CI 直接调这条用例或等价脚本 |
 | L-22 | `core_settings.dart` 拆分（平台级 / 领域级） | 未开始 | 现类混装模型池与平台开关 | 按 [§4.8](agent_pluginization.md#48-core_settingsdart-必须先拆分) 拆分；拆分前不得开始 A1 数据接管 |
 | L-23 | 插件 scope 去领域化（`team_id/agent_id/session_id/mode_key`） | 未开始 | 渗透 13 文件，且承担跨 team/跨 workspace 的 fail-closed 授权（勘测见 [§10.3](agent_pluginization.md#103-勘测插件-scope-仍含领域字段应去掉)） | 三步走：通用 `context` 先扩后收；授权搬到「执行器插件 + workspace 租约」；最后删字段。协议破坏性变更，需单独立项 |
 | L-24 | 新建 `local_executor` 插件（本地 `Process.start` + 文件操作 + PTY） | 未开始 | 核心不得持有 PTY / 文件逻辑；`files/file_service.dart`、`terminal/terminal_service.dart` 必须搬出（[§4.6](agent_pluginization.md#46-执行与文件全部下沉能力插件核心零-pty--零文件操作)） | 与 `ssh_executor` 对齐；A1 前置 |

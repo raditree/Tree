@@ -229,6 +229,40 @@ void main() {
       containsAll(<String>['hello', 'ping', 'tools/list', 'station/command']),
     );
   });
+
+  test('插件源码不得 import 核心包（插件仓可独立编译）', () {
+    // 为什么钉死：插件仓可能被第三方单独 clone；一旦出现
+    // `package:tree_core/` / `package:tree_protocol/`，那边直接编不出来。
+    // 复用核心能力只能走「平台内置站（日志/存储/租约）」或「其它插件的自建执行站」。
+    // 只认 import 语句：注释里提到这两个包名是允许的（迁移说明需要写它们）。
+    final RegExp forbidden = RegExp(
+      r'''import\s+['"]package:(tree_core|tree_protocol)/''',
+    );
+    final List<String> offenders = <String>[];
+    for (final Directory dir in pluginDirs()) {
+      for (final FileSystemEntity entity in dir.listSync(recursive: true)) {
+        if (entity is! File || !entity.path.endsWith('.dart')) continue;
+        if (entity.path.contains('${Platform.pathSeparator}.dart_tool'
+            '${Platform.pathSeparator}')) {
+          continue;
+        }
+        if (!forbidden.hasMatch(entity.readAsStringSync())) continue;
+        offenders.add(
+          entity.path.substring(pluginRepo.parent.path.length + 1).replaceAll(
+            r'\',
+            '/',
+          ),
+        );
+      }
+    }
+    expect(
+      offenders..sort(),
+      isEmpty,
+      reason:
+          '这些插件源码 import 了核心包，单独 clone 插件仓会编不出来：\n'
+          '${offenders.join('\n')}',
+    );
+  });
 }
 
 String _base(String path) {
