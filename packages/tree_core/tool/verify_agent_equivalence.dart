@@ -26,6 +26,7 @@ import 'package:tree_core/tree_core.dart';
 /// 当前已搬进插件、可做等价对照的路由（与 `agent_api_contract.md` 的编号对应）。
 const List<String> kImplementedRoutes = <String>[
   'GET /api/agents/{agentId}/todos',
+  'GET /api/agents/{agentId}/subagents',
 ];
 
 Future<void> main(List<String> args) async {
@@ -87,6 +88,64 @@ Future<String?> _runCase(String route, String exe) async {
       ]);
       call = const _RouteCall(
         concretePath: '/api/agents/agt/todos',
+        query: <String, String>{'session_id': 'session_default'},
+        pathParams: <String, String>{'agentId': 'agt'},
+        agentId: 'agt',
+      );
+    case 'GET /api/agents/{agentId}/subagents':
+      final CoreAgent owner = CoreAgent(
+        id: 'agt',
+        name: '等价夹具',
+        createdAt: 1,
+        updatedAt: 1,
+        workspaceDir: p.join(temp.path, 'workspace'),
+      );
+      store.putAgent(owner);
+      await store.flush();
+      store.putSubagent(
+        CoreSubagent(
+          id: 'sub_1',
+          name: '临时员工',
+          ownerAgentId: 'agt',
+          sessionId: 'session_default',
+          parentId: 'agt',
+          level: 1,
+          scope: '整理日志',
+          runCount: 2,
+          createdAt: 1761360000000,
+          updatedAt: 1761360005000,
+          agent: CoreAgent(
+            id: 'sub_1',
+            name: '临时员工',
+            createdAt: 1761360000000,
+            updatedAt: 1761360005000,
+            parentAgentId: 'agt',
+          ),
+        ),
+      );
+      store.putSubagent(
+        CoreSubagent(
+          id: 'sub_2',
+          name: '下级',
+          ownerAgentId: 'agt',
+          sessionId: 'session_default',
+          parentId: 'sub_1',
+          level: 2,
+          createdAt: 1761360100000,
+          updatedAt: 1761360100000,
+          agent: CoreAgent(
+            id: 'sub_2',
+            name: '下级',
+            createdAt: 1761360100000,
+            updatedAt: 1761360100000,
+            parentAgentId: 'sub_1',
+            level: 2,
+          ),
+        ),
+      );
+      await store.flush();
+      call = const _RouteCall(
+        concretePath: '/api/agents/agt/subagents',
         query: <String, String>{'session_id': 'session_default'},
         pathParams: <String, String>{'agentId': 'agt'},
         agentId: 'agt',
