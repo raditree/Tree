@@ -66,6 +66,8 @@ const List<String> kDeclaredOnlyRoutes = <String>[
   'POST /api/agents/{leaderId}/teammate/{memberId}/message',
   'GET /api/agents/{leaderId}/teammate/{memberId}/log',
   'POST /api/agents/{agentId}/compact',
+  'POST /api/agents/{agentId}/reset',
+  'POST /api/agents/{agentId}/ssh/reconnect',
   'GET /api/agents/{agentId}/specs',
   'GET /api/agents/{agentId}/specs/{specId}',
 ];
