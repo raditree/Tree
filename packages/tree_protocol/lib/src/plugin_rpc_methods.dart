@@ -224,4 +224,12 @@ const Map<String, String> nonProtocolPluginMethodLiterals = <String, String>{
   'PUT': '同上',
   'PATCH': '同上',
   'DELETE': '同上',
+  // 执行站命令名：插件经 `station/command` 下达，由核心的 `ExecuteStationMounts`
+  // 执行（命令白名单的家在 tree_core 的 `StationPoints`），不是插件↔核心 JSON-RPC
+  // method；插件侧实现 WorkspaceIO 时必然会出现这些字面量。
+  'fs.read': '执行站命令（StationPoints），非插件↔核心 JSON-RPC 面',
+  'fs.write': '同上',
+  'fs.list': '同上',
+  'fs.grep': '同上',
+  'terminal.exec': '同上',
 };
