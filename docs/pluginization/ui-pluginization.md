@@ -22,8 +22,8 @@
 
 1. UI 前端可安装、卸载、启停、替换，与现有插件走**同一条**分发/落盘/生命周期管道。
 2. 主题、布局、窗口形态（主窗口 / 悬浮球 / 托盘 / 多窗口）全部由 UI 插件自己决定，核心不感知。
-3. 核心的 REST 面收束为 **27 条**：平台控制面 14、传输设置 5、发现面 1、日志 API 3、数据存储 API 4。**核心不再保留任何 agent / 会话 / 运行监督 / 提问 / 远端链路类端点**（25 条移交 agent 插件）。
-4. 领域端点 18 条（Git 3、Spec 3、MCP 配置 2、文件 11）迁给领域插件。
+3. 核心的 REST 面收束为 **36 条方法路由**：平台控制面 16、传输设置 9、引导壳 3、发现面 1、日志 API 3、数据存储 API 4。**核心不再保留任何 agent / 会话 / 运行监督 / 提问 / 远端链路类端点**（36 条移交 agent 插件）。
+4. 领域端点 18 条路径 / 21 条方法路由（Git 3、Spec 2、MCP 3、文件 13）迁给领域插件。
 5. **agent 能力完全剥离为插件**（承接方见 [agent\_pluginization.md](agent_pluginization.md)），功能零丢失。
 6. 全部 UI 被卸载后，系统仍可恢复：由一个**不可卸载的极小引导壳**提供插件管理。
 7. 删除旧的「插件 UI 面板协议」（受限控件集），站点体系成为插件对外的**唯一贡献面**。
@@ -179,14 +179,14 @@
 
 ***
 
-## 4. API 端点归属总表（终态 70 条）
+## 4. API 端点归属总表（终态 93 条方法路由 / 88 条路径）
 
 > 判据：**卸载的是能力，端点跟着能力走。** 只把端点搬走、能力仍在核心，属于纯代理，不算卸载。
-> 存量 60 条 = 核心 19 + agent 23 + 领域 18；本次新增 10 条（发现面 1、日志 3、数据存储 4、agent 上行指令 2）。
+> 2026-10-25 按 `_registerRoutes` 实测重算：核心 36 + agent 36（含 2 条新增）+ spec 2 + mcp 3 + files 13 + git 3 = 93。
 
-### 4.1 核心永久面（27 条）
+### 4.1 核心永久面（36 条）
 
-**平台控制面（14）** — 装插件的前提，也是引导页唯一依赖。
+**平台控制面（16）** — 装插件的前提，也是引导页唯一依赖。
 
 | 端点                                                                                             | <br />                           | <br />                                                                    |
 | ---------------------------------------------------------------------------------------------- | :------------------------------- | :------------------------------------------------------------------------ |
@@ -196,9 +196,13 @@
 | `GET /api/plugin/release`、`POST .../refresh`、`POST .../{id}/install`、`POST .../{id}/uninstall` | <br />                           | <br />                                                                    |
 | `GET /api/plugin/stations/{id}`、`PATCH .../{id}/config`、`POST .../{id}/subscribers/{key}`      | <br />                           | <br />                                                                    |
 
-**传输 / 判活设置（5）** — 交给插件会与传输层形成循环依赖。
+**传输 / 判活设置（9 条方法路由）** — 交给插件会与传输层形成循环依赖。
 
-`/api/settings/frame-rate`、`/token-rate`、`/heartbeat-interval`、`/missed-heartbeat-limit`、`/data-collection`
+`/api/settings/frame-rate`（GET/POST）、`/heartbeat-interval`（GET/PATCH/POST）、`/missed-heartbeat-limit`（GET/PATCH/POST）、`/data-collection`（POST）。
+
+> `/api/settings/token-rate` **不在此列**：它是 LLM 取 token 的节奏，属 agent 领域，随 `tree.agent` 迁走（[agent_pluginization.md §4.8](agent_pluginization.md)）。
+
+**引导壳（3）** — `GET /api/bootstrap`、`POST /api/bootstrap/session`、`POST /api/bootstrap/ticket`。
 
 **发现面（1，新增）** — `GET /api/meta`：核心版本、`api_version`、可用路由、站点、capability、UI 连接、`can_manage_plugins`。
 
@@ -221,32 +225,41 @@
 
 约束：`ns` 必须等于调用方 `plugin_id`（核心自身用 `core`），跨命名空间读写一律 403；单值上限 1 MB，单命名空间上限 64 MB，超限给可读错误。**核心不解释值的内容。**
 
-### 4.2 agent 面（23 条存量 + 2 条新增 = 25 条 → agent 插件，批次 F/G）
+### 4.2 agent 面（34 条存量 + 2 条新增 = 36 条 → agent 插件，批次 F/G）
 
 **核心不再保留其中任何一条。** 承接方：`tree.agent` 插件（见 [agent\_pluginization.md](agent_pluginization.md)）。
 
-| 组                | 条数 | 端点                                                                                                                                                                                                                                    | <br />                               | <br />                               | <br />                                              | <br />                                                                                                                                                | <br />                   | <br />                    |
-| ---------------- | -- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------- | :----------------------------------- | :-------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------- | :------------------------ |
-| agent / 模型 / 团队  | 10 | \`GET                                                                                                                                                                                                                                 | POST /api/agents`、`GET               | PATCH                                | DELETE /api/agents/{id}`、`GET .../models-info`、`GET | PATCH .../todos`、`GET .../teammates`、`PATCH /api/agents/{leader}/teammate/{member}`、`GET .../teammate/{id}/log`、`POST .../teammate/{id}/message`、`GET | POST /api/models`、`PATCH | DELETE /api/models/{id}\` |
-| 会话 / 历史          | 6  | \`GET                                                                                                                                                                                                                                 | DELETE /api/conversations/{id}`、`GET | POST /api/agents/{id}/sessions`、`GET | PATCH                                               | DELETE /api/agents/{id}/sessions/{sid}`、`POST .../specs`、`POST /api/agents/{id}/reset`、`POST /api/agents/{id}/compact\`                               | <br />                   | <br />                    |
-| 运行监督 / 提问 / 远端链路 | 7  | `GET /api/tools/running`、`POST /api/tools/running/{handle}/close`、`GET /api/agents/{id}/subagents`、`GET .../subagents/{sid}/transcript`、`GET /api/questions`、`POST /api/questions/{qid}/answer`、`POST /api/agents/{id}/ssh/reconnect` | <br />                               | <br />                               | <br />                                              | <br />                                                                                                                                                | <br />                   | <br />                    |
-| 上行指令（新增，替代 WS 帧） | 2  | `POST /api/agents/{id}/messages`（替代 `send_message`）、`POST /api/agents/{id}/cancel`（替代 `cancel`）                                                                                                                                       | <br />                               | <br />                               | <br />                                              | <br />                                                                                                                                                | <br />                   | <br />                    |
+> 2026-10-25 按 `_registerRoutes` 逐条重数：旧「23 存量 / 25 移交」是**数错的**，实际 34 存量。
+
+| 组 | 条数 | 端点 |
+| --- | --- | --- |
+| agent 定义 | 7 | `GET/POST /api/agents`、`GET/PATCH/DELETE /api/agents/{id}`、`GET .../models-info`、`GET .../todos` |
+| 模型池 | 4 | `GET/POST /api/models`、`PATCH/DELETE /api/models/{id}` |
+| 团队 | 4 | `GET .../teammates`、`PATCH /api/agents/{leader}/teammate/{member}`、`GET .../teammate/{id}/log`、`POST .../teammate/{id}/message` |
+| 子 agent | 2 | `GET .../subagents`、`GET .../subagents/{sid}/transcript` |
+| 会话 / 历史 | 8 | `GET/DELETE /api/conversations/{id}`、`GET/POST .../sessions`、`GET/PATCH/DELETE .../sessions/{sid}`、`POST .../sessions/{sid}/specs` |
+| 维护 | 3 | `POST .../reset`、`POST .../compact`、`POST .../ssh/reconnect` |
+| 提问 | 2 | `GET /api/questions`、`POST /api/questions/{qid}/answer` |
+| 运行监督 | 2 | `GET /api/tools/running`、`POST /api/tools/running/{handle}/close` |
+| token 节奏（领域设置） | 2 | `GET/POST /api/settings/token-rate` |
+| 上行改委派（新增） | 2 | `POST /api/agents/{id}/messages`（替代 `send_message`）、`POST /api/agents/{id}/cancel`（替代 `cancel`） |
+| **合计** | **36** | |
 
 > `answer_question` 已有 REST 等价物，不新增。**不保留插件 → UI 的反向请求通道**：上行一律走委派端点。
 
-### 4.3 领域面 · JSON（7 条，批次 C-1）
+### 4.3 领域面 · JSON（7 条路径 / 8 条方法路由，批次 C-1）
 
-| 端点                                      | 承接插件                     | 说明          | <br />                                   |
-| --------------------------------------- | ------------------------ | ----------- | :--------------------------------------- |
-| `GET /api/files/{ws}/git-status`        | `git`                    | <br />      | <br />                                   |
-| `GET /api/workspaces/{ws}/git/log`      | `git`                    | <br />      | <br />                                   |
-| `GET /api/workspaces/{ws}/git/branches` | `git`                    | <br />      | <br />                                   |
-| `GET /api/agents/{id}/specs`            | `spec`                   | 工作空间文件 CRUD | <br />                                   |
-| `GET /api/agents/{id}/specs/{specId}`   | `spec`                   | <br />      | <br />                                   |
-| \`GET                                   | POST /api/mcp/services\` | `mcp`       | 配置面 + 客户端连接都由 `mcp` 插件承担，核心不再持有 MCP 任何逻辑 |
-| `DELETE /api/mcp/services/{name}`       | `mcp`                    | <br />      | <br />                                   |
+| 端点 | 承接插件 | 说明 |
+| --- | --- | --- |
+| `GET /api/files/{ws}/git-status` | `git` | |
+| `GET /api/workspaces/{ws}/git/log` | `git` | |
+| `GET /api/workspaces/{ws}/git/branches` | `git` | |
+| `GET /api/agents/{id}/specs` | `spec` | 工作空间文件 CRUD |
+| `GET /api/agents/{id}/specs/{specId}` | `spec` | |
+| `GET` / `POST /api/mcp/services` | `mcp` | 同路径两方法；配置面 + 客户端连接都由 `mcp` 插件承担 |
+| `DELETE /api/mcp/services/{name}` | `mcp` | |
 
-**硬规则：不得只搬 Git 三条。** C-1 的 7 条必须一次搬完、全部有对应用例；C-2 的 11 条同理。
+**硬规则：不得只搬 Git 三条。** C-1 的 7 条路径必须一次搬完、全部有对应用例；C-2 的 11 条路径同理。
 
 ### 4.4 领域面 · 二进制 / 大体积（11 条，批次 C-2）
 
@@ -264,22 +277,26 @@
 
 禁止用 base64 把整文件塞进一行 JSON。
 
-### 4.5 合计数
+### 4.5 合计数（2026-10-25 按 `_registerRoutes` 实测）
 
-| 分类       | 条数     | 归属                     |
-| -------- | ------ | ---------------------- |
-| 核心永久面    | 27     | `tree_core`            |
-| agent 面  | 25     | `tree.agent` 插件        |
-| 领域面 JSON | 7      | `git` / `spec` / `mcp` |
-| 领域面二进制   | 11     | `files`                |
-| **合计**   | **70** | <br />                 |
+| 分类 | 路径 / 方法路由 | 归属 |
+| --- | --- | --- |
+| 核心永久面 | 36 / 36 | `tree_core` |
+| agent 面 | 34 / 36（含 2 条新增） | `tree.agent` 插件 |
+| 领域面 JSON | 7 / 8 | `git` / `spec` / `mcp` |
+| 领域面二进制 | 11 / 13 | `files` |
+| **合计** | **88 / 93** | |
 
-`ApiPaths.kept` 语义改为「契约全集」（70 条）；新增静态集合：
+> 91 条已注册 + 2 条新增 = 93 条方法路由；路径去重后 88 条（同路径多方法：`/api/files`、`/content`、`/mcp/services` 各占 2 个方法）。
 
-- `ApiPaths.coreOwned`（27）
-- `ApiPaths.delegated`（43）
+`ApiPaths.kept` 语义改为「契约全集」（93 条）；新增静态集合：
+
+- `ApiPaths.coreOwned`（36）
+- `ApiPaths.delegated`（57）
 
 门禁从 `router ∪ stub ⊆ kept` 改为 **`coreOwned ∪ delegated == kept`**，且核心 `router` 不得包含任何 `delegated` 路径。
+
+> **待决（L-28）**：上面这条门禁仍依赖静态枚举 `delegated`。若要真正做到「插件自行申报、核心不逐条硬编码」，应删除该静态白名单，改为命名空间规则 + 前缀保留 + 归属表冲突检测；门禁改为「核心 router 键集 == `coreOwned`（36）」。详见 [agent_pluginization.md §10.4](agent_pluginization.md)。
 
 ***
 
@@ -583,11 +600,11 @@ UI 插件可申报图标，核心通过内置点位 `system.collect.ui.branding`
 | D  | `runtime: ui` + `UiHost` + **依赖闸门**      | —                                | 多个 UI 可并存、可独立卸载；缺依赖时拒绝启用并可一键补齐                 |
 | E  | 引导壳 + 删除旧 UI 面板协议                       | —                                | 卸掉所有 UI 后能从引导页装回                                   |
 | F  | 日志 API + 数据存储 API                       | —                                | 插件只经由公共出口读日志/落盘，跨命名空间被拒                            |
-| G  | **agent 面 25 条 + 领域帧所有权移交**             | `tree.agent`                     | 25 条由插件供；核心无 agent/session/question/ssh 路由，也不识别领域帧 |
+| G  | **agent 面 36 条 + 领域帧所有权移交**             | `tree.agent`                     | 36 条由插件供；核心无 agent/session/question/ssh 路由，也不识别领域帧 |
 
 **批次 C 是一次性迁移，不接受"先做 Git 三条"的中间态。** C-1 与 C-2 各自必须整组完成；两组都完成才算批次 C 结束。若同组内某条阻塞，该组挂起，不拆开交付。
 
-**批次 G 同理**：25 条一次性交接，不接受"先搬 agents 三条"。F 必须先于 G，因为 agent 插件依赖公共存储与日志出口。
+**批次 G 同理**：36 条一次性交接，不接受"先搬 agents 三条"。F 必须先于 G，因为 agent 插件依赖公共存储与日志出口。
 
 ***
 
@@ -603,7 +620,7 @@ UI 插件可申报图标，核心通过内置点位 `system.collect.ui.branding`
 | D | runtime:ui           | `builtin_plugins.dart`（`runtime` 取值）、`plugin_config_store.dart`（`runtime` 两档）、`ui_host.dart`、`plugin_bus.dart`（`_startOne` 分叉）、`plugin_downloader.dart`（卸载目标）                                              | 多 UI 并存；卸一个不影响其他；全停用后核心健康                                                                |
 | E | 引导壳 + 删除             | token 作用域注册表、`/bootstrap`、`/api/bootstrap/session`、`assets`→种子化 HTML、非 Flutter loader、删除 §3.6 全部对象                                                                                                  | 全量测试 + flutter；手工走通「卸光 → 引导页装回」与「只剩悬浮球 → 仍开引导页」                                          |
 | F | 日志 + 存储              | `api_paths.dart`（+7）、`core_server.dart`（两组路由）、`util/core_log_sink.dart`（源注册与尾部读）、`store/`（命名空间代理、配额、etag）                                                                                           | 源列表/尾部读/清空；`ns != plugin_id` 403；配额与 etag 冲突可读                                           |
-| G | agent 面交接            | 见 [agent\_pluginization.md](agent_pluginization.md) §6；本仓只负责**删除** 25 条路由与领域帧，插件侧在 `tree-plugins` 仓交付                                                                                               | 25 条由插件供且零功能丢失；核心 grep 不到领域模型                                                            |
+| G | agent 面交接            | 见 [agent\_pluginization.md](agent_pluginization.md) §6；本仓只负责**删除** 36 条路由与领域帧，插件侧在 `tree-plugins` 仓交付                                                                                               | 36 条由插件供且零功能丢失；核心 grep 不到领域模型                                                            |
 
 ***
 
@@ -623,7 +640,7 @@ UI 插件可申报图标，核心通过内置点位 `system.collect.ui.branding`
 | 核心 · 日志     | 源枚举、尾部读（`tail`/`since`）、清空权限、插件源与核心源隔离                                                  |
 | 核心 · 存储     | `ns != plugin_id` → 403；单值与命名空间配额；`etag` 乐观锁冲突 → 409；核心不解析值                             |
 | 前端          | 槽位相关用例随 E 片整体删除；`main_page` 无残留引用                                                       |
-| agent 交接    | 25 条端点的功能对等清单（见 agent 文档 §5），逐条有对应用例；核心侧路由删除后返回 404                                     |
+| agent 交接    | 36 条端点的功能对等清单（见 agent 文档 §5），逐条有对应用例；核心侧路由删除后返回 404                                     |
 | 流式一致性      | `seq` 单调、快照水位对齐、`lagged`/`reset`/`closed` 四态、合并发送（50ms / 32 token）                                |
 | 依赖          | 启用闸门 409、自动安装只补不升、版本求交、环检测、卸载连带停用                                             |
 | 品牌          | 收集站最后到达生效、撤回回退、路径限目录、格式/尺寸/体积闸门、失效回默认、exe 哈希不变                                       |

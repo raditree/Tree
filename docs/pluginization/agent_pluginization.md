@@ -8,7 +8,7 @@
 
 ## 0. 一句话
 
-把 `packages/tree_core/lib/src/{agent,llm,team,tool,mcp}` 连同 23 条 REST 端点与 2 条上行指令，整体迁给二进制插件 `tree.agent`；核心只保留插件平台、日志、数据存储三类基础 API。实现方式不是"另写一个插件"，而是**把现有实现原样搬进插件仓内的共享包 `tree_agent_loop`，让插件二进制引用它**——用搬运替代重写，才能保住功能等价。
+把 `packages/tree_core/lib/src/{agent,llm,team,tool,mcp}` 连同 34 条存量 REST 端点与 2 条上行指令（合计 36 条）整体迁给二进制插件 `tree.agent`；核心只保留插件平台、日志、数据存储三类基础 API。实现方式不是"另写一个插件"，而是**把现有实现原样搬进插件仓内的共享包 `tree_agent_loop`，让插件二进制引用它**——用搬运替代重写，才能保住功能等价。
 
 ---
 
@@ -35,9 +35,29 @@
 | `files/file_service.dart` | 本地/远端文件读写 | **迁出核心** → `local_executor` / `ssh_executor`（见 §4.6） |
 | `store/` | 文件存储、原子写、记录、用量日志 | 领域记录（`records` / `tree_store` / `subagent_registry`）随迁；通用小件插件自备；核心只留通用 KV 与日志 |
 
-### 1.2 REST 端点（23 条）
+### 1.2 REST 端点（36 条，2026-10-25 实测冻结）
 
-见 [ui-pluginization.md §4.2](ui-pluginization.md#42-agent-面23-条--agent-插件批次-f)。**23 条全部移交，核心一条不留。**
+口径来源：`core_server.dart` 的 `_registerRoutes` 逐条点数，非旧文档推算。
+
+| 组 | 条数 | 端点（方法 + 路径） |
+| --- | --- | --- |
+| agent 定义 | 7 | `GET/POST /api/agents`、`GET/PATCH/DELETE /api/agents/{id}`、`GET .../models-info`、`GET .../todos` |
+| 模型池 | 4 | `GET/POST /api/models`、`PATCH/DELETE /api/models/{id}` |
+| 团队 | 4 | `GET .../teammates`、`PATCH /api/agents/{leader}/teammate/{member}`、`GET .../teammate/{id}/log`、`POST .../teammate/{id}/message` |
+| 子 agent | 2 | `GET .../subagents`、`GET .../subagents/{sid}/transcript` |
+| 会话 / 历史 | 8 | `GET/DELETE /api/conversations/{id}`、`GET/POST .../sessions`、`GET/PATCH/DELETE .../sessions/{sid}`、`POST .../sessions/{sid}/specs` |
+| 维护 | 3 | `POST .../reset`、`POST .../compact`、`POST .../ssh/reconnect` |
+| 提问 | 2 | `GET /api/questions`、`POST /api/questions/{qid}/answer` |
+| 运行监督 | 2 | `GET /api/tools/running`、`POST /api/tools/running/{handle}/close` |
+| token 节奏（§4.8 判为领域） | 2 | `GET/POST /api/settings/token-rate` |
+| **存量小计** | **34** | |
+| 上行改委派（新增） | 2 | `POST /api/agents/{id}/messages`、`POST /api/agents/{id}/cancel` |
+| **合计移交** | **36** | 核心一条不留 |
+
+> **旧口径作废**：`23 条存量 / 25 条移交` 是错的；按组逐条数出来是 `34 + 2 = 36`。
+> 详见 [ui-pluginization.md](ui-pluginization.md) §4.2。
+
+其余归属（同一次实测）：`spec` 2、`mcp` 3、`files` 13、`git` 3、核心永久面 36，合计 93 条契约。
 
 ### 1.3 WS 帧
 
@@ -46,9 +66,9 @@
 | 下行 | `message`、`tool_start`、`tool_end`、`agent_status`、`agent_done`、`agent_error`、`question` | 改由插件以 `station_delivery` 的 topic 发出 |
 | 上行 | `send_message`、`cancel`、`answer_question` | 前两条改为新增委派端点；`answer_question` 复用 `POST /api/questions/{qid}/answer` |
 
-> **重要修正**：交接不是"23 条"。上行指令没有 REST 等价物，必须一并转成委派端点，因此 agent 插件实际承担 **25 条**：
+> **重要修正**：上行指令没有 REST 等价物，必须一并转成委派端点，因此 agent 插件实际承担 **36 条**（34 存量 + 2 新增）：
 > `POST /api/agents/{id}/messages`、`POST /api/agents/{id}/cancel` 为新增。
-> 这两条属于插件自有路由，登记在 `delegated` 集合，核心不实现。
+> 这两条属于插件自有路由，由插件经 `system.collect.api.routes` 申报，核心不实现。
 
 ---
 
@@ -69,7 +89,7 @@ UI (runtime: ui) ──WS──> tree_core ──转发──> 订阅者
 | 形态 | `runtime: headless`，`command` 指向 Dart AOT 单文件可执行体 |
 | 代码来源 | 新包 `tree_agent_loop`（插件仓 `plugins/tree.agent/`），从 `tree_core` 平移；**不得反向依赖 `tree_core`** |
 | 传输 | stdio 行式 JSON-RPC（与现有插件一致） |
-| 对外 API | 25 条委派路由，由 `system.collect.api.routes` 申报 |
+| 对外 API | 36 条委派路由，由 `system.collect.api.routes` 申报 |
 | 对外事件 | 注册广播站，topic 沿用原帧名 |
 | 持久化 | 小状态走 `/api/store/tree.agent`；大对象（会话、流水）落在插件自有目录 |
 | 日志 | 写 `/api/logs/plugin:tree.agent`（沿用核心日志 API） |
@@ -275,10 +295,10 @@ UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行�
 | 批次 | 内容 | 完成判据 |
 | --- | --- | --- |
 | A1 骨架 | `plugins/tree.agent/`（包 `tree_agent_loop`）建立；插件二进制 + stdio 循环 + 健康检查 + 日志/存储接入 | 空插件能被启停；日志出现在 `/api/logs/plugin:tree.agent` |
-| A2 只读面 | agents / models / sessions / conversations / todos / subagents / teammates / tools-running 的读路径 | 25 条中只读部分返回与核心逐字节一致（同一数据目录） |
+| A2 只读面 | agents / models / sessions / conversations / todos / subagents / teammates / tools-running 的读路径 | 36 条中只读部分返回与核心逐字节一致（同一数据目录） |
 | A3 写路径与生成 | 消息发送、取消、LLM 调用、工具编排、提问、reset/compact | 同一会话在插件侧跑出的记录与核心侧结构一致 |
 | A4 帧迁移 | 广播站注册，topic 沿用原帧名；UI 订阅切换到新来源 | 双轨比对无差异后关闭核心直发 |
-| A5 交接 | 核心删除 23 条路由 + 2 条上行指令 + `agent/llm/team/tool` 目录 | 核心 `grep` 不到领域模型；§5 全表打勾 |
+| A5 交接 | 核心删除 34 条路由 + 2 条上行指令 + `agent/llm/team/tool` 目录 | 核心 `grep` 不到领域模型；§5 全表打勾 |
 
 A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、插件写），A5 一次性切换并删除。
 
@@ -337,9 +357,10 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | 1 | 插件仓挂载在 `plugins/`（远端仓库名 `tree-plugins`），但其中**没有** `tree.agent/` 目录；发布索引 `plugins/release/plugin-index.json` 也没有该条目 | A1「插件二进制 + stdio 循环」需先在插件仓新建目录与包 |
 | 2 | ~~`packages/tree_agent` 重名~~ **已规避**：新包定名 `tree_agent_loop`（放 `plugins/tree.agent/`）；现有 `packages/tree_agent` 是目标机 Linux 执行体，不改名、不复用 | 无（命名冲突消解） |
 | 3 | 领域代码规模约 20k 行：`agent` 5345 / `llm` 5030 / `team` 2683 / `tool` 5139 / `mcp` 1572；且对核心基础件有硬依赖——`agent → store 12 / util 5 / tool 5 / settings 4 / plugin 2`、`tool → team 7 / plugin 5 / spec 4 / store 4`、`llm → util 6 / settings 5 / agent 5 / store 5` | 插件不得 import 核心包，故必须：领域层与通用小件**复制随迁**、设置先拆分、插件互通改**执行器插件的自建执行站**（§10.1） |
-| 4 | 核心测试 176 个文件，其中大量用例直接 import `src/agent|llm|team|tool`；`core_server.dart` 的 `_registerRoutes` 实际注册约 **33 条**领域路由（agents CRUD、models、sessions、conversations、subagents、teammates、specs、reset/compact/ssh reconnect、questions 等） | §1.2 / §6 的「23 / 25 条」口径已漂移；A2 的「逐字节一致」基线需先重新点数并冻结 |
+| 4 | 核心测试 176 个文件，其中大量用例直接 import `src/agent|llm|team|tool`；`_registerRoutes` 已逐条点清：`tree.agent` 34 条 + spec 2 + mcp 3 + files 13 + git 3 + 核心永久面 36 = 91 条已注册（+2 条新增 = 93） | 旧「23 / 25 条」口径作废；A2 基线按 36 条冻结（§1.2） |
+| 5 | 委派白名单 `ApiPaths.delegated` 是**静态 18 条路径**（`tree_protocol`）；不在集合内的插件路由一律拒收 | 不解决的话，新插件每加一条路由都要改核心并重新发版，与「插件自行申报」冲突 → L-28 |
 
-结论：G 的正确起点不是搬代码，而是先完成四项前置（`core_settings` 拆分、scope 去领域化立项、路由基线冻结、`local_executor` 执行站就位），再按 A1（最小端点 `GET /api/agents` 走通 stdio / 委派 / 一致性）验证脚手架。
+> 结论：G 的正确起点不是搬代码，而是先完成五项前置（`core_settings` 拆分、scope 去领域化立项、`local_executor` 执行站就位、委派白名单去静态化、按 36 条建 G-1 对照表），再按 A1（最小端点 `GET /api/agents` 走通 stdio / 委派 / 一致性）验证脚手架。
 
 ### 已拍板（2026-10-25）
 
@@ -356,10 +377,7 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | 9 | `core_settings.dart` 先按「平台级 / 领域级」拆分，拆分前不得开始 A1 数据接管（§4.8） |
 | 10 | 插件 scope 必须去领域化：`team_id / agent_id / session_id / mode_key` 逐步移除，授权搬到「执行器插件 + workspace 租约」（§10.3） |
 | 11 | **执行与文件全部下沉**：本地命令 / PTY / 文件修改归 `local_executor`，远端归 `ssh_executor`；核心零 PTY、零文件操作，只留通用流中继与租约登记（§4.6） |
-
-### 仍需拍板
-
-12. **路由点数基线**：以 `_registerRoutes` 的 33 条为准重写 §1.2/§5/§6，还是趁机裁剪到真正的 25 条功能面？
+| 12 | **路由基线按实测冻结**：`tree.agent` = **36 条**（34 存量 + 2 新增），核心永久面 36 条；「裁剪到 25 条」的口径作废（那份 25 是数错的）。是否裁剪功能另立遗留项 L-27，不与 G 混做 |
 
 ---
 
@@ -470,6 +488,36 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 3. 之后删除字段、映射、`scope.key` 与 UI 侧 scope 订阅参数，并更新 `tree_protocol` 的站点契约。
 
 > 这是一次协议破坏性变更，**不属于 G**；登记为遗留项 L-23，需单独立项与独立审批。
+
+## 10.4 路由可见面：核心硬编码 36 条，其余由插件申报
+
+**目标形态（迁移完成后）**
+
+| 层 | 内容 | 是否有 per-route 硬编码 |
+| --- | --- | --- |
+| 核心路由表 | 36 条核心永久面（插件管理、日志、store、bootstrap、meta、站点、平台设置、租约） | **有**，但这 36 条是核心自己的接口，本就该硬编码 |
+| 委派路由 | 其余 57 条（agent 36 / spec 2 / mcp 3 / files 13 / git 3） | **没有**：插件启动时经 `system.collect.api.routes` 申报 `{method, pattern}`，核心只维护「归属表」并转发 `api/delegate` |
+| 冲突 | 同一 `method + pattern` 被两家插件申报 ⇒ 整条拒收，`/api/meta` 不出现 | 规则化处理，不逐条配置 |
+
+即：**核心不会为任何插件路由写 handler**；`router.add` 只在 `_registerRoutes` 里给核心自己的 36 条用。
+
+**当前实现的两个不符合点**
+
+1. `stubApiPaths` 为空集（已无害），但 `stubRouter` 仍在查表链里——可保留为兜底，不构成硬编码。
+2. **`ApiPaths.delegated` 是静态 18 条路径白名单**（[api_paths.dart](file:///e:/programs/Tree/desktop/packages/tree_protocol/lib/src/api_paths.dart#L304-L330)），插件申报集合外的路径一律拒收。这等于「新插件加一条路由 = 改核心 + 发版」，与插件平台定位冲突。
+
+**建议改法（L-28）**
+
+| 现规则 | 建议规则 |
+| --- | --- |
+| 路径必须在静态白名单内 | 路径必须满足命名空间规则：`/api/` 前缀 + 不在核心 36 条内 + 不与核心 pattern 冲突 |
+| 白名单按批次手工追加 | 删除静态白名单；保留「归属表冲突检测」（同键唯一）+「核心路由优先」 |
+| 契约全集 `kept` 静态 93 条 | `coreOwned` 静态 36 条；委派面不再静态枚举，改由 `/api/meta` 运行期聚合 |
+| 门禁 `coreOwned ∪ delegated == kept` | 门禁改为：核心 router 的键集 == `coreOwned`（36），且不含任何委派键 |
+
+> 若担心「插件自造端点」失控，可保留**前缀保留**规则（如禁止申报 `/api/bootstrap`、`/api/plugins`、`/api/logs`、`/api/store`、`/api/meta` 前缀），而不是逐条枚举。
+
+---
 
 > 全部未闭环项（含 G-1~G-7、U-3/U-4、C-11、手工回归、文档缺口）已统一登记在
 > [ui-pluginization_acceptance.md §12 遗留项台账](ui-pluginization_acceptance.md#12-遗留项台账2026-10-25-落档)。
