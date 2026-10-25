@@ -203,7 +203,7 @@
 > 用途：一次把「还没做完 / 还没验完 / 还不能做」的项全部登记，避免靠对话记忆。
 > 每项都写清**为什么停在这里**与**解除条件**；解除后在本表就地改为「已闭环」并注明提交号。
 > 已闭环不再重复讨论：`requires.api` 闸门（`24b25d2`）、U1 附着化、U2 打包脚本、U3 `ui.hello`、
-> U4 站点客户端（订阅/重连/`closed` 横幅）、E-9 旧协议残留清理、L-28 委派白名单去静态化（2026-10-25）。
+> U4 站点客户端（订阅/重连/`closed` 横幅）、E-9 旧协议残留清理、L-28 委派白名单去静态化（`6a30e81`）。
 
 ### A. 代码项
 
@@ -246,7 +246,7 @@
 | L-18 | 插件开发文档「UI 视图受限控件集」与实际实现对齐 | 待复核 | 历史记录为不一致，需对照当前代码确认 |
 | L-19 | G-1 对照表本身（36 行，含样例） | 未建 | 作为 G-1 的前置产物 |
 | L-27 | 是否裁剪功能面（token-rate / tools-running / session specs 等） | 未决 | G 只做等量迁移，不做减法；裁剪需要产品决策 | G 完成后按真实使用数据单独评审，不与迁移混做 |
-| L-28 | 委派白名单 `ApiPaths.delegated` 去静态化 | **已闭环**（2026-10-25） | — | 已落地命名空间规则 + 保留前缀 + 与核心已实现路由同键拒收 + 归属表冲突检测；门禁改为「`coreOwned ⊆ 核心 router 键集 ⊆ coreOwned ∪ pendingHandoffRoutes`」。证据：`ui-pluginization.md` §4.5、`http_router.dart`、`server_test.dart`、`delegated_rest_test.dart` |
+| L-28 | 委派白名单 `ApiPaths.delegated` 去静态化 | **已闭环**（`6a30e81`，2026-10-25） | — | 已落地命名空间规则 + 保留前缀 + 与核心已实现路由同键拒收 + 归属表冲突检测；门禁改为「`coreOwned ⊆ 核心 router 键集 ⊆ coreOwned ∪ pendingHandoffRoutes`」。证据：`ui-pluginization.md` §4.5、`http_router.dart`、`server_test.dart`、`delegated_rest_test.dart` |
 
 ### D. 已拍板（避免重复问）
 
