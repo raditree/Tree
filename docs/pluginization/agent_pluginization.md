@@ -232,8 +232,12 @@ UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行�
 - **过渡形态**：执行站点位仍是核心内置（`system.execute.fs/terminal`），由插件
   挂载；「插件自建执行站 + 插件自定义 `file.*` / `exec.command` 命令」留到 A5。
   核心内置挂载仍保留给无租约的旧调用方（UI/其它插件），A5 删除；
+- **加固（评审后）**：插件只能显式接管数据面命令白名单（fs.read/write/list/grep、
+  terminal.exec），控制面 plugin.* 不可挂载；同命令已有其它插件接管则拒绝；
+  插件下线/卸载自动 unmount 并清租约；租约键按插件命名空间隔离；
+  `lease_id` 命令注入 root 后跳过 `_resolveTarget`。
 - **未覆盖**：SSH 工作空间仍走核心内置 IO（ssh_executor 执行站未接租约）、PTY、
-  后台 hook 任务、fs.delete/二进制写。
+  后台 hook 任务、fs.delete/二进制写；执行器转发尚未接入热重启缓冲。
 
 ### 4.6.2 核心职责白名单（反向约束）
 
