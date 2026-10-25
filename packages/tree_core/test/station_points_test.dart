@@ -90,9 +90,9 @@ void main() {
       );
     });
 
-    test('命令 → 点位：30 条命令，每条恰好属于一个执行站点位', () {
+    test('命令 → 点位：29 条命令，每条恰好属于一个执行站点位', () {
       final Set<String> commands = StationPoints.allCommands;
-      expect(commands.length, 30, reason: '$commands');
+      expect(commands.length, 29, reason: '$commands');
       expect(commands, <String>{
         'fs.read',
         'fs.write',
@@ -121,7 +121,6 @@ void main() {
         'plugin.restart',
         'plugin.suspend',
         'plugin.state',
-        'plugin.mount',
         'plugin.toolCall',
         'plugin.stateDump',
         'plugin.stateFetch',
