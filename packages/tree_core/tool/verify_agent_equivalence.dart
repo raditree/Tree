@@ -26,6 +26,7 @@ import 'package:tree_core/tree_core.dart';
 /// 当前已搬进插件、可做等价对照的路由（与 `agent_api_contract.md` 的编号对应）。
 const List<String> kImplementedRoutes = <String>[
   'GET /api/agents',
+  'GET /api/agents/{agentId}',
   'GET /api/agents/{agentId}/todos',
   'GET /api/agents/{agentId}/subagents',
   'GET /api/models',
@@ -248,6 +249,31 @@ Future<String?> _runCase(String route, String exe) async {
         query: <String, String>{},
         pathParams: <String, String>{},
         agentId: '',
+      );
+    case 'GET /api/agents/{agentId}':
+      store.putAgent(
+        CoreAgent(
+          id: 'agt_m',
+          name: '成员',
+          createdAt: DateTime.parse(
+            '2026-10-25T10:00:00.000',
+          ).millisecondsSinceEpoch,
+          updatedAt: DateTime.parse(
+            '2026-10-25T10:00:01.000',
+          ).millisecondsSinceEpoch,
+          teamId: 'agt_top',
+          parentAgentId: 'agt_top',
+          level: 1,
+          reviewStatus: 'pending_review',
+          sshConfig: const SshConfig(host: '10.0.0.5'),
+        ),
+      );
+      await store.flush();
+      call = const _RouteCall(
+        concretePath: '/api/agents/agt_m',
+        query: <String, String>{},
+        pathParams: <String, String>{'agentId': 'agt_m'},
+        agentId: 'agt_m',
       );
     case 'GET /api/agents/{agentId}/todos':
       store.putAgent(
