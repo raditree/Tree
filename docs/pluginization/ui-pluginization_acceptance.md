@@ -126,11 +126,10 @@
 > A1 证据：`--selftest` 8 项全绿；真核心拉起 AOT 产物后 ready，stderr 与 `log` 通知两路日志都出现在
 > `/api/logs/plugin:tree.agent`，`enabled:false` 热应用后下线。A2~A5（只读面 / 写路径与生成 / 帧迁移 /
 > 核心删除）仍按 [agent_pluginization.md](agent_pluginization.md) §6 与 [agent_api_contract.md](agent_api_contract.md) 推进。
-> A2 进行中：`api/delegate` 管道 + `GET /api/agents`、`GET /api/agents/{id}`、`GET /api/conversations/{id}`、
-> `GET …/sessions`、`GET …/sessions/{id}`、`GET …/todos`、`GET …/subagents`、`GET /api/models`、
-> `GET …/models-info` 已用 `packages/tree_core/tool/verify_agent_equivalence.dart` 做双跑对照
-> （九条均状态码 / Content-Type / body 逐字节一致）。剩余 A2 组：teammates / tools-running
-> （后者依赖工具层随迁，A3 再搬）。
+> A2 进行中：`api/delegate` 管道 + `GET /api/agents`、`GET /api/agents/{id}`、`GET …/teammates`、
+> `GET /api/conversations/{id}`、`GET …/sessions`、`GET …/sessions/{id}`、`GET …/todos`、`GET …/subagents`、
+> `GET /api/models`、`GET …/models-info` 已用 `packages/tree_core/tool/verify_agent_equivalence.dart`
+> 做双跑对照（十条均状态码 / Content-Type / body 逐字节一致）。仅剩 tools-running（依赖工具层随迁，A3 再搬）。
 > 在插件侧等价验收通过前，核心路由与领域帧保持原样（不变量 2/3）。
 
 | ID | 操作 | 期望 |
@@ -219,7 +218,7 @@
 
 | ID | 项 | 状态 | 阻塞 / 原因 | 解除条件与下一步 |
 | --- | --- | --- | --- | --- |
-| L-01 | G-1 端点等价对照（按实测 **36 条 = 34 存量 + 2 新增**；旧口径 23/25 已作废） | **进行中**：A1 + 对照表 + 第 1 条只读路由等价 | 其余 35 条未搬（A2~A5） | A1 已完成（tree-plugins `3704101`）；A2 已搬 `GET /api/agents`、`GET /api/agents/{id}`、`GET /api/conversations/{id}`、`GET …/sessions`、`GET …/sessions/{id}`、`GET …/todos`、`GET …/subagents`、`GET /api/models`、`GET …/models-info`，九条双跑逐字节一致（`tool/verify_agent_equivalence.dart`）；按 [agent_api_contract.md](agent_api_contract.md) 继续 |
+| L-01 | G-1 端点等价对照（按实测 **36 条 = 34 存量 + 2 新增**；旧口径 23/25 已作废） | **进行中**：A1 + 对照表 + 第 1 条只读路由等价 | 其余 35 条未搬（A2~A5） | A1 已完成（tree-plugins `3704101`）；A2 已搬 `GET /api/agents`、`GET /api/agents/{id}`、`GET …/teammates`、`GET /api/conversations/{id}`、`GET …/sessions`、`GET …/sessions/{id}`、`GET …/todos`、`GET …/subagents`、`GET /api/models`、`GET …/models-info`，十条双跑逐字节一致（`tool/verify_agent_equivalence.dart`）；仅剩 tools-running（A3 随迁） |
 | L-02 | G-2 核心路由表去除领域路由 | 未开始 | 不变量 27：插件侧等价验收通过前不得删 | G-1 全绿后同批删除 |
 | L-03 | G-3 领域帧改 `station_delivery` | 未开始 | 依赖 G-1 的事件面迁移 | topic 沿用原帧名，10 条帧逐条迁移 |
 | L-04 | G-4 过渡映射删除 | 未开始 | 依赖 G-3 完成一个版本周期 | G+1 提交时删除映射代码 |

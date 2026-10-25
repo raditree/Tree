@@ -27,6 +27,7 @@ import 'package:tree_core/tree_core.dart';
 const List<String> kImplementedRoutes = <String>[
   'GET /api/agents',
   'GET /api/agents/{agentId}',
+  'GET /api/agents/{agentId}/teammates',
   'GET /api/conversations/{agentId}',
   'GET /api/agents/{agentId}/sessions',
   'GET /api/agents/{agentId}/sessions/{sessionId}',
@@ -299,6 +300,69 @@ Future<String?> _runCase(String route, String exe) async {
         },
         agentId: 'agt',
       );
+    case 'GET /api/agents/{agentId}/teammates':
+      _writeModelFixtures(paths);
+      FileSettingsSink(paths).load(settings);
+      store.putAgent(
+        CoreAgent(
+          id: 'agt_top',
+          name: '指挥',
+          createdAt: DateTime.parse(
+            '2026-10-25T10:00:01.000',
+          ).millisecondsSinceEpoch,
+          updatedAt: DateTime.parse(
+            '2026-10-25T10:00:02.000',
+          ).millisecondsSinceEpoch,
+          modelId: 'm1',
+          systemPrompt: '你是指挥',
+        ),
+      );
+      store.putAgent(
+        CoreAgent(
+          id: 'agt_m',
+          name: '成员',
+          createdAt: DateTime.parse(
+            '2026-10-25T10:00:00.000',
+          ).millisecondsSinceEpoch,
+          updatedAt: DateTime.parse(
+            '2026-10-25T10:00:01.000',
+          ).millisecondsSinceEpoch,
+          teamId: 'agt_top',
+          parentAgentId: 'agt_top',
+          level: 1,
+          reviewStatus: 'pending_review',
+          reasoningEffort: 'low',
+          maxSeqlenOverride: 16000,
+          thinkingOverride: false,
+        ),
+      );
+      store.putAgent(
+        CoreAgent(
+          id: 'agt_m2',
+          name: '执行',
+          createdAt: DateTime.parse(
+            '2026-10-25T10:00:04.000',
+          ).millisecondsSinceEpoch,
+          updatedAt: DateTime.parse(
+            '2026-10-25T10:00:04.000',
+          ).millisecondsSinceEpoch,
+          teamId: 'agt_top',
+          parentAgentId: 'agt_m',
+          level: 2,
+          role: '执行',
+          duty: '跑测试',
+          modelId: 'm2',
+          reviewStatus: 'approved',
+          workspaceId: 'ws_m2',
+        ),
+      );
+      await store.flush();
+      call = const _RouteCall(
+        concretePath: '/api/agents/agt_top/teammates',
+        query: <String, String>{},
+        pathParams: <String, String>{'agentId': 'agt_top'},
+        agentId: 'agt_top',
+      );
     case 'GET /api/conversations/{agentId}':
       await _seedSessions(store);
       questionStore = FileQuestionStore(paths);
@@ -458,7 +522,7 @@ Future<String?> _runCase(String route, String exe) async {
     streamChunkDelay: Duration.zero,
     store: store,
     settings: settings,
-    teamService: TeamService(store: store),
+    teamService: TeamService(store: store, settings: settings),
     questions: questionBroker,
     todoStore: FileTodoStore(paths),
   );
