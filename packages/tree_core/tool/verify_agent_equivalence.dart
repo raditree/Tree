@@ -62,6 +62,12 @@ const List<String> kDeclaredOnlyRoutes = <String>[
   'DELETE /api/conversations/{agentId}',
   'GET /api/questions',
   'POST /api/questions/{qid}/answer',
+  'PATCH /api/agents/{leaderId}/teammate/{memberId}',
+  'POST /api/agents/{leaderId}/teammate/{memberId}/message',
+  'GET /api/agents/{leaderId}/teammate/{memberId}/log',
+  'POST /api/agents/{agentId}/compact',
+  'GET /api/agents/{agentId}/specs',
+  'GET /api/agents/{agentId}/specs/{specId}',
 ];
 
 Future<void> main(List<String> args) async {
