@@ -2160,4 +2160,48 @@ terminal/subagent hook 完成消息）在工具调用期间必须排队等待」
 ### 测试钉子
 
 `packages/tree_core/test/truncated_tool_args_repair_test.dart` 15 例（含真机 500 报错里那段半截
-markdown 的还原）；`http_sse_transport_test` 『有限重试』组钉截断 500 不重试 + 可操作提示。
+markdown 的还原）；`http_sse_transport_test` 『有限重试』组钉截断 500 不重试 +  可操作提示。
+
+---
+
+## #31 集成终端迁移后无承接方（PTY 数据面延后）
+
+**状态**：**未实现（2026-10-25 定案：本期不做新数据面）**。
+**影响**：UI 的 Ctrl+J 终端不可用——核心 `terminal/` 已随 A5 删除，执行器插件只提供一次性命令与文件操作，没有交互式 PTY。
+
+### 现象
+
+- `packages/tree_core/lib/src/terminal/` 已删除（`terminal_service` / `local_pty_starter` / `pty_process` / `ssh_pty_adapter`）；核心不再产生 `terminal_ready` / `terminal_output` / `terminal_exit` 帧。
+- `local_executor` 只注册 `file.*` / `exec.command`（一次性命令，无 PTY 句柄）；`ssh_executor` 的 PTY 依附于隧道内部事件，未向 UI 暴露。
+- UI 终端面板仍以旧帧名为入口，收不到任何数据。
+
+### 根因
+
+1. A5 按"核心零领域"删除终端实现，但承接方尚未实现；
+2. 原方案（acceptance L-26）要求核心新增「与协议无关的流中继（`stream session`）」——这是一条**新数据面**，本期明确不做。
+
+### 修复方向（已定，未实现）
+
+**不为终端新增核心流原语**；改为「REST 管会话 + 广播站推输出」：
+
+| 动作 | 端点 / 通道 | 所在 |
+| --- | --- | --- |
+| 建终端会话 | `POST /api/terminal/sessions` → `{session_id, cwd, shell}` | `local_executor` / `ssh_executor` 各自申报 |
+| 执行 / 输入 | `POST /api/terminal/sessions/{id}/input`（也用于"执行一条命令"） | 同上 |
+| 取消 / 中断 | `POST /api/terminal/sessions/{id}/cancel`（Ctrl+C 语义由执行器决定） | 同上 |
+| 调整尺寸 | `POST /api/terminal/sessions/{id}/resize` | 同上 |
+| 关闭会话 | `DELETE /api/terminal/sessions/{id}` | 同上 |
+| 输出推送 | 广播站 topic `executor.<session_id>.output` / `.exit`（复用 A4 的 `station_delivery`） | 执行器自建站 |
+
+约束：
+
+- 核心只做**路由 + 身份透传 + 租约校验**，不认识终端语义，不持有 PTY 句柄；
+- 本地 / 远端由 UI 选择（或由 workspace 的 mode 决定），`local_executor` 与 `ssh_executor` 接口同形；
+- 执行器崩溃 / 插件停用 ⇒ 推 `closed`，UI 显示可读提示并允许重开（会话不持久化）；
+- 输出帧必须带单调 `seq`（沿用 `StationDelivery.seq`），UI 按水位去重；
+- 不新增 WS 上行帧类型：输入走 REST，UI 侧仍保持"功能调用一律 REST"。
+
+### 关联
+
+- acceptance：L-24（执行器 PTY）、L-25（执行站契约）、**L-26 改为"不做新数据面，改 REST + 广播站"**；
+- 文档：`agent_pluginization.md` §4.6、`ui-pluginization.md` 不变量 28/29 与终端归属表。
