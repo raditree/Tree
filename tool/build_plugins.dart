@@ -95,7 +95,14 @@ Future<void> main(List<String> args) async {
     bool ok = true;
     for (final _PluginFile file in manifest.files) {
       final File artifact = File(_join(outDir.path, file.target));
-      if (manifest.runtime == 'binary' && file.isCommand) {
+      // 需要 Dart 编译的形态：新口径 headless / ui + 历史 binary。
+      // python 是脚本（历史值），不编译成可执行体。
+      if (const <String>{
+            'headless',
+            'ui',
+            'binary',
+          }.contains(manifest.runtime) &&
+          file.isCommand) {
         final String? entrySource = manifest.dartEntry;
         if (entrySource == null) {
           failures.add(
@@ -476,8 +483,11 @@ class _PluginManifest {
     if (!_versionPattern.hasMatch(version)) {
       return 'version（$version）必须是三段数字 x.y.z';
     }
-    if (runtime != 'binary' && runtime != 'python') {
-      return 'runtime（$runtime）只能是 binary / python';
+    // 片 D 起 runtime 只有两档分类：headless / ui（与语言、执行形态无关）。
+    // 历史清单的 binary / python 继续接受（核心归一化为 headless + 「清单待升级」），
+    // 但新写的清单请用 headless / ui——这里不做静默归一，否则拼错也照跑。
+    if (!const <String>['headless', 'ui', 'binary', 'python'].contains(runtime)) {
+      return 'runtime（$runtime）只能是 headless / ui（历史值 binary / python 仍接受）';
     }
     if (fileNames.isEmpty) return 'files 至少要有一个';
     if (command.trim().isEmpty) return '缺少 command（装完要知道拉哪个）';

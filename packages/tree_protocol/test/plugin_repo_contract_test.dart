@@ -101,10 +101,12 @@ void main() {
         reason: '$id 的 version（${_str(manifest['version'])}）必须是三段数字',
       );
       final String runtime = _str(manifest['runtime'], fallback: 'binary');
+      // 片 D：唯一分类维度是「有无界面」，与语言 / 执行形态无关。
+      // binary / python 是历史清单值（核心归一化为 headless + 「清单待升级」）。
       expect(
-        <String>['binary', 'python'],
+        <String>['headless', 'ui', 'binary', 'python'],
         contains(runtime),
-        reason: '$id 的 runtime（$runtime）只能是 binary / python',
+        reason: '$id 的 runtime（$runtime）只能是 headless / ui（历史值 binary / python 仍接受）',
       );
       final List<dynamic> files = manifest['files'] is List
           ? manifest['files'] as List<dynamic>
@@ -149,12 +151,13 @@ void main() {
     }
   });
 
-  test('runtime=binary 的插件都有 Dart 入口（构建脚本按约定找它）', () {
+  test('Dart 形态的插件都有入口（构建脚本按约定找它）', () {
     final List<String> missing = <String>[];
     for (final Map<String, dynamic> manifest in manifests) {
       final String id = _str(manifest['id']);
       final String runtime = _str(manifest['runtime'], fallback: 'binary');
-      if (runtime != 'binary') continue;
+      // headless / ui / 历史 binary 都要编成可执行体；python 是脚本，不在此列。
+      if (runtime == 'python') continue;
       final File entry = File('${pluginRepo.path}/$id/${id}_plugin.dart');
       if (!entry.existsSync()) missing.add('$id → ${entry.path}');
     }
