@@ -240,4 +240,20 @@ const Map<String, String> nonProtocolPluginMethodLiterals = <String, String>{
   'file.mkdir': '同上',
   'file.writeBytes': '同上',
   'exec.command': '同上',
+  // MCP 协议方法名（插件 ↔ 外部 MCP 服务，stdio JSON-RPC）：属于 MCP spec，
+  // 不是插件 ↔ 核心的方法；`tools/list` / `tools/call` / `ping` 与插件面同名，
+  // 这里只登记 MCP 独有的。
+  'initialize': 'MCP 协议（initialize），非插件↔核心 JSON-RPC 面',
+  'notifications/initialized': 'MCP 协议通知，同上',
+  'notifications/tools/list_changed': 'MCP 协议通知，同上',
+  'notifications/resources/list_changed': 'MCP 协议通知，同上',
+  'notifications/prompts/list_changed': 'MCP 协议通知，同上',
+  'notifications/message': 'MCP logging 通知，同上',
+  'notifications/roots/list_changed': 'MCP roots 通知，同上',
+  'roots/list': 'MCP 方法（服务端反向请求），同上',
+  'resources/list': 'MCP 方法，同上',
+  'resources/templates/list': 'MCP 方法，同上',
+  'resources/read': 'MCP 方法，同上',
+  'prompts/list': 'MCP 方法，同上',
+  'prompts/get': 'MCP 方法，同上',
 };
