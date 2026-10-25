@@ -527,6 +527,23 @@ class ExecuteStationMounts {
         '不假装已经做过）',
       );
     }
+    // plugin.mount：把内置执行站的命令挂到**发起者自己**（自建执行器）。
+    // 站点归属由核心按 source_plugin_id 决定，插件不能替别人挂载。
+    if (command == 'plugin.mount') {
+      final String source = context.sourcePluginId.trim();
+      if (source.isEmpty) {
+        return const StationCommandOutcome.failed(
+          'plugin.mount 必须由插件身份下达（没有 source_plugin_id）',
+        );
+      }
+      final Map<String, dynamic> result = await manager(
+        command: command,
+        pluginId: source,
+        sourcePluginId: source,
+        arguments: context.arguments,
+      );
+      return _outcomeOf(result, command);
+    }
     // plugin.toolCall：把调用原样转给目标插件的 tools/call。核心**不解析**
     // agent_id / team_id / mode_key / session_id：身份由发起方放在
     // arguments.scope 里（不透明载荷），这里只认 plugin_id 与 tool。

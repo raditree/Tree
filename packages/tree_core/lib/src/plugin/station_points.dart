@@ -335,7 +335,7 @@ abstract final class StationPoints {
       label: '插件管理',
       description:
           '执行站·插件族：plugin.list / plugin.restart / plugin.suspend / plugin.state /'
-          ' plugin.stateDump / plugin.stateFetch（插件热重启控制面）+ plugin.toolCall（把一次工具调用原样转给指定插件）',
+          ' plugin.stateDump / plugin.stateFetch（插件热重启控制面）+ plugin.mount（把执行站命令挂到本插件）/ plugin.toolCall（把一次工具调用原样转给指定插件）',
       alias: 'plugin',
       readme:
           '插件族（plugin.list / plugin.restart / plugin.suspend / plugin.state / plugin.toolCall /'
@@ -353,7 +353,8 @@ abstract final class StationPoints {
         'plugin.restart',
         'plugin.suspend',
         'plugin.state',
-        'plugin.toolCall',
+        'plugin.mount',
+      'plugin.toolCall',
       'plugin.stateDump',
         'plugin.stateFetch',
       ],

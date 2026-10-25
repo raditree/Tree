@@ -1,5 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+
+import 'package:path/path.dart' as p;
 
 import 'package:tree_protocol/tree_protocol.dart'
     show ApiMetaBranding, PluginRpcMethods;
@@ -366,6 +369,14 @@ class PluginBus {
 
   final List<PluginConfig> _configs = <PluginConfig>[];
   final Map<String, PluginHost> _hosts = <String, PluginHost>{};
+
+  /// 插件登记的工作空间租约：`workspace_id` → (绝对根目录, 登记方)。
+  ///
+  /// 只做「字符串 → 路径」映射与归属校验；执行站收到带 `workspace_id` 的命令时
+  /// 把 `root` 注入 arguments 并**直接交给插件执行器**，核心不再解析
+  /// agent/team/mode 这类领域身份，也不碰文件。
+  final Map<String, ({String root, String pluginId})> _workspaces =
+      <String, ({String root, String pluginId})>{};
 
   /// **UI 插件实例**（片 D）。
   ///
@@ -1168,6 +1179,10 @@ class PluginBus {
     final Map<String, dynamic> params = rawParams is Map
         ? rawParams.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
         : <String, dynamic>{};
+    if (method == PluginRpcMethods.workspaceRegister) {
+      _handleWorkspaceRegister(pluginId, params);
+      return;
+    }
     if (method == PluginRpcMethods.log) {
       // `log` 通知先落盘再照常广播：日志 API 读文件，前端读 plugin_event，
       // 两条出口互不替代（片 F：插件不各自造日志接口）。
@@ -2480,6 +2495,51 @@ class PluginBus {
   /// 下一个事件循环回合（而不是 microtask：回包本身就在当前回合的微任务队列里，
   /// 抢在它前面写 suspend 就等于没修）。这是“核心代答”的最小形态；窗口内的
   /// 暂存重放是阶段 2 的活。
+  /// 执行站的插件挂载位置：把命令经 station/request 转给执行器插件。
+  ///
+  /// 核心不解释文件/终端语义；插件回 `{payload: {...}}` 即命令结果，
+  /// 回 `{error: ...}` 即失败（可读原因原样回给发起方）。
+  Future<StationCommandOutcome> _forwardStationCommand(
+    String pluginId,
+    StationCommandContext context,
+  ) async {
+    final PluginHost? host = _hosts[pluginId];
+    if (host == null || host.isClosed) {
+      return StationCommandOutcome.failed('插件 $pluginId 未运行，命令未执行');
+    }
+    final StationReply reply = await host.requestStation(
+      StationRequest(
+        requestId:
+            'exec-${DateTime.now().microsecondsSinceEpoch}-${context.command}',
+        stationId: context.stationId,
+        kind: StationKind.execute,
+        scope: context.scope,
+        payload: <String, dynamic>{
+          'command': context.command,
+          'arguments': context.arguments,
+        },
+        meta: <String, dynamic>{'source_plugin_id': context.sourcePluginId},
+      ),
+    );
+    if (reply.isFailed) return StationCommandOutcome.failed(reply.error);
+    final Object? payload = reply.payload;
+    if (payload is! Map) {
+      return StationCommandOutcome.failed(
+        '执行器插件 $pluginId 的回包缺少 payload 对象（command=${context.command}）',
+      );
+    }
+    final Map<String, dynamic> result = payload.map(
+      (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+    );
+    final String error = (result['error'] ?? '').toString();
+    if (error.isNotEmpty || result['ok'] == false) {
+      return StationCommandOutcome.failed(
+        error.isEmpty ? '执行器插件 $pluginId 报失败但未给原因' : error,
+      );
+    }
+    return StationCommandOutcome.ok(result);
+  }
+
   Future<Map<String, dynamic>> _runPluginCommand({
     required String command,
     required String pluginId,
@@ -2542,6 +2602,52 @@ class PluginBus {
         return _pluginStateDump(pluginId, args);
       case 'plugin.stateFetch':
         return _pluginStateFetch(pluginId, args);
+      case 'plugin.mount': {
+        final String stationId = (args['station_id'] ?? '').toString().trim();
+        final ExecuteStation? station = stations.executePointFor(stationId);
+        if (station == null) {
+          return <String, dynamic>{
+            'ok': false,
+            'error': '执行站点位不存在：$stationId（可用 system.execute.fs / system.execute.terminal）',
+          };
+        }
+        final Object? rawCommands = args['commands'];
+        final List<String> commands = rawCommands is List
+            ? <String>[
+                for (final Object? item in rawCommands)
+                  if (item != null && item.toString().trim().isNotEmpty)
+                    item.toString().trim(),
+              ]
+            : List<String>.of(station.commands);
+        final List<String> mounted = <String>[];
+        final List<String> errors = <String>[];
+        final String mountId = 'plugin.$pluginId';
+        for (final String command in commands) {
+          if (!station.commands.contains(command)) {
+            errors.add('命令 $command 不属于点位 $stationId');
+            continue;
+          }
+          final String? error = station.mount(
+            command: command,
+            mountId: mountId,
+            priority: 100,
+            handler: (StationCommandContext context) =>
+                _forwardStationCommand(pluginId, context),
+          );
+          if (error != null) {
+            errors.add(error);
+          } else {
+            mounted.add(command);
+          }
+        }
+        return <String, dynamic>{
+          'ok': errors.isEmpty,
+          if (errors.isNotEmpty) 'error': errors.join('；'),
+          'station_id': stationId,
+          'mounted': mounted,
+          'mount_id': mountId,
+        };
+      }
       case 'plugin.toolCall': {
         // 不透明转发：core 只看 plugin_id / tool；arguments.scope 原样交给插件，
         // 不解析 agent_id / team_id / mode_key / session_id。
@@ -5233,6 +5339,31 @@ class PluginBus {
       return true;
     }
     return a == b;
+  }
+
+  /// 插件登记工作空间根目录（通知）。只做路径校验与归属记录，不解读语义。
+  void _handleWorkspaceRegister(
+    String pluginId,
+    Map<String, dynamic> params,
+  ) {
+    final String id =
+        (params['lease_id'] ?? params['workspace_id'] ?? '').toString().trim();
+    final String dir = (params['dir'] ?? '').toString().trim();
+    if (id.isEmpty || dir.isEmpty) {
+      log?.call('插件 $pluginId 的 workspace/register 缺少 workspace_id / dir，已忽略');
+      return;
+    }
+    if (!p.isAbsolute(dir)) {
+      log?.call('插件 $pluginId 登记的工作空间不是绝对路径（$dir），已忽略');
+      return;
+    }
+    final String normalized = p.normalize(dir);
+    if (!Directory(normalized).existsSync()) {
+      log?.call('插件 $pluginId 登记的工作空间不存在（$normalized），已忽略');
+      return;
+    }
+    _workspaces[id] = (root: normalized, pluginId: pluginId);
+    log?.call('插件 $pluginId 登记工作空间 $id → $normalized');
   }
 
   // ── 插件 → 核心的请求通道（M9 §3「插件主动下命令」） ────────────────────

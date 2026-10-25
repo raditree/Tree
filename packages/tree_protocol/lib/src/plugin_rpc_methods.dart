@@ -99,7 +99,7 @@ abstract final class PluginRpcMethods {
 
   /// **登记工作空间定位**（插件化新增；插件 → 核心，通知）。
   ///
-  /// `{workspace_id, dir}`：核心只做「字符串 → 路径」映射，供 `api/delegate`
+  /// `{lease_id, dir}`：核心只做「字符串 → 路径」映射，供 `api/delegate`
   /// 信封解析 `workspace_dir`，不解释语义；写入仅限登记方，读取对所有插件开放。
   static const String workspaceRegister = 'workspace/register';
 

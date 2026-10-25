@@ -76,7 +76,7 @@ void main() {
       bus.stations.station(StationPoints.ownerOfCommand(command)!.id)!
           as ExecuteStation;
 
-  test('核心启动即把二十六条命令挂到各自的点位（不再返回「暂无挂载位置」）', () {
+  test('核心启动即把二十七条命令挂到各自的点位（不再返回「暂无挂载位置」）', () {
     for (final StationPointSpec spec in StationPoints.executes) {
       expect(
         bus.stations
@@ -92,7 +92,7 @@ void main() {
     // session 1 + ssh 1 + plugin 6 + station 2 + usage 1）；`llm.call` / `tool.call` / `tool.close` /
     // `session.rename` / `ssh.reconnect` 也被各自点位接管，只是落到「尚无挂载实现」的显式失败
     // （不是「暂无挂载位置」）。
-    expect(ExecuteStation.builtinCommands, hasLength(26));
+    expect(ExecuteStation.builtinCommands, hasLength(27));
   });
 
   test('运行期四元组：team 取 agent 归属、mode_key 取工作空间模式', () {
