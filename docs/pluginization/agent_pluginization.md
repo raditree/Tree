@@ -31,8 +31,9 @@
 | `team/` | 团队、成员、消息 | `tree_agent_loop` |
 | `tool/` | 工具注册、调用编排、运行登记 | `tree_agent_loop` |
 | `mcp/` | MCP 客户端（连接、列工具、调用） | `mcp` 插件 |
-| `terminal/` | PTY | **保留核心**（宿主能力，见 §4.6） |
-| `store/` | 文件存储、原子写、记录、用量日志 | 核心保留基础件；领域记录搬走 |
+| `terminal/` | PTY | **迁出核心** → `local_executor` 插件（见 §4.6） |
+| `files/file_service.dart` | 本地/远端文件读写 | **迁出核心** → `local_executor` / `ssh_executor`（见 §4.6） |
+| `store/` | 文件存储、原子写、记录、用量日志 | 领域记录（`records` / `tree_store` / `subagent_registry`）随迁；通用小件插件自备；核心只留通用 KV 与日志 |
 
 ### 1.2 REST 端点（23 条）
 
@@ -86,9 +87,10 @@ UI (runtime: ui) ──WS──> tree_core ──转发──> 订阅者
 | 提问回路 | `tree.agent` | UI 答题走 `POST /api/questions/{qid}/answer` |
 | 子 agent、团队消息 | `tree.agent` | 依赖 `tree.agent` 自身状态 |
 | MCP 连接与工具 | `mcp` 插件 | 核心不再有 MCP 代码 |
-| 命令执行 / PTY | 核心（宿主） | 见 §4.6 |
-| 文件读写 | `files` / `spec` 插件 | 经 `workspace_dir` |
-| 日志、键值存储、插件管理 | 核心 | 基础 API |
+| 本地命令执行 / PTY | `local_executor` 插件 | 与 `ssh_executor` 同一套执行站接口（§4.6） |
+| 本地文件读写 | `local_executor`（或 `files` 插件） | 经 workspace 租约，核心不碰文件 |
+| 远端命令 / 文件 | `ssh_executor` 插件 | 现有通道 |
+| 日志、通用键值存储、插件管理、租约登记 | 核心 | 基础 API，无领域语义 |
 
 ---
 
@@ -164,9 +166,46 @@ UI (runtime: ui) ──WS──> tree_core ──转发──> 订阅者
 - 好处：零迁移、零格式漂移、可回退（只要回退时插件没写过新格式）。
 - 约束：交接后**核心不得再触碰这些文件**；同一文件只允许一个写者。
 
-### 4.6 PTY 归属
+### 4.6 执行与文件：全部下沉能力插件，核心零 PTY / 零文件操作
 
-PTY 是宿主能力（进程、终端句柄），不属于 agent 领域，**保留核心**。agent 插件不做 PTY；命令执行走工具插件贡献的执行站。
+**修正**：此前「PTY 保留核心」的说法作废。核心定位是调度微内核，PTY 与本地文件修改都是「具体工作」，不是调度。
+
+归属改为镜像现有 `ssh_executor` 的模式：
+
+| 能力 | 归属 | 说明 |
+| --- | --- | --- |
+| 本地进程 / 命令执行 | `local_executor` 插件 | `Process.start` 在插件内，核心不拉起子进程 |
+| 本地 PTY（交互终端） | `local_executor` 插件 | 核心不留 `terminal/`；PTY 句柄归插件 |
+| 本地文件读 / 写 / 列目录 / 移动 / 上传 | `local_executor`（或拆出 `files` 插件） | 路径守卫、原子写、锁都在插件内 |
+| 远端命令 / 远端文件 | `ssh_executor` 插件 | 已有形态，接口与本地执行器对齐 |
+
+调用关系：
+
+```
+tree.agent ──执行站命令(lease_id + relpath/argv)──> local_executor ──> OS / PTY
+     │                                                    │
+     └──执行站命令(同一接口)──> ssh_executor ──> 远端主机 ──┘
+UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行器插件
+```
+
+- **本地 vs 远端由 `tree.agent` 决定**：它拥有 agent → workspace 的领域映射；核心不判断。
+- **路径安全**：执行器只接受「租约内的相对路径」。`workspace/register {lease_id, dir}` 在核心登记的是**纯字符串映射**（`lease_id → dir`），无 agent/team 语义；执行器校验「解析后的绝对路径仍在租约根内」。
+- **PTY 流**：核心只做通用字节流中继（`stream session: open/input/resize/close` + 有序字节帧），不认识终端语义；UI 通过 REST 建流、再订阅插件 topic。原「PTY 是 WebSocket 唯一例外」的规则改为「核心提供与协议无关的流中继」。
+- **崩溃影响**：执行器崩溃会带走其 PTY 会话与在途命令；由看门狗重启插件，UI 收到 `closed` 并提示。这是把能力下沉必须接受的代价。
+
+### 4.6.1 核心职责白名单（反向约束）
+
+核心**只做**这些事，多一件都算定位漂移：
+
+| 允许 | 不允许 |
+| --- | --- |
+| 插件生命周期 / 看门狗 / 站点总线 | 任何领域模型（agent / session / team / model / question） |
+| WS / REST 传输与委派路由 | PTY、终端会话、子进程（除拉起插件外） |
+| 通用键值存储 `/api/store/*`、日志 `/api/logs/*` | 业务数据读写（agents.yaml、会话、用量账本） |
+| 通用 workspace 租约登记（`lease_id → dir`，纯字符串） | 文件读 / 写 / 列目录 / 路径守卫 |
+| 认证（核心令牌、UI 附着） | 跨 team / 跨 agent 的领域授权 |
+
+> 关于「核心只 store 业务数据」：准确说是**只 store 通用数据**——键值、日志、租约。业务记录（agent/会话/团队/模型）在迁移后归插件自有目录，核心连格式都不认识。
 
 ### 4.7 密钥与模型配置
 
@@ -257,6 +296,7 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 13. **插件不得 import 任何核心包**：只允许 pub.dev 依赖与插件仓自带的 `_kit`；复用核心能力走内置执行站（stdio）或 UI 的 REST 端点。
 14. **核心的站点 scope 不得含领域字段**（`team_id/agent_id/session_id/mode_key`）；领域归属与跨域授权由领域插件自己负责，核心只认证调用方与 workspace 租约。
 15. **核心设置只保留平台级**；模型池、token 节奏等 agent 领域配置随 `tree.agent` 迁走。
+16. **核心不持有 PTY、终端会话与文件操作**：本地执行 / 文件修改归 `local_executor`，远端归 `ssh_executor`；核心只保留与协议无关的流中继与租约登记。
 
 ---
 
@@ -267,6 +307,7 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | 生成循环多一跳，延迟上升 | 批量推帧（§4.4）；工具边界才同步等待 |
 | 双跑期两写冲突 | 双跑期核心强制只读；文件锁由插件持有 |
 | 插件崩溃导致所有会话不可用 | 看门狗 + 热重启；崩溃期间端点 503 并显示可读原因 |
+| 执行器插件崩溃导致 PTY / 文件操作中断 | 看门狗重启；UI 收 `closed` 并提示；文件写操作保持幂等，PTY 会话需重开 |
 | 密钥明文落盘 | 权限收紧；如需加密，主密钥由**核心**注入 `config.env`（非 loader）；不写日志 |
 | 交接后回退困难 | A5 单独成 commit；保留只读旧格式，回退核心可立即恢复接管 |
 
@@ -293,7 +334,7 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | 3 | 领域代码规模约 20k 行：`agent` 5345 / `llm` 5030 / `team` 2683 / `tool` 5139 / `mcp` 1572；且对核心基础件有硬依赖——`agent → store 12 / util 5 / tool 5 / settings 4 / plugin 2`、`tool → team 7 / plugin 5 / spec 4 / store 4`、`llm → util 6 / settings 5 / agent 5 / store 5` | 插件不得 import 核心包，故必须：领域层与通用小件**复制随迁**、设置先拆分、插件互通改**核心内置执行站**（§10.1） |
 | 4 | 核心测试 176 个文件，其中大量用例直接 import `src/agent|llm|team|tool`；`core_server.dart` 的 `_registerRoutes` 实际注册约 **33 条**领域路由（agents CRUD、models、sessions、conversations、subagents、teammates、specs、reset/compact/ssh reconnect、questions 等） | §1.2 / §6 的「23 / 25 条」口径已漂移；A2 的「逐字节一致」基线需先重新点数并冻结 |
 
-结论：G 的正确起点不是搬代码，而是先完成三项前置（`core_settings` 拆分、scope 去领域化立项、路由基线冻结），再按 A1（最小端点 `GET /api/agents` 走通 stdio / 委派 / 一致性）验证脚手架。
+结论：G 的正确起点不是搬代码，而是先完成四项前置（`core_settings` 拆分、scope 去领域化立项、路由基线冻结、`local_executor` 执行站就位），再按 A1（最小端点 `GET /api/agents` 走通 stdio / 委派 / 一致性）验证脚手架。
 
 ### 已拍板（2026-10-25）
 
@@ -308,11 +349,12 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | 7 | 模型供应商 Key 随插件明文落盘 + 权限收紧；落盘加密本期不做；「loader 注入」作废（§4.7） |
 | 8 | **插件不得 import 任何核心包**；复用核心能力只能走「核心内置执行站」或 UI 的 REST 委派端点；通用小件由插件自备（§10.1） |
 | 9 | `core_settings.dart` 先按「平台级 / 领域级」拆分，拆分前不得开始 A1 数据接管（§4.8） |
-| 10 | 插件 scope 必须去领域化：`team_id / agent_id / session_id / mode_key` 逐步移除，授权搬到「核心内置执行站 + workspace 租约」（§10.3） |
+| 10 | 插件 scope 必须去领域化：`team_id / agent_id / session_id / mode_key` 逐步移除，授权搬到「执行器插件 + workspace 租约」（§10.3） |
+| 11 | **执行与文件全部下沉**：本地命令 / PTY / 文件修改归 `local_executor`，远端归 `ssh_executor`；核心零 PTY、零文件操作，只留通用流中继与租约登记（§4.6） |
 
 ### 仍需拍板
 
-11. **路由点数基线**：以 `_registerRoutes` 的 33 条为准重写 §1.2/§5/§6，还是趁机裁剪到真正的 25 条功能面？
+12. **路由点数基线**：以 `_registerRoutes` 的 33 条为准重写 §1.2/§5/§6，还是趁机裁剪到真正的 25 条功能面？
 
 ---
 
@@ -368,6 +410,16 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 > - 反向依赖里 `plugin_bus` 与 `execute_mounts` 是硬点：核心插件平台反过来 import 领域代码，必须改成「协议 + 核心内置执行站」边界。
 > - `tree_agent_loop` 只允许依赖 pub.dev 包与 `plugins/_kit`；CI 需加一条检查：插件仓内不得出现 `package:tree_core/...` 或 `package:tree_protocol/...`。
 
+### 核心现有能力也要搬走（配合 §4.6）
+
+| 核心现有文件 | 去向 |
+| --- | --- |
+| `files/file_service.dart` | 本地部分 → `local_executor`；远端部分 → 并入 `ssh_executor`；UI 文件 REST 改为委派到执行器 |
+| `terminal/terminal_service.dart` | → `local_executor` 的 PTY 执行站；核心只留通用流中继 |
+| `server/core_server.dart` 里的文件 / 终端路由 | 从核心路由表移除，改由执行器插件声明 |
+
+> 这两个文件目前反向 import `team/team_workspace`（领域），搬迁时一并切断。
+
 ---
 
 ## 10.2 勘测：插件平台是否支持「按声明逐 agent 起实例」
@@ -404,13 +456,13 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | `agent_events.dart` | `agent_id` / `session_id` / `team_id` | 事件载荷 | 随 `tree_agent_loop` 迁走，核心不解释 |
 | `core_server.dart` / `plugin_host.dart` | 解析、透传 | UI 订阅 / 插件命令 | 改为通用上下文 |
 
-### 移除方案（两步，不能一把删）
+### 移除方案（三步，不能一把删）
 
 1. **协议先扩后收**：新增通用 `context {workspace_dir, data_dir, client_id}`；`team_id/agent_id/session_id` 标记废弃但继续接受一个版本（避免 UI 与现有插件同时断）。
-2. **授权搬家**：跨 team / 跨 workspace 的 fail-closed 检查从核心的 `execute_mounts` 搬到「核心内置执行站 + workspace 租约」——核心只证明「这个调用方被允许使用这个 workspace」，不再证明「这个 agent 属于这个 team」。
+2. **授权搬家**：跨 team / 跨 workspace 的 fail-closed 检查从核心的 `execute_mounts` 搬到「执行器插件 + workspace 租约」——核心只登记 `lease_id → dir` 并认证调用方，执行器只证明「路径在租约根内」；「这个 agent 属于这个 team」由 `tree.agent` 自己保证。
 3. 之后删除字段、映射、`scope.key` 与 UI 侧 scope 订阅参数，并更新 `tree_protocol` 的站点契约。
 
-> 这是一次协议破坏性变更，**不属于 G**；登记为遗留项 L-21，需单独立项与独立审批。
+> 这是一次协议破坏性变更，**不属于 G**；登记为遗留项 L-23，需单独立项与独立审批。
 
 > 全部未闭环项（含 G-1~G-7、U-3/U-4、C-11、手工回归、文档缺口）已统一登记在
 > [ui-pluginization_acceptance.md §12 遗留项台账](ui-pluginization_acceptance.md#12-遗留项台账2026-10-25-落档)。
