@@ -218,6 +218,11 @@ UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行�
 - **PTY 流**：核心只做通用字节流中继（`stream session: open/input/resize/close` + 有序字节帧），不认识终端语义；UI 通过 REST 建流、再订阅插件 topic。原「PTY 是 WebSocket 唯一例外」的规则改为「核心提供与协议无关的流中继」。
 - **崩溃影响**：执行器崩溃会带走其 PTY 会话与在途命令；由看门狗重启插件，UI 收到 `closed` 并提示。这是把能力下沉必须接受的代价。
 
+> **过渡期说明（2026-10-25）**：local_executor / tree.agent 已走**插件自建执行站**
+> （`plugin.local_executor.execute.local`，命令 `file.*` / `exec.command`），不再经
+> `plugin.mount`。核心仍保留 `system.execute.fs` / `system.execute.terminal` 两个
+> **legacy 点位**给无租约旧调用方（UI / 其它插件），A5 随核心领域执行器一起删除。
+
 ### 4.6.1 L-24 落地记录（2026-10-25）
 
 - 新增插件 `plugins/local_executor`（0.1.0）：自检覆盖 fs.read / fs.write / fs.list /
