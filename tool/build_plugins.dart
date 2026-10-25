@@ -411,6 +411,7 @@ class _PluginManifest {
     required this.granularity,
     required this.scope,
     required this.appVersionDefine,
+    this.requires,
   });
 
   final String dirName;
@@ -433,6 +434,9 @@ class _PluginManifest {
   /// 读同名键——否则“看上去注入了”而插件拿着 `defaultValue` 自报一个假版本，这条由
   /// `plugin_repo_contract_test.dart` 钉住。
   final String appVersionDefine;
+
+  /// `requires`（依赖声明）原样进索引；形状由装机端与合同用例校验。
+  final Object? requires;
 
   static final RegExp _idPattern = RegExp(r'^[A-Za-z0-9_.-]+$');
   static final RegExp _versionPattern = RegExp(r'^\d+\.\d+\.\d+$');
@@ -466,6 +470,7 @@ class _PluginManifest {
             )
           : <String, dynamic>{},
       appVersionDefine: '${json['app_version_define'] ?? ''}'.trim(),
+      requires: json['requires'],
     );
   }
 
@@ -506,6 +511,10 @@ class _PluginManifest {
           fileName.contains('..')) {
         return 'files 里的「$fileName」必须是纯文件名（防路径穿越）';
       }
+    }
+    if (requires != null &&
+        (requires is! Map || (requires as Map)['plugins'] is! List)) {
+      return 'requires 必须是对象，且 requires.plugins 必须是数组';
     }
     if (appVersionDefine.isNotEmpty &&
         !RegExp(r'^[A-Za-z_][A-Za-z0-9_]*$').hasMatch(appVersionDefine)) {
@@ -567,6 +576,7 @@ class _PluginManifest {
     if (suspension.isNotEmpty) 'suspension': suspension,
     'granularity': granularity,
     'scope': scope,
+    if (requires != null) 'requires': requires,
   };
 
   static String _stripExe(String name) =>
