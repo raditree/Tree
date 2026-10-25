@@ -529,6 +529,7 @@ class CoreServer {
               ? p.join(Directory.systemTemp.path, 'tree_core')
               : p.dirname(p.dirname(pluginBus.configFile)))
         : dataDir;
+    if (pluginBus != null) pluginBus.dataDir = resolvedDataDir;
     // 默认下载器接三个既有出口：已装条目读 plugins.yaml、脚本型解释器用**与内置
     // 插件同一个**探测口径、换文件闸门问总线（只有它知道进程在不在）。
     final PluginDownloader? resolvedDownloader =

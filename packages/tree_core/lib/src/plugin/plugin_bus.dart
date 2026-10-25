@@ -367,6 +367,9 @@ class PluginBus {
 
   bool enabled = true;
 
+  /// 核心数据根（委派 / 站请求回给插件的数据根；空 = 未接线）。
+  String dataDir = '';
+
   final List<PluginConfig> _configs = <PluginConfig>[];
   final Map<String, PluginHost> _hosts = <String, PluginHost>{};
 
@@ -2518,7 +2521,10 @@ class PluginBus {
           'command': context.command,
           'arguments': context.arguments,
         },
-        meta: <String, dynamic>{'source_plugin_id': context.sourcePluginId},
+        meta: <String, dynamic>{
+          'source_plugin_id': context.sourcePluginId,
+          'data_dir': dataDir,
+        },
       ),
     );
     if (reply.isFailed) return StationCommandOutcome.failed(reply.error);
