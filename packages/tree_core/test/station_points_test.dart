@@ -90,14 +90,17 @@ void main() {
       );
     });
 
-    test('命令 → 点位：27 条命令，每条恰好属于一个执行站点位', () {
+    test('命令 → 点位：30 条命令，每条恰好属于一个执行站点位', () {
       final Set<String> commands = StationPoints.allCommands;
-      expect(commands.length, 27, reason: '$commands');
+      expect(commands.length, 30, reason: '$commands');
       expect(commands, <String>{
         'fs.read',
         'fs.write',
         'fs.list',
         'fs.grep',
+        'fs.delete',
+        'fs.mkdir',
+        'fs.writeBytes',
         'terminal.exec',
         // 后台（hook）任务的结构化读口与控口（阶段 6）
         'terminal.listRuns',

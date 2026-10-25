@@ -787,7 +787,7 @@ void main() {
     );
   });
 
-  test('station/register：name 非法 / 缺 readme / 执行站 / 收集站缺 schema 都是可读拒绝', () async {
+  test('station/register：name 非法 / 缺 commands / 缺 readme / 收集站缺 schema 都是可读拒绝', () async {
     final PluginBus bus = await startBus(teamPluginYaml());
 
     // ① 缺 name
@@ -814,17 +814,20 @@ void main() {
       contains('只允许'),
     );
 
-    // ③ 执行站不能自建（没有消费方：它由插件主动下命令）
+    // ③ 自建执行站必须带非空 commands（插件内部定义能执行什么）
     final Map<String, dynamic> execute = await pluginRequest(
       bus,
       method: 'station/register',
-      params: <String, dynamic>{'kind': 'execute', 'name': 'x'},
+      params: <String, dynamic>{
+        'kind': 'execute',
+        'name': 'x',
+        'readme': '夹具',
+      },
     );
     expect((execute['result'] as Map<String, dynamic>)['ok'], isFalse);
     expect(
       (execute['result'] as Map<String, dynamic>)['error'],
-      contains('station/command'),
-      reason: '拒绝理由要指向正解',
+      contains('commands'),
     );
 
     // ④ 收集站必须带非空 schema（输入格式由站点定义）
@@ -870,6 +873,35 @@ void main() {
     expect(
       bus.stations.stationList().where((StationInstance s) => !s.builtin),
       isEmpty,
+    );
+  });
+
+  test('station/register：自建执行站 ⇒ id 由核心拼、命令挂到建站插件', () async {
+    final PluginBus bus = await startBus(teamPluginYaml());
+    final Map<String, dynamic> response = await pluginRequest(
+      bus,
+      method: 'station/register',
+      params: <String, dynamic>{
+        'kind': 'execute',
+        'name': 'local',
+        'readme': '夹具：自建执行站',
+        'commands': <String>['file.read', 'exec.command'],
+      },
+    );
+    final Map<String, dynamic> result =
+        response['result'] as Map<String, dynamic>;
+    expect(result['ok'], isTrue, reason: '${result['error']}');
+    expect(result['station_id'], 'plugin.sample.execute.local');
+    final ExecuteStation station =
+        bus.stations.station('plugin.sample.execute.local')! as ExecuteStation;
+    expect(station.commands, <String>['file.read', 'exec.command']);
+    expect(
+      station
+          .mounts(command: 'file.read')
+          .map((StationCommandMount mount) => mount.mountId)
+          .toList(),
+      contains('plugin.sample'),
+      reason: '自建执行站的命令必须挂回建站插件自己',
     );
   });
 

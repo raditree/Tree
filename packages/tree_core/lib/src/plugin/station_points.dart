@@ -222,14 +222,22 @@ abstract final class StationPoints {
       id: StationHubIds.executeFs,
       kind: StationKind.execute,
       label: '文件操作',
-      description: '执行站·文件操作族：fs.read / fs.write / fs.list / fs.grep',
+      description: '执行站·文件操作族：fs.read / fs.write / fs.list / fs.grep / fs.delete / fs.mkdir / fs.writeBytes',
       alias: 'fs',
       readme:
           '文件操作族（fs.read / fs.write / fs.list / fs.grep）：**执行站不订阅、不触发插件**，'
           '它是插件主动下命令的入口。命令按目标 agent 落到它的工作空间（本地目录或远端），'
           '因此不需要自己拼路径，也不能跨 team 访问（scope 不成立会被显拒）。'
           '白名单外的命令一律报错，不会“看起来执行了”。',
-      commands: <String>['fs.read', 'fs.write', 'fs.list', 'fs.grep'],
+      commands: <String>[
+        'fs.read',
+        'fs.write',
+        'fs.list',
+        'fs.grep',
+        'fs.delete',
+        'fs.mkdir',
+        'fs.writeBytes',
+      ],
     ),
     StationPointSpec(
       id: StationHubIds.executeTerminal,

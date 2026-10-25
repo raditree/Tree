@@ -232,4 +232,12 @@ const Map<String, String> nonProtocolPluginMethodLiterals = <String, String>{
   'fs.list': '同上',
   'fs.grep': '同上',
   'terminal.exec': '同上',
+  'file.read': '自建执行站命令（local_executor），非插件↔核心 JSON-RPC 面',
+  'file.write': '同上',
+  'file.list': '同上',
+  'file.grep': '同上',
+  'file.delete': '同上',
+  'file.mkdir': '同上',
+  'file.writeBytes': '同上',
+  'exec.command': '同上',
 };

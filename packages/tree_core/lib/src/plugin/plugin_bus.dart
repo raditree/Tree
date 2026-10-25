@@ -2613,6 +2613,9 @@ class PluginBus {
                 'fs.write',
                 'fs.list',
                 'fs.grep',
+                'fs.delete',
+                'fs.mkdir',
+                'fs.writeBytes',
               },
               'system.execute.terminal': <String>{'terminal.exec'},
             };
@@ -5488,21 +5491,18 @@ class PluginBus {
         '（收到「$kindRaw」）',
       );
     }
-    // 执行站不能自建（没有消费方），所以只有非执行站才拼 id
-    String stationId = '';
-    if (kind != StationKind.execute) {
-      final String name = (params['name'] ?? '').toString().trim();
-      final String? nameError = _checkSelfBuiltName(name);
-      if (nameError != null) {
-        return <String, dynamic>{
-          'ok': false,
-          'station_id': '',
-          'kind': kind.wire,
-          'error': nameError,
-        };
-      }
-      stationId = selfBuiltStationId(config.id, kind, name);
+    // 站点 id 一律由核心拼：plugin.<自己>.<kind>.<name>。
+    final String name = (params['name'] ?? '').toString().trim();
+    final String? nameError = _checkSelfBuiltName(name);
+    if (nameError != null) {
+      return <String, dynamic>{
+        'ok': false,
+        'station_id': '',
+        'kind': kind.wire,
+        'error': nameError,
+      };
     }
+    final String stationId = selfBuiltStationId(config.id, kind, name);
     // 幂等：同名重复注册拿到既有站点（插件重启后会再注册一遍）
     final StationInstance? existing = stationId.isEmpty
         ? null
@@ -5513,17 +5513,6 @@ class PluginBus {
         'station_id': existing.id,
         'kind': existing.kind.wire,
         'error': '',
-      };
-    }
-    // 执行站不支持订阅，建它没有任何消费方（插件自己下发命令走内置执行站）
-    if (kind == StationKind.execute) {
-      return <String, dynamic>{
-        'ok': false,
-        'station_id': '',
-        'kind': kind.wire,
-        'error':
-            '执行站不支持订阅（它由插件主动下命令），无需自建；'
-            '要下命令请用 station/command',
       };
     }
     final Object? rawSchema = params['schema'];
@@ -5562,6 +5551,35 @@ class PluginBus {
     );
     final String description = (params['description'] ?? '').toString().trim();
     final String id = stationId;
+    final List<String> executeCommands = kind == StationKind.execute
+        ? _selfBuiltExecuteCommands(params['commands'])
+        : const <String>[];
+    if (kind == StationKind.execute) {
+      final String? commandError = _checkExecuteCommands(executeCommands);
+      if (commandError != null) {
+        return <String, dynamic>{
+          'ok': false,
+          'station_id': '',
+          'kind': kind.wire,
+          'error': commandError,
+        };
+      }
+      final Set<String> taken = <String>{
+        for (final StationInstance candidate in stations.stationList())
+          if (candidate is ExecuteStation && candidate.id != stationId)
+            ...candidate.commands,
+      };
+      for (final String command in executeCommands) {
+        if (taken.contains(command)) {
+          return <String, dynamic>{
+            'ok': false,
+            'station_id': '',
+            'kind': kind.wire,
+            'error': '命令 $command 已被其它插件执行站占用',
+          };
+        }
+      }
+    }
     final StationInstance station = switch (kind) {
       StationKind.broadcast => BroadcastStation(
         id: id,
@@ -5597,12 +5615,28 @@ class PluginBus {
         allowedPlugins: allowedPlugins,
         config: stationConfig,
       ),
-      StationKind.execute => throw PluginRequestException(
-        PluginRpcErrorCode.invalidParams,
-        'station/register 不支持自建执行站',
+      StationKind.execute => ExecuteStation(
+        id: id,
+        description: description.isEmpty
+            ? '插件 ${config.id} 自建执行站'
+            : description,
+        readme: readme,
+        maxSubscriptions: maxSubscriptions,
+        commands: executeCommands,
       ),
     };
     final String? error = stations.register(station);
+    if (error == null && station is ExecuteStation) {
+      final String? mountError = _mountExecutor(config.id, station);
+      if (mountError != null) {
+        return <String, dynamic>{
+          'ok': false,
+          'station_id': station.id,
+          'kind': kind.wire,
+          'error': mountError,
+        };
+      }
+    }
     if (error != null) {
       return <String, dynamic>{
         'ok': false,
@@ -5621,6 +5655,57 @@ class PluginBus {
       'kind': kind.wire,
       'error': '',
     };
+  }
+
+  /// 自建执行站的命令表（宽容解析；真正的校验在 [_checkExecuteCommands]）。
+  static List<String> _selfBuiltExecuteCommands(Object? raw) {
+    if (raw is! List) return const <String>[];
+    return <String>[
+      for (final Object? item in raw)
+        if (item != null && item.toString().trim().isNotEmpty)
+          item.toString().trim(),
+    ];
+  }
+
+  /// 自建执行站命令表校验：非空、不超限、名字合法、不得占用核心内置命令。
+  static String? _checkExecuteCommands(List<String> commands) {
+    if (commands.isEmpty) {
+      return '自建执行站需要非空 commands 列表（插件能执行哪些命令）';
+    }
+    if (commands.length > 32) {
+      return 'commands 过多（${commands.length}，上限 32）';
+    }
+    final RegExp name = RegExp(r'^[A-Za-z][A-Za-z0-9_.-]*$');
+    for (final String command in commands) {
+      if (!name.hasMatch(command)) {
+        return '命令名非法：$command（只允许 [A-Za-z][A-Za-z0-9_.-]*）';
+      }
+      if (StationPoints.allCommands.contains(command)) {
+        return '命令 $command 是核心内置命令，插件不得自建同名命令';
+      }
+      if (command.startsWith('plugin.') ||
+          command.startsWith('station.') ||
+          command.startsWith('tool.') ||
+          command.startsWith('agent.')) {
+        return '命令 $command 属于控制面命名空间，插件不得自建';
+      }
+    }
+    return null;
+  }
+
+  /// 把自建执行站的命令挂到**建站插件自己**的执行器上；返回 null = 成功。
+  String? _mountExecutor(String pluginId, ExecuteStation station) {
+    for (final String command in station.commands) {
+      final String? error = station.mount(
+        command: command,
+        mountId: 'plugin.$pluginId',
+        priority: 100,
+        handler: (StationCommandContext context) =>
+            _forwardStationCommand(pluginId, context),
+      );
+      if (error != null) return error;
+    }
+    return null;
   }
 
   /// 自建站的共享白名单（宽容解析：非列表 = 空表 = 对所有插件开放）。
@@ -6402,27 +6487,31 @@ class PluginBus {
       leaseRoot = lease.root;
       arguments['root'] = leaseRoot;
     }
-    // 点位化：执行站按**命令族**拆成多个点位，命令 → 所属点位在这里路由
-    // （插件侧零改动：仍然只带 command）。
-    if (StationPoints.ownerOfCommand(command) == null) {
-      final List<String> allowed = StationPoints.allCommands.toList()..sort();
+    // 命令 → 点位：先查核心内置点位，再查**插件自建执行站**的命令表。
+    ExecuteStation? station = stations.executeForCommand(command);
+    if (station == null) {
+      for (final StationInstance candidate in stations.stationList()) {
+        if (candidate is ExecuteStation &&
+            candidate.commands.contains(command)) {
+          station = candidate;
+          break;
+        }
+      }
+    }
+    if (station == null) {
+      final List<String> allowed = <String>{
+        ...StationPoints.allCommands,
+        for (final StationInstance candidate in stations.stationList())
+          if (candidate is ExecuteStation) ...candidate.commands,
+      }.toList()
+        ..sort();
       return <String, dynamic>{
         'command': command,
         'ok': false,
         'mount_id': '',
         'payload': null,
-        'error':
-            '未知命令 $command（执行站命令白名单：${allowed.join('、')}）；'
-            '命令 → 点位的分配见 station_points.dart',
+        'error': '未知命令 $command（可用命令：${allowed.join('、')}）',
       };
-    }
-    final ExecuteStation? station = stations.executeForCommand(command);
-    if (station == null) {
-      throw PluginRequestException(
-        PluginRpcErrorCode.scopeDenied,
-        '插件 ${config.id} 的 scope（${scope.describe()}）没有可用的执行站'
-        '（站点未接线：核心未启动站点中枢）',
-      );
     }
     // 租约命令跳过内置挂载的 _resolveTarget：直接交给插件执行器。
     if (leaseRoot.isNotEmpty) {
