@@ -8,6 +8,7 @@ import '../../io/api_service.dart';
 import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
 import '../../io/ssh_executor_service.dart';
+import '../../io/station_client.dart';
 import '../../io/workspace_refresh_service.dart';
 import '../services/detail_selection.dart';
 import '../services/onboarding_requests.dart';
@@ -561,6 +562,14 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         child: Scaffold(
       body: Column(
         children: <Widget>[
+          // U4：站点 closed / 连接断开时，界面必须显式说"服务下线"，不能静默卡住。
+          ValueListenableBuilder<String?>(
+            valueListenable: StationClient.instance.offlineReason,
+            builder: (BuildContext context, String? reason, Widget? child) {
+              if (reason == null) return const SizedBox.shrink();
+              return _buildServiceOfflineBanner(context, reason);
+            },
+          ),
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) {
@@ -594,6 +603,29 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
           ),
         ],
       ),
+        ),
+      ),
+    );
+  }
+
+  /// 服务下线 / 重连中的顶部提示条（U4：不能静默卡住）。
+  Widget _buildServiceOfflineBanner(BuildContext context, String reason) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.errorContainer,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        child: Row(
+          children: <Widget>[
+            Icon(Icons.cloud_off, size: 16, color: scheme.onErrorContainer),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                reason,
+                style: TextStyle(color: scheme.onErrorContainer, fontSize: 12.5),
+              ),
+            ),
+          ],
         ),
       ),
     );

@@ -9,6 +9,7 @@ import 'package:window_manager/window_manager.dart';
 import 'io/api_service.dart';
 import 'io/core_attachment.dart';
 import 'io/single_instance.dart';
+import 'io/station_client.dart';
 import 'io/tray_service.dart';
 import 'io/ui_identity.dart';
 import 'io/websocket_service.dart';
@@ -68,6 +69,10 @@ Future<void> main() async {
   ApiService.setToken(attachment.token);
   // U3：装成插件时（同目录有 plugin.json）连上即声明身份；开发期不发。
   WebSocketService.helloFrame = UiIdentity.load().helloFrame();
+  // U4：站点订阅依赖 ui.hello 归属；没有身份时（开发期）不建这条连接。
+  if (WebSocketService.helloFrame != null) {
+    StationClient.instance.start();
+  }
 
   // **拦截关闭按钮**：默认只隐藏窗口（见 [TrayService]），真正的退出走托盘菜单 /
   // 设置页的退出入口。桌面端的长任务正在跑时，误点关闭等于终止整轮工作。

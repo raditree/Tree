@@ -93,10 +93,10 @@ plugin.json
 | 文件 | 改动 | 理由 |
 | --- | --- | --- |
 | [lib/main.dart](file:///e:/programs/Tree/desktop/lib/main.dart) | 删除"默认拉起核心"分支；改为**先读 `TREE_CORE_URL`/`TREE_CORE_TOKEN`**，缺失则直接报错退出（不自行 spawn） | 启动顺序反转 |
-| [lib/io/core_process_launcher.dart](file:///e:/programs/Tree/desktop/lib/io/core_process_launcher.dart) | 从 UI 依赖中移除；逻辑迁至 loader（loader 在核心仓交付） | UI 不再管核心进程 |
+| ~~`lib/io/core_process_launcher.dart`~~ | **已删除**（U1）；启动核心的逻辑归 loader | UI 不再管核心进程 |
 | `lib/io/api_service.dart`（构造处） | base URL 从环境变量取；保留 `--dart-define` 覆盖供开发 | 端口随机 |
 | `lib/io/websocket_service.dart` | token 从环境变量取；连接后发送 `ui.hello`；订阅改为**按 topic 订阅** | 站点化 |
-| 新增 `lib/io/station_client.dart` | 封装 `station/subscribe` / `station_delivery` / 重连后重放订阅；**不含 `station/trigger`**——功能调用一律走 REST | 目前没有 WS 侧站点客户端 |
+| 新增 `lib/io/station_client.dart` | 封装 `station/subscribe` / `station_delivery` / 重连后重放订阅（当前只订 `system.broadcast.plugin.state`）；**不含 `station/trigger`**——功能调用一律走 REST | 目前没有 WS 侧站点客户端 |
 | 新增 `lib/io/frame_router.dart` | 把 `station_delivery` 的 topic 分发到现有 UI 处理函数（`message`/`tool_start`/…） | 领域帧改由插件发出后，UI 侧只需换收口，不改渲染 |
 | `lib/ui/services/theme_service.dart`、`font_service.dart`、`text_scale_service.dart` | 不变（本地 prefs） | 主题/字体本就属于 UI |
 | `lib/ui/widgets/right_panel_host.dart`、`file_viewer/*` | 不变 | 应用内窗口不依赖核心 |
@@ -113,7 +113,7 @@ plugin.json
 | **U1 附着化** | 去掉自 spawn；缺失 env 时明确报错；开发模式支持 `flutter run --dart-define=TREE_CORE_URL=...` | 手动拉起核心后 UI 能连上；不启动第二个核心 |
 | **U2 打包** | `tool/package_ui_plugin.dart` 产出插件 zip（含 `plugin.json`）；本地以插件方式安装 | 从插件面板安装后能启动；卸载后文件被清空且条目保留 `enabled:false` |
 | **U3 身份** | 连上即发 `ui.hello`；`/api/meta` 能看到自己 | `/api/meta.ui` 出现本插件；不声明 `plugin.manage` 时引导页仍开 |
-| **U4 站点客户端** | 只做订阅广播（先只接 `plugin_status` 与心跳）；需要当前态时调 REST | 断开重连后订阅自动恢复；核心发 `closed` 时 UI 显示"服务下线"而不是静默卡住 |
+| **U4 站点客户端** | 订阅插件生命周期广播站（`system.broadcast.plugin.state`）；心跳继续由 WS 服务发；`closed` / 断线在主页顶部给出可见横幅 | 断开重连后订阅自动恢复；核心发 `closed` 时 UI 显示"服务下线"而不是静默卡住 |
 | **U5 帧收口** | 领域帧改由 `frame_router` 接收（批次 G 之后） | 消息流、工具卡片、agent 状态与改造前功能等价 |
 | **U6 清理** | 删除旧 `plugin_ui_*` 引用与槽位接线 | `grep plugin_ui` 为空；flutter 测试全绿 |
 

@@ -96,6 +96,13 @@ class WebSocketService {
   /// 连接状态变化回调
   void Function(bool connected)? onConnectionChange;
 
+  /// **会话确认**回调：建连后的宽限期内没有错误 / 关闭，视为本次连接可用。
+  ///
+  /// 与 [onConnectionChange] 的区别：后者在 `WebSocketChannel.connect` 返回时就
+  /// 乐观置 true（此时握手可能还在后台），本回调只在"确实没炸"时才触发。站点
+  /// 订阅据此清掉"离线"提示，避免每次重连尝试都把提示闪没。
+  void Function()? onSessionReady;
+
   /// 终端帧（terminal_ready / output / exit / error）的**广播流**。
   ///
   /// 为什么不复用 [onMessage]：终端输出是高频字节流（一块几十到几千字节），混进
@@ -223,6 +230,7 @@ class WebSocketService {
     _connectedTimer?.cancel();
     _connectedTimer = Timer(_connectedGrace, () {
       _reconnectAttempts = 0;
+      onSessionReady?.call();
     });
   }
 
