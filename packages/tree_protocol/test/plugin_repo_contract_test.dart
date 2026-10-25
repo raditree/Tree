@@ -81,6 +81,25 @@ void main() {
     );
   });
 
+  test('tree.agent 依赖 local_executor（执行器是 agent 的必需依赖）', () {
+    final Map<String, dynamic>? manifest = manifests.cast<Map<String, dynamic>?>().firstWhere(
+      (Map<String, dynamic>? m) => m?['id'] == 'tree.agent',
+      orElse: () => null,
+    );
+    expect(manifest, isNotNull, reason: '找不到 tree.agent');
+    final Object? requires = manifest!['requires'];
+    expect(requires, isA<Map<String, dynamic>>());
+    final Object? plugins = (requires as Map<String, dynamic>)['plugins'];
+    expect(plugins, isA<List<dynamic>>());
+    final List<dynamic> list = plugins as List<dynamic>;
+    final Map<String, dynamic>? dep = list
+        .whereType<Map<String, dynamic>>()
+        .cast<Map<String, dynamic>?>()
+        .firstWhere((Map<String, dynamic>? d) => d?['id'] == 'local_executor', orElse: () => null);
+    expect(dep, isNotNull, reason: 'tree.agent 必须声明 local_executor 依赖');
+    expect(dep!['optional'], isNot(true), reason: '执行器依赖不能是 optional');
+  });
+
   test('每个 plugin.json 都过字段纪律（与 plugins/README.md 的表逐条对齐）', () {
     final Set<String> seenIds = <String>{};
     final Set<String> seenCommands = <String>{};
