@@ -119,6 +119,13 @@ plugin.json
 
 **U1–U4 可在批次 D 后立即进行；U5 必须等批次 G；U6 属于批次 E。**
 
+> 2026-10-25 本仓实测：打包后的 `tree_ui.exe` 由核心 `UiHost` 拉起后可附着并完成
+> `ui.hello`，`/api/meta.ui` 返回 `tree.ui.default`（connections=3，
+> capabilities=[plugin.manage]，can_manage_plugins=true）；U1/U3 通过。
+> U4 的订阅/重连/`closed` 语义由 `test/station_client_test.dart` 覆盖（无真实核心）。
+> **U2 的"从面板安装"未验证**：本仓核心只有发布仓库安装流程，没有本地 zip 安装端点，
+> 且 `requires.api` 的核心侧启用前校验仍是片 D 的遗留项。
+
 ---
 
 ## 6. 版本与兼容
@@ -154,7 +161,8 @@ E 与 U5 顺序可互换，但 **U6 必须在 E 之后**，否则删了协议而
 
 | 层 | 用例 |
 | --- | --- |
-| 打包 | zip 内容白名单；`plugin.json` schema 校验；缺 `requires.api` 时安装被拒 |
+| 打包 | zip 内容白名单（`tree_ui.exe` + `plugin.json`，无 pdb / `tree_core.exe`）；`plugin.json` 形状校验；**缺 `requires.api` 时安装被拒 —— 核心侧尚未实现（片 D 遗留）** |
+| 安装 | **本仓无本地 zip 安装端点**；安装流程依赖 tree-plugins 发布仓库，此处只验证产物形状与 `UiHost` 拉起 |
 | 附着 | 无 env 直接退出并给可读错误；有 env 不 spawn 核心 |
 | 握手 | `ui.hello` 后 `meta.ui` 出现；id 与清单不符被拒 |
 | 订阅 | 断线重连恢复订阅；`closed` 帧触发 UI 提示 |

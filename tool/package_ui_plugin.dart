@@ -247,6 +247,8 @@ Future<int> _runLive(String exe, List<String> args, String workingDirectory) asy
     args,
     workingDirectory: workingDirectory,
     mode: ProcessStartMode.inheritStdio,
+    // Windows 上 `flutter` 是 .bat，必须经 shell 解析才能找到。
+    runInShell: Platform.isWindows,
   );
   return process.exitCode;
 }
