@@ -180,6 +180,23 @@ PTY 是宿主能力（进程、终端句柄），不属于 agent 领域，**保�
 
 > **「loader 注入」的说法作废**：loader 只负责拉起核心并完成 ready 握手，它不认识插件、也不该认识。能注入插件环境变量的只有核心的 `PluginConfig.env`。若未来需要主密钥，落点写死为「核心 → `config.env`」或「OS 凭据管理器」，不得把插件知识漏进 loader。
 
+### 4.8 `core_settings.dart` 必须先拆分
+
+现状把**平台开关**和**单一 agent 领域的模型配置**混在一个类里，这与「调度核心」定位冲突。拆分口径：
+
+| 现状字段 / 能力 | 归属 | 去向 |
+| --- | --- | --- |
+| `frame_rate`（UI 推送合并帧率） | 平台 | 留核心 |
+| `heartbeat_interval` / `missed_heartbeat_limit` / `livenessNotice` | 平台（插件判活） | 留核心 |
+| `data_collection_enabled` | 平台（遥测开关） | 留核心 |
+| `extra`（未知键透传） | 平台 | 留核心（仅透传，不解释） |
+| `models` / `CoreModelConfig`（含 `api_key`、`base_url`、thinking、vision、effort、`max_seqlen`、`max_output_tokens`、`token_scale`、`longest_session_tokens`） | **agent 领域** | **随 `tree_agent_loop` 迁走**；落 `models/<id>.yaml` 原路径 |
+| `token_acquisition_rate`（LLM 逐 token 取用节奏） | **agent 领域** | 随迁 |
+| `fallbackMaxSeqlen` | **agent 领域** | 随迁 |
+| `/api/settings` 的领域键 | 领域 | 由 `tree.agent` 的委派路由提供；核心 `/api/settings` 只回平台键 |
+
+拆分完成前不得开始 A1 的数据接管；否则插件会继续被迫感知核心设置模型。
+
 ---
 
 ## 5. 功能对等清单（验收必须逐条打勾）
@@ -237,6 +254,9 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 10. **核心不认识「子 agent 执行体」**：核心没有子 agent 进程、执行器或调度器概念；子 agent 的创建、排队、并发与回收全部在 `tree.agent` 进程内部完成，对外只暴露与会话一致的委派端点。核心只看到「一次委派请求」。
 11. MCP 整体迁 `mcp` 插件；核心不留 MCP 客户端 / 服务端代码，也不认识 MCP 工具类型。
 12. 命令执行一律走**工具插件贡献的执行站**；`tree.agent` 不直接 `Process.start`、不持有 PTY，避免绕过权限与审计。
+13. **插件不得 import 任何核心包**：只允许 pub.dev 依赖与插件仓自带的 `_kit`；复用核心能力走内置执行站（stdio）或 UI 的 REST 端点。
+14. **核心的站点 scope 不得含领域字段**（`team_id/agent_id/session_id/mode_key`）；领域归属与跨域授权由领域插件自己负责，核心只认证调用方与 workspace 租约。
+15. **核心设置只保留平台级**；模型池、token 节奏等 agent 领域配置随 `tree.agent` 迁走。
 
 ---
 
@@ -270,10 +290,10 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | --- | --- | --- |
 | 1 | 插件仓挂载在 `plugins/`（远端仓库名 `tree-plugins`），但其中**没有** `tree.agent/` 目录；发布索引 `plugins/release/plugin-index.json` 也没有该条目 | A1「插件二进制 + stdio 循环」需先在插件仓新建目录与包 |
 | 2 | ~~`packages/tree_agent` 重名~~ **已规避**：新包定名 `tree_agent_loop`（放 `plugins/tree.agent/`）；现有 `packages/tree_agent` 是目标机 Linux 执行体，不改名、不复用 | 无（命名冲突消解） |
-| 3 | 领域代码规模约 20k 行：`agent` 5345 / `llm` 5030 / `team` 2683 / `tool` 5139 / `mcp` 1572；且对核心基础件有硬依赖——`agent → store 12 / util 5 / tool 5 / settings 4 / plugin 2`、`tool → team 7 / plugin 5 / spec 4 / store 4`、`llm → util 6 / settings 5 / agent 5 / store 5` | 「只改 import 与注入」实际需要先把 `store / settings / util / plugin 客户端` 一并下放或抽共享包，否则不变量 1（不得依赖 `tree_core`）无法满足 |
+| 3 | 领域代码规模约 20k 行：`agent` 5345 / `llm` 5030 / `team` 2683 / `tool` 5139 / `mcp` 1572；且对核心基础件有硬依赖——`agent → store 12 / util 5 / tool 5 / settings 4 / plugin 2`、`tool → team 7 / plugin 5 / spec 4 / store 4`、`llm → util 6 / settings 5 / agent 5 / store 5` | 插件不得 import 核心包，故必须：领域层与通用小件**复制随迁**、设置先拆分、插件互通改**核心内置执行站**（§10.1） |
 | 4 | 核心测试 176 个文件，其中大量用例直接 import `src/agent|llm|team|tool`；`core_server.dart` 的 `_registerRoutes` 实际注册约 **33 条**领域路由（agents CRUD、models、sessions、conversations、subagents、teammates、specs、reset/compact/ssh reconnect、questions 等） | §1.2 / §6 的「23 / 25 条」口径已漂移；A2 的「逐字节一致」基线需先重新点数并冻结 |
 
-结论：G 的正确起点不是搬代码，而是先拍板下面两件事，然后按 A1（最小端点 `GET /api/agents` 走通 stdio / 委派 / 一致性）验证脚手架。
+结论：G 的正确起点不是搬代码，而是先完成三项前置（`core_settings` 拆分、scope 去领域化立项、路由基线冻结），再按 A1（最小端点 `GET /api/agents` 走通 stdio / 委派 / 一致性）验证脚手架。
 
 ### 已拍板（2026-10-25）
 
@@ -286,41 +306,50 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | 5 | 命令执行走工具插件执行站（不变量 12） |
 | 6 | 领域测试（`agent/llm/team/tool/mcp` 相关用例）**随代码迁到插件仓** `tree_agent_loop`；核心只保留插件平台 / 协议 / 服务端测试 |
 | 7 | 模型供应商 Key 随插件明文落盘 + 权限收紧；落盘加密本期不做；「loader 注入」作废（§4.7） |
+| 8 | **插件不得 import 任何核心包**；复用核心能力只能走「核心内置执行站」或 UI 的 REST 委派端点；通用小件由插件自备（§10.1） |
+| 9 | `core_settings.dart` 先按「平台级 / 领域级」拆分，拆分前不得开始 A1 数据接管（§4.8） |
+| 10 | 插件 scope 必须去领域化：`team_id / agent_id / session_id / mode_key` 逐步移除，授权搬到「核心内置执行站 + workspace 租约」（§10.3） |
 
 ### 仍需拍板
 
-8. **基础件供给方式**：`store / settings / util / plugin 客户端` 是用共享包下放，还是由核心暴露为插件 API（`/api/store`、`/api/logs` 已具备，其余需补）？具体依赖清单见 §10.1。
-9. **路由点数基线**：以 `_registerRoutes` 的 33 条为准重写 §1.2/§5/§6，还是趁机裁剪到真正的 25 条功能面？
+11. **路由点数基线**：以 `_registerRoutes` 的 33 条为准重写 §1.2/§5/§6，还是趁机裁剪到真正的 25 条功能面？
 
 ---
 
-## 10.1 核心基础件依赖清单（供拍板 #8）
+## 10.1 核心基础件依赖清单（2026-10-25 修正）
 
-> 口径：领域目录（`agent/llm/team/tool/mcp`）**直接 import** 的核心文件；`←` 后是使用方。
-> 这张表就是「要么下放到共享包、要么变成插件 API」的全部候选。
+> **已拍板：插件不得 import 任何核心包**（`tree_core`、`tree_protocol` 及主仓内其它包）。
+> 理由：插件仓可能被其他开发者单独 checkout，任何 `path:` / 相对路径依赖都会断。
+>
+> 插件复用核心能力只有两条路：
+> 1. 核心**主动提供内置执行站**（stdio 站点命令）；
+> 2. UI 插件走 **REST 委派端点**。
+>
+> 因此本节不再有「共享包下放」选项，只有 **随迁（插件自备）** 或 **核心执行站 API**。
+> `plugins/_kit` 属于插件仓自身，随插件仓分发，不算核心包。
 
-### 正向依赖（插件需要的东西）
+### 正向依赖与处理
 
-| 核心文件 | 使用方 | 用途 | 下放难度 |
+| 核心文件 | 使用方 | 用途 | 处理方式 |
 | --- | --- | --- | --- |
-| `store/tree_store.dart` | agent 4 / team 2 / tool 1 | 数据访问主入口（agent/session/message/team 读写） | 高：与 `records` 绑定 |
-| `store/records.dart` | agent 1 / team 2 / llm 1 | **领域记录模型**（CoreAgent/Session/Message/Team） | 高：本就是领域类型，应整体迁走 |
-| `store/atomic_file.dart` | agent 1 / llm 1 / team 1 / tool 1 / mcp 1 | 原子写 | 低：通用件 |
-| `store/tree_paths.dart` | agent 1 / team 1 / tool 1 | 路径布局 | 低：通用件 |
-| `store/write_queue.dart` | agent 1 | 串行写 | 低：通用件 |
-| `store/usage_log.dart` | agent 1 / llm 3 | 用量记录 | 中：可改走日志 API |
-| `store/subagent_registry.dart` | agent 2 / tool 1 | 子 agent 登记 | 低：领域件，随迁 |
-| `store/yaml_codec.dart` | mcp 1 | YAML 编解码 | 低：通用件 |
-| `util/ids.dart` | agent 3 / team 1 / llm 1 | id 生成 | 低 |
-| `util/tokens.dart` | agent 2 / llm 5 | token 估算 | 低 |
-| `util/liveness.dart` | team 1 / mcp 3 | 心跳判活 | 低 |
-| `settings/core_settings.dart` | agent 3 / llm 4 / team 1 | 全局设置（模型、并发、压缩阈值） | 中：领域设置项要拆 |
-| `settings/ssh_config.dart` | agent 1 / team 1 / tool 1 | SSH 配置 | 中：跨域 |
-| `plugin/agent_events.dart` | agent 2 | 事件形状 | 低：本质是协议，宜移 `tree_protocol` |
-| `plugin/plugin_bus.dart` | tool 2 | 向插件执行站下命令 | 高：插件客户端要抽 |
-| `plugin/plugin_host.dart` / `station_runtime.dart` / `station_scope.dart` | tool 1 | 插件工具适配 | 高 |
-| `ws/ws_hub.dart` | agent 1 | 事件推送 | 低：迁移后改 topic，直接删除 |
-| `spec/spec_service.dart` / `spec/builtin_specs.dart` | tool 4 | spec 工具 | 中：spec 插件化后改执行站 |
+| `store/tree_store.dart` | agent 4 / team 2 / tool 1 | 数据访问主入口 | **随迁**（领域数据层） |
+| `store/records.dart` | agent 1 / team 2 / llm 1 | 领域记录模型 | **随迁**（本就是领域类型） |
+| `store/subagent_registry.dart` | agent 2 / tool 1 | 子 agent 登记 | **随迁** |
+| `store/atomic_file.dart` | agent 1 / llm 1 / team 1 / tool 1 / mcp 1 | 原子写 | 插件自备（通用小件，复制进 `tree_agent_loop`） |
+| `store/tree_paths.dart` | agent 1 / team 1 / tool 1 | 路径布局 | 插件自备（改为接收 `data_dir`） |
+| `store/write_queue.dart` | agent 1 | 串行写 | 插件自备 |
+| `store/yaml_codec.dart` | mcp 1 | YAML 编解码 | 插件自备（或用 pub 依赖 `yaml`） |
+| `store/usage_log.dart` | agent 1 / llm 3 | 用量记录 | 走核心 `/api/logs`，或插件自备账本 |
+| `util/ids.dart` | agent 3 / team 1 / llm 1 | id 生成 | 插件自备 |
+| `util/tokens.dart` | agent 2 / llm 5 | token 估算 | 插件自备 |
+| `util/liveness.dart` | team 1 / mcp 3 | 心跳判活 | 插件自备（MCP 则迁 `mcp` 插件） |
+| `settings/core_settings.dart` | agent 3 / llm 4 / team 1 | 全局设置 | **先拆分**：平台级留核心；模型池 / token 节奏随迁（见 §4.8） |
+| `settings/ssh_config.dart` | agent 1 / team 1 / tool 1 | SSH 配置 | **随迁**（领域配置）；实际执行走 `ssh_executor` 插件 |
+| `plugin/agent_events.dart` | agent 2 | 事件形状 | **随迁**（topic 载荷由插件自定义） |
+| `plugin/plugin_bus.dart` | tool 2 | 向插件执行站下命令 | **不提供**：改为调用核心内置执行站 |
+| `plugin/plugin_host.dart` / `station_runtime.dart` / `station_scope.dart` | tool 1 | 插件工具适配 | **不提供**：站点命令是唯一互通通道 |
+| `ws/ws_hub.dart` | agent 1 | 事件推送 | **删除**：改广播站 topic |
+| `spec/spec_service.dart` / `spec/builtin_specs.dart` | tool 4 | spec 工具 | 走 `spec` 插件执行站 |
 
 ### 反向依赖（核心必须先切断，否则删不掉领域目录）
 
@@ -333,7 +362,11 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | `files/file_service.dart` | `team/team_workspace` |
 | `terminal/terminal_service.dart` | `team/team_workspace` |
 
-> 关键结论：`store/records.dart`、`store/tree_store.dart`、`settings/core_settings.dart` 是三条主干；它们不迁，`tree_agent_loop` 就不可能不依赖 `tree_core`。反向依赖里 `plugin_bus` 与 `execute_mounts` 是硬点（核心插件平台反过来 import 领域代码），必须先改成协议/站点边界。
+> **关键结论（修正版）**：
+> - `records` / `tree_store` 整体随迁；通用小件复制进插件仓，不再抽共享包。
+> - `core_settings.dart` **不能整包下放**：它按单一 agent 设计，必须先拆成「平台设置」与「领域设置」（§4.8）。
+> - 反向依赖里 `plugin_bus` 与 `execute_mounts` 是硬点：核心插件平台反过来 import 领域代码，必须改成「协议 + 核心内置执行站」边界。
+> - `tree_agent_loop` 只允许依赖 pub.dev 包与 `plugins/_kit`；CI 需加一条检查：插件仓内不得出现 `package:tree_core/...` 或 `package:tree_protocol/...`。
 
 ---
 
@@ -349,6 +382,35 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | `station_runtime.dart` | 默认 scope 仅用于订阅，不触发实例化 |
 
 若未来要「逐 agent 单独起实例」，平台需新增：实例键 `(plugin_id, agent_id)`、按需 spawn 与回收、每实例独立看门狗/站点命名空间、委派按信封 `agent_id` 路由、并发上限。**本期不做**，登记为遗留项 L-20。
+
+---
+
+## 10.3 勘测：插件 scope 仍含领域字段（应去掉）
+
+**结论：是，仍然存在，且渗透 13 个文件。** `StationScope` 当前字段为 `teamId / agentId / sessionId / modeKey`，`StationScopeContext` 另带同样三项 + `modeKey`。
+
+| 使用点 | 用到的字段 | 作用 | 去领域化后的替代 |
+| --- | --- | --- | --- |
+| `station_scope.dart` | 定义 / `fromJson` / `toJson` | 订阅与命令的上下文 | 删除四个领域字段，只留通用上下文 |
+| `station_runtime.dart:98` | `sessionId > agentId > teamId` | 派生订阅粒度 | 改为 `plugin_id + connection_id + topic` |
+| `station_channel.dart:108` | `scope.key` | 订阅者键 | 同上 |
+| `station_instance.dart:474` | `teamId` | 投递过滤 | 广播给全部订阅者，由订阅方自行过滤 |
+| `plugin_bus.dart:859-865` | team/agent/session | scope 匹配 | 同上 |
+| `plugin_bus.dart:3767` | `team_id` / `mode` | 站点 state 回包 | 删除这些键 |
+| `execute_mounts.dart:550/589/629/660/673` | `teamId` / `agentId` / `modeKey` | **跨 team / 跨 agent / 跨模式 fail-closed 授权** | 安全语义必须重新安置：核心只校验 workspace 租约与调用方身份，领域归属由 `tree.agent` 自己保证 |
+| `execute_mounts.dart:874/1202` | `sessionId` | 用量记账归属 | 改为调用方传入的 opaque `account_id` |
+| `plugin_tool_definition.dart:27` | 默认 `StationScope()` | 工具调用上下文 | 改为与领域无关的 `workspace_dir / data_dir` |
+| `plugin_state_pool.dart` | 声明 scope | 状态池键 | 删除 |
+| `agent_events.dart` | `agent_id` / `session_id` / `team_id` | 事件载荷 | 随 `tree_agent_loop` 迁走，核心不解释 |
+| `core_server.dart` / `plugin_host.dart` | 解析、透传 | UI 订阅 / 插件命令 | 改为通用上下文 |
+
+### 移除方案（两步，不能一把删）
+
+1. **协议先扩后收**：新增通用 `context {workspace_dir, data_dir, client_id}`；`team_id/agent_id/session_id` 标记废弃但继续接受一个版本（避免 UI 与现有插件同时断）。
+2. **授权搬家**：跨 team / 跨 workspace 的 fail-closed 检查从核心的 `execute_mounts` 搬到「核心内置执行站 + workspace 租约」——核心只证明「这个调用方被允许使用这个 workspace」，不再证明「这个 agent 属于这个 team」。
+3. 之后删除字段、映射、`scope.key` 与 UI 侧 scope 订阅参数，并更新 `tree_protocol` 的站点契约。
+
+> 这是一次协议破坏性变更，**不属于 G**；登记为遗留项 L-21，需单独立项与独立审批。
 
 > 全部未闭环项（含 G-1~G-7、U-3/U-4、C-11、手工回归、文档缺口）已统一登记在
 > [ui-pluginization_acceptance.md §12 遗留项台账](ui-pluginization_acceptance.md#12-遗留项台账2026-10-25-落档)。
