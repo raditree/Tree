@@ -8,14 +8,12 @@ import 'package:tree_local_exec/tree_local_exec.dart';
 import '../settings/ssh_config.dart';
 
 import '../agent/private_workspace_io.dart';
-import '../mcp/mcp_service.dart';
 import '../plugin/plugin_bus.dart';
 import '../spec/spec_service.dart';
 import '../team/message_dispatcher.dart';
 import '../team/team_service.dart';
 import 'builtin_tools.dart';
 import 'hook_ledger.dart';
-import 'mcp_tool.dart';
 import 'message_tool.dart';
 import 'plugin_tool.dart';
 import 'question_channel.dart';
@@ -52,7 +50,6 @@ class WorkspaceToolRunner implements ToolRunner {
     this.messageDispatcher,
     this.specService,
     this.subagentService,
-    this.mcpService,
     this.pluginBus,
     ToolRunRegistry? toolRuns,
     this.hookLedger,
@@ -147,8 +144,6 @@ class WorkspaceToolRunner implements ToolRunner {
   /// Spec 体系（为 null 时不声明 `spec`）。
   final SpecService? specService;
 
-  /// MCP 服务（为 null 时不声明 `mcp` 与各 MCP 工具）。
-  final McpService? mcpService;
 
   /// 插件总线（为 null 时不声明 `plugin` 与各插件工具）。
   final PluginBus? pluginBus;
@@ -210,10 +205,6 @@ class WorkspaceToolRunner implements ToolRunner {
         // 作用域解析用下面那份 team + 临时员工名册（缺谁就少看一路，不算未接线）。
         withToolRuns: true,
       ),
-      if (mcpService != null) ...<ToolSpec>[
-        McpTool.spec(),
-        ...McpTool.dynamicSpecs(mcpService!),
-      ],
       if (pluginBus != null) ...<ToolSpec>[
         PluginTool.spec(),
         // **工具表刷新处**（模型每轮生成前都走这里）：按调用点四元组取插件工具，
@@ -372,12 +363,6 @@ class WorkspaceToolRunner implements ToolRunner {
     ToolInvocation effective, {
     bool Function()? isCancelled,
   }) async {
-    // MCP 工具（含命名空间工具）不经 BuiltinTools 的 switch：它们的名字是
-    // 动态的，且同样不依赖工作空间。
-    final McpService? mcp = mcpService;
-    if (mcp != null && McpTool.handles(effective.name)) {
-      return _truncate(await McpTool.run(effective, mcp));
-    }
     final PluginBus? plugins = pluginBus;
     if (plugins != null && PluginTool.handles(effective.name)) {
       return _truncate(await PluginTool.run(effective, plugins));

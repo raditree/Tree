@@ -96,21 +96,8 @@ Future<void> main(List<String> args) async {
     log: coreLog.forPrefix('core:spec'),
   );
 
-  // MCP 服务（M6a）：配置在 <数据根>/config/mcp.yaml；启动时尝试连接一次，
-  // 失败只在日志里说明（坏插件不该拦住核心启动）。
-  // 心跳判活参数（M9 1.1）从设置取：MCP 的 ping 节拍与"连续几拍算死"因此可调。
-  // 生效时机 = **下次核心启动**：McpService / McpClient 的这两个字段是 final，
-  // 构造后不再变（设置在运行期改了也不会改到这里，界面上写的是"下次启动生效"）。
-  final McpService mcp = McpService(
-    configFile: paths.mcpConfigFile,
-    heartbeatInterval: settings.heartbeatInterval,
-    missedHeartbeatLimit: settings.missedHeartbeatLimit,
-    log: coreLog.forPrefix('core:mcp'),
-  );
-  // 首次连接**不在这里做**：MCP 的初始连接没有超时参数（见 McpClient 的类文档），
-  // 排在握手之前时，一家半死的 MCP 服务就能把核心启动拖到 25s 握手超时。改为握手
-  // 之后并行预热，见 _warmUpPeripheralsAfterHandshake。
-  bootLog('存储 / 设置 / MCP 装配完成');
+  bootLog('存储 / 设置装配完成');
+
 
   // 提问回路与插件总线都要"工具层先建、核心后建 WS 广播"，因此统一用一个可后置
   // 绑定的广播槽（核心起监听后立即接上 `hub.broadcast`）。
@@ -283,7 +270,6 @@ Future<void> main(List<String> args) async {
     messageDispatcher: messages,
     specService: specs,
     subagentService: subagentService,
-    mcpService: mcp,
     pluginBus: plugins,
     // **远端后台任务的落盘台账**（`<数据根>/hooks`）：核心/应用重启后据此接续
     // （见启动末尾的 `restorePending`），完成提示投递回原会话。
@@ -573,7 +559,6 @@ Future<void> main(List<String> args) async {
     specService: specs,
     specIoFor: tools.ioFor,
     systemPromptStore: systemPrompts,
-    mcpService: mcp,
     pluginBus: plugins,
     // 发布仓库（阶段 5：插件管理只拉发布源的 Release 资产）：这里只给数据根的缓存
     // 目录，剩下的接线（已装条目读 plugins.yaml / 脚本型解释器探测 / 换文件闸门）
@@ -678,7 +663,6 @@ Future<void> main(List<String> args) async {
   // 只影响"第一轮生成时的工具表"（那一轮由 awaitReady 闸门兜底），不再拖住核心启动。
   unawaited(
     _warmUpPeripheralsAfterHandshake(
-      mcp,
       plugins,
       peripheralsReady,
       coreLog.forPrefix('core:boot'),
@@ -735,7 +719,6 @@ Future<void> main(List<String> args) async {
 /// 1. 预热绝不排在握手之前（否则外设卡住 = 界面看到"核心进程未能启动"）；
 /// 2. 无论成败都要放行闸门（否则第一轮生成会永远等下去）。
 Future<void> _warmUpPeripheralsAfterHandshake(
-  McpService mcp,
   PluginBus plugins,
   Completer<void> ready,
   void Function(String message) log,
@@ -743,7 +726,6 @@ Future<void> _warmUpPeripheralsAfterHandshake(
   try {
     await warmUpPeripherals(
       <WarmUpTask>[
-        (name: 'MCP 服务', run: () => mcp.refresh()),
         (
           name: '插件',
           run: () async {

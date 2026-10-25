@@ -295,32 +295,6 @@ void main() {
       );
     });
 
-    test('运行器：命名空间工具可直接调用，且不需要工作空间', () async {
-      await service.register(<String, dynamic>{'name': 'fs', 'command': 'npx'});
-      final WorkspaceToolRunner runner = WorkspaceToolRunner(
-        resolveWorkspaceDir: (String _) => '',
-        mcpService: service,
-      );
-      final List<String> names = runner
-          .specsFor(agentId: 'agt_1', sessionId: 'ses_1')
-          .map((ToolSpec s) => s.name)
-          .toList();
-      expect(names, contains('mcp'));
-      expect(names, contains('mcp__fs__echo'));
-
-      final ToolOutcome outcome = await runner.run(
-        ToolInvocation(
-          id: 't',
-          name: 'mcp__fs__echo',
-          arguments: <String, dynamic>{'text': 'Y'},
-          agentId: 'agt_1',
-          sessionId: 'ses_1',
-        ),
-      );
-      expect(outcome.isError, isFalse);
-      expect(outcome.content, 'echo: Y');
-      await runner.close();
-    });
   });
 
   group('懒注册（真机反馈："点注册很久没反应、提示推了一次又一次"）', () {

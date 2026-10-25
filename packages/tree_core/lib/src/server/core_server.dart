@@ -18,8 +18,6 @@ import '../agent/workspace_prompt.dart';
 import '../files/file_service.dart';
 import '../llm/llm_agent_engine.dart';
 import '../llm/llm_json_caller.dart';
-import '../mcp/mcp_client.dart';
-import '../mcp/mcp_service.dart';
 import '../plugin/builtin_plugins.dart';
 import '../plugin/execute_mounts.dart';
 import '../plugin/plugin_bus.dart';
@@ -96,7 +94,6 @@ class CoreServer {
     required this.specService,
     required this.specIoFor,
     required this.systemPromptStore,
-    required this.mcpService,
     required this.pluginBus,
     required this.builtinPlugins,
     required this.pluginHotApplier,
@@ -276,8 +273,6 @@ class CoreServer {
   /// 系统提示词存储（工作空间 `.self/system_prompt.md`）；为 null 时重置路由 503。
   final SystemPromptStore? systemPromptStore;
 
-  /// MCP 服务（M6a）；为 null 时返回空服务列表。
-  final McpService? mcpService;
 
   /// 插件总线（M6b）；为 null 时快照返回 `enabled: false` 空集。
   final PluginBus? pluginBus;
@@ -457,7 +452,6 @@ class CoreServer {
     SpecService? specService,
     Future<WorkspaceIO?> Function(String agentId)? specIoFor,
     SystemPromptStore? systemPromptStore,
-    McpService? mcpService,
     PluginBus? pluginBus,
     BuiltinPluginCatalog? builtinPlugins,
     PluginHotApplier? pluginHotApplier,
@@ -557,7 +551,6 @@ class CoreServer {
       specService: specService,
       specIoFor: specIoFor,
       systemPromptStore: systemPromptStore,
-      mcpService: mcpService,
       pluginBus: pluginBus,
       builtinPlugins: resolvedBuiltinPlugins,
       // 默认热应用 = 总线公开面实现；总线为空时也用同一份（apply 前会先判空）
@@ -735,7 +728,6 @@ class CoreServer {
     await conversation.engine.close();
     reassembler.clear();
     await hub.closeAll();
-    await mcpService?.close();
     // 执行站挂载位置：只释放它**自建**的后台任务管理器（外部注入的那一份归注入方
     // 所有——CLI 里由 WorkspaceToolRunner.close() 关，这里重复关会把共用任务表清空）
     // 终端会话先收：别把孤儿 shell 留在用户的工作区里
@@ -2202,9 +2194,6 @@ class CoreServer {
     router.add('GET', ApiPaths.pluginStation, _stationDetail);
     router.add('PATCH', ApiPaths.pluginStationConfig, _updateStationConfig);
     router.add('POST', ApiPaths.pluginStationSubscriber, _setStationSubscriber);
-    router.add('GET', ApiPaths.mcpServices, _mcpServices);
-    router.add('POST', ApiPaths.mcpServices, _registerMcpService);
-    router.add('DELETE', ApiPaths.mcpService, _deleteMcpService);
     // 运行中工具（"工具卡住"的可见面）：只读快照 + 显式关闭。关闭走与执行站
     // `tool.close` **同一个**实现（`ToolRunRegistry.close`），fail-closed 给可读原因。
     router.add('GET', ApiPaths.toolsRunning, _listRunningTools);
@@ -6070,75 +6059,6 @@ class CoreServer {
     await writeJson(request, 200, bus.stations.station(stationId)!.describe());
   }
 
-  Future<void> _mcpServices(HttpRequest request, Map<String, String> _) async {
-    final McpService? mcp = mcpService;
-    if (mcp == null) {
-      await writeJson(request, 200, <String, dynamic>{
-        'services': <Map<String, dynamic>>[],
-      });
-      return;
-    }
-    final Map<String, String> errors = <String, String>{};
-    for (final McpServerConfig config in mcp.servers()) {
-      final String? error = mcp.errorOf(config.name);
-      if (error != null) errors[config.name] = error;
-    }
-    await writeJson(request, 200, <String, dynamic>{
-      'services': mcp
-          .servers()
-          .map((McpServerConfig s) => s.toApiJson())
-          .toList(),
-      'tools': <Map<String, dynamic>>[
-        for (final ({String service, McpToolInfo tool}) entry in mcp.allTools())
-          <String, dynamic>{
-            'service': entry.service,
-            'name': entry.tool.name,
-            'mcp_name': namespacedToolName(entry.service, entry.tool.name),
-            'description': entry.tool.description,
-          },
-      ],
-      'errors': errors,
-    });
-  }
-
-  /// `POST /api/mcp/services`：注册（或覆盖）一个 stdio MCP 服务。
-  Future<void> _registerMcpService(
-    HttpRequest request,
-    Map<String, String> _,
-  ) async {
-    final McpService? mcp = mcpService;
-    if (mcp == null) {
-      await writeJson(request, 501, errorBody('MCP 服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic> body = await readJsonBody(request);
-    final Map<String, dynamic> result = await mcp.register(body);
-    final Object? error = result['error'];
-    await writeJson(
-      request,
-      error == null ? 200 : 400,
-      error == null ? result : errorBody(error.toString()),
-    );
-  }
-
-  /// `DELETE /api/mcp/services/{name}`：删除一个服务（内置服务拒绝删除）。
-  Future<void> _deleteMcpService(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final McpService? mcp = mcpService;
-    if (mcp == null) {
-      await writeJson(request, 501, errorBody('MCP 服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic> result = await mcp.remove(params['name'] ?? '');
-    final Object? error = result['error'];
-    await writeJson(
-      request,
-      error == null ? 200 : 404,
-      error == null ? result : errorBody(error.toString()),
-    );
-  }
 }
 
 /// 一次热应用的结果：配置**已经落盘**，这里只说"对运行中的插件总线做了什么"。
