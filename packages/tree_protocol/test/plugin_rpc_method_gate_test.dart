@@ -196,6 +196,18 @@ void main() {
     );
   });
 
+  test('非协议登记表没有死条目（登记了就必须真的出现在扫描面里）', () {
+    final Set<String> found = scanMethodLiterals().keys.toSet();
+    final Set<String> stale = nonProtocolPluginMethodLiterals.keys.toSet().difference(found);
+    expect(
+      stale,
+      isEmpty,
+      reason:
+          '以下条目已无出现处，应从 nonProtocolPluginMethodLiterals 删除：'
+          '${stale.toList()..sort()}',
+    );
+  });
+
   test('登记表每项都写了原因，且原因不能是空话', () {
     nonProtocolPluginMethodLiterals.forEach((String key, String why) {
       expect(key, isNotEmpty);

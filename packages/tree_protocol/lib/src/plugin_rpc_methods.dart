@@ -201,43 +201,21 @@ abstract final class PluginRpcMethods {
 /// 这些字面量合法地存在于被扫描的源码里，但它们是**别的协议**，
 /// 不该被塞进 [PluginRpcMethods]（那会让不变量 7 与 13 的边界糊掉）。
 const Map<String, String> nonProtocolPluginMethodLiterals = <String, String>{
-  // SSH 中转站协议（核心 ⇄ 插件 ⇄ 目标机 tree_agent）：方法名的家另在
-  // tree_tunnel_protocol（不变量 13），不与本包共用一个常量表。
-  'tunnel.ensure': '属于 tree_tunnel_protocol（不变量 13），非插件↔核心 JSON-RPC 面',
-  'tunnel.request': '同上',
-  'tunnel.state': '同上',
-  'tunnel.close': '同上',
-  'tunnel.event': '同上',
-  // 目标机执行体自己的 stdio 协议（tree_agent 收的一侧），同样归 tree_tunnel_protocol。
-  'agent.ping': '目标机 tree_agent 的 stdio 协议，归 tree_tunnel_protocol',
-  'agent.start': '同上',
-  'agent.read': '同上',
-  'agent.write': '同上',
-  'agent.exec': '同上',
-  'agent.shell': '同上',
   // HTTP 方法：出现在**委派信封**（`api/delegate` 的 `method` 字段）与
   // `system.collect.api.routes` 的路由申报里，属于 REST 协议面，不是 JSON-RPC
   // method。插件实现委派时必然会写这些字面量，塞进 [PluginRpcMethods] 会把
   // "插件↔核心 RPC 面"和"REST 面"混成一张表。
   'GET': '委派信封 / 路由申报里的 HTTP 方法（REST 面），非 JSON-RPC method',
   'POST': '同上',
-  'PUT': '同上',
   'PATCH': '同上',
   'DELETE': '同上',
   // 执行站命令名：插件经 `station/command` 下达，由核心的 `ExecuteStationMounts`
   // 执行（命令白名单的家在 tree_core 的 `StationPoints`），不是插件↔核心 JSON-RPC
   // method；插件侧实现 WorkspaceIO 时必然会出现这些字面量。
-  'fs.read': '执行站命令（StationPoints），非插件↔核心 JSON-RPC 面',
-  'fs.write': '同上',
-  'fs.list': '同上',
-  'fs.grep': '同上',
-  'terminal.exec': '同上',
   'file.read': '自建执行站命令（local_executor），非插件↔核心 JSON-RPC 面',
   'file.write': '同上',
   'file.list': '同上',
-  'file.grep': '同上',
   'file.delete': '同上',
   'file.mkdir': '同上',
   'file.writeBytes': '同上',
-  'exec.command': '同上',
 };
