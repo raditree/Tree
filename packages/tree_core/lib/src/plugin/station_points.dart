@@ -335,10 +335,10 @@ abstract final class StationPoints {
       label: '插件管理',
       description:
           '执行站·插件族：plugin.list / plugin.restart / plugin.suspend / plugin.state /'
-          ' plugin.stateDump / plugin.stateFetch（插件热重启的控制面入口）',
+          ' plugin.stateDump / plugin.stateFetch（插件热重启控制面）+ plugin.toolCall（把一次工具调用原样转给指定插件）',
       alias: 'plugin',
       readme:
-          '插件族（plugin.list / plugin.restart / plugin.suspend / plugin.state /'
+          '插件族（plugin.list / plugin.restart / plugin.suspend / plugin.state / plugin.toolCall /'
           ' plugin.stateDump / plugin.stateFetch）：这一族管的是**插件自己**。'
           '它在插件调 `station/command` 时被触发，不在核心内部自动跑。'
           '回包口径：成功回 `{ok:true, ...结论}`，失败回可读中文原因（不假装做过）；'
@@ -353,7 +353,8 @@ abstract final class StationPoints {
         'plugin.restart',
         'plugin.suspend',
         'plugin.state',
-        'plugin.stateDump',
+        'plugin.toolCall',
+      'plugin.stateDump',
         'plugin.stateFetch',
       ],
     ),

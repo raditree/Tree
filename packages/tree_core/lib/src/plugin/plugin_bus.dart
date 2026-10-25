@@ -2542,6 +2542,44 @@ class PluginBus {
         return _pluginStateDump(pluginId, args);
       case 'plugin.stateFetch':
         return _pluginStateFetch(pluginId, args);
+      case 'plugin.toolCall': {
+        // 不透明转发：core 只看 plugin_id / tool；arguments.scope 原样交给插件，
+        // 不解析 agent_id / team_id / mode_key / session_id。
+        final PluginHost? host = _hosts[pluginId];
+        if (host == null || host.isClosed) {
+          return <String, dynamic>{
+            'ok': false,
+            'error': '插件 $pluginId 未运行，无法调用其工具',
+          };
+        }
+        final String tool = (args['tool'] ?? '').toString().trim();
+        final Object? rawToolArgs = args['arguments'];
+        final Map<String, dynamic> toolArguments = rawToolArgs is Map
+            ? rawToolArgs.map(
+                (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+              )
+            : <String, dynamic>{};
+        final Object? rawScope = args['scope'];
+        final Map<String, dynamic>? opaqueScope = rawScope is Map
+            ? rawScope.map(
+                (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+              )
+            : null;
+        final PluginCallResult result = await host.callTool(
+          tool,
+          toolArguments,
+          scope: opaqueScope,
+        );
+        return <String, dynamic>{
+          'ok': true,
+          'payload': <String, dynamic>{
+            'tool': tool,
+            'result': result.text,
+            'is_error': result.isError,
+            'raw': result.raw,
+          },
+        };
+      }
       default:
         return <String, dynamic>{
           'ok': false,

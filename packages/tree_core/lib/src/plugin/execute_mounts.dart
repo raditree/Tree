@@ -527,6 +527,29 @@ class ExecuteStationMounts {
         '不假装已经做过）',
       );
     }
+    // plugin.toolCall：把调用原样转给目标插件的 tools/call。核心**不解析**
+    // agent_id / team_id / mode_key / session_id：身份由发起方放在
+    // arguments.scope 里（不透明载荷），这里只认 plugin_id 与 tool。
+    if (command == 'plugin.toolCall') {
+      final String target = _string(context.arguments['plugin_id']);
+      if (target.isEmpty) {
+        return const StationCommandOutcome.failed(
+          'plugin.toolCall 需要 arguments.plugin_id（要调哪个插件）',
+        );
+      }
+      if (_string(context.arguments['tool']).isEmpty) {
+        return const StationCommandOutcome.failed(
+          'plugin.toolCall 需要 arguments.tool（插件内的工具名）',
+        );
+      }
+      final Map<String, dynamic> result = await manager(
+        command: command,
+        pluginId: target,
+        sourcePluginId: context.sourcePluginId,
+        arguments: context.arguments,
+      );
+      return _outcomeOf(result, command);
+    }
     final String requested = _string(context.arguments['plugin_id']);
     final bool selfSnapshot =
         command == 'plugin.stateDump' || command == 'plugin.stateFetch';
