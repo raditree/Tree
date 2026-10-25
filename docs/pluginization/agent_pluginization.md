@@ -297,7 +297,7 @@ UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行�
 | 批次 | 内容 | 完成判据 |
 | --- | --- | --- |
 | A1 骨架 | `plugins/tree.agent/`（包 `tree_agent_loop`）建立；插件二进制 + stdio 循环 + 健康检查 + 日志/存储接入 | 空插件能被启停；日志出现在 `/api/logs/plugin:tree.agent`。**已完成（2026-10-25，tree-plugins `3704101`）**：`--selftest` 8 项全绿；AOT 产物 6.1 MB 且产物自检通过；真核心 e2e 验证 ready → `[stderr]`/`[notify:info]` 两路日志进同一源 → `enabled:false` 后下线 |
-| A2 只读面 | agents / models / sessions / conversations / todos / subagents / teammates / tools-running 的读路径 | 36 条中只读部分返回与核心逐字节一致（同一数据目录）。**进行中（2026-10-25）**：`api/delegate` 管道 + `GET …/todos`、`GET …/subagents`、`GET /api/models`、`GET …/models-info` 已等价（`packages/tree_core/tool/verify_agent_equivalence.dart` 四条逐字节通过）；其余 4 组未开始 |
+| A2 只读面 | agents / models / sessions / conversations / todos / subagents / teammates / tools-running 的读路径 | 36 条中只读部分返回与核心逐字节一致（同一数据目录）。**进行中（2026-10-25）**：`api/delegate` 管道 + `GET /api/agents`、`GET …/todos`、`GET …/subagents`、`GET /api/models`、`GET …/models-info` 已等价（`packages/tree_core/tool/verify_agent_equivalence.dart` 五条逐字节通过）；其余 3 组未开始 |
 | A3 写路径与生成 | 消息发送、取消、LLM 调用、工具编排、提问、reset/compact | 同一会话在插件侧跑出的记录与核心侧结构一致 |
 | A4 帧迁移 | 广播站注册，topic 沿用原帧名；UI 订阅切换到新来源 | 双轨比对无差异后关闭核心直发 |
 | A5 交接 | 核心删除 34 条路由 + 2 条上行指令 + `agent/llm/team/tool` 目录 | 核心 `grep` 不到领域模型；§5 全表打勾 |

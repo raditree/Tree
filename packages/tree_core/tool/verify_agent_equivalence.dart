@@ -25,6 +25,7 @@ import 'package:tree_core/tree_core.dart';
 
 /// 当前已搬进插件、可做等价对照的路由（与 `agent_api_contract.md` 的编号对应）。
 const List<String> kImplementedRoutes = <String>[
+  'GET /api/agents',
   'GET /api/agents/{agentId}/todos',
   'GET /api/agents/{agentId}/subagents',
   'GET /api/models',
@@ -146,6 +147,108 @@ Future<String?> _runCase(String route, String exe) async {
   final CoreSettings settings = CoreSettings();
   final _RouteCall call;
   switch (route) {
+    case 'GET /api/agents':
+      final int m0 = DateTime.parse(
+        '2026-10-25T10:00:00.000',
+      ).millisecondsSinceEpoch;
+      final int m1 = DateTime.parse(
+        '2026-10-25T10:00:01.000',
+      ).millisecondsSinceEpoch;
+      final int m2 = DateTime.parse(
+        '2026-10-25T10:00:02.000',
+      ).millisecondsSinceEpoch;
+      final int m3 = DateTime.parse(
+        '2026-10-25T10:00:03.000',
+      ).millisecondsSinceEpoch;
+      store.putAgent(
+        CoreAgent(
+          id: 'agt',
+          name: '夹具',
+          createdAt: m3,
+          updatedAt: m3,
+          modelId: 'm1',
+          systemPrompt: '你是夹具',
+        ),
+      );
+      store.putAgent(
+        CoreAgent(
+          id: 'agt_top',
+          name: '指挥',
+          createdAt: m1,
+          updatedAt: m2,
+          modelId: 'm1',
+          systemPrompt: '你是指挥',
+        ),
+      );
+      store.putAgent(
+        CoreAgent(
+          id: 'agt_m',
+          name: '成员',
+          createdAt: m0,
+          updatedAt: m1,
+          teamId: 'agt_top',
+          parentAgentId: 'agt_top',
+          level: 1,
+          reviewStatus: 'pending_review',
+          sshConfig: const SshConfig(host: '10.0.0.5'),
+        ),
+      );
+      await store.flush();
+      // 会话预览：只让默认会话有消息；最后一条合格消息是 agent 文本。
+      int msgTime(String iso) =>
+          DateTime.parse(iso).millisecondsSinceEpoch;
+      store.appendMessage(
+        CoreMessage(
+          id: 'm1',
+          agentId: 'agt',
+          sessionId: 'session_default',
+          role: 'user',
+          content: '你好',
+          kind: 'text',
+          timestamp: msgTime('2026-10-25T10:00:06.000'),
+        ),
+      );
+      store.appendMessage(
+        CoreMessage(
+          id: 'm2',
+          agentId: 'agt',
+          sessionId: 'session_default',
+          role: 'agent',
+          content: '这是预览',
+          kind: 'text',
+          timestamp: msgTime('2026-10-25T10:00:09.000'),
+        ),
+      );
+      store.appendMessage(
+        CoreMessage(
+          id: 'm3',
+          agentId: 'agt',
+          sessionId: 'session_default',
+          role: 'agent',
+          content: '子回复',
+          kind: 'text',
+          subagentId: 'sub_1',
+          timestamp: msgTime('2026-10-25T10:00:09.500'),
+        ),
+      );
+      store.appendMessage(
+        CoreMessage(
+          id: 'm4',
+          agentId: 'agt',
+          sessionId: 'session_default',
+          role: 'agent',
+          content: '工具卡片',
+          kind: 'tool',
+          timestamp: msgTime('2026-10-25T10:00:09.900'),
+        ),
+      );
+      await store.flush();
+      call = const _RouteCall(
+        concretePath: '/api/agents',
+        query: <String, String>{},
+        pathParams: <String, String>{},
+        agentId: '',
+      );
     case 'GET /api/agents/{agentId}/todos':
       store.putAgent(
         CoreAgent(
@@ -275,6 +378,7 @@ Future<String?> _runCase(String route, String exe) async {
     streamChunkDelay: Duration.zero,
     store: store,
     settings: settings,
+    teamService: TeamService(store: store),
     todoStore: FileTodoStore(paths),
   );
   Process? process;
