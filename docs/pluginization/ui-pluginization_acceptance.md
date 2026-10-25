@@ -222,6 +222,7 @@
 | L-12 | C-11 删除 18 条领域端点核心实现（7 JSON + 11 文件） | 未开始 | `git/spec/mcp/files` 四插件未交付；C-1..C-10 未全绿 | 插件交付且 C-1..C-10 全绿后，同 commit 删除 |
 | L-13 | loader 托盘 | 延后 | 本期以控制台菜单替代（E-8 已按此口径） | 托盘实现单独排期，不影响其它项 |
 | L-14 | 历史已知问题：从仓库更新「运行中的内置插件」可能挂起 | 待复核 | 未见回归用例 | 补一条「运行中更新」回归，确认是否已修 |
+| L-20 | 平台能力：按声明「逐 agent 单独起实例」 | 不支持 | `granularity` 仅元数据；`_hosts` 按 plugin id 唯一（勘测见 [agent_pluginization.md §10.2](agent_pluginization.md#102-勘测插件平台是否支持按声明逐-agent-起实例)） | 本期由 `tree.agent` 内部调度；未来要支持需加实例键、按需启停与按 `agent_id` 路由 |
 
 ### B. 手工回归项
 
@@ -242,9 +243,15 @@
 
 | 项 | 结论 |
 | --- | --- |
-| 插件源码位置 | `E:\programs\Tree\desktop\plugins`（即 tree-plugins 仓挂载点） |
-| `tree.agent` 命名 | 新建 `plugins/tree.agent/`；现有 `packages/tree_agent`（目标机执行体）**不改名、不复用** |
-| 基础件供给 | **未定**（共享包下放 vs 插件自带 store）——L-05 的前置 |
+| 插件源码位置 | `E:\programs\Tree\desktop\plugins`；该目录远端仓库名即 `tree-plugins` |
+| 包命名 | 新包 `tree_agent_loop`（`plugins/tree.agent/`）；现有 `packages/tree_agent`（目标机执行体）**不改名、不复用** |
+| 子 agent 执行体 | 由 `tree.agent` **内部调度**；核心不认知子 agent 执行体 |
+| MCP | 整体迁 `mcp` 插件，核心零 MCP 代码 |
+| 命令执行 | 走工具插件执行站；`tree.agent` 不 `Process.start`、不持 PTY |
+| 密钥 | 供应商 Key 随插件、明文 + 权限收紧；加密本期不做；**无 loader 注入** |
+| 测试归属 | 领域测试随代码迁插件仓 `tree_agent_loop`；核心只留平台/协议/服务端测试 |
+| 逐 agent 实例 | 平台**当前不支持**声明式多实例（勘测见 [agent_pluginization.md §10.2](agent_pluginization.md#102-勘测插件平台是否支持按声明逐-agent-起实例)）→ L-20 |
+| 基础件供给 | **未定**（共享包下放 vs 插件自带 store）——清单见 [§10.1](agent_pluginization.md#101-核心基础件依赖清单供拍板-8)，L-05 的前置 |
 | 路由基线 | **未定**（按实测 33 条 vs 裁剪到 25 条功能面）——L-01 的前置 |
 
 ## 13. 回归基线（收束过程中不得退化）
