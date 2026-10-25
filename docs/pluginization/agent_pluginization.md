@@ -297,7 +297,7 @@ UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行�
 | 批次 | 内容 | 完成判据 |
 | --- | --- | --- |
 | A1 骨架 | `plugins/tree.agent/`（包 `tree_agent_loop`）建立；插件二进制 + stdio 循环 + 健康检查 + 日志/存储接入 | 空插件能被启停；日志出现在 `/api/logs/plugin:tree.agent`。**已完成（2026-10-25，tree-plugins `3704101`）**：`--selftest` 8 项全绿；AOT 产物 6.1 MB 且产物自检通过；真核心 e2e 验证 ready → `[stderr]`/`[notify:info]` 两路日志进同一源 → `enabled:false` 后下线 |
-| A2 只读面 | agents / models / sessions / conversations / todos / subagents / teammates / tools-running 的读路径 | 36 条中只读部分返回与核心逐字节一致（同一数据目录） |
+| A2 只读面 | agents / models / sessions / conversations / todos / subagents / teammates / tools-running 的读路径 | 36 条中只读部分返回与核心逐字节一致（同一数据目录）。**进行中（2026-10-25）**：`api/delegate` 管道 + `GET /api/agents/{agentId}/todos` 已等价（`packages/tree_core/tool/verify_agent_equivalence.dart` 逐字节通过）；其余 7 组未开始 |
 | A3 写路径与生成 | 消息发送、取消、LLM 调用、工具编排、提问、reset/compact | 同一会话在插件侧跑出的记录与核心侧结构一致 |
 | A4 帧迁移 | 广播站注册，topic 沿用原帧名；UI 订阅切换到新来源 | 双轨比对无差异后关闭核心直发 |
 | A5 交接 | 核心删除 34 条路由 + 2 条上行指令 + `agent/llm/team/tool` 目录 | 核心 `grep` 不到领域模型；§5 全表打勾 |
@@ -360,7 +360,7 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | 2 | ~~`packages/tree_agent` 重名~~ **已规避**：新包定名 `tree_agent_loop`（放 `plugins/tree.agent/`）；现有 `packages/tree_agent` 是目标机 Linux 执行体，不改名、不复用 | 无（命名冲突消解） |
 | 3 | 领域代码规模约 20k 行：`agent` 5345 / `llm` 5030 / `team` 2683 / `tool` 5139 / `mcp` 1572；且对核心基础件有硬依赖——`agent → store 12 / util 5 / tool 5 / settings 4 / plugin 2`、`tool → team 7 / plugin 5 / spec 4 / store 4`、`llm → util 6 / settings 5 / agent 5 / store 5` | 插件不得 import 核心包，故必须：领域层与通用小件**复制随迁**、设置先拆分、插件互通改**执行器插件的自建执行站**（§10.1） |
 | 4 | 核心测试 176 个文件，其中大量用例直接 import `src/agent|llm|team|tool`；`_registerRoutes` 已逐条点清：`tree.agent` 34 条 + spec 2 + mcp 3 + files 13 + git 3 + 核心永久面 36 = 91 条已注册（+2 条新增 = 93） | 旧「23 / 25 条」口径作废；A2 基线按 36 条冻结（§1.2） |
-| 5 | ~~委派白名单 `ApiPaths.delegated` 是**静态 18 条路径**~~ **已解除（2026-10-25，L-28）**：`DelegatedRouter` 改为命名空间规则 + 保留前缀 + 与核心已实现路由同键拒收；核心删实现后同一申报自动生效 | 新插件加路由不再需要改核心（证据：`ui-pluginization.md` §4.5、`http_router.dart`、`delegated_rest_test.dart`） |
+| 5 | ~~委派白名单 `ApiPaths.delegated` 是**静态 18 条路径**~~ **已解除（2026-10-25，L-28）**：`DelegatedRouter` 改为命名空间规则 + 保留前缀；与核心已实现路由同键的申报**接受并标 shadowed**（双跑期先申报后交接），核心删实现后同一申报自动生效 | 新插件加路由不再需要改核心（证据：`ui-pluginization.md` §4.5、`http_router.dart`、`delegated_rest_test.dart`） |
 
 > 结论：G 的正确起点不是搬代码，而是先完成五项前置（`core_settings` 拆分、scope 去领域化立项、`local_executor` 执行站就位、~~委派白名单去静态化~~ **已完成**、按 36 条建 G-1 对照表），再按 A1（最小端点 `GET /api/agents` 走通 stdio / 委派 / 一致性）验证脚手架。剩余四项：L-22 / L-23 / L-24~L-26 / L-19。
 

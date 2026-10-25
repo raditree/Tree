@@ -28,7 +28,7 @@
 | A-2 | 检查新增路径 | `/api/meta`、`/bootstrap`、`/api/bootstrap/session` 在 `kept` 内 |
 | A-3 | 编码/解码新帧 | `ui.hello`、`station/subscribe`、`station/unsubscribe`、`station_delivery`、`station/trigger`、`station/register`、`station/unregister` 往返一致 |
 | A-4 | 契约防漂移 | 删除任一路径或改任一帧名 ⇒ 契约测试变红（故意改一次验证后还原） |
-| A-5 | 委派命名空间（L-28） | 插件申报自造路径 `/api/x` ⇒ 可申报且出现在 `/api/meta.routes`；申报保留前缀（`/api/plugin/...`）或核心已实现的同键路由 ⇒ 可读拒收，归属表不出现 |
+| A-5 | 委派命名空间（L-28 + 双跑） | 自造 `/api/x` ⇒ 可申报且出现在 `/api/meta.routes`；保留前缀（`/api/plugin/...`）与 `coreOwned` 同键 ⇒ 可读拒收；**核心已实现的同键 ⇒ 接受并标 shadowed**（归属表/meta 可见，HTTP 仍由核心承接），核心删实现后自动生效 |
 
 ## 3. 批次 B：站点总线接 WS
 
@@ -126,6 +126,8 @@
 > A1 证据：`--selftest` 8 项全绿；真核心拉起 AOT 产物后 ready，stderr 与 `log` 通知两路日志都出现在
 > `/api/logs/plugin:tree.agent`，`enabled:false` 热应用后下线。A2~A5（只读面 / 写路径与生成 / 帧迁移 /
 > 核心删除）仍按 [agent_pluginization.md](agent_pluginization.md) §6 与 [agent_api_contract.md](agent_api_contract.md) 推进。
+> A2 进行中：`api/delegate` 管道 + `GET /api/agents/{agentId}/todos` 已用
+> `packages/tree_core/tool/verify_agent_equivalence.dart` 做双跑对照（状态码 / Content-Type / body 逐字节一致）。
 > 在插件侧等价验收通过前，核心路由与领域帧保持原样（不变量 2/3）。
 
 | ID | 操作 | 期望 |
@@ -214,7 +216,7 @@
 
 | ID | 项 | 状态 | 阻塞 / 原因 | 解除条件与下一步 |
 | --- | --- | --- | --- | --- |
-| L-01 | G-1 端点等价对照（按实测 **36 条 = 34 存量 + 2 新增**；旧口径 23/25 已作废） | **进行中**：A1 骨架 + 对照表已建立 | 36 条逐条搬与等价验收未开始（A2~A5） | A1 已完成（tree-plugins `3704101`）；按 [agent_api_contract.md](agent_api_contract.md) 逐条实现，决策已落 §3.1 |
+| L-01 | G-1 端点等价对照（按实测 **36 条 = 34 存量 + 2 新增**；旧口径 23/25 已作废） | **进行中**：A1 + 对照表 + 第 1 条只读路由等价 | 其余 35 条未搬（A2~A5） | A1 已完成（tree-plugins `3704101`）；A2 首条 `GET …/todos` 已双跑逐字节一致（`tool/verify_agent_equivalence.dart`）；按 [agent_api_contract.md](agent_api_contract.md) 继续 |
 | L-02 | G-2 核心路由表去除领域路由 | 未开始 | 不变量 27：插件侧等价验收通过前不得删 | G-1 全绿后同批删除 |
 | L-03 | G-3 领域帧改 `station_delivery` | 未开始 | 依赖 G-1 的事件面迁移 | topic 沿用原帧名，10 条帧逐条迁移 |
 | L-04 | G-4 过渡映射删除 | 未开始 | 依赖 G-3 完成一个版本周期 | G+1 提交时删除映射代码 |
@@ -236,7 +238,7 @@
 | L-25 | 执行器执行站契约（`exec.command` / `file.*` / `terminal.*`）与 workspace 租约 | 未设计 | 本地/远端需要同一套接口，`tree.agent` 才能无差别调用；执行站由**插件内部定义**，非核心内置 | 定义站点名、参数（`lease_id` + 相对路径 / argv）、错误码与幂等；核心只登记 `lease_id → dir` 并路由 |
 | L-26 | 核心通用流中继原语（PTY 字节流，不含终端语义） | 未实现 | 现有 PTY 走核心 `terminal_service` 与 WS 帧 | 新增 `stream session`（open/input/resize/close + 有序字节帧），核心只转发；UI 经 REST 建流 + 订阅 topic |
 | L-19 | G-1 对照表本身（36 行，含样例） | **已闭环**（`bda9df9`，2026-10-25） | — | 见 [agent_api_contract.md](agent_api_contract.md)：36 条 G-1 + 2 条 spec 附录，含全局约定、逐条样例与 C-01~C-12 契约缺口 |
-| L-28 | 委派白名单 `ApiPaths.delegated` 去静态化 | **已闭环**（`6a30e81`，2026-10-25） | — | 已落地命名空间规则 + 保留前缀 + 与核心已实现路由同键拒收 + 归属表冲突检测；门禁改为「`coreOwned ⊆ 核心 router 键集 ⊆ coreOwned ∪ pendingHandoffRoutes`」。证据：`ui-pluginization.md` §4.5、`http_router.dart`、`server_test.dart`、`delegated_rest_test.dart` |
+| L-28 | 委派白名单 `ApiPaths.delegated` 去静态化 | **已闭环**（`6a30e81`，2026-10-25） | — | 已落地命名空间规则 + 保留前缀 + 归属表冲突检测；双跑期同键申报接受并标 shadowed（2026-10-25 修正，见 A-5）。门禁改为「`coreOwned ⊆ 核心 router 键集 ⊆ coreOwned ∪ pendingHandoffRoutes`」。证据：`ui-pluginization.md` §4.5、`http_router.dart`、`server_test.dart`、`delegated_rest_test.dart` |
 | L-30 | 非法 JSON / 字段类型错误统一回 400（G-1 C-02/C-03） | 未开始 | G-1 决策为"复刻现状 500"，不与迁移混做 | G 完成后统一 400，并同批更新前端断言与文档 |
 | L-31 | `teammateLog` 路径占位符改 `{leaderId}`（G-1 C-04） | 未开始 | 现模板两个 `{memberId}`，leader 段不读取；改路径要动前端 | G 完成后核心 + 前端 + 插件同批改，附契约测试 |
 | L-32 | 建成员 REST 入口（G-1 C-09） | 未开始 | 现 `POST /api/agents` 只能建 TOP | 产品决策后补入口；G 只做等量迁移 |
@@ -277,7 +279,7 @@
 | 执行与文件 | **已定**：核心零 PTY / 零文件操作；本地执行、文件修改、终端归 `local_executor`，远端归 `ssh_executor`；执行站由**两个插件内部定义**（非核心内置）→ L-24~L-26 |
 | 核心职责 | 只做插件生命周期 / 站点总线 / 传输 / 通用键值存储与日志 / 租约登记 / 认证；业务数据与领域授权一律归插件 |
 | 路由基线 | **已定**：冻结实测 36 条（34 存量 + 2 新增）；核心永久面 36 条；是否裁剪另立 L-27 |
-| 路由申报 | **目标形态（L-28 已落地）**：核心只硬编码自己的 36 条；其余 57 条由插件经 `system.collect.api.routes` 运行期申报，核心只维护归属表并转发（详见 [agent_pluginization.md](agent_pluginization.md) §10.4）；放行规则为命名空间规则 + 保留前缀 + 与核心已实现路由同键拒收，无静态白名单 |
+| 路由申报 | **目标形态（L-28 已落地）**：核心只硬编码自己的 36 条；其余 57 条由插件经 `system.collect.api.routes` 运行期申报，核心只维护归属表并转发（详见 [agent_pluginization.md](agent_pluginization.md) §10.4）；放行规则为命名空间规则 + 保留前缀 + 同键申报标 shadowed（coreOwned 拒收），无静态白名单 |
 
 ## 13. 回归基线（收束过程中不得退化）
 

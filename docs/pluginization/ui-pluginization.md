@@ -313,8 +313,10 @@
 | 前缀 | 必须以 `/api/` 开头（`GET /bootstrap` 是核心页面入口，不可申报） |
 | 形状 | 段内只允许 `[A-Za-z0-9._~-]` 或 `{name}` 占位符；不得有空段、末尾斜杠 |
 | 保留前缀 | `/api/plugin`、`/api/bootstrap`、`/api/meta`、`/api/logs`、`/api/store` 整段保留给核心 |
-| 精确冲突 | `METHOD pattern` 命中 `coreOwned` ⇒ 拒收；命中**核心当前已实现**的路由 ⇒ 拒收（迁移期以核心为准；核心删除该实现后，同一申报自动生效，**不需要改核心**） |
+| 精确冲突 | `METHOD pattern` 命中 `coreOwned` ⇒ 拒收；命中**核心当前已实现**的路由 ⇒ **接受并标注 shadowed**（进入归属表与 `/api/meta.routes`，但核心 router 优先承接；核心删除该实现后同一申报自动生效，**不需要改核心**） |
 | 归属冲突 | 两家插件申报同一 `METHOD pattern` ⇒ 整条拒收（既有规则不变） |
+
+> **双跑期（A2~A4）先申报、后交接**：插件必须先申报路由，核心才有归属表可查、`/api/meta` 才看得见；所以命中「核心当前已实现」的键**不能拒收**（否则 G-1 死锁）。这类申报照常进归属表，只在 `DelegatedRouter.notes` 标注 shadowed；核心 router 永远优先，交接删除后立即生效。
 
 门禁随之改为（`test/server_test.dart`）：
 
@@ -578,7 +580,7 @@ UI 插件可申报图标，核心通过内置点位 `system.collect.ui.branding`
 
 1. **核心只增不改**：收束期内核心不得删除既有字段/路径，只有 `pendingHandoffRoutes` 登记的方法路由会从核心实现移出。
 2. **卸载的是能力，不是端点**：端点离开核心必须伴随能力下沉；纯代理不算卸载。
-3. **委派靠命名空间规则，不靠静态白名单**（L-28）：`/api/` 前缀 + 保留前缀 + 与核心已实现路由同键拒收 + 归属表冲突检测；`coreOwned` / `delegated` / `pendingHandoffRoutes` 只作契约与门禁口径，运行期路由面由插件申报聚合。
+3. **委派靠命名空间规则，不靠静态白名单**（L-28）：`/api/` 前缀 + 保留前缀 + 归属表冲突检测；与核心已实现路由同键的申报**接受并标 shadowed**（`coreOwned` / 保留前缀仍拒收）。`coreOwned` / `delegated` / `pendingHandoffRoutes` 只作契约与门禁口径，运行期路由面由插件申报聚合。
 4. **委派失败禁止 404**：未装/停用 ⇒ 503，未响应 ⇒ 504，回包非法 ⇒ 502，均带可读原因。
 5. **UI 订阅只限广播站**：中转 / 执行 / 收集的订阅一律可读拒绝。
 6. **UI 身份以声明为准**：`plugin_id` 必须匹配 `plugins.yaml` 的 `runtime: ui` 条目，scope 取声明。

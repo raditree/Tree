@@ -215,4 +215,13 @@ const Map<String, String> nonProtocolPluginMethodLiterals = <String, String>{
   'agent.write': '同上',
   'agent.exec': '同上',
   'agent.shell': '同上',
+  // HTTP 方法：出现在**委派信封**（`api/delegate` 的 `method` 字段）与
+  // `system.collect.api.routes` 的路由申报里，属于 REST 协议面，不是 JSON-RPC
+  // method。插件实现委派时必然会写这些字面量，塞进 [PluginRpcMethods] 会把
+  // "插件↔核心 RPC 面"和"REST 面"混成一张表。
+  'GET': '委派信封 / 路由申报里的 HTTP 方法（REST 面），非 JSON-RPC method',
+  'POST': '同上',
+  'PUT': '同上',
+  'PATCH': '同上',
+  'DELETE': '同上',
 };

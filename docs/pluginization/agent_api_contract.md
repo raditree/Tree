@@ -22,6 +22,7 @@
 8. **分页**：只有 `GET /api/conversations/{agentId}` 分页；其余列表端点（sessions / questions / specs / tools.running / subagents）都是一次性返回。
 9. **时间字段两种口径**：agent / 成员 / 会话的 `created_at`/`updated_at` 是**毫秒整数**；消息与子 agent 的 `timestamp`/`created_at` 是 **ISO-8601 字符串**（`JsonTime.encode`）。逐字段见样例。
 10. **路径占位符**：由 `CoreRouter` 的 `{name}` 提取，已按 `Uri.pathSegments` 解码一次。**同名占位符重复时后者覆盖前者**——`ApiPaths.teammateLog` 的模板就是两个 `{memberId}`（见 C-04）。
+11. **双跑期路由申报（2026-10-25）**：插件在 A2~A4 必须先申报、后交接。与核心**当前已实现**路由同键的申报**接受并标 shadowed**（进入归属表与 `/api/meta.routes`，HTTP 仍由核心 router 承接；核心删除该实现后自动生效）；只有 `coreOwned` / 保留前缀整段拒收。等价验证走 `packages/tree_core/tool/verify_agent_equivalence.dart`（同一数据根：核心 HTTP vs 插件 `api/delegate`，比状态码 / Content-Type / body 字节）。
 
 ---
 

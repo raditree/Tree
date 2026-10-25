@@ -367,7 +367,7 @@ void main() {
     expect(meta.json['routes'], isEmpty);
   });
 
-  test('已实现路由不被委派抢占：申报阶段即拒收（L-28）', () async {
+  test('已实现路由：申报被接受并标 shadowed，HTTP 仍由核心承接（双跑期）', () async {
     final ({CoreServer server, _Client client, PluginBus bus}) ctx = await serve(
       <({String id, List<String> args})>[
         (id: 'sample', args: <String>['--api-route', 'GET:$gitStatus']),
@@ -378,13 +378,25 @@ void main() {
       await ctx.server.close();
     });
 
-    // 同键已被核心实现：申报直接拒收并说明原因，而不是接受一份永远不会
-    // 生效的申报（旧行为是"接受但核心优先"，对插件作者是假成功）。
-    expect(ctx.server.delegatedRouter.routeCount, 0);
+    // 双跑期（A2~A4）：插件必须先申报、后交接。同键已被核心实现时**接受**申报
+    // （归属表里有它、/api/meta 能看到），但 notes 写明暂由核心承接；核心删掉
+    // 该实现后同一申报自动生效——不能再拒收，否则「先申报后交接」就死锁了。
+    expect(ctx.server.delegatedRouter.routeCount, 1);
     expect(
       ctx.server.delegatedRouter.notes.join('\n'),
-      contains('由核心实现'),
-      reason: '拒收原因必须点明"此刻由核心实现，交接后自动生效"',
+      allOf(contains('核心仍在实现'), contains('shadowed')),
+      reason: '接受申报必须留一条可读记录：核心仍在承接',
+    );
+    final _Response meta = await ctx.client.send('GET', '/api/meta');
+    expect(
+      meta.json['routes'],
+      contains(
+        allOf(
+          containsPair('method', 'GET'),
+          containsPair('pattern', '/api/files/{workspaceId}/git-status'),
+          containsPair('owner', 'sample'),
+        ),
+      ),
     );
 
     // 已实现路由（GET 未接 FileService，核心自己的回答是 501 文件服务尚未接入）。
@@ -441,7 +453,7 @@ void main() {
     expect(res.text, contains('plugin:GET $custom'));
   });
 
-  test('保留前缀 / 核心永久面 / 核心已实现同键 / 非 /api 前缀 ⇒ 申报阶段可读拒收', () async {
+  test('保留前缀 / 核心永久面 / 非 /api 前缀 ⇒ 申报阶段可读拒收', () async {
     final ({CoreServer server, _Client client, PluginBus bus}) ctx = await serve(
       <({String id, List<String> args})>[
         (
@@ -451,8 +463,6 @@ void main() {
             'GET:/api/plugin/snapshot',
             '--api-route',
             'GET:/api/settings/frame-rate',
-            '--api-route',
-            'GET:/api/agents/{agentId}/todos',
             '--api-route',
             'GET:/bootstrap',
           ],
@@ -469,7 +479,6 @@ void main() {
     final String notes = ctx.server.delegatedRouter.notes.join('\n');
     expect(notes, contains('核心保留面'), reason: '/api/plugin 是保留前缀');
     expect(notes, contains('核心永久面'), reason: '平台设置属于 coreOwned');
-    expect(notes, contains('由核心实现'), reason: 'agent 路由仍在核心（迁移期）');
     expect(notes, contains('必须以 /api/ 开头'), reason: '/bootstrap 不是 /api 命名空间');
     final _Response meta = await ctx.client.send('GET', '/api/meta');
     expect(meta.json['routes'], isEmpty);
