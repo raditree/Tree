@@ -11,6 +11,7 @@ import '../models/session.dart';
 import '../models/subagent_roster.dart';
 import '../../io/api_service.dart';
 import '../../io/attachment_upload_service.dart';
+import '../../io/legacy_frame_bus.dart';
 import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
 import '../../io/question_update_service.dart';
@@ -338,6 +339,9 @@ class _MessagePanelState extends State<MessagePanel> {
     // 同一套"成员写团队 TOP"的口径），不另开一个选择器。
     WorkspacePickRequest.instance.addListener(_onWorkspacePickRequested);
     _webSocket.onMessage = _handleIncomingMessage;
+    // A4：领域帧改由插件站点推来，经 FrameRouter 汇入这条总线；
+    // 与直接下行共用同一个处理函数（渲染字段一个不改）。
+    LegacyFrameBus.add(_handleIncomingMessage);
     // 未知会话消息（Task 7 接收方会话保障）：msg_chunk/msg_end 携带不在
     // 已知列表中的 session_id 时自动创建本地会话条目，使被动接收
     // （跨 team 推送等）的消息在会话列表可见
@@ -2169,6 +2173,7 @@ class _MessagePanelState extends State<MessagePanel> {
   void dispose() {
     TerminalToggleRequest.instance.removeListener(_onTerminalToggleRequested);
     WorkspacePickRequest.instance.removeListener(_onWorkspacePickRequested);
+    LegacyFrameBus.remove(_handleIncomingMessage);
     _webSocket.disconnect();
     super.dispose();
   }

@@ -66,18 +66,24 @@ void main() {
     CoreAttachment.instance.token = '';
   });
 
-  test('启动即订阅插件生命周期广播站，且只发 station/subscribe', () {
+  test('启动即订阅生命周期站与 agent 事件站，且只发 station/subscribe', () {
     client.start();
 
     expect(ws.connectedToken, 'tok-test');
     final List<Map<String, dynamic>> subscribes = ws.sent
         .where((Map<String, dynamic> f) => f['type'] == 'station/subscribe')
         .toList();
-    expect(subscribes, hasLength(1));
-    final Map<String, dynamic> data =
-        subscribes.single['data'] as Map<String, dynamic>;
-    expect(data['station_id'], StationClient.pluginStateStation);
-    expect(data['scope'], isEmpty);
+    expect(subscribes, hasLength(StationClient.defaultStations.length));
+    final Set<String> ids = <String>{
+      for (final Map<String, dynamic> frame in subscribes)
+        (frame['data'] as Map<String, dynamic>)['station_id'] as String,
+    };
+    expect(ids, StationClient.defaultStations);
+    expect(ids, contains(StationClient.pluginStateStation));
+    expect(ids, contains(StationClient.agentEventsStation));
+    for (final Map<String, dynamic> frame in subscribes) {
+      expect((frame['data'] as Map<String, dynamic>)['scope'], isEmpty);
+    }
     // U4 明确不发 trigger：功能调用一律走 REST。
     expect(ws.sent.any((Map<String, dynamic> f) => f['type'] == 'station/trigger'),
         isFalse);
@@ -92,7 +98,8 @@ void main() {
     ws.connect('tok-test');
 
     expect(client.subscribePasses, first + 1);
-    expect(ws.sent.length, sentBefore + 1);
+    // 每个已知站点一条订阅（A4 起是生命周期站 + agent 事件站）。
+    expect(ws.sent.length, sentBefore + StationClient.defaultStations.length);
     expect(client.stations, StationClient.defaultStations);
   });
 

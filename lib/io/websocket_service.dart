@@ -327,32 +327,42 @@ class WebSocketService {
   /// 对已确认完整的 JSON 字符串做业务分发（原 [_handleData] 主体）。
   void _dispatchDecoded(String raw) {
     try {
-      final Map<String, dynamic> json =
-          jsonDecode(raw) as Map<String, dynamic>;
-      // 过滤心跳响应
-      final String? type = json['type'] as String?;
-      if (type == 'heartbeat' || type == 'pong') {
-        return;
-      }
-      // 终端帧走自己的广播流（见 terminalFrames）：不混进消息分发
-      if (type != null && TerminalOutboundType.all.contains(type)) {
-        if (!_terminalFrames.isClosed) _terminalFrames.add(json);
-        return;
-      }
-      // 未知会话消息（Task 7 接收方会话保障）：msg_chunk / msg_end 携带
-      // 不在已知列表中的 session_id 时，先回调 UI 层创建本地会话条目，
-      // 再照常派发 onMessage（是否渲染仍由 UI 按当前会话过滤）。
-      if ((type == 'msg_chunk' || type == 'msg_end') &&
-          onUnknownSession != null) {
-        final String? sid = json['session_id'] as String?;
-        if (sid != null && sid.isNotEmpty && !knownSessionIds.contains(sid)) {
-          onUnknownSession!(json);
-        }
-      }
-      onMessage?.call(json);
+      _dispatchFrame(jsonDecode(raw) as Map<String, dynamic>);
     } catch (e) {
       // 忽略解析失败的包
     }
+  }
+
+  /// **站点帧转本地帧**（A4/U3）：把插件经 `station_delivery` 送来的领域帧
+  /// 重新送进与 WS 下行完全相同的分发路径。
+  ///
+  /// 为什么复用这一条：UI 的渲染入口（消息面板 / 团队页）认的是旧帧名与字段，
+  /// 迁移只换"帧从哪来"，不该让每个面板再写一套订阅。
+  void emitFrame(Map<String, dynamic> frame) => _dispatchFrame(frame);
+
+  /// 一帧已解析 JSON 的业务分发（WS 下行与站点转投共用）。
+  void _dispatchFrame(Map<String, dynamic> json) {
+    // 过滤心跳响应
+    final String? type = json['type'] as String?;
+    if (type == 'heartbeat' || type == 'pong') {
+      return;
+    }
+    // 终端帧走自己的广播流（见 terminalFrames）：不混进消息分发
+    if (type != null && TerminalOutboundType.all.contains(type)) {
+      if (!_terminalFrames.isClosed) _terminalFrames.add(json);
+      return;
+    }
+    // 未知会话消息（Task 7 接收方会话保障）：msg_chunk / msg_end 携带
+    // 不在已知列表中的 session_id 时，先回调 UI 层创建本地会话条目，
+    // 再照常派发 onMessage（是否渲染仍由 UI 按当前会话过滤）。
+    if ((type == 'msg_chunk' || type == 'msg_end') &&
+        onUnknownSession != null) {
+      final String? sid = json['session_id'] as String?;
+      if (sid != null && sid.isNotEmpty && !knownSessionIds.contains(sid)) {
+        onUnknownSession!(json);
+      }
+    }
+    onMessage?.call(json);
   }
 
   /// 调度自动重连

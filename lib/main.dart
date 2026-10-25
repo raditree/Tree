@@ -8,6 +8,7 @@ import 'package:window_manager/window_manager.dart';
 
 import 'io/api_service.dart';
 import 'io/core_attachment.dart';
+import 'io/frame_router.dart';
 import 'io/single_instance.dart';
 import 'io/station_client.dart';
 import 'io/tray_service.dart';
@@ -72,6 +73,8 @@ Future<void> main() async {
   // U4：站点订阅依赖 ui.hello 归属；没有身份时（开发期）不建这条连接。
   if (WebSocketService.helloFrame != null) {
     StationClient.instance.start();
+    // A4：把站点投递翻译回旧帧名，交给面板（FrameRouter → LegacyFrameBus）。
+    FrameRouter.instance.start();
   }
 
   // **拦截关闭按钮**：默认只隐藏窗口（见 [TrayService]），真正的退出走托盘菜单 /

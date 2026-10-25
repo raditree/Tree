@@ -29,8 +29,17 @@ class StationClient {
   /// 插件面板继续用既有 `plugin_status` 帧（同一条 WS 连接照常可达）。
   static const String pluginStateStation = 'system.broadcast.plugin.state';
 
+  /// **agent 领域事件站**（A4）：`tree.agent` 自建广播站的固定 id。
+  ///
+  /// 与插件仓 `kAgentEventsStationId` 同串（插件不能 import 协议包，故两侧各留
+  /// 一份常量；改名必须先改 `docs/pluginization/agent_pluginization.md`）。
+  static const String agentEventsStation = 'plugin.tree.agent.broadcast.events';
+
   /// 默认订阅集合。
-  static const Set<String> defaultStations = <String>{pluginStateStation};
+  static const Set<String> defaultStations = <String>{
+    pluginStateStation,
+    agentEventsStation,
+  };
 
   final WebSocketService Function() _connectionFactory;
 
@@ -112,6 +121,15 @@ class StationClient {
     }
   }
 
+  /// 每个 topic 的**本地水位**（A4/U4）：只接受单调递增的 `seq`。
+  final Map<String, int> _lastSeq = <String, int>{};
+
+  /// 检测到的**跳号次数**（诊断用；跳号意味着丢过帧，应按 `lagged` 处理）。
+  int seqGaps = 0;
+
+  /// 某个 topic 的当前水位（测试与排障用）。
+  int? lastSeqFor(String topic) => _lastSeq[topic];
+
   /// 处理一帧下行消息（非 `station_delivery` 一律忽略）。
   ///
   /// 公开可见是为了让测试在不起真实 socket 的情况下验证四态语义。
@@ -120,6 +138,7 @@ class StationClient {
     if (delivery == null) return;
     switch (delivery.state) {
       case StationDeliveryState.data:
+        if (!_acceptSeq(delivery)) return;
         _deliveries.add(delivery);
       case StationDeliveryState.closed:
         // 终止订阅：必须先让用户看见，不能静默失效。
@@ -130,8 +149,28 @@ class StationClient {
         debugPrint('[Station] 队列溢出，需重新拉快照：${delivery.stationId}');
         _deliveries.add(delivery);
       case StationDeliveryState.reset:
-        // 插件重启后 seq 归零：调用方重置本地水位。
+        // 插件重启后 seq 归零：清空该站水位（全清，避免拿到旧 topic 的残留）。
+        _lastSeq.clear();
         _deliveries.add(delivery);
     }
+  }
+
+  /// 水位判定：重复 / 回退直接丢弃；跳号记一次 gap 但仍然投递（不静默丢）。
+  ///
+  /// 没有 `topic` 或没有 `seq` 的投递（如生命周期站）不参与水位。
+  bool _acceptSeq(StationDelivery delivery) {
+    final String? topic = delivery.topic;
+    final int? seq = delivery.seq;
+    if (topic == null || topic.isEmpty || seq == null) return true;
+    final int? last = _lastSeq[topic];
+    if (last != null) {
+      if (seq <= last) return false;
+      if (seq > last + 1) {
+        seqGaps += 1;
+        debugPrint('[Station] $topic 跳号：$last → $seq（已记 gap，不静默）');
+      }
+    }
+    _lastSeq[topic] = seq;
+    return true;
   }
 }

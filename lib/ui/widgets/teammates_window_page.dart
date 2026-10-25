@@ -4,6 +4,7 @@ import '../models/agent.dart';
 import '../models/message.dart';
 import '../services/teammates_view.dart';
 import '../../io/api_service.dart';
+import '../../io/legacy_frame_bus.dart';
 import '../../io/websocket_service.dart';
 import 'message_list.dart';
 import 'stop_button.dart';
@@ -62,6 +63,7 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
   void initState() {
     super.initState();
     _webSocket.onMessage = _handleWsMessage;
+    LegacyFrameBus.add(_handleWsMessage);
     // 连接建立/重连时清空 working 集合：后端重启会清空其内存态 _active_tasks，
     // 若不清空，前端会残留旧的 working（成员已 idle 却显示工作中）。
     // 清空后由后端在 WS 建立时补推真实的 agent_status（仍在工作的才重新标记）。
@@ -78,6 +80,7 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
 
   @override
   void dispose() {
+    LegacyFrameBus.remove(_handleWsMessage);
     _webSocket.disconnect();
     super.dispose();
   }
@@ -538,6 +541,7 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
     _selectedModelId = _member['model_id'] as String? ?? '';
     _syncOverrideControllers();
     _webSocket.onMessage = _handleIncoming;
+    LegacyFrameBus.add(_handleIncoming);
     _connectWs();
     _loadHistory();
     _loadModels();
@@ -859,6 +863,7 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
 
   @override
   void dispose() {
+    LegacyFrameBus.remove(_handleIncoming);
     _webSocket.disconnect();
     _memberInput.dispose();
     super.dispose();
