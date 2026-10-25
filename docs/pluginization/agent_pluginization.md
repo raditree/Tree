@@ -247,8 +247,10 @@ UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行�
   terminal.exec），控制面 plugin.* 不可挂载；同命令已有其它插件接管则拒绝；
   插件下线/卸载自动 unmount 并清租约；租约键按插件命名空间隔离；
   `lease_id` 命令注入 root 后跳过 `_resolveTarget`。
-- **未覆盖**：SSH 工作空间仍走核心内置 IO（ssh_executor 执行站未接租约）、PTY、
-  后台 hook 任务；执行器转发尚未接入热重启缓冲。
+- **SSH 已接（2026-10-25，tree-plugins `8a5f6ee`）**：`ssh_executor` 自建执行站
+  `plugin.ssh_executor.execute.ssh_workspace`，命令 `ssh.file.*` 七族 + `ssh.exec.command`；
+  tree.agent 的 SSH 模式经 `ssh.*` 路由，租约丢失只重登记重试一次，不回落本机 IO。
+- **未覆盖**：PTY / `terminal.*` 交互流、SSH 后台 hook；执行器转发尚未接入热重启缓冲。
 
 ### 4.6.2 核心职责白名单（反向约束）
 
@@ -329,8 +331,8 @@ UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行�
 | 批次 | 内容 | 完成判据 |
 | --- | --- | --- |
 | A1 骨架 | `plugins/tree.agent/`（包 `tree_agent_loop`）建立；插件二进制 + stdio 循环 + 健康检查 + 日志/存储接入 | 空插件能被启停；日志出现在 `/api/logs/plugin:tree.agent`。**已完成（2026-10-25，tree-plugins `3704101`）**：`--selftest` 8 项全绿；AOT 产物 6.1 MB 且产物自检通过；真核心 e2e 验证 ready → `[stderr]`/`[notify:info]` 两路日志进同一源 → `enabled:false` 后下线 |
-| A2 只读面 | agents / models / sessions / conversations / todos / subagents / teammates / tools-running 的读路径 | 36 条中只读部分返回与核心逐字节一致（同一数据目录）。**进行中（2026-10-25）**：`api/delegate` 管道 + `GET /api/agents`、`GET /api/agents/{id}`、`GET …/teammates`、`GET /api/conversations/{id}`、`GET …/sessions`、`GET …/sessions/{id}`、`GET …/todos`、`GET …/subagents`、`GET /api/models`、`GET …/models-info` 已等价（`packages/tree_core/tool/verify_agent_equivalence.dart` 十条逐字节通过）；tools-running 也已搬（`GET /api/tools/running` 空快照 + `POST …/{handle}/close` 失效句柄 404；登记表随工具编排接线填充）——**A2 只读面全部完成** |
-| A3 写路径与生成 | 消息发送、取消、LLM 调用、工具编排、提问、reset/compact | **进行中（2026-10-25）**：领域代码已整体平移（store / settings / LLM / team / spec / 工具契约 / conversation / subagent / compaction），`LlmAgentEngine` 为运行时默认引擎；C-08 两条端点、模型/会话/提问/规范写路由与 `tools-running` 已接；**工具执行已下沉到 local_executor 插件**（L-24：tree.agent 登记 workspace 租约，`file.*` / `exec.command` 带 `lease_id` 下发；核心注入 root 后直送插件，不解析 agent/team/mode、不碰文件/不起进程；`StationToolRunner` 仍负责 read/write/list/grep/terminal）；团队写路由（成员模型分配/直发消息/活动日志）、手动压缩与 Spec 列表/详情也已接。插件测试 320 条、`--selftest` 122 项；另注册**工具贡献收集站**（`plugin.tree.agent.collect.tools`，shared），其它插件订阅后可按 schema 贡献工具，执行经 `plugin.toolCall` 转回贡献方（领域身份放 `arguments.scope`，核心只做不透明转发，不解析 agent/team/mode/session）。独立插件 `extra-tools` 已用它贡献 todo / question / subagent / team / message 五个工具；tree.agent 自建 `agent_tools` 执行站提供领域原语，工具定义与命令翻译在 extra-tools。剩余：A4 帧迁移与 A5 交接 |
+| A2 只读面 | agents / models / sessions / conversations / todos / subagents / teammates / tools-running 的读路径 | **已完成（2026-10-25，tree-plugins `0c6ee1d`）**：`api/delegate` 管道 + `GET /api/agents`、`GET /api/agents/{id}`、`GET …/teammates`、`GET /api/conversations/{id}`、`GET …/sessions`、`GET …/sessions/{id}`、`GET …/todos`、`GET …/subagents`、`GET /api/models`、`GET …/models-info` 已等价（`packages/tree_core/tool/verify_agent_equivalence.dart` **12 条双跑**逐字节通过：10 条只读 + tools-running + token-rate）；tools-running 也已搬（`GET /api/tools/running` 空快照 + `POST …/{handle}/close` 失效句柄 404；登记表随工具编排接线填充） |
+| A3 写路径与生成 | 消息发送、取消、LLM 调用、工具编排、提问、reset/compact、G-1 剩余 4 条 | **路由实现已完成（2026-10-25，tree-plugins `0c6ee1d` + 执行器 `8a5f6ee`）**：领域代码已整体平移（store / settings / LLM / team / spec / 工具契约 / conversation / subagent / compaction），`LlmAgentEngine` 为运行时默认引擎；C-08 两条端点、模型/会话/提问/规范写路由、`tools-running`、团队写路由、手动压缩、reset/compact/ssh 重连、agent 写接口与 subagent transcript 已接；**工具执行走插件自建执行站**（本机 `local_executor`，SSH `ssh_executor`；`lease_id` + 相对路径，核心不碰文件/不起进程）。插件测试 **330** 条、`--selftest` **124** 项（审计起点；审计时 **347 / 167**，见 §10.5）。**注意**：24 条写路由尚无核心↔插件 HTTP 双跑，行为由插件自检覆盖（acceptance L-01）。另注册**工具贡献收集站**（`plugin.tree.agent.collect.tools`，shared），其它插件订阅后可按 schema 贡献工具，执行经 `plugin.toolCall` 转回贡献方（领域身份放 `arguments.scope`，核心只做不透明转发，不解析 agent/team/mode/session）。独立插件 `extra-tools` 已用它贡献 todo / question / subagent / team / message 五个工具；tree.agent 自建 `agent_tools` 执行站提供领域原语，工具定义与命令翻译在 extra-tools。剩余：A4 帧迁移与 A5 交接 |
 | A4 帧迁移 | 广播站注册，topic 沿用原帧名；UI 订阅切换到新来源 | 双轨比对无差异后关闭核心直发 |
 | A5 交接 | 核心删除 34 条路由 + 2 条上行指令 + `agent/llm/team/tool` 目录 | 核心 `grep` 不到领域模型；§5 全表打勾 |
 
@@ -391,10 +393,10 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | 1 | ~~插件仓没有 `tree.agent/` 目录~~ **已解除（2026-10-25，`3704101`）**：`plugins/tree.agent/`（包 `tree_agent_loop`）已建，A1 骨架可编译、可上线。`release/plugin-index.json` 是空模板，条目由 `tool/build_plugins.dart` 生成（已含 `runtime: headless` 的 tree.agent 条目） | 无（A1 已完成） |
 | 2 | ~~`packages/tree_agent` 重名~~ **已规避**：新包定名 `tree_agent_loop`（放 `plugins/tree.agent/`）；现有 `packages/tree_agent` 是目标机 Linux 执行体，不改名、不复用 | 无（命名冲突消解） |
 | 3 | 领域代码规模约 20k 行：`agent` 5345 / `llm` 5030 / `team` 2683 / `tool` 5139 / `mcp` 1572；且对核心基础件有硬依赖——`agent → store 12 / util 5 / tool 5 / settings 4 / plugin 2`、`tool → team 7 / plugin 5 / spec 4 / store 4`、`llm → util 6 / settings 5 / agent 5 / store 5` | 插件不得 import 核心包，故必须：领域层与通用小件**复制随迁**、设置先拆分、插件互通改**执行器插件的自建执行站**（§10.1） |
-| 4 | 核心测试 176 个文件，其中大量用例直接 import `src/agent|llm|team|tool`；`_registerRoutes` 已逐条点清：`tree.agent` 34 条 + spec 2 + mcp 3 + files 13 + git 3 + 核心永久面 36 = 91 条已注册（+2 条新增 = 93） | 旧「23 / 25 条」口径作废；A2 基线按 36 条冻结（§1.2） |
+| 4 | 核心测试 176 个文件，其中大量用例直接 import `src/agent|llm|team|tool`；`_registerRoutes` 逐条点清：`tree.agent` 34 条 + spec 2 + mcp 3 + files 13 + git 3 + 核心永久面 36 = 91 条契约（+2 条新增 = 93）。其中 mcp 3 条核心实现已于 `f19c7ac` 删除（当前核心实现 88 条），契约集合仍为 93 | 旧「23 / 25 条」口径作废；A2 基线按 36 条冻结（§1.2） |
 | 5 | ~~委派白名单 `ApiPaths.delegated` 是**静态 18 条路径**~~ **已解除（2026-10-25，L-28）**：`DelegatedRouter` 改为命名空间规则 + 保留前缀；与核心已实现路由同键的申报**接受并标 shadowed**（双跑期先申报后交接），核心删实现后同一申报自动生效 | 新插件加路由不再需要改核心（证据：`ui-pluginization.md` §4.5、`http_router.dart`、`delegated_rest_test.dart`） |
 
-> 结论：G 的正确起点不是搬代码，而是先完成五项前置（`core_settings` 拆分、scope 去领域化立项、`local_executor` 执行站就位、~~委派白名单去静态化~~ **已完成**、按 36 条建 G-1 对照表），再按 A1（最小端点 `GET /api/agents` 走通 stdio / 委派 / 一致性）验证脚手架。剩余四项：L-22 / L-23 / L-24~L-26 / L-19。
+> 结论：G 的正确起点不是搬代码，而是先完成五项前置（`core_settings` 拆分、scope 去领域化立项、`local_executor` 执行站就位、~~委派白名单去静态化~~ **已完成**、按 36 条建 G-1 对照表），再按 A1（最小端点 `GET /api/agents` 走通 stdio / 委派 / 一致性）验证脚手架。剩余前置：L-22 / L-23 / L-24（SSH 与 PTY）/ L-25 / L-26；L-19、L-28 已闭环，L-24 本地执行站已落地。
 
 ### 已拍板（2026-10-25）
 
@@ -418,6 +420,7 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 ## 10.1 核心基础件依赖清单（2026-10-25 修正）
 
 > **已拍板：插件不得 import 任何核心包**（`tree_core`、`tree_protocol` 及主仓内其它包）。
+> 门禁落地：桌面仓 `plugin_repo_contract_test` + 插件仓可独立运行的 `tool/check_plugin_repo_contract.dart`（L-21，零三方依赖、`--selftest` 5/5、两种仓根实跑绿）。
 > 理由：插件仓可能被其他开发者单独 checkout，任何 `path:` / 相对路径依赖都会断。
 >
 > 插件复用核心能力只有两条路：
@@ -552,6 +555,23 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | 冲突检测 | 保留：同 `METHOD pattern` 双家申报整条拒收，不按启动顺序择一 |
 
 > 保留五段**整段前缀**（`/api/plugin`、`/api/bootstrap`、`/api/meta`、`/api/logs`、`/api/store`），既避免逐条枚举，也防止插件伪装平台控制面。
+
+## 10.5 测试与自检计数（2026-10-25 实测）
+
+> 口径：只统计 `dart test` 收集到的用例数 / `--selftest` 输出的通过项数，不拿「测试文件数」冒充用例数。
+> 基线：桌面仓 `e0e3529`、tree-plugins `93e54fe` 为审计起点；当前桌面 `676d5eb`、tree-plugins `e817d30`，相关并行任务已收口。两列分开列出「审计起点」与「审计时 HEAD」；以审计时列为准，后续提交后按同命令重跑。
+
+| 组件 | 命令 | 审计起点 | 审计时 HEAD | 备注 |
+| --- | --- | --- | --- | --- |
+| `tree.agent` 测试 | `cd plugins/tree.agent && dart test -r compact` | **330** | **347** | 当前全绿；新增 transcript / agent 写路由用例，按 347 复核 |
+| `tree.agent` 自检 | `cd plugins/tree.agent && dart run tree.agent_plugin.dart --selftest` | **124** | **167** | 当前 0 失败；新增写路由 / transcript 断言，按 167 复核 |
+| `mcp` 测试 | `cd plugins/mcp && dart test -r compact` | **7** | **18** | 当前全绿；新增委派路由 / 配置用例，按 18 复核 |
+| `local_executor` 自检 | `cd plugins/local_executor && dart run local_executor_plugin.dart --selftest` | **16** | **16** | 16 通过 / 0 失败 |
+| `tree_protocol` 测试 | `cd packages/tree_protocol && dart test -r compact` | **64** | **68** | 当前全绿；新增领域漂移门禁用例，按 68 复核 |
+| G-1 等价双跑 harness | `dart run packages/tree_core/tool/verify_agent_equivalence.dart` | **12 条** | **12 条** | `kImplementedRoutes` 12 条逐字节对照；其余 26 条在 `kDeclaredOnlyRoutes`，行为由插件自检覆盖 |
+
+> 计数不等于完成度：12 条双跑 ≠ 36 条 G-1 已等价；申报、双跑、签收三层状态见
+> [ui-pluginization_acceptance.md §12.E](ui-pluginization_acceptance.md#e-l-01l-34--g-1g-7-最新状态矩阵2026-10-25-审计)。
 
 ---
 
