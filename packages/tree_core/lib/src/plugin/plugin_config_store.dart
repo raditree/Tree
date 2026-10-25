@@ -309,6 +309,14 @@ class PluginConfigStore {
     if (requires.error != null) {
       return '插件 $id 的 ${requires.error}';
     }
+    // requires.api：插件对核心协议形状的要求，同样当场校验（前端 / 手改 YAML
+    // 写错区间不能被悄悄当成“没写要求”）。
+    final PluginApiRequirementParseResult api = parsePluginApiRequirement(
+      entry['requires'],
+    );
+    if (api.error != null) {
+      return '插件 $id 的 ${api.error}';
+    }
     return null;
   }
 
@@ -383,13 +391,17 @@ class PluginConfigStore {
     final PluginDependencyParseResult requires = parsePluginDependencies(
       src['requires'],
     );
-    if (requires.dependencies.isNotEmpty) {
-      out['requires'] = <String, dynamic>{
+    final PluginApiRequirementParseResult api = parsePluginApiRequirement(
+      src['requires'],
+    );
+    final Map<String, dynamic> requiresOut = <String, dynamic>{
+      if (api.requirement.raw.isNotEmpty) 'api': api.requirement.raw,
+      if (requires.dependencies.isNotEmpty)
         'plugins': requires.dependencies
             .map((PluginDependency d) => d.toJson())
             .toList(growable: false),
-      };
-    }
+    };
+    if (requiresOut.isNotEmpty) out['requires'] = requiresOut;
     // 未知键（含 builtin 标记、用户自己加的备注）排在规范字段之后
     for (final MapEntry<String, dynamic> e in src.entries) {
       if (canonicalFields.contains(e.key)) continue;

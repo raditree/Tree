@@ -326,4 +326,67 @@ plugins:
       expect(store.readEntry('demo')!['my_note'], '用户自己的备注');
     });
   });
+
+  group('requires.api（核心协议版本要求）', () {
+    test('与 requires.plugins 共存：两边都写回、读回同一个区间', () {
+      final PluginStoreResult result = store.upsert(<String, dynamic>{
+        'id': 'demo',
+        'command': 'python',
+        'requires': <String, dynamic>{
+          'api': '>=1.0 <2.0',
+          'plugins': <Map<String, dynamic>>[
+            <String, dynamic>{'id': 'base', 'version': '>=1.0'},
+          ],
+        },
+      });
+      expect(result.ok, isTrue, reason: result.error);
+      final Map<String, dynamic> entry = store.readEntry('demo')!;
+      final Map<dynamic, dynamic> requires =
+          entry['requires'] as Map<dynamic, dynamic>;
+      expect(requires['api'], '>=1.0 <2.0');
+      expect((requires['plugins'] as List<dynamic>), hasLength(1));
+      final PluginConfig config = PluginConfig.fromJson(entry);
+      expect(config.apiRequires, '>=1.0 <2.0');
+      expect(config.apiRequirement.satisfiedBy('1.0'), isTrue);
+      expect(config.apiRequirement.satisfiedBy('2.0'), isFalse);
+    });
+
+    test('形状 / 类型 / 区间当场拒，不落盘', () {
+      final List<Map<String, dynamic>> bad = <Map<String, dynamic>>[
+        <String, dynamic>{
+          'id': 'a',
+          'command': 'python',
+          'requires': <String, dynamic>{'api': 1},
+        },
+        <String, dynamic>{
+          'id': 'b',
+          'command': 'python',
+          'requires': <String, dynamic>{'api': 'not-a-version'},
+        },
+      ];
+      for (final Map<String, dynamic> entry in bad) {
+        final PluginStoreResult rejected = store.upsert(entry);
+        expect(rejected.ok, isFalse, reason: '${entry["id"]} 应当被拒');
+        expect(rejected.error, contains('requires.api'));
+      }
+      expect(store.readEntries(), isEmpty, reason: '校验失败不落盘');
+    });
+
+    test('空串 = 合法且不产出 requires 键（与 suspension 同口径）', () {
+      expect(
+        store.upsert(<String, dynamic>{
+          'id': 'demo',
+          'command': 'python',
+          'requires': <String, dynamic>{'api': ''},
+        }).ok,
+        isTrue,
+      );
+      expect(
+        store.readEntry('demo')!.containsKey('requires'),
+        isFalse,
+        reason: '空要求不该把文档改出一个空 requires',
+      );
+      expect(PluginConfig.fromJson(store.readEntry('demo')!).apiRequires, '');
+    });
+  });
 }

@@ -579,15 +579,39 @@ class PluginBus {
     );
   }
 
+  /// **`requires.api` 闸门**：插件声明的核心协议版本不满足 ⇒ 不可用。
+  ///
+  /// 回包形状向依赖 409 对齐（`ok` / `error` / `reasons` / `missing_dependencies`），
+  /// 另附 `requires_api` 与 `core_api`：前端要能一眼看出“是插件太新，还是核心太旧”。
+  Map<String, dynamic>? apiBlock(PluginConfig candidate) {
+    if (candidate.apiRequires.isEmpty) return null;
+    final PluginApiRequirement requirement = candidate.apiRequirement;
+    if (requirement.satisfiedBy(treeCoreApiVersion)) return null;
+    final String reason =
+        '插件 ${candidate.id} 要求核心 API ${requirement.raw}，'
+        '当前核心 API 为 $treeCoreApiVersion';
+    return <String, dynamic>{
+      'ok': false,
+      'error': reason,
+      'reasons': <String>[reason],
+      'missing_dependencies': const <Object?>[],
+      'requires_api': requirement.raw,
+      'core_api': treeCoreApiVersion,
+    };
+  }
+
   /// 供 HTTP 层在“启用 / 安装 / 重启”前复核：返回 null = 可以放行。
   ///
   /// 回包形状见 `spec.md` ADDED「插件依赖」：
   /// `{ok:false, error, reasons, missing_dependencies:[{id, required, installed,
   /// actual, by, optional, reason}]}`。
+  /// `requires.api` 不满足时回同一形状（`missing_dependencies` 为空）+ 两个版本字段。
   Map<String, dynamic>? dependencyBlock(String pluginId) {
     _reloadConfigs();
     final PluginConfig? candidate = config(pluginId);
     if (candidate == null) return null;
+    final Map<String, dynamic>? api = apiBlock(candidate);
+    if (api != null) return api;
     final PluginDependencyReport report = checkDependencies(candidate);
     return report.ok ? null : report.toJson();
   }
@@ -873,6 +897,17 @@ class PluginBus {
     final int generation = (_generations[config.id] ?? 0) + 1;
     _generations[config.id] = generation;
     _setLifecycle(config.id, PluginLifecycleState.booting);
+    // 片 D 遗留：`requires.api` —— 插件声明的核心协议版本不满足 ⇒ 进程绝不启动
+    //（HTTP 409 走 [apiBlock]，与此处同一份判定）。
+    final Map<String, dynamic>? apiBlocked = apiBlock(config);
+    if (apiBlocked != null) {
+      final String reason = (apiBlocked['error'] ?? '核心 API 版本不满足').toString();
+      _errors[config.id] = reason;
+      log?.call('插件 ${config.id} 不可用：$reason');
+      _setLifecycle(config.id, PluginLifecycleState.failed);
+      _emitStatus(config, 'disabled', reason: reason);
+      return;
+    }
     // 片 D：**启用前依赖闸门**——非可选依赖缺失 / 版本不符 / 区间无交集 / 成环
     // ⇒ 进程绝不启动（HTTP 层回 409 与此处同一份判定）。
     final PluginDependencyReport dependency = checkDependencies(config);

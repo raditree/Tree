@@ -1409,6 +1409,37 @@ void main() {
     );
   });
 
+  test('requires.api 不满足 ⇒ 409（可读原因 + 两侧版本），条目不落盘', () async {
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
+        await serve('enabled: true\nplugins: []\n');
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+
+    final _Res created = await ctx.client.send(
+      'POST',
+      '/api/plugin/configs',
+      body: <String, dynamic>{
+        'id': 'future',
+        'name': 'Future',
+        'command': Platform.resolvedExecutable,
+        'args': <String>[script],
+        // 核心固定 1.0，这条要求不可能满足。
+        'requires': <String, dynamic>{'api': '>=2.0'},
+      },
+    );
+    expect(created.status, 409, reason: created.json.toString());
+    expect(created.json['ok'], isFalse);
+    expect(created.json['plugin_id'], 'future');
+    expect(created.json['requires_api'], '>=2.0');
+    expect(created.json['core_api'], '1.0');
+    expect(created.json['error'], contains('核心 API'));
+    expect(created.json['missing_dependencies'], isEmpty);
+    expect(diskEntry('future'), isEmpty, reason: 'API 不满足不得写条目');
+    expect(ctx.bus.instances(), isEmpty, reason: '进程不得启动');
+  });
+
   test('with_dependencies：只补齐缺失项，不升级既有插件', () async {
     final _Repo repo = _Repo();
     final List<int> source = File(script).readAsBytesSync();

@@ -6,8 +6,8 @@
 
 | 位置 | 内容 |
 | --- | --- |
-| [main.dart](main.dart) | 启动序列：附着或拉起核心 → 读握手 → `ApiService.setToken` → 建 WS |
-| [io/core_process_launcher.dart](io/core_process_launcher.dart) | 找核心可执行文件（`TREE_CORE_EXE` → 应用同目录 → `.output/`）、拉起、解析握手、退出时请它优雅退出；找不到时给**带修复指引**的错误页 |
+| [main.dart](main.dart) | 启动序列：从环境附着核心 → `ApiService.setToken` → 建 WS（UI 不再拉起核心） |
+| [io/core_attachment.dart](io/core_attachment.dart) | 只读 `TREE_CORE_URL` / `TREE_CORE_TOKEN` 等环境变量附着核心；缺失或握手失败时给**带修复指引**的错误页；绝不 spawn 第二个核心 |
 | [io/tray_service.dart](io/tray_service.dart) | 托盘图标与菜单（恢复窗口 / 退出）、**关闭按钮的默认行为（隐藏到托盘）**与它的设置；[ui/widgets/close_to_tray_dialog.dart](ui/widgets/close_to_tray_dialog.dart) 是首次关闭时的一次性说明 |
 | [io/single_instance.dart](io/single_instance.dart) | **同数据根单实例锁**：回环端口 + 带锁键的握手；被拒绝的那个实例只负责把已有窗口叫到前面（`AlreadyRunningApp` 在 [main.dart](main.dart)） |
 | [io/api_service.dart](io/api_service.dart) | 全部 REST 端点的封装（唯一出网口） |
@@ -440,7 +440,7 @@
     [ui/services/core_log_files.dart](ui/services/core_log_files.dart)、
     [ui/widgets/usage_calls_panel.dart](ui/widgets/usage_calls_panel.dart)、
     [ui/widgets/core_log_card.dart](ui/widgets/core_log_card.dart)）：
-    ① 数据根只有一个来源 —— 握手可选字段 `data_root`（[io/core_process_launcher.dart](io/core_process_launcher.dart)）；
+    ① 数据根只有一个来源 —— 附着环境里的 `TREE_DATA_ROOT` / 握手可选字段 `data_root`（[io/core_attachment.dart](io/core_attachment.dart)）；
     拿不到就说"没有入口"（老核心 / 附着模式 / 核心未起），**绝不猜** `%APPDATA%\Tree` 之类的替代路径；
     ② 目录名按核心口径拼（`data/<agent_id>/<session_id>/…`）并做**路径穿越校验**（只允许 `[A-Za-z0-9_.-]`，
     拒绝 `.` / `..` / 空串），非法 id 只是"这一条读不了"，不是崩溃；

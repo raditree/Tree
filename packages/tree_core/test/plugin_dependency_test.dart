@@ -230,4 +230,58 @@ void main() {
       expect(report.error, contains('未记录版本'));
     });
   });
+
+  group('requires.api', () {
+    test('合法区间：保留原文并可按核心版本判定', () {
+      final PluginApiRequirementParseResult parsed =
+          parsePluginApiRequirement(<String, dynamic>{
+            'api': '>=1.0 <2.0',
+            'plugins': <Map<String, dynamic>>[
+              <String, dynamic>{'id': 'base'},
+            ],
+          });
+      expect(parsed.error, isNull);
+      expect(parsed.requirement.raw, '>=1.0 <2.0');
+      expect(parsed.requirement.isEmpty, isFalse);
+      expect(parsed.requirement.satisfiedBy('1.0'), isTrue);
+      expect(parsed.requirement.satisfiedBy('2.0'), isFalse);
+    });
+
+    test('没写 / 空串 = 不要求', () {
+      for (final Object? raw in <Object?>[
+        null,
+        <String, dynamic>{},
+        <String, dynamic>{'api': ''},
+        <String, dynamic>{'api': '   '},
+      ]) {
+        final PluginApiRequirementParseResult parsed =
+            parsePluginApiRequirement(raw);
+        expect(parsed.error, isNull, reason: '$raw');
+        expect(parsed.requirement.isEmpty, isTrue, reason: '$raw');
+        expect(parsed.requirement.satisfiedBy('0.1'), isTrue);
+      }
+    });
+
+    test('形状 / 类型 / 区间不合法都给可读原因（不抛）', () {
+      final List<Object?> bad = <Object?>[
+        'oops',
+        <String, dynamic>{'api': 1},
+        <String, dynamic>{'api': 'not-a-version'},
+      ];
+      for (final Object? raw in bad) {
+        final PluginApiRequirementParseResult parsed =
+            parsePluginApiRequirement(raw);
+        expect(parsed.error, isNotNull, reason: '$raw');
+        expect(parsed.error, contains('requires'), reason: '$raw');
+      }
+    });
+
+    test('核心与插件两侧共用同一份 API 版本常量', () {
+      // 不变量：核心声明 /api/meta 的 api_version 必须就是闸门比较的值。
+      expect(treeCoreApiVersion, '1.0');
+      expect(PluginVersionConstraint.tryParse('>=1.0 <2.0')!.satisfies(
+        treeCoreApiVersion,
+      ), isTrue);
+    });
+  });
 }

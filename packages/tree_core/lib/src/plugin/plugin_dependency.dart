@@ -602,6 +602,78 @@ PluginDependencyReport evaluatePluginDependencies({
   );
 }
 
+/// 核心 API 版本（`requires.api` 的对照基准）。
+///
+/// 只有**协议形状**变化才升；核心与插件两侧共用这一个常量，避免“核心升了、
+/// 校验还在比旧值”。
+const String treeCoreApiVersion = '1.0';
+
+/// 插件对核心 API 的版本要求（`requires.api`；空 = 不要求）。
+class PluginApiRequirement {
+  const PluginApiRequirement._(this.raw, this.constraint);
+
+  static const PluginApiRequirement none = PluginApiRequirement._('', null);
+
+  /// 原始区间文本（可读报错用）。
+  final String raw;
+
+  /// 解析后的区间；null = 不要求。
+  final PluginVersionConstraint? constraint;
+
+  bool get isEmpty => constraint == null;
+
+  /// 当前核心 API 版本是否满足本声明。
+  bool satisfiedBy(String coreApiVersion) {
+    final PluginVersionConstraint? value = constraint;
+    if (value == null) return true;
+    return value.satisfies(coreApiVersion);
+  }
+}
+
+/// `requires.api` 的解析结果（形状错误只回可读原因，不抛）。
+class PluginApiRequirementParseResult {
+  const PluginApiRequirementParseResult({
+    this.requirement = PluginApiRequirement.none,
+    this.error,
+  });
+
+  final PluginApiRequirement requirement;
+  final String? error;
+}
+
+/// 解析 `requires: {api: ">=1.0 <2.0"}`（[rawRequires] 是整个 `requires` 对象）。
+///
+/// 与 [parsePluginDependencies] 同口径：形状不对 / 区间不可解析都回可读原因，
+/// 调用方据此拒绝整条清单——拼错一条不许静默变成“没写要求”。
+PluginApiRequirementParseResult parsePluginApiRequirement(Object? rawRequires) {
+  if (rawRequires == null) return const PluginApiRequirementParseResult();
+  if (rawRequires is! Map) {
+    return const PluginApiRequirementParseResult(
+      error: 'requires 必须是对象（形如 {api: ">=1.0 <2.0"}）',
+    );
+  }
+  final Object? raw = rawRequires['api'];
+  if (raw == null) return const PluginApiRequirementParseResult();
+  if (raw is! String) {
+    return const PluginApiRequirementParseResult(
+      error: 'requires.api 必须是字符串版本区间（如 ">=1.0 <2.0"）',
+    );
+  }
+  final String text = raw.trim();
+  if (text.isEmpty) return const PluginApiRequirementParseResult();
+  final PluginVersionConstraint? constraint = PluginVersionConstraint.tryParse(
+    text,
+  );
+  if (constraint == null) {
+    return PluginApiRequirementParseResult(
+      error: 'requires.api 的版本区间不可解析：$text',
+    );
+  }
+  return PluginApiRequirementParseResult(
+    requirement: PluginApiRequirement._(text, constraint),
+  );
+}
+
 /// 沿非可选依赖边找环；返回环上的 id（按路径顺序，首尾重复）。
 List<String> _findCycle(
   String startId,

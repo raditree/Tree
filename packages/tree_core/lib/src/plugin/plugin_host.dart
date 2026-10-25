@@ -779,6 +779,7 @@ class PluginConfig {
     this.version = '',
     this.repoVersion = '',
     List<PluginDependency>? requires,
+    this.apiRequires = '',
   }) : args = args ?? <String>[],
        env = env ?? <String, String>{},
        scope = scope ?? <String, dynamic>{},
@@ -832,6 +833,17 @@ class PluginConfig {
   /// 依赖声明（`requires.plugins`）；空表 = 无依赖。
   final List<PluginDependency> requires;
 
+  /// 核心 API 版本要求（`requires.api`）；空串 = 不要求。
+  ///
+  /// 与 [requires] 分开建字段的原因：它约束的不是某个插件，而是**核心自身的协议
+  /// 形状**（[treeCoreApiVersion]）——混进依赖表会让“缺依赖”与“核心太旧”这两类
+  /// 故障在回包里长成同一副样子。
+  final String apiRequires;
+
+  /// 解析后的 API 要求（形状已由配置存储校验；这里做纯解析）。
+  PluginApiRequirement get apiRequirement =>
+      parsePluginApiRequirement(<String, dynamic>{'api': apiRequires}).requirement;
+
   /// 归一化后的运行形态（`ui` / `headless`）+ legacy 标记。
   PluginRuntimeInfo get runtimeInfo => PluginRuntime.parse(runtime);
 
@@ -870,11 +882,13 @@ class PluginConfig {
     // 同 suspension：只有声明了才写回，空串不让配置文档多一行噪声。
     if (runtime.isNotEmpty) 'runtime': runtime,
     if (version.isNotEmpty) 'version': version,
-    if (requires.isNotEmpty)
+    if (requires.isNotEmpty || apiRequires.isNotEmpty)
       'requires': <String, dynamic>{
-        'plugins': requires
-            .map((PluginDependency d) => d.toJson())
-            .toList(growable: false),
+        if (apiRequires.isNotEmpty) 'api': apiRequires,
+        if (requires.isNotEmpty)
+          'plugins': requires
+              .map((PluginDependency d) => d.toJson())
+              .toList(growable: false),
       },
   };
 
@@ -892,6 +906,8 @@ class PluginConfig {
     'runtime': runtimeInfo.value,
     'runtime_legacy': runtimeInfo.legacy,
     'requires': <String, dynamic>{
+      // 未声明不写这一键：存量清单的 API 形状与改动前逐字一致。
+      if (apiRequires.isNotEmpty) 'api': apiRequires,
       'plugins': requires
           .map((PluginDependency d) => d.toJson())
           .toList(growable: false),
@@ -940,6 +956,8 @@ class PluginConfig {
     // 形状已在 PluginConfigStore 校验；这里做纯解析，非法项丢弃（不会把插件
     // 变成"读不出来"）。依赖闸门只对解析出来的声明负责。
     requires: parsePluginDependencies(json['requires']).dependencies,
+    // 同宽松口径：形状已在配置存储校验，这里解析不出就当“没写要求”。
+    apiRequires: parsePluginApiRequirement(json['requires']).requirement.raw,
   );
 }
 

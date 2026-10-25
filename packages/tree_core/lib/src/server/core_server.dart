@@ -181,7 +181,8 @@ class CoreServer {
   /// 核心 HTTP API 的版本（`/api/meta.api_version`）。
   ///
   /// 与插件配置里的 `requires.api` 对比用；片 B 固定 1.0，协议形状变化才升。
-  static const String apiVersion = '1.0';
+  /// 单一来源在 [treeCoreApiVersion]（插件闸门也用同一个常量）。
+  static const String apiVersion = treeCoreApiVersion;
 
   /// UI 插件 ⇄ 站点总线的 WS 接线；插件系统未启用（测试 / 最小骨架）时为 null。
   StationWsBridge? _stationWsBridge;
@@ -4785,8 +4786,12 @@ class CoreServer {
     PluginBus bus,
     Map<String, dynamic> entry,
   ) {
+    final PluginConfig candidate = PluginConfig.fromJson(entry);
+    // `requires.api` 先于插件依赖：协议形状不满足时，装依赖也救不回来。
+    final Map<String, dynamic>? api = bus.apiBlock(candidate);
+    if (api != null) return api;
     final PluginDependencyReport report = bus.checkDependencies(
-      PluginConfig.fromJson(entry),
+      candidate,
       refresh: true,
     );
     return report.ok ? null : report.toJson();

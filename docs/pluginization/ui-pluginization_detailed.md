@@ -50,8 +50,10 @@
   的实例编组，UI 沿用契约内的默认值 `team`（当前核心的 `plugins.yaml` 校验只接受
   `team / agent / session`，写 `singleton` 会被拒——这是核心侧的既有值域，不是本插件要改的）。
 - `scope: {}`：UI 订阅用通配，不需要单独设计。
-- `requires.api`：与 `/api/meta` 的 `api_version` 比对。**当前核心尚未在启用前校验这一项**
-  （片 D 的文档目标，代码待补）；清单先按契约写上，装上后实际能力探测仍以 `/api/meta` 为准。
+- `requires.api`：与 `/api/meta` 的 `api_version` 比对。**2026-10-25 已补齐核心侧启用前校验**
+  （`PluginConfig.apiRequires` + `PluginBus.apiBlock`，配置存储校验形状）；区间不满足时
+  条目不落盘、进程不启动，HTTP 回 409（带 `requires_api` / `core_api`）。运行期实际能力
+  探测仍以 `/api/meta` 为准。
 
 ### 产物内容
 
@@ -123,8 +125,8 @@ plugin.json
 > `ui.hello`，`/api/meta.ui` 返回 `tree.ui.default`（connections=3，
 > capabilities=[plugin.manage]，can_manage_plugins=true）；U1/U3 通过。
 > U4 的订阅/重连/`closed` 语义由 `test/station_client_test.dart` 覆盖（无真实核心）。
-> **U2 的"从面板安装"未验证**：本仓核心只有发布仓库安装流程，没有本地 zip 安装端点，
-> 且 `requires.api` 的核心侧启用前校验仍是片 D 的遗留项。
+> **U2 的"从面板安装"未验证**：本仓核心只有发布仓库安装流程，没有本地 zip 安装端点。
+> `requires.api` 的核心侧启用前校验已在 2026-10-25 补齐（不再是遗留项）。
 
 ---
 
@@ -161,7 +163,7 @@ E 与 U5 顺序可互换，但 **U6 必须在 E 之后**，否则删了协议而
 
 | 层 | 用例 |
 | --- | --- |
-| 打包 | zip 内容白名单（`tree_ui.exe` + `plugin.json`，无 pdb / `tree_core.exe`）；`plugin.json` 形状校验；**缺 `requires.api` 时安装被拒 —— 核心侧尚未实现（片 D 遗留）** |
+| 打包 | zip 内容白名单（`tree_ui.exe` + `plugin.json`，无 pdb / `tree_core.exe`）；`plugin.json` 形状校验；`requires.api` 声明了但核心不满足时启用被拒（未声明 = 不要求） |
 | 安装 | **本仓无本地 zip 安装端点**；安装流程依赖 tree-plugins 发布仓库，此处只验证产物形状与 `UiHost` 拉起 |
 | 附着 | 无 env 直接退出并给可读错误；有 env 不 spawn 核心 |
 | 握手 | `ui.hello` 后 `meta.ui` 出现；id 与清单不符被拒 |
