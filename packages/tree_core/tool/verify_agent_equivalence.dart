@@ -35,6 +35,33 @@ const List<String> kImplementedRoutes = <String>[
   'GET /api/agents/{agentId}/subagents',
   'GET /api/models',
   'GET /api/agents/{agentId}/models-info',
+  'GET /api/tools/running',
+  'GET /api/settings/token-rate',
+];
+
+/// 插件已申报、但核心侧**没有 HTTP 实现**的新增路由（C-08）。
+///
+/// 它们没有"核心 vs 插件"双跑对照可做（核心不存在该接口），只校验申报表与
+/// 常量表一致；行为由插件 `--selftest` 覆盖。
+const List<String> kDeclaredOnlyRoutes = <String>[
+  'POST /api/agents/{agentId}/messages',
+  'POST /api/agents/{agentId}/cancel',
+  // 核心有实现，但本工具的 HTTP 客户端目前只发 GET；行为由插件自检覆盖。
+  'POST /api/tools/running/{handle}/close',
+  // 写路由：等价对照要求两侧各自从同一份种子开始；当前工具同一目录顺序跑，
+  // 第一条写会污染第二条的输入，故先用插件自检守住行为（模型 CRUD / token-rate 写）。
+  'POST /api/models',
+  'PATCH /api/models/{modelId}',
+  'DELETE /api/models/{modelId}',
+  'POST /api/settings/token-rate',
+  // 会话 / 历史 / 提问写接口（同上：写路由先由插件自检守住）。
+  'POST /api/agents/{agentId}/sessions',
+  'PATCH /api/agents/{agentId}/sessions/{sessionId}',
+  'DELETE /api/agents/{agentId}/sessions/{sessionId}',
+  'POST /api/agents/{agentId}/sessions/{sessionId}/specs',
+  'DELETE /api/conversations/{agentId}',
+  'GET /api/questions',
+  'POST /api/questions/{qid}/answer',
 ];
 
 Future<void> main(List<String> args) async {
@@ -54,7 +81,8 @@ Future<void> main(List<String> args) async {
     return;
   }
   stdout.writeln(
-    '[OK] 申报表与等价用例表一致（${kImplementedRoutes.length} 条）',
+    '[OK] 申报表与用例表一致（${kImplementedRoutes.length} 条双跑 + '
+    '${kDeclaredOnlyRoutes.length} 条仅申报）',
   );
   final List<String> failures = <String>[];
   for (final String route in kImplementedRoutes) {
@@ -126,8 +154,11 @@ Future<String?> _verifyDeclarations(String exe) async {
       if (item is! Map) return '路由申报项不是对象：$item';
       declared.add('${item['method']} ${item['pattern']}');
     }
-    final Set<String> expected = kImplementedRoutes.toSet();
-    final Set<String> missing = expected.difference(declared);
+    final Set<String> expected = <String>{
+      ...kImplementedRoutes,
+      ...kDeclaredOnlyRoutes,
+    };
+    final Set<String> missing = kImplementedRoutes.toSet().difference(declared);
     final Set<String> extra = declared.difference(expected);
     if (missing.isNotEmpty) return '申报缺这些已实现路由：${missing.toList()}';
     if (extra.isNotEmpty) return '申报多出没有等价用例的路由：${extra.toList()}';
@@ -362,6 +393,20 @@ Future<String?> _runCase(String route, String exe) async {
         query: <String, String>{},
         pathParams: <String, String>{'agentId': 'agt_top'},
         agentId: 'agt_top',
+      );
+    case 'GET /api/settings/token-rate':
+      call = const _RouteCall(
+        concretePath: '/api/settings/token-rate',
+        query: <String, String>{},
+        pathParams: <String, String>{},
+        agentId: '',
+      );
+    case 'GET /api/tools/running':
+      call = const _RouteCall(
+        concretePath: '/api/tools/running',
+        query: <String, String>{},
+        pathParams: <String, String>{},
+        agentId: '',
       );
     case 'GET /api/conversations/{agentId}':
       await _seedSessions(store);
