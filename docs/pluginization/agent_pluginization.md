@@ -122,6 +122,8 @@ UI (runtime: ui) ──WS──> tree_core ──转发──> 订阅者
 
 术语：**内置** = 核心定义；**自建** = 插件定义。两者都可以是执行站 / 收集站 / 广播站。所以「乙插件自建执行站、甲插件向它下令」是合法形态；前文"插件不能定义执行站"的说法是错的。
 
+本次迁移中，`local_executor` 与 `ssh_executor` 的 `exec.command` / `file.*` / `terminal.*` **全部是插件自建**，核心不内置这些站，只负责把命令路由给对应插件。
+
 **执行站原语（此处更正前文的语义漂移）**
 
 > **执行站 = 「对接入点下令，接入点执行并处理」。** 发起方不限（核心、插件均可），归属不限（核心内置、插件自建）。
@@ -188,6 +190,7 @@ tree.agent ──执行站命令(lease_id + relpath/argv)──> local_executor 
 UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行器插件
 ```
 
+- **执行站归属**：`exec.command` / `file.*` / `terminal.*` 这些执行站**由 `local_executor` / `ssh_executor` 在插件内部自行定义**（`plugin.json` 声明 + 站点注册），**不是核心内置**。核心只做路由、身份透传与响应校验，不实现任何执行语义。
 - **本地 vs 远端由 `tree.agent` 决定**：它拥有 agent → workspace 的领域映射；核心不判断。
 - **路径安全**：执行器只接受「租约内的相对路径」。`workspace/register {lease_id, dir}` 在核心登记的是**纯字符串映射**（`lease_id → dir`），无 agent/team 语义；执行器校验「解析后的绝对路径仍在租约根内」。
 - **PTY 流**：核心只做通用字节流中继（`stream session: open/input/resize/close` + 有序字节帧），不认识终端语义；UI 通过 REST 建流、再订阅插件 topic。原「PTY 是 WebSocket 唯一例外」的规则改为「核心提供与协议无关的流中继」。
@@ -206,6 +209,8 @@ UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行�
 | 认证（核心令牌、UI 附着） | 跨 team / 跨 agent 的领域授权 |
 
 > 关于「核心只 store 业务数据」：准确说是**只 store 通用数据**——键值、日志、租约。业务记录（agent/会话/团队/模型）在迁移后归插件自有目录，核心连格式都不认识。
+>
+> 注意：`exec.command` / `file.*` / `terminal.*` **不在**核心站点表里——它们由 `local_executor` / `ssh_executor` 插件自建并注册，核心只在总线里转发。
 
 ### 4.7 密钥与模型配置
 
@@ -293,7 +298,7 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 10. **核心不认识「子 agent 执行体」**：核心没有子 agent 进程、执行器或调度器概念；子 agent 的创建、排队、并发与回收全部在 `tree.agent` 进程内部完成，对外只暴露与会话一致的委派端点。核心只看到「一次委派请求」。
 11. MCP 整体迁 `mcp` 插件；核心不留 MCP 客户端 / 服务端代码，也不认识 MCP 工具类型。
 12. 命令执行一律走**工具插件贡献的执行站**；`tree.agent` 不直接 `Process.start`、不持有 PTY，避免绕过权限与审计。
-13. **插件不得 import 任何核心包**：只允许 pub.dev 依赖与插件仓自带的 `_kit`；复用核心能力走内置执行站（stdio）或 UI 的 REST 端点。
+13. **插件不得 import 任何核心包**：只允许 pub.dev 依赖与插件仓自带的 `_kit`；复用核心能力走核心内置站（仅平台通用能力）或 UI 的 REST 端点。`local_executor` / `ssh_executor` 的 `exec/file/terminal` 执行站属**插件自建**，不是核心内置。
 14. **核心的站点 scope 不得含领域字段**（`team_id/agent_id/session_id/mode_key`）；领域归属与跨域授权由领域插件自己负责，核心只认证调用方与 workspace 租约。
 15. **核心设置只保留平台级**；模型池、token 节奏等 agent 领域配置随 `tree.agent` 迁走。
 16. **核心不持有 PTY、终端会话与文件操作**：本地执行 / 文件修改归 `local_executor`，远端归 `ssh_executor`；核心只保留与协议无关的流中继与租约登记。
@@ -319,7 +324,7 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 2. **子 agent 的执行体** **已定**：由 `tree.agent` **内部调度**；核心不认知子 agent 执行体（不变量 10）。平台当前也不支持「按声明逐 agent 起实例」，勘测见 §10.2。
 3. **密钥来源** **已定**：模型供应商 API Key 随插件、明文落盘 + 权限收紧；落盘加密本期不做，「loader 注入」说法作废（§4.7）。
 4. **MCP** **已定**：整体迁往 `mcp` 插件（含客户端），核心零 MCP 代码。
-5. **终端工具** **已定**：命令执行走工具插件执行站；`tree.agent` 不直接 `Process.start`、不持有 PTY。
+5. **终端工具** **已定**：命令执行走向 `local_executor` / `ssh_executor` **插件自建**的执行站；`tree.agent` 不直接 `Process.start`、不持有 PTY。
 
 ---
 
@@ -331,7 +336,7 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | --- | --- | --- |
 | 1 | 插件仓挂载在 `plugins/`（远端仓库名 `tree-plugins`），但其中**没有** `tree.agent/` 目录；发布索引 `plugins/release/plugin-index.json` 也没有该条目 | A1「插件二进制 + stdio 循环」需先在插件仓新建目录与包 |
 | 2 | ~~`packages/tree_agent` 重名~~ **已规避**：新包定名 `tree_agent_loop`（放 `plugins/tree.agent/`）；现有 `packages/tree_agent` 是目标机 Linux 执行体，不改名、不复用 | 无（命名冲突消解） |
-| 3 | 领域代码规模约 20k 行：`agent` 5345 / `llm` 5030 / `team` 2683 / `tool` 5139 / `mcp` 1572；且对核心基础件有硬依赖——`agent → store 12 / util 5 / tool 5 / settings 4 / plugin 2`、`tool → team 7 / plugin 5 / spec 4 / store 4`、`llm → util 6 / settings 5 / agent 5 / store 5` | 插件不得 import 核心包，故必须：领域层与通用小件**复制随迁**、设置先拆分、插件互通改**核心内置执行站**（§10.1） |
+| 3 | 领域代码规模约 20k 行：`agent` 5345 / `llm` 5030 / `team` 2683 / `tool` 5139 / `mcp` 1572；且对核心基础件有硬依赖——`agent → store 12 / util 5 / tool 5 / settings 4 / plugin 2`、`tool → team 7 / plugin 5 / spec 4 / store 4`、`llm → util 6 / settings 5 / agent 5 / store 5` | 插件不得 import 核心包，故必须：领域层与通用小件**复制随迁**、设置先拆分、插件互通改**执行器插件的自建执行站**（§10.1） |
 | 4 | 核心测试 176 个文件，其中大量用例直接 import `src/agent|llm|team|tool`；`core_server.dart` 的 `_registerRoutes` 实际注册约 **33 条**领域路由（agents CRUD、models、sessions、conversations、subagents、teammates、specs、reset/compact/ssh reconnect、questions 等） | §1.2 / §6 的「23 / 25 条」口径已漂移；A2 的「逐字节一致」基线需先重新点数并冻结 |
 
 结论：G 的正确起点不是搬代码，而是先完成四项前置（`core_settings` 拆分、scope 去领域化立项、路由基线冻结、`local_executor` 执行站就位），再按 A1（最小端点 `GET /api/agents` 走通 stdio / 委派 / 一致性）验证脚手架。
@@ -347,7 +352,7 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | 5 | 命令执行走工具插件执行站（不变量 12） |
 | 6 | 领域测试（`agent/llm/team/tool/mcp` 相关用例）**随代码迁到插件仓** `tree_agent_loop`；核心只保留插件平台 / 协议 / 服务端测试 |
 | 7 | 模型供应商 Key 随插件明文落盘 + 权限收紧；落盘加密本期不做；「loader 注入」作废（§4.7） |
-| 8 | **插件不得 import 任何核心包**；复用核心能力只能走「核心内置执行站」或 UI 的 REST 委派端点；通用小件由插件自备（§10.1） |
+| 8 | **插件不得 import 任何核心包**；复用只能走核心平台内置站（仅通用能力）、**执行器插件的自建执行站**，或 UI 的 REST 委派端点；通用小件由插件自备（§10.1） |
 | 9 | `core_settings.dart` 先按「平台级 / 领域级」拆分，拆分前不得开始 A1 数据接管（§4.8） |
 | 10 | 插件 scope 必须去领域化：`team_id / agent_id / session_id / mode_key` 逐步移除，授权搬到「执行器插件 + workspace 租约」（§10.3） |
 | 11 | **执行与文件全部下沉**：本地命令 / PTY / 文件修改归 `local_executor`，远端归 `ssh_executor`；核心零 PTY、零文件操作，只留通用流中继与租约登记（§4.6） |
@@ -364,10 +369,12 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 > 理由：插件仓可能被其他开发者单独 checkout，任何 `path:` / 相对路径依赖都会断。
 >
 > 插件复用核心能力只有两条路：
-> 1. 核心**主动提供内置执行站**（stdio 站点命令）；
+> 1. **核心主动提供的平台内置站**（仅限核心拥有的通用能力：通用键值存储、日志、租约解析）；
 > 2. UI 插件走 **REST 委派端点**。
 >
-> 因此本节不再有「共享包下放」选项，只有 **随迁（插件自备）** 或 **核心执行站 API**。
+> 注意区分：`exec.command` / `file.*` / `terminal.*` 由 `local_executor` / `ssh_executor` **插件内部定义并注册**，不是核心内置站；核心只负责把命令路由到对应执行器。
+>
+> 因此本节不再有「共享包下放」选项，只有 **随迁（插件自备）**、**调用核心内置站**、或 **向其它插件的自建执行站下令**。
 > `plugins/_kit` 属于插件仓自身，随插件仓分发，不算核心包。
 
 ### 正向依赖与处理
@@ -388,7 +395,7 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | `settings/core_settings.dart` | agent 3 / llm 4 / team 1 | 全局设置 | **先拆分**：平台级留核心；模型池 / token 节奏随迁（见 §4.8） |
 | `settings/ssh_config.dart` | agent 1 / team 1 / tool 1 | SSH 配置 | **随迁**（领域配置）；实际执行走 `ssh_executor` 插件 |
 | `plugin/agent_events.dart` | agent 2 | 事件形状 | **随迁**（topic 载荷由插件自定义） |
-| `plugin/plugin_bus.dart` | tool 2 | 向插件执行站下命令 | **不提供**：改为调用核心内置执行站 |
+| `plugin/plugin_bus.dart` | tool 2 | 向插件执行站下命令 | **不提供**：改为向 `local_executor` / `ssh_executor` 等插件**自建**执行站下令 |
 | `plugin/plugin_host.dart` / `station_runtime.dart` / `station_scope.dart` | tool 1 | 插件工具适配 | **不提供**：站点命令是唯一互通通道 |
 | `ws/ws_hub.dart` | agent 1 | 事件推送 | **删除**：改广播站 topic |
 | `spec/spec_service.dart` / `spec/builtin_specs.dart` | tool 4 | spec 工具 | 走 `spec` 插件执行站 |
@@ -407,7 +414,7 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 > **关键结论（修正版）**：
 > - `records` / `tree_store` 整体随迁；通用小件复制进插件仓，不再抽共享包。
 > - `core_settings.dart` **不能整包下放**：它按单一 agent 设计，必须先拆成「平台设置」与「领域设置」（§4.8）。
-> - 反向依赖里 `plugin_bus` 与 `execute_mounts` 是硬点：核心插件平台反过来 import 领域代码，必须改成「协议 + 核心内置执行站」边界。
+> - 反向依赖里 `plugin_bus` 与 `execute_mounts` 是硬点：核心插件平台反过来 import 领域代码，必须改成「协议 + 插件自建执行站」边界。
 > - `tree_agent_loop` 只允许依赖 pub.dev 包与 `plugins/_kit`；CI 需加一条检查：插件仓内不得出现 `package:tree_core/...` 或 `package:tree_protocol/...`。
 
 ### 核心现有能力也要搬走（配合 §4.6）
