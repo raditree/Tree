@@ -249,7 +249,7 @@
 | L-21 | 插件仓禁止 import 核心包（CI 闸门） | **部分闭环**：桌面仓合同用例已加 | 插件仓独立 CI 尚未挂这条用例 | 已加 `plugin_repo_contract_test`：扫描全部插件源码的 `import 'package:tree_core|tree_protocol/...'`（mutation 验证会变红）；下一步在 tree-plugins CI 直接调这条用例或等价脚本 |
 | L-22 | `core_settings.dart` 拆分（平台级 / 领域级） | 未开始 | 现类混装模型池与平台开关 | 按 [§4.8](agent_pluginization.md#48-core_settingsdart-必须先拆分) 拆分；拆分前不得开始 A1 数据接管 |
 | L-23 | 插件 scope 去领域化（`team_id/agent_id/session_id/mode_key`） | 未开始 | 渗透 13 文件，且承担跨 team/跨 workspace 的 fail-closed 授权（勘测见 [§10.3](agent_pluginization.md#103-勘测插件-scope-仍含领域字段应去掉)） | 三步走：通用 `context` 先扩后收；授权搬到「执行器插件 + workspace 租约」；最后删字段。协议破坏性变更，需单独立项 |
-| L-24 | 新建 `local_executor` 插件（本地 `Process.start` + 文件操作 + PTY） | 未开始 | 核心不得持有 PTY / 文件逻辑；`files/file_service.dart`、`terminal/terminal_service.dart` 必须搬出（[§4.6](agent_pluginization.md#46-执行与文件全部下沉能力插件核心零-pty--零文件操作)） | 与 `ssh_executor` 对齐；A1 前置 |
+| L-24 | 新建 `local_executor` 插件（本地 `Process.start` + 文件操作 + PTY） | **本地部分落地（2026-10-25）**：自建执行站 `plugin.local_executor.execute.local`，命令 `file.*`/`exec.command`；FS+exec 完整，PTY/SSH 未接 | 核心不得持有 PTY / 文件逻辑；`files/file_service.dart`、`terminal/terminal_service.dart` 必须搬出（[§4.6](agent_pluginization.md#46-执行与文件全部下沉能力插件核心零-pty--零文件操作)） | 与 `ssh_executor` 对齐；A1 前置 |
 | L-25 | 执行器执行站契约（`exec.command` / `file.*` / `terminal.*`）与 workspace 租约 | 未设计 | 本地/远端需要同一套接口，`tree.agent` 才能无差别调用；执行站由**插件内部定义**，非核心内置 | 定义站点名、参数（`lease_id` + 相对路径 / argv）、错误码与幂等；核心只登记 `lease_id → dir` 并路由 |
 | L-26 | 核心通用流中继原语（PTY 字节流，不含终端语义） | 未实现 | 现有 PTY 走核心 `terminal_service` 与 WS 帧 | 新增 `stream session`（open/input/resize/close + 有序字节帧），核心只转发；UI 经 REST 建流 + 订阅 topic |
 | L-19 | G-1 对照表本身（36 行，含样例） | **已闭环**（`bda9df9`，2026-10-25） | — | 见 [agent_api_contract.md](agent_api_contract.md)：36 条 G-1 + 2 条 spec 附录，含全局约定、逐条样例与 C-01~C-12 契约缺口 |

@@ -229,15 +229,16 @@ UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行�
 - tree.agent 的工具调用（read/write/list/grep/terminal 与 Spec/团队日志的 IO）
   统一带 `lease_id`，由 local_executor 执行；没有 local_executor 时命令显式失败，
   不静默回退核心内置挂载；
-- **过渡形态**：执行站点位仍是核心内置（`system.execute.fs/terminal`），由插件
-  挂载；「插件自建执行站 + 插件自定义 `file.*` / `exec.command` 命令」留到 A5。
-  核心内置挂载仍保留给无租约的旧调用方（UI/其它插件），A5 删除；
+- **执行站归属**：local_executor 已改为**插件自建执行站**
+  （`plugin.local_executor.execute.local`，命令 `file.read/write/list/grep/delete/mkdir/writeBytes` + `exec.command`），
+  核心按命令表路由、不再内置这些命令；核心原有的 `fs.*` / `terminal.exec` 点位仍保留给
+  无租约旧调用方，A5 删除；
 - **加固（评审后）**：插件只能显式接管数据面命令白名单（fs.read/write/list/grep、
   terminal.exec），控制面 plugin.* 不可挂载；同命令已有其它插件接管则拒绝；
   插件下线/卸载自动 unmount 并清租约；租约键按插件命名空间隔离；
   `lease_id` 命令注入 root 后跳过 `_resolveTarget`。
 - **未覆盖**：SSH 工作空间仍走核心内置 IO（ssh_executor 执行站未接租约）、PTY、
-  后台 hook 任务、fs.delete/二进制写；执行器转发尚未接入热重启缓冲。
+  后台 hook 任务；执行器转发尚未接入热重启缓冲。
 
 ### 4.6.2 核心职责白名单（反向约束）
 
@@ -319,7 +320,7 @@ UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行�
 | --- | --- | --- |
 | A1 骨架 | `plugins/tree.agent/`（包 `tree_agent_loop`）建立；插件二进制 + stdio 循环 + 健康检查 + 日志/存储接入 | 空插件能被启停；日志出现在 `/api/logs/plugin:tree.agent`。**已完成（2026-10-25，tree-plugins `3704101`）**：`--selftest` 8 项全绿；AOT 产物 6.1 MB 且产物自检通过；真核心 e2e 验证 ready → `[stderr]`/`[notify:info]` 两路日志进同一源 → `enabled:false` 后下线 |
 | A2 只读面 | agents / models / sessions / conversations / todos / subagents / teammates / tools-running 的读路径 | 36 条中只读部分返回与核心逐字节一致（同一数据目录）。**进行中（2026-10-25）**：`api/delegate` 管道 + `GET /api/agents`、`GET /api/agents/{id}`、`GET …/teammates`、`GET /api/conversations/{id}`、`GET …/sessions`、`GET …/sessions/{id}`、`GET …/todos`、`GET …/subagents`、`GET /api/models`、`GET …/models-info` 已等价（`packages/tree_core/tool/verify_agent_equivalence.dart` 十条逐字节通过）；tools-running 也已搬（`GET /api/tools/running` 空快照 + `POST …/{handle}/close` 失效句柄 404；登记表随工具编排接线填充）——**A2 只读面全部完成** |
-| A3 写路径与生成 | 消息发送、取消、LLM 调用、工具编排、提问、reset/compact | **进行中（2026-10-25）**：领域代码已整体平移（store / settings / LLM / team / spec / 工具契约 / conversation / subagent / compaction），`LlmAgentEngine` 为运行时默认引擎；C-08 两条端点、模型/会话/提问/规范写路由与 `tools-running` 已接；**工具执行已下沉到 local_executor 插件**（L-24：tree.agent 登记 workspace 租约，`fs.*` / `terminal.exec` 带 `workspace_id` 下发；核心注入 root 后直送插件，不解析 agent/team/mode、不碰文件/不起进程；`StationToolRunner` 仍负责 read/write/list/grep/terminal）；团队写路由（成员模型分配/直发消息/活动日志）、手动压缩与 Spec 列表/详情也已接。插件测试 320 条、`--selftest` 122 项；另注册**工具贡献收集站**（`plugin.tree.agent.collect.tools`，shared），其它插件订阅后可按 schema 贡献工具，执行经 `plugin.toolCall` 转回贡献方（领域身份放 `arguments.scope`，核心只做不透明转发，不解析 agent/team/mode/session）。剩余：其余内置工具、reset/SSH 重连、A4 帧迁移与 A5 交接 |
+| A3 写路径与生成 | 消息发送、取消、LLM 调用、工具编排、提问、reset/compact | **进行中（2026-10-25）**：领域代码已整体平移（store / settings / LLM / team / spec / 工具契约 / conversation / subagent / compaction），`LlmAgentEngine` 为运行时默认引擎；C-08 两条端点、模型/会话/提问/规范写路由与 `tools-running` 已接；**工具执行已下沉到 local_executor 插件**（L-24：tree.agent 登记 workspace 租约，`file.*` / `exec.command` 带 `lease_id` 下发；核心注入 root 后直送插件，不解析 agent/team/mode、不碰文件/不起进程；`StationToolRunner` 仍负责 read/write/list/grep/terminal）；团队写路由（成员模型分配/直发消息/活动日志）、手动压缩与 Spec 列表/详情也已接。插件测试 320 条、`--selftest` 122 项；另注册**工具贡献收集站**（`plugin.tree.agent.collect.tools`，shared），其它插件订阅后可按 schema 贡献工具，执行经 `plugin.toolCall` 转回贡献方（领域身份放 `arguments.scope`，核心只做不透明转发，不解析 agent/team/mode/session）。剩余：其余内置工具、reset/SSH 重连、A4 帧迁移与 A5 交接 |
 | A4 帧迁移 | 广播站注册，topic 沿用原帧名；UI 订阅切换到新来源 | 双轨比对无差异后关闭核心直发 |
 | A5 交接 | 核心删除 34 条路由 + 2 条上行指令 + `agent/llm/team/tool` 目录 | 核心 `grep` 不到领域模型；§5 全表打勾 |
 
