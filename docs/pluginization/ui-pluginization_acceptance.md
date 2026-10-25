@@ -130,6 +130,19 @@
 > `GET /api/conversations/{id}`、`GET …/sessions`、`GET …/sessions/{id}`、`GET …/todos`、`GET …/subagents`、
 > `GET /api/models`、`GET …/models-info` 已用 `packages/tree_core/tool/verify_agent_equivalence.dart`
 > 做双跑对照（十条均状态码 / Content-Type / body 逐字节一致）。仅剩 tools-running（依赖工具层随迁，A3 再搬）。
+> A3 已开工：存储层（FileTreeStore / records / TreePaths / YAML / 原子写 / 写队列 / 子 agent 注册表 /
+> 容错 UTF-8 解码）已平移到插件包并通过独立自检；领域设置（模型池 / token 速率 / 覆盖 /
+> token_scale 学习）也已平移，模型只读视图改为与生成循环同源；提问回路与待办存储（含读写）
+> 也已平移并通过移植的核心契约测试；LLM 协议层（类型/编解码/SSE 传输）与引擎契约、
+> 脚本引擎也已平移；生成循环的兼容门面（插件侧 CoreSettings）、帧常量/序号兼容层与
+> 提示词小件、用量账本、工具结果门控与团队工作目录口径也已就位（插件测试 123 条）；
+> `workspace_prompt` 与 `compaction_service` 已平移并通过移植的核心测试（插件测试 160 条）；
+> `private_workspace_io` 的 WorkspaceIO 装饰器留到执行站接线后再搬。ConversationService 已平移
+> （脚本引擎可跑，流式序号/分段测试通过；WsHub 用最小帧出口、LLM 专属轮内压缩钩子暂缺）。
+> C-08 两条新端点（发消息/停止）已接，由插件内 `AgentRuntime` 承载；`LlmAgentEngine` 已平移并
+> 切为默认引擎（compaction/usage 接线、轮内压缩钩子恢复），工具执行器暂为 `EmptyToolRunner`。
+> `tools-running` 两条路由已接（登记表随工具编排接线填充），**A2 只读面全部完成**。
+> 下一步：工具编排（`workspace_tool_runner` + 执行站）让真实工具跑起来。
 > 在插件侧等价验收通过前，核心路由与领域帧保持原样（不变量 2/3）。
 
 | ID | 操作 | 期望 |
