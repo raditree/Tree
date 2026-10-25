@@ -392,6 +392,44 @@
 
 ---
 
+### 3.1 G-1 决策（2026-10-25 拍板：等价优先）
+
+> 口径：**G-1 只做等量迁移**。除"没有现状可复刻"的两条新增端点（C-08）外，一律**复刻核心现状**；"更正确"的改法登记为 G 后清理，不与迁移混做（L-27 同口径）。
+
+| ID | 决策 | 理由 / 后续 |
+| --- | --- | --- |
+| C-01 | 插件**逐字复刻** `{"detail":…}` | 前端按该形状解析错误；委派层错误体由核心产出，插件不重复 |
+| C-02 | **复刻现状**：除 `/compact` 外，非法 JSON ⇒ 500 | 不改行为；统一 400 登记 G 后清理项 L-30 |
+| C-03 | **复刻现状**：字段类型不符 ⇒ 500 | 随 C-02，登记 L-30 |
+| C-04 | **保持现有路径**（双 `{memberId}`，leader 段不读取） | 改路径要同时改前端与契约，风险不属于 G；登记 L-31 |
+| C-05 | **复刻无 404**：未知 agent ⇒ 200 + `self:null`；未接线 ⇒ 200 且无 `self` | 空态优于报错，前端已依赖 |
+| C-06 | 只改 `api_paths.dart` 注释（去 `missed`、修正 400/500 口径） | 代码行为不变；注释已随本决策修正 |
+| C-07 | 只改 `api_paths.dart` 注释（compact 已实现；501 仅限未接线） | 同上 |
+| C-08 | **两条新增端点回包定稿**（见 §3.2） | 无现状可复刻，必须先定，否则插件无法开工 |
+| C-09 | **复刻现状**：`POST /api/agents` 不提供建成员参数 | G 只做等量迁移；建成员 REST 入口登记 L-32 |
+| C-10 | **保留** `GET …/specs` 的播种/升级写副作用 | 用户可见的规范文件更新依赖它 |
+| C-11 | **逐字复刻**四个细节（sessions.message_count=0、conversations 无 404、token-rate 空 body 重置、DELETE 无 404） | 前端已按现状工作；修正登记 L-33 |
+| C-12 | **复刻现状**（不拦 `sub_…`） | 语义待产品定；登记 L-34 |
+
+### 3.2 C-08 定稿：两条新增端点的回包
+
+#### `POST /api/agents/{agentId}/messages`
+
+- **请求**：`{content: string（必填，trim 后非空）, session_id?: string, attachments?: array}`。字段与旧 WS `user_message` 帧一致；路径已带 `agentId`，body 里的 `agent_id` **忽略**。
+- **成功 200**：`{success:true, agent_id, session_id, session_created:bool}`。`session_id` 是解析后的会话（请求为空且新建时回新 id）；`session_created` 供 UI 决定是否切会话（替代旧 WS 的 `session_created` 帧）。
+- **失败**：`400 {"detail":"content 不能为空"}`（缺/空）；`404 {"detail":"未知 agent：<id>"}`；其余 `500` 兜底。
+- **语义**：与 `ConversationService.handleUserMessage` 一致——落库 user 消息、打断同会话在途轮次、把回复入队；`sub_…` 收件人走同一条"直接对临时员工说话"路径（`sendToSubagent`）。
+- **不新增反向请求通道**：生成过程仍由插件以广播 topic 推送（不变量 14/30）。
+
+#### `POST /api/agents/{agentId}/cancel`
+
+- **请求**：body 可空；可选 `{session_id?: string}`（只影响状态帧里带的 session）。
+- **成功 200**：`{success:true, agent_id, cascade:bool, cascade_ids:[...], cancelled:[...], idle:[...], any_running:bool}`——即 `_stopAgentTree` 的摘要。`cascade` 在收件人是 `sub_…` 时为 `false`（只停它自己），否则 `true`（团队级联）。
+- **语义**：与 WS `stop` 相同的级联与作废排队；**没有在途任务时仍回 200 + `any_running:false`**——不复刻 WS 的"没有进行中的任务可停止" error 帧（REST 用 200 + 空结果表达同一事实）。
+- **失败**：`404 {"detail":"未知 agent：<id>"}`（REST 侧新增存在性校验）；其余 `500` 兜底。
+
+---
+
 ## 4. 提取时登记的未决项（U1 ~ U13，原文保留）
 
 ### 4.1 原始提取清单

@@ -234,6 +234,13 @@
 | L-24 | 新建 `local_executor` 插件（本地 `Process.start` + 文件操作 + PTY） | 未开始 | 核心不得持有 PTY / 文件逻辑；`files/file_service.dart`、`terminal/terminal_service.dart` 必须搬出（[§4.6](agent_pluginization.md#46-执行与文件全部下沉能力插件核心零-pty--零文件操作)） | 与 `ssh_executor` 对齐；A1 前置 |
 | L-25 | 执行器执行站契约（`exec.command` / `file.*` / `terminal.*`）与 workspace 租约 | 未设计 | 本地/远端需要同一套接口，`tree.agent` 才能无差别调用；执行站由**插件内部定义**，非核心内置 | 定义站点名、参数（`lease_id` + 相对路径 / argv）、错误码与幂等；核心只登记 `lease_id → dir` 并路由 |
 | L-26 | 核心通用流中继原语（PTY 字节流，不含终端语义） | 未实现 | 现有 PTY 走核心 `terminal_service` 与 WS 帧 | 新增 `stream session`（open/input/resize/close + 有序字节帧），核心只转发；UI 经 REST 建流 + 订阅 topic |
+| L-19 | G-1 对照表本身（36 行，含样例） | **已闭环**（`bda9df9`，2026-10-25） | — | 见 [agent_api_contract.md](agent_api_contract.md)：36 条 G-1 + 2 条 spec 附录，含全局约定、逐条样例与 C-01~C-12 契约缺口 |
+| L-28 | 委派白名单 `ApiPaths.delegated` 去静态化 | **已闭环**（`6a30e81`，2026-10-25） | — | 已落地命名空间规则 + 保留前缀 + 与核心已实现路由同键拒收 + 归属表冲突检测；门禁改为「`coreOwned ⊆ 核心 router 键集 ⊆ coreOwned ∪ pendingHandoffRoutes`」。证据：`ui-pluginization.md` §4.5、`http_router.dart`、`server_test.dart`、`delegated_rest_test.dart` |
+| L-30 | 非法 JSON / 字段类型错误统一回 400（G-1 C-02/C-03） | 未开始 | G-1 决策为"复刻现状 500"，不与迁移混做 | G 完成后统一 400，并同批更新前端断言与文档 |
+| L-31 | `teammateLog` 路径占位符改 `{leaderId}`（G-1 C-04） | 未开始 | 现模板两个 `{memberId}`，leader 段不读取；改路径要动前端 | G 完成后核心 + 前端 + 插件同批改，附契约测试 |
+| L-32 | 建成员 REST 入口（G-1 C-09） | 未开始 | 现 `POST /api/agents` 只能建 TOP | 产品决策后补入口；G 只做等量迁移 |
+| L-33 | G-1 C-11 四个细节修正（sessions.message_count / conversations 404 / token-rate 空 body / DELETE 404） | 未开始 | G-1 逐字复刻现状 | G 完成后单独评审，逐条带回归用例 |
+| L-34 | `sub_…` id 在 agent 端点的语义（G-1 C-12） | 未开始 | 现会落到 SubagentStore 分支 | 明确"只接受真 agent id"并加 404，或正式定义该语义 |
 
 ### B. 手工回归项
 
@@ -248,9 +255,7 @@
 | --- | --- | --- | --- |
 | L-17 | `agent_pluginization.md` §1.2/§5/§6 路由数改 36 条 | **已改**（2026-10-25） | §1.2 已按 34+2 重写；ui-pluginization §4.2/§4.5 同步为 93 条契约 |
 | L-18 | 插件开发文档「UI 视图受限控件集」与实际实现对齐 | 待复核 | 历史记录为不一致，需对照当前代码确认 |
-| L-19 | G-1 对照表本身（36 行，含样例） | **已闭环**（2026-10-25） | — | 见 [agent_api_contract.md](agent_api_contract.md)：36 条 G-1 + 2 条 spec 附录，含全局约定、逐条样例与 C-01~C-12 契约缺口 |
-| L-27 | 是否裁剪功能面（token-rate / tools-running / session specs 等） | 未决 | G 只做等量迁移，不做减法；裁剪需要产品决策 | G 完成后按真实使用数据单独评审，不与迁移混做 |
-| L-28 | 委派白名单 `ApiPaths.delegated` 去静态化 | **已闭环**（`6a30e81`，2026-10-25） | — | 已落地命名空间规则 + 保留前缀 + 与核心已实现路由同键拒收 + 归属表冲突检测；门禁改为「`coreOwned ⊆ 核心 router 键集 ⊆ coreOwned ∪ pendingHandoffRoutes`」。证据：`ui-pluginization.md` §4.5、`http_router.dart`、`server_test.dart`、`delegated_rest_test.dart` |
+| L-27 | 是否裁剪功能面（token-rate / tools-running / session specs 等） | 未决 | G 只做等量迁移，不做减法；裁剪需要产品决策；G 完成后按真实使用数据单独评审，不与迁移混做 |
 
 ### D. 已拍板（避免重复问）
 

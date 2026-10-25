@@ -51,7 +51,7 @@ abstract final class ApiPaths {
   /// 一键重置该 agent 工作空间里的系统提示词 / Spec（备份 .bak.N 后还原默认）。
   static const String agentReset = '/api/agents/{agentId}/reset';
 
-  /// 手动压缩上下文（前端「压缩」按钮）。核心尚未实现：显式 501，不静默 404。
+  /// 手动压缩上下文（前端「压缩」按钮；已实现）。压缩服务未接线时显式 501，不静默 404。
   static const String agentCompact = '/api/agents/{agentId}/compact';
 
   /// 重建该 agent 的**远端链路**（POST，无 body）：SSH 心跳判失活之后的手动恢复入口。
@@ -59,10 +59,10 @@ abstract final class ApiPaths {
   /// 为什么需要它：判失活只**标记**链路已死（不关连接、不静默挂起），而一条已经断掉的
   /// TCP 连接不会自己活回来——传输层会按退避自动重连，但如果自动重连已用尽 / 用户不想等，
   /// 就要有一个**显式**入口。语义：
-  /// - 200 = 已重建（响应 `{ok, agent_id, stale, missed}`，`stale` 复位为 false）；
-  /// - 400 = 该 agent 不是 SSH 工作空间（本地后端没有可重连的链路）或 SSH 配置不完整；
+  /// - 200 = 已重建（响应 `{ok, agent_id, stale}`，`stale` 复位为 false；**没有 `missed` 键**）；
+  /// - 400 = 该 agent 不是 SSH 工作空间（本地后端没有可重连的链路）；
   /// - 404 = 没有这个 agent；
-  /// - 500 = 这次重连失败，`error.detail` 是**可读原因**（例如认证失败 / 主机不可达）。
+  /// - 500 = 这次重连失败 / SSH 配置不完整，`detail` 是**可读原因**（例如认证失败 / 主机不可达）。
   ///
   /// 判据不变：**重连不是新的判活依据**——判死仍然只认"连续 N 拍心跳丢失"（M9 规约 1.1），
   /// 重连是判死**之后**的动作，不引入任何静态时长上限。
@@ -278,14 +278,22 @@ abstract final class ApiPaths {
 
   /// 发送一条用户消息（POST，body 与旧 WS 上行 `send_message` 同形）。
   ///
-  /// 旧通道是 WS 上行帧 `send_message`；批次 G 改成**委派端点**，由
-  /// `tree.agent` 经 `system.collect.api.routes` 申报，核心**不实现**
-  /// （见 `docs/pluginization/agent_pluginization.md` §1.3）。
+  /// 旧通道是 WS 上行帧 `user_message`（设计文档曾叫 `send_message`）；批次 G
+  /// 改成**委派端点**，由 `tree.agent` 经 `system.collect.api.routes` 申报，核心
+  /// **不实现**（见 `docs/pluginization/agent_pluginization.md` §1.3）。
+  ///
+  /// 回包定稿（G-1 C-08，见 `docs/pluginization/agent_api_contract.md` §3.2）：
+  /// `200 {success:true, agent_id, session_id, session_created}`；缺 content ⇒ 400；
+  /// 未知 agent ⇒ 404。
   static const String agentMessages = '/api/agents/{agentId}/messages';
 
   /// 取消当前生成（POST，body 无）。
   ///
-  /// 旧通道是 WS 上行帧 `cancel`；同上改委派，核心不实现。
+  /// 旧通道是 WS 上行帧 `stop`（设计文档曾叫 `cancel`）；同上改委派，核心不实现。
+  ///
+  /// 回包定稿（G-1 C-08）：`200 {success:true, agent_id, cascade, cascade_ids,
+  /// cancelled, idle, any_running}`——即 `_stopAgentTree` 的摘要；`sub_…` 收件人
+  /// `cascade=false`，其余 `cascade=true`；未知 agent ⇒ 404。
   static const String agentCancel = '/api/agents/{agentId}/cancel';
 
   // ── 日志 / 存储（插件化新增，核心永久面）──────────────────────────────
