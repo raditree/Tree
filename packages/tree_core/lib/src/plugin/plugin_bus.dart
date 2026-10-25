@@ -2603,28 +2603,67 @@ class PluginBus {
       case 'plugin.stateFetch':
         return _pluginStateFetch(pluginId, args);
       case 'plugin.mount': {
+        // 授权：只允许接管**数据面**执行站（fs / terminal.exec），控制面
+        // （plugin.* / station.* / tool.* / agent.*）一律不可挂载，避免插件
+        // 劫持核心仍在用的命令或递归挂载。
+        const Map<String, Set<String>> mountable =
+            <String, Set<String>>{
+              'system.execute.fs': <String>{
+                'fs.read',
+                'fs.write',
+                'fs.list',
+                'fs.grep',
+              },
+              'system.execute.terminal': <String>{'terminal.exec'},
+            };
         final String stationId = (args['station_id'] ?? '').toString().trim();
+        final Set<String>? allowed = mountable[stationId];
         final ExecuteStation? station = stations.executePointFor(stationId);
-        if (station == null) {
+        if (allowed == null || station == null) {
           return <String, dynamic>{
             'ok': false,
-            'error': '执行站点位不存在：$stationId（可用 system.execute.fs / system.execute.terminal）',
+            'error':
+                '点位 $stationId 不允许插件接管（可接管：system.execute.fs / '
+                'system.execute.terminal，且仅数据面命令）',
           };
         }
         final Object? rawCommands = args['commands'];
-        final List<String> commands = rawCommands is List
-            ? <String>[
-                for (final Object? item in rawCommands)
-                  if (item != null && item.toString().trim().isNotEmpty)
-                    item.toString().trim(),
-              ]
-            : List<String>.of(station.commands);
+        if (rawCommands is! List || rawCommands.isEmpty) {
+          return <String, dynamic>{
+            'ok': false,
+            'error': 'plugin.mount 需要显式 commands 列表（不默认全量接管）',
+          };
+        }
+        final List<String> commands = <String>[
+          for (final Object? item in rawCommands)
+            if (item != null && item.toString().trim().isNotEmpty)
+              item.toString().trim(),
+        ];
+        if (commands.isEmpty) {
+          return <String, dynamic>{
+            'ok': false,
+            'error': 'plugin.mount 的 commands 不能为空',
+          };
+        }
         final List<String> mounted = <String>[];
         final List<String> errors = <String>[];
         final String mountId = 'plugin.$pluginId';
         for (final String command in commands) {
-          if (!station.commands.contains(command)) {
-            errors.add('命令 $command 不属于点位 $stationId');
+          if (!station.commands.contains(command) ||
+              !allowed.contains(command)) {
+            errors.add('命令 $command 不在该点位允许插件接管的范围内');
+            continue;
+          }
+          final List<StationCommandMount> others = station
+              .mounts(command: command)
+              .where(
+                (StationCommandMount mount) =>
+                    mount.mountId != mountId &&
+                    mount.mountId.startsWith('plugin.'),
+              )
+              .toList();
+          if (others.isNotEmpty) {
+            errors.add('命令 $command 已被插件 ${others.first.mountId} 接管');
             continue;
           }
           final String? error = station.mount(
@@ -5341,6 +5380,10 @@ class PluginBus {
     return a == b;
   }
 
+  /// 租约键：插件命名空间 + 插件给的名字（跨插件同名不冲突）。
+  static String _workspaceKey(String pluginId, String leaseId) =>
+      '$pluginId#$leaseId';
+
   /// 插件登记工作空间根目录（通知）。只做路径校验与归属记录，不解读语义。
   void _handleWorkspaceRegister(
     String pluginId,
@@ -5362,7 +5405,14 @@ class PluginBus {
       log?.call('插件 $pluginId 登记的工作空间不存在（$normalized），已忽略');
       return;
     }
-    _workspaces[id] = (root: normalized, pluginId: pluginId);
+    // 租约键按插件命名空间隔离：同名 lease_id 不属于别的插件，也不可能被抢。
+    final String key = _workspaceKey(pluginId, id);
+    final ({String root, String pluginId})? existing = _workspaces[key];
+    if (existing != null && existing.pluginId != pluginId) {
+      log?.call('插件 $pluginId 不能改写别人的工作空间租约 $id');
+      return;
+    }
+    _workspaces[key] = (root: normalized, pluginId: pluginId);
     log?.call('插件 $pluginId 登记工作空间 $id → $normalized');
   }
 
@@ -6316,6 +6366,42 @@ class PluginBus {
       params,
       arguments,
     );
+    // 工作空间租约（L-24）：带 lease_id 的命令由**插件执行器**在自己登记的
+    // 根目录里执行；核心只注入 root、把命令直送插件，不解析 agent/team/mode、
+    // 不碰文件、不起进程。租约只对登记方开放（跨插件 fail-closed）。
+    final String leaseId =
+        (arguments['lease_id'] ?? arguments['workspace_id'] ?? '')
+            .toString()
+            .trim();
+    String leaseRoot = '';
+    if (leaseId.isNotEmpty) {
+      final ({String root, String pluginId})? lease =
+          _workspaces[_workspaceKey(config.id, leaseId)];
+      if (lease == null) {
+        return <String, dynamic>{
+          'command': command,
+          'ok': false,
+          'mount_id': '',
+          'payload': null,
+          'error':
+              '工作空间租约 $leaseId 未登记（先发 workspace/register，'
+              '再下带 lease_id 的命令）',
+        };
+      }
+      if (lease.pluginId != config.id) {
+        return <String, dynamic>{
+          'command': command,
+          'ok': false,
+          'mount_id': '',
+          'payload': null,
+          'error':
+              '工作空间租约 $leaseId 属于插件 ${lease.pluginId}，'
+              '不能跨插件使用（fail-closed）',
+        };
+      }
+      leaseRoot = lease.root;
+      arguments['root'] = leaseRoot;
+    }
     // 点位化：执行站按**命令族**拆成多个点位，命令 → 所属点位在这里路由
     // （插件侧零改动：仍然只带 command）。
     if (StationPoints.ownerOfCommand(command) == null) {
@@ -6337,6 +6423,22 @@ class PluginBus {
         '插件 ${config.id} 的 scope（${scope.describe()}）没有可用的执行站'
         '（站点未接线：核心未启动站点中枢）',
       );
+    }
+    // 租约命令跳过内置挂载的 _resolveTarget：直接交给插件执行器。
+    if (leaseRoot.isNotEmpty) {
+      final StationCommandResult leased = await station.execute(
+        command: command,
+        scope: scope,
+        arguments: arguments,
+        sourcePluginId: config.id,
+      );
+      return <String, dynamic>{
+        'command': leased.command,
+        'ok': leased.ok,
+        'mount_id': leased.mountId,
+        'payload': leased.payload,
+        'error': leased.error,
+      };
     }
     final StationCommandResult result = await station.execute(
       command: command,
@@ -7040,8 +7142,24 @@ class PluginBus {
     );
   }
 
+  /// 撤掉某插件的执行站挂载与工作空间租约（下线 / 停用 / 卸载共用）。
+  void _releasePluginExecutors(String pluginId) {
+    for (final StationInstance station in stations.stationList()) {
+      if (station is ExecuteStation) {
+        station.unmount('plugin.$pluginId');
+      }
+    }
+    _workspaces.removeWhere(
+      (String _, ({String root, String pluginId}) lease) =>
+          lease.pluginId == pluginId,
+    );
+  }
+
   Future<void> _disconnect(String pluginId, {bool awaitExit = false}) async {
     final PluginHost? host = _hosts.remove(pluginId);
+    // 执行器插件下线 / 卸载 ⇒ 撤掉它挂到执行站的命令与它登记的工作空间租约。
+    // 否则 100 优先级的挂载会永久压住核心实现，卸载即坏。
+    _releasePluginExecutors(pluginId);
     // 片 D：UI 宿主与 stdio 宿主是两张表。断开时两边都收：哪怕配置刚改成 ui
     // （或反过来），也不会留下一个没人管的进程。
     final UiHost? uiHost = _uiHosts.remove(pluginId);

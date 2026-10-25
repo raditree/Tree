@@ -505,7 +505,7 @@ class ExecuteStationMounts {
     }
   }
 
-  /// `plugin.*` 族的归属闸门与分派（插件热重启控制面）。
+  /// `plugin.*` 族的归属闸门与分派（插件热重启控制面 + 执行器挂载/工具转发）。
   ///
   /// 两条不同的归属口径，刻意不合并成一条（合并就会一边假严、一边真松）：
   /// - `plugin.stateDump` / `plugin.stateFetch`：**发起者必须是插件**，且只能对
