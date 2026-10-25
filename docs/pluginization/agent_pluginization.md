@@ -225,6 +225,11 @@ UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行�
 
 ### 4.6.1 L-24 落地记录（2026-10-25）
 
+- **依赖关系**：tree.agent 声明 `requires.plugins: local_executor >=0.4.0`（非可选）。
+  执行器缺失时核心拒绝启动 tree.agent；卸载执行器需确认，确认后停用 tree.agent，
+  **不回落**到核心内置执行器。
+
+
 - 新增插件 `plugins/local_executor`（0.1.0）：自检覆盖 fs.read / fs.write / fs.list /
   fs.grep / terminal.exec 与越界路径拒绝；
 - 核心新增命令 `plugin.mount`：插件只能把执行站点位的命令挂到**自己**（`plugin_id`
