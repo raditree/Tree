@@ -27,6 +27,8 @@ import 'package:tree_core/tree_core.dart';
 const List<String> kImplementedRoutes = <String>[
   'GET /api/agents/{agentId}/todos',
   'GET /api/agents/{agentId}/subagents',
+  'GET /api/models',
+  'GET /api/agents/{agentId}/models-info',
 ];
 
 Future<void> main(List<String> args) async {
@@ -141,6 +143,7 @@ Future<String?> _runCase(String route, String exe) async {
   );
   final TreePaths paths = TreePaths(temp.path);
   final FileTreeStore store = FileTreeStore(paths);
+  final CoreSettings settings = CoreSettings();
   final _RouteCall call;
   switch (route) {
     case 'GET /api/agents/{agentId}/todos':
@@ -227,6 +230,41 @@ Future<String?> _runCase(String route, String exe) async {
         pathParams: <String, String>{'agentId': 'agt'},
         agentId: 'agt',
       );
+    case 'GET /api/models':
+      _writeModelFixtures(paths);
+      FileSettingsSink(paths).load(settings);
+      call = const _RouteCall(
+        concretePath: '/api/models',
+        query: <String, String>{},
+        pathParams: <String, String>{},
+        agentId: '',
+      );
+    case 'GET /api/agents/{agentId}/models-info':
+      _writeModelFixtures(paths);
+      FileSettingsSink(paths).load(settings);
+      store.putAgent(
+        CoreAgent(
+          id: 'agt',
+          name: '等价夹具',
+          createdAt: 1,
+          updatedAt: 1,
+          modelId: 'm1',
+          systemPrompt: '你是夹具',
+          workspaceDir: p.join(temp.path, 'workspace'),
+          reasoningEffort: 'high',
+          maxSeqlenOverride: 32000,
+          maxOutputTokens: 8192,
+          compressThreshold: 0.8,
+          thinkingOverride: true,
+        ),
+      );
+      await store.flush();
+      call = const _RouteCall(
+        concretePath: '/api/agents/agt/models-info',
+        query: <String, String>{},
+        pathParams: <String, String>{'agentId': 'agt'},
+        agentId: 'agt',
+      );
     default:
       return '没有为这条路由配置等价种子（加一个 case 再跑）';
   }
@@ -236,6 +274,7 @@ Future<String?> _runCase(String route, String exe) async {
     enableHeartbeat: false,
     streamChunkDelay: Duration.zero,
     store: store,
+    settings: settings,
     todoStore: FileTodoStore(paths),
   );
   Process? process;
@@ -365,6 +404,29 @@ Future<_PluginReply> _pluginDelegate(
     status: (result['status'] as num?)?.toInt() ?? -1,
     contentType: '${(result['headers'] as Map?)?['content-type'] ?? ''}',
     body: '${result['body'] ?? ''}',
+  );
+}
+
+/// 模型池夹具：与 selftest 同一份内容（脱敏 / 默认档位 / token_scale / 排序）。
+void _writeModelFixtures(TreePaths paths) {
+  final Directory dir = Directory(paths.modelsDir)..createSync(recursive: true);
+  File(p.join(dir.path, 'm1.yaml')).writeAsStringSync(
+    'model_id: m1\n'
+    'name: 模型一\n'
+    'base_url: https://api.example.com/v1\n'
+    'api_key: sk-secret\n'
+    'thinking: true\n'
+    'if_vision: false\n'
+    'reasoning_effort: high\n'
+    'reasoning_effort_options: [low, high]\n'
+    'max_seqlen: 64000\n'
+    'max_output_tokens: 8192\n'
+    'token_scale: 2.5\n'
+    'longest_session_tokens: 12000\n',
+  );
+  File(p.join(dir.path, 'm2.yaml')).writeAsStringSync(
+    'model_id: m2\n'
+    'base_url: http://127.0.0.1:8080/\n',
   );
 }
 
