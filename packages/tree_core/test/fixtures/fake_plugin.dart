@@ -83,6 +83,8 @@ void main(List<String> args) {
   // 用于订 `ssh.execute` 这类需要显式点位的中转点（`station: 'relay'` 留空只订工具前/后）。
   String relayPoint = '';
   String uiTeam = '';
+  // 启动时往 stderr 写一行：验证核心把插件 stderr 落进插件日志文件。
+  String stderrLine = '';
   for (int i = 0; i < args.length - 1; i++) {
     if (args[i] == '--events-file') eventsFile = args[i + 1];
     if (args[i] == '--ignore-ping-until') pingGateFile = args[i + 1];
@@ -109,9 +111,11 @@ void main(List<String> args) {
       apiResultSize = int.tryParse(args[i + 1]) ?? 32;
     }
     if (args[i] == '--api-result-path') apiResultPath = args[i + 1];
+    if (args[i] == '--stderr-line') stderrLine = args[i + 1];
   }
   // SSH 执行接管者默认显式订 `ssh.execute`（留空 relay 只订工具前/后）。
   if (sshExecuteFamily && relayPoint.isEmpty) relayPoint = 'ssh.execute';
+  if (stderrLine.isNotEmpty) stderr.writeln(stderrLine);
 
   /// 插件**主动**发起的请求：id → 等待核心响应的 completer。
   final Map<Object?, Completer<Map<String, dynamic>>> pendingRequests =

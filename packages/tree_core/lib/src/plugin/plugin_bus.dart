@@ -188,6 +188,22 @@ class PluginBus {
 
   final void Function(String message)? log;
 
+  /// 插件运行日志的落盘出口（核心接线时注入；null = 不落盘）。
+  ///
+  /// 三路写入共用它：插件 stderr（`stderr`）、`log` 通知（`notify:<level>`）。
+  /// 日志 API（`/api/logs/plugin:<id>`）读的是同一份文件。
+  ///
+  /// **必须在拉起插件之前接线**（生产：CoreServer 构造时绑定，`plugins.start()`
+  /// 在其后）；晚绑定期间的行只留在 stderr 与内存里，不做历史回放。
+  void Function(String pluginId, String line, String channel)? pluginLog;
+
+  /// 把落盘出口接上（幂等；核心启动时调用）。
+  void bindPluginLog(
+    void Function(String pluginId, String line, String channel) sink,
+  ) {
+    pluginLog = sink;
+  }
+
   /// **建连窗口**（只覆盖 hello 握手与首次 tools/list；不是任务总时长上限）。
   final Duration connectTimeout;
 
@@ -1002,7 +1018,14 @@ class PluginBus {
     if (factory != null) {
       return factory(config, coreUrl: coreUrl, coreToken: coreToken);
     }
-    return UiHost.start(config, coreUrl: coreUrl, coreToken: coreToken);
+    return UiHost.start(
+      config,
+      coreUrl: coreUrl,
+      coreToken: coreToken,
+      // UI 插件的进程输出同样进日志 API（stdout 是开发期诊断，stderr 是错误）。
+      onStdoutLine: (String line) => pluginLog?.call(config.id, line, 'stdout'),
+      onStderrLine: (String line) => pluginLog?.call(config.id, line, 'stderr'),
+    );
   }
 
   /// 开启 `ui.hello` 连接窗口。
@@ -1145,6 +1168,19 @@ class PluginBus {
     final Map<String, dynamic> params = rawParams is Map
         ? rawParams.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
         : <String, dynamic>{};
+    if (method == PluginRpcMethods.log) {
+      // `log` 通知先落盘再照常广播：日志 API 读文件，前端读 plugin_event，
+      // 两条出口互不替代（片 F：插件不各自造日志接口）。
+      final String level = (params['level'] ?? 'info').toString().trim();
+      final String message = (params['message'] ?? '').toString();
+      if (message.trim().isNotEmpty) {
+        pluginLog?.call(
+          pluginId,
+          message,
+          'notify:${level.isEmpty ? 'info' : level}',
+        );
+      }
+    }
     if (method == PluginRpcMethods.stationStream) {
       // 流式回填的数据面：插件推 delta / done / error（见 [_handleStationStream]）
       _handleStationStream(pluginId, params);
@@ -6825,6 +6861,9 @@ class PluginBus {
       resumeDumpId: resumeDumpId,
       onNotification: (Map<String, dynamic> notification) =>
           _emitPluginEvent(config.id, notification),
+      // stderr 的**落盘**副本：日志 API 的数据源就是这份文件（见 PluginLogSink）。
+      // 回调在 PluginHost 里按行触发，核心内存里的 stderrTail 不受影响。
+      onStderrLine: (String line) => pluginLog?.call(config.id, line, 'stderr'),
       // 插件主动请求（station/command）的处理器：建连时即接线，
       // 因此插件在 hello 握手期间就能下命令（不会撞上"未接线 ⇒ -32601"的窗口）。
       onPluginRequest: (String method, Map<String, dynamic> params) =>

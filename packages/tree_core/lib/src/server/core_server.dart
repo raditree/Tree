@@ -53,6 +53,7 @@ import '../tool/tool_runner.dart';
 import '../tool/workspace_tool_runner.dart';
 import '../util/core_log_sink.dart';
 import '../util/ids.dart';
+import '../util/plugin_log_sink.dart';
 import '../util/liveness.dart';
 import '../util/token.dart';
 import '../version.dart';
@@ -140,6 +141,16 @@ class CoreServer {
           const <String>[],
     );
     pluginStore = PluginStore(paths: apiPaths);
+    // 插件运行日志的落盘出口（日志 API 的数据源；片 F 此前只读不写）。
+    // 绑定发生在插件被拉起之前（生产：CLI 先 CoreServer.start 再 plugins.start）。
+    pluginLogSink = PluginLogSink(
+      apiPaths,
+      failureLog: (String message) => errorLog?.call(message),
+    );
+    pluginBus?.bindPluginLog(
+      (String pluginId, String line, String channel) =>
+          pluginLogSink.write(pluginId, line, channel: channel),
+    );
     // 集成终端会话（Ctrl+J）：它要按 agent 解析工作区根，所以只在接了文件服务时可用；
     // 伪终端实现默认用平台实现（ConPTY / script），测试可注入假的。
     terminalService = fileService == null
@@ -206,6 +217,12 @@ class CoreServer {
 
   /// 插件命名空间存储（片 F；`/api/store/{ns}/{key}` 的落盘实现）。
   late final PluginStore pluginStore;
+
+  /// 插件运行日志的落盘出口（`<数据根>/logs/plugins/<id>.log`）。
+  ///
+  /// 写入者是插件总线的两路回调（stderr / `log` 通知），读取者是
+  /// `LogSourceRegistry`（`/api/logs/plugin:<id>`）。两者同一个文件。
+  late final PluginLogSink pluginLogSink;
 
   /// 存储（默认内存实现；CLI 注入 `FileTreeStore` 落 `~/.tree`）。
   final TreeStore store;
@@ -724,6 +741,8 @@ class CoreServer {
     await terminalService?.closeAll();
     await _stationMounts?.close();
     await pluginBus?.close();
+    // 插件进程已停 ⇒ 不会再产生 stderr；把在途日志行落完再关监听。
+    await pluginLogSink.close();
     // 总结器可能持有自己的 HTTP 连接池（与引擎的池分开）：随服务一起释放
     await compaction?.dispose();
     // 执行站 `llm.call` 的调用器同样自带连接池（与引擎的池分开）

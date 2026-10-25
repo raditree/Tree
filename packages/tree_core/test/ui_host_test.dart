@@ -80,6 +80,30 @@ void main() {
     expect(host.exitCode, isNull);
   });
 
+  test('输出回调逐行触发：stdout / stderr 各走自己的回调（日志落盘接线用）', () async {
+    final List<String> stdoutLines = <String>[];
+    final List<String> stderrLines = <String>[];
+    final UiHost host = await UiHost.start(
+      configFor(),
+      coreUrl: 'ws://127.0.0.1:12345',
+      coreToken: 'secret-token',
+      onStdoutLine: stdoutLines.add,
+      onStderrLine: stderrLines.add,
+    );
+    hosts.add(host);
+    await waitUntil(
+      () => stdoutLines.any((String l) => l.contains('PROBE_ENV=marker-1')),
+      reason: 'stdout 回调应逐行收到',
+    );
+    await waitUntil(
+      () => stderrLines.any((String l) => l.contains('PROBE_STDERR_MARKER')),
+      reason: 'stderr 回调应逐行收到',
+    );
+    // 回调是**副本**：环形缓冲的行为不变。
+    expect(host.stdoutTail, contains('PROBE_ENV=marker-1'));
+    expect(host.stderrTail, contains('PROBE_STDERR_MARKER'));
+  });
+
   test('stop：核心发起停止 ⇒ stopRequested=true，进程真的退出', () async {
     final UiHost host = await startHost();
     await waitUntil(() => host.pid > 0);

@@ -214,6 +214,15 @@
 | `GET /api/logs/{source}?tail=N&since=` | 读尾部，NDJSON 行                  |
 | `DELETE /api/logs/{source}`            | 清空/轮转                         |
 
+**写入侧（核心，2026-10-25 补齐）**：插件日志文件此前只被测试手工种植、没有任何生产者，`/api/logs/plugin:<id>` 读不到插件自己写的东西。现在由核心的 `PluginLogSink` 统一落盘：
+
+| 来源 | 行样式 | 触发 |
+| --- | --- | --- |
+| 插件 stderr | `<本地时间戳> plugin=<id> [stderr] <原始行>` | `PluginHost` 收到 stderr 的每一行 |
+| 插件 `log` 通知 | `<本地时间戳> plugin=<id> [notify:<level>] <message>` | 插件 → 核心的 `log` 通知（仍照常广播成 `plugin_event`） |
+
+口径：每个插件一份文件、write-behind 队列串行、8 MiB × 5 份轮转、失败只报一次并降级；非法插件 id 直接跳过（日志出口不能成为路径注入面）。**插件不得自建日志文件**——日志 API 是唯一出口。
+
 **数据存储 API（4，新增）** — 插件持久化的唯一公共出口，避免每个插件自带一套落盘格式。
 
 | 端点                             | 说明                    |

@@ -16,13 +16,22 @@ import 'plugin_host.dart' show PluginConfig, PluginException;
 /// 判活：UI 插件没有 stdio 心跳，判据就是**进程是否退出**；连接窗口内的
 /// `ui.hello` 由 `PluginBus` 另记（窗口内没连上只降级，不杀进程）。
 class UiHost {
-  UiHost._(this.config, this._process, this.coreUrl) {
+  UiHost._(
+    this.config,
+    this._process,
+    this.coreUrl, {
+    void Function(String line)? onStdoutLine,
+    void Function(String line)? onStderrLine,
+  }) {
     // 纯 UTF-8、坏字节只顶替不中断（与 PluginHost 的 stdout 口径一致）。
     _process.stdout
         .transform(const Utf8Decoder(allowMalformed: true))
         .transform(const LineSplitter())
         .listen(
-          (String line) => _stdout.add(line),
+          (String line) {
+            _stdout.add(line);
+            onStdoutLine?.call(line);
+          },
           onError: (Object _) {},
           onDone: () {},
         );
@@ -30,7 +39,10 @@ class UiHost {
         .transform(const Utf8Decoder(allowMalformed: true))
         .transform(const LineSplitter())
         .listen(
-          (String line) => _stderr.add(line),
+          (String line) {
+            _stderr.add(line);
+            onStderrLine?.call(line);
+          },
           onError: (Object _) {},
           onDone: () {},
         );
@@ -48,6 +60,8 @@ class UiHost {
     PluginConfig config, {
     required String coreUrl,
     required String coreToken,
+    void Function(String line)? onStdoutLine,
+    void Function(String line)? onStderrLine,
   }) async {
     if (config.command.trim().isEmpty) {
       throw PluginException('插件 ${config.id} 未配置 command');
@@ -73,7 +87,13 @@ class UiHost {
     } catch (error) {
       throw PluginException('启动 UI 插件 ${config.id} 失败：$error');
     }
-    return UiHost._(config, process, coreUrl);
+    return UiHost._(
+      config,
+      process,
+      coreUrl,
+      onStdoutLine: onStdoutLine,
+      onStderrLine: onStderrLine,
+    );
   }
 
   final PluginConfig config;

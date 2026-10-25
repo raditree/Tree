@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import '../store/atomic_file.dart';
 import '../store/tree_paths.dart';
 import '../store/write_queue.dart';
+import 'log_timestamp.dart';
 
 /// 核心进程的**日志出口**：同一个出口**同时**写 stderr 与 `<数据根>/logs/core.log`。
 ///
@@ -105,37 +106,9 @@ class CoreLogSink {
     // 时间戳**在调用当下取**：入队是 write-behind，等到队列里（甚至等到真正落盘）
     // 再取就与"这件事发生的时刻"漂移了——磁盘慢、前面积压时尤其明显，
     // 而"用户截图那一刻核心在干什么"恰恰是这行时间戳要回答的问题。
-    final String stamp = _timestamp(_clock());
+    final String stamp = logLineTimestamp(_clock());
     // 文件行带时间戳与 pid：同一数据根可能同时有"App 的核心"与"开发期自起的核心"在写。
     _queue.enqueue(logFile, () => _append('$stamp pid=$_pid $line'));
-  }
-
-  /// 落盘行的**行首时间戳**：`<本地时间 ISO8601（毫秒 3 位）><显式时区偏移>`，
-  /// 例如 `2026-10-05T07:24:31.123+08:00`；本机为 UTC 时是 `+00:00`（不写 `Z`）。
-  ///
-  /// 为什么自己拼而不直接用 `DateTime.toIso8601String()`：
-  /// 1. 本地时间的 `toIso8601String()` **不带偏移**（`2026-10-05T07:24:31.123`）——
-  ///    这份日志会被拷到别的机器/别的时区去看，没有偏移就无法换算回真实时刻；
-  /// 2. 带微秒时它输出 **6 位**小数，与"毫秒 3 位"的固定口径不符。
-  static String _timestamp(DateTime at) {
-    final DateTime local = at.toLocal();
-    final Duration offset = local.timeZoneOffset;
-    final int offsetMinutes = offset.inMinutes.abs();
-    final String sign = offset.isNegative ? '-' : '+';
-    final String date =
-        '${local.year.toString().padLeft(4, '0')}'
-        '-${local.month.toString().padLeft(2, '0')}'
-        '-${local.day.toString().padLeft(2, '0')}';
-    final String time =
-        '${local.hour.toString().padLeft(2, '0')}'
-        ':${local.minute.toString().padLeft(2, '0')}'
-        ':${local.second.toString().padLeft(2, '0')}'
-        '.${local.millisecond.toString().padLeft(3, '0')}';
-    final String zone =
-        '$sign'
-        '${(offsetMinutes ~/ 60).toString().padLeft(2, '0')}'
-        ':${(offsetMinutes % 60).toString().padLeft(2, '0')}';
-    return '$date' 'T' '$time$zone';
   }
 
   /// 取一个**固定前缀**的日志函数：`forPrefix('core:compact')` 等价于原来的

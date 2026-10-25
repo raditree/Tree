@@ -63,6 +63,7 @@ class PluginHost {
       Map<String, dynamic> params,
     )?
     onPluginRequest,
+    void Function(String line)? onStderrLine,
   }) async {
     if (config.command.trim().isEmpty) {
       throw PluginException('插件 ${config.id} 未配置 command');
@@ -79,10 +80,19 @@ class PluginHost {
       throw PluginException('启动插件 ${config.id} 失败：$error');
     }
     final StringBuffer stderr = StringBuffer();
-    // 同 MCP：协议是 UTF-8，但坏字节只顶替（U+FFFD）不中断通道
+    // 同 MCP：协议是 UTF-8，但坏字节只顶替（U+FFFD）不中断通道。
+    // 按**行**收口：内存尾巴与落盘日志（`PluginLogSink`）用同一条行边界，
+    // 否则"用户看到的日志"与"核心内存里的 stderrTail"会是两种切法。
     process.stderr
         .transform(const Utf8Decoder(allowMalformed: true))
-        .listen(stderr.write, onError: (Object _) {});
+        .transform(const LineSplitter())
+        .listen(
+          (String line) {
+            stderr.writeln(line);
+            onStderrLine?.call(line);
+          },
+          onError: (Object _) {},
+        );
     final PluginHost host =
         PluginHost._(config, process, stderr, heartbeatInterval)
           .._onNotification = onNotification
