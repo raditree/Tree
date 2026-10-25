@@ -102,7 +102,7 @@ class DelegatedRouteDeclaration {
   /// HTTP 方法（已归一为大写）。
   final String method;
 
-  /// 路径模式（必须与 [ApiPaths.delegated] 中的一条完全一致）。
+  /// 路径模式（必须满足 [ApiPaths.delegationPatternError] 的命名空间规则）。
   final String pattern;
 
   /// 归属插件 id。
@@ -153,14 +153,23 @@ class DelegatedRouteMatch {
 /// - 同一 `method + pattern` 被两家以上插件申报 ⇒ **整条拒收**（不按启动顺序择一），
 ///   冲突键不出现在匹配与 `/api/meta` 里，[notes] 里留可读原因；
 /// - 插件重新申报时按 `plugin_id` 整组替换；插件被卸载时 [removePlugin] 销账；
-/// - 白名单静态化：只接受 [allowedPatterns]（默认 [ApiPaths.delegated]）里的模式，
-///   插件不能自己发明 REST 端点。
+/// - **命名空间规则，不设静态白名单**（L-28）：路径必须满足
+///   [ApiPaths.delegationPatternError]，且不得与核心永久面 / 核心当前已实现路由
+///   同键；核心删除某条实现后，同一申报自动生效，新增插件路由无需改核心。
 class DelegatedRouter {
-  DelegatedRouter({Set<String>? allowedPatterns})
-    : allowedPatterns = allowedPatterns ?? ApiPaths.delegated;
+  DelegatedRouter({Set<String>? coreRouteKeys})
+    : _coreRouteKeys = <String>{...?coreRouteKeys};
 
-  /// 允许委派的路径模式集合（静态白名单）。
-  final Set<String> allowedPatterns;
+  /// 核心**当前已实现**的方法路由键集（`METHOD /pattern`）。
+  ///
+  /// 由 `CoreServer` 在 `_registerRoutes` 之后绑定。申报命中这些键 ⇒ 拒收：
+  /// 已实现路由永远优先，静默接受一份永远不会生效的申报等于"假成功"。
+  Set<String> _coreRouteKeys;
+
+  /// 绑定核心已实现路由（服务器启动时调用一次；键格式同 [CoreRouter.routes]）。
+  void bindCoreRoutes(Iterable<String> keys) {
+    _coreRouteKeys = keys.toSet();
+  }
 
   /// 允许的 HTTP 方法。只覆盖 REST 委派实际会用到的方法。
   static const Set<String> allowedMethods = <String>{
@@ -228,9 +237,19 @@ class DelegatedRouter {
       );
       return null;
     }
-    if (!allowedPatterns.contains(normalizedPattern)) {
+    final String? contract = ApiPaths.delegationKeyError(
+      normalizedMethod,
+      normalizedPattern,
+    );
+    if (contract != null) {
+      _notes.add('插件 $pluginId 的路由申报被拒：$pattern —— $contract');
+      return null;
+    }
+    final String key = ApiPaths.routeKey(normalizedMethod, normalizedPattern);
+    if (_coreRouteKeys.contains(key)) {
       _notes.add(
-        '插件 $pluginId 的路由申报被拒：路径 "$pattern" 不在核心委派白名单内',
+        '插件 $pluginId 的路由申报被拒：$key 此刻由核心实现（迁移期以核心为准）；'
+        '核心交接后同一申报会自动生效',
       );
       return null;
     }

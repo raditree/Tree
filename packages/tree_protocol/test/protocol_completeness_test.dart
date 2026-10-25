@@ -197,6 +197,80 @@ void main() {
     );
   });
 
+  test('委派契约：coreOwned 36 / delegated 57 / pendingHandoffRoutes 55', () {
+    expect(ApiPaths.coreOwned.length, 36, reason: '核心永久面冻结为 36 条方法路由');
+    expect(ApiPaths.delegated.length, 57, reason: '插件面冻结为 57 条');
+    expect(ApiPaths.pendingHandoffRoutes.length, 55);
+    expect(ApiPaths.contractRoutes.length, 93);
+    expect(ApiPaths.contractRoutes.length, ApiPaths.coreOwned.length + ApiPaths.delegated.length);
+    expect(ApiPaths.coreOwned.intersection(ApiPaths.delegated), isEmpty);
+    expect(ApiPaths.pendingHandoffRoutes.difference(ApiPaths.delegated), isEmpty);
+
+    final RegExp keyShape = RegExp(r'^(GET|POST|PUT|PATCH|DELETE) /');
+    for (final String route in ApiPaths.contractRoutes) {
+      expect(keyShape.hasMatch(route), isTrue, reason: '契约键格式非法：$route');
+      final String pattern = route.substring(route.indexOf(' ') + 1);
+      expect(
+        ApiPaths.kept,
+        contains(pattern),
+        reason: '$route 的路径不在 ApiPaths.kept 内（前端可调用面必须可声明）',
+      );
+    }
+    expect(ApiPaths.routeKey('get', '/api/x'), 'GET /api/x');
+  });
+
+  test('委派命名空间规则：/api/ 前缀、保留前缀、段形状（L-28）', () {
+    for (final String ok in <String>[
+      '/api/tree.agent/hello',
+      '/api/files/{workspaceId}/git-status',
+      '/api/agents/{agentId}/messages',
+      '/api/sample/pdf_info',
+      '/api/x',
+    ]) {
+      expect(
+        ApiPaths.delegationPatternError(ok),
+        isNull,
+        reason: '$ok 应允许插件申报（L-28 去静态白名单）',
+      );
+    }
+    for (final String bad in <String>[
+      '/bootstrap',
+      '/api',
+      '/api/',
+      '/api/plugin/snapshot',
+      '/api/bootstrap/session',
+      '/api/meta',
+      '/api/logs/sources',
+      '/api/store/ns',
+      '/api/x/',
+      '/api//x',
+      '/api/x y',
+      '/api/{bad-name}',
+      '/api/中文',
+    ]) {
+      expect(
+        ApiPaths.delegationPatternError(bad),
+        isNotNull,
+        reason: '$bad 应被命名空间规则拒收并给出可读原因',
+      );
+    }
+    expect(
+      ApiPaths.delegationKeyError('GET', ApiPaths.settingsFrameRate),
+      contains('核心永久面'),
+      reason: '与 coreOwned 同键必须拒收',
+    );
+    expect(
+      ApiPaths.delegationKeyError('GET', ApiPaths.meta),
+      contains('核心保留面'),
+      reason: '保留前缀先于同键检查，同样必须拒收',
+    );
+    expect(
+      ApiPaths.delegationKeyError('GET', '/api/tree.agent/state'),
+      isNull,
+      reason: '非核心路径可申报',
+    );
+  });
+
   test('常量集合内部无重复且非空', () {
     for (final MapEntry<String, Set<String>> e in <String, Set<String>>{
       'WsInboundType': WsInboundType.all,

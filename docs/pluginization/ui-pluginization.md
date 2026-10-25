@@ -202,7 +202,7 @@
 
 > `/api/settings/token-rate` **不在此列**：它是 LLM 取 token 的节奏，属 agent 领域，随 `tree.agent` 迁走（[agent_pluginization.md §4.8](agent_pluginization.md)）。
 
-**引导壳（3）** — `GET /api/bootstrap`、`POST /api/bootstrap/session`、`POST /api/bootstrap/ticket`。
+**引导壳（3）** — `GET /bootstrap`、`POST /api/bootstrap/session`、`POST /api/bootstrap/ticket`。
 
 **发现面（1，新增）** — `GET /api/meta`：核心版本、`api_version`、可用路由、站点、capability、UI 连接、`can_manage_plugins`。
 
@@ -277,26 +277,41 @@
 
 禁止用 base64 把整文件塞进一行 JSON。
 
-### 4.5 合计数（2026-10-25 按 `_registerRoutes` 实测）
+### 4.5 合计数（2026-10-25 按 `_registerRoutes` 实测；L-28 落地时复核）
 
 | 分类 | 路径 / 方法路由 | 归属 |
 | --- | --- | --- |
-| 核心永久面 | 36 / 36 | `tree_core` |
-| agent 面 | 34 / 36（含 2 条新增） | `tree.agent` 插件 |
-| 领域面 JSON | 7 / 8 | `git` / `spec` / `mcp` |
-| 领域面二进制 | 11 / 13 | `files` |
-| **合计** | **88 / 93** | |
+| 核心永久面 | 26 / 36 | `tree_core` |
+| agent 面 | — / 36（34 存量 + 2 新增） | `tree.agent` 插件 |
+| 领域面 JSON | — / 8（spec 2 + mcp 3 + git 3） | `git` / `spec` / `mcp` |
+| 领域面二进制 | — / 13（files） | `files` |
+| **合计** | **71 / 93** | |
 
-> 91 条已注册 + 2 条新增 = 93 条方法路由；路径去重后 88 条（同路径多方法：`/api/files`、`/content`、`/mcp/services` 各占 2 个方法）。
+> 91 条已注册 + 2 条新增 = 93 条方法路由。**旧文档的「88 条路径」是数错的**：它只把三条多方法路径去重了，而实际有 17 条路径带多个方法。按路径去重后存量是 **69** 条，加 2 条新增 agent 路由 = **71** 条。
+>
+> `ApiPaths.kept` 保持**路径**集合语义（68 条存量 + 2 条新增 = 70）：`DELETE /api/files/{workspaceId}` 与 GET 共用路径常量（`fileDelete` 是 `files` 的别名），所以它比去重后的路径数少 1。契约的方法路由维度由下面的静态集合表达。
 
-`ApiPaths.kept` 语义改为「契约全集」（93 条）；新增静态集合：
+契约新增三个**方法路由**（`METHOD /pattern`）集合：
 
-- `ApiPaths.coreOwned`（36）
-- `ApiPaths.delegated`（57）
+- `ApiPaths.coreOwned`（36）：核心永久面，**只增不删**。交接完成后核心 router 的键集必须**恰好等于**它。
+- `ApiPaths.delegated`（57）：契约中归插件的全部方法路由（agent 36 + spec 2 + mcp 3 + files 13 + git 3）。**只作契约与验收口径，运行期不再当白名单用**（L-28）。
+- `ApiPaths.pendingHandoffRoutes`（55）：`delegated` 中**此刻仍由核心实现**的部分，是迁移债，只减不增；每交接一条就删一条，批次 C/G 完成后为空集。
 
-门禁从 `router ∪ stub ⊆ kept` 改为 **`coreOwned ∪ delegated == kept`**，且核心 `router` 不得包含任何 `delegated` 路径。
+**L-28 已决（2026-10-25）：委派去静态白名单。** 插件申报改走**命名空间规则**：
 
-> **待决（L-28）**：上面这条门禁仍依赖静态枚举 `delegated`。若要真正做到「插件自行申报、核心不逐条硬编码」，应删除该静态白名单，改为命名空间规则 + 前缀保留 + 归属表冲突检测；门禁改为「核心 router 键集 == `coreOwned`（36）」。详见 [agent_pluginization.md §10.4](agent_pluginization.md)。
+| 规则 | 内容 |
+| --- | --- |
+| 前缀 | 必须以 `/api/` 开头（`GET /bootstrap` 是核心页面入口，不可申报） |
+| 形状 | 段内只允许 `[A-Za-z0-9._~-]` 或 `{name}` 占位符；不得有空段、末尾斜杠 |
+| 保留前缀 | `/api/plugin`、`/api/bootstrap`、`/api/meta`、`/api/logs`、`/api/store` 整段保留给核心 |
+| 精确冲突 | `METHOD pattern` 命中 `coreOwned` ⇒ 拒收；命中**核心当前已实现**的路由 ⇒ 拒收（迁移期以核心为准；核心删除该实现后，同一申报自动生效，**不需要改核心**） |
+| 归属冲突 | 两家插件申报同一 `METHOD pattern` ⇒ 整条拒收（既有规则不变） |
+
+门禁随之改为（`test/server_test.dart`）：
+
+1. `coreOwned ⊆ 核心 router 键集 ⊆ coreOwned ∪ pendingHandoffRoutes`；
+2. `coreOwned ∩ delegated == ∅`，`pendingHandoffRoutes ⊆ delegated`；
+3. 核心 router 的路径 ⊆ `ApiPaths.kept`（前端可调用面仍在契约内）。
 
 ***
 
@@ -347,7 +362,7 @@
 ### 5.4 隔离
 
 - 四元组校验**只在核心**做，插件收到的 `scope` 是已校验结果；
-- 委派层不得放行 `delegated` 之外的路径（白名单静态化）；
+- 委派层按 §4.5 的命名空间规则放行（L-28：不再使用静态路径白名单），并拒收与核心已实现路由同键的申报；
 - 插件不得通过 `api/delegate` 反向触发另一个委派（只允许核心发起）；
 - **`api/delegate`** **只发往普通插件（stdio）**。UI 插件是委派端点的消费者，不接收委派——它是 WS 客户端，传输上也不成立。
 
@@ -552,9 +567,9 @@ UI 插件可申报图标，核心通过内置点位 `system.collect.ui.branding`
 
 ## 8. 不变量（本文档新增，编号独立）
 
-1. **核心只增不改**：收束期内核心不得删除既有字段/路径，只有 `delegated` 白名单内的路径会从核心实现移出。
+1. **核心只增不改**：收束期内核心不得删除既有字段/路径，只有 `pendingHandoffRoutes` 登记的方法路由会从核心实现移出。
 2. **卸载的是能力，不是端点**：端点离开核心必须伴随能力下沉；纯代理不算卸载。
-3. **委派白名单静态化**：`ApiPaths.delegated` 是静态集合，门禁要求 `router ∪ stub ∪ delegated == kept`。
+3. **委派靠命名空间规则，不靠静态白名单**（L-28）：`/api/` 前缀 + 保留前缀 + 与核心已实现路由同键拒收 + 归属表冲突检测；`coreOwned` / `delegated` / `pendingHandoffRoutes` 只作契约与门禁口径，运行期路由面由插件申报聚合。
 4. **委派失败禁止 404**：未装/停用 ⇒ 503，未响应 ⇒ 504，回包非法 ⇒ 502，均带可读原因。
 5. **UI 订阅只限广播站**：中转 / 执行 / 收集的订阅一律可读拒绝。
 6. **UI 身份以声明为准**：`plugin_id` 必须匹配 `plugins.yaml` 的 `runtime: ui` 条目，scope 取声明。
@@ -614,9 +629,9 @@ UI 插件可申报图标，核心通过内置点位 `system.collect.ui.branding`
 
 | 片 | 内容                   | 涉及文件                                                                                                                                                                                                | 验收                                                                                       |
 | - | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| A | 协议面新增                | `api_paths.dart`（+3 路径、`coreOwned` / `delegated` 集合）、`ws_inbound.dart`（+6 帧）、`ws_outbound.dart`（+1 帧）、`station_ws.dart`、`meta.dart`、`plugin_rpc_methods.dart`（+`api/delegate`、`workspace/register`） | 路径覆盖度与新帧编解码用例全绿                                                                          |
+| A | 协议面新增                | `api_paths.dart`（+3 路径、`coreOwned` / `delegated` / `pendingHandoffRoutes` 集合与命名空间规则）、`ws_inbound.dart`（+6 帧）、`ws_outbound.dart`（+1 帧）、`station_ws.dart`、`meta.dart`、`plugin_rpc_methods.dart`（+`api/delegate`、`workspace/register`） | 契约集合自检、命名空间规则用例与新帧编解码用例全绿 |
 | B | 站点接 WS + meta + 推送通道 | `core_server.dart`（连接身份、`ui.hello`、`/api/meta`）、`station_instance.dart`（订阅通道抽象、`closed` 终止帧）、`stations.dart`（订阅与注册权限、`topics[]` 过滤、按 `plugin_id` 归属）、`plugin_bus.dart`（投递分流）                        | 订广播收到投递 / 订自建站收到推送 / 下线收到 `closed` / 订中转被拒 / 身份不符被拒 / 申报后 `meta` 增长 / UI 自建站只限广播 / 关窗不销毁 |
-| C | 委派 + **18 条全搬**      | `http_router.dart`（`DelegatedRouter`）、`core_server.dart`（查表点、信封构造、`body_path`/`result_path` 落盘与清理）、`station_points.dart`（新收集站）、`station_ids.dart`、`plugin_bus.dart`（`api/delegate` 路由）、移除 18 条核心路由  | 插件未装/停用/在位三态正确；`coreOwned ∪ delegated == kept`；大文件下载无完整内存驻留                              |
+| C | 委派 + **18 条全搬**      | `http_router.dart`（`DelegatedRouter` 命名空间规则）、`core_server.dart`（查表点、核心路由冲突绑定、信封构造、`body_path`/`result_path` 落盘与清理）、`station_points.dart`（新收集站）、`station_ids.dart`、`plugin_bus.dart`（`api/delegate` 路由）、移除 18 条核心路由并同步删 `pendingHandoffRoutes` | 插件未装/停用/在位三态正确；核心 router 键集 == `coreOwned ∪ pendingHandoffRoutes`；大文件下载无完整内存驻留 |
 | D | runtime:ui           | `builtin_plugins.dart`（`runtime` 取值）、`plugin_config_store.dart`（`runtime` 两档）、`ui_host.dart`、`plugin_bus.dart`（`_startOne` 分叉）、`plugin_downloader.dart`（卸载目标）                                              | 多 UI 并存；卸一个不影响其他；全停用后核心健康                                                                |
 | E | 引导壳 + 删除             | token 作用域注册表、`/bootstrap`、`/api/bootstrap/session`、`assets`→种子化 HTML、非 Flutter loader、删除 §3.6 全部对象                                                                                                  | 全量测试 + flutter；手工走通「卸光 → 引导页装回」与「只剩悬浮球 → 仍开引导页」                                          |
 | F | 日志 + 存储              | `api_paths.dart`（+7）、`core_server.dart`（两组路由）、`util/core_log_sink.dart`（源注册与尾部读）、`store/`（命名空间代理、配额、etag）                                                                                           | 源列表/尾部读/清空；`ns != plugin_id` 403；配额与 etag 冲突可读                                           |
@@ -628,7 +643,7 @@ UI 插件可申报图标，核心通过内置点位 `system.collect.ui.branding`
 
 | 层           | 用例                                                                                      |
 | ----------- | --------------------------------------------------------------------------------------- |
-| 协议          | 路径覆盖度（`kept == router ∪ stub ∪ delegated`）、新帧名登记、`api/delegate` 计数基线                    |
+| 协议          | 契约集合自检（`coreOwned` 36 / `delegated` 57 / `pendingHandoffRoutes` 55、互不重叠）、委派命名空间规则（自由 `/api/x` 可申报、保留前缀与核心同键拒收）、新帧名登记、`api/delegate` 计数基线 |
 | 核心 · 站点 WS  | 订广播投递、越界订阅拒绝、`ui.hello` 身份不符拒绝、空 scope 通配、`topics[]` 过滤生效                               |
 | 核心 · UI 自建站 | 可注册广播；注册收集/中转/执行被拒；同 id 不同配置拒收；关一个窗口不销毁站点；最后连接断开注销并广播 `closed`；自环投递带 `origin_plugin_id` |
 | 核心 · 推送     | 插件自建广播站 → UI 收到；插件下线 → 收到 `state:"closed"`；公告板晚连回看                                      |

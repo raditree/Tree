@@ -350,7 +350,7 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 
 ## 10. 现状与阻塞（2026-10-25 实测）
 
-批次 G **尚未开始**：以下四项事实决定 A1 能否落地（第 1/3/4 项仍未解除）。
+批次 G **尚未开始**：以下事实决定 A1 能否落地（第 1/3/4 项仍未解除；第 5 项已于 2026-10-25 解除）。
 
 | # | 事实 | 影响 |
 | --- | --- | --- |
@@ -358,9 +358,9 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | 2 | ~~`packages/tree_agent` 重名~~ **已规避**：新包定名 `tree_agent_loop`（放 `plugins/tree.agent/`）；现有 `packages/tree_agent` 是目标机 Linux 执行体，不改名、不复用 | 无（命名冲突消解） |
 | 3 | 领域代码规模约 20k 行：`agent` 5345 / `llm` 5030 / `team` 2683 / `tool` 5139 / `mcp` 1572；且对核心基础件有硬依赖——`agent → store 12 / util 5 / tool 5 / settings 4 / plugin 2`、`tool → team 7 / plugin 5 / spec 4 / store 4`、`llm → util 6 / settings 5 / agent 5 / store 5` | 插件不得 import 核心包，故必须：领域层与通用小件**复制随迁**、设置先拆分、插件互通改**执行器插件的自建执行站**（§10.1） |
 | 4 | 核心测试 176 个文件，其中大量用例直接 import `src/agent|llm|team|tool`；`_registerRoutes` 已逐条点清：`tree.agent` 34 条 + spec 2 + mcp 3 + files 13 + git 3 + 核心永久面 36 = 91 条已注册（+2 条新增 = 93） | 旧「23 / 25 条」口径作废；A2 基线按 36 条冻结（§1.2） |
-| 5 | 委派白名单 `ApiPaths.delegated` 是**静态 18 条路径**（`tree_protocol`）；不在集合内的插件路由一律拒收 | 不解决的话，新插件每加一条路由都要改核心并重新发版，与「插件自行申报」冲突 → L-28 |
+| 5 | ~~委派白名单 `ApiPaths.delegated` 是**静态 18 条路径**~~ **已解除（2026-10-25，L-28）**：`DelegatedRouter` 改为命名空间规则 + 保留前缀 + 与核心已实现路由同键拒收；核心删实现后同一申报自动生效 | 新插件加路由不再需要改核心（证据：`ui-pluginization.md` §4.5、`http_router.dart`、`delegated_rest_test.dart`） |
 
-> 结论：G 的正确起点不是搬代码，而是先完成五项前置（`core_settings` 拆分、scope 去领域化立项、`local_executor` 执行站就位、委派白名单去静态化、按 36 条建 G-1 对照表），再按 A1（最小端点 `GET /api/agents` 走通 stdio / 委派 / 一致性）验证脚手架。
+> 结论：G 的正确起点不是搬代码，而是先完成五项前置（`core_settings` 拆分、scope 去领域化立项、`local_executor` 执行站就位、~~委派白名单去静态化~~ **已完成**、按 36 条建 G-1 对照表），再按 A1（最小端点 `GET /api/agents` 走通 stdio / 委派 / 一致性）验证脚手架。剩余四项：L-22 / L-23 / L-24~L-26 / L-19。
 
 ### 已拍板（2026-10-25）
 
@@ -501,21 +501,23 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 
 即：**核心不会为任何插件路由写 handler**；`router.add` 只在 `_registerRoutes` 里给核心自己的 36 条用。
 
-**当前实现的两个不符合点**
+**当前实现（2026-10-25：L-28 已落地）**
 
-1. `stubApiPaths` 为空集（已无害），但 `stubRouter` 仍在查表链里——可保留为兜底，不构成硬编码。
-2. **`ApiPaths.delegated` 是静态 18 条路径白名单**（[api_paths.dart](file:///e:/programs/Tree/desktop/packages/tree_protocol/lib/src/api_paths.dart#L304-L330)），插件申报集合外的路径一律拒收。这等于「新插件加一条路由 = 改核心 + 发版」，与插件平台定位冲突。
+1. `stubApiPaths` 为空集（已无害）；`stubRouter` 仍在查表链里，作为「没人认领」的兜底，不构成硬编码。
+2. ~~`ApiPaths.delegated` 是静态 18 条路径白名单~~ **已去静态化**：`DelegatedRouter` 改为命名空间规则（`/api/` 前缀、保留前缀、段形状合法），并把「与核心已实现路由同键」列为可读拒收。核心删除某条实现后，同一申报**自动生效**，新增插件路由不再需要改核心。
 
-**建议改法（L-28）**
+**落地形态**
 
-| 现规则 | 建议规则 |
+| 旧规则 | L-28 后 |
 | --- | --- |
-| 路径必须在静态白名单内 | 路径必须满足命名空间规则：`/api/` 前缀 + 不在核心 36 条内 + 不与核心 pattern 冲突 |
-| 白名单按批次手工追加 | 删除静态白名单；保留「归属表冲突检测」（同键唯一）+「核心路由优先」 |
-| 契约全集 `kept` 静态 93 条 | `coreOwned` 静态 36 条；委派面不再静态枚举，改由 `/api/meta` 运行期聚合 |
-| 门禁 `coreOwned ∪ delegated == kept` | 门禁改为：核心 router 的键集 == `coreOwned`（36），且不含任何委派键 |
+| 路径必须在静态白名单内 | 路径满足命名空间规则：`/api/` 前缀 + 不在保留前缀内 + 段形状合法 |
+| 白名单按批次手工追加 | 无白名单；`coreOwned`（36）/ `delegated`（57）/ `pendingHandoffRoutes`（55）只作**门禁与 G-1 对照口径**，不参与运行期放行 |
+| 契约全集 `kept` 静态 93 条 | `kept` 仍是**路径**集合（70）；方法路由契约由 `coreOwned ∪ delegated`（93）表达 |
+| 门禁 `coreOwned ∪ delegated == kept` | 门禁：`coreOwned ⊆ 核心 router 键集 ⊆ coreOwned ∪ pendingHandoffRoutes`，且核心 router 路径 ⊆ `kept` |
+| 核心路由与委派谁先匹配 | 已实现优先（不变）；申报与**当前已实现**路由同键 ⇒ 申报阶段可读拒收 |
+| 冲突检测 | 保留：同 `METHOD pattern` 双家申报整条拒收，不按启动顺序择一 |
 
-> 若担心「插件自造端点」失控，可保留**前缀保留**规则（如禁止申报 `/api/bootstrap`、`/api/plugins`、`/api/logs`、`/api/store`、`/api/meta` 前缀），而不是逐条枚举。
+> 保留五段**整段前缀**（`/api/plugin`、`/api/bootstrap`、`/api/meta`、`/api/logs`、`/api/store`），既避免逐条枚举，也防止插件伪装平台控制面。
 
 ---
 

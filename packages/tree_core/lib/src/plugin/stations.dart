@@ -115,9 +115,10 @@ class StationHub {
 
   /// 委派路由申报的 schema：`{routes: [{method, pattern}]}`。
   ///
-  /// [method] 允许取 GET / POST / PUT / PATCH / DELETE；[pattern] 必须与
-  /// [ApiPaths.delegated] 中的一条逐字一致（内容校验在 `DelegatedRouter` 里做，
-  /// schema 只保证形状与类型）。
+  /// [method] 允许取 GET / POST / PUT / PATCH / DELETE；[pattern] 必须满足
+  /// 委派命名空间规则（`/api/` 前缀、非保留前缀、段形状合法，见
+  /// [ApiPaths.delegationPatternError]），且不得与核心已实现路由同键
+  /// （内容校验在 `DelegatedRouter` 里做，schema 只保证形状与类型）。
   static const StationSchema apiRouteDeclarationSchema = StationSchema(
     description: '插件委派 REST 路由申报清单（每项 method + pattern）',
     fields: <StationSchemaField>[

@@ -367,7 +367,7 @@ void main() {
     expect(meta.json['routes'], isEmpty);
   });
 
-  test('已实现路由不被委派抢占', () async {
+  test('已实现路由不被委派抢占：申报阶段即拒收（L-28）', () async {
     final ({CoreServer server, _Client client, PluginBus bus}) ctx = await serve(
       <({String id, List<String> args})>[
         (id: 'sample', args: <String>['--api-route', 'GET:$gitStatus']),
@@ -378,6 +378,15 @@ void main() {
       await ctx.server.close();
     });
 
+    // 同键已被核心实现：申报直接拒收并说明原因，而不是接受一份永远不会
+    // 生效的申报（旧行为是"接受但核心优先"，对插件作者是假成功）。
+    expect(ctx.server.delegatedRouter.routeCount, 0);
+    expect(
+      ctx.server.delegatedRouter.notes.join('\n'),
+      contains('由核心实现'),
+      reason: '拒收原因必须点明"此刻由核心实现，交接后自动生效"',
+    );
+
     // 已实现路由（GET 未接 FileService，核心自己的回答是 501 文件服务尚未接入）。
     final _Response implemented = await ctx.client.send(
       'GET',
@@ -385,6 +394,85 @@ void main() {
     );
     expect(implemented.status, 501);
     expect(implemented.text, contains('文件服务'));
+  });
+
+  test('自造 /api 路由可申报并承接（L-28 去静态白名单）', () async {
+    const String custom = '/api/sample/tree-info';
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx = await serve(
+      <({String id, List<String> args})>[
+        (
+          id: 'sample',
+          args: <String>[
+            '--api-route',
+            'GET:$custom',
+            '--api-delegate-mode',
+            'text',
+          ],
+        ),
+      ],
+    );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+
+    expect(
+      ctx.server.delegatedRouter.routeCount,
+      1,
+      reason: '自造路径不需要改核心（不再有静态白名单）',
+    );
+    expect(ctx.server.delegatedRouter.notes, isEmpty);
+
+    final _Response meta = await ctx.client.send('GET', '/api/meta');
+    expect(meta.status, 200);
+    expect(
+      meta.json['routes'],
+      contains(
+        allOf(
+          containsPair('method', 'GET'),
+          containsPair('pattern', custom),
+          containsPair('owner', 'sample'),
+        ),
+      ),
+    );
+
+    final _Response res = await ctx.client.send('GET', custom);
+    expect(res.status, 200);
+    expect(res.text, contains('plugin:GET $custom'));
+  });
+
+  test('保留前缀 / 核心永久面 / 核心已实现同键 / 非 /api 前缀 ⇒ 申报阶段可读拒收', () async {
+    final ({CoreServer server, _Client client, PluginBus bus}) ctx = await serve(
+      <({String id, List<String> args})>[
+        (
+          id: 'sample',
+          args: <String>[
+            '--api-route',
+            'GET:/api/plugin/snapshot',
+            '--api-route',
+            'GET:/api/settings/frame-rate',
+            '--api-route',
+            'GET:/api/agents/{agentId}/todos',
+            '--api-route',
+            'GET:/bootstrap',
+          ],
+        ),
+      ],
+    );
+    addTearDown(() async {
+      ctx.client.close();
+      await ctx.server.close();
+    });
+
+    expect(ctx.server.delegatedRouter.routeCount, 0);
+    expect(ctx.server.delegatedRouter.conflictCount, 0);
+    final String notes = ctx.server.delegatedRouter.notes.join('\n');
+    expect(notes, contains('核心保留面'), reason: '/api/plugin 是保留前缀');
+    expect(notes, contains('核心永久面'), reason: '平台设置属于 coreOwned');
+    expect(notes, contains('由核心实现'), reason: 'agent 路由仍在核心（迁移期）');
+    expect(notes, contains('必须以 /api/ 开头'), reason: '/bootstrap 不是 /api 命名空间');
+    final _Response meta = await ctx.client.send('GET', '/api/meta');
+    expect(meta.json['routes'], isEmpty);
   });
 
   test('桩路由被委派覆盖后返回插件结果而不是 501', () async {

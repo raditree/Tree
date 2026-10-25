@@ -274,6 +274,20 @@ abstract final class ApiPaths {
   static const String agentSubagentTranscript =
       '/api/agents/{agentId}/subagents/{subagentId}/transcript';
 
+  // ── 上行改委派（插件化新增，归 tree.agent）────────────────────────────
+
+  /// 发送一条用户消息（POST，body 与旧 WS 上行 `send_message` 同形）。
+  ///
+  /// 旧通道是 WS 上行帧 `send_message`；批次 G 改成**委派端点**，由
+  /// `tree.agent` 经 `system.collect.api.routes` 申报，核心**不实现**
+  /// （见 `docs/pluginization/agent_pluginization.md` §1.3）。
+  static const String agentMessages = '/api/agents/{agentId}/messages';
+
+  /// 取消当前生成（POST，body 无）。
+  ///
+  /// 旧通道是 WS 上行帧 `cancel`；同上改委派，核心不实现。
+  static const String agentCancel = '/api/agents/{agentId}/cancel';
+
   // ── 日志 / 存储（插件化新增，核心永久面）──────────────────────────────
 
   /// 日志源枚举（GET）：`{sources:[{id, kind, size?, modified?}]}`。
@@ -301,33 +315,216 @@ abstract final class ApiPaths {
   /// `ns` 必须与调用方一致，否则一律 403（不泄露目标命名空间是否存在）。
   static const String storeEntry = '/api/store/{ns}/{key}';
 
-  /// 批次 C 起**允许由插件委派承担**的路径（静态白名单，按路径不看方法）。
+  // ── 契约与方法路由集合（L-28 起：委派不再有静态白名单）─────────────────
+
+  /// 方法路由键：`METHOD /pattern`，与 `CoreRouter.routes` 的键格式逐字一致。
   ///
-  /// 委派层只放行这一集合里的 pattern：插件申报其它路径一律拒收，避免
-  /// "插件自己发明一条 REST 端点"绕开核心的路由面。批次 C 目前是 18 条
-  /// （JSON 7 + 二进制/大体积 11）；批次 D/E/F/G 再按批次追加，删除核心实现
-  /// 时也从这里同步。**注意**：本片只加白名单，核心实现仍保留（SubTask 3.6
-  /// 不在本次范围），所以这些路径此刻同时出现在 [kept] 与核心路由里。
-  static const Set<String> delegated = <String>{
-    fileGitStatus,
-    workspaceGitLog,
-    workspaceGitBranches,
-    agentSpecs,
-    agentSpec,
-    mcpServices,
-    mcpService,
-    files,
-    fileContent,
-    filePdfInfo,
-    fileUploadInit,
-    fileUploadChunk,
-    fileUploadComplete,
-    fileSyncToLocal,
-    fileDownload,
-    fileDownloadFolder,
-    fileMkdir,
-    fileRename,
+  /// 契约集合（[coreOwned] / [delegated] / [pendingHandoffRoutes]）与核心
+  /// 覆盖度门禁都用这个格式，避免"路径集合"与"方法路由"两种口径混用
+  /// （旧文档的 88 条路径就是混用导致的错数）。
+  static String routeKey(String method, String pattern) =>
+      '${method.toUpperCase()} $pattern';
+
+  /// **核心永久面：36 条方法路由。**
+  ///
+  /// 平台控制面 16 + 传输设置 9 + 引导壳 3 + 发现面 1 + 日志 3 + 存储 4。
+  /// 只增不删：交接完成后核心 router 的键集必须**恰好等于**本集合
+  /// （见 `docs/pluginization/ui-pluginization.md` §4.1 / §4.5）。
+  static const Set<String> coreOwned = <String>{
+    // 平台控制面（16）：装插件的前提，也是引导页唯一依赖。
+    'GET $pluginSnapshot',
+    'GET $pluginConfigs',
+    'POST $pluginConfigs',
+    'PATCH $pluginConfig',
+    'DELETE $pluginConfig',
+    'POST $pluginConfigRestart',
+    'GET $pluginBuiltins',
+    'POST $pluginBuiltinEnable',
+    'POST $pluginBuiltinDisable',
+    'GET $pluginRelease',
+    'POST $pluginReleaseRefresh',
+    'POST $pluginReleaseInstall',
+    'POST $pluginReleaseUninstall',
+    'GET $pluginStation',
+    'PATCH $pluginStationConfig',
+    'POST $pluginStationSubscriber',
+    // 传输 / 判活设置（9）：交给插件会与传输层形成循环依赖。
+    'GET $settingsFrameRate',
+    'POST $settingsFrameRate',
+    'GET $settingsHeartbeatInterval',
+    'PATCH $settingsHeartbeatInterval',
+    'POST $settingsHeartbeatInterval',
+    'GET $settingsMissedHeartbeatLimit',
+    'PATCH $settingsMissedHeartbeatLimit',
+    'POST $settingsMissedHeartbeatLimit',
+    'POST $settingsDataCollection',
+    // 引导壳（3）。
+    'GET $bootstrap',
+    'POST $bootstrapSession',
+    'POST $bootstrapTicket',
+    // 发现面（1）。
+    'GET $meta',
+    // 日志 API（3）。
+    'GET $logSources',
+    'GET $logSource',
+    'DELETE $logSource',
+    // 数据存储 API（4）。
+    'GET $storeNamespace',
+    'GET $storeEntry',
+    'PUT $storeEntry',
+    'DELETE $storeEntry',
   };
+
+  /// [delegated] 中**此刻仍由核心实现**的部分：55 条，只减不增。
+  ///
+  /// 每交接一条（批次 C 的 21 条域路由 / 批次 G 的 34 条 agent 路由）就从
+  /// 这里删一条；删空即代表核心 router 只剩 [coreOwned]。门禁见
+  /// `packages/tree_core/test/server_test.dart` 的「路由覆盖度不变量」。
+  static const Set<String> pendingHandoffRoutes = <String>{
+    // agent 定义（7）
+    'GET $agents',
+    'POST $agents',
+    'GET $agent',
+    'PATCH $agent',
+    'DELETE $agent',
+    'GET $agentModelsInfo',
+    'GET $agentTodos',
+    // 子 agent（2）
+    'GET $agentSubagents',
+    'GET $agentSubagentTranscript',
+    // 团队（4）
+    'GET $agentTeammates',
+    'PATCH $teammate',
+    'GET $teammateLog',
+    'POST $teammateMessage',
+    // 模型池（4）
+    'GET $models',
+    'POST $models',
+    'PATCH $model',
+    'DELETE $model',
+    // 会话 / 历史（8）
+    'GET $conversations',
+    'DELETE $conversations',
+    'GET $agentSessions',
+    'POST $agentSessions',
+    'GET $agentSession',
+    'PATCH $agentSession',
+    'DELETE $agentSession',
+    'POST $agentSessionSpecs',
+    // 维护（3）
+    'POST $agentReset',
+    'POST $agentCompact',
+    'POST $agentSshReconnect',
+    // 提问（2）
+    'GET $questions',
+    'POST $questionAnswer',
+    // 运行监督（2）
+    'GET $toolsRunning',
+    'POST $toolsRunningClose',
+    // token 节奏（2，agent 领域设置）
+    'GET $settingsTokenRate',
+    'POST $settingsTokenRate',
+    // spec（2）
+    'GET $agentSpecs',
+    'GET $agentSpec',
+    // mcp（3）
+    'GET $mcpServices',
+    'POST $mcpServices',
+    'DELETE $mcpService',
+    // files（13）
+    'GET $files',
+    'DELETE $fileDelete',
+    'GET $fileContent',
+    'PUT $fileContent',
+    'GET $filePdfInfo',
+    'POST $fileUploadInit',
+    'POST $fileUploadChunk',
+    'POST $fileUploadComplete',
+    'POST $fileSyncToLocal',
+    'POST $fileDownload',
+    'POST $fileDownloadFolder',
+    'POST $fileMkdir',
+    'POST $fileRename',
+    // git（3）
+    'GET $fileGitStatus',
+    'GET $workspaceGitLog',
+    'GET $workspaceGitBranches',
+  };
+
+  /// **契约中归插件的全部方法路由：57 条。**
+  ///
+  /// agent 36（34 存量 + 2 新增上行改委派）+ spec 2 + mcp 3 + files 13 +
+  /// git 3。L-28 起它**不再是运行期白名单**：放行由 [delegationPatternError]
+  /// 的命名空间规则 + 归属表冲突检测决定；本集合只用于契约自检与 G-1 对照。
+  static const Set<String> delegated = <String>{
+    ...pendingHandoffRoutes,
+    // 上行改委派新增（2）：替代 WS 上行 send_message / cancel，核心不实现。
+    'POST $agentMessages',
+    'POST $agentCancel',
+  };
+
+  /// 契约全集（93 = [coreOwned] 36 + [delegated] 57）。
+  static final Set<String> contractRoutes = <String>{
+    ...coreOwned,
+    ...delegated,
+  };
+
+  /// **委派保留前缀**：整段保留给核心，插件不得申报。
+  ///
+  /// 只保留"谁都能看出是平台控制面"的五段；其余路径交给命名空间规则，
+  /// 避免每加一条插件路由都要改核心（L-28）。
+  static const Set<String> reservedDelegationPrefixes = <String>{
+    '/api/plugin',
+    '/api/bootstrap',
+    '/api/meta',
+    '/api/logs',
+    '/api/store',
+  };
+
+  /// 单个路径段的合法形状：字面量段或 `{name}` 占位符。
+  static final RegExp _delegationSegment = RegExp(
+    r'^(?:[A-Za-z0-9._~-]+|\{[A-Za-z][A-Za-z0-9_]*\})$',
+  );
+
+  /// 委派路径的**命名空间规则**：返回 null = 可申报，否则是给人看的拒收原因。
+  ///
+  /// 规则见 `docs/pluginization/ui-pluginization.md` §4.5：`/api/` 前缀、
+  /// 段形状合法、不落在 [reservedDelegationPrefixes] 内。**不再逐条枚举**。
+  static String? delegationPatternError(String pattern) {
+    final String p = pattern.trim();
+    if (!p.startsWith('/api/')) {
+      return '路径必须以 /api/ 开头（核心页面入口 /bootstrap 不可申报）';
+    }
+    if (p.endsWith('/') || p.contains('//')) {
+      return '路径不得以 / 结尾或包含空段';
+    }
+    for (final String segment in p.substring(1).split('/')) {
+      if (segment.isEmpty) return '路径不得包含空段';
+      if (!_delegationSegment.hasMatch(segment)) {
+        return '路径段 "$segment" 含非法字符（只允许 [A-Za-z0-9._~-] 或 {name}）';
+      }
+    }
+    for (final String prefix in reservedDelegationPrefixes) {
+      if (p == prefix || p.startsWith('$prefix/')) {
+        return '路径前缀 $prefix 是核心保留面，不允许插件申报';
+      }
+    }
+    return null;
+  }
+
+  /// 方法路由的**静态契约冲突**检查：返回 null = 可申报。
+  ///
+  /// 与"核心当前已实现路由同键"的动态检查在 `DelegatedRouter` 里做——
+  /// 核心删除实现后同一申报会自动生效，正是 L-28 要的效果。
+  static String? delegationKeyError(String method, String pattern) {
+    final String? shape = delegationPatternError(pattern);
+    if (shape != null) return shape;
+    final String key = routeKey(method, pattern);
+    if (coreOwned.contains(key)) {
+      return '该路由属于核心永久面（$key），不允许委派';
+    }
+    return null;
+  }
 
   /// 桌面分支保留的全部路径。
   static const Set<String> kept = <String>{
@@ -397,6 +594,8 @@ abstract final class ApiPaths {
     toolsRunningClose,
     agentSubagents,
     agentSubagentTranscript,
+    agentMessages,
+    agentCancel,
     logSources,
     logSource,
     storeNamespace,

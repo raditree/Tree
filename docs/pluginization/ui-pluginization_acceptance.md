@@ -24,10 +24,11 @@
 
 | ID | 操作 | 期望 |
 | --- | --- | --- |
-| A-1 | 运行路径覆盖度用例 | `coreOwned ∪ delegated == kept` 恒成立，无路径同时属于两侧 |
+| A-1 | 运行路径覆盖度用例 | `coreOwned ⊆ 核心 router 键集 ⊆ coreOwned ∪ pendingHandoffRoutes`；`coreOwned ∩ delegated == ∅`；`pendingHandoffRoutes ⊆ delegated`；核心 router 路径 ⊆ `kept` |
 | A-2 | 检查新增路径 | `/api/meta`、`/bootstrap`、`/api/bootstrap/session` 在 `kept` 内 |
 | A-3 | 编码/解码新帧 | `ui.hello`、`station/subscribe`、`station/unsubscribe`、`station_delivery`、`station/trigger`、`station/register`、`station/unregister` 往返一致 |
 | A-4 | 契约防漂移 | 删除任一路径或改任一帧名 ⇒ 契约测试变红（故意改一次验证后还原） |
+| A-5 | 委派命名空间（L-28） | 插件申报自造路径 `/api/x` ⇒ 可申报且出现在 `/api/meta.routes`；申报保留前缀（`/api/plugin/...`）或核心已实现的同键路由 ⇒ 可读拒收，归属表不出现 |
 
 ## 3. 批次 B：站点总线接 WS
 
@@ -202,7 +203,7 @@
 > 用途：一次把「还没做完 / 还没验完 / 还不能做」的项全部登记，避免靠对话记忆。
 > 每项都写清**为什么停在这里**与**解除条件**；解除后在本表就地改为「已闭环」并注明提交号。
 > 已闭环不再重复讨论：`requires.api` 闸门（`24b25d2`）、U1 附着化、U2 打包脚本、U3 `ui.hello`、
-> U4 站点客户端（订阅/重连/`closed` 横幅）、E-9 旧协议残留清理。
+> U4 站点客户端（订阅/重连/`closed` 横幅）、E-9 旧协议残留清理、L-28 委派白名单去静态化（2026-10-25）。
 
 ### A. 代码项
 
@@ -245,7 +246,7 @@
 | L-18 | 插件开发文档「UI 视图受限控件集」与实际实现对齐 | 待复核 | 历史记录为不一致，需对照当前代码确认 |
 | L-19 | G-1 对照表本身（36 行，含样例） | 未建 | 作为 G-1 的前置产物 |
 | L-27 | 是否裁剪功能面（token-rate / tools-running / session specs 等） | 未决 | G 只做等量迁移，不做减法；裁剪需要产品决策 | G 完成后按真实使用数据单独评审，不与迁移混做 |
-| L-28 | 委派白名单 `ApiPaths.delegated` 去静态化 | 未决 | 现为 18 条静态路径；新插件加路由必须改核心 | 改为命名空间规则 + 前缀保留 + 归属表冲突检测；门禁改为「核心 router 键集 == coreOwned 36」 |
+| L-28 | 委派白名单 `ApiPaths.delegated` 去静态化 | **已闭环**（2026-10-25） | — | 已落地命名空间规则 + 保留前缀 + 与核心已实现路由同键拒收 + 归属表冲突检测；门禁改为「`coreOwned ⊆ 核心 router 键集 ⊆ coreOwned ∪ pendingHandoffRoutes`」。证据：`ui-pluginization.md` §4.5、`http_router.dart`、`server_test.dart`、`delegated_rest_test.dart` |
 
 ### D. 已拍板（避免重复问）
 
@@ -266,7 +267,7 @@
 | 执行与文件 | **已定**：核心零 PTY / 零文件操作；本地执行、文件修改、终端归 `local_executor`，远端归 `ssh_executor`；执行站由**两个插件内部定义**（非核心内置）→ L-24~L-26 |
 | 核心职责 | 只做插件生命周期 / 站点总线 / 传输 / 通用键值存储与日志 / 租约登记 / 认证；业务数据与领域授权一律归插件 |
 | 路由基线 | **已定**：冻结实测 36 条（34 存量 + 2 新增）；核心永久面 36 条；是否裁剪另立 L-27 |
-| 路由申报 | **目标形态**：核心只硬编码自己的 36 条；其余 57 条由插件经 `system.collect.api.routes` 运行期申报，核心只维护归属表并转发（详见 [agent_pluginization.md](agent_pluginization.md) §10.4）；静态白名单去留见 L-28 |
+| 路由申报 | **目标形态（L-28 已落地）**：核心只硬编码自己的 36 条；其余 57 条由插件经 `system.collect.api.routes` 运行期申报，核心只维护归属表并转发（详见 [agent_pluginization.md](agent_pluginization.md) §10.4）；放行规则为命名空间规则 + 保留前缀 + 与核心已实现路由同键拒收，无静态白名单 |
 
 ## 13. 回归基线（收束过程中不得退化）
 

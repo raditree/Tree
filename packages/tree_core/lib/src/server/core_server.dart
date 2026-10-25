@@ -694,6 +694,10 @@ class CoreServer {
     // `system.tool.timeout`）与显式关闭的进程终止落点都在这里接线。
     server._wireToolRuns();
     server._registerRoutes();
+    // L-28：把核心**当前已实现**的方法路由交给委派归属表做同键拒收。
+    // 绑定的是注册后的实际键集，所以批次 C/G 删掉一条核心实现后，插件对
+    // 同一 `METHOD pattern` 的申报会自动从"拒收"变成"生效"——不需要改核心。
+    server.delegatedRouter.bindCoreRoutes(server.router.routes);
     server._registerStubRoutes();
     if (enableHeartbeat) {
       hub.startHeartbeat(interval: resolvedHeartbeatInterval);

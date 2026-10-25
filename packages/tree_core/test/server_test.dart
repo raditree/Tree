@@ -259,41 +259,58 @@ void main() {
   });
 
   group('路由覆盖度不变量', () {
-    test('保留路径 = 已实现 ∪ 显式 501 桩 ∪ 片 A 待实现清单', () {
-      final Set<String> implemented = server.router.patterns;
+    test('核心 router 键集 == coreOwned ∪ 迁移期未交接路由（L-28 门禁）', () {
+      final Set<String> registered = server.router.routes.toSet();
       final Set<String> stubs = server.stubRouter.patterns;
+      final Set<String> coreOwned = ApiPaths.coreOwned;
+      final Set<String> delegated = ApiPaths.delegated;
+      final Set<String> pending = ApiPaths.pendingHandoffRoutes;
 
-      // 片 E 已实现 `/bootstrap`、`/api/bootstrap/session`（以及 loader 用的
-      // `/api/bootstrap/ticket`），片 A 的待实现清单已清空。
-      // 与 `stubApiPaths` 同口径：**不许长期挂着**，实现一条就从这里删一条。
-      final Set<String> pendingImplementation = <String>{};
+      // 契约口径：核心永久面 36，插件面 57（agent 36 + spec 2 + mcp 3 +
+      // files 13 + git 3），合计 93；其中此刻仍由核心实现 55（= 91 - 36）。
+      expect(coreOwned.length, 36, reason: '核心永久面冻结为 36 条方法路由');
+      expect(
+        delegated.length,
+        57,
+        reason: '插件面冻结为 57 条（agent 36 + spec 2 + mcp 3 + files 13 + git 3）',
+      );
+      expect(ApiPaths.contractRoutes.length, 93);
+      expect(pending.length, 55, reason: '核心当前实现 55 条插件面路由；每交接一条删一条');
+      expect(coreOwned.intersection(delegated), isEmpty);
+      expect(pending.difference(delegated), isEmpty);
 
       expect(
-        implemented.intersection(stubs),
+        coreOwned.difference(registered),
+        isEmpty,
+        reason: '核心永久面缺路由：coreOwned 里的每条都必须由核心实现',
+      );
+      expect(
+        registered.difference(coreOwned.union(pending)),
+        isEmpty,
+        reason:
+            '核心注册了契约外或已交接的路由。新增核心永久面请同步 coreOwned；'
+            '交接给插件后请从 pendingHandoffRoutes 删除（核心不得重复实现）',
+      );
+      expect(
+        pending.difference(registered),
+        isEmpty,
+        reason:
+            '登记为迁移期未交接的路由必须在核心实现；删除实现时请同步从 '
+            'pendingHandoffRoutes 删掉，否则门禁会失真',
+      );
+      expect(
+        registered
+            .map((String key) => key.substring(key.indexOf(' ') + 1))
+            .toSet()
+            .difference(ApiPaths.kept),
+        isEmpty,
+        reason: '核心 router 的路径必须在 ApiPaths.kept 内（前端可调用面不脱契约）',
+      );
+
+      expect(
+        server.router.patterns.intersection(stubs),
         isEmpty,
         reason: '同一路径不应既实现又声明为未实现',
-      );
-      expect(
-        ApiPaths.kept.difference(implemented.union(stubs)),
-        pendingImplementation,
-        reason:
-            '除片 A 待实现清单外，协议包声明保留的路径都必须在核心进程登记；'
-            '实现（或加 501 桩）后请同步收紧这份清单',
-      );
-      expect(
-        implemented.intersection(pendingImplementation),
-        isEmpty,
-        reason: '已实现的路径必须从 pendingImplementation 删除（否则门禁会失真）',
-      );
-      expect(
-        pendingImplementation.difference(ApiPaths.kept),
-        isEmpty,
-        reason: '待实现清单只允许包含协议包声明保留的路径',
-      );
-      expect(
-        implemented.difference(ApiPaths.kept),
-        isEmpty,
-        reason: '核心进程不应实现协议包未声明的路径（含错别字）',
       );
       expect(stubs, CoreServer.stubApiPaths);
       expect(
