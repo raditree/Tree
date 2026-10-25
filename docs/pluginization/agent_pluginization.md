@@ -262,12 +262,18 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | 3 | 领域代码规模约 20k 行：`agent` 5345 / `llm` 5030 / `team` 2683 / `tool` 5139 / `mcp` 1572；且对核心基础件有硬依赖——`agent → store 12 / util 5 / tool 5 / settings 4 / plugin 2`、`tool → team 7 / plugin 5 / spec 4 / store 4`、`llm → util 6 / settings 5 / agent 5 / store 5` | 「只改 import 与注入」实际需要先把 `store / settings / util / plugin 客户端` 一并下放或抽共享包，否则不变量 1（不得依赖 `tree_core`）无法满足 |
 | 4 | 核心测试 176 个文件，其中大量用例直接 import `src/agent|llm|team|tool`；`core_server.dart` 的 `_registerRoutes` 实际注册约 **33 条**领域路由（agents CRUD、models、sessions、conversations、subagents、teammates、specs、reset/compact/ssh reconnect、questions 等） | §1.2 / §6 的「23 / 25 条」口径已漂移；A2 的「逐字节一致」基线需先重新点数并冻结 |
 
-结论：G 的正确起点不是搬代码，而是先拍板下面三件事，然后按 A1（最小端点 `GET /api/agents` 走通 stdio / 委派 / 一致性）验证脚手架。
+结论：G 的正确起点不是搬代码，而是先拍板下面两件事，然后按 A1（最小端点 `GET /api/agents` 走通 stdio / 委派 / 一致性）验证脚手架。
 
-### 需要拍板
+### 已拍板
 
-1. **包名与仓库位置**：把现有目标机执行体改名（如 `tree_tunnel_agent`）并让领域插件占用 `tree_agent`，还是领域插件另起名（如 `tree_agent_domain`）？插件源码放在本仓 `plugins/` 还是新建 `tree-plugins` 仓？
+1. **仓库位置与命名**：插件源码放 `E:\programs\Tree\desktop\plugins`（即 tree-plugins 仓挂载点），新建 `plugins/tree.agent/`；现有 `packages/tree_agent`（目标机 Linux 执行体）**不改名、不复用**，冲突消解。
+
+### 仍需拍板
+
 2. **基础件供给方式**：`store / settings / util / plugin 客户端` 是用共享包下放，还是由核心暴露为插件 API（`/api/store`、`/api/logs` 已具备，其余需补）？
 3. **路由点数基线**：以 `_registerRoutes` 的 33 条为准重写 §1.2/§5/§6，还是趁机裁剪到真正的 25 条功能面？
+
+> 全部未闭环项（含 G-1~G-7、U-3/U-4、C-11、手工回归、文档缺口）已统一登记在
+> [ui-pluginization_acceptance.md §12 遗留项台账](ui-pluginization_acceptance.md#12-遗留项台账2026-10-25-落档)。
 
 在以上决策落定前，核心路由、领域帧与 `agent/llm/team/tool` 目录**保持原样**（不变量 2/3 要求插件验收后才可删除；提前删会直接破坏现有功能）。
