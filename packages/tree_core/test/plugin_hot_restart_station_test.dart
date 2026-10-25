@@ -119,7 +119,7 @@ void main() {
     );
   });
 
-  test('插件点位的六条命令都真的挂上了挂载位置（表驱动，不是硬编码）', () {
+  test('插件点位的七条命令都真的挂上了挂载位置（表驱动，不是硬编码）', () {
     final StationPointSpec spec = StationPoints.byId(
       StationHubIds.executePlugin,
     )!;
@@ -131,6 +131,7 @@ void main() {
       'plugin.restart',
       'plugin.suspend',
       'plugin.state',
+      'plugin.toolCall',
       'plugin.stateDump',
       'plugin.stateFetch',
     ]);
@@ -219,7 +220,6 @@ void main() {
 
   test('快照两条：必须由插件身份下达，且不许写别人的键', () async {
     for (final String command in PluginToolSurface.lifecycleOnlyCommands) {
-      // 没有 source_plugin_id ⇒ 证明不了快照归谁
       final StationCommandResult anonymous = await run(
         command,
         arguments: const <String, dynamic>{
@@ -272,13 +272,14 @@ void main() {
 
   // ── 6：不暴露给 agent tool + 未接线 ──────────────────────────────────
   test('stateDump / stateFetch 不暴露给 agent tool（D9）', () {
-    // 两套命令必须**正好覆盖**点位表里的六条，且互不相交：漏一条或重一条都算没定稿
+    // 三套命令必须**正好覆盖**点位表里的七条，且互不相交：漏一条或重一条都算没定稿
     expect(
-      PluginToolSurface.agentToolCommands.union(
-        PluginToolSurface.lifecycleOnlyCommands,
-      ),
+      PluginToolSurface.agentToolCommands
+          .union(PluginToolSurface.lifecycleOnlyCommands)
+          .union(PluginToolSurface.internalCommands),
       StationPoints.byId(StationHubIds.executePlugin)!.commands.toSet(),
     );
+    expect(PluginToolSurface.internalCommands, <String>{'plugin.toolCall'});
     expect(
       PluginToolSurface.agentToolCommands.intersection(
         PluginToolSurface.lifecycleOnlyCommands,
@@ -286,7 +287,10 @@ void main() {
       isEmpty,
     );
     // 工具表里永远不会出现快照两条（它们不是能力，是生命周期原语）
-    for (final String command in PluginToolSurface.lifecycleOnlyCommands) {
+    for (final String command in <String>{
+      ...PluginToolSurface.lifecycleOnlyCommands,
+      ...PluginToolSurface.internalCommands,
+    }) {
       expect(bus.definitionOf(command), isNull, reason: command);
       expect(
         bus.allTools().any(

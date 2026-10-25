@@ -435,10 +435,6 @@ abstract final class ApiPaths {
     // spec（2）
     'GET $agentSpecs',
     'GET $agentSpec',
-    // mcp（3）
-    'GET $mcpServices',
-    'POST $mcpServices',
-    'DELETE $mcpService',
     // files（13）
     'GET $files',
     'DELETE $fileDelete',
@@ -466,6 +462,10 @@ abstract final class ApiPaths {
   /// 的命名空间规则 + 归属表冲突检测决定；本集合只用于契约自检与 G-1 对照。
   static const Set<String> delegated = <String>{
     ...pendingHandoffRoutes,
+    // mcp（3）：已交接给 mcp 插件，核心不再实现。
+    'GET $mcpServices',
+    'POST $mcpServices',
+    'DELETE $mcpService',
     // 上行改委派新增（2）：替代 WS 上行 send_message / cancel，核心不实现。
     'POST $agentMessages',
     'POST $agentCancel',

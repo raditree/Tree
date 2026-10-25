@@ -197,10 +197,10 @@ void main() {
     );
   });
 
-  test('委派契约：coreOwned 36 / delegated 57 / pendingHandoffRoutes 55', () {
+  test('委派契约：coreOwned 36 / delegated 57 / pendingHandoffRoutes 52', () {
     expect(ApiPaths.coreOwned.length, 36, reason: '核心永久面冻结为 36 条方法路由');
     expect(ApiPaths.delegated.length, 57, reason: '插件面冻结为 57 条');
-    expect(ApiPaths.pendingHandoffRoutes.length, 55);
+    expect(ApiPaths.pendingHandoffRoutes.length, 52);
     expect(ApiPaths.contractRoutes.length, 93);
     expect(ApiPaths.contractRoutes.length, ApiPaths.coreOwned.length + ApiPaths.delegated.length);
     expect(ApiPaths.coreOwned.intersection(ApiPaths.delegated), isEmpty);

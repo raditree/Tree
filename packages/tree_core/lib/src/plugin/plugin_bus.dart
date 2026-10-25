@@ -7427,6 +7427,11 @@ abstract final class PluginToolSurface {
     'plugin.stateFetch',
   };
 
+  /// **内部转发命令**：只供执行站/插件之间使用，不得申报成 agent tool。
+  static const Set<String> internalCommands = <String>{
+    'plugin.toolCall',
+  };
+
   /// 需要**留审计行**的命令：就是控制面那四条。
   ///
   /// 快照两条不审计是有意的：它们是插件自己续跑的内部动作（每一世都会下一次），

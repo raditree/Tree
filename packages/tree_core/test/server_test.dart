@@ -275,7 +275,7 @@ void main() {
         reason: '插件面冻结为 57 条（agent 36 + spec 2 + mcp 3 + files 13 + git 3）',
       );
       expect(ApiPaths.contractRoutes.length, 93);
-      expect(pending.length, 55, reason: '核心当前实现 55 条插件面路由；每交接一条删一条');
+      expect(pending.length, 52, reason: '核心当前实现 52 条插件面路由（MCP 3 条已交接）；每交接一条删一条');
       expect(coreOwned.intersection(delegated), isEmpty);
       expect(pending.difference(delegated), isEmpty);
 
@@ -684,10 +684,6 @@ void main() {
       );
       final _Res snapshot = await client.send('GET', ApiPaths.pluginSnapshot);
       expect(snapshot.json['enabled'], isFalse);
-      expect(
-        (await client.send('GET', ApiPaths.mcpServices)).json['services'],
-        isEmpty,
-      );
     });
   });
 
