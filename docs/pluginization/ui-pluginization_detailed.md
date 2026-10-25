@@ -35,7 +35,7 @@
   "runtime": "ui",
   "command": "tree_ui.exe",
   "args": [],
-  "granularity": "singleton",
+  "granularity": "team",
   "scope": {},
   "requires": { "api": ">=1.0 <2.0" },
   "files": ["**"]
@@ -45,9 +45,13 @@
 要点：
 
 - **可执行体必须改名 `tree_ui.exe`**，避免与不可卸载的 loader `Tree.exe` 同名。
-- `granularity: singleton`：默认界面只允许跑一个实例；多窗口由它自己开，不靠多实例。
+  打包脚本在压缩前改名，不重命名整个产品。
+- **单实例由 `UiHost` 保证**（每个插件 id 一个宿主进程）；`granularity` 只影响 headless
+  的实例编组，UI 沿用契约内的默认值 `team`（当前核心的 `plugins.yaml` 校验只接受
+  `team / agent / session`，写 `singleton` 会被拒——这是核心侧的既有值域，不是本插件要改的）。
 - `scope: {}`：UI 订阅用通配，不需要单独设计。
-- `requires.api`：与 `/api/meta` 的 `api_version` 比对，不满足则 `UiHost` 拒绝启动并给可读原因。
+- `requires.api`：与 `/api/meta` 的 `api_version` 比对。**当前核心尚未在启用前校验这一项**
+  （片 D 的文档目标，代码待补）；清单先按契约写上，装上后实际能力探测仍以 `/api/meta` 为准。
 
 ### 产物内容
 
@@ -103,7 +107,7 @@ plugin.json
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
 | **U1 附着化** | 去掉自 spawn；缺失 env 时明确报错；开发模式支持 `flutter run --dart-define=TREE_CORE_URL=...` | 手动拉起核心后 UI 能连上；不启动第二个核心 |
-| **U2 打包** | `tool/package_windows.dart` 产出插件 zip（含 `plugin.json`）；本地以插件方式安装 | 从插件面板安装后能启动；卸载后文件被清空且条目保留 `enabled:false` |
+| **U2 打包** | `tool/package_ui_plugin.dart` 产出插件 zip（含 `plugin.json`）；本地以插件方式安装 | 从插件面板安装后能启动；卸载后文件被清空且条目保留 `enabled:false` |
 | **U3 身份** | 连上即发 `ui.hello`；`/api/meta` 能看到自己 | `/api/meta.ui` 出现本插件；不声明 `plugin.manage` 时引导页仍开 |
 | **U4 站点客户端** | 只做订阅广播（先只接 `plugin_status` 与心跳）；需要当前态时调 REST | 断开重连后订阅自动恢复；核心发 `closed` 时 UI 显示"服务下线"而不是静默卡住 |
 | **U5 帧收口** | 领域帧改由 `frame_router` 接收（批次 G 之后） | 消息流、工具卡片、agent 状态与改造前功能等价 |
