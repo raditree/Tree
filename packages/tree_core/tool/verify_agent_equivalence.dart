@@ -70,6 +70,11 @@ const List<String> kDeclaredOnlyRoutes = <String>[
   'POST /api/agents/{agentId}/ssh/reconnect',
   'GET /api/agents/{agentId}/specs',
   'GET /api/agents/{agentId}/specs/{specId}',
+  // agent 写接口 / 临时员工 transcript（写路由先由插件自检守住，见 delegate.dart）。
+  'POST /api/agents',
+  'PATCH /api/agents/{agentId}',
+  'DELETE /api/agents/{agentId}',
+  'GET /api/agents/{agentId}/subagents/{subagentId}/transcript',
 ];
 
 Future<void> main(List<String> args) async {
