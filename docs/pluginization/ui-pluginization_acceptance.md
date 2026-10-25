@@ -129,7 +129,8 @@
 > A2 进行中：`api/delegate` 管道 + `GET /api/agents`、`GET /api/agents/{id}`、`GET …/todos`、
 > `GET …/subagents`、`GET /api/models`、`GET …/models-info` 已用
 > `packages/tree_core/tool/verify_agent_equivalence.dart` 做双跑对照
-> （六条均状态码 / Content-Type / body 逐字节一致）。
+> （六条均状态码 / Content-Type / body 逐字节一致）。剩余 A2 组：sessions / conversations /
+> teammates / tools-running（后者依赖工具层随迁，A3 再搬）。
 > 在插件侧等价验收通过前，核心路由与领域帧保持原样（不变量 2/3）。
 
 | ID | 操作 | 期望 |
