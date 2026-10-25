@@ -27,6 +27,8 @@ import 'package:tree_core/tree_core.dart';
 const List<String> kImplementedRoutes = <String>[
   'GET /api/agents',
   'GET /api/agents/{agentId}',
+  'GET /api/agents/{agentId}/sessions',
+  'GET /api/agents/{agentId}/sessions/{sessionId}',
   'GET /api/agents/{agentId}/todos',
   'GET /api/agents/{agentId}/subagents',
   'GET /api/models',
@@ -274,6 +276,25 @@ Future<String?> _runCase(String route, String exe) async {
         query: <String, String>{},
         pathParams: <String, String>{'agentId': 'agt_m'},
         agentId: 'agt_m',
+      );
+    case 'GET /api/agents/{agentId}/sessions':
+      await _seedSessions(store);
+      call = const _RouteCall(
+        concretePath: '/api/agents/agt/sessions',
+        query: <String, String>{},
+        pathParams: <String, String>{'agentId': 'agt'},
+        agentId: 'agt',
+      );
+    case 'GET /api/agents/{agentId}/sessions/{sessionId}':
+      await _seedSessions(store);
+      call = const _RouteCall(
+        concretePath: '/api/agents/agt/sessions/session_default',
+        query: <String, String>{},
+        pathParams: <String, String>{
+          'agentId': 'agt',
+          'sessionId': 'session_default',
+        },
+        agentId: 'agt',
       );
     case 'GET /api/agents/{agentId}/todos':
       store.putAgent(
@@ -535,6 +556,79 @@ Future<_PluginReply> _pluginDelegate(
     contentType: '${(result['headers'] as Map?)?['content-type'] ?? ''}',
     body: '${result['body'] ?? ''}',
   );
+}
+
+/// 会话夹具：默认会话四条消息（user / agent 文本 / 临时员工 / 工具）+ 第二个会话。
+Future<void> _seedSessions(FileTreeStore store) async {
+  store.putAgent(
+    CoreAgent(
+      id: 'agt',
+      name: '夹具',
+      createdAt: 1,
+      updatedAt: 1,
+      modelId: 'm1',
+    ),
+  );
+  await store.flush();
+  int t(String iso) => DateTime.parse(iso).millisecondsSinceEpoch;
+  store.appendMessage(
+    CoreMessage(
+      id: 'm1',
+      agentId: 'agt',
+      sessionId: 'session_default',
+      role: 'user',
+      content: '你好',
+      kind: 'text',
+      timestamp: t('2026-10-25T10:00:06.000'),
+    ),
+  );
+  store.appendMessage(
+    CoreMessage(
+      id: 'm2',
+      agentId: 'agt',
+      sessionId: 'session_default',
+      role: 'agent',
+      content: '这是预览',
+      kind: 'text',
+      timestamp: t('2026-10-25T10:00:09.000'),
+    ),
+  );
+  store.appendMessage(
+    CoreMessage(
+      id: 'm3',
+      agentId: 'agt',
+      sessionId: 'session_default',
+      role: 'agent',
+      content: '子回复',
+      kind: 'text',
+      subagentId: 'sub_1',
+      timestamp: t('2026-10-25T10:00:09.500'),
+    ),
+  );
+  store.appendMessage(
+    CoreMessage(
+      id: 'm4',
+      agentId: 'agt',
+      sessionId: 'session_default',
+      role: 'agent',
+      content: '工具卡片',
+      kind: 'tool',
+      timestamp: t('2026-10-25T10:00:09.900'),
+    ),
+  );
+  store.createSession('agt', title: '旧会话', sessionId: 'ses_old');
+  store.appendMessage(
+    CoreMessage(
+      id: 'm0',
+      agentId: 'agt',
+      sessionId: 'ses_old',
+      role: 'agent',
+      content: '旧的预览',
+      kind: 'text',
+      timestamp: t('2026-10-25T10:00:04.000'),
+    ),
+  );
+  await store.flush();
 }
 
 /// 模型池夹具：与 selftest 同一份内容（脱敏 / 默认档位 / token_scale / 排序）。
