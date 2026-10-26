@@ -15,10 +15,18 @@
 
 - 格式：**Conventional Commits** —— `type(scope): 摘要`，正文用中文写清"为什么"。
   常用 type：`feat` / `fix` / `refactor` / `perf` / `docs` / `test` / `chore` / `build`。
-  scope 用模块名：`core` / `llm` / `tool` / `team` / `spec` / `mcp` / `plugin` / `storage` / `ui` / `protocol` / `localexec` / `packaging`。
+  scope 用模块名：`core` / `plugin` / `protocol` / `ui` / `agent` / `files` / `executor` / `storage` / `packaging`。
+  领域 scope（`agent` / `files` / `executor`）在**插件仓**使用；桌面仓只改内核与 UI 时用前四个。
 - **一次提交一件事**：重构与行为变更分开；格式化 / 重命名单独一次提交，别夹在大改动里。
 - 分支：桌面线在 `desktop`，服务端线在 `main`；两条线各自独立 worktree，**不互相 merge 代码**。
-- 提交前必须本地跑过：`dart analyze`（改动的包）+ `dart test`（改动的包）+ `flutter analyze lib test`（改前端时）。
+  `plugins/` 是**独立 git 仓**的本地 clone，桌面仓的提交不会带上插件改动——两侧要分别提交。
+- 提交前必须本地跑过（按此顺序）：
+  1. `dart analyze`（改动的包，**无新增 error / warning**）；
+  2. `dart test`（改动的包，全量）；
+  3. `dart test` `packages/tree_protocol`（契约 / 文档门禁，路由或帧有变动时必跑）；
+  4. 插件仓改动跑 `dart run tool/check_plugin_repo_contract.dart`（桌面仓根，默认扫 `plugins/`；
+     插件仓内用 `--plugin-root .` 跑同一份脚本）；
+  5. 只有**动了 UI** 才跑 `flutter analyze lib test` + `flutter test`。
 - 提交信息里**不要**写机器绝对路径 / 个人目录 / 密钥。
 
 ## 2. 测试要求
@@ -26,13 +34,15 @@
 | 改动类型 | 最低要求 |
 | --- | --- |
 | 纯函数 / 领域逻辑 | 单测（含边界与错误分支） |
-| REST / WS 协议 | 端到端（`CoreServer.start` + 假引擎 / 假传输） |
-| 工具与工作空间 IO | 单测 + 越界与错误路径用例 |
-| 跨进程（插件 / MCP / 真进程 / SSH） | 门控测试（环境变量不具备时自动跳过，但**必须在具备环境时手工验证并记录**） |
-| 前端 | 组件测试 / 假核心 HTTP 测试 |
+| REST / WS 协议 | 端到端（`CoreServer.start` + 假引擎 / 假传输）；新增或改动路由必须同时进 `tree_protocol` 完备性清单 |
+| 工具与工作空间 IO（在插件仓） | 单测 + 越界与错误路径用例；本机与 SSH 两条分支同形断言 |
+| 插件平台（进程 / 站点 / 委派） | 单测 + 跨进程集成（假插件进程）；关停、崩溃、重连三类路径都要有用例 |
+| 跨进程（MCP / 真进程 / 真 sshd） | 门控测试（环境变量不具备时自动跳过，但**必须在具备环境时手工验证并记录**） |
+| 前端 / UI 插件 | 组件测试 / 假核心 HTTP 测试；涉及窗口与连接生命周期时补跨进程用例 |
 | 性能或缓存相关 | **可量化断言**（例如"第二轮请求前缀逐字一致"），不接受"看起来快了" |
 
 测试里**禁止**依赖真实网络、真实 LLM、真实时钟睡眠（`sleep` 只能用于最终兜底轮询）；时间相关逻辑用可注入的节拍器 / 假传输。
+插件仓的测试同样受此约束；`tree.agent` 的 agent 循环用假传输与假时钟驱动。
 
 ## 3. 文档制度
 
@@ -42,6 +52,8 @@
 | `docs/architecture.md` | 进程模型、模块职责、并发与缓存策略、存储布局、安全边界变了 |
 | `docs/development.md` | 环境、构建、测试、打包、发布流程变了 |
 | 各模块 `README.md` | **该模块的任何行为改动**（职责 / 入口 / 不变量 / 测试） |
+| 插件仓各插件 `README.md` | 该插件的行为、承接路由、执行站命令、已解缺口变了（在插件仓提交里同批改） |
+| `docs/pluginization/*.md` | 路由点位数、核心与插件的归属、执行站 / 终端 / UI 多窗口口径、验收台账状态变了——**设计文档与验收清单同批改** |
 | 提示词与规范文案（系统提示词 / 内置 Spec / 工具描述） | **模型可见行为变了**——先看 [docs/architecture.md §8.1](docs/architecture.md) 的「提示词资产」表定位文件；改内置 Spec 模板要同时 bump `version:` 并写 `changelog:` |
 | `docs/known-issues.md` | 发现或修掉一个"用户看得见的问题"（现象 / 根因 / 修复 / 验证 / 遗留） |
 | `docs/plugin-development.md` | 插件协议、点位、scope、执行站命令变了 |
@@ -72,10 +84,22 @@
 - **核心内部模块同样算模块**：`packages/tree_core/lib/src/<模块>/` 下每个业务模块都要有自己的 `README.md`
   （文件清单 + **不变量** + **测试**），并在 [packages/tree_core/README.md](packages/tree_core/README.md)
   的模块地图里有一行。新增模块目录而不写 README，门禁同样会红。
+- **领域模块的 README 在插件仓**：agent / 文件 / 本机与 SSH 执行器等已下沉为插件，
+  它们的不变量写在各自插件 README；本仓门禁不扫插件仓，靠插件仓 CI 与评审兜住。
 
 ## 5. 代码约定
 
 - **零告警**：`dart analyze` / `flutter analyze` 必须干净（warning 及以上视为错误）。
+- **插件零核心依赖（硬约束）**：插件源码不得 `import` / 依赖 `package:tree_core` 或
+  `package:tree_protocol`（第三方会单独 clone 插件仓，那边解析不到这两个包）。
+  复用核心能力只有两条路：核心主动提供的**内置执行站命令**，或 UI 插件的 **REST 委派端点**。
+  门禁：`tool/check_plugin_repo_contract.dart`（插件仓 CI 用同一份脚本，`--plugin-root .`）。
+- **路由归属**：核心只硬编码自己的**永久面**（`ApiPaths.coreOwned`，当前 39 条）；
+  域端点一律由插件启动时经 `system.collect.api.routes` 申报，核心只做归属转发与响应校验。
+  插件不得申报 `coreOwned` 同键，也不得占用保留前缀（`/api/plugin`、`/api/bootstrap`、`/api/meta`、`/api/logs`、`/api/store`）。
+- **UI 只消费不提供**：UI 插件的功能调用一律走 REST 委派；WS 上行白名单只有
+  `ui.hello` / `station/subscribe` / `station/unsubscribe` / 自有站 `trigger` / 终端与心跳帧。
+  不要为某个功能新开内置数据面。
 - 注释写**为什么**（背景、取舍、踩过的坑），不写"把 x 赋给 y"；踩坑结论尽量落到文档 + 测试，而不是只留在注释里。
 - **协议单一真源**：WS 帧类型 / REST 路径 / 握手字段只从 `packages/tree_protocol` 取，不写字面量；
   新增路由必须进完备性清单（有测试兜底）。
@@ -102,12 +126,24 @@
    `tree_core.exe`。改核心后必须重编译并确认它被放到了应用同目录；前端已有"陈旧核心"横幅告警。
 3. **字节 ↔ 文本边界要系统治理**：编码问题不要逐点打补丁，按"唯一入口 + 三类清单
    （用户数据 / 健壮性 / 协议内 UTF-8）"处理；输出不确定时**保字节**（latin1 兜底 + 标记）而不是猜编码。
+4. **站点 `seq` 是「通道级」计数**：每条新 WS 通道都从 1 开始。曾经只在"同键重订"时发 `reset`，
+   断线重连（新通道）不发 ⇒ UI 拿旧水位把 1..N 全丢。现在**每条新通道订阅成功都发 `reset`**，
+   UI 侧把领域站的 `reset` / `lagged` 合成 `station_resync` 重拉快照。改投递逻辑时必须同时回答
+   "重连之后水位怎么办"。
+5. **两个 git 仓**：`plugins/` 是独立仓的本地 clone，桌面仓的提交**不会**带上插件改动。
+   改了插件要在插件仓单独提交，否则发版 zip 里缺东西。
+6. **PATH 里的 Dart 可能不是维护版本**：机器上并存 2.19 与 3.47.5，`dart` / `flutter` 可能解析到老的那套
+   （表现为莫名的语法 / 依赖错误）。构建与门禁一律用维护 SDK 的全路径。
+7. **本机与远端回包必须同形**：`ssh_executor.file.list` 曾返回"请求目录相对"裸名，而 `local_executor`
+   是"工作空间根相对"，导致 spec reset 路径变成 `.self/spec/specs/x`（L-01 差异 3）。
+   执行器的 `file.*` 条目一律用工作空间根相对路径。
 
 ## 8. 报告问题
 
 请在 issue 里给出：**现象**（含截图 / 帧 / 日志）→ **复现步骤** → **期望** → **环境**
 （系统 / 版本 / 本地还是 SSH / 用的模型）。已知问题台账见 [docs/known-issues.md](docs/known-issues.md)，
-新问题照它的格式记录（现象 / 根因 / 修复 / 验证 / 遗留），不要只描述现象。
+新问题照它的格式记录（现象 / 根因 / 修复 / 验证 / 遗留），不要只描述现象；
+**编号取当前最大号 +1**，不要复用或猜号（历史上出现过重号，见台账头部说明）。
 
 ## 9. 许可
 

@@ -732,7 +732,7 @@ UI 插件可申报图标，核心通过内置点位 `system.collect.ui.branding`
 | 核心（永久）           | `heartbeat`、`plugin_status`、`plugin_event`、`station_delivery`、`ui.hello`、`station/subscribe`、`station/trigger`、`station/register`、`station/unregister` |
 | 核心（传输）           | 心跳与限流参数、连接鉴权、`closed` 终止帧                                                                                                                              |
 | agent 插件（批次 G 后） | `message`、`tool_start`、`tool_end`、`agent_status`、`agent_done`、`agent_error`、`question` 等全部领域帧——以 `topic` 形式经广播站投递，**核心不解释 payload**                    |
-| 终端               | 会话/输入/取消/尺寸/关闭走执行器插件（`local_executor` / `ssh_executor`）的**委派 REST**（`/api/terminal/{local,ssh}/sessions...`）；输出以 `terminal.<session>.output` / `.exit` 经各自广播站（`plugin.{local,ssh}_executor.broadcast.terminal`）投递。核心不持有 PTY、不做终端语义；UI 传输面在 `lib/ui/services/terminal_transport.dart`（见 [known-issues #31](../known-issues.md#31-集成终端迁移后无承接方pty-数据面延后)） |
+| 终端               | 会话/输入/取消/尺寸/关闭走执行器插件（`local_executor` / `ssh_executor`）的**委派 REST**（`/api/terminal/{local,ssh}/sessions...`）；输出以 `terminal.<session>.output` / `.exit` 经各自广播站（`plugin.{local,ssh}_executor.broadcast.terminal`）投递。核心不持有 PTY、不做终端语义；UI 传输面在 `lib/ui/services/terminal_transport.dart`（见 [known-issues #37](../known-issues.md#37-集成终端迁移后无承接方pty-数据面延后)） |
 
 由此 `plugin/README` 的帧兼容口径（不变量 25）只对**核心帧**生效；领域帧的兼容责任归对应插件，插件自行声明版本。
 

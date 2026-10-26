@@ -232,7 +232,7 @@ UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行�
   SSH 侧凭据只有插件有（UI 的 `GET /api/agents/{id}` 不回密码），因此**复用 `tree.agent`
   已登记的租约**：按 `ssh_lease_id` 或 `host`(+`username`) 找连接，找不到回 409 并提示
   "先在该工作区执行一次操作"，**不回落本机**。
-  详见 [known-issues #31](../known-issues.md#31-集成终端迁移后无承接方pty-数据面延后)。
+  详见 [known-issues #37](../known-issues.md#37-集成终端迁移后无承接方pty-数据面延后)。
 - **崩溃影响**：执行器崩溃会带走其 PTY 会话与在途命令；由看门狗重启插件，UI 收到 `closed` 并提示。这是把能力下沉必须接受的代价。
 
 > **过渡期说明（2026-10-25）**：local_executor / tree.agent 已走**插件自建执行站**
@@ -262,7 +262,7 @@ UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行�
   所以不认为这是额外耦合。
 - **terminal 归属（2026-10-25 用户决定，已实现）**：核心永不负责终端，也**不新增流中继数据面**。
   本地 / SSH 终端由 `local_executor` / `ssh_executor` 各自提供 REST 会话端点 + 广播站输出；
-  前端用 REST 管理会话、执行 / 取消命令，输出走站点推送（L-26 改为该方案，见 known-issues #31）。
+  前端用 REST 管理会话、执行 / 取消命令，输出走站点推送（L-26 改为该方案，见 known-issues #37）。
 - **执行站归属**：local_executor 已改为**插件自建执行站**
   （`plugin.local_executor.execute.local`，命令 `file.read/write/list/grep/delete/mkdir/writeBytes` + `exec.command`），
   核心按命令表路由、不再内置这些命令；核心原有的 `fs.*` / `terminal.exec` 点位仍保留给
