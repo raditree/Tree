@@ -2166,42 +2166,70 @@ markdown 的还原）；`http_sse_transport_test` 『有限重试』组钉截断
 
 ## #31 集成终端迁移后无承接方（PTY 数据面延后）
 
-**状态**：**未实现（2026-10-25 定案：本期不做新数据面）**。
-**影响**：UI 的 Ctrl+J 终端不可用——核心 `terminal/` 已随 A5 删除，执行器插件只提供一次性命令与文件操作，没有交互式 PTY。
+**状态**：**已修复（2026-10-25）**——按"REST 管会话 + 广播站推输出"落地，
+核心仍不持有 PTY、没有新增流中继数据面。
 
-### 现象
+### 现象（修复前）
 
-- `packages/tree_core/lib/src/terminal/` 已删除（`terminal_service` / `local_pty_starter` / `pty_process` / `ssh_pty_adapter`）；核心不再产生 `terminal_ready` / `terminal_output` / `terminal_exit` 帧。
-- `local_executor` 只注册 `file.*` / `exec.command`（一次性命令，无 PTY 句柄）；`ssh_executor` 的 PTY 依附于隧道内部事件，未向 UI 暴露。
-- UI 终端面板仍以旧帧名为入口，收不到任何数据。
+- `packages/tree_core/lib/src/terminal/` 已删除（`terminal_service` / `local_pty_starter` /
+  `pty_process` / `ssh_pty_adapter`）；核心不再产生 `terminal_ready` / `terminal_output` /
+  `terminal_exit` 帧。
+- `local_executor` 只注册 `file.*` / `exec.command`（一次性命令，无 PTY 句柄）；
+  `ssh_executor` 的 PTY 依附于隧道内部事件，未向 UI 暴露。
+- UI 终端面板仍以旧 WS 帧为入口，收不到任何数据。
 
 ### 根因
 
 1. A5 按"核心零领域"删除终端实现，但承接方尚未实现；
-2. 原方案（acceptance L-26）要求核心新增「与协议无关的流中继（`stream session`）」——这是一条**新数据面**，本期明确不做。
+2. 原方案（acceptance L-26）要求核心新增「与协议无关的流中继（`stream session`）」——
+   这是一条**新数据面**，本期明确不做。
 
-### 修复方向（已定，未实现）
+### 落地方式（已实现）
 
-**不为终端新增核心流原语**；改为「REST 管会话 + 广播站推输出」：
+**两个执行器各自申报同形 REST 路由**（前缀按执行器分，核心只做归属转发）：
 
-| 动作 | 端点 / 通道 | 所在 |
+| 动作 | 本地（`local_executor`） | SSH（`ssh_executor`） |
 | --- | --- | --- |
-| 建终端会话 | `POST /api/terminal/sessions` → `{session_id, cwd, shell}` | `local_executor` / `ssh_executor` 各自申报 |
-| 执行 / 输入 | `POST /api/terminal/sessions/{id}/input`（也用于"执行一条命令"） | 同上 |
-| 取消 / 中断 | `POST /api/terminal/sessions/{id}/cancel`（Ctrl+C 语义由执行器决定） | 同上 |
-| 调整尺寸 | `POST /api/terminal/sessions/{id}/resize` | 同上 |
-| 关闭会话 | `DELETE /api/terminal/sessions/{id}` | 同上 |
-| 输出推送 | 广播站 topic `executor.<session_id>.output` / `.exit`（复用 A4 的 `station_delivery`） | 执行器自建站 |
+| 建会话 | `POST /api/terminal/local/sessions` | `POST /api/terminal/ssh/sessions` |
+| 输入 / 执行 | `POST .../{sessionId}/input` | 同左（`/ssh/`） |
+| 取消 | `POST .../{sessionId}/cancel`（写 Ctrl+C） | 同左 |
+| 调整尺寸 | `POST .../{sessionId}/resize` | 同左 |
+| 关闭 | `DELETE .../{sessionId}` | 同左 |
+| 输出推送 | 广播站 `plugin.local_executor.broadcast.terminal` | `plugin.ssh_executor.broadcast.terminal` |
 
-约束：
+- topic 统一为 `terminal.<session_id>.output` / `.exit`；payload 即原终端帧
+  （`terminal_output` 带 base64 `bytes`，`terminal_exit` 带 `exit_code`）。
+- 实现位置：`plugins/local_executor/terminal_sessions.dart`、
+  `plugins/ssh_executor/lib/src/terminal_sessions.dart`；UI 侧传输面
+  `lib/ui/services/terminal_transport.dart`（REST + 按需订阅 `StationClient`）。
+- **SSH 凭据**：UI 拿不到密码（`GET /api/agents/{id}` 刻意不回显），所以 UI 在开终端前先调
+  `POST /api/agents/{id}/activate`（与 `tree.agent` 自建执行站 `agent_executor` 的
+  `executor.activate` 同一实现）：local 只检查设备与工作空间，**ssh 真建连并登记租约**。
+  之后终端会话带 `ssh_lease_id` 建立；激活失败（连不上 / 配置不全）在终端工具条给出可读原因。
+  `ssh_executor` 仍保留 `host`(+`username`) 匹配兜底，都没命中回 409 并提示先执行一次操作。
+- **本地 cwd 解析**（插件内，按优先级）：`body.cwd` → 委派信封的 `workspace_dir` →
+  `<data_dir>/workspaces/<agent_id>`（核心默认工作空间口径）→ 插件当前目录。
+- PTY 后端按"通用小件复制进插件仓"的纪律随 `local_executor` 分发
+  （`plugins/local_executor/lib/src/pty/`，不依赖桌面仓的 `tree_local_exec`）。
 
-- 核心只做**路由 + 身份透传 + 租约校验**，不认识终端语义，不持有 PTY 句柄；
-- 本地 / 远端由 UI 选择（或由 workspace 的 mode 决定），`local_executor` 与 `ssh_executor` 接口同形；
-- 执行器崩溃 / 插件停用 ⇒ 推 `closed`，UI 显示可读提示并允许重开（会话不持久化）；
-- 输出帧必须带单调 `seq`（沿用 `StationDelivery.seq`），UI 按水位去重；
-- 不新增 WS 上行帧类型：输入走 REST，UI 侧仍保持"功能调用一律 REST"。
+约束（保持）：
+
+- 核心只做**路由 + 身份透传**，不认识终端语义，不持有 PTY 句柄；
+- 插件崩溃 / 停用 ⇒ 广播站推 `closed`，UI 顶部横幅提示并允许重开（会话不持久化）；
+- 输出帧沿用 `StationDelivery.seq` 单调水位，UI 按水位去重 / 跳号记账；
+- **不新增 WS 上行帧**：输入走 REST，UI 侧仍保持"功能调用一律 REST"。
+
+### 测试钉子
+
+- `plugins/local_executor` 自检 23 条（含"建会话 → 输入 → 收到 `terminal_output`
+  → resize → cancel → close → `terminal_exit`"）；
+- `plugins/ssh_executor/test/terminal_sessions_test.dart` 8 条（租约解析 / 409 /
+  输入与取消 / 事件转播 / close / 远端失败 502）；
+- `plugins/tree.agent/test/agent_executor_activation_test.dart` 5 条（local 只检查、
+  ssh 真激活 + 缓存、统一失败形状、REST 200 / 404）；
+- `test/terminal_panel_test.dart` 26 条（键盘→字节、帧→屏幕、选区/粘贴/IME 全部保留）。
 
 ### 关联
 
-- acceptance：L-24（执行器 PTY）、L-25（执行站契约）、**L-26 改为"不做新数据面，改 REST + 广播站"**；
+- acceptance：L-24（执行器 PTY）、L-25（执行站契约）、**L-26 已改为"REST + 广播站"并实现**；
 - 文档：`agent_pluginization.md` §4.6、`ui-pluginization.md` 不变量 28/29 与终端归属表。

@@ -17,22 +17,22 @@
 
 ## 现状分析
 
-- [registry.py](server/prompt/registry.py)：硬编码单一 `PROMPT_VERSION = "1.0.0"`；
+- registry.py：硬编码单一 `PROMPT_VERSION = "1.0.0"`；
   `audit_header()` 用常量生成审计头。
-- [system_chapters.py](server/prompt/system_chapters.py)：模块级 `Chapter` 常量承载全部
+- system_chapters.py：模块级 `Chapter` 常量承载全部
   静态章节内容（`SYSTEM_STATIC_CHAPTERS` / `SYSTEM_STATIC_TAIL_CHAPTERS`），内容内嵌在代码。
-- [llm_prompts.py](server/prompt/llm_prompts.py)：`context_compressor_prompt(raw)` 内嵌在代码。
-- [tool_protocol.py](server/prompt/tool_protocol.py)：`describe()` 模板 + 仅审计用 `TOOL_MANIFEST`；
+- llm_prompts.py：`context_compressor_prompt(raw)` 内嵌在代码。
+- tool_protocol.py：`describe()` 模板 + 仅审计用 `TOOL_MANIFEST`；
   **工具实际描述是 tool/mcp 各文件里的硬编码字符串**，未接入版本体系。
-- [tool/*.py](server/tool/) 与 [mcp_tools/*.py](server/mcp_tools/)：`get_tool_definition()`
-  内联长 description 文本（如 [read_tool.py](server/tool/read_tool.py#L84-L94)）。
-- [document_server.py](server/mcp_tools/document_server.py)：`TOOLS` 列表内联各文档工具描述。
-- [embed_search_tool.py](server/mcp_tools/embed_search_tool.py)：描述分 `has_embed` 两分支。
-- [config.py](server/config/config.py)：`get_config()` 读 `configs/app.yaml`（带缓存）。
-- [chat.py](server/agent/chat.py)：直接 import `audit_header` / `SYSTEM_STATIC_CHAPTERS` /
+- tool/*.py 与 mcp_tools/*.py：`get_tool_definition()`
+  内联长 description 文本（如 read_tool.py）。
+- document_server.py：`TOOLS` 列表内联各文档工具描述。
+- embed_search_tool.py：描述分 `has_embed` 两分支。
+- config.py：`get_config()` 读 `configs/app.yaml`（带缓存）。
+- chat.py：直接 import `audit_header` / `SYSTEM_STATIC_CHAPTERS` /
   `SYSTEM_STATIC_TAIL_CHAPTERS`。
-- [llm.py](server/llm/llm.py)：`from prompt.llm_prompts import context_compressor_prompt`。
-- 测试 [test_fix_noop_tools.py](server/tests/test_fix_noop_tools.py#L335)：`from prompt.system_chapters
+- llm.py：`from prompt.llm_prompts import context_compressor_prompt`。
+- 测试 test_fix_noop_tools.py：`from prompt.system_chapters
   import WARNING_ACCOUNTABILITY`，且断言 `_build_agent_system_prompt` 含审计头/章节编号。
 
 关键结论：
@@ -115,9 +115,9 @@ prompt:
 
 - `meta.yaml`：版本 `1.0.0` / date `2026-08-23` / scope `system|tool|compressor` /
   changelog（沿用现有 `SYSTEM_PROMPT_CHANGELOG` 条目）。
-- `chapters/*.md`：把 [system_chapters.py](server/prompt/system_chapters.py) 中 7 个
+- `chapters/*.md`：把 system_chapters.py 中 7 个
   `Chapter` 的 `title/version/level/description/content` 原样落盘。
-- `compressor.md`：把 [llm_prompts.py](server/prompt/llm_prompts.py) 的
+- `compressor.md`：把 llm_prompts.py 的
   `context_compressor_prompt` 文本落盘（`历史对话：\n{raw}` 处用 `{raw}`）。
 - `tools/builtin.yaml`：迁移 `tool/*.py` 的 9 个描述（read/write/edit/terminal/mcp/team/
   set_todo_list/ask_user_question/spec）。
@@ -125,16 +125,16 @@ prompt:
 
 ### 5. 改造消费方 —— 从激活版本取内容
 
-- [chat.py](server/agent/chat.py)：删除对 `prompt.system_chapters`/`registry` 的直接 import；
+- chat.py：删除对 `prompt.system_chapters`/`registry` 的直接 import；
   `from prompt import versions`；`_build_agent_system_prompt` 内用
   `versions.active_system_head()/active_system_tail()/active_version()`（审计头）。
-- [llm.py](server/llm/llm.py)：删除 `from prompt.llm_prompts import context_compressor_prompt`；
+- llm.py：删除 `from prompt.llm_prompts import context_compressor_prompt`；
   压缩处改 `versions.active_compressor(raw)`。
-- 内置工具 [tool/*.py](server/tool/)：`get_tool_definition()` 的 `description` 改为
+- 内置工具 tool/*.py：`get_tool_definition()` 的 `description` 改为
   `versions.active_tool_description("<name>")`（参数 schema 等结构代码保留）。
-- [document_server.py](server/mcp_tools/document_server.py)：各 `TOOLS[i]["description"]` 改为
+- document_server.py：各 `TOOLS[i]["description"]` 改为
   `versions.active_tool_description("<name>")`。
-- [embed_search_tool.py](server/mcp_tools/embed_search_tool.py)：按 `has_embed` 选
+- embed_search_tool.py：按 `has_embed` 选
   `active_tool_description("embed_search.embed")` /
   `active_tool_description("embed_search.grep")`（数据文件里两分支分别登记）。
 
@@ -152,7 +152,7 @@ prompt:
 
 ### 8. 测试更新与新增
 
-- 既有 [test_fix_noop_tools.py](server/tests/test_fix_noop_tools.py#L335)：把
+- 既有 test_fix_noop_tools.py：把
   `from prompt.system_chapters import WARNING_ACCOUNTABILITY` 改为从 loader 读取 v1.0.0
   章节（或直接断言 `_build_agent_system_prompt` 输出的审计头/编号仍成立）。
 - 新增 `server/tests/test_prompt_versions.py`：

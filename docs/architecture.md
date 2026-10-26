@@ -100,7 +100,7 @@ Flutter UI 进程（lib/）                     核心进程（packages/tree_cor
 - 旧工作空间的 `.self` 由核心启动时一次性迁移到 `.tree/<TOP id>/.self`（幂等）。
 - 文件投递（`message send_message files:`）落到接收方 `.input/<日期>/`：**四种组合都支持**——local↔local（本机 `File.copy`）、
   local↔SSH、SSH↔SSH（含跨主机，**经本机中转**）；判据是**有效 SSH 接线**（`teamSshConfigFor`），不是 `agent.sshConfig`；
-  单文件 ≤32 MB、越界路径拒绝、部分失败如实回 `files_failed`（见 [team/README.md](../packages/tree_core/lib/src/team/README.md) 不变量 15）。
+  单文件 ≤32 MB、越界路径拒绝、部分失败如实回 `files_failed`（见 team/README.md 不变量 15）。
 
 ## 7. 团队与消息
 
@@ -125,14 +125,14 @@ Flutter UI 进程（lib/）                     核心进程（packages/tree_cor
 
 | 提示词 | 源码（唯一真源） | 运行期落点 |
 | --- | --- | --- |
-| 默认系统提示词（`defaultSystemPromptSeed`） | [agent/system_prompt_file.dart](../packages/tree_core/lib/src/agent/system_prompt_file.dart) | `.tree/<agent_id>/.self/system_prompt.md`——**只播种一次**：落盘后用户改文件即改提示词，代码不再覆盖；右侧「重置」先备份成 `.bak.<n>` |
-| 系统提示词拼装顺序（`systemPromptWithWorkspace`） | [agent/workspace_prompt.dart](../packages/tree_core/lib/src/agent/workspace_prompt.dart) | 基础段 + agent 自己的 `system_prompt` + 工作空间软约束 + Spec 索引 + 已选 Spec 全文 |
-| 内置 Spec 模板（`kBuiltinSpecs` / `kBuiltinSpecTexts`：general-task / hard-task / team-meeting / plugin-creator + 四条共享的「第 0 步」） | [spec/builtin_specs.dart](../packages/tree_core/lib/src/spec/builtin_specs.dart) | `.tree/<agent_id>/.self/spec/<id>.md`——**核心管理的快照**：模板内容变了就刷新（旧副本备份成 `<id>.md.bak.<n>`），副本 `version` 高于模板则保留不动 |
-| 插件开发指南（模型读的协议口径） | [plugin-development.md](plugin-development.md) | 选中 `plugin-creator` 规范时播种到 `.self/docs/plugin-development.md`（[spec/builtin_spec_assets.dart](../packages/tree_core/lib/src/spec/builtin_spec_assets.dart) + [plugin/plugin_guide.dart](../packages/tree_core/lib/src/plugin/plugin_guide.dart)） |
-| 附件说明片段（`attachmentPrompt`） | [agent/attachment_prompt.dart](../packages/tree_core/lib/src/agent/attachment_prompt.dart) | 拼进 user 消息的附件路径说明；生成与压缩估算**共用同一份**（逐字一致） |
-| 工具描述 / 参数 schema（模型读的"工具用法"） | [tool/](../packages/tree_core/lib/src/tool/) 各文件的 `ToolSpec`：`builtin_tools.dart` / `message_tool.dart` / `team_tool.dart` / `spec_tool.dart` / `mcp_tool.dart` / `plugin_tool.dart` | 每轮重新下发的工具表（**不进前缀缓存**）；MCP / 插件工具的描述由服务与插件自带 |
-| 每次工具结果前拼的会话状态（`sessionStatusText`） | [tool/status_text.dart](../packages/tree_core/lib/src/tool/status_text.dart) | todo 三态 + 已选 Spec 三态 |
-| 压缩摘要提示词 | [llm/llm_summarizer.dart](../packages/tree_core/lib/src/llm/llm_summarizer.dart) | 压缩时的一次总结调用（不带工具、复用模型输出长度） |
+| 默认系统提示词（`defaultSystemPromptSeed`） | agent/system_prompt_file.dart | `.tree/<agent_id>/.self/system_prompt.md`——**只播种一次**：落盘后用户改文件即改提示词，代码不再覆盖；右侧「重置」先备份成 `.bak.<n>` |
+| 系统提示词拼装顺序（`systemPromptWithWorkspace`） | agent/workspace_prompt.dart | 基础段 + agent 自己的 `system_prompt` + 工作空间软约束 + Spec 索引 + 已选 Spec 全文 |
+| 内置 Spec 模板（`kBuiltinSpecs` / `kBuiltinSpecTexts`：general-task / hard-task / team-meeting / plugin-creator + 四条共享的「第 0 步」） | spec/builtin_specs.dart | `.tree/<agent_id>/.self/spec/<id>.md`——**核心管理的快照**：模板内容变了就刷新（旧副本备份成 `<id>.md.bak.<n>`），副本 `version` 高于模板则保留不动 |
+| 插件开发指南（模型读的协议口径） | [plugin-development.md](plugin-development.md) | 选中 `plugin-creator` 规范时播种到 `.self/docs/plugin-development.md`（spec/builtin_spec_assets.dart + [plugin/plugin_guide.dart](../packages/tree_core/lib/src/plugin/plugin_guide.dart)） |
+| 附件说明片段（`attachmentPrompt`） | agent/attachment_prompt.dart | 拼进 user 消息的附件路径说明；生成与压缩估算**共用同一份**（逐字一致） |
+| 工具描述 / 参数 schema（模型读的"工具用法"） | tool/ 各文件的 `ToolSpec`：`builtin_tools.dart` / `message_tool.dart` / `team_tool.dart` / `spec_tool.dart` / `mcp_tool.dart` / `plugin_tool.dart` | 每轮重新下发的工具表（**不进前缀缓存**）；MCP / 插件工具的描述由服务与插件自带 |
+| 每次工具结果前拼的会话状态（`sessionStatusText`） | tool/status_text.dart | todo 三态 + 已选 Spec 三态 |
+| 压缩摘要提示词 | llm/llm_summarizer.dart | 压缩时的一次总结调用（不带工具、复用模型输出长度） |
 
 两条配套规则：
 
@@ -141,7 +141,7 @@ Flutter UI 进程（lib/）                     核心进程（packages/tree_cor
   并把原因写进 `changelog:`**（刷新按内容比对，同版本内容不同也会刷新并备份；版本号是"副本比模板新就保留"与审计的依据）。
 - **工具使用策略写在哪三处**：模型"知道何时 / 如何用某个工具"靠三处文字——工具描述（每轮随工具表下发）、
   系统提示词种子（动手之前的策略章，如「临时员工（subagent）使用策略」）、内置 Spec（按规范分工时的口径）。
-  三处必须同口径，由 [test/subagent_tool_test.dart](../packages/tree_core/test/subagent_tool_test.dart) 钉住；
+  三处必须同口径，由 test/subagent_tool_test.dart 钉住；
   改其中一处就要同步另两处（改法同上：工具描述随代码走、种子只影响新工作空间、内置 Spec 要 bump version）。
 - **侦察口径（已写进系统提示词与 general-task / hard-task）**：侦察**从文档开始**——`README.md` 与本索引 →
   相关模块 README 的「不变量（assertions）」→ `development.md` 的命令 / `known-issues.md` 的坑 → 领域指南 →

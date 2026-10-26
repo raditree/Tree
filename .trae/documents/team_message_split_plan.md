@@ -4,24 +4,24 @@
 
 ### 1.1 现状链路
 
-- [team_tool.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/tool/team_tool.py)（约 2091 行）单体类 `TeamTool`，以工具名 `team` 经 [tool/__init__.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/tool/__init__.py#L229-L235) 的 `register_builtin_tools` 注册到**每个** TOP 与成员会话（成员会话由 [chat.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/agent/chat.py#L243-L260) `_register_tools` 装配，传入各自的 agent_id/leader_id/team_id）。
-- 成员名单权威源是 SQLite `team_members` 表（[team_store.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/data/team_store.py)），`.self/team_roster.md` 仅为生成视图；TOP 创建时由 [team_init.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/data/team_init.py) 全量预建成员（parent_agent_id=TOP）。
+- team_tool.py（约 2091 行）单体类 `TeamTool`，以工具名 `team` 经 tool/__init__.py 的 `register_builtin_tools` 注册到**每个** TOP 与成员会话（成员会话由 chat.py `_register_tools` 装配，传入各自的 agent_id/leader_id/team_id）。
+- 成员名单权威源是 SQLite `team_members` 表（team_store.py），`.self/team_roster.md` 仅为生成视图；TOP 创建时由 team_init.py 全量预建成员（parent_agent_id=TOP）。
 - 消息出口：工具持 `message_dispatcher`（= chat.`_dispatch_agent_message`），无 dispatcher 时回退 broker 直投（`_dispatch_to_member`）。
-- 工具描述来自 [builtin.yaml](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/prompt/versions/1.0.0/tools/builtin.yaml#L58-L67)，经 `versions.active_tool_description(name)` 读取；**未登记的工具名会在注册时抛 KeyError**。另有审计清单 [tool_protocol.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/prompt/tool_protocol.py#L73-L94) `TOOL_MANIFEST`。
-- 引用 team action 的提示词/规范：[tool-routing.md](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/prompt/versions/1.0.0/chapters/tool-routing.md)、[task-paradigm.md](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/prompt/versions/1.0.0/chapters/task-paradigm.md)、chat.`_build_member_topology_text`（[chat.py:813-864](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/agent/chat.py#L813-L864)）、内置 spec（complex-task.md / team-meeting.md / hard-task.md）。
-- REST 层（[agent/routes.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/agent/routes.py) 的 teammates / teammate log / teammate message）**不依赖 TeamTool 类**，本次无需改动；`session.team_tool` 赋值后全仓库无读取方（死引用）。
+- 工具描述来自 builtin.yaml，经 `versions.active_tool_description(name)` 读取；**未登记的工具名会在注册时抛 KeyError**。另有审计清单 tool_protocol.py `TOOL_MANIFEST`。
+- 引用 team action 的提示词/规范：tool-routing.md、task-paradigm.md、chat.`_build_member_topology_text`（chat.py:813-864）、内置 spec（complex-task.md / team-meeting.md / hard-task.md）。
+- REST 层（agent/routes.py 的 teammates / teammate log / teammate message）**不依赖 TeamTool 类**，本次无需改动；`session.team_tool` 赋值后全仓库无读取方（死引用）。
 - 任务相关方法（`assign_task/query_tasks/complete_task/report_task_completion/update_member_score/mark_member_idle/_action_send_file`）除自身与测试外**无外部调用方**；`ContextIsolator` 类本身有独立单测，仅删除工具内的引用，类保留。
 
 ### 1.2 工作目录统一后的 git / 日志现状（对应要求 2、说明 1）
 
-- 云端共享模式：`create_workspace(shared_with=TOP)` 下成员不建独立容器/卷，共享 TOP 的 `/workspace`，私人空间为 `agentspace/{member_id}/.self`（[docker_manager.py:409-445](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/io_/docker_manager.py#L409-L445)）。共享建空间路径**跳过** `_setup_parent_remote`，即没有 per-member 分支；容器内 git 身份是 TOP 的。
+- 云端共享模式：`create_workspace(shared_with=TOP)` 下成员不建独立容器/卷，共享 TOP 的 `/workspace`，私人空间为 `agentspace/{member_id}/.self`（docker_manager.py:409-445）。共享建空间路径**跳过** `_setup_parent_remote`，即没有 per-member 分支；容器内 git 身份是 TOP 的。
 - 因此 `query_status/view_member_output` 里的 `docker_manager.git_log(member_ws)`：
   - 云端：解析到 TOP 共享容器执行 `git log --all`，返回的是**整个共享仓库**的提交，无法归属到具体成员（无成员分支、无成员 author 配置）→ 语义模棱两可；
   - 本地反向 WS 模式：服务端 docker 不可用，走 `<server>/workspaces/{member_id}` 降级目录，该目录在反向 WS 部署下通常不存在 → 错误被吞，`last_commit` 恒为空 → **事实已失效**。
-- 日志：`agentspace/{id}/.self/activity.log` 由 chat.`_append_activity_log`（[chat.py:1479-1505](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/agent/chat.py#L1479-L1505)）追加，read 工具允许相对路径 `agentspace/...`（无 `..`、非绝对路径即合法），统一工作目录下 leader 可直接 read 队友日志；无 agentspace 的 gitignore 规则，日志天然被 git 追踪。
-  - **时间格式现状（已核查）**：全部 17 个日志写入点统一经 `_clock_now()`（[chat.py:1474-1476](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/agent/chat.py#L1474-L1476)）打前缀，格式仅为 `HH:MM:SS`，**无日期**——跨天运行时无法判断产出日期。对策：把 `_clock_now()` 改为 `%Y-%m-%d %H:%M:%S`（一处改动覆盖全部写入点；历史旧行格式保持原样不迁移）。
+- 日志：`agentspace/{id}/.self/activity.log` 由 chat.`_append_activity_log`（chat.py:1479-1505）追加，read 工具允许相对路径 `agentspace/...`（无 `..`、非绝对路径即合法），统一工作目录下 leader 可直接 read 队友日志；无 agentspace 的 gitignore 规则，日志天然被 git 追踪。
+  - **时间格式现状（已核查）**：全部 17 个日志写入点统一经 `_clock_now()`（chat.py:1474-1476）打前缀，格式仅为 `HH:MM:SS`，**无日期**——跨天运行时无法判断产出日期。对策：把 `_clock_now()` 改为 `%Y-%m-%d %H:%M:%S`（一处改动覆盖全部写入点；历史旧行格式保持原样不迁移）。
   - 待验证点：`_append_activity_log` 走 `state.docker_manager.exec_in_workspace` 而非统一 IO（反向 WS），本地模式落点可能是服务端降级目录而非用户 base 目录。REST `/teammate/{id}/log` 已走 `io.read_file`。实施时需验证本地模式落点，若不一致则把该函数改走 `_get_workspace_io` 通道（小改动），这是"删除 view_member_log 后 leader 直接读日志"成立的前提。
-- 工具结果时间现状（已核查）：工具执行统一入口在 [llm.py:1001-1084](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/llm/llm.py#L1001-L1084) 的 tool_call 循环，`handler(**args)` 的结果经 `_tool_context_content` 写入给模型的 tool 消息——**当前结果不带任何时间**。集中注入点明确：在该循环构造 `base_content` 时统一追加"返回时间"脚注，一处覆盖全部内置工具与 MCP 工具。
+- 工具结果时间现状（已核查）：工具执行统一入口在 llm.py:1001-1084 的 tool_call 循环，`handler(**args)` 的结果经 `_tool_context_content` 写入给模型的 tool 消息——**当前结果不带任何时间**。集中注入点明确：在该循环构造 `base_content` 时统一追加"返回时间"脚注，一处覆盖全部内置工具与 MCP 工具。
 
 ### 1.3 调研中发现的现有缺陷（计划内一并修复）
 
@@ -91,7 +91,7 @@
 ### 2.5 时间信息补齐（本轮反馈新增）
 
 - **活动日志加日期**：`_clock_now()` 格式由 `%H:%M:%S` 改为 `%Y-%m-%d %H:%M:%S`。全部 17 个写入点共用此函数，一处改全覆盖；日志行形如 `[2026-06-30 14:23:05] [done] 回复完成`，跨天可判断产出日期。时区沿用服务器本地时间（与现状一致）。
-- **所有工具结果统一带返回时间**：在 [llm.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/llm/llm.py#L1047-L1084) 工具循环构造写入上下文的 `base_content` 时，统一追加脚注（如 `\n\n---\n结果返回时间：2026-06-30 14:23:05（服务器本地时间）`），使模型对任意工具（内置 + MCP）的产出时间都有判断依据；AskUserQuestion 占位、异常结果、未找到工具同样带时间。同时在 yield 给前端的 tool_call dict 中增 `timestamp` 字段（前端忽略多余字段无影响，供后续展示）。
+- **所有工具结果统一带返回时间**：在 llm.py 工具循环构造写入上下文的 `base_content` 时，统一追加脚注（如 `\n\n---\n结果返回时间：2026-06-30 14:23:05（服务器本地时间）`），使模型对任意工具（内置 + MCP）的产出时间都有判断依据；AskUserQuestion 占位、异常结果、未找到工具同样带时间。同时在 yield 给前端的 tool_call dict 中增 `timestamp` 字段（前端忽略多余字段无影响，供后续展示）。
   - 注意：不污染工具原始返回（前端 tool_end 展示与 dict 结果的图像/重定向逻辑保持原样），只在**模型可见的 tool 消息 content** 与事件元数据上加时间。
 - team/message 两个工具自身的返回也在基类提供统一 `generated_at` 字段（与上条脚注互为印证，字典结果中可被结构化读取）。
 

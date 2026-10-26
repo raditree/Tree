@@ -15,10 +15,10 @@
 
 ## 现状与根因
 
-- [ask_question_tool.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/tool/ask_question_tool.py#L126) `event.wait(timeout=600)` 阻塞工具线程；超时后 `_pending` 移除，答案被丢弃。全程线程挂起、agent 不干活。
+- ask_question_tool.py `event.wait(timeout=600)` 阻塞工具线程；超时后 `_pending` 移除，答案被丢弃。全程线程挂起、agent 不干活。
 - 问题不走历史：只是瞬态 WS 事件，内存 `_ask_registry`（按 user 单例）持有，断线/刷新/重启即丢。
 - 提问 payload 无 `agent_id`/`session_id`，AskUserQuestionTool 只带 `user_id`，无法定位"哪个 agent、哪个会话"来唤醒。
-- [llm.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/llm/llm.py#L680-L746) 工具循环每轮调 `handler(**args)` 后继续循环；目前 ask 会一直阻塞这个循环。
+- llm.py 工具循环每轮调 `handler(**args)` 后继续循环；目前 ask 会一直阻塞这个循环。
 
 核心改动：让 ask 工具的 `execute` **不阻塞**地返回一个"暂停哨兵"，工具循环检测到后停止本轮并触发持久化与闲置，作答后经现有 broker/消息派发通道重新触发一轮。
 
@@ -35,7 +35,7 @@
 ## 数据模型
 
 ### 新增表 `pending_questions`（存活态；重启后可路由）
-在 [conversation_store.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/data/conversation_store.py) 新增：
+在 conversation_store.py 新增：
 
 ```
 pending_questions(
@@ -109,7 +109,7 @@ CRUD：`save_pending_question` / `get_pending_question(qid)` / `mark_pending_ans
 - 已支持 `options`/`answered`；补 `fromJson` 解析后端新增的 `answer`/`options`（`answered` 已有）。
 
 ### 8. 断线/刷新后重投递与恢复可答（历史驱动，无需改副作用）
-- 提问已作为 `kind='ask_user_question'` 历史消息落库，`getHistory` 返回它 → [message_panel.dart](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/ui/widgets/message_panel.dart#L236) 历史加载即重建卡片。
+- 提问已作为 `kind='ask_user_question'` 历史消息落库，`getHistory` 返回它 → message_panel.dart 历史加载即重建卡片。
 - 卡片 `answered` 来自后端历史 → 已答的显示"已提交"，未答的可答；**无需手动重新投递**。
 - `_handleAskAnswer` 发送 `user_answer`（含 qid/answer）后标记 answered；后端应答后启动续跑，卡片下方出现新的流式输出。
 

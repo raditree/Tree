@@ -5,9 +5,9 @@
 SSH IO 工具链（后端 `SSHWorkspaceIO` → 反向 WebSocket 委托 → 前端 dartssh2 执行）在
 高负载场景下的鲁棒性尚未经过系统化验证。当前架构关键事实：
 
-- SSH 连接由**前端（Flutter + dartssh2）按 top_agent_id 懒建立并缓存**（[ssh_connection_manager.dart](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/io/ssh_connection_manager.dart) 的 `_clients` map，无显式容量上限）。
-- 后端经 [local_executor.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/io_/local_executor.py) 的 `request()` 阻塞配对 `tool_exec_request` / `tool_exec_response`（`concurrent.futures.Future`，120s 超时、冷启动 15s 探测、连续 2 次超时自动停用）。
-- WebSocket 连接按 user 管理，每用户可多连接（[ws_manager.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/ws/ws_manager.py)）。
+- SSH 连接由**前端（Flutter + dartssh2）按 top_agent_id 懒建立并缓存**（ssh_connection_manager.dart 的 `_clients` map，无显式容量上限）。
+- 后端经 local_executor.py 的 `request()` 阻塞配对 `tool_exec_request` / `tool_exec_response`（`concurrent.futures.Future`，120s 超时、冷启动 15s 探测、连续 2 次超时自动停用）。
+- WebSocket 连接按 user 管理，每用户可多连接（ws_manager.py）。
 
 **审查边界（分层）：** 工具链分三层——①上游库（dartssh2 / paramiko）为**黑盒依赖**，协议与传输稳定性不属审查范围（我们无法修改，压测库本身无意义）；②前端薄包装（`SshConnectionManager` / `SshExecutorService` / `SshWorkspaceExecutor`，约 700 行自研代码）只做**逻辑正确性验证**（建连竞态、归属过滤、清理路径），不做大规模压测；③**后端委托链是审查重心**——`local_executor.py` 请求/响应配对生命周期、`ws_manager.py` 连接管理、`ws/endpoints.py` 注册路由、`mode_resolver.py` 互斥判定。
 

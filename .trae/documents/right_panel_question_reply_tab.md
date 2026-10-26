@@ -12,17 +12,17 @@
 
 关键技术事实（已核实）：
 - `sessions` 表 `PRIMARY KEY (session_id)`，`session_id` 全局唯一；默认会话 `session_default` 各 agent 共用 → 按 `(user_id, session_id)` 查 `pending_questions` 即可拿到「当前会话 + 所有 agent」的问题。
-- 提问已持久化在 [pending_questions](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/data/conversation_store.py#L614-L646)（含 `agent_id/top_agent_id/session_id/is_member/question/options/answer/status`），无需新增数据表。
-- 答复链路（`mark_pending_answered` + 回写历史消息 + `resume_after_answer` 唤醒）已在 [ws/endpoints.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/ws/endpoints.py#L184-L229) 的 `user_answer` 分支实现，可复用同一套函数。
+- 提问已持久化在 pending_questions（含 `agent_id/top_agent_id/session_id/is_member/question/options/answer/status`），无需新增数据表。
+- 答复链路（`mark_pending_answered` + 回写历史消息 + `resume_after_answer` 唤醒）已在 ws/endpoints.py 的 `user_answer` 分支实现，可复用同一套函数。
 
 ---
 
 ## 现状分析
 
-- 提问工具 [ask_question_tool.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/tool/ask_question_tool.py#L108-L161) 落库 + 写历史 + 推 `ask_user_question` WS 事件 + 返回暂停哨兵。
-- 中栏 [message_panel.dart](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/ui/widgets/message_panel.dart#L449-L512) 收到 `ask_user_question` 后插入内联卡片（`_AskQuestionCard`），用户作答走 `_handleAskAnswer` 发送 WS `user_answer`。收到 `ask_user_question_resolved` 目前**未处理**。
-- 右侧面板 [file_panel.dart](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/ui/widgets/file_panel.dart#L82-L83) 顶层 3 个 Tab（文件 / MCP 配置 / 模型信息），`_tabController` 长度 3；已接收 `sessionId` 参数（Todo 面板会话隔离同款）。
-- 全局 ChangeNotifier 模式已有先例：[workspace_refresh_service.dart](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/io/workspace_refresh_service.dart)。
+- 提问工具 ask_question_tool.py 落库 + 写历史 + 推 `ask_user_question` WS 事件 + 返回暂停哨兵。
+- 中栏 message_panel.dart 收到 `ask_user_question` 后插入内联卡片（`_AskQuestionCard`），用户作答走 `_handleAskAnswer` 发送 WS `user_answer`。收到 `ask_user_question_resolved` 目前**未处理**。
+- 右侧面板 file_panel.dart 顶层 3 个 Tab（文件 / MCP 配置 / 模型信息），`_tabController` 长度 3；已接收 `sessionId` 参数（Todo 面板会话隔离同款）。
+- 全局 ChangeNotifier 模式已有先例：workspace_refresh_service.dart。
 - 右侧面板仅在选中 agent（`workspaceId` 非空）时渲染 `FilePanel`，未选中时显示占位。**结论**：提问页挂在 `FilePanel` 内，未选 agent 时不可见（可接受的边界，见决策）。
 
 ---
@@ -206,7 +206,7 @@ class QuestionUpdateService extends ChangeNotifier {
   });
   ```
 - 进度页 `MessageList` 透传：`MessageList(messages: _liveMessages, revision: _scrollRevision, scrollToMessageId: _scrollToMessageId, scrollToRevision: _scrollToRevision)`（`_scrollToMessageId` 一旦消费后无需清空，revision 递增才触发）。
-- **关键依据（已核实）**：成员提问经 [ask_question_tool.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/tool/ask_question_tool.py#L141-L152) 以 `store_message(user_id, agent_id=成员id, kind="ask_user_question", msg_id=qid)` **落库在成员名下**；`get_history(memberId, sessionId)`（[conversation_store.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/data/conversation_store.py#L342-L366)）返回 `kind/options/answered`，`ChatMessage.fromJson` 正确解析 → 成员历史里天然包含该提问卡片且 `message.id == qid == scrollToMessageId`，直接复用第 8 点的 `MessageList` 定位+高亮机制即可，无需在成员侧新增任何查询。
+- **关键依据（已核实）**：成员提问经 ask_question_tool.py 以 `store_message(user_id, agent_id=成员id, kind="ask_user_question", msg_id=qid)` **落库在成员名下**；`get_history(memberId, sessionId)`（conversation_store.py）返回 `kind/options/answered`，`ChatMessage.fromJson` 正确解析 → 成员历史里天然包含该提问卡片且 `message.id == qid == scrollToMessageId`，直接复用第 8 点的 `MessageList` 定位+高亮机制即可，无需在成员侧新增任何查询。
 - 进度页 `MessageList` 不传 `onAskAnswer`，卡片只读展示（成员提问由右栏作答）。
 
 ---

@@ -8,7 +8,7 @@
 
 ## 0. 一句话
 
-把「整个 Flutter 前端」做成插件平台里的**一种插件**（`runtime: ui`），把原本由核心提供的**领域型 API**（UI、agent、Git、Spec、MCP、文件）逐组迁给插件；核心最终只剩三类能力：**插件体系基础 API + 日志 API + 数据存储 API**。
+把「整个 Flutter 前端」做成插件平台里的**一种插件**（`runtime: ui`），把原本由核心提供的**领域型 API**（UI、agent、Spec、MCP、文件；**Git 已按用户决定删除**）逐组迁给插件；核心最终只剩三类能力：**插件体系基础 API + 日志 API + 数据存储 API**。
 
 **核心的定位随之改变**：从「Agent 系统的调度核心」变为「**面向未来的插件型超级应用的调度核心**」。核心不认识 agent、会话、提问、团队——这些全部是插件的领域知识。
 
@@ -21,9 +21,9 @@
 ### 1.1 目标
 
 1. UI 前端可安装、卸载、启停、替换，与现有插件走**同一条**分发/落盘/生命周期管道。
-2. 主题、布局、窗口形态（主窗口 / 悬浮球 / 托盘 / 多窗口）全部由 UI 插件自己决定，核心不感知。
-3. 核心的 REST 面收束为 **36 条方法路由**：平台控制面 16、传输设置 9、引导壳 3、发现面 1、日志 API 3、数据存储 API 4。**核心不再保留任何 agent / 会话 / 运行监督 / 提问 / 远端链路类端点**（36 条移交 agent 插件）。
-4. 领域端点 18 条路径 / 21 条方法路由（Git 3、Spec 2、MCP 3、文件 13）迁给领域插件。
+2. 主题、布局、窗口内形态（主界面 / 悬浮球 / 面板）全部由 UI 插件自己决定；核心只负责**进程级窗口实例**（多窗口 = 多进程）与窗口身份（`w1`/`w2`），不解释窗口内容。
+3. 核心的 REST 面收束为 **39 条方法路由**：平台控制面 19（含 UI 多窗口 3）、传输设置 9、引导壳 3、发现面 1、日志 API 3、数据存储 API 4。**核心不再保留任何 agent / 会话 / 运行监督 / 提问 / 远端链路类端点**（36 条移交 agent 插件）。
+4. 领域端点 **15 条路径 / 18 条方法路由**（Spec 2、MCP 3、文件 13）迁给领域插件；**Git 3 条已按用户决定删除（2026-10-25）**。
 5. **agent 能力完全剥离为插件**（承接方见 [agent\_pluginization.md](agent_pluginization.md)），功能零丢失。
 6. 全部 UI 被卸载后，系统仍可恢复：由一个**不可卸载的极小引导壳**提供插件管理。
 7. 删除旧的「插件 UI 面板协议」（受限控件集），站点体系成为插件对外的**唯一贡献面**。
@@ -179,14 +179,14 @@
 
 ***
 
-## 4. API 端点归属总表（终态 93 条方法路由 / 88 条路径）
+## 4. API 端点归属总表（终态 93 条方法路由 / 70 条路径）
 
 > 判据：**卸载的是能力，端点跟着能力走。** 只把端点搬走、能力仍在核心，属于纯代理，不算卸载。
-> 2026-10-25 按 `_registerRoutes` 实测重算：核心 36 + agent 36（含 2 条新增）+ spec 2 + mcp 3 + files 13 + git 3 = 93。
+> 2026-10-25 重算：核心 39（36 + UI 多窗口 3）+ agent 36（含 2 条新增）+ spec 2 + mcp 3 + files 13 = 93；**git 3 条已按用户决定删除**（不再属于契约）。
 
-### 4.1 核心永久面（36 条）
+### 4.1 核心永久面（39 条）
 
-**平台控制面（16）** — 装插件的前提，也是引导页唯一依赖。
+**平台控制面（19）** — 装插件的前提，也是引导页唯一依赖。
 
 | 端点                                                                                             | <br />                           | <br />                                                                    |
 | ---------------------------------------------------------------------------------------------- | :------------------------------- | :------------------------------------------------------------------------ |
@@ -195,6 +195,7 @@
 | `GET /api/plugin/builtins`、`POST .../{id}/enable`、`POST .../{id}/disable`                      | <br />                           | <br />                                                                    |
 | `GET /api/plugin/release`、`POST .../refresh`、`POST .../{id}/install`、`POST .../{id}/uninstall` | <br />                           | <br />                                                                    |
 | `GET /api/plugin/stations/{id}`、`PATCH .../{id}/config`、`POST .../{id}/subscribers/{key}`      | <br />                           | <br />                                                                    |
+| `GET /api/plugin/windows`（列出窗口）、`POST /api/plugin/windows`（新建窗口）、`DELETE /api/plugin/windows/{id}`（全关） | UI 多窗口：进程必须由核心拉起 | <br /> |
 
 **传输 / 判活设置（9 条方法路由）** — 交给插件会与传输层形成循环依赖。
 
@@ -234,6 +235,28 @@
 
 约束：`ns` 必须等于调用方 `plugin_id`（核心自身用 `core`），跨命名空间读写一律 403；单值上限 1 MB，单命名空间上限 64 MB，超限给可读错误。**核心不解释值的内容。**
 
+### 4.1.1 UI 多窗口（2026-10-25 落地）
+
+多窗口 = **多进程**：一个 Flutter 引擎一个窗口，同进程多 HWND 在桌面上不稳定、也不共用 UI 状态。
+
+- **同一插件多窗口**：UI 调 `POST /api/plugin/windows {plugin_id}`；核心按 `w1`、`w2`… 分配
+  `window_id`，经 `TREE_UI_WINDOW_ID` 注入，进程在 `ui.hello.window_id` 里带回。
+  UI **不能**自己 `Process.start` 自己——那会绕过 `UiHost` 的 pid 台账、收尸与 `/api/plugin/windows`。
+- **多个 UI 插件并存**：每个 `runtime: ui` 条目各自拉起窗口；`/api/meta.ui[]` 按插件聚合，
+  其中 `connections` 就是该插件的窗口数。
+- **归属与关闭**：自建站仍归属 `plugin_id`。**只有最后一个窗口退出**才发 `closed` 并注销自建站
+  （桥按插件引用计数，`_onUiWindowExit` 只在窗口表清空时走插件级收尾）；关一个窗口不会打断
+  另一个窗口的订阅。
+- **托盘归属**：UI 侧用回环端口锁（`tray:<core instance key>`）选一个窗口装托盘；抢不到的窗口
+  按普通窗口处理（关窗即退出），避免出现多个托盘图标 / 多个“退出”入口。
+- **状态不共享**：每个窗口一份进程内状态（选中的 agent / 打开的窗口 / 草稿）。需要联动时由
+  UI 自己经站点或 REST 同步，核心不做 UI 状态广播。
+- **窗口列表字段**：`GET /api/plugin/windows` 每行 `{plugin_id, window_id, pid, alive, ui_hello_seen}`。
+  `ui_hello_seen` 是**窗口级**事实（新开窗口没连上就是 `false`，不会被相邻窗口的 hello 洗白；
+  老版本 UI 不带 `window_id` 时按主窗口记账）；degraded 仍是**插件级**读数（任一窗口连上即解除）。
+- **上限与非 UI 目标**：每插件默认 8 个窗口（`PluginBus.maxUiWindowsPerPlugin`）；不是 `ui` /
+  未启用 / 依赖不满足 ⇒ `POST` 回 409 并给可读原因。
+
 ### 4.2 agent 面（34 条存量 + 2 条新增 = 36 条 → agent 插件，批次 F/G）
 
 **核心不再保留其中任何一条。** 承接方：`tree.agent` 插件（见 [agent\_pluginization.md](agent_pluginization.md)）。
@@ -256,19 +279,18 @@
 
 > `answer_question` 已有 REST 等价物，不新增。**不保留插件 → UI 的反向请求通道**：上行一律走委派端点。
 
-### 4.3 领域面 · JSON（7 条路径 / 8 条方法路由，批次 C-1）
+### 4.3 领域面 · JSON（4 条路径 / 5 条方法路由，批次 C-1）
 
 | 端点 | 承接插件 | 说明 |
 | --- | --- | --- |
-| `GET /api/files/{ws}/git-status` | `git` | |
-| `GET /api/workspaces/{ws}/git/log` | `git` | |
-| `GET /api/workspaces/{ws}/git/branches` | `git` | |
 | `GET /api/agents/{id}/specs` | `spec` | 工作空间文件 CRUD |
 | `GET /api/agents/{id}/specs/{specId}` | `spec` | |
 | `GET` / `POST /api/mcp/services` | `mcp` | 同路径两方法；配置面 + 客户端连接都由 `mcp` 插件承担 |
 | `DELETE /api/mcp/services/{name}` | `mcp` | |
 
-**硬规则：不得只搬 Git 三条。** C-1 的 7 条路径必须一次搬完、全部有对应用例；C-2 的 11 条路径同理。
+> **Git 3 条已按用户决定删除（2026-10-25）**：不再属于 `delegated`/`kept`，UI Git 面板与状态着色同步下线。
+
+**硬规则：C-1 的 4 条路径必须一次搬完、全部有对应用例；C-2 的 11 条路径同理。**
 
 ### 4.4 领域面 · 二进制 / 大体积（11 条，批次 C-2）
 
@@ -290,21 +312,21 @@
 
 | 分类 | 路径 / 方法路由 | 归属 |
 | --- | --- | --- |
-| 核心永久面 | 26 / 36 | `tree_core` |
+| 核心永久面 | 29 / 39（含 UI 多窗口 3） | `tree_core` |
 | agent 面 | — / 36（34 存量 + 2 新增） | `tree.agent` 插件 |
-| 领域面 JSON | — / 8（spec 2 + mcp 3 + git 3） | `git` / `spec` / `mcp` |
+| 领域面 JSON | — / 5（spec 2 + mcp 3） | `spec` / `mcp` |
 | 领域面二进制 | — / 13（files） | `files` |
-| **合计** | **71 / 93** | |
+| **合计** | **70 / 93** | |
 
-> 91 条已注册 + 2 条新增 = 93 条方法路由。**旧文档的「88 条路径」是数错的**：它只把三条多方法路径去重了，而实际有 17 条路径带多个方法。按路径去重后存量是 **69** 条，加 2 条新增 agent 路由 = **71** 条。
+> 93 条方法路由（`coreOwned` 39 + `delegated` 54）。**Git 3 条已删除**；旧「93」口径含 git，不再适用（当前 93 = 39 + 54）。
 >
-> `ApiPaths.kept` 保持**路径**集合语义（68 条存量 + 2 条新增 = 70）：`DELETE /api/files/{workspaceId}` 与 GET 共用路径常量（`fileDelete` 是 `files` 的别名），所以它比去重后的路径数少 1。契约的方法路由维度由下面的静态集合表达。
+> `ApiPaths.kept` 保持**路径**集合语义（71 条）：契约 93 条方法路由去重为 70 条路径，其中 `DELETE /api/files/{workspaceId}` 与 GET 共用常量（`fileDelete` 是 `files` 的别名）只列一次；另加执行器插件的 2 条终端路径（`/api/terminal/{local|ssh}/sessions`，插件申报、不在 93 条契约内）。契约的方法路由维度由下面的静态集合表达。
 
 契约新增三个**方法路由**（`METHOD /pattern`）集合：
 
-- `ApiPaths.coreOwned`（36）：核心永久面，**只增不删**。交接完成后核心 router 的键集必须**恰好等于**它。
-- `ApiPaths.delegated`（57）：契约中归插件的全部方法路由（agent 36 + spec 2 + mcp 3 + files 13 + git 3）。**只作契约与验收口径，运行期不再当白名单用**（L-28）。
-- `ApiPaths.pendingHandoffRoutes`（55）：`delegated` 中**此刻仍由核心实现**的部分，是迁移债，只减不增；每交接一条就删一条，批次 C/G 完成后为空集。
+- `ApiPaths.coreOwned`（39）：核心永久面，**只增不删**。交接完成后核心 router 的键集必须**恰好等于**它。
+- `ApiPaths.delegated`（54）：契约中归插件的全部方法路由（agent 36 + spec 2 + mcp 3 + files 13）。**git 3 已删除；只作契约与验收口径，运行期不再当白名单用**（L-28）。
+- `ApiPaths.pendingHandoffRoutes`（0）：A5 已删完核心域实现、G1 删除 git 后清零；保留空集合只为兼容旧门禁形状，不再登记迁移债。
 
 **L-28 已决（2026-10-25）：委派去静态白名单。** 插件申报改走**命名空间规则**：
 
@@ -320,8 +342,8 @@
 
 门禁随之改为（`test/server_test.dart`）：
 
-1. `coreOwned ⊆ 核心 router 键集 ⊆ coreOwned ∪ pendingHandoffRoutes`；
-2. `coreOwned ∩ delegated == ∅`，`pendingHandoffRoutes ⊆ delegated`；
+1. 核心 router 键集 == `coreOwned`（39 条）；
+2. `coreOwned ∩ delegated == ∅`，`pendingHandoffRoutes` 为空集；
 3. 核心 router 的路径 ⊆ `ApiPaths.kept`（前端可调用面仍在契约内）。
 
 ***
@@ -482,7 +504,15 @@ tree.agent（stdio）── station/trigger（发布自建广播站）──▶ 
 | **快照 + 增量对齐**    | UI 连接顺序固定为：先 `station/subscribe`（本地缓冲）→ `GET` 快照（拿 `seq`）→ 丢弃缓冲中 `seq ≤ 水位` 的帧 → 应用其余增量。否则会丢"订阅成功到快照返回"之间的帧 |
 | **背压不静默**        | 每条连接有界队列；溢出时核心发 `station_delivery {state:"lagged", from_seq}`，UI 重新拉快照。禁止静默丢帧                               |
 
-`station_delivery.state` 取值因此固定为：`data` | `closed`（站点注销/插件下线） | `lagged`（队列溢出） | `reset`（插件重启后 seq 归零）。
+`station_delivery.state` 取值因此固定为：`data` | `closed`（站点注销/插件下线） | `lagged`（队列溢出） | `reset`（**每条新通道**订阅成功时 seq 归零——含插件重启与 UI 断线重连）。
+
+> **2026-10-25 落地的对齐方式（L-09，与上表的等价简化）**：
+> `seq` 是**每条 WS 通道**的计数器，新通道天生从 1 开始 ⇒ 核心在**每次订阅成功**都发 `reset`
+> （不再只在"同键重订"时发。以前漏发会让重连后的 UI 拿旧水位丢弃 1..N 的首批帧，这是 E2E-04
+> 丢帧的根因）。UI 侧 `FrameRouter` 把领域事件站的 `reset` / `lagged` 合成一条
+> `station_resync` 帧，消息面板收到后**整表重拉会话详情 REST**（`GET /api/agents/{id}/sessions/{sid}`，
+> tree.agent 承接）作为快照——因此不需要"快照回包带 seq 水位"这一步：水位已由 `reset` 归零，
+> 缺的帧由快照补齐。终端站的 `reset` 是每次开会话的常态，不触发会话重载。
 
 **topic 约定**：`<plugin_id>.<session_id>.<kind>`，如 `tree.agent.s123.chunk`。UI 的 `frame_router` 就是按 topic 把载荷映射回现有的 `msg_chunk` / `tool_start` 等渲染入口——渲染逻辑不变，只换收口。
 
@@ -605,8 +635,8 @@ UI 插件可申报图标，核心通过内置点位 `system.collect.ui.branding`
 25. **存储命名空间隔离**：`/api/store/{ns}` 的 `ns` 必须等于调用方 `plugin_id`，跨命名空间一律 403；核心不解释值内容。
 26. **领域帧所有权归插件**：核心只按 topic 转发 `station_delivery`，不解释 payload、不维护领域帧的白名单。
 27. **迁移期功能零丢失**：任一领域端点/帧在插件侧未验收通过前，核心侧实现不得删除；删除与交接必须在同一批次内完成。
-28. **UI 功能调用一律 REST**：一次性动作与查询只能走委派端点；唯一例外是**流式会话（PTY 的 open/input/resize/close 与输出帧）**，它在物理上无法用请求/应答表达。
-29. **WS 上行白名单**：`ui.hello`、`station/subscribe`、`station/unsubscribe`、`station/trigger`（**仅限自己注册的自建广播站**）、PTY 四帧、`heartbeat`。其余上行一律可读拒绝。
+28. **UI 功能调用一律 REST（无例外）**：一次性动作、查询**以及终端输入**都走委派端点；终端输出不是"调用"，由执行器插件经广播站单向下推。**不新增任何流式上行帧**（2026-10-25 定案）。
+29. **WS 上行白名单**：`ui.hello`、`station/subscribe`、`station/unsubscribe`、`station/trigger`（**仅限自己注册的自建广播站**）、`heartbeat`。其余上行一律可读拒绝。
 30. **推送不承载能力**：`station_delivery` 的载荷是"已发生的事实"，不得要求 UI 回传才能推进某个流程；需要回话的交互必须由 UI 调 REST。
 31. **广播站传输无关**：发布走 stdio RPC（`station/trigger`），订阅可来自 stdio 插件或 WS 客户端；一次发布由核心同时投给两类订阅者，核心只做桥接与过滤。
 32. **流式一致性**：事件按 `topic` 单调递增 `seq`；REST 快照回包携带 `seq` 水位；UI 必须按「先订阅缓冲 → 拉快照 → 丢弃 ≤ 水位 → 应用增量」对齐。`station_delivery.state` 固定为 `data | closed | lagged | reset` 四态。
@@ -622,13 +652,13 @@ UI 插件可申报图标，核心通过内置点位 `system.collect.ui.branding`
 | 批次 | 内容                                      | 承接插件                             | 完成判据                                               |
 | -- | --------------------------------------- | -------------------------------- | -------------------------------------------------- |
 | B  | 站点总线接 WS 订阅 + `/api/meta`               | —                                | UI 能订广播并收到投递；收集站仍只由核心触发                 |
-| C  | **18 条**领域委派（C-1 JSON 7 条，C-2 二进制 11 条） | `git` / `spec` / `mcp` / `files` | 18 条全部由插件供，核心对应路由全部移除                              |
+| C  | **18 条**领域委派（spec 2 + mcp 3 + files 13） | `tree.agent`（spec 2）/ `mcp` / `files` | 全部由插件供，核心对应路由全部移除；**git 3 已按用户决定删除** |
 | D  | `runtime: ui` + `UiHost` + **依赖闸门**      | —                                | 多个 UI 可并存、可独立卸载；缺依赖时拒绝启用并可一键补齐                 |
 | E  | 引导壳 + 删除旧 UI 面板协议                       | —                                | 卸掉所有 UI 后能从引导页装回                                   |
 | F  | 日志 API + 数据存储 API                       | —                                | 插件只经由公共出口读日志/落盘，跨命名空间被拒                            |
 | G  | **agent 面 36 条 + 领域帧所有权移交**             | `tree.agent`                     | 36 条由插件供；核心无 agent/session/question/ssh 路由，也不识别领域帧 |
 
-**批次 C 是一次性迁移，不接受"先做 Git 三条"的中间态。** C-1 与 C-2 各自必须整组完成；两组都完成才算批次 C 结束。若同组内某条阻塞，该组挂起，不拆开交付。
+**批次 C 是一次性迁移，不接受"先做部分"的中间态。** Git 3 条已按用户决定删除；C-1（spec/mcp）与 C-2（files）各自必须整组完成；两组都完成才算批次 C 结束。若同组内某条阻塞，该组挂起，不拆开交付。
 
 **批次 G 同理**：36 条一次性交接，不接受"先搬 agents 三条"。F 必须先于 G，因为 agent 插件依赖公共存储与日志出口。
 
@@ -654,9 +684,10 @@ UI 插件可申报图标，核心通过内置点位 `system.collect.ui.branding`
 
 | 层           | 用例                                                                                      |
 | ----------- | --------------------------------------------------------------------------------------- |
-| 协议          | 契约集合自检（`coreOwned` 36 / `delegated` 57 / `pendingHandoffRoutes` 55、互不重叠）、委派命名空间规则（自由 `/api/x` 可申报、保留前缀拒收、核心已实现同键标 shadowed）、新帧名登记、`api/delegate` 计数基线 |
+| 协议          | 契约集合自检（`coreOwned` 39 / `delegated` 54 / `pendingHandoffRoutes` 0、互不重叠）、委派命名空间规则（自由 `/api/x` 可申报、保留前缀拒收、核心已实现同键标 shadowed）、新帧名登记、`api/delegate` 计数基线 |
 | 核心 · 站点 WS  | 订广播投递、越界订阅拒绝、`ui.hello` 身份不符拒绝、空 scope 通配、`topics[]` 过滤生效                               |
 | 核心 · UI 自建站 | 可注册广播；注册收集/中转/执行被拒；同 id 不同配置拒收；关一个窗口不销毁站点；最后连接断开注销并广播 `closed`；自环投递带 `origin_plugin_id` |
+| 核心 · UI 多窗口 | 同插件开第二个窗口（w1/w2 两个 pid、快照 `windows=2`、`TREE_UI_WINDOW_ID` 注入）；关一个窗口插件仍在线且不发 `closed`；最后一个窗口才下线；多个 UI 插件并存互不影响；窗口上限 / 非 UI 目标 409 |
 | 核心 · 推送     | 插件自建广播站 → UI 收到；插件下线 → 收到 `state:"closed"`；公告板晚连回看                                      |
 | 核心 · 发现面    | 插件申报路由后 `meta.routes` 增长；自建站注册后 `meta.stations` 增长；未知 capability 原样透传                   |
 | 核心 · 委派     | 三态回包（503/504/502）、双家申报拒收、四元组与只读上下文透传、白名单外路径 404、`body_path`/`result_path` 流式与临时文件清理     |
@@ -701,7 +732,7 @@ UI 插件可申报图标，核心通过内置点位 `system.collect.ui.branding`
 | 核心（永久）           | `heartbeat`、`plugin_status`、`plugin_event`、`station_delivery`、`ui.hello`、`station/subscribe`、`station/trigger`、`station/register`、`station/unregister` |
 | 核心（传输）           | 心跳与限流参数、连接鉴权、`closed` 终止帧                                                                                                                              |
 | agent 插件（批次 G 后） | `message`、`tool_start`、`tool_end`、`agent_status`、`agent_done`、`agent_error`、`question` 等全部领域帧——以 `topic` 形式经广播站投递，**核心不解释 payload**                    |
-| 终端               | PTY 为宿主能力，保留在核心；终端帧不属于任何插件领域                                                                                                                           |
+| 终端               | 会话/输入/取消/尺寸/关闭走执行器插件（`local_executor` / `ssh_executor`）的**委派 REST**（`/api/terminal/{local,ssh}/sessions...`）；输出以 `terminal.<session>.output` / `.exit` 经各自广播站（`plugin.{local,ssh}_executor.broadcast.terminal`）投递。核心不持有 PTY、不做终端语义；UI 传输面在 `lib/ui/services/terminal_transport.dart`（见 [known-issues #31](../known-issues.md#31-集成终端迁移后无承接方pty-数据面延后)） |
 
 由此 `plugin/README` 的帧兼容口径（不变量 25）只对**核心帧**生效；领域帧的兼容责任归对应插件，插件自行声明版本。
 

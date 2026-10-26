@@ -15,18 +15,18 @@
 
 ### 问题 A：右栏不即时刷新
 
-- 右栏 [`FilePanel`](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/ui/widgets/file_panel.dart) 用 `_fileRefreshTrigger` 触发 `FileTree` / `TodoPanel` 重载（[file_panel.dart](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/ui/widgets/file_panel.dart#L62-L70)），但该触发器**只在**本地模式切换（[L93-L96](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/ui/widgets/file_panel.dart#L93-L96)、[L78](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/ui/widgets/file_panel.dart#L78)）与文件上传（[L248-L251](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/ui/widgets/file_panel.dart#L248-L251)）时递增。
-- `GitHistory`（[git_history.dart](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/ui/widgets/git_history.dart#L56-L61)）**完全没有**刷新触发器，只在 `initState` 加载一次。
+- 右栏 `FilePanel` 用 `_fileRefreshTrigger` 触发 `FileTree` / `TodoPanel` 重载（file_panel.dart），但该触发器**只在**本地模式切换（L93-L96、L78）与文件上传（L248-L251）时递增。
+- `GitHistory`（git_history.dart）**完全没有**刷新触发器，只在 `initState` 加载一次。
 - `TodoPanel` 靠 `refreshTrigger` + `sessionId` 变化才重载。
 - **"切 Tab 再切回"之所以能刷新**，是因为右栏子分区是 `TabBarView` 的子节点，切换/离开时其 `State` 被销毁重建，`initState` 重新加载数据。这是"偶然生效"而非设计的刷新机制。
-- 后端**不发** `todo_update` 等专用变更事件；工具执行只广播 `tool_start` / `tool_end`（[chat.py L1342/L1353](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/agent/chat.py#L1342-L1353)）。所以"模型写文件 / 更新 todo / 做 git 提交"没有任何信号通知右栏。
+- 后端**不发** `todo_update` 等专用变更事件；工具执行只广播 `tool_start` / `tool_end`（chat.py L1342/L1353）。所以"模型写文件 / 更新 todo / 做 git 提交"没有任何信号通知右栏。
 
 ### 问题 B：SSH 模式 git 历史为空
 
-- git 端点 `io_/routes.py` 的 [`git_log`](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/io_/routes.py#L836-L872) 与 [`git_branches`](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/io_/routes.py#L875-L908) 只有**两条执行路径**：
+- git 端点 `io_/routes.py` 的 `git_log` 与 `git_branches` 只有**两条执行路径**：
   - **本地模式**：经反向 WS 转前端 `LocalExecutor`。
   - **其余全部**：`docker_manager.git_log`（docker 容器 或 docker 不可用时的本机目录）。
-- **没有 SSH 分支**。而 agent 的 shell/工具已用 `mode_resolver` 区分 cloud/local/ssh（[mode_resolver.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/io_/mode_resolver.py#L53-L74)），SSH 下返回 `SSHWorkspaceIO`（[ssh_workspace_io.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/io_/ssh_workspace_io.py#L178-L199) 的 `git_log` 已存在）。
+- **没有 SSH 分支**。而 agent 的 shell/工具已用 `mode_resolver` 区分 cloud/local/ssh（mode_resolver.py），SSH 下返回 `SSHWorkspaceIO`（ssh_workspace_io.py 的 `git_log` 已存在）。
 - 因此 SSH 模式下，git 端点落到 `docker_manager`，查询的是 **docker 容器/本机目录**而非 SSH 远端工作空间。远端有提交、本地/容器那份没提交 → `git log --all` 空 → 前端显示"暂无提交历史"。**"解析"本身没错，错在查询了错误的源。**
 
 ---
@@ -36,7 +36,7 @@
 ### 后端：SSH 模式 git 走 SSHWorkspaceIO
 
 **1. `server/io_/ssh_workspace_io.py` — 新增 `git_branches`**
-与现有 [`git_log`](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/io_/ssh_workspace_io.py#L178-L199) 同构：
+与现有 `git_log` 同构：
 
 ```python
 async def git_branches(self, workspace_id: str) -> Dict[str, Any]:
@@ -78,7 +78,7 @@ if mode == "ssh":
 > 说明：`git_diff / merge / fetch` 不在 `GitHistory` 面板展示范围内，本次不动，保持现状（docker/local 专用）。
 
 **3. 前端 `GitHistory` 必须传 `topAgentId`**
-SSH 注册以 `(user_id, top_agent_id)` 为 mode key（[mode_resolver._is_ssh](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/io_/mode_resolver.py#L43-L50)）。当前 `git_history.dart` 调 `ApiService.getGitLog(workspaceId)`（[L77](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/ui/widgets/git_history.dart#L77)）、`getGitBranches(workspaceId)`（[L102](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/ui/widgets/git_history.dart#L102)）未传 `top_agent_id` → mode key 落到 `workspace_id`，SSH 判定失败。因此即使修好后端，仍会退到 docker。必须把 `topAgentId` 透传（`api_service` 已支持该参数，[api_service.dart L291-L299](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/io/api_service.dart#L291-L299)）。
+SSH 注册以 `(user_id, top_agent_id)` 为 mode key（mode_resolver._is_ssh）。当前 `git_history.dart` 调 `ApiService.getGitLog(workspaceId)`（L77）、`getGitBranches(workspaceId)`（L102）未传 `top_agent_id` → mode key 落到 `workspace_id`，SSH 判定失败。因此即使修好后端，仍会退到 docker。必须把 `topAgentId` 透传（`api_service` 已支持该参数，api_service.dart L291-L299）。
 
 ### 前端：右栏即时刷新
 
@@ -111,7 +111,7 @@ class WorkspaceRefreshService extends ChangeNotifier {
 ```
 
 **5. `lib/ui/widgets/message_panel.dart` — 工具结束触发刷新**
-在 [`_handleIncomingMessage`](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/ui/widgets/message_panel.dart#L280) 的 `tool_end` 分支（[L373-L382](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/ui/widgets/message_panel.dart#L373-L382)）末尾调用：
+在 `_handleIncomingMessage` 的 `tool_end` 分支（L373-L382）末尾调用：
 
 ```dart
 WorkspaceRefreshService.instance.notifyWorkspaceChanged();

@@ -2,7 +2,7 @@
 
 ## Why
 
-现行实现存在六类已确诊故障：①前端执行器为"单槽位"（单一 `_currentTopAgentId` 上下文），多 team 无法同时工作，跨模式请求被误路由或超时；②id 链路缺失（IO 构造点不传 `agent_id`、payload 缺 `top_agent_id`），SSH 模式归属校验全部失效；③上传接口固定写入 docker 沙箱（[routes.py#L419-498](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/io_/routes.py#L419-L498)），SSH/local 模式下 agent 无法读取；④跨 team 消息接收方无对应会话导致 UI 不显示；⑤文件栏 `list_files`/`get_file_content` 只有 local/docker 两分支（[routes.py#L211-L268](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/io_/routes.py#L211-L268)），SSH 模式漏到 docker 分支显示沙箱文件（git 端点因正确调 `resolve_mode` 而正常）；⑥SSH teammate 的 `list_members` 仅显示数量（team_store 查询依赖的 `top_agent_id` 上下文缺失 + roster 回退读远端失败）。另认证为无状态 JWT（[auth.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/ws/auth.py)），撤销表仅内存、无多设备 token 管理。
+现行实现存在六类已确诊故障：①前端执行器为"单槽位"（单一 `_currentTopAgentId` 上下文），多 team 无法同时工作，跨模式请求被误路由或超时；②id 链路缺失（IO 构造点不传 `agent_id`、payload 缺 `top_agent_id`），SSH 模式归属校验全部失效；③上传接口固定写入 docker 沙箱（routes.py#L419-498），SSH/local 模式下 agent 无法读取；④跨 team 消息接收方无对应会话导致 UI 不显示；⑤文件栏 `list_files`/`get_file_content` 只有 local/docker 两分支（routes.py#L211-L268），SSH 模式漏到 docker 分支显示沙箱文件（git 端点因正确调 `resolve_mode` 而正常）；⑥SSH teammate 的 `list_members` 仅显示数量（team_store 查询依赖的 `top_agent_id` 上下文缺失 + roster 回退读远端失败）。另认证为无状态 JWT（auth.py），撤销表仅内存、无多设备 token 管理。
 
 ## 术语与 ID 模型（全局约定）
 

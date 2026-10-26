@@ -729,7 +729,7 @@
   代理对、`identical()` 钉定居块实例、围栏 hold/破硬顶每块自洽、封口全定居）。
 
 - **max_tokens 截断的半截工具参数必须被自动修复成合法 JSON**（**新增**
-  [packages/tree_core/lib/src/llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 15，
+  packages/tree_core/lib/src/llm/README.md 不变量 15，
   现场见 [docs/known-issues.md](docs/known-issues.md) #36）：
   - 端点对截断本身**从不报错**（实测：流式/非流式都是 200 + `finish_reason=length` + 半截
     `arguments` 原样透传）；500 发生在**下一轮**——半截串落库后端点渲染历史时解析失败，
@@ -953,7 +953,7 @@
   6 例（一次上报就拉起重连 / 重复上报只记数、不叠第二个 / 失败按退避继续到成功 / `clear()` 后循环退出 /
   关停后不再试 / 日志只喊一次）；**用例自己不调 `pump.start()`**——把 `report` 里的 start 摘掉，
   「一次上报」「重复上报」「失败重试」三例即红。
-- [packages/tree_core/test/plugin_execute_new_commands_test.dart](packages/tree_core/test/plugin_execute_new_commands_test.dart)
+- packages/tree_core/test/plugin_execute_new_commands_test.dart
   新增 `ssh.reconnect` 用例（目标透传 + 三种结局如实；未接线可读失败；四元组 fail-closed 同样管住它）。
 
 ### 文档
@@ -967,7 +967,7 @@
 
 ### 修复（真机复现后立刻补上的那一跳）
 
-- **失败载荷必须穿到插件**（修改 [packages/tree_core/lib/src/llm/README.md](packages/tree_core/lib/src/llm/README.md)
+- **失败载荷必须穿到插件**（修改 packages/tree_core/lib/src/llm/README.md
   不变量 14、[packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 5、
   [docs/plugin-development.md](docs/plugin-development.md) §6.1）：`llm.call` 解析不出 JSON 时，核心会把那次
   **已付费的模型正文原文**放进失败回包（`StationCommandOutcome.failedWith(error, payload)`）——可这份载荷在
@@ -984,10 +984,10 @@
 
 ### 新增回归用例（**先证伪，再修**）
 
-- [packages/tree_core/test/plugin_execute_new_commands_test.dart](packages/tree_core/test/plugin_execute_new_commands_test.dart)
+- packages/tree_core/test/plugin_execute_new_commands_test.dart
   「llm.call：解析失败也必须把原文（text）经执行站回给插件」——钉住执行站那一跳；**把本次修复 stash 掉该用例即失败**
   （`payload` 为 null）。
-- [packages/tree_core/test/compact_plugin_e2e_test.dart](packages/tree_core/test/compact_plugin_e2e_test.dart)
+- packages/tree_core/test/compact_plugin_e2e_test.dart
   （**真 Python 进程 + 真总线**）三条：① 正文只有尾逗号这类纯语法问题 ⇒ **零额外调用**（本地修复免费）就接管，
   摘要标注"由本地结构修复得到"；② 真截断 ⇒ **恰好 1 次**修复调用（断言该次不带 `tools` / `response_format` /
   `max_tokens`）后接管，摘要标注"由一次 JSON 修复调用补全 + 模型判定原文被截断"；③ 三段全败 ⇒ 回退内置，
@@ -998,7 +998,7 @@
 ### 断言变化（新增 / 修改的 README 不变量）
 
 - **SSH 链路失活后要能重建（判据不变，动作补齐）**（修改 [packages/tree_local_exec/README.md](packages/tree_local_exec/README.md)
-  不变量 6、[packages/tree_core/lib/src/tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 3、
+  不变量 6、packages/tree_core/lib/src/tool/README.md 不变量 3、
   [docs/architecture.md](docs/architecture.md) §11；**用户要求 2026-10-05**：
   「保持心跳失活判超时的断言，但判超时后重连 + 显式『重连』入口」）：判死判据**一个字没动**（连续 N 拍心跳窗口
   内没回包 ⇒ 判失活，在途操作显式失败），补上判死**之后**的动作——传输层在判失活的那一拍起**后台重连**
@@ -1025,7 +1025,7 @@
 > 不补这一段，tag 指向的代码与 CHANGELOG 的描述就对不上（用户 2026-10-05 拍板「补」）。
 
 - **图像真正送达模型：两条路径 + 一次被证伪的判定**（修改
-  [packages/tree_core/lib/src/llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 8）：
+  packages/tree_core/lib/src/llm/README.md 不变量 8）：
   `if_vision` 的图先走 Files API（`file_id` 引用 + 跨轮缓存），端点不支持 / 上传失败（非 2xx、网络错、
   响应无 `id`、缺 `base_url`·`api_key`）时**回退内联 base64**
   （`{"type":"image_url","image_url":{"url":"data:<mime>;base64,…"}}`，载体是新类型 `VisionImageRef`），
@@ -1037,7 +1037,7 @@
   （该端点就是不支持 Files API），真正让图送达模型的是**内联回退**
   （[docs/known-issues.md](docs/known-issues.md) #30）。
 - **压缩总结解析失败不再白花钱**（新增
-  [packages/tree_core/lib/src/llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 14、
+  packages/tree_core/lib/src/llm/README.md 不变量 14、
   修改 [packages/tree_core/lib/src/plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 5）：
   `llm.call` 解析不出 JSON 时，回包补齐 `error_kind='json_parse'` / `text`（模型正文**原文**）/
   `text_length` / `truncated_suspect`，**文案按实际响应形式分支**（`text` 形态下根本没发 `response_format`，
@@ -1084,8 +1084,8 @@
   （Windows 上是黄色），染不上主题色。「什么时候显示空态」的口径（只在确实加载完且真的没有
   消息时，加载中渲染骨架）**一个字没改**。
 - **后台 hook 的「可见可关」在生产接线上真正成立**（修改
-  [packages/tree_core/lib/src/tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 8；
-  修 [workspace_tool_runner.dart](packages/tree_core/lib/src/tool/workspace_tool_runner.dart) 的接线；
+  packages/tree_core/lib/src/tool/README.md 不变量 8；
+  修 workspace_tool_runner.dart 的接线；
   场景 [docs/known-issues.md](docs/known-issues.md) #25）：
   不变量 8 早就写着"后台任务要登记进 `ToolRunRegistry`、右栏可见可关"，但生产接线里
   `TerminalHooks(toolRuns: toolRuns)` 传的是**同名构造形参**（`tree_core_cli` 不传 ⇒ 恒 null），
@@ -1094,8 +1094,8 @@
   （直接构造 `TerminalHooks` 的用例钉不住它）。
 
 - **`ask_user_question` 不再被其它消息打断：任何工具调用执行期间，插入消息排队等待**（新增
-  [docs/known-issues.md](docs/known-issues.md) #26；修改 [agent/README.md](packages/tree_core/lib/src/agent/README.md)
-  不变量 8 / 13、[tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 10；
+  [docs/known-issues.md](docs/known-issues.md) #26；修改 agent/README.md
+  不变量 8 / 13、tool/README.md 不变量 10；
   **用户要求 2026-10-04**：「ask_user_question 会被其他消息（包括 terminal hook 等）打断」，
   断言原文：「任何工具调用执行期间不被插话打断，插入消息（包括 terminal/subagent hook 完成消息）
   在工具调用期间必须排队等待」）：取消信号拆成**软 / 硬**两条——`_RunToken.cancelled`
@@ -1106,7 +1106,7 @@
   ＋ broker 轮询拿到的软信号），插进来的消息改为**排队等到作答或显式取消**；`stop` 仍立刻收尾。
 
 - **`llm.call` 的返回形式可以显式选 `text`：复用对话前缀的调用这才真能吃到前缀缓存**（修改
-  [packages/tree_core/lib/src/llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 10、
+  packages/tree_core/lib/src/llm/README.md 不变量 10、
   [docs/plugin-development.md](docs/plugin-development.md) 的「缓存」段与 `llm.call` 参数表；
   场景见 [docs/known-issues.md](docs/known-issues.md) #27；**用户要求 2026-10-04**：
   「`llm.call` 的格式是 json，怀疑这类请求即使复用原消息仍零上下文缓存」）：
@@ -1123,8 +1123,8 @@
   同类调用 242023/**0**）。
 
 - **重启不再作废系统提示词（进而不再作废整条端点前缀缓存）：钉住值落库、跨重启逐字复用**（修改
-  [packages/tree_core/lib/src/agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 5；
-  修 [conversation_service.dart](packages/tree_core/lib/src/agent/conversation_service.dart) 的钉住 / 复用、
+  packages/tree_core/lib/src/agent/README.md 不变量 5；
+  修 conversation_service.dart 的钉住 / 复用、
   [core_server.dart](packages/tree_core/lib/src/server/core_server.dart) 的预热接线与两处"改来源即重建"、
   [records.dart](packages/tree_core/lib/src/store/records.dart) 的 `system_prompt_pinned`；
   场景 [docs/known-issues.md](docs/known-issues.md) #28；**用户要求 2026-10-04**：
@@ -1149,8 +1149,8 @@
 ### 断言变化（新增 / 修改的 README 不变量）
 
 - **`ask_user_question` 一次可以问多道题（单问行为逐字不变）**（新增
-  [agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 8.1、
-  [tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 10、
+  agent/README.md 不变量 8.1、
+  tool/README.md 不变量 10、
   [lib/README.md](lib/README.md) 不变量 24，**用户要求 2026-10-04**：
   「ask_user_question 工具仅支持单个问题（改为支持多问题）」）：
   工具 schema 收 `questions:[{question, options}]`（1~10 道，`question`/`options` 是"只有一道题"的简写），
@@ -1164,7 +1164,7 @@
   不追改用户数据；三件事的不变量（先落盘再推帧 / 作答幂等 / 取消能打断 / `createdAt` 严格递增）一个字没改。
 - **`terminal` 的 `hook=true` 在本机与远端（SSH）是同一套语义，且远端任务跨重启接续**（新增
   [tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 16、
-  [tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 8，**用户要求 2026-10-04**：
+  tool/README.md 不变量 8，**用户要求 2026-10-04**：
   「`hook=true` 那条路看不到我远端工作空间的文件……你应该修好它」；现场事故见
   [docs/known-issues.md](docs/known-issues.md) #22）：
   后台执行由新的 `BackgroundExecHost` 原语承担（本机 = 脚本 + shell 重定向直写日志、进程句柄在手；
@@ -1175,7 +1175,7 @@
   则**如实记日志、台账保留**，不假装投递成功；关停语义两端不同且如实（本机杀进程树，**远端不杀**）。
 - **远端 `hook=true` **立即返回**（不许退化成同步调用）**（修改
   [tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 16、
-  [tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 8、
+  tool/README.md 不变量 8、
   [docs/architecture.md](docs/architecture.md) §11；真机实测见
   [docs/known-issues.md](docs/known-issues.md) #23）：
   远端命令形状改为 `( setsid nohup sh -c '<cmd> ; printf %s $? > <哨兵>' > <日志> 2>&1 < /dev/null & echo $! )`
@@ -1195,8 +1195,8 @@
   （**只切上下文、不滚动到某条消息**，与「问题回复」页的定位是同一范式）；agent 名与会话标题取不到时
   **回退显示 id**（`session_default` → 「默认会话」），名字接口挂了不影响列表与关闭；未接定位回调或该行没有
   agent id ⇒ **整行不可点**（不假装能跳）。后台 hook 与普通工具运行共用同一条来源字段。
-- **后台 hook 出现在右栏「正在执行的 tool」，用户可关**（[tool/README.md](packages/tree_core/lib/src/tool/README.md)
-  不变量 8、[tool_run_registry.dart](packages/tree_core/lib/src/tool/tool_run_registry.dart)）：
+- **后台 hook 出现在右栏「正在执行的 tool」，用户可关**（tool/README.md
+  不变量 8、tool_run_registry.dart）：
   登记进运行中工具表（`watchdog: false` ⇒ 长任务**不判超时、不刷 warning**；`crossCall: true` ⇒ 跨工具调用存活），
   用户点关闭 = 取消该 hook（本机真杀进程树；远端尽力 `kill`，拿不到 pid **如实回原因**）——
   与右栏按钮 / 执行站 `tool.close` / agent 的 `tool_runs` 仍是**同一个实现**。**不做**"两个新站点 + leader 可杀"（暂缓）。
@@ -1214,16 +1214,16 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
-- **临时员工起的 `terminal hook` 完成之后：提示归到会话主人、唤醒的是它自己**（[agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 17、
-  [test/subagent_hook_wake_test.dart](packages/tree_core/test/subagent_hook_wake_test.dart) 强制；用户 2026-10-03 现场：子 agent 的 hook 干完没人收尾）：
+- **临时员工起的 `terminal hook` 完成之后：提示归到会话主人、唤醒的是它自己**（agent/README.md 不变量 17、
+  test/subagent_hook_wake_test.dart 强制；用户 2026-10-03 现场：子 agent 的 hook 干完没人收尾）：
   `WorkspaceToolRunner._finished` 把 `tagOf(task.agentId)` 的标记透传给 `onHookFinished`；`ConversationService.wake` 用
   `subagents.handle(agentId)?.ownerAgentId` 解析**会话主人**再取会话（临时员工没有自己的会话；旧实现拿 `sub_…` 取到 `null`
   就 `return` ⇒ 完成提示不落库、子永远不被唤醒、父在 `wait_for` / 阻塞 `subagent` 上白等）。完成提示按 `kind='notice'`
   + 它的标记落在**会话主人的会话流**（不能用 `subagent_report`：会被它自己的历史排掉），那一轮仍以**它自己**的身份跑并带
   **它自己的历史**；**hook 日志与超长结果重定向仍落在会话主人那一份**（刻意口径不变）。
 - **运行中的工具与 LLM 请求是"可观测 + 可显式干预"的**（新增
-  [tool/README.md](packages/tree_core/lib/src/tool/README.md) 文件表 4 行与
-  [tool_run_registry.dart](packages/tree_core/lib/src/tool/tool_run_registry.dart)）：
+  tool/README.md 文件表 4 行与
+  tool_run_registry.dart）：
   ① 所有工具调用走 `WorkspaceToolRunner` 的**同一登记入口**；
   ② 超过阈值（默认 **300 s**，与 `terminal` 缺省软超时同值）**每次运行只 warning 一次**——
   会话一条 `llm_hidden` + `core.log` 一行；
@@ -1233,34 +1233,34 @@
   ⑥ **不自动杀**：超时只 warning，关闭必须显式，且用户（右栏）/ 插件（执行站 `tool.close`）/
   agent（`tool_runs`）**走同一个实现**；句柄不跨进程重启存活（旧句柄回"已失效"）。
 - **工具软超时与"转 hook"两端一致**（[tree_local_exec/README.md](packages/tree_local_exec/README.md)、
-  [tool/README.md](packages/tree_core/lib/src/tool/README.md)）：
+  tool/README.md）：
   `timeout_seconds` 在**本地与 SSH 都兑现**为软超时（到点**不杀进程**、交还句柄，
   `0`/负值 = 永不软超时）；`terminal` 到点**先返回工具结果（批收尾）+ 会话继续**，
   命令结束经回调唤醒注入；SSH 侧为第三形态 `RunningSshExec`（不杀不重跑、结束补写输出与退出码、
   链路失活如实失败）。
-- **工具结果"永远拿不到"时在把关处自动修复**（[agent/README.md](packages/tree_core/lib/src/agent/README.md)、
-  [tool_result_repair.dart](packages/tree_core/lib/src/agent/tool_result_repair.dart)）：
+- **工具结果"永远拿不到"时在把关处自动修复**（agent/README.md、
+  tool_result_repair.dart）：
   引擎组装工具批时发现结果永远拿不到的卡 ⇒ 写回一段**如实**的失败信息（幂等、不新增消息、
   **不编造**退出码/输出/耗时）；未接线时退回老占位 `(该工具调用未完成，没有结果)`。
 - **批一定会收敛，但"不切开批"与"工具执行完前不接受新消息"两条语义保留**（
-  [llm/README.md](packages/tree_core/lib/src/llm/README.md)）：工具 `await` 期间按间隔**对账**——
+  llm/README.md）：工具 `await` 期间按间隔**对账**——
   存储里若已有这次调用（`callId` 命中）的**真实结果**就采用它让批收尾（**绝不注入合成结果**）；
   没有就**继续等显式取消**。"沉默/等待/关闭/对账"全部落 `core.log`（引擎侧生命周期留痕）。
-- **运行中的 LLM 请求也可观测、可关闭**（[tool/README.md](packages/tree_core/lib/src/tool/README.md)
+- **运行中的 LLM 请求也可观测、可关闭**（tool/README.md
   `llm_request_guard.dart`）：**连续零事件**达到阈值才登记（正常长生成不进表、不 warning）；
   被显式关闭 ⇒ 这一跳以**取消**收尾并掐掉底层订阅（HTTP/SSH 连接释放、插件收到取消通知）——
   插件挂住 / socket 挂住这条**无界**路径因此可关（此前它零日志、且"停止键"管不着）。
-- **`message` 的附件支持跨机投递**（[team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 15 重写、
-  [files/README.md](packages/tree_core/lib/src/files/README.md) 不变量 9 补充）：
+- **`message` 的附件支持跨机投递**（team/README.md 不变量 15 重写、
+  files/README.md 不变量 9 补充）：
   local↔local（本机 `File.copy`）、local↔SSH、SSH↔SSH（含跨主机，**经本机中转**）四种组合都支持；
   判据是**有效 SSH 接线**（`teamSshConfigFor`），不是 `agent.sshConfig`；单文件 ≤32 MB；
   越界路径拒绝、部分失败如实回 `files_failed`；local↔local 的行为与文案逐字不变。
-- **插话只打断目标那一轮**（[agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量）：
+- **插话只打断目标那一轮**（agent/README.md 不变量）：
   给主 agent 发消息**不再连带取消**它名下的临时员工（它们继续跑、完成报告照旧注入）；
   终止在途临时员工只有两条**显式**路径（用户 `stop` / 在它的视角里按停止）。
 
 - **没有任何硬超时：限制只有两类（心跳丢失 / 软超时），且软超时之后只允许显式关闭**（
-  [llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 2 加强、
+  llm/README.md 不变量 2 加强、
   [tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 2 加强、
   [plugin/README.md](packages/tree_core/lib/src/plugin/README.md) 不变量 8 加强，
   **用户断言 2026-10-03**：「仍旧无任何硬超时，所有超时限制仅限于心跳丢失或软超时（超时后仅允许显式关闭）」）：
@@ -1282,14 +1282,14 @@
   在跑的条目多一个**克制**的状态指示（小圆点 + 「工作中」，跟随主题色），空闲态不加噪音，**主会话那条永不显示**；
   数据源是面板已有的 `_workingSubagents`（`agent_status` 带 `subagent_id` 的子级帧分流进去的那份），以**只读**参数
   传给切换器——**不**塞回 `SubagentTranscript`（那是"过程 / 入口"的分栏），主视角的发送键 / 停止键语义不变（只认 `own_running`）。
-- **插话只打断目标那一轮：发给主 agent 不影响它名下的临时员工**（[agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 13、
+- **插话只打断目标那一轮：发给主 agent 不影响它名下的临时员工**（agent/README.md 不变量 13、
   [docs/team.md](docs/team.md) §4，**用户 2026-10-03 硬断言**：「发消息给主 agent，其子 agent 不受影响（和『发消息给子 agent，
   父 agent 及其他子 agent 不受影响』一致）」）：`_interruptForNewMessage` **只**标记目标 `(agentId, sessionId)` 那一轮，
   不再连带取消同一会话里它名下的临时员工——它们继续跑、完成报告照旧注入发起者；父那轮若正卡在 `subagent` / `wait_for`
   上，按"正在执行的工具跑完才收敛"把新消息排队等它返回。终止在途临时员工仍只有两条**显式**路径：用户 `stop`（按 agent，
   仍连带它名下的）与"在某个临时成员视角里按停止"（`sub_…` ⇒ 只停它自己）。
 - **临时员工的入口列表落盘；运行态与停止只作用在「当前视角那个人」身上**（[lib/README.md](lib/README.md) 不变量 21/22、
-  [agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 16、
+  agent/README.md 不变量 16、
   [server/README.md](packages/tree_core/lib/src/server/README.md) 不变量 15，**用户断言 2026-10-03**：
   「进入某个临时成员的选项经常会无端变化」+「临时成员的运行情况不应影响主 agent 运行情况……只有切到对应视角后才改停止按钮，
   且仅停止对应临时成员」）：① 新增只读 `GET /api/agents/{agentId}/subagents?session_id=`（`ApiPaths.agentSubagents`）：
@@ -1302,8 +1302,8 @@
   （`own_running: false` + `subagent_running: true`）——以前这种时刻什么都不发，主视角的停止键就一直亮着。
   ③ `stop` 传 `sub_…` ⇒ `cascade: false`：只停它自己（父 / 兄弟 / 其他成员 / 团队都不受影响），
   停止回执与补推的 `idle` 都带它自己的帧标记（前端只收它那一份「工作中」）。
-- **结果永远拿不到的工具卡：引擎在把关处自动修复**（[agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 15、
-  [llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 6、[store/README.md](packages/tree_core/lib/src/store/README.md) 消息口径，
+- **结果永远拿不到的工具卡：引擎在把关处自动修复**（agent/README.md 不变量 15、
+  llm/README.md 不变量 6、[store/README.md](packages/tree_core/lib/src/store/README.md) 消息口径，
   **用户口径 2026-10-03**：「在引擎的把关处，失败时自动修复」）：历史里 `kind=tool` 且 `tool_result` 为空的卡
   = 那次调用被停止 / 异常 / 核心重启收尾（结果**永远拿不到**；正在跑的调用不在历史里，不会误伤）⇒
   引擎组装工具批时把失败信息**写回同一张卡**（幂等、不新增消息：`tool_call_id` 不能重复）并把这份失败信息
@@ -1349,15 +1349,15 @@
 ### 断言变化（新增 / 修改的 README 不变量）
 
 - **SSH 那条线怎么拿到完整记录：找本机那条线代查；`message` 的附件只在本机工作空间之间可用**
-  （[team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 10 补充与 15、
-  [workspace_prompt.dart](packages/tree_core/lib/src/agent/workspace_prompt.dart)、[docs/team.md](docs/team.md) §6）：
+  （team/README.md 不变量 10 补充与 15、
+  workspace_prompt.dart、[docs/team.md](docs/team.md) §6）：
   ① 系统提示词的工作空间软约束**按模式**写明：`activity.log` **不是完整记录**（只有
   `[start]/[done]/[error]/[blocked]/[stale]` 这类生命周期行，写回时还会截断——够判断"谁在动、卡在哪"，
   不够复盘"到底做了什么"）；**SSH 那条线**（工作空间在远端）看不到本机、日志也在远端，要完整查询就用
   `message send_message` 找**工作空间在本机**的团队代查，并可请它用**自己的终端**（`scp` / `rsync` 之类）
   把**原文件推到远端**；**本机那条线**照做，并把结论或落地的远端路径回给对方。
   ② `message` 的 `files` 附件**只在本机工作空间之间可用**（⇒ **1.0.1 起已扩展为跨机投递**，
-  见上方 `## [1.0.2]` 与 [team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 15）：任一侧是 SSH 就不投递、
+  见上方 `## [1.0.2]` 与 team/README.md 不变量 15）：任一侧是 SSH 就不投递、
   明确回一句"未投递"，消息本身照常送达（工具描述里的 `files` 参数同步写清这条边界，免得模型以为跨机能带附件）。
 - **Tree 在"带着 RedirectionGuard"启动时会自愈重启；安装器改经 shell 启动**
   （[docs/architecture.md](docs/architecture.md) §13 不变量 11、`docs/known-issues.md` #16，
@@ -1381,16 +1381,16 @@
   指引文案从"先去管理员终端 `flutter pub get`"改成"**退出 Tree 从开始菜单重开一次**（新版本启动时会自愈）
   ／先在系统终端里跑这条命令"——用户实际踩到的正是 CMake 那种措辞，而上一轮的关键字里没有它。
 - **`subagent`（临时员工）的使用策略写进三处提示词资产：工具描述 / 系统提示词 / 内置 Spec**
-  （[tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 12、[docs/architecture.md](docs/architecture.md) §8.1）：
+  （tool/README.md 不变量 12、[docs/architecture.md](docs/architecture.md) §8.1）：
   口径统一为——**什么时候用**（边界清晰、可独立完成的子任务：多份文件的同类改动、独立检索与调研、各自可验收的
   验证；要同时推进就用 `background` 一次开几个）、**什么时候不用**（单文件小改、顺手就能干完的活、验收标准
   还说不清的事、为绕开工具/权限/上下文限制的套娃、原样转包）、**`task` 必须自包含**、**只有职责/范围一致才复用**
   `subagent_id`、**并行按文件/目录划分**（共享同一工作空间）、**套娃只用于把同一个大任务拆细**（层级有上限）、
   **与 `team` 的边界**（跨会话长期协作 / 需要正式团队流程才用 team）。落点：`SubagentTool.spec()` 的
   `description`；`defaultSystemPromptSeed` 新增「临时员工（subagent）使用策略」章
-  （[system_prompt_file.dart](packages/tree_core/lib/src/agent/system_prompt_file.dart)）；内置规范 general-task（v8）/ hard-task（v8）
+  （system_prompt_file.dart）；内置规范 general-task（v8）/ hard-task（v8）
   新增「成员 vs 临时员工（轻量并行）」判据、team-meeting（v6）把临时员工纳入"会议不许开工"的禁止面
-  （[builtin_specs.dart](packages/tree_core/lib/src/spec/builtin_specs.dart)）。注意：已有工作空间的 `.self/system_prompt.md`
+  （builtin_specs.dart）。注意：已有工作空间的 `.self/system_prompt.md`
   是用户文件，要拿到新种子需「重置」（[known-issues.md](docs/known-issues.md) #5）。
 - **中栏的窗口坐标实时化：拇指跟手、落点到位、只缓存坐标附近**（[lib/README.md](lib/README.md) 不变量 19②③、
   `docs/known-issues.md` #19，**用户断言 2026-10-03**：「页面上滚，拇指不动」「可以拖动拇指上滑，但很怪，
@@ -1422,17 +1422,17 @@
   UI 在拉起核心前先抢一把回环端口锁（锁键 = 数据根），第二个实例握手确认后立刻退出、并把已有实例的
   窗口叫到前面，绝不拉起第二个核心；端口被别的程序占用时照常启动（不因为撞端口把用户挡在门外）。
 
-- **LLM 传输层有限重试**（[llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 11）：最多 5 次重试、
+- **LLM 传输层有限重试**（llm/README.md 不变量 11）：最多 5 次重试、
   退避 `5/10/20/40/80s`（累计 155s），且**只在这一次尝试一个事件都还没交给上层时**重试——半路断流（已有增量）不重试，
   4xx / 流中 error 帧 / 取消 / 传输层已关闭不重试，退避等待可取消；**每次重试前先产出 `LlmRetryNotice`**
   （落成 `llm_hidden` 的进度消息），用户不会对着两分多钟的空白猜是不是卡死了；**总结器走同一条传输层**，
   它的进度经 `CompactionService.noticeSink` 落成同一种消息。
-- **`llm_hidden`：用户看得见、模型看不见**（[llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 12、
-  [agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 3、
+- **`llm_hidden`：用户看得见、模型看不见**（llm/README.md 不变量 12、
+  agent/README.md 不变量 3、
   [store/README.md](packages/tree_core/lib/src/store/README.md) 不变量 10）：失败 / 停止提示与**重试进度**照常落库、
   照常下发（前端当普通气泡），但引擎重建请求时**整条跳过**（压缩重试进度同理）；`kind` 保持 `text`——
   不做新 kind 的理由：`system` 会被读成 system prompt，「进不进提示词」与消息类别是两件正交的事。
-- **工具批是原子的：批中途的注入不切开它**（[llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 6）：
+- **工具批是原子的：批中途的注入不切开它**（llm/README.md 不变量 6）：
   一条 assistant 的 `tool_calls` 与它的**全部** tool 结果必须相邻；落在批中途的 hook 提示 / 用户插话
   一律推迟到该批结果之后——工具结果逐条落库（远端 SSH 上的慢工具尤其容易让注入卡在两条之间），
   就地发会把批切成"后半批没有 `reasoning_content`"，请求随即变成"以 tool 结果收尾、前面那条
@@ -1445,7 +1445,7 @@
   `maxScrollExtent` 是估算值，跟随模式下改为**粘底**（贴住就跟着长高走，用户一上滚立刻停手），
   且程序化跳底期间不再把滚动通知误判成"用户上滚"（长会话导入"划不到底"的真根因）。
 - **用户可以直接给临时员工发消息、停它，且"停"与"错"在发起者那边区别对待**
-  （[packages/tree_core/lib/src/agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 12、
+  （packages/tree_core/lib/src/agent/README.md 不变量 12、
   [lib/README.md](lib/README.md) 不变量 18）：界面复用 `user_message` 帧（收件人是 `sub_…`）→
   会话层 `sendToSubagent`：消息按 `role='user'` + **它的标记**落库（它自己的历史按标记取，发起者的模型
   上下文看不到它）、它正在跑就先**打断**（与主 agent 插话同一口径）、跑完把报告注入发起者会话；
@@ -1470,7 +1470,7 @@
 - **打包不许让图标字形静默缺失**（[tool/package_windows.dart](tool/package_windows.dart)）：构建改用
   `--no-tree-shake-icons`，并在打包后逐个人 `lib/` 里用到的 `Icons.*` 对字体 cmap，缺一个就失败并点名
   （真机现场：临时员工入口那颗按钮**画不出字形**，看着像"黑的"——发布版子集里没有 `badge_outlined`）。
-- **思考模型的每条 assistant 都带 `reasoning_content` 键**（[llm/README.md](packages/tree_core/lib/src/llm/README.md) 不变量 13）：
+- **思考模型的每条 assistant 都带 `reasoning_content` 键**（llm/README.md 不变量 13）：
   真端点实测（`deepseek-flash` @ `api.deepseek.com`，请求带 `tools`）：末尾 assistant（或末尾 tool 结果所属的
   那条 assistant）带 `reasoning_content: ""` 是 **200**，**整个键不给**才是 **400**
   `The reasoning_content in the thinking mode must be passed back to the API.`——端点只查**键在不在**，
@@ -1478,20 +1478,20 @@
   2026-10-03 10:10:41 契门会话，收尾正文没有思考卡、队友插话正好落在它前面）省略键会把整个会话打成 400。
   历史翻译（`LlmMessage.thinkingTurn`）与工具循环在途那一跳（`LlmSession.thinkingTurn`）**同口径**，
   字节一致才不丢前缀缓存；非思考模型（`thinking: false`）**一个键都不发**（OpenAI 系端点拒绝不认识的字段）。
-- **提问的 `createdAt` 严格递增**（[agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 8）：
+- **提问的 `createdAt` 严格递增**（agent/README.md 不变量 8）：
   `QuestionStore.add` 把提问时间抬成"全库严格递增"（与消息时间戳同一条规则，共用 `monotonicStamp`）——
   否则同一毫秒的两条在 `GET /api/questions` 的"最新的排前面"里顺序漂移（`List.sort` 不保证稳定）；
   装载旧文件只读不改，不追改用户数据。
 - **grep 的三个数字各管一件事**（[tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 7）：
   `scannedFileCount` 是计数、`scannedFilePaths` 只留 20 条抽样、`GrepQuery.maxResults`（默认 200）是命中行数上限。
-- **成员与 leader 共享工作目录与 SSH、私有状态按 agent 分栏**（[team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 2/3/4）：
+- **成员与 leader 共享工作目录与 SSH、私有状态按 agent 分栏**（team/README.md 不变量 2/3/4）：
   成员 yaml 里的 `workspace_dir` **不生效**、`ssh:` 缺省取 TOP 的、`.self` 落在 `.tree/<agent_id>/`。
 - **删 agent 有两道闸门，且删除路径与 team 工具同规则**（[server/README.md](packages/tree_core/lib/src/server/README.md) 不变量 12、
-  [team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 12、[lib/README.md](lib/README.md) 不变量 9）：
+  team/README.md 不变量 12、[lib/README.md](lib/README.md) 不变量 9）：
   有下级成员必须显式 `?cascade=1`（否则 409 + `cascade_required`，避免留下"删不掉、停不了、广播够不着却还能干活"
   的孤儿成员），**任一相关会话正在运行也拒绝**（409 + `running`，先停止并等它空闲——`stop` 抢不动正在执行的工具，
   核心不替用户等待）；通过后按「停 → 排水 → 清提问 → 叶→根删 → 回填 `team_member_count`」执行，删完不留 `data/<id>`。
-- **悬空团队指针启动自愈**（[team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 12：
+- **悬空团队指针启动自愈**（team/README.md 不变量 12：
   `team_repair.dart`）：上级被删的成员重挂到 TOP 且整棵子树的 `team_id`/`level` 一起平移；团队也没了就把最上层孤儿
   升为独立顶层 agent；`team_id` 悬空但父链完好按父链修正。每个被改的 `agents/<id>.yaml` 先备份 `.bak.<n>`（n 递增、
   绝不覆盖），幂等。
@@ -1501,7 +1501,7 @@
   POSIX 走系统 `script`，后端或 API 缺失一律**显式抛可读错误**（`PtyUnsupportedException`），
   **绝不静默降级**成无 TTY 的一次性 `exec`；改尺寸做不到时只记日志不抛。
 - **Ctrl+J 打开集成终端（真 PTY），且与焦点无关**（[lib/README.md](lib/README.md) 不变量 14、
-  [terminal/README.md](packages/tree_core/lib/src/terminal/README.md)）：输入框那块整体换成终端面板并**主动展开**
+  terminal/README.md）：输入框那块整体换成终端面板并**主动展开**
   （面板高 40%，可拖），再按一次回到输入框；终端**没有输入行**——按键逐键译成终端字节（回车 / 退格 / 方向键 /
   Ctrl+字母 / UTF-8 可打印字符），Ctrl+J 留给切换。快捷键绑在 MainPage 顶层的 `CallbackShortcuts` + 全局
   `TerminalToggleRequest` 上：**焦点在文件树 / 代码编辑器 / 详情页 / 终端自身时照样唤起**，连「没有任何主焦点」
@@ -1524,7 +1524,7 @@
   `CodeEditingController` 与同一份 `dirty` / `saving` / `loadedSize`——一边打字另一边立刻可见，任一窗格保存成功两边一起
   变成已保存、`if_size` 冲突流程不变；控制器归缓冲所有，两个窗格都关掉之后才释放。
   **这推翻了旧口径"同文件双开 ⇒ 非活动窗格强制只读"**：旧理由（两份缓冲互相覆盖）在共享一份缓冲之后不成立。
-- **新增 `PUT /api/files/{workspaceId}/content`**（[files/README.md](packages/tree_core/lib/src/files/README.md) 不变量 7/8）：
+- **新增 `PUT /api/files/{workspaceId}/content`**（files/README.md 不变量 7/8）：
   源码编辑器按完整文本保存，本机与 SSH 都走已有的工作空间 IO 抽象（UTF-8 写入、原样保留换行；既有非 UTF-8 文件沿用原代码页，
   编不回去就**显式拒绝**而不是静默转码）；`if_size` 与当前字节数不符回 409（文件已不存在也算冲突、不带 `size`），
   越界路径 / 图片 / PDF / Office / 压缩包 / 含 NUL 的二进制 / 超 `maxWriteBytes`（4 MB）一律可读 400，
@@ -1544,7 +1544,7 @@
   「展开」只把文本域原位变高（Esc 收起）且不动草稿与附件；附件一律可预览——图片给缩略图、
   其它给「图标+名称+大小」卡片，点开读**本机**文件（是不是图片看扩展名、是不是文本一律看字节：
   前 4 KB 有 NUL 就当二进制），文件不在或读不到时直说原因，不显示 0 B。
-- **提问 `cancel` 与"记录是否还在"解耦**（[agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 8）：
+- **提问 `cancel` 与"记录是否还在"解耦**（agent/README.md 不变量 8）：
   删除 agent 会摘掉提问记录，此时 `cancel` 也必须完成在途等待的 completer——否则等答案的工具永远拿不到结果，
   那一轮不收敛、`isRunning` 永远为真、连 `stop` 都救不回来。
 - **左栏列出全部 agent（含团队成员）**（[lib/README.md](lib/README.md) 不变量 6、[docs/team.md](docs/team.md) §7）：
@@ -1558,7 +1558,7 @@
   模型那一轮由 `LlmAgentEngine.awaitReady` 有界等一次预热，不会"悄悄少掉插件/MCP 工具"；
   每段往 stderr 打 `[core:boot]` 分段耗时。此前两段都排在握手**之前**，任何一家外设卡住都会让界面
   看到「核心进程未能启动（等待核心进程握手超时 25s）」。
-- **成员 yaml 里的 `workspace_dir` 是"共享目录的镜像"**（[team/README.md](packages/tree_core/lib/src/team/README.md)
+- **成员 yaml 里的 `workspace_dir` 是"共享目录的镜像"**（team/README.md
   不变量 13）：写进去的是**有效目录**——TOP 显式配置的，或 TOP 未配置时的默认目录；在建成员时、核心启动自愈时、
   TOP 改目录的 PATCH 之后维护（写前备份 `.bak.<n>`、幂等；TOP 自己的配置**绝不改写**）。
   它**不参与运行期解析**（仍只看 TOP 那份），只为两件事：界面显示成员实际在用的目录；
@@ -1569,8 +1569,8 @@
   （统一常量 [input_style.dart](lib/ui/widgets/input_style.dart)）——只写 `border: InputBorder.none` 压不住全局
   `inputDecorationTheme`（解析顺序 focusedBorder → enabledBorder → border），表现是卡片里多出主题那圈绿框；
   代码编辑器（源码视图）同一条口径。
-- **「这是远端吗」的唯一判据是「有效 SSH」**（[files/README.md](packages/tree_core/lib/src/files/README.md) 不变量 9、
-  [team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 3）：`teamSshConfigFor`（成员自己没有 `ssh:` 时跟随团队 TOP）
+- **「这是远端吗」的唯一判据是「有效 SSH」**（files/README.md 不变量 9、
+  team/README.md 不变量 3）：`teamSshConfigFor`（成员自己没有 `ssh:` 时跟随团队 TOP）
   贯穿工具层、文件面板、Git 面板与集成终端；此前文件面板只看 `agent.sshConfig`，把 SSH leader 的成员判成本机
   ——面板会拿一个远端路径去本机找目录（轻则"目录不存在"，重则读到本机同名路径），集成终端更会在本机起一个 shell。
 - **运行模式与工作目录是团队级的**（[lib/README.md](lib/README.md) 不变量 15）：中栏左上角按**团队 TOP** 合成
@@ -1605,7 +1605,7 @@
   `onPathRenamed` / `onPathDeleted` 接线也永远点不到；改成上下分栏（比例默认 0.4 且**记在面板状态**里），
   **没打开文件时树独占**（不留空分栏）；可用高度 < 200px 降级成**只显示查看器**；开 / 关查看器时文件子 Tab 区用
   `GlobalKey` **搬**进 / 搬出分栏而不是重建（展开状态、选中项、已加载的目录都不丢）。
-- **文件面板的增删改与 git 状态端点**（[files/README.md](packages/tree_core/lib/src/files/README.md) 不变量 10/11、
+- **文件面板的增删改与 git 状态端点**（files/README.md 不变量 10/11、
   [tree_local_exec/README.md](packages/tree_local_exec/README.md) 不变量 12/13）：新增 `POST .../mkdir`、`POST .../rename`、
   `DELETE ...?path=[&recursive=1]`、`GET .../git-status`（路径常量取自协议包 `ApiPaths`，不写字面量）。结构改动
   **只走工作空间 IO 抽象**（本机 `LocalWorkspaceIO`、远端 SFTP 的 `mkdir` / `rename` / `remove`，**不起 shell**，
@@ -1616,7 +1616,7 @@
   git 状态与 git 日志**共用** `GitOutput.statusArgs` / `parseStatus`（`--porcelain=v1 -z`，空格 / 中文 / 引号路径、
   重命名、暂存与工作区混合、未跟踪、被忽略、非法输入都有单测；条目上限 2000，超出即 `truncated: true`）；
   两侧都**不抛异常**：不是仓库 ⇒ `is_repo: false` + 空列表（面板空态，**不是** 400）。
-- **成员面板列的是「自己的下属」，且根卡片如实标注**（[team/README.md](packages/tree_core/lib/src/team/README.md)
+- **成员面板列的是「自己的下属」，且根卡片如实标注**（team/README.md
   不变量 14、[lib/ui/services/teammates_view.dart](lib/ui/services/teammates_view.dart)，**用户断言 2026-10-03**：
   「凌川的成员里有凌川」）：`GET /api/agents/{id}/teammates` 的名单改成**以该 agent 为根的下属子树**——
   TOP 仍是整队（取值与顺序照旧），成员的子树通常为空；**绝不把自己 / 自己的兄弟 / 自己的上级列成「它的成员」**，
@@ -1626,8 +1626,8 @@
   **滤掉自己**一道（旧核心 / 中间态兜底），拿不到描述符时用 `agent.teamId` 兜底，**不编「我是负责人」**。
 
 - **临时员工（`subagent`）工具：会话内的「临时员工」**（[store/README.md](packages/tree_core/lib/src/store/README.md) 不变量 11、
-  [tool/README.md](packages/tree_core/lib/src/tool/README.md) 不变量 11、
-  [agent/README.md](packages/tree_core/lib/src/agent/README.md) 不变量 10/11/12、
+  tool/README.md 不变量 11、
+  agent/README.md 不变量 10/11/12、
   [tree_core_cli/README.md](packages/tree_core_cli/README.md) 不变量 6、[tree_core/README.md](packages/tree_core/README.md)「临时员工给前端用的字段」；
   **用户断言 2026-10-04**）：模型可以现场召一个**临时员工**干活——召之即来、干完还在（同一会话内可复用）、可再派发
   （层级上限 3，超限给可读错误）。与 `team` 的本质区别是**它只活在会话里**：记录落在
@@ -1652,7 +1652,7 @@
   工具只在第一行顶一次，换人重新标）；`subagent` 工具卡片是普通工具卡片（中文标签「临时员工」，行正文给 `task`，
   复用与后台在行里带出来）。按 `subagent_id` 分组 / 按 `subagent_parent_id` 树形展示是后续渲染——字段已经全在
   帧与历史接口里。
-- **待处理成员红点接上真实计数**（[team/README.md](packages/tree_core/lib/src/team/README.md) 不变量 14、
+- **待处理成员红点接上真实计数**（team/README.md 不变量 14、
   [docs/team.md](docs/team.md) §7）：`GET /api/agents` 的 `pending_member_count` 此前**从不被赋值**（恒 0），
   而 `docs/team.md` 写着「未就绪成员会在 leader 上显示红点」——左栏那排红点与角标因此**永远不亮**。
   现在按**与成员面板同一个名册口径**数：TOP 数整队、成员只数自己那棵子树里未分配模型 / 待审核的成员

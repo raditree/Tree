@@ -1,6 +1,6 @@
 # 核心收束与 UI 插件化 Spec
 
-> 配套设计事实来源：[docs/pluginization/ui-pluginization.md](../../docs/pluginization/ui-pluginization.md)、[ui-pluginization_detailed.md](../../docs/pluginization/ui-pluginization_detailed.md)、[ui-pluginization_acceptance.md](../../docs/pluginization/ui-pluginization_acceptance.md)、[agent_pluginization.md](../../docs/pluginization/agent_pluginization.md)。实施时若与设计文档冲突，先改文档再改代码。
+> 配套设计事实来源：docs/pluginization/ui-pluginization.md、ui-pluginization_detailed.md、ui-pluginization_acceptance.md、agent_pluginization.md。实施时若与设计文档冲突，先改文档再改代码。
 
 ## Why
 

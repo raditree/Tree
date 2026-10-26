@@ -15,13 +15,13 @@
 
 ## 2. 现状分析
 
-- [terminal_tool.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/tool/terminal_tool.py)：`execute` 为同步阻塞调用 `run_io(io.exec_shell(...))`，有超时（默认 120s，封顶 3600），无后台/回调能力。
-- [workspace_io.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/io_/workspace_io.py)：`WorkspaceIO` 抽象了 cloud/local/ssh 三种执行；`LocalWorkspaceIO` 经反向 WS 转发到前端执行器。
-- [local_executor.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/io_/local_executor.py)：`LocalExecutorClient.request` 默认 **120s 响应超时**（`_LOCAL_EXEC_TIMEOUT`），这是本地模式长任务无法直接用 `exec_shell` 等待的原因——必须改为前端托管分离进程 + 退出时回传，才能支持长任务并拿到真实退出码。
-- [chat.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/agent/chat.py)：`_dispatch_agent_message`（顶部 agent 走 `top_chat_broker`、成员走 `team_broker`）与 `resume_after_answer` 就是“唤醒 agent 续跑”的现成机制；`_register_tools` 中能拿到 `session/user_id/agent_id/top_agent_id/session_id/is_member`，可构造闭包回调。
-- [tool/__init__.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/tool/__init__.py)：`register_builtin_tools` 构造 `TerminalTool(io, workspace_id)` 并注册；`_make_handler` 会把 kwargs 传给 `execute`。
-- 工具描述来源：[builtin.yaml](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/prompt/versions/1.0.0/tools/builtin.yaml)（`versions.active_tool_description("terminal")`），参数 schema 在 `get_tool_definition()`。
-- 前端本地执行器 [local_executor_service.dart](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/io/local_executor_service.dart) 用 `Process.run` 执行（无句柄可 kill）；[websocket_service.dart](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/lib/io/websocket_service.dart) 只把 `tool_exec_request` 路由给本地执行器。
+- terminal_tool.py：`execute` 为同步阻塞调用 `run_io(io.exec_shell(...))`，有超时（默认 120s，封顶 3600），无后台/回调能力。
+- workspace_io.py：`WorkspaceIO` 抽象了 cloud/local/ssh 三种执行；`LocalWorkspaceIO` 经反向 WS 转发到前端执行器。
+- local_executor.py：`LocalExecutorClient.request` 默认 **120s 响应超时**（`_LOCAL_EXEC_TIMEOUT`），这是本地模式长任务无法直接用 `exec_shell` 等待的原因——必须改为前端托管分离进程 + 退出时回传，才能支持长任务并拿到真实退出码。
+- chat.py：`_dispatch_agent_message`（顶部 agent 走 `top_chat_broker`、成员走 `team_broker`）与 `resume_after_answer` 就是“唤醒 agent 续跑”的现成机制；`_register_tools` 中能拿到 `session/user_id/agent_id/top_agent_id/session_id/is_member`，可构造闭包回调。
+- tool/__init__.py：`register_builtin_tools` 构造 `TerminalTool(io, workspace_id)` 并注册；`_make_handler` 会把 kwargs 传给 `execute`。
+- 工具描述来源：builtin.yaml（`versions.active_tool_description("terminal")`），参数 schema 在 `get_tool_definition()`。
+- 前端本地执行器 local_executor_service.dart 用 `Process.run` 执行（无句柄可 kill）；websocket_service.dart 只把 `tool_exec_request` 路由给本地执行器。
 
 ## 3. 设计决策（已与用户确认）
 

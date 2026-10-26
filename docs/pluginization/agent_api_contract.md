@@ -1,9 +1,9 @@
 # Agent 面 REST 契约逐条对照表（G-1 前置产物）
 
-> **状态**：2026-10-25 建立。对应台账 L-19（对照表本身）**已闭环**；L-01（插件侧逐条实现与等价验收）**仍未开始**。
+> **状态**：2026-10-25 建立；L-19（对照表本身）**已闭环**。L-01 已推进到「12 条只读双跑 + H1 24 条真实 HTTP 对照」：21 条一致、3 条已知差异（见 §5），**不宣称 36 条全等价**。
 > **定位**：把 [agent_pluginization.md](agent_pluginization.md) §1.2 的 **36 条**（34 存量 + 2 条上行改委派新增）逐条钉成契约：方法、路径、请求、成功/失败回包、副作用与已知缺口。迁移时**以本表为功能等价基线**（§5 清单），插件侧任何一条行为不同都算交接失败。
 >
-> **范围**：§1.1 的 17 条 + §1.2 的 17 条 = **34 条存量**，加 §1.2 表 1-2 的 **2 条新增** = G-1 的 36 条。§1.2 还多列了 **2 条 spec 端点**（#18/#19），它们归 `spec` 插件（批次 C）、**不属 G-1**；列在这里是因为它们与 agent 面共用数据层与错误口径，拆成两份文档更易漂。
+> **范围**：§1.1 的 17 条 + §1.2 的 17 条 = **34 条存量**，加 §1.2 表 1-2 的 **2 条新增** = G-1 的 36 条。§1.2 还多列了 **2 条 spec 端点**（#18/#19），A5 后由 `tree.agent` 申报承接（无独立 `spec` 插件）、**不属 G-1**；列在这里是因为它们与 agent 面共用数据层与错误口径，拆成两份文档更易漂。
 > **数据源**：`packages/tree_core/lib/src/server/core_server.dart` 的 `_registerRoutes()` 与各 handler；路径常量逐字取自 `packages/tree_protocol/lib/src/api_paths.dart`；字段形状来自 handler 写出的 JSON 与 `toApiJson` / `toJson` 等。**未凭记忆补字段**。
 > **行号口径**：以 2026-10-25 提交 `33f8115` 的工作树为准（`core_server.dart`）。此后该文件有改动时行号会漂，定位以"处理函数名"为准（行号只作辅助）。
 > **姊妹文档**：[ui-pluginization.md](ui-pluginization.md)（核心收束）、[agent_pluginization.md](agent_pluginization.md)（迁移计划）、[ui-pluginization_acceptance.md](ui-pluginization_acceptance.md)（验收）。
@@ -18,7 +18,7 @@
 4. **成功一律 200**（没有 201），`content-type: application/json; charset=utf-8`。
 5. **非法 JSON body 有两种口径**（代码现状，文档原先未写）：只有 `POST …/compact` 走 `_jsonBody` ⇒ `400 {"detail":"请求体非法：…"}`；其余处理器直接 `readJsonBody`，`FormatException` 未被捕获 ⇒ 全局兜底 **500**。字段类型不符（`as` 强转失败）同样是 **500**。见 C-02/C-03。
 6. **路由查表顺序**：已实现 router → 委派归属表 → 501 桩 → 404。`CoreServer.stubApiPaths` 为空集（`190`、`2064-2073`），所以"未实现且无插件申报"的路径今天是 `404`，不是 501。
-7. **迁移状态**：34 条存量仍在 `ApiPaths.pendingHandoffRoutes`（"此刻仍由核心实现、待交接"）；2 条新增只在 `ApiPaths.delegated`（核心未注册，今天请求是 404）。
+7. **迁移状态（2026-10-25 A5/G1 后）**：`ApiPaths.pendingHandoffRoutes` 已清零；34 条存量与 2 条新增全部在 `ApiPaths.delegated`，运行期由插件申报承接（插件不在位时 404）。
 8. **分页**：只有 `GET /api/conversations/{agentId}` 分页；其余列表端点（sessions / questions / specs / tools.running / subagents）都是一次性返回。
 9. **时间字段两种口径**：agent / 成员 / 会话的 `created_at`/`updated_at` 是**毫秒整数**；消息与子 agent 的 `timestamp`/`created_at` 是 **ISO-8601 字符串**（`JsonTime.encode`）。逐字段见样例。
 10. **路径占位符**：由 `CoreRouter` 的 `{name}` 提取，已按 `Uri.pathSegments` 解码一次。**同名占位符重复时后者覆盖前者**——`ApiPaths.teammateLog` 的模板就是两个 `{memberId}`（见 C-04）。
@@ -448,3 +448,18 @@
 - U11 POST .../sessions 的响应 message_count 恒 0：因为 3236 调 toApiJson() 未传计数；前端若拿它判断"会话是否有消息"会得到错误结论（与 #3/#5 口径不同）。
 - U12 handle 为空的 400 分支（_closeRunningTool:2234-2237）在正常 URL 路由匹配下不可达（/api/tools/running//close 不会匹配 {handle}）；保留为防御分支。
 - U13 记录类型：第 20 条的附件形状来自服务端归一化后的落库形态 {name, path, size, type}；WS 帧实际接受 {path,name?,size?,type?} 或纯字符串，REST 版是否同样宽松（代码未明确，但"同形"意味着沿用）。
+---
+
+## 5. H1 24 条真实 HTTP 对照（2026-10-25）
+
+> 口径：A5 删除核心实现前，用 tree.agent 插件的真实 HTTP 回包对照核心旧实现；覆盖 A2/A3 尚未双跑的 24 条路由。
+> 结果：**21 条一致、3 条差异**；**3 条差异已于 2026-10-25 清零**（见下表「处理结果」），口径回到 24/24 等价。
+
+| 路由 | H1 结果 | 差异 | 处理结果（2026-10-25 收口） |
+| --- | --- | --- | --- |
+| spec 路由（列表/详情） | 不一致 | 内置规范 `version` 3→4 | **已消除（无代码改动）**：插件 `lib/src/spec/builtin_specs.dart` 与核心 HEAD 版**逐字相同**（`git diff --no-index` 无差异），四个内置规范版本同为 8/8/6/4。H1 时看到的 3 来自当时工作空间里未刷新的旧副本；`SpecService.index → seedInto` 的升级语义（副本版本 ≤ 模板即备份刷新）与核心一致，读取时自动升到 4 |
+| `POST /api/agents/{agentId}/compact` | 不一致 | 插件回包无 `relay_skip_reason`（核心有） | **已消除**：插件 `CompactionResult.toJson()` 与核心 HEAD 同形（`git diff` 仅 3 行空行差异），`relay_skip_reason` 仅在非空时出现。回归用例：`test/compaction_test.dart`「REST 回包形状」 |
+| `POST /api/agents/{agentId}/reset` | 不一致 | 回包相对路径前缀不同 | **已修**：① 根因在 `ssh_executor` —— `ssh.file.list` 的条目原来是「请求目录相对」的裸名，与 `local_executor.file.list` 的「工作空间根相对」不同形；已统一为根相对（`_walkEntries` 用 `_relativePath`）。② `SpecService.reset` 再加一道 `_specRelativeOf` 归一，三种后端风格（根相对 / 请求目录相对 / 带私有前缀）都回 `.self/spec/<名>`。回归用例：`test/spec_tool_test.dart`「列目录只回文件名…也归一到 .self/spec/」 |
+| 其余 21 条 | **一致** | — | 状态码 / Content-Type / body 逐字节一致 |
+
+> 与 C-01~C-12 的关系：3 条差异不属于契约缺口，而是实测行为差异（acceptance L-01）。现已全部处理完毕；`agent_api_contract` 的 36 条 G-1 可宣称等价，剩余不等价项仅是 L-31 的 `teammateLog` 占位符命名（HTTP 形状等价）。

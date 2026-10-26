@@ -17,11 +17,11 @@
 
 ### 架构事实（已核实）
 
-- 四个内置模板位于 [server/tool/spec/builtin/](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/tool/spec/builtin)，结构为 front matter（YAML 风格）+ 三段正文（工作流/该类任务规范/注意事项）。
-- [spec_store.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/data/spec_store.py) 的 `_register_builtin_specs()` 在每次进程首次访问 DB 时把 front matter 的 title/task_type/description/when/tags **幂等同步**进 `specs` 表（UPDATE 路径会刷新元数据）→ **改 .md 文件内容后重启 server 即自动生效，无需 DB 迁移**。
-- [chat.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/agent/chat.py#L628-L669) 注入：Spec 索引（章节⑦，限摘要）+ 已选 Spec **全文**（章节⑧，含 front matter）→ 篇幅直接影响 token 成本（用户已接受详尽型成本）。
-- 系统实际工具名（[builtin.yaml](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/prompt/versions/1.0.0/tools/builtin.yaml) 已核实）：`read` / `write` / `grep` / `edit` / `terminal` / `mcp` / `team` / `set_todo_list` / `ask_user_question` / `spec`。
-- team 工具实际动作（[team_tool.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/tool/team_tool.py#L319-L329) 已核实）：`list_teams` / `list_members` / `create_member` / `query_member` / `update_member` / `view_member_output` / `view_member_log` / `send_message` / `assign_task`（spec 中这些引用正确）。
+- 四个内置模板位于 server/tool/spec/builtin/，结构为 front matter（YAML 风格）+ 三段正文（工作流/该类任务规范/注意事项）。
+- spec_store.py 的 `_register_builtin_specs()` 在每次进程首次访问 DB 时把 front matter 的 title/task_type/description/when/tags **幂等同步**进 `specs` 表（UPDATE 路径会刷新元数据）→ **改 .md 文件内容后重启 server 即自动生效，无需 DB 迁移**。
+- chat.py 注入：Spec 索引（章节⑦，限摘要）+ 已选 Spec **全文**（章节⑧，含 front matter）→ 篇幅直接影响 token 成本（用户已接受详尽型成本）。
+- 系统实际工具名（builtin.yaml 已核实）：`read` / `write` / `grep` / `edit` / `terminal` / `mcp` / `team` / `set_todo_list` / `ask_user_question` / `spec`。
+- team 工具实际动作（team_tool.py 已核实）：`list_teams` / `list_members` / `create_member` / `query_member` / `update_member` / `view_member_output` / `view_member_log` / `send_message` / `assign_task`（spec 中这些引用正确）。
 - todo 工具动作：`set` / `update` / `clear` / `get`（工具名为 `set_todo_list`）。
 
 ### 发现的问题

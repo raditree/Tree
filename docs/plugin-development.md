@@ -1083,7 +1083,7 @@ plugins:
   §5.6，没示例是因为接管者得**自带一份模型调用**（它才是循环的主人）：示例插件里那套
   `--relay-llm` 的流式写法就是它的下半身，把“每跳被问一次”换成“每轮被问一次”
   并把工具改成 `tool.call` + `run_id` 即成。要看逐帧形状，读测试夹具
-  [`test/fixtures/fake_llm_plugin.dart`](../packages/tree_core/test/fixtures/fake_llm_plugin.dart)
+  `test/fixtures/fake_llm_plugin.dart`
   的 `--loop-mode`（`stream` / `tool` / `late-tool` / `decline` / `whole` 五种回法，
   端到端用例在 `test/plugin_loop_relay_test.dart`）。
 - 运行：先 `dart run tool/build_plugins.dart` 产出到 `build/plugins/`，再把成品 exe 的路径

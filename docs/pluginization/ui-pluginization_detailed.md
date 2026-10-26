@@ -94,7 +94,7 @@ plugin.json
 
 | 文件 | 改动 | 理由 |
 | --- | --- | --- |
-| [lib/main.dart](file:///e:/programs/Tree/desktop/lib/main.dart) | 删除"默认拉起核心"分支；改为**先读 `TREE_CORE_URL`/`TREE_CORE_TOKEN`**，缺失则直接报错退出（不自行 spawn） | 启动顺序反转 |
+| lib/main.dart | 删除"默认拉起核心"分支；改为**先读 `TREE_CORE_URL`/`TREE_CORE_TOKEN`**，缺失则直接报错退出（不自行 spawn） | 启动顺序反转 |
 | ~~`lib/io/core_process_launcher.dart`~~ | **已删除**（U1）；启动核心的逻辑归 loader | UI 不再管核心进程 |
 | `lib/io/api_service.dart`（构造处） | base URL 从环境变量取；保留 `--dart-define` 覆盖供开发 | 端口随机 |
 | `lib/io/websocket_service.dart` | token 从环境变量取；连接后发送 `ui.hello`；订阅改为**按 topic 订阅** | 站点化 |

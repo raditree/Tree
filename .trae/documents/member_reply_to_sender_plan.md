@@ -7,7 +7,7 @@
 
 - 经团队工具（`send_message`/`assign_task`）由某个 agent 发出时，`source_agent_id`
   是真实发送者，回发目标正确；
-- 但**用户从 teammates 窗口直接发给成员**走 [send_teammate_message](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/agent/routes.py#L498-L508)，
+- 但**用户从 teammates 窗口直接发给成员**走 send_teammate_message，
   `source_agent_id=""`，`leader_id` 兜底成 top agent → 成员的总结被自动回发给 top agent，
   把 top agent 卷进了用户与成员的单独对话。
 
@@ -22,29 +22,29 @@
 - 一并覆盖“用户直接发→成员提问→回答续跑”边缘：`ask_user_question` 续跑后成员总结
   也要溯源原发送方，需在 `pending_questions` 表增加 `sender_id` 列持久化。
 
-**为什么平级/下级可行**：[`_dispatch_agent_message`](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/agent/chat.py#L1702-L1737)
+**为什么平级/下级可行**：`_dispatch_agent_message`
 的目标为**成员**的分支没有团队隔离拒绝，成员→成员本就经
-[`_find_roster_member`](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/agent/chat.py#L1582-L1630)
+`_find_roster_member`
 按 roster 解析；隔离拒绝只存在于“目标为顶部 agent”的分支（跨 Top 限制）。
 因此回发给“平级/下级（成员发送方）”天然可路由——只要 sender_id 指向该发送方。
 当前总回发给 top，恰恰是因为 `leader_id=top`，从没尝试按真实发送方寻址。
 
 ## 现状分析（已确认）
 
-- 成员负载在 [_dispatch_agent_message](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/agent/chat.py#L1633-L1745) 成员分支构造：
+- 成员负载在 _dispatch_agent_message 成员分支构造：
   `leader_id = source_agent_id or top_agent_id`，随后 `if extra: payload.update(extra)`。
-- [_process_member_message](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/agent/chat.py#L1373-L1568)：
+- _process_member_message：
   - `leader_id = payload.get("leader_id","")`；
   - 模型缺失报错块（约 L1420）用 `if leader_id:` 回发；
   - 最终总结回发（约 L1540）用 `if full_reply and leader_id:`。
-- `leader_id` 同时被 [register_builtin_tools → TeamTool](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/tool/__init__.py#L214-L220) 用作成员“认识自己上级”，**不能置空**。
+- `leader_id` 同时被 register_builtin_tools → TeamTool 用作成员“认识自己上级”，**不能置空**。
   因此需新增独立字段 `sender_id` 表示“本条消息的发送方”，`leader_id` 语义不变。
-- AskUserQuestionTool 在 [register_builtin_tools](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/tool/__init__.py#L221-L225) 构造，
-  execute 里 `save_pending_question` 持久化提问（[ask_question_tool.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/tool/ask_question_tool.py#L122-L132)）。
-- 用户回答唤醒走 [endpoints.py user_answer](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/ws/endpoints.py#L209-L217)
-  → [resume_after_answer](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/agent/chat.py#L1776-L1810) 成员分支
+- AskUserQuestionTool 在 register_builtin_tools 构造，
+  execute 里 `save_pending_question` 持久化提问（ask_question_tool.py）。
+- 用户回答唤醒走 endpoints.py user_answer
+  → resume_after_answer 成员分支
   以 `source=top` 重新投递，导致续跑后总结又回发给 top。
-- `pending_questions` 表结构见 [conversation_store.py](file:///e:/programs/Tree/flutter_application_tree/flutter_application_tree/server/data/conversation_store.py#L114-L130)，
+- `pending_questions` 表结构见 conversation_store.py，
   无 `sender_id` 列。库迁移使用 `PRAGMA table_info` + `ALTER TABLE ADD COLUMN` 幂等模式（见同文件 L107-L112）。
 
 ## 设计决策
