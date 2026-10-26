@@ -64,7 +64,6 @@ void main() {
       pluginBus: bus,
       dataDir: temp.path,
       enableHeartbeat: false,
-      streamChunkDelay: Duration.zero,
     );
     addTearDown(() async {
       await server.close();

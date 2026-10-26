@@ -98,8 +98,6 @@ void main() {
       store: store,
       dataDir: temp.path,
       enableHeartbeat: false,
-      streamChunkDelay: Duration.zero,
-      engine: ScriptedAgent(chunkDelay: Duration.zero),
     );
     // 接线完成（bindDelegatedRouter + invalidate）后再刷新一次：这一趟才会把
     // `system.collect.api.routes` 的申报写进归属表。
@@ -120,11 +118,14 @@ void main() {
       await ctx.server.close();
     });
 
-    // 用 POST 是刻意的：GET 这条核心自己已经实现（片 C 不删实现，见 SubTask 3.6），
-    // 委派必须让位；POST 只有 501 桩，归委派接。
+    // A5 后核心不再解析领域归属：信封里的 team / session / mode / workspace
+    // 全部按**调用方原样给出的 query** 透传（不给即空串），由领域插件自己解释。
+    final String workspaceDir = p.join(temp.path, 'workspace');
     final _Response res = await ctx.client.send(
       'POST',
-      '/api/files/ag1/git-status?ignored=1&tag=a&tag=b',
+      '/api/files/ag1/git-status?ignored=1&tag=a&tag=b'
+          '&team_id=team-1&session_id=ses-1&mode_key=local'
+          '&workspace_dir=${Uri.encodeQueryComponent(workspaceDir)}',
       headers: <String, String>{'X-Secret': 'nope', 'Accept': 'application/json'},
     );
     expect(res.status, 200);
@@ -138,10 +139,14 @@ void main() {
     expect(envelope['query'], <String, dynamic>{
       'ignored': '1',
       'tag': <String>['a', 'b'],
+      'team_id': 'team-1',
+      'session_id': 'ses-1',
+      'mode_key': 'local',
+      'workspace_dir': workspaceDir,
     });
     expect(envelope['agent_id'], 'ag1');
     expect(envelope['team_id'], 'team-1');
-    expect(envelope['workspace_dir'], p.join(temp.path, 'workspace'));
+    expect(envelope['workspace_dir'], workspaceDir);
     expect(envelope['data_dir'], temp.path);
     expect(envelope['scope']['mode_key'], StationModeKey.local);
     // 请求头白名单：自定义头与凭证头不出去
@@ -367,46 +372,6 @@ void main() {
     expect(meta.json['routes'], isEmpty);
   });
 
-  test('已实现路由：申报被接受并标 shadowed，HTTP 仍由核心承接（双跑期）', () async {
-    final ({CoreServer server, _Client client, PluginBus bus}) ctx = await serve(
-      <({String id, List<String> args})>[
-        (id: 'sample', args: <String>['--api-route', 'GET:$gitStatus']),
-      ],
-    );
-    addTearDown(() async {
-      ctx.client.close();
-      await ctx.server.close();
-    });
-
-    // 双跑期（A2~A4）：插件必须先申报、后交接。同键已被核心实现时**接受**申报
-    // （归属表里有它、/api/meta 能看到），但 notes 写明暂由核心承接；核心删掉
-    // 该实现后同一申报自动生效——不能再拒收，否则「先申报后交接」就死锁了。
-    expect(ctx.server.delegatedRouter.routeCount, 1);
-    expect(
-      ctx.server.delegatedRouter.notes.join('\n'),
-      allOf(contains('核心仍在实现'), contains('shadowed')),
-      reason: '接受申报必须留一条可读记录：核心仍在承接',
-    );
-    final _Response meta = await ctx.client.send('GET', '/api/meta');
-    expect(
-      meta.json['routes'],
-      contains(
-        allOf(
-          containsPair('method', 'GET'),
-          containsPair('pattern', '/api/files/{workspaceId}/git-status'),
-          containsPair('owner', 'sample'),
-        ),
-      ),
-    );
-
-    // 已实现路由（GET 未接 FileService，核心自己的回答是 501 文件服务尚未接入）。
-    final _Response implemented = await ctx.client.send(
-      'GET',
-      '/api/files/ag1/git-status',
-    );
-    expect(implemented.status, 501);
-    expect(implemented.text, contains('文件服务'));
-  });
 
   test('自造 /api 路由可申报并承接（L-28 去静态白名单）', () async {
     const String custom = '/api/sample/tree-info';

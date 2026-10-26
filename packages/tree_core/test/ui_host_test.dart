@@ -80,6 +80,28 @@ void main() {
     expect(host.exitCode, isNull);
   });
 
+  test('窗口身份：windowId 注入 TREE_UI_WINDOW_ID；未分配时不注入', () async {
+    final UiHost windowed = await UiHost.start(
+      configFor(),
+      coreUrl: 'ws://127.0.0.1:12345',
+      coreToken: 'secret-token',
+      windowId: 'w2',
+    );
+    hosts.add(windowed);
+    await waitUntil(
+      () => windowed.stdoutTail.contains('TREE_UI_WINDOW_ID=w2'),
+      reason: '多窗口时进程必须能读到自己的窗口 id',
+    );
+    expect(windowed.windowId, 'w2');
+
+    final UiHost plain = await startHost();
+    await waitUntil(
+      () => plain.stdoutTail.contains('TREE_UI_WINDOW_ID='),
+      reason: '未分配窗口的宿主照常启动（该键为空）',
+    );
+    expect(plain.windowId, isEmpty);
+  });
+
   test('输出回调逐行触发：stdout / stderr 各走自己的回调（日志落盘接线用）', () async {
     final List<String> stdoutLines = <String>[];
     final List<String> stderrLines = <String>[];

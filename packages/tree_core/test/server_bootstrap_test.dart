@@ -15,7 +15,6 @@ void main() {
   setUp(() async {
     temp = await Directory.systemTemp.createTemp('tree_bootstrap_');
     server = await CoreServer.start(
-      streamChunkDelay: Duration.zero,
       enableHeartbeat: false,
       dataDir: temp.path,
       // 显式指向仓库里的真实种子：测试进程的 cwd / exe 同级都探测不到它，
@@ -85,8 +84,7 @@ void main() {
       await server.close();
       client.close();
       server = await CoreServer.start(
-        streamChunkDelay: Duration.zero,
-        enableHeartbeat: false,
+          enableHeartbeat: false,
         dataDir: temp.path,
         bootstrapSourcePath: seed.path,
       );
@@ -126,8 +124,7 @@ void main() {
       await server.close();
       client.close();
       server = await CoreServer.start(
-        streamChunkDelay: Duration.zero,
-        enableHeartbeat: false,
+          enableHeartbeat: false,
         dataDir: temp.path,
         bootstrapSourcePath: '${temp.path}/definitely-missing.html',
       );
@@ -236,8 +233,7 @@ plugins:
 ''');
       bus = PluginBus(configFile: config.path, log: (_) {});
       uiServer = await CoreServer.start(
-        streamChunkDelay: Duration.zero,
-        enableHeartbeat: false,
+          enableHeartbeat: false,
         pluginBus: bus,
         dataDir: pluginRoot.path,
       );

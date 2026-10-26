@@ -4,61 +4,28 @@ import 'dart:io';
 import 'dart:typed_data' show BytesBuilder;
 
 import 'package:path/path.dart' as p;
-import 'package:tree_local_exec/tree_local_exec.dart';
 import 'package:tree_protocol/tree_protocol.dart';
 
-import '../agent/agent_engine.dart';
-import '../agent/compaction_service.dart';
-import '../agent/conversation_service.dart';
-import '../agent/question_broker.dart';
-import '../agent/question_store.dart';
-import '../agent/scripted_agent.dart';
-import '../agent/system_prompt_file.dart';
-import '../agent/workspace_prompt.dart';
-import '../files/file_service.dart';
-import '../llm/llm_agent_engine.dart';
-import '../llm/llm_json_caller.dart';
 import '../plugin/builtin_plugins.dart';
 import '../plugin/execute_mounts.dart';
 import '../plugin/plugin_bus.dart';
 import '../plugin/plugin_config_store.dart';
 import '../plugin/plugin_dependency.dart';
 import '../plugin/plugin_downloader.dart';
-import '../plugin/plugin_host.dart' show PluginConfig;
-import '../plugin/station_scope.dart';
+import '../plugin/plugin_host.dart' show PluginConfig, PluginException;
 import '../plugin/station_ws_bridge.dart';
 import '../settings/core_settings.dart';
-import '../settings/ssh_config.dart';
-import '../spec/builtin_spec_assets.dart';
-import '../spec/spec_service.dart';
 import '../store/memory_store.dart';
 import '../store/plugin_store.dart';
-import '../store/subagent_registry.dart';
 import '../store/tree_paths.dart';
 import '../store/tree_store.dart';
-import '../store/usage_log.dart';
-import '../team/message_dispatcher.dart';
-import '../team/team_model.dart';
-import '../team/team_repair.dart';
-import '../team/team_service.dart';
-import '../team/team_workspace.dart';
-import '../tool/question_channel.dart';
-import '../tool/terminal_hooks.dart';
-import '../tool/llm_request_guard.dart';
-import '../tool/todo_store.dart';
-import '../tool/tool_run_registry.dart';
-import '../tool/tool_runner.dart';
-import '../tool/workspace_tool_runner.dart';
 import '../util/core_log_sink.dart';
 import '../util/ids.dart';
-import '../util/plugin_log_sink.dart';
 import '../util/liveness.dart';
+import '../util/plugin_log_sink.dart';
 import '../util/token.dart';
 import '../version.dart';
 import '../ws/inbound_frames.dart';
-import '../terminal/local_pty_starter.dart';
-import '../terminal/pty_process.dart';
-import '../terminal/terminal_service.dart';
 import '../ws/ws_hub.dart';
 import 'http_io.dart';
 import 'http_router.dart';
@@ -66,7 +33,7 @@ import 'bootstrap_page.dart';
 import 'token_registry.dart';
 import 'ws_liveness.dart';
 
-/// 核心进程的回环 HTTP + WS 服务（M1 骨架）。
+/// 核心进程的回环 HTTP + WS 服务（A5 后的平台面）。
 ///
 /// 设计要点（见迁移方案 §4）：
 /// - **只监听 127.0.0.1**：不接受外部连接；
@@ -76,10 +43,11 @@ import 'ws_liveness.dart';
 ///   `lib/io` 只是把 baseUrl/token 换成核心下发的值；
 /// - **零第三方依赖**：便于 `dart compile exe` 出单文件可执行。
 ///
-/// 覆盖度不变量（由 `test/server_test.dart` 的覆盖度用例强制）：
-/// **协议包 [ApiPaths.kept] 里的每一条路径，要么已在 [router] 实现，
-/// 要么显式登记在 [stubApiPaths] 并以 501 明确拒绝**——不存在"前端会调、
-/// 核心静默 404"的灰区。
+/// A5（2026-10-25）起核心只保留平台面（`ApiPaths.coreOwned` 的 39 条方法路由）：
+/// 插件控制面 19（含 UI 多窗口 3）+ 传输设置 9 + 引导壳 3 + 发现面 1 + 日志 3 + 存储 4。
+/// 领域面（agent / files / llm / spec / team / terminal / tool）已整体移交插件，
+/// 对应路由由插件经 `system.collect.api.routes` 申报后走 [delegatedRouter] 承接；
+/// 核心不再注册、也不再实现它们（files/git/spec/terminal 暂时没有承接方 ⇒ 404）。
 class CoreServer {
   CoreServer._(
     this._http, {
@@ -88,31 +56,15 @@ class CoreServer {
     required this.token,
     required this.store,
     required this.settings,
-    required this.todoStore,
-    required this.teamService,
-    required this.messageDispatcher,
-    required this.specService,
-    required this.specIoFor,
-    required this.systemPromptStore,
     required this.pluginBus,
     required this.builtinPlugins,
     required this.pluginHotApplier,
     required this.pluginDownloader,
-    required this.fileService,
-    this.agentBackup,
     required this.hub,
-    required this.questions,
-    required this.compaction,
-    required this.subagents,
-    required this.conversation,
     required this.router,
     required this.stubRouter,
     required this.reassembler,
     required this.version,
-    this.llmJsonCaller,
-    this.usageLog,
-    this.ptyStarter,
-    this.sshPtyStarter,
     Duration bootstrapTicketTtl = const Duration(minutes: 5),
     Duration bootstrapSessionTtl = const Duration(minutes: 10),
     DateTime Function()? tokenClock,
@@ -138,7 +90,7 @@ class CoreServer {
           const <String>[],
     );
     pluginStore = PluginStore(paths: apiPaths);
-    // 插件运行日志的落盘出口（日志 API 的数据源；片 F 此前只读不写）。
+    // 插件运行日志的落盘出口（日志 API 的数据源）。
     // 绑定发生在插件被拉起之前（生产：CLI 先 CoreServer.start 再 plugins.start）。
     pluginLogSink = PluginLogSink(
       apiPaths,
@@ -148,17 +100,6 @@ class CoreServer {
       (String pluginId, String line, String channel) =>
           pluginLogSink.write(pluginId, line, channel: channel),
     );
-    // 集成终端会话（Ctrl+J）：它要按 agent 解析工作区根，所以只在接了文件服务时可用；
-    // 伪终端实现默认用平台实现（ConPTY / script），测试可注入假的。
-    terminalService = fileService == null
-        ? null
-        : TerminalService(
-            store: store,
-            files: fileService!,
-            startPty: ptyStarter ?? LocalPtyStarter(log: errorLog).start,
-            startSshPty: sshPtyStarter,
-            log: errorLog,
-          );
   }
 
   /// WS 端点路径（前端 `WebSocketService.connect` 固定拼接 `/ws?token=`）。
@@ -172,12 +113,6 @@ class CoreServer {
   /// 核心自身（命名空间 `core`）。跨命名空间一律 403，且不查目标是否存在
   /// （不变量 25：不泄露该命名空间是否存在）。
   static const String pluginIdHeader = 'x-tree-plugin-id';
-
-  /// 历史接口一次最多回多少条（[from] / [at] / 末尾分页共用同一上限）。
-  ///
-  /// 前端窗口只缓存视口附近（用户 2026-10-04：「滑到哪加载哪，限制缓存长度」），
-  /// 正常一页 = 200 条；上限只是防一次手滑的 limit 拼出巨型 JSON。
-  static const int _historyPageMax = 2000;
 
   /// 尚未实现、但前端会调用的路径（以 501 明确拒绝，而非静默 404）。
   ///
@@ -222,131 +157,50 @@ class CoreServer {
   late final PluginLogSink pluginLogSink;
 
   /// 存储（默认内存实现；CLI 注入 `FileTreeStore` 落 `~/.tree`）。
+  ///
+  /// A5 后平台面不再读写领域数据；保留字段只是为了启动参数兼容与未来平台状态。
   final TreeStore store;
 
-  /// 设置与模型池。
+  /// 设置（只保留平台级：帧率 / 心跳判活 / 数据收集开关）。
   final CoreSettings settings;
-
-  /// 会话待办（`GET /api/agents/{id}/todos` 与 `set_todo_list` 工具共用同一份）。
-  final TodoStore todoStore;
 
   /// WS 连接注册表与广播。
   final WsHub hub;
 
   /// 在线生效的 WS 判活节拍 I（= 保活定时器的实际间隔）。
-  ///
-  /// 启动时取自设置（或调用方显式传参），设置变更后可按需热更新（见
-  /// [_applyLivenessToRunningHub]）；观测与测试读它。
   Duration _liveHeartbeatInterval = LivenessTracker.defaultInterval;
 
   /// 在线生效的 WS 判活阈值 N（在线连接的 `LivenessTracker.maxMisses`）。
-  ///
-  /// 热更新只动节拍：`maxMisses` 与 `interval` 在 [LivenessTracker] 里都是 final，
-  /// 构造后改不了，所以这里记的是"在线台账真正在用的 N"。
   int _liveHeartbeatMissLimit = LivenessTracker.defaultMaxMisses;
 
-  /// 调用方是否显式传过心跳参数（测试/调试的逃生口）：显式传参后设置不热更新——
-  /// 否则一次设置变更会悄悄改掉调用方明确指定的节拍。
+  /// 调用方是否显式传过心跳参数：显式传参后设置不热更新。
   bool _heartbeatPinned = false;
 
-  /// 保活/判活是否开启：`enableHeartbeat: false` 时不热更新（那会把定时器重新打开）。
+  /// 保活/判活是否开启：`enableHeartbeat: false` 时不热更新。
   bool _heartbeatEnabled = false;
 
   /// 在线生效的 WS 判活节拍（= 保活定时器实际间隔；设置变更后热更新）。
   Duration get liveHeartbeatInterval => _liveHeartbeatInterval;
 
-  /// 在线生效的 WS 判活阈值（在线连接台账的 N；热更新不改它，见字段文档）。
+  /// 在线生效的 WS 判活阈值。
   int get liveHeartbeatMissLimit => _liveHeartbeatMissLimit;
 
-  /// 团队服务（M5b）；为 null 时不提供 teammates 路由（测试/最小骨架）。
-  final TeamService? teamService;
-
-  /// 团队消息派发（M5c）；为 null 时不提供消息/日志路由。
-  final TeamMessageDispatcher? messageDispatcher;
-
-  /// Spec 体系（M5d）；为 null 时 specs 路由返回空索引。
-  final SpecService? specService;
-
-  /// 取某 agent 的工作空间 IO（Spec 的自定义文件在工作空间里）。
-  final Future<WorkspaceIO?> Function(String agentId)? specIoFor;
-
-  /// 系统提示词存储（工作空间 `.self/system_prompt.md`）；为 null 时重置路由 503。
-  final SystemPromptStore? systemPromptStore;
-
-
-  /// 插件总线（M6b）；为 null 时快照返回 `enabled: false` 空集。
+  /// 插件总线；为 null 时快照返回 `enabled: false` 空集。
   final PluginBus? pluginBus;
 
-  /// 内置插件目录（M9 §4.2）：静态清单 + 运行时/脚本解析。
-  ///
-  /// 默认一份（探测 python / py -3、脚本查可执行文件同级的 plugins/）；测试注入
-  /// 假的探测器与脚本目录，才能确定性地覆盖"运行时缺失 / 脚本缺失"的可读错误。
+  /// 内置插件目录：静态清单 + 运行时/脚本解析。
   final BuiltinPluginCatalog builtinPlugins;
 
   /// 热应用接缝（把"配置已落盘"翻译成"对运行中的插件总线做了什么"）。
-  ///
-  /// null = 用默认实现 [BusPluginHotApplier]（只用 PluginBus 的公开方法，因此
-  /// "新增 / 改启动参数 / 停用"在本轮只能**如实回报**热应用失败——见该类的文档）；
-  /// 测试注入假实现可以直接断言"热应用失败"这条路径。
   final PluginHotApplier? pluginHotApplier;
 
-  /// 插件**发布仓库**（GitHub Releases）的取清单 / 下载 / 放置（阶段 5）。
-  ///
-  /// 为什么可以为 null：它需要**数据根**才能放缓存（`TreePaths.pluginsReleaseDir`），
-  /// 而数据根只有启动 CLI 知道。没接时三个路由都给**可读 503**（“这台核心没接发布
-  /// 仓库”），不像 501“功能开发中”——功能做了，只是这个实例不该去写磁盘。
+  /// 插件**发布仓库**的取清单 / 下载 / 放置；null = 三个路由给可读 503。
   final PluginDownloader? pluginDownloader;
 
-  /// 执行站首命令集的**挂载位置**（M9 Wave 3-I）；为 null = 未接线（命令会显式报
-  /// 「暂无挂载位置」而不是静默成功）。
+  /// 执行站平台命令的挂载位置（`plugin.*` / `station.*`）。
   ExecuteStationMounts? _stationMounts;
 
-  /// 工作空间文件服务（M7d）；为 null 时文件路由返回 501。
-  final FileService? fileService;
-
-  /// 备份 `agents/<id>.yaml` 的回调；null = 不备份（内存 store / 测试）。
-  final Future<String> Function(CoreAgent agent)? agentBackup;
-
-  /// 集成终端会话管理（Ctrl+J）；[fileService] 未接线时为 null，终端帧会给可读错误。
-  TerminalService? terminalService;
-
-  /// 伪终端工厂（测试注入假实现；生产用平台实现，见 [LocalPtyStarter]）
-  final PtyStarter? ptyStarter;
-
-  /// 远端（SSH）伪终端工厂（生产由 CLI 注入 SshPtyAdapter.start：从缓存的那条 SSH
-  /// 工作空间 IO 上取一条 shell 通道，复用同一条已建好的连接；测试注入假的）。
-  ///
-  /// 为 null = 远端终端未接线：远端 agent 的 terminal_open 回可读错误，**不会**
-  /// 悄悄在本机给它起一个终端（判据是「有效 SSH」，见 TerminalService）。
-  final SshPtyStarter? sshPtyStarter;
-
-  /// 提问回路（M5a）；为 null 时核心不提供 `ask_user_question`（测试/最小骨架）。
-  final QuestionBroker? questions;
-
-  /// 上下文压缩（M7d-4）；为 null 时 `agentCompact` 返回 501。
-  final CompactionService? compaction;
-
-  /// 执行站命令 `llm.call` 的落点（**硬设 JSON 返回形式**的 LLM 调用）；null = 未接线。
-  ///
-  /// 由核心进程（CLI）构造并注入：它需要"按 modelId 解析模型 + 成员级覆盖"这两件
-  /// 只有 CLI 手上的东西（与 [AgentEngine] / [CompactionService] 同一个理由）。
-  final LlmJsonCaller? llmJsonCaller;
-
-  /// **逐调用用量账本**（`<会话目录>/usage.jsonl`）；null = 不落账。
-  ///
-  /// 这里只负责 `source=llm.call` 那一类：核心替插件发出去的调用，账要落在**核心的
-  /// 会话目录**里才"事后可核对"。绑定按**每次调用**做（`usageLog.sinkFor(sessionId)`）
-  /// ——站点调用是并发的，共享可变状态会让 A 的账落到 B 的会话上。
-  /// 对话跳（`turn`）/ 压缩（`compact`）各有自己的落账口（引擎 / `CompactionService`）。
-  final UsageLog? usageLog;
-
-  /// 会话级**临时员工**名册；为 null 时本实例不认临时员工（测试/最小骨架）。
-  final SubagentRegistry? subagents;
-
-  /// 会话服务（用户消息 → 流式回复）。
-  final ConversationService conversation;
-
-  /// 已实现路由。
+  /// 已实现路由（A5 后 = [ApiPaths.coreOwned] 的 39 条）。
   final CoreRouter router;
 
   /// 显式登记为"未实现（501）"的路由。
@@ -367,29 +221,13 @@ class CoreServer {
   /// WS 上行分片重组。
   final InboundFrameReassembler reassembler;
 
-  /// 本实例绑定的 Spec 索引 provider（Q9）：close 时按身份解绑，
-  /// 免得已关闭的核心把过期索引留在全局 provider 上。
-  String Function(CoreAgent)? _specIndexBinding;
-
-  /// 本实例绑定的「已选 Spec 全文」provider（Q9 ⑧）：同样在 close 时按身份解绑。
-  String Function(CoreAgent, String)? _selectedSpecsBinding;
-
-  /// 本实例绑定的团队工作目录 provider（成员共享 TOP 目录）：同样按身份解绑。
-  TeamWorkspace? Function(CoreAgent)? _teamWorkspaceBinding;
-
   /// 版本号。
   final String version;
-
-  /// 启动时刻。
-  DateTime startedAt = DateTime.now();
 
   /// 请求级访问日志回调（CLI `--verbose` 打开；默认关闭以免刷屏）。
   void Function(String message)? accessLog;
 
   /// 未捕获异常日志回调（CLI 接到 stderr，始终打开）。
-  ///
-  /// 这条日志存在的理由：处理器在**响应已开始写出**时抛异常，兜底的 500 回包也会
-  /// 失败，此时客户端只看到"连接被关掉"，错误本身只剩这里能说清楚。
   void Function(String message)? errorLog;
 
   void _access(HttpRequest request, int status) {
@@ -421,62 +259,25 @@ class CoreServer {
   /// 启动服务器。
   ///
   /// [port] 为 0 时由内核分配空闲端口（默认，避免固定端口冲突）。
-  /// [streamChunkDelay] 是流式片段之间的延迟（测试传 `Duration.zero`）。
-  ///
-  /// [stationHooks] 是执行站 `terminal.exec` 要用的**后台任务管理器**；不传（null）
-  /// 时核心自建一份（与 M9 之前完全一致：自建、自理完成回调、关服务时一起关）。
-  /// 传了就用调用方的那一份——这样**插件下发的 hook 任务与 agent 自己起的 hook
-  /// 任务共用同一张任务表**（`hook_action=status/cancel` 因此能互相看到 task_id）。
-  /// 注入的实例**归调用方所有**：核心不接管它的完成回调、close 时也**不关它**
-  /// （完成回调由注入方自己接，CLI 里是 `WorkspaceToolRunner.hooks.onFinished`
-  /// → `tools.onHookFinished` → `conversation.wake`）。
   static Future<CoreServer> start({
     InternetAddress? address,
     int port = 0,
     String? token,
     String version = treeCoreVersion,
-    Duration streamChunkDelay = const Duration(milliseconds: 40),
     bool enableHeartbeat = true,
-    // 心跳判活参数（M9 规约 1.1）：默认**读设置**（用户已确认 I=10s / N=3，
-    // 设置页可调）。显式传参仍是测试/调试的逃生口：传了就以传的为准，且不参与
-    // 运行期热更新（见 [_applyLivenessToRunningHub]）。
     Duration? heartbeatInterval,
     int? heartbeatMissLimit,
     TreeStore? store,
     CoreSettings? settings,
-    TodoStore? todoStore,
-    AgentEngine? engine,
-    QuestionBroker? questions,
-    TeamService? teamService,
-    TeamMessageDispatcher? messageDispatcher,
-    SpecService? specService,
-    Future<WorkspaceIO?> Function(String agentId)? specIoFor,
-    SystemPromptStore? systemPromptStore,
     PluginBus? pluginBus,
     BuiltinPluginCatalog? builtinPlugins,
     PluginHotApplier? pluginHotApplier,
-
-    /// 发布仓库下载器（测试注入假的 ⇒ 整条安装链能离线钉死）。
     PluginDownloader? pluginDownloader,
 
     /// 发布仓库的下载缓存目录（生产传 `TreePaths.pluginsReleaseDir`）。
-    ///
-    /// null / 空 ⇒ **不自动建下载器**（不知道往哪写缓存就不该去碰网络）。
     String? pluginReleaseCacheDir,
-    FileService? fileService,
 
-    /// 备份 `agents/<id>.yaml` 的回调（工作目录镜像写盘前留底）。
-    ///
-    /// 与 team 自愈同约定：核心要改某个 agent 的 yaml 就先把它备份成 `.bak.<n>`。
-    /// 由 CLI 传 `backupAgentFile`（只有它知道数据根）；null = 不备份（测试）。
-    Future<String> Function(CoreAgent agent)? agentBackup,
-    CompactionService? compaction,
-    SubagentRegistry? subagents,
-    TerminalHooks? stationHooks,
-    LlmJsonCaller? llmJsonCaller,
-    UsageLog? usageLog,
-    PtyStarter? ptyStarter,
-    SshPtyStarter? sshPtyStarter,
+    /// 核心数据根（CLI 传 `TreePaths.root`；null 时从插件配置路径反推）。
     String? dataDir,
 
     /// 引导页种子路径（测试注入；空 = 按 exe 同级 / 当前目录 / 仓库根探测）。
@@ -497,11 +298,8 @@ class CoreServer {
     final int currentPid = pid;
     final TreeStore resolvedStore = store ?? MemoryStore();
     final CoreSettings resolvedSettings = settings ?? CoreSettings();
-    final TodoStore resolvedTodos = todoStore ?? MemoryTodoStore();
     // 心跳判活参数默认取设置（I=10s / N=3）：设置层保证 I×N **严格大于**前端固定的
-    // 10s WS 心跳（见 CoreSettings.minLivenessWindowSeconds），否则"在线但空闲"的
-    // 连接会被误判失活。连续 [resolvedHeartbeatMissLimit] 拍收不到任何入站帧才判失活，
-    // 详见 LivenessWsHub 的类文档。
+    // 10s WS 心跳（见 CoreSettings.minLivenessWindowSeconds）。
     final bool heartbeatPinned =
         heartbeatInterval != null || heartbeatMissLimit != null;
     final Duration resolvedHeartbeatInterval =
@@ -545,12 +343,6 @@ class CoreServer {
       token: resolvedToken,
       store: resolvedStore,
       settings: resolvedSettings,
-      todoStore: resolvedTodos,
-      teamService: teamService,
-      messageDispatcher: messageDispatcher,
-      specService: specService,
-      specIoFor: specIoFor,
-      systemPromptStore: systemPromptStore,
       pluginBus: pluginBus,
       builtinPlugins: resolvedBuiltinPlugins,
       // 默认热应用 = 总线公开面实现；总线为空时也用同一份（apply 前会先判空）
@@ -558,25 +350,7 @@ class CoreServer {
           pluginHotApplier ??
           (pluginBus == null ? null : BusPluginHotApplier(pluginBus)),
       pluginDownloader: resolvedDownloader,
-      fileService: fileService,
-      agentBackup: agentBackup,
-      compaction: compaction,
-      llmJsonCaller: llmJsonCaller,
-      usageLog: usageLog,
-      ptyStarter: ptyStarter,
-      sshPtyStarter: sshPtyStarter,
       hub: hub,
-      questions: questions,
-      subagents: subagents,
-      conversation: ConversationService(
-        store: resolvedStore,
-        hub: hub,
-        settings: resolvedSettings,
-        questions: questions,
-        compaction: compaction,
-        subagents: subagents,
-        engine: engine ?? ScriptedAgent(chunkDelay: streamChunkDelay),
-      ),
       router: CoreRouter(),
       stubRouter: CoreRouter(),
       reassembler: InboundFrameReassembler(),
@@ -598,91 +372,7 @@ class CoreServer {
     server._heartbeatEnabled = enableHeartbeat;
     server._liveHeartbeatInterval = resolvedHeartbeatInterval;
     server._liveHeartbeatMissLimit = resolvedHeartbeatMissLimit;
-    // **自动修复**（用户 2026-10-03：「在引擎的把关处，失败时自动修复」）：引擎在
-    // 组装工具批时发现"结果永远拿不到"的工具卡 ⇒ 写回失败信息 + 补一条 `tool_end` 帧。
-    // 与插件接线无关（`_wirePluginRelayPoints` 只在接了插件时走），必须**无条件**接上。
-    final AgentEngine wiredEngine = server.conversation.engine;
-    if (wiredEngine is LlmAgentEngine) {
-      wiredEngine.toolResultRepair = server.conversation.repairToolResult;
-      // 工具久不返回时的对账探针（同一个注入范式）：存储里已有真实结果 ⇒ 采用它让批收尾。
-      wiredEngine.toolResultProbe = server.conversation.probeToolResult;
-      // 「运行中的 LLM 请求」也进**同一张表**（用户 2026-10-03）：只有**连续沉默**（零事件）
-      // 达到阈值才登记（正常的长生成不进表、不 warning）；登记后被显式关闭 ⇒ 会话立刻以
-      // 取消收尾并掐掉底层订阅（插件挂住 / socket 挂住这条**无界**路径因此可关）。
-      // 见 `LlmSession._watchRequest` 与 `tool/llm_request_guard.dart`。
-      // 这里用进程级唯一那一个（`ToolRunRegistry.instance`）：生产路径下工具层的
-      // `WorkspaceToolRunner.toolRuns` 默认就是它，两边**是同一份表**。
-      wiredEngine.llmRequestRegistrar = llmRequestRegistrarOf(
-        ToolRunRegistry.instance,
-      );
-    }
-    // Q9：Spec 索引注入系统提示词。做成**可设置的 provider**（而不是给
-    // `systemPromptWithWorkspace` 加参数）是因为提示词在会话生成与压缩估算两处
-    // 拼装，两处必须逐字一致；provider 让它们自动同口径，也不需要改会话服务。
-    // `ioFor` 让索引在没有快照时（例如首个会话）能在后台补一次全量扫描。
-    if (specService != null) {
-      final SpecService specs = specService;
-      specs.ioFor = specIoFor;
-      // 选中内置规范时要播种到工作空间的**随附文档**（插件开发指南）：原件在核心
-      // 所在机器上（发行布局的应用目录 plugins/、开发态的仓库 docs/），解析与搬运
-      // 归 plugin 侧，所以在这里接线。取不到原件时只记日志 + 如实回报，不阻断 select。
-      specs.seedAssetsFor = seedBuiltinSpecAssets;
-      // agent 不属于这个 SpecService 的 store（同进程里可能有另一个核心/测试服务器）
-      // 时不注入：否则会把别的 store 的索引写进当前提示词。
-      String binding(CoreAgent agent) => specs.store.agent(agent.id) == null
-          ? ''
-          : specs.indexSnapshot(agent.id);
-      server._specIndexBinding = binding;
-      specIndexProvider = binding;
-      // Q9 ⑧：已选 Spec 全文（本会话挂的 hook）。`selected_spec_ids` 是**会话级**的，
-      // 所以这个 binding 多带一个 sessionId；没有它，`spec select` 对上下文就没有
-      // 持续影响（压缩一轮后规范正文再也回不来）。
-      String selectedBinding(CoreAgent agent, String sessionId) =>
-          specs.store.agent(agent.id) == null
-          ? ''
-          : specs.selectedSpecsSnapshot(agent.id, sessionId);
-      server._selectedSpecsBinding = selectedBinding;
-      selectedSpecsProvider = selectedBinding;
-      // 拼上下文前先把 ⑦/⑧ 快照热起来：冷热形态切换会让 `[0] system` 换字节，
-      // 而它在消息最前面 ⇒ 整条前缀缓存作废（known-issues #8）。
-    }
-    // **所有**冷热来源都要在拼上下文之前热完：⑦/⑧ 快照（Spec 索引 + 已选 Spec 全文）
-    // 与**工作空间提示词文件**（`<工作空间>/.self/system_prompt.md` —— 它是 `[0] system`
-    // 最前面那一段）。文件这条通路以前漏接：`SystemPromptStore.snapshot()` 在本进程
-    // 首次调用时**恒返回空串**（后台补读），于是首次拼装的提示词整整少一段、却被钉住
-    // 复用 ⇒ 重启后第一个请求（往往正是最贵的压缩）从第 0 个 token 起吃不到缓存。
-    // 真机现场见 docs/known-issues.md #28。
-    {
-      final SpecService? specs = specService;
-      final SystemPromptStore? prompts = server.systemPromptStore;
-      if (specs != null || prompts != null) {
-        server.conversation.promptStatePrewarm =
-            (String agentId, String sessionId) async {
-              if (prompts != null) await prompts.refresh(agentId);
-              if (specs == null) return;
-              if (specs.store.agent(agentId) == null) return;
-              await specs.ensureSnapshots(agentId, sessionId);
-            };
-      }
-    }
-    // 钉住 / 复用 / 兜底各留一行（`[core:agent]`）：这次有没有复用旧字节，一眼可见。
-    server.conversation.log = (String message) =>
-        server.errorLog?.call('[core:agent] $message');
-    // 团队工作目录（2026-10-02 用户定夺）：**成员与团队 TOP 共享同一个工作目录**，
-    // 不再是"每个成员一个 workspaces/<member_id>"。提示词在会话生成与压缩估算两处
-    // 拼装（必须逐字一致），而"一路向上找到 TOP"要查 store ⇒ 与 spec 同范式用 provider；
-    // 返回 null = 不接管（旧口径：agent 自己的 workspace_dir）。
-    // agent 不属于本实例的 store 时不接管：否则会把别的 store 的团队结构写进提示词。
-    TeamWorkspace? teamBinding(CoreAgent agent) =>
-        server.store.agent(agent.id) == null
-        ? null
-        : teamWorkspaceFor(agent, server.store.agent);
-    server._teamWorkspaceBinding = teamBinding;
-    teamWorkspaceProvider = teamBinding;
-    // 判死与恢复都要**可见**、要能触发补发（不静默）：
-    // - 判死：写错误日志 + 关连接（前端会自动重连，这就是"触发重连"）；
-    // - 恢复：把消息派发侧在失活期间登记的待补发消息补出去；
-    // - 派发侧活性：接上"全体连接"级别的台账（心跳丢失 ⇒ 派发显式报错 + 登记补发）。
+    // 判死与恢复都要**可见**：判死写错误日志 + 关连接（前端会自动重连）。
     hub.onStale = (String connectionId, LivenessTracker beat) {
       final String text = server._livenessLogText(beat);
       server.errorLog?.call('WS 连接 $connectionId $text');
@@ -691,23 +381,11 @@ class CoreServer {
       final String text = server._livenessLogText(beat);
       server.errorLog?.call('WS 链路 $text');
     };
-    hub.onLinkRecovered = () {
-      final TeamMessageDispatcher? dispatcher = messageDispatcher;
-      if (dispatcher == null) return;
-      unawaited(dispatcher.flushPendingResends());
-    };
-    // 调用方自带台账时不覆盖（??=），只补空缺
-    messageDispatcher?.linkLiveness ??= hub.linkLiveness;
-    // M9 Wave 3-I：执行站挂载位置 + 运行期四元组（站点隔离的运行期依据）。
-    // Wave 3-I 第 2 条：工具层把它的 hooks 传进来 ⇒ 插件与 agent 共用一张任务表。
-    server._wirePluginStations(stationHooks: stationHooks);
-    // 运行中工具登记表：warning（会话 llm_hidden + core.log）、超时广播（点位
-    // `system.tool.timeout`）与显式关闭的进程终止落点都在这里接线。
-    server._wireToolRuns();
+    // 平台执行站（plugin.* / station.*）+ UI 插件 WS 站点总线接线。
+    server._wirePluginStations();
     server._registerRoutes();
     // L-28：把核心**当前已实现**的方法路由交给委派归属表做同键拒收。
-    // 绑定的是注册后的实际键集，所以批次 C/G 删掉一条核心实现后，插件对
-    // 同一 `METHOD pattern` 的申报会自动从"拒收"变成"生效"——不需要改核心。
+    // 绑定的是注册后的实际键集：插件对同一 `METHOD pattern` 的申报会自动生效。
     server.delegatedRouter.bindCoreRoutes(server.router.routes);
     server._registerStubRoutes();
     if (enableHeartbeat) {
@@ -719,162 +397,35 @@ class CoreServer {
 
   /// 关闭服务并释放全部连接（幂等）。
   Future<void> close({bool force = true}) async {
-    // 运行中工具登记表：取消待发 warning 的计时器并清空登记项——别让一个 300s 的
-    // 计时器把核心进程吊在退出门口（进程终止是工具层自己的事，见 TerminalHooks.close）。
-    _toolRunsOf().shutdown();
-    conversation.dispose();
-    questions?.dispose();
-    // 引擎可能持有 HTTP 连接池（真实 LLM 传输层）：随服务一起释放
-    await conversation.engine.close();
     reassembler.clear();
     await hub.closeAll();
-    // 执行站挂载位置：只释放它**自建**的后台任务管理器（外部注入的那一份归注入方
-    // 所有——CLI 里由 WorkspaceToolRunner.close() 关，这里重复关会把共用任务表清空）
-    // 终端会话先收：别把孤儿 shell 留在用户的工作区里
-    await terminalService?.closeAll();
+    // 执行站挂载位置没有自有资源（A5 起不再持有 TerminalHooks / PTY）。
     await _stationMounts?.close();
     await pluginBus?.close();
     // 插件进程已停 ⇒ 不会再产生 stderr；把在途日志行落完再关监听。
     await pluginLogSink.close();
-    // 总结器可能持有自己的 HTTP 连接池（与引擎的池分开）：随服务一起释放
-    await compaction?.dispose();
-    // 执行站 `llm.call` 的调用器同样自带连接池（与引擎的池分开）
-    await llmJsonCaller?.close();
-    // 先把在途落盘任务写完再关闭监听（write-behind 的收尾）
-    await questions?.questions.flush();
     await store.flush();
-    // Q9：绑定还在自己身上才解绑（别的核心实例可能已经接管了全局 provider）
-    if (identical(specIndexProvider, _specIndexBinding)) {
-      specIndexProvider = null;
-    }
-    if (identical(selectedSpecsProvider, _selectedSpecsBinding)) {
-      selectedSpecsProvider = null;
-    }
-    if (identical(teamWorkspaceProvider, _teamWorkspaceBinding)) {
-      teamWorkspaceProvider = null;
-    }
     await _http.close(force: force);
   }
 
-  // ── 站点接线（M9 Wave 3-I） ───────────────────────────────────────────
+  // ── 站点接线（A5 平台面：plugin.* / station.*） ─────────────────────────
 
-  /// 执行站首命令集的**挂载位置** + 插件总线需要的**运行期四元组**。
+  /// 执行站平台命令的挂载位置 + 插件总线需要的**运行期四元组**解析器。
   ///
-  /// 站点体系的两条硬要求都在这里落地：
-  /// 1. 「执行器只是执行站的一种挂载位置」——八条命令（fs.* / terminal.exec /
-  ///    agent.*）接到核心的既有实现上，不再出现「暂无挂载位置」；
-  /// 2. plan §1.2 的隔离四元组在**运行期**解析：team 取 agent 的归属、mode_key 取
-  ///    agent 的工作空间模式（local | ssh），因此 SSH 团队的命令不会打到本地工作空间。
-  ///
-  /// 未接线（pluginBus 为空）时什么都不做；工具层与 REST 路径不受影响。
-  ///
-  /// [stationHooks] 见 [start]：null = 自建一份（完成回调接 [ConversationService.wake]），
-  /// 非 null = **与工具层共用**调用方那一份（插件命令与 agent 的工具调用因此看到同一张
-  /// 任务表；完成回调归注入方，核心不接管、close 也不关它）。
-  void _wirePluginStations({TerminalHooks? stationHooks}) {
+  /// A5 后核心不再实现领域命令（fs.* / terminal.* / agent.* / llm.call / tool.*）；
+  /// 这里只把两族平台命令（`plugin.*` / `station.*`）挂到内置执行站上，并接上
+  /// UI 插件的 WS 站点总线。
+  void _wirePluginStations() {
     final PluginBus? bus = pluginBus;
     if (bus == null) return;
-    // agent 工具调用事件 → 插件（Q8：轮次上限删掉后，限制能力交给插件：插件自己数
-    // 轮次，超限时用执行站的 agent.stop 发停止信号）。未接线 = no-op，与改动前一致。
-    conversation.agentEvents.sink = bus.dispatchAgentEvent;
-    // 调用点上下文：team 取 agent 的团队归属（agent / session 由调用点给）
-    bus.callSiteContext ??= (String agentId, String sessionId) {
-      final CoreAgent? agent = store.agent(agentId);
-      // 顶层 agent 的 team_id 为空 ⇒ **它自己就是团队**（与 TeamService.teamIdOf
-      // 和站点预建的 keying 同口径）；成员则用它的 team_id。
-      final String team = agent == null
-          ? ''
-          : (agent.teamId.trim().isEmpty ? agent.id : agent.teamId.trim());
-      return StationScopeContext(
-        teamId: team,
-        agentId: agentId,
-        sessionId: sessionId,
-      );
-    };
-    // mode_key 的运行期来源：agent 有没有配 SSH 决定它属于哪个工作面
-    bus.agentModeKeyResolver ??= (String agentId) =>
-        store.agent(agentId)?.sshConfig != null
-        ? StationModeKey.ssh
-        : StationModeKey.local;
-    // wait_for 的成员活性探针（M9 §1.1）：成员不存在 = 明确失联；在途生成 = 明确
-    // 活着；其余（刚派活尚未接单 / 已干完）**不判死**，交给启动宽限判据。
-    messageDispatcher?.memberLiveness ??= (String agentId) {
-      final CoreAgent? member = store.agent(agentId);
-      if (member == null) {
-        return const MemberLivenessState.lost('成员已不存在（可能已被移除）');
-      }
-      if (conversation.isRunning(agentId)) {
-        return const MemberLivenessState.alive(detail: '成员在途生成');
-      }
-      return const MemberLivenessState.unknown();
-    };
-    final ExecuteStationMounts mounts = ExecuteStationMounts.forStore(
-      store: store,
-      // 工作空间 IO = 工具层同一份解析（local / SSH 都走既有抽象）
-      ioFor: (String agentId) async {
-        final Future<WorkspaceIO?> Function(String agentId)? resolver =
-            specIoFor;
-        if (resolver == null) return null;
-        return resolver(agentId);
-      },
-      // 后台任务管理器：没注入就自建，并把它完成回调接到会话唤醒（下面这条
-      // onHookFinished 只对**自建**的那一份生效；注入的那份由注入方接回调——
-      // 在 CLI 里是 WorkspaceToolRunner.hooks.onFinished → tools.onHookFinished
-      // → conversation.wake，语义与自建路径一致）。
-      hooks: stationHooks,
-      onHookFinished: (String agentId, String sessionId, String notice) {
-        unawaited(
-          conversation
-              .wake(agentId: agentId, sessionId: sessionId, notice: notice)
-              .catchError((Object error) {
-                errorLog?.call('terminal hook 唤醒失败（$agentId）：$error');
-              }),
-        );
-      },
-      messageSender: _stationDeliverMessage,
-      agentStopper: (String agentId, {required bool cascade}) async =>
-          _stopAgentTree(agentId, cascade: cascade),
-      compactor: _stationCompact,
-      // 点位化新增的命令（llm.call / tool.call / tool.close / session.rename）：
-      // 工具执行器优先取引擎手上那一份（与模型调用工具**同一条路径**）；
-      // 没接线时命令以「未接线」显式失败，不做静默降级。`tool.close` 的关闭实现
-      // 与右栏"关闭"按钮、REST 共用同一个（`ToolRunRegistry.close`）。
-      llmCaller: _stationLlmCall,
-      toolCaller: _stationToolCall,
-      toolCloser: _stationToolClose,
-      sessionRenamer: _stationRenameSession,
-      // `ssh.reconnect`：与 REST 端点 / 右栏「重连」按钮同一实现（引擎手上的工具
-      // 执行器；它不在时命令以「未接线」显式失败，无从重连）。
-      sshReconnector: _stationSshReconnect,
-      // `plugin.*` 族（插件热重启控制面）：实现只能是总线——插件实例表、代际
-      // 计数、快照内存池都在它那里。没注入时这些命令以「未接线」显式失败。
+    final ExecuteStationMounts mounts = ExecuteStationMounts(
       pluginManager: bus.handlePluginCommand,
-      // `station.*` 族（阶段 6：站点拓扑，只读）：同一个理由——谁订了哪个点位、哪个
-      // 点位已接管、自建站归谁，这些事实只在总线的站点表里。这里不另取一份，
-      // 否则面板与插件看到的就是两套拓扑。
       topologyQuery: bus.handleStationQuery,
-      // `usage.query`（阶段 6：逐调用用量账本）：账本在**数据根**下，只有存储层那
-      // 一份路径规则能读到它（插件的 `fs.read` 只在工作空间作用域内）。
-      usageQuerier: _stationUsageQuery,
-      // 阶段 8（整轮接管）：接管者给自己发起的 tool.call 回带 `run_id` 时，
-      // **由核心**把这一次工具播成这一轮的 tool_start / tool_end 卡片；而接管
-      // 期间同一会话的 `agent.message` 会被拒（不开第二条写入口）。
-      runToolNote: bus.noteRunToolActivity,
-      activeLoopRunOf: bus.activeLoopRunOf,
       log: (String message) => errorLog?.call('[core:station] $message'),
     );
     _stationMounts = mounts;
-    // M9 §3「三站系统自带」+ 用户预期：内置三站原本是**懒创建**的（首次使用时才
-    // 实例化），于是"没配插件 / 没人用过"时面板上就是「站点（0）」，与「三站默认
-    // 设在系统中」不符。这里在站点接线处确保三站存在。
-    //
-    // **站点全局唯一**（用户定稿语义）：每类站一个实例，id 是类型常量，与 team /
-    // agent / mode 无关——所以这里不再需要（也不该）读存储里的 team 组合去预建。
-    // 新建 agent 不会、也不该产生新站点。
-    //
-    // 幂等 + 持久化由 StationHub.ensureBuiltinStations 保证：已从 stations.yaml
-    // 恢复的不再新建、也不重复落盘；只有真的新建了才写一次盘。
-    // **收集站不预建**：它的 schema 是接入点定义的输入格式（见该方法的 dartdoc）。
+    // 内置站原本是**懒创建**的，这里在接线处确保三站存在（幂等 + 持久化由
+    // StationHub.ensureBuiltinStations 保证；收集站不预建）。
     final List<String> prebuiltStations = bus.stations.ensureBuiltinStations();
     if (prebuiltStations.isNotEmpty) {
       errorLog?.call(
@@ -882,16 +433,13 @@ class CoreServer {
         '${prebuiltStations.length} 个：${prebuiltStations.join('、')}',
       );
     }
-    // 运行期四元组就绪 = 工具表的失效点：下次刷新点按**真实工作面**（local/ssh）
-    // 重新收集一次（CLI 里 plugins.start() 早于本接线，那次用的是声明里的 mode）。
-    // 片 C：同一趟刷新也收集 `system.collect.api.routes`，把插件申报写进委派归属表。
+    // 片 C：收集 `system.collect.api.routes`，把插件申报写进委派归属表。
     bus.bindDelegatedRouter(delegatedRouter);
     bus.invalidateToolTable(reason: '站点接线完成（运行期四元组就绪）');
     final String? mountError = bus.mountExecuteStations(mounts);
     if (mountError != null) {
       errorLog?.call('执行站挂载位置接线不完整：$mountError');
     }
-    _wirePluginRelayPoints(bus);
     // 片 B：UI 插件的 WS 站点总线。桥只做「连接身份 + 广播站订阅 + 四态投递 +
     // 自建站生命周期」，不碰 REST 委派（片 C）也不决定 UI 启动方式（片 D）。
     final StationWsBridge bridge = _stationWsBridge ??= StationWsBridge(
@@ -900,13 +448,12 @@ class CoreServer {
       routes: delegatedRouter.metaRoutes,
       log: (String message) => errorLog?.call('[core:station/ws] $message'),
       // 片 D：UI 插件连上后解除连接窗口的 degraded（总线只记状态，不做事）。
-      onUiHello: (String pluginId) {
-        bus.noteUiHello(pluginId);
-        // 片 E / 5.2：会话 token 在**首个** UI `ui.hello` 成功后吊销（设计 §7.2 第 5 步）。
+      onUiHello: (String pluginId, String windowId) {
+        bus.noteUiHello(pluginId, windowId: windowId);
+        // 片 E / 5.2：会话 token 在**首个** UI `ui.hello` 成功后吊销。
         tokens.revokeSessions(reason: 'UI 插件 $pluginId 已连接');
       },
-      // 片 E / 5.5：品牌申报随 `ui.hello` 到达（设计 §6.4 明确 UI 不参与收集站
-      // 请求/应答，因此这里由 hello 的 `branding` 字段投递一次）。
+      // 片 E / 5.5：品牌申报随 `ui.hello` 到达。
       onUiBranding: (String pluginId, Object? branding) {
         unawaited(bus.declareUiBranding(pluginId, branding));
       },
@@ -915,542 +462,6 @@ class CoreServer {
     bus.stations.onStationRemoved = bridge.onStationRemoved;
     bus.onPluginOffline = bridge.onPluginOffline;
   }
-
-  /// **点位化（2026-10-01）：把 LLM 侧的中转点接上插件总线**。
-  ///
-  /// 引擎（LLM 会话 / 系统提示词构造）与压缩服务都**不认识插件总线**，插件总线也
-  /// 拿不到它们；核心是唯一同时够得着两边的地方，所以接线放在这里——与
-  /// [LlmAgentEngine.toolTurnCompactor] 同一个范式（可写字段 + 显式接线点）。
-  ///
-  /// 接上之后的行为：
-  /// - `system.relay.llm.handle`：插件可接管某一跳的 LLM 响应（含流式回填）；
-  /// - `system.relay.llm.request`：插件可改写即将投出的请求体；
-  /// - `system.relay.prompt.system`：插件可改写本轮系统提示词；
-  /// - `system.relay.context.compact`：插件可产出**整份新上下文**（规划也归它，
-  ///   替代内置 compact）。
-  ///
-  /// 全部 fail-open：无订阅者 / 未回填 / 异常 ⇒ 与接线前**逐字一致**的行为。
-  void _wirePluginRelayPoints(PluginBus bus) {
-    final AgentEngine engine = conversation.engine;
-    if (engine is LlmAgentEngine) {
-      engine.llmTurnHandler = bus.relayLlmHandle;
-      engine.llmRequestRewriter = bus.relayLlmRequest;
-      engine.systemPromptRelay = bus.relaySystemPrompt;
-      // 阶段 8：**整轮 tool loop 接管**（`system.relay.loop.run`）。与 handle 的分界：
-      // handle 只交一跳（编排仍在核心），这一条把一整轮交出去；分流发生在
-      // **进入 LlmSession 之前**，无人接管时内置路径一行没跑过、逐字不变。
-      engine.loopTurnHandler = bus.relayLoopRun;
-    }
-    final CompactionService? compactionService = conversation.compaction;
-    if (compactionService != null) {
-      compactionService.relayHook = bus.relayCompaction;
-      // 「中转站为什么没接管」的回程：总线每处"不接管"分支 → 压缩结论
-      // （REST 可选键 `relay_skip_reason` / 会话里的压缩提示），不再只进 stderr。
-      bus.compactionSkipSink = compactionService.noteRelaySkip;
-      // 阶段 6（中转点位 `compact.skip.reason`）：插件可以把这句原因写得更准。
-      // 内置那句已经先记账（可读性不依赖插件），这里只给“覆盖还账上那一条”的口子。
-      bus.compactionSkipAnnotator = compactionService.annotateRelaySkip;
-    }
-    // 阶段 6 A 级：把三个「接管只能是附加 / 改写文案」的槽换成**复合实现**。
-    //
-    // 上面已经无条件接好了内置那一份（没插件时就是原行为），这里把它抢下来包一层：
-    // 先问中转点位，**没接管就逐字回内置**（fail-open）。为什么不在引擎里直接调
-    // 总线：引擎与 LlmSession 都不认识插件总线（上面那段接线的理由在这里同样成立）。
-    if (engine is LlmAgentEngine) {
-      final builtInRepair = engine.toolResultRepair;
-      final builtInProbe = engine.toolResultProbe;
-      final builtInRegistrar = engine.llmRequestRegistrar;
-      if (builtInRepair != null) {
-        // 接管的是“那句修复说明写什么”：落库与 `tool_end` 帧仍然只走内置那一条路。
-        engine.toolResultRepair =
-            ({
-              required String agentId,
-              required String sessionId,
-              required String toolCallId,
-              required String toolName,
-              required String result,
-            }) async {
-              final String? better = await bus.relayToolRepairText(
-                agentId: agentId,
-                sessionId: sessionId,
-                toolCallId: toolCallId,
-                toolName: toolName,
-                text: result,
-              );
-              return builtInRepair(
-                agentId: agentId,
-                sessionId: sessionId,
-                toolCallId: toolCallId,
-                toolName: toolName,
-                result: better ?? result,
-              );
-            };
-      }
-      if (builtInProbe != null) {
-        engine.toolResultProbe =
-            ({
-              required String agentId,
-              required String sessionId,
-              required String toolCallId,
-            }) async {
-              final verdict = await bus.relayToolProbe(
-                agentId: agentId,
-                sessionId: sessionId,
-                toolCallId: toolCallId,
-              );
-              // 没接管 ⇒ 内置探针（查库）；接管了 ⇒ 插件说“有”就用它那段，说“没有”就
-              // 回 null（与库里没查到是同一个可观测形状，但**不再查库**：结果在插件那侧）。
-              if (verdict == null) {
-                return builtInProbe(
-                  agentId: agentId,
-                  sessionId: sessionId,
-                  toolCallId: toolCallId,
-                );
-              }
-              return verdict.found ? verdict.text : null;
-            };
-      }
-      if (builtInRegistrar != null) {
-        // **内置登记表永远先建立**（它是流式可关闭性的唯一执行点），这里只是在登记
-        // 之后多递一份通告；取消 / 关闭 / 判死三个动作仍然只在核心里（不变量 4 / 15）。
-        engine.llmRequestRegistrar =
-            ({
-              required String agentId,
-              required String sessionId,
-              required String model,
-              required int turn,
-            }) {
-              final guard = builtInRegistrar(
-                agentId: agentId,
-                sessionId: sessionId,
-                model: model,
-                turn: turn,
-              );
-              bus.relayLlmRegisterNotice(
-                handle: guard.handle,
-                agentId: agentId,
-                sessionId: sessionId,
-                model: model,
-                turn: turn,
-              );
-              return guard;
-            };
-      }
-    }
-    // **逐调用用量**（`<会话目录>/usage.jsonl`）：插件读不到数据根（它的 `fs.read`
-    // 只在工作空间作用域内），而"这次压缩花了多少 token / 内置兜底那次花了多少"
-    // 只有这份账本知道 ⇒ 核心在压缩中转载荷里捎上**最近 N 行**（`usage_file` +
-    // `recent_usage`）。读不到 / 未接线 ⇒ 载荷里不带这两个键（用量是遥测，绝不
-    // 阻塞或干扰压缩；`relayCompaction` 那边也会再兜一层异常）。
-    final UsageLog? ledger = usageLog;
-    if (ledger != null) {
-      final TreePaths paths = ledger.paths;
-      bus.usageRecentProvider = (String agentId, String sessionId) async {
-        final UsageHistory history = await UsageLog.read(
-          paths,
-          agentId,
-          sessionId,
-        );
-        return PluginUsageRecent(
-          path: paths.usageFile(agentId, sessionId),
-          // `UsageCall.toJson()` 就是 `usage.jsonl` 的行形状（字段表的唯一出处），
-          // 不要在别处另拼一份键——插件面板照它消费。
-          calls: <Map<String, dynamic>>[
-            for (final UsageCall call in history.calls) call.toJson(),
-          ],
-        );
-      };
-    }
-  }
-
-  /// 执行站 `llm.call`：用目标 agent 的模型发一次 LLM 调用（**缺省硬设 JSON 返回形式**）。
-  ///
-  /// agent 的 modelId 在核心侧解析（`store.agent(...).modelId`），模型池与成员级
-  /// 覆盖由注入的 [llmJsonCaller] 负责——**与对话完全同一条解析路径**。
-  ///
-  /// [responseFormat] 原样转给 [LlmJsonCaller]：`'text'` = 这次调用**不发**
-  /// `response_format`（前缀与对话逐字一致 ⇒ 可命中端点前缀缓存）；缺省/`'json_object'`
-  /// = 站点硬设的 JSON 形式（语义与改动前一致）。
-  ///
-  /// [sessionId] 只用于**逐调用用量账本**的分文件（[usageLog]）。按调用绑定 sink：
-  /// 站点调用是并发的，共享可变状态会串账。
-  Future<Map<String, dynamic>> _stationLlmCall({
-    required String agentId,
-    required String sessionId,
-    List<Object?>? messages,
-    String? prompt,
-    String? system,
-    String? model,
-    double? temperature,
-    int? maxTokens,
-    List<Object?>? tools,
-    String? responseFormat,
-  }) async {
-    final LlmJsonCaller? caller = llmJsonCaller;
-    if (caller == null) {
-      return const <String, dynamic>{'error': 'llm.call 未接线：核心未注入 LLM 调用器'};
-    }
-    final CoreAgent? agent = store.agent(agentId);
-    if (agent == null) {
-      return <String, dynamic>{'error': 'agent 不存在：$agentId'};
-    }
-    return caller.call(
-      agentId: agentId,
-      modelId: agent.modelId,
-      messages: messages,
-      prompt: prompt,
-      system: system,
-      model: model,
-      temperature: temperature,
-      maxTokens: maxTokens,
-      tools: tools,
-      responseFormat: responseFormat,
-      usageSink: usageLog?.sinkFor(sessionId),
-    );
-  }
-
-  /// **运行中工具登记表**的接线（warning / 超时广播 / 关闭的进程终止落点）。
-  ///
-  /// 三条落点各管一段（plan §4 步骤 3/4/5）：
-  /// - `notice`：会话一条 `llm_hidden` 提示（复用 `ConversationService.sendHiddenNotice`
-  ///   ——`messages.jsonl` 键集因此**不变**）+ `core.log` 一行（`log`）；
-  /// - `onTimeout`：广播站点位 `system.tool.timeout`（超阈值**只广播一次**）；
-  /// - `terminate`：`tool.close` / REST 关闭的"先终止进程树"那一步，落到工具层
-  ///   （见 `WorkspaceToolRunner.terminateToolRun`：有 pid 才 `taskkill /T`，没有就如实说）。
-  ///
-  /// 登记表是**进程级唯一一份**（[ToolRunRegistry.instance]）——REST、`query_status`、
-  /// 执行站与工具层必须读同一份真值，所以这里只 attach 落点，不新建实例。
-  void _wireToolRuns() {
-    final WorkspaceToolRunner? runner = _runnerFromEngine();
-    final ToolRunRegistry registry =
-        runner?.toolRuns ?? ToolRunRegistry.instance;
-    final void Function(String message)? sink = errorLog;
-    registry.attach(
-      // core.log 一行（前缀与 [core:station] / [core:llm] 同口径）
-      log: sink == null
-          ? null
-          : (String message) => sink('[core:tool] $message'),
-      notice: conversation.sendHiddenNotice,
-      onTimeout: (Map<String, dynamic> payload) =>
-          pluginBus?.announceToolTimeout(payload),
-      terminate: runner == null
-          ? null
-          : (ToolRun run) => runner.terminateToolRun(run),
-    );
-  }
-
-  /// 执行站 `tool.close`：**显式关闭**一次正在执行的工具运行。
-  ///
-  /// 与右栏"关闭"按钮（REST `POST /api/tools/running/{handle}/close`）走**同一个**
-  /// 实现（[ToolRunRegistry.close]）：先尽力终止进程树，再把这次运行从登记表移除，
-  /// 并让在途工具调用**收敛**（回一段可读结果，批因此不再永不结束）。
-  /// 失败一律给可读原因（fail-closed），不假装成功。
-  Future<Map<String, dynamic>> _stationToolClose(String handle) async {
-    final ToolCloseOutcome outcome = await _toolRunsOf().close(handle);
-    if (!outcome.closed) return <String, dynamic>{'error': outcome.note};
-    return outcome.toJson();
-  }
-
-  /// 执行站 `ssh.reconnect`：**重建目标 agent 的远端（SSH）链路**。
-  ///
-  /// 与 REST `POST /api/agents/{id}/ssh/reconnect`（`_reconnectAgentSsh`）、右栏文件
-  /// 面板「重连」按钮走**同一份实现**（[WorkspaceToolRunner.reconnectSshLink]）。
-  /// **三种结局如实转成 Map**，不静默降级：
-  /// - 已重建 ⇒ `{ok: true, stale}`（`stale` 仍为 true 说明重建后立刻又判死）；
-  /// - 该 agent 不是 SSH 工作空间 ⇒ `{ok: false, not_ssh: true, error}`（**不假装成功**）；
-  /// - 重建失败 ⇒ `{ok: false, error}`；
-  /// - 工具执行器尚未接入 ⇒ `{ok: false, error}`（命令层报「未接线」，与 REST 的 501 同口径）。
-  ///
-  /// 判活判据不变：判死仍只看"连续 N 拍心跳丢失"，重连是判死**之后**的动作，
-  /// 不引入任何静态时长上限（M9 §1.1）。
-  Future<Map<String, dynamic>> _stationSshReconnect(String agentId) async {
-    final WorkspaceToolRunner? runner = _runnerFromEngine();
-    if (runner == null) {
-      return <String, dynamic>{
-        'ok': false,
-        'error': 'ssh.reconnect 未接线：核心未接入工具执行器（真实 LLM 引擎不可用）',
-      };
-    }
-    final SshReconnectOutcome outcome = await runner.reconnectSshLink(agentId);
-    if (outcome.ok) {
-      return <String, dynamic>{'ok': true, 'stale': outcome.stale};
-    }
-    return <String, dynamic>{
-      'ok': false,
-      if (outcome.notSsh) 'not_ssh': true,
-      'error': outcome.reason,
-    };
-  }
-
-  /// 执行站 `usage.query`：读一个会话的**逐调用用量账本**并算好聚合（阶段 6）。
-  ///
-  /// 实现放核心而不是挂载位置：账本在数据根下的会话目录里，路径布局与容错读取
-  /// 的出处只有 [TreePaths] + [UsageLog.read] 一份；`calls` 原样递
-  /// [UsageCall.toJson]（字段表的唯一出处，不在插件层另拼一套键），聚合也在这里算——
-  /// 算两份就与面板上那份漂。
-  ///
-  /// 口径：① 文件不存在 ⇒ **空账本**而不是错（老会话本来就没有它）；② 只读尾部
-  /// （[tailBytes] `<= 0` 用 [UsageLog.defaultTailBytes]，与面板同源）；③ 端点没给
-  /// `cached_tokens` 时汇总写 **null** 不编造 0（与账本里那一列同口径）。
-  Future<Map<String, dynamic>> _stationUsageQuery({
-    required String agentId,
-    required String sessionId,
-    int tailBytes = 0,
-  }) async {
-    final UsageLog? ledger = usageLog;
-    if (ledger == null) {
-      return <String, dynamic>{
-        'ok': false,
-        'error':
-            'usage.query 未接线：核心没有接入用量账本（usageLog 未注入），'
-            '没有东西可以读',
-      };
-    }
-    final TreePaths paths = ledger.paths;
-    final String file;
-    try {
-      file = paths.usageFile(agentId, sessionId);
-    } catch (error) {
-      // id 过不了 safeSegment：这不是“没账”，是“读不了”——如实分开，不回空账本
-      return <String, dynamic>{
-        'ok': false,
-        'error':
-            'usage.query 的目标 id 不合法（agent=$agentId / 会话=$sessionId）：$error',
-      };
-    }
-    final UsageHistory history = await UsageLog.read(
-      paths,
-      agentId,
-      sessionId,
-      tailBytes: tailBytes > 0 ? tailBytes : UsageLog.defaultTailBytes,
-    );
-    int prompt = 0;
-    int completion = 0;
-    int cached = 0;
-    bool anyCached = false;
-    final Map<String, Map<String, int>> bySource = <String, Map<String, int>>{};
-    for (final UsageCall call in history.calls) {
-      prompt += call.promptTokens;
-      completion += call.completionTokens;
-      final int? hit = call.cachedTokens;
-      if (hit != null) {
-        anyCached = true;
-        cached += hit;
-      }
-      // 分组键就是 `UsageSource` 那四类（账本自己写的）：不在此处再造第五类
-      final Map<String, int> row = bySource.putIfAbsent(
-        call.source,
-        () => <String, int>{
-          'calls': 0,
-          'prompt_tokens': 0,
-          'completion_tokens': 0,
-        },
-      );
-      row['calls'] = row['calls']! + 1;
-      row['prompt_tokens'] = row['prompt_tokens']! + call.promptTokens;
-      row['completion_tokens'] =
-          row['completion_tokens']! + call.completionTokens;
-    }
-    return <String, dynamic>{
-      'ok': true,
-      'agent_id': agentId,
-      'session_id': sessionId,
-      // 路径只作排障（与压缩中转载荷里的 `usage_file` 同一个口径）：插件据此向
-      // 用户解释“这笔账在哪”，但它自己读不到那个目录。
-      'usage_file': file,
-      'count': history.calls.length,
-      'skipped': history.skipped,
-      'tail_bytes': tailBytes > 0 ? tailBytes : UsageLog.defaultTailBytes,
-      'calls': <Map<String, dynamic>>[
-        for (final UsageCall call in history.calls) call.toJson(),
-      ],
-      'summary': <String, dynamic>{
-        'calls': history.calls.length,
-        'prompt_tokens': prompt,
-        'completion_tokens': completion,
-        'cached_tokens': anyCached ? cached : null,
-        'by_source': bySource,
-      },
-    };
-  }
-
-  /// 关闭入口用的登记表实例（与工具层同一份；引擎不可用时回落进程级唯一那一个）。
-  ToolRunRegistry _toolRunsOf() =>
-      _runnerFromEngine()?.toolRuns ?? ToolRunRegistry.instance;
-
-  /// 执行站 `tool.call`：执行**任意工具**（内置 / MCP / 插件工具同一入口）。
-  ///
-  /// 默认 `relay: false`（绕开工具中转与广播）——理由见
-  /// [WorkspaceToolRunner.runFromPlugin] 的自锁说明；要审计自己的调用就显式
-  /// `relay: true`。**权限口径不变**：与模型调用工具同一条路径、同一份工作空间解析。
-  Future<ToolOutcome> _stationToolCall({
-    required String agentId,
-    required String sessionId,
-    required String tool,
-    required Map<String, dynamic> arguments,
-    required String sourcePluginId,
-    required bool relay,
-  }) async {
-    final WorkspaceToolRunner? runner = _runnerFromEngine();
-    if (runner == null) {
-      return const ToolOutcome(
-        'tool.call 未接线：核心未接入工具执行器（真实 LLM 引擎不可用）',
-        isError: true,
-      );
-    }
-    return runner.runFromPlugin(
-      ToolInvocation(
-        id: CoreIds.next('call'),
-        name: tool,
-        arguments: arguments,
-        agentId: agentId,
-        sessionId: sessionId,
-      ),
-      sourcePluginId: sourcePluginId,
-      relay: relay,
-    );
-  }
-
-  /// 引擎手上的工具执行器（`tool.call` 的落点）；不是真实运行器时返回 null。
-  ///
-  /// 为什么不给 CoreServer 直接注入工具运行器：引擎已经持有它，而"模型的工具调用"
-  /// 与"插件经执行站的工具调用"必须是**同一个实例**（工作空间解析、MCP/插件工具
-  /// 分派、后台任务表都在它身上），多注一份就有两个真相。
-  WorkspaceToolRunner? _runnerFromEngine() {
-    final AgentEngine engine = conversation.engine;
-    if (engine is LlmAgentEngine && engine.toolRunner is WorkspaceToolRunner) {
-      return engine.toolRunner as WorkspaceToolRunner;
-    }
-    return null;
-  }
-
-  /// 执行站 `session.rename`：与 REST `PATCH …/sessions/{id}` **同一 store 实现**。
-  ///
-  /// 改名成功后向前端发一条下行帧，让界面上的会话标题即时更新（REST 路径是前端
-  /// 自己 setState，插件改名没有这条路径）。
-  Future<Map<String, dynamic>> _stationRenameSession({
-    required String agentId,
-    required String sessionId,
-    required String title,
-  }) async {
-    final bool renamed = store.renameSession(agentId, sessionId, title);
-    if (!renamed) {
-      return <String, dynamic>{'error': '会话不存在或未改名：$agentId/$sessionId'};
-    }
-    hub.broadcast(<String, dynamic>{
-      'type': WsOutboundType.sessionRenamed,
-      'data': <String, dynamic>{
-        'agent_id': agentId,
-        'session_id': sessionId,
-        'title': title,
-      },
-    });
-    return <String, dynamic>{'renamed': true};
-  }
-
-  /// 执行站 `agent.message`：插件 → 目标 agent 的会话。
-  ///
-  /// 首选团队派发（过审核闸门、写活动日志、链路失活时登记补发）；没有派发服务时
-  /// 退回会话投递（把来源插件写在发送者位上，模型知道是谁发的）。
-  Future<Map<String, dynamic>> _stationDeliverMessage({
-    required String agentId,
-    required String sessionId,
-    required String content,
-    String sourcePluginId = '',
-  }) async {
-    final CoreAgent? target = store.agent(agentId);
-    if (target == null) {
-      return <String, dynamic>{'error': '目标 agent 不存在：$agentId'};
-    }
-    final TeamMessageDispatcher? dispatcher = messageDispatcher;
-    if (dispatcher != null) {
-      // 插件不是团队成员：走用户侧入口（有审核闸门，且不会 auto_reply 回传给任何人）
-      return dispatcher.sendFromUser(
-        targetId: agentId,
-        content: content,
-        sessionId: sessionId,
-      );
-    }
-    final String sender = sourcePluginId.isEmpty ? '插件' : '插件 $sourcePluginId';
-    try {
-      await conversation.deliver(
-        agentId: agentId,
-        sessionId: sessionId,
-        content: content,
-        senderName: sender,
-      );
-    } catch (error) {
-      return <String, dynamic>{'error': '会话投递失败：$error'};
-    }
-    return <String, dynamic>{
-      'success': true,
-      'detail': <String, dynamic>{
-        'target': agentId,
-        'session_id': sessionId,
-        'sender': sender,
-      },
-    };
-  }
-
-  /// 执行站 `agent.compact`：手动压缩（与 REST 的 compact 同一服务，同样拒绝在途
-  /// 生成期间的压缩——压缩会改写上下文，与生成并发读写不安全）。
-  Future<Map<String, dynamic>> _stationCompact(
-    String agentId,
-    String sessionId,
-  ) async {
-    final CompactionService? service = compaction;
-    if (service == null) {
-      return <String, dynamic>{'error': '上下文压缩尚未接入'};
-    }
-    if (conversation.isRunning(agentId)) {
-      return <String, dynamic>{
-        'error': 'agent 正在生成：压缩会改写上下文，与生成并发读写不安全',
-        'reason': 'agent_working',
-      };
-    }
-    _broadcastCompactStatus(agentId, sessionId, 'compacting');
-    try {
-      final CompactionResult result = await service.compact(agentId, sessionId);
-      if (result.error.isNotEmpty) {
-        return <String, dynamic>{
-          'error': result.error,
-          'status': result.status,
-        };
-      }
-      _notifyManualCompact(agentId, sessionId, result);
-      return result.toJson();
-    } finally {
-      _broadcastCompactStatus(
-        agentId,
-        sessionId,
-        conversation.isRunning(agentId) ? 'working' : 'idle',
-      );
-    }
-  }
-
-  /// **手动压缩的结论通知**（REST `/compact` 与执行站 `agent.compact` 共用一条口径）。
-  ///
-  /// 压动了就落一条 `llm_hidden` 的会话消息（用户看得见、模型看不到、刷新后仍在）：
-  /// 手动压缩的 SnackBar 一刷新就没了，而"这次压缩走了哪条路 / 插件为什么没接管"
-  /// 恰恰是事后才想核对的东西。文案口径只有一处——[ConversationService.notifyCompactionResult]。
-  ///
-  /// 没压动（`too_few_messages` 等）不落库：那是"无事发生"，SnackBar 已经说清。
-  void _notifyManualCompact(
-    String agentId,
-    String sessionId,
-    CompactionResult result,
-  ) {
-    if (!result.compressed) return;
-    // 结果里的 sessionId 是压缩服务**实际用的**那个（body 没给 session_id 时它兜底到
-    // 默认会话），优先用它，避免通知落到别的会话里。
-    conversation.notifyCompactionResult(
-      agentId,
-      result.sessionId.isNotEmpty ? result.sessionId : sessionId,
-      result,
-    );
-  }
-
-  // ── 请求分发 ─────────────────────────────────────────────────────────
 
   void _dispatch(HttpRequest request) {
     unawaited(
@@ -1641,11 +652,6 @@ class CoreServer {
     socket.listen(
       (dynamic data) => _handleWsFrame(connection, data),
       onDone: () {
-        // 连接断了就把它开的终端收掉：否则会留下孤儿 shell 占着工作区
-        unawaited(
-          terminalService?.closeForConnection(connection.id) ??
-              Future<void>.value(),
-        );
         hub.unregister(connection.id);
         // 片 B：连接断开 = 该窗口的订阅全部失效；若是这个 UI 插件的最后一条
         // 连接，它自建的广播站也一起注销（站点移除钩子会给其它订阅者补 closed）。
@@ -1667,6 +673,8 @@ class CoreServer {
     return WsConnection(socket: socket);
   }
 
+  // ── WebSocket 帧分发（A5 平台面） ──────────────────────────────────────
+
   void _handleWsFrame(WsConnection connection, dynamic data) {
     // 收到**任意**入站帧（业务帧、心跳帧、分片帧……）= 链路还在 ⇒ 续期。
     // 这就是连接活性心跳的观测点：判据只在这里与保活定时器里产生，不看"上次发送
@@ -1685,35 +693,9 @@ class CoreServer {
       case WsInboundType.heartbeat:
         connection.send(<String, dynamic>{'type': WsOutboundType.heartbeat});
         break;
-      case WsInboundType.userMessage:
-        unawaited(conversation.handleUserMessage(frame));
-        break;
-      case WsInboundType.stop:
-        _handleStop(connection, frame);
-        break;
-      // 说明（M7c）：`register_*_executor` / `unregister_*_executor` 已随"前端执行器"
-      // 一起删除——桌面端工具由核心本机执行，不存在委托前端执行这回事。
-      case WsInboundType.userAnswer:
-        // 作答必须放进 `data` 子对象（前端 message_panel 的口径）；顶层回退
-        // 只是兼容手段。
-        if (!conversation.handleUserAnswer(frame)) {
-          connection.send(<String, dynamic>{
-            'type': WsOutboundType.error,
-            'data': <String, dynamic>{'message': '没有等待回答的问题'},
-          });
-        }
-        break;
-      case WsInboundType.cancelQuestion:
-        if (!conversation.handleCancelQuestion(frame)) {
-          connection.send(<String, dynamic>{
-            'type': WsOutboundType.error,
-            'data': <String, dynamic>{'message': '没有等待回答的问题'},
-          });
-        }
-        break;
-      // ── UI 插件 ⇄ 站点总线（片 B） ─────────────────────────────────────
+      // ── UI 插件 ⇄ 站点总线（片 B，平台面） ─────────────────────────────
       // ui.hello 是连接身份；其余五条在没有插件系统时也必须给可读拒绝，
-      // 不能像未知帧那样静默忽略（否则 UI 只会看到“没反应”）。
+      // 不能像未知帧那样静默忽略（否则 UI 只会看到"没反应"）。
       case WsInboundType.uiHello:
       case WsInboundType.stationSubscribe:
       case WsInboundType.stationUnsubscribe:
@@ -1734,31 +716,27 @@ class CoreServer {
           bridge.handleFrame(connection, frame);
         }
         break;
-      // ── 集成终端（Ctrl+J） ──────────────────────────────────────────
-      // 四条都要显式处理：静默忽略会让用户对着打不了字的终端猜（完备性门禁也拦）。
+      // ── A5：领域上行帧已移除 ──────────────────────────────────────────
+      // user_message / stop / user_answer / cancel_question 已改委派端点
+      // （POST /api/agents/{id}/messages | /cancel，由 tree.agent 承接）；
+      // terminal_* 归 local_executor / ssh_executor 插件的执行站。这里**显式**
+      // 回一条可读错误，不静默吞掉（否则 UI 只看到"没反应"）。
+      case WsInboundType.userMessage:
+      case WsInboundType.stop:
+      case WsInboundType.userAnswer:
+      case WsInboundType.cancelQuestion:
       case WsInboundType.terminalOpen:
-        final TerminalService? terminals = terminalService;
-        if (terminals == null) {
-          connection.send(<String, dynamic>{
-            'type': WsOutboundType.terminalError,
-            TerminalFrame.terminalId: (frame[TerminalFrame.terminalId] ?? '')
-                .toString(),
-            TerminalFrame.message: '核心未接线文件服务，终端不可用',
-          });
-        } else {
-          unawaited(terminals.open(connection, frame));
-        }
-        break;
       case WsInboundType.terminalInput:
-        unawaited(terminalService?.input(frame) ?? Future<void>.value());
-        break;
       case WsInboundType.terminalResize:
-        unawaited(terminalService?.resize(frame) ?? Future<void>.value());
-        break;
       case WsInboundType.terminalClose:
-        unawaited(
-          terminalService?.closeFromFrame(frame) ?? Future<void>.value(),
-        );
+        connection.send(<String, dynamic>{
+          'type': WsOutboundType.error,
+          'data': <String, dynamic>{
+            'ok': false,
+            'error': '该上行帧已随核心领域面移除（A5）：请改走插件委派端点 / 执行站',
+            'message': '该上行帧已随核心领域面移除（A5）：请改走插件委派端点 / 执行站',
+          },
+        });
         break;
       default:
         // 未知帧静默忽略（前向兼容：新前端配旧核心不应崩溃）
@@ -2052,7 +1030,7 @@ class CoreServer {
     });
   }
 
-  // ── 路由注册 ─────────────────────────────────────────────────────────
+  // ── 路由注册（A5：只剩 [ApiPaths.coreOwned] 的 39 条） ────────────────
 
   void _registerStubRoutes() {
     for (final String path in stubApiPaths) {
@@ -2066,46 +1044,34 @@ class CoreServer {
   }
 
   void _registerRoutes() {
-    router.add('GET', ApiPaths.agents, _listAgents);
-    router.add('POST', ApiPaths.agents, _createAgent);
-    router.add('GET', ApiPaths.agent, _getAgent);
-    router.add('PATCH', ApiPaths.agent, _updateAgent);
-    router.add('DELETE', ApiPaths.agent, _deleteAgent);
-    router.add('GET', ApiPaths.agentModelsInfo, _agentModelsInfo);
-    router.add('GET', ApiPaths.agentTodos, _agentTodos);
-    router.add('GET', ApiPaths.agentSubagents, _agentSubagents);
-    router.add(
-      'GET',
-      ApiPaths.agentSubagentTranscript,
-      _agentSubagentTranscript,
-    );
-    router.add('GET', ApiPaths.agentTeammates, _agentTeammates);
-    router.add('PATCH', ApiPaths.teammate, _updateTeammate);
-    router.add('GET', ApiPaths.teammateLog, _teammateLog);
-    router.add('POST', ApiPaths.teammateMessage, _teammateMessage);
-    router.add('GET', ApiPaths.models, _listModels);
-    router.add('POST', ApiPaths.models, _createModel);
-    router.add('PATCH', ApiPaths.model, _updateModel);
-    router.add('DELETE', ApiPaths.model, _deleteModel);
-    router.add('GET', ApiPaths.conversations, _conversationHistory);
-    router.add('DELETE', ApiPaths.conversations, _clearConversation);
-    router.add('GET', ApiPaths.agentSessions, _listSessions);
-    router.add('POST', ApiPaths.agentSessions, _createSession);
-    router.add('GET', ApiPaths.agentSession, _sessionDetail);
-    router.add('PATCH', ApiPaths.agentSession, _renameSession);
-    router.add('DELETE', ApiPaths.agentSession, _deleteSession);
-    router.add('POST', ApiPaths.agentSessionSpecs, _setSessionSpecs);
-    router.add('GET', ApiPaths.agentSpecs, _listSpecs);
-    router.add('GET', ApiPaths.agentSpec, _getSpec);
-    router.add('POST', ApiPaths.agentReset, _resetWorkspace);
-    router.add('POST', ApiPaths.agentCompact, _compactAgent);
-    router.add('POST', ApiPaths.agentSshReconnect, _reconnectAgentSsh);
-    router.add('GET', ApiPaths.questions, _listQuestions);
-    router.add('POST', ApiPaths.questionAnswer, _answerQuestion);
+    // 平台控制面（16）：装插件的前提，也是引导页唯一依赖。
+    router.add('GET', ApiPaths.pluginSnapshot, _pluginSnapshot);
+    router.add('GET', ApiPaths.pluginConfigs, _listPluginConfigs);
+    router.add('POST', ApiPaths.pluginConfigs, _createPluginConfig);
+    router.add('PATCH', ApiPaths.pluginConfig, _updatePluginConfig);
+    router.add('DELETE', ApiPaths.pluginConfig, _deletePluginConfig);
+    router.add('POST', ApiPaths.pluginConfigRestart, _restartPluginConfig);
+    router.add('GET', ApiPaths.pluginBuiltins, _listBuiltinPlugins);
+    router.add('POST', ApiPaths.pluginBuiltinEnable, _enableBuiltinPlugin);
+    router.add('POST', ApiPaths.pluginBuiltinDisable, _disableBuiltinPlugin);
+    // 发布仓库（阶段 5）：只读发布源（Gitee → GitHub 自动回退）的 Release 资产，
+    // 不 clone 源码；四个路由的分工与理由见 ApiPaths.pluginRelease 的注释。
+    router.add('GET', ApiPaths.pluginRelease, _pluginReleaseIndex);
+    router.add('POST', ApiPaths.pluginReleaseRefresh, _refreshPluginRelease);
+    router.add('POST', ApiPaths.pluginReleaseInstall, _installPluginRelease);
+    router.add('POST', ApiPaths.pluginReleaseUninstall, _uninstallPluginRelease);
+    // 站点详情与配置（面板「站点详情页」）。
+    router.add('GET', ApiPaths.pluginStation, _stationDetail);
+    router.add('PATCH', ApiPaths.pluginStationConfig, _updateStationConfig);
+    router.add('POST', ApiPaths.pluginStationSubscriber, _setStationSubscriber);
+
+    // UI 多窗口（3）：窗口 = 多进程，必须由核心拉起。
+    router.add('GET', ApiPaths.pluginWindows, _listUiWindows);
+    router.add('POST', ApiPaths.pluginWindows, _createUiWindow);
+    router.add('DELETE', ApiPaths.pluginWindowsOfPlugin, _closeUiWindows);
+    // 传输 / 判活设置（9）：交给插件会与传输层形成循环依赖。
     router.add('GET', ApiPaths.settingsFrameRate, _getFrameRate);
     router.add('POST', ApiPaths.settingsFrameRate, _setFrameRate);
-    router.add('GET', ApiPaths.settingsTokenRate, _getTokenRate);
-    router.add('POST', ApiPaths.settingsTokenRate, _setTokenRate);
     // 心跳判活参数：两个端点同形状（都接受两个字段），PATCH 是主用法（部分更新），
     // POST 作别名与帧率端点保持一致的调用习惯。
     router.add(
@@ -2139,29 +1105,13 @@ class CoreServer {
       _setMissedHeartbeatLimit,
     );
     router.add('POST', ApiPaths.settingsDataCollection, _setDataCollection);
-    router.add('GET', ApiPaths.files, _listFiles);
-    // 同路径的 DELETE（M11）：删除文件 / 目录（?path=&recursive=1）。
-    router.add('DELETE', ApiPaths.fileDelete, _fileDelete);
-    router.add('GET', ApiPaths.fileContent, _fileContent);
-    // 同路径的 PUT（M10）：源码编辑器保存（完整文本覆盖写）。
-    router.add('PUT', ApiPaths.fileContent, _fileWriteContent);
-    router.add('GET', ApiPaths.filePdfInfo, _filePdfInfo);
-    router.add('POST', ApiPaths.fileDownload, _downloadFile);
-    router.add('POST', ApiPaths.fileDownloadFolder, _downloadFolder);
-    router.add('POST', ApiPaths.fileUploadInit, _uploadInit);
-    router.add('POST', ApiPaths.fileUploadChunk, _uploadChunk);
-    router.add('POST', ApiPaths.fileUploadComplete, _uploadComplete);
-    router.add('POST', ApiPaths.fileSyncToLocal, _syncToLocal);
-    router.add('POST', ApiPaths.fileMkdir, _fileMkdir);
-    router.add('POST', ApiPaths.fileRename, _fileRename);
-    router.add('GET', ApiPaths.fileGitStatus, _fileGitStatus);
-    router.add('GET', ApiPaths.workspaceGitLog, _workspaceGitLog);
-    router.add('GET', ApiPaths.workspaceGitBranches, _workspaceGitBranches);
-    router.add('GET', ApiPaths.pluginSnapshot, _pluginSnapshot);
-    // 发现面（片 B）：UI 插件启动后据此判断核心能力、可订阅广播站与委派路由。
-    // routes 在片 C 之前为空数组（不编造静态清单）。
+    // 引导壳（3）。
+    router.add('GET', ApiPaths.bootstrap, _handleBootstrapPage);
+    router.add('POST', ApiPaths.bootstrapSession, _handleBootstrapSession);
+    router.add('POST', ApiPaths.bootstrapTicket, _apiBootstrapTicket);
+    // 发现面（1）。
     router.add('GET', ApiPaths.meta, _apiMeta);
-    // 日志与存储（片 F，核心永久面）。`/api/logs/sources` 必须先于
+    // 日志与存储（3 + 4，核心永久面）。`/api/logs/sources` 必须先于
     // `/api/logs/{source}` 注册，否则会被路径参数路由抢走。
     router.add('GET', ApiPaths.logSources, _listLogSources);
     router.add('GET', ApiPaths.logSource, _readLogSource);
@@ -2170,1444 +1120,6 @@ class CoreServer {
     router.add('GET', ApiPaths.storeEntry, _getStoreValue);
     router.add('PUT', ApiPaths.storeEntry, _putStoreValue);
     router.add('DELETE', ApiPaths.storeEntry, _deleteStoreValue);
-    // 引导壳（片 E）：页面与票据换会话都走专用处理（不认主 token）。
-    router.add('GET', ApiPaths.bootstrap, _handleBootstrapPage);
-    router.add('POST', ApiPaths.bootstrapSession, _handleBootstrapSession);
-    router.add('POST', ApiPaths.bootstrapTicket, _apiBootstrapTicket);
-    // 插件清单的读写面（M9 §4.2）：与只读快照分工见 ApiPaths.pluginConfigs 的注释。
-    router.add('GET', ApiPaths.pluginConfigs, _listPluginConfigs);
-    router.add('POST', ApiPaths.pluginConfigs, _createPluginConfig);
-    router.add('PATCH', ApiPaths.pluginConfig, _updatePluginConfig);
-    router.add('DELETE', ApiPaths.pluginConfig, _deletePluginConfig);
-    router.add('POST', ApiPaths.pluginConfigRestart, _restartPluginConfig);
-    router.add('GET', ApiPaths.pluginBuiltins, _listBuiltinPlugins);
-    router.add('POST', ApiPaths.pluginBuiltinEnable, _enableBuiltinPlugin);
-    router.add('POST', ApiPaths.pluginBuiltinDisable, _disableBuiltinPlugin);
-    // 发布仓库（阶段 5）：只读发布源（Gitee → GitHub 自动回退）的 Release 资产，
-    // 不 clone 源码；四个路由的分工与理由见 ApiPaths.pluginRelease /
-    // pluginReleaseRefresh / pluginReleaseInstall / pluginReleaseUninstall。
-    router.add('GET', ApiPaths.pluginRelease, _pluginReleaseIndex);
-    router.add('POST', ApiPaths.pluginReleaseRefresh, _refreshPluginRelease);
-    router.add('POST', ApiPaths.pluginReleaseInstall, _installPluginRelease);
-    router.add('POST', ApiPaths.pluginReleaseUninstall, _uninstallPluginRelease);
-    // 站点详情与配置（面板「站点详情页」）：介绍 / 可订阅上限 / 自定义配置 / 订阅者禁用。
-    router.add('GET', ApiPaths.pluginStation, _stationDetail);
-    router.add('PATCH', ApiPaths.pluginStationConfig, _updateStationConfig);
-    router.add('POST', ApiPaths.pluginStationSubscriber, _setStationSubscriber);
-    // 运行中工具（"工具卡住"的可见面）：只读快照 + 显式关闭。关闭走与执行站
-    // `tool.close` **同一个**实现（`ToolRunRegistry.close`），fail-closed 给可读原因。
-    router.add('GET', ApiPaths.toolsRunning, _listRunningTools);
-    router.add('POST', ApiPaths.toolsRunningClose, _closeRunningTool);
-  }
-
-  /// `GET /api/tools/running`：正在执行的工具**只读快照**（不触发任何副作用）。
-  ///
-  /// 形状（冻结）：`{runs:[{handle, agent_id, session_id, tool, command_preview,
-  /// started_at, elapsed_ms, over_threshold}]}`。数据源是核心的内存登记表：只登记
-  /// "正在跑的"、重启即清空、不做历史运行记录。
-  Future<void> _listRunningTools(
-    HttpRequest request,
-    Map<String, String> _,
-  ) async {
-    await writeJson(request, 200, _toolRunsOf().snapshot());
-  }
-
-  /// `POST /api/tools/running/{handle}/close`：**显式关闭**一次运行中的工具。
-  ///
-  /// 语义与执行站 `tool.close` 完全一致（同一个 `close` 实现）；句柄失效
-  /// （核心重启过 / 这次运行已结束）⇒ **404 + 可读原因**，不假装成功。
-  Future<void> _closeRunningTool(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final String handle = (params['handle'] ?? '').trim();
-    if (handle.isEmpty) {
-      await writeJson(request, 400, errorBody('缺少 handle（形如 toolrun_…）'));
-      return;
-    }
-    final ToolCloseOutcome outcome = await _toolRunsOf().close(handle);
-    if (!outcome.closed) {
-      await writeJson(request, 404, errorBody(outcome.note));
-      return;
-    }
-    await writeJson(request, 200, outcome.toJson());
-  }
-
-  // ── agent ────────────────────────────────────────────────────────────
-
-  /// `POST /api/agents/{agentId}/ssh/reconnect`：**显式**重建远端链路。
-  ///
-  /// 与传输层的**自动**重连（判失活那一瞬间起的退避循环，见 `DartSshTransport`）是
-  /// 同一份实现的两次入口——用户不想等退避（或自动重连已用尽）时点这个按钮。
-  /// **判活判据不变**：判死仍只看"连续 N 拍心跳丢失"，重连是判死**之后**的动作，
-  /// 不引入任何静态时长上限（M9 1.1）。
-  ///
-  /// 状态码：200 已重建（`stale` 复位为 false）；400 = 该 agent 不是 SSH 工作空间
-  /// （本地后端没有可重连的链路）；404 = 没有这个 agent；500 = 这次重建失败（detail 可读）。
-  Future<void> _reconnectAgentSsh(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final String agentId = (params['agentId'] ?? '').trim();
-    if (store.agent(agentId) == null) {
-      await writeJson(request, 404, errorBody('agent 不存在：$agentId'));
-      return;
-    }
-    final WorkspaceToolRunner? runner = _runnerFromEngine();
-    if (runner == null) {
-      await writeJson(request, 501, errorBody('工具执行器尚未接入，无法重连远端链路'));
-      return;
-    }
-    final SshReconnectOutcome outcome = await runner.reconnectSshLink(agentId);
-    if (outcome.ok) {
-      await writeJson(request, 200, <String, dynamic>{
-        'ok': true,
-        'agent_id': agentId,
-        'stale': outcome.stale,
-      });
-      return;
-    }
-    await writeJson(
-      request,
-      outcome.notSsh ? 400 : 500,
-      errorBody(outcome.reason),
-    );
-  }
-
-  /// `POST /api/agents/{agentId}/compact`：手动压缩上下文（M7d-4）。
-  ///
-  /// 状态帧与旧后端一致：压缩期间推 `agent_status=compacting`（前端显示「压缩中」
-  /// 并禁用按钮），结束（含异常）后按**实际**工作状态推 working/idle——压缩期间
-  /// 可能又来了新消息，无脑推 idle 会把前端的状态指示清掉。
-  Future<void> _compactAgent(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final CompactionService? service = compaction;
-    if (service == null) {
-      await writeJson(request, 501, errorBody('上下文压缩尚未接入'));
-      return;
-    }
-    final Map<String, dynamic>? body = await _jsonBody(request);
-    if (body == null) return;
-    final String agentId = params['agentId'] ?? '';
-    final String sessionId = (body['session_id'] ?? '').toString();
-    // 该会话正在生成：拒绝压缩（压缩会改写上下文，与生成并发读写不安全）
-    if (conversation.isRunning(agentId)) {
-      await writeJson(request, 200, <String, dynamic>{
-        'success': true,
-        'compressed': false,
-        'reason': 'agent_working',
-        'context_size': 0,
-      });
-      return;
-    }
-    _broadcastCompactStatus(agentId, sessionId, 'compacting');
-    try {
-      final CompactionResult result = await service.compact(agentId, sessionId);
-      if (result.error.isNotEmpty) {
-        await writeJson(request, result.status, errorBody(result.error));
-        return;
-      }
-      _notifyManualCompact(agentId, sessionId, result);
-      await writeJson(request, 200, result.toJson());
-    } finally {
-      _broadcastCompactStatus(
-        agentId,
-        sessionId,
-        conversation.isRunning(agentId) ? 'working' : 'idle',
-      );
-    }
-  }
-
-  /// 推一条 `agent_status` 帧（前端据此显示/清除「压缩中」）。
-  void _broadcastCompactStatus(
-    String agentId,
-    String sessionId,
-    String status,
-  ) {
-    hub.broadcast(<String, dynamic>{
-      'type': WsOutboundType.agentStatus,
-      'data': <String, dynamic>{
-        'agent_id': agentId,
-        'session_id': sessionId,
-        'status': status,
-      },
-    });
-  }
-
-  Future<void> _listAgents(HttpRequest request, Map<String, String> _) async {
-    final List<Map<String, dynamic>> items = <Map<String, dynamic>>[];
-    for (final CoreAgent agent in store.agents()) {
-      final CoreMessage? last = store.lastTextMessage(agent.id);
-      items.add(
-        agent.toApiJson(
-          lastMessage: last?.content ?? '',
-          lastMessageTime: last?.timestamp,
-          // 待处理成员红点/角标：数**它自己的下属**里未分配模型 / 待审核的成员
-          // （与成员面板同口径，见 TeamService.pendingMemberCountFor）。
-          // 此前这个参数从没传过 ⇒ 恒为 0 ⇒ 红点永远不亮（docs/team.md 却写着会亮）。
-          pendingMemberCount: teamService?.pendingMemberCountFor(agent.id) ?? 0,
-        ),
-      );
-    }
-    await writeJson(request, 200, <String, dynamic>{'agents': items});
-  }
-
-  Future<void> _createAgent(HttpRequest request, Map<String, String> _) async {
-    final Map<String, dynamic> body = await readJsonBody(request);
-    final String name = (body['name'] as String? ?? '').trim();
-    if (name.isEmpty) {
-      await writeJson(request, 400, errorBody('name 不能为空'));
-      return;
-    }
-    final String modelId = (body['model_id'] as String? ?? '').trim();
-    if (modelId.isEmpty) {
-      await writeJson(request, 400, errorBody('model_id 不能为空'));
-      return;
-    }
-    if (settings.model(modelId) == null) {
-      await writeJson(request, 400, errorBody('模型不存在：$modelId'));
-      return;
-    }
-    final CoreAgent agent = store.createAgent(
-      name: name,
-      systemPrompt: body['system_prompt'] as String? ?? '',
-      modelId: modelId,
-      teamMemberCount: (body['team_member_count'] as num?)?.toInt() ?? 0,
-      maxLevel: TeamLimits.level(body['max_level']),
-      maxMembersPerLevel: TeamLimits.members(body['max_members_per_level']),
-    );
-    // 站点已全局唯一（每类站一个实例，与 team / agent 无关），所以新建 agent
-    // **不需要**也不再触发任何站点预建：站点在核心启动的接线处就位，此后恒定。
-    await writeJson(request, 200, <String, dynamic>{
-      'success': true,
-      'agent': agent.toApiJson(),
-    });
-  }
-
-  Future<void> _getAgent(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final CoreAgent? agent = store.agent(params['agentId'] ?? '');
-    if (agent == null) {
-      await writeJson(request, 404, errorBody('agent 不存在'));
-      return;
-    }
-    await writeJson(request, 200, <String, dynamic>{
-      'agent': agent.toApiJson(),
-      // SSH 配置的**非机密**部分（host/port/username/auth/root/key_path），
-      // 供前端表单预填；密码与口令永不回显。
-      if (agent.sshConfig != null) 'ssh': _sshView(agent.sshConfig!),
-    });
-  }
-
-  Future<void> _updateAgent(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final Map<String, dynamic> body = await readJsonBody(request);
-    final String modelId = (body['model_id'] as String? ?? '').trim();
-    if (modelId.isNotEmpty && settings.model(modelId) == null) {
-      await writeJson(request, 400, errorBody('模型不存在：$modelId'));
-      return;
-    }
-    final CoreAgent? agent = store.updateAgent(
-      params['agentId'] ?? '',
-      systemPrompt: body.containsKey('system_prompt')
-          ? (body['system_prompt'] as String? ?? '')
-          : null,
-      modelId: modelId.isEmpty ? null : modelId,
-    );
-    if (agent == null) {
-      await writeJson(request, 404, errorBody('agent 不存在'));
-      return;
-    }
-
-    // 用户改了 agent 配置（提示词 / 工作空间 / 模型参数都可能影响 `[0]`）——但按
-    // 2026-10-04 的断言，**改来源不等于重建**：钉住的旧快照必须继续复用，否则一次重建
-    // 就把端点整条前缀缓存（长会话 20 万+ token）作废。要生效请**开新会话**或**压缩一次**。
-    // 老路径 `invalidateSystemPrompt` 还在（compact 之后走它），但这里**不再调**。
-    conversation.log?.call(
-      'agent 配置已改（提示词 / 工作空间 / 模型参数）：按断言继续复用钉住的系统提示词；'
-      '要生效请开新会话或压缩一次',
-    );
-
-    // ── 工作空间目录与 SSH 配置（M7c）：前端「运行模式」直接改 agent 配置 ──
-    // 语义与模型配置一致：字段缺失 = 不改；显式空值 = 清空。
-    bool touched = false;
-    // 目录改动 = 团队共享目录变了 ⇒ 要立刻镜像给成员（见 _syncWorkspaceMirrors）。
-    bool workspaceDirChanged = false;
-    if (body.containsKey('workspace_dir')) {
-      final String dir = (body['workspace_dir'] as String? ?? '').trim();
-      if (dir.isNotEmpty && !p.isAbsolute(dir)) {
-        await writeJson(
-          request,
-          400,
-          errorBody('workspace_dir 必须是绝对路径或空串（空 = 用默认工作空间）'),
-        );
-        return;
-      }
-      agent.workspaceDir = dir;
-      touched = true;
-      workspaceDirChanged = true;
-    }
-    if (body.containsKey('ssh')) {
-      final Object? raw = body['ssh'];
-      if (raw == null) {
-        agent.sshConfig = null;
-        touched = true;
-      } else if (raw is Map) {
-        final Map<String, dynamic> sshBody = raw.map(
-          (dynamic k, dynamic v) => MapEntry(k.toString(), v),
-        );
-        final SshConfig? parsed = SshConfig.parse(sshBody);
-        if (parsed == null) {
-          await writeJson(request, 400, errorBody('ssh.host 不能为空'));
-          return;
-        }
-        // 密码/口令按 PATCH 语义：键缺失 = 保留原值，显式空串 = 清空
-        final SshConfig? existing = agent.sshConfig;
-        final String password = sshBody.containsKey('password')
-            ? parsed.password
-            : (existing?.password ?? '');
-        final String passphrase = sshBody.containsKey('key_passphrase')
-            ? parsed.keyPassphrase
-            : (existing?.keyPassphrase ?? '');
-        if (password.isEmpty && parsed.keyPath.isEmpty) {
-          await writeJson(
-            request,
-            400,
-            errorBody('SSH 需要 password 或 key_path 之一'),
-          );
-          return;
-        }
-        agent.sshConfig = SshConfig(
-          host: parsed.host,
-          port: parsed.port,
-          username: parsed.username,
-          password: password,
-          keyPath: parsed.keyPath,
-          keyPassphrase: passphrase,
-          root: parsed.root,
-        );
-        touched = true;
-      } else {
-        await writeJson(request, 400, errorBody('ssh 必须是对象或 null'));
-        return;
-      }
-    }
-    // ── 模型参数覆盖（右栏「模型信息」页，M5b 语义）──
-    // 语义与团队成员的「模型配置」一致：键缺省 = 不修改；显式 null = 清除该项；
-    // clear_model_overrides = 一次性清空全部覆盖（回退模型默认，供「恢复默认」按钮）。
-    if (body['clear_model_overrides'] == true) {
-      agent.reasoningEffort = '';
-      agent.maxSeqlenOverride = 0;
-      agent.maxOutputTokens = 0;
-      agent.compressThreshold = 0;
-      agent.thinkingOverride = null;
-      touched = true;
-    } else {
-      if (body.containsKey('reasoning_effort')) {
-        agent.reasoningEffort = (body['reasoning_effort'] as String? ?? '')
-            .trim();
-        touched = true;
-      }
-      if (body.containsKey('max_seqlen')) {
-        final Object? raw = body['max_seqlen'];
-        if (raw == null) {
-          agent.maxSeqlenOverride = 0;
-        } else {
-          final int? parsed = raw is num ? raw.toInt() : int.tryParse('$raw');
-          if (parsed == null || parsed <= 0) {
-            await writeJson(
-              request,
-              400,
-              errorBody('max_seqlen 必须为正整数，或 null 清除该项覆盖'),
-            );
-            return;
-          }
-          agent.maxSeqlenOverride = parsed;
-        }
-        touched = true;
-      }
-      if (body.containsKey('max_output_tokens')) {
-        final Object? raw = body['max_output_tokens'];
-        if (raw == null) {
-          agent.maxOutputTokens = 0;
-        } else {
-          final int? parsed = raw is num ? raw.toInt() : int.tryParse('$raw');
-          if (parsed == null || parsed <= 0) {
-            await writeJson(
-              request,
-              400,
-              errorBody('max_output_tokens 必须为正整数，或 null 清除该项覆盖'),
-            );
-            return;
-          }
-          agent.maxOutputTokens = parsed;
-        }
-        touched = true;
-      }
-      if (body.containsKey('compress_threshold')) {
-        final Object? raw = body['compress_threshold'];
-        if (raw == null) {
-          agent.compressThreshold = 0;
-        } else {
-          final double? parsed = raw is num
-              ? raw.toDouble()
-              : double.tryParse('$raw');
-          if (parsed == null || parsed < 0.1 || parsed > 0.95) {
-            await writeJson(
-              request,
-              400,
-              errorBody('compress_threshold 必须在 0.1~0.95 之间，或 null 清除该项覆盖'),
-            );
-            return;
-          }
-          agent.compressThreshold = parsed;
-        }
-        touched = true;
-      }
-      if (body.containsKey('thinking')) {
-        final Object? raw = body['thinking'];
-        if (raw == null) {
-          agent.thinkingOverride = null;
-        } else if (raw is bool) {
-          agent.thinkingOverride = raw;
-        } else {
-          await writeJson(
-            request,
-            400,
-            errorBody('thinking 必须是 true / false，或 null 清除该项覆盖'),
-          );
-          return;
-        }
-        touched = true;
-      }
-    }
-    if (touched) {
-      agent.updatedAt = DateTime.now().millisecondsSinceEpoch;
-      store.putAgent(agent);
-    }
-    // 改的是团队 TOP 的目录 ⇒ 成员的镜像要立刻跟上：成员页显示的是这份镜像，
-    // 而"TOP 被删后成员升级为 TOP"要靠它做无损交接（用户断言 2026-10-03）。
-    if (workspaceDirChanged) await _syncWorkspaceMirrors();
-    await writeJson(request, 200, <String, dynamic>{
-      'success': true,
-      'agent': agent.toApiJson(),
-      if (agent.sshConfig != null) 'ssh': _sshView(agent.sshConfig!),
-    });
-  }
-
-  /// 把团队共享工作目录镜像到成员（幂等；见 syncWorkspaceMirrors）。
-  ///
-  /// 没有 [fileService] 时算不出"TOP 未配置目录时的默认目录"，直接跳过而不是写半份：
-  /// 写错比不写更糟（成员会落到一个并不存在的目录口径上）。
-  Future<void> _syncWorkspaceMirrors() async {
-    final FileService? files = fileService;
-    if (files == null) return;
-    try {
-      await syncWorkspaceMirrors(
-        store,
-        defaultDirFor: files.defaultWorkspaceDir,
-        backup: agentBackup,
-        log: errorLog,
-      );
-    } catch (error) {
-      // 镜像失败不该影响这次配置写入（用户改了目录就是改了；镜像下次启动会补上）
-      errorLog?.call('工作目录镜像失败（不影响本次写入）：$error');
-    }
-  }
-
-  /// SSH 配置的前端形态：在 `redacted()` 基础上补 `key_path`（表单预填需要），
-  /// **仍然绝不含 password / key_passphrase**。
-  static Map<String, dynamic> _sshView(SshConfig config) => <String, dynamic>{
-    ...config.redacted(),
-    if (config.keyPath.isNotEmpty) 'key_path': config.keyPath,
-  };
-
-  /// `DELETE /api/agents/{id}?cascade=1`：删除 agent（连同对话历史、会话与提问）。
-  ///
-  /// **两道闸门，都不通过就什么都不动**（2026-10-02 定稿）：
-  /// 1. **有下级必须显式级联**：否则回 409 + `cascade_required`（字段形状沿用 team 工具
-  ///    `remove_member`）。理由实测过：直接删掉一个中间层 leader，它的下级会变成
-  ///    **孤儿**——`parent_agent_id` 悬空 ⇒ `directMembers` 够不着（广播不达）、
-  ///    `cascadeIds` 够不着（级联停止/删除失效），而且 team 工具也再也删不掉它们
-  ///    （`_subtree` 同样沿父链走）；只有用户回到左栏手删一条路。
-  /// 2. **正在运行就拒绝**：`stop` 抢不动正在执行的工具（M9：本地执行活着就永不超时、
-  ///    不按时间杀进程），所以这里**不等待、不轮询**——等待会把 HTTP 挂住，且"删掉正在
-  ///    跑的 agent"正是残留的根因（那一轮继续往共享工作目录写、还能回一条来自幽灵成员的
-  ///    消息、`data/<id>` 被写回来）。请用户先停止并等它空闲。
-  ///
-  /// 通过闸门后的顺序：停（作废排队任务 + 收尾在途提问）→ 排水 → 清提问记录 →
-  /// 叶→根删 → 回填受影响 TOP 的 `team_member_count` → 再排水。
-  ///
-  /// 为什么先排水再删：`WriteQueue` 按**路径**串行，删 `data/<id>` 与写
-  /// `data/<id>/<session>/messages.jsonl` 是两个 key、顺序不保证；不排水就可能
-  /// "删完又被写回来"。
-  Future<void> _deleteAgent(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final String agentId = params['agentId'] ?? '';
-    if (store.agent(agentId) == null) {
-      await writeJson(request, 404, errorBody('agent 不存在'));
-      return;
-    }
-    final bool cascade =
-        request.uri.queryParameters['cascade'] == '1' ||
-        request.uri.queryParameters['cascade'] == 'true';
-    final List<CoreAgent> descendants =
-        teamService?.descendants(agentId) ?? const <CoreAgent>[];
-    if (descendants.isNotEmpty && !cascade) {
-      await writeJson(request, 409, <String, dynamic>{
-        'detail': '该 agent 还有 ${descendants.length} 个下级成员，未指定 cascade',
-        'error': '该 agent 还有 ${descendants.length} 个下级成员，未指定 cascade',
-        'cascade_required': <Map<String, dynamic>>[
-          for (final CoreAgent member in descendants)
-            <String, dynamic>{
-              'member_id': member.id,
-              'name': member.name,
-              'level': member.level,
-              'parent_agent_id': member.parentAgentId,
-            },
-        ],
-        'hint':
-            '直接删除会让这些下级变成孤儿（找不到上级，广播与级联停止都够不着）；'
-            '确认后带 ?cascade=1 连同下级一并删除，或先用 team 工具逐个移除下级',
-      });
-      return;
-    }
-    final List<String> ids = <String>[
-      agentId,
-      if (cascade) ...descendants.map((CoreAgent m) => m.id),
-    ];
-    // 记下每条的团队归属：删完就取不到了，而计数回填要用。
-    final Map<String, String> teamOf = <String, String>{};
-    for (final String id in ids) {
-      final CoreAgent? agent = store.agent(id);
-      if (agent == null) continue;
-      teamOf[id] = teamOfFor(agent);
-    }
-    List<String> running() =>
-        ids.where(conversation.isRunning).toList(growable: false);
-    if (running().isNotEmpty) {
-      await writeJson(request, 409, _busyBody(running()));
-      return;
-    }
-    // 停：作废排队任务（旧代次出队即丢）+ 收尾在途提问（QuestionBroker）。
-    for (final String id in ids) {
-      _stopAgentTree(id, cascade: false);
-    }
-    // 竞态兜底：恰好在闸门之后接单的排队任务会被这次代次推进作废，但"已过代次检查、
-    // 即将登记 token"的窗口仍在；再确认一次（不等待），有就照旧拒绝。
-    final List<String> started = running();
-    if (started.isNotEmpty) {
-      await writeJson(request, 409, _busyBody(started));
-      return;
-    }
-    await store.flush();
-    // 提问记录：先取消（记录还在时立刻收尾在途等待）再摘记录——顺序反了会让
-    // 等待中的工具永远拿不到结果（见 QuestionBroker.cancel 的注释）。
-    int questionsRemoved = 0;
-    for (final String id in ids) {
-      questions?.cancelForAgent(id);
-      questionsRemoved += questions?.questions.removeForAgent(id) ?? 0;
-      await questions?.questions.flush();
-    }
-    // 叶→根删（父先于子的逆序），避免留下"父没了子还在"的中间态
-    final List<String> removed = <String>[];
-    for (final String id in ids.reversed) {
-      if (store.deleteAgent(id)) removed.add(id);
-    }
-    await store.flush();
-    // 回填存活 TOP 的成员数（用户侧删除也走 team 工具那套"按实际成员数"的回填）
-    final Set<String> touchedTopIds = <String>{
-      for (final String teamId in teamOf.values)
-        if (!ids.contains(teamId)) teamId,
-    };
-    for (final String topId in touchedTopIds) {
-      teamService?.syncMemberCount(topId);
-    }
-    await store.flush();
-    await writeJson(request, 200, <String, dynamic>{
-      'success': true,
-      'removed': removed,
-      'cascade': cascade,
-      if (questionsRemoved > 0) 'questions_removed': questionsRemoved,
-    });
-  }
-
-  /// agent 的团队归属：成员取 `team_id`，顶层 agent 就是它自己。
-  static String teamOfFor(CoreAgent agent) =>
-      agent.teamId.isEmpty ? agent.id : agent.teamId;
-
-  /// "正在运行，不能删"的 409 响应体（两道闸门共用）。
-  Map<String, dynamic> _busyBody(List<String> running) => <String, dynamic>{
-    'detail': 'agent 正在运行，不能删除',
-    'error': 'agent 正在运行，不能删除',
-    'running': running,
-    'hint':
-        '请先停止该 agent（成员可在标题栏按「停止」）并等它变为空闲后再删除；'
-        '正在执行的工具无法被抢占（本地执行活着就永不超时），所以这里不会替你等待。',
-  };
-
-  Future<void> _agentModelsInfo(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final CoreAgent? agent = store.agent(params['agentId'] ?? '');
-    if (agent == null) {
-      await writeJson(request, 404, errorBody('agent 不存在'));
-      return;
-    }
-    await writeJson(request, 200, <String, dynamic>{
-      'agent': <String, dynamic>{
-        'id': agent.id,
-        'model_id': agent.modelId,
-        'system_prompt': agent.systemPrompt,
-      },
-      'models': settings
-          .models()
-          .map((CoreModelConfig m) => m.toApiJson())
-          .toList(),
-      // agent 级模型参数覆盖（M5 成员/覆盖特性落地）：只含**真正设置过**的键，
-      // 前端据此回填「模型参数（本 Agent）」的四个控件（缺省 = 不覆盖）。
-      'overrides': memberOverrides(agent),
-    });
-  }
-
-  Future<void> _agentTodos(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final String agentId = params['agentId'] ?? '';
-    final String sessionId =
-        request.uri.queryParameters['session_id'] ?? TreeStore.defaultSessionId;
-    if (store.agent(agentId) == null) {
-      await writeJson(request, 404, errorBody('agent 不存在'));
-      return;
-    }
-    // 待办由 set_todo_list 工具写入（落 <会话目录>/todos.md），此处读同一份数据
-    await writeJson(request, 200, <String, dynamic>{
-      'todos': todoStore
-          .read(agentId, sessionId)
-          .map((TodoItem todo) => todo.toApiJson())
-          .toList(),
-      'session_id': sessionId,
-    });
-  }
-
-  /// `GET /api/agents/{agentId}/subagents?session_id=`：该会话的**临时员工名册**。
-  ///
-  /// **只读**那份落盘名册（[TreeStore.subagents] ⇒ `subagents.json`）：中栏"进入某个
-  /// 临时员工"的入口用它当权威来源，因此不会随消息窗口的加载 / 淘汰抖动
-  /// （用户 2026-10-03：「进入某个临时成员的选项经常会无端变化」）。
-  ///
-  /// **跨会话不保留**：只回该 `(agentId, sessionId)` 的名册——查别的会话只会得到它
-  /// 自己那一份（通常是空表），删会话即随之消失；不新增任何跨会话存储。
-  Future<void> _agentSubagents(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final String agentId = params['agentId'] ?? '';
-    if (store.agent(agentId) == null) {
-      await writeJson(request, 404, errorBody('agent 不存在'));
-      return;
-    }
-    final String sessionId =
-        request.uri.queryParameters['session_id'] ?? TreeStore.defaultSessionId;
-    final List<CoreSubagent> roster = store.subagents(agentId, sessionId);
-    await writeJson(request, 200, <String, dynamic>{
-      'agent_id': agentId,
-      'session_id': sessionId,
-      'total': roster.length,
-      'subagents': <Map<String, dynamic>>[
-        for (final CoreSubagent s in roster) s.toRosterJson(),
-      ],
-    });
-  }
-
-  /// `GET /api/agents/{agentId}/subagents/{subagentId}/transcript?session_id=`：
-  /// 某临时员工的**全部落盘工作数据**（对话与工具调用，只读，方便后期复查）。
-  ///
-  /// 数据**本来就随会话落盘**（父会话 `messages.jsonl` 里带 `subagent_id` 标记的那一段，
-  /// `store/README.md` 不变量 11），这里补的是"按 id 一次取全"的**复查通路**：中栏是
-  /// 窗口化加载（只热视口附近），详情页不能再依赖"窗口恰好加载了什么"
-  /// （用户 2026-10-11：「subagent 的工作数据不落盘，导致非常不稳定」）。
-  ///
-  /// **跨会话不保留**照旧是硬不变量：先把**请求的那一会话**的名册装载（与跑一轮之前
-  /// "先打开会话"同一口径，兜住"重启后名册还没进内存"的时序），再核对记录自己的
-  /// `(ownerAgentId, sessionId)`，对不上就 404 + 可读原因，**不新增任何跨会话存储**。
-  /// 读取走 `store.messages(sub_…, session)`——装饰器按标记过滤出"它自己那一段"
-  /// （后台完成报告除外，那是发起者的输入）。
-  Future<void> _agentSubagentTranscript(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final String agentId = params['agentId'] ?? '';
-    final String subagentId = params['subagentId'] ?? '';
-    if (store.agent(agentId) == null) {
-      await writeJson(request, 404, errorBody('agent 不存在'));
-      return;
-    }
-    final String sessionId =
-        request.uri.queryParameters['session_id'] ?? TreeStore.defaultSessionId;
-    // 先装载这一会话的名册（幂等）：`handle` 只回答"已加载会话里的条目"，
-    // 不先装载就会把"重启后还没打开会话"误判成"不存在"。
-    subagents?.ensureSession(agentId, sessionId);
-    final CoreSubagent? record = subagents?.handle(subagentId);
-    if (record == null) {
-      await writeJson(request, 404, errorBody('临时员工不存在：$subagentId'));
-      return;
-    }
-    if (record.ownerAgentId != agentId || record.sessionId != sessionId) {
-      await writeJson(
-        request,
-        404,
-        errorBody(
-          '临时员工「${record.name}」属于会话 ${record.sessionId}，'
-          '不在这个会话（$sessionId）里——跨会话不保留是硬不变量。',
-        ),
-      );
-      return;
-    }
-    final List<CoreMessage> transcript =
-        List<CoreMessage>.of(store.messages(subagentId, sessionId))..sort(
-          (CoreMessage a, CoreMessage b) => a.timestamp.compareTo(b.timestamp),
-        );
-    await writeJson(request, 200, <String, dynamic>{
-      'agent_id': agentId,
-      'subagent_id': subagentId,
-      'session_id': sessionId,
-      'total': transcript.length,
-      'messages': transcript.map((CoreMessage m) => _messageJson(m)).toList(),
-    });
-  }
-
-  Future<void> _agentTeammates(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final TeamService? teams = teamService;
-    if (teams == null) {
-      // 未接入团队服务时返回空树（前端渲染空态），而不是 501 让窗口报错
-      await writeJson(request, 200, <String, dynamic>{
-        'agent_id': params['agentId'] ?? '',
-        'members': <Map<String, dynamic>>[],
-        'pending_member_count': 0,
-      });
-      return;
-    }
-    await writeJson(
-      request,
-      200,
-      teams.teammatesPayload(params['agentId'] ?? ''),
-    );
-  }
-
-  /// `PATCH /api/agents/{leaderId}/teammate/{memberId}`：**用户侧**唯一的模型写入口
-  /// （team 工具三处都拒绝改模型）。
-  Future<void> _updateTeammate(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final TeamService? teams = teamService;
-    if (teams == null) {
-      await writeJson(request, 501, errorBody('团队服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic> body = await readJsonBody(request);
-    final Map<String, dynamic> result = teams.assignModel(
-      topId: params['leaderId'] ?? '',
-      memberId: params['memberId'] ?? '',
-      body: body,
-    );
-    final Object? error = result['error'];
-    if (error != null) {
-      final String message = error.toString();
-      await writeJson(
-        request,
-        message.startsWith('成员不存在') ? 404 : 400,
-        errorBody(message),
-      );
-      return;
-    }
-    await writeJson(request, 200, result);
-  }
-
-  /// 停止一个 agent 的当前轮（[cascade] = 连同下级子树）：**既有停止路径的唯一实现**。
-  ///
-  /// WS `stop` 帧与执行站 `agent.stop` 命令共用它，因此两条路的语义严格一致：
-  /// 先 `cascadeIds` 展开子树，再逐个 `cancelAgent`（取消在途生成 + 作废排队任务）；
-  /// **没有在途任务**的成员补推一条 `idle`，否则前端/成员窗口的「工作中」标识会
-  /// 一直亮着（既有行为）。返回可读结论供调用方回报。
-  Map<String, dynamic> _stopAgentTree(
-    String agentId, {
-    bool cascade = true,
-    String sessionId = '',
-    Map<String, dynamic> extraFields = const <String, dynamic>{},
-  }) {
-    final List<String> ids = cascade
-        ? (teamService?.cascadeIds(agentId) ?? <String>[agentId])
-        : <String>[agentId];
-    final List<String> cancelled = <String>[];
-    final List<String> idle = <String>[];
-    for (final String id in ids) {
-      final bool running = conversation.cancelAgent(id);
-      if (running) {
-        cancelled.add(id);
-        continue;
-      }
-      idle.add(id);
-      hub.broadcast(<String, dynamic>{
-        'type': WsOutboundType.agentStatus,
-        'data': <String, dynamic>{
-          'agent_id': id,
-          'status': 'idle',
-          if (sessionId.isNotEmpty) 'session_id': sessionId,
-          // 停的是**临时员工**：带上它自己的标记，前端只收它那一份「工作中」；
-          // 停的是主 agent：显式声明「它自己不再跑了」（`own_running` 口径）。
-          if (extraFields.isNotEmpty) ...extraFields,
-          if (extraFields.isEmpty) 'own_running': false,
-        },
-      });
-    }
-    return <String, dynamic>{
-      'cascade': cascade,
-      'cascade_ids': ids,
-      'cancelled': cancelled,
-      'idle': idle,
-      'any_running': cancelled.isNotEmpty,
-    };
-  }
-
-  /// 处理 `stop`：**级联**语义（参考实现 `_stop_agent_tree`）。
-  ///
-  /// `agent_id` 是 TOP 时停整棵团队树：先自身、再成员。每个被取消的 agent 都作废
-  /// 排队任务（见 `ConversationService.cancelAgent`）；**没有在途任务**的成员补一条
-  /// `idle`，否则前端/成员窗口的"工作中"标识会一直亮着。
-  void _handleStop(WsConnection connection, Map<String, dynamic> frame) {
-    final Object? raw = frame['data'];
-    final Map<String, dynamic> data = raw is Map
-        ? raw.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
-        : frame;
-    final String agentId = (data['agent_id'] ?? frame['agent_id'] ?? '')
-        .toString()
-        .trim();
-    final String sessionId = (data['session_id'] ?? frame['session_id'] ?? '')
-        .toString()
-        .trim();
-    if (agentId.isEmpty) {
-      connection.send(<String, dynamic>{
-        'type': WsOutboundType.error,
-        'data': <String, dynamic>{'message': '缺少 agent_id'},
-      });
-      return;
-    }
-    // **临时员工 id：只停它自己**（用户 2026-10-03：「仅停止对应临时成员，保证对
-    // 其他成员无影响」）：它不在团队树里，`cascadeIds` 那套（TOP ⇒ 子树）对它没有
-    // 意义——显式关掉级联，别让「停一个临时员工」顺手扫到别的成员。
-    final bool stoppingSubagent = subagents?.isSubagent(agentId) ?? false;
-    final Map<String, dynamic> summary = _stopAgentTree(
-      agentId,
-      cascade: !stoppingSubagent,
-      sessionId: sessionId,
-      extraFields: stoppingSubagent
-          ? _subagentFrameFields(agentId)
-          : const <String, dynamic>{},
-    );
-    final bool anyRunning = summary['any_running'] == true;
-    final List<dynamic> ids = summary['cascade_ids'] as List<dynamic>;
-    if (!anyRunning && ids.length == 1) {
-      connection.send(<String, dynamic>{
-        'type': WsOutboundType.error,
-        'data': <String, dynamic>{'message': '没有进行中的任务可停止'},
-      });
-      return;
-    }
-    // 请求方：立刻回一条 stopping（前端把它当"已在停"处理）
-    connection.send(<String, dynamic>{
-      'type': WsOutboundType.agentStatus,
-      'data': <String, dynamic>{
-        'agent_id': agentId,
-        'status': 'stopping',
-        if (sessionId.isNotEmpty) 'session_id': sessionId,
-        if (stoppingSubagent) ..._subagentFrameFields(agentId),
-      },
-    });
-  }
-
-  /// 临时员工的**帧标记**（与 `SubagentTag.frameFields` 同口径）。
-  ///
-  /// 用途：停止回执与补推的 `idle` 也要带——前端据此只收掉**它自己**那一份
-  /// 「工作中」，而不是把主视角（或别的成员）也一起改掉（用户 2026-10-03）。
-  /// 名册里查不到（没加载 / 已删除）时至少给 `subagent_id`，别让帧失去归属。
-  Map<String, dynamic> _subagentFrameFields(String id) {
-    final CoreSubagent? record = subagents?.handle(id);
-    if (record == null) return <String, dynamic>{'subagent_id': id};
-    return <String, dynamic>{
-      'subagent_id': record.id,
-      if (record.name.isNotEmpty) 'subagent_name': record.name,
-      if (record.parentId.isNotEmpty) 'subagent_parent_id': record.parentId,
-      'subagent_level': record.level,
-    };
-  }
-
-  /// `GET /api/agents/{memberId}/teammate/{memberId}/log?lines=60`：成员活动日志尾部。
-  Future<void> _teammateLog(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final TeamMessageDispatcher? dispatcher = messageDispatcher;
-    if (dispatcher == null) {
-      await writeJson(request, 501, errorBody('团队服务尚未接入'));
-      return;
-    }
-    final String memberId = params['memberId'] ?? '';
-    final int lines =
-        int.tryParse(request.uri.queryParameters['lines'] ?? '') ?? 60;
-    // 读日志走 agent 自己的工作空间 IO ⇒ 本地与 **SSH 模式**同一个实现
-    // （`readActivityLog` 内部再退回本机绝对路径兜底）。
-    final Map<String, dynamic> read = await dispatcher.readActivityLog(
-      memberId,
-      lines: lines,
-    );
-    await writeJson(request, 200, <String, dynamic>{
-      'success': read['success'] ?? true,
-      'log': read['log'] ?? '',
-      'path': read['path'] ?? '',
-    });
-  }
-
-  /// `POST /api/agents/{leaderId}/teammate/{memberId}/message`：用户直接给成员发消息。
-  Future<void> _teammateMessage(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final TeamMessageDispatcher? dispatcher = messageDispatcher;
-    if (dispatcher == null) {
-      await writeJson(request, 501, errorBody('团队服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic> body = await readJsonBody(request);
-    final String content = (body['content'] ?? '').toString();
-    if (content.trim().isEmpty) {
-      await writeJson(request, 200, <String, dynamic>{
-        'success': false,
-        'error': '缺少 content',
-      });
-      return;
-    }
-    final String sessionId = (body['session_id'] ?? '').toString().trim();
-    final Map<String, dynamic> result = await dispatcher.sendFromUser(
-      targetId: params['memberId'] ?? '',
-      content: content,
-      sessionId: sessionId.isEmpty ? TreeStore.defaultSessionId : sessionId,
-    );
-    await writeJson(request, 200, result);
-  }
-
-  // ── 模型 ─────────────────────────────────────────────────────────────
-
-  Future<void> _listModels(HttpRequest request, Map<String, String> _) async {
-    await writeJson(request, 200, <String, dynamic>{
-      'models': settings
-          .models()
-          .map((CoreModelConfig m) => m.toApiJson())
-          .toList(),
-    });
-  }
-
-  Future<void> _createModel(HttpRequest request, Map<String, String> _) async {
-    final Map<String, dynamic> body = await readJsonBody(request);
-    final String? invalid = CoreSettings.validateNewModel(body);
-    if (invalid != null) {
-      await writeJson(request, 400, errorBody(invalid));
-      return;
-    }
-    final CoreModelConfig? model = settings.createModel(body);
-    if (model == null) {
-      await writeJson(request, 409, errorBody('模型已存在：${body['model_id']}'));
-      return;
-    }
-    await writeJson(request, 200, <String, dynamic>{
-      'success': true,
-      'model': model.toApiJson(),
-    });
-  }
-
-  Future<void> _updateModel(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final Map<String, dynamic> body = await readJsonBody(request);
-    final CoreModelConfig? model = settings.updateModel(
-      params['modelId'] ?? '',
-      body,
-    );
-    if (model == null) {
-      await writeJson(request, 404, errorBody('模型不存在'));
-      return;
-    }
-    await writeJson(request, 200, <String, dynamic>{
-      'success': true,
-      'model': model.toApiJson(),
-    });
-  }
-
-  Future<void> _deleteModel(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final String modelId = params['modelId'] ?? '';
-    final bool removed = settings.deleteModel(modelId);
-    if (!removed) {
-      await writeJson(request, 404, errorBody('模型不存在'));
-      return;
-    }
-    // 仍绑定该模型的 agent 列表（前端据此提示"需重新指定模型"）
-    final List<String> bound = store
-        .agents()
-        .where((CoreAgent a) => a.modelId == modelId)
-        .map((CoreAgent a) => a.id)
-        .toList();
-    await writeJson(request, 200, <String, dynamic>{
-      'success': true,
-      'bound_agents': bound,
-    });
-  }
-
-  // ── 会话与历史 ───────────────────────────────────────────────────────
-
-  Future<void> _listSessions(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final String agentId = params['agentId'] ?? '';
-    if (store.agent(agentId) == null) {
-      await writeJson(request, 404, errorBody('agent 不存在'));
-      return;
-    }
-    // 兜底默认会话（对齐现状 server：list_sessions 至少返回一个空会话）
-    store.ensureDefaultSession(agentId);
-    final List<Map<String, dynamic>> items = store
-        .sessions(agentId)
-        .map(
-          (CoreSession s) => s.toApiJson(
-            messageCount: store.messageCount(agentId, s.sessionId),
-          ),
-        )
-        .toList();
-    await writeJson(request, 200, <String, dynamic>{
-      'agent_id': agentId,
-      'sessions': items,
-    });
-  }
-
-  Future<void> _createSession(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final Map<String, dynamic> body = await readJsonBody(request);
-    final CoreSession? session = store.createSession(
-      params['agentId'] ?? '',
-      title: body['title'] as String? ?? '',
-      sessionId: body['session_id'] as String?,
-    );
-    if (session == null) {
-      await writeJson(request, 404, errorBody('agent 不存在'));
-      return;
-    }
-    await writeJson(request, 200, <String, dynamic>{
-      'success': true,
-      'session': session.toApiJson(),
-    });
-  }
-
-  Future<void> _sessionDetail(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final String agentId = params['agentId'] ?? '';
-    final String sessionId = params['sessionId'] ?? '';
-    final CoreSession? session = store.session(agentId, sessionId);
-    if (session == null) {
-      await writeJson(request, 404, errorBody('会话不存在'));
-      return;
-    }
-    await writeJson(request, 200, <String, dynamic>{
-      'session': session.toApiJson(
-        messageCount: store.messageCount(agentId, sessionId),
-      ),
-      'messages': store
-          .sessionMessages(agentId, sessionId)
-          .map((CoreMessage m) => m.toJson())
-          .toList(),
-    });
-  }
-
-  Future<void> _renameSession(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final Map<String, dynamic> body = await readJsonBody(request);
-    final bool renamed = store.renameSession(
-      params['agentId'] ?? '',
-      params['sessionId'] ?? '',
-      body['title'] as String? ?? '',
-    );
-    if (!renamed) {
-      await writeJson(request, 404, errorBody('会话不存在'));
-      return;
-    }
-    await writeJson(request, 200, <String, dynamic>{'success': true});
-  }
-
-  Future<void> _deleteSession(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final String agentId = params['agentId'] ?? '';
-    final String sessionId = params['sessionId'] ?? '';
-    // 临时员工只活在会话里：删会话即把它这一棵树从内存索引里摘掉
-    // （落盘名册随会话目录一起删，见 FileTreeStore.deleteSession）
-    subagents?.forgetSession(agentId, sessionId);
-    final bool removed = store.deleteSession(agentId, sessionId);
-    if (!removed) {
-      await writeJson(request, 404, errorBody('会话不存在'));
-      return;
-    }
-    await writeJson(request, 200, <String, dynamic>{'success': true});
-  }
-
-  Future<void> _conversationHistory(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final String agentId = params['agentId'] ?? '';
-    if (store.agent(agentId) == null) {
-      await writeJson(request, 404, errorBody('agent 不存在'));
-      return;
-    }
-    final String sessionId =
-        request.uri.queryParameters['session_id'] ?? TreeStore.defaultSessionId;
-    // **会话完整消息流**（含临时员工的消息）：用户要能看到临时员工干过什么，
-    // 因此历史接口走 sessionMessages（模型上下文走 messages，两者刻意不同）。
-    final List<CoreMessage> messages = (sessionId == 'all')
-        ? <CoreMessage>[
-            for (final CoreSession s in store.sessions(agentId))
-              ...store.sessionMessages(agentId, s.sessionId),
-          ]
-        : store.sessionMessages(agentId, sessionId);
-    final List<CoreMessage> ordered = List<CoreMessage>.of(messages)
-      ..sort(
-        (CoreMessage a, CoreMessage b) => a.timestamp.compareTo(b.timestamp),
-      );
-    // **懒加载分页**（用户 2026-10-04：「会话太长时导入不能直接划到底部；长会话仅加载
-    // 末尾一段」）：limit = 这次要多少条（取**末尾**），before = 只要比这条消息更早的
-    // （前端拿着"当前最老的那条 id"往回翻页）。不传 limit 就是老口径：整份都返回。
-    final int limit =
-        int.tryParse(request.uri.queryParameters['limit'] ?? '') ?? 0;
-    final String before = (request.uri.queryParameters['before'] ?? '').trim();
-    // **按下标寻址**（用户 2026-10-04：「滑到哪加载哪」）：
-    // - from = 从第几条开始（全局下标，0 = 最旧那条）；
-    // - at   = "含这条消息的那一段"（前端要定位一条**不在窗口里**的消息时用它，
-    //          窗口只缓存视口附近，定位目标很可能早就被淘汰了）。
-    // 不管走哪条路，响应都带 offset = 这一页第一条的**全局下标**：前端据此把这一页
-    // 放进窗口的槽位表（滑块的"全局长度"口径也来自它）。
-    final int? from = int.tryParse(request.uri.queryParameters['from'] ?? '');
-    final String at = (request.uri.queryParameters['at'] ?? '').trim();
-    // 单页上限：本地回环上也不为一次手滑的 limit 拼一份巨型 JSON
-    final int pageSize = limit <= 0
-        ? 0
-        : (limit > _historyPageMax ? _historyPageMax : limit);
-    final int total = ordered.length;
-    int start;
-    int end;
-    if (at.isNotEmpty) {
-      final int found = ordered.indexWhere((CoreMessage m) => m.id == at);
-      if (found < 0) {
-        // 找不到（被清掉 / 换了会话）：退回末尾一段 —— 与 before 找不到同口径，
-        // 绝不静默返回整份
-        end = total;
-        start = (pageSize > 0 && end > pageSize) ? end - pageSize : 0;
-      } else {
-        // 以目标为中心取一段，再夹一次保证**目标一定在页内**
-        final int span = pageSize > 0 ? pageSize : total;
-        start = (found - span ~/ 2).clamp(0, total);
-        end = (start + span).clamp(0, total);
-        // 贴边（目标是头几条 / 末尾几条）时整段回推，尽量回一份**整页**：
-        // 窗口填页时页头页尾都有内容，滑到边界也不会只剩两条
-        if (end - start < span) start = (end - span).clamp(0, total);
-        if (found < start) start = found;
-        if (found >= end) end = found + 1;
-      }
-    } else if (from != null) {
-      start = from.clamp(0, total);
-      end = pageSize > 0 ? (start + pageSize).clamp(0, total) : total;
-    } else {
-      end = total;
-      if (before.isNotEmpty) {
-        final int idx = ordered.indexWhere((CoreMessage m) => m.id == before);
-        // 找不到游标（消息被清掉 / 会话换了）：当"从头开始"，别默默返回整份
-        if (idx >= 0) end = idx;
-      }
-      start = (pageSize > 0 && end > pageSize) ? end - pageSize : 0;
-    }
-    final List<CoreMessage> page = ordered.sublist(start, end);
-    await writeJson(request, 200, <String, dynamic>{
-      'agent_id': agentId,
-      'session_id': sessionId,
-      'messages': page.map((CoreMessage m) => _messageJson(m)).toList(),
-      // 分页元信息（老前端忽略它们，行为不变）
-      'total': total,
-      // 这一页第一条的全局下标（按下标寻址的唯一真值）
-      'offset': start,
-      'has_more': start > 0,
-    });
-  }
-
-  /// 消息的前端形态：提问卡片额外叠加提问记录里的状态与答案。
-  ///
-  /// 消息日志是**只追加**的，`answered` 落盘后永远是 false；真源在提问记录里，
-  /// 因此历史加载时按 `qid == message.id` 覆盖。多问题：`questions` / `answers`
-  /// 一并叠加（老键 `question` / `options` / `answer` 保留，老前端零影响）。
-  Map<String, dynamic> _messageJson(CoreMessage message) {
-    final Map<String, dynamic> json = message.toJson();
-    if (message.kind != 'ask_user_question') return json;
-    final QuestionRecord? record = questions?.questions.byId(message.id);
-    if (record == null) return json;
-    json['answered'] = !record.isPending;
-    json['answer'] = record.answer;
-    json['questions'] = record.questions
-        .map((AskedQuestion q) => q.toJson())
-        .toList();
-    json['answers'] = record.answers;
-    if (record.options.isNotEmpty) json['options'] = record.options;
-    return json;
-  }
-
-  Future<void> _clearConversation(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final int deleted = store.clearMessages(
-      params['agentId'] ?? '',
-      sessionId: request.uri.queryParameters['session_id'],
-    );
-    await writeJson(request, 200, <String, dynamic>{
-      'success': true,
-      'deleted': deleted,
-    });
-  }
-
-  Future<void> _setSessionSpecs(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final Map<String, dynamic> body = await readJsonBody(request);
-    final String agentId = params['agentId'] ?? '';
-    final String sessionId = params['sessionId'] ?? '';
-    if (store.session(agentId, sessionId) == null) {
-      await writeJson(request, 404, errorBody('会话不存在'));
-      return;
-    }
-    final List<String> specIds =
-        (body['spec_ids'] as List<dynamic>? ?? <dynamic>[])
-            .map((dynamic e) => e.toString())
-            .toList();
-    store.setSelectedSpecs(agentId, sessionId, specIds);
-    // 改了 hook 就立刻刷新 ⑧ 章快照，否则要等下一次后台补扫才进系统提示词
-    final SpecService? specs = specService;
-    if (specs != null) {
-      await specs.refreshSelectedSpecs(
-        agentId,
-        sessionId,
-        await specIoFor?.call(agentId),
-      );
-    }
-    await writeJson(request, 200, <String, dynamic>{
-      'success': true,
-      'selected_spec_ids': specIds,
-    });
-  }
-
-  Future<void> _listSpecs(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final String agentId = params['agentId'] ?? '';
-    final CoreSession? session = store.session(
-      agentId,
-      request.uri.queryParameters['session_id'] ?? TreeStore.defaultSessionId,
-    );
-    final SpecService? specs = specService;
-    if (specs == null) {
-      await writeJson(request, 200, <String, dynamic>{
-        'specs': <Map<String, dynamic>>[],
-        'selected_spec_ids': session?.selectedSpecIds ?? <String>[],
-      });
-      return;
-    }
-    final WorkspaceIO? io = await specIoFor?.call(agentId);
-    final List<SpecDocument> documents = await specs.index(agentId, io);
-    await writeJson(request, 200, <String, dynamic>{
-      'specs': documents.map((SpecDocument d) => d.toMetaJson()).toList(),
-      'selected_spec_ids': session?.selectedSpecIds ?? <String>[],
-    });
-  }
-
-  /// `GET /api/agents/{agentId}/specs/{specId}`：Spec 详情（元数据 + 全文）。
-  Future<void> _getSpec(HttpRequest request, Map<String, String> params) async {
-    final SpecService? specs = specService;
-    final String specId = params['specId'] ?? '';
-    if (specs == null) {
-      await writeJson(request, 200, <String, dynamic>{
-        'meta': <String, dynamic>{},
-        'content': '',
-      });
-      return;
-    }
-    final String agentId = params['agentId'] ?? '';
-    final WorkspaceIO? io = await specIoFor?.call(agentId);
-    final SpecDocument? document = await specs.detail(agentId, io, specId);
-    if (document == null) {
-      await writeJson(request, 404, errorBody('Spec 不存在: $specId'));
-      return;
-    }
-    await writeJson(request, 200, <String, dynamic>{
-      'meta': document.toMetaJson(),
-      'content': document.raw,
-    });
-  }
-
-  /// `POST /api/agents/{agentId}/reset`：一键重置工作空间里的
-  /// 系统提示词 / Spec（body: `{target}`，target ∈ system_prompt | spec | all）。
-  ///
-  /// 语义：现有文件先备份成 `.bak.<n>`（保留旧备份），再写回默认内容；Spec 的
-  /// 自定义文件会一并清理（备份里可找回）。工作空间不可用时给**可读 400**，
-  /// 而不是静默成功。
-  Future<void> _resetWorkspace(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final String agentId = params['agentId'] ?? '';
-    final Map<String, dynamic> body = await readJsonBody(request);
-    final String target = (body['target'] as String? ?? 'all')
-        .trim()
-        .toLowerCase();
-    if (target != 'system_prompt' && target != 'spec' && target != 'all') {
-      await writeJson(
-        request,
-        400,
-        errorBody('target 只能是 system_prompt / spec / all'),
-      );
-      return;
-    }
-    if (store.agent(agentId) == null) {
-      await writeJson(request, 404, errorBody('agent 不存在'));
-      return;
-    }
-    final WorkspaceIO? io = await specIoFor?.call(agentId);
-    if (io == null) {
-      await writeJson(request, 400, errorBody('工作空间不可用（未接线 / SSH 配置不完整），无法重置'));
-      return;
-    }
-    final Map<String, dynamic> result = <String, dynamic>{'success': true};
-    if (target == 'system_prompt' || target == 'all') {
-      final SystemPromptStore? prompts = systemPromptStore;
-      if (prompts != null) {
-        final PromptResetResult reset = await prompts.reset(agentId, io);
-        await prompts.refresh(agentId);
-        result['system_prompt'] = reset.toJson();
-      }
-    }
-    // 显式重置写回了新文件——但按断言**不重建**钉住的快照（要生效请开新会话或压缩一次）：
-    // 否则一次重置就把端点整条前缀缓存作废（见 docs/known-issues.md #28）。
-    conversation.log?.call(
-      '工作空间提示词 / 规范已重置：按断言继续复用钉住的系统提示词；'
-      '要生效请开新会话或压缩一次',
-    );
-    if (target == 'spec' || target == 'all') {
-      final SpecService? specs = specService;
-      if (specs != null) {
-        result['spec'] = await specs.reset(io);
-        await specs.refreshIndex(agentId, io);
-      }
-    }
-    await writeJson(request, 200, result);
-  }
-
-  Future<void> _listQuestions(
-    HttpRequest request,
-    Map<String, String> _,
-  ) async {
-    final Map<String, String> query = request.uri.queryParameters;
-    final QuestionBroker? broker = questions;
-    final List<QuestionRecord> records = broker == null
-        ? const <QuestionRecord>[]
-        : broker.questions.list(
-            agentId: query['agent_id'],
-            sessionId: query['session_id'],
-          );
-    final String status = query['status'] ?? '';
-    final List<QuestionRecord> filtered = status.isEmpty
-        ? records
-        : records
-              .where((QuestionRecord r) => r.status == status)
-              .toList(growable: false);
-    // 最新的排前面（右栏「问题回复」页的首要需求是看到刚提出的问题）
-    final List<QuestionRecord> ordered = List<QuestionRecord>.of(filtered)
-      ..sort(
-        (QuestionRecord a, QuestionRecord b) =>
-            b.createdAt.compareTo(a.createdAt),
-      );
-    await writeJson(request, 200, <String, dynamic>{
-      'questions': ordered.map((QuestionRecord r) => r.toApiJson()).toList(),
-      'total': ordered.length,
-    });
-  }
-
-  /// `POST /api/questions/{qid}/answer`：与 WS `user_answer` 等价（REST 入口）。
-  Future<void> _answerQuestion(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final QuestionBroker? broker = questions;
-    if (broker == null) {
-      await writeJson(request, 501, errorBody('提问回路尚未接入'));
-      return;
-    }
-    final String qid = params['qid'] ?? '';
-    final Map<String, dynamic> body = await readJsonBody(request);
-    // 多问题：`answers`（逐题数组）优先；老前端只回 `answer`（单值 = 第一问）
-    final Object? rawAnswers = body['answers'];
-    final List<String> answers = rawAnswers is List
-        ? rawAnswers.map((dynamic e) => e?.toString() ?? '').toList()
-        : <String>[(body['answer'] ?? '').toString()];
-    final QuestionRecord? record = broker.questions.byId(qid);
-    if (record == null) {
-      await writeJson(request, 404, errorBody('没有等待回答的问题'));
-      return;
-    }
-    if (!record.isPending) {
-      await writeJson(request, 400, errorBody('没有等待回答的问题'));
-      return;
-    }
-    // 幂等：并发（WS + REST 同时作答）时只有第一次生效
-    if (!broker.answer(qid, answers)) {
-      await writeJson(request, 400, errorBody('没有等待回答的问题'));
-      return;
-    }
-    await writeJson(request, 200, <String, dynamic>{
-      'success': true,
-      'qid': qid,
-      'status': QuestionStatus.answered,
-      'answers': record.answers,
-    });
   }
 
   // ── 设置 ─────────────────────────────────────────────────────────────
@@ -3628,25 +1140,6 @@ class CoreServer {
       'frame_rate': settings.setFrameRate(requested),
       'min': CoreSettings.frameRateMin,
       'max': CoreSettings.frameRateMax,
-    });
-  }
-
-  Future<void> _getTokenRate(HttpRequest request, Map<String, String> _) async {
-    await writeJson(request, 200, <String, dynamic>{
-      'token_rate': settings.tokenAcquisitionRate,
-      'min': CoreSettings.tokenRateMin,
-      'max': CoreSettings.tokenRateMax,
-    });
-  }
-
-  Future<void> _setTokenRate(HttpRequest request, Map<String, String> _) async {
-    final Map<String, dynamic> body = await readJsonBody(request);
-    final int requested =
-        (body['token_rate'] as num?)?.toInt() ?? CoreSettings.tokenRateMax;
-    await writeJson(request, 200, <String, dynamic>{
-      'token_rate': settings.setTokenAcquisitionRate(requested),
-      'min': CoreSettings.tokenRateMin,
-      'max': CoreSettings.tokenRateMax,
     });
   }
 
@@ -3804,7 +1297,7 @@ class CoreServer {
         '（台账仍记启动值 ${LivenessTracker.formatDuration(trackerInterval)}）';
   }
 
-  // ── 插件 / MCP ───────────────────────────────────────────────────────
+// ── 请求体解析（插件端点共用） ───────────────────────────────────────
 
   /// 文件/工作空间路由的统一错误处理（FileService 用 `{error, status}` 表达失败）。
   /// 读 JSON 请求体；非法 JSON 时回 400 并返回 null（不留到 500）。
@@ -3817,423 +1310,14 @@ class CoreServer {
     }
   }
 
-  /// 宽松解析整数字段（前端偶尔把数字序列化成字符串）。
-  static int _asInt(Object? value) {
-    if (value is num) return value.toInt();
-    return int.tryParse('${value ?? ''}') ?? 0;
-  }
-
   /// 宽松解析**可选**整数字段：缺字段 / 非法值一律返回 null = **不改该项**。
   ///
-  /// 刻意不学 [_asInt] 兜 0：0 会被夹到区间下限，等于"字段写错了却悄悄改了配置"。
+  /// 刻意不兜 0：0 会被夹到区间下限，等于"字段写错了却悄悄改了配置"。
   static int? _optionalInt(Map<String, dynamic> body, String key) {
     final Object? raw = body[key];
     if (raw is num) return raw.toInt();
     if (raw is String) return int.tryParse(raw.trim());
     return null;
-  }
-
-  /// 服务层结果里带 `error` 时写回错误响应并返回 true（文件、压缩等共用）。
-  ///
-  /// 服务层统一用 `{error, status}` 表达失败，路由层只判断一次，避免每个处理器
-  /// 各写一遍状态码映射（写错就是「该 400 的变成 500」）。
-  Future<bool> _writeResultError(
-    HttpRequest request,
-    Map<String, dynamic> result,
-  ) async {
-    final Object? error = result['error'];
-    if (error == null) return false;
-    final int status = (result['status'] as num?)?.toInt() ?? 404;
-    await writeJson(request, status, errorBody(error.toString()));
-    return true;
-  }
-
-  /// `GET /api/files/{workspaceId}?path=`：目录树。
-  Future<void> _listFiles(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final FileService? files = fileService;
-    if (files == null) {
-      await writeJson(request, 501, errorBody('文件服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic> result = await files.list(
-      params['workspaceId'] ?? '',
-      path: request.uri.queryParameters['path'] ?? '',
-    );
-    if (await _writeResultError(request, result)) return;
-    await writeJson(request, 200, result);
-  }
-
-  /// `GET /api/files/{workspaceId}/content?path=`：文件内容（图片为 base64）。
-  Future<void> _fileContent(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final FileService? files = fileService;
-    if (files == null) {
-      await writeJson(request, 501, errorBody('文件服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic> result = await files.content(
-      params['workspaceId'] ?? '',
-      request.uri.queryParameters['path'] ?? '',
-    );
-    if (await _writeResultError(request, result)) return;
-    await writeJson(request, 200, result);
-  }
-
-  /// PUT /api/files/{workspaceId}/content?path=&force= ：按完整文本覆盖写（M10）。
-  ///
-  /// 前端源码编辑器保存用：请求体 {content, if_size?}（if_size = 前端加载时看到的
-  /// 字节数）。成功 200 {success, path, size, written}；if_size 与当前字节数不符
-  /// → 409 冲突 {error: 'conflict', detail, size}（文件已不存在时省略 size、由 detail
-  /// 说明，前端据此判定 missing）；其余失败
-  /// 400 {error, detail}。team_id 与 GET 同口径：当前核心按 workspaceId 定位工作
-  /// 空间，该参数仅为前后端调用点一致而保留、不参与分派。
-  ///
-  /// 落盘与判定（路径守卫 / 二进制 / 上限 / 冲突）都在 [FileService.writeContent]，
-  /// 这里只负责解析请求与把 {error, detail, status} 翻成 HTTP 响应。
-  Future<void> _fileWriteContent(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final FileService? files = fileService;
-    if (files == null) {
-      await writeJson(request, 501, errorBody('文件服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic>? body = await _jsonBody(request);
-    if (body == null) return;
-    final Object? content = body['content'];
-    if (content is! String) {
-      await writeJson(request, 400, <String, dynamic>{
-        'error': 'invalid_body',
-        'detail': '请求体缺少 content 字段（必须是完整文本）',
-      });
-      return;
-    }
-    final Map<String, String> query = request.uri.queryParameters;
-    final Map<String, dynamic> result = await files.writeContent(
-      params['workspaceId'] ?? '',
-      path: query['path'] ?? '',
-      content: content,
-      ifSize: _optionalInt(body, 'if_size'),
-      force: _truthy(query['force']),
-    );
-    // 写接口的错误体固定是 {error, detail}（409 冲突另带当前 size）。
-    await _writeWriteResult(request, result);
-  }
-
-  /// 写接口（`writeContent` / 结构改动）的响应收口。
-  ///
-  /// 服务层用 `{error, detail, status}` 表达失败：`error` 是机器码、`detail` 是
-  /// 可直接展示的中文原因（前端两种字段都认）。这里不走 [_writeResultError] 那套
-  /// 「error 即 detail」的口径——那会把机器码当文案发给用户。
-  Future<void> _writeWriteResult(
-    HttpRequest request,
-    Map<String, dynamic> result,
-  ) async {
-    final Object? error = result['error'];
-    if (error == null) {
-      await writeJson(request, 200, result);
-      return;
-    }
-    final int status = (result['status'] as num?)?.toInt() ?? 400;
-    final Map<String, dynamic> payload = <String, dynamic>{
-      'error': error,
-      'detail': result['detail'] ?? error,
-    };
-    final Object? size = result['size'];
-    if (size != null) payload['size'] = size;
-    await writeJson(request, status, payload);
-  }
-
-  /// `POST /api/files/{workspaceId}/mkdir`：新建文件夹（M11）。
-  ///
-  /// 请求体 `{path}`；成功 200 `{success, path}`，目标已存在 409，父目录不存在 400。
-  /// 判定与落盘都在 [FileService.mkdir]，这里只解析请求与收口响应。
-  Future<void> _fileMkdir(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final FileService? files = fileService;
-    if (files == null) {
-      await writeJson(request, 501, errorBody('文件服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic>? body = await _jsonBody(request);
-    if (body == null) return;
-    final Map<String, dynamic> result = await files.mkdir(
-      params['workspaceId'] ?? '',
-      path: (body['path'] ?? '').toString(),
-    );
-    await _writeWriteResult(request, result);
-  }
-
-  /// `POST /api/files/{workspaceId}/rename`：重命名 / 移动（M11）。
-  ///
-  /// 请求体 `{from, to}`；成功 200 `{success, from, to}`，目标已存在 409、源不存在
-  /// 404、目标父目录不存在 400（**不自动建目录**）。
-  Future<void> _fileRename(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final FileService? files = fileService;
-    if (files == null) {
-      await writeJson(request, 501, errorBody('文件服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic>? body = await _jsonBody(request);
-    if (body == null) return;
-    final Map<String, dynamic> result = await files.rename(
-      params['workspaceId'] ?? '',
-      from: (body['from'] ?? '').toString(),
-      to: (body['to'] ?? '').toString(),
-    );
-    await _writeWriteResult(request, result);
-  }
-
-  /// `DELETE /api/files/{workspaceId}?path=[&recursive=1]`：删除（M11）。
-  ///
-  /// 与 `GET /api/files/{workspaceId}`（列目录）**同一条路径、不同方法**。非空目录
-  /// 默认拒绝（要带 `recursive=1`）；工作空间根永远拒绝。
-  Future<void> _fileDelete(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final FileService? files = fileService;
-    if (files == null) {
-      await writeJson(request, 501, errorBody('文件服务尚未接入'));
-      return;
-    }
-    final Map<String, String> query = request.uri.queryParameters;
-    final Map<String, dynamic> result = await files.remove(
-      params['workspaceId'] ?? '',
-      path: query['path'] ?? '',
-      recursive: _truthy(query['recursive']),
-    );
-    await _writeWriteResult(request, result);
-  }
-
-  /// `GET /api/files/{workspaceId}/git-status`：Git 工作区状态（M11 文件面板）。
-  ///
-  /// `?ignored=1` 才带 `--ignored`（`!!` 条目）。**不是仓库不是错误**：200 +
-  /// `{is_repo: false, entries: [], truncated: false}`，面板显示空态。
-  Future<void> _fileGitStatus(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final FileService? files = fileService;
-    if (files == null) {
-      await writeJson(request, 501, errorBody('文件服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic> result = await files.gitStatus(
-      params['workspaceId'] ?? '',
-      ignored: _truthy(request.uri.queryParameters['ignored']),
-    );
-    if (await _writeResultError(request, result)) return;
-    await writeJson(request, 200, result);
-  }
-
-  /// 查询串里的布尔开关：「1」/「true」（大小写不敏感）为真，其余为假。
-  static bool _truthy(Object? value) {
-    final String text = (value ?? '').toString().trim().toLowerCase();
-    return text == '1' || text == 'true' || text == 'yes' || text == 'on';
-  }
-
-  /// `POST /api/files/{workspaceId}/download`：原始字节下载（body: `{path}`）。
-  Future<void> _downloadFile(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final FileService? files = fileService;
-    if (files == null) {
-      await writeJson(request, 501, errorBody('文件服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic> body = await readJsonBody(request);
-    final Map<String, dynamic> result = await files.openDownload(
-      params['workspaceId'] ?? '',
-      (body['path'] ?? '').toString(),
-    );
-    if (await _writeResultError(request, result)) return;
-    await writeStream(
-      request,
-      200,
-      result['stream'] as Stream<List<int>>,
-      filename: result['name'] as String?,
-      length: result['size'] as int?,
-    );
-  }
-
-  /// `POST /api/files/{workspaceId}/download_folder`：目录打包为 tar.gz。
-  Future<void> _downloadFolder(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final FileService? files = fileService;
-    if (files == null) {
-      await writeJson(request, 501, errorBody('文件服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic>? body = await _jsonBody(request);
-    if (body == null) return;
-    final Map<String, dynamic> result = await files.archive(
-      params['workspaceId'] ?? '',
-      (body['path'] ?? '').toString(),
-    );
-    if (await _writeResultError(request, result)) return;
-    await writeBytes(
-      request,
-      200,
-      result['bytes'] as List<int>,
-      filename: result['name'] as String?,
-    );
-  }
-
-  /// `POST /api/files/{workspaceId}/upload_init`：建立分片上传会话。
-  Future<void> _uploadInit(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final FileService? files = fileService;
-    if (files == null) {
-      await writeJson(request, 501, errorBody('文件服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic>? body = await _jsonBody(request);
-    if (body == null) return;
-    final Map<String, dynamic> result = await files.uploadInit(
-      params['workspaceId'] ?? '',
-      fileName: (body['file_name'] ?? '').toString(),
-      relPath: (body['rel_path'] ?? '').toString(),
-      totalSize: _asInt(body['total_size']),
-    );
-    if (await _writeResultError(request, result)) return;
-    await writeJson(request, 200, result);
-  }
-
-  /// `POST /api/files/{workspaceId}/upload_chunk`：追加一个分片（base64）。
-  Future<void> _uploadChunk(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final FileService? files = fileService;
-    if (files == null) {
-      await writeJson(request, 501, errorBody('文件服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic>? body = await _jsonBody(request);
-    if (body == null) return;
-    final Map<String, dynamic> result = await files.uploadChunk(
-      params['workspaceId'] ?? '',
-      uploadId: (body['upload_id'] ?? '').toString(),
-      index: _asInt(body['index']),
-      data: (body['data'] ?? '').toString(),
-    );
-    if (await _writeResultError(request, result)) return;
-    await writeJson(request, 200, result);
-  }
-
-  /// `POST /api/files/{workspaceId}/upload_complete`：组装分片并落盘。
-  Future<void> _uploadComplete(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final FileService? files = fileService;
-    if (files == null) {
-      await writeJson(request, 501, errorBody('文件服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic>? body = await _jsonBody(request);
-    if (body == null) return;
-    final Object? chunks = body['total_chunks'];
-    final Map<String, dynamic> result = await files.uploadComplete(
-      params['workspaceId'] ?? '',
-      uploadId: (body['upload_id'] ?? '').toString(),
-      totalChunks: chunks == null ? null : _asInt(chunks),
-    );
-    if (await _writeResultError(request, result)) return;
-    await writeJson(request, 200, result);
-  }
-
-  /// `POST /api/files/{workspaceId}/syncToLocal`：整棵工作空间复制到本机目录。
-  Future<void> _syncToLocal(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final FileService? files = fileService;
-    if (files == null) {
-      await writeJson(request, 501, errorBody('文件服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic>? body = await _jsonBody(request);
-    if (body == null) return;
-    final Map<String, dynamic> result = await files.syncToLocal(
-      params['workspaceId'] ?? '',
-      (body['local_path'] ?? '').toString(),
-      path: (body['path'] ?? '').toString(),
-    );
-    if (await _writeResultError(request, result)) return;
-    await writeJson(request, 200, result);
-  }
-
-  /// `GET /api/files/{workspaceId}/pdf_info?path=`：PDF 基本信息。
-  Future<void> _filePdfInfo(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final FileService? files = fileService;
-    if (files == null) {
-      await writeJson(request, 501, errorBody('文件服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic> result = await files.pdfInfo(
-      params['workspaceId'] ?? '',
-      request.uri.queryParameters['path'] ?? '',
-    );
-    if (await _writeResultError(request, result)) return;
-    await writeJson(request, 200, result);
-  }
-
-  /// `GET /api/workspaces/{workspaceId}/git/log?limit=`：提交历史。
-  Future<void> _workspaceGitLog(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final FileService? files = fileService;
-    if (files == null) {
-      await writeJson(request, 501, errorBody('文件服务尚未接入'));
-      return;
-    }
-    final int limit =
-        int.tryParse(request.uri.queryParameters['limit'] ?? '') ?? 50;
-    final Map<String, dynamic> result = await files.gitLog(
-      params['workspaceId'] ?? '',
-      limit: limit,
-    );
-    if (await _writeResultError(request, result)) return;
-    await writeJson(request, 200, result);
-  }
-
-  /// `GET /api/workspaces/{workspaceId}/git/branches`：分支列表。
-  Future<void> _workspaceGitBranches(
-    HttpRequest request,
-    Map<String, String> params,
-  ) async {
-    final FileService? files = fileService;
-    if (files == null) {
-      await writeJson(request, 501, errorBody('文件服务尚未接入'));
-      return;
-    }
-    final Map<String, dynamic> result = await files.gitBranches(
-      params['workspaceId'] ?? '',
-    );
-    if (await _writeResultError(request, result)) return;
-    await writeJson(request, 200, result);
   }
 
   // ── REST 委派（片 C） ───────────────────────────────────────────────
@@ -4293,15 +1377,18 @@ class CoreServer {
       final String agentId = rawAgentId is String
           ? rawAgentId.trim()
           : '';
-      final CoreAgent? agent = agentId.isEmpty ? null : store.agent(agentId);
-      final String teamId = agent == null
-          ? ''
-          : (agent.teamId.trim().isEmpty
-                ? agent.id
-                : agent.teamId.trim());
-      final String workspaceDir = agent == null
-          ? ''
-          : ((fileService?.rootFor(agent) ?? agent.workspaceDir).trim());
+      // A5：核心不再持有 agent / team 领域数据，也不解析工作空间根。信封只把
+      // 调用方**原样给出**的身份字段透传下去；team / session / mode / workspace
+      // 由领域插件自己解析（与不变量 14「核心 scope 不含领域归属」同方向）。
+      String passthrough(String key) {
+        final Object? raw = query[key];
+        return raw is String ? raw.trim() : '';
+      }
+
+      final String teamId = passthrough('team_id');
+      final String sessionId = passthrough('session_id');
+      final String modeKey = passthrough('mode_key');
+      final String workspaceDir = passthrough('workspace_dir');
       final Map<String, dynamic> envelope = <String, dynamic>{
         'method': request.method,
         'path': request.uri.path,
@@ -4312,10 +1399,8 @@ class CoreServer {
         'scope': <String, dynamic>{
           'team_id': teamId,
           'agent_id': agentId,
-          'session_id': '',
-          'mode_key': agent?.sshConfig != null
-              ? StationModeKey.ssh
-              : StationModeKey.local,
+          'session_id': sessionId,
+          'mode_key': modeKey,
         },
         'workspace_dir': workspaceDir,
         'data_dir': dataDir,
@@ -4715,19 +1800,89 @@ class CoreServer {
       });
       return;
     }
-    // team_id 参数按"团队"解释，但调用方可能传的是**成员 agent 的 id**（前端在
-    // 成员上下文里就是这样）。这里做一次反查：传进来的 id 若是成员，用它回指的
-    // 团队 id——与"顶层 agent 用自身 id 当团队"口径一致（前端插件面板就是这么
-    // 取当前团队的）。
+    // team_id 参数按"团队"解释。A5 起核心不再持有 agent / team 领域数据，无法把
+    // 成员 id 反查成团队 id：按原值透传（插件面板自己知道当前 team_id）。
     // **站点段不受此过滤**：站点全局唯一，过滤恒真；team 视角由每条订阅者的
     // scope 与 subscribers_by_team 承担（见 StationHub.snapshot）。
-    final String requested =
+    final String teamId =
         request.uri.queryParameters['team_id']?.trim() ?? '';
-    final CoreAgent? named = requested.isEmpty ? null : store.agent(requested);
-    final String teamId = named != null && named.teamId.isNotEmpty
-        ? named.teamId
-        : requested;
     await writeJson(request, 200, bus.snapshot(teamId: teamId));
+  }
+
+  // ── UI 多窗口（3 条：列出 / 新建 / 全关） ──────────────────────────
+  //
+  // 多窗口 = 多进程：UI 自己做不了"再起一个自己"（会与单实例口径打架，也拿不到
+  // 启动参数），所以进程由核心拉。窗口身份（`w1`/`w2`）由核心分配并经
+  // `TREE_UI_WINDOW_ID` 注入；UI 在 `ui.hello` 里带回，`/api/meta.ui[].connections`
+  // 就是窗口数。
+
+  Future<void> _listUiWindows(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    await writeJson(request, 200, <String, dynamic>{
+      'windows': bus.uiWindows(),
+    });
+  }
+
+  Future<void> _createUiWindow(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    final Map<String, dynamic> body = await readJsonBody(request);
+    final String pluginId = (body['plugin_id'] ?? '').toString().trim();
+    if (pluginId.isEmpty) {
+      await writeJson(request, 400, errorBody('缺少 plugin_id'));
+      return;
+    }
+    // 核心启动后手工加进 plugins.yaml 的条目：先对账再判断存在性。
+    if (bus.config(pluginId) == null) await bus.applyConfigs();
+    if (bus.config(pluginId) == null) {
+      await writeJson(request, 404, errorBody('插件不存在：$pluginId'));
+      return;
+    }
+    try {
+      await writeJson(request, 200, await bus.startUiWindow(pluginId));
+    } on PluginException catch (error) {
+      // 不是 UI / 未启用 / 依赖或 API 版本不满足 / 超过窗口上限：都是可读的 409。
+      await writeJson(request, 409, errorBody('$error'));
+    } catch (error) {
+      await writeJson(request, 500, errorBody('开窗口失败：$error'));
+    }
+  }
+
+  Future<void> _closeUiWindows(
+    HttpRequest request,
+    Map<String, String> params,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    final String pluginId = (params['pluginId'] ?? '').trim();
+    if (bus.config(pluginId) == null) await bus.applyConfigs();
+    if (bus.config(pluginId) == null) {
+      await writeJson(request, 404, errorBody('插件不存在：$pluginId'));
+      return;
+    }
+    try {
+      await writeJson(request, 200, await bus.closeAllUiWindows(pluginId));
+    } on PluginException catch (error) {
+      await writeJson(request, 409, errorBody('$error'));
+    } catch (error) {
+      await writeJson(request, 500, errorBody('关窗口失败：$error'));
+    }
   }
 
   // ── 插件清单读写（M9 §4.2：内置与自定义都要能在前端增删改 + 各自一个开关） ──
@@ -6204,7 +3359,5 @@ class _InvalidDelegateReply implements Exception {
 }
 
 /// 便捷入口：启动核心并返回握手（CLI 用）。
-Future<CoreServer> startCoreServer({
-  int port = 0,
-  Duration streamChunkDelay = const Duration(milliseconds: 40),
-}) => CoreServer.start(port: port, streamChunkDelay: streamChunkDelay);
+Future<CoreServer> startCoreServer({int port = 0}) =>
+    CoreServer.start(port: port);

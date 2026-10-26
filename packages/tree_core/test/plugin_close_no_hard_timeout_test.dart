@@ -137,8 +137,11 @@ void main() {
   test('A 心跳在、只是慢 ⇒ 跑很多拍看门狗也绝不收尸（D8 的正命题）', () async {
     // 心跳间隔比“看门狗拍的节奏”密得多：这才是“链路在、只是慢”的真实形状。
     // 反过来（拍比心跳密）本来就该被判失活，那不是本条要钉的东西。
+    // 取 120ms / 3 拍 = 360ms 窗口（而不是贴着 40ms 轮询的 120ms 窗口）：
+    // 全量套件并行跑真插件进程时事件循环偶发抖动，贴着窗口会把“链路仍在”
+    // 误判成连续丢拍；本条要钉的是“心跳在就不杀”，不是测调度器的抖动幅度。
     writeEntries(entry('alpha', beatMs: 5));
-    final PluginBus bus = newBus(const Duration(milliseconds: 40));
+    final PluginBus bus = newBus(const Duration(milliseconds: 120));
     await bus.start();
     expect(bus.instances(), hasLength(1));
 

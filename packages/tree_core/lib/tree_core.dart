@@ -16,6 +16,9 @@
 /// - M5：人机协作与团队编排（提问回路、team/message 工具、成员审核闸门、级联停止、
 ///   Spec 体系与会话状态注入）
 /// - M6：插件总线 + 进程外插件宿主（MCP 客户端与接线已于 2026-10 移除）
+///
+/// A5（2026-10-25）：领域面（agent / files / llm / spec / team / terminal / tool）
+/// 已整体移交插件，核心包只保留平台面（插件总线 / 服务端 / 存储 / 设置 / WS）。
 library;
 
 import 'package:tree_local_exec/tree_local_exec.dart';
@@ -23,34 +26,6 @@ import 'package:tree_protocol/tree_protocol.dart';
 
 import 'src/version.dart';
 
-export 'src/agent/agent_engine.dart';
-export 'src/agent/attachment_prompt.dart';
-export 'src/agent/compaction_service.dart';
-export 'src/agent/conversation_service.dart';
-export 'src/agent/question_broker.dart';
-export 'src/agent/question_store.dart';
-export 'src/agent/subagent_service.dart';
-export 'src/agent/system_prompt_file.dart';
-export 'src/agent/tool_result_repair.dart';
-export 'src/agent/workspace_prompt.dart';
-export 'src/team/message_dispatcher.dart';
-export 'src/team/team_model.dart';
-export 'src/team/team_repair.dart';
-export 'src/team/team_service.dart';
-export 'src/team/team_workspace.dart';
-export 'src/agent/private_workspace_io.dart';
-export 'src/agent/scripted_agent.dart';
-export 'src/llm/llm_agent_engine.dart';
-export 'src/llm/llm_json_caller.dart';
-export 'src/llm/llm_result_gate.dart';
-export 'src/llm/llm_session.dart';
-export 'src/llm/llm_summarizer.dart';
-export 'src/llm/llm_transport.dart';
-export 'src/llm/llm_types.dart';
-export 'src/llm/openai_codec.dart';
-export 'src/llm/sse_parser.dart';
-export 'src/llm/vision_files.dart';
-export 'src/files/file_service.dart';
 export 'src/plugin/agent_events.dart';
 export 'src/plugin/builtin_plugins.dart';
 export 'src/plugin/execute_mounts.dart';
@@ -76,33 +51,12 @@ export 'src/plugin/station_store.dart';
 export 'src/plugin/stations.dart';
 export 'src/plugin/station_ws_bridge.dart';
 export 'src/plugin/ui_host.dart';
-export 'src/tool/builtin_tools.dart';
-export 'src/tool/hook_ledger.dart';
-export 'src/tool/llm_request_guard.dart';
-export 'src/tool/message_tool.dart';
-export 'src/tool/plugin_tool.dart';
-export 'src/tool/question_channel.dart';
-export 'src/tool/spec_tool.dart';
-export 'src/tool/subagent_tool.dart';
-export 'src/tool/status_text.dart';
-export 'src/tool/team_tool.dart';
-export 'src/tool/terminal_hooks.dart';
-export 'src/tool/todo_store.dart';
-export 'src/tool/tool_run_registry.dart';
-export 'src/tool/tool_runner.dart';
-export 'src/tool/tool_runs_scope.dart';
-export 'src/tool/tool_runs_tool.dart';
-export 'src/tool/workspace_tool_runner.dart';
 export 'src/server/boot_warmup.dart';
-export 'src/terminal/ssh_pty_adapter.dart';
 export 'src/server/core_server.dart';
 export 'src/server/http_io.dart';
 export 'src/server/http_router.dart';
 export 'src/server/ws_liveness.dart';
 export 'src/settings/core_settings.dart';
-export 'src/spec/builtin_spec_assets.dart';
-export 'src/spec/builtin_specs.dart';
-export 'src/spec/spec_service.dart';
 export 'src/settings/file_settings_sink.dart';
 export 'src/settings/ssh_config.dart';
 export 'src/store/atomic_file.dart';

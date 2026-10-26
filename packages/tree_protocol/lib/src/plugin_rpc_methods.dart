@@ -97,10 +97,11 @@ abstract final class PluginRpcMethods {
   /// 插件自报日志（核心不按名字分支，原样转成前端 `plugin_event`）。
   static const String log = 'log';
 
-  /// **登记工作空间定位**（插件化新增；插件 → 核心，通知）。
+  /// **登记工作空间租约**（插件化新增；插件 → 核心，通知）。
   ///
-  /// `{lease_id, dir}`：核心只做「字符串 → 路径」映射，供 `api/delegate`
-  /// 信封解析 `workspace_dir`，不解释语义；写入仅限登记方，读取对所有插件开放。
+  /// `{lease_id, dir}`：核心按 `pluginId + lease_id` 记录「字符串 → 本机目录」，
+  /// 之后该插件发 `station/command` 带 `lease_id` 时，核心把 `root` 注入命令参数；
+  /// 租约只对登记方开放，跨插件使用 fail-closed。核心不解释目录语义。
   static const String workspaceRegister = 'workspace/register';
 
   // ── 集合与派生读数 ──────────────────────────────────────────────────
@@ -208,6 +209,7 @@ const Map<String, String> nonProtocolPluginMethodLiterals = <String, String>{
   'GET': '委派信封 / 路由申报里的 HTTP 方法（REST 面），非 JSON-RPC method',
   'POST': '同上',
   'PATCH': '同上',
+  'PUT': '同上（files 插件的 PUT content 委派路由字面量）',
   'DELETE': '同上',
   // 执行站命令名：插件经 `station/command` 下达，由核心的 `ExecuteStationMounts`
   // 执行（命令白名单的家在 tree_core 的 `StationPoints`），不是插件↔核心 JSON-RPC

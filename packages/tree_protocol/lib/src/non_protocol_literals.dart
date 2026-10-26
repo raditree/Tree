@@ -36,4 +36,8 @@ const Map<String, String> nonProtocolTypeLiterals = <String, String>{
   'missing': '文件类型枚举（fs.stat 结果：远端路径不存在）',
   'unknown': '未知值兜底枚举',
   'message_type': 'WS 上行 payload 的字段名（非帧类型）',
+  // UI 进程内的**合成帧**：`FrameRouter` 把领域事件站的 reset / lagged
+  // 转成 `{'type':'station_resync'}` 交给 `LegacyFrameBus`，驱动"重拉快照对齐"。
+  // 它只在 UI 进程内分发，**不走 WS、不属于协议**（见 ui-pluginization.md §6.7）。
+  'station_resync': 'UI 内部合成帧（reset/lagged → 重拉快照），不走 WS',
 };

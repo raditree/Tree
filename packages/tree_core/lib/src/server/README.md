@@ -25,9 +25,9 @@
 9. 前端心跳节奏是 30s ⇒ WS 判活窗口默认取 30s × 3 = 90s，而**不是** 10s × 3 = 30s——后者与前端心跳等长，边界抖动会把"在线但空闲"误判失活。前端心跳改成 10s 后，这里换回全局默认口径即可。
 10. **热应用如实回报**：插件配置已落盘但本次热应用失败 ⇒ `hot_applied: false` +「配置已保存，但本次热应用失败，重启核心后生效」+ 具体原因；清单读不出来（YAML 被手改坏）时运行实例**保持原样**，不因为一个拼写错误把在跑的插件全停掉。做成接缝（`PluginHotApplier`）是为了将来换实现时 REST 层与前端一个字都不用改，且测试能确定性地覆盖失败路径。
 11. provider 接线与解绑成对：`close()` 里解绑团队工作目录 provider，并 `store.flush()`。
-12. **`DELETE /api/agents/{id}` 有两道闸门，不通过就什么都不动**（[test/agent_delete_api_test.dart](../../../test/agent_delete_api_test.dart) 强制）：
+12. **`DELETE /api/agents/{id}` 有两道闸门，不通过就什么都不动**（test/agent_delete_api_test.dart 强制）：
     ① **有下级成员必须显式 `?cascade=1`**，否则 409 + `cascade_required`（列出下级）——直接删中间层 leader
-    会留下「删不掉、停不了、广播够不着、却还能干活」的孤儿成员（见 [../team/README.md](../team/README.md) 不变量 12）；
+    会留下「删不掉、停不了、广播够不着、却还能干活」的孤儿成员（见 ../team/README.md 不变量 12）；
     ② **任一相关会话正在运行就拒绝**（409 + `running`），提示先停止并等它空闲——`stop` 抢不动正在执行的工具
     （本地执行活着就永不超时），所以这里**不等待、不轮询**；删掉正在写的 agent 正是残留的来源（继续写共享工作目录、
     回一条来自幽灵成员的消息、`data/<id>` 被写回来）。通过后的顺序：停（作废排队任务 + 收尾在途提问）→
@@ -44,7 +44,7 @@
     每一段都往 stderr 打 `[core:boot]` 分段耗时——"启动慢"因此是可归因的数字，不是感觉。
 
 14. **会话历史接口按"全局下标"寻址**（[core_server.dart](core_server.dart) 的 `_conversationHistory`，
-    [test/conversation_history_paging_test.dart](../../../test/conversation_history_paging_test.dart) 强制；前端口径见
+    test/conversation_history_paging_test.dart 强制；前端口径见
     [lib/README.md](../../../../../lib/README.md) 不变量 19）：不传参数 = 老行为（整份）；`limit=N` = **末尾** N 条；
     `before=<id>` = 只要更早的（游标 = 消息 id）；**`from=<下标>` = 从第几条起**（前端窗口"滑到哪加载哪"）；
     **`at=<id>` = 含这条消息的那一段**（定位一条早被窗口淘汰的消息）。任何一条路径都回 **`offset` = 这一页第一条的
@@ -53,7 +53,7 @@
     **绝不静默返回整份**（"最坏情况传几 MB" 与"悄悄多传"都是要避免的）。
 
 15. **临时员工名册接口：只读、按会话**（[core_server.dart](core_server.dart) 的 `_agentSubagents`，
-    [test/subagents_api_test.dart](../../../test/subagents_api_test.dart) 强制）：
+    test/subagents_api_test.dart 强制）：
     `GET /api/agents/{agentId}/subagents?session_id=`（缺省会话同邻居口径）回 `{agent_id, session_id,
     total, subagents:[{id, name, owner_agent_id, session_id, parent_id, level, scope, run_count,
     created_at, updated_at}]}`——数据源就是那份落盘名册（`TreeStore.subagents` ⇒ `subagents.json`），
@@ -61,7 +61,7 @@
     不新增任何跨会话存储；agent 不存在 ⇒ 404 + 可读原因。
 
 16. **临时员工工作数据复查接口：只读、按会话、直读落盘**（[core_server.dart](core_server.dart) 的
-    `_agentSubagentTranscript`，[test/subagent_transcript_api_test.dart](../../../test/subagent_transcript_api_test.dart) 强制）：
+    `_agentSubagentTranscript`，test/subagent_transcript_api_test.dart 强制）：
     `GET /api/agents/{agentId}/subagents/{subagentId}/transcript?session_id=` 回 `{agent_id, subagent_id,
     session_id, total, messages:[…]}`——**直读那份落盘**（父会话 `messages.jsonl` 里带 `subagent_id` 标记的
     那一段，经 `TreeStore.messages(sub_…, session)` 过滤），一次取全、按时间戳排序，**不受中栏窗口化与历史分页

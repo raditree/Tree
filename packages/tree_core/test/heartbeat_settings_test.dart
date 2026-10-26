@@ -251,8 +251,7 @@ void main() {
 
     setUp(() async {
       server = await CoreServer.start(
-        streamChunkDelay: Duration.zero,
-        enableHeartbeat: false,
+          enableHeartbeat: false,
       );
       client = _Client(server);
     });
@@ -420,8 +419,7 @@ void main() {
           'missed_heartbeat_limit': 5,
         });
       final CoreServer server = await CoreServer.start(
-        streamChunkDelay: Duration.zero,
-        settings: settings,
+          settings: settings,
       );
       addTearDown(server.close);
       expect(server.liveHeartbeatInterval, const Duration(seconds: 20));
@@ -433,8 +431,7 @@ void main() {
 
     test('保存后立即生效：在跑的判活节拍被热更新', () async {
       final CoreServer server = await CoreServer.start(
-        streamChunkDelay: Duration.zero,
-      );
+        );
       addTearDown(server.close);
       expect(server.liveHeartbeatInterval, const Duration(seconds: 10));
       final _Client client = _Client(server);
@@ -457,8 +454,7 @@ void main() {
 
     test('显式传参是逃生口：设置变更不改动调用方指定的节拍', () async {
       final CoreServer server = await CoreServer.start(
-        streamChunkDelay: Duration.zero,
-        heartbeatInterval: const Duration(milliseconds: 60),
+          heartbeatInterval: const Duration(milliseconds: 60),
         heartbeatMissLimit: 2,
       );
       addTearDown(server.close);
@@ -482,8 +478,7 @@ void main() {
 
     test('保活关着时不热更新（不会把定时器重新打开）', () async {
       final CoreServer server = await CoreServer.start(
-        streamChunkDelay: Duration.zero,
-        enableHeartbeat: false,
+          enableHeartbeat: false,
       );
       addTearDown(server.close);
       final _Client client = _Client(server);

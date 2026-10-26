@@ -68,6 +68,15 @@ abstract final class ApiPaths {
   /// 重连是判死**之后**的动作，不引入任何静态时长上限。
   static const String agentSshReconnect = '/api/agents/{agentId}/ssh/reconnect';
 
+  // ── 执行器插件承接（非 delegated 契约集，仅登记前端调用面）─────────────
+  /// 终端会话（`local_executor` / `ssh_executor` 插件申报）。
+  ///
+  /// UI 只用这一族 REST 管会话（建 / 输入 / 取消 / 改尺寸 / 关），输出走执行器的
+  /// 广播站。它们不属于 [delegated] 的 54 条契约，登记在这里只是为了满足
+  /// 「前端用到的 /api 路径必须已声明」这条门禁。
+  static const String terminalLocalSessions = '/api/terminal/local/sessions';
+  static const String terminalSshSessions = '/api/terminal/ssh/sessions';
+
   // ── 提问 ──────────────────────────────────────────────────────────────
   static const String questions = '/api/questions';
   static const String questionAnswer = '/api/questions/{qid}/answer';
@@ -97,13 +106,6 @@ abstract final class ApiPaths {
   /// **与 [files] 是同一条路径**：REST 按方法区分（GET = 列目录，DELETE = 删除），
   /// 这里单独给一个常量名是因为前端调用点要能一眼看出"这是删除"。
   static const String fileDelete = files;
-
-  /// Git 工作区状态（GET）：{is_repo, entries: [{path, status}], truncated}。
-  static const String fileGitStatus = '/api/files/{workspaceId}/git-status';
-
-  static const String workspaceGitLog = '/api/workspaces/{workspaceId}/git/log';
-  static const String workspaceGitBranches =
-      '/api/workspaces/{workspaceId}/git/branches';
 
   // ── 设置 / 插件 / MCP ─────────────────────────────────────────────────
   static const String settingsFrameRate = '/api/settings/frame-rate';
@@ -234,6 +236,20 @@ abstract final class ApiPaths {
   static const String pluginStationSubscriber =
       '/api/plugin/stations/{stationId}/subscribers/{subscriberKey}';
 
+  /// UI 窗口（**多窗口**，2026-10-25）：列出当前窗口 / 新建一个窗口。
+  ///
+  /// 多窗口 = 多进程：每个窗口一条 WS 连接、一份进程内状态（选中的 agent、
+  /// 打开的窗口）。核心只负责进程与身份，不共享 UI 状态。
+  /// - `GET`：`{windows: [{plugin_id, window_id, pid, alive, ui_hello_seen}]}`；
+  /// - `POST {plugin_id}`：再拉一个窗口，回 `{ok, plugin_id, window_id, pid}`。
+  ///   不是 UI / 未启用 / 依赖不满足 / 超过窗口上限 ⇒ 409。
+  static const String pluginWindows = '/api/plugin/windows';
+
+  /// 关掉某个 UI 插件的**全部窗口**（`DELETE`，UI 的「退出应用」入口）。
+  ///
+  /// 与「停用」不同：条目仍是 `enabled: true`，下一次对账会重新拉起。
+  static const String pluginWindowsOfPlugin = '/api/plugin/windows/{pluginId}';
+
   static const String mcpServices = '/api/mcp/services';
   static const String mcpService = '/api/mcp/services/{name}';
 
@@ -333,13 +349,13 @@ abstract final class ApiPaths {
   static String routeKey(String method, String pattern) =>
       '${method.toUpperCase()} $pattern';
 
-  /// **核心永久面：36 条方法路由。**
+  /// **核心永久面：39 条方法路由。**
   ///
-  /// 平台控制面 16 + 传输设置 9 + 引导壳 3 + 发现面 1 + 日志 3 + 存储 4。
-  /// 只增不删：交接完成后核心 router 的键集必须**恰好等于**本集合
+  /// 平台控制面 19（含 UI 多窗口 3）+ 传输设置 9 + 引导壳 3 + 发现面 1 + 日志 3
+  /// + 存储 4。只增不删：交接完成后核心 router 的键集必须**恰好等于**本集合
   /// （见 `docs/pluginization/ui-pluginization.md` §4.1 / §4.5）。
   static const Set<String> coreOwned = <String>{
-    // 平台控制面（16）：装插件的前提，也是引导页唯一依赖。
+    // 平台控制面（19）：装插件的前提，也是引导页唯一依赖。
     'GET $pluginSnapshot',
     'GET $pluginConfigs',
     'POST $pluginConfigs',
@@ -356,6 +372,10 @@ abstract final class ApiPaths {
     'GET $pluginStation',
     'PATCH $pluginStationConfig',
     'POST $pluginStationSubscriber',
+    // UI 多窗口（3）：进程由核心拉起，UI 自己起不了第二个进程。
+    'GET $pluginWindows',
+    'POST $pluginWindows',
+    'DELETE $pluginWindowsOfPlugin',
     // 传输 / 判活设置（9）：交给插件会与传输层形成循环依赖。
     'GET $settingsFrameRate',
     'POST $settingsFrameRate',
@@ -383,12 +403,20 @@ abstract final class ApiPaths {
     'DELETE $storeEntry',
   };
 
-  /// [delegated] 中**此刻仍由核心实现**的部分：55 条，只减不增。
+  /// A5 后迁移债台账已清零：核心 router == [coreOwned] 39 条（36 + UI 多窗口 3）。
   ///
-  /// 每交接一条（批次 C 的 21 条域路由 / 批次 G 的 34 条 agent 路由）就从
-  /// 这里删一条；删空即代表核心 router 只剩 [coreOwned]。门禁见
-  /// `packages/tree_core/test/server_test.dart` 的「路由覆盖度不变量」。
-  static const Set<String> pendingHandoffRoutes = <String>{
+  /// 历史：这里曾登记 52 条「核心仍实现、待交接」的域路由；A5 已删除核心实现，
+  /// git 3 条也按用户决定从契约中删除。保留空集合只为兼容旧门禁形状；
+  /// 若将来需要登记「无承接方的插件面」，另建语义明确的集合，不要复用本名。
+  static const Set<String> pendingHandoffRoutes = <String>{};
+
+  /// **契约中归插件的全部方法路由：54 条。**
+  ///
+  /// agent 36（34 存量 + 2 新增上行改委派）+ spec 2 + mcp 3 + files 13。
+  /// **git 3 已按用户决定删除**（2026-10-25）。L-28 起它不是运行期白名单：
+  /// 放行由 [delegationPatternError] 的命名空间规则 + 归属表冲突检测决定；
+  /// 本集合只用于契约自检与 G-1 对照。
+  static const Set<String> delegated = <String>{
     // agent 定义（7）
     'GET $agents',
     'POST $agents',
@@ -432,9 +460,16 @@ abstract final class ApiPaths {
     // token 节奏（2，agent 领域设置）
     'GET $settingsTokenRate',
     'POST $settingsTokenRate',
+    // 上行改委派新增（2）：替代 WS 上行 send_message / cancel，核心不实现。
+    'POST $agentMessages',
+    'POST $agentCancel',
     // spec（2）
     'GET $agentSpecs',
     'GET $agentSpec',
+    // mcp（3）：已交接给 mcp 插件，核心不再实现。
+    'GET $mcpServices',
+    'POST $mcpServices',
+    'DELETE $mcpService',
     // files（13）
     'GET $files',
     'DELETE $fileDelete',
@@ -449,29 +484,9 @@ abstract final class ApiPaths {
     'POST $fileDownloadFolder',
     'POST $fileMkdir',
     'POST $fileRename',
-    // git（3）
-    'GET $fileGitStatus',
-    'GET $workspaceGitLog',
-    'GET $workspaceGitBranches',
   };
 
-  /// **契约中归插件的全部方法路由：57 条。**
-  ///
-  /// agent 36（34 存量 + 2 新增上行改委派）+ spec 2 + mcp 3 + files 13 +
-  /// git 3。L-28 起它**不再是运行期白名单**：放行由 [delegationPatternError]
-  /// 的命名空间规则 + 归属表冲突检测决定；本集合只用于契约自检与 G-1 对照。
-  static const Set<String> delegated = <String>{
-    ...pendingHandoffRoutes,
-    // mcp（3）：已交接给 mcp 插件，核心不再实现。
-    'GET $mcpServices',
-    'POST $mcpServices',
-    'DELETE $mcpService',
-    // 上行改委派新增（2）：替代 WS 上行 send_message / cancel，核心不实现。
-    'POST $agentMessages',
-    'POST $agentCancel',
-  };
-
-  /// 契约全集（93 = [coreOwned] 36 + [delegated] 57）。
+  /// 契约全集（93 = [coreOwned] 39 + [delegated] 54）。
   static final Set<String> contractRoutes = <String>{
     ...coreOwned,
     ...delegated,
@@ -570,9 +585,6 @@ abstract final class ApiPaths {
     fileRename,
     // fileDelete 是 [files] 的**别名**（同一条路径，REST 按方法区分）：kept 是**路径集合**，
     // 重复列同一个字符串会让 const Set 在编译期报错，因此这里只列 files 一次。
-    fileGitStatus,
-    workspaceGitLog,
-    workspaceGitBranches,
     settingsFrameRate,
     settingsTokenRate,
     settingsHeartbeatInterval,
@@ -596,6 +608,10 @@ abstract final class ApiPaths {
     pluginStation,
     pluginStationConfig,
     pluginStationSubscriber,
+    pluginWindows,
+    pluginWindowsOfPlugin,
+    terminalLocalSessions,
+    terminalSshSessions,
     mcpServices,
     mcpService,
     toolsRunning,

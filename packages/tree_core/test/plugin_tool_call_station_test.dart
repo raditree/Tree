@@ -8,9 +8,6 @@ void main() {
   test('plugin.toolCall：arguments.scope 原样透传，核心不解析领域字段', () async {
     Map<String, dynamic>? seenArguments;
     final ExecuteStationMounts mounts = ExecuteStationMounts(
-      ioFor: (String agentId) async => null,
-      agentTeamOf: (String agentId) => '',
-      agentModeOf: (String agentId) => '',
       pluginManager:
           ({
             required String command,

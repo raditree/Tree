@@ -197,11 +197,12 @@ void main() {
     );
   });
 
-  test('委派契约：coreOwned 36 / delegated 57 / pendingHandoffRoutes 52', () {
-    expect(ApiPaths.coreOwned.length, 36, reason: '核心永久面冻结为 36 条方法路由');
-    expect(ApiPaths.delegated.length, 57, reason: '插件面冻结为 57 条');
-    expect(ApiPaths.pendingHandoffRoutes.length, 52);
+  test('委派契约：coreOwned 39 / delegated 54 / pendingHandoffRoutes 0', () {
+    expect(ApiPaths.coreOwned.length, 39, reason: '核心永久面 39 条（36 + UI 多窗口 3）');
+    expect(ApiPaths.delegated.length, 54, reason: '插件面 54 条（git 3 已删除）');
+    expect(ApiPaths.pendingHandoffRoutes, isEmpty, reason: 'A5 已清空迁移债台账');
     expect(ApiPaths.contractRoutes.length, 93);
+    expect(ApiPaths.kept.length, 71, reason: 'git 3 已删；UI 多窗口 +2；终端 REST +2');
     expect(ApiPaths.contractRoutes.length, ApiPaths.coreOwned.length + ApiPaths.delegated.length);
     expect(ApiPaths.coreOwned.intersection(ApiPaths.delegated), isEmpty);
     expect(ApiPaths.pendingHandoffRoutes.difference(ApiPaths.delegated), isEmpty);
@@ -222,7 +223,7 @@ void main() {
   test('委派命名空间规则：/api/ 前缀、保留前缀、段形状（L-28）', () {
     for (final String ok in <String>[
       '/api/tree.agent/hello',
-      '/api/files/{workspaceId}/git-status',
+      '/api/files/{workspaceId}/syncToLocal',
       '/api/agents/{agentId}/messages',
       '/api/sample/pdf_info',
       '/api/x',

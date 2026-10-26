@@ -4,7 +4,6 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
-import 'package:tree_local_exec/tree_local_exec.dart';
 
 /// **插件 → 核心的请求通道**（M9 §3 执行站的核心语义）：插件主动下命令
 /// （`station/command`）——此前这类报文会被宿主静默丢掉（只认响应 / 通知两类）。
@@ -50,25 +49,6 @@ void main() {
   /// Windows 路径转正斜杠（YAML 双引号标量里不出现反斜杠，避免转义歧义）。
   String slash(String path) => path.replaceAll(Platform.pathSeparator, '/');
 
-  /// 执行站首命令集的挂载位置：agt_1 ∈ team-1、agt_2 ∈ team-2（都走本地工作空间）。
-  ExecuteStationMounts mounts(String workspaceDir, {bool bothAgents = false}) =>
-      ExecuteStationMounts(
-        ioFor: (String agentId) async => switch (agentId) {
-          'agt_1' => LocalWorkspaceIO(workspaceDir),
-          'agt_2' => bothAgents ? LocalWorkspaceIO(workspaceDir) : null,
-          _ => null,
-        },
-        agentTeamOf: (String agentId) => switch (agentId) {
-          'agt_1' => 'team-1',
-          'agt_2' => 'team-2',
-          _ => '',
-        },
-        agentModeOf: (String agentId) =>
-            (agentId == 'agt_1' || agentId == 'agt_2')
-            ? StationModeKey.local
-            : '',
-      );
-
   /// 声明了 team 的插件（能进站点体系 ⇒ 能使用执行站）。
   String teamPluginYaml() =>
       'enabled: true\n'
@@ -79,28 +59,6 @@ void main() {
       '    args: ["${slash(script)}", "--station-client"]\n'
       '    granularity: team\n'
       '    scope: {team_id: $team}\n';
-
-  /// 同上，但插件主动请求时**复用核心在途请求的 int id**（撞号用例）。
-  String teamPluginIntIdYaml() =>
-      'enabled: true\n'
-      'plugins:\n'
-      '  - id: sample\n'
-      '    name: 样例插件\n'
-      '    command: "${slash(Platform.resolvedExecutable)}"\n'
-      '    args: ["${slash(script)}", "--station-client", '
-      '"--station-client-int-id"]\n'
-      '    granularity: team\n'
-      '    scope: {team_id: $team}\n';
-
-  /// 单实例全局插件：**不声明 scope**，身份完全由每条命令的 agent_id 提供。
-  String globalPluginYaml() =>
-      'enabled: true\n'
-      'plugins:\n'
-      '  - id: global\n'
-      '    name: 全局插件\n'
-      '    command: "${slash(Platform.resolvedExecutable)}"\n'
-      '    args: ["${slash(script)}", "--station-client"]\n'
-      '    granularity: team\n';
 
   /// 额外申报 scope_probe 的插件（验证核心 → 插件的 tools/call 带身份）。
   String scopeProbePluginYaml() =>
@@ -173,11 +131,6 @@ void main() {
       broadcast: broadcast,
     );
     addTearDown(bus.close);
-    // 执行站的挂载位置：与核心接线一致（八条命令都接到真实现上）。
-    expect(
-      bus.mountExecuteStations(mounts(workspace, bothAgents: bothAgents)),
-      isNull,
-    );
     if (wireRuntimeScope) {
       // 复刻生产接线（CoreServer._wirePluginStations）：按目标 agent 的**真实归属**
       // 解析 team / mode —— 单实例插件因此能服务多个 team。
@@ -344,210 +297,6 @@ void main() {
     );
   });
 
-  test('插件发 station/command ⇒ 核心的响应原样回到插件，命令真的执行', () async {
-    final PluginBus bus = await startBus(teamPluginYaml());
-
-    final Map<String, dynamic> write = await pluginRequest(
-      bus,
-      method: 'station/command',
-      params: <String, dynamic>{
-        'command': 'fs.write',
-        'arguments': <String, dynamic>{
-          'agent_id': 'agt_1',
-          'path': 'notes/a.txt',
-          'content': '插件下的命令',
-        },
-      },
-    );
-    expect(write['jsonrpc'], '2.0');
-    expect(write['id'], isA<String>(), reason: '响应必须原样回填插件的 id');
-    expect(write['error'], isNull);
-    final Map<String, dynamic> result = write['result'] as Map<String, dynamic>;
-    expect(result['ok'], isTrue, reason: '${result['error']}');
-    expect(result['command'], 'fs.write');
-    expect(result['mount_id'], 'core.execute.fs.write');
-    expect(
-      (result['payload'] as Map<String, dynamic>)['bytes_written'],
-      greaterThan(0),
-    );
-    expect(
-      File(p.join(workspace, 'notes', 'a.txt')).readAsStringSync(),
-      '插件下的命令',
-      reason: '插件命令必须真的落在目标 agent 的工作空间里',
-    );
-
-    // 同一插件的**后续请求照常**（读回刚写的文件）
-    final Map<String, dynamic> read = await pluginRequest(
-      bus,
-      method: 'station/command',
-      params: <String, dynamic>{
-        'command': 'fs.read',
-        'arguments': <String, dynamic>{
-          'agent_id': 'agt_1',
-          'path': 'notes/a.txt',
-        },
-      },
-    );
-    final Map<String, dynamic> readResult =
-        read['result'] as Map<String, dynamic>;
-    expect(readResult['ok'], isTrue, reason: '${readResult['error']}');
-    expect(
-      (readResult['payload'] as Map<String, dynamic>)['content'],
-      '插件下的命令',
-    );
-  });
-
-  test('未声明 team 的插件 ⇒ 明确错误（不能使用执行站）', () async {
-    final PluginBus bus = await startBus(noTeamPluginYaml());
-    final Map<String, dynamic> response = await pluginRequest(
-      bus,
-      pluginId: 'noteam',
-      method: 'station/command',
-      params: <String, dynamic>{
-        'command': 'fs.read',
-        'arguments': <String, dynamic>{'agent_id': 'agt_1', 'path': 'a.txt'},
-      },
-    );
-    expect(response['result'], isNull, reason: '不合法的 scope 不许执行');
-    final Map<String, dynamic> error =
-        response['error'] as Map<String, dynamic>;
-    expect(error['code'], PluginRpcErrorCode.scopeDenied);
-    expect(error['message'], contains('noteam'), reason: '要点名是哪个插件');
-    expect(error['message'], contains('未声明 team'));
-    expect(error['message'], contains('不能使用执行站'));
-  });
-
-  test('请求里带的身份必须与目标 agent 的真实归属一致（不一致则拒）', () async {
-    final PluginBus bus = await startBus(teamPluginYaml());
-    final Map<String, dynamic> response = await pluginRequest(
-      bus,
-      method: 'station/command',
-      params: <String, dynamic>{
-        'command': 'fs.read',
-        'arguments': <String, dynamic>{
-          // 请求里带的 team_id 与目标 agent 的真实归属不一致 ⇒ 显式拒绝
-          // （身份要被**校验**，不是被忽略，也不能拿来给自己"换 scope"）
-          'team_id': 'team-2',
-          'agent_id': 'agt_2',
-          'session_id': 'ses-2',
-          'mode_key': StationModeKey.ssh,
-          'path': 'secret.txt',
-        },
-      },
-    );
-    expect(
-      response['result'],
-      isNull,
-      reason: 'scope 不一致走 -32001，不是站点级 ok=false',
-    );
-    final Map<String, dynamic> error =
-        response['error'] as Map<String, dynamic>;
-    expect(error['code'], PluginRpcErrorCode.scopeDenied);
-    expect(error['message'], contains('跨 team'));
-    expect(error['message'], contains('agt_2'));
-    expect(
-      error['message'],
-      contains('team=$team'),
-      reason: '真实归属（或未接线时回退的声明）是 team-1，请求里的 team-2 对不上',
-    );
-
-    // 站点侧旁证：身份不一致在**选站之前**就被拒，没有为 team-2 / ssh 建执行站
-    final List<ExecuteStation> executes = bus.stations
-        .stationList()
-        .whereType<ExecuteStation>()
-        .toList();
-    expect(executes, isEmpty);
-    expect(File(p.join(workspace, 'secret.txt')).existsSync(), isFalse);
-  });
-
-  test('单实例插件（不声明 scope）用每条命令的 agent_id 服务多个 team', () async {
-    final PluginBus bus = await startBus(
-      globalPluginYaml(),
-      wireRuntimeScope: true,
-      bothAgents: true,
-    );
-    final Map<String, dynamic> one = await pluginRequest(
-      bus,
-      pluginId: 'global',
-      method: 'station/command',
-      params: <String, dynamic>{
-        'command': 'fs.write',
-        'arguments': <String, dynamic>{
-          'agent_id': 'agt_1',
-          'path': 't1.txt',
-          'content': 'team-1',
-        },
-      },
-    );
-    expect(
-      (one['result'] as Map<String, dynamic>)['ok'],
-      isTrue,
-      reason: '${one['error']}',
-    );
-    final Map<String, dynamic> two = await pluginRequest(
-      bus,
-      pluginId: 'global',
-      method: 'station/command',
-      params: <String, dynamic>{
-        'command': 'fs.write',
-        'arguments': <String, dynamic>{
-          'agent_id': 'agt_2',
-          'path': 't2.txt',
-          'content': 'team-2',
-        },
-      },
-    );
-    expect(
-      (two['result'] as Map<String, dynamic>)['ok'],
-      isTrue,
-      reason: '${two['error']}',
-    );
-    expect(File(p.join(workspace, 't1.txt')).readAsStringSync(), 'team-1');
-    expect(File(p.join(workspace, 't2.txt')).readAsStringSync(), 'team-2');
-    expect(
-      bus.stations.stationList().whereType<ExecuteStation>().map(
-        (ExecuteStation s) => s.id,
-      ),
-      <String>[StationHubIds.executeFs],
-      reason: '两条 fs 命令同属**文件操作点位**：该点位按每条命令的 agent_id 服务多个 team',
-    );
-    expect(
-      bus.stations.station(StationHubIds.executeFs)!.scope.teamId,
-      isEmpty,
-      reason: '站点不绑 team——归属在每次命令的 scope 上',
-    );
-  });
-
-  test('声明了 team 的插件在运行期解析下仍被限制在自己 team（声明是上限）', () async {
-    final PluginBus bus = await startBus(
-      teamPluginYaml(),
-      wireRuntimeScope: true,
-      bothAgents: true,
-    );
-    final Map<String, dynamic> response = await pluginRequest(
-      bus,
-      method: 'station/command',
-      params: <String, dynamic>{
-        'command': 'fs.write',
-        'arguments': <String, dynamic>{
-          'agent_id': 'agt_2',
-          'path': 'nope.txt',
-          'content': 'x',
-        },
-      },
-    );
-    expect(response['result'], isNull);
-    final Map<String, dynamic> error =
-        response['error'] as Map<String, dynamic>;
-    expect(error['code'], PluginRpcErrorCode.scopeDenied);
-    expect(
-      error['message'],
-      contains('跨 team'),
-      reason: '声明 team-1 的插件不能碰 team-2 的 agent（声明是作用域上限）',
-    );
-    expect(File(p.join(workspace, 'nope.txt')).existsSync(), isFalse);
-  });
-
   test('核心 → 插件的 tools/call 带调用点 team/agent/session/mode', () async {
     final PluginBus bus = await startBus(
       scopeProbePluginYaml(),
@@ -568,86 +317,6 @@ void main() {
     expect(scope['agent_id'], 'agt_1');
     expect(scope['session_id'], 'ses-1');
     expect(scope['mode_key'], StationModeKey.local);
-  });
-
-  test('插件用与核心在途请求撞号的 int id 发请求：仍判为请求（不被当回包吞掉）', () async {
-    final PluginBus bus = await startBus(teamPluginIntIdYaml());
-    final Map<String, dynamic> response = await pluginRequest(
-      bus,
-      method: 'station/command',
-      params: <String, dynamic>{
-        'command': 'fs.write',
-        'arguments': <String, dynamic>{
-          'agent_id': 'agt_1',
-          'path': 'collision.txt',
-          'content': '撞号也要回',
-        },
-      },
-    );
-    // 判别口径：**有 method ⇒ 请求**（JSON-RPC 的 Response 不带 method）。
-    // 若按"int id 命中在途请求就当回包"，这里会把核心的 tools/call 用空 result
-    // 提前完成，插件只能拿到超时兜底——本用例因此有牙齿。
-    expect(response['result'], isNotNull, reason: '插件必须拿到一条真响应');
-    final Map<String, dynamic> result =
-        response['result'] as Map<String, dynamic>;
-    expect(result['ok'], isTrue, reason: '${result['error']}');
-    expect(
-      File(p.join(workspace, 'collision.txt')).readAsStringSync(),
-      '撞号也要回',
-    );
-  });
-
-  test('未知 method ⇒ -32601（不静默）；随后请求照常', () async {
-    final PluginBus bus = await startBus(teamPluginYaml());
-    final Map<String, dynamic> response = await pluginRequest(
-      bus,
-      method: 'station/unknown',
-      params: const <String, dynamic>{},
-    );
-    expect(response['result'], isNull);
-    final Map<String, dynamic> error =
-        response['error'] as Map<String, dynamic>;
-    expect(error['code'], PluginRpcErrorCode.methodNotFound);
-    expect(error['message'], contains('method not found'));
-    expect(error['message'], contains('station/unknown'));
-
-    // 宿主与请求通道不受影响：紧接着下一条真命令
-    final Map<String, dynamic> follow = await pluginRequest(
-      bus,
-      method: 'station/command',
-      params: <String, dynamic>{
-        'command': 'fs.write',
-        'arguments': <String, dynamic>{
-          'agent_id': 'agt_1',
-          'path': 'after-unknown.txt',
-          'content': 'ok',
-        },
-      },
-    );
-    expect((follow['result'] as Map<String, dynamic>)['ok'], isTrue);
-
-    // 缺 command / arguments 不是对象：也是显式错误（-32602），不是静默
-    final Map<String, dynamic> missing = await pluginRequest(
-      bus,
-      method: 'station/command',
-      params: const <String, dynamic>{},
-    );
-    expect(
-      (missing['error'] as Map<String, dynamic>)['code'],
-      PluginRpcErrorCode.invalidParams,
-    );
-    final Map<String, dynamic> badArgs = await pluginRequest(
-      bus,
-      method: 'station/command',
-      params: <String, dynamic>{
-        'command': 'fs.read',
-        'arguments': <String>['not', 'an', 'object'],
-      },
-    );
-    expect(
-      (badArgs['error'] as Map<String, dynamic>)['code'],
-      PluginRpcErrorCode.invalidParams,
-    );
   });
 
   test('宿主：未接线 ⇒ -32601；处理器抛异常 ⇒ error 响应且读循环不受影响', () async {

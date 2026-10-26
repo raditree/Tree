@@ -52,9 +52,7 @@ void main() {
       coreVersion: 'test',
       heartbeatInterval: const Duration(seconds: 30),
     );
-    final ExecuteStationMounts mounts = ExecuteStationMounts.forStore(
-      store: MemoryStore(),
-      ioFor: (String agentId) async => null,
+    final ExecuteStationMounts mounts = ExecuteStationMounts(
       // 生产由 CoreServer 注入同一个实现（站点表只在总线里）
       topologyQuery: bus.handleStationQuery,
     );
@@ -262,10 +260,7 @@ void main() {
   });
 
   test('未接线：核心没注入读口时以「未接线」失败，不假装读过', () async {
-    final ExecuteStationMounts bare = ExecuteStationMounts.forStore(
-      store: MemoryStore(),
-      ioFor: (String agentId) async => null,
-    );
+    final ExecuteStationMounts bare = ExecuteStationMounts();
     final PluginBus other = PluginBus(
       configFile: configFile,
       coreVersion: 'test',

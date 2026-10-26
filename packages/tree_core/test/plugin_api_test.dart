@@ -89,8 +89,6 @@ void main() {
     final CoreServer server = await CoreServer.start(
       pluginBus: bus,
       enableHeartbeat: false,
-      streamChunkDelay: Duration.zero,
-      engine: ScriptedAgent(chunkDelay: Duration.zero),
     );
     return (server: server, client: _Client(server), bus: bus);
   }
@@ -199,8 +197,6 @@ void main() {
     // 未接入总线：200 + enabled:false 空集（前端渲染空态而不是报错）
     final CoreServer bare = await CoreServer.start(
       enableHeartbeat: false,
-      streamChunkDelay: Duration.zero,
-      engine: ScriptedAgent(chunkDelay: Duration.zero),
     );
     final _Client bareClient = _Client(bare);
     addTearDown(() async {

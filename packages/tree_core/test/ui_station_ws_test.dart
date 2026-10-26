@@ -141,8 +141,7 @@ plugins:
         log: (_) {},
       );
       server = await CoreServer.start(
-        streamChunkDelay: Duration.zero,
-        enableHeartbeat: false,
+          enableHeartbeat: false,
         pluginBus: bus,
       );
       client = _Client(server);
@@ -177,6 +176,16 @@ plugins:
       });
       await settle();
 
+      // 每条新通道订阅成功都先发 reset（seq 从 1 重新计数）：断线重连后 UI 靠它
+      // 清掉旧水位，否则会把重放的首批帧当"重复"丢掉（E2E-04 丢帧根因）。
+      // 用 until 等帧（固定 sleep 在满负载跑全量时会不够）。
+      await ws.until(
+        (Map<String, dynamic> f) =>
+            f['type'] == WsOutboundType.stationDelivery &&
+            f['state'] == StationDeliveryState.reset.wire,
+        reason: '首次订阅也要 reset',
+      );
+
       final BroadcastStation station =
           bus.stations.pointFor('system.broadcast')! as BroadcastStation;
       await station.publish(
@@ -190,9 +199,13 @@ plugins:
       );
       await Future<void>.delayed(const Duration(milliseconds: 120));
       expect(
-        ws.frames.where((Map<String, dynamic> f) => f['type'] == WsOutboundType.stationDelivery),
+        ws.frames.where(
+          (Map<String, dynamic> f) =>
+              f['type'] == WsOutboundType.stationDelivery &&
+              f['state'] == StationDeliveryState.data.wire,
+        ),
         isEmpty,
-        reason: 'topic 不在白名单内不应投递',
+        reason: 'topic 不在白名单内不应投递（订阅时的 reset 不算 data）',
       );
 
       await station.publish(
@@ -380,8 +393,11 @@ plugins:
       final _WsClient a = await _connect(server);
       final _WsClient b = await _connect(server);
       sockets.addAll(<_WsClient>[a, b]);
-      for (final _WsClient ws in <_WsClient>[a, b]) {
-        ws.send(_hello('ui.alpha'));
+      final List<String> windows = <String>['w1', 'w2'];
+      for (int i = 0; i < windows.length; i++) {
+        final _WsClient ws = i == 0 ? a : b;
+        // 多窗口：`ui.hello.window_id` 让连接与窗口对上（核心只记录、不做路由）。
+        ws.send(_hello('ui.alpha', windowId: windows[i]));
         ws.send(<String, dynamic>{
           'type': WsInboundType.stationSubscribe,
           'data': <String, dynamic>{'station_id': 'system.broadcast', 'scope': <String, dynamic>{}},
@@ -581,12 +597,14 @@ Map<String, dynamic> _hello(
   String pluginId, {
   String version = '1.0.0',
   List<Object?> capabilities = const <Object?>[],
+  String windowId = '',
 }) => <String, dynamic>{
   'type': WsInboundType.uiHello,
   'data': <String, dynamic>{
     'plugin_id': pluginId,
     'version': version,
     'capabilities': capabilities,
+    if (windowId.isNotEmpty) 'window_id': windowId,
   },
 };
 

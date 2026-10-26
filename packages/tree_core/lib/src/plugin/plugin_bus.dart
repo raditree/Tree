@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
@@ -8,15 +7,9 @@ import 'package:tree_protocol/tree_protocol.dart'
     show ApiMetaBranding, PluginRpcMethods;
 import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart';
 
-import '../agent/agent_engine.dart';
-import '../agent/compaction_service.dart';
-import '../llm/llm_types.dart';
-import '../llm/openai_codec.dart';
 import '../server/http_router.dart';
 import '../store/atomic_file.dart';
-import '../store/tree_store.dart';
 import '../store/yaml_codec.dart';
-import '../tool/tool_runner.dart';
 import '../util/liveness.dart';
 import 'agent_events.dart';
 import 'execute_mounts.dart';
@@ -48,56 +41,17 @@ typedef RuntimeStationScopeResolver = StationScope Function(
   StationScopeContext context,
 );
 
-/// 一次压缩请求里捎给插件的**最近用量行**（`<会话目录>/usage.jsonl`）。
-///
-/// 为什么需要这条路：逐调用用量落在**数据根**下的会话目录里，而插件（`fs.read`
-/// 只在工作空间作用域内）**读不到数据根**——于是"这次压缩花了多少 token""内置
-/// 兜底那次花了多少"在插件面板上永远是空白。核心能同时够到账本与插件，所以在
-/// 压缩中转 payload 里捎上"最近 N 行"，插件不必也不该去猜文件在哪。
-///
-/// [path] 只作排障用（插件拿到的只是一个字符串）；[calls] 是**解析后的对象**，
-/// 形状 = `UsageCall.toJson()`（即 `usage.jsonl` 的行）。
-class PluginUsageRecent {
-  const PluginUsageRecent({required this.path, required this.calls});
-
-  /// 账本文件路径（`<数据根>/data/<agent>/<session>/usage.jsonl`）。
-  final String path;
-
-  /// 最近的调用（**早 → 晚**，最多 [PluginBus.maxRecentUsageLines] 行）。
-  final List<Map<String, dynamic>> calls;
-}
-
-/// 「最近用量行」提供者（**接线注入**，与 [PluginBus.log] /
-/// [PluginBus.compactionSkipSink] 同范式）。
-///
-/// 返回 null = 这条通路没接（payload 里就不会出现 `recent_usage`）；
-/// 抛异常 / 读不到文件 ⇒ 由 [PluginBus.relayCompaction] 收敛成"不带这个键"——
-/// 用量是**遥测**，它出问题绝不该影响一次压缩（fail-open）。
-typedef PluginUsageRecentProvider = Future<PluginUsageRecent?> Function(
-  String agentId,
-  String sessionId,
-);
-
-/// 中转点 `tool.probe` 的**三档答案**（阶段 6）。
-///
-/// 为什么不是一个 `String?`：“没接管”与“接管了、肯定没有”在调用方那里是两个
-/// 完全不同的动作（前者继续查库，后者直接停在等显式取消），一个 null 分不出这两件事。
-final class StationToolProbeVerdict {
-  const StationToolProbeVerdict({required this.found, this.text = ''});
-
-  /// 插件说这次调用**已有结果**（true 时 [text] 就是那段原文）。
-  final bool found;
-
-  /// 结果原文（[found]=false 时为空）。
-  final String text;
-}
 
 /// UI 宿主工厂（测试注入假宿主；生产走 [UiHost.start]）。
+///
+/// [windowId] 为空 = 老口径（单窗口）。同一 UI 插件的多窗口各自一份进程，
+/// 靠它区分身份（窗口级状态键 / `ui.hello.window_id`）。
 typedef UiHostFactory =
     Future<UiHost> Function(
       PluginConfig config, {
       required String coreUrl,
       required String coreToken,
+      String windowId,
     });
 
 /// 插件总线（M6b + M9 Wave 3-F）：配置、实例生命周期、事件分发、工具聚合、
@@ -326,45 +280,6 @@ class PluginBus {
   /// 工具表刷新时的**观测钩子**（测试 / 日志用：记录收集站真的被触发了几次）。
   void Function(StationScope? scope)? toolTableRefreshHook;
 
-  /// 压缩中转点「**为什么没接管**」的原因出口（可写字段，与 [log] 同范式）。
-  ///
-  /// [relayCompaction] 的**每一处**"不接管"分支都回调一次，带一句给用户看的人话、
-  /// 外加 [hasSubscriber] 这个**分级位**：
-  /// - `false` = **早退**（总开关关 / 作用域不匹配 / 无点位 / 无订阅者）：压根没有
-  ///   插件在这条路上，只是"没人干这事"；
-  /// - `true` = **有订阅者但没接管**（没回包 / 原数据放行 / 回包非法 / 越界 / 异常）：
-  ///   插件在场却没交出可用结果，这才是用户真正要追的。
-  ///
-  /// 为什么必须分级：REST 响应要**全量**（排障），而会话历史里的通知只该写"插件在场
-  /// 却没接管"——否则没装压缩插件的用户，每条压缩通知都多一句"没有插件订阅该点位"。
-  ///
-  /// 为什么需要它：这些原因以前**只进 stderr**（有几条连日志都没有），于是"我装了
-  /// 压缩插件，为什么没生效"只能靠猜。接线方（`CoreServer._wirePluginRelayPoints`）
-  /// 把它接到 `CompactionService.noteRelaySkip` ⇒ 原因随压缩结论上行（REST 可选键
-  /// `relay_skip_reason`）并按分级决定要不要落成会话提示。
-  void Function(
-    String agentId,
-    String sessionId,
-    String reason, {
-    required bool hasSubscriber,
-  })?
-  compactionSkipSink;
-
-  /// “这句原因能不能由插件写得更准”的**回写口**（阶段 6，中转点位
-  /// `compact.skip.reason`）：接线方接到 `CompactionService.annotateRelaySkip`。
-  ///
-  /// 只能改**文案**：内置那句已经先记账（可读性不依赖插件），分级位 `has_subscriber`
-  /// 与“到底有没有接管”那个判据都在核心里。未接线 ⇒ 插件回了也没人接（不报错）。
-  void Function(String agentId, String sessionId, String reason)?
-  compactionSkipAnnotator;
-
-  /// 一次压缩请求里捎给插件的**最近用量行**（见 [PluginUsageRecent]）：
-  /// 接线注入，未接线时压缩载荷里不会出现 `recent_usage` / `usage_file`。
-  PluginUsageRecentProvider? usageRecentProvider;
-
-  /// 压缩载荷里最多捎多少行用量（滚动的"最近一批"；账本本身会随会话一直长）。
-  static const int maxRecentUsageLines = 50;
-
   bool enabled = true;
 
   /// 核心数据根（委派 / 站请求回给插件的数据根；空 = 未接线）。
@@ -386,13 +301,36 @@ class PluginBus {
   /// 刻意**不放进 [_hosts]**：那是 stdio 宿主的表——看门狗会给它们 ping、快照会读
   /// 它们的 liveness、工具表会从它们身上收 tools/list。UI 插件没有这些语义，混在
   /// 一起等于让看门狗把“没有 stdio 回包”误判成掉线。
+  ///
+  /// 这里只记“主窗口”（同 id 的第一个活窗口）：状态 / 判活 / 强停 / 换文件这些
+  /// **插件级**语义都从这张表读，行为与多窗口之前逐字一致。
   final Map<String, UiHost> _uiHosts = <String, UiHost>{};
+
+  /// UI 插件 → 窗口 id → 宿主（含主窗口，按创建顺序）。
+  ///
+  /// 多窗口是**多进程**：每个窗口一条 WS 连接、一份进程内状态。窗口的增删只影响
+  /// 这一张表；插件级收尾（摘订阅、注销自建站、工具表失效）只在**最后一个窗口**
+  /// 消失时发生（见 [_onUiWindowExit]）。
+  final Map<String, Map<String, UiHost>> _uiWindows =
+      <String, Map<String, UiHost>>{};
+
+  /// 每个插件已用过的窗口序号（只增，避免关掉 `w2` 后新窗口复用同名）。
+  final Map<String, int> _uiWindowSeq = <String, int>{};
+
+  /// 同一 UI 插件最多同时开多少个窗口（防跑飞；不是功能限制）。
+  int maxUiWindowsPerPlugin = 8;
 
   /// UI 插件启动后的连接窗口定时器（超时只降级，不杀进程）。
   final Map<String, Timer> _uiHelloWindows = <String, Timer>{};
 
   /// 已经完成过 `ui.hello` 的 UI 插件（窗口判定的唯一依据）。
   final Set<String> _uiHelloSeen = <String>{};
+
+  /// 已完成 `ui.hello` 的**窗口**（键 `pluginId#windowId`）。
+  ///
+  /// [_uiHelloSeen] 是插件级读数（任一窗口连上即解除 degraded）；窗口列表要的是
+  /// 窗口级事实，否则新开一个还没连上的窗口会被相邻窗口的 hello 洗白。
+  final Set<String> _uiHelloWindowSeen = <String>{};
 
   /// UI 插件“进程活着但窗口内没连上”的可读原因（面板状态 degraded）。
   final Map<String, String> _uiDegraded = <String, String>{};
@@ -403,6 +341,9 @@ class PluginBus {
   /// 为什么不能拿 `_configs` 里的那一份比：对账会重读磁盘并**整体覆盖** `_configs`，
   /// 旧配置当场就没了；而"这个进程当时是按什么参数起来的"才是"要不要重启"的判据。
   final Map<String, PluginConfig> _spawnedConfigs = <String, PluginConfig>{};
+  /// 每世代已发过「插件下线」通知的插件（`closed` 只发一次；见 `_setLifecycle`）。
+  final Set<String> _offlineNotified = <String>{};
+
   final Map<String, String> _errors = <String, String>{};
   final Map<String, int> _queueDepth = <String, int>{};
 
@@ -819,6 +760,7 @@ class PluginBus {
         'degraded': degradedReason != null,
         'missed_heartbeats': 0,
         'process_alive': alive,
+        'windows': _liveUiWindowsOf(pluginId).length,
         'ui_hello_seen': _uiHelloSeen.contains(pluginId),
         'pid': uiHost.pid,
         if (degradedReason != null)
@@ -998,7 +940,7 @@ class PluginBus {
     }
   }
 
-  /// 拉起一个 UI 插件实例（片 D）。
+  /// 拉起一个 UI 插件的**主窗口**（片 D）。
   ///
   /// 与 stdio 路径的差别是**结构性的**，不是“少调一个接口”：
   /// - 不调 `listTools`、不 `refreshToolDefinitions`、不注册任何工具；
@@ -1008,52 +950,236 @@ class PluginBus {
     PluginConfig config, {
     required int generation,
   }) async {
-    final UiHost host = await _spawnUi(config);
-    _uiHosts[config.id] = host;
-    _spawnedConfigs[config.id] = config;
-    _errors.remove(config.id);
-    _queueDepth[config.id] = 0;
-    _dead.remove(config.id);
-    _uiHelloSeen.remove(config.id);
-    _uiDegraded.remove(config.id);
-    invalidateToolTable(reason: 'UI 插件 ${config.id} 上线');
+    final String windowId = _nextUiWindowId(config.id);
+    await _spawnUiWindow(
+      config,
+      windowId: windowId,
+      generation: generation,
+      primary: true,
+    );
+  }
+
+  /// 下一个窗口 id（`w1`、`w2`…；序号只增不复用）。
+  String _nextUiWindowId(String pluginId) {
+    final int next = (_uiWindowSeq[pluginId] ?? 0) + 1;
+    _uiWindowSeq[pluginId] = next;
+    return 'w$next';
+  }
+
+  /// 同一个 UI 插件再开一个窗口（多进程；插件未在跑时等价于启动它）。
+  ///
+  /// 失败一律抛 [PluginException]（可读中文），HTTP 层据此给 404 / 409：
+  /// 不是 UI / 未启用 / 依赖或 API 版本不满足 / 窗口数超上限。
+  ///
+  /// 语义边界：**新窗口不刷新工具表**（UI 不提供工具），也不改生命周期——
+  /// 只有“插件从没在跑”那一次才算上线。
+  Future<Map<String, dynamic>> startUiWindow(String pluginId) async {
+    load();
+    final String id = pluginId.trim();
+    final PluginConfig? config = this.config(id);
+    if (config == null) {
+      throw PluginException('插件 $id 不存在（未在 plugins.yaml 声明）');
+    }
+    if (config.runtimeKind != PluginRuntimeKind.ui) {
+      throw PluginException(
+        '插件 $id 的 runtime 是「${config.runtime}」，不是 ui，不能开窗口',
+      );
+    }
+    if (!config.enabled) throw PluginException('插件 $id 未启用');
+    final Map<String, dynamic>? blocked = apiBlock(config);
+    if (blocked != null) {
+      throw PluginException(
+        (blocked['error'] ?? '核心 API 版本不满足').toString(),
+      );
+    }
+    final PluginDependencyReport dependency = checkDependencies(config);
+    if (!dependency.ok) {
+      throw PluginException(dependency.error ?? '依赖未满足');
+    }
+    final Map<String, UiHost> windows = _liveUiWindowsOf(id);
+    if (windows.length >= maxUiWindowsPerPlugin) {
+      throw PluginException(
+        '插件 $id 已有 ${windows.length} 个窗口（上限 $maxUiWindowsPerPlugin）',
+      );
+    }
+    final String windowId = _nextUiWindowId(id);
+    if (windows.isEmpty) {
+      // 从“没在跑”到“有一个窗口”：走完整上线动作（判活窗口 / 生命周期 / 工具表）。
+      final int generation = (_generations[id] ?? 0) + 1;
+      _generations[id] = generation;
+      _setLifecycle(id, PluginLifecycleState.booting);
+      await _spawnUiWindow(
+        config,
+        windowId: windowId,
+        generation: generation,
+        primary: true,
+      );
+    } else {
+      await _spawnUiWindow(
+        config,
+        windowId: windowId,
+        generation: _generations[id] ?? 1,
+        primary: false,
+      );
+    }
+    final UiHost? host = _uiWindows[id]?[windowId];
+    if (host == null) {
+      throw PluginException('插件 $id 的窗口 $windowId 启动失败');
+    }
+    return <String, dynamic>{
+      'ok': true,
+      'plugin_id': id,
+      'window_id': windowId,
+      'pid': host.pid,
+    };
+  }
+
+  /// 关掉某个 UI 插件的**全部窗口**（UI 的「退出应用」入口）。
+  ///
+  /// 与 [forceStop] 的区别：这里走优雅停止（不 kill），目录语义仍是“插件被停”，
+  /// 而条目仍是启用 ⇒ 下一次对账会重新拉起。
+  Future<Map<String, dynamic>> closeAllUiWindows(String pluginId) async {
+    load();
+    final String id = pluginId.trim();
+    final PluginConfig? config = this.config(id);
+    if (config == null) {
+      throw PluginException('插件 $id 不存在（未在 plugins.yaml 声明）');
+    }
+    if (config.runtimeKind != PluginRuntimeKind.ui) {
+      throw PluginException(
+        '插件 $id 的 runtime 是「${config.runtime}」，不是 ui',
+      );
+    }
+    final int closed = _liveUiWindowsOf(id).length;
+    // `_disconnect` 已经把生命周期落到 stopped（非 restarting 时），这里只补一条状态帧。
+    await _disconnect(id);
+    _emitStatus(config, 'disabled', reason: 'UI 窗口已全部关闭');
+    return <String, dynamic>{
+      'ok': true,
+      'plugin_id': id,
+      'closed': closed,
+    };
+  }
+
+  /// 当前所有 UI 窗口（`GET /api/plugin/windows` 的数据源）。
+  List<Map<String, dynamic>> uiWindows() {
+    load();
+    final List<Map<String, dynamic>> out = <Map<String, dynamic>>[];
+    for (final MapEntry<String, Map<String, UiHost>> entry
+        in _uiWindows.entries) {
+      for (final MapEntry<String, UiHost> window in entry.value.entries) {
+        out.add(<String, dynamic>{
+          'plugin_id': entry.key,
+          'window_id': window.key,
+          'pid': window.value.pid,
+          'alive': !window.value.isClosed,
+          'ui_hello_seen': _uiHelloWindowSeen.contains(
+            '${entry.key}#${window.key}',
+          ),
+        });
+      }
+    }
+    return out;
+  }
+
+  /// 某插件**活着**的窗口（按创建顺序）。
+  Map<String, UiHost> _liveUiWindowsOf(String pluginId) {
+    final Map<String, UiHost>? windows = _uiWindows[pluginId];
+    if (windows == null) return <String, UiHost>{};
+    windows.removeWhere((String windowId, UiHost host) {
+      if (!host.isClosed) return false;
+      _uiHelloWindowSeen.remove('$pluginId#$windowId');
+      return true;
+    });
+    if (windows.isEmpty) _uiWindows.remove(pluginId);
+    return windows;
+  }
+
+  /// 拉起**一个窗口**（主窗口与追加窗口共用）。
+  Future<void> _spawnUiWindow(
+    PluginConfig config, {
+    required String windowId,
+    required int generation,
+    required bool primary,
+  }) async {
+    final UiHost host = await _spawnUi(config, windowId: windowId);
+    final Map<String, UiHost> windows = _uiWindows.putIfAbsent(
+      config.id,
+      () => <String, UiHost>{},
+    );
+    windows[windowId] = host;
+    if (primary || !_uiHosts.containsKey(config.id)) {
+      _uiHosts[config.id] = host;
+    }
+    if (primary) {
+      _spawnedConfigs[config.id] = config;
+      _errors.remove(config.id);
+      _queueDepth[config.id] = 0;
+      _dead.remove(config.id);
+      _uiHelloSeen.remove(config.id);
+      _uiHelloWindowSeen.removeWhere(
+        (String key) => key.startsWith('${config.id}#'),
+      );
+      _uiDegraded.remove(config.id);
+      invalidateToolTable(reason: 'UI 插件 ${config.id} 上线');
+      _setLifecycle(config.id, PluginLifecycleState.ready);
+      log?.call(
+        'UI 插件 ${config.id} 已拉起（第 $generation 代，窗口 $windowId，pid=${host.pid}）',
+      );
+    } else {
+      log?.call(
+        'UI 插件 ${config.id} 追加窗口 $windowId（pid=${host.pid}，共 ${windows.length} 个）',
+      );
+    }
     _armUiHelloWindow(config, host);
     // 进程退出的唯一判活信号；无论正常/异常都从这里收尾。
     unawaited(
-      host.exited.then((int code) => _onUiExit(config, host, code)),
+      host.exited.then((int code) => _onUiWindowExit(config, host, code)),
     );
-    _setLifecycle(config.id, PluginLifecycleState.ready);
-    _emitStatus(config, 'registered', degraded: false);
-    log?.call('UI 插件 ${config.id} 已拉起（第 $generation 代，pid=${host.pid}）');
+    _emitStatus(
+      config,
+      'registered',
+      degraded: _uiDegraded.containsKey(config.id),
+    );
   }
 
-  Future<UiHost> _spawnUi(PluginConfig config) {
+  Future<UiHost> _spawnUi(PluginConfig config, {String windowId = ''}) {
     final UiHostFactory? factory = uiHostFactory;
     if (factory != null) {
-      return factory(config, coreUrl: coreUrl, coreToken: coreToken);
+      return factory(
+        config,
+        coreUrl: coreUrl,
+        coreToken: coreToken,
+        windowId: windowId,
+      );
     }
     return UiHost.start(
       config,
       coreUrl: coreUrl,
       coreToken: coreToken,
+      windowId: windowId,
       // UI 插件的进程输出同样进日志 API（stdout 是开发期诊断，stderr 是错误）。
       onStdoutLine: (String line) => pluginLog?.call(config.id, line, 'stdout'),
       onStderrLine: (String line) => pluginLog?.call(config.id, line, 'stderr'),
     );
   }
 
-  /// 开启 `ui.hello` 连接窗口。
+  /// 开启某个窗口的 `ui.hello` 连接窗口。
   ///
   /// 窗口内没连上 **不杀进程**：UI 插件可能只是起得慢；只把面板状态降级并给出
-  /// 可读原因，等它后来连上再自动恢复。
+  /// 可读原因，等它后来连上再自动恢复。降级是**插件级**读数（任一窗口连上即解除），
+  /// 定时器按窗口记账（`pluginId#windowId`），互不覆盖。
   void _armUiHelloWindow(PluginConfig config, UiHost host) {
-    _uiHelloWindows.remove(config.id)?.cancel();
-    _uiHelloWindows[config.id] = Timer(uiHelloWindow, () {
-      _uiHelloWindows.remove(config.id);
-      if (_uiHosts[config.id] != host || _uiHelloSeen.contains(config.id)) return;
+    final String key = '${config.id}#${host.windowId}';
+    _uiHelloWindows.remove(key)?.cancel();
+    _uiHelloWindows[key] = Timer(uiHelloWindow, () {
+      _uiHelloWindows.remove(key);
+      final Map<String, UiHost>? windows = _uiWindows[config.id];
+      if (windows == null || windows[host.windowId] != host) return;
+      if (_uiHelloSeen.contains(config.id)) return;
       final String reason =
-          'UI 插件 ${config.id} 启动后 ${uiHelloWindow.inSeconds}s 内没有 '
-          'ui.hello 连接（进程仍在运行）';
+          'UI 插件 ${config.id} 的窗口 ${host.windowId} 启动后 '
+          '${uiHelloWindow.inSeconds}s 内没有 ui.hello 连接（进程仍在运行）';
       _uiDegraded[config.id] = reason;
       log?.call(reason);
       _emitStatus(config, 'registered', degraded: true, reason: reason);
@@ -1063,10 +1189,22 @@ class PluginBus {
   /// UI 插件完成 `ui.hello`（由 [StationWsBridge.onUiHello] 回调）。
   ///
   /// 只认**当前世代**的宿主：热重启后旧连接迟到的 hello 不能洗白新实例。
-  void noteUiHello(String pluginId) {
-    if (!_uiHosts.containsKey(pluginId)) return;
+  /// [windowId] 空串 = 老版本 UI 没带窗口号 ⇒ 按主窗口记账（窗口级读数不该永远是 false）。
+  void noteUiHello(String pluginId, {String windowId = ''}) {
+    if (!_uiHosts.containsKey(pluginId) &&
+        !(_uiWindows[pluginId]?.isNotEmpty ?? false)) {
+      return;
+    }
+    final String resolvedWindow =
+        windowId.isNotEmpty ? windowId : (_uiHosts[pluginId]?.windowId ?? '');
+    if (resolvedWindow.isNotEmpty) {
+      _uiHelloWindowSeen.add('$pluginId#$resolvedWindow');
+    }
     _uiHelloSeen.add(pluginId);
-    _uiHelloWindows.remove(pluginId)?.cancel();
+    for (final String key in _uiHelloWindows.keys.toList()) {
+      if (!key.startsWith('$pluginId#')) continue;
+      _uiHelloWindows.remove(key)?.cancel();
+    }
     final String? previous = _uiDegraded.remove(pluginId);
     if (previous != null) {
       final PluginConfig? config = this.config(pluginId);
@@ -1077,10 +1215,36 @@ class PluginBus {
     }
   }
 
-  /// UI 插件进程退出收尾。
-  Future<void> _onUiExit(PluginConfig config, UiHost host, int code) async {
-    // 已经被 stop / restart 替换掉的旧世代：心跳表里没有它，不重复记状态。
-    if (_uiHosts[config.id] != host) return;
+  /// UI 窗口进程退出收尾。
+  ///
+  /// **只有最后一个窗口退出**才走插件级收尾（摘订阅 / 注销自建站 / 工具表失效）；
+  /// 还有别的窗口时只更新窗口表与状态——关掉一个窗口不该把另一个的订阅打断。
+  Future<void> _onUiWindowExit(
+    PluginConfig config,
+    UiHost host,
+    int code,
+  ) async {
+    final Map<String, UiHost>? windows = _uiWindows[config.id];
+    if (windows == null || windows[host.windowId] != host) return;
+    windows.remove(host.windowId);
+    _uiHelloWindowSeen.remove('${config.id}#${host.windowId}');
+    _uiHelloWindows.remove('${config.id}#${host.windowId}')?.cancel();
+    if (windows.isNotEmpty) {
+      if (_uiHosts[config.id] == host) {
+        _uiHosts[config.id] = windows.values.first;
+      }
+      log?.call(
+        'UI 插件 ${config.id} 的窗口 ${host.windowId} 已退出'
+        '（剩余 ${windows.length} 个窗口，插件仍在线）',
+      );
+      _emitStatus(
+        config,
+        'registered',
+        degraded: _uiDegraded.containsKey(config.id),
+      );
+      return;
+    }
+    _uiWindows.remove(config.id);
     final bool restarting =
         lifecycleOf(config.id) == PluginLifecycleState.restarting;
     final bool stoppedByCore = host.stopRequested;
@@ -1200,8 +1364,12 @@ class PluginBus {
       }
     }
     if (method == PluginRpcMethods.stationStream) {
-      // 流式回填的数据面：插件推 delta / done / error（见 [_handleStationStream]）
-      _handleStationStream(pluginId, params);
+      // A5：核心不再有 LLM 接管流，这条数据面没有接收方；丢弃并留下可读日志，
+      // 不让它降级成 plugin_event 推给前端（那是插件事件通道，不是流数据面）。
+      log?.call(
+        '插件 $pluginId 的 station/stream 已无接收方（A5 起核心不含 LLM 接管流），'
+        '本条已丢弃：${params['request_id'] ?? ''}',
+      );
       return;
     }
     if (method == TunnelMethods.event) {
@@ -1681,15 +1849,18 @@ class PluginBus {
         if (host.config.id == pluginId) host,
     ];
     // 片 D：UI 实例不在收尸台账里（没有心跳判死），强停直接对进程下手。
-    final UiHost? uiTarget = _uiHosts[pluginId];
+    // 多窗口：逐个都要停，漏一个就是“强制停止后还有窗口在跑”。
+    final List<UiHost> uiTargets = _liveUiWindowsOf(pluginId).values.toList();
     await _disconnect(pluginId);
     int killed = 0;
-    if (uiTarget != null && !uiTarget.isClosed) {
-      await uiTarget.kill('用户显式强制停止 UI 插件 $pluginId');
-      killed++;
-      log?.call('UI 插件 $pluginId 被用户强制停止 ⇒ 显式 kill');
-    }
-    if (uiTarget != null) {
+    for (final UiHost uiTarget in uiTargets) {
+      if (!uiTarget.isClosed) {
+        await uiTarget.kill('用户显式强制停止 UI 插件 $pluginId 的窗口 ${uiTarget.windowId}');
+        killed++;
+        log?.call(
+          'UI 插件 $pluginId 的窗口 ${uiTarget.windowId} 被用户强制停止 ⇒ 显式 kill',
+        );
+      }
       await uiTarget.close(waitForExit: true);
     }
     for (final PluginHost host in targets) {
@@ -1712,13 +1883,13 @@ class PluginBus {
       // 退出确认逐个数：没有目标（本来就没在跑）也算干净，否则面板会报“停不掉”。
       'exited':
           targets.every((PluginHost host) => host.exitedConfirmed) &&
-          (uiTarget == null || uiTarget.isClosed),
+          uiTargets.every((UiHost host) => host.isClosed),
       'lifecycle': lifecycleOf(pluginId).wire,
       'generation': generationOf(pluginId),
       // 原因从**目标宿主本身**读：`_disconnect` 已经把实例从表里摸掉了，
       // 再走 [_pluginState] 那条路只会拿到空串（“杀了但说不清为什么杀的”）。
       'kill_reason': <String>[
-        if (uiTarget != null) uiTarget.killReason,
+        ...uiTargets.map((UiHost host) => host.killReason),
         ...targets.map((PluginHost host) => host.killReason),
       ].firstWhere((String reason) => reason.isNotEmpty, orElse: () => ''),
       'note':
@@ -1754,33 +1925,35 @@ class PluginBus {
     load();
     final String id = pluginId.trim();
     final PluginHost? live = _hosts[id];
-    final UiHost? uiLive = _uiHosts[id];
+    final List<UiHost> uiLives = _liveUiWindowsOf(id).values.toList();
     final List<PluginHost> stragglers = <PluginHost>[
       for (final PluginHost host in _reaping)
         if (host.config.id == id && !host.exitedConfirmed) host,
     ];
-    if (live == null && uiLive == null && stragglers.isEmpty) {
+    if (live == null && uiLives.isEmpty && stragglers.isEmpty) {
       // 没有在跑的实例、也没有待收尸的残留 ⇒ 这台核心没在持那些文件，可以放置。
       // 注意这里**不看条目是否存在**：一条 `enabled: false` 的条目照样可能刚刚被
       // 强制停止留下残留，那已经由上面两个集合覆盖。
       return '';
     }
-    if (live != null || uiLive != null) {
+    if (live != null || uiLives.isNotEmpty) {
       // 优雅关闭 + 把状态推给前端（面板要看得见「它停了」，不然用户以为没点上）。
       await _stopPlugin(id, '为替换插件文件而停止（发布仓库安装；没有强杀）');
     }
-    if (uiLive != null) {
+    for (final UiHost uiLive in uiLives) {
       // UI 插件没有心跳：只等“进程真的退出”。这里同样**不 kill**——换不掉就
-      // 回可读原因，由用户去走「强制停止」。
+      // 回可读原因，由用户去走「强制停止」。多窗口时**逐个**等：漏一个就还在
+      // 锁着 exe，换文件会在 Windows 上失败。
       try {
         await uiLive.exited.timeout(const Duration(seconds: 5));
       } on TimeoutException {
-        return 'UI 插件 $id 的进程在 5 秒内没有确认退出（优雅停止已发出）'
+        return 'UI 插件 $id 的窗口 ${uiLive.windowId} 在 5 秒内没有确认退出'
+            '（优雅停止已发出）'
             '⇒ 这次**不动插件文件**，旧文件一个都没动。'
             '等它退出后重试，或在面板上对它「强制停止」（那是唯一会强杀的动作）';
       }
       if (!uiLive.isClosed) {
-        return 'UI 插件 $id 的进程还没确认退出 ⇒ 这次**不动插件文件**。'
+        return 'UI 插件 $id 的窗口 ${uiLive.windowId} 还没确认退出 ⇒ 这次**不动插件文件**。'
             '等它退出后重试，或在面板上对它「强制停止」';
       }
     }
@@ -1863,6 +2036,8 @@ class PluginBus {
     if (!state.isTemporarilyUnavailable) _wakeLifecycleWaiters(pluginId);
     switch (state) {
       case PluginLifecycleState.ready:
+        // 这一世重新上线 ⇒ 下一次下线还要再通知一次（`closed` 只在“离开在线”时发）。
+        _offlineNotified.remove(pluginId);
         // ready **不清代管台账**：订阅申报常常晚于 ready 到达（插件收到 hello 回包
         // 才发 station/subscribe），在这里清掉就等于让 [_subscribeToStation] 看不出
         // 「这条声明是上一世留下的」，旧归属会和新归属同时挂在同一个点上。
@@ -1882,10 +2057,16 @@ class PluginBus {
         }
         // 片 B：WS 订阅者不是站点表里的持久订阅，没有 stdio 的“插件下线自动退订”
         // 这条路径；它们必须收到显式的 `closed`，否则会一直等不会再来的事件。
-        try {
-          onPluginOffline?.call(pluginId);
-        } catch (error) {
-          log?.call('插件下线钩子异常（$pluginId）：$error');
+        //
+        // **一世代只发一次**：崩溃路径会先因 `_disconnect` 落到 stopped、再改判
+        // failed，两次跃迁都走到这里；重复的 `closed` 会让订阅者收到两条“站点关闭”
+        // （多窗口时尤其明显：关一个窗口再关最后一个，日志里会出现两遍）。
+        if (_offlineNotified.add(pluginId)) {
+          try {
+            onPluginOffline?.call(pluginId);
+          } catch (error) {
+            log?.call('插件下线钩子异常（$pluginId）：$error');
+          }
         }
         _abandonBuffered(pluginId, '$why ⇒ 这些请求不再等待，各自的调用点按既有 fail-open 兜底');
         break;
@@ -1963,19 +2144,11 @@ class PluginBus {
 
   /// 重放前的逐条复查（为什么不能无条件重放见 [PluginRestartBuffer.replay]）。
   ///
-  /// 两条判据都**沿用已有台账**，不另造一套记录：
-  /// - `request_id` 已收尾（done / error / 取消 / 活性窗口判无回）⇒ 按「迟到无害」丢，
-  ///   与 [_handleStationStream] 对迟到增量的处置同一口径（用的就是同一个 [_closedStreamIds]）；
-  /// - scope 与这个插件现在的声明不再相容 ⇒ 丢（fail-closed：宁可让调用点放行原数据，
-  ///   也不把 A 工作面的请求递到 B 工作面上）。
+  /// 判据：scope 与这个插件现在的声明不再相容 ⇒ 丢（fail-closed：宁可让调用点
+  /// 放行原数据，也不把 A 工作面的请求递到 B 工作面上）。
+  ///
+  /// A5 删掉了「已收尾 request_id」那一条：它依赖的 LLM 接管流台账已随领域面移除。
   bool _bufferedRequestStillValid(String pluginId, QueuedStationRequest item) {
-    if (_closedStreamIds.contains(item.request.requestId)) {
-      log?.call(
-        '重放前丢弃 ${item.request.requestId}：它的发起方已经收尾（迟到无害），'
-        '不再递第二条给插件 ${item.request.stationId}',
-      );
-      return false;
-    }
     final PluginConfig? cfg = config(pluginId);
     if (cfg == null) {
       log?.call('重放前丢弃一条请求：插件 $pluginId 已不在配置里（对账把它删了）');
@@ -2918,6 +3091,7 @@ class PluginBus {
     for (final String pluginId in <String>{
       ..._hosts.keys,
       ..._uiHosts.keys,
+      ..._uiWindows.keys,
     }) {
       if (next.containsKey(pluginId)) continue;
       const String reason = '配置条目已删除：实例已断开并忘掉（工具定义与站点订阅一并注销）';
@@ -3050,12 +3224,18 @@ class PluginBus {
     final PluginHost? host = _hosts[pluginId];
     if (host != null && !host.isClosed) return true;
     final UiHost? uiHost = _uiHosts[pluginId];
-    return uiHost != null && !uiHost.isClosed;
+    if (uiHost != null && !uiHost.isClosed) return true;
+    return _uiWindows[pluginId]?.values.any(
+          (UiHost window) => !window.isClosed,
+        ) ??
+        false;
   }
 
   /// 某插件是否有实例（含 UI；哪怕刚退出但还没收尸）。
   bool _hasInstance(String pluginId) =>
-      _hosts.containsKey(pluginId) || _uiHosts.containsKey(pluginId);
+      _hosts.containsKey(pluginId) ||
+      _uiHosts.containsKey(pluginId) ||
+      (_uiWindows[pluginId]?.isNotEmpty ?? false);
 
   /// 拉起一个插件并归类成 started / restarted / failed（**单个插件的失败不外溢**）。
   Future<PluginReconcileAction> _startForReconcile(
@@ -3531,1506 +3711,6 @@ class PluginBus {
     });
     if (failed.isEmpty) return null;
     return failed.join('；');
-  }
-
-  /// **工具调用的中转站触发点**（工具层唯一入口调用；`phase` = pre | post）。
-  ///
-  /// 「把完整 tool_call 交给插件，改什么甚至不改由插件内部决定」——因此 payload 是
-  /// **整条调用报文**（工具名 / 调用 id / 轮次 / 参数或结果），回填可以是对象
-  /// （整体替换报文）或字符串（只替换结果文本）。
-  ///
-  /// **fail-open 红线**：未接线 / 无订阅者 / 订阅者未回 / 回包非法 / 任何异常，
-  /// 一律返回原报文并给可读原因，绝不抛出、绝不阻塞工具执行。
-  ///
-  /// 返回 null = 与输入完全相同（**未改动**，调用方零开销走原路径）。
-  Future<Map<String, dynamic>?> relayToolCall({
-    required String phase,
-    required String tool,
-    required String callId,
-    required int round,
-    required String agentId,
-    required String sessionId,
-    Map<String, dynamic>? arguments,
-    String result = '',
-    bool isError = false,
-
-    /// 这次调用是谁发起的（`agent` = 模型的工具调用；`plugin` = 插件经 `tool.call`）。
-    ///
-    /// 与广播 payload 同口径：中转订阅者拿到它才能区分"模型的调用"与"自己发起的
-    /// 调用"（否则一个既订 `tool.pre`、又用 `tool.call` 的插件无法在中转侧闭环审计）。
-    String origin = 'agent',
-    String sourcePluginId = '',
-  }) async {
-    load();
-    if (!enabled) return null;
-    // 无运行期四元组（测试 / 嵌入式宿主未接线）⇒ 站点隔离证明不了归属，直接放行。
-    final StationScope scope = runtimeScopeFor(
-      agentId: agentId,
-      sessionId: sessionId,
-    );
-    if (!scope.isValid) return null;
-    // 点位化：工具前 / 工具后是**两个独立的中转站点位**（各自唯一订阅者）。
-    // payload 仍带 phase（向后兼容：老订阅者就是按 phase 过滤的）。
-    final bool isPost = phase == 'post';
-    final RelayStation? station = stations.relayPointFor(
-      isPost ? StationHubIds.relayToolPost : StationHubIds.relayToolPre,
-    );
-    if (station == null) {
-      // 走到这里 = 站点中枢没接线 / 点位被占成了别的类型（后者已在 load() 纠正并
-      // 记日志）。fail-open 也要留线索，别让"插件没生效"变成零日志的悬案。
-      log?.call(
-        '工具中转（$phase $tool）：点位 '
-        '${isPost ? StationHubIds.relayToolPost : StationHubIds.relayToolPre}'
-        ' 不可用（未接线 / 类型不符），按未接线放行原报文',
-      );
-      return null;
-    }
-    if (station.subscribers.isEmpty) return null; // 快路径：没人订阅，零等待
-    final Map<String, dynamic> payload = <String, dynamic>{
-      'point': station.id,
-      'phase': phase,
-      'origin': origin,
-      if (sourcePluginId.isNotEmpty) 'source_plugin_id': sourcePluginId,
-      'tool': tool,
-      'call_id': callId,
-      'round': round,
-      'arguments': ?arguments,
-      if (phase == 'post') 'result': result,
-      if (phase == 'post') 'is_error': isError,
-    };
-    try {
-      final StationRelayResult relayed = await station.relay(
-        data: payload,
-        scope: scope,
-        meta: <String, dynamic>{'tool': tool, 'call_id': callId},
-      );
-      if (!relayed.handled) {
-        if (relayed.reason.isNotEmpty) {
-          log?.call('工具中转（$phase $tool）未处理：${relayed.reason}');
-        }
-        return null;
-      }
-      final Object? data = relayed.data;
-      if (data is Map) {
-        final Map<String, dynamic> next = data.map(
-          (dynamic k, dynamic v) => MapEntry(k.toString(), v),
-        );
-        // 未改动（内容相等）⇒ 返回 null，走原路径（避免无谓的对象替换）
-        if (_sameMap(next, payload)) return null;
-        return next;
-      }
-      if (data is String) {
-        // 字符串回填 = 只替换结果文本（pre 阶段没有可替换的文本 ⇒ 视为未改动）
-        if (phase != 'post' || data == result) return null;
-        return <String, dynamic>{...payload, 'result': data};
-      }
-      log?.call(
-        '工具中转（$phase $tool）：回填类型 ${data.runtimeType} 无法并入报文，'
-        '按原样放行',
-      );
-      return null;
-    } catch (error) {
-      log?.call('工具中转（$phase $tool）异常（已放行原报文）：$error');
-      return null;
-    }
-  }
-
-  // ── 阶段 6 A 级：四个新中转点位（tool.repair / tool.probe / llm.register /
-  //   compact.skip.reason）───────────────────────────────────────────────
-
-  /// 这四个点位的**共同投递形状**（只写一次，否则四处 fail-open 口径一定漂）。
-  ///
-  /// 返回 null = **未接管**（点位不可用 / 无订阅者 / 没回 / 回包失败 / 异常），
-  /// 调用方一律走内置那一条；绝不抛、绝不阻塞。接管了就把回包原样递上去（Map）。
-  Future<Object?> _relayRaw(
-    String pointId, {
-    required Map<String, dynamic> payload,
-    required StationScope scope,
-    required String label,
-    Map<String, dynamic>? meta,
-  }) async {
-    final RelayStation? station = stations.relayPointFor(pointId);
-    if (station == null) {
-      log?.call('$label：点位 $pointId 不可用（未接线 / 类型不符），按内置走');
-      return null;
-    }
-    if (station.subscribers.isEmpty) return null; // 快路径：没人订阅，零等待
-    try {
-      final StationRelayResult relayed = await station.relay(
-        data: <String, dynamic>{...payload, 'point': station.id},
-        scope: scope,
-        meta: meta ?? payload,
-      );
-      if (!relayed.handled) {
-        if (relayed.reason.isNotEmpty) {
-          log?.call('$label 未处理：${relayed.reason}');
-        }
-        return null;
-      }
-      return relayed.data;
-    } catch (error) {
-      log?.call('$label 异常（按内置走）：$error');
-      return null;
-    }
-  }
-
-  /// 中转点 `tool.repair`：历史里缺工具结果时，那句**修复文案由谁写**。
-  ///
-  /// 只接管“写什么”：落库与 `tool_end` 帧仍然只走内置那一条路（不开第二条落库路）。
-  /// 返回 null ⇒ 用内置那句（`autoRepairToolResultText`），**不会因本站失败而修不了**。
-  Future<String?> relayToolRepairText({
-    required String agentId,
-    required String sessionId,
-    required String toolCallId,
-    required String toolName,
-    required String text,
-  }) async {
-    load();
-    if (!enabled) return null;
-    final StationScope scope = runtimeScopeFor(
-      agentId: agentId,
-      sessionId: sessionId,
-    );
-    if (!scope.isValid) return null;
-    final Object? data = await _relayRaw(
-      StationHubIds.relayToolRepair,
-      label: '工具结果修复文案',
-      meta: <String, dynamic>{'call_id': toolCallId},
-      payload: <String, dynamic>{
-        'agent_id': agentId,
-        'session_id': sessionId,
-        'tool_call_id': toolCallId,
-        'tool_name': toolName,
-        'text': text,
-      },
-      scope: scope,
-    );
-    if (data is! Map) return null;
-    if (data['repaired'] != true) return null;
-    final String better = '${data['text'] ?? ''}'.trim();
-    if (better.isEmpty) {
-      log?.call('工具结果修复文案：回包 repaired=true 但没带 text（用内置那句）');
-      return null;
-    }
-    return better;
-  }
-
-  /// 中转点 `tool.probe`：“这次工具调用是不是已经有结果”由谁回答。
-  ///
-  /// 三档结果缺一不可（所以下面返回一个对象而不是 String?）：
-  /// - null ⇒ **未接管**，调用方走内置探针（查库）；
-  /// - `found: true` ⇒ 插件交出结果原文；
-  /// - `found: false` ⇒ 插件**肯定地**说没有（也不再进内置探针：结果在插件那一侧，
-  ///   库里查不到本来就是预期的）。
-  Future<StationToolProbeVerdict?> relayToolProbe({
-    required String agentId,
-    required String sessionId,
-    required String toolCallId,
-  }) async {
-    load();
-    if (!enabled) return null;
-    final StationScope scope = runtimeScopeFor(
-      agentId: agentId,
-      sessionId: sessionId,
-    );
-    if (!scope.isValid) return null;
-    final Object? data = await _relayRaw(
-      StationHubIds.relayToolProbe,
-      label: '工具结果探针',
-      meta: <String, dynamic>{'call_id': toolCallId},
-      payload: <String, dynamic>{
-        'agent_id': agentId,
-        'session_id': sessionId,
-        'tool_call_id': toolCallId,
-      },
-      scope: scope,
-    );
-    if (data is! Map) return null;
-    final Object? found = data['found'];
-    if (found is! bool) {
-      log?.call(
-        '工具结果探针：回包没有布尔 found（实际 ${data['found'].runtimeType}），'
-        '按未接管走内置探针',
-      );
-      return null;
-    }
-    return StationToolProbeVerdict(
-      found: found,
-      text: '${data['text'] ?? data['result'] ?? ''}',
-    );
-  }
-
-  /// 中转点 `llm.register`：把一次运行中请求的**登记**投给插件（fire-and-forget）。
-  ///
-  /// **内置登记表永远先建立**（它是流式可关闭性的唯一执行点），所以这里不 await、
-  /// 也不允许回包影响请求本身：插件回的 `note` 只进日志（计费 / 审计拿得到
-  /// handle 与模型就够了）。取消 / 关闭 / 判死三个动作仍然只在核心里。
-  void relayLlmRegisterNotice({
-    required String handle,
-    required String agentId,
-    required String sessionId,
-    required String model,
-    required int turn,
-  }) {
-    load();
-    if (!enabled) return;
-    final StationScope scope = runtimeScopeFor(
-      agentId: agentId,
-      sessionId: sessionId,
-    );
-    if (!scope.isValid) return;
-    unawaited(
-      _relayRaw(
-        StationHubIds.relayLlmRegister,
-        label: 'LLM 请求登记',
-        meta: <String, dynamic>{'handle': handle},
-        payload: <String, dynamic>{
-          'handle': handle,
-          'agent_id': agentId,
-          'session_id': sessionId,
-          'model': model,
-          'turn': turn,
-        },
-        scope: scope,
-      ).then((Object? data) {
-        if (data is! Map) return;
-        final String note = '${data['note'] ?? ''}'.trim();
-        if (note.isEmpty) return;
-        // 回执只进日志：登记本身已经成立，这里不拿它改写任何判据。
-        log?.call('LLM 请求登记回执（$handle）：$note');
-      }),
-    );
-  }
-
-  /// 中转点 `compact.skip.reason`：把“压缩为什么没走插件”那句原因投给插件，
-  /// 插件可回一句更准的说法**覆盖那一条记录**（只改文案，不改分级位）。
-  ///
-  /// [hasSubscriber]=false（总开关关 / 作用域不匹配 / 无订阅者）时**不投**：根本没
-  /// 插件在路上，投了只会多一条没人接的帧。回得太晚（这一轮已经收尾）就自然失效：
-  /// [compactionSkipAnnotator] 只会覆盖还在账上那条，不会凭空造一条。
-  void relayCompactSkipReason({
-    required String agentId,
-    required String sessionId,
-    required String reason,
-    required bool hasSubscriber,
-  }) {
-    load();
-    if (!enabled || !hasSubscriber) return;
-    final StationScope scope = runtimeScopeFor(
-      agentId: agentId,
-      sessionId: sessionId,
-    );
-    if (!scope.isValid) return;
-    unawaited(
-      _relayRaw(
-        StationHubIds.relayCompactSkipReason,
-        label: '压缩未接管原因',
-        meta: <String, dynamic>{'session_id': sessionId},
-        payload: <String, dynamic>{
-          'agent_id': agentId,
-          'session_id': sessionId,
-          'reason': reason,
-        },
-        scope: scope,
-      ).then((Object? data) {
-        if (data is! Map) return;
-        final String better = '${data['reason'] ?? ''}'.trim();
-        if (better.isEmpty || better == reason) return;
-        final void Function(String, String, String)? annotator =
-            compactionSkipAnnotator;
-        if (annotator == null) {
-          log?.call('压缩未接管原因：插件回了更准的说法，但回写口未接线（不假装改过）');
-          return;
-        }
-        annotator(agentId, sessionId, better);
-      }),
-    );
-  }
-
-  // ── 阶段 8：整轮 tool loop 接管（`system.relay.loop.run`）───────────────────
-  //
-  // 这一条**不另造一套流式机制**：底下复用 `llm.handle` 那条已验证的插件流
-  // （`_PluginLlmStream` + `_guardPluginStream`：归属校验、早到帧暂存、`station/cancel`
-  // 下发、心跳丢失收尾、同 id 顶替、下线时统一作废），上面只盖两层：
-  // ① LlmStreamEvent → AgentEvent 的翻译；② **由核心发的**工具活动卡片。
-  // 为什么工具卡片不能由接管者自己写：tool_start / tool_end 同时是**落库与面板的口径**
-  // （历史里一条工具调用及其结果），让插件造就等于把写侧交出去了。
-
-  /// 在册的整轮接管（键 = 打开这条 run 的 station request_id）。
-  final Map<String, _PluginRunPipe> _runPipes = <String, _PluginRunPipe>{};
-
-  /// 工具活动卡片的本地消息 id 计数（与 `LlmSession` 那份同性质：UI / 落库用）。
-  int _runToolSeq = 0;
-
-  /// 在册的整轮接管数（观测 / 用例）。
-  int get openLoopRuns => _runPipes.length;
-
-  /// 中转点 `loop.run`：**把整轮交出去**（一条用户消息 = 一个 run）。
-  ///
-  /// 返回 null = 未接管（未接线 / 无订阅者 / 回包不认 / 任何异常）⇒ 内置 loop **逐字不变**。
-  /// 返回一条流 = 接管成立；这条流开到接管者推 `done` / 出错 / 被取消 / 心跳丢失。
-  ///
-  /// 只支持流式（`stream: true`）：整轮的文本必须边产边播，否则面板上整轮空白到结束，
-  /// 而且一次性回整包就等于让核心无法在中间收尾（取消与判死仍是核心的职责）。
-  Future<Stream<AgentEvent>?> relayLoopRun({
-    required List<LlmMessage> messages,
-    required List<ToolSpec> tools,
-    required String agentId,
-    required String sessionId,
-    required String model,
-    required int maxContextTokens,
-    required bool Function() isCancelled,
-    bool Function()? isHardCancelled,
-  }) async {
-    load();
-    if (!enabled) return null;
-    final StationScope scope = runtimeScopeFor(
-      agentId: agentId,
-      sessionId: sessionId,
-    );
-    if (!scope.isValid) return null;
-    final RelayStation? station = stations.relayPointFor(
-      StationHubIds.relayLoopRun,
-    );
-    if (station == null) {
-      log?.call(
-        '整轮接管：点位 ${StationHubIds.relayLoopRun} 不可用（未接线 / 类型不符），'
-        '走内置 loop',
-      );
-      return null;
-    }
-    if (station.subscribers.isEmpty) return null; // 快路径：没人接管，零等待
-    final Map<String, dynamic> payload = <String, dynamic>{
-      'point': station.id,
-      'agent_id': agentId,
-      'session_id': sessionId,
-      'team_id': scope.teamId,
-      'mode': scope.modeKey,
-      'model': model,
-      'message_count': messages.length,
-      // 与 `context.compact` 同口径：递“引擎这一轮真会用的那份线形消息”，
-      // 而不是存储里的全量（否则接管者看到的与内置会发的不一致）。
-      'messages': <Map<String, dynamic>>[
-        for (final LlmMessage message in messages) message.toWire(),
-      ],
-      // 工具表也必须同一份：接管者靠它知道能用哪些工具、参数长什么样。
-      'tools': <Map<String, dynamic>>[
-        for (final ToolSpec tool in tools)
-          <String, dynamic>{
-            'name': tool.name,
-            'description': tool.description,
-            'parameters': tool.parameters,
-          },
-      ],
-    };
-    try {
-      final StationRelayResult relayed = await station.relay(
-        data: payload,
-        scope: scope,
-        meta: <String, dynamic>{'purpose': 'loop.run', 'session_id': sessionId},
-      );
-      if (!relayed.handled) {
-        if (relayed.reason.isNotEmpty) {
-          log?.call('整轮接管未接管：${relayed.reason}');
-        }
-        return null;
-      }
-      final Object? data = relayed.data;
-      if (data is! Map) {
-        log?.call('整轮接管回包不是对象（${data.runtimeType}），按未接管走内置 loop');
-        return null;
-      }
-      if (data['taken'] == false) {
-        // 接管者**明确说不接管**：这与“没回”不是同一件事（前者是插件主动让路，
-        // 后者可能只是这个点位没人写）；两者都回退内置，但只有这条会留下一行。
-        log?.call('整轮接管：插件明确回了 taken:false，本轮走内置 loop');
-        return null;
-      }
-      if (data['stream'] != true) {
-        // **显式说出来**，不静默当成“没接管”了事：插件作者需要知道这一条只收流式。
-        // 接管信号与 `llm.handle` 同一个约定（回 `stream: true` 就是流式接管），
-        // 不另外发明一套“还必须带 taken:true”的写法。
-        log?.call(
-          '整轮接管只回了整包（没有 stream:true）：这一条点位要求流式接管（取消与'
-          '单方面收尾都靠这条流），本轮按未接管走内置 loop',
-        );
-        return null;
-      }
-      return _openPluginRunStream(
-        station: station,
-        requestId: relayed.requestId,
-        pluginId: relayed.pluginId,
-        scope: scope,
-        agentId: agentId,
-        sessionId: sessionId,
-        model: model,
-        maxContextTokens: maxContextTokens,
-        isCancelled: isCancelled,
-      );
-    } catch (error) {
-      log?.call('整轮接管异常（已回退内置 loop）：$error');
-      return null;
-    }
-  }
-
-  /// 把一条插件流包装成“这一轮的 AgentEvent 流”。
-  ///
-  /// 登记与守护全部走现成的 [_openPluginLlmStream] / [_guardPluginStream]：
-  /// 取消下发、心跳丢失、早到帧暂存、同 id 顶替、下线作废都不需再写一遍。
-  Stream<AgentEvent> _openPluginRunStream({
-    required RelayStation station,
-    required String requestId,
-    required String pluginId,
-    required StationScope scope,
-    required String agentId,
-    required String sessionId,
-    required String model,
-    required int maxContextTokens,
-    required bool Function() isCancelled,
-  }) {
-    final Stream<LlmStreamEvent> hopStream = _openPluginLlmStream(
-      station: station,
-      requestId: requestId,
-      pluginId: pluginId,
-      scope: scope,
-      isCancelled: isCancelled,
-      turn: 0,
-    );
-    final StreamController<AgentEvent> controller =
-        StreamController<AgentEvent>();
-    final _PluginRunPipe pipe = _PluginRunPipe(
-      runId: requestId,
-      pluginId: pluginId,
-      agentId: agentId,
-      sessionId: sessionId,
-      model: model,
-      maxContextTokens: maxContextTokens,
-      controller: controller,
-    );
-    _runPipes[requestId] = pipe;
-    log?.call(
-      '整轮接管：插件 $pluginId 接管了一轮（$requestId，agent=$agentId '
-      'session=$sessionId model=$model）',
-    );
-    pipe.sub = hopStream.listen(
-      (LlmStreamEvent event) {
-        if (pipe.finished) return;
-        if (event is LlmTextDelta) {
-          pipe.add(AgentText(event.text));
-        } else if (event is LlmThinkingDelta) {
-          pipe.add(AgentThinking(event.text));
-        } else if (event is LlmRetryNotice) {
-          log?.call('整轮接管提示（$requestId）：${event.message}');
-          pipe.add(AgentNotice(event.message));
-        } else if (event is LlmUsageEvent) {
-          pipe.add(
-            AgentUsage(loopRunUsageMap(event.usage, pipe.maxContextTokens)),
-          );
-        } else if (event is LlmFinishEvent) {
-          // 收尾原因先记下来：真正的 AgentDone 在流关闭时发（与内置同一手：
-          // “收尾”只能有一次，而关闭可能来自 done / 取消 / 心跳三条路）。
-          pipe.finishReason = event.reason;
-        } else if (event is LlmFailureEvent) {
-          pipe.cancelled = event.cancelled;
-          pipe.failure = event.message;
-        } else if (event is LlmToolCallDelta) {
-          // 接管者的工具**自己执行**（它才是循环的主人）：这里只留痕，不造卡片——
-          // 面板上的工具卡片只从 `tool.call` 那一条路来（写侧在核心）。
-          log?.call(
-            '整轮接管（$requestId）推了一个 tool_call 增量（'
-            '${event.name ?? event.id ?? '?'}）：这一条点位不看它，'
-            '工具请经 tool.call 发起（带 run_id=$requestId）',
-          );
-        }
-      },
-      onError: (Object error, StackTrace stack) {
-        pipe.failure = error.toString();
-        pipe.finish();
-        _runPipes.remove(requestId);
-      },
-      onDone: () {
-        pipe.finish();
-        _runPipes.remove(requestId);
-      },
-    );
-    controller.onCancel = () {
-      // 消费方（会话）提前放弃：把底下那条流一起收尾，并把取消下发给插件
-      _closeLlmStream(requestId, cancelReason: '核心已放弃这一轮接管', cancelled: true);
-      _runPipes.remove(requestId);
-      pipe.cancelled = true;
-      pipe.finish();
-    };
-    return controller.stream;
-  }
-
-  /// 整轮接管期间，**由核心**把一次 `tool.call` 播报成这一轮的 tool_start / tool_end。
-  ///
-  /// 返回 false ⇒ 这个 `run_id` 不在册（不属于该插件 / 已经收尾）。调用方必须
-  /// **拒收这次 tool.call**：把“核心已收尾、插件还在写工作空间”那类孤儿行为变成
-  /// 一条看得见的拒绝，而不是默默改了磁盘。
-  ///
-  /// [phase] 只能是 `start` | `end`；两者靠同一个 `call_id` 配对（没给 call_id 就
-  /// 按“该 run 最后一条还没收尾的 start”配）。
-  bool noteRunToolActivity({
-    required String runId,
-    required String sourcePluginId,
-    required String phase,
-    required String tool,
-    String callId = '',
-    Map<String, dynamic>? arguments,
-    String result = '',
-    bool isError = false,
-  }) {
-    final _PluginRunPipe? pipe = _runPipes[runId];
-    if (pipe == null) {
-      log?.call(
-        'tool.call 带了 run_id=$runId，但这一轮不在册（已收尾 / 从未接管 / 属于别的插件）：'
-        '这次工具调用已被拒',
-      );
-      return false;
-    }
-    if (pipe.pluginId != sourcePluginId) {
-      log?.call(
-        '插件 $sourcePluginId 想往 $runId 的整轮播报工具活动（属于 ${pipe.pluginId}），已拒绝',
-      );
-      return false;
-    }
-    if (phase == 'start') {
-      final String id = 'runtool-${++_runToolSeq}';
-      pipe.openToolIds[callId] = id;
-      pipe.add(
-        AgentToolStart(
-          id: id,
-          name: tool,
-          arguments: arguments ?? const <String, dynamic>{},
-          callId: callId,
-        ),
-      );
-      return true;
-    }
-    if (phase != 'end') {
-      log?.call('整轮接管的工具播报 phase=$phase 非法（只能 start | end），已忽略');
-      return false;
-    }
-    final String id =
-        pipe.openToolIds.remove(callId) ??
-        pipe.openToolIds.remove('') ??
-        'runtool-${++_runToolSeq}';
-    pipe.add(AgentToolEnd(id: id, name: tool, result: result));
-    if (isError) {
-      // 失败结果本身就是卡片里的正文（内置路径也是这个口径），这里只多留一行日志
-      log?.call('整轮接管（$runId）的工具 $tool 回了错误结果');
-    }
-    return true;
-  }
-
-  /// 这个会话现在有被插件接管的整轮吗（返回 run_id；null = 没有）。
-  ///
-  /// 用途只有一件：**接管期间拒绝同一会话的 `agent.message`**——那一族会往会话里
-  /// 塞消息，与接管者的事件流开两条写入口就是双写历史。
-  String? activeLoopRunOf({String agentId = '', String sessionId = ''}) {
-    for (final _PluginRunPipe pipe in _runPipes.values) {
-      if (pipe.finished) continue;
-      if (sessionId.isNotEmpty && pipe.sessionId != sessionId) continue;
-      if (agentId.isNotEmpty && pipe.agentId != agentId) continue;
-      return pipe.runId;
-    }
-    return null;
-  }
-
-  // ── 中转站点位：LLM 路径（点位化，2026-10-01） ─────────────────────────────
-  //
-  // 四个点位，各自独立实例、各自唯一订阅者：
-  //   system.relay.llm.handle        LLM 处理（接管，含**流式回填**）
-  //   system.relay.llm.request       投入 LLM 前（改写请求体）
-  //   system.relay.context.compact   上下文压缩过程
-  //   system.relay.prompt.system     系统提示词构造过程
-  //
-  // 全部遵守中转站的三条不变量：无订阅者 ⇒ 零等待走系统默认；未回填 / 回包非法 /
-  // 心跳丢失 / 任何异常 ⇒ 回退系统默认（fail-open）；每个点位唯一订阅者。
-
-  /// 打开中的「LLM 处理」插件流（`request_id` → 流状态）。
-  final Map<String, _PluginLlmStream> _llmStreams =
-      <String, _PluginLlmStream>{};
-
-  /// **比流登记更早到达**的 `station/stream` 通知（`request_id` → 帧列表）。
-  ///
-  /// 为什么需要：核心是**处理完插件的回包之后**才把流登记进 [_llmStreams]，而插件
-  /// 常常在"发出回包"的同一瞬间就开始推第一片增量——那条通知可能先到（同一个读循环
-  /// tick）。早到的通知按 `request_id` 暂存，流一登记就**按原插件身份重放**（归属
-  /// 校验照走一遍），于是"回包后立刻推流"不必靠节流/时序兜底。
-  ///
-  /// 有界：最多 [maxPendingStreamFrames] 条、最多 [maxPendingStreamIds] 个 request_id，
-  /// 溢出丢最旧并记可读日志（绝不无界增长）。
-  final Map<String, List<_PendingStreamFrame>> _pendingStreamFrames =
-      <String, List<_PendingStreamFrame>>{};
-
-  /// 早到通知的条数上限（跨所有 request_id）。
-  static const int maxPendingStreamFrames = 128;
-
-  /// 早到通知的 request_id 上限（防止伪造 id 撑爆内存）。
-  static const int maxPendingStreamIds = 32;
-
-  int get _pendingStreamFrameCount => _pendingStreamFrames.values.fold<int>(
-    0,
-    (int sum, List<_PendingStreamFrame> frames) => sum + frames.length,
-  );
-
-  /// 暂存一条早到的 `station/stream`（有界；溢出丢最旧并记日志）。
-  void _bufferStreamFrame(
-    String pluginId,
-    String requestId,
-    Map<String, dynamic> params,
-  ) {
-    if (_pendingStreamFrames.length >= maxPendingStreamIds &&
-        !_pendingStreamFrames.containsKey(requestId)) {
-      final String oldest = _pendingStreamFrames.keys.first;
-      final int dropped = _pendingStreamFrames.remove(oldest)?.length ?? 0;
-      log?.call(
-        '插件 $pluginId 的 station/stream（$requestId）无法暂存：'
-        '待关联的 request_id 已达上限 $maxPendingStreamIds，丢弃最旧的 $oldest（$dropped 条）',
-      );
-    }
-    final List<_PendingStreamFrame> frames = _pendingStreamFrames.putIfAbsent(
-      requestId,
-      () => <_PendingStreamFrame>[],
-    );
-    frames.add(_PendingStreamFrame(pluginId: pluginId, params: params));
-    while (_pendingStreamFrameCount > maxPendingStreamFrames) {
-      final String oldest = _pendingStreamFrames.keys.first;
-      final List<_PendingStreamFrame> bucket = _pendingStreamFrames[oldest]!;
-      bucket.removeAt(0);
-      if (bucket.isEmpty) _pendingStreamFrames.remove(oldest);
-      log?.call(
-        '早到的 station/stream 超过上限 $maxPendingStreamFrames 条，'
-        '丢弃最旧的一条（request_id=$oldest）',
-      );
-    }
-  }
-
-  /// 把某 `request_id` 的早到通知按**原插件身份**重放（流登记后调用一次）。
-  void _replayStreamFrames(String requestId) {
-    final List<_PendingStreamFrame>? frames = _pendingStreamFrames.remove(
-      requestId,
-    );
-    if (frames == null || frames.isEmpty) return;
-    log?.call('LLM 接管流 $requestId：重放 ${frames.length} 条早到的 station/stream');
-    for (final _PendingStreamFrame frame in frames) {
-      // 走同一条入口 ⇒ 归属校验与"取消后丢弃"的判定都照旧生效
-      _handleStationStream(frame.pluginId, frame.params);
-    }
-  }
-
-  /// **丢弃**暂存的早到通知（流收尾 / 插件下线 / 溢出时）。
-  ///
-  /// [requestId] 非空只清那个 id；[pluginId] 非空只清该插件的帧。
-  /// 丢弃一定记可读日志：暂存本身是"正常竞态"，但**从没被重放就丢掉**意味着有插件
-  /// 在用一个不存在的 `request_id` 推流（最常见的原因：把 JSON-RPC 报文的 `id`
-  /// 当成了 `request_id`）——静默丢弃会让插件侧毫无反馈。
-  void _dropPendingStreamFrames({String? pluginId, String? requestId}) {
-    final List<String> removedIds = <String>[];
-    int dropped = 0;
-    if (requestId != null) {
-      dropped += _pendingStreamFrames.remove(requestId)?.length ?? 0;
-      if (dropped > 0) removedIds.add(requestId);
-    } else {
-      final List<String> ids = _pendingStreamFrames.keys.toList();
-      for (final String id in ids) {
-        final List<_PendingStreamFrame>? frames = _pendingStreamFrames[id];
-        if (frames == null) continue;
-        if (pluginId == null) {
-          dropped += frames.length;
-          _pendingStreamFrames.remove(id);
-          removedIds.add(id);
-          continue;
-        }
-        final int before = frames.length;
-        frames.removeWhere(
-          (_PendingStreamFrame frame) => frame.pluginId == pluginId,
-        );
-        dropped += before - frames.length;
-        if (frames.isEmpty) _pendingStreamFrames.remove(id);
-        if (before != frames.length) removedIds.add(id);
-      }
-    }
-    if (dropped == 0) return;
-    log?.call(
-      '丢弃 $dropped 条从未关联上在途流的 station/stream'
-      '${removedIds.isEmpty ? '' : '（request_id：${removedIds.join('、')}）'}'
-      '${pluginId == null ? '' : '，来源插件 $pluginId'}'
-      '——注意：station/stream 要带**请求 params 里的 request_id**，不是 JSON-RPC 报文的 id',
-    );
-  }
-
-  /// 暂存中的早到通知条数（快照 / 测试用；正常情况为 0）。
-  int get pendingStreamFrames => _pendingStreamFrameCount;
-
-  /// **刚刚收尾**的流 id（最近 [maxClosedStreamIds] 个）。
-  ///
-  /// 为什么需要：同一个 `request_id` 只有两种"当前没有流"的情形，处理方式相反——
-  /// - **从没登记过**（回包与第一片增量同 tick）⇒ 暂存待重放（[_bufferStreamFrame]）；
-  /// - **已经收尾**（done / error / 取消 / 心跳丢失）⇒ 迟到增量只能丢弃，并**当场**
-  ///   记一条可读日志（否则插件以为还在推，核心却毫无反馈）。
-  final Set<String> _closedStreamIds = <String>{};
-
-  /// 收尾流 id 的记忆条数上限（只为区分上面两种情形，不需要长期保留）。
-  static const int maxClosedStreamIds = 64;
-
-  /// 打开中的插件流数量（快照 / 测试用）。
-  int get openLlmStreams => _llmStreams.length;
-
-  /// **中转站点位「LLM 处理」**（`system.relay.llm.handle`）。
-  ///
-  /// 返回非 null = 这一跳交给插件（[LlmSession] 消费这条流、**不再调 LLM**）；
-  /// 返回 null = 不接管（无订阅者 / 未回填 / 回包认不出 / 任何异常）。
-  ///
-  /// 三种接管形态（`reply.payload`）：
-  /// - `{stream: true}` ⇒ **流式接管**：返回的流由后续 `station/stream` 通知喂数据，
-  ///   `done` / `error` 收尾；用户 stop 时向插件下发 `station/cancel`；
-  /// - OpenAI 兼容响应 / 裸 message（`{content, reasoning_content, tool_calls}`）
-  ///   ⇒ 一次性接管，展开成与流式同一套事件；
-  /// - 数组 ⇒ 每项按 SSE 分片或非流式响应解码（分片数组）。
-  Future<Stream<LlmStreamEvent>?> relayLlmHandle({
-    required LlmRequest request,
-    required String agentId,
-    required String sessionId,
-    required int turn,
-    required bool Function() isCancelled,
-  }) async {
-    load();
-    if (!enabled) return null;
-    final StationScope scope = runtimeScopeFor(
-      agentId: agentId,
-      sessionId: sessionId,
-    );
-    if (!scope.isValid) return null;
-    final RelayStation? station = stations.relayPointFor(
-      StationHubIds.relayLlmHandle,
-    );
-    if (station == null) return null;
-    if (station.subscribers.isEmpty) return null; // 快路径：没人订阅，零等待
-    final Map<String, dynamic> payload = <String, dynamic>{
-      'point': station.id,
-      'agent_id': agentId,
-      'session_id': sessionId,
-      'turn': turn,
-      'request': request.toWire(stream: true),
-    };
-    try {
-      final StationRelayResult relayed = await station.relay(
-        data: payload,
-        scope: scope,
-        meta: <String, dynamic>{'purpose': 'llm.handle', 'turn': turn},
-      );
-      if (!relayed.handled) {
-        if (relayed.reason.isNotEmpty) {
-          log?.call('LLM 处理中转未接管（第 $turn 跳）：${relayed.reason}');
-        }
-        return null;
-      }
-      final Object? data = relayed.data;
-      if (data == null) return null; // 订阅者选择不改动 = 不接管
-      if (data is Map && data['stream'] == true) {
-        return _openPluginLlmStream(
-          station: station,
-          requestId: relayed.requestId,
-          pluginId: relayed.pluginId,
-          scope: scope,
-          isCancelled: isCancelled,
-          turn: turn,
-        );
-      }
-      final List<LlmStreamEvent> events = _decodeLlmReply(data);
-      if (events.isEmpty) {
-        log?.call(
-          'LLM 处理中转回包认不出（第 $turn 跳）：${data.runtimeType}'
-          '——按未接管处理，走系统 LLM',
-        );
-        return null;
-      }
-      log?.call('LLM 处理中转：插件 ${relayed.pluginId} 一次性接管第 $turn 跳');
-      return Stream<LlmStreamEvent>.fromIterable(events);
-    } catch (error) {
-      log?.call('LLM 处理中转异常（第 $turn 跳，已回退系统 LLM）：$error');
-      return null;
-    }
-  }
-
-  /// 把插件的接管回包解码成流式事件（一次性接管 / 分片数组两种形态）。
-  static List<LlmStreamEvent> _decodeLlmReply(Object? data) {
-    final List<LlmStreamEvent> events = <LlmStreamEvent>[];
-    if (data is Map) {
-      final Map<String, dynamic> map = data.map(
-        (dynamic k, dynamic v) => MapEntry(k.toString(), v),
-      );
-      events.addAll(OpenAiCodec.decodeMessage(map));
-      if (events.isEmpty) {
-        // 也可能是 SSE 分片形态（`choices[0].delta`）
-        events.addAll(OpenAiCodec.decodeChunk(jsonEncode(map)));
-      }
-      return events;
-    }
-    if (data is List) {
-      for (final Object? item in data) {
-        if (item is String) {
-          events.addAll(OpenAiCodec.decodeChunk(item));
-          continue;
-        }
-        if (item is Map) {
-          final Map<String, dynamic> map = item.map(
-            (dynamic k, dynamic v) => MapEntry(k.toString(), v),
-          );
-          final List<LlmStreamEvent> one = OpenAiCodec.decodeMessage(map);
-          if (one.isNotEmpty) {
-            events.addAll(one);
-          } else {
-            events.addAll(OpenAiCodec.decodeChunk(jsonEncode(map)));
-          }
-          continue;
-        }
-        // 认不出的元素：整条回包作废（宁可走系统 LLM，也不吐半成品）
-        return const <LlmStreamEvent>[];
-      }
-      return events;
-    }
-    if (data is String) return OpenAiCodec.decodeChunk(data);
-    return const <LlmStreamEvent>[];
-  }
-
-  /// 打开一条**流式接管**（插件推 `station/stream`、核心边收边吐）。
-  ///
-  /// 三条收尾路径（缺一不可，否则会话会一直等下去）：
-  /// 1. 插件 `done` / `error` ⇒ 正常收尾；
-  /// 2. 用户取消（[isCancelled] 变真）⇒ 下发 `station/cancel` + 以"已取消"收尾；
-  /// 3. 插件心跳丢失 / 进程退出 ⇒ 以失败收尾（与站点判活同一口径，不设静态总超时）。
-  Stream<LlmStreamEvent> _openPluginLlmStream({
-    required RelayStation station,
-    required String requestId,
-    required String pluginId,
-    required StationScope scope,
-    required bool Function() isCancelled,
-    required int turn,
-  }) {
-    final StreamController<LlmStreamEvent> controller =
-        StreamController<LlmStreamEvent>();
-    final _PluginLlmStream stream = _PluginLlmStream(
-      requestId: requestId,
-      pluginId: pluginId,
-      station: station,
-      controller: controller,
-    );
-    // 同一 request_id 收到第二条 stream:true（插件重复回包 / 陈旧回包）：
-    // 让旧的以失败收尾，避免"两条流抢同一个 id"。
-    _llmStreams.remove(requestId)?.fail('同一 request_id 的新流已打开（旧流作废）');
-    _llmStreams[requestId] = stream;
-    log?.call('LLM 处理中转：插件 $pluginId 流式接管第 $turn 跳（$requestId）');
-    // **回包与第一片增量常常同 tick 到达**：早到的那几片在这里按原身份重放，
-    // 免得"插件推得比核心登记流更快"变成静默丢数据（示例插件原先只能靠节流苟住）。
-    _replayStreamFrames(requestId);
-    // 收尾守护：既不设静态总超时（长任务不该被时间杀），也不放任无限等——
-    // 每拍检查取消信号与订阅者心跳（与站点 awaitReply 的判活口径一致）。
-    _guardPluginStream(
-      stream: stream,
-      station: station,
-      requestId: requestId,
-      pluginId: pluginId,
-      isCancelled: isCancelled,
-    );
-    controller.onCancel = () {
-      // 消费方提前放弃（会话被取消 / 出错退出）：通知插件别再推了
-      _cancelLlmStream(requestId, '核心已放弃这条流');
-    };
-    return controller.stream;
-  }
-
-  /// 插件流的**收尾守护**（一跳接管与整轮接管共用同一套判据，两处写一定会漂）。
-  ///
-  /// 不设静态总超时（D8：长任务不该被时间杀），也不放任无限等：每拍查两件事
-  /// ——用户取消信号与订阅者心跳（与站点 awaitReply 同一个活性口径）。[what]
-  /// 只影响日志里那条“什么断了”的措辞。
-  void _guardPluginStream({
-    required _PluginLlmStream stream,
-    required RelayStation station,
-    required String requestId,
-    required String pluginId,
-    required bool Function() isCancelled,
-    String what = 'LLM 接管流',
-  }) {
-    stream.timer = Timer.periodic(const Duration(milliseconds: 250), (
-      Timer timer,
-    ) {
-      if (stream.finished) {
-        timer.cancel();
-        return;
-      }
-      if (isCancelled()) {
-        _closeLlmStream(
-          requestId,
-          cancelReason: '用户已停止本轮生成',
-          failure: '生成已取消（插件接管流被中断）',
-          cancelled: true,
-        );
-        return;
-      }
-      final StationLivenessState state = station.liveness(pluginId);
-      if (state.known && !state.alive) {
-        _closeLlmStream(
-          requestId,
-          failure:
-              '插件 $pluginId 心跳丢失（${state.detail.isEmpty ? '连续未达' : state.detail}），'
-              '$what中断',
-        );
-        return;
-      }
-    });
-  }
-
-  /// 收尾一条插件流（幂等）。
-  ///
-  /// [cancelReason] 非空时先向插件下发 `station/cancel`（下行通知）；
-  /// [failure] 非空时以 [LlmFailureEvent] 收尾，否则正常 `close`。
-  void _closeLlmStream(
-    String requestId, {
-    String cancelReason = '',
-    String failure = '',
-    bool cancelled = false,
-  }) {
-    final _PluginLlmStream? stream = _llmStreams.remove(requestId);
-    if (stream != null) {
-      _closedStreamIds.add(requestId);
-      while (_closedStreamIds.length > maxClosedStreamIds) {
-        _closedStreamIds.remove(_closedStreamIds.first);
-      }
-    }
-    // 这条流已经收尾：为它暂存的早到帧不会再有机会重放，直接清掉（并记线索）
-    _dropPendingStreamFrames(requestId: requestId);
-    if (stream == null) return;
-    if (cancelReason.isNotEmpty) {
-      _hosts[stream.pluginId]?.cancelStation(
-        requestId: requestId,
-        reason: cancelReason,
-      );
-    }
-    stream.finish(failure: failure, cancelled: cancelled);
-  }
-
-  /// 向插件下发取消（流继续等待它收尾，但不再接受已到达的增量之前的数据？
-  /// 不——**取消后到达的增量一律丢弃**，见 [_handleStationStream]）。
-  void _cancelLlmStream(String requestId, String reason) {
-    final _PluginLlmStream? stream = _llmStreams[requestId];
-    if (stream == null || stream.cancelled) return;
-    stream.cancelled = true;
-    _hosts[stream.pluginId]?.cancelStation(
-      requestId: requestId,
-      reason: reason,
-    );
-    _closeLlmStream(requestId, failure: '生成已取消（插件接管流被中断）', cancelled: true);
-  }
-
-  /// **插件 → 核心：`station/stream` 通知**（流式回填的数据面）。
-  ///
-  /// 形态：`{request_id, delta: {kind: text|thinking|tool_call, …}}` 推增量；
-  /// `{request_id, done: true, finish_reason?, usage?}` 收尾；
-  /// `{request_id, error: {message}}` 出错收尾。
-  ///
-  /// 未知 / 已收尾的 `request_id`：丢弃并记可读日志（不报错、不影响该轮生成）。
-  void _handleStationStream(String pluginId, Map<String, dynamic> params) {
-    final String requestId = (params['request_id'] ?? '').toString().trim();
-    if (requestId.isEmpty) {
-      log?.call('插件 $pluginId 的 station/stream 缺少 request_id，已丢弃');
-      return;
-    }
-    final _PluginLlmStream? stream = _llmStreams[requestId];
-    if (stream == null) {
-      if (_closedStreamIds.contains(requestId)) {
-        // 这条流已经收尾（done / error / 取消 / 心跳丢失）：迟到增量只能丢弃。
-        // **当场记日志**——插件以为还在推，核心必须给出反馈，否则是静默数据丢失。
-        log?.call('插件 $pluginId 的 station/stream 迟到（$requestId 已收尾），本条增量已丢弃');
-        return;
-      }
-      // 从没登记过：可能是"回包还没被处理完、插件已经推了第一片"——暂存等重放。
-      _bufferStreamFrame(pluginId, requestId, params);
-      return;
-    }
-    if (stream.pluginId != pluginId) {
-      // 归属校验：只有打开这条流的插件能往里推（点位的唯一订阅者）
-      log?.call('插件 $pluginId 试图写入 $requestId 的流（属于 ${stream.pluginId}），已拒绝');
-      return;
-    }
-    if (stream.cancelled || stream.finished) return; // 取消 / 收尾后到达的增量一律丢弃
-    final Object? rawError = params['error'];
-    if (rawError != null) {
-      final String message = rawError is Map
-          ? (rawError['message'] ?? rawError['type'] ?? '插件流报错').toString()
-          : rawError.toString();
-      _closeLlmStream(requestId, failure: '插件接管流出错：$message');
-      return;
-    }
-    if (params['done'] == true) {
-      final Object? usage = params['usage'];
-      if (usage is Map) {
-        final LlmUsage parsed = OpenAiCodec.decodeUsage(usage);
-        if (!parsed.isEmpty) stream.add(LlmUsageEvent(parsed));
-      }
-      // 逐调用用量账本（`usage.jsonl`）**不在这里写**：这一跳的账由引擎落
-      // （`LlmAgentEngine`），并因为"会话知道这一跳被插件接管"而归到 `source=plugin`
-      // ——插件回包带 usage 就用这份真值、不带就在会话里本地估算（标 `estimated`）。
-      // 总线在这里**唯一**要做的就是上面那行"把 usage 交给流"，别在这里补一次落账
-      // （那会与引擎那份重复记一行）。见 store/usage_log.dart 的 `UsageSource`。
-      final String finish = (params['finish_reason'] ?? '').toString();
-      if (finish.isNotEmpty) stream.add(LlmFinishEvent(finish));
-      _closeLlmStream(requestId);
-      return;
-    }
-    final Object? rawDelta = params['delta'];
-    if (rawDelta == null) {
-      log?.call('插件 $pluginId 的 station/stream 既没有 delta 也没有 done/error，已丢弃');
-      return;
-    }
-    final List<LlmStreamEvent> events = _decodeLlmDelta(rawDelta);
-    if (events.isEmpty) {
-      log?.call('插件 $pluginId 的 station/stream delta 认不出，已丢弃');
-      return;
-    }
-    for (final LlmStreamEvent event in events) {
-      stream.add(event);
-    }
-  }
-
-  /// 解码一条 `delta`（两种写法都认）：
-  /// - **紧凑写法**：`{kind: text|thinking|tool_call, text?, index?, id?, name?, arguments_delta?}`；
-  /// - **OpenAI 分片**：`{choices:[{delta:{…}}]}`（插件直接转发自己拿到的分片）。
-  static List<LlmStreamEvent> _decodeLlmDelta(Object? rawDelta) {
-    if (rawDelta is String) return OpenAiCodec.decodeChunk(rawDelta);
-    if (rawDelta is! Map) return const <LlmStreamEvent>[];
-    final Map<String, dynamic> delta = rawDelta.map(
-      (dynamic k, dynamic v) => MapEntry(k.toString(), v),
-    );
-    if (delta.containsKey('choices')) {
-      return OpenAiCodec.decodeChunk(jsonEncode(delta));
-    }
-    final String kind = (delta['kind'] ?? delta['type'] ?? '').toString();
-    switch (kind) {
-      case 'text':
-        final String text = (delta['text'] ?? delta['content'] ?? '')
-            .toString();
-        return text.isEmpty
-            ? const <LlmStreamEvent>[]
-            : <LlmStreamEvent>[LlmTextDelta(text)];
-      case 'thinking':
-      case 'reasoning':
-        final String text = (delta['text'] ?? delta['reasoning_content'] ?? '')
-            .toString();
-        return text.isEmpty
-            ? const <LlmStreamEvent>[]
-            : <LlmStreamEvent>[LlmThinkingDelta(text)];
-      case 'notice':
-        // 整轮接管专用（`loop.run`）：接管者要能播一条“说给人看”的进度（排队、
-        // 切渠道、重试）。形状复用 `LlmRetryNotice`（会话那一侧本来就把它们翻成
-        // `AgentNotice` + `llm_hidden`）；attempt/total 对整轮无意义 ⇒ 给 1/1。
-        final String noticeText = (delta['text'] ?? delta['message'] ?? '')
-            .toString();
-        return noticeText.isEmpty
-            ? const <LlmStreamEvent>[]
-            : <LlmStreamEvent>[
-                LlmRetryNotice(noticeText, attempt: 1, total: 1),
-              ];
-      case 'tool_call':
-        final Object? index = delta['index'];
-        final String id = (delta['id'] ?? '').toString();
-        final String name = (delta['name'] ?? '').toString();
-        final String args =
-            (delta['arguments_delta'] ?? delta['arguments'] ?? '').toString();
-        if (id.isEmpty && name.isEmpty && args.isEmpty) {
-          return const <LlmStreamEvent>[];
-        }
-        return <LlmStreamEvent>[
-          LlmToolCallDelta(
-            index: index is num ? index.toInt() : 0,
-            id: id.isEmpty ? null : id,
-            name: name.isEmpty ? null : name,
-            argumentsDelta: args,
-          ),
-        ];
-      default:
-        // 认不出 kind 时按"整条 OpenAI 分片 / 非流式响应"再试一次
-        final List<LlmStreamEvent> chunk = OpenAiCodec.decodeMessage(delta);
-        return chunk.isEmpty
-            ? OpenAiCodec.decodeChunk(jsonEncode(delta))
-            : chunk;
-    }
-  }
-
-  /// **中转站点位「投入 LLM 前」**（`system.relay.llm.request`）。
-  ///
-  /// 返回改写后的请求；null = 不改（无订阅者 / 未回填 / 回包重建失败）。**仅在未被
-  /// 「LLM 处理」接管时调用**——不投 LLM 就没有"投入前"可言。
-  Future<LlmRequest?> relayLlmRequest({
-    required LlmRequest request,
-    required String agentId,
-    required String sessionId,
-    required int turn,
-  }) async {
-    load();
-    if (!enabled) return null;
-    final StationScope scope = runtimeScopeFor(
-      agentId: agentId,
-      sessionId: sessionId,
-    );
-    if (!scope.isValid) return null;
-    final RelayStation? station = stations.relayPointFor(
-      StationHubIds.relayLlmRequest,
-    );
-    if (station == null) return null;
-    if (station.subscribers.isEmpty) return null;
-    final Map<String, dynamic> payload = <String, dynamic>{
-      'point': station.id,
-      'agent_id': agentId,
-      'session_id': sessionId,
-      'turn': turn,
-      'request': request.toWire(stream: true),
-    };
-    try {
-      final StationRelayResult relayed = await station.relay(
-        data: payload,
-        scope: scope,
-        meta: <String, dynamic>{'purpose': 'llm.request', 'turn': turn},
-      );
-      if (!relayed.handled || relayed.data == null) return null;
-      final Object? data = relayed.data;
-      // 回填可以是整个报文，也可以是只给 request 字段
-      final Object? rawRequest = data is Map && data.containsKey('request')
-          ? data['request']
-          : data;
-      final LlmRequest? rewritten = LlmRequest.tryFromWire(rawRequest);
-      if (rewritten == null) {
-        log?.call('投入 LLM 前改写点回包无法重建请求（第 $turn 跳）：按原请求放行');
-        return null;
-      }
-      log?.call('投入 LLM 前改写点：插件 ${relayed.pluginId} 改写了第 $turn 跳的请求');
-      return rewritten;
-    } catch (error) {
-      log?.call('投入 LLM 前改写点异常（第 $turn 跳，已放行原请求）：$error');
-      return null;
-    }
-  }
-
-  /// **中转站点位「上下文压缩过程」**（`system.relay.context.compact`）。
-  ///
-  /// **规划也归中转站**（2026-10 定稿）：只要这个点位有订阅者，核心就**不算切点**
-  /// （`buildPlan` 完全不跑），而是把整份原料交出去；插件产出**整份新上下文**并回传
-  /// 它覆盖了多少条原文。没订阅者（或它这轮不接管）才走系统内置 compact。
-  ///
-  /// 返回 null = 插件没接管，回退内置 compact。
-  Future<CompactionRelayReply?> relayCompaction({
-    required CoreAgent agent,
-    required CoreSession session,
-    required String systemPrompt,
-    required int totalMessageCount,
-    required int compactedMessageCount,
-    required String existingSummary,
-    required Map<String, dynamic>? wireRequest,
-  }) async {
-    load();
-    if (!enabled) {
-      _reportCompactionSkip(
-        agent,
-        session,
-        '插件总开关已关闭（plugins.yaml）',
-        hasSubscriber: false,
-      );
-      return null;
-    }
-    final StationScope scope = runtimeScopeFor(
-      agentId: agent.id,
-      sessionId: session.sessionId,
-    );
-    if (!scope.isValid) {
-      _reportCompactionSkip(
-        agent,
-        session,
-        '该会话不在插件的运行范围内（挂载点不匹配）',
-        hasSubscriber: false,
-      );
-      return null;
-    }
-    final RelayStation? station = stations.relayPointFor(
-      StationHubIds.relayContextCompact,
-    );
-    if (station == null) {
-      _reportCompactionSkip(
-        agent,
-        session,
-        '核心未注册「上下文压缩过程」这个中转点位',
-        hasSubscriber: false,
-      );
-      return null;
-    }
-    if (station.subscribers.isEmpty) {
-      _reportCompactionSkip(
-        agent,
-        session,
-        '没有插件订阅该点位（未声明 system.relay.context.compact）',
-        hasSubscriber: false,
-      );
-      return null;
-    }
-    // 这份会话的用量账本：插件读不到数据根（它的 fs.read 只在工作空间作用域内），
-    // 所以由核心把"最近 N 行"捎过去（只作展示/排障；**不参与压缩决策**）。
-    // 未接线 / 读失败 / 异常 ⇒ null ⇒ payload 里干脆不带这两个键（fail-open）。
-    final PluginUsageRecent? recentUsage = await _recentUsageFor(
-      agent.id,
-      session.sessionId,
-    );
-    final Map<String, dynamic> payload = <String, dynamic>{
-      'point': station.id,
-      'agent_id': agent.id,
-      'session_id': session.sessionId,
-      // 系统提示词：放在你的列表**首条 system**（提示词槽位）里；核心每轮会用最新
-      // 的那份覆盖它，所以这里给的是"压缩那一刻的快照"。
-      'system_prompt': systemPrompt,
-      // 原文条数（`covered_message_count` 的合法上界）。
-      // **载荷不给落库全量原文**：那份既大又与真实上下文不同步（冷前缀已被压缩产物
-      // 代表）；你要的原料是下面的 `request.messages`。
-      'total_message_count': totalMessageCount,
-      // 引擎此刻从原文第几条继续（这份新上下文要覆盖到哪，由回包决定）
-      'compacted_message_count': compactedMessageCount,
-      'existing_summary': existingSummary,
-      'compacted': session.compacted,
-      // **预先压缩态的线形请求**（引擎口径）：`{model, messages, tools, …}`，即
-      // "对话这一轮真会发的那份"。它同时是压缩的**唯一原料**与**缓存前缀**：
-      // 整份拿去当 `llm.call` 的 messages（末尾追加一条总结指令）即可命中端点前缀
-      // 缓存；要保留的尾部也从它的 messages 里原样截取。
-      'request': ?wireRequest,
-      // 用量账本（`<会话目录>/usage.jsonl`）：路径只作排障，内容供面板展示
-      // （这一轮花了多少 token / 内置兜底那次花了多少）。可选键，缺了照样工作。
-      if (recentUsage != null) 'usage_file': recentUsage.path,
-      if (recentUsage != null) 'recent_usage': recentUsage.calls,
-    };
-    try {
-      final StationRelayResult relayed = await station.relay(
-        data: payload,
-        scope: scope,
-        meta: <String, dynamic>{'purpose': 'context.compact'},
-      );
-      if (!relayed.handled || relayed.data == null) {
-        _reportCompactionSkip(
-          agent,
-          session,
-          '插件没有回包（未接管这次压缩）',
-          hasSubscriber: true,
-        );
-        return null;
-      }
-      final Object? data = relayed.data;
-      // 回包 `payload: null` = **不改动**：站点会把**原请求数据**原样放行
-      // （见 StationInstance.relay 的 None 分支）。这里必须用同一性判掉它——
-      // 不判就有可能把"插件没接管"误读成"插件回了一份新上下文"。
-      if (identical(data, payload)) {
-        // **原因优先用插件自己报的**（回包可选键 `reason`，纯增量）：只写"回 null"
-        // 会把最难查的那类故障（插件白跑一次、核心悄悄兜底）变成事后黑洞——
-        // 现场那次 734k prompt 的总结调用因正文非法 JSON 被弃，日志与会话提示
-        // 都只剩"回 null"（见 docs/known-issues.md #31）。
-        final String why = relayed.reason.trim();
-        log?.call(
-          '压缩中转：插件未接管（回 null），回退内置 compact'
-          '${why.isEmpty ? '' : '；原因：$why'}',
-        );
-        _reportCompactionSkip(
-          agent,
-          session,
-          why.isEmpty
-              ? '插件回 null（原数据放行 = 不改动，未接管）'
-              : '插件回 null（原数据放行 = 不改动）：$why',
-          hasSubscriber: true,
-        );
-        return null;
-      }
-      if (data is! Map) {
-        log?.call(
-          '压缩中转回包不是对象（回 ${data.runtimeType}）：按未接管处理，回退内置 compact。'
-          '回包形状应为 {"messages": [...], "covered_message_count": N}',
-        );
-        _reportCompactionSkip(
-          agent,
-          session,
-          '插件回包不是对象（回 ${data.runtimeType}），无法当上下文用',
-          hasSubscriber: true,
-        );
-        return null;
-      }
-      final Object? rawMessages = data['messages'];
-      if (rawMessages is! List || rawMessages.isEmpty) {
-        log?.call('压缩中转回包的 messages 不是非空数组：按未接管处理，回退内置 compact');
-        _reportCompactionSkip(
-          agent,
-          session,
-          '插件回包的 messages 不是非空数组',
-          hasSubscriber: true,
-        );
-        return null;
-      }
-      final List<Map<String, dynamic>> context = <Map<String, dynamic>>[];
-      for (int i = 0; i < rawMessages.length; i++) {
-        final Object? item = rawMessages[i];
-        if (LlmMessage.tryFromWire(item) == null) {
-          log?.call(
-            '压缩中转回包第 $i 条消息无法还原成 LLM 消息（角色/字段不合法）：'
-            '整包按未接管处理，回退内置 compact',
-          );
-          _reportCompactionSkip(
-            agent,
-            session,
-            '插件回包第 $i 条消息角色/字段不合法（无法还原成 LLM 消息）',
-            hasSubscriber: true,
-          );
-          return null;
-        }
-        context.add(
-          (item as Map).map(
-            (dynamic k, dynamic v) =>
-                MapEntry<String, dynamic>(k.toString(), v),
-          ),
-        );
-      }
-      final Object? rawCovered = data['covered_message_count'];
-      final int? covered = rawCovered is num ? rawCovered.toInt() : null;
-      if (covered == null || covered < 0 || covered > totalMessageCount) {
-        // 水位线是"下一轮从哪继续"的唯一依据：缺失/越界一律回退，绝不猜一个值
-        log?.call(
-          '压缩中转回包的 covered_message_count=${rawCovered ?? '缺失'} 非法'
-          '（合法区间 0..$totalMessageCount）：按未接管处理，回退内置 compact',
-        );
-        _reportCompactionSkip(
-          agent,
-          session,
-          '插件回包的 covered_message_count=${rawCovered ?? '缺失'} 非法'
-          '（须在 0..$totalMessageCount 内）',
-          hasSubscriber: true,
-        );
-        return null;
-      }
-      log?.call(
-        '压缩中转：插件 ${relayed.pluginId} 接管了这次压缩'
-        '（回 ${context.length} 条上下文，覆盖 $covered 条原文）',
-      );
-      return CompactionRelayReply(
-        messages: context,
-        coveredMessageCount: covered,
-      );
-    } catch (error) {
-      log?.call('压缩中转异常（回退内置 compact）：$error');
-      _reportCompactionSkip(
-        agent,
-        session,
-        '压缩中转点异常（插件侧报错）：$error',
-        hasSubscriber: true,
-      );
-      return null;
-    }
-  }
-
-  /// 上报"压缩中转点为什么没接管"（每处"不接管"分支各一次，文案与同处的 `log` 同源）。
-  ///
-  /// 出口是 [compactionSkipSink]（接线方接到 `CompactionService.noteRelaySkip`）；
-  /// [hasSubscriber] 见字段说明（决定该不该写进会话历史）。
-  /// 未接线时它什么都不做——**不改任何行为**（fail-open 与接线前逐字一致）。
-  void _reportCompactionSkip(
-    CoreAgent agent,
-    CoreSession session,
-    String reason, {
-    required bool hasSubscriber,
-  }) {
-    compactionSkipSink?.call(
-      agent.id,
-      session.sessionId,
-      reason,
-      hasSubscriber: hasSubscriber,
-    );
-    // 阶段 6：把这句原因投给 `compact.skip.reason`（让插件写得更准）。
-    // **早退不投**（hasSubscriber=false 时根本没插件在路上）；fire-and-forget，
-    // 不卡压缩本身（内置那句已经落账了）。
-    relayCompactSkipReason(
-      agentId: agent.id,
-      sessionId: session.sessionId,
-      reason: reason,
-      hasSubscriber: hasSubscriber,
-    );
-  }
-
-  /// 取该会话的**最近用量行**（[usageRecentProvider] 的包装）。
-  ///
-  /// 三条口径，缺一不可：
-  /// - **未接线 ⇒ null**（payload 里不带 `recent_usage`，"没有这条通路"与"没有用量"
-  ///   是两件事，插件据此区分"暂不支持"与"确实还没调用过"）；
-  /// - **条数上限** [maxRecentUsageLines]：账本随会话一直长，压缩载荷必须是有界的
-  ///   （取**最后** N 行 = 最近的那些）；
-  /// - **异常/读失败 ⇒ null + 一句日志**：用量是遥测，绝不影响这次压缩（fail-open）。
-  Future<PluginUsageRecent?> _recentUsageFor(
-    String agentId,
-    String sessionId,
-  ) async {
-    final PluginUsageRecentProvider? provider = usageRecentProvider;
-    if (provider == null) return null;
-    try {
-      final PluginUsageRecent? recent = await provider(agentId, sessionId);
-      if (recent == null) return null;
-      final List<Map<String, dynamic>> calls = recent.calls;
-      if (calls.length <= maxRecentUsageLines) return recent;
-      return PluginUsageRecent(
-        path: recent.path,
-        calls: calls.sublist(calls.length - maxRecentUsageLines),
-      );
-    } catch (error) {
-      log?.call('读取最近用量行失败（本次压缩照常，只是不带用量）：$error');
-      return null;
-    }
-  }
-
-  /// **中转站点位「系统提示词构造过程」**（`system.relay.prompt.system`）。
-  ///
-  /// 返回最终 system prompt；null = 不改（用内置构造结果）。空串 = 明确要求不带
-  /// 系统提示词（与"不改"区分开，见 `LlmAgentEngine._relayedSystemPrompt`）。
-  Future<String?> relaySystemPrompt({
-    required AgentRunContext context,
-    required String defaultPrompt,
-  }) async {
-    load();
-    if (!enabled) return null;
-    final StationScope scope = runtimeScopeFor(
-      agentId: context.agentId,
-      sessionId: context.sessionId,
-    );
-    if (!scope.isValid) return null;
-    final RelayStation? station = stations.relayPointFor(
-      StationHubIds.relayPromptSystem,
-    );
-    if (station == null) return null;
-    if (station.subscribers.isEmpty) return null;
-    final Map<String, dynamic> payload = <String, dynamic>{
-      'point': station.id,
-      'agent_id': context.agentId,
-      'session_id': context.sessionId,
-      'default': defaultPrompt,
-    };
-    try {
-      final StationRelayResult relayed = await station.relay(
-        data: payload,
-        scope: scope,
-        meta: <String, dynamic>{'purpose': 'prompt.system'},
-      );
-      if (!relayed.handled || relayed.data == null) return null;
-      final Object? data = relayed.data;
-      final Object? rawPrompt = data is Map
-          ? (data['system_prompt'] ?? data['prompt'] ?? data['text'])
-          : data;
-      if (rawPrompt == null) return null;
-      log?.call('系统提示词中转：插件 ${relayed.pluginId} 改写了本轮系统提示词');
-      return rawPrompt.toString();
-    } catch (error) {
-      log?.call('系统提示词中转异常（已用内置构造结果）：$error');
-      return null;
-    }
   }
 
   /// **中转站点位「SSH 执行」**（`system.relay.ssh.execute`，2026-10-15 新增）。
@@ -6339,6 +5019,19 @@ class PluginBus {
   /// 执行站的结论（含**可读错误**）原样放进 result 回给插件：命令被拒 / 挂载位置
   /// 失败不是 JSON-RPC 错误，而是 {ok: false, error: ...}——插件据此自查原因，
   /// 不会被吞成一句“调用失败”。
+  /// 执行站命令参数的**边界清洗**：租约是 root 的唯一来源。
+  ///
+  /// 调用方（任何插件）自带的 root / workspace_root 一律丢弃；需要根的命令
+  /// 没有租约时由执行器显式失败，不能借无租约命令把执行器指到任意目录。
+  static Map<String, dynamic> sanitizeStationArguments(Object? raw) {
+    final Map<String, dynamic> arguments = raw is Map
+        ? raw.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
+        : <String, dynamic>{};
+    arguments.remove('root');
+    arguments.remove('workspace_root');
+    return arguments;
+  }
+
   Future<Map<String, dynamic>> _handleStationCommand(
     PluginConfig config,
     Map<String, dynamic> params,
@@ -6357,9 +5050,8 @@ class PluginBus {
         'station/command 的 arguments 必须是 JSON 对象',
       );
     }
-    final Map<String, dynamic> arguments = rawArguments is Map
-        ? rawArguments.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
-        : <String, dynamic>{};
+    final Map<String, dynamic> arguments =
+        sanitizeStationArguments(rawArguments);
     // scope = 这一次命令的**运行期四元组**（Q2：单实例 + 每条消息带身份）。
     // 声明只作上限；team / mode 由核心按目标 agent 的真实归属解析。
     final StationScope declared = StationScope.parse(config.scope);
@@ -6541,9 +5233,17 @@ class PluginBus {
       agentId,
       sessionId,
     );
-    final String resolvedTeam = (context?.teamId ?? '').trim().isNotEmpty
-        ? context!.teamId.trim()
-        : declared.teamId.trim();
+    // A5 后核心不再持有 agent/team 领域数据，生产不接线 callSiteContext：
+    // 此时团队归属由拥有该领域的插件自报，核心只校验“不得放大插件声明”。
+    // 测试/嵌入式宿主仍可注入 callSiteContext 做真实归属校验。
+    final String contextTeam = (context?.teamId ?? '').trim();
+    final String resolvedTeam = contextTeam.isNotEmpty
+        ? contextTeam
+        : (callSiteContext == null
+              ? (requestedTeam.isNotEmpty
+                    ? requestedTeam
+                    : declared.teamId.trim())
+              : declared.teamId.trim());
     final String resolvedMode = (agentModeKeyResolver?.call(agentId) ?? '')
         .trim();
     // 命令的 mode 必须**有合法值**（它决定打本地还是 SSH 工作空间，见
@@ -7047,6 +5747,7 @@ class PluginBus {
         },
         if (uiHost != null) ...<String, dynamic>{
           'process_alive': uiAlive,
+          'windows': _liveUiWindowsOf(config.id).length,
           'ui_hello_seen': _uiHelloSeen.contains(config.id),
           'pid': uiHost.pid,
           'degraded_reason': uiDegradedReason ?? '',
@@ -7087,6 +5788,7 @@ class PluginBus {
     for (final String pluginId in <String>{
       ..._hosts.keys,
       ..._uiHosts.keys,
+      ..._uiWindows.keys,
     }) {
       final PluginConfig? pluginConfig = config(pluginId);
       await _disconnect(pluginId);
@@ -7168,10 +5870,18 @@ class PluginBus {
     // 否则 100 优先级的挂载会永久压住核心实现，卸载即坏。
     _releasePluginExecutors(pluginId);
     // 片 D：UI 宿主与 stdio 宿主是两张表。断开时两边都收：哪怕配置刚改成 ui
-    // （或反过来），也不会留下一个没人管的进程。
+    // （或反过来），也不会留下一个没人管的进程。**多窗口**：整批收，漏一个就是孤儿。
+    final Map<String, UiHost> uiWindows =
+        _uiWindows.remove(pluginId) ?? const <String, UiHost>{};
     final UiHost? uiHost = _uiHosts.remove(pluginId);
-    _uiHelloWindows.remove(pluginId)?.cancel();
+    for (final String key in _uiHelloWindows.keys.toList()) {
+      if (!key.startsWith('$pluginId#')) continue;
+      _uiHelloWindows.remove(key)?.cancel();
+    }
     _uiHelloSeen.remove(pluginId);
+    _uiHelloWindowSeen.removeWhere(
+      (String key) => key.startsWith('$pluginId#'),
+    );
     _uiDegraded.remove(pluginId);
     // 实例没了 ⇒ "上次按什么参数起来的"这条记录也失效（重启会重新记）
     _spawnedConfigs.remove(pluginId);
@@ -7189,11 +5899,6 @@ class PluginBus {
       _stationKept.remove(pluginId);
       stations.unsubscribePlugin(pluginId);
     }
-    // 插件下线 ⇒ 它打开着的 LLM 接管流**必须以失败收尾**：否则会话会一直等一条
-    // 永远不会有数据的流（判活定时器也会在一拍内发现并收尾，这里只是更快更明确）
-    _failLlmStreamsOf(pluginId, '插件已下线，LLM 接管流中断');
-    // 它"早到但从未关联上流"的帧也一并清掉（否则会留到下次同 id 的流被误放行）
-    _dropPendingStreamFrames(pluginId: pluginId);
     // 动态工具表：下线插件的定义一并移除（避免调用到不存在的插件）
     _definitions.removePlugin(pluginId);
     // 片 C：**已从配置里删除**的插件按 plugin_id 销账委派路由（归于 404）。
@@ -7204,16 +5909,20 @@ class PluginBus {
     }
     // 插件下线 = 工具表失效点（模型工具表必须随之变化）
     invalidateToolTable(reason: '插件 $pluginId 下线');
-    if (uiHost != null) {
+    final Set<UiHost> uiTargets = <UiHost>{
+      ...uiWindows.values,
+      ?uiHost,
+    };
+    for (final UiHost window in uiTargets) {
       try {
         // UI 插件没有 stdio shutdown：只能发信号。awaitExit 只给“要看到退出码”的场景。
-        await uiHost.close(waitForExit: awaitExit);
+        await window.close(waitForExit: awaitExit);
       } catch (error) {
-        log?.call('关闭 UI 插件 $pluginId 失败：$error');
+        log?.call('关闭 UI 插件 $pluginId 的窗口 ${window.windowId} 失败：$error');
       }
     }
     if (host == null) {
-      if (uiHost != null &&
+      if (uiTargets.isNotEmpty &&
           lifecycleOf(pluginId) != PluginLifecycleState.restarting) {
         _setLifecycle(pluginId, PluginLifecycleState.stopped);
       }
@@ -7241,17 +5950,6 @@ class PluginBus {
 
   static int _nowSeconds() => DateTime.now().millisecondsSinceEpoch ~/ 1000;
 
-  /// 让某插件打开着的全部 LLM 接管流以失败收尾（下线 / 重启时调用）。
-  void _failLlmStreamsOf(String pluginId, String reason) {
-    final List<String> owned = <String>[
-      for (final MapEntry<String, _PluginLlmStream> entry
-          in _llmStreams.entries)
-        if (entry.value.pluginId == pluginId) entry.key,
-    ];
-    for (final String requestId in owned) {
-      _closeLlmStream(requestId, failure: reason);
-    }
-  }
 }
 
 /// **`api/delegate` 的可读失败**（片 C）：HTTP 层据此映射 503 / 504 / 502。
@@ -7271,135 +5969,6 @@ class PluginDelegateException implements Exception {
   String toString() => reason;
 }
 
-/// 一条**比流登记更早到达**的 `station/stream` 通知（暂存待重放）。
-/// 带 [pluginId] 是为了重放时**照走归属校验**：别人冒名推的帧不会因为"早到"而被放行。
-class _PendingStreamFrame {
-  const _PendingStreamFrame({required this.pluginId, required this.params});
-
-  final String pluginId;
-  final Map<String, dynamic> params;
-}
-
-/// 一条**插件接管的 LLM 流**（`system.relay.llm.handle` 的流式回填状态）。
-///
-/// 生命周期由 [PluginBus] 持有（`_llmStreams`）：打开 → 若干 `station/stream` 增量
-/// → `done` / `error` / 取消 / 心跳丢失 收尾。**每个 request_id 只允许一条**。
-class _PluginLlmStream {
-  _PluginLlmStream({
-    required this.requestId,
-    required this.pluginId,
-    required this.station,
-    required this.controller,
-  });
-
-  final String requestId;
-  final String pluginId;
-  final RelayStation station;
-  final StreamController<LlmStreamEvent> controller;
-
-  /// 收尾守护定时器（取消信号 + 订阅者心跳判活）。
-  Timer? timer;
-
-  /// 是否已被取消（取消后到达的增量一律丢弃，见 `_handleStationStream`）。
-  bool cancelled = false;
-
-  /// 是否已收尾（幂等标记）。
-  bool finished = false;
-
-  void add(LlmStreamEvent event) {
-    if (finished || controller.isClosed) return;
-    controller.add(event);
-  }
-
-  /// 收尾（幂等）：[failure] 非空时先吐一条失败事件再关闭。
-  void finish({String failure = '', bool cancelled = false}) {
-    if (finished) return;
-    finished = true;
-    if (cancelled) this.cancelled = true;
-    timer?.cancel();
-    if (controller.isClosed) return;
-    if (failure.isNotEmpty) {
-      controller.add(LlmFailureEvent(failure, cancelled: cancelled));
-    }
-    controller.close();
-  }
-
-  /// 直接作废（同一 request_id 被新流顶掉时用）。
-  void fail(String reason) => finish(failure: reason);
-}
-
-/// 一条被插件接管的**整轮**（`system.relay.loop.run`，阶段 8）。
-///
-/// 底下那条流（[_PluginLlmStream]）负责“插件说了什么”，这一层只负责两件事：
-/// ① 把它们翻成**会话认的那套事件**（AgentText / AgentThinking / AgentNotice /
-///   AgentUsage / AgentToolStart / AgentToolEnd）；② **收尾只发一次**——不管这条流
-/// 是从接管者的 `done` 帧、从用户取消、还是从心跳丢失关的，`AgentDone` 只能有一条
-/// （两条会让会话以为这一轮既正常结束又被取消）。
-class _PluginRunPipe {
-  _PluginRunPipe({
-    required this.runId,
-    required this.pluginId,
-    required this.agentId,
-    required this.sessionId,
-    required this.model,
-    required this.maxContextTokens,
-    required this.controller,
-  });
-
-  /// 这条 run 的 station request_id（也是工具调用回带的 `run_id`）。
-  final String runId;
-  final String pluginId;
-  final String agentId;
-  final String sessionId;
-  final String model;
-
-  /// 模型上下文上限（由引擎递进来）：只用来把接管者的 usage 补成内置那张表的形状。
-  final int maxContextTokens;
-
-  final StreamController<AgentEvent> controller;
-
-  /// 底下那条插件流的订阅（收尾时取消，不留挂着的订阅）。
-  StreamSubscription<LlmStreamEvent>? sub;
-
-  /// 接管者给的 `finish_reason`（没有就留空）。
-  String finishReason = '';
-
-  /// 是不是以取消收尾（用户停止 / 核心放弃这条流）。
-  bool cancelled = false;
-
-  /// 失败原因（非空 ⇒ 收尾前先播一条 `AgentError`）。
-  String? failure;
-
-  /// 是否已收尾（幂等标记）。
-  bool finished = false;
-
-  /// 开了头还没收尾的工具卡片（键 = call_id，空键 = 没给 call_id 的那一条）。
-  final Map<String, String> openToolIds = <String, String>{};
-
-  void add(AgentEvent event) {
-    if (finished || controller.isClosed) return;
-    controller.add(event);
-  }
-
-  /// 收尾（幂等）：失败先播一条 `AgentError`，再播**唯一那一条** `AgentDone`。
-  ///
-  /// 取消的形状与内置一致：内置的取消只发 `AgentDone(cancelled: true)`、**不发**
-  /// 错误（“被用户停下”不是“出错”），这里照同一个形状。
-  void finish() {
-    if (finished) return;
-    finished = true;
-    final StreamSubscription<LlmStreamEvent>? s = sub;
-    sub = null;
-    if (s != null) unawaited(s.cancel());
-    if (controller.isClosed) return;
-    final String? why = failure;
-    if (!cancelled && why != null && why.isNotEmpty) {
-      controller.add(AgentError(why));
-    }
-    controller.add(AgentDone(cancelled: cancelled, finishReason: finishReason));
-    controller.close();
-  }
-}
 
 /// `plugin.*` 六条命令的**对外面**（20261015-hot-restart 阶段 1，D9/D2）。
 ///
@@ -7439,25 +6008,6 @@ abstract final class PluginToolSurface {
   /// （`_pluginCommand` 那里已经钉住了“只能是自己的键”）。
   static const Set<String> auditedCommands = agentToolCommands;
 }
-
-/// 接管者报的 usage 翻成与内置**同一形状**的那张表（`loop.run`，阶段 8）。
-///
-/// 三条口径照内置，写成公开函数是为了能被直接钉住（这张表一路走进前端进度条与
-/// 逐调用账本，形状漂了看不出来）：
-/// - `total_tokens`：**端点给了真值就用真值**，没给才用 prompt + completion；
-/// - `cached_tokens` 为 0 ⇒ **不写键**（端点没给这个字段就绝不编造 0）；
-/// - `max_tokens` 由引擎递进来（它才是认识模型配置的那一侧），拿不到就不写——
-///   进度条宁可少一段，也不能拿一个假的上限算百分比。
-Map<String, dynamic> loopRunUsageMap(LlmUsage usage, int maxTokens) =>
-    <String, dynamic>{
-      'prompt_tokens': usage.promptTokens,
-      'completion_tokens': usage.completionTokens,
-      'total_tokens': usage.totalTokens > 0
-          ? usage.totalTokens
-          : usage.promptTokens + usage.completionTokens,
-      if (usage.cachedTokens > 0) 'cached_tokens': usage.cachedTokens,
-      if (maxTokens > 0) 'max_tokens': maxTokens,
-    };
 
 /// 一次**热重启**的结论（每条都带可读结果，不“看起来成功了”）。
 ///

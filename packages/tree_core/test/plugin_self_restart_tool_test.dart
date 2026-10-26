@@ -141,9 +141,7 @@ void main() {
       heartbeatInterval: const Duration(seconds: 30),
       log: (String message) => logs.add(message),
     );
-    final ExecuteStationMounts mounts = ExecuteStationMounts.forStore(
-      store: MemoryStore(),
-      ioFor: (String agentId) async => null,
+    final ExecuteStationMounts mounts = ExecuteStationMounts(
       pluginManager: bus.handlePluginCommand,
     );
     expect(bus.mountExecuteStations(mounts), isNull, reason: '挂载必须全成功');

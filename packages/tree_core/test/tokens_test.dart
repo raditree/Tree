@@ -33,19 +33,5 @@ void main() {
       expect(estimateTokens('x' * 1000, scale: 0), 500);
       expect(estimateTokens('x' * 1000, scale: -1), 500);
     });
-
-    test('消息与请求的估算共用同一比例', () {
-      final LlmMessage message = LlmMessage.user('x' * 1000);
-      expect(message.estimatedTokens(), 500);
-      expect(message.estimatedTokens(scale: 4), 250);
-      expect(message.charCount, 1000);
-      final LlmRequest request = LlmRequest(
-        model: 'demo',
-        messages: <LlmMessage>[message],
-      );
-      expect(request.estimatedPromptTokens(), 500);
-      expect(request.estimatedPromptTokens(scale: 4), 250);
-      expect(request.contextChars(), 1000);
-    });
   });
 }

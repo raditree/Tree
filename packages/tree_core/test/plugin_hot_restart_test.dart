@@ -21,7 +21,6 @@ import 'package:test/test.dart';
 import 'package:tree_core/src/plugin/plugin_lifecycle.dart';
 import 'package:tree_core/src/plugin/plugin_state_pool.dart';
 import 'package:tree_core/tree_core.dart';
-import 'package:tree_local_exec/tree_local_exec.dart';
 
 void main() {
   late Directory temp;
@@ -70,11 +69,7 @@ void main() {
     server = await CoreServer.start(
       store: store,
       pluginBus: bus,
-      specIoFor: (String agentId) async =>
-          agentId == agent.id ? LocalWorkspaceIO(workspace) : null,
       enableHeartbeat: false,
-      streamChunkDelay: Duration.zero,
-      engine: ScriptedAgent(chunkDelay: Duration.zero),
     );
   });
 

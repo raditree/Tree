@@ -47,7 +47,7 @@
    升级成**核心日志 + `relay_skip_reason` + 会话提示**；不带该键的老插件行为**逐字不变**。
    同理，**命令类失败若带着产出**（`llm.call` 解析不出 JSON 时的模型正文）要用
    `StationCommandOutcome.failedWith(error, payload)` 回，别只回一句 `error`——那等于把插件已付费的
-   那次调用彻底丢掉（现场是 734k prompt 的总结，见 [../llm/README.md](../llm/README.md) 不变量 14）。
+   那次调用彻底丢掉（现场是 734k prompt 的总结，见 ../llm/README.md 不变量 14）。
    **而且这份 `payload` 必须"穿到底"**：`StationInstance.execute()` 的 `ok:false` 分支也要把
    `outcome.payload` 放进 `StationCommandResult`（**曾经就漏在这一跳**：核心明明把原文放进了回包，
    插件收到的 `payload` 却是 null、报"原文 0 字"当场弃权，那笔 448k prompt 的总结又整包白扔；
@@ -56,7 +56,7 @@
    （`test/plugin_execute_new_commands_test.dart` 钉这一跳，`test/compact_plugin_e2e_test.dart` 钉真进程那一跳）。
 6. 中转站是 `scopeKeyUnique` **先到先得**：同键位第二人被拒（显式 `replace` 才替换并回报被替换者）——一个接入点只能有一个处理者。这也是点位各自成实例的原因：否则"接管 LLM"的插件会顺带垄断"系统提示词构造""上下文压缩"。
 7. **收集站**：schema **必填**（订阅者必须按它产出，校验失败按可读错误回报该订阅者）；**不回填**原数据流（返回值即结果，后续处理由触发方负责）；某订阅者未响应（心跳丢失 / 窗口内无回 / 校验失败 / 回包报错）⇒ 返回**已收集部分 + 显式列出未响应者**，不静默、不阻塞、不整体失败。
-8. **无静态总时间上限**（M9 §1.1）：看门狗每拍 `ping`，连续 N 拍没有心跳 ⇒ 只标记 `health: degraded` 并让前端可见，**不自动终止插件**（长任务跑多久都不因时间被杀）；心跳恢复自动清除；用户可显式 `restart`。唯一保留的短窗口是**建连握手**——没有它就诊断不出"插件根本没起来"。**站请求 / `tools/call` 同样没有静态超时**（`plugin_host.requestStation` 明写这条）；未响应只记"未响应者清单"。**软窗口之后只允许显式收手**（用户 `restart` / 关闭那一次运行）——全仓同一条口径见 [../llm/README.md](../llm/README.md) 不变量 2。
+8. **无静态总时间上限**（M9 §1.1）：看门狗每拍 `ping`，连续 N 拍没有心跳 ⇒ 只标记 `health: degraded` 并让前端可见，**不自动终止插件**（长任务跑多久都不因时间被杀）；心跳恢复自动清除；用户可显式 `restart`。唯一保留的短窗口是**建连握手**——没有它就诊断不出"插件根本没起来"。**站请求 / `tools/call` 同样没有静态超时**（`plugin_host.requestStation` 明写这条）；未响应只记"未响应者清单"。**软窗口之后只允许显式收手**（用户 `restart` / 关闭那一次运行）——全仓同一条口径见 ../llm/README.md 不变量 2。
 9. **插件与 agent 同权**：本仓库**没有工具审批层**，`tool.call` 走工具层唯一入口，与模型调用工具是同一条路径、同一份权限。这是设计事实，文档如实写出来，而不是假装有沙箱。
 10. **写回配置必须保留未知键**：直接在原始 Map 上改 + 原子写，不经 `PluginConfig.fromJson` 中转（它会丢未知键，改一个开关会把文件改瘦成核心认识的形状）。id 白名单 `[A-Za-z0-9_.-]`（防止 id 被当成路径分段用）；校验失败一律返回**可读中文原因**，不抛异常。
 11. **UI 插件是纯消费者（片 E）**：`plugin_id` 一律取 `ui.hello` 里与 `plugins.yaml` 对账后的身份，不采信通知里的自述；WS 侧只允许**订阅广播站**，中转 / 执行 / 收集站与自建非广播站一律可读拒绝。旧槽位 / 受限控件集协议已随片 E 退役，UI 面板由插件自己的 UI 进程负责。
@@ -223,7 +223,7 @@
       `restarting`/`suspended`/`booting` ⇒ 暂存；`callTool` 在窗口里**等事件而不是等时长**。
       配置驱动的换一世（`applyConfigs` 看到 args/scope 变了）与 `hotRestart`/`restart`
       算**同一个窗口**：一个命题不能一套保活一套不保活。
-    用例：[test/plugin_restart_keepalive_test.dart](../../../test/plugin_restart_keepalive_test.dart)（7）、
+    用例：test/plugin_restart_keepalive_test.dart（7）、
     [test/plugin_restart_buffer_bounded_test.dart](../../../test/plugin_restart_buffer_bounded_test.dart)（9）、
     [test/plugin_state_broadcast_test.dart](../../../test/plugin_state_broadcast_test.dart)（6）、
     [test/plugin_status_compat_test.dart](../../../test/plugin_status_compat_test.dart)（6）。
@@ -257,7 +257,7 @@
       而「工具名与插件自报 id 同串」由真子进程用例钉。
     - **随包自检给的是退出码**：`tree_self_updater --selftest`（输出走 stderr，
       「stdout 只有协议帧」这条规则不因模式而变）。「面板没报错」证明不了工具真能申报进表。
-    用例：[test/plugin_tool_define_self_updater_test.dart](../../../test/plugin_tool_define_self_updater_test.dart)（6）、
+    用例：test/plugin_tool_define_self_updater_test.dart（6）、
     [test/plugin_self_restart_tool_test.dart](../../../test/plugin_self_restart_tool_test.dart)（6）、
     [test/plugin_hot_restart_station_test.dart](../../../test/plugin_hot_restart_station_test.dart)（13）；
     插件自身：[self_updater 的用例](https://github.com/raditree/tree-plugins/blob/master/self_updater/test/self_updater_loop_test.dart)（16，

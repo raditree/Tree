@@ -58,7 +58,8 @@ class StationWsBridge {
   /// 片 D：UI 插件成功完成 `ui.hello` 后通知总线（用于 30s 连接窗口判活）。
   ///
   /// 桥只负责“身份通过”这一事实，不关心宿主怎么记状态。
-  final void Function(String pluginId)? onUiHello;
+  /// [windowId] 来自 `ui.hello.window_id`（空串 = 老版本 UI / 单窗口口径）。
+  final void Function(String pluginId, String windowId)? onUiHello;
 
   /// 片 E：`ui.hello` 里可选携带的品牌申报（`{icon, role, sizes}`）。
   ///
@@ -251,6 +252,7 @@ class StationWsBridge {
     final Map<String, dynamic> data = _data(frame);
     final String pluginId = (data['plugin_id'] ?? '').toString().trim();
     final String version = (data['version'] ?? '').toString().trim();
+    final String windowId = (data['window_id'] ?? '').toString().trim();
     final List<Object?> capabilities = _capabilities(data['capabilities']);
     if (pluginId.isEmpty) {
       _rejectAndClose(connection, 'ui.hello 缺少 plugin_id，连接已关闭');
@@ -287,9 +289,17 @@ class StationWsBridge {
       );
       return;
     }
-    state.bond = _UiBond(pluginId, version, capabilities);
-    log?.call('UI 连接 ${connection.id} 已绑定插件 $pluginId（$version）');
-    onUiHello?.call(pluginId);
+    state.bond = _UiBond(
+      pluginId,
+      version,
+      capabilities,
+      windowId: windowId,
+    );
+    log?.call(
+      'UI 连接 ${connection.id} 已绑定插件 $pluginId'
+      '${windowId.isEmpty ? '' : '（窗口 $windowId）'}（$version）',
+    );
+    onUiHello?.call(pluginId, windowId);
     // 品牌申报随 hello 到达：没带 branding 键 = 该插件撤回申报（回退上一条 / 默认）。
     onUiBranding?.call(pluginId, data['branding']);
   }
@@ -372,10 +382,14 @@ class StationWsBridge {
       () => <WsStationSubscriberChannel>{},
     ).add(channel);
     if (old != null) {
-      // 重逢同一订阅（窗口主动重订 / 重连后的同键订阅）：seq 从 1 重新开始，
-      // 先发 reset 让 UI 清空本地水位。
-      channel.emitReset();
+      // 重逢同一订阅（窗口主动重订 / 重连后的同键订阅）：旧通道已换新，seq 从 1 重新开始。
+      log?.call('UI 复用订阅 ${station.id}（channel=${channel.channelId}），seq 重新计数');
     }
+    // **每条新通道都要发 reset**：seq 是「每个 WS 通道」的计数器，新通道天生从 1 开始。
+    // 只在 `old != null` 时发会让「断线重连」这条最常见的路径漏掉 reset——
+    // UI 还留着断线前的水位（例如 42），重连后收到 1..42 会被当作重复帧丢掉
+    // （E2E-04「生成中重连」的丢帧根因）。首次订阅收到 reset 无副作用（本来就空）。
+    channel.emitReset();
   }
 
   void _handleUnsubscribe(WsConnection connection, Map<String, dynamic> frame) {
@@ -801,9 +815,18 @@ class _UiConnectionState {
 
 /// `ui.hello` 自报的身份。
 class _UiBond {
-  const _UiBond(this.pluginId, this.version, this.capabilities);
+  const _UiBond(
+    this.pluginId,
+    this.version,
+    this.capabilities, {
+    this.windowId = '',
+  });
 
   final String pluginId;
   final String version;
   final List<Object?> capabilities;
+
+  /// 窗口 id（多窗口时由核心经 `TREE_UI_WINDOW_ID` 注入，UI 在 hello 里带回）。
+  /// 空串 = 单窗口口径 / 老版本 UI。
+  final String windowId;
 }

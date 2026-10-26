@@ -34,7 +34,7 @@
    ——到点**不杀进程、不重跑**：本地把仍活着的进程交出去（`LocalExecStillRunning`），
    SSH 交还 `RunningSshExec` 句柄（`SshExecStillRunning`，结束补写输出与退出码、链路失活如实失败）；
    `0` / 负值 = **永不软超时**。**软超时之后只允许显式关闭**（`close()` / 关闭句柄 / 上层 `tool.close`），
-   **没有任何"到点自动杀"**——全仓同一条口径见 [../tree_core/lib/src/llm/README.md](../tree_core/lib/src/llm/README.md) 不变量 2。
+   **没有任何"到点自动杀"**——全仓同一条口径见 ../tree_core/lib/src/llm/README.md 不变量 2。
    （2026-10-03 起 SSH 也兑现；此前 SSH 侧忽略它——现场事故见 [../../docs/known-issues.md](../../docs/known-issues.md)），
    到点**不杀进程、不重跑、不关通道**，把仍在跑的**命令**交出来：本地是 `LocalExecStillRunning`
    + `RunningLocalExec`（输出订阅还活着、进程杀得掉），SSH 是 `SshExecStillRunning` + `RunningSshExec`
@@ -262,7 +262,7 @@ PTY 不可用 ⇒ `PtyUnsupportedException`（不静默降级）、`shell.data`/
 `exitCode` 从台账收尾（`running → exited` / `gone` ⇒ 可辨码）；**断链不失败而是继续等**；
 `attachBackground` 只给日志路径就能对账且**不重跑**；`cancel` 走 `exec.kill`、台账里没有 ⇒ 如实 false；
 没有能力 ⇒ 形状仍是 `setsid nohup … echo $!`）—— 配套的**核心侧**接续用例在
-[../tree_core/test/terminal_hooks_tunnel_test.dart](../tree_core/test/terminal_hooks_tunnel_test.dart)
+../tree_core/test/terminal_hooks_tunnel_test.dart
 （重启 → 认领 → 回 hook 结束提醒 → 不重跑），两条一起才覆盖"跨日稳定"这条链);
 真链路的 SSH 会话通道没有在本仓库验证过（本机无 sshd），只保证编译通过与参数形状有据可依——见
 [../../docs/known-issues.md](../../docs/known-issues.md) #12。

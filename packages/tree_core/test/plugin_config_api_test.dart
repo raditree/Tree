@@ -199,8 +199,6 @@ void main() {
       builtinPlugins: builtins ?? catalog(),
       pluginDownloader: downloader,
       enableHeartbeat: false,
-      streamChunkDelay: Duration.zero,
-      engine: ScriptedAgent(chunkDelay: Duration.zero),
     );
     return (server: server, client: _Client(server), bus: bus);
   }
@@ -222,20 +220,6 @@ void main() {
     (Map<String, dynamic> e) => e['id'] == id,
     orElse: () => <String, dynamic>{},
   );
-
-  test('核心启动即接线 agent 工具调用事件（Q8：轮次上限交给插件）', () async {
-    final ({CoreServer server, _Client client, PluginBus bus}) ctx =
-        await serve('enabled: true\nplugins: []\n');
-    addTearDown(() async {
-      ctx.client.close();
-      await ctx.server.close();
-    });
-    expect(
-      ctx.server.conversation.agentEvents.enabled,
-      isTrue,
-      reason: '未接线的话示例插件收不到 agent.tool_call，也就无法用 agent.stop 兜轮次',
-    );
-  });
 
   test('GET /api/plugin/configs：持久态清单 + 运行态 + 真实路径', () async {
     final ({CoreServer server, _Client client, PluginBus bus}) ctx =
@@ -748,8 +732,6 @@ void main() {
   test('未接入插件总线：插件管理端点 503 + 可读原因（快照仍 200 空集）', () async {
     final CoreServer bare = await CoreServer.start(
       enableHeartbeat: false,
-      streamChunkDelay: Duration.zero,
-      engine: ScriptedAgent(chunkDelay: Duration.zero),
     );
     final _Client client = _Client(bare);
     addTearDown(() async {

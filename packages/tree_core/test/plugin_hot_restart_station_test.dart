@@ -62,9 +62,7 @@ void main() {
       heartbeatInterval: const Duration(seconds: 30),
     );
     // 把 plugin.* 的挂载位置接上（生产由 CoreServer 注入，这里注入的是同一个实现）。
-    final ExecuteStationMounts mounts = ExecuteStationMounts.forStore(
-      store: MemoryStore(),
-      ioFor: (String agentId) async => null,
+    final ExecuteStationMounts mounts = ExecuteStationMounts(
       pluginManager: bus.handlePluginCommand,
     );
     expect(bus.mountExecuteStations(mounts), isNull, reason: '挂载必须全成功');
@@ -309,9 +307,7 @@ void main() {
       heartbeatInterval: const Duration(seconds: 30),
     );
     // 只挂 fs 那一族常用的解析器，**不给** pluginManager
-    final ExecuteStationMounts noManager = ExecuteStationMounts.forStore(
-      store: MemoryStore(),
-      ioFor: (String agentId) async => null,
+    final ExecuteStationMounts noManager = ExecuteStationMounts(
     );
     expect(bare.mountExecuteStations(noManager), isNull);
 
@@ -357,9 +353,7 @@ void main() {
       log: (String message) => logs.add(message),
     );
     addTearDown(audited.close);
-    final ExecuteStationMounts mounts = ExecuteStationMounts.forStore(
-      store: MemoryStore(),
-      ioFor: (String agentId) async => null,
+    final ExecuteStationMounts mounts = ExecuteStationMounts(
       pluginManager: audited.handlePluginCommand,
     );
     expect(audited.mountExecuteStations(mounts), isNull);
@@ -431,9 +425,7 @@ void main() {
       heartbeatInterval: const Duration(seconds: 30),
     );
     addTearDown(reasonOnly.close);
-    final ExecuteStationMounts mounts = ExecuteStationMounts.forStore(
-      store: MemoryStore(),
-      ioFor: (String agentId) async => null,
+    final ExecuteStationMounts mounts = ExecuteStationMounts(
       pluginManager:
           ({
             required String command,

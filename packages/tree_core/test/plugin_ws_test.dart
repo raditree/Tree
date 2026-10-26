@@ -62,8 +62,6 @@ void main() {
     server = await CoreServer.start(
       pluginBus: bus,
       enableHeartbeat: false,
-      streamChunkDelay: Duration.zero,
-      engine: ScriptedAgent(chunkDelay: Duration.zero),
     );
     sink = server.hub.broadcast;
     ws = await TestWs.connect(server);

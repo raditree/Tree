@@ -20,6 +20,7 @@ class UiHost {
     this.config,
     this._process,
     this.coreUrl, {
+    this.windowId = '',
     void Function(String line)? onStdoutLine,
     void Function(String line)? onStderrLine,
   }) {
@@ -60,6 +61,7 @@ class UiHost {
     PluginConfig config, {
     required String coreUrl,
     required String coreToken,
+    String windowId = '',
     void Function(String line)? onStdoutLine,
     void Function(String line)? onStderrLine,
   }) async {
@@ -81,6 +83,9 @@ class UiHost {
           ...config.env,
           'TREE_CORE_URL': coreUrl,
           'TREE_CORE_TOKEN': coreToken,
+          // 窗口身份：同一 UI 插件可以拉起多个窗口，进程靠它区分自己
+          // （窗口级状态键 / ui.hello.window_id）。空串 = 单窗口口径，不注入。
+          if (windowId.isNotEmpty) 'TREE_UI_WINDOW_ID': windowId,
         },
         runInShell: Platform.isWindows && _needsShell(config.command),
       );
@@ -91,6 +96,7 @@ class UiHost {
       config,
       process,
       coreUrl,
+      windowId: windowId,
       onStdoutLine: onStdoutLine,
       onStderrLine: onStderrLine,
     );
@@ -99,6 +105,9 @@ class UiHost {
   final PluginConfig config;
   final Process _process;
   final String coreUrl;
+
+  /// 窗口 id（`w1` / `w2`…）；空串 = 老口径（未分配窗口身份）。
+  final String windowId;
 
   final _BoundedLog _stdout = _BoundedLog();
   final _BoundedLog _stderr = _BoundedLog();

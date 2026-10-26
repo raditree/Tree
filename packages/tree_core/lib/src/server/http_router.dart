@@ -208,7 +208,14 @@ class DelegatedRouter {
 
   /// `/api/meta.routes` 数据源：只返回**唯一归属**的路由（冲突条目不出现）。
   List<ApiMetaRoute> metaRoutes() {
-    final List<DelegatedRouteDeclaration> routes = _owners.values.toList()
+    // 双跑期：核心仍在实现的路由不算插件归属——/api/meta 只能报告真的已交接项。
+    final List<DelegatedRouteDeclaration> routes = _owners.values
+        .where(
+          (DelegatedRouteDeclaration route) => !_coreRouteKeys.contains(
+            ApiPaths.routeKey(route.method, route.pattern),
+          ),
+        )
+        .toList()
       ..sort((DelegatedRouteDeclaration a, DelegatedRouteDeclaration b) {
         final int byMethod = a.method.compareTo(b.method);
         return byMethod != 0 ? byMethod : a.pattern.compareTo(b.pattern);

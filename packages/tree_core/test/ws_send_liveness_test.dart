@@ -32,7 +32,6 @@ void main() {
       enableHeartbeat: true,
       heartbeatInterval: const Duration(milliseconds: 60),
       heartbeatMissLimit: 2,
-      streamChunkDelay: Duration.zero,
     );
     addTearDown(server.close);
     server.errorLog = logs.add;
@@ -79,7 +78,6 @@ void main() {
       enableHeartbeat: true,
       heartbeatInterval: const Duration(milliseconds: 60),
       heartbeatMissLimit: 2,
-      streamChunkDelay: Duration.zero,
     );
     addTearDown(server.close);
     final LivenessWsHub hub = server.hub as LivenessWsHub;
@@ -114,7 +112,6 @@ void main() {
       enableHeartbeat: true,
       heartbeatInterval: const Duration(milliseconds: 50),
       heartbeatMissLimit: 2,
-      streamChunkDelay: Duration.zero,
     );
     addTearDown(server.close);
     final LivenessWsHub hub = server.hub as LivenessWsHub;
@@ -128,7 +125,6 @@ void main() {
   test('关闭保活（enableHeartbeat: false）时行为与旧版一致：不判活、不入队', () async {
     final CoreServer server = await CoreServer.start(
       enableHeartbeat: false,
-      streamChunkDelay: Duration.zero,
     );
     addTearDown(server.close);
     final LivenessWsHub hub = server.hub as LivenessWsHub;

@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -6,7 +5,17 @@ import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
 import 'package:tree_protocol/tree_protocol.dart';
 
-/// 极简 HTTP 客户端：默认携带核心 token，返回状态码 + 解析后的 JSON。
+/// 核心 HTTP 骨架的**平台面**测试（A5：领域面已整体移交插件）。
+///
+/// 保留的覆盖：
+/// - 启动 / 握手 / 随机端口；
+/// - 本地 token 鉴权（HTTP + WS 升级拒绝）；
+/// - 路由覆盖度不变量：核心 router **恰好**是 [ApiPaths.coreOwned] 的 39 条；
+/// - 未知路径一律 404（M7 起无 501 桩）；
+/// - 核心仍实现的传输设置端点（帧率 / 数据收集开关）。
+///
+/// 领域路由（agents / models / sessions / files / specs / todos / questions /
+/// tools-running / token-rate …）的实现已随 A5 删除，其行为测试在插件仓。
 class _Client {
   _Client(this._server) : _http = HttpClient();
 
@@ -57,98 +66,12 @@ class _Res {
   String toString() => 'HTTP $status $json';
 }
 
-/// WS 客户端 + 帧记录器（单次订阅、持续累积，避免 broadcast 流丢事件）。
-class _WsClient {
-  _WsClient._(this._socket, this._controller) {
-    _subscription = _socket.listen(
-      (dynamic data) {
-        final Object? decoded = jsonDecode(data.toString());
-        if (decoded is Map<String, dynamic>) _controller.add(decoded);
-      },
-      onDone: () => _controller.close(),
-      onError: (Object _) => _controller.close(),
-    );
-  }
-
-  static Future<_WsClient> connect(CoreServer server, {String? token}) async {
-    final WebSocket socket = await WebSocket.connect(
-      '${server.handshake.wsBaseUrl}${CoreServer.wsPath}'
-      '?token=${token ?? server.token}',
-    );
-    return _WsClient._(
-      socket,
-      StreamController<Map<String, dynamic>>.broadcast(),
-    );
-  }
-
-  final WebSocket _socket;
-  final StreamController<Map<String, dynamic>> _controller;
-  late final StreamSubscription<dynamic> _subscription;
-  final List<Map<String, dynamic>> frames = <Map<String, dynamic>>[];
-
-  void send(Map<String, dynamic> frame) => _socket.add(jsonEncode(frame));
-
-  /// 记录后续到达的帧。
-  void record() => _controller.stream.listen(frames.add);
-
-  /// 轮询直到某个帧满足条件（比"订阅-发送-等待"更稳：不会漏帧）。
-  Future<void> until(
-    bool Function(Map<String, dynamic> frame) predicate, {
-    Duration timeout = const Duration(seconds: 5),
-    String? reason,
-  }) async {
-    final DateTime deadline = DateTime.now().add(timeout);
-    while (DateTime.now().isBefore(deadline)) {
-      if (frames.any(predicate)) return;
-      await Future<void>.delayed(const Duration(milliseconds: 5));
-    }
-    throw TimeoutException(
-      '超时等待${reason ?? '帧'}；已收到：'
-      '${frames.map((Map<String, dynamic> f) => f['type']).toList()}',
-    );
-  }
-
-  /// 轮询直到某类型帧累计到 [count] 个。
-  ///
-  /// 必须用"累计计数"而非"是否存在"：同一用例里连发多轮消息时，
-  /// `until` 会被上一轮已到达的帧立刻满足，从而漏等本轮完成。
-  Future<void> untilCount(
-    String type,
-    int count, {
-    Duration timeout = const Duration(seconds: 10),
-  }) async {
-    final DateTime deadline = DateTime.now().add(timeout);
-    while (DateTime.now().isBefore(deadline)) {
-      if (frames.where((Map<String, dynamic> f) => f['type'] == type).length >=
-          count) {
-        return;
-      }
-      await Future<void>.delayed(const Duration(milliseconds: 5));
-    }
-    throw TimeoutException('超时等待 $count 个 $type；已收到：${types()}');
-  }
-
-  List<String> types() => frames
-      .map((Map<String, dynamic> f) => f['type'] as String? ?? '')
-      .toList();
-
-  Future<void> close() async {
-    await _subscription.cancel();
-    await _socket.close();
-    if (!_controller.isClosed) await _controller.close();
-  }
-}
-
 void main() {
   late CoreServer server;
   late _Client client;
 
   setUp(() async {
-    // 20ms 片间延迟：既让"停止"测试有确定的取消窗口，又不拖慢整体用例
-    server = await CoreServer.start(
-      streamChunkDelay: const Duration(milliseconds: 20),
-      enableHeartbeat: false,
-    );
+    server = await CoreServer.start(enableHeartbeat: false);
     client = _Client(server);
   });
 
@@ -156,28 +79,6 @@ void main() {
     client.close();
     await server.close();
   });
-
-  /// 建一个模型 + agent，返回 agent id。
-  Future<String> seedAgent(String name) async {
-    final _Res model = await client.send(
-      'POST',
-      ApiPaths.models,
-      body: <String, dynamic>{
-        'model_id': 'demo',
-        'name': '演示模型',
-        'base_url': 'https://api.example.com/v1',
-        'api_key': 'sk-test',
-      },
-    );
-    expect(model.status, 200, reason: '$model');
-    final _Res agent = await client.send(
-      'POST',
-      ApiPaths.agents,
-      body: <String, dynamic>{'name': name, 'model_id': 'demo'},
-    );
-    expect(agent.status, 200, reason: '$agent');
-    return (agent.json['agent'] as Map<String, dynamic>)['id'] as String;
-  }
 
   group('启动与握手', () {
     test('监听回环随机端口，且 token 具备足够熵', () async {
@@ -199,10 +100,7 @@ void main() {
     });
 
     test('两个实例端口互不冲突（内核分配）', () async {
-      final CoreServer other = await CoreServer.start(
-        streamChunkDelay: Duration.zero,
-        enableHeartbeat: false,
-      );
+      final CoreServer other = await CoreServer.start(enableHeartbeat: false);
       expect(other.port, isNot(server.port));
       await other.close();
     });
@@ -210,21 +108,17 @@ void main() {
 
   group('本地 token 鉴权', () {
     test('缺 Authorization 头 -> 401', () async {
-      final _Res res = await client.send(
-        'GET',
-        ApiPaths.agents,
-        omitAuth: true,
-      );
+      final _Res res = await client.send('GET', ApiPaths.meta, omitAuth: true);
       expect(res.status, 401);
       expect(server.rejectedRequests, 1);
     });
 
     test('token 错误 -> 401；正确 -> 200', () async {
       expect(
-        (await client.send('GET', ApiPaths.agents, token: 'bad')).status,
+        (await client.send('GET', ApiPaths.meta, token: 'bad')).status,
         401,
       );
-      expect((await client.send('GET', ApiPaths.agents)).status, 200);
+      expect((await client.send('GET', ApiPaths.meta)).status, 200);
     });
 
     test('WS token 错误 -> 401（拒绝升级）', () async {
@@ -236,67 +130,27 @@ void main() {
     });
   });
 
-  group('运行中工具（GET /api/tools/running + 显式关闭）', () {
-    test('只读快照：空表也回冻结形状 {runs: []}', () async {
-      final _Res res = await client.send('GET', ApiPaths.toolsRunning);
-      expect(res.status, 200, reason: '$res');
-      expect(res.json.keys, <String>{'runs'});
-      expect(res.json['runs'], isEmpty);
-    });
-
-    test('显式关闭：句柄失效 ⇒ 404 + 可读原因（fail-closed，不假装成功）', () async {
-      final _Res missing = await client.send(
-        'POST',
-        ApiPaths.toolsRunningClose.replaceFirst('{handle}', 'toolrun_1_abcd_1'),
-      );
-      expect(missing.status, 404, reason: '$missing');
-      expect(
-        missing.json.toString(),
-        contains('已失效'),
-        reason: '登记表是纯内存的：旧句柄必须回"该句柄已失效"',
-      );
-    });
-  });
-
   group('路由覆盖度不变量', () {
-    test('核心 router 键集 == coreOwned ∪ 迁移期未交接路由（L-28 门禁）', () {
+    test('核心 router 键集 == coreOwned（A5 后只有平台面 39 条）', () {
       final Set<String> registered = server.router.routes.toSet();
       final Set<String> stubs = server.stubRouter.patterns;
       final Set<String> coreOwned = ApiPaths.coreOwned;
-      final Set<String> delegated = ApiPaths.delegated;
-      final Set<String> pending = ApiPaths.pendingHandoffRoutes;
 
-      // 契约口径：核心永久面 36，插件面 57（agent 36 + spec 2 + mcp 3 +
-      // files 13 + git 3），合计 93；其中此刻仍由核心实现 55（= 91 - 36）。
-      expect(coreOwned.length, 36, reason: '核心永久面冻结为 36 条方法路由');
+      expect(coreOwned.length, 39, reason: '核心永久面 39 条（36 + UI 多窗口 3）');
       expect(
-        delegated.length,
-        57,
-        reason: '插件面冻结为 57 条（agent 36 + spec 2 + mcp 3 + files 13 + git 3）',
-      );
-      expect(ApiPaths.contractRoutes.length, 93);
-      expect(pending.length, 52, reason: '核心当前实现 52 条插件面路由（MCP 3 条已交接）；每交接一条删一条');
-      expect(coreOwned.intersection(delegated), isEmpty);
-      expect(pending.difference(delegated), isEmpty);
-
-      expect(
-        coreOwned.difference(registered),
-        isEmpty,
-        reason: '核心永久面缺路由：coreOwned 里的每条都必须由核心实现',
+        registered,
+        coreOwned,
+        reason: 'A5 后核心只注册 coreOwned：领域路由全部由插件委派承接',
       );
       expect(
-        registered.difference(coreOwned.union(pending)),
+        coreOwned.intersection(ApiPaths.delegated),
         isEmpty,
-        reason:
-            '核心注册了契约外或已交接的路由。新增核心永久面请同步 coreOwned；'
-            '交接给插件后请从 pendingHandoffRoutes 删除（核心不得重复实现）',
+        reason: '核心永久面不得同时出现在插件契约面',
       );
       expect(
-        pending.difference(registered),
+        ApiPaths.pendingHandoffRoutes,
         isEmpty,
-        reason:
-            '登记为迁移期未交接的路由必须在核心实现；删除实现时请同步从 '
-            'pendingHandoffRoutes 删掉，否则门禁会失真',
+        reason: 'A5 已完成迁移债清零（git 3 已按用户决定删除，不再登记 pending）',
       );
       expect(
         registered
@@ -313,16 +167,6 @@ void main() {
         reason: '同一路径不应既实现又声明为未实现',
       );
       expect(stubs, CoreServer.stubApiPaths);
-      expect(
-        CoreServer.stubApiPaths.difference(ApiPaths.kept),
-        isEmpty,
-        reason: '501 桩只允许针对协议包声明保留的路径',
-      );
-      expect(
-        stubs.intersection(ApiPaths.removedWithAccounts),
-        isEmpty,
-        reason: '账号体系路径在 desktop 分支已删除，不应登记',
-      );
       expect(
         CoreServer.stubApiPaths,
         isEmpty,
@@ -343,352 +187,8 @@ void main() {
     });
   });
 
-  group('模型池', () {
-    test('新增/列表/更新/删除，密钥不回显', () async {
-      expect(
-        (await client.send(
-          'POST',
-          ApiPaths.models,
-          body: <String, dynamic>{
-            'model_id': 'demo',
-            'base_url': 'https://api.example.com/v1',
-            'api_key': 'sk-test',
-          },
-        )).status,
-        200,
-      );
-      expect(
-        (await client.send(
-          'POST',
-          ApiPaths.models,
-          body: <String, dynamic>{
-            'model_id': 'demo',
-            'base_url': 'https://api.example.com/v1',
-            'api_key': 'sk-test',
-          },
-        )).status,
-        409,
-      );
-      expect(
-        (await client.send(
-          'POST',
-          ApiPaths.models,
-          body: <String, dynamic>{'model_id': 'no-key'},
-        )).status,
-        400,
-      );
-
-      final _Res list = await client.send('GET', ApiPaths.models);
-      final List<dynamic> models = list.json['models'] as List<dynamic>;
-      expect(models.length, 1);
-      final Map<String, dynamic> model = (models.first as Map<String, dynamic>);
-      expect(model.containsKey('api_key'), isFalse);
-      expect(model['base_url'], 'https://api.example.com');
-
-      expect(
-        (await client.send(
-          'PATCH',
-          '/api/models/demo',
-          body: <String, dynamic>{'name': '改名'},
-        )).status,
-        200,
-      );
-      expect((await client.send('DELETE', '/api/models/demo')).status, 200);
-      expect((await client.send('DELETE', '/api/models/demo')).status, 404);
-    });
-
-    test('删除模型时回传仍绑定该模型的 agent（供前端提示）', () async {
-      final String agentId = await seedAgent('绑定者');
-      final _Res deleted = await client.send('DELETE', '/api/models/demo');
-      expect(deleted.status, 200);
-      expect(deleted.json['bound_agents'], contains(agentId));
-    });
-  });
-
-  group('agent 与会话', () {
-    test('创建时校验 name / model_id，且模型必须已存在', () async {
-      expect(
-        (await client.send(
-          'POST',
-          ApiPaths.agents,
-          body: <String, dynamic>{'model_id': 'demo'},
-        )).status,
-        400,
-      );
-      expect(
-        (await client.send(
-          'POST',
-          ApiPaths.agents,
-          body: <String, dynamic>{'name': 'a'},
-        )).status,
-        400,
-      );
-      expect(
-        (await client.send(
-          'POST',
-          ApiPaths.agents,
-          body: <String, dynamic>{'name': 'a', 'model_id': 'missing'},
-        )).status,
-        400,
-      );
-    });
-
-    test('列表返回前端 Agent 模型所需字段，并自动带兜底默认会话', () async {
-      final String agentId = await seedAgent('列表用例');
-      final _Res list = await client.send('GET', ApiPaths.agents);
-      final Map<String, dynamic> agent =
-          ((list.json['agents'] as List<dynamic>).first
-              as Map<String, dynamic>);
-      expect(agent['id'], agentId);
-      expect(agent['name'], '列表用例');
-      expect(agent['type'], 'normal');
-      expect(agent['workspace_id'], isNotEmpty);
-      expect(agent['pending_member_count'], 0);
-      expect(agent['last_message'], '');
-      expect(agent['last_message_time'], isNull);
-
-      final _Res sessions = await client.send(
-        'GET',
-        '/api/agents/$agentId/sessions',
-      );
-      final List<dynamic> items = sessions.json['sessions'] as List<dynamic>;
-      expect(items.length, 1);
-      expect(
-        (items.first as Map<String, dynamic>)['session_id'],
-        TreeStore.defaultSessionId,
-      );
-      expect((items.first as Map<String, dynamic>)['message_count'], 0);
-      expect((items.first as Map<String, dynamic>)['created_at'], isA<int>());
-    });
-
-    test('会话增删改与 specs 选择', () async {
-      final String agentId = await seedAgent('会话用例');
-      final _Res created = await client.send(
-        'POST',
-        '/api/agents/$agentId/sessions',
-        body: <String, dynamic>{'title': '第二个'},
-      );
-      expect(created.status, 200);
-      final String sessionId =
-          (created.json['session'] as Map<String, dynamic>)['session_id']
-              as String;
-      expect(sessionId, isNot(TreeStore.defaultSessionId));
-
-      expect(
-        (await client.send(
-          'GET',
-          '/api/agents/$agentId/sessions',
-        )).json['sessions'],
-        hasLength(2),
-      );
-      expect(
-        (await client.send(
-          'PATCH',
-          '/api/agents/$agentId/sessions/$sessionId',
-          body: <String, dynamic>{'title': '改名后'},
-        )).status,
-        200,
-      );
-      expect(
-        (await client.send(
-          'GET',
-          '/api/agents/$agentId/sessions/$sessionId',
-        )).json['session'],
-        containsPair('title', '改名后'),
-      );
-      expect(
-        (await client.send(
-          'POST',
-          '/api/agents/$agentId/sessions/$sessionId/specs',
-          body: <String, dynamic>{
-            'spec_ids': <String>['spec_a'],
-          },
-        )).json['selected_spec_ids'],
-        <String>['spec_a'],
-      );
-      expect(
-        (await client.send(
-          'GET',
-          '/api/agents/$agentId/specs?session_id=$sessionId',
-        )).json['selected_spec_ids'],
-        <String>['spec_a'],
-      );
-      expect(
-        (await client.send(
-          'DELETE',
-          '/api/agents/$agentId/sessions/$sessionId',
-        )).status,
-        200,
-      );
-      expect(
-        (await client.send(
-          'GET',
-          '/api/agents/$agentId/sessions/$sessionId',
-        )).status,
-        404,
-      );
-      // 不存在的 agent 一律 404
-      expect(
-        (await client.send('GET', '/api/agents/agt_missing/sessions')).status,
-        404,
-      );
-      expect((await client.send('GET', '/api/agents/agt_missing')).status, 404);
-      expect(
-        (await client.send('DELETE', '/api/agents/agt_missing')).status,
-        404,
-      );
-    });
-
-    test('models-info 同时给出 agent 当前绑定与模型池', () async {
-      final String agentId = await seedAgent('模型信息');
-      final _Res res = await client.send(
-        'GET',
-        '/api/agents/$agentId/models-info',
-      );
-      expect(res.status, 200);
-      expect((res.json['agent'] as Map<String, dynamic>)['model_id'], 'demo');
-      expect(res.json['models'], hasLength(1));
-      expect(res.json['overrides'], isEmpty);
-    });
-
-    test('PATCH agent 的模型参数覆盖会落库并回传给 models-info', () async {
-      final String agentId = await seedAgent('覆盖');
-      final _Res patched = await client.send(
-        'PATCH',
-        '/api/agents/$agentId',
-        body: <String, dynamic>{
-          'reasoning_effort': 'high',
-          'max_seqlen': 32000,
-          'max_output_tokens': 4096,
-          'compress_threshold': 0.7,
-          'thinking': true,
-        },
-      );
-      expect(patched.status, 200, reason: '$patched');
-      final _Res info = await client.send(
-        'GET',
-        '/api/agents/$agentId/models-info',
-      );
-      final Map<String, dynamic> overrides =
-          info.json['overrides'] as Map<String, dynamic>;
-      expect(overrides['reasoning_effort'], 'high');
-      expect(overrides['max_seqlen'], 32000);
-      expect(overrides['max_output_tokens'], 4096);
-      expect(overrides['compress_threshold'], 0.7);
-      expect(overrides['thinking'], isTrue, reason: '右栏「回传思考」覆盖');
-
-      // 三态：显式 null = 清除该项覆盖（回退模型默认），不是"关掉"
-      final _Res resetThinking = await client.send(
-        'PATCH',
-        '/api/agents/$agentId',
-        body: <String, dynamic>{'thinking': null},
-      );
-      expect(resetThinking.status, 200, reason: '$resetThinking');
-      final _Res infoAfterReset = await client.send(
-        'GET',
-        '/api/agents/$agentId/models-info',
-      );
-      expect(
-        (infoAfterReset.json['overrides'] as Map<String, dynamic>).containsKey(
-          'thinking',
-        ),
-        isFalse,
-      );
-      // 再设回 true，供后面的"一次性清除"断言
-      await client.send(
-        'PATCH',
-        '/api/agents/$agentId',
-        body: <String, dynamic>{'thinking': true},
-      );
-
-      // 非法值显式 400，绝不静默丢弃
-      expect(
-        (await client.send(
-          'PATCH',
-          '/api/agents/$agentId',
-          body: <String, dynamic>{'max_seqlen': 0},
-        )).status,
-        400,
-      );
-      expect(
-        (await client.send(
-          'PATCH',
-          '/api/agents/$agentId',
-          body: <String, dynamic>{'compress_threshold': 1.5},
-        )).status,
-        400,
-      );
-      expect(
-        (await client.send(
-          'PATCH',
-          '/api/agents/$agentId',
-          body: <String, dynamic>{'thinking': 'yes'},
-        )).status,
-        400,
-        reason: 'thinking 只接受 bool 或 null，字符串要显式拒绝',
-      );
-
-      // 一次性清除全部覆盖（右栏「恢复默认」按钮）
-      final _Res cleared = await client.send(
-        'PATCH',
-        '/api/agents/$agentId',
-        body: <String, dynamic>{'clear_model_overrides': true},
-      );
-      expect(cleared.status, 200, reason: '$cleared');
-      final _Res after = await client.send(
-        'GET',
-        '/api/agents/$agentId/models-info',
-      );
-      expect(after.json['overrides'], isEmpty);
-    });
-
-    test('PATCH system_prompt 落库并进入系统提示词装配（右栏输入框确实生效）', () async {
-      final String agentId = await seedAgent('提示词');
-      final _Res patched = await client.send(
-        'PATCH',
-        '/api/agents/$agentId',
-        body: <String, dynamic>{'system_prompt': '你是测试助手。'},
-      );
-      expect(patched.status, 200, reason: '$patched');
-      final _Res info = await client.send(
-        'GET',
-        '/api/agents/$agentId/models-info',
-      );
-      expect(
-        (info.json['agent'] as Map<String, dynamic>)['system_prompt'],
-        '你是测试助手。',
-        reason: '保存后 models-info 回填，右栏输入框重载可见',
-      );
-      // 落库 + 装配函数确实带上它（未接工作空间基础段时即整段提示词）
-      final CoreAgent agent = server.store.agent(agentId)!;
-      expect(agent.systemPrompt, '你是测试助手。', reason: '落库到 agents/<id>.yaml');
-      expect(systemPromptWithWorkspace(agent), contains('你是测试助手。'));
-    });
-
-    test('todos / teammates / questions 返回空集（M4/M5 前）', () async {
-      final String agentId = await seedAgent('空集');
-      expect(
-        (await client.send('GET', '/api/agents/$agentId/todos')).json['todos'],
-        isEmpty,
-      );
-      expect(
-        (await client.send(
-          'GET',
-          '/api/agents/$agentId/teammates',
-        )).json['members'],
-        isEmpty,
-      );
-      expect(
-        (await client.send('GET', ApiPaths.questions)).json['questions'],
-        isEmpty,
-      );
-      final _Res snapshot = await client.send('GET', ApiPaths.pluginSnapshot);
-      expect(snapshot.json['enabled'], isFalse);
-    });
-  });
-
-  group('设置', () {
-    test('帧率夹取、token 帧率、消息切入、数据收集开关', () async {
+  group('设置（核心永久面）', () {
+    test('帧率夹取与数据收集开关', () async {
       final _Res initial = await client.send('GET', ApiPaths.settingsFrameRate);
       expect(initial.json['frame_rate'], CoreSettings.frameRateMin);
       expect(initial.json['min'], CoreSettings.frameRateMin);
@@ -701,21 +201,6 @@ void main() {
       );
       expect(set.json['frame_rate'], CoreSettings.frameRateMax);
 
-      // token 获取帧率：默认上限（近似不限速），可夹取
-      final _Res tokenInitial = await client.send(
-        'GET',
-        ApiPaths.settingsTokenRate,
-      );
-      expect(tokenInitial.json['token_rate'], CoreSettings.tokenRateMax);
-      expect(tokenInitial.json['min'], CoreSettings.tokenRateMin);
-      expect(tokenInitial.json['max'], CoreSettings.tokenRateMax);
-      final _Res tokenSet = await client.send(
-        'POST',
-        ApiPaths.settingsTokenRate,
-        body: <String, dynamic>{'token_rate': 1},
-      );
-      expect(tokenSet.json['token_rate'], CoreSettings.tokenRateMin);
-
       expect(
         (await client.send(
           'POST',
@@ -724,417 +209,7 @@ void main() {
         )).status,
         200,
       );
-    });
-  });
-
-  group('WS 会话链路', () {
-    test('user_message -> agent_status/msg_start/msg_chunk/msg_end 并按序落库', () async {
-      final String agentId = await seedAgent('流式用例');
-      final _WsClient ws = await _WsClient.connect(server);
-      ws.record();
-      addTearDown(ws.close);
-
-      ws.send(<String, dynamic>{
-        'type': WsInboundType.userMessage,
-        'agent_id': agentId,
-        'content': '你好，核心进程',
-        'session_id': TreeStore.defaultSessionId,
-      });
-      await ws.until(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgEnd,
-        reason: 'msg_end',
-      );
-      // 再等终止的 idle 帧：msg_end 到达不等于 idle 已到达（帧是异步过网的），
-      // 不等就容易在负载高时把"最后一帧是 msg_end"读成断言失败
-      await ws.until(
-        (Map<String, dynamic> f) =>
-            f['type'] == WsOutboundType.agentStatus &&
-            ((f['data'] as Map<String, dynamic>?)?['status'] ?? '') == 'idle',
-        reason: 'agent_status(idle)',
-      );
-
-      final List<String> types = ws.types();
-      expect(types.first, WsOutboundType.agentStatus);
-      expect(types[1], WsOutboundType.msgStart);
-      // 推送刷新帧率常开：增量按帧率合并下发，帧数随节奏而定，至少一帧；
-      // 内容完整性由下面的「流式内容拼接 = 落库正文」兜底断言。
-      expect(
-        types.where((String t) => t == WsOutboundType.msgChunk).length,
-        greaterThanOrEqualTo(1),
-      );
-      expect(types.last, WsOutboundType.agentStatus);
-
-      final Map<String, dynamic> start = ws.frames.firstWhere(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgStart,
-      );
-      expect(start['agent_id'], agentId);
-      expect(start['session_id'], TreeStore.defaultSessionId);
-      expect(start['kind'], 'text');
-      final String messageId = start['id'] as String;
-      expect(messageId, isNotEmpty);
-      for (final Map<String, dynamic> chunk in ws.frames.where(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgChunk,
-      )) {
-        expect(chunk['id'], messageId);
-      }
-      final Map<String, dynamic> end = ws.frames.firstWhere(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgEnd,
-      );
-      expect(end['id'], messageId);
-      expect(end['cancelled'], isFalse);
-      final Map<String, dynamic> usage = end['usage'] as Map<String, dynamic>;
-      expect(usage['total_tokens'], greaterThan(0));
-      expect(usage['estimated'], isTrue);
-      expect(usage['max_tokens'], 128000);
-
-      // 状态帧内容
-      final Map<String, dynamic> working = ws.frames.firstWhere(
-        (Map<String, dynamic> f) =>
-            f['type'] == WsOutboundType.agentStatus &&
-            (f['data'] as Map<String, dynamic>)['status'] == 'working',
-      );
-      expect((working['data'] as Map<String, dynamic>)['agent_id'], agentId);
-
-      // 流式内容拼接 = 落库正文（API 与 WS 两条路径必须一致）
-      final String streamed = ws.frames
-          .where(
-            (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgChunk,
-          )
-          .map((Map<String, dynamic> f) => f['chunk'] as String)
-          .join();
-      final _Res history = await client.send(
-        'GET',
-        '/api/conversations/$agentId?session_id=${TreeStore.defaultSessionId}',
-      );
-      final List<dynamic> messages = history.json['messages'] as List<dynamic>;
-      expect(messages, hasLength(2));
-      expect((messages[0] as Map<String, dynamic>)['role'], 'user');
-      expect((messages[0] as Map<String, dynamic>)['content'], '你好，核心进程');
-      expect((messages[1] as Map<String, dynamic>)['role'], 'agent');
-      expect((messages[1] as Map<String, dynamic>)['content'], streamed);
-      expect((messages[1] as Map<String, dynamic>)['id'], messageId);
-      expect((messages[1] as Map<String, dynamic>)['timestamp'], isA<String>());
-
-      // agent 列表的会话摘要也同步了
-      final _Res sessions = await client.send(
-        'GET',
-        '/api/agents/$agentId/sessions',
-      );
-      expect(
-        ((sessions.json['sessions'] as List<dynamic>).first
-            as Map<String, dynamic>)['message_count'],
-        2,
-      );
-      final _Res agents = await client.send('GET', ApiPaths.agents);
-      final Map<String, dynamic> listed =
-          (agents.json['agents'] as List<dynamic>).first
-              as Map<String, dynamic>;
-      expect(listed['last_message'], streamed);
-      expect(listed['last_message_time'], isA<int>());
-    });
-
-    test('会话 id 为空时自动建会话并推送 session_created', () async {
-      final String agentId = await seedAgent('自动建会话');
-      final _WsClient ws = await _WsClient.connect(server);
-      ws.record();
-      addTearDown(ws.close);
-
-      ws.send(<String, dynamic>{
-        'type': WsInboundType.userMessage,
-        'agent_id': agentId,
-        // 内容 > 30 字符以触发标题截断（标题取前 30 字 + 省略号）
-        'content': '首条消息标题会截断到这里为止吧' * 3,
-      });
-      await ws.until(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgEnd,
-        reason: 'msg_end',
-      );
-      final Map<String, dynamic> created = ws.frames.firstWhere(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.sessionCreated,
-      );
-      final Map<String, dynamic> data = created['data'] as Map<String, dynamic>;
-      expect(data['agent_id'], agentId);
-      expect(data['session_id'], isNot(TreeStore.defaultSessionId));
-      expect(data['title'], isA<String>());
-      expect((data['title'] as String).endsWith('…'), isTrue);
-      expect(
-        (await client.send(
-          'GET',
-          '/api/agents/$agentId/sessions',
-        )).json['sessions'],
-        hasLength(2),
-      );
-    });
-
-    test('推送刷新帧率：同一帧窗口内的增量合并为一条 msg_chunk', () async {
-      // 零片间延迟 = 全部增量落在同一帧窗口内；默认 20fps（50ms）下应合并成一帧。
-      // 该旋钮的含义是"不模拟时间"：引擎瞬时产出全部增量，节奏控制（token 管道
-      // 与帧窗口定时器）随之整体关闭，攒帧只在显式 flush 点落地——否则窗口边界
-      // 落在哪一毫秒取决于 OS 计时器粒度（Windows 约 15.6ms）与机器负载，
-      // "合并成一帧"就不再是确定性的。
-      const String content = '合并一下';
-      final String reply = ScriptedAgent.replyFor(content);
-      // **牙齿**：占位引擎按 chunkChars 切片，回复必然是多片；若攒帧失效（每片
-      // 一帧），下面的 hasLength(1) 会立刻失败——本用例证明的是"合并确实发生"，
-      // 不是"引擎只产出了一片"。
-      final ScriptedAgent probe = ScriptedAgent();
-      expect(reply.length, greaterThan(probe.chunkChars));
-
-      final CoreServer coalesced = await CoreServer.start(
-        streamChunkDelay: Duration.zero,
-        enableHeartbeat: false,
-      );
-      addTearDown(coalesced.close);
-      final String agentId = coalesced.store.createAgent(name: '合并用例').id;
-      final _WsClient ws = await _WsClient.connect(coalesced);
-      ws.record();
-      addTearDown(ws.close);
-
-      ws.send(<String, dynamic>{
-        'type': WsInboundType.userMessage,
-        'agent_id': agentId,
-        'content': content,
-        'session_id': TreeStore.defaultSessionId,
-      });
-      await ws.until(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgEnd,
-        reason: 'msg_end',
-      );
-
-      final List<Map<String, dynamic>> chunks = ws.frames
-          .where(
-            (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgChunk,
-          )
-          .toList();
-      // 逐 token 片段被攒帧合并：多片内容合成一条帧，且正文完整无缺
-      expect(chunks, hasLength(1));
-      expect(chunks.single['chunk'], reply);
-    });
-
-    test('stop 中断流式并回 cancelled=true + message 提示', () async {
-      final String agentId = await seedAgent('停止用例');
-      final _WsClient ws = await _WsClient.connect(server);
-      ws.record();
-      addTearDown(ws.close);
-
-      ws.send(<String, dynamic>{
-        'type': WsInboundType.userMessage,
-        'agent_id': agentId,
-        'content': '这条会被中途停止',
-        'session_id': TreeStore.defaultSessionId,
-      });
-      await ws.until(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgChunk,
-        reason: '首个 msg_chunk',
-      );
-      ws.send(<String, dynamic>{
-        'type': WsInboundType.stop,
-        'data': <String, dynamic>{
-          'agent_id': agentId,
-          'session_id': TreeStore.defaultSessionId,
-        },
-      });
-      await ws.until(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgEnd,
-        reason: 'msg_end',
-      );
-      // 同上：等 idle 帧到齐再断言"最后一帧是 agent_status"
-      await ws.until(
-        (Map<String, dynamic> f) =>
-            f['type'] == WsOutboundType.agentStatus &&
-            ((f['data'] as Map<String, dynamic>?)?['status'] ?? '') == 'idle',
-        reason: 'agent_status(idle)',
-      );
-      final Map<String, dynamic> end = ws.frames.firstWhere(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgEnd,
-      );
-      expect(end['cancelled'], isTrue);
-      final Map<String, dynamic> notice = ws.frames.firstWhere(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.message,
-      );
-      expect(notice['role'], 'agent');
-      expect(notice['content'], contains('已停止'));
-      expect(notice['agent_id'], agentId);
-      expect(ws.frames.last['type'], WsOutboundType.agentStatus);
-      // 中断后 agent 归闲，可以继续下一轮
-      expect(server.conversation.activeRunCount, 0);
-    });
-
-    test('未知 agent 的 user_message 回 error 帧', () async {
-      final _WsClient ws = await _WsClient.connect(server);
-      ws.record();
-      addTearDown(ws.close);
-      ws.send(<String, dynamic>{
-        'type': WsInboundType.userMessage,
-        'agent_id': 'agt_missing',
-        'content': 'x',
-        'session_id': TreeStore.defaultSessionId,
-      });
-      await ws.until(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.error,
-        reason: 'error',
-      );
-      final Map<String, dynamic> error = ws.frames.firstWhere(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.error,
-      );
-      expect(
-        (error['data'] as Map<String, dynamic>)['message'],
-        contains('未知 agent'),
-      );
-    });
-
-    test('心跳帧即时回执（前端 30s 保活）', () async {
-      final _WsClient ws = await _WsClient.connect(server);
-      ws.record();
-      addTearDown(ws.close);
-      ws.send(<String, dynamic>{'type': WsInboundType.heartbeat});
-      await ws.until(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.heartbeat,
-        reason: 'heartbeat',
-      );
-    });
-
-    test('已删除的反向执行帧被静默忽略（老前端不崩、正常帧照常处理）', () async {
-      final _WsClient ws = await _WsClient.connect(server);
-      ws.record();
-      addTearDown(ws.close);
-      // M7c 删除了"前端执行器"与反向执行通道：老版本前端若仍发这些帧，
-      // 核心必须**静默忽略**（前向兼容），而不是崩溃或回错——它们描述的
-      // 执行器已不存在，但协议宽容性不能退化。
-      for (final String removed in <String>[
-        'register_local_executor',
-        'unregister_local_executor',
-        'register_ssh_executor',
-        'unregister_ssh_executor',
-        'tool_exec_response',
-        'tool_exec_progress',
-        'plugin_host_event',
-      ]) {
-        ws.send(<String, dynamic>{
-          'type': removed,
-          'data': <String, dynamic>{'team_id': 'agt_1'},
-        });
-      }
-      // 之后正常帧仍被处理（心跳必须有应答）
-      ws.send(<String, dynamic>{'type': WsInboundType.heartbeat});
-      await ws.until(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.heartbeat,
-        reason: '心跳应答',
-      );
-      expect(
-        ws.types(),
-        isNot(contains(WsOutboundType.error)),
-        reason: '已删除的帧不应触发错误帧',
-      );
-    });
-
-    test('分片上行被重组后按普通帧处理（大帧不再静默丢弃）', () async {
-      final String agentId = await seedAgent('分片上行');
-      final _WsClient ws = await _WsClient.connect(server);
-      ws.record();
-      addTearDown(ws.close);
-
-      final Map<String, dynamic> frame = <String, dynamic>{
-        'type': WsInboundType.userMessage,
-        'agent_id': agentId,
-        'content': '分片内容' * 40,
-        'session_id': TreeStore.defaultSessionId,
-      };
-      final String raw = jsonEncode(frame);
-      final List<String> parts = WsConnection.splitByUtf8Budget(raw, 64);
-      expect(parts.length, greaterThan(1));
-      ws.send(<String, dynamic>{
-        'type': WsOutboundType.frameBegin,
-        'id': 'frg_test',
-        'total': parts.length,
-      });
-      for (int i = 0; i < parts.length; i++) {
-        ws.send(<String, dynamic>{
-          'type': WsOutboundType.frameChunk,
-          'id': 'frg_test',
-          'seq': i,
-          'part': parts[i],
-        });
-      }
-      ws.send(<String, dynamic>{
-        'type': WsOutboundType.frameEnd,
-        'id': 'frg_test',
-      });
-      await ws.until(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgEnd,
-        reason: 'msg_end（分片消息已重组）',
-      );
-      final _Res history = await client.send(
-        'GET',
-        '/api/conversations/$agentId?session_id=${TreeStore.defaultSessionId}',
-      );
-      final List<dynamic> messages = history.json['messages'] as List<dynamic>;
-      expect((messages.first as Map<String, dynamic>)['content'], '分片内容' * 40);
-    });
-
-    test('多窗口并发连接都能收到广播', () async {
-      final String agentId = await seedAgent('多窗口');
-      final _WsClient a = await _WsClient.connect(server);
-      final _WsClient b = await _WsClient.connect(server);
-      a.record();
-      b.record();
-      addTearDown(a.close);
-      addTearDown(b.close);
-      // 服务端在 upgrade 完成后才登记连接：客户端 connect 返回可能更早，
-      // 因此这里轮询等待，而不是直接断言（否则是竞态型 flaky）
-      final DateTime deadline = DateTime.now().add(const Duration(seconds: 5));
-      while (server.hub.connectionCount < 2 &&
-          DateTime.now().isBefore(deadline)) {
-        await Future<void>.delayed(const Duration(milliseconds: 10));
-      }
-      expect(server.hub.connectionCount, 2);
-
-      a.send(<String, dynamic>{
-        'type': WsInboundType.userMessage,
-        'agent_id': agentId,
-        'content': '广播',
-        'session_id': TreeStore.defaultSessionId,
-      });
-      await b.until(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgEnd,
-        reason: '另一窗口收到 msg_end',
-      );
-      await a.until(
-        (Map<String, dynamic> f) => f['type'] == WsOutboundType.msgEnd,
-        reason: 'msg_end',
-      );
-    });
-  });
-
-  group('清空历史', () {
-    test('按会话清空只删该会话，all 清空全部', () async {
-      final String agentId = await seedAgent('清空');
-      final _WsClient ws = await _WsClient.connect(server);
-      ws.record();
-      addTearDown(ws.close);
-      for (int i = 0; i < 2; i++) {
-        ws.send(<String, dynamic>{
-          'type': WsInboundType.userMessage,
-          'agent_id': agentId,
-          'content': i == 0 ? '一' : '二',
-          'session_id': TreeStore.defaultSessionId,
-        });
-        await ws.untilCount(WsOutboundType.msgEnd, i + 1);
-      }
-      expect(server.store.totalMessageCount, 4);
-      final _Res cleared = await client.send(
-        'DELETE',
-        '/api/conversations/$agentId?session_id=${TreeStore.defaultSessionId}',
-      );
-      expect(cleared.json['deleted'], 4);
-      expect(server.store.totalMessageCount, 0);
-      expect(
-        (await client.send(
-          'DELETE',
-          '/api/conversations/$agentId?session_id=all',
-        )).json['deleted'],
-        0,
-      );
+      expect(server.settings.dataCollectionEnabled, isTrue);
     });
   });
 }

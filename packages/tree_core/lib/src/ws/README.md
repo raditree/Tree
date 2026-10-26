@@ -1,6 +1,6 @@
 # ws（回环 WebSocket）
 
-核心与前端之间唯一的实时通道：**连接注册表 + 广播 + 帧分片重组**。业务帧的语义不在这里（在 [../agent/conversation_service.dart](../agent/conversation_service.dart)）。
+核心与前端之间唯一的实时通道：**连接注册表 + 广播 + 帧分片重组**。业务帧的语义不在这里（在 ../agent/conversation_service.dart）。
 
 ## 文件
 

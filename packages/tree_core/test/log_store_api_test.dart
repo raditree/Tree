@@ -108,7 +108,6 @@ void main() {
     );
     bus = PluginBus(configFile: config.path, coreVersion: 'test');
     server = await CoreServer.start(
-      streamChunkDelay: Duration.zero,
       enableHeartbeat: false,
       dataDir: temp.path,
       pluginBus: bus,
