@@ -2,55 +2,85 @@
 
 <img src="docs/images/logo.png" width="104" align="right" alt="Tree">
 
-**LLM 驱动的 agent 团队桌面工作台**：按任务难度动态组建 agent 团队，让多个 agent 在同一个项目目录里协作，全部逻辑跑在**本机单进程**里——无服务器、无账号、无云端。
+**插件化的 LLM agent 团队桌面工作台**：内核只做调度，能力全部由插件提供，连界面本身也是一份可装卸的插件。
 
-- **界面**：Flutter 桌面应用（三栏：agent 列表 ｜ 会话与工具调用（一行式，完整详情见右栏）｜ 文件 / 模型 / 提问 / 详情面板）
-- **核心**：纯 Dart 进程 `tree_core`（`dart compile exe` 单文件，约 10 MB，无需运行时）
+- **界面**：Flutter 桌面应用，作为 `runtime: ui` 插件运行（可安装 / 卸载 / 替换；多窗口 = 多个 UI 插件进程）
+- **内核**：纯 Dart 进程 `tree_core`，只保留 **39 条永久路由**（平台控制面、传输设置、引导壳、发现面、日志、存储）
+- **功能插件**：agent、文件、本机 / SSH 执行、MCP、压缩、自迭代……各自承接原属核心的领域端点
 - **平台**：Windows / Linux / macOS（维护配置：Flutter 3.47.5 + Dart 3.13.4）
 - **数据**：全部在 `%APPDATA%\Tree`（可用 `TREE_HOME` / `--data-dir` 覆盖），明文配置、可直接手改
 
 ## 亮点
 
-- **跨团队交互**：队内 `message` 派活 / 广播 / `wait_for`；**TOP 之间可跨团队直连**（`list_teams` 寻址）。成员与 leader 共享同一工作目录，系统不替谁回传总结。
-- **插件站点体系**：广播 / 执行 / 中转 / 收集四类站点、35 个内置点位（工具前后、LLM 接管与改写、提示词、压缩、SSH 执行、**整轮 tool loop 接管**、工具申报、插件生命周期、轮次结束/取消/出错、提问暂停、对账结果、后台任务台账、站点拓扑、逐调用用量、修复文案与结果探针、LLM 登记回执、点位申报…），可接管 LLM 这一跳、改工具数据、接管 SSH 执行、申报工具与 UI 槽位；另接 MCP。
+- **agent 能力全在插件**：会话、工具循环、上下文压缩、团队协作、提问、用量与 Spec 体系都在 `tree.agent` 里；内核不认识 agent / 会话 / 团队 / 模型。
+- **插件平台的三类贡献面**：**广播站**（增量事件）、**收集站**（当前态快照 / 能力申报）、**委派**（插件承接 REST 端点）。站点分广播 / 执行 / 中转 / 收集四类，点位由插件在运行期申报——核心不维护静态能力清单，新增能力不需要核心发版。
+- **路由即申报**：内核只硬编码自己的 39 条；其余 54 条由插件启动时经 `system.collect.api.routes` 申报，核心只做归属转发与响应校验（契约全集 93 条）。
+- **UI 即插件**：同一插件内可开多个窗口（`w1`/`w2`…，核心拉起进程并注入 `TREE_UI_WINDOW_ID`），多个 UI 插件也可并存；全部 UI 被卸载时由不可卸载的极小引导壳接管插件管理。
+- **文件与终端下沉执行器**：`local_executor` / `ssh_executor` 在插件内部定义执行站命令；UI 与 agent 都只经它们读写文件、开终端。SSH 终端复用 agent 已登记的租约，UI 不持有凭据。
 - **Spec（规范）体系**：把"这类活怎么干"沉淀成规范，开工挂规范、长任务里全文进系统提示词；内置 general-task / hard-task / team-meeting / plugin-creator。
-- **本地与 SSH 双模式**：工具、文件面板、Git 面板同一套语义；SSH 下 agent 在远端主机 / 容器里读写，**成员跟随 leader 的 SSH**。
+- **本地与 SSH 双模式**：工具、文件面板同一套语义；SSH 下 agent 在远端主机 / 容器里读写，**成员跟随 leader 的 SSH**。
 - **harness 即 IDE**：不用离开应用就能改代码、跑命令——右侧文件面板直接编辑并保存（`Ctrl+S`、失焦自动保存、冲突检测），`Ctrl+J` 打开真·伪终端；改的跑的都在同一个项目目录里。
 
 ## 架构一览
 
 ```
-┌──────────────── Flutter UI 进程 ─────────────────┐
-│ ApiService / WebSocketService                    │
-└───────────────────────┬──────────────────────────┘
-                        │ 127.0.0.1 随机端口 + 一次性 token（仅经 stdout 握手）
-┌───────────────────────┴──────────────────────────┐
-│ tree_core（纯 Dart，单文件可执行）                 │
-│  CoreServer        路由 / 鉴权 / 覆盖度不变量       │
-│  ConversationService + LlmAgentEngine             │
-│                    会话 / 工具循环 / 压缩 / 缓存    │
-│  WorkspaceIO       Local（dart:io）/ SSH（dartssh2）│
-│  TreeStore         yaml 配置 + jsonl 会话           │
-│  Team / Spec / MCP / Plugin 子系统                 │
-└──────────────────────────────────────────────────┘
+┌──────────── 引导壳 Tree.exe（非 Flutter，不可卸载）────────────┐
+│  拉起内核；全部 UI 卸载时打开核心自带的静态插件管理页             │
+└───────────────────────────┬────────────────────────────────┘
+                            │ 拉起
+┌───────────────────────────┴────────────────────────────────┐
+│ 内核 tree_core（纯 Dart，单文件可执行）                        │
+│  CoreServer      39 条永久路由 / 鉴权 / 覆盖度不变量           │
+│  PluginBus       进程表 · 站点总线 · 路由归属转发（39 + 54）    │
+│  WsStationBridge UI 订阅 / 四态投递（data·closed·lagged·reset）│
+│  Store / Logs    数据存储 API · 日志 API                      │
+└───────┬───────────────────────────────┬────────────────────┘
+        │ stdio JSON-RPC 2.0            │ WebSocket（TREE_CORE_URL/TOKEN）
+┌───────┴─────────────────┐      ┌──────┴──────────────────────┐
+│ 功能插件（headless）      │      │ UI 插件（runtime: ui）        │
+│ tree.agent / files /    │      │ tree-ui-default（可多窗口）   │
+│ local_executor /        │      │                             │
+│ ssh_executor / mcp /    │      │                             │
+│ compact / extra-tools / │      │                             │
+│ self_updater            │      │                             │
+└─────────────────────────┘      └─────────────────────────────┘
 ```
 
-细节见 [架构文档](docs/architecture.md) 与各模块 README（[core](packages/tree_core/README.md) / [protocol](packages/tree_protocol/README.md) / [local_exec](packages/tree_local_exec/README.md) / [cli](packages/tree_core_cli/README.md) / [UI](lib/README.md)）。
+内核的 39 条永久面 = 平台控制面 19（含 UI 多窗口 3）+ 传输设置 9 + 引导壳 3 + 发现面 1 + 日志 3 + 存储 4。细节见 [架构文档](docs/architecture.md)、[UI 插件化](docs/pluginization/ui-pluginization.md) 与 [agent 插件化](docs/pluginization/agent_pluginization.md)。
+
+## 插件清单
+
+| 插件 | 角色 | 承接 / 能力 |
+| --- | --- | --- |
+| `tree.agent` | headless | agent 与会话、工具循环、压缩、团队、提问、用量、Spec（含原生 `spec` 工具）、自建事件广播站、执行器激活站 |
+| `files` | headless | 文件面板 13 条 REST（本机与 SSH 同形：列表 / 内容 / 读写 / PDF / 上传 / 同步 / 打包 / 结构改动） |
+| `local_executor` | headless | 本机执行站：`file.*` / `exec.command` / 终端会话（PTY + 广播站输出） |
+| `ssh_executor` | headless | SSH 工作空间执行站：`ssh.file.*` / `ssh.exec.command` / SSH 终端；目标机按需推送 `tree_agent` |
+| `mcp` | headless | MCP 服务管理 3 条 REST 与工具接入 |
+| `compact` | headless | 上下文压缩中转站（失败自动回退内置压缩） |
+| `extra-tools` | headless | 补充工具定义 |
+| `self_updater` | headless | 框架自迭代：列插件 / 看阶段 / 转储 / 热重启（含自重启） |
+
+`plugins/` 下的 `minimal` / `sample` / `suspendable` / `terminal_probe` 是测试与示例插件，`_kit` 是插件仓公共骨架。插件源码独立成仓，本仓 `plugins/` 是它的本地 clone。
 
 ## 快速开始（从源码）
 
 ```powershell
-# 1) 编译核心
-dart compile exe packages/tree_core_cli/bin/tree_core.dart -o build/windows/x64/runner/Debug/tree_core.exe
-# 2) 运行应用（会自动找到并拉起核心）
-flutter run -d windows
-```
+# 开发回路：脚本起核心（stdout 握手），再把 URL / token 注入 flutter run
+.\tool\dev_run.ps1
 
-一条命令出便携包（构建 + 编译核心 + 自检 + 压 zip）：
+# 单独编译内核
+dart run tool/build_core.dart --out dist/tree_core.exe
 
-```powershell
+# 编译插件仓全部插件（逐个 --selftest，并写发布索引）
+dart run tool/build_plugins.dart
+
+# 出便携包（构建 + 编译核心 + 自检 + 压 zip）
 dart run tool/package_windows.dart --flutter "<flutter.bat 的路径>"
 # 产物：dist/tree-desktop-<版本>-windows-x64.zip
+
+# 把 Flutter 发行目录打成 UI 插件包（tree-ui-default-<版本>.zip）
+dart run tool/package_ui_plugin.dart --build
 ```
 
 完整环境要求、测试矩阵、打包与安装包流程、调试技巧（附着模式 / 只跑核心 / 真机 SSH 门控测试）：[开发文档](docs/development.md)。
@@ -71,17 +101,20 @@ dart run tool/package_windows.dart --flutter "<flutter.bat 的路径>"
 
 | 文档 | 内容 |
 | --- | --- |
-| [docs/architecture.md](docs/architecture.md) | 进程模型、会话与工具循环、工作空间与私有目录、团队、存储、插件/站点体系 |
+| [docs/architecture.md](docs/architecture.md) | 进程模型、站点体系、路由归属、工作空间、团队、存储 |
 | [docs/development.md](docs/development.md) | 环境、构建、测试矩阵、打包与安装包、调试、发布检查单 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 开发规则约束：提交规范、测试要求、文档制度、跨模块不变量 |
+| [docs/pluginization/ui-pluginization.md](docs/pluginization/ui-pluginization.md) | UI 插件化与核心收束（核心侧唯一事实来源） |
+| [docs/pluginization/agent_pluginization.md](docs/pluginization/agent_pluginization.md) | agent 能力插件化（`tree.agent` 承接范围与契约） |
+| [docs/pluginization/ui-pluginization_acceptance.md](docs/pluginization/ui-pluginization_acceptance.md) | 逐批次验收清单与台账 |
+| [docs/plugin-development.md](docs/plugin-development.md) | 写插件的系统指南（协议、站点与点位、scope、执行站命令、流式接管） |
 | [docs/team.md](docs/team.md) | 团队与成员语义（共享工作目录、私有分栏、SSH 跟随、会话并行、派活与回信） |
-| [docs/plugin-development.md](docs/plugin-development.md) | 写插件的系统指南（协议、35 个点位、scope、执行站命令、流式接管） |
 | [docs/known-issues.md](docs/known-issues.md) | 已知问题台账（现象 / 根因 / 修复 / 验证） |
 | [docs/README.md](docs/README.md) | 全部文档索引（含历史与设计稿） |
 
 ## 分支说明
 
-- `desktop`（当前分支）：后端逻辑已迁入本机核心进程，**单机桌面应用**；`server/` 已于 M7 删除。
+- `desktop`（当前分支）：单机桌面形态，内核 + 插件进程 + UI 插件；`server/` 已于 M7 删除。
 - `main`：保留"Flutter 前端 + Python 后端"的服务端形态（旧 SDK 工具链）。
 
 两条线在独立 git worktree 中并行开发，**不迁移数据**。
@@ -98,4 +131,3 @@ dart run tool/package_windows.dart --flutter "<flutter.bat 的路径>"
 - **MCP 社区** —— Model Context Protocol，`mcp` 工具与全局 MCP 服务管理构建于其上。
 - **dartssh2** —— 纯 Dart SSH/SFTP 客户端，支撑 SSH 运行模式。
 - **Flutter / Dart 团队**，以及 OpenAI Chat Completions 协议、FastAPI、Docker 等生态。
-- 所有直接或间接支撑本项目的开源软件与贡献者。
