@@ -7,6 +7,7 @@ import '../models/agent.dart';
 import '../../io/api_service.dart';
 import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
+import '../../io/service_availability.dart';
 import '../../io/ssh_executor_service.dart';
 import '../../io/station_client.dart';
 import '../../io/workspace_refresh_service.dart';
@@ -21,7 +22,6 @@ import '../widgets/create_agent_dialog.dart';
 import '../widgets/detail_panel.dart';
 import '../widgets/download_panel.dart';
 import '../widgets/file_panel.dart';
-import '../widgets/git_history.dart';
 import '../widgets/mcp_config_panel.dart';
 import '../widgets/message_panel.dart';
 import '../widgets/model_info_panel.dart';
@@ -449,7 +449,6 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   /// 再透给窗口身体——避免「文件」窗与「正在执行的 tool」窗各自监听、互相抢
   /// `takeAreas()`，那是个"取走即清空"的通知）。
   int _fileRefreshTrigger = 0;
-  int _gitRefreshTrigger = 0;
   int _todoRefreshTrigger = 0;
   int _toolRunsRefreshTrigger = 0;
 
@@ -492,7 +491,6 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     if (areas == null || areas.isEmpty) return;
     setState(() {
       if (areas.contains(WorkspaceArea.files)) _fileRefreshTrigger++;
-      if (areas.contains(WorkspaceArea.git)) _gitRefreshTrigger++;
       if (areas.contains(WorkspaceArea.todo)) _todoRefreshTrigger++;
       if (areas.contains(WorkspaceArea.toolRuns)) _toolRunsRefreshTrigger++;
     });
@@ -570,6 +568,15 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
               return _buildServiceOfflineBanner(context, reason);
             },
           ),
+          // G-7：领域端点的归属插件不可用（503）时也要"服务级"可见，
+          // 而不是只在某次请求的 catch 里闪一行错误。
+          ValueListenableBuilder<String?>(
+            valueListenable: ServiceAvailability.reason,
+            builder: (BuildContext context, String? reason, Widget? child) {
+              if (reason == null) return const SizedBox.shrink();
+              return _buildServiceUnavailableBanner(context, reason);
+            },
+          ),
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) {
@@ -624,6 +631,43 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 reason,
                 style: TextStyle(color: scheme.onErrorContainer, fontSize: 12.5),
               ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 领域服务不可用的顶部提示条（G-7：归属插件停用 / 崩溃 ⇒ 核心回 503）。
+  ///
+  /// 与"连接断开"区分开：那条是传输层（UI 连不上核心），这条是**服务层**
+  /// （核心在、某个领域插件不在）。可手动关闭，下一次 503 会再出现。
+  Widget _buildServiceUnavailableBanner(BuildContext context, String reason) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.tertiaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        child: Row(
+          children: <Widget>[
+            Icon(
+              Icons.cloud_off_outlined,
+              size: 16,
+              color: scheme.onTertiaryContainer,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                '服务不可用：$reason',
+                style: TextStyle(
+                  color: scheme.onTertiaryContainer,
+                  fontSize: 12.5,
+                ),
+              ),
+            ),
+            TextButton(
+              onPressed: ServiceAvailability.dismiss,
+              child: const Text('知道了'),
             ),
           ],
         ),
@@ -1531,20 +1575,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 fileRefreshTrigger: _fileRefreshTrigger,
               ),
       ),
-      // Git 历史 / Todo（用户 2026-10-19）：从「文件」窗里拆出来各自成窗，
-      // 文件窗只干"看文件"一件事；未选 agent 时同样走「请先选择 Agent」空态。
-      RightPanelEntry(
-        id: 'git',
-        label: 'Git 历史',
-        icon: Icons.history_outlined,
-        bodyBuilder: (BuildContext context) => workspaceId.isEmpty
-            ? _buildNoAgentHint()
-            : GitHistory(
-                workspaceId: workspaceId,
-                teamId: _selectedAgent?.id,
-                refreshTrigger: _gitRefreshTrigger,
-              ),
-      ),
+      // Todo（用户 2026-10-19）：从「文件」窗里拆出来单独成窗；Git 历史已
+      // 随 git 路由删除下线（2026-10-25），右栏不再提供该窗口。
       RightPanelEntry(
         id: 'todo',
         label: 'Todo',

@@ -221,7 +221,7 @@
 
 15. **运行模式与工作目录是团队级的：成员默认继承团队 TOP**（[ui/services/team_scope_view.dart](ui/services/team_scope_view.dart)，
     [test/team_scope_view_test.dart](../test/team_scope_view_test.dart) 强制；核心口径见
-    [team/README.md](../packages/tree_core/lib/src/team/README.md) 不变量 2/3/13，**用户断言 2026-10-03**）：
+    team/README.md 不变量 2/3/13，**用户断言 2026-10-03**）：
     中栏左上角的模式开关与目录**按团队 TOP 合成**，不再是"只看成员自己那份配置"——
     ① **模式**：成员自己**显式**配了 SSH 就以自己为准（与核心 `teamSshConfigFor` 同优先级），否则跟随 TOP；
     ② **工作目录**：**只有 TOP 那份算数**（成员自己那份是核心写的镜像），显示 TOP 的目录；TOP 未配置时退回

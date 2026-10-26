@@ -79,15 +79,23 @@ void main() {
     expect(frames[1]['type'], 'agent_done');
   });
 
-  test('closed / lagged / reset 不转投；topic 非法或 payload 非对象也跳过', () {
+  test('closed 不转投；reset / lagged 只对领域事件站转成 station_resync', () {
     final List<Map<String, dynamic>> frames = <Map<String, dynamic>>[];
     final FrameRouter router = FrameRouter(
       deliveries: const Stream<StationDelivery>.empty(),
       dispatch: frames.add,
     );
 
+    // closed：没有"补数据"含义，不转投。
+    router.handleDelivery(
+      delivery(
+        topic: 'tree.agent.s1.agent_done',
+        payload: <String, dynamic>{'type': 'agent_done'},
+        state: StationDeliveryState.closed,
+      ),
+    );
+    // lagged（丢帧）/ reset（新通道 seq 归零）⇒ 通知 UI 拉快照对齐（L-09）。
     for (final StationDeliveryState state in <StationDeliveryState>[
-      StationDeliveryState.closed,
       StationDeliveryState.lagged,
       StationDeliveryState.reset,
     ]) {
@@ -99,6 +107,16 @@ void main() {
         ),
       );
     }
+    // 终端站的 reset 是每次开终端都正常的，不触发会话重载。
+    router.handleDelivery(
+      StationDelivery(
+        stationId: 'plugin.local_executor.broadcast.terminal',
+        point: 'plugin.local_executor.broadcast.terminal',
+        topic: 'terminal.t1.output',
+        payload: const <String, dynamic>{},
+        state: StationDeliveryState.reset,
+      ),
+    );
     router.handleDelivery(
       delivery(topic: 'bad-topic', payload: <String, dynamic>{}),
     );
@@ -106,8 +124,13 @@ void main() {
       delivery(topic: 'tree.agent.s1.msg_chunk', payload: 'text'),
     );
 
-    expect(frames, isEmpty);
-    expect(router.routed, 0);
+    expect(frames.map((Map<String, dynamic> f) => f['type']).toList(), <String>[
+      'station_resync',
+      'station_resync',
+    ]);
+    expect(frames[0]['state'], StationDeliveryState.lagged.wire);
+    expect(frames[1]['state'], StationDeliveryState.reset.wire);
+    expect(router.routed, 0, reason: 'resync 是合成帧，不计入转投数');
   });
 
   test('seq 水位：重复/回退丢弃，跳号记账，reset 清零', () async {

@@ -14,6 +14,7 @@ import '../ui/models/file_listing.dart';
 import '../ui/models/file_node.dart';
 import '../ui/models/git_status.dart';
 import '../ui/models/session.dart';
+import 'service_availability.dart';
 
 /// 流式下载被调用方取消（M8d 下载列表的「取消」按钮）。
 ///
@@ -82,6 +83,19 @@ class FileWriteConflict implements Exception {
 
   @override
   String toString() => detail;
+}
+
+/// Git 面板功能已下线（用户决定：删除 git 3 条路由）。
+///
+/// 三个方法仍保留签名，免得 UI 层大改；调用即抛 404 语义异常，
+/// Git 历史面板会显示可读原因，文件树的 git 状态着色会静默关闭。
+class GitFeatureRemoved implements Exception {
+  const GitFeatureRemoved();
+
+  static const int statusCode = 404;
+
+  @override
+  String toString() => 'Git 功能已下线（HTTP 404）：核心已删除 git 路由';
 }
 
 /// API 服务 - 封装对**本机核心进程**的 REST 调用。
@@ -270,7 +284,10 @@ class ApiService {
         currentSize: (data['size'] as num?)?.toInt(),
       );
     }
-    final Map<String, dynamic> data = _handleResponse(response);
+    final Map<String, dynamic> data = _handleResponse(
+      response,
+      path: '/api/files/$workspaceId/content',
+    );
     return (data['size'] as num?)?.toInt() ?? content.length;
   }
 
@@ -301,46 +318,23 @@ class ApiService {
     );
   }
 
-  // ==================== Git 相关接口 ====================
+  // ==================== Git 相关接口（已下线） ====================
 
-  /// 获取 Git 提交历史
-  ///
-  /// 调用 `GET /api/workspaces/{workspace_id}/git/log?limit=50`，返回
-  /// `{"commits": [...]}`，每条提交包含 hash、message、date 等字段。
-  /// 网络异常或核心进程返回错误时抛出中文异常。
+  /// 获取 Git 提交历史：**已下线**（核心删除 git 路由，G1 决策）。
   static Future<List<Map<String, dynamic>>> getGitLog(
     String workspaceId, {
     int limit = 50,
     String teamId = '',
   }) async {
-    final Map<String, dynamic> data = await _getJson(
-      '/api/workspaces/$workspaceId/git/log',
-      query: {
-        'limit': limit.toString(),
-        if (teamId.isNotEmpty) 'team_id': teamId,
-      },
-    );
-    final List<dynamic> commits = data['commits'] as List<dynamic>? ?? [];
-    return commits
-        .map(
-          (dynamic e) => Map<String, dynamic>.from(e as Map<dynamic, dynamic>),
-        )
-        .toList();
+    throw const GitFeatureRemoved();
   }
 
-  /// 获取 Git 分支列表
-  ///
-  /// 调用 `GET /api/workspaces/{workspace_id}/git/branches`，返回
-  /// `{"branches": [...], "current": "..."}`。
-  /// 网络异常或核心进程返回错误时抛出中文异常。
+  /// 获取 Git 分支列表：**已下线**（核心删除 git 路由，G1 决策）。
   static Future<Map<String, dynamic>> getGitBranches(
     String workspaceId, {
     String teamId = '',
   }) async {
-    return _getJson(
-      '/api/workspaces/$workspaceId/git/branches',
-      query: {if (teamId.isNotEmpty) 'team_id': teamId},
-    );
+    throw const GitFeatureRemoved();
   }
 
   // ==================== 文件同步相关接口 ====================
@@ -854,6 +848,15 @@ class ApiService {
     return _getJson('/api/agents/$agentId');
   }
 
+  /// 激活某个 agent 的执行器：`POST /api/agents/{id}/activate`（tree.agent 承接）。
+  ///
+  /// local：检查设备与工作空间（不建连接）；ssh：**真建连**并登记远端租约，
+  /// 回 `ssh_lease_id` / `conn_id` / `root`。终端在开会话前调用它——否则 SSH
+  /// 终端只能回"没有可复用的 SSH 连接"。
+  static Future<Map<String, dynamic>> activateAgent(String agentId) {
+    return _postJson('/api/agents/${Uri.encodeComponent(agentId)}/activate');
+  }
+
   /// 获取 agent 的可用模型池与当前模型信息（右栏「模型信息」页使用）
   ///
   /// 调用 `GET /api/agents/{id}/models-info`，返回
@@ -992,6 +995,31 @@ class ApiService {
       query: <String, String>{
         if (teamId != null && teamId.isNotEmpty) 'team_id': teamId,
       },
+    );
+  }
+
+  /// 列出当前 UI 窗口：`GET /api/plugin/windows`（多窗口诊断 / 面板展示用）。
+  static Future<Map<String, dynamic>> listUiWindows() {
+    return _getJson('/api/plugin/windows');
+  }
+
+  /// 再开一个窗口：`POST /api/plugin/windows`（窗口 = 核心拉起的新进程）。
+  ///
+  /// 返回 `{ok, plugin_id, window_id, pid}`；不是 UI / 未启用 / 依赖不满足 /
+  /// 超过窗口上限时核心回 409（本方法抛可读异常）。
+  static Future<Map<String, dynamic>> createUiWindow(String pluginId) {
+    return _postJson(
+      '/api/plugin/windows',
+      body: <String, dynamic>{'plugin_id': pluginId},
+    );
+  }
+
+  /// 关掉某个 UI 插件的**全部窗口**：`DELETE /api/plugin/windows/{pluginId}`。
+  ///
+  /// UI 的「退出应用」用它：只关自己会让其余窗口留在没有托盘的孤岛里。
+  static Future<Map<String, dynamic>> closeUiWindows(String pluginId) {
+    return _deleteJson(
+      '/api/plugin/windows/${Uri.encodeComponent(pluginId)}',
     );
   }
 
@@ -1734,26 +1762,14 @@ class ApiService {
     );
   }
 
-  /// 工作空间的 git 状态（文件面板的 VS Code 型状态着色）。
+  /// 工作空间的 git 状态：**已下线**（核心删除 git 路由，G1 决策）。
   ///
-  /// 调用 `GET /api/files/{workspaceId}/git-status`，返回
-  /// `{is_repo, entries: [{path, status}], truncated}`（解析见 [parseGitStatus]，
-  /// 核心契约里的 `is_repo=false` ⇒ 空表 ⇒ 完全不着色）。
-  /// **核心还没实现这个端点（404/501）或网络异常时同样抛中文异常**，由调用方决定
-  /// 是否静默——文件面板会吞掉它变成"完全不着色"（状态色是锦上添花，不能因为它
-  /// 把整棵树变成错误页）。
-  ///
-  /// 路径字面量与协议包：核心那位加路由时会同步补 `ApiPaths`（packages/** 不在
-  /// 本切片范围内），落地后这里的字面量应换成协议常量。
+  /// 文件面板会吞掉异常 ⇒ 不再有 git 状态着色；不再发已删除的请求。
   static Future<GitStatusSnapshot> getGitStatus(
     String workspaceId, {
     String teamId = '',
   }) async {
-    final Map<String, dynamic> data = await _getJson(
-      _filesPath(workspaceId, ApiPaths.fileGitStatus),
-      query: {if (teamId.isNotEmpty) 'team_id': teamId},
-    );
-    return parseGitStatus(data);
+    throw const GitFeatureRemoved();
   }
 
   /// 新建目录：`POST /api/files/{workspaceId}/mkdir`，请求体 `{path}`。
@@ -1824,6 +1840,21 @@ class ApiService {
     }
   }
 
+  // ==================== 终端（执行器插件 REST） ====================
+
+  /// 终端会话的写操作转发（`/api/terminal/{local|ssh}/sessions[/{id}/...]`）。
+  ///
+  /// 这些端点由**执行器插件**申报（`local_executor` / `ssh_executor`），核心只做
+  /// 归属转发；这里不解析终端语义，调用方（终端面板）自己读 `cwd` / `shell`。
+  static Future<Map<String, dynamic>> terminalPost(
+    String path,
+    Map<String, dynamic> body,
+  ) => _postJson(path, body: body);
+
+  /// 关闭一个终端会话（`DELETE /api/terminal/{local|ssh}/sessions/{id}`）。
+  static Future<Map<String, dynamic>> terminalDelete(String path) =>
+      _deleteJson(path);
+
   // ==================== 内部工具方法 ====================
 
   /// 发送 GET 请求并解析 JSON 响应
@@ -1840,7 +1871,7 @@ class ApiService {
         uri,
         headers: _getHeaders(),
       );
-      return _handleResponse(response);
+      return _handleResponse(response, path: path);
     } catch (e) {
       if (e is Exception) {
         rethrow;
@@ -1866,7 +1897,7 @@ class ApiService {
         headers: _getHeaders(),
         body: body != null ? jsonEncode(body) : null,
       );
-      return _handleResponse(response);
+      return _handleResponse(response, path: path);
     } catch (e) {
       if (e is Exception) {
         rethrow;
@@ -1890,7 +1921,7 @@ class ApiService {
         headers: _getHeaders(),
         body: body != null ? jsonEncode(body) : null,
       );
-      return _handleResponse(response);
+      return _handleResponse(response, path: path);
     } catch (e) {
       if (e is Exception) {
         rethrow;
@@ -1910,7 +1941,7 @@ class ApiService {
         uri,
         headers: _getHeaders(),
       );
-      return _handleResponse(response);
+      return _handleResponse(response, path: path);
     } catch (e) {
       if (e is Exception) {
         rethrow;
@@ -1923,9 +1954,13 @@ class ApiService {
   ///
   /// - 401：本地 token 无效（核心进程重启会换 token）
   /// - 501：该能力尚未在核心进程实现（迁移期里程碑的显式标记）
+  /// - 503：领域端点的归属插件不可用（停用 / 启动失败 / 崩溃）；抬到全局提示条
   /// - 非 200：抛出 HTTP 状态码异常
   /// - 200：解析 JSON 响应体（强制 UTF-8 解码，避免中文乱码）
-  static Map<String, dynamic> _handleResponse(http.Response response) {
+  static Map<String, dynamic> _handleResponse(
+    http.Response response, {
+    String path = '',
+  }) {
     if (response.statusCode == 401) {
       // 桌面分支没有账号体系：401 只可能是本地 token 不对（例如应用连上了
       // 上一轮遗留的核心实例）。**不清 token、不跳登录页**，只报错。
@@ -1934,9 +1969,17 @@ class ApiService {
     if (response.statusCode == 501) {
       throw Exception('功能开发中');
     }
+    if (response.statusCode == 503) {
+      // G-7：领域插件不可用是**服务级**状态，不止"这一次请求失败"。
+      final String detail = _errorFromBody(response);
+      ServiceAvailability.reportUnavailable(detail);
+      throw Exception('服务不可用：$detail');
+    }
     if (response.statusCode != 200) {
       throw Exception(_errorFromBody(response));
     }
+    // 领域端点成功 ⇒ 之前那条 503 提示自动撤掉（平台面端点不参与，见类注释）。
+    ServiceAvailability.reportAvailable(path);
     // 核心进程的 Content-Type 为 application/json（无 charset），
     // http 包默认按 latin-1 解码导致中文乱码，这里强制 UTF-8。
     final String body = utf8.decode(response.bodyBytes);

@@ -22,6 +22,11 @@ class CoreAttachment {
   /// 核心一次性本地 token。
   static const String envToken = 'TREE_CORE_TOKEN';
 
+  /// 窗口 id（多窗口：核心拉起每个窗口时注入 `w1` / `w2`…）。
+  ///
+  /// 空串 = 不是核心拉起的窗口（开发期手动运行 / 老核心）⇒ 仍走单实例锁。
+  static const String envWindowId = 'TREE_UI_WINDOW_ID';
+
   /// 数据根（loader 与核心共用的键；没有就为空串，**不猜** `%APPDATA%\Tree`）。
   static const String envDataRoot = 'TREE_DATA_ROOT';
 
@@ -43,6 +48,9 @@ class CoreAttachment {
 
   /// 核心数据根（日志 / 用量账本的读入口）；拿不到时为空串。
   String dataRoot = '';
+
+  /// 本窗口的窗口 id（多窗口）；空串 = 非核心拉起。
+  String windowId = '';
 
   /// 最近一次附着失败的可读原因（启动错误页展示）。
   String lastError = '';
@@ -81,6 +89,7 @@ class CoreAttachment {
       source[envDataRoot] ?? '',
       source[envHome] ?? '',
     ]);
+    windowId = (source[envWindowId] ?? '').trim();
     _keyOverride = (source['TREE_INSTANCE_KEY'] ?? '').trim();
 
     if (rawUrl.isEmpty || rawToken.isEmpty) {

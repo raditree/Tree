@@ -9,7 +9,6 @@ import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
 import '../models/file_listing.dart';
 import '../models/file_node.dart';
-import '../models/git_status.dart';
 import '../services/file_reveal.dart';
 import '../services/workspace_paths.dart';
 import 'file_tree_icon.dart';
@@ -34,16 +33,15 @@ const double kFileTreeEdgePadding = 6;
 /// 1. **惰性加载的嵌套树**：目录就地展开 / 折叠，展开时按需拉取该层（不预拉整棵）；
 /// 2. **只显示名字 + 类型图标**（没有"大小 / 修改时间"两列）：那两条信息进悬停 tooltip；
 /// 3. **中性类型图标**（[fileTreeVisualFor] 纯函数给形状、[fileTreeIconColor] 给色）：
-///    图标跟主题走、只有 git 状态上色（用户 2026-10-04 看图定稿，推翻旧的写死色板）；
+///    图标跟主题走（用户 2026-10-04 看图定稿，推翻旧的写死色板）；
 /// 4. **缩进引导线 + 箭头（只在目录上，展开顺时针转 90°）**，文件行留等宽空槽；
 /// 5. **整行悬停 / 选中高亮**，键盘 ↑/↓ 在树里移动选中；
-/// 6. **git 状态着色**（整行名字 + 行尾字母，目录聚合子项状态）：核心没有这个端点时静默不着色；
-/// 7. **新建 / 重命名 / 删除**（右键菜单 + 头部工具条；行内重命名、删除前确认）。
+/// 6. **新建 / 重命名 / 删除**（右键菜单 + 头部工具条；行内重命名、删除前确认）。
 ///
-/// 数据全部经核心：目录列举 [ApiService.getFilesWithMeta]、git 状态
-/// [ApiService.getGitStatus]、新建 [ApiService.createDirectory] /
-/// [ApiService.saveFileContent]、改名 [ApiService.renamePath]、删除
-/// [ApiService.deletePath]（前端不直接读盘，见 lib/README.md 不变量 1）。
+/// 数据全部经核心：目录列举 [ApiService.getFilesWithMeta]、新建
+/// [ApiService.createDirectory] / [ApiService.saveFileContent]、改名
+/// [ApiService.renamePath]、删除 [ApiService.deletePath]（前端不直接读盘，见
+/// lib/README.md 不变量 1）。Git 状态着色随 git 路由删除一并下线（2026-10-25）。
 class FileTree extends StatefulWidget {
   /// 工作空间 ID
   final String workspaceId;
@@ -166,14 +164,8 @@ class _FileTreeState extends State<FileTree> {
   /// 行滚动控制器（键盘移动选中时要把它滚进可见区）
   final ScrollController _scrollController = ScrollController();
 
-  /// git 状态快照（树渲染完拉一次，缓存到面板状态；操作后失效重拉）
-  GitStatusSnapshot _gitStatus = GitStatusSnapshot.none;
-
   /// 过期响应的世代号：切工作空间 / 重置后自增，旧请求回来直接丢
   int _generation = 0;
-
-  /// git 状态请求序号：后发先至的旧响应不许覆盖新状态
-  int _gitStatusRequest = 0;
 
   @override
   void initState() {
@@ -222,12 +214,11 @@ class _FileTreeState extends State<FileTree> {
       _hoveredPath = null;
       _renamingPath = null;
       _renameError = null;
-      _gitStatus = GitStatusSnapshot.none;
     });
     await _reloadAll();
   }
 
-  /// 重拉：根 + **已展开的目录**（展开状态不塌）+ git 状态
+  /// 重拉：根 + **已展开的目录**（展开状态不塌）
   Future<void> _reloadAll() async {
     await _loadDir('');
     if (!mounted) return;
@@ -235,7 +226,6 @@ class _FileTreeState extends State<FileTree> {
       if (!mounted) return;
       await _loadDir(dir);
     }
-    await _refreshGitStatus();
   }
 
   /// 拉一层目录（软更新：已有旧数据时保持可见，失败才换成错误行）
@@ -285,32 +275,6 @@ class _FileTreeState extends State<FileTree> {
       return a.isDirectory ? -1 : 1;
     }
     return a.name.toLowerCase().compareTo(b.name.toLowerCase());
-  }
-
-  /// 重新拉 git 状态。
-  ///
-  /// **失败一律静默不着色**：核心可能还没实现这个端点（404/501）、工作空间可能
-  /// 不是仓库、也可能断网——状态色是锦上添花，不能因为它把整棵树变成错误页。
-  Future<void> _refreshGitStatus() async {
-    final int generation = _generation;
-    final int request = ++_gitStatusRequest;
-    GitStatusSnapshot snapshot = GitStatusSnapshot.none;
-    try {
-      snapshot = await ApiService.getGitStatus(
-        widget.workspaceId,
-        teamId: widget.teamId ?? '',
-      );
-    } on Exception {
-      snapshot = GitStatusSnapshot.none;
-    }
-    if (!mounted ||
-        generation != _generation ||
-        request != _gitStatusRequest) {
-      return;
-    }
-    setState(() {
-      _gitStatus = snapshot;
-    });
   }
 
   // ==================== 展开 / 折叠 / 选中 ====================
@@ -809,17 +773,12 @@ class _FileTreeState extends State<FileTree> {
     final bool selected = _selectedPath == path;
     final bool hovered = _hoveredPath == path;
     final bool renaming = _renamingPath == path;
-    final GitFileStatus? git = isDir
-        ? _gitStatus.aggregateForDirectory(path)
-        : _gitStatus.statusFor(path);
     final FileTreeVisual visual = fileTreeVisualFor(
       path,
       isDirectory: isDir,
       expanded: expanded,
     );
-    final Color nameColor = git == null
-        ? cs.onSurface
-        : gitStatusColor(git).withValues(alpha: gitStatusOpacity(git));
+    final Color nameColor = cs.onSurface;
 
     final Widget body = SizedBox(
       key: FileTree.rowKey(path),
@@ -879,7 +838,7 @@ class _FileTreeState extends State<FileTree> {
                     Icon(
                       visual.icon,
                       size: 14,
-                      // 图标一律中性（跟主题走）：颜色只留给 git 状态（名字染色 + 行尾字母）
+                      // 图标一律中性（跟主题走）
                       color: fileTreeIconColor(cs),
                     ),
                     const SizedBox(width: 6),
@@ -898,20 +857,6 @@ class _FileTreeState extends State<FileTree> {
                           ),
                         ),
                       ),
-                    // 行尾 git 状态字母（目录带聚合状态时也用同一个字母，更淡）
-                    if (git != null) ...<Widget>[
-                      const SizedBox(width: 6),
-                      Text(
-                        git.letter,
-                        style: TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w700,
-                          color: gitStatusColor(git).withValues(
-                            alpha: gitStatusOpacity(git),
-                          ),
-                        ),
-                      ),
-                    ],
                     const SizedBox(width: kFileTreeEdgePadding),
                   ],
                 ),
@@ -934,7 +879,7 @@ class _FileTreeState extends State<FileTree> {
 
     if (renaming) return body;
     return Tooltip(
-      message: _tooltipFor(node, path, visual, git),
+      message: _tooltipFor(node, path, visual),
       waitDuration: const Duration(milliseconds: 400),
       child: body,
     );
@@ -1005,7 +950,7 @@ class _FileTreeState extends State<FileTree> {
     );
   }
 
-  /// 悬停 tooltip：名字（截断时靠它看全）+ 类型 · 大小/项数 · 修改时间 · git 状态。
+  /// 悬停 tooltip：名字（截断时靠它看全）+ 类型 · 大小/项数 · 修改时间。
   ///
   /// 「大小 / 修改时间」两列已从行里去掉，信息都搬到这里（VS Code 的资源管理器也
   /// 只显示名字 + 类型图标）：文件给 3.7 KB · 2026-10-02 11:31，目录给
@@ -1014,7 +959,6 @@ class _FileTreeState extends State<FileTree> {
     FileNode node,
     String path,
     FileTreeVisual visual,
-    GitFileStatus? git,
   ) {
     final List<String> parts = <String>[visual.label];
     if (node.isDirectory) {
@@ -1028,7 +972,6 @@ class _FileTreeState extends State<FileTree> {
     }
     final String modified = _formatModified(node.modified);
     if (modified.isNotEmpty) parts.add(modified);
-    if (git != null) parts.add(git.label);
     final String title = node.name;
     final String detail = parts.join(' · ');
     return '$title\n$detail';
@@ -1256,7 +1199,6 @@ class _FileTreeState extends State<FileTree> {
     });
     widget.onPathChanged?.call(dirPath);
     await _loadDir(dirPath);
-    await _refreshGitStatus();
     if (!mounted) return;
     _showSnackBar('$action：$target');
   }
@@ -1357,7 +1299,6 @@ class _FileTreeState extends State<FileTree> {
     widget.onPathChanged?.call(workspacePathParent(next));
     widget.onPathRenamed?.call(path, next);
     await _loadDir(dir);
-    await _refreshGitStatus();
     if (!mounted) return;
     final String oldName = node.name;
     final String nextName = rawName.trim();
@@ -1479,7 +1420,6 @@ class _FileTreeState extends State<FileTree> {
     });
     widget.onPathDeleted?.call(path);
     await _loadDir(parent);
-    await _refreshGitStatus();
     if (!mounted) return;
     _showSnackBar('已删除：$name');
   }

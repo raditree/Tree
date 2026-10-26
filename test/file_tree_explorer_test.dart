@@ -198,7 +198,7 @@ void main() {
   });
 
   group('类型图标 / 箭头 / 缩进引导线', () {
-    testWidgets('目录与文件都用中性图标（跟主题走）：类型靠形状、颜色只留给 git 状态', (
+    testWidgets('目录与文件都用中性图标（跟主题走）：类型只靠形状，不再有 git 状态色', (
       WidgetTester tester,
     ) async {
       await pumpTree(tester);
@@ -475,97 +475,6 @@ void main() {
     });
   });
 
-  group('git 状态着色（VS Code 口径）', () {
-    testWidgets('文件按状态染名字 + 行尾字母；目录聚合子项状态；一次请求就够', (
-      WidgetTester tester,
-    ) async {
-      core.gitStatus = <String, dynamic>{
-        'is_repo': true,
-        'entries': <dynamic>[
-          <String, dynamic>{'path': 'src/main.dart', 'status': 'M'},
-          <String, dynamic>{'path': 'a.txt', 'status': 'U'},
-        ],
-      };
-      await pumpTree(tester);
-
-      final Text untracked = tester.widget<Text>(find.descendant(of: find.byKey(FileTree.rowKey('a.txt')), matching: find.text('a.txt')));
-      expect(untracked.style?.color, const Color(0xFF73C991));
-      expect(
-        find.descendant(
-          of: find.byKey(FileTree.rowKey('a.txt')),
-          matching: find.text('U'),
-        ),
-        findsOneWidget,
-      );
-
-      final Text dir = tester.widget<Text>(find.descendant(of: find.byKey(FileTree.rowKey('src')), matching: find.text('src')));
-      expect(
-        dir.style?.color,
-        const Color(0xFFE2A03F),
-        reason: '目录聚合：子项改了 ⇒ 目录也带色',
-      );
-      expect(
-        find.descendant(
-          of: find.byKey(FileTree.rowKey('src')),
-          matching: find.text('M'),
-        ),
-        findsOneWidget,
-      );
-
-      final Text clean = tester.widget<Text>(find.descendant(of: find.byKey(FileTree.rowKey('b.md')), matching: find.text('b.md')));
-      expect(clean.style?.color, schemeAt(tester, 'b.md').onSurface);
-      expect(
-        core.gitStatusRequests,
-        1,
-        reason: '一帧一次请求就够，不要塞进每一行的重建路径',
-      );
-    });
-
-    testWidgets('不是仓库（is_repo=false）⇒ 一行都不上色', (WidgetTester tester) async {
-      await pumpTree(tester);
-      expect(
-        tester.widget<Text>(find.descendant(of: find.byKey(FileTree.rowKey('a.txt')), matching: find.text('a.txt'))).style?.color,
-        schemeAt(tester, 'a.txt').onSurface,
-      );
-      expect(find.text('U'), findsNothing);
-      expect(find.text('M'), findsNothing);
-    });
-
-    testWidgets('核心还没这个端点（404）⇒ 静默不着色，树照常可用', (
-      WidgetTester tester,
-    ) async {
-      core.gitStatusStatus = 404;
-      await pumpTree(tester);
-      expect(find.text('a.txt'), findsOneWidget);
-      expect(find.byIcon(Icons.error_outline), findsNothing);
-      expect(
-        tester.widget<Text>(find.descendant(of: find.byKey(FileTree.rowKey('a.txt')), matching: find.text('a.txt'))).style?.color,
-        schemeAt(tester, 'a.txt').onSurface,
-      );
-    });
-
-    testWidgets('改名 / 删除之后 git 状态会重拉（着色不滞后）', (
-      WidgetTester tester,
-    ) async {
-      core.gitStatus = <String, dynamic>{
-        'is_repo': true,
-        'entries': <dynamic>[
-          <String, dynamic>{'path': 'a.txt', 'status': 'M'},
-        ],
-      };
-      await pumpTree(tester);
-      final int before = core.gitStatusRequests;
-
-      await openRowMenu(tester, 'a.txt');
-      await tester.tap(find.text('删除'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.widgetWithText(FilledButton, '删除'));
-      await pumpUntil(tester, () => core.gitStatusRequests > before);
-
-      expect(core.gitStatusRequests, greaterThan(before));
-    });
-  });
-
   group('右键菜单与条目动作', () {
     testWidgets('全部折叠：把展开的目录（含嵌套）收回去，并滚回顶部', (
       WidgetTester tester,
@@ -742,7 +651,7 @@ void main() {
         ),
         findsOneWidget,
       );
-      // 建完还要重拉目录 + 重拉 git 状态，提示是最后一步：等它真的出现
+      // 建完只重拉目录，提示是最后一步：等它真的出现
       await pumpUntil(
         tester,
         () => find.textContaining('新建文件：hello.txt').evaluate().isNotEmpty,

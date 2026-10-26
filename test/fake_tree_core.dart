@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
-/// 假核心：只实现文件面板（目录树 / git 状态 / 新建 / 改名 / 删除）用得上的端点。
+/// 假核心：只实现文件面板（目录树 / 新建 / 改名 / 删除）用得上的端点。
 ///
 /// 为什么真起一个本机 HttpServer（与 test/file_editor_test.dart 同一套路）：ApiService
 /// 是静态的、直连核心，只有让它真发一次请求，才能验证"打到的是哪个端点、路径与 body
@@ -20,15 +20,6 @@ class FakeTreeCore {
 
   /// 根列举是否被核心截断（truncated 标记）
   bool truncatedRoot = false;
-
-  /// git 状态响应（默认"不是仓库" ⇒ 完全不着色）
-  Map<String, dynamic> gitStatus = <String, dynamic>{
-    'is_repo': false,
-    'entries': <dynamic>[],
-  };
-
-  /// git 状态端点的状态码（404 = 核心还没这个端点：UI 必须静默不着色）
-  int gitStatusStatus = 200;
 
   /// 收到的请求（方法 + 路径 + 查询串 + body）
   final List<
@@ -114,14 +105,6 @@ class FakeTreeCore {
         (queryContains == null || c.query.contains(queryContains)),
   );
 
-  /// git 状态被拉了几次（钉"一帧一次请求就够"）
-  int get gitStatusRequests => calls
-      .where(
-        (({String method, String path, String query, Map<String, dynamic> body}) c) =>
-            c.method == 'GET' && c.path.endsWith('/git-status'),
-      )
-      .length;
-
   Future<void> _handle(HttpRequest request) async {
     final String raw = await utf8.decoder.bind(request).join();
     final Map<String, dynamic> body = raw.trim().isEmpty
@@ -138,14 +121,7 @@ class FakeTreeCore {
     int status = 200;
     final String path = request.uri.path;
     if (request.method == 'GET') {
-      if (path.endsWith('/git-status')) {
-        if (gitStatusStatus != 200) {
-          status = gitStatusStatus;
-          payload = <String, dynamic>{'detail': 'git 状态不可用'};
-        } else {
-          payload = gitStatus;
-        }
-      } else if (path.endsWith('/content')) {
+      if (path.endsWith('/content')) {
         if (failContent) {
           status = 500;
           payload = <String, dynamic>{'detail': '读文件失败（脚本化）'};

@@ -1,15 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:tree/ui/models/git_status.dart';
 import 'package:tree/ui/widgets/file_tree_icon.dart';
 
-/// 文件树的**视觉映射纯函数**（中性类型图标 + git 状态装饰色）。
+/// 文件树的**视觉映射纯函数**（中性类型图标）。
 ///
 /// 用户 2026-10-04 看图定稿（"文件为什么是这种橙色"）：图标**一律中性、跟主题走**
 /// （[fileTreeIconColor]），类型靠**形状**区分、展开 / 收起靠**左侧箭头**区分；
-/// 颜色只留给 git 状态。旧的"暖黄文件夹 / 青色 Dart / 蓝色 md"写死色板已被推翻，
-/// 所以这里不再钉任何类型颜色——钉的是图标形状、kind 与 git 色（字面值）。
+/// 旧的"暖黄文件夹 / 青色 Dart / 蓝色 md"写死色板已被推翻，所以这里不再钉任何
+/// 类型颜色——钉的是图标形状与 kind（git 状态色随功能下线删除）。
 void main() {
   group('类型图标（纯函数，不带类型色）', () {
     test('目录：收起 / 展开是两个 kind，但都是描边文件夹图标', () {
@@ -162,22 +161,5 @@ void main() {
     });
   });
 
-  group('git 状态装饰色（纯函数，唯一保留的颜色）', () {
-    test('每个状态一个固定色：M 黄橙 / U·A·R 绿 / D 红 / I 灰', () {
-      expect(gitStatusColor(GitFileStatus.modified), const Color(0xFFE2A03F));
-      expect(gitStatusColor(GitFileStatus.untracked), const Color(0xFF73C991));
-      expect(gitStatusColor(GitFileStatus.added), const Color(0xFF73C991));
-      expect(gitStatusColor(GitFileStatus.deleted), const Color(0xFFE05252));
-      expect(gitStatusColor(GitFileStatus.renamed), const Color(0xFF73C991));
-      expect(gitStatusColor(GitFileStatus.ignored), const Color(0xFF7A7A7A));
-    });
 
-    test('「被忽略」压暗（更淡），其余不透明度 1.0', () {
-      expect(gitStatusOpacity(GitFileStatus.ignored), lessThan(1.0));
-      for (final GitFileStatus status in GitFileStatus.values) {
-        if (status == GitFileStatus.ignored) continue;
-        expect(gitStatusOpacity(status), 1.0, reason: status.name);
-      }
-    });
-  });
 }

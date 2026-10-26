@@ -1301,6 +1301,16 @@ class _MessagePanelState extends State<MessagePanel> {
     if (!mounted) return;
     final String? type = data['type'] as String?;
 
+    // L-09 / E2E-04：领域事件站发来 `reset`（重连后新通道 seq 归零）或 `lagged`
+    // （队列溢出丢过帧）⇒ **先拉快照再对齐**。快照复用会话详情 REST（tree.agent 承接），
+    // 整表重载；否则断线期间/溢出期间的增量永远补不回来（表现为缺字或重复段落）。
+    if (type == 'station_resync') {
+      if (widget.selectedAgent == null) return;
+      debugPrint('[消息] 站点 ${data['state']} ⇒ 重拉快照对齐');
+      unawaited(_loadHistory());
+      return;
+    }
+
     // 账本会在**没有对话帧**的时刻增长：压缩那两路（内置 `compact` / 插件中转经执行站
     // `llm.call`）都是核心内部或**插件进程**发起的调用，只写 `usage.jsonl`、不发对话帧
     // ⇒ 实时行入口（[_appendCallUsage] 那条路）永远收不到它们。
@@ -2268,7 +2278,7 @@ class _MessagePanelState extends State<MessagePanel> {
                   height: _terminalHeight,
                   child: TerminalPanel(
                     agentId: agent.id,
-                    webSocket: _webSocket,
+                    ssh: _sshEnabled,
                     onToggle: _toggleTerminal,
                     onClose: _toggleTerminal,
                     // 终端里的 `#TSend` 与手打一条消息走**同一个发送口**（上传附件、

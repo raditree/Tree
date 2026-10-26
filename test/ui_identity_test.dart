@@ -46,6 +46,26 @@ void main() {
     expect(data['capabilities'], contains('plugin.manage'));
   });
 
+  test('多窗口：hello 带 window_id（连接与窗口能对上），单窗口不带该键', () {
+    writeManifest(<String, Object>{
+      'id': 'tree.ui.default',
+      'version': '1.0.5',
+      'runtime': 'ui',
+    });
+    final UiIdentity identity = UiIdentity.load(appDir: temp);
+
+    final Map<String, dynamic> multi =
+        identity.helloFrame(windowId: 'w2')!;
+    final Map<String, dynamic> multiData =
+        multi['data'] as Map<String, dynamic>;
+    expect(multiData['window_id'], 'w2');
+
+    final Map<String, dynamic> single = identity.helloFrame()!;
+    final Map<String, dynamic> singleData =
+        single['data'] as Map<String, dynamic>;
+    expect(singleData.containsKey('window_id'), isFalse);
+  });
+
   test('没有清单时退回默认 id 且不发握手（开发期不能把自己踢下线）', () {
     final UiIdentity identity = UiIdentity.load(appDir: temp);
 

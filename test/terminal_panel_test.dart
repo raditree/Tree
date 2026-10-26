@@ -6,7 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:tree/io/websocket_service.dart';
+import 'package:tree/ui/services/terminal_transport.dart';
 import 'package:tree/ui/services/vt_screen.dart';
 import 'package:tree/ui/widgets/terminal_panel.dart';
 import 'package:tree_protocol/tree_protocol.dart';
@@ -21,23 +21,81 @@ bool screenHasText(TerminalPanelState state) {
   return false;
 }
 
-/// 假 WS：只把终端那条广播流交出来，并记录前端发出去的帧。
+/// 假传输面：把会话调用记成"旧帧形状"，并把输出帧交回来。
 ///
 /// 为什么不打真核心：这一层要验证的是「键盘怎么变成字节、帧怎么变成屏幕」，
-/// 与网络无关；真 PTY 的行为在核心侧单测里验（见 packages/tree_core/test/terminal_service_test.dart）。
-class FakeWs extends WebSocketService {
-  FakeWs() {
+/// 与网络无关；真 PTY 的行为在执行器插件自检里验
+/// （`plugins/local_executor --selftest` 的终端用例）。
+class FakeTransport implements TerminalTransport {
+  FakeTransport() {
     _controller = StreamController<Map<String, dynamic>>.broadcast();
   }
 
   late final StreamController<Map<String, dynamic>> _controller;
   final List<Map<String, dynamic>> sent = <Map<String, dynamic>>[];
+  String _session = '';
 
   @override
-  Stream<Map<String, dynamic>> get terminalFrames => _controller.stream;
+  Stream<Map<String, dynamic>> get frames => _controller.stream;
 
   @override
-  void send(Map<String, dynamic> message) => sent.add(message);
+  Future<Map<String, dynamic>> open({
+    required String sessionId,
+    required String agentId,
+    required int columns,
+    required int rows,
+  }) async {
+    _session = sessionId;
+    sent.add(<String, dynamic>{
+      'type': TerminalInboundType.open,
+      TerminalFrame.terminalId: sessionId,
+      TerminalFrame.agentId: agentId,
+      TerminalFrame.columns: columns,
+      TerminalFrame.rows: rows,
+    });
+    return <String, dynamic>{
+      'session_id': sessionId,
+      'cwd': '/workspace/a1',
+      'shell': 'sh',
+    };
+  }
+
+  @override
+  Future<void> input(String sessionId, List<int> bytes) async {
+    sent.add(<String, dynamic>{
+      'type': TerminalInboundType.input,
+      TerminalFrame.terminalId: sessionId,
+      TerminalFrame.bytes: base64Encode(bytes),
+    });
+  }
+
+  @override
+  Future<void> resize(String sessionId, int columns, int rows) async {
+    sent.add(<String, dynamic>{
+      'type': TerminalInboundType.resize,
+      TerminalFrame.terminalId: sessionId,
+      TerminalFrame.columns: columns,
+      TerminalFrame.rows: rows,
+    });
+  }
+
+  @override
+  Future<void> close() async => _recordClose();
+
+  @override
+  void dispose() {
+    _recordClose();
+    unawaited(_controller.close());
+  }
+
+  void _recordClose() {
+    if (_session.isEmpty) return;
+    sent.add(<String, dynamic>{
+      'type': TerminalInboundType.close,
+      TerminalFrame.terminalId: _session,
+    });
+    _session = '';
+  }
 
   void emit(Map<String, dynamic> frame) => _controller.add(frame);
 
@@ -58,10 +116,10 @@ class FakeWs extends WebSocketService {
 }
 
 void main() {
-  late FakeWs ws;
+  late FakeTransport ws;
 
   setUp(() {
-    ws = FakeWs();
+    ws = FakeTransport();
   });
 
   Future<void> pumpPanel(
@@ -76,7 +134,8 @@ void main() {
           height: 320,
           child: TerminalPanel(
             agentId: 'a1',
-            webSocket: ws,
+            ssh: false,
+            transport: ws,
             onToggle: onToggle ?? () {},
             onClose: onClose,
           ),
@@ -418,7 +477,8 @@ void main() {
           height: 600,
           child: TerminalPanel(
             agentId: 'a1',
-            webSocket: ws,
+            ssh: false,
+            transport: ws,
             onToggle: () {},
           ),
         ),

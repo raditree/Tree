@@ -39,14 +39,19 @@ Future<void> main() async {
     return;
   }
 
-  // **单实例判定**：同一核心只跑一个 UI 进程（不同核心的端口不同，互不干扰）。
-  final SingleInstanceState instanceState = await SingleInstanceLock.instance
-      .acquire(key: attachment.instanceKey);
-  if (instanceState == SingleInstanceState.alreadyRunning) {
-    // 已经请那个实例把窗口叫到前面了（托盘里的窗口会自己出来）。这个窗口只说明
-    // 一句就自己关闭：**同一核心只保留一个 UI 实例**。
-    runApp(const AlreadyRunningApp());
-    return;
+  // **单实例判定**：只对"不是核心拉起的窗口"生效（开发期手动运行 / 老核心）。
+  // 多窗口：核心拉起的每个窗口都带自己的 `TREE_UI_WINDOW_ID`，它们本来就该并存，
+  // 再抢同一把锁会把第二个窗口直接关掉。
+  if (attachment.windowId.isEmpty) {
+    final SingleInstanceState instanceState = await SingleInstanceLock.instance
+        .acquire(key: attachment.instanceKey);
+    if (instanceState == SingleInstanceState.alreadyRunning) {
+      // 已经请那个实例把窗口叫到前面了（托盘里的窗口会自己出来）。这个窗口只说明
+      // 一句就自己关闭：**手动重复启动**只保留一个 UI 实例；要多窗口请用托盘
+      // 菜单里的「新建窗口」（由核心拉起新进程，互不影响）。
+      runApp(const AlreadyRunningApp());
+      return;
+    }
   }
 
   // 关闭行为与主题一样属于本地偏好：先读出来，再决定关窗怎么做
@@ -54,6 +59,19 @@ Future<void> main() async {
 
   // 窗口控制插件先初始化（关闭拦截放到"核心起来了"之后：见下面的注释）
   await windowManager.ensureInitialized();
+
+  // 多窗口：第 2 个及以后的窗口默认与主窗口完全重叠，往右下错开并标上窗口号——
+  // 否则用户点了「新建窗口」会觉得“什么都没发生”。
+  if (attachment.windowId.isNotEmpty &&
+      attachment.windowId != 'w1') {
+    try {
+      final Offset origin = await windowManager.getPosition();
+      await windowManager.setPosition(origin + const Offset(36, 36));
+      await windowManager.setTitle('Tree — ${attachment.windowId}');
+    } catch (error) {
+      debugPrint('多窗口：错开新窗口位置失败（忽略）：$error');
+    }
+  }
 
   // 加载本地保存的主题模式
   await ThemeService.instance.load();
@@ -69,7 +87,11 @@ Future<void> main() async {
   WebSocketService.baseUrl = attachment.wsBaseUrl;
   ApiService.setToken(attachment.token);
   // U3：装成插件时（同目录有 plugin.json）连上即声明身份；开发期不发。
-  WebSocketService.helloFrame = UiIdentity.load().helloFrame();
+  // 多窗口：把本窗口 id 一并带上，核心据此把“连接”与“窗口”对上。
+  final UiIdentity identity = UiIdentity.load();
+  WebSocketService.helloFrame = identity.helloFrame(
+    windowId: attachment.windowId,
+  );
   // U4：站点订阅依赖 ui.hello 归属；没有身份时（开发期）不建这条连接。
   if (WebSocketService.helloFrame != null) {
     StationClient.instance.start();
@@ -77,14 +99,24 @@ Future<void> main() async {
     FrameRouter.instance.start();
   }
 
-  // **拦截关闭按钮**：默认只隐藏窗口（见 [TrayService]），真正的退出走托盘菜单 /
-  // 设置页的退出入口。桌面端的长任务正在跑时，误点关闭等于终止整轮工作。
-  //
-  // 放在核心就绪之后：错误页那条路没有窗口监听者，拦下关闭会让用户关不掉窗口。
-  await windowManager.setPreventClose(true);
+  // **托盘归属**：同一核心的多个窗口里只有一个装托盘（否则会出现多个图标与多个
+  // “退出”入口）。抢不到的窗口按普通窗口处理：关窗即退出。
+  TrayService.instance.uiPluginId = identity.fromManifest
+      ? identity.pluginId
+      : '';
+  final bool trayOwner = await TrayService.instance.claimTrayOwner(
+    attachment.instanceKey,
+  );
+  if (trayOwner) {
+    // **拦截关闭按钮**：默认只隐藏窗口（见 [TrayService]），真正的退出走托盘菜单 /
+    // 设置页的退出入口。桌面端的长任务正在跑时，误点关闭等于终止整轮工作。
+    //
+    // 放在核心就绪之后：错误页那条路没有窗口监听者，拦下关闭会让用户关不掉窗口。
+    await windowManager.setPreventClose(true);
 
-  // 托盘装不上**不致命**，但必须显式告诉用户：此时关闭按钮会直接退出（见 TrayService）
-  await TrayService.instance.install();
+    // 托盘装不上**不致命**，但必须显式告诉用户：此时关闭按钮会直接退出（见 TrayService）
+    await TrayService.instance.install();
+  }
 
   // 另一个实例想启动时（用户又双击了桌面图标）：把本窗口叫到前面——用户期望看到的是
   // "窗口回来了"，而不是"点了图标什么都没发生"。托盘不可用时也要能唤起（show 与托盘无关）。

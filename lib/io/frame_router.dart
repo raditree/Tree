@@ -58,7 +58,19 @@ class FrameRouter {
   /// 处理一条站点投递（公开可见：测试不必起真实连接）。
   void handleDelivery(StationDelivery delivery) {
     if (delivery.state != StationDeliveryState.data) {
-      // closed / lagged / reset 的可见性由 StationClient 负责；这里不重复提示。
+      // `reset`（新通道 seq 归零）/ `lagged`（队列溢出丢帧）都意味着**本地状态可能
+      // 缺口**：对领域事件站要通知 UI「先拉快照再对齐」（L-09 / E2E-04）。
+      // 终端站的 reset 是每次开终端都正常的，不在这里触发重载。
+      if (delivery.stationId == StationClient.agentEventsStation &&
+          (delivery.state == StationDeliveryState.reset ||
+              delivery.state == StationDeliveryState.lagged)) {
+        _dispatch(<String, dynamic>{
+          'type': 'station_resync',
+          'station_id': delivery.stationId,
+          'state': delivery.state.wire,
+          if (delivery.reason != null) 'reason': delivery.reason,
+        });
+      }
       return;
     }
     final String? topic = delivery.topic;

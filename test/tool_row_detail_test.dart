@@ -643,20 +643,20 @@ void main() {
       expect(panel.contains('_tabController'), isFalse,
           reason: '顶层页签已撤，改由 RightPanelHost 的窗口 chip 承担');
       expect(panel.contains("const Tab(text: '详情')"), isFalse);
-      // 用户 2026-10-19：Git 历史 / Todo 也从文件窗移出，各自成窗（见下一条用例）；
+      // 用户 2026-10-19：Git 历史 / Todo 也从文件窗移出；Git 已于 2026-10-25 下线。
       // 文件窗只留"看文件"这一件事，TickerProvider + TabController 一并撤掉。
       expect(panel.contains("Tab(text: 'Git 历史')"), isFalse);
       expect(panel.contains("Tab(text: 'Todo')"), isFalse);
       expect(panel.contains('TabBar'), isFalse);
     });
 
-    test('Git 历史 / Todo 改成独立窗口，文件窗里没有它们', () {
-      // 用户 2026-10-19：「移除文件浏览窗口内的 git 与 todo」「增加 todo 的单独窗口」
-      expect(page.contains("id: 'git'"), isTrue);
+    test('Git 历史已下线；Todo 仍为独立窗口', () {
+      // 2026-10-25：git 路由/API 已删除，右栏不再提供 Git 历史窗口。
+      expect(page.contains("id: 'git'"), isFalse);
+      expect(page.contains('GitHistory('), isFalse);
       expect(page.contains("id: 'todo'"), isTrue);
-      expect(page.contains('GitHistory('), isTrue);
       expect(page.contains('TodoPanel('), isTrue);
-      // 文件窗不再透传 git/todo 刷新触发（它们各归自己的窗口）
+      // 文件窗不再透传 git/todo 刷新触发
       expect(panel.contains('gitRefreshTrigger'), isFalse);
       expect(panel.contains('todoRefreshTrigger'), isFalse);
     });

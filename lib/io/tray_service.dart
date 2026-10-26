@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
+import 'api_service.dart';
 import 'single_instance.dart';
 
 /// 点窗口关闭按钮时该做什么（**纯决策**，与插件无关，便于单测）。
@@ -47,7 +48,23 @@ class TrayService extends ChangeNotifier {
   static const String tooltipHidden = 'Tree — 正在后台运行（双击恢复窗口，右键退出）';
 
   static const String menuShow = '显示主窗口';
+  static const String menuNewWindow = '新建窗口';
   static const String menuQuit = '退出 Tree';
+
+  /// 本进程的 UI 插件 id（空 = 开发期手动运行 / 没有清单）。
+  ///
+  /// 有它才能让核心“再拉起一个同一个插件的窗口”，也才能在退出时把同插件的
+  /// **全部**窗口一起关掉。
+  String uiPluginId = '';
+
+  /// 托盘归属锁：多窗口 / 多 UI 插件下**只有一个窗口**装托盘。
+  ///
+  /// 用回环端口当锁（进程退出由内核释放）：谁抢到谁负责托盘与“关窗进托盘”。
+  /// 抢不到的窗口按普通窗口处理（关窗即退出、没有托盘），避免出现多个托盘图标。
+  final SingleInstanceLock _trayLock = SingleInstanceLock();
+
+  /// 本进程是否持有托盘归属（[claimTrayOwner] 的结果）。
+  bool _ownsTray = false;
 
   bool _closeToTray = true;
   bool _askOnClose = true;
@@ -120,6 +137,21 @@ class TrayService extends ChangeNotifier {
       ? TrayCloseAction.hideToTray
       : TrayCloseAction.quit;
 
+  /// 抢“托盘归属”：同一核心的多个窗口里只有一个能返回 true。
+  ///
+  /// 返回值只决定**本窗口**是否装托盘 / 是否拦关闭；抢不到不是错误（不写
+  /// [installError]，避免每个副窗口都弹一条“托盘不可用”的启动提示）。
+  Future<bool> claimTrayOwner(String coreKey) async {
+    final SingleInstanceState state = await _trayLock.acquire(
+      key: 'tray:$coreKey',
+    );
+    _ownsTray = state == SingleInstanceState.acquired;
+    if (!_ownsTray) {
+      debugPrint('托盘归属：已被同一核心的另一个窗口持有，本窗口不装托盘（关窗即退出）');
+    }
+    return _ownsTray;
+  }
+
   /// 装上托盘图标与菜单。返回是否可用；失败原因进 [installError]。
   ///
   /// 幂等：已经装好时直接返回 true。
@@ -141,6 +173,12 @@ class TrayService extends ChangeNotifier {
         menuShow,
         MenuItemType.normal,
       );
+      final MenuItem? newWindowItem = uiPluginId.isEmpty
+          ? null
+          : MenuItem.createWithLabelAndType(
+              menuNewWindow,
+              MenuItemType.normal,
+            );
       final MenuItem? quitItem = MenuItem.createWithLabelAndType(
         menuQuit,
         MenuItemType.normal,
@@ -152,10 +190,16 @@ class TrayService extends ChangeNotifier {
       showItem.addListener((MenuEvent event) {
         if (event is MenuItemClickedEvent) unawaited(showWindow());
       });
+      newWindowItem?.addListener((MenuEvent event) {
+        if (event is MenuItemClickedEvent) unawaited(newWindow());
+      });
       quitItem.addListener((MenuEvent event) {
         if (event is MenuItemClickedEvent) unawaited(quit());
       });
       menu.addItem(showItem);
+      if (newWindowItem != null) {
+        menu.addItem(newWindowItem);
+      }
       menu.addSeparator();
       menu.addItem(quitItem);
       icon.setContextMenu(menu);
@@ -203,12 +247,76 @@ class TrayService extends ChangeNotifier {
     await windowManager.hide();
   }
 
-  /// **真正退出界面**：解除单实例锁 → 拿掉托盘图标 → 销毁窗口。
+  /// 让核心再拉起一个**同一个 UI 插件**的窗口（多窗口 = 多进程）。
+  ///
+  /// 为什么不让本进程自己 `Process.start`：窗口的进程生命周期归核心管
+  /// （`UiHost` 记录 pid、退出要收尸、`/api/plugin/windows` 要能列出来），
+  /// 自己拉起来的进程在核心看来是孤儿。
+  Future<void> newWindow() async {
+    if (uiPluginId.isEmpty) {
+      debugPrint('新建窗口：当前进程没有插件身份（开发期手动运行），核心无法拉起新窗口');
+      return;
+    }
+    try {
+      final Map<String, dynamic> result = await ApiService.createUiWindow(
+        uiPluginId,
+      );
+      debugPrint('新建窗口：${result['window_id']}（pid=${result['pid']}）');
+    } catch (error) {
+      debugPrint('新建窗口失败：$error');
+    }
+  }
+
+  /// 关掉当前核心上**全部 UI 插件的全部窗口**（多插件并存时也要一次退干净）。
+  ///
+  /// 顺序：别的插件先关、自己最后关——关自己这一条会让核心立刻收掉本进程，
+  /// 后面的请求就没机会发出去了。
+  Future<void> _closeAllUiWindows() async {
+    final Set<String> plugins = <String>{};
+    try {
+      final Map<String, dynamic> listing = await ApiService.listUiWindows();
+      final Object? raw = listing['windows'];
+      if (raw is List<dynamic>) {
+        for (final Object? item in raw) {
+          if (item is! Map) continue;
+          final String id = (item['plugin_id'] ?? '').toString().trim();
+          if (id.isNotEmpty) plugins.add(id);
+        }
+      }
+    } catch (error) {
+      debugPrint('列出 UI 窗口失败（按本插件关闭）：$error');
+    }
+    if (uiPluginId.isNotEmpty) plugins.add(uiPluginId);
+    final List<String> targets = plugins.toList()
+      ..sort((String a, String b) {
+        if (a == uiPluginId) return 1;
+        if (b == uiPluginId) return -1;
+        return a.compareTo(b);
+      });
+    for (final String id in targets) {
+      try {
+        await ApiService.closeUiWindows(id).timeout(const Duration(seconds: 2));
+      } catch (error) {
+        // 关到自己时核心已经把本进程收掉，这里必然失败；继续本地退出即可。
+        debugPrint('关闭 UI 插件 $id 的窗口失败（继续退出）：$error');
+      }
+    }
+  }
+
+  /// **真正退出界面**：关闭全部 UI 窗口 → 解除托盘归属 → 拿掉托盘图标 → 销毁窗口。
   ///
   /// 顺序是有意的：先解除"拦截关闭"（否则后续关闭流程仍会被拦）、再拿掉图标
   /// （否则图标会残留到鼠标划过才消失）、最后才关窗口。**核心不退出**：UI 是插件，
   /// 退出界面只让 `UiHost` 把它置为 stopped，系统继续运行。
+  ///
+  /// **多窗口 / 多 UI 插件**：只有托盘归属者会先请核心把**所有 UI 插件的窗口**关掉——
+  /// 否则用户点了“退出”，其余窗口会留在没有托盘的孤岛里。副窗口的关闭走
+  /// [decideClose] 的 quit 分支，只结束自己。
   Future<void> quit() async {
+    if (_ownsTray) {
+      await _closeAllUiWindows();
+    }
+    await _trayLock.release();
     // 先放开单实例锁：万一本进程还要多活一会儿（销毁窗口），同一个核心的下一个
     // UI 实例不该被一个"正在退出"的进程挡在门外。
     await SingleInstanceLock.instance.release();

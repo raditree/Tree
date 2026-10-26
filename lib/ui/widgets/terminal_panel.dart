@@ -6,18 +6,23 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:tree_protocol/tree_protocol.dart';
 
-import '../../io/websocket_service.dart';
 import '../services/terminal_ime_input.dart';
 import '../services/terminal_output_notice.dart';
 import '../services/terminal_selection.dart';
 import '../services/terminal_send_command.dart';
+import '../services/terminal_transport.dart';
 import '../services/vt_screen.dart';
 
 /// 集成终端（Ctrl+J）：真伪终端会话的渲染 + 键盘转发。
 ///
-/// 分工：核心开 PTY、把**原始字节**发过来；[VtScreen] 把这些字节解析成「一块屏幕」；
-/// 这里只做两件事——把屏幕画出来、把键盘**原样**转成字节发回去。真终端不该有
+/// 分工：**执行器插件**（`local_executor` / `ssh_executor`）开 PTY、把**原始字节**
+/// 经自建广播站推来；[VtScreen] 把这些字节解析成「一块屏幕」；这里只做两件事——
+/// 把屏幕画出来、把键盘**原样**转成字节发回去。真终端不该有
 /// 「输入行」这个概念：vim 要的是每一次按键（方向键、Esc、Ctrl+C），不是一行命令。
+///
+/// 传输（L-26）：会话管理走 REST（`POST /api/terminal/{local|ssh}/sessions...`，
+/// 核心只做归属转发），输出走广播站（`plugin.{local,ssh}_executor.broadcast.terminal`）。
+/// **没有** WS 上行帧：核心不再持有 PTY，也不做终端数据面。
 ///
 /// 因此没有 TextField：所有按键都经 [Focus.onKeyEvent] 直接转发（Ctrl+J 例外，
 /// 它留给"切回对话输入框"，见 [onToggle]）。
@@ -25,14 +30,20 @@ class TerminalPanel extends StatefulWidget {
   const TerminalPanel({
     super.key,
     required this.agentId,
-    required this.webSocket,
+    required this.ssh,
     required this.onToggle,
     this.onClose,
     this.onSend,
+    this.transport,
   });
 
-  /// 在哪个 agent 的工作区里起 shell（核心按它解析工作区根）
+  /// 在哪个 agent 的工作区里起 shell（local 用工作目录 / ssh 用已建立的租约）
   final String agentId;
+
+  /// **有效执行模式**（由外层按团队合成口径算好：成员跟随团队 TOP）。
+  ///
+  /// 不能在面板里读 `agent.has_ssh`——那只反映成员自己的配置。
+  final bool ssh;
 
   /// `#TSend` 的落点：把一段文本（与可选的本机文件路径附件）发给**当前会话**。
   ///
@@ -41,8 +52,8 @@ class TerminalPanel extends StatefulWidget {
   /// `#TSend` 不可用（如实提示，不静默吞掉用户那一行）。
   final Future<bool> Function(String text, List<String> filePaths)? onSend;
 
-  /// 与核心通信的 WS（终端帧走它自己的广播流，不混进消息分发）
-  final WebSocketService webSocket;
+  /// 传输面（缺省 = 生产实现：执行器 REST + 广播站；测试注入内存桩）。
+  final TerminalTransport? transport;
 
   /// Ctrl+J：切回对话输入框
   final VoidCallback onToggle;
@@ -55,7 +66,7 @@ class TerminalPanel extends StatefulWidget {
 }
 
 class TerminalPanelState extends State<TerminalPanel> {
-  /// 会话 id 由**前端**生成：核心按它路由输出与退出。
+  /// 会话 id 由**前端**生成：执行器按它路由输出与退出。
   /// 每次重开换一个新 id，免得旧会话的迟到输出泼到新屏幕上。
   String _terminalId = _newTerminalId();
 
@@ -63,7 +74,12 @@ class TerminalPanelState extends State<TerminalPanel> {
       'term_${DateTime.now().microsecondsSinceEpoch}';
 
   final FocusNode _focus = FocusNode(debugLabel: 'terminal');
+  late final TerminalTransport _transport =
+      widget.transport ?? CoreTerminalTransport(sshMode: widget.ssh);
   StreamSubscription<Map<String, dynamic>>? _frames;
+
+  /// 打开中：建会话是异步 REST，期间不重发 resize（否则会撞上"会话不存在"）。
+  bool _opening = false;
 
   /// 屏幕缓冲（cols/rows 随面板尺寸变）
   VtScreen _screen = VtScreen(columns: 80, rows: 24);
@@ -121,7 +137,7 @@ class TerminalPanelState extends State<TerminalPanel> {
   @override
   void initState() {
     super.initState();
-    _frames = widget.webSocket.terminalFrames.listen(_onFrame);
+    _frames = _transport.frames.listen(_onFrame);
     // 焦点 = 输入法通道的开关：有焦点才 attach（没有焦点的连接收不到字，
     // 也会跟别处的文本输入抢平台连接）
     _focus.addListener(_syncImeConnection);
@@ -137,15 +153,14 @@ class TerminalPanelState extends State<TerminalPanel> {
     _focus.removeListener(_syncImeConnection);
     _ime.detach();
     _frames?.cancel();
-    widget.webSocket.send(<String, dynamic>{
-      'type': TerminalInboundType.close,
-      TerminalFrame.terminalId: _terminalId,
-    });
+    _transport.dispose();
     _focus.dispose();
     super.dispose();
   }
 
-  /// 核心来的终端帧
+  /// 执行器推来的终端帧（`terminal_output` / `terminal_exit`）。
+  ///
+  /// 传输面已经把「本站 + 本会话」筛过了，这里只按帧型更新屏幕与状态。
   void _onFrame(Map<String, dynamic> frame) {
     final String id = (frame[TerminalFrame.terminalId] ?? '').toString();
     if (id != _terminalId) return; // 旧会话的迟到帧：丢掉
@@ -230,11 +245,21 @@ class TerminalPanelState extends State<TerminalPanel> {
   }
 
   void _sendInput(List<int> bytes) {
-    widget.webSocket.send(<String, dynamic>{
-      'type': TerminalInboundType.input,
-      TerminalFrame.terminalId: _terminalId,
-      TerminalFrame.bytes: base64Encode(bytes),
-    });
+    if (!_opened || bytes.isEmpty) return;
+    final String id = _terminalId;
+    unawaited(() async {
+      try {
+        await _transport.input(id, bytes);
+      } catch (error) {
+        _fail('写入终端失败：$error');
+      }
+    }());
+  }
+
+  /// 把一个可读错误写到工具条（不打断会话）。
+  void _fail(String message) {
+    if (!mounted) return;
+    setState(() => _error = message);
   }
 
   // ── 选区 / 复制粘贴（用户 2026-10-03：「没法选中文字，没法复制粘贴」）────────
@@ -387,29 +412,45 @@ class TerminalPanelState extends State<TerminalPanel> {
   @visibleForTesting
   TerminalSelection? get debugSelection => _selection;
 
-  /// 开一个会话（尺寸取自当前布局）
-  void _open() {
-    widget.webSocket.send(<String, dynamic>{
-      'type': TerminalInboundType.open,
-      TerminalFrame.terminalId: _terminalId,
-      TerminalFrame.agentId: widget.agentId,
-      TerminalFrame.columns: _columns,
-      TerminalFrame.rows: _rows,
-    });
+  /// 开一个会话（尺寸取自当前布局）。
+  ///
+  /// 走哪个执行器由传输面决定：它读一次 agent 配置（`has_ssh`），SSH 只把
+  /// `host` / `username` 交给插件去复用已建立的连接（凭据只有插件有）。
+  Future<void> _open() async {
+    if (_opening) return;
+    _opening = true;
+    final String id = _terminalId;
+    final int columns = _columns;
+    final int rows = _rows;
     setState(() {
       _opened = true;
       _error = null;
       _exitCode = null;
     });
     _focus.requestFocus();
+    try {
+      final Map<String, dynamic> opened = await _transport.open(
+        sessionId: id,
+        agentId: widget.agentId,
+        columns: columns,
+        rows: rows,
+      );
+      if (!mounted || id != _terminalId) return;
+      setState(() {
+        _cwd = (opened['cwd'] ?? '').toString();
+        _shell = (opened['shell'] ?? '').toString();
+        _error = null;
+      });
+    } catch (error) {
+      _fail(_readableError(error));
+    } finally {
+      _opening = false;
+    }
   }
 
-  /// 重开：换一个会话 id 重新开（旧会话由核心在 close 时收掉）
+  /// 重开：换一个会话 id 重新开（旧会话由执行器在 close 时收掉）
   void _restart() {
-    widget.webSocket.send(<String, dynamic>{
-      'type': TerminalInboundType.close,
-      TerminalFrame.terminalId: _terminalId,
-    });
+    unawaited(_transport.close());
     setState(() {
       _terminalId = _newTerminalId();
       _screen = VtScreen(columns: _columns, rows: _rows);
@@ -430,7 +471,7 @@ class TerminalPanelState extends State<TerminalPanel> {
 
   /// 布局变化：把像素换算成列/行，屏幕与远端的 PTY 一起改。
   ///
-  /// 这个函数是 LayoutBuilder 在**布局期间**调的：那里既不能 setState，也不该发帧
+  /// 这个函数是 LayoutBuilder 在**布局期间**调的：那里既不能 setState，也不该发请求
   /// （会打断布局），所以真正的副作用统一推到帧后回调里做。
   void _applySize(BoxConstraints constraints) {
     final int columns =
@@ -448,18 +489,30 @@ class TerminalPanelState extends State<TerminalPanel> {
         _open();
         return;
       }
-      if (sizeChanged) {
+      if (sizeChanged && !_opening) {
         // 尺寸一变，VtScreen 会**重排行**（历史也跟着换宽度）⇒ 选区的绝对行号失效
         _selection = null;
-        widget.webSocket.send(<String, dynamic>{
-          'type': TerminalInboundType.resize,
-          TerminalFrame.terminalId: _terminalId,
-          TerminalFrame.columns: columns,
-          TerminalFrame.rows: rows,
-        });
+        _resizeRemote(columns, rows);
       }
       setState(() {}); // 新尺寸下重画（列行数变了）
     });
+  }
+
+  void _resizeRemote(int columns, int rows) {
+    final String id = _terminalId;
+    unawaited(() async {
+      try {
+        await _transport.resize(id, columns, rows);
+      } catch (_) {
+        // 尺寸是"下一次覆盖"的操作：失败不打断终端，也不必弹窗。
+      }
+    }());
+  }
+
+  /// 把异常整理成一句能显示的话（去 `Exception: ` 前缀，空串兜底）。
+  static String _readableError(Object error) {
+    final String text = '$error'.replaceFirst('Exception: ', '').trim();
+    return text.isEmpty ? '终端启动失败' : text;
   }
 
   @override

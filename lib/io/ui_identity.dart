@@ -42,7 +42,10 @@ class UiIdentity {
   final String error;
 
   /// 连上核心后要发的握手帧；`fromManifest` 为 false 时返回 null（不发）。
-  Map<String, dynamic>? helloFrame() {
+  ///
+  /// [windowId] 来自核心注入的 `TREE_UI_WINDOW_ID`：多窗口时它让核心把
+  /// "连接"与"窗口"对上（`/api/meta.ui[].connections` 就是窗口数）。
+  Map<String, dynamic>? helloFrame({String windowId = ''}) {
     if (!fromManifest || pluginId.isEmpty) return null;
     return <String, dynamic>{
       'type': helloType,
@@ -50,6 +53,7 @@ class UiIdentity {
         'plugin_id': pluginId,
         'version': version,
         'capabilities': capabilities,
+        if (windowId.isNotEmpty) 'window_id': windowId,
       },
     };
   }

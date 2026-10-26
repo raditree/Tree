@@ -110,14 +110,45 @@ class StationClient {
     if (_stations.isEmpty) return;
     subscribePasses += 1;
     for (final String stationId in _stations) {
-      ws.send(<String, dynamic>{
-        'type': WsInboundType.stationSubscribe,
-        'data': <String, dynamic>{
-          'station_id': stationId,
-          // 通配：UI 不按团队 / 员工隔离收件，由核心按发布方归属过滤。
-          'scope': <String, dynamic>{},
-        },
-      });
+      _sendSubscription(ws, WsInboundType.stationSubscribe, stationId);
+    }
+  }
+
+  void _sendSubscription(
+    WebSocketService ws,
+    String type,
+    String stationId,
+  ) {
+    ws.send(<String, dynamic>{
+      'type': type,
+      'data': <String, dynamic>{
+        'station_id': stationId,
+        // 通配：UI 不按团队 / 员工隔离收件，由核心按发布方归属过滤。
+        'scope': <String, dynamic>{},
+      },
+    });
+  }
+
+  /// **按需订阅**一个广播站（例如打开终端时订执行器的输出站）。
+  ///
+  /// 登记进 [_stations]（重连重放的唯一依据），因此断线重连后**不需要**调用方
+  /// 自己重订；未连接时只登记，连上后 [_subscribeAll] 会带上它。
+  void subscribeStation(String stationId) {
+    final String id = stationId.trim();
+    if (id.isEmpty || !_stations.add(id)) return;
+    final WebSocketService? ws = _ws;
+    if (ws != null) _sendSubscription(ws, WsInboundType.stationSubscribe, id);
+  }
+
+  /// 撤销按需订阅（会话结束后调用；核心收到即停投该站）。
+  void unsubscribeStation(String stationId) {
+    final String id = stationId.trim();
+    if (id.isEmpty || !_stations.remove(id)) return;
+    // 该站的 topic 水位不再有意义：留着只会在下次订阅时误丢首帧。
+    _lastSeq.removeWhere((String topic, int _) => topic.startsWith('terminal.'));
+    final WebSocketService? ws = _ws;
+    if (ws != null) {
+      _sendSubscription(ws, WsInboundType.stationUnsubscribe, id);
     }
   }
 
