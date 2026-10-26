@@ -101,6 +101,7 @@ dart run tool/package_ui_plugin.dart --build
 
 | 文档 | 内容 |
 | --- | --- |
+| [docs/handover.md](docs/handover.md) | **交接文档**：现状与基线数字、已完成提交、环境与门禁、遗留项（P0~P3）、硬约束条例、待拍板决策 |
 | [docs/architecture.md](docs/architecture.md) | 进程模型、站点体系、路由归属、工作空间、团队、存储 |
 | [docs/development.md](docs/development.md) | 环境、构建、测试矩阵、打包与安装包、调试、发布检查单 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 开发规则约束：提交规范、测试要求、文档制度、跨模块不变量 |
