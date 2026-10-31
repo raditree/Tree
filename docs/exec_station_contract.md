@@ -418,8 +418,8 @@ plugins/files/lib/src/remote_files.dart:118                 if (!'$error'.contai
 | --- | --- | --- |
 | Q-1 | 本机要不要补齐 SSH 的四个增强（`details` / `append` / `rename` / `raw` 分块读） | **已拍板 → §8**：四条全补，本机与 SSH 的 payload 键集必须相同 |
 | Q-2 | 两套租约系统（核心 `workspace/register` vs 插件 `ssh.lease.register`）要不要统一 | **已拍板 → §8**：统一到**插件侧**（`local.lease.register`），核心撤掉租约簿记与 `root` 注入；随之必须搬走「租约只能登记方自己用」那道 fail-closed |
-| Q-3 | 非 UTF-8 读取的**内联 base64**（§2.2 末行）与交接文档 §8「大文件不许塞进 JSON」的张力 | 加尺寸上限＋超限改走 `result_path`／维持现状并写明上限（**未拍板**） |
-| Q-4 | `FileRouteError.read` 把 message 塞进 `code` 的旧口径（REST 面） | 一并收成 `{status, code, message}` 三件齐／REST 面另开片（**未拍板**） |
+| Q-3 | 非 UTF-8 读取的**内联 base64**（§2.2 末行）与交接文档 §8「大文件不许塞进 JSON」的张力 | **已拍板（2026-11-01）→ 两层保证**：①行为层：所有内联**图像**统一归一到长边 `[360p, 1024p]`——超过 1024p 等比压缩、低于 360p 等比拉伸，编码前由读取侧完成；非图像的非 UTF-8 文件不内联，一律走 `result_path`。②兜底层：内联 JSON（帧 / 回包 / 请求体）统一大小上限（建议 **4 MiB**，实施时以压测确认），超限强制改走 `result_path` |
+| Q-4 | `FileRouteError.read` 把 message 塞进 `code` 的旧口径（REST 面） | **已拍板（2026-11-01）→ 一并收成 `{status, code, message}` 三件齐**，REST 面同批做、不另开片（改动集中在一处路由文件；分两次做等于两次破坏性变更） |
 | Q-4b | 本机 REST 面把 `StateError` 一律映射成 **404**（`local_executor_plugin.dart:197-198`），而 SSH 侧同类"租约/会话不存在或已存在"是 **409**（`terminal_sessions.dart:117,259,271`） | **已拍板 → §8**：本机收成 409（404 在不变量里是"插件没装"的语义，不能兼作资源冲突） |
 | Q-5 | **20 条内置命令的定位**：它们既是 §2.4 那张"必然失败"的表，也是 §2.1 那 8 个"假别名"的根源，还是 compact 四条命令失败的原因——**先定方向才谈得上清** | **已拍板：走 A（删点位表 + 让名）**，2026-10-31。领域八族从 `StationPoints.executes` 整体摘掉，族名让给真正的实现方（`llm.*` / `tool.*` / `agent.*` / `session.*` / `usage.*` ⇒ tree.agent，`fs.*` / `terminal.*` ⇒ 由要做的人带着实现申报，本期不保留假可用）。让名同时必须撤 `_checkExecuteCommands` 的 `tool.` / `agent.` 前缀禁令，否则插件认不进来 |
 | Q-6 | 两个执行器的命令名要不要对称 | **已拍板 → §8**：本机改 `local.file.*` / `local.exec.command`，与 `ssh.*` 同后缀；限定词直接取 `StationModeKey` 的两个值 |

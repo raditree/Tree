@@ -12,6 +12,7 @@
 | [team.md](team.md) | 团队与成员语义：成员即 agent、审核闸门、共享工作目录与私有分栏、SSH 跟随、会话并行、派活与回信、活动日志 |
 | [plugin-development.md](plugin-development.md) | 写插件的系统指南：一分钟上手、协议与生命周期、站点与点位（点位由核心与插件申报，数量以 `/api/meta` 为准）、scope 两套含义、执行站命令、流式接管、UI 槽位、调试 |
 | [exec_station_contract.md](exec_station_contract.md) | **执行站契约**（L-25）：`station/command` 回包信封的六个键、两个执行站命令表逐条对照（本机 8 / SSH 10 与四处能力差异）、失败来源全清单与错误码表、逐命令幂等标注、八环传递链与门禁设计 |
+| [pluginization/scope-de-domainization-recon.md](pluginization/scope-de-domainization-recon.md) | **L-23 `scope` 去领域化侦查**（本期不实现）：wire 消费点、4 类判定点、12 个插件的空 `scope` 声明、C1→C2 方案与 S0~S4 执行序 / 验收判据 |
 | [ssh-tunnel-protocol.md](ssh-tunnel-protocol.md) | **SSH 执行器「中转站」协议**：core ⇄ ssh_executor 插件 ⇄ tree_agent 三层的消息面、错误码、分块帧、版本协商、后台任务落盘台账与 PTY 契约（中转站 =「处理拓展点位」：首选 `ssh.execute` 点位投递、`tunnel.*` 作兼容层） |
 | [known-issues.md](known-issues.md) | 已知问题台账（现象 / 根因 / 修复 / 验证 / 遗留），按发现顺序编号 |
 | [../CHANGELOG.md](../CHANGELOG.md) | 版本变更记录（自首个开源版本 1.0.0 起） |
