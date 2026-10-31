@@ -290,15 +290,16 @@ plugins/files/lib/src/remote_files.dart:118                 if (!'$error'.contai
 | 插件 | `dir_not_empty` | 12 | 删除需要 `recursive:true` |
 | 插件 | `target_exists` | 12 | rename 目标已存在 ⇒ 绝不覆盖 |
 | 插件 | `bad_base64` | 12 | base64 非法 |
-| 插件 | `lease_unknown`（复用） | 12 | 即 `ssh_lease_unknown`：重登记后**只重试一次** |
+| 插件 | `lease_unknown` | 12 | 两侧共用（旧名 `local_lease_unknown` / `ssh_lease_unknown` 已归并，片 5）：重登记后**只重试一次** |
 | 插件 | `backend_unreachable` | 12 | 隧道/远端 agent 不可用（`建立 SSH 隧道失败…`） |
 | 兜底 | `unknown` | 任何没给码的失败 | 只能当"可读原因、不可编程分支"处理 |
 
 > 命名规则：`<对象>_<状态>`，不带族前缀（`file_` / `ssh_` 不带）。
 > **例外**是 `lease_unknown`：两侧共用同一个码是对的——"租约不在"这件事
 > 本来就由"谁持有租约表"决定，语义同、来源异，`mount_id` 已经指出是谁。
-> `ssh_lease_unknown` 这个名字**不迁移**：它是插件仓的字面量常量，
-> 改成 `lease_unknown` 需要同时动三个包，属于 §6 片 2 的内容（一次改完，不留兼容分支）。
+> `ssh_lease_unknown` / `local_lease_unknown` 这两个旧名**已随片 5 归并**成
+> `lease_unknown`：一次改完三个包（tree.agent / files / ssh_executor），不留兼容分支、
+> 不做消息文本兜底（门禁 §5 第 5 条钉住"消费端再无 `contains('lease_unknown')`"）。
 
 ### 4.3 传递链改造点（八环，逐点必须动，少一环码就断）
 
@@ -315,6 +316,19 @@ plugins/files/lib/src/remote_files.dart:118                 if (!'$error'.contai
 
 环 2 与环 8 之间是**插件仓**，环 3~7 在**桌面仓**：所以这一条链必须
 **先合桌面仓（能收能回），再合插件仓（开始带码）**，顺序反过来只会让码在中间掉一层。
+
+**八环现状（2026-10-31，片 5 已合）**：八环**全部带码，无缺口**。
+
+- 环 3~7（桌面仓 `8876254`）：`StationReply.code` 读 `raw['code']`；
+  `StationCommandOutcome.failed/failedWith` 带码；`_forwardStationCommand` 用
+  `_settleReplyCode` 兜底（核心自己的失败给核心码，插件给的码原样传递不改写）；
+  `ExecuteStation.execute` 六处返回各带一个码；`plugin_bus.dart` 两处出口
+  （`5101` 的 `commandUnknown` 与 `5119` 的 `result.code`）键集合同一份常量表。
+- 环 1/2/8（插件仓 `f578894`）：`ExecutorError` / `SshStationError` 构造必带码
+  （`assert` 禁空）；两个入口把异常翻成 `{'error', 'code'}`（未知异常 `unknown`）；
+  `_kit` 的 `CmdFailureException` 带 `code` + `payload`，入口翻成 lib 内自有的
+  `StationCommandFailure`（`lib/` 不许 import 包外 `../_kit`，领域库只认自有类型）。
+  三处消费端（tree.agent / files / llm 调用）改按 `e.code` 分支。
 
 ### 4.4 逐命令幂等标注（重试前必看）
 
@@ -368,6 +382,18 @@ plugins/files/lib/src/remote_files.dart:118                 if (!'$error'.contai
    "只有一个 message"的形态再生）。
 5. **消费端不许再 `contains`**：`'$error'.contains('ssh_lease_unknown')`
    这类字符串嗅探在片 2 之后命中数必须为 0（这是这条链改完的验收线）。
+
+**现状（2026-10-31，片 5 已合）**：`packages/tree_core/test/exec_station_error_code_gate_test.dart`
+六条用例全绿（`627` 条 tree_core 全量测试同时通过）。
+
+- 第 1~3 条由桌面仓自证，随环 3~7 一起生效：码表成员逐项登记（新增常量不进
+  `memberValues` 就以"未登记成员"失败）、信封六键成员逐项登记、两处出口键集合比对。
+- 第 4 条覆盖五个异常类：`_kit` 的 `CmdFailureException`、`ExecutorError`、
+  `SshStationError`、tree.agent 与 files 两处 `StationCommandFailure`——要求
+  `final String code;` + `required this.code`（默认值只允许空串，且消费端必须把它
+  归成 `unknown`），禁空、禁无码形态。
+- 第 5 条按单行 `contains[^\n]{0,100}?lease_unknown`（忽略大小写）扫描同一扫面，
+  命中数必须为 0；旧名 `local_lease_unknown` / `ssh_lease_unknown` 同理。
 
 ---
 
@@ -511,5 +537,13 @@ plugins/files/lib/src/remote_files.dart:118                 if (!'$error'.contai
   `StationReply.failedWith`（`station_runtime.dart`）与 `_forwardStationCommand` 的
   `failedWith` 把 `ok:false` 与载荷**一起**带回调用方（`llm.call` 的"已付费正文"靠它抢救，
   known-issues #31）；工具级失败仍是 `{text, is_error}`，不是站级失败。
-- **片 5 未开始**（`code` 八字段链路 + `tree_protocol` 码表 + §5 门禁其余断言）；
+- **片 5 已合（桌面仓 `8876254` + 插件仓 `f578894`，2026-10-31）**：`code` 八环链路
+  （§4.3）全部带码——桌面仓先落环 3~7（`StationReply` / `StationCommandOutcome` /
+  `_forwardStationCommand` 的 `_settleReplyCode` 兜底 / `ExecuteStation.execute` 六处 /
+  两处出口信封），插件仓再落环 1/2/8（两个执行器异常类构造必带码、入口回包递码、
+  `_kit` 的 `CmdFailureException` 带 `code` + `payload`，入口翻成 lib 内自有的
+  `StationCommandFailure`）。缺码一律 `ExecStationErrorCodes.settle()` 收敛成 `unknown`
+  并记日志（不静默）。码值归一：`local_lease_unknown` / `ssh_lease_unknown` ⇒
+  `lease_unknown`，三个包一次改完，消费端判据从消息嗅探改成 `e.code`。
+  §5 门禁第 1~5 条全部落地、六条用例全绿；tree_core 全量 `627` 条通过。
   **#43 已随 Q-7 (a) 收口**（compact 四条与 sample 四个演示开关都有承接方）。

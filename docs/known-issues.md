@@ -2542,6 +2542,7 @@ compact 四条（`llm.call` / `fs.read` / `tool.call` / `agent.compact`）与 sa
 让插件回 `{error, payload}` 时载荷不被丢弃（`llm.call` 解析失败时的模型正文，本条 issue
 最初的触发点 known-issues #31 就靠它）。
 
-**仍未做**：§8.4 片 5（`code` 八字段链路 + `tree_protocol` 码表 + §5 门禁其余断言），
-与 #43 的记录范围无关，不阻塞本条收口。
+**片 5 也已落地**（2026-10-31，桌面仓 `8876254` + 插件仓 `f578894`）：`code` 八环链路、
+`tree_protocol` 码表、§5 门禁五条断言全绿，租约旧名归并为 `lease_unknown`，
+见 [exec_station_contract.md](exec_station_contract.md) §8.4「片 5 已合」。
 

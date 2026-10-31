@@ -203,7 +203,7 @@ cd packages/tree_protocol; <flutter-sdk>/bin/dart.bat test
 | **性能基线** | 50ms/32token 合并、首字延迟差 ≤50ms 均未测 | 固定脚本压测，与迁移前数据对比并落文档 | L-06 / G-6；known-issues #40 |
 | **本地 zip 安装** | 只有仓库安装通道，无本地端点/UI 入口 | 补 `POST /api/plugin/install/local`，或明确本期不做并改文案 | L-10；known-issues #38 |
 | **compact 命令面失效** | A5 撤了领域实现、没撤点位表 ⇒ 20 条内置命令「申报了、路由得到、执行必失败」，随包插件 compact 的 `llm.call` / `fs.read` / `tool.call` / `agent.compact` 四条全踩在上面。**已收口（2026-10-31，片 1 / 片 3（桌面）+ 片 2 / 片 4 / Q-7 (a)（插件））**：点位表领域族清零（36 → 28 点位、29 → 9 命令）、撤 `tool.` / `agent.` 前缀禁令、落盘空壳读侧对账、两处门禁；两执行器改名成对称的 `local.*` / `ssh.*` 各 10 条 + 租约统一到插件侧 + tree.agent 换口 + 核心撤 `workspace/register` 与租约簿记 ⇒ **文件与终端两族真机已能打通**；让名的另一半由 tree.agent 在 `agent_tools` 站认领 `llm.call` / `fs.read` / `tool.call` / `agent.compact` / `session.rename`（插件仓 `b21e946`），compact / sample **命令名零改动**即恢复 | 真机复核 compact 的三条功能（总结调用 / 必读文件 / todo 快照） | **L-25 Q-5 / Q-7**；known-issues **#43**；契约 §8.4 落地状态 |
-| **执行站契约登记** | 契约文档已落（[exec_station_contract.md](exec_station_contract.md)：信封 / 命令表 / 码来源 / 幂等逐条对照 + 目标口径 + §8 已拍板统一口径）；**片 1（点位表让名）/ 片 2 / 片 3 / 片 4 均已合**（2026-10-31）；`code` 八字段链路、`tree_protocol` 码表、§5 门禁其余断言都还在纸面上 | 文档 §6 片 5 全部落地，门禁跑绿 | L-25 |
+| **执行站契约登记** | 契约文档已落（[exec_station_contract.md](exec_station_contract.md)：信封 / 命令表 / 码来源 / 幂等逐条对照 + 目标口径 + §8 已拍板统一口径）；**片 1 / 2 / 3 / 4 / 5 均已合**（2026-10-31，片 5 = 桌面仓 `8876254` + 插件仓 `f578894`）；`code` 八环链路、`tree_protocol` 码表、§5 门禁五条断言全部落地，门禁六条用例与 tree_core 全量 627 条跑绿（`ssh_lease_unknown` / `local_lease_unknown` 已归并为 `lease_unknown`） | 文档 §8.4 全部落地，门禁跑绿 | L-25 |
 | **插件仓 CI** | 脚本 `tool/check_plugin_repo_contract.dart` 已可跑（`--selftest` 5/5），未接进 tree-plugins CI | 插件仓流水线跑同一脚本 | L-21 |
 | **发版工程** | 见 §6，全部未执行 | push + tag + setup/zip 资产 | — |
 

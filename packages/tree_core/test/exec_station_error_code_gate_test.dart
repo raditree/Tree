@@ -10,8 +10,9 @@ import 'package:tree_protocol/tree_protocol.dart';
 /// （核心兜底成 `unknown`，等于白加）、信封两条出口少写一个键（`code` 时有时无）。
 /// 所以门禁扫的是**源码字面量**，而不是只检查常量表"看起来有没有"。
 ///
-/// 本节只覆盖桌面仓能自证的三条（§5 第 1~3 条）；第 4~5 条（插件异常类带码、
-/// 消费端不许 `contains`）依赖插件仓改造，随插件仓落地后追加。
+/// 本节覆盖契约 §5 的全部五条：码表登记完整性 + 核心侧不写字面量 + 信封键名单一来源
+/// （第 1~3 条，桌面仓自证），以及插件异常类必须带码、消费端不许 `contains`
+/// （第 4~5 条，扫插件仓源码——片 5 已落地）。
 void main() {
   final Directory repoRoot = Directory('../..');
 
@@ -265,6 +266,92 @@ void main() {
       keySets[0],
       ExecStationEnvelopeKeys.all,
       reason: '信封键集合与 ExecStationEnvelopeKeys.all 不一致：${keySets[0]}',
+    );
+  });
+
+  // ── 第 4 条：插件侧异常类必须带码（环 1 / 环 8）────────────────────
+
+  test('插件侧执行站异常类都带必填 code', () {
+    // 为什么钉这几处：插件仓的"码"有两个来源——执行器自己抛的（环 1）与骨架把
+    // 核心回包转成的异常（环 8）。它们若不带码，核心只能兜底成 `unknown`，
+    // 调用方就永远等不到 `lease_unknown` 那条"可安全重发"的分支。
+    const List<String> errorClasses = <String>[
+      'plugins/_kit/plugin_kit.dart::CmdFailureException',
+      'plugins/local_executor/lib/src/executor.dart::ExecutorError',
+      'plugins/ssh_executor/lib/src/exec_station.dart::SshStationError',
+      'plugins/tree.agent/lib/src/workspace/station_command.dart::StationCommandFailure',
+      'plugins/files/lib/src/remote_files.dart::StationCommandFailure',
+    ];
+    final List<String> offenders = <String>[];
+    for (final String entry in errorClasses) {
+      final int split = entry.indexOf('::');
+      final String relative = entry.substring(0, split);
+      final String name = entry.substring(split + 2);
+      final File source = File('${repoRoot.path}/$relative');
+      expect(source.existsSync(), isTrue, reason: '$relative 不存在');
+      final String src = source.readAsStringSync();
+      final RegExpMatch? cls = RegExp(
+        'class $name implements Exception \\{([\\s\\S]*?)\\n\\}',
+      ).firstMatch(src);
+      if (cls == null) {
+        offenders.add('$relative 找不到 class $name implements Exception');
+        continue;
+      }
+      final String body = cls.group(1)!;
+      final bool hasField = body.contains('final String code;');
+      // 骨架那条允许"老产物没给码 ⇒ 空串"（入口翻译成 unknown），其余必须必填。
+      final bool takesCode =
+          body.contains('required this.code') || body.contains('this.code =');
+      final bool guardsCode =
+          body.contains('assert(code.isNotEmpty') ||
+          body.contains("this.code = ''") ||
+          body.contains("this.code = 'unknown'");
+      if (!hasField) offenders.add('$name 缺 `final String code;`');
+      if (!takesCode) offenders.add('$name 的构造没有 code 形参');
+      if (!guardsCode) offenders.add('$name 没有禁空/兜底 code 的约束');
+    }
+    expect(
+      offenders,
+      isEmpty,
+      reason: '插件侧异常类缺码（契约 §4）：$offenders',
+    );
+  });
+
+  // ── 第 5 条：消费端不许嗅探消息文本 ─────────────────────────────────
+
+  test('没人再用消息文本判断租约失效（只认结构化 code）', () {
+    // 现场教训：两侧过去各扫 `*_lease_unknown` 前缀，插件一改文案，重登记能力
+    // 就静默消失——而且是"最需要它的那条路"先坏。判据只能是 `code`。
+    // 只在**同一行**里找 `contains(...包含 lease_unknown)`：跨行会把下一条用例的
+    // 标题误判成嗅探（测试标题里本来就会写这个码名）。
+    final RegExp sniff = RegExp(
+      r"contains[^\n]{0,100}?lease_unknown",
+      caseSensitive: false,
+    );
+    final List<String> offenders = <String>[];
+    for (final String face in scanFaces) {
+      final Directory dir = Directory('${repoRoot.path}/$face');
+      expect(dir.existsSync(), isTrue, reason: '扫描面不存在：$face');
+      for (final FileSystemEntity entity in dir.listSync(recursive: true)) {
+        if (entity is! File) continue;
+        final String normalized = entity.path.replaceAll('\\', '/');
+        if (normalized.contains('/.git/')) continue;
+        if (!entity.path.endsWith('.dart')) continue;
+        final String src = entity.readAsStringSync();
+        for (final RegExpMatch match in sniff.allMatches(src)) {
+          offenders.add(
+            '${entity.path.substring(repoRoot.path.length + 1)}: '
+            '${match.group(0)!.replaceAll(RegExp(r'\s+'), ' ')}',
+          );
+        }
+      }
+    }
+    expect(
+      offenders,
+      isEmpty,
+      reason: '以下地方仍在嗅探消息文本判断租约失效：$offenders\n'
+          '—— 请改成 `error is StationCommandFailure && error.code == ...`'
+          '（或骨架侧的 `CmdFailureException.code`）',
     );
   });
 }
