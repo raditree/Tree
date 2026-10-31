@@ -1176,6 +1176,20 @@ class ApiService {
     );
   }
 
+  /// 从**本地 zip** 装一条插件：POST [ApiPaths.pluginInstallLocal]
+  ///
+  /// 与仓库通道同构，只是字节来自用户选的离线包：zip 里必须带 `plugin.json`
+  /// （与 [ApiPaths.pluginReleaseInstall] 的成品同一形状），解开后落到
+  /// `plugins/<id>/` 目录形态（UI 插件带 `data/`、多个 dll，扁平放不下）。
+  /// 闸门 / 原子换目录 / 写 `plugins.yaml` 并热应用与仓库通道**同一条纪律**；
+  /// 失败（包不合法 / 旧进程没退 / 目录没换成功）核心回 400 + 中文原因，这里抛异常。
+  static Future<Map<String, dynamic>> installPluginLocal(String zipPath) async {
+    return _postJson(
+      ApiPaths.pluginInstallLocal,
+      body: <String, dynamic>{'zip_path': zipPath},
+    );
+  }
+
   /// 卸载一条插件：POST [ApiPaths.pluginReleaseUninstall]
   ///
   /// 四段顺序（用户 2026-10-18 定稿）：停用 → 等退出确认（**不强杀**）→ 删

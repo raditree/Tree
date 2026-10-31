@@ -131,12 +131,16 @@ void main() {
   });
 
   group('路由覆盖度不变量', () {
-    test('核心 router 键集 == coreOwned（A5 后只有平台面 39 条）', () {
+    test('核心 router 键集 == coreOwned（A5 后只有平台面 40 条）', () {
       final Set<String> registered = server.router.routes.toSet();
       final Set<String> stubs = server.stubRouter.patterns;
       final Set<String> coreOwned = ApiPaths.coreOwned;
 
-      expect(coreOwned.length, 39, reason: '核心永久面 39 条（36 + UI 多窗口 3）');
+      expect(
+        coreOwned.length,
+        40,
+        reason: '核心永久面 40 条（36 + UI 多窗口 3 + 本地安装 1）',
+      );
       expect(
         registered,
         coreOwned,

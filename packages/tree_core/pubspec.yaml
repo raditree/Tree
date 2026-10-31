@@ -15,12 +15,15 @@ dependencies:
   # `tunnel/event` 通知与 `ssh-executor` 能力名，不手写字符串
   tree_tunnel_protocol:
     path: ../tree_tunnel_protocol
-  # 以下两个是 Dart 官方包（纯 Dart、可 AOT），核心进程因此不再是"零依赖"。
+  # 以下三个是 Dart 官方包（纯 Dart、可 AOT），核心进程因此不再是"零依赖"。
   # 取舍见 lib/src/store/tree_paths.dart 与 yaml_codec.dart 的说明：
   # - path：跨平台路径拼接（Windows 盘符/分隔符由官方实现保证正确）
   # - yaml：配置文件要允许用户**手改**，必须接受任意合法 YAML（手写解析器不现实）
+  # - archive：本地 zip 安装（`POST /api/plugin/install/local`）解包；不引入
+  #   外部 unzip 进程，跨平台一致（Windows 的 tar 支持 .zip 但不是所有平台都如此）
   path: ^1.9.0
   yaml: ^3.1.2
+  archive: ^4.3.0
 
 dev_dependencies:
   lints: ^6.0.0

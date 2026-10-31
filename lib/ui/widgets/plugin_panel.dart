@@ -1,3 +1,4 @@
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
@@ -62,6 +63,13 @@ abstract class PluginAdminClient {
   /// 旧进程没确认退出就**不换文件**（核心不为换文件而强杀插件），那种失败回
   /// 400 + 原因；这里抛成异常，面板直接显示那句话。
   Future<Map<String, dynamic>> installRelease(String id);
+
+  /// 从**本地 zip** 装一条插件：POST /api/plugin/install/local。
+  ///
+  /// 给离线 / 内网环境用：UI 插件包（`tree-ui-default-*.zip`）带 `data/` 与多个
+  /// dll，装成 `plugins/<id>/` 目录形态。闸门与「写盘 + 热应用」和仓库通道同一套；
+  /// 包不合法 / 旧进程没退时核心回 400 + 原因，这里抛成异常面板直接显示。
+  Future<Map<String, dynamic>> installLocal(String zipPath);
 
   /// 卸载一条插件：POST /api/plugin/release/{id}/uninstall。
   ///
@@ -148,6 +156,10 @@ class ApiPluginAdminClient implements PluginAdminClient {
   @override
   Future<Map<String, dynamic>> installRelease(String id) =>
       ApiService.installPluginRelease(id);
+
+  @override
+  Future<Map<String, dynamic>> installLocal(String zipPath) =>
+      ApiService.installPluginLocal(zipPath);
 
   @override
   Future<Map<String, dynamic>> uninstallRelease(String id) =>
@@ -269,6 +281,9 @@ class _PluginPanelState extends State<PluginPanel> {
 
   /// 正在提交的插件 id（提交期间禁用该项的开关，避免连点）。
   final Set<String> _busy = <String>{};
+
+  /// 本地 zip 安装的提交键（它不是某条插件的 id，只用来占住 [_busy]）。
+  static const String _localInstallKey = '__local_zip__';
 
   // ── 发布仓库（阶段 5）的展示状态 ────────────────────────────────────
 
@@ -463,6 +478,25 @@ class _PluginPanelState extends State<PluginPanel> {
           : '已从发布仓库安装 $id（$version）';
     },
   );
+
+  /// 从**本地 zip** 装一条（离线 / 内网环境用）。
+  ///
+  /// 选包是用户本机动作；装上之后的闸门 / 落盘 / 热应用全在核心（与仓库通道同一
+  /// 条纪律），面板只负责把核心给的可读原因原样显示。
+  Future<void> _installLocalZip() async {
+    final PlatformFile? picked = await FilePicker.pickFile(
+      dialogTitle: '选择插件包（zip，内含 plugin.json）',
+      type: FileType.custom,
+      allowedExtensions: <String>['zip'],
+    );
+    final String? path = picked?.path;
+    if (path == null || path.isEmpty) return;
+    await _submit(
+      _localInstallKey,
+      () => _admin.installLocal(path),
+      successText: '已从本地 zip 安装',
+    );
+  }
 
   static String _reasonOf(Object error) =>
       '$error'.replaceFirst('Exception: ', '');
@@ -1535,6 +1569,13 @@ class _PluginPanelState extends State<PluginPanel> {
                 '${_releaseSource.isEmpty ? '' : '本次来源 $_releaseSource；'}当前：$source',
                 style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
               ),
+            ),
+            TextButton(
+              key: const Key('plugin-install-local'),
+              onPressed: _busy.contains(_localInstallKey)
+                  ? null
+                  : _installLocalZip,
+              child: const Text('本地安装'),
             ),
             if (_releaseLoading)
               const SizedBox(

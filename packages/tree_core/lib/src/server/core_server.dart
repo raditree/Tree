@@ -1060,6 +1060,8 @@ class CoreServer {
     router.add('POST', ApiPaths.pluginReleaseRefresh, _refreshPluginRelease);
     router.add('POST', ApiPaths.pluginReleaseInstall, _installPluginRelease);
     router.add('POST', ApiPaths.pluginReleaseUninstall, _uninstallPluginRelease);
+    // 本地 zip 安装（离线包）：与仓库通道共用落盘 + 闸门 + 热应用。
+    router.add('POST', ApiPaths.pluginInstallLocal, _installPluginLocal);
     // 站点详情与配置（面板「站点详情页」）。
     router.add('GET', ApiPaths.pluginStation, _stationDetail);
     router.add('PATCH', ApiPaths.pluginStationConfig, _updateStationConfig);
@@ -2876,6 +2878,108 @@ class CoreServer {
     );
     errorLog?.call(
       '[core:plugin-release] 已安装 $id（${install.version}，'
+      '${install.files.length} 个文件，热应用 ${outcome.applied ? '成功' : '失败：${outcome.detail}'}）',
+    );
+    await writeJson(request, 200, <String, dynamic>{
+      ..._pluginWriteBody(store, result, outcome),
+      'install': install.toJson(),
+    });
+  }
+
+  /// POST /api/plugin/install/local：从**本地 zip** 装一条插件。
+  ///
+  /// 三段与仓库通道**完全同构**（只是"字节从哪来"不同）：
+  /// 1. 解包 + 校验 `plugin.json`（id / version / command 必须在包内 / 路径安全）；
+  /// 2. 过闸门 + 原子换 `plugins/<id>/` 目录（失败不动旧目录）；
+  /// 3. 成功才写 plugins.yaml 并热应用。
+  ///
+  /// `with_dependencies` 只在**目标插件恰好在发布索引里**时能补齐（本地包声明的
+  /// 依赖仍需可下载）；不在索引里就跳过补齐，交给依赖闸门如实回 409。
+  Future<void> _installPluginLocal(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    final PluginBus? bus = pluginBus;
+    if (bus == null) {
+      await _writePluginNotWired(request);
+      return;
+    }
+    final PluginDownloader? downloader = pluginDownloader;
+    if (downloader == null) {
+      await _writePluginRepoNotWired(request);
+      return;
+    }
+    final Map<String, dynamic>? body = await _jsonBody(request);
+    if (body == null) return;
+    final String zipPath =
+        (body['zip_path'] ?? body['zipPath'] ?? '').toString().trim();
+    if (zipPath.isEmpty) {
+      await writeJson(
+        request,
+        400,
+        errorBody('缺 zip_path：本地安装要传离线插件包的绝对路径（大文件不走 base64）'),
+      );
+      return;
+    }
+    final PluginInstallResult install = await downloader.installFromZip(
+      zipPath,
+      swapGate: bus.quiesceForSwap,
+    );
+    final Map<String, dynamic>? entry = install.entry;
+    if (!install.ok || entry == null) {
+      final String reason = install.error.isEmpty
+          ? '本地插件包安装失败（下载器没给出原因）'
+          : install.error;
+      errorLog?.call('[core:plugin-local] 安装 $zipPath 失败：$reason');
+      await writeJson(request, 400, errorBody(reason));
+      return;
+    }
+    final String id = install.pluginId;
+    final PluginConfigStore store = _pluginStore(bus);
+    final Map<String, dynamic>? existing = store.readEntry(id);
+    final Map<String, dynamic> toWrite = <String, dynamic>{
+      ...entry,
+      if (existing?['builtin'] == true) 'builtin': true,
+    };
+    final bool withDependencies =
+        body['with_dependencies'] == true || body['withDependencies'] == true;
+    if (withDependencies) {
+      final Map<String, dynamic>? dependencyBlock =
+          await _installMissingDependencies(bus, downloader, store, id);
+      if (dependencyBlock != null) {
+        await _writeDependencyConflict(request, <String, dynamic>{
+          ...dependencyBlock,
+          'install': install.toJson(),
+        }, pluginId: id);
+        return;
+      }
+    }
+    final Map<String, dynamic>? blocked = _dependencyBlockForEntry(bus, toWrite);
+    if (blocked != null) {
+      await _writeDependencyConflict(request, <String, dynamic>{
+        ...blocked,
+        'install': install.toJson(),
+      }, pluginId: id);
+      return;
+    }
+    final PluginStoreResult result = store.upsert(toWrite);
+    final Map<String, dynamic>? stored = result.entry;
+    if (!result.ok || stored == null) {
+      final String reason =
+          '插件文件已放置到 ${install.files.isEmpty ? '（空）' : install.files.first} 等'
+          '（${install.files.length} 个文件），但写入 plugins.yaml 失败：'
+          '${result.error}（旧条目未改动，新文件暂时不会被拉起）';
+      errorLog?.call('[core:plugin-local] $reason');
+      await writeJson(request, 400, errorBody(reason));
+      return;
+    }
+    final PluginHotApplyOutcome outcome = await _applyPluginChange(
+      bus,
+      stored,
+      enable: true,
+    );
+    errorLog?.call(
+      '[core:plugin-local] 已安装 $id（${install.version}，'
       '${install.files.length} 个文件，热应用 ${outcome.applied ? '成功' : '失败：${outcome.detail}'}）',
     );
     await writeJson(request, 200, <String, dynamic>{

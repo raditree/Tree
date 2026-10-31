@@ -195,6 +195,13 @@ class _FakeAdmin implements PluginAdminClient {
   Map<String, dynamic> uninstallResponse = <String, dynamic>{'ok': true};
 
   @override
+  Future<Map<String, dynamic>> installLocal(String zipPath) async {
+    calls.add('local:install:$zipPath');
+    if (failWrite.isNotEmpty) throw Exception(failWrite);
+    return <String, dynamic>{'ok': true};
+  }
+
+  @override
   Future<Map<String, dynamic>> uninstallRelease(String id) async {
     calls.add('uninstall:$id');
     if (failWrite.isNotEmpty) throw Exception(failWrite);

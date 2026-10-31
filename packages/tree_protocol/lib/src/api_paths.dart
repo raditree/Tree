@@ -211,6 +211,14 @@ abstract final class ApiPaths {
   static const String pluginReleaseUninstall =
       '/api/plugin/release/{pluginId}/uninstall';
 
+  /// 从**本地 zip** 装一条插件（POST，body `{zip_path, with_dependencies?}`）。
+  ///
+  /// 离线包入口（known-issues #38 / acceptance L-10）：zip 必须带 `plugin.json`
+  /// （与 `tool/package_ui_plugin.dart` 产物同形状）+ 全部文件；核心解到
+  /// `plugins/<id>/` 后走**与仓库通道同一套**后处理（依赖闸门 → 写 plugins.yaml →
+  /// 热应用）。校验失败 / 解压失败 / 闸门等不到退出 ⇒ 400 + 可读原因，旧文件不动。
+  static const String pluginInstallLocal = '/api/plugin/install/local';
+
   /// 单个站点的**详情**（GET）：介绍 + 可订阅上限 + 共享声明 + 自定义配置 +
   /// 订阅者列表（含禁用态）。
   ///
@@ -349,13 +357,13 @@ abstract final class ApiPaths {
   static String routeKey(String method, String pattern) =>
       '${method.toUpperCase()} $pattern';
 
-  /// **核心永久面：39 条方法路由。**
+  /// **核心永久面：40 条方法路由。**
   ///
-  /// 平台控制面 19（含 UI 多窗口 3）+ 传输设置 9 + 引导壳 3 + 发现面 1 + 日志 3
+  /// 平台控制面 20（含 UI 多窗口 3）+ 传输设置 9 + 引导壳 3 + 发现面 1 + 日志 3
   /// + 存储 4。只增不删：交接完成后核心 router 的键集必须**恰好等于**本集合
   /// （见 `docs/pluginization/ui-pluginization.md` §4.1 / §4.5）。
   static const Set<String> coreOwned = <String>{
-    // 平台控制面（19）：装插件的前提，也是引导页唯一依赖。
+    // 平台控制面（20）：装插件的前提，也是引导页唯一依赖。
     'GET $pluginSnapshot',
     'GET $pluginConfigs',
     'POST $pluginConfigs',
@@ -369,6 +377,7 @@ abstract final class ApiPaths {
     'POST $pluginReleaseRefresh',
     'POST $pluginReleaseInstall',
     'POST $pluginReleaseUninstall',
+    'POST $pluginInstallLocal',
     'GET $pluginStation',
     'PATCH $pluginStationConfig',
     'POST $pluginStationSubscriber',
@@ -486,7 +495,7 @@ abstract final class ApiPaths {
     'POST $fileRename',
   };
 
-  /// 契约全集（93 = [coreOwned] 39 + [delegated] 54）。
+  /// 契约全集（94 = [coreOwned] 40 + [delegated] 54）。
   static final Set<String> contractRoutes = <String>{
     ...coreOwned,
     ...delegated,
@@ -605,6 +614,7 @@ abstract final class ApiPaths {
     pluginReleaseRefresh,
     pluginReleaseInstall,
     pluginReleaseUninstall,
+    pluginInstallLocal,
     pluginStation,
     pluginStationConfig,
     pluginStationSubscriber,

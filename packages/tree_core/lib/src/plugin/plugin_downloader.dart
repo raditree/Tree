@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:archive/archive.dart';
 import 'package:path/path.dart' as p;
 
 import 'builtin_plugins.dart'
@@ -146,6 +147,12 @@ const int kPluginIndexSchema = 1;
 const String kRepoSourceKey = 'source';
 const String kRepoSourceValue = 'release';
 const String kRepoVersionKey = 'repo_version';
+
+/// 本地 zip 安装的来源标记（同一个 [kRepoSourceKey] 键，仅展示用）。
+const String kLocalSourceValue = 'local';
+
+/// 本地 zip 里必须带的清单文件名（`tool/package_ui_plugin.dart` 产物的同一条合同）。
+const String kLocalManifestName = 'plugin.json';
 
 /// 发布插件的**放置目录**默认值：核心可执行文件同级的 `plugins/`。
 ///
@@ -592,6 +599,10 @@ class PluginDownloader {
         if (file.existsSync()) targets.add(p.normalize(file.path));
       }
     }
+    // ④ 本地 zip 安装的**目录形态**（`plugins/<id>/`）：整目录算一个目标。
+    //    它不在发布索引里，也常常没有内置成品名，只看 ①②③ 会把它留在盘上变孤儿。
+    final Directory pluginDir = Directory(p.join(installDir, id));
+    if (pluginDir.existsSync()) targets.add(p.normalize(pluginDir.path));
     return targets.toList(growable: false);
   }
 
@@ -608,6 +619,11 @@ class PluginDownloader {
     final Map<String, String> failed = <String, String>{};
     for (final String path in targets) {
       try {
+        if (FileSystemEntity.typeSync(path) == FileSystemEntityType.directory) {
+          Directory(path).deleteSync(recursive: true);
+          deleted.add(p.basename(path));
+          continue;
+        }
         final File file = File(path);
         if (!file.existsSync()) continue;
         file.deleteSync();
@@ -1213,6 +1229,264 @@ class PluginDownloader {
           '文件已就位；插件条目由调用方写入 plugins.yaml 并热应用'
           '（起不来的原因会由面板与日志如实给出）',
     );
+  }
+
+  /// 装一个**本地 zip**（`POST /api/plugin/install/local` 的落点）。
+  ///
+  /// 与发布仓库通道只差"字节从哪来"：zip 里带 `plugin.json`（与
+  /// `tool/package_ui_plugin.dart` 产物同一形状）+ 全部文件；这里把它解到
+  /// **`plugins/<id>/` 目录形态**（UI 插件带 `data/`、多个 dll，扁平放置装不下），
+  /// 校验后交给调用方走同一条落盘 + 热应用路径（`plugins.yaml` 唯一入口）。
+  ///
+  /// 顺序与仓库通道一致：先解到 `.part-<nonce>`（碰不到旧目录）→ 过 [swapGate]
+  /// → 旧目录改名占位 → 新目录原子改名 → 失败回滚旧目录。任一步失败都不留半装状态。
+  ///
+  /// 安全口径：条目路径必须相对、无 `..`（zip 是外部输入）；`command` 必须指向
+  /// 包里真实存在的文件；id 与 `plugins.yaml` 同一条字符集（防路径穿越）。
+  Future<PluginInstallResult> installFromZip(
+    String zipPath, {
+    required PluginSwapGate swapGate,
+  }) async {
+    final File zip = File(zipPath.trim());
+    if (!zip.existsSync()) {
+      return PluginInstallResult.failed('本地 zip 不存在：${zip.path}');
+    }
+    final List<int> bytes;
+    final Archive archive;
+    try {
+      bytes = zip.readAsBytesSync();
+    } catch (error) {
+      return PluginInstallResult.failed('读取本地 zip 失败（${zip.path}）：$error');
+    }
+    try {
+      archive = ZipDecoder().decodeBytes(bytes);
+    } catch (error) {
+      return PluginInstallResult.failed(
+        '这不是一个能解开的 zip：${zip.path}（$error）',
+      );
+    }
+
+    // ① 归一化条目：zip 里常见 `./` 前缀（tar -C dir . 的产物），统一去掉。
+    final Map<String, ArchiveFile> payload = <String, ArchiveFile>{};
+    ArchiveFile? manifest;
+    for (final ArchiveFile file in archive) {
+      if (!file.isFile) continue;
+      final String? name = _normalizeZipEntry(file.name);
+      if (name == null) {
+        return PluginInstallResult.failed(
+          'zip 内的路径不安全或非法（${file.name}）：只接受相对路径、不含 ..',
+        );
+      }
+      if (name == kLocalManifestName) {
+        manifest = file;
+        continue;
+      }
+      payload[name] = file;
+    }
+    if (manifest == null) {
+      return PluginInstallResult.failed(
+        'zip 缺少 $kLocalManifestName（本地安装只认带清单的插件包，'
+        '没有它无法判断 id / 版本 / 该怎么拉起）',
+      );
+    }
+    if (payload.isEmpty) {
+      return PluginInstallResult.failed(
+        'zip 里除了 $kLocalManifestName 没有任何插件文件：这是一份空包',
+      );
+    }
+
+    // ② 校验清单 + 组装条目（字段口径与发布索引同一套校验）。
+    final Map<String, dynamic> raw;
+    try {
+      final Object? decoded = jsonDecode(utf8.decode(manifest.content));
+      if (decoded is! Map) {
+        return PluginInstallResult.failed(
+          '$kLocalManifestName 必须是 JSON 对象',
+        );
+      }
+      raw = decoded.map((Object? k, Object? v) => MapEntry(k.toString(), v));
+    } catch (error) {
+      return PluginInstallResult.failed('$kLocalManifestName 不是合法 JSON：$error');
+    }
+    final ({Map<String, dynamic>? entry, String error}) parsed =
+        _readLocalEntry(raw, payload);
+    if (parsed.error.isNotEmpty || parsed.entry == null) {
+      return PluginInstallResult.failed(parsed.error);
+    }
+    final Map<String, dynamic> entry = parsed.entry!;
+    final String id = (entry['id'] ?? '').toString();
+
+    // ③ 解到临时目录（碰不到旧目录）。
+    final String targetDir = p.join(installDir, id);
+    final String nonce = _nonce();
+    final String staging = '$targetDir.part-$nonce';
+    try {
+      Directory(installDir).createSync(recursive: true);
+      final Directory part = Directory(staging);
+      if (part.existsSync()) part.deleteSync(recursive: true);
+      part.createSync(recursive: true);
+      for (final MapEntry<String, ArchiveFile> item in payload.entries) {
+        final File out = File(p.join(staging, item.key));
+        out.parent.createSync(recursive: true);
+        out.writeAsBytesSync(item.value.content, flush: true);
+      }
+    } catch (error) {
+      _deleteDirQuietly(staging);
+      return PluginInstallResult.failed(
+        '解压插件包失败（旧目录一个都没动）：$error',
+        pluginId: id,
+      );
+    }
+
+    // ④ 闸门：旧进程没确认退出就不换（与仓库通道同一条纪律）。
+    final String blocked = await swapGate(id);
+    if (blocked.isNotEmpty) {
+      _deleteDirQuietly(staging);
+      return PluginInstallResult.failed(blocked, pluginId: id);
+    }
+
+    // ⑤ 原子换目录：旧目录先改名占位，新目录改名就位，成功后删旧的。
+    final String oldDir = '$targetDir.old-$nonce';
+    final bool hadOld = Directory(targetDir).existsSync();
+    try {
+      if (hadOld) Directory(targetDir).renameSync(oldDir);
+      Directory(staging).renameSync(targetDir);
+    } catch (error) {
+      _deleteDirQuietly(staging);
+      if (Directory(oldDir).existsSync() && !Directory(targetDir).existsSync()) {
+        try {
+          Directory(oldDir).renameSync(targetDir);
+        } catch (_) {
+          // 回滚也失败时把实情写进原因：此时旧目录在 `$oldDir`，用户可手工挪回。
+        }
+      }
+      return PluginInstallResult.failed(
+        '放置插件目录失败（旧目录未改动或已回滚到 $oldDir）：$error',
+        pluginId: id,
+      );
+    }
+    if (hadOld) _deleteDirQuietly(oldDir);
+
+    log?.call(
+      '本地安装：已放置 $id（${entry[kRepoVersionKey]}，${payload.length} 个文件）到 $targetDir',
+    );
+    return PluginInstallResult(
+      ok: true,
+      pluginId: id,
+      version: (entry[kRepoVersionKey] ?? '').toString(),
+      files: payload.keys.toList(growable: false),
+      entry: {...entry, 'command': p.join(targetDir, entry['command'] as String)},
+      swapped: true,
+      downloaded: bytes.length,
+      source: kLocalSourceValue,
+      note: '插件文件已就位；插件条目由调用方写入 plugins.yaml 并热应用',
+    );
+  }
+
+  /// 校验本地清单（字段口径与发布索引 [_readEntry] 同一套；差别只在文件来自 zip）。
+  ({Map<String, dynamic>? entry, String error}) _readLocalEntry(
+    Map<String, dynamic> raw,
+    Map<String, ArchiveFile> payload,
+  ) {
+    final String id = (raw['id'] ?? '').toString().trim();
+    if (id.isEmpty) return (entry: null, error: '$kLocalManifestName 缺 id');
+    if (id == '.' || id == '..' || !_idPattern.hasMatch(id)) {
+      return (entry: null, error: '插件 id 只允许字母、数字、下划线、点和连字符：$id');
+    }
+    final String name = (raw['name'] ?? '').toString().trim();
+    if (name.isEmpty) return (entry: null, error: '插件 $id 缺 name（面板要显示它）');
+    final String version = (raw['version'] ?? '').toString().trim();
+    if (!_versionPattern.hasMatch(version)) {
+      return (entry: null, error: '$id 的 version 必须是三段数字 x.y.z（当前：$version）');
+    }
+    final String command = (raw['command'] ?? '').toString().trim();
+    if (command.isEmpty) {
+      return (entry: null, error: '$id 缺 command（装完后拿什么拉起它）');
+    }
+    final String? normalizedCommand = _normalizeZipEntry(command);
+    if (normalizedCommand == null) {
+      return (entry: null, error: '$id 的 command「$command」不是包内相对路径');
+    }
+    if (!payload.containsKey(normalizedCommand)) {
+      return (
+        entry: null,
+        error: '$id 的 command「$command」在 zip 里不存在：'
+            '包内文件有 ${payload.keys.take(8).join(' / ')}${payload.length > 8 ? ' …' : ''}',
+      );
+    }
+    final String runtime = (raw['runtime'] ?? 'binary').toString().trim();
+    final PluginDependencyParseResult requires = parsePluginDependencies(
+      raw['requires'],
+    );
+    if (requires.error != null) {
+      return (entry: null, error: '$id 的 ${requires.error}');
+    }
+    final String suspension = (raw['suspension'] ?? '').toString().trim();
+    if (suspension.isNotEmpty && suspension != PluginSuspension.keep) {
+      return (entry: null, error: '$id 的 suspension 只能留空或 keep（当前：$suspension）');
+    }
+    final String granularity = (raw['granularity'] ?? 'team').toString().trim();
+    if (!const <String>['team', 'agent', 'session'].contains(granularity)) {
+      return (entry: null, error: '$id 的 granularity 只能是 team | agent | session（当前：$granularity）');
+    }
+    final Object? rawScope = raw['scope'];
+    if (rawScope != null && rawScope is! Map) {
+      return (entry: null, error: '$id 的 scope 必须是 JSON 对象');
+    }
+    return (
+      entry: <String, dynamic>{
+        'id': id,
+        'name': name,
+        'description': (raw['description'] ?? '').toString(),
+        // command 在 installFromZip 里改写成落盘后的绝对路径（这里先留包内相对名）。
+        'command': normalizedCommand,
+        'args': <String>[
+          if (raw['args'] is List)
+            for (final Object? a in (raw['args'] as List<dynamic>)) '$a',
+        ],
+        'env': <String, String>{},
+        'enabled': true,
+        'granularity': granularity,
+        'scope': rawScope is Map
+            ? rawScope.map((Object? k, Object? v) => MapEntry(k.toString(), v))
+            : <String, dynamic>{},
+        if (runtime.isNotEmpty) 'runtime': runtime,
+        // `requires` 原样带上：`api` 区间由 config store 解析，插件依赖已在上方校验。
+        if (raw['requires'] is Map)
+          'requires': (raw['requires'] as Map).map(
+            (Object? k, Object? v) => MapEntry(k.toString(), v),
+          ),
+        if (suspension.isNotEmpty) 'suspension': suspension,
+        kRepoSourceKey: kLocalSourceValue,
+        kRepoVersionKey: version,
+      },
+      error: '',
+    );
+  }
+
+  /// 把 zip 条目名归一化成 **posix 相对路径**；不合法（绝对 / `..` / 空）返回 null。
+  static String? _normalizeZipEntry(String raw) {
+    String name = raw.replaceAll('\\', '/').trim();
+    while (name.startsWith('./')) {
+      name = name.substring(2);
+    }
+    if (name.isEmpty || name == '.' || name == '..') return null;
+    if (name.startsWith('/')) return null;
+    // Windows 盘符与 NTFS 备用数据流（`C:` / `file:stream`）都按非法处理。
+    if (name.contains(':')) return null;
+    for (final String segment in name.split('/')) {
+      if (segment.isEmpty || segment == '.' || segment == '..') return null;
+    }
+    return name;
+  }
+
+  void _deleteDirQuietly(String path) {
+    try {
+      final Directory dir = Directory(path);
+      if (dir.existsSync()) dir.deleteSync(recursive: true);
+    } catch (error) {
+      log?.call('清临时目录 $path 失败（不影响结果，占位无害）：$error');
+    }
   }
 
   /// 按资产名去**发布源**里查下载地址（install 时再查一次，而不是把 URL 缓存进索引：
