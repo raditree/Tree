@@ -238,7 +238,7 @@
 | L-01 | G-1 端点等价对照（按实测 **36 条 = 34 存量 + 2 新增**；旧口径 23/25 已作废） | **已完成（2026-10-25）**：36 条 G-1 + 2 条 spec 附录全部申报（tree-plugins `0c6ee1d`）；**12 条**只读双跑逐字节一致；**H1 24 条真实 HTTP 对照：21 条一致 + 3 条差异全部清零** | 3 条差异的处理：① spec `version` 3→4：插件模板与核心 HEAD **逐字相同**（8/8/6/4），差异来自当时工作空间未刷新的旧副本，`seedInto` 会自动升级 ⇒ 无代码改动；② compact `relay_skip_reason`：插件 `toJson()` 与核心同形（仅非空时出现），补回归用例；③ reset 路径前缀：`SpecService.reset` 统一归一成 `.self/spec/<名>`，补回归用例。剩余唯一不等价项是 L-31 的占位符命名（HTTP 形状等价） | — |
 | L-02 | G-2 核心路由表去除领域路由 | **已完成（2026-10-25 独立复核）** | 实测 `CoreServer.router == ApiPaths.coreOwned` 36 条；`pendingHandoffRoutes` 已清零（G1 删 git 后）；`stubApiPaths` 为空 | — |
 | L-03 | G-3 领域帧改 `station_delivery` | **代码已接（2026-10-25），待真机签收** | 核心领域目录与领域帧生产代码已删；`tree.agent` 启动注册 `plugin.tree.agent.broadcast.events`，每帧以 `topic=tree.agent.<session>.<kind>` 经 `station/trigger` 发布；UI 订阅 + `FrameRouter` 还原旧帧名 | 缺口：真机双轨比对（帧序 / 丢帧 / closed / reset）与 50ms/32token 合并未做 | 按 E2E 跑一轮事件面，记录帧数与水位 |
-| L-04 | G-4 过渡映射删除 | 未开始 | 依赖 G-3 完成一个版本周期 | G+1 提交时删除映射代码 |
+| L-04 | G-4 过渡映射删除 | 未开始（过渡代码**存在**，见 E 节更正） | 依赖 G-3 完成一个版本周期 | G+1 提交时删除映射代码 |
 | L-05 | G-5 数据接管（`agents.yaml` + 会话历史原地接管、备份、回滚） | 未设计 | 存储布局已定为「插件自带 store + 原地接管」，但插件内无接管/备份/回滚代码与用例 | 按原地接管写备份/回滚用例；前提是 L-22 settings 拆分完成 |
 | L-06 | G-6 性能基线（50ms/32 token 合并、首字延迟差 ≤ 50ms） | 未测 | 依赖 G-3 | 压测脚本 + 迁移前后对比记录 |
 | L-07 | G-7 agent 插件崩溃 → 领域端点 503 + UI 可读提示 | **已完成（2026-10-25）** | 核心委派层对「归属插件停用 / 启动失败 / 崩溃」回 503（C-2）；UI 侧 `ApiService._handleResponse` 识别 503 ⇒ `ServiceAvailability` 记原因，主界面顶部显示「服务不可用：…」提示条（可「知道了」关闭，领域端点下一次成功自动撤掉；平台面端点不参与清除）。用例：`test/service_availability_test.dart` 2 条 | 真机项：用可崩溃测试插件跑一次（崩溃 → 503 提示 → 重启插件后自动消失） | 与 L-03 同批真机验 |
@@ -310,7 +310,7 @@
 | L-01 | 已完成（三差异清零） | 12 条只读双跑一致；H1 24 条：21 一致 + 3 差异已处理（spec 模板逐字同源 / compact `relay_skip_reason` 同形 / reset 路径归一）；36 条 + spec 2 已申报 | L-19、L-28、L-24 | — |
 | L-02 | 已完成 | 实测 `router == ApiPaths.coreOwned` 36；`pendingHandoffRoutes` 为空；stub 为空 | — | P2 |
 | L-03 | 代码已接，待签收 | 事件站 `plugin.tree.agent.broadcast.events` + `FrameRouter` 已落地；真机双轨未跑 | L-01 事件面 | P2 |
-| L-04 | 未开始 | 未发现 topic → 旧帧的过渡映射代码 | L-03 完成 + 一个版本周期 | P2（尾） |
+| L-04 | 未开始 | 过渡映射**确实存在**：`lib/io/frame_router.dart` 整层就是"topic → 旧帧名"的换收口（含 `LegacyFrameBus`，`test/frame_router_test.dart` 覆盖）；原"未发现过渡代码"已更正（2026-10-31 复核） | L-03 完成 + 一个版本周期 | P2（尾） |
 | L-05 | 未设计 | 插件无数据接管 / 备份 / 回滚代码与用例 | L-22、L-01 数据层 | P5 |
 | L-06 | 未测 | 无压测脚本与迁移前后对比记录 | L-03 | P2（G-3 后） |
 | L-07 | 已完成（2026-10-25） | 核心 503（C-2）+ UI `ServiceAvailability` 顶部提示条；`test/service_availability_test.dart` | G-2 | 真机崩溃用例 |
