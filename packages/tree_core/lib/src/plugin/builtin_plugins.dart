@@ -220,6 +220,11 @@ class BuiltinPluginCatalog {
     // 2026-10-17：**随包二进制**（以前是 `examples/plugins/sample_plugin.py` + 解释器）。
     // 它仍是**默认关闭**的那一个：这不是一块功能，而是一份演示，不该在用户没要求时
     // 就在后台拉起一个进程；面板里看得见、能一键开就够了。
+    //
+    // 2026-10-31 文案校准（契约 §8.4 片 1 遗留项）：这段描述原来把 `fs.read / llm.call /
+    // tool.call / session.rename` 说成四条能用的演示命令。点位表让名之后这四条名字**没有
+    // 承接方**（`docs/known-issues.md` #43 / 契约 §7 Q-7），文案不能再承诺它们跑得通——
+    // 面板上照抄示例的第三方插件就是被这种"半真"文案带偏的。
     BuiltinPluginSpec(
       id: kSamplePluginId,
       name: '示例插件',
@@ -227,7 +232,9 @@ class BuiltinPluginCatalog {
           '核心自带的示例插件（Dart 二进制，不随主包、成品从发布仓库装）：四站 + 插件布局的全链路参考—'
           '收集站申报 echo/rounds/read_probe 三个工具，事件按 (agent, session) 数工具轮次、'
           '超阈值（默认 200）经执行站发 agent.stop 并重置计数（“核心不设轮次上限，限制交给插件”的参考实现），'
-          'fs.read / llm.call / tool.call / session.rename 四条演示命令各一个开关，'
+          '另有四条 `station/command` 下行形状的开关联调（本机文件读 / LLM 调用 / 工具调用 / 会话改名——'
+          '这些领域命令名正由实现方按 `local.*` / `ssh.*` 与 tree.agent 自建站的口径认领中，'
+          '未认领前按下会显式报「暂无挂载位置」，不静默），'
           'ui/manifest 申报 activity + panel + card 三个槽位；新协议点位（llm.handle 流式接管、'
           'prompt.system 改写、tool.pre/post 广播）默认全关，开关见 `tree_sample --help`。'
           '可以直接当自己写插件的骨架（源码：插件仓 plugins/sample/）。'

@@ -2406,9 +2406,11 @@ test/plugin_close_no_hard_timeout_test.dart: A 心跳在、只是慢 ⇒ 跑很�
 
 ## #43 A5 撤了领域实现，没撤点位表：20 条内置命令"申报了、路由得到、执行必失败"，随包插件 compact 四条全踩在上面
 
-**状态**：**片 1（桌面侧）已修，2026-10-31**；插件侧认领（片 2）未开始 ⇒ 领域命令在真机上
-仍是显式失败，只是失败原因从「已不在核心平台面」变成「暂无挂载位置」，且插件现在**认得进**
-这些名字了。方向已拍板走 A，见 [exec_station_contract.md](exec_station_contract.md) §7 Q-5
+**状态**：**片 1（桌面侧）+ 片 2 / 片 4（插件侧）已修，2026-10-31**；文件与终端两族
+在真机上**已经能打通**（`local.*` / `ssh.*` 各 10 条、两侧对称、租约在插件侧）。
+剩下的是"让名"的另一半：`llm.* / tool.* / agent.* / session.*` 还没有实现方申报，
+compact 与 sample 因此仍踩在空名字上（见下方「片 2 / 片 4 收口记录」与契约 §7 Q-7）。
+方向已拍板走 A，见 [exec_station_contract.md](exec_station_contract.md) §7 Q-5
 与 §8.4 落地状态。
 **影响**：不是纸面漂移——`compact` 是核心内置插件条目之一（`builtin_plugins.dart:247`），
 它的总结调用、必读文件读取、todo 快照三条功能**在 A5 之后就是稳定失败**。
@@ -2493,4 +2495,26 @@ test/plugin_close_no_hard_timeout_test.dart: A 心跳在、只是慢 ⇒ 跑很�
 **没做**：`workspace/register` 与核心租约簿记仍在（片 3，协议破坏性改动，必须整片落）；
 `builtin_plugins.dart:230` 示例插件描述里的四个演示开关仍写旧名（随片 2 一起改，改早了
 会与还没动的插件产物更不符）。
+
+### 片 2 / 片 4 收口记录（2026-10-31，插件仓 `fb496e0` + `7313ae7`）
+
+- **片 2**：`local_executor` 认领 `local.lease.register` + `local.file.*`（8 条）+
+  `local.exec.command`，与 `ssh_executor` 的 `ssh.*` 逐字对称；`fs.*` 那 8 个假别名分支删除。
+  同时补齐 §8.2 四条能力差、把 §8.3 的两条落到**两侧**（`root` 只来自租约表；登记方比对
+  `meta.source_plugin_id` ⇒ `lease_denied`）。
+- **片 4**：tree.agent 的映射表换成「前缀 `local.` 换 `ssh.`」一条规则；本机租约改走
+  `local.lease.register`（不再向核心 notify `workspace/register`），`local_lease_unknown`
+  与 `ssh_lease_unknown` 共用「重登记 + 只重试一次」；SSH 参数不再带 `root`；
+  `reconnectSsh` 那条**活着但无挂载**的命令改走「丢缓存 + 重新 `ssh.lease.register`」
+  （它经 `delegate.dart` 的 `POST /api/agents/{id}/ssh/reconnect` 被 UI 用着，不是死代码）。
+  桌面侧同步：`nonProtocolPluginMethodLiterals` 六个命令名字面量改登记 `local.*`
+  （否则门禁的"死条目"断言会红），`builtin_plugins.dart` 的示例文案不再承诺那四条
+  演示命令跑得通。
+
+**这条 issue 还没收口**：compact 的四条（`llm.call` / `fs.read` / `tool.call` /
+`agent.compact`）与 sample 的四个演示开关**至今没有承接方**。换名解决不了——
+`llm.* / tool.* / agent.* / session.*` 是 Q-5 A 里点名"让给 tree.agent"的族，而 tree.agent
+今天既没申报也没实现；`fs.read → local.file.read` 又需要一条 `local_lease_id`，
+"agent → 工作空间目录"的解析目前 tree.agent 与 files 各有一份，不该再抄第三份。
+三条出路与推荐口径写在 [exec_station_contract.md](exec_station_contract.md) §7 **Q-7**。
 

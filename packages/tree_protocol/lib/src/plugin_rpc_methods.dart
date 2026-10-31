@@ -214,10 +214,12 @@ const Map<String, String> nonProtocolPluginMethodLiterals = <String, String>{
   // 执行站命令名：插件经 `station/command` 下达，由核心的 `ExecuteStationMounts`
   // 执行（命令白名单的家在 tree_core 的 `StationPoints`），不是插件↔核心 JSON-RPC
   // method；插件侧实现 WorkspaceIO 时必然会出现这些字面量。
-  'file.read': '自建执行站命令（local_executor），非插件↔核心 JSON-RPC 面',
-  'file.write': '同上',
-  'file.list': '同上',
-  'file.delete': '同上',
-  'file.mkdir': '同上',
-  'file.writeBytes': '同上',
+  // 2026-10-31（契约 §8.1）：本机命令族带上了 `local.` 限定词，与 `ssh_executor`
+  // 的 `ssh.*` 逐字对称——无前缀的 `file.*` 随内置点位表一起退场。
+  'local.file.read': '自建执行站命令（local_executor），非插件↔核心 JSON-RPC 面',
+  'local.file.write': '同上',
+  'local.file.list': '同上',
+  'local.file.delete': '同上',
+  'local.file.mkdir': '同上',
+  'local.file.writeBytes': '同上',
 };

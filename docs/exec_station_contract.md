@@ -385,6 +385,7 @@ plugins/files/lib/src/remote_files.dart:118                 if (!'$error'.contai
 | Q-4b | 本机 REST 面把 `StateError` 一律映射成 **404**（`local_executor_plugin.dart:197-198`），而 SSH 侧同类"租约/会话不存在或已存在"是 **409**（`terminal_sessions.dart:117,259,271`） | **已拍板 → §8**：本机收成 409（404 在不变量里是"插件没装"的语义，不能兼作资源冲突） |
 | Q-5 | **20 条内置命令的定位**：它们既是 §2.4 那张"必然失败"的表，也是 §2.1 那 8 个"假别名"的根源，还是 compact 四条命令失败的原因——**先定方向才谈得上清** | **已拍板：走 A（删点位表 + 让名）**，2026-10-31。领域八族从 `StationPoints.executes` 整体摘掉，族名让给真正的实现方（`llm.*` / `tool.*` / `agent.*` / `session.*` / `usage.*` ⇒ tree.agent，`fs.*` / `terminal.*` ⇒ 由要做的人带着实现申报，本期不保留假可用）。让名同时必须撤 `_checkExecuteCommands` 的 `tool.` / `agent.` 前缀禁令，否则插件认不进来 |
 | Q-6 | 两个执行器的命令名要不要对称 | **已拍板 → §8**：本机改 `local.file.*` / `local.exec.command`，与 `ssh.*` 同后缀；限定词直接取 `StationModeKey` 的两个值 |
+| Q-7 | **片 4 只换到了 tree.agent 一家**：`compact` 的四条命令（`llm.call` / `fs.read` / `tool.call` / `agent.compact`）与 `sample` 的四条演示开关，在片 1 让名之后**仍然没有任何承接方**，且不能靠换名解决——① `llm.* / tool.* / agent.*` 是 Q-5 A 里点名"让给 tree.agent"的族，但 tree.agent 今天没申报也没实现它们；② `fs.read → local.file.read` 换口需要一条 `local_lease_id`，而"agent → 工作空间目录"的解析只有 tree.agent（`_workspaceDirOf`）与 files（自己读 `agents/*.yaml`）各有一份，compact 再抄一份就是第三份漂移源 | **未拍板**，三条路：**(a)** tree.agent 在 `agent_tools` 站上申报并实现 `llm.call` / `tool.call` / `agent.compact` + 一条工作空间读命令，compact 改调它（领域命令回到唯一实现方，代价是 tree.agent 的站变大）；**(b)** compact 自己读 `agents/*.yaml` 解析目录并登记本机租约（改动只在 compact，但把同一份解析逻辑复制第三遍）；**(c)** 承认压缩的"必读文件"属于核心侧，撤掉这条 IO 依赖，只回摘要（改动最小，功能面收窄）。**建议 (a)**：与 Q-5 A 的"让名给真正的实现方"同一条线，不再新增重复解析 |
 
 ---
 
@@ -459,5 +460,24 @@ plugins/files/lib/src/remote_files.dart:118                 if (!'$error'.contai
 - **片 1 留下一条已知不一致**：`builtin_plugins.dart:230` 的示例插件描述仍在讲
   `fs.read / llm.call / tool.call / session.rename` 四个演示开关——那四条命令在片 2 换名
   之前确实没有承接方。文字随片 2 一起改（改在核心侧，改早了会与还没动的插件产物更不符）。
-- **片 2 / 3 / 4 / 5 未开始**。片 2 落地前，领域命令在真机上下不中，报「暂无挂载位置」
-  （以前报「已不在核心平台面」）——两者都是显式失败，不是静默。
+  → 已随片 4 一并改掉（见下）。
+- **片 2 已合（插件仓 `fb496e0`，2026-10-31）**：`local_executor` 认领
+  `local.file.*` / `local.exec.command` / `local.lease.register`（10 条，与 `ssh.*` 逐字
+  对称），补齐 §8.2 四条能力差（`read{raw,offset,length}` / `writeBytes{append}` /
+  `list.details` / `file.rename`），并落地 §8.3 两条：`root` 只来自插件自己那张租约表
+  （自检里注入假 `root` 证明它不生效）、登记方比对 `meta.source_plugin_id`（不一致 ⇒
+  新码 `lease_denied`，**两侧都补了**——SSH 侧原来缺的那一半不再是纸面一致）。
+  顺带收掉 §4b：本机 REST 面的 `StateError` 由 404 改 409。
+- **片 4 已合（插件仓 `7313ae7`，2026-10-31）**：tree.agent 的 16 项逐条映射表换成
+  一条规则「前缀 `local.` 换 `ssh.`」（`fs.*` 那半边是 §2.1 的假别名，随之消失）；
+  本机租约改由 `local.lease.register` 登记、命令带 `local_lease_id`，
+  `local_lease_unknown` 与 `ssh_lease_unknown` 共用「重登记 + 只重试一次」那一条判据；
+  不再向核心 notify `workspace/register`（协议面本身留给片 3）；SSH 命令参数不再带
+  `root`；`reconnectSsh` 不再下发无挂载的 `ssh.reconnect`，改为「丢弃缓存句柄 +
+  重新 `ssh.lease.register`」（`down` ⇒ 清零退避重建，健康 ⇒ 复用）。
+  桌面侧同步收了 `nonProtocolPluginMethodLiterals` 的六个命令名字面量与
+  `builtin_plugins.dart:230` 的演示文案。
+- **片 3 / 片 5 未开始**；**#43 仍未收口**：compact 与 sample 的命令换口卡在 §7 Q-7
+  （那四条名字到今天没有承接方，不是回归，是 A 的另一半没做）。片 2 落地前领域命令
+  在真机上报「暂无挂载位置」，落地后 `local.*` / `ssh.*` 两族是**能打通**的，
+  只有 `llm.* / tool.* / agent.* / session.*` 还悬着。
